@@ -3,6 +3,9 @@
 //#include "../network_manager/network_manager.h"
 //#include "../cxl_manager/cxl_manager.h"
 
+
 int main(int argc, char* argv[]){
+	Embarcadero::DiskManager diskmanager;
 	return 0;
 }
+
