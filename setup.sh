@@ -17,6 +17,7 @@ function Install_Abseil()
 	cd $EXTERNAL_DEP_DIR
 	git clone https://github.com/abseil/abseil-cpp.git
 	cd abseil-cpp
+	git checkout 20240116.1 
 	mkdir build && cd build
 	cmake ..
 	cmake --build . --target all
@@ -27,7 +28,7 @@ function Setup_CXL()
 {
 	echo "Setting up CXL Emulation"
 	mkdir -p ~/.CXL_EMUL
-	mount -t tmpfs -o size=31g tmpfs ~/.CXL_EMUL
+	sudo mount -t tmpfs -o size=31g tmpfs ~/.CXL_EMUL
 	sudo mount -o remount,mpol=bind:1 ~/.CXL_EMUL/
 	truncate -s 30G ~/.CXL_EMUL/cxl
 }
