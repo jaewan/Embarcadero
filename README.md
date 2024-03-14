@@ -6,3 +6,6 @@
 
 - Version 1: Support multi-topic, fault tolerance (dynamic broker addition/removal, replication)
 
+
+## TestBed
+Refer to [Test README](Embarcadero/tests/README.md)
