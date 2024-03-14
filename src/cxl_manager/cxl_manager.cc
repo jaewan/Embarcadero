@@ -17,6 +17,8 @@ CXLManager::CXLManager(){
 	std::string cxl_path(getenv("HOME"));
 	cxl_path += "/.CXL_EMUL/cxl";
 
+	long cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+
 	switch(cxl_type_){
 		case Emul:
 			cxl_emul_fd_ = open(cxl_path.c_str(), O_RDWR, 0777);
