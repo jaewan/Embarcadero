@@ -8,6 +8,7 @@ function Install_Dependencies()
 {
 	echo "Installing Dependencies"
 	sudo apt install numactl
+	sudo apt install cmake
 }
 
 # Abseil
@@ -17,7 +18,7 @@ function Install_Abseil()
 	git clone https://github.com/abseil/abseil-cpp.git
 	cd abseil-cpp
 	mkdir build && cd build
-	git clone https://github.com/abseil/abseil-cpp.git
+	cmake ..
 	cmake --build . --target all
 }
 
@@ -31,6 +32,18 @@ function Setup_CXL()
 	truncate -s 30G ~/.CXL_EMUL/cxl
 }
 
+function Build_Embarcadero()
+{
+	echo "Building Embacadero"
+	mkdir build
+	cd build
+	cmake ..
+	cmake --build . --target all
+}
+
 
 ##################### Execute ############################
+Install_Dependencies
+Install_Abseil
 Setup_CXL
+Build_Embarcadero
