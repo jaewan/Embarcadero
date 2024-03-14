@@ -12,42 +12,9 @@ namespace Embarcadero{
 #define CXL_SIZE (1UL << 34)
 
 DiskManager::DiskManager(){
-	// Initialize CXL
-	cxl_type_ = Emul;
-	std::string cxl_path(getenv("HOME"));
-	cxl_path += "/.CXL_EMUL/cxl";
-
-	switch(cxl_type_){
-		case Emul:
-			cxl_emul_fd_ = open(cxl_path.c_str(), O_RDWR|  (S_IRWXU | S_IRWXG | S_IRWXO) );
-			if (cxl_emul_fd_  < 0)
-				perror("Opening Emulated CXL error");
-
-			cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, cxl_emul_fd_, 0);
-			if (cxl_addr_ == MAP_FAILED)
-				perror("Mapping Emulated CXL error");
-
-			std::cout << "Successfully initialized CXL Emul" << std::endl;
-			break;
-		case Real:
-			perror("Not implemented real cxl yet");
-			break ;
-	}
 }
 
 DiskManager::~DiskManager(){
-	switch(cxl_type_){
-		case Emul:
-			if (munmap(cxl_addr_, CXL_SIZE) < 0)
-				perror("Unmapping Emulated CXL error");
-			close(cxl_emul_fd_);
-
-			std::cout << "Successfully deinitialized CXL Emul" << std::endl;
-			break;
-		case Real:
-			perror("Not implemented real cxl yet");
-			break;
-	}
 }
 
 } // End of namespace Embarcadero
