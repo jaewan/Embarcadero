@@ -2,9 +2,7 @@ configure_file(config.h.in config.h)
 
 # These are required for a folly build
 # Mostly from here: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
-find_package(Boost REQUIRED)
 find_package(folly REQUIRED)
-find_package(Threads REQUIRED)
 find_package(gflags REQUIRED)
 
 set_and_check(FOLLY_INCLUDE_DIR /usr/local/include/folly)
@@ -22,7 +20,7 @@ endif()
 add_executable(embarlet embarlet/embarlet.cc embarlet/publisher_queue.cc disk_manager/disk_manager.cc network_manager/network_manager.cc network_manager/network_manager.h config.h)
 
 
-target_link_libraries(embarlet ${Boost_LIBRARIES} ${FOLLY_LIBRARIES})
+target_link_libraries(embarlet ${FOLLY_LIBRARIES})
 target_include_directories(embarlet PUBLIC
 							"${CMAKE_CURRENT_BINARY_DIR}"
 						   )
