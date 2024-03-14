@@ -2,19 +2,19 @@
 
 # Run this script the first time you create this project
 
+EXTERNAL_DEP_DIR="external"
 
 # Install System dependencies
 function Install_Dependencies()
 {
-	echo "Installing Dependencies"
-	sudo apt install numactl
-	sudo apt install cmake
+	sudo apt install -y cmake numactl
 }
 
 # Abseil
 function Install_Abseil()
 {
 	echo "Installing Abseil"
+	cd $EXTERNAL_DEP_DIR
 	git clone https://github.com/abseil/abseil-cpp.git
 	cd abseil-cpp
 	mkdir build && cd build
