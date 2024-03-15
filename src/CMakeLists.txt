@@ -22,7 +22,6 @@ add_executable(embarlet
     disk_manager/disk_manager.cc 
     embarlet/pub_queue.cc 
     embarlet/pub_queue.h 
-    embarlet/pub_task.cc 
     embarlet/pub_task.h 
     config.h
 )

@@ -1,6 +1,9 @@
 #include "pub_queue.h"
 
-folly::MPMCQueue<PubTask> create_pub_queue(void) {
-    folly::MPMCQueue<PubTask> pq(PUB_QUEUE_ELEMENTS);
-    return pq;
+void pq_enqueue(PubQueue *pq, PubTask *pt) {
+    pq->blockingWrite(pt);
+}
+
+void pq_dequeue(PubQueue *pq, PubTask **pt_dest) {
+    pq->blockingRead(*pt_dest);
 }
