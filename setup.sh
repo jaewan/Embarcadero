@@ -2,7 +2,7 @@
 
 # Run this script the first time you create this project
 
-set -x
+set -ex
 
 # Install System dependencies
 function Install_Dependencies()
@@ -48,6 +48,34 @@ function Install_Folly()
 	cd $start_dir
 }
 
+function Install_gRPC()
+{
+	echo "Installing gRPC"
+	start_dir=$(pwd)
+
+	# system dependencies
+	sudo apt install -y build-essential autoconf libtool pkg-config
+	git clone --recurse-submodules -b v1.62.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc
+	cd grpc
+	git checkout v1.62.0
+	mkdir -p cmake/build
+	pushd cmake/build
+
+	# cmake options taken from here for system installation using packages:
+	# https://github.com/grpc/grpc/blob/master/test/distrib/cpp/run_distrib_test_cmake_module_install.sh
+	cmake \
+  		-DCMAKE_BUILD_TYPE=Release \
+  		-DgRPC_INSTALL=ON \
+  		-DgRPC_BUILD_TESTS=OFF \
+  		-DgRPC_SSL_PROVIDER=package \
+  		../..
+	make -j 8
+	make install
+	popd
+
+	cd $start_dir
+}
+
 # Mount Node:1 memory by tmpfs and create 30GB of file
 function Setup_CXL()
 {
@@ -70,7 +98,8 @@ function Build_Embarcadero()
 
 ##################### Execute ############################
 Install_Dependencies
-Install_Abseil
-Install_Folly
+#Install_Abseil
+#Install_Folly
+Install_gRPC
 Setup_CXL
 Build_Embarcadero
