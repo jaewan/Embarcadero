@@ -54,8 +54,9 @@ function Install_gRPC()
 	start_dir=$(pwd)
 
 	# system dependencies
-	sudo apt install -y build-essential autoconf libtool pkg-config
-	git clone --recurse-submodules -b v1.62.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc
+	sudo apt install -y build-essential autoconf libtool pkg-config libc-ares2 zlib1g-dev protobuf-compiler
+	#git clone --recurse-submodules -b v1.62.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc
+	git clone https://github.com/grpc/grpc
 	cd grpc
 	git checkout v1.62.0
 	mkdir -p cmake/build
@@ -67,10 +68,14 @@ function Install_gRPC()
   		-DCMAKE_BUILD_TYPE=Release \
   		-DgRPC_INSTALL=ON \
   		-DgRPC_BUILD_TESTS=OFF \
+		-DgRPC_ZLIB_PROVIDER=package \
+		-DgRPC_CARES_PROVIDER=package \
   		-DgRPC_SSL_PROVIDER=package \
+		-DgRPC_PROTOBUF_PROVIDER=package \
+		-DgRPC_ABSL_PROVIDER=package \
   		../..
 	make -j 8
-	make install
+	sudo make install
 	popd
 
 	cd $start_dir
