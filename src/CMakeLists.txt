@@ -17,7 +17,15 @@ if (NOT folly_FIND_QUIETLY)
   message(STATUS "Found folly: ${PACKAGE_PREFIX_DIR}")
 endif()
 
-add_executable(embarlet embarlet/embarlet.cc embarlet/publisher_queue.cc disk_manager/disk_manager.cc network_manager/network_manager.cc network_manager/network_manager.h config.h)
+add_executable(embarlet 
+    embarlet/embarlet.cc
+    disk_manager/disk_manager.cc 
+    embarlet/pub_queue.cc 
+    embarlet/pub_queue.h 
+    embarlet/pub_task.cc 
+    embarlet/pub_task.h 
+    config.h
+)
 
 target_include_directories(embarlet PUBLIC
 							"${CMAKE_CURRENT_BINARY_DIR}"
