@@ -8,9 +8,13 @@
 #include "pub_task.h"
 
 // defines
-#define PUB_QUEUE_ELEMENTS 1024
+#define PUB_QUEUE_CAPACITY 1024 // TODO: is this bytes or slots? Need to double check.
+
+// types
+using PubQueue = folly::MPMCQueue<PubTask*>;
 
 // function definitions
-folly::MPMCQueue<PubTask> create_pub_queue(void);
+void pq_enqueue(PubQueue *pq, PubTask *pt);
+void pq_dequeue(PubQueue *pq, PubTask **pt_dest);
 
 #endif // _PUB_QUEUE_H_
