@@ -98,8 +98,8 @@ function Build_Embarcadero()
 
 ##################### Execute ############################
 Install_Dependencies
-#Install_Abseil
-#Install_Folly
+Install_Abseil
+Install_Folly
 Install_gRPC
 Setup_CXL
 Build_Embarcadero
