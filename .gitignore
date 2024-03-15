@@ -4,6 +4,7 @@ build/
 # Ignore external dependencies
 abseil-cpp/
 folly/
+grpc/
 
 # Gitignore for C++ projects
 # https://github.com/github/gitignore/blob/main/C%2B%2B.gitignore
