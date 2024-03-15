@@ -22,6 +22,30 @@ function Install_Abseil()
 	cmake --build . --target all
 }
 
+# gRPC
+function Install_gRPC()
+{
+	echo "Installing gRPC"
+	git clone --recurse-submodules -b v1.62.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc
+	cd grpc
+	mkdir -p cmake/build
+	cd cmake/build
+	cmake ..
+	make -j 4
+	sudo make install
+}
+
+# Cxxopts
+function Install_Cxxopts()
+{
+	echo "Installing cxxopts"
+	git clone https://github.com/jarro2783/cxxopts
+	cd cxxopts
+	mkdir build && cd build
+	cmake ..
+	cmake --build . --target all
+}
+
 # Mount Node:1 memory by tmpfs and create 30GB of file
 function Setup_CXL()
 {
@@ -34,7 +58,7 @@ function Setup_CXL()
 
 function Build_Embarcadero()
 {
-	echo "Building Embacadero"
+	echo "Building Embarcadero"
 	mkdir build
 	cd build
 	cmake ..
@@ -45,5 +69,7 @@ function Build_Embarcadero()
 ##################### Execute ############################
 Install_Dependencies
 Install_Abseil
+install_gRPC
+Install_Cxxopts
 Setup_CXL
 Build_Embarcadero

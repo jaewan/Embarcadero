@@ -12,5 +12,6 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_FLAGS "-Wall")
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-add_subdirectory(abseil-cpp)
+add_subdirectory(grpc)
+# add_subdirectory(cxxopts)
 add_subdirectory(src)
