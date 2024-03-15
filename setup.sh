@@ -51,6 +51,9 @@ function Install_Folly()
 function Install_gRPC()
 {
 	echo "Installing gRPC"
+	echo "THIS DOESN'T WORK YET"
+	exit -1
+	
 	start_dir=$(pwd)
 
 	# system dependencies
@@ -61,6 +64,7 @@ function Install_gRPC()
 	git checkout v1.62.0
 	mkdir -p cmake/build
 	pushd cmake/build
+	cd cmake/build
 
 	# cmake options taken from here for system installation using packages:
 	# https://github.com/grpc/grpc/blob/master/test/distrib/cpp/run_distrib_test_cmake_module_install.sh
@@ -105,6 +109,6 @@ function Build_Embarcadero()
 Install_Dependencies
 Install_Abseil
 Install_Folly
-Install_gRPC
+#Install_gRPC
 Setup_CXL
 Build_Embarcadero
