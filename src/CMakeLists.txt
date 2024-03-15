@@ -5,3 +5,5 @@ add_executable(embarlet embarlet/embarlet.cc disk_manager/disk_manager.cc config
 target_include_directories(embarlet PUBLIC
 							"${CMAKE_CURRENT_BINARY_DIR}"
 						   )
+
+target_link_libraries(embarlet absl::strings)
