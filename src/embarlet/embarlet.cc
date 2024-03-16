@@ -5,12 +5,13 @@
 #include <iostream>
 #include "peer.h"
 #include <string>
-#include <cxxopts.hpp>
+#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 
 int main(int argc, char* argv[]){
 
-	xxopts::Options options("embarcadero");
+	cxxopts::Options options("embarcadero", "a totally ordered pub/sub system with CXL");
 
+    // Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
     options.add_options()
 		("head", "Head Node")
         ("follower", "Follower Address and Port", cxxopts::value<std::string>());
@@ -23,7 +24,7 @@ int main(int argc, char* argv[]){
 
         head_broker.Run();
     } else if (arguments.count("follower")) {
-        std::string follower = result["follower"].as<std::string>();
+        std::string follower = arguments["follower"].as<std::string>();
 
 		std::string head_addr = follower.substr(0, follower.find(":"));
 		std::string head_port = follower.substr(follower.find(":") + 1);

@@ -12,6 +12,6 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_FLAGS "-Wall")
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-add_subdirectory(grpc)
-# add_subdirectory(cxxopts)
+add_subdirectory(third_party/grpc)
+add_subdirectory(third_party/cxxopts)
 add_subdirectory(src)

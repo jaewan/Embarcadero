@@ -1,20 +1,20 @@
 syntax = "proto3";
 
 service Peer {
-    // Allows a broker to broadcast a heartbeat to all other peers
-    rpc HandleBroadcastHeartbeat(BroadcastHeartbeatRequest) returns (BroadcastHeartbeatResponse);
+    // Allows a new broker to request head to join cluster
+    rpc HandleJoinCluster(JoinClusterRequest) returns (JoinClusterResponse);
     // Notify all other brokers of a new broker
     rpc HandleReportNewBroker(ReportNewBrokerRequest) returns (ReportNewBrokerResponse);
 }
 
-// Request containing address and port of sender
-message BroadcastHeartbeatRequest {
+// Request containing address and port of sender (new broker)
+message JoinClusterRequest {
     string address = 1;
     string port = 2;
 }
 
 // Empty response for now
-message BroadcastHeartbeatResponse {}
+message JoinClusterResponse {}
 
 // Request containing address and port of new broker
 message ReportNewBrokerRequest {
@@ -22,7 +22,5 @@ message ReportNewBrokerRequest {
     string port = 2;
 }
 
-// Response containing success
-message ReportNewBrokerResponse {
-    bool success = 1;
-}
+// Empty response for now
+message ReportNewBrokerResponse {}
