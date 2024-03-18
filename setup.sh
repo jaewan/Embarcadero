@@ -2,12 +2,19 @@
 
 # Run this script the first time you create this project
 
-set -ex
-
 # Install System dependencies
 function Install_Dependencies()
 {
-	sudo apt install -y cmake numactl
+	echo "Installing Dependencies"
+	sudo apt install numactl
+	sudo apt install cmake
+	sudo apt-get install libboost-all-dev
+}
+
+function Create_Third_Party_Directory()
+{
+	mkdir third_party
+	cd third_party
 }
 
 # Abseil
@@ -42,46 +49,38 @@ function Install_Folly()
 	# Build and install folly
 	cd build
 	cmake ..
-	make
-	sudo make install
-
+	cmake --build . --target all
 	cd $start_dir
 }
 
+# gRPC
 function Install_gRPC()
 {
 	echo "Installing gRPC"
-	echo "THIS DOESN'T WORK YET"
-	exit -1
-	
 	start_dir=$(pwd)
-
-	# system dependencies
-	sudo apt install -y build-essential autoconf libtool pkg-config libc-ares2 zlib1g-dev protobuf-compiler
-	#git clone --recurse-submodules -b v1.62.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc
-	git clone https://github.com/grpc/grpc
+	git clone --recurse-submodules -b v1.62.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc
 	cd grpc
-	git checkout v1.62.0
 	mkdir -p cmake/build
-	pushd cmake/build
 	cd cmake/build
-
-	# cmake options taken from here for system installation using packages:
-	# https://github.com/grpc/grpc/blob/master/test/distrib/cpp/run_distrib_test_cmake_module_install.sh
-	cmake \
-  		-DCMAKE_BUILD_TYPE=Release \
-  		-DgRPC_INSTALL=ON \
-  		-DgRPC_BUILD_TESTS=OFF \
-		-DgRPC_ZLIB_PROVIDER=package \
-		-DgRPC_CARES_PROVIDER=package \
-  		-DgRPC_SSL_PROVIDER=package \
-		-DgRPC_PROTOBUF_PROVIDER=package \
-		-DgRPC_ABSL_PROVIDER=package \
-  		../..
-	make -j 8
+	cmake -DgRPC_INSTALL=ON \
+      -DgRPC_BUILD_TESTS=OFF \
+      -DCMAKE_INSTALL_PREFIX=$MY_INSTALL_DIR \
+      ../..
+	make -j 4
 	sudo make install
-	popd
+	cd $start_dir
+}
 
+# Cxxopts
+function Install_Cxxopts()
+{
+	echo "Installing cxxopts"
+	start_dir=$(pwd)
+	git clone https://github.com/jarro2783/cxxopts
+	cd cxxopts
+	mkdir build && cd build
+	cmake ..
+	cmake --build . --target all
 	cd $start_dir
 }
 
@@ -97,7 +96,8 @@ function Setup_CXL()
 
 function Build_Embarcadero()
 {
-	echo "Building Embacadero"
+    cd ~/Embarcadero
+	echo "Building Embarcadero"
 	mkdir build
 	cd build
 	cmake ..
@@ -107,8 +107,9 @@ function Build_Embarcadero()
 
 ##################### Execute ############################
 Install_Dependencies
+Create_Third_Party_Directory
 Install_Abseil
-Install_Folly
-#Install_gRPC
+install_gRPC
+Install_Cxxopts
 Setup_CXL
 Build_Embarcadero
