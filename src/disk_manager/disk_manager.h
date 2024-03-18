@@ -1,7 +1,7 @@
 #ifndef INCLUDE_DISK_MANGER_H_
 #define INCLUDE_DISK_MANGER_H_
 
-#include "config.h"
+#include "common/config.h"
 
 namespace Embarcadero{
 
