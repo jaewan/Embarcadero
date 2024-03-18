@@ -47,9 +47,10 @@ function Install_Folly()
 	sudo apt install -y libssl-dev libfmt-dev
 	
 	# Build and install folly
-	cd build
-	cmake ..
-	cmake --build . --target all
+	#cd build
+	#cmake ..
+	#cmake --build . --target all
+	./build.sh --install-dir /usr/local/
 	cd $start_dir
 }
 
@@ -109,8 +110,8 @@ function Build_Embarcadero()
 Install_Dependencies
 Create_Third_Party_Directory
 Install_Abseil
+Install_gRPC
 Install_Folly
-install_gRPC
 Install_Cxxopts
 Setup_CXL
 Build_Embarcadero
