@@ -3,7 +3,7 @@
 #include "pub_task.h"
 #include "../disk_manager/disk_manager.h"
 #include "../network_manager/network_manager.h"
-//#include "../cxl_manager/cxl_manager.h"
+#include "../cxl_manager/cxl_manager.h"
 #include <iostream>
 #include "peer.h"
 #include <string>
@@ -11,7 +11,7 @@
 
 int main(int argc, char* argv[]){
 
-	Embarcadero::CXLManager cxlmanager;
+	//Embarcadero::CXLManager cxlmanager;
 	cxxopts::Options options("embarcadero", "a totally ordered pub/sub system with CXL");
 
 	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
