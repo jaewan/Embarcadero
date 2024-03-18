@@ -1,6 +1,6 @@
 include(cmake/peer_grpc.cmake)
 
-configure_file(config.h.in config.h)
+configure_file(common/config.h.in common/config.h)
 
 add_executable(embarlet 
 	embarlet/embarlet.cc 

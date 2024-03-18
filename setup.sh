@@ -8,6 +8,7 @@ function Install_Dependencies()
 	echo "Installing Dependencies"
 	sudo apt install numactl
 	sudo apt install cmake
+	sudo apt-get install libboost-all-dev
 }
 
 function Create_Third_Party_Directory()

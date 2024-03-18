@@ -5,6 +5,8 @@ service Peer {
     rpc HandleJoinCluster(JoinClusterRequest) returns (JoinClusterResponse);
     // Notify all other brokers of a new broker
     rpc HandleReportNewBroker(ReportNewBrokerRequest) returns (ReportNewBrokerResponse);
+    // Perform a health check on another broker
+    rpc HandleHealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 
 // Request containing address and port of sender (new broker)
@@ -24,3 +26,9 @@ message ReportNewBrokerRequest {
 
 // Empty response for now
 message ReportNewBrokerResponse {}
+
+/// Empty request for now
+message HealthCheckRequest {}
+
+/// Empty response for now
+message HealthCheckResponse {}
