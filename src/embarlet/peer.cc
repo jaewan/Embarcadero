@@ -63,7 +63,6 @@ std::unique_ptr<Peer::Stub> PeerBroker::GetRpcClient(std::string peer_url) {
     return Peer::NewStub(channel);
 }
 
-/// TODO: cover the case where new node that joins is aware of all other peers
 void PeerBroker::JoinCluster() {
     std::string head_address = current_head_address_;
     std::string head_port = port_;
@@ -77,11 +76,12 @@ void PeerBroker::JoinCluster() {
 
     JoinClusterResponse response;
     grpc::ClientContext context;
-    // This RPC call is blocking for now
+    // This RPC call blocks until the new peer successfully joins the cluster
     grpc::Status status = rpc_client->HandleJoinCluster(&context, request, &response);
 
     if (!status.ok()) {
         std::cout << "Error sending join request to head " << head_address << ":" << head_port << std::endl;
+        return;
     } else {
         std::cout << "Successfully joined the cluster" << std::endl;
     }
@@ -94,6 +94,18 @@ grpc::Status PeerBroker::HandleJoinCluster(grpc::ServerContext* context, const J
     std::string new_peer_address = request->address();
     std::string new_peer_port = request->port();
 
+    // If the peer is not in the hashmap, add it
+    if (peer_brokers_.find(new_peer_address) == peer_brokers_.end()) {
+        peer_brokers_.emplace(new_peer_address, new_peer_port);
+        std::cout << "Peer " << new_peer_address << ":" << new_peer_port << " successfully joined the cluster" << std::endl;
+
+        // Start health check
+        InitiateHealthChecker(new_peer_address, new_peer_port);
+    } else {
+        std::cout << "Peer " << new_peer_address << ":" << new_peer_port << " already exists in the cluster" << std::endl;
+        return grpc::Status::CANCELLED;
+    }
+
     // Notify all other brokers of the new peer
     for (auto const& peer : peer_brokers_) {
         std::string peer_url = peer.first + ":" + peer.second;
@@ -103,7 +115,7 @@ grpc::Status PeerBroker::HandleJoinCluster(grpc::ServerContext* context, const J
         request.set_address(new_peer_address);
         request.set_port(new_peer_port);
 
-        // This RPC call is synchronous for now
+        /// TODO: This RPC call is synchronous for now but we have to make it async
         ReportNewBrokerResponse response;
         grpc::ClientContext context;
         grpc::Status status = rpc_client->HandleReportNewBroker(&context, request, &response);
@@ -151,16 +163,6 @@ grpc::Status PeerBroker::HandleJoinCluster(grpc::ServerContext* context, const J
         return grpc::Status::OK;
     }
 
-    // If the peer is not in the hashmap, add it
-    if (peer_brokers_.find(new_peer_address) == peer_brokers_.end()) {
-        peer_brokers_.emplace(new_peer_address, new_peer_port);
-    }
-
-    std::cout << "Peer " << new_peer_address << ":" << new_peer_port << " successfully joined the cluster" << std::endl;
-
-    // Start health check
-    InitiateHealthChecker(new_peer_address, new_peer_port);
-
     return grpc::Status::OK;
 }
 
@@ -171,12 +173,15 @@ grpc::Status PeerBroker::HandleReportNewBroker(grpc::ServerContext* context, con
     // If the new broker is not in the hashmap, add it
     if (peer_brokers_.find(new_peer_address) == peer_brokers_.end()) {
         peer_brokers_.emplace(new_peer_address, new_peer_port);
+        
+        std::cout << "New broker " << new_peer_address << ":" << new_peer_port << " successfully added to peer list of broker: " << address_ << std::endl;
+
+        // Start health check
+        InitiateHealthChecker(new_peer_address, new_peer_port);
+    } else {
+        std::cout << "New broker " << new_peer_address << ":" << new_peer_port << " already exists in peer list of broker: " << address_ << std::endl;
+        return grpc::Status::CANCELLED;
     }
-
-    std::cout << "New broker " << new_peer_address << ":" << new_peer_port << " successfully added to peer list of broker: " << address_ << std::endl;
-
-    // Start health check
-    InitiateHealthChecker(new_peer_address, new_peer_port);
 
     return grpc::Status::OK;
 }
@@ -189,7 +194,18 @@ void PeerBroker::InitiateHealthChecker(std::string address, std::string port) {
 }
 
 grpc::Status PeerBroker::HandleHealthCheck(grpc::ServerContext* context, const HealthCheckRequest* request, HealthCheckResponse* response) {
-    std::cout << "Received a health check" << std::endl;
+    std::string sender_address = request->address();
+    std::string sender_port = request->port();
+
+    std::cout << "Received a health check from " << sender_address << ":" << sender_port << std::endl;
+
+    // If the peer is not in the hashmap, add it and start a health check
+    // Initially, this peer might not know of all other peers until it receives a health check from them
+    // We are able to piggyback information about other peers through these health checks
+    if (peer_brokers_.find(sender_address) == peer_brokers_.end()) {
+        peer_brokers_.emplace(sender_address, sender_port);
+        InitiateHealthChecker(sender_address, sender_port);
+    }
 
     return grpc::Status::OK;
 }
@@ -204,7 +220,10 @@ void PeerBroker::HealthChecker::StartHealthCheck() {
         std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms_);
     health_check_context.set_deadline(deadline);
 
-    /// TODO: Figure out how to make this async
+    request.set_address(peer_->address_);
+    request.set_port(peer_->port_);
+
+    /// TODO: This rpc call should be async
     grpc::Status status = rpc_client_->HandleHealthCheck(&health_check_context, request, &response);
 
     // Check if the deadline expired
@@ -250,7 +269,7 @@ void PeerBroker::Run() {
         builder.RegisterService(this);
 
         std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
-        std::cout << "Embarcadero head started. To connect to this node from another node, run './embarlet --follower=" << server_address << "'" << std::endl;
+        std::cout << "Embarcadero head started. To connect to this node from another node, run: ./embarlet --follower='" << server_address << "'" << std::endl;
         server->Wait();
     } else {
         std::string server_address = address_ + ":" + port_;
