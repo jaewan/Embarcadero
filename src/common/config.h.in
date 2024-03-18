@@ -3,3 +3,13 @@
 #define Embarcadero_VERSION_MINOR 1
 
 #define NUM_BROKERS 4
+
+// Health check configs
+/// The delay to send the first health check
+#define HEALTH_CHECK_INITIAL_DELAY_MS 5000
+/// The interval between two health checks
+#define HEALTH_CHECK_PERIOD_MS 3000
+/// The timeout for a health check.
+#define HEALTH_CHECK_TIMEOUT_MS 10000
+/// The threshold for the amount of retries we do before we consider a node dead.
+#define HEALTH_CHECK_FAILURE_THRESHOLD 5

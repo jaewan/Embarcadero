@@ -15,7 +15,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 add_subdirectory(third_party/grpc)
 add_subdirectory(third_party/cxxopts)
 add_subdirectory(src)
-add_subdirectory(abseil-cpp)
 
 # Set output to lib/ or bin/ directories
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
