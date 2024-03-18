@@ -1,3 +1,5 @@
 // the configured options and settings for Embarcadero
 #define Embarcadero_VERSION_MAJOR 0.1
 #define Embarcadero_VERSION_MINOR 1
+
+#define NUM_BROKERS 4

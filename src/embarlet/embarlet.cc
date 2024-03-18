@@ -11,31 +11,32 @@
 
 int main(int argc, char* argv[]){
 
+	Embarcadero::CXLManager cxlmanager;
 	cxxopts::Options options("embarcadero", "a totally ordered pub/sub system with CXL");
 
-    // Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
-    options.add_options()
+	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
+	options.add_options()
 		("head", "Head Node")
-        ("follower", "Follower Address and Port", cxxopts::value<std::string>());
+		("follower", "Follower Address and Port", cxxopts::value<std::string>());
 
-    auto arguments = options.parse(argc, argv);
+	auto arguments = options.parse(argc, argv);
 
 	if (arguments.count("head")) {
-        // Initialize peer broker
-        PeerBroker head_broker(true);
+		// Initialize peer broker
+		PeerBroker head_broker(true);
 
-        head_broker.Run();
-    } else if (arguments.count("follower")) {
-        std::string follower = arguments["follower"].as<std::string>();
+		head_broker.Run();
+	} else if (arguments.count("follower")) {
+		std::string follower = arguments["follower"].as<std::string>();
 
 		std::string head_addr = follower.substr(0, follower.find(":"));
 		std::string head_port = follower.substr(follower.find(":") + 1);
-		
-        PeerBroker follower_broker(false, head_addr, head_port);
-        follower_broker.Run();
-    } else {
-        std::cout << "Invalid arguments" << std::endl;
-    }
+
+		PeerBroker follower_broker(false, head_addr, head_port);
+		follower_broker.Run();
+	} else {
+		std::cout << "Invalid arguments" << std::endl;
+	}
 
 	// Create a pub task
 	// This is slightly less than ideal, because it involved two heap allocations.
@@ -69,3 +70,4 @@ int main(int argc, char* argv[]){
 
 	return 0;
 }
+
