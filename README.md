@@ -6,6 +6,14 @@
 
 - Version 1: Support multi-topic, fault tolerance (dynamic broker addition/removal, replication)
 
+## Building
+
+```bash
+mkdir build
+cmake ../
+cmake --build .
+```
+The generated executable will be in ```build/bin/embarlet```.
 
 ## TestBed
 Refer to [Test README](Embarcadero/tests/README.md)
