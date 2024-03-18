@@ -6,7 +6,7 @@ add_executable(embarlet
 	embarlet/embarlet.cc 
     embarlet/peer.cc
 	disk_manager/disk_manager.cc
-	config.h
+	common/config.h
 )  
 
 target_include_directories(embarlet PUBLIC

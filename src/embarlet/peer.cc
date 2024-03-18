@@ -3,7 +3,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
-#include "config.h"
+#include "common/config.h"
 #include "peer.h"
 
 PeerBroker::PeerBroker(bool is_head, std::string address, std::string port) 
@@ -200,6 +200,7 @@ void PeerBroker::HealthChecker::StartHealthCheck() {
     HealthCheckRequest request;
     HealthCheckResponse response;
 
+    /// TODO: Figure out why this deadline isn't really working (rpc doesn't wait for the timeout to detect a failure but still detects a failure successfully)
     auto deadline =
         std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms_);
     health_check_context.set_deadline(deadline);
@@ -208,13 +209,15 @@ void PeerBroker::HealthChecker::StartHealthCheck() {
     grpc::Status status = rpc_client_->HandleHealthCheck(&health_check_context, request, &response);
 
     // Check if the deadline expired
-    if (status.error_code() == grpc::DEADLINE_EXCEEDED) {
-        --health_check_remaining_;
-    } else if (status.ok()) {
+    if (status.ok()) {
         // Health check passed
         std::cout << "Health check passed for " << health_check_address_ << ":" << health_check_port_ << std::endl;
 
         health_check_remaining_ = peer_->failure_threshold_;
+    } else {
+        std::cout << "Health check failed for " << health_check_address_ << ":" << health_check_port_ << "," << health_check_remaining_ << " retries remaining" << std::endl;
+
+        --health_check_remaining_;
     }
 
     // If number of health checks reaches 0 we consider the node as failed
@@ -232,7 +235,7 @@ void PeerBroker::HealthChecker::StartHealthCheck() {
 }
 
 void PeerBroker::FailNode(std::string address, std::string port) {
-    std::cout << "Node " << address << ":" << port << " has failed" << std::endl;
+    std::cout << "Node " << address << ":" << port << " has failed, shutting down the system" << std::endl;
     // For now, shut down the system
     exit(1);
 }
