@@ -4,7 +4,7 @@
 #include <cmath>
 #include <iostream>
 #include <string>
-#include "config.h"
+#include "common/config.h"
 
 void square_root(char* num);
 

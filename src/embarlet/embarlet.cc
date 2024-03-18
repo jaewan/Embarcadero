@@ -1,11 +1,41 @@
-#include "config.h"
+#include "common/config.h"
 #include "pub_queue.h"
 #include "pub_task.h"
 #include "../disk_manager/disk_manager.h"
 #include "../network_manager/network_manager.h"
 //#include "../cxl_manager/cxl_manager.h"
+#include <iostream>
+#include "peer.h"
+#include <string>
+#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[]){
+
+	cxxopts::Options options("embarcadero", "a totally ordered pub/sub system with CXL");
+
+    // Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
+    options.add_options()
+		("head", "Head Node")
+        ("follower", "Follower Address and Port", cxxopts::value<std::string>());
+
+    auto arguments = options.parse(argc, argv);
+
+	if (arguments.count("head")) {
+        // Initialize peer broker
+        PeerBroker head_broker(true);
+
+        head_broker.Run();
+    } else if (arguments.count("follower")) {
+        std::string follower = arguments["follower"].as<std::string>();
+
+		std::string head_addr = follower.substr(0, follower.find(":"));
+		std::string head_port = follower.substr(follower.find(":") + 1);
+		
+        PeerBroker follower_broker(false, head_addr, head_port);
+        follower_broker.Run();
+    } else {
+        std::cout << "Invalid arguments" << std::endl;
+    }
 
 	// Create a pub task
 	// This is slightly less than ideal, because it involved two heap allocations.
@@ -36,5 +66,6 @@ int main(int argc, char* argv[]) {
 	assert(tasks_left == 0);
 
 	delete pq;
+
 	return 0;
 }
