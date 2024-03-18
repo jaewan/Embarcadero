@@ -9,7 +9,7 @@ Start by
 ```
 for other nodes start by
 ```bash
-./embarlet --follower
+./embarlet --follower'ADDR:PORT'
 ```
 
 

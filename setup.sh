@@ -109,6 +109,7 @@ function Build_Embarcadero()
 Install_Dependencies
 Create_Third_Party_Directory
 Install_Abseil
+Install_Folly
 install_gRPC
 Install_Cxxopts
 Setup_CXL

@@ -1,7 +1,5 @@
 include(cmake/peer_grpc.cmake)
 
-configure_file(common/config.h.in common/config.h)
-
 # These are required for a folly build
 # folly cmake mostly from here: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
 find_package(folly REQUIRED)
@@ -19,6 +17,8 @@ if (NOT folly_FIND_QUIETLY)
   message(STATUS "Found folly: ${PACKAGE_PREFIX_DIR}")
 endif()
 
+configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/config.h")
+
 add_executable(embarlet 
     embarlet/embarlet.cc
     disk_manager/disk_manager.cc 
@@ -26,11 +26,11 @@ add_executable(embarlet
     embarlet/pub_queue.h 
     embarlet/pub_task.h 
     embarlet/peer.cc
-    config.h
 )
 
 target_include_directories(embarlet PUBLIC
 	"${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
 )
 
 target_link_libraries(embarlet
@@ -40,5 +40,5 @@ target_link_libraries(embarlet
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF}
+    ${FOLLY_LIBRARIES}
 )
-target_link_libraries(embarlet ${FOLLY_LIBRARIES})
