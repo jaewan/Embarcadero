@@ -7,7 +7,7 @@
 #include <peer.grpc.pb.h>
 #include <thread>
 #include <boost/asio.hpp>
-#include "../common/config.h"
+#include "../config.h"
 
 /// Class for a single broker
 class PeerBroker : public Peer::Service {
@@ -75,9 +75,9 @@ class PeerBroker : public Peer::Service {
                       health_check_remaining_(peer->failure_threshold_) {
                     health_check_address_ = address;
                     health_check_port_ = port;
-                    initial_delay_ms_ = health_check_initial_delay_ms;
-                    timeout_ms_ = health_check_timeout_ms;
-                    period_ms_ = health_check_period_ms;
+                    initial_delay_ms_ = HEALTH_CHECK_INITIAL_DELAY_MS;
+                    timeout_ms_ = HEALTH_CHECK_TIMEOUT_MS;
+                    period_ms_ = HEALTH_CHECK_PERIOD_MS;
 
                     rpc_client_ = peer_->GetRpcClient(health_check_address_ + ":" + health_check_port_);
 

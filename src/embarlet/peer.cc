@@ -3,7 +3,6 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
-#include "common/config.h"
 #include "peer.h"
 
 PeerBroker::PeerBroker(bool is_head, std::string address, std::string port) 
@@ -18,14 +17,14 @@ PeerBroker::PeerBroker(bool is_head, std::string address, std::string port)
         this->port_ = "8080"; // Default port for now
         this->peer_brokers_ = absl::flat_hash_map<std::string, std::string>();
         this->current_head_address_ = this->address_;
-        this->failure_threshold_ = health_check_failure_threshold;
+        this->failure_threshold_ = HEALTH_CHECK_FAILURE_THRESHOLD;
     } else {
         this->is_head_ = false;
         this->address_ = GetAddress();
         this->port_ = port;
         this->peer_brokers_.emplace(address, port);
         this->current_head_address_ = address;
-        this->failure_threshold_ = health_check_failure_threshold;
+        this->failure_threshold_ = HEALTH_CHECK_FAILURE_THRESHOLD;
     }
 }
 
@@ -251,7 +250,7 @@ void PeerBroker::Run() {
         builder.RegisterService(this);
 
         std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
-        std::cout << "Server listening on " << server_address << std::endl;
+        std::cout << "Embarcadero head started. To connect to this node from another node, run './embarlet --follower=" << server_address << "'" << std::endl;
         server->Wait();
     } else {
         std::string server_address = address_ + ":" + port_;
@@ -266,7 +265,7 @@ void PeerBroker::Run() {
         // Join the cluster
         JoinCluster();
         
-        std::cout << "Server listening on " << server_address << std::endl;
+        std::cout << "Embarcadero follower started on " << server_address << std::endl;
         server->Wait();
     }
 }
