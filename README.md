@@ -26,7 +26,7 @@ mkdir build
 cmake ../
 cmake --build .
 ```
-The generated executable will be in ```build/bin/embarlet```.
+The generated executable will be in ```build/src/embarlet```.
 
 ## TestBed
 Refer to [Test README](Embarcadero/tests/README.md)
