@@ -67,6 +67,9 @@ function Install_gRPC()
 	# Please do not remove this from the build script.
 	sudo apt install -y build-essential autoconf libtool pkg-config
 
+	# Necessary because we have to install from packages below
+        sudo apt -y install libc-ares2
+
 	git clone --recurse-submodules -b v1.62.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc
 	cd grpc
 	mkdir -p cmake/build
