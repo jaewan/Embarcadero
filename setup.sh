@@ -1,6 +1,7 @@
 #! /bin/bash
 
 # Run this script the first time you create this project
+set -ex
 
 # Install System dependencies
 function Install_Dependencies()
@@ -9,7 +10,8 @@ function Install_Dependencies()
 	sudo apt update
 	sudo apt install -y numactl
 	sudo apt install -y cmake
-	sudo apt-get install -y libboost-all-dev
+	sudo apt install -y libboost-all-dev
+	sudo apt -y install pkg-config
 }
 
 function Create_Third_Party_Directory()
@@ -46,7 +48,7 @@ function Install_Folly()
 	# Install dependencies. I don't know why the script misses some
 	sudo ./build/fbcode_builder/getdeps.py install-system-deps --recursive
 	sudo apt install -y libssl-dev libfmt-dev
-	
+
 	# Build and install folly
 	#cd build
 	#cmake ..
@@ -66,7 +68,7 @@ function Install_gRPC()
 	cd cmake/build
 	cmake -DgRPC_INSTALL=ON \
       -DgRPC_BUILD_TESTS=OFF \
-      -DCMAKE_INSTALL_PREFIX=$MY_INSTALL_DIR \
+      -DCMAKE_INSTALL_PREFIX=/usr/local/ \
       ../..
 	make -j 4
 	sudo make install
