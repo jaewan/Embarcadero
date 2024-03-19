@@ -6,9 +6,10 @@
 function Install_Dependencies()
 {
 	echo "Installing Dependencies"
-	sudo apt install numactl
-	sudo apt install cmake
-	sudo apt-get install libboost-all-dev
+	sudo apt update
+	sudo apt install -y numactl
+	sudo apt install -y cmake
+	sudo apt-get install -y libboost-all-dev
 }
 
 function Create_Third_Party_Directory()
@@ -50,7 +51,7 @@ function Install_Folly()
 	#cd build
 	#cmake ..
 	#cmake --build . --target all
-	./build.sh --install-dir /usr/local/
+	sudo ./build.sh --install-dir /usr/local/
 	cd $start_dir
 }
 
@@ -97,7 +98,6 @@ function Setup_CXL()
 
 function Build_Embarcadero()
 {
-    cd ~/Embarcadero
 	echo "Building Embarcadero"
 	mkdir build
 	cd build
@@ -107,6 +107,7 @@ function Build_Embarcadero()
 
 
 ##################### Execute ############################
+current_dir=$(pwd)
 Install_Dependencies
 Create_Third_Party_Directory
 Install_Abseil
@@ -114,4 +115,5 @@ Install_gRPC
 Install_Folly
 Install_Cxxopts
 Setup_CXL
+cd $current_dir
 Build_Embarcadero
