@@ -71,10 +71,25 @@ function Install_gRPC()
 	cd grpc
 	mkdir -p cmake/build
 	cd cmake/build
+
+	# Not sure if this issue is still relevant: https://github.com/grpc/grpc/issues/13841
+	# But seems to have install errors if you don't use packages for everything.
 	cmake -DgRPC_INSTALL=ON \
-      -DgRPC_BUILD_TESTS=OFF \
-      -DCMAKE_INSTALL_PREFIX=/usr/local/ \
-      ../..
+		-DgRPC_BUILD_TESTS=OFF \
+		-DgRPC_PROTOBUF_PROVIDER=package \
+		-DgRPC_ZLIB_PROVIDER=package \
+		-DgRPC_CARES_PROVIDER=package \
+		-DgRPC_SSL_PROVIDER=package \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DgRPC_ABSL_PROVIDER=package \
+	  	-DgRPC_BUILD_GRPC_CSHARP_PLUGIN=off \
+      	-DgRPC_BUILD_GRPC_NODE_PLUGIN=off \
+      	-DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=off \
+      	-DgRPC_BUILD_GRPC_PHP_PLUGIN=off \
+	  	-DgRPC_BUILD_GRPC_PYTHON_PLUGIN=off \
+	  	-DgRPC_BUILD_GRPC_RUBY_PLUGIN=off \
+		../.. 
+
 	make -j 4
 	sudo make install
 	cd $start_dir
@@ -84,13 +99,17 @@ function Install_gRPC()
 function Install_Cxxopts()
 {
 	echo "Installing cxxopts"
-	start_dir=$(pwd)
+	#start_dir=$(pwd)
 	git clone https://github.com/jarro2783/cxxopts
-	cd cxxopts
-	mkdir build && cd build
-	cmake ..
-	cmake --build . --target all
-	cd $start_dir
+
+	# Note: we install this in the CMakeLists by adding this as a subdirectory
+	# So there is no need to build here.
+
+	#cd cxxopts
+	#mkdir build && cd build
+	#cmake ..
+	#cmake --build . --target all
+	#cd $start_dir
 }
 
 # Mount Node:1 memory by tmpfs and create 30GB of file
@@ -111,6 +130,7 @@ function Build_Embarcadero()
 	cmake ..
 	cmake --build . --target all
 }
+
 
 
 ##################### Execute ############################

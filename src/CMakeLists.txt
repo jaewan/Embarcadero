@@ -17,7 +17,7 @@ if (NOT folly_FIND_QUIETLY)
   message(STATUS "Found folly: ${PACKAGE_PREFIX_DIR}")
 endif()
 
-configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/config.h")
+configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
 add_executable(embarlet 
     embarlet/embarlet.cc

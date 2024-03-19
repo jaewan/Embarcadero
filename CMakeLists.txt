@@ -11,7 +11,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "-Wall -O3")
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-add_subdirectory(third_party/grpc)
+# GRPC library location
+list(APPEND CMAKE_PREFIX_PATH "/usr/local/lib/" "/usr/local/lib/cmake/grpc" "/usr/local/bin/")
+set(_REFLECTION gRPC::grpc++_reflection)
+find_package(gRPC CONFIG REQUIRED)
+
 add_subdirectory(third_party/cxxopts)
 add_subdirectory(src)
 

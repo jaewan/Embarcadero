@@ -1,12 +1,8 @@
 #!/bin/bash
 
 # Clean up dependencies
-
-# abseil
-rm -rf abseil-cpp
-# folly: must use sudo due to python cache permissions
-sudo rm -rf folly
-rm -rf grpc
+# Note: some things from folly require the sudo to rm them
+sudo rm -rf third_party
 
 # Clean up build directory
 rm -rf build
