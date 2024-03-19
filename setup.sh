@@ -11,7 +11,6 @@ function Install_Dependencies()
 	sudo apt install -y numactl
 	sudo apt install -y cmake
 	sudo apt install -y libboost-all-dev
-	sudo apt -y install pkg-config
 }
 
 function Create_Third_Party_Directory()
@@ -47,7 +46,7 @@ function Install_Folly()
 	
 	# Install dependencies. I don't know why the script misses some
 	sudo ./build/fbcode_builder/getdeps.py install-system-deps --recursive
-	sudo apt install -y libssl-dev libfmt-dev
+	sudo apt install -y libssl-dev libfmt-dev pkg-config
 
 	# Build and install folly
 	#cd build
@@ -57,11 +56,17 @@ function Install_Folly()
 	cd $start_dir
 }
 
+
 # gRPC
 function Install_gRPC()
 {
 	echo "Installing gRPC"
 	start_dir=$(pwd)
+
+	# These packages are required to build gRPC per the documentation: https://grpc.io/docs/languages/cpp/quickstart/
+	# Please do not remove this from the build script.
+	sudo apt install -y build-essential autoconf libtool pkg-config
+
 	git clone --recurse-submodules -b v1.62.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc
 	cd grpc
 	mkdir -p cmake/build
