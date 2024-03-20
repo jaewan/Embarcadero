@@ -13,6 +13,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 add_subdirectory(third_party/grpc)
 add_subdirectory(third_party/cxxopts)
+add_subdirectory(third_party/folly)
 add_subdirectory(src)
 
 # Set output to lib/ or bin/ directories

@@ -50,7 +50,8 @@ function Install_Folly()
 	#cd build
 	#cmake ..
 	#cmake --build . --target all
-	./build.sh --install-dir /usr/local/
+	# ./build.sh --install-dir /usr/local/
+	sudo python3 ./build/fbcode_builder/getdeps.py --allow-system-packages build --install-dir /usr/local/
 	cd $start_dir
 }
 
