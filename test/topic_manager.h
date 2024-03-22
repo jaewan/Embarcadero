@@ -14,14 +14,21 @@ namespace Embarcadero{
 
 class CXLManager;
 
+using GetNewSegmentCallback = std::function<void*()>;
+
 class Topic{
 	public:
-		Topic(CXLManager &cxl_manager, char topic_name[32], int broker_id);
+		Topic(void* TInode_addr, const char* topic_name, int broker_id);
+
+		// Delete copy contstructor and copy assignment operator
+		Topic(const Topic &) = delete;
+		Topic& operator=(const Topic &) = delete;
+
 		void PublishToCXL(void* message, size_t size);
 
 	private:
-		CXLManager &cxl_manager_;
-		char* topic_name_;
+		//const GetNewSegmentCallback get_new_segment_callback_;
+		const char* topic_name_;
 		int broker_id_;
 		struct TInode *tinode_;
 		
@@ -39,7 +46,12 @@ class Topic{
 
 class TopicManager{
 	public:
-		void CreateNewTopic(char topic[32]);
+		TopicManager(CXLManager &cxl_manager, int broker_id):
+									cxl_manager_(cxl_manager),
+									broker_id_(broker_id){
+			std::cout << "Topic Manager Initialized" << std::endl;
+		}
+		void CreateNewTopic(const char topic[32]);
 		void DeleteTopic(char topic[32]);
 		void PublishToCXL(char topic[32], void* message, size_t size);
 
@@ -48,8 +60,10 @@ class TopicManager{
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
 		}
 
+		CXLManager &cxl_manager_;
 		static const std::hash<std::string> topic_to_idx_;
-		std::map<std::string, Topic> topics_;
+		std::map<std::string, std::unique_ptr<Topic> > topics_;
+		int broker_id_;
 		//absl::flat_hash_set<std::string, Topic> topics_;
 };
 

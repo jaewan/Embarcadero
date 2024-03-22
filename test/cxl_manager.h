@@ -29,9 +29,14 @@ struct publish_request{
 
 struct TInode{
 	char topic[32];
-	int ordered_offset_per_broker[NUM_BROKERS];
-	int written_offset_per_broker[NUM_BROKERS];
-	void* per_broker_log[NUM_BROKERS];
+	// Align and pad to 64B cacheline
+	struct alignas(64) offset_entry {
+    size_t ordered;
+    size_t written;
+    void* log_addr;
+    char _padding[64 - (sizeof(size_t) * 2 + sizeof(void*))]; 
+	};
+	offset_entry offsets[NUM_BROKERS];
 };
 
 struct MessageHeader{
@@ -41,7 +46,7 @@ struct MessageHeader{
 
 class CXLManager{
 	public:
-		CXLManager();
+		CXLManager(int broker_id);
 		~CXLManager();
 		void* Get_tinode(const char* topic, int broker_num);
 		void SetTopicManager(TopicManager *topic_manager){
@@ -53,8 +58,10 @@ class CXLManager{
 			queueCondVar_.notify_one(); 
 		}
 		void* GetNewSegment();
+		void* GetTInode(const char* topic, int broker_num);
 
 	private:
+		int broker_id_;
 		//TODO(Erika) Replace this queue, mutex, and condition variable with folly MPMC.
 		// We may not even want this thread model and rely on folly IOThreadPoolExecutor
 		std::queue<publish_request> requestQueue_;
@@ -66,8 +73,11 @@ class CXLManager{
 		CXL_Type cxl_type_;
 		int cxl_emul_fd_;
 		void* cxl_addr_;
+		void* bitmap_;
+		void* segments_;
 		void* current_log_addr_;
 		bool stop_threads_ = false;
+		std::atomic<int> thread_count_{0};
 
 		void CXL_io_thread();
 };
