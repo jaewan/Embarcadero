@@ -49,22 +49,38 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n)
 	memcpy(dst, src, n);
 }
 
+void TopicManager::CreateNewTopic(const char topic[32]){
+	// Get and initialize tinode
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic, broker_id_);
+	memcpy(tinode->topic, topic, 32);
+	tinode->offsets[broker_id_].ordered = 0;
+	tinode->offsets[broker_id_].written = 0;
+	tinode->offsets[broker_id_].log_addr = cxl_manager_.GetNewSegment();
+
+	//TODO(Jae) topics_ should be in a critical section
+	// But addition and deletion of a topic in our case is rare
+	// We will leave it this way for now but this needs to be fixed
+	topics_[topic] = std::make_unique<Topic>(tinode, topic, broker_id_);
+}
+
+void TopicManager::DeleteTopic(char topic[32]){
+}
+
 void TopicManager::PublishToCXL(char topic[32], void* message, size_t size){
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()){
 		perror("Topic not found");
 	}
-	topic_itr->second.PublishToCXL(message, size);
+	topic_itr->second->PublishToCXL(message, size);
 }
 
-Topic::Topic(CXLManager &cxl_manager, char topic_name[32], int broker_id):
-cxl_manager_(cxl_manager),
-topic_name_(topic_name),
-broker_id_(broker_id){
-	tinode_ = (struct TInode*)cxl_manager_.Get_tinode(topic_name_, broker_id_);
+Topic::Topic(void* TInode_addr, const char* topic_name, int broker_id):
+						tinode_(static_cast<struct TInode*>(TInode_addr)),
+						topic_name_(topic_name),
+						broker_id_(broker_id){
 	logical_offset_ = 0;
 	written_logical_offset_ = 0;
-	log_addr_ = tinode_->per_broker_log[broker_id_];
+	log_addr_ = tinode_->offsets[broker_id_].log_addr;
 
 	//TODO(Jae)
 	// have cache on disk as well
@@ -84,7 +100,7 @@ void Topic::PublishToCXL(void* message, size_t size){
 			log = log_addr_;
 			log_addr_ = (uint8_t*)log_addr_ + size;
 		}else{
-			log = cxl_manager_.GetNewSegment();
+			//log = get_new_segment_callback_();
 			log_addr_ = (uint8_t*)log + size;
 			remaining_size_ = SEGMENT_SIZE;
 		}
