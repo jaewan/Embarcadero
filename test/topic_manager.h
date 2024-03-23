@@ -18,7 +18,8 @@ using GetNewSegmentCallback = std::function<void*()>;
 
 class Topic{
 	public:
-		Topic(void* TInode_addr, const char* topic_name, int broker_id);
+		Topic(GetNewSegmentCallback get_new_segment_callback, 
+				void* TInode_addr, const char* topic_name, int broker_id);
 
 		// Delete copy contstructor and copy assignment operator
 		Topic(const Topic &) = delete;
@@ -27,8 +28,8 @@ class Topic{
 		void PublishToCXL(void* message, size_t size);
 
 	private:
-		//const GetNewSegmentCallback get_new_segment_callback_;
-		const char* topic_name_;
+		const GetNewSegmentCallback get_new_segment_callback_;
+		std::string topic_name_;
 		int broker_id_;
 		struct TInode *tinode_;
 		
