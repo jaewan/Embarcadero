@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <thread>
+#include <iostream>
 
 namespace Embarcadero{
 

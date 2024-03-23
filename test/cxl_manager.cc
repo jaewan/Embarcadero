@@ -43,7 +43,6 @@ CXLManager::CXLManager(int broker_id):
 	// Create CXL I/O threads
 	for (int i=0; i< NUM_CXL_IO_THREADS; i++)
 		threads_.emplace_back(&CXLManager::CXL_io_thread, this);
-	std::cout<< "Started threads:" << NUM_CXL_IO_THREADS << std::endl;
 
 	// Initialize CXL memory regions
 	size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC;
@@ -62,8 +61,25 @@ CXLManager::CXLManager(int broker_id):
 }
 
 CXLManager::~CXLManager(){
+	std::cout << "Starting CXLManager destructor" << std::endl;
 	//TODO(Jae) this is only for internal test. Remove this later
 	while(!requestQueue_.empty()){}
+	std::cout << "\t requestQueue_ is empty" << std::endl;
+
+	// Stop IO threads
+	{
+		std::lock_guard<std::mutex> lock(queueMutex_);
+		stop_threads_ = true;
+		queueCondVar_.notify_all(); 
+	}
+	std::cout << "\t Notified threads to stop" << std::endl;
+
+	for(std::thread& thread : threads_){
+		if(thread.joinable()){
+			thread.join();
+		}
+	}
+
 	// Close CXL emulation
 	switch(cxl_type_){
 		case Emul:
@@ -77,19 +93,6 @@ CXLManager::~CXLManager(){
 			perror("Not implemented real cxl yet");
 			break;
 	}
-
-	// Stop IO threads
-	{
-		std::lock_guard<std::mutex> lock(queueMutex_);
-		stop_threads_ = true;
-		queueCondVar_.notify_all(); 
-	}
-
-	for(std::thread& thread : threads_){
-		if(thread.joinable()){
-			thread.join();
-		}
-	}
 }
 
 void CXLManager::CXL_io_thread(){
@@ -98,13 +101,12 @@ void CXLManager::CXL_io_thread(){
 		// Sleep until a request is popped from the requestQueue
 		struct publish_request req;
 		{
-			std::cout << " IO thread going to sleep" << std::endl;
+			std::cout << std::this_thread::get_id() <<" IO thread going to sleep" << std::endl;
 			std::unique_lock<std::mutex> lock(queueMutex_);
 			queueCondVar_.wait(lock, [this] {return !requestQueue_.empty() || stop_threads_;});
-			std::cout << " IO thread woke up" << std::endl;
+			std::cout << std::this_thread::get_id() << " woke up stop_threads:" << stop_threads_ << std::endl;
 			if(stop_threads_)
 				break;
-			std::cout << requestQueue_.empty() << " from IO thread" << std::endl;
 			req = requestQueue_.front();
 			requestQueue_.pop();
 		}
@@ -132,25 +134,32 @@ void* CXLManager::GetTInode(const char* topic, int broker_num){
 }
 
 void* CXLManager::GetNewSegment(){
-	return nullptr;
+	static std::atomic<int> segment_count{0};
+	int offset = segment_count.fetch_and(1, std::memory_order_relaxed);
+
+	//TODO(Jae) Implement bitmap
+	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
 }
 
 
 } // End of namespace Embarcadero
 
+#define NUM 2
+
 int main(){
 	int broker_id = 0;
 	char topic[32];
+	memset(topic, 0, 32);
 	topic[0] = '0';
 	Embarcadero::CXLManager cxl_manager = Embarcadero::CXLManager(broker_id);
 	Embarcadero::TopicManager topic_manager = Embarcadero::TopicManager(cxl_manager, broker_id);
 	cxl_manager.SetTopicManager(&topic_manager);
 	topic_manager.CreateNewTopic(topic);
 
-	int num = 1;
-	Embarcadero::publish_request req[1];
-	for(int i=0; i<num; i++){
+	Embarcadero::publish_request req[NUM];
+	for(int i=0; i<NUM; i++){
 		size_t size = (1UL<<20);
+		memset(req[i].topic, 0, 32);
 		req[i].topic[0] = '0';
 		req[i].counter = new std::atomic<int>(1);
 		req[i].payload_address = malloc(size);
@@ -159,9 +168,10 @@ int main(){
 	}
 	sleep(1);
 
-	for(int i=0; i<num; i++){
+	for(int i=0; i<NUM; i++){
 		cxl_manager.EnqueueRequest(req[i]);
 	}
+	sleep(9);
 
 	return 0;
 }

@@ -60,7 +60,8 @@ void TopicManager::CreateNewTopic(const char topic[32]){
 	//TODO(Jae) topics_ should be in a critical section
 	// But addition and deletion of a topic in our case is rare
 	// We will leave it this way for now but this needs to be fixed
-	topics_[topic] = std::make_unique<Topic>(tinode, topic, broker_id_);
+	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
+			tinode, topic, broker_id_);
 }
 
 void TopicManager::DeleteTopic(char topic[32]){
@@ -74,16 +75,17 @@ void TopicManager::PublishToCXL(char topic[32], void* message, size_t size){
 	topic_itr->second->PublishToCXL(message, size);
 }
 
-Topic::Topic(void* TInode_addr, const char* topic_name, int broker_id):
+Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const char* topic_name, int broker_id):
+						get_new_segment_callback_(get_new_segment),
 						tinode_(static_cast<struct TInode*>(TInode_addr)),
 						topic_name_(topic_name),
 						broker_id_(broker_id){
 	logical_offset_ = 0;
 	written_logical_offset_ = 0;
+	remaining_size_ = SEGMENT_SIZE;
 	log_addr_ = tinode_->offsets[broker_id_].log_addr;
 
-	//TODO(Jae)
-	// have cache on disk as well
+	//TODO(Jae) have cache for disk as well
 }
 
 void Topic::PublishToCXL(void* message, size_t size){
@@ -96,13 +98,13 @@ void Topic::PublishToCXL(void* message, size_t size){
 		logical_offset = logical_offset_;
 		logical_offset_++;
 		remaining_size_ -= size;
-		if(remaining_size_ < 0){
+		if(remaining_size_ >= 0){
 			log = log_addr_;
 			log_addr_ = (uint8_t*)log_addr_ + size;
 		}else{
-			//log = get_new_segment_callback_();
+			log = get_new_segment_callback_();
 			log_addr_ = (uint8_t*)log + size;
-			remaining_size_ = SEGMENT_SIZE;
+			remaining_size_ = SEGMENT_SIZE - size;
 		}
 		writing_offsets_.insert(logical_offset);
 	}
@@ -118,7 +120,7 @@ void Topic::PublishToCXL(void* message, size_t size){
 				not_contigous_.pop();
 				written_logical_offset_++;
 			}
-			//TODO(Jae) write to cxl written offset
+			tinode_->offsets[broker_id_].written = written_logical_offset_;
 		}else{
 			not_contigous_.push(logical_offset);
 		}
