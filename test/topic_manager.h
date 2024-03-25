@@ -29,7 +29,7 @@ class Topic{
 
 		void PublishToCXL(void* message, size_t size);
 		bool GetMessageAddr(size_t &last_offset,
-												void* last_addr, void* messages, size_t &messages_size);
+												void* &last_addr, void* messages, size_t &messages_size);
 
 	private:
 		const GetNewSegmentCallback get_new_segment_callback_;
@@ -69,7 +69,7 @@ class TopicManager{
 		void DeleteTopic(char topic[32]);
 		void PublishToCXL(char topic[32], void* message, size_t size);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
-												void* last_addr, void* messages, size_t &messages_size);
+												void* &last_addr, void* messages, size_t &messages_size);
 
 	private:
 		int GetTopicIdx(char topic[32]){

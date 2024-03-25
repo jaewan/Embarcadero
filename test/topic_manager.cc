@@ -78,7 +78,7 @@ void TopicManager::PublishToCXL(char topic[32], void* message, size_t size){
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
-																	void* last_addr, void* messages, size_t &messages_size){
+																	void* &last_addr, void* messages, size_t &messages_size){
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()){
 		perror("Topic not found");
@@ -96,7 +96,6 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 	logical_offset_ = 0;
 	written_logical_offset_ = -1;
 	remaining_size_ = SEGMENT_SIZE - sizeof(void*);
-	std::cout << "Initial remaining size is:" << remaining_size_ << std::endl;
 	log_addr_ = tinode_->offsets[broker_id_].log_addr;
 	first_message_addr_ = tinode_->offsets[broker_id_].log_addr;
 	ordered_offset_addr_ = nullptr;
@@ -109,7 +108,6 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 void Topic::PublishToCXL(void* message, size_t size){
 	void* log;
 	int logical_offset;
-	static int caller=1;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 	{
 		//absl::MutexLock lock(&mu_);
@@ -145,30 +143,33 @@ void Topic::PublishToCXL(void* message, size_t size){
 		std::unique_lock<std::mutex> lock(mu_);
 		if (*(writing_offsets_.begin()++) == logical_offset){
 			struct MessageHeader *tmp_header = (struct MessageHeader*)log;
-			size_t written_size = msg_header_size + tmp_header->size;
+			if(written_logical_offset_ != (logical_offset-1)){
+				perror(" !!!!!!!!!!!!!!!!!!!!!!  write logic is wrong !!!!!!!!!!!!!!!!!!\n");
+			}
 			written_logical_offset_ = logical_offset;
-			void* current_segment = tmp_header->segment_header;
-			struct MessageHeader *prev_tmp_header=nullptr;
-			while(!not_contigous_.empty() && not_contigous_.top() == written_logical_offset_ + 1){
+
+			struct MessageHeader **current_segment_header= (struct MessageHeader**)tmp_header->segment_header;
+			struct MessageHeader *prev_tmp_header=tmp_header;
+			tmp_header = (struct MessageHeader*)tmp_header->next_message;
+			
+			// This is to record last message in the segment header if write goes beyond a segment
+			// We have not tested it over 2 segments. If concurrent writes go beyond 2 segments it will
+			// cause bugs
+			while(!not_contigous_.empty() && not_contigous_.top() == (written_logical_offset_ + 1)){
 				not_contigous_.pop();
 				written_logical_offset_++;
-				written_size += msg_header_size + tmp_header->size;
-				if(ORDER_LEVEL==1 && prev_tmp_header && prev_tmp_header->segment_header != tmp_header->segment_header){
-					(*(struct MessageHeader**)prev_tmp_header->segment_header) = prev_tmp_header;
+				if(tmp_header->segment_header != (void*)current_segment_header){
+					(*current_segment_header) = prev_tmp_header;
+					current_segment_header = (struct MessageHeader **)tmp_header->segment_header;
 				}
 				prev_tmp_header = tmp_header;
-				//TODO(Remove this after implementing ordered)
 				tmp_header = (struct MessageHeader*)tmp_header->next_message;
 			}
-			if (ORDER_LEVEL == 1){
-				struct MessageHeader** last_msg = (struct MessageHeader**)segment_metadata_;
-				*last_msg = (struct MessageHeader*)((uint8_t*)log + written_size);
-			}
-			std::cout << "\tlog " << log << " written_physical_addr_" << written_physical_addr_ <<std::endl;
-			written_physical_addr_ = (uint8_t*)log + written_size;
-			std::cout << "\twritten_size: " << written_size << " written_physical_addr_:" << written_physical_addr_ << " written: " << ((uint8_t*)written_physical_addr_ - (uint8_t*)first_message_addr_) <<std::endl;
+			(*current_segment_header) = prev_tmp_header;
+			written_physical_addr_ = (uint8_t*)(*current_segment_header) + (*current_segment_header)->size + msg_header_size;
 			tinode_->offsets[broker_id_].written = written_logical_offset_;
 		}else{
+			// Writes from smaller logical offset is not updated yet
 			not_contigous_.push(logical_offset);
 		}
 		writing_offsets_.erase(logical_offset);
@@ -184,14 +185,15 @@ void Topic::PublishToCXL(void* message, size_t size){
 // if the messages to export go over the segment boundary (not-contiguous), 
 // we should call this functiona again
 bool Topic::GetMessageAddr(size_t &last_offset,
-														void* last_addr, void* messages, size_t &messages_size){
+														void* &last_addr, void* messages, size_t &messages_size){
 	static size_t header_size = sizeof(struct MessageHeader);
 	//TODO(Jae) replace this line after test
 	//if(writing_offsets_ < tinode_->ordered)
 	if(written_logical_offset_ < last_offset){
+		std::cout << std::endl << std::endl << 
+				"[Topic::GetMessageAddr] Subscriber is up-to-date written logical offset:" << written_logical_offset_ << " last_offset:" << last_offset;
 		return false;
 	}
-	std::cout << "written_logical_offset_:"<< written_logical_offset_ << " last_offset:"<< last_offset << std::endl;
 	size_t subscriber_offset = last_offset;
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
@@ -201,12 +203,6 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		start_msg_header = (struct MessageHeader*)first_message_addr_;
 	}
 
-	std::cout << "addr:" << start_msg_header << std::endl;
-	std::cout << "size:" << start_msg_header->size << std::endl;
-	std::cout << "segmentMetadata:" << start_msg_header->segment_header << std::endl;
-	std::cout << "segmentMetadata:" << *((void**)start_msg_header->segment_header) << std::endl;
-
-	std::cout << "1" << std::endl;
 	messages = (void*)start_msg_header;
 	struct MessageHeader** segment_header = (struct MessageHeader**)start_msg_header->segment_header;
 	struct MessageHeader *last_msg_of_segment =(*segment_header);
@@ -214,20 +210,14 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		last_addr = nullptr; 
 		messages_size = ((uint8_t*)written_physical_addr_ - (uint8_t*)start_msg_header);
 	}else{
-		std::cout << "2.1" << std::endl;
 		messages_size =((uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header) + last_msg_of_segment->size + header_size; 
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
-		std::cout << last_addr << std::endl;
 	}
-	std::cout << "3" << std::endl;
 
 	struct MessageHeader *m = (struct MessageHeader*)messages;
 	size_t len = messages_size;
-	std::cout<<"len is " << len <<  std::endl;
-	std::cout<<"Message Header Size " << header_size <<  std::endl;
 	while(len>0){
-		std::cout << (void*)m << " len:" << len << " size:" << m->size << std::endl;
 		char* msg = (char*)((uint8_t*)m + header_size);
 		len -= header_size;
 		std::cout<< msg << std::endl;
