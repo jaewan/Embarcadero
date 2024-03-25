@@ -161,8 +161,9 @@ int main(){
 	topic_manager.CreateNewTopic(topic);
 
 	Embarcadero::publish_request req[NUM];
+	size_t size = (1UL<<20);
+
 	for(int i=0; i<NUM; i++){
-		size_t size = (1UL<<20);
 		memset(req[i].topic, 0, 32);
 		req[i].topic[0] = '0';
 		req[i].counter = new std::atomic<int>(1);
@@ -170,20 +171,17 @@ int main(){
 		memcpy(req[i].payload_address, "PublishTest", 11);
 		req[i].size = size;
 	}
-	sleep(1);
 
 	for(int i=0; i<NUM; i++){
 		cxl_manager.EnqueueRequest(req[i]);
 	}
 	sleep(5);
 
-	/*
 	void* last_addr = nullptr;
 	void* messages = nullptr;
 	size_t messages_size;
 	size_t last_offset = 0;
 	cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
-	*/
 
 	return 0;
 }
