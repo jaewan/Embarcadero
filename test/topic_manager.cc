@@ -119,13 +119,13 @@ void Topic::PublishToCXL(void* message, size_t size){
 		}else{
 			segment_metadata_ = get_new_segment_callback_();
 			log = (uint8_t*)segment_metadata_ + sizeof(void*);
-			if(prev_msg_header_ != nullptr)
-				prev_msg_header_->next_message = log;
-			else
-				perror("Increase the segment size. Only one message fits in a segment");
 			log_addr_ = (uint8_t*)log + size + msg_header_size;
 			remaining_size_ = SEGMENT_SIZE - size - msg_header_size - sizeof(void*);
 		}
+		if(prev_msg_header_ != nullptr)
+			prev_msg_header_->next_message = log;
+		else
+			perror("Increase the segment size. Only one message fits in a segment");
 		prev_msg_header_ = (struct MessageHeader*)log;
 		writing_offsets_.insert(logical_offset);
 	}
@@ -137,16 +137,22 @@ void Topic::PublishToCXL(void* message, size_t size){
 
 	nt_memcpy(log, &msg_header, sizeof(msg_header));
 	nt_memcpy((uint8_t*)log + msg_header_size, message, size);
+	std::cout << "wrote to " << log << std::endl;
 
 	{
 		//absl::MutexLock lock(&mu_);
 		std::unique_lock<std::mutex> lock(mu_);
 		if (*(writing_offsets_.begin()++) == logical_offset){
+			struct MessageHeader *tmp_header = (struct MessageHeader*)log;
+			size_t written_size = msg_header_size + tmp_header->size;
 			written_logical_offset_ = logical_offset;
 			while(!not_contigous_.empty() && not_contigous_.top() == written_logical_offset_ + 1){
 				not_contigous_.pop();
 				written_logical_offset_++;
+				written_size += msg_header_size + tmp_header->size;
+				tmp_header = (struct MessageHeader*)tmp_header->next_message;
 			}
+			written_physical_addr_ = (uint8_t*)log + written_size;
 			tinode_->offsets[broker_id_].written = written_logical_offset_;
 		}else{
 			not_contigous_.push(logical_offset);
@@ -154,6 +160,15 @@ void Topic::PublishToCXL(void* message, size_t size){
 		writing_offsets_.erase(logical_offset);
 	}
 }
+
+// Current implementation depends on the subscriber knows the physical address of last fetched message
+// This is only true if the messages were exported from CXL. If we implement disk cache optimization, 
+// we need to fix it. Probably need to have some sort of indexing or call this method to get indexes
+// even if at cache hit (without sending the messages)
+//
+// arguments: do not call this function again if this variable is nullptr
+// if the messages to export go over the segment boundary (not-contiguous), 
+// we should call this functiona again
 bool Topic::GetMessageAddr(size_t &last_offset,
 														void* last_addr, void* messages, size_t &messages_size){
 	//TODO(Jae) replace this line after test
@@ -162,26 +177,37 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		return false;
 	}
 	size_t subscriber_offset = last_offset;
-	if(last_offset == 0){
-		last_addr = first_message_addr_;
-	}
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
-	if(start_msg_header->next_message != nullptr){
+	if(last_addr != nullptr){
 		start_msg_header = (struct MessageHeader*)start_msg_header->next_message;
 	}else{
-		perror("GetMessageAddr Something's wrong. Message header not set");
-		return false;
+		start_msg_header = (struct MessageHeader*)first_message_addr_;
 	}
+
 	messages = (void*)start_msg_header;
 	messages_size = ((uint8_t*)written_physical_addr_ - (uint8_t*)start_msg_header);
+
+	std::cout << "\t\t written_physical_addr_: " << written_physical_addr_ << std::endl;
+
 	if(messages_size < (2*SEGMENT_SIZE)){
-		return true;
+		last_addr = nullptr; 
 	}else{
 		struct MessageHeader* last_msg_header = (struct MessageHeader*)(start_msg_header->segment_header);
 		messages_size =((uint8_t*)last_msg_header - (uint8_t*)start_msg_header) + last_msg_header->size; 
 		last_offset = last_msg_header->logical_offset;
 		last_addr = (void*)last_msg_header;
+	}
+
+	struct MessageHeader *m = (struct MessageHeader*)messages;
+	size_t len = messages_size;
+		std::cout<<"len is " << len <<  std::endl;
+	while(len>0){
+		char* msg = (char*)((uint8_t*)m + sizeof(struct MessageHeader));
+		len -= sizeof(struct MessageHeader);
+		std::cout<< msg << std::endl;
+		len -= m->size;
+		m =  (struct MessageHeader*)m->next_message;
 	}
 
 	return true;
