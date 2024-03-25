@@ -64,7 +64,6 @@ CXLManager::~CXLManager(){
 	std::cout << "Starting CXLManager destructor" << std::endl;
 	//TODO(Jae) this is only for internal test. Remove this later
 	while(!requestQueue_.empty()){}
-	std::cout << "\t requestQueue_ is empty" << std::endl;
 
 	// Stop IO threads
 	{
@@ -72,7 +71,6 @@ CXLManager::~CXLManager(){
 		stop_threads_ = true;
 		queueCondVar_.notify_all(); 
 	}
-	std::cout << "\t Notified threads to stop" << std::endl;
 
 	for(std::thread& thread : threads_){
 		if(thread.joinable()){
@@ -101,10 +99,10 @@ void CXLManager::CXL_io_thread(){
 		// Sleep until a request is popped from the requestQueue
 		struct publish_request req;
 		{
-			std::cout << std::this_thread::get_id() <<" IO thread going to sleep" << std::endl;
+			//std::cout << std::this_thread::get_id() <<" IO thread going to sleep" << std::endl;
 			std::unique_lock<std::mutex> lock(queueMutex_);
 			queueCondVar_.wait(lock, [this] {return !requestQueue_.empty() || stop_threads_;});
-			std::cout << std::this_thread::get_id() << " woke up stop_threads:" << stop_threads_ << std::endl;
+			//std::cout << std::this_thread::get_id() << " woke up stop_threads:" << stop_threads_ << std::endl;
 			if(stop_threads_)
 				break;
 			req = requestQueue_.front();
@@ -136,7 +134,9 @@ void* CXLManager::GetTInode(const char* topic, int broker_num){
 void* CXLManager::GetNewSegment(){
 	static std::atomic<int> segment_count{0};
 	int offset = segment_count.fetch_add(1, std::memory_order_relaxed);
+	void* segment = ((uint8_t*)segments_ + offset*SEGMENT_SIZE);
 
+	std::cout << "[GetNewSegment] base: " << segments_ << " allocated:" << segment << std::endl;
 	//TODO(Jae) Implement bitmap
 	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
 }
@@ -148,7 +148,7 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 
 } // End of namespace Embarcadero
 
-#define NUM 2
+#define NUM 3
 
 int main(){
 	int broker_id = 0;
@@ -182,6 +182,10 @@ int main(){
 	size_t messages_size;
 	size_t last_offset = 0;
 	cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
+	std::cout << "!!!!!!!!!!Returned!!!!!!!" << std::endl;
+	if(last_addr != nullptr){
+		cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
+	}
 
 	return 0;
 }

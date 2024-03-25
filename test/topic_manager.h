@@ -8,7 +8,8 @@
 
 #define SKIP_SIZE 4
 #define MAX_TOPIC_SIZE 4
-#define SEGMENT_SIZE (1UL<<30)
+//#define SEGMENT_SIZE (1UL<<30)
+#define SEGMENT_SIZE 2621440
 
 namespace Embarcadero{
 
@@ -39,7 +40,7 @@ class Topic{
 		
 		int logical_offset_;
 		int written_logical_offset_;
-		size_t remaining_size_;
+		long long remaining_size_;
 		void* log_addr_;
 		void* written_physical_addr_;
 		struct MessageHeader *prev_msg_header_;
@@ -50,7 +51,7 @@ class Topic{
 
 		//TInode cache
 		void* ordered_offset_addr_;
-		void* segment_metadata_;
+		struct MessageHeader** segment_metadata_;
 		size_t ordered_offset_;
 
 		//absl::mutex mu_;

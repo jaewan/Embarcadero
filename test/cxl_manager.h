@@ -57,6 +57,7 @@ struct NonCriticalMessageHeader{
 	size_t size;
 	void* segment_header;
 };
+
 struct MessageHeader{
 	size_t logical_offset;
 	size_t total_order;
