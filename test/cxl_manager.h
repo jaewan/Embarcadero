@@ -18,6 +18,17 @@ class TopicManager;
 
 enum CXL_Type {Emul, Real};
 
+/* CXL memory layout
+ *
+ * CXL is composed of three components; TINode, Bitmap, Segments
+ * TINode region: First sizeof(TINode) * MAX_TOPIC
+ * + Padding to make each region be aligned in cacheline
+ * Bitmap region: Cacheline_size * NUM_BROKERS
+ * Segment region: Rest. It is allocated to each brokers equally according to broker_id
+ * 		Segment: 8Byte of segment metadata to store address of last ordered_offset from the segment, messages
+ * 			Message: Header + paylod
+ */
+
 struct publish_request{
 	int client_id;
 	int request_id;
@@ -40,9 +51,18 @@ struct TInode{
 	offset_entry offsets[NUM_BROKERS];
 };
 
+struct NonCriticalMessageHeader{
+	size_t logical_offset;
+	size_t total_order;
+	size_t size;
+	void* segment_header;
+};
 struct MessageHeader{
-	void* skip_idx[4];
-	int order;
+	size_t logical_offset;
+	size_t total_order;
+	size_t size;
+	void* segment_header;
+	void* next_message;
 };
 
 class CXLManager{
@@ -60,6 +80,8 @@ class CXLManager{
 		}
 		void* GetNewSegment();
 		void* GetTInode(const char* topic, int broker_num);
+		bool GetMessageAddr(const char* topic, size_t &last_offset,
+												void* last_addr, void* messages, size_t &messages_size);
 
 	private:
 		int broker_id_;
