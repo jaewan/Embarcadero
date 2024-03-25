@@ -136,13 +136,12 @@ void* CXLManager::GetNewSegment(){
 	int offset = segment_count.fetch_add(1, std::memory_order_relaxed);
 	void* segment = ((uint8_t*)segments_ + offset*SEGMENT_SIZE);
 
-	std::cout << "[GetNewSegment] base: " << segments_ << " allocated:" << segment << std::endl;
 	//TODO(Jae) Implement bitmap
 	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
 }
 
 bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
-																void* last_addr, void* messages, size_t &messages_size){
+																void* &last_addr, void* messages, size_t &messages_size){
 	return topic_manager_->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
 }
 
@@ -175,16 +174,19 @@ int main(){
 	for(int i=0; i<NUM; i++){
 		cxl_manager.EnqueueRequest(req[i]);
 	}
-	sleep(5);
+	sleep(3);
 
 	void* last_addr = nullptr;
 	void* messages = nullptr;
 	size_t messages_size;
 	size_t last_offset = 0;
 	cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
-	std::cout << "!!!!!!!!!!Returned!!!!!!!" << std::endl;
 	if(last_addr != nullptr){
 		cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
+	}else{
+		std::cout << "!!!!!!!!!!Returned nullptr !!!!!!" << std::endl;
+		std::cout << last_addr << std::endl;
+		std::cout << last_offset << std::endl;
 	}
 
 	return 0;
