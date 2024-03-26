@@ -1,7 +1,7 @@
 #ifndef INCLUDE_CXL_MANGER_H_
 #define INCLUDE_CXL_MANGER_H_
 
-#include "config.h"
+#include "common/config.h"
 
 namespace Embarcadero{
 
