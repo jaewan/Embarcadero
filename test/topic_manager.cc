@@ -73,8 +73,10 @@ void TopicManager::PublishToCXL(char topic[32], void* message, size_t size){
 	auto topic_itr = topics_.find(topic);
 	//TODO(Jae) if not found from topics_, inspect CXL TInode region too
 	if (topic_itr == topics_.end()){
-		if(memcmp(topic, ((struct TInode*)(cxl_manager_.GetTInode(topic)))->topic, 32));
-		perror("Topic not found");
+		if(memcmp(topic, ((struct TInode*)(cxl_manager_.GetTInode(topic)))->topic, 32) == 0){
+		}else{
+			perror("Topic not found");
+		}
 	}
 	topic_itr->second->PublishToCXL(message, size);
 }
