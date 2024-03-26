@@ -54,6 +54,11 @@ CXLManager::CXLManager(int broker_id):
 	bitmap_ = (uint8_t*)cxl_addr_ + TINode_Region_size;
 	segments_ = (uint8_t*)bitmap_ + ((broker_id_)*Segment_Region_size);
 
+	// Head node initialize the CXL
+	if(broker_id_ == 0){
+		memset(cxl_addr_, 0, TINode_Region_size);
+	}
+
 	// Wait untill al IO threads are up
 	while(thread_count_.load() != NUM_CXL_IO_THREADS){}
 
@@ -124,7 +129,7 @@ void CXLManager::CXL_io_thread(){
 	}
 }
 
-void* CXLManager::GetTInode(const char* topic, int broker_num){
+void* CXLManager::GetTInode(const char* topic){
 	// Convert topic to tinode address
 	static const std::hash<std::string> topic_to_idx;
 	int TInode_idx = topic_to_idx(topic) % MAX_TOPIC;
