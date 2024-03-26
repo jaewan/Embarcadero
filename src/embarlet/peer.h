@@ -7,7 +7,7 @@
 #include <peer.grpc.pb.h>
 #include <thread>
 #include <boost/asio.hpp>
-#include "../config.h"
+#include "common/config.h"
 
 /// Class for a single broker
 class PeerBroker : public Peer::Service {
