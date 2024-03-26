@@ -80,7 +80,7 @@ class CXLManager{
 			queueCondVar_.notify_one(); 
 		}
 		void* GetNewSegment();
-		void* GetTInode(const char* topic, int broker_num);
+		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 

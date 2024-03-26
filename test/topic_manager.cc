@@ -53,7 +53,7 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n)
 void TopicManager::CreateNewTopic(const char topic[32]){
 	// Get and initialize tinode
 	void* segment_metadata = cxl_manager_.GetNewSegment();
-	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic, broker_id_);
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	memcpy(tinode->topic, topic, 32);
 	tinode->offsets[broker_id_].ordered = 0;
 	tinode->offsets[broker_id_].written = 0;
@@ -71,7 +71,9 @@ void TopicManager::DeleteTopic(char topic[32]){
 
 void TopicManager::PublishToCXL(char topic[32], void* message, size_t size){
 	auto topic_itr = topics_.find(topic);
+	//TODO(Jae) if not found from topics_, inspect CXL TInode region too
 	if (topic_itr == topics_.end()){
+		if(memcmp(topic, ((struct TInode*)(cxl_manager_.GetTInode(topic)))->topic, 32));
 		perror("Topic not found");
 	}
 	topic_itr->second->PublishToCXL(message, size);
