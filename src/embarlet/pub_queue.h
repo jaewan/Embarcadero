@@ -6,6 +6,7 @@
 
 // local includes
 #include "pub_task.h"
+#include <atomic>
 
 // defines
 #define PUB_QUEUE_CAPACITY 1024 // TODO: is this bytes or slots? Need to double check.

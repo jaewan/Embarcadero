@@ -30,8 +30,7 @@ class DiskManager{
 		void Disk_io_thread();
 
 		std::vector<std::thread> threads_;
-		folly::MPMCQueue<std::optional<struct PublishRequest>> requests_;
-		const std::optional<struct PublishRequest> sentinel = std::nullopt;
+		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
 
 		int log_fd_;
 		std::atomic<int> offset_{0};
