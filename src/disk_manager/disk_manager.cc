@@ -1,20 +1,65 @@
 #include "disk_manager.h"
-#include <sys/mman.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-
 #include <iostream>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
 
 namespace Embarcadero{
 
-#define CXL_SIZE (1UL << 34)
+#define DISK_LOG_PATH "/home/domin/Jae/Embarcadero/.DiskLog/log"
+#define NUM_ACTIVE_POLL 100
+#define NUM_DISK_IO_THREADS 4
 
-DiskManager::DiskManager(){
+DiskManager::DiskManager(size_t queueCapacity):requests_(queueCapacity){
+	//Initialize log file
+	log_fd_ = open(DISK_LOG_PATH, O_RDWR|O_CREAT, 0777);
+	if (log_fd_ < 0){
+		perror("Error in opening a file for disk log\n");
+		std::cout<< strerror(errno) << std::endl;
+	}
+
+	// Create Disk I/O threads
+	for (int i=0; i< NUM_DISK_IO_THREADS; i++)
+		threads_.emplace_back(&DiskManager::Disk_io_thread, this);
+
+	while(thread_count_.load() != NUM_DISK_IO_THREADS){}
+	std::cout << "[DiskManager]: \tCreated" << std::endl;
 }
 
 DiskManager::~DiskManager(){
+	stop_threads_ = true;
+	for (int i=0; i<NUM_DISK_IO_THREADS; i++)
+		requests_.blockingWrite(sentinel);
+
+	close(log_fd_);
+
+	for(std::thread& thread : threads_){
+		if(thread.joinable()){
+			thread.join();
+		}
+	}
+	std::cout << "[DiskManager]: \tDestructed" << std::endl;
+}
+
+void DiskManager::EnqueueRequest(struct PublishRequest req){
+	requests_.blockingWrite(req);
+}
+
+void DiskManager::Disk_io_thread(){
+	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	std::optional<struct PublishRequest> optReq;
+
+	while(!stop_threads_){
+		requests_.blockingRead(optReq);
+		if(!optReq.has_value()){
+			break;
+		}
+		const struct PublishRequest &req = optReq.value();
+		int off = offset_.fetch_add(req.size, std::memory_order_relaxed);
+		pwrite(log_fd_, req.payload_address, req.size, off);
+	}
 }
 
 } // End of namespace Embarcadero
