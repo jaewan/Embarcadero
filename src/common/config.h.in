@@ -3,6 +3,7 @@
 #define Embarcadero_VERSION_MINOR 1
 
 #define NUM_BROKERS 4
+#define LOG_SIZE (1UL<<30)
 
 // Health check configs
 /// The delay to send the first health check

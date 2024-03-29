@@ -14,8 +14,7 @@ namespace Embarcadero{
 #define NUM_CXL_IO_THREADS 2
 #define MAX_TOPIC 4
 
-CXLManager::CXLManager(size_t queueCapacity, int broker_id):
-	requestQueue_(queueCapacity),
+CXLManager::CXLManager(int broker_id):
 	broker_id_(broker_id){
 	// Initialize CXL
 	cxl_type_ = Emul;
@@ -67,10 +66,22 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id):
 }
 
 CXLManager::~CXLManager(){
-	std::optional<struct PublishRequest> sentinel = std::nullopt;
-	stop_threads_ = true;
-	for (int i=0; i<NUM_DISK_IO_THREADS; i++)
-		requestQueue_.blockingWrite(sentinel);
+	std::cout << "Starting CXLManager destructor" << std::endl;
+	//TODO(Jae) this is only for internal test. Remove this later
+	while(!requestQueue_.empty()){}
+
+	// Stop IO threads
+	{
+		std::lock_guard<std::mutex> lock(queueMutex_);
+		stop_threads_ = true;
+		queueCondVar_.notify_all(); 
+	}
+
+	for(std::thread& thread : threads_){
+		if(thread.joinable()){
+			thread.join();
+		}
+	}
 
 	// Close CXL emulation
 	switch(cxl_type_){
@@ -85,26 +96,24 @@ CXLManager::~CXLManager(){
 			perror("Not implemented real cxl yet");
 			break;
 	}
-
-	for(std::thread& thread : threads_){
-		if(thread.joinable()){
-			thread.join();
-		}
-	}
-
-	std::cout << "[CXLManager]: \tDestructed" << std::endl;
 }
 
 void CXLManager::CXL_io_thread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	std::optional<struct PublishRequest> optReq;
-
 	while(!stop_threads_){
-		requestQueue_.blockingRead(optReq);
-		if(!optReq.has_value()){
-			break;
+		// Sleep until a request is popped from the requestQueue
+		struct publish_request req;
+		{
+			//std::cout << std::this_thread::get_id() <<" IO thread going to sleep" << std::endl;
+			std::unique_lock<std::mutex> lock(queueMutex_);
+			queueCondVar_.wait(lock, [this] {return !requestQueue_.empty() || stop_threads_;});
+			//std::cout << std::this_thread::get_id() << " woke up stop_threads:" << stop_threads_ << std::endl;
+			if(stop_threads_)
+				break;
+			req = requestQueue_.front();
+			requestQueue_.pop();
 		}
-		const struct PublishRequest &req = optReq.value();
+
 		// Actual IO to the CXL
 		topic_manager_->PublishToCXL(req.topic, req.payload_address, req.size);
 
@@ -112,7 +121,6 @@ void CXLManager::CXL_io_thread(){
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 		if( counter == 1){
 			free(req.payload_address);
-			free(req.couter);
 		}else if(req.acknowledge){
 			//TODO(Jae)
 			//Enque ack request to network manager
@@ -143,3 +151,48 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 }
 
 } // End of namespace Embarcadero
+
+#define NUM 3
+
+int main(){
+	int broker_id = 0;
+	char topic[32];
+	memset(topic, 0, 32);
+	topic[0] = '0';
+	Embarcadero::CXLManager cxl_manager = Embarcadero::CXLManager(broker_id);
+	Embarcadero::TopicManager topic_manager = Embarcadero::TopicManager(cxl_manager, broker_id);
+	cxl_manager.SetTopicManager(&topic_manager);
+	topic_manager.CreateNewTopic(topic);
+
+	Embarcadero::publish_request req[NUM];
+	size_t size = (1UL<<20);
+
+	for(int i=0; i<NUM; i++){
+		memset(req[i].topic, 0, 32);
+		req[i].topic[0] = '0';
+		req[i].counter = new std::atomic<int>(1);
+		req[i].payload_address = malloc(size);
+		memcpy(req[i].payload_address, "PublishTest", 11);
+		req[i].size = size;
+	}
+
+	for(int i=0; i<NUM; i++){
+		cxl_manager.EnqueueRequest(req[i]);
+	}
+	sleep(3);
+
+	void* last_addr = nullptr;
+	void* messages = nullptr;
+	size_t messages_size;
+	size_t last_offset = 0;
+	cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
+	if(last_addr != nullptr){
+		cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
+	}else{
+		std::cout << "!!!!!!!!!!Returned nullptr !!!!!!" << std::endl;
+		std::cout << last_addr << std::endl;
+		std::cout << last_offset << std::endl;
+	}
+
+	return 0;
+}

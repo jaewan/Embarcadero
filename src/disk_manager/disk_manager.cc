@@ -12,14 +12,13 @@ namespace Embarcadero{
 #define NUM_ACTIVE_POLL 100
 #define NUM_DISK_IO_THREADS 4
 
-DiskManager::DiskManager(size_t queueCapacity):requests_(queueCapacity){
+DiskManager::DiskManager(size_t queueCapacity):requestQueue_(queueCapacity){
 	//Initialize log file
 	log_fd_ = open(DISK_LOG_PATH, O_RDWR|O_CREAT, 0777);
 	if (log_fd_ < 0){
 		perror("Error in opening a file for disk log\n");
 		std::cout<< strerror(errno) << std::endl;
 	}
-
 	// Create Disk I/O threads
 	for (int i=0; i< NUM_DISK_IO_THREADS; i++)
 		threads_.emplace_back(&DiskManager::Disk_io_thread, this);
@@ -29,9 +28,10 @@ DiskManager::DiskManager(size_t queueCapacity):requests_(queueCapacity){
 }
 
 DiskManager::~DiskManager(){
+	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	stop_threads_ = true;
 	for (int i=0; i<NUM_DISK_IO_THREADS; i++)
-		requests_.blockingWrite(sentinel);
+		requestQueue_.blockingWrite(sentinel);
 
 	close(log_fd_);
 
@@ -44,7 +44,7 @@ DiskManager::~DiskManager(){
 }
 
 void DiskManager::EnqueueRequest(struct PublishRequest req){
-	requests_.blockingWrite(req);
+	requestQueue_.blockingWrite(req);
 }
 
 void DiskManager::Disk_io_thread(){
@@ -52,13 +52,24 @@ void DiskManager::Disk_io_thread(){
 	std::optional<struct PublishRequest> optReq;
 
 	while(!stop_threads_){
-		requests_.blockingRead(optReq);
+		requestQueue_.blockingRead(optReq);
 		if(!optReq.has_value()){
 			break;
 		}
 		const struct PublishRequest &req = optReq.value();
 		int off = offset_.fetch_add(req.size, std::memory_order_relaxed);
 		pwrite(log_fd_, req.payload_address, req.size, off);
+
+		// Post I/O work (as disk I/O depend on the same payload)
+		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
+		if( counter == 1){
+			free(req.payload_address);
+			free(req.couter);
+		}else if(req.acknowledge){
+			//TODO(Jae)
+			//Enque ack request to network manager
+			// network_manager_.EnqueueAckRequest();
+		}
 	}
 }
 
