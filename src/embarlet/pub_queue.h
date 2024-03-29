@@ -18,13 +18,4 @@ using PubQueue = folly::MPMCQueue<PubTask*>;
 void pq_enqueue(PubQueue *pq, PubTask *pt);
 void pq_dequeue(PubQueue *pq, PubTask **pt_dest);
 
-struct publish_request{
-	int client_id;
-	int request_id;
-	char topic[32];
-	int offset;
-	std::atomic<int> *counter;
-	void* payload_address;
-};
-
 #endif // _PUB_QUEUE_H_

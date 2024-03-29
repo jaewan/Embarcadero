@@ -19,7 +19,6 @@ DiskManager::DiskManager(size_t queueCapacity):requestQueue_(queueCapacity){
 		perror("Error in opening a file for disk log\n");
 		std::cout<< strerror(errno) << std::endl;
 	}
-
 	// Create Disk I/O threads
 	for (int i=0; i< NUM_DISK_IO_THREADS; i++)
 		threads_.emplace_back(&DiskManager::Disk_io_thread, this);
