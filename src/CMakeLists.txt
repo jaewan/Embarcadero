@@ -10,10 +10,15 @@ configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 add_executable(embarlet 
     embarlet/embarlet.cc
     disk_manager/disk_manager.cc 
+    disk_manager/disk_manager.h 
+    cxl_manager/cxl_manager.cc
+    cxl_manager/cxl_manager.h 
     embarlet/pub_queue.cc 
     embarlet/pub_queue.h 
     embarlet/pub_task.h 
     embarlet/peer.cc
+    embarlet/topic_manager.cc
+    embarlet/topic_manager.h
 )
 
 target_include_directories(embarlet PUBLIC

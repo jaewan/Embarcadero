@@ -8,8 +8,6 @@
 namespace Embarcadero{
 
 #define NT_THRESHOLD 128
-#define ORDER_LEVEL 1
-
 
 void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n)
 {
@@ -58,6 +56,7 @@ void TopicManager::CreateNewTopic(const char topic[32]){
 	tinode->offsets[broker_id_].ordered = 0;
 	tinode->offsets[broker_id_].written = 0;
 	tinode->offsets[broker_id_].log_addr = (uint8_t*)segment_metadata + sizeof(void*);
+	//std::cout << "[TopicManager::CreateNewTopic] created topic:" << topic << std::endl;
 
 	//TODO(Jae) topics_ should be in a critical section
 	// But addition and deletion of a topic in our case is rare
@@ -112,8 +111,7 @@ void Topic::PublishToCXL(void* message, size_t size){
 	int logical_offset;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 	{
-		//absl::MutexLock lock(&mu_);
-		std::unique_lock<std::mutex> lock(mu_);
+		absl::MutexLock lock(&mu_);
 		logical_offset = logical_offset_;
 		logical_offset_++;
 		remaining_size_ -= size - msg_header_size;
@@ -141,8 +139,7 @@ void Topic::PublishToCXL(void* message, size_t size){
 	nt_memcpy((uint8_t*)log + msg_header_size, message, size);
 
 	{
-		//absl::MutexLock lock(&mu_);
-		std::unique_lock<std::mutex> lock(mu_);
+		absl::MutexLock lock(&mu_);
 		if (*(writing_offsets_.begin()++) == logical_offset){
 			struct MessageHeader *tmp_header = (struct MessageHeader*)log;
 			if(written_logical_offset_ != (logical_offset-1)){
@@ -187,16 +184,13 @@ void Topic::PublishToCXL(void* message, size_t size){
 // if the messages to export go over the segment boundary (not-contiguous), 
 // we should call this functiona again
 bool Topic::GetMessageAddr(size_t &last_offset,
-														void* &last_addr, void* messages, size_t &messages_size){
+						   void* &last_addr, void* messages, size_t &messages_size){
 	static size_t header_size = sizeof(struct MessageHeader);
 	//TODO(Jae) replace this line after test
 	//if(writing_offsets_ < tinode_->ordered)
-	if(written_logical_offset_ < last_offset){
-		std::cout << std::endl << std::endl << 
-				"[Topic::GetMessageAddr] Subscriber is up-to-date written logical offset:" << written_logical_offset_ << " last_offset:" << last_offset;
+	if(written_logical_offset_ < (int)last_offset){
 		return false;
 	}
-	size_t subscriber_offset = last_offset;
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
 	if(last_addr != nullptr){

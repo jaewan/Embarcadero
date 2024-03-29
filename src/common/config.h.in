@@ -1,9 +1,19 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+namespace Embarcadero{
 // the configured options and settings for Embarcadero
 #define Embarcadero_VERSION_MAJOR 0.1
 #define Embarcadero_VERSION_MINOR 1
 
+#define ORDER_LEVEL 1
 #define NUM_BROKERS 4
 #define LOG_SIZE (1UL<<30)
+#define MAX_TOPIC_SIZE 4
+#define MAX_TOPIC_NAME_SIZE 32
+#define SEGMENT_SIZE (1UL << 30)
+#define NUM_DISK_IO_THREADS 4
+#define NUM_CXL_IO_THREADS 4
 
 // Health check configs
 /// The delay to send the first health check
@@ -14,3 +24,19 @@
 #define HEALTH_CHECK_TIMEOUT_MS 10000
 /// The threshold for the amount of retries we do before we consider a node dead.
 #define HEALTH_CHECK_FAILURE_THRESHOLD 5
+
+#include <atomic>
+#include <cstddef>
+
+struct PublishRequest{
+	int client_id;
+	int request_id;
+	char topic[MAX_TOPIC_NAME_SIZE];
+	bool acknowledge;
+	std::atomic<int> *counter;
+	void* payload_address;
+	size_t size;
+};
+
+} // End of namespace Embarcadero
+#endif // CONFIG_H

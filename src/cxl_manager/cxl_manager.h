@@ -2,16 +2,12 @@
 #define INCLUDE_CXL_MANGER_H_
 
 
-#include <queue>
-#include <atomic>
-#include <mutex>
-#include <condition_variable>
 #include <thread>
 #include <iostream>
 #include <optional>
 #include "folly/MPMCQueue.h"
 #include "common/config.h"
-#include "topic_manager.h"
+#include "../embarlet/topic_manager.h"
 
 namespace Embarcadero{
 
@@ -31,16 +27,6 @@ enum CXL_Type {Emul, Real};
  * 		Segment: 8Byte of segment metadata to store address of last ordered_offset from the segment, messages
  * 			Message: Header + paylod
  */
-
-struct publish_request{
-	int client_id;
-	int request_id;
-	char topic[32];
-	bool acknowledge;
-	std::atomic<int> *counter;
-	void* payload_address;
-	size_t size;
-};
 
 struct TInode{
 	char topic[32];
@@ -71,25 +57,22 @@ struct MessageHeader{
 
 class CXLManager{
 	public:
-		CXLManager(size_t queueCapacity, int broker_id, );
+		CXLManager(size_t queueCapacity, int broker_id, int num_io_threads=NUM_CXL_IO_THREADS);
 		~CXLManager();
 		void* Get_tinode(const char* topic, int broker_num);
 		void SetTopicManager(TopicManager *topic_manager){
 			topic_manager_ = topic_manager;
 		}
-		void EnqueueRequest(struct publish_request req){
-			requestQueue_.blockingWrite(req);
-		}
+		void EnqueueRequest(struct PublishRequest req);
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 
-	private:
-		int broker_id_;
-		//TODO(Erika) Replace this queue, mutex, and condition variable with folly MPMC.
-		// We may not even want this thread model and rely on folly IOThreadPoolExecutor
+		private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
+		int broker_id_;
+		int num_io_threads_;
 		std::vector<std::thread> threads_;
 
 		TopicManager *topic_manager_;

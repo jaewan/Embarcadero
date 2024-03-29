@@ -11,12 +11,12 @@ namespace Embarcadero{
 
 #define CXL_SIZE (1UL << 34)
 #define log_SIZE (1UL << 30)
-#define NUM_CXL_IO_THREADS 2
 #define MAX_TOPIC 4
 
-CXLManager::CXLManager(size_t queueCapacity, int broker_id):
+CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	requestQueue_(queueCapacity),
-	broker_id_(broker_id){
+	broker_id_(broker_id),
+	num_io_threads_(num_io_threads){
 	// Initialize CXL
 	cxl_type_ = Emul;
 	std::string cxl_path(getenv("HOME"));
@@ -42,7 +42,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id):
 	}
 
 	// Create CXL I/O threads
-	for (int i=0; i< NUM_CXL_IO_THREADS; i++)
+	for (int i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&CXLManager::CXL_io_thread, this);
 
 	// Initialize CXL memory regions
@@ -61,15 +61,16 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id):
 	}
 
 	// Wait untill al IO threads are up
-	while(thread_count_.load() != NUM_CXL_IO_THREADS){}
+	while(thread_count_.load() != num_io_threads_){}
 
+	std::cout << "[CXLManager]: \tConstructed" << std::endl;
 	return;
 }
 
 CXLManager::~CXLManager(){
 	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	stop_threads_ = true;
-	for (int i=0; i<NUM_DISK_IO_THREADS; i++)
+	for (int i=0; i< num_io_threads_; i++)
 		requestQueue_.blockingWrite(sentinel);
 
 	// Close CXL emulation
@@ -104,16 +105,19 @@ void CXLManager::CXL_io_thread(){
 		if(!optReq.has_value()){
 			break;
 		}
-		const struct PublishRequest &req = optReq.value();
+		std::cout<<"Cxl req" << std::endl;
+		struct PublishRequest &req = optReq.value();
 		// Actual IO to the CXL
 		topic_manager_->PublishToCXL(req.topic, req.payload_address, req.size);
+		std::cout<<"Cxl wrote" << std::endl;
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 		if( counter == 1){
+		std::cout<<"\t\tCXL is Slower" << std::endl;
 			free(req.payload_address);
-			free(req.couter);
 		}else if(req.acknowledge){
+		std::cout<<"\t\tCXL is faster" << std::endl;
 			//TODO(Jae)
 			//Enque ack request to network manager
 			// network_manager_.EnqueueAckRequest();
@@ -128,10 +132,13 @@ void* CXLManager::GetTInode(const char* topic){
 	return ((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
 }
 
+void CXLManager::EnqueueRequest(struct PublishRequest req){
+	requestQueue_.blockingWrite(req);
+}
+
 void* CXLManager::GetNewSegment(){
 	static std::atomic<int> segment_count{0};
 	int offset = segment_count.fetch_add(1, std::memory_order_relaxed);
-	void* segment = ((uint8_t*)segments_ + offset*SEGMENT_SIZE);
 
 	//TODO(Jae) Implement bitmap
 	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
