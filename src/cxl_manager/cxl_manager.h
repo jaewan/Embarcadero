@@ -9,6 +9,8 @@
 #include <condition_variable>
 #include <thread>
 #include <iostream>
+#include <optional>
+#include "folly/MPMCQueue.h"
 
 namespace Embarcadero{
 
@@ -68,16 +70,14 @@ struct MessageHeader{
 
 class CXLManager{
 	public:
-		CXLManager(int broker_id);
+		CXLManager(size_t queueCapacity, int broker_id, );
 		~CXLManager();
 		void* Get_tinode(const char* topic, int broker_num);
 		void SetTopicManager(TopicManager *topic_manager){
 			topic_manager_ = topic_manager;
 		}
-		void EnqueueRequest(struct publish_request &request){
-			std::unique_lock<std::mutex> lock(queueMutex_);
-			requestQueue_.push(request);
-			queueCondVar_.notify_one(); 
+		void EnqueueRequest(struct publish_request req){
+			requestQueue_.blockingWrite(req);
 		}
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
@@ -88,9 +88,7 @@ class CXLManager{
 		int broker_id_;
 		//TODO(Erika) Replace this queue, mutex, and condition variable with folly MPMC.
 		// We may not even want this thread model and rely on folly IOThreadPoolExecutor
-		std::queue<publish_request> requestQueue_;
-		std::mutex queueMutex_;
-		std::condition_variable queueCondVar_;
+		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
 		std::vector<std::thread> threads_;
 
 		TopicManager *topic_manager_;

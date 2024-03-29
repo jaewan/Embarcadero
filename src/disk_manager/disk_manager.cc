@@ -8,11 +8,11 @@
 
 namespace Embarcadero{
 
-#define DISK_LOG_PATH "~/Embarcadero/.DiskLog/log"
+#define DISK_LOG_PATH "/home/domin/Jae/Embarcadero/.DiskLog/log"
 #define NUM_ACTIVE_POLL 100
 #define NUM_DISK_IO_THREADS 4
 
-DiskManager::DiskManager(size_t queueCapacity):requests_(queueCapacity){
+DiskManager::DiskManager(size_t queueCapacity):requestQueue_(queueCapacity){
 	//Initialize log file
 	log_fd_ = open(DISK_LOG_PATH, O_RDWR|O_CREAT, 0777);
 	if (log_fd_ < 0){
@@ -29,7 +29,10 @@ DiskManager::DiskManager(size_t queueCapacity):requests_(queueCapacity){
 }
 
 DiskManager::~DiskManager(){
+	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	stop_threads_ = true;
+	for (int i=0; i<NUM_DISK_IO_THREADS; i++)
+		requestQueue_.blockingWrite(sentinel);
 
 	close(log_fd_);
 
@@ -41,49 +44,32 @@ DiskManager::~DiskManager(){
 	std::cout << "[DiskManager]: \tDestructed" << std::endl;
 }
 
-DiskManager::Disk_io_thread(){
+void DiskManager::EnqueueRequest(struct PublishRequest req){
+	requestQueue_.blockingWrite(req);
+}
+
+void DiskManager::Disk_io_thread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	int loop_count = 0;
+	std::optional<struct PublishRequest> optReq;
 
 	while(!stop_threads_){
-		loop_count++;
-		struct PublishRequest req;
-		if(requests_.readIfNotEmpty(req)){
-			int off = offset_.fetch_add(req.size, std::memory_order_relaxed);
-			pwrite(log_fd_, req.payload_address, req.size, off);
-			loop_count = 0;
-		}else{
-			// Active polling phase
-			bool popped_reqeust = false;
-			int num_try = 0;
-			while(!stop_threads_ && !popped_reqeust && num_try < NUM_ACTIVE_POLL){
-				if(queues.readIfNotEmpty(req)){
-					int off = offset_.fetch_add(req.size, std::memory_order_relaxed);
-					pwrite(log_fd_, req.payload_address, req.size, off);
-					popped_reqeust = true;
-					loop_count = 0;
-				}else{
-					std::this_thread::yield(); // Yield to reduce busy-waiting impact
-				}
-			}
-
-			if (!popped_request) {
-					// Wait phase: no tasks found, wait on a baton for a brief period
-					baton_.try_wait_for(std::chrono::milliseconds(loop_count*10));
-					baton_.reset();
-			}
+		requestQueue_.blockingRead(optReq);
+		if(!optReq.has_value()){
+			break;
 		}
+		const struct PublishRequest &req = optReq.value();
+		int off = offset_.fetch_add(req.size, std::memory_order_relaxed);
+		pwrite(log_fd_, req.payload_address, req.size, off);
 
 		// Post I/O work (as disk I/O depend on the same payload)
-		if( loop_count == 0){
-			int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
-			if( counter == 1){
-				free(req.payload_address);
-			}else if(req.acknowledge){
-				//TODO(Jae)
-				//Enque ack request to network manager
-				// network_manager_.EnqueueAckRequest();
-			}
+		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
+		if( counter == 1){
+			free(req.payload_address);
+			free(req.couter);
+		}else if(req.acknowledge){
+			//TODO(Jae)
+			//Enque ack request to network manager
+			// network_manager_.EnqueueAckRequest();
 		}
 	}
 }

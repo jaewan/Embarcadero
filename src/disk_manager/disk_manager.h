@@ -3,6 +3,10 @@
 
 #include "common/config.h"
 #include <atomic>
+#include <thread>
+#include <vector>
+#include <optional>
+#include "folly/MPMCQueue.h"
 
 namespace Embarcadero{
 
@@ -20,16 +24,16 @@ class DiskManager{
 	public:
 		DiskManager(size_t queueCapacity);
 		~DiskManager();
+		void EnqueueRequest(struct PublishRequest);
 
 	private:
-		Disk_io_thread();
+		void Disk_io_thread();
 
 		std::vector<std::thread> threads_;
-    folly::MPMCQueue<struct PublishRequest> requests_;
-    folly::Baton<> baton_;
+		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
 
 		int log_fd_;
-		atomic<int> offset_{0};
+		std::atomic<int> offset_{0};
 		bool stop_threads_ = false;
 		std::atomic<int> thread_count_{0};
 };
