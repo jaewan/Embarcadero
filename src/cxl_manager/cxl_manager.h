@@ -1,7 +1,6 @@
 #ifndef INCLUDE_CXL_MANGER_H_
 #define INCLUDE_CXL_MANGER_H_
 
-#include "topic_manager.h"
 
 #include <queue>
 #include <atomic>
@@ -11,6 +10,8 @@
 #include <iostream>
 #include <optional>
 #include "folly/MPMCQueue.h"
+#include "common/config.h"
+#include "topic_manager.h"
 
 namespace Embarcadero{
 
