@@ -1,4 +1,5 @@
 #include "disk_manager.h"
+
 #include <iostream>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -10,9 +11,11 @@ namespace Embarcadero{
 
 #define DISK_LOG_PATH "/home/domin/Jae/Embarcadero/.DiskLog/log"
 #define NUM_ACTIVE_POLL 100
-#define NUM_DISK_IO_THREADS 4
 
-DiskManager::DiskManager(size_t queueCapacity):requestQueue_(queueCapacity){
+DiskManager::DiskManager(size_t queueCapacity, 
+						 int num_io_threads):
+						 requestQueue_(queueCapacity),
+						 num_io_threads_(num_io_threads){
 	//Initialize log file
 	log_fd_ = open(DISK_LOG_PATH, O_RDWR|O_CREAT, 0777);
 	if (log_fd_ < 0){
@@ -20,17 +23,17 @@ DiskManager::DiskManager(size_t queueCapacity):requestQueue_(queueCapacity){
 		std::cout<< strerror(errno) << std::endl;
 	}
 	// Create Disk I/O threads
-	for (int i=0; i< NUM_DISK_IO_THREADS; i++)
+	for (int i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&DiskManager::Disk_io_thread, this);
 
-	while(thread_count_.load() != NUM_DISK_IO_THREADS){}
+	while(thread_count_.load() != num_io_threads_){}
 	std::cout << "[DiskManager]: \tCreated" << std::endl;
 }
 
 DiskManager::~DiskManager(){
 	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	stop_threads_ = true;
-	for (int i=0; i<NUM_DISK_IO_THREADS; i++)
+	for (int i=0; i<num_io_threads_; i++)
 		requestQueue_.blockingWrite(sentinel);
 
 	close(log_fd_);
@@ -56,16 +59,19 @@ void DiskManager::Disk_io_thread(){
 		if(!optReq.has_value()){
 			break;
 		}
+		std::cout<<"Disk req" << std::endl;
 		const struct PublishRequest &req = optReq.value();
 		int off = offset_.fetch_add(req.size, std::memory_order_relaxed);
 		pwrite(log_fd_, req.payload_address, req.size, off);
+		std::cout<<"Disk wrote" << std::endl;
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 		if( counter == 1){
+		std::cout<<"\t\tDisk is Slower" << std::endl;
 			free(req.payload_address);
-			free(req.couter);
 		}else if(req.acknowledge){
+		std::cout<<"\t\tDisk is faster" << std::endl;
 			//TODO(Jae)
 			//Enque ack request to network manager
 			// network_manager_.EnqueueAckRequest();
