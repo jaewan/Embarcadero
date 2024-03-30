@@ -77,7 +77,7 @@ class CXLManager{
 
 		TopicManager *topic_manager_;
 		CXL_Type cxl_type_;
-		int cxl_emul_fd_;
+		int cxl_fd_;
 		void* cxl_addr_;
 		void* bitmap_;
 		void* segments_;

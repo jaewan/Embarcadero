@@ -9,47 +9,42 @@
 
 namespace Embarcadero{
 
-#define CXL_SIZE (1UL << 34)
-#define log_SIZE (1UL << 30)
-#define MAX_TOPIC 4
+#define CXL_SIZE (1UL << 37)
 
 CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	requestQueue_(queueCapacity),
 	broker_id_(broker_id),
 	num_io_threads_(num_io_threads){
 	// Initialize CXL
-	cxl_type_ = Emul;
+	cxl_type_ = Real;
 	std::string cxl_path(getenv("HOME"));
-	cxl_path += "/.CXL_EMUL/cxl";
-
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
 	switch(cxl_type_){
 		case Emul:
-			cxl_emul_fd_ = open(cxl_path.c_str(), O_RDWR, 0777);
-			if (cxl_emul_fd_  < 0)
-				perror("Opening Emulated CXL error");
-
-			cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, cxl_emul_fd_, 0);
-			if (cxl_addr_ == MAP_FAILED)
-				perror("Mapping Emulated CXL error");
-
-			std::cout << "Successfully initialized CXL Emul" << std::endl;
+			cxl_path += "/.CXL_EMUL/cxl";
+			cxl_fd_ = open(cxl_path.c_str(), O_RDWR, 0777);
 			break;
 		case Real:
-			perror("Not implemented real cxl yet");
+			cxl_fd_ = open("/dev/dax0.0", O_RDWR);
 			break ;
 	}
+	if (cxl_fd_  < 0)
+		perror("Opening CXL error");
+
+	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, cxl_fd_, 0);
+	if (cxl_addr_ == MAP_FAILED)
+		perror("Mapping Emulated CXL error");
 
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&CXLManager::CXL_io_thread, this);
 
 	// Initialize CXL memory regions
-	size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC;
+	size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
 	size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
 	TINode_Region_size += padding;
-	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC;
+	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
 	size_t Segment_Region_size = (CXL_SIZE - TINode_Region_size - Bitmap_Region_size)/NUM_BROKERS;
 
 	bitmap_ = (uint8_t*)cxl_addr_ + TINode_Region_size;
@@ -73,19 +68,10 @@ CXLManager::~CXLManager(){
 	for (int i=0; i< num_io_threads_; i++)
 		requestQueue_.blockingWrite(sentinel);
 
-	// Close CXL emulation
-	switch(cxl_type_){
-		case Emul:
-			if (munmap(cxl_addr_, CXL_SIZE) < 0)
-				perror("Unmapping Emulated CXL error");
-			close(cxl_emul_fd_);
+	if (munmap(cxl_addr_, CXL_SIZE) < 0)
+		perror("Unmapping CXL error");
+	close(cxl_fd_);
 
-			std::cout << "Successfully deinitialized CXL Emul" << std::endl;
-			break;
-		case Real:
-			perror("Not implemented real cxl yet");
-			break;
-	}
 
 	for(std::thread& thread : threads_){
 		if(thread.joinable()){
@@ -128,7 +114,7 @@ void CXLManager::CXL_io_thread(){
 void* CXLManager::GetTInode(const char* topic){
 	// Convert topic to tinode address
 	static const std::hash<std::string> topic_to_idx;
-	int TInode_idx = topic_to_idx(topic) % MAX_TOPIC;
+	int TInode_idx = topic_to_idx(topic) % MAX_TOPIC_SIZE;
 	return ((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
 }
 
