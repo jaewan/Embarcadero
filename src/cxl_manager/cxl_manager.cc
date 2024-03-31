@@ -91,19 +91,16 @@ void CXLManager::CXL_io_thread(){
 		if(!optReq.has_value()){
 			break;
 		}
-		std::cout<<"Cxl req" << std::endl;
 		struct PublishRequest &req = optReq.value();
+
 		// Actual IO to the CXL
 		topic_manager_->PublishToCXL(req.topic, req.payload_address, req.size);
-		std::cout<<"Cxl wrote" << std::endl;
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 		if( counter == 1){
-		std::cout<<"\t\tCXL is Slower" << std::endl;
 			free(req.payload_address);
 		}else if(req.acknowledge){
-		std::cout<<"\t\tCXL is faster" << std::endl;
 			//TODO(Jae)
 			//Enque ack request to network manager
 			// network_manager_.EnqueueAckRequest();
@@ -133,6 +130,30 @@ void* CXLManager::GetNewSegment(){
 bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 																void* &last_addr, void* messages, size_t &messages_size){
 	return topic_manager_->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
+}
+
+void CXLManager::Sequencer(const char* topic){
+	struct TInode *tinode = GetTInode(topic);
+	struct MessageHeader *msg_headers[NUM_BROKERS];
+	offset_entry offsets[NUM_BROKERS];
+	absl::flat_hash_set<int> brokers;
+	absl::flat_hash_map<int, size_t> last_ordered;
+	absl::flat_hash_map<int, absl::btree_map<size_t, *void>> skipped_msg;
+	size_t seq = 0;
+
+	for(int=0; i<NUM_BROKERS; i++){
+		memcpy(&offsets[i], &(tinode->offsets[i]), sizeof(struct offset_entry));
+		msg_headers[i] = (struct MessageHeader*)offsets[i].log_addr;
+		brokers.insert(i);
+	}
+
+	while(1){
+		for(int=0; i<NUM_BROKERS; i++){
+			if(msg_headers[i] != nullptr){
+				msg_headers[i]->client_id
+			}
+		}
+	}
 }
 
 } // End of namespace Embarcadero

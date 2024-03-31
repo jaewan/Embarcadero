@@ -9,8 +9,7 @@ namespace Embarcadero{
 
 #define NT_THRESHOLD 128
 
-void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n)
-{
+void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	static size_t CACHE_LINE_SIZE = sysconf (_SC_LEVEL1_DCACHE_LINESIZE);
 	if (n < NT_THRESHOLD) {
 		memcpy(dst, src, n);
