@@ -28,16 +28,17 @@ enum CXL_Type {Emul, Real};
  * 			Message: Header + paylod
  */
 
+// Align and pad to 64B cacheline
+struct alignas(64) offset_entry {
+	size_t ordered;
+	size_t written;
+	void* log_addr;
+	char _padding[64 - (sizeof(size_t) * 2 + sizeof(void*))]; 
+};
+
 struct TInode{
 	char topic[32];
-	// Align and pad to 64B cacheline
-	struct alignas(64) offset_entry {
-    size_t ordered;
-    size_t written;
-    void* log_addr;
-    char _padding[64 - (sizeof(size_t) * 2 + sizeof(void*))]; 
-	};
-	offset_entry offsets[NUM_BROKERS];
+	volatile offset_entry offsets[NUM_BROKERS];
 };
 
 struct NonCriticalMessageHeader{
@@ -48,8 +49,10 @@ struct NonCriticalMessageHeader{
 };
 
 struct MessageHeader{
+	int client_id;
+	size_t client_order;
 	size_t logical_offset;
-	size_t total_order;
+	volatile size_t total_order;
 	size_t size;
 	void* segment_header;
 	void* next_message;
@@ -59,7 +62,6 @@ class CXLManager{
 	public:
 		CXLManager(size_t queueCapacity, int broker_id, int num_io_threads=NUM_CXL_IO_THREADS);
 		~CXLManager();
-		void* Get_tinode(const char* topic, int broker_num);
 		void SetTopicManager(TopicManager *topic_manager){
 			topic_manager_ = topic_manager;
 		}
@@ -68,6 +70,7 @@ class CXLManager{
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
+		void Sequencer();
 
 		private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
