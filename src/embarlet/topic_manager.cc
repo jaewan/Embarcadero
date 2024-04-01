@@ -52,8 +52,8 @@ void TopicManager::CreateNewTopic(const char topic[32]){
 	void* segment_metadata = cxl_manager_.GetNewSegment();
 	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	memcpy(tinode->topic, topic, 32);
-	tinode->offsets[broker_id_].ordered = 0;
-	tinode->offsets[broker_id_].written = 0;
+	tinode->offsets[broker_id_].ordered = -1;
+	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_addr = (uint8_t*)segment_metadata + sizeof(void*);
 	//std::cout << "[TopicManager::CreateNewTopic] created topic:" << topic << std::endl;
 
@@ -141,7 +141,7 @@ void Topic::PublishToCXL(void* message, size_t size){
 		absl::MutexLock lock(&mu_);
 		if (*(writing_offsets_.begin()++) == logical_offset){
 			struct MessageHeader *tmp_header = (struct MessageHeader*)log;
-			if(written_logical_offset_ != (logical_offset-1)){
+			if(written_logical_offset_ != (logical_offset - 1)){
 				perror(" !!!!!!!!!!!!!!!!!!!!!!  write logic is wrong !!!!!!!!!!!!!!!!!!\n");
 			}
 			written_logical_offset_ = logical_offset;

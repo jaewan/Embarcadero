@@ -132,28 +132,68 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 	return topic_manager_->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
 }
 
+/*
 void CXLManager::Sequencer(const char* topic){
 	struct TInode *tinode = GetTInode(topic);
 	struct MessageHeader *msg_headers[NUM_BROKERS];
-	offset_entry offsets[NUM_BROKERS];
-	absl::flat_hash_set<int> brokers;
-	absl::flat_hash_map<int, size_t> last_ordered;
-	absl::flat_hash_map<int, absl::btree_map<size_t, *void>> skipped_msg;
+	absl::flat_hash_map<int, int> last_ordered; // <client_id, client_request_id>>
+	absl::flat_hash_map<int, absl::btree_map<size_t, struct MessageHeader*>> skipped_msg; //<client_id, <client_req_id,*msg_header>>
 	size_t seq = 0;
+    int perLogOff[NUM_BROKERS];
 
 	for(int=0; i<NUM_BROKERS; i++){
-		memcpy(&offsets[i], &(tinode->offsets[i]), sizeof(struct offset_entry));
-		msg_headers[i] = (struct MessageHeader*)offsets[i].log_addr;
-		brokers.insert(i);
+        while(tinode->offsets[i].log_addr == nullptr){}
+		msg_headers[i] = (struct MessageHeader*)tinode->offsets[i].log_addr;
+        last_ordered[i] = -1;
+        perLogOff[i] = -1;
 	}
 
 	while(1){
 		for(int=0; i<NUM_BROKERS; i++){
-			if(msg_headers[i] != nullptr){
-				msg_headers[i]->client_id
+            if(perLogOff[i] < tinode->offsets[i].written && msg_headers[i]->logical_offset == perLogOff[i]){
+                msg_headers[i] = msg_headers[i]->next_message;
+            }
+            while(perLogOff[i] < tinode->offsets[i].written){
+                int client = msg_headers[i]->client_id;
+				if(last_ordered[client] == msg_headers[i]->client_order - 1){
+                    //Give order
+                    msg_headers[i]->total_order = seq;
+                    tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
+                    seq++;
+                    last_ordered[client] = msg_headers[i]->client_order;
+                    auto it = skipped_msg.find(client);
+                    if(it != skipped_msg.end()){
+                        std::vector<int> to_remove;
+                        for (auto& pair : it->second) {
+                            if(pair.first == last_ordered[client] + 1){
+                                pair.second->total_order = seq;
+                                tinode->offsets[i].ordered = pair.second->logical_offset;
+                                seq++;
+                                last_ordered[client] = pair.first;
+                                to_remove.push_back(pair.first);
+                            }
+                        }
+                        for(auto &id: to_remove){
+                            it->second.erase(id);
+                        }
+                    }
+                }else{
+                    //Insert to skipped messages
+                    auto it = skipped_msg.find(client);
+                     if (it == skipped_msg.end()) {
+                         absl::btree_map<size_t, struct MessageHeader*> new_map;
+                         new_map.emplace(msg_headers[i]->client_order, msg_headers[i]);
+                         skipped_msg.emplace(client, std::move(new_map));
+                     } else {
+                         it->second.emplace(msg_headers[i]->client_order, msg_headers[i]);
+                     }
+                }
+                if(msg_headers[i]->next_message)
+                    msg_headers[i] = (struct MessageHeader*)msg_headers[i]->next_message;
 			}
 		}
 	}
 }
+*/
 
 } // End of namespace Embarcadero
