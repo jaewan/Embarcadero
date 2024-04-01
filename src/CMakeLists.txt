@@ -1,7 +1,8 @@
 include(cmake/peer_grpc.cmake)
+include(cmake/pubsub_grpc.cmake)
 
 # These are required for a folly build
-# folly cmake mostly from here: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
+# folly cmake mostly from pehere: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
 find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
 
@@ -21,6 +22,9 @@ add_executable(embarlet
     embarlet/peer.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
+    client/client.h
+    network_manager/network_manager.h
+    network_manager/network_manager.cc
 )
 
 target_include_directories(embarlet PUBLIC
@@ -31,9 +35,23 @@ target_include_directories(embarlet PUBLIC
 target_link_libraries(embarlet
     absl::flat_hash_map 
     peer_grpc_proto
+    pubsub_grpc_proto
     cxxopts::cxxopts
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF}
     ${FOLLY_LIBRARIES}
+)
+
+add_executable(client
+    client/client.cc
+    client/client.h
+)
+
+target_link_libraries(client
+    pubsub_grpc_proto
+    cxxopts::cxxopts
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOF}
 )
