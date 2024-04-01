@@ -8,12 +8,14 @@
 #include "folly/MPMCQueue.h"
 #include "common/config.h"
 #include "../embarlet/topic_manager.h"
+#include "../network_manager/network_manager.h"
 
 namespace Embarcadero{
 
 #define NUM_BROKERS 4
 
 class TopicManager;
+class NetworkManager;
 
 enum CXL_Type {Emul, Real};
 
@@ -42,9 +44,11 @@ struct TInode{
 };
 
 struct NonCriticalMessageHeader{
+	int client_id;
+	size_t client_order;
 	size_t logical_offset;
-	size_t total_order;
-	size_t size;
+	volatile size_t total_order;
+	volatile size_t size;
 	void* segment_header;
 };
 
@@ -65,6 +69,9 @@ class CXLManager{
 		void SetTopicManager(TopicManager *topic_manager){
 			topic_manager_ = topic_manager;
 		}
+		void SetNetworkManager(NetworkManager* network_manager){
+			network_manager_ = network_manager;
+		}
 		void EnqueueRequest(struct PublishRequest req);
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
@@ -79,6 +86,8 @@ class CXLManager{
 		std::vector<std::thread> threads_;
 
 		TopicManager *topic_manager_;
+		NetworkManager *network_manager_;
+
 		CXL_Type cxl_type_;
 		int cxl_fd_;
 		void* cxl_addr_;
