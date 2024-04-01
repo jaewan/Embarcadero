@@ -8,23 +8,36 @@
 #include "../cxl_manager/cxl_manager.h"
 #include <iostream>
 #include <string>
-#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
+//#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 
 int main(int argc, char* argv[]){
+
+	//Initialize
 	int broker_id = 0;
+	Embarcadero::CXLManager cxl_manager(10000,broker_id);
+	Embarcadero::DiskManager disk_manager(10000);
+	Embarcadero::NetworkManager network_manager(100000, NUM_NETWORK_IO_THREADS);
+	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
-	Embarcadero::CXLManager cxl_manager = Embarcadero::CXLManager(100,broker_id);
-	Embarcadero::DiskManager disk_manager(100);
-	Embarcadero::TopicManager topic_manager = Embarcadero::TopicManager(cxl_manager, broker_id);
 	cxl_manager.SetTopicManager(&topic_manager);
+	cxl_manager.SetNetworkManager(&network_manager);
+	disk_manager.SetNetworkManager(&network_manager);
+	network_manager.SetCXLManager(&cxl_manager);
+	network_manager.SetDiskManager(&disk_manager);
 
+/*
+	char topic[32];
+	memset(topic, 0, 32);
+	topic[0] = '0';
+	topic_manager.CreateNewTopic(topic);
+	*/
 	//********* Load Generate **************
-	/*
 	char topic[32];
 	memset(topic, 0, 32);
 	topic[0] = '0';
 	topic_manager.CreateNewTopic(topic);
 	
+	/*
 	Embarcadero::PublishRequest req;
 	std::atomic<int> c{2};
 	memcpy(req.topic, topic, 32);
@@ -32,8 +45,16 @@ int main(int argc, char* argv[]){
 	req.counter = &c;
 	req.size = 1024;
 	req.acknowledge = true;
-	cxl_manager.EnqueueRequest(req);
-	disk_manager.EnqueueRequest(req);
+	*/
+	Embarcadero::NetworkRequest req;
+	req.req_type = Embarcadero::Test;
+	std::cout <<"Submitting reqs" << std::endl;
+	for(int i =0; i<1000000; i++){
+		network_manager.EnqueueRequest(req);
+	}
+		std::cout <<"Submitted all reqs" << std::endl;
+	//cxl_manager.EnqueueRequest(req);
+	//disk_manager.EnqueueRequest(req);
 	sleep(1);
 
 	void* last_addr = nullptr;
@@ -41,7 +62,6 @@ int main(int argc, char* argv[]){
 	size_t messages_size;
 	size_t last_offset = 0;
 	cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
-	*/
 
 	/*
 	//Embarcadero::CXLManager cxlmanager;
@@ -101,6 +121,7 @@ int main(int argc, char* argv[]){
 
 	delete pq;
 	*/
+
+while(1){sleep(10);}
 	return 0;
 }
-

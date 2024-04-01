@@ -13,6 +13,8 @@ add_executable(embarlet
     disk_manager/disk_manager.h 
     cxl_manager/cxl_manager.cc
     cxl_manager/cxl_manager.h 
+    network_manager/network_manager.cc
+    network_manager/network_manager.h 
     embarlet/pub_queue.cc 
     embarlet/pub_queue.h 
     embarlet/pub_task.h 

@@ -31,8 +31,8 @@ DiskManager::DiskManager(size_t queueCapacity,
 }
 
 DiskManager::~DiskManager(){
-	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	stop_threads_ = true;
+	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	for (int i=0; i<num_io_threads_; i++)
 		requestQueue_.blockingWrite(sentinel);
 
@@ -59,19 +59,18 @@ void DiskManager::Disk_io_thread(){
 		if(!optReq.has_value()){
 			break;
 		}
-		std::cout<<"Disk req" << std::endl;
 		const struct PublishRequest &req = optReq.value();
 		int off = offset_.fetch_add(req.size, std::memory_order_relaxed);
 		pwrite(log_fd_, req.payload_address, req.size, off);
-		std::cout<<"Disk wrote" << std::endl;
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 		if( counter == 1){
-		std::cout<<"\t\tDisk is Slower" << std::endl;
-			free(req.payload_address);
+			//free(req.payload_address);
 		}else if(req.acknowledge){
-		std::cout<<"\t\tDisk is faster" << std::endl;
+			struct NetworkRequest req;
+			req.req_type = Acknowledge;
+			network_manager_->EnqueueRequest(req);
 			//TODO(Jae)
 			//Enque ack request to network manager
 			// network_manager_.EnqueueAckRequest();

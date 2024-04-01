@@ -99,8 +99,11 @@ void CXLManager::CXL_io_thread(){
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 		if( counter == 1){
-			free(req.payload_address);
+			//free(req.payload_address);
 		}else if(req.acknowledge){
+			struct NetworkRequest req;
+			req.req_type = Acknowledge;
+			network_manager_->EnqueueRequest(req);
 			//TODO(Jae)
 			//Enque ack request to network manager
 			// network_manager_.EnqueueAckRequest();
