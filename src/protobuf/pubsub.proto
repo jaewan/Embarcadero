@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+service PubSub {
+    // Allows a publish to try to publish a message
+    rpc Publish(PublishRequest) returns (PublishResponse);
+}
+
+// Request containing address and port of sender (new broker)
+message PublishRequest {
+    uint32 ack_level = 1;
+    uint64 topic = 2;
+    bytes payload = 3; // TODO: this is limited to be 2**23
+}
+
+// Empty response for now
+message PublishResponse {
+    uint32 error = 1;
+}

@@ -183,3 +183,29 @@ void NetworkManager::MainThread(){
 }
 
 } // End of namespace Embarcadero
+
+NetworkManager::NetworkManager(size_t num_net_threads) {
+    num_net_threads_ = num_net_threads;
+}
+
+NetworkManager::~NetworkManager() {
+    server_->Shutdown();
+    // Always shutdown the completion queue after the server.
+    cq_->Shutdown();
+}
+
+// TODO: There is no error shutdown handling in this code.
+void NetworkManager::Run(uint16_t port) {
+    // TODO: fix IP address
+    std::string server_address = absl::StrFormat("0.0.0.0:%d", port);
+
+    ServerBuilder builder;
+    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    builder.RegisterService(&service_);
+    cq_ = builder.AddCompletionQueue();
+    server_ = builder.BuildAndStart();
+    std::cout << "Server listening on " << server_address << std::endl;
+
+    // Proceed to the server's main loop.
+    HandleRpcs();
+}

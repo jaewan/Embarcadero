@@ -133,4 +133,10 @@ int main(int argc, char* argv[]){
 
 	delete pq;
 	*/
+
+	size_t num_net_threads = 3;
+	NetworkManager network_manager(num_net_threads);
+	network_manager.Run(DEFAULT_PORT);
+
+	return 0;
 }

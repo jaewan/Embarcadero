@@ -4,6 +4,9 @@ build/
 # Ignore external dependencies
 third_party/
 
+# Ignore vscode
+.vscode
+
 # Gitignore for C++ projects
 # https://github.com/github/gitignore/blob/main/C%2B%2B.gitignore
 # Prerequisites
