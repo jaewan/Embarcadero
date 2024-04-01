@@ -30,7 +30,7 @@ namespace Embarcadero{
 
 struct PublishRequest{
 	int client_id;
-	size_t client_order;
+	size_t client_order; // Must start from 0
 	char topic[MAX_TOPIC_NAME_SIZE];
 	bool acknowledge;
 	std::atomic<int> *counter;

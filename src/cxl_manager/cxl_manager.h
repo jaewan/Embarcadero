@@ -30,8 +30,8 @@ enum CXL_Type {Emul, Real};
 
 // Align and pad to 64B cacheline
 struct alignas(64) offset_entry {
-	size_t ordered;
-	size_t written;
+	int ordered;
+	int written;
 	void* log_addr;
 	char _padding[64 - (sizeof(size_t) * 2 + sizeof(void*))]; 
 };
@@ -53,7 +53,7 @@ struct MessageHeader{
 	size_t client_order;
 	size_t logical_offset;
 	volatile size_t total_order;
-	size_t size;
+	volatile size_t size;
 	void* segment_header;
 	void* next_message;
 };
