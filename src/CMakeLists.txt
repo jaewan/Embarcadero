@@ -21,6 +21,7 @@ add_executable(embarlet
     embarlet/peer.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
+    client/publisher.h
 )
 
 target_include_directories(embarlet PUBLIC
@@ -36,4 +37,19 @@ target_link_libraries(embarlet
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF}
     ${FOLLY_LIBRARIES}
+)
+
+add_executable(client
+    client/client.cc
+    client/publisher.cc
+    client/subscriber.cc
+    client/publisher.h
+)
+
+target_link_libraries(client
+    peer_grpc_proto
+    cxxopts::cxxopts
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOF}
 )
