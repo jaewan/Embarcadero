@@ -6,6 +6,10 @@
 
 #include "client.h"
 
+// analogous to RK_MSG_BLOCK in kafka 
+// (e.g. if MSG_BLOCK, we block if queue is full. Otherwise, we fail is queue is full.)
+#define CLIENT_MSG_BLOCK 0x1
+
 enum PublisherError : uint16_t
 {
   ERR_NO_ERROR,
@@ -38,6 +42,7 @@ class Publisher {
   
   public:
     Publisher(PublisherConfig *config);
+    PublisherError publish(Topic *topic, int msgflags, void *payload, size_t len);
 };
 
 #endif // _PUBLISHER_H_

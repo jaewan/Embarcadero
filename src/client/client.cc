@@ -19,5 +19,12 @@ int main(int argc, char* argv[]){
     std::cout << "MADE CONFIG" << std::endl;
 
     Publisher pub(&publisher_config);
+
+    int msg_flags = CLIENT_MSG_BLOCK;
+    Topic topic = 0;
+    char *payload = "Hello world";
+    size_t payload_len = strnlen(payload, 1024);
+    pub.publish(&topic, msg_flags, (void *)payload, payload_len);
+    
     return 0;
 }
