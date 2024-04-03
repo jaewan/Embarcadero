@@ -8,13 +8,25 @@
 #include "../cxl_manager/cxl_manager.h"
 #include <iostream>
 #include <string>
-//#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
+#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 
 int main(int argc, char* argv[]){
 
+	cxxopts::Options options("embarc", "Embrokeradaro (TODO: add real description)");
+	options.add_options()
+		("e,emul", "Use emulation instead of CXL")
+	;
+	auto result = options.parse(argc, argv);
+
+	Embarcadero::CXL_Type cxl_type = Embarcadero::CXL_Type::Real;
+	if (result.count("emul")) {
+		cxl_type = Embarcadero::CXL_Type::Emul;
+		std::cout << "WARNING: Using emulated CXL" << std::endl;
+	}
+
 	//Initialize
 	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager(10000,broker_id);
+	Embarcadero::CXLManager cxl_manager(10000, broker_id, cxl_type);
 	Embarcadero::DiskManager disk_manager(10000);
 	Embarcadero::NetworkManager network_manager(100000, NUM_NETWORK_IO_THREADS);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
@@ -52,7 +64,7 @@ int main(int argc, char* argv[]){
 	for(int i =0; i<1000000; i++){
 		network_manager.EnqueueRequest(req);
 	}
-		std::cout <<"Submitted all reqs" << std::endl;
+	std::cout <<"Submitted all reqs" << std::endl;
 	//cxl_manager.EnqueueRequest(req);
 	//disk_manager.EnqueueRequest(req);
 	sleep(1);
@@ -121,7 +133,4 @@ int main(int argc, char* argv[]){
 
 	delete pq;
 	*/
-
-while(1){sleep(10);}
-	return 0;
 }

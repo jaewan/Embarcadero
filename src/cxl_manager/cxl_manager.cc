@@ -11,12 +11,12 @@ namespace Embarcadero{
 
 #define CXL_SIZE (1UL << 37)
 
-CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
+CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, int num_io_threads):
 	requestQueue_(queueCapacity),
 	broker_id_(broker_id),
 	num_io_threads_(num_io_threads){
 	// Initialize CXL
-	cxl_type_ = Real;
+	cxl_type_ = cxl_type;
 	std::string cxl_path(getenv("HOME"));
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
@@ -26,15 +26,22 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 			cxl_fd_ = open(cxl_path.c_str(), O_RDWR, 0777);
 			break;
 		case Real:
-			cxl_fd_ = open("/dev/dax0.0", O_RDWR);
-			break ;
+			cxl_path = "/dev/dax0.0";
+			cxl_fd_ = open(cxl_path.c_str(), O_RDWR);
+			break;
 	}
-	if (cxl_fd_  < 0)
+	std::cout << "Opening CXL at: " << cxl_path << std::endl;
+	if (cxl_fd_ < 0) {
 		perror("Opening CXL error");
+		exit(-1);
+	}
 
 	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, cxl_fd_, 0);
-	if (cxl_addr_ == MAP_FAILED)
+	if (cxl_addr_ == MAP_FAILED) {
 		perror("Mapping Emulated CXL error");
+		close(cxl_fd_);
+		exit(-1);
+	}
 
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)

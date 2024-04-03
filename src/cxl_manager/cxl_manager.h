@@ -12,8 +12,6 @@
 
 namespace Embarcadero{
 
-#define NUM_BROKERS 4
-
 class TopicManager;
 class NetworkManager;
 
@@ -64,7 +62,7 @@ struct MessageHeader{
 
 class CXLManager{
 	public:
-		CXLManager(size_t queueCapacity, int broker_id, int num_io_threads=NUM_CXL_IO_THREADS);
+		CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, int num_io_threads=NUM_CXL_IO_THREADS);
 		~CXLManager();
 		void SetTopicManager(TopicManager *topic_manager){
 			topic_manager_ = topic_manager;
