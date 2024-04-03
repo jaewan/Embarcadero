@@ -3,6 +3,7 @@
 #include <librdkafka/rdkafkacpp.h>
 #include <ctime>
 #include <chrono>
+#include <yaml-cpp/yaml.h>
 
 class KafkaConsumer {
 public:
@@ -10,10 +11,10 @@ public:
     RdKafka::Conf *conf;
     RdKafka::KafkaConsumer *rk;
 
-    KafkaConsumer() {
+    KafkaConsumer(const std::string& brokers) {
         conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
 
-        if (conf->set("metadata.broker.list", "0.0.0.0:9092,0.0.0.0:9093", errstr) != RdKafka::Conf::CONF_OK) {
+        if (conf->set("metadata.broker.list", brokers, errstr) != RdKafka::Conf::CONF_OK) {
             std::cerr << "% " << errstr << std::endl;
             exit(1);
         }
@@ -36,9 +37,21 @@ public:
 };
 
 int main() {
-    KafkaConsumer kc;
-    std::string topic_name = "misc";
+    std::ifstream file("config/producer.yaml");
+    if (!file.is_open()) {
+        std::cerr << "Failed to open YAML file." << std::endl;
+        return 1;
+    }
 
+    // Parse the YAML file
+    YAML::Node config = YAML::Load(file);
+
+    std::string brokers = config["brokers"].as<std::string>();
+    std::string topic_name = config["topic"].as<std::string>();
+    int num_messages = config["numMessages"].as<int>();
+    int num_bytes = config["messageSize"].as<int>();
+
+    KafkaConsumer kc(brokers);
     RdKafka::Topic *topic = RdKafka::Topic::create(kc.rk, topic_name, nullptr, kc.errstr);
 
     RdKafka::ErrorCode err = kc.rk->subscribe({topic_name});
@@ -47,18 +60,33 @@ int main() {
         exit(1);
     }
 
-    // Open the file for writing
-    std::ofstream outputFile("latency.txt");
-    if (!outputFile.is_open()) {
-        std::cerr << "Error: Unable to open file for writing." << std::endl;
-        return 1;
-    }
-
+    // initialize empty vector for latencies
+    std::vector<int64_t> latencies;
+    int64_t count = 0;
+    std::chrono::time_point<std::chrono::system_clock> start;
+    std::chrono::time_point<std::chrono::system_clock> end;
     while (true) {
-        RdKafka::Message *rkmessage = kc.rk->consume(20000);
+        RdKafka::Message *rkmessage = kc.rk->consume(1000);
         if (rkmessage) {
-            if (rkmessage->err()) {
-                std::cerr << "% Consumer error: " << rkmessage->errstr() << std::endl;
+            if (rkmessage->err() && !latencies.empty()) {
+                // Open the file for writing
+                std::ofstream outputFile("latency.txt");
+                if (!outputFile.is_open()) {
+                    std::cerr << "Error: Unable to open file for writing." << std::endl;
+                    return 1;
+                }
+
+                // clear the file first
+                outputFile.clear();
+
+                for (auto latency : latencies) {
+                    outputFile << latency << std::endl;
+                }
+
+                // delete content in latencies
+                latencies.clear();
+            } else if (rkmessage->err()) {
+                // std::cerr << "% Consumer error: " << rkmessage->errstr() << std::endl;
             } else {
                 int64_t timestamp = rkmessage->timestamp().timestamp;
 
@@ -67,8 +95,34 @@ int main() {
                 int64_t millis_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
                 int64_t latency = millis_since_epoch - timestamp;
+                
+                latencies.push_back(latency);
 
-                outputFile << latency << std::endl;
+                count++;
+                if (count == 1) {
+                    // start the time
+                    start = std::chrono::system_clock::now();
+                }
+
+                if (count == num_messages) {
+                    end = std::chrono::system_clock::now();
+                    std::chrono::duration<double> elapsed_seconds = end - start;
+        
+                    // calculate throughput
+                    double throughput = (static_cast<double>(num_bytes) * num_messages) / elapsed_seconds.count();
+                    throughput /= 1024 * 1024;
+
+                    std::cerr << "Throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
+
+                    // Print average latency
+                    int64_t sum = 0;
+                    for (auto latency : latencies) {
+                        sum += latency;
+                    }
+                    std::cerr << "Average latency: " << sum / latencies.size() << " ms" << std::endl;
+
+                    count = 0;
+                }
             }
             delete rkmessage;
         }
