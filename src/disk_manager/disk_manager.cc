@@ -9,7 +9,7 @@
 
 namespace Embarcadero{
 
-#define DISK_LOG_PATH "/home/domin/Jae/Embarcadero/.DiskLog/log"
+#define DISK_LOG_PATH "embarc.disklog"
 #define NUM_ACTIVE_POLL 100
 
 DiskManager::DiskManager(size_t queueCapacity, 
