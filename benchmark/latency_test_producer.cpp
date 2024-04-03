@@ -1,6 +1,10 @@
 #include <iostream>
 #include <string>
 #include <librdkafka/rdkafkacpp.h>
+#include <chrono>
+#include <fstream>
+#include <unordered_map> 
+#include <yaml-cpp/yaml.h>
 
 class KafkaProducer {
     std::string errstr;
@@ -10,7 +14,7 @@ class KafkaProducer {
     RdKafka::Topic *topic;
 
 public:
-    KafkaProducer(const std::string& brokers, const std::string& topic_name)
+    KafkaProducer(const std::string& brokers, const std::string& topic_name, const std::string& ack)
         : brokers(brokers), topic_name(topic_name) {
         RdKafka::Conf *conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
 
@@ -19,10 +23,21 @@ public:
             exit(1);
         }
 
-        if (conf->set("acks", "0", errstr) != RdKafka::Conf::CONF_OK) {
+        if (conf->set("acks", ack, errstr) != RdKafka::Conf::CONF_OK) {
             std::cerr << "% " << errstr << std::endl;
             exit(1);
         }
+
+        // Might need these 2 configs to optimize for latency
+        // if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
+        //     std::cerr << "% " << errstr << std::endl;
+        //     exit(1);
+        // }
+
+        // if (conf->set("batch.size", "1000000", errstr) != RdKafka::Conf::CONF_OK) {
+        //     std::cerr << "% " << errstr << std::endl;
+        //     exit(1);
+        // }
 
         producer = RdKafka::Producer::create(conf, errstr);
         if (!producer) {
@@ -53,7 +68,7 @@ public:
                                         /* Key */
                                         NULL, 0,
                                         /* Timestamp (defaults to current time) */
-                                        0,
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
                                         /* Message headers, if any */
                                         NULL,
                                         /* Per-message opaque value passed to
@@ -76,31 +91,80 @@ public:
 };
 
 int main() {
-    std::string brokers = "0.0.0.0:9092,0.0.0.0:9093";
-    std::string topic_name = "misc";
-
-    std::string payload = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
-                          "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. "
-                          "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. "
-                          "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. "
-                          "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.";
-
-    KafkaProducer kp(brokers, topic_name);
-    for (int i = 0; i < 10000; ++i) {
-        RdKafka::ErrorCode err = kp.produce(payload);
-        if (err != RdKafka::ERR_NO_ERROR) {
-            std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
-        }
-
-        kp.poll(0);
+    std::ifstream file("config/producer.yaml");
+    if (!file.is_open()) {
+        std::cerr << "Failed to open YAML file." << std::endl;
+        return 1;
     }
 
-    std::cerr << "% Flushing final messages..." << std::endl;
-    kp.flush(10 * 1000 /* wait for max 10 seconds */);
+    // Parse the YAML file
+    YAML::Node config = YAML::Load(file);
 
-    if (kp.outq_len() > 0)
-        std::cerr << "% " << kp.outq_len()
-                << " message(s) were not delivered" << std::endl;
+    std::string brokers = config["brokers"].as<std::string>();
+    std::string topic_name = config["topic"].as<std::string>();
+    int num_messages = config["numMessages"].as<int>();
+    int num_bytes = config["messageSize"].as<int>();
+    std::string ack = config["ack"].as<std::string>();
+
+    std::vector<int> byte_sizes = {num_bytes};
+
+    // load payload from file
+    std::ifstream file("payloads/payload-4kb.data");    
+    std::string payload((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+
+    KafkaProducer kp(brokers, topic_name, ack);
+    // for each byte size, produce 10000 messages    
+    for (auto num_bytes : byte_sizes) {
+
+        /* For constant payload */
+        // start time for throughput
+        // std::string payload;
+        // payload.reserve(num_bytes);
+
+        // // Generate random characters
+        // for (int i = 0; i < num_bytes; ++i) {
+        //     payload += alphanum[rand() % (sizeof(alphanum) - 1)];
+        // }
+
+        auto start = std::chrono::system_clock::now();
+        for (int i = 0; i < num_messages; ++i) {
+
+            /* For random payload */
+            // start time for throughput
+            // std::string payload;
+            // payload.reserve(num_bytes);
+
+            // // Generate random characters
+            // for (int i = 0; i < num_bytes; ++i) {
+            //     payload += alphanum[rand() % (sizeof(alphanum) - 1)];
+            // }
+            
+            RdKafka::ErrorCode err = kp.produce(payload);
+            if (err != RdKafka::ERR_NO_ERROR) {
+                std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
+            }
+
+            kp.poll(0);
+        }
+
+        std::cerr << "% Flushing final messages..." << std::endl;
+        kp.flush(10 * 100000 /* wait for max 1000 seconds */);
+
+        if (kp.outq_len() > 0)
+            std::cerr << "% " << kp.outq_len()
+                    << " message(s) were not delivered" << std::endl;
+
+        // end time for throughput
+        auto end = std::chrono::system_clock::now();
+        std::chrono::duration<double> elapsed_seconds = end - start;
+        
+        // calculate throughput
+        double throughput = (static_cast<double>(num_bytes) * num_messages) / elapsed_seconds.count();
+        throughput /= 1024 * 1024;
+
+        std::cerr << "Throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
+    }
 
     return 0;
 }
