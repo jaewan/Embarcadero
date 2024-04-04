@@ -94,7 +94,7 @@ void CXLManager::CXL_io_thread(){
 		struct PublishRequest &req = optReq.value();
 
 		// Actual IO to the CXL
-		topic_manager_->PublishToCXL(req.topic, req.payload_address, req.size);
+		topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
@@ -135,32 +135,34 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 	return topic_manager_->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
 }
 
-/*
 void CXLManager::Sequencer(const char* topic){
-	struct TInode *tinode = GetTInode(topic);
+	struct TInode *tinode = (struct TInode *)GetTInode(topic);
 	struct MessageHeader *msg_headers[NUM_BROKERS];
-	absl::flat_hash_map<int, int> last_ordered; // <client_id, client_request_id>>
+	absl::flat_hash_map<int, size_t> last_ordered; // <client_id, client_request_id>>
 	absl::flat_hash_map<int, absl::btree_map<size_t, struct MessageHeader*>> skipped_msg; //<client_id, <client_req_id,*msg_header>>
 	size_t seq = 0;
     int perLogOff[NUM_BROKERS];
 
-	for(int=0; i<NUM_BROKERS; i++){
+	for(int i = 0; i<NUM_BROKERS; i++){
         while(tinode->offsets[i].log_addr == nullptr){}
 		msg_headers[i] = (struct MessageHeader*)tinode->offsets[i].log_addr;
-        last_ordered[i] = -1;
         perLogOff[i] = -1;
 	}
 
+//TODO(Jae) This logic is wrong as the ordered offset can skip few messages 
+//and the broker exports all data upto the ordered offset
 	while(1){
-		for(int=0; i<NUM_BROKERS; i++){
-            if(perLogOff[i] < tinode->offsets[i].written && msg_headers[i]->logical_offset == perLogOff[i]){
-                msg_headers[i] = msg_headers[i]->next_message;
+		for(int i = 0; i<NUM_BROKERS; i++){
+            if(perLogOff[i] < tinode->offsets[i].written && (int)msg_headers[i]->logical_offset == perLogOff[i]){
+                msg_headers[i] = (MessageHeader*)(msg_headers[i]->next_message);
             }
             while(perLogOff[i] < tinode->offsets[i].written){
                 int client = msg_headers[i]->client_id;
-				if(last_ordered[client] == msg_headers[i]->client_order - 1){
+				auto last_ordered_itr = last_ordered.find(client);
+				if(last_ordered_itr == last_ordered.end() || last_ordered_itr->second == msg_headers[i]->client_order - 1){
                     //Give order
                     msg_headers[i]->total_order = seq;
+					perLogOff[i] = msg_headers[i]->logical_offset;
                     tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
                     seq++;
                     last_ordered[client] = msg_headers[i]->client_order;
@@ -170,6 +172,7 @@ void CXLManager::Sequencer(const char* topic){
                         for (auto& pair : it->second) {
                             if(pair.first == last_ordered[client] + 1){
                                 pair.second->total_order = seq;
+								perLogOff[i] = msg_headers[i]->logical_offset;
                                 tinode->offsets[i].ordered = pair.second->logical_offset;
                                 seq++;
                                 last_ordered[client] = pair.first;
@@ -197,6 +200,5 @@ void CXLManager::Sequencer(const char* topic){
 		}
 	}
 }
-*/
 
 } // End of namespace Embarcadero

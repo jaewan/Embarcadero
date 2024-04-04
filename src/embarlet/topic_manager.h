@@ -23,7 +23,7 @@ class Topic{
 		Topic(const Topic &) = delete;
 		Topic& operator=(const Topic &) = delete;
 
-		void PublishToCXL(void* message, size_t size);
+		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 
@@ -62,7 +62,7 @@ class TopicManager{
 		}
 		void CreateNewTopic(const char topic[32]);
 		void DeleteTopic(char topic[32]);
-		void PublishToCXL(char topic[32], void* message, size_t size);
+		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 

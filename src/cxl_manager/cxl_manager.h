@@ -9,10 +9,10 @@
 #include "common/config.h"
 #include "../embarlet/topic_manager.h"
 #include "../network_manager/network_manager.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/btree_map.h"
 
 namespace Embarcadero{
-
-#define NUM_BROKERS 4
 
 class TopicManager;
 class NetworkManager;
@@ -77,7 +77,7 @@ class CXLManager{
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
-		void Sequencer();
+		void Sequencer(const char* topic);
 
 		private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
