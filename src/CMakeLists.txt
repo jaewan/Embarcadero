@@ -48,6 +48,11 @@ add_executable(client
     client/client.h
 )
 
+target_include_directories(client PUBLIC
+	"${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+)
+
 target_link_libraries(client
     pubsub_grpc_proto
     cxxopts::cxxopts

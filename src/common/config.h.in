@@ -33,6 +33,8 @@ namespace Embarcadero{
 /// The threshold for the amount of retries we do before we consider a node dead.
 #define HEALTH_CHECK_FAILURE_THRESHOLD 5
 
+#define DEFAULT_CHANNEL "127.0.0.1:10110"
+
 struct PublishRequest{
 	int client_id;
 	size_t client_order; // Must start from 0

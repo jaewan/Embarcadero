@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include "common/config.h"
 
 namespace Embarcadero{
 
@@ -15,6 +16,23 @@ NetworkManager::NetworkManager(size_t queueCapacity, int num_receive_threads, in
 	for (int i = 0; i < num_ack_threads; i++) {
 		threads_.emplace_back(&NetworkManager::AckThread, this);
 	}
+	
+	// Wait for all ack threads to spawn
+	while (thread_count_.load() != num_ack_threads) {}
+
+	// Create service
+	// TODO(erika): make IP addr and port parameters
+    ServerBuilder builder;
+    builder.AddListeningPort(DEFAULT_CHANNEL, grpc::InsecureServerCredentials());
+    builder.RegisterService(&service_);
+	
+	// One completion queue per two receive threads. This is recommended in grpc perf docs
+	for (int i = 0; i < num_receive_threads / 2 + num_receive_threads % 2; i++) {
+		std::cout << "[NetworkManager]: Created completion queue " << i << std::endl;
+    	cqs_.push_back(builder.AddCompletionQueue());
+	}
+    server_ = builder.BuildAndStart();
+    std::cout << "[NetworkManager]: Server listening on " << DEFAULT_CHANNEL << std::endl;
 
 	// Create receive threads to process received gRPC messages
 	for (int i = 0; i < num_receive_threads; i++) {
@@ -71,7 +89,7 @@ char JaeDebugBuf[1024];
 std::chrono::high_resolution_clock::time_point start;
 */
 
-void NetworkManager::ReceiveThread(){
+void NetworkManager::ReceiveThread() {
 	std::cout << "[Network Manager]: \tStarting Receive I/O Thread" << std::endl;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 
