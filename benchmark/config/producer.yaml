@@ -1,6 +1,7 @@
-brokers: "0.0.0.0:9092,0.0.0.0:9093"
-topic: "latency_test_1"
-numMessages: 10000
-messageSize: 4000
-ack: "0"
-payload: "payloads/payload-4kb.data"
+brokers: "192.168.60.171:9093,192.168.60.171:9094,192.168.60.171:9095,192.168.60.171:9096"
+# brokers: "192.168.60.171:9093"
+topic: "cxl-test-2"
+numMessages: 1000
+messageSize: 1000
+ack: "1"
+payload: "payloads/payload-1kb.data"
