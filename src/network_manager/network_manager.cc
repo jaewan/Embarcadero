@@ -45,10 +45,18 @@ NetworkManager::NetworkManager(size_t queueCapacity, int num_receive_threads, in
 }
 
 NetworkManager::~NetworkManager() {
+
+	// We need to stop the receivers before we stop the ack queues
+	// Shutdown the gRPC server
+    server_->Shutdown();
+
+    // Always shutdown the completion queue after the server.
+	for (size_t i = 0; i < cqs_.size(); i++) {
+    	cqs_[i]->Shutdown();
+	}
+
 	// Notify threads we would like to stop
 	stop_threads_ = true;
-
-	// TODO: we need to stop the receivers before we stop the ack queues
 
 	// Write a nullopt to the ack queue, so the ack threads can finish flushing the queue
 	std::optional<struct NetworkRequest> sentinel = std::nullopt;
@@ -68,6 +76,7 @@ NetworkManager::~NetworkManager() {
 			thread.join();
 		}
 	}
+
 	std::cout << "[NetworkManager]: \tDestructed" << std::endl;
 }
 
@@ -90,33 +99,34 @@ std::chrono::high_resolution_clock::time_point start;
 */
 
 void NetworkManager::ReceiveThread() {
-	std::cout << "[Network Manager]: \tStarting Receive I/O Thread" << std::endl;
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	int recv_thread_id = thread_count_.fetch_add(1, std::memory_order_relaxed) - num_ack_threads_;
+	int my_cq_index = recv_thread_id / 2;
+	std::cout << "[Network Manager]: \tStarting Receive I/O Thread " << recv_thread_id << " with cq " << my_cq_index << std::endl;
+
+	// Spawn a new CallData instance to serve new clients.
+	if (!stop_threads_) {
+    	new CallData(&service_, cqs_[my_cq_index].get());
+    	void* tag;  // uniquely identifies a request.
+    	bool ok;
+    	while (!stop_threads_) {
+      		// Block waiting to read the next event from the completion queue. The
+      		// event is uniquely identified by its tag, which in this case is the
+      		// memory address of a CallData instance.
+      		// The return value of Next should always be checked. This return value
+      		// tells us whether there is any kind of event or cq is shutting down.
+      		GPR_ASSERT(cqs_[my_cq_index]->Next(&tag, &ok));
+			if (!ok) {
+				std::cout << "[Network Manager]: \tTerminating Receive I/O Thread " << recv_thread_id << std::endl;
+				return;
+			}
+      		static_cast<CallData*>(tag)->Proceed();
+    	}
+	}
 
 	// TODO: Implement this
 	//cxl_manager_->EnqueueRequest(pub_req);
 	//disk_manager_->EnqueueRequest(pub_req);
 }
-
-/*
-  // This can be run in multiple threads if needed.
-  void HandleRpcs() {
-    // Spawn a new CallData instance to serve new clients.
-    new CallData(&service_, cq_.get());
-    void* tag;  // uniquely identifies a request.
-    bool ok;
-    while (true) {
-      // Block waiting to read the next event from the completion queue. The
-      // event is uniquely identified by its tag, which in this case is the
-      // memory address of a CallData instance.
-      // The return value of Next should always be checked. This return value
-      // tells us whether there is any kind of event or cq_ is shutting down.
-      GPR_ASSERT(cq_->Next(&tag, &ok));
-      GPR_ASSERT(ok);
-      static_cast<CallData*>(tag)->Proceed();
-    }
-  }
-*/
 
 void NetworkManager::AckThread() {
 	std::cout << "[Network Manager]: \tStarting Acknowledgement I/O Thread" << std::endl;
