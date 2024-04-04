@@ -5,6 +5,7 @@
 #include <fstream>
 #include <unordered_map> 
 #include <yaml-cpp/yaml.h>
+#include <thread>
 
 class KafkaProducer {
     std::string errstr;
@@ -29,10 +30,10 @@ public:
         }
 
         // Might need these 2 configs to optimize for latency
-        if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
-            std::cerr << "% " << errstr << std::endl;
-            exit(1);
-        }
+        // if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
+        //     std::cerr << "% " << errstr << std::endl;
+        //     exit(1);
+        // }
 
         // if (conf->set("batch.size", "1000000", errstr) != RdKafka::Conf::CONF_OK) {
         //     std::cerr << "% " << errstr << std::endl;
@@ -102,21 +103,25 @@ int main() {
 
     std::string brokers = config["brokers"].as<std::string>();
     std::string topic_name = config["topic"].as<std::string>();
-    int num_messages = config["numMessages"].as<int>();
+    // int num_messages = config["numMessages"].as<int>();
     int num_bytes = config["messageSize"].as<int>();
     std::string ack = config["ack"].as<std::string>();
-    std::string payload_config = config["payload"].as<std::string>();
+    // std::string payload_config = config["payload"].as<std::string>();
 
-    std::vector<int> byte_sizes = {num_bytes};
-
-    // load payload from file
-    std::ifstream file(payload_config);    
-    std::string payload((std::istreambuf_iterator<char>(file)),
-                        std::istreambuf_iterator<char>());
+    std::vector<int> message_sizes = {1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 512000};
+    std::vector<std::string> payload_configs = {"config/payload-1kb.data", "config/payload-2kb.data", "config/payload-4kb.data", "config/payload-8kb.data", "config/payload-16kb.data", "config/payload-32kb.data", "config/payload-64kb.data", "config/payload-128kb.data", "config/payload-256kb.data", "config/payload-512kb.data"};
 
     KafkaProducer kp(brokers, topic_name, ack);
     // for each byte size, produce 10000 messages    
-    for (auto num_bytes : byte_sizes) {
+    for (int i = 0; i < message_sizes.size(); ++i) {
+
+        // load payload from file
+        std::ifstream file(payload_configs[i]);    
+        std::string payload((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+
+        // sleep for 5 seconds
+        std::this_thread::sleep_for(std::chrono::seconds(5));
 
         /* For constant payload */
         // start time for throughput
@@ -129,7 +134,7 @@ int main() {
         // }
 
         auto start = std::chrono::system_clock::now();
-        for (int i = 0; i < num_messages; ++i) {
+        for (int i = 0; i < message_sizes[i]; ++i) {
 
             /* For random payload */
             // start time for throughput
@@ -161,7 +166,7 @@ int main() {
         std::chrono::duration<double> elapsed_seconds = end - start;
         
         // calculate throughput
-        double throughput = (static_cast<double>(num_bytes) * num_messages) / elapsed_seconds.count();
+        double throughput = (static_cast<double>(num_bytes) * message_sizes[i]) / elapsed_seconds.count();
         throughput /= 1024 * 1024;
 
         std::cerr << "Throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;

@@ -49,7 +49,7 @@ int main() {
     std::string brokers = config["brokers"].as<std::string>();
     std::string topic_name = config["topic"].as<std::string>();
     int num_messages = config["numMessages"].as<int>();
-    int num_bytes = config["messageSize"].as<int>();
+    // int num_bytes = config["messageSize"].as<int>();
 
     KafkaConsumer kc(brokers);
     RdKafka::Topic *topic = RdKafka::Topic::create(kc.rk, topic_name, nullptr, kc.errstr);
@@ -63,6 +63,8 @@ int main() {
     // initialize empty vector for latencies
     std::vector<int64_t> latencies;
     int64_t count = 0;
+    std::vector<int> message_sizes = {1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 512000};
+    int64_t message_sizes_count = 0;
     std::chrono::time_point<std::chrono::system_clock> start;
     std::chrono::time_point<std::chrono::system_clock> end;
     while (true) {
@@ -109,10 +111,15 @@ int main() {
                     std::chrono::duration<double> elapsed_seconds = end - start;
         
                     // calculate throughput
-                    double throughput = (static_cast<double>(num_bytes) * num_messages) / elapsed_seconds.count();
+                    double throughput = (static_cast<double>(message_sizes[message_sizes_count]) * num_messages) / elapsed_seconds.count();
                     throughput /= 1024 * 1024;
 
-                    std::cerr << "Throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
+                    std::cerr << "Throughput for " << message_sizes[message_sizes_count] << " bytes: " << throughput << " MB/s" << std::endl;
+                    
+                    message_sizes_count++;
+                    if (message_sizes_count == message_sizes.size()) {
+                        message_sizes_count = 0;
+                    }
 
                     // Print average latency
                     int64_t sum = 0;
