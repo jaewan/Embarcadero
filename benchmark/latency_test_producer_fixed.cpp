@@ -103,8 +103,8 @@ int main() {
 
     std::string brokers = config["brokers"].as<std::string>();
     std::string topic_name = config["topic"].as<std::string>();
-    // int num_messages = config["numMessages"].as<int>();
-    int num_bytes = config["messageSize"].as<int>();
+    int num_messages = config["numMessages"].as<int>();
+    // int num_bytes = config["messageSize"].as<int>();
     std::string ack = config["ack"].as<std::string>();
     // std::string payload_config = config["payload"].as<std::string>();
 
@@ -134,7 +134,7 @@ int main() {
         // }
 
         auto start = std::chrono::system_clock::now();
-        for (int i = 0; i < message_sizes[i]; ++i) {
+        for (int i = 0; i < num_messages; ++i) {
 
             /* For random payload */
             // start time for throughput
@@ -166,10 +166,10 @@ int main() {
         std::chrono::duration<double> elapsed_seconds = end - start;
         
         // calculate throughput
-        double throughput = (static_cast<double>(num_bytes) * message_sizes[i]) / elapsed_seconds.count();
+        double throughput = (static_cast<double>(message_sizes[i]) * num_messages) / elapsed_seconds.count();
         throughput /= 1024 * 1024;
 
-        std::cerr << "Throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
+        std::cerr << "Throughput for " << message_sizes[i] << " bytes: " << throughput << " MB/s" << std::endl;
     }
 
     return 0;
