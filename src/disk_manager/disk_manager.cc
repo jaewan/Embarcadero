@@ -70,10 +70,7 @@ void DiskManager::Disk_io_thread(){
 		}else if(req.acknowledge){
 			struct NetworkRequest req;
 			req.req_type = Acknowledge;
-			network_manager_->EnqueueRequest(req);
-			//TODO(Jae)
-			//Enque ack request to network manager
-			// network_manager_.EnqueueAckRequest();
+			network_manager_->EnqueueAck(req);
 		}
 	}
 }

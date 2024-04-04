@@ -9,8 +9,11 @@
 #include "absl/strings/str_format.h"
 #include <grpcpp/grpcpp.h>
 
+#include "common/config.h"
 #include <pubsub.grpc.pb.h>
 #include "../client/client.h"
+#include "../disk_manager/disk_manager.h"
+#include "../cxl_manager/cxl_manager.h"
 
 using grpc::Server;
 using grpc::ServerAsyncResponseWriter;
@@ -19,6 +22,7 @@ using grpc::ServerCompletionQueue;
 using grpc::ServerContext;
 using grpc::Status;
 
+/*
 class NetworkManager final {
  public:
   NetworkManager(size_t num_net_threads);
@@ -120,10 +124,7 @@ class NetworkManager final {
   PubSub::AsyncService service_;
   std::unique_ptr<Server> server_;
 };
-
-#include "common/config.h"
-#include "../disk_manager/disk_manager.h"
-#include "../cxl_manager/cxl_manager.h"
+*/
 
 namespace Embarcadero{
 
@@ -137,9 +138,9 @@ struct NetworkRequest{
 
 class NetworkManager{
 	public:
-		NetworkManager(size_t queueCapacity, int num_io_threads=NUM_NETWORK_IO_THREADS);
+		NetworkManager(size_t queueCapacity, int num_receive_threads=NUM_IO_RECEIVE_THREADS, int num_ack_threads=NUM_IO_ACK_THREADS);
 		~NetworkManager();
-		void EnqueueRequest(struct NetworkRequest);
+    void EnqueueAck(std::optional<struct NetworkRequest> req);
 		void SetDiskManager(DiskManager* disk_manager){
 			disk_manager_ = disk_manager;
 		}
@@ -150,16 +151,16 @@ class NetworkManager{
 	private:
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
-		void Network_io_thread();
-		void MainThread();
+		void ReceiveThread();
 		void AckThread();
-		int GetBuffer();
+		//int GetBuffer();
 
 		std::vector<std::thread> threads_;
-		int num_io_threads_;
+    int num_receive_threads_;
+    int num_ack_threads_;
 
-		char *buffers_[NUM_BUFFERS];
-		std::atomic<int> buffers_counters_[NUM_BUFFERS];
+		//char *buffers_[NUM_BUFFERS];
+		//std::atomic<int> buffers_counters_[NUM_BUFFERS];
 
 		CXLManager *cxl_manager_;
 		DiskManager *disk_manager_;

@@ -28,7 +28,7 @@ int main(int argc, char* argv[]){
 	int broker_id = 0;
 	Embarcadero::CXLManager cxl_manager(10000, broker_id, cxl_type);
 	Embarcadero::DiskManager disk_manager(10000);
-	Embarcadero::NetworkManager network_manager(100000, NUM_NETWORK_IO_THREADS);
+	Embarcadero::NetworkManager network_manager(100000, NUM_IO_RECEIVE_THREADS, NUM_IO_ACK_THREADS);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
 	cxl_manager.SetTopicManager(&topic_manager);
@@ -62,7 +62,7 @@ int main(int argc, char* argv[]){
 	req.req_type = Embarcadero::Test;
 	std::cout <<"Submitting reqs" << std::endl;
 	for(int i =0; i<1000000; i++){
-		network_manager.EnqueueRequest(req);
+		network_manager.EnqueueAck(req);
 	}
 	std::cout <<"Submitted all reqs" << std::endl;
 	//cxl_manager.EnqueueRequest(req);
@@ -134,9 +134,10 @@ int main(int argc, char* argv[]){
 	delete pq;
 	*/
 
+	/*
 	size_t num_net_threads = 3;
 	NetworkManager network_manager(num_net_threads);
 	network_manager.Run(DEFAULT_PORT);
-
+	*/
 	return 0;
 }
