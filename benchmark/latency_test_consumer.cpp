@@ -86,7 +86,7 @@ int main() {
                 // delete content in latencies
                 latencies.clear();
             } else if (rkmessage->err()) {
-                // std::cerr << "% Consumer error: " << rkmessage->errstr() << std::endl;
+                //std::cerr << "% Consumer error: " << rkmessage->errstr() << std::endl;
             } else {
                 int64_t timestamp = rkmessage->timestamp().timestamp;
 
