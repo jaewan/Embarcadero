@@ -91,7 +91,7 @@ public:
 };
 
 int main() {
-    std::ifstream config_file("config/producer.yaml");
+    std::ifstream config_file("config/fixed_producer.yaml");
     if (!config_file.is_open()) {
         std::cerr << "Failed to open YAML file." << std::endl;
         return 1;
