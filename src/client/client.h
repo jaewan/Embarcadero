@@ -5,13 +5,11 @@
 #include <string>
 #include <grpcpp/grpcpp.h>
 #include <pubsub.grpc.pb.h>
+#include "common/config.h"
 
 using grpc::Channel;
 using grpc::ClientContext;
 using grpc::Status;
-
-#define DEFAULT_CHANNEL "127.0.0.1:10110"
-#define DEFAULT_PORT 10110
 
 // Note: if you change this type, change also in pubsub.proto
 typedef uint64_t Topic;
