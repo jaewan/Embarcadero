@@ -46,12 +46,12 @@ class PubSubClient {
             : stub_(PubSub::NewStub(channel)) {}
 
         PublisherError Publish(Topic topic, int msgflags, const char *payload, size_t len) {
-            PublishRequest req;
+            GRPCPublishRequest req;
             req.set_ack_level(ACK0); // TODO: get this from config
             req.set_topic(topic);
             req.set_payload(payload, len);
 
-            PublishResponse res;
+            GRPCPublishResponse res;
 
             ClientContext context;
 
