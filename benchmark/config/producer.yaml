@@ -3,3 +3,4 @@ topic: "latency_test_1"
 numMessages: 10000
 messageSize: 4000
 ack: "0"
+payload: "payloads/payload-4kb.data"

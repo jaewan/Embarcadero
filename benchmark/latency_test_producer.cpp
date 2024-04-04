@@ -105,11 +105,12 @@ int main() {
     int num_messages = config["numMessages"].as<int>();
     int num_bytes = config["messageSize"].as<int>();
     std::string ack = config["ack"].as<std::string>();
+    std::string payload = config["payload"].as<std::string>();
 
     std::vector<int> byte_sizes = {num_bytes};
 
     // load payload from file
-    std::ifstream file("payloads/payload-4kb.data");    
+    std::ifstream file(payload);    
     std::string payload((std::istreambuf_iterator<char>(file)),
                         std::istreambuf_iterator<char>());
 
