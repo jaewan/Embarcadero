@@ -91,26 +91,26 @@ public:
 };
 
 int main() {
-    std::ifstream file("config/producer.yaml");
-    if (!file.is_open()) {
+    std::ifstream config_file("config/producer.yaml");
+    if (!config_file.is_open()) {
         std::cerr << "Failed to open YAML file." << std::endl;
         return 1;
     }
 
     // Parse the YAML file
-    YAML::Node config = YAML::Load(file);
+    YAML::Node config = YAML::Load(config_file);
 
     std::string brokers = config["brokers"].as<std::string>();
     std::string topic_name = config["topic"].as<std::string>();
     int num_messages = config["numMessages"].as<int>();
     int num_bytes = config["messageSize"].as<int>();
     std::string ack = config["ack"].as<std::string>();
-    std::string payload = config["payload"].as<std::string>();
+    std::string payload_config = config["payload"].as<std::string>();
 
     std::vector<int> byte_sizes = {num_bytes};
 
     // load payload from file
-    std::ifstream file(payload);    
+    std::ifstream file(payload_config);    
     std::string payload((std::istreambuf_iterator<char>(file)),
                         std::istreambuf_iterator<char>());
 
@@ -150,7 +150,7 @@ int main() {
         }
 
         std::cerr << "% Flushing final messages..." << std::endl;
-        kp.flush(10 * 100000 /* wait for max 1000 seconds */);
+        kp.flush(10 * 10000 /* wait for max 100 seconds */);
 
         if (kp.outq_len() > 0)
             std::cerr << "% " << kp.outq_len()
