@@ -2,17 +2,17 @@ syntax = "proto3";
 
 service PubSub {
     // Allows a publish to try to publish a message
-    rpc Publish(PublishRequest) returns (PublishResponse);
+    rpc Publish(GRPCPublishRequest) returns (GRPCPublishResponse);
 }
 
 // Request containing address and port of sender (new broker)
-message PublishRequest {
+message GRPCPublishRequest {
     uint32 ack_level = 1;
     uint64 topic = 2;
     bytes payload = 3; // TODO: this is limited to be 2**23
 }
 
 // Empty response for now
-message PublishResponse {
+message GRPCPublishResponse {
     uint32 error = 1;
 }

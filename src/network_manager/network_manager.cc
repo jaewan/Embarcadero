@@ -80,6 +80,26 @@ void NetworkManager::ReceiveThread(){
 	//disk_manager_->EnqueueRequest(pub_req);
 }
 
+/*
+  // This can be run in multiple threads if needed.
+  void HandleRpcs() {
+    // Spawn a new CallData instance to serve new clients.
+    new CallData(&service_, cq_.get());
+    void* tag;  // uniquely identifies a request.
+    bool ok;
+    while (true) {
+      // Block waiting to read the next event from the completion queue. The
+      // event is uniquely identified by its tag, which in this case is the
+      // memory address of a CallData instance.
+      // The return value of Next should always be checked. This return value
+      // tells us whether there is any kind of event or cq_ is shutting down.
+      GPR_ASSERT(cq_->Next(&tag, &ok));
+      GPR_ASSERT(ok);
+      static_cast<CallData*>(tag)->Proceed();
+    }
+  }
+*/
+
 void NetworkManager::AckThread() {
 	std::cout << "[Network Manager]: \tStarting Acknowledgement I/O Thread" << std::endl;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
