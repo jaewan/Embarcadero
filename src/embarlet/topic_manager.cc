@@ -67,14 +67,14 @@ void TopicManager::CreateNewTopic(const char topic[32]){
 void TopicManager::DeleteTopic(char topic[32]){
 }
 
-void TopicManager::PublishToCXL(char topic[32], void* message, size_t size){
-	auto topic_itr = topics_.find(topic);
+void TopicManager::PublishToCXL(PublishRequest &req){
+	auto topic_itr = topics_.find(req.topic);
 	//TODO(Jae) if not found from topics_, inspect CXL TInode region too
 	if (topic_itr == topics_.end()){
-		if(memcmp(topic, ((struct TInode*)(cxl_manager_.GetTInode(topic)))->topic, 32));
+		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, 32));
 		perror("Topic not found");
 	}
-	topic_itr->second->PublishToCXL(message, size);
+	topic_itr->second->PublishToCXL(req);
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -105,9 +105,10 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 	//TODO(Jae) have cache for disk as well
 }
 
-void Topic::PublishToCXL(void* message, size_t size){
+void Topic::PublishToCXL(PublishRequest &req){
 	void* log;
 	int logical_offset;
+	size_t size = req.size;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 	{
 		absl::MutexLock lock(&mu_);
@@ -130,12 +131,14 @@ void Topic::PublishToCXL(void* message, size_t size){
 	}
 
 	struct NonCriticalMessageHeader msg_header;
+	msg_header.client_id= req.client_id;
+	msg_header.client_order= req.client_order;
 	msg_header.logical_offset = logical_offset;
 	msg_header.size = size;
 	msg_header.segment_header = segment_metadata_;
 
 	nt_memcpy(log, &msg_header, sizeof(msg_header));
-	nt_memcpy((uint8_t*)log + msg_header_size, message, size);
+	nt_memcpy((uint8_t*)log + msg_header_size, req.payload_address, req.size);
 
 	{
 		absl::MutexLock lock(&mu_);

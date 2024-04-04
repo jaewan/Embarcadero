@@ -52,6 +52,7 @@ void NetworkManager::EnqueueRequest(struct NetworkRequest req){
 #define READ_SIZE 1024
 #define MSG_SIZE 1000000
 struct EmbarcaderoReq{
+	size_t client_id;
 	size_t client_order;
 	char topic[32];
 	size_t ack;
@@ -74,26 +75,27 @@ void NetworkManager::Network_io_thread(){
 		switch(req.req_type){
 			case Receive:
 				//TODO(Jae) define if its publish or subscribe
-				{
-				int buffer_off = GetBuffer();
-				char* buf = buffers_[buffer_off];
-				ssize_t bytes_read = read(req.client_socket, buf, READ_SIZE);
-				struct EmbarcaderoReq *clientReq = (struct EmbarcaderoReq*)buf;
-				// Create publish request
-				struct PublishRequest pub_req;
-				pub_req.client_id = 0;
-				pub_req.client_order = clientReq->client_order;
-				pub_req.topic[0] = '0';
-				pub_req.acknowledge = true;
-				pub_req.payload_address = (uint8_t*)buf + sizeof(EmbarcaderoReq);
-				pub_req.counter = &buffers_counters_[buffer_off];
-				pub_req.size = clientReq->size;
+				while(true){
+					int buffer_off = GetBuffer();
+					char* buf = buffers_[buffer_off];
+					int bytes_read = read(req.client_socket, buf, READ_SIZE);
+					if(bytes_read <= 0)
+						break;
+					struct EmbarcaderoReq *clientReq = (struct EmbarcaderoReq*)buf;
+					// Create publish request
+					struct PublishRequest pub_req;
+					pub_req.client_id = clientReq->client_id;
+					pub_req.client_order = clientReq->client_order;
+					memcpy(pub_req.topic, clientReq->topic, 32);
+					pub_req.acknowledge = clientReq->ack;
+					pub_req.payload_address = (uint8_t*)buf + sizeof(EmbarcaderoReq);
+					pub_req.counter = &buffers_counters_[buffer_off];
+					pub_req.size = clientReq->size;
 
-				cxl_manager_->EnqueueRequest(pub_req);
-				disk_manager_->EnqueueRequest(pub_req);
-
-				close(req.client_socket);
+					cxl_manager_->EnqueueRequest(pub_req);
+					disk_manager_->EnqueueRequest(pub_req);
 				}
+				close(req.client_socket);
 				break;
 			case Send:
 				std::cout << "Send" << std::endl;
@@ -124,18 +126,24 @@ void NetworkManager::Network_io_thread(){
 void NetworkManager::AckThread(){
 	std::optional<struct NetworkRequest> optReq;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	static std::atomic<int> JaeDebugCount{0};
+	static std::atomic<int> JaeDebugDiskCount{0};
 
 	while(!stop_threads_){
 		ackQueue_.blockingRead(optReq);
 		if(!optReq.has_value()){
 			break;
 		}
-		static std::atomic<int> JaeDebugCount{0};
+		const struct NetworkRequest &req = optReq.value();
+		if(req.client_socket == -1){
+			JaeDebugDiskCount.fetch_add(1, std::memory_order_relaxed);
+		}
 		JaeDebugCount.fetch_add(1, std::memory_order_relaxed);
 		if(JaeDebugCount == MSG_SIZE){
 			auto end = std::chrono::high_resolution_clock::now();
 			auto dur = end - start;
 			std::cout<<std::chrono::duration_cast<std::chrono::milliseconds>(dur).count() << std::endl;
+			std::cout<< "Disk ack:" << JaeDebugDiskCount << std::endl;
 		}
 	}
 }
