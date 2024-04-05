@@ -16,9 +16,6 @@ add_executable(embarlet
     cxl_manager/cxl_manager.h 
     network_manager/network_manager.cc
     network_manager/network_manager.h 
-    embarlet/pub_queue.cc 
-    embarlet/pub_queue.h 
-    embarlet/pub_task.h 
     embarlet/peer.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
