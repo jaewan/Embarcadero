@@ -116,13 +116,15 @@ void CXLManager::CXL_io_thread(){
 				struct NetworkRequest ack_req;
 				ack_req.req_type = Acknowledge;
 				ack_req.grpcTag = req.grpcTag;
-				std::cout << "CXLManager enqueing value to ack queue" << std::endl;
+				printf("DiskManager enquing to ack queue, tag=%p\n", ack_req.grpcTag);
 				network_manager_->EnqueueAck(ack_req);
 			} else {
 				// gRPC has already sent response, so here we can just free the CallData object.
 				std::cout << "CXLManager calling proceed on call data" << std::endl;
 				network_manager_->Proceed(req.grpcTag);
 			}
+		} else {
+			std::cout << "CXLManager got counter: " << counter << std::endl;
 		}
 	}
 }

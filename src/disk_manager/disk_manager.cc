@@ -61,7 +61,7 @@ void DiskManager::Disk_io_thread(){
 		}
 		const struct PublishRequest &req = optReq.value();
 		int off = offset_.fetch_add(req.req->payload_size(), std::memory_order_relaxed);
-		std::cout << "Received payload is: " << req.req->payload().c_str() << std::endl;
+		std::cout << "[DiskManager]: Received payload is: " << req.req->payload().c_str() << std::endl;
 		pwrite(log_fd_, req.req->payload().c_str(), req.req->payload_size(), off);
 
 		// Post I/O work (as disk I/O depend on the same payload)
@@ -70,17 +70,22 @@ void DiskManager::Disk_io_thread(){
 		// If no more tasks are left to do
 		if (counter == 0) {
 			if (req.req->acknowledge()) {
-				// Signal GRPC to send acknowledgement
-				// TODO(erika) send CallData object to NetworkManager Ack thread and set result
-				//call_data.reply_.set_error(ERR_NO_ERROR);
+				// TODO: Set result - just assume success
+				network_manager_->SetError(req.grpcTag, ERR_NO_ERROR);
 
-				struct NetworkRequest req;
-				req.req_type = Acknowledge;
-				network_manager_->EnqueueAck(req);
+				// Send to network manager ack queue
+				struct NetworkRequest ack_req;
+				ack_req.req_type = Acknowledge;
+				ack_req.grpcTag = req.grpcTag;
+				printf("DiskManager enquing to ack queue, tag=%p\n", ack_req.grpcTag);
+				network_manager_->EnqueueAck(ack_req);
 			} else {
-				// TODO(erika) gRPC has already sent response, so here we can just free the CallData object.
-				// call_data.Finish();
+				// gRPC has already sent response, so here we can just free the CallData object.
+				std::cout << "DiskManager calling proceed on call data" << std::endl;
+				network_manager_->Proceed(req.grpcTag);
 			}
+		} else {
+			std::cout << "DiskManager got counter: " << counter << std::endl;
 		}
 	}
 }
