@@ -35,10 +35,10 @@ public:
         //     exit(1);
         // }
 
-        // if (conf->set("batch.size", "1000000", errstr) != RdKafka::Conf::CONF_OK) {
-        //     std::cerr << "% " << errstr << std::endl;
-        //     exit(1);
-        // }
+        if (conf->set("batch.size", "5000000", errstr) != RdKafka::Conf::CONF_OK) {
+            std::cerr << "% " << errstr << std::endl;
+            exit(1);
+        }
 
         producer = RdKafka::Producer::create(conf, errstr);
         if (!producer) {
