@@ -121,11 +121,11 @@ int main() {
         RdKafka::ErrorCode err = kp.produce(payload);
         if (err != RdKafka::ERR_NO_ERROR) {
             std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
+        } else {
+            num_messages_sent++;
         }
 
         kp.poll(0);
-
-        num_messages_sent++;
 
         stream_end = std::chrono::system_clock::now();
     }
