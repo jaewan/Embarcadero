@@ -40,12 +40,12 @@ public:
         //     exit(1);
         // }
 
-        if (conf->set("queue.buffering.max.messages", std::to_string(num_bytes), errstr) != RdKafka::Conf::CONF_OK) {
+        if (conf->set("queue.buffering.max.messages", std::to_string(num_bytes * 2), errstr) != RdKafka::Conf::CONF_OK) {
             std::cerr << "% " << errstr << std::endl;
             exit(1);
         }
 
-        if (conf->set("message.max.bytes", std::to_string(num_bytes), errstr) != RdKafka::Conf::CONF_OK) {
+        if (conf->set("message.max.bytes", std::to_string(num_bytes * 2), errstr) != RdKafka::Conf::CONF_OK) {
             std::cerr << "% " << errstr << std::endl;
             exit(1);
         }
