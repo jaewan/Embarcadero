@@ -12,7 +12,7 @@ int main(int argc, char* argv[]){
         client_order: 0, // TODO(erika): how is this set?
     };
     PubSubClient pubsub(&config, grpc::CreateChannel(DEFAULT_CHANNEL, grpc::InsecureChannelCredentials()));
-    PublisherError pub_ret = pubsub.Publish("mytopic", "mymsg", strlen("mymsg"));
+    PublisherError pub_ret = pubsub.Publish("a", "mymsg", strlen("mymsg"));
     std::cout << "Publisher received: " << pub_ret << std::endl;
     return 0;
 }

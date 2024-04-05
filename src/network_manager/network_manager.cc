@@ -40,9 +40,9 @@ class NetworkManager::CallData {
 		std::cout << "Creating new CallData object in CallData" << std::endl;
         new CallData(service_, cq_, cxl_manager_, disk_manager_);
         PublishRequest req;
-	      std::atomic<int> c{2};
-        req.counter = &c;
+        req.counter = new std::atomic<int>(1);
         req.req = &request_;
+		req.grpcTag = this;
 
         if (request_.acknowledge()) {
           // Wait for acknowlegment to respond
@@ -53,8 +53,8 @@ class NetworkManager::CallData {
           responder_.Finish(reply_, Status::OK, this);
         }
         // No matter what, we need to do processing tasks.
-        //cxl_manager_->EnqueueRequest(req);
-	      disk_manager_->EnqueueRequest(req);
+        cxl_manager_->EnqueueRequest(req);
+		disk_manager_->EnqueueRequest(req);
 
       } else if (status_ == ACKNOWLEDGE) {
         std::cout << "Acknowledging the CallData() object" << std::endl;
@@ -259,6 +259,7 @@ void NetworkManager::AckThread() {
 		
 		std::cout << "[NetworkManager]: AckThread calling proceed on CallData" << std::endl;
 		struct NetworkRequest net_req = optReq.value();
+		printf("[NetworkManager]: Got net_req, tag=%p\n", net_req.grpcTag);
     	static_cast<CallData*>(net_req.grpcTag)->Proceed();
 	}
 }

@@ -35,16 +35,9 @@ int main(int argc, char* argv[]){
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
 
-/*
-	char topic[32];
-	memset(topic, 0, 32);
-	topic[0] = '0';
-	topic_manager.CreateNewTopic(topic);
-	*/
 	//********* Load Generate **************
-	char topic[32];
-	memset(topic, 0, 32);
-	topic[0] = '0';
+	char topic[32] = { 0 };
+	topic[0] = 'a';
 	topic_manager.CreateNewTopic(topic);
 
 	/*
