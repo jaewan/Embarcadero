@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cstddef>
 
+#include <pubsub.grpc.pb.h>
+
 namespace Embarcadero{
 // the configured options and settings for Embarcadero
 #define Embarcadero_VERSION_MAJOR 0.1
@@ -36,13 +38,8 @@ namespace Embarcadero{
 #define DEFAULT_CHANNEL "127.0.0.1:10110"
 
 struct PublishRequest{
-	int client_id;
-	size_t client_order; // Must start from 0
-	char topic[MAX_TOPIC_NAME_SIZE];
-	bool acknowledge;
 	std::atomic<int> *counter;
-	void* payload_address;
-	size_t size;
+	GRPCPublishRequest *req;
 };
 
 } // End of namespace Embarcadero

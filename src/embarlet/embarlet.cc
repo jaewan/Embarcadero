@@ -58,6 +58,8 @@ int main(int argc, char* argv[]){
 	req.size = 1024;
 	req.acknowledge = true;
 	*/
+
+	/*
 	Embarcadero::NetworkRequest req;
 	req.req_type = Embarcadero::Test;
 	std::cout <<"Submitting reqs" << std::endl;
@@ -74,6 +76,9 @@ int main(int argc, char* argv[]){
 	size_t messages_size;
 	size_t last_offset = 0;
 	cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
+	*/
+
+    sleep(60);
 
 	/*
 	//Embarcadero::CXLManager cxlmanager;

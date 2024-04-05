@@ -60,17 +60,27 @@ void DiskManager::Disk_io_thread(){
 			break;
 		}
 		const struct PublishRequest &req = optReq.value();
-		int off = offset_.fetch_add(req.size, std::memory_order_relaxed);
-		pwrite(log_fd_, req.payload_address, req.size, off);
+		int off = offset_.fetch_add(req.req->payload_size(), std::memory_order_relaxed);
+		std::cout << "Received payload is: " << req.req->payload().c_str() << std::endl;
+		pwrite(log_fd_, req.req->payload().c_str(), req.req->payload_size(), off);
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
-		if( counter == 1){
-			//free(req.payload_address);
-		}else if(req.acknowledge){
-			struct NetworkRequest req;
-			req.req_type = Acknowledge;
-			network_manager_->EnqueueAck(req);
+
+		// If no more tasks are left to do
+		if (counter == 0) {
+			if (req.req->acknowledge()) {
+				// Signal GRPC to send acknowledgement
+				// TODO(erika) send CallData object to NetworkManager Ack thread and set result
+				//call_data.reply_.set_error(ERR_NO_ERROR);
+
+				struct NetworkRequest req;
+				req.req_type = Acknowledge;
+				network_manager_->EnqueueAck(req);
+			} else {
+				// TODO(erika) gRPC has already sent response, so here we can just free the CalData object.
+				// call_data.Finish();
+			}
 		}
 	}
 }
