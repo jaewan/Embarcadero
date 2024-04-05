@@ -153,6 +153,9 @@ int main() {
 
     // print elapsed seconds
     std::cerr << "Elapsed time: " << elapsed_seconds.count() << " seconds" << std::endl;
+
+    // print number of messages sent
+    std::cerr << "Number of messages sent: " << num_messages_sent << std::endl;
     
     // calculate throughput
     double throughput = (static_cast<double>(num_bytes) * num_messages_sent) / elapsed_seconds.count();
