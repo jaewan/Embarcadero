@@ -140,6 +140,9 @@ int main() {
 
         stream_end = std::chrono::system_clock::now();
         elapsed_seconds_stream_end = stream_end - start;
+
+        // print elapsed seconds
+        std::cerr << "Elapsed time during producing: " << elapsed_seconds_stream_end.count() << " seconds" << std::endl;
     }
 
     auto end_before_flush = std::chrono::system_clock::now();
