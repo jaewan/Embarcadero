@@ -115,9 +115,9 @@ int main() {
                         std::istreambuf_iterator<char>());
 
     auto start = std::chrono::system_clock::now();
-    auto end = std::chrono::system_clock::now();
+    auto stream_end = std::chrono::system_clock::now();
     int num_messages_sent = 0;
-    while((std::chrono::duration_cast<std::chrono::seconds>(end - start).count() <= duration)) {
+    while((std::chrono::duration_cast<std::chrono::seconds>(stream_end - start).count() <= duration)) {
         RdKafka::ErrorCode err = kp.produce(payload);
         if (err != RdKafka::ERR_NO_ERROR) {
             std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
@@ -127,7 +127,7 @@ int main() {
 
         num_messages_sent++;
 
-        end = std::chrono::system_clock::now();
+        stream_end = std::chrono::system_clock::now();
     }
 
     std::cerr << "% Flushing final messages..." << std::endl;
