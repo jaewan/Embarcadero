@@ -29,7 +29,7 @@ class DiskManager;
 enum NetworkRequestType {Acknowledge, Receive, Send, Test};
 struct NetworkRequest{
 	NetworkRequestType req_type;
-	int client_socket;
+	void *grpcTag;
 };
 
 class NetworkManager{
@@ -37,17 +37,18 @@ class NetworkManager{
 		NetworkManager(size_t queueCapacity, int num_receive_threads=NUM_IO_RECEIVE_THREADS, int num_ack_threads=NUM_IO_ACK_THREADS);
 		~NetworkManager();
     void EnqueueAck(std::optional<struct NetworkRequest> req);
+	void Proceed(void *grpcTag);
+	void SetError(void *grpcTag, PublisherError err);
 		void SetDiskManager(DiskManager* disk_manager){
 			disk_manager_ = disk_manager;
 		}
 		void SetCXLManager(CXLManager* cxl_manager){
 			cxl_manager_ = cxl_manager;
 		}
+	// Class encompasing the state and logic needed to serve a request.
+	class CallData;
 
 	private:
-    // Class encompasing the state and logic needed to serve a request.
-    class CallData;
-    
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
 		void ReceiveThread();

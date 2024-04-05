@@ -109,16 +109,19 @@ void CXLManager::CXL_io_thread(){
 		// If no more tasks are left to do
 		if (counter == 0) {
 			if (req.req->acknowledge()) {
-				// Signal GRPC to send acknowledgement
-				// TODO(erika) send CallData object to NetworkManager Ack thread and set result
-				//call_data.reply_.set_error(ERR_NO_ERROR);
+				// TODO: Set result - just assume success
+				network_manager_->SetError(req.grpcTag, ERR_NO_ERROR);
 
-				struct NetworkRequest req;
-				req.req_type = Acknowledge;
-				network_manager_->EnqueueAck(req);
+				// Send to network manager ack queue
+				struct NetworkRequest ack_req;
+				ack_req.req_type = Acknowledge;
+				ack_req.grpcTag = req.grpcTag;
+				std::cout << "CXLManager enqueing value to ack queue" << std::endl;
+				network_manager_->EnqueueAck(ack_req);
 			} else {
-				// TODO(erika) gRPC has already sent response, so here we can just free the CallData object.
-				// call_data.Finish();
+				// gRPC has already sent response, so here we can just free the CallData object.
+				std::cout << "CXLManager calling proceed on call data" << std::endl;
+				network_manager_->Proceed(req.grpcTag);
 			}
 		}
 	}

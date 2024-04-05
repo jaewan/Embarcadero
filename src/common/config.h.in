@@ -40,6 +40,7 @@ namespace Embarcadero{
 struct PublishRequest{
 	std::atomic<int> *counter;
 	GRPCPublishRequest *req;
+	void *grpcTag;
 };
 
 } // End of namespace Embarcadero
