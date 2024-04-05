@@ -19,10 +19,12 @@ class NetworkManager::CallData {
     }
 
     void Proceed() {
+		std::cout << "In CallData.Proceed() with status_ == " << status_ << std::endl;
       if (status_ == CREATE) {
         // Make this instance progress to the PROCESS state.
         std::cout << "Creating call data, asking for RPC" << std::endl;
         status_ = PROCESS;
+		reply_.set_error(ERR_NO_ERROR);
 
         // As part of the initial CREATE state, we *request* that the system
         // start processing SayHello requests. In this request, "this" acts are
@@ -35,13 +37,12 @@ class NetworkManager::CallData {
         // Spawn a new CallData instance to serve new clients while we process
         // the one for this CallData. The instance will deallocate itself as
         // part of its FINISH state.
+		std::cout << "Creating new CallData object in CallData" << std::endl;
         new CallData(service_, cq_, cxl_manager_, disk_manager_);
-
         PublishRequest req;
 	      std::atomic<int> c{2};
         req.counter = &c;
         req.req = &request_;
-        reply_.set_error(ERR_NO_ERROR);
 
         if (request_.acknowledge()) {
           // Wait for acknowlegment to respond
@@ -72,6 +73,13 @@ class NetworkManager::CallData {
         }
       }
     }
+
+	void SetError(PublisherError err) {
+		// Only overwrite error if currently a success
+		if (reply_.error() == ERR_NO_ERROR) {
+			reply_.set_error(err);
+		}
+	}
 
     void Finish() {
         GPR_ASSERT(status_ == FINISH);
@@ -188,6 +196,14 @@ void NetworkManager::EnqueueAck(std::optional<struct NetworkRequest> req) {
 	ackQueue_.blockingWrite(req);
 }
 
+void NetworkManager::Proceed(void *grpcTag) {
+	static_cast<CallData*>(grpcTag)->Proceed();
+}
+
+void NetworkManager::SetError(void *grpcTag, PublisherError err) {
+	static_cast<CallData*>(grpcTag)->SetError(ERR_NO_ERROR);
+}
+
 /*
 #define READ_SIZE 1024
 #define MSG_SIZE 1000000
@@ -240,8 +256,10 @@ void NetworkManager::AckThread() {
 			std::cout << "[Network Manager]: \tTerminating Acknoweldgement I/O Thread" << std::endl;
 			return;
 		}
-
-		// TODO(erika): do something with the message
+		
+		std::cout << "[NetworkManager]: AckThread calling proceed on CallData" << std::endl;
+		struct NetworkRequest net_req = optReq.value();
+    	static_cast<CallData*>(net_req.grpcTag)->Proceed();
 	}
 }
 
@@ -260,31 +278,3 @@ int NetworkManager::GetBuffer(){
 */
 
 } // End of namespace Embarcadero
-
-/*
-NetworkManager::NetworkManager(size_t num_net_threads) {
-    num_net_threads_ = num_net_threads;
-}
-
-NetworkManager::~NetworkManager() {
-    server_->Shutdown();
-    // Always shutdown the completion queue after the server.
-    cq_->Shutdown();
-}
-
-// TODO: There is no error shutdown handling in this code.
-void NetworkManager::Run(uint16_t port) {
-    // TODO: fix IP address
-    std::string server_address = absl::StrFormat("0.0.0.0:%d", port);
-
-    ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service_);
-    cq_ = builder.AddCompletionQueue();
-    server_ = builder.BuildAndStart();
-    std::cout << "Server listening on " << server_address << std::endl;
-
-    // Proceed to the server's main loop.
-    HandleRpcs();
-}
-*/
