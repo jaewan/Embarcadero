@@ -27,27 +27,26 @@ enum PublisherError : uint32_t
   ERR_NOT_IMPLEMENTED,
 };
 
-// TODO: if change this type, change in publish.proto
-enum AckLevel : uint32_t 
-{
-  // TODO: make descriptive
-  ACK0,
-  ACK1,
-  ACK2,
+struct PubConfig {
+    bool acknowledge;
+    uint64_t client_id;
+    uint64_t client_order;
 };
 
 /// Class for a single broker
 class PubSubClient {
     public:
         /// Constructor for Client
-        explicit PubSubClient(std::shared_ptr<Channel> channel)
-            : stub_(PubSub::NewStub(channel)) {}
+        explicit PubSubClient(PubConfig *config, std::shared_ptr<Channel> channel)
+            : stub_(PubSub::NewStub(channel)), config_(config) {}
 
-        PublisherError Publish(Topic topic, int msgflags, const char *payload, size_t len) {
+        PublisherError Publish(std::string topic, char *payload, uint64_t payload_size) {
             GRPCPublishRequest req;
-            req.set_ack_level(ACK0); // TODO: get this from config
             req.set_topic(topic);
-            req.set_payload(payload, len);
+            req.set_acknowledge(config_->acknowledge);
+            req.set_client_id(config_->client_id);
+            req.set_client_order(config_->client_order);
+            req.set_payload(payload, payload_size);
 
             GRPCPublishResponse res;
 
@@ -66,6 +65,7 @@ class PubSubClient {
         }
 
     private:
+        PubConfig *config_;
         std::unique_ptr<PubSub::Stub> stub_;
 };
 

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+
 #include "common/config.h"
 
 namespace Embarcadero{
@@ -105,7 +106,7 @@ void NetworkManager::ReceiveThread() {
 
 	// Spawn a new CallData instance to serve new clients.
 	if (!stop_threads_) {
-    	new CallData(&service_, cqs_[my_cq_index].get());
+    	new CallData(&service_, cqs_[my_cq_index].get(), cxl_manager_, disk_manager_);
     	void* tag;  // uniquely identifies a request.
     	bool ok;
     	while (!stop_threads_) {
@@ -122,10 +123,6 @@ void NetworkManager::ReceiveThread() {
       		static_cast<CallData*>(tag)->Proceed();
     	}
 	}
-
-	// TODO: Implement this
-	//cxl_manager_->EnqueueRequest(pub_req);
-	//disk_manager_->EnqueueRequest(pub_req);
 }
 
 void NetworkManager::AckThread() {

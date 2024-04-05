@@ -51,8 +51,8 @@ class NetworkManager{
     // Take in the "service" instance (in this case representing an asynchronous
     // server) and the completion queue "cq" used for asynchronous communication
     // with the gRPC runtime.
-    CallData(PubSub::AsyncService* service, ServerCompletionQueue* cq)
-        : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE) {
+    CallData(PubSub::AsyncService* service, ServerCompletionQueue* cq, CXLManager *cxl_manager, DiskManager *disk_manager)
+        : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE), cxl_manager_(cxl_manager), disk_manager_(disk_manager) {
       // Invoke the serving logic right away.
       Proceed();
     }
@@ -60,6 +60,7 @@ class NetworkManager{
     void Proceed() {
       if (status_ == CREATE) {
         // Make this instance progress to the PROCESS state.
+        std::cout << "Creating call data, asking for RPC" << std::endl;
         status_ = PROCESS;
 
         // As part of the initial CREATE state, we *request* that the system
@@ -73,11 +74,28 @@ class NetworkManager{
         // Spawn a new CallData instance to serve new clients while we process
         // the one for this CallData. The instance will deallocate itself as
         // part of its FINISH state.
-        new CallData(service_, cq_);
+        new CallData(service_, cq_, cxl_manager_, disk_manager_);
 
-        // The actual processing.
-        std::string prefix("Hello ");
+        PublishRequest req;
+	      std::atomic<int> c{2};
+        req.counter = &c;
+        req.req = &request_;
         reply_.set_error(ERR_NO_ERROR);
+
+        if (request_.acknowledge()) {
+          // Wait for acknowlegment to respond
+          status_ = ACKNOWLEDGE;
+        } else {
+          // If no acknowledgement is needed, respond now and signal this object ready for destruction
+          status_ = FINISH;
+          responder_.Finish(reply_, Status::OK, this);
+        }
+        // No matter what, we need to do processing tasks.
+        //cxl_manager_->EnqueueRequest(req);
+	      disk_manager_->EnqueueRequest(req);
+
+      } else if (status_ == ACKNOWLEDGE) {
+        std::cout << "Acknowledging the CallData() object" << std::endl;
 
         // And we are done! Let the gRPC runtime know we've finished, using the
         // memory address of this instance as the uniquely identifying tag for
@@ -85,10 +103,20 @@ class NetworkManager{
         status_ = FINISH;
         responder_.Finish(reply_, Status::OK, this);
       } else {
+        // If we asked for acknowledgement, we can destruct right after moving to FINISH
+        // If we did not ask for acknowledgement, we will let cxl/disk to destroy the object
+        // by calling the Finish() function.
+        if (request_.acknowledge()) {
+          Finish();
+        }
+      }
+    }
+
+    void Finish() {
         GPR_ASSERT(status_ == FINISH);
+        std::cout << "Destructing CallData() object" << std::endl;
         // Once in the FINISH state, deallocate ourselves (CallData).
         delete this;
-      }
     }
 
    private:
@@ -112,8 +140,11 @@ class NetworkManager{
     ServerAsyncResponseWriter<GRPCPublishResponse> responder_;
 
     // Let's implement a tiny state machine with the following states.
-    enum CallStatus { CREATE, PROCESS, FINISH };
+    enum CallStatus { CREATE, PROCESS, ACKNOWLEDGE, FINISH };
     CallStatus status_;  // The current serving state.
+
+    CXLManager *cxl_manager_;
+		DiskManager *disk_manager_;
   };
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
