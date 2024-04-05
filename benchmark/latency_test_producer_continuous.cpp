@@ -140,6 +140,10 @@ int main() {
         stream_end = std::chrono::system_clock::now();
     }
 
+    auto end_before_flush = std::chrono::system_clock::now();
+    // print end_before_flush
+    std::cerr << "Elapsed time before flush: " << std::chrono::duration_cast<std::chrono::seconds>(end_before_flush - start).count() << " seconds" << std::endl;
+
     std::cerr << "% Flushing final messages..." << std::endl;
     kp.flush(10 * 10000 /* wait for max 100 seconds */);
 
@@ -152,7 +156,7 @@ int main() {
     std::chrono::duration<double> elapsed_seconds = end - start;
 
     // print elapsed seconds
-    std::cerr << "Elapsed time: " << elapsed_seconds.count() << " seconds" << std::endl;
+    std::cerr << "Elapsed time after flush: " << elapsed_seconds.count() << " seconds" << std::endl;
 
     // print number of messages sent
     std::cerr << "Number of messages sent: " << num_messages_sent << std::endl;
