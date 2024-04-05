@@ -101,16 +101,25 @@ void CXLManager::CXL_io_thread(){
 		struct PublishRequest &req = optReq.value();
 
 		// Actual IO to the CXL
-		topic_manager_->PublishToCXL(req.topic, req.payload_address, req.size);
+		topic_manager_->PublishToCXL((char *)(req.req->topic().c_str()), (void *)(req.req->payload().c_str()), req.req->payload_size());
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
-		if( counter == 1){
-			//free(req.payload_address);
-		}else if(req.acknowledge){
-			struct NetworkRequest req;
-			req.req_type = Acknowledge;
-			network_manager_->EnqueueAck(req);
+
+		// If no more tasks are left to do
+		if (counter == 0) {
+			if (req.req->acknowledge()) {
+				// Signal GRPC to send acknowledgement
+				// TODO(erika) send CallData object to NetworkManager Ack thread and set result
+				//call_data.reply_.set_error(ERR_NO_ERROR);
+
+				struct NetworkRequest req;
+				req.req_type = Acknowledge;
+				network_manager_->EnqueueAck(req);
+			} else {
+				// TODO(erika) gRPC has already sent response, so here we can just free the CallData object.
+				// call_data.Finish();
+			}
 		}
 	}
 }
