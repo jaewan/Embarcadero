@@ -45,7 +45,7 @@ public:
             exit(1);
         }
 
-        if (conf->set("max.request.size", std::to_string(num_bytes), errstr) != RdKafka::Conf::CONF_OK) {
+        if (conf->set("message.max.bytes", std::to_string(num_bytes), errstr) != RdKafka::Conf::CONF_OK) {
             std::cerr << "% " << errstr << std::endl;
             exit(1);
         }
