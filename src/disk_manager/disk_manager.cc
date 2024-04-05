@@ -78,7 +78,7 @@ void DiskManager::Disk_io_thread(){
 				req.req_type = Acknowledge;
 				network_manager_->EnqueueAck(req);
 			} else {
-				// TODO(erika) gRPC has already sent response, so here we can just free the CalData object.
+				// TODO(erika) gRPC has already sent response, so here we can just free the CallData object.
 				// call_data.Finish();
 			}
 		}
