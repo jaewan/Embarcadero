@@ -15,7 +15,7 @@ class KafkaProducer {
     RdKafka::Topic *topic;
 
 public:
-    KafkaProducer(const std::string& brokers, const std::string& topic_name, const std::string& ack)
+    KafkaProducer(const std::string& brokers, const std::string& topic_name, const std::string& ack, int num_bytes)
         : brokers(brokers), topic_name(topic_name) {
         RdKafka::Conf *conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
 
@@ -39,6 +39,16 @@ public:
         //     std::cerr << "% " << errstr << std::endl;
         //     exit(1);
         // }
+
+        if (conf->set("buffer.memory", "0", errstr) != RdKafka::Conf::CONF_OK) {
+            std::cerr << "% " << errstr << std::endl;
+            exit(1);
+        }
+
+        if (conf->set("max.request.size", std::to_string(num_bytes), errstr) != RdKafka::Conf::CONF_OK) {
+            std::cerr << "% " << errstr << std::endl;
+            exit(1);
+        }
 
         producer = RdKafka::Producer::create(conf, errstr);
         if (!producer) {
@@ -108,7 +118,7 @@ int main() {
     std::string ack = config["ack"].as<std::string>();
     std::string payload_config = config["payload"].as<std::string>();
 
-    KafkaProducer kp(brokers, topic_name, ack);
+    KafkaProducer kp(brokers, topic_name, ack, num_bytes);
     // load payload from file
     std::ifstream file(payload_config);    
     std::string payload((std::istreambuf_iterator<char>(file)),
