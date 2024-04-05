@@ -5,6 +5,7 @@
 #include <fstream>
 #include <unordered_map> 
 #include <yaml-cpp/yaml.h>
+#include <thread>
 
 class KafkaProducer {
     std::string errstr;
@@ -29,10 +30,10 @@ public:
         }
 
         // Might need these 2 configs to optimize for latency
-        if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
-            std::cerr << "% " << errstr << std::endl;
-            exit(1);
-        }
+        // if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
+        //     std::cerr << "% " << errstr << std::endl;
+        //     exit(1);
+        // }
 
         // if (conf->set("batch.size", "1000000", errstr) != RdKafka::Conf::CONF_OK) {
         //     std::cerr << "% " << errstr << std::endl;
@@ -102,70 +103,52 @@ int main() {
 
     std::string brokers = config["brokers"].as<std::string>();
     std::string topic_name = config["topic"].as<std::string>();
-    int duration = config["duration"].as<int>();
     int num_bytes = config["messageSize"].as<int>();
+    int duration = config["duration"].as<int>();
     std::string ack = config["ack"].as<std::string>();
     std::string payload_config = config["payload"].as<std::string>();
 
-    std::vector<int> byte_sizes = {num_bytes};
-
+    KafkaProducer kp(brokers, topic_name, ack);
     // load payload from file
     std::ifstream file(payload_config);    
     std::string payload((std::istreambuf_iterator<char>(file)),
                         std::istreambuf_iterator<char>());
 
-    KafkaProducer kp(brokers, topic_name, ack);
-    // for each byte size, produce 10000 messages    
-    for (auto num_bytes : byte_sizes) {
-
-        /* For constant payload */
-        // start time for throughput
-        // std::string payload;
-        // payload.reserve(num_bytes);
-
-        // // Generate random characters
-        // for (int i = 0; i < num_bytes; ++i) {
-        //     payload += alphanum[rand() % (sizeof(alphanum) - 1)];
-        // }
-
-        auto start = std::chrono::system_clock::now();
-        for (int i = 0; i < num_messages; ++i) {
-
-            /* For random payload */
-            // start time for throughput
-            // std::string payload;
-            // payload.reserve(num_bytes);
-
-            // // Generate random characters
-            // for (int i = 0; i < num_bytes; ++i) {
-            //     payload += alphanum[rand() % (sizeof(alphanum) - 1)];
-            // }
-            
-            RdKafka::ErrorCode err = kp.produce(payload);
-            if (err != RdKafka::ERR_NO_ERROR) {
-                std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
-            }
-
-            kp.poll(0);
+    auto start = std::chrono::system_clock::now();
+    auto end = std::chrono::system_clock::now();
+    int num_messages_sent = 0;
+    while((std::chrono::duration_cast<std::chrono::seconds>(end - start).count() <= duration)) {
+        RdKafka::ErrorCode err = kp.produce(payload);
+        if (err != RdKafka::ERR_NO_ERROR) {
+            std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
         }
 
-        std::cerr << "% Flushing final messages..." << std::endl;
-        kp.flush(10 * 10000 /* wait for max 100 seconds */);
+        kp.poll(0);
 
-        if (kp.outq_len() > 0)
-            std::cerr << "% " << kp.outq_len()
-                    << " message(s) were not delivered" << std::endl;
+        num_messages_sent++;
 
-        // end time for throughput
-        auto end = std::chrono::system_clock::now();
-        std::chrono::duration<double> elapsed_seconds = end - start;
-        
-        // calculate throughput
-        double throughput = (static_cast<double>(num_bytes) * num_messages) / elapsed_seconds.count();
-        throughput /= 1024 * 1024;
-
-        std::cerr << "Throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
+        end = std::chrono::system_clock::now();
     }
+
+    std::cerr << "% Flushing final messages..." << std::endl;
+    kp.flush(10 * 10000 /* wait for max 100 seconds */);
+
+    if (kp.outq_len() > 0)
+        std::cerr << "% " << kp.outq_len()
+                << " message(s) were not delivered" << std::endl;
+
+    // end time for throughput
+    auto end = std::chrono::system_clock::now();
+    std::chrono::duration<double> elapsed_seconds = end - start;
+
+    // print elapsed seconds
+    std::cerr << "Elapsed time: " << elapsed_seconds.count() << " seconds" << std::endl;
+    
+    // calculate throughput
+    double throughput = (static_cast<double>(num_bytes) * num_messages_sent) / elapsed_seconds.count();
+    throughput /= 1024 * 1024;
+
+    std::cerr << "Throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
 
     return 0;
 }
