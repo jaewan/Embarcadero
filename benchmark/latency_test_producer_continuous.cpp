@@ -130,7 +130,7 @@ int main() {
     while((std::chrono::duration_cast<std::chrono::seconds>(stream_end - start).count() <= duration)) {
         RdKafka::ErrorCode err = kp.produce(payload);
         if (err != RdKafka::ERR_NO_ERROR) {
-            // std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
+            std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
         } else {
             num_messages_sent++;
         }
