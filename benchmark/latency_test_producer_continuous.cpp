@@ -126,8 +126,9 @@ int main() {
 
     auto start = std::chrono::system_clock::now();
     auto stream_end = std::chrono::system_clock::now();
+    std::chrono::duration<double> elapsed_seconds_stream_end = stream_end - start;
     int num_messages_sent = 0;
-    while((std::chrono::duration_cast<std::chrono::seconds>(stream_end - start).count() <= duration)) {
+    while((elapsed_seconds_stream_end.count() <= duration)) {
         RdKafka::ErrorCode err = kp.produce(payload);
         if (err != RdKafka::ERR_NO_ERROR) {
             std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
@@ -138,11 +139,13 @@ int main() {
         kp.poll(0);
 
         stream_end = std::chrono::system_clock::now();
+        elapsed_seconds_stream_end = stream_end - start;
     }
 
     auto end_before_flush = std::chrono::system_clock::now();
     // print end_before_flush
-    std::cerr << "Elapsed time before flush: " << std::chrono::duration_cast<std::chrono::seconds>(end_before_flush - start).count() << " seconds" << std::endl;
+    std::chrono::duration<double> elapsed_seconds_before_flush = end_before_flush - start;
+    std::cerr << "Elapsed time before flush: " << elapsed_seconds_before_flush.count() << " seconds" << std::endl;
 
     std::cerr << "% Flushing final messages..." << std::endl;
     kp.flush(10 * 10000 /* wait for max 100 seconds */);
