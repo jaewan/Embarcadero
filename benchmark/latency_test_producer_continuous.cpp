@@ -29,23 +29,12 @@ public:
             exit(1);
         }
 
-        // Might need these 2 configs to optimize for latency
-        // if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
-        //     std::cerr << "% " << errstr << std::endl;
-        //     exit(1);
-        // }
-
-        // if (conf->set("batch.size", "1", errstr) != RdKafka::Conf::CONF_OK) {
-        //     std::cerr << "% " << errstr << std::endl;
-        //     exit(1);
-        // }
-
-        if (conf->set("queue.buffering.max.messages", std::to_string(num_bytes * 2), errstr) != RdKafka::Conf::CONF_OK) {
+        if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
             std::cerr << "% " << errstr << std::endl;
             exit(1);
         }
 
-        if (conf->set("message.max.bytes", std::to_string(num_bytes * 2), errstr) != RdKafka::Conf::CONF_OK) {
+        if (conf->set("batch.size", "1", errstr) != RdKafka::Conf::CONF_OK) {
             std::cerr << "% " << errstr << std::endl;
             exit(1);
         }
@@ -140,15 +129,7 @@ int main() {
 
         stream_end = std::chrono::system_clock::now();
         elapsed_seconds_stream_end = stream_end - start;
-
-        // print elapsed seconds
-        std::cerr << "Elapsed time during producing: " << elapsed_seconds_stream_end.count() << " seconds" << std::endl;
     }
-
-    auto end_before_flush = std::chrono::system_clock::now();
-    // print end_before_flush
-    std::chrono::duration<double> elapsed_seconds_before_flush = end_before_flush - start;
-    std::cerr << "Elapsed time before flush: " << elapsed_seconds_before_flush.count() << " seconds" << std::endl;
 
     std::cerr << "% Flushing final messages..." << std::endl;
     kp.flush(10 * 10000 /* wait for max 100 seconds */);
