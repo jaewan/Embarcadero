@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <glog/logging.h>
 
 #include "common/config.h"
 
@@ -19,10 +20,10 @@ class NetworkManager::CallData {
     }
 
     void Proceed() {
-		std::cout << "In CallData.Proceed() with status_ == " << status_ << std::endl;
+		DLOG(INFO) << "In CallData.Proceed() with status_ == " << status_;
       if (status_ == CREATE) {
         // Make this instance progress to the PROCESS state.
-        std::cout << "Creating call data, asking for RPC" << std::endl;
+        DLOG(INFO) << "Creating call data, asking for RPC";
         status_ = PROCESS;
 		reply_.set_error(ERR_NO_ERROR);
 
@@ -37,7 +38,7 @@ class NetworkManager::CallData {
         // Spawn a new CallData instance to serve new clients while we process
         // the one for this CallData. The instance will deallocate itself as
         // part of its FINISH state.
-		std::cout << "Creating new CallData object in CallData" << std::endl;
+		DLOG(INFO) << "Creating new CallData object in CallData";
         new CallData(service_, cq_, cxl_manager_, disk_manager_);
         PublishRequest req;
         req.counter = new std::atomic<int>(1);
@@ -57,7 +58,7 @@ class NetworkManager::CallData {
 		disk_manager_->EnqueueRequest(req);
 
       } else if (status_ == ACKNOWLEDGE) {
-        std::cout << "Acknowledging the CallData() object" << std::endl;
+        DLOG(INFO) << "Acknowledging the CallData() object";
 
         // And we are done! Let the gRPC runtime know we've finished, using the
         // memory address of this instance as the uniquely identifying tag for
@@ -83,7 +84,7 @@ class NetworkManager::CallData {
 
     void Finish() {
         GPR_ASSERT(status_ == FINISH);
-        std::cout << "Destructing CallData() object" << std::endl;
+        DLOG(INFO) << "Destructing CallData";
         // Once in the FINISH state, deallocate ourselves (CallData).
         delete this;
     }
@@ -139,11 +140,11 @@ NetworkManager::NetworkManager(size_t queueCapacity, int num_receive_threads, in
 	
 	// One completion queue per two receive threads. This is recommended in grpc perf docs
 	for (int i = 0; i < num_receive_threads / 2 + num_receive_threads % 2; i++) {
-		std::cout << "[NetworkManager]: Created completion queue " << i << std::endl;
+		LOG(INFO) << "Created completion queue " << i;
     	cqs_.push_back(builder.AddCompletionQueue());
 	}
     server_ = builder.BuildAndStart();
-    std::cout << "[NetworkManager]: Server listening on " << DEFAULT_CHANNEL << std::endl;
+    LOG(INFO) << "gRPC Server listening on " << DEFAULT_CHANNEL;
 
 	// Create receive threads to process received gRPC messages
 	for (int i = 0; i < num_receive_threads; i++) {
@@ -152,7 +153,7 @@ NetworkManager::NetworkManager(size_t queueCapacity, int num_receive_threads, in
 
 	// Wait for the threads to all start
 	while (thread_count_.load() != num_receive_threads + num_ack_threads) {}
-	std::cout << "[NetworkManager]: \tAll threads created!" << std::endl;
+	LOG(INFO) << "Constructed!";
 }
 
 NetworkManager::~NetworkManager() {
@@ -188,7 +189,7 @@ NetworkManager::~NetworkManager() {
 		}
 	}
 
-	std::cout << "[NetworkManager]: \tDestructed" << std::endl;
+	LOG(INFO) << "Destructed";
 }
 
 //Currently only for ack
@@ -220,7 +221,7 @@ std::chrono::high_resolution_clock::time_point start;
 void NetworkManager::ReceiveThread() {
 	int recv_thread_id = thread_count_.fetch_add(1, std::memory_order_relaxed) - num_ack_threads_;
 	int my_cq_index = recv_thread_id / 2;
-	std::cout << "[Network Manager]: \tStarting Receive I/O Thread " << recv_thread_id << " with cq " << my_cq_index << std::endl;
+	LOG(INFO) << "Starting Receive I/O Thread " << recv_thread_id << " with cq " << my_cq_index;
 
 	// Spawn a new CallData instance to serve new clients.
 	if (!stop_threads_) {
@@ -235,7 +236,7 @@ void NetworkManager::ReceiveThread() {
       		// tells us whether there is any kind of event or cq is shutting down.
       		GPR_ASSERT(cqs_[my_cq_index]->Next(&tag, &ok));
 			if (!ok) {
-				std::cout << "[Network Manager]: \tTerminating Receive I/O Thread " << recv_thread_id << std::endl;
+				LOG(INFO) << "Terminating Receive I/O Thread " << recv_thread_id;
 				return;
 			}
       		static_cast<CallData*>(tag)->Proceed();
@@ -244,7 +245,7 @@ void NetworkManager::ReceiveThread() {
 }
 
 void NetworkManager::AckThread() {
-	std::cout << "[Network Manager]: \tStarting Acknowledgement I/O Thread" << std::endl;
+	LOG(INFO) << "Starting Acknowledgement I/O Thread";
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 
 	std::optional<struct NetworkRequest> optReq;
@@ -253,13 +254,13 @@ void NetworkManager::AckThread() {
 		if(!optReq.has_value()) {
 			// This should means we are trying to shutdown threads
 			assert(stop_threads_ == true);
-			std::cout << "[Network Manager]: \tTerminating Acknoweldgement I/O Thread" << std::endl;
+			LOG(INFO) << "Terminating Acknoweldgement I/O Thread";
 			return;
 		}
 		
-		std::cout << "[NetworkManager]: AckThread calling proceed on CallData" << std::endl;
+		DLOG(INFO) << "AckThread calling proceed on CallData";
 		struct NetworkRequest net_req = optReq.value();
-		printf("[NetworkManager]: Got net_req, tag=%p\n", net_req.grpcTag);
+		DLOG(INFO) << "Got net_req, tag=" << net_req.grpcTag;
     	static_cast<CallData*>(net_req.grpcTag)->Proceed();
 	}
 }

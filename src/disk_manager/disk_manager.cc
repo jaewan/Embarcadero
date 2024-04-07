@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
+#include <glog/logging.h>
 
 namespace Embarcadero{
 
@@ -20,14 +21,14 @@ DiskManager::DiskManager(size_t queueCapacity,
 	log_fd_ = open(DISK_LOG_PATH, O_RDWR|O_CREAT, 0777);
 	if (log_fd_ < 0){
 		perror("Error in opening a file for disk log\n");
-		std::cout<< strerror(errno) << std::endl;
+		LOG(ERROR) << strerror(errno);
 	}
 	// Create Disk I/O threads
 	for (int i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&DiskManager::Disk_io_thread, this);
 
 	while(thread_count_.load() != num_io_threads_){}
-	std::cout << "[DiskManager]: \tCreated" << std::endl;
+	LOG(INFO) << "Created";
 }
 
 DiskManager::~DiskManager(){
@@ -43,7 +44,7 @@ DiskManager::~DiskManager(){
 			thread.join();
 		}
 	}
-	std::cout << "[DiskManager]: \tDestructed" << std::endl;
+	LOG(INFO) << "Destructed";
 }
 
 void DiskManager::EnqueueRequest(struct PublishRequest req){
@@ -61,7 +62,7 @@ void DiskManager::Disk_io_thread(){
 		}
 		const struct PublishRequest &req = optReq.value();
 		int off = offset_.fetch_add(req.req->payload_size(), std::memory_order_relaxed);
-		std::cout << "[DiskManager]: Received payload is: " << req.req->payload().c_str() << std::endl;
+		DLOG(INFO) << "Received payload is: " << req.req->payload().c_str();
 		pwrite(log_fd_, req.req->payload().c_str(), req.req->payload_size(), off);
 
 		// Post I/O work (as disk I/O depend on the same payload)
@@ -81,11 +82,11 @@ void DiskManager::Disk_io_thread(){
 				network_manager_->EnqueueAck(ack_req);
 			} else {
 				// gRPC has already sent response, so here we can just free the CallData object.
-				std::cout << "DiskManager calling proceed on call data" << std::endl;
+				DLOG(INFO) << "DiskManager calling proceed on call data";
 				network_manager_->Proceed(req.grpcTag);
 			}
 		} else {
-			std::cout << "DiskManager got counter: " << counter << std::endl;
+			DLOG(INFO) << "DiskManager got counter: " << counter;
 		}
 	}
 }

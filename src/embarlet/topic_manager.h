@@ -7,6 +7,7 @@
 #include "absl/synchronization/mutex.h"
 
 #include <bits/stdc++.h>
+#include <glog/logging.h>
 
 namespace Embarcadero{
 
@@ -58,7 +59,7 @@ class TopicManager{
 		TopicManager(CXLManager &cxl_manager, int broker_id):
 									cxl_manager_(cxl_manager),
 									broker_id_(broker_id){
-			std::cout << "[TopicManager]\tConstructed" << std::endl;
+			LOG(INFO) << "Constructed";
 		}
 		void CreateNewTopic(const char topic[32]);
 		void DeleteTopic(char topic[32]);

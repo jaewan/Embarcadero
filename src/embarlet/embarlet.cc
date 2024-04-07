@@ -1,14 +1,21 @@
+#include <iostream>
+#include <string>
+#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
+#include <glog/logging.h>
+
 #include "common/config.h"
 #include "peer.h"
 #include "topic_manager.h"
 #include "../disk_manager/disk_manager.h"
 #include "../network_manager/network_manager.h"
 #include "../cxl_manager/cxl_manager.h"
-#include <iostream>
-#include <string>
-#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 
 int main(int argc, char* argv[]){
+	// Initialize logging
+	google::InitGoogleLogging(argv[0]);
+	google::InstallFailureSignalHandler();
+
+	FLAGS_logtostderr = 1; // log only to console, no files.
 
 	cxxopts::Options options("embarc", "Embrokeradaro (TODO: add real description)");
 	options.add_options()
@@ -19,7 +26,7 @@ int main(int argc, char* argv[]){
 	Embarcadero::CXL_Type cxl_type = Embarcadero::CXL_Type::Real;
 	if (result.count("emul")) {
 		cxl_type = Embarcadero::CXL_Type::Emul;
-		std::cout << "WARNING: Using emulated CXL" << std::endl;
+		LOG(WARNING) << "Using emulated CXL";
 	}
 
 	//Initialize

@@ -6,6 +6,7 @@
 #include <errno.h>
 
 #include <iostream>
+#include <glog/logging.h>
 
 namespace Embarcadero{
 
@@ -30,7 +31,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 			cxl_fd_ = open(cxl_path.c_str(), O_RDWR);
 			break;
 	}
-	std::cout << "Opening CXL at: " << cxl_path << std::endl;
+	LOG(INFO) << "Opening CXL at: " << cxl_path;
 	if (cxl_fd_ < 0) {
 		perror("Opening CXL error");
 		exit(-1);
@@ -65,7 +66,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 	// Wait untill al IO threads are up
 	while(thread_count_.load() != num_io_threads_){}
 
-	std::cout << "[CXLManager]: \tConstructed" << std::endl;
+	LOG(INFO) << "Constructed";
 	return;
 }
 
@@ -86,7 +87,7 @@ CXLManager::~CXLManager(){
 		}
 	}
 
-	std::cout << "[CXLManager]: \tDestructed" << std::endl;
+	LOG(INFO) << "Destructed";
 }
 
 void CXLManager::CXL_io_thread(){
@@ -120,11 +121,11 @@ void CXLManager::CXL_io_thread(){
 				network_manager_->EnqueueAck(ack_req);
 			} else {
 				// gRPC has already sent response, so here we can just free the CallData object.
-				std::cout << "CXLManager calling proceed on call data" << std::endl;
+				DLOG(INFO) << "CallData.Proceed()";
 				network_manager_->Proceed(req.grpcTag);
 			}
 		} else {
-			std::cout << "CXLManager got counter: " << counter << std::endl;
+			DLOG(INFO) << "counter: " << counter;
 		}
 	}
 }

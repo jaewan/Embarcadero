@@ -34,6 +34,7 @@ target_link_libraries(embarlet
     peer_grpc_proto
     pubsub_grpc_proto
     cxxopts::cxxopts
+    glog::glog
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF}
@@ -53,6 +54,7 @@ target_include_directories(client PUBLIC
 target_link_libraries(client
     pubsub_grpc_proto
     cxxopts::cxxopts
+    glog::glog
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOF}
