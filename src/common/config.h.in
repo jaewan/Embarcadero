@@ -6,6 +6,9 @@
 
 #include <pubsub.grpc.pb.h>
 
+// TODO(erika) this is for debug logging
+#define NDEBUG
+
 namespace Embarcadero{
 // the configured options and settings for Embarcadero
 #define Embarcadero_VERSION_MAJOR 0.1
@@ -20,7 +23,7 @@ namespace Embarcadero{
 #define SEGMENT_SIZE (1UL << 30)
 #define NUM_DISK_IO_THREADS 8
 #define NUM_CXL_IO_THREADS 8
-#define NUM_IO_RECEIVE_THREADS 1 
+#define NUM_IO_RECEIVE_THREADS 2
 #define NUM_IO_ACK_THREADS 1
 #define NUM_BUFFERS 64
 #define BUFFER_SIZE 1024

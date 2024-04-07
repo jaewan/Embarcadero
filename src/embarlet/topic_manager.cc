@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdint>
 #include <immintrin.h>
+#include <glog/logging.h>
 
 namespace Embarcadero{
 
@@ -55,7 +56,7 @@ void TopicManager::CreateNewTopic(const char topic[32]){
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_addr = (uint8_t*)segment_metadata + sizeof(void*);
-	//std::cout << "[TopicManager::CreateNewTopic] created topic:" << topic << std::endl;
+	DLOG(INFO) << "Created topic: \"" << topic << "\"";
 
 	//TODO(Jae) topics_ should be in a critical section
 	// But addition and deletion of a topic in our case is rare
@@ -215,7 +216,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	while(len>0){
 		char* msg = (char*)((uint8_t*)m + header_size);
 		len -= header_size;
-		std::cout<< msg << std::endl;
+		DLOG(INFO) << msg;
 		len -= m->size;
 		m =  (struct MessageHeader*)m->next_message;
 	}
