@@ -42,10 +42,7 @@ int main(int argc, char* argv[]){
 	Embarcadero::DiskManager disk_manager(ackQueue, diskReqQueue);
 	Embarcadero::NetworkManager network_manager(ackQueue, cxlReqQueue, diskReqQueue, NUM_IO_RECEIVE_THREADS, NUM_IO_ACK_THREADS);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
-
 	cxl_manager.SetTopicManager(&topic_manager);
-	cxl_manager.SetNetworkManager(&network_manager);
-	disk_manager.SetNetworkManager(&network_manager);
 
 	//********* Load Generate **************
 	char topic[32] = { 0 };

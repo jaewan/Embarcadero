@@ -20,6 +20,7 @@ add_executable(embarlet
     cxl_manager/cxl_manager.h 
     network_manager/network_manager.cc
     network_manager/network_manager.h 
+    network_manager/request_data.h
     embarlet/peer.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h

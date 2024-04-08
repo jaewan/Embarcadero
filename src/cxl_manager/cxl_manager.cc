@@ -7,6 +7,7 @@
 
 #include <iostream>
 #include <glog/logging.h>
+#include "../network_manager/request_data.h"
 
 namespace Embarcadero{
 
@@ -103,28 +104,27 @@ void CXLManager::CXL_io_thread(){
 			break;
 		}
 		struct PublishRequest &req = optReq.value();
+		struct RequestData *req_data = static_cast<RequestData*>(req.grpcTag);
 
 		// Actual IO to the CXL
-		topic_manager_->PublishToCXL((char *)(req.req->topic().c_str()), (void *)(req.req->payload().c_str()), req.req->payload_size());
+		topic_manager_->PublishToCXL((char *)(req_data->request_.topic().c_str()), (void *)(req_data->request_.payload().c_str()), req_data->request_.payload_size());
 
-		// TODO(erika): make shared function, finishNetJob(PublishReq *req);
-		// Post I/O work (as disk I/O depend on the same payload)
+		// TODO(erika): below logic should really be shared function between CXL and Disk managers
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 
 		// If no more tasks are left to do
 		if (counter == 0) {
-			if (req.req->acknowledge()) {
+			if (req_data->request_.acknowledge()) {
 				// TODO: Set result - just assume success
-				network_manager_->SetError(req.grpcTag, ERR_NO_ERROR);
+				req_data->SetError(ERR_NO_ERROR);
 
 				// Send to network manager ack queue
 				auto maybeTag = std::make_optional(req.grpcTag);
-				printf("DiskManager enquing to ack queue, tag=%p\n", req.grpcTag);
+				DLOG(INFO) << "Enquing to ack queue, tag=" << req.grpcTag;
 				EnqueueAck(ackQueue_, maybeTag);
 			} else {
-				// gRPC has already sent response, so here we can just free the CallData object.
-				DLOG(INFO) << "CallData.Proceed()";
-				network_manager_->Proceed(req.grpcTag);
+				// gRPC has already sent response, so just mark the object as ready for destruction
+				req_data->Proceed();
 			}
 		} else {
 			DLOG(INFO) << "counter: " << counter;
