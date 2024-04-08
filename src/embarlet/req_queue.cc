@@ -3,11 +3,11 @@
 
 namespace Embarcadero {
 
-void EnqueueReq(ReqQueue *queue, std::optional<struct PublishRequest> maybeReq) {
+void EnqueueReq(std::shared_ptr<ReqQueue> queue, std::optional<struct PublishRequest> maybeReq) {
     queue->blockingWrite(maybeReq);
 }
 
-void DequeueReq(ReqQueue *queue, std::optional<struct PublishRequest> *maybeReq) {
+void DequeueReq(std::shared_ptr<ReqQueue> queue, std::optional<struct PublishRequest> *maybeReq) {
     queue->blockingRead(*maybeReq);
 }
 

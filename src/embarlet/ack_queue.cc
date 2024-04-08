@@ -3,11 +3,11 @@
 
 namespace Embarcadero {
 
-void EnqueueAck(AckQueue *queue, std::optional<void *> maybeTag) {
+void EnqueueAck(std::shared_ptr<AckQueue> queue, std::optional<void *> maybeTag) {
     queue->blockingWrite(maybeTag);
 }
 
-void DequeueAck(AckQueue *queue, std::optional<void *> *maybeTag) {
+void DequeueAck(std::shared_ptr<AckQueue> queue, std::optional<void *> *maybeTag) {
     queue->blockingRead(*maybeTag);
 }
 

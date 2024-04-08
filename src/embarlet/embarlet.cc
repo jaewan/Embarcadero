@@ -36,17 +36,16 @@ int main(int argc, char* argv[]){
 	auto cxlReqQueue = std::make_shared<Embarcadero::ReqQueue>(REQ_QUEUE_SIZE);
 	auto diskReqQueue = std::make_shared<Embarcadero::ReqQueue>(REQ_QUEUE_SIZE);
 
+	// Initialize components
 	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager(10000, broker_id, cxl_type);
-	Embarcadero::DiskManager disk_manager(10000);
-	Embarcadero::NetworkManager network_manager(100000, NUM_IO_RECEIVE_THREADS, NUM_IO_ACK_THREADS);
+	Embarcadero::CXLManager cxl_manager(ackQueue, cxlReqQueue, broker_id, cxl_type);
+	Embarcadero::DiskManager disk_manager(ackQueue, diskReqQueue);
+	Embarcadero::NetworkManager network_manager(ackQueue, cxlReqQueue, diskReqQueue, NUM_IO_RECEIVE_THREADS, NUM_IO_ACK_THREADS);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);
 	disk_manager.SetNetworkManager(&network_manager);
-	network_manager.SetCXLManager(&cxl_manager);
-	network_manager.SetDiskManager(&disk_manager);
 
 	//********* Load Generate **************
 	char topic[32] = { 0 };
@@ -102,11 +101,5 @@ int main(int argc, char* argv[]){
 		std::cout << "Invalid arguments" << std::endl;
 	}
 	*/
-
-	// Relinquish ownership of shared pointers to queues
-	ackQueue.reset();
-	cxlReqQueue.reset();
-	diskReqQueue.reset();
-
 	return 0;
 }

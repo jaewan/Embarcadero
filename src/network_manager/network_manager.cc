@@ -4,8 +4,6 @@
 #include <sys/socket.h>
 #include <glog/logging.h>
 
-#include "common/config.h"
-
 namespace Embarcadero{
 
 class NetworkManager::CallData {
@@ -13,8 +11,8 @@ class NetworkManager::CallData {
     // Take in the "service" instance (in this case representing an asynchronous
     // server) and the completion queue "cq" used for asynchronous communication
     // with the gRPC runtime.
-    CallData(PubSub::AsyncService* service, ServerCompletionQueue* cq, CXLManager *cxl_manager, DiskManager *disk_manager)
-        : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE), cxl_manager_(cxl_manager), disk_manager_(disk_manager) {
+    CallData(PubSub::AsyncService* service, ServerCompletionQueue* cq, std::shared_ptr<ReqQueue> reqQueueCXL, std::shared_ptr<ReqQueue> reqQueueDisk)
+        : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE), reqQueueCXL_(reqQueueCXL), reqQueueDisk_(reqQueueDisk) {
       // Invoke the serving logic right away.
       Proceed();
     }
@@ -39,11 +37,12 @@ class NetworkManager::CallData {
         // the one for this CallData. The instance will deallocate itself as
         // part of its FINISH state.
 		DLOG(INFO) << "Creating new CallData object in CallData";
-        new CallData(service_, cq_, cxl_manager_, disk_manager_);
+        new CallData(service_, cq_, reqQueueCXL_, reqQueueDisk_);
         PublishRequest req;
         req.counter = new std::atomic<int>(1);
         req.req = &request_;
 		req.grpcTag = this;
+		auto maybeReq = std::make_optional(req);
 
         if (request_.acknowledge()) {
           // Wait for acknowlegment to respond
@@ -54,8 +53,8 @@ class NetworkManager::CallData {
           responder_.Finish(reply_, Status::OK, this);
         }
         // No matter what, we need to do processing tasks.
-        cxl_manager_->EnqueueRequest(req);
-		disk_manager_->EnqueueRequest(req);
+        EnqueueReq(reqQueueCXL_, req);
+		EnqueueReq(reqQueueDisk_, req);
 
       } else if (status_ == ACKNOWLEDGE) {
         DLOG(INFO) << "Acknowledging the CallData() object";
@@ -113,14 +112,15 @@ class NetworkManager::CallData {
     enum CallStatus { CREATE, PROCESS, ACKNOWLEDGE, FINISH };
     CallStatus status_;  // The current serving state.
 
-    CXLManager *cxl_manager_;
-		DiskManager *disk_manager_;
+    std::shared_ptr<ReqQueue> reqQueueCXL_;
+	std::shared_ptr<ReqQueue> reqQueueDisk_;
   };
 
 
-NetworkManager::NetworkManager(size_t queueCapacity, int num_receive_threads, int num_ack_threads):
-						 requestQueue_(queueCapacity),
-						 ackQueue_(50),
+NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> cxl_req_queue, std::shared_ptr<ReqQueue> disk_req_queue, int num_receive_threads, int num_ack_threads):
+						 ackQueue_(ack_queue),
+						 reqQueueCXL_(cxl_req_queue),
+						 reqQueueDisk_(disk_req_queue),
 						 num_receive_threads_(num_receive_threads),
 						 num_ack_threads_(num_ack_threads) {
 
@@ -171,9 +171,9 @@ NetworkManager::~NetworkManager() {
 	stop_threads_ = true;
 
 	// Write a nullopt to the ack queue, so the ack threads can finish flushing the queue
-	std::optional<struct NetworkRequest> sentinel = std::nullopt;
+	std::optional<void *> sentinel = std::nullopt;
 	for (int i = 0; i < num_ack_threads_; i++) {
-		EnqueueAck(sentinel);
+		EnqueueAck(ackQueue_, sentinel);
 	}
 
 	/*
@@ -190,11 +190,6 @@ NetworkManager::~NetworkManager() {
 	}
 
 	LOG(INFO) << "Destructed";
-}
-
-//Currently only for ack
-void NetworkManager::EnqueueAck(std::optional<struct NetworkRequest> req) {
-	ackQueue_.blockingWrite(req);
 }
 
 void NetworkManager::Proceed(void *grpcTag) {
@@ -225,7 +220,7 @@ void NetworkManager::ReceiveThread() {
 
 	// Spawn a new CallData instance to serve new clients.
 	if (!stop_threads_) {
-    	new CallData(&service_, cqs_[my_cq_index].get(), cxl_manager_, disk_manager_);
+    	new CallData(&service_, cqs_[my_cq_index].get(), reqQueueCXL_, reqQueueDisk_);
     	void* tag;  // uniquely identifies a request.
     	bool ok;
     	while (!stop_threads_) {
@@ -248,9 +243,9 @@ void NetworkManager::AckThread() {
 	LOG(INFO) << "Starting Acknowledgement I/O Thread";
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 
-	std::optional<struct NetworkRequest> optReq;
+	std::optional<void *> optReq;
 	while(true) {
-		ackQueue_.blockingRead(optReq);
+		ackQueue_->blockingRead(optReq);
 		if(!optReq.has_value()) {
 			// This should means we are trying to shutdown threads
 			assert(stop_threads_ == true);
@@ -259,9 +254,9 @@ void NetworkManager::AckThread() {
 		}
 		
 		DLOG(INFO) << "AckThread calling proceed on CallData";
-		struct NetworkRequest net_req = optReq.value();
-		DLOG(INFO) << "Got net_req, tag=" << net_req.grpcTag;
-    	static_cast<CallData*>(net_req.grpcTag)->Proceed();
+		void *grpcTag = optReq.value();
+		DLOG(INFO) << "Got net_req, tag=" << grpcTag;
+    	static_cast<CallData*>(grpcTag)->Proceed();
 	}
 }
 

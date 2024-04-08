@@ -13,9 +13,9 @@ namespace Embarcadero{
 #define DISK_LOG_PATH "embarc.disklog"
 #define NUM_ACTIVE_POLL 100
 
-DiskManager::DiskManager(size_t queueCapacity, 
-						 int num_io_threads):
-						 requestQueue_(queueCapacity),
+DiskManager::DiskManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> req_queue, int num_io_threads):
+						ackQueue_(ack_queue),
+						 reqQueue_(req_queue),
 						 num_io_threads_(num_io_threads){
 	//Initialize log file
 	log_fd_ = open(DISK_LOG_PATH, O_RDWR|O_CREAT, 0777);
@@ -35,7 +35,7 @@ DiskManager::~DiskManager(){
 	stop_threads_ = true;
 	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	for (int i=0; i<num_io_threads_; i++)
-		requestQueue_.blockingWrite(sentinel);
+		reqQueue_->blockingWrite(sentinel);
 
 	close(log_fd_);
 
@@ -47,16 +47,12 @@ DiskManager::~DiskManager(){
 	LOG(INFO) << "Destructed";
 }
 
-void DiskManager::EnqueueRequest(struct PublishRequest req){
-	requestQueue_.blockingWrite(req);
-}
-
 void DiskManager::Disk_io_thread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct PublishRequest> optReq;
 
 	while(!stop_threads_){
-		requestQueue_.blockingRead(optReq);
+		reqQueue_->blockingRead(optReq);
 		if(!optReq.has_value()){
 			break;
 		}
@@ -75,11 +71,10 @@ void DiskManager::Disk_io_thread(){
 				network_manager_->SetError(req.grpcTag, ERR_NO_ERROR);
 
 				// Send to network manager ack queue
-				struct NetworkRequest ack_req;
-				ack_req.req_type = Acknowledge;
-				ack_req.grpcTag = req.grpcTag;
-				printf("DiskManager enquing to ack queue, tag=%p\n", ack_req.grpcTag);
-				network_manager_->EnqueueAck(ack_req);
+				auto maybeTag = std::make_optional(req.grpcTag);
+				// TODO(erika) remove printf
+				printf("DiskManager enquing to ack queue, tag=%p\n", req.grpcTag);
+				EnqueueAck(ackQueue_, maybeTag);
 			} else {
 				// gRPC has already sent response, so here we can just free the CallData object.
 				DLOG(INFO) << "DiskManager calling proceed on call data";

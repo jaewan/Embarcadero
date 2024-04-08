@@ -12,11 +12,13 @@ namespace Embarcadero{
 
 #define CXL_SIZE (1UL << 37)
 
-CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, int num_io_threads):
-	requestQueue_(queueCapacity),
+CXLManager::CXLManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> req_queue, int broker_id, CXL_Type cxl_type, int num_io_threads):
+	ackQueue_(ack_queue),
+	reqQueue_(req_queue),
 	broker_id_(broker_id),
-	num_io_threads_(num_io_threads){
+	num_io_threads_(num_io_threads) {
 	// Initialize CXL
+
 	cxl_type_ = cxl_type;
 	std::string cxl_path(getenv("HOME"));
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
@@ -73,8 +75,9 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 CXLManager::~CXLManager(){
 	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	stop_threads_ = true;
-	for (int i=0; i< num_io_threads_; i++)
-		requestQueue_.blockingWrite(sentinel);
+	for (int i=0; i< num_io_threads_; i++) {
+		reqQueue_->blockingWrite(sentinel);
+	}
 
 	if (munmap(cxl_addr_, CXL_SIZE) < 0)
 		perror("Unmapping CXL error");
@@ -95,7 +98,7 @@ void CXLManager::CXL_io_thread(){
 	std::optional<struct PublishRequest> optReq;
 
 	while(!stop_threads_){
-		requestQueue_.blockingRead(optReq);
+		reqQueue_->blockingRead(optReq);
 		if(!optReq.has_value()){
 			break;
 		}
@@ -104,6 +107,7 @@ void CXLManager::CXL_io_thread(){
 		// Actual IO to the CXL
 		topic_manager_->PublishToCXL((char *)(req.req->topic().c_str()), (void *)(req.req->payload().c_str()), req.req->payload_size());
 
+		// TODO(erika): make shared function, finishNetJob(PublishReq *req);
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 
@@ -114,11 +118,9 @@ void CXLManager::CXL_io_thread(){
 				network_manager_->SetError(req.grpcTag, ERR_NO_ERROR);
 
 				// Send to network manager ack queue
-				struct NetworkRequest ack_req;
-				ack_req.req_type = Acknowledge;
-				ack_req.grpcTag = req.grpcTag;
-				printf("DiskManager enquing to ack queue, tag=%p\n", ack_req.grpcTag);
-				network_manager_->EnqueueAck(ack_req);
+				auto maybeTag = std::make_optional(req.grpcTag);
+				printf("DiskManager enquing to ack queue, tag=%p\n", req.grpcTag);
+				EnqueueAck(ackQueue_, maybeTag);
 			} else {
 				// gRPC has already sent response, so here we can just free the CallData object.
 				DLOG(INFO) << "CallData.Proceed()";
@@ -135,10 +137,6 @@ void* CXLManager::GetTInode(const char* topic){
 	static const std::hash<std::string> topic_to_idx;
 	int TInode_idx = topic_to_idx(topic) % MAX_TOPIC_SIZE;
 	return ((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
-}
-
-void CXLManager::EnqueueRequest(struct PublishRequest req){
-	requestQueue_.blockingWrite(req);
 }
 
 void* CXLManager::GetNewSegment(){
