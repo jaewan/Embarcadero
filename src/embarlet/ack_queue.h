@@ -9,8 +9,8 @@
 namespace Embarcadero {
 
 using AckQueue = folly::MPMCQueue<std::optional<void *>>;
-void EnqueueAck(AckQueue *queue, std::optional<void *> maybeTag);
-void DequeueAck(AckQueue *queue, std::optional<void *> *maybeTag);
+void EnqueueAck(std::shared_ptr<AckQueue> queue, std::optional<void *> maybeTag);
+void DequeueAck(std::shared_ptr<AckQueue> queue, std::optional<void *> *maybeTag);
 
 } // End of namespace Embarcadero
 #endif // _ACK_QUEUE_H_

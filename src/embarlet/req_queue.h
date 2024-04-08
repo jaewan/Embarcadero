@@ -11,8 +11,8 @@ namespace Embarcadero {
 using ReqQueue = folly::MPMCQueue<std::optional<struct PublishRequest>>;
 
 using AckQueue = folly::MPMCQueue<std::optional<void *>>;
-void EnqueueReq(AckQueue *queue, std::optional<struct PublishRequest> maybeTag);
-void DequeueReq(AckQueue *queue, std::optional<struct PublishRequest> *maybeTag);
+void EnqueueReq(std::shared_ptr<ReqQueue> queue, std::optional<struct PublishRequest> maybeTag);
+void DequeueReq(std::shared_ptr<ReqQueue> queue, std::optional<struct PublishRequest> *maybeTag);
 
 } // End of namespace Embarcadero
 #endif // _REQ_QUEUE_H_
