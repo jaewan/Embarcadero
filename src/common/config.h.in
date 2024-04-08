@@ -23,10 +23,13 @@ namespace Embarcadero{
 #define SEGMENT_SIZE (1UL << 30)
 #define NUM_DISK_IO_THREADS 8
 #define NUM_CXL_IO_THREADS 8
-#define NUM_IO_RECEIVE_THREADS 2
-#define NUM_IO_ACK_THREADS 1
+#define NUM_IO_RECEIVE_THREADS 6
+#define NUM_IO_ACK_THREADS 2
 #define NUM_BUFFERS 64
 #define BUFFER_SIZE 1024
+
+#define REQ_QUEUE_SIZE 10000
+#define ACK_QUEUE_SIZE 10000
 
 // Health check configs
 /// The delay to send the first health check
@@ -42,7 +45,7 @@ namespace Embarcadero{
 
 struct PublishRequest{
 	std::atomic<int> *counter;
-	GRPCPublishRequest *req;
+	GRPCPublishRequest *req; // TODO(erika): remove this field.
 	void *grpcTag;
 };
 
