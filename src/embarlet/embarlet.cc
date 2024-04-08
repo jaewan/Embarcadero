@@ -9,6 +9,8 @@
 #include "../disk_manager/disk_manager.h"
 #include "../network_manager/network_manager.h"
 #include "../cxl_manager/cxl_manager.h"
+#include "ack_queue.h"
+#include "req_queue.h"
 
 int main(int argc, char* argv[]){
 	// Initialize logging
@@ -29,7 +31,11 @@ int main(int argc, char* argv[]){
 		LOG(WARNING) << "Using emulated CXL";
 	}
 
-	//Initialize
+	// Initialize queues
+	auto ackQueue = std::make_shared<Embarcadero::AckQueue>(ACK_QUEUE_SIZE);
+	auto cxlReqQueue = std::make_shared<Embarcadero::ReqQueue>(REQ_QUEUE_SIZE);
+	auto diskReqQueue = std::make_shared<Embarcadero::ReqQueue>(REQ_QUEUE_SIZE);
+
 	int broker_id = 0;
 	Embarcadero::CXLManager cxl_manager(10000, broker_id, cxl_type);
 	Embarcadero::DiskManager disk_manager(10000);
@@ -97,10 +103,10 @@ int main(int argc, char* argv[]){
 	}
 	*/
 
-	/*
-	size_t num_net_threads = 3;
-	NetworkManager network_manager(num_net_threads);
-	network_manager.Run(DEFAULT_PORT);
-	*/
+	// Relinquish ownership of shared pointers to queues
+	ackQueue.reset();
+	cxlReqQueue.reset();
+	diskReqQueue.reset();
+
 	return 0;
 }

@@ -10,6 +10,10 @@ configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
 add_executable(embarlet 
     embarlet/embarlet.cc
+    embarlet/req_queue.h
+    embarlet/req_queue.cc
+    embarlet/ack_queue.h
+    embarlet/ack_queue.cc
     disk_manager/disk_manager.cc 
     disk_manager/disk_manager.h 
     cxl_manager/cxl_manager.cc
