@@ -9,12 +9,11 @@
 #include "common/config.h"
 #include "../embarlet/topic_manager.h"
 #include "../embarlet/req_queue.h"
-#include "../network_manager/network_manager.h"
+#include "../embarlet/ack_queue.h"
 
 namespace Embarcadero{
 
 class TopicManager;
-class NetworkManager;
 
 enum CXL_Type {Emul, Real};
 
@@ -68,9 +67,6 @@ class CXLManager{
 		void SetTopicManager(TopicManager *topic_manager){
 			topic_manager_ = topic_manager;
 		}
-		void SetNetworkManager(NetworkManager* network_manager){
-			network_manager_ = network_manager;
-		}
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
@@ -85,7 +81,6 @@ class CXLManager{
 		std::vector<std::thread> threads_;
 
 		TopicManager *topic_manager_;
-		NetworkManager *network_manager_;
 
 		CXL_Type cxl_type_;
 		int cxl_fd_;

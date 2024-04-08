@@ -6,7 +6,7 @@
 
 #include <pubsub.grpc.pb.h>
 
-// TODO(erika) this is for debug logging
+// This is for debug logging
 #define NDEBUG
 
 namespace Embarcadero{
@@ -45,7 +45,6 @@ namespace Embarcadero{
 
 struct PublishRequest{
 	std::atomic<int> *counter;
-	GRPCPublishRequest *req; // TODO(erika): remove this field.
 	void *grpcTag;
 };
 

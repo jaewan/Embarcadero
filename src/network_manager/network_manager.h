@@ -28,11 +28,6 @@ class NetworkManager{
 	public:
 		NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> cxl_req_queue, std::shared_ptr<ReqQueue> disk_req_queue, int num_receive_threads=NUM_IO_RECEIVE_THREADS, int num_ack_threads=NUM_IO_ACK_THREADS);
 		~NetworkManager();
-		void Proceed(void *grpcTag);
-		void SetError(void *grpcTag, PublisherError err);
-
-		// Class encompasing the state and logic needed to serve a request.
-		class CallData;
 
 	private:
 		void ReceiveThread();
