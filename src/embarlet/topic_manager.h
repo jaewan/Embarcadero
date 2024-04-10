@@ -4,10 +4,10 @@
 #include "../cxl_manager/cxl_manager.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_set.h"
-#include "absl/synchronization/mutex.h"
 
 #include <bits/stdc++.h>
 
+#define CACHELINE_SIZE 64
 namespace Embarcadero{
 
 class CXLManager;
@@ -33,24 +33,22 @@ class Topic{
 		std::string topic_name_;
 		int broker_id_;
 		struct MessageHeader *last_message_header_;
+		int order_;
 		
 		int logical_offset_;
 		int written_logical_offset_;
 		long long remaining_size_;
-		void* log_addr_;
+		std::atomic<unsigned long long int> log_addr_;
 		void* written_physical_addr_;
 		struct MessageHeader *prev_msg_header_;
 		//TODO(Jae) set this to nullptr if the sement is GCed
 		void* first_message_addr_;
-		absl::btree_set<int> writing_offsets_;
 		std::priority_queue<int, std::vector<int>, std::greater<int>> not_contigous_;
 
 		//TInode cache
 		void* ordered_offset_addr_;
 		struct MessageHeader** segment_metadata_;
 		size_t ordered_offset_;
-
-		absl::Mutex mu_;
 };
 
 class TopicManager{

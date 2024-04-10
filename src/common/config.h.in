@@ -15,14 +15,15 @@ namespace Embarcadero{
 #define LOG_SIZE (1UL<<35)
 #define MAX_TOPIC_SIZE 4
 #define MAX_TOPIC_NAME_SIZE 32
-#define SEGMENT_SIZE (1UL << 30)
-#define NUM_DISK_IO_THREADS 8
-#define NUM_CXL_IO_THREADS 8
+#define SEGMENT_SIZE (1UL << 35)
+#define NUM_DISK_IO_THREADS 40
+#define NUM_CXL_IO_THREADS 128
 #define NUM_NETWORK_IO_THREADS 8
-#define NUM_BUFFERS 64
-#define BUFFER_SIZE 1024
+#define NUM_BUFFERS 50000
+//This is the max message size && must be multiple of cacheline size
+#define BUFFER_SIZE 1024 
 
-// Health check configs
+//********* Health check configs *********
 /// The delay to send the first health check
 #define HEALTH_CHECK_INITIAL_DELAY_MS 5000
 /// The interval between two health checks

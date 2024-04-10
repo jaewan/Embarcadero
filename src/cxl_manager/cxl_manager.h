@@ -46,19 +46,21 @@ struct TInode{
 struct NonCriticalMessageHeader{
 	int client_id;
 	size_t client_order;
-	size_t logical_offset;
-	volatile size_t total_order;
-	volatile size_t size;
+	size_t size;
+	size_t total_order;
+	size_t paddedSize;
 	void* segment_header;
+	char _padding[64 - (sizeof(int) + sizeof(size_t) * 4 + sizeof(void*))]; 
 };
 
-struct MessageHeader{
+struct alignas(64) MessageHeader{
 	int client_id;
 	size_t client_order;
-	size_t logical_offset;
-	volatile size_t total_order;
 	volatile size_t size;
+	volatile size_t total_order;
+	volatile size_t paddedSize;
 	void* segment_header;
+	size_t logical_offset;
 	void* next_message;
 };
 
@@ -78,6 +80,26 @@ class CXLManager{
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 		void Sequencer(const char* topic);
+#define InternalTest 1
+
+#ifdef InternalTest
+		std::atomic<bool> startInternalTest_{false};
+		std::atomic<size_t> reqCount_{0};;
+		std::vector<std::thread> testThreads_;
+		std::chrono::high_resolution_clock::time_point start;
+		void DummyReq();
+		void WriteDummyReq(){
+			PublishRequest req;
+			memset(req.topic, 0, 32);
+			req.topic[0] = '0';
+			req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>));
+			req.counter->store(1);
+			req.payload_address = malloc(1024);
+			req.size = 1024;
+			requestQueue_.blockingWrite(req);
+		}
+		void StartInternalTest();
+#endif
 
 		private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
@@ -98,6 +120,7 @@ class CXLManager{
 		std::atomic<int> thread_count_{0};
 
 		void CXL_io_thread();
+
 };
 
 } // End of namespace Embarcadero

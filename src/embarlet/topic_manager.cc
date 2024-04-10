@@ -4,11 +4,46 @@
 #include <cstring>
 #include <cstdint>
 #include <immintrin.h>
+#include "folly/ConcurrentSkipList.h"
 
 namespace Embarcadero{
 
 #define NT_THRESHOLD 128
 
+void memcpy_nt(void* dst, const void* src, size_t size) {
+    // Cast the input pointers to the appropriate types
+    uint8_t* d = static_cast<uint8_t*>(dst);
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+
+    // Align the destination pointer to 16-byte boundary
+    size_t alignment = reinterpret_cast<uintptr_t>(d) & 0xF;
+    if (alignment) {
+        alignment = 16 - alignment;
+        size_t copy_size = (alignment > size) ? size : alignment;
+        std::memcpy(d, s, copy_size);
+        d += copy_size;
+        s += copy_size;
+        size -= copy_size;
+    }
+
+    // Copy the bulk of the data using non-temporal stores
+    size_t block_size = size / 64;
+    for (size_t i = 0; i < block_size; ++i) {
+        _mm_stream_si64(reinterpret_cast<long long*>(d), *reinterpret_cast<const long long*>(s));
+        _mm_stream_si64(reinterpret_cast<long long*>(d + 8), *reinterpret_cast<const long long*>(s + 8));
+        _mm_stream_si64(reinterpret_cast<long long*>(d + 16), *reinterpret_cast<const long long*>(s + 16));
+        _mm_stream_si64(reinterpret_cast<long long*>(d + 24), *reinterpret_cast<const long long*>(s + 24));
+        _mm_stream_si64(reinterpret_cast<long long*>(d + 32), *reinterpret_cast<const long long*>(s + 32));
+        _mm_stream_si64(reinterpret_cast<long long*>(d + 40), *reinterpret_cast<const long long*>(s + 40));
+        _mm_stream_si64(reinterpret_cast<long long*>(d + 48), *reinterpret_cast<const long long*>(s + 48));
+        _mm_stream_si64(reinterpret_cast<long long*>(d + 56), *reinterpret_cast<const long long*>(s + 56));
+        d += 64;
+        s += 64;
+    }
+
+    // Copy the remaining data using standard memcpy
+    std::memcpy(d, s, size % 64);
+}
 void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	static size_t CACHE_LINE_SIZE = sysconf (_SC_LEVEL1_DCACHE_LINESIZE);
 	if (n < NT_THRESHOLD) {
@@ -54,14 +89,14 @@ void TopicManager::CreateNewTopic(const char topic[32]){
 	memcpy(tinode->topic, topic, 32);
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
-	tinode->offsets[broker_id_].log_addr = (uint8_t*)segment_metadata + sizeof(void*);
-	//std::cout << "[TopicManager::CreateNewTopic] created topic:" << topic << std::endl;
+	tinode->offsets[broker_id_].log_addr = (uint8_t*)segment_metadata + CACHELINE_SIZE;
 
 	//TODO(Jae) topics_ should be in a critical section
 	// But addition and deletion of a topic in our case is rare
 	// We will leave it this way for now but this needs to be fixed
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
 			tinode, topic, broker_id_, segment_metadata);
+	//TODO Spawn a thread to order this topic
 }
 
 void TopicManager::DeleteTopic(char topic[32]){
@@ -92,11 +127,12 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 						tinode_(static_cast<struct TInode*>(TInode_addr)),
 						topic_name_(topic_name),
 						broker_id_(broker_id),
+						order_(0),
 						segment_metadata_((struct MessageHeader**)segment_metadata){
 	logical_offset_ = 0;
 	written_logical_offset_ = -1;
 	remaining_size_ = SEGMENT_SIZE - sizeof(void*);
-	log_addr_ = tinode_->offsets[broker_id_].log_addr;
+	log_addr_.store((unsigned long long int)tinode_->offsets[broker_id_].log_addr);
 	first_message_addr_ = tinode_->offsets[broker_id_].log_addr;
 	ordered_offset_addr_ = nullptr;
 	prev_msg_header_ = nullptr;
@@ -105,76 +141,30 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 	//TODO(Jae) have cache for disk as well
 }
 
+//MessageHeader is already included from network manager
 void Topic::PublishToCXL(PublishRequest &req){
-	void* log;
-	int logical_offset;
-	size_t size = req.size;
+	static unsigned long long int segment_metadata = (unsigned long long int)segment_metadata_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
-	{
-		absl::MutexLock lock(&mu_);
-		logical_offset = logical_offset_;
-		logical_offset_++;
-		remaining_size_ -= size - msg_header_size;
-		if(remaining_size_ >= 0){
-			log = log_addr_;
-			log_addr_ = (uint8_t*)log_addr_ + size + msg_header_size;
+	size_t size = req.size;
+	size_t reqSize = size + msg_header_size;
+	size_t padding = CACHELINE_SIZE - (reqSize%CACHELINE_SIZE);
+	size_t msgSize = size + padding;
+
+	void* log = (void*)log_addr_.fetch_add(msgSize);
+	int logical_offset;
+	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
+		std::cout << "!!!!!!!!! Increase the Segment Size" << std::endl;
+		//TODO(Jae) Finish below segment boundary crossing code
+		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
+			// Allocate a new segment
+			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
+			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}else{
-			segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
-			log = (uint8_t*)segment_metadata_ + sizeof(void*);
-			log_addr_ = (uint8_t*)log + size + msg_header_size;
-			remaining_size_ = SEGMENT_SIZE - size - msg_header_size - sizeof(void*);
+			// Wait for the first thread that crossed the segment to allocate a new segment
+			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
-		if(prev_msg_header_ != nullptr)
-			prev_msg_header_->next_message = log;
-		prev_msg_header_ = (struct MessageHeader*)log;
-		writing_offsets_.insert(logical_offset);
 	}
-
-	struct NonCriticalMessageHeader msg_header;
-	msg_header.client_id= req.client_id;
-	msg_header.client_order= req.client_order;
-	msg_header.logical_offset = logical_offset;
-	msg_header.size = size;
-	msg_header.segment_header = segment_metadata_;
-
-	nt_memcpy(log, &msg_header, sizeof(msg_header));
-	nt_memcpy((uint8_t*)log + msg_header_size, req.payload_address, req.size);
-
-	{
-		absl::MutexLock lock(&mu_);
-		if (*(writing_offsets_.begin()++) == logical_offset){
-			struct MessageHeader *tmp_header = (struct MessageHeader*)log;
-			if(written_logical_offset_ != (logical_offset - 1)){
-				perror(" !!!!!!!!!!!!!!!!!!!!!!  write logic is wrong !!!!!!!!!!!!!!!!!!\n");
-			}
-			written_logical_offset_ = logical_offset;
-
-			struct MessageHeader **current_segment_header= (struct MessageHeader**)tmp_header->segment_header;
-			struct MessageHeader *prev_tmp_header=tmp_header;
-			tmp_header = (struct MessageHeader*)tmp_header->next_message;
-			
-			// This is to record last message in the segment header if write goes beyond a segment
-			// We have not tested it over 2 segments. If concurrent writes go beyond 2 segments it will
-			// cause bugs
-			while(!not_contigous_.empty() && not_contigous_.top() == (written_logical_offset_ + 1)){
-				not_contigous_.pop();
-				written_logical_offset_++;
-				if(tmp_header->segment_header != (void*)current_segment_header){
-					(*current_segment_header) = prev_tmp_header;
-					current_segment_header = (struct MessageHeader **)tmp_header->segment_header;
-				}
-				prev_tmp_header = tmp_header;
-				tmp_header = (struct MessageHeader*)tmp_header->next_message;
-			}
-			(*current_segment_header) = prev_tmp_header;
-			written_physical_addr_ = (uint8_t*)(*current_segment_header) + (*current_segment_header)->size + msg_header_size;
-			tinode_->offsets[broker_id_].written = written_logical_offset_;
-		}else{
-			// Writes from smaller logical offset is not updated yet
-			not_contigous_.push(logical_offset);
-		}
-		writing_offsets_.erase(logical_offset);
-	}
+	memcpy_nt((uint8_t*)log + msg_header_size, req.payload_address, msgSize);
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message

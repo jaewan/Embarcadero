@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-
 #include <iostream>
 
 namespace Embarcadero{
@@ -32,7 +31,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	if (cxl_fd_  < 0)
 		perror("Opening CXL error");
 
-	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, cxl_fd_, 0);
+	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd_, 0);
 	if (cxl_addr_ == MAP_FAILED)
 		perror("Mapping Emulated CXL error");
 
@@ -48,19 +47,45 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	size_t Segment_Region_size = (CXL_SIZE - TINode_Region_size - Bitmap_Region_size)/NUM_BROKERS;
 
 	bitmap_ = (uint8_t*)cxl_addr_ + TINode_Region_size;
-	segments_ = (uint8_t*)bitmap_ + ((broker_id_)*Segment_Region_size);
+	segments_ = (uint8_t*)bitmap_ + Bitmap_Region_size + ((broker_id_)*Segment_Region_size);
 
 	// Head node initialize the CXL
 	if(broker_id_ == 0){
 		memset(cxl_addr_, 0, TINode_Region_size);
 	}
 
+#ifdef InternalTest
+	for(size_t i=0; i<queueCapacity; i++){
+		WriteDummyReq();
+	}
+#endif
 	// Wait untill al IO threads are up
 	while(thread_count_.load() != num_io_threads_){}
 
 	std::cout << "[CXLManager]: \tConstructed" << std::endl;
 	return;
 }
+
+#ifdef InternalTest
+void CXLManager::DummyReq(){
+	for(int i=0; i<100000; i++){
+		WriteDummyReq();
+	}
+}
+
+void CXLManager::StartInternalTest(){
+	for(int i=0; i<10; i++){
+		testThreads_.emplace_back(&CXLManager::DummyReq, this);
+	}
+	start = std::chrono::high_resolution_clock::now();
+	startInternalTest_.store(true);
+	for(std::thread& thread : testThreads_){
+		if(thread.joinable()){
+			thread.join();
+		}
+	}
+}
+#endif
 
 CXLManager::~CXLManager(){
 	std::optional<struct PublishRequest> sentinel = std::nullopt;
@@ -86,6 +111,9 @@ void CXLManager::CXL_io_thread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct PublishRequest> optReq;
 
+#ifdef InternalTest
+	while(startInternalTest_.load() == false){}
+#endif
 	while(!stop_threads_){
 		requestQueue_.blockingRead(optReq);
 		if(!optReq.has_value()){
@@ -97,16 +125,23 @@ void CXLManager::CXL_io_thread(){
 		topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
 
 		// Post I/O work (as disk I/O depend on the same payload)
-		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
+		int counter = req.counter->fetch_sub(1);
 		if( counter == 1){
-			//free(req.payload_address);
+			free(req.counter);
+			free(req.payload_address);
+#ifdef InternalTest
+			if(reqCount_.fetch_add(1) == 999999){
+				auto end = std::chrono::high_resolution_clock::now();
+				auto dur = end - start;
+				std::cout<<"Runtime:" << std::chrono::duration_cast<std::chrono::milliseconds>(dur).count() << std::endl;
+				std::cout<<(double)1024/(double)std::chrono::duration_cast<std::chrono::milliseconds>(dur).count() << "GB/s" << std::endl;
+			}
+#endif
 		}else if(req.acknowledge){
 			struct NetworkRequest req;
 			req.req_type = Acknowledge;
+			req.client_socket = 1;
 			network_manager_->EnqueueRequest(req);
-			//TODO(Jae)
-			//Enque ack request to network manager
-			// network_manager_.EnqueueAckRequest();
 		}
 	}
 }
