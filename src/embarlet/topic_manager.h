@@ -19,15 +19,27 @@ class Topic{
 		Topic(GetNewSegmentCallback get_new_segment_callback, 
 				void* TInode_addr, const char* topic_name, int broker_id,
 				void* segment_metadata);
+		~Topic(){
+			stop_threads_ = true;
+			for(std::thread& thread : combiningThreads_){
+				if(thread.joinable()){
+					thread.join();
+				}
+			}
+			std::cout << "[Topic]: \tDestructed" << std::endl;
+		}
 		// Delete copy contstructor and copy assignment operator
 		Topic(const Topic &) = delete;
 		Topic& operator=(const Topic &) = delete;
 
+		
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(size_t &last_offset,
-												void* &last_addr, void* messages, size_t &messages_size);
+							void* &last_addr, void* messages, size_t &messages_size);
+		void Combiner();
 
 	private:
+		void CombinerThread();
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		std::string topic_name_;
@@ -35,7 +47,7 @@ class Topic{
 		struct MessageHeader *last_message_header_;
 		int order_;
 		
-		int logical_offset_;
+		size_t logical_offset_;
 		int written_logical_offset_;
 		long long remaining_size_;
 		std::atomic<unsigned long long int> log_addr_;
@@ -49,6 +61,9 @@ class Topic{
 		void* ordered_offset_addr_;
 		struct MessageHeader** segment_metadata_;
 		size_t ordered_offset_;
+		bool stop_threads_ = false;
+
+		std::vector<std::thread> combiningThreads_;
 };
 
 class TopicManager{
@@ -58,7 +73,7 @@ class TopicManager{
 									broker_id_(broker_id){
 			std::cout << "[TopicManager]\tConstructed" << std::endl;
 		}
-		void CreateNewTopic(const char topic[32]);
+		void CreateNewTopic(char topic[32]);
 		void DeleteTopic(char topic[32]);
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
