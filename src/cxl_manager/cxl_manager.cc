@@ -34,6 +34,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd_, 0);
 	if (cxl_addr_ == MAP_FAILED)
 		perror("Mapping Emulated CXL error");
+	memset(cxl_addr_, 0, CXL_SIZE);
 
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
@@ -67,14 +68,25 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 }
 
 #ifdef InternalTest
+void CXLManager::WriteDummyReq(){
+	PublishRequest req;
+	memset(req.topic, 0, 32);
+	req.topic[0] = '0';
+	req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>));
+	req.counter->store(1);
+	req.payload_address = malloc(1024);
+	req.size = 1024-64;
+	requestQueue_.blockingWrite(req);
+}
+
 void CXLManager::DummyReq(){
-	for(int i=0; i<100000; i++){
+	for(int i=0; i<10000; i++){
 		WriteDummyReq();
 	}
 }
 
 void CXLManager::StartInternalTest(){
-	for(int i=0; i<10; i++){
+	for(int i=0; i<100; i++){
 		testThreads_.emplace_back(&CXLManager::DummyReq, this);
 	}
 	start = std::chrono::high_resolution_clock::now();

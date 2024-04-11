@@ -82,7 +82,7 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	memcpy(dst, src, n);
 }
 
-void TopicManager::CreateNewTopic(const char topic[32]){
+void TopicManager::CreateNewTopic(char topic[32]){
 	// Get and initialize tinode
 	void* segment_metadata = cxl_manager_.GetNewSegment();
 	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
@@ -96,7 +96,7 @@ void TopicManager::CreateNewTopic(const char topic[32]){
 	// We will leave it this way for now but this needs to be fixed
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
 			tinode, topic, broker_id_, segment_metadata);
-	//TODO Spawn a thread to order this topic
+	topics_[topic]->Combiner();
 }
 
 void TopicManager::DeleteTopic(char topic[32]){
@@ -137,21 +137,53 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 	ordered_offset_addr_ = nullptr;
 	prev_msg_header_ = nullptr;
 	ordered_offset_ = 0;
-
-	//TODO(Jae) have cache for disk as well
 }
 
-//MessageHeader is already included from network manager
+void Topic::CombinerThread(){
+	const static size_t header_size = sizeof(MessageHeader);
+	static void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
+	std::cout << "Combiner called " << std::endl;
+	MessageHeader *header = (MessageHeader*)first_message_addr_;
+	while(true || !stop_threads_){
+		while(header->paddedSize == 0){
+			if(stop_threads_){
+				return;
+			}
+			std::this_thread::yield();
+		}
+#ifdef MULTISEGMENT
+		if(header->next_message != nullptr){ // Moved to new segment
+			header = header->next_message;
+			segment_header = (uint8_t*)header - CACHELINE_SIZE;
+			continue;
+		}
+#endif
+		header->segment_header = segment_header;
+		header->logical_offset = logical_offset_;
+		tinode_->offsets[broker_id_].written = logical_offset_;
+		logical_offset_++;
+		header->next_message = (uint8_t*)header + header->paddedSize + header_size;
+		header = (MessageHeader*)header->next_message;
+	}
+}
+
+// Give logical order, not total order to messages. 
+// Order=0 can export these ordeerd messages. 1 and 2 should wait for sequencer
+void Topic::Combiner(){
+	combiningThreads_.emplace_back(&Topic::CombinerThread, this);
+}
+
+// MessageHeader is already included from network manager
+// For performance (to not have any mutex) have a separate combiner to give logical offsets  to the messages
 void Topic::PublishToCXL(PublishRequest &req){
 	static unsigned long long int segment_metadata = (unsigned long long int)segment_metadata_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
-	size_t size = req.size;
-	size_t reqSize = size + msg_header_size;
+
+	size_t reqSize = req.size + msg_header_size;
 	size_t padding = CACHELINE_SIZE - (reqSize%CACHELINE_SIZE);
-	size_t msgSize = size + padding;
+	size_t msgSize = req.size + padding;
 
 	void* log = (void*)log_addr_.fetch_add(msgSize);
-	int logical_offset;
 	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
 		std::cout << "!!!!!!!!! Increase the Segment Size" << std::endl;
 		//TODO(Jae) Finish below segment boundary crossing code
@@ -215,5 +247,6 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 
 	return true;
 }
+
 
 } // End of namespace Embarcadero

@@ -30,15 +30,14 @@ enum CXL_Type {Emul, Real};
  * 			Message: Header + paylod
  */
 
-// Align and pad to 64B cacheline
-struct alignas(64) offset_entry {
+struct alignas(32) offset_entry {
 	int ordered;
 	int written;
 	void* log_addr;
-	char _padding[64 - (sizeof(size_t) * 2 + sizeof(void*))]; 
+	char _padding[32 - (sizeof(size_t) * 2 + sizeof(void*))]; 
 };
 
-struct TInode{
+struct alignas(64) TInode{
 	char topic[32];
 	volatile offset_entry offsets[NUM_BROKERS];
 };
@@ -88,16 +87,7 @@ class CXLManager{
 		std::vector<std::thread> testThreads_;
 		std::chrono::high_resolution_clock::time_point start;
 		void DummyReq();
-		void WriteDummyReq(){
-			PublishRequest req;
-			memset(req.topic, 0, 32);
-			req.topic[0] = '0';
-			req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>));
-			req.counter->store(1);
-			req.payload_address = malloc(1024);
-			req.size = 1024;
-			requestQueue_.blockingWrite(req);
-		}
+		void WriteDummyReq();
 		void StartInternalTest();
 #endif
 
