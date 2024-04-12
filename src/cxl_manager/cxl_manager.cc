@@ -191,8 +191,8 @@ void CXLManager::Sequencer(const char* topic){
     int perLogOff[NUM_BROKERS];
 
 	for(int i = 0; i<NUM_BROKERS; i++){
-        while(tinode->offsets[i].log_addr == nullptr){}
-		msg_headers[i] = (struct MessageHeader*)tinode->offsets[i].log_addr;
+        while(tinode->offsets[i].log_offset == 0){}
+		msg_headers[i] = (struct MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[i].log_offset);
         perLogOff[i] = -1;
 	}
 

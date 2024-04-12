@@ -82,20 +82,21 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	memcpy(dst, src, n);
 }
 
-void TopicManager::CreateNewTopic(char topic[32]){
+void TopicManager::CreateNewTopic(char topic[32], int order){
 	// Get and initialize tinode
 	void* segment_metadata = cxl_manager_.GetNewSegment();
+	static void* cxl_addr = cxl_manager_.GetCXLAddr();
 	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	memcpy(tinode->topic, topic, 32);
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
-	tinode->offsets[broker_id_].log_addr = (uint8_t*)segment_metadata + CACHELINE_SIZE;
+	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
 
 	//TODO(Jae) topics_ should be in a critical section
 	// But addition and deletion of a topic in our case is rare
 	// We will leave it this way for now but this needs to be fixed
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
-			tinode, topic, broker_id_, segment_metadata);
+			tinode, topic, broker_id_, order, cxl_addr, segment_metadata);
 	topics_[topic]->Combiner();
 }
 
@@ -122,34 +123,34 @@ bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
 }
 
 Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const char* topic_name,
-					int broker_id, void* segment_metadata):
+					int broker_id, int order, void* cxl_addr, void* segment_metadata):
 						get_new_segment_callback_(get_new_segment),
 						tinode_(static_cast<struct TInode*>(TInode_addr)),
 						topic_name_(topic_name),
 						broker_id_(broker_id),
-						order_(0),
-						segment_metadata_((struct MessageHeader**)segment_metadata){
+						order_(order),
+						cxl_addr_(cxl_addr),
+						current_segment_(segment_metadata){
 	logical_offset_ = 0;
-	written_logical_offset_ = -1;
-	remaining_size_ = SEGMENT_SIZE - sizeof(void*);
-	log_addr_.store((unsigned long long int)tinode_->offsets[broker_id_].log_addr);
-	first_message_addr_ = tinode_->offsets[broker_id_].log_addr;
+	written_logical_offset_ = (size_t)-1;
+	log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
+	first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
 	ordered_offset_addr_ = nullptr;
-	prev_msg_header_ = nullptr;
 	ordered_offset_ = 0;
 }
 
 void Topic::CombinerThread(){
 	const static size_t header_size = sizeof(MessageHeader);
 	static void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
-	std::cout << "Combiner called " << std::endl;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
 	while(true || !stop_threads_){
 		while(header->paddedSize == 0){
 			if(stop_threads_){
+				std::cout << "Stopping CombinerThread" << std::endl;
 				return;
 			}
-			std::this_thread::yield();
+			sleep(1);
+			//std::this_thread::yield();
 		}
 #ifdef MULTISEGMENT
 		if(header->next_message != nullptr){ // Moved to new segment
@@ -160,9 +161,13 @@ void Topic::CombinerThread(){
 #endif
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
-		tinode_->offsets[broker_id_].written = logical_offset_;
-		logical_offset_++;
 		header->next_message = (uint8_t*)header + header->paddedSize + header_size;
+		tinode_->offsets[broker_id_].written = logical_offset_;
+		(*(unsigned long long int*)segment_header) +=
+		(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
+		written_logical_offset_ = logical_offset_;
+		written_physical_addr_ = (void*)header;
+		logical_offset_++;
 		header = (MessageHeader*)header->next_message;
 	}
 }
@@ -176,15 +181,15 @@ void Topic::Combiner(){
 // MessageHeader is already included from network manager
 // For performance (to not have any mutex) have a separate combiner to give logical offsets  to the messages
 void Topic::PublishToCXL(PublishRequest &req){
-	static unsigned long long int segment_metadata = (unsigned long long int)segment_metadata_;
+	static unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 
 	size_t reqSize = req.size + msg_header_size;
 	size_t padding = CACHELINE_SIZE - (reqSize%CACHELINE_SIZE);
-	size_t msgSize = req.size + padding;
+	size_t msgSize = reqSize + padding;
 
-	void* log = (void*)log_addr_.fetch_add(msgSize);
-	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
+	unsigned long long int log = log_addr_.fetch_add(msgSize);
+	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
 		std::cout << "!!!!!!!!! Increase the Segment Size" << std::endl;
 		//TODO(Jae) Finish below segment boundary crossing code
 		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
@@ -196,7 +201,7 @@ void Topic::PublishToCXL(PublishRequest &req){
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
-	memcpy_nt((uint8_t*)log + msg_header_size, req.payload_address, msgSize);
+	memcpy_nt((void*)log, req.payload_address, msgSize);
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message
@@ -209,41 +214,56 @@ void Topic::PublishToCXL(PublishRequest &req){
 // we should call this functiona again
 bool Topic::GetMessageAddr(size_t &last_offset,
 						   void* &last_addr, void* messages, size_t &messages_size){
-	static size_t header_size = sizeof(struct MessageHeader);
-	//TODO(Jae) replace this line after test
-	//if(writing_offsets_ < tinode_->ordered)
-	if(written_logical_offset_ < (int)last_offset){
+	static const size_t header_size = sizeof(struct MessageHeader);
+	size_t digested_offset = written_logical_offset_;
+	void* digested_addr = written_physical_addr_;
+	if(order_ > 0){
+		digested_offset = tinode_->offsets[broker_id_].ordered;
+		digested_addr = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].ordered_offset;
+	}
+	if(digested_offset == (size_t)-1 || ((last_addr != nullptr) && (digested_offset <= last_offset))){
+		std::cout<< "No messages to export digested_offset:" << digested_offset << std::endl;
 		return false;
 	}
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
 	if(last_addr != nullptr){
+		while((struct MessageHeader*)start_msg_header->next_message == nullptr){
+			std::cout<< "[GetMessageAddr] waiting for the message to be combined " << std::endl;
+			std::this_thread::yield();
+		}
 		start_msg_header = (struct MessageHeader*)start_msg_header->next_message;
 	}else{
+		if(digested_addr <= last_addr){
+			perror("[GetMessageAddr] Wrong!!\n");
+			return false;
+		}
 		start_msg_header = (struct MessageHeader*)first_message_addr_;
 	}
 
 	messages = (void*)start_msg_header;
-	struct MessageHeader** segment_header = (struct MessageHeader**)start_msg_header->segment_header;
-	struct MessageHeader *last_msg_of_segment =(*segment_header);
-	if((last_msg_of_segment->size + header_size + (uint8_t*)last_msg_of_segment) ==  written_physical_addr_){
+	unsigned long long int* last_msg_off = (unsigned long long int*)start_msg_header->segment_header;
+	struct MessageHeader *last_msg_of_segment = (MessageHeader*)((uint8_t*)last_msg_off + *last_msg_off);
+	if(last_msg_of_segment >= written_physical_addr_){
 		last_addr = nullptr; 
-		messages_size = ((uint8_t*)written_physical_addr_ - (uint8_t*)start_msg_header);
+		messages_size = (uint8_t*)written_physical_addr_ - (uint8_t*)start_msg_header + ((MessageHeader*)written_physical_addr_)->paddedSize + header_size;
 	}else{
-		messages_size =((uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header) + last_msg_of_segment->size + header_size; 
+		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize + header_size; 
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
 	}
 
+#ifdef DEBUG
 	struct MessageHeader *m = (struct MessageHeader*)messages;
 	size_t len = messages_size;
 	while(len>0){
 		char* msg = (char*)((uint8_t*)m + header_size);
 		len -= header_size;
 		std::cout<< msg << std::endl;
-		len -= m->size;
+		len -= m->paddedSize;
 		m =  (struct MessageHeader*)m->next_message;
 	}
+#endif
 
 	return true;
 }
