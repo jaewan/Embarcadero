@@ -33,8 +33,9 @@ enum CXL_Type {Emul, Real};
 struct alignas(32) offset_entry {
 	int ordered;
 	int written;
-	void* log_addr;
-	char _padding[32 - (sizeof(size_t) * 2 + sizeof(void*))]; 
+	//Since each broker will have different virtual adddress on the CXL memory, access it via CXL_addr_ + off
+	size_t ordered_offset; //relative offset to last ordered message header
+	size_t log_offset;
 };
 
 struct alignas(64) TInode{
@@ -79,7 +80,10 @@ class CXLManager{
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 		void Sequencer(const char* topic);
-#define InternalTest 1
+		void* GetCXLAddr(){
+			return cxl_addr_;
+		}
+//#define InternalTest 1
 
 #ifdef InternalTest
 		std::atomic<bool> startInternalTest_{false};

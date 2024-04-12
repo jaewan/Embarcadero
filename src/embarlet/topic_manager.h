@@ -17,8 +17,8 @@ using GetNewSegmentCallback = std::function<void*()>;
 class Topic{
 	public:
 		Topic(GetNewSegmentCallback get_new_segment_callback, 
-				void* TInode_addr, const char* topic_name, int broker_id,
-				void* segment_metadata);
+				void* TInode_addr, const char* topic_name, int broker_id, int order,
+				void* cxl_addr, void* segment_metadata);
 		~Topic(){
 			stop_threads_ = true;
 			for(std::thread& thread : combiningThreads_){
@@ -46,20 +46,18 @@ class Topic{
 		int broker_id_;
 		struct MessageHeader *last_message_header_;
 		int order_;
+		void* cxl_addr_;
 		
 		size_t logical_offset_;
-		int written_logical_offset_;
-		long long remaining_size_;
-		std::atomic<unsigned long long int> log_addr_;
+		size_t written_logical_offset_;
 		void* written_physical_addr_;
-		struct MessageHeader *prev_msg_header_;
+		std::atomic<unsigned long long int> log_addr_;
 		//TODO(Jae) set this to nullptr if the sement is GCed
 		void* first_message_addr_;
-		std::priority_queue<int, std::vector<int>, std::greater<int>> not_contigous_;
 
 		//TInode cache
 		void* ordered_offset_addr_;
-		struct MessageHeader** segment_metadata_;
+		void* current_segment_;
 		size_t ordered_offset_;
 		bool stop_threads_ = false;
 
@@ -73,7 +71,10 @@ class TopicManager{
 									broker_id_(broker_id){
 			std::cout << "[TopicManager]\tConstructed" << std::endl;
 		}
-		void CreateNewTopic(char topic[32]);
+		~TopicManager(){
+			std::cout << "[TopicManager]\tDestructed" << std::endl;
+		}
+		void CreateNewTopic(char topic[32], int order);
 		void DeleteTopic(char topic[32]);
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
