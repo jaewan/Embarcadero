@@ -12,9 +12,9 @@ namespace Embarcadero{
 #define ORDER_LEVEL 1
 #define PORT 1214
 #define NUM_BROKERS 1
-#define LOG_SIZE (1UL<<35)
-#define MAX_TOPIC_SIZE 4
-#define MAX_TOPIC_NAME_SIZE 32
+#define CXL_SIZE (1UL<<37)
+#define MAX_TOPIC_SIZE 32
+#define TOPIC_NAME_SIZE 31
 #define SEGMENT_SIZE (1UL << 35)
 #define NUM_DISK_IO_THREADS 4
 #define NUM_CXL_IO_THREADS 128
@@ -36,7 +36,7 @@ namespace Embarcadero{
 struct PublishRequest{
 	int client_id;
 	size_t client_order; // Must start from 0
-	char topic[MAX_TOPIC_NAME_SIZE];
+	char topic[TOPIC_NAME_SIZE];
 	bool acknowledge;
 	std::atomic<int> *counter;
 	void* payload_address;

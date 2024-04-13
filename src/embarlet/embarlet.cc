@@ -87,16 +87,28 @@ size_t GetPhysicalCoreCount(){
 }
 
 Embarcadero::TopicManager *t;
-#define LOOPLEN 10000
-void CXLWriteBandwidthTest(){
+#define LOOPLEN 100
+#define NUM_TOPICS 1
+double NUM_THREADS = 1;
+void CXLWriteBandwidthTest(int tid){
 	Embarcadero::PublishRequest req;
-	memset(req.topic, 0, 32);
-	req.topic[0] = '0';
+	memset(req.topic, 0, 31);
+	tid = tid%NUM_TOPICS;
+	std::sprintf(req.topic, "%d", tid);
 	req.client_id = 0;
 	req.client_order = 1;
-	req.size = 777;
+	req.size = 1024-64;
 	for(int i=0; i<LOOPLEN; i++){
 		req.payload_address = malloc(1024);;
+		Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
+		header->client_id = 0;
+		header->client_order = i;
+		header->size = req.size;
+		header->total_order = 0;
+		header->paddedSize = req.size;
+		header->segment_header = nullptr;
+		header->logical_offset = (size_t)-1; // Sentinel value
+		header->next_message = nullptr;
 		t->PublishToCXL(req);
 		free(req.payload_address);
 	}
@@ -107,20 +119,23 @@ void RawCXLWriteTest(){
 	int broker_id = 0;
 	Embarcadero::CXLManager cxl_manager(200,broker_id);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
+	cxl_manager.SetTopicManager(&topic_manager);
 
 	//********* Load Generate **************
-	char topic[32];
-	memset(topic, 0, 32);
-	topic[0] = '0';
-	topic_manager.CreateNewTopic(topic);
+	char topic[31];
+	int order =1;
+	for(int i=0; i<NUM_TOPICS; i++){
+		memset(topic, 0, 31);
+		std::sprintf(topic, "%d", i);
+		cxl_manager.CreateNewTopic(topic, order);
+	}
 
 	std::cout << "Starting Topic Manager Test" << std::endl;
-	double NUM_THREADS = 128;
     std::vector<std::thread> threads;
 	t = &topic_manager;
     auto start = std::chrono::high_resolution_clock::now();
     for (double i = 0; i < NUM_THREADS; ++i) {
-        threads.emplace_back(CXLWriteBandwidthTest);
+        threads.emplace_back(CXLWriteBandwidthTest, i);
     }
     // Join threads
     for (double i = 0; i < NUM_THREADS; ++i) {
@@ -135,9 +150,105 @@ void RawCXLWriteTest(){
 
     std::cout << "Runtime: " << duration.count() << std::endl;
     std::cout << "Internal Publish bandwidth: " << bandwidth << " GB/s" << std::endl;
+
+	sleep(2);
+	size_t last_offset = (size_t)-2;
+	void* last_addr = nullptr;
+	void* messages;
+	size_t messages_size;
+	size_t off = 0;
+	size_t to_read_msg = LOOPLEN*1024*NUM_THREADS;
+		if(cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)){
+			std::cout << "read :" << last_offset<< std::endl;
+		}else{
+			std::cout << "Did not read anything" << std::endl;
+		}
+	/*
+	while(to_read_msg > 0){
+		if(cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)){
+			Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)messages;
+			for(off; off<last_offset; off++){
+				//std::cout << header->total_order << std::endl;
+			}
+			to_read_msg -= messages_size;
+		}else{
+			std::cout << std::endl;
+		}
+	};
+	*/
+}
+
+void ReadWriteTest(){
+	int broker_id = 0;
+	Embarcadero::CXLManager cxl_manager(4000,broker_id, 4);
+	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
+
+	cxl_manager.SetTopicManager(&topic_manager);
+
+	char topic[31];
+	memset(topic, 0, 31);
+	topic[0] = '0';
+	int order = 1;
+	cxl_manager.CreateNewTopic(topic, order);
+
+	Embarcadero::PublishRequest req;
+	memset(req.topic, 0, 31);
+	req.topic[0] = '0';
+	req.client_id = 0;
+	req.client_order = 1;
+	req.size = 777;
+	req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>));
+	req.counter->store(1);
+
+	req.payload_address = malloc(1024);;
+	memcpy(req.payload_address + 64, "testing write read", 18);
+					Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
+					header->client_id = 0;
+					header->client_order = 0;
+					header->size = 777;
+					header->total_order = 0;
+					header->paddedSize = 64 - (777 % 64) + 777;
+					header->segment_header = nullptr;
+					header->logical_offset = (size_t)-1; // Sentinel value
+					header->next_message = nullptr;
+	cxl_manager.EnqueueRequest(req);
+
+	Embarcadero::PublishRequest req1;
+	memset(req1.topic, 0, 31);
+	req1.topic[0] = '0';
+	req1.client_id = 0;
+	req1.client_order = 2;
+	req1.size = 777;
+	req1.payload_address = malloc(1024);;
+	req1.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>));
+	req1.counter->store(1);
+	memcpy(req1.payload_address + 64, "Second Message", 14);
+					header = (Embarcadero::MessageHeader*)req1.payload_address;
+					header->client_id = 0;
+					header->client_order = 1;
+					header->size = 777;
+					header->total_order = 0;
+					header->paddedSize = 64 - (777 % 64) + 777;
+					header->segment_header = nullptr;
+					header->logical_offset = (size_t)-1; // Sentinel value
+					header->next_message = nullptr;
+	cxl_manager.EnqueueRequest(req1);
+
+	size_t last_offset = (size_t)-2;
+	void* last_addr = nullptr;
+	void* messages;
+	size_t messages_size;
+	sleep(2);
+	std::cout << cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)
+	<< std::endl;
+	std::cout << messages_size << std::endl;
+	return ;
 }
 
 int main(int argc, char* argv[]){
+	RawCXLWriteTest();
+	//ReadWriteTest();
+	return 0;
 	//Initialize
 	//size_t num_cores = GetPhysicalCoreCount();
 	int broker_id = 0;
@@ -153,13 +264,14 @@ int main(int argc, char* argv[]){
 	network_manager.SetDiskManager(&disk_manager);
 
 	//********* Load Generate **************
-	char topic[32];
-	memset(topic, 0, 32);
+	char topic[31];
+	memset(topic, 0, 31);
 	topic[0] = '0';
-	topic_manager.CreateNewTopic(topic);
+	int order = 0;
+	topic_manager.CreateNewTopic(topic, order);
 
 	std::cout << "You are now safe to go" << std::endl;
-	cxl_manager.StartInternalTest();
+	//cxl_manager.StartInternalTest();
 
 	// Sequencer Test
 	//sleep(2);
@@ -168,13 +280,13 @@ int main(int argc, char* argv[]){
 	// Disk Manager Test
 
 	/*
-	char topic[32];
-	memset(topic, 0, 32);
+	char topic[31];
+	memset(topic, 0, 31);
 	topic[0] = '0';
-	topic_manager.CreateNewTopic(topic);
+	topic_manager.CreateNewTopic(topic, 0);
 	Embarcadero::PublishRequest req;
 	std::atomic<int> c{2};
-	memcpy(req.topic, topic, 32);
+	memcpy(req.topic, topic, 31);
 	req.payload_address = malloc(1024);
 	req.counter = &c;
 	req.size = 1024;
@@ -186,8 +298,8 @@ int main(int argc, char* argv[]){
 
 	// Network Manager Test
 	/*
-	char topic[32];
-	memset(topic, 0, 32);
+	char topic[31];
+	memset(topic, 0, 31);
 	topic[0] = '0';
 	topic_manager.CreateNewTopic(topic);
 	
@@ -265,6 +377,5 @@ int main(int argc, char* argv[]){
 	delete pq;
 	*/
 
-	while(1){sleep(10);}
 	return 0;
 }

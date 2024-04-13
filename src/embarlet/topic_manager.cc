@@ -82,12 +82,13 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	memcpy(dst, src, n);
 }
 
-void TopicManager::CreateNewTopic(char topic[32], int order){
+void TopicManager::CreateNewTopic(char topic[31], int order){
 	// Get and initialize tinode
 	void* segment_metadata = cxl_manager_.GetNewSegment();
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
 	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
-	memcpy(tinode->topic, topic, 32);
+	memcpy(tinode->topic, topic, 31);
+	tinode->order= (uint8_t)order;
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
@@ -100,14 +101,14 @@ void TopicManager::CreateNewTopic(char topic[32], int order){
 	topics_[topic]->Combiner();
 }
 
-void TopicManager::DeleteTopic(char topic[32]){
+void TopicManager::DeleteTopic(char topic[31]){
 }
 
 void TopicManager::PublishToCXL(PublishRequest &req){
 	auto topic_itr = topics_.find(req.topic);
 	//TODO(Jae) if not found from topics_, inspect CXL TInode region too
 	if (topic_itr == topics_.end()){
-		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, 32));
+		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, 31));
 		perror("Topic not found");
 	}
 	topic_itr->second->PublishToCXL(req);
@@ -141,16 +142,15 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 
 void Topic::CombinerThread(){
 	const static size_t header_size = sizeof(MessageHeader);
-	static void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
+	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
-	while(true || !stop_threads_){
+	while(!stop_threads_){
 		while(header->paddedSize == 0){
 			if(stop_threads_){
 				std::cout << "Stopping CombinerThread" << std::endl;
 				return;
 			}
-			sleep(1);
-			//std::this_thread::yield();
+			std::this_thread::yield();
 		}
 #ifdef MULTISEGMENT
 		if(header->next_message != nullptr){ // Moved to new segment
@@ -181,16 +181,18 @@ void Topic::Combiner(){
 // MessageHeader is already included from network manager
 // For performance (to not have any mutex) have a separate combiner to give logical offsets  to the messages
 void Topic::PublishToCXL(PublishRequest &req){
-	static unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
+	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 
 	size_t reqSize = req.size + msg_header_size;
-	size_t padding = CACHELINE_SIZE - (reqSize%CACHELINE_SIZE);
+	size_t padding = req.size%CACHELINE_SIZE;
+	if(padding)
+		padding = (CACHELINE_SIZE - padding);
 	size_t msgSize = reqSize + padding;
 
 	unsigned long long int log = log_addr_.fetch_add(msgSize);
 	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
-		std::cout << "!!!!!!!!! Increase the Segment Size" << std::endl;
+		std::cout << "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE << std::endl;
 		//TODO(Jae) Finish below segment boundary crossing code
 		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
 			// Allocate a new segment
@@ -259,7 +261,8 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	while(len>0){
 		char* msg = (char*)((uint8_t*)m + header_size);
 		len -= header_size;
-		std::cout<< msg << std::endl;
+		std::cout << " total_order:" << m->total_order<< " logical_order:" <<
+		m->logical_offset << " msg:" << msg << std::endl;
 		len -= m->paddedSize;
 		m =  (struct MessageHeader*)m->next_message;
 	}
