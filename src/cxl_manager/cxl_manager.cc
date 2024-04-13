@@ -5,10 +5,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <iostream>
+#include <cstdlib>
 
 namespace Embarcadero{
-
-#define CXL_SIZE (1UL << 37)
 
 CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	requestQueue_(queueCapacity),
@@ -34,7 +33,8 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd_, 0);
 	if (cxl_addr_ == MAP_FAILED)
 		perror("Mapping Emulated CXL error");
-	memset(cxl_addr_, 0, CXL_SIZE);
+	//memset(cxl_addr_, 0, CXL_SIZE);
+	memset(cxl_addr_, 0, (1UL<<30));
 
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
@@ -70,7 +70,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 #ifdef InternalTest
 void CXLManager::WriteDummyReq(){
 	PublishRequest req;
-	memset(req.topic, 0, 32);
+	memset(req.topic, 0, TOPIC_NAME_SIZE);
 	req.topic[0] = '0';
 	req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>));
 	req.counter->store(1);
@@ -111,6 +111,12 @@ CXLManager::~CXLManager(){
 
 
 	for(std::thread& thread : threads_){
+		if(thread.joinable()){
+			thread.join();
+		}
+	}
+
+	for(std::thread& thread : sequencerThreads_){
 		if(thread.joinable()){
 			thread.join();
 		}
@@ -160,8 +166,9 @@ void CXLManager::CXL_io_thread(){
 
 void* CXLManager::GetTInode(const char* topic){
 	// Convert topic to tinode address
-	static const std::hash<std::string> topic_to_idx;
-	int TInode_idx = topic_to_idx(topic) % MAX_TOPIC_SIZE;
+	//static const std::hash<std::string> topic_to_idx;
+	//int TInode_idx = topic_to_idx(topic) % MAX_TOPIC_SIZE;
+	int TInode_idx = atoi(topic) % MAX_TOPIC_SIZE;
 	return ((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
 }
 
@@ -182,7 +189,50 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 	return topic_manager_->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
 }
 
-void CXLManager::Sequencer(const char* topic){
+void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+	topic_manager_->CreateNewTopic(topic, order);
+	if (order == 1){
+		sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic);
+	}else if (order == 2)
+		sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic);
+}
+
+void CXLManager::Sequencer1(char* topic){
+	static size_t header_size = sizeof(MessageHeader);
+	struct TInode *tinode = (struct TInode *)GetTInode(topic);
+	struct MessageHeader *msg_headers[NUM_BROKERS];
+	size_t seq = 0;
+    int perLogOff[NUM_BROKERS];
+
+	for(int i = 0; i<NUM_BROKERS; i++){
+        while(tinode->offsets[i].log_offset == 0){}
+		msg_headers[i] = (struct MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[i].log_offset);
+        perLogOff[i] = -1;
+	}
+	while(!stop_threads_){
+		bool yield = true;
+		for(int i = 0; i<NUM_BROKERS; i++){
+            if(perLogOff[i] < tinode->offsets[i].written){
+				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
+					perror("!!!!!!!!!!!! [Sequencer1] Error msg_header is not equal to the perLogOff");
+				}
+				msg_headers[i]->total_order = seq;
+				tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
+				perLogOff[i] = msg_headers[i]->logical_offset;
+				seq++;
+				msg_headers[i] = (MessageHeader*)((uint8_t*)msg_headers[i] + msg_headers[i]->paddedSize + header_size);
+            }else{
+				yield = false;
+			}
+			//TODO(Jae) if multi segment is implemented as last message to have a dummy, this should be handled
+		}
+		if(yield)
+			std::this_thread::yield();
+	}
+}
+
+// One Sequencer per topic. The broker that received CreateNewTopic spawn it.
+void CXLManager::Sequencer2(char* topic){
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
 	struct MessageHeader *msg_headers[NUM_BROKERS];
 	absl::flat_hash_map<int, size_t> last_ordered; // <client_id, client_request_id>>
@@ -193,12 +243,12 @@ void CXLManager::Sequencer(const char* topic){
 	for(int i = 0; i<NUM_BROKERS; i++){
         while(tinode->offsets[i].log_offset == 0){}
 		msg_headers[i] = (struct MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[i].log_offset);
-        perLogOff[i] = -1;
+        perLogOff[i] = -1; 
 	}
 
 //TODO(Jae) This logic is wrong as the ordered offset can skip few messages 
 //and the broker exports all data upto the ordered offset
-	while(1){
+	while(!stop_threads_){
 		for(int i = 0; i<NUM_BROKERS; i++){
             if(perLogOff[i] < tinode->offsets[i].written && (int)msg_headers[i]->logical_offset == perLogOff[i]){
                 msg_headers[i] = (MessageHeader*)(msg_headers[i]->next_message);

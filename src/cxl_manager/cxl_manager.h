@@ -31,15 +31,16 @@ enum CXL_Type {Emul, Real};
  */
 
 struct alignas(32) offset_entry {
-	int ordered;
-	int written;
+	volatile int ordered;
+	volatile int written;
 	//Since each broker will have different virtual adddress on the CXL memory, access it via CXL_addr_ + off
-	size_t ordered_offset; //relative offset to last ordered message header
+	volatile size_t ordered_offset; //relative offset to last ordered message header
 	size_t log_offset;
 };
 
 struct alignas(64) TInode{
-	char topic[32];
+	char topic[31];
+	uint8_t order;
 	volatile offset_entry offsets[NUM_BROKERS];
 };
 
@@ -79,7 +80,7 @@ class CXLManager{
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
-		void Sequencer(const char* topic);
+		void CreateNewTopic(char topic[31], int order);
 		void* GetCXLAddr(){
 			return cxl_addr_;
 		}
@@ -100,6 +101,7 @@ class CXLManager{
 		int broker_id_;
 		int num_io_threads_;
 		std::vector<std::thread> threads_;
+		std::vector<std::thread> sequencerThreads_;
 
 		TopicManager *topic_manager_;
 		NetworkManager *network_manager_;
@@ -114,6 +116,8 @@ class CXLManager{
 		std::atomic<int> thread_count_{0};
 
 		void CXL_io_thread();
+		void Sequencer1(char* topic);
+		void Sequencer2(char* topic);
 
 };
 

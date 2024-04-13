@@ -74,14 +74,14 @@ class TopicManager{
 		~TopicManager(){
 			std::cout << "[TopicManager]\tDestructed" << std::endl;
 		}
-		void CreateNewTopic(char topic[32], int order);
-		void DeleteTopic(char topic[32]);
+		void CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order);
+		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 
 	private:
-		int GetTopicIdx(char topic[32]){
+		int GetTopicIdx(char topic[TOPIC_NAME_SIZE]){
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
 		}
 
