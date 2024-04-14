@@ -5,27 +5,22 @@ include(cmake/peer_grpc.cmake)
 find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
 
-set_and_check(FOLLY_INCLUDE_DIR /usr/local/include/folly)
-set_and_check(FOLLY_CMAKE_DIR /usr/local/lib/cmake/folly)
-if (NOT TARGET Folly::folly)
-  include("${FOLLY_CMAKE_DIR}/folly-targets.cmake")
-endif()
-
-set(FOLLY_LIBRARIES Folly::folly)
-
-if (NOT folly_FIND_QUIETLY)
-  message(STATUS "Found folly: ${PACKAGE_PREFIX_DIR}")
-endif()
-
-configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/config.h")
+configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
 add_executable(embarlet 
     embarlet/embarlet.cc
     disk_manager/disk_manager.cc 
+    disk_manager/disk_manager.h 
+    cxl_manager/cxl_manager.cc
+    cxl_manager/cxl_manager.h 
+    network_manager/network_manager.cc
+    network_manager/network_manager.h 
     embarlet/pub_queue.cc 
     embarlet/pub_queue.h 
     embarlet/pub_task.h 
     embarlet/peer.cc
+    embarlet/topic_manager.cc
+    embarlet/topic_manager.h
 )
 
 target_include_directories(embarlet PUBLIC
