@@ -262,7 +262,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		char* msg = (char*)((uint8_t*)m + header_size);
 		len -= header_size;
 		std::cout << " total_order:" << m->total_order<< " logical_order:" <<
-		m->logical_offset << " msg:" << msg << std::endl;
+		m->logical_offset << " client_order::" << m->client_order << std::endl;
 		len -= m->paddedSize;
 		m =  (struct MessageHeader*)m->next_message;
 	}
