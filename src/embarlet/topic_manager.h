@@ -4,10 +4,10 @@
 #include "../cxl_manager/cxl_manager.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_set.h"
-#include "absl/synchronization/mutex.h"
 
 #include <bits/stdc++.h>
 
+#define CACHELINE_SIZE 64
 namespace Embarcadero{
 
 class CXLManager;
@@ -17,40 +17,51 @@ using GetNewSegmentCallback = std::function<void*()>;
 class Topic{
 	public:
 		Topic(GetNewSegmentCallback get_new_segment_callback, 
-				void* TInode_addr, const char* topic_name, int broker_id,
-				void* segment_metadata);
+				void* TInode_addr, const char* topic_name, int broker_id, int order,
+				void* cxl_addr, void* segment_metadata);
+		~Topic(){
+			stop_threads_ = true;
+			for(std::thread& thread : combiningThreads_){
+				if(thread.joinable()){
+					thread.join();
+				}
+			}
+			std::cout << "[Topic]: \tDestructed" << std::endl;
+		}
 		// Delete copy contstructor and copy assignment operator
 		Topic(const Topic &) = delete;
 		Topic& operator=(const Topic &) = delete;
 
-		void PublishToCXL(void* message, size_t size);
+		
+		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(size_t &last_offset,
-												void* &last_addr, void* messages, size_t &messages_size);
+							void* &last_addr, void* messages, size_t &messages_size);
+		void Combiner();
 
 	private:
+		void CombinerThread();
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		std::string topic_name_;
 		int broker_id_;
 		struct MessageHeader *last_message_header_;
+		int order_;
+		void* cxl_addr_;
 		
-		int logical_offset_;
-		int written_logical_offset_;
-		long long remaining_size_;
-		void* log_addr_;
+		size_t logical_offset_;
+		size_t written_logical_offset_;
 		void* written_physical_addr_;
-		struct MessageHeader *prev_msg_header_;
+		std::atomic<unsigned long long int> log_addr_;
 		//TODO(Jae) set this to nullptr if the sement is GCed
 		void* first_message_addr_;
-		absl::btree_set<int> writing_offsets_;
-		std::priority_queue<int, std::vector<int>, std::greater<int>> not_contigous_;
 
 		//TInode cache
 		void* ordered_offset_addr_;
-		struct MessageHeader** segment_metadata_;
+		void* current_segment_;
 		size_t ordered_offset_;
+		bool stop_threads_ = false;
 
-		absl::Mutex mu_;
+		std::vector<std::thread> combiningThreads_;
 };
 
 class TopicManager{
@@ -60,14 +71,17 @@ class TopicManager{
 									broker_id_(broker_id){
 			std::cout << "[TopicManager]\tConstructed" << std::endl;
 		}
-		void CreateNewTopic(const char topic[32]);
-		void DeleteTopic(char topic[32]);
-		void PublishToCXL(char topic[32], void* message, size_t size);
+		~TopicManager(){
+			std::cout << "[TopicManager]\tDestructed" << std::endl;
+		}
+		void CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order);
+		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
+		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 
 	private:
-		int GetTopicIdx(char topic[32]){
+		int GetTopicIdx(char topic[TOPIC_NAME_SIZE]){
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
 		}
 

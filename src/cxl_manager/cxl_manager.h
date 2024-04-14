@@ -9,10 +9,10 @@
 #include "common/config.h"
 #include "../embarlet/topic_manager.h"
 #include "../network_manager/network_manager.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/btree_map.h"
 
 namespace Embarcadero{
-
-#define NUM_BROKERS 4
 
 class TopicManager;
 class NetworkManager;
@@ -30,35 +30,38 @@ enum CXL_Type {Emul, Real};
  * 			Message: Header + paylod
  */
 
-// Align and pad to 64B cacheline
-struct alignas(64) offset_entry {
-	int ordered;
-	int written;
-	void* log_addr;
-	char _padding[64 - (sizeof(size_t) * 2 + sizeof(void*))]; 
+struct alignas(32) offset_entry {
+	volatile int ordered;
+	volatile int written;
+	//Since each broker will have different virtual adddress on the CXL memory, access it via CXL_addr_ + off
+	volatile size_t ordered_offset; //relative offset to last ordered message header
+	size_t log_offset;
 };
 
-struct TInode{
-	char topic[32];
+struct alignas(64) TInode{
+	char topic[31];
+	uint8_t order;
 	volatile offset_entry offsets[NUM_BROKERS];
 };
 
 struct NonCriticalMessageHeader{
 	int client_id;
 	size_t client_order;
-	size_t logical_offset;
-	volatile size_t total_order;
-	volatile size_t size;
+	size_t size;
+	size_t total_order;
+	size_t paddedSize;
 	void* segment_header;
+	char _padding[64 - (sizeof(int) + sizeof(size_t) * 4 + sizeof(void*))]; 
 };
 
-struct MessageHeader{
+struct alignas(64) MessageHeader{
 	int client_id;
 	size_t client_order;
-	size_t logical_offset;
-	volatile size_t total_order;
 	volatile size_t size;
+	volatile size_t total_order;
+	volatile size_t paddedSize;
 	void* segment_header;
+	size_t logical_offset;
 	void* next_message;
 };
 
@@ -77,13 +80,28 @@ class CXLManager{
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
-		void Sequencer();
+		void CreateNewTopic(char topic[31], int order);
+		void* GetCXLAddr(){
+			return cxl_addr_;
+		}
+//#define InternalTest 1
+
+#ifdef InternalTest
+		std::atomic<bool> startInternalTest_{false};
+		std::atomic<size_t> reqCount_{0};;
+		std::vector<std::thread> testThreads_;
+		std::chrono::high_resolution_clock::time_point start;
+		void DummyReq();
+		void WriteDummyReq();
+		void StartInternalTest();
+#endif
 
 		private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
 		int broker_id_;
 		int num_io_threads_;
 		std::vector<std::thread> threads_;
+		std::vector<std::thread> sequencerThreads_;
 
 		TopicManager *topic_manager_;
 		NetworkManager *network_manager_;
@@ -98,6 +116,9 @@ class CXLManager{
 		std::atomic<int> thread_count_{0};
 
 		void CXL_io_thread();
+		void Sequencer1(char* topic);
+		void Sequencer2(char* topic);
+
 };
 
 } // End of namespace Embarcadero
