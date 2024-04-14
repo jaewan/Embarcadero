@@ -31,7 +31,7 @@ add_executable(embarlet
 
 target_include_directories(embarlet PUBLIC
 	"${CMAKE_CURRENT_BINARY_DIR}"
-    "${PROJECT_BINARY_DIR}"
+  "${PROJECT_BINARY_DIR}"
 )
 
 target_link_libraries(embarlet

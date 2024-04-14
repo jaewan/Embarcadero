@@ -17,21 +17,22 @@ namespace Embarcadero{
 #define ORDER_LEVEL 1
 #define PORT 1214
 #define NUM_BROKERS 1
-#define LOG_SIZE (1UL<<35)
-#define MAX_TOPIC_SIZE 4
-#define MAX_TOPIC_NAME_SIZE 32
-#define SEGMENT_SIZE (1UL << 30)
-#define NUM_DISK_IO_THREADS 8
-#define NUM_CXL_IO_THREADS 8
+
+#define CXL_SIZE (1UL<<37)
+#define MAX_TOPIC_SIZE 32
+#define TOPIC_NAME_SIZE 31
+#define SEGMENT_SIZE (1UL << 35)
+#define NUM_DISK_IO_THREADS 4
+#define NUM_CXL_IO_THREADS 128
+#define NUM_NETWORK_IO_THREADS 4
 #define NUM_IO_RECEIVE_THREADS 6
 #define NUM_IO_ACK_THREADS 2
-#define NUM_BUFFERS 64
-#define BUFFER_SIZE 1024
-
 #define REQ_QUEUE_SIZE 10000
 #define ACK_QUEUE_SIZE 10000
+//This is the max message size && must be multiple of cacheline size
+#define BUFFER_SIZE (64UL<<4) 
 
-// Health check configs
+//********* Health check configs *********
 /// The delay to send the first health check
 #define HEALTH_CHECK_INITIAL_DELAY_MS 5000
 /// The interval between two health checks
@@ -44,6 +45,10 @@ namespace Embarcadero{
 #define DEFAULT_CHANNEL "127.0.0.1:10110"
 
 struct PublishRequest{
+	int client_id;
+	size_t client_order; // Must start from 0
+	char topic[TOPIC_NAME_SIZE];
+	bool acknowledge;
 	std::atomic<int> *counter;
 	void *grpcTag;
 };
