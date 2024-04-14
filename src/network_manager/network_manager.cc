@@ -8,7 +8,8 @@
 
 namespace Embarcadero{
 
-NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> cxl_req_queue, std::shared_ptr<ReqQueue> disk_req_queue, int num_receive_threads, int num_ack_threads):
+NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> cxl_req_queue,
+                               std::shared_ptr<ReqQueue> disk_req_queue, int num_receive_threads, int num_ack_threads):
 						 ackQueue_(ack_queue),
 						 reqQueueCXL_(cxl_req_queue),
 						 reqQueueDisk_(disk_req_queue),
@@ -19,9 +20,6 @@ NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_
 	for (int i = 0; i < num_ack_threads; i++) {
 		threads_.emplace_back(&NetworkManager::AckThread, this);
 	}
-	
-	// Wait for all ack threads to spawn
-	while (thread_count_.load() != num_ack_threads) {}
 
 	// Create service
 	// TODO: make IP addr and port parameters
@@ -41,10 +39,12 @@ NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_
 	for (int i = 0; i < num_receive_threads; i++) {
 		threads_.emplace_back(&NetworkManager::ReceiveThread, this);
 	}
-
+	
+	// Wait for all ack threads to spawn
+	while (thread_count_.load() != num_ack_threads) {}
 	// Wait for the threads to all start
 	while (thread_count_.load() != num_receive_threads + num_ack_threads) {}
-	LOG(INFO) << "Constructed!";
+	LOG(INFO) << "[NetworkManager] Constructed!";
 }
 
 NetworkManager::~NetworkManager() {
@@ -69,6 +69,7 @@ NetworkManager::~NetworkManager() {
 
 	// Wait for all threads to terminate
 	for(std::thread& thread : threads_) {
+
 		if(thread.joinable()){
 			thread.join();
 		}
@@ -102,6 +103,84 @@ void NetworkManager::ReceiveThread() {
     	}
 	}
 }
+  /*
+#define READ_SIZE 1024
+
+void NetworkManager::Network_io_thread(){
+
+	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	std::optional<struct NetworkRequest> optReq;
+
+	while(!stop_threads_){
+		requestQueue_.blockingRead(optReq);
+		if(!optReq.has_value()){
+			break;
+		}
+		const struct NetworkRequest &req = optReq.value();
+		switch(req.req_type){
+			case Receive:
+				//TODO(Jae) define if its publish or subscribe
+				//while(processed < batch_size){
+				while(true){
+					void* buf = malloc(BUFFER_SIZE);
+
+					int bytes_read = read(req.client_socket, buf, READ_SIZE);
+					if(bytes_read <= 0){
+					 	std::cout << "\t\t !!!!!!! Bytes Read:"<< bytes_read << std::endl;
+						break;
+					}
+					while((size_t)bytes_read < sizeof(EmbarcaderoReq)){
+						int ret = read(req.client_socket, (uint8_t*)buf + bytes_read, READ_SIZE - bytes_read);
+						if(ret <=0)
+							perror("!!!!!!!!!!!!!!!! read error\n\n\n");
+						bytes_read += ret;
+					}
+					struct EmbarcaderoReq *clientReq = (struct EmbarcaderoReq*)buf;
+					// Create publish request
+					struct PublishRequest pub_req;
+					pub_req.client_id = clientReq->client_id;
+					pub_req.client_order = clientReq->client_order;
+					pub_req.size = clientReq->size;
+					memcpy(pub_req.topic, clientReq->topic, 31);
+					pub_req.acknowledge = clientReq->ack;
+					pub_req.payload_address = (uint8_t*)buf;// + sizeof(EmbarcaderoReq);
+					pub_req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>)); 
+
+					// Transform EmbarcaderoReq at buf to MessageHeader
+					struct MessageHeader *header = (MessageHeader*)buf;
+					header->client_id = pub_req.client_id;
+					header->client_order = pub_req.client_order;
+					header->size = pub_req.size;
+					header->paddedSize = 64 - (header->size % 64) + header->size + sizeof(MessageHeader);
+					header->segment_header = nullptr;
+					header->logical_offset = (size_t)-1; // Sentinel value
+					header->next_message = nullptr;
+
+					bool close = false;
+					int to_read = (pub_req.size + sizeof(EmbarcaderoReq) - bytes_read);
+					while(to_read){
+						int ret = read(req.client_socket, (uint8_t*)buf + bytes_read, to_read);
+						if(ret == 0){
+							close = true;
+							break;
+						}
+						to_read -= ret;
+						bytes_read += ret;
+					}
+					if(close)
+						break;
+
+					cxl_manager_->EnqueueRequest(pub_req);
+					disk_manager_->EnqueueRequest(pub_req);
+					//processed++;
+				}
+				close(req.client_socket);
+				break;
+			case Send:
+				std::cout << "Send" << std::endl;
+				break;
+		}
+*/
 
 void NetworkManager::AckThread() {
 	LOG(INFO) << "Starting Acknowledgement I/O Thread";

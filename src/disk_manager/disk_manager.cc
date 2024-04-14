@@ -12,7 +12,6 @@
 namespace Embarcadero{
 
 #define DISK_LOG_PATH "embarc.disklog"
-#define NUM_ACTIVE_POLL 100
 
 DiskManager::DiskManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> req_queue, int num_io_threads):
 						ackQueue_(ack_queue),
@@ -68,7 +67,7 @@ void DiskManager::Disk_io_thread(){
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 
 		// If no more tasks are left to do
-		if (counter == 0) {
+		if (counter == 2) {
 			if (req_data->request_.acknowledge()) {
 				// TODO: Set result - just assume success
 				req_data->SetError(ERR_NO_ERROR);

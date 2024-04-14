@@ -1,0 +1,5 @@
+brokers: "0.0.0.0:9092,0.0.0.0:9093"
+topic: "latency_test_1"
+numMessages: 10000
+messageSize: 4000
+ack: 0
