@@ -13,14 +13,9 @@ NetworkManager::NetworkManager(size_t queueCapacity, int num_io_threads):
 	threads_.emplace_back(&NetworkManager::MainThread, this);
 	threads_.emplace_back(&NetworkManager::AckThread, this);
 	threads_.emplace_back(&NetworkManager::AckThread, this);
-	for (int i=3; i< num_io_threads_; i++)
+	threads_.emplace_back(&NetworkManager::AckThread, this);
+	for (int i=4; i< num_io_threads_; i++)
 		threads_.emplace_back(&NetworkManager::Network_io_thread, this);
-
-	for (int i=0; i< NUM_BUFFERS; i++){
-		buffers_[i] = (char*)malloc(BUFFER_SIZE);
-		buffers_counters_[i] = 0;
-	}
-
 
 	while(thread_count_.load() != num_io_threads_){}
 	std::cout << "[NetworkManager]: \tCreated" << std::endl;
@@ -30,12 +25,9 @@ NetworkManager::~NetworkManager(){
 	stop_threads_ = true;
 	std::optional<struct NetworkRequest> sentinel = std::nullopt;
 	ackQueue_.blockingWrite(sentinel);
-	for (int i=3; i<num_io_threads_; i++)
+	for (int i=4; i<num_io_threads_; i++)
 		requestQueue_.blockingWrite(sentinel);
-	for (int i=0; i< NUM_BUFFERS; i++){
-		free(buffers_[i]);
-	}
-
+	
 	for(std::thread& thread : threads_){
 		if(thread.joinable()){
 			thread.join();
@@ -50,18 +42,8 @@ void NetworkManager::EnqueueRequest(struct NetworkRequest req){
 }
 
 #define READ_SIZE 1024
-#define MSG_SIZE 1000000
-struct EmbarcaderoReq{
-	size_t client_id;
-	size_t client_order;
-	char topic[32];
-	size_t ack;
-	size_t size;
-};
-char JaeDebugBuf[1024];
-std::chrono::high_resolution_clock::time_point start;
+
 void NetworkManager::Network_io_thread(){
-	start = std::chrono::high_resolution_clock::now();
 
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct NetworkRequest> optReq;
@@ -75,49 +57,64 @@ void NetworkManager::Network_io_thread(){
 		switch(req.req_type){
 			case Receive:
 				//TODO(Jae) define if its publish or subscribe
+				//while(processed < batch_size){
 				while(true){
-					int buffer_off = GetBuffer();
-					char* buf = buffers_[buffer_off];
+					void* buf = malloc(BUFFER_SIZE);
+
 					int bytes_read = read(req.client_socket, buf, READ_SIZE);
-					if(bytes_read <= 0)
+					if(bytes_read <= 0){
+					 	std::cout << "\t\t !!!!!!! Bytes Read:"<< bytes_read << std::endl;
 						break;
+					}
+					while((size_t)bytes_read < sizeof(EmbarcaderoReq)){
+						int ret = read(req.client_socket, (uint8_t*)buf + bytes_read, READ_SIZE - bytes_read);
+						if(ret <=0)
+							perror("!!!!!!!!!!!!!!!! read error\n\n\n");
+						bytes_read += ret;
+					}
 					struct EmbarcaderoReq *clientReq = (struct EmbarcaderoReq*)buf;
 					// Create publish request
 					struct PublishRequest pub_req;
 					pub_req.client_id = clientReq->client_id;
 					pub_req.client_order = clientReq->client_order;
-					memcpy(pub_req.topic, clientReq->topic, 32);
-					pub_req.acknowledge = clientReq->ack;
-					pub_req.payload_address = (uint8_t*)buf + sizeof(EmbarcaderoReq);
-					pub_req.counter = &buffers_counters_[buffer_off];
 					pub_req.size = clientReq->size;
+					memcpy(pub_req.topic, clientReq->topic, 31);
+					pub_req.acknowledge = clientReq->ack;
+					pub_req.payload_address = (uint8_t*)buf;// + sizeof(EmbarcaderoReq);
+					pub_req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>)); 
+
+					// Transform EmbarcaderoReq at buf to MessageHeader
+					struct MessageHeader *header = (MessageHeader*)buf;
+					header->client_id = pub_req.client_id;
+					header->client_order = pub_req.client_order;
+					header->size = pub_req.size;
+					header->paddedSize = 64 - (header->size % 64) + header->size + sizeof(MessageHeader);
+					header->segment_header = nullptr;
+					header->logical_offset = (size_t)-1; // Sentinel value
+					header->next_message = nullptr;
+
+					bool close = false;
+					int to_read = (pub_req.size + sizeof(EmbarcaderoReq) - bytes_read);
+					while(to_read){
+						int ret = read(req.client_socket, (uint8_t*)buf + bytes_read, to_read);
+						if(ret == 0){
+							close = true;
+							break;
+						}
+						to_read -= ret;
+						bytes_read += ret;
+					}
+					if(close)
+						break;
 
 					cxl_manager_->EnqueueRequest(pub_req);
 					disk_manager_->EnqueueRequest(pub_req);
+					//processed++;
 				}
 				close(req.client_socket);
 				break;
 			case Send:
 				std::cout << "Send" << std::endl;
-				break;
-			case Test:
-				{
-				int buffer_off = GetBuffer();
-				char* buf = buffers_[buffer_off];
-				memcpy(buf, JaeDebugBuf, 1024);
-				// Create publish request
-				struct PublishRequest pub_req;
-				pub_req.client_id = 0;
-				pub_req.client_order = 0;
-				pub_req.topic[0] = '0';
-				pub_req.acknowledge = true;
-				pub_req.payload_address = (void*)buf; 
-				pub_req.counter = &buffers_counters_[buffer_off];
-				pub_req.size = 1024;
-
-				cxl_manager_->EnqueueRequest(pub_req);
-				disk_manager_->EnqueueRequest(pub_req);
-				}
 				break;
 		}
 	}
@@ -126,8 +123,6 @@ void NetworkManager::Network_io_thread(){
 void NetworkManager::AckThread(){
 	std::optional<struct NetworkRequest> optReq;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	static std::atomic<int> JaeDebugCount{0};
-	static std::atomic<int> JaeDebugDiskCount{0};
 
 	while(!stop_threads_){
 		ackQueue_.blockingRead(optReq);
@@ -135,28 +130,6 @@ void NetworkManager::AckThread(){
 			break;
 		}
 		const struct NetworkRequest &req = optReq.value();
-		if(req.client_socket == -1){
-			JaeDebugDiskCount.fetch_add(1, std::memory_order_relaxed);
-		}
-		JaeDebugCount.fetch_add(1, std::memory_order_relaxed);
-		if(JaeDebugCount == MSG_SIZE){
-			auto end = std::chrono::high_resolution_clock::now();
-			auto dur = end - start;
-			std::cout<<std::chrono::duration_cast<std::chrono::milliseconds>(dur).count() << std::endl;
-			std::cout<< "Disk ack:" << JaeDebugDiskCount << std::endl;
-		}
-	}
-}
-
-int NetworkManager::GetBuffer(){
-	static std::atomic<int> counter{0};
-	int off = counter.fetch_add(1, std::memory_order_relaxed) % NUM_BUFFERS;
-	int zero = 0;
-	while(1){
-		if(buffers_counters_[off].compare_exchange_weak(zero, 2)){
-			return off;
-		}
-		off = (off+1) % NUM_BUFFERS;
 	}
 }
 
@@ -173,7 +146,6 @@ void NetworkManager::MainThread(){
         std::cerr << "Error binding socket" << std::endl;
 		sleep(5);
     }
-
 
     listen(server_socket, 32);
 
