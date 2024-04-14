@@ -1,46 +1,109 @@
 #include "network_manager.h"
+#include "request_data.h"
+
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <glog/logging.h>
 
 namespace Embarcadero{
 
-NetworkManager::NetworkManager(size_t queueCapacity, int num_io_threads):
-						 requestQueue_(queueCapacity),
-						 ackQueue_(50),
-						 num_io_threads_(num_io_threads){
-	// Create Network I/O threads
-	threads_.emplace_back(&NetworkManager::MainThread, this);
-	threads_.emplace_back(&NetworkManager::AckThread, this);
-	threads_.emplace_back(&NetworkManager::AckThread, this);
-	threads_.emplace_back(&NetworkManager::AckThread, this);
-	for (int i=4; i< num_io_threads_; i++)
-		threads_.emplace_back(&NetworkManager::Network_io_thread, this);
+NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> cxl_req_queue,
+                               std::shared_ptr<ReqQueue> disk_req_queue, int num_receive_threads, int num_ack_threads):
+						 ackQueue_(ack_queue),
+						 reqQueueCXL_(cxl_req_queue),
+						 reqQueueDisk_(disk_req_queue),
+						 num_receive_threads_(num_receive_threads),
+						 num_ack_threads_(num_ack_threads) {
 
-	while(thread_count_.load() != num_io_threads_){}
-	std::cout << "[NetworkManager]: \tCreated" << std::endl;
+	// Start by creating threads to acknowledge when messages are done being processed
+	for (int i = 0; i < num_ack_threads; i++) {
+		threads_.emplace_back(&NetworkManager::AckThread, this);
+	}
+
+	// Create service
+	// TODO: make IP addr and port parameters
+    ServerBuilder builder;
+    builder.AddListeningPort(DEFAULT_CHANNEL, grpc::InsecureServerCredentials());
+    builder.RegisterService(&service_);
+	
+	// One completion queue per two receive threads. This is recommended in grpc perf docs
+	for (int i = 0; i < num_receive_threads / 2 + num_receive_threads % 2; i++) {
+		LOG(INFO) << "Created completion queue " << i;
+    	cqs_.push_back(builder.AddCompletionQueue());
+	}
+    server_ = builder.BuildAndStart();
+    LOG(INFO) << "gRPC Server listening on " << DEFAULT_CHANNEL;
+
+	// Create receive threads to process received gRPC messages
+	for (int i = 0; i < num_receive_threads; i++) {
+		threads_.emplace_back(&NetworkManager::ReceiveThread, this);
+	}
+	
+	// Wait for all ack threads to spawn
+	while (thread_count_.load() != num_ack_threads) {}
+	// Wait for the threads to all start
+	while (thread_count_.load() != num_receive_threads + num_ack_threads) {}
+	LOG(INFO) << "[NetworkManager] Constructed!";
 }
 
-NetworkManager::~NetworkManager(){
+NetworkManager::~NetworkManager() {
+
+	// We need to stop the receivers before we stop the ack queues
+	// Shutdown the gRPC server
+    server_->Shutdown();
+
+    // Always shutdown the completion queue after the server.
+	for (size_t i = 0; i < cqs_.size(); i++) {
+    	cqs_[i]->Shutdown();
+	}
+
+	// Notify threads we would like to stop
 	stop_threads_ = true;
-	std::optional<struct NetworkRequest> sentinel = std::nullopt;
-	ackQueue_.blockingWrite(sentinel);
-	for (int i=4; i<num_io_threads_; i++)
-		requestQueue_.blockingWrite(sentinel);
-	
-	for(std::thread& thread : threads_){
+
+	// Write a nullopt to the ack queue, so the ack threads can finish flushing the queue
+	std::optional<void *> sentinel = std::nullopt;
+	for (int i = 0; i < num_ack_threads_; i++) {
+		EnqueueAck(ackQueue_, sentinel);
+	}
+
+	// Wait for all threads to terminate
+	for(std::thread& thread : threads_) {
+
 		if(thread.joinable()){
 			thread.join();
 		}
 	}
-	std::cout << "[NetworkManager]: \tDestructed" << std::endl;
+
+	LOG(INFO) << "Destructed";
 }
 
-//Currently only for ack
-void NetworkManager::EnqueueRequest(struct NetworkRequest req){
-	ackQueue_.blockingWrite(req);
-}
+void NetworkManager::ReceiveThread() {
+	int recv_thread_id = thread_count_.fetch_add(1, std::memory_order_relaxed) - num_ack_threads_;
+	int my_cq_index = recv_thread_id / 2;
+	LOG(INFO) << "Starting Receive I/O Thread " << recv_thread_id << " with cq " << my_cq_index;
 
+	// Spawn a new RequestData instance to serve new clients.
+	if (!stop_threads_) {
+    	new RequestData(&service_, cqs_[my_cq_index].get(), reqQueueCXL_, reqQueueDisk_);
+    	void* tag;  // uniquely identifies a request.
+    	bool ok;
+    	while (!stop_threads_) {
+      		// Block waiting to read the next event from the completion queue. The
+      		// event is uniquely identified by its tag, which in this case is the
+      		// memory address of a RequestData instance.
+      		// The return value of Next should always be checked. This return value
+      		// tells us whether there is any kind of event or cq is shutting down.
+      		GPR_ASSERT(cqs_[my_cq_index]->Next(&tag, &ok));
+			if (!ok) {
+				LOG(INFO) << "Terminating Receive I/O Thread " << recv_thread_id;
+				return;
+			}
+      		static_cast<RequestData*>(tag)->Proceed();
+    	}
+	}
+}
+  /*
 #define READ_SIZE 1024
 
 void NetworkManager::Network_io_thread(){
@@ -117,49 +180,26 @@ void NetworkManager::Network_io_thread(){
 				std::cout << "Send" << std::endl;
 				break;
 		}
-	}
-}
+*/
 
-void NetworkManager::AckThread(){
-	std::optional<struct NetworkRequest> optReq;
+void NetworkManager::AckThread() {
+	LOG(INFO) << "Starting Acknowledgement I/O Thread";
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 
-	while(!stop_threads_){
-		ackQueue_.blockingRead(optReq);
-		if(!optReq.has_value()){
-			break;
+	std::optional<void *> optReq;
+	while(true) {
+		ackQueue_->blockingRead(optReq);
+		if(!optReq.has_value()) {
+			// This should means we are trying to shutdown threads
+			assert(stop_threads_ == true);
+			LOG(INFO) << "Terminating Acknoweldgement I/O Thread";
+			return;
 		}
-		const struct NetworkRequest &req = optReq.value();
+		
+		void *grpcTag = optReq.value();
+		DLOG(INFO) << "Got net_req, tag=" << grpcTag;
+    	static_cast<RequestData*>(grpcTag)->Proceed();
 	}
-}
-
-void NetworkManager::MainThread(){
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
-
-	int server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in server_address;
-    server_address.sin_family = AF_INET;
-    server_address.sin_port = htons(PORT);
-    server_address.sin_addr.s_addr = INADDR_ANY;
-	
-	 while (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
-        std::cerr << "Error binding socket" << std::endl;
-		sleep(5);
-    }
-
-    listen(server_socket, 32);
-
-    while (true) {
-		struct NetworkRequest req;
-		req.req_type = Receive;
-        req.client_socket = accept(server_socket, nullptr, nullptr);
-        if (req.client_socket < 0) {
-            std::cerr << "Error accepting connection" << std::endl;
-            continue;
-        }
-		//EnqueueRequest(req);
-		requestQueue_.blockingWrite(req);
-    }
 }
 
 } // End of namespace Embarcadero

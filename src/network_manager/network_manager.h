@@ -5,10 +5,22 @@
 #include <vector>
 #include <optional>
 #include "folly/MPMCQueue.h"
+#include <string>
+#include "absl/strings/str_format.h"
+#include <grpcpp/grpcpp.h>
 
 #include "common/config.h"
-#include "../disk_manager/disk_manager.h"
-#include "../cxl_manager/cxl_manager.h"
+#include <pubsub.grpc.pb.h>
+#include "../client/client.h"
+#include "../embarlet/req_queue.h"
+#include "../embarlet/ack_queue.h"
+
+using grpc::Server;
+using grpc::ServerAsyncResponseWriter;
+using grpc::ServerBuilder;
+using grpc::ServerCompletionQueue;
+using grpc::ServerContext;
+using grpc::Status;
 
 namespace Embarcadero{
 
@@ -31,28 +43,27 @@ struct alignas(64) EmbarcaderoReq{
 
 class NetworkManager{
 	public:
-		NetworkManager(size_t queueCapacity, int num_io_threads=NUM_NETWORK_IO_THREADS);
+		NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> cxl_req_queue, std::shared_ptr<ReqQueue> disk_req_queue, int num_receive_threads=NUM_IO_RECEIVE_THREADS, int num_ack_threads=NUM_IO_ACK_THREADS);
 		~NetworkManager();
-		void EnqueueRequest(struct NetworkRequest);
-		void SetDiskManager(DiskManager* disk_manager){
-			disk_manager_ = disk_manager;
-		}
-		void SetCXLManager(CXLManager* cxl_manager){
-			cxl_manager_ = cxl_manager;
-		}
 
 	private:
-		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
-		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
-		void Network_io_thread();
-		void MainThread();
+		void ReceiveThread();
 		void AckThread();
-		int GetBuffer();
 
 		std::vector<std::thread> threads_;
-		int num_io_threads_;
+    int num_receive_threads_;
+    int num_ack_threads_;
+
+		std::shared_ptr<AckQueue> ackQueue_;
+		std::shared_ptr<ReqQueue> reqQueueCXL_;
+		std::shared_ptr<ReqQueue> reqQueueDisk_;
+
 		std::atomic<int> thread_count_{0};
 		bool stop_threads_ = false;
+
+    std::vector<std::unique_ptr<ServerCompletionQueue>> cqs_;
+    PubSub::AsyncService service_;
+    std::unique_ptr<Server> server_;
 
 		CXLManager *cxl_manager_;
 		DiskManager *disk_manager_;

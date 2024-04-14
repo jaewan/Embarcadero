@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
 find_package(gflags REQUIRED)
+find_package(glog REQUIRED)
 find_package(folly REQUIRED)
 add_subdirectory(third_party/cxxopts)
 

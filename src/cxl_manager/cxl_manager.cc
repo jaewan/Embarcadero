@@ -6,15 +6,20 @@
 #include <errno.h>
 #include <iostream>
 #include <cstdlib>
+#include <glog/logging.h>
+#include "../network_manager/request_data.h"
 
 namespace Embarcadero{
 
-CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
-	requestQueue_(queueCapacity),
+CXLManager::CXLManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> req_queue, int broker_id, CXL_Type cxl_type, int num_io_threads):
+	ackQueue_(ack_queue),
+	reqQueue_(req_queue),
+
 	broker_id_(broker_id),
-	num_io_threads_(num_io_threads){
+	num_io_threads_(num_io_threads) {
 	// Initialize CXL
-	cxl_type_ = Real;
+
+	cxl_type_ = cxl_type;
 	std::string cxl_path(getenv("HOME"));
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
@@ -24,17 +29,22 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 			cxl_fd_ = open(cxl_path.c_str(), O_RDWR, 0777);
 			break;
 		case Real:
-			cxl_fd_ = open("/dev/dax0.0", O_RDWR);
-			break ;
+			cxl_path = "/dev/dax0.0";
+			cxl_fd_ = open(cxl_path.c_str(), O_RDWR);
+			break;
 	}
-	if (cxl_fd_  < 0)
+	LOG(INFO) << "Opening CXL at: " << cxl_path;
+	if (cxl_fd_ < 0) {
 		perror("Opening CXL error");
+		exit(-1);
+	}
 
 	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd_, 0);
-	if (cxl_addr_ == MAP_FAILED)
-		perror("Mapping Emulated CXL error");
-	//memset(cxl_addr_, 0, CXL_SIZE);
-	memset(cxl_addr_, 0, (1UL<<30));
+	if (cxl_addr_ == MAP_FAILED){
+		perror("Mapping Emulated CXL error");close(cxl_fd_);
+		exit(-1);
+	}
+	memset(cxl_addr_, 0, CXL_SIZE);
 
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
@@ -63,7 +73,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	// Wait untill al IO threads are up
 	while(thread_count_.load() != num_io_threads_){}
 
-	std::cout << "[CXLManager]: \tConstructed" << std::endl;
+	LOG(INFO) << "Constructed";
 	return;
 }
 
@@ -76,7 +86,7 @@ void CXLManager::WriteDummyReq(){
 	req.counter->store(1);
 	req.payload_address = malloc(1024);
 	req.size = 1024-64;
-	requestQueue_.blockingWrite(req);
+	reqQueue_.blockingWrite(req);
 }
 
 void CXLManager::DummyReq(){
@@ -102,8 +112,9 @@ void CXLManager::StartInternalTest(){
 CXLManager::~CXLManager(){
 	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	stop_threads_ = true;
-	for (int i=0; i< num_io_threads_; i++)
-		requestQueue_.blockingWrite(sentinel);
+	for (int i=0; i< num_io_threads_; i++) {
+		reqQueue_->blockingWrite(sentinel);
+	}
 
 	if (munmap(cxl_addr_, CXL_SIZE) < 0)
 		perror("Unmapping CXL error");
@@ -121,8 +132,6 @@ CXLManager::~CXLManager(){
 			thread.join();
 		}
 	}
-
-	std::cout << "[CXLManager]: \tDestructed" << std::endl;
 }
 
 void CXLManager::CXL_io_thread(){
@@ -133,20 +142,31 @@ void CXLManager::CXL_io_thread(){
 	while(startInternalTest_.load() == false){}
 #endif
 	while(!stop_threads_){
-		requestQueue_.blockingRead(optReq);
+		reqQueue_->blockingRead(optReq);
 		if(!optReq.has_value()){
 			break;
 		}
 		struct PublishRequest &req = optReq.value();
+		struct RequestData *req_data = static_cast<RequestData*>(req.grpcTag);
 
 		// Actual IO to the CXL
-		topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
+   topic_manager_->PublishToCXL((char *)(req_data->request_.topic().c_str()), (void *)(req_data->request_.payload().c_str()), req_data->request_.payload_size());
+   //topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
+   
+   // TODO(erika): below logic should really be shared function between CXL and Disk managers
+	 int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
+	
+	 // If no more tasks are left to do
+	 if (counter == 2) {
+      if (req_data->request_.acknowledge()) {
+				// TODO: Set result - just assume success
+				req_data->SetError(ERR_NO_ERROR);
 
-		// Post I/O work (as disk I/O depend on the same payload)
-		int counter = req.counter->fetch_sub(1);
-		if( counter == 1){
-			free(req.counter);
-			free(req.payload_address);
+				// Send to network manager ack queue
+				auto maybeTag = std::make_optional(req.grpcTag);
+				DLOG(INFO) << "Enquing to ack queue, tag=" << req.grpcTag;
+				EnqueueAck(ackQueue_, maybeTag);
+      }
 #ifdef InternalTest
 			if(reqCount_.fetch_add(1) == 999999){
 				auto end = std::chrono::high_resolution_clock::now();
@@ -155,13 +175,11 @@ void CXLManager::CXL_io_thread(){
 				std::cout<<(double)1024/(double)std::chrono::duration_cast<std::chrono::milliseconds>(dur).count() << "GB/s" << std::endl;
 			}
 #endif
-		}else if(req.acknowledge){
-			struct NetworkRequest req;
-			req.req_type = Acknowledge;
-			req.client_socket = 1;
-			network_manager_->EnqueueRequest(req);
-		}
-	}
+	  } else {
+				// gRPC has already sent response, so just mark the object as ready for destruction
+				req_data->Proceed();
+	  }
+	}// End While
 }
 
 void* CXLManager::GetTInode(const char* topic){
@@ -170,10 +188,6 @@ void* CXLManager::GetTInode(const char* topic){
 	//int TInode_idx = topic_to_idx(topic) % MAX_TOPIC_SIZE;
 	int TInode_idx = atoi(topic) % MAX_TOPIC_SIZE;
 	return ((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
-}
-
-void CXLManager::EnqueueRequest(struct PublishRequest req){
-	requestQueue_.blockingWrite(req);
 }
 
 void* CXLManager::GetNewSegment(){

@@ -6,6 +6,7 @@
 #include "absl/container/btree_set.h"
 
 #include <bits/stdc++.h>
+#include <glog/logging.h>
 
 #define CACHELINE_SIZE 64
 namespace Embarcadero{
@@ -69,7 +70,7 @@ class TopicManager{
 		TopicManager(CXLManager &cxl_manager, int broker_id):
 									cxl_manager_(cxl_manager),
 									broker_id_(broker_id){
-			std::cout << "[TopicManager]\tConstructed" << std::endl;
+			LOG(INFO) << "Constructed";
 		}
 		~TopicManager(){
 			std::cout << "[TopicManager]\tDestructed" << std::endl;
