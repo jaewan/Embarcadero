@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+service PubSub {
+    // Allows a publish to try to publish a message
+    rpc Publish(GRPCPublishRequest) returns (GRPCPublishResponse);
+}
+
+// Request containing address and port of sender (new broker)
+message GRPCPublishRequest {
+    uint64 client_id = 1;
+    uint64 client_order = 2;
+    string topic = 3; // TODO(erika): This has a max which is different than max name size. Will need to be verified
+    bool acknowledge = 4;
+    bytes payload = 5; // TODO: this is limited to be 2**23
+    uint64 payload_size = 6;
+}
+
+// Empty response for now
+message GRPCPublishResponse {
+    uint32 error = 1;
+}

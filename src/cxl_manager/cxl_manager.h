@@ -8,6 +8,8 @@
 #include "folly/MPMCQueue.h"
 #include "common/config.h"
 #include "../embarlet/topic_manager.h"
+#include "../embarlet/req_queue.h"
+#include "../embarlet/ack_queue.h"
 #include "../network_manager/network_manager.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_map.h"
@@ -15,7 +17,6 @@
 namespace Embarcadero{
 
 class TopicManager;
-class NetworkManager;
 
 enum CXL_Type {Emul, Real};
 
@@ -67,15 +68,11 @@ struct alignas(64) MessageHeader{
 
 class CXLManager{
 	public:
-		CXLManager(size_t queueCapacity, int broker_id, int num_io_threads=NUM_CXL_IO_THREADS);
+		CXLManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> req_queue, int broker_id, CXL_Type cxl_type, int num_io_threads=NUM_CXL_IO_THREADS);
 		~CXLManager();
 		void SetTopicManager(TopicManager *topic_manager){
 			topic_manager_ = topic_manager;
 		}
-		void SetNetworkManager(NetworkManager* network_manager){
-			network_manager_ = network_manager;
-		}
-		void EnqueueRequest(struct PublishRequest req);
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
@@ -96,15 +93,15 @@ class CXLManager{
 		void StartInternalTest();
 #endif
 
-		private:
-		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
+	private:
+		std::shared_ptr<ReqQueue> reqQueue_;
+		std::shared_ptr<AckQueue> ackQueue_;
 		int broker_id_;
 		int num_io_threads_;
 		std::vector<std::thread> threads_;
 		std::vector<std::thread> sequencerThreads_;
 
 		TopicManager *topic_manager_;
-		NetworkManager *network_manager_;
 
 		CXL_Type cxl_type_;
 		int cxl_fd_;

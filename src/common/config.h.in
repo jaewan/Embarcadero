@@ -4,6 +4,11 @@
 #include <atomic>
 #include <cstddef>
 
+#include <pubsub.grpc.pb.h>
+
+// This is for debug logging
+#define NDEBUG
+
 namespace Embarcadero{
 // the configured options and settings for Embarcadero
 #define Embarcadero_VERSION_MAJOR 0.1
@@ -12,6 +17,7 @@ namespace Embarcadero{
 #define ORDER_LEVEL 1
 #define PORT 1214
 #define NUM_BROKERS 1
+
 #define CXL_SIZE (1UL<<37)
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
@@ -19,7 +25,10 @@ namespace Embarcadero{
 #define NUM_DISK_IO_THREADS 4
 #define NUM_CXL_IO_THREADS 128
 #define NUM_NETWORK_IO_THREADS 4
-#define NUM_BUFFERS 50000
+#define NUM_IO_RECEIVE_THREADS 6
+#define NUM_IO_ACK_THREADS 2
+#define REQ_QUEUE_SIZE 10000
+#define ACK_QUEUE_SIZE 10000
 //This is the max message size && must be multiple of cacheline size
 #define BUFFER_SIZE (64UL<<4) 
 
@@ -33,14 +42,15 @@ namespace Embarcadero{
 /// The threshold for the amount of retries we do before we consider a node dead.
 #define HEALTH_CHECK_FAILURE_THRESHOLD 5
 
+#define DEFAULT_CHANNEL "127.0.0.1:10110"
+
 struct PublishRequest{
 	int client_id;
 	size_t client_order; // Must start from 0
 	char topic[TOPIC_NAME_SIZE];
 	bool acknowledge;
 	std::atomic<int> *counter;
-	void* payload_address;
-	size_t size;
+	void *grpcTag;
 };
 
 } // End of namespace Embarcadero

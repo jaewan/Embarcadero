@@ -79,7 +79,7 @@ function Setup_CXL()
 	echo "Setting up CXL Emulation"
 	mkdir -p ~/.CXL_EMUL
 	sudo mount -t tmpfs -o size=31g tmpfs ~/.CXL_EMUL
-	sudo mount -o remount,mpol=bind:1 ~/.CXL_EMUL/
+	sudo mount -o remount,mpol=bind:0 ~/.CXL_EMUL
 	truncate -s 30G ~/.CXL_EMUL/cxl
 }
 
