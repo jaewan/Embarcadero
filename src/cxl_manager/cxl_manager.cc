@@ -212,7 +212,7 @@ void CXLManager::Sequencer1(char* topic){
 	while(!stop_threads_){
 		bool yield = true;
 		for(int i = 0; i<NUM_BROKERS; i++){
-            if(perLogOff[i] < tinode->offsets[i].written){
+            if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
 				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
 					perror("!!!!!!!!!!!! [Sequencer1] Error msg_header is not equal to the perLogOff");
 				}
@@ -221,7 +221,6 @@ void CXLManager::Sequencer1(char* topic){
 				perLogOff[i] = msg_headers[i]->logical_offset;
 				seq++;
 				msg_headers[i] = (MessageHeader*)((uint8_t*)msg_headers[i] + msg_headers[i]->paddedSize + header_size);
-            }else{
 				yield = false;
 			}
 			//TODO(Jae) if multi segment is implemented as last message to have a dummy, this should be handled
@@ -233,11 +232,13 @@ void CXLManager::Sequencer1(char* topic){
 
 // One Sequencer per topic. The broker that received CreateNewTopic spawn it.
 void CXLManager::Sequencer2(char* topic){
+	static size_t header_size = sizeof(MessageHeader);
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
 	struct MessageHeader *msg_headers[NUM_BROKERS];
-	absl::flat_hash_map<int, size_t> last_ordered; // <client_id, client_request_id>>
-	absl::flat_hash_map<int, absl::btree_map<size_t, struct MessageHeader*>> skipped_msg; //<client_id, <client_req_id,*msg_header>>
-	size_t seq = 0;
+	absl::flat_hash_map<int/*client_id*/, size_t/*client_req_id*/> last_ordered; 
+	// It is OK to store as addresses b/c the total order is given by a single thread
+	absl::flat_hash_map<int, absl::btree_map<size_t/*client_id*/, struct MessageHeader*>> skipped_msg;
+	static size_t seq = 0;
     int perLogOff[NUM_BROKERS];
 
 	for(int i = 0; i<NUM_BROKERS; i++){
@@ -249,38 +250,42 @@ void CXLManager::Sequencer2(char* topic){
 //TODO(Jae) This logic is wrong as the ordered offset can skip few messages 
 //and the broker exports all data upto the ordered offset
 	while(!stop_threads_){
+		bool yield = true;
 		for(int i = 0; i<NUM_BROKERS; i++){
-            if(perLogOff[i] < tinode->offsets[i].written && (int)msg_headers[i]->logical_offset == perLogOff[i]){
-                msg_headers[i] = (MessageHeader*)(msg_headers[i]->next_message);
-            }
-            while(perLogOff[i] < tinode->offsets[i].written){
+            if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
+				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
+					perror("!!!!!!!!!!!! [Sequencer2] Error msg_header is not equal to the perLogOff");
+				}
                 int client = msg_headers[i]->client_id;
 				auto last_ordered_itr = last_ordered.find(client);
-				if(last_ordered_itr == last_ordered.end() || last_ordered_itr->second == msg_headers[i]->client_order - 1){
-                    //Give order
-                    msg_headers[i]->total_order = seq;
-					perLogOff[i] = msg_headers[i]->logical_offset;
-                    tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
-                    seq++;
+				perLogOff[i] = msg_headers[i]->logical_offset;
+				if(msg_headers[i]->client_order == 0 || 
+				(last_ordered_itr != last_ordered.end() && last_ordered_itr->second == msg_headers[i]->client_order - 1)){
+                    // Give order 
+					msg_headers[i]->total_order = seq;
+					tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
+					seq++;
                     last_ordered[client] = msg_headers[i]->client_order;
+					// Check if there are skipped messages from this client and give order
                     auto it = skipped_msg.find(client);
                     if(it != skipped_msg.end()){
                         std::vector<int> to_remove;
                         for (auto& pair : it->second) {
                             if(pair.first == last_ordered[client] + 1){
                                 pair.second->total_order = seq;
-								perLogOff[i] = msg_headers[i]->logical_offset;
                                 tinode->offsets[i].ordered = pair.second->logical_offset;
                                 seq++;
                                 last_ordered[client] = pair.first;
                                 to_remove.push_back(pair.first);
-                            }
+                            }else{
+								break;
+							}
                         }
                         for(auto &id: to_remove){
                             it->second.erase(id);
                         }
                     }
-                }else{
+				}else{
                     //Insert to skipped messages
                     auto it = skipped_msg.find(client);
                      if (it == skipped_msg.end()) {
@@ -290,11 +295,13 @@ void CXLManager::Sequencer2(char* topic){
                      } else {
                          it->second.emplace(msg_headers[i]->client_order, msg_headers[i]);
                      }
-                }
-                if(msg_headers[i]->next_message)
-                    msg_headers[i] = (struct MessageHeader*)msg_headers[i]->next_message;
-			}
+				}
+				msg_headers[i] = (MessageHeader*)((uint8_t*)msg_headers[i] + msg_headers[i]->paddedSize + header_size);
+				yield = false;
+            }
 		}
+		if(yield)
+			std::this_thread::yield();
 	}
 }
 
