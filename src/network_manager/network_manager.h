@@ -14,10 +14,19 @@ namespace Embarcadero{
 
 class CXLManager;
 class DiskManager;
-enum NetworkRequestType {Acknowledge, Receive, Send, Test};
+enum NetworkRequestType {Acknowledge, Receive, Send};
+
 struct NetworkRequest{
 	NetworkRequestType req_type;
 	int client_socket;
+};
+
+struct alignas(64) EmbarcaderoReq{
+	size_t client_id;
+	size_t client_order;
+	size_t size;
+	char topic[32]; //This is to align thie struct as 64B
+	size_t ack;
 };
 
 class NetworkManager{
@@ -42,15 +51,11 @@ class NetworkManager{
 
 		std::vector<std::thread> threads_;
 		int num_io_threads_;
-
-		char *buffers_[NUM_BUFFERS];
-		std::atomic<int> buffers_counters_[NUM_BUFFERS];
+		std::atomic<int> thread_count_{0};
+		bool stop_threads_ = false;
 
 		CXLManager *cxl_manager_;
 		DiskManager *disk_manager_;
-
-		std::atomic<int> thread_count_{0};
-		bool stop_threads_ = false;
 };
 
 } // End of namespace Embarcadero
