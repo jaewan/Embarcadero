@@ -87,14 +87,13 @@ size_t GetPhysicalCoreCount(){
 }
 
 Embarcadero::TopicManager *t;
-#define LOOPLEN 100
+#define LOOPLEN 10
 #define NUM_TOPICS 1
-double NUM_THREADS = 1;
+double NUM_THREADS = 10;
 void CXLWriteBandwidthTest(int tid){
 	Embarcadero::PublishRequest req;
 	memset(req.topic, 0, 31);
-	tid = tid%NUM_TOPICS;
-	std::sprintf(req.topic, "%d", tid);
+	std::sprintf(req.topic, "%d", tid%NUM_TOPICS);
 	req.client_id = 0;
 	req.client_order = 1;
 	req.size = 1024-64;
@@ -102,7 +101,7 @@ void CXLWriteBandwidthTest(int tid){
 		req.payload_address = malloc(1024);;
 		Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
 		header->client_id = 0;
-		header->client_order = i;
+		header->client_order = (tid*LOOPLEN)+i;
 		header->size = req.size;
 		header->total_order = 0;
 		header->paddedSize = req.size;
@@ -123,7 +122,7 @@ void RawCXLWriteTest(){
 
 	//********* Load Generate **************
 	char topic[31];
-	int order =1;
+	int order =2;
 	for(int i=0; i<NUM_TOPICS; i++){
 		memset(topic, 0, 31);
 		std::sprintf(topic, "%d", i);
@@ -188,7 +187,7 @@ void ReadWriteTest(){
 	char topic[31];
 	memset(topic, 0, 31);
 	topic[0] = '0';
-	int order = 1;
+	int order = 2;
 	cxl_manager.CreateNewTopic(topic, order);
 
 	Embarcadero::PublishRequest req;
