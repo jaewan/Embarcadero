@@ -106,14 +106,14 @@ void TopicManager::CreateNewTopic(char topic[31], int order){
 void TopicManager::DeleteTopic(char topic[31]){
 }
 
-void TopicManager::PublishToCXL(PublishRequest &req){
-	auto topic_itr = topics_.find(req.topic);
+void TopicManager::PublishToCXL(struct RequestData *req_data){
+	auto topic_itr = topics_.find(req_data->request_.topic().c_str());
 	//TODO(Jae) if not found from topics_, inspect CXL TInode region too
 	if (topic_itr == topics_.end()){
-		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, 31));
+		if(memcmp(req_data->request_.topic().c_str(), ((struct TInode*)(cxl_manager_.GetTInode(req_data->request_.topic().c_str())))->topic, 31));
 		perror("Topic not found");
 	}
-	topic_itr->second->PublishToCXL(req);
+	topic_itr->second->PublishToCXL(req_data);
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -182,12 +182,12 @@ void Topic::Combiner(){
 
 // MessageHeader is already included from network manager
 // For performance (to not have any mutex) have a separate combiner to give logical offsets  to the messages
-void Topic::PublishToCXL(PublishRequest &req){
+void Topic::PublishToCXL(struct RequestData *req_data){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 
-	size_t reqSize = req.size + msg_header_size;
-	size_t padding = req.size%CACHELINE_SIZE;
+	size_t reqSize = req_data->request_.payload_size() + msg_header_size;
+	size_t padding = req_data->request_.payload_size()%CACHELINE_SIZE;
 	if(padding)
 		padding = (CACHELINE_SIZE - padding);
 	size_t msgSize = reqSize + padding;
@@ -205,7 +205,7 @@ void Topic::PublishToCXL(PublishRequest &req){
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
-	memcpy_nt((void*)log, req.payload_address, msgSize);
+	memcpy_nt((void*)log, (void *)(req_data->request_.payload().c_str()), msgSize);
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message

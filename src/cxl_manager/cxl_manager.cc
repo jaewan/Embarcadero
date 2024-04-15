@@ -14,7 +14,6 @@ namespace Embarcadero{
 CXLManager::CXLManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> req_queue, int broker_id, CXL_Type cxl_type, int num_io_threads):
 	ackQueue_(ack_queue),
 	reqQueue_(req_queue),
-
 	broker_id_(broker_id),
 	num_io_threads_(num_io_threads) {
 	// Initialize CXL
@@ -44,11 +43,13 @@ CXLManager::CXLManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQ
 		perror("Mapping Emulated CXL error");close(cxl_fd_);
 		exit(-1);
 	}
-	memset(cxl_addr_, 0, CXL_SIZE);
+	LOG(INFO) << "Zeroing the CXL memory: ";
+	//memset(cxl_addr_, 0, CXL_SIZE);
+	memset(cxl_addr_, 0, (1UL)<<30);
 
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
-		threads_.emplace_back(&CXLManager::CXL_io_thread, this);
+		threads_.emplace_back(&CXLManager::CXLIOThread, this);
 
 	// Initialize CXL memory regions
 	size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
@@ -73,7 +74,7 @@ CXLManager::CXLManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQ
 	// Wait untill al IO threads are up
 	while(thread_count_.load() != num_io_threads_){}
 
-	LOG(INFO) << "Constructed";
+	LOG(INFO) << "[CXLManager] Constructed";
 	return;
 }
 
@@ -134,7 +135,7 @@ CXLManager::~CXLManager(){
 	}
 }
 
-void CXLManager::CXL_io_thread(){
+void CXLManager::CXLIOThread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct PublishRequest> optReq;
 
@@ -150,34 +151,35 @@ void CXLManager::CXL_io_thread(){
 		struct RequestData *req_data = static_cast<RequestData*>(req.grpcTag);
 
 		// Actual IO to the CXL
-   topic_manager_->PublishToCXL((char *)(req_data->request_.topic().c_str()), (void *)(req_data->request_.payload().c_str()), req_data->request_.payload_size());
-   //topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
-   
-   // TODO(erika): below logic should really be shared function between CXL and Disk managers
+	   topic_manager_->PublishToCXL(req_data);//(char *)(req_data->request_.topic().c_str()), (void *)(req_data->request_.payload().c_str()), req_data->request_.payload_size());
+	   //topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
+	   
+	   // TODO(erika): below logic should really be shared function between CXL and Disk managers
 	 int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 	
 	 // If no more tasks are left to do
-	 if (counter == 2) {
-      if (req_data->request_.acknowledge()) {
-				// TODO: Set result - just assume success
-				req_data->SetError(ERR_NO_ERROR);
+	 if (counter == 1) {
+	 	if (req_data->request_.acknowledge()) {
+			// TODO: Set result - just assume success
+			req_data->SetError(ERR_NO_ERROR);
 
-				// Send to network manager ack queue
-				auto maybeTag = std::make_optional(req.grpcTag);
-				DLOG(INFO) << "Enquing to ack queue, tag=" << req.grpcTag;
-				EnqueueAck(ackQueue_, maybeTag);
-      }
+			// Send to network manager ack queue
+			auto maybeTag = std::make_optional(req.grpcTag);
+			VLOG(1) << "Enquing to ack queue, tag=" << req.grpcTag;
+			EnqueueAck(ackQueue_, maybeTag);
+      	}
 #ifdef InternalTest
-			if(reqCount_.fetch_add(1) == 999999){
-				auto end = std::chrono::high_resolution_clock::now();
-				auto dur = end - start;
-				std::cout<<"Runtime:" << std::chrono::duration_cast<std::chrono::milliseconds>(dur).count() << std::endl;
-				std::cout<<(double)1024/(double)std::chrono::duration_cast<std::chrono::milliseconds>(dur).count() << "GB/s" << std::endl;
-			}
+		if(reqCount_.fetch_add(1) == 999999){
+			auto end = std::chrono::high_resolution_clock::now();
+			auto dur = end - start;
+			std::cout<<"Runtime:" << std::chrono::duration_cast<std::chrono::milliseconds>(dur).count() << std::endl;
+			std::cout<<(double)1024/(double)std::chrono::duration_cast<std::chrono::milliseconds>(dur).count() << "GB/s" << std::endl;
+		}
 #endif
 	  } else {
-				// gRPC has already sent response, so just mark the object as ready for destruction
-				req_data->Proceed();
+			// gRPC has already sent response, so just mark the object as ready for destruction
+			//delete req.counter;
+			//req_data->Proceed();
 	  }
 	}// End While
 }

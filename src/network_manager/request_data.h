@@ -26,17 +26,22 @@ public:
     // Take in the "service" instance (in this case representing an asynchronous
     // server) and the completion queue "cq" used for asynchronous communication
     // with the gRPC runtime.
-    RequestData(PubSub::AsyncService* service, ServerCompletionQueue* cq, std::shared_ptr<ReqQueue> reqQueueCXL, std::shared_ptr<ReqQueue> reqQueueDisk)
-            : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE), reqQueueCXL_(reqQueueCXL), reqQueueDisk_(reqQueueDisk) {
+    RequestData(PubSub::AsyncService* service, ServerCompletionQueue* cq, std::shared_ptr<ReqQueue> reqQueueCXL,
+	std::shared_ptr<ReqQueue> reqQueueDisk)
+            : service_(service),
+			cq_(cq), responder_(&ctx_), 
+			status_(CREATE), 
+			reqQueueCXL_(reqQueueCXL), 
+			reqQueueDisk_(reqQueueDisk) {
         // Invoke the serving logic right away.
         Proceed();
     }
 
     void Proceed() {
-		    DLOG(INFO) << "In RequestData.Proceed() with status_ == " << status_;
+		    VLOG(1) << "In RequestData.Proceed() with status_ == " << status_;
         if (status_ == CREATE) {
             // Make this instance progress to the PROCESS state.
-            DLOG(INFO) << "Creating call data, asking for RPC";
+            VLOG(1) << "Creating call data, asking for RPC";
             status_ = PROCESS;
 		        reply_.set_error(ERR_NO_ERROR);
 
@@ -51,12 +56,14 @@ public:
             // Spawn a new RequestData instance to serve new clients while we process
             // the one for this RequestData. The instance will deallocate itself as
             // part of its FINISH state.
-		        DLOG(INFO) << "Creating new RequestData object in RequestData";
+		        VLOG(1) << "Creating new RequestData object in RequestData";
             new RequestData(service_, cq_, reqQueueCXL_, reqQueueDisk_);
             PublishRequest req;
             req.counter = new std::atomic<int>(1);
-		        req.grpcTag = this;
-		        auto maybeReq = std::make_optional(req);
+			req.grpcTag = this;
+			auto maybeReq = std::make_optional(req);
+			//TODO(Erika)
+			//We have two requests, publish and subscribe.
 
             if (request_.acknowledge()) {
                 // Wait for acknowlegment to respond
@@ -72,7 +79,7 @@ public:
 		    EnqueueReq(reqQueueDisk_, maybeReq);
 
         } else if (status_ == ACKNOWLEDGE) {
-            DLOG(INFO) << "Acknowledging the RequestData() object";
+            VLOG(1) << "Acknowledging the RequestData() object";
 
             // And we are done! Let the gRPC runtime know we've finished, using the
             // memory address of this instance as the uniquely identifying tag for
@@ -98,7 +105,7 @@ public:
 
     void Finish() {
         GPR_ASSERT(status_ == FINISH);
-        DLOG(INFO) << "Destructing RequestData";
+        VLOG(1) << "destructing requestdata";
         // Once in the FINISH state, deallocate ourselves (RequestData).
         delete this;
     }
@@ -125,7 +132,7 @@ private:
     CallStatus status_;  // The current serving state.
 
     std::shared_ptr<ReqQueue> reqQueueCXL_;
-	  std::shared_ptr<ReqQueue> reqQueueDisk_;
+    std::shared_ptr<ReqQueue> reqQueueDisk_;
   };
 
 } // End of namespace Embarcadero

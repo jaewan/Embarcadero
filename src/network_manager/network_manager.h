@@ -43,7 +43,9 @@ struct alignas(64) EmbarcaderoReq{
 
 class NetworkManager{
 	public:
-		NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> cxl_req_queue, std::shared_ptr<ReqQueue> disk_req_queue, int num_receive_threads=NUM_IO_RECEIVE_THREADS, int num_ack_threads=NUM_IO_ACK_THREADS);
+		NetworkManager(std::shared_ptr<AckQueue> ack_queue, 
+		std::shared_ptr<ReqQueue> cxl_req_queue, std::shared_ptr<ReqQueue> disk_req_queue,
+		int num_receive_threads=NUM_IO_RECEIVE_THREADS, int num_ack_threads=NUM_IO_ACK_THREADS);
 		~NetworkManager();
 
 	private:
@@ -51,8 +53,7 @@ class NetworkManager{
 		void AckThread();
 
 		std::vector<std::thread> threads_;
-    int num_receive_threads_;
-    int num_ack_threads_;
+		int num_ack_threads_;
 
 		std::shared_ptr<AckQueue> ackQueue_;
 		std::shared_ptr<ReqQueue> reqQueueCXL_;
@@ -65,8 +66,6 @@ class NetworkManager{
     PubSub::AsyncService service_;
     std::unique_ptr<Server> server_;
 
-		CXLManager *cxl_manager_;
-		DiskManager *disk_manager_;
 };
 
 } // End of namespace Embarcadero
