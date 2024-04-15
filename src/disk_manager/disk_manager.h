@@ -17,7 +17,7 @@ class DiskManager{
 		~DiskManager();
 
 	private:
-		void Disk_io_thread();
+		void DiskIOThread();
 
 		std::vector<std::thread> threads_;
 		std::shared_ptr<ReqQueue> reqQueue_;

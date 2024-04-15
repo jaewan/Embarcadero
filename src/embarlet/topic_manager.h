@@ -2,6 +2,7 @@
 #define INCLUDE_TOPIC_MANGER_H_
 
 #include "../cxl_manager/cxl_manager.h"
+#include "../network_manager/request_data.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_set.h"
 
@@ -34,7 +35,7 @@ class Topic{
 		Topic& operator=(const Topic &) = delete;
 
 		
-		void PublishToCXL(PublishRequest &req);
+		void PublishToCXL(struct RequestData *req_data);
 		bool GetMessageAddr(size_t &last_offset,
 							void* &last_addr, void* messages, size_t &messages_size);
 		void Combiner();
@@ -77,7 +78,7 @@ class TopicManager{
 		}
 		void CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
-		void PublishToCXL(PublishRequest &req);
+		void PublishToCXL(struct RequestData *req_data);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 

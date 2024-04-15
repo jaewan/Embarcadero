@@ -94,8 +94,8 @@ class CXLManager{
 #endif
 
 	private:
-		std::shared_ptr<ReqQueue> reqQueue_;
 		std::shared_ptr<AckQueue> ackQueue_;
+		std::shared_ptr<ReqQueue> reqQueue_;
 		int broker_id_;
 		int num_io_threads_;
 		std::vector<std::thread> threads_;
@@ -112,7 +112,7 @@ class CXLManager{
 		bool stop_threads_ = false;
 		std::atomic<int> thread_count_{0};
 
-		void CXL_io_thread();
+		void CXLIOThread();
 		void Sequencer1(char* topic);
 		void Sequencer2(char* topic);
 

@@ -25,10 +25,10 @@ DiskManager::DiskManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<Re
 	}
 	// Create Disk I/O threads
 	for (int i=0; i< num_io_threads_; i++)
-		threads_.emplace_back(&DiskManager::Disk_io_thread, this);
+		threads_.emplace_back(&DiskManager::DiskIOThread, this);
 
 	while(thread_count_.load() != num_io_threads_){}
-	LOG(INFO) << "Created";
+	LOG(INFO) << "[DiskManager] Created";
 }
 
 DiskManager::~DiskManager(){
@@ -44,10 +44,10 @@ DiskManager::~DiskManager(){
 			thread.join();
 		}
 	}
-	LOG(INFO) << "Destructed";
+	LOG(INFO) << "[DiskManager] Destructed";
 }
 
-void DiskManager::Disk_io_thread(){
+void DiskManager::DiskIOThread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct PublishRequest> optReq;
 
@@ -60,14 +60,13 @@ void DiskManager::Disk_io_thread(){
 		struct RequestData *req_data = static_cast<RequestData*>(req.grpcTag);
 
 		int off = offset_.fetch_add(req_data->request_.payload_size(), std::memory_order_relaxed);
-		DLOG(INFO) << "Received payload is: " << req_data->request_.payload().c_str();
 		pwrite(log_fd_, req_data->request_.payload().c_str(), req_data->request_.payload_size(), off);
 
 		// TODO(erika): below logic should really be shared function between CXL and Disk managers
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 
 		// If no more tasks are left to do
-		if (counter == 2) {
+		if (counter == 1) {
 			if (req_data->request_.acknowledge()) {
 				// TODO: Set result - just assume success
 				req_data->SetError(ERR_NO_ERROR);
@@ -78,10 +77,12 @@ void DiskManager::Disk_io_thread(){
 				EnqueueAck(ackQueue_, maybeTag);
 			} else {
 				// gRPC has already sent response, so just mark the object as ready for destruction
-				req_data->Proceed();
+				DLOG(INFO) << "!!!!!!!!!!!!! This should not happen";
+				//req_data->Proceed();
 			}
 		} else {
-			DLOG(INFO) << "counter: " << counter;
+			//delete req.counter;
+			//DLOG(INFO) << "counter: " << counter;
 		}
 	}
 }

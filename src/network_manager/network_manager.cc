@@ -13,7 +13,6 @@ NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_
 						 ackQueue_(ack_queue),
 						 reqQueueCXL_(cxl_req_queue),
 						 reqQueueDisk_(disk_req_queue),
-						 num_receive_threads_(num_receive_threads),
 						 num_ack_threads_(num_ack_threads) {
 
 	// Start by creating threads to acknowledge when messages are done being processed
@@ -103,6 +102,26 @@ void NetworkManager::ReceiveThread() {
     	}
 	}
 }
+
+void NetworkManager::AckThread() {
+	LOG(INFO) << "Starting Acknowledgement I/O Thread";
+	thread_count_.fetch_add(1, std::memory_order_relaxed);
+
+	std::optional<void *> optReq;
+	while(true) {
+		ackQueue_->blockingRead(optReq);
+		if(!optReq.has_value()) {
+			// This should means we are trying to shutdown threads
+			assert(stop_threads_ == true);
+			LOG(INFO) << "Terminating Acknoweldgement I/O Thread";
+			return;
+		}
+		
+		void *grpcTag = optReq.value();
+		DLOG(INFO) << "Got net_req, tag=" << grpcTag;
+    	static_cast<RequestData*>(grpcTag)->Proceed();
+	}
+}
   /*
 #define READ_SIZE 1024
 
@@ -181,25 +200,5 @@ void NetworkManager::Network_io_thread(){
 				break;
 		}
 */
-
-void NetworkManager::AckThread() {
-	LOG(INFO) << "Starting Acknowledgement I/O Thread";
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
-
-	std::optional<void *> optReq;
-	while(true) {
-		ackQueue_->blockingRead(optReq);
-		if(!optReq.has_value()) {
-			// This should means we are trying to shutdown threads
-			assert(stop_threads_ == true);
-			LOG(INFO) << "Terminating Acknoweldgement I/O Thread";
-			return;
-		}
-		
-		void *grpcTag = optReq.value();
-		DLOG(INFO) << "Got net_req, tag=" << grpcTag;
-    	static_cast<RequestData*>(grpcTag)->Proceed();
-	}
-}
 
 } // End of namespace Embarcadero

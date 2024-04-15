@@ -90,6 +90,7 @@ size_t GetPhysicalCoreCount(){
     return coreIdentifiers.size();
 }
 
+/*
 Embarcadero::TopicManager *t;
 #define LOOPLEN 100
 #define NUM_TOPICS 1
@@ -125,7 +126,7 @@ void RawCXLWriteTest(){
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 	cxl_manager.SetTopicManager(&topic_manager);
 
-	//********* Load Generate **************
+	// ********* Load Generate **************
 	char topic[31];
 	int order =1;
 	for(int i=0; i<NUM_TOPICS; i++){
@@ -162,12 +163,6 @@ void RawCXLWriteTest(){
 	size_t messages_size;
 	size_t off = 0;
 	size_t to_read_msg = LOOPLEN*1024*NUM_THREADS;
-		if(cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)){
-			std::cout << "read :" << last_offset<< std::endl;
-		}else{
-			std::cout << "Did not read anything" << std::endl;
-		}
-	/*
 	while(to_read_msg > 0){
 		if(cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)){
 			Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)messages;
@@ -179,7 +174,6 @@ void RawCXLWriteTest(){
 			std::cout << std::endl;
 		}
 	};
-	*/
 }
 
 void ReadWriteTest(){
@@ -248,6 +242,7 @@ void ReadWriteTest(){
 	std::cout << messages_size << std::endl;
 	return ;
 }
+*/
 
 int main(int argc, char* argv[]){
 	//size_t num_cores = GetPhysicalCoreCount();
@@ -281,10 +276,6 @@ int main(int argc, char* argv[]){
 	Embarcadero::NetworkManager network_manager(4000, NUM_NETWORK_IO_THREADS);
   */
 
-	cxl_manager.SetNetworkManager(&network_manager);
-	disk_manager.SetNetworkManager(&network_manager);
-	network_manager.SetCXLManager(&cxl_manager);
-	network_manager.SetDiskManager(&disk_manager);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 	cxl_manager.SetTopicManager(&topic_manager);
   
@@ -308,6 +299,7 @@ int main(int argc, char* argv[]){
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
 
+	FLAGS_v = 1;
 	FLAGS_logtostderr = 1; // log only to console, no files.
 
 
@@ -318,7 +310,7 @@ int main(int argc, char* argv[]){
 	int order = 0;
 	topic_manager.CreateNewTopic(topic, order);
 
-	std::cout << "You are now safe to go" << std::endl;
+	LOG(INFO) << "You are now safe to go ";
 	//cxl_manager.StartInternalTest();
 
 

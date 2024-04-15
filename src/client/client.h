@@ -33,12 +33,23 @@ struct PubConfig {
     uint64_t client_order;
 };
 
-/// Class for a single broker
+struct alignas(64) MessageHeader{
+	int client_id;
+	size_t client_order;
+	volatile size_t size;
+	volatile size_t total_order;
+	volatile size_t paddedSize;
+	void* segment_header;
+	size_t logical_offset;
+	void* next_message;
+};
+
+// Class for a single broker
 class PubSubClient {
     public:
         /// Constructor for Client
         explicit PubSubClient(PubConfig *config, std::shared_ptr<Channel> channel)
-            : stub_(PubSub::NewStub(channel)), config_(config) {}
+            : config_(config), stub_(PubSub::NewStub(channel)) {}
 
         PublisherError Publish(std::string topic, char *payload, uint64_t payload_size) {
             GRPCPublishRequest req;
@@ -47,6 +58,8 @@ class PubSubClient {
             req.set_client_id(config_->client_id);
             req.set_client_order(config_->client_order);
             req.set_payload(payload, payload_size);
+            req.set_payload_size(payload_size);
+			config_->client_order++;
 
             GRPCPublishResponse res;
 
