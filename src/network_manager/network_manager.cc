@@ -39,9 +39,8 @@ NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_
 		threads_.emplace_back(&NetworkManager::ReceiveThread, this);
 	}
 	
-	// Wait for all ack threads to spawn
-	while (thread_count_.load() != num_ack_threads) {}
 	// Wait for the threads to all start
+	LOG(INFO) << " Waiting for receive threads" << num_receive_threads;
 	while (thread_count_.load() != num_receive_threads + num_ack_threads) {}
 	LOG(INFO) << "[NetworkManager] Constructed!";
 }
