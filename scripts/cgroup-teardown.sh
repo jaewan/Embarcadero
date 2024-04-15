@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -ex
+set -x
 
 MY_CGROUP=eh-test2
 CHILD_CGROUPS="broker0 broker1 broker2 broker3 pub0 pub1"
