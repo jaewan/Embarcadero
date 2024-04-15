@@ -63,5 +63,9 @@ int main(int argc, char* argv[]) {
         }
 		header->client_order++;
     }
+	
+	double data_sent = ((double)message_size*header->client_order)/(1024*1024); //In MB
+	double bandwidth = (double)data_sent/(double)duration;
+	LOG(INFO) << "Publish Bandwidth:" << bandwidth ;
     return 0;
 }
