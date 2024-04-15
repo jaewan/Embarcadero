@@ -18,7 +18,6 @@ CHILD_CGROUPS="broker0 broker1 broker2 broker3 pub0 pub1"
 # Since some system processes will always be using memory, we'll limit each process to 1/7th of the total (rounded down), which gives us: 
 MEM_TOTAL=226327253
 
-DEVICE="253:0"
 # TODO: this is a just a filler, until we can accurately divide the system
 READ_IOLIMIT=1048576
 WRITE_IOLIMIT=1048576
@@ -62,8 +61,12 @@ for child_cgroup in $CHILD_CGROUPS; do
 	echo $MEM_TOTAL | sudo tee -a /sys/fs/cgroup/$MY_CGROUP/$child_cgroup/memory.high
 
 	# Limit disk I/O
-	echo "$DEVICE rbps=$READ_IOLIMIT" | sudo tee -a /sys/fs/cgroup/$MY_CGROUP/$child_cgroup/io.max
-	echo "$DEVICE wbps=$WRITE_IOLIMIT" | sudo tee -a /sys/fs/cgroup/$MY_CGROUP/$child_cgroup/io.max
+	echo "253:0 rbps=$READ_IOLIMIT" | sudo tee -a /sys/fs/cgroup/$MY_CGROUP/$child_cgroup/io.max
+	echo "253:0 wbps=$WRITE_IOLIMIT" | sudo tee -a /sys/fs/cgroup/$MY_CGROUP/$child_cgroup/io.max
+	echo "253:1 rbps=$READ_IOLIMIT" | sudo tee -a /sys/fs/cgroup/$MY_CGROUP/$child_cgroup/io.max
+	echo "253:1 wbps=$WRITE_IOLIMIT" | sudo tee -a /sys/fs/cgroup/$MY_CGROUP/$child_cgroup/io.max
+	echo "253:2 rbps=$READ_IOLIMIT" | sudo tee -a /sys/fs/cgroup/$MY_CGROUP/$child_cgroup/io.max
+	echo "253:2 wbps=$WRITE_IOLIMIT" | sudo tee -a /sys/fs/cgroup/$MY_CGROUP/$child_cgroup/io.max
 
 done
 
