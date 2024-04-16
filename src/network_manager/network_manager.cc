@@ -40,7 +40,6 @@ NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_
 	}
 	
 	// Wait for the threads to all start
-	LOG(INFO) << " Waiting for receive threads" << num_receive_threads;
 	while (thread_count_.load() != num_receive_threads + num_ack_threads) {}
 	LOG(INFO) << "[NetworkManager] Constructed!";
 }
@@ -73,7 +72,7 @@ NetworkManager::~NetworkManager() {
 		}
 	}
 
-	LOG(INFO) << "Destructed";
+	LOG(INFO) << "[NetworkManager] Destructed";
 }
 
 void NetworkManager::ReceiveThread() {
@@ -117,7 +116,7 @@ void NetworkManager::AckThread() {
 		}
 		
 		void *grpcTag = optReq.value();
-		DLOG(INFO) << "Got net_req, tag=" << grpcTag;
+		VLOG(2) << "Got net_req, tag=" << grpcTag;
     	static_cast<RequestData*>(grpcTag)->Proceed();
 	}
 }

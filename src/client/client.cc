@@ -1,4 +1,5 @@
 #include <iostream>
+#include <thread>
 #include <stdlib.h>
 #include <arpa/inet.h>
 
@@ -7,7 +8,40 @@
 
 #include "client.h"
 
-void PublishThroughputTest(){
+void PublishThroughputTest(size_t message_size, int duration, int num_threads){
+    PubConfig config = {
+        acknowledge: true,
+        client_id: 0, // TODO(erika): how is this set?
+        client_order: 0, // TODO(erika): how is this set? // Client_order should be set in increasing order, starting from 0
+    };
+
+    PubSubClient pubsub(&config, grpc::CreateChannel(DEFAULT_CHANNEL, grpc::InsecureChannelCredentials()), num_threads, message_size);
+    LOG(INFO) << "Created gRPC channel";
+    LOG(INFO) << "Publishing message size:" << message_size << " for " << duration;
+
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back([&, i]() {
+            std::chrono::time_point start = std::chrono::steady_clock::now();
+            while (true) {
+                PublisherError pub_ret = pubsub.Publish("0", i);
+                assert(pub_ret == ERR_NO_ERROR);
+                if (std::chrono::steady_clock::now() - start > std::chrono::seconds(duration)) {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Join all threads to wait for them to finish
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+	double data_sent = ((double)pubsub.GetNumPublishedMessages() * message_size)/(double)(1024*1024); //In MB
+	double bandwidth = (double)data_sent/(double)duration;
+	LOG(INFO) << "Publish Bandwidth:" << bandwidth ;
 }
 
 void SubscribeThroughputTest(){
@@ -24,48 +58,15 @@ int main(int argc, char* argv[]) {
 	options.add_options()
         ("d,duration", "Number of seconds to run", cxxopts::value<int>()->default_value("1"))
         ("s,size", "Size of a message", cxxopts::value<int>()->default_value("960"))
+        ("t,num_thread", "Number of request threads", cxxopts::value<int>()->default_value("4"))
+        //("b,benchmark", "Type of benchmark (Publish, Subscribe)", cxxopts::value<string>()->default_value("Publish"))
 	;
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<int>();
     int duration = result["duration"].as<int>();
-	char* payload = (char*)malloc(sizeof(char) * (message_size + 64));
-	MessageHeader *header = (MessageHeader*)payload;
-    LOG(INFO) << "Running for " << duration << " seconds";
+    int num_threads = result["num_thread"].as<int>();
 
-    PubConfig config = {
-        acknowledge: true,
-        client_id: 0, // TODO(erika): how is this set?
-        client_order: 0, // TODO(erika): how is this set? // Client_order should be set in increasing order, starting from 0
-    };
-	header->client_id = 0;
-	header->client_order = 0;
-	header->size = message_size;
-	header->total_order = 0;
-	size_t padding = message_size%64;
-	if(padding > 0)
-		padding = 64 - padding;
-	header->total_order = 0;
-	header->paddedSize = message_size + padding;
-	header->segment_header = nullptr;
-	header->logical_offset = (size_t)-1;;
-	header->next_message = nullptr;
+	PublishThroughputTest(message_size, duration, num_threads);
 
-    PubSubClient pubsub(&config, grpc::CreateChannel(DEFAULT_CHANNEL, grpc::InsecureChannelCredentials()));
-    LOG(INFO) << "Created gRPC channel";
-    LOG(INFO) << "Publishing message size:" << message_size << " for " << duration;
-
-    std::chrono::time_point start = std::chrono::steady_clock::now();
-    while (true) {
-        PublisherError pub_ret = pubsub.Publish("0", payload, message_size);
-        assert(pub_ret == ERR_NO_ERROR);
-        if(std::chrono::steady_clock::now() - start > std::chrono::seconds(duration)) {
-            break;
-        }
-		header->client_order++;
-    }
-	
-	double data_sent = ((double)message_size*header->client_order)/(1024*1024); //In MB
-	double bandwidth = (double)data_sent/(double)duration;
-	LOG(INFO) << "Publish Bandwidth:" << bandwidth ;
     return 0;
 }
