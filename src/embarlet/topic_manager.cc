@@ -149,7 +149,7 @@ void Topic::CombinerThread(){
 	while(!stop_threads_){
 		while(header->paddedSize == 0){
 			if(stop_threads_){
-				std::cout << "Stopping CombinerThread" << std::endl;
+				LOG(INFO) << "Stopping CombinerThread" ;
 				return;
 			}
 			std::this_thread::yield();
@@ -194,7 +194,7 @@ void Topic::PublishToCXL(struct RequestData *req_data){
 
 	unsigned long long int log = log_addr_.fetch_add(msgSize);
 	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
-		std::cout << "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE << std::endl;
+		LOG(INFO) << "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
 		//TODO(Jae) Finish below segment boundary crossing code
 		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
 			// Allocate a new segment
