@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <string>
+#include <atomic>
 #include <grpcpp/grpcpp.h>
 #include <pubsub.grpc.pb.h>
 #include "common/config.h"
@@ -48,18 +49,45 @@ struct alignas(64) MessageHeader{
 class PubSubClient {
     public:
         /// Constructor for Client
-        explicit PubSubClient(PubConfig *config, std::shared_ptr<Channel> channel)
-            : config_(config), stub_(PubSub::NewStub(channel)) {}
+        explicit PubSubClient(PubConfig *config, std::shared_ptr<Channel> channel, int num_threads, int message_size)
+            : config_(config), stub_(PubSub::NewStub(channel)), num_threads_(num_threads), message_size_(message_size) {
+			messages_ = (void**)malloc(sizeof(void*)*num_threads);
+			for (int i=0; i<num_threads; i++){
+				messages_[i] = malloc(message_size);
+				MessageHeader *header = (MessageHeader*)messages_[i];
+				header->client_id = 0;
+				header->client_order = 0;
+				header->size = message_size;
+				header->total_order = 0;
+				size_t padding = message_size%64;
+				if(padding > 0)
+					padding = 64 - padding;
+				header->total_order = 0;
+				header->paddedSize = message_size + padding;
+				header->segment_header = nullptr;
+				header->logical_offset = (size_t)-1;;
+				header->next_message = nullptr;
+			}
+		}
+		~PubSubClient(){
+			for (int i=0; i<num_threads_; i++){
+				free(messages_[i]);
+			}
+			free(messages_);
+		}
 
-        PublisherError Publish(std::string topic, char *payload, uint64_t payload_size) {
+        PublisherError Publish(std::string topic, int tid) {
+			unsigned int order = client_order_.fetch_add(1);
+			MessageHeader *header = (MessageHeader*)messages_[tid];
+			header->client_order = order;
             GRPCPublishRequest req;
             req.set_topic(topic);
             req.set_acknowledge(config_->acknowledge);
             req.set_client_id(config_->client_id);
-            req.set_client_order(config_->client_order);
-            req.set_payload(payload, payload_size);
-            req.set_payload_size(payload_size);
-			config_->client_order++;
+            req.set_client_order(order);
+            req.set_payload(messages_[tid], message_size_);
+            req.set_payload_size(message_size_);
+			//config_->client_order++;
 
             GRPCPublishResponse res;
 
@@ -73,13 +101,19 @@ class PubSubClient {
                 std::cerr << status.error_code() << ": " << status.error_message() << std::endl;
                 return ERR_GRPC_ERROR;
             }
-
-
         }
+
+		unsigned int GetNumPublishedMessages(){
+			return client_order_.load();
+		}
 
     private:
         PubConfig *config_;
         std::unique_ptr<PubSub::Stub> stub_;
+		std::atomic<unsigned int> client_order_{0};
+		int num_threads_;
+		int message_size_;
+		void** messages_;
 };
 
 #endif // _CLIENT_H_

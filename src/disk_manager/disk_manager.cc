@@ -73,7 +73,7 @@ void DiskManager::DiskIOThread(){
 
 				// Send to network manager ack queue
 				auto maybeTag = std::make_optional(req.grpcTag);
-				DLOG(INFO) << "Enquing to ack queue, tag=" << req.grpcTag;
+				VLOG(2) << "Enquing to ack queue, tag=" << req.grpcTag;
 				EnqueueAck(ackQueue_, maybeTag);
 			} else {
 				// gRPC has already sent response, so just mark the object as ready for destruction

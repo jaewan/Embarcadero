@@ -38,10 +38,10 @@ public:
     }
 
     void Proceed() {
-		    VLOG(1) << "In RequestData.Proceed() with status_ == " << status_;
+		    VLOG(2) << "In RequestData.Proceed() with status_ == " << status_;
         if (status_ == CREATE) {
             // Make this instance progress to the PROCESS state.
-            VLOG(1) << "Creating call data, asking for RPC";
+            VLOG(2) << "Creating call data, asking for RPC";
             status_ = PROCESS;
 		        reply_.set_error(ERR_NO_ERROR);
 
@@ -56,7 +56,7 @@ public:
             // Spawn a new RequestData instance to serve new clients while we process
             // the one for this RequestData. The instance will deallocate itself as
             // part of its FINISH state.
-		        VLOG(1) << "Creating new RequestData object in RequestData";
+			VLOG(2) << "Creating new RequestData object in RequestData";
             new RequestData(service_, cq_, reqQueueCXL_, reqQueueDisk_);
             PublishRequest req;
             req.counter = new std::atomic<int>(1);
@@ -79,7 +79,7 @@ public:
 		    EnqueueReq(reqQueueDisk_, maybeReq);
 
         } else if (status_ == ACKNOWLEDGE) {
-            VLOG(1) << "Acknowledging the RequestData() object";
+            VLOG(2) << "Acknowledging the RequestData() object";
 
             // And we are done! Let the gRPC runtime know we've finished, using the
             // memory address of this instance as the uniquely identifying tag for
@@ -105,7 +105,7 @@ public:
 
     void Finish() {
         GPR_ASSERT(status_ == FINISH);
-        VLOG(1) << "destructing requestdata";
+        VLOG(2) << "destructing requestdata";
         // Once in the FINISH state, deallocate ourselves (RequestData).
         delete this;
     }
