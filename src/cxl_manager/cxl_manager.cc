@@ -165,7 +165,7 @@ void CXLManager::CXLIOThread(){
 
 			// Send to network manager ack queue
 			auto maybeTag = std::make_optional(req.grpcTag);
-			VLOG(1) << "Enquing to ack queue, tag=" << req.grpcTag;
+			VLOG(2) << "Enquing to ack queue, tag=" << req.grpcTag;
 			EnqueueAck(ackQueue_, maybeTag);
       	}
 #ifdef InternalTest
@@ -230,7 +230,7 @@ void CXLManager::Sequencer1(char* topic){
 		for(int i = 0; i<NUM_BROKERS; i++){
             if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
 				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
-					perror("!!!!!!!!!!!! [Sequencer1] Error msg_header is not equal to the perLogOff");
+					LOG(ERROR) << "!!!!!!!!!!!! [Sequencer1] Error msg_header is not equal to the perLogOff";
 				}
 				msg_headers[i]->total_order = seq;
 				tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
@@ -270,7 +270,7 @@ void CXLManager::Sequencer2(char* topic){
 		for(int i = 0; i<NUM_BROKERS; i++){
             if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
 				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
-					perror("!!!!!!!!!!!! [Sequencer2] Error msg_header is not equal to the perLogOff");
+					LOG(ERROR) << "!!!!!!!!!!!! [Sequencer2] Error msg_header is not equal to the perLogOff";
 				}
                 int client = msg_headers[i]->client_id;
 				auto last_ordered_itr = last_ordered.find(client);
