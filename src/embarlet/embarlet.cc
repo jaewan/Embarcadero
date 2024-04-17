@@ -262,8 +262,8 @@ int main(int argc, char* argv[]){
 	auto arguments = options.parse(argc, argv);
 
 	FLAGS_v = arguments["log_level"].as<int>();
-	//FLAGS_logtostderr = 1; // log only to console, no files.
-	FLAGS_log_dir = "/tmp/vlog2_log";
+	FLAGS_logtostderr = 1; // log only to console, no files.
+	//FLAGS_log_dir = "/tmp/vlog2_log";
 	
 	Embarcadero::CXL_Type cxl_type = Embarcadero::CXL_Type::Real;
 	if (arguments.count("emul")) {

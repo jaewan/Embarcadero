@@ -28,6 +28,7 @@ void PublishThroughputTest(size_t message_size, int duration, int num_threads){
 
 	std::string channels[NUM_CHANNEL];
 	std::vector<PubSubClient*> pubsubs;
+	std::vector<CompletionQueue> cqs;
 	for(int i=0; i<NUM_CHANNEL; i++){
 		channels[i] = ip + ":" + std::to_string(port_num);
 		port_num++; 
@@ -66,6 +67,7 @@ void PublishThroughputTest(size_t message_size, int duration, int num_threads){
 	double data_sent = (num_messages * message_size)/(double)(1024); //In MB
 	double bandwidth = (double)data_sent/(double)duration;
 	LOG(INFO) << "Publish Bandwidth:" << bandwidth ;
+	LOG(INFO) << "Num Messages:" << num_messages*1024 ;
 }
 
 void SubscribeThroughputTest(){
@@ -82,7 +84,7 @@ int main(int argc, char* argv[]) {
 	options.add_options()
         ("d,duration", "Number of seconds to run", cxxopts::value<int>()->default_value("1"))
         ("s,size", "Size of a message", cxxopts::value<int>()->default_value("960"))
-        ("t,num_thread", "Number of request threads", cxxopts::value<int>()->default_value("4"))
+        ("t,num_thread", "Number of request threads", cxxopts::value<int>()->default_value("1"))
         //("b,benchmark", "Type of benchmark (Publish, Subscribe)", cxxopts::value<string>()->default_value("Publish"))
 	;
 	auto result = options.parse(argc, argv);

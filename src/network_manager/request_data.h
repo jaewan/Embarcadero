@@ -57,6 +57,7 @@ public:
             // part of its FINISH state.
 			VLOG(3) << "Creating new RequestData object in RequestData";
             new RequestData(service_, cq_, reqQueueCXL_, reqQueueDisk_);
+			/*
             PublishRequest req;
 			counter_ = new std::atomic<int>(2);
             req.counter = counter_;
@@ -77,8 +78,11 @@ public:
             // No matter what, we need to do processing tasks.
             EnqueueReq(reqQueueCXL_, maybeReq);
 		    EnqueueReq(reqQueueDisk_, maybeReq);
-
-        } else if (status_ == ACKNOWLEDGE) {
+			*/
+			status_ = FINISH;
+			responder_.Finish(reply_, Status::OK, this);
+			//Finish();
+        /* } else if (status_ == ACKNOWLEDGE) {
             VLOG(3) << "Acknowledging the RequestData() object";
 
             // And we are done! Let the gRPC runtime know we've finished, using the
@@ -87,7 +91,8 @@ public:
             status_ = FINISH;
             responder_.Finish(reply_, Status::OK, this);
 			VLOG(3) << "Ack responder_.Finish called called";
-        } else {
+        */
+		} else {
             // If we asked for acknowledgement, we can destruct right after moving to FINISH
             // If we did not ask for acknowledgement, we will let cxl/disk to destroy the object
             // by calling the Finish() function.
@@ -95,6 +100,7 @@ public:
                 Finish();
             //}
         }
+		
     }
 
   	void SetError(PublisherError err) {
@@ -106,11 +112,11 @@ public:
 
     void Finish() {
         VLOG(3) << "Finish() called";
-		while(counter_->load() != 0){std::this_thread::yield();}
+		//while(counter_->load() != 0){std::this_thread::yield();}
         GPR_ASSERT(status_ == FINISH);
         VLOG(3) << "destructing requestdata";
         // Once in the FINISH state, deallocate ourselves (RequestData).
-		delete counter_;
+		//delete counter_;
         delete this;
     }
 
