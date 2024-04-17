@@ -66,23 +66,23 @@ void DiskManager::DiskIOThread(){
 		int counter = req.counter->fetch_sub(1, std::memory_order_relaxed);
 
 		// If no more tasks are left to do
-		if (counter == 1) {
+		if (counter == 2) {
 			if (req_data->request_.acknowledge()) {
 				// TODO: Set result - just assume success
 				req_data->SetError(ERR_NO_ERROR);
 
 				// Send to network manager ack queue
 				auto maybeTag = std::make_optional(req.grpcTag);
-				VLOG(2) << "Enquing to ack queue, tag=" << req.grpcTag;
+				VLOG(3) << "Enquing to ack queue, tag=" << req.grpcTag;
 				EnqueueAck(ackQueue_, maybeTag);
 			} else {
 				// gRPC has already sent response, so just mark the object as ready for destruction
 				DLOG(INFO) << "!!!!!!!!!!!!! This should not happen";
-				//req_data->Proceed();
 			}
 		} else {
 			//delete req.counter;
-			//DLOG(INFO) << "counter: " << counter;
+			VLOG(3) << "Finishing the RPC: " << counter;
+			//req_data->Finish();
 		}
 	}
 }

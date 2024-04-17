@@ -24,8 +24,7 @@ namespace Embarcadero{
 #define SEGMENT_SIZE (1UL << 37)
 #define NUM_DISK_IO_THREADS 64
 #define NUM_CXL_IO_THREADS 128
-#define NUM_NETWORK_IO_THREADS 4
-#define NUM_IO_RECEIVE_THREADS 66
+#define NUM_IO_RECEIVE_THREADS 128
 #define NUM_IO_ACK_THREADS 32 
 #define REQ_QUEUE_SIZE 100000
 #define ACK_QUEUE_SIZE 100000
@@ -43,6 +42,7 @@ namespace Embarcadero{
 #define HEALTH_CHECK_FAILURE_THRESHOLD 5
 
 #define DEFAULT_CHANNEL "127.0.0.1:121416"
+#define NUM_CHANNEL 1
 
 struct PublishRequest{
 	int client_id;

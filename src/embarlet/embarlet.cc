@@ -245,17 +245,27 @@ void ReadWriteTest(){
 */
 
 int main(int argc, char* argv[]){
+  // Initialize logging
+	google::InitGoogleLogging(argv[0]);
+	google::InstallFailureSignalHandler();
+
 	//size_t num_cores = GetPhysicalCoreCount();
-  cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
-		// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
-  options.add_options()
-    ("head", "Head Node")
-		("follower", "Follower Address and Port", cxxopts::value<std::string>())
-		("e,emul", "Use emulation instead of CXL")
-	;
+  	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
+	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
+  	options.add_options()
+		("head", "Head Node")
+			("follower", "Follower Address and Port", cxxopts::value<std::string>())
+			("e,emul", "Use emulation instead of CXL")
+			("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
+		;
 	
 	auto arguments = options.parse(argc, argv);
-  Embarcadero::CXL_Type cxl_type = Embarcadero::CXL_Type::Real;
+
+	FLAGS_v = arguments["log_level"].as<int>();
+	//FLAGS_logtostderr = 1; // log only to console, no files.
+	FLAGS_log_dir = "/tmp/vlog2_log";
+	
+	Embarcadero::CXL_Type cxl_type = Embarcadero::CXL_Type::Real;
 	if (arguments.count("emul")) {
 		cxl_type = Embarcadero::CXL_Type::Emul;
 		LOG(WARNING) << "Using emulated CXL";
@@ -270,16 +280,11 @@ int main(int argc, char* argv[]){
 	Embarcadero::CXLManager cxl_manager(ackQueue, cxlReqQueue, broker_id, cxl_type);
 	Embarcadero::DiskManager disk_manager(ackQueue, diskReqQueue);
 	Embarcadero::NetworkManager network_manager(ackQueue, cxlReqQueue, diskReqQueue, NUM_IO_RECEIVE_THREADS, NUM_IO_ACK_THREADS);
-   /*
-	Embarcadero::CXLManager cxl_manager(4000,broker_id);
-	Embarcadero::DiskManager disk_manager(4000);
-	Embarcadero::NetworkManager network_manager(4000, NUM_NETWORK_IO_THREADS);
-  */
 
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 	cxl_manager.SetTopicManager(&topic_manager);
   
-  if (arguments.count("head")) {
+  	if (arguments.count("head")) {
 		// Initialize peer broker
 		PeerBroker head_broker(true);
 
@@ -295,12 +300,6 @@ int main(int argc, char* argv[]){
 	} else {
 		std::cout << "Invalid arguments" << std::endl;
 	}
-  // Initialize logging
-	google::InitGoogleLogging(argv[0]);
-	google::InstallFailureSignalHandler();
-
-	FLAGS_v = 1;
-	FLAGS_logtostderr = 1; // log only to console, no files.
 
 
 	//********* Load Generate **************
@@ -314,8 +313,8 @@ int main(int argc, char* argv[]){
 	//cxl_manager.StartInternalTest();
 
 
-  while(true){
-    sleep(60);
-  }
+	while(true){
+		sleep(60);
+	}
 	return 0;
 }

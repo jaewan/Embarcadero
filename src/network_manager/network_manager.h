@@ -52,19 +52,18 @@ class NetworkManager{
 		void ReceiveThread();
 		void AckThread();
 
-		std::vector<std::thread> threads_;
-		int num_ack_threads_;
-
 		std::shared_ptr<AckQueue> ackQueue_;
 		std::shared_ptr<ReqQueue> reqQueueCXL_;
 		std::shared_ptr<ReqQueue> reqQueueDisk_;
+		int num_ack_threads_;
 
+		std::vector<std::thread> threads_;
 		std::atomic<int> thread_count_{0};
 		bool stop_threads_ = false;
 
-    std::vector<std::unique_ptr<ServerCompletionQueue>> cqs_;
-    PubSub::AsyncService service_;
-    std::unique_ptr<Server> server_;
+		std::vector<std::unique_ptr<ServerCompletionQueue>> cqs_;
+		PubSub::AsyncService service_[NUM_CHANNEL];
+		std::unique_ptr<Server> server_[NUM_CHANNEL];
 
 };
 

@@ -161,6 +161,8 @@ void Topic::CombinerThread(){
 			continue;
 		}
 #endif
+		VLOG(3) << "Stopping CombinerThread" ;
+		
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
 		header->next_message = (uint8_t*)header + header->paddedSize + header_size;
@@ -205,7 +207,11 @@ void Topic::PublishToCXL(struct RequestData *req_data){
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
-	memcpy_nt((void*)log, (void *)(req_data->request_.payload().c_str()), msgSize);
+	VLOG(2) << "log offset:" << log - (unsigned long long int)first_message_addr_;
+	VLOG(2) << "payload addr:" << (void *)(req_data->request_.payload().c_str());
+	const std::string& payload = req_data->request_.payload();
+
+	nt_memcpy((void*)log, payload.data(), msgSize);
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message

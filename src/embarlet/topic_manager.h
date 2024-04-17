@@ -22,13 +22,14 @@ class Topic{
 				void* TInode_addr, const char* topic_name, int broker_id, int order,
 				void* cxl_addr, void* segment_metadata);
 		~Topic(){
+			VLOG(3) << "[Topic]: Destructor called" ;
 			stop_threads_ = true;
 			for(std::thread& thread : combiningThreads_){
 				if(thread.joinable()){
 					thread.join();
 				}
 			}
-			std::cout << "[Topic]: \tDestructed" << std::endl;
+			LOG(INFO) << "[Topic]: \tDestructed" ;
 		}
 		// Delete copy contstructor and copy assignment operator
 		Topic(const Topic &) = delete;

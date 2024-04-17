@@ -38,28 +38,28 @@ public:
     }
 
     void Proceed() {
-		    VLOG(2) << "In RequestData.Proceed() with status_ == " << status_;
+		VLOG(3) << "In RequestData.Proceed() with status_ == " << status_;
         if (status_ == CREATE) {
             // Make this instance progress to the PROCESS state.
-            VLOG(2) << "Creating call data, asking for RPC";
+            VLOG(3) << "Creating call data, asking for RPC";
             status_ = PROCESS;
-		        reply_.set_error(ERR_NO_ERROR);
+			reply_.set_error(ERR_NO_ERROR);
 
             // As part of the initial CREATE state, we *request* that the system
             // start processing SayHello requests. In this request, "this" acts are
             // the tag uniquely identifying the request (so that different RequestData
             // instances can serve different requests concurrently), in this case
             // the memory address of this RequestData instance.
-            service_->RequestPublish(&ctx_, &request_, &responder_, cq_, cq_,
-                                  this);
+            service_->RequestPublish(&ctx_, &request_, &responder_, cq_, cq_, this);
         } else if (status_ == PROCESS) {
             // Spawn a new RequestData instance to serve new clients while we process
             // the one for this RequestData. The instance will deallocate itself as
             // part of its FINISH state.
-			VLOG(2) << "Creating new RequestData object in RequestData";
+			VLOG(3) << "Creating new RequestData object in RequestData";
             new RequestData(service_, cq_, reqQueueCXL_, reqQueueDisk_);
             PublishRequest req;
-            req.counter = new std::atomic<int>(1);
+			counter_ = new std::atomic<int>(2);
+            req.counter = counter_;
 			req.grpcTag = this;
 			auto maybeReq = std::make_optional(req);
 			//TODO(Erika)
@@ -79,34 +79,38 @@ public:
 		    EnqueueReq(reqQueueDisk_, maybeReq);
 
         } else if (status_ == ACKNOWLEDGE) {
-            VLOG(2) << "Acknowledging the RequestData() object";
+            VLOG(3) << "Acknowledging the RequestData() object";
 
             // And we are done! Let the gRPC runtime know we've finished, using the
             // memory address of this instance as the uniquely identifying tag for
             // the event.
             status_ = FINISH;
             responder_.Finish(reply_, Status::OK, this);
+			VLOG(3) << "Ack responder_.Finish called called";
         } else {
             // If we asked for acknowledgement, we can destruct right after moving to FINISH
             // If we did not ask for acknowledgement, we will let cxl/disk to destroy the object
             // by calling the Finish() function.
-            if (request_.acknowledge()) {
+            //if (request_.acknowledge()) {
                 Finish();
-            }
+            //}
         }
     }
 
-	  void SetError(PublisherError err) {
-		    // Only overwrite error if currently a success
-		    if (reply_.error() == ERR_NO_ERROR) {
-			      reply_.set_error(err);
-        }
-	  }
+  	void SetError(PublisherError err) {
+		// Only overwrite error if currently a success
+		if (reply_.error() == ERR_NO_ERROR) {
+			  reply_.set_error(err);
+		}
+  	}
 
     void Finish() {
+        VLOG(3) << "Finish() called";
+		while(counter_->load() != 0){std::this_thread::yield();}
         GPR_ASSERT(status_ == FINISH);
-        VLOG(2) << "destructing requestdata";
+        VLOG(3) << "destructing requestdata";
         // Once in the FINISH state, deallocate ourselves (RequestData).
+		delete counter_;
         delete this;
     }
 
@@ -130,6 +134,7 @@ private:
     // Let's implement a tiny state machine with the following states.
     enum CallStatus { CREATE, PROCESS, ACKNOWLEDGE, FINISH };
     CallStatus status_;  // The current serving state.
+	std::atomic<int> *counter_;
 
     std::shared_ptr<ReqQueue> reqQueueCXL_;
     std::shared_ptr<ReqQueue> reqQueueDisk_;

@@ -49,7 +49,7 @@ struct alignas(64) MessageHeader{
 class PubSubClient {
     public:
         /// Constructor for Client
-        explicit PubSubClient(PubConfig *config, std::shared_ptr<Channel> channel, int num_threads, int message_size)
+        explicit PubSubClient(PubConfig *config, std::shared_ptr<Channel> channel, int num_threads, size_t message_size)
             : config_(config), stub_(PubSub::NewStub(channel)), num_threads_(num_threads), message_size_(message_size) {
 			messages_ = (void**)malloc(sizeof(void*)*num_threads);
 			for (int i=0; i<num_threads; i++){
@@ -76,8 +76,11 @@ class PubSubClient {
 			free(messages_);
 		}
 
-        PublisherError Publish(std::string topic, int tid) {
-			unsigned int order = client_order_.fetch_add(1);
+        PublisherError Publish(std::string topic, int tid, std::atomic<unsigned int> *client_order_) {
+			unsigned int order = client_order_->fetch_add(1);
+			if((message_size_ * order)>(1UL<<36)){
+				LOG(INFO) << "Publish will overflow";
+			}
 			MessageHeader *header = (MessageHeader*)messages_[tid];
 			header->client_order = order;
             GRPCPublishRequest req;
@@ -103,16 +106,12 @@ class PubSubClient {
             }
         }
 
-		unsigned int GetNumPublishedMessages(){
-			return client_order_.load();
-		}
 
     private:
         PubConfig *config_;
         std::unique_ptr<PubSub::Stub> stub_;
-		std::atomic<unsigned int> client_order_{0};
 		int num_threads_;
-		int message_size_;
+		size_t message_size_;
 		void** messages_;
 };
 

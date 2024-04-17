@@ -1,4 +1,5 @@
 #include <iostream>
+#include <string>
 #include <thread>
 #include <stdlib.h>
 #include <arpa/inet.h>
@@ -9,14 +10,31 @@
 #include "client.h"
 
 void PublishThroughputTest(size_t message_size, int duration, int num_threads){
+	std::atomic<unsigned int> client_order_{0};
     PubConfig config = {
         acknowledge: true,
         client_id: 0, // TODO(erika): how is this set?
         client_order: 0, // TODO(erika): how is this set? // Client_order should be set in increasing order, starting from 0
     };
+ 	std::string channel = DEFAULT_CHANNEL;
+    std::istringstream iss(channel);
+    std::string ip;
+    std::string port;
 
-    PubSubClient pubsub(&config, grpc::CreateChannel(DEFAULT_CHANNEL, grpc::InsecureChannelCredentials()), num_threads, message_size);
-    LOG(INFO) << "Created gRPC channel";
+    std::getline(iss, ip, ':'); // Extract IP
+    std::getline(iss, port, ':'); // Extract port
+
+    int port_num = std::stoi(port); // Convert port to integer
+
+	std::string channels[NUM_CHANNEL];
+	std::vector<PubSubClient*> pubsubs;
+	for(int i=0; i<NUM_CHANNEL; i++){
+		channels[i] = ip + ":" + std::to_string(port_num);
+		port_num++; 
+		pubsubs.emplace_back(new PubSubClient(&config, grpc::CreateChannel(channels[i], grpc::InsecureChannelCredentials()), num_threads, message_size));
+	}
+
+    LOG(INFO) << "Created gRPC channels:" << NUM_CHANNEL;
     LOG(INFO) << "Publishing message size:" << message_size << " for " << duration;
 
     std::vector<std::thread> threads;
@@ -25,7 +43,7 @@ void PublishThroughputTest(size_t message_size, int duration, int num_threads){
         threads.emplace_back([&, i]() {
             std::chrono::time_point start = std::chrono::steady_clock::now();
             while (true) {
-                PublisherError pub_ret = pubsub.Publish("0", i);
+                PublisherError pub_ret = pubsubs[i%NUM_CHANNEL]->Publish("0", i, &client_order_);
                 assert(pub_ret == ERR_NO_ERROR);
                 if (std::chrono::steady_clock::now() - start > std::chrono::seconds(duration)) {
                     break;
@@ -39,7 +57,13 @@ void PublishThroughputTest(size_t message_size, int duration, int num_threads){
         thread.join();
     }
 
-	double data_sent = ((double)pubsub.GetNumPublishedMessages() * message_size)/(double)(1024*1024); //In MB
+	double num_messages = (double)client_order_.load();
+	for(int i=0; i<NUM_CHANNEL; i++){
+		delete pubsubs[i];
+	}
+	num_messages = num_messages/(double)1024;
+
+	double data_sent = (num_messages * message_size)/(double)(1024); //In MB
 	double bandwidth = (double)data_sent/(double)duration;
 	LOG(INFO) << "Publish Bandwidth:" << bandwidth ;
 }

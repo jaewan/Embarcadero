@@ -1,6 +1,7 @@
 #include "network_manager.h"
 #include "request_data.h"
 
+#include <string>
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -19,20 +20,34 @@ NetworkManager::NetworkManager(std::shared_ptr<AckQueue> ack_queue, std::shared_
 	for (int i = 0; i < num_ack_threads; i++) {
 		threads_.emplace_back(&NetworkManager::AckThread, this);
 	}
+	// Wait for the threads to all start
+	while (thread_count_.load() != num_ack_threads) {}
 
 	// Create service
 	// TODO: make IP addr and port parameters
-    ServerBuilder builder;
-    builder.AddListeningPort(DEFAULT_CHANNEL, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service_);
-	
-	// One completion queue per two receive threads. This is recommended in grpc perf docs
-	for (int i = 0; i < num_receive_threads / 2 + num_receive_threads % 2; i++) {
-		LOG(INFO) << "Created completion queue " << i;
-    	cqs_.push_back(builder.AddCompletionQueue());
+ 	std::string channel = DEFAULT_CHANNEL, ip, port;
+    std::istringstream iss(channel);
+    std::getline(iss, ip, ':'); // Extract IP
+    std::getline(iss, port, ':'); // Extract port
+    int port_num = std::stoi(port); // Convert port to integer
+	std::string channels[NUM_CHANNEL];
+    ServerBuilder builders[NUM_CHANNEL];
+
+	for (int i=0 ; i < NUM_CHANNEL; i++){
+		builders[i].AddListeningPort(ip+":"+std::to_string(port_num), grpc::InsecureServerCredentials());
+		builders[i].RegisterService(&service_[i]);
+		port_num++;
 	}
-    server_ = builder.BuildAndStart();
-    LOG(INFO) << "gRPC Server listening on " << DEFAULT_CHANNEL;
+	
+	// Ensure the num_receive_threads is even
+	num_receive_threads = num_receive_threads + num_receive_threads%2;
+	// One completion queue per two receive threads. This is recommended in grpc perf docs
+	for (int i = 0; i < num_receive_threads / 2 ; i++) {
+    	cqs_.push_back(builders[i%NUM_CHANNEL].AddCompletionQueue());
+	}
+	for (int i=0 ; i < NUM_CHANNEL; i++){
+		server_[i] = builders[i].BuildAndStart();
+	}
 
 	// Create receive threads to process received gRPC messages
 	for (int i = 0; i < num_receive_threads; i++) {
@@ -48,7 +63,9 @@ NetworkManager::~NetworkManager() {
 
 	// We need to stop the receivers before we stop the ack queues
 	// Shutdown the gRPC server
-    server_->Shutdown();
+	for (int i=0 ; i < NUM_CHANNEL; i++){
+    	server_[i]->Shutdown();
+	}
 
     // Always shutdown the completion queue after the server.
 	for (size_t i = 0; i < cqs_.size(); i++) {
@@ -82,7 +99,7 @@ void NetworkManager::ReceiveThread() {
 
 	// Spawn a new RequestData instance to serve new clients.
 	if (!stop_threads_) {
-    	new RequestData(&service_, cqs_[my_cq_index].get(), reqQueueCXL_, reqQueueDisk_);
+    	new RequestData(&service_[my_cq_index%NUM_CHANNEL], cqs_[my_cq_index].get(), reqQueueCXL_, reqQueueDisk_);
     	void* tag;  // uniquely identifies a request.
     	bool ok;
     	while (!stop_threads_) {
@@ -116,7 +133,7 @@ void NetworkManager::AckThread() {
 		}
 		
 		void *grpcTag = optReq.value();
-		VLOG(2) << "Got net_req, tag=" << grpcTag;
+		VLOG(3) << "Got net_req, tag=" << grpcTag;
     	static_cast<RequestData*>(grpcTag)->Proceed();
 	}
 }
