@@ -15,11 +15,11 @@ namespace Embarcadero{
 #define CXL_SIZE (1UL<<37)
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
-#define SEGMENT_SIZE (1UL << 35)
-#define NUM_DISK_IO_THREADS 4
+#define SEGMENT_SIZE (1UL << 37)
+#define NUM_DISK_IO_THREADS 64
 #define NUM_CXL_IO_THREADS 128
-#define NUM_NETWORK_IO_THREADS 4
-#define NUM_BUFFERS 50000
+#define NUM_NETWORK_IO_THREADS 128
+#define NUM_ACK_THREADS 16
 //This is the max message size && must be multiple of cacheline size
 #define BUFFER_SIZE (64UL<<4) 
 
@@ -41,6 +41,7 @@ struct PublishRequest{
 	std::atomic<int> *counter;
 	void* payload_address;
 	size_t size;
+	int client_socket;
 };
 
 } // End of namespace Embarcadero

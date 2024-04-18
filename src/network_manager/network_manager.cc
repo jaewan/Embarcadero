@@ -5,19 +5,22 @@
 
 namespace Embarcadero{
 
-NetworkManager::NetworkManager(size_t queueCapacity, int num_io_threads):
+#define SKIP_LIST_SIZE 1024
+
+NetworkManager::NetworkManager(size_t queueCapacity, int num_reqReceive_threads):
 						 requestQueue_(queueCapacity),
-						 ackQueue_(50),
-						 num_io_threads_(num_io_threads){
+						 ackQueue_(5000),
+						 num_reqReceive_threads_(num_reqReceive_threads){
 	// Create Network I/O threads
 	threads_.emplace_back(&NetworkManager::MainThread, this);
-	threads_.emplace_back(&NetworkManager::AckThread, this);
-	threads_.emplace_back(&NetworkManager::AckThread, this);
-	threads_.emplace_back(&NetworkManager::AckThread, this);
-	for (int i=4; i< num_io_threads_; i++)
-		threads_.emplace_back(&NetworkManager::Network_io_thread, this);
+	for (int i=0; i< NUM_ACK_THREADS; i++)
+		threads_.emplace_back(&NetworkManager::AckThread, this);
+	for (int i=0; i< num_reqReceive_threads; i++)
+		threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
 
-	while(thread_count_.load() != num_io_threads_){}
+	//socketFdList = SkipList::createInstance(SKIP_LIST_SIZE);
+
+	while(thread_count_.load() != (1 + NUM_ACK_THREADS + num_reqReceive_threads_)){}
 	std::cout << "[NetworkManager]: \tCreated" << std::endl;
 }
 
@@ -25,9 +28,9 @@ NetworkManager::~NetworkManager(){
 	stop_threads_ = true;
 	std::optional<struct NetworkRequest> sentinel = std::nullopt;
 	ackQueue_.blockingWrite(sentinel);
-	for (int i=4; i<num_io_threads_; i++)
+	for (int i=0; i<num_reqReceive_threads_; i++)
 		requestQueue_.blockingWrite(sentinel);
-	
+
 	for(std::thread& thread : threads_){
 		if(thread.joinable()){
 			thread.join();
@@ -41,10 +44,7 @@ void NetworkManager::EnqueueRequest(struct NetworkRequest req){
 	ackQueue_.blockingWrite(req);
 }
 
-#define READ_SIZE 1024
-
-void NetworkManager::Network_io_thread(){
-
+void NetworkManager::ReqReceiveThread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct NetworkRequest> optReq;
 
@@ -57,44 +57,52 @@ void NetworkManager::Network_io_thread(){
 		switch(req.req_type){
 			case Receive:
 				//TODO(Jae) define if its publish or subscribe
-				//while(processed < batch_size){
+
+				{
+				//Handshake
+				EmbarcaderoReq shake;
+				int ret = read(req.client_socket, &shake, sizeof(shake));
+				if(ret <=0)
+					perror("!!!!!!!!!!!!!!!! read shake error\n\n\n");
+				size_t READ_SIZE = shake.size;
 				while(true){
-					void* buf = malloc(BUFFER_SIZE);
+					void* buf = malloc(READ_SIZE);
 
 					int bytes_read = read(req.client_socket, buf, READ_SIZE);
 					if(bytes_read <= 0){
-					 	std::cout << "\t\t !!!!!!! Bytes Read:"<< bytes_read << std::endl;
 						break;
 					}
-					while((size_t)bytes_read < sizeof(EmbarcaderoReq)){
-						int ret = read(req.client_socket, (uint8_t*)buf + bytes_read, READ_SIZE - bytes_read);
-						if(ret <=0)
+					while((size_t)bytes_read < sizeof(MessageHeader)){
+						ret = read(req.client_socket, (uint8_t*)buf + bytes_read, READ_SIZE - bytes_read);
+						if(ret <=0){
 							perror("!!!!!!!!!!!!!!!! read error\n\n\n");
+							return;
+						}
 						bytes_read += ret;
 					}
-					struct EmbarcaderoReq *clientReq = (struct EmbarcaderoReq*)buf;
-					// Create publish request
-					struct PublishRequest pub_req;
-					pub_req.client_id = clientReq->client_id;
-					pub_req.client_order = clientReq->client_order;
-					pub_req.size = clientReq->size;
-					memcpy(pub_req.topic, clientReq->topic, 31);
-					pub_req.acknowledge = clientReq->ack;
-					pub_req.payload_address = (uint8_t*)buf;// + sizeof(EmbarcaderoReq);
-					pub_req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>)); 
 
-					// Transform EmbarcaderoReq at buf to MessageHeader
-					struct MessageHeader *header = (MessageHeader*)buf;
-					header->client_id = pub_req.client_id;
-					header->client_order = pub_req.client_order;
-					header->size = pub_req.size;
-					header->paddedSize = 64 - (header->size % 64) + header->size + sizeof(MessageHeader);
-					header->segment_header = nullptr;
-					header->logical_offset = (size_t)-1; // Sentinel value
-					header->next_message = nullptr;
+					MessageHeader *header = (MessageHeader*)buf;
+					// Finish Message
+					if(header->client_id == -1){
+						free(buf);
+						break;
+					}
+					// Create publish request
+					send(req.client_socket, "1", 1, 0);
+					/*
+					struct PublishRequest pub_req;
+					pub_req.client_id = header->client_id;
+					pub_req.client_order = header->client_order;
+					pub_req.size = header->size;
+					memcpy(pub_req.topic, shake.topic, 31);
+					pub_req.acknowledge = shake.ack;
+					pub_req.payload_address = (void*)buf;
+					pub_req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>)); 
+					pub_req.counter->store(2);
+					pub_req.client_socket = req.client_socket;
 
 					bool close = false;
-					int to_read = (pub_req.size + sizeof(EmbarcaderoReq) - bytes_read);
+					int to_read = (pub_req.size + sizeof(MessageHeader) - bytes_read);
 					while(to_read){
 						int ret = read(req.client_socket, (uint8_t*)buf + bytes_read, to_read);
 						if(ret == 0){
@@ -109,9 +117,10 @@ void NetworkManager::Network_io_thread(){
 
 					cxl_manager_->EnqueueRequest(pub_req);
 					disk_manager_->EnqueueRequest(pub_req);
-					//processed++;
+					*/
 				}
-				close(req.client_socket);
+				//close(req.client_socket);
+				}// end Receive
 				break;
 			case Send:
 				std::cout << "Send" << std::endl;
@@ -123,6 +132,8 @@ void NetworkManager::Network_io_thread(){
 void NetworkManager::AckThread(){
 	std::optional<struct NetworkRequest> optReq;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	char buf = '1';
+	//static std::atomic<int> DEBUG_Ack_num[100] = {};
 
 	while(!stop_threads_){
 		ackQueue_.blockingRead(optReq);
@@ -130,7 +141,22 @@ void NetworkManager::AckThread(){
 			break;
 		}
 		const struct NetworkRequest &req = optReq.value();
+		//std::cout << "[DEBUG] socket:" << req.client_socket << std::endl;
+		/*
+		if(DEBUG_Ack_num[req.client_socket].fetch_add(1) == 9999){
+			int ret = send(req.client_socket, &buf, 1, 0);
+			std::cout << "Acked:" << req.client_socket << std::endl;
+			if(ret <=0 )
+				std::cout<< strerror(errno) << std::endl;
+			close(req.client_socket);
+		}
+		*/
+			int ret = send(req.client_socket, &buf, 1, 0);
+			if(ret <=0 )
+				std::cout<< strerror(errno) << std::endl;
 	}
+	//TODO(Jae) close socket. Should implemente a counter
+	
 }
 
 void NetworkManager::MainThread(){

@@ -68,10 +68,10 @@ void DiskManager::Disk_io_thread(){
 			free(req.counter);
 			free(req.payload_address);
 		}else if(req.acknowledge){
-			struct NetworkRequest req;
-			req.req_type = Acknowledge;
-			req.client_socket = -1;
-			network_manager_->EnqueueRequest(req);
+			struct NetworkRequest ackReq;
+			ackReq.req_type = Acknowledge;
+			ackReq.client_socket = req.client_socket;
+			network_manager_->EnqueueRequest(ackReq);
 			//TODO(Jae)
 			//Enque ack request to network manager
 			// network_manager_.EnqueueAckRequest();

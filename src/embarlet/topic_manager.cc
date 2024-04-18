@@ -161,7 +161,7 @@ void Topic::CombinerThread(){
 #endif
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
-		header->next_message = (uint8_t*)header + header->paddedSize + header_size;
+		header->next_message = (uint8_t*)header + header->paddedSize;
 		tinode_->offsets[broker_id_].written = logical_offset_;
 		(*(unsigned long long int*)segment_header) +=
 		(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
@@ -248,9 +248,9 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	struct MessageHeader *last_msg_of_segment = (MessageHeader*)((uint8_t*)last_msg_off + *last_msg_off);
 	if(last_msg_of_segment >= written_physical_addr_){
 		last_addr = nullptr; 
-		messages_size = (uint8_t*)written_physical_addr_ - (uint8_t*)start_msg_header + ((MessageHeader*)written_physical_addr_)->paddedSize + header_size;
+		messages_size = (uint8_t*)written_physical_addr_ - (uint8_t*)start_msg_header + ((MessageHeader*)written_physical_addr_)->paddedSize;
 	}else{
-		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize + header_size; 
+		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
 	}
@@ -260,7 +260,6 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	size_t len = messages_size;
 	while(len>0){
 		char* msg = (char*)((uint8_t*)m + header_size);
-		len -= header_size;
 		std::cout << " total_order:" << m->total_order<< " logical_order:" <<
 		m->logical_offset << " client_order::" << m->client_order << std::endl;
 		len -= m->paddedSize;
