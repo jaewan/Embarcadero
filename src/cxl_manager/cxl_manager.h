@@ -59,7 +59,7 @@ struct alignas(64) MessageHeader{
 	size_t client_order;
 	volatile size_t size;
 	volatile size_t total_order;
-	volatile size_t paddedSize;
+	volatile size_t paddedSize; // This include message+padding+header size
 	void* segment_header;
 	size_t logical_offset;
 	void* next_message;

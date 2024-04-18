@@ -156,10 +156,10 @@ void CXLManager::CXL_io_thread(){
 			}
 #endif
 		}else if(req.acknowledge){
-			struct NetworkRequest req;
-			req.req_type = Acknowledge;
-			req.client_socket = 1;
-			network_manager_->EnqueueRequest(req);
+			struct NetworkRequest ackReq;
+			ackReq.req_type = Acknowledge;
+			ackReq.client_socket = req.client_socket;
+			network_manager_->EnqueueRequest(ackReq);
 		}
 	}
 }
@@ -220,7 +220,7 @@ void CXLManager::Sequencer1(char* topic){
 				tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
 				perLogOff[i] = msg_headers[i]->logical_offset;
 				seq++;
-				msg_headers[i] = (MessageHeader*)((uint8_t*)msg_headers[i] + msg_headers[i]->paddedSize + header_size);
+				msg_headers[i] = (MessageHeader*)((uint8_t*)msg_headers[i] + msg_headers[i]->paddedSize);
 				yield = false;
 			}
 			//TODO(Jae) if multi segment is implemented as last message to have a dummy, this should be handled
@@ -296,7 +296,7 @@ void CXLManager::Sequencer2(char* topic){
                          it->second.emplace(msg_headers[i]->client_order, msg_headers[i]);
                      }
 				}
-				msg_headers[i] = (MessageHeader*)((uint8_t*)msg_headers[i] + msg_headers[i]->paddedSize + header_size);
+				msg_headers[i] = (MessageHeader*)((uint8_t*)msg_headers[i] + msg_headers[i]->paddedSize);
 				yield = false;
             }
 		}

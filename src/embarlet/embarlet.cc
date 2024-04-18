@@ -18,7 +18,8 @@
 #include <emmintrin.h>
 
 #include <thread>
-//#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
+#include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
+#include <glog/logging.h>
 void memcpy_nt(void* dst, const void* src, size_t size) {
     // Cast the input pointers to the appropriate types
     uint8_t* d = static_cast<uint8_t*>(dst);
@@ -245,9 +246,25 @@ void ReadWriteTest(){
 }
 
 int main(int argc, char* argv[]){
-	RawCXLWriteTest();
-	//ReadWriteTest();
-	return 0;
+	google::InitGoogleLogging(argv[0]);
+	google::InstallFailureSignalHandler();
+
+	//size_t num_cores = GetPhysicalCoreCount();
+  	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
+	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
+  	options.add_options()
+		("head", "Head Node")
+			("follower", "Follower Address and Port", cxxopts::value<std::string>())
+			("e,emul", "Use emulation instead of CXL")
+			("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
+		;
+
+	auto arguments = options.parse(argc, argv);
+
+	FLAGS_v = arguments["log_level"].as<int>();
+	//FLAGS_logtostderr = 1; // log only to console, no files.
+	FLAGS_log_dir = "/tmp/vlog2_log";
+
 	//Initialize
 	//size_t num_cores = GetPhysicalCoreCount();
 	int broker_id = 0;
@@ -261,72 +278,6 @@ int main(int argc, char* argv[]){
 	disk_manager.SetNetworkManager(&network_manager);
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
-
-	//********* Load Generate **************
-	char topic[31];
-	memset(topic, 0, 31);
-	topic[0] = '0';
-	int order = 0;
-	topic_manager.CreateNewTopic(topic, order);
-
-	std::cout << "You are now safe to go" << std::endl;
-	//cxl_manager.StartInternalTest();
-
-	// Sequencer Test
-	//sleep(2);
-	//cxl_manager.Sequencer(topic);
-
-	// Disk Manager Test
-
-	/*
-	char topic[31];
-	memset(topic, 0, 31);
-	topic[0] = '0';
-	topic_manager.CreateNewTopic(topic, 0);
-	Embarcadero::PublishRequest req;
-	std::atomic<int> c{2};
-	memcpy(req.topic, topic, 31);
-	req.payload_address = malloc(1024);
-	req.counter = &c;
-	req.size = 1024;
-	req.acknowledge = true;
-	cxl_manager.EnqueueRequest(req);
-	disk_manager.EnqueueRequest(req);
-	cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
-	*/
-
-	// Network Manager Test
-	/*
-	char topic[31];
-	memset(topic, 0, 31);
-	topic[0] = '0';
-	topic_manager.CreateNewTopic(topic);
-	
-	Embarcadero::NetworkRequest req;
-	req.req_type = Embarcadero::Test;
-	std::cout <<"Submitting reqs" << std::endl;
-	for(int i =0; i<1000000; i++){
-		network_manager.EnqueueRequest(req);
-	}
-		std::cout <<"Submitted all reqs" << std::endl;
-	sleep(1);
-
-	void* last_addr = nullptr;
-	void* messages = nullptr;
-	size_t messages_size;
-	size_t last_offset = 0;
-	cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
-	*/
-
-	/*
-	cxxopts::Options options("embarcadero", "a totally ordered pub/sub system with CXL");
-
-	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
-	options.add_options()
-		("head", "Head Node")
-		("follower", "Follower Address and Port", cxxopts::value<std::string>());
-
-	auto arguments = options.parse(argc, argv);
 
 	if (arguments.count("head")) {
 		// Initialize peer broker
@@ -342,39 +293,22 @@ int main(int argc, char* argv[]){
 		PeerBroker follower_broker(false, head_addr, head_port);
 		follower_broker.Run();
 	} else {
-		std::cout << "Invalid arguments" << std::endl;
+		LOG(INFO) << "Invalid arguments";
 	}
 
-	// Create a pub task
-	// This is slightly less than ideal, because it involved two heap allocations.
-	// But we'll worry about performance optimizations later.
-	std::atomic<uint8_t> *num_subtasks = new std::atomic<uint8_t>(1); // this will be freed by the PubTask destructor
-	PubTask *pt = new PubTask(num_subtasks);
+	//********* Load Generate **************
+	char topic[31];
+	memset(topic, 0, 31);
+	topic[0] = '0';
+	int order = 0;
+	topic_manager.CreateNewTopic(topic, order);
 
-	// Create a pub queue
-	PubQueue *pq = new PubQueue(PUB_QUEUE_CAPACITY);
-
-	pq_enqueue(pq, pt);
-	pq_dequeue(pq, &pt);
-
-	uint8_t tasks_left = pt->subtasks_left->fetch_sub(1, std::memory_order_seq_cst);
-	printf("Tasks left: %d\n", tasks_left);
-	assert(tasks_left == 1);
-
-	pq_enqueue(pq, pt);
-	pq_dequeue(pq, &pt);
-
-	tasks_left = pt->subtasks_left->fetch_sub(1, std::memory_order_seq_cst);
-	printf("Tasks left: %d\n", tasks_left);
-	if (0 == tasks_left) {
-		printf("No tasks left! Time to signal the completion queue before freeing the PubTask!\n");
-		// TODO: signal completion queue
-		delete pt;
+	std::cout << "You are now safe to go" << std::endl;
+	//cxl_manager.StartInternalTest();
+	while(true){
+	std::this_thread::yield();
+	sleep(100);
 	}
-	assert(tasks_left == 0);
-
-	delete pq;
-	*/
 
 	return 0;
 }
