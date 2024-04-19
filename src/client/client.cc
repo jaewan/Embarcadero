@@ -28,7 +28,6 @@ void PublishThroughputTest(size_t message_size, int duration, int num_threads){
 
 	std::string channels[NUM_CHANNEL];
 	std::vector<PubSubClient*> pubsubs;
-	std::vector<CompletionQueue> cqs;
 	for(int i=0; i<NUM_CHANNEL; i++){
 		channels[i] = ip + ":" + std::to_string(port_num);
 		port_num++; 
