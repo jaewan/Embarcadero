@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <glog/logging.h>
 
 namespace Embarcadero{
 
@@ -63,15 +64,19 @@ void NetworkManager::ReqReceiveThread(){
 				EmbarcaderoReq shake;
 				int ret = read(req.client_socket, &shake, sizeof(shake));
 				if(ret <=0)
-					perror("!!!!!!!!!!!!!!!! read shake error\n\n\n");
+					LOG(INFO) << "!!!!!!!!!!!!!!!! read shake error\n\n\n";
+				VLOG(3) << "[DEBUG] Publish req shake";
 				size_t READ_SIZE = shake.size;
-				while(true){
 					void* buf = malloc(READ_SIZE);
+				while(true){
+					//void* buf = malloc(READ_SIZE);
 
+					VLOG(3) << "[DEBUG] start receving pub msg";
 					int bytes_read = read(req.client_socket, buf, READ_SIZE);
 					if(bytes_read <= 0){
 						break;
 					}
+					VLOG(3) << "[DEBUG] publish message recved:" << bytes_read;
 					while((size_t)bytes_read < sizeof(MessageHeader)){
 						ret = read(req.client_socket, (uint8_t*)buf + bytes_read, READ_SIZE - bytes_read);
 						if(ret <=0){
@@ -81,14 +86,16 @@ void NetworkManager::ReqReceiveThread(){
 						bytes_read += ret;
 					}
 
+					VLOG(3) << "[DEBUG] publish message recved:" << bytes_read;
 					MessageHeader *header = (MessageHeader*)buf;
 					// Finish Message
 					if(header->client_id == -1){
+						VLOG(3) << "[DEBUG] Finishing pub";
 						free(buf);
 						break;
 					}
+					//send(req.client_socket, "1", 1, 0);
 					// Create publish request
-					send(req.client_socket, "1", 1, 0);
 					/*
 					struct PublishRequest pub_req;
 					pub_req.client_id = header->client_id;

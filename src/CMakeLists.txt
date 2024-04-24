@@ -39,3 +39,21 @@ target_link_libraries(embarlet
     ${_PROTOBUF_LIBPROTOBUF}
     ${FOLLY_LIBRARIES}
 )
+
+add_executable(throughput_test
+    client/throughput_test.cc
+)
+
+target_include_directories(throughput_test PUBLIC
+	"${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+)
+
+target_link_libraries(throughput_test 
+	glog
+	gflags
+    cxxopts::cxxopts
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOF}
+)
