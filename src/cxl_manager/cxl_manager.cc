@@ -6,6 +6,9 @@
 #include <errno.h>
 #include <iostream>
 #include <cstdlib>
+#include <cstring>
+#include <errno.h>
+#include <glog/logging.h>
 
 namespace Embarcadero{
 
@@ -14,7 +17,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	broker_id_(broker_id),
 	num_io_threads_(num_io_threads){
 	// Initialize CXL
-	cxl_type_ = Real;
+	cxl_type_ = Emul;
 	std::string cxl_path(getenv("HOME"));
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
@@ -31,11 +34,11 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 		perror("Opening CXL error");
 
 	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd_, 0);
-	if (cxl_addr_ == MAP_FAILED)
+	if (cxl_addr_ == MAP_FAILED){
 		perror("Mapping Emulated CXL error");
+	}
 	//memset(cxl_addr_, 0, CXL_SIZE);
 	memset(cxl_addr_, 0, (1UL<<30));
-
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&CXLManager::CXL_io_thread, this);

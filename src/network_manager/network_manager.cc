@@ -1,12 +1,34 @@
 #include "network_manager.h"
 #include <stdlib.h>
 #include <netinet/in.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <glog/logging.h>
+#include <cstring>
+#include <errno.h>
 
 namespace Embarcadero{
 
 #define SKIP_LIST_SIZE 1024
+
+inline void make_socket_non_blocking(int sfd) {
+	int flags = fcntl(sfd, F_GETFL, 0);
+	if (flags == -1) {
+		perror("fcntl F_GETFL");
+		return ;
+	}
+
+	flags |= O_NONBLOCK;
+	if (fcntl(sfd, F_SETFL, flags) == -1) {
+		perror("fcntl F_SETFL");
+		return ;
+	}
+}
 
 NetworkManager::NetworkManager(size_t queueCapacity, int num_reqReceive_threads):
 						 requestQueue_(queueCapacity),
@@ -60,40 +82,80 @@ void NetworkManager::ReqReceiveThread(){
 				//TODO(Jae) define if its publish or subscribe
 
 				{
+				// Set socket as non-blocking and epoll
+				make_socket_non_blocking(req.client_socket);
+				int efd = epoll_create1(0);
+				if ( efd == -1){
+					std::cerr << "!!!!! Error epoll_create:" << strerror(errno) << std::endl;
+					return;
+				}
+				struct epoll_event event;
+				event.data.fd = req.client_socket;
+				//TODO(Jae) add write after read test
+				event.events = EPOLLIN | EPOLLET; 
+				if(epoll_ctl(efd, EPOLL_CTL_ADD, req.client_socket, &event) == -1){
+					std::cerr << "!!!!! Error epoll_ctl:" << strerror(errno) << std::endl;
+					return;
+				}
+
+				struct epoll_event events[10]; // Adjust size as needed
+
 				//Handshake
 				EmbarcaderoReq shake;
-				int ret = read(req.client_socket, &shake, sizeof(shake));
-				if(ret <=0)
-					LOG(INFO) << "!!!!!!!!!!!!!!!! read shake error\n\n\n";
+				int i,n;
+				size_t to_read = sizeof(shake);
+				bool running = true;
+				while(to_read > 0){
+ 					n = epoll_wait(efd, events, 10, -1);
+					for( i=0; i< n; i++){
+						if(events[i].events & EPOLLIN){
+							int ret = read(req.client_socket, &shake, to_read);
+							to_read -= ret;
+							if(to_read == 0){
+								if(i == n-1)
+									n = epoll_wait(efd, events, 10, -1);
+								break;
+							}
+						}
+					}
+				}
+
 				VLOG(3) << "[DEBUG] Publish req shake";
 				size_t READ_SIZE = shake.size;
-					void* buf = malloc(READ_SIZE);
-				while(true){
-					//void* buf = malloc(READ_SIZE);
+				to_read = READ_SIZE;
+				void* buf = malloc(READ_SIZE);
 
-					VLOG(3) << "[DEBUG] start receving pub msg";
-					int bytes_read = read(req.client_socket, buf, READ_SIZE);
-					if(bytes_read <= 0){
-						break;
-					}
-					VLOG(3) << "[DEBUG] publish message recved:" << bytes_read;
-					while((size_t)bytes_read < sizeof(MessageHeader)){
-						ret = read(req.client_socket, (uint8_t*)buf + bytes_read, READ_SIZE - bytes_read);
-						if(ret <=0){
-							perror("!!!!!!!!!!!!!!!! read error\n\n\n");
-							return;
+				while(running){
+					for ( ; i < n; i++) {
+						if(events[i].events & EPOLLIN){
+							int bytes_read = recv(req.client_socket, buf, to_read, 0);
+							if(bytes_read <= 0 && errno != EAGAIN){
+								LOG(INFO) << "Receiving data ERROR:" << strerror(errno);;
+								break;
+							}
+							to_read -= bytes_read;
+							size_t read = READ_SIZE - to_read;
+							MessageHeader *header;
+							if(read > sizeof(MessageHeader)){
+								header = (MessageHeader*)buf;
+								if(header->client_id == -1){
+									free(buf);
+									running = false;
+									//TODO(Jae) we do not want to close it for ack
+									epoll_ctl(efd, EPOLL_CTL_DEL, req.client_socket, nullptr);
+									close(req.client_socket);
+								}
+							}
+							if(to_read == 0){
+								to_read = READ_SIZE;
+								//TODO(Jae) enqueue
+								//buf = malloc(READ_SIZE);
+							}
 						}
-						bytes_read += ret;
 					}
+					n = epoll_wait(efd, events, 10, -1);
+					i = 0;
 
-					VLOG(3) << "[DEBUG] publish message recved:" << bytes_read;
-					MessageHeader *header = (MessageHeader*)buf;
-					// Finish Message
-					if(header->client_id == -1){
-						VLOG(3) << "[DEBUG] Finishing pub";
-						free(buf);
-						break;
-					}
 					//send(req.client_socket, "1", 1, 0);
 					// Create publish request
 					/*
@@ -170,29 +232,41 @@ void NetworkManager::MainThread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 
 	int server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in server_address;
-    server_address.sin_family = AF_INET;
-    server_address.sin_port = htons(PORT);
-    server_address.sin_addr.s_addr = INADDR_ANY;
+	if(server_socket < 0){
+		LOG(INFO) << "Socket Creation Failed";
+	}
+	int flag = 1;
+	setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+
+	//make_socket_non_blocking(server_socket);
+
+	struct sockaddr_in server_address;
+	server_address.sin_family = AF_INET;
+	server_address.sin_port = htons(PORT);
+	server_address.sin_addr.s_addr = INADDR_ANY;
 	
-	 while (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
-        std::cerr << "Error binding socket" << std::endl;
+	while (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
+		std::cerr << "!!!!! Error binding socket" << std::endl;
 		sleep(5);
-    }
+	}
 
-    listen(server_socket, 32);
+  if(listen(server_socket, SOMAXCONN) == -1){
+		std::cerr << "!!!!! Error Listen:" << strerror(errno) << std::endl;
+		return;
+	}
 
-    while (true) {
-		struct NetworkRequest req;
-		req.req_type = Receive;
-        req.client_socket = accept(server_socket, nullptr, nullptr);
-        if (req.client_socket < 0) {
-            std::cerr << "Error accepting connection" << std::endl;
-            continue;
-        }
-		//EnqueueRequest(req);
-		requestQueue_.blockingWrite(req);
-    }
+  while (true) {
+			struct NetworkRequest req;
+			req.req_type = Receive;
+			req.client_socket = accept(server_socket, nullptr, nullptr);
+			if (req.client_socket < 0) {
+					std::cerr << "!!!!! Error accepting connection:" << strerror(errno) << std::endl;
+					break;
+					continue;
+			}
+			//EnqueueRequest(req);
+			requestQueue_.blockingWrite(req);
+   }
 }
 
 } // End of namespace Embarcadero
