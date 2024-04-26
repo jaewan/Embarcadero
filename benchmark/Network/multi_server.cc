@@ -37,10 +37,11 @@ int make_socket_non_blocking(int sfd) {
 
 void handle_client(int client_sock) {
 #ifdef EPOLL
+	make_socket_non_blocking(client_sock);
 	int efd = epoll_create1(0);
 	struct epoll_event event;
 	event.data.fd =client_sock;
-	event.events = EPOLLIN ; // Edge-triggered for both read and write
+	event.eventepolls = EPOLLIN | EPOLLET ; // Edge-triggered for both read and write
 	epoll_ctl(efd, EPOLL_CTL_ADD, client_sock, &event);
 
 	struct epoll_event events[10]; // Adjust size as needed

@@ -112,8 +112,9 @@ void NetworkManager::ReqReceiveThread(){
 							int ret = read(req.client_socket, &shake, to_read);
 							to_read -= ret;
 							if(to_read == 0){
-								if(i == n-1)
+								if(i == n-1){
 									n = epoll_wait(efd, events, 10, -1);
+								}
 								break;
 							}
 						}
@@ -128,9 +129,11 @@ void NetworkManager::ReqReceiveThread(){
 				while(running){
 					for ( ; i < n; i++) {
 						if(events[i].events & EPOLLIN){
-							int bytes_read = recv(req.client_socket, buf, to_read, 0);
+								VLOG(3) << "Before recv";
+							int bytes_read = recv(req.client_socket, (uint8_t*)buf + (READ_SIZE - to_read), to_read, 0);
+								VLOG(3) << "Read:"<< bytes_read;
 							if(bytes_read <= 0 && errno != EAGAIN){
-								LOG(INFO) << "Receiving data ERROR:" << strerror(errno);;
+								LOG(INFO) << "Receiving data ERROR:" << strerror(errno);
 								break;
 							}
 							to_read -= bytes_read;
@@ -141,6 +144,7 @@ void NetworkManager::ReqReceiveThread(){
 								if(header->client_id == -1){
 									free(buf);
 									running = false;
+								VLOG(3) << "Finish receiving pub messages";
 									//TODO(Jae) we do not want to close it for ack
 									epoll_ctl(efd, EPOLL_CTL_DEL, req.client_socket, nullptr);
 									close(req.client_socket);
@@ -148,12 +152,15 @@ void NetworkManager::ReqReceiveThread(){
 							}
 							if(to_read == 0){
 								to_read = READ_SIZE;
+								VLOG(3) << "Received a req" ;
 								//TODO(Jae) enqueue
 								//buf = malloc(READ_SIZE);
 							}
 						}
 					}
+								VLOG(3) << "before epoll_wait";
 					n = epoll_wait(efd, events, 10, -1);
+								VLOG(3) << "after epoll wait: " << n;
 					i = 0;
 
 					//send(req.client_socket, "1", 1, 0);
