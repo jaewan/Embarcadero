@@ -15,6 +15,7 @@
 namespace Embarcadero{
 
 #define SKIP_LIST_SIZE 1024
+#define MAX_EVENTS 10
 
 inline void make_socket_non_blocking(int sfd) {
 	int flags = fcntl(sfd, F_GETFL, 0);
@@ -84,21 +85,17 @@ void NetworkManager::ReqReceiveThread(){
 				{
 				// Set socket as non-blocking and epoll
 				make_socket_non_blocking(req.client_socket);
-				int efd = epoll_create1(0);
-				if ( efd == -1){
-					std::cerr << "!!!!! Error epoll_create:" << strerror(errno) << std::endl;
-					return;
-				}
 				struct epoll_event event;
+				int efd = req.efd;
 				event.data.fd = req.client_socket;
 				//TODO(Jae) add write after read test
-				event.events = EPOLLIN | EPOLLET; 
+				event.events = EPOLLIN;
 				if(epoll_ctl(efd, EPOLL_CTL_ADD, req.client_socket, &event) == -1){
 					std::cerr << "!!!!! Error epoll_ctl:" << strerror(errno) << std::endl;
 					return;
 				}
 
-				struct epoll_event events[10]; // Adjust size as needed
+				struct epoll_event events[MAX_EVENTS]; // Adjust size as needed
 
 				//Handshake
 				EmbarcaderoReq shake;
@@ -106,14 +103,14 @@ void NetworkManager::ReqReceiveThread(){
 				size_t to_read = sizeof(shake);
 				bool running = true;
 				while(to_read > 0){
- 					n = epoll_wait(efd, events, 10, -1);
+ 					n = epoll_wait(efd, events, MAX_EVENTS, -1);
 					for( i=0; i< n; i++){
-						if(events[i].events & EPOLLIN){
+						if((events[i].events & EPOLLIN) && events[i].data.fd == req.client_socket){
 							int ret = read(req.client_socket, &shake, to_read);
 							to_read -= ret;
 							if(to_read == 0){
 								if(i == n-1){
-									n = epoll_wait(efd, events, 10, -1);
+									n = epoll_wait(efd, events, MAX_EVENTS, -1);
 								}
 								break;
 							}
@@ -128,7 +125,7 @@ void NetworkManager::ReqReceiveThread(){
 
 				while(running){
 					for ( ; i < n; i++) {
-						if(events[i].events & EPOLLIN){
+						if((events[i].events & EPOLLIN)&& events[i].data.fd == req.client_socket){
 								VLOG(3) << "Before recv";
 							int bytes_read = recv(req.client_socket, (uint8_t*)buf + (READ_SIZE - to_read), to_read, 0);
 								VLOG(3) << "Read:"<< bytes_read;
@@ -262,17 +259,39 @@ void NetworkManager::MainThread(){
 		return;
 	}
 
+	// Create epoll instance
+	int efd = epoll_create1(0);
+	if (efd == -1) perror("epoll_create1");
+
+	// Add server socket to epoll
+	struct epoll_event event;
+	event.events = EPOLLIN;
+	event.data.fd = server_socket;
+	if (epoll_ctl(efd, EPOLL_CTL_ADD, server_socket, &event) == -1){
+		perror("epoll_ctl");
+		LOG(INFO) << "epoll_ctl Error" << strerror(errno);
+	}
+	struct epoll_event events[MAX_EVENTS];
+
   while (true) {
-			struct NetworkRequest req;
-			req.req_type = Receive;
-			req.client_socket = accept(server_socket, nullptr, nullptr);
-			if (req.client_socket < 0) {
-					std::cerr << "!!!!! Error accepting connection:" << strerror(errno) << std::endl;
-					break;
-					continue;
+		int n = epoll_wait(efd, events, MAX_EVENTS, -1);
+		for(int i=0; i< n; i++){
+			if (events[i].data.fd == server_socket) {
+				struct NetworkRequest req;
+				req.req_type = Receive;
+				req.efd = efd;
+				struct sockaddr_in client_addr;
+				socklen_t client_addr_len = sizeof(client_addr);
+				req.client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_addr_len);
+				if (req.client_socket < 0) {
+						std::cerr << "!!!!! Error accepting connection:" << strerror(errno) << std::endl;
+						break;
+						continue;
+				}
+				//EnqueueRequest(req);
+				requestQueue_.blockingWrite(req);
 			}
-			//EnqueueRequest(req);
-			requestQueue_.blockingWrite(req);
+		}
    }
 }
 
