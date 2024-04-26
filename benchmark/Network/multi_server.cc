@@ -11,11 +11,15 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <cstring>
+#include <errno.h>
 
 #define PORT 1214
 #define DATA_SIZE 1024
 #define BACKLOG_SIZE 64
-#define NUM_THREADS 16 
+#define NUM_THREADS 1 
+
+#define EPOLL 1
 
 std::atomic<bool> running(true);
 std::atomic<ssize_t> totalBytesReceived(0);
@@ -36,15 +40,17 @@ int make_socket_non_blocking(int sfd) {
 }
 
 void handle_client(int client_sock) {
+	std::cout << "[DEBUG] handle_client called" << std::endl;
 #ifdef EPOLL
 	make_socket_non_blocking(client_sock);
 	int efd = epoll_create1(0);
 	struct epoll_event event;
 	event.data.fd =client_sock;
-	event.eventepolls = EPOLLIN | EPOLLET ; // Edge-triggered for both read and write
+	event.events = EPOLLIN | EPOLLET ; // Edge-triggered for both read and write
 	epoll_ctl(efd, EPOLL_CTL_ADD, client_sock, &event);
 
 	struct epoll_event events[10]; // Adjust size as needed
+	std::cout << "[DEBUG] Created epoll and made socket:" << client_sock << " non blocking" << std::endl;
 #endif
 
 	char data[DATA_SIZE];
@@ -55,8 +61,12 @@ void handle_client(int client_sock) {
 		for (int i = 0; i < n; i++) {
 			if(events[i].events & EPOLLIN){
 #endif
-				if(bytesReceived = recv(client_sock, data, DATA_SIZE, 0))
+				bytesReceived = recv(client_sock, data, DATA_SIZE, 0);
+				if(bytesReceived > 0)
 					totalBytesReceived += bytesReceived;
+				else
+					std::cout << "!!!!!! [DEBUG] read error:" << strerror(errno) << std::endl;
+				std::cout << "[DEBUG] read:" << bytesReceived << std::endl;
 #ifdef EPOLL
 			}
 		}
@@ -109,6 +119,11 @@ int main() {
 		close(server_sock);
 		return 1;
 	}
+	// Add server socket to epoll
+	struct epoll_event event;
+	event.events = EPOLLIN;
+	event.data.fd = server_sock;
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_sock, &event) == -1) error("epoll_ctl");
 
 	std::vector<std::thread> threads;
 	for (int i = 0; i < NUM_THREADS; ++i) {

@@ -20,6 +20,7 @@ enum NetworkRequestType {Acknowledge, Receive, Send};
 struct NetworkRequest{
 	NetworkRequestType req_type;
 	int client_socket;
+	int efd;
 };
 
 struct alignas(64) EmbarcaderoReq{

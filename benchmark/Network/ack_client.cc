@@ -19,7 +19,7 @@ constexpr int PORT = 1214;
 constexpr char SERVER_ADDR[] = "127.0.0.1";
 constexpr int DATA_SIZE = 1024; // Size of the data packet to send
 constexpr int ACK_SIZE = 1024;  // Expected size of acknowledgment packet
-constexpr int NUM_THREADS = 32;
+constexpr int NUM_THREADS = 1;
 
 std::atomic<ssize_t> totalBytesSent(0);
 std::atomic<ssize_t> totalBytesRead(0);
