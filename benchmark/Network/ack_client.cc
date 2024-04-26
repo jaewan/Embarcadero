@@ -45,7 +45,6 @@ void send_data(int tid) {
         perror("Socket creation failed");
         return;
     }
-    sock_fds[tid] = sock;
 
     make_socket_non_blocking(sock);
 

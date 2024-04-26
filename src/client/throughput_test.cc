@@ -75,7 +75,7 @@ void send_data(size_t message_size, size_t total_message_size) {
 	event.events = EPOLLOUT | EPOLLIN | EPOLLET; // Edge-triggered for both read and write
 	char ack[ACK_SIZE];
 #else
-	event.events = EPOLLOUT ; 
+	event.events = EPOLLOUT;
 #endif
 	epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event);
 
@@ -104,19 +104,57 @@ void send_data(size_t message_size, size_t total_message_size) {
 	req.topic[0] = '0';
 	req.ack = 1;
 	req.size = message_size + sizeof(Embarcadero::MessageHeader);
+	int n, i;
+	struct epoll_event events[10]; // Adjust size as needed
+	bool running = true;
+	size_t sent_bytes = 0;
+	while (running) {
+		n = epoll_wait(efd, events, 10, -1);
+		for (i = 0; i < n; i++) {
+			if (events[i].events & EPOLLOUT) {
+				ssize_t bytesSent = send(sock, (int8_t*)(&req) + sent_bytes, sizeof(req), 0);
+				if (bytesSent < 0) {
+					if (errno != EAGAIN) {
+						perror("send failed");
+						running = false;
+						break;
+					}
+				} 
+				sent_bytes += bytesSent;
+				if(sent_bytes == sizeof(req)){
+					running = false;
+					if(i == n-1){
+						i = 0;
+						n = epoll_wait(efd, events, 10, -1);
+					}
+					break;
+				}
+			}
+		}
+	}
+	/*
 	int ret = send(sock, &req, sizeof(req), 0);
 	if(ret <=0 ){
 		LOG(INFO) << "req (Handshake) failed";
 		return;
 	}
-	struct epoll_event events[10]; // Adjust size as needed
-	bool running = true;
+	*/
+	running = true;
+	bool stop_sending = false;
 	while (running) {
-		int n = epoll_wait(efd, events, 10, -1);
-		for (int i = 0; i < n; i++) {
-			if (events[i].events & EPOLLOUT && client_order_ < run_count) {
-				header->client_order = client_order_.fetch_add(1);
+				VLOG(3) << "Sending: " << client_order_ << "/" << run_count;
+		for (; i < n; i++) {
+			if (events[i].events & EPOLLOUT && (!stop_sending || client_order_ < run_count)) {
+				if(!stop_sending && client_order_ >= run_count){
+					stop_sending = true;
+					header->client_id = -1;
+				VLOG(3) << "Finished";
+				}else{
+					header->client_order = client_order_.fetch_add(1);
+				}
+				VLOG(3) << "Sending";
 				ssize_t bytesSent = send(sock, data, message_size, 0);
+				VLOG(3) << "Sent";
 				if (bytesSent < 0) {
 					if (errno != EAGAIN) {
 						perror("send failed");
@@ -147,13 +185,17 @@ void send_data(size_t message_size, size_t total_message_size) {
 				break;
 				//running = false;
 		}
+		n = epoll_wait(efd, events, 10, -1);
+		i = 0;
 	}
+	/*
 	header->client_id = -1;
 	ret = send(sock, (void*)header, sizeof(Embarcadero::MessageHeader), 0);
 	if(ret <=0 ){
 		std::cout<< "End Message Error: " <<strerror(errno) << std::endl;
 		return;
 	}
+	*/
 
 	close(sock);
 	close(efd);
@@ -166,6 +208,7 @@ int main(int argc, char* argv[]) {
 	cxxopts::Options options("embarcadero-throughputTest", "Embarcadero Throughput Test");
 
 	options.add_options()
+				("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
         ("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("1000000000"))
         ("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
         ("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("4"));
@@ -174,6 +217,7 @@ int main(int argc, char* argv[]) {
 	size_t message_size = result["size"].as<size_t>();
 	size_t total_message_size = result["total_message_size"].as<size_t>();
 	size_t num_threads = result["num_thread"].as<size_t>();
+	FLAGS_v = result["log_level"].as<int>();
 
 	LOG(INFO) << "Starting Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
 
