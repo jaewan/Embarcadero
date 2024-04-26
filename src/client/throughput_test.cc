@@ -82,9 +82,10 @@ void send_data(size_t message_size, size_t total_message_size) {
 	char *data = (char*)calloc(message_size+64, sizeof(char));
 
 	Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)data;
-	header->client_id = 0;
+	header->client_id = 2;
 	header->size = message_size;
 	header->total_order = 0;
+	header->client_order = client_order_.fetch_add(1);
 	int padding = message_size % 64;
 	if(padding){
 		padding = 64 - padding;
@@ -98,7 +99,7 @@ void send_data(size_t message_size, size_t total_message_size) {
 
 
 	Embarcadero::EmbarcaderoReq req;
-	req.client_id = 0;
+	req.client_id = 2;
 	req.client_order = 0;
 	memset(req.topic, 0, 32);
 	req.topic[0] = '0';
@@ -112,7 +113,7 @@ void send_data(size_t message_size, size_t total_message_size) {
 		n = epoll_wait(efd, events, 10, -1);
 		for (i = 0; i < n; i++) {
 			if (events[i].events & EPOLLOUT) {
-				ssize_t bytesSent = send(sock, (int8_t*)(&req) + sent_bytes, sizeof(req), 0);
+				ssize_t bytesSent = send(sock, (int8_t*)(&req) + sent_bytes, sizeof(req) - sent_bytes, 0);
 				if (bytesSent < 0) {
 					if (errno != EAGAIN) {
 						perror("send failed");
@@ -132,29 +133,18 @@ void send_data(size_t message_size, size_t total_message_size) {
 			}
 		}
 	}
-	/*
-	int ret = send(sock, &req, sizeof(req), 0);
-	if(ret <=0 ){
-		LOG(INFO) << "req (Handshake) failed";
-		return;
-	}
-	*/
+
+	sent_bytes = 0;
 	running = true;
 	bool stop_sending = false;
 	while (running) {
-				VLOG(3) << "Sending: " << client_order_ << "/" << run_count;
 		for (; i < n; i++) {
-			if (events[i].events & EPOLLOUT && (!stop_sending || client_order_ < run_count)) {
-				if(!stop_sending && client_order_ >= run_count){
+			if (events[i].events & EPOLLOUT && (!stop_sending || header->client_order < run_count)) {
+				if(!stop_sending && header->client_order >= run_count){
 					stop_sending = true;
 					header->client_id = -1;
-				VLOG(3) << "Finished";
-				}else{
-					header->client_order = client_order_.fetch_add(1);
 				}
-				VLOG(3) << "Sending";
-				ssize_t bytesSent = send(sock, data, message_size, 0);
-				VLOG(3) << "Sent";
+				ssize_t bytesSent = send(sock, (uint8_t*)data + sent_bytes, req.size - sent_bytes, 0);
 				if (bytesSent < 0) {
 					if (errno != EAGAIN) {
 						perror("send failed");
@@ -162,6 +152,11 @@ void send_data(size_t message_size, size_t total_message_size) {
 						break;
 					}
 				} 
+				sent_bytes += bytesSent;
+				if(sent_bytes == req.size){
+					sent_bytes = 0;
+					header->client_order = client_order_.fetch_add(1);
+				}
 			}
 #ifdef ACK
 			if (events[i].events & EPOLLIN) {
@@ -178,7 +173,7 @@ void send_data(size_t message_size, size_t total_message_size) {
 			}
 #endif
 		}
-		if (client_order_ >= run_count) { // Example break condition
+		if (header->client_order >= run_count && stop_sending) { // Example break condition
 #ifdef ACK
 			if(totalBytesRead_ >= total_message_size)
 #endif
