@@ -11,11 +11,14 @@
 #include <glog/logging.h>
 #include <cstring>
 #include <errno.h>
+#include "mimalloc.h"
 
 namespace Embarcadero{
 
 #define SKIP_LIST_SIZE 1024
 #define MAX_EVENTS 10
+
+//#define EPOLL 1
 
 inline void make_socket_non_blocking(int sfd) {
 	int flags = fcntl(sfd, F_GETFL, 0);
@@ -84,6 +87,7 @@ void NetworkManager::ReqReceiveThread(){
 
 				{
 				// Set socket as non-blocking and epoll
+#ifdef EPOLL
 				make_socket_non_blocking(req.client_socket);
 				struct epoll_event event;
 				int efd = req.efd;
@@ -95,7 +99,7 @@ void NetworkManager::ReqReceiveThread(){
 					return;
 				}
 
-				struct epoll_event events[MAX_EVENTS]; // Adjust size as needed
+				struct epoll_event events[MAX_EVENTS]; 
 
 				//Handshake
 				EmbarcaderoReq shake;
@@ -123,12 +127,19 @@ void NetworkManager::ReqReceiveThread(){
 				to_read = READ_SIZE;
 				void* buf = malloc(READ_SIZE);
 
+				// Create publish request
+				struct PublishRequest pub_req;
+				pub_req.client_id = shake.client_id;
+				memcpy(pub_req.topic, shake.topic, 31);
+				pub_req.acknowledge = shake.ack;
+				pub_req.client_socket = req.client_socket;
+
 				while(running){
 					for ( ; i < n; i++) {
 						if((events[i].events & EPOLLIN)&& events[i].data.fd == req.client_socket){
 							int bytes_read = recv(req.client_socket, (uint8_t*)buf + (READ_SIZE - to_read), to_read, 0);
 							if(bytes_read <= 0 && errno != EAGAIN){
-								//LOG(INFO) << "Receiving data ERROR:" << strerror(errno);
+								LOG(INFO) << "Receiving data ERROR:" << strerror(errno);
 								break;
 							}
 							to_read -= bytes_read;
@@ -147,47 +158,85 @@ void NetworkManager::ReqReceiveThread(){
 								}
 							}
 							if(to_read == 0){
+								pub_req.size = header->size;
+								pub_req.client_order = header->client_order;
+								pub_req.payload_address = (void*)buf;
+								pub_req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>)); 
+								pub_req.counter->store(2);
+								cxl_manager_->EnqueueRequest(pub_req);
+								disk_manager_->EnqueueRequest(pub_req);
+
+								buf = malloc(READ_SIZE);
 								to_read = READ_SIZE;
-								//TODO(Jae) enqueue
-								//buf = malloc(READ_SIZE);
 							}
 						}
 					}
 					n = epoll_wait(efd, events, 10, -1);
 					i = 0;
-
-					//send(req.client_socket, "1", 1, 0);
-					// Create publish request
-					/*
-					struct PublishRequest pub_req;
-					pub_req.client_id = header->client_id;
-					pub_req.client_order = header->client_order;
-					pub_req.size = header->size;
-					memcpy(pub_req.topic, shake.topic, 31);
-					pub_req.acknowledge = shake.ack;
-					pub_req.payload_address = (void*)buf;
-					pub_req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>)); 
-					pub_req.counter->store(2);
-					pub_req.client_socket = req.client_socket;
-
-					bool close = false;
-					int to_read = (pub_req.size + sizeof(MessageHeader) - bytes_read);
-					while(to_read){
-						int ret = read(req.client_socket, (uint8_t*)buf + bytes_read, to_read);
-						if(ret == 0){
-							close = true;
-							break;
+			}
+#else
+				//Handshake
+				EmbarcaderoReq shake;
+				size_t to_read = sizeof(shake);
+				bool running = true;
+				while(to_read > 0){
+						int ret = recv(req.client_socket, &shake, to_read, 0);
+						if(ret < 0){
+							LOG(INFO) << "Error receiving shake:" << strerror(errno);
+							return;
 						}
 						to_read -= ret;
-						bytes_read += ret;
-					}
-					if(close)
-						break;
-
-					cxl_manager_->EnqueueRequest(pub_req);
-					disk_manager_->EnqueueRequest(pub_req);
-					*/
+						if(to_read == 0){
+							break;
+						}
 				}
+
+				VLOG(3) << "[DEBUG] Publish req shake";
+				size_t READ_SIZE = shake.size;
+				to_read = READ_SIZE;
+				void* buf = malloc(READ_SIZE);
+
+				// Create publish request
+				struct PublishRequest pub_req;
+				pub_req.client_id = shake.client_id;
+				memcpy(pub_req.topic, shake.topic, 31);
+				pub_req.acknowledge = shake.ack;
+				pub_req.client_socket = req.client_socket;
+
+				while(running){
+						int bytes_read = recv(req.client_socket, (uint8_t*)buf + (READ_SIZE - to_read), to_read, 0);
+						if(bytes_read <= 0){
+							LOG(INFO) << "Receiving data ERROR:" << strerror(errno);
+							break;
+						}
+						to_read -= bytes_read;
+						size_t read = READ_SIZE - to_read;
+						MessageHeader *header;
+						if(read > sizeof(MessageHeader)){
+							header = (MessageHeader*)buf;
+							if(header->client_id == -1){
+								VLOG(3) << "Last message received:";
+								mi_free(buf);
+								running = false;
+								//TODO(Jae) we do not want to close it for ack
+								close(req.client_socket);
+								break;
+							}
+						}
+						if(to_read == 0){
+							pub_req.size = header->size;
+							pub_req.client_order = header->client_order;
+							pub_req.payload_address = (void*)buf;
+							pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
+							pub_req.counter->store(2);
+							cxl_manager_->EnqueueRequest(pub_req);
+							disk_manager_->EnqueueRequest(pub_req);
+							buf = mi_malloc(READ_SIZE);
+							to_read = READ_SIZE;
+						}
+				}
+#endif
+
 				//close(req.client_socket);
 				}// end Receive
 				break;
@@ -220,9 +269,9 @@ void NetworkManager::AckThread(){
 			close(req.client_socket);
 		}
 		*/
-			int ret = send(req.client_socket, &buf, 1, 0);
-			if(ret <=0 )
-				std::cout<< strerror(errno) << std::endl;
+		//	int ret = send(req.client_socket, &buf, 1, 0);
+		//	if(ret <=0 )
+		//		std::cout<< strerror(errno) << std::endl;
 	}
 	//TODO(Jae) close socket. Should implemente a counter
 	

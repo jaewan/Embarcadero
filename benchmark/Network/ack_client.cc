@@ -19,7 +19,8 @@ constexpr int PORT = 1214;
 constexpr char SERVER_ADDR[] = "127.0.0.1";
 constexpr int DATA_SIZE = 1024; // Size of the data packet to send
 constexpr int ACK_SIZE = 1024;  // Expected size of acknowledgment packet
-constexpr int NUM_THREADS = 1;
+constexpr int NUM_THREADS = 32;
+constexpr size_t TOTAL_DATA_SIZE = 1000000000;
 
 std::atomic<ssize_t> totalBytesSent(0);
 std::atomic<ssize_t> totalBytesRead(0);
@@ -88,7 +89,7 @@ void send_data(int tid) {
     while (running) {
         int n = epoll_wait(efd, events, 10, -1);
         for (int i = 0; i < n; i++) {
-            if (events[i].events & EPOLLOUT && totalBytesSent < 1000000000) {
+            if (events[i].events & EPOLLOUT && totalBytesSent < TOTAL_DATA_SIZE ) {
                 ssize_t bytesSent = send(sock, data, DATA_SIZE, 0);
                 if (bytesSent < 0) {
                     if (errno != EAGAIN) {
@@ -115,7 +116,7 @@ void send_data(int tid) {
             }
 #endif
         }
-        if (totalBytesSent >= 1000000000) { // Example break condition
+        if (totalBytesSent >= TOTAL_DATA_SIZE ) { // Example break condition
             running = false;
         }
     }

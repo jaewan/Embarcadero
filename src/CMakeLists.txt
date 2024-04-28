@@ -31,6 +31,7 @@ target_include_directories(embarlet PUBLIC
 target_link_libraries(embarlet
 	glog
 	gflags
+	mimalloc
     absl::flat_hash_map 
     peer_grpc_proto
     cxxopts::cxxopts
@@ -52,6 +53,7 @@ target_include_directories(throughput_test PUBLIC
 target_link_libraries(throughput_test 
 	glog
 	gflags
+	mimalloc
     cxxopts::cxxopts
     ${_REFLECTION}
     ${_GRPC_GRPCPP}

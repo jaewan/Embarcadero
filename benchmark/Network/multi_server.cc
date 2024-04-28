@@ -5,7 +5,6 @@
 #include <netinet/tcp.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <string.h>
 #include <arpa/inet.h>
 #include <chrono>
 #include <thread>
@@ -19,7 +18,8 @@
 #define BACKLOG_SIZE 64
 #define NUM_THREADS 1 
 
-#define EPOLL 1
+//#define EPOLL 1
+#define MAX_EVENTS 10
 
 std::atomic<bool> running(true);
 std::atomic<ssize_t> totalBytesReceived(0);
@@ -39,17 +39,16 @@ int make_socket_non_blocking(int sfd) {
 	return 0;
 }
 
-void handle_client(int client_sock) {
+void handle_client(int efd, int client_sock) {
 	std::cout << "[DEBUG] handle_client called" << std::endl;
 #ifdef EPOLL
 	make_socket_non_blocking(client_sock);
-	int efd = epoll_create1(0);
 	struct epoll_event event;
 	event.data.fd =client_sock;
-	event.events = EPOLLIN | EPOLLET ; // Edge-triggered for both read and write
+	event.events = EPOLLIN ; // Edge-triggered for both read and write
 	epoll_ctl(efd, EPOLL_CTL_ADD, client_sock, &event);
 
-	struct epoll_event events[10]; // Adjust size as needed
+	struct epoll_event events[MAX_EVENTS]; // Adjust size as needed
 	std::cout << "[DEBUG] Created epoll and made socket:" << client_sock << " non blocking" << std::endl;
 #endif
 
@@ -57,16 +56,18 @@ void handle_client(int client_sock) {
 	ssize_t bytesReceived;
 	while (running){
 #ifdef EPOLL
-		int n = epoll_wait(efd, events, 10, -1);
+		int n = epoll_wait(efd, events, MAX_EVENTS, -1);
 		for (int i = 0; i < n; i++) {
-			if(events[i].events & EPOLLIN){
+			if(events[i].events & EPOLLIN && events[i].data.fd == client_sock){
 #endif
 				bytesReceived = recv(client_sock, data, DATA_SIZE, 0);
 				if(bytesReceived > 0)
 					totalBytesReceived += bytesReceived;
-				else
+				else{
+					break;
 					std::cout << "!!!!!! [DEBUG] read error:" << strerror(errno) << std::endl;
-				std::cout << "[DEBUG] read:" << bytesReceived << std::endl;
+				}
+				//std::cout << "[DEBUG] read:" << bytesReceived << std::endl;
 #ifdef EPOLL
 			}
 		}
@@ -87,8 +88,8 @@ void accept_clients(int server_sock) {
 			continue;
 		}
 
-		std::thread client_thread(handle_client, client_sock);
-		client_thread.detach();
+		//std::thread client_thread(handle_client, client_sock);
+		//client_thread.detach();
 	}
 }
 
@@ -119,16 +120,29 @@ int main() {
 		close(server_sock);
 		return 1;
 	}
+	std::vector<std::thread> threads;
 	// Add server socket to epoll
+	int efd = epoll_create1(0);
 	struct epoll_event event;
 	event.events = EPOLLIN;
 	event.data.fd = server_sock;
-	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_sock, &event) == -1) error("epoll_ctl");
+	if (epoll_ctl(efd, EPOLL_CTL_ADD, server_sock, &event) == -1) perror("epoll_ctl");
+	struct epoll_event events[MAX_EVENTS];
+	while(true){
+		int n = epoll_wait(efd, events, MAX_EVENTS, -1);
+		for(int i=0; i<n; i++){
+			struct sockaddr_in client_addr;
+			socklen_t client_addr_len = sizeof(client_addr);
+			int client_socket = accept(server_sock, (struct sockaddr*)&client_addr, &client_addr_len);
+			threads.emplace_back(handle_client, efd, client_socket);
+		}
+	}
 
-	std::vector<std::thread> threads;
+	/*
 	for (int i = 0; i < NUM_THREADS; ++i) {
 		threads.emplace_back(accept_clients, server_sock);
 	}
+	*/
 
 	std::cout << "Press ENTER to stop the server..." << std::endl;
 	std::cin.get();

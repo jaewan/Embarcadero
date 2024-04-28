@@ -10,6 +10,7 @@ set(CMAKE_CXX_FLAGS "-Wall -O3")
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 #set(CMAKE_VERBOSE_MAKEFILE ON)
 set(CMAKE_INSTALL_MESSAGE LAZY)
+set(CMAKE_PARALLEL_LEVEL 8)
 
 find_package(gflags REQUIRED)
 find_package(folly REQUIRED)
@@ -17,6 +18,8 @@ add_subdirectory(third_party/cxxopts)
 
 include_directories("/usr/include/glog")
 link_directories("usr/lib64/libglog.so.0")
+include_directories("/usr/local/include/mimalloc-1.8")
+link_directories("/usr/local/lib64")
 
 include(FetchContent)
 set(ABSL_ENABLE_INSTALL ON) # bug fix: https://stackoverflow.com/questions/76697852/using-fetchcontent-to-retrieve-protobuf-and-grpc-to-compile-during-build-hermet

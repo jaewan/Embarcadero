@@ -9,6 +9,7 @@
 #include <cstring>
 #include <errno.h>
 #include <glog/logging.h>
+#include "mimalloc.h"
 
 namespace Embarcadero{
 
@@ -148,8 +149,8 @@ void CXLManager::CXL_io_thread(){
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1);
 		if( counter == 1){
-			free(req.counter);
-			free(req.payload_address);
+			mi_free(req.counter);
+			mi_free(req.payload_address);
 #ifdef InternalTest
 			if(reqCount_.fetch_add(1) == 999999){
 				auto end = std::chrono::high_resolution_clock::now();
