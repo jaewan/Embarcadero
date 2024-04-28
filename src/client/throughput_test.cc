@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
+#include <mimalloc.h>
 
 #include "common/config.h"
 #include "../cxl_manager/cxl_manager.h"
@@ -183,17 +184,9 @@ void send_data(size_t message_size, size_t total_message_size) {
 		n = epoll_wait(efd, events, 10, -1);
 		i = 0;
 	}
-	/*
-	header->client_id = -1;
-	ret = send(sock, (void*)header, sizeof(Embarcadero::MessageHeader), 0);
-	if(ret <=0 ){
-		std::cout<< "End Message Error: " <<strerror(errno) << std::endl;
-		return;
-	}
-	*/
-
 	close(sock);
 	close(efd);
+	free(data);
 }
 
 int main(int argc, char* argv[]) {
@@ -204,9 +197,9 @@ int main(int argc, char* argv[]) {
 
 	options.add_options()
 				("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
-        ("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("1000000000"))
+        ("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10000000000"))
         ("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
-        ("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("4"));
+        ("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("32"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();

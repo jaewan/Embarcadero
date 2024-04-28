@@ -52,15 +52,16 @@ class NetworkManager{
 		}
 
 	private:
-		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
-		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
 		void ReqReceiveThread();
 		void MainThread();
 		void AckThread();
 		int GetBuffer();
 
+		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
+		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
 		std::vector<std::thread> threads_;
 		int num_reqReceive_threads_;
+
 		std::atomic<int> thread_count_{0};
 		bool stop_threads_ = false;
 

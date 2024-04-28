@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
+#include "mimalloc.h"
 
 namespace Embarcadero{
 
@@ -65,8 +66,8 @@ void DiskManager::Disk_io_thread(){
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1,std::memory_order_release);
 		if( counter == 1){
-			free(req.counter);
-			free(req.payload_address);
+			mi_free(req.counter);
+			mi_free(req.payload_address);
 		}else if(req.acknowledge){
 			struct NetworkRequest ackReq;
 			ackReq.req_type = Acknowledge;

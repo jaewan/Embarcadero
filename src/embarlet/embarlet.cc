@@ -268,9 +268,9 @@ int main(int argc, char* argv[]){
 	//Initialize
 	//size_t num_cores = GetPhysicalCoreCount();
 	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager(4000,broker_id);
-	Embarcadero::DiskManager disk_manager(4000);
-	Embarcadero::NetworkManager network_manager(4000, NUM_NETWORK_IO_THREADS);
+	Embarcadero::CXLManager cxl_manager(1000000,broker_id);
+	Embarcadero::DiskManager disk_manager(1000000);
+	Embarcadero::NetworkManager network_manager(1000, NUM_NETWORK_IO_THREADS);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
 	cxl_manager.SetTopicManager(&topic_manager);
