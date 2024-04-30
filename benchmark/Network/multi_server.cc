@@ -16,10 +16,9 @@
 #define PORT 1214
 #define DATA_SIZE 1024
 #define BACKLOG_SIZE 64
-#define NUM_THREADS 1 
 
-//#define EPOLL 1
-#define MAX_EVENTS 10
+#define EPOLL 1
+#define MAX_EVENTS 100
 
 std::atomic<bool> running(true);
 std::atomic<ssize_t> totalBytesReceived(0);
@@ -45,7 +44,7 @@ void handle_client(int efd, int client_sock) {
 	make_socket_non_blocking(client_sock);
 	struct epoll_event event;
 	event.data.fd =client_sock;
-	event.events = EPOLLIN ; // Edge-triggered for both read and write
+	event.events = EPOLLIN | EPOLLET ; // Edge-triggered for both read and write
 	epoll_ctl(efd, EPOLL_CTL_ADD, client_sock, &event);
 
 	struct epoll_event events[MAX_EVENTS]; // Adjust size as needed
@@ -71,26 +70,11 @@ void handle_client(int efd, int client_sock) {
 #ifdef EPOLL
 			}
 		}
+	  event.events = EPOLLIN; // Level-triggered
+		epoll_ctl(efd, EPOLL_CTL_MOD, client_sock, &event);
 #endif
 	}
 	close(client_sock);
-}
-
-void accept_clients(int server_sock) {
-	while (running) {
-		sockaddr_in client_addr;
-		socklen_t client_addr_len = sizeof(client_addr);
-		int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
-		if (client_sock < 0) {
-			if (running) {
-				perror("Accept failed");
-			}
-			continue;
-		}
-
-		//std::thread client_thread(handle_client, client_sock);
-		//client_thread.detach();
-	}
 }
 
 int main() {
@@ -100,6 +84,7 @@ int main() {
 		return 1;
 	}
 
+	make_socket_non_blocking(server_sock);
 	int flag = 1;
 	setsockopt(server_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
 
@@ -131,18 +116,14 @@ int main() {
 	while(true){
 		int n = epoll_wait(efd, events, MAX_EVENTS, -1);
 		for(int i=0; i<n; i++){
-			struct sockaddr_in client_addr;
-			socklen_t client_addr_len = sizeof(client_addr);
-			int client_socket = accept(server_sock, (struct sockaddr*)&client_addr, &client_addr_len);
-			threads.emplace_back(handle_client, efd, client_socket);
+			if(events[i].events & EPOLLIN && events[i].data.fd == server_sock){
+				struct sockaddr_in client_addr;
+				socklen_t client_addr_len = sizeof(client_addr);
+				int client_socket = accept(server_sock, (struct sockaddr*)&client_addr, &client_addr_len);
+				threads.emplace_back(handle_client, efd, client_socket);
+			}
 		}
 	}
-
-	/*
-	for (int i = 0; i < NUM_THREADS; ++i) {
-		threads.emplace_back(accept_clients, server_sock);
-	}
-	*/
 
 	std::cout << "Press ENTER to stop the server..." << std::endl;
 	std::cin.get();

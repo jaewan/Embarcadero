@@ -17,9 +17,9 @@ namespace Embarcadero{
 #define TOPIC_NAME_SIZE 31
 #define SEGMENT_SIZE (1UL << 37)
 #define NUM_DISK_IO_THREADS 32 
-#define NUM_CXL_IO_THREADS 64 
+#define NUM_CXL_IO_THREADS 128 
 #define NUM_NETWORK_IO_THREADS 32
-#define NUM_ACK_THREADS 16
+#define NUM_ACK_THREADS 1
 
 //********* Health check configs *********
 /// The delay to send the first health check

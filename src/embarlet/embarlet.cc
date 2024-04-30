@@ -11,49 +11,15 @@
 #include <iostream>
 #include <string>
 #include <set>
-
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <emmintrin.h>
-
 #include <thread>
+
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
-void memcpy_nt(void* dst, const void* src, size_t size) {
-    // Cast the input pointers to the appropriate types
-    uint8_t* d = static_cast<uint8_t*>(dst);
-    const uint8_t* s = static_cast<const uint8_t*>(src);
-
-    // Align the destination pointer to 16-byte boundary
-    size_t alignment = reinterpret_cast<uintptr_t>(d) & 0xF;
-    if (alignment) {
-        alignment = 16 - alignment;
-        size_t copy_size = (alignment > size) ? size : alignment;
-        std::memcpy(d, s, copy_size);
-        d += copy_size;
-        s += copy_size;
-        size -= copy_size;
-    }
-
-    // Copy the bulk of the data using non-temporal stores
-    size_t block_size = size / 64;
-    for (size_t i = 0; i < block_size; ++i) {
-        _mm_stream_si64(reinterpret_cast<long long*>(d), *reinterpret_cast<const long long*>(s));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 8), *reinterpret_cast<const long long*>(s + 8));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 16), *reinterpret_cast<const long long*>(s + 16));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 24), *reinterpret_cast<const long long*>(s + 24));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 32), *reinterpret_cast<const long long*>(s + 32));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 40), *reinterpret_cast<const long long*>(s + 40));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 48), *reinterpret_cast<const long long*>(s + 48));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 56), *reinterpret_cast<const long long*>(s + 56));
-        d += 64;
-        s += 64;
-    }
-
-    // Copy the remaining data using standard memcpy
-    std::memcpy(d, s, size % 64);
-}
+#include "mimalloc.h"
 
 size_t GetPhysicalCoreCount(){
 	std::ifstream cpuinfo("/proc/cpuinfo");
@@ -88,14 +54,15 @@ size_t GetPhysicalCoreCount(){
 }
 
 Embarcadero::TopicManager *t;
-#define LOOPLEN 10
+#define LOOPLEN 250000
 #define NUM_TOPICS 1
-double NUM_THREADS = 10;
+double NUM_THREADS = 40;
 void CXLWriteBandwidthTest(int tid){
 	Embarcadero::PublishRequest req;
 	memset(req.topic, 0, 31);
 	std::sprintf(req.topic, "%d", tid%NUM_TOPICS);
 	req.client_id = 0;
+	req.acknowledge = 1;
 	req.client_order = 1;
 	req.size = 1024-64;
 	for(int i=0; i<LOOPLEN; i++){
@@ -112,6 +79,68 @@ void CXLWriteBandwidthTest(int tid){
 		t->PublishToCXL(req);
 		free(req.payload_address);
 	}
+}
+
+std::atomic<size_t> client_order_{0};
+Embarcadero::CXLManager *cxl_manager_;
+Embarcadero::DiskManager *disk_manager_;
+Embarcadero::NetworkManager *network_manager_;
+
+void SimulateNetworkManager(size_t message_size){
+	Embarcadero::PublishRequest req;
+	memset(req.topic, 0, 31);
+	//std::sprintf(req.topic, "%d", tid%NUM_TOPICS);
+	std::sprintf(req.topic, "%d", 0);
+	req.client_id = 1;
+	req.acknowledge = true;
+	req.client_order = client_order_.fetch_add(1);
+	req.size = message_size;
+	int padding = message_size % 64;
+	if(padding)
+		padding = 64 - padding;
+	size_t padded_size = message_size + padding + sizeof(Embarcadero::MessageHeader);
+	for(int i=0; i<LOOPLEN; i++){
+		req.payload_address = mi_malloc(padded_size);
+		Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
+		header->client_id = 1;
+		header->client_order = req.client_id;
+		header->size = req.size;
+		header->total_order = 0;
+		header->paddedSize = padded_size;
+		header->segment_header = nullptr;
+		header->logical_offset = (size_t)-1; // Sentinel value
+		header->next_message = nullptr;
+		req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
+		req.counter->store(2);
+		cxl_manager_->EnqueueRequest(req);
+		disk_manager_->EnqueueRequest(req);
+	}
+}
+
+//End to end test
+void E2ETest(size_t message_size){
+		LOG(INFO) << "Starting E2ETest";
+    std::vector<std::thread> threads;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (double i = 0; i < NUM_THREADS; ++i) {
+        threads.emplace_back(SimulateNetworkManager, message_size);
+    }
+		LOG(INFO) << "Spawned network manger simulation";
+    // Join threads
+    for (double i = 0; i < NUM_THREADS; ++i) {
+        threads[i].join();
+    }
+		LOG(INFO) << "Enqueued all reqs. Waiting for ack...";
+		network_manager_->WaitUntilAcked();
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+
+    double bytes_written = NUM_THREADS * LOOPLEN * message_size;
+    double bandwidth = bytes_written / (duration.count()*1024*1024); // Convert bytes to MB
+
+    std::cout << "Runtime: " << duration.count() << std::endl;
+    std::cout << "Internal Publish bandwidth: " << bandwidth << " GB/s" << std::endl;
 }
 
 //Topic Manager Test
@@ -156,14 +185,14 @@ void RawCXLWriteTest(){
 	void* last_addr = nullptr;
 	void* messages;
 	size_t messages_size;
-	size_t off = 0;
-	size_t to_read_msg = LOOPLEN*1024*NUM_THREADS;
 		if(cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)){
 			std::cout << "read :" << last_offset<< std::endl;
 		}else{
 			std::cout << "Did not read anything" << std::endl;
 		}
 	/*
+	size_t to_read_msg = LOOPLEN*1024*NUM_THREADS;
+	size_t off = 0;
 	while(to_read_msg > 0){
 		if(cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)){
 			Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)messages;
@@ -201,7 +230,7 @@ void ReadWriteTest(){
 	req.counter->store(1);
 
 	req.payload_address = malloc(1024);;
-	memcpy(req.payload_address + 64, "testing write read", 18);
+	memcpy((uint8_t*)req.payload_address + 64, "testing write read", 18);
 					Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
 					header->client_id = 0;
 					header->client_order = 0;
@@ -222,7 +251,7 @@ void ReadWriteTest(){
 	req1.payload_address = malloc(1024);;
 	req1.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>));
 	req1.counter->store(1);
-	memcpy(req1.payload_address + 64, "Second Message", 14);
+	memcpy((uint8_t*)req1.payload_address + 64, "Second Message", 14);
 					header = (Embarcadero::MessageHeader*)req1.payload_address;
 					header->client_id = 0;
 					header->client_order = 1;
@@ -268,9 +297,9 @@ int main(int argc, char* argv[]){
 	//Initialize
 	//size_t num_cores = GetPhysicalCoreCount();
 	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager(1000000,broker_id);
-	Embarcadero::DiskManager disk_manager(1000000);
-	Embarcadero::NetworkManager network_manager(1000, NUM_NETWORK_IO_THREADS);
+	Embarcadero::CXLManager cxl_manager(10000000,broker_id);
+	Embarcadero::DiskManager disk_manager(10000000);
+	Embarcadero::NetworkManager network_manager(1000, NUM_NETWORK_IO_THREADS,true);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
 	cxl_manager.SetTopicManager(&topic_manager);
@@ -305,6 +334,13 @@ int main(int argc, char* argv[]){
 
 	std::cout << "You are now safe to go" << std::endl;
 	//cxl_manager.StartInternalTest();
+	
+	// *********** E2E Bandwidth Teste ******************* //
+	cxl_manager_ = &cxl_manager;
+	disk_manager_ = &disk_manager;
+	network_manager_ = &network_manager;
+	E2ETest(1024);
+
 	while(true){
 	std::this_thread::yield();
 	sleep(100);
