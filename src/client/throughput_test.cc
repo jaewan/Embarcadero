@@ -20,6 +20,7 @@
 
 #define ACK_SIZE 1024
 #define SERVER_ADDR "127.0.0.1"
+#define CLIENT_ID 1
 
 std::atomic<size_t> totalBytesRead_(0);
 std::atomic<size_t> client_order_(0);
@@ -39,7 +40,7 @@ int make_socket_non_blocking(int sfd) {
 	return 0;
 }
 
-void send_data(size_t message_size, size_t total_message_size) {
+void send_data(size_t message_size, size_t total_message_size, int ack_level) {
 	int sock = socket(AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
 		perror("Socket creation failed");
@@ -48,7 +49,14 @@ void send_data(size_t message_size, size_t total_message_size) {
 
 	make_socket_non_blocking(sock);
 
-	int flag = 1;
+	// Set the SO_REUSEADDR option
+	int flag = 1; // Enable the option
+	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
+			perror("setsockopt(SO_REUSEADDR) failed");
+			close(sock);
+			return ;
+	}
+
 	if(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
 		perror("setsockopt error");
 		close(sock);
@@ -83,7 +91,7 @@ void send_data(size_t message_size, size_t total_message_size) {
 	char *data = (char*)calloc(message_size+64, sizeof(char));
 
 	Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)data;
-	header->client_id = 2;
+	header->client_id = CLIENT_ID;
 	header->size = message_size;
 	header->total_order = 0;
 	header->client_order = client_order_.fetch_add(1);
@@ -100,16 +108,17 @@ void send_data(size_t message_size, size_t total_message_size) {
 
 
 	Embarcadero::EmbarcaderoReq req;
-	req.client_id = 2;
+	req.client_id = CLIENT_ID;
 	req.client_order = 0;
 	memset(req.topic, 0, 32);
 	req.topic[0] = '0';
-	req.ack = 1;
+	req.ack = ack_level;
 	req.size = message_size + sizeof(Embarcadero::MessageHeader);
 	int n, i;
 	struct epoll_event events[10]; // Adjust size as needed
 	bool running = true;
 	size_t sent_bytes = 0;
+	VLOG(3) << "Start publishing  on fd" << sock;
 	while (running) {
 		n = epoll_wait(efd, events, 10, -1);
 		for (i = 0; i < n; i++) {
@@ -189,6 +198,80 @@ void send_data(size_t message_size, size_t total_message_size) {
 	free(data);
 }
 
+void read_ack(size_t TOTAL_DATA_SIZE, size_t message_size){
+    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        perror("Socket creation failed");
+        return ;
+    }
+
+    int flag = 1;
+		if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
+				perror("setsockopt(SO_REUSEADDR) failed");
+				close(server_sock);
+				return ;
+		}
+    setsockopt(server_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+
+    sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT + CLIENT_ID);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        close(server_sock);
+        return ;
+    }
+
+    if (listen(server_sock, SOMAXCONN) < 0) {
+        perror("Listen failed");
+        close(server_sock);
+        return ;
+    }
+
+		sockaddr_in client_addr;
+		socklen_t client_addr_len = sizeof(client_addr);
+		int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
+		if (client_sock < 0) {
+			perror("Accept failed");
+			return;
+		}
+		/*
+    int efd = epoll_create1(0);
+    struct epoll_event event;
+    event.data.fd = client_sock;
+    event.events = EPOLLIN ; // Edge-triggered for both read and write
+    epoll_ctl(efd, EPOLL_CTL_ADD, client_sock, &event);
+
+    struct epoll_event events[10]; // Adjust size as needed
+		*/
+
+    char *data = (char*)calloc(TOTAL_DATA_SIZE/message_size, sizeof(char));
+    ssize_t bytesReceived;
+		int to_read = 1;//TOTAL_DATA_SIZE/message_size;
+		VLOG(3) << "Start reading ack: " << to_read << " on fd" << client_sock;
+    while (to_read > 0){
+		/*
+			int n = epoll_wait(efd, events, 10, -1);
+			for (int i = 0; i < n; i++) {
+				if(events[i].events & EPOLLIN){
+				*/
+						VLOG(4) << "Before reading" ;
+					if(bytesReceived = recv(client_sock, (uint8_t*)data + (TOTAL_DATA_SIZE/message_size - to_read) , 1024, 0)){
+						to_read -= bytesReceived;
+						VLOG(4) << "Ack received:" << bytesReceived;
+					}else{
+						perror("Read error");
+					}
+				//}
+		//	}
+    }
+		free(data);
+    close(client_sock);
+}
+
 int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
@@ -197,7 +280,8 @@ int main(int argc, char* argv[]) {
 
 	options.add_options()
 				("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
-        ("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10000000000"))
+				("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
+        ("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
         ("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
         ("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("32"));
 
@@ -205,14 +289,18 @@ int main(int argc, char* argv[]) {
 	size_t message_size = result["size"].as<size_t>();
 	size_t total_message_size = result["total_message_size"].as<size_t>();
 	size_t num_threads = result["num_thread"].as<size_t>();
+	int ack_level = result["ack_level"].as<int>();
 	FLAGS_v = result["log_level"].as<int>();
 
 	LOG(INFO) << "Starting Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
 
 	auto start = std::chrono::high_resolution_clock::now();
 	std::vector<std::thread> threads;
+	if(ack_level > 0){
+		threads.emplace_back(read_ack, total_message_size, message_size);
+	}
 	for (size_t i = 0; i < num_threads; ++i) {
-		threads.emplace_back(send_data, message_size, total_message_size);
+		threads.emplace_back(send_data, message_size, total_message_size, ack_level);
 	}
 
 	for (auto &t : threads) {

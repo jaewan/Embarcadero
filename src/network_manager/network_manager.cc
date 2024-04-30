@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <glog/logging.h>
 #include <cstring>
+#include <sstream>
 #include <errno.h>
 #include "mimalloc.h"
 
@@ -34,14 +35,19 @@ inline void make_socket_non_blocking(int sfd) {
 	}
 }
 
-NetworkManager::NetworkManager(size_t queueCapacity, int num_reqReceive_threads):
+NetworkManager::NetworkManager(size_t queueCapacity, int num_reqReceive_threads, bool test):
 						 requestQueue_(queueCapacity),
-						 ackQueue_(5000),
+						 ackQueue_(10000000),
 						 num_reqReceive_threads_(num_reqReceive_threads){
 	// Create Network I/O threads
 	threads_.emplace_back(&NetworkManager::MainThread, this);
-	for (int i=0; i< NUM_ACK_THREADS; i++)
-		threads_.emplace_back(&NetworkManager::AckThread, this);
+	if(test){
+		for (int i=0; i< NUM_ACK_THREADS; i++)
+			threads_.emplace_back(&NetworkManager::TestAckThread, this);
+	}else{
+		for (int i=0; i< NUM_ACK_THREADS; i++)
+			threads_.emplace_back(&NetworkManager::AckThread, this);
+	}
 	for (int i=0; i< num_reqReceive_threads; i++)
 		threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
 
@@ -86,6 +92,9 @@ void NetworkManager::ReqReceiveThread(){
 				//TODO(Jae) define if its publish or subscribe
 
 				{
+				struct sockaddr_in client_address;
+				socklen_t client_address_len = sizeof(client_address);
+				getpeername(req.client_socket, (struct sockaddr*)&client_address, &client_address_len);
 				// Set socket as non-blocking and epoll
 #ifdef EPOLL
 				make_socket_non_blocking(req.client_socket);
@@ -166,7 +175,7 @@ void NetworkManager::ReqReceiveThread(){
 								cxl_manager_->EnqueueRequest(pub_req);
 								disk_manager_->EnqueueRequest(pub_req);
 
-								buf = malloc(READ_SIZE);
+								buf = mi_malloc(READ_SIZE);
 								to_read = READ_SIZE;
 							}
 						}
@@ -191,7 +200,60 @@ void NetworkManager::ReqReceiveThread(){
 						}
 				}
 
-				VLOG(3) << "[DEBUG] Publish req shake";
+				VLOG(3) << "[DEBUG] Publish req shake finished";
+				//TODO(Jae) This code asumes there's only one active client publishing
+				// If there are parallel clients, change the ack queue
+				int ack_fd = req.client_socket;
+				if(shake.ack){
+					absl::MutexLock lock(&ack_mu_);
+					auto it = ack_connections_.find(shake.client_id);
+					if(it != ack_connections_.end()){
+						ack_fd = it->second;
+					}else{
+						int ack_fd = socket(AF_INET, SOCK_STREAM, 0);
+						if (ack_fd < 0) {
+							perror("Socket creation failed");
+							return;
+						}
+
+						make_socket_non_blocking(ack_fd);
+
+						int flag = 1;
+						if (setsockopt(ack_fd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
+								perror("setsockopt(SO_REUSEADDR) failed");
+								close(ack_fd);
+								return ;
+						}
+						if(setsockopt(ack_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
+							perror("setsockopt error");
+							close(ack_fd);
+							return;
+						}
+
+						sockaddr_in server_addr; 
+						memset(&server_addr, 0, sizeof(server_addr));
+						server_addr.sin_family = AF_INET;
+						server_addr.sin_family = AF_INET;
+						server_addr.sin_port = ntohs(PORT+shake.client_id);
+						server_addr.sin_addr.s_addr = inet_addr(inet_ntoa(client_address.sin_addr));
+						VLOG(3) << "[DEBUG] Ack connecting to:" << (PORT + shake.client_id);
+						if (connect(ack_fd, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+							if (errno != EINPROGRESS) {
+								perror("Connect failed");
+								close(ack_fd);
+								return;
+							}
+						}
+						VLOG(3) << "[DEBUG] Ack connected to:" << (PORT + shake.client_id);
+						ack_fd_ = ack_fd;
+						ack_efd_ = epoll_create1(0);
+						struct epoll_event event;
+						event.data.fd = ack_fd;
+						event.events = EPOLLOUT; 
+						epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event);
+						ack_connections_[shake.client_id] = ack_fd;
+					}
+				}
 				size_t READ_SIZE = shake.size;
 				to_read = READ_SIZE;
 				void* buf = malloc(READ_SIZE);
@@ -201,7 +263,7 @@ void NetworkManager::ReqReceiveThread(){
 				pub_req.client_id = shake.client_id;
 				memcpy(pub_req.topic, shake.topic, 31);
 				pub_req.acknowledge = shake.ack;
-				pub_req.client_socket = req.client_socket;
+				pub_req.client_socket = ack_fd;
 
 				while(running){
 						int bytes_read = recv(req.client_socket, (uint8_t*)buf + (READ_SIZE - to_read), to_read, 0);
@@ -230,7 +292,7 @@ void NetworkManager::ReqReceiveThread(){
 							pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
 							pub_req.counter->store(2);
 							cxl_manager_->EnqueueRequest(pub_req);
-							disk_manager_->EnqueueRequest(pub_req);
+							//disk_manager_->EnqueueRequest(pub_req);
 							buf = mi_malloc(READ_SIZE);
 							to_read = READ_SIZE;
 						}
@@ -247,34 +309,97 @@ void NetworkManager::ReqReceiveThread(){
 	}
 }
 
-void NetworkManager::AckThread(){
+void NetworkManager::TestAckThread(){
 	std::optional<struct NetworkRequest> optReq;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	char buf = '1';
-	//static std::atomic<int> DEBUG_Ack_num[100] = {};
 
+	VLOG(3) << "[DEBUG] Testack started" ;
 	while(!stop_threads_){
 		ackQueue_.blockingRead(optReq);
 		if(!optReq.has_value()){
 			break;
 		}
-		const struct NetworkRequest &req = optReq.value();
-		//std::cout << "[DEBUG] socket:" << req.client_socket << std::endl;
+		if(ack_count_.fetch_add(1) == 9999999){
+			test_acked_all_ = true;
+		}
+	VLOG(3) << "[DEBUG] acked:" << ack_count_ ;
+	}
+}
+void NetworkManager::AckThread(){
+	std::optional<struct NetworkRequest> optReq;
+	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	char buf[1000000];
+	struct epoll_event events[10]; // Adjust size as needed
+
+		VLOG(3) << "[DEBUG] ack started" ;
+	while(!stop_threads_){
+		size_t ack_count = 0;
 		/*
-		if(DEBUG_Ack_num[req.client_socket].fetch_add(1) == 9999){
-			int ret = send(req.client_socket, &buf, 1, 0);
-			std::cout << "Acked:" << req.client_socket << std::endl;
-			if(ret <=0 )
-				std::cout<< strerror(errno) << std::endl;
-			close(req.client_socket);
+		ackQueue_.blockingRead(optReq);
+		if(!optReq.has_value()){
+			break;
+		}
+		const struct NetworkRequest &req = optReq.value();
+		*/
+		/*
+		while(ackQueue_.read(optReq)){
+			ack_count++;
+			if(!optReq.has_value()){
+				break;
+			}
 		}
 		*/
-		//	int ret = send(req.client_socket, &buf, 1, 0);
-		//	if(ret <=0 )
-		//		std::cout<< strerror(errno) << std::endl;
+		size_t DEBUG_num_total_ack = 10066329600/960;
+		while(ack_count != DEBUG_num_total_ack){
+			ackQueue_.blockingRead(optReq);
+			if(!optReq.has_value()){
+				break;
+			}
+			ack_count++;
+		}
+		size_t acked_size = 0;
+		while (acked_size < 1) {
+			int n = epoll_wait(ack_efd_, events, 10, -1);
+			for (int i = 0; i < n; i++) {
+				if (events[i].events & EPOLLOUT && acked_size < 1 ) {
+					ssize_t bytesSent = send(ack_fd_, buf, 1, 0);
+					if (bytesSent < 0) {
+						if (errno != EAGAIN) {
+							perror("Ack send failed");
+							return;
+							break;
+						}
+					} else {
+						acked_size += bytesSent;
+					}
+				}
+			}
+		}
+		/*
+		size_t acked_size = 0;
+		while (acked_size < ack_count) {
+			int n = epoll_wait(ack_efd_, events, 10, -1);
+			for (int i = 0; i < n; i++) {
+				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
+					ssize_t bytesSent = send(ack_fd_, buf, ack_count - acked_size, 0);
+					if (bytesSent < 0) {
+						if (errno != EAGAIN) {
+							perror("Ack send failed");
+							return;
+							break;
+						}
+					} else {
+						acked_size += bytesSent;
+					}
+				}
+			}
+		}
+		*/
+		if(ack_count > 0 && !optReq.has_value()){
+		//if(!optReq.has_value()){
+			break;
+		}
 	}
-	//TODO(Jae) close socket. Should implemente a counter
-	
 }
 
 void NetworkManager::MainThread(){
@@ -285,6 +410,11 @@ void NetworkManager::MainThread(){
 		LOG(INFO) << "Socket Creation Failed";
 	}
 	int flag = 1;
+	if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
+			perror("setsockopt(SO_REUSEADDR) failed");
+			close(server_socket);
+			return ;
+	}
 	setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
 
 	//make_socket_non_blocking(server_socket);

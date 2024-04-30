@@ -160,6 +160,7 @@ void CXLManager::CXL_io_thread(){
 			}
 #endif
 		}else if(req.acknowledge){
+			VLOG(3) << "Calling ack";
 			struct NetworkRequest ackReq;
 			ackReq.req_type = Acknowledge;
 			ackReq.client_socket = req.client_socket;

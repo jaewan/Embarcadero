@@ -64,11 +64,13 @@ void DiskManager::Disk_io_thread(){
 		pwrite(log_fd_, req.payload_address, req.size, off);
 
 		// Post I/O work (as disk I/O depend on the same payload)
+			VLOG(3) << "is ack:" << req.acknowledge;
 		int counter = req.counter->fetch_sub(1,std::memory_order_release);
 		if( counter == 1){
 			mi_free(req.counter);
 			mi_free(req.payload_address);
 		}else if(req.acknowledge){
+			VLOG(3) << "Calling ack";
 			struct NetworkRequest ackReq;
 			ackReq.req_type = Acknowledge;
 			ackReq.client_socket = req.client_socket;
