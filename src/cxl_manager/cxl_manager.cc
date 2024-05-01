@@ -18,7 +18,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	broker_id_(broker_id),
 	num_io_threads_(num_io_threads){
 	// Initialize CXL
-	cxl_type_ = Emul;
+	cxl_type_ = Real;
 	std::string cxl_path(getenv("HOME"));
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
@@ -39,7 +39,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 		perror("Mapping Emulated CXL error");
 	}
 	//memset(cxl_addr_, 0, CXL_SIZE);
-	memset(cxl_addr_, 0, (1UL<<30));
+	memset(cxl_addr_, 0, (1UL<<34));
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&CXLManager::CXL_io_thread, this);
@@ -129,9 +129,14 @@ CXLManager::~CXLManager(){
 	std::cout << "[CXLManager]: \tDestructed" << std::endl;
 }
 
+
 void CXLManager::CXL_io_thread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct PublishRequest> optReq;
+	/*
+	static std::atomic<size_t> DEBUG_1{0};
+	static std::atomic<size_t> DEBUG_2{0};
+	*/
 
 #ifdef InternalTest
 	while(startInternalTest_.load() == false){}
@@ -142,9 +147,22 @@ void CXLManager::CXL_io_thread(){
 			break;
 		}
 		struct PublishRequest &req = optReq.value();
+		/*
+		if(DEBUG_1.fetch_add(1) == 9999999){
+			VLOG(3) << "All requests popped";
+			DEBUG_1_passed_ = true;
+		}
+		*/
 
 		// Actual IO to the CXL
 		topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
+
+		/*
+		if(DEBUG_2.fetch_add(1) == 9999999){
+			VLOG(3) << "All requests Written";
+			DEBUG_2_passed_ = true;
+		}
+		*/
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1);
@@ -160,7 +178,6 @@ void CXLManager::CXL_io_thread(){
 			}
 #endif
 		}else if(req.acknowledge){
-			VLOG(3) << "Calling ack";
 			struct NetworkRequest ackReq;
 			ackReq.req_type = Acknowledge;
 			ackReq.client_socket = req.client_socket;

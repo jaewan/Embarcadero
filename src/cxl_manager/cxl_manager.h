@@ -96,6 +96,19 @@ class CXLManager{
 		void StartInternalTest();
 #endif
 
+		void Wait1(){
+			while(DEBUG_1_passed_==false){
+				std::this_thread::yield();
+			}
+			return;
+		}
+		void Wait2(){
+			while(DEBUG_2_passed_ == false){
+				std::this_thread::yield();
+			}
+			return;
+		}
+
 		private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
 		int broker_id_;
@@ -114,6 +127,8 @@ class CXLManager{
 		void* current_log_addr_;
 		bool stop_threads_ = false;
 		std::atomic<int> thread_count_{0};
+		bool DEBUG_1_passed_ = false;
+		bool DEBUG_2_passed_ = false;
 
 		void CXL_io_thread();
 		void Sequencer1(char* topic);

@@ -120,27 +120,41 @@ void SimulateNetworkManager(size_t message_size){
 //End to end test
 void E2ETest(size_t message_size){
 		LOG(INFO) << "Starting E2ETest";
+
+    double bytes_written = NUM_THREADS * LOOPLEN * message_size;
+		bytes_written = bytes_written/(double)(1024*1024);
+
     std::vector<std::thread> threads;
     auto start = std::chrono::high_resolution_clock::now();
     for (double i = 0; i < NUM_THREADS; ++i) {
         threads.emplace_back(SimulateNetworkManager, message_size);
     }
 		LOG(INFO) << "Spawned network manger simulation";
+		cxl_manager_->Wait1();
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    //std::cout << " 1 MPMC bandwidth: " << bytes_written/duration.count() << " MB/s" << std::endl;
+		VLOG(3)<< " 1 MPMC bandwidth: " << bytes_written/duration.count() << " MB/s";
     // Join threads
     for (double i = 0; i < NUM_THREADS; ++i) {
         threads[i].join();
     }
 		LOG(INFO) << "Enqueued all reqs. Waiting for ack...";
+
+		cxl_manager_->Wait2();
+    end = std::chrono::high_resolution_clock::now();
+    duration = end - start;
+		VLOG(3)<< " 2 MPMC bandwidth: " << bytes_written/duration.count() << " MB/s";
+    //std::cout << " 2 MPMC bandwidth: " << bytes_written/duration.count() << " MB/s" << std::endl;
 		network_manager_->WaitUntilAcked();
 
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end - start;
+    end = std::chrono::high_resolution_clock::now();
+    duration = end - start;
 
-    double bytes_written = NUM_THREADS * LOOPLEN * message_size;
-    double bandwidth = bytes_written / (duration.count()*1024*1024); // Convert bytes to MB
+    double bandwidth = bytes_written / (duration.count()); // Convert bytes to MB
 
     std::cout << "Runtime: " << duration.count() << std::endl;
-    std::cout << "Internal Publish bandwidth: " << bandwidth << " GB/s" << std::endl;
+    std::cout << "Internal Publish bandwidth: " << bandwidth << " MB/s" << std::endl;
 }
 
 //Topic Manager Test
@@ -297,9 +311,9 @@ int main(int argc, char* argv[]){
 	//Initialize
 	//size_t num_cores = GetPhysicalCoreCount();
 	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager(10000000,broker_id);
-	Embarcadero::DiskManager disk_manager(10000000);
-	Embarcadero::NetworkManager network_manager(1000, NUM_NETWORK_IO_THREADS,true);
+	Embarcadero::CXLManager cxl_manager((1UL<<23),broker_id);
+	Embarcadero::DiskManager disk_manager((1UL<<23));
+	Embarcadero::NetworkManager network_manager(128, NUM_NETWORK_IO_THREADS, false);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
 	cxl_manager.SetTopicManager(&topic_manager);
@@ -336,10 +350,12 @@ int main(int argc, char* argv[]){
 	//cxl_manager.StartInternalTest();
 	
 	// *********** E2E Bandwidth Teste ******************* //
+	/*
 	cxl_manager_ = &cxl_manager;
 	disk_manager_ = &disk_manager;
 	network_manager_ = &network_manager;
-	E2ETest(1024);
+	E2ETest(960);
+	*/
 
 	while(true){
 	std::this_thread::yield();
