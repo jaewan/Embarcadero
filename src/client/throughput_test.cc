@@ -200,6 +200,7 @@ void send_data(size_t message_size, size_t total_message_size, int ack_level) {
 
 void read_ack(size_t TOTAL_DATA_SIZE, size_t message_size){
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+		std::chrono::time_point<std::chrono::high_resolution_clock> DEBUG_end_time;
     if (server_sock < 0) {
         perror("Socket creation failed");
         return ;
@@ -250,7 +251,7 @@ void read_ack(size_t TOTAL_DATA_SIZE, size_t message_size){
 
     char *data = (char*)calloc(TOTAL_DATA_SIZE/message_size, sizeof(char));
     ssize_t bytesReceived;
-		int to_read = 1;//TOTAL_DATA_SIZE/message_size;
+		int to_read = TOTAL_DATA_SIZE/message_size;//sizeof(std::chrono::time_point<std::chrono::high_resolution_clock>);
 		VLOG(3) << "Start reading ack: " << to_read << " on fd" << client_sock;
     while (to_read > 0){
 		/*
@@ -260,6 +261,7 @@ void read_ack(size_t TOTAL_DATA_SIZE, size_t message_size){
 				*/
 						VLOG(4) << "Before reading" ;
 					if(bytesReceived = recv(client_sock, (uint8_t*)data + (TOTAL_DATA_SIZE/message_size - to_read) , 1024, 0)){
+					//if(bytesReceived = recv(client_sock, &DEBUG_end_time, sizeof(DEBUG_end_time), 0)){
 						to_read -= bytesReceived;
 						VLOG(4) << "Ack received:" << bytesReceived;
 					}else{

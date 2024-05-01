@@ -11,6 +11,7 @@
 #include <glog/logging.h>
 #include <cstring>
 #include <sstream>
+#include <chrono>
 #include <errno.h>
 #include "mimalloc.h"
 
@@ -312,6 +313,7 @@ void NetworkManager::ReqReceiveThread(){
 void NetworkManager::TestAckThread(){
 	std::optional<struct NetworkRequest> optReq;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	static	std::atomic<size_t> ack_count_{0};
 
 	VLOG(3) << "[DEBUG] Testack started" ;
 	while(!stop_threads_){
@@ -322,7 +324,6 @@ void NetworkManager::TestAckThread(){
 		if(ack_count_.fetch_add(1) == 9999999){
 			test_acked_all_ = true;
 		}
-	VLOG(3) << "[DEBUG] acked:" << ack_count_ ;
 	}
 }
 void NetworkManager::AckThread(){
@@ -331,73 +332,66 @@ void NetworkManager::AckThread(){
 	char buf[1000000];
 	struct epoll_event events[10]; // Adjust size as needed
 
-		VLOG(3) << "[DEBUG] ack started" ;
-	while(!stop_threads_){
-		size_t ack_count = 0;
-		/*
-		ackQueue_.blockingRead(optReq);
-		if(!optReq.has_value()){
-			break;
-		}
-		const struct NetworkRequest &req = optReq.value();
-		*/
-		/*
-		while(ackQueue_.read(optReq)){
-			ack_count++;
-			if(!optReq.has_value()){
-				break;
+	VLOG(3) << "[DEBUG] ack started" ;
+	if(ack_type_ == Immediate){
+		while(!stop_threads_){
+			size_t ack_count = 0;
+			while(ackQueue_.read(optReq)){
+				ack_count++;
+				if(!optReq.has_value()){
+					break;
+				}
 			}
-		}
-		*/
-		size_t DEBUG_num_total_ack = 10066329600/960;
-		while(ack_count != DEBUG_num_total_ack){
-			ackQueue_.blockingRead(optReq);
-			if(!optReq.has_value()){
-				break;
-			}
-			ack_count++;
-		}
-		size_t acked_size = 0;
-		while (acked_size < 1) {
-			int n = epoll_wait(ack_efd_, events, 10, -1);
-			for (int i = 0; i < n; i++) {
-				if (events[i].events & EPOLLOUT && acked_size < 1 ) {
-					ssize_t bytesSent = send(ack_fd_, buf, 1, 0);
-					if (bytesSent < 0) {
-						if (errno != EAGAIN) {
-							perror("Ack send failed");
-							return;
-							break;
+			//const struct NetworkRequest &req = optReq.value();
+			size_t acked_size = 0;
+			while (acked_size < ack_count) {
+				int n = epoll_wait(ack_efd_, events, 10, -1);
+				for (int i = 0; i < n; i++) {
+					if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
+						ssize_t bytesSent = send(ack_fd_, buf, ack_count - acked_size, 0);
+						if (bytesSent < 0) {
+							if (errno != EAGAIN) {
+								perror("Ack send failed");
+								return;
+								break;
+							}
+						} else {
+							acked_size += bytesSent;
 						}
-					} else {
-						acked_size += bytesSent;
 					}
 				}
 			}
+			if(ack_count > 0 && !optReq.has_value()) // Check ack_count >0 as the read is non-blocking
+				break;
 		}
-		/*
-		size_t acked_size = 0;
-		while (acked_size < ack_count) {
-			int n = epoll_wait(ack_efd_, events, 10, -1);
-			for (int i = 0; i < n; i++) {
-				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
-					ssize_t bytesSent = send(ack_fd_, buf, ack_count - acked_size, 0);
-					if (bytesSent < 0) {
-						if (errno != EAGAIN) {
-							perror("Ack send failed");
-							return;
-							break;
+	}else{
+		while(!stop_threads_){
+			size_t ack_count = 0;
+			size_t DEBUG_num_total_ack = 10066329600/960;
+			while(ack_count != DEBUG_num_total_ack){
+				ackQueue_.blockingRead(optReq);
+				ack_count++;
+			}
+			auto end = std::chrono::high_resolution_clock::now();
+
+			size_t acked_size = 0;
+			while (acked_size < 1) {
+				int n = epoll_wait(ack_efd_, events, 10, -1);
+				for (int i = 0; i < n; i++) {
+					if (events[i].events & EPOLLOUT && acked_size < 1 ) {
+						ssize_t bytesSent = send(ack_fd_, &end, sizeof(end), 0);
+						if (bytesSent < 0) {
+							if (errno != EAGAIN) {
+								perror("Ack send failed");
+								return;
+								break;
+							}
+						} else {
+							acked_size += bytesSent;
 						}
-					} else {
-						acked_size += bytesSent;
 					}
 				}
 			}
-		}
-		*/
-		if(ack_count > 0 && !optReq.has_value()){
-		//if(!optReq.has_value()){
-			break;
 		}
 	}
 }
