@@ -1,0 +1,15 @@
+version: '3'
+services:
+  consumer:
+    image: consumer-image:latest
+    container_name: consumer
+    mem_limit: "226327253000"
+    cpu_count: 85
+    blkio_config:
+       weight: 100
+    networks:
+      - brokers_default
+
+networks:
+  brokers_default:
+    external: true

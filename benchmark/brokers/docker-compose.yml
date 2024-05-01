@@ -1,0 +1,104 @@
+---
+version: '3'
+services:
+  zookeeper-1:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper-1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "22181:2181"
+
+  broker-1:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - zookeeper-1
+    container_name: broker-1
+    hostname: broker-1
+    ports:
+      - 19092:19092
+      - 9092:9092
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-1:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-1:9092,PLAINTEXT_HOST://localhost:19092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_NUM_PARTITIONS: 4
+      KAKFA_REPLICATION_FACTOR: 4
+      KAFKA_MIN_INSYNC_REPLICAS: 3
+    mem_limit: "226327253000"
+    cpu_count: 85
+    blkio_config:
+       weight: 100
+    # network bandwidth 
+
+  broker-2:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - zookeeper-1
+    container_name: broker-2
+    hostname: broker-2
+    ports:
+      - 19093:19093
+      - 9093:9093
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-1:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-2:9093,PLAINTEXT_HOST://localhost:19093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_NUM_PARTITIONS: 4
+      KAKFA_REPLICATION_FACTOR: 4
+      KAFKA_MIN_INSYNC_REPLICAS: 3
+    mem_limit: "226327253000"
+    cpu_count: 85
+    blkio_config:
+       weight: 100
+
+  broker-3:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - zookeeper-1
+    container_name: broker-3
+    hostname: broker-3
+    ports:
+      - 19094:19094
+      - 9094:9094
+    environment:
+      KAFKA_BROKER_ID: 3
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-1:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-3:9094,PLAINTEXT_HOST://localhost:19094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_NUM_PARTITIONS: 4
+      KAKFA_REPLICATION_FACTOR: 4
+      KAFKA_MIN_INSYNC_REPLICAS: 3
+    mem_limit: "226327253000"
+    cpu_count: 85
+    blkio_config:
+       weight: 100
+
+  broker-4:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - zookeeper-1
+    container_name: broker-4
+    hostname: broker-4
+    ports:
+      - 19095:19095
+      - 9095:9095
+    environment:
+      KAFKA_BROKER_ID: 4
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-1:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-4:9095,PLAINTEXT_HOST://localhost:19095
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_NUM_PARTITIONS: 4
+      KAKFA_REPLICATION_FACTOR: 4
+      KAFKA_MIN_INSYNC_REPLICAS: 3
+    mem_limit: "226327253000"
+    cpu_count: 85
+    blkio_config:
+       weight: 100

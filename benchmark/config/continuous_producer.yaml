@@ -2,6 +2,6 @@ brokers: "192.168.60.171:9093,192.168.60.171:9094,192.168.60.171:9095,192.168.60
 # brokers: "192.168.60.171:9093"
 topic: "cxl-test-2"
 duration: 2
-messageSize: 1000
-ack: "0"
-payload: "payloads/payload-1kb.data"
+messageSize: 16000
+ack: "1"
+payload: "payloads/payload-16kb.data"
