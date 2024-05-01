@@ -20,7 +20,6 @@
 
 #define ACK_SIZE 1024
 #define SERVER_ADDR "127.0.0.1"
-#define CLIENT_ID 1
 
 std::atomic<size_t> totalBytesRead_(0);
 std::atomic<size_t> client_order_(0);
@@ -40,7 +39,7 @@ int make_socket_non_blocking(int sfd) {
 	return 0;
 }
 
-void send_data(size_t message_size, size_t total_message_size, int ack_level) {
+void send_data(size_t message_size, size_t total_message_size, int ack_level, size_t CLIENT_ID) {
 	int sock = socket(AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
 		perror("Socket creation failed");
@@ -198,7 +197,7 @@ void send_data(size_t message_size, size_t total_message_size, int ack_level) {
 	free(data);
 }
 
-void read_ack(size_t TOTAL_DATA_SIZE, size_t message_size){
+void read_ack(size_t TOTAL_DATA_SIZE,size_t message_size, ize_t CLIENT_ID){
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
 		std::chrono::time_point<std::chrono::high_resolution_clock> DEBUG_end_time;
     if (server_sock < 0) {
@@ -274,6 +273,57 @@ void read_ack(size_t TOTAL_DATA_SIZE, size_t message_size){
     close(client_sock);
 }
 
+void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, size_t message_size, int ack_level){
+	LOG(INFO) << "Starting SingleClientMultipleThreads Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
+
+	size_t client_id = 1;
+	auto start = std::chrono::high_resolution_clock::now();
+	std::vector<std::thread> threads;
+	if(ack_level > 0){
+		threads.emplace_back(read_ack, total_message_size, message_size, client_id);
+	}
+	for (size_t i = 0; i < num_threads; ++i) {
+		threads.emplace_back(send_data, message_size, total_message_size, ack_level, client_id);
+	}
+
+	for (auto &t : threads) {
+		t.join();
+	}
+	auto end = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> elapsed = end - start;
+	double seconds = elapsed.count();
+
+	// Calculate bandwidth
+	double bandwidthMbps = ((client_order_ * message_size) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
+
+	LOG(INFO) << "Bandwidth:" << bandwidthMbps << " MBps" ;
+}
+
+void MultipleClientsSingleThread(size_t num_threads, size_t total_message_size, size_t message_size, int ack_level){
+	LOG(INFO) << "Starting MultipleClientsSingleThread Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
+
+	size_t client_id = 1;
+	auto start = std::chrono::high_resolution_clock::now();
+	std::vector<std::thread> threads;
+	for (size_t i = 0; i < num_threads; ++i) {
+		client_id += i;
+		threads.emplace_back(read_ack, total_message_size, message_size, client_id);
+		threads.emplace_back(send_data, message_size, total_message_size, ack_level, client_id);
+	}
+
+	for (auto &t : threads) {
+		t.join();
+	}
+	auto end = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> elapsed = end - start;
+	double seconds = elapsed.count();
+
+	// Calculate bandwidth
+	double bandwidthMbps = ((client_order_ * message_size) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
+
+	LOG(INFO) << "Bandwidth:" << bandwidthMbps << " MBps" ;
+}
+
 int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
@@ -294,28 +344,8 @@ int main(int argc, char* argv[]) {
 	int ack_level = result["ack_level"].as<int>();
 	FLAGS_v = result["log_level"].as<int>();
 
-	LOG(INFO) << "Starting Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
-
-	auto start = std::chrono::high_resolution_clock::now();
-	std::vector<std::thread> threads;
-	if(ack_level > 0){
-		threads.emplace_back(read_ack, total_message_size, message_size);
-	}
-	for (size_t i = 0; i < num_threads; ++i) {
-		threads.emplace_back(send_data, message_size, total_message_size, ack_level);
-	}
-
-	for (auto &t : threads) {
-		t.join();
-	}
-	auto end = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> elapsed = end - start;
-	double seconds = elapsed.count();
-
-	// Calculate bandwidth
-	double bandwidthMbps = ((client_order_ * message_size) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
-
-	LOG(INFO) << "Bandwidth:" << bandwidthMbps << " MBps" ;
+	SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level);
+	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 
 	return 0;
 }
