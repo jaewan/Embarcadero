@@ -8,6 +8,7 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <future>
 #include <atomic>
 #include <vector>
 #include <cstring>
@@ -39,11 +40,14 @@ int make_socket_non_blocking(int sfd) {
 	return 0;
 }
 
-void send_data(size_t message_size, size_t total_message_size, int ack_level, size_t CLIENT_ID) {
+std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_data(size_t message_size,
+		size_t total_message_size, int ack_level, size_t CLIENT_ID, bool record_latency) {
+	std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> times;
+	times.reserve(1<<15);
 	int sock = socket(AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
 		perror("Socket creation failed");
-		return;
+		return times;
 	}
 
 	make_socket_non_blocking(sock);
@@ -51,15 +55,15 @@ void send_data(size_t message_size, size_t total_message_size, int ack_level, si
 	// Set the SO_REUSEADDR option
 	int flag = 1; // Enable the option
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-			perror("setsockopt(SO_REUSEADDR) failed");
-			close(sock);
-			return ;
+		perror("setsockopt(SO_REUSEADDR) failed");
+		close(sock);
+		return times;
 	}
 
 	if(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
 		perror("setsockopt error");
 		close(sock);
-		return;
+		return times;
 	}
 
 	sockaddr_in server_addr;
@@ -72,7 +76,7 @@ void send_data(size_t message_size, size_t total_message_size, int ack_level, si
 		if (errno != EINPROGRESS) {
 			perror("Connect failed");
 			close(sock);
-			return;
+			return times;
 		}
 	}
 
@@ -153,6 +157,8 @@ void send_data(size_t message_size, size_t total_message_size, int ack_level, si
 					stop_sending = true;
 					header->client_id = -1;
 				}
+				if(record_latency)
+					times.emplace_back(std::chrono::high_resolution_clock::now());
 				ssize_t bytesSent = send(sock, (uint8_t*)data + sent_bytes, req.size - sent_bytes, 0);
 				if (bytesSent < 0) {
 					if (errno != EAGAIN) {
@@ -187,7 +193,7 @@ void send_data(size_t message_size, size_t total_message_size, int ack_level, si
 			if(totalBytesRead_ >= total_message_size)
 #endif
 				break;
-				//running = false;
+			//running = false;
 		}
 		n = epoll_wait(efd, events, 10, -1);
 		i = 0;
@@ -195,103 +201,128 @@ void send_data(size_t message_size, size_t total_message_size, int ack_level, si
 	close(sock);
 	close(efd);
 	free(data);
+
+	return times;
 }
 
-void read_ack(size_t TOTAL_DATA_SIZE,size_t message_size, ize_t CLIENT_ID){
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-		std::chrono::time_point<std::chrono::high_resolution_clock> DEBUG_end_time;
-    if (server_sock < 0) {
-        perror("Socket creation failed");
-        return ;
-    }
+std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> read_ack(size_t TOTAL_DATA_SIZE,
+		size_t message_size, size_t CLIENT_ID, bool record_latency){
+	int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+	std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> times;
+	times.reserve(1<<15);
+	std::chrono::time_point<std::chrono::high_resolution_clock> DEBUG_end_time;
+	if (server_sock < 0) {
+		perror("Socket creation failed");
+		return times;
+	}
 
-    int flag = 1;
-		if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-				perror("setsockopt(SO_REUSEADDR) failed");
-				close(server_sock);
-				return ;
+	int flag = 1;
+	if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
+		perror("setsockopt(SO_REUSEADDR) failed");
+		close(server_sock);
+		return times;
+	}
+	setsockopt(server_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+
+	sockaddr_in server_addr;
+	memset(&server_addr, 0, sizeof(server_addr));
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_port = htons(PORT + CLIENT_ID);
+	server_addr.sin_addr.s_addr = INADDR_ANY;
+
+	if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+		perror("Bind failed");
+		close(server_sock);
+		return times;
+	}
+
+	if (listen(server_sock, SOMAXCONN) < 0) {
+		perror("Listen failed");
+		close(server_sock);
+		return times;
+	}
+
+	sockaddr_in client_addr;
+	socklen_t client_addr_len = sizeof(client_addr);
+	int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
+	if (client_sock < 0) {
+		perror("Accept failed");
+		return times;
+	}
+
+	char *data = (char*)calloc(TOTAL_DATA_SIZE/message_size, sizeof(char));
+	ssize_t bytesReceived;
+	int to_read = TOTAL_DATA_SIZE/message_size;//sizeof(std::chrono::time_point<std::chrono::high_resolution_clock>);
+	VLOG(3) << "Start reading ack: " << to_read << " on fd" << client_sock;
+	while (to_read > 0){
+		VLOG(4) << "Before reading" ;
+		if((bytesReceived = recv(client_sock, (uint8_t*)data + ((TOTAL_DATA_SIZE/message_size) - to_read) , 1024, 0))){
+			if(record_latency){
+				auto t = std::chrono::high_resolution_clock::now();
+				for(int i =0; i < bytesReceived; i++){
+					times.emplace_back(t);
+				}
+			}
+			to_read -= bytesReceived;
+			VLOG(4) << "Ack received:" << bytesReceived;
+		}else{
+			perror("Read error");
 		}
-    setsockopt(server_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-
-    sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT + CLIENT_ID);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-        perror("Bind failed");
-        close(server_sock);
-        return ;
-    }
-
-    if (listen(server_sock, SOMAXCONN) < 0) {
-        perror("Listen failed");
-        close(server_sock);
-        return ;
-    }
-
-		sockaddr_in client_addr;
-		socklen_t client_addr_len = sizeof(client_addr);
-		int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
-		if (client_sock < 0) {
-			perror("Accept failed");
-			return;
-		}
-		/*
-    int efd = epoll_create1(0);
-    struct epoll_event event;
-    event.data.fd = client_sock;
-    event.events = EPOLLIN ; // Edge-triggered for both read and write
-    epoll_ctl(efd, EPOLL_CTL_ADD, client_sock, &event);
-
-    struct epoll_event events[10]; // Adjust size as needed
-		*/
-
-    char *data = (char*)calloc(TOTAL_DATA_SIZE/message_size, sizeof(char));
-    ssize_t bytesReceived;
-		int to_read = TOTAL_DATA_SIZE/message_size;//sizeof(std::chrono::time_point<std::chrono::high_resolution_clock>);
-		VLOG(3) << "Start reading ack: " << to_read << " on fd" << client_sock;
-    while (to_read > 0){
-		/*
-			int n = epoll_wait(efd, events, 10, -1);
-			for (int i = 0; i < n; i++) {
-				if(events[i].events & EPOLLIN){
-				*/
-						VLOG(4) << "Before reading" ;
-					if(bytesReceived = recv(client_sock, (uint8_t*)data + (TOTAL_DATA_SIZE/message_size - to_read) , 1024, 0)){
-					//if(bytesReceived = recv(client_sock, &DEBUG_end_time, sizeof(DEBUG_end_time), 0)){
-						to_read -= bytesReceived;
-						VLOG(4) << "Ack received:" << bytesReceived;
-					}else{
-						perror("Read error");
-					}
-				//}
-		//	}
-    }
-		free(data);
-    close(client_sock);
+	}
+	free(data);
+	close(client_sock);
+	return times;
 }
 
-void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, size_t message_size, int ack_level){
+void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, size_t message_size, int ack_level, bool record_latency){
 	LOG(INFO) << "Starting SingleClientMultipleThreads Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
 
 	size_t client_id = 1;
 	auto start = std::chrono::high_resolution_clock::now();
-	std::vector<std::thread> threads;
+	std::vector<std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>>> pub_futures;
+
+	std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>> ack_future;
 	if(ack_level > 0){
-		threads.emplace_back(read_ack, total_message_size, message_size, client_id);
+		ack_future = std::async(read_ack, total_message_size, message_size, client_id, record_latency);
 	}
 	for (size_t i = 0; i < num_threads; ++i) {
-		threads.emplace_back(send_data, message_size, total_message_size, ack_level, client_id);
+		pub_futures.emplace_back(std::async(std::launch::async, send_data, message_size, total_message_size, ack_level, client_id, record_latency));
 	}
+	std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> pub_times;
+	std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> ack_times;
+	for(auto& future: pub_futures){
+		auto vec = future.get();
+		pub_times.insert(pub_times.end(), vec.begin(), vec.end());
+	}
+	ack_times = ack_future.get();
 
-	for (auto &t : threads) {
-		t.join();
-	}
 	auto end = std::chrono::high_resolution_clock::now();
 	std::chrono::duration<double> elapsed = end - start;
 	double seconds = elapsed.count();
+
+	LOG(INFO) << "Ack size:" << ack_times.size() << " pub size:" << pub_times.size();
+	//assert(ack_times.size() == pub_times.size());
+
+  std::sort(pub_times.begin(), pub_times.end());
+  std::sort(ack_times.begin(), ack_times.end());
+
+	size_t len = ack_times.size();
+
+	std::vector<long long> latencies;
+	for(size_t i=0; i<len; i++){
+		latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(ack_times[i] - pub_times[i]).count());
+	}
+  std::sort(latencies.begin(), latencies.end());
+	std::ofstream file("/home/domin/.CXL_EMUL/CDF_data.csv");
+	file << "Latency (ns),CDF\n";
+	for (size_t i = 0; i < latencies.size(); ++i) {
+			if (i == 0 || latencies[i] != latencies[i - 1]) {
+					double cdf = static_cast<double>(i + 1) / latencies.size();
+					file << latencies[i] << "," << cdf << "\n";
+			}
+	}
+	file.close();
+
 
 	// Calculate bandwidth
 	double bandwidthMbps = ((client_order_ * message_size) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
@@ -299,21 +330,29 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 	LOG(INFO) << "Bandwidth:" << bandwidthMbps << " MBps" ;
 }
 
-void MultipleClientsSingleThread(size_t num_threads, size_t total_message_size, size_t message_size, int ack_level){
-	LOG(INFO) << "Starting MultipleClientsSingleThread Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
+void MultipleClientsSingleThread(size_t num_threads, size_t total_message_size, size_t message_size, int ack_level, bool record_latency){
+	LOG(INFO) << "Starting SingleClientMultipleThreads Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
 
 	size_t client_id = 1;
 	auto start = std::chrono::high_resolution_clock::now();
-	std::vector<std::thread> threads;
+	std::vector<std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>>> pub_futures;
+	std::vector<std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>>> ack_futures;
+
 	for (size_t i = 0; i < num_threads; ++i) {
-		client_id += i;
-		threads.emplace_back(read_ack, total_message_size, message_size, client_id);
-		threads.emplace_back(send_data, message_size, total_message_size, ack_level, client_id);
+		pub_futures.emplace_back(std::async(std::launch::async, send_data, message_size, total_message_size, ack_level, client_id, record_latency));
+		ack_futures.emplace_back(std::async(std::launch::async, read_ack, total_message_size, message_size, client_id, record_latency));
+	}
+	std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> pub_times;
+	std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> ack_times;
+	for(auto& future: pub_futures){
+		auto vec = future.get();
+		pub_times.insert(pub_times.end(), vec.begin(), vec.end());
+	}
+	for(auto& future: ack_futures){
+		auto vec = future.get();
+		ack_times.insert(ack_times.end(), vec.begin(), vec.end());
 	}
 
-	for (auto &t : threads) {
-		t.join();
-	}
 	auto end = std::chrono::high_resolution_clock::now();
 	std::chrono::duration<double> elapsed = end - start;
 	double seconds = elapsed.count();
@@ -331,11 +370,11 @@ int main(int argc, char* argv[]) {
 	cxxopts::Options options("embarcadero-throughputTest", "Embarcadero Throughput Test");
 
 	options.add_options()
-				("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
-				("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
-        ("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
-        ("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
-        ("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("32"));
+		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
+		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
+		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
+		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("32"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
@@ -344,7 +383,7 @@ int main(int argc, char* argv[]) {
 	int ack_level = result["ack_level"].as<int>();
 	FLAGS_v = result["log_level"].as<int>();
 
-	SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level);
+	SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level, true);
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 
 	return 0;
