@@ -29,16 +29,16 @@ public:
             exit(1);
         }
 
-        // Might need these 2 configs to optimize for latency
-        // if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
-        //     std::cerr << "% " << errstr << std::endl;
-        //     exit(1);
-        // }
 
-        // if (conf->set("batch.size", "1000000", errstr) != RdKafka::Conf::CONF_OK) {
-        //     std::cerr << "% " << errstr << std::endl;
-        //     exit(1);
-        // }
+		    if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
+            std::cerr << "% " << errstr << std::endl;
+            exit(1);
+        }
+
+        if (conf->set("batch.size", "1", errstr) != RdKafka::Conf::CONF_OK) {
+            std::cerr << "% " << errstr << std::endl;
+            exit(1);
+        }
 
         producer = RdKafka::Producer::create(conf, errstr);
         if (!producer) {
