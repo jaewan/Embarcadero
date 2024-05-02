@@ -1,3 +1,1 @@
-FROM ubuntu:latest
-RUN apt-get update
-RUN apt-get install -y libyaml-cpp-dev
+FROM registry.access.redhat.com/ubi9/ubi:latest

@@ -4,6 +4,6 @@ brokers: "broker-1:9092,broker-2:9093,broker-3:9094,broker-4:9095"
 # brokers: "192.168.60.171:9093"
 topic: "embarcadero"
 numMessages: 1000
-messageSize: 1000
+messageSize: 64
 ack: "0"
-payload: "payloads/payload-1kb.data"
+payload: "payloads/payload-64b.data"

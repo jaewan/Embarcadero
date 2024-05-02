@@ -55,11 +55,6 @@ public:
         printf("Created producer %s\n", producer->name().c_str());
     }
 
-    ~KafkaProducer() {
-        delete topic;
-        delete producer;
-    }
-
     RdKafka::ErrorCode produce(const std::string& message) {
         RdKafka::ErrorCode err = producer->produce(
                                         topic_name,

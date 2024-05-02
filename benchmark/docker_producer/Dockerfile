@@ -1,10 +1,12 @@
 # Use a base image
 FROM base-image:latest
 
-COPY dependencies/libyaml-cpp.so.0.7 /usr/local/lib/libyaml-cpp.so.0.7
+COPY dependencies/libyaml-cpp.so.0.6 /usr/local/lib/libyaml-cpp.so.0.6
 COPY dependencies/librdkafka++.so.1 /usr/local/lib/librdkafka++.so.1
-COPY dependencies/libsasl2.so.2 /usr/local/lib/libsasl2.so.2
-COPY dependencies/librdkafka.so.1 /usr/local/lib/librdkafka.so.1 
+COPY dependencies/librdkafka.so.1 /usr/local/lib/librdkafka.so.1
+COPY dependencies/libssl.so.3 /usr/local/lib/libssl.so.3
+COPY dependencies/libcrypto.so.3 /usr/local/lib/libcrypto.so.3
+COPY dependencies/libzstd.so.1 /usr/local/lib/libzstd.so.1
 ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
 # Set the working directory inside the container
