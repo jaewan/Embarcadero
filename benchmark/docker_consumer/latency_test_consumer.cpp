@@ -65,6 +65,7 @@ int main() {
     int64_t count = 0;
     std::chrono::time_point<std::chrono::system_clock> start;
     std::chrono::time_point<std::chrono::system_clock> end;
+    int64_t producer_start_time;
     while (true) {
         RdKafka::Message *rkmessage = kc.rk->consume(1000);
         if (rkmessage) {
@@ -102,6 +103,9 @@ int main() {
                 if (count == 1) {
                     // start the time
                     start = std::chrono::system_clock::now();
+
+                    // mark the first msg sent by producer's timestamp
+                    producer_start_time = timestamp;
                 }
 
                 if (count == num_messages) {
@@ -120,6 +124,12 @@ int main() {
                         sum += latency;
                     }
                     std::cerr << "Average latency: " << sum / latencies.size() << " ms" << std::endl;
+
+                    // Print end to end throughput
+                    std::chrono::duration<double> elapsed_seconds_end_to_end = end - std::chrono::system_clock::from_time_t(producer_start_time / 1000);
+                    double throughput_end_to_end = (static_cast<double>(num_bytes) * num_messages) / elapsed_seconds_end_to_end.count();
+                    throughput_end_to_end /= 1024 * 1024;
+                    std::cerr << "End to end throughput for " << num_bytes << " bytes: " << throughput_end_to_end << " MB/s" << std::endl;
 
                     count = 0;
                 }
