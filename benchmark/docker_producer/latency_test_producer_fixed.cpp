@@ -109,12 +109,26 @@ int main() {
     std::string payload((std::istreambuf_iterator<char>(file)),
                         std::istreambuf_iterator<char>());
 
+		std::cerr << "Brokers: " << brokers << std::endl;
+		std::cerr << "Topic: " << topic_name << std::endl;
+		std::cerr << "Number of messages: " << num_messages << std::endl;
+		std::cerr << "Number of bytes: " << num_bytes << std::endl;
+		std::cerr << "Ack level: " << ack << std::endl;
+
+    if (payload == "") {
+			std::cerr << "Payload is empty, rerun experiment" << std::endl;
+		} else {
+			std::cerr << "Payload was not empty" << std::endl;
+		}
+
     auto start = std::chrono::system_clock::now();
     for (int i = 0; i < num_messages; ++i) {
         RdKafka::ErrorCode err = kp.produce(payload);
         if (err != RdKafka::ERR_NO_ERROR) {
             std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
         }
+
+				std::cerr << i << std::endl;
 
         kp.poll(0);
     }
@@ -129,7 +143,9 @@ int main() {
     // end time for throughput
     auto end = std::chrono::system_clock::now();
     std::chrono::duration<double> elapsed_seconds = end - start;
-    
+   
+		std::cerr << "Elapsed seconds: " << elapsed_seconds.count() << std::endl;
+
     // calculate throughput
     double throughput = (static_cast<double>(num_bytes) * num_messages) / elapsed_seconds.count();
     throughput /= 1024 * 1024;

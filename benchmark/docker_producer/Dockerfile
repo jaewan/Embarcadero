@@ -12,6 +12,8 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 # Set the working directory inside the container
 WORKDIR /app
 
+COPY payloads /app/payloads
+
 # Copy the producer executable to the container
 COPY producer /app/
 

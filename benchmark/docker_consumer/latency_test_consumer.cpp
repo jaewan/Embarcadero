@@ -60,6 +60,11 @@ int main() {
         exit(1);
     }
 
+		std::cerr << "Brokers: " << brokers << std::endl;
+		std::cerr << "Topic: " << topic_name << std::endl;
+		std::cerr << "Number of messages: " << num_messages << std::endl;
+		std::cerr << "Number of bytes: " << num_bytes << std::endl;
+
     // initialize empty vector for latencies
     std::vector<int64_t> latencies;
     int64_t count = 0;
@@ -69,25 +74,26 @@ int main() {
     while (true) {
         RdKafka::Message *rkmessage = kc.rk->consume(1000);
         if (rkmessage) {
-            if (rkmessage->err() && !latencies.empty()) {
+            //if (rkmessage->err() && !latencies.empty()) {
                 // Open the file for writing
-                std::ofstream outputFile("latency.txt");
-                if (!outputFile.is_open()) {
-                    std::cerr << "Error: Unable to open file for writing." << std::endl;
-                    return 1;
-                }
+                //std::ofstream outputFile("latency.txt");
+                //if (!outputFile.is_open()) {
+                //   std::cerr << "Error: Unable to open file for writing." << std::endl;
+                //    return 1;
+                //}
 
                 // clear the file first
-                outputFile.clear();
+                //outputFile.clear();
 
-                for (auto latency : latencies) {
-                    outputFile << latency << std::endl;
-                }
+                //for (auto latency : latencies) {
+                //    outputFile << latency << std::endl;
+                //}
 
                 // delete content in latencies
-                latencies.clear();
-            } else if (rkmessage->err()) {
-                //std::cerr << "% Consumer error: " << rkmessage->errstr() << std::endl;
+                //latencies.clear();
+            //}
+						if (rkmessage->err()) {
+                std::cerr << "% Consumer error: " << rkmessage->errstr() << std::endl;
             } else {
                 int64_t timestamp = rkmessage->timestamp().timestamp;
 
@@ -95,12 +101,17 @@ int main() {
                 auto now = std::chrono::system_clock::now();
                 int64_t millis_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
-                int64_t latency = millis_since_epoch - timestamp;
+                //int64_t latency = millis_since_epoch - timestamp;
                 
-                latencies.push_back(latency);
+                //latencies.push_back(latency);
 
                 count++;
+
+								std::cerr << "Count: " << count << std::endl;
+
                 if (count == 1) {
+										std::cerr << "Received the first message" << std::endl;
+
                     // start the time
                     start = std::chrono::system_clock::now();
 
@@ -111,19 +122,21 @@ int main() {
                 if (count == num_messages) {
                     end = std::chrono::system_clock::now();
                     std::chrono::duration<double> elapsed_seconds = end - start;
-        
+    
+										std::cerr << "Elapsed seconds: " << elapsed_seconds.count() << std::endl;
+
                     // calculate throughput
                     double throughput = (static_cast<double>(num_bytes) * num_messages) / elapsed_seconds.count();
                     throughput /= 1024 * 1024;
 
-                    std::cerr << "Throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
+                    std::cerr << "Subscriber throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
                     
                     // Print average latency
-                    int64_t sum = 0;
-                    for (auto latency : latencies) {
-                        sum += latency;
-                    }
-                    std::cerr << "Average latency: " << sum / latencies.size() << " ms" << std::endl;
+                    //int64_t sum = 0;
+                    //for (auto latency : latencies) {
+                    //    sum += latency;
+                    //}
+                    //std::cerr << "Average latency: " << sum / latencies.size() << " ms" << std::endl;
 
                     // Print end to end throughput
                     std::chrono::duration<double> elapsed_seconds_end_to_end = end - std::chrono::system_clock::from_time_t(producer_start_time / 1000);
