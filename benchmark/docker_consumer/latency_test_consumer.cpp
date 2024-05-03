@@ -50,6 +50,7 @@ int main() {
     std::string topic_name = config["topic"].as<std::string>();
     int num_messages = config["numMessages"].as<int>();
     int num_bytes = config["messageSize"].as<int>();
+    std::string ack = config["ack"].as<std::string>();
 
     KafkaConsumer kc(brokers);
     RdKafka::Topic *topic = RdKafka::Topic::create(kc.rk, topic_name, nullptr, kc.errstr);
@@ -92,7 +93,26 @@ int main() {
                 // delete content in latencies
                 //latencies.clear();
             //}
-						if (rkmessage->err()) {
+            if (rkmessage->err() && ack == "0" && count > 0) {
+                std::cerr << "Calculating throughput for ack = 0" << std::endl;
+                end = std::chrono::system_clock::now();
+
+                // Offset the end time by 1 second
+                end -= std::chrono::seconds(1);
+
+                std::chrono::duration<double> elapsed_seconds = end - start;
+                double throughput = (static_cast<double>(num_bytes) * count) / elapsed_seconds.count();
+                throughput /= 1024 * 1024;
+                std::cerr << "Subscriber throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
+
+                // Print end to end throughput
+                std::chrono::duration<double> elapsed_seconds_end_to_end = end - std::chrono::system_clock::from_time_t(producer_start_time / 1000);
+                double throughput_end_to_end = (static_cast<double>(num_bytes) * count) / elapsed_seconds_end_to_end.count();
+                throughput_end_to_end /= 1024 * 1024;
+                std::cerr << "End to end throughput for " << num_bytes << " bytes: " << throughput_end_to_end << " MB/s" << std::endl;
+
+                count = 0;
+            } else if (rkmessage->err()) {
                 std::cerr << "% Consumer error: " << rkmessage->errstr() << std::endl;
             } else {
                 int64_t timestamp = rkmessage->timestamp().timestamp;
@@ -107,10 +127,10 @@ int main() {
 
                 count++;
 
-								std::cerr << "Count: " << count << std::endl;
+				std::cerr << "Count: " << count << std::endl;
 
                 if (count == 1) {
-										std::cerr << "Received the first message" << std::endl;
+					std::cerr << "Received the first message" << std::endl;
 
                     // start the time
                     start = std::chrono::system_clock::now();
