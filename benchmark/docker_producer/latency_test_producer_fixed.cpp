@@ -30,7 +30,7 @@ public:
         }
 
 
-		    if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
+	if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
             std::cerr << "% " << errstr << std::endl;
             exit(1);
         }
