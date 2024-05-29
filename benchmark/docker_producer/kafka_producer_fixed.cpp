@@ -128,8 +128,6 @@ int main() {
             std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
         }
 
-				std::cerr << i << std::endl;
-
         kp.poll(0);
     }
 

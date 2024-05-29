@@ -73,7 +73,7 @@ int main() {
     std::chrono::time_point<std::chrono::system_clock> end;
     int64_t producer_start_time;
     while (true) {
-        RdKafka::Message *rkmessage = kc.rk->consume(1000);
+        RdKafka::Message *rkmessage = kc.rk->consume(10000);
         if (rkmessage) {
             //if (rkmessage->err() && !latencies.empty()) {
                 // Open the file for writing
@@ -95,13 +95,16 @@ int main() {
             //}
             if (rkmessage->err() && ack == "0" && count > 0) {
                 std::cerr << "Calculating throughput for ack = 0" << std::endl;
+								std::cerr << "Number of messages consumed: " << count << std::endl;
                 end = std::chrono::system_clock::now();
 
-                // Offset the end time by 1 second
-                end -= std::chrono::seconds(1);
+                // Offset the end time by 10 second
+                end -= std::chrono::seconds(10);
 
                 std::chrono::duration<double> elapsed_seconds = end - start;
-                double throughput = (static_cast<double>(num_bytes) * count) / elapsed_seconds.count();
+                std::cerr << "Elapsed seconds: " << elapsed_seconds.count() << std::endl;
+
+								double throughput = (static_cast<double>(num_bytes) * count) / elapsed_seconds.count();
                 throughput /= 1024 * 1024;
                 std::cerr << "Subscriber throughput for " << num_bytes << " bytes: " << throughput << " MB/s" << std::endl;
 
@@ -113,7 +116,7 @@ int main() {
 
                 count = 0;
             } else if (rkmessage->err()) {
-                std::cerr << "% Consumer error: " << rkmessage->errstr() << std::endl;
+                // std::cerr << "% Consumer error: " << rkmessage->errstr() << std::endl;
             } else {
                 int64_t timestamp = rkmessage->timestamp().timestamp;
 
@@ -126,8 +129,6 @@ int main() {
                 //latencies.push_back(latency);
 
                 count++;
-
-				std::cerr << "Count: " << count << std::endl;
 
                 if (count == 1) {
 					std::cerr << "Received the first message" << std::endl;
