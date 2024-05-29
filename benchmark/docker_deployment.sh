@@ -1,5 +1,5 @@
 sudo cp config/fixed_producer.yaml docker_producer/config/fixed_producer.yaml
-sudo cp config/fixed_producer.yaml docker_consumer/config/fixed_producer.yaml
+sudo cp config/fixed_producer.yaml docker_consumer/config/consumer.yaml
 
 sudo cp /usr/lib64/libyaml-cpp.so.0.6 docker_producer/dependencies
 sudo cp /usr/lib64/libyaml-cpp.so.0.6 docker_consumer/dependencies
