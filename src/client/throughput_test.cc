@@ -52,7 +52,6 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 
 	make_socket_non_blocking(sock);
 
-	// Set the SO_REUSEADDR option
 	int flag = 1; // Enable the option
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
 		perror("setsockopt(SO_REUSEADDR) failed");
@@ -122,6 +121,10 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	bool running = true;
 	size_t sent_bytes = 0;
 	VLOG(3) << "Start publishing  on fd" << sock;
+	//This is to measure throughput more precisely
+	if(!record_latency){
+		times.emplace_back(std::chrono::high_resolution_clock::now());
+	}
 	while (running) {
 		n = epoll_wait(efd, events, 10, -1);
 		for (i = 0; i < n; i++) {
@@ -150,6 +153,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	sent_bytes = 0;
 	running = true;
 	bool stop_sending = false;
+	int num_send_called_this_msg = 0;
 	while (running) {
 		for (; i < n; i++) {
 			if (events[i].events & EPOLLOUT && (!stop_sending || header->client_order < run_count)) {
@@ -160,7 +164,10 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 				if(record_latency)
 					times.emplace_back(std::chrono::high_resolution_clock::now());
 				ssize_t bytesSent = send(sock, (uint8_t*)data + sent_bytes, req.size - sent_bytes, 0);
+				num_send_called_this_msg++;
 				if (bytesSent < 0) {
+					if(record_latency)
+						times.pop_back();
 					if (errno != EAGAIN) {
 						perror("send failed");
 						running = false;
@@ -170,7 +177,12 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 				sent_bytes += bytesSent;
 				if(sent_bytes == req.size){
 					sent_bytes = 0;
+					num_send_called_this_msg = 0;
 					header->client_order = client_order_.fetch_add(1);
+				}else{
+					if(record_latency && num_send_called_this_msg>1){
+						times.pop_back();
+					}
 				}
 			}
 #ifdef ACK
@@ -197,6 +209,9 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 		}
 		n = epoll_wait(efd, events, 10, -1);
 		i = 0;
+	}
+	if(!record_latency){
+		times.emplace_back(std::chrono::high_resolution_clock::now());
 	}
 	close(sock);
 	close(efd);
@@ -278,13 +293,15 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 	LOG(INFO) << "Starting SingleClientMultipleThreads Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
 
 	size_t client_id = 1;
-	auto start = std::chrono::high_resolution_clock::now();
 	std::vector<std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>>> pub_futures;
 
 	std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>> ack_future;
 	if(ack_level > 0){
 		ack_future = std::async(read_ack, total_message_size, message_size, client_id, record_latency);
 	}
+
+
+	// Spawning threads to publish
 	for (size_t i = 0; i < num_threads; ++i) {
 		pub_futures.emplace_back(std::async(std::launch::async, send_data, message_size, total_message_size, ack_level, client_id, record_latency));
 	}
@@ -296,15 +313,16 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 	}
 	ack_times = ack_future.get();
 
-	auto end = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> elapsed = end - start;
-	double seconds = elapsed.count();
-
 	LOG(INFO) << "Ack size:" << ack_times.size() << " pub size:" << pub_times.size();
 	//assert(ack_times.size() == pub_times.size());
 
   std::sort(pub_times.begin(), pub_times.end());
   std::sort(ack_times.begin(), ack_times.end());
+
+	auto start = pub_times.front();
+	auto end = pub_times.back();
+	std::chrono::duration<double> elapsed = end - start;
+	double seconds = elapsed.count();
 
 	size_t len = ack_times.size();
 

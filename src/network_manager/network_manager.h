@@ -17,28 +17,26 @@ namespace Embarcadero{
 
 class CXLManager;
 class DiskManager;
-enum NetworkRequestType {Acknowledge, Receive, Send};
+
+enum ClientRequestType {Publish, Subscribe};
 
 struct NetworkRequest{
-	NetworkRequestType req_type;
 	int client_socket;
 	int efd;
 };
 
-struct alignas(64) EmbarcaderoReq{
-	size_t client_id;
-	size_t client_order;
-	size_t ack;
+struct SubscribeShake{
 	size_t size;
-	char topic[32]; //This is to align thie struct as 64B
 };
 
-struct alignas(64) EmbarcaderoHandshake{
-	size_t client_id;
-	size_t client_order;
-	size_t size; //Maximum size of messages in this batch
+struct alignas(64) EmbarcaderoReq{
+	uint32_t client_id;
+	uint32_t size;//Pub: Maximum size of messages in this batch
+	size_t client_order; // at Sub: used as last offset  set to -2 as sentinel value
+	void* last_addr; // Sub: address of last fetched msg
+	uint32_t ack;
+	ClientRequestType client_req;
 	char topic[32]; //This is to align thie struct as 64B
-	size_t ack;
 };
 
 class NetworkManager{

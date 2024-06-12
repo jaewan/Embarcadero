@@ -17,7 +17,8 @@ namespace Embarcadero{
 class TopicManager;
 class NetworkManager;
 
-enum CXL_Type {Emul, Real};
+enum CXLType {Emul, Real};
+enum SequencerType {Embarcadero, Scalog, Corfu};
 
 /* CXL memory layout
  *
@@ -80,7 +81,7 @@ class CXLManager{
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
-		void CreateNewTopic(char topic[31], int order);
+		void CreateNewTopic(char topic[31], int order, SequencerType seqType = Embarcadero);
 		void* GetCXLAddr(){
 			return cxl_addr_;
 		}
@@ -119,7 +120,7 @@ class CXLManager{
 		TopicManager *topic_manager_;
 		NetworkManager *network_manager_;
 
-		CXL_Type cxl_type_;
+		CXLType cxl_type_;
 		int cxl_fd_;
 		void* cxl_addr_;
 		void* bitmap_;
