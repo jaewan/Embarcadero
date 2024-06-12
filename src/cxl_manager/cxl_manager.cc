@@ -179,7 +179,6 @@ void CXLManager::CXL_io_thread(){
 #endif
 		}else if(req.acknowledge){
 			struct NetworkRequest ackReq;
-			ackReq.req_type = Acknowledge;
 			ackReq.client_socket = req.client_socket;
 			network_manager_->EnqueueRequest(ackReq);
 		}
@@ -211,12 +210,31 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 	return topic_manager_->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
 }
 
-void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType){
 	topic_manager_->CreateNewTopic(topic, order);
-	if (order == 1){
-		sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic);
-	}else if (order == 2)
-		sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic);
+	if (order == 0)
+		return;
+	switch(sequencerType){
+		case Embarcadero:
+			if (order == 1)
+				sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic);
+			else if (order == 2)
+				sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic);
+			break;
+		case Scalog:
+			if (order == 1){
+				//TODO(Tony) fill this
+			}else if (order == 2)
+				LOG(ERROR) << "Order is set 2 at scalog";
+			break;
+		case Corfu:
+			if (order == 1)
+				LOG(ERROR) << "Order is set 1 at corfu";
+			else if (order == 2){
+				//TODO(Erika) fill this
+			}
+			break;
+	}
 }
 
 void CXLManager::Sequencer1(char* topic){

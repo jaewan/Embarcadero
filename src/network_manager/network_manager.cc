@@ -88,54 +88,71 @@ void NetworkManager::ReqReceiveThread(){
 			break;
 		}
 		const struct NetworkRequest &req = optReq.value();
-		switch(req.req_type){
-			case Receive:
-				//TODO(Jae) define if its publish or subscribe
-
-				{
-				struct sockaddr_in client_address;
-				socklen_t client_address_len = sizeof(client_address);
-				getpeername(req.client_socket, (struct sockaddr*)&client_address, &client_address_len);
-				// Set socket as non-blocking and epoll
+		struct sockaddr_in client_address;
+		socklen_t client_address_len = sizeof(client_address);
+		getpeername(req.client_socket, (struct sockaddr*)&client_address, &client_address_len);
 #ifdef EPOLL
-				make_socket_non_blocking(req.client_socket);
-				struct epoll_event event;
-				int efd = req.efd;
-				event.data.fd = req.client_socket;
-				//TODO(Jae) add write after read test
-				event.events = EPOLLIN;
-				if(epoll_ctl(efd, EPOLL_CTL_ADD, req.client_socket, &event) == -1){
-					std::cerr << "!!!!! Error epoll_ctl:" << strerror(errno) << std::endl;
-					return;
-				}
+		// Set socket as non-blocking and epoll
+		make_socket_non_blocking(req.client_socket);
+		struct epoll_event event;
+		int efd = req.efd;
+		event.data.fd = req.client_socket;
+		//TODO(Jae) add write after read test
+		event.events = EPOLLIN;
+		if(epoll_ctl(efd, EPOLL_CTL_ADD, req.client_socket, &event) == -1){
+			std::cerr << "!!!!! Error epoll_ctl:" << strerror(errno) << std::endl;
+			return;
+		}
 
-				struct epoll_event events[MAX_EVENTS]; 
+		struct epoll_event events[MAX_EVENTS]; 
 
-				//Handshake
-				EmbarcaderoReq shake;
-				int i,n;
-				size_t to_read = sizeof(shake);
-				bool running = true;
-				while(to_read > 0){
- 					n = epoll_wait(efd, events, MAX_EVENTS, -1);
-					for( i=0; i< n; i++){
-						if((events[i].events & EPOLLIN) && events[i].data.fd == req.client_socket){
-							int ret = read(req.client_socket, &shake, to_read);
-							to_read -= ret;
-							if(to_read == 0){
-								if(i == n-1){
-									n = epoll_wait(efd, events, MAX_EVENTS, -1);
-								}
-								break;
-							}
+		//Handshake
+		EmbarcaderoReq shake;
+		int i,n;
+		size_t to_read = sizeof(shake);
+		bool running = true;
+		while(to_read > 0){
+			n = epoll_wait(efd, events, MAX_EVENTS, -1);
+			for( i=0; i< n; i++){
+				if((events[i].events & EPOLLIN) && events[i].data.fd == req.client_socket){
+					int ret = read(req.client_socket, &shake, to_read);
+					to_read -= ret;
+					if(to_read == 0){
+						if(i == n-1){
+							n = epoll_wait(efd, events, MAX_EVENTS, -1);
 						}
+						break;
 					}
 				}
+			}
+		}, messages;
+#else
+		//Handshake
+		EmbarcaderoReq shake;
+		size_t to_read = sizeof(shake);
+		bool running = true;
+		while(to_read > 0){
+				int ret = recv(req.client_socket, &shake, to_read, 0);
+				if(ret < 0){
+					LOG(INFO) << "Error receiving shake:" << strerror(errno);
+					return;
+				}
+				to_read -= ret;
+				if(to_read == 0){
+					break;
+				}
+		}
+#endif
+		VLOG(3) << "[DEBUG] Client shake finished";
 
-				VLOG(3) << "[DEBUG] Publish req shake";
+
+		switch(shake.client_req){
+			case Publish:
+				{
+#ifdef EPOLL
 				size_t READ_SIZE = shake.size;
 				to_read = READ_SIZE;
-				void* buf = malloc(READ_SIZE);
+				void* buf = mi_malloc(READ_SIZE);
 
 				// Create publish request
 				struct PublishRequest pub_req;
@@ -171,7 +188,7 @@ void NetworkManager::ReqReceiveThread(){
 								pub_req.size = header->size;
 								pub_req.client_order = header->client_order;
 								pub_req.payload_address = (void*)buf;
-								pub_req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>)); 
+								pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
 								pub_req.counter->store(2);
 								cxl_manager_->EnqueueRequest(pub_req);
 								disk_manager_->EnqueueRequest(pub_req);
@@ -183,26 +200,9 @@ void NetworkManager::ReqReceiveThread(){
 					}
 					n = epoll_wait(efd, events, 10, -1);
 					i = 0;
-			}
-#else
-				//Handshake
-				EmbarcaderoReq shake;
-				size_t to_read = sizeof(shake);
-				bool running = true;
-				while(to_read > 0){
-						int ret = recv(req.client_socket, &shake, to_read, 0);
-						if(ret < 0){
-							LOG(INFO) << "Error receiving shake:" << strerror(errno);
-							return;
-						}
-						to_read -= ret;
-						if(to_read == 0){
-							break;
-						}
 				}
-
-				VLOG(3) << "[DEBUG] Publish req shake finished";
-				//TODO(Jae) This code asumes there's only one active client publishing
+#else
+				// TODO(Jae) This code asumes there's only one active client publishing
 				// If there are parallel clients, change the ack queue
 				int ack_fd = req.client_socket;
 				if(shake.ack){
@@ -257,7 +257,7 @@ void NetworkManager::ReqReceiveThread(){
 				}
 				size_t READ_SIZE = shake.size;
 				to_read = READ_SIZE;
-				void* buf = malloc(READ_SIZE);
+				void* buf = mi_malloc(READ_SIZE);
 
 				// Create publish request
 				struct PublishRequest pub_req;
@@ -293,18 +293,46 @@ void NetworkManager::ReqReceiveThread(){
 							pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
 							pub_req.counter->store(2);
 							cxl_manager_->EnqueueRequest(pub_req);
-							//disk_manager_->EnqueueRequest(pub_req);
+							disk_manager_->EnqueueRequest(pub_req);
 							buf = mi_malloc(READ_SIZE);
 							to_read = READ_SIZE;
 						}
 				}
 #endif
-
-				//close(req.client_socket);
-				}// end Receive
+				close(req.client_socket);
+				}// end Publish
 				break;
-			case Send:
-				std::cout << "Send" << std::endl;
+			case Subscribe:
+				{
+				size_t last_offset = shake.client_order;
+				void* last_addr = shake.last_addr;
+				void* messages;
+				size_t messages_size;
+				bool no_updates = false;
+				SubscribeShake reply_shake;
+				do{
+					if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
+						VLOG(3) << "read :" << last_offset;
+						reply_shake.size = messages_size;
+						// Send
+						// send(req.client_socket, messages, messages_size, 0);
+					}else{
+						reply_shake.size = 0;
+						// send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
+						VLOG(3) << "Did not read anything";
+						no_updates = true;
+						break;
+					}
+					//TODO(Jae)
+					// Send the messages to the client
+					// send(req.client_socket, messages, messages_size, 0);
+				}while(last_addr != nullptr);
+
+				if(!no_updates){
+					reply_shake.size = 0;
+					// send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
+				}
+				}//end Subscribe
 				break;
 		}
 	}
@@ -447,7 +475,6 @@ void NetworkManager::MainThread(){
 		for(int i=0; i< n; i++){
 			if (events[i].data.fd == server_socket) {
 				struct NetworkRequest req;
-				req.req_type = Receive;
 				req.efd = efd;
 				struct sockaddr_in client_addr;
 				socklen_t client_addr_len = sizeof(client_addr);
