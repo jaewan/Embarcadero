@@ -18,7 +18,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	broker_id_(broker_id),
 	num_io_threads_(num_io_threads){
 	// Initialize CXL
-	cxl_type_ = Real;
+	cxl_type_ = Emul;
 	std::string cxl_path(getenv("HOME"));
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
