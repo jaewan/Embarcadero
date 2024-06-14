@@ -16,9 +16,9 @@ namespace Embarcadero{
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
 #define SEGMENT_SIZE (1UL << 37)
-#define NUM_DISK_IO_THREADS 32 
-#define NUM_CXL_IO_THREADS 128 
-#define NUM_NETWORK_IO_THREADS 32
+#define NUM_DISK_IO_THREADS 8 
+#define NUM_CXL_IO_THREADS 32 
+#define NUM_NETWORK_IO_THREADS 8
 #define NUM_ACK_THREADS 1
 
 //********* Health check configs *********
@@ -31,6 +31,8 @@ namespace Embarcadero{
 /// The threshold for the amount of retries we do before we consider a node dead.
 #define HEALTH_CHECK_FAILURE_THRESHOLD 5
 
+//********* Health check configs *********
+#define CGROUP_CORE 85
 struct PublishRequest{
 	int client_id;
 	size_t client_order; // Must start from 0

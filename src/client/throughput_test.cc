@@ -15,6 +15,7 @@
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
 #include <mimalloc.h>
+#include <sched.h>
 
 #include "common/config.h"
 #include "../cxl_manager/cxl_manager.h"
@@ -381,6 +382,28 @@ void MultipleClientsSingleThread(size_t num_threads, size_t total_message_size, 
 	LOG(INFO) << "Bandwidth:" << bandwidthMbps << " MBps" ;
 }
 
+// Checks if Cgroup is successful. Wait for 1 second to allow the process to be attached to the cgroup
+bool CheckAvailableCores(){
+	sleep(1);
+	size_t num_cores = 0;
+	cpu_set_t mask;
+	CPU_ZERO(&mask);
+
+	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
+			perror("sched_getaffinity");
+			exit(EXIT_FAILURE);
+	}
+
+	printf("This process can run on CPUs: ");
+	for (int i = 0; i < CPU_SETSIZE; i++) {
+			if (CPU_ISSET(i, &mask)) {
+					printf("%d ", i);
+					num_cores++;
+			}
+	}
+	return num_cores == CGROUP_CORE;
+}
+
 int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
@@ -401,6 +424,10 @@ int main(int argc, char* argv[]) {
 	int ack_level = result["ack_level"].as<int>();
 	FLAGS_v = result["log_level"].as<int>();
 
+	if(!CheckAvailableCores()){
+		LOG(ERROR) << "CGroup core throttle is wrong";
+		return -1;
+	}
 	SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level, true);
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 

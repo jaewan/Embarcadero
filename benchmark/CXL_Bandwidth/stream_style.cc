@@ -55,38 +55,38 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	memcpy(dst, src, n);
 }
 void memcpy_nt(void* dst, const void* src, size_t size) {
-    // Cast the input pointers to the appropriate types
-    uint8_t* d = static_cast<uint8_t*>(dst);
-    const uint8_t* s = static_cast<const uint8_t*>(src);
+	// Cast the input pointers to the appropriate types
+	uint8_t* d = static_cast<uint8_t*>(dst);
+	const uint8_t* s = static_cast<const uint8_t*>(src);
 
-    // Align the destination pointer to 16-byte boundary
-    size_t alignment = reinterpret_cast<uintptr_t>(d) & 0xF;
-    if (alignment) {
-        alignment = 16 - alignment;
-        size_t copy_size = (alignment > size) ? size : alignment;
-        std::memcpy(d, s, copy_size);
-        d += copy_size;
-        s += copy_size;
-        size -= copy_size;
-    }
+	// Align the destination pointer to 16-byte boundary
+	size_t alignment = reinterpret_cast<uintptr_t>(d) & 0xF;
+	if (alignment) {
+		alignment = 16 - alignment;
+		size_t copy_size = (alignment > size) ? size : alignment;
+		std::memcpy(d, s, copy_size);
+		d += copy_size;
+		s += copy_size;
+		size -= copy_size;
+	}
 
-    // Copy the bulk of the data using non-temporal stores
-    size_t block_size = size / 64;
-    for (size_t i = 0; i < block_size; ++i) {
-        _mm_stream_si64(reinterpret_cast<long long*>(d), *reinterpret_cast<const long long*>(s));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 8), *reinterpret_cast<const long long*>(s + 8));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 16), *reinterpret_cast<const long long*>(s + 16));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 24), *reinterpret_cast<const long long*>(s + 24));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 32), *reinterpret_cast<const long long*>(s + 32));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 40), *reinterpret_cast<const long long*>(s + 40));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 48), *reinterpret_cast<const long long*>(s + 48));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 56), *reinterpret_cast<const long long*>(s + 56));
-        d += 64;
-        s += 64;
-    }
+	// Copy the bulk of the data using non-temporal stores
+	size_t block_size = size / 64;
+	for (size_t i = 0; i < block_size; ++i) {
+		_mm_stream_si64(reinterpret_cast<long long*>(d), *reinterpret_cast<const long long*>(s));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 8), *reinterpret_cast<const long long*>(s + 8));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 16), *reinterpret_cast<const long long*>(s + 16));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 24), *reinterpret_cast<const long long*>(s + 24));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 32), *reinterpret_cast<const long long*>(s + 32));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 40), *reinterpret_cast<const long long*>(s + 40));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 48), *reinterpret_cast<const long long*>(s + 48));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 56), *reinterpret_cast<const long long*>(s + 56));
+		d += 64;
+		s += 64;
+	}
 
-    // Copy the remaining data using standard memcpy
-    std::memcpy(d, s, size % 64);
+	// Copy the remaining data using standard memcpy
+	std::memcpy(d, s, size % 64);
 }
 
 void* vbuf;
@@ -95,7 +95,7 @@ void atomicMemoryCpy(void* arr, int start, int end) {
 	int num = ((end - start)*sizeof(double))/size;
 	while(0 < num){
 		size_t off = off_.fetch_add(size);
-		memcpy_nt((uint8_t*)arr + off, (uint8_t*)vbuf + off, size);
+		nt_memcpy((uint8_t*)arr + off, (uint8_t*)vbuf + off, size);
 		num--;
 	}
 }
@@ -107,15 +107,16 @@ void memoryCpy(double* arr, int start, int end) {
 	void* addr = &arr[start];
 	size_t off = 0;
 	while(off < (end-start)){
-		nt_memcpy((uint8_t*)&arr[start]+size, (uint8_t*)buf+size, size);
+		//nt_memcpy((uint8_t*)&arr[start]+size, (uint8_t*)buf+size, size);
+		memcpy_nt((uint8_t*)&arr[start]+size, (uint8_t*)buf+size, size);
 		off += size;
 	}
 }
 
 void writeMemory(double* arr, int start, int end) {
-    for (int i = start; i < end; ++i) {
-        arr[i] = 0.0;
-    }
+	for (int i = start; i < end; ++i) {
+		arr[i] = 0.0;
+	}
 }
 
 int main() {
@@ -131,40 +132,40 @@ int main() {
 		close(fd);
 		return 1;
 	}
-	//double* arr = (double*)dax_addr;
-    double* arr = new double[ARRAY_SIZE];
-	
+	double* arr = (double*)dax_addr;
+	//double* arr = new double[ARRAY_SIZE];
+
 	buf = (double*)malloc(sizeof(double)*ARRAY_SIZE);
 	vbuf = malloc(sizeof(double)*ARRAY_SIZE);
 
-    std::thread threads[NUM_THREADS];
-    long long int chunkSize = ARRAY_SIZE / NUM_THREADS;
+	std::thread threads[NUM_THREADS];
+	long long int chunkSize = ARRAY_SIZE / NUM_THREADS;
 
-    auto start = std::chrono::high_resolution_clock::now();
+	auto start = std::chrono::high_resolution_clock::now();
 
-    // Create and start threads
-    for (int i = 0; i < NUM_THREADS; ++i) {
-        int startIdx = i * chunkSize;
-        int endIdx = (i == NUM_THREADS - 1) ? ARRAY_SIZE : startIdx + chunkSize;
-        threads[i] = std::thread(memoryCpy, arr, startIdx, endIdx);
-        //threads[i] = std::thread(atomicMemoryCpy, dax_addr, startIdx, endIdx);
-    }
+	// Create and start threads
+	for (int i = 0; i < NUM_THREADS; ++i) {
+		int startIdx = i * chunkSize;
+		int endIdx = (i == NUM_THREADS - 1) ? ARRAY_SIZE : startIdx + chunkSize;
+		threads[i] = std::thread(memoryCpy, arr, startIdx, endIdx);
+		//threads[i] = std::thread(atomicMemoryCpy, dax_addr, startIdx, endIdx);
+	}
 
-    // Join threads
-    for (int i = 0; i < NUM_THREADS; ++i) {
-        threads[i].join();
-    }
+	// Join threads
+	for (int i = 0; i < NUM_THREADS; ++i) {
+		threads[i].join();
+	}
 
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end - start;
+	auto end = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> duration = end - start;
 
-    double bytes_written = ARRAY_SIZE * sizeof(double);
-    double bandwidth = bytes_written / (duration.count() * 1024 *1024*1024); // Convert bytes to MB
+	double bytes_written = ARRAY_SIZE * sizeof(double);
+	double bandwidth = bytes_written / (duration.count() * 1024 *1024*1024); // Convert bytes to MB
 
-    std::cout << "Maximum memory write bandwidth: " << bandwidth << " GB/s" << std::endl;
+	std::cout << "Maximum memory write bandwidth: " << bandwidth << " GB/s" << std::endl;
 
-    //delete[] arr;
+	//delete[] arr;
 	munmap(dax_addr, sizeof(double)*ARRAY_SIZE);
 	close(fd);
-    return 0;
+	return 0;
 }

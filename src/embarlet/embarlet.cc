@@ -13,6 +13,7 @@
 #include <set>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <emmintrin.h>
 #include <thread>
@@ -20,6 +21,27 @@
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
 #include "mimalloc.h"
+
+bool CheckAvailableCores(){
+	sleep(1);
+	size_t num_cores = 0;
+	cpu_set_t mask;
+	CPU_ZERO(&mask);
+
+	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
+			perror("sched_getaffinity");
+			exit(EXIT_FAILURE);
+	}
+
+	printf("This process can run on CPUs: ");
+	for (int i = 0; i < CPU_SETSIZE; i++) {
+			if (CPU_ISSET(i, &mask)) {
+					printf("%d ", i);
+					num_cores++;
+			}
+	}
+	return num_cores == CGROUP_CORE;
+}
 
 size_t GetPhysicalCoreCount(){
 	std::ifstream cpuinfo("/proc/cpuinfo");
@@ -296,9 +318,10 @@ int main(int argc, char* argv[]){
   	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
 	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
   	options.add_options()
-		("head", "Head Node")
+			("head", "Head Node")
 			("follower", "Follower Address and Port", cxxopts::value<std::string>())
 			("e,emul", "Use emulation instead of CXL")
+			("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("1"))
 			("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		;
 
@@ -309,7 +332,10 @@ int main(int argc, char* argv[]){
 	//FLAGS_log_dir = "/tmp/vlog2_log";
 
 	//Initialize
-	//size_t num_cores = GetPhysicalCoreCount();
+	if(arguments["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
+		LOG(ERROR) << "CGroup core throttle is wrong";
+		return -1;
+	}
 	int broker_id = 0;
 	Embarcadero::CXLManager cxl_manager((1UL<<23),broker_id);
 	Embarcadero::DiskManager disk_manager((1UL<<23));
