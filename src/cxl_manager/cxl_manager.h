@@ -11,6 +11,7 @@
 #include "../network_manager/network_manager.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_map.h"
+#include "../embarlet/peer.h"
 
 namespace Embarcadero{
 
@@ -66,10 +67,13 @@ struct alignas(64) MessageHeader{
 	void* next_message;
 };
 
-class CXLManager{
+class CXLManager : public ScalogSequencer::Service {
 	public:
 		CXLManager(size_t queueCapacity, int broker_id, int num_io_threads=NUM_CXL_IO_THREADS);
 		~CXLManager();
+		void SetBroker(PeerBroker *broker){
+			broker_ = broker;
+		}
 		void SetTopicManager(TopicManager *topic_manager){
 			topic_manager_ = topic_manager;
 		}
@@ -85,6 +89,30 @@ class CXLManager{
 		void* GetCXLAddr(){
 			return cxl_addr_;
 		}
+
+		/// Create a new rpc client to communicate with a peer broker
+        /// @param peer_url URL of the peer broker
+        /// @return rpc client
+        std::unique_ptr<ScalogSequencer::Stub> GetRpcClient(std::string peer_url);
+
+    	/// Notifies another broker to start their local sequencer for Scalog
+        /// @param context
+        /// @param request Request containing topic and url of the global sequencer
+        /// @param response Empty for now
+		grpc::Status HandleScalogStartLocalSequencer(grpc::ServerContext* context, const ScalogStartLocalSequencerRequest* request, ScalogStartLocalSequencerResponse* response)
+
+    	/// Receives a local cut from a local sequencer
+        /// @param context
+        /// @param request Request containing the local cut and the epoch
+        /// @param response Empty for now
+		grpc::Status HandleScalogSendLocalCutResponse(grpc::ServerContext* context, const ScalogSendLocalCutRequest* request, ScalogSendLocalCutResponse* response)
+
+    	/// Receives the global cut from global sequencer
+        /// @param context
+        /// @param request Request containing the global cut and topic
+        /// @param response Empty for now
+		grpc::Status HandleScalogSendGlobalCutResponse(grpc::ServerContext* context, const ScalogSendGlobalCutRequest* request, ScalogSendGlobalCutResponse* response)
+
 //#define InternalTest 1
 
 #ifdef InternalTest
@@ -119,6 +147,7 @@ class CXLManager{
 
 		TopicManager *topic_manager_;
 		NetworkManager *network_manager_;
+		PeerBroker *broker_;
 
 		CXLType cxl_type_;
 		int cxl_fd_;
@@ -135,6 +164,24 @@ class CXLManager{
 		void Sequencer1(char* topic);
 		void Sequencer2(char* topic);
 
+		absl::flat_hash_map<std::string, int> scalog_local_epoch_;
+
+		absl::flat_hash_map<std::string, int> scalog_global_epoch_;
+
+		absl::flat_hash_map<std::string, int> local_cuts_count_;
+
+		absl::flat_hash_map<std::string, bool> scalog_received_global_seq_;
+
+		absl::flat_hash_map<std::string, std::vector<int>> scalog_global_cut_;
+
+		absl::flat_hash_map<std::string, std::string> scalog_global_sequencer_url_;
+
+		void ScalogLocalSequencer(char* topic, std::string global_sequencer_ur);
+		void ScalogGlobalSequencer(char* topic);
+		void ScalogSendLocalCut(int epoch, int written, std::string global_sequencer_url);
+		void ScalogReceiveGlobalCut(std::vector<int> global_cut, char* topic);
+		void ScalogReceiveLocalCut(int epoch, int written);
+		void ScalogUpdateTotalOrdering(std::vector<int> global_cut, struct TInode *tinode);
 };
 
 } // End of namespace Embarcadero

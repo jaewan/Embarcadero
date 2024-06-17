@@ -308,36 +308,43 @@ int main(int argc, char* argv[]){
 	FLAGS_logtostderr = 1; // log only to console, no files.
 	//FLAGS_log_dir = "/tmp/vlog2_log";
 
-	//Initialize
-	//size_t num_cores = GetPhysicalCoreCount();
-	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager((1UL<<23),broker_id);
-	Embarcadero::DiskManager disk_manager((1UL<<23));
-	Embarcadero::NetworkManager network_manager(128, NUM_NETWORK_IO_THREADS, false);
-	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
-	cxl_manager.SetTopicManager(&topic_manager);
-	cxl_manager.SetNetworkManager(&network_manager);
-	disk_manager.SetNetworkManager(&network_manager);
-	network_manager.SetCXLManager(&cxl_manager);
-	network_manager.SetDiskManager(&disk_manager);
-
+    PeerBroker* broker = nullptr;
+    std::thread broker_thread;
 	if (arguments.count("head")) {
 		// Initialize peer broker
-		PeerBroker head_broker(true);
+		PeerBroker broker(true);
 
-		head_broker.Run();
+		// Create a thread for head_broker and start it
+        broker_thread = std::thread(&PeerBroker::Run, broker);
 	} else if (arguments.count("follower")) {
 		std::string follower = arguments["follower"].as<std::string>();
 
 		std::string head_addr = follower.substr(0, follower.find(":"));
 		std::string head_port = follower.substr(follower.find(":") + 1);
 
-		PeerBroker follower_broker(false, head_addr, head_port);
-		follower_broker.Run();
+		PeerBroker broker(false, head_addr, head_port);
+		
+        // Create a thread for follower_broker and start it
+        broker_thread = std::thread(&PeerBroker::Run, broker);
 	} else {
 		LOG(INFO) << "Invalid arguments";
 	}
+
+	//Initialize
+	//size_t num_cores = GetPhysicalCoreCount();
+	int broker_id = 0;
+	Embarcadero::CXLManager cxl_manager((1UL<<23), broker_id);
+	Embarcadero::DiskManager disk_manager((1UL<<23));
+	Embarcadero::NetworkManager network_manager(128, NUM_NETWORK_IO_THREADS, false);
+	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
+
+	cxl_manager.SetBroker(&broker);
+	cxl_manager.SetTopicManager(&topic_manager);
+	cxl_manager.SetNetworkManager(&network_manager);
+	disk_manager.SetNetworkManager(&network_manager);
+	network_manager.SetCXLManager(&cxl_manager);
+	network_manager.SetDiskManager(&disk_manager);
 
 	//********* Load Generate **************
 	char topic[31];
