@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include "peer.h"
 
+namespace Embarcadero{
+
 PeerBroker::PeerBroker(bool is_head, std::string address, std::string port) 
     : io_service_thread_(std::make_unique<std::thread>([this] {
           // Keep io_service_ alive.
@@ -255,3 +257,5 @@ void PeerBroker::Run() {
         server->Wait();
     }
 }
+
+} // End of namespace Embarcadero

@@ -9,6 +9,8 @@
 #include <boost/asio.hpp>
 #include "common/config.h"
 
+namespace Embarcadero{
+
 /// Class for a single broker
 class PeerBroker : public Peer::Service {
     public:
@@ -22,6 +24,18 @@ class PeerBroker : public Peer::Service {
         /// Fetch the ip address of the host broker
         /// @return ip address as a string
         std::string GetAddress();
+
+        /// Fetch the URL of the broker
+        /// @return url as a string
+        std::string GetUrl() {
+            return address_ + ":" + port_;
+        }
+
+        /// Fetch the peer brokers of the broker
+        /// @return peer brokers as a hashmap
+        absl::flat_hash_map<std::string, std::string> GetPeerBrokers() {
+            return peer_brokers_;
+        }
 
         /// Create a new rpc client to communicate with a peer broker
         /// @param peer_url URL of the peer broker
@@ -142,4 +156,5 @@ class PeerBroker : public Peer::Service {
         int64_t failure_threshold_;
 };
 
+} // End of namespace Embarcadero
 #endif

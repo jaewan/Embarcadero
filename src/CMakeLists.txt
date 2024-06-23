@@ -1,4 +1,5 @@
 include(cmake/peer_grpc.cmake)
+include(cmake/scalog_sequencer_grpc.cmake)
 
 # These are required for a folly build
 # folly cmake mostly from here: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
@@ -34,6 +35,7 @@ target_link_libraries(embarlet
 	mimalloc
     absl::flat_hash_map 
     peer_grpc_proto
+    scalog_sequencer_grpc_proto
     cxxopts::cxxopts
     ${_REFLECTION}
     ${_GRPC_GRPCPP}

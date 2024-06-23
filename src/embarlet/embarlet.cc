@@ -309,26 +309,29 @@ int main(int argc, char* argv[]){
 	//FLAGS_log_dir = "/tmp/vlog2_log";
 
 
-    PeerBroker* broker = nullptr;
+    // Embarcadero::PeerBroker* broker = nullptr;
+	std::shared_ptr<Embarcadero::PeerBroker> broker;
     std::thread broker_thread;
 	if (arguments.count("head")) {
 		// Initialize peer broker
-		PeerBroker broker(true);
+		// Embarcadero::PeerBroker broker(true);
+		broker = std::make_shared<Embarcadero::PeerBroker>(true);
 
 		// Create a thread for head_broker and start it
-        broker_thread = std::thread(&PeerBroker::Run, broker);
+        broker_thread = std::thread(&Embarcadero::PeerBroker::Run, broker);
 	} else if (arguments.count("follower")) {
 		std::string follower = arguments["follower"].as<std::string>();
 
 		std::string head_addr = follower.substr(0, follower.find(":"));
 		std::string head_port = follower.substr(follower.find(":") + 1);
 
-		PeerBroker broker(false, head_addr, head_port);
-		
+		// Embarcadero::PeerBroker broker(false, head_addr, head_port);
+		broker = std::make_shared<Embarcadero::PeerBroker>(false, head_addr, head_port);
+
         // Create a thread for follower_broker and start it
-        broker_thread = std::thread(&PeerBroker::Run, broker);
+        broker_thread = std::thread(&Embarcadero::PeerBroker::Run, broker);
 	} else {
-		LOG(INFO) << "Invalid arguments";
+		LOG(ERROR) << "Invalid arguments to initialize broker";
 	}
 
 	//Initialize
@@ -339,7 +342,7 @@ int main(int argc, char* argv[]){
 	Embarcadero::NetworkManager network_manager(128, NUM_NETWORK_IO_THREADS, false);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
-	cxl_manager.SetBroker(&broker);
+	cxl_manager.SetBroker(broker);
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);
 	disk_manager.SetNetworkManager(&network_manager);
