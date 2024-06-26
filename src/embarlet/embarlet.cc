@@ -288,6 +288,46 @@ void ReadWriteTest(){
 	return ;
 }
 
+void ScalogOrderTest(Embarcadero::CXLManager *cxl_manager, char* topic) {
+	int num_messages = 5;
+
+	for (int i = 0; i < num_messages; i++) {
+		Embarcadero::PublishRequest req;
+		memset(req.topic, 0, 31);
+		req.topic[0] = '0';
+		req.client_id = 0;
+		req.client_order = i;
+		req.size = 777;
+		req.payload_address = malloc(1024);
+		memcpy((uint8_t*)req.payload_address + 64, "testing write read", 18);
+		Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
+		header->client_id = 0;
+		header->client_order = i;
+		header->size = 777;
+		header->total_order = 0;
+		header->paddedSize = 64 - (777 % 64) + 777;
+		header->segment_header = nullptr;
+		header->logical_offset = (size_t)-1; // Sentinel value
+		header->next_message = nullptr;
+		cxl_manager->EnqueueRequest(req);
+	}
+
+
+	sleep(5);
+
+	absl::flat_hash_map<std::string, std::vector<int>> global_cut_map = cxl_manager->ScalogGetGlobalCut();
+	std::vector<int> global_cut = global_cut_map[topic];
+
+	// print global cut
+	std::cout << "Contents of global_cut for topic \"" << topic << "\":" << std::endl;
+	for (int value : global_cut) {
+		std::cout << value << " ";
+	}
+	std::cout << std::endl;  // To add a newline at the end
+
+	return ;
+}
+
 int main(int argc, char* argv[]){
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
@@ -312,7 +352,10 @@ int main(int argc, char* argv[]){
     // Embarcadero::PeerBroker* broker = nullptr;
 	std::shared_ptr<Embarcadero::PeerBroker> broker;
     std::thread broker_thread;
+	bool is_head;
 	if (arguments.count("head")) {
+		is_head = true;
+
 		// Initialize peer broker
 		// Embarcadero::PeerBroker broker(true);
 		broker = std::make_shared<Embarcadero::PeerBroker>(true);
@@ -320,6 +363,8 @@ int main(int argc, char* argv[]){
 		// Create a thread for head_broker and start it
         broker_thread = std::thread(&Embarcadero::PeerBroker::Run, broker);
 	} else if (arguments.count("follower")) {
+		is_head = false;
+
 		std::string follower = arguments["follower"].as<std::string>();
 
 		std::string head_addr = follower.substr(0, follower.find(":"));
@@ -349,14 +394,26 @@ int main(int argc, char* argv[]){
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
 
-	//********* Load Generate **************
+	// //********* Load Generate **************
+	// char topic[31];
+	// memset(topic, 0, 31);
+	// topic[0] = '0';
+	// int order = 0;
+	// topic_manager.CreateNewTopic(topic, order);
+
+	//********* Load Generate For Scalog **************
 	char topic[31];
 	memset(topic, 0, 31);
 	topic[0] = '0';
-	int order = 0;
-	topic_manager.CreateNewTopic(topic, order);
+	if (is_head) {
+		int order = 1;
+		topic_manager.CreateNewTopic(topic, order);
+	}
 
 	std::cout << "You are now safe to go" << std::endl;
+
+	ScalogOrderTest(&cxl_manager, topic);
+
 	//cxl_manager.StartInternalTest();
 	
 	// *********** E2E Bandwidth Teste ******************* //

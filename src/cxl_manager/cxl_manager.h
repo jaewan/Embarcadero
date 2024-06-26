@@ -93,6 +93,10 @@ class CXLManager : public ScalogSequencer::Service {
 			return cxl_addr_;
 		}
 
+		absl::flat_hash_map<std::string, std::vector<int>> ScalogGetGlobalCut() {
+			return scalog_global_cut_;
+		}
+
 		/// Create a new rpc client to communicate with a peer broker
         /// @param peer_url URL of the peer broker
         /// @return rpc client
