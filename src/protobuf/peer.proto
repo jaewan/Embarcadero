@@ -28,7 +28,10 @@ message ReportNewBrokerRequest {
 message ReportNewBrokerResponse {}
 
 /// Empty request for now
-message HealthCheckRequest {}
+message HealthCheckRequest {
+    string address = 1;
+    string port = 2;
+}
 
 /// Empty response for now
 message HealthCheckResponse {}

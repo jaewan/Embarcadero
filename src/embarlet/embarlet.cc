@@ -310,6 +310,46 @@ void ReadWriteTest(){
 	return ;
 }
 
+void ScalogOrderTest(Embarcadero::CXLManager *cxl_manager, char* topic) {
+	int num_messages = 5;
+
+	for (int i = 0; i < num_messages; i++) {
+		Embarcadero::PublishRequest req;
+		memset(req.topic, 0, 31);
+		req.topic[0] = '0';
+		req.client_id = 0;
+		req.client_order = i;
+		req.size = 777;
+		req.payload_address = malloc(1024);
+		memcpy((uint8_t*)req.payload_address + 64, "testing write read", 18);
+		Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
+		header->client_id = 0;
+		header->client_order = i;
+		header->size = 777;
+		header->total_order = 0;
+		header->paddedSize = 64 - (777 % 64) + 777;
+		header->segment_header = nullptr;
+		header->logical_offset = (size_t)-1; // Sentinel value
+		header->next_message = nullptr;
+		cxl_manager->EnqueueRequest(req);
+	}
+
+
+	sleep(5);
+
+	absl::flat_hash_map<std::string, std::vector<int>> global_cut_map = cxl_manager->ScalogGetGlobalCut();
+	std::vector<int> global_cut = global_cut_map[topic];
+
+	// print global cut
+	std::cout << "Contents of global_cut for topic \"" << topic << "\":" << std::endl;
+	for (int value : global_cut) {
+		std::cout << value << " ";
+	}
+	std::cout << std::endl;  // To add a newline at the end
+
+	return ;
+}
+
 int main(int argc, char* argv[]){
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
@@ -331,48 +371,75 @@ int main(int argc, char* argv[]){
 	FLAGS_logtostderr = 1; // log only to console, no files.
 	//FLAGS_log_dir = "/tmp/vlog2_log";
 
+
+    // Embarcadero::PeerBroker* broker = nullptr;
+	std::shared_ptr<Embarcadero::PeerBroker> broker;
+    std::thread broker_thread;
+	bool is_head;
+	if (arguments.count("head")) {
+		is_head = true;
+
+		// Initialize peer broker
+		// Embarcadero::PeerBroker broker(true);
+		broker = std::make_shared<Embarcadero::PeerBroker>(true);
+
+		// Create a thread for head_broker and start it
+        broker_thread = std::thread(&Embarcadero::PeerBroker::Run, broker);
+	} else if (arguments.count("follower")) {
+		is_head = false;
+
+		std::string follower = arguments["follower"].as<std::string>();
+
+		std::string head_addr = follower.substr(0, follower.find(":"));
+		std::string head_port = follower.substr(follower.find(":") + 1);
+
+		// Embarcadero::PeerBroker broker(false, head_addr, head_port);
+		broker = std::make_shared<Embarcadero::PeerBroker>(false, head_addr, head_port);
+
+        // Create a thread for follower_broker and start it
+        broker_thread = std::thread(&Embarcadero::PeerBroker::Run, broker);
+	} else {
+		LOG(ERROR) << "Invalid arguments to initialize broker";
+	}
+
 	//Initialize
 	if(arguments["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
 		LOG(ERROR) << "CGroup core throttle is wrong";
 		return -1;
 	}
 	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager((1UL<<23),broker_id);
+	Embarcadero::CXLManager cxl_manager((1UL<<23), broker_id);
 	Embarcadero::DiskManager disk_manager((1UL<<23));
 	Embarcadero::NetworkManager network_manager(128, NUM_NETWORK_IO_THREADS, false);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
+	cxl_manager.SetBroker(broker);
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);
 	disk_manager.SetNetworkManager(&network_manager);
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
 
-	if (arguments.count("head")) {
-		// Initialize peer broker
-		PeerBroker head_broker(true);
+	// //********* Load Generate **************
+	// char topic[31];
+	// memset(topic, 0, 31);
+	// topic[0] = '0';
+	// int order = 0;
+	// topic_manager.CreateNewTopic(topic, order);
 
-		head_broker.Run();
-	} else if (arguments.count("follower")) {
-		std::string follower = arguments["follower"].as<std::string>();
-
-		std::string head_addr = follower.substr(0, follower.find(":"));
-		std::string head_port = follower.substr(follower.find(":") + 1);
-
-		PeerBroker follower_broker(false, head_addr, head_port);
-		follower_broker.Run();
-	} else {
-		LOG(INFO) << "Invalid arguments";
-	}
-
-	//********* Load Generate **************
+	//********* Load Generate For Scalog **************
 	char topic[31];
 	memset(topic, 0, 31);
 	topic[0] = '0';
-	int order = 0;
-	topic_manager.CreateNewTopic(topic, order);
+	if (is_head) {
+		int order = 1;
+		topic_manager.CreateNewTopic(topic, order);
+	}
 
 	std::cout << "You are now safe to go" << std::endl;
+
+	ScalogOrderTest(&cxl_manager, topic);
+
 	//cxl_manager.StartInternalTest();
 	
 	// *********** E2E Bandwidth Teste ******************* //
