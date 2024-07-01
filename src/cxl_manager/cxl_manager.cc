@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <iostream>
+#include <future>
 #include <cstdlib>
 #include <cstring>
 #include <errno.h>
@@ -370,7 +371,10 @@ void CXLManager::ScalogSendLocalCut(int epoch, int written, const char* topic) {
 
 		std::cout << "Detected global sequencer on this machine, so sending the local cut without grpc" << std::endl;
 
-		ScalogReceiveLocalCut(epoch, written, topic, broker_id_);
+		std::async(std::launch::async, &CXLManager::ScalogReceiveLocalCut, this, epoch, written, topic, broker_id_);
+		// ScalogReceiveLocalCut(epoch, written, topic, broker_id_);
+
+		std::cout << "Asynchronously sent local cut" << std::endl;
 	} else {
 
 		std::cout << "Sending local cut to " << scalog_global_sequencer_url_[topic] << " with grpc" << std::endl;
@@ -417,7 +421,8 @@ void CXLManager::ScalogReceiveLocalCut(int epoch, int local_cut, const char* top
 		std::cout << "All local cuts for epoch " << epoch << " have been received, sending global cut" << std::endl;
 
 		// Send global cut to own node's local sequencer
-		ScalogReceiveGlobalCut(scalog_global_cut_[topic], topic);
+		std::async(std::launch::async, &CXLManager::ScalogReceiveGlobalCut, this, scalog_global_cut_[topic], topic);
+		// ScalogReceiveGlobalCut(scalog_global_cut_[topic], topic);
 
 		// Iterate through broker list and call async grpc to send global cut
 		for (auto const& peer : broker_->GetPeerBrokers()) {
@@ -526,7 +531,8 @@ grpc::Status CXLManager::HandleScalogSendLocalCut(grpc::ServerContext* context, 
 		std::cout << "All local cuts for epoch " << epoch << " have been received, sending global cut" << std::endl;
 
 		// Send global cut to own node's local sequencer
-		ScalogReceiveGlobalCut(scalog_global_cut_[topic], topic);
+		std::async(std::launch::async, &CXLManager::ScalogReceiveGlobalCut, this, scalog_global_cut_[topic], topic);
+		// ScalogReceiveGlobalCut(scalog_global_cut_[topic], topic);
 
 		// Iterate through broker list and call async grpc to send global cut
 		for (auto const& peer : broker_->GetPeerBrokers()) {
