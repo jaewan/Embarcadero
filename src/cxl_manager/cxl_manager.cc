@@ -408,8 +408,6 @@ void CXLManager::ScalogReceiveLocalCut(int epoch, int local_cut, const char* top
 		exit(1);
 	}
 
-	std::cout << "Received local cut without grpc" << std::endl;
-
 	// Insert local cut into global cut
 	scalog_global_cut_[topic][broker_id] = local_cut;
 
@@ -514,53 +512,7 @@ grpc::Status CXLManager::HandleScalogSendLocalCut(grpc::ServerContext* context, 
 
 	std::cout << "Received local cut with grpc" << std::endl;
 
-	if (epoch != scalog_global_epoch_[topic]) {
-		// If the epoch is not the same as the current global epoch, there is an error
-		LOG(ERROR) << "Local cut from local sequencer was sent too early, global sequencer has not yet sent the global cut";
-		exit(1);
-	}
-
-	// Insert local cut into global cut
-	scalog_global_cut_[topic][broker_id] = local_cut;
-
-	// increment local_cuts_count_
-	scalog_local_cuts_count_[topic]++;
-
-	if (scalog_local_cuts_count_[topic] == NUM_BROKERS) {
-
-		std::cout << "All local cuts for epoch " << epoch << " have been received, sending global cut" << std::endl;
-
-		// Send global cut to own node's local sequencer
-		std::async(std::launch::async, &CXLManager::ScalogReceiveGlobalCut, this, scalog_global_cut_[topic], topic);
-		// ScalogReceiveGlobalCut(scalog_global_cut_[topic], topic);
-
-		// Iterate through broker list and call async grpc to send global cut
-		for (auto const& peer : broker_->GetPeerBrokers()) {
-			std::string peer_url = peer.first + ":" + peer.second;
-			auto rpc_client = GetRpcClient(peer_url);
-
-			std::cout << "Sending global cut to " << peer_url << std::endl;
-
-			ScalogSendGlobalCutRequest request;
-			for (int value : scalog_global_cut_[topic]) {
-				request.add_global_cut(value);
-			}
-
-			ScalogSendGlobalCutResponse response;
-			grpc::ClientContext context;
-
-			auto callback = [](grpc::Status status) {
-				if (!status.ok()) {
-					std::cout << "Error sending global cut request" << std::endl;
-				}
-			};
-
-			rpc_client->async()->HandleScalogSendGlobalCut(&context, &request, &response, callback);
-		}
-
-		scalog_local_cuts_count_[topic] = 0;
-		scalog_global_epoch_[topic]++;
-	}
+	ScalogReceiveLocalCut(epoch, local_cut, topic, broker_id);
 
 	return grpc::Status::OK;
 }
