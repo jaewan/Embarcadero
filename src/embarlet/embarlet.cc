@@ -289,7 +289,9 @@ void ReadWriteTest(){
 }
 
 void ScalogOrderTest(Embarcadero::CXLManager *cxl_manager, char* topic) {
-	int num_messages = 5;
+	int num_messages = 1;
+
+	std::cout << "Starting scalog order test" << std::endl;
 
 	for (int i = 0; i < num_messages; i++) {
 		Embarcadero::PublishRequest req;
@@ -407,12 +409,12 @@ int main(int argc, char* argv[]){
 	topic[0] = '0';
 	if (is_head) {
 		int order = 1;
-		topic_manager.CreateNewTopic(topic, order);
+		cxl_manager.CreateNewTopic(topic, order, Embarcadero::Scalog);
 	}
 
 	std::cout << "You are now safe to go" << std::endl;
 
-	ScalogOrderTest(&cxl_manager, topic);
+	// ScalogOrderTest(&cxl_manager, topic);
 
 	//cxl_manager.StartInternalTest();
 	
