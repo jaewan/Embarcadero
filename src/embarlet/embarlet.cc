@@ -61,6 +61,7 @@ double NUM_THREADS = 40;
 void CXLWriteBandwidthTest(int tid){
 	Embarcadero::PublishRequest req;
 	memset(req.topic, 0, 31);
+	req.topic[0] = '0';
 	std::sprintf(req.topic, "%d", tid%NUM_TOPICS);
 	req.client_id = 0;
 	req.acknowledge = 1;
