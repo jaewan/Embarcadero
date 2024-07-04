@@ -333,6 +333,8 @@ void CXLManager::ScalogLocalSequencer(const char* topic, std::string global_sequ
 
 		std::cout << "Sending the first local cut to " << global_sequencer_url << std::endl;
 
+		std::cout << "Sending local cut: " << tinode->offsets[broker_id_].written << std::endl;
+
 		// send epoch and tinode->offsets[broker_id_].written to global sequencer
 		ScalogSendLocalCut(scalog_local_epoch_[topic], tinode->offsets[broker_id_].written, topic);
 
@@ -344,6 +346,8 @@ void CXLManager::ScalogLocalSequencer(const char* topic, std::string global_sequ
 		scalog_received_global_seq_[topic] = false;
 
 		std::cout << "Set received global seq to false" << std::endl;
+
+		std::cout << "Sending local cut: " << tinode->offsets[broker_id_].written << std::endl;
 
 		/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
 		ScalogSendLocalCut(scalog_local_epoch_[topic], tinode->offsets[broker_id_].written, topic);
@@ -407,6 +411,8 @@ void CXLManager::ScalogReceiveLocalCut(int epoch, int local_cut, const char* top
 		LOG(ERROR) << "Local cut from local sequencer was sent too early, global sequencer has not yet sent the global cut";
 		exit(1);
 	}
+
+	std::cout << "Received local cut from broker " << broker_id << " with value " << local_cut << std::endl;
 
 	// Insert local cut into global cut
 	scalog_global_cut_[topic][broker_id] = local_cut;

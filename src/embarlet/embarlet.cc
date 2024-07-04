@@ -54,7 +54,8 @@ size_t GetPhysicalCoreCount(){
 }
 
 Embarcadero::TopicManager *t;
-#define LOOPLEN 250000
+// #define LOOPLEN 250000
+#define LOOPLEN 5
 #define NUM_TOPICS 1
 double NUM_THREADS = 40;
 void CXLWriteBandwidthTest(int tid){
@@ -289,34 +290,40 @@ void ReadWriteTest(){
 }
 
 void ScalogOrderTest(Embarcadero::CXLManager *cxl_manager, char* topic) {
-	int num_messages = 1;
+	std::cout << "Starting ScalogOrderTest" << std::endl;
 
-	std::cout << "Starting scalog order test" << std::endl;
+    std::vector<std::thread> threads;
+	double num_threads = 1;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (double i = 0; i < num_threads; ++i) {
+        threads.emplace_back(CXLWriteBandwidthTest, i);
+    }
+    // Join threads
+    for (double i = 0; i < num_threads; ++i) {
+        threads[i].join();
+    }
 
-	for (int i = 0; i < num_messages; i++) {
-		Embarcadero::PublishRequest req;
-		memset(req.topic, 0, 31);
-		req.topic[0] = '0';
-		req.client_id = 0;
-		req.client_order = i;
-		req.size = 777;
-		req.payload_address = malloc(1024);
-		memcpy((uint8_t*)req.payload_address + 64, "testing write read", 18);
-		Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
-		header->client_id = 0;
-		header->client_order = i;
-		header->size = 777;
-		header->total_order = 0;
-		header->paddedSize = 64 - (777 % 64) + 777;
-		header->segment_header = nullptr;
-		header->logical_offset = (size_t)-1; // Sentinel value
-		header->next_message = nullptr;
-		cxl_manager->EnqueueRequest(req);
-	}
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
 
+    double bytes_written =NUM_THREADS * (double)LOOPLEN/1024 ;
+    double bandwidth = bytes_written / (duration.count() *1024); // Convert bytes to MB
 
-	sleep(5);
+    std::cout << "Runtime: " << duration.count() << std::endl;
+    std::cout << "Internal Publish bandwidth: " << bandwidth << " GB/s" << std::endl;
 
+	sleep(2);
+	size_t last_offset = (size_t)-2;
+	void* last_addr = nullptr;
+	void* messages;
+	size_t messages_size;
+		if(cxl_manager->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)){
+			std::cout << "read :" << last_offset<< std::endl;
+		}else{
+			std::cout << "Did not read anything" << std::endl;
+		}
+
+	// Print global cut
 	absl::flat_hash_map<std::string, std::vector<int>> global_cut_map = cxl_manager->ScalogGetGlobalCut();
 	std::vector<int> global_cut = global_cut_map[topic];
 
@@ -326,8 +333,6 @@ void ScalogOrderTest(Embarcadero::CXLManager *cxl_manager, char* topic) {
 		std::cout << value << " ";
 	}
 	std::cout << std::endl;  // To add a newline at the end
-
-	return ;
 }
 
 int main(int argc, char* argv[]){
@@ -414,7 +419,8 @@ int main(int argc, char* argv[]){
 
 	std::cout << "You are now safe to go" << std::endl;
 
-	// ScalogOrderTest(&cxl_manager, topic);
+	t = &topic_manager;
+	ScalogOrderTest(&cxl_manager, topic);
 
 	//cxl_manager.StartInternalTest();
 	
