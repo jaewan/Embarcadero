@@ -36,9 +36,11 @@ inline void make_socket_non_blocking(int sfd) {
 	}
 }
 
-NetworkManager::NetworkManager(size_t queueCapacity, int num_reqReceive_threads, bool test):
+NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads,
+															bool test):
 						 requestQueue_(queueCapacity),
 						 ackQueue_(10000000),
+						 broker_id_(broker_id),
 						 num_reqReceive_threads_(num_reqReceive_threads){
 	// Create Network I/O threads
 	threads_.emplace_back(&NetworkManager::MainThread, this);
@@ -235,9 +237,9 @@ void NetworkManager::ReqReceiveThread(){
 						memset(&server_addr, 0, sizeof(server_addr));
 						server_addr.sin_family = AF_INET;
 						server_addr.sin_family = AF_INET;
-						server_addr.sin_port = ntohs(PORT+shake.client_id);
+						server_addr.sin_port = ntohs(shake.port);
 						server_addr.sin_addr.s_addr = inet_addr(inet_ntoa(client_address.sin_addr));
-						VLOG(3) << "[DEBUG] Ack connecting to:" << (PORT + shake.client_id);
+						VLOG(3) << "[DEBUG] Ack connecting to:" << (shake.port);
 						if (connect(ack_fd, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
 							if (errno != EINPROGRESS) {
 								perror("Connect failed");
@@ -245,7 +247,7 @@ void NetworkManager::ReqReceiveThread(){
 								return;
 							}
 						}
-						VLOG(3) << "[DEBUG] Ack connected to:" << (PORT + shake.client_id);
+						VLOG(3) << "[DEBUG] Ack connected to:" << (shake.port);
 						ack_fd_ = ack_fd;
 						ack_efd_ = epoll_create1(0);
 						struct epoll_event event;
@@ -443,11 +445,11 @@ void NetworkManager::MainThread(){
 
 	struct sockaddr_in server_address;
 	server_address.sin_family = AF_INET;
-	server_address.sin_port = htons(PORT);
+	server_address.sin_port = htons(PORT + broker_id_);
 	server_address.sin_addr.s_addr = INADDR_ANY;
 	
 	while (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
-		std::cerr << "!!!!! Error binding socket" << std::endl;
+		LOG(ERROR)<< "!!!!! Error binding socket:" << (PORT + broker_id_) << " broker_id: " << broker_id_;
 		sleep(5);
 	}
 

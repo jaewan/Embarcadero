@@ -49,7 +49,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
 	TINode_Region_size += padding;
 	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
-	size_t Segment_Region_size = (CXL_SIZE - TINode_Region_size - Bitmap_Region_size)/NUM_BROKERS;
+	size_t Segment_Region_size = (CXL_SIZE - TINode_Region_size - Bitmap_Region_size)/NUM_MAX_BROKERS;
 
 	bitmap_ = (uint8_t*)cxl_addr_ + TINode_Region_size;
 	segments_ = (uint8_t*)bitmap_ + Bitmap_Region_size + ((broker_id_)*Segment_Region_size);
@@ -240,18 +240,18 @@ void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequence
 void CXLManager::Sequencer1(char* topic){
 	static size_t header_size = sizeof(MessageHeader);
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
-	struct MessageHeader *msg_headers[NUM_BROKERS];
+	struct MessageHeader *msg_headers[NUM_MAX_BROKERS];
 	size_t seq = 0;
-    int perLogOff[NUM_BROKERS];
+    int perLogOff[NUM_MAX_BROKERS];
 
-	for(int i = 0; i<NUM_BROKERS; i++){
+	for(int i = 0; i<NUM_MAX_BROKERS; i++){
         while(tinode->offsets[i].log_offset == 0){}
 		msg_headers[i] = (struct MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[i].log_offset);
         perLogOff[i] = -1;
 	}
 	while(!stop_threads_){
 		bool yield = true;
-		for(int i = 0; i<NUM_BROKERS; i++){
+		for(int i = 0; i<NUM_MAX_BROKERS; i++){
             if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
 				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
 					perror("!!!!!!!!!!!! [Sequencer1] Error msg_header is not equal to the perLogOff");
@@ -274,14 +274,14 @@ void CXLManager::Sequencer1(char* topic){
 void CXLManager::Sequencer2(char* topic){
 	static size_t header_size = sizeof(MessageHeader);
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
-	struct MessageHeader *msg_headers[NUM_BROKERS];
+	struct MessageHeader *msg_headers[NUM_MAX_BROKERS];
 	absl::flat_hash_map<int/*client_id*/, size_t/*client_req_id*/> last_ordered; 
 	// It is OK to store as addresses b/c the total order is given by a single thread
 	absl::flat_hash_map<int, absl::btree_map<size_t/*client_id*/, struct MessageHeader*>> skipped_msg;
 	static size_t seq = 0;
-    int perLogOff[NUM_BROKERS];
+    int perLogOff[NUM_MAX_BROKERS];
 
-	for(int i = 0; i<NUM_BROKERS; i++){
+	for(int i = 0; i<NUM_MAX_BROKERS; i++){
         while(tinode->offsets[i].log_offset == 0){}
 		msg_headers[i] = (struct MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[i].log_offset);
         perLogOff[i] = -1; 
@@ -291,7 +291,7 @@ void CXLManager::Sequencer2(char* topic){
 //and the broker exports all data upto the ordered offset
 	while(!stop_threads_){
 		bool yield = true;
-		for(int i = 0; i<NUM_BROKERS; i++){
+		for(int i = 0; i<NUM_MAX_BROKERS; i++){
             if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
 				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
 					perror("!!!!!!!!!!!! [Sequencer2] Error msg_header is not equal to the perLogOff");

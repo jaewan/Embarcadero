@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdint>
 #include <immintrin.h>
+#include <glog/logging.h>
 #include "folly/ConcurrentSkipList.h"
 
 namespace Embarcadero{
@@ -141,13 +142,12 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 }
 
 void Topic::CombinerThread(){
-	const static size_t header_size = sizeof(MessageHeader);
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
 	while(!stop_threads_){
 		while(header->paddedSize == 0){
 			if(stop_threads_){
-				std::cout << "Stopping CombinerThread" << std::endl;
+				LOG(INFO) << "Stopping CombinerThread";
 				return;
 			}
 			std::this_thread::yield();
@@ -216,7 +216,6 @@ void Topic::PublishToCXL(PublishRequest &req){
 // we should call this functiona again
 bool Topic::GetMessageAddr(size_t &last_offset,
 						   void* &last_addr, void* messages, size_t &messages_size){
-	static const size_t header_size = sizeof(struct MessageHeader);
 	size_t digested_offset = written_logical_offset_;
 	void* digested_addr = written_physical_addr_;
 	if(order_ > 0){
@@ -259,7 +258,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	struct MessageHeader *m = (struct MessageHeader*)messages;
 	size_t len = messages_size;
 	while(len>0){
-		char* msg = (char*)((uint8_t*)m + header_size);
+		char* msg = (char*)((uint8_t*)m + sizeof(struct MessageHeader);
 		std::cout << " total_order:" << m->total_order<< " logical_order:" <<
 		m->logical_offset << " client_order::" << m->client_order << std::endl;
 		len -= m->paddedSize;

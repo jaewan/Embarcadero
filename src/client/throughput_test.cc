@@ -12,6 +12,7 @@
 #include <atomic>
 #include <vector>
 #include <cstring>
+#include <random>
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
 #include <mimalloc.h>
@@ -25,6 +26,16 @@
 
 std::atomic<size_t> totalBytesRead_(0);
 std::atomic<size_t> client_order_(0);
+int ack_port_;;
+
+// This is to avoid contention if brokers and clients run on the same node
+int GenerateRandomPORT(){
+		// Generate a random number
+		std::random_device rd;
+		std::mt19937 gen(rd());
+		std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
+		return  dis(gen);
+}
 
 int make_socket_non_blocking(int sfd) {
 	int flags = fcntl(sfd, F_GETFL, 0);
@@ -110,12 +121,14 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	size_t run_count = total_message_size/message_size;
 
 
+	ack_port_ = GenerateRandomPORT();
 	Embarcadero::EmbarcaderoReq req;
 	req.client_id = CLIENT_ID;
 	req.client_order = 0;
 	memset(req.topic, 0, 32);
 	req.topic[0] = '0';
 	req.ack = ack_level;
+	req.port = ack_port_;
 	req.size = message_size + sizeof(Embarcadero::MessageHeader);
 	int n, i;
 	struct epoll_event events[10]; // Adjust size as needed
@@ -243,7 +256,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> read_ac
 	sockaddr_in server_addr;
 	memset(&server_addr, 0, sizeof(server_addr));
 	server_addr.sin_family = AF_INET;
-	server_addr.sin_port = htons(PORT + CLIENT_ID);
+	server_addr.sin_port = htons(ack_port_);
 	server_addr.sin_addr.s_addr = INADDR_ANY;
 
 	if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {

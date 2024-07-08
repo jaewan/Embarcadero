@@ -11,7 +11,8 @@ namespace Embarcadero{
 
 #define ORDER_LEVEL 1
 #define PORT 1214
-#define NUM_BROKERS 1
+#define BROKER_PORT 12140
+#define NUM_MAX_BROKERS 2
 #define CXL_SIZE (1UL<<38)
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
@@ -22,6 +23,7 @@ namespace Embarcadero{
 #define NUM_ACK_THREADS 1
 
 //********* Health check configs *********
+#define HEARTBEAT_INTERVAL 3 // in seconds
 /// The delay to send the first health check
 #define HEALTH_CHECK_INITIAL_DELAY_MS 5000
 /// The interval between two health checks
