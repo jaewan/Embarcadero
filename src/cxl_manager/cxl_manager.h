@@ -1,7 +1,6 @@
 #ifndef INCLUDE_CXL_MANGER_H_
 #define INCLUDE_CXL_MANGER_H_
 
-
 #include <thread>
 #include <iostream>
 #include <optional>
@@ -25,7 +24,7 @@ enum SequencerType {Embarcadero, Scalog, Corfu};
  * CXL is composed of three components; TINode, Bitmap, Segments
  * TINode region: First sizeof(TINode) * MAX_TOPIC
  * + Padding to make each region be aligned in cacheline
- * Bitmap region: Cacheline_size * NUM_BROKERS
+ * Bitmap region: Cacheline_size * NUM_MAX_BROKERS
  * Segment region: Rest. It is allocated to each brokers equally according to broker_id
  * 		Segment: 8Byte of segment metadata to store address of last ordered_offset from the segment, messages
  * 			Message: Header + paylod
@@ -42,7 +41,7 @@ struct alignas(32) offset_entry {
 struct alignas(64) TInode{
 	char topic[31];
 	uint8_t order;
-	volatile offset_entry offsets[NUM_BROKERS];
+	volatile offset_entry offsets[NUM_MAX_BROKERS];
 };
 
 struct NonCriticalMessageHeader{

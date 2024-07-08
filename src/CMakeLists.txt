@@ -1,4 +1,4 @@
-include(cmake/peer_grpc.cmake)
+include(cmake/heartbeat_grpc.cmake)
 
 # These are required for a folly build
 # folly cmake mostly from here: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
@@ -18,7 +18,7 @@ add_executable(embarlet
     embarlet/pub_queue.cc 
     embarlet/pub_queue.h 
     embarlet/pub_task.h 
-    embarlet/peer.cc
+    embarlet/heartbeat.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
 )
@@ -33,7 +33,7 @@ target_link_libraries(embarlet
 	gflags
 	mimalloc
     absl::flat_hash_map 
-    peer_grpc_proto
+    heartbeat_grpc_proto
     cxxopts::cxxopts
     ${_REFLECTION}
     ${_GRPC_GRPCPP}

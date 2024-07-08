@@ -1,7 +1,7 @@
 #include "common/config.h"
 #include "pub_queue.h"
 #include "pub_task.h"
-#include "peer.h"
+#include "heartbeat.h"
 #include "topic_manager.h"
 #include "../disk_manager/disk_manager.h"
 #include "../network_manager/network_manager.h"
@@ -43,37 +43,6 @@ bool CheckAvailableCores(){
 	return num_cores == CGROUP_CORE;
 }
 
-size_t GetPhysicalCoreCount(){
-	std::ifstream cpuinfo("/proc/cpuinfo");
-    std::string line;
-    std::set<std::pair<int, int>> coreIdentifiers; // Set to store unique (physical id, core id) pairs
-
-    int physicalId = -1;
-    int coreId = -1;
-
-    while (std::getline(cpuinfo, line)) {
-        std::istringstream iss(line);
-        std::string key;
-        if (getline(iss, key, ':')) {
-            std::string value;
-            getline(iss, value); // Read the rest of the line
-            if (key.find("physical id") != std::string::npos) {
-                physicalId = std::stoi(value);
-            } else if (key.find("core id") != std::string::npos) {
-                coreId = std::stoi(value);
-            }
-
-            // When we have both physical id and core id, insert them as a pair into the set
-            if (physicalId != -1 && coreId != -1) {
-                coreIdentifiers.insert(std::make_pair(physicalId, coreId));
-                physicalId = -1; // Reset for the next processor entry
-                coreId = -1;
-            }
-        }
-    }
-
-    return coreIdentifiers.size();
-}
 
 Embarcadero::TopicManager *t;
 #define LOOPLEN 250000
@@ -311,17 +280,18 @@ void ReadWriteTest(){
 }
 
 int main(int argc, char* argv[]){
+
+	// *************** Initializing Logging ********************** 
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
 
-	//size_t num_cores = GetPhysicalCoreCount();
-  	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
-	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
-  	options.add_options()
+	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
+	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="HEAD_ADDR:PORT"
+	options.add_options()
 			("head", "Head Node")
 			("follower", "Follower Address and Port", cxxopts::value<std::string>())
 			("e,emul", "Use emulation instead of CXL")
-			("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("1"))
+			("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 			("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		;
 
@@ -331,15 +301,31 @@ int main(int argc, char* argv[]){
 	FLAGS_logtostderr = 1; // log only to console, no files.
 	//FLAGS_log_dir = "/tmp/vlog2_log";
 
-	//Initialize
+	// *************** Initializing Broker ********************** 
+	bool is_head_node = false;
+	std::string head_addr = "0.0.0.0:" + std::to_string(BROKER_PORT);
+
+	if (arguments.count("head")) {
+		is_head_node = true;
+	} else if (arguments.count("follower")) {
+		head_addr = arguments["follower"].as<std::string>();
+	} else {
+		LOG(ERROR) << "Invalid arguments";
+	}
+	HeartBeatManager heartbeat_manager(is_head_node, head_addr);
+	int broker_id = heartbeat_manager.GetBrokerId();
+
+	LOG(INFO) << "Starting Embarlet broker_id:" << broker_id;
+	// Check Cgroup setting
 	if(arguments["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
 		LOG(ERROR) << "CGroup core throttle is wrong";
 		return -1;
 	}
-	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager((1UL<<23),broker_id);
+
+	// *************** Initializing Managers ********************** 
+	Embarcadero::CXLManager cxl_manager((1UL<<23), broker_id);
 	Embarcadero::DiskManager disk_manager((1UL<<23));
-	Embarcadero::NetworkManager network_manager(128, NUM_NETWORK_IO_THREADS, false);
+	Embarcadero::NetworkManager network_manager(128, broker_id, NUM_NETWORK_IO_THREADS, false);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 
 	cxl_manager.SetTopicManager(&topic_manager);
@@ -347,23 +333,6 @@ int main(int argc, char* argv[]){
 	disk_manager.SetNetworkManager(&network_manager);
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
-
-	if (arguments.count("head")) {
-		// Initialize peer broker
-		PeerBroker head_broker(true);
-
-		head_broker.Run();
-	} else if (arguments.count("follower")) {
-		std::string follower = arguments["follower"].as<std::string>();
-
-		std::string head_addr = follower.substr(0, follower.find(":"));
-		std::string head_port = follower.substr(follower.find(":") + 1);
-
-		PeerBroker follower_broker(false, head_addr, head_port);
-		follower_broker.Run();
-	} else {
-		LOG(INFO) << "Invalid arguments";
-	}
 
 	//********* Load Generate **************
 	char topic[31];
@@ -383,10 +352,8 @@ int main(int argc, char* argv[]){
 	E2ETest(960);
 	*/
 
-	while(true){
-	std::this_thread::yield();
-	sleep(100);
-	}
+	// This waits indefinitely until heartbeat manager fails
+	heartbeat_manager.Wait();
 
 	return 0;
 }
