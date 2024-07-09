@@ -303,7 +303,7 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Broker ********************** 
 	bool is_head_node = false;
-	std::string head_addr = "0.0.0.0:" + std::to_string(BROKER_PORT);
+	std::string head_addr = "127.0.0.1:" + std::to_string(BROKER_PORT);
 
 	if (arguments.count("head")) {
 		is_head_node = true;
@@ -335,11 +335,13 @@ int main(int argc, char* argv[]){
 	network_manager.SetDiskManager(&disk_manager);
 
 	//********* Load Generate **************
-	char topic[31];
-	memset(topic, 0, 31);
-	topic[0] = '0';
-	int order = 0;
-	topic_manager.CreateNewTopic(topic, order);
+	if(is_head_node || true){ 
+		char topic[31];
+		memset(topic, 0, 31);
+		topic[0] = '0';
+		int order = 0;
+		topic_manager.CreateNewTopic(topic, order);
+	}
 
 	std::cout << "You are now safe to go" << std::endl;
 	//cxl_manager.StartInternalTest();
