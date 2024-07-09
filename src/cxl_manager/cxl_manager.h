@@ -35,12 +35,12 @@ struct alignas(32) offset_entry {
 	volatile int written;
 	//Since each broker will have different virtual adddress on the CXL memory, access it via CXL_addr_ + off
 	volatile size_t ordered_offset; //relative offset to last ordered message header
-	size_t log_offset;
+	volatile size_t log_offset;
 };
 
 struct alignas(64) TInode{
-	char topic[31];
-	uint8_t order;
+	char topic[TOPIC_NAME_SIZE];
+	volatile uint8_t order;
 	volatile offset_entry offsets[NUM_MAX_BROKERS];
 };
 

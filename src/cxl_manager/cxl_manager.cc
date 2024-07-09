@@ -38,8 +38,9 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	if (cxl_addr_ == MAP_FAILED){
 		perror("Mapping Emulated CXL error");
 	}
+	if(broker_id_ == 0)
+		memset(cxl_addr_, 0, (1UL<<35));
 	//memset(cxl_addr_, 0, CXL_SIZE);
-	memset(cxl_addr_, 0, (1UL<<34));
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&CXLManager::CXL_io_thread, this);
@@ -50,6 +51,8 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	TINode_Region_size += padding;
 	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
 	size_t Segment_Region_size = (CXL_SIZE - TINode_Region_size - Bitmap_Region_size)/NUM_MAX_BROKERS;
+	padding = Segment_Region_size%cacheline_size;
+	Segment_Region_size -= padding;
 
 	bitmap_ = (uint8_t*)cxl_addr_ + TINode_Region_size;
 	segments_ = (uint8_t*)bitmap_ + Bitmap_Region_size + ((broker_id_)*Segment_Region_size);
@@ -67,7 +70,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	// Wait untill al IO threads are up
 	while(thread_count_.load() != num_io_threads_){}
 
-	std::cout << "[CXLManager]: \tConstructed" << std::endl;
+	LOG(INFO) << "[CXLManager]: \tConstructed";
 	return;
 }
 
@@ -126,7 +129,7 @@ CXLManager::~CXLManager(){
 		}
 	}
 
-	std::cout << "[CXLManager]: \tDestructed" << std::endl;
+	LOG(INFO) << "[CXLManager]: \tDestructed";
 }
 
 
@@ -185,6 +188,7 @@ void CXLManager::CXL_io_thread(){
 	}
 }
 
+// This function returns TInode without inspecting if the topic exists
 void* CXLManager::GetTInode(const char* topic){
 	// Convert topic to tinode address
 	//static const std::hash<std::string> topic_to_idx;
@@ -198,10 +202,10 @@ void CXLManager::EnqueueRequest(struct PublishRequest req){
 }
 
 void* CXLManager::GetNewSegment(){
-	static std::atomic<int> segment_count{0};
+	//TODO(Jae) Implement bitmap
+	std::atomic<int> segment_count{0};
 	int offset = segment_count.fetch_add(1, std::memory_order_relaxed);
 
-	//TODO(Jae) Implement bitmap
 	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
 }
 
