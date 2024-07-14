@@ -5,6 +5,16 @@ package heartbeat_system;
 service HeartBeat {
   rpc RegisterNode (NodeInfo) returns (RegistrationStatus);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+	rpc GetClusterStatus (ClientInfo) returns (ClusterStatus);
+}
+
+message ClientInfo{
+	repeated int32 nodes_info = 1;
+}
+
+message ClusterStatus{
+  repeated string new_nodes = 1;
+  repeated int32 removed_nodes = 2;
 }
 
 message NodeInfo {

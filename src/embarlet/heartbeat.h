@@ -12,6 +12,7 @@
 
 #include <glog/logging.h>
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/synchronization/mutex.h"
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/alarm.h>
@@ -24,13 +25,17 @@ using grpc::ServerContext;
 using grpc::Status;
 using heartbeat_system::HeartBeat;
 using heartbeat_system::NodeInfo;
+using heartbeat_system::ClientInfo;
+using heartbeat_system::ClusterStatus;
 using heartbeat_system::RegistrationStatus;
 using heartbeat_system::HeartbeatRequest;
 using heartbeat_system::HeartbeatResponse;
 
 class HeartBeatServiceImpl final : public HeartBeat::Service {
 	public:
-		HeartBeatServiceImpl() {
+		HeartBeatServiceImpl(std::string head_addr) {
+			// Inserting head node to the nodes_
+			nodes_["0"] = {0, head_addr, head_addr+":"+std::to_string(PORT + 0), std::chrono::steady_clock::now()};
 			// Start a thread to check follower node heartbeats
 			heartbeat_thread_ = std::thread([this]() {
 					this->CheckHeartbeats();
@@ -58,7 +63,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				else
 					reply->set_message("Trying to Register too many brokers. Increase NUM_MAX_BROKERS");
 			} else {
-				nodes_[request->node_id()] = {broker_id, request->address(), std::chrono::steady_clock::now()};
+				nodes_[request->node_id()] = {broker_id, request->address(), request->address()+":"+std::to_string(broker_id+PORT), std::chrono::steady_clock::now()};
 				reply->set_success(true);
 				reply->set_broker_id(broker_id);
 				reply->set_message("Node registered successfully");
@@ -79,10 +84,30 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			return Status::OK;
 		}
 
+		Status GetClusterStatus(ServerContext* context, const ClientInfo* request,
+														ClusterStatus* reply) override {
+			absl::flat_hash_set<int32_t> s(request->nodes_info().begin(), request->nodes_info().end());
+			{
+				absl::MutexLock lock(&mutex_);
+				for (const auto &it : nodes_){
+					if(s.contains(it.second.broker_id)){
+						s.erase(it.second.broker_id);
+					}else{
+						reply->add_new_nodes(it.second.network_mgr_addr);
+					}
+				}
+			}
+			for (const auto &it : s){
+				reply->add_removed_nodes(it);
+			}
+			return Status::OK;
+		}
+
 	private:
 		struct NodeInfo {
 			int broker_id;
 			std::string address;
+			std::string network_mgr_addr;
 			std::chrono::steady_clock::time_point last_heartbeat;
 		};
 
@@ -103,12 +128,12 @@ class FollowerNodeClient {
 			shutdown_ = true;
 			cq_.Shutdown();
 			if (!wait_called_ && heartbeat_thread_.joinable()) {
-					heartbeat_thread_.join();
+				heartbeat_thread_.join();
 			}
 		}
 
 		void Wait() {
-			bool wait_called_ = true;
+			wait_called_ = true;
 			heartbeat_thread_.join();
 			return;
 		}
@@ -128,8 +153,8 @@ class FollowerNodeClient {
 			std::unique_ptr<grpc::ClientAsyncResponseReader<HeartbeatResponse>> response_reader;
 			grpc::Alarm alarm;
 			~AsyncClientCall() {
-					context.TryCancel();
-					alarm.Cancel();
+				context.TryCancel();
+				alarm.Cancel();
 			}
 		};
 
@@ -143,10 +168,10 @@ class FollowerNodeClient {
 		std::string address_;
 		grpc::CompletionQueue cq_;
 		bool head_alive_;
+		bool wait_called_;
 		int broker_id_;
 		std::thread heartbeat_thread_;
 		bool shutdown_ = false;
-		bool wait_called_ = false;
 };
 
 class HeartBeatManager{
@@ -155,14 +180,14 @@ class HeartBeatManager{
 		HeartBeatManager(bool is_head_node, std::string head_address)
 			:is_head_node_(is_head_node){
 				if(is_head_node){
-					service_ = std::make_unique<HeartBeatServiceImpl>();
+					service_ = std::make_unique<HeartBeatServiceImpl>(GetAddress());
 					ServerBuilder builder;
 					builder.AddListeningPort(head_address, grpc::InsecureServerCredentials());
 					builder.RegisterService(service_.get());
 					server_ = builder.BuildAndStart();
 				}else{
 					follower_ = std::make_unique<FollowerNodeClient>(GenerateUniqueId(), GetAddress(), 
-								grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials()));
+							grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials()));
 				}
 			}
 
@@ -211,33 +236,33 @@ class HeartBeatManager{
 		}
 
 		std::string GetAddress() {
-				char hostbuffer[256];
-				char *IPbuffer;
-				struct hostent *host_entry;
-				int hostname;
+			char hostbuffer[256];
+			char *IPbuffer;
+			struct hostent *host_entry;
+			int hostname;
 
-				// Get hostname
-				hostname = gethostname(hostbuffer, sizeof(hostbuffer));
-				if (hostname == -1) {
-						perror("Error getting hostname");
-						return "";
-				}
+			// Get hostname
+			hostname = gethostname(hostbuffer, sizeof(hostbuffer));
+			if (hostname == -1) {
+				perror("Error getting hostname");
+				return "";
+			}
 
-				// Get host information
-				host_entry = gethostbyname(hostbuffer);
-				if (host_entry == NULL) {
-						perror("Error getting host information");
-						return "";
-				}
+			// Get host information
+			host_entry = gethostbyname(hostbuffer);
+			if (host_entry == NULL) {
+				perror("Error getting host information");
+				return "";
+			}
 
-				// Convert IP address to string
-				IPbuffer = inet_ntoa(*((struct in_addr *)host_entry->h_addr_list[0]));
-				if (IPbuffer == NULL) {
-						perror("Error converting IP address to string");
-						return "";
-				}
+			// Convert IP address to string
+			IPbuffer = inet_ntoa(*((struct in_addr *)host_entry->h_addr_list[0]));
+			if (IPbuffer == NULL) {
+				perror("Error converting IP address to string");
+				return "";
+			}
 
-				return std::string(IPbuffer);
+			return std::string(IPbuffer);
 		}
 };
 #endif

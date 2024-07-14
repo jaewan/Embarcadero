@@ -55,6 +55,7 @@ target_link_libraries(throughput_test
 	gflags
 	mimalloc
     cxxopts::cxxopts
+    heartbeat_grpc_proto
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOF}

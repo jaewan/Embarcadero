@@ -3,6 +3,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <iostream>
@@ -13,13 +14,104 @@
 #include <vector>
 #include <cstring>
 #include <random>
+
+#include <grpcpp/grpcpp.h>
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
 #include <mimalloc.h>
-#include <sched.h>
+#include "absl/synchronization/mutex.h"
 
+#include <heartbeat.grpc.pb.h>
 #include "common/config.h"
 #include "../cxl_manager/cxl_manager.h"
+
+using heartbeat_system::HeartBeat;
+
+class Client{
+	public:
+		Client(std::string& head_addr, std::string& port):
+			head_addr_(head_addr), port_(port), shutdown_(false){
+				std::string addr = head_addr+":"+port;
+				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
+				client_id_ = GenerateRandomNum();
+				nodes_[0] = addr;
+				cluster_probe_thread_ = std::thread([this](){
+						this->ClusterProbeLoop();
+						});
+			}
+		~Client(){
+			shutdown_ = true;
+			cluster_probe_thread_.join();
+		};
+
+		void Publish(){
+		};
+	private:
+		void ClusterProbeLoop(){
+			heartbeat_system::ClientInfo client_info;
+			heartbeat_system::ClusterStatus cluster_status;
+			for (const auto &it: nodes_){
+				client_info.add_nodes_info(it.first);
+			}
+			grpc::ClientContext context;
+			while(shutdown_){
+				grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
+				if(status.ok()){
+					const auto& removed_nodes = cluster_status.removed_nodes();
+					const auto& new_nodes = cluster_status.new_nodes();
+					if(!removed_nodes.empty()){
+						absl::MutexLock lock(&mutex_);
+						//TODO(Jae) Handle broker failure
+						for(const auto& id:removed_nodes){
+							LOG(ERROR) << "Failed Node reported : " << id;
+							nodes_.erase(id);
+						}
+					}
+					if(!new_nodes.empty()){
+						absl::MutexLock lock(&mutex_);
+						for(const auto& addr:new_nodes){
+							LOG(INFO) << "New Node reported";
+							nodes_[GetBrokerId(addr)] = addr;
+						}
+					}
+				}else{
+					LOG(ERROR) << "Head is dead, try reaching other brokers for a newly elected head";
+				}
+				std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_INTERVAL));
+			}
+		}
+
+		int GetBrokerId(const std::string& input) {
+			size_t colonPos = input.find(':');
+			if (colonPos == std::string::npos) {
+				throw std::invalid_argument("Input string does not contain a colon");
+			}
+			std::string numberStr = input.substr(colonPos + 1);
+			try {
+				return std::stoi(numberStr) - PORT;
+			} catch (const std::exception& e) {
+				throw std::invalid_argument("Failed to convert to integer: " + std::string(e.what()));
+			}
+		}
+
+		int GenerateRandomNum(){
+			// Generate a random number
+			std::random_device rd;
+			std::mt19937 gen(rd());
+			std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
+			return  dis(gen);
+		}
+
+		std::string head_addr_;
+		std::string port_;
+		bool shutdown_;
+		int client_id_;
+		std::unique_ptr<HeartBeat::Stub> stub_;
+		std::thread cluster_probe_thread_;
+		// <broker_id, address::port of network_mgr>
+		absl::flat_hash_map<int, std::string> nodes_;
+		absl::Mutex mutex_;
+};
 
 #define ACK_SIZE 1024
 #define SERVER_ADDR "127.0.0.1"
@@ -30,11 +122,11 @@ int ack_port_;;
 
 // This is to avoid contention if brokers and clients run on the same node
 int GenerateRandomPORT(){
-		// Generate a random number
-		std::random_device rd;
-		std::mt19937 gen(rd());
-		std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
-		return  dis(gen);
+	// Generate a random number
+	std::random_device rd;
+	std::mt19937 gen(rd());
+	std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
+	return  dis(gen);
 }
 
 int make_socket_non_blocking(int sfd) {
@@ -330,8 +422,8 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 	LOG(INFO) << "Ack size:" << ack_times.size() << " pub size:" << pub_times.size();
 	//assert(ack_times.size() == pub_times.size());
 
-  std::sort(pub_times.begin(), pub_times.end());
-  std::sort(ack_times.begin(), ack_times.end());
+	std::sort(pub_times.begin(), pub_times.end());
+	std::sort(ack_times.begin(), ack_times.end());
 
 	auto start = pub_times.front();
 	auto end = pub_times.back();
@@ -344,14 +436,14 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 	for(size_t i=0; i<len; i++){
 		latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(ack_times[i] - pub_times[i]).count());
 	}
-  std::sort(latencies.begin(), latencies.end());
+	std::sort(latencies.begin(), latencies.end());
 	std::ofstream file("/home/domin/.CXL_EMUL/CDF_data.csv");
 	file << "Latency (ns),CDF\n";
 	for (size_t i = 0; i < latencies.size(); ++i) {
-			if (i == 0 || latencies[i] != latencies[i - 1]) {
-					double cdf = static_cast<double>(i + 1) / latencies.size();
-					file << latencies[i] << "," << cdf << "\n";
-			}
+		if (i == 0 || latencies[i] != latencies[i - 1]) {
+			double cdf = static_cast<double>(i + 1) / latencies.size();
+			file << latencies[i] << "," << cdf << "\n";
+		}
 	}
 	file.close();
 
@@ -403,16 +495,16 @@ bool CheckAvailableCores(){
 	CPU_ZERO(&mask);
 
 	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
-			perror("sched_getaffinity");
-			exit(EXIT_FAILURE);
+		perror("sched_getaffinity");
+		exit(EXIT_FAILURE);
 	}
 
 	printf("This process can run on CPUs: ");
 	for (int i = 0; i < CPU_SETSIZE; i++) {
-			if (CPU_ISSET(i, &mask)) {
-					printf("%d ", i);
-					num_cores++;
-			}
+		if (CPU_ISSET(i, &mask)) {
+			printf("%d ", i);
+			num_cores++;
+		}
 	}
 	return num_cores == CGROUP_CORE;
 }
