@@ -9,6 +9,11 @@ void HeartBeatServiceImpl::CheckHeartbeats(){
 		absl::MutexLock lock(&mutex_);
 		auto now = std::chrono::steady_clock::now();
 		for (auto it = nodes_.begin(); it != nodes_.end();) {
+			// Do not check head node
+			if(it->second.broker_id == 0){
+				++it;
+				continue;
+			}
 			if (std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_heartbeat).count() > timeout) {
 				LOG(INFO) << "Node " << it->first << " is dead";
 				auto key_to_erase = it->first;
