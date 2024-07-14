@@ -29,7 +29,7 @@ using heartbeat_system::HeartBeat;
 
 class Client{
 	public:
-		Client(std::string& head_addr, std::string& port):
+		Client(std::string head_addr, std::string port):
 			head_addr_(head_addr), port_(port), shutdown_(false){
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
@@ -40,6 +40,7 @@ class Client{
 						});
 			}
 		~Client(){
+			LOG(INFO) << "Destructing Client";
 			shutdown_ = true;
 			cluster_probe_thread_.join();
 		};
@@ -53,8 +54,8 @@ class Client{
 			for (const auto &it: nodes_){
 				client_info.add_nodes_info(it.first);
 			}
-			grpc::ClientContext context;
-			while(shutdown_){
+			while(!shutdown_){
+				grpc::ClientContext context;
 				grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
 				if(status.ok()){
 					const auto& removed_nodes = cluster_status.removed_nodes();
@@ -65,19 +66,36 @@ class Client{
 						for(const auto& id:removed_nodes){
 							LOG(ERROR) << "Failed Node reported : " << id;
 							nodes_.erase(id);
+							RemoveNodeFromClientInfo(client_info, id);
 						}
 					}
 					if(!new_nodes.empty()){
 						absl::MutexLock lock(&mutex_);
 						for(const auto& addr:new_nodes){
-							LOG(INFO) << "New Node reported";
+							int broker_id = GetBrokerId(addr);
+							LOG(INFO) << "New Node reported:" << broker_id;
 							nodes_[GetBrokerId(addr)] = addr;
+							client_info.add_nodes_info(broker_id);
 						}
 					}
 				}else{
 					LOG(ERROR) << "Head is dead, try reaching other brokers for a newly elected head";
 				}
 				std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_INTERVAL));
+			}
+		}
+
+		void RemoveNodeFromClientInfo(heartbeat_system::ClientInfo& client_info, int32_t node_to_remove) {
+			auto* nodes_info = client_info.mutable_nodes_info();
+			int size = nodes_info->size();
+			for (int i = 0; i < size; ++i) {
+				if (nodes_info->Get(i) == node_to_remove) {
+					// Remove this element by swapping it with the last element and then removing the last
+					nodes_info->SwapElements(i, size - 1);
+					nodes_info->RemoveLast();
+					--size;
+					--i;  // Recheck this index since we swapped elements
+				}
 			}
 		}
 
@@ -519,6 +537,7 @@ int main(int argc, char* argv[]) {
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
+		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("32"));
 
@@ -529,10 +548,11 @@ int main(int argc, char* argv[]) {
 	int ack_level = result["ack_level"].as<int>();
 	FLAGS_v = result["log_level"].as<int>();
 
-	if(!CheckAvailableCores()){
+	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
 		LOG(ERROR) << "CGroup core throttle is wrong";
 		return -1;
 	}
+	Client c("127.0.0.1", std::to_string(BROKER_PORT));
 	SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level, true);
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 

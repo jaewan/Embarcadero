@@ -54,7 +54,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				RegistrationStatus* reply) override {
 			absl::MutexLock lock(&mutex_);
 			auto nodes_it = nodes_.find(request->node_id());
-			int broker_id = (int)(nodes_.size() + 1);
+			int broker_id = (int)nodes_.size();
 			if ( nodes_it != nodes_.end() || broker_id >= NUM_MAX_BROKERS) {
 				reply->set_success(false);
 				reply->set_broker_id(nodes_it->second.broker_id);
@@ -63,6 +63,8 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				else
 					reply->set_message("Trying to Register too many brokers. Increase NUM_MAX_BROKERS");
 			} else {
+				VLOG(3) << "Registering broker:" << broker_id;;
+				VLOG(3) << "Registering node:" << request->address();;
 				nodes_[request->node_id()] = {broker_id, request->address(), request->address()+":"+std::to_string(broker_id+PORT), std::chrono::steady_clock::now()};
 				reply->set_success(true);
 				reply->set_broker_id(broker_id);
