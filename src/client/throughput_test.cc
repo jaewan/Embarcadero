@@ -235,8 +235,8 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	Embarcadero::EmbarcaderoReq req;
 	req.client_id = CLIENT_ID;
 	req.client_order = 0;
-	memset(req.topic, 0, 32);
-	req.topic[0] = '0';
+	memset(req.topic, 0, TOPIC_NAME_SIZE);
+	memcpy(req.topic, "TestTopic", 9);
 	req.ack = ack_level;
 	req.port = ack_port_;
 	req.size = message_size + sizeof(Embarcadero::MessageHeader);

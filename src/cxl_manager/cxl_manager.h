@@ -120,7 +120,6 @@ class CXLManager{
 		NetworkManager *network_manager_;
 
 		CXLType cxl_type_;
-		int cxl_fd_;
 		void* cxl_addr_;
 		void* bitmap_;
 		void* segments_;
@@ -133,7 +132,6 @@ class CXLManager{
 		void CXL_io_thread();
 		void Sequencer1(char* topic);
 		void Sequencer2(char* topic);
-
 };
 
 } // End of namespace Embarcadero

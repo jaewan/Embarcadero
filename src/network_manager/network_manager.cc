@@ -145,7 +145,7 @@ void NetworkManager::ReqReceiveThread(){
 				}
 		}
 #endif
-		VLOG(3) << "[DEBUG] Client shake finished";
+		VLOG(3) << "[DEBUG] Client shake finished topic:" << shake.topic << " ack:" <<shake.ack << " size:" << shake.size << " port:" << shake.port ;
 
 
 		switch(shake.client_req){
@@ -204,6 +204,10 @@ void NetworkManager::ReqReceiveThread(){
 					i = 0;
 				}
 #else
+				if(memcmp(shake.topic, "\0", 31) == 0){
+					LOG(ERROR) << "Topic cannot be null:" << shake.topic;
+					return;
+				}
 				// TODO(Jae) This code asumes there's only one active client publishing
 				// If there are parallel clients, change the ack queue
 				int ack_fd = req.client_socket;

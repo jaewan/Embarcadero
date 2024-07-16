@@ -83,6 +83,7 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 }
 
 struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]){
+	absl::MutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
 	if(topics_.find(topic)!= topics_.end()){
 		LOG(ERROR)<< "Topic already exists!!!";
@@ -115,7 +116,8 @@ void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 void TopicManager::PublishToCXL(PublishRequest &req){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
-		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE)){
+		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
+			VLOG(3) << "[PublishToCXL] TopicManager topic entry not found, creating one";
 			// The topic was created from another broker
 			CreateNewTopicInternal(req.topic);
 		}else{

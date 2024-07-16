@@ -1,13 +1,15 @@
 #include "cxl_manager.h"
-#include <sys/mman.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
-#include <errno.h>
+#include <filesystem>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <numa.h>
+#include <numaif.h>
 #include <glog/logging.h>
 #include "mimalloc.h"
 
@@ -18,28 +20,68 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	broker_id_(broker_id),
 	num_io_threads_(num_io_threads){
 	// Initialize CXL
-	cxl_type_ = Emul;
+	cxl_type_ = Real;
 	std::string cxl_path(getenv("HOME"));
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+	int cxl_fd;
+	bool numa_alloc = false;
 
 	switch(cxl_type_){
 		case Emul:
 			cxl_path += "/.CXL_EMUL/cxl";
-			cxl_fd_ = open(cxl_path.c_str(), O_RDWR, 0777);
+			cxl_fd = open(cxl_path.c_str(), O_RDWR, 0777);
 			break;
 		case Real:
-			cxl_fd_ = open("/dev/dax0.0", O_RDWR);
+			if(std::filesystem::exists("/dev/dax0.0"))
+				cxl_fd = open("/dev/dax0.0", O_RDWR);
+			else{
+				if (numa_available() == -1) {
+					LOG(ERROR) << "Cannot allocate from real CXL";
+					return;
+				}
+				VLOG(3) << "Opening a shared file at CXL";
+				cxl_fd = shm_open("/CXL_SHARED_FILE", O_CREAT | O_RDWR, 0666);
+				numa_alloc = true;
+				if(broker_id == 0 && cxl_fd >= 0){
+					if (ftruncate(cxl_fd, CXL_SIZE) == -1) {
+						LOG(ERROR) << "ftruncate failed";
+						close(cxl_fd);
+						return ;
+					}
+				}
+			}
 			break ;
 	}
-	if (cxl_fd_  < 0)
-		perror("Opening CXL error");
+	if (cxl_fd < 0)
+		LOG(ERROR)<<"Opening CXL error";
+	VLOG(3) << "mmaping cxl_fd:" << cxl_fd;
+	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd, 0);
+	close(cxl_fd);
 
-	cxl_addr_= mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd_, 0);
-	if (cxl_addr_ == MAP_FAILED){
-		perror("Mapping Emulated CXL error");
+	if(numa_alloc && broker_id == 0){
+		// Create a bitmask for the NUMA node
+		struct bitmask* bitmask = numa_allocate_nodemask();
+		numa_bitmask_setbit(bitmask, 2);
+
+		// Bind the memory to the specified NUMA node
+		if (mbind(cxl_addr_, CXL_SIZE, MPOL_BIND, bitmask->maskp, bitmask->size, MPOL_MF_MOVE | MPOL_MF_STRICT) == -1) {
+			LOG(ERROR)<< "mbind failed";
+			numa_free_nodemask(bitmask);
+			munmap(cxl_addr_, CXL_SIZE);
+			return ;
+		}
+		VLOG(3) << "Binded the memory to CXL";
+
+		numa_free_nodemask(bitmask);
 	}
-	if(broker_id_ == 0)
+
+	if (cxl_addr_ == MAP_FAILED){
+		LOG(ERROR) << "Mapping Emulated CXL error";
+	}
+	if(broker_id_ == 0){
 		memset(cxl_addr_, 0, (1UL<<35));
+		VLOG(3) << "Cleared CXL 32GB";
+	}
 	//memset(cxl_addr_, 0, CXL_SIZE);
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
@@ -113,9 +155,7 @@ CXLManager::~CXLManager(){
 		requestQueue_.blockingWrite(sentinel);
 
 	if (munmap(cxl_addr_, CXL_SIZE) < 0)
-		perror("Unmapping CXL error");
-	close(cxl_fd_);
-
+		LOG(ERROR) << "Unmapping CXL error";
 
 	for(std::thread& thread : threads_){
 		if(thread.joinable()){
@@ -242,7 +282,6 @@ void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequence
 }
 
 void CXLManager::Sequencer1(char* topic){
-	static size_t header_size = sizeof(MessageHeader);
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
 	struct MessageHeader *msg_headers[NUM_MAX_BROKERS];
 	size_t seq = 0;
@@ -258,7 +297,7 @@ void CXLManager::Sequencer1(char* topic){
 		for(int i = 0; i<NUM_MAX_BROKERS; i++){
             if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
 				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
-					perror("!!!!!!!!!!!! [Sequencer1] Error msg_header is not equal to the perLogOff");
+					LOG(ERROR) <<"!!!!!!!!!!!! [Sequencer1] Error msg_header is not equal to the perLogOff";
 				}
 				msg_headers[i]->total_order = seq;
 				tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
@@ -276,7 +315,6 @@ void CXLManager::Sequencer1(char* topic){
 
 // One Sequencer per topic. The broker that received CreateNewTopic spawn it.
 void CXLManager::Sequencer2(char* topic){
-	static size_t header_size = sizeof(MessageHeader);
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
 	struct MessageHeader *msg_headers[NUM_MAX_BROKERS];
 	absl::flat_hash_map<int/*client_id*/, size_t/*client_req_id*/> last_ordered; 
@@ -298,7 +336,7 @@ void CXLManager::Sequencer2(char* topic){
 		for(int i = 0; i<NUM_MAX_BROKERS; i++){
             if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
 				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
-					perror("!!!!!!!!!!!! [Sequencer2] Error msg_header is not equal to the perLogOff");
+					LOG(ERROR)<<"!!!!!!!!!!!! [Sequencer2] Error msg_header is not equal to the perLogOff";
 				}
                 int client = msg_headers[i]->client_id;
 				auto last_ordered_itr = last_ordered.find(client);
