@@ -104,10 +104,15 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	return tinode;
 }
 
-void TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+	VLOG(3) << "[CreateNewTopic] topic:" << topic;
 	struct TInode* tinode = CreateNewTopicInternal(topic);
-	memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
-	tinode->order= (uint8_t)order;
+	if(tinode != nullptr){
+		memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
+		tinode->order= (uint8_t)order;
+		return true;
+	}
+	return false;
 }
 
 void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){

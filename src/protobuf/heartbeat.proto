@@ -6,6 +6,7 @@ service HeartBeat {
   rpc RegisterNode (NodeInfo) returns (RegistrationStatus);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 	rpc GetClusterStatus (ClientInfo) returns (ClusterStatus);
+	rpc CreateNewTopic(CreateTopicRequest) returns (CreateTopicResponse);
 }
 
 message ClientInfo{
@@ -36,3 +37,11 @@ message HeartbeatResponse {
   bool alive = 1;
 }
 
+message CreateTopicRequest {
+  string topic = 1;
+	int32 order = 2;
+}
+
+message CreateTopicResponse {
+  bool success = 1;
+}

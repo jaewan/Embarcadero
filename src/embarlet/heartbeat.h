@@ -30,6 +30,8 @@ using heartbeat_system::ClusterStatus;
 using heartbeat_system::RegistrationStatus;
 using heartbeat_system::HeartbeatRequest;
 using heartbeat_system::HeartbeatResponse;
+using heartbeat_system::CreateTopicRequest;
+using heartbeat_system::CreateTopicResponse;
 
 class HeartBeatServiceImpl final : public HeartBeat::Service {
 	public:
@@ -105,6 +107,16 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			return Status::OK;
 		}
 
+		Status CreateNewTopic(ServerContext* context, const CreateTopicRequest* request,
+				CreateTopicResponse* reply){
+				reply->set_success(
+					create_topic_entry_callback_(const_cast<char*>(request->topic().c_str()), (int)request->order()));
+		}
+
+		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback){
+			create_topic_entry_callback_ = callback;
+		}
+
 	private:
 		struct NodeInfo {
 			int broker_id;
@@ -119,6 +131,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		absl::flat_hash_map<std::string, NodeInfo> nodes_;
 		std::thread heartbeat_thread_;
 		bool shutdown_ = false;
+		Embarcadero::CreateTopicEntryCallback create_topic_entry_callback_;
 };
 
 class FollowerNodeClient {
@@ -206,6 +219,13 @@ class HeartBeatManager{
 				return 0;
 			}
 			return follower_->GetBrokerId();
+		}
+
+		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback){
+			if(is_head_node_){
+				service_->RegisterCreateTopicEntryCallback(callback);
+			}
+			return;
 		}
 
 	private:
