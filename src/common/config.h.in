@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 
 namespace Embarcadero{
 // the configured options and settings for Embarcadero
@@ -45,6 +46,8 @@ struct PublishRequest{
 	size_t size;
 	int client_socket;
 };
+
+using CreateTopicEntryCallback = std::function<bool(char*, int)>;
 
 } // End of namespace Embarcadero
 #endif // CONFIG_H

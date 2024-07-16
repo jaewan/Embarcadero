@@ -86,23 +86,13 @@ int main(int argc, char* argv[]){
 	Embarcadero::DiskManager disk_manager((1UL<<23));
 	Embarcadero::NetworkManager network_manager(128, broker_id, NUM_NETWORK_IO_THREADS, false);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
+	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, std::placeholders::_2));
 
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);
 	disk_manager.SetNetworkManager(&network_manager);
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
-
-	//********* Load Generate **************
-	/*
-	if(is_head_node || true){ 
-		char topic[31];
-		memset(topic, 0, 31);
-		topic[0] = '0';
-		int order = 0;
-		topic_manager.CreateNewTopic(topic, order);
-	}
-	*/
 
 	LOG(INFO) << "You are now safe to go";
 	//cxl_manager.StartInternalTest();

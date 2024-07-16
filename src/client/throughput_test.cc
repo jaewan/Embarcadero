@@ -47,6 +47,20 @@ class Client{
 
 		void Publish(){
 		};
+
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+			grpc::ClientContext context;
+			heartbeat_system::CreateTopicRequest create_topic_req;;
+			heartbeat_system::CreateTopicResponse create_topic_reply;;
+			create_topic_req.set_topic(topic);
+			create_topic_req.set_order(order);
+			grpc::Status status = stub_->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
+			if(status.ok()){
+				return create_topic_reply.success();
+			}
+			return false;
+		}
+
 	private:
 		void ClusterProbeLoop(){
 			heartbeat_system::ClientInfo client_info;
@@ -553,6 +567,7 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 	Client c("127.0.0.1", std::to_string(BROKER_PORT));
+	c.CreateNewTopic("TestTopic", 0);
 	SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level, true);
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 
