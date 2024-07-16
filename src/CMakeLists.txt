@@ -29,6 +29,7 @@ target_include_directories(embarlet PUBLIC
 )
 
 target_link_libraries(embarlet
+	numa
 	glog
 	gflags
 	mimalloc

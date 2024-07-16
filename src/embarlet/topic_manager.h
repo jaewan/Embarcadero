@@ -4,6 +4,7 @@
 #include "../cxl_manager/cxl_manager.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_set.h"
+#include "absl/synchronization/mutex.h"
 #include <glog/logging.h>
 
 #include <bits/stdc++.h>
@@ -95,6 +96,7 @@ class TopicManager{
 		CXLManager &cxl_manager_;
 		static const std::hash<std::string> topic_to_idx_;
 		absl::flat_hash_map<std::string, std::unique_ptr<Topic> > topics_;
+		absl::Mutex mutex_;
 		int broker_id_;
 		size_t num_topics_;
 };
