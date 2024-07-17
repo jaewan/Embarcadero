@@ -10,7 +10,6 @@
 #include "../network_manager/network_manager.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_map.h"
-#include "../embarlet/peer.h"
 #include <grpcpp/grpcpp.h>
 #include <scalog_sequencer.grpc.pb.h>
 #include <boost/asio.hpp>

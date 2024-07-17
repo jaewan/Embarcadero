@@ -23,32 +23,19 @@ bool CheckAvailableCores(){
 	cpu_set_t mask;
 	CPU_ZERO(&mask);
 
-<<<<<<< HEAD
-    int physicalId = -1;
-    int coreId = -1;
+	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
+			perror("sched_getaffinity");
+			exit(EXIT_FAILURE);
+	}
 
-    while (std::getline(cpuinfo, line)) {
-        std::istringstream iss(line);
-        std::string key;
-        if (getline(iss, key, ':')) {
-            std::string value;
-            getline(iss, value); // Read the rest of the line
-            if (key.find("physical id") != std::string::npos) {
-                physicalId = std::stoi(value);
-            } else if (key.find("core id") != std::string::npos) {
-                coreId = std::stoi(value);
-            }
-
-            // When we have both physical id and core id, insert them as a pair into the set
-            if (physicalId != -1 && coreId != -1) {
-                coreIdentifiers.insert(std::make_pair(physicalId, coreId));
-                physicalId = -1; // Reset for the next processor entry
-                coreId = -1;
-            }
-        }
-    }
-
-    return coreIdentifiers.size();
+	printf("This process can run on CPUs: ");
+	for (int i = 0; i < CPU_SETSIZE; i++) {
+			if (CPU_ISSET(i, &mask)) {
+					printf("%d ", i);
+					num_cores++;
+			}
+	}
+	return num_cores == CGROUP_CORE;
 }
 
 Embarcadero::TopicManager *t;
@@ -79,113 +66,6 @@ void CXLWriteBandwidthTest(int tid){
 		t->PublishToCXL(req);
 		free(req.payload_address);
 	}
-}
-
-std::atomic<size_t> client_order_{0};
-Embarcadero::CXLManager *cxl_manager_;
-Embarcadero::DiskManager *disk_manager_;
-Embarcadero::NetworkManager *network_manager_;
-
-void SimulateNetworkManager(size_t message_size){
-	Embarcadero::PublishRequest req;
-	memset(req.topic, 0, 31);
-	//std::sprintf(req.topic, "%d", tid%NUM_TOPICS);
-	std::sprintf(req.topic, "%d", 0);
-	req.client_id = 1;
-	req.acknowledge = true;
-	req.client_order = client_order_.fetch_add(1);
-	req.size = message_size;
-	int padding = message_size % 64;
-	if(padding)
-		padding = 64 - padding;
-	size_t padded_size = message_size + padding + sizeof(Embarcadero::MessageHeader);
-	for(int i=0; i<LOOPLEN; i++){
-		req.payload_address = mi_malloc(padded_size);
-		Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
-		header->client_id = 1;
-		header->client_order = req.client_id;
-		header->size = req.size;
-		header->total_order = 0;
-		header->paddedSize = padded_size;
-		header->segment_header = nullptr;
-		header->logical_offset = (size_t)-1; // Sentinel value
-		header->next_message = nullptr;
-		req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
-		req.counter->store(2);
-		cxl_manager_->EnqueueRequest(req);
-		disk_manager_->EnqueueRequest(req);
-	}
-}
-
-//End to end test
-void E2ETest(size_t message_size){
-		LOG(INFO) << "Starting E2ETest";
-
-    double bytes_written = NUM_THREADS * LOOPLEN * message_size;
-		bytes_written = bytes_written/(double)(1024*1024);
-
-    std::vector<std::thread> threads;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (double i = 0; i < NUM_THREADS; ++i) {
-        threads.emplace_back(SimulateNetworkManager, message_size);
-    }
-		LOG(INFO) << "Spawned network manger simulation";
-		cxl_manager_->Wait1();
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end - start;
-    //std::cout << " 1 MPMC bandwidth: " << bytes_written/duration.count() << " MB/s" << std::endl;
-		VLOG(3)<< " 1 MPMC bandwidth: " << bytes_written/duration.count() << " MB/s";
-    // Join threads
-    for (double i = 0; i < NUM_THREADS; ++i) {
-        threads[i].join();
-    }
-		LOG(INFO) << "Enqueued all reqs. Waiting for ack...";
-
-		cxl_manager_->Wait2();
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-		VLOG(3)<< " 2 MPMC bandwidth: " << bytes_written/duration.count() << " MB/s";
-    //std::cout << " 2 MPMC bandwidth: " << bytes_written/duration.count() << " MB/s" << std::endl;
-		network_manager_->WaitUntilAcked();
-
-    end = std::chrono::high_resolution_clock::now();
-    duration = end - start;
-
-    double bandwidth = bytes_written / (duration.count()); // Convert bytes to MB
-
-    std::cout << "Runtime: " << duration.count() << std::endl;
-    std::cout << "Internal Publish bandwidth: " << bandwidth << " MB/s" << std::endl;
-}
-
-//Topic Manager Test
-void RawCXLWriteTest(){
-	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager(200,broker_id);
-	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
-	cxl_manager.SetTopicManager(&topic_manager);
-
-	//********* Load Generate **************
-	char topic[31];
-	int order =2;
-	for(int i=0; i<NUM_TOPICS; i++){
-		memset(topic, 0, 31);
-		std::sprintf(topic, "%d", i);
-		cxl_manager.CreateNewTopic(topic, order);
-=======
-	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
-			perror("sched_getaffinity");
-			exit(EXIT_FAILURE);
->>>>>>> ab044835779d736c489448da4443adced11d7472
-	}
-
-	printf("This process can run on CPUs: ");
-	for (int i = 0; i < CPU_SETSIZE; i++) {
-			if (CPU_ISSET(i, &mask)) {
-					printf("%d ", i);
-					num_cores++;
-			}
-	}
-	return num_cores == CGROUP_CORE;
 }
 
 void ScalogOrderTest(Embarcadero::CXLManager *cxl_manager, char* topic) {
@@ -284,7 +164,6 @@ int main(int argc, char* argv[]){
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, std::placeholders::_2));
 
-	cxl_manager.SetBroker(broker);
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);
 	disk_manager.SetNetworkManager(&network_manager);

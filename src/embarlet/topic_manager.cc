@@ -168,6 +168,7 @@ void Topic::CombinerThread(){
 				LOG(INFO) << "Stopping CombinerThread";
 				return;
 			}
+
 			std::this_thread::yield();
 		}
 #ifdef MULTISEGMENT
@@ -177,6 +178,9 @@ void Topic::CombinerThread(){
 			continue;
 		}
 #endif
+
+		std::cout << "Updating written" << std::endl;
+
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
 		header->next_message = (uint8_t*)header + header->paddedSize;

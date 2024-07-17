@@ -409,7 +409,7 @@ void CXLManager::ScalogLocalSequencer(const char* topic, std::string global_sequ
 	}
 
 	timer_.expires_from_now(
-		boost::posix_time::milliseconds(5));
+		boost::posix_time::milliseconds(1000));
 	timer_.async_wait([this, topic, global_sequencer_url](auto) { ScalogLocalSequencer(topic, global_sequencer_url); });
 }
 
