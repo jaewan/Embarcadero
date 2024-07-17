@@ -245,7 +245,6 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	size_t run_count = total_message_size/message_size;
 
 
-	ack_port_ = GenerateRandomPORT();
 	Embarcadero::EmbarcaderoReq req;
 	req.client_id = CLIENT_ID;
 	req.client_order = 0;
@@ -429,8 +428,8 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> read_ac
 
 void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, size_t message_size, int ack_level, bool record_latency){
 	LOG(INFO) << "Starting SingleClientMultipleThreads Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
-
 	size_t client_id = 1;
+	ack_port_ = GenerateRandomPORT();
 	std::vector<std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>>> pub_futures;
 
 	std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>> ack_future;
@@ -478,7 +477,6 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 		}
 	}
 	file.close();
-
 
 	// Calculate bandwidth
 	double bandwidthMbps = ((client_order_ * message_size) / seconds) / (1024 * 1024);  // Convert to Megabytes per second

@@ -57,7 +57,7 @@ NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqR
 	//socketFdList = SkipList::createInstance(SKIP_LIST_SIZE);
 
 	while(thread_count_.load() != (1 + NUM_ACK_THREADS + num_reqReceive_threads_)){}
-	std::cout << "[NetworkManager]: \tCreated" << std::endl;
+	LOG(INFO) << "[NetworkManager]: \tCreated";
 }
 
 NetworkManager::~NetworkManager(){
@@ -72,7 +72,7 @@ NetworkManager::~NetworkManager(){
 			thread.join();
 		}
 	}
-	std::cout << "[NetworkManager]: \tDestructed" << std::endl;
+	LOG(INFO) << "[NetworkManager]: \tDestructed";
 }
 
 //Currently only for ack
