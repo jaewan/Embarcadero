@@ -10,7 +10,7 @@ for i in {0,1}; do
 	if [$i == 0];then
 		./$PROGRAM --head &
 	else
-		./$PROGRAM --follower="localhost:8080"&
+		./$PROGRAM --follower="localhost:12140"&
 	fi
 
 	echo "/sys/fs/cgroup/embarcadero_cgroup$i/cgroup.procs"
@@ -19,10 +19,3 @@ for i in {0,1}; do
 	#PID=$(pidof $PROGRAM)
 	echo $PID | sudo tee "/sys/fs/cgroup/embarcadero_cgroup$i/cgroup.procs"
 done
-
-'''
-PROGRAM=throughput_test
-./$PROGRAM &
-PID=$(pidof $PROGRAM)
-echo $PID | sudo tee "/sys/fs/cgroup/embarcadero_cgroup$4/cgroup.procs"
-'''
