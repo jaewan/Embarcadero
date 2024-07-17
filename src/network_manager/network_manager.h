@@ -30,18 +30,20 @@ struct SubscribeShake{
 };
 
 struct alignas(64) EmbarcaderoReq{
-	uint32_t client_id;
+	uint16_t client_id;
 	uint32_t size;//Pub: Maximum size of messages in this batch
 	size_t client_order; // at Sub: used as last offset  set to -2 as sentinel value
 	void* last_addr; // Sub: address of last fetched msg
-	uint32_t ack;
+	uint16_t ack;
+	uint32_t port;
 	ClientRequestType client_req;
 	char topic[32]; //This is to align thie struct as 64B
 };
 
 class NetworkManager{
 	public:
-		NetworkManager(size_t queueCapacity, int num_reqReceive_threads=NUM_NETWORK_IO_THREADS, bool test=false);
+		NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads=NUM_NETWORK_IO_THREADS,
+									 bool test=false);
 		~NetworkManager();
 		void EnqueueRequest(struct NetworkRequest);
 		void SetDiskManager(DiskManager* disk_manager){
@@ -65,6 +67,7 @@ class NetworkManager{
 
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
+		int broker_id_;
 		std::vector<std::thread> threads_;
 		int num_reqReceive_threads_;
 

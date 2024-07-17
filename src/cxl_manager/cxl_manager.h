@@ -1,7 +1,6 @@
 #ifndef INCLUDE_CXL_MANGER_H_
 #define INCLUDE_CXL_MANGER_H_
 
-
 #include <thread>
 #include <iostream>
 #include <optional>
@@ -29,7 +28,7 @@ enum SequencerType {Embarcadero, Scalog, Corfu};
  * CXL is composed of three components; TINode, Bitmap, Segments
  * TINode region: First sizeof(TINode) * MAX_TOPIC
  * + Padding to make each region be aligned in cacheline
- * Bitmap region: Cacheline_size * NUM_BROKERS
+ * Bitmap region: Cacheline_size * NUM_MAX_BROKERS
  * Segment region: Rest. It is allocated to each brokers equally according to broker_id
  * 		Segment: 8Byte of segment metadata to store address of last ordered_offset from the segment, messages
  * 			Message: Header + paylod
@@ -40,13 +39,13 @@ struct alignas(32) offset_entry {
 	volatile int written;
 	//Since each broker will have different virtual adddress on the CXL memory, access it via CXL_addr_ + off
 	volatile size_t ordered_offset; //relative offset to last ordered message header
-	size_t log_offset;
+	volatile size_t log_offset;
 };
 
 struct alignas(64) TInode{
-	char topic[31];
-	uint8_t order;
-	volatile offset_entry offsets[NUM_BROKERS];
+	char topic[TOPIC_NAME_SIZE];
+	volatile uint8_t order;
+	volatile offset_entry offsets[NUM_MAX_BROKERS];
 };
 
 struct NonCriticalMessageHeader{
@@ -157,7 +156,6 @@ class CXLManager : public ScalogSequencer::Service {
 		std::shared_ptr<Embarcadero::PeerBroker> broker_;
 
 		CXLType cxl_type_;
-		int cxl_fd_;
 		void* cxl_addr_;
 		void* bitmap_;
 		void* segments_;

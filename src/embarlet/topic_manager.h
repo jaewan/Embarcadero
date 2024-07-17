@@ -4,6 +4,8 @@
 #include "../cxl_manager/cxl_manager.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_set.h"
+#include "absl/synchronization/mutex.h"
+#include <glog/logging.h>
 
 #include <bits/stdc++.h>
 
@@ -26,7 +28,7 @@ class Topic{
 					thread.join();
 				}
 			}
-			std::cout << "[Topic]: \tDestructed" << std::endl;
+			LOG(INFO) << "[Topic]: \tDestructed";
 		}
 		// Delete copy contstructor and copy assignment operator
 		Topic(const Topic &) = delete;
@@ -68,27 +70,35 @@ class TopicManager{
 	public:
 		TopicManager(CXLManager &cxl_manager, int broker_id):
 									cxl_manager_(cxl_manager),
-									broker_id_(broker_id){
-			std::cout << "[TopicManager]\tConstructed" << std::endl;
+									broker_id_(broker_id),
+									num_topics_(0){
+			LOG(INFO) << "[TopicManager]\tConstructed";
 		}
 		~TopicManager(){
-			std::cout << "[TopicManager]\tDestructed" << std::endl;
+			LOG(INFO) << "[TopicManager]\tDestructed";
 		}
-		void CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order);
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* messages, size_t &messages_size);
 
 	private:
+		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]);
 		int GetTopicIdx(char topic[TOPIC_NAME_SIZE]){
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
+		}
+
+		inline bool IsHeadNode(){
+			return broker_id_ == 0;
 		}
 
 		CXLManager &cxl_manager_;
 		static const std::hash<std::string> topic_to_idx_;
 		absl::flat_hash_map<std::string, std::unique_ptr<Topic> > topics_;
+		absl::Mutex mutex_;
 		int broker_id_;
+		size_t num_topics_;
 };
 
 } // End of namespace Embarcadero

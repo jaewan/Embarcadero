@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 
 namespace Embarcadero{
 // the configured options and settings for Embarcadero
@@ -11,17 +12,19 @@ namespace Embarcadero{
 
 #define ORDER_LEVEL 1
 #define PORT 1214
-#define NUM_BROKERS 1
-#define CXL_SIZE (1UL<<38)
+#define BROKER_PORT 12140
+#define NUM_MAX_BROKERS 2
+#define CXL_SIZE (1UL<<37)
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
-#define SEGMENT_SIZE (1UL << 37)
-#define NUM_DISK_IO_THREADS 32 
-#define NUM_CXL_IO_THREADS 128 
-#define NUM_NETWORK_IO_THREADS 32
+#define SEGMENT_SIZE (1UL << 32)
+#define NUM_DISK_IO_THREADS 8 
+#define NUM_CXL_IO_THREADS 32 
+#define NUM_NETWORK_IO_THREADS 8
 #define NUM_ACK_THREADS 1
 
 //********* Health check configs *********
+#define HEARTBEAT_INTERVAL 3 // in seconds
 /// The delay to send the first health check
 #define HEALTH_CHECK_INITIAL_DELAY_MS 5000
 /// The interval between two health checks
@@ -31,6 +34,8 @@ namespace Embarcadero{
 /// The threshold for the amount of retries we do before we consider a node dead.
 #define HEALTH_CHECK_FAILURE_THRESHOLD 5
 
+//********* Health check configs *********
+#define CGROUP_CORE 85
 struct PublishRequest{
 	int client_id;
 	size_t client_order; // Must start from 0
@@ -41,6 +46,8 @@ struct PublishRequest{
 	size_t size;
 	int client_socket;
 };
+
+using CreateTopicEntryCallback = std::function<bool(char*, int)>;
 
 } // End of namespace Embarcadero
 #endif // CONFIG_H

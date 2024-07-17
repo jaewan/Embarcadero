@@ -3,6 +3,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <iostream>
@@ -12,18 +13,153 @@
 #include <atomic>
 #include <vector>
 #include <cstring>
+#include <random>
+
+#include <grpcpp/grpcpp.h>
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
 #include <mimalloc.h>
+#include "absl/synchronization/mutex.h"
 
+#include <heartbeat.grpc.pb.h>
 #include "common/config.h"
 #include "../cxl_manager/cxl_manager.h"
+
+using heartbeat_system::HeartBeat;
+
+class Client{
+	public:
+		Client(std::string head_addr, std::string port):
+			head_addr_(head_addr), port_(port), shutdown_(false){
+				std::string addr = head_addr+":"+port;
+				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
+				client_id_ = GenerateRandomNum();
+				nodes_[0] = addr;
+				cluster_probe_thread_ = std::thread([this](){
+						this->ClusterProbeLoop();
+						});
+			}
+		~Client(){
+			LOG(INFO) << "Destructing Client";
+			shutdown_ = true;
+			cluster_probe_thread_.join();
+		};
+
+		void Publish(){
+		};
+
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+			grpc::ClientContext context;
+			heartbeat_system::CreateTopicRequest create_topic_req;;
+			heartbeat_system::CreateTopicResponse create_topic_reply;;
+			create_topic_req.set_topic(topic);
+			create_topic_req.set_order(order);
+			grpc::Status status = stub_->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
+			if(status.ok()){
+				return create_topic_reply.success();
+			}
+			return false;
+		}
+
+	private:
+		void ClusterProbeLoop(){
+			heartbeat_system::ClientInfo client_info;
+			heartbeat_system::ClusterStatus cluster_status;
+			for (const auto &it: nodes_){
+				client_info.add_nodes_info(it.first);
+			}
+			while(!shutdown_){
+				grpc::ClientContext context;
+				grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
+				if(status.ok()){
+					const auto& removed_nodes = cluster_status.removed_nodes();
+					const auto& new_nodes = cluster_status.new_nodes();
+					if(!removed_nodes.empty()){
+						absl::MutexLock lock(&mutex_);
+						//TODO(Jae) Handle broker failure
+						for(const auto& id:removed_nodes){
+							LOG(ERROR) << "Failed Node reported : " << id;
+							nodes_.erase(id);
+							RemoveNodeFromClientInfo(client_info, id);
+						}
+					}
+					if(!new_nodes.empty()){
+						absl::MutexLock lock(&mutex_);
+						for(const auto& addr:new_nodes){
+							int broker_id = GetBrokerId(addr);
+							LOG(INFO) << "New Node reported:" << broker_id;
+							nodes_[GetBrokerId(addr)] = addr;
+							client_info.add_nodes_info(broker_id);
+						}
+					}
+				}else{
+					LOG(ERROR) << "Head is dead, try reaching other brokers for a newly elected head";
+				}
+				std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_INTERVAL));
+			}
+		}
+
+		void RemoveNodeFromClientInfo(heartbeat_system::ClientInfo& client_info, int32_t node_to_remove) {
+			auto* nodes_info = client_info.mutable_nodes_info();
+			int size = nodes_info->size();
+			for (int i = 0; i < size; ++i) {
+				if (nodes_info->Get(i) == node_to_remove) {
+					// Remove this element by swapping it with the last element and then removing the last
+					nodes_info->SwapElements(i, size - 1);
+					nodes_info->RemoveLast();
+					--size;
+					--i;  // Recheck this index since we swapped elements
+				}
+			}
+		}
+
+		int GetBrokerId(const std::string& input) {
+			size_t colonPos = input.find(':');
+			if (colonPos == std::string::npos) {
+				throw std::invalid_argument("Input string does not contain a colon");
+			}
+			std::string numberStr = input.substr(colonPos + 1);
+			try {
+				return std::stoi(numberStr) - PORT;
+			} catch (const std::exception& e) {
+				throw std::invalid_argument("Failed to convert to integer: " + std::string(e.what()));
+			}
+		}
+
+		int GenerateRandomNum(){
+			// Generate a random number
+			std::random_device rd;
+			std::mt19937 gen(rd());
+			std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
+			return  dis(gen);
+		}
+
+		std::string head_addr_;
+		std::string port_;
+		bool shutdown_;
+		int client_id_;
+		std::unique_ptr<HeartBeat::Stub> stub_;
+		std::thread cluster_probe_thread_;
+		// <broker_id, address::port of network_mgr>
+		absl::flat_hash_map<int, std::string> nodes_;
+		absl::Mutex mutex_;
+};
 
 #define ACK_SIZE 1024
 #define SERVER_ADDR "127.0.0.1"
 
 std::atomic<size_t> totalBytesRead_(0);
 std::atomic<size_t> client_order_(0);
+int ack_port_;;
+
+// This is to avoid contention if brokers and clients run on the same node
+int GenerateRandomPORT(){
+	// Generate a random number
+	std::random_device rd;
+	std::mt19937 gen(rd());
+	std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
+	return  dis(gen);
+}
 
 int make_socket_non_blocking(int sfd) {
 	int flags = fcntl(sfd, F_GETFL, 0);
@@ -109,12 +245,14 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	size_t run_count = total_message_size/message_size;
 
 
+	ack_port_ = GenerateRandomPORT();
 	Embarcadero::EmbarcaderoReq req;
 	req.client_id = CLIENT_ID;
 	req.client_order = 0;
-	memset(req.topic, 0, 32);
-	req.topic[0] = '0';
+	memset(req.topic, 0, TOPIC_NAME_SIZE);
+	memcpy(req.topic, "TestTopic", 9);
 	req.ack = ack_level;
+	req.port = ack_port_;
 	req.size = message_size + sizeof(Embarcadero::MessageHeader);
 	int n, i;
 	struct epoll_event events[10]; // Adjust size as needed
@@ -242,7 +380,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> read_ac
 	sockaddr_in server_addr;
 	memset(&server_addr, 0, sizeof(server_addr));
 	server_addr.sin_family = AF_INET;
-	server_addr.sin_port = htons(PORT + CLIENT_ID);
+	server_addr.sin_port = htons(ack_port_);
 	server_addr.sin_addr.s_addr = INADDR_ANY;
 
 	if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
@@ -316,8 +454,8 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 	LOG(INFO) << "Ack size:" << ack_times.size() << " pub size:" << pub_times.size();
 	//assert(ack_times.size() == pub_times.size());
 
-  std::sort(pub_times.begin(), pub_times.end());
-  std::sort(ack_times.begin(), ack_times.end());
+	std::sort(pub_times.begin(), pub_times.end());
+	std::sort(ack_times.begin(), ack_times.end());
 
 	auto start = pub_times.front();
 	auto end = pub_times.back();
@@ -330,14 +468,14 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 	for(size_t i=0; i<len; i++){
 		latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(ack_times[i] - pub_times[i]).count());
 	}
-  std::sort(latencies.begin(), latencies.end());
+	std::sort(latencies.begin(), latencies.end());
 	std::ofstream file("/home/domin/.CXL_EMUL/CDF_data.csv");
 	file << "Latency (ns),CDF\n";
 	for (size_t i = 0; i < latencies.size(); ++i) {
-			if (i == 0 || latencies[i] != latencies[i - 1]) {
-					double cdf = static_cast<double>(i + 1) / latencies.size();
-					file << latencies[i] << "," << cdf << "\n";
-			}
+		if (i == 0 || latencies[i] != latencies[i - 1]) {
+			double cdf = static_cast<double>(i + 1) / latencies.size();
+			file << latencies[i] << "," << cdf << "\n";
+		}
 	}
 	file.close();
 
@@ -381,6 +519,28 @@ void MultipleClientsSingleThread(size_t num_threads, size_t total_message_size, 
 	LOG(INFO) << "Bandwidth:" << bandwidthMbps << " MBps" ;
 }
 
+// Checks if Cgroup is successful. Wait for 1 second to allow the process to be attached to the cgroup
+bool CheckAvailableCores(){
+	sleep(1);
+	size_t num_cores = 0;
+	cpu_set_t mask;
+	CPU_ZERO(&mask);
+
+	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
+		perror("sched_getaffinity");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("This process can run on CPUs: ");
+	for (int i = 0; i < CPU_SETSIZE; i++) {
+		if (CPU_ISSET(i, &mask)) {
+			printf("%d ", i);
+			num_cores++;
+		}
+	}
+	return num_cores == CGROUP_CORE;
+}
+
 int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
@@ -391,6 +551,7 @@ int main(int argc, char* argv[]) {
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
+		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("32"));
 
@@ -401,6 +562,12 @@ int main(int argc, char* argv[]) {
 	int ack_level = result["ack_level"].as<int>();
 	FLAGS_v = result["log_level"].as<int>();
 
+	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
+		LOG(ERROR) << "CGroup core throttle is wrong";
+		return -1;
+	}
+	Client c("127.0.0.1", std::to_string(BROKER_PORT));
+	c.CreateNewTopic("TestTopic", 0);
 	SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level, true);
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 

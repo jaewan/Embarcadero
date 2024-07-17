@@ -1,31 +1,29 @@
 #include "common/config.h"
 #include "pub_queue.h"
 #include "pub_task.h"
-#include "peer.h"
+#include "heartbeat.h"
 #include "topic_manager.h"
 #include "../disk_manager/disk_manager.h"
 #include "../network_manager/network_manager.h"
 #include "../cxl_manager/cxl_manager.h"
-#include <fstream>
-#include <sstream>
-#include <iostream>
 #include <string>
-#include <set>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <emmintrin.h>
 #include <thread>
 
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
-#include "mimalloc.h"
 
-size_t GetPhysicalCoreCount(){
-	std::ifstream cpuinfo("/proc/cpuinfo");
-    std::string line;
-    std::set<std::pair<int, int>> coreIdentifiers; // Set to store unique (physical id, core id) pairs
+bool CheckAvailableCores(){
+	sleep(1);
+	size_t num_cores = 0;
+	cpu_set_t mask;
+	CPU_ZERO(&mask);
 
+<<<<<<< HEAD
     int physicalId = -1;
     int coreId = -1;
 
@@ -173,121 +171,21 @@ void RawCXLWriteTest(){
 		memset(topic, 0, 31);
 		std::sprintf(topic, "%d", i);
 		cxl_manager.CreateNewTopic(topic, order);
+=======
+	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
+			perror("sched_getaffinity");
+			exit(EXIT_FAILURE);
+>>>>>>> ab044835779d736c489448da4443adced11d7472
 	}
 
-	std::cout << "Starting Topic Manager Test" << std::endl;
-    std::vector<std::thread> threads;
-	t = &topic_manager;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (double i = 0; i < NUM_THREADS; ++i) {
-        threads.emplace_back(CXLWriteBandwidthTest, i);
-    }
-    // Join threads
-    for (double i = 0; i < NUM_THREADS; ++i) {
-        threads[i].join();
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end - start;
-
-    double bytes_written =NUM_THREADS * (double)LOOPLEN/1024 ;
-    double bandwidth = bytes_written / (duration.count() *1024); // Convert bytes to MB
-
-    std::cout << "Runtime: " << duration.count() << std::endl;
-    std::cout << "Internal Publish bandwidth: " << bandwidth << " GB/s" << std::endl;
-
-	sleep(2);
-	size_t last_offset = (size_t)-2;
-	void* last_addr = nullptr;
-	void* messages;
-	size_t messages_size;
-		if(cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)){
-			std::cout << "read :" << last_offset<< std::endl;
-		}else{
-			std::cout << "Did not read anything" << std::endl;
-		}
-	/*
-	size_t to_read_msg = LOOPLEN*1024*NUM_THREADS;
-	size_t off = 0;
-	while(to_read_msg > 0){
-		if(cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)){
-			Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)messages;
-			for(off; off<last_offset; off++){
-				//std::cout << header->total_order << std::endl;
+	printf("This process can run on CPUs: ");
+	for (int i = 0; i < CPU_SETSIZE; i++) {
+			if (CPU_ISSET(i, &mask)) {
+					printf("%d ", i);
+					num_cores++;
 			}
-			to_read_msg -= messages_size;
-		}else{
-			std::cout << std::endl;
-		}
-	};
-	*/
-}
-
-void ReadWriteTest(){
-	int broker_id = 0;
-	Embarcadero::CXLManager cxl_manager(4000,broker_id, 4);
-	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
-
-	cxl_manager.SetTopicManager(&topic_manager);
-
-	char topic[31];
-	memset(topic, 0, 31);
-	topic[0] = '0';
-	int order = 2;
-	cxl_manager.CreateNewTopic(topic, order);
-
-	Embarcadero::PublishRequest req;
-	memset(req.topic, 0, 31);
-	req.topic[0] = '0';
-	req.client_id = 0;
-	req.client_order = 1;
-	req.size = 777;
-	req.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>));
-	req.counter->store(1);
-
-	req.payload_address = malloc(1024);;
-	memcpy((uint8_t*)req.payload_address + 64, "testing write read", 18);
-					Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)req.payload_address;
-					header->client_id = 0;
-					header->client_order = 0;
-					header->size = 777;
-					header->total_order = 0;
-					header->paddedSize = 64 - (777 % 64) + 777;
-					header->segment_header = nullptr;
-					header->logical_offset = (size_t)-1; // Sentinel value
-					header->next_message = nullptr;
-	cxl_manager.EnqueueRequest(req);
-
-	Embarcadero::PublishRequest req1;
-	memset(req1.topic, 0, 31);
-	req1.topic[0] = '0';
-	req1.client_id = 0;
-	req1.client_order = 2;
-	req1.size = 777;
-	req1.payload_address = malloc(1024);;
-	req1.counter = (std::atomic<int>*)malloc(sizeof(std::atomic<int>));
-	req1.counter->store(1);
-	memcpy((uint8_t*)req1.payload_address + 64, "Second Message", 14);
-					header = (Embarcadero::MessageHeader*)req1.payload_address;
-					header->client_id = 0;
-					header->client_order = 1;
-					header->size = 777;
-					header->total_order = 0;
-					header->paddedSize = 64 - (777 % 64) + 777;
-					header->segment_header = nullptr;
-					header->logical_offset = (size_t)-1; // Sentinel value
-					header->next_message = nullptr;
-	cxl_manager.EnqueueRequest(req1);
-
-	size_t last_offset = (size_t)-2;
-	void* last_addr = nullptr;
-	void* messages;
-	size_t messages_size;
-	sleep(2);
-	std::cout << cxl_manager.GetMessageAddr(topic, last_offset, last_addr, messages, messages_size)
-	<< std::endl;
-	std::cout << messages_size << std::endl;
-	return ;
+	}
+	return num_cores == CGROUP_CORE;
 }
 
 void ScalogOrderTest(Embarcadero::CXLManager *cxl_manager, char* topic) {
@@ -337,16 +235,18 @@ void ScalogOrderTest(Embarcadero::CXLManager *cxl_manager, char* topic) {
 }
 
 int main(int argc, char* argv[]){
+
+	// *************** Initializing Logging ********************** 
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
 
-	//size_t num_cores = GetPhysicalCoreCount();
-  	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
-	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="10.182.0.4:8080"
-  	options.add_options()
-		("head", "Head Node")
+	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
+	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="HEAD_ADDR:PORT"
+	options.add_options()
+			("head", "Head Node")
 			("follower", "Follower Address and Port", cxxopts::value<std::string>())
 			("e,emul", "Use emulation instead of CXL")
+			("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 			("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		;
 
@@ -356,44 +256,33 @@ int main(int argc, char* argv[]){
 	FLAGS_logtostderr = 1; // log only to console, no files.
 	//FLAGS_log_dir = "/tmp/vlog2_log";
 
+	// *************** Initializing Broker ********************** 
+	bool is_head_node = false;
+	std::string head_addr = "127.0.0.1:" + std::to_string(BROKER_PORT);
 
-    // Embarcadero::PeerBroker* broker = nullptr;
-	std::shared_ptr<Embarcadero::PeerBroker> broker;
-    std::thread broker_thread;
-	bool is_head;
 	if (arguments.count("head")) {
-		is_head = true;
-
-		// Initialize peer broker
-		// Embarcadero::PeerBroker broker(true);
-		broker = std::make_shared<Embarcadero::PeerBroker>(true);
-
-		// Create a thread for head_broker and start it
-        broker_thread = std::thread(&Embarcadero::PeerBroker::Run, broker);
+		is_head_node = true;
 	} else if (arguments.count("follower")) {
-		is_head = false;
-
-		std::string follower = arguments["follower"].as<std::string>();
-
-		std::string head_addr = follower.substr(0, follower.find(":"));
-		std::string head_port = follower.substr(follower.find(":") + 1);
-
-		// Embarcadero::PeerBroker broker(false, head_addr, head_port);
-		broker = std::make_shared<Embarcadero::PeerBroker>(false, head_addr, head_port);
-
-        // Create a thread for follower_broker and start it
-        broker_thread = std::thread(&Embarcadero::PeerBroker::Run, broker);
+		head_addr = arguments["follower"].as<std::string>();
 	} else {
-		LOG(ERROR) << "Invalid arguments to initialize broker";
+		LOG(ERROR) << "Invalid arguments";
+	}
+	HeartBeatManager heartbeat_manager(is_head_node, head_addr);
+	int broker_id = heartbeat_manager.GetBrokerId();
+
+	LOG(INFO) << "Starting Embarlet broker_id:" << broker_id;
+	// Check Cgroup setting
+	if(arguments["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
+		LOG(ERROR) << "CGroup core throttle is wrong";
+		return -1;
 	}
 
-	//Initialize
-	//size_t num_cores = GetPhysicalCoreCount();
-	int broker_id = 0;
+	// *************** Initializing Managers ********************** 
 	Embarcadero::CXLManager cxl_manager((1UL<<23), broker_id);
 	Embarcadero::DiskManager disk_manager((1UL<<23));
-	Embarcadero::NetworkManager network_manager(128, NUM_NETWORK_IO_THREADS, false);
+	Embarcadero::NetworkManager network_manager(128, broker_id, NUM_NETWORK_IO_THREADS, false);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
+	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, std::placeholders::_2));
 
 	cxl_manager.SetBroker(broker);
 	cxl_manager.SetTopicManager(&topic_manager);
@@ -418,25 +307,15 @@ int main(int argc, char* argv[]){
 		cxl_manager.CreateNewTopic(topic, order, Embarcadero::Scalog);
 	}
 
-	std::cout << "You are now safe to go" << std::endl;
 
 	t = &topic_manager;
 	ScalogOrderTest(&cxl_manager, topic);
 
+	LOG(INFO) << "You are now safe to go";
 	//cxl_manager.StartInternalTest();
 	
-	// *********** E2E Bandwidth Teste ******************* //
-	/*
-	cxl_manager_ = &cxl_manager;
-	disk_manager_ = &disk_manager;
-	network_manager_ = &network_manager;
-	E2ETest(960);
-	*/
-
-	while(true){
-	std::this_thread::yield();
-	sleep(100);
-	}
+	// *************** Wait unless there's a failure ********************** 
+	heartbeat_manager.Wait();
 
 	return 0;
 }

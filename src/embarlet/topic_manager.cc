@@ -82,34 +82,53 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	memcpy(dst, src, n);
 }
 
-void TopicManager::CreateNewTopic(char topic[31], int order){
-	// Get and initialize tinode
-	void* segment_metadata = cxl_manager_.GetNewSegment();
+struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]){
+	absl::MutexLock lock(&mutex_);
+	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
+	if(topics_.find(topic)!= topics_.end()){
+		LOG(ERROR)<< "Topic already exists!!!";
+		return nullptr;
+	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
+	void* segment_metadata = cxl_manager_.GetNewSegment();
 	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
-	memcpy(tinode->topic, topic, 31);
-	tinode->order= (uint8_t)order;
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
 
-	//TODO(Jae) topics_ should be in a critical section
-	// But addition and deletion of a topic in our case is rare
-	// We will leave it this way for now but this needs to be fixed
+	//_mm_clflushopt(tinode);
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
-			tinode, topic, broker_id_, order, cxl_addr, segment_metadata);
+			tinode, topic, broker_id_, tinode->order, cxl_manager_.GetCXLAddr(), segment_metadata);
+	
 	topics_[topic]->Combiner();
+	return tinode;
 }
 
-void TopicManager::DeleteTopic(char topic[31]){
+bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+	VLOG(3) << "[CreateNewTopic] topic:" << topic;
+	struct TInode* tinode = CreateNewTopicInternal(topic);
+	if(tinode != nullptr){
+		memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
+		tinode->order= (uint8_t)order;
+		return true;
+	}
+	return false;
+}
+
+void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
 void TopicManager::PublishToCXL(PublishRequest &req){
 	auto topic_itr = topics_.find(req.topic);
-	//TODO(Jae) if not found from topics_, inspect CXL TInode region too
 	if (topic_itr == topics_.end()){
-		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, 31));
-		perror("Topic not found");
+		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
+			VLOG(3) << "[PublishToCXL] TopicManager topic entry not found, creating one";
+			// The topic was created from another broker
+			CreateNewTopicInternal(req.topic);
+		}else{
+			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before";
+			return;
+		}
 	}
 	topic_itr->second->PublishToCXL(req);
 }
@@ -141,13 +160,12 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 }
 
 void Topic::CombinerThread(){
-	const static size_t header_size = sizeof(MessageHeader);
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
 	while(!stop_threads_){
 		while(header->paddedSize == 0){
 			if(stop_threads_){
-				std::cout << "Stopping CombinerThread" << std::endl;
+				LOG(INFO) << "Stopping CombinerThread";
 				return;
 			}
 			std::this_thread::yield();
@@ -216,7 +234,6 @@ void Topic::PublishToCXL(PublishRequest &req){
 // we should call this functiona again
 bool Topic::GetMessageAddr(size_t &last_offset,
 						   void* &last_addr, void* messages, size_t &messages_size){
-	static const size_t header_size = sizeof(struct MessageHeader);
 	size_t digested_offset = written_logical_offset_;
 	void* digested_addr = written_physical_addr_;
 	if(order_ > 0){
@@ -259,7 +276,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	struct MessageHeader *m = (struct MessageHeader*)messages;
 	size_t len = messages_size;
 	while(len>0){
-		char* msg = (char*)((uint8_t*)m + header_size);
+		char* msg = (char*)((uint8_t*)m + sizeof(struct MessageHeader);
 		std::cout << " total_order:" << m->total_order<< " logical_order:" <<
 		m->logical_offset << " client_order::" << m->client_order << std::endl;
 		len -= m->paddedSize;
