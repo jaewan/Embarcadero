@@ -164,6 +164,7 @@ int main(int argc, char* argv[]){
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, std::placeholders::_2));
 
+	cxl_manager.SetBroker(&heartbeat_manager);
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);
 	disk_manager.SetNetworkManager(&network_manager);
@@ -181,7 +182,7 @@ int main(int argc, char* argv[]){
 	char topic[31];
 	memset(topic, 0, 31);
 	topic[0] = '0';
-	if (is_head) {
+	if (is_head_node) {
 		int order = 1;
 		cxl_manager.CreateNewTopic(topic, order, Embarcadero::Scalog);
 	}

@@ -124,7 +124,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			std::string network_mgr_addr;
 			std::chrono::steady_clock::time_point last_heartbeat;
 		};
-
+		
 		void CheckHeartbeats();
 
 		absl::Mutex mutex_;
@@ -226,6 +226,13 @@ class HeartBeatManager{
 				service_->RegisterCreateTopicEntryCallback(callback);
 			}
 			return;
+		}
+
+		std::string GetBrokerUrl(){
+			if (is_head_node_) {
+				return GetAddress()+":"+std::to_string(0+PORT);
+			}
+			return GetAddress()+":"+std::to_string(follower_->GetBrokerId()+PORT);
 		}
 
 	private:

@@ -13,6 +13,7 @@
 #include <grpcpp/grpcpp.h>
 #include <scalog_sequencer.grpc.pb.h>
 #include <boost/asio.hpp>
+#include "../embarlet/heartbeat.h"
 
 namespace Embarcadero{
 
@@ -72,7 +73,7 @@ class CXLManager : public ScalogSequencer::Service {
 	public:
 		CXLManager(size_t queueCapacity, int broker_id, int num_io_threads=NUM_CXL_IO_THREADS);
 		~CXLManager();
-		void SetBroker(std::shared_ptr<Embarcadero::PeerBroker> broker){
+		void SetBroker(HeartBeatManager *broker){
 			broker_ = broker;
 		}
 		void SetTopicManager(TopicManager *topic_manager){
@@ -152,7 +153,7 @@ class CXLManager : public ScalogSequencer::Service {
 
 		TopicManager *topic_manager_;
 		NetworkManager *network_manager_;
-		std::shared_ptr<Embarcadero::PeerBroker> broker_;
+		HeartBeatManager *broker_;
 
 		CXLType cxl_type_;
 		void* cxl_addr_;
