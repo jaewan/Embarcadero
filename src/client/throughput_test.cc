@@ -20,6 +20,7 @@
 #include <glog/logging.h>
 #include <mimalloc.h>
 #include "absl/synchronization/mutex.h"
+#include "folly/MPMCQueue.h"
 
 #include <heartbeat.grpc.pb.h>
 #include "common/config.h"
@@ -29,8 +30,8 @@ using heartbeat_system::HeartBeat;
 
 class Client{
 	public:
-		Client(std::string head_addr, std::string port):
-			head_addr_(head_addr), port_(port), shutdown_(false){
+		Client(std::string head_addr, std::string port, size_t queueSize):
+			head_addr_(head_addr), port_(port), shutdown_(false), pubQue_(queueSize), client_order_(0){
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				client_id_ = GenerateRandomNum();
@@ -43,10 +44,42 @@ class Client{
 			LOG(INFO) << "Destructing Client";
 			shutdown_ = true;
 			cluster_probe_thread_.join();
+			std::optional<char*> sentinel = std::nullopt;
+			for (int i=0; i < num_threads_; i++)
+				pubQue_.blockingWrite(sentinel);
+			for(auto &t : threads_)
+				t.join();
 		};
 
-		void Publish(){
-		};
+		void Init(int num_threads, int msg_copy, char topic[TOPIC_NAME_SIZE], int ack_level, int order, size_t message_size){
+			num_threads_ = num_threads;
+			msg_copy_ = msg_copy;
+			memcpy(topic_, topic, TOPIC_NAME_SIZE);
+			ack_level_ = ack_level;
+			order_ = order;
+			ack_port_ = GenerateRandomNum();
+			message_size_ = message_size;
+			ack_thread_ = std::thread([this](){
+					this->AckThread();
+					});
+			for (int i=0; i < num_threads; i++){
+				threads_.emplace_back(&Client::PublishThread, this);
+			}
+			return;
+		}
+
+		void Publish(std::string &message){
+			pubQue_.blockingWrite(message.data());
+		}
+
+		void Poll(int n){
+			while(client_order_ != n){
+				std::this_thread::yield();
+			}
+			shutdown_ = true;
+			ack_thread_.join();
+			return;
+		}
 
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
 			grpc::ClientContext context;
@@ -62,6 +95,177 @@ class Client{
 		}
 
 	private:
+		std::string head_addr_;
+		std::string port_;
+		bool shutdown_;
+		int client_id_;
+		std::unique_ptr<HeartBeat::Stub> stub_;
+		std::thread cluster_probe_thread_;
+		// <broker_id, address::port of network_mgr>
+		absl::flat_hash_map<int, std::string> nodes_;
+		absl::Mutex mutex_;
+		folly::MPMCQueue<std::optional<char*>> pubQue_;
+		std::atomic<size_t> client_order_;
+		int num_threads_;
+		int msg_copy_;
+		char topic_[TOPIC_NAME_SIZE];
+		int ack_level_;
+		int order_;
+		int ack_port_;
+		size_t message_size_;
+		std::vector<std::thread> threads_;
+		std::thread ack_thread_;
+
+		void AckThread(){
+			int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+			int flag = 1;
+			if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
+				LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed";
+				close(server_sock);
+				return ;
+			}
+			setsockopt(server_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+
+			sockaddr_in server_addr;
+			memset(&server_addr, 0, sizeof(server_addr));
+			server_addr.sin_family = AF_INET;
+			server_addr.sin_port = htons(ack_port_);
+			server_addr.sin_addr.s_addr = INADDR_ANY;
+
+			if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+				LOG(ERROR) << "Bind failed";
+				close(server_sock);
+				return ;
+			}
+
+			if (listen(server_sock, SOMAXCONN) < 0) {
+				LOG(ERROR) << "Listen failed";
+				close(server_sock);
+				return ;
+			}
+
+			sockaddr_in client_addr;
+			socklen_t client_addr_len = sizeof(client_addr);
+			int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
+			if (client_sock < 0) {
+				LOG(ERROR) << "Accept failed";
+				return ;
+			}
+			size_t read = 0;
+			uint8_t* data = (uint8_t*)malloc(1024);
+			while (!shutdown_ || read<client_order_){//shutdown_ is to ensure the client_order_ is fully updated
+				size_t bytesReceived;
+				if((bytesReceived = recv(client_sock, data, 1024, 0))){
+					read += bytesReceived;
+				}else{
+					LOG(ERROR) << "Read error:" << bytesReceived << " " << strerror(errno);
+				}
+			}
+			LOG(INFO) << "Acked:" << read;
+			return;
+		}
+
+		void PublishThread(){
+			int sock = GetNonblockingSock("127.0.0.1", PORT);
+			// *********** Initiate Shake *********** 
+			int efd = epoll_create1(0);
+			struct epoll_event event;
+			event.data.fd = sock;
+			event.events = EPOLLOUT;
+			epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event);
+
+			Embarcadero::EmbarcaderoReq shake;
+			shake.client_id = client_id_;
+			memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
+			shake.ack = ack_level_;
+			shake.client_order = order_;
+			shake.port = ack_port_;
+			shake.size = message_size_ + sizeof(Embarcadero::MessageHeader);
+			int n, i;
+			struct epoll_event events[10]; // Adjust size as needed
+			bool running = true;
+			size_t sent_bytes = 0;
+			while (running) {
+				n = epoll_wait(efd, events, 10, -1);
+				for (i = 0; i < n; i++) {
+					if (events[i].events & EPOLLOUT) {
+						ssize_t bytesSent = send(sock, (int8_t*)(&shake) + sent_bytes, sizeof(shake) - sent_bytes, 0);
+						if (bytesSent < 0) {
+							if (errno != EAGAIN) {
+								perror("send failed");
+								running = false;
+								break;
+							}
+						} 
+						sent_bytes += bytesSent;
+						if(sent_bytes == sizeof(shake)){
+							running = false;
+							if(i == n-1){
+								i = 0;
+								n = epoll_wait(efd, events, 10, -1);
+							}
+							break;
+						}
+					}
+				}
+			}
+
+			// *********** Sending Messages *********** 
+			Embarcadero::MessageHeader header;
+			header.client_id = client_id_;
+			header.size = message_size_;
+			header.total_order = 0;
+			int padding = message_size_ % 64;
+			if(padding){
+				padding = 64 - padding;
+			}
+			header.paddedSize = message_size_ + padding + sizeof(Embarcadero::MessageHeader);
+			header.segment_header = nullptr;
+			header.logical_offset = (size_t)-1; // Sentinel value
+			header.next_message = nullptr;
+			std::optional<char*> optReq;
+
+			while(!shutdown_){
+				pubQue_.blockingRead(optReq);
+				if(!optReq.has_value()){
+					return;
+				}
+				char* message = optReq.value();
+				header.client_order = client_order_.fetch_add(1);
+
+				bool send_msg = true;
+				sent_bytes = 0;
+				while (send_msg) {
+					for (; i < n; i++) {
+						if (events[i].events & EPOLLOUT) {
+							ssize_t bytesSent;
+							if(sent_bytes < sizeof(header)){
+								bytesSent = send(sock, (uint8_t*)&header + sent_bytes, sizeof(header) - sent_bytes, 0);
+							}else{
+								bytesSent = send(sock, (uint8_t*)message + sent_bytes - 64, shake.size - sent_bytes, 0);
+							}
+							if (bytesSent < 0) {
+								if (errno != EAGAIN) {
+									LOG(ERROR) << "send failed";
+									send_msg = false;
+									break;
+								}
+							}
+							sent_bytes += bytesSent;
+							if(sent_bytes == shake.size){
+								send_msg = false;
+								break;
+							}
+						}
+					}
+					n = epoll_wait(efd, events, 10, -1);
+					i = 0;
+				}
+			}
+			close(sock);
+			close(efd);
+		}
+
 		void ClusterProbeLoop(){
 			heartbeat_system::ClientInfo client_info;
 			heartbeat_system::ClusterStatus cluster_status;
@@ -134,15 +338,52 @@ class Client{
 			return  dis(gen);
 		}
 
-		std::string head_addr_;
-		std::string port_;
-		bool shutdown_;
-		int client_id_;
-		std::unique_ptr<HeartBeat::Stub> stub_;
-		std::thread cluster_probe_thread_;
-		// <broker_id, address::port of network_mgr>
-		absl::flat_hash_map<int, std::string> nodes_;
-		absl::Mutex mutex_;
+		int GetNonblockingSock(char *broker_address, int port){
+			int sock = socket(AF_INET, SOCK_STREAM, 0);
+			if (sock < 0) {
+				LOG(ERROR) << "Socket creation failed";
+				return -1;
+			}
+			int flags = fcntl(sock, F_GETFL, 0);
+			if (flags == -1) {
+				perror("fcntl F_GETFL");
+				return -1;
+			}
+
+			flags |= O_NONBLOCK;
+			if (fcntl(sock, F_SETFL, flags) == -1) {
+				perror("fcntl F_SETFL");
+				return -1;
+			}
+			int flag = 1; // Enable the option
+			if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
+				LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed";
+				close(sock);
+				return -1;
+			}
+
+			if(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
+				LOG(ERROR) << "setsockopt error";
+				close(sock);
+				return -1;
+			}
+
+			sockaddr_in server_addr;
+			memset(&server_addr, 0, sizeof(server_addr));
+			server_addr.sin_family = AF_INET;
+			server_addr.sin_port = htons(port);
+			server_addr.sin_addr.s_addr = inet_addr(broker_address);
+
+			if (connect(sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+				if (errno != EINPROGRESS) {
+					LOG(ERROR) << "Connect failed";
+					close(sock);
+					return -1;
+				}
+			}
+
+			return sock;
+		}
 };
 
 #define ACK_SIZE 1024
@@ -174,9 +415,6 @@ int make_socket_non_blocking(int sfd) {
 		return -1;
 	}
 	return 0;
-}
-
-static inline void SendHeader(void* header){
 }
 
 std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_data(size_t message_size,
@@ -224,7 +462,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	event.events = EPOLLOUT;
 	epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event);
 
-// =============== Sending Shake =============== 
+	// =============== Sending Shake =============== 
 	Embarcadero::EmbarcaderoReq shake;
 	shake.client_id = CLIENT_ID;
 	shake.client_order = 0;
@@ -289,7 +527,6 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	running = true;
 	bool stop_sending = false;
 	int num_send_called_this_msg = 0;
-	bool msgSent = true;
 	while (running) {
 		for (; i < n; i++) {
 			if (events[i].events & EPOLLOUT && (!stop_sending || header.client_order < run_count)) {
@@ -329,7 +566,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 			}
 		}
 		if (header.client_order >= run_count && stop_sending) { // Example break condition
-				break;
+			break;
 			//running = false;
 		}
 		n = epoll_wait(efd, events, 10, -1);
@@ -393,9 +630,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> read_ac
 	char *data = (char*)calloc(TOTAL_DATA_SIZE/message_size, sizeof(char));
 	ssize_t bytesReceived;
 	int to_read = TOTAL_DATA_SIZE/message_size;//sizeof(std::chrono::time_point<std::chrono::high_resolution_clock>);
-	VLOG(3) << "Start reading ack: " << to_read << " on fd" << client_sock;
 	while (to_read > 0){
-		VLOG(4) << "Before reading" ;
 		if((bytesReceived = recv(client_sock, (uint8_t*)data + ((TOTAL_DATA_SIZE/message_size) - to_read) , 1024, 0))){
 			if(record_latency){
 				auto t = std::chrono::high_resolution_clock::now();
@@ -404,7 +639,6 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> read_ac
 				}
 			}
 			to_read -= bytesReceived;
-			VLOG(4) << "Ack received:" << bytesReceived;
 		}else{
 			perror("Read error");
 		}
@@ -539,7 +773,7 @@ int main(int argc, char* argv[]) {
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("32"));
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
@@ -547,14 +781,35 @@ int main(int argc, char* argv[]) {
 	size_t num_threads = result["num_thread"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	FLAGS_v = result["log_level"].as<int>();
+	char topic[32];
+	memcpy(topic, "TestTopic", 9);
+	int order = 0;
 
 	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
 		LOG(ERROR) << "CGroup core throttle is wrong";
 		return -1;
 	}
-	Client c("127.0.0.1", std::to_string(BROKER_PORT));
-	c.CreateNewTopic("TestTopic", 0);
-	SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level, true);
+
+	int n = total_message_size/message_size;
+	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
+	std::string message(message_size, 0);
+
+	Client c("127.0.0.1", std::to_string(BROKER_PORT), n + 1024);
+	std::cout << "Client Created" << std::endl;
+	c.CreateNewTopic(topic, order);
+	c.Init(num_threads, 0, topic, ack_level, order, message_size);
+	auto start = std::chrono::high_resolution_clock::now();
+	for(int i=0; i<n; i++){
+		c.Publish(message);
+	}
+	c.Poll(n);
+
+	auto end = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> elapsed = end - start;
+	double seconds = elapsed.count();
+	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
+	std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
+	//SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level, true);
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 
 	return 0;

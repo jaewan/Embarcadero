@@ -60,4 +60,5 @@ target_link_libraries(throughput_test
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOF}
+    ${FOLLY_LIBRARIES}
 )
