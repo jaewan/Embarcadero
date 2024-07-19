@@ -57,7 +57,7 @@ NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqR
 	//socketFdList = SkipList::createInstance(SKIP_LIST_SIZE);
 
 	while(thread_count_.load() != (1 + NUM_ACK_THREADS + num_reqReceive_threads_)){}
-	std::cout << "[NetworkManager]: \tCreated" << std::endl;
+	LOG(INFO) << "[NetworkManager]: \tCreated";
 }
 
 NetworkManager::~NetworkManager(){
@@ -72,7 +72,7 @@ NetworkManager::~NetworkManager(){
 			thread.join();
 		}
 	}
-	std::cout << "[NetworkManager]: \tDestructed" << std::endl;
+	LOG(INFO) << "[NetworkManager]: \tDestructed";
 }
 
 //Currently only for ack
@@ -268,31 +268,25 @@ void NetworkManager::ReqReceiveThread(){
 				// Create publish request
 				struct PublishRequest pub_req;
 				pub_req.client_id = shake.client_id;
-				memcpy(pub_req.topic, shake.topic, 31);
+				memcpy(pub_req.topic, shake.topic, TOPIC_NAME_SIZE);
 				pub_req.acknowledge = shake.ack;
 				pub_req.client_socket = ack_fd;
 
 				while(running){
 						int bytes_read = recv(req.client_socket, (uint8_t*)buf + (READ_SIZE - to_read), to_read, 0);
 						if(bytes_read <= 0){
-							LOG(INFO) << "Receiving data ERROR:" << strerror(errno);
+							if(bytes_read < 0)
+								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
+							VLOG(3) << "Receiving data: " << bytes_read << " gracefully closing connection";
+							mi_free(buf);
+							running = false;
 							break;
-						}
+						}						
 						to_read -= bytes_read;
 						size_t read = READ_SIZE - to_read;
-						MessageHeader *header;
-						if(read > sizeof(MessageHeader)){
-							header = (MessageHeader*)buf;
-							if(header->client_id == -1){
-								VLOG(3) << "Last message received:";
-								mi_free(buf);
-								running = false;
-								//TODO(Jae) we do not want to close it for ack
-								close(req.client_socket);
-								break;
-							}
-						}
+						//TODO(Jae) Change this to malloc here to allow dynamic message size during one connection
 						if(to_read == 0){
+							MessageHeader *header = (MessageHeader*)buf;;
 							pub_req.size = header->size;
 							pub_req.client_order = header->client_order;
 							pub_req.payload_address = (void*)buf;
@@ -360,6 +354,8 @@ void NetworkManager::TestAckThread(){
 		}
 	}
 }
+
+// Current impl opens ack connection at publish and does not close it
 void NetworkManager::AckThread(){
 	std::optional<struct NetworkRequest> optReq;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);

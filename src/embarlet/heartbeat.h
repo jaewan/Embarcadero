@@ -111,6 +111,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				CreateTopicResponse* reply){
 				reply->set_success(
 					create_topic_entry_callback_(const_cast<char*>(request->topic().c_str()), (int)request->order()));
+				return Status::OK;
 		}
 
 		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback){

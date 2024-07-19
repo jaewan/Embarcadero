@@ -158,9 +158,10 @@ int main(int argc, char* argv[]){
 	}
 
 	// *************** Initializing Managers ********************** 
-	Embarcadero::CXLManager cxl_manager((1UL<<23), broker_id);
-	Embarcadero::DiskManager disk_manager((1UL<<23));
-	Embarcadero::NetworkManager network_manager(128, broker_id, NUM_NETWORK_IO_THREADS, false);
+	// Queue Size (1UL<<22)(1UL<<25)(1UL<<25) respectly performed 6GB/s 1kb message disk thread:8 cxl:16 network: 32
+	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id);
+	Embarcadero::DiskManager disk_manager((1UL<<25));
+	Embarcadero::NetworkManager network_manager((1UL<<25), broker_id, NUM_NETWORK_IO_THREADS, false);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, std::placeholders::_2));
 

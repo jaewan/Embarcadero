@@ -1,6 +1,5 @@
 #include "disk_manager.h"
 
-#include <iostream>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -19,15 +18,14 @@ DiskManager::DiskManager(size_t queueCapacity,
 	//Initialize log file
 	log_fd_ = open(DISK_LOG_PATH, O_RDWR|O_CREAT, 0777);
 	if (log_fd_ < 0){
-		perror("Error in opening a file for disk log\n");
-		std::cout<< strerror(errno) << std::endl;
+		LOG(ERROR) << "Error in opening a file for disk log:" <<strerror(errno);
 	}
 	// Create Disk I/O threads
 	for (int i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&DiskManager::Disk_io_thread, this);
 
 	while(thread_count_.load() != num_io_threads_){}
-	std::cout << "[DiskManager]: \tCreated" << std::endl;
+	LOG(INFO) << "[DiskManager]: \tCreated";
 }
 
 DiskManager::~DiskManager(){
@@ -43,7 +41,7 @@ DiskManager::~DiskManager(){
 			thread.join();
 		}
 	}
-	std::cout << "[DiskManager]: \tDestructed" << std::endl;
+	LOG(INFO)<< "[DiskManager]: \tDestructed";
 }
 
 void DiskManager::EnqueueRequest(struct PublishRequest req){

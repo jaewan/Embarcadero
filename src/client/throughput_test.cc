@@ -176,6 +176,9 @@ int make_socket_non_blocking(int sfd) {
 	return 0;
 }
 
+static inline void SendHeader(void* header){
+}
+
 std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_data(size_t message_size,
 		size_t total_message_size, int ack_level, size_t CLIENT_ID, bool record_latency) {
 	std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> times;
@@ -218,42 +221,18 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	int efd = epoll_create1(0);
 	struct epoll_event event;
 	event.data.fd = sock;
-#ifdef ACK
-	event.events = EPOLLOUT | EPOLLIN | EPOLLET; // Edge-triggered for both read and write
-	char ack[ACK_SIZE];
-#else
 	event.events = EPOLLOUT;
-#endif
 	epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event);
 
-	char *data = (char*)calloc(message_size+64, sizeof(char));
-
-	Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)data;
-	header->client_id = CLIENT_ID;
-	header->size = message_size;
-	header->total_order = 0;
-	header->client_order = client_order_.fetch_add(1);
-	int padding = message_size % 64;
-	if(padding){
-		padding = 64 - padding;
-	}
-	header->paddedSize = message_size + padding + sizeof(Embarcadero::MessageHeader);
-	header->segment_header = nullptr;
-	header->logical_offset = (size_t)-1; // Sentinel value
-	header->next_message = nullptr;
-
-	size_t run_count = total_message_size/message_size;
-
-
-	ack_port_ = GenerateRandomPORT();
-	Embarcadero::EmbarcaderoReq req;
-	req.client_id = CLIENT_ID;
-	req.client_order = 0;
-	memset(req.topic, 0, TOPIC_NAME_SIZE);
-	memcpy(req.topic, "TestTopic", 9);
-	req.ack = ack_level;
-	req.port = ack_port_;
-	req.size = message_size + sizeof(Embarcadero::MessageHeader);
+// =============== Sending Shake =============== 
+	Embarcadero::EmbarcaderoReq shake;
+	shake.client_id = CLIENT_ID;
+	shake.client_order = 0;
+	memset(shake.topic, 0, TOPIC_NAME_SIZE);
+	memcpy(shake.topic, "TestTopic", 9);
+	shake.ack = ack_level;
+	shake.port = ack_port_;
+	shake.size = message_size + sizeof(Embarcadero::MessageHeader);
 	int n, i;
 	struct epoll_event events[10]; // Adjust size as needed
 	bool running = true;
@@ -267,7 +246,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 		n = epoll_wait(efd, events, 10, -1);
 		for (i = 0; i < n; i++) {
 			if (events[i].events & EPOLLOUT) {
-				ssize_t bytesSent = send(sock, (int8_t*)(&req) + sent_bytes, sizeof(req) - sent_bytes, 0);
+				ssize_t bytesSent = send(sock, (int8_t*)(&shake) + sent_bytes, sizeof(shake) - sent_bytes, 0);
 				if (bytesSent < 0) {
 					if (errno != EAGAIN) {
 						perror("send failed");
@@ -276,7 +255,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 					}
 				} 
 				sent_bytes += bytesSent;
-				if(sent_bytes == sizeof(req)){
+				if(sent_bytes == sizeof(shake)){
 					running = false;
 					if(i == n-1){
 						i = 0;
@@ -288,20 +267,45 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 		}
 	}
 
+	char *data = (char*)calloc(message_size+64, sizeof(char));
+
+	Embarcadero::MessageHeader header;
+	header.client_id = CLIENT_ID;
+	header.size = message_size;
+	header.total_order = 0;
+	header.client_order = client_order_.fetch_add(1);
+	int padding = message_size % 64;
+	if(padding){
+		padding = 64 - padding;
+	}
+	header.paddedSize = message_size + padding + sizeof(Embarcadero::MessageHeader);
+	header.segment_header = nullptr;
+	header.logical_offset = (size_t)-1; // Sentinel value
+	header.next_message = nullptr;
+
+	size_t run_count = total_message_size/message_size;
+
 	sent_bytes = 0;
 	running = true;
 	bool stop_sending = false;
 	int num_send_called_this_msg = 0;
+	bool msgSent = true;
 	while (running) {
 		for (; i < n; i++) {
-			if (events[i].events & EPOLLOUT && (!stop_sending || header->client_order < run_count)) {
-				if(!stop_sending && header->client_order >= run_count){
+			if (events[i].events & EPOLLOUT && (!stop_sending || header.client_order < run_count)) {
+				if(!stop_sending && header.client_order >= run_count){
 					stop_sending = true;
-					header->client_id = -1;
+					header.client_id = -1;
+					std::cout << "Closing the connectiong" << std::endl;
 				}
 				if(record_latency)
 					times.emplace_back(std::chrono::high_resolution_clock::now());
-				ssize_t bytesSent = send(sock, (uint8_t*)data + sent_bytes, req.size - sent_bytes, 0);
+				ssize_t bytesSent;
+				if(sent_bytes < sizeof(header)){
+					bytesSent = send(sock, (uint8_t*)&header + sent_bytes, sizeof(header) - sent_bytes, 0);
+				}else{
+					bytesSent = send(sock, (uint8_t*)data + sent_bytes, shake.size - sent_bytes, 0);
+				}
 				num_send_called_this_msg++;
 				if (bytesSent < 0) {
 					if(record_latency)
@@ -313,35 +317,18 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 					}
 				} 
 				sent_bytes += bytesSent;
-				if(sent_bytes == req.size){
+				if(sent_bytes == shake.size){
 					sent_bytes = 0;
 					num_send_called_this_msg = 0;
-					header->client_order = client_order_.fetch_add(1);
+					header.client_order = client_order_.fetch_add(1);
 				}else{
 					if(record_latency && num_send_called_this_msg>1){
 						times.pop_back();
 					}
 				}
 			}
-#ifdef ACK
-			if (events[i].events & EPOLLIN) {
-				ssize_t bytesReceived = recv(sock, ack, ACK_SIZE, 0);
-				if (bytesReceived <= 0) {
-					if (bytesReceived == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-						perror("recv failed or connection closed");
-						running = false;
-						break;
-					}
-				} else {
-					totalBytesRead_.fetch_add(bytesReceived);
-				}
-			}
-#endif
 		}
-		if (header->client_order >= run_count && stop_sending) { // Example break condition
-#ifdef ACK
-			if(totalBytesRead_ >= total_message_size)
-#endif
+		if (header.client_order >= run_count && stop_sending) { // Example break condition
 				break;
 			//running = false;
 		}
@@ -429,8 +416,8 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> read_ac
 
 void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, size_t message_size, int ack_level, bool record_latency){
 	LOG(INFO) << "Starting SingleClientMultipleThreads Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
-
 	size_t client_id = 1;
+	ack_port_ = GenerateRandomPORT();
 	std::vector<std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>>> pub_futures;
 
 	std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>> ack_future;
@@ -478,7 +465,6 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 		}
 	}
 	file.close();
-
 
 	// Calculate bandwidth
 	double bandwidthMbps = ((client_order_ * message_size) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
