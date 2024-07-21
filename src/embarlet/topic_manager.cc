@@ -86,7 +86,6 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	absl::MutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
 	if(topics_.find(topic)!= topics_.end()){
-		LOG(ERROR)<< "Topic already exists!!!";
 		return nullptr;
 	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
@@ -106,13 +105,14 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 }
 
 bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
-	VLOG(3) << "[CreateNewTopic] topic:" << topic;
 	struct TInode* tinode = CreateNewTopicInternal(topic);
 	if(tinode != nullptr){
 		memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
 		tinode->order= (uint8_t)order;
 		//TODO(Tony) Initiate Global Scalog Sequencer
 		return true;
+	}else{
+		LOG(ERROR)<< "Topic already exists!!!";
 	}
 	return false;
 }
@@ -128,7 +128,7 @@ void TopicManager::PublishToCXL(PublishRequest &req){
 			// The topic was created from another broker
 			CreateNewTopicInternal(req.topic);
 		}else{
-			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before";
+			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic << " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
 			return;
 		}
 	}

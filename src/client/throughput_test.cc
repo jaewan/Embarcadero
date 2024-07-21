@@ -31,22 +31,36 @@ using heartbeat_system::HeartBeat;
 class Client{
 	public:
 		Client(std::string head_addr, std::string port, size_t queueSize):
-			head_addr_(head_addr), port_(port), shutdown_(false), pubQue_(queueSize), client_order_(0){
+			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), total_queue_size_(queueSize), client_order_(0){
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				client_id_ = GenerateRandomNum();
-				nodes_[0] = addr;
+				nodes_[0] = head_addr+":"+std::to_string(PORT);
 				cluster_probe_thread_ = std::thread([this](){
 						this->ClusterProbeLoop();
 						});
+				while(!connected_){
+					std::this_thread::yield();
+				}
+				{
+					absl::MutexLock lock(&mutex_);
+					//Add headnode as headnode is not reported from ClusterProbeLoop
+					size_t queueSize = total_queue_size_ / (nodes_.size() + 1);
+					pubQues_.emplace_back(queueSize);
+					broker_id_to_queue_idx_[0] = pubQues_.size() - 1;
+				}
 			}
+
 		~Client(){
 			LOG(INFO) << "Destructing Client";
 			shutdown_ = true;
 			cluster_probe_thread_.join();
 			std::optional<char*> sentinel = std::nullopt;
-			for (int i=0; i < num_threads_; i++)
-				pubQue_.blockingWrite(sentinel);
+			int len = pubQues_.size();
+			for(auto& q:pubQues_){
+				for(int i =0; i<num_threads_; i++) // This is not correct for sanity overwrite sentinel
+					q.blockingWrite(sentinel);
+			}
 			for(auto &t : threads_)
 				t.join();
 		};
@@ -62,14 +76,27 @@ class Client{
 			ack_thread_ = std::thread([this](){
 					this->AckThread();
 					});
+			int num_nodes = pubQues_.size();
 			for (int i=0; i < num_threads; i++){
-				threads_.emplace_back(&Client::PublishThread, this);
+				threads_.emplace_back(&Client::PublishThread, this, i%num_nodes);
 			}
 			return;
 		}
 
 		void Publish(std::string &message){
-			pubQue_.blockingWrite(message.data());
+			static int i = 0;
+			pubQues_[i].blockingWrite(message.data());
+			i = (i+1)%pubQues_.size();
+		}
+
+		void CorfuPublish(std::string &message){
+			static int i = 0;
+			// TODO(Erika) RPC global sequencer and get the messages ordered
+			// Best way to do this is to create a CorfuClient
+			// Make batch argument
+			// stub_->GetMessageOrder(num_batch)
+			pubQues_[i].blockingWrite(message.data());
+			i = (i+1)%pubQues_.size();
 		}
 
 		void Poll(int n){
@@ -87,6 +114,10 @@ class Client{
 			heartbeat_system::CreateTopicResponse create_topic_reply;;
 			create_topic_req.set_topic(topic);
 			create_topic_req.set_order(order);
+	char Jae_Check[TOPIC_NAME_SIZE];
+	memset(Jae_Check, 0, TOPIC_NAME_SIZE);
+	memcpy(Jae_Check, "TestTopic", 9);
+	VLOG(3) << "[CreateNewTopic] memcmp:" << memcmp(topic, Jae_Check, TOPIC_NAME_SIZE);
 			grpc::Status status = stub_->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
 			if(status.ok()){
 				return create_topic_reply.success();
@@ -98,13 +129,16 @@ class Client{
 		std::string head_addr_;
 		std::string port_;
 		bool shutdown_;
+		bool connected_;
 		int client_id_;
+		size_t total_queue_size_;
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::thread cluster_probe_thread_;
 		// <broker_id, address::port of network_mgr>
 		absl::flat_hash_map<int, std::string> nodes_;
 		absl::Mutex mutex_;
-		folly::MPMCQueue<std::optional<char*>> pubQue_;
+		std::vector<folly::MPMCQueue<std::optional<char*>>> pubQues_; 
+		absl::flat_hash_map<int, int> broker_id_to_queue_idx_;
 		std::atomic<size_t> client_order_;
 		int num_threads_;
 		int msg_copy_;
@@ -165,8 +199,17 @@ class Client{
 			return;
 		}
 
-		void PublishThread(){
-			int sock = GetNonblockingSock("127.0.0.1", PORT);
+		void PublishThread(int pubQuesIdx){
+			int broker_id = 0;
+			for(auto& it:broker_id_to_queue_idx_){
+				if(it.second == pubQuesIdx){
+					broker_id = it.first;
+					break;
+				}
+			}
+			auto [addr, addressPort] = ParseAddressPort(nodes_[broker_id]);
+			//int sock = GetNonblockingSock("127.0.0.1", PORT);
+			int sock = GetNonblockingSock(addr.data(), PORT + broker_id);
 			// *********** Initiate Shake *********** 
 			int efd = epoll_create1(0);
 			struct epoll_event event;
@@ -226,7 +269,7 @@ class Client{
 			std::optional<char*> optReq;
 
 			while(!shutdown_){
-				pubQue_.blockingRead(optReq);
+				pubQues_[pubQuesIdx].blockingRead(optReq);
 				if(!optReq.has_value()){
 					return;
 				}
@@ -276,6 +319,7 @@ class Client{
 				grpc::ClientContext context;
 				grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
 				if(status.ok()){
+					connected_ = true;
 					const auto& removed_nodes = cluster_status.removed_nodes();
 					const auto& new_nodes = cluster_status.new_nodes();
 					if(!removed_nodes.empty()){
@@ -285,15 +329,25 @@ class Client{
 							LOG(ERROR) << "Failed Node reported : " << id;
 							nodes_.erase(id);
 							RemoveNodeFromClientInfo(client_info, id);
+
+							/*
+								 pubQues_.erase(pubQues_.begin() + broker_id_to_queue_idx_[id]);
+								 broker_id_to_queue_idx_.erase(id);
+								 */
 						}
 					}
 					if(!new_nodes.empty()){
 						absl::MutexLock lock(&mutex_);
+						size_t queueSize = total_queue_size_ / (nodes_.size() + new_nodes.size());
 						for(const auto& addr:new_nodes){
 							int broker_id = GetBrokerId(addr);
 							LOG(INFO) << "New Node reported:" << broker_id;
 							nodes_[GetBrokerId(addr)] = addr;
 							client_info.add_nodes_info(broker_id);
+
+							//pubQues.emplace(broker_id, folly::MPMCQueue<std::optional<char*>>(queueSize));
+							pubQues_.emplace_back(queueSize);
+							broker_id_to_queue_idx_[broker_id] = pubQues_.size() - 1;
 						}
 					}
 				}else{
@@ -317,17 +371,32 @@ class Client{
 			}
 		}
 
-		int GetBrokerId(const std::string& input) {
+		std::pair<std::string, int> ParseAddressPort(const std::string& input) {
 			size_t colonPos = input.find(':');
 			if (colonPos == std::string::npos) {
-				throw std::invalid_argument("Input string does not contain a colon");
+				throw std::invalid_argument("Invalid input format. Expected 'address:port'");
 			}
-			std::string numberStr = input.substr(colonPos + 1);
+
+			std::string address = input.substr(0, colonPos);
+			std::string portStr = input.substr(colonPos + 1);
+
+			int port;
 			try {
-				return std::stoi(numberStr) - PORT;
+				port = std::stoi(portStr);
 			} catch (const std::exception& e) {
-				throw std::invalid_argument("Failed to convert to integer: " + std::string(e.what()));
+				throw std::invalid_argument("Invalid port number");
 			}
+
+			if (port < 0 || port > 65535) {
+				throw std::out_of_range("Port number out of valid range (0-65535)");
+			}
+
+			return std::make_pair(address, port);
+		}
+
+		int GetBrokerId(const std::string& input) {
+			auto [addr, addressPort] = ParseAddressPort(input);
+			return addressPort - PORT;
 		}
 
 		int GenerateRandomNum(){
@@ -761,38 +830,18 @@ bool CheckAvailableCores(){
 	return num_cores == CGROUP_CORE;
 }
 
-int main(int argc, char* argv[]) {
-	google::InitGoogleLogging(argv[0]);
-	google::InstallFailureSignalHandler();
-	FLAGS_logtostderr = 1; // log only to console, no files.
-	cxxopts::Options options("embarcadero-throughputTest", "Embarcadero Throughput Test");
+void ThroughputTestRaw(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order){
+	SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level, true);
+	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
+}
 
-	options.add_options()
-		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
-		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
-		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
-		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
-
-	auto result = options.parse(argc, argv);
-	size_t message_size = result["size"].as<size_t>();
-	size_t total_message_size = result["total_message_size"].as<size_t>();
-	size_t num_threads = result["num_thread"].as<size_t>();
-	int ack_level = result["ack_level"].as<int>();
-	FLAGS_v = result["log_level"].as<int>();
-	char topic[32];
-	memcpy(topic, "TestTopic", 9);
-	int order = 0;
-
-	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
-		LOG(ERROR) << "CGroup core throttle is wrong";
-		return -1;
-	}
-
+void ThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order){
 	int n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
+	char topic[TOPIC_NAME_SIZE];
+	memset(topic, 0, TOPIC_NAME_SIZE);
+	memcpy(topic, "TestTopic", 9);
 
 	Client c("127.0.0.1", std::to_string(BROKER_PORT), n + 1024);
 	std::cout << "Client Created" << std::endl;
@@ -809,8 +858,37 @@ int main(int argc, char* argv[]) {
 	double seconds = elapsed.count();
 	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
 	std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
-	//SingleClientMultipleThreads(num_threads, total_message_size, message_size, ack_level, true);
-	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
+}
+
+int main(int argc, char* argv[]) {
+	google::InitGoogleLogging(argv[0]);
+	google::InstallFailureSignalHandler();
+	FLAGS_logtostderr = 1; // log only to console, no files.
+	cxxopts::Options options("embarcadero-throughputTest", "Embarcadero Throughput Test");
+
+	options.add_options()
+		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
+		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
+		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("0"))
+		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
+		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
+		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
+
+	auto result = options.parse(argc, argv);
+	size_t message_size = result["size"].as<size_t>();
+	size_t total_message_size = result["total_message_size"].as<size_t>();
+	size_t num_threads = result["num_thread"].as<size_t>();
+	int ack_level = result["ack_level"].as<int>();
+	int order = result["order_level"].as<int>();
+	FLAGS_v = result["log_level"].as<int>();
+
+	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
+		LOG(ERROR) << "CGroup core throttle is wrong";
+		return -1;
+	}
+
+	ThroughputTest(total_message_size, message_size, num_threads, ack_level, order);
 
 	return 0;
 }
