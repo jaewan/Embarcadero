@@ -18,6 +18,7 @@
 #include <grpcpp/alarm.h>
 #include <heartbeat.grpc.pb.h>
 #include "common/config.h"
+#include <scalog_sequencer.grpc.pb.h>
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -32,6 +33,13 @@ using heartbeat_system::HeartbeatRequest;
 using heartbeat_system::HeartbeatResponse;
 using heartbeat_system::CreateTopicRequest;
 using heartbeat_system::CreateTopicResponse;
+
+struct LocalNodeInfo {
+	int broker_id;
+	std::string address;
+	std::string network_mgr_addr;
+	std::chrono::steady_clock::time_point last_heartbeat;
+};
 
 class HeartBeatServiceImpl final : public HeartBeat::Service {
 	public:
@@ -118,18 +126,23 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			create_topic_entry_callback_ = callback;
 		}
 
+		int GetNumBrokers() {
+			absl::MutexLock lock(&mutex_);
+			return nodes_.size();
+		}
+
+		absl::flat_hash_map<std::string, LocalNodeInfo> GetPeerBrokers() {
+			absl::MutexLock lock(&mutex_);
+			absl::flat_hash_map<std::string, LocalNodeInfo> peer_nodes = nodes_;
+			peer_nodes.erase("0");
+			return peer_nodes;
+		}
+
 	private:
-		struct NodeInfo {
-			int broker_id;
-			std::string address;
-			std::string network_mgr_addr;
-			std::chrono::steady_clock::time_point last_heartbeat;
-		};
-		
 		void CheckHeartbeats();
 
 		absl::Mutex mutex_;
-		absl::flat_hash_map<std::string, NodeInfo> nodes_;
+		absl::flat_hash_map<std::string, LocalNodeInfo> nodes_;
 		std::thread heartbeat_thread_;
 		bool shutdown_ = false;
 		Embarcadero::CreateTopicEntryCallback create_topic_entry_callback_;
@@ -138,7 +151,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 class FollowerNodeClient {
 	public:
 		FollowerNodeClient(const std::string& node_id, const std::string& address,
-				const std::shared_ptr<grpc::Channel>& channel);
+				const std::shared_ptr<grpc::Channel>& heartbeat_channel, const std::shared_ptr<grpc::Channel>& scalog_channel);
 
 		~FollowerNodeClient() {
 			shutdown_ = true;
@@ -161,6 +174,10 @@ class FollowerNodeClient {
 		std::string GetNodeId() const { return node_id_; }
 		std::string GetAddress() const { return address_; }
 
+		std::unique_ptr<ScalogSequencer::Stub> GetScalogStub() {
+			return std::move(scalog_stub_);
+		}
+
 	private:
 		struct AsyncClientCall {
 			HeartbeatResponse reply;
@@ -180,6 +197,7 @@ class FollowerNodeClient {
 		void HeartBeatLoop();
 
 		std::unique_ptr<HeartBeat::Stub> stub_;
+		std::unique_ptr<ScalogSequencer::Stub> scalog_stub_;
 		std::string node_id_;
 		std::string address_;
 		grpc::CompletionQueue cq_;
@@ -203,6 +221,7 @@ class HeartBeatManager{
 					server_ = builder.BuildAndStart();
 				}else{
 					follower_ = std::make_unique<FollowerNodeClient>(GenerateUniqueId(), GetAddress(), 
+							grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials()),
 							grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials()));
 				}
 			}
@@ -234,6 +253,21 @@ class HeartBeatManager{
 				return GetAddress()+":"+std::to_string(0+PORT);
 			}
 			return GetAddress()+":"+std::to_string(follower_->GetBrokerId()+PORT);
+		}
+
+		std::unique_ptr<ScalogSequencer::Stub> GetScalogStub(){
+			if (is_head_node_) {
+				return nullptr;
+			}
+			return follower_->GetScalogStub();
+		}
+
+		int GetNumBrokers() {
+			return service_->GetNumBrokers();
+		}
+
+		absl::flat_hash_map<std::string, LocalNodeInfo> GetPeerBrokers() {
+			return service_->GetPeerBrokers();
 		}
 
 	private:

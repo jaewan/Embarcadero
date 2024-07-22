@@ -269,34 +269,10 @@ void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequence
 			break;
 		case Scalog:
 			if (order == 1){
-				std::string global_sequencer_url = broker_->GetUrl();
-				
-				// Iterate through broker list and call async grpc to notify them to run local ordering thread
-				for (auto const& peer : broker_->GetPeerBrokers()) {
-					std::string peer_url = peer.first + ":" + peer.second;
+				std::cout << "Starting scalog sequencer in head" << std::endl;
 
-					std::cout << "Sending start local sequencer request to " << peer_url << std::endl;
-
-					auto rpc_client = GetRpcClient(peer_url);
-
-					ScalogStartLocalSequencerRequest request;
-					request.set_topic(topic);
-					request.set_global_sequencer_url(global_sequencer_url);
-
-					ScalogStartLocalSequencerResponse response;
-					grpc::ClientContext context;
-
-					auto callback = [](grpc::Status status) {
-						if (!status.ok()) {
-							std::cout << "Error sending start local sequencer request" << std::endl;
-						}
-					};
-
-					// Async call to HandleStartLocalSequencer
-					rpc_client->async()->HandleScalogStartLocalSequencer(&context, &request, &response, callback);
-				}
-
-				std::cout << "Starting scalog sequencer" << std::endl;
+				struct TInode* tinode = (struct TInode*)GetTInode(topic);
+				tinode->seqType = sequencerType;
 
 				// Set scalog_has_global_sequencer_ to true
 				scalog_has_global_sequencer_[topic] = true;
@@ -314,9 +290,9 @@ void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequence
 					scalog_io_service_.run();
 				});
 
-				scalog_io_service_.dispatch([this, topic, global_sequencer_url] {
-					std::cout << "Sending local cuts for topic " << topic << " to global sequencer at " << global_sequencer_url << std::endl;
-					ScalogLocalSequencer(topic, global_sequencer_url);
+				scalog_io_service_.dispatch([this, topic] {
+					std::cout << "Sending local cuts for topic " << topic << " to global sequencer" << std::endl;
+					ScalogLocalSequencer(topic);
 				});
 			} else if (order == 2)
 				LOG(ERROR) << "Order is set 2 at scalog";
@@ -331,18 +307,7 @@ void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequence
 	}
 }
 
-std::unique_ptr<ScalogSequencer::Stub> CXLManager::GetRpcClient(std::string peer_url) {
-    std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(peer_url, grpc::InsecureChannelCredentials());
-    return ScalogSequencer::NewStub(channel);
-}
-
-grpc::Status CXLManager::HandleScalogStartLocalSequencer(grpc::ServerContext* context, const ScalogStartLocalSequencerRequest* request, ScalogStartLocalSequencerResponse* response) {
-
-	std::cout << "Received start local sequencer request" << std::endl;
-
-	const char* topic = request->topic().c_str();
-	std::string global_sequencer_url = request->global_sequencer_url();
-
+void CXLManager::StartFollowerLocalSequencer(const char* topic) {
 	scalog_has_global_sequencer_[topic] = false;
 
 	scalog_received_global_seq_[topic] = false;
@@ -358,26 +323,20 @@ grpc::Status CXLManager::HandleScalogStartLocalSequencer(grpc::ServerContext* co
 		scalog_io_service_.run();
 	});
 
-	scalog_io_service_.dispatch([this, topic, global_sequencer_url] {
-		std::cout << "Sending local cuts for topic " << topic << " to global sequencer at " << global_sequencer_url << std::endl;
-		ScalogLocalSequencer(topic, global_sequencer_url);
+	scalog_io_service_.dispatch([this, topic] {
+		std::cout << "Sending local cuts for topic " << topic << " to global sequencer" << std::endl;
+		ScalogLocalSequencer(topic);
 	});
-
-	return grpc::Status::OK;
 }
 
-void CXLManager::ScalogLocalSequencer(const char* topic, std::string global_sequencer_url){
-	scalog_global_sequencer_url_[topic] = global_sequencer_url;
+void CXLManager::ScalogLocalSequencer(const char* topic){
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
-	scalog_global_cut_[topic] = std::vector<int>(NUM_BROKERS, 0);
+	scalog_global_cut_[topic] = std::vector<int>(NUM_MAX_BROKERS, 0);
 
 	// Send written offset variable to global sequencer every 5 ms iff global cut has been received
 	if (scalog_local_epoch_[topic] == 0) {
 		// This is the first local cut to be sent, don't need to wait for global cut
-
-		std::cout << "Sending the first local cut to " << global_sequencer_url << std::endl;
-
-		std::cout << "Sending local cut: " << tinode->offsets[broker_id_].written << std::endl;
+		std::cout << "Sending first local cut: " << tinode->offsets[broker_id_].written << std::endl;
 
 		// send epoch and tinode->offsets[broker_id_].written to global sequencer
 		ScalogSendLocalCut(scalog_local_epoch_[topic], tinode->offsets[broker_id_].written, topic);
@@ -385,7 +344,7 @@ void CXLManager::ScalogLocalSequencer(const char* topic, std::string global_sequ
 		scalog_local_epoch_[topic]++;
 	} else if (scalog_local_epoch_[topic] > 0 && scalog_received_global_seq_[topic]) {
 
-		std::cout << "Received global cut, so sending local cut again to " << global_sequencer_url << std::endl;
+		std::cout << "Received global cut, so sending local cut again" << std::endl;
 
 		scalog_received_global_seq_[topic] = false;
 
@@ -410,7 +369,7 @@ void CXLManager::ScalogLocalSequencer(const char* topic, std::string global_sequ
 
 	timer_.expires_from_now(
 		boost::posix_time::milliseconds(1000));
-	timer_.async_wait([this, topic, global_sequencer_url](auto) { ScalogLocalSequencer(topic, global_sequencer_url); });
+	timer_.async_wait([this, topic](auto) { ScalogLocalSequencer(topic); });
 }
 
 // Helper function that allows a local scalog sequencer to send their local cut
@@ -425,9 +384,7 @@ void CXLManager::ScalogSendLocalCut(int epoch, int written, const char* topic) {
 		std::cout << "Asynchronously sent local cut" << std::endl;
 	} else {
 
-		std::cout << "Sending local cut to " << scalog_global_sequencer_url_[topic] << " with grpc" << std::endl;
-		
-		auto rpc_client = GetRpcClient(scalog_global_sequencer_url_[topic]);
+		std::cout << "Sending local cut with grpc" << std::endl;
 
 		ScalogSendLocalCutRequest request;
 		request.set_epoch(epoch);
@@ -445,8 +402,13 @@ void CXLManager::ScalogSendLocalCut(int epoch, int written, const char* topic) {
 		};
 
 		// Async call to HandleStartLocalSequencer
-		rpc_client->async()->HandleScalogSendLocalCut(&context, &request, &response, callback);
+		broker_->GetScalogStub()->async()->HandleScalogSendLocalCut(&context, &request, &response, callback);
 	}
+}
+
+std::unique_ptr<ScalogSequencer::Stub> CXLManager::GetRpcClient(std::string peer_url) {
+    std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(peer_url, grpc::InsecureChannelCredentials());
+    return ScalogSequencer::NewStub(channel);
 }
 
 void CXLManager::ScalogReceiveLocalCut(int epoch, int local_cut, const char* topic, int broker_id) {
@@ -464,7 +426,7 @@ void CXLManager::ScalogReceiveLocalCut(int epoch, int local_cut, const char* top
 	// increment local_cuts_count_
 	scalog_local_cuts_count_[topic]++;
 
-	if (scalog_local_cuts_count_[topic] == NUM_BROKERS) {
+	if (scalog_local_cuts_count_[topic] == broker_->GetNumBrokers()) {
 
 		std::cout << "All local cuts for epoch " << epoch << " have been received, sending global cut" << std::endl;
 
@@ -475,7 +437,7 @@ void CXLManager::ScalogReceiveLocalCut(int epoch, int local_cut, const char* top
 		// Iterate through broker list and call async grpc to send global cut
 		for (auto const& peer : broker_->GetPeerBrokers()) {
 
-			std::string peer_url = peer.first + ":" + peer.second;
+			std::string peer_url = peer.second.address;
 			auto rpc_client = GetRpcClient(peer_url);
 
 			std::cout << "Sending global cut to " << peer_url << std::endl;

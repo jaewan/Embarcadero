@@ -1,22 +1,11 @@
 syntax = "proto3";
 
 service ScalogSequencer {
-    // Notifies another broker to start their local sequencer for Scalog
-    rpc HandleScalogStartLocalSequencer(ScalogStartLocalSequencerRequest) returns (ScalogStartLocalSequencerResponse);
     // Receives a local cut from a local sequencer
     rpc HandleScalogSendLocalCut(ScalogSendLocalCutRequest) returns (ScalogSendLocalCutResponse);
     // Receives the global cut from global sequencer
     rpc HandleScalogSendGlobalCut(ScalogSendGlobalCutRequest) returns (ScalogSendGlobalCutResponse);
 }
-
-// Request containing topic and url of the global sequencer
-message ScalogStartLocalSequencerRequest {
-    string topic = 1;
-    string global_sequencer_url = 2;
-}
-
-// Empty response for now
-message ScalogStartLocalSequencerResponse {}
 
 // Request containing the local cut and the epoch
 message ScalogSendLocalCutRequest {

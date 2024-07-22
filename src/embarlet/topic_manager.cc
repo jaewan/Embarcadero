@@ -102,6 +102,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	
 	topics_[topic]->Combiner();
 	//TODO(Tony) Initiate Scalog Local sequencer
+	if (tinode->seqType == Scalog){
+		cxl_manager_.StartFollowerLocalSequencer(topic);
+	}
 	return tinode;
 }
 
@@ -111,7 +114,6 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
 	if(tinode != nullptr){
 		memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
 		tinode->order= (uint8_t)order;
-		//TODO(Tony) Initiate Global Scalog Sequencer
 		return true;
 	}
 	return false;

@@ -46,6 +46,7 @@ struct alignas(64) TInode{
 	char topic[TOPIC_NAME_SIZE];
 	volatile uint8_t order;
 	volatile offset_entry offsets[NUM_MAX_BROKERS];
+	SequencerType seqType;
 };
 
 struct NonCriticalMessageHeader{
@@ -96,16 +97,12 @@ class CXLManager : public ScalogSequencer::Service {
 			return scalog_global_cut_;
 		}
 
+		void StartFollowerLocalSequencer(const char* topic);
+
 		/// Create a new rpc client to communicate with a peer broker
         /// @param peer_url URL of the peer broker
         /// @return rpc client
         std::unique_ptr<ScalogSequencer::Stub> GetRpcClient(std::string peer_url);
-
-    	/// Notifies another broker to start their local sequencer for Scalog
-        /// @param context
-        /// @param request Request containing topic and url of the global sequencer
-        /// @param response Empty for now
-		grpc::Status HandleScalogStartLocalSequencer(grpc::ServerContext* context, const ScalogStartLocalSequencerRequest* request, ScalogStartLocalSequencerResponse* response);
 
     	/// Receives a local cut from a local sequencer
         /// @param context
@@ -179,8 +176,6 @@ class CXLManager : public ScalogSequencer::Service {
 
 		absl::flat_hash_map<std::string, std::vector<int>> scalog_global_cut_;
 
-		absl::flat_hash_map<std::string, std::string> scalog_global_sequencer_url_;
-
 		absl::flat_hash_map<std::string, bool> scalog_has_global_sequencer_;
 
 		absl::flat_hash_map<std::string, bool> scalog_received_gobal_seq_after_interval_;
@@ -195,7 +190,7 @@ class CXLManager : public ScalogSequencer::Service {
 		using Timer = boost::asio::deadline_timer;
 		Timer timer_;
 
-		void ScalogLocalSequencer(const char* topic, std::string global_sequencer_ur);
+		void ScalogLocalSequencer(const char* topic);
 		void ScalogGlobalSequencer(const char* topic);
 		void ScalogSendLocalCut(int epoch, int written, const char* topic);
 		void ScalogReceiveGlobalCut(std::vector<int> global_cut, const char* topic);
