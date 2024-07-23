@@ -20,7 +20,7 @@ namespace Embarcadero{
 #define SEGMENT_SIZE (1UL << 35)
 #define NUM_DISK_IO_THREADS 8 
 #define NUM_CXL_IO_THREADS 16 
-#define NUM_NETWORK_IO_THREADS 32
+#define NUM_NETWORK_IO_THREADS 16
 #define NUM_ACK_THREADS 1
 
 //********* Health check configs *********

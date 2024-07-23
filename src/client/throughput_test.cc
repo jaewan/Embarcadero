@@ -74,7 +74,7 @@ class Client{
 			ack_port_ = GenerateRandomNum();
 			message_size_ = message_size;
 			ack_thread_ = std::thread([this](){
-					this->AckThread();
+					this->EpollAckThread();
 					});
 			int num_nodes = pubQues_.size();
 			for (int i=0; i < num_threads; i++){
@@ -102,6 +102,7 @@ class Client{
 		void Poll(int n){
 			while(client_order_ != n){
 				std::this_thread::yield();
+				sleep(1);
 			}
 			shutdown_ = true;
 			ack_thread_.join();
@@ -114,10 +115,6 @@ class Client{
 			heartbeat_system::CreateTopicResponse create_topic_reply;;
 			create_topic_req.set_topic(topic);
 			create_topic_req.set_order(order);
-	char Jae_Check[TOPIC_NAME_SIZE];
-	memset(Jae_Check, 0, TOPIC_NAME_SIZE);
-	memcpy(Jae_Check, "TestTopic", 9);
-	VLOG(3) << "[CreateNewTopic] memcmp:" << memcmp(topic, Jae_Check, TOPIC_NAME_SIZE);
 			grpc::Status status = stub_->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
 			if(status.ok()){
 				return create_topic_reply.success();
@@ -149,6 +146,117 @@ class Client{
 		size_t message_size_;
 		std::vector<std::thread> threads_;
 		std::thread ack_thread_;
+
+		void EpollAckThread(){
+			int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+			if (server_sock < 0) {
+				LOG(ERROR) << "Socket creation failed";
+				return;
+			}
+
+			int flag = 1;
+			if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) < 0) {
+				std::cerr << "setsockopt(SO_REUSEADDR) failed\n";
+				close(server_sock);
+				return;
+			}
+
+			setsockopt(server_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+			sockaddr_in server_addr;
+			memset(&server_addr, 0, sizeof(server_addr));
+			server_addr.sin_family = AF_INET;
+			server_addr.sin_port = htons(ack_port_);
+			server_addr.sin_addr.s_addr = INADDR_ANY;
+
+			if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+				std::cerr << "Bind failed\n";
+				close(server_sock);
+				return;
+			}
+
+			if (listen(server_sock, SOMAXCONN) < 0) {
+				std::cerr << "Listen failed\n";
+				close(server_sock);
+				return;
+			}
+
+			int epoll_fd = epoll_create1(0);
+			if (epoll_fd == -1) {
+				std::cerr << "Failed to create epoll file descriptor\n";
+				close(server_sock);
+				return;
+			}
+
+			epoll_event event;
+			event.events = EPOLLIN;
+			event.data.fd = server_sock;
+			if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_sock, &event) == -1) {
+				std::cerr << "Failed to add server socket to epoll\n";
+				close(server_sock);
+				close(epoll_fd);
+				return;
+			}
+
+			std::vector<epoll_event> events(num_threads_);
+			char buffer[1024];
+			size_t total_received = 0;
+			int EPOLL_TIMEOUT = 1; // 1 millisecond timeout
+
+			while (!shutdown_ || total_received < client_order_) {
+				int num_events = epoll_wait(epoll_fd, events.data(), num_threads_, EPOLL_TIMEOUT);
+				for (int i = 0; i < num_events; i++) {
+					if (events[i].data.fd == server_sock) {
+						// New connection
+						sockaddr_in client_addr;
+						socklen_t client_addr_len = sizeof(client_addr);
+						int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
+						if (client_sock == -1) {
+							std::cerr << "Accept failed\n";
+							continue;
+						}
+						//Make client_sock non-blocking
+						int flags = fcntl(client_sock, F_GETFL, 0);
+						fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
+						event.events = EPOLLIN | EPOLLET;
+						event.data.fd = client_sock;
+						if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
+							std::cerr << "Failed to add client socket to epoll\n";
+							close(client_sock);
+						}
+					} else {
+						// Data from existing client
+						int client_sock = events[i].data.fd;
+						ssize_t bytes_received;
+
+						while (total_received < client_order_ && (bytes_received = recv(client_sock, buffer, 1024, 0)) > 0) {
+							total_received += bytes_received;
+							// Process received data here
+							// For example, you might want to count the number of 1-byte messages:
+							// message_count += bytes_received;
+						}
+
+						if (bytes_received == 0) {
+							// Connection closed by client
+							std::cout << "Client disconnected. Total bytes received: " << total_received << std::endl;
+							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
+							close(client_sock);
+						} else if (bytes_received == -1) {
+							if (errno != EAGAIN && errno != EWOULDBLOCK) {
+								// Error occurred
+								std::cerr << "recv error: " << strerror(errno) << std::endl;
+								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
+								close(client_sock);
+							}
+						}
+					}
+				}
+			}
+
+			// Cleanup
+			close(server_sock);
+			close(epoll_fd);
+		}
 
 		void AckThread(){
 			int server_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -191,8 +299,9 @@ class Client{
 				size_t bytesReceived;
 				if((bytesReceived = recv(client_sock, data, 1024, 0))){
 					read += bytesReceived;
+					VLOG(3) << "Ack Received:" << read;
 				}else{
-					LOG(ERROR) << "Read error:" << bytesReceived << " " << strerror(errno);
+					//LOG(ERROR) << "Read error:" << bytesReceived << " " << strerror(errno);
 				}
 			}
 			LOG(INFO) << "Acked:" << read;
@@ -544,7 +653,6 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	struct epoll_event events[10]; // Adjust size as needed
 	bool running = true;
 	size_t sent_bytes = 0;
-	VLOG(3) << "Start publishing  on fd" << sock;
 	//This is to measure throughput more precisely
 	if(!record_latency){
 		times.emplace_back(std::chrono::high_resolution_clock::now());

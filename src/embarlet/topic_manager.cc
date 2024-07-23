@@ -100,7 +100,6 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 			tinode, topic, broker_id_, tinode->order, cxl_manager_.GetCXLAddr(), segment_metadata);
 	
 	topics_[topic]->Combiner();
-	//TODO(Tony) Initiate Scalog Local sequencer
 	return tinode;
 }
 
@@ -124,9 +123,13 @@ void TopicManager::PublishToCXL(PublishRequest &req){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
-			VLOG(3) << "[PublishToCXL] TopicManager topic entry not found, creating one";
 			// The topic was created from another broker
 			CreateNewTopicInternal(req.topic);
+			topic_itr = topics_.find(req.topic);
+			if(topic_itr == topics_.end()){
+				LOG(ERROR) << "Topic Entry was not created Something is wrong";
+				return;
+			}
 		}else{
 			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic << " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
 			return;
@@ -212,7 +215,7 @@ void Topic::PublishToCXL(PublishRequest &req){
 
 	unsigned long long int log = log_addr_.fetch_add(msgSize);
 	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
-		std::cout << "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE << std::endl;
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
 		//TODO(Jae) Finish below segment boundary crossing code
 		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
 			// Allocate a new segment

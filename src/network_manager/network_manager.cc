@@ -294,6 +294,7 @@ void NetworkManager::ReqReceiveThread(){
 							pub_req.counter->store(2);
 							cxl_manager_->EnqueueRequest(pub_req);
 							disk_manager_->EnqueueRequest(pub_req);
+
 							buf = mi_malloc(READ_SIZE);
 							to_read = READ_SIZE;
 						}
@@ -362,13 +363,13 @@ void NetworkManager::AckThread(){
 	char buf[1000000];
 	struct epoll_event events[10]; // Adjust size as needed
 
-	VLOG(3) << "[DEBUG] ack started" ;
 	if(ack_type_ == Immediate){
 		while(!stop_threads_){
 			size_t ack_count = 0;
 			while(ackQueue_.read(optReq)){
 				ack_count++;
 				if(!optReq.has_value()){
+					ack_count--;
 					break;
 				}
 			}
@@ -386,6 +387,7 @@ void NetworkManager::AckThread(){
 								break;
 							}
 						} else {
+							VLOG(3) << "[DEBUG] Ack Sent:" << bytesSent;
 							acked_size += bytesSent;
 						}
 					}
