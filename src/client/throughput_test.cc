@@ -102,7 +102,6 @@ class Client{
 		void Poll(int n){
 			while(client_order_ != n){
 				std::this_thread::yield();
-				sleep(1);
 			}
 			shutdown_ = true;
 			ack_thread_.join();
@@ -198,13 +197,14 @@ class Client{
 				return;
 			}
 
-			std::vector<epoll_event> events(num_threads_);
+			int max_events = nodes_.size();
+			std::vector<epoll_event> events(max_events);
 			char buffer[1024];
 			size_t total_received = 0;
 			int EPOLL_TIMEOUT = 1; // 1 millisecond timeout
 
 			while (!shutdown_ || total_received < client_order_) {
-				int num_events = epoll_wait(epoll_fd, events.data(), num_threads_, EPOLL_TIMEOUT);
+				int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
 				for (int i = 0; i < num_events; i++) {
 					if (events[i].data.fd == server_sock) {
 						// New connection
