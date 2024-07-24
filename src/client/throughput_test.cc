@@ -977,11 +977,11 @@ int main(int argc, char* argv[]) {
 	options.add_options()
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
-		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("0"))
-		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
+		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("1"))
+		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("4800"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("1"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();

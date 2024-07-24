@@ -179,18 +179,18 @@ int main(int argc, char* argv[]){
 	// int order = 0;
 	// topic_manager.CreateNewTopic(topic, order);
 
-	//********* Load Generate For Scalog **************
-	char topic[31];
-	memset(topic, 0, 31);
-	topic[0] = '0';
-	if (is_head_node) {
-		int order = 1;
-		cxl_manager.CreateNewTopic(topic, order, Embarcadero::Scalog);
-	}
+	// //********* Load Generate For Scalog **************
+	// char topic[31];
+	// memset(topic, 0, 31);
+	// topic[0] = '0';
+	// if (is_head_node) {
+	// 	int order = 1;
+	// 	cxl_manager.CreateNewTopic(topic, order, Embarcadero::Scalog);
+	// }
 
 
-	t = &topic_manager;
-	ScalogOrderTest(&cxl_manager, topic);
+	// t = &topic_manager;
+	// ScalogOrderTest(&cxl_manager, topic);
 
 	LOG(INFO) << "You are now safe to go";
 	//cxl_manager.StartInternalTest();
