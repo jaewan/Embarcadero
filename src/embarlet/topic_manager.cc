@@ -86,7 +86,6 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	absl::MutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
 	if(topics_.find(topic)!= topics_.end()){
-		LOG(ERROR)<< "Topic already exists!!!";
 		return nullptr;
 	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
@@ -109,12 +108,13 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 }
 
 bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
-	VLOG(3) << "[CreateNewTopic] topic:" << topic;
 	struct TInode* tinode = CreateNewTopicInternal(topic);
 	if(tinode != nullptr){
 		memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
 		tinode->order= (uint8_t)order;
 		return true;
+	}else{
+		LOG(ERROR)<< "Topic already exists!!!";
 	}
 	return false;
 }
@@ -126,11 +126,15 @@ void TopicManager::PublishToCXL(PublishRequest &req){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
-			VLOG(3) << "[PublishToCXL] TopicManager topic entry not found, creating one";
 			// The topic was created from another broker
 			CreateNewTopicInternal(req.topic);
+			topic_itr = topics_.find(req.topic);
+			if(topic_itr == topics_.end()){
+				LOG(ERROR) << "Topic Entry was not created Something is wrong";
+				return;
+			}
 		}else{
-			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before";
+			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic << " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
 			return;
 		}
 	}
@@ -218,7 +222,7 @@ void Topic::PublishToCXL(PublishRequest &req){
 
 	unsigned long long int log = log_addr_.fetch_add(msgSize);
 	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
-		std::cout << "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE << std::endl;
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
 		//TODO(Jae) Finish below segment boundary crossing code
 		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
 			// Allocate a new segment

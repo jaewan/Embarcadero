@@ -67,7 +67,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			int broker_id = (int)nodes_.size();
 			if ( nodes_it != nodes_.end() || broker_id >= NUM_MAX_BROKERS) {
 				reply->set_success(false);
-				reply->set_broker_id(nodes_it->second.broker_id);
+				reply->set_broker_id(broker_id);
 				if (broker_id < NUM_MAX_BROKERS)
 					reply->set_message("Node already registered");
 				else
@@ -117,8 +117,10 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 
 		Status CreateNewTopic(ServerContext* context, const CreateTopicRequest* request,
 				CreateTopicResponse* reply){
+				char topic[TOPIC_NAME_SIZE] = {0};
+				memcpy(topic, request->topic().data(), request->topic().size());
 				reply->set_success(
-					create_topic_entry_callback_(const_cast<char*>(request->topic().c_str()), (int)request->order()));
+					create_topic_entry_callback_(topic, (int)request->order()));
 				return Status::OK;
 		}
 

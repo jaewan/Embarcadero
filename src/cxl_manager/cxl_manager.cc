@@ -81,10 +81,10 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 		LOG(ERROR) << "Mapping Emulated CXL error";
 	}
 	if(broker_id_ == 0){
-		memset(cxl_addr_, 0, (1UL<<35));
+		//memset(cxl_addr_, 0, (1UL<<35));
+		memset(cxl_addr_, 0, CXL_SIZE);
 		VLOG(3) << "Cleared CXL 32GB";
 	}
-	//memset(cxl_addr_, 0, CXL_SIZE);
 	// Create CXL I/O threads
 	for (int i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&CXLManager::CXL_io_thread, this);
