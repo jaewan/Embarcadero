@@ -74,18 +74,13 @@ class NetworkManager{
 		std::atomic<int> thread_count_{0};
 		bool stop_threads_ = false;
 		volatile bool test_acked_all_ = false;
-		enum ackType{
-			Batch,
-			Immediate
-		};
 
 		//using SkipList= folly::ConcurrentSkipList<int>;
 		//std::shared_ptr<SkipList> socketFdList;
 		absl::flat_hash_map<size_t, int> ack_connections_; // <client_id, ack_sock>
 		absl::Mutex ack_mu_;
 		int ack_efd_;
-		int ack_fd_;
-		ackType ack_type_ = Immediate;
+		int ack_fd_ = -1;
 
 		CXLManager *cxl_manager_;
 		DiskManager *disk_manager_;

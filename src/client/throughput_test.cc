@@ -133,7 +133,7 @@ class Client{
 		// <broker_id, address::port of network_mgr>
 		absl::flat_hash_map<int, std::string> nodes_;
 		absl::Mutex mutex_;
-		std::vector<folly::MPMCQueue<std::optional<char*>>> pubQues_; 
+		std::vector<folly::MPMCQueue<std::optional<char*>>> pubQues_;
 		absl::flat_hash_map<int, int> broker_id_to_queue_idx_;
 		std::atomic<size_t> client_order_;
 		int num_threads_;
@@ -319,7 +319,7 @@ class Client{
 			auto [addr, addressPort] = ParseAddressPort(nodes_[broker_id]);
 			//int sock = GetNonblockingSock("127.0.0.1", PORT);
 			int sock = GetNonblockingSock(addr.data(), PORT + broker_id);
-			// *********** Initiate Shake *********** 
+			// *********** Initiate Shake ***********
 			int efd = epoll_create1(0);
 			struct epoll_event event;
 			event.data.fd = sock;
@@ -348,7 +348,7 @@ class Client{
 								running = false;
 								break;
 							}
-						} 
+						}
 						sent_bytes += bytesSent;
 						if(sent_bytes == sizeof(shake)){
 							running = false;
@@ -362,7 +362,7 @@ class Client{
 				}
 			}
 
-			// *********** Sending Messages *********** 
+			// *********** Sending Messages ***********
 			Embarcadero::MessageHeader header;
 			header.client_id = client_id_;
 			header.size = message_size_;
@@ -640,7 +640,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	event.events = EPOLLOUT;
 	epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event);
 
-	// =============== Sending Shake =============== 
+	// =============== Sending Shake ===============
 	Embarcadero::EmbarcaderoReq shake;
 	shake.client_id = CLIENT_ID;
 	shake.client_order = 0;
@@ -668,7 +668,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 						running = false;
 						break;
 					}
-				} 
+				}
 				sent_bytes += bytesSent;
 				if(sent_bytes == sizeof(shake)){
 					running = false;
@@ -729,7 +729,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 						running = false;
 						break;
 					}
-				} 
+				}
 				sent_bytes += bytesSent;
 				if(sent_bytes == shake.size){
 					sent_bytes = 0;
@@ -951,7 +951,7 @@ void ThroughputTest(size_t total_message_size, size_t message_size, int num_thre
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
 
-	Client c("127.0.0.1", std::to_string(BROKER_PORT), n + 1024);
+	Client c("127.0.0.1", std::to_string(BROKER_PORT), n/4);
 	std::cout << "Client Created" << std::endl;
 	c.CreateNewTopic(topic, order);
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
