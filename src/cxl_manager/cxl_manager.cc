@@ -306,7 +306,7 @@ void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequence
 
 void CXLManager::StartScalogLocalSequencer(const char* topic) {
 	if (broker_id_ == 0) {
-		std::cout << "Starting scalog sequencer in head" << std::endl;
+		std::cout << "Starting scalog sequencer in head for topic: " << topic << std::endl;
 		scalog_has_global_sequencer_[topic] = true;
 	} else {
 		scalog_has_global_sequencer_[topic] = false;
@@ -325,9 +325,10 @@ void CXLManager::StartScalogLocalSequencer(const char* topic) {
 		scalog_io_service_.run();
 	});
 
-	scalog_io_service_.dispatch([this, topic] {
-		std::cout << "Sending local cuts for topic " << topic << " to global sequencer" << std::endl;
-		ScalogLocalSequencer(topic);
+	std::string topic_str(topic);
+	scalog_io_service_.dispatch([this, topic_str] {
+		std::cout << "Sending local cuts for topic " << topic_str << " to global sequencer" << std::endl;
+		ScalogLocalSequencer(topic_str.c_str());
 	});
 }
 
@@ -369,9 +370,12 @@ void CXLManager::ScalogLocalSequencer(const char* topic){
 		exit(1);
 	}
 
+	std::string topic_str(topic);
 	timer_.expires_from_now(
 		boost::posix_time::milliseconds(1000));
-	timer_.async_wait([this, topic](auto) { ScalogLocalSequencer(topic); });
+	timer_.async_wait([this, topic_str](auto) { 
+			ScalogLocalSequencer(topic_str.c_str()); 
+	});
 }
 
 // Helper function that allows a local scalog sequencer to send their local cut
@@ -386,7 +390,7 @@ void CXLManager::ScalogSendLocalCut(int epoch, int written, const char* topic) {
 		std::cout << "Asynchronously sent local cut" << std::endl;
 	} else {
 
-		std::cout << "Sending local cut with grpc" << std::endl;
+		std::cout << "Sending local cut with grpc for topic: " << topic << std::endl;
 
 		ScalogSendLocalCutRequest request;
 		request.set_epoch(epoch);
