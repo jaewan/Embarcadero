@@ -161,8 +161,7 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Managers ********************** 
 	// Queue Size (1UL<<22)(1UL<<25)(1UL<<25) respectly performed 6GB/s 1kb message disk thread:8 cxl:16 network: 32
-	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id);
-	builder.RegisterService(&cxl_manager);
+	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id, builder);
 	heartbeat_manager.StartGrpcServer(builder);
 
 	Embarcadero::DiskManager disk_manager((1UL<<25));

@@ -16,7 +16,7 @@
 
 namespace Embarcadero{
 
-CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
+CXLManager::CXLManager(size_t queueCapacity, int broker_id, ServerBuilder &builder, int num_io_threads):
 	requestQueue_(queueCapacity),
 	broker_id_(broker_id),
 	num_io_threads_(num_io_threads),
@@ -27,6 +27,8 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 	int cxl_fd;
 	bool numa_alloc = false;
+
+	builder.RegisterService(this);
 
 	switch(cxl_type_){
 		case Emul:
