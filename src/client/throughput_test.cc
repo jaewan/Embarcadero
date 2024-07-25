@@ -108,12 +108,13 @@ class Client{
 			return;
 		}
 
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int seqType){
 			grpc::ClientContext context;
 			heartbeat_system::CreateTopicRequest create_topic_req;;
 			heartbeat_system::CreateTopicResponse create_topic_reply;;
 			create_topic_req.set_topic(topic);
 			create_topic_req.set_order(order);
+			create_topic_req.set_seq_type(seqType);
 			grpc::Status status = stub_->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
 			if(status.ok()){
 				return create_topic_reply.success();
@@ -943,7 +944,7 @@ void ThroughputTestRaw(size_t total_message_size, size_t message_size, int num_t
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 }
 
-void ThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order){
+void ThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, int seq_type){
 	int n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
@@ -953,7 +954,7 @@ void ThroughputTest(size_t total_message_size, size_t message_size, int num_thre
 
 	Client c("127.0.0.1", std::to_string(BROKER_PORT), n + 1024);
 	std::cout << "Client Created" << std::endl;
-	c.CreateNewTopic(topic, order);
+	c.CreateNewTopic(topic, order, seq_type);
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
 	auto start = std::chrono::high_resolution_clock::now();
 	for(int i=0; i<n; i++){
@@ -981,7 +982,8 @@ int main(int argc, char* argv[]) {
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("4800"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("1"));
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("1"))
+		("st,seq_type", "Type of sequencer to use", cxxopts::value<int>()->default_value("1"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
@@ -989,6 +991,7 @@ int main(int argc, char* argv[]) {
 	size_t num_threads = result["num_thread"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
+	int seq_type = result["seq_type"].as<int>();
 	FLAGS_v = result["log_level"].as<int>();
 
 	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
@@ -996,7 +999,7 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
-	ThroughputTest(total_message_size, message_size, num_threads, ack_level, order);
+	ThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
 	return 0;
 }

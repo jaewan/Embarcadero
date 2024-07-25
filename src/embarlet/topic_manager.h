@@ -77,7 +77,7 @@ class TopicManager{
 		~TopicManager(){
 			LOG(INFO) << "[TopicManager]\tDestructed";
 		}
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order);
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int seqType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,

@@ -101,17 +101,23 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	
 	topics_[topic]->Combiner();
 	//TODO(Tony) Initiate Scalog Local sequencer
-	if (tinode->seqType == Scalog){
-		cxl_manager_.StartFollowerLocalSequencer(topic);
+	if (broker_id_ != 0 && tinode->seqType == 1){
+		cxl_manager_.StartScalogLocalSequencer(topic);
 	}
 	return tinode;
 }
 
-bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int seqType){
 	struct TInode* tinode = CreateNewTopicInternal(topic);
 	if(tinode != nullptr){
 		memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
 		tinode->order= (uint8_t)order;
+		tinode->seqType = seqType;
+
+		if (seqType == 1) {
+			cxl_manager_.StartScalogLocalSequencer(topic);
+		}
+
 		return true;
 	}else{
 		LOG(ERROR)<< "Topic already exists!!!";

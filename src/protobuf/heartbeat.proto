@@ -40,6 +40,7 @@ message HeartbeatResponse {
 message CreateTopicRequest {
   string topic = 1;
 	int32 order = 2;
+  int32 seq_type = 3;
 }
 
 message CreateTopicResponse {

@@ -46,7 +46,7 @@ struct alignas(64) TInode{
 	char topic[TOPIC_NAME_SIZE];
 	volatile uint8_t order;
 	volatile offset_entry offsets[NUM_MAX_BROKERS];
-	SequencerType seqType;
+	int seqType;
 };
 
 struct NonCriticalMessageHeader{
@@ -97,7 +97,7 @@ class CXLManager : public ScalogSequencer::Service {
 			return scalog_global_cut_;
 		}
 
-		void StartFollowerLocalSequencer(const char* topic);
+		void StartScalogLocalSequencer(const char* topic);
 
 		/// Create a new rpc client to communicate with a peer broker
         /// @param peer_url URL of the peer broker

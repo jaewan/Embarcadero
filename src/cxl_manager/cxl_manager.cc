@@ -257,7 +257,7 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 }
 
 void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType){
-	topic_manager_->CreateNewTopic(topic, order);
+	// topic_manager_->CreateNewTopic(topic, order);
 	if (order == 0)
 		return;
 	switch(sequencerType){
@@ -270,9 +270,6 @@ void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequence
 		case Scalog:
 			if (order == 1){
 				std::cout << "Starting scalog sequencer in head" << std::endl;
-
-				struct TInode* tinode = (struct TInode*)GetTInode(topic);
-				tinode->seqType = sequencerType;
 
 				// Set scalog_has_global_sequencer_ to true
 				scalog_has_global_sequencer_[topic] = true;
@@ -307,8 +304,13 @@ void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequence
 	}
 }
 
-void CXLManager::StartFollowerLocalSequencer(const char* topic) {
-	scalog_has_global_sequencer_[topic] = false;
+void CXLManager::StartScalogLocalSequencer(const char* topic) {
+	if (broker_id_ == 0) {
+		std::cout << "Starting scalog sequencer in head" << std::endl;
+		scalog_has_global_sequencer_[topic] = true;
+	} else {
+		scalog_has_global_sequencer_[topic] = false;
+	}
 
 	scalog_received_global_seq_[topic] = false;
 
