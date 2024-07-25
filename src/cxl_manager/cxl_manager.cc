@@ -403,7 +403,7 @@ void CXLManager::ScalogSendLocalCut(int epoch, int written, const char* topic) {
 
 		auto callback = [](grpc::Status status) {
 			if (!status.ok()) {
-				std::cout << "Error sending local cut" << std::endl;
+				std::cout << "Error sending local cut: " << status.error_message() << std::endl;
 			}
 		};
 
@@ -443,7 +443,7 @@ void CXLManager::ScalogReceiveLocalCut(int epoch, int local_cut, const char* top
 		// Iterate through broker list and call async grpc to send global cut
 		for (auto const& peer : broker_->GetPeerBrokers()) {
 
-			std::string peer_url = peer.second.address;
+			std::string peer_url = peer.second.network_mgr_addr;
 			auto rpc_client = GetRpcClient(peer_url);
 
 			std::cout << "Sending global cut to " << peer_url << std::endl;

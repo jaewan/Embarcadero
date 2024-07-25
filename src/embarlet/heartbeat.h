@@ -213,20 +213,21 @@ class FollowerNodeClient {
 class HeartBeatManager{
 	public:
 		// param head_address should be the ipadress:port
-		HeartBeatManager(bool is_head_node, std::string head_address)
+		HeartBeatManager(bool is_head_node, std::string head_address, ServerBuilder &builder)
 			:is_head_node_(is_head_node){
 				if(is_head_node){
 					service_ = std::make_unique<HeartBeatServiceImpl>(GetAddress());
-					ServerBuilder builder;
-					builder.AddListeningPort(head_address, grpc::InsecureServerCredentials());
 					builder.RegisterService(service_.get());
-					server_ = builder.BuildAndStart();
 				}else{
 					follower_ = std::make_unique<FollowerNodeClient>(GenerateUniqueId(), GetAddress(), 
 							grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials()),
 							grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials()));
 				}
 			}
+
+		void StartGrpcServer(ServerBuilder &builder){
+			server_ = builder.BuildAndStart();
+		}
 
 		void Wait(){
 			if(is_head_node_){
