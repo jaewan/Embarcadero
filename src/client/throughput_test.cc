@@ -690,8 +690,8 @@ class Subscriber{
 					close(sock);
 					broker_fds_.pop_back();
 				} else {
-					std::pair<void*, msgIdx> msg(malloc(buffer_size_), {0,0,0,new_broker.second,0});
-					std::pair<void*, msgIdx> msg1(malloc(buffer_size_), {0,0,0,new_broker.second,0});
+					std::pair<void*, msgIdx> msg(static_cast<void*>(malloc(buffer_size_)), msgIdx(0,0,0,new_broker.first,0));
+					std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(0,0,0,new_broker.first,0));
 					int idx = messages_[0].size();
 					messages_[0].push_back(msg);
 					messages_[1].push_back(msg1);
