@@ -25,8 +25,13 @@ struct NetworkRequest{
 	int efd;
 };
 
-struct SubscribeShake{
-	size_t size;
+struct alignas(32) SubscribeHeader{
+	int broker_id;
+	// Logical address of first and last msg
+	int first_id; 
+	int last_id;
+	// Total len of payload
+	size_t len;
 };
 
 struct alignas(64) EmbarcaderoReq{

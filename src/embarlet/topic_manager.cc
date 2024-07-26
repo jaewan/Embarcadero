@@ -167,6 +167,7 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 void Topic::CombinerThread(){
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
+	size_t DEBUG_num_ordered = 0;
 	while(!stop_threads_){
 		while(header->paddedSize == 0){
 			if(stop_threads_){
@@ -192,6 +193,7 @@ void Topic::CombinerThread(){
 		written_physical_addr_ = (void*)header;
 		logical_offset_++;
 		header = (MessageHeader*)header->next_message;
+		DEBUG_num_ordered++;
 	}
 }
 
@@ -246,7 +248,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		digested_addr = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].ordered_offset;
 	}
 	if(digested_offset == (size_t)-1 || ((last_addr != nullptr) && (digested_offset <= last_offset))){
-		std::cout<< "No messages to export digested_offset:" << digested_offset << std::endl;
+		LOG(INFO)<< "No messages to export digested_offset:" << digested_offset;
 		return false;
 	}
 
