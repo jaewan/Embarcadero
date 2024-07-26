@@ -304,34 +304,30 @@ void NetworkManager::ReqReceiveThread(){
 				break;
 			case Subscribe:
 				{
-				size_t last_offset = shake.client_order;
-				void* last_addr = shake.last_addr;
-				void* messages;
-				size_t messages_size;
-				bool no_updates = false;
-				SubscribeShake reply_shake;
-				do{
-					if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
-						VLOG(3) << "read :" << last_offset;
-						reply_shake.size = messages_size;
-						// Send
-						// send(req.client_socket, messages, messages_size, 0);
-					}else{
-						reply_shake.size = 0;
-						// send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
-						VLOG(3) << "Did not read anything";
-						no_updates = true;
-						break;
+					size_t last_offset = shake.client_order;
+					void* last_addr = shake.last_addr;
+					void* messages;
+					size_t messages_size;
+					bool no_updates = false;
+					SubscribeHeader reply_shake;
+					while(!stop_threads_){
+						size_t prev_off = last_offset;
+						if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
+							VLOG(3) << "read :" << last_offset;
+							reply_shake.len = messages_size;
+							reply_shake.first_id = prev_off;
+							reply_shake.last_id = last_offset;
+							// Send
+							send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
+							send(req.client_socket, messages, messages_size, 0);
+						}else{
+							std::this_thread::yield();
+							VLOG(3) << "Did not read anything";
+							no_updates = true;
+							break;
+						}
 					}
-					//TODO(Jae)
-					// Send the messages to the client
-					// send(req.client_socket, messages, messages_size, 0);
-				}while(last_addr != nullptr);
 
-				if(!no_updates){
-					reply_shake.size = 0;
-					// send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
-				}
 				}//end Subscribe
 				break;
 		}
