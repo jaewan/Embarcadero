@@ -1139,7 +1139,7 @@ void ThroughputTestRaw(size_t total_message_size, size_t message_size, int num_t
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 }
 
-void ThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order){
+void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order){
 	int n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
@@ -1162,6 +1162,15 @@ void ThroughputTest(size_t total_message_size, size_t message_size, int num_thre
 	double seconds = elapsed.count();
 	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
 	std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
+}
+
+void SubscribeThroughputTest(){
+	LOG(INFO) << "[Subscribe Throuput Test] ";
+	char topic[TOPIC_NAME_SIZE];
+	memset(topic, 0, TOPIC_NAME_SIZE);
+	memcpy(topic, "TestTopic", 9);
+	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
+	sleep(10);
 }
 
 int main(int argc, char* argv[]) {
@@ -1192,7 +1201,8 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
-	ThroughputTest(total_message_size, message_size, num_threads, ack_level, order);
+	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order);
+	SubscribeThroughputTest();
 
 	return 0;
 }

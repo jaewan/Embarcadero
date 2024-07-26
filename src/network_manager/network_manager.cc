@@ -327,7 +327,6 @@ void NetworkManager::ReqReceiveThread(){
 							break;
 						}
 					}
-
 				}//end Subscribe
 				break;
 		}
