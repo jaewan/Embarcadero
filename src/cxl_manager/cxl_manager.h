@@ -48,19 +48,18 @@ struct NonCriticalMessageHeader{
 	int client_id;
 	size_t client_order;
 	size_t size;
-	size_t total_order;
 	size_t paddedSize;
 	void* segment_header;
-	char _padding[64 - (sizeof(int) + sizeof(size_t) * 4 + sizeof(void*))]; 
+	char _padding[64 - (sizeof(int) + sizeof(size_t) * 3 + sizeof(void*))]; 
 };
 
 struct alignas(64) MessageHeader{
 	int client_id;
 	size_t client_order;
 	volatile size_t size;
-	volatile size_t total_order;
 	volatile size_t paddedSize; // This include message+padding+header size
 	void* segment_header;
+	volatile size_t total_order;
 	size_t logical_offset;
 	void* next_message;
 };
