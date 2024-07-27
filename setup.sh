@@ -34,29 +34,38 @@ function Install_Ubuntu_Dependencies()
 	
 	# install folly manually
 	cd third_party
-	if [ -d "folly" ]; then
-  		echo "folly already cloned; not re-cloning"
+	if [ -f "/usr/local/lib/libfolly.a" ]; then
+		echo "folly already installed; skipping build"
 	else
-		git clone --depth 1 --branch v2024.03.11.00 https://github.com/facebook/folly.git
+		if [ -d "folly" ]; then
+			echo "folly already cloned; not re-cloning"
+		else
+			git clone --depth 1 --branch v2024.03.11.00 https://github.com/facebook/folly.git
+		fi
+		cd folly/build
+		cmake ..
+		sudo cmake --build . --target install
+		cd ../..
 	fi
-	cd folly/build
-	cmake ..
-	sudo cmake --build . --target install
-	cd ../..
 
 	# install mi_malloc manually
-	if [ -d "mimalloc" ]; then
-		echo "folly already cloned; not re-cloning"
+	if [ -d "/usr/local/lib/mimalloc-2.1" ]; then
+		echo "mimalloc already installed; skipping build"
 	else
-		git clone --depth 1 --branch v2.1.7 https://github.com/microsoft/mimalloc.git
+		if [ -d "mimalloc" ]; then
+			echo "mimalloc already cloned; not re-cloning"
+		else
+			git clone --depth 1 --branch v2.1.7 https://github.com/microsoft/mimalloc.git
+		fi
+		cd mimalloc
+		mkdir -p out/release
+		cd out/release
+		cmake ../..
+		make
+		sudo make install
+		cd ../../..
 	fi
-	cd mimalloc
-	mkdir -p out/release
-	cd out/release
-	cmake ../..
-	make
-	sudo make install
-	cd ../../../..
+	cd ..
 }
 
 function Install_RHEL_Dependencies()
@@ -79,9 +88,20 @@ function Install_RHEL_Dependencies()
 	# TODO: install mi_malloc
 }
 
+function Download_Dependency_Source_Code()
+{
+	cd third_party
+	if [ -d "cxxopts" ]; then
+		echo "cxxopts already cloned; not re-cloning"
+	else
+		git clone --depth 1 --branch v3.2.0 https://github.com/jarro2783/cxxopts
+	fi
+	cd ..
+}
+
 function Build_Project()
 {
-	mkdir build
+	mkdir -p build
 	cd build
 	cmake ..
 	cmake --build .
@@ -118,5 +138,6 @@ else
 	Install_RHEL_Dependencies
 fi
 
+Download_Dependency_Source_Code
 Setup_CXL
 Build_Project
