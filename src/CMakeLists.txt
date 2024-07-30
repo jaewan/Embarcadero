@@ -60,3 +60,24 @@ target_link_libraries(throughput_test
     ${_PROTOBUF_LIBPROTOF}
     ${FOLLY_LIBRARIES}
 )
+
+add_executable(corfu_throughput_test
+    corfu_client/throughput_test.cc
+)
+
+target_include_directories(corfu_throughput_test PUBLIC
+	"${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+)
+
+target_link_libraries(corfu_throughput_test 
+	glog
+	gflags
+	mimalloc
+    cxxopts::cxxopts
+    heartbeat_grpc_proto
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOF}
+    ${FOLLY_LIBRARIES}
+)
