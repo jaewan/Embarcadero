@@ -1193,7 +1193,7 @@ int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
 	FLAGS_logtostderr = 1; // log only to console, no files.
-	cxxopts::Options options("embarcadero-throughputTest", "Embarcadero Throughput Test");
+	cxxopts::Options options("corfu-throughputTest", "Corfu Sequencer + Embarcadero Throughput Test");
 
 	options.add_options()
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
@@ -1203,8 +1203,6 @@ int main(int argc, char* argv[]) {
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
-		("b,batch_size", "How to batch (group) messages", cxxopts::value<size_t>()->default_value("1"));
-
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
@@ -1212,8 +1210,8 @@ int main(int argc, char* argv[]) {
 	size_t num_threads = result["num_thread"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
-	size_t batch_size = result["batch_size"].as<int>();
 	FLAGS_v = result["log_level"].as<int>();
+	size_t batch_size = 1; // TODO: make this an actual argument
 
 	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
 		LOG(ERROR) << "CGroup core throttle is wrong";
