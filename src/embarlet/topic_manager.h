@@ -37,7 +37,7 @@ class Topic{
 		
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(size_t &last_offset,
-							void* &last_addr, void* messages, size_t &messages_size);
+							void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
 
 	private:
@@ -81,7 +81,7 @@ class TopicManager{
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
-												void* &last_addr, void* messages, size_t &messages_size);
+												void* &last_addr, void* &messages, size_t &messages_size);
 
 	private:
 		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]);
