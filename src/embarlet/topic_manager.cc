@@ -139,7 +139,7 @@ void TopicManager::PublishToCXL(PublishRequest &req){
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
-																	void* &last_addr, void* messages, size_t &messages_size){
+																	void* &last_addr, void* &messages, size_t &messages_size){
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()){
 		perror("Topic not found");
@@ -187,7 +187,7 @@ void Topic::CombinerThread(){
 		header->logical_offset = logical_offset_;
 		header->next_message = (uint8_t*)header + header->paddedSize;
 		tinode_->offsets[broker_id_].written = logical_offset_;
-		(*(unsigned long long int*)segment_header) +=
+		(*(unsigned long long int*)segment_header) =
 		(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
 		written_logical_offset_ = logical_offset_;
 		written_physical_addr_ = (void*)header;
@@ -236,32 +236,34 @@ void Topic::PublishToCXL(PublishRequest &req){
 // we need to fix it. Probably need to have some sort of indexing or call this method to get indexes
 // even if at cache hit (without sending the messages)
 //
-// arguments: do not call this function again if this variable is nullptr
+// arguments: 
 // if the messages to export go over the segment boundary (not-contiguous), 
-// we should call this functiona again
+// we should call this functiona again. Try calling it if it returns true
 bool Topic::GetMessageAddr(size_t &last_offset,
-						   void* &last_addr, void* messages, size_t &messages_size){
-	size_t digested_offset = written_logical_offset_;
-	void* digested_addr = written_physical_addr_;
+						   void* &last_addr, void* &messages, size_t &messages_size){
+	size_t combined_offset = written_logical_offset_;
+	void* combined_addr = written_physical_addr_;
 	if(order_ > 0){
-		digested_offset = tinode_->offsets[broker_id_].ordered;
-		digested_addr = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].ordered_offset;
+		combined_offset = tinode_->offsets[broker_id_].ordered;
+		combined_addr = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].ordered_offset;
 	}
-	if(digested_offset == (size_t)-1 || ((last_addr != nullptr) && (digested_offset <= last_offset))){
-		LOG(INFO)<< "No messages to export digested_offset:" << digested_offset;
+
+	if(combined_offset == (size_t)-1 || ((last_addr != nullptr) && (combined_offset <= last_offset))){
+		VLOG(3)<< "No messages to export combined_offset:" << combined_offset;
 		return false;
 	}
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
 	if(last_addr != nullptr){
 		while((struct MessageHeader*)start_msg_header->next_message == nullptr){
-			std::cout<< "[GetMessageAddr] waiting for the message to be combined " << std::endl;
+			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
 			std::this_thread::yield();
 		}
 		start_msg_header = (struct MessageHeader*)start_msg_header->next_message;
 	}else{
-		if(digested_addr <= last_addr){
-			perror("[GetMessageAddr] Wrong!!\n");
+		//TODO(Jae) this is only true in a single segment setup
+		if(combined_addr <= last_addr){
+			LOG(ERROR) << "[GetMessageAddr] Wrong!!";
 			return false;
 		}
 		start_msg_header = (struct MessageHeader*)first_message_addr_;
@@ -270,14 +272,9 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	messages = (void*)start_msg_header;
 	unsigned long long int* last_msg_off = (unsigned long long int*)start_msg_header->segment_header;
 	struct MessageHeader *last_msg_of_segment = (MessageHeader*)((uint8_t*)last_msg_off + *last_msg_off);
-	if(last_msg_of_segment >= written_physical_addr_){
-		last_addr = nullptr; 
-		messages_size = (uint8_t*)written_physical_addr_ - (uint8_t*)start_msg_header + ((MessageHeader*)written_physical_addr_)->paddedSize;
-	}else{
-		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
-		last_offset = last_msg_of_segment->logical_offset;
-		last_addr = (void*)last_msg_of_segment;
-	}
+	messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
+	last_offset = last_msg_of_segment->logical_offset;
+	last_addr = (void*)last_msg_of_segment;
 
 #ifdef DEBUG
 	struct MessageHeader *m = (struct MessageHeader*)messages;

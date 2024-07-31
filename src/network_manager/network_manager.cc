@@ -306,20 +306,39 @@ void NetworkManager::ReqReceiveThread(){
 				{
 					size_t last_offset = shake.client_order;
 					void* last_addr = shake.last_addr;
-					void* messages;
+					void* messages = nullptr;
 					size_t messages_size;
 					bool no_updates = false;
 					SubscribeHeader reply_shake;
+
 					while(!stop_threads_){
-						size_t prev_off = last_offset;
 						if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
-							VLOG(3) << "read :" << last_offset;
 							reply_shake.len = messages_size;
-							reply_shake.first_id = prev_off;
+							//reply_shake.first_id = ((MessageHeader*)messages)->logical_offset;
+							reply_shake.first_id = 0;
 							reply_shake.last_id = last_offset;
 							// Send
-							send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
-							send(req.client_socket, messages, messages_size, 0);
+							size_t ret = send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
+							if(ret < 0){
+								LOG(ERROR) << "Error in sending reply_shake";
+								break;
+							}	
+							ret = send(req.client_socket, messages, messages_size, 0);
+							if(ret < 0){
+								LOG(ERROR) << "Error in sending messages";
+								break;
+							}else if(ret < messages_size){
+								// messages are too large to send in one call
+								size_t total_sent = ret;
+								while(total_sent < messages_size){
+									ret = send(req.client_socket, (uint8_t*)messages+total_sent, messages_size-total_sent, 0);
+									if(ret < 0){
+										LOG(ERROR) << "Error in sending messages";
+										return;
+									}	
+									total_sent += ret;
+								}
+							}
 						}else{
 							std::this_thread::yield();
 							VLOG(3) << "Did not read anything";
@@ -376,12 +395,10 @@ void NetworkManager::AckThread(){
 					ssize_t bytesSent = send(ack_fd_, buf, ack_count - acked_size, 0);
 					if (bytesSent < 0) {
 						if (errno != EAGAIN) {
-							perror("Ack send failed");
+							LOG(ERROR) << " Ack Send failed:";
 							return;
-							break;
 						}
 					} else {
-						VLOG(3) << "[DEBUG] Ack Sent:" << bytesSent;
 						acked_size += bytesSent;
 					}
 				}

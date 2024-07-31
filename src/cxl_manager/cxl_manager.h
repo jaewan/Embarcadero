@@ -78,7 +78,7 @@ class CXLManager{
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
-												void* &last_addr, void* messages, size_t &messages_size);
+												void* &last_addr, void* &messages, size_t &messages_size);
 		void CreateNewTopic(char topic[31], int order, SequencerType seqType = Embarcadero);
 		void* GetCXLAddr(){
 			return cxl_addr_;

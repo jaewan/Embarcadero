@@ -250,7 +250,7 @@ void* CXLManager::GetNewSegment(){
 }
 
 bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
-																void* &last_addr, void* messages, size_t &messages_size){
+																void* &last_addr, void* &messages, size_t &messages_size){
 	return topic_manager_->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
 }
 
