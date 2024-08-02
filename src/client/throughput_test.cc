@@ -27,7 +27,111 @@
 #include "../cxl_manager/cxl_manager.h"
 
 using heartbeat_system::HeartBeat;
+struct msgIdx{
+	int first;
+	int last;
+	size_t offset;
+	int broker_id;
+	int remaining_len;
+	msgIdx(int f, int l, size_t o, int b, int r):first(f), last(l), offset(o), broker_id(b), remaining_len(r){}
+};
+#define NUM_BROKERS 4
 
+void RemoveNodeFromClientInfo(heartbeat_system::ClientInfo& client_info, int32_t node_to_remove) {
+	auto* nodes_info = client_info.mutable_nodes_info();
+	int size = nodes_info->size();
+	for (int i = 0; i < size; ++i) {
+		if (nodes_info->Get(i) == node_to_remove) {
+			// Remove this element by swapping it with the last element and then removing the last
+			nodes_info->SwapElements(i, size - 1);
+			nodes_info->RemoveLast();
+			--size;
+			--i;  // Recheck this index since we swapped elements
+		}
+	}
+}
+
+std::pair<std::string, int> ParseAddressPort(const std::string& input) {
+	size_t colonPos = input.find(':');
+	if (colonPos == std::string::npos) {
+		throw std::invalid_argument("Invalid input format. Expected 'address:port'");
+	}
+
+	std::string address = input.substr(0, colonPos);
+	std::string portStr = input.substr(colonPos + 1);
+
+	int port;
+	try {
+		port = std::stoi(portStr);
+	} catch (const std::exception& e) {
+		throw std::invalid_argument("Invalid port number");
+	}
+
+	if (port < 0 || port > 65535) {
+		throw std::out_of_range("Port number out of valid range (0-65535)");
+	}
+
+	return std::make_pair(address, port);
+}
+
+int GetBrokerId(const std::string& input) {
+	auto [addr, addressPort] = ParseAddressPort(input);
+	return addressPort - PORT;
+}
+
+int GetNonblockingSock(char *broker_address, int port){
+	int sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock < 0) {
+		LOG(ERROR) << "Socket creation failed";
+		return -1;
+	}
+	int flags = fcntl(sock, F_GETFL, 0);
+	if (flags == -1) {
+		perror("fcntl F_GETFL");
+		return -1;
+	}
+
+	flags |= O_NONBLOCK;
+	if (fcntl(sock, F_SETFL, flags) == -1) {
+		perror("fcntl F_SETFL");
+		return -1;
+	}
+	int flag = 1; // Enable the option
+	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
+		LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed";
+		close(sock);
+		return -1;
+	}
+
+	if(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
+		LOG(ERROR) << "setsockopt error";
+		close(sock);
+		return -1;
+	}
+
+	sockaddr_in server_addr;
+	memset(&server_addr, 0, sizeof(server_addr));
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_port = htons(port);
+	server_addr.sin_addr.s_addr = inet_addr(broker_address);
+
+	if (connect(sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+		if (errno != EINPROGRESS) {
+			LOG(ERROR) << "Connect failed";
+			close(sock);
+			return -1;
+		}
+	}
+
+	return sock;
+}
+int GenerateRandomNum(){
+	// Generate a random number
+	std::random_device rd;
+	std::mt19937 gen(rd());
+	std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
+	return  dis(gen);
+}
 class Client{
 	public:
 		Client(std::string head_addr, std::string port, size_t queueSize):
@@ -134,7 +238,7 @@ class Client{
 		// <broker_id, address::port of network_mgr>
 		absl::flat_hash_map<int, std::string> nodes_;
 		absl::Mutex mutex_;
-		std::vector<folly::MPMCQueue<std::optional<char*>>> pubQues_; 
+		std::vector<folly::MPMCQueue<std::optional<char*>>> pubQues_;
 		absl::flat_hash_map<int, int> broker_id_to_queue_idx_;
 		std::atomic<size_t> client_order_;
 		int num_threads_;
@@ -318,9 +422,8 @@ class Client{
 				}
 			}
 			auto [addr, addressPort] = ParseAddressPort(nodes_[broker_id]);
-			//int sock = GetNonblockingSock("127.0.0.1", PORT);
 			int sock = GetNonblockingSock(addr.data(), PORT + broker_id);
-			// *********** Initiate Shake *********** 
+			// *********** Initiate Shake ***********
 			int efd = epoll_create1(0);
 			struct epoll_event event;
 			event.data.fd = sock;
@@ -349,7 +452,7 @@ class Client{
 								running = false;
 								break;
 							}
-						} 
+						}
 						sent_bytes += bytesSent;
 						if(sent_bytes == sizeof(shake)){
 							running = false;
@@ -363,7 +466,7 @@ class Client{
 				}
 			}
 
-			// *********** Sending Messages *********** 
+			// *********** Sending Messages ***********
 			Embarcadero::MessageHeader header;
 			header.client_id = client_id_;
 			header.size = message_size_;
@@ -439,25 +542,15 @@ class Client{
 							LOG(ERROR) << "Failed Node reported : " << id;
 							nodes_.erase(id);
 							RemoveNodeFromClientInfo(client_info, id);
-
-							/*
-								 pubQues_.erase(pubQues_.begin() + broker_id_to_queue_idx_[id]);
-								 broker_id_to_queue_idx_.erase(id);
-								 */
 						}
 					}
 					if(!new_nodes.empty()){
 						absl::MutexLock lock(&mutex_);
-						size_t queueSize = total_queue_size_ / (nodes_.size() + new_nodes.size());
 						for(const auto& addr:new_nodes){
 							int broker_id = GetBrokerId(addr);
 							LOG(INFO) << "New Node reported:" << broker_id;
-							nodes_[GetBrokerId(addr)] = addr;
+							nodes_[broker_id] = addr;
 							client_info.add_nodes_info(broker_id);
-
-							//pubQues.emplace(broker_id, folly::MPMCQueue<std::optional<char*>>(queueSize));
-							pubQues_.emplace_back(queueSize);
-							broker_id_to_queue_idx_[broker_id] = pubQues_.size() - 1;
 						}
 					}
 				}else{
@@ -467,102 +560,213 @@ class Client{
 			}
 		}
 
-		void RemoveNodeFromClientInfo(heartbeat_system::ClientInfo& client_info, int32_t node_to_remove) {
-			auto* nodes_info = client_info.mutable_nodes_info();
-			int size = nodes_info->size();
-			for (int i = 0; i < size; ++i) {
-				if (nodes_info->Get(i) == node_to_remove) {
-					// Remove this element by swapping it with the last element and then removing the last
-					nodes_info->SwapElements(i, size - 1);
-					nodes_info->RemoveLast();
-					--size;
-					--i;  // Recheck this index since we swapped elements
+};
+
+//TODO(Jae) Broker Failure is not handled
+class Subscriber{
+	public:
+		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE]):
+			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false),  buffer_size_((1UL<<30)){
+				memcpy(topic_, topic, TOPIC_NAME_SIZE);
+				std::string addr = head_addr+":"+port;
+				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
+				nodes_[0] = head_addr+":"+std::to_string(PORT);
+				new_brokers_[0] = head_addr+":"+std::to_string(PORT);
+				cluster_probe_thread_ = std::thread([this](){
+						this->ClusterProbeLoop();
+						});
+				while(!connected_){
+					std::this_thread::yield();
 				}
+				messages_.reserve(2);
 			}
+
+		~Subscriber(){
+			LOG(INFO) << "Destructing Subscriber";
+			shutdown_ = true;
+			cluster_probe_thread_.join();
+		};
+
+		void* Consume(){
+			int i = messages_idx_.fetch_xor(1);
+			return nullptr;
 		}
 
-		std::pair<std::string, int> ParseAddressPort(const std::string& input) {
-			size_t colonPos = input.find(':');
-			if (colonPos == std::string::npos) {
-				throw std::invalid_argument("Invalid input format. Expected 'address:port'");
+
+	private:
+		std::string head_addr_;
+		std::string port_;
+		bool shutdown_;
+		bool connected_;
+		std::unique_ptr<HeartBeat::Stub> stub_;
+		std::thread cluster_probe_thread_;
+		// <broker_id, address::port of network_mgr>
+		absl::flat_hash_map<int, std::string> nodes_;
+		absl::flat_hash_map<int, std::string> new_brokers_;
+		absl::Mutex mutex_;
+		char topic_[TOPIC_NAME_SIZE];
+		size_t buffer_size_;
+		void* last_fetched_addr_;
+		int last_fetched_offset_;
+		std::vector<std::vector<std::pair<void*, msgIdx>>> messages_;
+		absl::flat_hash_map<int, int> fd_to_msg_idx_;
+		std::atomic<int> messages_idx_;
+		std::vector<int> broker_fds_;
+
+		void SubscribeThread(){
+			int num_brokers = nodes_.size();
+			int epoll_fd = epoll_create1(0);
+			const size_t header_size = sizeof(Embarcadero::SubscribeHeader);
+			if (epoll_fd < 0) {
+				LOG(ERROR) << "Failed to create epoll instance";
+				return ;
 			}
 
-			std::string address = input.substr(0, colonPos);
-			std::string portStr = input.substr(colonPos + 1);
+			epoll_event events[num_brokers];
+			while(!shutdown_){
+				ProcessClusterChanges(epoll_fd);
+				int nfds = epoll_wait(epoll_fd, events, num_brokers, 1000); // 1 second timeout
+				if (nfds == -1) {
+					if (errno == EINTR) continue;  // Interrupted system call, just continue
+					LOG(ERROR) << "epoll_wait error" << std::endl;
+					break;
+				}
+				for (int n = 0; n < nfds; ++n) {
+					if (events[n].events & EPOLLIN) {
+						size_t to_read = buffer_size_;
+						while (true) {
+							int fd = events[n].data.fd;
+							int idx = messages_idx_.load();
+							struct msgIdx *m = &messages_[idx][fd_to_msg_idx_[fd]].second;
+							void* buf = messages_[idx][fd_to_msg_idx_[fd]].first;
+							if(m->remaining_len !=0){
+								to_read = m->remaining_len;
+							}
+							int bytes_received = recv(fd, (uint8_t*)buf + m->offset, to_read, 0);
+							if (bytes_received > 0) {
+								m->offset += bytes_received;
+								if(m->remaining_len == 0){
+									if(m->offset < header_size){
+										continue;
+									}else{
+										Embarcadero::SubscribeHeader *header = (Embarcadero::SubscribeHeader*)buf;
+										m->remaining_len = header->len - m->offset;
+										m->first = header->first_id;
+										m->last = header->last_id;
+										m->broker_id = header->broker_id;
+										break;
+									}
+								}else{
+									m->remaining_len -= bytes_received;
+								}
 
-			int port;
-			try {
-				port = std::stoi(portStr);
-			} catch (const std::exception& e) {
-				throw std::invalid_argument("Invalid port number");
-			}
+							} else if (bytes_received == 0) {
+								LOG(ERROR) << "Server " << fd << " disconnected";
+								break;
+							} else {
+								if (errno != EWOULDBLOCK && errno != EAGAIN) {
+									LOG(ERROR) << "Recv failed for server " << fd;
+								}
+								break;
+							}
+						}
+					}
+				} // end epoll cycle
+			} // end while(shutdown_)
 
-			if (port < 0 || port > 65535) {
-				throw std::out_of_range("Port number out of valid range (0-65535)");
-			}
-
-			return std::make_pair(address, port);
+			close(epoll_fd);
 		}
 
-		int GetBrokerId(const std::string& input) {
-			auto [addr, addressPort] = ParseAddressPort(input);
-			return addressPort - PORT;
-		}
-
-		int GenerateRandomNum(){
-			// Generate a random number
-			std::random_device rd;
-			std::mt19937 gen(rd());
-			std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
-			return  dis(gen);
-		}
-
-		int GetNonblockingSock(char *broker_address, int port){
-			int sock = socket(AF_INET, SOCK_STREAM, 0);
-			if (sock < 0) {
-				LOG(ERROR) << "Socket creation failed";
-				return -1;
-			}
-			int flags = fcntl(sock, F_GETFL, 0);
-			if (flags == -1) {
-				perror("fcntl F_GETFL");
-				return -1;
-			}
-
-			flags |= O_NONBLOCK;
-			if (fcntl(sock, F_SETFL, flags) == -1) {
-				perror("fcntl F_SETFL");
-				return -1;
-			}
-			int flag = 1; // Enable the option
-			if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-				LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed";
-				close(sock);
-				return -1;
-			}
-
-			if(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
-				LOG(ERROR) << "setsockopt error";
-				close(sock);
-				return -1;
-			}
-
-			sockaddr_in server_addr;
-			memset(&server_addr, 0, sizeof(server_addr));
-			server_addr.sin_family = AF_INET;
-			server_addr.sin_port = htons(port);
-			server_addr.sin_addr.s_addr = inet_addr(broker_address);
-
-			if (connect(sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-				if (errno != EINPROGRESS) {
-					LOG(ERROR) << "Connect failed";
+		void ProcessClusterChanges(int epoll_fd){
+			absl::MutexLock lock(&mutex_);
+			for(auto &new_broker: new_brokers_){
+				auto [addr, addressPort] = ParseAddressPort(new_broker.second);
+				int sock = GetNonblockingSock(addr.data(), PORT + new_broker.first);
+				broker_fds_.emplace_back(sock);
+				epoll_event ev;
+				ev.events = EPOLLIN | EPOLLET;
+				ev.data.ptr = &broker_fds_.back();
+				if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1) {
+					LOG(ERROR) << "Failed to add new server to epoll";
 					close(sock);
-					return -1;
+					broker_fds_.pop_back();
+				} else {
+					std::pair<void*, msgIdx> msg(static_cast<void*>(malloc(buffer_size_)), msgIdx(0,0,0,new_broker.first,0));
+					std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(0,0,0,new_broker.first,0));
+					int idx = messages_[0].size();
+					messages_[0].push_back(msg);
+					messages_[1].push_back(msg1);
+					fd_to_msg_idx_[sock] = idx;
+					//Send Sub request
+					Embarcadero::EmbarcaderoReq shake;
+					shake.client_order = 0;
+					shake.last_addr = 0;
+					shake.client_req = Embarcadero::Subscribe;
+					memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
+					send(sock, &shake, sizeof(shake), 0);
 				}
 			}
+			new_brokers_.clear();
 
-			return sock;
+			// Handle removed brokers, reference below code to implement broker failure.
+			// Need a way to associate broker_id to fd
+			/*
+				 while (!servers_to_remove.empty()) {
+				 int socket_to_remove = servers_to_remove.front();
+				 servers_to_remove.pop();
+
+				 std::lock_guard<std::mutex> servers_lock(servers_mutex);
+				 auto it = std::find_if(servers.begin(), servers.end(),
+				 [socket_to_remove](const Server& s) { return s.socket == socket_to_remove; });
+				 if (it != servers.end()) {
+				 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, socket_to_remove, nullptr);
+				 close(socket_to_remove);
+				 servers.erase(it);
+				 std::cout << "Removed server with socket: " << socket_to_remove << std::endl;
+				 }
+				 }
+				 */
 		}
+
+		void ClusterProbeLoop(){
+			heartbeat_system::ClientInfo client_info;
+			heartbeat_system::ClusterStatus cluster_status;
+			for (const auto &it: nodes_){
+				client_info.add_nodes_info(it.first);
+			}
+			while(!shutdown_){
+				grpc::ClientContext context;
+				grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
+				if(status.ok()){
+					connected_ = true;
+					const auto& removed_nodes = cluster_status.removed_nodes();
+					const auto& new_nodes = cluster_status.new_nodes();
+					if(!removed_nodes.empty()){
+						absl::MutexLock lock(&mutex_);
+						//TODO(Jae) Handle broker failure
+						for(const auto& id:removed_nodes){
+							LOG(ERROR) << "Failed Node reported : " << id;
+							nodes_.erase(id);
+							RemoveNodeFromClientInfo(client_info, id);
+						}
+					}
+					if(!new_nodes.empty()){
+						absl::MutexLock lock(&mutex_);
+						for(const auto& addr:new_nodes){
+							int broker_id = GetBrokerId(addr);
+							LOG(INFO) << "New Node reported:" << broker_id;
+							nodes_[broker_id] = addr;
+							client_info.add_nodes_info(broker_id);
+							new_brokers_[broker_id] = addr;
+						}
+					}
+				}else{
+					LOG(ERROR) << "Head is dead, try reaching other brokers for a newly elected head";
+				}
+				std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_INTERVAL));
+			}
+		}
+
 };
 
 #define ACK_SIZE 1024
@@ -571,15 +775,6 @@ class Client{
 std::atomic<size_t> totalBytesRead_(0);
 std::atomic<size_t> client_order_(0);
 int ack_port_;;
-
-// This is to avoid contention if brokers and clients run on the same node
-int GenerateRandomPORT(){
-	// Generate a random number
-	std::random_device rd;
-	std::mt19937 gen(rd());
-	std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
-	return  dis(gen);
-}
 
 int make_socket_non_blocking(int sfd) {
 	int flags = fcntl(sfd, F_GETFL, 0);
@@ -641,7 +836,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	event.events = EPOLLOUT;
 	epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event);
 
-	// =============== Sending Shake =============== 
+	// =============== Sending Shake ===============
 	Embarcadero::EmbarcaderoReq shake;
 	shake.client_id = CLIENT_ID;
 	shake.client_order = 0;
@@ -650,6 +845,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	shake.ack = ack_level;
 	shake.port = ack_port_;
 	shake.size = message_size + sizeof(Embarcadero::MessageHeader);
+	shake.client_req = Embarcadero::Publish;
 	int n, i;
 	struct epoll_event events[10]; // Adjust size as needed
 	bool running = true;
@@ -669,7 +865,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 						running = false;
 						break;
 					}
-				} 
+				}
 				sent_bytes += bytesSent;
 				if(sent_bytes == sizeof(shake)){
 					running = false;
@@ -730,7 +926,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 						running = false;
 						break;
 					}
-				} 
+				}
 				sent_bytes += bytesSent;
 				if(sent_bytes == shake.size){
 					sent_bytes = 0;
@@ -829,7 +1025,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> read_ac
 void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, size_t message_size, int ack_level, bool record_latency){
 	LOG(INFO) << "Starting SingleClientMultipleThreads Throughput Test with " << num_threads << " threads, total message size:" << total_message_size;
 	size_t client_id = 1;
-	ack_port_ = GenerateRandomPORT();
+	ack_port_ = GenerateRandomNum();
 	std::vector<std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>>> pub_futures;
 
 	std::future<std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>>> ack_future;
@@ -944,7 +1140,7 @@ void ThroughputTestRaw(size_t total_message_size, size_t message_size, int num_t
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 }
 
-void ThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, int seq_type){
+void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, int seq_type){
 	int n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
@@ -952,7 +1148,7 @@ void ThroughputTest(size_t total_message_size, size_t message_size, int num_thre
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
 
-	Client c("127.0.0.1", std::to_string(BROKER_PORT), n + 1024);
+	Client c("127.0.0.1", std::to_string(BROKER_PORT), n/4);
 	std::cout << "Client Created" << std::endl;
 	c.CreateNewTopic(topic, order, seq_type);
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
@@ -967,6 +1163,15 @@ void ThroughputTest(size_t total_message_size, size_t message_size, int num_thre
 	double seconds = elapsed.count();
 	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
 	std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
+}
+
+void SubscribeThroughputTest(){
+	LOG(INFO) << "[Subscribe Throuput Test] ";
+	char topic[TOPIC_NAME_SIZE];
+	memset(topic, 0, TOPIC_NAME_SIZE);
+	memcpy(topic, "TestTopic", 9);
+	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
+	sleep(10);
 }
 
 int main(int argc, char* argv[]) {
@@ -999,7 +1204,8 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
-	ThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	// SubscribeThroughputTest();
 
 	return 0;
 }

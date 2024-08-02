@@ -204,7 +204,7 @@ void NetworkManager::ReqReceiveThread(){
 					i = 0;
 				}
 #else
-				if(memcmp(shake.topic, "\0", 31) == 0){
+				if(strlen(shake.topic) == 0){
 					LOG(ERROR) << "Topic cannot be null:" << shake.topic;
 					return;
 				}
@@ -283,7 +283,6 @@ void NetworkManager::ReqReceiveThread(){
 							break;
 						}						
 						to_read -= bytes_read;
-						size_t read = READ_SIZE - to_read;
 						//TODO(Jae) Change this to malloc here to allow dynamic message size during one connection
 						if(to_read == 0){
 							MessageHeader *header = (MessageHeader*)buf;;
@@ -305,34 +304,29 @@ void NetworkManager::ReqReceiveThread(){
 				break;
 			case Subscribe:
 				{
-				size_t last_offset = shake.client_order;
-				void* last_addr = shake.last_addr;
-				void* messages;
-				size_t messages_size;
-				bool no_updates = false;
-				SubscribeShake reply_shake;
-				do{
-					if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
-						VLOG(3) << "read :" << last_offset;
-						reply_shake.size = messages_size;
-						// Send
-						// send(req.client_socket, messages, messages_size, 0);
-					}else{
-						reply_shake.size = 0;
-						// send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
-						VLOG(3) << "Did not read anything";
-						no_updates = true;
-						break;
+					size_t last_offset = shake.client_order;
+					void* last_addr = shake.last_addr;
+					void* messages;
+					size_t messages_size;
+					bool no_updates = false;
+					SubscribeHeader reply_shake;
+					while(!stop_threads_){
+						size_t prev_off = last_offset;
+						if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
+							VLOG(3) << "read :" << last_offset;
+							reply_shake.len = messages_size;
+							reply_shake.first_id = prev_off;
+							reply_shake.last_id = last_offset;
+							// Send
+							send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
+							send(req.client_socket, messages, messages_size, 0);
+						}else{
+							std::this_thread::yield();
+							VLOG(3) << "Did not read anything";
+							no_updates = true;
+							break;
+						}
 					}
-					//TODO(Jae)
-					// Send the messages to the client
-					// send(req.client_socket, messages, messages_size, 0);
-				}while(last_addr != nullptr);
-
-				if(!no_updates){
-					reply_shake.size = 0;
-					// send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
-				}
 				}//end Subscribe
 				break;
 		}
@@ -360,71 +354,50 @@ void NetworkManager::TestAckThread(){
 void NetworkManager::AckThread(){
 	std::optional<struct NetworkRequest> optReq;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	char buf[1000000];
+	char buf[128];
 	struct epoll_event events[10]; // Adjust size as needed
 
-	if(ack_type_ == Immediate){
-		while(!stop_threads_){
-			size_t ack_count = 0;
-			while(ackQueue_.read(optReq)){
-				ack_count++;
-				if(!optReq.has_value()){
-					ack_count--;
-					break;
-				}
-			}
-			//const struct NetworkRequest &req = optReq.value();
-			size_t acked_size = 0;
-			while (acked_size < ack_count) {
-				int n = epoll_wait(ack_efd_, events, 10, -1);
-				for (int i = 0; i < n; i++) {
-					if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
-						ssize_t bytesSent = send(ack_fd_, buf, ack_count - acked_size, 0);
-						if (bytesSent < 0) {
-							if (errno != EAGAIN) {
-								perror("Ack send failed");
-								return;
-								break;
-							}
-						} else {
-							VLOG(3) << "[DEBUG] Ack Sent:" << bytesSent;
-							acked_size += bytesSent;
-						}
-					}
-				}
-			}
-			if(ack_count > 0 && !optReq.has_value()) // Check ack_count >0 as the read is non-blocking
+	while(!stop_threads_){
+		size_t ack_count = 0;
+		while(ackQueue_.read(optReq)){
+			ack_count++;
+			if(!optReq.has_value()){
+				ack_count--;
 				break;
-		}
-	}else{
-		while(!stop_threads_){
-			size_t ack_count = 0;
-			size_t DEBUG_num_total_ack = 10066329600/960;
-			while(ack_count != DEBUG_num_total_ack){
-				ackQueue_.blockingRead(optReq);
-				ack_count++;
 			}
-			auto end = std::chrono::high_resolution_clock::now();
-
-			size_t acked_size = 0;
-			while (acked_size < 1) {
-				int n = epoll_wait(ack_efd_, events, 10, -1);
-				for (int i = 0; i < n; i++) {
-					if (events[i].events & EPOLLOUT && acked_size < 1 ) {
-						ssize_t bytesSent = send(ack_fd_, &end, sizeof(end), 0);
-						if (bytesSent < 0) {
-							if (errno != EAGAIN) {
-								perror("Ack send failed");
-								return;
-								break;
-							}
-						} else {
-							acked_size += bytesSent;
+		}
+		//const struct NetworkRequest &req = optReq.value();
+		int EPOLL_TIMEOUT = -1; 
+		size_t acked_size = 0;
+		while (acked_size < ack_count) {
+			int n = epoll_wait(ack_efd_, events, 10, EPOLL_TIMEOUT);
+			for (int i = 0; i < n; i++) {
+				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
+					ssize_t bytesSent = send(ack_fd_, buf, ack_count - acked_size, 0);
+					if (bytesSent < 0) {
+						if (errno != EAGAIN) {
+							perror("Ack send failed");
+							return;
+							break;
 						}
+					} else {
+						VLOG(3) << "[DEBUG] Ack Sent:" << bytesSent;
+						acked_size += bytesSent;
 					}
 				}
 			}
 		}
+		// Check if the connection is alive only after ack_fd_ is connected
+		if(ack_fd_ > 0){
+			int result = recv(ack_fd_, buf, 1, MSG_PEEK | MSG_DONTWAIT);
+			if(result == 0){
+				LOG(INFO) << "Connection is closed ack_fd_:" << ack_fd_ ;
+				stop_threads_ = true;
+				break;
+			}
+		}
+		if(ack_count > 0 && !optReq.has_value()) // Check ack_count >0 as the read is non-blocking
+			break;
 	}
 }
 
