@@ -71,7 +71,7 @@ struct alignas(64) MessageHeader{
 
 class CXLManager : public ScalogSequencer::Service {
 	public:
-		CXLManager(size_t queueCapacity, int broker_id, ServerBuilder &builder, int num_io_threads=NUM_CXL_IO_THREADS);
+		CXLManager(size_t queueCapacity, int broker_id, int num_io_threads=NUM_CXL_IO_THREADS);
 		~CXLManager();
 		void SetBroker(HeartBeatManager *broker){
 			broker_ = broker;
