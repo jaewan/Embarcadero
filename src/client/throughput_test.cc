@@ -164,10 +164,9 @@ class Client{
 			shutdown_ = true;
 			cluster_probe_thread_.join();
 			std::optional<char*> sentinel = std::nullopt;
-			int len = pubQues_.size();
 			for(auto& q:pubQues_){
 				for(int i =0; i<num_threads_; i++) // This is not correct for sanity overwrite sentinel
-					q.blockingWrite(sentinel);
+					q.write(sentinel);
 			}
 			for(auto &t : threads_)
 				t.join();
@@ -471,7 +470,7 @@ class Client{
 			header.paddedSize = message_size_ + padding + sizeof(Embarcadero::MessageHeader);
 			header.segment_header = nullptr;
 			header.logical_offset = (size_t)-1; // Sentinel value
-			header.next_message = nullptr;
+			header.next_msg_diff = 0;
 			std::optional<char*> optReq;
 
 			while(!shutdown_){
@@ -582,6 +581,7 @@ class Subscriber{
 			LOG(INFO) << "Destructing Subscriber";
 			shutdown_ = true;
 			cluster_probe_thread_.join();
+			subscribe_thread_.join();
 		};
 
 		void* Consume(){
@@ -914,7 +914,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	header.paddedSize = message_size + padding + sizeof(Embarcadero::MessageHeader);
 	header.segment_header = nullptr;
 	header.logical_offset = (size_t)-1; // Sentinel value
-	header.next_message = nullptr;
+	header.next_msg_diff = 0;
 
 	size_t run_count = total_message_size/message_size;
 
@@ -1169,7 +1169,11 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
 
-	Client c("127.0.0.1", std::to_string(BROKER_PORT), n/4);
+	size_t q_size = n/4;
+	if(q_size < 1024){
+		q_size = 1024;
+	}
+	Client c("127.0.0.1", std::to_string(BROKER_PORT), q_size);
 	std::cout << "Client Created" << std::endl;
 	c.CreateNewTopic(topic, order);
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);

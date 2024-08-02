@@ -145,9 +145,6 @@ void NetworkManager::ReqReceiveThread(){
 				}
 		}
 #endif
-		VLOG(3) << "[DEBUG] Client shake finished topic:" << shake.topic << " ack:" <<shake.ack << " size:" << shake.size << " port:" << shake.port ;
-
-
 		switch(shake.client_req){
 			case Publish:
 				{
@@ -243,7 +240,6 @@ void NetworkManager::ReqReceiveThread(){
 						server_addr.sin_family = AF_INET;
 						server_addr.sin_port = ntohs(shake.port);
 						server_addr.sin_addr.s_addr = inet_addr(inet_ntoa(client_address.sin_addr));
-						VLOG(3) << "[DEBUG] Ack connecting to:" << (shake.port);
 						if (connect(ack_fd, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
 							if (errno != EINPROGRESS) {
 								perror("Connect failed");
@@ -251,7 +247,6 @@ void NetworkManager::ReqReceiveThread(){
 								return;
 							}
 						}
-						VLOG(3) << "[DEBUG] Ack connected to:" << (shake.port);
 						ack_fd_ = ack_fd;
 						ack_efd_ = epoll_create1(0);
 						struct epoll_event event;
@@ -307,16 +302,16 @@ void NetworkManager::ReqReceiveThread(){
 					size_t last_offset = shake.client_order;
 					void* last_addr = shake.last_addr;
 					void* messages = nullptr;
-					size_t messages_size;
-					bool no_updates = false;
 					SubscribeHeader reply_shake;
 
 					while(!stop_threads_){
+						size_t messages_size = 0;
 						if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
 							reply_shake.len = messages_size;
 							//reply_shake.first_id = ((MessageHeader*)messages)->logical_offset;
 							reply_shake.first_id = 0;
 							reply_shake.last_id = last_offset;
+							VLOG(3) << "[DEBUG] broker:" << broker_id_ << " sub reply " << messages_size;
 							// Send
 							size_t ret = send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
 							if(ret < 0){
@@ -341,9 +336,6 @@ void NetworkManager::ReqReceiveThread(){
 							}
 						}else{
 							std::this_thread::yield();
-							VLOG(3) << "Did not read anything";
-							no_updates = true;
-							break;
 						}
 					}
 				}//end Subscribe

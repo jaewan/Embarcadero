@@ -103,12 +103,32 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	return tinode;
 }
 
+struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order){
+	absl::MutexLock lock(&mutex_);
+	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
+	if(topics_.find(topic)!= topics_.end()){
+		return nullptr;
+	}
+	static void* cxl_addr = cxl_manager_.GetCXLAddr();
+	void* segment_metadata = cxl_manager_.GetNewSegment();
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+	tinode->offsets[broker_id_].ordered = -1;
+	tinode->offsets[broker_id_].written = -1;
+	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
+	tinode->order= (uint8_t)order;
+	memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
+
+	//_mm_clflushopt(tinode);
+	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
+			tinode, topic, broker_id_, order, cxl_manager_.GetCXLAddr(), segment_metadata);
+	
+	topics_[topic]->Combiner();
+	return tinode;
+}
+
 bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
-	struct TInode* tinode = CreateNewTopicInternal(topic);
-	if(tinode != nullptr){
-		memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
-		tinode->order= (uint8_t)order;
-		//TODO(Tony) Initiate Global Scalog Sequencer
+	if(CreateNewTopicInternal(topic, order)){
+		cxl_manager_.RunSequencer(topic, order, Embarcadero);
 		return true;
 	}else{
 		LOG(ERROR)<< "Topic already exists!!!";
@@ -177,23 +197,23 @@ void Topic::CombinerThread(){
 			std::this_thread::yield();
 		}
 #ifdef MULTISEGMENT
-		if(header->next_message != nullptr){ // Moved to new segment
-			header = header->next_message;
+		if(header->next_msg_diff!= 0){ // Moved to new segment
+			header = (int8_t*)header + header->next_msg_diff;
 			segment_header = (uint8_t*)header - CACHELINE_SIZE;
 			continue;
 		}
 #endif
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
-		header->next_message = (uint8_t*)header + header->paddedSize;
+		header->next_msg_diff = header->paddedSize;
 		tinode_->offsets[broker_id_].written = logical_offset_;
 		(*(unsigned long long int*)segment_header) =
 		(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
 		written_logical_offset_ = logical_offset_;
 		written_physical_addr_ = (void*)header;
-		logical_offset_++;
-		header = (MessageHeader*)header->next_message;
+		header = (MessageHeader*)((uint8_t*)header + header->next_msg_diff);
 		DEBUG_num_ordered++;
+		logical_offset_++;
 	}
 }
 
@@ -249,17 +269,16 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	}
 
 	if(combined_offset == (size_t)-1 || ((last_addr != nullptr) && (combined_offset <= last_offset))){
-		VLOG(3)<< "No messages to export combined_offset:" << combined_offset;
 		return false;
 	}
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
 	if(last_addr != nullptr){
-		while((struct MessageHeader*)start_msg_header->next_message == nullptr){
+		while((struct MessageHeader*)start_msg_header->next_msg_diff == 0){
 			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
 			std::this_thread::yield();
 		}
-		start_msg_header = (struct MessageHeader*)start_msg_header->next_message;
+		start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
 	}else{
 		//TODO(Jae) this is only true in a single segment setup
 		if(combined_addr <= last_addr){
@@ -272,9 +291,29 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	messages = (void*)start_msg_header;
 	unsigned long long int* last_msg_off = (unsigned long long int*)start_msg_header->segment_header;
 	struct MessageHeader *last_msg_of_segment = (MessageHeader*)((uint8_t*)last_msg_off + *last_msg_off);
-	messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
-	last_offset = last_msg_of_segment->logical_offset;
-	last_addr = (void*)last_msg_of_segment;
+
+	if(combined_addr < last_msg_of_segment){ // last msg is not ordered yet
+		messages_size = (uint8_t*)combined_addr - (uint8_t*)start_msg_header + ((MessageHeader*)combined_addr)->paddedSize; 
+		last_offset = ((MessageHeader*)combined_addr)->logical_offset;
+		last_addr = (void*)combined_addr;
+		/*
+			while(start_msg_header <= combined_addr){
+				VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
+				start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
+			}
+			*/
+	}else{
+		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
+		last_offset = last_msg_of_segment->logical_offset;
+		last_addr = (void*)last_msg_of_segment;
+		/*
+			while(start_msg_header <= last_msg_of_segment){
+				VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
+				start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
+			}
+			*/
+	}
+
 
 #ifdef DEBUG
 	struct MessageHeader *m = (struct MessageHeader*)messages;
@@ -284,7 +323,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		std::cout << " total_order:" << m->total_order<< " logical_order:" <<
 		m->logical_offset << " client_order::" << m->client_order << std::endl;
 		len -= m->paddedSize;
-		m =  (struct MessageHeader*)m->next_message;
+		m =  (struct MessageHeader*)((uint8_t*)m + m->next_msg_diff);
 	}
 #endif
 

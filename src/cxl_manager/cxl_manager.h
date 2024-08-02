@@ -61,7 +61,7 @@ struct alignas(64) MessageHeader{
 	void* segment_header;
 	volatile size_t total_order;
 	size_t logical_offset;
-	void* next_message;
+	unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
 };
 
 class CXLManager{
@@ -79,9 +79,12 @@ class CXLManager{
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 												void* &last_addr, void* &messages, size_t &messages_size);
-		void CreateNewTopic(char topic[31], int order, SequencerType seqType = Embarcadero);
+		void RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType);
 		void* GetCXLAddr(){
 			return cxl_addr_;
+		}
+		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
+			get_registered_brokers_callback_ = callback;
 		}
 //#define InternalTest 1
 
@@ -127,6 +130,7 @@ class CXLManager{
 		std::atomic<int> thread_count_{0};
 		bool DEBUG_1_passed_ = false;
 		bool DEBUG_2_passed_ = false;
+		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 
 		void CXL_io_thread();
 		void Sequencer1(char* topic);
