@@ -20,11 +20,12 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 	broker_id_(broker_id),
 	num_io_threads_(num_io_threads){
 	// Initialize CXL
-	cxl_type_ = Real;
+	cxl_type_ = Emul;
 	std::string cxl_path(getenv("HOME"));
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 	int cxl_fd;
 	bool numa_alloc = false;
+	int ret;
 
 	switch(cxl_type_){
 		case Emul:
@@ -65,7 +66,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, int num_io_threads):
 
 		// Bind the memory to the specified NUMA node
 		if (mbind(cxl_addr_, CXL_SIZE, MPOL_BIND, bitmask->maskp, bitmask->size, MPOL_MF_MOVE | MPOL_MF_STRICT) == -1) {
-			LOG(ERROR)<< "mbind failed";
+			LOG(ERROR)<< "mbind failed" << strerror(errno);
 			numa_free_nodemask(bitmask);
 			munmap(cxl_addr_, CXL_SIZE);
 			return ;

@@ -14,7 +14,7 @@ namespace Embarcadero{
 #define PORT 1214
 #define BROKER_PORT 12140
 #define NUM_MAX_BROKERS 4
-#define CXL_SIZE (1UL<<37)
+#define CXL_SIZE (1UL<<32)
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
 #define SEGMENT_SIZE (1UL << 35)
