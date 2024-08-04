@@ -10,6 +10,7 @@ function Clean_Previous_Artifacts()
 	rm -rf build
 	rm -rf third_party
 	rm -rf ~/.CXL_EMUL
+	rm -rf ~/.DiskLog
 }
 
 # Install System dependencies
@@ -126,6 +127,7 @@ else
 fi
 
 mkdir -p third_party
+mkdir -p ~/.DiskLog
 
 MY_DISTRO=$(awk -F= '/^NAME/{print $2}' /etc/os-release)
 echo "Distro: $MY_DISTRO"
