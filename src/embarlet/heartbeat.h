@@ -19,6 +19,9 @@
 #include <heartbeat.grpc.pb.h>
 #include "common/config.h"
 #include <scalog_sequencer.grpc.pb.h>
+#include "../cxl_manager/cxl_manager.h"
+
+namespace Embarcadero{
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -331,4 +334,6 @@ class HeartBeatManager{
 			return std::string(IPbuffer);
 		}
 };
+
+} // End of namespace Embarcadero
 #endif

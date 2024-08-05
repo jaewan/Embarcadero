@@ -2,6 +2,8 @@
 
 #include "heartbeat.h"
 
+namespace Embarcadero{
+
 void HeartBeatServiceImpl::CheckHeartbeats(){
 	static const int timeout = HEARTBEAT_INTERVAL * 3;
 	while (!shutdown_) {
@@ -182,3 +184,5 @@ void FollowerNodeClient::HeartBeatLoop() {
 }
 
 */
+
+} // End of namespace Embarcadero

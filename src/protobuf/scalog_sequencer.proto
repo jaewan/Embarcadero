@@ -2,13 +2,13 @@ syntax = "proto3";
 
 service ScalogSequencer {
     // Receives a local cut from a local sequencer
-    rpc HandleScalogSendLocalCut(ScalogSendLocalCutRequest) returns (ScalogSendLocalCutResponse);
+    rpc HandleSendLocalCut(SendLocalCutRequest) returns (SendLocalCutResponse);
     // Receives the global cut from global sequencer
-    rpc HandleScalogSendGlobalCut(ScalogSendGlobalCutRequest) returns (ScalogSendGlobalCutResponse);
+    rpc HandleSendGlobalCut(SendGlobalCutRequest) returns (SendGlobalCutResponse);
 }
 
 // Request containing the local cut and the epoch
-message ScalogSendLocalCutRequest {
+message SendLocalCutRequest {
     int64 epoch = 1;
     int64 local_cut = 2;
     string topic = 3;
@@ -16,13 +16,13 @@ message ScalogSendLocalCutRequest {
 }
 
 // Empty response for now
-message ScalogSendLocalCutResponse {}
+message SendLocalCutResponse {}
 
 // Request containing the global cut and topic
-message ScalogSendGlobalCutRequest {
+message SendGlobalCutRequest {
     repeated int64 global_cut = 1;
     string topic = 2;
 }
 
 // Empty response for now
-message ScalogSendGlobalCutResponse {}
+message SendGlobalCutResponse {}

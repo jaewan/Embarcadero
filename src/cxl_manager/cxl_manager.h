@@ -19,6 +19,70 @@ namespace Embarcadero{
 
 class TopicManager;
 class NetworkManager;
+class HeartBeatManager;
+
+class ScalogSequencerService : public ScalogSequencer::Service {
+	public:
+		ScalogSequencerService(CXLManager* cxl_manager, int broker_id, const char* topic, HeartBeatManager *broker, void* cxl_addr);
+
+		absl::flat_hash_map<std::string, std::vector<int>> GetGlobalCut() {
+			return global_cut_;
+		}
+
+		/// Create a new rpc client to communicate with a peer broker
+        /// @param peer_url URL of the peer broker
+        /// @return rpc client
+        std::unique_ptr<ScalogSequencer::Stub> GetRpcClient(std::string peer_url);
+
+    	/// Receives a local cut from a local sequencer
+        /// @param context
+        /// @param request Request containing the local cut and the epoch
+        /// @param response Empty for now
+		grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response);
+
+    	/// Receives the global cut from global sequencer
+        /// @param context
+        /// @param request Request containing the global cut and topic
+        /// @param response Empty for now
+		grpc::Status HandleSendGlobalCut(grpc::ServerContext* context, const SendGlobalCutRequest* request, SendGlobalCutResponse* response);
+
+	private:
+		CXLManager* cxl_manager_;
+		HeartBeatManager *broker_;
+		int broker_id_;
+		void* cxl_addr_;
+
+		absl::flat_hash_map<std::string, int> local_epoch_;
+
+		absl::flat_hash_map<std::string, int> global_epoch_;
+
+		absl::flat_hash_map<std::string, int> local_cuts_count_;
+
+		absl::flat_hash_map<std::string, bool> received_global_seq_;
+
+		absl::flat_hash_map<std::string, std::vector<int>> global_cut_;
+
+		absl::flat_hash_map<std::string, bool> has_global_sequencer_;
+
+		absl::flat_hash_map<std::string, bool> received_gobal_seq_after_interval_;
+
+        /// Thread to run the io_service in a loop
+        std::unique_ptr<std::thread> io_service_thread_;
+
+        /// IO context that peers use to post tasks
+        boost::asio::io_context io_service_;
+
+		/// Timer used to perform async wait before sending the next local cut
+		using Timer = boost::asio::deadline_timer;
+		Timer timer_;
+
+		void LocalSequencer(const char* topic);
+		void GlobalSequencer(const char* topic);
+		void SendLocalCut(int epoch, int written, const char* topic);
+		void ReceiveGlobalCut(std::vector<int> global_cut, const char* topic);
+		void ReceiveLocalCut(int epoch, int written, const char* topic, int broker_id);
+		void UpdateTotalOrdering(std::vector<int> global_cut, struct TInode *tinode);
+};
 
 enum CXLType {Emul, Real};
 enum SequencerType {Embarcadero, Scalog, Corfu};
@@ -69,9 +133,9 @@ struct alignas(64) MessageHeader{
 	void* next_message;
 };
 
-class CXLManager : public ScalogSequencer::Service {
+class CXLManager {
 	public:
-		CXLManager(size_t queueCapacity, int broker_id, int num_io_threads=NUM_CXL_IO_THREADS);
+		CXLManager(size_t queueCapacity, int broker_id, std::string head_address, int num_io_threads=NUM_CXL_IO_THREADS);
 		~CXLManager();
 		void SetBroker(HeartBeatManager *broker){
 			broker_ = broker;
@@ -86,34 +150,13 @@ class CXLManager : public ScalogSequencer::Service {
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
-												void* &last_addr, void* messages, size_t &messages_size);
+												void* &last_addr, void* &messages, size_t &messages_size);
 		void CreateNewTopic(char topic[31], int order, SequencerType seqType = Embarcadero);
 		void* GetCXLAddr(){
 			return cxl_addr_;
 		}
-
-		absl::flat_hash_map<std::string, std::vector<int>> ScalogGetGlobalCut() {
-			return scalog_global_cut_;
-		}
-
-		void StartScalogLocalSequencer(const char* topic);
-
-		/// Create a new rpc client to communicate with a peer broker
-        /// @param peer_url URL of the peer broker
-        /// @return rpc client
-        std::unique_ptr<ScalogSequencer::Stub> GetRpcClient(std::string peer_url);
-
-    	/// Receives a local cut from a local sequencer
-        /// @param context
-        /// @param request Request containing the local cut and the epoch
-        /// @param response Empty for now
-		grpc::Status HandleScalogSendLocalCut(grpc::ServerContext* context, const ScalogSendLocalCutRequest* request, ScalogSendLocalCutResponse* response);
-
-    	/// Receives the global cut from global sequencer
-        /// @param context
-        /// @param request Request containing the global cut and topic
-        /// @param response Empty for now
-		grpc::Status HandleScalogSendGlobalCut(grpc::ServerContext* context, const ScalogSendGlobalCutRequest* request, ScalogSendGlobalCutResponse* response);
+		
+		void StartScalogLocalSequencer(std::string topic_str);
 
 //#define InternalTest 1
 
@@ -143,6 +186,7 @@ class CXLManager : public ScalogSequencer::Service {
 		private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
 		int broker_id_;
+		std::string head_address_;
 		int num_io_threads_;
 		std::vector<std::thread> threads_;
 		std::vector<std::thread> sequencerThreads_;
@@ -165,36 +209,8 @@ class CXLManager : public ScalogSequencer::Service {
 		void Sequencer1(char* topic);
 		void Sequencer2(char* topic);
 
-		absl::flat_hash_map<std::string, int> scalog_local_epoch_;
-
-		absl::flat_hash_map<std::string, int> scalog_global_epoch_;
-
-		absl::flat_hash_map<std::string, int> scalog_local_cuts_count_;
-
-		absl::flat_hash_map<std::string, bool> scalog_received_global_seq_;
-
-		absl::flat_hash_map<std::string, std::vector<int>> scalog_global_cut_;
-
-		absl::flat_hash_map<std::string, bool> scalog_has_global_sequencer_;
-
-		absl::flat_hash_map<std::string, bool> scalog_received_gobal_seq_after_interval_;
-
-        /// Thread to run the io_service in a loop
-        std::unique_ptr<std::thread> scalog_io_service_thread_;
-
-        /// IO context that peers use to post tasks
-        boost::asio::io_context scalog_io_service_;
-
-		/// Timer used to perform async wait before sending the next local cut
-		using Timer = boost::asio::deadline_timer;
-		Timer timer_;
-
-		void ScalogLocalSequencer(const char* topic);
-		void ScalogGlobalSequencer(const char* topic);
-		void ScalogSendLocalCut(int epoch, int written, const char* topic);
-		void ScalogReceiveGlobalCut(std::vector<int> global_cut, const char* topic);
-		void ScalogReceiveLocalCut(int epoch, int written, const char* topic, int broker_id);
-		void ScalogUpdateTotalOrdering(std::vector<int> global_cut, struct TInode *tinode);
+		std::unique_ptr<ScalogSequencerService> scalog_sequencer_service_;
+		std::unique_ptr<grpc::Server> scalog_server_;
 };
 
 } // End of namespace Embarcadero

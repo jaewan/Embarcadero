@@ -125,6 +125,7 @@ int GetNonblockingSock(char *broker_address, int port){
 
 	return sock;
 }
+
 int GenerateRandomNum(){
 	// Generate a random number
 	std::random_device rd;
@@ -132,6 +133,7 @@ int GenerateRandomNum(){
 	std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
 	return  dis(gen);
 }
+
 class Client{
 	public:
 		Client(std::string head_addr, std::string port, size_t queueSize):
@@ -150,8 +152,10 @@ class Client{
 					absl::MutexLock lock(&mutex_);
 					//Add headnode as headnode is not reported from ClusterProbeLoop
 					size_t queueSize = total_queue_size_ / (nodes_.size() + 1);
-					pubQues_.emplace_back(queueSize);
-					broker_id_to_queue_idx_[0] = pubQues_.size() - 1;
+					for(int i=0; i<nodes_.size(); i++){
+						pubQues_.emplace_back(queueSize);
+						broker_id_to_queue_idx_[i] = pubQues_.size() - 1;
+					}
 				}
 			}
 
@@ -189,16 +193,6 @@ class Client{
 
 		void Publish(std::string &message){
 			static int i = 0;
-			pubQues_[i].blockingWrite(message.data());
-			i = (i+1)%pubQues_.size();
-		}
-
-		void CorfuPublish(std::string &message){
-			static int i = 0;
-			// TODO(Erika) RPC global sequencer and get the messages ordered
-			// Best way to do this is to create a CorfuClient
-			// Make batch argument
-			// stub_->GetMessageOrder(num_batch)
 			pubQues_[i].blockingWrite(message.data());
 			i = (i+1)%pubQues_.size();
 		}
@@ -522,6 +516,7 @@ class Client{
 			close(efd);
 		}
 
+		// Current implementation does not send messages to newly added nodes after init
 		void ClusterProbeLoop(){
 			heartbeat_system::ClientInfo client_info;
 			heartbeat_system::ClusterStatus cluster_status;
@@ -562,11 +557,11 @@ class Client{
 
 };
 
-//TODO(Jae) Broker Failure is not handled
+//TODO(Jae) Broker Failure is not handled, dynamic node addition not handled
 class Subscriber{
 	public:
 		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE]):
-			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false),  buffer_size_((1UL<<30)){
+			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false),  buffer_size_((1UL<<33)){
 				memcpy(topic_, topic, TOPIC_NAME_SIZE);
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
@@ -578,7 +573,10 @@ class Subscriber{
 				while(!connected_){
 					std::this_thread::yield();
 				}
-				messages_.reserve(2);
+				messages_.resize(2);
+				subscribe_thread_ = std::thread([this](){
+						this->SubscribeThread();
+						});
 			}
 
 		~Subscriber(){
@@ -592,6 +590,24 @@ class Subscriber{
 			return nullptr;
 		}
 
+		void* ConsumeBatch(){
+			int i = messages_idx_.fetch_xor(1);
+			return nullptr;
+		}
+
+		void DEBUG_wait(size_t total_msg_size, size_t msg_size){
+			size_t num_msg = total_msg_size/msg_size;
+			auto start = std::chrono::steady_clock::now();
+			size_t total_data_size = num_msg * sizeof(Embarcadero::MessageHeader) + total_msg_size;
+			while(DEBUG_count_ < total_data_size){
+				std::this_thread::yield();
+				if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-start).count() >=3){
+					start = std::chrono::steady_clock::now();
+					VLOG(3) << "Received:" << DEBUG_count_ << "/" << total_data_size;
+				}
+			}
+			return;
+		}
 
 	private:
 		std::string head_addr_;
@@ -600,23 +616,24 @@ class Subscriber{
 		bool connected_;
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::thread cluster_probe_thread_;
+		std::thread subscribe_thread_;
 		// <broker_id, address::port of network_mgr>
 		absl::flat_hash_map<int, std::string> nodes_;
 		absl::flat_hash_map<int, std::string> new_brokers_;
 		absl::Mutex mutex_;
 		char topic_[TOPIC_NAME_SIZE];
 		size_t buffer_size_;
+		size_t DEBUG_count_ = 0;
 		void* last_fetched_addr_;
 		int last_fetched_offset_;
 		std::vector<std::vector<std::pair<void*, msgIdx>>> messages_;
 		absl::flat_hash_map<int, int> fd_to_msg_idx_;
 		std::atomic<int> messages_idx_;
-		std::vector<int> broker_fds_;
 
 		void SubscribeThread(){
+			const size_t header_size = sizeof(Embarcadero::SubscribeHeader);
 			int num_brokers = nodes_.size();
 			int epoll_fd = epoll_create1(0);
-			const size_t header_size = sizeof(Embarcadero::SubscribeHeader);
 			if (epoll_fd < 0) {
 				LOG(ERROR) << "Failed to create epoll instance";
 				return ;
@@ -644,12 +661,15 @@ class Subscriber{
 							}
 							int bytes_received = recv(fd, (uint8_t*)buf + m->offset, to_read, 0);
 							if (bytes_received > 0) {
+								DEBUG_count_ += bytes_received;
 								m->offset += bytes_received;
 								if(m->remaining_len == 0){
 									if(m->offset < header_size){
 										continue;
 									}else{
 										Embarcadero::SubscribeHeader *header = (Embarcadero::SubscribeHeader*)buf;
+										CHECK_LT(header->len, buffer_size_) << "Subscribe batch is larger than buffer size";
+										VLOG(3) << "fd:" << fd << " batch_size:" << header->len;
 										m->remaining_len = header->len - m->offset;
 										m->first = header->first_id;
 										m->last = header->last_id;
@@ -662,10 +682,13 @@ class Subscriber{
 
 							} else if (bytes_received == 0) {
 								LOG(ERROR) << "Server " << fd << " disconnected";
+								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+								close(fd);
+								//TODO(Jae) remove from other data structures
 								break;
 							} else {
 								if (errno != EWOULDBLOCK && errno != EAGAIN) {
-									LOG(ERROR) << "Recv failed for server " << fd;
+									LOG(ERROR) << "Recv failed for server " << fd << " " << strerror(errno);
 								}
 								break;
 							}
@@ -682,14 +705,13 @@ class Subscriber{
 			for(auto &new_broker: new_brokers_){
 				auto [addr, addressPort] = ParseAddressPort(new_broker.second);
 				int sock = GetNonblockingSock(addr.data(), PORT + new_broker.first);
-				broker_fds_.emplace_back(sock);
 				epoll_event ev;
 				ev.events = EPOLLIN | EPOLLET;
-				ev.data.ptr = &broker_fds_.back();
+				ev.data.fd = sock;
+				VLOG(3) << "[DEBUG] fd:" << sock << " addr:" << new_broker.second << " id:" << new_broker.first;
 				if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1) {
 					LOG(ERROR) << "Failed to add new server to epoll";
 					close(sock);
-					broker_fds_.pop_back();
 				} else {
 					std::pair<void*, msgIdx> msg(static_cast<void*>(malloc(buffer_size_)), msgIdx(0,0,0,new_broker.first,0));
 					std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(0,0,0,new_broker.first,0));
@@ -1148,7 +1170,7 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
 
-	Client c("127.0.0.1", std::to_string(BROKER_PORT), n/4);
+	Client c("127.0.0.1", std::to_string(BROKER_PORT), n + 1024);
 	std::cout << "Client Created" << std::endl;
 	c.CreateNewTopic(topic, order, seq_type);
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
@@ -1165,13 +1187,18 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
 }
 
-void SubscribeThroughputTest(){
+void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size){
 	LOG(INFO) << "[Subscribe Throuput Test] ";
 	char topic[TOPIC_NAME_SIZE];
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
+	auto start = std::chrono::high_resolution_clock::now();
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
-	sleep(10);
+	s.DEBUG_wait(total_msg_size, msg_size);
+	auto end = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> elapsed = end - start;
+	double seconds = elapsed.count();
+	LOG(INFO) << (total_msg_size/(1024*1024))/seconds << "MB/s";
 }
 
 int main(int argc, char* argv[]) {
@@ -1184,7 +1211,7 @@ int main(int argc, char* argv[]) {
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
 		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("1"))
-		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("4800"))
+		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("19200"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("1"))
