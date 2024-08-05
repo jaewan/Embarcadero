@@ -1,7 +1,7 @@
 # Run this script the first time you create this project
 #!/bin/bash
 
-set -x
+set -xe
 
 DO_CLEAN=false
 
@@ -9,6 +9,7 @@ function Clean_Previous_Artifacts()
 {
 	rm -rf build
 	rm -rf third_party
+	rm -rf ~/.CXL_EMUL
 }
 
 # Install System dependencies
@@ -33,11 +34,38 @@ function Install_Ubuntu_Dependencies()
 	
 	# install folly manually
 	cd third_party
-	git clone --depth 1 --branch v2024.03.11.00 https://github.com/facebook/folly.git
-	cd folly/build
-	cmake ..
-	sudo cmake --build . --target install
-	cd ../..
+	if [ -f "/usr/local/lib/libfolly.a" ]; then
+		echo "folly already installed; skipping build"
+	else
+		if [ -d "folly" ]; then
+			echo "folly already cloned; not re-cloning"
+		else
+			git clone --depth 1 --branch v2024.03.11.00 https://github.com/facebook/folly.git
+		fi
+		cd folly/build
+		cmake ..
+		sudo cmake --build . --target install
+		cd ../..
+	fi
+
+	# install mi_malloc manually
+	if [ -d "/usr/local/lib/mimalloc-2.1" ]; then
+		echo "mimalloc already installed; skipping build"
+	else
+		if [ -d "mimalloc" ]; then
+			echo "mimalloc already cloned; not re-cloning"
+		else
+			git clone --depth 1 --branch v2.1.7 https://github.com/microsoft/mimalloc.git
+		fi
+		cd mimalloc
+		mkdir -p out/release
+		cd out/release
+		cmake ../..
+		make
+		sudo make install
+		cd ../../..
+	fi
+	cd ..
 }
 
 function Install_RHEL_Dependencies()
@@ -56,18 +84,24 @@ function Install_RHEL_Dependencies()
 	# for grpc
 	sudo dnf install -y systemd-devel
 	sudo dnf install -y protobuf-devel protobuf-lite-devel
+
+	# TODO: install mi_malloc
 }
 
 function Download_Dependency_Source_Code()
 {
 	cd third_party
-	git clone --depth 1 --branch v3.2.0 https://github.com/jarro2783/cxxopts
+	if [ -d "cxxopts" ]; then
+		echo "cxxopts already cloned; not re-cloning"
+	else
+		git clone --depth 1 --branch v3.2.0 https://github.com/jarro2783/cxxopts
+	fi
 	cd ..
 }
 
 function Build_Project()
 {
-	mkdir build
+	mkdir -p build
 	cd build
 	cmake ..
 	cmake --build .
@@ -91,7 +125,7 @@ else
 	echo "Not cleaning artifacts from prevous setup/build"
 fi
 
-mkdir third_party
+mkdir -p third_party
 
 MY_DISTRO=$(awk -F= '/^NAME/{print $2}' /etc/os-release)
 echo "Distro: $MY_DISTRO"
@@ -104,6 +138,7 @@ else
 	Install_RHEL_Dependencies
 fi
 
+Install_Ubuntu_Dependencies
 Download_Dependency_Source_Code
 Setup_CXL
 Build_Project
