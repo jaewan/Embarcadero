@@ -5,67 +5,75 @@
 #include <vector>
 #include <optional>
 #include "folly/MPMCQueue.h"
-#include <string>
-#include "absl/strings/str_format.h"
-#include <grpcpp/grpcpp.h>
+#include "absl/synchronization/mutex.h"
+#include "absl/container/flat_hash_map.h"
 
 #include "common/config.h"
-#include <pubsub.grpc.pb.h>
-#include "../client/client.h"
-#include "../embarlet/req_queue.h"
-#include "../embarlet/ack_queue.h"
-
-using grpc::Server;
-using grpc::ServerAsyncResponseWriter;
-using grpc::ServerBuilder;
-using grpc::ServerCompletionQueue;
-using grpc::ServerContext;
-using grpc::Status;
+#include "../disk_manager/disk_manager.h"
+#include "../cxl_manager/cxl_manager.h"
 
 namespace Embarcadero{
 
 class CXLManager;
 class DiskManager;
-enum NetworkRequestType {Acknowledge, Receive, Send};
+
+enum ClientRequestType {Publish, Subscribe};
 
 struct NetworkRequest{
-	NetworkRequestType req_type;
 	int client_socket;
+	int efd;
+};
+
+struct alignas(32) SubscribeHeader{
+	int broker_id;
+	// Logical address of first and last msg
+	int first_id; 
+	int last_id;
+	// Total len of payload
+	size_t len;
 };
 
 struct alignas(64) EmbarcaderoReq{
-	size_t client_id;
-	size_t client_order;
-	size_t size;
+	uint16_t client_id;
+	uint32_t size;//Pub: Maximum size of messages in this batch
+	size_t client_order; // at Sub: used as last offset  set to -2 as sentinel value
+	void* last_addr; // Sub: address of last fetched msg
+	uint16_t ack;
+	uint32_t port;
+	ClientRequestType client_req;
 	char topic[32]; //This is to align thie struct as 64B
-	size_t ack;
 };
 
 class NetworkManager{
 	public:
-		NetworkManager(std::shared_ptr<AckQueue> ack_queue, 
-		std::shared_ptr<ReqQueue> cxl_req_queue, std::shared_ptr<ReqQueue> disk_req_queue,
-		int num_receive_threads=NUM_IO_RECEIVE_THREADS, int num_ack_threads=NUM_IO_ACK_THREADS);
+		NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads=NUM_NETWORK_IO_THREADS);
 		~NetworkManager();
 
+		void EnqueueRequest(struct NetworkRequest);
+		void SetDiskManager(DiskManager* disk_manager){disk_manager_ = disk_manager;}
+		void SetCXLManager(CXLManager* cxl_manager){cxl_manager_ = cxl_manager;}
+
 	private:
-		void ReceiveThread();
+		void ReqReceiveThread();
+		void MainThread();
 		void AckThread();
 
+		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
+		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
+		int broker_id_;
 		std::vector<std::thread> threads_;
-		int num_ack_threads_;
-
-		std::shared_ptr<AckQueue> ackQueue_;
-		std::shared_ptr<ReqQueue> reqQueueCXL_;
-		std::shared_ptr<ReqQueue> reqQueueDisk_;
+		int num_reqReceive_threads_;
 
 		std::atomic<int> thread_count_{0};
 		bool stop_threads_ = false;
 
-    std::vector<std::unique_ptr<ServerCompletionQueue>> cqs_;
-    PubSub::AsyncService service_;
-    std::unique_ptr<Server> server_;
+		absl::flat_hash_map<size_t, int> ack_connections_; // <client_id, ack_sock>
+		absl::Mutex ack_mu_;
+		int ack_efd_;
+		int ack_fd_ = -1;
 
+		CXLManager *cxl_manager_;
+		DiskManager *disk_manager_;
 };
 
 } // End of namespace Embarcadero
