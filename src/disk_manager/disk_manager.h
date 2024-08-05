@@ -6,22 +6,26 @@
 #include <optional>
 #include "folly/MPMCQueue.h"
 #include "common/config.h"
-#include "../embarlet/req_queue.h"
-#include "../embarlet/ack_queue.h"
+#include "../network_manager/network_manager.h"
 
 namespace Embarcadero{
 
+class NetworkManager;
+
 class DiskManager{
 	public:
-		DiskManager(std::shared_ptr<AckQueue> ack_queue, std::shared_ptr<ReqQueue> req_queue, int num_io_threads=NUM_DISK_IO_THREADS);
+		DiskManager(size_t queueCapacity, int num_io_threads=NUM_DISK_IO_THREADS);
 		~DiskManager();
+		void EnqueueRequest(struct PublishRequest);
+		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 
 	private:
 		void DiskIOThread();
 
 		std::vector<std::thread> threads_;
-		std::shared_ptr<ReqQueue> reqQueue_;
-		std::shared_ptr<AckQueue> ackQueue_;
+		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
+
+		NetworkManager *network_manager_;
 
 		int log_fd_;
 		std::atomic<int> offset_{0};

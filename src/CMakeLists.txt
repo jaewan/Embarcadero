@@ -1,5 +1,4 @@
-include(cmake/peer_grpc.cmake)
-include(cmake/pubsub_grpc.cmake)
+include(cmake/heartbeat_grpc.cmake)
 
 # These are required for a folly build
 # folly cmake mostly from pehere: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
@@ -10,23 +9,15 @@ configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
 add_executable(embarlet 
     embarlet/embarlet.cc
-    embarlet/req_queue.h
-    embarlet/req_queue.cc
-    embarlet/ack_queue.h
-    embarlet/ack_queue.cc
     disk_manager/disk_manager.cc 
     disk_manager/disk_manager.h 
     cxl_manager/cxl_manager.cc
     cxl_manager/cxl_manager.h 
     network_manager/network_manager.cc
     network_manager/network_manager.h 
-    network_manager/request_data.h
-    embarlet/peer.cc
+    embarlet/heartbeat.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
-    client/client.h
-    network_manager/network_manager.h
-    network_manager/network_manager.cc
 )
 
 target_include_directories(embarlet PUBLIC
@@ -35,12 +26,12 @@ target_include_directories(embarlet PUBLIC
 )
 
 target_link_libraries(embarlet
-	#glog:glog
+	numa
 	glog
 	gflags
+	mimalloc
     absl::flat_hash_map 
-    peer_grpc_proto
-    pubsub_grpc_proto
+    heartbeat_grpc_proto
     cxxopts::cxxopts
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
@@ -48,24 +39,23 @@ target_link_libraries(embarlet
     ${FOLLY_LIBRARIES}
 )
 
-add_executable(client
-    client/client.cc
-    client/client.h
+add_executable(throughput_test
+    client/throughput_test.cc
 )
 
-target_include_directories(client PUBLIC
+target_include_directories(throughput_test PUBLIC
 	"${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_BINARY_DIR}"
 )
 
-target_link_libraries(client
-	#glog:glog
+target_link_libraries(throughput_test 
 	glog
 	gflags
-    pubsub_grpc_proto
+	mimalloc
     cxxopts::cxxopts
-    #glog::glog
+    heartbeat_grpc_proto
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOF}
+    ${FOLLY_LIBRARIES}
 )

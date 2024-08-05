@@ -3,11 +3,8 @@
 
 #include <atomic>
 #include <cstddef>
-
-#include <pubsub.grpc.pb.h>
-
-// This is for debug logging
-#define NDEBUG
+#include <functional>
+#include "absl/container/btree_set.h"
 
 namespace Embarcadero{
 // the configured options and settings for Embarcadero
@@ -15,24 +12,20 @@ namespace Embarcadero{
 #define Embarcadero_VERSION_MINOR 1
 
 #define ORDER_LEVEL 1
-#define PORT 121416
-#define NUM_BROKERS 1
-
-#define CXL_SIZE (1UL<<37)
-#define MAX_TOPIC_SIZE 4
+#define PORT 1214
+#define BROKER_PORT 12140
+#define NUM_MAX_BROKERS 4
+#define CXL_SIZE (1UL<<36)
+#define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
-#define SEGMENT_SIZE (1UL << 37)
-#define NUM_DISK_IO_THREADS 64
-#define NUM_CXL_IO_THREADS 128
-#define NUM_NETWORK_IO_THREADS 4
-#define NUM_IO_RECEIVE_THREADS 66
-#define NUM_IO_ACK_THREADS 32 
-#define REQ_QUEUE_SIZE 100000
-#define ACK_QUEUE_SIZE 100000
-//This is the max message size && must be multiple of cacheline size
-#define BUFFER_SIZE (64UL<<4) 
+#define SEGMENT_SIZE (1UL << 32)
+#define NUM_DISK_IO_THREADS 8 
+#define NUM_CXL_IO_THREADS 16 
+#define NUM_NETWORK_IO_THREADS 8
+#define NUM_ACK_THREADS 1
 
 //********* Health check configs *********
+#define HEARTBEAT_INTERVAL 3 // in seconds
 /// The delay to send the first health check
 #define HEALTH_CHECK_INITIAL_DELAY_MS 5000
 /// The interval between two health checks
@@ -42,16 +35,21 @@ namespace Embarcadero{
 /// The threshold for the amount of retries we do before we consider a node dead.
 #define HEALTH_CHECK_FAILURE_THRESHOLD 5
 
-#define DEFAULT_CHANNEL "127.0.0.1:121416"
-
+//********* Health check configs *********
+#define CGROUP_CORE 85
 struct PublishRequest{
 	int client_id;
 	size_t client_order; // Must start from 0
 	char topic[TOPIC_NAME_SIZE];
 	bool acknowledge;
 	std::atomic<int> *counter;
-	void *grpcTag;
+	void* payload_address;
+	size_t size;
+	int client_socket;
 };
 
+using CreateTopicEntryCallback = std::function<bool(char*, int)>;
+using GetRegisteredBrokersCallback = std::function<void(absl::btree_set<int> &registered_brokers, 
+														struct MessageHeader** msg_to_order, struct TInode *tinode)>;
 } // End of namespace Embarcadero
 #endif // CONFIG_H
