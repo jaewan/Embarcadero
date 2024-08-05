@@ -256,8 +256,7 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 	return topic_manager_->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
 }
 
-void CXLManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType){
-	// topic_manager_->CreateNewTopic(topic, order);
+void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType){
 	if (order == 0)
 		return;
 	switch(sequencerType){
@@ -582,33 +581,51 @@ void ScalogSequencerService::ReceiveGlobalCut(std::vector<int> global_cut, const
 
 void CXLManager::Sequencer1(char* topic){
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
-	struct MessageHeader *msg_headers[NUM_MAX_BROKERS];
-	size_t seq = 0;
-    int perLogOff[NUM_MAX_BROKERS];
+	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
+	absl::btree_set<int> registered_brokers;
+	size_t perLogOff[NUM_MAX_BROKERS];
+	static size_t seq = 0;
 
-	for(int i = 0; i<NUM_MAX_BROKERS; i++){
-        while(tinode->offsets[i].log_offset == 0){}
-		msg_headers[i] = (struct MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[i].log_offset);
-        perLogOff[i] = -1;
+	for(int i = 0; i < NUM_MAX_BROKERS; i++){
+		msg_to_order[i] = (struct MessageHeader*)cxl_addr_;
+		perLogOff[i] = -1;
 	}
+
+	get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode);
+	auto last_updated = std::chrono::steady_clock::now();
+
 	while(!stop_threads_){
 		bool yield = true;
-		for(int i = 0; i<NUM_MAX_BROKERS; i++){
-            if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
-				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
-					LOG(ERROR) <<"!!!!!!!!!!!! [Sequencer1] Error msg_header is not equal to the perLogOff";
+		for(auto broker : registered_brokers){
+			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
+			//if(perLogOff[broker] < tinode->offsets[broker].written){//This ensures the message is Combined (all the other fields are filled)
+			if(msg_to_order[broker]->paddedSize != 0 && msg_logical_off != (size_t)-1 && msg_logical_off <= tinode->offsets[broker].written){//This ensures the message is Combined (all the other fields are filled)
+				if(msg_logical_off != perLogOff[broker]+1){
+					if(msg_logical_off != (size_t)-1 && msg_to_order[broker]->next_msg_diff != 0){
+						msg_to_order[broker] = (MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
+					}
+					continue;
 				}
-				msg_headers[i]->total_order = seq;
-				tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
-				perLogOff[i] = msg_headers[i]->logical_offset;
+				msg_to_order[broker]->total_order = seq;
+				tinode->offsets[broker].ordered = msg_logical_off;
+				tinode->offsets[broker].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
+				perLogOff[broker] = msg_logical_off;
 				seq++;
-				msg_headers[i] = (MessageHeader*)((uint8_t*)msg_headers[i] + msg_headers[i]->paddedSize);
 				yield = false;
+				if(msg_to_order[broker]->next_msg_diff != 0){
+					msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
+				}
 			}
-			//TODO(Jae) if multi segment is implemented as last message to have a dummy, this should be handled
 		}
-		if(yield)
+		if(yield){
+			get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode);
+			last_updated = std::chrono::steady_clock::now();
 			std::this_thread::yield();
+		}else if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()
+						- last_updated).count() >= HEARTBEAT_INTERVAL){
+			get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode);
+			last_updated = std::chrono::steady_clock::now();
+		}
 	}
 }
 

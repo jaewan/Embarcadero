@@ -13,6 +13,7 @@
 #include <glog/logging.h>
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/btree_set.h"
 #include "absl/synchronization/mutex.h"
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/alarm.h>
@@ -76,8 +77,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				else
 					reply->set_message("Trying to Register too many brokers. Increase NUM_MAX_BROKERS");
 			} else {
-				VLOG(3) << "Registering broker:" << broker_id;;
-				VLOG(3) << "Registering node:" << request->address();;
+				VLOG(3) << "Registering node:" << request->address() << " broker:" << broker_id;
 				nodes_[request->node_id()] = {broker_id, request->address(), request->address()+":"+std::to_string(broker_id+PORT), std::chrono::steady_clock::now()};
 				reply->set_success(true);
 				reply->set_broker_id(broker_id);
@@ -134,6 +134,30 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		int GetNumBrokers() {
 			absl::MutexLock lock(&mutex_);
 			return nodes_.size();
+		}
+
+		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
+														struct Embarcadero::MessageHeader** msg_to_order, struct Embarcadero::TInode *tinode){
+			absl::flat_hash_set<int> copy_set(registered_brokers.begin(), registered_brokers.end());
+			{
+				absl::MutexLock lock(&mutex_);
+				for(const auto &node:nodes_){
+					int broker_id = node.second.broker_id;
+					if(registered_brokers.find(broker_id) == registered_brokers.end()){
+						registered_brokers.insert(broker_id);
+						while(tinode->offsets[broker_id].log_offset == 0){
+							_mm_pause(); //yield can cause deadlock in grpc. Instead of yield, make it spin
+						}
+						msg_to_order[broker_id] = ((struct Embarcadero::MessageHeader*)((uint8_t*)msg_to_order[broker_id] + tinode->offsets[broker_id].log_offset));
+					}else{
+						copy_set.erase(broker_id);
+					}
+				}
+			}
+			for(auto broker_id : copy_set){
+				registered_brokers.erase(broker_id);
+				msg_to_order[broker_id] = nullptr;
+			}
 		}
 
 		absl::flat_hash_map<std::string, LocalNodeInfo> GetPeerBrokers() {
@@ -244,6 +268,14 @@ class HeartBeatManager{
 				return 0;
 			}
 			return follower_->GetBrokerId();
+		}
+		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
+														struct Embarcadero::MessageHeader** msg_to_order, struct Embarcadero::TInode *tinode){
+			if(is_head_node_){
+				service_->GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+			}else{
+				LOG(ERROR) << "GetRegisteredBrokers should not be called from non-head brokers, this it for sequencer";
+			}
 		}
 
 		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback){

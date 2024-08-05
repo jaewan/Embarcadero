@@ -85,6 +85,7 @@ class TopicManager{
 
 	private:
 		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]);
+		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order);
 		int GetTopicIdx(char topic[TOPIC_NAME_SIZE]){
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
 		}
