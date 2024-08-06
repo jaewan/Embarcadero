@@ -33,9 +33,9 @@ struct msgIdx{
 	size_t offset;
 	int broker_id;
 	int remaining_len;
+	bool metadata_received = false;
 	msgIdx(int f, int l, size_t o, int b, int r):first(f), last(l), offset(o), broker_id(b), remaining_len(r){}
 };
-#define NUM_BROKERS 4
 
 void RemoveNodeFromClientInfo(heartbeat_system::ClientInfo& client_info, int32_t node_to_remove) {
 	auto* nodes_info = client_info.mutable_nodes_info();
@@ -170,6 +170,12 @@ class Client{
 			}
 			for(auto &t : threads_)
 				t.join();
+			if(ack_thread_.joinable())
+				ack_thread_.join();
+			if(cluster_probe_thread_.joinable())
+				cluster_probe_thread_.join();
+
+			LOG(INFO) << "Destructed Client";
 		};
 
 		void Init(int num_threads, int msg_copy, char topic[TOPIC_NAME_SIZE], int ack_level, int order, size_t message_size){
@@ -299,6 +305,7 @@ class Client{
 			char buffer[1024];
 			size_t total_received = 0;
 			int EPOLL_TIMEOUT = 1; // 1 millisecond timeout
+			std::vector<int> client_sockets;
 
 			while (!shutdown_ || total_received < client_order_) {
 				int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
@@ -319,7 +326,10 @@ class Client{
 						event.data.fd = client_sock;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
 							std::cerr << "Failed to add client socket to epoll\n";
+							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 							close(client_sock);
+						} else {
+							client_sockets.push_back(client_sock);
 						}
 					} else {
 						// Data from existing client
@@ -338,21 +348,29 @@ class Client{
 							std::cout << "Client disconnected. Total bytes received: " << total_received << std::endl;
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 							close(client_sock);
+							client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
 						} else if (bytes_received == -1) {
 							if (errno != EAGAIN && errno != EWOULDBLOCK) {
 								// Error occurred
 								std::cerr << "recv error: " << strerror(errno) << std::endl;
 								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 								close(client_sock);
+								client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
 							}
 						}
 					}
 				}
 			}
 
+			// Close all remaining open client sockets
+			for (int client_sock : client_sockets) {
+				epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
+				close(client_sock);
+			}
+
 			// Cleanup
-			close(server_sock);
 			close(epoll_fd);
+			close(server_sock);
 		}
 
 		void AckThread(){
@@ -433,7 +451,7 @@ class Client{
 			struct epoll_event events[10]; // Adjust size as needed
 			bool running = true;
 			size_t sent_bytes = 0;
-			while (running) {
+			while (!shutdown_ && running) {
 				n = epoll_wait(efd, events, 10, -1);
 				for (i = 0; i < n; i++) {
 					if (events[i].events & EPOLLOUT) {
@@ -476,7 +494,7 @@ class Client{
 			while(!shutdown_){
 				pubQues_[pubQuesIdx].blockingRead(optReq);
 				if(!optReq.has_value()){
-					return;
+					break;
 				}
 				char* message = optReq.value();
 				header.client_order = client_order_.fetch_add(1);
@@ -662,23 +680,23 @@ class Subscriber{
 							if (bytes_received > 0) {
 								DEBUG_count_ += bytes_received;
 								m->offset += bytes_received;
-								if(m->remaining_len == 0){
+								if(!m->metadata_received){
 									if(m->offset < header_size){
 										continue;
 									}else{
 										Embarcadero::SubscribeHeader *header = (Embarcadero::SubscribeHeader*)buf;
 										CHECK_LT(header->len, buffer_size_) << "Subscribe batch is larger than buffer size";
-										VLOG(3) << "fd:" << fd << " batch_size:" << header->len;
+										VLOG(3) << "fd:" << fd << " batch_size:" << header->len << " received:" << m->offset;
 										m->remaining_len = header->len - m->offset;
 										m->first = header->first_id;
 										m->last = header->last_id;
 										m->broker_id = header->broker_id;
+										m->metadata_received = true;
 										break;
 									}
 								}else{
 									m->remaining_len -= bytes_received;
 								}
-
 							} else if (bytes_received == 0) {
 								LOG(ERROR) << "Server " << fd << " disconnected";
 								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
@@ -707,7 +725,6 @@ class Subscriber{
 				epoll_event ev;
 				ev.events = EPOLLIN | EPOLLET;
 				ev.data.fd = sock;
-				VLOG(3) << "[DEBUG] fd:" << sock << " addr:" << new_broker.second << " id:" << new_broker.first;
 				if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1) {
 					LOG(ERROR) << "Failed to add new server to epoll";
 					close(sock);
@@ -724,7 +741,13 @@ class Subscriber{
 					shake.last_addr = 0;
 					shake.client_req = Embarcadero::Subscribe;
 					memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
-					send(sock, &shake, sizeof(shake), 0);
+					int ret = send(sock, &shake, sizeof(shake), 0);
+					if(ret < 0){
+						LOG(ERROR) << "fd:" << sock << " addr:" << new_broker.second << " id:" << new_broker.first 
+							<< " failed:" << strerror(errno);
+					}else{
+						VLOG(3) << "Sub req sent:" << ret << " to:" << new_broker.first;
+					}
 				}
 			}
 			new_brokers_.clear();
@@ -1169,7 +1192,7 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
 
-	size_t q_size = n/4;
+	size_t q_size = n/3;
 	if(q_size < 1024){
 		q_size = 1024;
 	}
