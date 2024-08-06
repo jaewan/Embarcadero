@@ -42,6 +42,7 @@ int main(int argc, char* argv[]){
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
 
+	std::string head_addr = "127.0.0.1:" + std::to_string(BROKER_PORT);
 	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
 	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="HEAD_ADDR:PORT"
 	options.add_options()
@@ -60,14 +61,13 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Broker ********************** 
 	bool is_head_node = false;
-	std::string head_addr = "127.0.0.1:" + std::to_string(BROKER_PORT);
 
 	if (arguments.count("head")) {
 		is_head_node = true;
 	} else if (arguments.count("follower")) {
 		head_addr = arguments["follower"].as<std::string>();
 	} else {
-		LOG(ERROR) << "Invalid arguments";
+		LOG(INFO) << "head_addr is set to default:" << head_addr;
 	}
 	HeartBeatManager heartbeat_manager(is_head_node, head_addr);
 	int broker_id = heartbeat_manager.GetBrokerId();

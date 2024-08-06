@@ -72,10 +72,10 @@ class TopicManager{
 			cxl_manager_(cxl_manager),
 			broker_id_(broker_id),
 			num_topics_(0){
-				LOG(INFO) << "[TopicManager]\tConstructed";
+				LOG(INFO) << "[TopicManager]\t\tConstructed";
 			}
 		~TopicManager(){
-			LOG(INFO) << "[TopicManager]\tDestructed";
+			LOG(INFO) << "[TopicManager]\t\tDestructed";
 		}
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);

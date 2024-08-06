@@ -268,6 +268,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		combined_addr = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].ordered_offset;
 	}
 
+	//VLOG(3) << "combined_offset:" << combined_offset << " combined_addr:" << combined_addr;
 	if(combined_offset == (size_t)-1 || ((last_addr != nullptr) && (combined_offset <= last_offset))){
 		return false;
 	}
