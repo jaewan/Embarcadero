@@ -112,8 +112,8 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				CreateTopicResponse* reply){
 				char topic[TOPIC_NAME_SIZE] = {0};
 				memcpy(topic, request->topic().data(), request->topic().size());
-				reply->set_success(
-					create_topic_entry_callback_(topic, (int)request->order()));
+				bool success = create_topic_entry_callback_(topic, (int)request->order(), request->sequencer_type());
+				reply->set_success(success);
 				return Status::OK;
 		}
 

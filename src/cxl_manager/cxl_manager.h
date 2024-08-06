@@ -8,6 +8,7 @@
 #include "common/config.h"
 #include "../embarlet/topic_manager.h"
 #include "../network_manager/network_manager.h"
+#include <heartbeat.grpc.pb.h>
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_map.h"
 
@@ -17,7 +18,11 @@ class TopicManager;
 class NetworkManager;
 
 enum CXL_Type {Emul, Real};
-enum SequencerType {Embarcadero, Scalog, Corfu};
+using heartbeat_system::SequencerType;
+using heartbeat_system::SequencerType::EMBARCADERO;
+using heartbeat_system::SequencerType::KAFKA;
+using heartbeat_system::SequencerType::SCALOG;
+using heartbeat_system::SequencerType::CORFU;
 
 /* CXL memory layout
  *
@@ -41,6 +46,7 @@ struct alignas(32) offset_entry {
 struct alignas(64) TInode{
 	char topic[TOPIC_NAME_SIZE];
 	volatile uint8_t order;
+	SequencerType seq_type;
 	volatile offset_entry offsets[NUM_MAX_BROKERS];
 };
 

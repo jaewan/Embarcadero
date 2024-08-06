@@ -20,7 +20,7 @@ class Topic{
 	public:
 		Topic(GetNewSegmentCallback get_new_segment_callback, 
 				void* TInode_addr, const char* topic_name, int broker_id, int order,
-				void* cxl_addr, void* segment_metadata);
+				heartbeat_system::SequencerType, void* cxl_addr, void* segment_metadata);
 		~Topic(){
 			stop_threads_ = true;
 			for(std::thread& thread : combiningThreads_){
@@ -48,6 +48,7 @@ class Topic{
 		int broker_id_;
 		struct MessageHeader *last_message_header_;
 		int order_;
+		heartbeat_system::SequencerType seq_type_;
 		void* cxl_addr_;
 
 		size_t logical_offset_;
@@ -77,7 +78,7 @@ class TopicManager{
 		~TopicManager(){
 			LOG(INFO) << "[TopicManager]\t\tDestructed";
 		}
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order);
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
@@ -85,7 +86,7 @@ class TopicManager{
 
 	private:
 		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]);
-		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order);
+		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
 		int GetTopicIdx(char topic[TOPIC_NAME_SIZE]){
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
 		}

@@ -83,6 +83,8 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 }
 
 struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]){
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+	{
 	absl::MutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
 	if(topics_.find(topic)!= topics_.end()){
@@ -90,20 +92,23 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
 	void* segment_metadata = cxl_manager_.GetNewSegment();
-	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
 
 	//_mm_clflushopt(tinode);
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
-			tinode, topic, broker_id_, tinode->order, cxl_manager_.GetCXLAddr(), segment_metadata);
+			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
+	}
 
-	topics_[topic]->Combiner();
+	if(tinode->seq_type != KAFKA)
+		topics_[topic]->Combiner();
 	return tinode;
 }
 
-struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order){
+struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+	{
 	absl::MutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
 	if(topics_.find(topic)!= topics_.end()){
@@ -111,24 +116,26 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
 	void* segment_metadata = cxl_manager_.GetNewSegment();
-	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
-	tinode->order= (uint8_t)order;
+	tinode->order = (uint8_t)order;
+	tinode->seq_type = seq_type;
 	memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
 
 	//_mm_clflushopt(tinode);
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
-			tinode, topic, broker_id_, order, cxl_manager_.GetCXLAddr(), segment_metadata);
+			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
+	}
 
-	topics_[topic]->Combiner();
+	if(seq_type != KAFKA)
+		topics_[topic]->Combiner();
 	return tinode;
 }
 
-bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
-	if(CreateNewTopicInternal(topic, order)){
-		cxl_manager_.RunSequencer(topic, order, Embarcadero);
+bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
+	if(CreateNewTopicInternal(topic, order, seq_type)){
+		cxl_manager_.RunSequencer(topic, order, seq_type);
 		return true;
 	}else{
 		LOG(ERROR)<< "Topic already exists!!!";
@@ -168,12 +175,13 @@ bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
 }
 
 Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const char* topic_name,
-		int broker_id, int order, void* cxl_addr, void* segment_metadata):
+		int broker_id, int order, SequencerType seq_type, void* cxl_addr, void* segment_metadata):
 	get_new_segment_callback_(get_new_segment),
 	tinode_(static_cast<struct TInode*>(TInode_addr)),
 	topic_name_(topic_name),
 	broker_id_(broker_id),
 	order_(order),
+	seq_type_(seq_type),
 	cxl_addr_(cxl_addr),
 	current_segment_(segment_metadata){
 		logical_offset_ = 0;
@@ -297,22 +305,18 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		messages_size = (uint8_t*)combined_addr - (uint8_t*)start_msg_header + ((MessageHeader*)combined_addr)->paddedSize; 
 		last_offset = ((MessageHeader*)combined_addr)->logical_offset;
 		last_addr = (void*)combined_addr;
-		/*
 			 while(start_msg_header <= combined_addr){
-			 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
-			 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
+				 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
+				 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
 			 }
-			 */
 	}else{
 		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
-		/*
 			 while(start_msg_header <= last_msg_of_segment){
-			 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
-			 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
+				 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
+				 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
 			 }
-			 */
 	}
 
 

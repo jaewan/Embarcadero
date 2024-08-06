@@ -262,7 +262,6 @@ void NetworkManager::ReqReceiveThread(){
 						if(bytes_read <= 0){
 							if(bytes_read < 0)
 								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
-							VLOG(3) << "Receiving data: " << bytes_read << " gracefully closing connection";
 							mi_free(buf);
 							running = false;
 							break;

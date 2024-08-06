@@ -195,19 +195,19 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 	if (order == 0)
 		return;
 	switch(sequencerType){
-		case Embarcadero:
+		case EMBARCADERO:
 			if (order == 1)
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic);
 			else if (order == 2)
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic);
 			break;
-		case Scalog:
+		case SCALOG:
 			if (order == 1){
 				//TODO(Tony) fill this
 			}else if (order == 2)
 				LOG(ERROR) << "Order is set 2 at scalog";
 			break;
-		case Corfu:
+		case CORFU:
 			if (order == 1)
 				LOG(ERROR) << "Order is set 1 at corfu";
 			else if (order == 2){
