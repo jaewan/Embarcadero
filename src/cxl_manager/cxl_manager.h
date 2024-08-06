@@ -84,7 +84,7 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		void UpdateTotalOrdering(std::vector<int> global_cut, struct TInode *tinode);
 };
 
-enum CXLType {Emul, Real};
+enum CXL_Type {Emul, Real};
 enum SequencerType {Embarcadero, Scalog, Corfu};
 
 /* CXL memory layout
@@ -135,56 +135,27 @@ struct alignas(64) MessageHeader{
 
 class CXLManager {
 	public:
-		CXLManager(size_t queueCapacity, int broker_id, std::string head_address, int num_io_threads=NUM_CXL_IO_THREADS);
+		CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, std::string head_address, int num_io_threads);
 		~CXLManager();
 		void SetBroker(HeartBeatManager *broker){
 			broker_ = broker;
 		}
-		void SetTopicManager(TopicManager *topic_manager){
-			topic_manager_ = topic_manager;
-		}
-		void SetNetworkManager(NetworkManager* network_manager){
-			network_manager_ = network_manager;
-		}
+		void SetTopicManager(TopicManager *topic_manager){topic_manager_ = topic_manager;}
+		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		void EnqueueRequest(struct PublishRequest req);
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
-												void* &last_addr, void* &messages, size_t &messages_size);
+				void* &last_addr, void* &messages, size_t &messages_size);
 		void RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType);
-		void* GetCXLAddr(){
-			return cxl_addr_;
-		}
-		// void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
-		// 	get_registered_brokers_callback_ = callback;
-		// }
 		void StartScalogLocalSequencer(std::string topic_str);
 //#define InternalTest 1
-
-#ifdef InternalTest
-		std::atomic<bool> startInternalTest_{false};
-		std::atomic<size_t> reqCount_{0};;
-		std::vector<std::thread> testThreads_;
-		std::chrono::high_resolution_clock::time_point start;
-		void DummyReq();
-		void WriteDummyReq();
-		void StartInternalTest();
-#endif
-
-		void Wait1(){
-			while(DEBUG_1_passed_==false){
-				std::this_thread::yield();
-			}
-			return;
-		}
-		void Wait2(){
-			while(DEBUG_2_passed_ == false){
-				std::this_thread::yield();
-			}
-			return;
+		void* GetCXLAddr(){return cxl_addr_;}
+		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
+			get_registered_brokers_callback_ = callback;
 		}
 
-		private:
+	private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
 		int broker_id_;
 		std::string head_address_;
@@ -196,18 +167,15 @@ class CXLManager {
 		NetworkManager *network_manager_;
 		HeartBeatManager *broker_;
 
-		CXLType cxl_type_;
 		void* cxl_addr_;
 		void* bitmap_;
 		void* segments_;
 		void* current_log_addr_;
 		bool stop_threads_ = false;
 		std::atomic<int> thread_count_{0};
-		bool DEBUG_1_passed_ = false;
-		bool DEBUG_2_passed_ = false;
-		// GetRegisteredBrokersCallback get_registered_brokers_callback_;
+		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 
-		void CXL_io_thread();
+		void CXLIOThread();
 		void Sequencer1(char* topic);
 		void Sequencer2(char* topic);
 

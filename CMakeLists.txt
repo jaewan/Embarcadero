@@ -13,6 +13,7 @@ set(CMAKE_INSTALL_MESSAGE LAZY)
 set(CMAKE_PARALLEL_LEVEL 8)
 
 find_package(gflags REQUIRED)
+#find_package(glog REQUIRED)
 find_package(folly REQUIRED)
 add_subdirectory(third_party/cxxopts)
 

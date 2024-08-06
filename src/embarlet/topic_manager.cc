@@ -11,38 +11,38 @@ namespace Embarcadero{
 #define NT_THRESHOLD 128
 
 void memcpy_nt(void* dst, const void* src, size_t size) {
-    // Cast the input pointers to the appropriate types
-    uint8_t* d = static_cast<uint8_t*>(dst);
-    const uint8_t* s = static_cast<const uint8_t*>(src);
+	// Cast the input pointers to the appropriate types
+	uint8_t* d = static_cast<uint8_t*>(dst);
+	const uint8_t* s = static_cast<const uint8_t*>(src);
 
-    // Align the destination pointer to 16-byte boundary
-    size_t alignment = reinterpret_cast<uintptr_t>(d) & 0xF;
-    if (alignment) {
-        alignment = 16 - alignment;
-        size_t copy_size = (alignment > size) ? size : alignment;
-        std::memcpy(d, s, copy_size);
-        d += copy_size;
-        s += copy_size;
-        size -= copy_size;
-    }
+	// Align the destination pointer to 16-byte boundary
+	size_t alignment = reinterpret_cast<uintptr_t>(d) & 0xF;
+	if (alignment) {
+		alignment = 16 - alignment;
+		size_t copy_size = (alignment > size) ? size : alignment;
+		std::memcpy(d, s, copy_size);
+		d += copy_size;
+		s += copy_size;
+		size -= copy_size;
+	}
 
-    // Copy the bulk of the data using non-temporal stores
-    size_t block_size = size / 64;
-    for (size_t i = 0; i < block_size; ++i) {
-        _mm_stream_si64(reinterpret_cast<long long*>(d), *reinterpret_cast<const long long*>(s));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 8), *reinterpret_cast<const long long*>(s + 8));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 16), *reinterpret_cast<const long long*>(s + 16));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 24), *reinterpret_cast<const long long*>(s + 24));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 32), *reinterpret_cast<const long long*>(s + 32));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 40), *reinterpret_cast<const long long*>(s + 40));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 48), *reinterpret_cast<const long long*>(s + 48));
-        _mm_stream_si64(reinterpret_cast<long long*>(d + 56), *reinterpret_cast<const long long*>(s + 56));
-        d += 64;
-        s += 64;
-    }
+	// Copy the bulk of the data using non-temporal stores
+	size_t block_size = size / 64;
+	for (size_t i = 0; i < block_size; ++i) {
+		_mm_stream_si64(reinterpret_cast<long long*>(d), *reinterpret_cast<const long long*>(s));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 8), *reinterpret_cast<const long long*>(s + 8));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 16), *reinterpret_cast<const long long*>(s + 16));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 24), *reinterpret_cast<const long long*>(s + 24));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 32), *reinterpret_cast<const long long*>(s + 32));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 40), *reinterpret_cast<const long long*>(s + 40));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 48), *reinterpret_cast<const long long*>(s + 48));
+		_mm_stream_si64(reinterpret_cast<long long*>(d + 56), *reinterpret_cast<const long long*>(s + 56));
+		d += 64;
+		s += 64;
+	}
 
-    // Copy the remaining data using standard memcpy
-    std::memcpy(d, s, size % 64);
+	// Copy the remaining data using standard memcpy
+	std::memcpy(d, s, size % 64);
 }
 void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	static size_t CACHE_LINE_SIZE = sysconf (_SC_LEVEL1_DCACHE_LINESIZE);
@@ -82,6 +82,37 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	memcpy(dst, src, n);
 }
 
+struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]){
+	absl::MutexLock lock(&mutex_);
+	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
+	if(topics_.find(topic)!= topics_.end()){
+		return nullptr;
+	}
+	static void* cxl_addr = cxl_manager_.GetCXLAddr();
+	void* segment_metadata = cxl_manager_.GetNewSegment();
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+	tinode->offsets[broker_id_].ordered = -1;
+	tinode->offsets[broker_id_].written = -1;
+	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
+
+	//_mm_clflushopt(tinode);
+	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
+			tinode, topic, broker_id_, tinode->order, cxl_manager_.GetCXLAddr(), segment_metadata);
+
+	topics_[topic]->Combiner();
+
+	if (broker_id_ != 0 && tinode->seqType == 1){
+		std::cout << "Starting Scalog Local Sequencer in CreateNewTopicInternal" << std::endl;
+
+		std::string topic_str(topic);
+		std::thread scalogSequencerThread(&CXLManager::StartScalogLocalSequencer, &cxl_manager_, topic_str);
+		scalogSequencerThread.detach();
+		// cxl_manager_.StartScalogLocalSequencer(topic);
+	}
+
+	return tinode;
+}
+
 struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order){
 	absl::MutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
@@ -100,10 +131,12 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 	//_mm_clflushopt(tinode);
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
 			tinode, topic, broker_id_, order, cxl_manager_.GetCXLAddr(), segment_metadata);
-	
+
 	topics_[topic]->Combiner();
 
 	if (broker_id_ != 0 && tinode->seqType == 1){
+		std::cout << "Starting Scalog Local Sequencer in CreateNewTopicInternal" << std::endl;
+
 		std::string topic_str(topic);
 		std::thread scalogSequencerThread(&CXLManager::StartScalogLocalSequencer, &cxl_manager_, topic_str);
 		scalogSequencerThread.detach();
@@ -115,7 +148,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 
 bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int seqType){
 
-	if(CreateNewTopicInternal(topic, order)){
+	struct TInode* tinode = CreateNewTopicInternal(topic, order);
+	if(tinode != nullptr){
+		tinode->seqType = seqType;
 		if (seqType == 1) {
 			std::string topic_str(topic);
 			std::thread scalogSequencerThread(&CXLManager::StartScalogLocalSequencer, &cxl_manager_, topic_str);
@@ -135,6 +170,7 @@ void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
 void TopicManager::PublishToCXL(PublishRequest &req){
+	std::cout << "Publishing to CXL" << std::endl;
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
@@ -154,7 +190,7 @@ void TopicManager::PublishToCXL(PublishRequest &req){
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
-																	void* &last_addr, void* &messages, size_t &messages_size){
+		void* &last_addr, void* &messages, size_t &messages_size){
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()){
 		perror("Topic not found");
@@ -163,21 +199,21 @@ bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
 }
 
 Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const char* topic_name,
-					int broker_id, int order, void* cxl_addr, void* segment_metadata):
-						get_new_segment_callback_(get_new_segment),
-						tinode_(static_cast<struct TInode*>(TInode_addr)),
-						topic_name_(topic_name),
-						broker_id_(broker_id),
-						order_(order),
-						cxl_addr_(cxl_addr),
-						current_segment_(segment_metadata){
-	logical_offset_ = 0;
-	written_logical_offset_ = (size_t)-1;
-	log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
-	first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
-	ordered_offset_addr_ = nullptr;
-	ordered_offset_ = 0;
-}
+		int broker_id, int order, void* cxl_addr, void* segment_metadata):
+	get_new_segment_callback_(get_new_segment),
+	tinode_(static_cast<struct TInode*>(TInode_addr)),
+	topic_name_(topic_name),
+	broker_id_(broker_id),
+	order_(order),
+	cxl_addr_(cxl_addr),
+	current_segment_(segment_metadata){
+		logical_offset_ = 0;
+		written_logical_offset_ = (size_t)-1;
+		log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
+		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
+		ordered_offset_addr_ = nullptr;
+		ordered_offset_ = 0;
+	}
 
 void Topic::CombinerThread(){
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
@@ -207,7 +243,7 @@ void Topic::CombinerThread(){
 		header->next_msg_diff = header->paddedSize;
 		tinode_->offsets[broker_id_].written = logical_offset_;
 		(*(unsigned long long int*)segment_header) =
-		(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
+			(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
 		written_logical_offset_ = logical_offset_;
 		written_physical_addr_ = (void*)header;
 		header = (MessageHeader*)((uint8_t*)header + header->next_msg_diff);
@@ -259,7 +295,7 @@ void Topic::PublishToCXL(PublishRequest &req){
 // if the messages to export go over the segment boundary (not-contiguous), 
 // we should call this functiona again. Try calling it if it returns true
 bool Topic::GetMessageAddr(size_t &last_offset,
-						   void* &last_addr, void* &messages, size_t &messages_size){
+		void* &last_addr, void* &messages, size_t &messages_size){
 	size_t combined_offset = written_logical_offset_;
 	void* combined_addr = written_physical_addr_;
 	if(order_ > 0){
@@ -296,38 +332,25 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		last_offset = ((MessageHeader*)combined_addr)->logical_offset;
 		last_addr = (void*)combined_addr;
 		/*
-			while(start_msg_header <= combined_addr){
-				VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
-				start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
-			}
-			*/
+			 while(start_msg_header <= combined_addr){
+			 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
+			 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
+			 }
+			 */
 	}else{
 		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
 		/*
-			while(start_msg_header <= last_msg_of_segment){
-				VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
-				start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
-			}
-			*/
+			 while(start_msg_header <= last_msg_of_segment){
+			 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
+			 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
+			 }
+			 */
 	}
 
-
-#ifdef DEBUG
-	struct MessageHeader *m = (struct MessageHeader*)messages;
-	size_t len = messages_size;
-	while(len>0){
-		char* msg = (char*)((uint8_t*)m + sizeof(struct MessageHeader);
-		std::cout << " total_order:" << m->total_order<< " logical_order:" <<
-		m->logical_offset << " client_order::" << m->client_order << std::endl;
-		len -= m->paddedSize;
-		m =  (struct MessageHeader*)((uint8_t*)m + m->next_msg_diff);
-	}
-#endif
 
 	return true;
 }
-
 
 } // End of namespace Embarcadero

@@ -9,7 +9,7 @@
 
 namespace Embarcadero{
 
-#define DISK_LOG_PATH "/home/domin/Jae/Embarcadero/.DiskLog/log"
+#define DISK_LOG_PATH "embarc.disklog"
 
 DiskManager::DiskManager(size_t queueCapacity, 
 						 int num_io_threads):
@@ -22,7 +22,7 @@ DiskManager::DiskManager(size_t queueCapacity,
 	}
 	// Create Disk I/O threads
 	for (int i=0; i< num_io_threads_; i++)
-		threads_.emplace_back(&DiskManager::Disk_io_thread, this);
+		threads_.emplace_back(&DiskManager::DiskIOThread, this);
 
 	while(thread_count_.load() != num_io_threads_){}
 	LOG(INFO) << "[DiskManager]: \tCreated";
@@ -48,7 +48,7 @@ void DiskManager::EnqueueRequest(struct PublishRequest req){
 	requestQueue_.blockingWrite(req);
 }
 
-void DiskManager::Disk_io_thread(){
+void DiskManager::DiskIOThread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct PublishRequest> optReq;
 
@@ -70,9 +70,6 @@ void DiskManager::Disk_io_thread(){
 			struct NetworkRequest ackReq;
 			ackReq.client_socket = req.client_socket;
 			network_manager_->EnqueueRequest(ackReq);
-			//TODO(Jae)
-			//Enque ack request to network manager
-			// network_manager_.EnqueueAckRequest();
 		}
 	}
 }

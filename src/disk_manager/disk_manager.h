@@ -17,12 +17,10 @@ class DiskManager{
 		DiskManager(size_t queueCapacity, int num_io_threads=NUM_DISK_IO_THREADS);
 		~DiskManager();
 		void EnqueueRequest(struct PublishRequest);
-		void SetNetworkManager(NetworkManager* network_manager){
-			network_manager_ = network_manager;
-		}
+		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 
 	private:
-		void Disk_io_thread();
+		void DiskIOThread();
 
 		std::vector<std::thread> threads_;
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;

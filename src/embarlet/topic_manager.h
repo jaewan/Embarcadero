@@ -34,10 +34,10 @@ class Topic{
 		Topic(const Topic &) = delete;
 		Topic& operator=(const Topic &) = delete;
 
-		
+
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(size_t &last_offset,
-							void* &last_addr, void* &messages, size_t &messages_size);
+				void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
 
 	private:
@@ -49,7 +49,7 @@ class Topic{
 		struct MessageHeader *last_message_header_;
 		int order_;
 		void* cxl_addr_;
-		
+
 		size_t logical_offset_;
 		size_t written_logical_offset_;
 		void* written_physical_addr_;
@@ -69,11 +69,11 @@ class Topic{
 class TopicManager{
 	public:
 		TopicManager(CXLManager &cxl_manager, int broker_id):
-									cxl_manager_(cxl_manager),
-									broker_id_(broker_id),
-									num_topics_(0){
-			LOG(INFO) << "[TopicManager]\tConstructed";
-		}
+			cxl_manager_(cxl_manager),
+			broker_id_(broker_id),
+			num_topics_(0){
+				LOG(INFO) << "[TopicManager]\tConstructed";
+			}
 		~TopicManager(){
 			LOG(INFO) << "[TopicManager]\tDestructed";
 		}
@@ -81,7 +81,7 @@ class TopicManager{
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
-												void* &last_addr, void* &messages, size_t &messages_size);
+				void* &last_addr, void* &messages, size_t &messages_size);
 
 	private:
 		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]);

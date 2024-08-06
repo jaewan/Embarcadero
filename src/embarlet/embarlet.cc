@@ -1,6 +1,4 @@
 #include "common/config.h"
-#include "pub_queue.h"
-#include "pub_task.h"
 #include "heartbeat.h"
 #include "topic_manager.h"
 #include "../disk_manager/disk_manager.h"
@@ -24,16 +22,16 @@ bool CheckAvailableCores(){
 	CPU_ZERO(&mask);
 
 	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
-			perror("sched_getaffinity");
-			exit(EXIT_FAILURE);
+		perror("sched_getaffinity");
+		exit(EXIT_FAILURE);
 	}
 
 	printf("This process can run on CPUs: ");
 	for (int i = 0; i < CPU_SETSIZE; i++) {
-			if (CPU_ISSET(i, &mask)) {
-					printf("%d ", i);
-					num_cores++;
-			}
+		if (CPU_ISSET(i, &mask)) {
+			printf("%d ", i);
+			num_cores++;
+		}
 	}
 	return num_cores == CGROUP_CORE;
 }
@@ -47,11 +45,11 @@ int main(int argc, char* argv[]){
 	cxxopts::Options options("Embarcadero", "A totally ordered pub/sub system with CXL");
 	// Ex: you can add arguments on command line like ./embarcadero --head or ./embarcadero --follower="HEAD_ADDR:PORT"
 	options.add_options()
-			("head", "Head Node")
-			("follower", "Follower Address and Port", cxxopts::value<std::string>())
-			("e,emul", "Use emulation instead of CXL")
-			("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-			("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
+		("head", "Head Node")
+		("follower", "Follower Address and Port", cxxopts::value<std::string>())
+		("e,emul", "Use emulation instead of CXL")
+		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
+		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		;
 
 	auto arguments = options.parse(argc, argv);
@@ -81,16 +79,22 @@ int main(int argc, char* argv[]){
 		return -1;
 	}
 
+	Embarcadero::CXL_Type cxl_type = Embarcadero::CXL_Type::Real;
+	if (arguments.count("emul")) {
+		cxl_type = Embarcadero::CXL_Type::Emul;
+		LOG(WARNING) << "Using emulated CXL";
+	}
+
 	// *************** Initializing Managers ********************** 
 	// Queue Size (1UL<<22)(1UL<<25)(1UL<<25) respectly performed 6GB/s 1kb message disk thread:8 cxl:16 network: 32
-	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id, head_addr);
+	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id, cxl_type, head_addr, NUM_CXL_IO_THREADS);
 	Embarcadero::DiskManager disk_manager((1UL<<25));
-	Embarcadero::NetworkManager network_manager((1UL<<25), broker_id, NUM_NETWORK_IO_THREADS, false);
+	Embarcadero::NetworkManager network_manager((1UL<<25), broker_id, NUM_NETWORK_IO_THREADS);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-	// if(is_head_node){
-	// 	cxl_manager.RegisterGetRegisteredBrokersCallback(std::bind(&HeartBeatManager::GetRegisteredBrokers, &heartbeat_manager, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-	// }
+	if(is_head_node){
+		cxl_manager.RegisterGetRegisteredBrokersCallback(std::bind(&Embarcadero::HeartBeatManager::GetRegisteredBrokers, &heartbeat_manager, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+	}
 
 	cxl_manager.SetBroker(&heartbeat_manager);
 	cxl_manager.SetTopicManager(&topic_manager);
@@ -99,28 +103,7 @@ int main(int argc, char* argv[]){
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
 
-	// //********* Load Generate **************
-	// char topic[31];
-	// memset(topic, 0, 31);
-	// topic[0] = '0';
-	// int order = 0;
-	// topic_manager.CreateNewTopic(topic, order);
-
-	// //********* Load Generate For Scalog **************
-	// char topic[31];
-	// memset(topic, 0, 31);
-	// topic[0] = '0';
-	// if (is_head_node) {
-	// 	int order = 1;
-	// 	cxl_manager.CreateNewTopic(topic, order, Embarcadero::Scalog);
-	// }
-
-
-	// t = &topic_manager;
-	// ScalogOrderTest(&cxl_manager, topic);
-
 	LOG(INFO) << "You are now safe to go";
-	//cxl_manager.StartInternalTest();
 	
 	// *************** Wait unless there's a failure ********************** 
 	heartbeat_manager.Wait();

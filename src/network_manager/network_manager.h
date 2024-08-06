@@ -5,7 +5,6 @@
 #include <vector>
 #include <optional>
 #include "folly/MPMCQueue.h"
-//#include "folly/ConcurrentSkipList.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/container/flat_hash_map.h"
 
@@ -47,28 +46,17 @@ struct alignas(64) EmbarcaderoReq{
 
 class NetworkManager{
 	public:
-		NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads=NUM_NETWORK_IO_THREADS,
-									 bool test=false);
+		NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads=NUM_NETWORK_IO_THREADS);
 		~NetworkManager();
-		void EnqueueRequest(struct NetworkRequest);
-		void SetDiskManager(DiskManager* disk_manager){
-			disk_manager_ = disk_manager;
-		}
-		void SetCXLManager(CXLManager* cxl_manager){
-			cxl_manager_ = cxl_manager;
-		}
 
-		void WaitUntilAcked(){
-			while(!test_acked_all_){}
-			return;
-		}
+		void EnqueueRequest(struct NetworkRequest);
+		void SetDiskManager(DiskManager* disk_manager){disk_manager_ = disk_manager;}
+		void SetCXLManager(CXLManager* cxl_manager){cxl_manager_ = cxl_manager;}
 
 	private:
 		void ReqReceiveThread();
 		void MainThread();
 		void AckThread();
-		void TestAckThread();
-		int GetBuffer();
 
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
@@ -78,10 +66,7 @@ class NetworkManager{
 
 		std::atomic<int> thread_count_{0};
 		bool stop_threads_ = false;
-		volatile bool test_acked_all_ = false;
 
-		//using SkipList= folly::ConcurrentSkipList<int>;
-		//std::shared_ptr<SkipList> socketFdList;
 		absl::flat_hash_map<size_t, int> ack_connections_; // <client_id, ack_sock>
 		absl::Mutex ack_mu_;
 		int ack_efd_;
