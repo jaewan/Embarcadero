@@ -91,7 +91,7 @@ int main(int argc, char* argv[]){
 	Embarcadero::DiskManager disk_manager((1UL<<25));
 	Embarcadero::NetworkManager network_manager((1UL<<25), broker_id, NUM_NETWORK_IO_THREADS);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
-	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, std::placeholders::_2));
+	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 	if(is_head_node){
 		cxl_manager.RegisterGetRegisteredBrokersCallback(std::bind(&HeartBeatManager::GetRegisteredBrokers, &heartbeat_manager, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 	}
