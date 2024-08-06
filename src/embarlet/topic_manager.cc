@@ -190,12 +190,18 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
+		if(seq_type == KAFKA){
+			WriteToCXLFunc = &Topic::WriteToCXLWithMutex;
+			VLOG(3) << "Kafka Sequencer is selected";
+		}else{
+			WriteToCXLFunc = &Topic::WriteToCXL;
+			VLOG(3) << "Kafka Sequencer is not selected:" << seq_type;
+		}
 	}
 
 void Topic::CombinerThread(){
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
-	size_t DEBUG_num_ordered = 0;
 	while(!stop_threads_){
 		while(header->paddedSize == 0){
 			if(stop_threads_){
@@ -220,7 +226,6 @@ void Topic::CombinerThread(){
 		written_logical_offset_ = logical_offset_;
 		written_physical_addr_ = (void*)header;
 		header = (MessageHeader*)((uint8_t*)header + header->next_msg_diff);
-		DEBUG_num_ordered++;
 		logical_offset_++;
 	}
 }
@@ -233,7 +238,7 @@ void Topic::Combiner(){
 
 // MessageHeader is already included from network manager
 // For performance (to not have any mutex) have a separate combiner to give logical offsets  to the messages
-void Topic::PublishToCXL(PublishRequest &req){
+void Topic::WriteToCXL(PublishRequest &req){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 
@@ -257,6 +262,54 @@ void Topic::PublishToCXL(PublishRequest &req){
 		}
 	}
 	memcpy_nt((void*)log, req.payload_address, msgSize);
+}
+
+void Topic::WriteToCXLWithMutex(PublishRequest &req){
+	static const size_t msg_header_size = sizeof(struct MessageHeader);
+	unsigned long long int log;
+	size_t logical_offset;
+	bool new_segment_alloced = false;
+
+	MessageHeader *header = (MessageHeader*)req.payload_address;
+	size_t reqSize = req.size + msg_header_size;
+	size_t padding = req.size%CACHELINE_SIZE;
+	if(padding)
+		padding = (CACHELINE_SIZE - padding);
+	size_t msgSize = reqSize + padding;
+
+	{
+		absl::MutexLock lock(&mutex_);
+		log = log_addr_;
+		log_addr_ += msgSize;
+		logical_offset = logical_offset_;
+		logical_offset_++;
+		if((unsigned long long int)current_segment_ + SEGMENT_SIZE <= log_addr_){
+			LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+			//TODO(Jae) Finish below segment boundary crossing code
+			new_segment_alloced = true;
+		}
+	}
+	header->segment_header = current_segment_;
+	header->logical_offset = logical_offset;
+	if(new_segment_alloced){
+		//TODO(Jae) Finish below segment boundary crossing code
+		header->next_msg_diff = header->paddedSize;
+	}else
+		header->next_msg_diff = header->paddedSize;
+
+	memcpy_nt((void*)log, req.payload_address, msgSize);
+
+	{
+		absl::MutexLock lock(&written_mutex_);
+		if(written_logical_offset_ == (size_t)-1 || written_logical_offset_ < logical_offset){
+			written_physical_addr_ = (void*)log;
+			written_logical_offset_ = logical_offset;
+			tinode_->offsets[broker_id_].written = logical_offset;
+			(*(unsigned long long int*)current_segment_) =
+				(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
+			VLOG(3) << "[DEBUG] Kafka write last msg of:" << ((uint8_t*)log - (uint8_t*)current_segment_);
+		}
+	}
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message
@@ -305,20 +358,11 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		messages_size = (uint8_t*)combined_addr - (uint8_t*)start_msg_header + ((MessageHeader*)combined_addr)->paddedSize; 
 		last_offset = ((MessageHeader*)combined_addr)->logical_offset;
 		last_addr = (void*)combined_addr;
-			 while(start_msg_header <= combined_addr){
-				 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
-				 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
-			 }
 	}else{
 		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
-			 while(start_msg_header <= last_msg_of_segment){
-				 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
-				 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
-			 }
 	}
-
 
 	return true;
 }

@@ -34,14 +34,19 @@ class Topic{
 		Topic(const Topic &) = delete;
 		Topic& operator=(const Topic &) = delete;
 
+		void PublishToCXL(PublishRequest &req){
+			(this->*WriteToCXLFunc)(req);
+		}
 
-		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
 
 	private:
 		void CombinerThread();
+		void (Topic::*WriteToCXLFunc)(PublishRequest &req);
+		void WriteToCXL(PublishRequest &req);
+		void WriteToCXLWithMutex(PublishRequest &req);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		std::string topic_name_;
@@ -57,6 +62,8 @@ class Topic{
 		std::atomic<unsigned long long int> log_addr_;
 		//TODO(Jae) set this to nullptr if the sement is GCed
 		void* first_message_addr_;
+		absl::Mutex mutex_;
+		absl::Mutex written_mutex_;
 
 		//TInode cache
 		void* ordered_offset_addr_;

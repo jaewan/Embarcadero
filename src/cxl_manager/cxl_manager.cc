@@ -195,6 +195,7 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 	if (order == 0)
 		return;
 	switch(sequencerType){
+		case KAFKA: // Kafka is just a way to not run CombinerThread, not actual sequencer
 		case EMBARCADERO:
 			if (order == 1)
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic);
