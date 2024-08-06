@@ -111,7 +111,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, s
 	// Wait untill al IO threads are up
 	while(thread_count_.load() != num_io_threads_){}
 
-	LOG(INFO) << "[CXLManager]: \tConstructed";
+	LOG(INFO) << "[CXLManager]: \t\tConstructed";
 	return;
 }
 
@@ -137,7 +137,7 @@ CXLManager::~CXLManager(){
 		}
 	}
 
-	LOG(INFO) << "[CXLManager]: \tDestructed";
+	LOG(INFO) << "[CXLManager]: \t\tDestructed";
 }
 
 

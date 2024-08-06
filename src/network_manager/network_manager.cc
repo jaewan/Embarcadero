@@ -48,7 +48,7 @@ NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqR
 			threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
 
 		while(thread_count_.load() != (1 + NUM_ACK_THREADS + num_reqReceive_threads_)){}
-		LOG(INFO) << "[NetworkManager]: \tCreated";
+		LOG(INFO) << "[NetworkManager]: \tConstructed";
 }
 
 NetworkManager::~NetworkManager(){
@@ -165,7 +165,6 @@ void NetworkManager::ReqReceiveThread(){
 								if(read > sizeof(MessageHeader)){
 									header = (MessageHeader*)buf;
 									if(header->client_id == -1){
-										VLOG(3) << "Last message received:";
 										free(buf);
 										running = false;
 										//TODO(Jae) we do not want to close it for ack
@@ -267,7 +266,7 @@ void NetworkManager::ReqReceiveThread(){
 							mi_free(buf);
 							running = false;
 							break;
-						}						
+						}
 						to_read -= bytes_read;
 						//TODO(Jae) Change this to malloc here to allow dynamic message size during one connection
 						if(to_read == 0){
@@ -282,6 +281,8 @@ void NetworkManager::ReqReceiveThread(){
 
 							buf = mi_malloc(READ_SIZE);
 							to_read = READ_SIZE;
+						}else if(to_read < 0){
+							VLOG(3) << " to_read:" << to_read;
 						}
 					}
 #endif
@@ -297,12 +298,11 @@ void NetworkManager::ReqReceiveThread(){
 
 					while(!stop_threads_){
 						size_t messages_size = 0;
+
 						if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
 							reply_shake.len = messages_size;
-							//reply_shake.first_id = ((MessageHeader*)messages)->logical_offset;
-							reply_shake.first_id = 0;
+							reply_shake.first_id = ((MessageHeader*)messages)->logical_offset;
 							reply_shake.last_id = last_offset;
-							VLOG(3) << "[DEBUG] broker:" << broker_id_ << " sub reply " << messages_size;
 							// Send
 							size_t ret = send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
 							if(ret < 0){
@@ -326,6 +326,11 @@ void NetworkManager::ReqReceiveThread(){
 								}
 							}
 						}else{
+							char c;
+							if(recv(req.client_socket, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0){
+								LOG(INFO) << "Subscribe Connection is closed :" << req.client_socket ;
+								return ;
+							}
 							std::this_thread::yield();
 						}
 					}
@@ -375,7 +380,7 @@ void NetworkManager::AckThread(){
 			int result = recv(ack_fd_, buf, 1, MSG_PEEK | MSG_DONTWAIT);
 			if(result == 0){
 				LOG(INFO) << "Connection is closed ack_fd_:" << ack_fd_ ;
-				stop_threads_ = true;
+				//stop_threads_ = true;
 				break;
 			}
 		}
