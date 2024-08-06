@@ -1295,7 +1295,6 @@ int main(int argc, char* argv[]) {
 		LOG(ERROR) << "CGroup core throttle is wrong";
 		return -1;
 	}
-	return 0;
 
 	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 	SubscribeThroughputTest(total_message_size, message_size);
