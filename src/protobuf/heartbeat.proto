@@ -3,10 +3,17 @@ syntax = "proto3";
 package heartbeat_system;
 
 service HeartBeat {
-  rpc RegisterNode (NodeInfo) returns (RegistrationStatus);
-  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+	rpc RegisterNode (NodeInfo) returns (RegistrationStatus);
+	rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 	rpc GetClusterStatus (ClientInfo) returns (ClusterStatus);
 	rpc CreateNewTopic(CreateTopicRequest) returns (CreateTopicResponse);
+}
+
+enum SequencerType{
+	EMBARCADERO = 0;
+	KAFKA = 1;
+	SCALOG = 2;
+	CORFU = 3;
 }
 
 message ClientInfo{
@@ -14,35 +21,35 @@ message ClientInfo{
 }
 
 message ClusterStatus{
-  repeated string new_nodes = 1;
-  repeated int32 removed_nodes = 2;
+	repeated string new_nodes = 1;
+	repeated int32 removed_nodes = 2;
 }
 
 message NodeInfo {
-  string node_id = 1;
-  string address = 2;
+	string node_id = 1;
+	string address = 2;
 }
 
 message RegistrationStatus {
-  bool success = 1;
-  int64 broker_id = 2;
-  string message = 3;
+	bool success = 1;
+	int64 broker_id = 2;
+	string message = 3;
 }
 
 message HeartbeatRequest {
-  string node_id = 1;
+	string node_id = 1;
 }
 
 message HeartbeatResponse {
-  bool alive = 1;
+	bool alive = 1;
 }
 
 message CreateTopicRequest {
-  string topic = 1;
+	string topic = 1;
 	int32 order = 2;
-  int32 seq_type = 3;
+	SequencerType sequencer_type = 3;
 }
 
 message CreateTopicResponse {
-  bool success = 1;
+	bool success = 1;
 }

@@ -20,7 +20,7 @@ class Topic{
 	public:
 		Topic(GetNewSegmentCallback get_new_segment_callback, 
 				void* TInode_addr, const char* topic_name, int broker_id, int order,
-				void* cxl_addr, void* segment_metadata);
+				heartbeat_system::SequencerType, void* cxl_addr, void* segment_metadata);
 		~Topic(){
 			stop_threads_ = true;
 			for(std::thread& thread : combiningThreads_){
@@ -34,20 +34,26 @@ class Topic{
 		Topic(const Topic &) = delete;
 		Topic& operator=(const Topic &) = delete;
 
+		void PublishToCXL(PublishRequest &req){
+			(this->*WriteToCXLFunc)(req);
+		}
 
-		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
 
 	private:
 		void CombinerThread();
+		void (Topic::*WriteToCXLFunc)(PublishRequest &req);
+		void WriteToCXL(PublishRequest &req);
+		void WriteToCXLWithMutex(PublishRequest &req);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		std::string topic_name_;
 		int broker_id_;
 		struct MessageHeader *last_message_header_;
 		int order_;
+		heartbeat_system::SequencerType seq_type_;
 		void* cxl_addr_;
 
 		size_t logical_offset_;
@@ -56,6 +62,8 @@ class Topic{
 		std::atomic<unsigned long long int> log_addr_;
 		//TODO(Jae) set this to nullptr if the sement is GCed
 		void* first_message_addr_;
+		absl::Mutex mutex_;
+		absl::Mutex written_mutex_;
 
 		//TInode cache
 		void* ordered_offset_addr_;
@@ -77,7 +85,7 @@ class TopicManager{
 		~TopicManager(){
 			LOG(INFO) << "[TopicManager]\t\tDestructed";
 		}
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int seqType);
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		void PublishToCXL(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
@@ -85,7 +93,7 @@ class TopicManager{
 
 	private:
 		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]);
-		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order);
+		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
 		int GetTopicIdx(char topic[TOPIC_NAME_SIZE]){
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
 		}

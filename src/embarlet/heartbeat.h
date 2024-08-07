@@ -122,8 +122,8 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				CreateTopicResponse* reply){
 				char topic[TOPIC_NAME_SIZE] = {0};
 				memcpy(topic, request->topic().data(), request->topic().size());
-				reply->set_success(
-					create_topic_entry_callback_(topic, (int)request->order(), (int)request->seq_type()));
+				bool success = create_topic_entry_callback_(topic, (int)request->order(), request->sequencer_type());
+				reply->set_success(success);
 				return Status::OK;
 		}
 
@@ -180,7 +180,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 class FollowerNodeClient {
 	public:
 		FollowerNodeClient(const std::string& node_id, const std::string& address,
-				const std::shared_ptr<grpc::Channel>& heartbeat_channel, const std::shared_ptr<grpc::Channel>& scalog_channel);
+				const std::shared_ptr<grpc::Channel>& heartbeat_channel);
 
 		~FollowerNodeClient() {
 			shutdown_ = true;
@@ -203,10 +203,6 @@ class FollowerNodeClient {
 		std::string GetNodeId() const { return node_id_; }
 		std::string GetAddress() const { return address_; }
 
-		std::unique_ptr<ScalogSequencer::Stub> GetScalogStub() {
-			return std::move(scalog_stub_);
-		}
-
 	private:
 		struct AsyncClientCall {
 			HeartbeatResponse reply;
@@ -226,7 +222,6 @@ class FollowerNodeClient {
 		void HeartBeatLoop();
 
 		std::unique_ptr<HeartBeat::Stub> stub_;
-		std::unique_ptr<ScalogSequencer::Stub> scalog_stub_;
 		std::string node_id_;
 		std::string address_;
 		grpc::CompletionQueue cq_;
@@ -250,7 +245,6 @@ class HeartBeatManager{
 					server_ = builder.BuildAndStart();
 				}else{
 					follower_ = std::make_unique<FollowerNodeClient>(GenerateUniqueId(), GetAddress(), 
-							grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials()),
 							grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials()));
 				}
 			}
@@ -290,13 +284,6 @@ class HeartBeatManager{
 				return GetAddress()+":"+std::to_string(0+PORT);
 			}
 			return GetAddress()+":"+std::to_string(follower_->GetBrokerId()+PORT);
-		}
-
-		std::unique_ptr<ScalogSequencer::Stub> GetScalogStub(){
-			if (is_head_node_) {
-				return nullptr;
-			}
-			return follower_->GetScalogStub();
 		}
 
 		int GetNumBrokers() {

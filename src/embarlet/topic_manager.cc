@@ -83,6 +83,8 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 }
 
 struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]){
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+	{
 	absl::MutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
 	if(topics_.find(topic)!= topics_.end()){
@@ -90,30 +92,29 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
 	void* segment_metadata = cxl_manager_.GetNewSegment();
-	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
 
 	//_mm_clflushopt(tinode);
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
-			tinode, topic, broker_id_, tinode->order, cxl_manager_.GetCXLAddr(), segment_metadata);
-
-	topics_[topic]->Combiner();
-
-	if (broker_id_ != 0 && tinode->seqType == 1){
-		std::cout << "Starting Scalog Local Sequencer in CreateNewTopicInternal" << std::endl;
-
-		std::string topic_str(topic);
-		std::thread scalogSequencerThread(&CXLManager::StartScalogLocalSequencer, &cxl_manager_, topic_str);
-		scalogSequencerThread.detach();
-		// cxl_manager_.StartScalogLocalSequencer(topic);
+			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
+	if(tinode->seq_type != KAFKA)
+		topics_[topic]->Combiner();
+
+		if (broker_id_ != 0 && tinode->seq_type == SCALOG){
+			std::cout << "Starting Scalog Local Sequencer in CreateNewTopicInternal" << std::endl;
+
+			cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
+		}
 	return tinode;
 }
 
-struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order){
+struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+	{
 	absl::MutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
 	if(topics_.find(topic)!= topics_.end()){
@@ -121,44 +122,26 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
 	void* segment_metadata = cxl_manager_.GetNewSegment();
-	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
-	tinode->order= (uint8_t)order;
+	tinode->order = (uint8_t)order;
+	tinode->seq_type = seq_type;
 	memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
 
 	//_mm_clflushopt(tinode);
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
-			tinode, topic, broker_id_, order, cxl_manager_.GetCXLAddr(), segment_metadata);
-
-	topics_[topic]->Combiner();
-
-	if (broker_id_ != 0 && tinode->seqType == 1){
-		std::cout << "Starting Scalog Local Sequencer in CreateNewTopicInternal" << std::endl;
-
-		std::string topic_str(topic);
-		std::thread scalogSequencerThread(&CXLManager::StartScalogLocalSequencer, &cxl_manager_, topic_str);
-		scalogSequencerThread.detach();
-		// cxl_manager_.StartScalogLocalSequencer(topic);
+			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
-
+	
+	if(seq_type != KAFKA)
+		topics_[topic]->Combiner();
 	return tinode;
 }
 
-bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int seqType){
-
-	struct TInode* tinode = CreateNewTopicInternal(topic, order);
-	if(tinode != nullptr){
-		tinode->seqType = seqType;
-		if (seqType == 1) {
-			std::string topic_str(topic);
-			std::thread scalogSequencerThread(&CXLManager::StartScalogLocalSequencer, &cxl_manager_, topic_str);
-			scalogSequencerThread.detach();
-			// cxl_manager_.StartScalogLocalSequencer(topic);
-		}
-
-		// cxl_manager_.RunSequencer(topic, order, Embarcadero);
+bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
+	if(CreateNewTopicInternal(topic, order, seq_type)){
+		cxl_manager_.RunSequencer(topic, order, seq_type);
 		return true;
 	}else{
 		LOG(ERROR)<< "Topic already exists!!!";
@@ -170,7 +153,6 @@ void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
 void TopicManager::PublishToCXL(PublishRequest &req){
-	std::cout << "Publishing to CXL" << std::endl;
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
@@ -199,12 +181,13 @@ bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
 }
 
 Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const char* topic_name,
-		int broker_id, int order, void* cxl_addr, void* segment_metadata):
+		int broker_id, int order, SequencerType seq_type, void* cxl_addr, void* segment_metadata):
 	get_new_segment_callback_(get_new_segment),
 	tinode_(static_cast<struct TInode*>(TInode_addr)),
 	topic_name_(topic_name),
 	broker_id_(broker_id),
 	order_(order),
+	seq_type_(seq_type),
 	cxl_addr_(cxl_addr),
 	current_segment_(segment_metadata){
 		logical_offset_ = 0;
@@ -213,12 +196,18 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
+		if(seq_type == KAFKA){
+			WriteToCXLFunc = &Topic::WriteToCXLWithMutex;
+			VLOG(3) << "Kafka Sequencer is selected";
+		}else{
+			WriteToCXLFunc = &Topic::WriteToCXL;
+			VLOG(3) << "Kafka Sequencer is not selected:" << seq_type;
+		}
 	}
 
 void Topic::CombinerThread(){
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
-	size_t DEBUG_num_ordered = 0;
 	while(!stop_threads_){
 		while(header->paddedSize == 0){
 			if(stop_threads_){
@@ -247,7 +236,6 @@ void Topic::CombinerThread(){
 		written_logical_offset_ = logical_offset_;
 		written_physical_addr_ = (void*)header;
 		header = (MessageHeader*)((uint8_t*)header + header->next_msg_diff);
-		DEBUG_num_ordered++;
 		logical_offset_++;
 	}
 }
@@ -260,7 +248,7 @@ void Topic::Combiner(){
 
 // MessageHeader is already included from network manager
 // For performance (to not have any mutex) have a separate combiner to give logical offsets  to the messages
-void Topic::PublishToCXL(PublishRequest &req){
+void Topic::WriteToCXL(PublishRequest &req){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 
@@ -284,6 +272,54 @@ void Topic::PublishToCXL(PublishRequest &req){
 		}
 	}
 	memcpy_nt((void*)log, req.payload_address, msgSize);
+}
+
+void Topic::WriteToCXLWithMutex(PublishRequest &req){
+	static const size_t msg_header_size = sizeof(struct MessageHeader);
+	unsigned long long int log;
+	size_t logical_offset;
+	bool new_segment_alloced = false;
+
+	MessageHeader *header = (MessageHeader*)req.payload_address;
+	size_t reqSize = req.size + msg_header_size;
+	size_t padding = req.size%CACHELINE_SIZE;
+	if(padding)
+		padding = (CACHELINE_SIZE - padding);
+	size_t msgSize = reqSize + padding;
+
+	{
+		absl::MutexLock lock(&mutex_);
+		log = log_addr_;
+		log_addr_ += msgSize;
+		logical_offset = logical_offset_;
+		logical_offset_++;
+		if((unsigned long long int)current_segment_ + SEGMENT_SIZE <= log_addr_){
+			LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+			//TODO(Jae) Finish below segment boundary crossing code
+			new_segment_alloced = true;
+		}
+	}
+	header->segment_header = current_segment_;
+	header->logical_offset = logical_offset;
+	if(new_segment_alloced){
+		//TODO(Jae) Finish below segment boundary crossing code
+		header->next_msg_diff = header->paddedSize;
+	}else
+		header->next_msg_diff = header->paddedSize;
+
+	memcpy_nt((void*)log, req.payload_address, msgSize);
+
+	{
+		absl::MutexLock lock(&written_mutex_);
+		if(written_logical_offset_ == (size_t)-1 || written_logical_offset_ < logical_offset){
+			written_physical_addr_ = (void*)log;
+			written_logical_offset_ = logical_offset;
+			tinode_->offsets[broker_id_].written = logical_offset;
+			(*(unsigned long long int*)current_segment_) =
+				(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
+			VLOG(3) << "[DEBUG] Kafka write last msg of:" << ((uint8_t*)log - (uint8_t*)current_segment_);
+		}
+	}
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message
@@ -332,24 +368,11 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		messages_size = (uint8_t*)combined_addr - (uint8_t*)start_msg_header + ((MessageHeader*)combined_addr)->paddedSize; 
 		last_offset = ((MessageHeader*)combined_addr)->logical_offset;
 		last_addr = (void*)combined_addr;
-		/*
-			 while(start_msg_header <= combined_addr){
-			 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
-			 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
-			 }
-			 */
 	}else{
 		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
-		/*
-			 while(start_msg_header <= last_msg_of_segment){
-			 VLOG(3) << "broker:" << broker_id_ << "logical_order:" << start_msg_header->logical_offset << " total_order:" <<  start_msg_header->total_order;
-			 start_msg_header = (MessageHeader*)((uint8_t*)start_msg_header + 1024);
-			 }
-			 */
 	}
-
 
 	return true;
 }

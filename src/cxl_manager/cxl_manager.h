@@ -8,6 +8,7 @@
 #include "common/config.h"
 #include "../embarlet/topic_manager.h"
 #include "../network_manager/network_manager.h"
+#include <heartbeat.grpc.pb.h>
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_map.h"
 #include <grpcpp/grpcpp.h>
@@ -23,7 +24,7 @@ class HeartBeatManager;
 
 class ScalogSequencerService : public ScalogSequencer::Service {
 	public:
-		ScalogSequencerService(CXLManager* cxl_manager, int broker_id, const char* topic, HeartBeatManager *broker, void* cxl_addr);
+		ScalogSequencerService(CXLManager* cxl_manager, int broker_id, const char* topic, HeartBeatManager *broker, void* cxl_addr, std::string head_address);
 
 		absl::flat_hash_map<std::string, std::vector<int>> GetGlobalCut() {
 			return global_cut_;
@@ -51,6 +52,8 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		HeartBeatManager *broker_;
 		int broker_id_;
 		void* cxl_addr_;
+		std::string head_address_;
+		std::unique_ptr<ScalogSequencer::Stub> stub_;
 
 		absl::flat_hash_map<std::string, int> local_epoch_;
 
@@ -65,6 +68,8 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		absl::flat_hash_map<std::string, bool> has_global_sequencer_;
 
 		absl::flat_hash_map<std::string, bool> received_gobal_seq_after_interval_;
+
+		absl::flat_hash_map<int, std::unique_ptr<ScalogSequencer::Stub>> follower_stubs_;
 
         /// Thread to run the io_service in a loop
         std::unique_ptr<std::thread> io_service_thread_;
@@ -85,7 +90,11 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 };
 
 enum CXL_Type {Emul, Real};
-enum SequencerType {Embarcadero, Scalog, Corfu};
+using heartbeat_system::SequencerType;
+using heartbeat_system::SequencerType::EMBARCADERO;
+using heartbeat_system::SequencerType::KAFKA;
+using heartbeat_system::SequencerType::SCALOG;
+using heartbeat_system::SequencerType::CORFU;
 
 /* CXL memory layout
  *
@@ -109,8 +118,8 @@ struct alignas(32) offset_entry {
 struct alignas(64) TInode{
 	char topic[TOPIC_NAME_SIZE];
 	volatile uint8_t order;
+	SequencerType seq_type;
 	volatile offset_entry offsets[NUM_MAX_BROKERS];
-	int seqType;
 };
 
 struct NonCriticalMessageHeader{

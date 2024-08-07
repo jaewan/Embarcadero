@@ -13,6 +13,8 @@
 #include <numaif.h>
 #include <glog/logging.h>
 #include "mimalloc.h"
+#include <sys/socket.h>
+#include <netdb.h>
 
 namespace Embarcadero{
 
@@ -194,43 +196,28 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 }
 
 void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType){
+	std::cout << "Order: " << order << std::endl;
 	if (order == 0)
 		return;
 	switch(sequencerType){
-		case Embarcadero:
+		case KAFKA: // Kafka is just a way to not run CombinerThread, not actual sequencer
+		case EMBARCADERO:
 			if (order == 1)
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic);
 			else if (order == 2)
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic);
 			break;
-		case Scalog:
+		case SCALOG:
 			if (order == 1){
-				// std::cout << "Starting scalog sequencer in head" << std::endl;
-
-				// // Set scalog_has_global_sequencer_ to true
-				// scalog_has_global_sequencer_[topic] = true;
-
-				// scalog_received_global_seq_[topic] = false;
-
-				// scalog_received_gobal_seq_after_interval_[topic] = false;
-
-				// scalog_local_epoch_[topic] = 0;
-
-				// // Start scalog_io_service_thread_
-				// scalog_io_service_thread_ = std::make_unique<std::thread>([this] {
-				// 	// Keep io_service_ alive.
-				// 	boost::asio::io_service::work io_service_work_(scalog_io_service_);
-				// 	scalog_io_service_.run();
-				// });
-
-				// scalog_io_service_.dispatch([this, topic] {
-				// 	std::cout << "Sending local cuts for topic " << topic << " to global sequencer" << std::endl;
-				// 	ScalogLocalSequencer(topic);
-				// });
+				std::cout << "Starting scalog sequencer for topic: " << topic << std::endl;
+				// std::thread scalogSequencerThread(&CXLManager::StartScalogLocalSequencer, &cxl_manager_, topic_str);
+				// scalogSequencerThread.detach();
+				std::string topic_str(topic);
+				sequencerThreads_.emplace_back(&CXLManager::StartScalogLocalSequencer, this, topic_str);
 			} else if (order == 2)
 				LOG(ERROR) << "Order is set 2 at scalog";
 			break;
-		case Corfu:
+		case CORFU:
 			if (order == 1)
 				LOG(ERROR) << "Order is set 1 at corfu";
 			else if (order == 2){
@@ -246,27 +233,50 @@ void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
 
 	const char* topic = topic_str.c_str();
 
-	scalog_sequencer_service_ = std::make_unique<ScalogSequencerService>(this, broker_id_, topic, broker_, cxl_addr_);
-	ServerBuilder builder;
-	builder.AddListeningPort(head_address_, grpc::InsecureServerCredentials());
-	builder.RegisterService(scalog_sequencer_service_.get());
-	scalog_server_ = builder.BuildAndStart();
-	scalog_server_->Wait();
+	scalog_sequencer_service_ = std::make_unique<ScalogSequencerService>(this, broker_id_, topic, broker_, cxl_addr_, head_address_);
+
+	if (broker_id_ == 0) {
+		ServerBuilder builder;
+		builder.AddListeningPort(head_address_, grpc::InsecureServerCredentials());
+		builder.RegisterService(scalog_sequencer_service_.get());
+		scalog_server_ = builder.BuildAndStart();
+		std::cout << "Scalog sequencer listening on " << head_address_ << std::endl;
+		scalog_server_->Wait();
+	} else {
+		std::string follower_url = "127.0.0.1:" + std::to_string(BROKER_PORT + 1 + broker_id_);
+		std::cout << "Follower url: " << follower_url << std::endl;
+		ServerBuilder builder;
+		builder.AddListeningPort(follower_url, grpc::InsecureServerCredentials());
+		builder.RegisterService(scalog_sequencer_service_.get());
+		scalog_server_ = builder.BuildAndStart();
+		std::cout << "Scalog sequencer listening on " << follower_url << std::endl;
+		scalog_server_->Wait();
+	}
 }
 
-ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int broker_id, const char* topic, HeartBeatManager* broker, void* cxl_addr) :
+std::unique_ptr<ScalogSequencer::Stub> ScalogSequencerService::GetRpcClient(std::string peer_url) {
+    std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(peer_url, grpc::InsecureChannelCredentials());
+    return ScalogSequencer::NewStub(channel);
+}
+
+ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int broker_id, const char* topic, HeartBeatManager* broker, void* cxl_addr, std::string head_address) :
 	cxl_manager_(cxl_manager),
 	broker_id_(broker_id),
 	timer_(io_service_),
 	broker_(broker),
-	cxl_addr_(cxl_addr) {
+	cxl_addr_(cxl_addr),
+	head_address_(head_address) {
 
 	if (broker_id_ == 0) {
 		std::cout << "Starting scalog sequencer in head for topic: " << topic << std::endl;
 		has_global_sequencer_[topic] = true;
+		global_epoch_[topic] = 0;
 	} else {
 		has_global_sequencer_[topic] = false;
 	}
+
+	std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials());
+    stub_ = ScalogSequencer::NewStub(channel);
 
 	received_global_seq_[topic] = false;
 
@@ -360,17 +370,19 @@ void ScalogSequencerService::SendLocalCut(int epoch, int written, const char* to
 		auto callback = [](grpc::Status status) {
 			if (!status.ok()) {
 				std::cout << "Error sending local cut: " << status.error_message() << std::endl;
+
+				std::cout << "Error code: " << status.error_code() << std::endl;
 			}
 		};
 
-		// Async call to HandleStartLocalSequencer
-		broker_->GetScalogStub()->async()->HandleSendLocalCut(&context, &request, &response, callback);
-	}
-}
+		std::cout << "Sending local cut to: " << head_address_ << std::endl;
 
-std::unique_ptr<ScalogSequencer::Stub> ScalogSequencerService::GetRpcClient(std::string peer_url) {
-    std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(peer_url, grpc::InsecureChannelCredentials());
-    return ScalogSequencer::NewStub(channel);
+		// Async call to HandleStartLocalSequencer
+		// auto rpc_client = GetRpcClient(head_address_);
+		// rpc_client->async()->HandleSendLocalCut(&context, &request, &response, callback);
+		// rpc_client->HandleSendLocalCut(&context, request, &response);
+		stub_->async()->HandleSendLocalCut(&context, &request, &response, callback);
+	}
 }
 
 void ScalogSequencerService::ReceiveLocalCut(int epoch, int local_cut, const char* topic, int broker_id) {
@@ -399,10 +411,11 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, int local_cut, const cha
 		// Iterate through broker list and call async grpc to send global cut
 		for (auto const& peer : broker_->GetPeerBrokers()) {
 
-			std::string peer_url = peer.second.network_mgr_addr;
-			auto rpc_client = GetRpcClient(peer_url);
-
-			std::cout << "Sending global cut to " << peer_url << std::endl;
+			std::string follower_url = "127.0.0.1:" + std::to_string(BROKER_PORT + 1 + peer.second.broker_id);
+			if (follower_stubs_.find(peer.second.broker_id) == follower_stubs_.end()) {
+				std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(follower_url, grpc::InsecureChannelCredentials());
+				follower_stubs_[peer.second.broker_id] = ScalogSequencer::NewStub(channel);
+			}
 
 			SendGlobalCutRequest request;
 			for (int value : global_cut_[topic]) {
@@ -414,11 +427,15 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, int local_cut, const cha
 
 			auto callback = [](grpc::Status status) {
 				if (!status.ok()) {
-					std::cout << "Error sending global cut request" << std::endl;
+					std::cout << "Error sending global cut request: " << status.error_message() << std::endl;
 				}
 			};
 
-			rpc_client->async()->HandleSendGlobalCut(&context, &request, &response, callback);
+			std::cout << "Sending global cut to " << follower_url << std::endl;
+
+			follower_stubs_[peer.second.broker_id]->async()->HandleSendGlobalCut(&context, &request, &response, callback);
+
+			std::cout << "Finished sending global cut to " << follower_url << std::endl;
 		}
 
 		local_cuts_count_[topic] = 0;
@@ -479,12 +496,12 @@ void ScalogSequencerService::UpdateTotalOrdering(std::vector<int> global_cut, st
 }
 
 grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response) {
-  const char* topic = request->topic().c_str();
+  	std::cout << "Received local cut with grpc" << std::endl;
+	
+	const char* topic = request->topic().c_str();
 	int epoch = request->epoch();
 	int local_cut = request->local_cut();
 	int broker_id = request->broker_id();
-
-	std::cout << "Received local cut with grpc" << std::endl;
 
 	ReceiveLocalCut(epoch, local_cut, topic, broker_id);
 

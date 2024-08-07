@@ -87,7 +87,8 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Managers ********************** 
 	// Queue Size (1UL<<22)(1UL<<25)(1UL<<25) respectly performed 6GB/s 1kb message disk thread:8 cxl:16 network: 32
-	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id, cxl_type, head_addr, NUM_CXL_IO_THREADS);
+	std::string scalog_head_addr = "127.0.0.1:" + std::to_string(BROKER_PORT + 1);
+	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id, cxl_type, scalog_head_addr, NUM_CXL_IO_THREADS);
 	Embarcadero::DiskManager disk_manager((1UL<<25));
 	Embarcadero::NetworkManager network_manager((1UL<<25), broker_id, NUM_NETWORK_IO_THREADS);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);

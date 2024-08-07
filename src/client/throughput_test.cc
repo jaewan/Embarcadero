@@ -27,6 +27,8 @@
 #include "../cxl_manager/cxl_manager.h"
 
 using heartbeat_system::HeartBeat;
+using heartbeat_system::SequencerType;
+
 struct msgIdx{
 	int first;
 	int last;
@@ -211,13 +213,13 @@ class Client{
 			return;
 		}
 
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int seqType){
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
 			grpc::ClientContext context;
 			heartbeat_system::CreateTopicRequest create_topic_req;;
 			heartbeat_system::CreateTopicResponse create_topic_reply;;
 			create_topic_req.set_topic(topic);
 			create_topic_req.set_order(order);
-			create_topic_req.set_seq_type(seqType);
+			create_topic_req.set_sequencer_type(seq_type);
 			grpc::Status status = stub_->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
 			if(status.ok()){
 				return create_topic_reply.success();
@@ -746,8 +748,6 @@ class Subscriber{
 					if(ret < 0){
 						LOG(ERROR) << "fd:" << sock << " addr:" << new_broker.second << " id:" << new_broker.first 
 							<< " failed:" << strerror(errno);
-					}else{
-						VLOG(3) << "Sub req sent:" << ret << " to:" << new_broker.first;
 					}
 				}
 			}
@@ -1185,7 +1185,7 @@ void ThroughputTestRaw(size_t total_message_size, size_t message_size, int num_t
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 }
 
-void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, int seq_type){
+void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
 	int n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
@@ -1198,13 +1198,14 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 		q_size = 1024;
 	}
 	Client c("127.0.0.1", std::to_string(BROKER_PORT), q_size);
-	std::cout << "Client Created" << std::endl;
+	LOG(INFO) << "Client Created" ;
 	c.CreateNewTopic(topic, order, seq_type);
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
 	auto start = std::chrono::high_resolution_clock::now();
 	for(int i=0; i<n; i++){
 		c.Publish(message);
 	}
+	while(true) {}
 	c.Poll(n);
 
 	auto end = std::chrono::high_resolution_clock::now();
@@ -1228,6 +1229,44 @@ void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size){
 	LOG(INFO) << (total_msg_size/(1024*1024))/seconds << "MB/s";
 }
 
+void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
+	int n = total_message_size/message_size;
+	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
+	std::string message(message_size, 0);
+	char topic[TOPIC_NAME_SIZE];
+	memset(topic, 0, TOPIC_NAME_SIZE);
+	memcpy(topic, "TestTopic", 9);
+
+	size_t q_size = n/3;
+	if(q_size < 1024){
+		q_size = 1024;
+	}
+	Client c("127.0.0.1", std::to_string(BROKER_PORT), q_size);
+	LOG(INFO) << "Client Created" ;
+	c.CreateNewTopic(topic, order, seq_type);
+	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
+	c.Init(num_threads, 0, topic, ack_level, order, message_size);
+
+	auto start = std::chrono::high_resolution_clock::now();
+	for(int i=0; i<n; i++){
+		c.Publish(message);
+	}
+	s.DEBUG_wait(total_message_size, message_size);
+	auto end = std::chrono::high_resolution_clock::now();
+
+	auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
+	LOG(INFO) << "Runtime: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
+
+}
+
+heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
+    if (value == "EMBARCADERO") return heartbeat_system::SequencerType::EMBARCADERO;
+    if (value == "KAFKA") return heartbeat_system::SequencerType::KAFKA;
+    if (value == "SCALOG") return heartbeat_system::SequencerType::SCALOG;
+    if (value == "CORFU") return heartbeat_system::SequencerType::CORFU;
+	 	throw std::runtime_error("Invalid SequencerType: " + value);
+}
+
 int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
@@ -1238,11 +1277,11 @@ int main(int argc, char* argv[]) {
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
 		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("1"))
+		("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", cxxopts::value<std::string>()->default_value("SCALOG"))
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("19200"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("1"))
-		("st,seq_type", "Type of sequencer to use", cxxopts::value<int>()->default_value("1"));
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("2"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
@@ -1250,7 +1289,7 @@ int main(int argc, char* argv[]) {
 	size_t num_threads = result["num_thread"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
-	int seq_type = result["seq_type"].as<int>();
+	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 	FLAGS_v = result["log_level"].as<int>();
 
 	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){

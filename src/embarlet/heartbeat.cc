@@ -30,10 +30,9 @@ void HeartBeatServiceImpl::CheckHeartbeats(){
 //************************* Client Part *************************
 
 FollowerNodeClient::FollowerNodeClient(const std::string& node_id, const std::string& address,
-		const std::shared_ptr<grpc::Channel>& heartbeat_channel, const std::shared_ptr<grpc::Channel>& scalog_channel)
+		const std::shared_ptr<grpc::Channel>& heartbeat_channel)
 	: node_id_(node_id), address_(address), head_alive_(true), wait_called_(false) {
 		stub_ = HeartBeat::NewStub(heartbeat_channel);
-		scalog_stub_ = ScalogSequencer::NewStub(scalog_channel);
 		Register();
 		heartbeat_thread_ = std::thread([this]() {
 				this->HeartBeatLoop();
