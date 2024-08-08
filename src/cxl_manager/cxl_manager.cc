@@ -109,7 +109,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 	// Wait untill al IO threads are up
 	while(thread_count_.load() != num_io_threads_){}
 
-	LOG(INFO) << "[CXLManager]: \t\tConstructed";
+	LOG(INFO) << "\t[CXLManager]: \tConstructed";
 	return;
 }
 
@@ -218,50 +218,53 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 	}
 }
 
+void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
+														struct MessageHeader** msg_to_order, struct TInode *tinode){
+	if(get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode)){
+		for(const auto &broker_id : registered_brokers){
+			// Wait for other brokers to initialize this topic. 
+			// This is here to avoid contention in grpc(hearbeat) which can cause deadlock when rpc is called
+			// while waiting for other brokers to initialize (untill publish is called)
+			while(tinode->offsets[broker_id].log_offset == 0){
+				std::this_thread::yield();
+			}
+			msg_to_order[broker_id] = ((struct Embarcadero::MessageHeader*)((uint8_t*)msg_to_order[broker_id] + tinode->offsets[broker_id].log_offset));
+		}
+	}
+}
+
 void CXLManager::Sequencer1(char* topic){
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
-	size_t perLogOff[NUM_MAX_BROKERS];
 	static size_t seq = 0;
 
 	for(int i = 0; i < NUM_MAX_BROKERS; i++){
 		msg_to_order[i] = (struct MessageHeader*)cxl_addr_;
-		perLogOff[i] = -1;
 	}
-
-	get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode);
+	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 	auto last_updated = std::chrono::steady_clock::now();
 
 	while(!stop_threads_){
 		bool yield = true;
 		for(auto broker : registered_brokers){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
-			if(msg_to_order[broker]->paddedSize != 0 && msg_logical_off != (size_t)-1 && msg_logical_off <= tinode->offsets[broker].written){//This ensures the message is Combined (all the other fields are filled)
-				if(msg_logical_off != perLogOff[broker]+1){
-					if(msg_logical_off != (size_t)-1 && msg_to_order[broker]->next_msg_diff != 0){
-						msg_to_order[broker] = (MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
-					}
-					continue;
-				}
+			if(msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written && msg_to_order[broker]->next_msg_diff != 0){//This ensures the message is Combined (all the other fields are filled)
 				msg_to_order[broker]->total_order = seq;
+				seq++;
 				tinode->offsets[broker].ordered = msg_logical_off;
 				tinode->offsets[broker].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
-				perLogOff[broker] = msg_logical_off;
-				seq++;
+				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
 				yield = false;
-				if(msg_to_order[broker]->next_msg_diff != 0){
-					msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
-				}
 			}
 		}
 		if(yield){
-			get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode);
+			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 			last_updated = std::chrono::steady_clock::now();
 			std::this_thread::yield();
 		}else if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()
 					- last_updated).count() >= HEARTBEAT_INTERVAL){
-			get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode);
+			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 			last_updated = std::chrono::steady_clock::now();
 		}
 	}

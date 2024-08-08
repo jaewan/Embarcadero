@@ -121,19 +121,23 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			create_topic_entry_callback_ = callback;
 		}
 
-		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
+		int GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
 														struct Embarcadero::MessageHeader** msg_to_order, struct Embarcadero::TInode *tinode){
 			absl::flat_hash_set<int> copy_set(registered_brokers.begin(), registered_brokers.end());
+			int ret = 0;
 			{
 				absl::MutexLock lock(&mutex_);
 				for(const auto &node:nodes_){
 					int broker_id = node.second.broker_id;
 					if(registered_brokers.find(broker_id) == registered_brokers.end()){
-						registered_brokers.insert(broker_id);
+						/*
 						while(tinode->offsets[broker_id].log_offset == 0){
 							_mm_pause(); //yield can cause deadlock in grpc. Instead of yield, make it spin
 						}
 						msg_to_order[broker_id] = ((struct Embarcadero::MessageHeader*)((uint8_t*)msg_to_order[broker_id] + tinode->offsets[broker_id].log_offset));
+						*/
+						ret++;
+						registered_brokers.insert(broker_id);
 					}else{
 						copy_set.erase(broker_id);
 					}
@@ -143,6 +147,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				registered_brokers.erase(broker_id);
 				msg_to_order[broker_id] = nullptr;
 			}
+			return ret;
 		}
 
 	private:
@@ -248,12 +253,13 @@ class HeartBeatManager{
 			}
 			return follower_->GetBrokerId();
 		}
-		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
+		int GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
 														struct Embarcadero::MessageHeader** msg_to_order, struct Embarcadero::TInode *tinode){
 			if(is_head_node_){
-				service_->GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+				return service_->GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 			}else{
 				LOG(ERROR) << "GetRegisteredBrokers should not be called from non-head brokers, this it for sequencer";
+				return 0;
 			}
 		}
 

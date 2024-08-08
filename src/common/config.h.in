@@ -22,7 +22,7 @@ namespace Embarcadero{
 #define SEGMENT_SIZE (1UL << 32)
 #define NUM_DISK_IO_THREADS 8 
 #define NUM_CXL_IO_THREADS 16 
-#define NUM_NETWORK_IO_THREADS 8
+#define NUM_NETWORK_IO_THREADS 10
 #define NUM_ACK_THREADS 1
 
 //********* Health check configs *********
@@ -45,12 +45,12 @@ struct PublishRequest{
 	bool acknowledge;
 	std::atomic<int> *counter;
 	void* payload_address;
-	size_t size;
+	size_t paddedSize;
 	int client_socket;
 };
 
 using CreateTopicEntryCallback = std::function<bool(char*, int, heartbeat_system::SequencerType)>;
-using GetRegisteredBrokersCallback = std::function<void(absl::btree_set<int> &registered_brokers, 
+using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers, 
 														struct MessageHeader** msg_to_order, struct TInode *tinode)>;
 } // End of namespace Embarcadero
 #endif // CONFIG_H

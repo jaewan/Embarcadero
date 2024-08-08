@@ -159,6 +159,7 @@ class Client{
 						broker_id_to_queue_idx_[i] = pubQues_.size() - 1;
 					}
 				}
+				LOG(INFO) << "Publisher Constructed";
 			}
 
 		~Client(){
@@ -463,6 +464,8 @@ class Client{
 							if (errno != EAGAIN) {
 								perror("send failed");
 								running = false;
+								close(sock);
+								return;
 								break;
 							}
 						}
@@ -596,6 +599,7 @@ class Subscriber{
 				subscribe_thread_ = std::thread([this](){
 						this->SubscribeThread();
 						});
+				LOG(INFO) << "Subscriber Constructed";
 			}
 
 		~Subscriber(){
@@ -1243,8 +1247,11 @@ void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_t
 	Client c("127.0.0.1", std::to_string(BROKER_PORT), q_size);
 	LOG(INFO) << "Client Created" ;
 	c.CreateNewTopic(topic, order, seq_type);
+	LOG(INFO) << "Created new topic" ;
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
+	LOG(INFO) << "Subscriber created" ;
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
+	LOG(INFO) << "Publisher initialized" ;
 
 	auto start = std::chrono::high_resolution_clock::now();
 	for(int i=0; i<n; i++){
@@ -1298,6 +1305,7 @@ int main(int argc, char* argv[]) {
 
 	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 	SubscribeThroughputTest(total_message_size, message_size);
+	//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
 	return 0;
 }
