@@ -59,6 +59,9 @@ struct NonCriticalMessageHeader{
 	char _padding[64 - (sizeof(int) + sizeof(size_t) * 3 + sizeof(void*))]; 
 };
 
+
+// Orders are very important to avoid race conditions. 
+// If you change orders of elements, change how sequencers and combiner check written messages
 struct alignas(64) MessageHeader{
 	int client_id;
 	size_t client_order;
@@ -66,8 +69,8 @@ struct alignas(64) MessageHeader{
 	volatile size_t paddedSize; // This include message+padding+header size
 	void* segment_header;
 	volatile size_t total_order;
-	size_t logical_offset;
 	unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
+	size_t logical_offset;
 };
 
 class CXLManager{
@@ -105,6 +108,8 @@ class CXLManager{
 		std::atomic<int> thread_count_{0};
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 
+		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
+														struct MessageHeader** msg_to_order, struct TInode *tinode);
 		void CXLIOThread();
 		void Sequencer1(char* topic);
 		void Sequencer2(char* topic);

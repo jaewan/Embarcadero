@@ -25,7 +25,7 @@ DiskManager::DiskManager(size_t queueCapacity,
 		threads_.emplace_back(&DiskManager::DiskIOThread, this);
 
 	while(thread_count_.load() != num_io_threads_){}
-	LOG(INFO) << "[DiskManager]: \tConstructed";
+	LOG(INFO) << "\t[DiskManager]: \tConstructed";
 }
 
 DiskManager::~DiskManager(){
@@ -58,8 +58,8 @@ void DiskManager::DiskIOThread(){
 			break;
 		}
 		const struct PublishRequest &req = optReq.value();
-		int off = offset_.fetch_add(req.size, std::memory_order_relaxed);
-		pwrite(log_fd_, req.payload_address, req.size, off);
+		int off = offset_.fetch_add(req.paddedSize, std::memory_order_relaxed);
+		pwrite(log_fd_, req.payload_address, req.paddedSize, off);
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1,std::memory_order_release);

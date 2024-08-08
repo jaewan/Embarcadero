@@ -48,7 +48,7 @@ NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqR
 			threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
 
 		while(thread_count_.load() != (1 + NUM_ACK_THREADS + num_reqReceive_threads_)){}
-		LOG(INFO) << "[NetworkManager]: \tConstructed";
+		LOG(INFO) << "\t[NetworkManager]: \tConstructed";
 }
 
 NetworkManager::~NetworkManager(){
@@ -270,7 +270,7 @@ void NetworkManager::ReqReceiveThread(){
 						//TODO(Jae) Change this to malloc here to allow dynamic message size during one connection
 						if(to_read == 0){
 							MessageHeader *header = (MessageHeader*)buf;;
-							pub_req.size = header->size;
+							pub_req.paddedSize = header->paddedSize;
 							pub_req.client_order = header->client_order;
 							pub_req.payload_address = (void*)buf;
 							pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
@@ -280,9 +280,7 @@ void NetworkManager::ReqReceiveThread(){
 
 							buf = mi_malloc(READ_SIZE);
 							to_read = READ_SIZE;
-						}else if(to_read < 0){
-							VLOG(3) << " to_read:" << to_read;
-						}
+						}	
 					}
 #endif
 					close(req.client_socket);
@@ -303,6 +301,7 @@ void NetworkManager::ReqReceiveThread(){
 							reply_shake.first_id = ((MessageHeader*)messages)->logical_offset;
 							reply_shake.last_id = last_offset;
 							// Send
+							VLOG(3) << "Sending " << messages_size << " first:" << reply_shake.first_id << " last:" << reply_shake.last_id;;
 							size_t ret = send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
 							if(ret < 0){
 								LOG(ERROR) << "Error in sending reply_shake";

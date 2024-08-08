@@ -158,7 +158,8 @@ void TopicManager::PublishToCXL(PublishRequest &req){
 				return;
 			}
 		}else{
-			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic << " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
+			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic
+			<< " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
 			return;
 		}
 	}
@@ -169,7 +170,9 @@ bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
 		void* &last_addr, void* &messages, size_t &messages_size){
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()){
-		perror("Topic not found");
+		//LOG(ERROR) << "Topic not found";
+		// Not throwing error as subscribe can be called before the topic is created
+		return false;
 	}
 	return topic_itr->second->GetMessageAddr(last_offset, last_addr, messages, messages_size);
 }
@@ -192,10 +195,8 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 		ordered_offset_ = 0;
 		if(seq_type == KAFKA){
 			WriteToCXLFunc = &Topic::WriteToCXLWithMutex;
-			VLOG(3) << "Kafka Sequencer is selected";
 		}else{
 			WriteToCXLFunc = &Topic::WriteToCXL;
-			VLOG(3) << "Kafka Sequencer is not selected:" << seq_type;
 		}
 	}
 
@@ -203,7 +204,7 @@ void Topic::CombinerThread(){
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
 	while(!stop_threads_){
-		while(header->paddedSize == 0){
+		while(header->size == 0 || header->logical_offset == 0){
 			if(stop_threads_){
 				LOG(INFO) << "Stopping CombinerThread";
 				return;
@@ -216,6 +217,8 @@ void Topic::CombinerThread(){
 			segment_header = (uint8_t*)header - CACHELINE_SIZE;
 			continue;
 		}
+#else
+	 CHECK_LT((unsigned long long int)header, log_addr_);
 #endif
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
@@ -242,11 +245,7 @@ void Topic::WriteToCXL(PublishRequest &req){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 
-	size_t reqSize = req.size + msg_header_size;
-	size_t padding = req.size%CACHELINE_SIZE;
-	if(padding)
-		padding = (CACHELINE_SIZE - padding);
-	size_t msgSize = reqSize + padding;
+	size_t msgSize = req.paddedSize;
 
 	unsigned long long int log = log_addr_.fetch_add(msgSize);
 	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
@@ -271,11 +270,7 @@ void Topic::WriteToCXLWithMutex(PublishRequest &req){
 	bool new_segment_alloced = false;
 
 	MessageHeader *header = (MessageHeader*)req.payload_address;
-	size_t reqSize = req.size + msg_header_size;
-	size_t padding = req.size%CACHELINE_SIZE;
-	if(padding)
-		padding = (CACHELINE_SIZE - padding);
-	size_t msgSize = reqSize + padding;
+	size_t msgSize = req.paddedSize;
 
 	{
 		absl::MutexLock lock(&mutex_);
@@ -307,7 +302,6 @@ void Topic::WriteToCXLWithMutex(PublishRequest &req){
 			tinode_->offsets[broker_id_].written = logical_offset;
 			(*(unsigned long long int*)current_segment_) =
 				(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
-			VLOG(3) << "[DEBUG] Kafka write last msg of:" << ((uint8_t*)log - (uint8_t*)current_segment_);
 		}
 	}
 }
@@ -329,7 +323,6 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		combined_addr = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].ordered_offset;
 	}
 
-	//VLOG(3) << "combined_offset:" << combined_offset << " combined_addr:" << combined_addr;
 	if(combined_offset == (size_t)-1 || ((last_addr != nullptr) && (combined_offset <= last_offset))){
 		return false;
 	}

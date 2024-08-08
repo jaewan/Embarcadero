@@ -80,10 +80,10 @@ class TopicManager{
 			cxl_manager_(cxl_manager),
 			broker_id_(broker_id),
 			num_topics_(0){
-				LOG(INFO) << "[TopicManager]\t\tConstructed";
+				LOG(INFO) << "\t[TopicManager]\tConstructed";
 			}
 		~TopicManager(){
-			LOG(INFO) << "[TopicManager]\t\tDestructed";
+			LOG(INFO) << "\t[TopicManager]\tDestructed";
 		}
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
