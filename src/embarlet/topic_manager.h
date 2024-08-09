@@ -80,7 +80,7 @@ class TopicManager{
 			cxl_manager_(cxl_manager),
 			broker_id_(broker_id),
 			num_topics_(0){
-				LOG(INFO) << "\t[TopicManager]\tConstructed";
+				LOG(INFO) << "\t[TopicManager]\t\tConstructed";
 			}
 		~TopicManager(){
 			LOG(INFO) << "\t[TopicManager]\tDestructed";

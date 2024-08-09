@@ -109,7 +109,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 	// Wait untill al IO threads are up
 	while(thread_count_.load() != num_io_threads_){}
 
-	LOG(INFO) << "\t[CXLManager]: \tConstructed";
+	LOG(INFO) << "\t[CXLManager]: \t\tConstructed";
 	return;
 }
 
@@ -228,7 +228,7 @@ void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 			while(tinode->offsets[broker_id].log_offset == 0){
 				std::this_thread::yield();
 			}
-			msg_to_order[broker_id] = ((struct Embarcadero::MessageHeader*)((uint8_t*)msg_to_order[broker_id] + tinode->offsets[broker_id].log_offset));
+			msg_to_order[broker_id] = ((struct Embarcadero::MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id].log_offset));
 		}
 	}
 }
@@ -239,9 +239,6 @@ void CXLManager::Sequencer1(char* topic){
 	absl::btree_set<int> registered_brokers;
 	static size_t seq = 0;
 
-	for(int i = 0; i < NUM_MAX_BROKERS; i++){
-		msg_to_order[i] = (struct MessageHeader*)cxl_addr_;
-	}
 	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 	auto last_updated = std::chrono::steady_clock::now();
 
@@ -249,7 +246,8 @@ void CXLManager::Sequencer1(char* topic){
 		bool yield = true;
 		for(auto broker : registered_brokers){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
-			if(msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written && msg_to_order[broker]->next_msg_diff != 0){//This ensures the message is Combined (all the other fields are filled)
+			//This ensures the message is Combined (all the other fields are filled)
+			if(msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written && msg_to_order[broker]->next_msg_diff != 0){
 				msg_to_order[broker]->total_order = seq;
 				seq++;
 				tinode->offsets[broker].ordered = msg_logical_off;
@@ -270,52 +268,48 @@ void CXLManager::Sequencer1(char* topic){
 	}
 }
 
-// One Sequencer per topic. The broker that received CreateNewTopic spawn it.
 void CXLManager::Sequencer2(char* topic){
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
-	struct MessageHeader *msg_headers[NUM_MAX_BROKERS];
+	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
+	absl::btree_set<int> registered_brokers;
 	absl::flat_hash_map<int/*client_id*/, size_t/*client_req_id*/> last_ordered; 
-	// It is OK to store as addresses b/c the total order is given by a single thread
-	absl::flat_hash_map<int, absl::btree_map<size_t/*client_id*/, struct MessageHeader*>> skipped_msg;
+	absl::flat_hash_map<int, absl::btree_map<size_t/*client_id*/, std::pair<int /*broker_id*/, struct MessageHeader*>>> skipped_msg;
 	static size_t seq = 0;
-	int perLogOff[NUM_MAX_BROKERS];
 
-	for(int i = 0; i<NUM_MAX_BROKERS; i++){
-		while(tinode->offsets[i].log_offset == 0){}
-		msg_headers[i] = (struct MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[i].log_offset);
-		perLogOff[i] = -1; 
-	}
+	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+	auto last_updated = std::chrono::steady_clock::now();
 
-	//TODO(Jae) This logic is wrong as the ordered offset can skip few messages 
-	//and the broker exports all data upto the ordered offset
 	while(!stop_threads_){
 		bool yield = true;
-		for(int i = 0; i<NUM_MAX_BROKERS; i++){
-			if(perLogOff[i] < tinode->offsets[i].written){//This ensures the message is Combined (all the other fields are filled)
-				if((int)msg_headers[i]->logical_offset != perLogOff[i]+1){
-					LOG(ERROR) << "!!!!!!!!!!!! [Sequencer2] Error msg_header is not equal to the perLogOff";
-				}
-				int client = msg_headers[i]->client_id;
+		for(auto broker : registered_brokers){
+			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
+			//This ensures the message is Combined (all the other fields are filled)
+			if(msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written && msg_to_order[broker]->next_msg_diff != 0){
+				yield = false;
+				int client = msg_to_order[broker]->client_id;
+				size_t client_order = msg_to_order[broker]->client_order;
 				auto last_ordered_itr = last_ordered.find(client);
-				perLogOff[i] = msg_headers[i]->logical_offset;
-				if(msg_headers[i]->client_order == 0 || 
-						(last_ordered_itr != last_ordered.end() && last_ordered_itr->second == msg_headers[i]->client_order - 1)){
-					// Give order 
-					msg_headers[i]->total_order = seq;
-					tinode->offsets[i].ordered = msg_headers[i]->logical_offset;
+				if(client_order == 0 || 
+						(last_ordered_itr != last_ordered.end() && last_ordered_itr->second == client_order - 1)){
+					msg_to_order[broker]->total_order = seq;
 					seq++;
-					last_ordered[client] = msg_headers[i]->client_order;
+					tinode->offsets[broker].ordered = msg_logical_off;
+					tinode->offsets[broker].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
+
+					last_ordered[client] = client_order;
 					// Check if there are skipped messages from this client and give order
 					auto it = skipped_msg.find(client);
 					if(it != skipped_msg.end()){
 						std::vector<int> to_remove;
 						for (auto& pair : it->second) {
-							if(pair.first == last_ordered[client] + 1){
-								pair.second->total_order = seq;
-								tinode->offsets[i].ordered = pair.second->logical_offset;
+							int client_id = pair.first;
+							if(client_id == last_ordered[client] + 1){
+								pair.second.second->total_order = seq;
+								tinode->offsets[pair.second.first].ordered = pair.second.second->logical_offset;
+								tinode->offsets[pair.second.first].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
 								seq++;
-								last_ordered[client] = pair.first;
-								to_remove.push_back(pair.first);
+								last_ordered[client] = client_id;
+								to_remove.push_back(client_id);
 							}else{
 								break;
 							}
@@ -328,20 +322,26 @@ void CXLManager::Sequencer2(char* topic){
 					//Insert to skipped messages
 					auto it = skipped_msg.find(client);
 					if (it == skipped_msg.end()) {
-						absl::btree_map<size_t, struct MessageHeader*> new_map;
-						new_map.emplace(msg_headers[i]->client_order, msg_headers[i]);
+						absl::btree_map<size_t, std::pair<int, MessageHeader*>> new_map;
+						new_map.emplace(client_order, std::make_pair(broker, msg_to_order[broker]));
 						skipped_msg.emplace(client, std::move(new_map));
 					} else {
-						it->second.emplace(msg_headers[i]->client_order, msg_headers[i]);
+						it->second.emplace(client_order, std::make_pair(broker, msg_to_order[broker]));
 					}
 				}
-				msg_headers[i] = (MessageHeader*)((uint8_t*)msg_headers[i] + msg_headers[i]->paddedSize);
-				yield = false;
+				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
 			}
-		}
-		if(yield)
+		} // end broker loop
+		if(yield){
+			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+			last_updated = std::chrono::steady_clock::now();
 			std::this_thread::yield();
-	}
+		}else if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()
+					- last_updated).count() >= HEARTBEAT_INTERVAL){
+			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+			last_updated = std::chrono::steady_clock::now();
+		}
+	}// end while
 }
 
 } // End of namespace Embarcadero
