@@ -25,7 +25,7 @@ DiskManager::DiskManager(size_t queueCapacity,
 		threads_.emplace_back(&DiskManager::DiskIOThread, this);
 
 	while(thread_count_.load() != num_io_threads_){}
-	LOG(INFO) << "\t[DiskManager]: \tConstructed";
+	LOG(INFO) << "\t[DiskManager]: \t\tConstructed";
 }
 
 DiskManager::~DiskManager(){

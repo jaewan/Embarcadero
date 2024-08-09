@@ -1245,23 +1245,23 @@ void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_t
 		q_size = 1024;
 	}
 	Client c("127.0.0.1", std::to_string(BROKER_PORT), q_size);
-	LOG(INFO) << "Client Created" ;
 	c.CreateNewTopic(topic, order, seq_type);
-	LOG(INFO) << "Created new topic" ;
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
-	LOG(INFO) << "Subscriber created" ;
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
-	LOG(INFO) << "Publisher initialized" ;
 
 	auto start = std::chrono::high_resolution_clock::now();
 	for(int i=0; i<n; i++){
 		c.Publish(message);
 	}
+	c.Poll(n);
+	auto pub_end = std::chrono::high_resolution_clock::now();
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
 
+	auto pub_duration = std::chrono::duration_cast<std::chrono::seconds>(pub_end - start);
 	auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-	LOG(INFO) << "Runtime: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
+	LOG(INFO) << "Pub Bandwidth: " << (total_message_size/(1024*1024))/pub_duration.count() << " MB/s";
+	LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
 
 }
 
