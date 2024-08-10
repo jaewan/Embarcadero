@@ -24,9 +24,9 @@ class HeartBeatManager;
 
 class ScalogSequencerService : public ScalogSequencer::Service {
 	public:
-		ScalogSequencerService(CXLManager* cxl_manager, int broker_id, const char* topic, HeartBeatManager *broker, void* cxl_addr, std::string head_address);
+		ScalogSequencerService(CXLManager* cxl_manager, int broker_id, const char* topic, HeartBeatManager *broker, void* cxl_addr, std::string scalog_seq_address);
 
-		absl::flat_hash_map<std::string, std::vector<int>> GetGlobalCut() {
+		absl::flat_hash_map<int, int> GetGlobalCut() {
 			return global_cut_;
 		}
 
@@ -39,7 +39,7 @@ class ScalogSequencerService : public ScalogSequencer::Service {
         /// @param context
         /// @param request Request containing the local cut and the epoch
         /// @param response Empty for now
-		grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response);
+		grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response, std::function<void(grpc::Status)> callback);
 
     	/// Receives the global cut from global sequencer
         /// @param context
@@ -52,24 +52,25 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		HeartBeatManager *broker_;
 		int broker_id_;
 		void* cxl_addr_;
-		std::string head_address_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
 
-		absl::flat_hash_map<std::string, int> local_epoch_;
+		absl::flat_hash_map<int, std::function<void(grpc::Status)>> follower_callbacks_;
 
-		absl::flat_hash_map<std::string, int> global_epoch_;
+		absl::flat_hash_map<int, SendLocalCutResponse*> follower_responses_;
 
-		absl::flat_hash_map<std::string, int> local_cuts_count_;
+		int local_epoch_;
 
-		absl::flat_hash_map<std::string, bool> received_global_seq_;
+		int global_epoch_;
 
-		absl::flat_hash_map<std::string, std::vector<int>> global_cut_;
+		int local_cuts_count_;
 
-		absl::flat_hash_map<std::string, bool> has_global_sequencer_;
+		bool received_global_seq_;
 
-		absl::flat_hash_map<std::string, bool> received_gobal_seq_after_interval_;
+		absl::flat_hash_map<int, int> global_cut_;
 
-		absl::flat_hash_map<int, std::unique_ptr<ScalogSequencer::Stub>> follower_stubs_;
+		bool has_global_sequencer_;
+
+		bool received_gobal_seq_after_interval_;
 
         /// Thread to run the io_service in a loop
         std::unique_ptr<std::thread> io_service_thread_;
@@ -83,10 +84,10 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 
 		void LocalSequencer(const char* topic);
 		void GlobalSequencer(const char* topic);
-		void SendLocalCut(int epoch, int written, const char* topic);
-		void ReceiveGlobalCut(std::vector<int> global_cut, const char* topic);
-		void ReceiveLocalCut(int epoch, int written, const char* topic, int broker_id);
-		void UpdateTotalOrdering(std::vector<int> global_cut, struct TInode *tinode);
+		void SendLocalCut(int epoch, int local_cut, const char* topic);
+		void ReceiveGlobalCut(absl::flat_hash_map<int, int>  global_cut, const char* topic);
+		void ReceiveLocalCut(int epoch, const char* topic, int broker_id);
+		void UpdateTotalOrdering(absl::flat_hash_map<int, int>  global_cut, struct TInode *tinode);
 };
 
 enum CXL_Type {Emul, Real};
@@ -167,7 +168,7 @@ class CXLManager {
 	private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
 		int broker_id_;
-		std::string head_address_;
+		std::string head_ip_;
 		int num_io_threads_;
 		std::vector<std::thread> threads_;
 		std::vector<std::thread> sequencerThreads_;

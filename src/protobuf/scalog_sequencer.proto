@@ -16,11 +16,13 @@ message SendLocalCutRequest {
 }
 
 // Empty response for now
-message SendLocalCutResponse {}
+message SendLocalCutResponse {
+    map<int64, int64> global_cut = 1;
+}
 
 // Request containing the global cut and topic
 message SendGlobalCutRequest {
-    repeated int64 global_cut = 1;
+    map<int64, int64> global_cut = 1;
     string topic = 2;
 }
 
