@@ -39,7 +39,7 @@ class ScalogSequencerService : public ScalogSequencer::Service {
         /// @param context
         /// @param request Request containing the local cut and the epoch
         /// @param response Empty for now
-		grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response, std::function<void(grpc::Status)> callback);
+		grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response);
 
     	/// Receives the global cut from global sequencer
         /// @param context
@@ -54,9 +54,12 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		void* cxl_addr_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
 
-		absl::flat_hash_map<int, std::function<void(grpc::Status)>> follower_callbacks_;
+		std::mutex mutex_;
+		std::condition_variable cv_;
 
-		absl::flat_hash_map<int, SendLocalCutResponse*> follower_responses_;
+		// absl::flat_hash_map<int, std::function<void(grpc::Status)>> follower_callbacks_;
+
+		// absl::flat_hash_map<int, SendLocalCutResponse*> follower_responses_;
 
 		int local_epoch_;
 
