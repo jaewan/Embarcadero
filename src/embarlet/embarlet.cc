@@ -50,6 +50,8 @@ int main(int argc, char* argv[]){
 		("follower", "Follower Address and Port", cxxopts::value<std::string>())
 		("e,emul", "Use emulation instead of CXL")
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
+		("cxl_threads", "Number of CXL IO threads", cxxopts::value<int>()->default_value(std::to_string(NUM_CXL_IO_THREADS)))
+		("network_threads", "Number of network IO threads", cxxopts::value<int>()->default_value(std::to_string(NUM_DISK_IO_THREADS)))
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		;
 
@@ -84,12 +86,14 @@ int main(int argc, char* argv[]){
 		cxl_type = Embarcadero::CXL_Type::Emul;
 		LOG(WARNING) << "Using emulated CXL";
 	}
+	int num_cxl_io_threads = arguments["cxl_threads"].as<int>();
+	int num_network_io_threads = arguments["network_threads"].as<int>();
 
 	// *************** Initializing Managers ********************** 
 	// Queue Size (1UL<<22)(1UL<<25)(1UL<<25) respectly performed 6GB/s 1kb message disk thread:8 cxl:16 network: 32
-	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id, cxl_type, NUM_CXL_IO_THREADS);
+	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id, cxl_type, num_cxl_io_threads);
 	Embarcadero::DiskManager disk_manager((1UL<<25));
-	Embarcadero::NetworkManager network_manager((1UL<<25), broker_id, NUM_NETWORK_IO_THREADS);
+	Embarcadero::NetworkManager network_manager((1UL<<25), broker_id, num_network_io_threads);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
 	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 	if(is_head_node){
