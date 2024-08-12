@@ -61,6 +61,8 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 
 		// absl::flat_hash_map<int, SendLocalCutResponse*> follower_responses_;
 
+		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(5000);
+
 		int local_epoch_;
 
 		int global_epoch_;
