@@ -63,14 +63,14 @@ struct NonCriticalMessageHeader{
 // Orders are very important to avoid race conditions. 
 // If you change orders of elements, change how sequencers and combiner check written messages
 struct alignas(64) MessageHeader{
+	void* segment_header;
+	size_t logical_offset;
+	unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
+	volatile size_t total_order;
 	int client_id;
 	size_t client_order;
 	volatile size_t size;
 	volatile size_t paddedSize; // This include message+padding+header size
-	void* segment_header;
-	volatile size_t total_order;
-	unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
-	size_t logical_offset;
 };
 
 class CXLManager{

@@ -85,7 +85,7 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]){
 	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	{
-	absl::MutexLock lock(&mutex_);
+	absl::WriterMutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
 	if(topics_.find(topic)!= topics_.end()){
 		return nullptr;
@@ -109,7 +109,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
 	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	{
-	absl::MutexLock lock(&mutex_);
+	absl::WriterMutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
 	if(topics_.find(topic)!= topics_.end()){
 		return nullptr;
@@ -168,6 +168,7 @@ void TopicManager::PublishToCXL(PublishRequest &req){
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
 		void* &last_addr, void* &messages, size_t &messages_size){
+	absl::ReaderMutexLock lock(&mutex_);
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()){
 		//LOG(ERROR) << "Topic not found";
@@ -204,7 +205,7 @@ void Topic::CombinerThread(){
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
 	while(!stop_threads_){
-		while(header->size == 0 || header->logical_offset == 0){
+		while(header->paddedSize == 0){
 			if(stop_threads_){
 				LOG(INFO) << "Stopping CombinerThread";
 				return;
@@ -297,8 +298,8 @@ void Topic::WriteToCXLWithMutex(PublishRequest &req){
 	{
 		absl::MutexLock lock(&written_mutex_);
 		if(written_logical_offset_ == (size_t)-1 || written_logical_offset_ < logical_offset){
-			written_physical_addr_ = (void*)log;
 			written_logical_offset_ = logical_offset;
+			written_physical_addr_ = (void*)log;
 			tinode_->offsets[broker_id_].written = logical_offset;
 			(*(unsigned long long int*)current_segment_) =
 				(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
@@ -329,6 +330,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
 	if(last_addr != nullptr){
+	
 		while((struct MessageHeader*)start_msg_header->next_msg_diff == 0){
 			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
 			std::this_thread::yield();
@@ -341,6 +343,10 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 			return false;
 		}
 		start_msg_header = (struct MessageHeader*)first_message_addr_;
+	}
+
+	if(start_msg_header->paddedSize == 0){
+		return false;
 	}
 
 	messages = (void*)start_msg_header;
