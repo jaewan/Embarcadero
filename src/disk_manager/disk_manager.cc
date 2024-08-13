@@ -12,7 +12,7 @@
 
 namespace Embarcadero{
 
-#define DISK_LOG_PATH "embarc.disklog"
+#define DISK_LOG_PATH_SUFFIX "embarc.disklog"
 
 DiskManager::DiskManager(size_t queueCapacity, 
 						 int num_io_threads):
