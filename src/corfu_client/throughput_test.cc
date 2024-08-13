@@ -1217,7 +1217,7 @@ void ThroughputTestRaw(size_t total_message_size, size_t message_size, int num_t
 
 void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
 	int n = total_message_size/message_size;
-	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
+	LOG(INFO) << "[Throughput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
 	char topic[TOPIC_NAME_SIZE];
 	memset(topic, 0, TOPIC_NAME_SIZE);
@@ -1249,7 +1249,7 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 }
 
 void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size){
-	LOG(INFO) << "[Subscribe Throuput Test] ";
+	LOG(INFO) << "[Subscribe Throughput Test] ";
 	char topic[TOPIC_NAME_SIZE];
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
@@ -1264,7 +1264,7 @@ void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size){
 
 void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
 	int n = total_message_size/message_size;
-	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
+	LOG(INFO) << "[E2E Throughput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
 	char topic[TOPIC_NAME_SIZE];
 	memset(topic, 0, TOPIC_NAME_SIZE);
@@ -1311,13 +1311,12 @@ int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
 	FLAGS_logtostderr = 1; // log only to console, no files.
-	cxxopts::Options options("embarcadero-throughputTest", "Embarcadero Throughput Test");
+	cxxopts::Options options("corfu-throughputTest", "Corfu Sequencer + Embarcadero Throughput Test");
 
 	options.add_options()
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
 		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("0"))
-		("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", cxxopts::value<std::string>()->default_value("EMBARCADERO"))
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
@@ -1329,7 +1328,6 @@ int main(int argc, char* argv[]) {
 	size_t num_threads = result["num_thread"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
-	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 	FLAGS_v = result["log_level"].as<int>();
 
 	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
@@ -1337,8 +1335,8 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
-	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-	SubscribeThroughputTest(total_message_size, message_size);
+	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, SequencerType::CORFU);
+	//SubscribeThroughputTest(total_message_size, message_size);
 	//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
 	return 0;
