@@ -30,22 +30,11 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 			return global_cut_;
 		}
 
-		/// Create a new rpc client to communicate with a peer broker
-        /// @param peer_url URL of the peer broker
-        /// @return rpc client
-        std::unique_ptr<ScalogSequencer::Stub> GetRpcClient(std::string peer_url);
-
     	/// Receives a local cut from a local sequencer
         /// @param context
         /// @param request Request containing the local cut and the epoch
         /// @param response Empty for now
 		grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response);
-
-    	/// Receives the global cut from global sequencer
-        /// @param context
-        /// @param request Request containing the global cut and topic
-        /// @param response Empty for now
-		grpc::Status HandleSendGlobalCut(grpc::ServerContext* context, const SendGlobalCutRequest* request, SendGlobalCutResponse* response);
 
 	private:
 		CXLManager* cxl_manager_;
@@ -57,11 +46,7 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		std::mutex mutex_;
 		std::condition_variable cv_;
 
-		// absl::flat_hash_map<int, std::function<void(grpc::Status)>> follower_callbacks_;
-
-		// absl::flat_hash_map<int, SendLocalCutResponse*> follower_responses_;
-
-		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(1000000);
+		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(3000000);
 
 		int local_epoch_;
 
@@ -69,13 +54,11 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 
 		int local_cuts_count_;
 
-		bool received_global_seq_;
+		bool received_global_cut_;
 
 		absl::flat_hash_map<int, int> global_cut_;
 
 		bool has_global_sequencer_;
-
-		bool received_gobal_seq_after_interval_;
 
         /// Thread to run the io_service in a loop
         std::unique_ptr<std::thread> io_service_thread_;
