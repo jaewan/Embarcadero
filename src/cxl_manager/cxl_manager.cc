@@ -277,17 +277,17 @@ ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int brok
 	local_epoch_ = 0;
 
 	// // Start scalog_io_service_thread_
-	// io_service_thread_ = std::make_unique<std::thread>([this] {
-	// 	// Keep io_service_ alive.
-	// 	boost::asio::io_service::work io_service_work_(io_service_);
-	// 	io_service_.run();
-	// });
+	io_service_thread_ = std::make_unique<std::thread>([this] {
+		// Keep io_service_ alive.
+		boost::asio::io_service::work io_service_work_(io_service_);
+		io_service_.run();
+	});
 
-	// std::string topic_str(topic);
-	// io_service_.dispatch([this, topic_str] {
-	// 	std::cout << "Sending local cuts for topic " << topic_str << " to global sequencer" << std::endl;
-	// 	LocalSequencer(topic_str.c_str());
-	// });
+	std::string topic_str(topic);
+	io_service_.dispatch([this, topic_str] {
+		std::cout << "Sending local cuts for topic " << topic_str << " to global sequencer" << std::endl;
+		LocalSequencer(topic_str.c_str());
+	});
 
 	std::cout << "Finished starting scalog sequencer" << std::endl;
 }
@@ -345,10 +345,17 @@ void ScalogSequencerService::LocalSequencer(const char* topic){
 
 	auto end_time = std::chrono::steady_clock::now();
 	auto elapsed_time_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+
+	// print elapsed time
+	std::cout << "Elapsed time: " << elapsed_time_us.count() << " us" << std::endl;
 	
 	std::string topic_str(topic);
 	if (elapsed_time_us < local_cut_interval_) {
 		auto interval = boost::posix_time::microseconds((local_cut_interval_ - elapsed_time_us).count());
+
+		// print interval
+		std::cout << "Interval to wait: " << interval.total_microseconds() << " us" << std::endl;
+
 		timer_.expires_from_now(interval);
 		timer_.async_wait([this, topic_str](const boost::system::error_code& ec) {
 			if (!ec) {
@@ -403,17 +410,18 @@ void ScalogSequencerService::SendLocalCut(int epoch, int local_cut, const char* 
 
 			if (!status.ok()) {
 				std::cout << "Error sending local cut: " << status.error_message() << std::endl;
-			} else {
-				std::cout << "Successfully sent local cut for topic: " << topic << std::endl;
+			} 
+			// else {
+			// 	std::cout << "Successfully sent local cut for topic: " << topic << std::endl;
 
-				// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
-				absl::flat_hash_map<int, int> global_cut_map;
-				for (const auto& entry : response.global_cut()) {
-					global_cut_map[static_cast<int>(entry.first)] = static_cast<int>(entry.second);
-				}
+			// 	// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
+			// 	absl::flat_hash_map<int, int> global_cut_map;
+			// 	for (const auto& entry : response.global_cut()) {
+			// 		global_cut_map[static_cast<int>(entry.first)] = static_cast<int>(entry.second);
+			// 	}
 
-				this->ReceiveGlobalCut(global_cut_map, topic);
-			}
+			// 	this->ReceiveGlobalCut(global_cut_map, topic);
+			// }
 
 			std::lock_guard<std::mutex> lock(mu);
 			done = true;
@@ -445,10 +453,10 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 
 	ReceiveLocalCut(epoch, topic, broker_id);
 
-	auto* mutable_global_cut = response->mutable_global_cut();
-	for (const auto& entry : global_cut_) {
-		(*mutable_global_cut)[static_cast<int64_t>(entry.first)] = static_cast<int64_t>(entry.second);
-	}
+	// auto* mutable_global_cut = response->mutable_global_cut();
+	// for (const auto& entry : global_cut_) {
+	// 	(*mutable_global_cut)[static_cast<int64_t>(entry.first)] = static_cast<int64_t>(entry.second);
+	// }
 
 	std::cout << "Finished receiving local cut" << std::endl;
 
