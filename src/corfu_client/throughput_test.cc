@@ -27,8 +27,10 @@
 #include "../cxl_manager/cxl_manager.h"
 
 using heartbeat_system::HeartBeat;
+using heartbeat_system::SequencerType;
 
 struct PubQueueEntry {
+	size_t local_order;
 	size_t order;
 	char* msg;
 };
@@ -39,9 +41,9 @@ struct msgIdx{
 	size_t offset;
 	int broker_id;
 	int remaining_len;
+	bool metadata_received = false;
 	msgIdx(int f, int l, size_t o, int b, int r):first(f), last(l), offset(o), broker_id(b), remaining_len(r){}
 };
-#define NUM_BROKERS 4
 
 void RemoveNodeFromClientInfo(heartbeat_system::ClientInfo& client_info, int32_t node_to_remove) {
 	auto* nodes_info = client_info.mutable_nodes_info();
@@ -131,6 +133,7 @@ int GetNonblockingSock(char *broker_address, int port){
 
 	return sock;
 }
+
 int GenerateRandomNum(){
 	// Generate a random number
 	std::random_device rd;
@@ -138,6 +141,7 @@ int GenerateRandomNum(){
 	std::uniform_int_distribution<> dis(NUM_MAX_BROKERS, 999999);
 	return  dis(gen);
 }
+
 class Client{
 	public:
 		Client(std::string head_addr, std::string port, size_t queueSize):
@@ -156,9 +160,12 @@ class Client{
 					absl::MutexLock lock(&mutex_);
 					//Add headnode as headnode is not reported from ClusterProbeLoop
 					size_t queueSize = total_queue_size_ / (nodes_.size() + 1);
-					pubQues_.emplace_back(queueSize);
-					broker_id_to_queue_idx_[0] = pubQues_.size() - 1;
+					for(int i=0; i<nodes_.size(); i++){
+						pubQues_.emplace_back(queueSize);
+						broker_id_to_queue_idx_[i] = pubQues_.size() - 1;
+					}
 				}
+				LOG(INFO) << "Publisher Constructed";
 			}
 
 		~Client(){
@@ -168,10 +175,16 @@ class Client{
 			std::optional<PubQueueEntry> sentinel = std::nullopt;
 			for(auto& q:pubQues_){
 				for(int i =0; i<num_threads_; i++) // This is not correct for sanity overwrite sentinel
-					q.blockingWrite(sentinel);
+					q.write(sentinel);
 			}
 			for(auto &t : threads_)
 				t.join();
+			if(ack_thread_.joinable())
+				ack_thread_.join();
+			if(cluster_probe_thread_.joinable())
+				cluster_probe_thread_.join();
+
+			LOG(INFO) << "Destructed Client";
 		};
 
 		void Init(int num_threads, int msg_copy, char topic[TOPIC_NAME_SIZE], int ack_level, int order, size_t message_size){
@@ -205,8 +218,9 @@ class Client{
 				printf("Corfu Sequencer Order: %d\n", order);
 				for (uint32_t i = order; i < order + batch_size; i++) {
 					PubQueueEntry entry {
-						i, 				// order
-						message.data(), // message
+						client_order_.fetch_add(1), // local order
+						i, 							// order
+						message.data(), 			// message
 					};
 					pubQues_[i % num_queues].blockingWrite(entry);
 				}
@@ -225,12 +239,13 @@ class Client{
 			return;
 		}
 
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order){
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
 			grpc::ClientContext context;
 			heartbeat_system::CreateTopicRequest create_topic_req;;
 			heartbeat_system::CreateTopicResponse create_topic_reply;;
 			create_topic_req.set_topic(topic);
 			create_topic_req.set_order(order);
+			create_topic_req.set_sequencer_type(seq_type);
 			grpc::Status status = stub_->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
 			if(status.ok()){
 				return create_topic_reply.success();
@@ -319,6 +334,7 @@ class Client{
 			char buffer[1024];
 			size_t total_received = 0;
 			int EPOLL_TIMEOUT = 1; // 1 millisecond timeout
+			std::vector<int> client_sockets;
 
 			while (!shutdown_ || total_received < client_order_) {
 				int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
@@ -339,12 +355,15 @@ class Client{
 						event.data.fd = client_sock;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
 							std::cerr << "Failed to add client socket to epoll\n";
+							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 							close(client_sock);
+						} else {
+							client_sockets.push_back(client_sock);
 						}
 					} else {
 						// Data from existing client
 						int client_sock = events[i].data.fd;
-						ssize_t bytes_received = 0;
+						ssize_t bytes_received;
 
 						while (total_received < client_order_ && (bytes_received = recv(client_sock, buffer, 1024, 0)) > 0) {
 							total_received += bytes_received;
@@ -358,21 +377,29 @@ class Client{
 							std::cout << "Client disconnected. Total bytes received: " << total_received << std::endl;
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 							close(client_sock);
+							client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
 						} else if (bytes_received == -1) {
 							if (errno != EAGAIN && errno != EWOULDBLOCK) {
 								// Error occurred
 								std::cerr << "recv error: " << strerror(errno) << std::endl;
 								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 								close(client_sock);
+								client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
 							}
 						}
 					}
 				}
 			}
 
+			// Close all remaining open client sockets
+			for (int client_sock : client_sockets) {
+				epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
+				close(client_sock);
+			}
+
 			// Cleanup
-			close(server_sock);
 			close(epoll_fd);
+			close(server_sock);
 		}
 
 		void AckThread(){
@@ -453,7 +480,7 @@ class Client{
 			struct epoll_event events[10]; // Adjust size as needed
 			bool running = true;
 			size_t sent_bytes = 0;
-			while (running) {
+			while (!shutdown_ && running) {
 				n = epoll_wait(efd, events, 10, -1);
 				for (i = 0; i < n; i++) {
 					if (events[i].events & EPOLLOUT) {
@@ -462,6 +489,8 @@ class Client{
 							if (errno != EAGAIN) {
 								perror("send failed");
 								running = false;
+								close(sock);
+								return;
 								break;
 							}
 						}
@@ -482,6 +511,7 @@ class Client{
 			Embarcadero::MessageHeader header;
 			header.client_id = client_id_;
 			header.size = message_size_;
+			header.total_order = 0;
 			int padding = message_size_ % 64;
 			if(padding){
 				padding = 64 - padding;
@@ -489,7 +519,7 @@ class Client{
 			header.paddedSize = message_size_ + padding + sizeof(Embarcadero::MessageHeader);
 			header.segment_header = nullptr;
 			header.logical_offset = (size_t)-1; // Sentinel value
-			header.next_message = nullptr;
+			header.next_msg_diff = 0;
 			std::optional<PubQueueEntry> optReq;
 
 			while(!shutdown_){
@@ -499,7 +529,7 @@ class Client{
 				}
 				PubQueueEntry e = optReq.value();
 				header.total_order = e.order;
-				header.client_order = client_order_.fetch_add(1);
+				header.client_order = e.local_order;
 
 				bool send_msg = true;
 				sent_bytes = 0;
@@ -534,6 +564,7 @@ class Client{
 			close(efd);
 		}
 
+		// Current implementation does not send messages to newly added nodes after init
 		void ClusterProbeLoop(){
 			heartbeat_system::ClientInfo client_info;
 			heartbeat_system::ClusterStatus cluster_status;
@@ -574,11 +605,11 @@ class Client{
 
 };
 
-//TODO(Jae) Broker Failure is not handled
+//TODO(Jae) Broker Failure is not handled, dynamic node addition not handled
 class Subscriber{
 	public:
 		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE]):
-			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false),  buffer_size_((1UL<<30)){
+			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false),  buffer_size_((1UL<<33)){
 				memcpy(topic_, topic, TOPIC_NAME_SIZE);
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
@@ -590,20 +621,43 @@ class Subscriber{
 				while(!connected_){
 					std::this_thread::yield();
 				}
-				messages_.reserve(2);
+				messages_.resize(2);
+				subscribe_thread_ = std::thread([this](){
+						this->SubscribeThread();
+						});
+				LOG(INFO) << "Subscriber Constructed";
 			}
 
 		~Subscriber(){
 			LOG(INFO) << "Destructing Subscriber";
 			shutdown_ = true;
 			cluster_probe_thread_.join();
+			subscribe_thread_.join();
 		};
 
 		void* Consume(){
-			messages_idx_.fetch_xor(1);
+			int i = messages_idx_.fetch_xor(1);
 			return nullptr;
 		}
 
+		void* ConsumeBatch(){
+			int i = messages_idx_.fetch_xor(1);
+			return nullptr;
+		}
+
+		void DEBUG_wait(size_t total_msg_size, size_t msg_size){
+			size_t num_msg = total_msg_size/msg_size;
+			auto start = std::chrono::steady_clock::now();
+			size_t total_data_size = num_msg * sizeof(Embarcadero::MessageHeader) + total_msg_size;
+			while(DEBUG_count_ < total_data_size){
+				std::this_thread::yield();
+				if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-start).count() >=3){
+					start = std::chrono::steady_clock::now();
+					VLOG(3) << "Received:" << DEBUG_count_ << "/" << total_data_size;
+				}
+			}
+			return;
+		}
 
 	private:
 		std::string head_addr_;
@@ -612,23 +666,24 @@ class Subscriber{
 		bool connected_;
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::thread cluster_probe_thread_;
+		std::thread subscribe_thread_;
 		// <broker_id, address::port of network_mgr>
 		absl::flat_hash_map<int, std::string> nodes_;
 		absl::flat_hash_map<int, std::string> new_brokers_;
 		absl::Mutex mutex_;
 		char topic_[TOPIC_NAME_SIZE];
 		size_t buffer_size_;
+		size_t DEBUG_count_ = 0;
 		void* last_fetched_addr_;
 		int last_fetched_offset_;
 		std::vector<std::vector<std::pair<void*, msgIdx>>> messages_;
 		absl::flat_hash_map<int, int> fd_to_msg_idx_;
 		std::atomic<int> messages_idx_;
-		std::vector<int> broker_fds_;
 
 		void SubscribeThread(){
+			const size_t header_size = sizeof(Embarcadero::SubscribeHeader);
 			int num_brokers = nodes_.size();
 			int epoll_fd = epoll_create1(0);
-			const size_t header_size = sizeof(Embarcadero::SubscribeHeader);
 			if (epoll_fd < 0) {
 				LOG(ERROR) << "Failed to create epoll instance";
 				return ;
@@ -656,28 +711,34 @@ class Subscriber{
 							}
 							int bytes_received = recv(fd, (uint8_t*)buf + m->offset, to_read, 0);
 							if (bytes_received > 0) {
+								DEBUG_count_ += bytes_received;
 								m->offset += bytes_received;
-								if(m->remaining_len == 0){
+								if(!m->metadata_received){
 									if(m->offset < header_size){
 										continue;
 									}else{
 										Embarcadero::SubscribeHeader *header = (Embarcadero::SubscribeHeader*)buf;
+										CHECK_LT(header->len, buffer_size_) << "Subscribe batch is larger than buffer size";
+										VLOG(3) << "fd:" << fd << " batch_size:" << header->len << " received:" << m->offset;
 										m->remaining_len = header->len - m->offset;
 										m->first = header->first_id;
 										m->last = header->last_id;
 										m->broker_id = header->broker_id;
+										m->metadata_received = true;
 										break;
 									}
 								}else{
 									m->remaining_len -= bytes_received;
 								}
-
 							} else if (bytes_received == 0) {
 								LOG(ERROR) << "Server " << fd << " disconnected";
+								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+								close(fd);
+								//TODO(Jae) remove from other data structures
 								break;
 							} else {
 								if (errno != EWOULDBLOCK && errno != EAGAIN) {
-									LOG(ERROR) << "Recv failed for server " << fd;
+									LOG(ERROR) << "Recv failed for server " << fd << " " << strerror(errno);
 								}
 								break;
 							}
@@ -694,14 +755,12 @@ class Subscriber{
 			for(auto &new_broker: new_brokers_){
 				auto [addr, addressPort] = ParseAddressPort(new_broker.second);
 				int sock = GetNonblockingSock(addr.data(), PORT + new_broker.first);
-				broker_fds_.emplace_back(sock);
 				epoll_event ev;
 				ev.events = EPOLLIN | EPOLLET;
-				ev.data.ptr = &broker_fds_.back();
+				ev.data.fd = sock;
 				if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1) {
 					LOG(ERROR) << "Failed to add new server to epoll";
 					close(sock);
-					broker_fds_.pop_back();
 				} else {
 					std::pair<void*, msgIdx> msg(static_cast<void*>(malloc(buffer_size_)), msgIdx(0,0,0,new_broker.first,0));
 					std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(0,0,0,new_broker.first,0));
@@ -715,7 +774,11 @@ class Subscriber{
 					shake.last_addr = 0;
 					shake.client_req = Embarcadero::Subscribe;
 					memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
-					send(sock, &shake, sizeof(shake), 0);
+					int ret = send(sock, &shake, sizeof(shake), 0);
+					if(ret < 0){
+						LOG(ERROR) << "fd:" << sock << " addr:" << new_broker.second << " id:" << new_broker.first 
+							<< " failed:" << strerror(errno);
+					}
 				}
 			}
 			new_brokers_.clear();
@@ -905,7 +968,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	header.paddedSize = message_size + padding + sizeof(Embarcadero::MessageHeader);
 	header.segment_header = nullptr;
 	header.logical_offset = (size_t)-1; // Sentinel value
-	header.next_message = nullptr;
+	header.next_msg_diff = 0;
 
 	size_t run_count = total_message_size/message_size;
 
@@ -1152,24 +1215,29 @@ void ThroughputTestRaw(size_t total_message_size, size_t message_size, int num_t
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 }
 
-void PublishThroughputTest(size_t batch_size, size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order){
+void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
 	int n = total_message_size/message_size;
-	assert(n % batch_size == 0);
-	int n_batched = n / batch_size;
-
-	LOG(INFO) << "[Throuput Test] batch_size: " << batch_size << " total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
+	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
 	char topic[TOPIC_NAME_SIZE];
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
 
-	Client c("127.0.0.1", std::to_string(BROKER_PORT), n/4);
-	std::cout << "Client Created" << std::endl;
-	c.CreateNewTopic(topic, order);
+	size_t q_size = n/3;
+	if(q_size < 1024){
+		q_size = 1024;
+	}
+	Client c("127.0.0.1", std::to_string(BROKER_PORT), q_size);
+	LOG(INFO) << "Client Created" ;
+	c.CreateNewTopic(topic, order, seq_type);
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
 	auto start = std::chrono::high_resolution_clock::now();
-	for(int i=0; i<n_batched; i++){
+	size_t batch_size = 1; // TODO(erika): set batch size appropriately
+	for(int i = 0; i < (n / batch_size); i++) {
 		c.Publish(batch_size, message);
+	}
+	if (n % batch_size != 0) {
+		c.Publish(n % batch_size, message);
 	}
 	c.Poll(n);
 
@@ -1180,25 +1248,76 @@ void PublishThroughputTest(size_t batch_size, size_t total_message_size, size_t 
 	std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
 }
 
-void SubscribeThroughputTest(){
+void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size){
 	LOG(INFO) << "[Subscribe Throuput Test] ";
 	char topic[TOPIC_NAME_SIZE];
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
+	auto start = std::chrono::high_resolution_clock::now();
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
-	sleep(10);
+	s.DEBUG_wait(total_msg_size, msg_size);
+	auto end = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> elapsed = end - start;
+	double seconds = elapsed.count();
+	LOG(INFO) << (total_msg_size/(1024*1024))/seconds << "MB/s";
+}
+
+void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
+	int n = total_message_size/message_size;
+	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
+	std::string message(message_size, 0);
+	char topic[TOPIC_NAME_SIZE];
+	memset(topic, 0, TOPIC_NAME_SIZE);
+	memcpy(topic, "TestTopic", 9);
+
+	size_t q_size = n/3;
+	if(q_size < 1024){
+		q_size = 1024;
+	}
+	Client c("127.0.0.1", std::to_string(BROKER_PORT), q_size);
+	c.CreateNewTopic(topic, order, seq_type);
+	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
+	c.Init(num_threads, 0, topic, ack_level, order, message_size);
+
+	auto start = std::chrono::high_resolution_clock::now();
+	size_t batch_size = 1; // TODO(erika): set batch size appropriately
+	for(int i = 0; i < (n / batch_size); i++){
+		c.Publish(batch_size, message);
+	}
+	if (n % batch_size != 0) {
+		c.Publish(n % batch_size, message);
+	}
+	c.Poll(n);
+	auto pub_end = std::chrono::high_resolution_clock::now();
+	s.DEBUG_wait(total_message_size, message_size);
+	auto end = std::chrono::high_resolution_clock::now();
+
+	auto pub_duration = std::chrono::duration_cast<std::chrono::seconds>(pub_end - start);
+	auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
+	LOG(INFO) << "Pub Bandwidth: " << (total_message_size/(1024*1024))/pub_duration.count() << " MB/s";
+	LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
+
+}
+
+heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
+    if (value == "EMBARCADERO") return heartbeat_system::SequencerType::EMBARCADERO;
+    if (value == "KAFKA") return heartbeat_system::SequencerType::KAFKA;
+    if (value == "SCALOG") return heartbeat_system::SequencerType::SCALOG;
+    if (value == "CORFU") return heartbeat_system::SequencerType::CORFU;
+	 	throw std::runtime_error("Invalid SequencerType: " + value);
 }
 
 int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
 	FLAGS_logtostderr = 1; // log only to console, no files.
-	cxxopts::Options options("corfu-throughputTest", "Corfu Sequencer + Embarcadero Throughput Test");
+	cxxopts::Options options("embarcadero-throughputTest", "Embarcadero Throughput Test");
 
 	options.add_options()
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
 		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("0"))
+		("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", cxxopts::value<std::string>()->default_value("EMBARCADERO"))
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
@@ -1210,16 +1329,17 @@ int main(int argc, char* argv[]) {
 	size_t num_threads = result["num_thread"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
+	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 	FLAGS_v = result["log_level"].as<int>();
-	size_t batch_size = 1; // TODO: make this an actual argument
 
 	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
 		LOG(ERROR) << "CGroup core throttle is wrong";
 		return -1;
 	}
 
-	PublishThroughputTest(batch_size, total_message_size, message_size, num_threads, ack_level, order);
-	SubscribeThroughputTest();
+	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	SubscribeThroughputTest(total_message_size, message_size);
+	//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
 	return 0;
 }
