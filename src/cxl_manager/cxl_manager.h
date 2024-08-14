@@ -45,8 +45,11 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 
 		std::mutex mutex_;
 		std::condition_variable cv_;
+		std::condition_variable reset_cv_;
 
 		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(3000000);
+
+		int waiting_threads_count_ = 0;
 
 		int local_epoch_;
 

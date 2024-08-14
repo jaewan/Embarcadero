@@ -332,7 +332,6 @@ void ScalogSequencerService::SendLocalCut(int epoch, int local_cut, const char* 
 		std::cout << "Received local cut from broker " << broker_id_ << " with value " << local_cut << std::endl;
 		ReceiveLocalCut(epoch, topic, broker_id_);
 
-		std::cout << "Asynchronously sent local cut" << std::endl;
 	} else {
 
 		std::cout << "Sending local cut with grpc for topic: " << topic << std::endl;
@@ -424,26 +423,36 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 
 		global_epoch_++;
 
+		waiting_threads_count_ = broker_->GetNumBrokers() - 1;
 		cv_.notify_all();
+
+		// Wait until all threads have finished processing
+		reset_cv_.wait(lock, [this]() { return waiting_threads_count_ == 0; });
+
+		// Safely reset local_cuts_count_ after all threads have been notified and processed
+		local_cuts_count_ = 0;
+
+		std::cout << "Reset local_cuts_count_ to 0 after notifying all threads" << std::endl;
 	} else {
 		std::cout << "Calling receive local cut from broker: " << broker_id << std::endl;
 
-        cv_.wait(lock, [this]() {
-			std::cout << "I've been notified that all local cuts have been received" << std::endl;
+        cv_.wait(lock, [this, broker_id]() {
+			std::cout << "I've been notified that all local cuts have been received from broker: " << broker_id << std::endl;
 			std::cout << "Num brokers: " << broker_->GetNumBrokers() << std::endl;
 			std::cout << "Local cuts count: " << local_cuts_count_ << std::endl;
 			if (local_cuts_count_ == broker_->GetNumBrokers()) {
-				local_cuts_count_ = 0;
-
-				std::cout << "Set local cuts count to 0" << std::endl;
-
 				return true;
 			} else {
 				return false;
 			}
         });
 
-		std::cout << "Finished waiting for all local cuts to be received" << std::endl;
+		// Decrement waiting_threads_count_ after processing the notification
+		if (--waiting_threads_count_ == 0) {
+			reset_cv_.notify_one();
+		}		
+
+		std::cout << "Finished waiting for all local cuts to be received for broker: " << broker_id << std::endl;
 	}
 }
 
