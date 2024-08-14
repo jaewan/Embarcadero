@@ -1,13 +1,13 @@
 bootstrap: "172.18.0.1:9292,172.18.1.1:9092,172.18.2.1:9092,172.18.3.1:9092"
 producer: 1
 consumer: 1
-ack: all
+ack: "1"
 topic:
   name: kafka-benchmark
   partitions: 4
   replicationFactor: 2
 payload:
-  total: 209715200 # 1Gi
-  msgSize: 1024 # 4Ki
+  total: 536870912 # 2Gi
+  msgSize: 1048576 # 4Ki
 # entity: single, end2end
-entity: end2end
+entity: single

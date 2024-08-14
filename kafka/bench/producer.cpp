@@ -5,46 +5,55 @@
 #include <unistd.h>
 #include <vector>
 #include <fstream>
-#include <numeric>
 #include <yaml-cpp/yaml.h>
+#include <thread>
 
 #include "benchmark.hpp"
 
+#define POLLING_THREAD 4
 
 static Pipe pp;
-static long message_to_produce = 0, message_to_delivered = 0;
-static std::chrono::time_point<std::chrono::system_clock> start;
-static std::vector<long long> latency;
+static long payload_count = 0, produced = 0;
+static volatile long delivered = 0;
+static std::chrono::time_point<std::chrono::steady_clock> start;
+static long *latency = NULL;
+static bool measure_latency = false;
 
 class DeliveryReportCb : public RdKafka::DeliveryReportCb {
 public:
     void dr_cb(RdKafka::Message &message) override {
-        if (message.err()) {
+        if (message.err())
             std::cerr << "Message delivery failed: " << message.errstr() << std::endl;
-            message_to_produce++;
-        } else {
-            latency.push_back(timestamp_now() - get_timestamp(message.payload()));
-            if (--message_to_delivered == 0) {
+        else {
+            long idx = __sync_fetch_and_add(&delivered, 1);
+            latency[idx] = timestamp_now() - get_timestamp(message.payload());
+            // if (idx == 0)
+            //     std::cout << "first ack" << std::endl;
+            if (delivered == payload_count) {
+                // std::cout << "last ack" << std::endl;
+                long latency_sum = 0;
+                if (measure_latency) {
+                    sleep(1);
+                    std::ofstream outFile("producer_latency.csv");
+                    if (!outFile) {
+                        std::cerr << "Failed to open file" << std::endl;
+                        return;
+                    }
+                    for (size_t i = 0; i < payload_count; i++) {
+                        latency_sum += latency[i];
+                        outFile << latency[i];
+                        if (i != payload_count-1) {
+                            outFile << ',';
+                        }
+                    }
+                    outFile.close();
+                }
+
                 struct kafka_benchmark_throughput_report report;
                 report.start = start;
-                report.end = std::chrono::system_clock::now();
-                report.latency = std::chrono::nanoseconds(
-                    std::accumulate(latency.begin(), latency.end(), 0LL) / latency.size()
-                );
+                report.end = std::chrono::steady_clock::now();
+                report.latency = std::chrono::microseconds(latency_sum / payload_count);
                 write(pp.second, &report, sizeof(report));
-
-                std::ofstream outFile("producer_latency.csv");
-                if (!outFile) {
-                    std::cerr << "Failed to open file" << std::endl;
-                    return;
-                }
-                for (size_t i = 0; i < latency.size(); ++i) {
-                    outFile << latency[i];
-                    if (i != latency.size()-1) {
-                        outFile << ',';
-                    }
-                }
-                outFile.close();
             }
         }
     }
@@ -74,6 +83,18 @@ RdKafka::Producer *create_producer(const std::string& brokers, const std::string
         std::cerr << "% " << errstr << std::endl;
         exit(1);
     }
+
+    if (conf->set("message.max.bytes", "2097152", errstr) != RdKafka::Conf::CONF_OK) {
+        std::cerr << "% " << errstr << std::endl;
+        exit(1);
+    }
+
+    // default: 100000
+    // if (conf->set("queue.buffering.max.messages", "1", errstr) != RdKafka::Conf::CONF_OK) {
+    //     std::cerr << "% " << errstr << std::endl;
+    //     exit(1);
+    // }
+
     // Create the delivery report callback
     if (conf->set("dr_cb", &dr_cb, errstr) != RdKafka::Conf::CONF_OK) {
         std::cerr << "% " << errstr << std::endl;
@@ -88,6 +109,11 @@ RdKafka::Producer *create_producer(const std::string& brokers, const std::string
     return producer;
 }
 
+void ppoll(RdKafka::Producer *producer) {
+    while (delivered < payload_count) {
+        producer->poll(10);
+    }
+}
 
 int main(int argc, char **argv) {
     if (argc != 3) {
@@ -105,39 +131,55 @@ int main(int argc, char **argv) {
     while (true) {
         struct kafka_benchmark_spec spec;
         read(pp.first, &spec, sizeof(spec));
-        message_to_produce = message_to_delivered = spec.payload_count;
         auto payload_msg_size = spec.payload_msg_size;
+        payload_count = spec.payload_count;
+        produced = delivered = 0;
         void *buf;
         switch (spec.type) {
-            case B_BEGIN:
+            case B_SINGLE:
+                measure_latency = true;
+                [[fallthrough]];
+            case B_END2END:
+                {
+                std::vector<std::thread> poll_threads;
                 buf = malloc(payload_msg_size);
+                latency = (long *)calloc(payload_count, sizeof(long));
                 memset(buf, 0xAB, payload_msg_size);
-                latency.clear();
-                start = std::chrono::system_clock::now();
-                while (message_to_delivered > 0) {
+                for (auto i = 0; i < POLLING_THREAD; i++)
+                    poll_threads.emplace_back(ppoll, producer);
+                start = std::chrono::steady_clock::now();
+                // std::cout << "first produce" << std::endl;
+                while (produced < payload_count) {
                     set_timestamp(buf);
-                    if (message_to_produce > 0) {
-                        auto err = producer->produce(
-                            bench_config["topic"]["name"].as<std::string>(),
-                            RdKafka::Topic::PARTITION_UA,
-                            RdKafka::Producer::RK_MSG_COPY,
-                            buf,
-                            payload_msg_size,
-                            NULL, 0,
-                            0,
-                            NULL
-                        );
-                        if (err != RdKafka::ERR_NO_ERROR)
-                            std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
-                        else
-                            message_to_produce--;
-                    }
-                    producer->poll(1);
+                    auto err = producer->produce(
+                        bench_config["topic"]["name"].as<std::string>(),
+                        RdKafka::Topic::PARTITION_UA,
+                        RdKafka::Producer::RK_MSG_COPY,
+                        buf,
+                        payload_msg_size,
+                        NULL, 0,
+                        0,
+                        NULL
+                    );
+                    if (err == RdKafka::ERR__QUEUE_FULL)
+                        producer->poll(1);
+                    else if (err != RdKafka::ERR_NO_ERROR)
+                        std::cerr << "Failed to produce message: " << RdKafka::err2str(err) << std::endl;
+                    else
+                        produced++;
                 };
-                producer->flush(10 * 100);
-                producer->poll(1);
+                // std::cout << "last produce" << std::endl;
+                producer->flush(10 * 1000);
+                for (auto &t : poll_threads) {
+                    if (t.joinable()) {
+                        t.join();
+                    }
+                }
                 free(buf);
+                free(latency);
+                buf = latency = NULL;
                 break;
+                }
             case B_END:
                 return 0;
         }

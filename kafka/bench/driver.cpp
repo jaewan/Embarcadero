@@ -55,6 +55,12 @@ void create_topic(rd_kafka_t *rk, const std::string &topic_name, int num_partiti
     rd_kafka_event_t *event;
     rd_kafka_queue_t *queue = rd_kafka_queue_new(rk);
 
+    auto err = rd_kafka_NewTopic_set_config(new_topic, "max.message.bytes", "2097152");
+    if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
+        std::cerr << "Failed to set max.request.size." << std::endl;
+        exit(1);
+    }
+
     rd_kafka_CreateTopics(rk, &new_topic, 1, options, queue);
     event = rd_kafka_queue_poll(queue, 10000);
 
@@ -67,6 +73,7 @@ void create_topic(rd_kafka_t *rk, const std::string &topic_name, int num_partiti
         std::cout << "Topic " << topic_name << " created successfully." << std::endl;
     } else {
         std::cerr << "Failed to create topic " << topic_name << ": " << rd_kafka_event_error_string(event) << std::endl;
+        exit(1);
     }
 
     rd_kafka_event_destroy(event);
@@ -87,6 +94,9 @@ void delete_topic(rd_kafka_t *rk, const std::string &topic_name) {
     rd_kafka_DeleteTopics(rk, &del_topic, 1, options, queue);
     event = rd_kafka_queue_poll(queue, 10000);
 
+    if (!event)
+        std::cerr << "Failed to delete topic." << std::endl;
+
     if (rd_kafka_event_error(event) == RD_KAFKA_RESP_ERR_NO_ERROR) {
         std::cout << "Topic " << topic_name << " deleted successfully." << std::endl;
     } else {
@@ -101,6 +111,21 @@ void delete_topic(rd_kafka_t *rk, const std::string &topic_name) {
 
 int main(int argc, char **argv) {
     auto bench_config = YAML::LoadFile("./config.yaml");
+    std::string entity;
+    long payload_total = bench_config["payload"]["total"].as<long>();
+    long payload_msg_size;
+    if (argc == 1) {
+        entity = bench_config["entity"].as<std::string>();
+        payload_msg_size = bench_config["payload"]["msgSize"].as<long>();
+    }
+    else if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " $entity $msg_size" << std::endl;
+        return 1;
+    }
+    else {
+        entity = std::string(argv[1]);
+        payload_msg_size = std::atoi(argv[2]);
+    }
 
     // Create topic for benchmark
     char errstr[512];
@@ -118,6 +143,8 @@ int main(int argc, char **argv) {
     auto replication_factor = bench_config["topic"]["replicationFactor"].as<int>();
 
     create_topic(rk, topic_name, num_partitions, replication_factor);
+    rd_kafka_destroy(rk);
+    sleep(10);
 
     // Create producers and consumers
     auto num_producers = bench_config["producer"].as<int>();
@@ -135,63 +162,55 @@ int main(int argc, char **argv) {
     }
 
     // Do benchmark
-    auto entity = bench_config["entity"].as<std::string>();
-    auto payload_total = bench_config["payload"]["total"].as<long>();
-    auto payload_msg_size = bench_config["payload"]["msgSize"].as<long>();
-
-    struct kafka_benchmark_spec spec = {
-        .type = B_BEGIN
-    };
     struct kafka_benchmark_throughput_report report;
     if (entity == "single") {
+        struct kafka_benchmark_spec spec = {
+            .type = B_SINGLE
+        };
         spec.payload_count = payload_total / payload_msg_size / num_producers;
         spec.payload_msg_size = payload_msg_size;
         for (auto pp : producer_pipes)
             write(pp.second, &spec, sizeof(spec));
-        std::cout << "======Producer======" << std::endl;
-        int count = 0;
         for (auto pp : producer_pipes) {
-            count++;
             read(pp.first, &report, sizeof(report));
             auto sec = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::microseconds>(report.end - report.start).count()
             ) / 1000 / 1000;
             double throughput = (static_cast<double>(spec.payload_count * spec.payload_msg_size)) / sec;
-            std::cout << "producer " << count << " throughput: " << (throughput / (1<<20)) << "MiB/s latency: " << report.latency.count() << "ns" << std::endl;
+            std::cout << "Producer: " << (throughput / (1<<20)) << "MiB/s, " << report.latency.count() << "us" << std::endl;
         }
 
-        sleep(3);
+        sleep(10);
         // Consume message
         spec.payload_count = payload_total / payload_msg_size / num_consumers;
         spec.payload_msg_size = payload_msg_size;
         for (auto pp : consumer_pipes)
             write(pp.second, &spec, sizeof(spec));
-        std::cout << "======Consumer======" << std::endl;
-        count = 0;
         for (auto pp : consumer_pipes) {
-            count++;
             read(pp.first, &report, sizeof(report));
             auto sec = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::microseconds>(report.end - report.start).count()
             ) / 1000 / 1000;
             double throughput = (static_cast<double>(spec.payload_count * spec.payload_msg_size)) / sec;
-            std::cout << "consumer " << count << " " << (throughput / (1<<20)) << "MiB/s" << std::endl;
+            std::cout << "Consumer: " << (throughput / (1<<20)) << "MiB/s" << std::endl;
         }
     } else if (entity == "end2end") {
+        struct kafka_benchmark_spec spec = {
+            .type = B_END2END
+        };
         // Start consumer
         spec.payload_count = payload_total / payload_msg_size / num_consumers;
         spec.payload_msg_size = payload_msg_size;
         for (auto pp : consumer_pipes)
             write(pp.second, &spec, sizeof(spec));
-        sleep(3);
+        sleep(10);
         // Start producer
         spec.payload_count = payload_total / payload_msg_size / num_producers;
         spec.payload_msg_size = payload_msg_size;
         for (auto pp : producer_pipes)
             write(pp.second, &spec, sizeof(spec));
-        std::cout << "======End2end throughput test result======" << std::endl;
-        auto start = std::chrono::time_point<std::chrono::system_clock>::max();
-        auto end = std::chrono::time_point<std::chrono::system_clock>::min();
+        auto start = std::chrono::time_point<std::chrono::steady_clock>::max();
+        auto end = std::chrono::time_point<std::chrono::steady_clock>::min();
         for (auto pp : producer_pipes) {
             read(pp.first, &report, sizeof(report));
             // Find first producer's start time
@@ -208,18 +227,15 @@ int main(int argc, char **argv) {
             std::chrono::duration_cast<std::chrono::microseconds>(report.end - report.start).count()
         ) / 1000 / 1000;
         double throughput = (static_cast<double>(spec.payload_count * spec.payload_msg_size)) / sec;
-        // TODO latency
-        std::cout << "end2end throughput: " << (throughput / (1<<20)) << "MiB/s latency: " << report.latency.count() << "ns" << std::endl;
+        std::cout << "End2end: " << (throughput / (1<<20)) << "MiB/s, " << report.latency.count() << "us" << std::endl;
     } else {
         std::cerr << "Unknown entity " << entity << std::endl;
     }
 
-    // Delete topic for benchmark
-    delete_topic(rk, topic_name);
-    rd_kafka_destroy(rk);
-
     // Collect producers and consumers
-    spec.type = B_END;
+    struct kafka_benchmark_spec spec = {
+        .type = B_END
+    };
     for (auto pp : producer_pipes)
         write(pp.second, &spec, sizeof(spec));
     for (auto pp : consumer_pipes)
@@ -235,6 +251,9 @@ int main(int argc, char **argv) {
         waitpid(pid, &status, 0);
         std::cout << "consumer " << pid << " exit " << status << std::endl;
     }
+
+    // Delete topic for benchmark
+    // delete_topic(rk, topic_name);
 
     return 0;
 }
