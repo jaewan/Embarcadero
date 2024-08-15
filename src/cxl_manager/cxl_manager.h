@@ -91,7 +91,7 @@ class CXLManager{
 		}
 
 	private:
-		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;
+		std::vector<folly::MPMCQueue<std::optional<struct PublishRequest>>> requestQueues_;
 		int broker_id_;
 		int num_io_threads_;
 		std::vector<std::thread> threads_;
@@ -110,7 +110,7 @@ class CXLManager{
 
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
 														struct MessageHeader** msg_to_order, struct TInode *tinode);
-		void CXLIOThread();
+		void CXLIOThread(int tid);
 		void Sequencer1(char* topic);
 		void Sequencer2(char* topic);
 };
