@@ -276,7 +276,7 @@ void NetworkManager::ReqReceiveThread(){
 							pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
 							pub_req.counter->store(2);
 							cxl_manager_->EnqueueRequest(pub_req);
-							disk_manager_->EnqueueRequest(pub_req);
+							//disk_manager_->EnqueueRequest(pub_req);
 
 							buf = mi_malloc(READ_SIZE);
 							to_read = READ_SIZE;
@@ -300,6 +300,7 @@ void NetworkManager::ReqReceiveThread(){
 							reply_shake.len = messages_size;
 							reply_shake.first_id = ((MessageHeader*)messages)->logical_offset;
 							reply_shake.last_id = last_offset;
+							reply_shake.broker_id = broker_id_;
 							// Send
 							VLOG(3) << "Sending " << messages_size << " first:" << reply_shake.first_id << " last:" << reply_shake.last_id;;
 							size_t ret = send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
