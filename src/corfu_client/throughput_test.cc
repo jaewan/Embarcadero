@@ -215,7 +215,7 @@ class Client{
 			if (status.ok()) {
 				uint32_t order = res.order_start();
 				size_t num_queues = pubQues_.size();
-				printf("Corfu Sequencer Order: %d\n", order);
+				// printf("Corfu Sequencer Order: %d\n", order);
 				for (uint32_t i = order; i < order + batch_size; i++) {
 					PubQueueEntry entry {
 						client_order_.fetch_add(1), // local order
@@ -530,6 +530,7 @@ class Client{
 				PubQueueEntry e = optReq.value();
 				header.total_order = e.order;
 				header.client_order = e.local_order;
+				//printf("Total Order: %ld, Local Order: %ld\n", header.total_order, header.client_order);
 
 				bool send_msg = true;
 				sent_bytes = 0;

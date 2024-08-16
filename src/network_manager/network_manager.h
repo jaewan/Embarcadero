@@ -22,6 +22,7 @@ enum ClientRequestType {Publish, Subscribe};
 struct NetworkRequest{
 	int client_socket;
 	int efd;
+	bool success;
 };
 
 struct alignas(32) SubscribeHeader{
