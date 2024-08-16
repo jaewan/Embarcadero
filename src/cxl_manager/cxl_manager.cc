@@ -71,8 +71,8 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type){
 	}
 
 	if(broker_id == 0){
-		memset(addr, 0, (1UL<<35));
-		//memset(addr, 0, CXL_SIZE);
+		//memset(addr, 0, (1UL<<35));
+		memset(addr, 0, CXL_SIZE);
 		VLOG(3) << "Cleared CXL:" << CXL_SIZE;
 	}
 	return addr;
