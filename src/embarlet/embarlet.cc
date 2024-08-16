@@ -92,7 +92,7 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Managers ********************** 
 	// Queue Size (1UL<<22)(1UL<<25)(1UL<<25) respectly performed 6GB/s 1kb message disk thread:8 cxl:16 network: 32
-	Embarcadero::CXLManager cxl_manager((1UL<<30), broker_id, cxl_type, num_cxl_io_threads);
+	Embarcadero::CXLManager cxl_manager((1UL<<22), broker_id, cxl_type, num_cxl_io_threads);
 	Embarcadero::DiskManager disk_manager((1UL<<25));
 	Embarcadero::NetworkManager network_manager(128, broker_id, num_network_io_threads);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
