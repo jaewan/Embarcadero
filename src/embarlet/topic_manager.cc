@@ -101,7 +101,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	if(tinode->seq_type != KAFKA)
+	if(tinode->seq_type == EMBARCADERO)
 		topics_[topic]->Combiner();
 	return tinode;
 }
@@ -128,7 +128,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	if(seq_type != KAFKA)
+	if(seq_type == EMBARCADERO)
 		topics_[topic]->Combiner();
 	return tinode;
 }
@@ -146,7 +146,7 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequen
 void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
-void TopicManager::PublishToCXL(PublishRequest &req){
+bool TopicManager::PublishToCXL(PublishRequest &req){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
@@ -155,15 +155,15 @@ void TopicManager::PublishToCXL(PublishRequest &req){
 			topic_itr = topics_.find(req.topic);
 			if(topic_itr == topics_.end()){
 				LOG(ERROR) << "Topic Entry was not created Something is wrong";
-				return;
+				return false;
 			}
 		}else{
 			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic
 			<< " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
-			return;
+			return false;
 		}
 	}
-	topic_itr->second->PublishToCXL(req);
+	return topic_itr->second->PublishToCXL(req);
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -194,10 +194,14 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
-		if(seq_type == KAFKA){
+		if(seq_type == KAFKA || seq_type == CORFU){
 			WriteToCXLFunc = &Topic::WriteToCXLWithMutex;
 		}else{
 			WriteToCXLFunc = &Topic::WriteToCXL;
+		}
+
+		if (seq_type == CORFU){
+
 		}
 	}
 
@@ -242,7 +246,7 @@ void Topic::Combiner(){
 
 // MessageHeader is already included from network manager
 // For performance (to not have any mutex) have a separate combiner to give logical offsets  to the messages
-void Topic::WriteToCXL(PublishRequest &req){
+bool Topic::WriteToCXL(PublishRequest &req){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 
@@ -262,9 +266,10 @@ void Topic::WriteToCXL(PublishRequest &req){
 		}
 	}
 	memcpy_nt((void*)log, req.payload_address, msgSize);
+	return true;
 }
 
-void Topic::WriteToCXLWithMutex(PublishRequest &req){
+bool Topic::WriteToCXLWithMutex(PublishRequest &req){
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 	unsigned long long int log;
 	size_t logical_offset;
@@ -305,6 +310,7 @@ void Topic::WriteToCXLWithMutex(PublishRequest &req){
 				(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
 		}
 	}
+	return true;
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message

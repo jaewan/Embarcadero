@@ -153,7 +153,7 @@ void CXLManager::CXLIOThread(int tid){
 		struct PublishRequest &req = optReq.value();
 
 		// Actual IO to the CXL
-		topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
+		bool success = topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
 
 		// Post I/O work (as disk I/O depend on the same payload)
 		/*
@@ -164,6 +164,7 @@ void CXLManager::CXLIOThread(int tid){
 		}else if(req.acknowledge){
 			struct NetworkRequest ackReq;
 			ackReq.client_socket = req.client_socket;
+			ackReq.success = success;
 			network_manager_->EnqueueRequest(ackReq);
 		}
 		*/
