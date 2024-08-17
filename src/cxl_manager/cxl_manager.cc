@@ -281,6 +281,8 @@ ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int brok
 	std::cout << "Finished starting scalog sequencer" << std::endl;
 }
 
+/// TODO: Change to while
+/// TODO: Can use high resolution clock instead
 void ScalogSequencerService::LocalSequencer(const char* topic){
 	auto start_time = std::chrono::steady_clock::now();
 
