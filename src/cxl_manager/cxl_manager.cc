@@ -246,7 +246,6 @@ void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
 ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int broker_id, const char* topic, HeartBeatManager* broker, void* cxl_addr, std::string scalog_seq_address) :
 	cxl_manager_(cxl_manager),
 	broker_id_(broker_id),
-	timer_(io_service_),
 	broker_(broker),
 	cxl_addr_(cxl_addr) {
 
@@ -265,60 +264,49 @@ ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int brok
 
 	local_epoch_ = 0;
 
-	// // Start scalog_io_service_thread_
-	io_service_thread_ = std::make_unique<std::thread>([this] {
-		// Keep io_service_ alive.
-		boost::asio::io_service::work io_service_work_(io_service_);
-		io_service_.run();
-	});
-
 	std::string topic_str(topic);
-	io_service_.dispatch([this, topic_str] {
-		std::cout << "Sending local cuts for topic " << topic_str << " to global sequencer" << std::endl;
-		LocalSequencer(topic_str.c_str());
-	});
+	std::thread local_sequencer_thread(&ScalogSequencerService::LocalSequencer, this, topic_str);
+	local_sequencer_thread.detach();
 
 	std::cout << "Finished starting scalog sequencer" << std::endl;
 }
 
-/// TODO: Change to while
-/// TODO: Can use high resolution clock instead
-void ScalogSequencerService::LocalSequencer(const char* topic){
-	auto start_time = std::chrono::steady_clock::now();
+void ScalogSequencerService::LocalSequencer(std::string topic_str){
+
+	const char* topic = topic_str.c_str();
 
 	std::cout << "Calling local sequencer for topic: " << topic << std::endl;
-
 	struct TInode *tinode = (struct TInode *) cxl_manager_->GetTInode(topic);
 	global_cut_ = absl::flat_hash_map<int, int>();
 
-	std::cout << "Sending local cut: " << tinode->offsets[broker_id_].written << std::endl;
+	while(true) {
+		auto start_time = std::chrono::high_resolution_clock::now();
 
-	/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
-	SendLocalCut(local_epoch_, tinode->offsets[broker_id_].written, topic);
+		std::cout << "Sending local cut: " << tinode->offsets[broker_id_].written << std::endl;
 
-	local_epoch_++;
+		/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
+		SendLocalCut(local_epoch_, tinode->offsets[broker_id_].written, topic);
 
-	auto end_time = std::chrono::steady_clock::now();
-	auto elapsed_time_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+		local_epoch_++;
 
-	// print elapsed time
-	std::cout << "Elapsed time: " << elapsed_time_us.count() << " us" << std::endl;
-	
-	std::string topic_str(topic);
-	if (elapsed_time_us < local_cut_interval_) {
-		auto interval = boost::posix_time::microseconds((local_cut_interval_ - elapsed_time_us).count());
+		auto end_time = std::chrono::high_resolution_clock::now();
+		auto elapsed_time_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
 
-		// print interval
-		std::cout << "Interval to wait: " << interval.total_microseconds() << " us" << std::endl;
+		// print elapsed time
+		std::cout << "Elapsed time: " << elapsed_time_us.count() << " us" << std::endl;
+		
+		std::string topic_str(topic);
+		if (elapsed_time_us < local_cut_interval_) {
+            auto remaining_time = local_cut_interval_ - elapsed_time_us;
 
-		timer_.expires_from_now(interval);
-		timer_.async_wait([this, topic_str](const boost::system::error_code& ec) {
-			if (!ec) {
-				LocalSequencer(topic_str.c_str()); 
-			}
-		});
-	} else {
-		LocalSequencer(topic);
+			std::cout << "Waiting for remaining time: " << remaining_time.count() << " us" << std::endl;
+
+            // Busy-wait until the remaining time has passed
+            auto wait_start_time = std::chrono::high_resolution_clock::now();
+            while (std::chrono::high_resolution_clock::now() - wait_start_time < remaining_time) {
+                std::this_thread::yield();
+            }
+		}
 	}
 }
 

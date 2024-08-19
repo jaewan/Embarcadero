@@ -63,17 +63,7 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 
 		bool has_global_sequencer_;
 
-        /// Thread to run the io_service in a loop
-        std::unique_ptr<std::thread> io_service_thread_;
-
-        /// IO context that peers use to post tasks
-        boost::asio::io_context io_service_;
-
-		/// Timer used to perform async wait before sending the next local cut
-		using Timer = boost::asio::deadline_timer;
-		Timer timer_;
-
-		void LocalSequencer(const char* topic);
+		void LocalSequencer(std::string topic_str);
 		void GlobalSequencer(const char* topic);
 		void SendLocalCut(int epoch, int local_cut, const char* topic);
 		void ReceiveGlobalCut(absl::flat_hash_map<int, int>  global_cut, const char* topic);
