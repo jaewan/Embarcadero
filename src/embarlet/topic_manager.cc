@@ -251,7 +251,7 @@ bool Topic::WriteToCXL(PublishRequest &req){
 	bool skipped_message = false;
 
 	if (seq_type_ == CORFU) {
-		size_t num_brokers = 2; // TODO(erika): get this from message header?
+		size_t num_brokers = 1; // TODO(erika): get this from message header?
 
 		std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 		while (true) {
