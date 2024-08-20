@@ -171,7 +171,7 @@ void CXLManager::CXLIOThread(int tid){
 		ackReq.client_socket = req.client_socket;
 		ackReq.success = success;
 		ackReq.client_order = req.client_order;
-		mi_free(req.counter);
+		//mi_free(req.counter);
 		mi_free(req.payload_address);
 		network_manager_->EnqueueRequest(ackReq);
 

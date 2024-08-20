@@ -55,6 +55,7 @@ class Topic{
 		int order_;
 		heartbeat_system::SequencerType seq_type_;
 		void* cxl_addr_;
+		size_t topic_sequence_num_;
 
 		std::atomic<uint32_t> corfu_global_sequence_{0};
 
