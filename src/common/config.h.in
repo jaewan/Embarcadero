@@ -43,7 +43,7 @@ struct PublishRequest{
 	size_t client_order; // Must start from 0
 	char topic[TOPIC_NAME_SIZE];
 	bool acknowledge;
-	std::atomic<int> *counter;
+	size_t total_order;
 	void* payload_address;
 	size_t paddedSize;
 	int client_socket;

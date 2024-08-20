@@ -175,10 +175,9 @@ void NetworkManager::ReqReceiveThread(){
 								}
 								if(to_read == 0){
 									pub_req.size = header->size;
-									pub_req.client_order = header->client_order;
+									pub_req.client_order = header->global_order;
 									pub_req.payload_address = (void*)buf;
-									pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
-									pub_req.counter->store(2);
+									pub_req.total_order = header->total_order
 									cxl_manager_->EnqueueRequest(pub_req);
 									disk_manager_->EnqueueRequest(pub_req);
 
@@ -273,8 +272,7 @@ void NetworkManager::ReqReceiveThread(){
 							pub_req.paddedSize = header->paddedSize;
 							pub_req.client_order = header->client_order;
 							pub_req.payload_address = (void*)buf;
-							pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
-							pub_req.counter->store(2);
+							pub_req.total_order = header->total_order;
 							cxl_manager_->EnqueueRequest(pub_req);
 							//disk_manager_->EnqueueRequest(pub_req);
 
