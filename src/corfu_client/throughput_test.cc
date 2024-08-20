@@ -237,7 +237,7 @@ class Client{
 		}
 
 		size_t Poll(size_t n) {
-			size_t resend_count;
+			size_t resend_count = 0;
 			while(ack_count_.load() != n && (resend_count = resend_count_.exchange(0)) == 0){
 				std::this_thread::yield();
 			}
@@ -407,11 +407,11 @@ class Client{
 							}
 							for (size_t i = 0; i < bytes_received / sizeof(struct AckResponse); i++) {
 								if (!buf[i].success) {
-									//LOG(ERROR) << "RECEIVED NEGATIVE ACK (" << buf[i].success << ") FOR " << buf[i].client_order;
+									LOG(ERROR) << "RECEIVED NEGATIVE ACK (" << buf[i].success << ") FOR " << buf[i].client_order;
 									resend_count_.fetch_add(1);
 									ack_count_.fetch_add(1);
 								} else {
-									//LOG(INFO) << "RECEIVED ACK FOR: " << buf[i].client_order;
+									LOG(INFO) << "RECEIVED ACK FOR: " << buf[i].client_order;
 									ack_count_.fetch_add(1);
 								}
 							}
@@ -1000,7 +1000,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 	header.client_id = CLIENT_ID;
 	header.size = message_size;
 	header.total_order = 0;
-	header.client_order = client_order_.fetch_add(1);
+	header.client_order = client_order_;
 	int padding = message_size % 64;
 	if(padding){
 		padding = 64 - padding;
@@ -1046,7 +1046,7 @@ std::vector<std::chrono::time_point<std::chrono::high_resolution_clock>> send_da
 				if(sent_bytes == shake.size){
 					sent_bytes = 0;
 					num_send_called_this_msg = 0;
-					header.client_order = client_order_.fetch_add(1);
+					header.client_order = client_order_;
 				}else{
 					if(record_latency && num_send_called_this_msg>1){
 						times.pop_back();
@@ -1190,6 +1190,7 @@ void SingleClientMultipleThreads(size_t num_threads, size_t total_message_size, 
 	file.close();
 
 	// Calculate bandwidth
+	// TODO(erika): I don't think this is valid, because some client orders are holes due to CORFU logic.
 	double bandwidthMbps = ((client_order_ * message_size) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
 
 	LOG(INFO) << "Bandwidth:" << bandwidthMbps << " MBps" ;
@@ -1281,6 +1282,7 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	size_t resend_count;
 	size_t total_sent = n;
 	while (0 < (resend_count = c.Poll(total_sent))) {
+		LOG(ERROR) << "RESENDCOUNT: " << resend_count;
 		for(size_t i = 0; i < (resend_count / batch_size); i++) {
 			c.Publish(batch_size, message);
 		}
@@ -1288,6 +1290,7 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 			c.Publish(resend_count % batch_size, message);
 		}
 		total_sent += resend_count;
+		LOG(ERROR) << "TOTAL SENT: " << total_sent;
 	}
 	auto end = std::chrono::high_resolution_clock::now();
 	c.Shutdown();
