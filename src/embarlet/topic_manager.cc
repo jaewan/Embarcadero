@@ -101,7 +101,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	if(tinode->seq_type == EMBARCADERO)
+	if(tinode->seq_type != KAFKA)
 		topics_[topic]->Combiner();
 	return tinode;
 }
@@ -128,7 +128,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	if(seq_type == EMBARCADERO)
+	if(seq_type != KAFKA)
 		topics_[topic]->Combiner();
 	return tinode;
 }
@@ -194,14 +194,10 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
-		if(seq_type == KAFKA || seq_type == CORFU){
+		if(seq_type == KAFKA){
 			WriteToCXLFunc = &Topic::WriteToCXLWithMutex;
 		}else{
 			WriteToCXLFunc = &Topic::WriteToCXL;
-		}
-
-		if (seq_type == CORFU){
-
 		}
 	}
 
