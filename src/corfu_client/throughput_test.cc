@@ -1255,7 +1255,7 @@ void ThroughputTestRaw(size_t total_message_size, size_t message_size, int num_t
 	//MultipleClientsSingleThread(num_threads, total_message_size, message_size, ack_level);
 }
 
-void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
+void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, size_t batch_size){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Throughput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
@@ -1272,7 +1272,6 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	c.CreateNewTopic(topic, order, seq_type);
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
 	auto start = std::chrono::high_resolution_clock::now();
-	size_t batch_size = 1; // TODO(erika): set batch size appropriately
 	for(size_t i = 0; i < (n / batch_size); i++) {
 		c.Publish(batch_size, message);
 	}
@@ -1371,7 +1370,8 @@ int main(int argc, char* argv[]) {
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10066329600"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"))
+		("b,batch_size", "Batch size for publish", cxxopts::value<size_t>()->default_value("1"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
@@ -1379,6 +1379,7 @@ int main(int argc, char* argv[]) {
 	size_t num_threads = result["num_thread"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
+	int batch_size = result["batch_size"].as<size_t>();
 	FLAGS_v = result["log_level"].as<int>();
 
 	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
@@ -1386,7 +1387,7 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
-	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, SequencerType::CORFU);
+	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, SequencerType::CORFU, batch_size);
 	//SubscribeThroughputTest(total_message_size, message_size);
 	//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
