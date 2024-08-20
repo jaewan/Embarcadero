@@ -409,7 +409,6 @@ class Client{
 								if (!buf[i].success) {
 									LOG(ERROR) << "RECEIVED NEGATIVE ACK (" << buf[i].success << ") FOR " << buf[i].client_order;
 									resend_count_.fetch_add(1);
-									ack_count_.fetch_add(1);
 								} else {
 									LOG(INFO) << "RECEIVED ACK FOR: " << buf[i].client_order;
 									ack_count_.fetch_add(1);
@@ -1280,17 +1279,14 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 		c.Publish(n % batch_size, message);
 	}
 	size_t resend_count;
-	size_t total_sent = n;
-	while (0 < (resend_count = c.Poll(total_sent))) {
-		LOG(ERROR) << "RESENDCOUNT: " << resend_count;
+	while (0 < (resend_count = c.Poll(n))) {
+		LOG(ERROR) << "RESEND COUNT: " << resend_count;
 		for(size_t i = 0; i < (resend_count / batch_size); i++) {
 			c.Publish(batch_size, message);
 		}
 		if (resend_count % batch_size != 0) {
 			c.Publish(resend_count % batch_size, message);
 		}
-		total_sent += resend_count;
-		LOG(ERROR) << "TOTAL SENT: " << total_sent;
 	}
 	auto end = std::chrono::high_resolution_clock::now();
 	c.Shutdown();
