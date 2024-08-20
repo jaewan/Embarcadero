@@ -164,15 +164,18 @@ void CXLManager::CXLIOThread(int tid){
 		}else if(req.acknowledge){
 			struct NetworkRequest ackReq;
 			ackReq.client_socket = req.client_socket;
-			ackReq.success = success;
 			network_manager_->EnqueueRequest(ackReq);
 		}
 		*/
-		mi_free(req.counter);
-		mi_free(req.payload_address);
 		struct NetworkRequest ackReq;
 		ackReq.client_socket = req.client_socket;
+		ackReq.success = success;
+		ackReq.client_order = req.client_order;
+		mi_free(req.counter);
+		mi_free(req.payload_address);
 		network_manager_->EnqueueRequest(ackReq);
+
+
 	}
 }
 

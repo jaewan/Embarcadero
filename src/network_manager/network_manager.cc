@@ -343,33 +343,39 @@ void NetworkManager::ReqReceiveThread(){
 void NetworkManager::AckThread(){
 	std::optional<struct NetworkRequest> optReq;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	char buf[128];
+	struct AckResponse buf[128];
 	struct epoll_event events[10]; // Adjust size as needed
 
 	while(!stop_threads_){
 		size_t ack_count = 0;
-		while(ackQueue_.read(optReq)){
-			ack_count++;
+		// Can only read in size of max ack buff
+		while(ackQueue_.read(optReq) && ack_count <= 128){
 			if(!optReq.has_value()){
-				ack_count--;
 				break;
+			} else {
+				const struct NetworkRequest &req = optReq.value();
+				buf[ack_count].success = req.success;
+				buf[ack_count].client_order = req.client_order;
+				ack_count++;
 			}
 		}
-		//const struct NetworkRequest &req = optReq.value();
+
 		int EPOLL_TIMEOUT = -1; 
-		size_t acked_size = 0;
-		while (acked_size < ack_count) {
+		size_t total_bytes_sent = 0;
+		size_t total_bytes_to_send = ack_count * sizeof(struct AckResponse);
+		while (total_bytes_sent < total_bytes_to_send) {
 			int n = epoll_wait(ack_efd_, events, 10, EPOLL_TIMEOUT);
 			for (int i = 0; i < n; i++) {
-				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
-					ssize_t bytesSent = send(ack_fd_, buf, ack_count - acked_size, 0);
-					if (bytesSent < 0) {
+				if (events[i].events & EPOLLOUT && total_bytes_sent < total_bytes_to_send) {
+					ssize_t bytes_sent = send(ack_fd_, &(((char *)buf)[total_bytes_sent]), total_bytes_to_send - total_bytes_sent, 0);
+					if (bytes_sent < 0) {
 						if (errno != EAGAIN) {
 							LOG(ERROR) << " Ack Send failed:";
+							stop_threads_ = true;
 							return;
 						}
 					} else {
-						acked_size += bytesSent;
+						total_bytes_sent += bytes_sent;
 					}
 				}
 			}
@@ -378,8 +384,8 @@ void NetworkManager::AckThread(){
 		if(ack_fd_ > 0){
 			int result = recv(ack_fd_, buf, 1, MSG_PEEK | MSG_DONTWAIT);
 			if(result == 0){
-				LOG(INFO) << "Connection is closed ack_fd_:" << ack_fd_ ;
-				//stop_threads_ = true;
+				LOG(ERROR) << "Connection is closed ack_fd_:" << ack_fd_ ;
+				stop_threads_ = true;
 				break;
 			}
 		}

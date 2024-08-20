@@ -29,6 +29,12 @@
 using heartbeat_system::HeartBeat;
 using heartbeat_system::SequencerType;
 
+// TODO(erika): this should be in common, maybe?
+struct AckResponse {
+	bool success;
+	size_t client_order;
+};
+
 struct PubQueueEntry {
 	size_t local_order;
 	size_t order;
@@ -145,7 +151,7 @@ int GenerateRandomNum(){
 class Client{
 	public:
 		Client(std::string head_addr, std::string port, size_t queueSize):
-			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), total_queue_size_(queueSize), client_order_(0){
+			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), total_queue_size_(queueSize), client_order_(0), ack_count_(0), resend_count_(0) {
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				client_id_ = GenerateRandomNum();
@@ -230,13 +236,17 @@ class Client{
 			}
 		}
 
-		void Poll(int n){
-			while(client_order_ != n){
+		size_t Poll(size_t n) {
+			size_t resend_count;
+			while(ack_count_.load() != n && (resend_count = resend_count_.exchange(0)) == 0){
 				std::this_thread::yield();
 			}
+			return resend_count;
+		}
+
+		void Shutdown() {
 			shutdown_ = true;
 			ack_thread_.join();
-			return;
 		}
 
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
@@ -268,6 +278,8 @@ class Client{
 		std::vector<folly::MPMCQueue<std::optional<PubQueueEntry>>> pubQues_;
 		absl::flat_hash_map<int, int> broker_id_to_queue_idx_;
 		std::atomic<size_t> client_order_;
+		std::atomic<size_t> ack_count_;
+		std::atomic<size_t> resend_count_;
 		int num_threads_;
 		int msg_copy_;
 		char topic_[TOPIC_NAME_SIZE];
@@ -331,12 +343,11 @@ class Client{
 
 			int max_events = nodes_.size();
 			std::vector<epoll_event> events(max_events);
-			char buffer[1024];
-			size_t total_received = 0;
+			struct AckResponse buf[128];
 			int EPOLL_TIMEOUT = 1; // 1 millisecond timeout
 			std::vector<int> client_sockets;
 
-			while (!shutdown_ || total_received < client_order_) {
+			while (!shutdown_) {
 				int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
 				for (int i = 0; i < num_events; i++) {
 					if (events[i].data.fd == server_sock) {
@@ -363,25 +374,53 @@ class Client{
 					} else {
 						// Data from existing client
 						int client_sock = events[i].data.fd;
-						ssize_t bytes_received;
+						ssize_t bytes_received = 0;
 
-						while (total_received < client_order_ && (bytes_received = recv(client_sock, buffer, 1024, 0)) > 0) {
-							total_received += bytes_received;
-							// Process received data here
-							// For example, you might want to count the number of 1-byte messages:
-							// message_count += bytes_received;
+						while (!shutdown_ && (bytes_received = recv(client_sock, (char *)buf, 128 * sizeof(struct AckResponse), 0)) > 0) {
+							//LOG(ERROR) << "Received " << bytes_received << "bytes";
+							//LOG(ERROR) << "Received " << bytes_received / sizeof(struct AckResponse) << " acks";
+							if (bytes_received % sizeof(struct AckResponse) != 0) {
+								// Handle partial receive 
+								// TODO(erika): this code path isn't well tested
+								ssize_t bytes_to_receive = sizeof(struct AckResponse) - (bytes_received % sizeof(struct AckResponse));
+								ssize_t inner_bytes_received = 0;
+								while (!shutdown_ && (inner_bytes_received = recv(client_sock, &(((char *)buf)[bytes_received]), bytes_to_receive, 0)) > 0) {
+									if (bytes_received == -1) {
+										if (errno != EAGAIN && errno != EWOULDBLOCK) {
+											// Error occurred
+											LOG(ERROR) << "recv error: " << strerror(errno);
+											shutdown_ = true;
+											epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
+											close(client_sock);
+											client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
+											return;
+										}
+									} else {
+										bytes_received += inner_bytes_received;
+										if (bytes_received % sizeof(struct AckResponse) == 0) {
+											break;
+										} else {
+											bytes_to_receive -= inner_bytes_received;
+										}
+									}
+								}
+							}
+							for (size_t i = 0; i < bytes_received / sizeof(struct AckResponse); i++) {
+								if (!buf[i].success) {
+									//LOG(ERROR) << "RECEIVED NEGATIVE ACK (" << buf[i].success << ") FOR " << buf[i].client_order;
+									resend_count_.fetch_add(1);
+									ack_count_.fetch_add(1);
+								} else {
+									//LOG(INFO) << "RECEIVED ACK FOR: " << buf[i].client_order;
+									ack_count_.fetch_add(1);
+								}
+							}
 						}
-
-						if (bytes_received == 0) {
-							// Connection closed by client
-							std::cout << "Client disconnected. Total bytes received: " << total_received << std::endl;
-							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
-							close(client_sock);
-							client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
-						} else if (bytes_received == -1) {
+						if (bytes_received == -1) {
 							if (errno != EAGAIN && errno != EWOULDBLOCK) {
 								// Error occurred
-								std::cerr << "recv error: " << strerror(errno) << std::endl;
+								LOG(ERROR) << "recv error: " << strerror(errno);
+								shutdown_ = true;
 								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 								close(client_sock);
 								client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
@@ -1217,7 +1256,7 @@ void ThroughputTestRaw(size_t total_message_size, size_t message_size, int num_t
 }
 
 void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
-	int n = total_message_size/message_size;
+	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Throughput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
 	char topic[TOPIC_NAME_SIZE];
@@ -1234,15 +1273,26 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	c.Init(num_threads, 0, topic, ack_level, order, message_size);
 	auto start = std::chrono::high_resolution_clock::now();
 	size_t batch_size = 1; // TODO(erika): set batch size appropriately
-	for(int i = 0; i < (n / batch_size); i++) {
+	for(size_t i = 0; i < (n / batch_size); i++) {
 		c.Publish(batch_size, message);
 	}
 	if (n % batch_size != 0) {
 		c.Publish(n % batch_size, message);
 	}
-	c.Poll(n);
-
+	size_t resend_count;
+	size_t total_sent = n;
+	while (0 < (resend_count = c.Poll(total_sent))) {
+		for(size_t i = 0; i < (resend_count / batch_size); i++) {
+			c.Publish(batch_size, message);
+		}
+		if (resend_count % batch_size != 0) {
+			c.Publish(resend_count % batch_size, message);
+		}
+		total_sent += resend_count;
+	}
 	auto end = std::chrono::high_resolution_clock::now();
+	c.Shutdown();
+
 	std::chrono::duration<double> elapsed = end - start;
 	double seconds = elapsed.count();
 	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
@@ -1282,7 +1332,7 @@ void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_t
 
 	auto start = std::chrono::high_resolution_clock::now();
 	size_t batch_size = 1; // TODO(erika): set batch size appropriately
-	for(int i = 0; i < (n / batch_size); i++){
+	for(size_t i = 0; i < (n / batch_size); i++){
 		c.Publish(batch_size, message);
 	}
 	if (n % batch_size != 0) {
