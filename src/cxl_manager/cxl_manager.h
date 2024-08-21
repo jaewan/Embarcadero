@@ -43,31 +43,52 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		void* cxl_addr_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
 
+		/// Used in ReceiveLocalCut() to properly update local_cuts_count_
 		std::mutex mutex_;
+
+		/// Used in ReceiveLocalCut() to wait for all local cuts to be received
 		std::condition_variable cv_;
 		std::condition_variable reset_cv_;
 
+		/// Time between each local cut
 		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(3000000);
 
+		/// Used to keep track of how many grpc threads are waiting for the notification
+		/// If it's greater than 0, we can't reset the local epoch
 		int waiting_threads_count_ = 0;
 
+		/// Each local sequencer keeps track of its own local epoch
 		int local_epoch_;
 
+		/// The head node keeps track of the global epoch and increments it whenever we complete a round of local cuts
 		int global_epoch_;
 
+		/// Used by the head node to keep track of how many local cuts it has received
 		int local_cuts_count_;
 
 		bool received_global_cut_;
 
+		/// The key is the broker id and the value is its corresponding local cut
 		absl::flat_hash_map<int, int> global_cut_;
 
 		bool has_global_sequencer_;
 
+		/// Called when first starting the scalog local sequencer. It manages
+		/// the timing between each local cut
 		void LocalSequencer(std::string topic_str);
-		void GlobalSequencer(const char* topic);
+
+		/// Sends a local cut to the head node	
 		void SendLocalCut(int epoch, int local_cut, const char* topic);
+
+		/// Receives the global cut from the head node
+		/// This function is called in the callback of the send local cut grpc call
 		void ReceiveGlobalCut(absl::flat_hash_map<int, int>  global_cut, const char* topic);
+
+		/// Keep track of the global cut and if all the local cuts have been received
 		void ReceiveLocalCut(int epoch, const char* topic, int broker_id);
+
+		/// Updates the total ordering of the messages based on the global cut
+		/// The global cut is a map where the key is the broker id and the value is the local cut
 		void UpdateTotalOrdering(absl::flat_hash_map<int, int>  global_cut, struct TInode *tinode);
 };
 
@@ -139,12 +160,14 @@ class CXLManager {
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType);
-		void StartScalogLocalSequencer(std::string topic_str);
 //#define InternalTest 1
 		void* GetCXLAddr(){return cxl_addr_;}
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
+
+		/// Initializes the scalog sequencer service and starts the grpc server
+		void StartScalogLocalSequencer(std::string topic_str);
 
 	private:
 		folly::MPMCQueue<std::optional<struct PublishRequest>> requestQueue_;

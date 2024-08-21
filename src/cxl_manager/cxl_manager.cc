@@ -15,6 +15,7 @@
 #include "mimalloc.h"
 #include <sys/socket.h>
 #include <netdb.h>
+#include <emmintrin.h>
 
 namespace Embarcadero{
 
@@ -249,6 +250,7 @@ ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int brok
 	broker_(broker),
 	cxl_addr_(cxl_addr) {
 
+	/// For now, only the head node will have the global sequencer and send global cuts
 	if (broker_id_ == 0) {
 		std::cout << "Starting scalog sequencer in head for topic: " << topic << std::endl;
 		has_global_sequencer_ = true;
@@ -261,12 +263,16 @@ ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int brok
 	}
 
 	received_global_cut_ = false;
-
 	local_epoch_ = 0;
 
+	/// New thread for the local sequencer is required in the head so we can also run the grpc server
 	std::string topic_str(topic);
-	std::thread local_sequencer_thread(&ScalogSequencerService::LocalSequencer, this, topic_str);
-	local_sequencer_thread.detach();
+	if (broker_id_ == 0) {
+		std::thread local_sequencer_thread(&ScalogSequencerService::LocalSequencer, this, topic_str);
+		local_sequencer_thread.detach();
+	} else {
+		LocalSequencer(topic_str);
+	}
 
 	std::cout << "Finished starting scalog sequencer" << std::endl;
 }
@@ -290,27 +296,29 @@ void ScalogSequencerService::LocalSequencer(std::string topic_str){
 		local_epoch_++;
 
 		auto end_time = std::chrono::high_resolution_clock::now();
+
+		/// We measure the time it takes to send the local cut
 		auto elapsed_time_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
 
-		// print elapsed time
 		std::cout << "Elapsed time: " << elapsed_time_us.count() << " us" << std::endl;
 		
 		std::string topic_str(topic);
+
+		/// In the case where we receive the global cut before the interval has passed, we wait for the remaining time left in the interval
 		if (elapsed_time_us < local_cut_interval_) {
             auto remaining_time = local_cut_interval_ - elapsed_time_us;
 
 			std::cout << "Waiting for remaining time: " << remaining_time.count() << " us" << std::endl;
 
-            // Busy-wait until the remaining time has passed
             auto wait_start_time = std::chrono::high_resolution_clock::now();
             while (std::chrono::high_resolution_clock::now() - wait_start_time < remaining_time) {
-                std::this_thread::yield();
+                // std::this_thread::yield();
+				_mm_pause();
             }
 		}
 	}
 }
 
-// Helper function that allows a local scalog sequencer to send their local cut
 void ScalogSequencerService::SendLocalCut(int epoch, int local_cut, const char* topic) {
 	if (has_global_sequencer_ == true) {
 
@@ -320,6 +328,8 @@ void ScalogSequencerService::SendLocalCut(int epoch, int local_cut, const char* 
 		global_cut_[broker_id_] = local_cut;
 
 		std::cout << "Received local cut from broker " << broker_id_ << " with value " << local_cut << std::endl;
+
+		/// Call local function to receive local cut instead of grpc
 		ReceiveLocalCut(epoch, topic, broker_id_);
 
 	} else {
@@ -338,6 +348,8 @@ void ScalogSequencerService::SendLocalCut(int epoch, int local_cut, const char* 
 		std::mutex mu;
 		std::condition_variable cv;
 		bool done = false;
+
+		/// Callback is called when all followers are ready to receive the global cut
 		auto callback = [this, topic, &response, &mu, &cv, &done](grpc::Status status) {
 			if (!status.ok()) {
 				std::cout << "Error sending local cut: " << status.error_message() << std::endl;
@@ -355,12 +367,15 @@ void ScalogSequencerService::SendLocalCut(int epoch, int local_cut, const char* 
 
 			std::lock_guard<std::mutex> lock(mu);
 			done = true;
+
+			/// Notify the main thread that the callback has been called
 			cv.notify_one();
 		};
 
 		// Async call to HandleStartLocalSequencer
 		stub_->async()->HandleSendLocalCut(&context, &request, &response, callback);
 
+		/// Wait until the callback has been called so it doesn't go out of scope
 		std::unique_lock<std::mutex> lock(mu);
     	cv.wait(lock, [&done] { return done; });
 	}
@@ -380,6 +395,7 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 
 	ReceiveLocalCut(epoch, topic, broker_id);
 
+	/// Convert global_cut_ to google::protobuf::Map<int64_t, int64_t>
 	auto* mutable_global_cut = response->mutable_global_cut();
 	for (const auto& entry : global_cut_) {
 		(*mutable_global_cut)[static_cast<int64_t>(entry.first)] = static_cast<int64_t>(entry.second);
@@ -399,7 +415,6 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 
 	std::unique_lock<std::mutex> lock(mutex_);
 
-	// increment local_cuts_count_
 	local_cuts_count_++;
 
 	if (local_cuts_count_ == broker_->GetNumBrokers()) {
@@ -414,18 +429,21 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 		global_epoch_++;
 
 		waiting_threads_count_ = broker_->GetNumBrokers() - 1;
+
+		/// Notify all waiting grpc threads that the global cut has been received
 		cv_.notify_all();
 
-		// Wait until all threads have finished processing
+		/// Wait until all threads have been notified before resetting local_cuts_count_
 		reset_cv_.wait(lock, [this]() { return waiting_threads_count_ == 0; });
 
-		// Safely reset local_cuts_count_ after all threads have been notified and processed
+		/// Safely reset local_cuts_count_ after all threads have been notified and processed
 		local_cuts_count_ = 0;
 
 		std::cout << "Reset local_cuts_count_ to 0 after notifying all threads" << std::endl;
 	} else {
 		std::cout << "Calling receive local cut from broker: " << broker_id << std::endl;
 
+		/// If we haven't received all local cuts, the grpc thread must wait until we do to send the correct global cut back to the caller
         cv_.wait(lock, [this, broker_id]() {
 			std::cout << "I've been notified that all local cuts have been received from broker: " << broker_id << std::endl;
 			std::cout << "Num brokers: " << broker_->GetNumBrokers() << std::endl;
@@ -437,8 +455,9 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 			}
         });
 
-		// Decrement waiting_threads_count_ after processing the notification
+		/// Decrement waiting_threads_count_ after processing the notification
 		if (--waiting_threads_count_ == 0) {
+			/// This notifies the waiting thread that we can reset local_cuts_count_ to 0
 			reset_cv_.notify_one();
 		}		
 
