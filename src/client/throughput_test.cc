@@ -276,8 +276,8 @@ class Buffer{
 			return true;
 		}
 
-		void* Read(int bufIdx, size_t &len, bool ignore_batch=false){
-			while(!shutdown_ &&!ignore_batch && (bufs[bufIdx].tail - bufs[bufIdx].head) < batch_size_){
+		void* Read(int bufIdx, size_t &len ){
+			while(!shutdown_ && bufs[bufIdx].tail <= bufs[bufIdx].head){
 				std::this_thread::yield();
 			}
 			size_t head = bufs[bufIdx].head;
@@ -307,7 +307,7 @@ class Buffer{
 class Client{
 	public:
 		Client(std::string head_addr, std::string port, int num_threads, size_t message_size, size_t queueSize):
-			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0), batch_size_((1UL)<<17),
+			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0), batch_size_(BATCH_SIZE),
 			client_id_(GenerateRandomNum()), num_threads_(num_threads), message_size_(message_size),
 			pubQue_(num_threads, batch_size_, queueSize, client_id_, message_size){
 				std::string addr = head_addr+":"+port;
@@ -383,11 +383,11 @@ class Client{
 		void DEBUG_check_send_finish(){
 			LOG(INFO) << "DEBUG_check_send_finish called" ;
 			pubQue_.ReturnReads();
-			shutdown_ = true;
 			for(auto &t : threads_){
 				if(t.joinable())
 					t.join();
 			}
+			shutdown_ = true;
 			double avg = 0;
 			for(auto time:DEBUG_send_time_){
 				avg += time;
@@ -674,11 +674,15 @@ class Client{
 			double poll_time = 0;
 			std::vector<double> send_times;
 			std::vector<double> poll_times;
+			std::vector<int> send_lens;;
 			thread_count_.fetch_add(1);
 			while(!shutdown_){
 				size_t len;
 				auto start = std::chrono::high_resolution_clock::now();
 				void *msg = pubQue_.Read(pubQuesIdx, len);
+				send_lens.push_back(len);
+				if(len == 0)
+					break;
 				auto end = std::chrono::high_resolution_clock::now();
 				std::chrono::duration<double> elapsed = end - start;
 				poll_time += elapsed.count();
@@ -687,12 +691,20 @@ class Client{
 
 				sent_bytes = 0;
 				int backoff = 1;
+				size_t ZERO_COPY_SEND_LIMIT = (1UL)<<23;
 				start = std::chrono::high_resolution_clock::now();
 				while(sent_bytes < len){
-					ssize_t bytesSent = send(sock, (uint8_t*)msg + sent_bytes, len - sent_bytes, MSG_ZEROCOPY);
+					size_t remaining_bytes = len - sent_bytes;
+					size_t to_send = std::min(remaining_bytes, ZERO_COPY_SEND_LIMIT);
+					ssize_t bytesSent;
+					if(to_send < 1UL<<16)
+						bytesSent = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
+					else
+						bytesSent = send(sock, (uint8_t*)msg + sent_bytes, to_send, MSG_ZEROCOPY);
 					if (bytesSent > 0) {
 						sent_bytes += bytesSent;
 						backoff = 1;
+						ZERO_COPY_SEND_LIMIT = (1UL)<<23;
 					} else if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
 						struct epoll_event events[10];
 						int n = epoll_wait(efd, events, 10, -1);
@@ -708,10 +720,11 @@ class Client{
 						// Exponential backoff
 						std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
 						backoff = std::min(backoff * 2, 1000); // Cap backoff at 1000ms
+						ZERO_COPY_SEND_LIMIT = std::max(ZERO_COPY_SEND_LIMIT / 2, 1UL<<16); // Cap backoff at 1000ms
 					} else if (bytesSent < 0) {
 						LOG(ERROR) << "send failed: " << strerror(errno);
 						sent_bytes -= bytesSent;
-						//exit(1);
+						exit(1);
 					}
 				}
 				end = std::chrono::high_resolution_clock::now();
@@ -726,11 +739,15 @@ class Client{
 			}
 			std::ofstream send_file(std::to_string(pubQuesIdx) + "send_times.csv");
 			std::ofstream poll_file(std::to_string(pubQuesIdx) + "poll_times.csv");
+			std::ofstream len_file(std::to_string(pubQuesIdx) + "send_len.csv");
 			for (const auto& value : send_times) {
 				send_file << value << "\n";
 			}
 			for (const auto& value : poll_times) {
 				poll_file << value << "\n";
+			}
+			for (const auto l : send_lens) {
+				len_file << l << "\n";
 			}
 
 			// Close the files
