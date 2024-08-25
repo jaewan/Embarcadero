@@ -24,6 +24,7 @@ namespace Embarcadero{
 #define NUM_CXL_IO_THREADS 16 
 #define NUM_NETWORK_IO_THREADS 10
 #define NUM_ACK_THREADS 1
+#define CORFU_TIMEOUT_MICROSEC 500000
 
 //********* Health check configs *********
 #define HEARTBEAT_INTERVAL 3 // in seconds

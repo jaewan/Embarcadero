@@ -224,7 +224,8 @@ class Client{
 				// printf("Corfu Sequencer Order: %d\n", order);
 				for (uint32_t i = order; i < order + batch_size; i++) {
 					PubQueueEntry entry {
-						client_order_.fetch_add(1), // local order
+						nodes_.size(), //TODO(erika) - this is hack for getting num brokers, could be: 
+						// client_order_.fetch_add(1), // local order
 						i, 							// order
 						message.data(), 			// message
 					};
@@ -407,10 +408,10 @@ class Client{
 							}
 							for (size_t i = 0; i < bytes_received / sizeof(struct AckResponse); i++) {
 								if (!buf[i].success) {
-									LOG(ERROR) << "RECEIVED NEGATIVE ACK (" << buf[i].success << ") FOR " << buf[i].client_order;
+									//LOG(ERROR) << "RECEIVED NEGATIVE ACK (" << buf[i].success << ") FOR " << buf[i].client_order;
 									resend_count_.fetch_add(1);
 								} else {
-									LOG(INFO) << "RECEIVED ACK FOR: " << buf[i].client_order;
+									//LOG(INFO) << "RECEIVED ACK FOR: " << buf[i].client_order;
 									ack_count_.fetch_add(1);
 								}
 							}
@@ -1280,7 +1281,7 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	}
 	size_t resend_count;
 	while (0 < (resend_count = c.Poll(n))) {
-		LOG(ERROR) << "RESEND COUNT: " << resend_count;
+		//LOG(ERROR) << "RESEND COUNT: " << resend_count;
 		for(size_t i = 0; i < (resend_count / batch_size); i++) {
 			c.Publish(batch_size, message);
 		}
