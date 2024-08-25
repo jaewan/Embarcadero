@@ -187,7 +187,7 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 	order_(order),
 	seq_type_(seq_type),
 	cxl_addr_(cxl_addr),
-	topic_sequence_num_(0),
+	topic_sequence_num_(broker_id),
 	current_segment_(segment_metadata){
 		logical_offset_ = 0;
 		written_logical_offset_ = (size_t)-1;
@@ -251,7 +251,8 @@ bool Topic::WriteToCXL(PublishRequest &req){
 	bool skipped_message = false;
 
 	if (seq_type_ == CORFU) {
-		size_t num_brokers = 1; // TODO(erika): get this from message header?
+		size_t num_brokers = req.client_order; // TODO(erika): this is a hack for now, but client order isn't used for anything else.
+		//LOG(ERROR) << "NUM BROKERS IS: " << num_brokers;
 
 		std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 		while (true) {
@@ -259,30 +260,32 @@ bool Topic::WriteToCXL(PublishRequest &req){
 			if (topic_sequence_num_ == req.total_order) {
 				topic_sequence_num_ += num_brokers;
 				log = log_addr_.fetch_add(msgSize);
+				//LOG(ERROR) << "ACCEPTED: " << req.total_order << " TOPIC COUNT: " << topic_sequence_num_;
 				written_mutex_.Unlock();
-				LOG(ERROR) << "ACCEPTED: " << req.total_order << "TOPIC COUNT: " << topic_sequence_num_;
 				break;
 			} else if (topic_sequence_num_ > req.total_order) {
+				//LOG(ERROR) << "SKIPPED: " << req.total_order << " TOPIC COUNT: " << topic_sequence_num_;
 				written_mutex_.Unlock();
 				// We were skipped due to timeout!
-				LOG(ERROR) << "SKIPPED: " << req.total_order << "TOPIC COUNT: " << topic_sequence_num_;
 				skipped_message = true;
 				break;
 			} else {
 				// We need to wait for timeout
 				written_mutex_.Unlock();
 				std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-				// TODO(erika): make timeout a configurable value, set at 0.5 seconds for now
-				if (std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() > 500000) {
+				if (std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() > CORFU_TIMEOUT_MICROSEC) {
 					{
 						absl::MutexLock lock(&written_mutex_);
 						if (topic_sequence_num_ <= req.total_order) {
-							topic_sequence_num_ += req.total_order + num_brokers;
+							// clients should be sending round-robin
+							//assert((req.total_order - topic_sequence_num_) % num_brokers == 0);
+
+							topic_sequence_num_ = req.total_order + num_brokers;
 							log = log_addr_.fetch_add(msgSize);
-							LOG(ERROR) << "ACCEPTED AFTER TIMEOUT: " << req.total_order << "TOPIC COUNT: " << topic_sequence_num_;
+							//LOG(ERROR) << "ACCEPTED AFTER TIMEOUT: " << req.total_order << " TOPIC COUNT: " << topic_sequence_num_;
 							break;
 						} else {
-							LOG(ERROR) << "SKIPPED AFTER TIMEOUT: " << req.total_order << "TOPIC COUNT: " << topic_sequence_num_;
+							//LOG(ERROR) << "SKIPPED AFTER TIMEOUT: " << req.total_order << " TOPIC COUNT: " << topic_sequence_num_;
 							skipped_message = true;
 						}
 					}
@@ -291,13 +294,13 @@ bool Topic::WriteToCXL(PublishRequest &req){
 				std::this_thread::yield();
 			}
 		}
+		req.client_order = req.total_order;
 		if (skipped_message) {
 			return false;
 		}
 
-		// TODO(erika): populate data that sequencer would normally populate?
 	} else {
-		unsigned long long int log = log_addr_.fetch_add(msgSize);
+		log = log_addr_.fetch_add(msgSize);
 	}
 
 	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
