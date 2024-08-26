@@ -18,26 +18,37 @@
 namespace Embarcadero{
 
 #define MAX_EVENTS 10
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-//#define EPOLL 1
-
-inline void make_socket_non_blocking(int sfd) {
-	int flags = fcntl(sfd, F_GETFL, 0);
+inline void make_socket_non_blocking(int fd) {
+	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags == -1) {
 		perror("fcntl F_GETFL");
 		return ;
 	}
 
 	flags |= O_NONBLOCK;
-	if (fcntl(sfd, F_SETFL, flags) == -1) {
+	if (fcntl(fd, F_SETFL, flags) == -1) {
 		perror("fcntl F_SETFL");
 		return ;
+	}
+
+	int flag = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
+		perror("setsockopt(SO_REUSEADDR) failed");
+		close(fd);
+		return ;
+	}
+	if(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
+		perror("setsockopt error");
+		close(fd);
+		return;
 	}
 }
 
 NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads):
 	requestQueue_(queueCapacity),
-	ackQueue_(10000000),
+	ackQueue_(10000),
 	broker_id_(broker_id),
 	num_reqReceive_threads_(num_reqReceive_threads){
 		// Create Network I/O threads
@@ -72,6 +83,13 @@ void NetworkManager::EnqueueRequest(struct NetworkRequest req){
 }
 
 void NetworkManager::ReqReceiveThread(){
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+	CPU_SET(thread_count_.load() + 16, &cpuset);
+	pthread_t current_thread = pthread_self();
+	if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) != 0) {
+			LOG(ERROR) << "Error setting thread affinity" ;
+	}
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct NetworkRequest> optReq;
 
@@ -84,42 +102,6 @@ void NetworkManager::ReqReceiveThread(){
 		struct sockaddr_in client_address;
 		socklen_t client_address_len = sizeof(client_address);
 		getpeername(req.client_socket, (struct sockaddr*)&client_address, &client_address_len);
-#ifdef EPOLL
-		// Set socket as non-blocking and epoll
-		make_socket_non_blocking(req.client_socket);
-		struct epoll_event event;
-		int efd = req.efd;
-		event.data.fd = req.client_socket;
-		//TODO(Jae) add write after read test
-		event.events = EPOLLIN;
-		if(epoll_ctl(efd, EPOLL_CTL_ADD, req.client_socket, &event) == -1){
-			std::cerr << "!!!!! Error epoll_ctl:" << strerror(errno) << std::endl;
-			return;
-		}
-
-		struct epoll_event events[MAX_EVENTS]; 
-
-		//Handshake
-		EmbarcaderoReq shake;
-		int i,n;
-		size_t to_read = sizeof(shake);
-		bool running = true;
-		while(to_read > 0){
-			n = epoll_wait(efd, events, MAX_EVENTS, -1);
-			for( i=0; i< n; i++){
-				if((events[i].events & EPOLLIN) && events[i].data.fd == req.client_socket){
-					int ret = read(req.client_socket, &shake, to_read);
-					to_read -= ret;
-					if(to_read == 0){
-						if(i == n-1){
-							n = epoll_wait(efd, events, MAX_EVENTS, -1);
-						}
-						break;
-					}
-				}
-			}
-		}, messages;
-#else
 		//Handshake
 		EmbarcaderoReq shake;
 		size_t to_read = sizeof(shake);
@@ -135,62 +117,9 @@ void NetworkManager::ReqReceiveThread(){
 				break;
 			}
 		}
-#endif
 		switch(shake.client_req){
 			case Publish:
 				{
-#ifdef EPOLL
-					size_t READ_SIZE = shake.size;
-					to_read = READ_SIZE;
-					void* buf = mi_malloc(READ_SIZE);
-
-					// Create publish request
-					struct PublishRequest pub_req;
-					pub_req.client_id = shake.client_id;
-					memcpy(pub_req.topic, shake.topic, 31);
-					pub_req.acknowledge = shake.ack;
-					pub_req.client_socket = req.client_socket;
-
-					while(running){
-						for ( ; i < n; i++) {
-							if((events[i].events & EPOLLIN)&& events[i].data.fd == req.client_socket){
-								int bytes_read = recv(req.client_socket, (uint8_t*)buf + (READ_SIZE - to_read), to_read, 0);
-								if(bytes_read <= 0 && errno != EAGAIN){
-									LOG(INFO) << "Receiving data ERROR:" << strerror(errno);
-									break;
-								}
-								to_read -= bytes_read;
-								size_t read = READ_SIZE - to_read;
-								MessageHeader *header;
-								if(read > sizeof(MessageHeader)){
-									header = (MessageHeader*)buf;
-									if(header->client_id == -1){
-										free(buf);
-										running = false;
-										//TODO(Jae) we do not want to close it for ack
-										epoll_ctl(efd, EPOLL_CTL_DEL, req.client_socket, nullptr);
-										close(req.client_socket);
-										break;
-									}
-								}
-								if(to_read == 0){
-									pub_req.size = header->size;
-									pub_req.client_order = header->client_order;
-									pub_req.payload_address = (void*)buf;
-									pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
-									pub_req.counter->store(2);
-									cxl_manager_->EnqueueRequest(pub_req);
-									disk_manager_->EnqueueRequest(pub_req);
-
-									buf = mi_malloc(READ_SIZE);
-									to_read = READ_SIZE;
-								}
-							}
-						}
-						n = epoll_wait(efd, events, 10, -1);
-						i = 0;
-					}
-#else
 					if(strlen(shake.topic) == 0){
 						LOG(ERROR) << "Topic cannot be null:" << shake.topic;
 						return;
@@ -211,18 +140,6 @@ void NetworkManager::ReqReceiveThread(){
 							}
 
 							make_socket_non_blocking(ack_fd);
-
-							int flag = 1;
-							if (setsockopt(ack_fd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-								perror("setsockopt(SO_REUSEADDR) failed");
-								close(ack_fd);
-								return ;
-							}
-							if(setsockopt(ack_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
-								perror("setsockopt error");
-								close(ack_fd);
-								return;
-							}
 
 							sockaddr_in server_addr; 
 							memset(&server_addr, 0, sizeof(server_addr));
@@ -246,19 +163,24 @@ void NetworkManager::ReqReceiveThread(){
 							ack_connections_[shake.client_id] = ack_fd;
 						}
 					}
-					size_t READ_SIZE = shake.size;
+					//size_t READ_SIZE = shake.size;
+					size_t READ_SIZE = ZERO_COPY_SEND_LIMIT;
 					to_read = READ_SIZE;
-					void* buf = mi_malloc(READ_SIZE);
+					// Allow 4K buffer space as messages can go over batch size
+					size_t buf_size = READ_SIZE + MAX_MSG_SIZE + sizeof(MessageHeader);
+					void* buf = mi_malloc(buf_size);
 
 					// Create publish request
 					struct PublishRequest pub_req;
-					pub_req.client_id = shake.client_id;
 					memcpy(pub_req.topic, shake.topic, TOPIC_NAME_SIZE);
 					pub_req.acknowledge = shake.ack;
 					pub_req.client_socket = ack_fd;
 
+					size_t read = 0;
+					int num_msg = 0;
+					MessageHeader *header = (MessageHeader*)buf;
 					while(running){
-						int bytes_read = recv(req.client_socket, (uint8_t*)buf + (READ_SIZE - to_read), to_read, 0);
+						int bytes_read = recv(req.client_socket, (uint8_t*)buf + read, to_read, 0);
 						if(bytes_read <= 0){
 							if(bytes_read < 0)
 								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
@@ -266,23 +188,38 @@ void NetworkManager::ReqReceiveThread(){
 							running = false;
 							break;
 						}
-						to_read -= bytes_read;
-						//TODO(Jae) Change this to malloc here to allow dynamic message size during one connection
-						if(to_read == 0){
-							MessageHeader *header = (MessageHeader*)buf;;
-							pub_req.paddedSize = header->paddedSize;
-							pub_req.client_order = header->client_order;
-							pub_req.payload_address = (void*)buf;
-							pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>)); 
-							pub_req.counter->store(2);
-							cxl_manager_->EnqueueRequest(pub_req);
-							//disk_manager_->EnqueueRequest(pub_req);
+						read += bytes_read;
+						size_t total_size = 0;
+						if(read >= sizeof(MessageHeader)){
+							while(read >= header->paddedSize){
+								num_msg++;
+								read -= header->paddedSize;
+								total_size += header->paddedSize;
+								if(read < sizeof(MessageHeader)){
+									break;
+								}
+								header = (MessageHeader*)((uint8_t*)header + header->paddedSize);
+							}
+						}
 
-							buf = mi_malloc(READ_SIZE);
+						to_read -= bytes_read;
+
+						if(num_msg > 0){
+							pub_req.payload_address = (void*)buf;
+							pub_req.num_messages = num_msg;
+							pub_req.total_size = total_size;
+							void *new_buf = mi_malloc(READ_SIZE);
+							if(read){
+								memcpy(new_buf, (uint8_t*)buf + total_size, read);
+							}
+							cxl_manager_->EnqueueRequest(pub_req);
+
+							header = (MessageHeader*)new_buf;;
+							buf = new_buf;
 							to_read = READ_SIZE;
+							num_msg = 0;
 						}	
 					}
-#endif
 					close(req.client_socket);
 				}// end Publish
 				break;
@@ -343,7 +280,8 @@ void NetworkManager::ReqReceiveThread(){
 void NetworkManager::AckThread(){
 	std::optional<struct NetworkRequest> optReq;
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	char buf[128];
+	size_t bufSize = 1024*1024;
+	char buf[bufSize];
 	struct epoll_event events[10]; // Adjust size as needed
 
 	while(!stop_threads_){
@@ -355,17 +293,16 @@ void NetworkManager::AckThread(){
 				break;
 			}
 		}
-		//const struct NetworkRequest &req = optReq.value();
 		int EPOLL_TIMEOUT = -1; 
 		size_t acked_size = 0;
 		while (acked_size < ack_count) {
 			int n = epoll_wait(ack_efd_, events, 10, EPOLL_TIMEOUT);
 			for (int i = 0; i < n; i++) {
 				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
-					ssize_t bytesSent = send(ack_fd_, buf, ack_count - acked_size, 0);
+					ssize_t bytesSent = send(ack_fd_, buf, MIN(bufSize, ack_count - acked_size), 0);
 					if (bytesSent < 0) {
 						if (errno != EAGAIN) {
-							LOG(ERROR) << " Ack Send failed:";
+							LOG(ERROR) << " Ack Send failed:" << strerror(errno) << " ack_fd:" << ack_fd_ << " ack size:" << (ack_count - acked_size);
 							return;
 						}
 					} else {
@@ -402,8 +339,6 @@ void NetworkManager::MainThread(){
 		return ;
 	}
 	setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-
-	//make_socket_non_blocking(server_socket);
 
 	struct sockaddr_in server_address;
 	server_address.sin_family = AF_INET;

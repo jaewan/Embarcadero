@@ -246,7 +246,7 @@ void Topic::WriteToCXL(PublishRequest &req){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 
-	size_t msgSize = req.paddedSize;
+	size_t msgSize = req.total_size;
 
 	unsigned long long int log = log_addr_.fetch_add(msgSize);
 	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
@@ -271,7 +271,7 @@ void Topic::WriteToCXLWithMutex(PublishRequest &req){
 	bool new_segment_alloced = false;
 
 	MessageHeader *header = (MessageHeader*)req.payload_address;
-	size_t msgSize = req.paddedSize;
+	size_t msgSize = req.total_size;
 
 	{
 		absl::MutexLock lock(&mutex_);

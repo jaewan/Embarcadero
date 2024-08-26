@@ -6,6 +6,7 @@
 #include "../cxl_manager/cxl_manager.h"
 #include <string>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -14,6 +15,8 @@
 
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
+
+#define CGROUP_BASE "/sys/fs/cgroup/embarcadero_cgroup"
 
 bool CheckAvailableCores(){
 	sleep(1);
@@ -34,6 +37,38 @@ bool CheckAvailableCores(){
 		}
 	}
 	return num_cores == CGROUP_CORE;
+}
+
+bool AttachCgroup(int broker_id){
+		int fd = open((CGROUP_BASE + std::to_string(broker_id) + "/cgroup.procs").c_str(), O_WRONLY);
+		if (fd < 0){
+			LOG(ERROR) << "Cgroup open failed:" << strerror(errno);
+			return false;
+		}
+		std::string pid_str = std::to_string(getpid());
+		if(write(fd, pid_str.c_str(), pid_str.length()) < 0){
+			LOG(ERROR) << "Attaching to the cgroup failed:" << strerror(errno) << 
+			" If Permission denied, chown the cgroup.procs file try again with 'sudo setcap cap_sys_admin,cap_dac_override,cap_dac_read_search=eip ./embarlet and run ./embarlet again' or just sudo";
+			return false;
+		}
+		close(fd);
+		/*
+		std::string netns_path = "/var/run/netns/embarcadero_netns" + std::to_string(broker_id);
+    int netns_fd = open(netns_path.c_str(), O_RDONLY);
+    if (netns_fd < 0) {
+        LOG(ERROR) << "Opening network namespace failed: " << strerror(errno);
+        return false;
+    }
+
+    if (setns(netns_fd, CLONE_NEWNET) < 0) {
+        LOG(ERROR) << "Attaching to network namespace failed: " << strerror(errno);
+        close(netns_fd);
+        return false;
+    }
+
+    close(netns_fd);
+		*/
+		return true;
 }
 
 int main(int argc, char* argv[]){
@@ -76,9 +111,11 @@ int main(int argc, char* argv[]){
 
 	LOG(INFO) << "Starting Embarlet broker_id:" << broker_id;
 	// Check Cgroup setting
-	if(arguments["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
-		LOG(ERROR) << "CGroup core throttle is wrong";
-		return -1;
+	if(arguments["run_cgroup"].as<int>() > 0){
+		if(!AttachCgroup(broker_id) || !CheckAvailableCores()){
+			LOG(ERROR) << "CGroup core throttle is wrong";
+			return -1;
+		}
 	}
 
 	Embarcadero::CXL_Type cxl_type = Embarcadero::CXL_Type::Real;
@@ -100,6 +137,20 @@ int main(int argc, char* argv[]){
 	if(is_head_node){
 		cxl_manager.RegisterGetRegisteredBrokersCallback(std::bind(&HeartBeatManager::GetRegisteredBrokers, &heartbeat_manager, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 	}
+
+	/*
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+	int quota = 48;
+	int base = quota + (broker_id * quota);
+	for (int i = base; i <= base + quota; ++i) {
+			CPU_SET(i, &cpuset);
+	}
+	pthread_t current_thread = pthread_self();
+	if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) != 0) {
+			LOG(ERROR) << "Error setting thread affinity" ;
+	}
+	*/
 
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);

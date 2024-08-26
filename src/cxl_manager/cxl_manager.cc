@@ -71,8 +71,8 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type){
 	}
 
 	if(broker_id == 0){
-		memset(addr, 0, (1UL<<35));
-		//memset(addr, 0, CXL_SIZE);
+		//memset(addr, 0, (1UL<<34));
+		memset(addr, 0, CXL_SIZE);
 		VLOG(3) << "Cleared CXL:" << CXL_SIZE;
 	}
 	return addr;
@@ -87,6 +87,9 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 	for(int i=0; i<num_io_threads; i++){
 		requestQueues_.emplace_back(queSize);
 	}
+/*
+	requestQueues_.emplace_back(queueCapacity);
+	*/
 
 	// Initialize CXL
 	cxl_addr_ = allocate_shm(broker_id, cxl_type);
@@ -122,6 +125,9 @@ CXLManager::~CXLManager(){
 	for (int i=0; i< num_io_threads_; i++) {
 		requestQueues_[i].blockingWrite(sentinel);
 	}
+	/*
+		requestQueues_[0].blockingWrite(sentinel);
+	*/
 
 	if (munmap(cxl_addr_, CXL_SIZE) < 0)
 		LOG(ERROR) << "Unmapping CXL error";
@@ -143,35 +149,40 @@ CXLManager::~CXLManager(){
 
 
 void CXLManager::CXLIOThread(int tid){
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+	/*
+	int quota = 48;
+	int base = quota + (broker_id_ * quota);
+	for (int i = base; i <= base + num_io_threads_; ++i) {
+			CPU_SET(i, &cpuset);
+	}
+	*/
+	CPU_SET(tid + CGROUP_CORE*broker_id_, &cpuset);
+	pthread_t current_thread = pthread_self();
+	if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) != 0) {
+			LOG(ERROR) << "Error setting thread affinity" ;
+	}
 	std::optional<struct PublishRequest> optReq;
+	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	while(!stop_threads_){
 		requestQueues_[tid].blockingRead(optReq);
+		//requestQueues_[0].blockingRead(optReq);
 		if(!optReq.has_value()){
 			break;
 		}
 		struct PublishRequest &req = optReq.value();
 
 		// Actual IO to the CXL
-		topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
+		topic_manager_->PublishToCXL(req);
 
 		// Post I/O work (as disk I/O depend on the same payload)
-		/*
-		int counter = req.counter->fetch_sub(1);
-		if( counter == 1){
-			mi_free(req.counter);
-			mi_free(req.payload_address);
-		}else if(req.acknowledge){
+		mi_free(req.payload_address);
+		if(req.acknowledge){
 			struct NetworkRequest ackReq;
 			ackReq.client_socket = req.client_socket;
 			network_manager_->EnqueueRequest(ackReq);
 		}
-		*/
-		mi_free(req.counter);
-		mi_free(req.payload_address);
-		struct NetworkRequest ackReq;
-		ackReq.client_socket = req.client_socket;
-		network_manager_->EnqueueRequest(ackReq);
 	}
 }
 
@@ -192,6 +203,7 @@ void CXLManager::EnqueueRequest(struct PublishRequest req){
 	std::uniform_int_distribution<> dis(0, num_io_threads_ - 1);
 
 	requestQueues_[dis(gen)].blockingWrite(req);
+	//requestQueues_[0].blockingWrite(req);
 }
 
 void* CXLManager::GetNewSegment(){

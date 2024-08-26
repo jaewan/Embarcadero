@@ -50,6 +50,7 @@ void DiskManager::EnqueueRequest(struct PublishRequest req){
 
 void DiskManager::DiskIOThread(){
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	/*
 	std::optional<struct PublishRequest> optReq;
 
 	while(!stop_threads_){
@@ -72,6 +73,7 @@ void DiskManager::DiskIOThread(){
 			network_manager_->EnqueueRequest(ackReq);
 		}
 	}
+	*/
 }
 
 } // End of namespace Embarcadero
