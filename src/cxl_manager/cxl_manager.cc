@@ -186,6 +186,10 @@ void CXLManager::CXLIOThread(int tid){
 	}
 }
 
+void* CXLManager::GetCXLBuffer(PublishRequest &req){
+	return topic_manager_->GetCXLBuffer(req);
+}
+
 // This function returns TInode without inspecting if the topic exists
 void* CXLManager::GetTInode(const char* topic){
 	// Convert topic to tinode address

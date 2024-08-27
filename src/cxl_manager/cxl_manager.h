@@ -59,6 +59,10 @@ struct NonCriticalMessageHeader{
 	char _padding[64 - (sizeof(int) + sizeof(size_t) * 3 + sizeof(void*))]; 
 };
 
+struct BatchHeader{
+	size_t total_size;
+};
+
 
 // Orders are very important to avoid race conditions. 
 // If you change orders of elements, change how sequencers and combiner check written messages
@@ -89,6 +93,7 @@ class CXLManager{
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
+		void* GetCXLBuffer(PublishRequest &req);
 
 	private:
 		std::vector<folly::MPMCQueue<std::optional<struct PublishRequest>>> requestQueues_;

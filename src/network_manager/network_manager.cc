@@ -83,13 +83,6 @@ void NetworkManager::EnqueueRequest(struct NetworkRequest req){
 }
 
 void NetworkManager::ReqReceiveThread(){
-	cpu_set_t cpuset;
-	CPU_ZERO(&cpuset);
-	CPU_SET(thread_count_.load() + 16, &cpuset);
-	pthread_t current_thread = pthread_self();
-	if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) != 0) {
-			LOG(ERROR) << "Error setting thread affinity" ;
-	}
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct NetworkRequest> optReq;
 
@@ -166,9 +159,6 @@ void NetworkManager::ReqReceiveThread(){
 					//size_t READ_SIZE = shake.size;
 					size_t READ_SIZE = ZERO_COPY_SEND_LIMIT;
 					to_read = READ_SIZE;
-					// Allow 4K buffer space as messages can go over batch size
-					size_t buf_size = READ_SIZE + MAX_MSG_SIZE + sizeof(MessageHeader);
-					void* buf = mi_malloc(buf_size);
 
 					// Create publish request
 					struct PublishRequest pub_req;
@@ -176,49 +166,50 @@ void NetworkManager::ReqReceiveThread(){
 					pub_req.acknowledge = shake.ack;
 					pub_req.client_socket = ack_fd;
 
-					size_t read = 0;
-					int num_msg = 0;
-					MessageHeader *header = (MessageHeader*)buf;
+					BatchHeader batch_header;
 					while(running){
-						int bytes_read = recv(req.client_socket, (uint8_t*)buf + read, to_read, 0);
+						int bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
 						if(bytes_read <= 0){
 							if(bytes_read < 0)
 								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
-							mi_free(buf);
 							running = false;
 							break;
 						}
-						read += bytes_read;
-						size_t total_size = 0;
-						if(read >= sizeof(MessageHeader)){
-							while(read >= header->paddedSize){
-								num_msg++;
-								read -= header->paddedSize;
-								total_size += header->paddedSize;
-								if(read < sizeof(MessageHeader)){
-									break;
-								}
-								header = (MessageHeader*)((uint8_t*)header + header->paddedSize);
-							}
+						while(bytes_read < sizeof(BatchHeader)){
+							bytes_read += recv(req.client_socket, (uint8_t*)(&batch_header) + bytes_read, sizeof(BatchHeader) - bytes_read, 0);
 						}
-
-						to_read -= bytes_read;
-
-						if(num_msg > 0){
-							pub_req.payload_address = (void*)buf;
-							pub_req.num_messages = num_msg;
-							pub_req.total_size = total_size;
-							void *new_buf = mi_malloc(READ_SIZE);
-							if(read){
-								memcpy(new_buf, (uint8_t*)buf + total_size, read);
+						to_read = batch_header.total_size;
+						pub_req.total_size = batch_header.total_size;
+						void* buf = cxl_manager_->GetCXLBuffer(pub_req);
+						size_t read = 0;
+						while(running){
+							bytes_read = recv(req.client_socket, (uint8_t*)buf + read, to_read, 0);
+							if(bytes_read <= 0){
+								if(bytes_read < 0)
+									LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
+								running = false;
+								break;
 							}
-							cxl_manager_->EnqueueRequest(pub_req);
+							read += bytes_read;
+							to_read -= bytes_read;
 
-							header = (MessageHeader*)new_buf;;
-							buf = new_buf;
-							to_read = READ_SIZE;
-							num_msg = 0;
-						}	
+							if(to_read == 0){
+								if(shake.ack == 1){
+									MessageHeader *header = (MessageHeader*)buf;
+									int num_msg = 0;
+									while(read > 0 && header->paddedSize <= read){
+										num_msg++;
+										read -= header->paddedSize;
+										header = (MessageHeader*)((uint8_t*)header + header->paddedSize);
+									}
+									NetworkRequest ack_req;
+									ack_req.client_socket = ack_fd;
+									ack_req.num_msg = 1;
+									EnqueueRequest(ack_req);
+								}
+								break;
+							}	
+						}
 					}
 					close(req.client_socket);
 				}// end Publish
@@ -374,7 +365,6 @@ void NetworkManager::MainThread(){
 		for(int i=0; i< n; i++){
 			if (events[i].data.fd == server_socket) {
 				struct NetworkRequest req;
-				req.efd = efd;
 				struct sockaddr_in client_addr;
 				socklen_t client_addr_len = sizeof(client_addr);
 				req.client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_addr_len);

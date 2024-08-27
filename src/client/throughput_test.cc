@@ -674,6 +674,14 @@ class Client{
 				void *msg = pubQue_.Read(pubQuesIdx, len);
 				if(len == 0)
 					break;
+				Embarcadero::BatchHeader batch_header;
+				batch_header.total_size = len;
+
+				ssize_t bytesSent = send(sock, (uint8_t*)(&batch_header), sizeof(Embarcadero::BatchHeader), 0);
+				if(bytesSent < sizeof(Embarcadero::BatchHeader)){
+					LOG(ERROR) << "Jae compelte this too when batch header is partitioned.";
+					return;
+				}
 
 				sent_bytes = 0;
 				int backoff = 1;
@@ -681,7 +689,6 @@ class Client{
 				while(sent_bytes < len){
 					size_t remaining_bytes = len - sent_bytes;
 					size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
-					ssize_t bytesSent;
 					if(to_send < 1UL<<16)
 						bytesSent = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
 					else
