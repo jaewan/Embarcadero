@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #include "../src/cxl_manager/cxl_manager.h"
+#include "../src/embarlet/heartbeat.h"
 
 using namespace Embarcadero;
+using ::testing::Return;
+using ::testing::StrEq;
 
 class MockCXLManager : public CXLManager {
 public:
@@ -18,6 +21,13 @@ public:
         : ScalogSequencerService(cxl_manager, broker_id, broker, cxl_addr, scalog_seq_address) {}
 
     MOCK_METHOD(void, SendLocalCut, (int epoch, int offset, const char* topic), (override));
+    MOCK_METHOD(void, ReceiveLocalCut, (int epoch, const char* topic, int offset), (override));
+};
+
+class MockHeartBeatManager : public HeartBeatManager {
+public:
+    MockHeartBeatManager(bool is_head_node, std::string head_address)
+        : HeartBeatManager(is_head_node, head_address) {}
 };
 
 // Test fixture for ScalogSequencerService
@@ -25,16 +35,19 @@ class ScalogSequencerServiceTest : public ::testing::Test {
 protected:
     void SetUp() override {
         mock_cxl_manager_ = new MockCXLManager((1UL<<22), 0, CXL_Type::Emul, "127.0.0.1", NUM_CXL_IO_THREADS);
-        service_ = new MockScalogSequencerService(mock_cxl_manager_, 0, nullptr, nullptr, "");
+        mock_scalog_sequencer_service_ = new MockScalogSequencerService(mock_cxl_manager_, 0, nullptr, nullptr, "");
+        mock_heartbeat_manager_ = new MockHeartBeatManager(true, "127.0.0.1:12140");
     }
 
     void TearDown() override {
-        delete service_;
         delete mock_cxl_manager_;
+        delete mock_scalog_sequencer_service_;
+        delete mock_heartbeat_manager_;
     }
 
     MockCXLManager* mock_cxl_manager_;
-    MockScalogSequencerService* service_;
+    MockScalogSequencerService* mock_scalog_sequencer_service_;
+    MockHeartBeatManager* mock_heartbeat_manager_;
 };
 
 TEST_F(ScalogSequencerServiceTest, LocalSequencerDuration) {
@@ -50,7 +63,7 @@ TEST_F(ScalogSequencerServiceTest, LocalSequencerDuration) {
         .WillByDefault(::testing::Return(&TInode));
 
     auto start = std::chrono::high_resolution_clock::now();
-    service_->LocalSequencer("test");
+    mock_scalog_sequencer_service_->LocalSequencer("test");
     auto end = std::chrono::high_resolution_clock::now();
     
     // Calculate the duration
@@ -58,4 +71,27 @@ TEST_F(ScalogSequencerServiceTest, LocalSequencerDuration) {
 
     // Assert that the duration is equal to 5 milliseconds
     EXPECT_EQ(duration.count(), 5);
+}
+
+TEST_F(ScalogSequencerServiceTest, HandleSendLocalCutTest) {
+    grpc::ServerContext context;
+    SendLocalCutRequest request;
+    SendLocalCutResponse response;
+
+    request.set_topic("test_topic");
+    request.set_epoch(0);
+    request.set_local_cut(100);
+    request.set_broker_id(0);
+
+    // Expect the ReceiveLocalCut method to be called with the correct arguments
+    EXPECT_CALL(*mock_scalog_sequencer_service_, ReceiveLocalCut(0, StrEq("test_topic"), 0))
+        .Times(1);
+
+    grpc::Status status = mock_scalog_sequencer_service_->HandleSendLocalCut(&context, &request, &response);
+
+    ASSERT_TRUE(status.ok());
+    // Verify that the response contains the expected global cut
+    auto global_cut_map = response.global_cut();
+    ASSERT_EQ(global_cut_map.size(), 1);
+    ASSERT_EQ(global_cut_map[0], 100);
 }

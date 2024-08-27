@@ -34,7 +34,7 @@ class ScalogSequencerService : public ScalogSequencer::Service {
         /// @param context
         /// @param request Request containing the local cut and the epoch
         /// @param response Empty for now
-		grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response);
+		virtual grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response);
 
 		/// Called when first starting the scalog local sequencer. It manages
 		/// the timing between each local cut
@@ -48,7 +48,7 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		void ReceiveGlobalCut(absl::flat_hash_map<int, int>  global_cut, const char* topic);
 
 		/// Keep track of the global cut and if all the local cuts have been received
-		void ReceiveLocalCut(int epoch, const char* topic, int broker_id);
+		virtual void ReceiveLocalCut(int epoch, const char* topic, int broker_id);
 
 		/// Updates the total ordering of the messages based on the global cut
 		/// The global cut is a map where the key is the broker id and the value is the local cut
