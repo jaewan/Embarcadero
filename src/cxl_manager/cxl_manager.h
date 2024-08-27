@@ -79,11 +79,10 @@ struct alignas(64) MessageHeader{
 
 class CXLManager{
 	public:
-		CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, int num_io_threads);
+		CXLManager(int broker_id, CXL_Type cxl_type);
 		~CXLManager();
 		void SetTopicManager(TopicManager *topic_manager){topic_manager_ = topic_manager;}
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
-		void EnqueueRequest(struct PublishRequest req);
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
@@ -96,10 +95,7 @@ class CXLManager{
 		void* GetCXLBuffer(PublishRequest &req);
 
 	private:
-		std::vector<folly::MPMCQueue<std::optional<struct PublishRequest>>> requestQueues_;
 		int broker_id_;
-		int num_io_threads_;
-		std::vector<std::thread> threads_;
 		std::vector<std::thread> sequencerThreads_;
 
 		TopicManager *topic_manager_;

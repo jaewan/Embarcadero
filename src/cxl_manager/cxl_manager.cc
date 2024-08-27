@@ -78,27 +78,15 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type){
 	return addr;
 }
 
-CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, int num_io_threads):
-	broker_id_(broker_id),
-	num_io_threads_(num_io_threads){
-	size_t queSize = queueCapacity/num_io_threads;
+CXLManager::CXLManager(int broker_id, CXL_Type cxl_type):
+	broker_id_(broker_id){
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
-
-	for(int i=0; i<num_io_threads; i++){
-		requestQueues_.emplace_back(queSize);
-	}
-/*
-	requestQueues_.emplace_back(queueCapacity);
-	*/
 
 	// Initialize CXL
 	cxl_addr_ = allocate_shm(broker_id, cxl_type);
 	if(cxl_addr_ == nullptr){
 		return;
 	}
-	// Create CXL I/O threads
-	for (int i=0; i< num_io_threads_; i++)
-		threads_.emplace_back(&CXLManager::CXLIOThread, this, i);
 
 	// Initialize CXL memory regions
 	size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
@@ -112,8 +100,6 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 	bitmap_ = (uint8_t*)cxl_addr_ + TINode_Region_size;
 	segments_ = (uint8_t*)bitmap_ + Bitmap_Region_size + ((broker_id_)*Segment_Region_size);
 
-	// Wait untill al IO threads are up
-	while(thread_count_.load() != num_io_threads_){}
 
 	LOG(INFO) << "\t[CXLManager]: \t\tConstructed";
 	return;
@@ -122,21 +108,6 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 CXLManager::~CXLManager(){
 	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	stop_threads_ = true;
-	for (int i=0; i< num_io_threads_; i++) {
-		requestQueues_[i].blockingWrite(sentinel);
-	}
-	/*
-		requestQueues_[0].blockingWrite(sentinel);
-	*/
-
-	if (munmap(cxl_addr_, CXL_SIZE) < 0)
-		LOG(ERROR) << "Unmapping CXL error";
-
-	for(std::thread& thread : threads_){
-		if(thread.joinable()){
-			thread.join();
-		}
-	}
 
 	for(std::thread& thread : sequencerThreads_){
 		if(thread.joinable()){
@@ -144,46 +115,11 @@ CXLManager::~CXLManager(){
 		}
 	}
 
+	if (munmap(cxl_addr_, CXL_SIZE) < 0)
+		LOG(ERROR) << "Unmapping CXL error";
+
+
 	LOG(INFO) << "[CXLManager]: \t\tDestructed";
-}
-
-
-void CXLManager::CXLIOThread(int tid){
-	cpu_set_t cpuset;
-	CPU_ZERO(&cpuset);
-	/*
-	int quota = 48;
-	int base = quota + (broker_id_ * quota);
-	for (int i = base; i <= base + num_io_threads_; ++i) {
-			CPU_SET(i, &cpuset);
-	}
-	*/
-	CPU_SET(tid + CGROUP_CORE*broker_id_, &cpuset);
-	pthread_t current_thread = pthread_self();
-	if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) != 0) {
-			LOG(ERROR) << "Error setting thread affinity" ;
-	}
-	std::optional<struct PublishRequest> optReq;
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	while(!stop_threads_){
-		requestQueues_[tid].blockingRead(optReq);
-		//requestQueues_[0].blockingRead(optReq);
-		if(!optReq.has_value()){
-			break;
-		}
-		struct PublishRequest &req = optReq.value();
-
-		// Actual IO to the CXL
-		topic_manager_->PublishToCXL(req);
-
-		// Post I/O work (as disk I/O depend on the same payload)
-		mi_free(req.payload_address);
-		if(req.acknowledge){
-			struct NetworkRequest ackReq;
-			ackReq.client_socket = req.client_socket;
-			network_manager_->EnqueueRequest(ackReq);
-		}
-	}
 }
 
 void* CXLManager::GetCXLBuffer(PublishRequest &req){
@@ -197,17 +133,6 @@ void* CXLManager::GetTInode(const char* topic){
 	//int TInode_idx = topic_to_idx(topic) % MAX_TOPIC_SIZE;
 	int TInode_idx = atoi(topic) % MAX_TOPIC_SIZE;
 	return ((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
-}
-
-// When a requestQueue is a single queue, enqueueing to the queue evenly distributes the tasks to io threads
-// To evenly distribute reqs to multiple queues, we use thread-local random number generator
-void CXLManager::EnqueueRequest(struct PublishRequest req){
-	thread_local std::random_device rd;
-	thread_local std::mt19937 gen(rd());
-	std::uniform_int_distribution<> dis(0, num_io_threads_ - 1);
-
-	requestQueues_[dis(gen)].blockingWrite(req);
-	//requestQueues_[0].blockingWrite(req);
 }
 
 void* CXLManager::GetNewSegment(){
