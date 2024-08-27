@@ -24,7 +24,7 @@ class HeartBeatManager;
 
 class ScalogSequencerService : public ScalogSequencer::Service {
 	public:
-		ScalogSequencerService(CXLManager* cxl_manager, int broker_id, const char* topic, HeartBeatManager *broker, void* cxl_addr, std::string scalog_seq_address);
+		ScalogSequencerService(CXLManager* cxl_manager, int broker_id, HeartBeatManager *broker, void* cxl_addr, std::string scalog_seq_address);
 
 		absl::flat_hash_map<int, int> GetGlobalCut() {
 			return global_cut_;
@@ -35,6 +35,24 @@ class ScalogSequencerService : public ScalogSequencer::Service {
         /// @param request Request containing the local cut and the epoch
         /// @param response Empty for now
 		grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response);
+
+		/// Called when first starting the scalog local sequencer. It manages
+		/// the timing between each local cut
+		virtual void LocalSequencer(std::string topic_str);
+
+		/// Sends a local cut to the head node	
+		virtual void SendLocalCut(int epoch, int local_cut, const char* topic);
+
+		/// Receives the global cut from the head node
+		/// This function is called in the callback of the send local cut grpc call
+		void ReceiveGlobalCut(absl::flat_hash_map<int, int>  global_cut, const char* topic);
+
+		/// Keep track of the global cut and if all the local cuts have been received
+		void ReceiveLocalCut(int epoch, const char* topic, int broker_id);
+
+		/// Updates the total ordering of the messages based on the global cut
+		/// The global cut is a map where the key is the broker id and the value is the local cut
+		void UpdateTotalOrdering(absl::flat_hash_map<int, int>  global_cut, struct TInode *tinode);
 
 	private:
 		CXLManager* cxl_manager_;
@@ -51,7 +69,7 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		std::condition_variable reset_cv_;
 
 		/// Time between each local cut
-		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(3000000);
+		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(5000);
 
 		/// Used to keep track of how many grpc threads are waiting for the notification
 		/// If it's greater than 0, we can't reset the local epoch
@@ -72,24 +90,6 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		absl::flat_hash_map<int, int> global_cut_;
 
 		bool has_global_sequencer_;
-
-		/// Called when first starting the scalog local sequencer. It manages
-		/// the timing between each local cut
-		void LocalSequencer(std::string topic_str);
-
-		/// Sends a local cut to the head node	
-		void SendLocalCut(int epoch, int local_cut, const char* topic);
-
-		/// Receives the global cut from the head node
-		/// This function is called in the callback of the send local cut grpc call
-		void ReceiveGlobalCut(absl::flat_hash_map<int, int>  global_cut, const char* topic);
-
-		/// Keep track of the global cut and if all the local cuts have been received
-		void ReceiveLocalCut(int epoch, const char* topic, int broker_id);
-
-		/// Updates the total ordering of the messages based on the global cut
-		/// The global cut is a map where the key is the broker id and the value is the local cut
-		void UpdateTotalOrdering(absl::flat_hash_map<int, int>  global_cut, struct TInode *tinode);
 };
 
 enum CXL_Type {Emul, Real};
@@ -156,7 +156,7 @@ class CXLManager {
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		void EnqueueRequest(struct PublishRequest req);
 		void* GetNewSegment();
-		void* GetTInode(const char* topic);
+		virtual void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType);

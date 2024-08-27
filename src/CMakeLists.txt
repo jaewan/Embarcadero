@@ -61,3 +61,45 @@ target_link_libraries(throughput_test
     ${_PROTOBUF_LIBPROTOF}
     ${FOLLY_LIBRARIES}
 )
+
+# Testing
+enable_testing()
+
+add_executable(
+  test_scalog_sequencer
+  ../test/test_scalog_sequencer.cc
+  disk_manager/disk_manager.cc 
+  disk_manager/disk_manager.h 
+  cxl_manager/cxl_manager.cc
+  cxl_manager/cxl_manager.h 
+  network_manager/network_manager.cc
+  network_manager/network_manager.h 
+  embarlet/heartbeat.cc
+  embarlet/topic_manager.cc
+  embarlet/topic_manager.h
+)
+
+target_include_directories(test_scalog_sequencer PUBLIC
+	"${CMAKE_CURRENT_BINARY_DIR}"
+  "${PROJECT_BINARY_DIR}"
+)
+
+target_link_libraries(
+  test_scalog_sequencer
+	numa
+	glog
+	gflags
+	mimalloc
+  absl::flat_hash_map 
+  scalog_sequencer_grpc_proto
+  heartbeat_grpc_proto
+  ${_REFLECTION}
+  ${_GRPC_GRPCPP}
+  ${_PROTOBUF_LIBPROTOBUF}
+  ${FOLLY_LIBRARIES}
+  GTest::gtest_main
+  gmock_main
+)
+
+include(GoogleTest)
+gtest_discover_tests(test_scalog_sequencer)
