@@ -126,7 +126,6 @@ int main(int argc, char* argv[]){
 
 
 	// *************** Initializing Managers ********************** 
-	// Queue Size (1UL<<22)(1UL<<25)(1UL<<25) respectly performed 6GB/s 1kb message disk thread:8 cxl:16 network: 32
 	Embarcadero::CXLManager cxl_manager(broker_id, cxl_type);
 	Embarcadero::DiskManager disk_manager((1UL<<25));
 	Embarcadero::NetworkManager network_manager(128, broker_id, num_network_io_threads);
@@ -135,20 +134,6 @@ int main(int argc, char* argv[]){
 	if(is_head_node){
 		cxl_manager.RegisterGetRegisteredBrokersCallback(std::bind(&HeartBeatManager::GetRegisteredBrokers, &heartbeat_manager, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 	}
-
-	/*
-	cpu_set_t cpuset;
-	CPU_ZERO(&cpuset);
-	int quota = 48;
-	int base = quota + (broker_id * quota);
-	for (int i = base; i <= base + quota; ++i) {
-			CPU_SET(i, &cpuset);
-	}
-	pthread_t current_thread = pthread_self();
-	if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) != 0) {
-			LOG(ERROR) << "Error setting thread affinity" ;
-	}
-	*/
 
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);
