@@ -255,15 +255,18 @@ class Buffer{
 			if(len == header_.size){
 				padded = header_.paddedSize;
 			}else{
+				LOG(ERROR) << "Jae handle dynamic message sizes:" << len << " size:" << header_size;
 				padded = len % 64;
 				if(padded){
 					padded = 64 - padded;
 				}
-				header_.paddedSize = len + padded + header_size;
+				padded = len + padded + header_size;
+				header_.paddedSize = padded;
+				//header_.size = len;
 			}
 			header_.client_order = client_order;
 			if(bufs[bufIdx].tail + header_size + padded > bufs[bufIdx].len){
-				LOG(ERROR) << "tail:" << bufs[bufIdx].tail << " write size:" << padded << " will go over buffer:" << bufs[bufIdx].len;
+				//LOG(ERROR) << "tail:" << bufs[bufIdx].tail << " write size:" << padded << " will go over buffer:" << bufs[bufIdx].len;
 				return false;
 			}
 			memcpy((void*)((uint8_t*)bufs[bufIdx].buffer + bufs[bufIdx].tail), &header_, header_size);
@@ -382,19 +385,6 @@ class Client{
 				if(t.joinable())
 					t.join();
 			}
-			shutdown_ = true;
-			double avg = 0;
-			for(auto time:DEBUG_send_time_){
-				avg += time;
-				//LOG(INFO) << "Send time:" << time;
-			}
-			LOG(INFO) << "Avg Send time:" << avg/DEBUG_send_time_.size();
-			avg = 0;
-			for(auto time:DEBUG_poll_time_){
-				avg += time;
-				//LOG(INFO) << "poll time:" << time;
-			}
-			LOG(INFO) << "Avg Poll time:" << avg/DEBUG_poll_time_.size();
 			return;
 		}
 
@@ -429,8 +419,6 @@ class Client{
 		absl::flat_hash_map<int, std::string> nodes_;
 		std::vector<int> brokers_;
 		absl::Mutex mutex_;
-		std::vector<double> DEBUG_send_time_;
-		std::vector<double> DEBUG_poll_time_;
 		char topic_[TOPIC_NAME_SIZE];
 		int ack_level_;
 		int order_;
@@ -438,9 +426,9 @@ class Client{
 		std::vector<std::thread> threads_;
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
-
+		
 		void EpollAckThread(){
-			if(ack_level_ == 0)
+			if(ack_level_ != 2)
 				return;
 			int server_sock = socket(AF_INET, SOCK_STREAM, 0);
 			if (server_sock < 0) {
@@ -494,7 +482,7 @@ class Client{
 
 			int max_events = nodes_.size();
 			std::vector<epoll_event> events(max_events);
-			char buffer[1024];
+			char buffer[1024*1024];
 			size_t total_received = 0;
 			int EPOLL_TIMEOUT = 1; // 1 millisecond timeout
 			std::vector<int> client_sockets;
@@ -528,7 +516,7 @@ class Client{
 						int client_sock = events[i].data.fd;
 						ssize_t bytes_received;
 
-						while (total_received < client_order_ && (bytes_received = recv(client_sock, buffer, 1024, 0)) > 0) {
+						while (total_received < client_order_ && (bytes_received = recv(client_sock, buffer, 1024*1024, 0)) > 0) {
 							total_received += bytes_received;
 							// Process received data here
 							// For example, you might want to count the number of 1-byte messages:
@@ -606,7 +594,6 @@ class Client{
 				size_t bytesReceived;
 				if((bytesReceived = recv(client_sock, data, 1024, 0))){
 					read += bytesReceived;
-					VLOG(3) << "Ack Received:" << read;
 				}else{
 					//LOG(ERROR) << "Read error:" << bytesReceived << " " << strerror(errno);
 				}
@@ -664,8 +651,6 @@ class Client{
 			}
 
 			// *********** Sending Messages ***********
-			double send_time = 0;
-			double poll_time = 0;
 			std::vector<double> send_times;
 			std::vector<double> poll_times;
 			thread_count_.fetch_add(1);
@@ -719,11 +704,6 @@ class Client{
 						exit(1);
 					}
 				}
-			}
-			{
-				absl::MutexLock lock(&mutex_);
-				DEBUG_send_time_.emplace_back(send_time);
-				DEBUG_poll_time_.emplace_back(poll_time);
 			}
 			close(sock);
 			close(efd);

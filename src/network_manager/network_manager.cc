@@ -120,7 +120,7 @@ void NetworkManager::ReqReceiveThread(){
 					// TODO(Jae) This code asumes there's only one active client publishing
 					// If there are parallel clients, change the ack queue
 					int ack_fd = req.client_socket;
-					if(shake.ack){
+					if(shake.ack == 2){
 						absl::MutexLock lock(&ack_mu_);
 						auto it = ack_connections_.find(shake.client_id);
 						if(it != ack_connections_.end()){
@@ -194,19 +194,6 @@ void NetworkManager::ReqReceiveThread(){
 							to_read -= bytes_read;
 
 							if(to_read == 0){
-								if(shake.ack == 1){
-									MessageHeader *header = (MessageHeader*)buf;
-									int num_msg = 0;
-									while(read > 0 && header->paddedSize <= read){
-										num_msg++;
-										read -= header->paddedSize;
-										header = (MessageHeader*)((uint8_t*)header + header->paddedSize);
-									}
-									NetworkRequest ack_req;
-									ack_req.client_socket = ack_fd;
-									ack_req.num_msg = 1;
-									EnqueueRequest(ack_req);
-								}
 								break;
 							}	
 						}
@@ -278,11 +265,11 @@ void NetworkManager::AckThread(){
 	while(!stop_threads_){
 		size_t ack_count = 0;
 		while(ackQueue_.read(optReq)){
-			ack_count++;
 			if(!optReq.has_value()){
-				ack_count--;
 				break;
 			}
+			//struct NetworkRequest &req = optReq.value();
+			ack_count++;
 		}
 		int EPOLL_TIMEOUT = -1; 
 		size_t acked_size = 0;

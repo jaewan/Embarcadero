@@ -239,7 +239,7 @@ void Topic::CombinerThread(){
 			continue;
 		}
 #else
-	 //CHECK_LT((unsigned long long int)header, log_addr_);
+	 CHECK_LT((unsigned long long int)header, log_addr_) << "header calculated wrong";
 #endif
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
