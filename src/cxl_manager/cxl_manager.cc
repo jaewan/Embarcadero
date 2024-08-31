@@ -230,7 +230,8 @@ void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
 
 	std::cout << "Initializing scalog sequencer service for topic: " << topic_str << std::endl;
 
-	std::string scalog_seq_address = head_ip_ + ":" + std::to_string(SCALOG_SEQ_PORT);
+	int unique_port = SCALOG_SEQ_PORT + scalog_sequencer_service_port_offset_.fetch_add(1);
+	std::string scalog_seq_address = head_ip_ + ":" + std::to_string(unique_port);
 	scalog_sequencer_service_ = std::make_unique<ScalogSequencerService>(this, broker_id_, broker_, cxl_addr_, scalog_seq_address);
 
 	/// New thread for the local sequencer is required in the head so we can also run the grpc server
@@ -403,6 +404,7 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 	return grpc::Status::OK;
 }
 
+/// TODO: Jae, check the locking in this function to see if there is a more optimal way
 void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int broker_id) {
 	if (epoch != global_epoch_) {
 		// If the epoch is not the same as the current global epoch, there is an error

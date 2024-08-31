@@ -1,6 +1,7 @@
 #ifndef INCLUDE_CXL_MANGER_H_
 #define INCLUDE_CXL_MANGER_H_
 
+#include <atomic>
 #include <thread>
 #include <iostream>
 #include <optional>
@@ -195,6 +196,7 @@ class CXLManager {
 
 		std::unique_ptr<ScalogSequencerService> scalog_sequencer_service_;
 		std::unique_ptr<grpc::Server> scalog_server_;
+		std::atomic<int> scalog_sequencer_service_port_offset_{0};
 };
 
 } // End of namespace Embarcadero
