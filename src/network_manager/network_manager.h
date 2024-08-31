@@ -23,15 +23,6 @@ struct NetworkRequest{
 	int client_socket;
 };
 
-struct alignas(32) SubscribeHeader{
-	int broker_id;
-	// Logical address of first and last msg
-	int first_id; 
-	int last_id;
-	// Total len of payload
-	size_t len;
-};
-
 struct alignas(64) EmbarcaderoReq{
 	uint16_t client_id;
 	uint32_t size;//Pub: Maximum size of messages in this batch
