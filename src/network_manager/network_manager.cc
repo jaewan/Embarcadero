@@ -182,6 +182,9 @@ void NetworkManager::ReqReceiveThread(){
 						pub_req.total_size = batch_header.total_size;
 						void* buf = cxl_manager_->GetCXLBuffer(pub_req);
 						size_t read = 0;
+						MessageHeader* header;
+						size_t header_size = sizeof(MessageHeader);
+						size_t bytes_to_next_header = 0;
 						while(running){
 							bytes_read = recv(req.client_socket, (uint8_t*)buf + read, to_read, 0);
 							if(bytes_read <= 0){
@@ -190,8 +193,17 @@ void NetworkManager::ReqReceiveThread(){
 								running = false;
 								break;
 							}
+							while(bytes_to_next_header + header_size <= bytes_read){
+								header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
+								header->complete = 1;
+								bytes_read -= bytes_to_next_header;
+								read += bytes_to_next_header;
+								to_read -= bytes_to_next_header;
+								bytes_to_next_header = header->paddedSize;
+							}
 							read += bytes_read;
 							to_read -= bytes_read;
+							bytes_to_next_header -= bytes_read;
 
 							if(to_read == 0){
 								break;
@@ -206,48 +218,89 @@ void NetworkManager::ReqReceiveThread(){
 					size_t last_offset = shake.client_order;
 					void* last_addr = shake.last_addr;
 					void* messages = nullptr;
-					SubscribeHeader reply_shake;
 
+					make_socket_non_blocking(req.client_socket);
+					int sendBufferSize = 16 * 1024 * 1024;
+					if (setsockopt(req.client_socket, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize)) == -1) {
+						LOG(ERROR) << "Subscriber setsockopt SNGBUf failed";
+						close(req.client_socket);
+						return;
+					}
+					// Enable zero-copy
+					int flag = 1;
+					if (setsockopt(req.client_socket, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
+						LOG(ERROR) << "Subscriber setsockopt(SO_ZEROCOPY) failed";
+						close(req.client_socket);
+						return;
+					}
+
+					int efd = epoll_create1(0);
+					if(efd < 0){
+						LOG(ERROR) << "Subscribe Thread epoll_create1 failed:" << strerror(errno);
+						close(req.client_socket);
+						return;
+					}
+					struct epoll_event event;
+					event.data.fd = req.client_socket;
+					event.events = EPOLLOUT;
+					if(epoll_ctl(efd, EPOLL_CTL_ADD, req.client_socket, &event)){
+						LOG(ERROR) << "epoll_ctl failed:" << strerror(errno);
+						close(req.client_socket);
+						close(efd);
+					}
 					while(!stop_threads_){
 						size_t messages_size = 0;
-
+						size_t first_off = last_offset;
 						if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
-							reply_shake.len = messages_size;
-							reply_shake.first_id = ((MessageHeader*)messages)->logical_offset;
-							reply_shake.last_id = last_offset;
-							reply_shake.broker_id = broker_id_;
-							// Send
-							VLOG(3) << "Sending " << messages_size << " first:" << reply_shake.first_id << " last:" << reply_shake.last_id;;
-							size_t ret = send(req.client_socket, &reply_shake, sizeof(reply_shake), 0);
-							if(ret < 0){
-								LOG(ERROR) << "Error in sending reply_shake";
-								break;
-							}	
-							ret = send(req.client_socket, messages, messages_size, 0);
-							if(ret < 0){
-								LOG(ERROR) << "Error in sending messages";
-								break;
-							}else if(ret < messages_size){
-								// messages are too large to send in one call
-								size_t total_sent = ret;
-								while(total_sent < messages_size){
-									ret = send(req.client_socket, (uint8_t*)messages+total_sent, messages_size-total_sent, 0);
-									if(ret < 0){
-										LOG(ERROR) << "Error in sending messages";
+							VLOG(3) << "Sending " << first_off << " ~ " << last_offset << " : " << messages_size;
+							ssize_t sent_bytes = 0;
+							size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
+							while(sent_bytes < messages_size){
+								size_t remaining_bytes = messages_size - sent_bytes;
+								size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
+								int ret;
+								if(to_send < 1UL<<16)
+									ret = send(req.client_socket, (uint8_t*)messages + sent_bytes, to_send, 0);
+								else
+									ret = send(req.client_socket, (uint8_t*)messages + sent_bytes, to_send, MSG_ZEROCOPY);
+								if(ret > 0){
+									sent_bytes += ret;
+									zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
+								}else if(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS){
+									struct epoll_event events[10];
+									int n = epoll_wait(efd, events, 10, -1);
+									if (n == -1) {
+										LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
+										close(req.client_socket);
+										close(efd);
 										return;
-									}	
-									total_sent += ret;
+									}
+									for (int i = 0; i < n; i++) {
+										if (events[i].events & EPOLLOUT) {
+											break;
+										}
+									}
+									zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL<<16); // Cap sendlimit at 64K
+								}else{
+									LOG(ERROR) << "Error in sending messages:" << strerror(errno);
+									close(req.client_socket);
+									close(efd);
+									break;
 								}
 							}
 						}else{
 							char c;
 							if(recv(req.client_socket, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0){
 								LOG(INFO) << "Subscribe Connection is closed :" << req.client_socket ;
+								close(req.client_socket);
+								close(efd);
 								return ;
 							}
 							std::this_thread::yield();
 						}
 					}
+					close(req.client_socket);
+					close(efd);
 				}//end Subscribe
 				break;
 		}

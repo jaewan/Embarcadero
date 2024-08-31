@@ -225,7 +225,7 @@ void Topic::CombinerThread(){
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
 	while(!stop_threads_){
-		while(header->paddedSize == 0){
+		while(header->complete == 0){
 			if(stop_threads_){
 				LOG(INFO) << "Stopping CombinerThread";
 				return;
