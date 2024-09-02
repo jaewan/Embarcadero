@@ -10,7 +10,10 @@ Start by
 for other nodes start by
 ```bash
 ./embarlet --follower'ADDR:PORT'
+or
+./embarlet --follower
 ```
+
 
 
 ## Version
@@ -20,11 +23,13 @@ for other nodes start by
 - Version 1: Support multi-topic, fault tolerance (dynamic broker addition/removal, replication)
 
 ## Building
-
+To enable cgroup, add permission to the executables
 ```bash
 mkdir build
 cmake ../
 cmake --build .
+cd bin
+sudo setcap cap_sys_admin,cap_dac_override,cap_dac_read_search=eip ./embarlet 
 ```
 The generated executable will be in ```build/src/embarlet```.
 

@@ -146,7 +146,31 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequen
 void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
+<<<<<<< HEAD
 bool TopicManager::PublishToCXL(PublishRequest &req){
+=======
+void* TopicManager::GetCXLBuffer(PublishRequest &req){
+	auto topic_itr = topics_.find(req.topic);
+	if (topic_itr == topics_.end()){
+		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
+			// The topic was created from another broker
+			CreateNewTopicInternal(req.topic);
+			topic_itr = topics_.find(req.topic);
+			if(topic_itr == topics_.end()){
+				LOG(ERROR) << "Topic Entry was not created Something is wrong";
+				return nullptr;
+			}
+		}else{
+			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic
+			<< " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
+			return nullptr;
+		}
+	}
+	return topic_itr->second->GetCXLBuffer(req);
+}
+
+void TopicManager::PublishToCXL(PublishRequest &req){
+>>>>>>> main
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
@@ -206,7 +230,7 @@ void Topic::CombinerThread(){
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
 	MessageHeader *header = (MessageHeader*)first_message_addr_;
 	while(!stop_threads_){
-		while(header->paddedSize == 0){
+		while(header->complete == 0){
 			if(stop_threads_){
 				LOG(INFO) << "Stopping CombinerThread";
 				return;
@@ -220,7 +244,7 @@ void Topic::CombinerThread(){
 			continue;
 		}
 #else
-	 //CHECK_LT((unsigned long long int)header, log_addr_);
+	 CHECK_LT((unsigned long long int)header, log_addr_) << "header calculated wrong";
 #endif
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
@@ -247,7 +271,7 @@ bool Topic::WriteToCXL(PublishRequest &req){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 	unsigned long long int log = NULL;
-	size_t msgSize = req.paddedSize;
+	size_t msgSize = req.total_size;
 	bool skipped_message = false;
 
 	if (seq_type_ == CORFU) {
@@ -318,15 +342,33 @@ bool Topic::WriteToCXL(PublishRequest &req){
 	memcpy_nt((void*)log, req.payload_address, msgSize);
 	return true;
 }
+void* Topic::GetCXLBuffer(PublishRequest &req){
+	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
+	size_t msgSize = req.total_size;
+	unsigned long long int log = log_addr_.fetch_add(msgSize);
+	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+		//TODO(Jae) Finish below segment boundary crossing code
+		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
+			// Allocate a new segment
+			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}else{
+			// Wait for the first thread that crossed the segment to allocate a new segment
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}
+	}
+	return (void*)log;
+}
 
-bool Topic::WriteToCXLWithMutex(PublishRequest &req){
+void Topic::WriteToCXLWithMutex(PublishRequest &req){
 	static const size_t msg_header_size = sizeof(struct MessageHeader);
 	unsigned long long int log;
 	size_t logical_offset;
 	bool new_segment_alloced = false;
 
 	MessageHeader *header = (MessageHeader*)req.payload_address;
-	size_t msgSize = req.paddedSize;
+	size_t msgSize = req.total_size;
 
 	{
 		absl::MutexLock lock(&mutex_);
@@ -360,7 +402,6 @@ bool Topic::WriteToCXLWithMutex(PublishRequest &req){
 				(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
 		}
 	}
-	return true;
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message

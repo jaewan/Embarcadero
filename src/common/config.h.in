@@ -16,16 +16,17 @@ namespace Embarcadero{
 #define PORT 1214
 #define BROKER_PORT 12140
 #define NUM_MAX_BROKERS 4
-#define CXL_SIZE (1UL<<36)
+#define CXL_SIZE (1UL<<35)
 #define CXL_EMUL_SIZE (1UL<<34)
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
-#define SEGMENT_SIZE (1UL << 32)
-#define NUM_DISK_IO_THREADS 8 
-#define NUM_CXL_IO_THREADS 16 
-#define NUM_NETWORK_IO_THREADS 10
+#define SEGMENT_SIZE (1UL << 34)
+#define NUM_DISK_IO_THREADS 1 
+#define NUM_NETWORK_IO_THREADS 24 
 #define NUM_ACK_THREADS 1
 #define CORFU_TIMEOUT_MICROSEC 500000
+#define ZERO_COPY_SEND_LIMIT 1UL<<23
+#define MAX_MSG_SIZE 1UL << 20
 
 //********* Health check configs *********
 #define HEARTBEAT_INTERVAL 3 // in seconds
@@ -40,15 +41,14 @@ namespace Embarcadero{
 
 //********* Health check configs *********
 #define CGROUP_CORE 85
-struct PublishRequest{
-	int client_id;
-	size_t order; // For embarcadero, must start from 0. For corfu, is used as total order
+	
+struct alignas(64) PublishRequest{
 	char topic[TOPIC_NAME_SIZE];
 	bool acknowledge;
-  std::atomic<int> *counter;
-	void* payload_address;
-	size_t paddedSize;
 	int client_socket;
+	void* payload_address;
+	int num_messages;
+	size_t total_size;;
 };
 
 using CreateTopicEntryCallback = std::function<bool(char*, int, heartbeat_system::SequencerType)>;

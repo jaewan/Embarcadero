@@ -21,23 +21,6 @@ enum ClientRequestType {Publish, Subscribe};
 
 struct NetworkRequest{
 	int client_socket;
-	int efd;
-	bool success;
-	size_t order;
-};
-
-struct AckResponse {
-	bool success;
-	size_t order;
-};
-
-struct alignas(32) SubscribeHeader{
-	int broker_id;
-	// Logical address of first and last msg
-	int first_id; 
-	int last_id;
-	// Total len of payload
-	size_t len;
 };
 
 struct alignas(64) EmbarcaderoReq{
@@ -85,3 +68,4 @@ class NetworkManager{
 
 } // End of namespace Embarcadero
 #endif // _NETWORK_MANAGER_H_
+
