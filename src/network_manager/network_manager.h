@@ -23,12 +23,12 @@ struct NetworkRequest{
 	int client_socket;
 	int efd;
 	bool success;
-	size_t client_order;
+	size_t order;
 };
 
 struct AckResponse {
 	bool success;
-	size_t client_order;
+	size_t order;
 };
 
 struct alignas(32) SubscribeHeader{

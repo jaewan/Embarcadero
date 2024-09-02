@@ -176,12 +176,10 @@ void CXLManager::CXLIOThread(int tid){
 		struct NetworkRequest ackReq;
 		ackReq.client_socket = req.client_socket;
 		ackReq.success = success;
-		ackReq.client_order = req.client_order;
-		//mi_free(req.counter);
-		mi_free(req.payload_address);
+		ackReq.order = req.order;
 		network_manager_->EnqueueRequest(ackReq);
-
-
+		mi_free(req.counter);
+		mi_free(req.payload_address);
 	}
 }
 
@@ -238,7 +236,7 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 			if (order == 1)
 				LOG(ERROR) << "Order is set 1 at corfu";
 			else if (order == 2){
-				//TODO(Erika) fill this
+				LOG(INFO) << "Sequencers not needed for corfu";
 			}
 			break;
 	}

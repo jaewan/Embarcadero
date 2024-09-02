@@ -42,10 +42,10 @@ namespace Embarcadero{
 #define CGROUP_CORE 85
 struct PublishRequest{
 	int client_id;
-	size_t client_order; // Must start from 0
+	size_t order; // For embarcadero, must start from 0. For corfu, is used as total order
 	char topic[TOPIC_NAME_SIZE];
 	bool acknowledge;
-	size_t total_order;
+  std::atomic<int> *counter;
 	void* payload_address;
 	size_t paddedSize;
 	int client_socket;
