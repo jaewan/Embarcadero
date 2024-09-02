@@ -664,6 +664,7 @@ class Client{
 					if (events[i].events & EPOLLOUT) {
 						ssize_t bytesSent = send(sock, (int8_t*)(&shake) + sent_bytes, sizeof(shake) - sent_bytes, 0);
 						if (bytesSent <= 0) {
+							bytesSent = 0;
 							if (errno != EAGAIN && errno != EWOULDBLOCK) {
 								LOG(ERROR) << "send failed:" << strerror(errno);
 								running = false;

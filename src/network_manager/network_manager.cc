@@ -168,15 +168,23 @@ void NetworkManager::ReqReceiveThread(){
 
 					BatchHeader batch_header;
 					while(running){
-						int bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
+						// give up if we can't at least read a partial batch header
+						ssize_t bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
 						if(bytes_read <= 0){
 							if(bytes_read < 0)
 								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
 							running = false;
 							break;
 						}
-						while(bytes_read < sizeof(BatchHeader)){
-							bytes_read += recv(req.client_socket, (uint8_t*)(&batch_header) + bytes_read, sizeof(BatchHeader) - bytes_read, 0);
+						// finish reading batch header
+						while(bytes_read < (ssize_t)sizeof(BatchHeader)){
+							ssize_t recv_ret = recv(req.client_socket, (uint8_t*)(&batch_header) + bytes_read, sizeof(BatchHeader) - bytes_read, 0);
+							if(recv_ret < 0){
+								LOG(ERROR) << "Receiving data: " << recv_ret << " ERROR:" << strerror(errno);
+								running = false;
+								return;
+							}
+							bytes_read += recv_ret;
 						}
 						to_read = batch_header.total_size;
 						pub_req.total_size = batch_header.total_size;
@@ -187,13 +195,12 @@ void NetworkManager::ReqReceiveThread(){
 						size_t bytes_to_next_header = 0;
 						while(running){
 							bytes_read = recv(req.client_socket, (uint8_t*)buf + read, to_read, 0);
-							if(bytes_read <= 0){
-								if(bytes_read < 0)
-									LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
+							if(bytes_read < 0){
+								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
 								running = false;
-								break;
+								return;
 							}
-							while(bytes_to_next_header + header_size <= bytes_read){
+							while(bytes_to_next_header + header_size <= (size_t) bytes_read){
 								header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
 								header->complete = 1;
 								bytes_read -= bytes_to_next_header;
@@ -255,7 +262,7 @@ void NetworkManager::ReqReceiveThread(){
 							VLOG(3) << "Sending " << first_off << " ~ " << last_offset << " : " << messages_size;
 							ssize_t sent_bytes = 0;
 							size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
-							while(sent_bytes < messages_size){
+							while((size_t)sent_bytes < messages_size){
 								size_t remaining_bytes = messages_size - sent_bytes;
 								size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
 								int ret;
@@ -332,6 +339,7 @@ void NetworkManager::AckThread(){
 				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
 					ssize_t bytesSent = send(ack_fd_, buf, MIN(bufSize, ack_count - acked_size), 0);
 					if (bytesSent < 0) {
+						bytesSent = 0;
 						if (errno != EAGAIN) {
 							LOG(ERROR) << " Ack Send failed:" << strerror(errno) << " ack_fd:" << ack_fd_ << " ack size:" << (ack_count - acked_size);
 							return;
