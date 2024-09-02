@@ -15,7 +15,7 @@
 
 namespace Embarcadero{
 
-static inline void* allocate_shm(int broker_id, CXL_Type cxl_type){
+static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_size){
 	void *addr = nullptr;
 	int cxl_fd;
 	bool dev = false;
@@ -40,13 +40,13 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type){
 		return nullptr;
 	}
 	if(broker_id == 0 && !dev){
-		if (ftruncate(cxl_fd, CXL_SIZE) == -1) {
+		if (ftruncate(cxl_fd, cxl_size) == -1) {
 			LOG(ERROR) << "ftruncate failed";
 			close(cxl_fd);
 			return nullptr;
 		}
 	}
-	addr = mmap(NULL, CXL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd, 0);
+	addr = mmap(NULL, cxl_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd, 0);
 	close(cxl_fd);
 	if(addr == MAP_FAILED){
 		LOG(ERROR) << "Mapping CXL failed";
@@ -59,10 +59,10 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type){
 		numa_bitmask_setbit(bitmask, 2);
 
 		// Bind the memory to the specified NUMA node
-		if (mbind(addr, CXL_SIZE, MPOL_BIND, bitmask->maskp, bitmask->size, MPOL_MF_MOVE | MPOL_MF_STRICT) == -1) {
+		if (mbind(addr, cxl_size, MPOL_BIND, bitmask->maskp, bitmask->size, MPOL_MF_MOVE | MPOL_MF_STRICT) == -1) {
 			LOG(ERROR)<< "mbind failed";
 			numa_free_nodemask(bitmask);
-			munmap(addr, CXL_SIZE);
+			munmap(addr, cxl_size);
 			return nullptr;
 		}
 		VLOG(3) << "Binded the memory to CXL";
@@ -72,8 +72,8 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type){
 
 	if(broker_id == 0){
 		//memset(addr, 0, (1UL<<35));
-		memset(addr, 0, CXL_SIZE);
-		VLOG(3) << "Cleared CXL:" << CXL_SIZE;
+		memset(addr, 0, cxl_size);
+		VLOG(3) << "Cleared CXL:" << cxl_size;
 	}
 	return addr;
 }
@@ -84,12 +84,18 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 	size_t queSize = queueCapacity/num_io_threads;
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
+  if (cxl_type == Real) {
+	  cxl_size_ = CXL_SIZE;
+	} else {
+	  cxl_size_ = CXL_EMUL_SIZE;
+	}
+
 	for(int i=0; i<num_io_threads; i++){
 		requestQueues_.emplace_back(queSize);
 	}
 
 	// Initialize CXL
-	cxl_addr_ = allocate_shm(broker_id, cxl_type);
+	cxl_addr_ = allocate_shm(broker_id, cxl_type, cxl_size_);
 	if(cxl_addr_ == nullptr){
 		return;
 	}
@@ -102,7 +108,7 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 	size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
 	TINode_Region_size += padding;
 	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
-	size_t Segment_Region_size = (CXL_SIZE - TINode_Region_size - Bitmap_Region_size)/NUM_MAX_BROKERS;
+	size_t Segment_Region_size = (cxl_size_ - TINode_Region_size - Bitmap_Region_size)/NUM_MAX_BROKERS;
 	padding = Segment_Region_size%cacheline_size;
 	Segment_Region_size -= padding;
 
