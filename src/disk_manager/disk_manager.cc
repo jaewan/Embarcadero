@@ -75,7 +75,6 @@ void DiskManager::DiskIOThread(){
 		int off = offset_.fetch_add(req.paddedSize, std::memory_order_relaxed);
 		pwrite(log_fd_, req.payload_address, req.paddedSize, off);
 
-		/*
 		// Post I/O work (as disk I/O depend on the same payload)
 		int counter = req.counter->fetch_sub(1,std::memory_order_release);
 		if( counter == 1){
@@ -86,7 +85,6 @@ void DiskManager::DiskIOThread(){
 			ackReq.client_socket = req.client_socket;
 			network_manager_->EnqueueRequest(ackReq);
 		}
-		*/
 	}
 }
 

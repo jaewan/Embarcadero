@@ -175,9 +175,8 @@ void NetworkManager::ReqReceiveThread(){
 								}
 								if(to_read == 0){
 									pub_req.size = header->size;
-									pub_req.client_order = header->global_order;
+									pub_req.client_order = header->order;
 									pub_req.payload_address = (void*)buf;
-									pub_req.total_order = header->total_order
 									cxl_manager_->EnqueueRequest(pub_req);
 									disk_manager_->EnqueueRequest(pub_req);
 
@@ -268,11 +267,12 @@ void NetworkManager::ReqReceiveThread(){
 						to_read -= bytes_read;
 						//TODO(Jae) Change this to malloc here to allow dynamic message size during one connection
 						if(to_read == 0){
-							MessageHeader *header = (MessageHeader*)buf;;
+							MessageHeader *header = (MessageHeader*)buf;
 							pub_req.paddedSize = header->paddedSize;
-							pub_req.client_order = header->client_order;
+							pub_req.order = header->client_order;
 							pub_req.payload_address = (void*)buf;
-							pub_req.total_order = header->total_order;
+							pub_req.counter = (std::atomic<int>*)mi_malloc(sizeof(std::atomic<int>));
+							pub_req.counter->store(2);
 							cxl_manager_->EnqueueRequest(pub_req);
 							//disk_manager_->EnqueueRequest(pub_req);
 
@@ -353,7 +353,7 @@ void NetworkManager::AckThread(){
 			} else {
 				const struct NetworkRequest &req = optReq.value();
 				buf[ack_count].success = req.success;
-				buf[ack_count].client_order = req.client_order;
+				buf[ack_count].order = req.order;
 				ack_count++;
 			}
 		}
