@@ -82,10 +82,10 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type):
 	broker_id_(broker_id){
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
-  if (cxl_type == Real) {
-	  cxl_size_ = CXL_SIZE;
+	if (cxl_type == Real) {
+		cxl_size_ = CXL_SIZE;
 	} else {
-	  cxl_size_ = CXL_EMUL_SIZE;
+		cxl_size_ = CXL_EMUL_SIZE;
 	}
 
 	// Initialize CXL
