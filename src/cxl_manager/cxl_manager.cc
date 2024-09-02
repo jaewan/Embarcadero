@@ -292,6 +292,7 @@ void CXLManager::Sequencer2(char* topic){
 						}
 					}
 				}else{
+					queues[broker].push(msg_to_order[broker]);
 					//Insert to skipped messages
 					auto it = skipped_msg.find(client);
 					if (it == skipped_msg.end()) {
