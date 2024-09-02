@@ -34,8 +34,8 @@ class Topic{
 		Topic(const Topic &) = delete;
 		Topic& operator=(const Topic &) = delete;
 
-		bool PublishToCXL(PublishRequest &req){
-			return (this->*WriteToCXLFunc)(req);
+		void PublishToCXL(PublishRequest &req){
+			(this->*WriteToCXLFunc)(req);
 		}
 
 		bool GetMessageAddr(size_t &last_offset,
@@ -45,9 +45,9 @@ class Topic{
 
 	private:
 		void CombinerThread();
-		bool (Topic::*WriteToCXLFunc)(PublishRequest &req);
-		bool WriteToCXL(PublishRequest &req);
-		bool WriteToCXLWithMutex(PublishRequest &req);
+		void (Topic::*WriteToCXLFunc)(PublishRequest &req);
+		void WriteToCXL(PublishRequest &req);
+		void WriteToCXLWithMutex(PublishRequest &req);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		std::string topic_name_;
@@ -56,9 +56,6 @@ class Topic{
 		int order_;
 		heartbeat_system::SequencerType seq_type_;
 		void* cxl_addr_;
-
-		// used for corfu only within written_mutex_ so no need to be atomic
-		size_t topic_sequence_num_;
 
 		size_t logical_offset_;
 		size_t written_logical_offset_;
@@ -91,7 +88,7 @@ class TopicManager{
 		}
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
-		bool PublishToCXL(PublishRequest &req);
+		void PublishToCXL(PublishRequest &req);
 		void* GetCXLBuffer(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);

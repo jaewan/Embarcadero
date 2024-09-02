@@ -146,9 +146,6 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequen
 void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
-<<<<<<< HEAD
-bool TopicManager::PublishToCXL(PublishRequest &req){
-=======
 void* TopicManager::GetCXLBuffer(PublishRequest &req){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
@@ -170,7 +167,6 @@ void* TopicManager::GetCXLBuffer(PublishRequest &req){
 }
 
 void TopicManager::PublishToCXL(PublishRequest &req){
->>>>>>> main
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
@@ -179,15 +175,15 @@ void TopicManager::PublishToCXL(PublishRequest &req){
 			topic_itr = topics_.find(req.topic);
 			if(topic_itr == topics_.end()){
 				LOG(ERROR) << "Topic Entry was not created Something is wrong";
-				return false;
+				return;
 			}
 		}else{
 			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic
 			<< " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
-			return false;
+			return;
 		}
 	}
-	return topic_itr->second->PublishToCXL(req);
+	topic_itr->second->PublishToCXL(req);
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -211,7 +207,6 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 	order_(order),
 	seq_type_(seq_type),
 	cxl_addr_(cxl_addr),
-	topic_sequence_num_(broker_id),
 	current_segment_(segment_metadata){
 		logical_offset_ = 0;
 		written_logical_offset_ = (size_t)-1;
@@ -267,65 +262,11 @@ void Topic::Combiner(){
 
 // MessageHeader is already included from network manager
 // For performance (to not have any mutex) have a separate combiner to give logical offsets  to the messages
-bool Topic::WriteToCXL(PublishRequest &req){
+void Topic::WriteToCXL(PublishRequest &req){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
-	static const size_t msg_header_size = sizeof(struct MessageHeader);
-	unsigned long long int log = NULL;
 	size_t msgSize = req.total_size;
-	bool skipped_message = false;
 
-	if (seq_type_ == CORFU) {
-		size_t num_brokers = 1; // TODO(erika): this is a hack for now
-		//LOG(ERROR) << "NUM BROKERS IS: " << num_brokers;
-
-		std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
-		while (true) {
-			written_mutex_.Lock();
-			if (topic_sequence_num_ == req.order) {
-				topic_sequence_num_ += num_brokers;
-				log = log_addr_.fetch_add(msgSize);
-				//LOG(ERROR) << "ACCEPTED: " << req.order << " TOPIC COUNT: " << topic_sequence_num_;
-				written_mutex_.Unlock();
-				break;
-			} else if (topic_sequence_num_ > req.order) {
-				//LOG(ERROR) << "SKIPPED: " << req.order << " TOPIC COUNT: " << topic_sequence_num_;
-				written_mutex_.Unlock();
-				// We were skipped due to timeout!
-				skipped_message = true;
-				break;
-			} else {
-				// We need to wait for timeout
-				written_mutex_.Unlock();
-				std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-				if (std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() > CORFU_TIMEOUT_MICROSEC) {
-					{
-						absl::MutexLock lock(&written_mutex_);
-						if (topic_sequence_num_ <= req.order) {
-							// clients should be sending round-robin
-							//assert((req.order - topic_sequence_num_) % num_brokers == 0);
-
-							topic_sequence_num_ = req.order + num_brokers;
-							log = log_addr_.fetch_add(msgSize);
-							//LOG(ERROR) << "ACCEPTED AFTER TIMEOUT: " << req.order << " TOPIC COUNT: " << topic_sequence_num_;
-							break;
-						} else {
-							//LOG(ERROR) << "SKIPPED AFTER TIMEOUT: " << req.order << " TOPIC COUNT: " << topic_sequence_num_;
-							skipped_message = true;
-						}
-					}
-					break;
-				}
-				std::this_thread::yield();
-			}
-		}
-		if (skipped_message) {
-			return false;
-		}
-
-	} else {
-		log = log_addr_.fetch_add(msgSize);
-	}
-
+	unsigned long long int log = log_addr_.fetch_add(msgSize);
 	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
 		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
 		//TODO(Jae) Finish below segment boundary crossing code
@@ -337,11 +278,10 @@ bool Topic::WriteToCXL(PublishRequest &req){
 			// Wait for the first thread that crossed the segment to allocate a new segment
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
-		return false;
 	}
 	memcpy_nt((void*)log, req.payload_address, msgSize);
-	return true;
 }
+
 void* Topic::GetCXLBuffer(PublishRequest &req){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = req.total_size;

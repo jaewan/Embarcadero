@@ -420,4 +420,3 @@ void NetworkManager::MainThread(){
 }
 
 } // End of namespace Embarcadero
-
