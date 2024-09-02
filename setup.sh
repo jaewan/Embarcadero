@@ -86,7 +86,7 @@ function Install_RHEL_Dependencies()
 	sudo dnf install -y systemd-devel
 	sudo dnf install -y protobuf-devel protobuf-lite-devel
 
-	# TODO: install mi_malloc
+	# TODO: install mi_malloc, currently running on test machines with v1.8
 }
 
 function Download_Dependency_Source_Code()
