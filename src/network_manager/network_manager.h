@@ -68,4 +68,3 @@ class NetworkManager{
 
 } // End of namespace Embarcadero
 #endif // _NETWORK_MANAGER_H_
-

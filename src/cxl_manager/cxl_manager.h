@@ -97,7 +97,7 @@ class CXLManager{
 
 	private:
 		int broker_id_;
-    size_t cxl_size_;
+		size_t cxl_size_;
 		std::vector<std::thread> sequencerThreads_;
 
 		TopicManager *topic_manager_;
