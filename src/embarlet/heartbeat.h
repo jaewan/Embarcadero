@@ -34,8 +34,6 @@ using heartbeat_system::HeartbeatRequest;
 using heartbeat_system::HeartbeatResponse;
 using heartbeat_system::CreateTopicRequest;
 using heartbeat_system::CreateTopicResponse;
-using heartbeat_system::CorfuSequencerRequest;
-using heartbeat_system::CorfuSequencerResponse;
 
 class HeartBeatServiceImpl final : public HeartBeat::Service {
 	public:
@@ -119,14 +117,6 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				return Status::OK;
 		}
 
-		Status CorfuSequencer(ServerContext* context, const CorfuSequencerRequest* request,
-				CorfuSequencerResponse* reply) {
-			reply->set_order_start(corfu_global_sequence_.fetch_add(
-					request->batch_size(), std::memory_order_acquire)
-			);
-			return Status::OK;
-		}
-
 		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback){
 			create_topic_entry_callback_ = callback;
 		}
@@ -173,7 +163,6 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		absl::Mutex mutex_;
 		absl::flat_hash_map<std::string, NodeInfo> nodes_;
 		std::thread heartbeat_thread_;
-		std::atomic<uint32_t> corfu_global_sequence_{0};
 		bool shutdown_ = false;
 		Embarcadero::CreateTopicEntryCallback create_topic_entry_callback_;
 };
