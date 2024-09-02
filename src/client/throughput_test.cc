@@ -359,10 +359,34 @@ class Client{
 				j = 0;
 			}
 			client_order_++;
-			/*
-				 pubQue_.Write(client_order_%num_threads_, client_order_, message, len);
-				 client_order_++;
-				 */
+		}
+
+		void PublishCorfu(char* message, size_t len, size_t batch_size){
+			static size_t i = 0;
+			static size_t j = 0;
+			size_t n = batch_size/(len+64);
+
+			grpc::ClientContext context;
+			heartbeat_system::CorfuSequencerRequest req;
+			heartbeat_system::CorfuSequencerResponse res;
+			req.set_batch_size(batch_size);
+
+			grpc::Status status = stub_->CorfuSequencer(&context, req, &res);
+			if (status.ok()) {
+				uint32_t order = res.order_start();
+				for (uint32_t k = order; k < order + batch_size; k++) {
+					pubQue_.Write(i, k, message, len); // send global order instead of client order
+					j++;
+					if(j == n){
+						i = (i+1)%num_threads_;
+						j = 0;
+					}
+					client_order_++;
+				}
+			} else {
+				LOG(ERROR) << "Corfu Sequencer Request Failed";
+				exit(-1);
+			}
 		}
 
 		void Poll(size_t n){
@@ -1100,8 +1124,20 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	c.CreateNewTopic(topic, order, seq_type);
 	c.Init(topic, ack_level, order);
 	auto start = std::chrono::high_resolution_clock::now();
-	for(size_t i=0; i<n; i++){
-		c.Publish(message, message_size, batch_size);
+
+	if (seq_type != heartbeat_system::SequencerType::CORFU) {
+		for(size_t i=0; i<n; i++){
+			c.Publish(message, message_size, batch_size);
+		}
+	} else {
+		size_t num_batches = n / batch_size;
+		for (size_t i = 0; i < num_batches; i++) {
+			c.PublishCorfu(message, message_size, batch_size);
+		}
+		size_t leftovers = n % batch_size;
+		if (leftovers != 0) {
+			c.PublishCorfu(message, message_size, leftovers);
+		}
 	}
 	auto produce_end = std::chrono::high_resolution_clock::now();
 	c.DEBUG_check_send_finish();
@@ -1152,19 +1188,34 @@ void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_t
 	c.Init(topic, ack_level, order);
 
 	auto start = std::chrono::high_resolution_clock::now();
-	for(size_t i=0; i<n; i++){
-		c.Publish(message.data(), message_size, batch_size);
+	if (seq_type != heartbeat_system::SequencerType::CORFU) {
+		for(size_t i=0; i<n; i++){
+			c.Publish(message.data(), message_size, batch_size);
+		}
+	} else {
+		size_t num_batches = n / batch_size;
+		for (size_t i = 0; i < num_batches; i++) {
+			c.PublishCorfu(message.data(), message_size, batch_size);
+		}
+		size_t leftovers = n % batch_size;
+		if (leftovers != 0) {
+			c.PublishCorfu(message.data(), message_size, leftovers);
+		}
 	}
 	c.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
-	s.DEBUG_wait(total_message_size, message_size);
-	auto end = std::chrono::high_resolution_clock::now();
 
+	if (seq_type != heartbeat_system::SequencerType::CORFU) { // TODO(erika): just until sequencer enabled for corfu
+		s.DEBUG_wait(total_message_size, message_size);
+	}
+	auto end = std::chrono::high_resolution_clock::now();
 	auto pub_duration = std::chrono::duration_cast<std::chrono::seconds>(pub_end - start);
-	auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
 	LOG(INFO) << "Pub Bandwidth: " << (total_message_size/(1024*1024))/pub_duration.count() << " MB/s";
-	LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
-	s.DEBUG_check_order(order);
+	if (seq_type != heartbeat_system::SequencerType::CORFU) { // TODO(erika): just until sequencer enabled for corfu
+		auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
+		LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
+		s.DEBUG_check_order(order);
+	}
 }
 
 void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, size_t batch_size){
@@ -1190,7 +1241,20 @@ void LatencyTest(size_t total_message_size, size_t message_size, int num_threads
 		long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
 				timestamp.time_since_epoch()).count();
 		memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
-		c.Publish(message, message_size, batch_size);
+		if (seq_type != heartbeat_system::SequencerType::CORFU) {
+			for(size_t i=0; i<n; i++){
+				c.Publish(message, message_size, batch_size);
+			}
+		} else {
+			size_t num_batches = n / batch_size;
+			for (size_t i = 0; i < num_batches; i++) {
+				c.PublishCorfu(message, message_size, batch_size);
+			}
+			size_t leftovers = n % batch_size;
+			if (leftovers != 0) {
+				c.PublishCorfu(message, message_size, leftovers);
+			}
+		}
 	}
 	c.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
