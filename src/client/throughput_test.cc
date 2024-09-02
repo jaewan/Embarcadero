@@ -348,9 +348,10 @@ class Client{
 			return;
 		}
 
-		void Publish(char* message, size_t len, size_t batch_size){
+		void Publish(char* message, size_t len){
 			static size_t i = 0;
 			static size_t j = 0;
+			const static size_t batch_size = 1UL<<19;
 			size_t n = batch_size/(len+64);
 			pubQue_.Write(i, client_order_, message, len);
 			j++;
@@ -359,34 +360,6 @@ class Client{
 				j = 0;
 			}
 			client_order_++;
-		}
-
-		void PublishCorfu(char* message, size_t len, size_t batch_size){
-			static size_t i = 0;
-			static size_t j = 0;
-			size_t n = batch_size/(len+64);
-
-			grpc::ClientContext context;
-			heartbeat_system::CorfuSequencerRequest req;
-			heartbeat_system::CorfuSequencerResponse res;
-			req.set_batch_size(batch_size);
-
-			grpc::Status status = stub_->CorfuSequencer(&context, req, &res);
-			if (status.ok()) {
-				uint32_t order = res.order_start();
-				for (uint32_t k = order; k < order + batch_size; k++) {
-					pubQue_.Write(i, k, message, len); // send global order instead of client order
-					j++;
-					if(j == n){
-						i = (i+1)%num_threads_;
-						j = 0;
-					}
-					client_order_++;
-				}
-			} else {
-				LOG(ERROR) << "Corfu Sequencer Request Failed";
-				exit(-1);
-			}
 		}
 
 		void Poll(size_t n){
@@ -1108,7 +1081,7 @@ bool CheckAvailableCores(){
 	return num_cores == CGROUP_CORE;
 }
 
-void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, size_t batch_size){
+void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	char* message = (char*)malloc(sizeof(char)*message_size);
@@ -1126,20 +1099,10 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	c.Init(topic, ack_level, order);
 	auto start = std::chrono::high_resolution_clock::now();
 
-	if (seq_type != heartbeat_system::SequencerType::CORFU) {
-		for(size_t i=0; i<n; i++){
-			c.Publish(message, message_size, batch_size);
-		}
-	} else {
-		size_t num_batches = n / batch_size;
-		for (size_t i = 0; i < num_batches; i++) {
-			c.PublishCorfu(message, message_size, batch_size);
-		}
-		size_t leftovers = n % batch_size;
-		if (leftovers != 0) {
-			c.PublishCorfu(message, message_size, leftovers);
-		}
+	for(size_t i=0; i<n; i++){
+		c.Publish(message, message_size);
 	}
+
 	auto produce_end = std::chrono::high_resolution_clock::now();
 	c.DEBUG_check_send_finish();
 	auto send_end = std::chrono::high_resolution_clock::now();
@@ -1171,7 +1134,7 @@ void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size){
 	s.DEBUG_check_order(2);
 }
 
-void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, size_t batch_size){
+void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
@@ -1189,37 +1152,22 @@ void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_t
 	c.Init(topic, ack_level, order);
 
 	auto start = std::chrono::high_resolution_clock::now();
-	if (seq_type != heartbeat_system::SequencerType::CORFU) {
-		for(size_t i=0; i<n; i++){
-			c.Publish(message.data(), message_size, batch_size);
-		}
-	} else {
-		size_t num_batches = n / batch_size;
-		for (size_t i = 0; i < num_batches; i++) {
-			c.PublishCorfu(message.data(), message_size, batch_size);
-		}
-		size_t leftovers = n % batch_size;
-		if (leftovers != 0) {
-			c.PublishCorfu(message.data(), message_size, leftovers);
-		}
+	for(size_t i=0; i<n; i++){
+		c.Publish(message.data(), message_size);
 	}
+
 	c.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
-
-	if (seq_type != heartbeat_system::SequencerType::CORFU) { // TODO(erika): just until sequencer enabled for corfu
-		s.DEBUG_wait(total_message_size, message_size);
-	}
+	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
 	auto pub_duration = std::chrono::duration_cast<std::chrono::seconds>(pub_end - start);
 	LOG(INFO) << "Pub Bandwidth: " << (total_message_size/(1024*1024))/pub_duration.count() << " MB/s";
-	if (seq_type != heartbeat_system::SequencerType::CORFU) { // TODO(erika): just until sequencer enabled for corfu
-		auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-		LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
-		s.DEBUG_check_order(order);
-	}
+	auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
+	LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
+	s.DEBUG_check_order(order);
 }
 
-void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, size_t batch_size){
+void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	char message[message_size];
@@ -1242,19 +1190,8 @@ void LatencyTest(size_t total_message_size, size_t message_size, int num_threads
 		long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
 				timestamp.time_since_epoch()).count();
 		memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
-		if (seq_type != heartbeat_system::SequencerType::CORFU) {
-			for(size_t i=0; i<n; i++){
-				c.Publish(message, message_size, batch_size);
-			}
-		} else {
-			size_t num_batches = n / batch_size;
-			for (size_t i = 0; i < num_batches; i++) {
-				c.PublishCorfu(message, message_size, batch_size);
-			}
-			size_t leftovers = n % batch_size;
-			if (leftovers != 0) {
-				c.PublishCorfu(message, message_size, leftovers);
-			}
+		for(size_t i=0; i<n; i++){
+			c.Publish(message, message_size);
 		}
 	}
 	c.Poll(n);
@@ -1292,8 +1229,7 @@ int main(int argc, char* argv[]) {
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10737418240"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"))
-		("b,batch_size", "Batch size for publish", cxxopts::value<size_t>()->default_value("524288")); // Default is: 1UL<<19;
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
@@ -1303,17 +1239,16 @@ int main(int argc, char* argv[]) {
 	int order = result["order_level"].as<int>();
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 	FLAGS_v = result["log_level"].as<int>();
-	size_t batch_size = result["batch_size"].as<size_t>();
 
 	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
 		LOG(ERROR) << "CGroup core throttle is wrong";
 		return -1;
 	}
 
-	//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, batch_size);
+	//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 	//SubscribeThroughputTest(total_message_size, message_size);
-	E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, batch_size);
-	//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, batch_size);
+	E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
 	return 0;
 }
