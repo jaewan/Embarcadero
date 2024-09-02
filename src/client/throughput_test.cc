@@ -220,7 +220,7 @@ class Buffer{
 				size_t allocated;
 				// 4K is a buffer space as message can go over
 				size_t buf_size = (total_buf_size / num_buf) + 4096; 
-				for(int i=0; i < num_buf; i++){
+				for(size_t i=0; i < num_buf; i++){
 					bufs[i].buffer = mmap_large_buffer(buf_size, allocated);
 					bufs[i].tail = 0;
 					bufs[i].head = 0;
@@ -241,7 +241,7 @@ class Buffer{
 			}
 
 		~Buffer(){
-			for(int i=0; i < num_buf_; i++){
+			for(size_t i=0; i < num_buf_; i++){
 				munmap(bufs[i].buffer, bufs[i].len);
 			}
 			free(bufs);
@@ -348,10 +348,9 @@ class Client{
 			return;
 		}
 
-		void Publish(char* message, size_t len){
+		void Publish(char* message, size_t len, size_t batch_size){
 			static size_t i = 0;
 			static size_t j = 0;
-			const static size_t batch_size = 1UL<<19;
 			size_t n = batch_size/(len+64);
 			pubQue_.Write(i, client_order_, message, len);
 			j++;
@@ -366,7 +365,7 @@ class Client{
 				 */
 		}
 
-		void Poll(int n){
+		void Poll(size_t n){
 			pubQue_.ReturnReads();
 			while(client_order_ < n){
 				std::this_thread::yield();
@@ -516,7 +515,7 @@ class Client{
 					} else {
 						// Data from existing client
 						int client_sock = events[i].data.fd;
-						ssize_t bytes_received;
+						ssize_t bytes_received = 0;
 
 						while (total_received < client_order_ && (bytes_received = recv(client_sock, buffer, 1024*1024, 0)) > 0) {
 							total_received += bytes_received;
@@ -671,7 +670,7 @@ class Client{
 				batch_header.total_size = len;
 
 				ssize_t bytesSent = send(sock, (uint8_t*)(&batch_header), sizeof(Embarcadero::BatchHeader), 0);
-				if(bytesSent < sizeof(Embarcadero::BatchHeader)){
+				if(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
 					LOG(ERROR) << "Jae compelte this too when batch header is partitioned.";
 					return;
 				}
@@ -1084,8 +1083,8 @@ bool CheckAvailableCores(){
 	return num_cores == CGROUP_CORE;
 }
 
-void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
-	int n = total_message_size/message_size;
+void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, size_t batch_size){
+	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 	char topic[TOPIC_NAME_SIZE];
@@ -1101,8 +1100,8 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	c.CreateNewTopic(topic, order, seq_type);
 	c.Init(topic, ack_level, order);
 	auto start = std::chrono::high_resolution_clock::now();
-	for(int i=0; i<n; i++){
-		c.Publish(message, message_size);
+	for(size_t i=0; i<n; i++){
+		c.Publish(message, message_size, batch_size);
 	}
 	auto produce_end = std::chrono::high_resolution_clock::now();
 	c.DEBUG_check_send_finish();
@@ -1135,8 +1134,8 @@ void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size){
 	s.DEBUG_check_order(2);
 }
 
-void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
-	int n = total_message_size/message_size;
+void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, size_t batch_size){
+	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
 	char topic[TOPIC_NAME_SIZE];
@@ -1153,8 +1152,8 @@ void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_t
 	c.Init(topic, ack_level, order);
 
 	auto start = std::chrono::high_resolution_clock::now();
-	for(int i=0; i<n; i++){
-		c.Publish(message.data(), message_size);
+	for(size_t i=0; i<n; i++){
+		c.Publish(message.data(), message_size, batch_size);
 	}
 	c.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
@@ -1168,8 +1167,8 @@ void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_t
 	s.DEBUG_check_order(order);
 }
 
-void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
-	int n = total_message_size/message_size;
+void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, size_t batch_size){
+	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	char message[message_size];
 	char topic[TOPIC_NAME_SIZE];
@@ -1186,12 +1185,12 @@ void LatencyTest(size_t total_message_size, size_t message_size, int num_threads
 	c.Init(topic, ack_level, order);
 
 	auto start = std::chrono::high_resolution_clock::now();
-	for(int i=0; i<n; i++){
+	for(size_t i=0; i<n; i++){
 		auto timestamp = std::chrono::steady_clock::now();
 		long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
 				timestamp.time_since_epoch()).count();
 		memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
-		c.Publish(message, message_size);
+		c.Publish(message, message_size, batch_size);
 	}
 	c.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
@@ -1228,7 +1227,8 @@ int main(int argc, char* argv[]) {
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10737418240"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"))
+		("b,batch_size", "Batch size for publish", cxxopts::value<size_t>()->default_value("524288")); // Default is: 1UL<<19;
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
@@ -1238,16 +1238,17 @@ int main(int argc, char* argv[]) {
 	int order = result["order_level"].as<int>();
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 	FLAGS_v = result["log_level"].as<int>();
+	size_t batch_size = result["batch_size"].as<size_t>();
 
 	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
 		LOG(ERROR) << "CGroup core throttle is wrong";
 		return -1;
 	}
 
-	//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, batch_size);
 	//SubscribeThroughputTest(total_message_size, message_size);
-	E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-	//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, batch_size);
+	//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, batch_size);
 
 	return 0;
 }
