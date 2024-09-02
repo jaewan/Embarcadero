@@ -83,7 +83,9 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		int global_epoch_;
 
 		/// Used by the head node to keep track of how many local cuts it has received
-		int local_cuts_count_;
+		// int local_cuts_count_;
+		// absl::flat_hash_map<int, std::unique_ptr<std::atomic<int>>> local_cuts_count_;
+		absl::flat_hash_map<int, int> local_cuts_count_;
 
 		bool received_global_cut_;
 

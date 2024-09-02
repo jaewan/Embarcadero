@@ -224,9 +224,6 @@ void Topic::CombinerThread(){
 			continue;
 		}
 #endif
-
-		std::cout << "Updating written" << std::endl;
-
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
 		header->next_msg_diff = header->paddedSize;

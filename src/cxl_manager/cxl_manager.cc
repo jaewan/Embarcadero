@@ -406,59 +406,68 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 
 /// TODO: Jae, check the locking in this function to see if there is a more optimal way
 void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int broker_id) {
-	if (epoch != global_epoch_) {
+	if (epoch - 1 > global_epoch_) {
 		// If the epoch is not the same as the current global epoch, there is an error
-		LOG(ERROR) << "Local cut from local sequencer was sent too early, global sequencer has not yet sent the global cut";
+		LOG(ERROR) << "Local epoch: " << epoch << " while global epoch: " << global_epoch_;
 		exit(1);
 	}
 
 	std::unique_lock<std::mutex> lock(mutex_);
+	local_cuts_count_[epoch]++;
 
-	local_cuts_count_++;
+	// auto result = local_cuts_count_.emplace(epoch, std::make_unique<std::atomic<int>>(0));
+	// result.first->second->fetch_add(1);
 
-	if (local_cuts_count_ == broker_->GetNumBrokers()) {
+	if (local_cuts_count_[epoch] == broker_->GetNumBrokers()) {
 
 		std::cout << "We have received all local cuts, calling receive local cut from broker: " << broker_id << std::endl;
 
 		std::cout << "All local cuts for epoch " << epoch << " have been received, sending global cut" << std::endl;
 
 		// Send global cut to own node's local sequencer
+		global_epoch_++;
 		ReceiveGlobalCut(global_cut_, topic);
 
-		global_epoch_++;
-
-		waiting_threads_count_ = broker_->GetNumBrokers() - 1;
+		// waiting_threads_count_ = broker_->GetNumBrokers() - 1;
 
 		/// Notify all waiting grpc threads that the global cut has been received
 		cv_.notify_all();
 
 		/// Wait until all threads have been notified before resetting local_cuts_count_
-		reset_cv_.wait(lock, [this]() { return waiting_threads_count_ == 0; });
+		// reset_cv_.wait(lock, [this]() { return waiting_threads_count_ == 0; });
 
 		/// Safely reset local_cuts_count_ after all threads have been notified and processed
-		local_cuts_count_ = 0;
-
+		auto it = local_cuts_count_.find(epoch - 2);
+		if (it != local_cuts_count_.end()) {
+			// The element exists, so delete it
+			std::cout << "Erasing local cuts count for epoch: " << epoch - 2 << std::endl;
+			local_cuts_count_.erase(it);
+		}
 		std::cout << "Reset local_cuts_count_ to 0 after notifying all threads" << std::endl;
 	} else {
 		std::cout << "Calling receive local cut from broker: " << broker_id << std::endl;
 
 		/// If we haven't received all local cuts, the grpc thread must wait until we do to send the correct global cut back to the caller
-        cv_.wait(lock, [this, broker_id]() {
+        cv_.wait(lock, [this, broker_id, epoch]() {
 			std::cout << "I've been notified that all local cuts have been received from broker: " << broker_id << std::endl;
 			std::cout << "Num brokers: " << broker_->GetNumBrokers() << std::endl;
-			std::cout << "Local cuts count: " << local_cuts_count_ << std::endl;
-			if (local_cuts_count_ == broker_->GetNumBrokers()) {
+			std::cout << "Local cuts count: " << local_cuts_count_[epoch] << std::endl;
+			if (local_cuts_count_[epoch] == broker_->GetNumBrokers()) {
 				return true;
 			} else {
 				return false;
 			}
         });
 
+		// while (local_cuts_count_[epoch]->load() != broker_->GetNumBrokers()) {
+		// 	std::this_thread::yield();
+		// }
+
 		/// Decrement waiting_threads_count_ after processing the notification
-		if (--waiting_threads_count_ == 0) {
-			/// This notifies the waiting thread that we can reset local_cuts_count_ to 0
-			reset_cv_.notify_one();
-		}		
+		// if (--waiting_threads_count_ == 0) {
+		// 	/// This notifies the waiting thread that we can reset local_cuts_count_ to 0
+		// 	reset_cv_.notify_one();
+		// }		
 
 		std::cout << "Finished waiting for all local cuts to be received for broker: " << broker_id << std::endl;
 	}

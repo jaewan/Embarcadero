@@ -1278,10 +1278,10 @@ int main(int argc, char* argv[]) {
 		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
 		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("1"))
 		("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", cxxopts::value<std::string>()->default_value("SCALOG"))
-		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("19200"))
-		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("960"))
+		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10737418240"))
+		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("4"));
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
