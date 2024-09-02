@@ -41,6 +41,7 @@ class Topic{
 		bool GetMessageAddr(size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
+		void* GetCXLBuffer(PublishRequest &req);
 
 	private:
 		void CombinerThread();
@@ -91,6 +92,7 @@ class TopicManager{
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		bool PublishToCXL(PublishRequest &req);
+		void* GetCXLBuffer(PublishRequest &req);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 

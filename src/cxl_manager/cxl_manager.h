@@ -59,6 +59,10 @@ struct NonCriticalMessageHeader{
 	char _padding[64 - (sizeof(int) + sizeof(size_t) * 3 + sizeof(void*))]; 
 };
 
+struct BatchHeader{
+	size_t total_size;
+};
+
 
 // Orders are very important to avoid race conditions. 
 // If you change orders of elements, change how sequencers and combiner check written messages
@@ -67,19 +71,19 @@ struct alignas(64) MessageHeader{
 	size_t logical_offset;
 	unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
 	volatile size_t total_order;
-	int client_id;
-	size_t client_order;
-	volatile size_t size;
+	uint32_t client_id;
+	uint32_t client_order;
+	size_t size;
 	volatile size_t paddedSize; // This include message+padding+header size
+	uint32_t complete;
 };
 
 class CXLManager{
 	public:
-		CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, int num_io_threads);
+		CXLManager(int broker_id, CXL_Type cxl_type);
 		~CXLManager();
 		void SetTopicManager(TopicManager *topic_manager){topic_manager_ = topic_manager;}
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
-		void EnqueueRequest(struct PublishRequest req);
 		void* GetNewSegment();
 		void* GetTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
@@ -89,13 +93,11 @@ class CXLManager{
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
+		void* GetCXLBuffer(PublishRequest &req);
 
 	private:
-		std::vector<folly::MPMCQueue<std::optional<struct PublishRequest>>> requestQueues_;
 		int broker_id_;
-		int num_io_threads_;
     size_t cxl_size_;
-    std::vector<std::thread> threads_;
 		std::vector<std::thread> sequencerThreads_;
 
 		TopicManager *topic_manager_;

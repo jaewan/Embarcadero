@@ -71,17 +71,15 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 	}
 
 	if(broker_id == 0){
-		//memset(addr, 0, (1UL<<35));
+		//memset(addr, 0, (1UL<<34));
 		memset(addr, 0, cxl_size);
 		VLOG(3) << "Cleared CXL:" << cxl_size;
 	}
 	return addr;
 }
 
-CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, int num_io_threads):
-	broker_id_(broker_id),
-	num_io_threads_(num_io_threads){
-	size_t queSize = queueCapacity/num_io_threads;
+CXLManager::CXLManager(int broker_id, CXL_Type cxl_type):
+	broker_id_(broker_id){
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
   if (cxl_type == Real) {
@@ -90,18 +88,11 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 	  cxl_size_ = CXL_EMUL_SIZE;
 	}
 
-	for(int i=0; i<num_io_threads; i++){
-		requestQueues_.emplace_back(queSize);
-	}
-
 	// Initialize CXL
 	cxl_addr_ = allocate_shm(broker_id, cxl_type, cxl_size_);
 	if(cxl_addr_ == nullptr){
 		return;
 	}
-	// Create CXL I/O threads
-	for (int i=0; i< num_io_threads_; i++)
-		threads_.emplace_back(&CXLManager::CXLIOThread, this, i);
 
 	// Initialize CXL memory regions
 	size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
@@ -115,8 +106,6 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 	bitmap_ = (uint8_t*)cxl_addr_ + TINode_Region_size;
 	segments_ = (uint8_t*)bitmap_ + Bitmap_Region_size + ((broker_id_)*Segment_Region_size);
 
-	// Wait untill al IO threads are up
-	while(thread_count_.load() != num_io_threads_){}
 
 	LOG(INFO) << "\t[CXLManager]: \t\tConstructed";
 	return;
@@ -125,18 +114,6 @@ CXLManager::CXLManager(size_t queueCapacity, int broker_id, CXL_Type cxl_type, i
 CXLManager::~CXLManager(){
 	std::optional<struct PublishRequest> sentinel = std::nullopt;
 	stop_threads_ = true;
-	for (int i=0; i< num_io_threads_; i++) {
-		requestQueues_[i].blockingWrite(sentinel);
-	}
-
-	if (munmap(cxl_addr_, CXL_SIZE) < 0)
-		LOG(ERROR) << "Unmapping CXL error";
-
-	for(std::thread& thread : threads_){
-		if(thread.joinable()){
-			thread.join();
-		}
-	}
 
 	for(std::thread& thread : sequencerThreads_){
 		if(thread.joinable()){
@@ -144,43 +121,15 @@ CXLManager::~CXLManager(){
 		}
 	}
 
+	if (munmap(cxl_addr_, CXL_SIZE) < 0)
+		LOG(ERROR) << "Unmapping CXL error";
+
+
 	LOG(INFO) << "[CXLManager]: \t\tDestructed";
 }
 
-
-void CXLManager::CXLIOThread(int tid){
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	std::optional<struct PublishRequest> optReq;
-	while(!stop_threads_){
-		requestQueues_[tid].blockingRead(optReq);
-		if(!optReq.has_value()){
-			break;
-		}
-		struct PublishRequest &req = optReq.value();
-
-		// Actual IO to the CXL
-		bool success = topic_manager_->PublishToCXL(req);//req.topic, req.payload_address, req.size);
-
-		// Post I/O work (as disk I/O depend on the same payload)
-		/*
-		int counter = req.counter->fetch_sub(1);
-		if( counter == 1){
-			mi_free(req.counter);
-			mi_free(req.payload_address);
-		}else if(req.acknowledge){
-			struct NetworkRequest ackReq;
-			ackReq.client_socket = req.client_socket;
-			network_manager_->EnqueueRequest(ackReq);
-		}
-		*/
-		struct NetworkRequest ackReq;
-		ackReq.client_socket = req.client_socket;
-		ackReq.success = success;
-		ackReq.order = req.order;
-		network_manager_->EnqueueRequest(ackReq);
-		mi_free(req.counter);
-		mi_free(req.payload_address);
-	}
+void* CXLManager::GetCXLBuffer(PublishRequest &req){
+	return topic_manager_->GetCXLBuffer(req);
 }
 
 // This function returns TInode without inspecting if the topic exists
@@ -190,16 +139,6 @@ void* CXLManager::GetTInode(const char* topic){
 	//int TInode_idx = topic_to_idx(topic) % MAX_TOPIC_SIZE;
 	int TInode_idx = atoi(topic) % MAX_TOPIC_SIZE;
 	return ((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
-}
-
-// When a requestQueue is a single queue, enqueueing to the queue evenly distributes the tasks to io threads
-// To evenly distribute reqs to multiple queues, we use thread-local random number generator
-void CXLManager::EnqueueRequest(struct PublishRequest req){
-	thread_local std::random_device rd;
-	thread_local std::mt19937 gen(rd());
-	std::uniform_int_distribution<> dis(0, num_io_threads_ - 1);
-
-	requestQueues_[dis(gen)].blockingWrite(req);
 }
 
 void* CXLManager::GetNewSegment(){
