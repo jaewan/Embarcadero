@@ -789,12 +789,12 @@ class Subscriber{
 		};
 
 		void* Consume(){
-			int i = messages_idx_.fetch_xor(1);
+			//int i = messages_idx_.fetch_xor(1);
 			return nullptr;
 		}
 
 		void* ConsumeBatch(){
-			int i = messages_idx_.fetch_xor(1);
+			//int i = messages_idx_.fetch_xor(1);
 			return nullptr;
 		}
 
@@ -1099,16 +1099,11 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
 	LOG(INFO) << "Client Created" ;
 	c.CreateNewTopic(topic, order, seq_type);
-	for(int i=0; i<n; i++){
-		c.Publish(message, message_size);
-	}
 	c.Init(topic, ack_level, order);
 	auto start = std::chrono::high_resolution_clock::now();
-	/*
 	for(int i=0; i<n; i++){
 		c.Publish(message, message_size);
 	}
-	*/
 	auto produce_end = std::chrono::high_resolution_clock::now();
 	c.DEBUG_check_send_finish();
 	auto send_end = std::chrono::high_resolution_clock::now();
@@ -1249,8 +1244,9 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
-	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-	SubscribeThroughputTest(total_message_size, message_size);
+	//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	//SubscribeThroughputTest(total_message_size, message_size);
+	E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 	//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
 	return 0;
