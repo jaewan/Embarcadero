@@ -7,7 +7,6 @@ service HeartBeat {
 	rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 	rpc GetClusterStatus (ClientInfo) returns (ClusterStatus);
 	rpc CreateNewTopic(CreateTopicRequest) returns (CreateTopicResponse);
-  rpc CorfuSequencer(CorfuSequencerRequest) returns (CorfuSequencerResponse);
 }
 
 enum SequencerType{
@@ -54,12 +53,3 @@ message CreateTopicRequest {
 message CreateTopicResponse {
 	bool success = 1;
 }
-
-message CorfuSequencerRequest {
-  uint32 batch_size = 1;
-}
-
-message CorfuSequencerResponse {
-  uint32 order_start = 1;
-}
-
