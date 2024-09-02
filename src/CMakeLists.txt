@@ -4,7 +4,7 @@ include(cmake/heartbeat_grpc.cmake)
 # folly cmake mostly from pehere: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
 find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
-find_package(mimalloc 2.1.7 REQUIRED)
+find_package(mimalloc REQUIRED)
 
 configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
