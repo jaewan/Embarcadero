@@ -94,7 +94,8 @@ class CXLManager{
 		std::vector<folly::MPMCQueue<std::optional<struct PublishRequest>>> requestQueues_;
 		int broker_id_;
 		int num_io_threads_;
-		std::vector<std::thread> threads_;
+    size_t cxl_size_;
+    std::vector<std::thread> threads_;
 		std::vector<std::thread> sequencerThreads_;
 
 		TopicManager *topic_manager_;
