@@ -83,7 +83,7 @@ int GetBrokerId(const std::string& input) {
 	return addressPort - PORT;
 }
 
-int GetNonblockingSock(char *broker_address, int port){
+int GetNonblockingSock(char *broker_address, int port, bool send = true){
 	int sock = socket(AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
 		LOG(ERROR) << "Socket creation failed";
@@ -113,11 +113,25 @@ int GetNonblockingSock(char *broker_address, int port){
 		return -1;
 	}
 
-	int sendBufferSize = 16 * 1024 * 1024;
-	if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize)) == -1) {
-		LOG(ERROR) << "setsockopt SNGBUf failed";
-		close(sock);
-		return -1;
+	int BufferSize = 16 * 1024 * 1024;
+	if(send){
+		if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &BufferSize, sizeof(BufferSize)) == -1) {
+			LOG(ERROR) << "setsockopt SNGBUf failed";
+			close(sock);
+			return -1;
+		}
+		// Enable zero-copy
+		if (setsockopt(sock, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
+			LOG(ERROR) << "setsockopt(SO_ZEROCOPY) failed";
+			close(sock);
+			return -1;
+		}
+	}else{
+		if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &BufferSize, sizeof(BufferSize)) == -1) {
+			LOG(ERROR) << "setsockopt SNGBUf failed";
+			close(sock);
+			return -1;
+		}
 	}
 	/*
 		 int mss = 4108;
@@ -128,12 +142,6 @@ int GetNonblockingSock(char *broker_address, int port){
 		 }
 		 */
 
-	// Enable zero-copy
-	if (setsockopt(sock, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
-		LOG(ERROR) << "setsockopt(SO_ZEROCOPY) failed";
-		close(sock);
-		return -1;
-	}
 
 	sockaddr_in server_addr;
 	memset(&server_addr, 0, sizeof(server_addr));
@@ -940,12 +948,6 @@ class Subscriber{
 							DEBUG_count_ += bytes_received;
 							m->offset += bytes_received;
 							if(measure_latency_){
-								/*
-								 * Copy this code to calculate the latency
-								 long long received_nanoseconds_since_epoch = std::stoll(received_timestamp_str);
-								 auto received_time_point = std::chrono::time_point<std::chrono::steady_clock>(
-								 std::chrono::nanoseconds(received_nanoseconds_since_epoch));
-								 */
 								m->timestamps.emplace_back(m->offset, std::chrono::steady_clock::now());
 							}
 						} else if (bytes_received == 0) {
@@ -972,31 +974,35 @@ class Subscriber{
 			absl::MutexLock lock(&mutex_);
 			for(auto &new_broker: new_brokers_){
 				auto [addr, addressPort] = ParseAddressPort(new_broker.second);
-				int sock = GetNonblockingSock(addr.data(), PORT + new_broker.first);
+				int sock = GetNonblockingSock(addr.data(), PORT + new_broker.first, false);
+
+				std::pair<void*, msgIdx> msg(static_cast<void*>(malloc(buffer_size_)), msgIdx(new_broker.first));
+				std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(new_broker.first));
+				int idx = messages_[0].size();
+				messages_[0].push_back(msg);
+				messages_[1].push_back(msg1);
+				fd_to_msg_idx_[sock] = idx;
+				//Send Sub request
+				Embarcadero::EmbarcaderoReq shake;
+				shake.client_order = 0;
+				shake.last_addr = 0;
+				shake.client_req = Embarcadero::Subscribe;
+				memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
+
+				int ret = send(sock, &shake, sizeof(shake), 0);
+				if(ret < sizeof(shake)){
+					LOG(ERROR) << "fd:" << sock << " addr:" << new_broker.second << " id:" << new_broker.first  << 
+					"sent:" << ret<< "/" <<sizeof(shake) 	<< " failed:" << strerror(errno);
+					close(sock);
+					continue;
+				}
+
 				epoll_event ev;
-				ev.events = EPOLLIN | EPOLLET;
+				ev.events = EPOLLIN;
 				ev.data.fd = sock;
 				if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1) {
 					LOG(ERROR) << "Failed to add new server to epoll";
 					close(sock);
-				} else {
-					std::pair<void*, msgIdx> msg(static_cast<void*>(malloc(buffer_size_)), msgIdx(new_broker.first));
-					std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(new_broker.first));
-					int idx = messages_[0].size();
-					messages_[0].push_back(msg);
-					messages_[1].push_back(msg1);
-					fd_to_msg_idx_[sock] = idx;
-					//Send Sub request
-					Embarcadero::EmbarcaderoReq shake;
-					shake.client_order = 0;
-					shake.last_addr = 0;
-					shake.client_req = Embarcadero::Subscribe;
-					memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
-					int ret = send(sock, &shake, sizeof(shake), 0);
-					if(ret < 0){
-						LOG(ERROR) << "fd:" << sock << " addr:" << new_broker.second << " id:" << new_broker.first 
-							<< " failed:" << strerror(errno);
-					}
 				}
 			}
 			new_brokers_.clear();
@@ -1244,9 +1250,9 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
-	//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-	//SubscribeThroughputTest(total_message_size, message_size);
-	E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	SubscribeThroughputTest(total_message_size, message_size);
+	//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 	//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
 	return 0;
