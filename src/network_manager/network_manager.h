@@ -34,6 +34,18 @@ struct alignas(64) EmbarcaderoReq{
 	char topic[32]; //This is to align thie struct as 64B
 };
 
+struct LargeMsgRequest{
+	void* msg;
+	size_t len;
+};
+
+struct SubscriberState{
+	absl::Mutex mu;
+	size_t last_offset;
+	void* last_addr;
+	bool initialized = false;
+};
+
 class NetworkManager{
 	public:
 		NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads=NUM_NETWORK_IO_THREADS);
@@ -47,9 +59,11 @@ class NetworkManager{
 		void ReqReceiveThread();
 		void MainThread();
 		void AckThread();
+		void SubscribeNetworkThread(int , int, char*, int);
 
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
+		folly::MPMCQueue<struct LargeMsgRequest> largeMsgQueue_;
 		int broker_id_;
 		std::vector<std::thread> threads_;
 		int num_reqReceive_threads_;
@@ -59,6 +73,8 @@ class NetworkManager{
 
 		absl::flat_hash_map<size_t, int> ack_connections_; // <client_id, ack_sock>
 		absl::Mutex ack_mu_;
+		absl::Mutex sub_mu_;
+		absl::flat_hash_map<int /* client_id */, std::unique_ptr<SubscriberState>> sub_state_;
 		int ack_efd_;
 		int ack_fd_ = -1;
 
