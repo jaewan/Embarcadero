@@ -770,7 +770,7 @@ class Client{
 class Subscriber{
 	public:
 		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency=false):
-			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), measure_latency_(measure_latency), buffer_size_((1UL<<34)), messages_idx_(0){
+			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), measure_latency_(measure_latency), buffer_size_((1UL<<34)), messages_idx_(0), client_id_(GenerateRandomNum()){
 				memcpy(topic_, topic, TOPIC_NAME_SIZE);
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
@@ -918,6 +918,7 @@ class Subscriber{
 		std::vector<std::vector<std::pair<void*, msgIdx>>> messages_;
 		absl::flat_hash_map<int, int> fd_to_msg_idx_;
 		std::atomic<int> messages_idx_;
+		int client_id_;
 
 		void SubscribeThread(){
 			int num_brokers = nodes_.size();
@@ -974,35 +975,38 @@ class Subscriber{
 			absl::MutexLock lock(&mutex_);
 			for(auto &new_broker: new_brokers_){
 				auto [addr, addressPort] = ParseAddressPort(new_broker.second);
-				int sock = GetNonblockingSock(addr.data(), PORT + new_broker.first, false);
+				for (int i=0; i < NUM_SUB_CONNECTIONS; i++){
+					int sock = GetNonblockingSock(addr.data(), PORT + new_broker.first, false);
 
-				std::pair<void*, msgIdx> msg(static_cast<void*>(malloc(buffer_size_)), msgIdx(new_broker.first));
-				std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(new_broker.first));
-				int idx = messages_[0].size();
-				messages_[0].push_back(msg);
-				messages_[1].push_back(msg1);
-				fd_to_msg_idx_[sock] = idx;
-				//Send Sub request
-				Embarcadero::EmbarcaderoReq shake;
-				shake.client_order = 0;
-				shake.last_addr = 0;
-				shake.client_req = Embarcadero::Subscribe;
-				memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
+					std::pair<void*, msgIdx> msg(static_cast<void*>(malloc(buffer_size_)), msgIdx(new_broker.first));
+					std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(new_broker.first));
+					int idx = messages_[0].size();
+					messages_[0].push_back(msg);
+					messages_[1].push_back(msg1);
+					fd_to_msg_idx_[sock] = idx;
+					//Send Sub request
+					Embarcadero::EmbarcaderoReq shake;
+					shake.client_order = 0;
+					shake.client_id = client_id_;
+					shake.last_addr = 0;
+					shake.client_req = Embarcadero::Subscribe;
+					memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
 
-				int ret = send(sock, &shake, sizeof(shake), 0);
-				if(ret < sizeof(shake)){
-					LOG(ERROR) << "fd:" << sock << " addr:" << new_broker.second << " id:" << new_broker.first  << 
-					"sent:" << ret<< "/" <<sizeof(shake) 	<< " failed:" << strerror(errno);
-					close(sock);
-					continue;
-				}
+					int ret = send(sock, &shake, sizeof(shake), 0);
+					if(ret < sizeof(shake)){
+						LOG(ERROR) << "fd:" << sock << " addr:" << new_broker.second << " id:" << new_broker.first  << 
+						"sent:" << ret<< "/" <<sizeof(shake) 	<< " failed:" << strerror(errno);
+						close(sock);
+						continue;
+					}
 
-				epoll_event ev;
-				ev.events = EPOLLIN;
-				ev.data.fd = sock;
-				if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1) {
-					LOG(ERROR) << "Failed to add new server to epoll";
-					close(sock);
+					epoll_event ev;
+					ev.events = EPOLLIN;
+					ev.data.fd = sock;
+					if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1) {
+						LOG(ERROR) << "Failed to add new server to epoll";
+						close(sock);
+					}
 				}
 			}
 			new_brokers_.clear();

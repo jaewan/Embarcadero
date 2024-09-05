@@ -23,6 +23,7 @@ namespace Embarcadero{
 #define NUM_DISK_IO_THREADS 1 
 #define NUM_NETWORK_IO_THREADS 24 
 #define NUM_ACK_THREADS 1
+#define NUM_SUB_CONNECTIONS 2
 #define ZERO_COPY_SEND_LIMIT 1UL<<23
 #define MAX_MSG_SIZE 1UL << 20
 
