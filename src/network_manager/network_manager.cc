@@ -271,21 +271,17 @@ void NetworkManager::ReqReceiveThread(){
 // To make it support multiple topics, make some variables as a map (topic, var)
 // Iterate over messages to make sure the large message parittion is not cutting the message in the middle
 void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int client_id){
-	VLOG(3) << "SubscribeNetworkThread called";
 	while(!stop_threads_){
 		void* msg;
 		size_t messages_size = 0;
 		struct LargeMsgRequest req;
 		size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
-		VLOG(3) << "Reading largeMsgQueue_";
 		if(largeMsgQueue_.read(req)){
 			msg = req.msg;
 			messages_size = req.len;
 		}else{
-		VLOG(3) << "Calling GetMessageAddr";
 			absl::MutexLock lock(&sub_state_[client_id]->mu);
 			if(cxl_manager_->GetMessageAddr(topic, sub_state_[client_id]->last_offset, sub_state_[client_id]->last_addr, msg, messages_size)){
-		VLOG(3) << "GetMessageAddr returned:" << messages_size;
 				while(messages_size > zero_copy_send_limit){
 					struct LargeMsgRequest r;
 					r.msg = msg;
@@ -296,13 +292,14 @@ void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int 
 					messages_size -= r.len;
 				}
 			}else{
-		VLOG(3) << "GetMessageAddr returned nothing:" << messages_size;
 				continue;;
 			}
 		}
 		size_t sent_bytes = 0;
+		if(messages_size < 64){
+			LOG(ERROR) << "[DEBUG] messages_size is below 64!!!! cannot happen " << messages_size;
+		}
 		while(sent_bytes < messages_size){
-			VLOG(3) << "sent_bytes:" << sent_bytes << " messages_size:" << messages_size;
 			struct epoll_event events[10];
 			int n = epoll_wait(efd, events, 10, -1);
 			if (n == -1) {
@@ -311,19 +308,16 @@ void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int 
 				close(efd);
 				return;
 			}
-
 			for (int i = 0; i < n; ++i) {
 				if (events[i].events & EPOLLOUT) {
 					size_t remaining_bytes = messages_size - sent_bytes;
 					size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
 					int ret;
-					VLOG(3) << "sending:" << to_send;
 					if(to_send < 1UL<<16)
 						ret = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
 					else
 						ret = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
 						//ret = send(sock, (uint8_t*)messages + sent_bytes, to_send, MSG_ZEROCOPY);
-					VLOG(3) << "sent:" << ret;
 					if (ret > 0) {
 							sent_bytes += ret;
 							zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
