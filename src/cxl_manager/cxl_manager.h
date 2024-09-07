@@ -181,14 +181,14 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		/// Used by the head node to keep track of how many local cuts it has received
 		// int local_cuts_count_;
 		// absl::flat_hash_map<int, std::unique_ptr<std::atomic<int>>> local_cuts_count_;
-		absl::flat_hash_map<int, int> local_cuts_count_;
+		// absl::flat_hash_map<int, int> local_cuts_count_;
 
 		/// The key is the broker id and the value is its corresponding local cut
 		//TODO(tony) this is not thread safe. no parallel threads should be updating at the same time
 		// <epoch, <broker_id, local_cut>>
-		absl::flat_hash_map<int, std::pair<int, int>> global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
 		absl::Mutex global_cut_mu_;
-
+		absl::flat_hash_map<int, absl::flat_hash_map<int, int>> global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
+	
 		bool has_global_sequencer_;
 };
 

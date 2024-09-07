@@ -415,6 +415,11 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 		unclock();
 		*/
 
+		{
+			absl::WriterMutexLock lock(&global_cut_mu_);
+			global_cut_[epoch][broker_id_] = local_cut;
+		}
+
 		VLOG(3) << "Received local cut from broker " << broker_id_ << " with value " << local_cut;
 
 		/// Call local function to receive local cut instead of grpc
@@ -436,19 +441,21 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 		bool done = false;
 
 		/// Callback is called when all followers are ready to receive the global cut
-		auto callback = [this, topic, &response, &mu, &cv, &done](grpc::Status status) {
+		auto callback = [this, topic, &response, &mu, &cv, &done, epoch](grpc::Status status) {
 			if (!status.ok()) {
 				LOG(ERROR) << "Error sending local cut: " << status.error_message();
 			} else {
 				VLOG(3) << "Successfully sent local cut for topic: " << topic;
 
 				// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
-				absl::flat_hash_map<int, int> global_cut_map;
-				for (const auto& entry : response.global_cut()) {
-					global_cut_map[static_cast<int>(entry.first)] = static_cast<int>(entry.second);
+				{
+					absl::WriterMutexLock lock(&global_cut_mu_);
+					for (const auto& entry : response.global_cut()) {
+						global_cut_[epoch][static_cast<int>(entry.first)] = static_cast<int>(entry.second);
+					}
 				}
 
-				this->ReceiveGlobalCut(global_cut_map, topic);
+				this->ReceiveGlobalCut(epoch, topic);
 			}
 
 			std::lock_guard<std::mutex> lock(mu);
@@ -459,9 +466,9 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 		};
 
 		// Async call to HandleStartLocalSequencer
-		//stub_->async()->HandleSendLocalCut(&context, &request, &response, callback);
+		stub_->async()->HandleSendLocalCut(&context, &request, &response, callback);
 		//TODO (tony) priority 1 (latency improvement) potential change
-		stub_->HandleSendLocalCut(&context, &request, &response, callback);
+		// stub_->HandleSendLocalCut(&context, &request, &response, callback);
 		//(tony) check response
 
 		/// Wait until the callback has been called so it doesn't go out of scope
@@ -471,7 +478,7 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 	epoch++;
 }
 
-void ScalogSequencerService::ReceiveGlobalCut(int  epoch, const char* topic) {
+void ScalogSequencerService::ReceiveGlobalCut(int epoch, const char* topic) {
 	// Maybe request can hold topic string
 	struct TInode *tinode = (struct TInode *) cxl_manager_->GetTInode(topic);
 
@@ -491,8 +498,8 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 
 	//TODO(tony) this should be parallel safe. This function can be interrupted while it is updating the glocal_cut_
 	{
-		absl::WriterMutexLock lock(&glocal_cut_mu_);
-		global_cut_[epoch].emplace({broker_id, local_cut})'
+		absl::WriterMutexLock lock(&global_cut_mu_);
+		global_cut_[epoch][broker_id] = local_cut;
 	}
 
 	VLOG(3) << "Received local cut from broker " << broker_id << " with value " << local_cut;
@@ -502,7 +509,7 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 	/// Convert global_cut_ to google::protobuf::Map<int64_t, int64_t>
 	auto* mutable_global_cut = response->mutable_global_cut();
 	{
-		absl::ReaderMutexLock lock(&global_cut_);
+		absl::ReaderMutexLock lock(&global_cut_mu_);
 		for (const auto& entry : global_cut_[epoch]) {
 			(*mutable_global_cut)[static_cast<int64_t>(entry.first)] = static_cast<int64_t>(entry.second);
 		}
@@ -514,13 +521,11 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 }
 
 void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int broker_id) {
-	/*
 	if (epoch - 1 > global_epoch_) {
 		// If the epoch is not the same as the current global epoch, there is an error
 		LOG(ERROR) << "Local epoch: " << epoch << " while global epoch: " << global_epoch_;
 		exit(1);
 	}
-	*/
 
 	std::unique_lock<std::mutex> lock(mutex_);
 
@@ -530,19 +535,20 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 
 	cxl_manager_->GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 
-	local_cuts_count_[epoch]++;
+	// local_cuts_count_[epoch]++;
 	//TODO(tony)
 	// Add checking epoch of each local cut logic here
 	//(tony)
+	int local_cut_num = 0;
 	{
-	absl::ReaderMutexLock lock(&mutex_);
-	global_cut_[epoch].size();
+		absl::ReaderMutexLock lock(&global_cut_mu_);
+		local_cut_num = global_cut_[epoch].size();
 	}
 
 	// auto result = local_cuts_count_.emplace(epoch, std::make_unique<std::atomic<int>>(0));
 	// result.first->second->fetch_add(1);
 
-	if (local_cuts_count_[epoch] == registered_brokers.size()) {
+	if (local_cut_num == registered_brokers.size()) {
 
 		std::cout << "We have received all local cuts, calling receive local cut from broker: " << broker_id << std::endl;
 
@@ -550,7 +556,7 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 
 		// Send global cut to own node's local sequencer
 		global_epoch_++;
-		ReceiveGlobalCut(global_cut_, topic);
+		ReceiveGlobalCut(epoch, topic);
 
 		// waiting_threads_count_ = broker_->GetNumBrokers() - 1;
 
@@ -561,11 +567,14 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 		// reset_cv_.wait(lock, [this]() { return waiting_threads_count_ == 0; });
 
 		/// Safely reset local_cuts_count_ after all threads have been notified and processed
-		auto it = local_cuts_count_.find(epoch - 2);
-		if (it != local_cuts_count_.end()) {
+		auto it = global_cut_.find(epoch - 2);
+		if (it != global_cut_.end()) {
 			// The element exists, so delete it
-			std::cout << "Erasing local cuts count for epoch: " << epoch - 2 << std::endl;
-			local_cuts_count_.erase(it);
+			std::cout << "Erasing global cut for epoch: " << epoch - 2 << std::endl;
+			{
+				absl::WriterMutexLock lock(&global_cut_mu_);
+				global_cut_.erase(epoch - 2);
+			}
 		}
 		std::cout << "Reset local_cuts_count_ to 0 after notifying all threads" << std::endl;
 	} else {
@@ -573,10 +582,15 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 
 		/// If we haven't received all local cuts, the grpc thread must wait until we do to send the correct global cut back to the caller
         cv_.wait(lock, [this, broker_id, epoch, registered_brokers]() {
+			int local_cut_num = 0;
+			{
+				absl::ReaderMutexLock lock(&global_cut_mu_);
+				local_cut_num = global_cut_[epoch].size();
+			}
 			std::cout << "I've been notified that all local cuts have been received from broker: " << broker_id << std::endl;
 			std::cout << "Num brokers: " << registered_brokers.size() << std::endl;
-			std::cout << "Local cuts count: " << local_cuts_count_[epoch] << std::endl;
-			if (local_cuts_count_[epoch] == registered_brokers.size()){
+			std::cout << "Local cuts count: " << local_cut_num << std::endl;
+			if (local_cut_num == registered_brokers.size()){
 				return true;
 			} else {
 				return false;
