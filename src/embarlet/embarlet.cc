@@ -107,6 +107,7 @@ int main(int argc, char* argv[]){
 	}
 	HeartBeatManager heartbeat_manager(is_head_node, head_addr);
 	int broker_id = heartbeat_manager.GetBrokerId();
+	size_t colonPos = head_addr.find(':');
 
 	LOG(INFO) << "Starting Embarlet broker_id:" << broker_id;
 	// Check Cgroup setting
@@ -126,7 +127,7 @@ int main(int argc, char* argv[]){
 
 
 	// *************** Initializing Managers ********************** 
-	Embarcadero::CXLManager cxl_manager(broker_id, cxl_type);
+	Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_addr.substr(0, colonPos));
 	Embarcadero::DiskManager disk_manager((1UL<<25));
 	Embarcadero::NetworkManager network_manager(128, broker_id, num_network_io_threads);
 	Embarcadero::TopicManager topic_manager(cxl_manager, broker_id);
