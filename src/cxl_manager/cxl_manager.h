@@ -105,6 +105,10 @@ class CXLManager{
 		/// Initializes the scalog sequencer service and starts the grpc server
 		void StartScalogLocalSequencer(std::string topic_str);
 
+		/// Receives the global cut from the head node
+		/// This function is called in the callback of the send local cut grpc call
+		void ScalogSequencer(int epoch, const char* topic, absl::Mutex &global_cut_mu, 
+		absl::flat_hash_map<int, absl::btree_map<int, int>> &global_cut);
 	private:
 		int broker_id_;
 		std::vector<std::thread> sequencerThreads_;
@@ -148,10 +152,6 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		/// Sends a local cut to the head node	
 		virtual void SendLocalCut(int local_cut, const char* topic);
 
-		/// Receives the global cut from the head node
-		/// This function is called in the callback of the send local cut grpc call
-		void ReceiveGlobalCut(int epoch, const char* topic);
-
 		/// Keep track of the global cut and if all the local cuts have been received
 		virtual void ReceiveLocalCut(int epoch, const char* topic, int broker_id);
 
@@ -181,7 +181,8 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		/// The key is the current epoch and it contains another map of broker_id to local cut
 		//TODO(tony) this is not thread safe. no parallel threads should be updating at the same time
 		absl::Mutex global_cut_mu_;
-		absl::flat_hash_map<int, absl::flat_hash_map<int, int>> global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
+		// <epoch, <broker_id, local_cut>>
+		absl::flat_hash_map<int, absl::btree_map<int, int>> global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
 	
 		bool has_global_sequencer_;
 };
