@@ -1,22 +1,36 @@
 #include "disk_manager.h"
 
+#include <unistd.h>
+#include <pwd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
 #include "mimalloc.h"
+#include <iostream>
 
 namespace Embarcadero{
 
-#define DISK_LOG_PATH "embarc.disklog"
+#define DISK_LOG_PATH_SUFFIX "embarc.disklog"
 
 DiskManager::DiskManager(size_t queueCapacity, 
 						 int num_io_threads):
 						 requestQueue_(queueCapacity),
 						 num_io_threads_(num_io_threads){
+
+	const char *homedir;
+	if ((homedir = getenv("HOME")) == NULL) {
+		homedir = getpwuid(getuid())->pw_dir;
+	}
+	size_t len = strlen(homedir) + strlen(DISK_LOG_PATH_SUFFIX) + 1;
+	char *disk_log_path = (char *)malloc(len);
+	assert((long)disk_log_path > 0);
+	sprintf(disk_log_path, "%s/%s", homedir, DISK_LOG_PATH_SUFFIX);
+	LOG(INFO) << "[DiskManager]: Using disk log at: " << disk_log_path;
+
 	//Initialize log file
-	log_fd_ = open(DISK_LOG_PATH, O_RDWR|O_CREAT, 0777);
+	log_fd_ = open(disk_log_path, O_RDWR|O_CREAT, 0777);
 	if (log_fd_ < 0){
 		LOG(ERROR) << "Error in opening a file for disk log:" <<strerror(errno);
 	}
