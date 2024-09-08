@@ -105,8 +105,6 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 		topics_[topic]->Combiner();
 
 		if (broker_id_ != 0 && tinode->seq_type == SCALOG){
-			std::cout << "Starting Scalog Local Sequencer in CreateNewTopicInternal" << std::endl;
-
 			cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
 		}
 
