@@ -404,10 +404,6 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 		} else {
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
-				std::cout << "Sanity check epoch: " << epoch << std::endl;
-				std::cout << "Previous local cut: " << global_cut_[epoch - 1][broker_id_] << std::endl;
-				std::cout << "Local cut: " << local_cut << std::endl;
-				std::cout << "Difference: " << local_cut - global_cut_[epoch - 1][broker_id_] << std::endl;
 				global_cut_[epoch][broker_id_] = local_cut - logical_offsets_[epoch - 1][broker_id_];
 				logical_offsets_[epoch][broker_id_] = local_cut;
 			}
@@ -581,6 +577,7 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
 				global_cut_.erase(epoch - 2);
+				logical_offsets_.erase(epoch - 2);
 			}
 		}
 	} else {
