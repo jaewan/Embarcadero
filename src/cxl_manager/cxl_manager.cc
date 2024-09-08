@@ -376,7 +376,7 @@ void ScalogSequencerService::LocalSequencer(std::string topic_str){
 
 	auto start_time = std::chrono::high_resolution_clock::now();
 	/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
-	SendLocalCut(tinode->offsets[broker_id_].written, topic_str.c_str());
+	SendLocalCut(local_cut, topic_str.c_str());
 	auto end_time = std::chrono::high_resolution_clock::now();
 
 	/// We measure the time it takes to send the local cut
@@ -398,7 +398,7 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 		if (epoch == 0) {
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
-				global_cut_[epoch][broker_id_] = local_cut;
+				global_cut_[epoch][broker_id_] = local_cut + 1;
 				logical_offsets_[epoch][broker_id_] = local_cut;
 			}
 		} else {
@@ -480,8 +480,6 @@ void CXLManager::ScalogSequencer(int epoch, const char* topic, absl::Mutex &glob
 		for(auto &cut : global_cut[epoch_to_order]){
 			if(cut.first == broker_id_){
 				DEBUG_count += cut.second;
-	VLOG(3) << "Epoch:" << epoch_to_order << " cut:" << DEBUG_count;
-				std::cout << "Epoch: " << epoch_to_order << " cut: " << DEBUG_count << std::endl; 
 				for(int i = 0; i<cut.second; i++){
 					/*
 					if(msg_to_order->logical_offset == 0){
@@ -517,7 +515,7 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 	if (epoch == 0) {
 		{
 			absl::WriterMutexLock lock(&global_cut_mu_);
-			global_cut_[epoch][broker_id] = local_cut;
+			global_cut_[epoch][broker_id] = local_cut + 1;
 			logical_offsets_[epoch][broker_id] = local_cut;
 		}
 	} else {
