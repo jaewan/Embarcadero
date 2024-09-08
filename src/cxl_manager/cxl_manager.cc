@@ -398,7 +398,7 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 		if (epoch == 0) {
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
-				global_cut_[epoch][broker_id_] = local_cut;
+				global_cut_[epoch][broker_id_] = local_cut + 1;
 				logical_offsets_[epoch][broker_id_] = local_cut;
 			}
 		} else {
@@ -517,7 +517,7 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 	if (epoch == 0) {
 		{
 			absl::WriterMutexLock lock(&global_cut_mu_);
-			global_cut_[epoch][broker_id] = local_cut;
+			global_cut_[epoch][broker_id] = local_cut + 1;
 			logical_offsets_[epoch][broker_id] = local_cut;
 		}
 	} else {
