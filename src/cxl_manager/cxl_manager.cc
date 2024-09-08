@@ -404,9 +404,16 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 	if (has_global_sequencer_ == true) {
 		// Insert local cut into global cut
 		// TODO(tony) manage local cuts per epoch
-		{
-			absl::WriterMutexLock lock(&global_cut_mu_);
-			global_cut_[epoch][broker_id_] = local_cut;
+		if (epoch == 0) {
+			{
+				absl::WriterMutexLock lock(&global_cut_mu_);
+				global_cut_[epoch][broker_id_] = local_cut;
+			}
+		} else {
+			{
+				absl::WriterMutexLock lock(&global_cut_mu_);
+				global_cut_[epoch][broker_id_] = local_cut - global_cut_[epoch - 1][broker_id_];
+			}
 		}
 
 		VLOG(3) << "Received local cut from broker " << broker_id_ << " with value " << local_cut;
@@ -486,9 +493,16 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 	int broker_id = request->broker_id();
 
 	//TODO(tony) this should be parallel safe. This function can be interrupted while it is updating the glocal_cut_
-	{
-		absl::WriterMutexLock lock(&global_cut_mu_);
-		global_cut_[epoch][broker_id] = local_cut;
+	if (epoch == 0) {
+		{
+			absl::WriterMutexLock lock(&global_cut_mu_);
+			global_cut_[epoch][broker_id] = local_cut;
+		}
+	} else {
+		{
+			absl::WriterMutexLock lock(&global_cut_mu_);
+			global_cut_[epoch][broker_id] = local_cut - global_cut_[epoch - 1][broker_id];
+		}
 	}
 
 	VLOG(3) << "Received local cut from broker " << broker_id << " with value " << local_cut;
