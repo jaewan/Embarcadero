@@ -376,6 +376,7 @@ void ScalogSequencerService::LocalSequencer(std::string topic_str){
 
 	auto start_time = std::chrono::high_resolution_clock::now();
 	/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
+	int local_cut = tinode->offsets[broker_id_].written;
 	SendLocalCut(local_cut, topic_str.c_str());
 	auto end_time = std::chrono::high_resolution_clock::now();
 
@@ -394,7 +395,6 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 	// Bypass grpc call
 	if (has_global_sequencer_ == true) {
 		// Insert local cut into global cut
-		// TODO(tony) manage local cuts per epoch
 		if (epoch == 0) {
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
@@ -468,7 +468,6 @@ void CXLManager::ScalogSequencer(int epoch, const char* topic, absl::Mutex &glob
 	static size_t seq = 0;
 	static TInode *tinode = nullptr; 
 	static MessageHeader* msg_to_order = nullptr;
-	static size_t DEBUG_count = 0;
 	if(tinode == nullptr){
 		tinode = (struct TInode *) GetTInode(topic);
 		msg_to_order = ((MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id_].log_offset));
@@ -479,13 +478,7 @@ void CXLManager::ScalogSequencer(int epoch, const char* topic, absl::Mutex &glob
 	if(global_cut.contains(epoch_to_order)){
 		for(auto &cut : global_cut[epoch_to_order]){
 			if(cut.first == broker_id_){
-				DEBUG_count += cut.second;
 				for(int i = 0; i<cut.second; i++){
-					/*
-					if(msg_to_order->logical_offset == 0){
-						LOG(ERROR) << "MSG:" << msg_to_order->client_order << " is not given logical_off";
-					}
-					*/
 					msg_to_order->total_order = seq;
 					std::atomic_thread_fence(std::memory_order_release);
 					tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset;
@@ -511,7 +504,6 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 	int local_cut = request->local_cut();
 	int broker_id = request->broker_id();
 
-	//TODO(tony) this should be parallel safe. This function can be interrupted while it is updating the glocal_cut_
 	if (epoch == 0) {
 		{
 			absl::WriterMutexLock lock(&global_cut_mu_);
@@ -540,11 +532,9 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 }
 
 void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int broker_id) {
-	//TODO(tony) Add checking epoch of each local cut logic here
 	if (epoch - 1 > global_epoch_) {
 		// If the epoch is not the same as the current global epoch, there is an error
 		LOG(ERROR) << "Local epoch: " << epoch << " while global epoch: " << global_epoch_;
-		exit(1);
 	}
 
 	std::unique_lock<std::mutex> lock(mutex_);
@@ -554,7 +544,6 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 	absl::btree_set<int> registered_brokers;
 	cxl_manager_->GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 
-	//TODO(tony)
 	int local_cut_num = 0;
 	{
 		absl::ReaderMutexLock lock(&global_cut_mu_);

@@ -179,12 +179,11 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 		int global_epoch_;
 
 		/// The key is the current epoch and it contains another map of broker_id to local cut
-		//TODO(tony) this is not thread safe. no parallel threads should be updating at the same time
 		absl::Mutex global_cut_mu_;
-		// <epoch, <broker_id, local_cut>>
 		absl::flat_hash_map<int, absl::btree_map<int, int>> global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
 
 		/// Used to keep track of # messages of each epoch so we can calculate the global cut
+		/// Key is the current epoch and it contains another map of broker_id to logical offset
 		absl::flat_hash_map<int, absl::btree_map<int, int>> logical_offsets_ ABSL_GUARDED_BY(global_cut_mu_);
 	
 		bool has_global_sequencer_;
