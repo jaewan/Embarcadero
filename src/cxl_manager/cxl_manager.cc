@@ -399,6 +399,7 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
 				global_cut_[epoch][broker_id_] = local_cut;
+				logical_offsets_[epoch][broker_id_] = local_cut;
 			}
 		} else {
 			{
@@ -407,7 +408,8 @@ void ScalogSequencerService::SendLocalCut(int local_cut, const char* topic) {
 				std::cout << "Previous local cut: " << global_cut_[epoch - 1][broker_id_] << std::endl;
 				std::cout << "Local cut: " << local_cut << std::endl;
 				std::cout << "Difference: " << local_cut - global_cut_[epoch - 1][broker_id_] << std::endl;
-				global_cut_[epoch][broker_id_] = local_cut - global_cut_[epoch - 1][broker_id_];
+				global_cut_[epoch][broker_id_] = local_cut - logical_offsets_[epoch - 1][broker_id_];
+				logical_offsets_[epoch][broker_id_] = local_cut;
 			}
 		}
 
@@ -520,11 +522,13 @@ grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* con
 		{
 			absl::WriterMutexLock lock(&global_cut_mu_);
 			global_cut_[epoch][broker_id] = local_cut;
+			logical_offsets_[epoch][broker_id] = local_cut;
 		}
 	} else {
 		{
 			absl::WriterMutexLock lock(&global_cut_mu_);
-			global_cut_[epoch][broker_id] = local_cut - global_cut_[epoch - 1][broker_id];
+			global_cut_[epoch][broker_id] = local_cut - logical_offsets_[epoch - 1][broker_id];
+			logical_offsets_[epoch][broker_id] = local_cut;
 		}
 	}
 	ReceiveLocalCut(epoch, topic, broker_id);
