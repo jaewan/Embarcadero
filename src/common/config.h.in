@@ -17,6 +17,7 @@ namespace Embarcadero{
 #define BROKER_PORT 12140
 #define NUM_MAX_BROKERS 4
 #define CXL_SIZE (1UL<<35)
+#define CXL_EMUL_SIZE (1UL<<34)
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
 #define SEGMENT_SIZE (1UL << 34)
@@ -40,6 +41,7 @@ namespace Embarcadero{
 
 //********* Health check configs *********
 #define CGROUP_CORE 85
+	
 struct alignas(64) PublishRequest{
 	char topic[TOPIC_NAME_SIZE];
 	bool acknowledge;

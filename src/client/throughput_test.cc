@@ -221,7 +221,7 @@ class Buffer{
 				size_t allocated;
 				// 4K is a buffer space as message can go over
 				size_t buf_size = (total_buf_size / num_buf) + 4096; 
-				for(int i=0; i < num_buf; i++){
+				for(size_t i=0; i < num_buf; i++){
 					bufs[i].buffer = mmap_large_buffer(buf_size, allocated);
 					bufs[i].tail = 0;
 					bufs[i].head = 0;
@@ -242,7 +242,7 @@ class Buffer{
 			}
 
 		~Buffer(){
-			for(int i=0; i < num_buf_; i++){
+			for(size_t i=0; i < num_buf_; i++){
 				munmap(bufs[i].buffer, bufs[i].len);
 			}
 			free(bufs);
@@ -361,13 +361,9 @@ class Client{
 				j = 0;
 			}
 			client_order_++;
-			/*
-				 pubQue_.Write(client_order_%num_threads_, client_order_, message, len);
-				 client_order_++;
-				 */
 		}
 
-		void Poll(int n){
+		void Poll(size_t n){
 			pubQue_.ReturnReads();
 			while(client_order_ < n){
 				std::this_thread::yield();
@@ -517,7 +513,7 @@ class Client{
 					} else {
 						// Data from existing client
 						int client_sock = events[i].data.fd;
-						ssize_t bytes_received;
+						ssize_t bytes_received = 0;
 
 						while (total_received < client_order_ && (bytes_received = recv(client_sock, buffer, 1024*1024, 0)) > 0) {
 							total_received += bytes_received;
@@ -642,6 +638,7 @@ class Client{
 					if (events[i].events & EPOLLOUT) {
 						ssize_t bytesSent = send(sock, (int8_t*)(&shake) + sent_bytes, sizeof(shake) - sent_bytes, 0);
 						if (bytesSent <= 0) {
+							bytesSent = 0;
 							if (errno != EAGAIN && errno != EWOULDBLOCK) {
 								LOG(ERROR) << "send failed:" << strerror(errno);
 								running = false;
@@ -672,7 +669,7 @@ class Client{
 				batch_header.total_size = len;
 
 				ssize_t bytesSent = send(sock, (uint8_t*)(&batch_header), sizeof(Embarcadero::BatchHeader), 0);
-				if(bytesSent < sizeof(Embarcadero::BatchHeader)){
+				if(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
 					LOG(ERROR) << "Jae compelte this too when batch header is partitioned.";
 					return;
 				}
@@ -1080,7 +1077,7 @@ bool CheckAvailableCores(){
 }
 
 void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
-	int n = total_message_size/message_size;
+	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 	char topic[TOPIC_NAME_SIZE];
@@ -1096,9 +1093,11 @@ void PublishThroughputTest(size_t total_message_size, size_t message_size, int n
 	c.CreateNewTopic(topic, order, seq_type);
 	c.Init(topic, ack_level, order);
 	auto start = std::chrono::high_resolution_clock::now();
-	for(int i=0; i<n; i++){
+
+	for(size_t i=0; i<n; i++){
 		c.Publish(message, message_size);
 	}
+
 	auto produce_end = std::chrono::high_resolution_clock::now();
 	c.DEBUG_check_send_finish();
 	auto send_end = std::chrono::high_resolution_clock::now();
@@ -1131,7 +1130,7 @@ void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size, int order){
 }
 
 void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
-	int n = total_message_size/message_size;
+	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	std::string message(message_size, 0);
 	char topic[TOPIC_NAME_SIZE];
@@ -1148,23 +1147,23 @@ void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_t
 	c.Init(topic, ack_level, order);
 
 	auto start = std::chrono::high_resolution_clock::now();
-	for(int i=0; i<n; i++){
+	for(size_t i=0; i<n; i++){
 		c.Publish(message.data(), message_size);
 	}
+
 	c.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
-
 	auto pub_duration = std::chrono::duration_cast<std::chrono::seconds>(pub_end - start);
-	auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
 	LOG(INFO) << "Pub Bandwidth: " << (total_message_size/(1024*1024))/pub_duration.count() << " MB/s";
+	auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
 	LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
 	s.DEBUG_check_order(order);
 }
 
 void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
-	int n = total_message_size/message_size;
+	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	char message[message_size];
 	char topic[TOPIC_NAME_SIZE];
@@ -1181,12 +1180,14 @@ void LatencyTest(size_t total_message_size, size_t message_size, int num_threads
 	c.Init(topic, ack_level, order);
 
 	auto start = std::chrono::high_resolution_clock::now();
-	for(int i=0; i<n; i++){
+	for(size_t i=0; i<n; i++){
 		auto timestamp = std::chrono::steady_clock::now();
 		long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
 				timestamp.time_since_epoch()).count();
 		memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
-		c.Publish(message, message_size);
+		for(size_t i=0; i<n; i++){
+			c.Publish(message, message_size);
+		}
 	}
 	c.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
