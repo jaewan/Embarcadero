@@ -235,10 +235,11 @@ void CXLManager::Sequencer2(char* topic){
 	absl::flat_hash_map<int/*client_id*/, size_t/*client_req_id*/> last_ordered; 
 	// Store skipped messages to respect the client order.
 	// Use absolute adrress b/c it is only used in this thread later
-	absl::flat_hash_map<int, absl::btree_map<size_t/*client_order*/, std::pair<int /*broker_id*/, struct MessageHeader*>>> skipped_msg;
+	absl::flat_hash_map<int/*client_id*/, absl::btree_map<size_t/*client_order*/, std::pair<int /*broker_id*/, struct MessageHeader*>>> skipped_msg;
 	static size_t seq = 0;
 	// Tracks the messages of written order to later report the sequentially written messages
 	std::array<std::queue<MessageHeader* /*physical addr*/>, NUM_MAX_BROKERS> queues;
+
 
 	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 	auto last_updated = std::chrono::steady_clock::now();
@@ -248,6 +249,7 @@ void CXLManager::Sequencer2(char* topic){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
 			//This ensures the message is Combined (complete ensures it is fully received)
 			if(msg_to_order[broker]->complete == 1 && msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written){
+				int client_id;
 				yield = false;
 				queues[broker].push(msg_to_order[broker]);
 				int client = msg_to_order[broker]->client_id;
@@ -277,24 +279,24 @@ void CXLManager::Sequencer2(char* topic){
 							it->second.erase(id);
 						}
 					}
-					if(queues[broker].empty()){
-						tinode->offsets[broker].ordered = msg_logical_off;
-						tinode->offsets[broker].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
-					}else{
-						queues[broker].push(msg_to_order[broker]);
-						MessageHeader  *header = queues[broker].front();
-						MessageHeader* exportable_msg = nullptr;
-						while(header->client_order <= last_ordered[header->client_id]){
-							queues[broker].pop();
-							exportable_msg = header;
-							if(queues[broker].empty()){
-								break;
+					for(auto b: registered_brokers){
+						if(queues[b].empty()){
+							continue;
+						}else{
+							MessageHeader  *header = queues[b].front();
+							MessageHeader* exportable_msg = nullptr;
+							while(header->client_order <= last_ordered[header->client_id]){
+								queues[b].pop();
+								exportable_msg = header;
+								if(queues[b].empty()){
+									break;
+								}
+								header = queues[b].front();
 							}
-							header = queues[broker].front();
-						}
-						if(exportable_msg){
-							tinode->offsets[broker].ordered = exportable_msg->logical_offset;
-							tinode->offsets[broker].ordered_offset = (uint8_t*)exportable_msg - (uint8_t*)cxl_addr_;
+							if(exportable_msg){
+								tinode->offsets[b].ordered = exportable_msg->logical_offset;
+								tinode->offsets[b].ordered_offset = (uint8_t*)exportable_msg - (uint8_t*)cxl_addr_;
+							}
 						}
 					}
 				}else{

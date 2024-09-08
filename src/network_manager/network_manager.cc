@@ -49,6 +49,7 @@ inline void make_socket_non_blocking(int fd) {
 NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads):
 	requestQueue_(queueCapacity),
 	ackQueue_(10000),
+	largeMsgQueue_(10000),
 	broker_id_(broker_id),
 	num_reqReceive_threads_(num_reqReceive_threads){
 		// Create Network I/O threads
@@ -188,6 +189,7 @@ void NetworkManager::ReqReceiveThread(){
 						}
 						to_read = batch_header.total_size;
 						pub_req.total_size = batch_header.total_size;
+						// TODO(Jae) Send -1 to ack if this returns nullptr
 						void* buf = cxl_manager_->GetCXLBuffer(pub_req);
 						size_t read = 0;
 						MessageHeader* header;
@@ -200,6 +202,8 @@ void NetworkManager::ReqReceiveThread(){
 								running = false;
 								return;
 							}
+              // TODO(Jae) Add validation logic here to check if the message headers are valid and send acknowledgement
+							// We need this for ack=1 as well to confirm that the messages are valid
 							while(bytes_to_next_header + header_size <= (size_t) bytes_read){
 								header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
 								header->complete = 1;
@@ -222,10 +226,6 @@ void NetworkManager::ReqReceiveThread(){
 				break;
 			case Subscribe:
 				{
-					size_t last_offset = shake.client_order;
-					void* last_addr = shake.last_addr;
-					void* messages = nullptr;
-
 					make_socket_non_blocking(req.client_socket);
 					int sendBufferSize = 16 * 1024 * 1024;
 					if (setsockopt(req.client_socket, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize)) == -1) {
@@ -255,63 +255,98 @@ void NetworkManager::ReqReceiveThread(){
 						close(req.client_socket);
 						close(efd);
 					}
-					while(!stop_threads_){
-						size_t messages_size = 0;
-						size_t first_off = last_offset;
-						if(cxl_manager_->GetMessageAddr(shake.topic, last_offset, last_addr, messages, messages_size)){
-							VLOG(3) << "Sending " << first_off << " ~ " << last_offset << " : " << messages_size;
-							ssize_t sent_bytes = 0;
-							size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
-							while((size_t)sent_bytes < messages_size){
-								size_t remaining_bytes = messages_size - sent_bytes;
-								size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
-								int ret;
-								if(to_send < 1UL<<16)
-									ret = send(req.client_socket, (uint8_t*)messages + sent_bytes, to_send, 0);
-								else
-									ret = send(req.client_socket, (uint8_t*)messages + sent_bytes, to_send, MSG_ZEROCOPY);
-								if(ret > 0){
-									sent_bytes += ret;
-									zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
-								}else if(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS){
-									struct epoll_event events[10];
-									int n = epoll_wait(efd, events, 10, -1);
-									if (n == -1) {
-										LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
-										close(req.client_socket);
-										close(efd);
-										return;
-									}
-									for (int i = 0; i < n; i++) {
-										if (events[i].events & EPOLLOUT) {
-											break;
-										}
-									}
-									zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL<<16); // Cap sendlimit at 64K
-								}else{
-									LOG(ERROR) << "Error in sending messages:" << strerror(errno);
-									close(req.client_socket);
-									close(efd);
-									break;
-								}
-							}
-						}else{
-							char c;
-							if(recv(req.client_socket, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0){
-								LOG(INFO) << "Subscribe Connection is closed :" << req.client_socket ;
-								close(req.client_socket);
-								close(efd);
-								return ;
-							}
-							std::this_thread::yield();
-						}
+
+					{
+					absl::MutexLock lock(&sub_mu_);
+					if(!sub_state_.contains(shake.client_id)){
+						auto state = std::make_unique<SubscriberState>();
+						state->last_offset = shake.client_order;
+						state->last_addr = shake.last_addr;
+						state->initialized = true;
+						sub_state_[shake.client_id] = std::move(state);
 					}
+					}
+					SubscribeNetworkThread(req.client_socket, efd, shake.topic, shake.client_id);
 					close(req.client_socket);
 					close(efd);
 				}//end Subscribe
 				break;
 		}
 	}
+}
+
+// This implementation does not support multiple topics and dynamic message size.
+// To make it support multiple topics, make some variables as a map (topic, var)
+// Iterate over messages to make sure the large message parittion is not cutting the message in the middle
+void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int client_id){
+	while(!stop_threads_){
+		void* msg;
+		size_t messages_size = 0;
+		struct LargeMsgRequest req;
+		size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
+		if(largeMsgQueue_.read(req)){
+			msg = req.msg;
+			messages_size = req.len;
+		}else{
+			absl::MutexLock lock(&sub_state_[client_id]->mu);
+			if(cxl_manager_->GetMessageAddr(topic, sub_state_[client_id]->last_offset, sub_state_[client_id]->last_addr, msg, messages_size)){
+				while(messages_size > zero_copy_send_limit){
+					struct LargeMsgRequest r;
+					r.msg = msg;
+					int mod = zero_copy_send_limit % ((MessageHeader*)msg)->paddedSize;
+					r.len = zero_copy_send_limit - mod;
+					largeMsgQueue_.blockingWrite(r);
+					msg = (uint8_t*)msg + r.len;
+					messages_size -= r.len;
+				}
+			}else{
+				continue;;
+			}
+		}
+		size_t sent_bytes = 0;
+		if(messages_size < 64){
+			LOG(ERROR) << "[DEBUG] messages_size is below 64!!!! cannot happen " << messages_size;
+		}
+		while(sent_bytes < messages_size){
+			struct epoll_event events[10];
+			int n = epoll_wait(efd, events, 10, -1);
+			if (n == -1) {
+				LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
+				close(sock);
+				close(efd);
+				return;
+			}
+			for (int i = 0; i < n; ++i) {
+				if (events[i].events & EPOLLOUT) {
+					size_t remaining_bytes = messages_size - sent_bytes;
+					size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
+					int ret;
+					if(to_send < 1UL<<16)
+						ret = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
+					else
+						ret = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
+						//ret = send(sock, (uint8_t*)messages + sent_bytes, to_send, MSG_ZEROCOPY);
+					if (ret > 0) {
+							sent_bytes += ret;
+							zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
+					} else if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+							zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL << 16); // Cap send limit at 64K
+							continue;
+					} else if (ret < 0) {
+							LOG(ERROR) << "Error in sending messages: " << strerror(errno);
+							close(sock);
+							close(efd);
+							return;
+					}
+				} else if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+						LOG(INFO) << "Socket error or hang-up";
+						close(sock);
+						close(efd);
+						return;
+				}
+			}
+		}//end send loop
+	}//end main while
 }
 
 // Current impl opens ack connection at publish and does not close it
