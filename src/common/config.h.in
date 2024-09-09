@@ -15,6 +15,7 @@ namespace Embarcadero{
 #define ORDER_LEVEL 1
 #define PORT 1214
 #define BROKER_PORT 12140
+#define SCALOG_SEQ_PORT 50051
 #define NUM_MAX_BROKERS 4
 #define CXL_SIZE (1UL<<35)
 #define CXL_EMUL_SIZE (1UL<<34)
@@ -27,6 +28,7 @@ namespace Embarcadero{
 #define NUM_SUB_CONNECTIONS 2
 #define ZERO_COPY_SEND_LIMIT 1UL<<23
 #define MAX_MSG_SIZE 1UL << 20
+#define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
 
 //********* Health check configs *********
 #define HEARTBEAT_INTERVAL 3 // in seconds
@@ -39,7 +41,9 @@ namespace Embarcadero{
 /// The threshold for the amount of retries we do before we consider a node dead.
 #define HEALTH_CHECK_FAILURE_THRESHOLD 5
 
-//********* Health check configs *********
+//********* Scalog configs *********
+#define SCALOG_SEQ_PORT 50051
+
 #define CGROUP_CORE 85
 	
 struct alignas(64) PublishRequest{
