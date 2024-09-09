@@ -951,7 +951,6 @@ class Subscriber{
 							//TODO(Jae) remove from other data structures
 							break;
 						} else {
-							//VLOG(3) << "Recv failed for server " << fd << " " << strerror(errno);
 							if (errno != EWOULDBLOCK && errno != EAGAIN) {
 								LOG(ERROR) << "Recv failed EWOULDBLOCK or EAGAIN for server " << fd << " " << strerror(errno);
 							}
@@ -1224,12 +1223,12 @@ int main(int argc, char* argv[]) {
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10737418240"))
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
+		("t,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
 	size_t total_message_size = result["total_message_size"].as<size_t>();
-	size_t num_threads = result["num_thread"].as<size_t>();
+	size_t num_threads = result["num_threads"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
