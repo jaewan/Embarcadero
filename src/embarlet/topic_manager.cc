@@ -103,6 +103,11 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 
 	if(tinode->seq_type != KAFKA)
 		topics_[topic]->Combiner();
+
+		if (broker_id_ != 0 && tinode->seq_type == SCALOG){
+			cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
+		}
+
 	return tinode;
 }
 

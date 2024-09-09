@@ -1,4 +1,5 @@
 include(cmake/heartbeat_grpc.cmake)
+include(cmake/scalog_sequencer_grpc.cmake)
 
 # These are required for a folly build
 # folly cmake mostly from pehere: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
@@ -32,6 +33,7 @@ target_link_libraries(embarlet
 	gflags
 	mimalloc
     absl::flat_hash_map 
+    scalog_sequencer_grpc_proto
     heartbeat_grpc_proto
     cxxopts::cxxopts
     ${_REFLECTION}
