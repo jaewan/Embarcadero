@@ -224,7 +224,7 @@ int main(int argc, char **argv) {
                 end = report.end;
         }
         auto sec = static_cast<double>(
-            std::chrono::duration_cast<std::chrono::microseconds>(report.end - report.start).count()
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
         ) / 1000 / 1000;
         double throughput = (static_cast<double>(spec.payload_count * spec.payload_msg_size)) / sec;
         std::cout << "End2end: " << (throughput / (1<<20)) << "MiB/s, " << report.latency.count() << "us" << std::endl;

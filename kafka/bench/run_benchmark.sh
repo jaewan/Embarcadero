@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Array of message sizes
-msg_sizes=(512 1024 4096 1048576)
+msg_sizes=(128 512 1024 4096 65536 1048576)
 
 # Number of trials
 trials=10
@@ -45,12 +45,12 @@ run_benchmark() {
     # Stop Kafka
     sleep 10
     ../scripts/stop_kafka.sh
-    sleep 20
+    sleep 30
 }
 
 # Run benchmark for all msg_sizes
-for msg_size in "${msg_sizes[@]}"; do
-    for ((trial=1; trial<=trials; trial++)); do
+for ((trial=1; trial<=trials; trial++)); do
+    for msg_size in "${msg_sizes[@]}"; do
         run_benchmark "single" $msg_size $trial
         run_benchmark "end2end" $msg_size $trial
     done

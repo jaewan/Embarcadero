@@ -27,13 +27,15 @@ public:
         else {
             long idx = __sync_fetch_and_add(&delivered, 1);
             latency[idx] = timestamp_now() - get_timestamp(message.payload());
-            // if (idx == 0)
-            //     std::cout << "first ack" << std::endl;
             if (delivered == payload_count) {
-                // std::cout << "last ack" << std::endl;
+                struct kafka_benchmark_throughput_report report;
+                report.start = start;
+                report.end = std::chrono::steady_clock::now();
+
                 long latency_sum = 0;
                 if (measure_latency) {
-                    sleep(1);
+                    // (junbong): Ensure other threads finish store latency
+                    // sleep(1);
                     std::ofstream outFile("producer_latency.csv");
                     if (!outFile) {
                         std::cerr << "Failed to open file" << std::endl;
@@ -49,9 +51,6 @@ public:
                     outFile.close();
                 }
 
-                struct kafka_benchmark_throughput_report report;
-                report.start = start;
-                report.end = std::chrono::steady_clock::now();
                 report.latency = std::chrono::microseconds(latency_sum / payload_count);
                 write(pp.second, &report, sizeof(report));
             }
@@ -74,15 +73,15 @@ RdKafka::Producer *create_producer(const std::string& brokers, const std::string
         exit(1);
     }
 
-    if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
-        std::cerr << "% " << errstr << std::endl;
-        exit(1);
-    }
+    // if (conf->set("linger.ms", "0", errstr) != RdKafka::Conf::CONF_OK) {
+    //     std::cerr << "% " << errstr << std::endl;
+    //     exit(1);
+    // }
 
-    if (conf->set("batch.size", "1", errstr) != RdKafka::Conf::CONF_OK) {
-        std::cerr << "% " << errstr << std::endl;
-        exit(1);
-    }
+    // if (conf->set("batch.size", "1", errstr) != RdKafka::Conf::CONF_OK) {
+    //     std::cerr << "% " << errstr << std::endl;
+    //     exit(1);
+    // }
 
     if (conf->set("message.max.bytes", "2097152", errstr) != RdKafka::Conf::CONF_OK) {
         std::cerr << "% " << errstr << std::endl;

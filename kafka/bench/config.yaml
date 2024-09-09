@@ -5,9 +5,9 @@ ack: "1"
 topic:
   name: kafka-benchmark
   partitions: 4
-  replicationFactor: 2
+  replicationFactor: 1
 payload:
-  total: 536870912 # 2Gi
+  total: 10737418240 # 10Gi
   msgSize: 1048576 # 4Ki
 # entity: single, end2end
 entity: single
