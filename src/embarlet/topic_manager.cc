@@ -212,9 +212,9 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 	order_(order),
 	seq_type_(seq_type),
 	cxl_addr_(cxl_addr),
+	logical_offset_(0),
+	written_logical_offset_((size_t)-1),
 	current_segment_(segment_metadata){
-		logical_offset_ = 0;
-		written_logical_offset_ = (size_t)-1;
 		log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
 		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
 		ordered_offset_addr_ = nullptr;
@@ -249,6 +249,17 @@ void Topic::CombinerThread(){
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
 		header->next_msg_diff = header->paddedSize;
+		/*
+#ifdef __INTEL__
+    _mm_clflushopt(header);
+#elif defined(__AMD__)
+    _mm_clwb(header);
+#else
+		LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
+    // Fallback or error handling
+#endif
+*/
+		std::atomic_thread_fence(std::memory_order_release);
 		tinode_->offsets[broker_id_].written = logical_offset_;
 		(*(unsigned long long int*)segment_header) =
 			(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);

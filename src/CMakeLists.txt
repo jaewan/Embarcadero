@@ -7,6 +7,35 @@ find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
 find_package(mimalloc REQUIRED)
 
+# Detect the processor type
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+    # Check for Intel specific intrinsics
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
+    if(COMPILER_SUPPORTS_MARCH_NATIVE)
+        message(STATUS "Enabling -march=native")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+    endif()
+
+    # Detect Intel or AMD processor using lscpu
+    execute_process(
+        COMMAND lscpu
+        COMMAND grep "Vendor ID:"
+        COMMAND awk "{print $NF}"
+        OUTPUT_VARIABLE CPU_VENDOR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+
+    if(CPU_VENDOR STREQUAL "GenuineIntel")
+        set(__INTEL__ 1)
+    elseif(CPU_VENDOR STREQUAL "AuthenticAMD")
+        set(__AMD__ 1)
+    else()
+        message(WARNING "Unknown CPU vendor: ${CPU_VENDOR}")
+    endif()
+endif()
+
+
 configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
 add_executable(embarlet 

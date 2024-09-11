@@ -12,6 +12,9 @@ namespace Embarcadero{
 #define Embarcadero_VERSION_MAJOR 0.1
 #define Embarcadero_VERSION_MINOR 1
 
+#cmakedefine01 __INTEL__
+#cmakedefine01 __AMD__
+
 #define ORDER_LEVEL 1
 #define PORT 1214
 #define BROKER_PORT 12140
