@@ -304,7 +304,7 @@ void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int 
 			}
 		}
 		size_t sent_bytes = 0;
-		if(messages_size < 64){
+		if(messages_size < 64 && messages_size != 0){
 			LOG(ERROR) << "[DEBUG] messages_size is below 64!!!! cannot happen " << messages_size;
 		}
 		while(sent_bytes < messages_size){
