@@ -1212,40 +1212,40 @@ class Subscriber{
 			throw std::runtime_error("Invalid SequencerType: " + value);
 		}
 
-		int main(int argc, char* argv[]) {
-			google::InitGoogleLogging(argv[0]);
-			google::InstallFailureSignalHandler();
-			FLAGS_logtostderr = 1; // log only to console, no files.
-			cxxopts::Options options("embarcadero-throughputTest", "Embarcadero Throughput Test");
+int main(int argc, char* argv[]) {
+	google::InitGoogleLogging(argv[0]);
+	google::InstallFailureSignalHandler();
+	FLAGS_logtostderr = 1; // log only to console, no files.
+	cxxopts::Options options("embarcadero-throughputTest", "Embarcadero Throughput Test");
 
-			options.add_options()
-				("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
-				("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
-				("o,order_level", "Order Level", cxxopts::value<int>()->default_value("0"))
-				("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", cxxopts::value<std::string>()->default_value("EMBARCADERO"))
-				("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10737418240"))
-				("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
-				("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
-				("t,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
+	options.add_options()
+		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
+		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
+		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("1"))
+		("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", cxxopts::value<std::string>()->default_value("SCALOG"))
+		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10737418240"))
+		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
+		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
+		("t,num_thread", "Number of request threads", cxxopts::value<size_t>()->default_value("24"));
 
-			auto result = options.parse(argc, argv);
-			size_t message_size = result["size"].as<size_t>();
-			size_t total_message_size = result["total_message_size"].as<size_t>();
-			size_t num_threads = result["num_threads"].as<size_t>();
-			int ack_level = result["ack_level"].as<int>();
-			int order = result["order_level"].as<int>();
-			SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
-			FLAGS_v = result["log_level"].as<int>();
+	auto result = options.parse(argc, argv);
+	size_t message_size = result["size"].as<size_t>();
+	size_t total_message_size = result["total_message_size"].as<size_t>();
+	size_t num_threads = result["num_thread"].as<size_t>();
+	int ack_level = result["ack_level"].as<int>();
+	int order = result["order_level"].as<int>();
+	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
+	FLAGS_v = result["log_level"].as<int>();
 
-			if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
-				LOG(ERROR) << "CGroup core throttle is wrong";
-				return -1;
-			}
+	if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
+		LOG(ERROR) << "CGroup core throttle is wrong";
+		return -1;
+	}
 
-			//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			//SubscribeThroughputTest(total_message_size, message_size, order);
-			//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	//SubscribeThroughputTest(total_message_size, message_size, order);
+	//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+	// LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
-			return 0;
-		}
+	return 0;
+}
