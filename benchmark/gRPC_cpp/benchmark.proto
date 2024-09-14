@@ -1,0 +1,20 @@
+// benchmark.proto
+syntax = "proto3";
+
+package benchmark;
+
+// Service for benchmarking gRPC
+service BenchmarkService {
+  // Sends a message and receives an acknowledgment
+  rpc SendMessage(BenchmarkRequest) returns (BenchmarkReply);
+}
+
+// The message sent to the server
+message BenchmarkRequest {
+  string message = 1;
+}
+
+// The message received from the server
+message BenchmarkReply {
+  string message = 1;
+}
