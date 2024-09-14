@@ -470,7 +470,7 @@ class Client{
 		bool connected_;
 		bool fixed_batch_size_;
 		size_t client_order_;
-		int client_id_;
+		uint16_t client_id_;
 		int num_threads_;
 		size_t message_size_;
 		Buffer pubQue_;
@@ -934,7 +934,7 @@ class Subscriber{
 			int last_fetched_offset_;
 			std::vector<std::vector<std::pair<void*, msgIdx*>>> messages_;
 			std::atomic<int> messages_idx_;
-			int client_id_;
+			uint16_t client_id_;
 
 			void SubscribeThread(int epoll_fd, absl::flat_hash_map<int, std::pair<void*, msgIdx*>> fd_to_msg){
 				epoll_event events[NUM_SUB_CONNECTIONS];

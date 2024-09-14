@@ -202,10 +202,10 @@ void CXLManager::Sequencer1(char* topic){
 	static size_t seq = 0;
 
 	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-	auto last_updated = std::chrono::steady_clock::now();
+	//auto last_updated = std::chrono::steady_clock::now();
 
 	while(!stop_threads_){
-		bool yield = true;
+		//bool yield = true;
 		for(auto broker : registered_brokers){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
 			size_t written = tinode->offsets[broker].written;
@@ -220,7 +220,7 @@ void CXLManager::Sequencer1(char* topic){
 				tinode->offsets[broker].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
 				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
 				msg_logical_off++;
-				yield = false;
+				//yield = false;
 			}
 		}
 		/*
@@ -241,10 +241,10 @@ void CXLManager::Sequencer2(char* topic){
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
-	absl::flat_hash_map<int/*client_id*/, size_t/*client_req_id*/> last_ordered; 
+	absl::flat_hash_map<uint16_t/*client_id*/, size_t/*client_req_id*/> last_ordered; 
 	// Store skipped messages to respect the client order.
 	// Use absolute adrress b/c it is only used in this thread later
-	absl::flat_hash_map<int/*client_id*/, absl::btree_map<size_t/*client_order*/, std::pair<int /*broker_id*/, struct MessageHeader*>>> skipped_msg;
+	absl::flat_hash_map<uint16_t/*client_id*/, absl::btree_map<size_t/*client_order*/, std::pair<int /*broker_id*/, struct MessageHeader*>>> skipped_msg;
 	static size_t seq = 0;
 	// Tracks the messages of written order to later report the sequentially written messages
 	std::array<std::queue<MessageHeader* /*physical addr*/>, NUM_MAX_BROKERS> queues;
@@ -258,10 +258,9 @@ void CXLManager::Sequencer2(char* topic){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
 			//This ensures the message is Combined (complete ensures it is fully received)
 			if(msg_to_order[broker]->complete == 1 && msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written){
-				int client_id;
 				yield = false;
 				queues[broker].push(msg_to_order[broker]);
-				int client = msg_to_order[broker]->client_id;
+				uint16_t client = msg_to_order[broker]->client_id;
 				size_t client_order = msg_to_order[broker]->client_order;
 				auto last_ordered_itr = last_ordered.find(client);
 				if(client_order == 0 || 
@@ -275,7 +274,7 @@ void CXLManager::Sequencer2(char* topic){
 						std::vector<int> to_remove;
 						for (auto& pair : it->second) {
 							int client_order = pair.first;
-							if(client_order == last_ordered[client] + 1){
+							if((long unsigned int)client_order == (long unsigned int)last_ordered[client] + 1){
 								pair.second.second->total_order = seq;
 								seq++;
 								last_ordered[client] = client_order;
@@ -557,7 +556,7 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 	absl::btree_set<int> registered_brokers;
 	cxl_manager_->GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 
-	int local_cut_num = 0;
+	size_t local_cut_num = 0;
 	{
 		absl::ReaderMutexLock lock(&global_cut_mu_);
 		local_cut_num = global_cut_[epoch].size();
@@ -583,7 +582,7 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 	} else {
 		/// If we haven't received all local cuts, the grpc thread must wait until we do to send the correct global cut back to the caller
         cv_.wait(lock, [this, broker_id, epoch, registered_brokers]() {
-			int local_cut_num = 0;
+			size_t local_cut_num = 0;
 			{
 				absl::ReaderMutexLock lock(&global_cut_mu_);
 				local_cut_num = global_cut_[epoch].size();
