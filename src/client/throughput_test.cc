@@ -404,8 +404,7 @@ class Client{
 				pub_efd_.push_back(efd);
 			}
 			for (int pub_thread_id=0; pub_thread_id < num_threads_; pub_thread_id++) {
-				int broker_id = pub_thread_id%brokers_.size();
-				threads_.emplace_back(&Client::PublishThread, this, brokers_[broker_id], pub_thread_id, pub_socks_[pub_thread_id], pub_efd_[pub_thread_id]);
+				threads_.emplace_back(&Client::PublishThread, this, pub_thread_id, pub_socks_[pub_thread_id], pub_efd_[pub_thread_id]);
 			}
 
 			while(thread_count_.load() != num_threads_){std::this_thread::yield();}
@@ -669,7 +668,7 @@ class Client{
 			return;
 		}
 
-		void PublishThread(int broker_id, int pubQuesIdx, int sock, int efd){
+		void PublishThread(int pubQuesIdx, int sock, int efd){
 			// *********** Sending Messages ***********
 			std::vector<double> send_times;
 			std::vector<double> poll_times;
