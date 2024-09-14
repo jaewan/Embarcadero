@@ -51,9 +51,8 @@ int main(int argc, char** argv) {
   BenchmarkClient client(grpc::CreateChannel(target_str, grpc::InsecureChannelCredentials()));
 
   int message_count = 1000;  // Number of messages to send
-  int message_size = 1024;
-
-  // Generate 1KB message
+  // 1 MB
+  int message_size = 1024 * 1024;
   std::string message(message_size, 'A'); 
 
   client.BenchmarkThroughput(message_count, message, message_size);
