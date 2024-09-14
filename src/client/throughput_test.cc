@@ -343,8 +343,66 @@ class Client{
 			ack_thread_ = std::thread([this](){
 					this->EpollAckThread();
 					});
-			for (int i=0; i < num_threads_; i++)
-				threads_.emplace_back(&Client::PublishThread, this, brokers_[i%brokers_.size()],  i);
+
+			// Setup sockets before creating threads, in case share across threads
+			for (int pub_thread_id=0; pub_thread_id < num_threads_; pub_thread_id++) {
+				int broker_id = pub_thread_id%brokers_.size();
+				auto [addr, addressPort] = ParseAddressPort(nodes_[broker_id]);
+				int sock = GetNonblockingSock(addr.data(), PORT + broker_id);
+				// *********** Initiate Shake ***********
+				int efd = epoll_create1(0);
+				if(efd < 0){
+					LOG(ERROR) << "Publish Thread epoll_create1 failed:" << strerror(errno);
+					close(sock);
+					return;
+				}
+				struct epoll_event event;
+				event.data.fd = sock;
+				event.events = EPOLLOUT;
+				if(epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event)){
+					LOG(ERROR) << "epoll_ctl failed:" << strerror(errno);
+					close(sock);
+					close(efd);
+				}
+
+				Embarcadero::EmbarcaderoReq shake;
+				shake.client_id = client_id_;
+				memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
+				shake.ack = ack_level_;
+				shake.client_order = order_;
+				shake.port = ack_port_;
+				shake.size = message_size_ + sizeof(Embarcadero::MessageHeader);
+
+				struct epoll_event events[10]; // Adjust size as needed
+				bool running = true;
+				size_t sent_bytes = 0;
+
+				while (!shutdown_ && running) {
+					int n = epoll_wait(efd, events, 10, -1);
+					for (int i = 0; i < n; i++) {
+						if (events[i].events & EPOLLOUT) {
+							ssize_t bytesSent = send(sock, (int8_t*)(&shake) + sent_bytes, sizeof(shake) - sent_bytes, 0);
+							if (bytesSent <= 0) {
+								bytesSent = 0;
+								if (errno != EAGAIN && errno != EWOULDBLOCK) {
+									LOG(ERROR) << "send failed:" << strerror(errno);
+									running = false;
+									close(sock);
+									close(efd);
+									return;
+								}
+							}
+							sent_bytes += bytesSent;
+							if(sent_bytes == sizeof(shake)){
+								running = false;
+								break;
+							}
+						}
+					}
+				}
+				threads_.emplace_back(&Client::PublishThread, this, brokers_[broker_id], pub_thread_id, sock, efd);
+			}
+
 			while(thread_count_.load() != num_threads_){std::this_thread::yield();}
 			return;
 		}
@@ -602,61 +660,7 @@ class Client{
 			return;
 		}
 
-		void PublishThread(int broker_id, int pubQuesIdx){
-			auto [addr, addressPort] = ParseAddressPort(nodes_[broker_id]);
-			int sock = GetNonblockingSock(addr.data(), PORT + broker_id);
-			// *********** Initiate Shake ***********
-			int efd = epoll_create1(0);
-			if(efd < 0){
-				LOG(ERROR) << "Publish Thread epoll_create1 failed:" << strerror(errno);
-				close(sock);
-				return;
-			}
-			struct epoll_event event;
-			event.data.fd = sock;
-			event.events = EPOLLOUT;
-			if(epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event)){
-				LOG(ERROR) << "epoll_ctl failed:" << strerror(errno);
-				close(sock);
-				close(efd);
-			}
-
-			Embarcadero::EmbarcaderoReq shake;
-			shake.client_id = client_id_;
-			memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
-			shake.ack = ack_level_;
-			shake.client_order = order_;
-			shake.port = ack_port_;
-			shake.size = message_size_ + sizeof(Embarcadero::MessageHeader);
-
-			struct epoll_event events[10]; // Adjust size as needed
-			bool running = true;
-			size_t sent_bytes = 0;
-
-			while (!shutdown_ && running) {
-				int n = epoll_wait(efd, events, 10, -1);
-				for (int i = 0; i < n; i++) {
-					if (events[i].events & EPOLLOUT) {
-						ssize_t bytesSent = send(sock, (int8_t*)(&shake) + sent_bytes, sizeof(shake) - sent_bytes, 0);
-						if (bytesSent <= 0) {
-							bytesSent = 0;
-							if (errno != EAGAIN && errno != EWOULDBLOCK) {
-								LOG(ERROR) << "send failed:" << strerror(errno);
-								running = false;
-								close(sock);
-								close(efd);
-								return;
-							}
-						}
-						sent_bytes += bytesSent;
-						if(sent_bytes == sizeof(shake)){
-							running = false;
-							break;
-						}
-					}
-				}
-			}
-
+		void PublishThread(int broker_id, int pubQuesIdx, int sock, int efd){
 			// *********** Sending Messages ***********
 			std::vector<double> send_times;
 			std::vector<double> poll_times;
@@ -675,7 +679,7 @@ class Client{
 					return;
 				}
 
-				sent_bytes = 0;
+				size_t sent_bytes = 0;
 				size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
 				while(sent_bytes < len){
 					size_t remaining_bytes = len - sent_bytes;
