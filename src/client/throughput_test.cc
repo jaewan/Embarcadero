@@ -400,7 +400,12 @@ class Client{
 						}
 					}
 				}
-				threads_.emplace_back(&Client::PublishThread, this, brokers_[broker_id], pub_thread_id, sock, efd);
+				pub_socks_.push_back(sock);
+				pub_efd_.push_back(efd);
+			}
+			for (int pub_thread_id=0; pub_thread_id < num_threads_; pub_thread_id++) {
+				int broker_id = pub_thread_id%brokers_.size();
+				threads_.emplace_back(&Client::PublishThread, this, brokers_[broker_id], pub_thread_id, pub_socks_[pub_thread_id], pub_efd_[pub_thread_id]);
 			}
 
 			while(thread_count_.load() != num_threads_){std::this_thread::yield();}
@@ -482,6 +487,10 @@ class Client{
 		int order_;
 		int ack_port_;
 		std::vector<std::thread> threads_;
+		
+		std::vector<int> pub_socks_;
+		std::vector<int> pub_efd_;
+
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
 
