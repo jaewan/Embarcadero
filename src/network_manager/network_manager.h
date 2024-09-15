@@ -74,7 +74,7 @@ class NetworkManager{
 		absl::flat_hash_map<uint16_t, int> ack_connections_; // <client_id, ack_sock>
 		absl::Mutex ack_mu_;
 		absl::Mutex sub_mu_;
-		absl::flat_hash_map<uint16_t /* client_id */, std::unique_ptr<SubscriberState>> sub_state_;
+		absl::flat_hash_map<uint16_t /* client_id */, std::unique_ptr<SubscriberState>> sub_state_ ABSL_GUARDED_BY(sub_mu_);
 		int ack_efd_;
 		int ack_fd_ = -1;
 

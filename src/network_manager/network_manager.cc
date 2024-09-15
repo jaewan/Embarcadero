@@ -256,15 +256,12 @@ void NetworkManager::ReqReceiveThread(){
 						close(efd);
 					}
 
-					{
-						absl::MutexLock lock(&sub_mu_);
-						if(!sub_state_.contains(shake.client_id)){
-							auto state = std::make_unique<SubscriberState>();
-							state->last_offset = shake.client_order;
-							state->last_addr = shake.last_addr;
-							state->initialized = true;
-							sub_state_[shake.client_id] = std::move(state);
-						}
+					if(!sub_state_.contains(shake.client_id)){
+						auto state = std::make_unique<SubscriberState>();
+						state->last_offset = shake.client_order;
+						state->last_addr = shake.last_addr;
+						state->initialized = true;
+						sub_state_[shake.client_id] = std::move(state);
 					}
 					SubscribeNetworkThread(req.client_socket, efd, shake.topic, shake.client_id);
 					close(req.client_socket);
