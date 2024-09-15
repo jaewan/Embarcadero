@@ -678,6 +678,7 @@ class Client{
 		void PublishThread(int pubQuesIdx){
 			int sock = pub_socks_[pubQuesIdx];
 			int efd = pub_efd_[pubQuesIdx];
+			LOG(INFO) << "PublishThread starting, sock=" << sock << ", efd=" << efd;
 
 			// *********** Sending Messages ***********
 			std::vector<double> send_times;
@@ -733,7 +734,7 @@ class Client{
 
 				}
 			}
-			//LOG(INFO) << "PublishThread complete, closing sock=" << sock << ", efd=" << efd;
+			LOG(INFO) << "PublishThread complete, closing sock=" << sock << ", efd=" << efd;
 			close(sock);
 			close(efd);
 		}

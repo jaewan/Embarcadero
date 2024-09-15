@@ -241,7 +241,7 @@ void CXLManager::Sequencer2(char* topic){
 	struct TInode *tinode = (struct TInode *)GetTInode(topic);
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
-	absl::flat_hash_map<uint16_t/*client_id*/, size_t/*client_req_id*/> last_ordered; 
+	absl::flat_hash_map<uint16_t/*client_id*/, int32_t/*client_req_id*/> last_ordered; 
 	// Store skipped messages to respect the client order.
 	// Use absolute adrress b/c it is only used in this thread later
 	absl::flat_hash_map<uint16_t/*client_id*/, absl::btree_map<int32_t/*client_order*/, std::pair<int /*broker_id*/, struct MessageHeader*>>> skipped_msg;
