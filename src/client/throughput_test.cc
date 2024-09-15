@@ -306,10 +306,10 @@ class Buffer{
 
 class Client{
 	public:
-		Client(std::string head_addr, std::string port, int num_threads, size_t message_size, size_t queueSize):
+		Client(std::string head_addr, std::string port, int num_threads, size_t message_size, size_t queueSize, bool fixed_batch_size):
 			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0),
 			client_id_(GenerateRandomNum()), num_threads_(num_threads), message_size_(message_size),
-			pubQue_(num_threads, queueSize, client_id_, message_size){
+			pubQue_(num_threads, queueSize, client_id_, message_size), fixed_batch_size_(fixed_batch_size) {
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				nodes_[0] = head_addr+":"+std::to_string(PORT);
@@ -414,6 +414,7 @@ class Client{
 		int num_threads_;
 		size_t message_size_;
 		Buffer pubQue_;
+		bool fixed_batch_size_;
 
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::thread cluster_probe_thread_;
@@ -1121,7 +1122,7 @@ class Subscriber{
 			if(q_size < 1024){
 				q_size = 1024;
 			}
-			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
+			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, fixed_batch_size);
 			LOG(INFO) << "Client Created" ;
 			c.CreateNewTopic(topic, order, seq_type);
 			c.Init(topic, ack_level);
@@ -1174,7 +1175,7 @@ class Subscriber{
 			if(q_size < 1024){
 				q_size = 1024;
 			}
-			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
+			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, fixed_batch_size);
 			c.CreateNewTopic(topic, order, seq_type);
 			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
 			c.Init(topic, ack_level);
@@ -1207,7 +1208,7 @@ class Subscriber{
 			if(q_size < 1024){
 				q_size = 1024;
 			}
-			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
+			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, fixed_batch_size);
 			c.CreateNewTopic(topic, order, seq_type);
 			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
 			c.Init(topic, ack_level);
