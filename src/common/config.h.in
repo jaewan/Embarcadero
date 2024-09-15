@@ -32,6 +32,7 @@ namespace Embarcadero{
 #define ZERO_COPY_SEND_LIMIT 1UL<<23
 #define MAX_MSG_SIZE 1UL << 20
 #define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
+#define BATCH_SIZE (1UL<<19)
 
 //********* Health check configs *********
 #define HEARTBEAT_INTERVAL 3 // in seconds
@@ -52,10 +53,12 @@ namespace Embarcadero{
 struct alignas(64) PublishRequest{
 	char topic[TOPIC_NAME_SIZE];
 	bool acknowledge;
-	int client_socket;
-	void* payload_address;
+	uint32_t batch_seq;
+	uint32_t client_id; 
+	uint16_t num_brokers; // For order 3, this impl does not allow dynamic brokers
+	uint16_t connection_id;
 	int num_messages;
-	size_t total_size;;
+	size_t total_size;
 };
 
 using CreateTopicEntryCallback = std::function<bool(char*, int, heartbeat_system::SequencerType)>;

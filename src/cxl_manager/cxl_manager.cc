@@ -162,6 +162,8 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic);
 			else if (order == 2)
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic);
+			else if (order == 3)
+				sequencerThreads_.emplace_back(&CXLManager::Sequencer3, this, topic);
 			break;
 		case SCALOG:
 			if (order == 1){
@@ -333,6 +335,48 @@ void CXLManager::Sequencer2(char* topic){
 			last_updated = std::chrono::steady_clock::now();
 		}
 	}// end while
+}
+
+void CXLManager::Sequencer3(char* topic){
+	struct TInode *tinode = (struct TInode *)GetTInode(topic);
+	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
+	absl::btree_set<int> registered_brokers;
+	static size_t seq = 0;
+
+	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+	auto last_updated = std::chrono::steady_clock::now();
+
+	while(!stop_threads_){
+		bool yield = true;
+		for(auto broker : registered_brokers){
+			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
+			size_t written = tinode->offsets[broker].written;
+			if(written == (size_t)-1){
+				continue;
+			}
+			while(msg_logical_off <= written && msg_to_order[broker]->next_msg_diff != 0 && msg_to_order[broker]->logical_offset != (size_t)-1){
+				msg_to_order[broker]->total_order = seq;
+				seq++;
+				//std::atomic_thread_fence(std::memory_order_release);
+				tinode->offsets[broker].ordered = msg_logical_off;
+				tinode->offsets[broker].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
+				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
+				msg_logical_off++;
+				yield = false;
+			}
+		}
+		/*
+		if(yield){
+			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+			last_updated = std::chrono::steady_clock::now();
+			std::this_thread::yield();
+		}else if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()
+					- last_updated).count() >= HEARTBEAT_INTERVAL){
+			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+			last_updated = std::chrono::steady_clock::now();
+		}
+	*/
+	}
 }
 
 void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
