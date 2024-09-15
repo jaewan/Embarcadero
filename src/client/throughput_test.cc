@@ -248,7 +248,7 @@ class Buffer{
 			free(bufs);
 		}
 
-		bool Write(int bufIdx, size_t client_order, char* msg, size_t len){
+		bool Write(int bufIdx, int32_t client_order, char* msg, size_t len){
 			static const size_t header_size = sizeof(Embarcadero::MessageHeader);
 			size_t padded;
 			if(len == header_.size){
@@ -404,10 +404,12 @@ class Client{
 				pub_efd_.push_back(efd);
 			}
 			for (int pub_thread_id=0; pub_thread_id < num_threads_; pub_thread_id++) {
-				threads_.emplace_back(&Client::PublishThread, this, pub_thread_id, pub_socks_[pub_thread_id], pub_efd_[pub_thread_id]);
+				threads_.emplace_back(&Client::PublishThread, this, pub_thread_id);
 			}
 
+			LOG(INFO) << "Waiting for PublisherThreads to initialize...";
 			while(thread_count_.load() != num_threads_){std::this_thread::yield();}
+			LOG(INFO) << "Initialized PublisherThreads";
 			return;
 		}
 
@@ -425,17 +427,22 @@ class Client{
 			client_order_++;
 		}
 
-		void Poll(size_t n){
+		void Poll(int32_t n){
+			LOG(INFO) << "In Poll()";
 			pubQue_.ReturnReads();
+			LOG(INFO) << "Waiting for client_order to increase...";
 			while(client_order_ < n){
 				std::this_thread::yield();
 			}
+			LOG(INFO) << "client order is good!!";
 			for(auto &t : threads_){
 				if(t.joinable())
 					t.join();
 			}
+			LOG(INFO) << "Finished joining threads...?";
 			shutdown_ = true;
 			ack_thread_.join();
+			LOG(INFO) << "End of Poll()";
 			return;
 		}
 
@@ -468,10 +475,10 @@ class Client{
 		std::string port_;
 		bool shutdown_;
 		bool connected_;
-		bool fixed_batch_size_;
-		size_t client_order_;
+		int32_t client_order_;
 		uint16_t client_id_;
 		int num_threads_;
+		bool fixed_batch_size_;
 		size_t message_size_;
 		Buffer pubQue_;
 
@@ -553,7 +560,7 @@ class Client{
 			int EPOLL_TIMEOUT = 1; // 1 millisecond timeout
 			std::vector<int> client_sockets;
 
-			while (!shutdown_ || total_received < client_order_) {
+			while (!shutdown_ || total_received < (size_t)client_order_) {
 				int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
 				for (int i = 0; i < num_events; i++) {
 					if (events[i].data.fd == server_sock) {
@@ -582,7 +589,7 @@ class Client{
 						int client_sock = events[i].data.fd;
 						ssize_t bytes_received = 0;
 
-						while (total_received < client_order_ && (bytes_received = recv(client_sock, buffer, 1024*1024, 0)) > 0) {
+						while (total_received < (size_t)client_order_ && (bytes_received = recv(client_sock, buffer, 1024*1024, 0)) > 0) {
 							total_received += bytes_received;
 							// Process received data here
 							// For example, you might want to count the number of 1-byte messages:
@@ -656,7 +663,7 @@ class Client{
 			}
 			size_t read = 0;
 			uint8_t* data = (uint8_t*)malloc(1024);
-			while (!shutdown_ || read<client_order_){//shutdown_ is to ensure the client_order_ is fully updated
+			while (!shutdown_ || read < (size_t)client_order_){//shutdown_ is to ensure the client_order_ is fully updated
 				size_t bytesReceived;
 				if((bytesReceived = recv(client_sock, data, 1024, 0))){
 					read += bytesReceived;
@@ -668,7 +675,10 @@ class Client{
 			return;
 		}
 
-		void PublishThread(int pubQuesIdx, int sock, int efd){
+		void PublishThread(int pubQuesIdx){
+			int sock = pub_socks_[pubQuesIdx];
+			int efd = pub_efd_[pubQuesIdx];
+
 			// *********** Sending Messages ***********
 			std::vector<double> send_times;
 			std::vector<double> poll_times;
@@ -855,7 +865,7 @@ class Subscriber{
 				// Check if messages are given total order the same as client_order
 				header = (Embarcadero::MessageHeader*)buf;
 				while(header->paddedSize != 0){
-					if(header->total_order != header->client_order){
+					if(header->total_order != (size_t)header->client_order){
 						LOG(ERROR) << "msg:" << header->client_order << " logical off:" << header->logical_offset << " was given a wrong total order" << header->total_order;
 						return false;
 					}
@@ -1119,7 +1129,7 @@ class Subscriber{
 			auto produce_end = std::chrono::high_resolution_clock::now();
 			c.DEBUG_check_send_finish();
 			auto send_end = std::chrono::high_resolution_clock::now();
-			c.Poll(n);
+			c.Poll((int32_t)n);
 
 			auto end = std::chrono::high_resolution_clock::now();
 			std::chrono::duration<double> elapsed = end - start;
@@ -1169,7 +1179,7 @@ class Subscriber{
 				c.Publish(message.data(), message_size);
 			}
 
-			c.Poll(n);
+			c.Poll((int32_t)n);
 			auto pub_end = std::chrono::high_resolution_clock::now();
 			s.DEBUG_wait(total_message_size, message_size);
 			auto end = std::chrono::high_resolution_clock::now();
@@ -1197,6 +1207,7 @@ class Subscriber{
 			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
 			c.Init(topic, ack_level, order);
 
+			LOG(INFO) << "Starting publish loop...";
 			auto start = std::chrono::high_resolution_clock::now();
 			for(size_t i=0; i<n; i++){
 				auto timestamp = std::chrono::steady_clock::now();
@@ -1205,9 +1216,12 @@ class Subscriber{
 				memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
 				c.Publish(message, message_size);
 			}
-			c.Poll(n);
+			LOG(INFO) << "Finished publish loop!";
+			c.Poll((int32_t)n);
+			LOG(INFO) << "Finished poll!";
 			auto pub_end = std::chrono::high_resolution_clock::now();
 			s.DEBUG_wait(total_message_size, message_size);
+			LOG(INFO) << "Finished subscribe wait!";
 			auto end = std::chrono::high_resolution_clock::now();
 
 			auto pub_duration = std::chrono::duration_cast<std::chrono::seconds>(pub_end - start);

@@ -244,7 +244,7 @@ void CXLManager::Sequencer2(char* topic){
 	absl::flat_hash_map<uint16_t/*client_id*/, size_t/*client_req_id*/> last_ordered; 
 	// Store skipped messages to respect the client order.
 	// Use absolute adrress b/c it is only used in this thread later
-	absl::flat_hash_map<uint16_t/*client_id*/, absl::btree_map<size_t/*client_order*/, std::pair<int /*broker_id*/, struct MessageHeader*>>> skipped_msg;
+	absl::flat_hash_map<uint16_t/*client_id*/, absl::btree_map<int32_t/*client_order*/, std::pair<int /*broker_id*/, struct MessageHeader*>>> skipped_msg;
 	static size_t seq = 0;
 	// Tracks the messages of written order to later report the sequentially written messages
 	std::array<std::queue<MessageHeader* /*physical addr*/>, NUM_MAX_BROKERS> queues;
@@ -261,7 +261,7 @@ void CXLManager::Sequencer2(char* topic){
 				yield = false;
 				queues[broker].push(msg_to_order[broker]);
 				uint16_t client = msg_to_order[broker]->client_id;
-				size_t client_order = msg_to_order[broker]->client_order;
+				int32_t client_order = msg_to_order[broker]->client_order;
 				auto last_ordered_itr = last_ordered.find(client);
 				if(client_order == 0 || 
 						(last_ordered_itr != last_ordered.end() && last_ordered_itr->second == client_order - 1)){
@@ -273,7 +273,8 @@ void CXLManager::Sequencer2(char* topic){
 					if(it != skipped_msg.end()){
 						std::vector<int> to_remove;
 						for (auto& pair : it->second) {
-							int client_order = pair.first;
+							int32_t client_order = pair.first;
+							// TODO(erika): is sentinel value may be -2 then this cast may not be safe
 							if((long unsigned int)client_order == (long unsigned int)last_ordered[client] + 1){
 								pair.second.second->total_order = seq;
 								seq++;
@@ -312,7 +313,7 @@ void CXLManager::Sequencer2(char* topic){
 					//Insert to skipped messages
 					auto it = skipped_msg.find(client);
 					if (it == skipped_msg.end()) {
-						absl::btree_map<size_t, std::pair<int, MessageHeader*>> new_map;
+						absl::btree_map<int32_t, std::pair<int, MessageHeader*>> new_map;
 						new_map.emplace(client_order, std::make_pair(broker, msg_to_order[broker]));
 						skipped_msg.emplace(client, std::move(new_map));
 					} else {

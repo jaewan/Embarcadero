@@ -26,7 +26,7 @@ struct NetworkRequest{
 struct alignas(64) EmbarcaderoReq{
 	uint16_t client_id;
 	uint32_t size;//Pub: Maximum size of messages in this batch
-	size_t client_order; // at Sub: used as last offset  set to -2 as sentinel value
+	int32_t client_order; // at Sub: used as last offset set to -2 as sentinel value
 	void* last_addr; // Sub: address of last fetched msg
 	uint16_t ack;
 	uint32_t port;

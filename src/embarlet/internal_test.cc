@@ -9,7 +9,7 @@
 #define LOOPLEN 250000
 double NUM_THREADS = 32;
 
-std::atomic<size_t> client_order_{0};
+std::atomic<int32_t> client_order_{0};
 
 void TopicManagerWriteThread(int tid, Embarcadero::TopicManager &topic_manager){
 	Embarcadero::PublishRequest req;

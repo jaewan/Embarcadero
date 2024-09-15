@@ -57,7 +57,7 @@ struct alignas(64) TInode{
 
 struct NonCriticalMessageHeader{
 	uint16_t client_id;
-	size_t client_order;
+	int32_t client_order;
 	size_t size;
 	size_t paddedSize;
 	void* segment_header;
@@ -77,7 +77,7 @@ struct alignas(64) MessageHeader{
 	unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
 	volatile size_t total_order;
 	uint16_t client_id;
-	uint32_t client_order;
+	int32_t client_order;
 	size_t size;
 	volatile size_t paddedSize; // This include message+padding+header size
 	uint32_t complete;
