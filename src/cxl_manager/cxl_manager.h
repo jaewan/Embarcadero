@@ -5,15 +5,15 @@
 #include <iostream>
 #include <optional>
 #include "folly/MPMCQueue.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/btree_map.h"
 #include "common/config.h"
 #include "../embarlet/topic_manager.h"
 #include "../network_manager/network_manager.h"
 #include <heartbeat.grpc.pb.h>
-#include "absl/container/flat_hash_map.h"
-#include "absl/container/btree_map.h"
+#include "../embarlet/heartbeat.h"
 #include <grpcpp/grpcpp.h>
 #include <scalog_sequencer.grpc.pb.h>
-#include "../embarlet/heartbeat.h"
 
 namespace Embarcadero{
 
@@ -66,6 +66,7 @@ struct NonCriticalMessageHeader{
 
 struct BatchHeader{
 	size_t total_size;
+	size_t num_msg;
 };
 
 
@@ -98,7 +99,7 @@ class CXLManager{
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
-		void* GetCXLBuffer(PublishRequest &req);
+		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 														struct MessageHeader** msg_to_order, struct TInode *tinode);
 

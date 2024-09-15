@@ -126,8 +126,8 @@ CXLManager::~CXLManager(){
 	LOG(INFO) << "[CXLManager]: \t\tDestructed";
 }
 
-void* CXLManager::GetCXLBuffer(PublishRequest &req){
-	return topic_manager_->GetCXLBuffer(req);
+std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	return topic_manager_->GetCXLBuffer(req, log, segment_header, logical_offset);
 }
 
 // This function returns TInode without inspecting if the topic exists

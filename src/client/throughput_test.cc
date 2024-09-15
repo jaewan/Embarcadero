@@ -255,6 +255,7 @@ class Buffer{
 				padded = header_.paddedSize;
 			}else{
 				LOG(ERROR) << "Jae handle dynamic message sizes:" << len << " size:" << header_size;
+				// have MessageHeader to each buf 
 				padded = len % 64;
 				if(padded){
 					padded = 64 - padded;
@@ -270,6 +271,7 @@ class Buffer{
 			}
 			memcpy((void*)((uint8_t*)bufs[bufIdx].buffer + bufs[bufIdx].tail), &header_, header_size);
 			memcpy((void*)((uint8_t*)bufs[bufIdx].buffer + bufs[bufIdx].tail + header_size), msg, len);
+			//std::atomic_thread_fence(std::memory_order_release);
 			bufs[bufIdx].tail += padded;
 			return true;
 		}
@@ -279,6 +281,7 @@ class Buffer{
 				std::this_thread::yield();
 			}
 			size_t head = bufs[bufIdx].head;
+			//std::atomic_thread_fence(std::memory_order_acquire);
 			size_t tail = bufs[bufIdx].tail;
 			len = tail - head;
 			bufs[bufIdx].head = tail;
@@ -335,10 +338,9 @@ class Client{
 			LOG(INFO) << "Destructed Client";
 		};
 
-		void Init(char topic[TOPIC_NAME_SIZE], int ack_level, int order){
+		void Init(char topic[TOPIC_NAME_SIZE], int ack_level){
 			memcpy(topic_, topic, TOPIC_NAME_SIZE);
 			ack_level_ = ack_level;
-			order_ = order;
 			ack_port_ = GenerateRandomNum();
 			ack_thread_ = std::thread([this](){
 					this->EpollAckThread();
@@ -388,6 +390,7 @@ class Client{
 		}
 
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
+			seq_type_ = seq_type;
 			grpc::ClientContext context;
 			heartbeat_system::CreateTopicRequest create_topic_req;;
 			heartbeat_system::CreateTopicResponse create_topic_reply;;
@@ -420,11 +423,11 @@ class Client{
 		absl::Mutex mutex_;
 		char topic_[TOPIC_NAME_SIZE];
 		int ack_level_;
-		int order_;
 		int ack_port_;
 		std::vector<std::thread> threads_;
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
+		SequencerType seq_type_;
 
 		void EpollAckThread(){
 			if(ack_level_ != 2)
@@ -624,7 +627,6 @@ class Client{
 			shake.client_id = client_id_;
 			memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
 			shake.ack = ack_level_;
-			shake.client_order = order_;
 			shake.port = ack_port_;
 			shake.size = message_size_ + sizeof(Embarcadero::MessageHeader);
 
@@ -663,10 +665,37 @@ class Client{
 			while(!shutdown_){
 				size_t len;
 				void *msg = pubQue_.Read(pubQuesIdx, len);
-				if(len == 0)
+				if(len == 0){
 					break;
+				}
 				Embarcadero::BatchHeader batch_header;
 				batch_header.total_size = len;
+				batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize;
+				/*
+				if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
+					Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader *)msg;
+					while(header->paddedSize == 0){
+						VLOG(3) << "client_order:" << header->client_order << " size is 0";
+						break;
+						std::this_thread::yield();
+					}
+					//batch_header.num_msg = len/1088;
+					size_t off = 0;
+					while(off < len){
+						batch_header.num_msg++;
+						while(header->paddedSize == 0){
+							std::this_thread::yield();
+						}
+						header = (Embarcadero::MessageHeader *)((uint8_t*)header + header->paddedSize);
+						while(header->paddedSize == 0){
+						VLOG(3) << "client_order:" << header->client_order << " size is 0";
+						break;
+							std::this_thread::yield();
+						}
+						off += header->paddedSize;
+					}
+				}
+				*/
 
 				ssize_t bytesSent = send(sock, (uint8_t*)(&batch_header), sizeof(Embarcadero::BatchHeader), 0);
 				if(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
@@ -989,7 +1018,7 @@ class Subscriber{
 
 					//Create a connection by Sending a Sub request
 					Embarcadero::EmbarcaderoReq shake;
-					shake.client_order = 0;
+					shake.num_msg = 0;
 					shake.client_id = client_id_;
 					shake.last_addr = 0;
 					shake.client_req = Embarcadero::Subscribe;
@@ -1095,7 +1124,7 @@ class Subscriber{
 			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
 			LOG(INFO) << "Client Created" ;
 			c.CreateNewTopic(topic, order, seq_type);
-			c.Init(topic, ack_level, order);
+			c.Init(topic, ack_level);
 			auto start = std::chrono::high_resolution_clock::now();
 
 			for(size_t i=0; i<n; i++){
@@ -1148,7 +1177,7 @@ class Subscriber{
 			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
 			c.CreateNewTopic(topic, order, seq_type);
 			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
-			c.Init(topic, ack_level, order);
+			c.Init(topic, ack_level);
 
 			auto start = std::chrono::high_resolution_clock::now();
 			for(size_t i=0; i<n; i++){
@@ -1181,7 +1210,7 @@ class Subscriber{
 			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
 			c.CreateNewTopic(topic, order, seq_type);
 			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
-			c.Init(topic, ack_level, order);
+			c.Init(topic, ack_level);
 
 			auto start = std::chrono::high_resolution_clock::now();
 			for(size_t i=0; i<n; i++){
@@ -1242,10 +1271,10 @@ class Subscriber{
 				return -1;
 			}
 
-			//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			//SubscribeThroughputTest(total_message_size, message_size, order);
+			PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+			SubscribeThroughputTest(total_message_size, message_size, order);
 			//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+			//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
 			return 0;
 		}
