@@ -104,13 +104,13 @@ int GetNonblockingSock(char *broker_address, int port, bool send = true){
 
 	int flag = 1; // Enable the option
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-		LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed";
+		LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed, closing sock=" << sock;
 		close(sock);
 		return -1;
 	}
 
 	if(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
-		LOG(ERROR) << "setsockopt error";
+		LOG(ERROR) << "setsockopt error, closing sock=" << sock;
 		close(sock);
 		return -1;
 	}
@@ -118,19 +118,19 @@ int GetNonblockingSock(char *broker_address, int port, bool send = true){
 	int BufferSize = 16 * 1024 * 1024;
 	if(send){
 		if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &BufferSize, sizeof(BufferSize)) == -1) {
-			LOG(ERROR) << "setsockopt SNDBUf failed";
+			LOG(ERROR) << "setsockopt SNDBUf failed, closing sock=" << sock;
 			close(sock);
 			return -1;
 		}
 		// Enable zero-copy
 		if (setsockopt(sock, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
-			LOG(ERROR) << "setsockopt(SO_ZEROCOPY) failed";
+			LOG(ERROR) << "setsockopt(SO_ZEROCOPY) failed, closing sock=" << sock;
 			close(sock);
 			return -1;
 		}
 	}else{
 		if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &BufferSize, sizeof(BufferSize)) == -1) {
-			LOG(ERROR) << "setsockopt RCVBUf failed";
+			LOG(ERROR) << "setsockopt RCVBUf failed, closing sock=" << sock;
 			close(sock);
 			return -1;
 		}
@@ -144,7 +144,7 @@ int GetNonblockingSock(char *broker_address, int port, bool send = true){
 
 	if (connect(sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
 		if (errno != EINPROGRESS) {
-			LOG(ERROR) << "Connect failed to addr:" << broker_address << " " << strerror(errno);
+			LOG(ERROR) << "Connect failed to addr:" << broker_address << " " << strerror(errno) << ", closing sock=" << sock;
 			close(sock);
 			return -1;
 		}
@@ -305,8 +305,8 @@ class Client{
 	public:
 		Client(std::string head_addr, std::string port, int num_threads, size_t message_size, size_t queueSize, bool fixed_batch_size):
 			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0),
-			client_id_(GenerateRandomNum()), num_threads_(num_threads), message_size_(message_size),
-			pubQue_(num_threads, queueSize, client_id_, message_size), fixed_batch_size_(fixed_batch_size) {
+			client_id_(GenerateRandomNum()), num_threads_(num_threads), fixed_batch_size_(fixed_batch_size), message_size_(message_size),
+			pubQue_(num_threads, queueSize, client_id_, message_size) {
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				nodes_[0] = head_addr+":"+std::to_string(PORT);
@@ -352,7 +352,7 @@ class Client{
 				// *********** Initiate Shake ***********
 				int efd = epoll_create1(0);
 				if(efd < 0){
-					LOG(ERROR) << "Publish Thread epoll_create1 failed:" << strerror(errno);
+					LOG(ERROR) << "Publish Thread epoll_create1 failed:" << strerror(errno) << ", closing sock=" << sock;
 					close(sock);
 					return;
 				}
@@ -360,7 +360,7 @@ class Client{
 				event.data.fd = sock;
 				event.events = EPOLLOUT;
 				if(epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event)){
-					LOG(ERROR) << "epoll_ctl failed:" << strerror(errno);
+					LOG(ERROR) << "epoll_ctl failed:" << strerror(errno) << ", closing sock=" << sock << ", efd=" << efd;
 					close(sock);
 					close(efd);
 				}
@@ -385,7 +385,7 @@ class Client{
 							if (bytesSent <= 0) {
 								bytesSent = 0;
 								if (errno != EAGAIN && errno != EWOULDBLOCK) {
-									LOG(ERROR) << "send failed:" << strerror(errno);
+									LOG(ERROR) << "send failed:" << strerror(errno) << ", closing sock=" << sock << ", efd=" << efd;
 									running = false;
 									close(sock);
 									close(efd);
@@ -504,7 +504,7 @@ class Client{
 
 			int flag = 1;
 			if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) < 0) {
-				std::cerr << "setsockopt(SO_REUSEADDR) failed\n";
+				LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed, closing sock=" << server_sock;
 				close(server_sock);
 				return;
 			}
@@ -518,20 +518,20 @@ class Client{
 			server_addr.sin_addr.s_addr = INADDR_ANY;
 
 			if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-				std::cerr << "Bind failed\n";
+				LOG(ERROR) << "Bind failed, closing sock=" << server_sock;
 				close(server_sock);
 				return;
 			}
 
 			if (listen(server_sock, SOMAXCONN) < 0) {
-				std::cerr << "Listen failed\n";
+				LOG(ERROR) << "Listen failed, , closing sock=" << server_sock;
 				close(server_sock);
 				return;
 			}
 
 			int epoll_fd = epoll_create1(0);
 			if (epoll_fd == -1) {
-				std::cerr << "Failed to create epoll file descriptor\n";
+				LOG(ERROR) << "Failed to create epoll file descriptor, closing sock=" << server_sock;
 				close(server_sock);
 				return;
 			}
@@ -540,7 +540,7 @@ class Client{
 			event.events = EPOLLIN;
 			event.data.fd = server_sock;
 			if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_sock, &event) == -1) {
-				std::cerr << "Failed to add server socket to epoll\n";
+				LOG(ERROR) << "Failed to add server socket to epoll, closing sock=" << server_sock << ", efd=" << epoll_fd;
 				close(server_sock);
 				close(epoll_fd);
 				return;
@@ -571,7 +571,7 @@ class Client{
 						event.events = EPOLLIN | EPOLLET;
 						event.data.fd = client_sock;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
-							std::cerr << "Failed to add client socket to epoll\n";
+							LOG(ERROR) << "Failed to add client socket to epoll, closing sock=" << client_sock;
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 							close(client_sock);
 						} else {
@@ -591,14 +591,14 @@ class Client{
 
 						if (bytes_received == 0) {
 							// Connection closed by client
-							std::cout << "Client disconnected. Total bytes received: " << total_received << std::endl;
+							LOG(ERROR) << "Client disconnected. Total bytes received: " << total_received << ", closing sock=" << client_sock;
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 							close(client_sock);
 							client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
 						} else if (bytes_received == -1) {
 							if (errno != EAGAIN && errno != EWOULDBLOCK) {
 								// Error occurred
-								std::cerr << "recv error: " << strerror(errno) << std::endl;
+								LOG(ERROR) << "recv error: " << strerror(errno) << ", closing sock=" << client_sock;
 								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 								close(client_sock);
 								client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
@@ -623,7 +623,7 @@ class Client{
 			int server_sock = socket(AF_INET, SOCK_STREAM, 0);
 			int flag = 1;
 			if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-				LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed";
+				LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed, closing sock=" << server_sock;
 				close(server_sock);
 				return ;
 			}
@@ -636,13 +636,13 @@ class Client{
 			server_addr.sin_addr.s_addr = INADDR_ANY;
 
 			if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-				LOG(ERROR) << "Bind failed";
+				LOG(ERROR) << "Bind failed, closing sock=" << server_sock;
 				close(server_sock);
 				return ;
 			}
 
 			if (listen(server_sock, SOMAXCONN) < 0) {
-				LOG(ERROR) << "Listen failed";
+				LOG(ERROR) << "Listen failed, closing sock=" << server_sock;
 				close(server_sock);
 				return ;
 			}
@@ -715,7 +715,7 @@ class Client{
 						}
 						zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL<<16); // Cap backoff at 1000ms
 					} else if (bytesSent < 0) {
-						LOG(ERROR) << "send failed: " << strerror(errno);
+						LOG(ERROR) << "send failed: " << strerror(errno) << ", closing sock=" << sock << ", efd=" << efd;
 						close(sock);
 						close(efd);
 						return;
@@ -723,6 +723,7 @@ class Client{
 
 				}
 			}
+			//LOG(INFO) << "PublishThread complete, closing sock=" << sock << ", efd=" << efd;
 			close(sock);
 			close(efd);
 		}
@@ -949,7 +950,7 @@ class Subscriber{
 						if (events[n].events & EPOLLIN) {
 							int fd = events[n].data.fd;
 							//int idx = messages_idx_.load();
-							int idx = 0;
+							//int idx = 0;
 							struct msgIdx *m = fd_to_msg[fd].second; // &messages_[idx][fd_to_msg_idx[fd]].second;
 							void* buf = fd_to_msg[fd].first;// messages_[idx][fd_to_msg_idx[fd]].first;
 																							// This ensures the receive never goes out of the boundary
@@ -963,7 +964,7 @@ class Subscriber{
 									m->timestamps.emplace_back(m->offset, std::chrono::steady_clock::now());
 								}
 							} else if (bytes_received == 0) {
-								LOG(ERROR) << "Server " << fd << " disconnected";
+								LOG(ERROR) << "Server disconnected, closing sock=" << fd;
 								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
 								close(fd);
 								//TODO(Jae) remove from other data structures
@@ -995,7 +996,7 @@ class Subscriber{
 					std::pair<void*, msgIdx*> msg(static_cast<void*>(calloc(buffer_size_, sizeof(char))), (msgIdx*)malloc(sizeof(msgIdx)));
 					// This is for client retrieval, double buffer
 					//std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(broker_id));
-					int idx = messages_[0].size();
+					//int idx = messages_[0].size();
 					messages_[0].push_back(msg);
 					//messages_[1].push_back(msg1);
 					fd_to_msg.insert({sock, msg});;
@@ -1007,9 +1008,9 @@ class Subscriber{
 					shake.last_addr = 0;
 					shake.client_req = Embarcadero::Subscribe;
 					memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
-					int ret = send(sock, &shake, sizeof(shake), 0);
-					if(ret < sizeof(shake)){
-						LOG(ERROR) << "fd:" << sock << " addr:" << addr << " id:" << broker_id  << 
+					ssize_t ret = send(sock, &shake, sizeof(shake), 0);
+					if(ret < 0 || (unsigned long int)ret < sizeof(shake)){
+						LOG(ERROR) << "closing fd:" << sock << " addr:" << addr << " id:" << broker_id  << 
 							"sent:" << ret<< "/" <<sizeof(shake) 	<< " failed:" << strerror(errno);
 						close(sock);
 						continue;
@@ -1019,7 +1020,7 @@ class Subscriber{
 					ev.events = EPOLLIN;
 					ev.data.fd = sock;
 					if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1) {
-						LOG(ERROR) << "Failed to add new server to epoll";
+						LOG(ERROR) << "Failed to add new server to epoll, closing sock=" << sock;
 						close(sock);
 					}
 					subscribe_threads_.emplace_back(&Subscriber::SubscribeThread, this, epoll_fd, fd_to_msg);
