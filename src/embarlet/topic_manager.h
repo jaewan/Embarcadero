@@ -34,20 +34,18 @@ class Topic{
 		Topic(const Topic &) = delete;
 		Topic& operator=(const Topic &) = delete;
 
-		void PublishToCXL(PublishRequest &req){
-			(this->*WriteToCXLFunc)(req);
-		}
-
 		bool GetMessageAddr(size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
-		void* GetCXLBuffer(PublishRequest &req);
+		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+			return (this->*GetCXLBufferFunc)(req, log, segment_header, logical_offset);
+		}
 
 	private:
 		void CombinerThread();
-		void (Topic::*WriteToCXLFunc)(PublishRequest &req);
-		void WriteToCXL(PublishRequest &req);
-		void WriteToCXLWithMutex(PublishRequest &req);
+		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		std::string topic_name_;
@@ -65,6 +63,8 @@ class Topic{
 		void* first_message_addr_;
 		absl::Mutex mutex_;
 		absl::Mutex written_mutex_;
+		std::atomic<size_t> kafka_logical_offset_{0};
+		absl::flat_hash_map<size_t, size_t> written_messages_range_;
 
 		//TInode cache
 		void* ordered_offset_addr_;
@@ -88,8 +88,7 @@ class TopicManager{
 		}
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
-		void PublishToCXL(PublishRequest &req);
-		void* GetCXLBuffer(PublishRequest &req);
+		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 

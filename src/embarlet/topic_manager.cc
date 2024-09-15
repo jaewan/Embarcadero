@@ -96,7 +96,15 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
 
-	//_mm_clflushopt(tinode);
+/*
+#ifdef __INTEL__
+    _mm_clflushopt(&tinode->offsets[broker_id_]);
+#elif defined(__AMD__)
+    _mm_clwb(&tinode->offsets[broker_id_]);
+#else
+		LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
+#endif
+*/
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
 			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
@@ -128,7 +136,15 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 	tinode->seq_type = seq_type;
 	memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
 
-	//_mm_clflushopt(tinode);
+/*
+#ifdef __INTEL__
+    _mm_clflushopt(&tinode->offsets[broker_id_]);
+#elif defined(__AMD__)
+    _mm_clwb(&tinode->offsets[broker_id_]);
+#else
+		LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
+#endif
+*/
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
 			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
@@ -151,7 +167,7 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequen
 void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
-void* TopicManager::GetCXLBuffer(PublishRequest &req){
+std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
@@ -163,32 +179,12 @@ void* TopicManager::GetCXLBuffer(PublishRequest &req){
 				return nullptr;
 			}
 		}else{
-			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic
+			LOG(ERROR) << "[GetCXLBuffer] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic
 			<< " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
 			return nullptr;
 		}
 	}
-	return topic_itr->second->GetCXLBuffer(req);
-}
-
-void TopicManager::PublishToCXL(PublishRequest &req){
-	auto topic_itr = topics_.find(req.topic);
-	if (topic_itr == topics_.end()){
-		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
-			// The topic was created from another broker
-			CreateNewTopicInternal(req.topic);
-			topic_itr = topics_.find(req.topic);
-			if(topic_itr == topics_.end()){
-				LOG(ERROR) << "Topic Entry was not created Something is wrong";
-				return;
-			}
-		}else{
-			LOG(ERROR) << "[PublishToCXL] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic
-			<< " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
-			return;
-		}
-	}
-	topic_itr->second->PublishToCXL(req);
+	return topic_itr->second->GetCXLBuffer(req, log, segment_header, logical_offset);
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -220,9 +216,9 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
 		if(seq_type == KAFKA){
-			WriteToCXLFunc = &Topic::WriteToCXLWithMutex;
+			GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
 		}else{
-			WriteToCXLFunc = &Topic::WriteToCXL;
+			GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
 		}
 	}
 
@@ -276,88 +272,66 @@ void Topic::Combiner(){
 	combiningThreads_.emplace_back(&Topic::CombinerThread, this);
 }
 
-// MessageHeader is already included from network manager
-// For performance (to not have any mutex) have a separate combiner to give logical offsets  to the messages
-void Topic::WriteToCXL(PublishRequest &req){
-	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
-	size_t msgSize = req.total_size;
-
-	unsigned long long int log = log_addr_.fetch_add(msgSize);
-	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
-		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
-		//TODO(Jae) Finish below segment boundary crossing code
-		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
-			// Allocate a new segment
-			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
-			//segment_metadata = (unsigned long long int)segment_metadata_;
-		}else{
-			// Wait for the first thread that crossed the segment to allocate a new segment
-			//segment_metadata = (unsigned long long int)segment_metadata_;
-		}
-	}
-	memcpy_nt((void*)log, req.payload_address, msgSize);
-}
-
-void* Topic::GetCXLBuffer(PublishRequest &req){
-	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
-	size_t msgSize = req.total_size;
-	unsigned long long int log = log_addr_.fetch_add(msgSize);
-	if(segment_metadata + SEGMENT_SIZE <= log + msgSize){
-		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
-		//TODO(Jae) Finish below segment boundary crossing code
-		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
-			// Allocate a new segment
-			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
-			//segment_metadata = (unsigned long long int)segment_metadata_;
-		}else{
-			// Wait for the first thread that crossed the segment to allocate a new segment
-			//segment_metadata = (unsigned long long int)segment_metadata_;
-		}
-	}
-	return (void*)log;
-}
-
-void Topic::WriteToCXLWithMutex(PublishRequest &req){
-	static const size_t msg_header_size = sizeof(struct MessageHeader);
-	unsigned long long int log;
-	size_t logical_offset;
-	bool new_segment_alloced = false;
-
-	MessageHeader *header = (MessageHeader*)req.payload_address;
-	size_t msgSize = req.total_size;
-
+std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	size_t start_logical_offset;
 	{
-		absl::MutexLock lock(&mutex_);
-		log = log_addr_;
-		log_addr_ += msgSize;
-		logical_offset = logical_offset_;
-		logical_offset_++;
-		if((unsigned long long int)current_segment_ + SEGMENT_SIZE <= log_addr_){
-			LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
-			//TODO(Jae) Finish below segment boundary crossing code
-			new_segment_alloced = true;
-		}
-	}
-	header->segment_header = current_segment_;
-	header->logical_offset = logical_offset;
-	if(new_segment_alloced){
+	absl::MutexLock lock(&mutex_);
+	log = (void*)(log_addr_.fetch_add(req.total_size));
+	logical_offset = logical_offset_;
+	segment_header = current_segment_;
+	start_logical_offset = logical_offset_;
+	logical_offset_+= req.num_messages;
+	//TODO(Jae) This does not work with dynamic message size
+	(void*)(log_addr_.load() - ((MessageHeader*)log)->paddedSize);
+	if((unsigned long long int)current_segment_ + SEGMENT_SIZE <= log_addr_){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
 		//TODO(Jae) Finish below segment boundary crossing code
-		header->next_msg_diff = header->paddedSize;
-	}else
-		header->next_msg_diff = header->paddedSize;
-
-	memcpy_nt((void*)log, req.payload_address, msgSize);
-
+	}
+	}
+	return [this, start_logical_offset](void* log, size_t logical_offset)
 	{
 		absl::MutexLock lock(&written_mutex_);
-		if(written_logical_offset_ == (size_t)-1 || written_logical_offset_ < logical_offset){
-			written_logical_offset_ = logical_offset;
-			written_physical_addr_ = (void*)log;
-			tinode_->offsets[broker_id_].written = logical_offset;
-			(*(unsigned long long int*)current_segment_) =
-				(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
+		if(kafka_logical_offset_.load() != start_logical_offset){
+			written_messages_range_[start_logical_offset] = logical_offset;
+		}else{
+			size_t start = start_logical_offset;
+			bool has_next_messages_written = false;
+			do{
+				has_next_messages_written = false;
+				written_logical_offset_ = logical_offset;
+				written_physical_addr_ = (void*)log;
+				tinode_->offsets[broker_id_].written = logical_offset;
+				(*(unsigned long long int*)current_segment_) =
+					(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
+				kafka_logical_offset_.store(logical_offset+1);
+				if(written_messages_range_.contains(logical_offset+1)){
+					start = logical_offset+1;
+					logical_offset = written_messages_range_[start];
+					written_messages_range_.erase(start);
+					has_next_messages_written = true;
+				}
+			}while(has_next_messages_written);
+		}
+	};
+}
+
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
+	size_t msgSize = req.total_size;
+	log = (void*)(log_addr_.fetch_add(msgSize));
+	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+		//TODO(Jae) Finish below segment boundary crossing code
+		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
+			// Allocate a new segment
+			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}else{
+			// Wait for the first thread that crossed the segment to allocate a new segment
+			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
+	return nullptr;
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message
@@ -372,6 +346,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		void* &last_addr, void* &messages, size_t &messages_size){
 	size_t combined_offset = written_logical_offset_;
 	void* combined_addr = written_physical_addr_;
+
 	if(order_ > 0){
 		combined_offset = tinode_->offsets[broker_id_].ordered;
 		combined_addr = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].ordered_offset;
@@ -383,7 +358,6 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
 	if(last_addr != nullptr){
-	
 		while((struct MessageHeader*)start_msg_header->next_msg_diff == 0){
 			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
 			std::this_thread::yield();
@@ -415,7 +389,6 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
 	}
-
 	return true;
 }
 

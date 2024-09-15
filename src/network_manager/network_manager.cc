@@ -189,8 +189,12 @@ void NetworkManager::ReqReceiveThread(){
 						}
 						to_read = batch_header.total_size;
 						pub_req.total_size = batch_header.total_size;
+						pub_req.num_messages = batch_header.num_msg;
 						// TODO(Jae) Send -1 to ack if this returns nullptr
-						void* buf = cxl_manager_->GetCXLBuffer(pub_req);
+						void*  segment_header;
+						void*  buf;
+						size_t logical_offset;
+						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset);
 						size_t read = 0;
 						MessageHeader* header;
 						size_t header_size = sizeof(MessageHeader);
@@ -211,6 +215,24 @@ void NetworkManager::ReqReceiveThread(){
 								read += bytes_to_next_header;
 								to_read -= bytes_to_next_header;
 								bytes_to_next_header = header->paddedSize;
+								if(kafka_callback){
+									header->logical_offset = logical_offset;
+									if(segment_header == nullptr){
+										LOG(ERROR) << "segment_header is null!!!!!!!!";
+									}
+									header->segment_header = segment_header;
+									//TODO(Jae) This imple does not support multi segments
+									header->next_msg_diff = header->paddedSize;
+#ifdef __INTEL__
+									_mm_clflushopt(header);
+#elif defined(__AMD__)
+									_mm_clwb(header);
+#else
+										LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
+#endif
+									//kafka_callback((void*)header, logical_offset);
+									logical_offset++;
+								}
 							}
 							read += bytes_read;
 							to_read -= bytes_read;
@@ -219,6 +241,9 @@ void NetworkManager::ReqReceiveThread(){
 							if(to_read == 0){
 								break;
 							}	
+						}
+						if(kafka_callback){
+							kafka_callback((void*)header, logical_offset-1);
 						}
 					}
 					close(req.client_socket);
@@ -260,7 +285,7 @@ void NetworkManager::ReqReceiveThread(){
 					absl::MutexLock lock(&sub_mu_);
 					if(!sub_state_.contains(shake.client_id)){
 						auto state = std::make_unique<SubscriberState>();
-						state->last_offset = shake.client_order;
+						state->last_offset = shake.num_msg;
 						state->last_addr = shake.last_addr;
 						state->initialized = true;
 						sub_state_[shake.client_id] = std::move(state);
