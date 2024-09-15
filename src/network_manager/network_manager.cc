@@ -264,9 +264,9 @@ void NetworkManager::ReqReceiveThread(){
 							sub_state_[client_id]->last_offset = shake.client_order;
 							sub_state_[client_id]->last_addr = shake.last_addr;
 							sub_state_[client_id]->initialized = true;
-							LOG(ERROR) << "CREATED STATE FOR client_id=" << client_id;
-							LOG(ERROR) << "Is created?? " << sub_state_.contains(client_id);
-							printf("MY SUB_STATE prt=%p\n", &sub_state_);
+							//LOG(ERROR) << "CREATED STATE FOR client_id=" << client_id;
+							//LOG(ERROR) << "Is created?? " << sub_state_.contains(client_id);
+							//printf("MY SUB_STATE prt=%p\n", &sub_state_);
 						}
 					}
 					SubscribeNetworkThread(req.client_socket, efd, shake.topic, client_id);
@@ -291,10 +291,12 @@ void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, uint
 			msg = req.msg;
 			messages_size = req.len;
 		}else{
+			/*
 			if(!sub_state_.contains(client_id)) {
 				printf("MY SUB_STATE prt=%p\n", &sub_state_);
 				LOG(ERROR) << "WHY IS THIS HAPPENING?? client_id=" << client_id;
 			}
+			*/
 			absl::MutexLock lock(&sub_state_[client_id]->mu);
 			if(cxl_manager_->GetMessageAddr(topic, sub_state_[client_id]->last_offset, sub_state_[client_id]->last_addr, msg, messages_size)){
 				while(messages_size > zero_copy_send_limit){
