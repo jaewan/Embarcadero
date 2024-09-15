@@ -157,7 +157,6 @@ void NetworkManager::ReqReceiveThread(){
 							ack_connections_[shake.client_id] = ack_fd;
 						}
 					}
-					//size_t READ_SIZE = shake.size;
 					size_t READ_SIZE = ZERO_COPY_SEND_LIMIT;
 					to_read = READ_SIZE;
 
@@ -165,7 +164,8 @@ void NetworkManager::ReqReceiveThread(){
 					struct PublishRequest pub_req;
 					memcpy(pub_req.topic, shake.topic, TOPIC_NAME_SIZE);
 					pub_req.acknowledge = shake.ack;
-					pub_req.client_socket = ack_fd;
+					pub_req.connection_id = shake.connection_id;
+					pub_req.num_brokers = shake.num_msg; //shake.num_msg used as num_brokers at pub
 
 					BatchHeader batch_header;
 					while(running){
@@ -190,6 +190,7 @@ void NetworkManager::ReqReceiveThread(){
 						to_read = batch_header.total_size;
 						pub_req.total_size = batch_header.total_size;
 						pub_req.num_messages = batch_header.num_msg;
+						pub_req.batch_seq = batch_header.batch_seq;
 						// TODO(Jae) Send -1 to ack if this returns nullptr
 						void*  segment_header;
 						void*  buf;

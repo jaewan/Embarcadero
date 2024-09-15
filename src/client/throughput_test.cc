@@ -215,8 +215,8 @@ int GenerateRandomNum(){
 
 class Buffer{
 	public:
-		Buffer(size_t num_buf, size_t total_buf_size, int client_id, size_t message_size):
-			num_buf_(num_buf){
+		Buffer(size_t num_buf, size_t total_buf_size, int client_id, size_t message_size, int order=0):
+			num_buf_(num_buf), order_(order){
 				bufs = (struct Buf*)malloc(sizeof(struct Buf) * num_buf);
 				size_t allocated;
 				// 4K is a buffer space as message can go over
@@ -277,15 +277,26 @@ class Buffer{
 		}
 
 		void* Read(int bufIdx, size_t &len ){
-			while(!shutdown_ && bufs[bufIdx].tail <= bufs[bufIdx].head){
-				std::this_thread::yield();
+			if(order_ == 3){
+				while(!shutdown_ && bufs[bufIdx].tail - bufs[bufIdx].head < BATCH_SIZE){
+					std::this_thread::yield();
+				}
+				size_t head = bufs[bufIdx].head;
+				//std::atomic_thread_fence(std::memory_order_acquire);
+				len = BATCH_SIZE;
+				bufs[bufIdx].head += BATCH_SIZE;
+				return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
+			}else{
+				while(!shutdown_ && bufs[bufIdx].tail <= bufs[bufIdx].head){
+					std::this_thread::yield();
+				}
+				size_t head = bufs[bufIdx].head;
+				//std::atomic_thread_fence(std::memory_order_acquire);
+				size_t tail = bufs[bufIdx].tail;
+				len = tail - head;
+				bufs[bufIdx].head = tail;
+				return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
 			}
-			size_t head = bufs[bufIdx].head;
-			//std::atomic_thread_fence(std::memory_order_acquire);
-			size_t tail = bufs[bufIdx].tail;
-			len = tail - head;
-			bufs[bufIdx].head = tail;
-			return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
 		}
 
 		void ReturnReads(){
@@ -300,6 +311,7 @@ class Buffer{
 			size_t len;
 		} *bufs;
 		size_t num_buf_;
+		int order_;
 		bool shutdown_ = false;
 		Embarcadero::MessageHeader header_;
 };
@@ -354,7 +366,7 @@ class Client{
 		void Publish(char* message, size_t len){
 			static size_t i = 0;
 			static size_t j = 0;
-			const static size_t batch_size = 1UL<<19;
+			const static size_t batch_size = BATCH_SIZE;
 			size_t n = batch_size/(len+64);
 			pubQue_.Write(i, client_order_, message, len);
 			j++;
@@ -628,7 +640,8 @@ class Client{
 			memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
 			shake.ack = ack_level_;
 			shake.port = ack_port_;
-			shake.size = message_size_ + sizeof(Embarcadero::MessageHeader);
+			shake.connection_id = pubQuesIdx;
+			shake.num_msg = nodes_.size(); // shake.num_msg used as num brokers at pub
 
 			struct epoll_event events[10]; // Adjust size as needed
 			bool running = true;
@@ -662,6 +675,7 @@ class Client{
 			std::vector<double> send_times;
 			std::vector<double> poll_times;
 			thread_count_.fetch_add(1);
+			size_t batch_seq = pubQuesIdx;
 			while(!shutdown_){
 				size_t len;
 				void *msg = pubQue_.Read(pubQuesIdx, len);
@@ -671,6 +685,8 @@ class Client{
 				Embarcadero::BatchHeader batch_header;
 				batch_header.total_size = len;
 				batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize;
+				batch_header.batch_seq = batch_seq;
+				batch_seq += num_threads_;
 				/*
 				if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
 					Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader *)msg;
@@ -1270,9 +1286,19 @@ class Subscriber{
 				LOG(ERROR) << "CGroup core throttle is wrong";
 				return -1;
 			}
+			if(order == 3){
+				if(BATCH_SIZE % (message_size)){
+					LOG(ERROR) << "Adjust message size!!";
+					return 0;
+				}
+				if(total_message_size % (num_threads*BATCH_SIZE)){
+					LOG(ERROR) << "Adjust total message size!!";
+					return 0;
+				}
+			}
 
 			PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			SubscribeThroughputTest(total_message_size, message_size, order);
+			//SubscribeThroughputTest(total_message_size, message_size, order);
 			//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 			//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 

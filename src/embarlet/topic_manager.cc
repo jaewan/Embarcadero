@@ -210,6 +210,7 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 	cxl_addr_(cxl_addr),
 	logical_offset_(0),
 	written_logical_offset_((size_t)-1),
+	batch_seq_q_(order == 3 ? 10000 : 1),//only make 10,000 when order is 3. Or make the que as a pointer
 	current_segment_(segment_metadata){
 		log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
 		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
@@ -218,7 +219,11 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 		if(seq_type == KAFKA){
 			GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
 		}else{
-			GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
+			if(order_ == 3){
+				GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
+			}else{
+				GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
+			}
 		}
 	}
 
@@ -313,6 +318,29 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 			}while(has_next_messages_written);
 		}
 	};
+}
+
+std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	std::shared_ptr<std::atomic<size_t>> batch_seq;
+	{
+		absl::MutexLock lock(&mutex_);
+		auto it = order3_client_batch_.find(req.client_id);
+		if (it == order3_client_batch_.end()) {
+			batch_seq = std::make_shared<std::atomic<size_t>>(broker_id_);
+			order3_client_batch_.emplace(req.client_id, batch_seq);
+		} else {
+			batch_seq = it->second;
+		}
+	}
+	while(batch_seq->load() != req.batch_seq){
+		std::this_thread::yield();
+	}
+	batch_seq->fetch_add(req.num_brokers);
+	log = (void*)(log_addr_.fetch_add(req.total_size));
+	while(!batch_seq_q_.write(std::make_pair(req.client_id, req.batch_seq))){
+		std::this_thread::yield();
+	}
+	return nullptr;
 }
 
 std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){

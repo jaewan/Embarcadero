@@ -64,9 +64,10 @@ struct NonCriticalMessageHeader{
 	char _padding[64 - (sizeof(int) + sizeof(size_t) * 3 + sizeof(void*))]; 
 };
 
-struct BatchHeader{
+struct alignas(64) BatchHeader{
 	size_t total_size;
 	size_t num_msg;
+	size_t batch_seq;
 };
 
 
@@ -136,6 +137,7 @@ class CXLManager{
 		void CXLIOThread(int tid);
 		void Sequencer1(char* topic);
 		void Sequencer2(char* topic);
+		void Sequencer3(char* topic);
 };
 
 class ScalogSequencerService : public ScalogSequencer::Service {

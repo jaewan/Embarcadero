@@ -5,6 +5,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/synchronization/mutex.h"
+#include "folly/ProducerConsumerQueue.h"
 #include <glog/logging.h>
 
 #include <bits/stdc++.h>
@@ -40,11 +41,15 @@ class Topic{
 		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
 			return (this->*GetCXLBufferFunc)(req, log, segment_header, logical_offset);
 		}
+		bool GetBatchInfo(std::pair<size_t, size_t> &batch_info){
+			return batch_seq_q_.read(batch_info);
+		}
 
 	private:
 		void CombinerThread();
 		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
@@ -61,6 +66,8 @@ class Topic{
 		std::atomic<unsigned long long int> log_addr_;
 		//TODO(Jae) set this to nullptr if the sement is GCed
 		void* first_message_addr_;
+		folly::ProducerConsumerQueue<std::pair<size_t, size_t>> batch_seq_q_;
+		absl::flat_hash_map<size_t, std::shared_ptr<std::atomic<size_t>>> order3_client_batch_ ABSL_GUARDED_BY(mutex_);
 		absl::Mutex mutex_;
 		absl::Mutex written_mutex_;
 		std::atomic<size_t> kafka_logical_offset_{0};
