@@ -1271,10 +1271,10 @@ class Subscriber{
 				return -1;
 			}
 
-			PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			SubscribeThroughputTest(total_message_size, message_size, order);
+			//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+			//SubscribeThroughputTest(total_message_size, message_size, order);
 			//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+			LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
 			return 0;
 		}
