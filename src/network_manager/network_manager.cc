@@ -256,20 +256,17 @@ void NetworkManager::ReqReceiveThread(){
 						close(efd);
 					}
 
-					uint16_t client_id = shake.client_id;
 					{
 						absl::MutexLock lock(&sub_mu_);
-						if(!sub_state_.contains(client_id)){
-							sub_state_.try_emplace(client_id, std::make_unique<SubscriberState>());
-							sub_state_[client_id]->last_offset = shake.client_order;
-							sub_state_[client_id]->last_addr = shake.last_addr;
-							sub_state_[client_id]->initialized = true;
-							LOG(ERROR) << "CREATED STATE FOR client_id=" << client_id;
-							LOG(ERROR) << "Is created?? " << sub_state_.contains(client_id);
-							printf("MY SUB_STATE prt=%p\n", &sub_state_);
+						if(!sub_state_.contains(shake.client_id)){
+							auto state = std::make_unique<SubscriberState>();
+							state->last_offset = shake.client_order;
+							state->last_addr = shake.last_addr;
+							state->initialized = true;
+							sub_state_[shake.client_id] = std::move(state);
 						}
 					}
-					SubscribeNetworkThread(req.client_socket, efd, shake.topic, client_id);
+					SubscribeNetworkThread(req.client_socket, efd, shake.topic, shake.client_id);
 					close(req.client_socket);
 					close(efd);
 				}//end Subscribe
