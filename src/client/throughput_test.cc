@@ -390,7 +390,7 @@ class Client{
 				}
 
 				Embarcadero::EmbarcaderoReq shake = { 0 };
-				shake.client_req = Embarcadero::ClientRequestType::Publish;
+				shake.client_req = Embarcadero::Publish;
 				shake.client_id = client_id_;
 				memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
 				shake.ack = ack_level_;
