@@ -288,6 +288,22 @@ class Buffer{
 			return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
 		}
 
+		void* ReadExact(int bufIdx, size_t size){
+			while(!shutdown_ && bufs[bufIdx].tail <= bufs[bufIdx].head && bufs[bufIdx].tail - bufs[bufIdx].head < size){
+				std::this_thread::yield();
+			}
+			if (shutdown_) {
+				if (bufs[bufIdx].tail > bufs[bufIdx].head) {
+					LOG(ERROR) << "Buffer shutting down when there is still data in it....";
+				}
+				return NULL;
+			}
+
+			size_t head = bufs[bufIdx].head;
+			bufs[bufIdx].head += size;
+			return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
+		}
+
 		void ReturnReads(){
 			shutdown_ = true;
 		}
@@ -409,7 +425,7 @@ class Client{
 			assert(pub_efds_.size() == num_threads_);
 
 			for (int i=0; i < num_threads_; i++)
-				threads_.emplace_back(&Client::PublishThread, this, brokers_[i%brokers_.size()],  i, pub_fds_[i], pub_efds_[i]);
+				threads_.emplace_back(&Client::PublishThread, this, i);
 			while(thread_count_.load() != num_threads_){std::this_thread::yield();}
 			LOG(ERROR) << "Init finished.";
 			return;
@@ -671,7 +687,10 @@ class Client{
 			return;
 		}
 
-		void PublishThread(int broker_id, int pubQuesIdx, int sock, int efd){
+		void PublishThread(int pubQuesIdx){
+			int sock = pub_fds_[pubQuesIdx];
+			int efd = pub_efds_[pubQuesIdx];
+
 			std::vector<double> send_times;
 			std::vector<double> poll_times;
 			thread_count_.fetch_add(1);
