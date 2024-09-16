@@ -82,7 +82,7 @@ struct alignas(64) MessageHeader{
 	uint32_t client_order;
 	size_t size;
 	volatile size_t paddedSize; // This include message+padding+header size
-	uint32_t complete;
+	volatile uint32_t complete;
 };
 
 class CXLManager{

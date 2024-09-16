@@ -21,7 +21,7 @@ namespace Embarcadero{
 #define SCALOG_SEQ_PORT 50051
 #define NUM_MAX_BROKERS 4
 #define CXL_SIZE (1UL<<35)
-#define CXL_EMUL_SIZE (1UL<<34)
+#define CXL_EMUL_SIZE (1UL<<35)
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
 #define SEGMENT_SIZE (1UL << 34)
@@ -32,7 +32,8 @@ namespace Embarcadero{
 #define ZERO_COPY_SEND_LIMIT 1UL<<23
 #define MAX_MSG_SIZE 1UL << 20
 #define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
-#define BATCH_SIZE (1UL<<19)
+//#define BATCH_SIZE (1UL<<19)
+#define BATCH_SIZE  557056
 
 //********* Health check configs *********
 #define HEARTBEAT_INTERVAL 3 // in seconds
