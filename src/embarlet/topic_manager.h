@@ -46,6 +46,7 @@ class Topic{
 		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		std::string topic_name_;

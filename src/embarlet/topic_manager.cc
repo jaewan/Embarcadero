@@ -109,13 +109,13 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	if(tinode->seq_type != KAFKA)
+	// TODO(erika): should this be disabled for Corfu too?
+	if(tinode->seq_type != KAFKA) {
 		topics_[topic]->Combiner();
-
-		if (broker_id_ != 0 && tinode->seq_type == SCALOG){
-			cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
-		}
-
+	}
+	if (broker_id_ != 0 && tinode->seq_type == SCALOG){
+		cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
+	}
 	return tinode;
 }
 
@@ -217,7 +217,9 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 		ordered_offset_ = 0;
 		if(seq_type == KAFKA){
 			GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
-		}else{
+		} else if (seq_type == CORFU) {
+			GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
+		} else {
 			GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
 		}
 	}
@@ -316,6 +318,26 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 }
 
 std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
+	size_t msgSize = req.total_size;
+	log = (void*)(log_addr_.fetch_add(msgSize));
+	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+		//TODO(Jae) Finish below segment boundary crossing code
+		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
+			// Allocate a new segment
+			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}else{
+			// Wait for the first thread that crossed the segment to allocate a new segment
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}
+	}
+	return nullptr;
+}
+
+std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	LOG(ERROR) << "In CORFU GetCXLBuffer for batch_num=" << logical_offset;
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = req.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));
