@@ -350,7 +350,7 @@ class Client{
 		Client(std::string head_addr, std::string port, int num_threads, size_t message_size, size_t queueSize, bool fixed_batch_size):
 			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0),
 			client_id_(GenerateRandomNum()), num_threads_(num_threads), message_size_(message_size),
-			pubQue_(num_threads, queueSize, client_id_, message_size), fixed_batch_size_(fixed_batch_size), last_batch_ordered_(0) {
+			pubQue_(num_threads, queueSize, client_id_, message_size), fixed_batch_size_(fixed_batch_size), last_batch_ordered_(0), pub_sock_locks_(num_threads) {
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				nodes_[0] = head_addr+":"+std::to_string(PORT);
@@ -375,6 +375,13 @@ class Client{
 				ack_thread_.join();
 			if(cluster_probe_thread_.joinable())
 				cluster_probe_thread_.join();
+
+			for (auto &s : pub_fds_) {
+				close(s);
+			}
+			for (auto &e : pub_efds_) {
+				close(e);
+			}
 
 			LOG(INFO) << "Destructed Client";
 		};
@@ -538,6 +545,7 @@ class Client{
 		Buffer pubQue_;
 		bool fixed_batch_size_;
 		uint32_t last_batch_ordered_;
+		std::vector<absl::Mutex> pub_sock_locks_;
 
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::thread cluster_probe_thread_;
@@ -731,8 +739,9 @@ class Client{
 		}
 
 		void PublishThread(int pubQuesIdx){
-			int sock = pub_fds_[pubQuesIdx];
-			int efd = pub_efds_[pubQuesIdx];
+			int sock = -1;
+			int efd = -1;
+			size_t socket_idx = pubQuesIdx;
 
 			thread_count_.fetch_add(1);
 			while(!shutdown_){
@@ -763,7 +772,14 @@ class Client{
 					}
 					batch_header.batch_num = batch_order;
 					//LOG(INFO) << "BATCH SEQ NUM IS: " << batch_order << " (client_order=" << hdr->client_order << ")";
+					socket_idx = (pub_fds_.size() / brokers_.size() /* socker per broker */) * (/* round robin by batch num */batch_order % brokers_.size()) + /* pick broker socket by thread id */ pubQuesIdx % brokers_.size();
 				}
+
+				// We need a lock so that we don't interleave batches
+				absl::MutexLock lock(&pub_sock_locks_[socket_idx]);
+				LOG(INFO) << "Got socket idx " << socket_idx << " for batch num " << batch_header.batch_num;
+				sock = pub_fds_[socket_idx];
+				efd = pub_efds_[socket_idx];
 				
 				/*
 				if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
@@ -833,8 +849,9 @@ class Client{
 
 				}
 			}
-			close(sock);
-			close(efd);
+			// Since there is no one-to-one relationship of threads to sockets, do not close them here.
+			//close(sock);
+			//close(efd);
 			LOG(ERROR) << "PublishThread completed";
 		}
 
