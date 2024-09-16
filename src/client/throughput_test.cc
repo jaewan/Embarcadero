@@ -1373,6 +1373,10 @@ class Subscriber{
 				return -1;
 			}
 
+			if (!fixed_batch_size && seq_type == heartbeat_system::SequencerType::CORFU) {
+				LOG(ERROR) << "CORFU sequencer requires --fixed_batch_size option";
+				return -1;
+			}
 			//PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, fixed_batch_size);
 			//SubscribeThroughputTest(total_message_size, message_size, order);
 			//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, fixed_batch_size);
