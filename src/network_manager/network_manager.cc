@@ -101,7 +101,7 @@ void NetworkManager::ReqReceiveThread(){
 		size_t to_read = sizeof(shake);
 		bool running = true;
 		while(to_read > 0){
-			int ret = recv(req.client_socket, &shake, to_read, 0);
+			ssize_t ret = recv(req.client_socket, &shake, to_read, 0);
 			if(ret < 0){
 				LOG(INFO) << "Error receiving shake:" << strerror(errno);
 				return;
@@ -113,7 +113,7 @@ void NetworkManager::ReqReceiveThread(){
 		}
 		switch(shake.client_req){
 			case Publish:
-				{
+				{ 
 					if(strlen(shake.topic) == 0){
 						LOG(ERROR) << "Topic cannot be null:" << shake.topic;
 						return;
@@ -172,8 +172,7 @@ void NetworkManager::ReqReceiveThread(){
 						// give up if we can't at least read a partial batch header
 						ssize_t bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
 						if(bytes_read <= 0){
-							if(bytes_read < 0)
-								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
+							LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
 							running = false;
 							break;
 						}
@@ -187,6 +186,7 @@ void NetworkManager::ReqReceiveThread(){
 							}
 							bytes_read += recv_ret;
 						}
+						LOG(ERROR) << "Received batch header";
 						to_read = batch_header.total_size;
 						pub_req.total_size = batch_header.total_size;
 						pub_req.num_messages = batch_header.num_msg;
@@ -296,6 +296,9 @@ void NetworkManager::ReqReceiveThread(){
 					close(efd);
 				}//end Subscribe
 				break;
+		default:
+			LOG(ERROR) << "UNKNOWN CLIENT REQUEST TYPE??";
+			exit(-1);
 		}
 	}
 }
