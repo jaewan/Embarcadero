@@ -495,6 +495,18 @@ class Client{
 			return false;
 		}
 
+	inline bool GetGlobalBatchNum(uint32_t &order) {
+		grpc::ClientContext context;
+		heartbeat_system::GlobalBatchNumRequest req;
+		heartbeat_system::GlobalBatchNumResponse reply;
+		grpc::Status status = stub_->GetGlobalBatchNum(&context, req, &reply);
+		if (status.ok()) {
+			order = reply.order();
+			return true;
+		}
+		return false;
+	}
+
 	private:
 		std::string head_addr_;
 		std::string port_;
