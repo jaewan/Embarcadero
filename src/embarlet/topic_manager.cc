@@ -337,7 +337,29 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest
 }
 
 std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-	LOG(ERROR) << "In CORFU GetCXLBuffer for batch_num=" << logical_offset;
+	//LOG(ERROR) << "In CORFU GetCXLBuffer for batch_num=" << logical_offset;
+	uint32_t global_batch_num = (uint32_t)logical_offset;
+	size_t num_brokers = 1; // TODO(erika): hack for now, corfu doesn't support dynamic brokers at the moment anyways
+	auto start = std::chrono::high_resolution_clock::now();
+
+	// TODO(erika): Need to implement invalidation behavior on timeout
+	while (global_batch_num > corfu_global_batch_num_.load()) {
+		std::this_thread::yield();
+		auto end = std::chrono::high_resolution_clock::now();
+		if (std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() >= CORFU_TIMEOUT) {
+			LOG(ERROR) << "CORFU: This is where I should invalidate entries";
+			return nullptr;
+		}
+	}
+
+	if (corfu_global_batch_num_.load() > global_batch_num) {
+		// This batch has been invalidated by another thread, nothing to do here
+		LOG(ERROR) << "CORFU: Batch invalidated";
+		return nullptr;
+	}
+
+	// At this point, corfu_global_batch_num_ == global_batch_num
+
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = req.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));
@@ -353,6 +375,15 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req,
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
+
+
+	// We've udpated the log pointers that we needed to, so now we can increment the batch num since this batch has been assigned a region already
+	logical_offset = accepted_batches_;
+	accepted_batches_++; // TODO(erika): This should be global, can be used to sequence individual messages 
+	assert(global_batch_num == corfu_global_batch_num_.load());
+	assert(global_batch_num == corfu_global_batch_num_.fetch_add(num_brokers)); // TODO(erika): remove assert when confident
+	
+
 	return nullptr;
 }
 

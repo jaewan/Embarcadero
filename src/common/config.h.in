@@ -33,6 +33,7 @@ namespace Embarcadero{
 #define MAX_MSG_SIZE 1UL << 20
 #define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
 #define MSGS_PER_FIXED_BATCH (1UL<<12)
+#define CORFU_TIMEOUT 5000
 
 //********* Health check configs *********
 #define HEARTBEAT_INTERVAL 3 // in seconds
