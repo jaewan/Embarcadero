@@ -440,18 +440,14 @@ class Client{
 			static size_t i = 0;
 			static size_t j = 0;
 			const static size_t batch_size = 1UL<<19;
-			size_t n = batch_size/(len+64);
+			size_t n = fixed_batch_size_ ? MSGS_PER_FIXED_BATCH : batch_size/(len+64);
 
 			pubQue_.Write(i, client_order_, message, len);
 			
-			if(!fixed_batch_size_) {
-				j++;
-				if (j == n){
-					i = (i+1)%num_threads_;
-					j = 0;
-				}
-			} else {
+			j++;
+			if (j == n){
 				i = (i+1)%num_threads_;
+				j = 0;
 			}
 			client_order_++;
 		}
