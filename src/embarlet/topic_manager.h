@@ -65,6 +65,7 @@ class Topic{
 		absl::Mutex mutex_;
 		absl::Mutex written_mutex_;
 		std::atomic<size_t> kafka_logical_offset_{0};
+		std::atomic<uint32_t> corfu_global_batch_num_{0}; // TODO(erika): This should probably be in global shared memory
 		absl::flat_hash_map<size_t, size_t> written_messages_range_;
 
 		//TInode cache

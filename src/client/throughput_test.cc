@@ -31,8 +31,6 @@
 #define MSG_ZEROCOPY    0x4000000
 #endif
 
-#define MSGS_PER_FIXED_BATCH (1UL<<12)
-
 using heartbeat_system::HeartBeat;
 using heartbeat_system::SequencerType;
 
