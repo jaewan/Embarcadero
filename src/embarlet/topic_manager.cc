@@ -210,7 +210,6 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 	cxl_addr_(cxl_addr),
 	logical_offset_(0),
 	written_logical_offset_((size_t)-1),
-	batch_seq_q_(order == 3 ? 10000 : 1),//only make 10,000 when order is 3. Or make the que as a pointer
 	current_segment_(segment_metadata){
 		log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
 		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
@@ -268,6 +267,9 @@ void Topic::CombinerThread(){
 		written_physical_addr_ = (void*)header;
 		header = (MessageHeader*)((uint8_t*)header + header->next_msg_diff);
 		logical_offset_++;
+		if(logical_offset_ >= 2621439){
+			VLOG(3) << "Combined:" << logical_offset_;
+		}
 	}
 }
 
@@ -321,25 +323,28 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 }
 
 std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-	std::shared_ptr<std::atomic<size_t>> batch_seq;
-	{
-		absl::MutexLock lock(&mutex_);
-		auto it = order3_client_batch_.find(req.client_id);
-		if (it == order3_client_batch_.end()) {
-			batch_seq = std::make_shared<std::atomic<size_t>>(broker_id_);
-			order3_client_batch_.emplace(req.client_id, batch_seq);
-		} else {
-			batch_seq = it->second;
+	size_t batch_seq;
+	absl::MutexLock lock(&mutex_);
+	if(skipped_batch_.contains(req.client_id)){
+		auto it = skipped_batch_[req.client_id].find(req.batch_seq);
+		if(it != skipped_batch_[req.client_id].end()){
+			log = it->second;
+			skipped_batch_[req.client_id].erase(it);
+			return nullptr;
 		}
 	}
-	while(batch_seq->load() != req.batch_seq){
-		std::this_thread::yield();
+	auto it = order3_client_batch_.find(req.client_id);
+	if (it == order3_client_batch_.end()) {
+		order3_client_batch_.emplace(req.client_id, broker_id_);
 	}
-	batch_seq->fetch_add(req.num_brokers);
-	log = (void*)(log_addr_.fetch_add(req.total_size));
-	while(!batch_seq_q_.write(std::make_pair(req.client_id, req.batch_seq))){
-		std::this_thread::yield();
+	while(order3_client_batch_[req.client_id] < req.batch_seq){
+		skipped_batch_[req.client_id].emplace(order3_client_batch_[req.client_id],(void*)log_addr_.load());
+		log_addr_ += req.total_size; // This assumes the batch sizes are identical. Change this later
+		order3_client_batch_[req.client_id] += req.num_brokers;
 	}
+	log = (void*)(log_addr_.load());
+	log_addr_ += req.total_size;
+	order3_client_batch_[req.client_id] += req.num_brokers;
 	return nullptr;
 }
 
@@ -417,6 +422,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
 	}
+	VLOG(3) << "sending:" << messages_size << " last_offset:" << last_offset << " combined:" << combined_offset;
 	return true;
 }
 

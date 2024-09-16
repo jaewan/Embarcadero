@@ -193,7 +193,7 @@ void NetworkManager::ReqReceiveThread(){
 						pub_req.batch_seq = batch_header.batch_seq;
 						// TODO(Jae) Send -1 to ack if this returns nullptr
 						void*  segment_header;
-						void*  buf;
+						void*  buf = nullptr;
 						size_t logical_offset;
 						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset);
 						size_t read = 0;

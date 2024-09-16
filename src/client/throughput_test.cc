@@ -283,6 +283,10 @@ class Buffer{
 				}
 				size_t head = bufs[bufIdx].head;
 				//std::atomic_thread_fence(std::memory_order_acquire);
+				len = bufs[bufIdx].tail - head;
+				if(len==0){
+					return nullptr;
+				}
 				len = BATCH_SIZE;
 				bufs[bufIdx].head += BATCH_SIZE;
 				return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
@@ -318,10 +322,10 @@ class Buffer{
 
 class Client{
 	public:
-		Client(std::string head_addr, std::string port, int num_threads, size_t message_size, size_t queueSize):
+		Client(std::string head_addr, std::string port, int num_threads, size_t message_size, size_t queueSize, int order):
 			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0),
 			client_id_(GenerateRandomNum()), num_threads_(num_threads), message_size_(message_size),
-			pubQue_(num_threads, queueSize, client_id_, message_size){
+			pubQue_(num_threads, queueSize, client_id_, message_size, order){
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				nodes_[0] = head_addr+":"+std::to_string(PORT);
@@ -641,7 +645,8 @@ class Client{
 			shake.ack = ack_level_;
 			shake.port = ack_port_;
 			shake.connection_id = pubQuesIdx;
-			shake.num_msg = nodes_.size(); // shake.num_msg used as num brokers at pub
+			size_t num_brokers = nodes_.size();
+			shake.num_msg = num_brokers; // shake.num_msg used as num brokers at pub
 
 			struct epoll_event events[10]; // Adjust size as needed
 			bool running = true;
@@ -789,6 +794,9 @@ class Client{
 							LOG(INFO) << "New Node reported:" << broker_id;
 							nodes_[broker_id] = addr;
 							brokers_.emplace_back(broker_id);
+							//Make sure the brokers are sorted to have threads send in round robin in broker_id seq
+							//This is needed for order3
+							std::sort(brokers_.begin(), brokers_.end());
 							client_info.add_nodes_info(broker_id);
 						}
 					}
@@ -1137,7 +1145,7 @@ class Subscriber{
 			if(q_size < 1024){
 				q_size = 1024;
 			}
-			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
+			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
 			LOG(INFO) << "Client Created" ;
 			c.CreateNewTopic(topic, order, seq_type);
 			c.Init(topic, ack_level);
@@ -1190,7 +1198,7 @@ class Subscriber{
 			if(q_size < 1024){
 				q_size = 1024;
 			}
-			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
+			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
 			c.CreateNewTopic(topic, order, seq_type);
 			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
 			c.Init(topic, ack_level);
@@ -1223,7 +1231,7 @@ class Subscriber{
 			if(q_size < 1024){
 				q_size = 1024;
 			}
-			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size);
+			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
 			c.CreateNewTopic(topic, order, seq_type);
 			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
 			c.Init(topic, ack_level);
@@ -1287,18 +1295,36 @@ class Subscriber{
 				return -1;
 			}
 			if(order == 3){
-				if(BATCH_SIZE % (message_size)){
-					LOG(ERROR) << "Adjust message size!!";
+				size_t padding = message_size % 64;
+				if(padding){
+					padding = 64 - padding;
+				}
+				size_t paddedSize = message_size + padding + sizeof(Embarcadero::MessageHeader);
+				if(BATCH_SIZE % (paddedSize)){
+					LOG(ERROR) << "Adjusting Batch size of message size!!";
 					return 0;
 				}
-				if(total_message_size % (num_threads*BATCH_SIZE)){
-					LOG(ERROR) << "Adjust total message size!!";
-					return 0;
+				/*
+				 * 128  : 2^12 * (128 + 64)    total_message_size : 2^22 * 20
+				 * 512  : 2^10 * (512 + 64)    total_message_size : 2^20 * 20
+				 * 1024 : 2^9 * (1024 + 64)
+				 * 4096 : 2^7 * (4096 + 64)
+				 * 64K  : 2^3 * (2^26 + 64)
+				 * 1M   : 2^-1 * (2^30+ 64)
+				 */
+
+				size_t n = total_message_size/message_size;
+				size_t total_payload = n*paddedSize;
+				padding = total_payload % (BATCH_SIZE);
+				if(padding){
+					padding = (num_threads*BATCH_SIZE) - padding;
+					LOG(INFO) << "Adjusting total message size from " << total_message_size << " to " << total_message_size+padding << " :" <<(total_message_size+padding)%(num_threads*BATCH_SIZE); 
+					total_message_size += padding;
 				}
 			}
 
 			PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			//SubscribeThroughputTest(total_message_size, message_size, order);
+			SubscribeThroughputTest(total_message_size, message_size, order);
 			//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 			//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
 
