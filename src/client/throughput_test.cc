@@ -31,6 +31,8 @@
 #define MSG_ZEROCOPY    0x4000000
 #endif
 
+#define MSGS_PER_FIXED_BATCH (1UL<<12)
+
 using heartbeat_system::HeartBeat;
 using heartbeat_system::SequencerType;
 
@@ -231,6 +233,7 @@ class Buffer{
 				header_.size = message_size;
 				header_.total_order = 0;
 				int padding = message_size % 64;
+
 				if(padding){
 					padding = 64 - padding;
 				}
@@ -266,7 +269,7 @@ class Buffer{
 			}
 			header_.client_order = client_order;
 			if(bufs[bufIdx].tail + header_size + padded > bufs[bufIdx].len){
-				//LOG(ERROR) << "tail:" << bufs[bufIdx].tail << " write size:" << padded << " will go over buffer:" << bufs[bufIdx].len;
+				LOG(ERROR) << "tail:" << bufs[bufIdx].tail << " write size:" << padded << " will go over buffer:" << bufs[bufIdx].len;
 				return false;
 			}
 			memcpy((void*)((uint8_t*)bufs[bufIdx].buffer + bufs[bufIdx].tail), &header_, header_size);
@@ -288,19 +291,23 @@ class Buffer{
 			return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
 		}
 
-		void* ReadExact(int bufIdx, size_t size){
-			while(!shutdown_ && bufs[bufIdx].tail <= bufs[bufIdx].head && bufs[bufIdx].tail - bufs[bufIdx].head < size){
+		void* ReadExact(int bufIdx, size_t &len, size_t num_msgs){
+			len = num_msgs * (header_.size + sizeof(Embarcadero::MessageHeader));
+			//LOG(ERROR) << "In ReadExact for len " << len << " (num_msgs=" << num_msgs << ")";
+			while(bufs[bufIdx].tail < bufs[bufIdx].head + len){
 				std::this_thread::yield();
-			}
-			if (shutdown_) {
-				if (bufs[bufIdx].tail > bufs[bufIdx].head) {
-					LOG(ERROR) << "Buffer shutting down when there is still data in it....";
+				if (shutdown_) {
+					if (bufs[bufIdx].tail == bufs[bufIdx].head) {
+						len = 0;
+						return NULL;
+					} else {
+						LOG(ERROR) << "Detected shutdown but " << bufs[bufIdx].tail - bufs[bufIdx].head<< " bytes still in buffer... ";
+					}
 				}
-				return NULL;
 			}
-
+			//LOG(ERROR) << bufIdx << " - Ready to ReadExact, len=" << len << " diff=" << bufs[bufIdx].tail - bufs[bufIdx].head;
 			size_t head = bufs[bufIdx].head;
-			bufs[bufIdx].head += size;
+			bufs[bufIdx].head = head + len;
 			return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
 		}
 
@@ -421,8 +428,6 @@ class Client{
 				pub_fds_.push_back(sock);
 				pub_efds_.push_back(efd);
 			}
-			assert(pub_fds_.size() == num_threads_);
-			assert(pub_efds_.size() == num_threads_);
 
 			for (int i=0; i < num_threads_; i++)
 				threads_.emplace_back(&Client::PublishThread, this, i);
@@ -436,11 +441,17 @@ class Client{
 			static size_t j = 0;
 			const static size_t batch_size = 1UL<<19;
 			size_t n = batch_size/(len+64);
+
 			pubQue_.Write(i, client_order_, message, len);
-			j++;
-			if(j == n){
+			
+			if(!fixed_batch_size_) {
+				j++;
+				if (j == n){
+					i = (i+1)%num_threads_;
+					j = 0;
+				}
+			} else {
 				i = (i+1)%num_threads_;
-				j = 0;
 			}
 			client_order_++;
 		}
@@ -691,18 +702,26 @@ class Client{
 			int sock = pub_fds_[pubQuesIdx];
 			int efd = pub_efds_[pubQuesIdx];
 
-			std::vector<double> send_times;
-			std::vector<double> poll_times;
 			thread_count_.fetch_add(1);
 			while(!shutdown_){
-				size_t len;
-				void *msg = pubQue_.Read(pubQuesIdx, len);
-				if(len == 0){
-					break;
+				size_t len = 0;
+				void *msg = NULL;
+				Embarcadero::BatchHeader batch_header = { 0 };
+				if (fixed_batch_size_) {
+					batch_header.num_msg = MSGS_PER_FIXED_BATCH;
+					msg = pubQue_.ReadExact(pubQuesIdx, len, MSGS_PER_FIXED_BATCH);
+					if (msg == NULL) {
+						break;
+					}
+				} else {
+					msg = pubQue_.Read(pubQuesIdx, len);
+					if(len == 0){
+						break;
+					}
+					batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize; 
 				}
-				Embarcadero::BatchHeader batch_header;
 				batch_header.total_size = len;
-				batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize;
+				
 				/*
 				if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
 					Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader *)msg;
@@ -998,7 +1017,7 @@ class Subscriber{
 						if (events[n].events & EPOLLIN) {
 							int fd = events[n].data.fd;
 							//int idx = messages_idx_.load();
-							int idx = 0;
+							//int idx = 0;
 							struct msgIdx *m = fd_to_msg[fd].second; // &messages_[idx][fd_to_msg_idx[fd]].second;
 							void* buf = fd_to_msg[fd].first;// messages_[idx][fd_to_msg_idx[fd]].first;
 																							// This ensures the receive never goes out of the boundary
@@ -1044,7 +1063,7 @@ class Subscriber{
 					std::pair<void*, msgIdx*> msg(static_cast<void*>(calloc(buffer_size_, sizeof(char))), (msgIdx*)malloc(sizeof(msgIdx)));
 					// This is for client retrieval, double buffer
 					//std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(broker_id));
-					int idx = messages_[0].size();
+					//int idx = messages_[0].size();
 					messages_[0].push_back(msg);
 					//messages_[1].push_back(msg1);
 					fd_to_msg.insert({sock, msg});;
@@ -1056,8 +1075,8 @@ class Subscriber{
 					shake.last_addr = 0;
 					shake.client_req = Embarcadero::Subscribe;
 					memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
-					int ret = send(sock, &shake, sizeof(shake), 0);
-					if(ret < sizeof(shake)){
+					ssize_t ret = send(sock, &shake, sizeof(shake), 0);
+					if(ret < (ssize_t)sizeof(shake)){
 						LOG(ERROR) << "fd:" << sock << " addr:" << addr << " id:" << broker_id  << 
 							"sent:" << ret<< "/" <<sizeof(shake) 	<< " failed:" << strerror(errno);
 						close(sock);
@@ -1144,6 +1163,7 @@ class Subscriber{
 
 		void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, bool fixed_batch_size){
 			size_t n = total_message_size/message_size;
+			
 			LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads << " seq_type:" << seq_type << " fixed_batch_size:" << fixed_batch_size;
 			char* message = (char*)malloc(sizeof(char)*message_size);
 			char topic[TOPIC_NAME_SIZE];
@@ -1231,6 +1251,9 @@ class Subscriber{
 		void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type, bool fixed_batch_size){
 			size_t n = total_message_size/message_size;
 			LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads << " seq_type:" << seq_type << " fixed_batch_size:" << fixed_batch_size;
+			if (fixed_batch_size) {
+				assert(n % (num_threads * MSGS_PER_FIXED_BATCH) == 0);
+			}
 			char message[message_size];
 			char topic[TOPIC_NAME_SIZE];
 			memset(topic, 0, TOPIC_NAME_SIZE);

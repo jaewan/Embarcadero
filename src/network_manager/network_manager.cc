@@ -186,7 +186,6 @@ void NetworkManager::ReqReceiveThread(){
 							}
 							bytes_read += recv_ret;
 						}
-						LOG(ERROR) << "Received batch header";
 						to_read = batch_header.total_size;
 						pub_req.total_size = batch_header.total_size;
 						pub_req.num_messages = batch_header.num_msg;
