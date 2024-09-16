@@ -67,6 +67,7 @@ struct NonCriticalMessageHeader{
 struct BatchHeader{
 	size_t total_size;
 	size_t num_msg;
+	uint32_t batch_num;
 };
 
 

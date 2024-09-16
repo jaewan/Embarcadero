@@ -761,6 +761,7 @@ class Client{
 						LOG(ERROR) << "Failed to get global batch number for batch starting with client order " << hdr->client_order;
 						exit(-1);
 					}
+					batch_header.batch_num = batch_order;
 					//LOG(INFO) << "BATCH SEQ NUM IS: " << batch_order << " (client_order=" << hdr->client_order << ")";
 				}
 				
