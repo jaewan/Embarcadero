@@ -350,7 +350,7 @@ class Client{
 		Client(std::string head_addr, std::string port, int num_threads, size_t message_size, size_t queueSize, bool fixed_batch_size):
 			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0),
 			client_id_(GenerateRandomNum()), num_threads_(num_threads), message_size_(message_size),
-			pubQue_(num_threads, queueSize, client_id_, message_size), fixed_batch_size_(fixed_batch_size) {
+			pubQue_(num_threads, queueSize, client_id_, message_size), fixed_batch_size_(fixed_batch_size), last_batch_ordered_(0) {
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				nodes_[0] = head_addr+":"+std::to_string(PORT);
@@ -509,13 +509,18 @@ class Client{
 			return false;
 		}
 
-	inline bool GetGlobalBatchNum(uint32_t &order) {
+	inline bool GetGlobalBatchNum(uint32_t *batch_order, uint32_t client_order) {
+		while (last_batch_ordered_ != client_order) {
+			std::this_thread::yield();	
+		}
+
 		grpc::ClientContext context;
 		heartbeat_system::GlobalBatchNumRequest req;
 		heartbeat_system::GlobalBatchNumResponse reply;
 		grpc::Status status = stub_->GetGlobalBatchNum(&context, req, &reply);
 		if (status.ok()) {
-			order = reply.order();
+			*batch_order = reply.order();
+			last_batch_ordered_ += MSGS_PER_FIXED_BATCH;
 			return true;
 		}
 		return false;
@@ -532,6 +537,7 @@ class Client{
 		size_t message_size_;
 		Buffer pubQue_;
 		bool fixed_batch_size_;
+		uint32_t last_batch_ordered_;
 
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::thread cluster_probe_thread_;
@@ -747,6 +753,16 @@ class Client{
 					batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize; 
 				}
 				batch_header.total_size = len;
+				
+				if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
+					Embarcadero::MessageHeader *hdr = (Embarcadero::MessageHeader *)msg;
+					uint32_t batch_order = 0;
+					if (!GetGlobalBatchNum(&batch_order, hdr->client_order)) {
+						LOG(ERROR) << "Failed to get global batch number for batch starting with client order " << hdr->client_order;
+						exit(-1);
+					}
+					//LOG(INFO) << "BATCH SEQ NUM IS: " << batch_order << " (client_order=" << hdr->client_order << ")";
+				}
 				
 				/*
 				if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
