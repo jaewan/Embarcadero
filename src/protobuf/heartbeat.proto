@@ -7,6 +7,7 @@ service HeartBeat {
 	rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 	rpc GetClusterStatus (ClientInfo) returns (ClusterStatus);
 	rpc CreateNewTopic(CreateTopicRequest) returns (CreateTopicResponse);
+	rpc GetGlobalBatchNum(GlobalBatchNumRequest) returns (GlobalBatchNumResponse);
 }
 
 enum SequencerType{
@@ -52,4 +53,10 @@ message CreateTopicRequest {
 
 message CreateTopicResponse {
 	bool success = 1;
+}
+
+message GlobalBatchNumRequest { }
+
+message GlobalBatchNumResponse {
+	uint32 order = 1;
 }
