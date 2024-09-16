@@ -305,10 +305,28 @@ class Buffer{
 					}
 				}
 			}
+
 			//LOG(ERROR) << bufIdx << " - Ready to ReadExact, len=" << len << " diff=" << bufs[bufIdx].tail - bufs[bufIdx].head;
 			size_t head = bufs[bufIdx].head;
 			bufs[bufIdx].head = head + len;
 			return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
+
+			/*
+			// TODO(erika): remove verification code when confident; this checks that client order is sequential in batch
+			void *buff_start = (void *)((uint8_t*)bufs[bufIdx].buffer + head);
+			size_t step = (header_.size + sizeof(Embarcadero::MessageHeader));
+			uint32_t current_seq = 0;
+			for (size_t i = 0; i < num_msgs; i++) {
+				auto current_header = (Embarcadero::MessageHeader *)((uint8_t*)buff_start + step * i);
+				if (current_seq == 0) {
+					current_seq = current_header->client_order;
+				} else {
+					assert(current_header->client_order == current_seq + 1);
+					current_seq++;
+				}
+			}
+			return buff_start;
+			*/
 		}
 
 		void ReturnReads(){
