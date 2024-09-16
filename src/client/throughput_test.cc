@@ -742,6 +742,7 @@ class Client{
 			int sock = -1;
 			int efd = -1;
 			size_t socket_idx = pubQuesIdx;
+			size_t num_brokers = brokers_.size(); // TODO: corfu assumes this is static
 
 			thread_count_.fetch_add(1);
 			while(!shutdown_){
@@ -772,12 +773,12 @@ class Client{
 					}
 					batch_header.batch_num = batch_order;
 					//LOG(INFO) << "BATCH SEQ NUM IS: " << batch_order << " (client_order=" << hdr->client_order << ")";
-					socket_idx = (pub_fds_.size() / brokers_.size() /* socker per broker */) * (/* round robin by batch num */batch_order % brokers_.size()) + /* pick broker socket by thread id */ pubQuesIdx % brokers_.size();
+					socket_idx = (num_threads_ / num_brokers) * (batch_order % num_brokers) + pubQuesIdx % (num_threads_ / num_brokers);
 				}
 
 				// We need a lock so that we don't interleave batches
 				absl::MutexLock lock(&pub_sock_locks_[socket_idx]);
-				LOG(INFO) << "Got socket idx " << socket_idx << " for batch num " << batch_header.batch_num;
+				//LOG(INFO) << "Got socket idx " << socket_idx << " for batch num " << batch_header.batch_num;
 				sock = pub_fds_[socket_idx];
 				efd = pub_efds_[socket_idx];
 				
