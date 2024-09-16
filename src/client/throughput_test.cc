@@ -389,7 +389,7 @@ class Client{
 					close(efd);
 				}
 
-				Embarcadero::EmbarcaderoReq shake;
+				Embarcadero::EmbarcaderoReq shake = { 0 };
 				shake.client_req = Embarcadero::ClientRequestType::Publish;
 				shake.client_id = client_id_;
 				memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
@@ -1069,7 +1069,7 @@ class Subscriber{
 					fd_to_msg.insert({sock, msg});;
 
 					//Create a connection by Sending a Sub request
-					Embarcadero::EmbarcaderoReq shake;
+					Embarcadero::EmbarcaderoReq shake = { 0 };
 					shake.num_msg = 0;
 					shake.client_id = client_id_;
 					shake.last_addr = 0;
