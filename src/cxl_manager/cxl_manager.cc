@@ -15,7 +15,7 @@
 
 namespace Embarcadero{
 
-static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_size){
+static inline void* allocate_shm(const char *filename, int broker_id, CXL_Type cxl_type, size_t cxl_size){
 	void *addr = nullptr;
 	int cxl_fd;
 	bool dev = false;
@@ -28,11 +28,11 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 				LOG(ERROR) << "Cannot allocate from real CXL";
 				return nullptr;
 			}else{
-				cxl_fd = shm_open("/CXL_SHARED_FILE", O_CREAT | O_RDWR, 0666);
+				cxl_fd = shm_open(filename, O_CREAT | O_RDWR, 0666);
 			}
 		}
 	}else{
-		cxl_fd = shm_open("/CXL_SHARED_FILE", O_CREAT | O_RDWR, 0666);
+		cxl_fd = shm_open(filename, O_CREAT | O_RDWR, 0666);
 	}
 
 	if (cxl_fd < 0){
@@ -89,7 +89,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	}
 
 	// Initialize CXL
-	cxl_addr_ = allocate_shm(broker_id, cxl_type, cxl_size_);
+	cxl_addr_ = allocate_shm("/CXL_SHARED_FILE", broker_id, cxl_type, cxl_size_);
 	if(cxl_addr_ == nullptr){
 		return;
 	}
