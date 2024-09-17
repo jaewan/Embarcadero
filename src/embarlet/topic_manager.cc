@@ -109,8 +109,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	// TODO(erika): should this be disabled for Corfu too?
-	if(tinode->seq_type != KAFKA) {
+	if(tinode->seq_type != KAFKA && tinode->seq_type != CORFU) {
 		topics_[topic]->Combiner();
 	}
 	if (broker_id_ != 0 && tinode->seq_type == SCALOG){
@@ -149,7 +148,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	if(seq_type != KAFKA)
+	if(seq_type != KAFKA && seq_type != CORFU)
 		topics_[topic]->Combiner();
 	return tinode;
 }
@@ -167,7 +166,7 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequen
 void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
-std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
@@ -184,7 +183,7 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &re
 			return nullptr;
 		}
 	}
-	return topic_itr->second->GetCXLBuffer(req, log, segment_header, logical_offset);
+	return topic_itr->second->GetCXLBuffer(req, log, segment_header, logical_offset, is_valid);
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -274,7 +273,7 @@ void Topic::Combiner(){
 	combiningThreads_.emplace_back(&Topic::CombinerThread, this);
 }
 
-std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
 	size_t start_logical_offset;
 	{
 	absl::MutexLock lock(&mutex_);
@@ -317,7 +316,7 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 	};
 }
 
-std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = req.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));
@@ -336,30 +335,49 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-	//LOG(ERROR) << "In CORFU GetCXLBuffer for batch_num=" << logical_offset;
+std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
+	LOG(ERROR) << "In CORFU GetCXLBuffer for batch_num=" << logical_offset;
+	
 	uint32_t global_batch_num = (uint32_t)logical_offset;
-	size_t num_brokers = 1; // TODO(erika): hack for now, corfu doesn't support dynamic brokers at the moment anyways
 	auto start = std::chrono::high_resolution_clock::now();
 
-	// TODO(erika): Need to implement invalidation behavior on timeout
-	while (global_batch_num > corfu_global_batch_num_.load()) {
+	// Wait until timeout or ready for us to read
+	auto current_batch_num = corfu_global_batch_num_.load();
+	bool timeout = false;
+	bool set_validity = false;
+	while (!timeout && global_batch_num > current_batch_num) {
 		std::this_thread::yield();
 		auto end = std::chrono::high_resolution_clock::now();
 		if (std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() >= CORFU_TIMEOUT) {
-			LOG(ERROR) << "CORFU: This is where I should invalidate entries";
-			return nullptr;
+			LOG(ERROR) << "CORFU: Timeout detected!";
+			timeout = true;
+		}
+		current_batch_num = corfu_global_batch_num_.load();
+	}
+
+	// if timeout, update value but be careful not to update if someone else has updated it first
+	if (timeout) {
+		while (current_batch_num < global_batch_num) {
+			if (corfu_global_batch_num_.compare_exchange_strong(current_batch_num, global_batch_num + 1)) {
+				// We have successfully registered the batch!
+				is_valid = true;
+				set validity = true;
+				break;
+			}
+			current_batch_num = corfu_global_batch_num_.load();
+		}
+		if (current_batch_num > global_batch_num) {
+			is_valid = false; // Uh oh, someone else beat us to it.
+			set_validity = true;
 		}
 	}
-
-	if (corfu_global_batch_num_.load() > global_batch_num) {
-		// This batch has been invalidated by another thread, nothing to do here
-		LOG(ERROR) << "CORFU: Batch invalidated";
-		return nullptr;
+		
+	if (!set_validity) {
+		// Since corfu_global_batch_num_ monotonically increases we know it is either equal to the current batch num (valid) or above (invalid)
+		is_valid = corfu_global_batch_num_.compare_exchange_strong(global_batch_num, global_batch_num + 1);
 	}
 
-	// At this point, corfu_global_batch_num_ == global_batch_num
-
+	// Regardless of validity, we need a buffer to read in the messages
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = req.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));
@@ -375,16 +393,9 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req,
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
-
-
-	// We've udpated the log pointers that we needed to, so now we can increment the batch num since this batch has been assigned a region already
-	logical_offset = accepted_batches_;
-	accepted_batches_++; // TODO(erika): This should be global, can be used to sequence individual messages 
-	assert(global_batch_num == corfu_global_batch_num_.load());
-	assert(global_batch_num == corfu_global_batch_num_.fetch_add(num_brokers)); // TODO(erika): remove assert when confident
-	
-
-	return nullptr;
+	LOG(ERROR) << "CORFU BATCH NUM " << global_batch_num << " SET ISVALID=" << is_valid;
+	assert(-1 != nullptr); // TODO(ERIKA): remove this
+	return -1;
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message

@@ -125,8 +125,8 @@ CXLManager::~CXLManager(){
 	LOG(INFO) << "[CXLManager]: \t\tDestructed";
 }
 
-std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-	return topic_manager_->GetCXLBuffer(req, log, segment_header, logical_offset);
+std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
+	return topic_manager_->GetCXLBuffer(req, log, segment_header, logical_offset, is_valid);
 }
 
 // This function returns TInode without inspecting if the topic exists
@@ -256,7 +256,7 @@ void CXLManager::Sequencer2(char* topic){
 		for(auto broker : registered_brokers){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
 			//This ensures the message is Combined (complete ensures it is fully received)
-			if(msg_to_order[broker]->complete == 1 && msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written){
+			if(msg_to_order[broker]->complete != 1 && msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written){
 				yield = false;
 				queues[broker].push(msg_to_order[broker]);
 				int client = msg_to_order[broker]->client_id;

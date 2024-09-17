@@ -192,8 +192,9 @@ void NetworkManager::ReqReceiveThread(){
 						// TODO(Jae) Send -1 to ack if this returns nullptr
 						void*  segment_header;
 						void*  buf;
+						bool is_valid = true;
 						size_t logical_offset = batch_header.batch_num;
-						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset);
+						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset, is_valid);
 						size_t read = 0;
 						MessageHeader* header = { 0 };
 						size_t header_size = sizeof(MessageHeader);
@@ -209,12 +210,17 @@ void NetworkManager::ReqReceiveThread(){
 							// We need this for ack=1 as well to confirm that the messages are valid
 							while(bytes_to_next_header + header_size <= (size_t) bytes_read){
 								header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
-								header->complete = 1;
+								if (!is_valid) {
+									header->complete = -1;
+								} else {
+									header->complete = 1;
+								}
 								bytes_read -= bytes_to_next_header;
 								read += bytes_to_next_header;
 								to_read -= bytes_to_next_header;
 								bytes_to_next_header = header->paddedSize;
-								if(kafka_callback){
+								if (kafka_callback) {
+									// This is kafka or corfu
 									header->logical_offset = logical_offset;
 									if(segment_header == nullptr){
 										LOG(ERROR) << "segment_header is null!!!!!!!!";
@@ -241,7 +247,7 @@ void NetworkManager::ReqReceiveThread(){
 								break;
 							}	
 						}
-						if(kafka_callback){
+						if(kafka_callback && (size_t)kafka_callback != -1) {
 							kafka_callback((void*)header, logical_offset-1);
 						}
 					}

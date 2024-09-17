@@ -37,16 +37,16 @@ class Topic{
 		bool GetMessageAddr(size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
-		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-			return (this->*GetCXLBufferFunc)(req, log, segment_header, logical_offset);
+		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
+			return (this->*GetCXLBufferFunc)(req, log, segment_header, logical_offset, is_valid);
 		}
 
 	private:
 		void CombinerThread();
-		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid);
+		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid);
+		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid);
+		std::function<void(void*, size_t)> CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		std::string topic_name_;
@@ -91,7 +91,7 @@ class TopicManager{
 		}
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
-		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 
