@@ -194,7 +194,8 @@ void NetworkManager::ReqReceiveThread(){
 						void*  buf;
 						bool is_valid = true;
 						size_t logical_offset = batch_header.batch_num;
-						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset, is_valid);
+					  SequencerType seq_type = EMBARCADERO;	
+						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset, is_valid, seq_type);
 						size_t read = 0;
 						MessageHeader* header = { 0 };
 						size_t header_size = sizeof(MessageHeader);
@@ -208,8 +209,16 @@ void NetworkManager::ReqReceiveThread(){
 							}
               // TODO(Jae) Add validation logic here to check if the message headers are valid and send acknowledgement
 							// We need this for ack=1 as well to confirm that the messages are valid
+							size_t msg_in_batch = 0;
 							while(bytes_to_next_header + header_size <= (size_t) bytes_read){
 								header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
+								
+								// Do this before combiner runs (before we mark as complete) to ensure no problems w/ writes
+								if (seq_type == CORFU) {
+									// This is only needed for corfu but shouldn't hurt to do w/ kafka too
+									header->total_order = MSGS_PER_FIXED_BATCH * batch_header.batch_num + msg_in_batch;
+								}
+
 								if (!is_valid) {
 									header->complete = -1;
 								} else {
@@ -220,8 +229,8 @@ void NetworkManager::ReqReceiveThread(){
 								to_read -= bytes_to_next_header;
 								bytes_to_next_header = header->paddedSize;
 								if (kafka_callback) {
-									// This is kafka or corfu
 									header->logical_offset = logical_offset;
+
 									if(segment_header == nullptr){
 										LOG(ERROR) << "segment_header is null!!!!!!!!";
 									}
@@ -242,12 +251,13 @@ void NetworkManager::ReqReceiveThread(){
 							read += bytes_read;
 							to_read -= bytes_read;
 							bytes_to_next_header -= bytes_read;
+							msg_in_batch++;
 
 							if(to_read == 0){
 								break;
 							}	
 						}
-						if(kafka_callback && (size_t)kafka_callback != -1) {
+						if(kafka_callback) {
 							kafka_callback((void*)header, logical_offset-1);
 						}
 					}

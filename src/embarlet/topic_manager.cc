@@ -109,7 +109,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	if(tinode->seq_type != KAFKA && tinode->seq_type != CORFU) {
+	if(tinode->seq_type != KAFKA) {
 		topics_[topic]->Combiner();
 	}
 	if (broker_id_ != 0 && tinode->seq_type == SCALOG){
@@ -148,7 +148,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	if(seq_type != KAFKA && seq_type != CORFU)
+	if(seq_type != KAFKA)
 		topics_[topic]->Combiner();
 	return tinode;
 }
@@ -166,7 +166,7 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, Sequen
 void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
-std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
+std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
@@ -183,7 +183,7 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &re
 			return nullptr;
 		}
 	}
-	return topic_itr->second->GetCXLBuffer(req, log, segment_header, logical_offset, is_valid);
+	return topic_itr->second->GetCXLBuffer(req, log, segment_header, logical_offset, is_valid, seq_type);
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -273,7 +273,7 @@ void Topic::Combiner(){
 	combiningThreads_.emplace_back(&Topic::CombinerThread, this);
 }
 
-std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
+std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
 	size_t start_logical_offset;
 	{
 	absl::MutexLock lock(&mutex_);
@@ -316,7 +316,7 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 	};
 }
 
-std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = req.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));
@@ -335,9 +335,9 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid){
+std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
 	LOG(ERROR) << "In CORFU GetCXLBuffer for batch_num=" << logical_offset;
-	
+  seq_type = CORFU;	
 	uint32_t global_batch_num = (uint32_t)logical_offset;
 	auto start = std::chrono::high_resolution_clock::now();
 
@@ -361,7 +361,7 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req,
 			if (corfu_global_batch_num_.compare_exchange_strong(current_batch_num, global_batch_num + 1)) {
 				// We have successfully registered the batch!
 				is_valid = true;
-				set validity = true;
+				set_validity = true;
 				break;
 			}
 			current_batch_num = corfu_global_batch_num_.load();
@@ -394,8 +394,7 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req,
 		}
 	}
 	LOG(ERROR) << "CORFU BATCH NUM " << global_batch_num << " SET ISVALID=" << is_valid;
-	assert(-1 != nullptr); // TODO(ERIKA): remove this
-	return -1;
+	return nullptr;
 }
 
 // Current implementation depends on the subscriber knows the physical address of last fetched message

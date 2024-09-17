@@ -100,7 +100,7 @@ class CXLManager{
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
-		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid);
+		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type);
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 														struct MessageHeader** msg_to_order, struct TInode *tinode);
 
