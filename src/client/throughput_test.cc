@@ -405,13 +405,14 @@ class Client{
 			return;
 		}
 
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type, int replication_factor){
 			seq_type_ = seq_type;
 			grpc::ClientContext context;
 			heartbeat_system::CreateTopicRequest create_topic_req;;
 			heartbeat_system::CreateTopicResponse create_topic_reply;;
 			create_topic_req.set_topic(topic);
 			create_topic_req.set_order(order);
+			create_topic_req.set_replication_factor(replication_factor);
 			create_topic_req.set_sequencer_type(seq_type);
 			grpc::Status status = stub_->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
 			if(status.ok()){
@@ -1133,7 +1134,8 @@ class Subscriber{
 			return num_cores == CGROUP_CORE;
 		}
 
-		void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
+		void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads,
+				int ack_level, int order, SequencerType seq_type, int replication_factor){
 			size_t n = total_message_size/message_size;
 			LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 			char* message = (char*)malloc(sizeof(char)*message_size);
@@ -1147,7 +1149,7 @@ class Subscriber{
 			}
 			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
 			LOG(INFO) << "Client Created" ;
-			c.CreateNewTopic(topic, order, seq_type);
+			c.CreateNewTopic(topic, order, seq_type, replication_factor);
 			c.Init(topic, ack_level);
 			auto start = std::chrono::high_resolution_clock::now();
 
@@ -1171,7 +1173,7 @@ class Subscriber{
 			free(message);
 		}
 
-		void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size, int order){
+		void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size, int order, int replication_factor){
 			LOG(INFO) << "[Subscribe Throuput Test] ";
 			char topic[TOPIC_NAME_SIZE];
 			memset(topic, 0, TOPIC_NAME_SIZE);
@@ -1186,7 +1188,8 @@ class Subscriber{
 			s.DEBUG_check_order(order);
 		}
 
-		void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
+		void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level,
+				int order, SequencerType seq_type, int replication_factor){
 			size_t n = total_message_size/message_size;
 			LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 			std::string message(message_size, 0);
@@ -1199,7 +1202,7 @@ class Subscriber{
 				q_size = 1024;
 			}
 			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-			c.CreateNewTopic(topic, order, seq_type);
+			c.CreateNewTopic(topic, order, seq_type, replication_factor);
 			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
 			c.Init(topic, ack_level);
 
@@ -1219,7 +1222,8 @@ class Subscriber{
 			s.DEBUG_check_order(order);
 		}
 
-		void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level, int order, SequencerType seq_type){
+		void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, 
+				int ack_level, int order, SequencerType seq_type, int replication_factor){
 			size_t n = total_message_size/message_size;
 			LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 			char message[message_size];
@@ -1232,7 +1236,7 @@ class Subscriber{
 				q_size = 1024;
 			}
 			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-			c.CreateNewTopic(topic, order, seq_type);
+			c.CreateNewTopic(topic, order, seq_type, replication_factor);
 			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
 			c.Init(topic, ack_level);
 
@@ -1279,6 +1283,7 @@ class Subscriber{
 				("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10737418240"))
 				("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
 				("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
+				("r,replication_factor", "Replication factor", cxxopts::value<int>()->default_value("0"))
 				("t,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
 
 			auto result = options.parse(argc, argv);
@@ -1287,6 +1292,7 @@ class Subscriber{
 			size_t num_threads = result["num_threads"].as<size_t>();
 			int ack_level = result["ack_level"].as<int>();
 			int order = result["order_level"].as<int>();
+			int replication_factor =result["replication_factor"].as<int>();
 			SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 			FLAGS_v = result["log_level"].as<int>();
 
@@ -1323,10 +1329,10 @@ class Subscriber{
 				}
 			}
 
-			PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			SubscribeThroughputTest(total_message_size, message_size, order);
-			//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
-			//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type);
+			PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+			SubscribeThroughputTest(total_message_size, message_size, order, replication_factor);
+			//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+			//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
 
 			return 0;
 		}

@@ -109,6 +109,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
+	int replication_factor = tinode->replication_factor;
+	disk_manager_.Replicate(tinode, replication_factor);
+
 	if(tinode->seq_type != KAFKA)
 		topics_[topic]->Combiner();
 
@@ -119,7 +122,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	return tinode;
 }
 
-struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
+struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, SequencerType seq_type){
 	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
 	{
 	absl::WriterMutexLock lock(&mutex_);
@@ -133,6 +136,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
 	tinode->order = (uint8_t)order;
+	tinode->replication_factor = (uint8_t)replication_factor;
 	tinode->seq_type = seq_type;
 	memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
 
@@ -149,13 +153,15 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
+	disk_manager_.Replicate(tinode, replication_factor);
+
 	if(seq_type != KAFKA)
 		topics_[topic]->Combiner();
 	return tinode;
 }
 
-bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type){
-	if(CreateNewTopicInternal(topic, order, seq_type)){
+bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, SequencerType seq_type){
+	if(CreateNewTopicInternal(topic, order, replication_factor, seq_type)){
 		cxl_manager_.RunSequencer(topic, order, seq_type);
 		return true;
 	}else{
@@ -249,7 +255,7 @@ void Topic::CombinerThread(){
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
 		header->next_msg_diff = header->paddedSize;
-		/*
+/*
 #ifdef __INTEL__
     _mm_clflushopt(header);
 #elif defined(__AMD__)

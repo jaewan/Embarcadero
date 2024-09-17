@@ -14,9 +14,10 @@ namespace Embarcadero{
 
 #define DISK_LOG_PATH_SUFFIX "embarc.disklog"
 
-DiskManager::DiskManager(size_t queueCapacity, 
+DiskManager::DiskManager(size_t queueCapacity, int broker_id,
 						 int num_io_threads):
 						 requestQueue_(queueCapacity),
+						 broker_id_(broker_id),
 						 num_io_threads_(num_io_threads){
 
 	const char *homedir;
@@ -56,6 +57,10 @@ DiskManager::~DiskManager(){
 		}
 	}
 	LOG(INFO)<< "[DiskManager]: \tDestructed";
+}
+
+void DiskManager::Replicate(TInode* TInode_addr, int replication_factor){
+	VLOG(3) << "Replicate called";
 }
 
 void DiskManager::EnqueueRequest(struct PublishRequest req){

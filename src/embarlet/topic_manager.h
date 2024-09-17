@@ -2,6 +2,7 @@
 #define INCLUDE_TOPIC_MANGER_H_
 
 #include "../cxl_manager/cxl_manager.h"
+#include "../disk_manager/disk_manager.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/synchronization/mutex.h"
@@ -13,6 +14,7 @@
 namespace Embarcadero{
 
 class CXLManager;
+class DiskManager;
 
 using GetNewSegmentCallback = std::function<void*()>;
 
@@ -80,8 +82,9 @@ class Topic{
 
 class TopicManager{
 	public:
-		TopicManager(CXLManager &cxl_manager, int broker_id):
+		TopicManager(CXLManager &cxl_manager, DiskManager &disk_manager, int broker_id):
 			cxl_manager_(cxl_manager),
+			disk_manager_(disk_manager),
 			broker_id_(broker_id),
 			num_topics_(0){
 				LOG(INFO) << "\t[TopicManager]\t\tConstructed";
@@ -89,7 +92,7 @@ class TopicManager{
 		~TopicManager(){
 			LOG(INFO) << "\t[TopicManager]\tDestructed";
 		}
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
@@ -97,7 +100,7 @@ class TopicManager{
 
 	private:
 		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]);
-		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, heartbeat_system::SequencerType);
+		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, heartbeat_system::SequencerType);
 		int GetTopicIdx(char topic[TOPIC_NAME_SIZE]){
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
 		}
@@ -107,6 +110,7 @@ class TopicManager{
 		}
 
 		CXLManager &cxl_manager_;
+		DiskManager &disk_manager_;
 		static const std::hash<std::string> topic_to_idx_;
 		absl::flat_hash_map<std::string, std::unique_ptr<Topic> > topics_;
 		absl::Mutex mutex_;
