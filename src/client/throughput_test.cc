@@ -455,7 +455,7 @@ class Client{
 			for (int i=0; i < num_threads_; i++)
 				threads_.emplace_back(&Client::PublishThread, this, i);
 			while(thread_count_.load() != num_threads_){std::this_thread::yield();}
-			LOG(ERROR) << "Init finished.";
+			//LOG(ERROR) << "Init finished.";
 			return;
 		}
 
@@ -851,7 +851,7 @@ class Client{
 			// Since there is no one-to-one relationship of threads to sockets, do not close them here.
 			//close(sock);
 			//close(efd);
-			LOG(ERROR) << "PublishThread completed";
+			//LOG(ERROR) << "PublishThread completed";
 		}
 
 		// Current implementation does not send messages to newly added nodes after init
@@ -1335,9 +1335,7 @@ class Subscriber{
 				memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
 				c.Publish(message, message_size);
 			}
-			LOG(ERROR) << "Finished publish loop.";
 			c.Poll(n);
-			LOG(ERROR) << "Stuck in Poll.";
 			auto pub_end = std::chrono::high_resolution_clock::now();
 			s.DEBUG_wait(total_message_size, message_size);
 			auto end = std::chrono::high_resolution_clock::now();
