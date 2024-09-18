@@ -32,7 +32,13 @@ namespace Embarcadero{
 #define MAX_MSG_SIZE 1UL << 20
 #define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
 #define BATCH_SIZE (1UL<<19)
+//#define BATCH_SIZE  786432   
+//#define BATCH_SIZE  589824
 //#define BATCH_SIZE  557056
+//#define BATCH_SIZE 532480
+//#define BATCH_SIZE 524800
+//#define BATCH_SIZE 1048640
+
 
 //********* Health check configs *********
 #define HEARTBEAT_INTERVAL 3 // in seconds
