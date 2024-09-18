@@ -110,7 +110,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	}
 
 	int replication_factor = tinode->replication_factor;
-	disk_manager_.Replicate(tinode, replication_factor);
+	if(replication_factor > 0){
+		disk_manager_.Replicate(tinode, replication_factor);
+	}
 
 	if(tinode->seq_type != KAFKA)
 		topics_[topic]->Combiner();
@@ -153,7 +155,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
-	disk_manager_.Replicate(tinode, replication_factor);
+	if(replication_factor > 0){
+		disk_manager_.Replicate(tinode, replication_factor);
+	}
 
 	if(seq_type != KAFKA)
 		topics_[topic]->Combiner();

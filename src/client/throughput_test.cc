@@ -395,7 +395,8 @@ class Client{
 					t.join();
 			}
 			shutdown_ = true;
-			ack_thread_.join();
+			if(ack_thread_.joinable())
+				ack_thread_.join();
 			return;
 		}
 
@@ -1143,7 +1144,8 @@ class Subscriber{
 		void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads,
 				int ack_level, int order, SequencerType seq_type, int replication_factor){
 			size_t n = total_message_size/message_size;
-			LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
+			LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << 
+				" num_threads:" << num_threads << " replication_factor:" << replication_factor;
 			char* message = (char*)malloc(sizeof(char)*message_size);
 			char topic[TOPIC_NAME_SIZE];
 			memset(topic, 0, TOPIC_NAME_SIZE);
