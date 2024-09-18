@@ -57,7 +57,7 @@ struct alignas(64) PublishRequest{
 	int client_socket;
 	void* payload_address;
 	int num_messages;
-	size_t total_size;;
+	size_t total_size;
 };
 
 using CreateTopicEntryCallback = std::function<bool(char*, int, heartbeat_system::SequencerType)>;
