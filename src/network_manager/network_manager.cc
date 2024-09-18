@@ -11,6 +11,7 @@
 #include <glog/logging.h>
 #include <cstring>
 #include <sstream>
+#include <limits>
 #include <chrono>
 #include <errno.h>
 #include "mimalloc.h"
@@ -48,25 +49,21 @@ inline void make_socket_non_blocking(int fd) {
 
 NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads):
 	requestQueue_(queueCapacity),
-	ackQueue_(10000),
 	largeMsgQueue_(10000),
 	broker_id_(broker_id),
 	num_reqReceive_threads_(num_reqReceive_threads){
 		// Create Network I/O threads
 		threads_.emplace_back(&NetworkManager::MainThread, this);
-		for (int i=0; i< NUM_ACK_THREADS; i++)
-			threads_.emplace_back(&NetworkManager::AckThread, this);
 		for (int i=0; i< num_reqReceive_threads; i++)
 			threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
 
-		while(thread_count_.load() != (1 + NUM_ACK_THREADS + num_reqReceive_threads_)){}
+		while(thread_count_.load() != (1 + num_reqReceive_threads_)){}
 		LOG(INFO) << "\t[NetworkManager]: \tConstructed";
 }
 
 NetworkManager::~NetworkManager(){
 	stop_threads_ = true;
 	std::optional<struct NetworkRequest> sentinel = std::nullopt;
-	ackQueue_.blockingWrite(sentinel);
 	for (int i=0; i<num_reqReceive_threads_; i++)
 		requestQueue_.blockingWrite(sentinel);
 
@@ -76,11 +73,6 @@ NetworkManager::~NetworkManager(){
 		}
 	}
 	LOG(INFO) << "[NetworkManager]: \tDestructed";
-}
-
-//Currently only for ack
-void NetworkManager::EnqueueRequest(struct NetworkRequest req){
-	ackQueue_.blockingWrite(req);
 }
 
 void NetworkManager::ReqReceiveThread(){
@@ -147,14 +139,68 @@ void NetworkManager::ReqReceiveThread(){
 									close(ack_fd);
 									return;
 								}
+								//VLOG(3) << "connect failed:" << strerror(errno);
+								if (errno == EINPROGRESS) {
+									// Connection is in progress, use epoll to wait for completion
+									//VLOG(3) << "Connection in progress...";
+
+									// Create epoll instance to monitor the socket for EPOLLOUT
+									ack_efd_ = epoll_create1(0);
+									struct epoll_event event;
+									event.data.fd = ack_fd;
+									event.events = EPOLLOUT;
+									if (epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
+											perror("epoll_ctl failed");
+											close(ack_fd);
+											return;
+									}
+
+									// Wait for the socket to become writable (i.e., connection success/failure)
+									struct epoll_event events[1];
+									int n = epoll_wait(ack_efd_, events, 1, 5000);  // 5-second timeout
+									if (n > 0 && (events[0].events & EPOLLOUT)) {
+											// Check if the connection was successful
+											int sock_error;
+											socklen_t len = sizeof(sock_error);
+											if (getsockopt(ack_fd, SOL_SOCKET, SO_ERROR, &sock_error, &len) < 0) {
+													perror("getsockopt failed");
+													close(ack_fd);
+													return;
+											}
+
+											if (sock_error != 0) {
+												// Connection failed
+												LOG(ERROR) << "Connection failed: " << strerror(sock_error);
+												close(ack_fd);
+												return;
+											}
+									} else if (n == 0) {
+											// Timeout
+											LOG(ERROR) << "Connection timed out" << strerror(errno);
+											close(ack_fd);
+											return;
+									} else {
+											// epoll_wait error
+											LOG(ERROR) << "epoll_wait failed" << strerror(errno);
+											close(ack_fd);
+											return;
+									}
+								} else {
+									// Handle other connection errors
+									LOG(ERROR)<<"Connect failed" << strerror(errno);
+									close(ack_fd);
+									return;
+								}
+							}else{
+								ack_fd_ = ack_fd;
+								ack_efd_ = epoll_create1(0);
+								struct epoll_event event;
+								event.data.fd = ack_fd;
+								event.events = EPOLLOUT; 
+								epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event);
 							}
-							ack_fd_ = ack_fd;
-							ack_efd_ = epoll_create1(0);
-							struct epoll_event event;
-							event.data.fd = ack_fd;
-							event.events = EPOLLOUT; 
-							epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event);
 							ack_connections_[shake.client_id] = ack_fd;
+							threads_.emplace_back(&NetworkManager::AckThread, this, shake.topic, ack_fd);
 						}
 					}
 					size_t READ_SIZE = ZERO_COPY_SEND_LIMIT;
@@ -376,33 +422,40 @@ void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int 
 }
 
 // Current impl opens ack connection at publish and does not close it
-void NetworkManager::AckThread(){
-	std::optional<struct NetworkRequest> optReq;
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
+void NetworkManager::AckThread(char *topic, int ack_fd){
 	size_t bufSize = 1024*1024;
 	char buf[bufSize];
 	struct epoll_event events[10]; // Adjust size as needed
-
+	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+	int replication_factor = tinode->replication_factor;
+	CHECK_GT(replication_factor, 0) << " Replication factor must be larger than 0 at ack:2";
+	int replicated = -1; // This is not precise but just one
 	while(!stop_threads_){
-		size_t ack_count = 0;
-		while(ackQueue_.read(optReq)){
-			if(!optReq.has_value()){
-				break;
+		size_t min = std::numeric_limits<size_t>::max();
+		// TODO(Jae) this relies on num_active_brokers == MAX_BROKER_NUM as disk manager
+		// Fix this to get current active num active brokers
+		for(int i=0; i<replication_factor; i++){
+			int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
+			if(min > tinode->offsets[b].replication_done[broker_id_]){
+				min = tinode->offsets[b].replication_done[broker_id_];
 			}
-			//struct NetworkRequest &req = optReq.value();
-			ack_count++;
 		}
+		size_t ack_count = min - replicated;
+		if(ack_count == 0){
+			continue;
+		}
+		replicated = min;
 		int EPOLL_TIMEOUT = -1; 
 		size_t acked_size = 0;
 		while (acked_size < ack_count) {
 			int n = epoll_wait(ack_efd_, events, 10, EPOLL_TIMEOUT);
 			for (int i = 0; i < n; i++) {
 				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
-					ssize_t bytesSent = send(ack_fd_, buf, MIN(bufSize, ack_count - acked_size), 0);
+					ssize_t bytesSent = send(ack_fd, buf, MIN(bufSize, ack_count - acked_size), 0);
 					if (bytesSent < 0) {
 						bytesSent = 0;
 						if (errno != EAGAIN) {
-							LOG(ERROR) << " Ack Send failed:" << strerror(errno) << " ack_fd:" << ack_fd_ << " ack size:" << (ack_count - acked_size);
+							LOG(ERROR) << " Ack Send failed:" << strerror(errno) << " ack_fd:" << ack_fd << " ack size:" << (ack_count - acked_size);
 							return;
 						}
 					} else {
@@ -411,17 +464,15 @@ void NetworkManager::AckThread(){
 				}
 			}
 		}
-		// Check if the connection is alive only after ack_fd_ is connected
-		if(ack_fd_ > 0){
-			int result = recv(ack_fd_, buf, 1, MSG_PEEK | MSG_DONTWAIT);
+		// Check if the connection is alive only after ack_fd is connected
+		if(ack_fd > 0){
+			int result = recv(ack_fd, buf, 1, MSG_PEEK | MSG_DONTWAIT);
 			if(result == 0){
-				LOG(INFO) << "Connection is closed ack_fd_:" << ack_fd_ ;
+				LOG(INFO) << "Connection is closed ack_fd:" << ack_fd ;
 				//stop_threads_ = true;
 				break;
 			}
 		}
-		if(ack_count > 0 && !optReq.has_value()) // Check ack_count >0 as the read is non-blocking
-			break;
 	}
 }
 

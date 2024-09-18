@@ -40,29 +40,42 @@ using heartbeat_system::SequencerType::CORFU;
  * 			Message: Header + paylod
  */
 
-struct alignas(32) offset_entry {
-	volatile int ordered;
+struct alignas(64) offset_entry {
+	/*
 	volatile int written;
+	volatile unsigned long long int written_addr;
 	//Since each broker will have different virtual adddress on the CXL memory, access it via CXL_addr_ + off
+	volatile int ordered;
 	volatile size_t ordered_offset; //relative offset to last ordered message header
 	volatile size_t log_offset;
+	volatile int replication_done[NUM_MAX_BROKERS];
+	*/
+	struct {
+		volatile size_t log_offset;
+		volatile int written;
+		volatile unsigned long long int written_addr;
+		volatile int replication_done[NUM_MAX_BROKERS];
+	}__attribute__((aligned(64)));
+	struct {
+		volatile int ordered;
+		volatile size_t ordered_offset; //relative offset to last ordered message header
+	}__attribute__((aligned(64)));
 };
 
 struct alignas(64) TInode{
+	struct {
+		char topic[TOPIC_NAME_SIZE];
+		volatile uint8_t order;
+		volatile uint8_t replication_factor;
+		SequencerType seq_type;
+	}__attribute__((aligned(64)));
+	/*
 	char topic[TOPIC_NAME_SIZE];
 	volatile uint8_t order;
 	volatile uint8_t replication_factor;
 	SequencerType seq_type;
+	 */
 	volatile offset_entry offsets[NUM_MAX_BROKERS];
-};
-
-struct NonCriticalMessageHeader{
-	int client_id;
-	size_t client_order;
-	size_t size;
-	size_t paddedSize;
-	void* segment_header;
-	char _padding[64 - (sizeof(int) + sizeof(size_t) * 3 + sizeof(void*))]; 
 };
 
 struct alignas(64) BatchHeader{
@@ -77,7 +90,7 @@ struct alignas(64) BatchHeader{
 struct alignas(64) MessageHeader{
 	void* segment_header;
 	size_t logical_offset;
-	unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
+	volatile unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
 	volatile size_t total_order;
 	uint32_t client_id;
 	uint32_t client_order;

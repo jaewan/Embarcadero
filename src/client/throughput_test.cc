@@ -358,9 +358,13 @@ class Client{
 			memcpy(topic_, topic, TOPIC_NAME_SIZE);
 			ack_level_ = ack_level;
 			ack_port_ = GenerateRandomNum();
-			ack_thread_ = std::thread([this](){
-					this->EpollAckThread();
-					});
+			if(ack_level >= 2){
+				ack_thread_ = std::thread([this](){
+						this->EpollAckThread();
+						});
+				while(thread_count_.load() == 0){std::this_thread::yield();}
+				thread_count_.store(0);
+			}
 			for (int i=0; i < num_threads_; i++)
 				threads_.emplace_back(&Client::PublishThread, this, brokers_[i%brokers_.size()],  i);
 			while(thread_count_.load() != num_threads_){std::this_thread::yield();}
@@ -457,7 +461,7 @@ class Client{
 
 			int flag = 1;
 			if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) < 0) {
-				std::cerr << "setsockopt(SO_REUSEADDR) failed\n";
+				LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed\n";
 				close(server_sock);
 				return;
 			}
@@ -471,20 +475,20 @@ class Client{
 			server_addr.sin_addr.s_addr = INADDR_ANY;
 
 			if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-				std::cerr << "Bind failed\n";
+				LOG(ERROR) << "Bind failed:" << strerror(errno);
 				close(server_sock);
 				return;
 			}
 
 			if (listen(server_sock, SOMAXCONN) < 0) {
-				std::cerr << "Listen failed\n";
+				LOG(ERROR) << "Listen failed\n";
 				close(server_sock);
 				return;
 			}
 
 			int epoll_fd = epoll_create1(0);
 			if (epoll_fd == -1) {
-				std::cerr << "Failed to create epoll file descriptor\n";
+				LOG(ERROR) << "Failed to create epoll file descriptor\n";
 				close(server_sock);
 				return;
 			}
@@ -505,6 +509,8 @@ class Client{
 			size_t total_received = 0;
 			int EPOLL_TIMEOUT = 1; // 1 millisecond timeout
 			std::vector<int> client_sockets;
+
+			thread_count_.fetch_add(1);
 
 			while (!shutdown_ || total_received < client_order_) {
 				int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);

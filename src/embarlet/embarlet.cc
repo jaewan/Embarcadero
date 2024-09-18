@@ -128,7 +128,7 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Managers ********************** 
 	Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_addr.substr(0, colonPos));
-	Embarcadero::DiskManager disk_manager((1UL<<25), broker_id);
+	Embarcadero::DiskManager disk_manager(64, broker_id, cxl_manager.GetCXLAddr());
 	Embarcadero::NetworkManager network_manager(128, broker_id, num_network_io_threads);
 	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id);
 	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, 

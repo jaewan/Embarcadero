@@ -58,11 +58,10 @@ class NetworkManager{
 	private:
 		void ReqReceiveThread();
 		void MainThread();
-		void AckThread();
+		void AckThread(char* topic, int ack_fd);
 		void SubscribeNetworkThread(int , int, char*, int);
 
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;
-		folly::MPMCQueue<std::optional<struct NetworkRequest>> ackQueue_;
 		folly::MPMCQueue<struct LargeMsgRequest> largeMsgQueue_;
 		int broker_id_;
 		std::vector<std::thread> threads_;
