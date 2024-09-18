@@ -195,7 +195,7 @@ void NetworkManager::ReqReceiveThread(){
 					  //LOG(ERROR) << "RECEIVED BATCH_NUM(" << batch_header.batch_num << ")";
 						SequencerType seq_type = EMBARCADERO;	
 						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset, is_valid, seq_type);
-						assert(buf != NULL);
+						//assert(buf != NULL);
 
 						size_t batch_bytes_read = 0;
 						size_t batch_to_read  = batch_header.total_size;
