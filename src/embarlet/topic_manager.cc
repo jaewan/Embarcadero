@@ -359,7 +359,7 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest
 }
 
 std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
-	LOG(ERROR) << "In CORFU GetCXLBuffer for batch_num=" << logical_offset;
+	//LOG(ERROR) << "In CORFU GetCXLBuffer for batch_num=" << logical_offset;
   seq_type = CORFU;	
 	uint32_t global_batch_num = (uint32_t)logical_offset;
 	auto start = std::chrono::high_resolution_clock::now();
@@ -416,7 +416,7 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req,
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
-	LOG(ERROR) << "CORFU BATCH NUM " << global_batch_num << " SET ISVALID=" << is_valid;
+	//LOG(ERROR) << "CORFU BATCH NUM " << global_batch_num << " SET ISVALID=" << is_valid;
 	return nullptr;
 }
 

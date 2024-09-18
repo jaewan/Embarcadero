@@ -192,7 +192,8 @@ void NetworkManager::ReqReceiveThread(){
 						void* buf = NULL;
 						bool is_valid = true;
 						size_t logical_offset = batch_header.batch_num;
-					  SequencerType seq_type = EMBARCADERO;	
+					  //LOG(ERROR) << "RECEIVED BATCH_NUM(" << batch_header.batch_num << ")";
+						SequencerType seq_type = EMBARCADERO;	
 						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset, is_valid, seq_type);
 						assert(buf != NULL);
 
@@ -223,9 +224,8 @@ void NetworkManager::ReqReceiveThread(){
 
 								// Do this before combiner runs (before we mark as complete) to ensure no problems w/ writes
 								if (seq_type == CORFU) {
-									// This is only needed for corfu but shouldn't hurt to do w/ kafka too
 									header->total_order = MSGS_PER_FIXED_BATCH * batch_header.batch_num + msg_in_batch;
-									LOG(ERROR) << "SEQUENCED: " << MSGS_PER_FIXED_BATCH * batch_header.batch_num + msg_in_batch;
+									//LOG(ERROR) << "SEQUENCED: " << MSGS_PER_FIXED_BATCH * batch_header.batch_num + msg_in_batch;
 								}
 
 								if (!is_valid) {
