@@ -427,11 +427,22 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
 	if(last_addr != nullptr){
-		while((struct MessageHeader*)start_msg_header->next_msg_diff == 0){
-			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
-			std::this_thread::yield();
+		while(true) {
+			while((struct MessageHeader*)start_msg_header->next_msg_diff == 0){
+				LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
+				std::this_thread::yield();
+			}
+			start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
+			
+			// This is for corfu only
+			if (start_msg_header->complete != -1) {
+				break;
+			} else {
+				LOG(INFO) << "[GetMessageAddr] skipping invalid message ";
+				start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
+			}
+
 		}
-		start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
 	}else{
 		//TODO(Jae) this is only true in a single segment setup
 		if(combined_addr <= last_addr){
