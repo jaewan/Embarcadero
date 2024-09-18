@@ -27,13 +27,12 @@ namespace Embarcadero{
 #define SEGMENT_SIZE (1UL << 34)
 #define NUM_DISK_IO_THREADS 1 
 #define NUM_NETWORK_IO_THREADS 24 
-#define NUM_ACK_THREADS 1
 #define NUM_SUB_CONNECTIONS 2
 #define ZERO_COPY_SEND_LIMIT 1UL<<23
 #define MAX_MSG_SIZE 1UL << 20
 #define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
-//#define BATCH_SIZE (1UL<<19)
-#define BATCH_SIZE  557056
+#define BATCH_SIZE (1UL<<19)
+//#define BATCH_SIZE  557056
 
 //********* Health check configs *********
 #define HEARTBEAT_INTERVAL 3 // in seconds

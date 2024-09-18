@@ -255,7 +255,6 @@ void Topic::CombinerThread(){
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
 		header->next_msg_diff = header->paddedSize;
-/*
 #ifdef __INTEL__
     _mm_clflushopt(header);
 #elif defined(__AMD__)
@@ -264,18 +263,15 @@ void Topic::CombinerThread(){
 		LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
     // Fallback or error handling
 #endif
-*/
 		std::atomic_thread_fence(std::memory_order_release);
 		tinode_->offsets[broker_id_].written = logical_offset_;
+		tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)header - (uint8_t*)cxl_addr_);
 		(*(unsigned long long int*)segment_header) =
 			(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
 		written_logical_offset_ = logical_offset_;
 		written_physical_addr_ = (void*)header;
 		header = (MessageHeader*)((uint8_t*)header + header->next_msg_diff);
 		logical_offset_++;
-		if(logical_offset_ >= 2621439){
-			VLOG(3) << "Combined:" << logical_offset_;
-		}
 	}
 }
 
@@ -314,6 +310,7 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 				written_logical_offset_ = logical_offset;
 				written_physical_addr_ = (void*)log;
 				tinode_->offsets[broker_id_].written = logical_offset;
+				tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)log - (uint8_t*)cxl_addr_);
 				(*(unsigned long long int*)current_segment_) =
 					(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
 				kafka_logical_offset_.store(logical_offset+1);
@@ -416,6 +413,8 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	}
 
 	messages = (void*)start_msg_header;
+#ifdef MULTISEGMENT
+	//TODO(Jae) use relative addr here for multi-node
 	unsigned long long int* last_msg_off = (unsigned long long int*)start_msg_header->segment_header;
 	struct MessageHeader *last_msg_of_segment = (MessageHeader*)((uint8_t*)last_msg_off + *last_msg_off);
 
@@ -428,6 +427,11 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 		last_offset = last_msg_of_segment->logical_offset;
 		last_addr = (void*)last_msg_of_segment;
 	}
+#else
+	messages_size = (uint8_t*)combined_addr - (uint8_t*)start_msg_header + ((MessageHeader*)combined_addr)->paddedSize; 
+	last_offset = ((MessageHeader*)combined_addr)->logical_offset;
+	last_addr = (void*)combined_addr;
+#endif
 	VLOG(3) << "sending:" << messages_size << " last_offset:" << last_offset << " combined:" << combined_offset;
 	return true;
 }
