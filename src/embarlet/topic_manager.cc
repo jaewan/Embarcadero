@@ -259,27 +259,10 @@ void Topic::CombinerThread(){
 		std::atomic_thread_fence(std::memory_order_release);
 		tinode_->offsets[broker_id_].written = logical_offset_;
 
-		/*
-			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
-			size_t written = tinode->offsets[broker].written;
-			if(written == (size_t)-1){
-				continue;
-			}
-			while(msg_logical_off <= written && msg_to_order[broker]->next_msg_diff != 0 && msg_to_order[broker]->logical_offset != (size_t)-1){
-				msg_to_order[broker]->total_order = seq;
-				seq++;
-				//std::atomic_thread_fence(std::memory_order_release);
-		*/
-
 		if (seq_type_ == CORFU) {
 			tinode_->offsets[broker_id_].ordered = logical_offset_;
 			tinode_->offsets[broker_id_].ordered_offset = (size_t)header; //(uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
 		}
-		/*
-				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
-				msg_logical_off++;
-				yield = false;
-		*/
 
 		(*(unsigned long long int*)segment_header) =
 			(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
