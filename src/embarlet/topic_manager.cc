@@ -259,6 +259,7 @@ void Topic::CombinerThread(){
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
 		header->next_msg_diff = header->paddedSize;
+		/*
 #ifdef __INTEL__
     _mm_clflushopt(header);
 #elif defined(__AMD__)
@@ -267,6 +268,7 @@ void Topic::CombinerThread(){
 		LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
     // Fallback or error handling
 #endif
+*/
 		std::atomic_thread_fence(std::memory_order_release);
 		tinode_->offsets[broker_id_].written = logical_offset_;
 		tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)header - (uint8_t*)cxl_addr_);

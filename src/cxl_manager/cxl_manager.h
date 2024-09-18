@@ -52,7 +52,7 @@ struct alignas(64) offset_entry {
 	*/
 	struct {
 		volatile size_t log_offset;
-		volatile int written;
+		volatile size_t written;
 		volatile unsigned long long int written_addr;
 		volatile int replication_done[NUM_MAX_BROKERS];
 	}__attribute__((aligned(64)));
