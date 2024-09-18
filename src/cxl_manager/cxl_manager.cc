@@ -256,7 +256,7 @@ void CXLManager::Sequencer2(char* topic){
 		for(auto broker : registered_brokers){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
 			//This ensures the message is Combined (complete ensures it is fully received)
-			if(msg_to_order[broker]->complete != 1 && msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written){
+			if(msg_to_order[broker]->complete == 1 && msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written){
 				yield = false;
 				queues[broker].push(msg_to_order[broker]);
 				int client = msg_to_order[broker]->client_id;
