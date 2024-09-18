@@ -372,7 +372,7 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req,
 			}
 			current_batch_num = corfu_global_batch_num_.load();
 		}
-		if (current_batch_num > global_batch_num) {
+		if (!set_validity && current_batch_num > global_batch_num) {
 			is_valid = false; // Uh oh, someone else beat us to it.
 			set_validity = true;
 		}
