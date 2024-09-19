@@ -404,7 +404,7 @@ class Client{
 				memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
 				shake.ack = ack_level_;
 				shake.port = ack_port_;
-				shake.connection_id = pubQuesIdx;
+				shake.connection_id = m;
 				size_t num_brokers = nodes_.size();
 				shake.num_msg = num_brokers; // shake.num_msg used as num brokers at pub
 
@@ -514,7 +514,7 @@ class Client{
 		grpc::Status status = stub_->GetGlobalBatchNum(&context, req, &reply);
 		if (status.ok()) {
 			*batch_order = reply.order();
-			last_batch_ordered_ += MSGS_PER_FIXED_BATCH;
+			last_batch_ordered_ += BATCH_SIZE / 1088; // TODO(erika): this is header->paddedSize
 			return true;
 		}
 		return false;
@@ -730,12 +730,14 @@ class Client{
 			int sock = -1;
 			int efd = -1;
 			size_t socket_idx = pubQuesIdx;
+			size_t num_brokers = nodes_.size();
 
 			// *********** Sending Messages ***********
 			std::vector<double> send_times;
 			std::vector<double> poll_times;
 			thread_count_.fetch_add(1);
 			size_t batch_seq = pubQuesIdx;
+			uint32_t corfu_batch_seq = 0;
 			while(!shutdown_){
 				size_t len;
 				void *msg = pubQue_.Read(pubQuesIdx, len);
@@ -745,8 +747,6 @@ class Client{
 				Embarcadero::BatchHeader batch_header = { 0 };
 				batch_header.total_size = len;
 				batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize;
-				batch_header.batch_seq = batch_seq;
-				batch_seq += num_threads_;
 
 				/*
 				if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
@@ -776,12 +776,12 @@ class Client{
 
 				if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
 					Embarcadero::MessageHeader *hdr = (Embarcadero::MessageHeader *)msg;
-					if (!GetGlobalBatchNum(&batch_seq, hdr->client_order)) {
+					if (!GetGlobalBatchNum(&corfu_batch_seq, hdr->client_order)) {
 						LOG(ERROR) << "Failed to get global batch number for batch starting with client order " << hdr->client_order;
 						exit(-1);
 					}
-					batch_header.batch_seq = batch_order;
-					socket_idx = (num_threads_ / num_brokers) * (batch_order % num_brokers) + pubQuesIdx % (num_threads_ / num_brokers);
+					batch_header.batch_seq = (size_t)corfu_batch_seq;
+					socket_idx = (num_threads_ / num_brokers) * (corfu_batch_seq % num_brokers) + pubQuesIdx % (num_threads_ / num_brokers);
 				} else {
 					batch_header.batch_seq = batch_seq;
 					batch_seq += num_threads_;
