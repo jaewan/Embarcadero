@@ -207,13 +207,14 @@ void NetworkManager::ReqReceiveThread(){
 					to_read = READ_SIZE;
 
 					// Create publish request
-					struct PublishRequest pub_req;
+					PublishRequest pub_req = { 0 };
 					memcpy(pub_req.topic, shake.topic, TOPIC_NAME_SIZE);
+
 					pub_req.acknowledge = shake.ack;
 					pub_req.connection_id = shake.connection_id;
 					pub_req.num_brokers = shake.num_msg; //shake.num_msg used as num_brokers at pub
 
-					BatchHeader batch_header;
+					BatchHeader batch_header = { 0 };
 					while(running){
 						// give up if we can't at least read a partial batch header
 						ssize_t bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
@@ -233,19 +234,24 @@ void NetworkManager::ReqReceiveThread(){
 							}
 							bytes_read += recv_ret;
 						}
+
 						to_read = batch_header.total_size;
 						pub_req.total_size = batch_header.total_size;
 						pub_req.num_messages = batch_header.num_msg;
 						pub_req.batch_seq = batch_header.batch_seq;
+
 						// TODO(Jae) Send -1 to ack if this returns nullptr
 						void*  segment_header;
 						void*  buf = nullptr;
 						size_t logical_offset;
-						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset);
+						SequencerType seq-type = EMBARCADERO;
+						bool is_valid = true;
+						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset, is_valid, seq_type);
 						size_t read = 0;
-						MessageHeader* header;
+						MessageHeader* header;	
 						size_t header_size = sizeof(MessageHeader);
 						size_t bytes_to_next_header = 0;
+						size_t msg_in_batch = 0;
 						while(running){
 							bytes_read = recv(req.client_socket, (uint8_t*)buf + read, to_read, 0);
 							if(bytes_read < 0){
@@ -257,13 +263,28 @@ void NetworkManager::ReqReceiveThread(){
 							// We need this for ack=1 as well to confirm that the messages are valid
 							while(bytes_to_next_header + header_size <= (size_t) bytes_read){
 								header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
-								header->complete = 1;
+								
+								// Do this before combiner runs (before we mark as complete) to½U½U ensure no problems w/ writes
+								if (seq_type == CORFU) {
+									header->total_order = MSGS_PER_FIXED_BATCH * batch_header.batch_num + msg_in_batch;
+									//LOG(ERROR) << "SEQUENCED: " << MSGS_PER_FIXED_BATCH * batch_header.batch_num + msg_in_batch;
+									msg_in_batch++;
+								}
+	
+								if (!is_valid) {
+									header->complete = -1;
+								} else {
+									header->complete = 1;
+								}
+								
+
 								bytes_read -= bytes_to_next_header;
 								read += bytes_to_next_header;
 								to_read -= bytes_to_next_header;
 								bytes_to_next_header = header->paddedSize;
 								if(kafka_callback){
 									header->logical_offset = logical_offset;
+
 									if(segment_header == nullptr){
 										LOG(ERROR) << "segment_header is null!!!!!!!!";
 									}
@@ -289,6 +310,8 @@ void NetworkManager::ReqReceiveThread(){
 								break;
 							}	
 						}
+
+						assert(batch_header.num_msg == msg_in_batch); // TODO(erika) remove this later
 						if(kafka_callback){
 							kafka_callback((void*)header, logical_offset-1);
 						}
@@ -343,6 +366,9 @@ void NetworkManager::ReqReceiveThread(){
 					close(efd);
 				}//end Subscribe
 				break;
+		default:
+			LOG(ERROR) << "UNKNOWN CLIENT REQUEST TYPE??";
+			exit(-1);
 		}
 	}
 }
