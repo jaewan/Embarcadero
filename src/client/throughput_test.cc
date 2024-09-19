@@ -1389,8 +1389,7 @@ class Subscriber{
 			}
 			if (seq_type == heartbeat_system::SequencerType::CORFU) {
 				size_t num_msgs =  total_message_size / message_size;
-				assert(MSGS_PER_CORFU_BATCH % num_threads == 0);
-				assert(num_msgs % (MSGS_PER_CORFU_BATCH / num_threads));
+				assert(num_msgs % MSGS_PER_CORFU_BATCH);
 			}
 			if(order == 3){
 				size_t padding = message_size % 64;
