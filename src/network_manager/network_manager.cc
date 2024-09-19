@@ -434,17 +434,24 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 		size_t min = std::numeric_limits<size_t>::max();
 		// TODO(Jae) this relies on num_active_brokers == MAX_BROKER_NUM as disk manager
 		// Fix this to get current active num active brokers
+		size_t r[replication_factor];
 		for(int i=0; i<replication_factor; i++){
 			int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
-			if(min > tinode->offsets[b].replication_done[broker_id_]){
-				min = tinode->offsets[b].replication_done[broker_id_];
+			r[i] =tinode->offsets[b].replication_done[broker_id_] ;
+			if(min > r[i]){
+				min = r[i];
+			}
+		}
+		if(min<replicated && replicated != -1){
+		VLOG(3) <<"min:" << min << " replicated:" << replicated;
+			for(int i=0; i<replication_factor; i++){
+		VLOG(3) <<r[i];
 			}
 		}
 		size_t ack_count = min - replicated;
 		if(ack_count == 0){
 			continue;
 		}
-		replicated = min;
 		int EPOLL_TIMEOUT = -1; 
 		size_t acked_size = 0;
 		while (acked_size < ack_count) {
@@ -455,7 +462,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 					if (bytesSent < 0) {
 						bytesSent = 0;
 						if (errno != EAGAIN) {
-							LOG(ERROR) << " Ack Send failed:" << strerror(errno) << " ack_fd:" << ack_fd << " ack size:" << (ack_count - acked_size);
+							LOG(ERROR) << " Ack Send failed:" << strerror(errno) << " ack_fd:" << ack_fd << " ack size:" << (ack_count - acked_size) << " ack_count:" <<ack_count << " acked_size:" << acked_size << " min:" << min << " repicated:" << replicated;
 							return;
 						}
 					} else {
@@ -464,6 +471,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 				}
 			}
 		}
+		replicated = min;
 		// Check if the connection is alive only after ack_fd is connected
 		if(ack_fd > 0){
 			int result = recv(ack_fd, buf, 1, MSG_PEEK | MSG_DONTWAIT);

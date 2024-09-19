@@ -88,7 +88,11 @@ void *mmap_large_buffer(size_t need, size_t &allocated){
 			LOG(INFO) <<"MAP_HUGETLB attempt failed, look at /sys/kernel/mm/hugepages for optimal performance";
 		}else{
 			LOG(ERROR) <<"mmap failed:" << strerror(errno);
+			buffer = malloc(need);
+			if(buffer){
+			LOG(ERROR) <<"malloc failed:" << strerror(errno);
 			exit(1);
+			}
 		}
 	}
 
@@ -97,21 +101,24 @@ void *mmap_large_buffer(size_t need, size_t &allocated){
 	return buffer;
 }
 
-DiskManager::DiskManager(size_t queueCapacity, int broker_id, void* cxl_addr,
-						 int num_io_threads, bool log_to_memory):
+DiskManager::DiskManager(size_t queueCapacity, int broker_id, void* cxl_addr, bool log_to_memory,
+						 int num_io_threads):
 						 requestQueue_(queueCapacity),
 						 broker_id_(broker_id),
 						 cxl_addr_(cxl_addr),
-						 num_io_threads_(num_io_threads),
-						 log_to_memory_(log_to_memory){
+						 log_to_memory_(log_to_memory),
+						 num_io_threads_(num_io_threads){
 	//TODO(Jae) this onlye works at single topic upto replication fator of all, change this later
 	num_io_threads_ = NUM_MAX_BROKERS;
 	if(log_to_memory_){
+	VLOG(3) << "log to mem";
 		for (int i=0; i< NUM_MAX_BROKERS; i++){
-			size_t allocated;
-			logs_[i] = mmap_large_buffer((1<<30)*10, allocated);
+			//size_t allocated;
+			//logs_[i] = mmap_large_buffer((1<<30), allocated);
+			logs_[i] = malloc((1<<30));
 		}
 	}else{
+	VLOG(3) << "log to disk";
 		const char *homedir;
 		if ((homedir = getenv("HOME")) == NULL) {
 			homedir = getpwuid(getuid())->pw_dir;
@@ -264,7 +271,7 @@ void DiskManager::DiskIOThread(){
 		while(!stop_threads_){
 			if(GetMessageAddr(req.tinode, order, req.broker_id, last_offset, last_addr, messages, messages_size)){
 				memcpy_nt((uint8_t*)logs_[req.broker_id] + offset, messages, messages_size);
-				offset+=messages_size;
+				//offset+=messages_size;
 				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
 			}
 		}
@@ -272,7 +279,7 @@ void DiskManager::DiskIOThread(){
 	}else{
 		while(!stop_threads_){
 			if(GetMessageAddr(req.tinode, order, req.broker_id, last_offset, last_addr, messages, messages_size)){
-				//write(req.fd, messages, messages_size);
+				write(req.fd, messages, messages_size);
 				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
 			}
 		}
