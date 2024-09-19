@@ -277,9 +277,13 @@ class Buffer{
 			return true;
 		}
 
-		void* Read(int bufIdx, size_t &len ){
-			if(order_ == 3){
-				while(!shutdown_ && bufs[bufIdx].tail - bufs[bufIdx].head < BATCH_SIZE){
+		void* Read(int bufIdx, size_t &len, heartbeat_system::SequencerType seq_type ){
+			if(order_ == 3 || seq_type == heartbeat_system::SequencerType::CORFU){
+				size_t data_to_read = BATCH_SIZE;
+				if (seq_type == heartbeat_system::SequencerType::CORFU) {
+					data_to_read = MSGS_PER_CORFU_BATCH * header_.paddedSize;
+				}
+				while(!shutdown_ && bufs[bufIdx].tail - bufs[bufIdx].head < data_to_read){
 					std::this_thread::yield();
 				}
 				size_t head = bufs[bufIdx].head;
@@ -288,8 +292,8 @@ class Buffer{
 				if(len==0){
 					return nullptr;
 				}
-				len = BATCH_SIZE;
-				bufs[bufIdx].head += BATCH_SIZE;
+				len = data_to_read;
+				bufs[bufIdx].head += data_to_read;
 				return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
 			}else{
 				while(!shutdown_ && bufs[bufIdx].tail <= bufs[bufIdx].head){
@@ -448,8 +452,10 @@ class Client{
 		void Publish(char* message, size_t len){
 			static size_t i = 0;
 			static size_t j = 0;
-			const static size_t batch_size = BATCH_SIZE;
-			size_t n = batch_size/(len+64);
+			size_t n = BATCH_SIZE/(len+64);
+			if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
+				n = MSGS_PER_CORFU_BATCH;
+			}
 			if(n == 0)
 				n = 1;
 			pubQue_.Write(i, client_order_, message, len);
@@ -514,7 +520,7 @@ class Client{
 		grpc::Status status = stub_->GetGlobalBatchNum(&context, req, &reply);
 		if (status.ok()) {
 			*batch_order = reply.order();
-			last_batch_ordered_ += BATCH_SIZE / 1088; // TODO(erika): this is header->paddedSize
+			last_batch_ordered_ += MSGS_PER_CORFU_BATCH;
 			return true;
 		}
 		return false;
@@ -740,7 +746,7 @@ class Client{
 			uint32_t corfu_batch_seq = 0;
 			while(!shutdown_){
 				size_t len;
-				void *msg = pubQue_.Read(pubQuesIdx, len);
+				void *msg = pubQue_.Read(pubQuesIdx, len, seq_type_);
 				if(len == 0){
 					break;
 				}
@@ -1380,6 +1386,11 @@ class Subscriber{
 			if(result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()){
 				LOG(ERROR) << "CGroup core throttle is wrong";
 				return -1;
+			}
+			if (seq_type == heartbeat_system::SequencerType::CORFU) {
+				size_t num_msgs =  total_message_size / message_size;
+				assert(MSGS_PER_CORFU_BATCH % num_threads == 0);
+				assert(num_msgs % (MSGS_PER_CORFU_BATCH / num_threads));
 			}
 			if(order == 3){
 				size_t padding = message_size % 64;

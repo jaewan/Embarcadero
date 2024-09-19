@@ -39,6 +39,7 @@ namespace Embarcadero{
 //#define BATCH_SIZE 524800
 //#define BATCH_SIZE 1048640
 #define CORFU_TIMEOUT 5000
+#define MSGS_PER_CORFU_BATCH (1UL<<12) // with padded msg size 1088 * 1<<12 = 4456448
 
 //********* Health check configs *********
 #define HEARTBEAT_INTERVAL 3 // in seconds
