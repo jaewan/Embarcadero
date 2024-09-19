@@ -83,9 +83,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	if(tinode->seq_type != KAFKA)
 		topics_[topic]->Combiner();
 
-		if (broker_id_ != 0 && tinode->seq_type == SCALOG){
-			cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
-		}
+	if (broker_id_ != 0 && tinode->seq_type == SCALOG){
+		cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
+	}
 
 	return tinode;
 }
@@ -225,7 +225,7 @@ void Topic::CombinerThread(){
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
 		header->next_msg_diff = header->paddedSize;
-		/*
+/*
 #ifdef __INTEL__
     _mm_clflushopt(header);
 #elif defined(__AMD__)
@@ -282,6 +282,7 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 				written_logical_offset_ = logical_offset;
 				written_physical_addr_ = (void*)log;
 				tinode_->offsets[broker_id_].written = logical_offset;
+				((MessageHeader*)log)->logical_offset = (size_t)-1;
 				tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)log - (uint8_t*)cxl_addr_);
 				(*(unsigned long long int*)current_segment_) =
 					(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);

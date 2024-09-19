@@ -106,7 +106,6 @@ DiskManager::DiskManager(size_t queueCapacity, int broker_id, void* cxl_addr,
 						 log_to_memory_(log_to_memory){
 	//TODO(Jae) this onlye works at single topic upto replication fator of all, change this later
 	num_io_threads_ = NUM_MAX_BROKERS;
-	VLOG(3) << "Log to memory:" << log_to_memory_ << " : " << log_to_memory;
 	if(log_to_memory_){
 		for (int i=0; i< NUM_MAX_BROKERS; i++){
 			size_t allocated;
@@ -182,9 +181,12 @@ void DiskManager::Replicate(TInode* tinode, int replication_factor){
 //This is a copy of Topic::GetMessageAddr changed to use tinode instead of topic variables
 bool DiskManager::GetMessageAddr(TInode* tinode, int order, int broker_id, size_t &last_offset,
 		void* &last_addr, void* &messages, size_t &messages_size){
-	void* combined_addr = (void*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id].written_addr);
-	//size_t combined_offset = ((MessageHeader*)combined_addr)->logical_offset;//tinode->offsets[broker_id].written;
-	size_t combined_offset = tinode->offsets[broker_id].written;
+	size_t relative_off = tinode->offsets[broker_id].written_addr;;
+	if(relative_off == 0)
+		return false;
+	void* combined_addr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(cxl_addr_) + relative_off);
+	size_t combined_offset = ((MessageHeader*)combined_addr)->logical_offset;//tinode->offsets[broker_id].written;
+	//size_t combined_offset = tinode->offsets[broker_id].written;
 
 	if(order > 0){
 		combined_addr = (uint8_t*)cxl_addr_ + tinode->offsets[broker_id].ordered_offset;
@@ -199,10 +201,10 @@ bool DiskManager::GetMessageAddr(TInode* tinode, int order, int broker_id, size_
 	if(last_addr != nullptr){
 		while(start_msg_header->next_msg_diff == 0){
 			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined " << start_msg_header->logical_offset
-				<< " combined_offset:" << combined_offset << " combined_from_addr:" << ((MessageHeader*)combined_addr)->logical_offset
-				<< "paddedSize:" << start_msg_header->paddedSize 
-				<< " last_offset:" << last_offset << " last_addr:" << last_addr << " client_order:" << start_msg_header->client_id
-				<< " local:" << (broker_id == broker_id_) << " complete:" << start_msg_header->complete;
+				<< " cxl_addr:" << cxl_addr_  << " +  relative addr:" << relative_off
+				<< " = combined_addr:" << reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(cxl_addr_) + relative_off)
+				<< " combined_addr:" << combined_addr
+				<< " combined_offset:" << combined_offset << " combined_from_addr:" << ((MessageHeader*)combined_addr)->logical_offset;
 			std::this_thread::yield();
 			sleep(3);
 		}
@@ -219,12 +221,6 @@ bool DiskManager::GetMessageAddr(TInode* tinode, int order, int broker_id, size_
 	if(start_msg_header->paddedSize == 0){
 		return false;
 	}
-			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined " << start_msg_header->logical_offset
-				<< " combined_offset:" << combined_offset << " combined_from_addr:" << ((MessageHeader*)combined_addr)->logical_offset
-				<< "paddedSize:" << start_msg_header->paddedSize 
-				<< " last_offset:" << last_offset << " last_addr:" << last_addr << " client_order:" << start_msg_header->client_id
-				<< " local:" << (broker_id == broker_id_) << " complete:" << start_msg_header->complete;
-
 	messages = (void*)start_msg_header;
 
 #ifdef MULTISEGMENT
@@ -276,7 +272,7 @@ void DiskManager::DiskIOThread(){
 	}else{
 		while(!stop_threads_){
 			if(GetMessageAddr(req.tinode, order, req.broker_id, last_offset, last_addr, messages, messages_size)){
-				write(req.fd, messages, messages_size);
+				//write(req.fd, messages, messages_size);
 				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
 			}
 		}
