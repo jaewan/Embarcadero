@@ -311,12 +311,14 @@ void NetworkManager::ReqReceiveThread(){
 						}
 
 						// TODO(erika): remove these later
-						if (read > 0 && batch_header.num_msg * header->paddedSize != read) {
+						if (seq_type == CORFU && read > 0 && batch_header.num_msg * header->paddedSize != read) {
 							LOG(ERROR) << "msg_count: " << msg_in_batch << " num_msg: " << batch_header.num_msg << " expected: " << MSGS_PER_CORFU_BATCH / header->paddedSize;
 							assert(batch_header.num_msg * header->paddedSize == read);
 						}
-						assert(batch_header.num_msg == MSGS_PER_CORFU_BATCH);
-						assert(batch_header.num_msg == msg_in_batch); // TODO(erika) remove this later
+						if (seq_type == CORFU) {
+							assert(batch_header.num_msg == MSGS_PER_CORFU_BATCH);
+							assert(batch_header.num_msg == msg_in_batch); // TODO(erika) remove this later
+						}
 						if(kafka_callback){
 							kafka_callback((void*)header, logical_offset-1);
 						}
