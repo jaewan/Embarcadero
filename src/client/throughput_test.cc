@@ -1388,8 +1388,16 @@ class Subscriber{
 				return -1;
 			}
 			if (seq_type == heartbeat_system::SequencerType::CORFU) {
-				size_t num_msgs =  total_message_size / message_size;
-				assert(num_msgs % MSGS_PER_CORFU_BATCH);
+				assert(total_message_size % message_size == 0);
+				size_t num_msgs = total_message_size / message_size;
+				size_t batch_padding = num_msgs % MSGS_PER_CORFU_BATCH;
+				if (batch_padding) {
+					size_t num_msgs_to_add = MSGS_PER_CORFU_BATCH - batch_padding;
+					LOG(INFO) << "Adjusting total message size from " << total_message_size << " to " << num_msgs_to_add * message_size + total_message_size;
+					total_message_size += batch_padding * message_size;
+				}
+				num_msgs = total_message_size / message_size;
+				assert(num_msgs % MSGS_PER_CORFU_BATCH == 0);
 			}
 			if(order == 3){
 				size_t padding = message_size % 64;
