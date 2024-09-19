@@ -22,7 +22,8 @@ struct ReplicationRequest{
 
 class DiskManager{
 	public:
-		DiskManager(size_t queueCapacity, int broker_id, void* cxl_manager, int num_io_threads=NUM_DISK_IO_THREADS);
+		DiskManager(size_t queueCapacity, int broker_id, void* cxl_manager, 
+						int num_io_threads=NUM_DISK_IO_THREADS, bool log_to_memory=false);
 		~DiskManager();
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
@@ -45,6 +46,8 @@ class DiskManager{
 		std::atomic<int> thread_count_{0};
 		int broker_id_;
 		int num_io_threads_;
+		bool log_to_memory_;
+		void* logs_[NUM_MAX_BROKERS];
 		fs::path prefix_path_;
 };
 

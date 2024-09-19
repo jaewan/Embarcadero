@@ -376,6 +376,8 @@ class Client{
 			static size_t j = 0;
 			const static size_t batch_size = BATCH_SIZE;
 			size_t n = batch_size/(len+64);
+			if(n == 0)
+				n = 1;
 			pubQue_.Write(i, client_order_, message, len);
 			j++;
 			if(j == n){
@@ -1211,7 +1213,7 @@ class Subscriber{
 			}
 			Client c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
 			c.CreateNewTopic(topic, order, seq_type, replication_factor);
-			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
+			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false);
 			c.Init(topic, ack_level);
 
 			auto start = std::chrono::high_resolution_clock::now();
@@ -1292,7 +1294,8 @@ class Subscriber{
 				("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
 				("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 				("r,replication_factor", "Replication factor", cxxopts::value<int>()->default_value("0"))
-				("t,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
+				("t,test_number", "Test to run. 0:pub/sub 1:E2E 2:Latency", cxxopts::value<int>()->default_value("0"))
+				("n,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
 
 			auto result = options.parse(argc, argv);
 			size_t message_size = result["size"].as<size_t>();
@@ -1319,12 +1322,12 @@ class Subscriber{
 					return 0;
 				}
 				/*
-				 * 128  : 2^12 * (128 + 64)    total_message_size : 2^22 * 20
-				 * 512  : 2^10 * (512 + 64)    total_message_size : 2^20 * 20
-				 * 1024 : 2^9 * (1024 + 64)
-				 * 4096 : 2^7 * (4096 + 64)
-				 * 64K  : 2^3 * (2^26 + 64)
-				 * 1M   : 2^-1 * (2^30+ 64)
+				 * 128  : 2^12 * (128 + 64) = 786432   total_message size = 10737942528  total_message_size : 2^22 * 20
+				 * 512  : 2^10 * (512 + 64) = 589824   defulat
+				 * 1024 : 2^9 * (1024 + 64) = 557056   default
+				 * 4096 : 2^7 * (4096 + 64) = 532480   default
+				 * 64K  : 2^3 * (2^16 + 64) = 524800	10737418240
+				 * 1M   : 2^-1 * (2^20+ 64) = 1048640
 				 */
 
 				size_t n = total_message_size/message_size;
@@ -1337,10 +1340,15 @@ class Subscriber{
 				}
 			}
 
-			PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
-			SubscribeThroughputTest(total_message_size, message_size, order, replication_factor);
-			//E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
-			//LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+			if(result["test_number"].as<int>() == 0){
+				PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+				sleep(3);
+				SubscribeThroughputTest(total_message_size, message_size, order, replication_factor);
+			}else if(result["test_number"].as<int>() == 1){
+				E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+			}else{
+				LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+			}
 
 			return 0;
 		}

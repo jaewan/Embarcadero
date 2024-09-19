@@ -10,40 +10,6 @@ namespace Embarcadero{
 
 #define NT_THRESHOLD 128
 
-void memcpy_nt(void* dst, const void* src, size_t size) {
-	// Cast the input pointers to the appropriate types
-	uint8_t* d = static_cast<uint8_t*>(dst);
-	const uint8_t* s = static_cast<const uint8_t*>(src);
-
-	// Align the destination pointer to 16-byte boundary
-	size_t alignment = reinterpret_cast<uintptr_t>(d) & 0xF;
-	if (alignment) {
-		alignment = 16 - alignment;
-		size_t copy_size = (alignment > size) ? size : alignment;
-		std::memcpy(d, s, copy_size);
-		d += copy_size;
-		s += copy_size;
-		size -= copy_size;
-	}
-
-	// Copy the bulk of the data using non-temporal stores
-	size_t block_size = size / 64;
-	for (size_t i = 0; i < block_size; ++i) {
-		_mm_stream_si64(reinterpret_cast<long long*>(d), *reinterpret_cast<const long long*>(s));
-		_mm_stream_si64(reinterpret_cast<long long*>(d + 8), *reinterpret_cast<const long long*>(s + 8));
-		_mm_stream_si64(reinterpret_cast<long long*>(d + 16), *reinterpret_cast<const long long*>(s + 16));
-		_mm_stream_si64(reinterpret_cast<long long*>(d + 24), *reinterpret_cast<const long long*>(s + 24));
-		_mm_stream_si64(reinterpret_cast<long long*>(d + 32), *reinterpret_cast<const long long*>(s + 32));
-		_mm_stream_si64(reinterpret_cast<long long*>(d + 40), *reinterpret_cast<const long long*>(s + 40));
-		_mm_stream_si64(reinterpret_cast<long long*>(d + 48), *reinterpret_cast<const long long*>(s + 48));
-		_mm_stream_si64(reinterpret_cast<long long*>(d + 56), *reinterpret_cast<const long long*>(s + 56));
-		d += 64;
-		s += 64;
-	}
-
-	// Copy the remaining data using standard memcpy
-	std::memcpy(d, s, size % 64);
-}
 void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	static size_t CACHE_LINE_SIZE = sysconf (_SC_LEVEL1_DCACHE_LINESIZE);
 	if (n < NT_THRESHOLD) {

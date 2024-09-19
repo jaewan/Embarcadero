@@ -86,6 +86,7 @@ int main(int argc, char* argv[]){
 		("e,emul", "Use emulation instead of CXL")
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("network_threads", "Number of network IO threads", cxxopts::value<int>()->default_value(std::to_string(NUM_NETWORK_IO_THREADS)))
+		("replicate_to_mem", "Replicate to Memory")
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		;
 
@@ -97,7 +98,11 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Broker ********************** 
 	bool is_head_node = false;
-
+	bool replicate_to_memory = false;
+	if (arguments.count("replicate_to_mem")) {
+		replicate_to_memory = true;
+	}
+	VLOG(3) << "Replicate to memory:" << replicate_to_memory;
 	if (arguments.count("head")) {
 		is_head_node = true;
 	} else if (arguments.count("follower")) {
@@ -128,7 +133,7 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Managers ********************** 
 	Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_addr.substr(0, colonPos));
-	Embarcadero::DiskManager disk_manager(64, broker_id, cxl_manager.GetCXLAddr());
+	Embarcadero::DiskManager disk_manager(64, broker_id, cxl_manager.GetCXLAddr(), replicate_to_memory);
 	Embarcadero::NetworkManager network_manager(128, broker_id, num_network_io_threads);
 	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id);
 	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, 
