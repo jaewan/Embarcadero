@@ -243,6 +243,7 @@ class Buffer{
 			}
 
 		~Buffer(){
+			LOG(ERROR) << "BUFFER DESTRUCTING";
 			for(size_t i=0; i < num_buf_; i++){
 				munmap(bufs[i].buffer, bufs[i].len);
 			}
@@ -281,6 +282,9 @@ class Buffer{
 			while(!shutdown_ && bufs[bufIdx].tail <= bufs[bufIdx].head){
 				std::this_thread::yield();
 			}
+			if (shutdown_) {
+				
+			}
 			size_t head = bufs[bufIdx].head;
 			//std::atomic_thread_fence(std::memory_order_acquire);
 			size_t tail = bufs[bufIdx].tail;
@@ -293,7 +297,6 @@ class Buffer{
 			len = num_msgs * (header_.size + sizeof(Embarcadero::MessageHeader));
 			//LOG(ERROR) << "In ReadExact for len " << len << " (num_msgs=" << num_msgs << ")";
 			while(bufs[bufIdx].tail < bufs[bufIdx].head + len){
-				std::this_thread::yield();
 				if (shutdown_) {
 					if (bufs[bufIdx].tail == bufs[bufIdx].head) {
 						len = 0;
@@ -302,6 +305,7 @@ class Buffer{
 						LOG(ERROR) << "Detected shutdown but " << bufs[bufIdx].tail - bufs[bufIdx].head<< " bytes still in buffer... ";
 					}
 				}
+				std::this_thread::yield();
 			}
 
 			//LOG(ERROR) << bufIdx << " - Ready to ReadExact, len=" << len << " diff=" << bufs[bufIdx].tail - bufs[bufIdx].head;
@@ -328,7 +332,13 @@ class Buffer{
 		}
 
 		void ReturnReads(){
+			//LOG(ERROR) << "ReturnReads() called";
 			shutdown_ = true;
+			for (size_t i = 0; i < num_buf_; i++) { 
+				while (bufs[i].head != bufs[i].tail) {
+					std::this_thread::yield();
+				}
+			}
 		}
 
 	private:
@@ -337,7 +347,7 @@ class Buffer{
 			size_t head;
 			size_t tail;
 			size_t len;
-		} *bufs;
+		} *bufs = { 0 };
 		size_t num_buf_;
 		bool shutdown_ = false;
 		Embarcadero::MessageHeader header_;
@@ -363,7 +373,9 @@ class Client{
 			}
 
 		~Client(){
+			LOG(ERROR) << "Destructing client";
 			shutdown_ = true;
+			
 			cluster_probe_thread_.join();
 			for(auto &t : threads_){
 				if(t.joinable())
@@ -403,7 +415,7 @@ class Client{
 					close(sock);
 					return;
 				}
-				struct epoll_event event;
+				struct epoll_event event = { 0 };
 				event.data.fd = sock;
 				event.events = EPOLLOUT;
 				if(epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event)){
@@ -420,7 +432,7 @@ class Client{
 				shake.port = ack_port_;
 				shake.size = message_size_ + sizeof(Embarcadero::MessageHeader);
 
-				struct epoll_event events[10]; // Adjust size as needed
+				struct epoll_event events[10] = { 0 }; // Adjust size as needed
 				bool running = true;
 				size_t sent_bytes = 0;
 
@@ -484,6 +496,7 @@ class Client{
 				if(t.joinable())
 					t.join();
 			}
+			//LOG(ERROR) << "shutdown_ in Poll()";
 			shutdown_ = true;
 			ack_thread_.join();
 			return;
@@ -916,6 +929,7 @@ class Subscriber{
 			}
 
 		~Subscriber(){
+			LOG(ERROR) << "Destructing subscriber";
 			shutdown_ = true;
 			cluster_probe_thread_.join();
 			for( auto &t : subscribe_threads_){
@@ -1337,6 +1351,7 @@ class Subscriber{
 			}
 			c.Poll(n);
 			auto pub_end = std::chrono::high_resolution_clock::now();
+			
 			s.DEBUG_wait(total_message_size, message_size);
 			auto end = std::chrono::high_resolution_clock::now();
 
