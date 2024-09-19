@@ -46,10 +46,10 @@ class Topic{
 
 	private:
 		void CombinerThread();
-		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
-		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
-		std::function<void(void*, size_t)> Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
-		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
+		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type);
+		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type);
+		std::function<void(void*, size_t)> Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type);
+		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type);
 		std::function<void(void*, size_t)> CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;

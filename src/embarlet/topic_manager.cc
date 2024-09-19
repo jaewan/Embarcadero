@@ -241,7 +241,7 @@ void Topic::CombinerThread(){
 		tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)header - (uint8_t*)cxl_addr_);
 		if (seq_type_ == CORFU) {
 			tinode_->offsets[broker_id_].ordered = logical_offset_;
-			tinode_->offsets[broker_id_].ordered_offset = (size_t)header; //(uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
+			tinode_->offsets[broker_id_].ordered_offset = (unsigned long long int)((uint8_t*)header - (uint8_t*)cxl_addr_);
 		}
 
 		(*(unsigned long long int*)segment_header) =
@@ -303,7 +303,7 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 	};
 }
 
-std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type){
+std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
 	size_t batch_seq;
 	absl::MutexLock lock(&mutex_);
 	if(skipped_batch_.contains(req.client_id)){
@@ -444,11 +444,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 			// This is for corfu only
 			if (start_msg_header->complete != -1) {
 				break;
-			} else {
-				LOG(INFO) << "[GetMessageAddr] skipping invalid message ";
-				start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
 			}
-
 		}
 	}else{
 		//TODO(Jae) this is only true in a single segment setup

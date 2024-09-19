@@ -96,7 +96,7 @@ struct alignas(64) MessageHeader{
 	uint32_t client_order;
 	size_t size;
 	volatile size_t paddedSize; // This include message+padding+header size
-	volatile uint32_t complete; // o = incomplete, 1 = complete, -1 = complete but invalid TODO(erika): make int32_t
+	volatile int32_t complete; // o = incomplete, 1 = complete, -1 = complete but invalid
 };
 
 class CXLManager{

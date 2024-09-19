@@ -243,7 +243,6 @@ class Buffer{
 			}
 
 		~Buffer(){
-			LOG(ERROR) << "BUFFER DESTRUCTING";
 			for(size_t i=0; i < num_buf_; i++){
 				munmap(bufs[i].buffer, bufs[i].len);
 			}
@@ -268,7 +267,7 @@ class Buffer{
 			}
 			header_.client_order = client_order;
 			if(bufs[bufIdx].tail + header_size + padded > bufs[bufIdx].len){
-				LOG(ERROR) << "tail:" << bufs[bufIdx].tail << " write size:" << padded << " will go over buffer:" << bufs[bufIdx].len;
+				//LOG(ERROR) << "tail:" << bufs[bufIdx].tail << " write size:" << padded << " will go over buffer:" << bufs[bufIdx].len;
 				return false;
 			}
 			memcpy((void*)((uint8_t*)bufs[bufIdx].buffer + bufs[bufIdx].tail), &header_, header_size);
@@ -305,52 +304,8 @@ class Buffer{
 			}
 		}
 
-		void* ReadExact(int bufIdx, size_t &len, size_t num_msgs){
-			len = num_msgs * (header_.size + sizeof(Embarcadero::MessageHeader));
-			//LOG(ERROR) << "In ReadExact for len " << len << " (num_msgs=" << num_msgs << ")";
-			while(bufs[bufIdx].tail < bufs[bufIdx].head + len){
-				if (shutdown_) {
-					if (bufs[bufIdx].tail == bufs[bufIdx].head) {
-						len = 0;
-						return NULL;
-					} else {
-						LOG(ERROR) << "Detected shutdown but " << bufs[bufIdx].tail - bufs[bufIdx].head<< " bytes still in buffer... ";
-					}
-				}
-				std::this_thread::yield();
-			}
-
-			//LOG(ERROR) << bufIdx << " - Ready to ReadExact, len=" << len << " diff=" << bufs[bufIdx].tail - bufs[bufIdx].head;
-			size_t head = bufs[bufIdx].head;
-			bufs[bufIdx].head = head + len;
-			return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
-
-			/*
-			// TODO(erika): remove verification code when confident; this checks that client order is sequential in batch
-			void *buff_start = (void *)((uint8_t*)bufs[bufIdx].buffer + head);
-			size_t step = (header_.size + sizeof(Embarcadero::MessageHeader));
-			uint32_t current_seq = 0;
-			for (size_t i = 0; i < num_msgs; i++) {
-				auto current_header = (Embarcadero::MessageHeader *)((uint8_t*)buff_start + step * i);
-				if (current_seq == 0) {
-					current_seq = current_header->client_order;
-				} else {
-					assert(current_header->client_order == current_seq + 1);
-					current_seq++;
-				}
-			}
-			return buff_start;
-			*/
-		}
-
 		void ReturnReads(){
-			//LOG(ERROR) << "ReturnReads() called";
 			shutdown_ = true;
-			for (size_t i = 0; i < num_buf_; i++) { 
-				while (bufs[i].head != bufs[i].tail) {
-					std::this_thread::yield();
-				}
-			}
 		}
 
 	private:
@@ -359,7 +314,7 @@ class Buffer{
 			size_t head;
 			size_t tail;
 			size_t len;
-		} *bufs = { 0 };
+		} *bufs;
 		size_t num_buf_;
 		int order_;
 		bool shutdown_ = false;
@@ -386,7 +341,6 @@ class Client{
 			}
 
 		~Client(){
-			LOG(ERROR) << "Destructing client";
 			shutdown_ = true;
 			
 			cluster_probe_thread_.join();
@@ -399,11 +353,13 @@ class Client{
 			if(cluster_probe_thread_.joinable())
 				cluster_probe_thread_.join();
 
-			for (auto &s : pub_fds_) {
-				close(s);
-			}
-			for (auto &e : pub_efds_) {
-				close(e);
+			if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
+				for (auto &s : pub_fds_) {
+					close(s);
+				}
+				for (auto &e : pub_efds_) {
+					close(e);
+				}
 			}
 
 			LOG(INFO) << "Destructed Client";
@@ -422,9 +378,10 @@ class Client{
 			}
 
 			for (int m = 0; m < num_threads_; m++) {
-				size_t broker_id = m % brokers_.size();
-				auto [addr, addressPort] = ParseAddressPort(nodes_[broker_id]);
-				int sock = GetNonblockingSock(addr.data(), PORT + broker_id);
+				size_t broker_id = brokers_[m % brokers_.size()];
+			  auto [addr, addressPort] = ParseAddressPort(nodes_[broker_id]);
+				int sock = GetNonblockingSock(addr.data(), PORT + broker_id);	
+				
 				// *********** Initiate Shake ***********
 				int efd = epoll_create1(0);
 				if(efd < 0){
@@ -432,7 +389,7 @@ class Client{
 					close(sock);
 					return;
 				}
-				struct epoll_event event = { 0 };
+				struct epoll_event event;
 				event.data.fd = sock;
 				event.events = EPOLLOUT;
 				if(epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event)){
@@ -447,9 +404,11 @@ class Client{
 				memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
 				shake.ack = ack_level_;
 				shake.port = ack_port_;
-				shake.size = message_size_ + sizeof(Embarcadero::MessageHeader);
+				shake.connection_id = pubQuesIdx;
+				size_t num_brokers = nodes_.size();
+				shake.num_msg = num_brokers; // shake.num_msg used as num brokers at pub
 
-				struct epoll_event events[10] = { 0 }; // Adjust size as needed
+				struct epoll_event events[10]; // Adjust size as needed
 				bool running = true;
 				size_t sent_bytes = 0;
 
@@ -476,7 +435,6 @@ class Client{
 						}
 					}
 				}
-
 				pub_fds_.push_back(sock);
 				pub_efds_.push_back(efd);
 			}
@@ -484,7 +442,6 @@ class Client{
 			for (int i=0; i < num_threads_; i++)
 				threads_.emplace_back(&Client::PublishThread, this, i);
 			while(thread_count_.load() != num_threads_){std::this_thread::yield();}
-			//LOG(ERROR) << "Init finished.";
 			return;
 		}
 
@@ -498,7 +455,7 @@ class Client{
 			pubQue_.Write(i, client_order_, message, len);
 			
 			j++;
-			if (j == n){
+			if(j == n){
 				i = (i+1)%num_threads_;
 				j = 0;
 			}
@@ -514,7 +471,6 @@ class Client{
 				if(t.joinable())
 					t.join();
 			}
-			//LOG(ERROR) << "shutdown_ in Poll()";
 			shutdown_ = true;
 			if(ack_thread_.joinable())
 				ack_thread_.join();
@@ -547,7 +503,7 @@ class Client{
 			return false;
 		}
 
-	inline bool GetGlobalBatchNum(uint32_t *batch_order, uint32_t client_order) {
+	bool GetGlobalBatchNum(uint32_t *batch_order, uint32_t client_order) {
 		while (last_batch_ordered_ != client_order) {
 			std::this_thread::yield();	
 		}
@@ -574,7 +530,6 @@ class Client{
 		int num_threads_;
 		size_t message_size_;
 		Buffer pubQue_;
-		bool fixed_batch_size_;
 		uint32_t last_batch_ordered_;
 		std::vector<absl::Mutex> pub_sock_locks_;
 
@@ -775,45 +730,64 @@ class Client{
 			int sock = -1;
 			int efd = -1;
 			size_t socket_idx = pubQuesIdx;
-			size_t num_brokers = brokers_.size(); // TODO: corfu assumes this is static
 
+			// *********** Sending Messages ***********
+			std::vector<double> send_times;
+			std::vector<double> poll_times;
 			thread_count_.fetch_add(1);
 			size_t batch_seq = pubQuesIdx;
 			while(!shutdown_){
-				size_t len = 0;
-				void *msg = NULL;
-				Embarcadero::BatchHeader batch_header = { 0 };
-				if (fixed_batch_size_) {
-					batch_header.num_msg = MSGS_PER_FIXED_BATCH;
-					msg = pubQue_.ReadExact(pubQuesIdx, len, MSGS_PER_FIXED_BATCH);
-					if (msg == NULL) {
-						break;
-					}
-				} else {
-					msg = pubQue_.Read(pubQuesIdx, len);
-					if(len == 0){
-						break;
-					}
-					batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize; 
+				size_t len;
+				void *msg = pubQue_.Read(pubQuesIdx, len);
+				if(len == 0){
+					break;
 				}
+				Embarcadero::BatchHeader batch_header = { 0 };
 				batch_header.total_size = len;
 				batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize;
 				batch_header.batch_seq = batch_seq;
 				batch_seq += num_threads_;
-				
+
+				/*
+				if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
+					Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader *)msg;
+					while(header->paddedSize == 0){
+						VLOG(3) << "client_order:" << header->client_order << " size is 0";
+						break;
+						std::this_thread::yield();
+					}
+					//batch_header.num_msg = len/1088;
+					size_t off = 0;
+					while(off < len){
+						batch_header.num_msg++;
+						while(header->paddedSize == 0){
+							std::this_thread::yield();
+						}
+						header = (Embarcadero::MessageHeader *)((uint8_t*)header + header->paddedSize);
+						while(header->paddedSize == 0){
+						VLOG(3) << "client_order:" << header->client_order << " size is 0";
+						break;
+							std::this_thread::yield();
+						}
+						off += header->paddedSize;
+					}
+				}
+				*/
+
 				if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
 					Embarcadero::MessageHeader *hdr = (Embarcadero::MessageHeader *)msg;
-					uint32_t batch_order = 0;
-					if (!GetGlobalBatchNum(&batch_order, hdr->client_order)) {
+					if (!GetGlobalBatchNum(&batch_seq, hdr->client_order)) {
 						LOG(ERROR) << "Failed to get global batch number for batch starting with client order " << hdr->client_order;
 						exit(-1);
 					}
-					batch_header.batch_num = batch_order;
-					//LOG(INFO) << "BATCH SEQ NUM IS: " << batch_order << " (client_order=" << hdr->client_order << ")";
+					batch_header.batch_seq = batch_order;
 					socket_idx = (num_threads_ / num_brokers) * (batch_order % num_brokers) + pubQuesIdx % (num_threads_ / num_brokers);
+				} else {
+					batch_header.batch_seq = batch_seq;
+					batch_seq += num_threads_;
 				}
 
-				// We need a lock so that we don't interleave batches
+				// We need a lock so that we don't interleave batches. Note that if there is 1-1 thread/socket should never block (which is always the case except for corfu)
 				absl::MutexLock lock(&pub_sock_locks_[socket_idx]);
 				//LOG(INFO) << "Got socket idx " << socket_idx << " for batch num " << batch_header.batch_num;
 				sock = pub_fds_[socket_idx];
@@ -861,10 +835,12 @@ class Client{
 
 				}
 			}
-			// Since there is no one-to-one relationship of threads to sockets, do not close them here.
-			//close(sock);
-			//close(efd);
-			//LOG(ERROR) << "PublishThread completed";
+			
+			if (seq_type_ != heartbeat_system::SequencerType::CORFU) {
+				// Since there is no one-to-one relationship of threads to sockets, do not close them here.
+				close(sock);
+				close(efd);
+			}
 		}
 
 		// Current implementation does not send messages to newly added nodes after init
@@ -932,7 +908,6 @@ class Subscriber{
 			}
 
 		~Subscriber(){
-			LOG(ERROR) << "Destructing subscriber";
 			shutdown_ = true;
 			cluster_probe_thread_.join();
 			for( auto &t : subscribe_threads_){
@@ -1093,7 +1068,7 @@ class Subscriber{
 						if (events[n].events & EPOLLIN) {
 							int fd = events[n].data.fd;
 							//int idx = messages_idx_.load();
-							//int idx = 0;
+							int idx = 0;
 							struct msgIdx *m = fd_to_msg[fd].second; // &messages_[idx][fd_to_msg_idx[fd]].second;
 							void* buf = fd_to_msg[fd].first;// messages_[idx][fd_to_msg_idx[fd]].first;
 																							// This ensures the receive never goes out of the boundary
@@ -1139,7 +1114,7 @@ class Subscriber{
 					std::pair<void*, msgIdx*> msg(static_cast<void*>(calloc(buffer_size_, sizeof(char))), (msgIdx*)malloc(sizeof(msgIdx)));
 					// This is for client retrieval, double buffer
 					//std::pair<void*, msgIdx> msg1(static_cast<void*>(malloc(buffer_size_)), msgIdx(broker_id));
-					//int idx = messages_[0].size();
+					int idx = messages_[0].size();
 					messages_[0].push_back(msg);
 					//messages_[1].push_back(msg1);
 					fd_to_msg.insert({sock, msg});;
@@ -1151,8 +1126,8 @@ class Subscriber{
 					shake.last_addr = 0;
 					shake.client_req = Embarcadero::Subscribe;
 					memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
-					ssize_t ret = send(sock, &shake, sizeof(shake), 0);
-					if(ret < (ssize_t)sizeof(shake)){
+					int ret = send(sock, &shake, sizeof(shake), 0);
+					if(ret < sizeof(shake)){
 						LOG(ERROR) << "fd:" << sock << " addr:" << addr << " id:" << broker_id  << 
 							"sent:" << ret<< "/" <<sizeof(shake) 	<< " failed:" << strerror(errno);
 						close(sock);
@@ -1295,7 +1270,7 @@ class Subscriber{
 		void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level,
 				int order, SequencerType seq_type, int replication_factor){
 			size_t n = total_message_size/message_size;
-			LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads << " seq_type:" << seq_type << " fixed_batch_size:" << fixed_batch_size;
+			LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 			std::string message(message_size, 0);
 			char topic[TOPIC_NAME_SIZE];
 			memset(topic, 0, TOPIC_NAME_SIZE);
@@ -1329,10 +1304,7 @@ class Subscriber{
 		void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, 
 				int ack_level, int order, SequencerType seq_type, int replication_factor){
 			size_t n = total_message_size/message_size;
-			LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads << " seq_type:" << seq_type << " fixed_batch_size:" << fixed_batch_size;
-			if (fixed_batch_size) {
-				assert(n % (num_threads * MSGS_PER_FIXED_BATCH) == 0);
-			}
+			LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 			char message[message_size];
 			char topic[TOPIC_NAME_SIZE];
 			memset(topic, 0, TOPIC_NAME_SIZE);
