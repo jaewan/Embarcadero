@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+service CorfuValidator {
+    // Receives a local cut from a local sequencer
+    rpc CorfuGlobalSeq(CorfuGlobalSeqRequest) returns (CorfuGlobalSeqResponse);
+}
+
+// Request containing the local cut and the epoch
+message CorfuGlobalSeqRequest {
+    int64 expected = 1;
+	int64 updated = 2;
+	int32 force = 3;
+}
+
+// Empty response for now
+message CorfuGlobalSeqResponse {
+    int64 current_global_seq = 1;
+}
