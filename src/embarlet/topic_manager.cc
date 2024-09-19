@@ -82,11 +82,10 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 
 	if(tinode->seq_type != KAFKA)
 		topics_[topic]->Combiner();
-
-		if (broker_id_ != 0 && tinode->seq_type == SCALOG){
-			cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
-		}
-
+	
+	if (broker_id_ != 0 && tinode->seq_type == SCALOG){
+		cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
+	}
 	return tinode;
 }
 
@@ -143,7 +142,7 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int re
 void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
-std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
@@ -160,7 +159,7 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &re
 			return nullptr;
 		}
 	}
-	return topic_itr->second->GetCXLBuffer(req, log, segment_header, logical_offset);
+	return topic_itr->second->GetCXLBuffer(req, log, segment_header, logical_offset, is_valid, seq_type);
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -196,7 +195,9 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 		}else{
 			if(order_ == 3){
 				GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
-			}else{
+			} else if (seq_type == CORFU) {
+				GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
+			} else {
 				GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
 			}
 		}
@@ -238,6 +239,11 @@ void Topic::CombinerThread(){
 		std::atomic_thread_fence(std::memory_order_release);
 		tinode_->offsets[broker_id_].written = logical_offset_;
 		tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)header - (uint8_t*)cxl_addr_);
+		if (seq_type_ == CORFU) {
+			tinode_->offsets[broker_id_].ordered = logical_offset_;
+			tinode_->offsets[broker_id_].ordered_offset = (size_t)header; //(uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
+		}
+
 		(*(unsigned long long int*)segment_header) =
 			(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
 		written_logical_offset_ = logical_offset_;
@@ -253,7 +259,7 @@ void Topic::Combiner(){
 	combiningThreads_.emplace_back(&Topic::CombinerThread, this);
 }
 
-std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
 	size_t start_logical_offset;
 	{
 	absl::MutexLock lock(&mutex_);
@@ -297,7 +303,7 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 	};
 }
 
-std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type){
 	size_t batch_seq;
 	absl::MutexLock lock(&mutex_);
 	if(skipped_batch_.contains(req.client_id)){
@@ -323,7 +329,7 @@ std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = req.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));
@@ -339,6 +345,68 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
+	return nullptr;
+}
+
+std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
+	//LOG(ERROR) << "In CORFU GetCXLBuffer for batch_num=" << logical_offset;
+  seq_type = CORFU;	
+	uint32_t global_batch_num = (uint32_t)logical_offset;
+	auto start = std::chrono::high_resolution_clock::now();
+
+	// Wait until timeout or ready for us to read
+	auto current_batch_num = corfu_global_batch_num_.load();
+	bool timeout = false;
+	bool set_validity = false;
+	while (!timeout && global_batch_num > current_batch_num) {
+		std::this_thread::yield();
+		auto end = std::chrono::high_resolution_clock::now();
+		if (std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() >= CORFU_TIMEOUT) {
+			LOG(ERROR) << "CORFU: Timeout detected!";
+			timeout = true;
+		}
+		current_batch_num = corfu_global_batch_num_.load();
+	}
+
+	// if timeout, update value but be careful not to update if someone else has updated it first
+	if (timeout) {
+		while (current_batch_num < global_batch_num) {
+			if (corfu_global_batch_num_.compare_exchange_strong(current_batch_num, global_batch_num + 1)) {
+				// We have successfully registered the batch!
+				is_valid = true;
+				set_validity = true;
+				break;
+			}
+			current_batch_num = corfu_global_batch_num_.load();
+		}
+		if (!set_validity && current_batch_num > global_batch_num) {
+			is_valid = false; // Uh oh, someone else beat us to it.
+			set_validity = true;
+		}
+	}
+		
+	if (!set_validity) {
+		// Since corfu_global_batch_num_ monotonically increases we know it is either equal to the current batch num (valid) or above (invalid)
+		is_valid = corfu_global_batch_num_.compare_exchange_strong(global_batch_num, global_batch_num + 1);
+	}
+
+	// Regardless of validity, we need a buffer to read in the messages
+	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
+	size_t msgSize = req.total_size;
+	log = (void*)(log_addr_.fetch_add(msgSize));
+	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+		//TODO(Jae) Finish below segment boundary crossing code
+		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
+			// Allocate a new segment
+			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}else{
+			// Wait for the first thread that crossed the segment to allocate a new segment
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}
+	}
+	//LOG(ERROR) << "CORFU BATCH NUM " << global_batch_num << " SET ISVALID=" << is_valid;
 	return nullptr;
 }
 
@@ -366,11 +434,22 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
 	if(last_addr != nullptr){
-		while((struct MessageHeader*)start_msg_header->next_msg_diff == 0){
-			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
-			std::this_thread::yield();
+		while(true) {
+			while((struct MessageHeader*)start_msg_header->next_msg_diff == 0){
+				LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
+				std::this_thread::yield();
+			}
+			start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
+			
+			// This is for corfu only
+			if (start_msg_header->complete != -1) {
+				break;
+			} else {
+				LOG(INFO) << "[GetMessageAddr] skipping invalid message ";
+				start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
+			}
+
 		}
-		start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
 	}else{
 		//TODO(Jae) this is only true in a single segment setup
 		if(combined_addr <= last_addr){

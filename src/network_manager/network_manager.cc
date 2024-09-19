@@ -1,542 +1,412 @@
-#include "network_manager.h"
-#include <stdlib.h>
-#include <netinet/in.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <fcntl.h>
+#include "topic_manager.h"
+
 #include <unistd.h>
-#include <glog/logging.h>
 #include <cstring>
-#include <sstream>
-#include <limits>
-#include <chrono>
-#include <errno.h>
-#include "mimalloc.h"
+#include <cstdint>
+#include <immintrin.h>
+#include "folly/ConcurrentSkipList.h"
 
 namespace Embarcadero{
 
-#define MAX_EVENTS 10
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define NT_THRESHOLD 128
 
-inline void make_socket_non_blocking(int fd) {
-	int flags = fcntl(fd, F_GETFL, 0);
-	if (flags == -1) {
-		perror("fcntl F_GETFL");
-		return ;
-	}
-
-	flags |= O_NONBLOCK;
-	if (fcntl(fd, F_SETFL, flags) == -1) {
-		perror("fcntl F_SETFL");
-		return ;
-	}
-
-	int flag = 1;
-	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-		perror("setsockopt(SO_REUSEADDR) failed");
-		close(fd);
-		return ;
-	}
-	if(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
-		perror("setsockopt error");
-		close(fd);
+void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
+	static size_t CACHE_LINE_SIZE = sysconf (_SC_LEVEL1_DCACHE_LINESIZE);
+	if (n < NT_THRESHOLD) {
+		memcpy(dst, src, n);
 		return;
 	}
-}
 
-NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads):
-	requestQueue_(queueCapacity),
-	largeMsgQueue_(10000),
-	broker_id_(broker_id),
-	num_reqReceive_threads_(num_reqReceive_threads){
-		// Create Network I/O threads
-		threads_.emplace_back(&NetworkManager::MainThread, this);
-		for (int i=0; i< num_reqReceive_threads; i++)
-			threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
+	size_t n_unaligned = CACHE_LINE_SIZE - (uintptr_t)dst % CACHE_LINE_SIZE;
 
-		while(thread_count_.load() != (1 + num_reqReceive_threads_)){}
-		LOG(INFO) << "\t[NetworkManager]: \tConstructed";
-}
+	if (n_unaligned > n)
+		n_unaligned = n;
 
-NetworkManager::~NetworkManager(){
-	stop_threads_ = true;
-	std::optional<struct NetworkRequest> sentinel = std::nullopt;
-	for (int i=0; i<num_reqReceive_threads_; i++)
-		requestQueue_.blockingWrite(sentinel);
+	memcpy(dst, src, n_unaligned);
+	dst = (void*)(((uint8_t*)dst) + n_unaligned);
+	src = (void*)(((uint8_t*)src) + n_unaligned);
+	n -= n_unaligned;
 
-	for(std::thread& thread : threads_){
-		if(thread.joinable()){
-			thread.join();
+	size_t num_lines = n / CACHE_LINE_SIZE;
+
+	size_t i;
+	for (i = 0; i < num_lines; i++) {
+		size_t j;
+		for (j = 0; j < CACHE_LINE_SIZE / sizeof(__m128i); j++) {
+			__m128i blk = _mm_loadu_si128((const __m128i *)src);
+			/* non-temporal store */
+			_mm_stream_si128((__m128i *)dst, blk);
+			src = (void*)(((uint8_t*)src) + sizeof(__m128i));
+			dst = (void*)(((uint8_t*)dst) + sizeof(__m128i));
 		}
+		n -= CACHE_LINE_SIZE;
 	}
-	LOG(INFO) << "[NetworkManager]: \tDestructed";
+
+	if (num_lines > 0)
+		_mm_sfence();
+
+	memcpy(dst, src, n);
 }
 
-void NetworkManager::ReqReceiveThread(){
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	std::optional<struct NetworkRequest> optReq;
+struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]){
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+	{
+	absl::WriterMutexLock lock(&mutex_);
+	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
+	if(topics_.find(topic)!= topics_.end()){
+		return nullptr;
+	}
+	static void* cxl_addr = cxl_manager_.GetCXLAddr();
+	void* segment_metadata = cxl_manager_.GetNewSegment();
+	tinode->offsets[broker_id_].ordered = -1;
+	tinode->offsets[broker_id_].written = -1;
+	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
 
-	while(!stop_threads_){
-		requestQueue_.blockingRead(optReq);
-		if(!optReq.has_value()){
-			break;
-		}
-		const struct NetworkRequest &req = optReq.value();
-		struct sockaddr_in client_address;
-		socklen_t client_address_len = sizeof(client_address);
-		getpeername(req.client_socket, (struct sockaddr*)&client_address, &client_address_len);
-		//Handshake
-		EmbarcaderoReq shake;
-		size_t to_read = sizeof(shake);
-		bool running = true;
-		while(to_read > 0){
-			int ret = recv(req.client_socket, &shake, to_read, 0);
-			if(ret < 0){
-				LOG(INFO) << "Error receiving shake:" << strerror(errno);
-				return;
-			}
-			to_read -= ret;
-			if(to_read == 0){
-				break;
-			}
-		}
-		switch(shake.client_req){
-			case Publish:
-				{
-					if(strlen(shake.topic) == 0){
-						LOG(ERROR) << "Topic cannot be null:" << shake.topic;
-						return;
-					}
-					// TODO(Jae) This code asumes there's only one active client publishing
-					// If there are parallel clients, change the ack queue
-					int ack_fd = req.client_socket;
-					if(shake.ack == 2){
-						absl::MutexLock lock(&ack_mu_);
-						auto it = ack_connections_.find(shake.client_id);
-						if(it != ack_connections_.end()){
-							ack_fd = it->second;
-						}else{
-							int ack_fd = socket(AF_INET, SOCK_STREAM, 0);
-							if (ack_fd < 0) {
-								perror("Socket creation failed");
-								return;
-							}
-
-							make_socket_non_blocking(ack_fd);
-
-							sockaddr_in server_addr; 
-							memset(&server_addr, 0, sizeof(server_addr));
-							server_addr.sin_family = AF_INET;
-							server_addr.sin_family = AF_INET;
-							server_addr.sin_port = ntohs(shake.port);
-							server_addr.sin_addr.s_addr = inet_addr(inet_ntoa(client_address.sin_addr));
-							if (connect(ack_fd, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-								if (errno != EINPROGRESS) {
-									perror("Connect failed");
-									close(ack_fd);
-									return;
-								}
-								//VLOG(3) << "connect failed:" << strerror(errno);
-								if (errno == EINPROGRESS) {
-									// Connection is in progress, use epoll to wait for completion
-									//VLOG(3) << "Connection in progress...";
-
-									// Create epoll instance to monitor the socket for EPOLLOUT
-									ack_efd_ = epoll_create1(0);
-									struct epoll_event event;
-									event.data.fd = ack_fd;
-									event.events = EPOLLOUT;
-									if (epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
-											perror("epoll_ctl failed");
-											close(ack_fd);
-											return;
-									}
-
-									// Wait for the socket to become writable (i.e., connection success/failure)
-									struct epoll_event events[1];
-									int n = epoll_wait(ack_efd_, events, 1, 5000);  // 5-second timeout
-									if (n > 0 && (events[0].events & EPOLLOUT)) {
-											// Check if the connection was successful
-											int sock_error;
-											socklen_t len = sizeof(sock_error);
-											if (getsockopt(ack_fd, SOL_SOCKET, SO_ERROR, &sock_error, &len) < 0) {
-													perror("getsockopt failed");
-													close(ack_fd);
-													return;
-											}
-
-											if (sock_error != 0) {
-												// Connection failed
-												LOG(ERROR) << "Connection failed: " << strerror(sock_error);
-												close(ack_fd);
-												return;
-											}
-									} else if (n == 0) {
-											// Timeout
-											LOG(ERROR) << "Connection timed out" << strerror(errno);
-											close(ack_fd);
-											return;
-									} else {
-											// epoll_wait error
-											LOG(ERROR) << "epoll_wait failed" << strerror(errno);
-											close(ack_fd);
-											return;
-									}
-								} else {
-									// Handle other connection errors
-									LOG(ERROR)<<"Connect failed" << strerror(errno);
-									close(ack_fd);
-									return;
-								}
-							}else{
-								ack_fd_ = ack_fd;
-								ack_efd_ = epoll_create1(0);
-								struct epoll_event event;
-								event.data.fd = ack_fd;
-								event.events = EPOLLOUT; 
-								epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event);
-							}
-							ack_connections_[shake.client_id] = ack_fd;
-							threads_.emplace_back(&NetworkManager::AckThread, this, shake.topic, ack_fd);
-						}
-					}
-					size_t READ_SIZE = ZERO_COPY_SEND_LIMIT;
-					to_read = READ_SIZE;
-
-					// Create publish request
-					struct PublishRequest pub_req;
-					memcpy(pub_req.topic, shake.topic, TOPIC_NAME_SIZE);
-					pub_req.acknowledge = shake.ack;
-					pub_req.connection_id = shake.connection_id;
-					pub_req.num_brokers = shake.num_msg; //shake.num_msg used as num_brokers at pub
-
-					BatchHeader batch_header;
-					while(running){
-						// give up if we can't at least read a partial batch header
-						ssize_t bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
-						if(bytes_read <= 0){
-							if(bytes_read < 0)
-								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
-							running = false;
-							break;
-						}
-						// finish reading batch header
-						while(bytes_read < (ssize_t)sizeof(BatchHeader)){
-							ssize_t recv_ret = recv(req.client_socket, (uint8_t*)(&batch_header) + bytes_read, sizeof(BatchHeader) - bytes_read, 0);
-							if(recv_ret < 0){
-								LOG(ERROR) << "Receiving data: " << recv_ret << " ERROR:" << strerror(errno);
-								running = false;
-								return;
-							}
-							bytes_read += recv_ret;
-						}
-						to_read = batch_header.total_size;
-						pub_req.total_size = batch_header.total_size;
-						pub_req.num_messages = batch_header.num_msg;
-						pub_req.batch_seq = batch_header.batch_seq;
-						// TODO(Jae) Send -1 to ack if this returns nullptr
-						void*  segment_header;
-						void*  buf = nullptr;
-						size_t logical_offset;
-						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset);
-						size_t read = 0;
-						MessageHeader* header;
-						size_t header_size = sizeof(MessageHeader);
-						size_t bytes_to_next_header = 0;
-						while(running){
-							bytes_read = recv(req.client_socket, (uint8_t*)buf + read, to_read, 0);
-							if(bytes_read < 0){
-								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
-								running = false;
-								return;
-							}
-              // TODO(Jae) Add validation logic here to check if the message headers are valid and send acknowledgement
-							// We need this for ack=1 as well to confirm that the messages are valid
-							while(bytes_to_next_header + header_size <= (size_t) bytes_read){
-								header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
-								header->complete = 1;
-								bytes_read -= bytes_to_next_header;
-								read += bytes_to_next_header;
-								to_read -= bytes_to_next_header;
-								bytes_to_next_header = header->paddedSize;
-								if(kafka_callback){
-									header->logical_offset = logical_offset;
-									if(segment_header == nullptr){
-										LOG(ERROR) << "segment_header is null!!!!!!!!";
-									}
-									header->segment_header = segment_header;
-									//TODO(Jae) This imple does not support multi segments
-									header->next_msg_diff = header->paddedSize;
+/*
 #ifdef __INTEL__
-									_mm_clflushopt(header);
+    _mm_clflushopt(&tinode->offsets[broker_id_]);
 #elif defined(__AMD__)
-									_mm_clwb(header);
+    _mm_clwb(&tinode->offsets[broker_id_]);
 #else
-										LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
+		LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
 #endif
-									//kafka_callback((void*)header, logical_offset);
-									logical_offset++;
-								}
-							}
-							read += bytes_read;
-							to_read -= bytes_read;
-							bytes_to_next_header -= bytes_read;
+*/
+	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
+			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
+	}
 
-							if(to_read == 0){
-								break;
-							}	
-						}
-						if(kafka_callback){
-							kafka_callback((void*)header, logical_offset-1);
-						}
-					}
-					close(req.client_socket);
-				}// end Publish
-				break;
-			case Subscribe:
-				{
-					make_socket_non_blocking(req.client_socket);
-					int sendBufferSize = 16 * 1024 * 1024;
-					if (setsockopt(req.client_socket, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize)) == -1) {
-						LOG(ERROR) << "Subscriber setsockopt SNGBUf failed";
-						close(req.client_socket);
-						return;
-					}
-					// Enable zero-copy
-					int flag = 1;
-					if (setsockopt(req.client_socket, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
-						LOG(ERROR) << "Subscriber setsockopt(SO_ZEROCOPY) failed";
-						close(req.client_socket);
-						return;
-					}
+	int replication_factor = tinode->replication_factor;
+	if(replication_factor > 0){
+		disk_manager_.Replicate(tinode, replication_factor);
+	}
 
-					int efd = epoll_create1(0);
-					if(efd < 0){
-						LOG(ERROR) << "Subscribe Thread epoll_create1 failed:" << strerror(errno);
-						close(req.client_socket);
-						return;
-					}
-					struct epoll_event event;
-					event.data.fd = req.client_socket;
-					event.events = EPOLLOUT;
-					if(epoll_ctl(efd, EPOLL_CTL_ADD, req.client_socket, &event)){
-						LOG(ERROR) << "epoll_ctl failed:" << strerror(errno);
-						close(req.client_socket);
-						close(efd);
-					}
+	if(tinode->seq_type != KAFKA)
+		topics_[topic]->Combiner();
 
-					{
-					absl::MutexLock lock(&sub_mu_);
-					if(!sub_state_.contains(shake.client_id)){
-						auto state = std::make_unique<SubscriberState>();
-						state->last_offset = shake.num_msg;
-						state->last_addr = shake.last_addr;
-						state->initialized = true;
-						sub_state_[shake.client_id] = std::move(state);
-					}
-					}
-					SubscribeNetworkThread(req.client_socket, efd, shake.topic, shake.client_id);
-					close(req.client_socket);
-					close(efd);
-				}//end Subscribe
-				break;
+		if (broker_id_ != 0 && tinode->seq_type == SCALOG){
+			cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
+		}
+
+	return tinode;
+}
+
+struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, SequencerType seq_type){
+	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+	{
+	absl::WriterMutexLock lock(&mutex_);
+	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
+	if(topics_.find(topic)!= topics_.end()){
+		return nullptr;
+	}
+	static void* cxl_addr = cxl_manager_.GetCXLAddr();
+	void* segment_metadata = cxl_manager_.GetNewSegment();
+	tinode->offsets[broker_id_].ordered = -1;
+	tinode->offsets[broker_id_].written = -1;
+	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
+	tinode->order = (uint8_t)order;
+	tinode->replication_factor = (uint8_t)replication_factor;
+	tinode->seq_type = seq_type;
+	memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
+
+/*
+#ifdef __INTEL__
+    _mm_clflushopt(&tinode->offsets[broker_id_]);
+#elif defined(__AMD__)
+    _mm_clwb(&tinode->offsets[broker_id_]);
+#else
+		LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
+#endif
+*/
+	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
+			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
+	}
+
+	if(replication_factor > 0){
+		disk_manager_.Replicate(tinode, replication_factor);
+	}
+
+	if(seq_type != KAFKA)
+		topics_[topic]->Combiner();
+	return tinode;
+}
+
+bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, SequencerType seq_type){
+	if(CreateNewTopicInternal(topic, order, replication_factor, seq_type)){
+		cxl_manager_.RunSequencer(topic, order, seq_type);
+		return true;
+	}else{
+		LOG(ERROR)<< "Topic already exists!!!";
+	}
+	return false;
+}
+
+void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
+}
+
+std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	auto topic_itr = topics_.find(req.topic);
+	if (topic_itr == topics_.end()){
+		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
+			// The topic was created from another broker
+			CreateNewTopicInternal(req.topic);
+			topic_itr = topics_.find(req.topic);
+			if(topic_itr == topics_.end()){
+				LOG(ERROR) << "Topic Entry was not created Something is wrong";
+				return nullptr;
+			}
+		}else{
+			LOG(ERROR) << "[GetCXLBuffer] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic
+			<< " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
+			return nullptr;
 		}
 	}
+	return topic_itr->second->GetCXLBuffer(req, log, segment_header, logical_offset);
 }
 
-// This implementation does not support multiple topics and dynamic message size.
-// To make it support multiple topics, make some variables as a map (topic, var)
-// Iterate over messages to make sure the large message parittion is not cutting the message in the middle
-void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int client_id){
-	while(!stop_threads_){
-		void* msg;
-		size_t messages_size = 0;
-		struct LargeMsgRequest req;
-		size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
-		if(largeMsgQueue_.read(req)){
-			msg = req.msg;
-			messages_size = req.len;
+bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
+		void* &last_addr, void* &messages, size_t &messages_size){
+	absl::ReaderMutexLock lock(&mutex_);
+	auto topic_itr = topics_.find(topic);
+	if (topic_itr == topics_.end()){
+		//LOG(ERROR) << "Topic not found";
+		// Not throwing error as subscribe can be called before the topic is created
+		return false;
+	}
+	return topic_itr->second->GetMessageAddr(last_offset, last_addr, messages, messages_size);
+}
+
+Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const char* topic_name,
+		int broker_id, int order, SequencerType seq_type, void* cxl_addr, void* segment_metadata):
+	get_new_segment_callback_(get_new_segment),
+	tinode_(static_cast<struct TInode*>(TInode_addr)),
+	topic_name_(topic_name),
+	broker_id_(broker_id),
+	order_(order),
+	seq_type_(seq_type),
+	cxl_addr_(cxl_addr),
+	logical_offset_(0),
+	written_logical_offset_((size_t)-1),
+	current_segment_(segment_metadata){
+		log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
+		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
+		ordered_offset_addr_ = nullptr;
+		ordered_offset_ = 0;
+		if(seq_type == KAFKA){
+			GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
 		}else{
-			absl::MutexLock lock(&sub_state_[client_id]->mu);
-			if(cxl_manager_->GetMessageAddr(topic, sub_state_[client_id]->last_offset, sub_state_[client_id]->last_addr, msg, messages_size)){
-				while(messages_size > zero_copy_send_limit){
-					struct LargeMsgRequest r;
-					r.msg = msg;
-					int mod = zero_copy_send_limit % ((MessageHeader*)msg)->paddedSize;
-					r.len = zero_copy_send_limit - mod;
-					largeMsgQueue_.blockingWrite(r);
-					msg = (uint8_t*)msg + r.len;
-					messages_size -= r.len;
-				}
+			if(order_ == 3){
+				GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
 			}else{
-				continue;;
+				GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
 			}
 		}
-		size_t sent_bytes = 0;
-		if(messages_size < 64 && messages_size != 0){
-			LOG(ERROR) << "[DEBUG] messages_size is below 64!!!! cannot happen " << messages_size;
-		}
-		while(sent_bytes < messages_size){
-			struct epoll_event events[10];
-			int n = epoll_wait(efd, events, 10, -1);
-			if (n == -1) {
-				LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
-				close(sock);
-				close(efd);
+	}
+
+void Topic::CombinerThread(){
+	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;
+	MessageHeader *header = (MessageHeader*)first_message_addr_;
+	while(!stop_threads_){
+		while(header->complete == 0){
+			if(stop_threads_){
+				LOG(INFO) << "Stopping CombinerThread";
 				return;
 			}
-			for (int i = 0; i < n; ++i) {
-				if (events[i].events & EPOLLOUT) {
-					size_t remaining_bytes = messages_size - sent_bytes;
-					size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
-					int ret;
-					if(to_send < 1UL<<16)
-						ret = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
-					else
-						ret = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
-						//ret = send(sock, (uint8_t*)messages + sent_bytes, to_send, MSG_ZEROCOPY);
-					if (ret > 0) {
-							sent_bytes += ret;
-							zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
-					} else if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-							zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL << 16); // Cap send limit at 64K
-							continue;
-					} else if (ret < 0) {
-							LOG(ERROR) << "Error in sending messages: " << strerror(errno);
-							close(sock);
-							close(efd);
-							return;
-					}
-				} else if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-						LOG(INFO) << "Socket error or hang-up";
-						close(sock);
-						close(efd);
-						return;
-				}
-			}
-		}//end send loop
-	}//end main while
-}
-
-// Current impl opens ack connection at publish and does not close it
-void NetworkManager::AckThread(char *topic, int ack_fd){
-	size_t bufSize = 1024*1024;
-	char buf[bufSize];
-	struct epoll_event events[10]; // Adjust size as needed
-	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
-	int replication_factor = tinode->replication_factor;
-	CHECK_GT(replication_factor, 0) << " Replication factor must be larger than 0 at ack:2";
-	int replicated = -1; // This is not precise but just one
-	while(!stop_threads_){
-		size_t min = std::numeric_limits<size_t>::max();
-		// TODO(Jae) this relies on num_active_brokers == MAX_BROKER_NUM as disk manager
-		// Fix this to get current active num active brokers
-		for(int i=0; i<replication_factor; i++){
-			int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
-			if(min > tinode->offsets[b].replication_done[broker_id_]){
-				min = tinode->offsets[b].replication_done[broker_id_];
-			}
+			std::this_thread::yield();
 		}
-		size_t ack_count = min - replicated;
-		if(ack_count == 0){
+#ifdef MULTISEGMENT
+		if(header->next_msg_diff!= 0){ // Moved to new segment
+			header = (int8_t*)header + header->next_msg_diff;
+			segment_header = (uint8_t*)header - CACHELINE_SIZE;
 			continue;
 		}
-		replicated = min;
-		int EPOLL_TIMEOUT = -1; 
-		size_t acked_size = 0;
-		while (acked_size < ack_count) {
-			int n = epoll_wait(ack_efd_, events, 10, EPOLL_TIMEOUT);
-			for (int i = 0; i < n; i++) {
-				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
-					ssize_t bytesSent = send(ack_fd, buf, MIN(bufSize, ack_count - acked_size), 0);
-					if (bytesSent < 0) {
-						bytesSent = 0;
-						if (errno != EAGAIN) {
-							LOG(ERROR) << " Ack Send failed:" << strerror(errno) << " ack_fd:" << ack_fd << " ack size:" << (ack_count - acked_size);
-							return;
-						}
-					} else {
-						acked_size += bytesSent;
-					}
-				}
-			}
-		}
-		// Check if the connection is alive only after ack_fd is connected
-		if(ack_fd > 0){
-			int result = recv(ack_fd, buf, 1, MSG_PEEK | MSG_DONTWAIT);
-			if(result == 0){
-				LOG(INFO) << "Connection is closed ack_fd:" << ack_fd ;
-				//stop_threads_ = true;
-				break;
-			}
-		}
+#else
+	 CHECK_LT((unsigned long long int)header, log_addr_) << "header calculated wrong";
+#endif
+		header->segment_header = segment_header;
+		header->logical_offset = logical_offset_;
+		header->next_msg_diff = header->paddedSize;
+		/*
+#ifdef __INTEL__
+    _mm_clflushopt(header);
+#elif defined(__AMD__)
+    _mm_clwb(header);
+#else
+		LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
+    // Fallback or error handling
+#endif
+*/
+		std::atomic_thread_fence(std::memory_order_release);
+		tinode_->offsets[broker_id_].written = logical_offset_;
+		tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)header - (uint8_t*)cxl_addr_);
+		(*(unsigned long long int*)segment_header) =
+			(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
+		written_logical_offset_ = logical_offset_;
+		written_physical_addr_ = (void*)header;
+		header = (MessageHeader*)((uint8_t*)header + header->next_msg_diff);
+		logical_offset_++;
 	}
 }
 
-void NetworkManager::MainThread(){
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
+// Give logical order, not total order to messages. 
+// Order=0 can export these ordeerd messages. 1 and 2 should wait for sequencer
+void Topic::Combiner(){
+	combiningThreads_.emplace_back(&Topic::CombinerThread, this);
+}
 
-	int server_socket = socket(AF_INET, SOCK_STREAM, 0);
-	if(server_socket < 0){
-		LOG(INFO) << "Socket Creation Failed";
+std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	size_t start_logical_offset;
+	{
+	absl::MutexLock lock(&mutex_);
+	log = (void*)(log_addr_.fetch_add(req.total_size));
+	logical_offset = logical_offset_;
+	segment_header = current_segment_;
+	start_logical_offset = logical_offset_;
+	logical_offset_+= req.num_messages;
+	//TODO(Jae) This does not work with dynamic message size
+	(void*)(log_addr_.load() - ((MessageHeader*)log)->paddedSize);
+	if((unsigned long long int)current_segment_ + SEGMENT_SIZE <= log_addr_){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+		//TODO(Jae) Finish below segment boundary crossing code
 	}
-	int flag = 1;
-	if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-		perror("setsockopt(SO_REUSEADDR) failed");
-		close(server_socket);
-		return ;
 	}
-	setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-
-	struct sockaddr_in server_address;
-	server_address.sin_family = AF_INET;
-	server_address.sin_port = htons(PORT + broker_id_);
-	server_address.sin_addr.s_addr = INADDR_ANY;
-
-	while (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
-		LOG(ERROR)<< "!!!!! Error binding socket:" << (PORT + broker_id_) << " broker_id: " << broker_id_;
-		sleep(5);
-	}
-
-	if(listen(server_socket, SOMAXCONN) == -1){
-		std::cerr << "!!!!! Error Listen:" << strerror(errno) << std::endl;
-		return;
-	}
-
-	// Create epoll instance
-	int efd = epoll_create1(0);
-	if (efd == -1) perror("epoll_create1");
-
-	// Add server socket to epoll
-	struct epoll_event event;
-	event.events = EPOLLIN;
-	event.data.fd = server_socket;
-	if (epoll_ctl(efd, EPOLL_CTL_ADD, server_socket, &event) == -1){
-		perror("epoll_ctl");
-		LOG(INFO) << "epoll_ctl Error" << strerror(errno);
-	}
-	struct epoll_event events[MAX_EVENTS];
-
-	while (true) {
-		int n = epoll_wait(efd, events, MAX_EVENTS, -1);
-		for(int i=0; i< n; i++){
-			if (events[i].data.fd == server_socket) {
-				struct NetworkRequest req;
-				struct sockaddr_in client_addr;
-				socklen_t client_addr_len = sizeof(client_addr);
-				req.client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_addr_len);
-				if (req.client_socket < 0) {
-					std::cerr << "!!!!! Error accepting connection:" << strerror(errno) << std::endl;
-					break;
-					continue;
+	return [this, start_logical_offset](void* log, size_t logical_offset)
+	{
+		absl::MutexLock lock(&written_mutex_);
+		if(kafka_logical_offset_.load() != start_logical_offset){
+			written_messages_range_[start_logical_offset] = logical_offset;
+		}else{
+			size_t start = start_logical_offset;
+			bool has_next_messages_written = false;
+			do{
+				has_next_messages_written = false;
+				written_logical_offset_ = logical_offset;
+				written_physical_addr_ = (void*)log;
+				tinode_->offsets[broker_id_].written = logical_offset;
+				tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)log - (uint8_t*)cxl_addr_);
+				(*(unsigned long long int*)current_segment_) =
+					(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
+				kafka_logical_offset_.store(logical_offset+1);
+				if(written_messages_range_.contains(logical_offset+1)){
+					start = logical_offset+1;
+					logical_offset = written_messages_range_[start];
+					written_messages_range_.erase(start);
+					has_next_messages_written = true;
 				}
-				requestQueue_.blockingWrite(req);
-			}
+			}while(has_next_messages_written);
+		}
+	};
+}
+
+std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	size_t batch_seq;
+	absl::MutexLock lock(&mutex_);
+	if(skipped_batch_.contains(req.client_id)){
+		auto it = skipped_batch_[req.client_id].find(req.batch_seq);
+		if(it != skipped_batch_[req.client_id].end()){
+			log = it->second;
+			skipped_batch_[req.client_id].erase(it);
+			return nullptr;
 		}
 	}
+	auto it = order3_client_batch_.find(req.client_id);
+	if (it == order3_client_batch_.end()) {
+		order3_client_batch_.emplace(req.client_id, broker_id_);
+	}
+	while(order3_client_batch_[req.client_id] < req.batch_seq){
+		skipped_batch_[req.client_id].emplace(order3_client_batch_[req.client_id],(void*)log_addr_.load());
+		log_addr_ += req.total_size; // This assumes the batch sizes are identical. Change this later
+		order3_client_batch_[req.client_id] += req.num_brokers;
+	}
+	log = (void*)(log_addr_.load());
+	log_addr_ += req.total_size;
+	order3_client_batch_[req.client_id] += req.num_brokers;
+	return nullptr;
+}
+
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
+	size_t msgSize = req.total_size;
+	log = (void*)(log_addr_.fetch_add(msgSize));
+	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+		//TODO(Jae) Finish below segment boundary crossing code
+		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
+			// Allocate a new segment
+			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}else{
+			// Wait for the first thread that crossed the segment to allocate a new segment
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}
+	}
+	return nullptr;
+}
+
+// Current implementation depends on the subscriber knows the physical address of last fetched message
+// This is only true if the messages were exported from CXL. If we implement disk cache optimization, 
+// we need to fix it. Probably need to have some sort of indexing or call this method to get indexes
+// even if at cache hit (without sending the messages)
+//
+// arguments: 
+// if the messages to export go over the segment boundary (not-contiguous), 
+// we should call this functiona again. Try calling it if it returns true
+bool Topic::GetMessageAddr(size_t &last_offset,
+		void* &last_addr, void* &messages, size_t &messages_size){
+	size_t combined_offset = written_logical_offset_;
+	void* combined_addr = written_physical_addr_;
+
+	if(order_ > 0){
+		combined_offset = tinode_->offsets[broker_id_].ordered;
+		combined_addr = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].ordered_offset;
+	}
+
+	if(combined_offset == (size_t)-1 || ((last_addr != nullptr) && (combined_offset <= last_offset))){
+		return false;
+	}
+
+	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
+	if(last_addr != nullptr){
+		while((struct MessageHeader*)start_msg_header->next_msg_diff == 0){
+			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
+			std::this_thread::yield();
+		}
+		start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
+	}else{
+		//TODO(Jae) this is only true in a single segment setup
+		if(combined_addr <= last_addr){
+			LOG(ERROR) << "[GetMessageAddr] Wrong!!";
+			return false;
+		}
+		start_msg_header = (struct MessageHeader*)first_message_addr_;
+	}
+
+	if(start_msg_header->paddedSize == 0){
+		return false;
+	}
+
+	messages = (void*)start_msg_header;
+#ifdef MULTISEGMENT
+	//TODO(Jae) use relative addr here for multi-node
+	unsigned long long int* last_msg_off = (unsigned long long int*)start_msg_header->segment_header;
+	struct MessageHeader *last_msg_of_segment = (MessageHeader*)((uint8_t*)last_msg_off + *last_msg_off);
+
+	if(combined_addr < last_msg_of_segment){ // last msg is not ordered yet
+		messages_size = (uint8_t*)combined_addr - (uint8_t*)start_msg_header + ((MessageHeader*)combined_addr)->paddedSize; 
+		last_offset = ((MessageHeader*)combined_addr)->logical_offset;
+		last_addr = (void*)combined_addr;
+	}else{
+		messages_size = (uint8_t*)last_msg_of_segment - (uint8_t*)start_msg_header + last_msg_of_segment->paddedSize; 
+		last_offset = last_msg_of_segment->logical_offset;
+		last_addr = (void*)last_msg_of_segment;
+	}
+#else
+	messages_size = (uint8_t*)combined_addr - (uint8_t*)start_msg_header + ((MessageHeader*)combined_addr)->paddedSize; 
+	last_offset = ((MessageHeader*)combined_addr)->logical_offset;
+	last_addr = (void*)combined_addr;
+#endif
+	VLOG(3) << "sending:" << messages_size << " last_offset:" << last_offset << " combined:" << combined_offset;
+	return true;
 }
 
 } // End of namespace Embarcadero
+

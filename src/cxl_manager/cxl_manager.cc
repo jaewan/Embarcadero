@@ -15,7 +15,7 @@
 
 namespace Embarcadero{
 
-static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_size){
+static inline void* allocate_shm(const char *filename, int broker_id, CXL_Type cxl_type, size_t cxl_size){
 	void *addr = nullptr;
 	int cxl_fd;
 	bool dev = false;
@@ -28,11 +28,11 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 				LOG(ERROR) << "Cannot allocate from real CXL";
 				return nullptr;
 			}else{
-				cxl_fd = shm_open("/CXL_SHARED_FILE", O_CREAT | O_RDWR, 0666);
+				cxl_fd = shm_open(filename, O_CREAT | O_RDWR, 0666);
 			}
 		}
 	}else{
-		cxl_fd = shm_open("/CXL_SHARED_FILE", O_CREAT | O_RDWR, 0666);
+		cxl_fd = shm_open(filename, O_CREAT | O_RDWR, 0666);
 	}
 
 	if (cxl_fd < 0){
@@ -79,8 +79,7 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 }
 
 CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
-	head_ip_(head_ip),
-	broker_id_(broker_id){
+	broker_id_(broker_id), head_ip_(head_ip){
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
 	if (cxl_type == Real) {
@@ -90,7 +89,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	}
 
 	// Initialize CXL
-	cxl_addr_ = allocate_shm(broker_id, cxl_type, cxl_size_);
+	cxl_addr_ = allocate_shm("/CXL_SHARED_FILE", broker_id, cxl_type, cxl_size_);
 	if(cxl_addr_ == nullptr){
 		return;
 	}
@@ -126,8 +125,8 @@ CXLManager::~CXLManager(){
 	LOG(INFO) << "[CXLManager]: \t\tDestructed";
 }
 
-std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-	return topic_manager_->GetCXLBuffer(req, log, segment_header, logical_offset);
+std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
+	return topic_manager_->GetCXLBuffer(req, log, segment_header, logical_offset, is_valid, seq_type);
 }
 
 // This function returns TInode without inspecting if the topic exists
@@ -179,6 +178,8 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 				LOG(INFO) << "Sequencers not needed for corfu";
 			}
 			break;
+		default:
+			LOG(ERROR) << "Invalid sequencesType: " << sequencerType;
 	}
 }
 
@@ -204,10 +205,8 @@ void CXLManager::Sequencer1(char* topic){
 	static size_t seq = 0;
 
 	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-	auto last_updated = std::chrono::steady_clock::now();
-
 	while(!stop_threads_){
-		bool yield = true;
+		//bool yield = true;
 		for(auto broker : registered_brokers){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
 			size_t written = tinode->offsets[broker].written;
@@ -222,7 +221,7 @@ void CXLManager::Sequencer1(char* topic){
 				tinode->offsets[broker].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
 				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
 				msg_logical_off++;
-				yield = false;
+				//yield = false;
 			}
 		}
 		/*
@@ -260,7 +259,6 @@ void CXLManager::Sequencer2(char* topic){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
 			//This ensures the message is Combined (complete ensures it is fully received)
 			if(msg_to_order[broker]->complete == 1 && msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written){
-				int client_id;
 				yield = false;
 				queues[broker].push(msg_to_order[broker]);
 				int client = msg_to_order[broker]->client_id;

@@ -34,6 +34,8 @@ using heartbeat_system::HeartbeatRequest;
 using heartbeat_system::HeartbeatResponse;
 using heartbeat_system::CreateTopicRequest;
 using heartbeat_system::CreateTopicResponse;
+using heartbeat_system::GlobalBatchNumRequest;
+using heartbeat_system::GlobalBatchNumResponse;
 
 class HeartBeatServiceImpl final : public HeartBeat::Service {
 	public:
@@ -117,6 +119,11 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				return Status::OK;
 		}
 
+		Status GetGlobalBatchNum(ServerContext* context, const GlobalBatchNumRequest* request, GlobalBatchNumResponse* reply) {
+				reply->set_order(corfu_batch_seq_.fetch_add(1));
+				return Status::OK;
+		}
+
 		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback){
 			create_topic_entry_callback_ = callback;
 		}
@@ -165,6 +172,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		std::thread heartbeat_thread_;
 		bool shutdown_ = false;
 		Embarcadero::CreateTopicEntryCallback create_topic_entry_callback_;
+		std::atomic<uint32_t> corfu_batch_seq_{0};
 };
 
 class FollowerNodeClient {

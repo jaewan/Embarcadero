@@ -17,6 +17,8 @@ namespace Embarcadero{
 class CXLManager;
 class DiskManager;
 
+using heartbeat_system::SequencerType;
+
 enum ClientRequestType {Publish, Subscribe};
 
 struct NetworkRequest{

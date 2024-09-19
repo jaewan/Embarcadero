@@ -16,6 +16,7 @@ namespace Embarcadero{
 class CXLManager;
 class DiskManager;
 
+using heartbeat_system::SequencerType;
 using GetNewSegmentCallback = std::function<void*()>;
 
 class Topic{
@@ -39,16 +40,17 @@ class Topic{
 		bool GetMessageAddr(size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
-		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-			return (this->*GetCXLBufferFunc)(req, log, segment_header, logical_offset);
+		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type){
+			return (this->*GetCXLBufferFunc)(req, log, segment_header, logical_offset, is_valid, seq_type);
 		}
 
 	private:
 		void CombinerThread();
-		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
+		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
+		std::function<void(void*, size_t)> Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
+		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
+		std::function<void(void*, size_t)> CorfuGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		std::string topic_name_;
@@ -69,6 +71,7 @@ class Topic{
 		absl::Mutex mutex_;
 		absl::Mutex written_mutex_;
 		std::atomic<size_t> kafka_logical_offset_{0};
+		std::atomic<uint32_t> corfu_global_batch_num_{0}; // TODO(erika): This should probably be in global shared memory
 		absl::flat_hash_map<size_t, size_t> written_messages_range_;
 
 		//TInode cache
@@ -94,7 +97,7 @@ class TopicManager{
 		}
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
-		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 

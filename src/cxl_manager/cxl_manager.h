@@ -96,7 +96,7 @@ struct alignas(64) MessageHeader{
 	uint32_t client_order;
 	size_t size;
 	volatile size_t paddedSize; // This include message+padding+header size
-	volatile uint32_t complete;
+	volatile uint32_t complete; // o = incomplete, 1 = complete, -1 = complete but invalid TODO(erika): make int32_t
 };
 
 class CXLManager{
@@ -114,7 +114,7 @@ class CXLManager{
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
-		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset, bool &is_valid, SequencerType &seq_type);
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 														struct MessageHeader** msg_to_order, struct TInode *tinode);
 
