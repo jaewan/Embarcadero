@@ -403,7 +403,6 @@ class Client{
 		}
 
 		void DEBUG_check_send_finish(){
-			LOG(INFO) << "DEBUG_check_send_finish called" ;
 			pubQue_.ReturnReads();
 			for(auto &t : threads_){
 				if(t.joinable())
@@ -703,28 +702,28 @@ class Client{
 				batch_header.batch_seq = batch_seq;
 				batch_seq += num_threads_;
 				/*
-				if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
-					Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader *)msg;
-					while(header->paddedSize == 0){
-						VLOG(3) << "client_order:" << header->client_order << " size is 0";
-						break;
-						std::this_thread::yield();
-					}
-					//batch_header.num_msg = len/1088;
-					size_t off = 0;
-					while(off < len){
-						batch_header.num_msg++;
-						while(header->paddedSize == 0){
-							std::this_thread::yield();
-						}
-						header = (Embarcadero::MessageHeader *)((uint8_t*)header + header->paddedSize);
-						while(header->paddedSize == 0){
-						VLOG(3) << "client_order:" << header->client_order << " size is 0";
-						break;
-							std::this_thread::yield();
-						}
-						off += header->paddedSize;
-					}
+					 if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
+					 Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader *)msg;
+					 while(header->paddedSize == 0){
+					 VLOG(3) << "client_order:" << header->client_order << " size is 0";
+					 break;
+					 std::this_thread::yield();
+					 }
+				//batch_header.num_msg = len/1088;
+				size_t off = 0;
+				while(off < len){
+				batch_header.num_msg++;
+				while(header->paddedSize == 0){
+				std::this_thread::yield();
+				}
+				header = (Embarcadero::MessageHeader *)((uint8_t*)header + header->paddedSize);
+				while(header->paddedSize == 0){
+				VLOG(3) << "client_order:" << header->client_order << " size is 0";
+				break;
+				std::this_thread::yield();
+				}
+				off += header->paddedSize;
+				}
 				}
 				*/
 
@@ -801,7 +800,7 @@ class Client{
 						absl::MutexLock lock(&mutex_);
 						for(const auto& addr:new_nodes){
 							int broker_id = GetBrokerId(addr);
-							LOG(INFO) << "New Node reported:" << broker_id;
+							//LOG(INFO) << "New Node reported:" << broker_id;
 							nodes_[broker_id] = addr;
 							brokers_.emplace_back(broker_id);
 							//Make sure the brokers are sorted to have threads send in round robin in broker_id seq
@@ -1002,8 +1001,8 @@ class Subscriber{
 							int idx = 0;
 							struct msgIdx *m = fd_to_msg[fd].second; // &messages_[idx][fd_to_msg_idx[fd]].second;
 							void* buf = fd_to_msg[fd].first;// messages_[idx][fd_to_msg_idx[fd]].first;
-																							// This ensures the receive never goes out of the boundary
-																							// bit it may cause the incomplete recv
+							// This ensures the receive never goes out of the boundary
+							// bit it may cause the incomplete recv
 							size_t to_read = buffer_size_ - m->offset;
 							int bytes_received = recv(fd, (uint8_t*)buf + m->offset, to_read, 0);
 							if (bytes_received > 0) {
@@ -1143,7 +1142,7 @@ class Subscriber{
 			return num_cores == CGROUP_CORE;
 		}
 
-		void PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads,
+		double PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads,
 				int ack_level, int order, SequencerType seq_type, int replication_factor){
 			size_t n = total_message_size/message_size;
 			LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << 
@@ -1176,11 +1175,14 @@ class Subscriber{
 			std::chrono::duration<double> elapsed = end - start;
 			double seconds = elapsed.count();
 			double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
-			std::cout << "Produce time: " << ((std::chrono::duration<double>)(produce_end-start)).count() << std::endl;
-			std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
-			std::cout << "Total time: " << seconds << std::endl;
+			/*
+				 std::cout << "Produce time: " << ((std::chrono::duration<double>)(produce_end-start)).count() << std::endl;
+				 std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
+				 std::cout << "Total time: " << seconds << std::endl;
+				 */
 			std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
 			free(message);
+			return bandwidthMbps;
 		}
 
 		void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size, int order, int replication_factor){
@@ -1294,7 +1296,8 @@ class Subscriber{
 				("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
 				("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 				("r,replication_factor", "Replication factor", cxxopts::value<int>()->default_value("0"))
-				("t,test_number", "Test to run. 0:pub/sub 1:E2E 2:Latency", cxxopts::value<int>()->default_value("0"))
+				("t,test_number", "Test to run. 0:pub/sub 1:E2E 2:Latency 3:Parallel", cxxopts::value<int>()->default_value("0"))
+				("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
 				("n,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
 
 			auto result = options.parse(argc, argv);
@@ -1342,12 +1345,42 @@ class Subscriber{
 
 			if(result["test_number"].as<int>() == 0){
 				PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
-				sleep(3);
+				sleep(10);
 				SubscribeThroughputTest(total_message_size, message_size, order, replication_factor);
 			}else if(result["test_number"].as<int>() == 1){
 				E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
-			}else{
+			}else if(result["test_number"].as<int>() == 2){
 				LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+			}else{
+				int num_clients = result["parallel_client"].as<int>();
+				std::vector<std::thread> threads;
+				std::vector<std::promise<double>> promises(num_clients); // Vector of promises
+				std::vector<std::future<double>> futures;                // Vector of futures
+
+				// Prepare the futures
+				for (int i = 0; i < num_clients; ++i) {
+					futures.push_back(promises[i].get_future());  // Get future from each promise
+				}
+
+				// Launch the threads
+				for (int i = 0; i < num_clients; i++) {
+					threads.emplace_back([&, i]() {
+							double result = PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+							promises[i].set_value(result); // Set the result in the promise
+							});
+				}
+
+				double aggregate_bandwidth = 0;
+
+				// Wait for the threads to finish and collect the results
+				for (int i = 0; i < num_clients; ++i) {
+					if (threads[i].joinable()) {
+						threads[i].join();  // Wait for the thread to finish
+						aggregate_bandwidth += futures[i].get();  // Get the result from the future
+					}
+				}
+
+				std::cout << "Aggregate Bandwidth:" << aggregate_bandwidth;
 			}
 
 			return 0;
