@@ -372,7 +372,8 @@ void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int 
 					messages_size -= r.len;
 				}
 			}else{
-				continue;;
+				std::this_thread::yield();
+				continue;
 			}
 		}
 		size_t sent_bytes = 0;
@@ -405,7 +406,7 @@ void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int 
 							zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL << 16); // Cap send limit at 64K
 							continue;
 					} else if (ret < 0) {
-							LOG(ERROR) << "Error in sending messages: " << strerror(errno);
+							LOG(ERROR) << "Error in sending messages: " << strerror(errno) << " to_send:" << to_send;
 							close(sock);
 							close(efd);
 							return;
