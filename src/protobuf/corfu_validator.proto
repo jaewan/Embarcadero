@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+service CorfuValidator {
+    rpc ValidateGlobalBatchNum(BatchValidationRequest) returns (BatchValidationResponse);
+}
+
+message BatchValidationRequest {
+    int64 global_seq = 1;
+	bool force = 2;
+}
+
+// Empty response for now
+message BatchValidationResponse {
+    int32 ret = 1;
+}
+

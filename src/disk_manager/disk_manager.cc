@@ -111,14 +111,12 @@ DiskManager::DiskManager(size_t queueCapacity, int broker_id, void* cxl_addr, bo
 	//TODO(Jae) this onlye works at single topic upto replication fator of all, change this later
 	num_io_threads_ = NUM_MAX_BROKERS;
 	if(log_to_memory_){
-	VLOG(3) << "log to mem";
 		for (int i=0; i< NUM_MAX_BROKERS; i++){
 			//size_t allocated;
 			//logs_[i] = mmap_large_buffer((1<<30), allocated);
 			logs_[i] = malloc((1<<30));
 		}
 	}else{
-	VLOG(3) << "log to disk";
 		const char *homedir;
 		if ((homedir = getenv("HOME")) == NULL) {
 			homedir = getpwuid(getuid())->pw_dir;

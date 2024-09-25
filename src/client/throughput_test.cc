@@ -865,6 +865,8 @@ class Subscriber{
 		}
 
 		bool DEBUG_check_order(int order){
+			if(DEBUG_do_not_check_order_)
+				return true;
 			int idx = 0;
 			for(auto &msg_pair : messages_[idx]){
 				//for(auto &msg_pairs : messages_){
@@ -984,9 +986,11 @@ class Subscriber{
 			std::vector<std::vector<std::pair<void*, msgIdx*>>> messages_;
 			std::atomic<int> messages_idx_;
 			int client_id_;
+			bool DEBUG_do_not_check_order_ = false;
 
 			void SubscribeThread(int epoll_fd, absl::flat_hash_map<int, std::pair<void*, msgIdx*>> fd_to_msg){
 				epoll_event events[NUM_SUB_CONNECTIONS];
+				static int DEBUG_count =0;
 				while(!shutdown_){
 					int nfds = epoll_wait(epoll_fd, events, NUM_SUB_CONNECTIONS, 100); // 0.1 second timeout
 					if (nfds == -1) {
@@ -1004,6 +1008,12 @@ class Subscriber{
 							// This ensures the receive never goes out of the boundary
 							// bit it may cause the incomplete recv
 							size_t to_read = buffer_size_ - m->offset;
+							if(to_read == 0){
+								LOG(ERROR) << "Subscriber buffer is full. Overwriting from head. Increase buffer_size_ or do not check message correctness";
+								DEBUG_do_not_check_order_ = true;
+								m->offset = 0;
+								to_read = buffer_size_;
+							}
 							int bytes_received = recv(fd, (uint8_t*)buf + m->offset, to_read, 0);
 							if (bytes_received > 0) {
 								DEBUG_count_.fetch_add(bytes_received);
@@ -1012,7 +1022,7 @@ class Subscriber{
 									m->timestamps.emplace_back(m->offset, std::chrono::steady_clock::now());
 								}
 							} else if (bytes_received == 0) {
-								LOG(ERROR) << "Server " << fd << " disconnected";
+								LOG(ERROR) << "epoll_fd:" << epoll_fd << " Server sock: " << fd << " disconnected:" << strerror(errno);
 								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
 								close(fd);
 								//TODO(Jae) remove from other data structures
@@ -1033,12 +1043,12 @@ class Subscriber{
 			void CreateAConnection(int broker_id, std::string address){
 				absl::flat_hash_map<int, std::pair<void*, msgIdx*>> fd_to_msg;
 				auto [addr, addressPort] = ParseAddressPort(address);
+				int epoll_fd = epoll_create1(0);
+				if (epoll_fd < 0) {
+					LOG(ERROR) << "Failed to create epoll instance";
+					return ;
+				}
 				for (int i=0; i < NUM_SUB_CONNECTIONS; i++){
-					int epoll_fd = epoll_create1(0);
-					if (epoll_fd < 0) {
-						LOG(ERROR) << "Failed to create epoll instance";
-						return ;
-					}
 					int sock = GetNonblockingSock(addr.data(), PORT + broker_id, false);
 
 					std::pair<void*, msgIdx*> msg(static_cast<void*>(calloc(buffer_size_, sizeof(char))), (msgIdx*)malloc(sizeof(msgIdx)));
@@ -1071,6 +1081,7 @@ class Subscriber{
 						LOG(ERROR) << "Failed to add new server to epoll";
 						close(sock);
 					}
+					VLOG(3) << "Spawning sub thread epoll:" << epoll_fd << " fd:" << sock ;
 					subscribe_threads_.emplace_back(&Subscriber::SubscribeThread, this, epoll_fd, fd_to_msg);
 				}
 			}
@@ -1293,6 +1304,7 @@ class Subscriber{
 				("o,order_level", "Order Level", cxxopts::value<int>()->default_value("0"))
 				("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", cxxopts::value<std::string>()->default_value("EMBARCADERO"))
 				("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10737418240"))
+				//("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("536870912"))
 				("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
 				("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 				("r,replication_factor", "Replication factor", cxxopts::value<int>()->default_value("0"))
@@ -1345,13 +1357,14 @@ class Subscriber{
 
 			if(result["test_number"].as<int>() == 0){
 				PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
-				sleep(10);
+				sleep(3);
+				LOG(INFO) << "Finished sleeping. Starting Subscriber";
 				SubscribeThroughputTest(total_message_size, message_size, order, replication_factor);
 			}else if(result["test_number"].as<int>() == 1){
 				E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
 			}else if(result["test_number"].as<int>() == 2){
 				LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
-			}else{
+			}else if(result["test_number"].as<int>() == 3){
 				int num_clients = result["parallel_client"].as<int>();
 				std::vector<std::thread> threads;
 				std::vector<std::promise<double>> promises(num_clients); // Vector of promises
@@ -1381,6 +1394,12 @@ class Subscriber{
 				}
 
 				std::cout << "Aggregate Bandwidth:" << aggregate_bandwidth;
+			}else if(result["test_number"].as<int>() == 4){
+				PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+			}else if(result["test_number"].as<int>() == 5){
+				SubscribeThroughputTest(total_message_size, message_size, order, replication_factor);
+			}else{
+				LOG(ERROR) << "Invalid test number option:" << result["test_number"].as<int>();
 			}
 
 			return 0;
