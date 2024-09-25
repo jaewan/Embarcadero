@@ -102,7 +102,6 @@ int main(int argc, char* argv[]){
 	if (arguments.count("replicate_to_mem")) {
 		replicate_to_memory = true;
 	}
-	VLOG(3) << "Replicate to memory:" << replicate_to_memory;
 	if (arguments.count("head")) {
 		is_head_node = true;
 	} else if (arguments.count("follower")) {

@@ -941,6 +941,8 @@ class Subscriber{
 		}
 
 		bool DEBUG_check_order(int order){
+			if(DEBUG_do_not_check_order_)
+				return true;
 			int idx = 0;
 			for(auto &msg_pair : messages_[idx]){
 				//for(auto &msg_pairs : messages_){
@@ -1060,6 +1062,7 @@ class Subscriber{
 			std::vector<std::vector<std::pair<void*, msgIdx*>>> messages_;
 			std::atomic<int> messages_idx_;
 			int client_id_;
+			bool DEBUG_do_not_check_order_ = false;
 
 			void SubscribeThread(int epoll_fd, absl::flat_hash_map<int, std::pair<void*, msgIdx*>> fd_to_msg){
 				epoll_event events[NUM_SUB_CONNECTIONS];
@@ -1080,6 +1083,12 @@ class Subscriber{
 																							// This ensures the receive never goes out of the boundary
 																							// bit it may cause the incomplete recv
 							size_t to_read = buffer_size_ - m->offset;
+							if(to_read == 0){
+								LOG(ERROR) << "Subscriber buffer is full. Overwriting from head. Increase buffer_size_ or do not check message correctness";
+								DEBUG_do_not_check_order_ = true;
+								m->offset = 0;
+								to_read = buffer_size_;
+							}
 							int bytes_received = recv(fd, (uint8_t*)buf + m->offset, to_read, 0);
 							if (bytes_received > 0) {
 								DEBUG_count_.fetch_add(bytes_received);
