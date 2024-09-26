@@ -924,6 +924,7 @@ class Subscriber{
 				int recv_latency_idx = 0;
 				while(off < m->offset){
 					Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)((uint8_t*)buf + off);
+					off += header->paddedSize;
 					while(off > m->timestamps[recv_latency_idx].first){
 						recv_latency_idx++;
 					}
@@ -933,8 +934,7 @@ class Subscriber{
 							std::chrono::nanoseconds(send_nanoseconds_since_epoch));
 
 					auto latency = m->timestamps[recv_latency_idx].second - received_time_point;;
-					latencies.emplace_back(std::chrono::duration_cast<std::chrono::microseconds>(latency).count());
-					off += header->paddedSize;
+					latencies.emplace_back(std::chrono::duration_cast<std::chrono::nanoseconds>(latency).count());
 				}
 			}
 			std::ofstream latencyFile("latencies.csv");
@@ -1160,13 +1160,11 @@ double PublishThroughputTest(size_t total_message_size, size_t message_size, int
 	memcpy(topic, "TestTopic", 9);
 
 	size_t q_size = total_message_size + (total_message_size/message_size)*64;
-	if(q_size < 1024){
-		q_size = 1024;
-	}
-	Publisher c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-	LOG(INFO) << "Publisher Created" ;
-	c.CreateNewTopic(topic, order, seq_type, replication_factor);
-	c.Init(topic, ack_level);
+	q_size = std::max(q_size, static_cast<size_t>(1024));
+
+	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
+	p.CreateNewTopic(topic, order, seq_type, replication_factor);
+	p.Init(topic, ack_level);
 	// **************    Wait until other threads are initialized ************** //
 	synchronizer.fetch_sub(1);
 	while(synchronizer.load() != 0){
@@ -1175,23 +1173,23 @@ double PublishThroughputTest(size_t total_message_size, size_t message_size, int
 	auto start = std::chrono::high_resolution_clock::now();
 
 	for(size_t i=0; i<n; i++){
-		c.Publish(message, message_size);
+		p.Publish(message, message_size);
 	}
 
 	auto produce_end = std::chrono::high_resolution_clock::now();
-	c.DEBUG_check_send_finish();
+	p.DEBUG_check_send_finish();
 	auto send_end = std::chrono::high_resolution_clock::now();
-	c.Poll(n);
+	p.Poll(n);
 
 	auto end = std::chrono::high_resolution_clock::now();
 	std::chrono::duration<double> elapsed = end - start;
 	double seconds = elapsed.count();
 	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
 	/*
-		 std::cout << "Produce time: " << ((std::chrono::duration<double>)(produce_end-start)).count() << std::endl;
-		 std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
-		 std::cout << "Total time: " << seconds << std::endl;
-		 */
+	 std::cout << "Produce time: " << ((std::chrono::duration<double>)(produce_end-start)).count() << std::endl;
+	 std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
+	 std::cout << "Total time: " << seconds << std::endl;
+	 */
 	std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
 	free(message);
 	return bandwidthMbps;
@@ -1215,35 +1213,38 @@ void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size, int order, 
 void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level,
 		int order, SequencerType seq_type, int replication_factor){
 	size_t n = total_message_size/message_size;
-	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
-	std::string message(message_size, 0);
+	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << 
+		" num_threads:" << num_threads << " replication_factor:" << replication_factor;
+	char* message = (char*)malloc(sizeof(char)*message_size);
 	char topic[TOPIC_NAME_SIZE];
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
 
 	size_t q_size = total_message_size + (total_message_size/message_size)*64;
-	if(q_size < 1024){
-		q_size = 1024;
-	}
-	Publisher c("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-	c.CreateNewTopic(topic, order, seq_type, replication_factor);
+	q_size = std::max(q_size, static_cast<size_t>(1024));
+
+	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
+	p.CreateNewTopic(topic, order, seq_type, replication_factor);
+	p.Init(topic, ack_level);
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false);
-	c.Init(topic, ack_level);
 
 	auto start = std::chrono::high_resolution_clock::now();
 	for(size_t i=0; i<n; i++){
-		c.Publish(message.data(), message_size);
+		p.Publish(message, message_size);
 	}
-
-	c.Poll(n);
+	p.DEBUG_check_send_finish();
+	p.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
+
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
-	auto pub_duration = std::chrono::duration_cast<std::chrono::seconds>(pub_end - start);
-	LOG(INFO) << "Pub Bandwidth: " << (total_message_size/(1024*1024))/pub_duration.count() << " MB/s";
-	auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-	LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
+	double pub_duration = (std::chrono::duration<double>(pub_end - start)).count();
+	LOG(INFO) << "Pub Bandwidth: " << ((message_size*n)/pub_duration)/(1024*1024) << " MB/s";
+	auto duration = (std::chrono::duration<double>(end - start)).count();
+	LOG(INFO) << "E2E Bandwidth: " << ((message_size*n)/duration)/(1024*1024) << " MB/s";
 	s.DEBUG_check_order(order);
+
+	free(message);
 }
 
 void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, 
@@ -1275,8 +1276,8 @@ void LatencyTest(size_t total_message_size, size_t message_size, int num_threads
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
 
-	auto pub_duration = std::chrono::duration_cast<std::chrono::seconds>(pub_end - start);
-	auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
+	auto pub_duration = std::chrono::duration<double>(pub_end - start);
+	auto duration = std::chrono::duration<double>(end - start);
 	LOG(INFO) << "Pub Bandwidth: " << (total_message_size/(1024*1024))/pub_duration.count() << " MB/s";
 	LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
 	s.DEBUG_check_order(order);
