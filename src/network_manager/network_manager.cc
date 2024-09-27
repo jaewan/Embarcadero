@@ -18,9 +18,6 @@
 
 namespace Embarcadero{
 
-#define MAX_EVENTS 10
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-
 inline void make_socket_non_blocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags == -1) {
@@ -47,18 +44,18 @@ inline void make_socket_non_blocking(int fd) {
 	}
 }
 
-NetworkManager::NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads):
-	requestQueue_(queueCapacity),
-	largeMsgQueue_(10000),
-	broker_id_(broker_id),
-	num_reqReceive_threads_(num_reqReceive_threads){
-		// Create Network I/O threads
-		threads_.emplace_back(&NetworkManager::MainThread, this);
-		for (int i=0; i< num_reqReceive_threads; i++)
-			threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
+NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads):
+									requestQueue_(64),
+									largeMsgQueue_(10000),
+									broker_id_(broker_id),
+									num_reqReceive_threads_(num_reqReceive_threads){
+	// Create Network I/O threads
+	threads_.emplace_back(&NetworkManager::MainThread, this);
+	for (int i=0; i< num_reqReceive_threads; i++)
+		threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
 
-		while(thread_count_.load() != (1 + num_reqReceive_threads_)){}
-		LOG(INFO) << "\t[NetworkManager]: \tConstructed";
+	while(thread_count_.load() != (1 + num_reqReceive_threads_)){}
+	LOG(INFO) << "\t[NetworkManager]: \tConstructed";
 }
 
 NetworkManager::~NetworkManager(){
@@ -119,7 +116,7 @@ void NetworkManager::ReqReceiveThread(){
 						if(it != ack_connections_.end()){
 							ack_fd = it->second;
 						}else{
-							int ack_fd = socket(AF_INET, SOCK_STREAM, 0);
+							ack_fd = socket(AF_INET, SOCK_STREAM, 0);
 							if (ack_fd < 0) {
 								perror("Socket creation failed");
 								return;
@@ -214,7 +211,7 @@ void NetworkManager::ReqReceiveThread(){
 					pub_req.num_brokers = shake.num_msg; //shake.num_msg used as num_brokers at pub
 
 					BatchHeader batch_header;
-					while(running){
+					while(!stop_threads_){
 						// give up if we can't at least read a partial batch header
 						ssize_t bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
 						if(bytes_read <= 0){
@@ -246,7 +243,7 @@ void NetworkManager::ReqReceiveThread(){
 						MessageHeader* header;
 						size_t header_size = sizeof(MessageHeader);
 						size_t bytes_to_next_header = 0;
-						while(running){
+						while(running && !stop_threads_){
 							bytes_read = recv(req.client_socket, (uint8_t*)buf + read, to_read, 0);
 							if(bytes_read < 0){
 								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
@@ -459,7 +456,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 			int n = epoll_wait(ack_efd_, events, 10, EPOLL_TIMEOUT);
 			for (int i = 0; i < n; i++) {
 				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
-					ssize_t bytesSent = send(ack_fd, buf, MIN(bufSize, ack_count - acked_size), 0);
+					ssize_t bytesSent = send(ack_fd, buf, std::min(bufSize, ack_count - acked_size), 0);
 					if (bytesSent < 0) {
 						bytesSent = 0;
 						if (errno != EAGAIN) {
@@ -527,10 +524,13 @@ void NetworkManager::MainThread(){
 		perror("epoll_ctl");
 		LOG(INFO) << "epoll_ctl Error" << strerror(errno);
 	}
-	struct epoll_event events[MAX_EVENTS];
 
-	while (true) {
-		int n = epoll_wait(efd, events, MAX_EVENTS, -1);
+	int  MAX_EVENTS = 10;
+	struct epoll_event events[MAX_EVENTS];
+	int EPOLL_TIMEOUT = 1; // 1 millisecond timeout
+
+	while (!stop_threads_) {
+		int n = epoll_wait(efd, events, MAX_EVENTS, EPOLL_TIMEOUT);
 		for(int i=0; i< n; i++){
 			if (events[i].data.fd == server_socket) {
 				struct NetworkRequest req;

@@ -2,11 +2,14 @@ syntax = "proto3";
 
 package heartbeat_system;
 
+import "google/protobuf/empty.proto";
+
 service HeartBeat {
 	rpc RegisterNode (NodeInfo) returns (RegistrationStatus);
 	rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 	rpc GetClusterStatus (ClientInfo) returns (ClusterStatus);
 	rpc CreateNewTopic(CreateTopicRequest) returns (CreateTopicResponse);
+	rpc TerminateCluster(google.protobuf.Empty) returns (google.protobuf.Empty);
 }
 
 enum SequencerType{
@@ -42,6 +45,7 @@ message HeartbeatRequest {
 
 message HeartbeatResponse {
 	bool alive = 1;
+	bool shutdown = 2;
 }
 
 message CreateTopicRequest {

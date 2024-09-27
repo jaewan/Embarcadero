@@ -22,8 +22,7 @@ struct ReplicationRequest{
 
 class DiskManager{
 	public:
-		DiskManager(size_t queueCapacity, int broker_id, void* cxl_manager, bool log_to_memory, 
-						int num_io_threads=NUM_DISK_IO_THREADS);
+		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory, size_t queueCapacity = 64);
 		~DiskManager();
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
@@ -37,17 +36,17 @@ class DiskManager{
 
 		std::vector<std::thread> threads_;
 		folly::MPMCQueue<std::optional<struct ReplicationRequest>> requestQueue_;
+		int broker_id_;
+		void* cxl_addr_;
+		bool log_to_memory_;
 
 		NetworkManager *network_manager_;
 
-		void* cxl_addr_;
 		std::atomic<int> offset_{0};
 		bool stop_threads_ = false;
-		std::atomic<int> thread_count_{0};
-		int broker_id_;
-		int num_io_threads_;
-		bool log_to_memory_;
-		void* logs_[NUM_MAX_BROKERS];
+		std::atomic<size_t> thread_count_{0};
+		std::atomic<size_t> num_io_threads_{0};
+		std::atomic<size_t> num_active_threads_{0};
 		fs::path prefix_path_;
 };
 

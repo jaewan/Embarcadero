@@ -80,8 +80,13 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				HeartbeatResponse* reply) override {
 			absl::MutexLock lock(&mutex_);
 			auto it = nodes_.find(request->node_id());
+			reply->set_shutdown(false);
 			if (it != nodes_.end()) {
 				it->second.last_heartbeat = std::chrono::steady_clock::now();
+				if(shutdown_){
+					reply->set_shutdown(true);
+					nodes_.erase(it);
+				}
 				reply->set_alive(true);
 			} else {
 				reply->set_alive(false);
@@ -90,7 +95,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		}
 
 		Status GetClusterStatus(ServerContext* context, const ClientInfo* request,
-														ClusterStatus* reply) override {
+				ClusterStatus* reply) override {
 			absl::flat_hash_set<int32_t> s(request->nodes_info().begin(), request->nodes_info().end());
 			{
 				absl::MutexLock lock(&mutex_);
@@ -108,13 +113,37 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			return Status::OK;
 		}
 
+		void SetServer(std::shared_ptr<grpc::Server> server) {
+			server_ = server;
+		}
+
+		Status TerminateCluster(ServerContext* context, const google::protobuf::Empty* request,
+				google::protobuf::Empty* response) override {
+			LOG(INFO) << "[HeartBeatServiceImpl] TerminateCluster called, shutting down server.";
+			shutdown_ = true;
+
+			if (heartbeat_thread_.joinable()) {
+				heartbeat_thread_.join();  // Stop the heartbeat thread before shutting down the server
+			}
+			// Wait until other nodes in the cluster to shutdown
+			while(nodes_.size() != 1){
+				std::this_thread::yield();
+			}
+			 // Schedule the server shutdown
+			std::thread([this]() {
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+				server_->Shutdown();
+			}).detach();
+			return Status::OK;
+		}
+
 		Status CreateNewTopic(ServerContext* context, const CreateTopicRequest* request,
 				CreateTopicResponse* reply){
-				char topic[TOPIC_NAME_SIZE] = {0};
-				memcpy(topic, request->topic().data(), request->topic().size());
-				bool success = create_topic_entry_callback_(topic, (int)request->order(), (int)request->replication_factor(), request->sequencer_type());
-				reply->set_success(success);
-				return Status::OK;
+			char topic[TOPIC_NAME_SIZE] = {0};
+			memcpy(topic, request->topic().data(), request->topic().size());
+			bool success = create_topic_entry_callback_(topic, (int)request->order(), (int)request->replication_factor(), request->sequencer_type());
+			reply->set_success(success);
+			return Status::OK;
 		}
 
 		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback){
@@ -122,7 +151,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		}
 
 		int GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
-														struct Embarcadero::MessageHeader** msg_to_order, struct Embarcadero::TInode *tinode){
+				struct Embarcadero::MessageHeader** msg_to_order, struct Embarcadero::TInode *tinode){
 			absl::flat_hash_set<int> copy_set(registered_brokers.begin(), registered_brokers.end());
 			int ret = 0;
 			{
@@ -131,11 +160,11 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 					int broker_id = node.second.broker_id;
 					if(registered_brokers.find(broker_id) == registered_brokers.end()){
 						/*
-						while(tinode->offsets[broker_id].log_offset == 0){
-							_mm_pause(); //yield can cause deadlock in grpc. Instead of yield, make it spin
-						}
-						msg_to_order[broker_id] = ((struct Embarcadero::MessageHeader*)((uint8_t*)msg_to_order[broker_id] + tinode->offsets[broker_id].log_offset));
-						*/
+							 while(tinode->offsets[broker_id].log_offset == 0){
+							 _mm_pause(); //yield can cause deadlock in grpc. Instead of yield, make it spin
+							 }
+							 msg_to_order[broker_id] = ((struct Embarcadero::MessageHeader*)((uint8_t*)msg_to_order[broker_id] + tinode->offsets[broker_id].log_offset));
+							 */
 						ret++;
 						registered_brokers.insert(broker_id);
 					}else{
@@ -164,6 +193,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		absl::flat_hash_map<std::string, NodeInfo> nodes_;
 		std::thread heartbeat_thread_;
 		bool shutdown_ = false;
+		std::shared_ptr<grpc::Server> server_;
 		Embarcadero::CreateTopicEntryCallback create_topic_entry_callback_;
 };
 
@@ -208,7 +238,7 @@ class FollowerNodeClient {
 
 		void Register();
 		void SendHeartbeat();
-		void CheckHeartBeatReply();
+		bool CheckHeartBeatReply();
 		void HeartBeatLoop();
 
 		std::unique_ptr<HeartBeat::Stub> stub_;
@@ -233,6 +263,7 @@ class HeartBeatManager{
 					builder.AddListeningPort(head_address, grpc::InsecureServerCredentials());
 					builder.RegisterService(service_.get());
 					server_ = builder.BuildAndStart();
+					service_->SetServer(server_);
 				}else{
 					follower_ = std::make_unique<FollowerNodeClient>(GenerateUniqueId(), GetAddress(), 
 							grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials()));
@@ -240,11 +271,15 @@ class HeartBeatManager{
 			}
 
 		void Wait(){
+			VLOG(3) << "Wait called";
 			if(is_head_node_){
+				VLOG(3) << "head";
 				server_->Wait();
 			}else{
+				VLOG(3) << "follower";
 				follower_->Wait();
 			}
+			VLOG(3) << "wait finished";
 		}
 
 		int GetBrokerId(){
@@ -254,7 +289,7 @@ class HeartBeatManager{
 			return follower_->GetBrokerId();
 		}
 		int GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
-														struct Embarcadero::MessageHeader** msg_to_order, struct Embarcadero::TInode *tinode){
+				struct Embarcadero::MessageHeader** msg_to_order, struct Embarcadero::TInode *tinode){
 			if(is_head_node_){
 				return service_->GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
 			}else{
@@ -272,7 +307,7 @@ class HeartBeatManager{
 
 	private:
 		bool is_head_node_;
-		std::unique_ptr<Server> server_;
+		std::shared_ptr<Server> server_;
 		std::unique_ptr<HeartBeatServiceImpl> service_;
 		std::unique_ptr<FollowerNodeClient> follower_;
 

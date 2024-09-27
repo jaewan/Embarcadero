@@ -138,7 +138,6 @@ class CXLManager{
 		void* segments_;
 		void* current_log_addr_;
 		bool stop_threads_ = false;
-		std::atomic<int> thread_count_{0};
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 
 
@@ -188,10 +187,6 @@ class ScalogSequencerService : public ScalogSequencer::Service {
 
 		/// Time between each local cut
 		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL);
-
-		/// Used to keep track of how many grpc threads are waiting for the notification
-		/// If it's greater than 0, we can't reset the local epoch
-		int waiting_threads_count_ = 0;
 
 		/// The head node keeps track of the global epoch and increments it whenever we complete a round of local cuts
 		int global_epoch_;

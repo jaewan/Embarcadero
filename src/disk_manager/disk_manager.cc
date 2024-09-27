@@ -101,22 +101,14 @@ void *mmap_large_buffer(size_t need, size_t &allocated){
 	return buffer;
 }
 
-DiskManager::DiskManager(size_t queueCapacity, int broker_id, void* cxl_addr, bool log_to_memory,
-						 int num_io_threads):
+DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, size_t queueCapacity):
 						 requestQueue_(queueCapacity),
 						 broker_id_(broker_id),
 						 cxl_addr_(cxl_addr),
-						 log_to_memory_(log_to_memory),
-						 num_io_threads_(num_io_threads){
+						 log_to_memory_(log_to_memory){
 	//TODO(Jae) this onlye works at single topic upto replication fator of all, change this later
 	num_io_threads_ = NUM_MAX_BROKERS;
-	if(log_to_memory_){
-		for (int i=0; i< NUM_MAX_BROKERS; i++){
-			//size_t allocated;
-			//logs_[i] = mmap_large_buffer((1<<30), allocated);
-			logs_[i] = malloc((1<<30));
-		}
-	}else{
+	if(!log_to_memory){
 		const char *homedir;
 		if ((homedir = getenv("HOME")) == NULL) {
 			homedir = getpwuid(getuid())->pw_dir;
@@ -132,17 +124,18 @@ DiskManager::DiskManager(size_t queueCapacity, int broker_id, void* cxl_addr, bo
 	}
 
 	// Create Disk I/O threads
-	for (int i=0; i< num_io_threads_; i++)
+	for (size_t i=0; i< num_io_threads_; i++)
 		threads_.emplace_back(&DiskManager::DiskIOThread, this);
 
-	while(thread_count_.load() != num_io_threads_){}
+	while(thread_count_.load() != num_io_threads_){std::this_thread::yield();}
 	LOG(INFO) << "\t[DiskManager]: \t\tConstructed";
 }
 
 DiskManager::~DiskManager(){
 	stop_threads_ = true;
 	std::optional<struct ReplicationRequest> sentinel = std::nullopt;
-	for (int i=0; i<num_io_threads_; i++)
+	size_t n = num_io_threads_.load();
+	for (int i=0; i<n; i++)
 		requestQueue_.blockingWrite(sentinel);
 
 	for(std::thread& thread : threads_){
@@ -150,10 +143,21 @@ DiskManager::~DiskManager(){
 			thread.join();
 		}
 	}
+	
 	LOG(INFO)<< "[DiskManager]: \tDestructed";
 }
 
 void DiskManager::Replicate(TInode* tinode, int replication_factor){
+	size_t available_threads = num_io_threads_.load() - num_active_threads_.load();
+	int threads_needed = replication_factor - available_threads;
+	if(threads_needed > 0){
+		for(int i=0; i < threads_needed; i++){
+			VLOG(3) << "Spawning more disk io threads";
+			threads_.emplace_back(&DiskManager::DiskIOThread, this);
+		}
+		num_io_threads_.fetch_add(threads_needed);
+		while(thread_count_.load() != num_io_threads_.load()){std::this_thread::yield();}
+	}
 	if(!log_to_memory_){
 		fs::path log_dir = prefix_path_/tinode->topic;
 		VLOG(3) << "Logging to:" << log_dir;
@@ -181,6 +185,60 @@ void DiskManager::Replicate(TInode* tinode, int replication_factor){
 			requestQueue_.blockingWrite(req);
 		}
 	}
+}
+
+// Replicate req.tinode->topic req.broker_id's log to local disk
+// Runs until stop_threads_ signaled
+// TODO(Jae) handle when the leader broker fails. This is why we have num_io_threads_ tracked
+void DiskManager::DiskIOThread(){
+	void *log;
+	size_t log_size = (1<<30);
+	if(log_to_memory_){
+		log = malloc(log_size);
+	}
+	thread_count_.fetch_add(1, std::memory_order_relaxed);
+	std::optional<struct ReplicationRequest> optReq;
+
+	requestQueue_.blockingRead(optReq);
+	if(!optReq.has_value()){
+		if(log_to_memory_)
+			free(log);
+		thread_count_.fetch_sub(1);
+		num_active_threads_.fetch_sub(1);
+		num_io_threads_.fetch_sub(1);
+		return;
+	}
+	num_active_threads_.fetch_add(1);
+	const struct ReplicationRequest &req = optReq.value();
+	size_t last_offset = 0;
+	void* last_addr = nullptr;
+	void* messages;
+	size_t messages_size;
+	int order = req.tinode->order; // Do this here to avoid accessing CXL every time GetMesgaddr called
+
+	if(log_to_memory_){
+		size_t offset = 0;
+		while(!stop_threads_){
+			if(GetMessageAddr(req.tinode, order, req.broker_id, last_offset, last_addr, messages, messages_size)){
+				memcpy_nt((uint8_t*)log + offset, messages, messages_size);
+				//offset = (offset+messages_size)%log_size;
+				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
+			}
+		}
+		close(req.fd);
+	}else{
+		while(!stop_threads_){
+			if(GetMessageAddr(req.tinode, order, req.broker_id, last_offset, last_addr, messages, messages_size)){
+				write(req.fd, messages, messages_size);
+				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
+			}
+		}
+	}
+	if(log_to_memory_)
+		free(log);
+	thread_count_.fetch_sub(1);
+	num_active_threads_.fetch_sub(1);
+	num_io_threads_.fetch_sub(1);
 }
 
 //This is a copy of Topic::GetMessageAddr changed to use tinode instead of topic variables
@@ -249,39 +307,4 @@ bool DiskManager::GetMessageAddr(TInode* tinode, int order, int broker_id, size_
 #endif
 	return true;
 }
-
-void DiskManager::DiskIOThread(){
-	thread_count_.fetch_add(1, std::memory_order_relaxed);
-	std::optional<struct ReplicationRequest> optReq;
-
-	requestQueue_.blockingRead(optReq);
-	if(!optReq.has_value()){
-		return;
-	}
-	const struct ReplicationRequest &req = optReq.value();
-	size_t last_offset = 0;
-	void* last_addr = nullptr;
-	void* messages;
-	size_t messages_size;
-	int order = req.tinode->order; // Do this here to avoid accessing CXL every time GetMesgaddr called
-	if(log_to_memory_){
-		size_t offset = 0;
-		while(!stop_threads_){
-			if(GetMessageAddr(req.tinode, order, req.broker_id, last_offset, last_addr, messages, messages_size)){
-				memcpy_nt((uint8_t*)logs_[req.broker_id] + offset, messages, messages_size);
-				//offset+=messages_size;
-				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
-			}
-		}
-		close(req.fd);
-	}else{
-		while(!stop_threads_){
-			if(GetMessageAddr(req.tinode, order, req.broker_id, last_offset, last_addr, messages, messages_size)){
-				write(req.fd, messages, messages_size);
-				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
-			}
-		}
-	}
-}
-
 } // End of namespace Embarcadero
