@@ -48,7 +48,7 @@ struct SubscriberState{
 
 class NetworkManager{
 	public:
-		NetworkManager(size_t queueCapacity, int broker_id, int num_reqReceive_threads=NUM_NETWORK_IO_THREADS);
+		NetworkManager(int broker_id, int num_reqReceive_threads=NUM_NETWORK_IO_THREADS);
 		~NetworkManager();
 
 		void EnqueueRequest(struct NetworkRequest);

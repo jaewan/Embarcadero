@@ -1420,5 +1420,12 @@ int main(int argc, char* argv[]) {
 			break;
 	}
 
+	//*****************  Shuting down Embarlet ************************
+	std::unique_ptr<HeartBeat::Stub> stub = HeartBeat::NewStub(grpc::CreateChannel("127.0.0.1:"+std::to_string(BROKER_PORT), grpc::InsecureChannelCredentials()));
+	LOG(INFO) << "Calling TerminateCluster";
+	grpc::ClientContext context;
+	google::protobuf::Empty request, response;
+	stub->TerminateCluster(&context, request, &response);
+
 	return 0;
 }

@@ -15,7 +15,7 @@ else()
 endif()
 
 find_package(Protobuf REQUIRED)
-#find_package(gRPC REQUIRED)
+find_package(gRPC REQUIRED)
 
 # Proto file
 get_filename_component(heartbeat_proto "protobuf/heartbeat.proto" ABSOLUTE)
@@ -26,15 +26,6 @@ set(heartbeat_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/heartbeat.pb.cc")
 set(heartbeat_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/heartbeat.pb.h")
 set(heartbeat_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/heartbeat.grpc.pb.cc")
 set(heartbeat_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/heartbeat.grpc.pb.h")
-add_custom_command(
-      OUTPUT "${heartbeat_proto_srcs}" "${heartbeat_proto_hdrs}" "${heartbeat_grpc_srcs}" "${heartbeat_grpc_hdrs}"
-      COMMAND ${_PROTOBUF_PROTOC}
-      ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
-        --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
-        -I "${heartbeat_proto_path}"
-        --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
-        "${heartbeat_proto}"
-      DEPENDS "${heartbeat_proto}")
 
 # Include generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")

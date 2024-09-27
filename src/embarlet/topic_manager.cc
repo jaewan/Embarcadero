@@ -177,30 +177,30 @@ bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
 
 Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const char* topic_name,
 		int broker_id, int order, SequencerType seq_type, void* cxl_addr, void* segment_metadata):
-	get_new_segment_callback_(get_new_segment),
-	tinode_(static_cast<struct TInode*>(TInode_addr)),
-	topic_name_(topic_name),
-	broker_id_(broker_id),
-	order_(order),
-	seq_type_(seq_type),
-	cxl_addr_(cxl_addr),
-	logical_offset_(0),
-	written_logical_offset_((size_t)-1),
-	current_segment_(segment_metadata){
-		log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
-		first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
-		ordered_offset_addr_ = nullptr;
-		ordered_offset_ = 0;
-		if(seq_type == KAFKA){
-			GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
+		get_new_segment_callback_(get_new_segment),
+		tinode_(static_cast<struct TInode*>(TInode_addr)),
+		topic_name_(topic_name),
+		broker_id_(broker_id),
+		order_(order),
+		seq_type_(seq_type),
+		cxl_addr_(cxl_addr),
+		logical_offset_(0),
+		written_logical_offset_((size_t)-1),
+		current_segment_(segment_metadata){
+	log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
+	first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
+	ordered_offset_addr_ = nullptr;
+	ordered_offset_ = 0;
+	if(seq_type == KAFKA){
+		GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
+	}else{
+		if(order_ == 3){
+			GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
 		}else{
-			if(order_ == 3){
-				GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
-			}else{
-				GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
-			}
+			GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
 		}
 	}
+}
 
 void Topic::CombinerThread(){
 	void* segment_header = (uint8_t*)first_message_addr_ - CACHELINE_SIZE;

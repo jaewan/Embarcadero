@@ -214,7 +214,8 @@ void CXLManager::Sequencer1(char* topic){
 			if(written == (size_t)-1){
 				continue;
 			}
-			while(msg_logical_off <= written && msg_to_order[broker]->next_msg_diff != 0 && msg_to_order[broker]->logical_offset != (size_t)-1){
+			while(!stop_threads_ && msg_logical_off <= written && msg_to_order[broker]->next_msg_diff != 0 
+						&& msg_to_order[broker]->logical_offset != (size_t)-1){
 				msg_to_order[broker]->total_order = seq;
 				seq++;
 				//std::atomic_thread_fence(std::memory_order_release);
@@ -353,19 +354,22 @@ void CXLManager::Sequencer3(char* topic){
 		bool yield = true;
 		for(auto broker : registered_brokers){
 			while(msg_to_order[broker]->complete == 0){
+				if(stop_threads_)
+					return;
 				std::this_thread::yield();
 			}
 			size_t num_msg_per_batch = BATCH_SIZE / msg_to_order[broker]->paddedSize;
 			size_t msg_logical_off = (batch_seq/num_brokers)*num_msg_per_batch;
 			size_t n = msg_logical_off + num_msg_per_batch;
 			//VLOG(3) << batch_seq << ") Broker:" << broker <<  " Ordering:" << msg_logical_off << "~" << n;
-			while(msg_logical_off < n){
+			while(!stop_threads_ && msg_logical_off < n){
 				size_t written = tinode->offsets[broker].written;
 				if(written == (size_t)-1){
 					continue;
 				}
 				written = std::min(written, n-1);
-				while(msg_logical_off <= written && msg_to_order[broker]->next_msg_diff != 0 && msg_to_order[broker]->logical_offset != (size_t)-1){
+				while(!stop_threads_ && msg_logical_off <= written && msg_to_order[broker]->next_msg_diff != 0 
+							&& msg_to_order[broker]->logical_offset != (size_t)-1){
 					msg_to_order[broker]->total_order = seq;
 					seq++;
 					//std::atomic_thread_fence(std::memory_order_release);

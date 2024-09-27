@@ -39,6 +39,18 @@ endif()
 
 configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
+# Include the Protobuf and gRPC include directories passed from the parent CMakeLists.txt
+include_directories(${PROTOBUF_INCLUDE_DIRS})
+
+# Directories for your .proto files
+set(PROTO_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
+
+# List of .proto files
+set(PROTO_FILES
+    "${PROTO_SRC_DIR}/heartbeat.proto"
+)
+
+
 add_executable(embarlet 
     embarlet/embarlet.cc
     disk_manager/disk_manager.cc 
@@ -50,6 +62,17 @@ add_executable(embarlet
     embarlet/heartbeat.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
+)
+add_custom_command(
+  OUTPUT "${heartbeat_proto_srcs}" "${heartbeat_proto_hdrs}" "${heartbeat_grpc_srcs}" "${heartbeat_grpc_hdrs}"
+  COMMAND ${_PROTOBUF_PROTOC}
+  ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
+    --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
+    -I "${heartbeat_proto_path}"
+    -I "${PROTOBUF_INCLUDE_DIRS}"  # Add this line
+    --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
+    "${heartbeat_proto}"
+  DEPENDS "${heartbeat_proto}"
 )
 
 target_include_directories(embarlet PUBLIC
