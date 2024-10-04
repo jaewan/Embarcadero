@@ -47,11 +47,11 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		}
 
 		~HeartBeatServiceImpl() {
-			LOG(INFO) << "[HeartBeatServiceImpl] Destructing";
 			shutdown_ = true;
 			if (heartbeat_thread_.joinable()) {
 				heartbeat_thread_.join();
 			}
+			LOG(INFO) << "[HeartBeatServiceImpl] Destructed";
 		}
 
 		Status RegisterNode(ServerContext* context, const NodeInfo* request,

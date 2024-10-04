@@ -147,18 +147,17 @@ int main(int argc, char* argv[]){
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
 
-	if(is_head_node){
-		int fd = open("script_signal_pipe", O_WRONLY);
-		if (fd != -1) {
-			const char* signal = "ready";
-			write(fd, signal, strlen(signal) + 1);
-			close(fd);
-		}
+	int fd = open("script_signal_pipe", O_WRONLY);
+	if (fd != -1) {
+		const char* signal = "ready";
+		write(fd, signal, strlen(signal) + 1);
+		close(fd);
 	}
 	LOG(INFO) << "Embarcadero initialized. Ready to go";
 
 	// *************** Wait unless there's a failure ********************** 
 	heartbeat_manager.Wait();
 
+	LOG(INFO) << "Embarcadero Terminating";
 	return 0;
 }
