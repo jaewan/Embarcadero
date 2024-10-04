@@ -3,19 +3,11 @@
 pushd ../build/bin/
 
 NUM_TRIALS=1
+NUM_BROKERS=4
 order_level=(0 1 2)
 test_cases=(0 1)
 #msg_sizes=(128 512 1024 4096 65536 1048576)
 msg_sizes=(1024)
-
-# Function to start a process
-start_process() {
-  local command=$1
-  $command &
-  pid=$!
-  echo "Started process with command '$command' and PID $pid"
-  pids+=($pid)
-}
 
 wait_for_signal() {
   while true; do
@@ -25,6 +17,15 @@ wait_for_signal() {
       break
     fi
   done
+}
+
+# Function to start a process
+start_process() {
+  local command=$1
+  $command &
+  pid=$!
+  echo "Started process with command '$command' and PID $pid"
+  pids+=($pid)
 }
 
 # Array to store process IDs
@@ -39,12 +40,15 @@ for msg_size in "${msg_sizes[@]}"; do
 
 	# Start the processes
     start_process "./embarlet --head"
+	wait_for_signal
     head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
 	sleep 1
-    for i in {1..3}; do
+	for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
       start_process "./embarlet"
     done
-	wait_for_signal
+	for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
+	  wait_for_signal
+    done
     start_process "./throughput_test -m $msg_size"
 
     # Wait for all processes to finish
