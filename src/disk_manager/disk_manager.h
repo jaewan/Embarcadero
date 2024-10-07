@@ -20,6 +20,12 @@ struct ReplicationRequest{
 	int broker_id;
 };
 
+struct MemcpyRequest{
+    void* addr;
+    void* buf;
+    size_t len;
+};
+
 class DiskManager{
 	public:
 		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory, size_t queueCapacity = 64);
@@ -31,11 +37,13 @@ class DiskManager{
 
 	private:
 		void DiskIOThread();
+		void CopyThread();
 		bool GetMessageAddr(TInode* tinode, int order, int broker_id, size_t &last_offset,
 			void* &last_addr, void* &messages, size_t &messages_size);
 
 		std::vector<std::thread> threads_;
 		folly::MPMCQueue<std::optional<struct ReplicationRequest>> requestQueue_;
+		folly::MPMCQueue<std::optional<MemcpyRequest>> copyQueue_;
 		int broker_id_;
 		void* cxl_addr_;
 		bool log_to_memory_;

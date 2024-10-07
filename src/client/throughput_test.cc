@@ -552,7 +552,8 @@ class Publisher{
 
 						if (bytes_received == 0) {
 							// Connection closed by client
-							LOG(ERROR) << "Broker disconnected. Total bytes received: " << total_received;
+							LOG(ERROR) << "Broker may have been disconnected. " << strerror(errno) << " Total bytes received: " << total_received;
+							continue;
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 							close(client_sock);
 							client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
@@ -729,7 +730,7 @@ class Publisher{
 
 				ssize_t bytesSent = send(sock, (uint8_t*)(&batch_header), sizeof(Embarcadero::BatchHeader), 0);
 				if(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
-					LOG(ERROR) << "Jae compelte this too when batch header is partitioned.";
+					LOG(ERROR) << "Jae compelete this too when batch header is partitioned.";
 					return;
 				}
 

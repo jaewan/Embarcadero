@@ -103,6 +103,7 @@ void *mmap_large_buffer(size_t need, size_t &allocated){
 
 DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, size_t queueCapacity):
 						 requestQueue_(queueCapacity),
+						 copyQueue_(1024),
 						 broker_id_(broker_id),
 						 cxl_addr_(cxl_addr),
 						 log_to_memory_(log_to_memory){
@@ -123,9 +124,10 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, size
 		}
 	}
 
-	// Create Disk I/O threads
-	for (size_t i=0; i< num_io_threads_; i++)
+	for (size_t i=0; i< num_io_threads_; i++){
 		threads_.emplace_back(&DiskManager::DiskIOThread, this);
+		threads_.emplace_back(&DiskManager::CopyThread, this);
+	}
 
 	while(thread_count_.load() != num_io_threads_){std::this_thread::yield();}
 	LOG(INFO) << "\t[DiskManager]: \t\tConstructed";
@@ -134,9 +136,12 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, size
 DiskManager::~DiskManager(){
 	stop_threads_ = true;
 	std::optional<struct ReplicationRequest> sentinel = std::nullopt;
+	std::optional<struct MemcpyRequest> copy_sentinel = std::nullopt;
 	size_t n = num_io_threads_.load();
-	for (int i=0; i<n; i++)
+	for (int i=0; i<n; i++){
 		requestQueue_.blockingWrite(sentinel);
+		copyQueue_.blockingWrite(copy_sentinel);
+	}
 
 	for(std::thread& thread : threads_){
 		if(thread.joinable()){
@@ -145,6 +150,18 @@ DiskManager::~DiskManager(){
 	}
 	
 	LOG(INFO)<< "[DiskManager]: \tDestructed";
+}
+
+void DiskManager::CopyThread(){
+	while(!stop_threads_){
+		std::optional<MemcpyRequest> optReq;
+		copyQueue_.blockingRead(optReq);
+		if(!optReq.has_value()){
+			return;
+		}
+		MemcpyRequest &req = optReq.value();
+		std::memcpy(req.addr, req.buf, req.len);
+	}
 }
 
 void DiskManager::Replicate(TInode* tinode, int replication_factor){
@@ -180,7 +197,9 @@ void DiskManager::Replicate(TInode* tinode, int replication_factor){
 		}
 	}else{
 		for(int i = 0; i< replication_factor; i++){
+			//TODO(Jae) get current num brokers
 			int b = (broker_id_ + i)%NUM_MAX_BROKERS;
+			VLOG(3) << broker_id_ << " Replicating to " << b;
 			ReplicationRequest req = {tinode, -1, b};
 			requestQueue_.blockingWrite(req);
 		}
@@ -220,7 +239,31 @@ void DiskManager::DiskIOThread(){
 		size_t offset = 0;
 		while(!stop_threads_){
 			if(GetMessageAddr(req.tinode, order, req.broker_id, last_offset, last_addr, messages, messages_size)){
-				memcpy_nt((uint8_t*)log + offset, messages, messages_size);
+				if(messages_size > (1UL<<25)){
+					size_t write_granularity = (1UL<<24);
+					size_t remaining = messages_size - write_granularity;
+					while(remaining > 0){
+						MemcpyRequest req;
+						if(remaining >= write_granularity){
+							req.len = write_granularity;
+						}else{
+							req.len = remaining;
+						}
+						if(offset + req.len > log_size){
+							offset = 0;
+							LOG(ERROR) << "Consider increasing replica log size";
+						}
+						req.addr = (void*)((uint8_t*)log + offset);
+						req.buf = (void*)((uint8_t*)messages + offset);
+						copyQueue_.blockingWrite(req);
+
+						offset += req.len;
+						messages_size -= req.len;
+						remaining -= req.len;
+					}
+				}
+				memcpy((uint8_t*)log + offset, messages, messages_size);
+				offset = 0;
 				//offset = (offset+messages_size)%log_size;
 				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
 			}

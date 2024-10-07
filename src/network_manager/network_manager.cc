@@ -18,45 +18,55 @@
 
 namespace Embarcadero{
 
+// Cleanup function to close sockets and epoll
+inline void cleanup(int socket_fd, int epoll_fd) {
+    if (socket_fd >= 0) {
+        close(socket_fd);
+    }
+    if (epoll_fd >= 0) {
+        close(epoll_fd);
+    }
+}
+
 inline void make_socket_non_blocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags == -1) {
-		perror("fcntl F_GETFL");
+		LOG(ERROR) <<"fcntl F_GETFL";
 		return ;
 	}
 
 	flags |= O_NONBLOCK;
 	if (fcntl(fd, F_SETFL, flags) == -1) {
-		perror("fcntl F_SETFL");
+		LOG(ERROR) <<"fcntl F_SETFL";
 		return ;
 	}
 
 	int flag = 1;
 	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-		perror("setsockopt(SO_REUSEADDR) failed");
+		LOG(ERROR) <<"setsockopt(SO_REUSEADDR) failed";
 		close(fd);
 		return ;
 	}
 	if(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) != 0){
-		perror("setsockopt error");
+		LOG(ERROR) <<"setsockopt error";
 		close(fd);
 		return;
 	}
 }
 
 NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads):
-									requestQueue_(64),
-									largeMsgQueue_(10000),
-									broker_id_(broker_id),
-									num_reqReceive_threads_(num_reqReceive_threads){
-	// Create Network I/O threads
-	threads_.emplace_back(&NetworkManager::MainThread, this);
-	for (int i=0; i< num_reqReceive_threads; i++)
-		threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
+	requestQueue_(64),
+	largeMsgQueue_(10000),
+	broker_id_(broker_id),
+	num_reqReceive_threads_(num_reqReceive_threads){
+		// Create Network I/O threads
+		threads_.emplace_back(&NetworkManager::MainThread, this);
+		for (int i=0; i< num_reqReceive_threads; i++)
+			threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
 
-	while(thread_count_.load() != (1 + num_reqReceive_threads_)){}
-	LOG(INFO) << "\t[NetworkManager]: \tConstructed";
-}
+		while(thread_count_.load() != (1 + num_reqReceive_threads_)){}
+		LOG(INFO) << "\t[NetworkManager]: \tConstructed";
+	}
 
 NetworkManager::~NetworkManager(){
 	stop_threads_ = true;
@@ -118,7 +128,7 @@ void NetworkManager::ReqReceiveThread(){
 						}else{
 							ack_fd = socket(AF_INET, SOCK_STREAM, 0);
 							if (ack_fd < 0) {
-								perror("Socket creation failed");
+								LOG(ERROR) << "Socket creation failed";
 								return;
 							}
 
@@ -127,75 +137,92 @@ void NetworkManager::ReqReceiveThread(){
 							sockaddr_in server_addr; 
 							memset(&server_addr, 0, sizeof(server_addr));
 							server_addr.sin_family = AF_INET;
-							server_addr.sin_family = AF_INET;
-							server_addr.sin_port = ntohs(shake.port);
+							server_addr.sin_port = htons(shake.port);
 							server_addr.sin_addr.s_addr = inet_addr(inet_ntoa(client_address.sin_addr));
-							if (connect(ack_fd, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+							ack_efd_ = epoll_create1(0);
+							if (ack_efd_ == -1) {
+								LOG(ERROR) <<"epoll_create1 failed";
+								close(ack_fd);
+								return;
+							}
+							int max_retries = 5;
+							int retries = 0;
+
+							while (retries < max_retries) {
+								int connect_result = connect(ack_fd, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr));
+								if (connect_result == 0) {
+									// Connection successful
+									break;
+								}
 								if (errno != EINPROGRESS) {
-									perror("Connect failed");
-									close(ack_fd);
-									return;
+									LOG(ERROR) << "Connect failed: " << strerror(errno);
+									cleanup(ack_fd, ack_efd_);
+									return ;
 								}
-								//VLOG(3) << "connect failed:" << strerror(errno);
-								if (errno == EINPROGRESS) {
-									// Connection is in progress, use epoll to wait for completion
-									//VLOG(3) << "Connection in progress...";
 
-									// Create epoll instance to monitor the socket for EPOLLOUT
-									ack_efd_ = epoll_create1(0);
-									struct epoll_event event;
-									event.data.fd = ack_fd;
-									event.events = EPOLLOUT;
-									if (epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
-											perror("epoll_ctl failed");
-											close(ack_fd);
-											return;
-									}
-
-									// Wait for the socket to become writable (i.e., connection success/failure)
-									struct epoll_event events[1];
-									int n = epoll_wait(ack_efd_, events, 1, 5000);  // 5-second timeout
-									if (n > 0 && (events[0].events & EPOLLOUT)) {
-											// Check if the connection was successful
-											int sock_error;
-											socklen_t len = sizeof(sock_error);
-											if (getsockopt(ack_fd, SOL_SOCKET, SO_ERROR, &sock_error, &len) < 0) {
-													perror("getsockopt failed");
-													close(ack_fd);
-													return;
-											}
-
-											if (sock_error != 0) {
-												// Connection failed
-												LOG(ERROR) << "Connection failed: " << strerror(sock_error);
-												close(ack_fd);
-												return;
-											}
-									} else if (n == 0) {
-											// Timeout
-											LOG(ERROR) << "Connection timed out" << strerror(errno);
-											close(ack_fd);
-											return;
-									} else {
-											// epoll_wait error
-											LOG(ERROR) << "epoll_wait failed" << strerror(errno);
-											close(ack_fd);
-											return;
-									}
-								} else {
-									// Handle other connection errors
-									LOG(ERROR)<<"Connect failed" << strerror(errno);
-									close(ack_fd);
-									return;
-								}
-							}else{
-								ack_fd_ = ack_fd;
-								ack_efd_ = epoll_create1(0);
+								// Connection is in progress, use epoll to wait for completion
 								struct epoll_event event;
 								event.data.fd = ack_fd;
-								event.events = EPOLLOUT; 
-								epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event);
+								event.events = EPOLLOUT;
+
+								if (epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
+									LOG(ERROR) << "epoll_ctl failed: " << strerror(errno);
+									cleanup(ack_fd, ack_efd_);
+									return ;
+								}
+
+								// Wait for the socket to become writable (i.e., connection success/failure)
+								struct epoll_event events[1];
+								int n = epoll_wait(ack_efd_, events, 1, 5000);  // 5-second timeout
+
+								if (n > 0 && (events[0].events & EPOLLOUT)) {
+									// Check if the connection was successful
+									int sock_error;
+									socklen_t len = sizeof(sock_error);
+									if (getsockopt(ack_fd, SOL_SOCKET, SO_ERROR, &sock_error, &len) < 0) {
+										LOG(ERROR) << "getsockopt failed: " << strerror(errno);
+										cleanup(ack_fd, ack_efd_);
+										return ;
+									}
+
+									if (sock_error == 0) {
+										// Connection successful
+										break;  // Exit the retry loop on success
+									} else {
+										// Connection failed, log the error
+										LOG(ERROR) << "Connection failed: " << strerror(sock_error);
+										cleanup(ack_fd, ack_efd_);
+										return ;  // Exit due to failure
+									}
+								} else if (n == 0) {
+									// Timeout occurred
+									LOG(ERROR) << "Connection timed out, retrying...";
+									retries++;
+									sleep(1);  // Wait before retrying (optional)
+								} else {
+									// epoll_wait error
+									LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
+									cleanup(ack_fd, ack_efd_);
+									return ;  // Exit due to error
+								}
+
+								// Remove the fd from epoll before trying again
+								epoll_ctl(ack_efd_, EPOLL_CTL_DEL, ack_fd, NULL);
 							}
+
+							// After exiting the loop, if retries are exhausted
+							if (retries == max_retries) {
+								LOG(ERROR) << "Max retries reached. Connection failed.";
+								cleanup(ack_fd, ack_efd_);
+								return ;
+							}
+							ack_fd_ = ack_fd;
+							ack_efd_ = epoll_create1(0);
+							struct epoll_event event;
+							event.data.fd = ack_fd;
+							event.events = EPOLLOUT; 
+							epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event);
+
 							ack_connections_[shake.client_id] = ack_fd;
 							threads_.emplace_back(&NetworkManager::AckThread, this, shake.topic, ack_fd);
 						}
@@ -250,7 +277,7 @@ void NetworkManager::ReqReceiveThread(){
 								running = false;
 								return;
 							}
-              // TODO(Jae) Add validation logic here to check if the message headers are valid and send acknowledgement
+							// TODO(Jae) Add validation logic here to check if the message headers are valid and send acknowledgement
 							// We need this for ack=1 as well to confirm that the messages are valid
 							while(bytes_to_next_header + header_size <= (size_t) bytes_read){
 								header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
@@ -272,7 +299,7 @@ void NetworkManager::ReqReceiveThread(){
 #elif defined(__AMD__)
 									_mm_clwb(header);
 #else
-										LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
+									LOG(ERROR) << "Neither Intel nor AMD processor detected. If you see this and you either Intel or AMD, change cmake";
 #endif
 									//kafka_callback((void*)header, logical_offset);
 									logical_offset++;
@@ -326,14 +353,14 @@ void NetworkManager::ReqReceiveThread(){
 					}
 
 					{
-					absl::MutexLock lock(&sub_mu_);
-					if(!sub_state_.contains(shake.client_id)){
-						auto state = std::make_unique<SubscriberState>();
-						state->last_offset = shake.num_msg;
-						state->last_addr = shake.last_addr;
-						state->initialized = true;
-						sub_state_[shake.client_id] = std::move(state);
-					}
+						absl::MutexLock lock(&sub_mu_);
+						if(!sub_state_.contains(shake.client_id)){
+							auto state = std::make_unique<SubscriberState>();
+							state->last_offset = shake.num_msg;
+							state->last_addr = shake.last_addr;
+							state->initialized = true;
+							sub_state_[shake.client_id] = std::move(state);
+						}
 					}
 					SubscribeNetworkThread(req.client_socket, efd, shake.topic, shake.client_id);
 					close(req.client_socket);
@@ -395,24 +422,24 @@ void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int 
 						ret = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
 					else
 						ret = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
-						//ret = send(sock, (uint8_t*)messages + sent_bytes, to_send, MSG_ZEROCOPY);
+					//ret = send(sock, (uint8_t*)messages + sent_bytes, to_send, MSG_ZEROCOPY);
 					if (ret > 0) {
-							sent_bytes += ret;
-							zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
+						sent_bytes += ret;
+						zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
 					} else if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-							zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL << 16); // Cap send limit at 64K
-							continue;
+						zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL << 16); // Cap send limit at 64K
+						continue;
 					} else if (ret < 0) {
-							LOG(ERROR) << "Error in sending messages: " << strerror(errno) << " to_send:" << to_send;
-							close(sock);
-							close(efd);
-							return;
-					}
-				} else if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-						LOG(INFO) << "Socket error or hang-up";
+						LOG(ERROR) << "Error in sending messages: " << strerror(errno) << " to_send:" << to_send;
 						close(sock);
 						close(efd);
 						return;
+					}
+				} else if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+					LOG(INFO) << "Socket error or hang-up";
+					close(sock);
+					close(efd);
+					return;
 				}
 			}
 		}//end send loop
@@ -441,9 +468,9 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 			}
 		}
 		if(min<replicated && replicated != -1){
-		VLOG(3) <<"min:" << min << " replicated:" << replicated;
+			VLOG(3) <<"min:" << min << " replicated:" << replicated;
 			for(int i=0; i<replication_factor; i++){
-		VLOG(3) <<r[i];
+				VLOG(3) <<r[i];
 			}
 		}
 		size_t ack_count = min - replicated;
@@ -454,17 +481,41 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 		size_t acked_size = 0;
 		while (acked_size < ack_count) {
 			int n = epoll_wait(ack_efd_, events, 10, EPOLL_TIMEOUT);
-			for (int i = 0; i < n; i++) {
-				if (events[i].events & EPOLLOUT && acked_size < ack_count ) {
-					ssize_t bytesSent = send(ack_fd, buf, std::min(bufSize, ack_count - acked_size), 0);
-					if (bytesSent < 0) {
-						bytesSent = 0;
-						if (errno != EAGAIN) {
-							LOG(ERROR) << " Ack Send failed:" << strerror(errno) << " ack_fd:" << ack_fd << " ack size:" << (ack_count - acked_size) << " ack_count:" <<ack_count << " acked_size:" << acked_size << " min:" << min << " repicated:" << replicated;
-							return;
+			 for (int i = 0; i < n; i++) {
+				if (events[i].events & EPOLLOUT) {
+					bool retry;
+					do {
+						retry = false;
+						ssize_t bytesSent = send(ack_fd, buf + acked_size,
+																		 std::min(bufSize - acked_size, ack_count - acked_size), 0);
+						if(std::min(bufSize - acked_size, ack_count - acked_size) == 0){
+							LOG(ERROR) << "Ack sent 0!!!";
 						}
-					} else {
-						acked_size += bytesSent;
+						if (bytesSent < 0) {
+							if (errno == EAGAIN || errno == EWOULDBLOCK) {
+								// Would block, retry immediately
+								retry = true;
+								continue;
+							} else if (errno == EINTR) {
+								// Interrupted, retry
+								retry = true;
+								continue;
+							} else {
+								LOG(ERROR) << "Ack Send failed: " << strerror(errno)
+													 << " ack_fd: " << ack_fd
+													 << " ack size: " << (ack_count - acked_size)
+													 << " ack_count: " << ack_count
+													 << " acked_size: " << acked_size
+													 << " min: " << min
+													 << " replicated: " << replicated;
+								return;
+							}
+						} else {
+							acked_size += bytesSent;
+						}
+					} while (retry && acked_size < ack_count);
+					if (acked_size >= ack_count) {
+							break; // All data sent, exit the epoll loop
 					}
 				}
 			}
@@ -491,7 +542,7 @@ void NetworkManager::MainThread(){
 	}
 	int flag = 1;
 	if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) < 0) {
-		perror("setsockopt(SO_REUSEADDR) failed");
+		LOG(ERROR) <<"setsockopt(SO_REUSEADDR) failed";
 		close(server_socket);
 		return ;
 	}
@@ -503,25 +554,25 @@ void NetworkManager::MainThread(){
 	server_address.sin_addr.s_addr = INADDR_ANY;
 
 	while (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
-		LOG(ERROR)<< "!!!!! Error binding socket:" << (PORT + broker_id_) << " broker_id: " << broker_id_;
+		LOG(ERROR) << "!!!!! Error binding socket:" << (PORT + broker_id_) << " broker_id: " << broker_id_;
 		sleep(5);
 	}
 
 	if(listen(server_socket, SOMAXCONN) == -1){
-		std::cerr << "!!!!! Error Listen:" << strerror(errno) << std::endl;
+		LOG(ERROR) << "!!!!! Error Listen:" << strerror(errno);
 		return;
 	}
 
 	// Create epoll instance
 	int efd = epoll_create1(0);
-	if (efd == -1) perror("epoll_create1");
+	if (efd == -1) LOG(ERROR) <<"epoll_create1";
 
 	// Add server socket to epoll
 	struct epoll_event event;
 	event.events = EPOLLIN;
 	event.data.fd = server_socket;
 	if (epoll_ctl(efd, EPOLL_CTL_ADD, server_socket, &event) == -1){
-		perror("epoll_ctl");
+		LOG(ERROR) <<"epoll_ctl";
 		LOG(INFO) << "epoll_ctl Error" << strerror(errno);
 	}
 
@@ -538,7 +589,7 @@ void NetworkManager::MainThread(){
 				socklen_t client_addr_len = sizeof(client_addr);
 				req.client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_addr_len);
 				if (req.client_socket < 0) {
-					std::cerr << "!!!!! Error accepting connection:" << strerror(errno) << std::endl;
+					LOG(ERROR) << "!!!!! Error accepting connection:" << strerror(errno);
 					break;
 					continue;
 				}
