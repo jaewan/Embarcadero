@@ -271,15 +271,11 @@ class HeartBeatManager{
 			}
 
 		void Wait(){
-			VLOG(3) << "Wait called";
 			if(is_head_node_){
-				VLOG(3) << "head";
 				server_->Wait();
 			}else{
-				VLOG(3) << "follower";
 				follower_->Wait();
 			}
-			VLOG(3) << "wait finished";
 		}
 
 		int GetBrokerId(){
