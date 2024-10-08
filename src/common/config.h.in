@@ -67,7 +67,7 @@ struct alignas(64) PublishRequest{
 	size_t total_size;
 };
 
-using CreateTopicEntryCallback = std::function<bool(char*, int, int, heartbeat_system::SequencerType)>;
+using CreateTopicEntryCallback = std::function<bool(char*, int, int, bool, heartbeat_system::SequencerType)>;
 using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers, 
 														struct MessageHeader** msg_to_order, struct TInode *tinode)>;
 } // End of namespace Embarcadero
