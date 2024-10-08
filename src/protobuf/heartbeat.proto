@@ -52,7 +52,8 @@ message CreateTopicRequest {
 	string topic = 1;
 	int32 order = 2;
 	int32 replication_factor = 3;
-	SequencerType sequencer_type = 4;
+	bool replicate_tinode = 4;
+	SequencerType sequencer_type = 5;
 }
 
 message CreateTopicResponse {

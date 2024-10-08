@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdint>
+#include <cstdint>
+#include <algorithm>
 #include <immintrin.h>
 #include "folly/ConcurrentSkipList.h"
 
@@ -49,7 +51,8 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 }
 
 struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]){
-	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+	struct TInode* tinode = cxl_manager_.GetTInode(topic);
+	TInode* replica_tinode = nullptr;
 	{
 	absl::WriterMutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
@@ -58,6 +61,12 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
 	void* segment_metadata = cxl_manager_.GetNewSegment();
+	if(tinode->replicate_tinode){
+		replica_tinode = cxl_manager_.GetReplicaTInode(topic);
+		replica_tinode->offsets[broker_id_].ordered = -1;
+		replica_tinode->offsets[broker_id_].written = -1;
+		replica_tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
+	}
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
@@ -72,12 +81,12 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 #endif
 */
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
-			tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
+			tinode, replica_tinode, topic, broker_id_, tinode->order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
 	int replication_factor = tinode->replication_factor;
 	if(replication_factor > 0){
-		disk_manager_.Replicate(tinode, replication_factor);
+		disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
 	}
 
 	if(tinode->seq_type != KAFKA)
@@ -90,8 +99,18 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	return tinode;
 }
 
-struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, SequencerType seq_type){
-	struct TInode* tinode = (struct TInode*)cxl_manager_.GetTInode(topic);
+struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, SequencerType seq_type){
+	struct TInode* tinode = cxl_manager_.GetTInode(topic);
+	struct TInode* replica_tinode = nullptr;
+	bool no_collision = std::all_of(
+    reinterpret_cast<const unsigned char*>(tinode->topic),
+    reinterpret_cast<const unsigned char*>(tinode->topic) + TOPIC_NAME_SIZE,
+    [](unsigned char c) { return c == 0; }
+);
+	if(!no_collision){
+		LOG(ERROR) << "Jae Topic name collides: " << tinode->topic << " handle collision";
+		exit(1);
+	}
 	{
 	absl::WriterMutexLock lock(&mutex_);
 	CHECK_LT(num_topics_, MAX_TOPIC_SIZE) << "Creating too many topics, increase MAX_TOPIC_SIZE";
@@ -103,10 +122,35 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
-	tinode->order = (uint8_t)order;
-	tinode->replication_factor = (uint8_t)replication_factor;
+	tinode->order = order;
+	tinode->replication_factor = replication_factor;
+	tinode->replicate_tinode = replicate_tinode;
 	tinode->seq_type = seq_type;
 	memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
+
+	if(replicate_tinode){
+		char replica_topic[TOPIC_NAME_SIZE];
+		memcpy(replica_topic, topic, TOPIC_NAME_SIZE);
+		memcpy((uint8_t*)replica_topic + (TOPIC_NAME_SIZE-7), "replica", 7); 
+		replica_tinode = cxl_manager_.GetReplicaTInode(topic);
+		no_collision = std::all_of(
+			reinterpret_cast<const unsigned char*>(replica_tinode->topic),
+			reinterpret_cast<const unsigned char*>(replica_tinode->topic) + TOPIC_NAME_SIZE,
+			[](unsigned char c) { return c == 0; }
+		);
+		if(!no_collision){
+			LOG(ERROR) << "Jae replica Topic name collides: " << replica_tinode->topic << " handle collision";
+			exit(1);
+		}
+		replica_tinode->offsets[broker_id_].ordered = -1;
+		replica_tinode->offsets[broker_id_].written = -1;
+		replica_tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
+		replica_tinode->order = order;
+		replica_tinode->replication_factor = replication_factor;
+		replica_tinode->replicate_tinode = replicate_tinode;
+		replica_tinode->seq_type = seq_type;
+		memcpy(replica_tinode->topic, replica_topic, TOPIC_NAME_SIZE);
+	}
 
 /*
 #ifdef __INTEL__
@@ -118,11 +162,11 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 #endif
 */
 	topics_[topic] = std::make_unique<Topic>([this](){return cxl_manager_.GetNewSegment();},
-			tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
+			tinode, replica_tinode, topic, broker_id_, order, tinode->seq_type, cxl_manager_.GetCXLAddr(), segment_metadata);
 	}
 
 	if(replication_factor > 0){
-		disk_manager_.Replicate(tinode, replication_factor);
+		disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
 	}
 
 	if(seq_type != KAFKA)
@@ -130,8 +174,8 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 	return tinode;
 }
 
-bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, SequencerType seq_type){
-	if(CreateNewTopicInternal(topic, order, replication_factor, seq_type)){
+bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, SequencerType seq_type){
+	if(CreateNewTopicInternal(topic, order, replication_factor, replicate_tinode, seq_type)){
 		cxl_manager_.RunSequencer(topic, order, seq_type);
 		return true;
 	}else{
@@ -146,7 +190,7 @@ void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
 	auto topic_itr = topics_.find(req.topic);
 	if (topic_itr == topics_.end()){
-		if(memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE) == 0){
+		if(memcmp(req.topic, cxl_manager_.GetTInode(req.topic)->topic, TOPIC_NAME_SIZE) == 0){
 			// The topic was created from another broker
 			CreateNewTopicInternal(req.topic);
 			topic_itr = topics_.find(req.topic);
@@ -155,8 +199,8 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &re
 				return nullptr;
 			}
 		}else{
-			LOG(ERROR) << "[GetCXLBuffer] Topic:" << req.topic << " was not created before:" << ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic
-			<< " memcmp:" << memcmp(req.topic, ((struct TInode*)(cxl_manager_.GetTInode(req.topic)))->topic, TOPIC_NAME_SIZE);
+			LOG(ERROR) << "[GetCXLBuffer] Topic:" << req.topic << " was not created before:" << cxl_manager_.GetTInode(req.topic)->topic
+			<< " memcmp:" << memcmp(req.topic, cxl_manager_.GetTInode(req.topic)->topic, TOPIC_NAME_SIZE);
 			return nullptr;
 		}
 	}
@@ -175,10 +219,11 @@ bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
 	return topic_itr->second->GetMessageAddr(last_offset, last_addr, messages, messages_size);
 }
 
-Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const char* topic_name,
+Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, TInode* replica_tinode, const char* topic_name,
 		int broker_id, int order, SequencerType seq_type, void* cxl_addr, void* segment_metadata):
 		get_new_segment_callback_(get_new_segment),
 		tinode_(static_cast<struct TInode*>(TInode_addr)),
+		replica_tinode_(replica_tinode),
 		topic_name_(topic_name),
 		broker_id_(broker_id),
 		order_(order),
@@ -200,6 +245,15 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, const cha
 			GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
 		}
 	}
+}
+
+inline void Topic::UpdateTInodeWritten(size_t written, size_t written_addr){
+	if(tinode_->replicate_tinode){
+		replica_tinode_->offsets[broker_id_].written = written;
+		replica_tinode_->offsets[broker_id_].written_addr = written_addr;
+	}
+	tinode_->offsets[broker_id_].written = written;
+	tinode_->offsets[broker_id_].written_addr = written_addr;
 }
 
 void Topic::CombinerThread(){
@@ -236,8 +290,7 @@ void Topic::CombinerThread(){
 #endif
 */
 		std::atomic_thread_fence(std::memory_order_release);
-		tinode_->offsets[broker_id_].written = logical_offset_;
-		tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)header - (uint8_t*)cxl_addr_);
+		UpdateTInodeWritten(logical_offset_, (unsigned long long int)((uint8_t*)header - (uint8_t*)cxl_addr_));
 		(*(unsigned long long int*)segment_header) =
 			(unsigned long long int)((uint8_t*)header - (uint8_t*)segment_header);
 		written_logical_offset_ = logical_offset_;
@@ -281,9 +334,10 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 				has_next_messages_written = false;
 				written_logical_offset_ = logical_offset;
 				written_physical_addr_ = (void*)log;
-				tinode_->offsets[broker_id_].written = logical_offset;
+				//tinode_->offsets[broker_id_].written = logical_offset;
 				((MessageHeader*)log)->logical_offset = (size_t)-1;
-				tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)log - (uint8_t*)cxl_addr_);
+				//tinode_->offsets[broker_id_].written_addr = (unsigned long long int)((uint8_t*)log - (uint8_t*)cxl_addr_);
+				UpdateTInodeWritten(logical_offset, (unsigned long long int)((uint8_t*)log - (uint8_t*)cxl_addr_));
 				(*(unsigned long long int*)current_segment_) =
 					(unsigned long long int)((uint8_t*)log - (uint8_t*)current_segment_);
 				kafka_logical_offset_.store(logical_offset+1);
@@ -299,7 +353,6 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 }
 
 std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-	size_t batch_seq;
 	absl::MutexLock lock(&mutex_);
 	if(skipped_batch_.contains(req.client_id)){
 		auto it = skipped_batch_[req.client_id].find(req.batch_seq);

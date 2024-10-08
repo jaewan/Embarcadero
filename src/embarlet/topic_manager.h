@@ -21,7 +21,7 @@ using GetNewSegmentCallback = std::function<void*()>;
 class Topic{
 	public:
 		Topic(GetNewSegmentCallback get_new_segment_callback, 
-				void* TInode_addr, const char* topic_name, int broker_id, int order,
+				void* TInode_addr, TInode* replica_tinode, const char* topic_name, int broker_id, int order,
 				heartbeat_system::SequencerType, void* cxl_addr, void* segment_metadata);
 		~Topic(){
 			stop_threads_ = true;
@@ -44,6 +44,7 @@ class Topic{
 		}
 
 	private:
+		inline void UpdateTInodeWritten(size_t written, size_t written_addr);
 		void CombinerThread();
 		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		std::function<void(void*, size_t)> KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
@@ -51,6 +52,7 @@ class Topic{
 		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
+		struct TInode *replica_tinode_;
 		std::string topic_name_;
 		int broker_id_;
 		struct MessageHeader *last_message_header_;
@@ -92,7 +94,7 @@ class TopicManager{
 		~TopicManager(){
 			LOG(INFO) << "\t[TopicManager]\tDestructed";
 		}
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, heartbeat_system::SequencerType);
+		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
 		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
@@ -100,7 +102,7 @@ class TopicManager{
 
 	private:
 		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]);
-		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, heartbeat_system::SequencerType);
+		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, heartbeat_system::SequencerType);
 		int GetTopicIdx(char topic[TOPIC_NAME_SIZE]){
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
 		}
