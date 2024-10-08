@@ -79,8 +79,8 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 }
 
 CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
-	head_ip_(head_ip),
-	broker_id_(broker_id){
+	broker_id_(broker_id),
+	head_ip_(head_ip){
 	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
 	if (cxl_type == Real) {
@@ -130,13 +130,30 @@ std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(PublishRequest &req,
 	return topic_manager_->GetCXLBuffer(req, log, segment_header, logical_offset);
 }
 
+inline int hashTopic(const char topic[TOPIC_NAME_SIZE]) {
+	unsigned int hash = 0;
+
+	for (int i = 0; i < TOPIC_NAME_SIZE; ++i) {
+		hash = (hash * TOPIC_NAME_SIZE) + topic[i];
+	}
+	return hash % MAX_TOPIC_SIZE;
+}
+
 // This function returns TInode without inspecting if the topic exists
-void* CXLManager::GetTInode(const char* topic){
+TInode* CXLManager::GetTInode(const char* topic){
 	// Convert topic to tinode address
 	//static const std::hash<std::string> topic_to_idx;
 	//int TInode_idx = topic_to_idx(topic) % MAX_TOPIC_SIZE;
-	int TInode_idx = atoi(topic) % MAX_TOPIC_SIZE;
-	return ((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
+	int TInode_idx = hashTopic(topic);
+	return (TInode*)((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
+}
+
+TInode* CXLManager::GetReplicaTInode(const char* topic){
+	char replica_topic[TOPIC_NAME_SIZE];
+	memcpy(replica_topic, topic, TOPIC_NAME_SIZE);
+	memcpy((uint8_t*)replica_topic + (TOPIC_NAME_SIZE-7), "replica", 7); 
+	int TInode_idx = hashTopic(replica_topic);
+	return (TInode*)((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
 }
 
 void* CXLManager::GetNewSegment(){
@@ -179,6 +196,9 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 				LOG(INFO) << "Sequencers not needed for corfu";
 			}
 			break;
+		default:
+			LOG(ERROR) << "Unknown sequencer:" << sequencerType;
+			break;
 	}
 }
 
@@ -197,17 +217,28 @@ void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 	}
 }
 
+inline void CXLManager::UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t ordered_offset){
+	if(tinode->replicate_tinode){
+		struct TInode *replica_tinode = GetReplicaTInode(topic);
+		replica_tinode->offsets[broker].ordered = msg_logical_off;
+		replica_tinode->offsets[broker].ordered_offset = ordered_offset;
+	}
+
+	tinode->offsets[broker].ordered = msg_logical_off;
+	tinode->offsets[broker].ordered_offset = ordered_offset;
+}
+
 void CXLManager::Sequencer1(char* topic){
-	struct TInode *tinode = (struct TInode *)GetTInode(topic);
+	struct TInode *tinode = GetTInode(topic);
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
 	static size_t seq = 0;
 
 	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-	auto last_updated = std::chrono::steady_clock::now();
+	//auto last_updated = std::chrono::steady_clock::now();
 
 	while(!stop_threads_){
-		bool yield = true;
+		//bool yield = true;
 		for(auto broker : registered_brokers){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
 			size_t written = tinode->offsets[broker].written;
@@ -219,11 +250,10 @@ void CXLManager::Sequencer1(char* topic){
 				msg_to_order[broker]->total_order = seq;
 				seq++;
 				//std::atomic_thread_fence(std::memory_order_release);
-				tinode->offsets[broker].ordered = msg_logical_off;
-				tinode->offsets[broker].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
+				UpdateTinodeOrder(topic, tinode, broker , msg_logical_off, (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_);
 				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
 				msg_logical_off++;
-				yield = false;
+				//yield = false;
 			}
 		}
 		/*
@@ -241,7 +271,7 @@ void CXLManager::Sequencer1(char* topic){
 }
 
 void CXLManager::Sequencer2(char* topic){
-	struct TInode *tinode = (struct TInode *)GetTInode(topic);
+	struct TInode *tinode = GetTInode(topic);
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
 	absl::flat_hash_map<int/*client_id*/, size_t/*client_req_id*/> last_ordered; 
@@ -260,8 +290,7 @@ void CXLManager::Sequencer2(char* topic){
 		for(auto broker : registered_brokers){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
 			//This ensures the message is Combined (complete ensures it is fully received)
-			if(msg_to_order[broker]->complete == 1 && msg_logical_off != (size_t)-1 && (int)msg_logical_off <= tinode->offsets[broker].written){
-				int client_id;
+			if(msg_to_order[broker]->complete == 1 && msg_logical_off != (size_t)-1 && msg_logical_off <= tinode->offsets[broker].written){
 				yield = false;
 				queues[broker].push(msg_to_order[broker]);
 				int client = msg_to_order[broker]->client_id;
@@ -278,7 +307,7 @@ void CXLManager::Sequencer2(char* topic){
 						std::vector<int> to_remove;
 						for (auto& pair : it->second) {
 							int client_order = pair.first;
-							if(client_order == last_ordered[client] + 1){
+							if((size_t)client_order == last_ordered[client] + 1){
 								pair.second.second->total_order = seq;
 								seq++;
 								last_ordered[client] = client_order;
@@ -306,8 +335,7 @@ void CXLManager::Sequencer2(char* topic){
 								header = queues[b].front();
 							}
 							if(exportable_msg){
-								tinode->offsets[b].ordered = exportable_msg->logical_offset;
-								tinode->offsets[b].ordered_offset = (uint8_t*)exportable_msg - (uint8_t*)cxl_addr_;
+								UpdateTinodeOrder(topic, tinode, b, exportable_msg->logical_offset,(uint8_t*)exportable_msg - (uint8_t*)cxl_addr_);
 							}
 						}
 					}
@@ -340,18 +368,18 @@ void CXLManager::Sequencer2(char* topic){
 
 // Does not support multi-client, dynamic message size, dynamic batch 
 void CXLManager::Sequencer3(char* topic){
-	struct TInode *tinode = (struct TInode *)GetTInode(topic);
+	struct TInode *tinode = GetTInode(topic);
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
 	static size_t seq = 0;
 	static size_t batch_seq = 0;
 
 	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-	auto last_updated = std::chrono::steady_clock::now();
+	//auto last_updated = std::chrono::steady_clock::now();
 	size_t num_brokers = registered_brokers.size();
 
 	while(!stop_threads_){
-		bool yield = true;
+		//bool yield = true;
 		for(auto broker : registered_brokers){
 			while(msg_to_order[broker]->complete == 0){
 				if(stop_threads_)
@@ -373,8 +401,7 @@ void CXLManager::Sequencer3(char* topic){
 					msg_to_order[broker]->total_order = seq;
 					seq++;
 					//std::atomic_thread_fence(std::memory_order_release);
-					tinode->offsets[broker].ordered = msg_logical_off;
-					tinode->offsets[broker].ordered_offset = (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_;
+					UpdateTinodeOrder(topic, tinode, broker, msg_logical_off, (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_);
 					msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
 					msg_logical_off++;
 				}
@@ -445,7 +472,7 @@ ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int brok
 }
 
 void ScalogSequencerService::LocalSequencer(std::string topic_str){
-	struct TInode *tinode = (struct TInode *) cxl_manager_->GetTInode(topic_str.c_str());
+	struct TInode *tinode = cxl_manager_->GetTInode(topic_str.c_str());
 
 	auto start_time = std::chrono::high_resolution_clock::now();
 	/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
@@ -542,7 +569,7 @@ void CXLManager::ScalogSequencer(int epoch, const char* topic, absl::Mutex &glob
 	static TInode *tinode = nullptr; 
 	static MessageHeader* msg_to_order = nullptr;
 	if(tinode == nullptr){
-		tinode = (struct TInode *) GetTInode(topic);
+		tinode = GetTInode(topic);
 		msg_to_order = ((MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id_].log_offset));
 	}
 
@@ -612,7 +639,7 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 
 	std::unique_lock<std::mutex> lock(mutex_);
 
-	struct TInode *tinode = (struct TInode *) cxl_manager_->GetTInode(topic);
+	struct TInode *tinode = cxl_manager_->GetTInode(topic);
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
 	cxl_manager_->GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
@@ -622,7 +649,7 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 		absl::ReaderMutexLock lock(&global_cut_mu_);
 		local_cut_num = global_cut_[epoch].size();
 	}
-	if (local_cut_num == registered_brokers.size()) {
+	if ((size_t)local_cut_num == registered_brokers.size()) {
 		// Send global cut to own node's local sequencer
 		global_epoch_++;
 		cxl_manager_->ScalogSequencer(epoch, topic, global_cut_mu_, global_cut_);
@@ -648,7 +675,7 @@ void ScalogSequencerService::ReceiveLocalCut(int epoch, const char* topic, int b
 				absl::ReaderMutexLock lock(&global_cut_mu_);
 				local_cut_num = global_cut_[epoch].size();
 			}
-			if (local_cut_num == registered_brokers.size()){
+			if ((size_t)local_cut_num == registered_brokers.size()){
 				return true;
 			} else {
 				return false;

@@ -65,8 +65,9 @@ struct alignas(64) offset_entry {
 struct alignas(64) TInode{
 	struct {
 		char topic[TOPIC_NAME_SIZE];
-		volatile uint8_t order;
-		volatile uint8_t replication_factor;
+		volatile bool replicate_tinode = false;
+		volatile int order;
+		volatile int replication_factor;
 		SequencerType seq_type;
 	}__attribute__((aligned(64)));
 	/*
@@ -106,7 +107,8 @@ class CXLManager{
 		void SetTopicManager(TopicManager *topic_manager){topic_manager_ = topic_manager;}
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		void* GetNewSegment();
-		void* GetTInode(const char* topic);
+		TInode* GetTInode(const char* topic);
+		TInode* GetReplicaTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType);
@@ -148,6 +150,8 @@ class CXLManager{
 		std::atomic<int> scalog_sequencer_service_port_offset_{0};
 
 		void CXLIOThread(int tid);
+		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
+																		size_t msg_to_order);
 		void Sequencer1(char* topic);
 		void Sequencer2(char* topic);
 		void Sequencer3(char* topic);

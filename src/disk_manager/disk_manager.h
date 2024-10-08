@@ -16,6 +16,7 @@ class NetworkManager;
 
 struct ReplicationRequest{
 	TInode* tinode;
+	TInode* replica_tinode;
 	int fd;
 	int broker_id;
 };
@@ -33,7 +34,7 @@ class DiskManager{
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
 		// Change this to get real-time num brokers
-		void Replicate(TInode* TInode_addr, int replication_factor);
+		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
 
 	private:
 		void DiskIOThread();

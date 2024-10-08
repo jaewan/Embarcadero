@@ -411,22 +411,6 @@ class Publisher{
 			return;
 		}
 
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, SequencerType seq_type, int replication_factor){
-			seq_type_ = seq_type;
-			grpc::ClientContext context;
-			heartbeat_system::CreateTopicRequest create_topic_req;;
-			heartbeat_system::CreateTopicResponse create_topic_reply;;
-			create_topic_req.set_topic(topic);
-			create_topic_req.set_order(order);
-			create_topic_req.set_replication_factor(replication_factor);
-			create_topic_req.set_sequencer_type(seq_type);
-			grpc::Status status = stub_->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
-			if(status.ok()){
-				return create_topic_reply.success();
-			}
-			return false;
-		}
-
 	private:
 		std::string head_addr_;
 		std::string port_;
@@ -450,7 +434,6 @@ class Publisher{
 		std::vector<std::thread> threads_;
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
-		SequencerType seq_type_;
 
 		void EpollAckThread(){
 			if(ack_level_ != 2)
@@ -699,34 +682,10 @@ class Publisher{
 				}
 				Embarcadero::BatchHeader batch_header;
 				batch_header.total_size = len;
+				//TODO(Jae) This assumes static message sizes. Must make it count the messages to allow dynamic msg sizes
 				batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize;
 				batch_header.batch_seq = batch_seq;
 				batch_seq += num_threads_;
-				/*
-					 if(seq_type_ == heartbeat_system::SequencerType::KAFKA){
-					 Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader *)msg;
-					 while(header->paddedSize == 0){
-					 VLOG(3) << "client_order:" << header->client_order << " size is 0";
-					 break;
-					 std::this_thread::yield();
-					 }
-				//batch_header.num_msg = len/1088;
-				size_t off = 0;
-				while(off < len){
-				batch_header.num_msg++;
-				while(header->paddedSize == 0){
-				std::this_thread::yield();
-				}
-				header = (Embarcadero::MessageHeader *)((uint8_t*)header + header->paddedSize);
-				while(header->paddedSize == 0){
-				VLOG(3) << "client_order:" << header->client_order << " size is 0";
-				break;
-				std::this_thread::yield();
-				}
-				off += header->paddedSize;
-				}
-				}
-				*/
 
 				ssize_t bytesSent = send(sock, (uint8_t*)(&batch_header), sizeof(Embarcadero::BatchHeader), 0);
 				if(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
@@ -1150,21 +1109,17 @@ bool CheckAvailableCores(){
 	return num_cores == CGROUP_CORE;
 }
 
-double PublishThroughputTest(size_t total_message_size, size_t message_size, int num_threads,
-		int ack_level, int order, SequencerType seq_type, int replication_factor, std::atomic<int> &synchronizer){
+double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads,
+		int ack_level, int order, std::atomic<int> &synchronizer){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << 
-		" num_threads:" << num_threads << " replication_factor:" << replication_factor;
+		" num_threads:" << num_threads;
 	char* message = (char*)malloc(sizeof(char)*message_size);
-	char topic[TOPIC_NAME_SIZE];
-	memset(topic, 0, TOPIC_NAME_SIZE);
-	memcpy(topic, "TestTopic", 9);
 
 	size_t q_size = total_message_size + (total_message_size/message_size)*64;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-	p.CreateNewTopic(topic, order, seq_type, replication_factor);
 	p.Init(topic, ack_level);
 	// **************    Wait until other threads are initialized ************** //
 	synchronizer.fetch_sub(1);
@@ -1196,11 +1151,8 @@ double PublishThroughputTest(size_t total_message_size, size_t message_size, int
 	return bandwidthMbps;
 }
 
-void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size, int order, int replication_factor){
+void SubscribeThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_msg_size, size_t msg_size, int order){
 	LOG(INFO) << "[Subscribe Throuput Test] ";
-	char topic[TOPIC_NAME_SIZE];
-	memset(topic, 0, TOPIC_NAME_SIZE);
-	memcpy(topic, "TestTopic", 9);
 	auto start = std::chrono::high_resolution_clock::now();
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
 	s.DEBUG_wait(total_msg_size, msg_size);
@@ -1211,21 +1163,17 @@ void SubscribeThroughputTest(size_t total_msg_size, size_t msg_size, int order, 
 	s.DEBUG_check_order(order);
 }
 
-void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_threads, int ack_level,
-		int order, SequencerType seq_type, int replication_factor){
+void E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, int ack_level,
+		int order){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << 
-		" num_threads:" << num_threads << " replication_factor:" << replication_factor;
+		" num_threads:" << num_threads;
 	char* message = (char*)malloc(sizeof(char)*message_size);
-	char topic[TOPIC_NAME_SIZE];
-	memset(topic, 0, TOPIC_NAME_SIZE);
-	memcpy(topic, "TestTopic", 9);
 
 	size_t q_size = total_message_size + (total_message_size/message_size)*64;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-	p.CreateNewTopic(topic, order, seq_type, replication_factor);
 	p.Init(topic, ack_level);
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false);
 
@@ -1248,19 +1196,15 @@ void E2EThroughputTest(size_t total_message_size, size_t message_size, int num_t
 	free(message);
 }
 
-void LatencyTest(size_t total_message_size, size_t message_size, int num_threads, 
-		int ack_level, int order, SequencerType seq_type, int replication_factor){
+void LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, 
+		int ack_level, int order){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
 	char message[message_size];
-	char topic[TOPIC_NAME_SIZE];
-	memset(topic, 0, TOPIC_NAME_SIZE);
-	memcpy(topic, "TestTopic", 9);
 
 	size_t q_size = total_message_size + (total_message_size/message_size)*64;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-	p.CreateNewTopic(topic, order, seq_type, replication_factor);
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
 	p.Init(topic, ack_level);
 
@@ -1284,6 +1228,24 @@ void LatencyTest(size_t total_message_size, size_t message_size, int num_threads
 	s.DEBUG_check_order(order);
 	s.StoreLatency();
 }
+
+bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE], 
+		int order, SequencerType seq_type, int replication_factor, bool replicate_tinode){
+	grpc::ClientContext context;
+	heartbeat_system::CreateTopicRequest create_topic_req;;
+	heartbeat_system::CreateTopicResponse create_topic_reply;;
+	create_topic_req.set_topic(topic);
+	create_topic_req.set_order(order);
+	create_topic_req.set_replication_factor(replication_factor);
+	create_topic_req.set_replicate_tinode(replicate_tinode);
+	create_topic_req.set_sequencer_type(seq_type);
+	grpc::Status status = stub->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
+	if(status.ok()){
+		return create_topic_reply.success();
+	}
+	return false;
+}
+
 
 heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
 	if (value == "EMBARCADERO") return heartbeat_system::SequencerType::EMBARCADERO;
@@ -1309,6 +1271,7 @@ int main(int argc, char* argv[]) {
 		("m,size", "Size of a message", cxxopts::value<size_t>()->default_value("1024"))
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("r,replication_factor", "Replication factor", cxxopts::value<int>()->default_value("0"))
+		("replicate_tinode", "Replicate Tinode for Disaggregated memory fault tolerance")
 		("t,test_number", "Test to run. 0:pub/sub 1:E2E 2:Latency 3:Parallel", cxxopts::value<int>()->default_value("0"))
 		("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
 		("n,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
@@ -1320,6 +1283,7 @@ int main(int argc, char* argv[]) {
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
 	int replication_factor =result["replication_factor"].as<int>();
+	bool replicate_tinode = result.count("replicate_tinode");
 	int num_clients = result["parallel_client"].as<int>();
 	std::atomic<int> synchronizer{num_clients};
 	int test_num = result["test_number"].as<int>();
@@ -1360,24 +1324,33 @@ int main(int argc, char* argv[]) {
 		}
 	}
 
+	std::unique_ptr<HeartBeat::Stub> stub = HeartBeat::NewStub(grpc::CreateChannel("127.0.0.1:"+std::to_string(BROKER_PORT), grpc::InsecureChannelCredentials()));
+	char topic[TOPIC_NAME_SIZE];
+	memset(topic, 0, TOPIC_NAME_SIZE);
+	memcpy(topic, "TestTopic", 9);
+
 	switch(test_num){
 		case 0:
+			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 			LOG(INFO) << "Running Publish and Subscribe: "<< total_message_size;
-			PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor, synchronizer);
+			PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
 			sleep(3);
-			SubscribeThroughputTest(total_message_size, message_size, order, replication_factor);
+			SubscribeThroughputTest(topic, total_message_size, message_size, order);
 			break;
 		case 1:
 			LOG(INFO) << "Running E2E Throughput";
-			E2EThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+			E2EThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order);
 			break;
 		case 2:
 			LOG(INFO) << "Running E2E Latency Test";
-			LatencyTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor);
+			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+			LatencyTest(topic, total_message_size, message_size, num_threads, ack_level, order);
 			break;
 		case 3:
 			LOG(INFO) << "Running Parallel Publish Test num_clients:" << num_clients << ":" << num_threads;
 			{
+			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 			std::vector<std::thread> threads;
 			std::vector<std::promise<double>> promises(num_clients); // Vector of promises
 			std::vector<std::future<double>> futures;                // Vector of futures
@@ -1390,7 +1363,7 @@ int main(int argc, char* argv[]) {
 			// Launch the threads
 			for (int i = 0; i < num_clients; i++) {
 				threads.emplace_back([&, i]() {
-					double result = PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor, synchronizer);
+					double result = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
 					promises[i].set_value(result); // Set the result in the promise
 				});
 			}
@@ -1410,11 +1383,12 @@ int main(int argc, char* argv[]) {
 			break;
 		case 4:
 			LOG(INFO) << "Running Publish : "<< total_message_size;
-			PublishThroughputTest(total_message_size, message_size, num_threads, ack_level, order, seq_type, replication_factor, synchronizer);
+			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+			PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
 			break;
 		case 5:
 			LOG(INFO) << "Running Subscribe ";
-			SubscribeThroughputTest(total_message_size, message_size, order, replication_factor);
+			SubscribeThroughputTest(topic, total_message_size, message_size, order);
 			break;
 		default:
 			LOG(ERROR) << "Invalid test number option:" << result["test_number"].as<int>();
@@ -1422,10 +1396,9 @@ int main(int argc, char* argv[]) {
 	}
 
 	//*****************  Shuting down Embarlet ************************
-	std::unique_ptr<HeartBeat::Stub> stub = HeartBeat::NewStub(grpc::CreateChannel("127.0.0.1:"+std::to_string(BROKER_PORT), grpc::InsecureChannelCredentials()));
-	LOG(INFO) << "Calling TerminateCluster";
-	grpc::ClientContext context;
 	google::protobuf::Empty request, response;
+	grpc::ClientContext context;
+	LOG(INFO) << "Calling TerminateCluster";
 	stub->TerminateCluster(&context, request, &response);
 
 	return 0;

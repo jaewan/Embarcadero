@@ -164,7 +164,7 @@ void DiskManager::CopyThread(){
 	}
 }
 
-void DiskManager::Replicate(TInode* tinode, int replication_factor){
+void DiskManager::Replicate(TInode* tinode, TInode* replica_tinode, int replication_factor){
 	size_t available_threads = num_io_threads_.load() - num_active_threads_.load();
 	int threads_needed = replication_factor - available_threads;
 	if(threads_needed > 0){
@@ -192,7 +192,7 @@ void DiskManager::Replicate(TInode* tinode, int replication_factor){
 			if(fd == -1){
 				LOG(ERROR) << "File open for replication failed:" << strerror(errno);
 			}
-			ReplicationRequest req = {tinode, fd, b};
+			ReplicationRequest req = {tinode, replica_tinode, fd, b};
 			requestQueue_.blockingWrite(req);
 		}
 	}else{
@@ -200,7 +200,7 @@ void DiskManager::Replicate(TInode* tinode, int replication_factor){
 			//TODO(Jae) get current num brokers
 			int b = (broker_id_ + i)%NUM_MAX_BROKERS;
 			VLOG(3) << broker_id_ << " Replicating to " << b;
-			ReplicationRequest req = {tinode, -1, b};
+			ReplicationRequest req = {tinode, replica_tinode, -1, b};
 			requestQueue_.blockingWrite(req);
 		}
 	}
@@ -234,6 +234,8 @@ void DiskManager::DiskIOThread(){
 	void* messages;
 	size_t messages_size;
 	int order = req.tinode->order; // Do this here to avoid accessing CXL every time GetMesgaddr called
+	TInode* replica_tinode = req.replica_tinode;
+	bool replicate_tinode = req.tinode->replicate_tinode;
 
 	if(log_to_memory_){
 		size_t offset = 0;
@@ -251,7 +253,7 @@ void DiskManager::DiskIOThread(){
 						}
 						if(offset + req.len > log_size){
 							offset = 0;
-							LOG(ERROR) << "Consider increasing replica log size";
+							LOG(ERROR) << "Consider increasing replica log size message_size:" << messages_size;
 						}
 						req.addr = (void*)((uint8_t*)log + offset);
 						req.buf = (void*)((uint8_t*)messages + offset);
@@ -265,6 +267,9 @@ void DiskManager::DiskIOThread(){
 				memcpy((uint8_t*)log + offset, messages, messages_size);
 				offset = 0;
 				//offset = (offset+messages_size)%log_size;
+				if(replicate_tinode){
+					replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
+				}
 				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
 			}
 		}
@@ -273,6 +278,9 @@ void DiskManager::DiskIOThread(){
 		while(!stop_threads_){
 			if(GetMessageAddr(req.tinode, order, req.broker_id, last_offset, last_addr, messages, messages_size)){
 				write(req.fd, messages, messages_size);
+				if(replicate_tinode){
+					replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
+				}
 				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_offset;
 			}
 		}
