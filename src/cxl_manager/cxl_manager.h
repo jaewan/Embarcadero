@@ -139,7 +139,7 @@ class CXLManager{
 		void* bitmap_;
 		void* segments_;
 		void* current_log_addr_;
-		bool stop_threads_ = false;
+		volatile bool stop_threads_ = false;
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 
 
@@ -152,9 +152,9 @@ class CXLManager{
 		void CXLIOThread(int tid);
 		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
 																		size_t msg_to_order);
-		void Sequencer1(char* topic);
-		void Sequencer2(char* topic);
-		void Sequencer3(char* topic);
+		void Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic);
+		void Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic);
+		void Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic);
 };
 
 class ScalogSequencerService : public ScalogSequencer::Service {

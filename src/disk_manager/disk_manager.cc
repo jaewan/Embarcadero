@@ -303,7 +303,10 @@ bool DiskManager::GetMessageAddr(TInode* tinode, int order, int broker_id, size_
 	//size_t combined_offset = tinode->offsets[broker_id].written;
 
 	if(order > 0){
-		combined_addr = (uint8_t*)cxl_addr_ + tinode->offsets[broker_id].ordered_offset;
+		if(tinode->offsets[broker_id].ordered_offset == 0){
+			return false;
+		}
+		combined_addr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(cxl_addr_) + tinode->offsets[broker_id].ordered_offset);
 		combined_offset = ((MessageHeader*)combined_addr)->logical_offset;//tinode->offsets[broker_id].ordered;
 	}
 
@@ -358,4 +361,5 @@ bool DiskManager::GetMessageAddr(TInode* tinode, int order, int broker_id, size_
 #endif
 	return true;
 }
+
 } // End of namespace Embarcadero
