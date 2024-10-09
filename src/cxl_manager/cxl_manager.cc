@@ -172,15 +172,18 @@ bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
 void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType){
 	if (order == 0)
 		return;
+	std::array<char, TOPIC_NAME_SIZE> topic_arr;
+	memcpy(topic_arr.data(), topic, TOPIC_NAME_SIZE);
+
 	switch(sequencerType){
 		case KAFKA: // Kafka is just a way to not run CombinerThread, not actual sequencer
 		case EMBARCADERO:
 			if (order == 1)
-				sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic);
+				sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic_arr);
 			else if (order == 2)
-				sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic);
+				sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic_arr);
 			else if (order == 3)
-				sequencerThreads_.emplace_back(&CXLManager::Sequencer3, this, topic);
+				sequencerThreads_.emplace_back(&CXLManager::Sequencer3, this, topic_arr);
 			break;
 		case SCALOG:
 			if (order == 1){
@@ -228,8 +231,8 @@ inline void CXLManager::UpdateTinodeOrder(char *topic, TInode* tinode, int broke
 	tinode->offsets[broker].ordered_offset = ordered_offset;
 }
 
-void CXLManager::Sequencer1(char* topic){
-	struct TInode *tinode = GetTInode(topic);
+void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic){
+	struct TInode *tinode = GetTInode(topic.data());
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
 	static size_t seq = 0;
@@ -250,7 +253,7 @@ void CXLManager::Sequencer1(char* topic){
 				msg_to_order[broker]->total_order = seq;
 				seq++;
 				//std::atomic_thread_fence(std::memory_order_release);
-				UpdateTinodeOrder(topic, tinode, broker , msg_logical_off, (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_);
+				UpdateTinodeOrder(topic.data(), tinode, broker , msg_logical_off, (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_);
 				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
 				msg_logical_off++;
 				//yield = false;
@@ -270,8 +273,8 @@ void CXLManager::Sequencer1(char* topic){
 	}
 }
 
-void CXLManager::Sequencer2(char* topic){
-	struct TInode *tinode = GetTInode(topic);
+void CXLManager::Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic){
+	struct TInode *tinode = GetTInode(topic.data());
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
 	absl::flat_hash_map<int/*client_id*/, size_t/*client_req_id*/> last_ordered; 
@@ -335,7 +338,7 @@ void CXLManager::Sequencer2(char* topic){
 								header = queues[b].front();
 							}
 							if(exportable_msg){
-								UpdateTinodeOrder(topic, tinode, b, exportable_msg->logical_offset,(uint8_t*)exportable_msg - (uint8_t*)cxl_addr_);
+								UpdateTinodeOrder(topic.data(), tinode, b, exportable_msg->logical_offset,(uint8_t*)exportable_msg - (uint8_t*)cxl_addr_);
 							}
 						}
 					}
@@ -367,8 +370,8 @@ void CXLManager::Sequencer2(char* topic){
 }
 
 // Does not support multi-client, dynamic message size, dynamic batch 
-void CXLManager::Sequencer3(char* topic){
-	struct TInode *tinode = GetTInode(topic);
+void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
+	struct TInode *tinode = GetTInode(topic.data());
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
 	static size_t seq = 0;
@@ -401,7 +404,7 @@ void CXLManager::Sequencer3(char* topic){
 					msg_to_order[broker]->total_order = seq;
 					seq++;
 					//std::atomic_thread_fence(std::memory_order_release);
-					UpdateTinodeOrder(topic, tinode, broker, msg_logical_off, (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_);
+					UpdateTinodeOrder(topic.data(), tinode, broker, msg_logical_off, (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_);
 					msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
 					msg_logical_off++;
 				}

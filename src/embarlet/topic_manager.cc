@@ -262,7 +262,6 @@ void Topic::CombinerThread(){
 	while(!stop_threads_){
 		while(header->complete == 0){
 			if(stop_threads_){
-				LOG(INFO) << "Stopping CombinerThread";
 				return;
 			}
 			std::this_thread::yield();
