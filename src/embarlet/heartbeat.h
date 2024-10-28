@@ -310,6 +310,9 @@ class HeartBeatManager{
 
 		// We do not use IP address as node identifier b/c multiple brokers could run on a single node
 		std::string GenerateUniqueId() {
+			pid_t pid = getpid();
+			std::string pid_str = std::to_string(pid);
+			return pid_str;
 			// Get current timestamp
 			auto now = std::chrono::system_clock::now();
 			auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now);
