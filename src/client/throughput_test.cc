@@ -1146,12 +1146,12 @@ double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_s
 	 std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
 	 std::cout << "Total time: " << seconds << std::endl;
 	 */
-	std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
+	LOG(INFO) << "Bandwidth: " << bandwidthMbps << " MBps";
 	free(message);
 	return bandwidthMbps;
 }
 
-void SubscribeThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_msg_size, size_t msg_size, int order){
+double SubscribeThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_msg_size, size_t msg_size, int order){
 	LOG(INFO) << "[Subscribe Throuput Test] ";
 	auto start = std::chrono::high_resolution_clock::now();
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
@@ -1159,11 +1159,13 @@ void SubscribeThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_msg_size,
 	auto end = std::chrono::high_resolution_clock::now();
 	std::chrono::duration<double> elapsed = end - start;
 	double seconds = elapsed.count();
-	LOG(INFO) << (total_msg_size/(1024*1024))/seconds << "MB/s";
+	double bandwidthMbps = (total_msg_size/(1024*1024))/seconds;
+	LOG(INFO) << bandwidthMbps << "MB/s";
 	s.DEBUG_check_order(order);
+	return bandwidthMbps;
 }
 
-void E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, int ack_level,
+std::pair<double, double> E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, int ack_level,
 		int order){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << 
@@ -1187,16 +1189,18 @@ void E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, s
 
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
-	double pub_duration = (std::chrono::duration<double>(pub_end - start)).count();
-	LOG(INFO) << "Pub Bandwidth: " << ((message_size*n)/pub_duration)/(1024*1024) << " MB/s";
-	auto duration = (std::chrono::duration<double>(end - start)).count();
-	LOG(INFO) << "E2E Bandwidth: " << ((message_size*n)/duration)/(1024*1024) << " MB/s";
+	double pubBandwidthMbps = ((message_size*n)/(std::chrono::duration<double>(pub_end - start)).count())/(1024*1024);
+	LOG(INFO) << "Pub Bandwidth: " << pubBandwidthMbps;
+	auto e2eBandwidthMbps = ((message_size*n)/(std::chrono::duration<double>(end - start)).count())/(1024*1024);
+	LOG(INFO) << "E2E Bandwidth: " << e2eBandwidthMbps << " MB/s";
 	s.DEBUG_check_order(order);
 
 	free(message);
+
+	return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);
 }
 
-void LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, 
+std::pair<double, double> LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, 
 		int ack_level, int order){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
@@ -1221,12 +1225,14 @@ void LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t 
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
 
-	auto pub_duration = std::chrono::duration<double>(pub_end - start);
-	auto duration = std::chrono::duration<double>(end - start);
-	LOG(INFO) << "Pub Bandwidth: " << (total_message_size/(1024*1024))/pub_duration.count() << " MB/s";
-	LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
+	auto pubBandwidthMbps = (total_message_size/(1024*1024))/std::chrono::duration<double>(pub_end - start).count();
+	auto e2eBandwidthMbps = (total_message_size/(1024*1024))/std::chrono::duration<double>(end - start).count();
+	LOG(INFO) << "Pub Bandwidth: " << pubBandwidthMbps << " MB/s";
+	LOG(INFO) << "E2E Bandwidth: " << e2eBandwidthMbps << " MB/s";
 	s.DEBUG_check_order(order);
 	s.StoreLatency();
+
+	return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);
 }
 
 bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE], 
@@ -1272,6 +1278,7 @@ int main(int argc, char* argv[]) {
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("r,replication_factor", "Replication factor", cxxopts::value<int>()->default_value("0"))
 		("replicate_tinode", "Replicate Tinode for Disaggregated memory fault tolerance")
+		("record_results", "Record Results in a csv file")
 		("t,test_number", "Test to run. 0:pub/sub 1:E2E 2:Latency 3:Parallel", cxxopts::value<int>()->default_value("0"))
 		("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
 		("n,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
@@ -1284,6 +1291,7 @@ int main(int argc, char* argv[]) {
 	int order = result["order_level"].as<int>();
 	int replication_factor =result["replication_factor"].as<int>();
 	bool replicate_tinode = result.count("replicate_tinode");
+	bool record_results = result.count("record_results");
 	int num_clients = result["parallel_client"].as<int>();
 	std::atomic<int> synchronizer{num_clients};
 	int test_num = result["test_number"].as<int>();
@@ -1331,21 +1339,27 @@ int main(int argc, char* argv[]) {
 
 	switch(test_num){
 		case 0:
+		{
 			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 			LOG(INFO) << "Running Publish and Subscribe: "<< total_message_size;
-			PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+			double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
 			sleep(3);
-			SubscribeThroughputTest(topic, total_message_size, message_size, order);
+			double sub_bandwidthMb = SubscribeThroughputTest(topic, total_message_size, message_size, order);
+		}
 			break;
 		case 1:
+		{
 			LOG(INFO) << "Running E2E Throughput";
 			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-			E2EThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+			std::pair<double, double> bandwidths = E2EThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+		}
 			break;
 		case 2:
+		{
 			LOG(INFO) << "Running E2E Latency Test";
 			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-			LatencyTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+			std::pair<double, double> bandwidths = LatencyTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+		}
 			break;
 		case 3:
 			LOG(INFO) << "Running Parallel Publish Test num_clients:" << num_clients << ":" << num_threads;
@@ -1382,13 +1396,24 @@ int main(int argc, char* argv[]) {
 			}
 			break;
 		case 4:
-			LOG(INFO) << "Running Publish : "<< total_message_size;
+			LOG(INFO) << "Running Broker failure at publish ";
+		{
 			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-			PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+			double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+		}
 			break;
 		case 5:
+			LOG(INFO) << "Running Publish : "<< total_message_size;
+		{
+			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+			double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+		}
+			break;
+		case 6:
 			LOG(INFO) << "Running Subscribe ";
-			SubscribeThroughputTest(topic, total_message_size, message_size, order);
+		{
+			double sub_bandwidthMb = SubscribeThroughputTest(topic, total_message_size, message_size, order);
+		}
 			break;
 		default:
 			LOG(ERROR) << "Invalid test number option:" << result["test_number"].as<int>();
