@@ -1261,6 +1261,95 @@ heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
 	throw std::runtime_error("Invalid SequencerType: " + value);
 }
 
+class ResultWriter{
+	public:
+		ResultWriter(const cxxopts::ParseResult& result):result_path("../../data/"){
+			message_size = result["size"].as<size_t>();
+			total_message_size = result["total_message_size"].as<size_t>();
+			num_threads = result["num_threads"].as<size_t>();
+			ack_level = result["ack_level"].as<int>();
+			order = result["order_level"].as<int>();
+			replication_factor =result["replication_factor"].as<int>();
+			replicate_tinode = result.count("replicate_tinode");
+			record_result_ = result.count("record_results");
+			num_clients = result["parallel_client"].as<int>();
+			int test_num = result["test_number"].as<int>();
+
+			switch(test_num){
+				case 0:
+					result_path += "throughput/pubsub/result.csv";
+					break;
+				case 1:
+					result_path += "throughput/e2e/result.csv";
+					break;
+				case 2:
+					result_path += "latency/e2e/result.csv";
+					break;
+				case 3:
+					result_path += "throughput/multiclient/result.csv";
+					break;
+				case 4:
+					result_path += "throughput/failure/result.csv";
+					break;
+				case 5:
+					result_path += "throughput/pub/result.csv";
+					break;
+				case 6:
+					result_path += "throughput/sub/result.csv";
+					break;
+			}
+		}
+		~ResultWriter(){
+			if(record_result_){
+				std::ofstream file;
+				file.open(result_path, std::ios::app);
+				if(!file.is_open()){
+					LOG(ERROR) << "Error: Could not open file:" << result_path << " : " << strerror(errno);
+					return;
+				}
+				file << message_size << ",";
+				file << total_message_size << ",";
+				file << num_threads << ",";
+				file << ack_level << ",";
+				file << order << ",";
+				file << replication_factor << ",";
+				file << replicate_tinode << ",";
+				file << num_clients << ",";
+				file << pubBandwidthMbps << ",";
+				file << subBandwidthMbps << ",";
+				file << e2eBandwidthMbps << "\n";
+
+				file.close();
+			}
+		}
+
+		void SetPubResult(double res){
+			pubBandwidthMbps = res;
+		}
+		void SetSubResult(double res){
+			subBandwidthMbps = res;
+		}
+		void SetE2EResult(double res){
+			e2eBandwidthMbps = res;
+		}
+
+	private:
+		size_t message_size;
+		size_t total_message_size;
+		size_t num_threads;
+		int ack_level;
+		int order;
+		int replication_factor;
+		bool replicate_tinode;
+		bool record_result_;
+		int num_clients;
+
+		std::string result_path;
+		double pubBandwidthMbps = 0;
+		double subBandwidthMbps = 0;
+		double e2eBandwidthMbps = 0;
+};
+
 int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
@@ -1337,6 +1426,8 @@ int main(int argc, char* argv[]) {
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
 
+	ResultWriter writer(result);
+
 	switch(test_num){
 		case 0:
 		{
@@ -1345,6 +1436,8 @@ int main(int argc, char* argv[]) {
 			double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
 			sleep(3);
 			double sub_bandwidthMb = SubscribeThroughputTest(topic, total_message_size, message_size, order);
+			writer.SetPubResult(pub_bandwidthMb);
+			writer.SetSubResult(sub_bandwidthMb);
 		}
 			break;
 		case 1:
@@ -1352,6 +1445,8 @@ int main(int argc, char* argv[]) {
 			LOG(INFO) << "Running E2E Throughput";
 			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 			std::pair<double, double> bandwidths = E2EThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+			writer.SetPubResult(bandwidths.first);
+			writer.SetSubResult(bandwidths.second);
 		}
 			break;
 		case 2:
@@ -1359,6 +1454,8 @@ int main(int argc, char* argv[]) {
 			LOG(INFO) << "Running E2E Latency Test";
 			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 			std::pair<double, double> bandwidths = LatencyTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+			writer.SetPubResult(bandwidths.first);
+			writer.SetSubResult(bandwidths.second);
 		}
 			break;
 		case 3:
@@ -1391,6 +1488,7 @@ int main(int argc, char* argv[]) {
 					aggregate_bandwidth += futures[i].get();  // Get the result from the future
 				}
 			}
+			writer.SetPubResult(aggregate_bandwidth);
 
 			std::cout << "Aggregate Bandwidth:" << aggregate_bandwidth;
 			}
@@ -1400,6 +1498,7 @@ int main(int argc, char* argv[]) {
 		{
 			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 			double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+			writer.SetPubResult(pub_bandwidthMb);
 		}
 			break;
 		case 5:
@@ -1407,12 +1506,14 @@ int main(int argc, char* argv[]) {
 		{
 			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 			double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+			writer.SetPubResult(pub_bandwidthMb);
 		}
 			break;
 		case 6:
 			LOG(INFO) << "Running Subscribe ";
 		{
 			double sub_bandwidthMb = SubscribeThroughputTest(topic, total_message_size, message_size, order);
+			writer.SetSubResult(sub_bandwidthMb);
 		}
 			break;
 		default:
@@ -1420,6 +1521,7 @@ int main(int argc, char* argv[]) {
 			break;
 	}
 
+	writer.~ResultWriter();
 	//*****************  Shuting down Embarlet ************************
 	google::protobuf::Empty request, response;
 	grpc::ClientContext context;
