@@ -86,7 +86,7 @@ int main(int argc, char* argv[]){
 		("e,emul", "Use emulation instead of CXL")
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("network_threads", "Number of network IO threads", cxxopts::value<int>()->default_value(std::to_string(NUM_NETWORK_IO_THREADS)))
-		("replicate_to_mem", "Replicate to Memory")
+		("replicate_to_disk", "Replicate to Disk instead of Memory")
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		;
 
@@ -98,9 +98,9 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Broker ********************** 
 	bool is_head_node = false;
-	bool replicate_to_memory = false;
-	if (arguments.count("replicate_to_mem")) {
-		replicate_to_memory = true;
+	bool replicate_to_memory = true;
+	if (arguments.count("replicate_to_disk")) {
+		replicate_to_memory = false;
 	}
 	if (arguments.count("head")) {
 		is_head_node = true;

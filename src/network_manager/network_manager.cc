@@ -454,7 +454,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
 	int replication_factor = tinode->replication_factor;
 	CHECK_GT(replication_factor, 0) << " Replication factor must be larger than 0 at ack:2";
-	int replicated = -1; // This is not precise but just one
+	int replicated = -1; // This is not precise as 0 will always be reported as replicated (initialized as 0 but compares with -1) but just one
 	while(!stop_threads_){
 		size_t min = std::numeric_limits<size_t>::max();
 		// TODO(Jae) this relies on num_active_brokers == MAX_BROKER_NUM as disk manager
@@ -465,12 +465,6 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 			r[i] =tinode->offsets[b].replication_done[broker_id_] ;
 			if(min > r[i]){
 				min = r[i];
-			}
-		}
-		if(min<replicated && replicated != -1){
-			VLOG(3) <<"min:" << min << " replicated:" << replicated;
-			for(int i=0; i<replication_factor; i++){
-				VLOG(3) <<r[i];
 			}
 		}
 		size_t ack_count = min - replicated;
@@ -489,7 +483,9 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 						ssize_t bytesSent = send(ack_fd, buf + acked_size,
 																		 std::min(bufSize - acked_size, ack_count - acked_size), 0);
 						if(std::min(bufSize - acked_size, ack_count - acked_size) == 0){
-							LOG(ERROR) << "Ack sent 0!!!";
+							LOG(ERROR) << "Ack sent 0!!! acked_size:" << acked_size << " ack_count:" << ack_count 
+							<< " min:" << min << " replicated:" << replicated << " replication_factor:" << replication_factor;
+							return;
 						}
 						if (bytesSent < 0) {
 							if (errno == EAGAIN || errno == EWOULDBLOCK) {
