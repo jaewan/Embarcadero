@@ -9,6 +9,7 @@ service HeartBeat {
 	rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 	rpc GetClusterStatus (ClientInfo) returns (ClusterStatus);
 	rpc CreateNewTopic(CreateTopicRequest) returns (CreateTopicResponse);
+	rpc KillBrokers(KillBrokersRequest) returns (KillBrokersResponse);
 	rpc TerminateCluster(google.protobuf.Empty) returns (google.protobuf.Empty);
 }
 
@@ -46,6 +47,14 @@ message HeartbeatRequest {
 message HeartbeatResponse {
 	bool alive = 1;
 	bool shutdown = 2;
+}
+
+message KillBrokersRequest{
+	int64 num_brokers = 1;
+}
+
+message KillBrokersResponse{
+	bool success = 1;
 }
 
 message CreateTopicRequest {
