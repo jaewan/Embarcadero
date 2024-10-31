@@ -2,6 +2,131 @@
 
 #include "heartbeat.h"
 
+Status HeartBeatServiceImpl::GetClusterStatus(ServerContext* context, const ClientInfo* request,
+				ClusterStatus* reply) {
+	absl::flat_hash_set<int32_t> s(request->nodes_info().begin(), request->nodes_info().end());
+	{
+		absl::MutexLock lock(&mutex_);
+		for (const auto &it : nodes_){
+			if(s.contains(it.second.broker_id)){
+				s.erase(it.second.broker_id);
+			}else{
+				reply->add_new_nodes(it.second.network_mgr_addr);
+			}
+		}
+	}
+	for (const auto &it : s){
+		reply->add_removed_nodes(it);
+	}
+	return Status::OK;
+}
+
+Status HeartBeatServiceImpl::TerminateCluster(ServerContext* context, const google::protobuf::Empty* request,
+				google::protobuf::Empty* response) {
+	LOG(INFO) << "[HeartBeatServiceImpl] TerminateCluster called, shutting down server.";
+	shutdown_ = true;
+
+	if (heartbeat_thread_.joinable()) {
+		heartbeat_thread_.join();  // Stop the heartbeat thread before shutting down the server
+	}
+	// Wait until other nodes in the cluster to shutdown
+	while(nodes_.size() != 1){
+		std::this_thread::yield();
+	}
+	 // Schedule the server shutdown
+	std::thread([this]() {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		server_->Shutdown();
+	}).detach();
+	return Status::OK;
+}
+
+Status HeartBeatServiceImpl::KillBrokers(ServerContext* context, const KillBrokersRequest* request,
+		KillBrokersResponse* reply){
+	size_t num_brokers_to_kill = request->num_brokers();
+	{
+		absl::MutexLock lock(&mutex_);
+		if(num_brokers_to_kill >= nodes_.size()){
+			LOG(ERROR) << "KillBrokersRequest:" << num_brokers_to_kill << " is larger than the cluster size:" << nodes_.size();
+			reply->set_success(false);
+			return Status::OK;
+		}
+		for (auto node_itr = nodes_.begin(); node_itr != nodes_.end();){
+			// Does not kill head node
+			int pid = std::stoi(node_itr->first);
+			if(pid != 0){
+				if(kill(pid, SIGKILL) != 0){
+					if(errno == EAGAIN || errno == ESRCH){
+						// Process might be gone, veryfying
+						if(kill(pid, 0) == -1 && errno == ESRCH){
+							// It is dead
+							num_brokers_to_kill--;
+							nodes_.erase(node_itr);
+						}else{
+							LOG(INFO) << "Killing process:" << pid << " failed:" << strerror(errno);
+						}
+					}else{
+						LOG(INFO) << "Killing process:" << pid << " failed:" << strerror(errno);
+					}
+				}else{
+					num_brokers_to_kill--;
+					nodes_.erase(node_itr);
+				}
+				if(num_brokers_to_kill == 0){
+					break;
+				}
+			}
+			++node_itr;
+		}
+	}
+	if(num_brokers_to_kill > 0){
+		reply->set_success(false);
+	}else{
+		reply->set_success(true);
+	}
+	return Status::OK;
+}
+
+Status HeartBeatServiceImpl::CreateNewTopic(ServerContext* context, const CreateTopicRequest* request,
+				CreateTopicResponse* reply){
+	char topic[TOPIC_NAME_SIZE] = {0};
+	memcpy(topic, request->topic().data(), request->topic().size());
+	bool success = create_topic_entry_callback_(topic, (int)request->order(), (int)request->replication_factor(),
+									(bool)request->replicate_tinode(), request->sequencer_type());
+	reply->set_success(success);
+	return Status::OK;
+}
+
+int HeartBeatServiceImpl::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
+				struct Embarcadero::MessageHeader** msg_to_order, struct Embarcadero::TInode *tinode){
+	absl::flat_hash_set<int> copy_set(registered_brokers.begin(), registered_brokers.end());
+	int ret = 0;
+	{
+		absl::MutexLock lock(&mutex_);
+		for(const auto &node:nodes_){
+			int broker_id = node.second.broker_id;
+			if(registered_brokers.find(broker_id) == registered_brokers.end()){
+				/*
+					 while(tinode->offsets[broker_id].log_offset == 0){
+					 _mm_pause(); //yield can cause deadlock in grpc. Instead of yield, make it spin
+					 }
+					 msg_to_order[broker_id] = ((struct Embarcadero::MessageHeader*)((uint8_t*)msg_to_order[broker_id] + tinode->offsets[broker_id].log_offset));
+					 */
+				ret++;
+				registered_brokers.insert(broker_id);
+			}else{
+				copy_set.erase(broker_id);
+			}
+		}
+	}
+	for(auto broker_id : copy_set){
+		registered_brokers.erase(broker_id);
+		msg_to_order[broker_id] = nullptr;
+	}
+	return ret;
+}
+
+
 void HeartBeatServiceImpl::CheckHeartbeats(){
 	static const int timeout = HEARTBEAT_INTERVAL * 3;
 	while (!shutdown_) {
