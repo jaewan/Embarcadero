@@ -234,8 +234,7 @@ void NetworkManager::ReqReceiveThread(){
 					struct PublishRequest pub_req;
 					memcpy(pub_req.topic, shake.topic, TOPIC_NAME_SIZE);
 					pub_req.acknowledge = shake.ack;
-					pub_req.connection_id = shake.connection_id;
-					pub_req.num_brokers = shake.num_msg; //shake.num_msg used as num_brokers at pub
+					pub_req.num_brokers = shake.num_msg; //shake.num_msg used as num_brokers at pub used at order 3
 
 					BatchHeader batch_header;
 					while(!stop_threads_){

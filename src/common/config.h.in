@@ -20,7 +20,7 @@ namespace Embarcadero{
 #define BROKER_PORT 12140
 #define SCALOG_SEQ_PORT 50051
 #define NUM_MAX_BROKERS 4
-#define CXL_SIZE (1UL<<35)
+#define CXL_SIZE (1UL<<36)
 #define CXL_EMUL_SIZE (1UL<<35)
 #define MAX_TOPIC_SIZE 32
 #define TOPIC_NAME_SIZE 31
@@ -62,7 +62,6 @@ struct alignas(64) PublishRequest{
 	uint32_t batch_seq;
 	uint32_t client_id; 
 	uint16_t num_brokers; // For order 3, this impl does not allow dynamic brokers
-	uint16_t connection_id;
 	int num_messages;
 	size_t total_size;
 };
