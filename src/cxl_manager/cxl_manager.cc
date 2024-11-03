@@ -426,7 +426,6 @@ void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
 }
 
 void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
-
 	int unique_port = SCALOG_SEQ_PORT + scalog_sequencer_service_port_offset_.fetch_add(1);
 	std::string scalog_seq_address = head_ip_ + ":" + std::to_string(unique_port);
 	scalog_sequencer_service_ = std::make_unique<ScalogSequencerService>(this, broker_id_, cxl_addr_, scalog_seq_address);
@@ -475,12 +474,14 @@ ScalogSequencerService::ScalogSequencerService(CXLManager* cxl_manager, int brok
 }
 
 void ScalogSequencerService::LocalSequencer(std::string topic_str){
-	struct TInode *tinode = cxl_manager_->GetTInode(topic_str.c_str());
+	static char topic[TOPIC_NAME_SIZE];
+	memcpy(topic, topic_str.data(), topic_str.size());
+	struct TInode *tinode = cxl_manager_->GetTInode(topic);
 
 	auto start_time = std::chrono::high_resolution_clock::now();
 	/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
 	int local_cut = tinode->offsets[broker_id_].written;
-	SendLocalCut(local_cut, topic_str.c_str());
+	SendLocalCut(local_cut, topic);
 	auto end_time = std::chrono::high_resolution_clock::now();
 
 	/// We measure the time it takes to send the local cut
@@ -602,7 +603,8 @@ void CXLManager::ScalogSequencer(int epoch, const char* topic, absl::Mutex &glob
 
 grpc::Status ScalogSequencerService::HandleSendLocalCut(grpc::ServerContext* context,
 		const SendLocalCutRequest* request, SendLocalCutResponse* response) {
-	const char* topic = request->topic().c_str();
+	static char topic[TOPIC_NAME_SIZE];
+	memcpy(topic, request->topic().c_str(), request->topic().size());
 	int epoch = request->epoch();
 	int local_cut = request->local_cut();
 	int broker_id = request->broker_id();
