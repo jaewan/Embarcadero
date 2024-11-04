@@ -15,7 +15,7 @@ else()
 endif()
 
 find_package(Protobuf REQUIRED)
-#find_package(gRPC REQUIRED)
+# find_package(gRPC REQUIRED)
 
 # Proto file
 get_filename_component(corfu_validator_proto "protobuf/corfu_validator.proto" ABSOLUTE)

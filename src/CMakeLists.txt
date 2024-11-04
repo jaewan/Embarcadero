@@ -116,3 +116,21 @@ target_link_libraries(throughput_test
     ${_PROTOBUF_LIBPROTOF}
     ${FOLLY_LIBRARIES}
 )
+
+add_executable(scalog_global_sequencer
+    cxl_manager/scalog_global_sequencer.cc
+    cxl_manager/scalog_global_sequencer.h
+)
+
+target_include_directories(scalog_global_sequencer PUBLIC
+	"${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+)
+
+target_link_libraries(scalog_global_sequencer 
+    glog
+    absl::flat_hash_map
+    scalog_sequencer_grpc_proto
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOF}
+)
