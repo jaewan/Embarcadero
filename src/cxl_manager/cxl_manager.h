@@ -20,7 +20,7 @@ namespace Embarcadero{
 class TopicManager;
 class NetworkManager;
 class HeartBeatManager;
-class ScalogSequencerService;
+class ScalogLocalSequencer;
 
 enum CXL_Type {Emul, Real};
 using heartbeat_system::SequencerType;
@@ -125,10 +125,14 @@ class CXLManager{
 
 		/// Receives the global cut from the head node
 		/// This function is called in the callback of the send local cut grpc call
-		void ScalogSequencer(int epoch, const char* topic, absl::Mutex &global_cut_mu, 
-		absl::flat_hash_map<int, absl::btree_map<int, int>> &global_cut);
+		void ScalogSequencer(const char* topic, absl::flat_hash_map<int, absl::btree_map<int, int>> &global_cut);
+
+		void SetEpochToOrder(int epoch){
+			epoch_to_order_ = epoch;
+		}
 	private:
 		int broker_id_;
+		std::string head_ip_;
 		size_t cxl_size_;
 		std::vector<std::thread> sequencerThreads_;
 
@@ -144,10 +148,12 @@ class CXLManager{
 
 
 		// Scalog
-		std::string head_ip_;
-		std::unique_ptr<ScalogSequencerService> scalog_sequencer_service_;
-		std::unique_ptr<grpc::Server> scalog_server_;
-		std::atomic<int> scalog_sequencer_service_port_offset_{0};
+		std::string scalog_global_sequencer_ip_ = "192.168.60.172";
+		std::unique_ptr<ScalogLocalSequencer> scalog_local_sequencer_;
+		// std::atomic<int> scalog_local_sequencer_port_offset_{0};
+
+		/// Epoch to order
+		int epoch_to_order_ = 0;
 
 		void CXLIOThread(int tid);
 		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
@@ -157,53 +163,33 @@ class CXLManager{
 		void Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic);
 };
 
-class ScalogSequencerService : public ScalogSequencer::Service {
+class ScalogLocalSequencer {
 	public:
-		ScalogSequencerService(CXLManager* cxl_manager, int broker_id, void* cxl_addr, std::string scalog_seq_address);
-
-    	/// Receives a local cut from a local sequencer
-			/// @param request Request containing the local cut and the epoch
-			/// @param response Empty for now
-		virtual grpc::Status HandleSendLocalCut(grpc::ServerContext* context, const SendLocalCutRequest* request, SendLocalCutResponse* response);
+		ScalogLocalSequencer(CXLManager* cxl_manager, int broker_id, void* cxl_addr, std::string scalog_seq_address);
 
 		/// Called when first starting the scalog local sequencer. It manages
 		/// the timing between each local cut
-		virtual void LocalSequencer(std::string topic_str);
+		void LocalSequencer(std::string topic_str);
 
-		/// Sends a local cut to the head node	
-		virtual void SendLocalCut(int local_cut, const char* topic);
+		/// Sends a local cut to the global sequencer
+		void SendLocalCut(int local_cut, const char* topic);
 
-		/// Keep track of the global cut and if all the local cuts have been received
-		virtual void ReceiveLocalCut(int epoch, const char* topic, int broker_id);
-
+		/// Sends a register request to the global sequencer
+		void Register();
 	private:
 		CXLManager* cxl_manager_;
 		int broker_id_;
 		void* cxl_addr_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
 
-		/// Used in ReceiveLocalCut() so we receive local cuts one at a time
-		std::mutex mutex_;
-
-		/// Used in ReceiveLocalCut() to wait for all local cuts to be received
-		std::condition_variable cv_;
-		std::condition_variable reset_cv_;
-
 		/// Time between each local cut
 		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL);
 
-		/// The head node keeps track of the global epoch and increments it whenever we complete a round of local cuts
-		int global_epoch_;
-
 		/// The key is the current epoch and it contains another map of broker_id to local cut
-		absl::Mutex global_cut_mu_;
-		absl::flat_hash_map<int, absl::btree_map<int, int>> global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
+		absl::flat_hash_map<int, absl::btree_map<int, int>> global_cut_;
 
-		/// Used to keep track of # messages of each epoch so we can calculate the global cut
-		/// Key is the current epoch and it contains another map of broker_id to logical offset
-		absl::flat_hash_map<int, absl::btree_map<int, int>> logical_offsets_ ABSL_GUARDED_BY(global_cut_mu_);
-	
-		bool has_global_sequencer_;
+		/// Local epoch
+		int local_epoch_ = 0;
 };
 
 } // End of namespace Embarcadero
