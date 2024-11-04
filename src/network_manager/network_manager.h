@@ -24,11 +24,10 @@ struct NetworkRequest{
 };
 
 struct alignas(64) EmbarcaderoReq{
-	uint16_t client_id;
-	uint32_t connection_id;
+	uint32_t client_id;
+	uint32_t ack;
 	size_t num_msg; // at Sub: used as last offset  set to -2 as sentinel value, at Pub: used as num brokers
 	void* last_addr; // Sub: address of last fetched msg
-	uint16_t ack;
 	uint32_t port;
 	ClientRequestType client_req;
 	char topic[32]; //This is to align thie struct as 64B
