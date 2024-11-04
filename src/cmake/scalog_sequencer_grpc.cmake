@@ -15,7 +15,7 @@ else()
 endif()
 
 find_package(Protobuf REQUIRED)
-#find_package(gRPC REQUIRED)
+# find_package(gRPC REQUIRED)
 
 # Proto file
 get_filename_component(scalog_sequencer_proto "protobuf/scalog_sequencer.proto" ABSOLUTE)

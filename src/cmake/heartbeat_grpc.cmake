@@ -15,7 +15,7 @@ else()
 endif()
 
 find_package(Protobuf REQUIRED)
-find_package(gRPC REQUIRED)
+# find_package(gRPC REQUIRED)
 
 # Proto file
 get_filename_component(heartbeat_proto "protobuf/heartbeat.proto" ABSOLUTE)

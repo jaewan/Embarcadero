@@ -111,10 +111,11 @@ function Build_Project()
 # Mount Node:1 memory by tmpfs and create 30GB of file
 function Setup_CXL()
 {
-	echo "Setting up CXL Emulation on numa node 1"
-	sudo mkdir /mnt/CXL_DIR
-	sudo chown $USER /mnt/CXL_DIR
-	sudo numactl --membind=1 mount -t tmpfs tmpfs /mnt/CXL_DIR/ -o size=128G
+	echo "Setting up CXL Emulation"
+	mkdir -p ~/.CXL_EMUL
+	sudo mount -t tmpfs -o size=31g tmpfs ~/.CXL_EMUL
+	sudo mount -o remount,mpol=bind:0 ~/.CXL_EMUL
+	truncate -s 30G ~/.CXL_EMUL/cxl
 }
 
 ##################### Execute ############################
