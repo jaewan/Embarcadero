@@ -117,7 +117,7 @@ void ScalogGlobalSequencer::ReceiveLocalCut(int epoch, const char* topic, int br
 
 int main(int argc, char* argv[]){
     // Initialize scalog global sequencer
-    std::string scalog_seq_address = "128.110.219.17:50051";
+    std::string scalog_seq_address = "192.168.60.172:50051";
     ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
 
     return 0;

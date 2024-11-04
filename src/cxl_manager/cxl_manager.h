@@ -148,7 +148,7 @@ class CXLManager{
 
 
 		// Scalog
-		std::string scalog_global_sequencer_ip_ = "128.110.219.17";
+		std::string scalog_global_sequencer_ip_ = "192.168.60.172";
 		std::unique_ptr<ScalogLocalSequencer> scalog_local_sequencer_;
 		// std::atomic<int> scalog_local_sequencer_port_offset_{0};
 
