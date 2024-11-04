@@ -107,7 +107,6 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, size
 						 broker_id_(broker_id),
 						 cxl_addr_(cxl_addr),
 						 log_to_memory_(log_to_memory){
-	//TODO(Jae) this onlye works at single topic upto replication fator of all, change this later
 	num_io_threads_ = NUM_MAX_BROKERS;
 	if(!log_to_memory){
 		const char *homedir;
@@ -125,7 +124,7 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, size
 	}
 
 	for (size_t i=0; i< num_io_threads_; i++){
-		threads_.emplace_back(&DiskManager::DiskIOThread, this);
+		threads_.emplace_back(&DiskManager::ReplicateThread, this);
 		threads_.emplace_back(&DiskManager::CopyThread, this);
 	}
 
@@ -169,15 +168,13 @@ void DiskManager::Replicate(TInode* tinode, TInode* replica_tinode, int replicat
 	int threads_needed = replication_factor - available_threads;
 	if(threads_needed > 0){
 		for(int i=0; i < threads_needed; i++){
-			VLOG(3) << "Spawning more disk io threads";
-			threads_.emplace_back(&DiskManager::DiskIOThread, this);
+			threads_.emplace_back(&DiskManager::ReplicateThread, this);
 		}
 		num_io_threads_.fetch_add(threads_needed);
 		while(thread_count_.load() != num_io_threads_.load()){std::this_thread::yield();}
 	}
 	if(!log_to_memory_){
 		fs::path log_dir = prefix_path_/tinode->topic;
-		VLOG(3) << "Logging to:" << log_dir;
 		if (!fs::exists(log_dir)) {
 			if (!fs::create_directory(log_dir)) {
 				LOG(ERROR) << "Error: Unable to create directory " << log_dir << " : " << strerror(errno);
@@ -199,7 +196,6 @@ void DiskManager::Replicate(TInode* tinode, TInode* replica_tinode, int replicat
 		for(int i = 0; i< replication_factor; i++){
 			//TODO(Jae) get current num brokers
 			int b = (broker_id_ + i)%NUM_MAX_BROKERS;
-			VLOG(3) << broker_id_ << " Replicating to " << b;
 			ReplicationRequest req = {tinode, replica_tinode, -1, b};
 			requestQueue_.blockingWrite(req);
 		}
@@ -209,11 +205,11 @@ void DiskManager::Replicate(TInode* tinode, TInode* replica_tinode, int replicat
 // Replicate req.tinode->topic req.broker_id's log to local disk
 // Runs until stop_threads_ signaled
 // TODO(Jae) handle when the leader broker fails. This is why we have num_io_threads_ tracked
-void DiskManager::DiskIOThread(){
+void DiskManager::ReplicateThread(){
 	void *log;
 	size_t log_size = (1<<30);
 	if(log_to_memory_){
-		log = malloc(log_size);
+		log = mi_malloc(log_size);
 	}
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct ReplicationRequest> optReq;
@@ -221,7 +217,7 @@ void DiskManager::DiskIOThread(){
 	requestQueue_.blockingRead(optReq);
 	if(!optReq.has_value()){
 		if(log_to_memory_)
-			free(log);
+			mi_free(log);
 		thread_count_.fetch_sub(1);
 		num_active_threads_.fetch_sub(1);
 		num_io_threads_.fetch_sub(1);
@@ -286,7 +282,7 @@ void DiskManager::DiskIOThread(){
 		}
 	}
 	if(log_to_memory_)
-		free(log);
+		mi_free(log);
 	thread_count_.fetch_sub(1);
 	num_active_threads_.fetch_sub(1);
 	num_io_threads_.fetch_sub(1);

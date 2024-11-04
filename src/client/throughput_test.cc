@@ -426,8 +426,8 @@ class Publisher{
 		std::thread cluster_probe_thread_;
 		// <broker_id, address::port of network_mgr>
 		absl::flat_hash_map<int, std::string> nodes_;
-		std::vector<int> brokers_;
 		absl::Mutex mutex_;
+		std::vector<int> brokers_;
 		char topic_[TOPIC_NAME_SIZE];
 		int ack_level_;
 		int ack_port_;
@@ -614,64 +614,76 @@ class Publisher{
 		}
 
 		void PublishThread(int broker_id, int pubQuesIdx){
-			auto [addr, addressPort] = ParseAddressPort(nodes_[broker_id]);
-			int sock = GetNonblockingSock(addr.data(), PORT + broker_id);
-			// *********** Initiate Shake ***********
-			int efd = epoll_create1(0);
-			if(efd < 0){
-				LOG(ERROR) << "Publish Thread epoll_create1 failed:" << strerror(errno);
-				close(sock);
-				return;
-			}
-			struct epoll_event event;
-			event.data.fd = sock;
-			event.events = EPOLLOUT;
-			if(epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event)){
-				LOG(ERROR) << "epoll_ctl failed:" << strerror(errno);
+			int sock = -1;
+			int efd = -1;
+			auto connect_to_server = [&](size_t brokerId) -> bool {
 				close(sock);
 				close(efd);
-			}
 
-			Embarcadero::EmbarcaderoReq shake;
-			shake.client_id = client_id_;
-			memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
-			shake.ack = ack_level_;
-			shake.port = ack_port_;
-			shake.connection_id = pubQuesIdx;
-			size_t num_brokers = nodes_.size();
-			shake.num_msg = num_brokers; // shake.num_msg used as num brokers at pub
+				auto [addr, addressPort] = ParseAddressPort(nodes_[brokerId]);
+				sock = GetNonblockingSock(addr.data(), PORT + brokerId);
+				efd = epoll_create1(0);
+				if (efd < 0) {
+					LOG(ERROR) << "epoll_create1 failed: " << strerror(errno);
+					close(sock);
+					return false;
+				}
 
-			struct epoll_event events[10]; // Adjust size as needed
-			bool running = true;
-			size_t sent_bytes = 0;
+				struct epoll_event event;
+				event.data.fd = sock;
+				event.events = EPOLLOUT;
+				if (epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event) != 0) {
+					LOG(ERROR) << "epoll_ctl failed: " << strerror(errno);
+					close(sock);
+					close(efd);
+					return false;
+				}
 
-			while (!shutdown_ && running) {
-				int n = epoll_wait(efd, events, 10, -1);
-				for (int i = 0; i < n; i++) {
-					if (events[i].events & EPOLLOUT) {
-						ssize_t bytesSent = send(sock, (int8_t*)(&shake) + sent_bytes, sizeof(shake) - sent_bytes, 0);
-						if (bytesSent <= 0) {
-							bytesSent = 0;
-							if (errno != EAGAIN && errno != EWOULDBLOCK) {
-								LOG(ERROR) << "send failed:" << strerror(errno);
-								running = false;
-								close(sock);
-								close(efd);
-								return;
+				// *********** Initiate Shake ***********
+
+				Embarcadero::EmbarcaderoReq shake;
+				shake.client_req = Embarcadero::Publish;
+				shake.client_id = client_id_;
+				memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
+				shake.ack = ack_level_;
+				shake.port = ack_port_;
+				size_t num_brokers = nodes_.size();
+				shake.num_msg = num_brokers; // shake.num_msg used as num brokers at pub
+
+				struct epoll_event events[10]; // Adjust size as needed
+				bool running = true;
+				size_t sent_bytes = 0;
+
+				while (!shutdown_ && running) {
+					int n = epoll_wait(efd, events, 10, -1);
+					for (int i = 0; i < n; i++) {
+						if (events[i].events & EPOLLOUT) {
+							ssize_t bytesSent = send(sock, (int8_t*)(&shake) + sent_bytes, sizeof(shake) - sent_bytes, 0);
+							if (bytesSent <= 0) {
+								bytesSent = 0;
+								if (errno != EAGAIN && errno != EWOULDBLOCK) {
+									LOG(ERROR) << "send failed:" << strerror(errno);
+									running = false;
+									close(sock);
+									close(efd);
+									return false;
+								}
 							}
-						}
-						sent_bytes += bytesSent;
-						if(sent_bytes == sizeof(shake)){
-							running = false;
-							break;
+							sent_bytes += bytesSent;
+							if(sent_bytes == sizeof(shake)){
+								running = false;
+								break;
+							}
 						}
 					}
 				}
-			}
+				return true;
+			}; // End of connect_to_server lambda
+			
+			if(!connect_to_server(broker_id))
+				return;
 
 			// *********** Sending Messages ***********
-			std::vector<double> send_times;
-			std::vector<double> poll_times;
 			thread_count_.fetch_add(1);
 			size_t batch_seq = pubQuesIdx;
 			while(!shutdown_){
@@ -685,16 +697,23 @@ class Publisher{
 				//TODO(Jae) This assumes static message sizes. Must make it count the messages to allow dynamic msg sizes
 				batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize;
 				batch_header.batch_seq = batch_seq;
-				batch_seq += num_threads_;
+				ssize_t bytesSent = 0;
+				auto send_batch_header = [&]() -> void{
+					bytesSent = send(sock, (uint8_t*)(&batch_header), sizeof(Embarcadero::BatchHeader), 0);
+					while(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
+						if(bytesSent < 0 ){
+							LOG(ERROR) << "Batch send failed!!";
+							return;
+						}
+						bytesSent += send(sock, (uint8_t*)(&batch_header) + bytesSent, sizeof(Embarcadero::BatchHeader) - bytesSent, 0);
+					}
+				};
+				send_batch_header();
 
-				ssize_t bytesSent = send(sock, (uint8_t*)(&batch_header), sizeof(Embarcadero::BatchHeader), 0);
-				if(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
-					LOG(ERROR) << "Jae compelete this too when batch header is partitioned.";
-					return;
-				}
-
-				sent_bytes = 0;
+				size_t sent_bytes = 0;
 				size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
+
+
 				while(sent_bytes < len){
 					size_t remaining_bytes = len - sent_bytes;
 					size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
@@ -719,15 +738,33 @@ class Publisher{
 								break;
 							}
 						}
-						zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL<<16); // Cap backoff at 1000ms
+						zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL<<6); // Cap backoff at 1000ms
 					} else if (bytesSent < 0) {
-						LOG(ERROR) << "send failed: " << strerror(errno);
-						close(sock);
-						close(efd);
-						return;
-					}
+						int brokerId;
+						{
+							// Remove the crashed broker.
+							absl::MutexLock lock(&mutex_);
+							auto it = std::find(brokers_.begin(), brokers_.end(), broker_id);
+							if(it != brokers_.end()){
+								brokers_.erase(it);
+								nodes_.erase(broker_id);
+							}
+							int num_orphan_threads = num_threads_/(brokers_.size() + 1);
+							brokerId = brokers_[(pubQuesIdx/num_orphan_threads)%brokers_.size()];
+						}
+						if(!connect_to_server(brokerId)){
+							LOG(ERROR) << "Send failed: " << strerror(errno);
+							return;
+						}
+						send_batch_header();
+						sent_bytes = 0;
 
+						broker_id = brokerId;
+					}
 				}
+				// Update here for fault tolerance.
+				// At broker failure, we should send the same batch to another broker
+				batch_seq += num_threads_;
 			}
 			close(sock);
 			close(efd);
@@ -1109,6 +1146,53 @@ bool CheckAvailableCores(){
 	return num_cores == CGROUP_CORE;
 }
 
+// Faile num_brokers_to_fail when failure_percentage of messages were sent
+double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads,
+		int ack_level, int order, double failure_percentage, std::function<bool()> killbrokers){
+	size_t n = total_message_size/message_size;
+	size_t n_before_fail = (size_t)(n*failure_percentage);
+	size_t n_after_fail = n - n_before_fail;
+
+	LOG(INFO) << "[Failure Publish Throughput Test] total_message:" << total_message_size << 
+		" message_size:" << message_size << " failure percentage:" << failure_percentage;
+	char* message = (char*)malloc(sizeof(char)*message_size);
+
+	size_t q_size = total_message_size + (total_message_size/message_size)*64;
+	q_size = std::max(q_size, static_cast<size_t>(1024));
+
+	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
+	p.Init(topic, ack_level);
+	auto start = std::chrono::high_resolution_clock::now();
+
+	for(size_t i=0; i<n_before_fail; i++){
+		p.Publish(message, message_size);
+	}
+
+	killbrokers();
+
+	for(size_t i=0; i<n_after_fail; i++){
+		p.Publish(message, message_size);
+	}
+
+	auto produce_end = std::chrono::high_resolution_clock::now();
+	p.DEBUG_check_send_finish();
+	auto send_end = std::chrono::high_resolution_clock::now();
+	p.Poll(n);
+
+	auto end = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> elapsed = end - start;
+	double seconds = elapsed.count();
+	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
+	/*
+		 std::cout << "Produce time: " << ((std::chrono::duration<double>)(produce_end-start)).count() << std::endl;
+		 std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
+		 std::cout << "Total time: " << seconds << std::endl;
+		 */
+	LOG(INFO) << "Bandwidth: " << bandwidthMbps << " MBps";
+	free(message);
+	return bandwidthMbps;
+}
+
 double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads,
 		int ack_level, int order, std::atomic<int> &synchronizer){
 	size_t n = total_message_size/message_size;
@@ -1142,16 +1226,16 @@ double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_s
 	double seconds = elapsed.count();
 	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
 	/*
-	 std::cout << "Produce time: " << ((std::chrono::duration<double>)(produce_end-start)).count() << std::endl;
-	 std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
-	 std::cout << "Total time: " << seconds << std::endl;
-	 */
-	std::cout << "Bandwidth: " << bandwidthMbps << " MBps" << std::endl;
+		 std::cout << "Produce time: " << ((std::chrono::duration<double>)(produce_end-start)).count() << std::endl;
+		 std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
+		 std::cout << "Total time: " << seconds << std::endl;
+		 */
+	LOG(INFO) << "Bandwidth: " << bandwidthMbps << " MBps";
 	free(message);
 	return bandwidthMbps;
 }
 
-void SubscribeThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_msg_size, size_t msg_size, int order){
+double SubscribeThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_msg_size, size_t msg_size, int order){
 	LOG(INFO) << "[Subscribe Throuput Test] ";
 	auto start = std::chrono::high_resolution_clock::now();
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
@@ -1159,11 +1243,13 @@ void SubscribeThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_msg_size,
 	auto end = std::chrono::high_resolution_clock::now();
 	std::chrono::duration<double> elapsed = end - start;
 	double seconds = elapsed.count();
-	LOG(INFO) << (total_msg_size/(1024*1024))/seconds << "MB/s";
+	double bandwidthMbps = (total_msg_size/(1024*1024))/seconds;
+	LOG(INFO) << bandwidthMbps << "MB/s";
 	s.DEBUG_check_order(order);
+	return bandwidthMbps;
 }
 
-void E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, int ack_level,
+std::pair<double, double> E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, int ack_level,
 		int order){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << 
@@ -1187,16 +1273,18 @@ void E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, s
 
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
-	double pub_duration = (std::chrono::duration<double>(pub_end - start)).count();
-	LOG(INFO) << "Pub Bandwidth: " << ((message_size*n)/pub_duration)/(1024*1024) << " MB/s";
-	auto duration = (std::chrono::duration<double>(end - start)).count();
-	LOG(INFO) << "E2E Bandwidth: " << ((message_size*n)/duration)/(1024*1024) << " MB/s";
+	double pubBandwidthMbps = ((message_size*n)/(std::chrono::duration<double>(pub_end - start)).count())/(1024*1024);
+	LOG(INFO) << "Pub Bandwidth: " << pubBandwidthMbps;
+	auto e2eBandwidthMbps = ((message_size*n)/(std::chrono::duration<double>(end - start)).count())/(1024*1024);
+	LOG(INFO) << "E2E Bandwidth: " << e2eBandwidthMbps << " MB/s";
 	s.DEBUG_check_order(order);
 
 	free(message);
+
+	return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);
 }
 
-void LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, 
+std::pair<double, double> LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, 
 		int ack_level, int order){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
@@ -1221,12 +1309,14 @@ void LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t 
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
 
-	auto pub_duration = std::chrono::duration<double>(pub_end - start);
-	auto duration = std::chrono::duration<double>(end - start);
-	LOG(INFO) << "Pub Bandwidth: " << (total_message_size/(1024*1024))/pub_duration.count() << " MB/s";
-	LOG(INFO) << "E2E Bandwidth: " << (total_message_size/(1024*1024))/duration.count() << " MB/s";
+	auto pubBandwidthMbps = (total_message_size/(1024*1024))/std::chrono::duration<double>(pub_end - start).count();
+	auto e2eBandwidthMbps = (total_message_size/(1024*1024))/std::chrono::duration<double>(end - start).count();
+	LOG(INFO) << "Pub Bandwidth: " << pubBandwidthMbps << " MB/s";
+	LOG(INFO) << "E2E Bandwidth: " << e2eBandwidthMbps << " MB/s";
 	s.DEBUG_check_order(order);
 	s.StoreLatency();
+
+	return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);
 }
 
 bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE], 
@@ -1246,6 +1336,19 @@ bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAM
 	return false;
 }
 
+bool KillBrokers(std::unique_ptr<HeartBeat::Stub>& stub, int num_brokers){
+	grpc::ClientContext context;
+	heartbeat_system::KillBrokersRequest req;;
+	heartbeat_system::KillBrokersResponse reply;;
+	req.set_num_brokers(num_brokers);
+
+	grpc::Status status = stub->KillBrokers(&context, req, &reply);
+	if(status.ok()){
+		return reply.success();
+	}
+	return false;
+}
+
 
 heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
 	if (value == "EMBARCADERO") return heartbeat_system::SequencerType::EMBARCADERO;
@@ -1254,6 +1357,101 @@ heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
 	if (value == "CORFU") return heartbeat_system::SequencerType::CORFU;
 	throw std::runtime_error("Invalid SequencerType: " + value);
 }
+
+class ResultWriter{
+	public:
+		ResultWriter(const cxxopts::ParseResult& result):result_path("../../data/"){
+			message_size = result["size"].as<size_t>();
+			total_message_size = result["total_message_size"].as<size_t>();
+			num_threads = result["num_threads"].as<size_t>();
+			ack_level = result["ack_level"].as<int>();
+			order = result["order_level"].as<int>();
+			replication_factor =result["replication_factor"].as<int>();
+			replicate_tinode = result.count("replicate_tinode");
+			record_result_ = result.count("record_results");
+			num_clients = result["parallel_client"].as<int>();
+			num_brokers_to_kill = result["num_brokers_to_kill"].as<int>();
+			failure_percentage = result["failure_percentage"].as<double>();
+			int test_num = result["test_number"].as<int>();
+
+			switch(test_num){
+				case 0:
+					result_path += "throughput/pubsub/result.csv";
+					break;
+				case 1:
+					result_path += "throughput/e2e/result.csv";
+					break;
+				case 2:
+					result_path += "latency/e2e/result.csv";
+					break;
+				case 3:
+					result_path += "throughput/multiclient/result.csv";
+					break;
+				case 4:
+					result_path += "throughput/failure/result.csv";
+					break;
+				case 5:
+					result_path += "throughput/pub/result.csv";
+					break;
+				case 6:
+					result_path += "throughput/sub/result.csv";
+					break;
+			}
+		}
+		~ResultWriter(){
+			if(record_result_){
+				std::ofstream file;
+				file.open(result_path, std::ios::app);
+				if(!file.is_open()){
+					LOG(ERROR) << "Error: Could not open file:" << result_path << " : " << strerror(errno);
+					return;
+				}
+				file << message_size << ",";
+				file << total_message_size << ",";
+				file << num_threads << ",";
+				file << ack_level << ",";
+				file << order << ",";
+				file << replication_factor << ",";
+				file << replicate_tinode << ",";
+				file << num_clients << ",";
+				file << num_brokers_to_kill << ",";
+				file << failure_percentage << ",";
+				file << pubBandwidthMbps << ",";
+				file << subBandwidthMbps << ",";
+				file << e2eBandwidthMbps << "\n";
+
+				file.close();
+			}
+		}
+
+		void SetPubResult(double res){
+			pubBandwidthMbps = res;
+		}
+		void SetSubResult(double res){
+			subBandwidthMbps = res;
+		}
+		void SetE2EResult(double res){
+			e2eBandwidthMbps = res;
+		}
+
+	private:
+		size_t message_size;
+		size_t total_message_size;
+		size_t num_threads;
+		int ack_level;
+		int order;
+		int replication_factor;
+		bool replicate_tinode;
+		bool record_result_;
+		int num_clients;
+		int num_brokers_to_kill;
+		double failure_percentage;
+
+		std::string result_path;
+		double pubBandwidthMbps = 0;
+		double subBandwidthMbps = 0;
+		double e2eBandwidthMbps = 0;
+};
 
 int main(int argc, char* argv[]) {
 	google::InitGoogleLogging(argv[0]);
@@ -1272,8 +1470,11 @@ int main(int argc, char* argv[]) {
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("r,replication_factor", "Replication factor", cxxopts::value<int>()->default_value("0"))
 		("replicate_tinode", "Replicate Tinode for Disaggregated memory fault tolerance")
+		("record_results", "Record Results in a csv file")
 		("t,test_number", "Test to run. 0:pub/sub 1:E2E 2:Latency 3:Parallel", cxxopts::value<int>()->default_value("0"))
 		("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
+		("num_brokers_to_kill", "Number of brokers to kill during execution", cxxopts::value<int>()->default_value("1"))
+		("failure_percentage", "When to fail brokers, after what percentages of messages sent", cxxopts::value<double>()->default_value("0.2"))
 		("n,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
 
 	auto result = options.parse(argc, argv);
@@ -1285,6 +1486,8 @@ int main(int argc, char* argv[]) {
 	int replication_factor =result["replication_factor"].as<int>();
 	bool replicate_tinode = result.count("replicate_tinode");
 	int num_clients = result["parallel_client"].as<int>();
+	int num_brokers_to_kill = result["num_brokers_to_kill"].as<int>();
+	double failure_percentage = result["failure_percentage"].as<double>();
 	std::atomic<int> synchronizer{num_clients};
 	int test_num = result["test_number"].as<int>();
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
@@ -1319,7 +1522,7 @@ int main(int argc, char* argv[]) {
 		if(padding){
 			padding = (num_threads*BATCH_SIZE) - padding;
 			LOG(INFO) << "Adjusting total message size from " << total_message_size << " to " << total_message_size+padding << 
-									" :" <<(total_message_size+padding)%(num_threads*BATCH_SIZE); 
+				" :" <<(total_message_size+padding)%(num_threads*BATCH_SIZE); 
 			total_message_size += padding;
 		}
 	}
@@ -1329,72 +1532,106 @@ int main(int argc, char* argv[]) {
 	memset(topic, 0, TOPIC_NAME_SIZE);
 	memcpy(topic, "TestTopic", 9);
 
+	ResultWriter writer(result);
+
 	switch(test_num){
 		case 0:
-			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-			LOG(INFO) << "Running Publish and Subscribe: "<< total_message_size;
-			PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
-			sleep(3);
-			SubscribeThroughputTest(topic, total_message_size, message_size, order);
+			{
+				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+				LOG(INFO) << "Running Publish and Subscribe: "<< total_message_size;
+				double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+				sleep(3);
+				double sub_bandwidthMb = SubscribeThroughputTest(topic, total_message_size, message_size, order);
+				writer.SetPubResult(pub_bandwidthMb);
+				writer.SetSubResult(sub_bandwidthMb);
+			}
 			break;
 		case 1:
-			LOG(INFO) << "Running E2E Throughput";
-			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-			E2EThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+			{
+				LOG(INFO) << "Running E2E Throughput";
+				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+				std::pair<double, double> bandwidths = E2EThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+				writer.SetPubResult(bandwidths.first);
+				writer.SetSubResult(bandwidths.second);
+			}
 			break;
 		case 2:
-			LOG(INFO) << "Running E2E Latency Test";
-			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-			LatencyTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+			{
+				LOG(INFO) << "Running E2E Latency Test";
+				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+				std::pair<double, double> bandwidths = LatencyTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+				writer.SetPubResult(bandwidths.first);
+				writer.SetSubResult(bandwidths.second);
+			}
 			break;
 		case 3:
 			LOG(INFO) << "Running Parallel Publish Test num_clients:" << num_clients << ":" << num_threads;
 			{
-			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-			std::vector<std::thread> threads;
-			std::vector<std::promise<double>> promises(num_clients); // Vector of promises
-			std::vector<std::future<double>> futures;                // Vector of futures
+				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+				std::vector<std::thread> threads;
+				std::vector<std::promise<double>> promises(num_clients); // Vector of promises
+				std::vector<std::future<double>> futures;                // Vector of futures
 
-			// Prepare the futures
-			for (int i = 0; i < num_clients; ++i) {
-				futures.push_back(promises[i].get_future());  // Get future from each promise
-			}
-
-			// Launch the threads
-			for (int i = 0; i < num_clients; i++) {
-				threads.emplace_back([&, i]() {
-					double result = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
-					promises[i].set_value(result); // Set the result in the promise
-				});
-			}
-
-			double aggregate_bandwidth = 0;
-
-			// Wait for the threads to finish and collect the results
-			for (int i = 0; i < num_clients; ++i) {
-				if (threads[i].joinable()) {
-					threads[i].join();  // Wait for the thread to finish
-					aggregate_bandwidth += futures[i].get();  // Get the result from the future
+				// Prepare the futures
+				for (int i = 0; i < num_clients; ++i) {
+					futures.push_back(promises[i].get_future());  // Get future from each promise
 				}
-			}
 
-			std::cout << "Aggregate Bandwidth:" << aggregate_bandwidth;
+				// Launch the threads
+				for (int i = 0; i < num_clients; i++) {
+					threads.emplace_back([&, i]() {
+							double result = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+							promises[i].set_value(result); // Set the result in the promise
+							});
+				}
+
+				double aggregate_bandwidth = 0;
+
+				// Wait for the threads to finish and collect the results
+				for (int i = 0; i < num_clients; ++i) {
+					if (threads[i].joinable()) {
+						threads[i].join();  // Wait for the thread to finish
+						aggregate_bandwidth += futures[i].get();  // Get the result from the future
+					}
+				}
+				writer.SetPubResult(aggregate_bandwidth);
+
+				std::cout << "Aggregate Bandwidth:" << aggregate_bandwidth;
 			}
 			break;
 		case 4:
-			LOG(INFO) << "Running Publish : "<< total_message_size;
-			CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-			PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+			LOG(INFO) << "Running Broker failure at publish ";
+			{
+				auto killbrokers = [&stub, num_brokers_to_kill](){
+					return KillBrokers(stub, num_brokers_to_kill);
+				};
+				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+				double pub_bandwidthMb = FailurePublishThroughputTest(topic, total_message_size, message_size,
+						num_threads, ack_level, order, failure_percentage, killbrokers);
+				writer.SetPubResult(pub_bandwidthMb);
+			}
 			break;
 		case 5:
+			LOG(INFO) << "Running Publish : "<< total_message_size;
+			{
+				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+				double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+				writer.SetPubResult(pub_bandwidthMb);
+			}
+			break;
+		case 6:
 			LOG(INFO) << "Running Subscribe ";
-			SubscribeThroughputTest(topic, total_message_size, message_size, order);
+			{
+				double sub_bandwidthMb = SubscribeThroughputTest(topic, total_message_size, message_size, order);
+				writer.SetSubResult(sub_bandwidthMb);
+			}
 			break;
 		default:
 			LOG(ERROR) << "Invalid test number option:" << result["test_number"].as<int>();
 			break;
 	}
 
+	writer.~ResultWriter();
 	//*****************  Shuting down Embarlet ************************
 	google::protobuf::Empty request, response;
 	grpc::ClientContext context;

@@ -426,11 +426,11 @@ void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
 }
 
 void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
-
 	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
 	int unique_port = SCALOG_SEQ_PORT;
 	std::string scalog_seq_address = scalog_global_sequencer_ip_ + ":" + std::to_string(unique_port);
 	scalog_local_sequencer_ = std::make_unique<ScalogLocalSequencer>(this, broker_id_, cxl_addr_, scalog_seq_address);
+
 
 	while (!stop_threads_) {
 		scalog_local_sequencer_->LocalSequencer(topic_str);

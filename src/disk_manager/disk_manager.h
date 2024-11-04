@@ -37,7 +37,7 @@ class DiskManager{
 		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
 
 	private:
-		void DiskIOThread();
+		void ReplicateThread();
 		void CopyThread();
 		bool GetMessageAddr(TInode* tinode, int order, int broker_id, size_t &last_offset,
 			void* &last_addr, void* &messages, size_t &messages_size);
