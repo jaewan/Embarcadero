@@ -120,6 +120,12 @@ CXLManager::~CXLManager(){
 		}
 	}
 
+    // If this is the head node, terminate the global sequencer
+    if (broker_id_ == 0 && scalog_local_sequencer_) {
+		LOG(INFO) << "Terminating global sequencer";
+        scalog_local_sequencer_->TerminateGlobalSequencer();
+    }	
+
 	if (munmap(cxl_addr_, CXL_SIZE) < 0)
 		LOG(ERROR) << "Unmapping CXL error";
 
@@ -434,11 +440,6 @@ void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
 
 	while (!stop_threads_) {
 		scalog_local_sequencer_->LocalSequencer(topic_str);
-	}
-
-	/// Send request to terminate global seq if head node
-	if (broker_id_ == 0) {
-		scalog_local_sequencer_->TerminateGlobalSequencer();
 	}
 }
 
