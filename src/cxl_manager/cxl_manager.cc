@@ -550,8 +550,11 @@ void CXLManager::ScalogSequencer(const char* topic,
 				for(int i = 0; i<cut.second; i++){
 					msg_to_order->total_order = seq;
 					std::atomic_thread_fence(std::memory_order_release);
+					/*
 					tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset;
 					tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
+					*/
+					UpdateTinodeOrder(topic, tinode, broker_id_, msg_logical_off, (uint8_t*)msg_to_order[broker_id_] - (uint8_t*)cxl_addr_);
 					msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
 					seq++;
 				}
