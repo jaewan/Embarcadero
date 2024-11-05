@@ -12,6 +12,13 @@ ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
     scalog_server_->Wait();
 }
 
+grpc::Status ScalogGlobalSequencer::HandleTerminateGlobalSequencer(grpc::ServerContext* context,
+		const TerminateGlobalSequencerRequest* request, TerminateGlobalSequencerResponse* response) {
+	LOG(INFO) << "Terminating Scalog global sequencer";
+	scalog_server_->Shutdown();
+	return grpc::Status::OK;
+}
+
 grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* context,
         const RegisterBrokerRequest* request, RegisterBrokerResponse* response) {
 

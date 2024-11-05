@@ -176,6 +176,9 @@ class ScalogLocalSequencer {
 
 		/// Sends a register request to the global sequencer
 		void Register();
+
+		/// Sends a request to global sequencer to terminate itself
+		void TerminateGlobalSequencer();
 	private:
 		CXLManager* cxl_manager_;
 		int broker_id_;
