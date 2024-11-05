@@ -501,38 +501,19 @@ void ScalogLocalSequencer::SendLocalCut(int local_cut, const char* topic) {
 	SendLocalCutResponse response;
 	grpc::ClientContext context;
 
-	std::mutex mu;
-	std::condition_variable cv;
-	bool done = false;
+	// Synchronous call to HandleSendLocalCut
+	grpc::Status status = stub_->HandleSendLocalCut(&context, request, &response);
 
-	/// Callback is called when all followers are ready to receive the global cut
-	auto callback = [this, topic, &response, &mu, &cv, &done](grpc::Status status) {
-		if (!status.ok()) {
-			LOG(ERROR) << "Error sending local cut: " << status.error_message();
-		} else {
-			// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
-			for (const auto& entry : response.global_cut()) {
-				global_cut_[local_epoch_][static_cast<int>(entry.first)] = static_cast<int>(entry.second);
-			}
-			this->cxl_manager_->ScalogSequencer(topic, global_cut_);
+	if (!status.ok()) {
+		LOG(ERROR) << "Error sending local cut: " << status.error_message();
+	} else {
+		// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
+		for (const auto& entry : response.global_cut()) {
+			global_cut_[local_epoch_][static_cast<int>(entry.first)] = static_cast<int>(entry.second);
 		}
+		this->cxl_manager_->ScalogSequencer(topic, global_cut_);
+	}
 
-		std::lock_guard<std::mutex> lock(mu);
-		done = true;
-
-		/// Notify the main thread that the callback has been called
-		cv.notify_one();
-	};
-
-	// Async call to HandleStartLocalSequencer
-	stub_->async()->HandleSendLocalCut(&context, &request, &response, callback);
-	//TODO (tony) priority 1 (latency improvement) potential change
-	// stub_->HandleSendLocalCut(&context, &request, &response, callback);
-	//(tony) check response
-
-	/// Wait until the callback has been called so it doesn't go out of scope
-	std::unique_lock<std::mutex> lock(mu);
-	cv.wait(lock, [&done] { return done; });
 	local_epoch_++;
 }
 
