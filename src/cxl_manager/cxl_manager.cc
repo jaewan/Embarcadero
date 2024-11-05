@@ -121,10 +121,10 @@ CXLManager::~CXLManager(){
 	}
 
     // If this is the head node, terminate the global sequencer
-    if (broker_id_ == 0 && scalog_local_sequencer_) {
-		LOG(INFO) << "Terminating global sequencer";
-        scalog_local_sequencer_->TerminateGlobalSequencer();
-    }	
+    // if (broker_id_ == 0 && scalog_local_sequencer_) {
+	// 	LOG(INFO) << "Terminating global sequencer";
+    //     scalog_local_sequencer_->TerminateGlobalSequencer();
+    // }	
 
 	if (munmap(cxl_addr_, CXL_SIZE) < 0)
 		LOG(ERROR) << "Unmapping CXL error";
@@ -518,11 +518,19 @@ void ScalogLocalSequencer::SendLocalCut(int local_cut, const char* topic) {
 	SendLocalCutResponse response;
 	grpc::ClientContext context;
 
+	// Set a timeout of 5 seconds for the gRPC call
+	auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
+	context.set_deadline(deadline);
+
 	// Synchronous call to HandleSendLocalCut
 	grpc::Status status = stub_->HandleSendLocalCut(&context, request, &response);
 
 	if (!status.ok()) {
-		LOG(ERROR) << "Error sending local cut: " << status.error_message();
+		if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+			LOG(ERROR) << "Timeout error sending local cut: " << status.error_message();
+		} else {
+			LOG(ERROR) << "Error sending local cut: " << status.error_message();
+		}
 	} else {
 		// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
 		for (const auto& entry : response.global_cut()) {
