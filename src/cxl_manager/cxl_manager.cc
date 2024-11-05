@@ -435,6 +435,11 @@ void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
 	while (!stop_threads_) {
 		scalog_local_sequencer_->LocalSequencer(topic_str);
 	}
+
+	/// Send request to terminate global seq if head node
+	if (broker_id_ == 0) {
+		scalog_local_sequencer_->TerminateGlobalSequencer();
+	}
 }
 
 //TODO (tony) priority 2 (failure test)  make the scalog code failure prone.
@@ -452,6 +457,17 @@ ScalogLocalSequencer::ScalogLocalSequencer(CXLManager* cxl_manager, int broker_i
 	// Send register request to the global sequencer
 	Register();
 	cxl_manager_->SetEpochToOrder(local_epoch_);
+}
+
+void ScalogLocalSequencer::TerminateGlobalSequencer() {
+	TerminateGlobalSequencerRequest request;
+	TerminateGlobalSequencerResponse response;
+	grpc::ClientContext context;
+
+	grpc::Status status = stub_->HandleTerminateGlobalSequencer(&context, request, &response);
+	if (!status.ok()) {
+		LOG(ERROR) << "Error terminating global sequencer: " << status.error_message();
+	}
 }
 
 void ScalogLocalSequencer::Register() {

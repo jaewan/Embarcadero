@@ -6,6 +6,9 @@ service ScalogSequencer {
 
     /// Receives a register request from a local sequencer
     rpc HandleRegisterBroker(RegisterBrokerRequest) returns (RegisterBrokerResponse);
+
+    /// Receives a terminate request from a local sequencer
+    rpc HandleTerminateGlobalSequencer(TerminateGlobalSequencerRequest) returns (TerminateGlobalSequencerResponse);
 }
 
 // Request containing the local cut and the epoch
@@ -29,3 +32,9 @@ message RegisterBrokerRequest {
 message RegisterBrokerResponse {
     int64 global_epoch = 1;
 }
+
+// Empty request for now
+message TerminateGlobalSequencerRequest {}
+
+// Empty response for now
+message TerminateGlobalSequencerResponse {}
