@@ -11,6 +11,9 @@ service HeartBeat {
 	rpc CreateNewTopic(CreateTopicRequest) returns (CreateTopicResponse);
 	rpc KillBrokers(KillBrokersRequest) returns (KillBrokersResponse);
 	rpc TerminateCluster(google.protobuf.Empty) returns (google.protobuf.Empty);
+	// Client sends a request to get the initial cluster info and subscribes to updates.
+	// This is for dynamic broker addition benchmark (to update client immediately)
+  rpc SubscribeToCluster (ClientInfo) returns (stream ClusterStatus);
 }
 
 enum SequencerType{

@@ -215,18 +215,11 @@ int GenerateRandomNum(){
 
 class Buffer{
 	public:
-		Buffer(size_t num_buf, size_t total_buf_size, int client_id, size_t message_size, int order=0):
-			num_buf_(num_buf), order_(order){
-				bufs = (struct Buf*)malloc(sizeof(struct Buf) * num_buf);
-				size_t allocated;
+		Buffer(size_t num_buf, int client_id, size_t message_size, int order=0):
+			bufs_(num_buf), order_(order){
 				// 4K is a buffer space as message can go over
-				size_t buf_size = (total_buf_size / num_buf) + 4096; 
-				for(size_t i=0; i < num_buf; i++){
-					bufs[i].buffer = mmap_large_buffer(buf_size, allocated);
-					bufs[i].tail = 0;
-					bufs[i].head = 0;
-					bufs[i].len = allocated;
-				}
+				//size_t buf_size_ = (total_buf_size / num_buf) + 4096; 
+
 				header_.client_id = client_id;
 				header_.size = message_size;
 				header_.total_order = 0;
@@ -242,10 +235,28 @@ class Buffer{
 			}
 
 		~Buffer(){
-			for(size_t i=0; i < num_buf_; i++){
-				munmap(bufs[i].buffer, bufs[i].len);
+			for(auto& buf: bufs_){
+				munmap(buf.buffer, buf.len);
 			}
-			free(bufs);
+		}
+
+		bool AddBuffers(size_t n, size_t buf_size){
+			size_t idx = num_buf_.fetch_add(n);
+			if(idx + n > bufs_.size()){
+				LOG(ERROR) << "!!!! Buffer allocation OOM. Try increasing the num buffer !!!!";
+				return false;
+			}
+
+			for (size_t i = 0; i < n; i++) {
+				size_t allocated;
+				void* new_buffer = mmap_large_buffer(buf_size, allocated);
+				if (new_buffer == nullptr) {
+					return false;
+				}
+				bufs_[idx + i].buffer = new_buffer;
+				bufs_[idx + i].len = allocated;
+			}
+			return true;
 		}
 
 		bool Write(int bufIdx, size_t client_order, char* msg, size_t len){
@@ -265,41 +276,41 @@ class Buffer{
 				//header_.size = len;
 			}
 			header_.client_order = client_order;
-			if(bufs[bufIdx].tail + header_size + padded > bufs[bufIdx].len){
-				//LOG(ERROR) << "tail:" << bufs[bufIdx].tail << " write size:" << padded << " will go over buffer:" << bufs[bufIdx].len;
+			if(bufs_[bufIdx].tail + header_size + padded > bufs_[bufIdx].len){
+				//LOG(ERROR) << "tail:" << bufs_[bufIdx].tail << " write size:" << padded << " will go over buffer:" << bufs_[bufIdx].len;
 				return false;
 			}
-			memcpy((void*)((uint8_t*)bufs[bufIdx].buffer + bufs[bufIdx].tail), &header_, header_size);
-			memcpy((void*)((uint8_t*)bufs[bufIdx].buffer + bufs[bufIdx].tail + header_size), msg, len);
+			memcpy((void*)((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].tail), &header_, header_size);
+			memcpy((void*)((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].tail + header_size), msg, len);
 			//std::atomic_thread_fence(std::memory_order_release);
-			bufs[bufIdx].tail += padded;
+			bufs_[bufIdx].tail += padded;
 			return true;
 		}
 
 		void* Read(int bufIdx, size_t &len ){
 			if(order_ == 3){
-				while(!shutdown_ && bufs[bufIdx].tail - bufs[bufIdx].head < BATCH_SIZE){
+				while(!shutdown_ && bufs_[bufIdx].tail - bufs_[bufIdx].head < BATCH_SIZE){
 					std::this_thread::yield();
 				}
-				size_t head = bufs[bufIdx].head;
+				size_t head = bufs_[bufIdx].head;
 				//std::atomic_thread_fence(std::memory_order_acquire);
-				len = bufs[bufIdx].tail - head;
+				len = bufs_[bufIdx].tail - head;
 				if(len==0){
 					return nullptr;
 				}
 				len = BATCH_SIZE;
-				bufs[bufIdx].head += BATCH_SIZE;
-				return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
+				bufs_[bufIdx].head += BATCH_SIZE;
+				return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
 			}else{
-				while(!shutdown_ && bufs[bufIdx].tail <= bufs[bufIdx].head){
+				while(!shutdown_ && bufs_[bufIdx].tail <= bufs_[bufIdx].head){
 					std::this_thread::yield();
 				}
-				size_t head = bufs[bufIdx].head;
+				size_t head = bufs_[bufIdx].head;
 				//std::atomic_thread_fence(std::memory_order_acquire);
-				size_t tail = bufs[bufIdx].tail;
+				size_t tail = bufs_[bufIdx].tail;
 				len = tail - head;
-				bufs[bufIdx].head = tail;
-				return (void*)((uint8_t*)bufs[bufIdx].buffer + head);
+				bufs_[bufIdx].head = tail;
+				return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
 			}
 		}
 
@@ -313,25 +324,29 @@ class Buffer{
 			size_t head;
 			size_t tail;
 			size_t len;
-		} *bufs;
-		size_t num_buf_;
+			Buf() : head(0), tail(0){}
+		};
+		std::vector<Buf> bufs_;
+		std::atomic<size_t> num_buf_{0};
 		int order_;
-		bool shutdown_ = false;
+		bool shutdown_ {false};
 		Embarcadero::MessageHeader header_;
 };
 
 class Publisher{
 	public:
-		Publisher(std::string head_addr, std::string port, int num_threads, size_t message_size, size_t queueSize, int order):
+		Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, int num_threads_per_broker, size_t message_size, size_t queueSize, int order):
 			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0),
-			client_id_(GenerateRandomNum()), num_threads_(num_threads), message_size_(message_size),
-			pubQue_(num_threads, queueSize, client_id_, message_size, order){
+			client_id_(GenerateRandomNum()), num_threads_per_broker_(num_threads_per_broker), message_size_(message_size),
+			queueSize_(queueSize),
+			pubQue_(num_threads_per_broker_*NUM_MAX_BROKERS, client_id_, message_size, order){
+				memcpy(topic_, topic, TOPIC_NAME_SIZE);
 				std::string addr = head_addr+":"+port;
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				nodes_[0] = head_addr+":"+std::to_string(PORT);
 				brokers_.emplace_back(0);
 				cluster_probe_thread_ = std::thread([this](){
-						this->ClusterProbeLoop();
+						this->SubscribeToClusterStatus();
 						});
 				while(!connected_){
 					std::this_thread::yield();
@@ -341,33 +356,27 @@ class Publisher{
 
 		~Publisher(){
 			shutdown_ = true;
+			context_.TryCancel();
+
 			cluster_probe_thread_.join();
 			for(auto &t : threads_){
 				if(t.joinable())
 					t.join();
 			}
-			if(ack_thread_.joinable())
-				ack_thread_.join();
 			if(cluster_probe_thread_.joinable())
 				cluster_probe_thread_.join();
 
 			LOG(INFO) << "Destructed Publisher";
 		};
 
-		void Init(char topic[TOPIC_NAME_SIZE], int ack_level){
-			memcpy(topic_, topic, TOPIC_NAME_SIZE);
+		void Init(int ack_level){
 			ack_level_ = ack_level;
 			ack_port_ = GenerateRandomNum();
 			if(ack_level >= 2){
-				ack_thread_ = std::thread([this](){
-						this->EpollAckThread();
-						});
-				while(thread_count_.load() == 0){std::this_thread::yield();}
-				thread_count_.store(0);
+				threads_.emplace_back(&Publisher::EpollAckThread, this);
+				thread_count_.fetch_add(1);
 			}
-			for (int i=0; i < num_threads_; i++)
-				threads_.emplace_back(&Publisher::PublishThread, this, brokers_[i%brokers_.size()],  i);
-			while(thread_count_.load() != num_threads_){std::this_thread::yield();}
+			while(thread_count_.load() != thread_count_.load()){std::this_thread::yield();}
 			return;
 		}
 
@@ -397,8 +406,7 @@ class Publisher{
 					t.join();
 			}
 			shutdown_ = true;
-			if(ack_thread_.joinable())
-				ack_thread_.join();
+			context_.TryCancel();
 			return;
 		}
 
@@ -418,10 +426,14 @@ class Publisher{
 		bool connected_;
 		size_t client_order_;
 		int client_id_;
-		int num_threads_;
+		size_t num_threads_per_broker_;
+		std::atomic<int> num_threads_{0};
 		size_t message_size_;
+		size_t queueSize_;
 		Buffer pubQue_;
 
+		// Context for clusterprobe
+		grpc::ClientContext context_;
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::thread cluster_probe_thread_;
 		// <broker_id, address::port of network_mgr>
@@ -432,7 +444,6 @@ class Publisher{
 		int ack_level_;
 		int ack_port_;
 		std::vector<std::thread> threads_;
-		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
 
 		void EpollAckThread(){
@@ -679,7 +690,7 @@ class Publisher{
 				}
 				return true;
 			}; // End of connect_to_server lambda
-			
+
 			if(!connect_to_server(broker_id))
 				return;
 
@@ -749,7 +760,7 @@ class Publisher{
 								brokers_.erase(it);
 								nodes_.erase(broker_id);
 							}
-							int num_orphan_threads = num_threads_/(brokers_.size() + 1);
+							int num_orphan_threads = num_threads_.load()/(brokers_.size() + 1);
 							brokerId = brokers_[(pubQuesIdx/num_orphan_threads)%brokers_.size()];
 						}
 						if(!connect_to_server(brokerId)){
@@ -764,13 +775,52 @@ class Publisher{
 				}
 				// Update here for fault tolerance.
 				// At broker failure, we should send the same batch to another broker
-				batch_seq += num_threads_;
+				batch_seq += num_threads_.load();
 			}
 			close(sock);
 			close(efd);
 		}
 
-		// Current implementation does not send messages to newly added nodes after init
+		void SubscribeToClusterStatus(){
+			heartbeat_system::ClientInfo client_info;
+			heartbeat_system::ClusterStatus cluster_status;
+			for (const auto &it: nodes_){
+				client_info.add_nodes_info(it.first);
+			}
+			std::unique_ptr<grpc::ClientReader<ClusterStatus>> reader(
+					stub_->SubscribeToCluster(&context_, client_info));
+			while(!shutdown_){
+				if(reader->Read(&cluster_status)){
+					const auto& new_nodes = cluster_status.new_nodes();
+					if(!new_nodes.empty()){
+						if(!connected_){
+							int num_brokers = 1 + new_nodes.size();
+							size_t buf_size = (queueSize_/(num_brokers*num_threads_per_broker_)) + 4096;
+							queueSize_ = buf_size;
+							// nodes_[0] the head broker as it is not recognized as a new node
+							if(!AddPublisherThreads(num_threads_per_broker_, brokers_[0]))
+								return;
+						}
+						absl::MutexLock lock(&mutex_);
+						for(const auto& addr:new_nodes){
+							int broker_id = GetBrokerId(addr);
+							VLOG(3) << "New Node reported:" << broker_id << " addr:" << addr;
+							nodes_[broker_id] = addr;
+							brokers_.emplace_back(broker_id);
+							if(!AddPublisherThreads(num_threads_per_broker_, broker_id))
+								return;
+							//Make sure the brokers are sorted to have threads send in round robin in broker_id seq
+							//This is needed for order3
+							std::sort(brokers_.begin(), brokers_.end());
+						}
+						connected_ = true;
+					}
+				}
+			}
+			grpc::Status status = reader->Finish();
+		}
+
+		// Embarcadero cluster stateless mode. Client polls the Cluster Status.
 		void ClusterProbeLoop(){
 			heartbeat_system::ClientInfo client_info;
 			heartbeat_system::ClusterStatus cluster_status;
@@ -778,8 +828,7 @@ class Publisher{
 				client_info.add_nodes_info(it.first);
 			}
 			while(!shutdown_){
-				grpc::ClientContext context;
-				grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
+				grpc::Status status = stub_->GetClusterStatus(&context_, client_info, &cluster_status);
 				if(status.ok()){
 					connected_ = true;
 					const auto& removed_nodes = cluster_status.removed_nodes();
@@ -797,7 +846,7 @@ class Publisher{
 						absl::MutexLock lock(&mutex_);
 						for(const auto& addr:new_nodes){
 							int broker_id = GetBrokerId(addr);
-							VLOG(3) << "New Node reported:" << broker_id;
+							VLOG(3) << "New Node reported:" << broker_id << " addr:" << addr;
 							nodes_[broker_id] = addr;
 							brokers_.emplace_back(broker_id);
 							//Make sure the brokers are sorted to have threads send in round robin in broker_id seq
@@ -813,6 +862,17 @@ class Publisher{
 			}
 		}
 
+	bool AddPublisherThreads(size_t num_threads, int broker_id){
+		if(pubQue_.AddBuffers(num_threads_per_broker_, queueSize_)){
+			for (int i=0; i < num_threads; i++){
+				int n = num_threads_.fetch_add(1);
+				threads_.emplace_back(&Publisher::PublishThread, this, broker_id, n);
+			}
+			VLOG(3) << "[DEBUG] AddPublisherThreads added new threads:" << num_threads_.load();
+		}else
+			return false;
+		return true;
+	}
 };
 
 //TODO(Jae) Broker Failure is not handled, dynamic node addition not handled
@@ -827,7 +887,7 @@ class Subscriber{
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				nodes_[0] = head_addr+":"+std::to_string(PORT);
 				cluster_probe_thread_ = std::thread([this](){
-						this->ClusterProbeLoop();
+						this->SubscribeToClusterStatus();
 						});
 				while(!connected_){
 					std::this_thread::yield();
@@ -837,6 +897,7 @@ class Subscriber{
 
 		~Subscriber(){
 			shutdown_ = true;
+			context_.TryCancel();
 			cluster_probe_thread_.join();
 			for( auto &t : subscribe_threads_){
 				if(t.joinable()){
@@ -966,6 +1027,7 @@ class Subscriber{
 		std::string port_;
 		bool shutdown_;
 		bool connected_;
+		grpc::ClientContext context_;
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::thread cluster_probe_thread_;
 		std::vector<std::thread> subscribe_threads_;
@@ -1079,6 +1141,33 @@ class Subscriber{
 			subscribe_threads_.emplace_back(&Subscriber::SubscribeThread, this, epoll_fd, fd_to_msg);
 		}
 
+		void SubscribeToClusterStatus(){
+			heartbeat_system::ClientInfo client_info;
+			heartbeat_system::ClusterStatus cluster_status;
+			for (const auto &it: nodes_){
+				client_info.add_nodes_info(it.first);
+			}
+			std::unique_ptr<grpc::ClientReader<ClusterStatus>> reader(
+					stub_->SubscribeToCluster(&context_, client_info));
+			CreateAConnection(0, nodes_[0]);
+			while(!shutdown_){
+				if(reader->Read(&cluster_status)){
+					const auto& new_nodes = cluster_status.new_nodes();
+					if(!new_nodes.empty()){
+						connected_ = true;
+						absl::MutexLock lock(&mutex_);
+						for(const auto& addr:new_nodes){
+							int broker_id = GetBrokerId(addr);
+							VLOG(3) << "New Node reported:" << broker_id << " addr:" << addr;
+							nodes_[broker_id] = addr;
+							CreateAConnection(broker_id, addr);
+						}
+					}
+				}
+			}
+			grpc::Status status = reader->Finish();
+		}
+
 		void ClusterProbeLoop(){
 			heartbeat_system::ClientInfo client_info;
 			heartbeat_system::ClusterStatus cluster_status;
@@ -1086,8 +1175,7 @@ class Subscriber{
 				client_info.add_nodes_info(it.first);
 			}
 			while(!shutdown_){
-				grpc::ClientContext context;
-				grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
+				grpc::Status status = stub_->GetClusterStatus(&context_, client_info, &cluster_status);
 				if(status.ok()){
 					// Head is alive (broker 0), add a connection
 					if(!connected_){
@@ -1147,7 +1235,7 @@ bool CheckAvailableCores(){
 }
 
 // Faile num_brokers_to_fail when failure_percentage of messages were sent
-double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads,
+double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads_per_broker,
 		int ack_level, int order, double failure_percentage, std::function<bool()> killbrokers){
 	size_t n = total_message_size/message_size;
 	size_t n_before_fail = (size_t)(n*failure_percentage);
@@ -1160,8 +1248,8 @@ double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_me
 	size_t q_size = total_message_size + (total_message_size/message_size)*64;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
-	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-	p.Init(topic, ack_level);
+	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
+	p.Init(ack_level);
 	auto start = std::chrono::high_resolution_clock::now();
 
 	for(size_t i=0; i<n_before_fail; i++){
@@ -1193,18 +1281,18 @@ double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_me
 	return bandwidthMbps;
 }
 
-double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads,
-		int ack_level, int order, std::atomic<int> &synchronizer){
+double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, 
+														int num_threads_per_broker, int ack_level, int order, std::atomic<int> &synchronizer){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << 
-		" num_threads:" << num_threads;
+		" num_threads_per_broker:" << num_threads_per_broker;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 
 	size_t q_size = total_message_size + (total_message_size/message_size)*64;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
-	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-	p.Init(topic, ack_level);
+	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
+	p.Init(ack_level);
 	// **************    Wait until other threads are initialized ************** //
 	synchronizer.fetch_sub(1);
 	while(synchronizer.load() != 0){
@@ -1249,18 +1337,18 @@ double SubscribeThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_msg_siz
 	return bandwidthMbps;
 }
 
-std::pair<double, double> E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, int ack_level,
+std::pair<double, double> E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads_per_broker, int ack_level,
 		int order){
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[E2E Throuput Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << 
-		" num_threads:" << num_threads;
+		" num_threads_per_broker:" << num_threads_per_broker;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 
 	size_t q_size = total_message_size + (total_message_size/message_size)*64;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
-	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
-	p.Init(topic, ack_level);
+	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
+	p.Init(ack_level);
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false);
 
 	auto start = std::chrono::high_resolution_clock::now();
@@ -1284,17 +1372,17 @@ std::pair<double, double> E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t 
 	return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);
 }
 
-std::pair<double, double> LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads, 
+std::pair<double, double> LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads_per_broker, 
 		int ack_level, int order){
 	size_t n = total_message_size/message_size;
-	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads:" << num_threads;
+	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads_per_broker:" << num_threads_per_broker;
 	char message[message_size];
 
 	size_t q_size = total_message_size + (total_message_size/message_size)*64;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
-	Publisher p("127.0.0.1", std::to_string(BROKER_PORT), num_threads, message_size, q_size, order);
+	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
-	p.Init(topic, ack_level);
+	p.Init(ack_level);
 
 	auto start = std::chrono::high_resolution_clock::now();
 	for(size_t i=0; i<n; i++){
@@ -1363,7 +1451,7 @@ class ResultWriter{
 		ResultWriter(const cxxopts::ParseResult& result):result_path("../../data/"){
 			message_size = result["size"].as<size_t>();
 			total_message_size = result["total_message_size"].as<size_t>();
-			num_threads = result["num_threads"].as<size_t>();
+			num_threads_per_broker = result["num_threads_per_broker"].as<size_t>();
 			ack_level = result["ack_level"].as<int>();
 			order = result["order_level"].as<int>();
 			replication_factor =result["replication_factor"].as<int>();
@@ -1408,7 +1496,7 @@ class ResultWriter{
 				}
 				file << message_size << ",";
 				file << total_message_size << ",";
-				file << num_threads << ",";
+				file << num_threads_per_broker << ",";
 				file << ack_level << ",";
 				file << order << ",";
 				file << replication_factor << ",";
@@ -1437,7 +1525,7 @@ class ResultWriter{
 	private:
 		size_t message_size;
 		size_t total_message_size;
-		size_t num_threads;
+		size_t num_threads_per_broker;
 		int ack_level;
 		int order;
 		int replication_factor;
@@ -1475,12 +1563,12 @@ int main(int argc, char* argv[]) {
 		("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
 		("num_brokers_to_kill", "Number of brokers to kill during execution", cxxopts::value<int>()->default_value("1"))
 		("failure_percentage", "When to fail brokers, after what percentages of messages sent", cxxopts::value<double>()->default_value("0.2"))
-		("n,num_threads", "Number of request threads", cxxopts::value<size_t>()->default_value("16"));
+		("n,num_threads_per_broker", "Number of request threads_per_broker", cxxopts::value<size_t>()->default_value("4"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
 	size_t total_message_size = result["total_message_size"].as<size_t>();
-	size_t num_threads = result["num_threads"].as<size_t>();
+	size_t num_threads_per_broker = result["num_threads_per_broker"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
 	int replication_factor =result["replication_factor"].as<int>();
@@ -1520,9 +1608,9 @@ int main(int argc, char* argv[]) {
 		size_t total_payload = n*paddedSize;
 		padding = total_payload % (BATCH_SIZE);
 		if(padding){
-			padding = (num_threads*BATCH_SIZE) - padding;
+			padding = (num_threads_per_broker*BATCH_SIZE) - padding;
 			LOG(INFO) << "Adjusting total message size from " << total_message_size << " to " << total_message_size+padding << 
-				" :" <<(total_message_size+padding)%(num_threads*BATCH_SIZE); 
+				" :" <<(total_message_size+padding)%(num_threads_per_broker*BATCH_SIZE); 
 			total_message_size += padding;
 		}
 	}
@@ -1539,7 +1627,7 @@ int main(int argc, char* argv[]) {
 			{
 				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 				LOG(INFO) << "Running Publish and Subscribe: "<< total_message_size;
-				double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+				double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads_per_broker, ack_level, order, synchronizer);
 				sleep(3);
 				double sub_bandwidthMb = SubscribeThroughputTest(topic, total_message_size, message_size, order);
 				writer.SetPubResult(pub_bandwidthMb);
@@ -1550,7 +1638,7 @@ int main(int argc, char* argv[]) {
 			{
 				LOG(INFO) << "Running E2E Throughput";
 				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-				std::pair<double, double> bandwidths = E2EThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+				std::pair<double, double> bandwidths = E2EThroughputTest(topic, total_message_size, message_size, num_threads_per_broker, ack_level, order);
 				writer.SetPubResult(bandwidths.first);
 				writer.SetSubResult(bandwidths.second);
 			}
@@ -1559,13 +1647,13 @@ int main(int argc, char* argv[]) {
 			{
 				LOG(INFO) << "Running E2E Latency Test";
 				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-				std::pair<double, double> bandwidths = LatencyTest(topic, total_message_size, message_size, num_threads, ack_level, order);
+				std::pair<double, double> bandwidths = LatencyTest(topic, total_message_size, message_size, num_threads_per_broker, ack_level, order);
 				writer.SetPubResult(bandwidths.first);
 				writer.SetSubResult(bandwidths.second);
 			}
 			break;
 		case 3:
-			LOG(INFO) << "Running Parallel Publish Test num_clients:" << num_clients << ":" << num_threads;
+			LOG(INFO) << "Running Parallel Publish Test num_clients:" << num_clients << ":" << num_threads_per_broker;
 			{
 				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 				std::vector<std::thread> threads;
@@ -1580,7 +1668,7 @@ int main(int argc, char* argv[]) {
 				// Launch the threads
 				for (int i = 0; i < num_clients; i++) {
 					threads.emplace_back([&, i]() {
-							double result = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+							double result = PublishThroughputTest(topic, total_message_size, message_size, num_threads_per_broker, ack_level, order, synchronizer);
 							promises[i].set_value(result); // Set the result in the promise
 							});
 				}
@@ -1607,7 +1695,7 @@ int main(int argc, char* argv[]) {
 				};
 				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 				double pub_bandwidthMb = FailurePublishThroughputTest(topic, total_message_size, message_size,
-						num_threads, ack_level, order, failure_percentage, killbrokers);
+						num_threads_per_broker, ack_level, order, failure_percentage, killbrokers);
 				writer.SetPubResult(pub_bandwidthMb);
 			}
 			break;
@@ -1615,7 +1703,7 @@ int main(int argc, char* argv[]) {
 			LOG(INFO) << "Running Publish : "<< total_message_size;
 			{
 				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
-				double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads, ack_level, order, synchronizer);
+				double pub_bandwidthMb = PublishThroughputTest(topic, total_message_size, message_size, num_threads_per_broker, ack_level, order, synchronizer);
 				writer.SetPubResult(pub_bandwidthMb);
 			}
 			break;

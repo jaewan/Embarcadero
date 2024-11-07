@@ -75,6 +75,16 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				reply->set_success(true);
 				reply->set_broker_id(broker_id);
 				reply->set_message("Node registered successfully");
+				{
+					ClusterStatus cluster_status;
+					cluster_status.add_new_nodes(request->address()+":"+std::to_string(broker_id+PORT));
+					absl::MutexLock lock(&subscriber_mutex_);
+					for (auto& writer : subscribers_) {
+            if (writer) {
+							writer->Write(cluster_status);  // Push update to each connected client
+            }
+					}
+				}
 			}
 			return Status::OK;
 		}
@@ -94,6 +104,51 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			} else {
 				reply->set_alive(false);
 			}
+			return Status::OK;
+		}
+
+		// gRPC Stream to update client of cluster changes. This  is for dynamic broker addition benchmark
+		// It will alert the client faster than client polling
+		// This does not alert removed nodes
+		Status SubscribeToCluster(ServerContext* context, const ClientInfo* request,
+				grpc::ServerWriter<ClusterStatus>* writer) override {
+			ClusterStatus initial_status;
+			absl::flat_hash_set<int32_t> s(request->nodes_info().begin(), request->nodes_info().end());
+			{
+				absl::MutexLock lock(&mutex_);
+				for (const auto &it : nodes_){
+					if(s.contains(it.second.broker_id)){
+						s.erase(it.second.broker_id);
+					}else{
+						initial_status.add_new_nodes(it.second.network_mgr_addr);
+					}
+				}
+			}
+			writer->Write(initial_status);
+			{
+				absl::MutexLock lock(&subscriber_mutex_);
+				subscribers_.push_back(std::make_shared<grpc::ServerWriter<ClusterStatus>>(*writer));
+			}
+
+			// Keep the stream open and active for the client (blocking call)
+			while (true) {
+				// Simulate keeping the stream alive, handling disconnection, etc.
+				if (context->IsCancelled()) {
+					break;
+				}
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+			}
+
+			// Cleanup the subscriber on disconnection
+			{
+				absl::MutexLock lock(&subscriber_mutex_);
+				subscribers_.erase(std::remove_if(subscribers_.begin(), subscribers_.end(),
+							[writer](const std::shared_ptr<grpc::ServerWriter<ClusterStatus>>& w) {
+							return w.get() == writer;
+							}),
+						subscribers_.end());
+			}
+
 			return Status::OK;
 		}
 
@@ -132,6 +187,9 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 
 		absl::Mutex mutex_;
 		absl::flat_hash_map<std::string, NodeInfo> nodes_;
+		// This is for stream communication with clients. Remove this if stream is not used
+		std::vector<std::shared_ptr<grpc::ServerWriter<ClusterStatus>>> subscribers_;
+		absl::Mutex subscriber_mutex_;
 		std::thread heartbeat_thread_;
 		bool shutdown_ = false;
 		std::shared_ptr<grpc::Server> server_;
