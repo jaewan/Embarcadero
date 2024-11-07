@@ -544,9 +544,11 @@ void ScalogLocalSequencer::SendLocalCut(int local_cut, const char* topic) {
 
 void CXLManager::ScalogSequencer(const char* topic,
 		absl::flat_hash_map<int, absl::btree_map<int, int>> &global_cut) {
+	static char topic_char[TOPIC_NAME_SIZE];
 	static size_t seq = 0;
 	static TInode *tinode = nullptr; 
 	static MessageHeader* msg_to_order = nullptr;
+	memcpy(topic_char, topic, TOPIC_NAME_SIZE);
 	if(tinode == nullptr){
 		tinode = GetTInode(topic);
 		msg_to_order = ((MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id_].log_offset));
@@ -562,7 +564,7 @@ void CXLManager::ScalogSequencer(const char* topic,
 					tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset;
 					tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
 					*/
-					UpdateTinodeOrder(topic, tinode, broker_id_, msg_logical_off, (uint8_t*)msg_to_order[broker_id_] - (uint8_t*)cxl_addr_);
+					UpdateTinodeOrder(topic_char, tinode, broker_id_, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
 					msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
 					seq++;
 				}
