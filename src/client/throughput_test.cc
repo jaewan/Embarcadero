@@ -21,7 +21,6 @@
 #include <glog/logging.h>
 #include <mimalloc.h>
 #include "absl/synchronization/mutex.h"
-#include "folly/ProducerConsumerQueue.h"
 
 #include <heartbeat.grpc.pb.h>
 #include "common/config.h"
@@ -345,12 +344,6 @@ class Publisher{
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				nodes_[0] = head_addr+":"+std::to_string(PORT);
 				brokers_.emplace_back(0);
-				cluster_probe_thread_ = std::thread([this](){
-						this->SubscribeToClusterStatus();
-						});
-				while(!connected_){
-					std::this_thread::yield();
-				}
 				LOG(INFO) << "Publisher Constructed";
 			}
 
@@ -358,13 +351,14 @@ class Publisher{
 			shutdown_ = true;
 			context_.TryCancel();
 
-			cluster_probe_thread_.join();
 			for(auto &t : threads_){
 				if(t.joinable())
 					t.join();
 			}
 			if(cluster_probe_thread_.joinable())
 				cluster_probe_thread_.join();
+			if(ack_thread_.joinable())
+				ack_thread_.join();
 
 			LOG(INFO) << "Destructed Publisher";
 		};
@@ -373,10 +367,17 @@ class Publisher{
 			ack_level_ = ack_level;
 			ack_port_ = GenerateRandomNum();
 			if(ack_level >= 2){
-				threads_.emplace_back(&Publisher::EpollAckThread, this);
-				thread_count_.fetch_add(1);
+				ack_thread_ = std::thread([this](){
+					this->EpollAckThread();
+					});
 			}
-			while(thread_count_.load() != thread_count_.load()){std::this_thread::yield();}
+			cluster_probe_thread_ = std::thread([this](){
+					this->SubscribeToClusterStatus();
+					});
+			while(!connected_){
+				std::this_thread::yield();
+			}
+			while(thread_count_.load() != num_threads_.load() + 1){std::this_thread::yield();}
 			return;
 		}
 
@@ -401,20 +402,21 @@ class Publisher{
 			while(client_order_ < n){
 				std::this_thread::yield();
 			}
+			shutdown_ = true;
+			context_.TryCancel();
 			for(auto &t : threads_){
 				if(t.joinable())
 					t.join();
 			}
-			shutdown_ = true;
-			context_.TryCancel();
 			return;
 		}
 
 		void DEBUG_check_send_finish(){
 			pubQue_.ReturnReads();
 			for(auto &t : threads_){
-				if(t.joinable())
+				if(t.joinable()){
 					t.join();
+				}
 			}
 			return;
 		}
@@ -444,6 +446,7 @@ class Publisher{
 		int ack_level_;
 		int ack_port_;
 		std::vector<std::thread> threads_;
+		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
 
 		void EpollAckThread(){
@@ -499,7 +502,7 @@ class Publisher{
 				return;
 			}
 
-			int max_events = nodes_.size();
+			int max_events = NUM_MAX_BROKERS;
 			std::vector<epoll_event> events(max_events);
 			char buffer[1024*1024];
 			size_t total_received = 0;
@@ -517,7 +520,7 @@ class Publisher{
 						socklen_t client_addr_len = sizeof(client_addr);
 						int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
 						if (client_sock == -1) {
-							std::cerr << "Accept failed\n";
+							LOG(ERROR) << "Accept failed";
 							continue;
 						}
 						//Make client_sock non-blocking
@@ -526,7 +529,7 @@ class Publisher{
 						event.events = EPOLLIN | EPOLLET;
 						event.data.fd = client_sock;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
-							std::cerr << "Failed to add client socket to epoll\n";
+							LOG(ERROR) << "Failed to add client socket to epoll";
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 							close(client_sock);
 						} else {
@@ -548,13 +551,15 @@ class Publisher{
 							// Connection closed by client
 							LOG(ERROR) << "Broker may have been disconnected. " << strerror(errno) << " Total bytes received: " << total_received;
 							continue;
+							/*
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 							close(client_sock);
 							client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
+							*/
 						} else if (bytes_received == -1) {
 							if (errno != EAGAIN && errno != EWOULDBLOCK) {
 								// Error occurred
-								std::cerr << "recv error: " << strerror(errno) << std::endl;
+								LOG(ERROR) << "recv error: " << strerror(errno);
 								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
 								close(client_sock);
 								client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), client_sock), client_sockets.end());
@@ -631,7 +636,14 @@ class Publisher{
 				close(sock);
 				close(efd);
 
-				auto [addr, addressPort] = ParseAddressPort(nodes_[brokerId]);
+				std::string addr;
+				size_t num_brokers;
+				{
+				absl::MutexLock lock(&mutex_);
+				auto[_addr, _addressPort] = ParseAddressPort(nodes_[brokerId]);
+				addr = _addr;
+				num_brokers = nodes_.size();
+				}
 				sock = GetNonblockingSock(addr.data(), PORT + brokerId);
 				efd = epoll_create1(0);
 				if (efd < 0) {
@@ -658,7 +670,6 @@ class Publisher{
 				memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
 				shake.ack = ack_level_;
 				shake.port = ack_port_;
-				size_t num_brokers = nodes_.size();
 				shake.num_msg = num_brokers; // shake.num_msg used as num brokers at pub
 
 				struct epoll_event events[10]; // Adjust size as needed
@@ -784,8 +795,11 @@ class Publisher{
 		void SubscribeToClusterStatus(){
 			heartbeat_system::ClientInfo client_info;
 			heartbeat_system::ClusterStatus cluster_status;
+			{
+			absl::MutexLock lock(&mutex_);
 			for (const auto &it: nodes_){
 				client_info.add_nodes_info(it.first);
+			}
 			}
 			std::unique_ptr<grpc::ClientReader<ClusterStatus>> reader(
 					stub_->SubscribeToCluster(&context_, client_info));
@@ -793,18 +807,14 @@ class Publisher{
 				if(reader->Read(&cluster_status)){
 					const auto& new_nodes = cluster_status.new_nodes();
 					if(!new_nodes.empty()){
+						absl::MutexLock lock(&mutex_);
 						if(!connected_){
 							int num_brokers = 1 + new_nodes.size();
 							size_t buf_size = (queueSize_/(num_brokers*num_threads_per_broker_)) + 4096;
 							queueSize_ = buf_size;
-							// nodes_[0] the head broker as it is not recognized as a new node
-							if(!AddPublisherThreads(num_threads_per_broker_, brokers_[0]))
-								return;
 						}
-						absl::MutexLock lock(&mutex_);
 						for(const auto& addr:new_nodes){
 							int broker_id = GetBrokerId(addr);
-							VLOG(3) << "New Node reported:" << broker_id << " addr:" << addr;
 							nodes_[broker_id] = addr;
 							brokers_.emplace_back(broker_id);
 							if(!AddPublisherThreads(num_threads_per_broker_, broker_id))
@@ -813,6 +823,17 @@ class Publisher{
 							//This is needed for order3
 							std::sort(brokers_.begin(), brokers_.end());
 						}
+					}
+					if(!connected_){
+						// Set here again as head node can be the only one
+						// TODO(Jae) receive head node from this rpc to make it cleaner 
+						int num_brokers = 1 + new_nodes.size();
+						size_t buf_size = (queueSize_/(num_brokers*num_threads_per_broker_)) + 4096;
+						queueSize_ = buf_size;
+						// Connect to head node.
+						if(!AddPublisherThreads(num_threads_per_broker_, brokers_[0]))
+							return;
+						// set here to make Init() to return after first connections are made
 						connected_ = true;
 					}
 				}
@@ -868,7 +889,6 @@ class Publisher{
 				int n = num_threads_.fetch_add(1);
 				threads_.emplace_back(&Publisher::PublishThread, this, broker_id, n);
 			}
-			VLOG(3) << "[DEBUG] AddPublisherThreads added new threads:" << num_threads_.load();
 		}else
 			return false;
 		return true;
@@ -1137,7 +1157,6 @@ class Subscriber{
 					close(sock);
 				}
 			}
-			VLOG(3) << "Spawning sub thread epoll:" << epoll_fd ;
 			subscribe_threads_.emplace_back(&Subscriber::SubscribeThread, this, epoll_fd, fd_to_msg);
 		}
 
@@ -1262,9 +1281,7 @@ double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_me
 		p.Publish(message, message_size);
 	}
 
-	auto produce_end = std::chrono::high_resolution_clock::now();
 	p.DEBUG_check_send_finish();
-	auto send_end = std::chrono::high_resolution_clock::now();
 	p.Poll(n);
 
 	auto end = std::chrono::high_resolution_clock::now();
@@ -1304,9 +1321,7 @@ double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_s
 		p.Publish(message, message_size);
 	}
 
-	auto produce_end = std::chrono::high_resolution_clock::now();
 	p.DEBUG_check_send_finish();
-	auto send_end = std::chrono::high_resolution_clock::now();
 	p.Poll(n);
 
 	auto end = std::chrono::high_resolution_clock::now();

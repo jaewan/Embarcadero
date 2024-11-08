@@ -276,7 +276,6 @@ void NetworkManager::ReqReceiveThread(){
 								running = false;
 								return;
 							}
-							// TODO(Jae) Add validation logic here to check if the message headers are valid and send acknowledgement
 							// We need this for ack=1 as well to confirm that the messages are valid
 							while(bytes_to_next_header + header_size <= (size_t) bytes_read){
 								header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);

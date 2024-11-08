@@ -136,7 +136,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				if (context->IsCancelled()) {
 					break;
 				}
-				std::this_thread::sleep_for(std::chrono::seconds(1));
+				std::this_thread::yield();
 			}
 
 			// Cleanup the subscriber on disconnection
