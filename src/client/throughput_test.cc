@@ -234,8 +234,8 @@ class Buffer{
 			}
 
 		~Buffer(){
-			for(auto& buf: bufs_){
-				munmap(buf.buffer, buf.len);
+			for(int i=0; i<num_buf_; i++){
+				munmap(bufs_[i].buffer, bufs_[i].len);
 			}
 		}
 
@@ -344,7 +344,7 @@ class Publisher{
 				stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
 				nodes_[0] = head_addr+":"+std::to_string(PORT);
 				brokers_.emplace_back(0);
-				LOG(INFO) << "Publisher Constructed";
+				VLOG(3) << "Publisher Constructed";
 			}
 
 		~Publisher(){
@@ -352,15 +352,18 @@ class Publisher{
 			context_.TryCancel();
 
 			for(auto &t : threads_){
-				if(t.joinable())
+				if(t.joinable()){
 					t.join();
+				}
 			}
-			if(cluster_probe_thread_.joinable())
+			if(cluster_probe_thread_.joinable()){
 				cluster_probe_thread_.join();
-			if(ack_thread_.joinable())
+			}
+			if(ack_thread_.joinable()){
 				ack_thread_.join();
+			}
 
-			LOG(INFO) << "Destructed Publisher";
+			VLOG(3) << "Publisher Destructed";
 		};
 
 		void Init(int ack_level){
@@ -370,6 +373,8 @@ class Publisher{
 				ack_thread_ = std::thread([this](){
 					this->EpollAckThread();
 					});
+				while(thread_count_.load() !=  1){std::this_thread::yield();}
+				thread_count_.store(0);
 			}
 			cluster_probe_thread_ = std::thread([this](){
 					this->SubscribeToClusterStatus();
@@ -377,14 +382,15 @@ class Publisher{
 			while(!connected_){
 				std::this_thread::yield();
 			}
-			while(thread_count_.load() != num_threads_.load() + 1){std::this_thread::yield();}
+			while(thread_count_.load() != num_threads_.load()){std::this_thread::yield();}
 			return;
 		}
 
 		void Publish(char* message, size_t len){
 			static size_t i = 0;
 			static size_t j = 0;
-			const static size_t batch_size = BATCH_SIZE;
+			//const static size_t batch_size = BATCH_SIZE;
+			const static size_t batch_size = 1;
 			size_t n = batch_size/(len+64);
 			if(n == 0)
 				n = 1;
@@ -510,6 +516,7 @@ class Publisher{
 			std::vector<int> client_sockets;
 
 			thread_count_.fetch_add(1);
+			VLOG(3) << "[DEBUG] ack thread inited";
 
 			while (!shutdown_ || total_received < client_order_) {
 				int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
@@ -519,6 +526,7 @@ class Publisher{
 						sockaddr_in client_addr;
 						socklen_t client_addr_len = sizeof(client_addr);
 						int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
+			VLOG(3) << "[DEBUG] accepted";
 						if (client_sock == -1) {
 							LOG(ERROR) << "Accept failed";
 							continue;
@@ -849,7 +857,8 @@ class Publisher{
 				client_info.add_nodes_info(it.first);
 			}
 			while(!shutdown_){
-				grpc::Status status = stub_->GetClusterStatus(&context_, client_info, &cluster_status);
+				grpc::ClientContext context;
+				grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
 				if(status.ok()){
 					connected_ = true;
 					const auto& removed_nodes = cluster_status.removed_nodes();
@@ -912,7 +921,7 @@ class Subscriber{
 				while(!connected_){
 					std::this_thread::yield();
 				}
-				LOG(INFO) << "Subscriber Constructed";
+				VLOG(3) << "Subscriber Constructed";
 			}
 
 		~Subscriber(){
@@ -930,7 +939,7 @@ class Subscriber{
 					free(msg_pair.second);
 				}
 			}
-			LOG(INFO) << "Subscriber Destructed";
+			VLOG(3) << "Subscriber Destructed";
 		};
 
 		void* Consume(){
@@ -1173,7 +1182,6 @@ class Subscriber{
 				if(reader->Read(&cluster_status)){
 					const auto& new_nodes = cluster_status.new_nodes();
 					if(!new_nodes.empty()){
-						connected_ = true;
 						absl::MutexLock lock(&mutex_);
 						for(const auto& addr:new_nodes){
 							int broker_id = GetBrokerId(addr);
@@ -1182,6 +1190,7 @@ class Subscriber{
 							CreateAConnection(broker_id, addr);
 						}
 					}
+					connected_ = true;
 				}
 			}
 			grpc::Status status = reader->Finish();
@@ -1194,7 +1203,8 @@ class Subscriber{
 				client_info.add_nodes_info(it.first);
 			}
 			while(!shutdown_){
-				grpc::Status status = stub_->GetClusterStatus(&context_, client_info, &cluster_status);
+				grpc::ClientContext context;
+				grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
 				if(status.ok()){
 					// Head is alive (broker 0), add a connection
 					if(!connected_){
@@ -1320,7 +1330,6 @@ double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_s
 	for(size_t i=0; i<n; i++){
 		p.Publish(message, message_size);
 	}
-
 	p.DEBUG_check_send_finish();
 	p.Poll(n);
 
@@ -1328,11 +1337,7 @@ double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_s
 	std::chrono::duration<double> elapsed = end - start;
 	double seconds = elapsed.count();
 	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
-	/*
-		 std::cout << "Produce time: " << ((std::chrono::duration<double>)(produce_end-start)).count() << std::endl;
-		 std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
-		 std::cout << "Total time: " << seconds << std::endl;
-		 */
+
 	LOG(INFO) << "Bandwidth: " << bandwidthMbps << " MBps";
 	free(message);
 	return bandwidthMbps;
@@ -1377,13 +1382,13 @@ std::pair<double, double> E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t 
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
 	double pubBandwidthMbps = ((message_size*n)/(std::chrono::duration<double>(pub_end - start)).count())/(1024*1024);
-	LOG(INFO) << "Pub Bandwidth: " << pubBandwidthMbps;
 	auto e2eBandwidthMbps = ((message_size*n)/(std::chrono::duration<double>(end - start)).count())/(1024*1024);
-	LOG(INFO) << "E2E Bandwidth: " << e2eBandwidthMbps << " MB/s";
 	s.DEBUG_check_order(order);
 
 	free(message);
 
+	LOG(INFO) << "Pub Bandwidth: " << pubBandwidthMbps << " MB/s";
+	LOG(INFO) << "E2E Bandwidth: " << e2eBandwidthMbps << " MB/s";
 	return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);
 }
 

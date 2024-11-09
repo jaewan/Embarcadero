@@ -129,7 +129,7 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, size
 	}
 
 	while(thread_count_.load() != num_io_threads_){std::this_thread::yield();}
-	LOG(INFO) << "\t[DiskManager]: \t\tConstructed";
+	VLOG(3) << "\t[DiskManager]: \t\tConstructed";
 }
 
 DiskManager::~DiskManager(){
@@ -148,7 +148,7 @@ DiskManager::~DiskManager(){
 		}
 	}
 	
-	LOG(INFO)<< "[DiskManager]: \tDestructed";
+	VLOG(3)<< "[DiskManager]: \tDestructed";
 }
 
 void DiskManager::CopyThread(){

@@ -65,7 +65,6 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 			munmap(addr, cxl_size);
 			return nullptr;
 		}
-		VLOG(3) << "Binded the memory to CXL";
 
 		numa_free_nodemask(bitmask);
 	}
@@ -108,7 +107,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	segments_ = (uint8_t*)bitmap_ + Bitmap_Region_size + ((broker_id_)*Segment_Region_size);
 
 
-	LOG(INFO) << "\t[CXLManager]: \t\tConstructed";
+	VLOG(3) << "\t[CXLManager]: \t\tConstructed";
 	return;
 }
 
@@ -129,7 +128,7 @@ CXLManager::~CXLManager(){
 	if (munmap(cxl_addr_, CXL_SIZE) < 0)
 		LOG(ERROR) << "Unmapping CXL error";
 
-	LOG(INFO) << "[CXLManager]: \t\tDestructed";
+	VLOG(3) << "[CXLManager]: \t\tDestructed";
 }
 
 std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
