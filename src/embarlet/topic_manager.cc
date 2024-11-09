@@ -457,7 +457,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	last_offset = ((MessageHeader*)combined_addr)->logical_offset;
 	last_addr = (void*)combined_addr;
 #endif
-	VLOG(3) << "sending:" << messages_size << " last_offset:" << last_offset << " combined:" << combined_offset;
+	//VLOG(3) << "sending:" << messages_size << " last_offset:" << last_offset << " combined:" << combined_offset;
 	return true;
 }
 

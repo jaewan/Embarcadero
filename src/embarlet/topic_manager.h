@@ -30,7 +30,7 @@ class Topic{
 					thread.join();
 				}
 			}
-			LOG(INFO) << "[Topic]: \tDestructed";
+			VLOG(3) << "[Topic]: \tDestructed";
 		}
 		// Delete copy contstructor and copy assignment operator
 		Topic(const Topic &) = delete;
@@ -89,10 +89,10 @@ class TopicManager{
 			disk_manager_(disk_manager),
 			broker_id_(broker_id),
 			num_topics_(0){
-				LOG(INFO) << "\t[TopicManager]\t\tConstructed";
+				VLOG(3) << "\t[TopicManager]\t\tConstructed";
 			}
 		~TopicManager(){
-			LOG(INFO) << "\t[TopicManager]\tDestructed";
+			VLOG(3) << "\t[TopicManager]\tDestructed";
 		}
 		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, heartbeat_system::SequencerType);
 		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);

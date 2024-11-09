@@ -65,7 +65,7 @@ NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads):
 			threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
 
 		while(thread_count_.load() != (1 + num_reqReceive_threads_)){}
-		LOG(INFO) << "\t[NetworkManager]: \tConstructed";
+		VLOG(3) << "\t[NetworkManager]: \tConstructed";
 	}
 
 NetworkManager::~NetworkManager(){
@@ -79,7 +79,7 @@ NetworkManager::~NetworkManager(){
 			thread.join();
 		}
 	}
-	LOG(INFO) << "[NetworkManager]: \tDestructed";
+	VLOG(3) << "[NetworkManager]: \tDestructed";
 }
 
 void NetworkManager::ReqReceiveThread(){
