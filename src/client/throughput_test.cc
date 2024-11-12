@@ -337,7 +337,7 @@ class Publisher{
 		Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, int num_threads_per_broker, size_t message_size, size_t queueSize, int order):
 			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0),
 			client_id_(GenerateRandomNum()), num_threads_per_broker_(num_threads_per_broker), message_size_(message_size),
-			queueSize_(queueSize),
+			queueSize_(queueSize / num_threads_per_broker),
 			pubQue_(num_threads_per_broker_*NUM_MAX_BROKERS, client_id_, message_size, order){
 				memcpy(topic_, topic, TOPIC_NAME_SIZE);
 				std::string addr = head_addr+":"+port;
@@ -389,8 +389,7 @@ class Publisher{
 		void Publish(char* message, size_t len){
 			static size_t i = 0;
 			static size_t j = 0;
-			//const static size_t batch_size = BATCH_SIZE;
-			const static size_t batch_size = 1;
+			const static size_t batch_size = BATCH_SIZE;
 			size_t n = batch_size/(len+64);
 			if(n == 0)
 				n = 1;
@@ -516,7 +515,6 @@ class Publisher{
 			std::vector<int> client_sockets;
 
 			thread_count_.fetch_add(1);
-			VLOG(3) << "[DEBUG] ack thread inited";
 
 			while (!shutdown_ || total_received < client_order_) {
 				int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
@@ -526,7 +524,6 @@ class Publisher{
 						sockaddr_in client_addr;
 						socklen_t client_addr_len = sizeof(client_addr);
 						int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
-			VLOG(3) << "[DEBUG] accepted";
 						if (client_sock == -1) {
 							LOG(ERROR) << "Accept failed";
 							continue;
@@ -818,8 +815,7 @@ class Publisher{
 						absl::MutexLock lock(&mutex_);
 						if(!connected_){
 							int num_brokers = 1 + new_nodes.size();
-							size_t buf_size = (queueSize_/(num_brokers*num_threads_per_broker_)) + 4096;
-							queueSize_ = buf_size;
+							queueSize_ /= num_brokers;
 						}
 						for(const auto& addr:new_nodes){
 							int broker_id = GetBrokerId(addr);
@@ -833,11 +829,7 @@ class Publisher{
 						}
 					}
 					if(!connected_){
-						// Set here again as head node can be the only one
 						// TODO(Jae) receive head node from this rpc to make it cleaner 
-						int num_brokers = 1 + new_nodes.size();
-						size_t buf_size = (queueSize_/(num_brokers*num_threads_per_broker_)) + 4096;
-						queueSize_ = buf_size;
 						// Connect to head node.
 						if(!AddPublisherThreads(num_threads_per_broker_, brokers_[0]))
 							return;
@@ -1166,6 +1158,7 @@ class Subscriber{
 					close(sock);
 				}
 			}
+			VLOG(3) << "Subscribing to :" << broker_id << " addr:" << address;
 			subscribe_threads_.emplace_back(&Subscriber::SubscribeThread, this, epoll_fd, fd_to_msg);
 		}
 
@@ -1185,7 +1178,6 @@ class Subscriber{
 						absl::MutexLock lock(&mutex_);
 						for(const auto& addr:new_nodes){
 							int broker_id = GetBrokerId(addr);
-							VLOG(3) << "New Node reported:" << broker_id << " addr:" << addr;
 							nodes_[broker_id] = addr;
 							CreateAConnection(broker_id, addr);
 						}
@@ -1274,7 +1266,7 @@ double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_me
 		" message_size:" << message_size << " failure percentage:" << failure_percentage;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 
-	size_t q_size = total_message_size + (total_message_size/message_size)*64;
+	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 4096;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
@@ -1315,7 +1307,8 @@ double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_s
 		" num_threads_per_broker:" << num_threads_per_broker;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 
-	size_t q_size = total_message_size + (total_message_size/message_size)*64;
+	// + 4096 as buffer
+	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 4096;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
@@ -1364,7 +1357,7 @@ std::pair<double, double> E2EThroughputTest(char topic[TOPIC_NAME_SIZE], size_t 
 		" num_threads_per_broker:" << num_threads_per_broker;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 
-	size_t q_size = total_message_size + (total_message_size/message_size)*64;
+	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 4096;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
@@ -1398,7 +1391,7 @@ std::pair<double, double> LatencyTest(char topic[TOPIC_NAME_SIZE], size_t total_
 	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads_per_broker:" << num_threads_per_broker;
 	char message[message_size];
 
-	size_t q_size = total_message_size + (total_message_size/message_size)*64;
+	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 4096;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
@@ -1581,7 +1574,7 @@ int main(int argc, char* argv[]) {
 		("record_results", "Record Results in a csv file")
 		("t,test_number", "Test to run. 0:pub/sub 1:E2E 2:Latency 3:Parallel", cxxopts::value<int>()->default_value("0"))
 		("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
-		("num_brokers_to_kill", "Number of brokers to kill during execution", cxxopts::value<int>()->default_value("1"))
+		("num_brokers_to_kill", "Number of brokers to kill during execution", cxxopts::value<int>()->default_value("0"))
 		("failure_percentage", "When to fail brokers, after what percentages of messages sent", cxxopts::value<double>()->default_value("0.2"))
 		("n,num_threads_per_broker", "Number of request threads_per_broker", cxxopts::value<size_t>()->default_value("4"));
 
