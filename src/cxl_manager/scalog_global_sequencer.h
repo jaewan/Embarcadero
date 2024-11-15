@@ -6,6 +6,7 @@
 #include "absl/container/btree_map.h"
 #include <scalog_sequencer.grpc.pb.h>
 #include "common/config.h"
+#include <thread>
 
 class ScalogGlobalSequencer : public ScalogSequencer::Service {
     public:
@@ -55,4 +56,7 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
         /// Used to keep track of all registered brokers
         /// Each element is a broker_id
         absl::btree_set<int> registered_brokers_;
+
+        /// Flag to indicate shutdown request
+        std::atomic<bool> shutdown_requested_{false};
 };
