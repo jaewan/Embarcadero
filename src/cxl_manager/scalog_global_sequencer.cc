@@ -15,8 +15,18 @@ ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
 grpc::Status ScalogGlobalSequencer::HandleTerminateGlobalSequencer(grpc::ServerContext* context,
 		const TerminateGlobalSequencerRequest* request, TerminateGlobalSequencerResponse* response) {
 	LOG(INFO) << "Terminating Scalog global sequencer";
-	scalog_server_->Shutdown();
-	return grpc::Status::OK;
+
+    // Signal shutdown to waiting threads
+    shutdown_requested_ = true;
+    cv_.notify_all();
+
+    // auto deadline = std::chrono::system_clock::now();
+	std::thread([this]() {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		scalog_server_->Shutdown();
+	}).detach();
+
+    return grpc::Status::OK;
 }
 
 grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* context,
@@ -66,6 +76,10 @@ grpc::Status ScalogGlobalSequencer::HandleSendLocalCut(grpc::ServerContext* cont
 		}
 	}
 
+	if (shutdown_requested_) {
+		return grpc::Status(grpc::StatusCode::CANCELLED, "Server is shutting down");
+	}
+
 	return grpc::Status::OK;
 }
 
@@ -112,18 +126,17 @@ void ScalogGlobalSequencer::ReceiveLocalCut(int epoch, const char* topic, int br
 				absl::ReaderMutexLock lock(&global_cut_mu_);
 				local_cut_num = global_cut_[epoch].size();
 			}
-			if ((size_t)local_cut_num == registered_brokers.size()){
+			if (shutdown_requested_ || (size_t)local_cut_num == registered_brokers.size()){
 				return true;
 			} else {
 				return false;
 			}
         });
-
 	}
 }
 
 int main(int argc, char* argv[]){
-    // Initialize scalog global sequencer
+    // Initialize scalog global sequencerq
     std::string scalog_seq_address = "192.168.60.172:50051";
     ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
 
