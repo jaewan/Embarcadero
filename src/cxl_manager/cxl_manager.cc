@@ -120,10 +120,10 @@ CXLManager::~CXLManager(){
 	}
 
     // If this is the head node, terminate the global sequencer
-    // if (broker_id_ == 0 && scalog_local_sequencer_) {
-	// 	LOG(INFO) << "Terminating global sequencer";
-    //     scalog_local_sequencer_->TerminateGlobalSequencer();
-    // }	
+    if (broker_id_ == 0 && scalog_local_sequencer_) {
+		LOG(INFO) << "Terminating global sequencer";
+        scalog_local_sequencer_->TerminateGlobalSequencer();
+    }	
 
 	if (munmap(cxl_addr_, CXL_SIZE) < 0)
 		LOG(ERROR) << "Unmapping CXL error";

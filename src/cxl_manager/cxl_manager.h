@@ -146,7 +146,6 @@ class CXLManager{
 		volatile bool stop_threads_ = false;
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 
-
 		// Scalog
 		std::string scalog_global_sequencer_ip_ = "192.168.60.172";
 		std::unique_ptr<ScalogLocalSequencer> scalog_local_sequencer_;
