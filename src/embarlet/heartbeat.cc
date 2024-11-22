@@ -46,22 +46,25 @@ Status HeartBeatServiceImpl::KillBrokers(ServerContext* context, const KillBroke
 	size_t num_brokers_to_kill = request->num_brokers();
 	{
 		absl::MutexLock lock(&mutex_);
-		if(num_brokers_to_kill >= nodes_.size()){
-			LOG(ERROR) << "KillBrokersRequest:" << num_brokers_to_kill << " is larger than the cluster size:" << nodes_.size();
+		if(num_brokers_to_kill >= nodes_.size() || num_brokers_to_kill == 0){
+			LOG(ERROR) << "KillBrokersRequest:" << num_brokers_to_kill << " is larger (or 0) than the cluster size:" << nodes_.size();
 			reply->set_success(false);
 			return Status::OK;
 		}
 		for (auto node_itr = nodes_.begin(); node_itr != nodes_.end();){
 			// Does not kill head node
 			int pid = std::stoi(node_itr->first);
+			bool killed_a_broker = false;
 			if(pid != 0){
 				if(kill(pid, SIGKILL) != 0){
 					if(errno == EAGAIN || errno == ESRCH){
 						// Process might be gone, veryfying
 						if(kill(pid, 0) == -1 && errno == ESRCH){
 							// It is dead
+							auto current = node_itr++;
+							nodes_.erase(current);
 							num_brokers_to_kill--;
-							nodes_.erase(node_itr);
+							killed_a_broker = true;
 						}else{
 							LOG(INFO) << "Killing process:" << pid << " failed:" << strerror(errno);
 						}
@@ -69,14 +72,17 @@ Status HeartBeatServiceImpl::KillBrokers(ServerContext* context, const KillBroke
 						LOG(INFO) << "Killing process:" << pid << " failed:" << strerror(errno);
 					}
 				}else{
+					auto current = node_itr++;
+					nodes_.erase(current);
 					num_brokers_to_kill--;
-					nodes_.erase(node_itr);
+					killed_a_broker = true;
 				}
 				if(num_brokers_to_kill == 0){
 					break;
 				}
 			}
-			++node_itr;
+			if(!killed_a_broker)
+				++node_itr;
 		}
 	}
 	if(num_brokers_to_kill > 0){

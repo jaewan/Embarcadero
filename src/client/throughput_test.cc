@@ -258,31 +258,19 @@ class Buffer{
 			return true;
 		}
 
-		bool Write(int bufIdx, size_t client_order, char* msg, size_t len){
+		bool Write(int bufIdx, size_t client_order, char* msg, size_t len, size_t paddedSize){
 			static const size_t header_size = sizeof(Embarcadero::MessageHeader);
-			size_t padded;
-			if(len == header_.size){
-				padded = header_.paddedSize;
-			}else{
-				LOG(ERROR) << "Jae handle dynamic message sizes:" << len << " size:" << header_size;
-				// have MessageHeader to each buf 
-				padded = len % 64;
-				if(padded){
-					padded = 64 - padded;
-				}
-				padded = len + padded + header_size;
-				header_.paddedSize = padded;
-				//header_.size = len;
-			}
+			header_.paddedSize = paddedSize;
+			header_.size = len;
 			header_.client_order = client_order;
-			if(bufs_[bufIdx].tail + header_size + padded > bufs_[bufIdx].len){
-				//LOG(ERROR) << "tail:" << bufs_[bufIdx].tail << " write size:" << padded << " will go over buffer:" << bufs_[bufIdx].len;
+			if(bufs_[bufIdx].tail + header_size + paddedSize > bufs_[bufIdx].len){
+				LOG(ERROR) << "tail:" << bufs_[bufIdx].tail << " write size:" << paddedSize << " will go over buffer:" << bufs_[bufIdx].len;
 				return false;
 			}
 			memcpy((void*)((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].tail), &header_, header_size);
 			memcpy((void*)((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].tail + header_size), msg, len);
 			//std::atomic_thread_fence(std::memory_order_release);
-			bufs_[bufIdx].tail += padded;
+			bufs_[bufIdx].tail += paddedSize;
 			return true;
 		}
 
@@ -390,10 +378,16 @@ class Publisher{
 			static size_t i = 0;
 			static size_t j = 0;
 			const static size_t batch_size = BATCH_SIZE;
-			size_t n = batch_size/(len+64);
+			const static size_t header_size = sizeof(Embarcadero::MessageHeader);
+			size_t padded = len % header_size;
+			if(padded){
+				padded = 64 - padded;
+			}
+			padded = len + padded + header_size;
+			size_t n = batch_size/(padded);
 			if(n == 0)
 				n = 1;
-			pubQue_.Write(i, client_order_, message, len);
+			pubQue_.Write(i, client_order_, message, len, padded);
 			j++;
 			if(j == n){
 				i = (i+1)%num_threads_;
@@ -426,6 +420,38 @@ class Publisher{
 			return;
 		}
 
+		void SetMeasureRealTimeThroughput(){
+			measure_real_time_throughput_ = true;
+			real_time_throughput_.resize(num_threads_.load());
+		}
+
+		void StoreRealTimeThroughput(std::string filename){
+			// Find the maximum size of inner vectors
+			size_t max_size = 0;
+			for (const auto& vec : real_time_throughput_) {
+				max_size = std::max(max_size, real_time_throughput_.size());
+			}
+
+			// Create a result vector to store the sum at each index
+			std::vector<double> sums(max_size, 0);
+
+			// Iterate over the outer vector and accumulate sums
+			for (const auto& vec : real_time_throughput_) {
+				for (size_t i = 0; i < vec.size(); ++i) {
+					sums[i] += vec[i];
+				}
+			}
+			std::ofstream throughputFile(filename);
+			if(!throughputFile.is_open()){
+				LOG(ERROR) << "Failed to open file for writing";
+				return ;
+			}
+				throughputFile <<"RealTimeThroughput\n";
+			for(double throughput: sums){
+				throughputFile << (throughput*10)/(1024*1024) << "\n";
+			}
+		}
+
 	private:
 		std::string head_addr_;
 		std::string port_;
@@ -439,6 +465,10 @@ class Publisher{
 		size_t queueSize_;
 		Buffer pubQue_;
 
+		// Used to measure real time throughput of failure bench
+		// Since it is updated by multi-thread, no dynamic addition allowed
+		std::vector<std::vector<double>> real_time_throughput_;
+		bool measure_real_time_throughput_ = false;
 		// Context for clusterprobe
 		grpc::ClientContext context_;
 		std::unique_ptr<HeartBeat::Stub> stub_;
@@ -713,6 +743,8 @@ class Publisher{
 			// *********** Sending Messages ***********
 			thread_count_.fetch_add(1);
 			size_t batch_seq = pubQuesIdx;
+			auto start = std::chrono::steady_clock::now();
+			double real_time_bytes = 0;
 			while(!shutdown_){
 				size_t len;
 				void *msg = pubQue_.Read(pubQuesIdx, len);
@@ -739,7 +771,6 @@ class Publisher{
 
 				size_t sent_bytes = 0;
 				size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
-
 
 				while(sent_bytes < len){
 					size_t remaining_bytes = len - sent_bytes;
@@ -789,6 +820,13 @@ class Publisher{
 						broker_id = brokerId;
 					}
 				}
+				real_time_bytes += sent_bytes;
+				if(measure_real_time_throughput_ && 
+				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count() >= 100){
+					real_time_throughput_[pubQuesIdx].emplace_back(real_time_bytes);
+					start = std::chrono::steady_clock::now();
+				}
+
 				// Update here for fault tolerance.
 				// At broker failure, we should send the same batch to another broker
 				batch_seq += num_threads_.load();
@@ -1158,7 +1196,6 @@ class Subscriber{
 					close(sock);
 				}
 			}
-			VLOG(3) << "Subscribing to :" << broker_id << " addr:" << address;
 			subscribe_threads_.emplace_back(&Subscriber::SubscribeThread, this, epoll_fd, fd_to_msg);
 		}
 
@@ -1255,7 +1292,7 @@ bool CheckAvailableCores(){
 	return num_cores == CGROUP_CORE;
 }
 
-// Faile num_brokers_to_fail when failure_percentage of messages were sent
+// Fail num_brokers_to_fail when failure_percentage of messages were sent
 double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads_per_broker,
 		int ack_level, int order, double failure_percentage, std::function<bool()> killbrokers){
 	size_t n = total_message_size/message_size;
@@ -1271,6 +1308,7 @@ double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_me
 
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
 	p.Init(ack_level);
+	p.SetMeasureRealTimeThroughput();
 	auto start = std::chrono::high_resolution_clock::now();
 
 	for(size_t i=0; i<n_before_fail; i++){
@@ -1290,13 +1328,10 @@ double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_me
 	std::chrono::duration<double> elapsed = end - start;
 	double seconds = elapsed.count();
 	double bandwidthMbps = ((message_size*n) / seconds) / (1024 * 1024);  // Convert to Megabytes per second
-	/*
-		 std::cout << "Produce time: " << ((std::chrono::duration<double>)(produce_end-start)).count() << std::endl;
-		 std::cout << "Send time: " << ((std::chrono::duration<double>)(send_end-start)).count() << std::endl;
-		 std::cout << "Total time: " << seconds << std::endl;
-		 */
 	LOG(INFO) << "Bandwidth: " << bandwidthMbps << " MBps";
 	free(message);
+
+	p.StoreRealTimeThroughput("/home/domin/Jae/Embarcadero/data/failure/real_time_throughput.csv");
 	return bandwidthMbps;
 }
 
@@ -1461,7 +1496,8 @@ heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
 
 class ResultWriter{
 	public:
-		ResultWriter(const cxxopts::ParseResult& result):result_path("../../data/"){
+		//ResultWriter(const cxxopts::ParseResult& result):result_path("../../data/"){
+		ResultWriter(const cxxopts::ParseResult& result):result_path("/home/domin/Jae/Embarcadero/data/"){
 			message_size = result["size"].as<size_t>();
 			total_message_size = result["total_message_size"].as<size_t>();
 			num_threads_per_broker = result["num_threads_per_broker"].as<size_t>();
@@ -1474,28 +1510,38 @@ class ResultWriter{
 			num_brokers_to_kill = result["num_brokers_to_kill"].as<int>();
 			failure_percentage = result["failure_percentage"].as<double>();
 			int test_num = result["test_number"].as<int>();
+			
+			if(replication_factor > 0){
+				result_path += "replication/";
+				if(test_num == 2){
+					LOG(ERROR) << "Replication and latency are separate test.";
+					exit(1);
+				}
+			}else{
+				result_path += "throughput/";
+			}
 
 			switch(test_num){
 				case 0:
-					result_path += "throughput/pubsub/result.csv";
+					result_path += "pubsub/result.csv";
 					break;
 				case 1:
-					result_path += "throughput/e2e/result.csv";
+					result_path += "e2e/result.csv";
 					break;
 				case 2:
 					result_path += "latency/e2e/result.csv";
 					break;
 				case 3:
-					result_path += "throughput/multiclient/result.csv";
+					result_path += "multiclient/result.csv";
 					break;
 				case 4:
-					result_path += "throughput/failure/result.csv";
+					result_path += "failure/result.csv";
 					break;
 				case 5:
-					result_path += "throughput/pub/result.csv";
+					result_path += "pub/result.csv";
 					break;
 				case 6:
-					result_path += "throughput/sub/result.csv";
+					result_path += "sub/result.csv";
 					break;
 			}
 		}
@@ -1575,7 +1621,7 @@ int main(int argc, char* argv[]) {
 		("t,test_number", "Test to run. 0:pub/sub 1:E2E 2:Latency 3:Parallel", cxxopts::value<int>()->default_value("0"))
 		("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
 		("num_brokers_to_kill", "Number of brokers to kill during execution", cxxopts::value<int>()->default_value("0"))
-		("failure_percentage", "When to fail brokers, after what percentages of messages sent", cxxopts::value<double>()->default_value("0.2"))
+		("failure_percentage", "When to fail brokers, after what percentages of messages sent", cxxopts::value<double>()->default_value("0"))
 		("n,num_threads_per_broker", "Number of request threads_per_broker", cxxopts::value<size_t>()->default_value("4"));
 
 	auto result = options.parse(argc, argv);
@@ -1653,7 +1699,7 @@ int main(int argc, char* argv[]) {
 				CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
 				std::pair<double, double> bandwidths = E2EThroughputTest(topic, total_message_size, message_size, num_threads_per_broker, ack_level, order);
 				writer.SetPubResult(bandwidths.first);
-				writer.SetSubResult(bandwidths.second);
+				writer.SetE2EResult(bandwidths.second);
 			}
 			break;
 		case 2:
@@ -1703,6 +1749,11 @@ int main(int argc, char* argv[]) {
 		case 4:
 			LOG(INFO) << "Running Broker failure at publish ";
 			{
+				if(num_brokers_to_kill == 0){
+					LOG(ERROR) << "Specify how many brokers to faile";
+					break;
+				}
+
 				auto killbrokers = [&stub, num_brokers_to_kill](){
 					return KillBrokers(stub, num_brokers_to_kill);
 				};
