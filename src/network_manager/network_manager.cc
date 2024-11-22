@@ -77,6 +77,7 @@ NetworkManager::~NetworkManager(){
 	for(std::thread& thread : threads_){
 		if(thread.joinable()){
 			thread.join();
+		}else{
 		}
 	}
 	VLOG(3) << "[NetworkManager]: \tDestructed";
@@ -238,15 +239,14 @@ void NetworkManager::ReqReceiveThread(){
 
 					BatchHeader batch_header;
 					while(!stop_threads_){
-						// give up if we can't at least read a partial batch header
 						ssize_t bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
+						// finish reading batch header
 						if(bytes_read <= 0){
 							if(bytes_read < 0)
 								LOG(ERROR) << "Receiving data: " << bytes_read << " ERROR:" << strerror(errno);
 							running = false;
 							break;
 						}
-						// finish reading batch header
 						while(bytes_read < (ssize_t)sizeof(BatchHeader)){
 							ssize_t recv_ret = recv(req.client_socket, (uint8_t*)(&batch_header) + bytes_read, sizeof(BatchHeader) - bytes_read, 0);
 							if(recv_ret < 0){
@@ -260,6 +260,7 @@ void NetworkManager::ReqReceiveThread(){
 						pub_req.total_size = batch_header.total_size;
 						pub_req.num_messages = batch_header.num_msg;
 						pub_req.batch_seq = batch_header.batch_seq;
+
 						// TODO(Jae) Send -1 to ack if this returns nullptr
 						void*  segment_header;
 						void*  buf = nullptr;
@@ -400,7 +401,7 @@ void NetworkManager::SubscribeNetworkThread(int sock, int efd, char* topic, int 
 		}
 		size_t sent_bytes = 0;
 		if(messages_size < 64 && messages_size != 0){
-			LOG(ERROR) << "[DEBUG] messages_size is below 64!!!! cannot happen " << messages_size;
+			LOG(ERROR) << "messages_size is below 64!!!! cannot happen " << messages_size;
 		}
 		while(sent_bytes < messages_size){
 			struct epoll_event events[10];
@@ -452,7 +453,8 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
 	int replication_factor = tinode->replication_factor;
 	CHECK_GT(replication_factor, 0) << " Replication factor must be larger than 0 at ack:2";
-	int replicated = -1; // This is not precise as 0 will always be reported as replicated (initialized as 0 but compares with -1) but just one
+	int acked_replicated = -1; // This is not precise as 0 will always be reported as acked_replicated (initialized as 0 but compares with -1) but just one
+
 	while(!stop_threads_){
 		size_t min = std::numeric_limits<size_t>::max();
 		// TODO(Jae) this relies on num_active_brokers == MAX_BROKER_NUM as disk manager
@@ -465,7 +467,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 				min = r[i];
 			}
 		}
-		size_t ack_count = min - replicated;
+		size_t ack_count = min - acked_replicated;
 		if(ack_count == 0){
 			continue;
 		}
@@ -478,13 +480,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 					bool retry;
 					do {
 						retry = false;
-						ssize_t bytesSent = send(ack_fd, buf + acked_size,
-																		 std::min(bufSize - acked_size, ack_count - acked_size), 0);
-						if(std::min(bufSize - acked_size, ack_count - acked_size) == 0){
-							LOG(ERROR) << "Ack sent 0!!! acked_size:" << acked_size << " ack_count:" << ack_count 
-							<< " min:" << min << " replicated:" << replicated << " replication_factor:" << replication_factor;
-							return;
-						}
+						ssize_t bytesSent = send(ack_fd, buf, std::min(bufSize, ack_count - acked_size), 0);
 						if (bytesSent < 0) {
 							if (errno == EAGAIN || errno == EWOULDBLOCK) {
 								// Would block, retry immediately
@@ -501,7 +497,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 													 << " ack_count: " << ack_count
 													 << " acked_size: " << acked_size
 													 << " min: " << min
-													 << " replicated: " << replicated;
+													 << " acked_replicated: " << acked_replicated;
 								return;
 							}
 						} else {
@@ -514,7 +510,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 				}
 			}
 		}
-		replicated = min;
+		acked_replicated = min;
 		// Check if the connection is alive only after ack_fd is connected
 		if(ack_fd > 0){
 			int result = recv(ack_fd, buf, 1, MSG_PEEK | MSG_DONTWAIT);
@@ -524,7 +520,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 				break;
 			}
 		}
-	}
+	} //end while
 }
 
 void NetworkManager::MainThread(){
