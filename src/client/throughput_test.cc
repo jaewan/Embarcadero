@@ -1750,8 +1750,7 @@ int main(int argc, char* argv[]) {
 			LOG(INFO) << "Running Broker failure at publish ";
 			{
 				if(num_brokers_to_kill == 0){
-					LOG(ERROR) << "Specify how many brokers to faile";
-					break;
+					LOG(WARNING) << "Number of broker fail in FailureTest is 0, are you sure about it?";
 				}
 
 				auto killbrokers = [&stub, num_brokers_to_kill](){

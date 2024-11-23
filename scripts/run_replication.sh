@@ -5,11 +5,11 @@ pushd ../build/bin/
 NUM_BROKERS=4
 
 NUM_TRIALS=5
-ACK=0
-orders=(0 1)
-replication_factors=(0)
-test_cases=(0 1)
-msg_sizes=(128 512 1024 4096 65536 1048576)
+acks=(0)
+replication_factors=(1 2 3)
+test_cases=(5)
+msg_sizes=(1024)
+#msg_sizes=(128 512 1024 4096 65536 1048576)
 
 wait_for_signal() {
   while true; do
@@ -38,7 +38,7 @@ mkfifo script_signal_pipe
 
 # Run experiments for each message size
 for test_case in "${test_cases[@]}"; do
-	for order in "${orders[@]}"; do
+	for ack in "${acks[@]}"; do
 		for msg_size in "${msg_sizes[@]}"; do
 		  for replication_factor in "${replication_factors[@]}"; do
 			  for ((trial=1; trial<=NUM_TRIALS; trial++)); do
@@ -55,7 +55,7 @@ for test_case in "${test_cases[@]}"; do
 				for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
 				  wait_for_signal
 				done
-				start_process "./throughput_test -m $msg_size --record_results -t $test_case -r $replication_factor -a $ACK -o $order"
+				start_process "./throughput_test -m $msg_size --record_results -t $test_case -r $replication_factor -a $ack "
 
 				# Wait for all processes to finish
 				for pid in "${pids[@]}"; do
@@ -65,6 +65,7 @@ for test_case in "${test_cases[@]}"; do
 
 				echo "All processes have finished for trial $trial with message size $msg_size"
 				pids=()  # Clear the pids array for the next trial
+				sleep 2
 			  done
 		  done
 		done
