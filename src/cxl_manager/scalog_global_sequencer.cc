@@ -93,8 +93,8 @@ void ScalogGlobalSequencer::ReceiveLocalCut(int epoch, const char* topic, int br
 
     absl::btree_set<int> registered_brokers;
     {
-    absl::ReaderMutexLock lock(&registered_brokers_mu_);
-	registered_brokers = registered_brokers_;
+   		absl::ReaderMutexLock lock(&registered_brokers_mu_);
+		registered_brokers = registered_brokers_;
     }
 
 	int local_cut_num = 0;
@@ -120,12 +120,19 @@ void ScalogGlobalSequencer::ReceiveLocalCut(int epoch, const char* topic, int br
 		}
 	} else {
 		/// If we haven't received all local cuts, the grpc thread must wait until we do to send the correct global cut back to the caller
-        cv_.wait(lock, [this, broker_id, epoch, registered_brokers]() {
+        cv_.wait(lock, [this, broker_id, epoch]() {
 			int local_cut_num = 0;
 			{
 				absl::ReaderMutexLock lock(&global_cut_mu_);
 				local_cut_num = global_cut_[epoch].size();
 			}
+
+			absl::btree_set<int> registered_brokers;
+			{
+				absl::ReaderMutexLock lock(&registered_brokers_mu_);
+				registered_brokers = registered_brokers_;
+			}
+
 			if (shutdown_requested_ || (size_t)local_cut_num == registered_brokers.size()){
 				return true;
 			} else {
@@ -136,7 +143,7 @@ void ScalogGlobalSequencer::ReceiveLocalCut(int epoch, const char* topic, int br
 }
 
 int main(int argc, char* argv[]){
-    // Initialize scalog global sequencerq
+    // Initialize scalog global sequencer
     std::string scalog_seq_address = "192.168.60.172:50051";
     ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
 
