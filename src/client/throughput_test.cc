@@ -25,6 +25,7 @@
 #include <heartbeat.grpc.pb.h>
 #include "common/config.h"
 #include "../cxl_manager/cxl_manager.h"
+#include "corfu_client.h"
 
 #ifndef MSG_ZEROCOPY
 #define MSG_ZEROCOPY    0x4000000
