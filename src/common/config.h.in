@@ -51,6 +51,9 @@ namespace Embarcadero{
 /// The threshold for the amount of retries we do before we consider a node dead.
 #define HEALTH_CHECK_FAILURE_THRESHOLD 5
 
+//********* Corfu configs *********
+#define CORFU_SEQ_PORT 50052
+
 //********* Scalog configs *********
 #define SCALOG_SEQ_PORT 50051
 
