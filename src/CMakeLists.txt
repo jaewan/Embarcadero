@@ -1,5 +1,6 @@
 include(cmake/heartbeat_grpc.cmake)
 include(cmake/scalog_sequencer_grpc.cmake)
+include(cmake/corfu_sequencer_grpc.cmake)
 include(cmake/corfu_validator_grpc.cmake)
 
 # These are required for a folly build
@@ -50,6 +51,9 @@ set(PROTO_FILES
     "${PROTO_SRC_DIR}/heartbeat.proto"
 )
 
+set(CORFU_CLIENT_HEADERS
+    "${CMAKE_CURRENT_SOURCE_DIR}/client/corfu_client.h" 
+)
 
 add_executable(embarlet 
     embarlet/embarlet.cc
@@ -103,6 +107,7 @@ add_executable(throughput_test
 target_include_directories(throughput_test PUBLIC
 	"${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_BINARY_DIR}"
+	"${CMAKE_CURRENT_SOURCE_DIR}/client"
 )
 
 target_link_libraries(throughput_test 
@@ -111,6 +116,7 @@ target_link_libraries(throughput_test
 	mimalloc
     cxxopts::cxxopts
     heartbeat_grpc_proto
+	corfu_sequencer_grpc_proto
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOF}
@@ -131,6 +137,23 @@ target_link_libraries(scalog_global_sequencer
     glog
     absl::flat_hash_map
     scalog_sequencer_grpc_proto
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOF}
+)
+
+add_executable(corfu_global_sequencer
+    cxl_manager/corfu_global_sequencer.cc
+)
+
+target_include_directories(corfu_global_sequencer PUBLIC
+	"${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+)
+
+target_link_libraries(corfu_global_sequencer 
+    glog
+    absl::flat_hash_map
+    corfu_sequencer_grpc_proto
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOF}
 )

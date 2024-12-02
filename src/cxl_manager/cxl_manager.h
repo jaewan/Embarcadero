@@ -80,9 +80,13 @@ struct alignas(64) TInode{
 };
 
 struct alignas(64) BatchHeader{
+	size_t batch_seq;
 	size_t total_size;
 	size_t num_msg;
-	size_t batch_seq;
+	// Corfu variables
+	int broker_id;
+	size_t total_order;
+	size_t log_idx;
 };
 
 
