@@ -75,9 +75,13 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 
 // Function to perform sequential write
 void sequentialWrite(char* addr, size_t size) {
-	for (size_t i = 0; i < size; ++i) {
-		addr[i] = 'A';
+	size_t remaining = size%64;
+	size_t n = size/64;
+	char buf[64];
+	for (size_t i = 0; i < n; ++i) {
+		memcpy(addr + (i*64), buf, 64);
 	}
+	memcpy(addr, buf, remaining);
 }
 
 // Function to perform sequential read
@@ -88,91 +92,114 @@ void sequentialRead(char* addr, size_t size) {
 	}
 }
 
+#define CACHE_LINE_SIZE 64 // Cache line size in bytes
+
+// Function to perform sequential writes at cache-line granularity
+void cacheLineWrite(char* addr, size_t size) {
+    size_t num_cache_lines = size / CACHE_LINE_SIZE; // Number of cache lines to write
+    for (size_t i = 0; i < num_cache_lines; ++i) {
+        memset(addr + i * CACHE_LINE_SIZE, 'A', CACHE_LINE_SIZE);
+    }
+}
+
+// Function to perform sequential reads at cache-line granularity
+void cacheLineRead(char* addr, size_t size) {
+    size_t num_cache_lines = size / CACHE_LINE_SIZE; // Number of cache lines to read
+    volatile char temp; // Prevent compiler optimization
+    for (size_t i = 0; i < num_cache_lines; ++i) {
+        temp = addr[i * CACHE_LINE_SIZE]; // Read one byte per cache line
+    }
+}
+
 int main(){
 	void* mmaped_region = allocate_shm(0, Real, SIZE);
 	char* char_addr = static_cast<char*>(mmaped_region);
 
 	//unsigned int num_threads = std::thread::hardware_concurrency(); // Use available cores
-	unsigned int num_threads = 32;
-	size_t chunk_size = SIZE / num_threads; // Divide the memory region into chunks for each thread
-	size_t remainder = SIZE % num_threads; // Handle any remaining memory
+	//unsigned int num_threads = 32;
+	std::vector<unsigned int> num_threads_vec = {4,8,16,20,24,32,48,64,80,128,256,512};
+	for(unsigned int num_threads : num_threads_vec){
+		std::cout << "\nRunning with " << num_threads << " threads\n";
+		size_t chunk_size = SIZE / num_threads; // Divide the memory region into chunks for each thread
+		size_t remainder = SIZE % num_threads; // Handle any remaining memory
 
-	// --- 1. Maximum Write Bandwidth (Parallel Write) ---
-	std::vector<std::thread> threads;
-	auto start_write = std::chrono::high_resolution_clock::now();
+		// --- 1. Maximum Write Bandwidth (Parallel Write) ---
+		std::vector<std::thread> threads;
+		auto start_write = std::chrono::high_resolution_clock::now();
 
-	// Launch threads to perform parallel writes
-	for (unsigned int i = 0; i < num_threads; ++i) {
-		size_t current_chunk_size = (i == num_threads - 1) ? chunk_size + remainder : chunk_size;
-		threads.emplace_back(sequentialWrite, char_addr + i * chunk_size, current_chunk_size);
-	}
-
-	// Wait for all threads to finish
-	for (auto& thread : threads) {
-		thread.join();
-	}
-
-	auto end_write = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> write_duration = end_write - start_write;
-	double write_bandwidth = (double)SIZE / (1024 * 1024 * 1024) / write_duration.count();
-	std::cout << "Maximum Parallel Write Bandwidth: " << write_bandwidth << " GB/s" << std::endl;
-
-	// --- 2. Maximum Read Bandwidth (Parallel Read) ---
-	threads.clear(); // Clear the thread vector for reuse
-	auto start_read = std::chrono::high_resolution_clock::now();
-
-	// Launch threads to perform parallel reads
-	for (unsigned int i = 0; i < num_threads; ++i) {
-		size_t current_chunk_size = (i == num_threads - 1) ? chunk_size + remainder : chunk_size;
-		threads.emplace_back(sequentialRead, char_addr + i * chunk_size, current_chunk_size);
-	}
-
-	// Wait for all threads to finish
-	for (auto& thread : threads) {
-		thread.join();
-	}
-
-	auto end_read = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> read_duration = end_read - start_read;
-	double read_bandwidth = (double)SIZE / (1024 * 1024 * 1024) / read_duration.count();
-	std::cout << "Maximum Parallel Read Bandwidth: " << read_bandwidth << " GB/s" << std::endl;
-
-	// --- 3. Parallel Read and Write Bandwidth ---
-	// Use the same number of threads for fair comparison: num_threads for read-only + num_threads for write-only
-	unsigned int rw_num_threads = 2 * num_threads; // Total threads for parallel read/write
-	size_t rw_chunk_size = SIZE / rw_num_threads; // Each thread will handle a smaller chunk of the total memory
-	size_t rw_remainder = SIZE % rw_num_threads;  // Handle any leftover bytes for the last thread
-	threads.clear(); // Clear the thread vector for reuse
-
-	auto start_parallel_rw = std::chrono::high_resolution_clock::now();
-
-	// Launch half of the threads for reads and the other half for writes
-	for (unsigned int i = 0; i < rw_num_threads; ++i) {
-		size_t current_chunk_size = (i == rw_num_threads - 1) ? rw_chunk_size + rw_remainder : rw_chunk_size;
-
-		if (i % 2 == 0) {
-			// Even-indexed threads perform writes
-			threads.emplace_back(sequentialWrite, char_addr + i * rw_chunk_size, current_chunk_size);
-		} else {
-			// Odd-indexed threads perform reads
-			threads.emplace_back(sequentialRead, char_addr + i * rw_chunk_size, current_chunk_size);
+		// Launch threads to perform parallel writes
+		for (unsigned int i = 0; i < num_threads; ++i) {
+			size_t current_chunk_size = (i == num_threads - 1) ? chunk_size + remainder : chunk_size;
+			threads.emplace_back(sequentialWrite, char_addr + i * chunk_size, current_chunk_size);
 		}
+
+		// Wait for all threads to finish
+		for (auto& thread : threads) {
+			thread.join();
+		}
+
+		auto end_write = std::chrono::high_resolution_clock::now();
+		std::chrono::duration<double> write_duration = end_write - start_write;
+		double write_bandwidth = (double)SIZE / (1024 * 1024 * 1024) / write_duration.count();
+		std::cout << "Maximum Parallel Write Bandwidth: " << write_bandwidth << " GB/s" << std::endl;
+
+		// --- 2. Maximum Read Bandwidth (Parallel Read) ---
+		threads.clear(); // Clear the thread vector for reuse
+		auto start_read = std::chrono::high_resolution_clock::now();
+
+		// Launch threads to perform parallel reads
+		for (unsigned int i = 0; i < num_threads; ++i) {
+			size_t current_chunk_size = (i == num_threads - 1) ? chunk_size + remainder : chunk_size;
+			threads.emplace_back(sequentialRead, char_addr + i * chunk_size, current_chunk_size);
+		}
+
+		// Wait for all threads to finish
+		for (auto& thread : threads) {
+			thread.join();
+		}
+
+		auto end_read = std::chrono::high_resolution_clock::now();
+		std::chrono::duration<double> read_duration = end_read - start_read;
+		double read_bandwidth = (double)SIZE / (1024 * 1024 * 1024) / read_duration.count();
+		std::cout << "Maximum Parallel Read Bandwidth: " << read_bandwidth << " GB/s" << std::endl;
+
+		// --- 3. Parallel Read and Write Bandwidth ---
+		// Use the same number of threads for fair comparison: num_threads for read-only + num_threads for write-only
+		unsigned int rw_num_threads = 2 * num_threads; // Total threads for parallel read/write
+		size_t rw_chunk_size = SIZE / rw_num_threads; // Each thread will handle a smaller chunk of the total memory
+		size_t rw_remainder = SIZE % rw_num_threads;  // Handle any leftover bytes for the last thread
+		threads.clear(); // Clear the thread vector for reuse
+
+		auto start_parallel_rw = std::chrono::high_resolution_clock::now();
+
+		// Launch half of the threads for reads and the other half for writes
+		for (unsigned int i = 0; i < rw_num_threads; ++i) {
+			size_t current_chunk_size = (i == rw_num_threads - 1) ? rw_chunk_size + rw_remainder : rw_chunk_size;
+
+			if (i % 2 == 0) {
+				// Even-indexed threads perform writes
+				threads.emplace_back(sequentialWrite, char_addr + i * rw_chunk_size, current_chunk_size);
+			} else {
+				// Odd-indexed threads perform reads
+				threads.emplace_back(sequentialRead, char_addr + i * rw_chunk_size, current_chunk_size);
+			}
+		}
+
+		// Wait for all threads to finish
+		for (auto& thread : threads) {
+			thread.join();
+		}
+
+		auto end_parallel_rw = std::chrono::high_resolution_clock::now();
+		std::chrono::duration<double> parallel_rw_duration = end_parallel_rw - start_parallel_rw;
+
+		// Calculate separate read and write bandwidths
+		double parallel_write_bandwidth = (double)(SIZE / 2) / (1024 * 1024 * 1024) / parallel_rw_duration.count(); // Only half the memory is written
+		double parallel_read_bandwidth = (double)(SIZE / 2) / (1024 * 1024 * 1024) / parallel_rw_duration.count();  // Only half the memory is read
+
+		std::cout << "Parallel Write Bandwidth (during read/write): " << parallel_write_bandwidth << " GB/s" << std::endl;
+		std::cout << "Parallel Read Bandwidth (during read/write): " << parallel_read_bandwidth << " GB/s" << std::endl;
 	}
-
-	// Wait for all threads to finish
-	for (auto& thread : threads) {
-		thread.join();
-	}
-
-	auto end_parallel_rw = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> parallel_rw_duration = end_parallel_rw - start_parallel_rw;
-
-	// Calculate separate read and write bandwidths
-	double parallel_write_bandwidth = (double)(SIZE / 2) / (1024 * 1024 * 1024) / parallel_rw_duration.count(); // Only half the memory is written
-	double parallel_read_bandwidth = (double)(SIZE / 2) / (1024 * 1024 * 1024) / parallel_rw_duration.count();  // Only half the memory is read
-
-	std::cout << "Parallel Write Bandwidth (during read/write): " << parallel_write_bandwidth << " GB/s" << std::endl;
-	std::cout << "Parallel Read Bandwidth (during read/write): " << parallel_read_bandwidth << " GB/s" << std::endl;
 
 	// --- Cleanup ---
 	munmap(mmaped_region, SIZE);
