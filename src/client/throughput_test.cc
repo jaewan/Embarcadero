@@ -329,6 +329,7 @@ class Buffer{
 			static const size_t header_size = sizeof(Embarcadero::MessageHeader);
 			static int bufIdx = 0;
 			while(bufs_[bufIdx].sealing){
+				VLOG(3) << "[DEBUG] buffer:" << bufIdx << " is sealing";
 				bufIdx = (bufIdx+1) % num_buf_;
 			}
 			size_t head, tail;
@@ -340,7 +341,7 @@ class Buffer{
 			tail = bufs_[bufIdx].tail;
 			bufs_[bufIdx].num_msg++;
 			// Seal if written messages > BATCH_SIZE
-			if((bufs_[bufIdx].tail - bufs_[bufIdx].head) > BATCH_SIZE){
+			if((bufs_[bufIdx].tail - head) > BATCH_SIZE){
 				bufs_[bufIdx].sealed.push(std::make_pair(head, tail));
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
 				batch_header->batch_seq = batch_seq_.fetch_add(1);
@@ -365,6 +366,40 @@ class Buffer{
 
 		void* Read(int bufIdx){
 			size_t len;
+				if(bufs_[bufIdx].sealed.empty()){
+			VLOG(3) <<"[DEBUG] buf:" << bufIdx << " has no sealed";
+					bufs_[bufIdx].sealing = true;
+					size_t head, tail, num_msg;
+					{
+					absl::MutexLock lock(&bufs_[bufIdx].mu);
+					head = bufs_[bufIdx].head;
+					tail = bufs_[bufIdx].tail;
+					num_msg = bufs_[bufIdx].num_msg;
+					bufs_[bufIdx].head = tail;
+					bufs_[bufIdx].tail = tail + sizeof(Embarcadero::BatchHeader);
+					bufs_[bufIdx].num_msg = 0;
+					bufs_[bufIdx].sealing = false;
+					}
+					if(num_msg == 0){
+						return nullptr;
+					}
+					Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
+					batch_header->batch_seq = batch_seq_.fetch_add(1);
+					batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
+					batch_header->num_msg = num_msg;
+					return (void*)batch_header;
+				}else{
+			VLOG(3) <<"[DEBUG] returning sealed buf:" << bufIdx;
+					size_t head, tail;
+					{
+					absl::MutexLock lock(&bufs_[bufIdx].mu);
+					auto [first, second] = bufs_[bufIdx].sealed.front();
+					bufs_[bufIdx].sealed.pop();
+					head = first;
+					tail = second;
+					}
+					return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
+				}
 			if(order_ >= 3){
 				if(bufs_[bufIdx].sealed.empty()){
 					bufs_[bufIdx].sealing = true;
@@ -510,7 +545,6 @@ class Publisher{
 				padded = 64 - padded;
 			}
 			padded = len + padded + header_size;
-			/*
 			size_t n = batch_size/(padded);
 			if(n == 0)
 				n = 1;
@@ -520,8 +554,7 @@ class Publisher{
 				i = (i+1)%num_threads_;
 				j = 0;
 			}
-			*/
-			pubQue_.Write(client_order_, message, len, padded);
+			//pubQue_.Write(client_order_, message, len, padded);
 			client_order_++;
 		}
 
@@ -909,10 +942,12 @@ class Publisher{
 			size_t batch_seq = pubQuesIdx;
 			while(!shutdown_){
 				size_t len;
-				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)pubQue_.Read(len);
-				void *msg = (uint8_t*)batch_header + sizeof(Embarcadero::BatchHeader);
-				if(batch_header->total_size == 0)
+				/*
+				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)pubQue_.Read(pubQuesIdx);
+				if(batch_header == nullptr || batch_header->total_size == 0)
 					break;
+				VLOG(3) << "[DEBUG] batch_seq:" << batch_header->batch_seq << " len:" << batch_header->total_size;
+				void *msg = (uint8_t*)batch_header + sizeof(Embarcadero::BatchHeader);
 				int bytesSent = 0;
 				auto send_batch_header = [&]() -> void{
 					bytesSent = send(sock, (uint8_t*)(batch_header), sizeof(Embarcadero::BatchHeader), 0);
@@ -924,7 +959,7 @@ class Publisher{
 						bytesSent += send(sock, (uint8_t*)(batch_header) + bytesSent, sizeof(Embarcadero::BatchHeader) - bytesSent, 0);
 					}
 				};
-				/*
+				*/
 				void *msg = pubQue_.Read(pubQuesIdx, len);
 				if(len == 0){
 					break;
@@ -945,7 +980,6 @@ class Publisher{
 						bytesSent += send(sock, (uint8_t*)(&batch_header) + bytesSent, sizeof(Embarcadero::BatchHeader) - bytesSent, 0);
 					}
 				};
-				*/
 				send_batch_header();
 
 				size_t sent_bytes = 0;
@@ -1503,6 +1537,7 @@ double PublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_s
 	for(size_t i=0; i<n; i++){
 		p.Publish(message, message_size);
 	}
+	VLOG(3) << "[DEBUG] Finished publishing from client";
 	p.DEBUG_check_send_finish();
 	p.Poll(n);
 
