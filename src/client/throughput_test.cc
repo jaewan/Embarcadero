@@ -1,12 +1,3 @@
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <sys/epoll.h>
-#include <sys/mman.h>
-#include <sched.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -16,13 +7,22 @@
 #include <cstring>
 #include <random>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sched.h>
+
 #include <grpcpp/grpcpp.h>
 #include <cxxopts.hpp> // https://github.com/jarro2783/cxxopts
 #include <glog/logging.h>
 #include <mimalloc.h>
 #include "absl/synchronization/mutex.h"
 
-#include <heartbeat.grpc.pb.h>
 #include "common/config.h"
 #include "../cxl_manager/cxl_manager.h"
 #include "corfu_client.h"
@@ -31,6 +31,7 @@
 #define MSG_ZEROCOPY    0x4000000
 #endif
 
+#include <heartbeat.grpc.pb.h>
 using heartbeat_system::HeartBeat;
 using heartbeat_system::SequencerType;
 
@@ -213,6 +214,27 @@ int GenerateRandomNum(){
 	return  dis(gen);
 }
 
+// Checks if Cgroup is successful. Wait for 1 second to allow the process to be attached to the cgroup
+bool CheckAvailableCores(){
+	sleep(1);
+	size_t num_cores = 0;
+	cpu_set_t mask;
+	CPU_ZERO(&mask);
+
+	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
+		perror("sched_getaffinity");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("This process can run on CPUs: ");
+	for (int i = 0; i < CPU_SETSIZE; i++) {
+		if (CPU_ISSET(i, &mask)) {
+			printf("%d ", i);
+			num_cores++;
+		}
+	}
+	return num_cores == CGROUP_CORE;
+}
 class Buffer{
 	public:
 		Buffer(size_t num_buf, int client_id, size_t message_size, int order=0):
@@ -235,7 +257,7 @@ class Buffer{
 			}
 
 		~Buffer(){
-			for(int i=0; i<num_buf_; i++){
+			for(int i=0; i < num_buf_; i++){
 				munmap(bufs_[i].buffer, bufs_[i].len);
 			}
 		}
@@ -302,23 +324,123 @@ class Buffer{
 			}
 		}
 
+		// Strong Total Order version
+		bool Write(size_t client_order, char* msg, size_t len, size_t paddedSize){
+			static const size_t header_size = sizeof(Embarcadero::MessageHeader);
+			static int bufIdx = 0;
+			while(bufs_[bufIdx].sealing){
+				bufIdx = (bufIdx+1) % num_buf_;
+			}
+			size_t head, tail;
+			void* buffer = bufs_[bufIdx].buffer;;
+			head = bufs_[bufIdx].head;
+			{
+			absl::MutexLock lock(&bufs_[bufIdx].mu);
+			bufs_[bufIdx].tail += paddedSize;
+			tail = bufs_[bufIdx].tail;
+			bufs_[bufIdx].num_msg++;
+			// Seal if written messages > BATCH_SIZE
+			if((bufs_[bufIdx].tail - bufs_[bufIdx].head) > BATCH_SIZE){
+				bufs_[bufIdx].sealed.push(std::make_pair(head, tail));
+				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
+				batch_header->batch_seq = batch_seq_.fetch_add(1);
+				batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
+				batch_header->num_msg = bufs_[bufIdx].num_msg;
+				bufIdx = (bufIdx+1) % num_buf_;
+			}
+			}
+			header_.paddedSize = paddedSize;
+			header_.size = len;
+			header_.client_order = client_order;
+			/*
+			if(tail + header_size + paddedSize > bufs_[bufIdx].len){
+				LOG(ERROR) << "tail:" << bufs_[bufIdx].tail << " write size:" << paddedSize << " will go over buffer:" << bufs_[bufIdx].len;
+				return false;
+			}
+			*/
+			memcpy((void*)((uint8_t*)buffer + tail), &header_, header_size);
+			memcpy((void*)((uint8_t*)buffer + tail + header_size), msg, len);
+			return true;
+		}
+
+		void* Read(int bufIdx){
+			size_t len;
+			if(order_ >= 3){
+				if(bufs_[bufIdx].sealed.empty()){
+					bufs_[bufIdx].sealing = true;
+					size_t head, tail, num_msg;
+					{
+					absl::MutexLock lock(&bufs_[bufIdx].mu);
+					head = bufs_[bufIdx].head;
+					tail = bufs_[bufIdx].tail;
+					num_msg = bufs_[bufIdx].num_msg;
+					bufs_[bufIdx].head = tail;
+					bufs_[bufIdx].tail = tail + sizeof(Embarcadero::BatchHeader);
+					bufs_[bufIdx].num_msg = 0;
+					bufs_[bufIdx].sealing = false;
+					}
+					if(num_msg == 0){
+						return nullptr;
+					}
+					Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
+					batch_header->batch_seq = batch_seq_.fetch_add(1);
+					batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
+					batch_header->num_msg = num_msg;
+					return (void*)batch_header;
+				}else{
+					size_t head, tail;
+					{
+					absl::MutexLock lock(&bufs_[bufIdx].mu);
+					auto [first, second] = bufs_[bufIdx].sealed.front();
+					head = first;
+					tail = second;
+					}
+					return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
+				}
+			}else{
+				while(!shutdown_ && bufs_[bufIdx].tail <= bufs_[bufIdx].head){
+					std::this_thread::yield();
+				}
+				size_t head = bufs_[bufIdx].head;
+				//std::atomic_thread_fence(std::memory_order_acquire);
+				size_t tail = bufs_[bufIdx].tail;
+				len = tail - head;
+				bufs_[bufIdx].head = tail;
+				return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
+			}
+		}
+
 		void ReturnReads(){
 			shutdown_ = true;
 		}
 
 	private:
-		struct Buf{
+		struct alignas(64) Buf{
 			void* buffer;
+			size_t len;
 			size_t head;
 			size_t tail;
-			size_t len;
-			Buf() : head(0), tail(0){}
+			size_t num_msg;
+			bool sealing;
+			absl::Mutex mu;
+			std::queue<std::pair<size_t,size_t>> sealed;  // Note: std::queue takes one template parameter for value type
+			Buf() : sealing(false), head(0), tail(0), num_msg(0){}
 		};
 		std::vector<Buf> bufs_;
 		std::atomic<size_t> num_buf_{0};
+		std::atomic<size_t> batch_seq_{0};
 		int order_;
 		bool shutdown_ {false};
 		Embarcadero::MessageHeader header_;
+
+		inline void Seal(int &bufIdx){
+			absl::MutexLock lock(&bufs_[bufIdx].mu);
+			bufs_[bufIdx].sealed.push(std::make_pair(bufs_[bufIdx].head, bufs_[bufIdx].tail));
+			bufs_[bufIdx].head = bufs_[bufIdx].tail;
+			bufs_[bufIdx].tail = bufs_[bufIdx].head + sizeof(Embarcadero::BatchHeader);
+			bufs_[bufIdx].sealing = false;
+			bufIdx = (bufIdx+1) % num_buf_;
+		}
 };
 
 class Publisher{
@@ -388,6 +510,7 @@ class Publisher{
 				padded = 64 - padded;
 			}
 			padded = len + padded + header_size;
+			/*
 			size_t n = batch_size/(padded);
 			if(n == 0)
 				n = 1;
@@ -397,6 +520,8 @@ class Publisher{
 				i = (i+1)%num_threads_;
 				j = 0;
 			}
+			*/
+			pubQue_.Write(client_order_, message, len, padded);
 			client_order_++;
 		}
 
@@ -784,6 +909,22 @@ class Publisher{
 			size_t batch_seq = pubQuesIdx;
 			while(!shutdown_){
 				size_t len;
+				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)pubQue_.Read(len);
+				void *msg = (uint8_t*)batch_header + sizeof(Embarcadero::BatchHeader);
+				if(batch_header->total_size == 0)
+					break;
+				int bytesSent = 0;
+				auto send_batch_header = [&]() -> void{
+					bytesSent = send(sock, (uint8_t*)(batch_header), sizeof(Embarcadero::BatchHeader), 0);
+					while(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
+						if(bytesSent < 0 ){
+							LOG(ERROR) << "Batch send failed!!";
+							return;
+						}
+						bytesSent += send(sock, (uint8_t*)(batch_header) + bytesSent, sizeof(Embarcadero::BatchHeader) - bytesSent, 0);
+					}
+				};
+				/*
 				void *msg = pubQue_.Read(pubQuesIdx, len);
 				if(len == 0){
 					break;
@@ -804,6 +945,7 @@ class Publisher{
 						bytesSent += send(sock, (uint8_t*)(&batch_header) + bytesSent, sizeof(Embarcadero::BatchHeader) - bytesSent, 0);
 					}
 				};
+				*/
 				send_batch_header();
 
 				size_t sent_bytes = 0;
@@ -1303,28 +1445,6 @@ class Subscriber{
 		}
 
 };
-
-// Checks if Cgroup is successful. Wait for 1 second to allow the process to be attached to the cgroup
-bool CheckAvailableCores(){
-	sleep(1);
-	size_t num_cores = 0;
-	cpu_set_t mask;
-	CPU_ZERO(&mask);
-
-	if (sched_getaffinity(0, sizeof(mask), &mask) == -1) {
-		perror("sched_getaffinity");
-		exit(EXIT_FAILURE);
-	}
-
-	printf("This process can run on CPUs: ");
-	for (int i = 0; i < CPU_SETSIZE; i++) {
-		if (CPU_ISSET(i, &mask)) {
-			printf("%d ", i);
-			num_cores++;
-		}
-	}
-	return num_cores == CGROUP_CORE;
-}
 
 // Fail num_brokers_to_fail when failure_percentage of messages were sent
 double FailurePublishThroughputTest(char topic[TOPIC_NAME_SIZE], size_t total_message_size, size_t message_size, int num_threads_per_broker,
