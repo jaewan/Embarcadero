@@ -32,6 +32,9 @@
 #endif
 
 #include <heartbeat.grpc.pb.h>
+
+#define BATCH_OPTIMIZATION 1
+
 using heartbeat_system::HeartBeat;
 using heartbeat_system::SequencerType;
 
@@ -281,6 +284,81 @@ class Buffer{
 			return true;
 		}
 
+#ifdef BATCH_OPTIMIZATION
+		bool Write(size_t client_order, char* msg, size_t len, size_t paddedSize){
+			static const size_t header_size = sizeof(Embarcadero::MessageHeader);
+			static int bufIdx = 0;
+			while(bufs_[bufIdx].sealing){
+				VLOG(3) << "[DEBUG] buffer:" << bufIdx << " is sealing";
+				bufIdx = (bufIdx+1) % num_buf_;
+			}
+			size_t head, tail;
+			void* buffer = bufs_[bufIdx].buffer;;
+			head = bufs_[bufIdx].head;
+			{
+			absl::MutexLock lock(&bufs_[bufIdx].mu);
+			bufs_[bufIdx].tail += paddedSize;
+			tail = bufs_[bufIdx].tail;
+			bufs_[bufIdx].num_msg++;
+			// Seal if written messages > BATCH_SIZE
+			if((bufs_[bufIdx].tail - head) > BATCH_SIZE){
+				bufs_[bufIdx].sealed.push(std::make_pair(head, tail));
+				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
+				batch_header->batch_seq = batch_seq_.fetch_add(1);
+				batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
+				batch_header->num_msg = bufs_[bufIdx].num_msg;
+				bufIdx = (bufIdx+1) % num_buf_;
+			}
+			}
+			header_.paddedSize = paddedSize;
+			header_.size = len;
+			header_.client_order = client_order;
+			/*
+			if(tail + header_size + paddedSize > bufs_[bufIdx].len){
+				LOG(ERROR) << "tail:" << bufs_[bufIdx].tail << " write size:" << paddedSize << " will go over buffer:" << bufs_[bufIdx].len;
+				return false;
+			}
+			*/
+			memcpy((void*)((uint8_t*)buffer + tail), &header_, header_size);
+			memcpy((void*)((uint8_t*)buffer + tail + header_size), msg, len);
+			return true;
+		}
+
+		void* Read(int bufIdx){
+			if(bufs_[bufIdx].sealed.empty()){
+				bufs_[bufIdx].sealing = true;
+				size_t head, tail, num_msg;
+				{
+				absl::MutexLock lock(&bufs_[bufIdx].mu);
+				head = bufs_[bufIdx].head;
+				tail = bufs_[bufIdx].tail;
+				num_msg = bufs_[bufIdx].num_msg;
+				bufs_[bufIdx].head = tail;
+				bufs_[bufIdx].tail = tail + sizeof(Embarcadero::BatchHeader);
+				bufs_[bufIdx].num_msg = 0;
+				bufs_[bufIdx].sealing = false;
+				}
+				if(num_msg == 0){
+					return nullptr;
+				}
+				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
+				batch_header->batch_seq = batch_seq_.fetch_add(1);
+				batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
+				batch_header->num_msg = num_msg;
+				return (void*)batch_header;
+			}else{
+				size_t head, tail;
+				{
+				absl::MutexLock lock(&bufs_[bufIdx].mu);
+				auto [first, second] = bufs_[bufIdx].sealed.front();
+				bufs_[bufIdx].sealed.pop();
+				head = first;
+				tail = second;
+				}
+				return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
+			}
+		}
+#else
 		bool Write(int bufIdx, size_t client_order, char* msg, size_t len, size_t paddedSize){
 			static const size_t header_size = sizeof(Embarcadero::MessageHeader);
 			header_.paddedSize = paddedSize;
@@ -323,127 +401,7 @@ class Buffer{
 				return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
 			}
 		}
-
-		// Strong Total Order version
-		bool Write(size_t client_order, char* msg, size_t len, size_t paddedSize){
-			static const size_t header_size = sizeof(Embarcadero::MessageHeader);
-			static int bufIdx = 0;
-			while(bufs_[bufIdx].sealing){
-				VLOG(3) << "[DEBUG] buffer:" << bufIdx << " is sealing";
-				bufIdx = (bufIdx+1) % num_buf_;
-			}
-			size_t head, tail;
-			void* buffer = bufs_[bufIdx].buffer;;
-			head = bufs_[bufIdx].head;
-			{
-			absl::MutexLock lock(&bufs_[bufIdx].mu);
-			bufs_[bufIdx].tail += paddedSize;
-			tail = bufs_[bufIdx].tail;
-			bufs_[bufIdx].num_msg++;
-			// Seal if written messages > BATCH_SIZE
-			if((bufs_[bufIdx].tail - head) > BATCH_SIZE){
-				bufs_[bufIdx].sealed.push(std::make_pair(head, tail));
-				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
-				batch_header->batch_seq = batch_seq_.fetch_add(1);
-				batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
-				batch_header->num_msg = bufs_[bufIdx].num_msg;
-				bufIdx = (bufIdx+1) % num_buf_;
-			}
-			}
-			header_.paddedSize = paddedSize;
-			header_.size = len;
-			header_.client_order = client_order;
-			/*
-			if(tail + header_size + paddedSize > bufs_[bufIdx].len){
-				LOG(ERROR) << "tail:" << bufs_[bufIdx].tail << " write size:" << paddedSize << " will go over buffer:" << bufs_[bufIdx].len;
-				return false;
-			}
-			*/
-			memcpy((void*)((uint8_t*)buffer + tail), &header_, header_size);
-			memcpy((void*)((uint8_t*)buffer + tail + header_size), msg, len);
-			return true;
-		}
-
-		void* Read(int bufIdx){
-			size_t len;
-				if(bufs_[bufIdx].sealed.empty()){
-			VLOG(3) <<"[DEBUG] buf:" << bufIdx << " has no sealed";
-					bufs_[bufIdx].sealing = true;
-					size_t head, tail, num_msg;
-					{
-					absl::MutexLock lock(&bufs_[bufIdx].mu);
-					head = bufs_[bufIdx].head;
-					tail = bufs_[bufIdx].tail;
-					num_msg = bufs_[bufIdx].num_msg;
-					bufs_[bufIdx].head = tail;
-					bufs_[bufIdx].tail = tail + sizeof(Embarcadero::BatchHeader);
-					bufs_[bufIdx].num_msg = 0;
-					bufs_[bufIdx].sealing = false;
-					}
-					if(num_msg == 0){
-						return nullptr;
-					}
-					Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
-					batch_header->batch_seq = batch_seq_.fetch_add(1);
-					batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
-					batch_header->num_msg = num_msg;
-					return (void*)batch_header;
-				}else{
-			VLOG(3) <<"[DEBUG] returning sealed buf:" << bufIdx;
-					size_t head, tail;
-					{
-					absl::MutexLock lock(&bufs_[bufIdx].mu);
-					auto [first, second] = bufs_[bufIdx].sealed.front();
-					bufs_[bufIdx].sealed.pop();
-					head = first;
-					tail = second;
-					}
-					return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
-				}
-			if(order_ >= 3){
-				if(bufs_[bufIdx].sealed.empty()){
-					bufs_[bufIdx].sealing = true;
-					size_t head, tail, num_msg;
-					{
-					absl::MutexLock lock(&bufs_[bufIdx].mu);
-					head = bufs_[bufIdx].head;
-					tail = bufs_[bufIdx].tail;
-					num_msg = bufs_[bufIdx].num_msg;
-					bufs_[bufIdx].head = tail;
-					bufs_[bufIdx].tail = tail + sizeof(Embarcadero::BatchHeader);
-					bufs_[bufIdx].num_msg = 0;
-					bufs_[bufIdx].sealing = false;
-					}
-					if(num_msg == 0){
-						return nullptr;
-					}
-					Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
-					batch_header->batch_seq = batch_seq_.fetch_add(1);
-					batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
-					batch_header->num_msg = num_msg;
-					return (void*)batch_header;
-				}else{
-					size_t head, tail;
-					{
-					absl::MutexLock lock(&bufs_[bufIdx].mu);
-					auto [first, second] = bufs_[bufIdx].sealed.front();
-					head = first;
-					tail = second;
-					}
-					return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
-				}
-			}else{
-				while(!shutdown_ && bufs_[bufIdx].tail <= bufs_[bufIdx].head){
-					std::this_thread::yield();
-				}
-				size_t head = bufs_[bufIdx].head;
-				//std::atomic_thread_fence(std::memory_order_acquire);
-				size_t tail = bufs_[bufIdx].tail;
-				len = tail - head;
-				bufs_[bufIdx].head = tail;
-				return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
-			}
-		}
+#endif
 
 		void ReturnReads(){
 			shutdown_ = true;
@@ -545,6 +503,9 @@ class Publisher{
 				padded = 64 - padded;
 			}
 			padded = len + padded + header_size;
+#ifdef BATCH_OPTIMIZATION
+			pubQue_.Write(client_order_, message, len, padded);
+#else
 			size_t n = batch_size/(padded);
 			if(n == 0)
 				n = 1;
@@ -554,7 +515,7 @@ class Publisher{
 				i = (i+1)%num_threads_;
 				j = 0;
 			}
-			//pubQue_.Write(client_order_, message, len, padded);
+#endif
 			client_order_++;
 		}
 
@@ -942,13 +903,13 @@ class Publisher{
 			size_t batch_seq = pubQuesIdx;
 			while(!shutdown_){
 				size_t len;
-				/*
+				int bytesSent = 0;
+#ifdef BATCH_OPTIMIZATION
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)pubQue_.Read(pubQuesIdx);
 				if(batch_header == nullptr || batch_header->total_size == 0)
 					break;
-				VLOG(3) << "[DEBUG] batch_seq:" << batch_header->batch_seq << " len:" << batch_header->total_size;
 				void *msg = (uint8_t*)batch_header + sizeof(Embarcadero::BatchHeader);
-				int bytesSent = 0;
+				len = batch_header->total_size;
 				auto send_batch_header = [&]() -> void{
 					bytesSent = send(sock, (uint8_t*)(batch_header), sizeof(Embarcadero::BatchHeader), 0);
 					while(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
@@ -959,7 +920,7 @@ class Publisher{
 						bytesSent += send(sock, (uint8_t*)(batch_header) + bytesSent, sizeof(Embarcadero::BatchHeader) - bytesSent, 0);
 					}
 				};
-				*/
+#else
 				void *msg = pubQue_.Read(pubQuesIdx, len);
 				if(len == 0){
 					break;
@@ -969,7 +930,6 @@ class Publisher{
 				//TODO(Jae) This assumes static message sizes. Must make it count the messages to allow dynamic msg sizes
 				batch_header.num_msg = len/((Embarcadero::MessageHeader *)msg)->paddedSize;
 				batch_header.batch_seq = batch_seq;
-				int bytesSent = 0;
 				auto send_batch_header = [&]() -> void{
 					bytesSent = send(sock, (uint8_t*)(&batch_header), sizeof(Embarcadero::BatchHeader), 0);
 					while(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
@@ -980,6 +940,7 @@ class Publisher{
 						bytesSent += send(sock, (uint8_t*)(&batch_header) + bytesSent, sizeof(Embarcadero::BatchHeader) - bytesSent, 0);
 					}
 				};
+#endif
 				send_batch_header();
 
 				size_t sent_bytes = 0;
