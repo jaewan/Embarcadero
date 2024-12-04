@@ -22,6 +22,7 @@
 #include <glog/logging.h>
 #include <mimalloc.h>
 #include "absl/synchronization/mutex.h"
+#include "folly/ProducerConsumerQueue.h"
 
 #include "common/config.h"
 #include "../cxl_manager/cxl_manager.h"
@@ -288,6 +289,9 @@ class Buffer{
 				}
 				bufs_[idx + i].buffer = new_buffer;
 				bufs_[idx + i].len = allocated;
+#ifdef BATCH_OPTIMIZATION
+				bufs_[idx + i].tail = sizeof(Embarcadero::BatchHeader);
+#endif
 			}
 			return true;
 		}
@@ -296,73 +300,77 @@ class Buffer{
 		bool Write(size_t client_order, char* msg, size_t len, size_t paddedSize){
 			static const size_t header_size = sizeof(Embarcadero::MessageHeader);
 			static int bufIdx = 0;
-			while(bufs_[bufIdx].sealing){
-				VLOG(3) << "[DEBUG] buffer:" << bufIdx << " is sealing";
+			void* buffer;
+			size_t head, tail;
+			{
+			while(!bufs_[bufIdx].mu.TryLock()){
 				bufIdx = (bufIdx+1) % num_buf_;
 			}
-			size_t head, tail;
-			void* buffer = bufs_[bufIdx].buffer;;
+			size_t lockedIdx = bufIdx;
+			buffer = bufs_[bufIdx].buffer;;
 			head = bufs_[bufIdx].head;
-			{
-			absl::MutexLock lock(&bufs_[bufIdx].mu);
-			bufs_[bufIdx].tail += paddedSize;
 			tail = bufs_[bufIdx].tail;
+			bufs_[bufIdx].tail += paddedSize;
 			bufs_[bufIdx].num_msg++;
 			// Seal if written messages > BATCH_SIZE
 			if((bufs_[bufIdx].tail - head) > BATCH_SIZE){
-				bufs_[bufIdx].sealed.push(std::make_pair(head, tail));
+				bufs_[bufIdx].head = bufs_[bufIdx].tail;
+				bufs_[bufIdx].tail += sizeof(Embarcadero::BatchHeader);
+				while(!bufs_[bufIdx].spsc_sealed.write(std::make_pair(head, bufs_[bufIdx].tail))){
+					LOG(INFO) << "SPSC sealed queue is full. It will perform slowly. Consier increasing it";
+					std::this_thread::yield();
+				}
+
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
 				batch_header->batch_seq = batch_seq_.fetch_add(1);
 				batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
 				batch_header->num_msg = bufs_[bufIdx].num_msg;
 				bufIdx = (bufIdx+1) % num_buf_;
 			}
-			}
-			header_.paddedSize = paddedSize;
-			header_.size = len;
-			header_.client_order = client_order;
 			/*
 			if(tail + header_size + paddedSize > bufs_[bufIdx].len){
 				LOG(ERROR) << "tail:" << bufs_[bufIdx].tail << " write size:" << paddedSize << " will go over buffer:" << bufs_[bufIdx].len;
 				return false;
 			}
 			*/
+			bufs_[lockedIdx].mu.Unlock();
+			}
+
+			header_.paddedSize = paddedSize;
+			header_.size = len;
+			header_.client_order = client_order;
 			memcpy((void*)((uint8_t*)buffer + tail), &header_, header_size);
 			memcpy((void*)((uint8_t*)buffer + tail + header_size), msg, len);
 			return true;
 		}
 
 		void* Read(int bufIdx){
-			if(bufs_[bufIdx].sealed.empty()){
-				bufs_[bufIdx].sealing = true;
-				size_t head, tail, num_msg;
+			std::pair<size_t, size_t> batch;
+			if(bufs_[bufIdx].spsc_sealed.read(batch)){
+			VLOG(3) << "Read returning sealed";
+				return (void*)((uint8_t*)bufs_[bufIdx].buffer + batch.first);
+			}else{
+				//Queue is empty
+				size_t head, tail, num_msg, batch_seq;
 				{
 				absl::MutexLock lock(&bufs_[bufIdx].mu);
 				head = bufs_[bufIdx].head;
 				tail = bufs_[bufIdx].tail;
 				num_msg = bufs_[bufIdx].num_msg;
+				if(num_msg == 0){
+			VLOG(3) << "Nothing sealed head:" << head << " tail:" << tail;
+					return nullptr;
+				}
 				bufs_[bufIdx].head = tail;
 				bufs_[bufIdx].tail = tail + sizeof(Embarcadero::BatchHeader);
 				bufs_[bufIdx].num_msg = 0;
-				bufs_[bufIdx].sealing = false;
-				}
-				if(num_msg == 0){
-					return nullptr;
+				batch_seq = batch_seq_.fetch_add(1);
 				}
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + head);
-				batch_header->batch_seq = batch_seq_.fetch_add(1);
+				batch_header->batch_seq = batch_seq;
 				batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
 				batch_header->num_msg = num_msg;
 				return (void*)batch_header;
-			}else{
-				size_t head;
-				{
-				absl::MutexLock lock(&bufs_[bufIdx].mu);
-				auto [first, second] = bufs_[bufIdx].sealed.front();
-				bufs_[bufIdx].sealed.pop();
-				head = first;
-				}
-				return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
 			}
 		}
 #else
@@ -421,26 +429,16 @@ class Buffer{
 			size_t head;
 			size_t tail;
 			size_t num_msg;
-			bool sealing;
 			absl::Mutex mu;
-			std::queue<std::pair<size_t,size_t>> sealed;  // Note: std::queue takes one template parameter for value type
-			Buf() : head(0), tail(0), num_msg(0), sealing(false) {}
+			folly::ProducerConsumerQueue<std::pair<size_t,size_t>> spsc_sealed{4096};
+			Buf() : head(0), tail(0), num_msg(0){}
 		};
 		std::vector<Buf> bufs_;
+		int order_;
 		std::atomic<size_t> num_buf_{0};
 		std::atomic<size_t> batch_seq_{0};
-		int order_;
 		bool shutdown_ {false};
 		Embarcadero::MessageHeader header_;
-
-		inline void Seal(int &bufIdx){
-			absl::MutexLock lock(&bufs_[bufIdx].mu);
-			bufs_[bufIdx].sealed.push(std::make_pair(bufs_[bufIdx].head, bufs_[bufIdx].tail));
-			bufs_[bufIdx].head = bufs_[bufIdx].tail;
-			bufs_[bufIdx].tail = bufs_[bufIdx].head + sizeof(Embarcadero::BatchHeader);
-			bufs_[bufIdx].sealing = false;
-			bufIdx = (bufIdx+1) % num_buf_;
-		}
 };
 
 class Publisher{
@@ -448,7 +446,7 @@ class Publisher{
 		Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, int num_threads_per_broker,
 		size_t message_size, size_t queueSize, int order, 
 		SequencerType seq_type = heartbeat_system::SequencerType::EMBARCADERO):
-			head_addr_(head_addr), port_(port), shutdown_(false), connected_(false), client_order_(0),
+			head_addr_(head_addr), port_(port),
 			client_id_(GenerateRandomNum()), num_threads_per_broker_(num_threads_per_broker), message_size_(message_size),
 			queueSize_(queueSize / num_threads_per_broker),
 			pubQue_(num_threads_per_broker_*NUM_MAX_BROKERS, client_id_, message_size, order),
@@ -463,6 +461,7 @@ class Publisher{
 			}
 
 		~Publisher(){
+			publish_finished_ = true;
 			shutdown_ = true;
 			context_.TryCancel();
 
@@ -499,6 +498,11 @@ class Publisher{
 			while(!connected_){
 				std::this_thread::yield();
 			}
+			if(seq_type_ == heartbeat_system::SequencerType::CORFU){
+			corfu_client_ = std::make_unique<CorfuSequencerClient>(
+                //std::string("localhost:") + std::to_string(CORFU_SEQ_PORT));
+                std::string("192.168.60.173:") + std::to_string(CORFU_SEQ_PORT));
+			}
 			while(thread_count_.load() != num_threads_.load()){std::this_thread::yield();}
 			return;
 		}
@@ -530,6 +534,7 @@ class Publisher{
 		}
 
 		void Poll(size_t n){
+			publish_finished_ = true;
 			pubQue_.ReturnReads();
 			while(client_order_ < n){
 				std::this_thread::yield();
@@ -544,6 +549,7 @@ class Publisher{
 		}
 
 		void DEBUG_check_send_finish(){
+			publish_finished_ = true;
 			pubQue_.ReturnReads();
 			for(auto &t : threads_){
 				if(t.joinable()){
@@ -603,9 +609,6 @@ class Publisher{
 	private:
 		std::string head_addr_;
 		std::string port_;
-		bool shutdown_;
-		bool connected_;
-		size_t client_order_;
 		int client_id_;
 		size_t num_threads_per_broker_;
 		std::atomic<int> num_threads_{0};
@@ -613,7 +616,12 @@ class Publisher{
 		size_t queueSize_;
 		Buffer pubQue_;
 		SequencerType  seq_type_;
+		std::unique_ptr<CorfuSequencerClient> corfu_client_;
 
+		bool shutdown_{false};
+		bool publish_finished_ {false};
+		bool connected_{false};
+		size_t client_order_ = 0;
 		// Used to measure real time throughput of failure bench
 		// Since it is updated by multi-thread, no dynamic addition allowed
 		std::atomic<size_t> total_sent_bytes_{0};
@@ -900,15 +908,32 @@ class Publisher{
 				int bytesSent = 0;
 #ifdef BATCH_OPTIMIZATION
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)pubQue_.Read(pubQuesIdx);
-				if(batch_header == nullptr || batch_header->total_size == 0)
-					break;
+				if(batch_header == nullptr || batch_header->total_size == 0){
+					if(publish_finished_)
+						break;
+					else{
+						std::this_thread::yield();
+						continue;
+					}
+				}
 				void *msg = (uint8_t*)batch_header + sizeof(Embarcadero::BatchHeader);
 				len = batch_header->total_size;
 				auto send_batch_header = [&]() -> void{
+					if(seq_type_ == heartbeat_system::SequencerType::CORFU){
+						corfu_client_->GetTotalOrder(batch_header);
+						Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)msg;
+						size_t total_order = batch_header->total_order;
+					if(broker_id == 0){
+						VLOG(3) << "[DEBUG] Corfu total order:" << total_order;
+					}
+						for(size_t i = 0; i < batch_header->num_msg; i++){
+							header->total_order = total_order++;
+						}
+					}
 					bytesSent = send(sock, (uint8_t*)(batch_header), sizeof(Embarcadero::BatchHeader), 0);
 					while(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
 						if(bytesSent < 0 ){
-							LOG(ERROR) << "Batch send failed!!";
+							LOG(ERROR) << "Batch send failed!! " << strerror(errno);
 							return;
 						}
 						bytesSent += send(sock, (uint8_t*)(batch_header) + bytesSent, sizeof(Embarcadero::BatchHeader) - bytesSent, 0);

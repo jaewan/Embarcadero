@@ -65,14 +65,14 @@ class CorfuSequencerClient {
 			client_id_(GenerateClientId()){}
 
 		// Get total order for a batch of messages
-		bool GetTotalOrder(Embarcadero::BatchHeader &batch_header){
+		bool GetTotalOrder(Embarcadero::BatchHeader *batch_header){
 		//, size_t batch_seq, size_t num_msg, size_t total_size, int broker_id, std::vector<uint64_t>& total_orders) {
 			TotalOrderRequest request;
 			request.set_client_id(client_id_);
-			request.set_batchseq(batch_header.batch_seq);
-			request.set_num_msg(batch_header.num_msg);
-			request.set_total_size(batch_header.total_size);
-			request.set_broker_id(batch_header.broker_id);
+			request.set_batchseq(batch_header->batch_seq);
+			request.set_num_msg(batch_header->num_msg);
+			request.set_total_size(batch_header->total_size);
+			request.set_broker_id(batch_header->broker_id);
 
 			TotalOrderResponse response;
 			ClientContext context;
@@ -84,8 +84,8 @@ class CorfuSequencerClient {
 				return false;
 			}
 
-			batch_header.total_order = response.total_order();
-			batch_header.log_idx = response.log_idx();
+			batch_header->total_order = response.total_order();
+			batch_header->log_idx = response.log_idx();
 
 			return true;
 		}
