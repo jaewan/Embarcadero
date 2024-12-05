@@ -80,6 +80,7 @@ struct alignas(64) TInode{
 };
 
 struct alignas(64) BatchHeader{
+	size_t next_reader_head; // used in publish buffer write
 	size_t batch_seq;
 	size_t total_size;
 	size_t num_msg;
