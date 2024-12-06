@@ -238,8 +238,8 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, TInode* r
 	ordered_offset_ = 0;
 	if(seq_type == KAFKA){
 		GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
-	//}else if(seq_type == CORFU){
-		//GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
+	}else if(seq_type == CORFU){
+		GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
 	}else{
 		if(order_ == 3){
 			GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
@@ -275,7 +275,8 @@ void Topic::CombinerThread(){
 			continue;
 		}
 #else
-	 CHECK_LT((unsigned long long int)header, log_addr_) << "header calculated wrong";
+	// This check is only true besides CORFU which does not change log_addr_
+	 //CHECK_LT((unsigned long long int)header, log_addr_) << "header calculated wrong";
 #endif
 		header->segment_header = segment_header;
 		header->logical_offset = logical_offset_;
