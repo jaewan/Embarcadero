@@ -59,16 +59,6 @@ namespace Embarcadero{
 
 #define CGROUP_CORE 85
 	
-struct alignas(64) PublishRequest{
-	char topic[TOPIC_NAME_SIZE];
-	bool acknowledge;
-	uint32_t batch_seq;
-	uint32_t client_id; 
-	uint16_t num_brokers; // For order 3, this impl does not allow dynamic brokers
-	int num_messages;
-	size_t total_size;
-};
-
 using CreateTopicEntryCallback = std::function<bool(char*, int, int, bool, heartbeat_system::SequencerType)>;
 using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers, 
 														struct MessageHeader** msg_to_order, struct TInode *tinode)>;

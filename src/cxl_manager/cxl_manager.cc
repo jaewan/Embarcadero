@@ -131,8 +131,8 @@ CXLManager::~CXLManager(){
 	VLOG(3) << "[CXLManager]: \t\tDestructed";
 }
 
-std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-	return topic_manager_->GetCXLBuffer(req, log, segment_header, logical_offset);
+std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+	return topic_manager_->GetCXLBuffer(batch_header, topic, log, segment_header, logical_offset);
 }
 
 inline int hashTopic(const char topic[TOPIC_NAME_SIZE]) {

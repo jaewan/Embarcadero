@@ -231,14 +231,11 @@ void NetworkManager::ReqReceiveThread(){
 					size_t READ_SIZE = ZERO_COPY_SEND_LIMIT;
 					to_read = READ_SIZE;
 
-					// Create publish request
-					struct PublishRequest pub_req;
-					memcpy(pub_req.topic, shake.topic, TOPIC_NAME_SIZE);
-					pub_req.acknowledge = shake.ack;
-					pub_req.num_brokers = shake.num_msg; //shake.num_msg used as num_brokers at pub used at order 3
 
 					while(!stop_threads_){
 						BatchHeader batch_header;
+						batch_header.client_id = shake.client_id;
+						batch_header.num_brokers = shake.num_msg; //shake.num_msg used as num_brokers at pub used at order 3
 						ssize_t bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
 						// finish reading batch header
 						if(bytes_read <= 0){
@@ -257,15 +254,12 @@ void NetworkManager::ReqReceiveThread(){
 							bytes_read += recv_ret;
 						}
 						to_read = batch_header.total_size;
-						pub_req.total_size = batch_header.total_size;
-						pub_req.num_messages = batch_header.num_msg;
-						pub_req.batch_seq = batch_header.batch_seq;
 
 						// TODO(Jae) Send -1 to ack if this returns nullptr
 						void*  segment_header;
 						void*  buf = nullptr;
 						size_t logical_offset;
-						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(pub_req, buf, segment_header, logical_offset);
+						std::function<void(void*, size_t)> kafka_callback = cxl_manager_->GetCXLBuffer(batch_header, shake.topic, buf, segment_header, logical_offset);
 						size_t read = 0;
 						MessageHeader* header;
 						size_t header_size = sizeof(MessageHeader);
