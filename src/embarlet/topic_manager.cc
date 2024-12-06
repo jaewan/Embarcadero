@@ -187,24 +187,24 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int re
 void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
 }
 
-std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-	auto topic_itr = topics_.find(req.topic);
+std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()){
-		if(memcmp(req.topic, cxl_manager_.GetTInode(req.topic)->topic, TOPIC_NAME_SIZE) == 0){
+		if(memcmp(topic, cxl_manager_.GetTInode(topic)->topic, TOPIC_NAME_SIZE) == 0){
 			// The topic was created from another broker
-			CreateNewTopicInternal(req.topic);
-			topic_itr = topics_.find(req.topic);
+			CreateNewTopicInternal(topic);
+			topic_itr = topics_.find(topic);
 			if(topic_itr == topics_.end()){
 				LOG(ERROR) << "Topic Entry was not created Something is wrong";
 				return nullptr;
 			}
 		}else{
-			LOG(ERROR) << "[GetCXLBuffer] Topic:" << req.topic << " was not created before:" << cxl_manager_.GetTInode(req.topic)->topic
-			<< " memcmp:" << memcmp(req.topic, cxl_manager_.GetTInode(req.topic)->topic, TOPIC_NAME_SIZE);
+			LOG(ERROR) << "[GetCXLBuffer] Topic:" << topic << " was not created before:" << cxl_manager_.GetTInode(topic)->topic
+			<< " memcmp:" << memcmp(topic, cxl_manager_.GetTInode(topic)->topic, TOPIC_NAME_SIZE);
 			return nullptr;
 		}
 	}
-	return topic_itr->second->GetCXLBuffer(req, log, segment_header, logical_offset);
+	return topic_itr->second->GetCXLBuffer(batch_header, topic, log, segment_header, logical_offset);
 }
 
 bool TopicManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -305,15 +305,15 @@ void Topic::Combiner(){
 	combiningThreads_.emplace_back(&Topic::CombinerThread, this);
 }
 
-std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
 	size_t start_logical_offset;
 	{
 	absl::MutexLock lock(&mutex_);
-	log = (void*)(log_addr_.fetch_add(req.total_size));
+	log = (void*)(log_addr_.fetch_add(batch_header.total_size));
 	logical_offset = logical_offset_;
 	segment_header = current_segment_;
 	start_logical_offset = logical_offset_;
-	logical_offset_+= req.num_messages;
+	logical_offset_+= batch_header.num_msg;
 	//TODO(Jae) This does not work with dynamic message size
 	(void*)(log_addr_.load() - ((MessageHeader*)log)->paddedSize);
 	if((unsigned long long int)current_segment_ + SEGMENT_SIZE <= log_addr_){
@@ -351,34 +351,53 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(PublishRequest &req,
 	};
 }
 
-std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
-	absl::MutexLock lock(&mutex_);
-	if(skipped_batch_.contains(req.client_id)){
-		auto it = skipped_batch_[req.client_id].find(req.batch_seq);
-		if(it != skipped_batch_[req.client_id].end()){
-			log = it->second;
-			skipped_batch_[req.client_id].erase(it);
-			return nullptr;
+std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
+	size_t msgSize = batch_header.total_size;
+	log = (void*)(log_addr_.fetch_add(msgSize));
+	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+		//TODO(Jae) Finish below segment boundary crossing code
+		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
+			// Allocate a new segment
+			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}else{
+			// Wait for the first thread that crossed the segment to allocate a new segment
+			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
-	auto it = order3_client_batch_.find(req.client_id);
-	if (it == order3_client_batch_.end()) {
-		order3_client_batch_.emplace(req.client_id, broker_id_);
-	}
-	while(order3_client_batch_[req.client_id] < req.batch_seq){
-		skipped_batch_[req.client_id].emplace(order3_client_batch_[req.client_id],(void*)log_addr_.load());
-		log_addr_ += req.total_size; // This assumes the batch sizes are identical. Change this later
-		order3_client_batch_[req.client_id] += req.num_brokers;
-	}
-	log = (void*)(log_addr_.load());
-	log_addr_ += req.total_size;
-	order3_client_batch_[req.client_id] += req.num_brokers;
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+	absl::MutexLock lock(&mutex_);
+	if(skipped_batch_.contains(batch_header.client_id)){
+		auto it = skipped_batch_[batch_header.client_id].find(batch_header.batch_seq);
+		if(it != skipped_batch_[batch_header.client_id].end()){
+			log = it->second;
+			skipped_batch_[batch_header.client_id].erase(it);
+			return nullptr;
+		}
+	}
+	auto it = order3_client_batch_.find(batch_header.client_id);
+	if (it == order3_client_batch_.end()) {
+		order3_client_batch_.emplace(batch_header.client_id, broker_id_);
+	}
+	while(order3_client_batch_[batch_header.client_id] < batch_header.batch_seq){
+		skipped_batch_[batch_header.client_id].emplace(order3_client_batch_[batch_header.client_id],(void*)log_addr_.load());
+		log_addr_ += batch_header.total_size; // This assumes the batch sizes are identical. Change this later
+		order3_client_batch_[batch_header.client_id] += batch_header.num_brokers;
+	}
+	log = (void*)(log_addr_.load());
+	log_addr_ += batch_header.total_size;
+	order3_client_batch_[batch_header.client_id] += batch_header.num_brokers;
+	return nullptr;
+}
+
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
-	size_t msgSize = req.total_size;
+	size_t msgSize = batch_header.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));
 	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
 		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;

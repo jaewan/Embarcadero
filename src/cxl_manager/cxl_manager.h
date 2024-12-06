@@ -80,12 +80,15 @@ struct alignas(64) TInode{
 };
 
 struct alignas(64) BatchHeader{
+	size_t client_id;
+	// Fill from buffer
 	size_t next_reader_head; // used in publish buffer write
 	size_t batch_seq;
 	size_t total_size;
 	size_t num_msg;
 	// Corfu variables
-	int broker_id;
+	uint32_t broker_id;
+	uint32_t num_brokers;
 	size_t total_order;
 	size_t log_idx;
 };
@@ -121,7 +124,7 @@ class CXLManager{
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
-		std::function<void(void*, size_t)> GetCXLBuffer(PublishRequest &req, void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 														struct MessageHeader** msg_to_order, struct TInode *tinode);
 
