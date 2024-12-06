@@ -940,12 +940,10 @@ class Publisher{
 				len = batch_header->total_size;
 				auto send_batch_header = [&]() -> void{
 					if(seq_type_ == heartbeat_system::SequencerType::CORFU){
+						batch_header->broker_id = broker_id;
 						corfu_client_->GetTotalOrder(batch_header);
 						Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)msg;
 						size_t total_order = batch_header->total_order;
-					if(broker_id == 0){
-						VLOG(3) << "[DEBUG] Corfu total order:" << total_order;
-					}
 						for(size_t i = 0; i < batch_header->num_msg; i++){
 							header->total_order = total_order++;
 						}
