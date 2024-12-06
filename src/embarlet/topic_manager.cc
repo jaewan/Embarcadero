@@ -238,6 +238,8 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, TInode* r
 	ordered_offset_ = 0;
 	if(seq_type == KAFKA){
 		GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
+	//}else if(seq_type == CORFU){
+		//GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
 	}else{
 		if(order_ == 3){
 			GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
@@ -354,7 +356,7 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(BatchHeader &batch_h
 std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = batch_header.total_size;
-	log = (void*)(log_addr_.fetch_add(msgSize));
+	log = (void*)((uint8_t*)log_addr_.load() +  batch_header.log_idx);
 	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
 		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
 		//TODO(Jae) Finish below segment boundary crossing code
