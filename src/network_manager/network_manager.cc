@@ -237,8 +237,8 @@ void NetworkManager::ReqReceiveThread(){
 					pub_req.acknowledge = shake.ack;
 					pub_req.num_brokers = shake.num_msg; //shake.num_msg used as num_brokers at pub used at order 3
 
-					BatchHeader batch_header;
 					while(!stop_threads_){
+						BatchHeader batch_header;
 						ssize_t bytes_read = recv(req.client_socket, &batch_header, sizeof(BatchHeader), 0);
 						// finish reading batch header
 						if(bytes_read <= 0){

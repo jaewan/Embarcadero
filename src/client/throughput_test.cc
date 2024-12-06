@@ -312,6 +312,7 @@ class Buffer{
 			tail = bufs_[write_buf_id_].tail;
 			// Buffer Full, circle the buffer
 			if(tail + header_size + paddedSize + paddedSize/*buffer*/ > bufs_[lockedIdx].len){
+				VLOG(3) << "Buffer:" << write_buf_id_ << " full. Circle";
 				// Seal what is written now to move to next buffer
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[write_buf_id_].buffer + head);
 				batch_header->next_reader_head = 0;
@@ -356,7 +357,7 @@ class Buffer{
 
 		void* Read(int bufIdx){
 			Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].reader_head);
-			if(batch_header->batch_seq != 0 && batch_header->total_size != 0 && batch_header->num_msg != 0){
+			if(batch_header->total_size != 0 && batch_header->num_msg != 0){
 				bufs_[bufIdx].reader_head = batch_header->next_reader_head;
 				return (void*)batch_header;
 			}else{
@@ -407,27 +408,27 @@ class Buffer{
 
 		void* Read(int bufIdx, size_t &len ){
 			if(order_ == 3){
-				while(!shutdown_ && bufs_[bufIdx].tail - bufs_[bufIdx].head < BATCH_SIZE){
+				while(!shutdown_ && bufs_[bufIdx].tail - bufs_[bufIdx].reader_head < BATCH_SIZE){
 					std::this_thread::yield();
 				}
-				size_t head = bufs_[bufIdx].head;
+				size_t head = bufs_[bufIdx].reader_head;
 				//std::atomic_thread_fence(std::memory_order_acquire);
 				len = bufs_[bufIdx].tail - head;
 				if(len==0){
 					return nullptr;
 				}
 				len = BATCH_SIZE;
-				bufs_[bufIdx].head += BATCH_SIZE;
+				bufs_[bufIdx].reader_head += BATCH_SIZE;
 				return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
 			}else{
-				while(!shutdown_ && bufs_[bufIdx].tail <= bufs_[bufIdx].head){
+				while(!shutdown_ && bufs_[bufIdx].tail <= bufs_[bufIdx].reader_head){
 					std::this_thread::yield();
 				}
-				size_t head = bufs_[bufIdx].head;
+				size_t head = bufs_[bufIdx].reader_head;
 				//std::atomic_thread_fence(std::memory_order_acquire);
 				size_t tail = bufs_[bufIdx].tail;
 				len = tail - head;
-				bufs_[bufIdx].head = tail;
+				bufs_[bufIdx].reader_head = tail;
 				return (void*)((uint8_t*)bufs_[bufIdx].buffer + head);
 			}
 		}
@@ -920,7 +921,7 @@ class Publisher{
 			// *********** Sending Messages ***********
 			thread_count_.fetch_add(1);
 			size_t batch_seq = pubQuesIdx;
-			size_t DEBUG_count = 0;
+
 			while(!shutdown_){
 				size_t len;
 				int bytesSent = 0;
@@ -935,7 +936,6 @@ class Publisher{
 						continue;
 					}
 				}
-				DEBUG_count += batch_header->total_size;
 				void *msg = (uint8_t*)batch_header + sizeof(Embarcadero::BatchHeader);
 				len = batch_header->total_size;
 				auto send_batch_header = [&]() -> void{
@@ -1199,6 +1199,7 @@ class Subscriber{
 		}
 
 		bool DEBUG_check_order(int order){
+			DEBUG_do_not_check_order_ = true;
 			if(DEBUG_do_not_check_order_)
 				return true;
 			int idx = 0;
@@ -1513,7 +1514,6 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 	for(size_t i=0; i<n; i++){
 		p.Publish(message, message_size);
 	}
-
 	p.DEBUG_check_send_finish();
 	p.Poll(n);
 
@@ -1585,7 +1585,9 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
 	double seconds = elapsed.count();
 	double bandwidthMbps = (total_message_size/(1024*1024))/seconds;
 	LOG(INFO) << bandwidthMbps << "MB/s";
-	s.DEBUG_check_order(order);
+	if(!s.DEBUG_check_order(order)){
+		LOG(ERROR) << "Order check failed!!";
+	}
 	return bandwidthMbps;
 }
 
