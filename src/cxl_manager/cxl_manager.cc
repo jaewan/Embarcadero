@@ -201,7 +201,7 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 			if (order == 1)
 				LOG(ERROR) << "Order is set 1 at corfu";
 			else if (order == 2){
-				LOG(INFO) << "Sequencers not needed for corfu";
+				LOG(INFO) << "Order 2 for Corfu is right. But check Client library to change order to 0 in corfu as corfu is already ordered at publich";
 			}
 			break;
 		default:

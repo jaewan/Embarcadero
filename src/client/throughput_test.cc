@@ -1677,7 +1677,11 @@ bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAM
 	heartbeat_system::CreateTopicRequest create_topic_req;;
 	heartbeat_system::CreateTopicResponse create_topic_reply;;
 	create_topic_req.set_topic(topic);
-	create_topic_req.set_order(order);
+	if(seq_type == SequencerType::CORFU){
+		create_topic_req.set_order(0);
+	}else{
+		create_topic_req.set_order(order);
+	}
 	create_topic_req.set_replication_factor(replication_factor);
 	create_topic_req.set_replicate_tinode(replicate_tinode);
 	create_topic_req.set_sequencer_type(seq_type);
