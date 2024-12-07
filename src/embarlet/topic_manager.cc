@@ -417,7 +417,7 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &b
 	return nullptr;
 }
 
-// Current implementation depends on the subscriber knows the physical address of last fetched message
+// Current implementation depends on the subscriber knowing the physical address of last fetched message
 // This is only true if the messages were exported from CXL. If we implement disk cache optimization, 
 // we need to fix it. Probably need to have some sort of indexing or call this method to get indexes
 // even if at cache hit (without sending the messages)
@@ -442,7 +442,7 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	struct MessageHeader *start_msg_header = (struct MessageHeader*)last_addr;
 	if(last_addr != nullptr){
 		while((struct MessageHeader*)start_msg_header->next_msg_diff == 0){
-			LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
+			//LOG(INFO) << "[GetMessageAddr] waiting for the message to be combined ";
 			std::this_thread::yield();
 		}
 		start_msg_header = (struct MessageHeader*)((uint8_t*)start_msg_header + start_msg_header->next_msg_diff);
