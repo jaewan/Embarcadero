@@ -61,7 +61,6 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 grpc::Status ScalogGlobalSequencer::HandleSendLocalCut(grpc::ServerContext* context,
 		grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream) {
 
-	// TODO: Have lock for protecting map of streams
 	{
 		absl::MutexLock lock(&stream_mu_);
 		local_sequencers_.push_back(std::shared_ptr<grpc::ServerReaderWriter<GlobalCut, LocalCut>>(stream));

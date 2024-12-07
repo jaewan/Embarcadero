@@ -497,6 +497,8 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 		std::this_thread::sleep_for(local_cut_interval_);
 	}
 
+	LOG(INFO) << "Local epoch " << local_epoch_ << " has been reached. Terminating global sequencer.";
+
 	stream->WritesDone();
 	stop_reading_from_stream_ = true;
 	receive_global_cut.join();
@@ -506,6 +508,7 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 	static char topic[TOPIC_NAME_SIZE];
 	memcpy(topic, topic_str.data(), topic_str.size());
 
+	int num_global_cuts = 0;
 	while (!stop_reading_from_stream_) {
 		GlobalCut global_cut;
 		if (stream->Read(&global_cut)) {
@@ -515,13 +518,14 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 			}
 
 			this->cxl_manager_->ScalogSequencer(topic, global_cut_);
+
+			num_global_cuts++;
 		}
 	}
 
-    grpc::Status status = stream->Finish();
-    if (!status.ok()) {
-        std::cerr << "Stream finished with error: " << status.error_message() << std::endl;
-    }
+	LOG(INFO) << "Received " << num_global_cuts << " global cuts";
+
+    // grpc::Status status = stream->Finish();
 }
 
 void CXLManager::ScalogSequencer(const char* topic, absl::btree_map<int, int> &global_cut) {

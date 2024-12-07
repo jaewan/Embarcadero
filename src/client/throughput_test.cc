@@ -1613,14 +1613,25 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 	for(size_t i=0; i<n; i++){
 		p.Publish(message, message_size);
 	}
+
+	LOG(INFO) << "Finished publishing from client";
+
 	p.DEBUG_check_send_finish();
+
+	LOG(INFO) << "Polling for messages to be received";
+
 	p.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
+
+	LOG(INFO) << "Waiting for messages to be received";
 
 	s.DEBUG_wait(total_message_size, message_size);
 	auto end = std::chrono::high_resolution_clock::now();
 	double pubBandwidthMbps = ((message_size*n)/(std::chrono::duration<double>(pub_end - start)).count())/(1024*1024);
 	auto e2eBandwidthMbps = ((message_size*n)/(std::chrono::duration<double>(end - start)).count())/(1024*1024);
+
+	LOG(INFO) << "Checking order";
+
 	s.DEBUG_check_order(order);
 
 	free(message);
