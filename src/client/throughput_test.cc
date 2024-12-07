@@ -305,16 +305,10 @@ class Buffer{
 #ifdef BATCH_OPTIMIZATION
 		bool Write(size_t client_order, char* msg, size_t len, size_t paddedSize){
 			static const size_t header_size = sizeof(Embarcadero::MessageHeader);
-			size_t batch_size = (1UL<<20);
 
 			void* buffer;
 			size_t head, tail;
 			{
-			/*
-			while(!bufs_[write_buf_id_].mu.TryLock()){
-				write_buf_id_ = (write_buf_id_+1) % num_buf_;
-			}
-			*/
 			size_t lockedIdx = write_buf_id_;
 			buffer = bufs_[write_buf_id_].buffer;;
 			head = bufs_[write_buf_id_].writer_head;
@@ -322,11 +316,6 @@ class Buffer{
 			// Buffer Full, circle the buffer
 			if(tail + header_size + paddedSize + paddedSize/*buffer*/ > bufs_[lockedIdx].len){
 				LOG(INFO) << "Buffer:" << write_buf_id_ << " full." << bufs_[write_buf_id_].len <<" Circle. This can be buggy as it does not check new head is read or not";
-				/*
-				for(size_t i =0; i<num_buf_; i++){
-					LOG(INFO) << i << " :\t" << bufs_[i].tail;
-				}
-				*/
 				// Seal what is written now to move to next buffer
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[write_buf_id_].buffer + head);
 				batch_header->next_reader_head = 0;
@@ -339,13 +328,12 @@ class Buffer{
 				bufs_[write_buf_id_].tail = sizeof(Embarcadero::BatchHeader);
 
 				write_buf_id_ = (write_buf_id_+1) % num_buf_; 
-				bufs_[lockedIdx].mu.Unlock();
 				return Write(client_order, msg, len, paddedSize);;
 			}
 			bufs_[write_buf_id_].tail += paddedSize;
 			bufs_[write_buf_id_].num_msg++;
 			// Seal if written messages > BATCH_SIZE
-			if((bufs_[write_buf_id_].tail - head) >= batch_size){
+			if((bufs_[write_buf_id_].tail - head) >= BATCH_SIZE){
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[write_buf_id_].buffer + head);
 				batch_header->next_reader_head = bufs_[write_buf_id_].tail;
 				batch_header->batch_seq = batch_seq_.fetch_add(1);
@@ -357,9 +345,7 @@ class Buffer{
 				bufs_[write_buf_id_].tail += sizeof(Embarcadero::BatchHeader);
 
 				write_buf_id_ = (write_buf_id_+1) % num_buf_; 
-				batch_size = (1<<19);
 			} 
-			//bufs_[lockedIdx].mu.Unlock();
 			}
 
 			header_.paddedSize = paddedSize;
@@ -394,7 +380,6 @@ class Buffer{
 				//Queue is empty
 				size_t head, tail, num_msg, batch_seq;
 				{
-				//absl::MutexLock lock(&bufs_[bufIdx].mu);
 				if(batch_header->batch_seq != 0 && batch_header->total_size != 0 && batch_header->num_msg != 0){
 					bufs_[bufIdx].reader_head = batch_header->next_reader_head;
 					return (void*)batch_header;
@@ -478,7 +463,6 @@ class Buffer{
 			// Static
 			void* buffer;
 			size_t len;
-			absl::Mutex mu;
 			// Writer modify
 			size_t writer_head;
 			size_t tail;
@@ -1918,7 +1902,7 @@ int main(int argc, char* argv[]) {
 		("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
 		("num_brokers_to_kill", "Number of brokers to kill during execution", cxxopts::value<int>()->default_value("0"))
 		("failure_percentage", "When to fail brokers, after what percentages of messages sent", cxxopts::value<double>()->default_value("0"))
-		("n,num_threads_per_broker", "Number of request threads_per_broker", cxxopts::value<size_t>()->default_value("4"));
+		("n,num_threads_per_broker", "Number of request threads_per_broker", cxxopts::value<size_t>()->default_value("3"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
