@@ -19,6 +19,11 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
             /// @param response Empty for now
         grpc::Status HandleSendLocalCut(grpc::ServerContext* context, grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream);
 
+        /// Receives a register request from a local sequencer
+            /// @param request Request containing the broker id
+            /// @param response Empty for now
+        grpc::Status HandleRegisterBroker(grpc::ServerContext* context, const RegisterBrokerRequest* request, RegisterBrokerResponse* response);
+
         /// Receives a terminate request from a local sequencer
             /// @param request Empty for now
             /// @param response Empty for now

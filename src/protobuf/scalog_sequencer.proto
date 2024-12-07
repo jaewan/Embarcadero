@@ -4,6 +4,9 @@ service ScalogSequencer {
     // Receives a local cut from a local sequencer
     rpc HandleSendLocalCut(stream LocalCut) returns (stream GlobalCut);
 
+    /// Receives a register request from a local sequencer
+    rpc HandleRegisterBroker(RegisterBrokerRequest) returns (RegisterBrokerResponse);
+
     /// Receives a terminate request from a local sequencer
     rpc HandleTerminateGlobalSequencer(TerminateGlobalSequencerRequest) returns (TerminateGlobalSequencerResponse);
 }
@@ -20,6 +23,13 @@ message LocalCut {
 message GlobalCut {
     map<int64, int64> global_cut = 1;
 }
+
+message RegisterBrokerRequest {
+    int64 broker_id = 1;
+}
+
+// Empty
+message RegisterBrokerResponse {}
 
 // Empty request for now
 message TerminateGlobalSequencerRequest {}

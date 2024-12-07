@@ -431,6 +431,8 @@ void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
 }
 
 void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
+	LOG(INFO) << "Starting Scalog local sequencer";
+
 	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
 	int unique_port = SCALOG_SEQ_PORT;
 	std::string scalog_seq_address = scalog_global_sequencer_ip_ + ":" + std::to_string(unique_port);
@@ -450,6 +452,18 @@ ScalogLocalSequencer::ScalogLocalSequencer(CXLManager* cxl_manager, int broker_i
 
 	std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 	stub_ = ScalogSequencer::NewStub(channel);
+
+	// Register broker
+	RegisterBrokerRequest request;
+	request.set_broker_id(broker_id_);
+
+	RegisterBrokerResponse response;
+	grpc::ClientContext context;
+
+	grpc::Status status = stub_->HandleRegisterBroker(&context, request, &response);
+	if (!status.ok()) {
+		LOG(ERROR) << "Error registering local sequencer: " << status.error_message();
+	}
 }
 
 void ScalogLocalSequencer::TerminateGlobalSequencer() {

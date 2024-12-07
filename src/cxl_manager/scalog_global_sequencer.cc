@@ -5,8 +5,6 @@ ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
 
 	global_epoch_ = 0;
 
-	std::thread global_cut_thread(&ScalogGlobalSequencer::SendGlobalCut, this);
-
     grpc::ServerBuilder builder;
     builder.AddListeningPort(scalog_seq_address, grpc::InsecureServerCredentials());
     builder.RegisterService(this);
@@ -26,6 +24,24 @@ grpc::Status ScalogGlobalSequencer::HandleTerminateGlobalSequencer(grpc::ServerC
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 		scalog_server_->Shutdown();
 	}).detach();
+
+    return grpc::Status::OK;
+}
+
+grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* context,
+        const RegisterBrokerRequest* request, RegisterBrokerResponse* response) {
+
+	std::unique_lock<std::mutex> lock(mutex_);
+
+    int broker_id = request->broker_id();
+    {
+        absl::WriterMutexLock lock(&registered_brokers_mu_);
+        registered_brokers_.insert(broker_id);
+
+		if (registered_brokers_.size() == NUM_MAX_BROKERS) {
+			std::thread global_cut_thread(&ScalogGlobalSequencer::SendGlobalCut, this);
+		}
+    }
 
     return grpc::Status::OK;
 }
