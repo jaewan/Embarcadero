@@ -252,7 +252,6 @@ class Buffer{
 		Buffer(size_t num_buf, int client_id, size_t message_size, int order=0):
 			bufs_(num_buf), order_(order){
 				// 4K is a buffer space as message can go over
-				//size_t buf_size_ = (total_buf_size / num_buf) + 4096; 
 
 				header_.client_id = client_id;
 				header_.size = message_size;
@@ -275,6 +274,12 @@ class Buffer{
 		}
 
 		bool AddBuffers(size_t n, size_t buf_size){
+			size_t aligned_size = ((buf_size + 64 - 1) / 64) * 64;
+			const static size_t min_size = (1UL<<30);
+			if(min_size < aligned_size)
+				buf_size = aligned_size;
+			else
+				buf_size = min_size;
 			size_t idx = num_buf_.fetch_add(n);
 			if(idx + n > bufs_.size()){
 				LOG(ERROR) << "!!!! Buffer allocation OOM. Try increasing the num buffer !!!!";
@@ -289,6 +294,7 @@ class Buffer{
 				}
 				bufs_[idx + i].buffer = new_buffer;
 				bufs_[idx + i].len = allocated;
+				//bufs_[idx + i].limit = allocated;
 #ifdef BATCH_OPTIMIZATION
 				bufs_[idx + i].tail = sizeof(Embarcadero::BatchHeader);
 #endif
@@ -303,16 +309,13 @@ class Buffer{
 			void* buffer;
 			size_t head, tail;
 			{
-			while(!bufs_[write_buf_id_].mu.TryLock()){
-				write_buf_id_ = (write_buf_id_+1) % num_buf_;
-			}
 			size_t lockedIdx = write_buf_id_;
 			buffer = bufs_[write_buf_id_].buffer;;
 			head = bufs_[write_buf_id_].writer_head;
 			tail = bufs_[write_buf_id_].tail;
 			// Buffer Full, circle the buffer
 			if(tail + header_size + paddedSize + paddedSize/*buffer*/ > bufs_[lockedIdx].len){
-				VLOG(3) << "Buffer:" << write_buf_id_ << " full. Circle";
+				LOG(INFO) << "Buffer:" << write_buf_id_ << " full." << bufs_[write_buf_id_].len <<" Circle. This can be buggy as it does not check new head is read or not";
 				// Seal what is written now to move to next buffer
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[write_buf_id_].buffer + head);
 				batch_header->next_reader_head = 0;
@@ -325,7 +328,6 @@ class Buffer{
 				bufs_[write_buf_id_].tail = sizeof(Embarcadero::BatchHeader);
 
 				write_buf_id_ = (write_buf_id_+1) % num_buf_; 
-				bufs_[lockedIdx].mu.Unlock();
 				return Write(client_order, msg, len, paddedSize);;
 			}
 			bufs_[write_buf_id_].tail += paddedSize;
@@ -344,7 +346,6 @@ class Buffer{
 
 				write_buf_id_ = (write_buf_id_+1) % num_buf_; 
 			} 
-			bufs_[lockedIdx].mu.Unlock();
 			}
 
 			header_.paddedSize = paddedSize;
@@ -361,10 +362,24 @@ class Buffer{
 				bufs_[bufIdx].reader_head = batch_header->next_reader_head;
 				return (void*)batch_header;
 			}else{
+				if(!seal_from_read_){
+					bool seal_exist = true;
+					while(batch_header->total_size == 0 || batch_header->num_msg == 0){
+						if(seal_from_read_){
+							seal_exist = false;
+							break;
+						}else{
+							std::this_thread::yield();
+						}
+					}
+					if(seal_exist){
+						bufs_[bufIdx].reader_head = batch_header->next_reader_head;
+						return (void*)batch_header;
+					}
+				}
 				//Queue is empty
 				size_t head, tail, num_msg, batch_seq;
 				{
-				absl::MutexLock lock(&bufs_[bufIdx].mu);
 				if(batch_header->batch_seq != 0 && batch_header->total_size != 0 && batch_header->num_msg != 0){
 					bufs_[bufIdx].reader_head = batch_header->next_reader_head;
 					return (void*)batch_header;
@@ -386,6 +401,7 @@ class Buffer{
 				batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
 				batch_header->num_msg = num_msg;
 				batch_header->next_reader_head = tail;
+				VLOG(3) << "[DEBUG] buf:" << bufIdx << " sealing num_msg:" << batch_header->num_msg;
 				return (void*)batch_header;
 			}
 		}
@@ -438,16 +454,23 @@ class Buffer{
 			shutdown_ = true;
 		}
 
+		void WriteFinished(){
+			seal_from_read_ = true;
+		}
+
 	private:
 		struct alignas(64) Buf{
+			// Static
 			void* buffer;
 			size_t len;
+			// Writer modify
 			size_t writer_head;
-			size_t reader_head;
 			size_t tail;
 			size_t num_msg;
-			absl::Mutex mu;
-			Buf() : writer_head(0),reader_head(0), tail(0), num_msg(0){}
+			// Reader modify
+			size_t reader_head;
+			//size_t limit;
+			Buf() : writer_head(0), tail(0), num_msg(0),reader_head(0){}
 		};
 		size_t write_buf_id_ = 0;
 		std::vector<Buf> bufs_;
@@ -455,6 +478,7 @@ class Buffer{
 		std::atomic<size_t> num_buf_{0};
 		std::atomic<size_t> batch_seq_{0};
 		bool shutdown_ {false};
+		bool seal_from_read_ {false};
 		Embarcadero::MessageHeader header_;
 		absl::flat_hash_set<size_t> full_idx_;
 };
@@ -567,6 +591,7 @@ class Publisher{
 		}
 
 		void DEBUG_check_send_finish(){
+			WriteFinished();
 			publish_finished_ = true;
 			pubQue_.ReturnReads();
 			for(auto &t : threads_){
@@ -622,7 +647,9 @@ class Publisher{
 				kill_brokers_thread_.join();
 			});
 		}
-
+		void WriteFinished(){
+			pubQue_.WriteFinished();
+		}
 
 	private:
 		std::string head_addr_;
@@ -842,6 +869,48 @@ class Publisher{
 			return;
 		}
 
+							/*
+		void HandleErrorQueue(){
+			if (events[i].events & EPOLLERR) {
+				// Check for zero-copy completions
+				struct msghdr msg = {};
+				char control[CMSG_SPACE(sizeof(struct sock_extended_err))];
+				struct iovec iov = {};
+				char data[1];  // Dummy buffer for payload
+				iov.iov_base = data;
+				iov.iov_len = sizeof(data);
+				msg.msg_iov = &iov;
+				msg.msg_iovlen = 1;
+				msg.msg_control = control;
+				msg.msg_controllen = sizeof(control);
+
+				while (true) {
+					int res = recvmsg(sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+					if (res < 0) {
+						if (errno == EAGAIN || errno == EWOULDBLOCK) {
+							// No messages in the error queue;no zero-copy completion yet
+							break;
+						}
+					LOG(ERROR) << "recvmsg failed: " << strerror(errno);
+					can_send = true;
+					break;
+				}
+					struct cmsghdr *cmsg;
+					for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+						if (cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_RECVERR) {
+							struct sock_extended_err *serr = (struct sock_extended_err *)CMSG_DATA(cmsg);
+								if (serr->ee_origin == SO_EE_ORIGIN_ZEROCOPY) {
+									VLOG(3) << "Zero-copy completion for " << serr->ee_info << " bytes";
+								} else {
+									has_error = true;
+								}
+						}
+					}
+				}
+			}
+		}
+							*/
+
 		void PublishThread(int broker_id, int pubQuesIdx){
 			int sock = -1;
 			int efd = -1;
@@ -988,13 +1057,11 @@ class Publisher{
 					size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
 					// First attempts to send messages for efficiency. 
 					// epoll_wait at failure where there's not enough buffer space
-					/*
-					if(to_send < 1UL<<16)
+					if(to_send < 1UL<<16){
 						bytesSent = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
-					else
+					}else{
 						bytesSent = send(sock, (uint8_t*)msg + sent_bytes, to_send, MSG_ZEROCOPY);
-						*/
-						bytesSent = send(sock, (uint8_t*)msg + sent_bytes, to_send, 0);
+					}
 
 					if (bytesSent > 0) {
 						sent_bytes_per_broker_[broker_id].fetch_add(bytesSent);
@@ -1003,7 +1070,7 @@ class Publisher{
 						zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
 					} else if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
 						struct epoll_event events[10];
-						int n = epoll_wait(efd, events, 10, -1);
+						int n = epoll_wait(efd, events, 10, 1000);
 						if (n == -1) {
 							LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
 							exit(1);
@@ -1012,8 +1079,9 @@ class Publisher{
 							if (events[i].events & EPOLLOUT) {
 								break;
 							}
+							// TODO(Circular Buffer) check if zerocopy is finished. Check MSG_ERRQUEUE here HandleErrorQueue();
 						}
-						zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL<<6); // Cap backoff at 1000ms
+						zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL<<6); // Cap backoff 
 					} else if (bytesSent < 0) {
 						int brokerId;
 						{
@@ -1033,13 +1101,11 @@ class Publisher{
 						send_batch_header();
 						sent_bytes = 0;
 
-						VLOG(3)  << "pubQuesIdx:" << pubQuesIdx << " to broker:" << broker_id << " detected failure. Redirect to :" << brokerId;
+						LOG(INFO)  << "pubQuesIdx:" << pubQuesIdx << " to broker:" << broker_id << " detected failure. Redirect to :" << brokerId;
 						broker_id = brokerId;
 					}
 				}
-#ifdef BATCH_OPTIMIZATION
-				memset(batch_header,0, batch_header->total_size + sizeof(Embarcadero::BatchHeader));
-#endif
+				//TODO (Circular Buffer) check if kernel has reported sucessful zerocopy here 
 
 				// Update here for fault tolerance.
 				// At broker failure, we should send the same batch to another broker
@@ -1501,7 +1567,7 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 		" message_size:" << message_size << " failure percentage:" << failure_percentage;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 
-	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 4096;
+	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 2097152;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order);
@@ -1539,8 +1605,8 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		" num_threads_per_broker:" << num_threads_per_broker;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 
-	// + 4096 as buffer
-	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 4096;
+	// + 2097152 as buffer
+	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 2097152;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order, seq_type);
@@ -1602,7 +1668,7 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		" num_threads_per_broker:" << num_threads_per_broker;
 	char* message = (char*)malloc(sizeof(char)*message_size);
 
-	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 4096;
+	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 2097152;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order, seq_type);
@@ -1653,7 +1719,7 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads_per_broker:" << num_threads_per_broker;
 	char message[message_size];
 
-	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 4096;
+	size_t q_size = total_message_size + (total_message_size/message_size)*64 + 2097152;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), num_threads_per_broker, message_size, q_size, order, seq_type);
 	Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
@@ -1847,7 +1913,7 @@ int main(int argc, char* argv[]) {
 		("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
 		("num_brokers_to_kill", "Number of brokers to kill during execution", cxxopts::value<int>()->default_value("0"))
 		("failure_percentage", "When to fail brokers, after what percentages of messages sent", cxxopts::value<double>()->default_value("0"))
-		("n,num_threads_per_broker", "Number of request threads_per_broker", cxxopts::value<size_t>()->default_value("4"));
+		("n,num_threads_per_broker", "Number of request threads_per_broker", cxxopts::value<size_t>()->default_value("3"));
 
 	auto result = options.parse(argc, argv);
 	size_t message_size = result["size"].as<size_t>();
