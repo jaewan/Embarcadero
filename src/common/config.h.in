@@ -15,22 +15,23 @@ namespace Embarcadero{
 #cmakedefine01 __INTEL__
 #cmakedefine01 __AMD__
 
-#define ORDER_LEVEL 1
 #define PORT 1214
 #define BROKER_PORT 12140
-#define SCALOG_SEQ_PORT 50051
+#define HEARTBEAT_INTERVAL 3 // in seconds
+#define TOPIC_NAME_SIZE 31
+#define CGROUP_CORE 85
+
 #define NUM_MAX_BROKERS 4
 #define CXL_SIZE (1UL<<35)
 #define CXL_EMUL_SIZE (1UL<<35)
 #define MAX_TOPIC_SIZE 32
-#define TOPIC_NAME_SIZE 31
 #define SEGMENT_SIZE (1UL << 34)
+
 #define NUM_DISK_IO_THREADS 1 
 #define NUM_NETWORK_IO_THREADS 8 
 #define NUM_SUB_CONNECTIONS 4
 #define ZERO_COPY_SEND_LIMIT 1UL<<23
-#define MAX_MSG_SIZE 1UL << 20
-#define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
+
 #define BATCH_SIZE (1UL<<19)
 //#define BATCH_SIZE  786432   
 //#define BATCH_SIZE  589824
@@ -39,25 +40,12 @@ namespace Embarcadero{
 //#define BATCH_SIZE 524800
 //#define BATCH_SIZE 1048640
 
-
-//********* Health check configs *********
-#define HEARTBEAT_INTERVAL 3 // in seconds
-/// The delay to send the first health check
-#define HEALTH_CHECK_INITIAL_DELAY_MS 5000
-/// The interval between two health checks
-#define HEALTH_CHECK_PERIOD_MS 3000
-/// The timeout for a health check.
-#define HEALTH_CHECK_TIMEOUT_MS 10000
-/// The threshold for the amount of retries we do before we consider a node dead.
-#define HEALTH_CHECK_FAILURE_THRESHOLD 5
-
 //********* Corfu configs *********
 #define CORFU_SEQ_PORT 50052
 
 //********* Scalog configs *********
 #define SCALOG_SEQ_PORT 50051
-
-#define CGROUP_CORE 85
+#define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
 	
 using CreateTopicEntryCallback = std::function<bool(char*, int, int, bool, heartbeat_system::SequencerType)>;
 using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers, 
