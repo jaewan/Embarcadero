@@ -62,8 +62,14 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 			}
 
 			for (auto local_sequencer : local_sequencers_) {
-				if (!local_sequencer->Write(global_cut)) {
-					std::cerr << "Error writing GlobalCut to the client" << std::endl;
+				auto& stream = std::get<0>(local_sequencer);
+				auto& stream_lock = std::get<1>(local_sequencer);
+
+				{
+					absl::MutexLock lock(stream_lock.get());
+					if (!stream->Write(global_cut)) {
+						std::cerr << "Error writing GlobalCut to the client" << std::endl;
+					}
 				}
 			}
 		}
@@ -76,12 +82,18 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 grpc::Status ScalogGlobalSequencer::HandleSendLocalCut(grpc::ServerContext* context,
 		grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream) {
 
+    // Create a lock associated with the stream
+    auto stream_lock = std::make_shared<absl::Mutex>();
+
+    auto shared_stream = std::shared_ptr<grpc::ServerReaderWriter<GlobalCut, LocalCut>>(stream);
+
 	{
 		absl::MutexLock lock(&stream_mu_);
-		local_sequencers_.push_back(std::shared_ptr<grpc::ServerReaderWriter<GlobalCut, LocalCut>>(stream));
+        // Push a tuple containing the stream and its lock into local_sequencers_
+        local_sequencers_.emplace_back(shared_stream, stream_lock);
 	}
 
-    std::thread receive_global_cut(&ScalogGlobalSequencer::ReceiveLocalCut, this, std::ref(stream));
+    std::thread receive_global_cut(&ScalogGlobalSequencer::ReceiveLocalCut, this, std::ref(stream), stream_lock);
 
 	// Keep the stream open and active for the client (blocking call)
 	while (true) {
@@ -95,25 +107,28 @@ grpc::Status ScalogGlobalSequencer::HandleSendLocalCut(grpc::ServerContext* cont
 	stop_reading_from_stream_ = true;
 }
 
-void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream) {
+void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream, std::shared_ptr<absl::Mutex> stream_lock) {
 	while (!stop_reading_from_stream_) {
 		LocalCut request;
-		if (stream->Read(&request)) {
-			static char topic[TOPIC_NAME_SIZE];
-			memcpy(topic, request.topic().c_str(), request.topic().size());
-			int epoch = request.epoch();
-			int local_cut = request.local_cut();
-			int broker_id = request.broker_id();
+		{
+			absl::MutexLock lock(stream_lock.get());
+			if (stream->Read(&request)) {
+				static char topic[TOPIC_NAME_SIZE];
+				memcpy(topic, request.topic().c_str(), request.topic().size());
+				int epoch = request.epoch();
+				int local_cut = request.local_cut();
+				int broker_id = request.broker_id();
 
-			{
-				absl::WriterMutexLock lock(&global_cut_mu_);
-				if (epoch == 0) {
-					global_cut_[broker_id] = local_cut + 1;
-					logical_offsets_[broker_id] = local_cut;
-					last_sent_global_cut_[broker_id] = -1;
-				} else {
-					global_cut_[broker_id] = local_cut - last_sent_global_cut_[broker_id];
-					logical_offsets_[broker_id] = local_cut;			
+				{
+					absl::WriterMutexLock lock(&global_cut_mu_);
+					if (epoch == 0) {
+						global_cut_[broker_id] = local_cut + 1;
+						logical_offsets_[broker_id] = local_cut;
+						last_sent_global_cut_[broker_id] = -1;
+					} else {
+						global_cut_[broker_id] = local_cut - last_sent_global_cut_[broker_id];
+						logical_offsets_[broker_id] = local_cut;			
+					}
 				}
 			}
 		}

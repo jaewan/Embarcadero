@@ -200,6 +200,9 @@ class ScalogLocalSequencer {
 
 		/// Flag to indicate if we should stop reading from the stream
 		bool stop_reading_from_stream_ = false;
+
+		/// Lock for streams
+		absl::Mutex stream_mu_;
 };
 
 } // End of namespace Embarcadero
