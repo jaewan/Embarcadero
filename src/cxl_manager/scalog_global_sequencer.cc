@@ -40,6 +40,7 @@ grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* co
 
 		if (registered_brokers_.size() == NUM_MAX_BROKERS) {
 			std::thread global_cut_thread(&ScalogGlobalSequencer::SendGlobalCut, this);
+			global_cut_thread.detach();
 		}
     }
 

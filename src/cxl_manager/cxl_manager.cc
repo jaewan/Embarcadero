@@ -500,11 +500,8 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 		request.set_epoch(local_epoch_);
 
 		// Send the LocalCut message to the server
-		{
-			absl::MutexLock lock(&stream_mu_);
-			if (!stream->Write(request)) {
-				std::cerr << "Error writing LocalCut to the server" << std::endl;
-			}
+		if (!stream->Write(request)) {
+			std::cerr << "Error writing LocalCut to the server" << std::endl;
 		}
 
 		// Increment the epoch
@@ -513,8 +510,6 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 		// Sleep until interval passes to send next local cut
 		std::this_thread::sleep_for(local_cut_interval_);
 	}
-
-	LOG(INFO) << "Local epoch " << local_epoch_ << " has been reached. Terminating global sequencer.";
 
 	stream->WritesDone();
 	stop_reading_from_stream_ = true;
@@ -528,22 +523,17 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 	int num_global_cuts = 0;
 	while (!stop_reading_from_stream_) {
 		GlobalCut global_cut;
-		{
-			absl::MutexLock lock(&stream_mu_);
-			if (stream->Read(&global_cut)) {
-				// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
-				for (const auto& entry : global_cut.global_cut()) {
-					global_cut_[static_cast<int>(entry.first)] = static_cast<int>(entry.second);
-				}
-
-				this->cxl_manager_->ScalogSequencer(topic, global_cut_);
-
-				num_global_cuts++;
+		if (stream->Read(&global_cut)) {
+			// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
+			for (const auto& entry : global_cut.global_cut()) {
+				global_cut_[static_cast<int>(entry.first)] = static_cast<int>(entry.second);
 			}
+
+			this->cxl_manager_->ScalogSequencer(topic, global_cut_);
+
+			num_global_cuts++;
 		}
 	}
-
-	LOG(INFO) << "Received " << num_global_cuts << " global cuts";
 
     // grpc::Status status = stream->Finish();
 }
