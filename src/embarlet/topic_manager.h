@@ -50,6 +50,7 @@ class Topic{
 		std::function<void(void*, size_t)> KafkaGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
 		std::function<void(void*, size_t)> CorfuGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
 		std::function<void(void*, size_t)> Order3GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> Order4GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
 		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
@@ -65,8 +66,10 @@ class Topic{
 		size_t written_logical_offset_;
 		void* written_physical_addr_;
 		std::atomic<unsigned long long int> log_addr_;
+		std::atomic<unsigned long long int> batch_headers_;
 		//TODO(Jae) set this to nullptr if the sement is GCed
 		void* first_message_addr_;
+		void* first_batch_headers_addr_;
 		absl::flat_hash_map<size_t, absl::flat_hash_map<size_t, void*>> skipped_batch_ ABSL_GUARDED_BY(mutex_);
 		absl::flat_hash_map<size_t, size_t> order3_client_batch_ ABSL_GUARDED_BY(mutex_);
 		absl::Mutex mutex_;

@@ -99,12 +99,15 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
 	TINode_Region_size += padding;
 	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
-	size_t Segment_Region_size = (cxl_size_ - TINode_Region_size - Bitmap_Region_size)/NUM_MAX_BROKERS;
+	size_t BatchHeaders_Region_size = NUM_MAX_BROKERS * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+	size_t Segment_Region_size = (cxl_size_ - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size)/NUM_MAX_BROKERS;
 	padding = Segment_Region_size%cacheline_size;
 	Segment_Region_size -= padding;
 
 	bitmap_ = (uint8_t*)cxl_addr_ + TINode_Region_size;
-	segments_ = (uint8_t*)bitmap_ + Bitmap_Region_size + ((broker_id_)*Segment_Region_size);
+	batchHeaders_ = (uint8_t*)bitmap_ + Bitmap_Region_size;
+	segments_ = (uint8_t*)batchHeaders_ + BatchHeaders_Region_size + ((broker_id_)*Segment_Region_size);
+	batchHeaders_ = (uint8_t*)batchHeaders_ + (broker_id_ * (BATCHHEADERS_SIZE * MAX_TOPIC_SIZE));
 
 
 	VLOG(3) << "\t[CXLManager]: \t\tConstructed";
@@ -163,8 +166,16 @@ TInode* CXLManager::GetReplicaTInode(const char* topic){
 
 void* CXLManager::GetNewSegment(){
 	//TODO(Jae) Implement bitmap
-	std::atomic<int> segment_count{0};
-	int offset = segment_count.fetch_add(1, std::memory_order_relaxed);
+	std::atomic<size_t> segment_count{0};
+	size_t offset = segment_count.fetch_add(1, std::memory_order_relaxed);
+
+	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
+}
+
+void* CXLManager::GetNewBatchHeaderLog(){
+	std::atomic<size_t> batch_header_log_count{0};
+	CHECK_LT(batch_header_log_count, MAX_TOPIC_SIZE) << "You are creating too many topics";
+	size_t offset = batch_header_log_count.fetch_add(1, std::memory_order_relaxed);
 
 	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
 }
@@ -189,6 +200,8 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic_arr);
 			else if (order == 3)
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer3, this, topic_arr);
+			else if (order == 4)
+				sequencerThreads_.emplace_back(&CXLManager::Sequencer4, this, topic_arr);
 			break;
 		case SCALOG:
 			if (order == 1){
@@ -415,6 +428,48 @@ void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
 				}
 			}
 			batch_seq++;
+		}
+		/*
+		if(yield){
+			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+			last_updated = std::chrono::steady_clock::now();
+			std::this_thread::yield();
+		}else if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()
+					- last_updated).count() >= HEARTBEAT_INTERVAL){
+			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+			last_updated = std::chrono::steady_clock::now();
+		}
+	*/
+	}
+}
+
+void CXLManager::Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic){
+	struct TInode *tinode = GetTInode(topic.data());
+	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
+	absl::btree_set<int> registered_brokers;
+	static size_t seq = 0;
+
+	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+	//auto last_updated = std::chrono::steady_clock::now();
+
+	while(!stop_threads_){
+		//bool yield = true;
+		for(auto broker : registered_brokers){
+			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
+			size_t written = tinode->offsets[broker].written;
+			if(written == (size_t)-1){
+				continue;
+			}
+			while(!stop_threads_ && msg_logical_off <= written && msg_to_order[broker]->next_msg_diff != 0 
+						&& msg_to_order[broker]->logical_offset != (size_t)-1){
+				msg_to_order[broker]->total_order = seq;
+				seq++;
+				//std::atomic_thread_fence(std::memory_order_release);
+				UpdateTinodeOrder(topic.data(), tinode, broker , msg_logical_off, (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_);
+				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
+				msg_logical_off++;
+				//yield = false;
+			}
 		}
 		/*
 		if(yield){

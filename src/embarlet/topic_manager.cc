@@ -61,15 +61,18 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
 	void* segment_metadata = cxl_manager_.GetNewSegment();
+	void* batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
 	if(tinode->replicate_tinode){
 		replica_tinode = cxl_manager_.GetReplicaTInode(topic);
 		replica_tinode->offsets[broker_id_].ordered = -1;
 		replica_tinode->offsets[broker_id_].written = -1;
 		replica_tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
+		replica_tinode->offsets[broker_id_].batch_headers_offset = (size_t)((uint8_t*)batch_headers_region - (uint8_t*)cxl_addr);
 	}
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
+	tinode->offsets[broker_id_].batch_headers_offset = (size_t)((uint8_t*)batch_headers_region - (uint8_t*)cxl_addr);
 
 /*
 #ifdef __INTEL__
@@ -119,9 +122,11 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 	}
 	static void* cxl_addr = cxl_manager_.GetCXLAddr();
 	void* segment_metadata = cxl_manager_.GetNewSegment();
+	void* batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
 	tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
+	tinode->offsets[broker_id_].batch_headers_offset = (size_t)((uint8_t*)batch_headers_region - (uint8_t*)cxl_addr);
 	tinode->order = order;
 	tinode->replication_factor = replication_factor;
 	tinode->replicate_tinode = replicate_tinode;
@@ -145,6 +150,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 		replica_tinode->offsets[broker_id_].ordered = -1;
 		replica_tinode->offsets[broker_id_].written = -1;
 		replica_tinode->offsets[broker_id_].log_offset = (size_t)((uint8_t*)segment_metadata + CACHELINE_SIZE - (uint8_t*)cxl_addr);
+		replica_tinode->offsets[broker_id_].batch_headers_offset = (size_t)((uint8_t*)batch_headers_region - (uint8_t*)cxl_addr);
 		replica_tinode->order = order;
 		replica_tinode->replication_factor = replication_factor;
 		replica_tinode->replicate_tinode = replicate_tinode;
@@ -233,7 +239,9 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, TInode* r
 		written_logical_offset_((size_t)-1),
 		current_segment_(segment_metadata){
 	log_addr_.store((unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset));
+	batch_headers_ = (unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].batch_headers_offset);
 	first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
+	first_batch_headers_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].batch_headers_offset;
 	ordered_offset_addr_ = nullptr;
 	ordered_offset_ = 0;
 	if(seq_type == KAFKA){
@@ -243,6 +251,8 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, TInode* r
 	}else{
 		if(order_ == 3){
 			GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
+		}else if (order_ == 4){
+			GetCXLBufferFunc = &Topic::Order4GetCXLBuffer;
 		}else{
 			GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
 		}
@@ -398,7 +408,7 @@ std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(BatchHeader &batch_
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = batch_header.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));
@@ -414,6 +424,31 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &b
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
+	return nullptr;
+}
+
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
+	size_t msgSize = batch_header.total_size;
+	void *batch_headers_log;
+	{
+	absl::MutexLock lock(&mutex_);
+	log = (void*)(log_addr_.fetch_add(msgSize));
+	batch_headers_log = (void*)(batch_headers_.fetch_add(sizeof(BatchHeader)));
+	}
+	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+		//TODO(Jae) Finish below segment boundary crossing code
+		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
+			// Allocate a new segment
+			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}else{
+			// Wait for the first thread that crossed the segment to allocate a new segment
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}
+	}
+	memcpy(batch_headers_log, &batch_header, sizeof(BatchHeader));
 	return nullptr;
 }
 
