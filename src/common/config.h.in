@@ -26,6 +26,7 @@ namespace Embarcadero{
 #define CXL_EMUL_SIZE (1UL<<35)
 #define MAX_TOPIC_SIZE 32
 #define SEGMENT_SIZE (1UL << 34)
+#define BATCHHEADERS_SIZE (1UL << 16)
 
 #define NUM_DISK_IO_THREADS 1 
 #define NUM_NETWORK_IO_THREADS 8 
