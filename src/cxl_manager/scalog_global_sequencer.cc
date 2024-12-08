@@ -3,7 +3,7 @@
 ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
 	LOG(INFO) << "Starting Scalog global sequencer";
 
-	global_epoch_ = 0;
+	global_epoch_ = 1;
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(scalog_seq_address, grpc::InsecureServerCredentials());
@@ -54,17 +54,23 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 			absl::MutexLock lock(&stream_mu_);
 			/// Convert global_cut_ to google::protobuf::Map<int64_t, int64_t>
 			{
-				absl::ReaderMutexLock lock(&global_cut_mu_);
-				for (const auto& entry : global_cut_) {
+				absl::WriterMutexLock lock(&global_cut_mu_);
+				for (const auto& entry : global_cut_[global_epoch_]) {
 					global_cut.mutable_global_cut()->insert({entry.first, entry.second});
 				}
+				auto it = global_cut_.find(global_epoch_ - 2);
+				if (it != global_cut_.end()) {
+					// The element exists, so delete it
+					global_cut_.erase(global_epoch_ - 2);
+					logical_offsets_.erase(global_epoch_ - 2);
+				}
+
+				global_epoch_++;
 			}
 
 			for (auto local_sequencer : local_sequencers_) {
-				if (local_sequencer) {
-					if (!local_sequencer->Write(global_cut)) {
-						std::cerr << "Error writing GlobalCut to the client" << std::endl;
-					}
+				if (!local_sequencer->Write(global_cut)) {
+					std::cerr << "Error writing GlobalCut to the client" << std::endl;
 				}
 			}
 		}
@@ -109,11 +115,11 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
 				if (epoch == 0) {
-					global_cut_[broker_id] = local_cut + 1;
-					logical_offsets_[broker_id] = local_cut;
+					global_cut_[global_epoch_][broker_id] = local_cut + 1;
+					logical_offsets_[global_epoch_][broker_id] = local_cut;
 				} else {
-					global_cut_[broker_id] = local_cut - logical_offsets_[broker_id];
-					logical_offsets_[broker_id] = local_cut;			
+					global_cut_[global_epoch_][broker_id] = local_cut - logical_offsets_[global_epoch_ - 1][broker_id];
+					logical_offsets_[global_epoch_][broker_id] = local_cut;			
 				}
 			}
 		}
