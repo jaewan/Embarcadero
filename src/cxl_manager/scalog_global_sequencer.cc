@@ -1,7 +1,7 @@
 #include "scalog_global_sequencer.h"
 
 ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
-	LOG(INFO) << "Starting Scalog global sequencer";
+	LOG(INFO) << "Starting Scalog global sequencer with interval: " << SCALOG_SEQ_LOCAL_CUT_INTERVAL;
 
 	global_epoch_ = 0;
 

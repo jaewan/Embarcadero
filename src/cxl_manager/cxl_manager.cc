@@ -489,6 +489,8 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 	// Spawn a thread to receive global cuts, passing the stream by reference
     std::thread receive_global_cut(&ScalogLocalSequencer::ReceiveGlobalCut, this, std::ref(stream), topic_str);
 
+	LOG(INFO) << "Running scalog local sequencer with interval " << SCALOG_SEQ_LOCAL_CUT_INTERVAL;
+
 	while (!cxl_manager_->GetStopThreads()) {
 		/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
 		int local_cut = tinode->offsets[broker_id_].written;
@@ -502,6 +504,8 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 		// Send the LocalCut message to the server
 		if (!stream->Write(request)) {
 			std::cerr << "Error writing LocalCut to the server" << std::endl;
+
+			break;
 		}
 
 		// Increment the epoch
