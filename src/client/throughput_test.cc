@@ -249,8 +249,8 @@ bool CheckAvailableCores(){
 }
 class Buffer{
 	public:
-		Buffer(size_t num_buf, int client_id, size_t message_size, int order=0):
-			bufs_(num_buf), order_(order){
+		Buffer(size_t num_buf, size_t num_threads_per_broker, int client_id, size_t message_size, int order=0):
+			bufs_(num_buf), num_threads_per_broker_(num_threads_per_broker), order_(order){
 				// 4K is a buffer space as message can go over
 
 				header_.client_id = client_id;
@@ -273,20 +273,20 @@ class Buffer{
 			}
 		}
 
-		bool AddBuffers(size_t n, size_t buf_size){
+		bool AddBuffers(size_t buf_size){
 			size_t aligned_size = ((buf_size + 64 - 1) / 64) * 64;
 			const static size_t min_size = (1UL<<30);
 			if(min_size < aligned_size)
 				buf_size = aligned_size;
 			else
 				buf_size = min_size;
-			size_t idx = num_buf_.fetch_add(n);
-			if(idx + n > bufs_.size()){
+			size_t idx = num_buf_.fetch_add(num_threads_per_broker_);
+			if(idx + num_threads_per_broker_ > bufs_.size()){
 				LOG(ERROR) << "!!!! Buffer allocation OOM. Try increasing the num buffer !!!!";
 				return false;
 			}
 
-			for (size_t i = 0; i < n; i++) {
+			for (size_t i = 0; i < num_threads_per_broker_ ; i++) {
 				size_t allocated;
 				void* new_buffer = mmap_large_buffer(buf_size, allocated);
 				if (new_buffer == nullptr) {
@@ -300,6 +300,17 @@ class Buffer{
 #endif
 			}
 			return true;
+		}
+
+		void AdvanceWriteBufId(){
+			static size_t i = 0; // Num of brokers =  num_buf_ / num_threads_per_broker_
+			static size_t j = 0; // num_threads_per_broker_
+			size_t num_broker = num_buf_/num_threads_per_broker_;
+			i = (i+1)%num_broker;;
+			if( i == 0){
+				j = (j+1)%num_threads_per_broker_;
+			}
+			write_buf_id_ = i * num_threads_per_broker_ + j;
 		}
 
 #ifdef BATCH_OPTIMIZATION
@@ -327,7 +338,7 @@ class Buffer{
 				bufs_[write_buf_id_].writer_head = 0;
 				bufs_[write_buf_id_].tail = sizeof(Embarcadero::BatchHeader);
 
-				write_buf_id_ = (write_buf_id_+1) % num_buf_; 
+				AdvanceWriteBufId();
 				return Write(client_order, msg, len, paddedSize);;
 			}
 			bufs_[write_buf_id_].tail += paddedSize;
@@ -344,7 +355,7 @@ class Buffer{
 				bufs_[write_buf_id_].writer_head = bufs_[write_buf_id_].tail;
 				bufs_[write_buf_id_].tail += sizeof(Embarcadero::BatchHeader);
 
-				write_buf_id_ = (write_buf_id_+1) % num_buf_; 
+				AdvanceWriteBufId();
 			} 
 			}
 
@@ -472,15 +483,16 @@ class Buffer{
 			//size_t limit;
 			Buf() : writer_head(0), tail(0), num_msg(0),reader_head(0){}
 		};
-		size_t write_buf_id_ = 0;
 		std::vector<Buf> bufs_;
+		size_t num_threads_per_broker_;
 		int order_;
+
+		size_t write_buf_id_ = 0;
 		std::atomic<size_t> num_buf_{0};
 		std::atomic<size_t> batch_seq_{0};
 		bool shutdown_ {false};
 		bool seal_from_read_ {false};
 		Embarcadero::MessageHeader header_;
-		absl::flat_hash_set<size_t> full_idx_;
 };
 
 class Publisher{
@@ -491,7 +503,7 @@ class Publisher{
 			head_addr_(head_addr), port_(port),
 			client_id_(GenerateRandomNum()), num_threads_per_broker_(num_threads_per_broker), message_size_(message_size),
 			queueSize_(queueSize / num_threads_per_broker),
-			pubQue_(num_threads_per_broker_*NUM_MAX_BROKERS, client_id_, message_size, order),
+			pubQue_(num_threads_per_broker_*NUM_MAX_BROKERS, num_threads_per_broker_, client_id_, message_size, order),
 			seq_type_(seq_type),
 			sent_bytes_per_broker_(NUM_MAX_BROKERS){
 				memcpy(topic_, topic, TOPIC_NAME_SIZE);
@@ -541,9 +553,8 @@ class Publisher{
 				std::this_thread::yield();
 			}
 			if(seq_type_ == heartbeat_system::SequencerType::CORFU){
-			corfu_client_ = std::make_unique<CorfuSequencerClient>(
-                //std::string("localhost:") + std::to_string(CORFU_SEQ_PORT));
-                std::string("192.168.60.173:") + std::to_string(CORFU_SEQ_PORT));
+				corfu_client_ = std::make_unique<CorfuSequencerClient>(
+						std::string("192.168.60.173:") + std::to_string(CORFU_SEQ_PORT));
 			}
 			while(thread_count_.load() != num_threads_.load()){std::this_thread::yield();}
 			return;
@@ -1017,13 +1028,24 @@ class Publisher{
 							header->total_order = total_order++;
 						}
 					}
-					bytesSent = send(sock, (uint8_t*)(batch_header), sizeof(Embarcadero::BatchHeader), 0);
-					while(bytesSent < (ssize_t)sizeof(Embarcadero::BatchHeader)){
-						if(bytesSent < 0 ){
-							LOG(ERROR) << "Batch send failed!! " << strerror(errno);
-							return;
+					size_t total_sent = 0;
+					while(total_sent < sizeof(Embarcadero::BatchHeader)){
+						bytesSent = send(sock, (uint8_t*)(batch_header) + total_sent, sizeof(Embarcadero::BatchHeader) - total_sent, 0);
+						if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+							struct epoll_event events[10];
+							int n = epoll_wait(efd, events, 10, 1000);
+							if (n == -1) {
+								LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
+								exit(1);
+							}
+							for (int i = 0; i < n; i++) {
+								if (events[i].events & EPOLLOUT) {
+									break;
+								}
+							}
+						}else{
+							total_sent += bytesSent;
 						}
-						bytesSent += send(sock, (uint8_t*)(batch_header) + bytesSent, sizeof(Embarcadero::BatchHeader) - bytesSent, 0);
 					}
 				};
 #else
@@ -1203,7 +1225,7 @@ class Publisher{
 		}
 
 	bool AddPublisherThreads(size_t num_threads, int broker_id){
-		if(pubQue_.AddBuffers(num_threads_per_broker_, queueSize_)){
+		if(pubQue_.AddBuffers(queueSize_)){
 			for (size_t i=0; i < num_threads; i++){
 				int n = num_threads_.fetch_add(1);
 				threads_.emplace_back(&Publisher::PublishThread, this, broker_id, n);
