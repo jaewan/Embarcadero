@@ -447,43 +447,151 @@ void CXLManager::Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic){
 	struct TInode *tinode = GetTInode(topic.data());
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
-	static size_t seq = 0;
+	size_t seq = 0;
+	absl::flat_hash_map <size_t, size_t> batch_seq_per_client;
+	absl::Mutex mutex;
 
 	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-	//auto last_updated = std::chrono::steady_clock::now();
 
-	while(!stop_threads_){
-		//bool yield = true;
-		for(auto broker : registered_brokers){
-			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
-			size_t written = tinode->offsets[broker].written;
-			if(written == (size_t)-1){
-				continue;
-			}
-			while(!stop_threads_ && msg_logical_off <= written && msg_to_order[broker]->next_msg_diff != 0 
-						&& msg_to_order[broker]->logical_offset != (size_t)-1){
-				msg_to_order[broker]->total_order = seq;
-				seq++;
-				//std::atomic_thread_fence(std::memory_order_release);
-				UpdateTinodeOrder(topic.data(), tinode, broker , msg_logical_off, (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_);
-				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
-				msg_logical_off++;
-				//yield = false;
-			}
-		}
-		/*
-		if(yield){
-			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-			last_updated = std::chrono::steady_clock::now();
+	for (auto broker : registered_brokers) {
+    if (broker != broker_id_) {
+			sequencer4_threads_.emplace_back(
+				&CXLManager::Sequencer4Worker,
+				this,
+				topic,
+				broker,
+				msg_to_order[broker],
+				&mutex,
+				std::ref(seq),                 // Pass reference safely
+				std::ref(batch_seq_per_client) // Pass reference safely
+			);
+    }
+	}
+
+	Sequencer4Worker(topic, broker_id_, msg_to_order[broker_id_], &mutex, seq, batch_seq_per_client);
+
+	for(auto &t : sequencer4_threads_){
+		while(!t.joinable()){
 			std::this_thread::yield();
-		}else if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()
-					- last_updated).count() >= HEARTBEAT_INTERVAL){
-			GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-			last_updated = std::chrono::steady_clock::now();
 		}
-	*/
+		t.join();
 	}
 }
+
+// This does not work with multi-segments as it advances to next messaeg with message's size
+void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int broker, MessageHeader* msg_to_order,
+						absl::Mutex* mutex, size_t &seq, absl::flat_hash_map<size_t, size_t> &batch_seq) {
+	struct TInode *tinode = GetTInode(topic.data());
+	absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>> skipped_batches; // client_id, <batch_seq, *msg>
+	BatchHeader* batch_header = ((BatchHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker].batch_headers_offset));
+	size_t tracker_idx = 0;
+	std::vector<unsigned int64_t> location_tracker; 
+	location_tracker.emplace_back(0);
+
+	auto assign_total_order = [&](BatchHeader* batch_to_order, size_t seq) ->void{
+		msg_to_order = (MessageHeader*)((void*)batch_to_order->log_idx);
+		size_t i = msg_to_order->total_order/64;
+		size_t j = msg_to_order->total_order%64;
+		location_tracker[i] = location_tracker[i]^j;
+		bool update = false;
+		if((location_tracker[i]<<(64-j)) == 0){
+			update = true;
+		}
+		
+		for (size_t i=0; i < batch_to_order->num_msg; i++){
+			while(msg_to_order->paddedSize == 0){ // check complete if it has errors
+				std::this_thread::yield();
+			}
+			msg_to_order->total_order = seq;
+			seq++;
+			msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->paddedSize);
+			if(update)
+				UpdateTinodeOrder(topic.data(), tinode, broker, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
+		}
+	};
+	auto try_assigning_order = [&]() ->void{
+		std::vector<std::pair<size_t, size_t>> keys_to_erase;
+		size_t total_order;
+		BatchHeader *batch_to_order = nullptr;
+
+		for(auto map_it : skipped_batches){
+			if(!map_it.second.empty()){
+				absl::MutexLock lock(mutex);
+				total_order = seq;
+				auto inner_it = map_it.second.begin();
+				if(batch_seq[map_it.first] + 1 == inner_it->first){
+					batch_to_order = inner_it->second;
+					batch_seq[map_it.first] = inner_it->first;
+					seq += batch_to_order->total_size;
+					keys_to_erase.push_back({map_it.first, inner_it->first}); //Store key to erase
+				}
+			}
+			if(batch_to_order != nullptr){
+				assign_total_order(batch_to_order, total_order);
+			}
+			for (const auto& key_pair : keys_to_erase) {
+				skipped_batches[key_pair.first].erase(key_pair.second);
+				/*
+				 * commented for short term performance. For long-term performance with dynamic clients, uncomment it
+				if (skipped_batches[key_pair.first].empty()) {
+						skipped_batches.erase(key_pair.first); //Erase outer map entry if inner map is empty
+				}
+				*/
+			}
+		}
+	};
+
+	while(!stop_threads_){
+		size_t total_order;
+		// Check if the batch is written. 
+		while(batch_header->client_id == 0 && batch_header->num_msg == 0){
+			try_assigning_order();
+			if(stop_threads_){
+				return;
+			}
+		}
+		if(skipped_batches.find(batch_header->client_id) == skipped_batches.end()){
+			skipped_batches[batch_header->client_id] = absl::btree_map<size_t, BatchHeader*>();
+		}
+		skipped_batches[batch_header->client_id][batch_header->batch_seq] = batch_header;
+		BatchHeader* batch_to_order = skipped_batches[batch_header->client_id].begin()->second;
+
+		bool assign = false;
+		// Check if the read batch_header can be ordered
+		{
+		absl::MutexLock lock(mutex);
+		total_order = seq;
+		auto it = batch_seq.find(batch_to_order->client_id);
+		if(it == batch_seq.end()){
+			if(batch_to_order->batch_seq == 0){
+				batch_seq[batch_to_order->client_id] = 0;
+				seq += batch_to_order->total_size;
+				assign = true;
+			}
+		}else{
+			if(it->second + 1 == batch_to_order->batch_seq){
+				batch_seq[batch_to_order->client_id] = batch_to_order->batch_seq;
+				seq += batch_to_order->total_size;
+				assign = true;
+			}
+		}
+		}
+		if(assign){
+			assign_total_order(batch_to_order, total_order);
+			skipped_batches[batch_to_order->client_id].erase(batch_to_order->batch_seq);
+		}else{
+			size_t i = tracker_idx/64;
+			size_t j = tracker_idx%64;
+			if(location_tracker.size() < i){
+				location_tracker.emplace_back(0);
+			}
+			location_tracker[i] = location_tracker[i]^j;
+			batch_to_order->total_order = tracker_idx;
+		}
+		tracker_idx++;
+	}
+}
+
 
 void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
 	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
