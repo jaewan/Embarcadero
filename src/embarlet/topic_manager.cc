@@ -430,8 +430,11 @@ std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
+	batch_header.next_reader_head = 0;
+	batch_header.broker_id = 0;
+	batch_header.num_brokers = 0;
+	batch_header.total_order = 0;
 	batch_header.log_idx = (size_t)((uint8_t*)log - (uint8_t*)cxl_addr_);
-	VLOG(3) << "Receive batch:" << batch_header.batch_seq << " num_msg:" << batch_header.num_msg;
 	memcpy(batch_headers_log, &batch_header, sizeof(BatchHeader));
 	return nullptr;
 }
@@ -514,8 +517,12 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	}
 #else
 	messages_size = (uint8_t*)combined_addr - (uint8_t*)start_msg_header + ((MessageHeader*)combined_addr)->paddedSize; 
+
 	last_offset = ((MessageHeader*)combined_addr)->logical_offset;
 	last_addr = (void*)combined_addr;
+
+	//VLOG(3) << "\t\t\t[sub] size:" << ((MessageHeader*)combined_addr)->paddedSize << " total:" << messages_size << " offset:" << last_offset;
+	//sleep(3);
 #endif
 	return true;
 }

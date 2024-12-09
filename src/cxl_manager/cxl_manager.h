@@ -80,25 +80,25 @@ struct alignas(64) BatchHeader{
 	size_t total_size;
 	size_t num_msg;
 	// Corfu variables
-	uint32_t broker_id;
-	uint32_t num_brokers;
-	size_t total_order;
-	size_t log_idx;
+	uint32_t broker_id; 	// Sequencer4: batch_ordered
+	uint32_t num_brokers;	// Sequencer4: all prev batches are ordered
+	size_t total_order;	// Sequencer4: relative offset to previous batch header
+	size_t log_idx;	// Sequencer4: relative log offset to the payload of the batch and elative offset to last message
 };
 
 
 // Orders are very important to avoid race conditions. 
 // If you change orders of elements, change how sequencers and combiner check written messages
 struct alignas(64) MessageHeader{
+	volatile size_t paddedSize; // This include message+padding+header size
 	void* segment_header;
 	size_t logical_offset;
 	volatile unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
 	volatile size_t total_order;
+	size_t client_order;
 	uint32_t client_id;
-	uint32_t client_order;
-	size_t size;
-	volatile size_t paddedSize; // This include message+padding+header size
 	volatile uint32_t complete;
+	size_t size;
 };
 
 class CXLManager{
