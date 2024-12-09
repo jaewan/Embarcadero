@@ -92,7 +92,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 		disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
 	}
 
-	if(tinode->seq_type != KAFKA)
+	if(tinode->seq_type != KAFKA && tinode->order != 4)
 		topics_[topic]->Combiner();
 
 	if (broker_id_ != 0 && tinode->seq_type == SCALOG){
@@ -175,7 +175,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 		disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
 	}
 
-	if(seq_type != KAFKA)
+	if(tinode->seq_type != KAFKA && tinode->order != 4)
 		topics_[topic]->Combiner();
 	return tinode;
 }
@@ -408,25 +408,6 @@ std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(BatchHeader &batch_
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
-	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
-	size_t msgSize = batch_header.total_size;
-	log = (void*)(log_addr_.fetch_add(msgSize));
-	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
-		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
-		//TODO(Jae) Finish below segment boundary crossing code
-		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
-			// Allocate a new segment
-			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
-			//segment_metadata = (unsigned long long int)segment_metadata_;
-		}else{
-			// Wait for the first thread that crossed the segment to allocate a new segment
-			//segment_metadata = (unsigned long long int)segment_metadata_;
-		}
-	}
-	return nullptr;
-}
-
 std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = batch_header.total_size;
@@ -449,8 +430,28 @@ std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
-	batch_header.log_idx = (size_t)log;
+	batch_header.log_idx = (size_t)((uint8_t*)log - (uint8_t*)cxl_addr_);
+	VLOG(3) << "Receive batch:" << batch_header.batch_seq << " num_msg:" << batch_header.num_msg;
 	memcpy(batch_headers_log, &batch_header, sizeof(BatchHeader));
+	return nullptr;
+}
+
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
+	size_t msgSize = batch_header.total_size;
+	log = (void*)(log_addr_.fetch_add(msgSize));
+	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
+		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
+		//TODO(Jae) Finish below segment boundary crossing code
+		if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log){
+			// Allocate a new segment
+			// segment_metadata_ = (struct MessageHeader**)get_new_segment_callback_();
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}else{
+			// Wait for the first thread that crossed the segment to allocate a new segment
+			//segment_metadata = (unsigned long long int)segment_metadata_;
+		}
+	}
 	return nullptr;
 }
 
@@ -516,7 +517,6 @@ bool Topic::GetMessageAddr(size_t &last_offset,
 	last_offset = ((MessageHeader*)combined_addr)->logical_offset;
 	last_addr = (void*)combined_addr;
 #endif
-	//VLOG(3) << "sending:" << messages_size << " last_offset:" << last_offset << " combined:" << combined_offset;
 	return true;
 }
 

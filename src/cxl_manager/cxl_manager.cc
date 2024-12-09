@@ -70,7 +70,6 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 	}
 
 	if(broker_id == 0){
-		//memset(addr, 0, (1UL<<34));
 		memset(addr, 0, cxl_size);
 		VLOG(3) << "Cleared CXL:" << cxl_size;
 	}
@@ -122,13 +121,13 @@ CXLManager::~CXLManager(){
 		}
 	}
 
-    // If this is the head node, terminate the global sequencer
-    if (broker_id_ == 0 && scalog_local_sequencer_) {
-		LOG(INFO) << "Terminating global sequencer";
-        scalog_local_sequencer_->TerminateGlobalSequencer();
-    }	
+	// If this is the head node, terminate the global sequencer
+	if (broker_id_ == 0 && scalog_local_sequencer_) {
+		LOG(INFO) << "Scalog Terminating global sequencer";
+		scalog_local_sequencer_->TerminateGlobalSequencer();
+	}	
 
-	if (munmap(cxl_addr_, CXL_SIZE) < 0)
+	if (munmap(cxl_addr_, cxl_size_) < 0)
 		LOG(ERROR) << "Unmapping CXL error";
 
 	VLOG(3) << "[CXLManager]: \t\tDestructed";
@@ -177,7 +176,7 @@ void* CXLManager::GetNewBatchHeaderLog(){
 	CHECK_LT(batch_header_log_count, MAX_TOPIC_SIZE) << "You are creating too many topics";
 	size_t offset = batch_header_log_count.fetch_add(1, std::memory_order_relaxed);
 
-	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
+	return (uint8_t*)batchHeaders_  + offset*BATCHHEADERS_SIZE;
 }
 
 bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
@@ -200,8 +199,9 @@ void CXLManager::RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerT
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic_arr);
 			else if (order == 3)
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer3, this, topic_arr);
-			else if (order == 4)
+			else if (order == 4){
 				sequencerThreads_.emplace_back(&CXLManager::Sequencer4, this, topic_arr);
+			}
 			break;
 		case SCALOG:
 			if (order == 1){
@@ -410,7 +410,6 @@ void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
 			size_t num_msg_per_batch = BATCH_SIZE / msg_to_order[broker]->paddedSize;
 			size_t msg_logical_off = (batch_seq/num_brokers)*num_msg_per_batch;
 			size_t n = msg_logical_off + num_msg_per_batch;
-			//VLOG(3) << batch_seq << ") Broker:" << broker <<  " Ordering:" << msg_logical_off << "~" << n;
 			while(!stop_threads_ && msg_logical_off < n){
 				size_t written = tinode->offsets[broker].written;
 				if(written == (size_t)-1){
@@ -468,7 +467,7 @@ void CXLManager::Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic){
     }
 	}
 
-	Sequencer4Worker(topic, broker_id_, msg_to_order[broker_id_], &mutex, seq, batch_seq_per_client);
+	Sequencer4Worker(topic, broker_id_, msg_to_order[broker_id_], &mutex, std::ref(seq), std::ref(batch_seq_per_client));
 
 	for(auto &t : sequencer4_threads_){
 		while(!t.joinable()){
@@ -484,29 +483,24 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 	struct TInode *tinode = GetTInode(topic.data());
 	absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>> skipped_batches; // client_id, <batch_seq, *msg>
 	BatchHeader* batch_header = ((BatchHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker].batch_headers_offset));
-	size_t tracker_idx = 0;
-	std::vector<unsigned int64_t> location_tracker; 
-	location_tracker.emplace_back(0);
+	size_t logical_offset = 0;
 
-	auto assign_total_order = [&](BatchHeader* batch_to_order, size_t seq) ->void{
-		msg_to_order = (MessageHeader*)((void*)batch_to_order->log_idx);
-		size_t i = msg_to_order->total_order/64;
-		size_t j = msg_to_order->total_order%64;
-		location_tracker[i] = location_tracker[i]^j;
-		bool update = false;
-		if((location_tracker[i]<<(64-j)) == 0){
-			update = true;
-		}
+	auto assign_total_order = [&](BatchHeader* batch_to_order, size_t sequence) ->void{
+		msg_to_order = (MessageHeader*)((uint8_t*)cxl_addr_ + batch_to_order->log_idx);
+		size_t off = batch_to_order->next_reader_head;
+		size_t i = batch_to_order->total_order/64;
+		size_t j = batch_to_order->total_order%64;
 		
 		for (size_t i=0; i < batch_to_order->num_msg; i++){
 			while(msg_to_order->paddedSize == 0){ // check complete if it has errors
 				std::this_thread::yield();
 			}
-			msg_to_order->total_order = seq;
-			seq++;
+			msg_to_order->total_order = sequence;
+			msg_to_order->logical_offset = off;
+			msg_to_order->next_msg_diff = msg_to_order->paddedSize;
+			sequence++;
 			msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->paddedSize);
-			if(update)
-				UpdateTinodeOrder(topic.data(), tinode, broker, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
+			UpdateTinodeOrder(topic.data(), tinode, broker, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
 		}
 	};
 	auto try_assigning_order = [&]() ->void{
@@ -519,10 +513,10 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 				absl::MutexLock lock(mutex);
 				total_order = seq;
 				auto inner_it = map_it.second.begin();
-				if(batch_seq[map_it.first] + 1 == inner_it->first){
+				if(batch_seq[map_it.first] == inner_it->first){
 					batch_to_order = inner_it->second;
-					batch_seq[map_it.first] = inner_it->first;
-					seq += batch_to_order->total_size;
+					batch_seq[map_it.first] = inner_it->first+1;
+					seq += batch_to_order->num_msg;
 					keys_to_erase.push_back({map_it.first, inner_it->first}); //Store key to erase
 				}
 			}
@@ -565,30 +559,24 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 		if(it == batch_seq.end()){
 			if(batch_to_order->batch_seq == 0){
 				batch_seq[batch_to_order->client_id] = 0;
-				seq += batch_to_order->total_size;
+				seq += batch_to_order->num_msg;
 				assign = true;
 			}
 		}else{
-			if(it->second + 1 == batch_to_order->batch_seq){
-				batch_seq[batch_to_order->client_id] = batch_to_order->batch_seq;
-				seq += batch_to_order->total_size;
+			if(it->second  == batch_to_order->batch_seq){
+				batch_seq[batch_to_order->client_id] = batch_to_order->batch_seq + 1;
+				seq += batch_to_order->num_msg;
 				assign = true;
 			}
 		}
 		}
+		batch_to_order->next_reader_head = logical_offset;
 		if(assign){
 			assign_total_order(batch_to_order, total_order);
 			skipped_batches[batch_to_order->client_id].erase(batch_to_order->batch_seq);
-		}else{
-			size_t i = tracker_idx/64;
-			size_t j = tracker_idx%64;
-			if(location_tracker.size() < i){
-				location_tracker.emplace_back(0);
-			}
-			location_tracker[i] = location_tracker[i]^j;
-			batch_to_order->total_order = tracker_idx;
 		}
-		tracker_idx++;
+		logical_offset += batch_header->num_msg;
+		batch_header = (BatchHeader*)((uint8_t*)batch_header + sizeof(BatchHeader));
 	}
 }
 
