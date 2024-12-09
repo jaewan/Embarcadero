@@ -408,7 +408,7 @@ std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(BatchHeader &batch_
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = batch_header.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));
@@ -427,14 +427,15 @@ std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = batch_header.total_size;
 	void *batch_headers_log;
 	{
 	absl::MutexLock lock(&mutex_);
 	log = (void*)(log_addr_.fetch_add(msgSize));
-	batch_headers_log = (void*)(batch_headers_.fetch_add(sizeof(BatchHeader)));
+	batch_headers_log = (void*)(batch_headers_);
+	batch_headers_ += sizeof(BatchHeader);
 	}
 	if(segment_metadata + SEGMENT_SIZE <= (unsigned long long int)log + msgSize){
 		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
@@ -448,6 +449,7 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &b
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
+	batch_header.log_idx = (size_t)log;
 	memcpy(batch_headers_log, &batch_header, sizeof(BatchHeader));
 	return nullptr;
 }

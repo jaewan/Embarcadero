@@ -82,7 +82,7 @@ struct alignas(64) BatchHeader{
 	// Corfu variables
 	uint32_t broker_id;
 	uint32_t num_brokers;
-	size_t total_order;
+	size_t total_order; // used as tracker_idx in Sequencer4
 	size_t log_idx;
 };
 
@@ -148,6 +148,7 @@ class CXLManager{
 		void* current_log_addr_;
 		volatile bool stop_threads_ = false;
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
+		std::vector<std::thread> sequencer4_threads_;
 
 		// Scalog
 		std::string scalog_global_sequencer_ip_ = "192.168.60.172";
@@ -164,6 +165,8 @@ class CXLManager{
 		void Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic);
+		void Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int broker, MessageHeader* msg_to_order, 
+					absl::Mutex* mutex, size_t &seq, absl::flat_hash_map<size_t, size_t> &batch_seq);
 };
 
 class ScalogLocalSequencer {
