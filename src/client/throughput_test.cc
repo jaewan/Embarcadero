@@ -412,7 +412,6 @@ class Buffer{
 				batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
 				batch_header->num_msg = num_msg;
 				batch_header->next_reader_head = tail;
-				VLOG(3) << "[DEBUG] buf:" << bufIdx << " sealing num_msg:" << batch_header->num_msg;
 				return (void*)batch_header;
 			}
 		}

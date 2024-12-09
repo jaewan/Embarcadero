@@ -75,14 +75,14 @@ struct alignas(64) TInode{
 struct alignas(64) BatchHeader{
 	size_t client_id;
 	// Fill from buffer
-	size_t next_reader_head; // used in publish buffer write
+	size_t next_reader_head; // used in publish buffer write, logical_offset in Sequencer4
 	size_t batch_seq;
 	size_t total_size;
 	size_t num_msg;
 	// Corfu variables
 	uint32_t broker_id;
 	uint32_t num_brokers;
-	size_t total_order; // used as tracker_idx in Sequencer4
+	size_t total_order;
 	size_t log_idx;
 };
 
