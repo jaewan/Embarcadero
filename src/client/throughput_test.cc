@@ -1372,7 +1372,8 @@ class Subscriber{
 		void DEBUG_wait(size_t total_msg_size, size_t msg_size){
 			size_t num_msg = total_msg_size/msg_size;
 			auto start = std::chrono::steady_clock::now();
-			size_t total_data_size = num_msg * sizeof(Embarcadero::MessageHeader) + total_msg_size;
+			msg_size = ((msg_size + 64 - 1) / 64) * 64;
+			size_t total_data_size = num_msg * (sizeof(Embarcadero::MessageHeader) + msg_size);
 			while(DEBUG_count_ < total_data_size){
 				std::this_thread::yield();
 				if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-start).count() >=3){
@@ -1619,6 +1620,8 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 	size_t num_threads_per_broker = result["num_threads_per_broker"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
+	int num_clients = result["parallel_client"].as<int>();
+	total_message_size = total_message_size/num_clients;
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 
 	size_t n = total_message_size/message_size;
@@ -2017,19 +2020,28 @@ int main(int argc, char* argv[]) {
 				std::vector<std::thread> threads;
 				std::vector<std::promise<double>> promises(num_clients); // Vector of promises
 				std::vector<std::future<double>> futures;                // Vector of futures
+				std::future<double> sub_future;
+				std::promise<double> sub_promise;
+				std::vector<std::thread> sub_thread;
 
+				sub_future = sub_promise.get_future();
 				// Prepare the futures
 				for (int i = 0; i < num_clients; ++i) {
 					futures.push_back(promises[i].get_future());  // Get future from each promise
 				}
 
 				// Launch the threads
+				sub_thread.emplace_back([&result,&topic,&sub_promise]() {
+							double res = SubscribeThroughputTest(result, topic);
+							sub_promise.set_value(res); // Set the result in the promise
+							});
 				for (int i = 0; i < num_clients; i++) {
 					threads.emplace_back([&result,&topic,&synchronizer,&promises, i]() {
 							double res = PublishThroughputTest(result, topic, synchronizer);
 							promises[i].set_value(res); // Set the result in the promise
 							});
 				}
+
 
 				double aggregate_bandwidth = 0;
 
@@ -2040,9 +2052,16 @@ int main(int argc, char* argv[]) {
 						aggregate_bandwidth += futures[i].get();  // Get the result from the future
 					}
 				}
+				double subBandwidth = 0;
+				if (sub_thread[0].joinable()) {
+					sub_thread[0].join();  // Wait for the thread to finish
+					subBandwidth = sub_future.get();  // Get the result from the future
+				}
 				writer.SetPubResult(aggregate_bandwidth);
+				writer.SetSubResult(subBandwidth);
 
 				std::cout << "Aggregate Bandwidth:" << aggregate_bandwidth;
+				std::cout << "Sub Bandwidth:" << subBandwidth;
 			}
 			break;
 		case 4:

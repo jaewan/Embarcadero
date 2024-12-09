@@ -484,23 +484,56 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 	absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>> skipped_batches; // client_id, <batch_seq, *msg>
 	BatchHeader* batch_header = ((BatchHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker].batch_headers_offset));
 	size_t logical_offset = 0;
+	size_t last_ordered_offset = 0;
 
 	auto assign_total_order = [&](BatchHeader* batch_to_order, size_t sequence) ->void{
 		msg_to_order = (MessageHeader*)((uint8_t*)cxl_addr_ + batch_to_order->log_idx);
 		size_t off = batch_to_order->next_reader_head;
-		size_t i = batch_to_order->total_order/64;
-		size_t j = batch_to_order->total_order%64;
 		
+		/*
+		batch_to_order->broker_id = 1;
+		BatchHeader* prev_batch = (BatchHeader*)((uint8_t*)batch_to_order - batch_to_order->total_order);
+		BatchHeader* last_ordered_batch = nullptr;
+		if(prev_batch->broker_id == 1 && prev_batch->num_brokers == 1){
+			last_ordered_batch = batch_to_order;
+			batch_to_order->num_brokers = 1;
+			BatchHeader* next_batch = (BatchHeader*)((uint8_t*)batch_to_order+ sizeof(BatchHeader));
+			while(next_batch->broker_id == 1){
+				next_batch->num_brokers = 1;
+				last_ordered_batch = next_batch;
+				next_batch = (BatchHeader*)((uint8_t*)next_batch + sizeof(BatchHeader));
+			}
+		}
+		*/
+
+		size_t last_msg_size = 0;
 		for (size_t i=0; i < batch_to_order->num_msg; i++){
-			while(msg_to_order->paddedSize == 0){ // check complete if it has errors
+			while(msg_to_order->paddedSize == 0 || msg_to_order->paddedSize != (sizeof(MessageHeader)+(((msg_to_order->size + 64 - 1) / 64) * 64))){ // check complete if it has errors
 				std::this_thread::yield();
 			}
 			msg_to_order->total_order = sequence;
 			msg_to_order->logical_offset = off;
-			msg_to_order->next_msg_diff = msg_to_order->paddedSize;
+			last_msg_size = msg_to_order->paddedSize;
+			msg_to_order->next_msg_diff = last_msg_size;
+			off++;
 			sequence++;
-			msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->paddedSize);
-			UpdateTinodeOrder(topic.data(), tinode, broker, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
+			msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + last_msg_size);
+		}
+		msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order - last_msg_size);
+		/*
+		batch_to_order->log_idx = (size_t)(msg_to_order);
+		if(last_ordered_batch){
+			//VLOG(3) << "\t\t\tOrdered:" << last_ordered_batch->batch_seq;
+			UpdateTinodeOrder(topic.data(), tinode, broker, 
+			last_ordered_batch->next_reader_head + last_ordered_batch->num_msg,
+			(uint8_t*)last_ordered_batch->log_idx - (uint8_t*)cxl_addr_);
+		}
+		*/
+		if(msg_to_order->logical_offset > last_ordered_offset){
+			UpdateTinodeOrder(topic.data(), tinode, broker, 
+			msg_to_order->logical_offset,
+			(uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
+			last_ordered_offset = msg_to_order->logical_offset;
 		}
 	};
 	auto try_assigning_order = [&]() ->void{
@@ -535,6 +568,7 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 		}
 	};
 
+	uint32_t prev = 0;
 	while(!stop_threads_){
 		size_t total_order;
 		// Check if the batch is written. 
@@ -549,6 +583,16 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 		}
 		skipped_batches[batch_header->client_id][batch_header->batch_seq] = batch_header;
 		BatchHeader* batch_to_order = skipped_batches[batch_header->client_id].begin()->second;
+		batch_header->next_reader_head = logical_offset;
+		batch_header->broker_id = 0;
+		batch_header->num_brokers = 0;
+		if(prev == 0){
+			batch_header->total_order = 0;
+			batch_header->num_brokers = 1;
+			prev = 64;
+		}else{
+			batch_header->total_order = sizeof(BatchHeader);
+		}
 
 		bool assign = false;
 		// Check if the read batch_header can be ordered
@@ -558,7 +602,7 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 		auto it = batch_seq.find(batch_to_order->client_id);
 		if(it == batch_seq.end()){
 			if(batch_to_order->batch_seq == 0){
-				batch_seq[batch_to_order->client_id] = 0;
+				batch_seq[batch_to_order->client_id] = 1;
 				seq += batch_to_order->num_msg;
 				assign = true;
 			}
@@ -570,10 +614,11 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 			}
 		}
 		}
-		batch_to_order->next_reader_head = logical_offset;
 		if(assign){
 			assign_total_order(batch_to_order, total_order);
 			skipped_batches[batch_to_order->client_id].erase(batch_to_order->batch_seq);
+		}else{
+			try_assigning_order();
 		}
 		logical_offset += batch_header->num_msg;
 		batch_header = (BatchHeader*)((uint8_t*)batch_header + sizeof(BatchHeader));
