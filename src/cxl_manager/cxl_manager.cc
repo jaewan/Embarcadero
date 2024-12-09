@@ -490,7 +490,6 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 		msg_to_order = (MessageHeader*)((uint8_t*)cxl_addr_ + batch_to_order->log_idx);
 		size_t off = batch_to_order->next_reader_head;
 		
-		/*
 		batch_to_order->broker_id = 1;
 		BatchHeader* prev_batch = (BatchHeader*)((uint8_t*)batch_to_order - batch_to_order->total_order);
 		BatchHeader* last_ordered_batch = nullptr;
@@ -504,11 +503,10 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 				next_batch = (BatchHeader*)((uint8_t*)next_batch + sizeof(BatchHeader));
 			}
 		}
-		*/
 
 		size_t last_msg_size = 0;
 		for (size_t i=0; i < batch_to_order->num_msg; i++){
-			while(msg_to_order->paddedSize == 0 || msg_to_order->paddedSize != (sizeof(MessageHeader)+(((msg_to_order->size + 64 - 1) / 64) * 64))){ // check complete if it has errors
+			while(msg_to_order->complete==0){// && (msg_to_order->paddedSize == 0 || msg_to_order->paddedSize != (sizeof(MessageHeader)+(((msg_to_order->size + 64 - 1) / 64) * 64)))){ // check complete if it has errors
 				std::this_thread::yield();
 			}
 			msg_to_order->total_order = sequence;
@@ -520,7 +518,6 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 			msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + last_msg_size);
 		}
 		msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order - last_msg_size);
-		/*
 		batch_to_order->log_idx = (size_t)(msg_to_order);
 		if(last_ordered_batch){
 			//VLOG(3) << "\t\t\tOrdered:" << last_ordered_batch->batch_seq;
@@ -528,7 +525,6 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 			last_ordered_batch->next_reader_head + last_ordered_batch->num_msg,
 			(uint8_t*)last_ordered_batch->log_idx - (uint8_t*)cxl_addr_);
 		}
-		*/
 		if(msg_to_order->logical_offset > last_ordered_offset){
 			UpdateTinodeOrder(topic.data(), tinode, broker, 
 			msg_to_order->logical_offset,
