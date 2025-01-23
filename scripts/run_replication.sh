@@ -7,9 +7,8 @@ NUM_BROKERS=4
 NUM_TRIALS=5
 acks=(0)
 replication_factors=(1 2 3)
-test_cases=(5)
-msg_sizes=(1024)
-#msg_sizes=(128 512 1024 4096 65536 1048576)
+test_cases=(1)
+msg_sizes=(128 256  512 1024 4096 16384 65536 262144 1048576)
 
 wait_for_signal() {
   while true; do
@@ -51,10 +50,11 @@ for test_case in "${test_cases[@]}"; do
 				sleep 1
 				for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
 				  start_process "./embarlet"
+				   wait_for_signal
 				done
-				for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-				  wait_for_signal
-				done
+				#for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
+				 # wait_for_signal
+				#done
 				start_process "./throughput_test -m $msg_size --record_results -t $test_case -r $replication_factor -a $ack "
 
 				# Wait for all processes to finish

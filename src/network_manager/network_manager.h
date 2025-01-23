@@ -58,6 +58,7 @@ class NetworkManager{
 		void ReqReceiveThread();
 		void MainThread();
 		void AckThread(char* topic, int ack_fd);
+		void Ack1Thread(char* topic, int ack_fd);
 		void SubscribeNetworkThread(int , int, char*, int);
 
 		folly::MPMCQueue<std::optional<struct NetworkRequest>> requestQueue_;

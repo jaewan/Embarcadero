@@ -121,7 +121,7 @@ void NetworkManager::ReqReceiveThread(){
 					// TODO(Jae) This code asumes there's only one active client publishing
 					// If there are parallel clients, change the ack queue
 					int ack_fd = req.client_socket;
-					if(shake.ack == 2){
+					if(shake.ack >= 1){
 						absl::MutexLock lock(&ack_mu_);
 						auto it = ack_connections_.find(shake.client_id);
 						if(it != ack_connections_.end()){
@@ -225,7 +225,11 @@ void NetworkManager::ReqReceiveThread(){
 							epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event);
 
 							ack_connections_[shake.client_id] = ack_fd;
-							threads_.emplace_back(&NetworkManager::AckThread, this, shake.topic, ack_fd);
+							if(shake.ack == 1){
+								threads_.emplace_back(&NetworkManager::Ack1Thread, this, shake.topic, ack_fd);
+							}else{
+								threads_.emplace_back(&NetworkManager::AckThread, this, shake.topic, ack_fd);
+							}
 						}
 					}
 					size_t READ_SIZE = ZERO_COPY_SEND_LIMIT;
@@ -449,6 +453,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 	CHECK_GT(replication_factor, 0) << " Replication factor must be larger than 0 at ack:2";
 	int acked_replicated = -1; // This is not precise as 0 will always be reported as acked_replicated (initialized as 0 but compares with -1) but just one
 
+VLOG(3) << "AckThread spawned";
 	while(!stop_threads_){
 		size_t min = std::numeric_limits<size_t>::max();
 		// TODO(Jae) this relies on num_active_brokers == MAX_BROKER_NUM as disk manager
@@ -465,6 +470,7 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 		if(ack_count == 0){
 			continue;
 		}
+		VLOG(3) << "sending ack:" << ack_count;
 		int EPOLL_TIMEOUT = -1; 
 		size_t acked_size = 0;
 		while (acked_size < ack_count) {
@@ -514,6 +520,61 @@ void NetworkManager::AckThread(char *topic, int ack_fd){
 				break;
 			}
 		}
+	} //end while
+}
+void NetworkManager::Ack1Thread(char *topic, int ack_fd){
+	struct epoll_event events[10]; // Adjust size as needed
+	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+	size_t next_to_ack_offset = 0;
+	char buf[1024];
+
+	while(!stop_threads_){
+		if(tinode->offsets[broker_id_].written != (size_t)-1 && next_to_ack_offset <= tinode->offsets[broker_id_].written){
+			next_to_ack_offset = tinode->offsets[broker_id_].written + 1;
+			size_t acked_size = 0;
+			while (acked_size < sizeof(next_to_ack_offset)) {
+				int n = epoll_wait(ack_efd_, events, 10, -1);
+				 for (int i = 0; i < n; i++) {
+					if (events[i].events & EPOLLOUT) {
+						bool retry;
+						do {
+							retry = false;
+							ssize_t bytesSent = send(ack_fd, &next_to_ack_offset, sizeof(next_to_ack_offset) - acked_size, 0);
+							//VLOG(3) << "acked:" << next_to_ack_offset << " sent:" <<bytesSent;
+							if (bytesSent < 0) {
+								if (errno == EAGAIN || errno == EWOULDBLOCK) {
+									// Would block, retry immediately
+									retry = true;
+									continue;
+								} else if (errno == EINTR) {
+									// Interrupted, retry
+									retry = true;
+									continue;
+								} else {
+									LOG(ERROR) << "Ack Send failed: " << strerror(errno);
+									return;
+								}
+							} else {
+								acked_size += bytesSent;
+							}
+						} while (retry && acked_size < sizeof(next_to_ack_offset));
+						if (acked_size >= sizeof(next_to_ack_offset)) {
+								break; // All data sent, exit the epoll loop
+						}
+					}
+				}
+			}
+			// Check if the connection is alive only after ack_fd is connected
+			if(ack_fd > 0){
+				int result = recv(ack_fd, buf, 1, MSG_PEEK | MSG_DONTWAIT);
+				if(result == 0){
+					LOG(INFO) << "Connection is closed ack_fd:" << ack_fd ;
+					//stop_threads_ = true;
+					break;
+				}
+			}
+		}
+
 	} //end while
 }
 

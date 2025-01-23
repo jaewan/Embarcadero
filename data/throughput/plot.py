@@ -46,4 +46,3 @@ plt.tight_layout()
 
 # Save the plot with higher DPI
 plt.savefig('publish_throughput.png', dpi=300, bbox_inches='tight')
-

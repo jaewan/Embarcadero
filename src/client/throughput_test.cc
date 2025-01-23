@@ -303,14 +303,12 @@ class Buffer{
 		}
 
 		void AdvanceWriteBufId(){
-			static size_t i = 0; // Num of brokers =  num_buf_ / num_threads_per_broker_
-			static size_t j = 0; // num_threads_per_broker_
 			size_t num_broker = num_buf_/num_threads_per_broker_;
-			i = (i+1)%num_broker;;
-			if( i == 0){
-				j = (j+1)%num_threads_per_broker_;
+			i_ = (i_+1)%num_broker;;
+			if(i_ == 0){
+				j_ = (j_+1)%num_threads_per_broker_;
 			}
-			write_buf_id_ = i * num_threads_per_broker_ + j;
+			write_buf_id_ = i_ * num_threads_per_broker_ + j_;
 		}
 
 #ifdef BATCH_OPTIMIZATION
@@ -485,6 +483,8 @@ class Buffer{
 		std::vector<Buf> bufs_;
 		size_t num_threads_per_broker_;
 		int order_;
+		size_t i_ = 0;
+		size_t j_ = 0;
 
 		size_t write_buf_id_ = 0;
 		std::atomic<size_t> num_buf_{0};
@@ -538,7 +538,8 @@ class Publisher{
 		void Init(int ack_level){
 			ack_level_ = ack_level;
 			ack_port_ = GenerateRandomNum();
-			if(ack_level >= 2){
+			if(ack_level >= 1){
+	VLOG(3) << "ack_level:" << ack_level;
 				ack_thread_ = std::thread([this](){
 					this->EpollAckThread();
 					});
@@ -590,6 +591,11 @@ class Publisher{
 			pubQue_.ReturnReads();
 			while(client_order_ < n){
 				std::this_thread::yield();
+			}
+			if(ack_level_ >= 1){
+				while(ack_received_ < client_order_){
+					std::this_thread::yield();
+				}
 			}
 			shutdown_ = true;
 			context_.TryCancel();
@@ -648,8 +654,8 @@ class Publisher{
 						size_t bytes = sent_bytes_per_broker_[i].load(std::memory_order_relaxed);
 						size_t real_time_throughput = (bytes-prev_throughputs[i]);
 						throughputs[i].emplace_back(real_time_throughput);
-						throughputFile << (real_time_throughput*200/(1024*1024)) << ",";
-						sum += (real_time_throughput*200/(1024*1024));
+						throughputFile << (real_time_throughput*200/(1024*1024*1024)) << ",";
+						sum += (real_time_throughput*200/(1024*1024*1024));
 						prev_throughputs[i] = bytes;
 					}
 					throughputFile << sum << "\n";
@@ -695,12 +701,13 @@ class Publisher{
 		char topic_[TOPIC_NAME_SIZE];
 		int ack_level_;
 		int ack_port_;
+		size_t ack_received_;
 		std::vector<std::thread> threads_;
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
 
 		void EpollAckThread(){
-			if(ack_level_ != 2)
+			if(ack_level_ < 1)
 				return;
 			int server_sock = socket(AF_INET, SOCK_STREAM, 0);
 			if (server_sock < 0) {
@@ -760,6 +767,7 @@ class Publisher{
 			std::vector<int> client_sockets;
 
 			thread_count_.fetch_add(1);
+			absl::flat_hash_map<int, size_t> ack1_per_sock;
 
 			while (!shutdown_ || total_received < client_order_) {
 				int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
@@ -778,6 +786,7 @@ class Publisher{
 						fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
 						event.events = EPOLLIN | EPOLLET;
 						event.data.fd = client_sock;
+						ack1_per_sock[client_sock] = 0;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
 							LOG(ERROR) << "Failed to add client socket to epoll";
 							epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
@@ -790,12 +799,24 @@ class Publisher{
 						int client_sock = events[i].data.fd;
 						ssize_t bytes_received = 0;
 
-						while (total_received < client_order_ && (bytes_received = recv(client_sock, buffer, 1024*1024, 0)) > 0) {
-							total_received += bytes_received;
-							// Process received data here
-							// For example, you might want to count the number of 1-byte messages:
-							// message_count += bytes_received;
+						if(ack_level_ == 1){
+							size_t acked_logical_id;
+							bytes_received = recv(client_sock, &acked_logical_id, sizeof(acked_logical_id), 0);
+							total_received -= (acked_logical_id - ack1_per_sock[client_sock]);
+							ack1_per_sock[client_sock] = acked_logical_id;
+							ack_received_ = total_received;
+						}else{
+							bytes_received = recv(client_sock, buffer, 1024*1024, 0);
+							if(bytes_received > 0){
+								VLOG(3) << "acked:" <<bytes_received;
+								total_received += bytes_received;
+								ack_received_ = total_received;
+							}
+								// Process received data here
+								// For example, you might want to count the number of 1-byte messages:
+								// message_count += bytes_received;
 						}
+						
 
 						if (bytes_received == 0) {
 							// Connection closed by client
@@ -1726,8 +1747,19 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	size_t num_threads_per_broker = result["num_threads_per_broker"].as<size_t>();
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
+	bool steady_rate = result.count("steady_rate");
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 
+	if(steady_rate){
+		LOG(INFO) << "Warning! This only works with 4 brokers. Change if you need to run with diff number of brokers";
+	}
+	size_t paddedMsgSizeWithHeader = ((((message_size + 64 - 1) / 64) * 64) + 64);
+	size_t send_interval =BATCH_SIZE/paddedMsgSizeWithHeader;
+	if(BATCH_SIZE%paddedMsgSizeWithHeader){
+		send_interval += 1;
+	}
+	send_interval = send_interval * 4 * num_threads_per_broker;
+		
 	size_t n = total_message_size/message_size;
 	LOG(INFO) << "[Latency Test] total_message:" << total_message_size << " message_size:" << message_size << " n:" << n << " num_threads_per_broker:" << num_threads_per_broker;
 	char message[message_size];
@@ -1745,7 +1777,11 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 				timestamp.time_since_epoch()).count();
 		memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
 		p.Publish(message, message_size);
+		if(steady_rate && (i%send_interval == 0)){
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
 	}
+	p.DEBUG_check_send_finish();
 	p.Poll(n);
 	auto pub_end = std::chrono::high_resolution_clock::now();
 	s.DEBUG_wait(total_message_size, message_size);
@@ -1912,7 +1948,7 @@ int main(int argc, char* argv[]) {
 
 	options.add_options()
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
-		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("1"))
+		("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("0"))
 		("o,order_level", "Order Level", cxxopts::value<int>()->default_value("0"))
 		("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", cxxopts::value<std::string>()->default_value("EMBARCADERO"))
 		("s,total_message_size", "Total size of messages to publish", cxxopts::value<size_t>()->default_value("10737418240"))
@@ -1926,6 +1962,7 @@ int main(int argc, char* argv[]) {
 		("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))
 		("num_brokers_to_kill", "Number of brokers to kill during execution", cxxopts::value<int>()->default_value("0"))
 		("failure_percentage", "When to fail brokers, after what percentages of messages sent", cxxopts::value<double>()->default_value("0"))
+		("steady_rate", "Send message in steady rate")
 		("n,num_threads_per_broker", "Number of request threads_per_broker", cxxopts::value<size_t>()->default_value("3"));
 
 	auto result = options.parse(argc, argv);
