@@ -29,7 +29,8 @@ struct MemcpyRequest{
 
 class DiskManager{
 	public:
-		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory, size_t queueCapacity = 64);
+		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory, 
+								heartbeat_system::SequencerType sequencerType, size_t queueCapacity = 64);
 		~DiskManager();
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
