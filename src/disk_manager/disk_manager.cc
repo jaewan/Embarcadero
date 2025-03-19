@@ -109,9 +109,6 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 						 cxl_addr_(cxl_addr),
 						 log_to_memory_(log_to_memory){
 	num_io_threads_ = NUM_MAX_BROKERS;
-	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
-	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
-	}
 
 	if(!log_to_memory){
 		const char *homedir;
@@ -126,6 +123,11 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 				return ;
 			}
 		}
+	}
+
+	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
+		//TODO(Tony) redirect to your implementation
+	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 	}
 
 	for (size_t i=0; i< num_io_threads_; i++){
