@@ -83,6 +83,8 @@ int main(int argc, char* argv[]){
 	options.add_options()
 		("head", "Head Node")
 		("follower", "Follower Address and Port", cxxopts::value<std::string>())
+		("scalog", "Follower Address and Port", cxxopts::value<std::string>())
+		("corfu", "Follower Address and Port", cxxopts::value<std::string>())
 		("e,emul", "Use emulation instead of CXL")
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("network_threads", "Number of network IO threads", cxxopts::value<int>()->default_value(std::to_string(NUM_NETWORK_IO_THREADS)))
@@ -99,8 +101,14 @@ int main(int argc, char* argv[]){
 	// *************** Initializing Broker ********************** 
 	bool is_head_node = false;
 	bool replicate_to_memory = true;
+	heartbeat_system::SequencerType sequencerType = heartbeat_system::SequencerType::EMBARCADERO;
 	if (arguments.count("replicate_to_disk")) {
 		replicate_to_memory = false;
+	}
+	if (arguments.count("scalog")) {
+		sequencerType = heartbeat_system::SequencerType::SCALOG;
+	}else if (arguments.count("corfu")) {
+		sequencerType = heartbeat_system::SequencerType::CORFU;
 	}
 	if (arguments.count("head")) {
 		is_head_node = true;
@@ -132,7 +140,7 @@ int main(int argc, char* argv[]){
 
 	// *************** Initializing Managers ********************** 
 	Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_addr.substr(0, colonPos));
-	Embarcadero::DiskManager disk_manager(broker_id, cxl_manager.GetCXLAddr(), replicate_to_memory);
+	Embarcadero::DiskManager disk_manager(broker_id, cxl_manager.GetCXLAddr(), replicate_to_memory, sequencerType);
 	Embarcadero::NetworkManager network_manager(broker_id, num_network_io_threads);
 	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id);
 	heartbeat_manager.RegisterCreateTopicEntryCallback(std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager, std::placeholders::_1, 

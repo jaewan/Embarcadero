@@ -101,13 +101,18 @@ void *mmap_large_buffer(size_t need, size_t &allocated){
 	return buffer;
 }
 
-DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, size_t queueCapacity):
+DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, 
+												heartbeat_system::SequencerType sequencerType, size_t queueCapacity):
 						 requestQueue_(queueCapacity),
 						 copyQueue_(1024),
 						 broker_id_(broker_id),
 						 cxl_addr_(cxl_addr),
 						 log_to_memory_(log_to_memory){
 	num_io_threads_ = NUM_MAX_BROKERS;
+	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
+	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
+	}
+
 	if(!log_to_memory){
 		const char *homedir;
 		if ((homedir = getenv("HOME")) == NULL) {
