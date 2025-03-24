@@ -1,56 +1,44 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.16)
+cmake_policy(SET CMP0144 NEW)
 
 project(Embarcadero VERSION 0.1
-	DESCRIPTION "Pubsub with disaggregated memory"
-	LANGUAGES CXX)
+        DESCRIPTION "Pubsub with disaggregated memory"
+        LANGUAGES CXX)
 
-# Setting the C++ version to 17 for folly compatibility
+# Load custom CMake modules
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# Compiler settings
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "-Wall -O3")
-set(CMAKE_CXX_STANDARD_REQUIRED True)
-#set(CMAKE_VERBOSE_MAKEFILE ON)
 set(CMAKE_INSTALL_MESSAGE LAZY)
 set(CMAKE_PARALLEL_LEVEL 16)
 
-find_package(gflags REQUIRED)
-#find_package(glog REQUIRED)
-find_package(folly REQUIRED)
-add_subdirectory(third_party/cxxopts)
-
-include_directories("/usr/include/glog")
-link_directories("usr/lib64/libglog.so.0")
-include_directories("/usr/local/include/mimalloc-1.8")
-link_directories("/usr/local/lib64")
-
 include(FetchContent)
-set(ABSL_ENABLE_INSTALL ON) # bug fix: https://stackoverflow.com/questions/76697852/using-fetchcontent-to-retrieve-protobuf-and-grpc-to-compile-during-build-hermet
+set(ABSL_ENABLE_INSTALL OFF) # Do NOT install Abseil
+set(gRPC_INSTALL OFF)       # Do NOT install gRPC
+set(protobuf_INSTALL OFF)  # Do NOT install Protobuf
+
+# Add these two lines if you are worried about dynamic linking of these libraries
+set(BUILD_SHARED_LIBS OFF)
+set(gRPC_BUILD_TESTS OFF CACHE BOOL "Don't build gRPC tests." FORCE)
+
 FetchContent_Declare(
   gRPC
   GIT_REPOSITORY https://github.com/grpc/grpc
   GIT_TAG        v1.55.1
 )
-set(FETCHCONTENT_QUIET OFF)
+set(FETCHCONTENT_QUIET OFF) # Consider turning this on after initial setup
 FetchContent_MakeAvailable(gRPC)
+ 
+# Find packages (installed by setup scripts)
+find_package(Mimalloc REQUIRED)
+find_package(gflags REQUIRED)
+find_package(glog REQUIRED)
+find_package(folly REQUIRED)
 
-set(_PROTOBUF_LIBPROTOBUF libprotobuf)
-set(_REFLECTION grpc++_reflection)
-set(_ORCA_SERVICE grpcpp_orca_service)
-if(CMAKE_CROSSCOMPILING)
-  find_program(_PROTOBUF_PROTOC protoc)
-else()
-  set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)
-endif()
-set(_GRPC_GRPCPP grpc++)
-if(CMAKE_CROSSCOMPILING)
-  find_program(_GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin)
-else()
-  set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)
-endif()
-find_package(Protobuf REQUIRED)
+add_subdirectory(third_party)
 
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
+# Setup source
 add_subdirectory(src)
-
