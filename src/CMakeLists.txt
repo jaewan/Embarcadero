@@ -1,12 +1,15 @@
+cmake_policy(SET CMP0144 NEW)
+
 include(cmake/heartbeat_grpc.cmake)
 include(cmake/scalog_sequencer_grpc.cmake)
 include(cmake/corfu_sequencer_grpc.cmake)
 
-# These are required for a folly build
-# folly cmake mostly from pehere: https://stackoverflow.com/questions/56511716/cmake-file-for-a-folly-project
 find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
 find_package(mimalloc REQUIRED)
+find_package(glog REQUIRED)
+find_package(Threads REQUIRED)
+find_package(cxxopts REQUIRED)
 
 # Detect the processor type
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
@@ -39,21 +42,6 @@ endif()
 
 configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
-# Include the Protobuf and gRPC include directories passed from the parent CMakeLists.txt
-include_directories(${PROTOBUF_INCLUDE_DIRS})
-
-# Directories for your .proto files
-set(PROTO_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
-
-# List of .proto files
-set(PROTO_FILES
-    "${PROTO_SRC_DIR}/heartbeat.proto"
-)
-
-set(CORFU_CLIENT_HEADERS
-    "${CMAKE_CURRENT_SOURCE_DIR}/client/corfu_client.h" 
-)
-
 add_executable(embarlet 
     embarlet/embarlet.cc
     disk_manager/disk_manager.cc 
@@ -66,17 +54,7 @@ add_executable(embarlet
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
 )
-add_custom_command(
-  OUTPUT "${heartbeat_proto_srcs}" "${heartbeat_proto_hdrs}" "${heartbeat_grpc_srcs}" "${heartbeat_grpc_hdrs}"
-  COMMAND ${_PROTOBUF_PROTOC}
-  ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
-    --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
-    -I "${heartbeat_proto_path}"
-    -I "${PROTOBUF_INCLUDE_DIRS}"  # Add this line
-    --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
-    "${heartbeat_proto}"
-  DEPENDS "${heartbeat_proto}"
-)
+
 
 target_include_directories(embarlet PUBLIC
 	"${CMAKE_CURRENT_BINARY_DIR}"
@@ -84,18 +62,19 @@ target_include_directories(embarlet PUBLIC
 )
 
 target_link_libraries(embarlet
-	numa
-	glog
-	gflags
-	mimalloc
-    absl::flat_hash_map 
-    scalog_sequencer_grpc_proto
+    numa
+    glog
+    gflags
+    mimalloc
+    absl::flat_hash_map
+	scalog_sequencer_grpc_proto
 	heartbeat_grpc_proto
     cxxopts::cxxopts
-    ${_REFLECTION}
-    ${_GRPC_GRPCPP}
-    ${_PROTOBUF_LIBPROTOBUF}
+    grpc++_reflection
+    grpc++
+    protobuf::libprotobuf
     ${FOLLY_LIBRARIES}
+    Threads::Threads
 )
 
 add_executable(throughput_test
@@ -108,17 +87,18 @@ target_include_directories(throughput_test PUBLIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/client"
 )
 
-target_link_libraries(throughput_test 
-	glog
-	gflags
-	mimalloc
+target_link_libraries(throughput_test
+    glog
+    gflags
+    mimalloc
     cxxopts::cxxopts
-    heartbeat_grpc_proto
+	heartbeat_grpc_proto
 	corfu_sequencer_grpc_proto
-    ${_REFLECTION}
-    ${_GRPC_GRPCPP}
-    ${_PROTOBUF_LIBPROTOF}
+	grpc++_reflection
+    grpc++
+    protobuf::libprotobuf
     ${FOLLY_LIBRARIES}
+    Threads::Threads
 )
 
 add_executable(scalog_global_sequencer
@@ -131,12 +111,13 @@ target_include_directories(scalog_global_sequencer PUBLIC
     "${PROJECT_BINARY_DIR}"
 )
 
-target_link_libraries(scalog_global_sequencer 
+target_link_libraries(scalog_global_sequencer
     glog
     absl::flat_hash_map
-    scalog_sequencer_grpc_proto
-    ${_GRPC_GRPCPP}
-    ${_PROTOBUF_LIBPROTOF}
+	scalog_sequencer_grpc_proto
+    grpc++
+    protobuf::libprotobuf
+    Threads::Threads
 )
 
 add_executable(corfu_global_sequencer
@@ -148,10 +129,11 @@ target_include_directories(corfu_global_sequencer PUBLIC
     "${PROJECT_BINARY_DIR}"
 )
 
-target_link_libraries(corfu_global_sequencer 
+target_link_libraries(corfu_global_sequencer
     glog
     absl::flat_hash_map
-    corfu_sequencer_grpc_proto
-    ${_GRPC_GRPCPP}
-    ${_PROTOBUF_LIBPROTOF}
+	corfu_sequencer_grpc_proto
+    grpc++
+    protobuf::libprotobuf
+    Threads::Threads
 )
