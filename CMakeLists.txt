@@ -20,7 +20,7 @@ set(ABSL_ENABLE_INSTALL OFF) # Do NOT install Abseil
 set(gRPC_INSTALL OFF)       # Do NOT install gRPC
 set(protobuf_INSTALL OFF)  # Do NOT install Protobuf
 
-# Add these two lines if you are worried about dynamic linking of these libraries
+# Worried about dynamic linking of these libraries, may not be needed
 set(BUILD_SHARED_LIBS OFF)
 set(gRPC_BUILD_TESTS OFF CACHE BOOL "Don't build gRPC tests." FORCE)
 
