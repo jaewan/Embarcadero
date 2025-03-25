@@ -50,7 +50,7 @@ void nt_memcpy(void *__restrict dst, const void * __restrict src, size_t n){
 	memcpy(dst, src, n);
 }
 
-struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]){
+struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_SIZE]){
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	TInode* replica_tinode = nullptr;
 	{
@@ -102,7 +102,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE])
 	return tinode;
 }
 
-struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, SequencerType seq_type){
+struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, SequencerType seq_type){
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	struct TInode* replica_tinode = nullptr;
 	bool no_collision = std::all_of(
@@ -180,7 +180,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE],
 	return tinode;
 }
 
-bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, SequencerType seq_type){
+bool TopicManager::CreateNewTopic(const char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, SequencerType seq_type){
 	if(CreateNewTopicInternal(topic, order, replication_factor, replicate_tinode, seq_type)){
 		cxl_manager_.RunSequencer(topic, order, seq_type);
 		return true;
@@ -190,10 +190,11 @@ bool TopicManager::CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int re
 	return false;
 }
 
-void TopicManager::DeleteTopic(char topic[TOPIC_NAME_SIZE]){
+void TopicManager::DeleteTopic(const char topic[TOPIC_NAME_SIZE]){
 }
 
-std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(BatchHeader &batch_header,
+		const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(topic, cxl_manager_.GetTInode(topic)->topic, TOPIC_NAME_SIZE) == 0){
@@ -318,7 +319,8 @@ void Topic::Combiner(){
 	combiningThreads_.emplace_back(&Topic::CombinerThread, this);
 }
 
-std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], 
+		void* &log, void* &segment_header, size_t &logical_offset){
 	size_t start_logical_offset;
 	{
 	absl::MutexLock lock(&mutex_);
@@ -328,7 +330,7 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(BatchHeader &batch_h
 	start_logical_offset = logical_offset_;
 	logical_offset_+= batch_header.num_msg;
 	//TODO(Jae) This does not work with dynamic message size
-	(void*)(log_addr_.load() - ((MessageHeader*)log)->paddedSize);
+	//(void*)(log_addr_.load() - ((MessageHeader*)log)->paddedSize);
 	if((unsigned long long int)current_segment_ + SEGMENT_SIZE <= log_addr_){
 		LOG(ERROR)<< "!!!!!!!!! Increase the Segment Size:" << SEGMENT_SIZE;
 		//TODO(Jae) Finish below segment boundary crossing code
@@ -364,7 +366,8 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(BatchHeader &batch_h
 	};
 }
 
-std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], 
+		void* &log, void* &segment_header, size_t &logical_offset){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = batch_header.total_size;
 	log = (void*)((uint8_t*)log_addr_.load() +  batch_header.log_idx);
@@ -383,7 +386,8 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(BatchHeader &batch_h
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], 
+		void* &log, void* &segment_header, size_t &logical_offset){
 	absl::MutexLock lock(&mutex_);
 	if(skipped_batch_.contains(batch_header.client_id)){
 		auto it = skipped_batch_[batch_header.client_id].find(batch_header.batch_seq);
@@ -408,7 +412,8 @@ std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(BatchHeader &batch_
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], 
+		void* &log, void* &segment_header, size_t &logical_offset){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = batch_header.total_size;
 	void *batch_headers_log;
@@ -439,7 +444,8 @@ std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(BatchHeader &batch_
 	return nullptr;
 }
 
-std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], 
+		void* &log, void* &segment_header, size_t &logical_offset){
 	unsigned long long int segment_metadata = (unsigned long long int)current_segment_;
 	size_t msgSize = batch_header.total_size;
 	log = (void*)(log_addr_.fetch_add(msgSize));

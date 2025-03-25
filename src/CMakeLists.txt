@@ -3,6 +3,7 @@ cmake_policy(SET CMP0144 NEW)
 include(cmake/heartbeat_grpc.cmake)
 include(cmake/scalog_sequencer_grpc.cmake)
 include(cmake/corfu_sequencer_grpc.cmake)
+include(cmake/corfu_replication_grpc.cmake)
 
 find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
@@ -44,12 +45,14 @@ configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
 add_executable(embarlet 
     embarlet/embarlet.cc
-    disk_manager/disk_manager.cc 
-    disk_manager/disk_manager.h 
+    disk_manager/disk_manager.cc
+    disk_manager/disk_manager.h
+    disk_manager/corfu_replication_manager.cc
+    disk_manager/corfu_replication_manager.h
     cxl_manager/cxl_manager.cc
-    cxl_manager/cxl_manager.h 
+    cxl_manager/cxl_manager.h
     network_manager/network_manager.cc
-    network_manager/network_manager.h 
+    network_manager/network_manager.h
     embarlet/heartbeat.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
@@ -68,6 +71,7 @@ target_link_libraries(embarlet
     mimalloc
     absl::flat_hash_map
 	scalog_sequencer_grpc_proto
+	corfu_replication_grpc_proto
 	heartbeat_grpc_proto
     cxxopts::cxxopts
     grpc++_reflection
@@ -75,6 +79,10 @@ target_link_libraries(embarlet
     protobuf::libprotobuf
     ${FOLLY_LIBRARIES}
     Threads::Threads
+)
+
+set_target_properties(embarlet PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
 add_executable(throughput_test
@@ -101,6 +109,10 @@ target_link_libraries(throughput_test
     Threads::Threads
 )
 
+set_target_properties(throughput_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 add_executable(scalog_global_sequencer
     cxl_manager/scalog_global_sequencer.cc
     cxl_manager/scalog_global_sequencer.h
@@ -120,6 +132,10 @@ target_link_libraries(scalog_global_sequencer
     Threads::Threads
 )
 
+set_target_properties(scalog_global_sequencer PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 add_executable(corfu_global_sequencer
     cxl_manager/corfu_global_sequencer.cc
 )
@@ -137,3 +153,8 @@ target_link_libraries(corfu_global_sequencer
     protobuf::libprotobuf
     Threads::Threads
 )
+
+set_target_properties(corfu_global_sequencer PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
