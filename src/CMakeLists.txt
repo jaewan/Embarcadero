@@ -60,6 +60,8 @@ add_executable(embarlet
     disk_manager/disk_manager.h 
     cxl_manager/cxl_manager.cc
     cxl_manager/cxl_manager.h 
+    cxl_manager/scalog_local_sequencer.cc
+    cxl_manager/scalog_local_sequencer.h
     network_manager/network_manager.cc
     network_manager/network_manager.h 
     embarlet/heartbeat.cc
