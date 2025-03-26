@@ -109,7 +109,7 @@ void Publisher::Init(int ack_level) {
         std::this_thread::yield();
     }
     
-    VLOG(2) << "Publisher initialization complete with " << num_threads_.load() << " threads";
+    VLOG(5) << "Publisher initialization complete with " << num_threads_.load() << " threads";
 }
 
 void Publisher::Publish(char* message, size_t len) {
@@ -163,14 +163,14 @@ void Publisher::Poll(size_t n) {
     pubQue_.ReturnReads();
     
     // Wait for all messages to be sent
-    VLOG(2) << "Polling for " << n << " messages to be published";
+    VLOG(5) << "Polling for " << n << " messages to be published";
     while (client_order_ < n) {
         std::this_thread::yield();
     }
     
     // If acknowledgments are enabled, wait for all acks
     if (ack_level_ >= 1) {
-        VLOG(2) << "Waiting for acknowledgments, received " << ack_received_ << " out of " << client_order_;
+        VLOG(5) << "Waiting for acknowledgments, received " << ack_received_ << " out of " << client_order_;
         while (ack_received_ < client_order_) {
             std::this_thread::yield();
         }
@@ -187,7 +187,7 @@ void Publisher::Poll(size_t n) {
         }
     }
     
-    VLOG(2) << "Polling complete, all messages sent and acknowledged";
+    VLOG(5) << "Polling complete, all messages sent and acknowledged";
 }
 
 void Publisher::DEBUG_check_send_finish() {
@@ -203,7 +203,7 @@ void Publisher::DEBUG_check_send_finish() {
 }
 
 void Publisher::FailBrokers(size_t total_message_size, double failure_percentage, std::function<bool()> killbrokers) {
-    VLOG(2) << "Setting up broker failure simulation at " << failure_percentage << " of total messages";
+    VLOG(5) << "Setting up broker failure simulation at " << failure_percentage << " of total messages";
     
     measure_real_time_throughput_ = true;
     size_t num_brokers = nodes_.size();
@@ -216,7 +216,7 @@ void Publisher::FailBrokers(size_t total_message_size, double failure_percentage
     // Start thread to monitor progress and kill brokers at specified percentage
     kill_brokers_thread_ = std::thread([=, this]() {
         size_t bytes_to_kill_brokers = total_message_size * failure_percentage;
-        VLOG(2) << "Will kill brokers after sending " << bytes_to_kill_brokers << " bytes";
+        VLOG(5) << "Will kill brokers after sending " << bytes_to_kill_brokers << " bytes";
         
         while (!shutdown_ && total_sent_bytes_ < bytes_to_kill_brokers) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -289,7 +289,7 @@ void Publisher::EpollAckThread() {
         return;
     }
     
-    VLOG(2) << "Starting acknowledgment server on port " << ack_port_;
+    VLOG(5) << "Starting acknowledgment server on port " << ack_port_;
     
     // Create server socket
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -467,11 +467,11 @@ void Publisher::EpollAckThread() {
     close(epoll_fd);
     close(server_sock);
     
-    VLOG(2) << "Acknowledgment server shut down, received " << total_received << " acks";
+    VLOG(5) << "Acknowledgment server shut down, received " << total_received << " acks";
 }
 
 void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
-    VLOG(2) << "Starting publisher thread " << pubQuesIdx << " for broker " << broker_id;
+    VLOG(5) << "Starting publisher thread " << pubQuesIdx << " for broker " << broker_id;
     
     int sock = -1;
     int efd = -1;
@@ -837,7 +837,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 }
 
 void Publisher::SubscribeToClusterStatus() {
-    VLOG(2) << "Starting cluster status subscription";
+    VLOG(5) << "Starting cluster status subscription";
     
     // Prepare client info for initial request
     heartbeat_system::ClientInfo client_info;
@@ -866,7 +866,7 @@ void Publisher::SubscribeToClusterStatus() {
                 if (!connected_) {
                     int num_brokers = 1 + new_nodes.size();
                     queueSize_ /= num_brokers;
-                    VLOG(2) << "Adjusted queue size to " << queueSize_ << " for " << num_brokers << " brokers";
+                    VLOG(5) << "Adjusted queue size to " << queueSize_ << " for " << num_brokers << " brokers";
                 }
                 
                 // Add new brokers
@@ -881,7 +881,7 @@ void Publisher::SubscribeToClusterStatus() {
                         return;
                     }
                     
-                    VLOG(2) << "Added new broker: " << broker_id << " at " << addr;
+                    VLOG(5) << "Added new broker: " << broker_id << " at " << addr;
                 }
                 
                 // Sort brokers for deterministic round-robin assignment
@@ -898,7 +898,7 @@ void Publisher::SubscribeToClusterStatus() {
                 
                 // Signal that we're connected
                 connected_ = true;
-                VLOG(2) << "Connected to cluster with head broker ID " << brokers_[0];
+                VLOG(5) << "Connected to cluster with head broker ID " << brokers_[0];
             }
         } else {
             // Handle read error or end of stream
@@ -919,7 +919,7 @@ void Publisher::SubscribeToClusterStatus() {
 }
 
 bool Publisher::AddPublisherThreads(size_t num_threads, int broker_id) {
-    VLOG(2) << "Adding " << num_threads << " publisher threads for broker " << broker_id;
+    VLOG(5) << "Adding " << num_threads << " publisher threads for broker " << broker_id;
     
     // Allocate buffers
     if (!pubQue_.AddBuffers(queueSize_)) {

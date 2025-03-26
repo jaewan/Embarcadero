@@ -125,22 +125,10 @@ ResultWriter::ResultWriter(const cxxopts::ParseResult& result)
             LOG(ERROR) << "Error creating header file: " << e.what();
         }
     }
-    
-    // Log the configuration for this test run
-    LOG(INFO) << "ResultWriter initialized for test " << test_name << ":"
-              << " message_size=" << message_size
-              << " total_size=" << total_message_size
-              << " threads=" << num_threads_per_broker
-              << " ack=" << ack_level
-              << " order=" << order
-              << " rep_factor=" << replication_factor
-              << " clients=" << num_clients
-              << " sequencer=" << seq_type;
 }
 
 ResultWriter::~ResultWriter() {
     if (!record_result_) {
-        LOG(INFO) << "Result recording disabled, skipping file write";
         return;
     }
     

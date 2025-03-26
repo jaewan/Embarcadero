@@ -25,7 +25,7 @@ Buffer::Buffer(size_t num_buf, size_t num_threads_per_broker, int client_id, siz
     header_.next_msg_diff = 0;
     header_.complete = 0;
     
-    VLOG(2) << "Buffer created with " << num_buf << " buffers, " 
+    VLOG(5) << "Buffer created with " << num_buf << " buffers, " 
             << num_threads_per_broker << " threads per broker, "
             << "message size: " << message_size 
             << ", padded size: " << header_.paddedSize;
@@ -89,7 +89,7 @@ bool Buffer::AddBuffers(size_t buf_size) {
         bufs_[idx + i].tail = sizeof(Embarcadero::BatchHeader);
 #endif
         
-        VLOG(2) << "Added buffer " << (idx + i) << " with size " 
+        VLOG(5) << "Added buffer " << (idx + i) << " with size " 
                 << allocated << " bytes";
     }
     
@@ -354,10 +354,10 @@ void* Buffer::Read(int bufIdx, size_t& len) {
 
 void Buffer::ReturnReads() {
     shutdown_ = true;
-    VLOG(2) << "Buffer reads returned, shutdown signal set";
+    VLOG(5) << "Buffer reads returned, shutdown signal set";
 }
 
 void Buffer::WriteFinished() {
     seal_from_read_ = true;
-    VLOG(2) << "Buffer writing finished, seal from read signal set";
+    VLOG(5) << "Buffer writing finished, seal from read signal set";
 }

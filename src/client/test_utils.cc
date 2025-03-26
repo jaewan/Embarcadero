@@ -19,13 +19,13 @@ void FillRandomData(char* buffer, size_t size) {
 
 // Helper function to log test parameters
 void LogTestParameters(const std::string& test_name, const cxxopts::ParseResult& result) {
-    LOG(INFO) << "===== " << test_name << " ====="
-              << "\n  Message size: " << result["size"].as<size_t>() << " bytes"
-              << "\n  Total message size: " << result["total_message_size"].as<size_t>() << " bytes"
-              << "\n  Threads per broker: " << result["num_threads_per_broker"].as<size_t>()
-              << "\n  ACK level: " << result["ack_level"].as<int>()
-              << "\n  Order level: " << result["order_level"].as<int>()
-              << "\n  Sequencer: " << result["sequencer"].as<std::string>();
+    LOG(INFO) << "\n\n===== " << test_name << " ====="
+              << "\n\t  Message size: " << result["size"].as<size_t>() << " bytes"
+              << "\n\t  Total message size: " << result["total_message_size"].as<size_t>() << " bytes"
+              << "\n\t  Threads per broker: " << result["num_threads_per_broker"].as<size_t>()
+              << "\n\t  ACK level: " << result["ack_level"].as<int>()
+              << "\n\t  Order level: " << result["order_level"].as<int>()
+              << "\n\t  Sequencer: " << result["sequencer"].as<std::string>();
 }
 
 // Helper class to track and report test progress
@@ -202,13 +202,13 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
         
         // Synchronize with other clients
         synchronizer.fetch_sub(1);
-        LOG(INFO) << "Waiting for other clients to initialize, " << synchronizer.load() << " remaining...";
+        VLOG(5) << "Waiting for other clients to initialize, " << synchronizer.load() << " remaining...";
         
         while (synchronizer.load() != 0) {
             std::this_thread::yield();
         }
         
-        LOG(INFO) << "All clients ready, starting publish test";
+        VLOG(5) << "All clients ready, starting publish test";
         
         // Create progress tracker
         ProgressTracker progress(n, 1000);
@@ -227,7 +227,7 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
         }
         
         // Finalize publishing
-        VLOG(3) << "Finished publishing from client";
+        VLOG(5) << "Finished publishing from client";
         p.DEBUG_check_send_finish();
         p.Poll(n);
         
@@ -263,7 +263,8 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
     LOG(INFO) << "Starting subscribe throughput test for " << total_message_size << " bytes of data";
     
     // Create progress tracker for the receiving process
-    size_t total_expected_bytes = total_message_size + (total_message_size / message_size) * sizeof(Embarcadero::MessageHeader);
+    size_t total_expected_bytes = total_message_size + (total_message_size / message_size) * 
+			sizeof(Embarcadero::MessageHeader);
     ProgressTracker progress(total_expected_bytes, 2000);
     
     try {
@@ -277,7 +278,7 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
         auto receive_start = std::chrono::high_resolution_clock::now();
         
         // Wait for all messages to be received
-        LOG(INFO) << "Waiting to receive " << total_message_size << " bytes of data";
+        VLOG(5) << "Waiting to receive " << total_message_size << " bytes of data";
         
         // Wait for all data to be received
         s.DEBUG_wait(total_message_size, message_size);
@@ -526,11 +527,6 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 
 bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE], 
                    int order, SequencerType seq_type, int replication_factor, bool replicate_tinode) {
-    LOG(INFO) << "Creating new topic '" << topic << "' with order=" << order
-              << ", replication_factor=" << replication_factor
-              << ", sequencer=" << static_cast<int>(seq_type)
-              << (replicate_tinode ? ", with tinode replication" : "");
-    
     // Prepare request
     grpc::ClientContext context;
     heartbeat_system::CreateTopicRequest create_topic_req;
@@ -563,7 +559,6 @@ bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAM
         return false;
     }
     
-    LOG(INFO) << "Successfully created topic '" << topic << "'";
     return true;
 }
 

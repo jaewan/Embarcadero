@@ -224,7 +224,7 @@ int main(int argc, char* argv[]) {
     // Shutdown the cluster
     google::protobuf::Empty request, response;
     grpc::ClientContext context;
-    LOG(INFO) << "Calling TerminateCluster";
+    VLOG(5) << "Calling TerminateCluster";
     stub->TerminateCluster(&context, request, &response);
     
     return 0;

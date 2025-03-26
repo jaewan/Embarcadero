@@ -179,7 +179,7 @@ bool Subscriber::DEBUG_check_order(int order) {
     }
     
     if (order_correct) {
-        VLOG(2) << "Order check passed for level " << order;
+        VLOG(5) << "Order check passed for level " << order;
     } else {
         LOG(ERROR) << "Order check failed for level " << order;
     }
@@ -188,7 +188,7 @@ bool Subscriber::DEBUG_check_order(int order) {
 }
 
 void Subscriber::StoreLatency() {
-    VLOG(2) << "Storing latency measurements";
+    VLOG(5) << "Storing latency measurements";
     
     if (!measure_latency_) {
         LOG(WARNING) << "Latency measurement was not enabled at subscriber initialization";
@@ -282,7 +282,7 @@ void Subscriber::StoreLatency() {
 }
 
 void Subscriber::DEBUG_wait(size_t total_msg_size, size_t msg_size) {
-    VLOG(2) << "Waiting to receive " << total_msg_size << " bytes of data with message size " << msg_size;
+    VLOG(5) << "Waiting to receive " << total_msg_size << " bytes of data with message size " << msg_size;
     
     // Calculate expected total data size based on padded message size
     msg_size = ((msg_size + 64 - 1) / 64) * 64;
@@ -300,7 +300,7 @@ void Subscriber::DEBUG_wait(size_t total_msg_size, size_t msg_size) {
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
             double percentage = static_cast<double>(DEBUG_count_) / total_data_size * 100.0;
-            VLOG(2) << "Received " << DEBUG_count_ << "/" << total_data_size 
+            VLOG(5) << "Received " << DEBUG_count_ << "/" << total_data_size 
                     << " bytes (" << std::fixed << std::setprecision(1) << percentage << "%)";
             last_log_time = now;
         }
@@ -310,7 +310,7 @@ void Subscriber::DEBUG_wait(size_t total_msg_size, size_t msg_size) {
     double seconds = std::chrono::duration<double>(end - start).count();
     double throughput_mbps = (total_data_size / seconds) / (1024 * 1024);
     
-    LOG(INFO) << "Received all " << total_data_size << " bytes in " << seconds << " seconds"
+    VLOG(3) << "Received all " << total_data_size << " bytes in " << seconds << " seconds"
               << " (" << throughput_mbps << " MB/s)";
 }
 
@@ -420,7 +420,7 @@ void Subscriber::SubscribeThread(int epoll_fd, absl::flat_hash_map<int, std::pai
 }
 
 void Subscriber::CreateAConnection(int broker_id, std::string address) {
-    VLOG(2) << "Creating connections to broker " << broker_id << " at " << address;
+    VLOG(5) << "Creating connections to broker " << broker_id << " at " << address;
     
     // Parse address to get IP and port
     auto [addr, addressPort] = ParseAddressPort(address);
@@ -434,8 +434,9 @@ void Subscriber::CreateAConnection(int broker_id, std::string address) {
     
     // Map to track file descriptors to message buffers
     absl::flat_hash_map<int, std::pair<void*, msgIdx*>> fd_to_msg;
+		std::vector<int> pending_sockets;
     
-    // Create multiple connections to the broker
+    // Create multiple connections to the broker in parallel
     int successful_connections = 0;
     
     for (int i = 0; i < NUM_SUB_CONNECTIONS; i++) {
@@ -445,72 +446,118 @@ void Subscriber::CreateAConnection(int broker_id, std::string address) {
             LOG(ERROR) << "Failed to create socket for broker " << broker_id;
             continue;
         }
-        
-        // Allocate message buffer and metadata
+
+				// Add to epoll for write readiness (connection completion)
+        epoll_event ev;
+        ev.events = EPOLLOUT;
+        ev.data.fd = sock;
+
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) < 0) {
+            LOG(ERROR) << "Failed to add socket to epoll: " << strerror(errno);
+            close(sock);
+            continue;
+        }
+
+        pending_sockets.push_back(sock);
+    }
+
+		// Wait for connections to complete with timeout
+    const int CONNECT_TIMEOUT_MS = 2000; // 2 seconds timeout
+    epoll_event events[NUM_SUB_CONNECTIONS];
+
+    int nfds = epoll_wait(epoll_fd, events, NUM_SUB_CONNECTIONS, CONNECT_TIMEOUT_MS);
+    if (nfds <= 0) {
+        LOG(ERROR) << "Connection timeout or error for broker " << broker_id;
+        // Clean up pending sockets
+        for (int sock : pending_sockets) {
+            close(sock);
+        }
+        close(epoll_fd);
+        return;
+    }
+
+		// Process connected sockets
+    for (int n = 0; n < nfds; n++) {
+        int sock = events[n].data.fd;
+
+        // Verify connection succeeded
+        int error = 0;
+        socklen_t len = sizeof(error);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
+            LOG(ERROR) << "Connection failed for broker " << broker_id << ": " << strerror(error);
+            close(sock);
+            continue;
+        }
+
+        // Connection succeeded - allocate buffer and setup for data
         void* buffer = calloc(buffer_size_, sizeof(char));
         msgIdx* msg_idx = static_cast<msgIdx*>(malloc(sizeof(msgIdx)));
-        
+
         if (!buffer || !msg_idx) {
-            LOG(ERROR) << "Failed to allocate memory for message buffer or metadata";
+            LOG(ERROR) << "Failed to allocate memory for message buffer";
             if (buffer) free(buffer);
             if (msg_idx) free(msg_idx);
             close(sock);
             continue;
         }
-        
+
         // Initialize message index
         new (msg_idx) msgIdx(broker_id);
-        
+
         // Store message buffer and metadata
         messages_[0].push_back(std::make_pair(buffer, msg_idx));
         fd_to_msg.insert({sock, std::make_pair(buffer, msg_idx)});
-        
-        // Create subscription request
+
+        // Send subscription request asynchronously
         Embarcadero::EmbarcaderoReq shake;
         shake.num_msg = 0;
         shake.client_id = client_id_;
         shake.last_addr = 0;
         shake.client_req = Embarcadero::Subscribe;
         memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
-        
-        // Send subscription request
-        int ret = send(sock, &shake, sizeof(shake), 0);
-        if (ret < static_cast<int>(sizeof(shake))) {
-            LOG(ERROR) << "Failed to send subscription request to broker " << broker_id 
-                       << " (" << ret << "/" << sizeof(shake) << " bytes sent): " << strerror(errno);
-            close(sock);
-            continue;
-        }
-        
-        // Add socket to epoll
+
+        // Modify epoll to watch for read events
         epoll_event ev;
         ev.events = EPOLLIN;
         ev.data.fd = sock;
-        
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) == -1) {
-            LOG(ERROR) << "Failed to add socket to epoll: " << strerror(errno);
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, sock, &ev) < 0) {
+            LOG(ERROR) << "Failed to modify epoll for socket: " << strerror(errno);
             close(sock);
             continue;
         }
-        
-        VLOG(3) << "Successfully established connection " << i << " to broker " << broker_id;
+
+        // Send subscription request
+        if (send(sock, &shake, sizeof(shake), 0) < static_cast<int>(sizeof(shake))) {
+            LOG(ERROR) << "Failed to send subscription request: " << strerror(errno);
+            close(sock);
+            continue;
+        }
+
+        VLOG(3) << "Successfully established connection to broker " << broker_id;
         successful_connections++;
     }
-    
+
+    // Clean up any sockets that didn't connect
+    for (int sock : pending_sockets) {
+        if (fd_to_msg.find(sock) == fd_to_msg.end()) {
+            close(sock);
+        }
+    }
+
     if (successful_connections == 0) {
         LOG(ERROR) << "Failed to establish any connections to broker " << broker_id;
         close(epoll_fd);
         return;
     }
-    
+
     // Start thread to handle this broker's connections
     subscribe_threads_.emplace_back(&Subscriber::SubscribeThread, this, epoll_fd, fd_to_msg);
-    
-    VLOG(2) << "Created " << successful_connections << " connections to broker " << broker_id;
+        
+    VLOG(5) << "Created " << successful_connections << " connections to broker " << broker_id;
 }
 
 void Subscriber::SubscribeToClusterStatus() {
-    VLOG(2) << "Starting cluster status subscription";
+    VLOG(5) << "Starting cluster status subscription";
     
     // Prepare client info for initial request
     heartbeat_system::ClientInfo client_info;
@@ -550,7 +597,7 @@ void Subscriber::SubscribeToClusterStatus() {
                     nodes_[broker_id] = addr;
                     CreateAConnection(broker_id, addr);
                     
-                    VLOG(2) << "Added new broker: " << broker_id << " at " << addr;
+                    VLOG(5) << "Added new broker: " << broker_id << " at " << addr;
                 }
             }
             
@@ -575,79 +622,4 @@ void Subscriber::SubscribeToClusterStatus() {
     }
     
     VLOG(3) << "Cluster status subscription thread exiting";
-}
-
-void Subscriber::ClusterProbeLoop() {
-    VLOG(2) << "Starting cluster probe loop";
-    
-    // Prepare client info for requests
-    heartbeat_system::ClientInfo client_info;
-    heartbeat_system::ClusterStatus cluster_status;
-    
-    {
-        absl::MutexLock lock(&mutex_);
-        for (const auto& it : nodes_) {
-            client_info.add_nodes_info(it.first);
-        }
-    }
-    
-    // Periodically poll for cluster status
-    while (!shutdown_) {
-        // Create new context for each request
-        grpc::ClientContext context;
-        grpc::Status status = stub_->GetClusterStatus(&context, client_info, &cluster_status);
-        
-        if (status.ok()) {
-            // If not already connected to head, add connection
-            if (!connected_) {
-                CreateAConnection(0, nodes_[0]);
-            }
-            
-            connected_ = true;
-            
-            // Process removed nodes
-            const auto& removed_nodes = cluster_status.removed_nodes();
-            if (!removed_nodes.empty()) {
-                absl::MutexLock lock(&mutex_);
-                
-                // Handle broker failures
-                for (const auto& id : removed_nodes) {
-                    LOG(WARNING) << "Broker " << id << " has failed";
-                    nodes_.erase(id);
-                    RemoveNodeFromClientInfo(client_info, id);
-                }
-            }
-            
-            // Process new nodes
-            const auto& new_nodes = cluster_status.new_nodes();
-            if (!new_nodes.empty()) {
-                absl::MutexLock lock(&mutex_);
-                
-                // Add new brokers
-                for (const auto& addr : new_nodes) {
-                    int broker_id = GetBrokerId(addr);
-                    
-                    if (nodes_.find(broker_id) != nodes_.end()) {
-                        continue;
-                    }
-                    
-                    VLOG(2) << "New broker reported: " << broker_id << " at " << addr;
-                    nodes_[broker_id] = addr;
-                    client_info.add_nodes_info(broker_id);
-                    CreateAConnection(broker_id, addr);
-                }
-            }
-        } else {
-            LOG(WARNING) << "Failed to get cluster status: " << status.error_message()
-                         << ". Head may be down, trying to reach other brokers.";
-            
-            // In a production implementation, we would attempt to connect to other brokers
-            // and establish a new connection to the newly elected head
-        }
-        
-        // Wait before next poll
-        std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_INTERVAL));
-    }
-    
-    VLOG(3) << "Cluster probe loop exiting";
 }
