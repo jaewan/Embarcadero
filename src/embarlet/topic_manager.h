@@ -39,19 +39,20 @@ class Topic{
 		bool GetMessageAddr(size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
-		std::function<void(void*, size_t)> GetCXLBuffer(struct BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+		std::function<void(void*, size_t)> GetCXLBuffer(struct BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], 
+				void* &log, void* &segment_header, size_t &logical_offset){
 			return (this->*GetCXLBufferFunc)(batch_header, topic, log, segment_header, logical_offset);
 		}
 
 	private:
 		inline void UpdateTInodeWritten(size_t written, size_t written_addr);
 		void CombinerThread();
-		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> KafkaGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> CorfuGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> Order3GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> Order4GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
-		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)>(Topic::*GetCXLBufferFunc)(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> KafkaGetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> CorfuGetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> Order3GetCXLBuffer(BatchHeader &batch_header,const  char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> Order4GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
 		const GetNewSegmentCallback get_new_segment_callback_;
 		struct TInode *tinode_;
 		struct TInode *replica_tinode_;
@@ -98,16 +99,16 @@ class TopicManager{
 		~TopicManager(){
 			VLOG(3) << "\t[TopicManager]\tDestructed";
 		}
-		bool CreateNewTopic(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, heartbeat_system::SequencerType);
-		void DeleteTopic(char topic[TOPIC_NAME_SIZE]);
-		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		bool CreateNewTopic(const char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, heartbeat_system::SequencerType);
+		void DeleteTopic(const char topic[TOPIC_NAME_SIZE]);
+		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 
 	private:
-		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE]);
-		struct TInode* CreateNewTopicInternal(char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, heartbeat_system::SequencerType);
-		int GetTopicIdx(char topic[TOPIC_NAME_SIZE]){
+		struct TInode* CreateNewTopicInternal(const char topic[TOPIC_NAME_SIZE]);
+		struct TInode* CreateNewTopicInternal(const char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, heartbeat_system::SequencerType);
+		int GetTopicIdx(const char topic[TOPIC_NAME_SIZE]){
 			return topic_to_idx_(topic) % MAX_TOPIC_SIZE;
 		}
 
