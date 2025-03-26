@@ -8,6 +8,8 @@
 #include "common/config.h"
 #include <thread>
 
+namespace Scalog {
+
 class ScalogGlobalSequencer : public ScalogSequencer::Service {
     public:
         ScalogGlobalSequencer(std::string scalog_seq_address);
@@ -60,3 +62,5 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
         /// Flag to indicate shutdown request
         std::atomic<bool> shutdown_requested_{false};
 };
+
+} // End of namespace Scalog

@@ -1,5 +1,7 @@
 #include "scalog_global_sequencer.h"
 
+namespace Scalog {
+
 ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
 	LOG(INFO) << "Starting Scalog global sequencer";
 
@@ -142,10 +144,12 @@ void ScalogGlobalSequencer::ReceiveLocalCut(int epoch, const char* topic, int br
 	}
 }
 
+} // End of namespace Scalog
+
 int main(int argc, char* argv[]){
     // Initialize scalog global sequencer
     std::string scalog_seq_address = "192.168.60.172:50051";
-    ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
+    Scalog::ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
 
     return 0;
 }
