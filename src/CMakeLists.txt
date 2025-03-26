@@ -88,13 +88,25 @@ set_target_properties(embarlet PROPERTIES
 )
 
 add_executable(throughput_test
-    client/throughput_test.cc
+    client/common.cc
+    client/common.h
+    client/buffer.cc
+    client/buffer.h
+    client/publisher.cc
+    client/publisher.h
+    client/subscriber.cc
+    client/subscriber.h
+    client/result_writer.cc
+    client/result_writer.h
+    client/test_utils.cc
+    client/test_utils.h
+    client/main.cc
 )
 
 target_include_directories(throughput_test PUBLIC
-	"${CMAKE_CURRENT_BINARY_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_BINARY_DIR}"
-	"${CMAKE_CURRENT_SOURCE_DIR}/client"
+    "${CMAKE_CURRENT_SOURCE_DIR}/client"
 )
 
 target_link_libraries(throughput_test
@@ -102,13 +114,17 @@ target_link_libraries(throughput_test
     gflags
     mimalloc
     cxxopts::cxxopts
-	heartbeat_grpc_proto
-	corfu_sequencer_grpc_proto
-	grpc++_reflection
+    heartbeat_grpc_proto
+    corfu_sequencer_grpc_proto
+    grpc++_reflection
     grpc++
     protobuf::libprotobuf
     ${FOLLY_LIBRARIES}
     Threads::Threads
+)
+
+set_target_properties(throughput_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
 set_target_properties(throughput_test PROPERTIES
