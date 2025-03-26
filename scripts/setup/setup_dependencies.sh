@@ -26,6 +26,13 @@ function clean_all() {
     rm ~/embarc.disklog
 }
 
+function hugepage_setup() {
+	echo 10420 | sudo tee /proc/sys/vm/nr_hugepages # 20GB of huge pages
+	sudo sysctl -w net.core.wmem_max=16777216  # 16 MB
+	sudo sysctl -w net.core.rmem_max=16777216  # 16 MB
+	sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216"
+}
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -62,6 +69,7 @@ if $FORCE_INSTALL; then
 fi
 
 setup_common
+hugepage_setup
 install_dependencies
 setup_third_party
 
