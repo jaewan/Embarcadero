@@ -113,12 +113,12 @@ class CXLManager{
 		TInode* GetReplicaTInode(const char* topic);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
-		void RunSequencer(char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType);
+		void RunSequencer(const char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType);
 		void* GetCXLAddr(){return cxl_addr_;}
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
-		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 														struct MessageHeader** msg_to_order, struct TInode *tinode);
 		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t ordered_offset) {

@@ -14,6 +14,12 @@ or
 ./embarlet --follower
 ```
 
+### System Dependencies
+
+**Debian/Ubuntu**:
+```bash
+sudo apt-get update
+```
 
 
 ## Version
@@ -25,6 +31,7 @@ or
 ## Building
 To enable cgroup, add permission to the executables
 ```bash
+./scripts/setup/setup_dependencies.sh
 mkdir build
 cmake ../
 cmake --build .

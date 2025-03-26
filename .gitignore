@@ -2,7 +2,9 @@
 build/
 
 # Ignore external dependencies
-third_party/
+!third_party/
+third_party/*
+!third_party/CMakeLists.txt
 
 # Ignore vscode
 .vscode
