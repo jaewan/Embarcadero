@@ -194,7 +194,8 @@ void TopicManager::DeleteTopic(const char topic[TOPIC_NAME_SIZE]){
 }
 
 std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(BatchHeader &batch_header,
-		const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset){
+		const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, 
+		size_t &logical_offset, SequencerType &seq_type){
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()){
 		if(memcmp(topic, cxl_manager_.GetTInode(topic)->topic, TOPIC_NAME_SIZE) == 0){
@@ -206,11 +207,12 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(BatchHeader &batch
 				return nullptr;
 			}
 		}else{
-			LOG(ERROR) << "[GetCXLBuffer] Topic:" << topic << " was not created before:" << cxl_manager_.GetTInode(topic)->topic
+			LOG(ERROR) << "[etCXLBuffer] Topic:" << topic << " was not created before:" << cxl_manager_.GetTInode(topic)->topic
 			<< " memcmp:" << memcmp(topic, cxl_manager_.GetTInode(topic)->topic, TOPIC_NAME_SIZE);
 			return nullptr;
 		}
 	}
+	seq_type = topic_itr->second->GetSeqtype();
 	return topic_itr->second->GetCXLBuffer(batch_header, topic, log, segment_header, logical_offset);
 }
 
@@ -243,12 +245,20 @@ Topic::Topic(GetNewSegmentCallback get_new_segment, void* TInode_addr, TInode* r
 	batch_headers_ = (unsigned long long int)((uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].batch_headers_offset);
 	first_message_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].log_offset;
 	first_batch_headers_addr_ = (uint8_t*)cxl_addr_ + tinode_->offsets[broker_id_].batch_headers_offset;
+	replication_factor_ = tinode_->replication_factor;
 	ordered_offset_addr_ = nullptr;
 	ordered_offset_ = 0;
 	if(seq_type == KAFKA){
 		GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
 	}else if(seq_type == CORFU){
+		//TODO(Jae) change this to actual replica address
+		corfu_replication_client_ = std::make_unique<Corfu::CorfuReplicationClient>(topic_name, replication_factor_, "127.0.0.1:" + std::to_string(CORFU_REP_PORT));
+		if(!corfu_replication_client_->Connect()){
+			LOG(ERROR) << "Corfu replication client failed to connect to replica";
+		}
 		GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
+	}else if(seq_type == SCALOG){
+		//TODO(Tony) call Scalog Replication here
 	}else{
 		if(order_ == 3){
 			GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
@@ -383,7 +393,13 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(BatchHeader &batch_h
 			//segment_metadata = (unsigned long long int)segment_metadata_;
 		}
 	}
-	return nullptr;
+	return [this, batch_header](void* log, size_t place_holder)
+	{
+		VLOG(3) << "Callback called: " << replication_factor_;
+		if(replication_factor_ > 0){
+			corfu_replication_client_->ReplicateData(batch_header.log_idx, batch_header.total_size, log);
+		}
+	};
 }
 
 std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], 

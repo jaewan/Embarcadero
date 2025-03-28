@@ -1,4 +1,5 @@
 #include "disk_manager.h"
+#include "corfu_replication_manager.h"
 
 #include <unistd.h>
 #include <pwd.h>
@@ -101,13 +102,21 @@ void *mmap_large_buffer(size_t need, size_t &allocated){
 	return buffer;
 }
 
-DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, size_t queueCapacity):
+DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, 
+												heartbeat_system::SequencerType sequencerType, size_t queueCapacity):
 						 requestQueue_(queueCapacity),
 						 copyQueue_(1024),
 						 broker_id_(broker_id),
 						 cxl_addr_(cxl_addr),
-						 log_to_memory_(log_to_memory){
+						 log_to_memory_(log_to_memory),
+						 sequencerType_(sequencerType){
 	num_io_threads_ = NUM_MAX_BROKERS;
+	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
+	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
+		corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>();
+		return;
+	}
+
 	if(!log_to_memory){
 		const char *homedir;
 		if ((homedir = getenv("HOME")) == NULL) {
@@ -137,7 +146,7 @@ DiskManager::~DiskManager(){
 	std::optional<struct ReplicationRequest> sentinel = std::nullopt;
 	std::optional<struct MemcpyRequest> copy_sentinel = std::nullopt;
 	size_t n = num_io_threads_.load();
-	for (int i=0; i<n; i++){
+	for (size_t i=0; i<n; i++){
 		requestQueue_.blockingWrite(sentinel);
 		copyQueue_.blockingWrite(copy_sentinel);
 	}
@@ -152,6 +161,12 @@ DiskManager::~DiskManager(){
 }
 
 void DiskManager::CopyThread(){
+	if(sequencerType_ == heartbeat_system::SequencerType::SCALOG){
+		return;
+	}else if(sequencerType_ == heartbeat_system::SequencerType::CORFU){
+		corfu_replication_manager_->Shutdown();
+		return;
+	}
 	while(!stop_threads_){
 		std::optional<MemcpyRequest> optReq;
 		copyQueue_.blockingRead(optReq);

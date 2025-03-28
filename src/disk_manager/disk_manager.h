@@ -8,6 +8,7 @@
 #include "folly/MPMCQueue.h"
 #include "common/config.h"
 #include "../network_manager/network_manager.h"
+#include "corfu_replication_manager.h"
 
 namespace Embarcadero{
 
@@ -29,7 +30,8 @@ struct MemcpyRequest{
 
 class DiskManager{
 	public:
-		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory, size_t queueCapacity = 64);
+		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory,
+								heartbeat_system::SequencerType sequencerType, size_t queueCapacity = 64);
 		~DiskManager();
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
@@ -48,8 +50,10 @@ class DiskManager{
 		int broker_id_;
 		void* cxl_addr_;
 		bool log_to_memory_;
+		heartbeat_system::SequencerType sequencerType_;
 
 		NetworkManager *network_manager_;
+		std::unique_ptr<Corfu::CorfuReplicationManager> corfu_replication_manager_;
 
 		std::atomic<int> offset_{0};
 		bool stop_threads_ = false;

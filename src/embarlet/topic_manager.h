@@ -3,6 +3,7 @@
 
 #include "../cxl_manager/cxl_manager.h"
 #include "../disk_manager/disk_manager.h"
+#include "../disk_manager/corfu_replication_client.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/synchronization/mutex.h"
@@ -39,9 +40,14 @@ class Topic{
 		bool GetMessageAddr(size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 		void Combiner();
-		std::function<void(void*, size_t)> GetCXLBuffer(struct BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], 
+		std::function<void(void*, size_t)> GetCXLBuffer(struct BatchHeader &batch_header, 
+				const char topic[TOPIC_NAME_SIZE], 
 				void* &log, void* &segment_header, size_t &logical_offset){
 			return (this->*GetCXLBufferFunc)(batch_header, topic, log, segment_header, logical_offset);
+		}
+
+		heartbeat_system::SequencerType GetSeqtype(){
+			return seq_type_;
 		}
 
 	private:
@@ -63,6 +69,8 @@ class Topic{
 		heartbeat_system::SequencerType seq_type_;
 		void* cxl_addr_;
 
+		std::unique_ptr<Corfu::CorfuReplicationClient> corfu_replication_client_;
+
 		size_t logical_offset_;
 		size_t written_logical_offset_;
 		void* written_physical_addr_;
@@ -79,9 +87,11 @@ class Topic{
 		absl::flat_hash_map<size_t, size_t> written_messages_range_;
 
 		//TInode cache
+		int replication_factor_;
 		void* ordered_offset_addr_;
 		void* current_segment_;
 		size_t ordered_offset_;
+
 		bool stop_threads_ = false;
 
 		std::vector<std::thread> combiningThreads_;
@@ -101,7 +111,7 @@ class TopicManager{
 		}
 		bool CreateNewTopic(const char topic[TOPIC_NAME_SIZE], int order, int replication_factor, bool replicate_tinode, heartbeat_system::SequencerType);
 		void DeleteTopic(const char topic[TOPIC_NAME_SIZE]);
-		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset);
+		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header, size_t &logical_offset, heartbeat_system::SequencerType &seq_type);
 		bool GetMessageAddr(const char* topic, size_t &last_offset,
 				void* &last_addr, void* &messages, size_t &messages_size);
 
