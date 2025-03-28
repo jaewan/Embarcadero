@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <queue>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -127,9 +128,11 @@ CXLManager::~CXLManager(){
 	VLOG(3) << "[CXLManager]: \t\tDestructed";
 }
 
-std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE], 
-		void* &log, void* &segment_header, size_t &logical_offset){
-	return topic_manager_->GetCXLBuffer(batch_header, topic, log, segment_header, logical_offset);
+std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(BatchHeader &batch_header,
+                const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header,
+                size_t &logical_offset, SequencerType &seq_type) {
+	return topic_manager_->GetCXLBuffer(batch_header, topic, log, segment_header,
+					logical_offset, seq_type);
 }
 
 inline int hashTopic(const char topic[TOPIC_NAME_SIZE]) {

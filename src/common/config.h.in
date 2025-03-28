@@ -43,6 +43,7 @@ namespace Embarcadero{
 
 //********* Corfu configs *********
 #define CORFU_SEQ_PORT 50052
+#define CORFU_REP_PORT 50053
 
 //********* Scalog configs *********
 #define SCALOG_SEQ_PORT 50051
