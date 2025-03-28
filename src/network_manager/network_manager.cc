@@ -488,10 +488,11 @@ void NetworkManager::HandlePublishRequest(
         void* segment_header = nullptr;
         void* buf = nullptr;
         size_t logical_offset;
+				SequencerType seq_type;
         
-        std::function<void(void*, size_t)> kafka_callback = 
+        std::function<void(void*, size_t)> non_emb_seq_callback = 
             cxl_manager_->GetCXLBuffer(batch_header, handshake.topic, buf, 
-                                      segment_header, logical_offset);
+                                      segment_header, logical_offset, seq_type);
         
         if (!buf) {
             LOG(ERROR) << "Failed to get CXL buffer";
@@ -522,7 +523,7 @@ void NetworkManager::HandlePublishRequest(
                 to_read -= bytes_to_next_header;
                 bytes_to_next_header = header->paddedSize;
                 
-                if (kafka_callback) {
+                if (seq_type == KAFKA) {
                     header->logical_offset = logical_offset;
                     if (segment_header == nullptr) {
                         LOG(ERROR) << "segment_header is null!";
@@ -552,8 +553,11 @@ void NetworkManager::HandlePublishRequest(
         }
         
         // Finalize batch processing
-        if (kafka_callback) {
-            kafka_callback((void*)header, logical_offset - 1);
+        if (non_emb_seq_callback) {
+            non_emb_seq_callback((void*)header, logical_offset - 1);
+						if (seq_type == CORFU) {
+							//TODO(Jae) Replication ack
+						}
         }
     }
     

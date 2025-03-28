@@ -49,6 +49,8 @@ add_executable(embarlet
     disk_manager/disk_manager.h
     disk_manager/corfu_replication_manager.cc
     disk_manager/corfu_replication_manager.h
+    disk_manager/corfu_replication_client.cc
+    disk_manager/corfu_replication_client.h
     cxl_manager/cxl_manager.cc
     cxl_manager/cxl_manager.h 
     cxl_manager/scalog_local_sequencer.cc
