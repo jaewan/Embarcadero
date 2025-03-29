@@ -500,8 +500,8 @@ void NetworkManager::HandlePublishRequest(
         }
         
         // Receive message data
+				MessageHeader* header = nullptr;
         size_t read = 0;
-        MessageHeader* header;
         size_t header_size = sizeof(MessageHeader);
         size_t bytes_to_next_header = 0;
         
@@ -773,11 +773,12 @@ void NetworkManager::AckThread(const char* topic, int ack_fd) {
     
     while (!stop_threads_) {
         // Find minimum replication offset across all replicas
+				int num_brokers = get_num_brokers_callback_();
         size_t min = std::numeric_limits<size_t>::max();
         size_t r[replication_factor];
         
         for (int i = 0; i < replication_factor; i++) {
-            int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
+            int b = (broker_id_ + num_brokers - i) % num_brokers;
             r[i] = tinode->offsets[b].replication_done[broker_id_];
             if (min > r[i]) {
                 min = r[i];

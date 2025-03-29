@@ -49,8 +49,9 @@ namespace Embarcadero{
 #define SCALOG_SEQ_PORT 50051
 #define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
 	
-using CreateTopicEntryCallback = std::function<bool(char*, int, int, bool, heartbeat_system::SequencerType)>;
+using GetNumBrokersCallback = std::function<int()>;
 using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers, 
 														struct MessageHeader** msg_to_order, struct TInode *tinode)>;
+using CreateTopicEntryCallback = std::function<bool(char*, int, int, bool, heartbeat_system::SequencerType)>;
 } // End of namespace Embarcadero
 #endif // CONFIG_H
