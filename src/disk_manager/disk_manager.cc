@@ -111,7 +111,6 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 						 log_to_memory_(log_to_memory),
 						 sequencerType_(sequencerType){
 	num_io_threads_ = NUM_MAX_BROKERS;
-
 	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
 	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 		corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>();
@@ -131,11 +130,6 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 				return ;
 			}
 		}
-	}
-
-	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
-		//TODO(Tony) redirect to your implementation
-	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 	}
 
 	for (size_t i=0; i< num_io_threads_; i++){
