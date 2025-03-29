@@ -364,7 +364,7 @@ Topic::Topic(
         GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
     } else if (seq_type == CORFU) {
         // Initialize Corfu replication client
-				// TODO(Jae) change this to actual replica address
+		// TODO(Jae) change this to actual replica address
         corfu_replication_client_ = std::make_unique<Corfu::CorfuReplicationClient>(
             topic_name, 
             replication_factor_, 
@@ -377,17 +377,17 @@ Topic::Topic(
         
         GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
     } else if (seq_type == SCALOG) {
-				// TODO(Jae) change this to actual replica address
-        corfu_replication_client_ = std::make_unique<Corfu::CorfuReplicationClient>(
+		// TODO(Tony) change this to actual replica address
+        scalog_replication_client_ = std::make_unique<Scalog::ScalogReplicationClient>(
             topic_name, 
             replication_factor_, 
-            "127.0.0.1:" + std::to_string(CORFU_REP_PORT)
+            "127.0.0.1:" + std::to_string(SCALOG_REP_PORT)
         );
         
-        if (!corfu_replication_client_->Connect()) {
-            LOG(ERROR) << "Corfu replication client failed to connect to replica";
+        if (!scalog_replication_client_->Connect()) {
+            LOG(ERROR) << "Scalog replication client failed to connect to replica";
         }
-				GetCXLBufferFunc = &Topic::ScalogGetCXLBuffer;
+		GetCXLBufferFunc = &Topic::ScalogGetCXLBuffer;
     } else {
         // Set buffer function based on order
         if (order_ == 3) {
@@ -703,7 +703,6 @@ std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(
     return nullptr;
 }
 
-//TODO(Tony) Change the names appropriately to scalog from corfu
 std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
         BatchHeader &batch_header,
         const char topic[TOPIC_NAME_SIZE],
@@ -727,8 +726,8 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
         VLOG(3) << "Callback called: " << replication_factor_;
 
         // Handle replication if needed
-        if (replication_factor_ > 0 && corfu_replication_client_) {
-            corfu_replication_client_->ReplicateData(
+        if (replication_factor_ > 0 && scalog_replication_client_) {
+            scalog_replication_client_->ReplicateData(
                 batch_header.log_idx,
                 batch_header.total_size,
                 log_ptr

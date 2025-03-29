@@ -488,7 +488,7 @@ void NetworkManager::HandlePublishRequest(
         void* segment_header = nullptr;
         void* buf = nullptr;
         size_t logical_offset;
-				SequencerType seq_type;
+        SequencerType seq_type;
         
         std::function<void(void*, size_t)> non_emb_seq_callback = 
             cxl_manager_->GetCXLBuffer(batch_header, handshake.topic, buf, 
@@ -555,9 +555,9 @@ void NetworkManager::HandlePublishRequest(
         // Finalize batch processing
         if (non_emb_seq_callback) {
             non_emb_seq_callback((void*)header, logical_offset - 1);
-						if (seq_type == CORFU) {
-							//TODO(Jae) Replication ack
-						}
+            if (seq_type == CORFU) {
+                //TODO(Jae) Replication ack
+            }
         }
     }
     

@@ -13,7 +13,7 @@
 #include <heartbeat.grpc.pb.h>
 #include "../embarlet/heartbeat.h"
 #include <grpcpp/grpcpp.h>
-#include <scalog_local_sequencer.h>
+#include "scalog_local_sequencer.h"
 
 namespace Embarcadero{
 

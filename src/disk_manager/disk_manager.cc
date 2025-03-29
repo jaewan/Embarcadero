@@ -1,5 +1,6 @@
 #include "disk_manager.h"
 #include "corfu_replication_manager.h"
+#include "scalog_replication_manager.h"
 
 #include <unistd.h>
 #include <pwd.h>
@@ -113,6 +114,8 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 	num_io_threads_ = NUM_MAX_BROKERS;
 
 	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
+		scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>();
+		return;
 	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 		corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>();
 		return;
@@ -131,11 +134,6 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 				return ;
 			}
 		}
-	}
-
-	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
-		//TODO(Tony) redirect to your implementation
-	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 	}
 
 	for (size_t i=0; i< num_io_threads_; i++){
@@ -168,6 +166,7 @@ DiskManager::~DiskManager(){
 
 void DiskManager::CopyThread(){
 	if(sequencerType_ == heartbeat_system::SequencerType::SCALOG){
+		scalog_replication_manager_->Shutdown();
 		return;
 	}else if(sequencerType_ == heartbeat_system::SequencerType::CORFU){
 		corfu_replication_manager_->Shutdown();
