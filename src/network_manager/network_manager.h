@@ -68,6 +68,9 @@ public:
     
     void SetDiskManager(DiskManager* disk_manager) { disk_manager_ = disk_manager; }
     void SetCXLManager(CXLManager* cxl_manager) { cxl_manager_ = cxl_manager; }
+		void RegisterGetNumBrokersCallback(GetNumBrokersCallback callback){
+			get_num_brokers_callback_ = callback;
+		}
 
 private:
     // Network socket utility functions
@@ -111,6 +114,8 @@ private:
     // Manager dependencies
     CXLManager* cxl_manager_ = nullptr;
     DiskManager* disk_manager_ = nullptr;
+
+		Embarcadero::GetNumBrokersCallback get_num_brokers_callback_;
 };
 
 } // namespace Embarcadero
