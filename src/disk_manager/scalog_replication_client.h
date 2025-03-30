@@ -7,6 +7,7 @@
 #include <random>
 #include <mutex>
 #include <atomic>
+#include "common/config.h"
 
 // Include the generated gRPC headers
 #include "scalog_replication.grpc.pb.h"
@@ -16,6 +17,8 @@ class Channel;
 }
 
 namespace Scalog {
+
+#define NUM_BROKERS 4
 
 /**
  * @brief Thread-safe client for the Scalog Replication Service
@@ -31,7 +34,7 @@ public:
      *
      * @param server_address The address of the server in format "hostname:port"
      */
-    explicit ScalogReplicationClient(const char* topic, size_t replication_factor, const std::string& server_address);
+    explicit ScalogReplicationClient(const char* topic, size_t replication_factor, const std::string& address, int broker_id);
 
     /**
      * @brief Destroy the client and release resources
@@ -113,6 +116,7 @@ private:
 
 		std::string topic_;
 		size_t replication_factor_;
+    int broker_id_;
     std::string server_address_;
     std::shared_ptr<grpc::Channel> channel_;
     std::unique_ptr<scalogreplication::ScalogReplicationService::Stub> stub_;

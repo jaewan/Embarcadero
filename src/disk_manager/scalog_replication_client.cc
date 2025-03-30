@@ -9,8 +9,11 @@
 
 namespace Scalog {
 
-ScalogReplicationClient::ScalogReplicationClient(const char* topic, size_t replication_factor, const std::string& server_address)
-	: topic_(topic), replication_factor_(replication_factor), server_address_(server_address) {
+ScalogReplicationClient::ScalogReplicationClient(const char* topic, size_t replication_factor, const std::string& address, int broker_id)
+	: topic_(topic), replication_factor_(replication_factor), broker_id_(broker_id) {
+
+		// Set the server address
+		server_address_ = address + ":" + std::to_string(SCALOG_REP_PORT + ((broker_id + 1) % NUM_BROKERS));
 
 		// Initialize sequential replication guarantee
 		last_sequentially_replicated_.store(0);
@@ -34,6 +37,8 @@ ScalogReplicationClient::~ScalogReplicationClient() {
 }
 
 bool ScalogReplicationClient::Connect(int timeout_seconds) {
+	LOG(INFO) << "Attempting to connect to server at " << server_address_ << " ...";
+
 	// Quick check without lock
 	if (is_connected_.load(std::memory_order_acquire)) {
 		return true;

@@ -12,6 +12,8 @@ namespace grpc {
 
 namespace Scalog {
 
+#define NUM_BROKERS 4
+
 class ScalogReplicationServiceImpl;
 
 class ScalogReplicationManager {
