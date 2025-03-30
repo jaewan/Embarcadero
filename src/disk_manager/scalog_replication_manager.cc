@@ -54,6 +54,12 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 				return CreateErrorResponse(response, "Service is shutting down", Status::CANCELLED);
 			}
 
+			// Increment request count
+			replicate_count_.fetch_add(1, std::memory_order_relaxed);
+
+			// Log the current replicate count
+			LOG(INFO) << "Number of replication requests: " << replicate_count_.load(std::memory_order_relaxed);
+
 			// Lock only for file operations
 			std::lock_guard<std::mutex> lock(file_mutex_);
 
@@ -147,6 +153,9 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 		int fd_ = -1;
 		std::atomic<bool> running_;
 		std::mutex file_mutex_;
+
+		// Testing
+		std::atomic<int64_t> replicate_count_{0}; // Track number of replication requests
 };
 
 ScalogReplicationManager::ScalogReplicationManager(const std::string& address,
@@ -157,6 +166,9 @@ ScalogReplicationManager::ScalogReplicationManager(const std::string& address,
 		service_ = std::make_unique<ScalogReplicationServiceImpl>(base_filename);
 
 		std::string server_address = address + ":" + (port.empty() ? std::to_string(SCALOG_REP_PORT) : port);
+
+		LOG(INFO) << "Starting scalog replication manager at " << server_address;
+
 		ServerBuilder builder;
 
 		// Set server options

@@ -99,8 +99,6 @@ void ScalogLocalSequencer::SendLocalCut(int local_cut, const char* topic) {
 			global_cut_[local_epoch_][static_cast<int>(entry.first)] = static_cast<int>(entry.second);
 		}
 
-		LOG(INFO) << "Received global cut at epoch " << local_epoch_ << " for broker " << broker_id_;
-
 		ScalogSequencer(topic, global_cut_);
 	}
 

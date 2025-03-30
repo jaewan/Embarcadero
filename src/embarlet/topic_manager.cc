@@ -381,7 +381,8 @@ Topic::Topic(
         scalog_replication_client_ = std::make_unique<Scalog::ScalogReplicationClient>(
             topic_name, 
             replication_factor_, 
-            "127.0.0.1:" + std::to_string(SCALOG_REP_PORT)
+            "localhost",
+            broker_id_ // broker_id used to determine the port
         );
         
         if (!scalog_replication_client_->Connect()) {
