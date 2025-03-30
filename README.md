@@ -29,9 +29,9 @@ sudo apt-get update
 - Version 1: Support multi-topic, fault tolerance (dynamic broker addition/removal, replication)
 
 ## Building
-To enable cgroup, add permission to the executables
+To enable cgroup, add permission to the executables.
 ```bash
-./scripts/setup/setup_dependencies.sh
+./scripts/setup/setup_dependencies.sh # Must run this from project's root directory
 mkdir build
 cmake ../
 cmake --build .
