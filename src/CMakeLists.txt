@@ -75,7 +75,7 @@ target_include_directories(embarlet PUBLIC
 
 target_link_libraries(embarlet
     numa
-    glog
+    glog::glog
     gflags
     mimalloc
     absl::flat_hash_map
@@ -118,7 +118,7 @@ target_include_directories(throughput_test PUBLIC
 )
 
 target_link_libraries(throughput_test
-    glog
+    glog::glog
     gflags
     mimalloc
     cxxopts::cxxopts
@@ -150,7 +150,7 @@ target_include_directories(scalog_global_sequencer PUBLIC
 )
 
 target_link_libraries(scalog_global_sequencer
-    glog
+    glog::glog
     absl::flat_hash_map
 	scalog_sequencer_grpc_proto
     grpc++
@@ -172,7 +172,7 @@ target_include_directories(corfu_global_sequencer PUBLIC
 )
 
 target_link_libraries(corfu_global_sequencer
-    glog
+    glog::glog
     absl::flat_hash_map
 	corfu_sequencer_grpc_proto
     grpc++
