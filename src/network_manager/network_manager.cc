@@ -769,8 +769,6 @@ void NetworkManager::AckThread(const char* topic, int ack_fd) {
     // Track last acknowledged replication offset
     int acked_replicated = -1;
     
-    VLOG(3) << "AckThread spawned";
-    
     while (!stop_threads_) {
         // Find minimum replication offset across all replicas
 				int num_brokers = get_num_brokers_callback_();
@@ -786,12 +784,10 @@ void NetworkManager::AckThread(const char* topic, int ack_fd) {
         }
         
         // Calculate how many new acknowledgments to send
-        size_t ack_count = min - acked_replicated;
+        size_t ack_count = min - (size_t)acked_replicated;
         if (ack_count == 0) {
             continue;
         }
-        
-        VLOG(3) << "Sending acknowledgment count: " << ack_count;
         
         // Send acknowledgments
         size_t acked_size = 0;
