@@ -363,6 +363,11 @@ Topic::Topic(
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
 
+		// Initialized Replication Done as -1
+		for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
+			tinode_->offsets[broker_id_].replication_done[i] = -1;
+		}
+
 		// Set appropriate get buffer function based on sequencer type
 		if (seq_type == KAFKA) {
 			GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
@@ -591,39 +596,37 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 	const size_t msg_size = batch_header.total_size;
 
 	// Get log address with batch offset
-	log = reinterpret_cast<void*>(
-			reinterpret_cast<uint8_t*>(
-				reinterpret_cast<void*>(
-					reinterpret_cast<uint8_t*>(cxl_addr_) + log_addr_.load()
-					)
-				) + batch_header.log_idx
-			);
+	log = reinterpret_cast<void*>(log_addr_.load()
+			+ batch_header.log_idx);
 
 	// Check for segment boundary issues
 	CheckSegmentBoundary(log, msg_size, segment_metadata);
 
 	// Return replication callback
-	return [this, batch_header](void* log_ptr, size_t /*placeholder*/) {
+	return [this, batch_header, log](void* log_ptr, size_t /*placeholder*/) {
 		// Handle replication if needed
 		if (replication_factor_ > 0 && corfu_replication_client_) {
-			MessageHeader *header = (MessageHeader*)log_ptr;
+			MessageHeader *header = (MessageHeader*)log;
 			// Wait until the message is combined
-			while(header->logical_offset == 0 || header->next_msg_diff == 0){
+			while(header->next_msg_diff == 0){
 				std::this_thread::yield();
 			}
-			size_t last_offset = header->logical_offset + batch_header.num_msg - 1;
+
 			corfu_replication_client_->ReplicateData(
 					batch_header.log_idx,
 					batch_header.total_size,
-					log_ptr
+					log
 					);
+
+			// Marking replication done
+			size_t last_offset = header->logical_offset + batch_header.num_msg - 1;
 			for (int i = 0; i < replication_factor_; i++) {
 				int num_brokers = get_num_brokers_callback_();
 				int b = (broker_id_ + num_brokers - i) % num_brokers;
 				if (tinode_->replicate_tinode) {
 					replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
 				}
-				replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+				tinode_->offsets[b].replication_done[broker_id_] = last_offset;
 			}
 		}
 	};
@@ -742,8 +745,6 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 
 	// Return replication callback
 	return [this, batch_header](void* log_ptr, size_t /*placeholder*/) {
-		VLOG(3) << "Callback called: " << replication_factor_;
-
 		// Handle replication if needed
 		if (replication_factor_ > 0 && corfu_replication_client_) {
 			corfu_replication_client_->ReplicateData(
