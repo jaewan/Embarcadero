@@ -15,9 +15,6 @@ ScalogReplicationClient::ScalogReplicationClient(const char* topic, size_t repli
 		// Set the server address
 		server_address_ = address + ":" + std::to_string(SCALOG_REP_PORT + broker_id);
 
-		// Initialize sequential replication guarantee
-		last_sequentially_replicated_.store(0);
-
 		// Initialize random generator for exponential backoff
 		{
 			std::lock_guard<std::mutex> lock(rng_mutex_);
@@ -70,6 +67,7 @@ bool ScalogReplicationClient::Connect(int timeout_seconds) {
 	return connected;
 }
 
+//TODO(Tony) have num_msg as argument and send it to rep manager so the manager can keep track of num_msg as well.
 bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, void* data,
 		int max_retries) {
 	if (!EnsureConnected()) {
@@ -149,16 +147,6 @@ bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, void* da
 				break;
 			}
 		}
-	}
-
-	LOG(INFO) << "About to check last_sequentially_replicated_";
-
-	while (true) {
-		size_t expected = offset;
-		if (last_sequentially_replicated_.compare_exchange_weak(expected, offset + size)) {
-			break;
-		}
-		std::this_thread::yield();
 	}
 
 	LOG(INFO) << "Successfully replicated data";
