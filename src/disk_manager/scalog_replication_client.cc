@@ -13,7 +13,7 @@ ScalogReplicationClient::ScalogReplicationClient(const char* topic, size_t repli
 	: topic_(topic), replication_factor_(replication_factor), broker_id_(broker_id) {
 
 		// Set the server address
-		server_address_ = address + ":" + std::to_string(SCALOG_REP_PORT + ((broker_id + 1) % NUM_BROKERS));
+		server_address_ = address + ":" + std::to_string(SCALOG_REP_PORT + broker_id);
 
 		// Initialize sequential replication guarantee
 		last_sequentially_replicated_.store(0);
@@ -122,6 +122,7 @@ bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, void* da
 		grpc::ClientContext context;
 		context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
 
+		LOG(INFO) << "About to call Replicate grpc";
 		// Call the RPC using our thread-local stub copy
 		grpc::Status status = local_stub->Replicate(&context, request, &response);
 
@@ -150,6 +151,8 @@ bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, void* da
 		}
 	}
 
+	LOG(INFO) << "About to check last_sequentially_replicated_";
+
 	while (true) {
 		size_t expected = offset;
 		if (last_sequentially_replicated_.compare_exchange_weak(expected, offset + size)) {
@@ -157,6 +160,8 @@ bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, void* da
 		}
 		std::this_thread::yield();
 	}
+
+	LOG(INFO) << "Successfully replicated data";
 
 	return success;
 }
