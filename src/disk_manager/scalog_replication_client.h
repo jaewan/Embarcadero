@@ -132,9 +132,6 @@ private:
     // Reconnection state
     std::mutex reconnect_mutex_;
     std::atomic<bool> reconnection_in_progress_{false};
-
-		// Sequential replication guarantee
-		std::atomic<size_t> last_sequentially_replicated_;
 };
 
 } // End of namespace Scalog

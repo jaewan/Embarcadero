@@ -34,6 +34,7 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 				if (!OpenOutputFile()) {
 					throw std::runtime_error("Failed to open replication file: " + base_filename_);
 				}
+				//TODO(Tony) spawn a new thread to send local cut in certain interval (as we already do in primary node) and give order to written messages
 			}
 
 		~ScalogReplicationServiceImpl() override {
@@ -119,6 +120,10 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 			}
 
 			ssize_t bytes_written = pwrite(fd_, data.data(), size, offset);
+			//TODO(tony) update local cut
+			// Make sure that 
+			// 1. local cut ensures all prior messages are written (there can be holes b/c of multi-threaded request)
+			// 2. Local cut maintains the number of messages, not number of batches
 			if (bytes_written == -1) {
 				throw std::system_error(errno, std::generic_category(), "pwrite failed");
 			}

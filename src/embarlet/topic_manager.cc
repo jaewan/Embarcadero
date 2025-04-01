@@ -734,10 +734,12 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 			}
 
 			// Handle replication if needed
+			// TODO(Tony) change scalog_replication_client_ ReplciateData() accordingly to new num_msg argument
 			if (replication_factor_ > 0 && scalog_replication_client_) {
 					scalog_replication_client_->ReplicateData(
 							batch_header.log_idx,
 							batch_header.total_size,
+							batch_header.num_msg,
 							log
 					);
 			}
