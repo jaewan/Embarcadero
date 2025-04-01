@@ -710,6 +710,8 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
         void* &log,
         void* &segment_header,
         size_t &logical_offset) {
+		static std::atomic<size_t> batch_offset = 0;
+		batch_header->log_idx = batch_offset.fetch_add(batch_header.total_size); 
 
     // Calculate addresses
     const unsigned long long int segment_metadata = 
@@ -725,20 +727,20 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
     // Return replication callback
     return [this, batch_header, log](void* log_ptr, size_t /*placeholder*/) {
         MessageHeader *header = (MessageHeader*)log;
-	// TODO(Jae) Change this to check from processed_ptr 
-	// Wait until the message is combined
-	while(header->next_msg_diff == 0){
-		std::this_thread::yield();
-	}
+			// TODO(Jae) Change this to check from processed_ptr 
+			// Wait until the message is combined
+			while(header->next_msg_diff == 0){
+				std::this_thread::yield();
+			}
 
-        // Handle replication if needed
-        if (replication_factor_ > 0 && scalog_replication_client_) {
-            scalog_replication_client_->ReplicateData(
-                batch_header.log_idx,
-                batch_header.total_size,
-                log
-            );
-        }
+			// Handle replication if needed
+			if (replication_factor_ > 0 && scalog_replication_client_) {
+					scalog_replication_client_->ReplicateData(
+							batch_header.log_idx,
+							batch_header.total_size,
+							log
+					);
+			}
     };
 }
 std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
