@@ -89,7 +89,7 @@ private:
      * @param broker_id Broker ID
      * @param address Broker address
      */
-    void CreateAConnection(int broker_id, std::string address);
+    void BrokerHandlerThread(int broker_id, const std::string &address);
     
     /**
      * Subscribes to cluster status updates
