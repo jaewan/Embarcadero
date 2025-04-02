@@ -23,6 +23,7 @@ class HeartBeatManager;
 class ScalogLocalSequencer;
 
 enum CXL_Type {Emul, Real};
+
 using heartbeat_system::SequencerType;
 using heartbeat_system::SequencerType::EMBARCADERO;
 using heartbeat_system::SequencerType::KAFKA;
@@ -63,12 +64,7 @@ struct alignas(64) TInode{
 		volatile int replication_factor;
 		SequencerType seq_type;
 	}__attribute__((aligned(64)));
-	/*
-	char topic[TOPIC_NAME_SIZE];
-	volatile uint8_t order;
-	volatile uint8_t replication_factor;
-	SequencerType seq_type;
-	 */
+
 	volatile offset_entry offsets[NUM_MAX_BROKERS];
 };
 

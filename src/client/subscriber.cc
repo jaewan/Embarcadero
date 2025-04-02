@@ -63,7 +63,8 @@ Subscriber::~Subscriber() {
     for (auto& msg_pairs : messages_) {
         for (auto& msg_pair : msg_pairs) {
             if (msg_pair.first) {
-                free(msg_pair.first);
+                //mi_free(msg_pair.first);
+            		munmap(msg_pair.first, buffer_size_);
                 msg_pair.first = nullptr;
             }
             if (msg_pair.second) {
@@ -374,7 +375,7 @@ void Subscriber::SubscribeThread(int epoll_fd, absl::flat_hash_map<int, std::pai
                     DEBUG_count_.fetch_add(bytes_received, std::memory_order_relaxed);
                     m->offset += bytes_received;
                     
-                    VLOG(4) << "Received " << bytes_received << " bytes from fd " << fd 
+                    VLOG(6) << "Received " << bytes_received << " bytes from fd " << fd 
                             << ", total " << m->offset << "/" << buffer_size_;
                     
                     // Record timestamp if measuring latency
@@ -419,35 +420,30 @@ void Subscriber::SubscribeThread(int epoll_fd, absl::flat_hash_map<int, std::pai
     VLOG(3) << "Subscriber thread exiting for epoll_fd " << epoll_fd;
 }
 
-void Subscriber::CreateAConnection(int broker_id, std::string address) {
-    VLOG(5) << "Creating connections to broker " << broker_id << " at " << address;
-    
-    // Parse address to get IP and port
+void Subscriber::BrokerHandlerThread(int broker_id, const std::string& address) {
+    VLOG(3) << "Starting BrokerHandlerThread for broker " << broker_id << " (" << address << ")";
+
+    // Parse address
     auto [addr, addressPort] = ParseAddressPort(address);
-    
+
     // Create epoll instance
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         LOG(ERROR) << "Failed to create epoll instance: " << strerror(errno);
         return;
     }
-    
-    // Map to track file descriptors to message buffers
+
     absl::flat_hash_map<int, std::pair<void*, msgIdx*>> fd_to_msg;
-		std::vector<int> pending_sockets;
-    
-    // Create multiple connections to the broker in parallel
-    int successful_connections = 0;
-    
-    for (int i = 0; i < NUM_SUB_CONNECTIONS; i++) {
-        // Create socket
+    std::vector<int> pending_sockets;
+
+    // Step 1: Create all sockets and add to epoll for connection (EPOLLOUT)
+    for (int i = 0; i < NUM_SUB_CONNECTIONS; ++i) {
         int sock = GetNonblockingSock(const_cast<char*>(addr.c_str()), PORT + broker_id, false);
         if (sock < 0) {
             LOG(ERROR) << "Failed to create socket for broker " << broker_id;
             continue;
         }
 
-				// Add to epoll for write readiness (connection completion)
         epoll_event ev;
         ev.events = EPOLLOUT;
         ev.data.fd = sock;
@@ -461,14 +457,13 @@ void Subscriber::CreateAConnection(int broker_id, std::string address) {
         pending_sockets.push_back(sock);
     }
 
-		// Wait for connections to complete with timeout
-    const int CONNECT_TIMEOUT_MS = 2000; // 2 seconds timeout
+    // Step 2: Wait for connection completion
     epoll_event events[NUM_SUB_CONNECTIONS];
-
+    const int CONNECT_TIMEOUT_MS = 500;
     int nfds = epoll_wait(epoll_fd, events, NUM_SUB_CONNECTIONS, CONNECT_TIMEOUT_MS);
+
     if (nfds <= 0) {
         LOG(ERROR) << "Connection timeout or error for broker " << broker_id;
-        // Clean up pending sockets
         for (int sock : pending_sockets) {
             close(sock);
         }
@@ -476,11 +471,12 @@ void Subscriber::CreateAConnection(int broker_id, std::string address) {
         return;
     }
 
-		// Process connected sockets
-    for (int n = 0; n < nfds; n++) {
+    int successful_connections = 0;
+
+    for (int n = 0; n < nfds; ++n) {
         int sock = events[n].data.fd;
 
-        // Verify connection succeeded
+        // Check connection success
         int error = 0;
         socklen_t len = sizeof(error);
         if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
@@ -489,26 +485,23 @@ void Subscriber::CreateAConnection(int broker_id, std::string address) {
             continue;
         }
 
-        // Connection succeeded - allocate buffer and setup for data
-        void* buffer = calloc(buffer_size_, sizeof(char));
+        // Allocate buffer
+        void* buffer = mmap(nullptr, buffer_size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         msgIdx* msg_idx = static_cast<msgIdx*>(malloc(sizeof(msgIdx)));
 
         if (!buffer || !msg_idx) {
             LOG(ERROR) << "Failed to allocate memory for message buffer";
-            if (buffer) free(buffer);
+            if (buffer) munmap(buffer, buffer_size_);
             if (msg_idx) free(msg_idx);
             close(sock);
             continue;
         }
 
-        // Initialize message index
         new (msg_idx) msgIdx(broker_id);
-
-        // Store message buffer and metadata
         messages_[0].push_back(std::make_pair(buffer, msg_idx));
         fd_to_msg.insert({sock, std::make_pair(buffer, msg_idx)});
 
-        // Send subscription request asynchronously
+        // Send subscription request
         Embarcadero::EmbarcaderoReq shake;
         shake.num_msg = 0;
         shake.client_id = client_id_;
@@ -516,28 +509,27 @@ void Subscriber::CreateAConnection(int broker_id, std::string address) {
         shake.client_req = Embarcadero::Subscribe;
         memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
 
-        // Modify epoll to watch for read events
         epoll_event ev;
         ev.events = EPOLLIN;
         ev.data.fd = sock;
+
         if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, sock, &ev) < 0) {
             LOG(ERROR) << "Failed to modify epoll for socket: " << strerror(errno);
             close(sock);
             continue;
         }
 
-        // Send subscription request
         if (send(sock, &shake, sizeof(shake), 0) < static_cast<int>(sizeof(shake))) {
             LOG(ERROR) << "Failed to send subscription request: " << strerror(errno);
             close(sock);
             continue;
         }
 
-        VLOG(3) << "Successfully established connection to broker " << broker_id;
-        successful_connections++;
+        VLOG(3) << "Connected to broker " << broker_id << " on socket " << sock;
+        ++successful_connections;
     }
 
-    // Clean up any sockets that didn't connect
+    // Cleanup failed sockets
     for (int sock : pending_sockets) {
         if (fd_to_msg.find(sock) == fd_to_msg.end()) {
             close(sock);
@@ -545,15 +537,15 @@ void Subscriber::CreateAConnection(int broker_id, std::string address) {
     }
 
     if (successful_connections == 0) {
-        LOG(ERROR) << "Failed to establish any connections to broker " << broker_id;
+        LOG(ERROR) << "No successful connections to broker " << broker_id;
         close(epoll_fd);
         return;
     }
 
-    // Start thread to handle this broker's connections
-    subscribe_threads_.emplace_back(&Subscriber::SubscribeThread, this, epoll_fd, fd_to_msg);
-        
-    VLOG(5) << "Created " << successful_connections << " connections to broker " << broker_id;
+    // Start epoll loop
+    SubscribeThread(epoll_fd, fd_to_msg);
+
+    VLOG(3) << "BrokerHandlerThread exiting for broker " << broker_id;
 }
 
 void Subscriber::SubscribeToClusterStatus() {
@@ -575,7 +567,7 @@ void Subscriber::SubscribeToClusterStatus() {
         stub_->SubscribeToCluster(&context_, client_info));
     
     // Connect to head broker
-    CreateAConnection(0, nodes_[0]);
+		subscribe_threads_.emplace_back(&Subscriber::BrokerHandlerThread, this, 0, nodes_[0]);
     
     // Process cluster status updates
     while (!shutdown_) {
@@ -595,7 +587,7 @@ void Subscriber::SubscribeToClusterStatus() {
                     }
                     
                     nodes_[broker_id] = addr;
-                    CreateAConnection(broker_id, addr);
+										subscribe_threads_.emplace_back(&Subscriber::BrokerHandlerThread, this, broker_id, addr);
                     
                     VLOG(5) << "Added new broker: " << broker_id << " at " << addr;
                 }
