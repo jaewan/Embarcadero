@@ -71,6 +71,9 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	// Initialize offset values
 	tinode->offsets[broker_id_].ordered = -1;
 	tinode->offsets[broker_id_].written = -1;
+	for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
+		tinode->offsets[broker_id_].replication_done[i] = -1;
+	}
 
 	// Calculate log offset using pointer difference plus CACHELINE_SIZE
 	const uintptr_t segment_addr = reinterpret_cast<uintptr_t>(segment_metadata);
@@ -362,11 +365,6 @@ Topic::Topic(
 		replication_factor_ = tinode_->replication_factor;
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
-
-		// Initialized Replication Done as -1
-		for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
-			tinode_->offsets[broker_id_].replication_done[i] = -1;
-		}
 
 		// Set appropriate get buffer function based on sequencer type
 		if (seq_type == KAFKA) {
