@@ -81,7 +81,7 @@ private:
     void MainThread();
     void ReqReceiveThread();
     void AckThread(const char* topic, int ack_fd);
-    void Ack1Thread(const char* topic, int ack_fd);
+    size_t GetOffsetToAck(const char* topic);
     void SubscribeNetworkThread(int sock, int efd, const char* topic, int client_id);
 
     // Request handling helpers

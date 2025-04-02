@@ -88,9 +88,6 @@ bool Buffer::AddBuffers(size_t buf_size) {
         // In batch mode, initialize tail to leave space for batch header
         bufs_[idx + i].tail = sizeof(Embarcadero::BatchHeader);
 #endif
-        
-        VLOG(5) << "Added buffer " << (idx + i) << " with size " 
-                << allocated << " bytes";
     }
     
     return true;

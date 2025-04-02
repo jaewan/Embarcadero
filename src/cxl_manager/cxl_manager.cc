@@ -218,7 +218,7 @@ void CXLManager::RunSequencer(const char topic[TOPIC_NAME_SIZE], int order, Sequ
 			if (order == 1)
 				LOG(ERROR) << "Order is set 1 at corfu";
 			else if (order == 2){
-				LOG(INFO) << "Order 2 for Corfu is right. But check Client library to change order to 0 in corfu as corfu is already ordered at publich";
+				LOG(INFO) << "Order 2 for Corfu is right. But check Client library to change order to 0 in corfu as corfu is already ordered at publish";
 			}
 			break;
 		default:
