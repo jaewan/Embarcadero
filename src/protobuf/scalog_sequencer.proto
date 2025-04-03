@@ -2,7 +2,7 @@ syntax = "proto3";
 
 service ScalogSequencer {
     // Receives a local cut from a local sequencer
-    rpc HandleSendLocalCut(SendLocalCutRequest) returns (SendLocalCutResponse);
+    rpc HandleSendLocalCut(stream LocalCut) returns (stream GlobalCut);
 
     /// Receives a register request from a local sequencer
     rpc HandleRegisterBroker(RegisterBrokerRequest) returns (RegisterBrokerResponse);
@@ -12,15 +12,15 @@ service ScalogSequencer {
 }
 
 // Request containing the local cut and the epoch
-message SendLocalCutRequest {
-    int64 epoch = 1;
-    int64 local_cut = 2;
-    string topic = 3;
-    int64 broker_id = 4;
+message LocalCut {
+    int64 local_cut = 1;
+    string topic = 2;
+    int64 broker_id = 3;
+    int64 epoch = 4;
 }
 
 // Response containing the updated global cut
-message SendLocalCutResponse {
+message GlobalCut {
     map<int64, int64> global_cut = 1;
 }
 
@@ -28,10 +28,8 @@ message RegisterBrokerRequest {
     int64 broker_id = 1;
 }
 
-// Respond with global epoch
-message RegisterBrokerResponse {
-    int64 global_epoch = 1;
-}
+// Empty
+message RegisterBrokerResponse {}
 
 // Empty request for now
 message TerminateGlobalSequencerRequest {}

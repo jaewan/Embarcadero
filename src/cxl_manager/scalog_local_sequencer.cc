@@ -19,7 +19,6 @@ ScalogLocalSequencer::ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager,
 
 	// Send register request to the global sequencer
 	Register();
-	SetEpochToOrder(local_epoch_);
 }
 
 void ScalogLocalSequencer::TerminateGlobalSequencer() {
@@ -44,69 +43,78 @@ void ScalogLocalSequencer::Register() {
 	if (!status.ok()) {
 		LOG(ERROR) << "Error registering local sequencer: " << status.error_message();
 	}
-
-	// Set local epoch to the global epoch
-	local_epoch_ = response.global_epoch();
 }
 
-void ScalogLocalSequencer::LocalSequencer(std::string topic_str){
+void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 	static char topic[TOPIC_NAME_SIZE];
 	memcpy(topic, topic_str.data(), topic_str.size());
 	struct TInode *tinode = cxl_manager_->GetTInode(topic);
 
-	auto start_time = std::chrono::high_resolution_clock::now();
-	/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
-	int local_cut = tinode->offsets[broker_id_].written;
-	SendLocalCut(local_cut, topic);
-	auto end_time = std::chrono::high_resolution_clock::now();
-
-	/// We measure the time it takes to send the local cut
-	auto elapsed_time_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-	
-	/// In the case where we receive the global cut before the interval has passed, we wait for the remaining time left in the interval
-	while(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time) 
-			< local_cut_interval_){
-		std::this_thread::yield();
-	}
-}
-
-void ScalogLocalSequencer::SendLocalCut(int local_cut, const char* topic) {
-	SendLocalCutRequest request;
-	request.set_epoch(local_epoch_);
-	request.set_local_cut(local_cut);
-	request.set_topic(topic);
-	request.set_broker_id(broker_id_);
-
-	SendLocalCutResponse response;
 	grpc::ClientContext context;
+    std::unique_ptr<grpc::ClientReaderWriter<LocalCut, GlobalCut>> stream(
+        stub_->HandleSendLocalCut(&context));
 
-	// Set a timeout of 5 seconds for the gRPC call
-	auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
-	context.set_deadline(deadline);
+	// Spawn a thread to receive global cuts, passing the stream by reference
+    std::thread receive_global_cut(&ScalogLocalSequencer::ReceiveGlobalCut, this, std::ref(stream), topic_str);
 
-	// Synchronous call to HandleSendLocalCut
-	grpc::Status status = stub_->HandleSendLocalCut(&context, request, &response);
+	while (!cxl_manager_->GetStopThreads()) {
+		/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
+		int local_cut = tinode->offsets[broker_id_].written;
 
-	if (!status.ok()) {
-		if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
-			LOG(ERROR) << "Timeout error sending local cut: " << status.error_message();
-		} else {
-			LOG(ERROR) << "Error sending local cut: " << status.error_message();
+		LocalCut request;
+		request.set_local_cut(local_cut);
+		request.set_topic(topic);
+		request.set_broker_id(broker_id_);
+		request.set_epoch(local_epoch_);
+
+		// Send the LocalCut message to the server
+		if (!stream->Write(request)) {
+			std::cerr << "Error writing LocalCut to the server" << std::endl;
+
+			break;
 		}
-	} else {
-		// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
-		for (const auto& entry : response.global_cut()) {
-			global_cut_[local_epoch_][static_cast<int>(entry.first)] = static_cast<int>(entry.second);
-		}
 
-		ScalogSequencer(topic, global_cut_);
+		// Increment the epoch
+		local_epoch_++;
+
+		// Sleep until interval passes to send next local cut
+		std::this_thread::sleep_for(local_cut_interval_);
 	}
 
-	local_epoch_++;
+	stream->WritesDone();
+	stop_reading_from_stream_ = true;
+	receive_global_cut.join();
+
+	// If this is the head node, terminate the global sequencer
+	if (broker_id_ == 0) {
+		LOG(INFO) << "Scalog Terminating global sequencer";
+		TerminateGlobalSequencer();
+	}	
 }
 
-void ScalogLocalSequencer::ScalogSequencer(const char* topic,
-		absl::flat_hash_map<int, absl::btree_map<int, int>> &global_cut) {
+void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWriter<LocalCut, GlobalCut>>& stream, std::string topic_str) {
+	static char topic[TOPIC_NAME_SIZE];
+	memcpy(topic, topic_str.data(), topic_str.size());
+
+	int num_global_cuts = 0;
+	while (!stop_reading_from_stream_) {
+		GlobalCut global_cut;
+		if (stream->Read(&global_cut)) {
+			// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
+			for (const auto& entry : global_cut.global_cut()) {
+				global_cut_[static_cast<int>(entry.first)] = static_cast<int>(entry.second);
+			}
+
+			ScalogSequencer(topic, global_cut_);
+
+			num_global_cuts++;
+		}
+	}
+
+    // grpc::Status status = stream->Finish();
+}
+
+void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<int, int> &global_cut) {
 	static char topic_char[TOPIC_NAME_SIZE];
 	static size_t seq = 0;
 	static TInode *tinode = nullptr; 
@@ -117,28 +125,23 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic,
 		msg_to_order = ((MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id_].log_offset));
 	}
 
-	if(global_cut.contains(epoch_to_order_)){
-		for(auto &cut : global_cut[epoch_to_order_]){
-			if(cut.first == broker_id_){
-				for(int i = 0; i<cut.second; i++){
-					msg_to_order->total_order = seq;
-					std::atomic_thread_fence(std::memory_order_release);
-					/*
-					tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset;
-					tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
-					*/
-					cxl_manager_->UpdateTinodeOrder(topic_char, tinode, broker_id_, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
-					msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
-					seq++;
-				}
-			}else{
-				seq += cut.second;
+	for(auto &cut : global_cut){
+		if(cut.first == broker_id_){
+			for(int i = 0; i<cut.second; i++){
+				msg_to_order->total_order = seq;
+				std::atomic_thread_fence(std::memory_order_release);
+				/*
+				tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset;
+				tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
+				*/
+				cxl_manager_->UpdateTinodeOrder(topic_char, tinode, broker_id_, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
+				msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
+				seq++;
 			}
+		}else{
+			seq += cut.second;
 		}
-	}else{
-		LOG(ERROR) << "Expected Epoch:" << epoch_to_order_ << " is not received";
 	}
-	epoch_to_order_++;
 }
 
 } // End of namespace Scalog

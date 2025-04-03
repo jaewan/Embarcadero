@@ -611,17 +611,8 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
 	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
 	auto scalog_local_sequencer = std::make_unique<Scalog::ScalogLocalSequencer>(this, broker_id_, cxl_addr_);
-
-
-	while (!stop_threads_) {
-		scalog_local_sequencer->LocalSequencer(topic_str);
-	}
-
-	// If this is the head node, terminate the global sequencer
-	if (broker_id_ == 0) {
-		LOG(INFO) << "Scalog Terminating global sequencer";
-		scalog_local_sequencer->TerminateGlobalSequencer();
-	}	
+	scalog_local_sequencer->SendLocalCut(topic_str);
 }
+
 
 } // End of namespace Embarcadero

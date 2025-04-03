@@ -67,8 +67,7 @@ bool ScalogReplicationClient::Connect(int timeout_seconds) {
 	return connected;
 }
 
-//TODO(Tony) have num_msg as argument and send it to rep manager so the manager can keep track of num_msg as well.
-bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, void* data,
+bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, size_t num_msg, void* data,
 		int max_retries) {
 	if (!EnsureConnected()) {
 		// Try to reconnect - this is thread-safe
@@ -82,6 +81,7 @@ bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, void* da
 	request.set_offset(offset);
 	request.set_data(std::string(static_cast<char*>(data), size));
 	request.set_size(size);
+	request.set_num_msg(num_msg);
 
 	// Create response object - local to this call
 	scalogreplication::ScalogReplicationResponse response;

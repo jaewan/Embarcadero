@@ -710,8 +710,8 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
         void* &log,
         void* &segment_header,
         size_t &logical_offset) {
-		static std::atomic<size_t> batch_offset = 0;
-		batch_header->log_idx = batch_offset.fetch_add(batch_header.total_size); 
+    static std::atomic<size_t> batch_offset = 0;
+    batch_header.log_idx = batch_offset.fetch_add(batch_header.total_size); 
 
     // Calculate addresses
     const unsigned long long int segment_metadata = 
@@ -734,7 +734,6 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 			}
 
 			// Handle replication if needed
-			// TODO(Tony) change scalog_replication_client_ ReplciateData() accordingly to new num_msg argument
 			if (replication_factor_ > 0 && scalog_replication_client_) {
 					scalog_replication_client_->ReplicateData(
 							batch_header.log_idx,

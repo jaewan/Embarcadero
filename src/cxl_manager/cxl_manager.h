@@ -132,6 +132,9 @@ class CXLManager{
 			tinode->offsets[broker].ordered = msg_logical_off;
 			tinode->offsets[broker].ordered_offset = ordered_offset;
 		}
+		bool GetStopThreads(){
+			return stop_threads_;
+		}
 	private:
 		int broker_id_;
 		std::string head_ip_;

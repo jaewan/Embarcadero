@@ -66,7 +66,7 @@ public:
      * @param max_retries Number of retry attempts on failure
      * @return true if replication successful, false otherwise
      */
-    bool ReplicateData(size_t start_idx, size_t size, void* data,
+    bool ReplicateData(size_t start_idx, size_t size, size_t num_msg, void* data,
                       int max_retries = 3);
 
     /**
