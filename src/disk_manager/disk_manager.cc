@@ -114,7 +114,7 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 	num_io_threads_ = NUM_MAX_BROKERS;
 
 	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
-		scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>("localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
+		scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
 		return;
 	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 		corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>();

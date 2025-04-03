@@ -4,6 +4,7 @@
 #include <thread>
 #include <memory>
 #include <string>
+#include <scalog_sequencer.grpc.pb.h>
 
 // Forward declarations
 namespace grpc {
@@ -15,10 +16,12 @@ namespace Scalog {
 #define NUM_BROKERS 4
 
 class ScalogReplicationServiceImpl;
+using Embarcadero::MessageHeader;
 
 class ScalogReplicationManager {
 public:
-    ScalogReplicationManager(const std::string& address = "localhost",
+    ScalogReplicationManager(int broker_id,
+                            const std::string& address = "localhost",
                             const std::string& port = "",
                             const std::string& log_file = "");
     ~ScalogReplicationManager();
