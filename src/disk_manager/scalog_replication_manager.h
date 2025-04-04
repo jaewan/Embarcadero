@@ -16,7 +16,20 @@ namespace Scalog {
 #define NUM_BROKERS 4
 
 class ScalogReplicationServiceImpl;
-using Embarcadero::MessageHeader;
+
+// Orders are very important to avoid race conditions. 
+// If you change orders of elements, change how sequencers and combiner check written messages
+struct alignas(64) ScalogMessageHeader{
+	volatile size_t paddedSize; // This include message+padding+header size
+	void* segment_header;
+	size_t logical_offset;
+	volatile unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
+	volatile size_t total_order;
+	size_t client_order;
+	uint32_t client_id;
+	volatile uint32_t complete;
+	size_t size;
+};
 
 class ScalogReplicationManager {
 public:

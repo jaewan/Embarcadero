@@ -57,8 +57,28 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
 				for (const auto& entry : global_cut_) {
-					global_cut.mutable_global_cut()->insert({entry.first, entry.second});
-					last_sent_global_cut_[entry.first] = logical_offsets_[entry.first];
+					if (entry.second.empty()) {
+						global_cut.mutable_global_cut()->insert({entry.first, 0});
+						continue;
+					}
+
+					size_t num_replicas = entry.second.size();
+					if (num_replicas < 2) {
+						global_cut.mutable_global_cut()->insert({entry.first, 0});
+						continue;
+					}
+
+					auto min_entry = std::min_element(entry.second.begin(), entry.second.end(),
+													[](const auto& a, const auto& b) {
+														return a.second < b.second;
+													});
+
+					global_cut.mutable_global_cut()->insert({entry.first, min_entry->second});
+
+					// Update all entries in last_sent_global_cut_[entry.first]
+					for (const auto& replica_entry : entry.second) {
+						last_sent_global_cut_[entry.first][replica_entry.first] = logical_offsets_[entry.first][min_entry->first];
+					}
 				}
 			}
 
@@ -119,18 +139,17 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 				int epoch = request.epoch();
 				int local_cut = request.local_cut();
 				int broker_id = request.broker_id();
-
-				// TODO(Tony) Take in replica id here and properly modify the map
+				int replica_id = request.replica_id();
 
 				{
 					absl::WriterMutexLock lock(&global_cut_mu_);
 					if (epoch == 0) {
-						global_cut_[broker_id] = local_cut + 1;
-						logical_offsets_[broker_id] = local_cut;
-						last_sent_global_cut_[broker_id] = -1;
+						global_cut_[broker_id][replica_id] = local_cut + 1;
+						logical_offsets_[broker_id][replica_id] = local_cut;
+						last_sent_global_cut_[broker_id][replica_id] = -1;
 					} else {
-						global_cut_[broker_id] = local_cut - last_sent_global_cut_[broker_id];
-						logical_offsets_[broker_id] = local_cut;	
+						global_cut_[broker_id][replica_id] = local_cut - last_sent_global_cut_[broker_id][replica_id];
+						logical_offsets_[broker_id][replica_id] = local_cut;	
 					}
 				}
 			}
