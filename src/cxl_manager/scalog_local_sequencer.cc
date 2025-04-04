@@ -66,6 +66,7 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 		request.set_topic(topic);
 		request.set_broker_id(broker_id_);
 		request.set_epoch(local_epoch_);
+		request.set_replica_id(replica_id_);
 
 		// Send the LocalCut message to the server
 		if (!stream->Write(request)) {

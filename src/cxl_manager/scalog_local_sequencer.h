@@ -34,6 +34,7 @@ class ScalogLocalSequencer {
 	private:
 		Embarcadero::CXLManager* cxl_manager_;
 		int broker_id_;
+		int replica_id_ = 0;
 		void* cxl_addr_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
 

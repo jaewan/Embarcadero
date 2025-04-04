@@ -744,6 +744,7 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 			}
     };
 }
+
 std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
         BatchHeader &batch_header,
         const char topic[TOPIC_NAME_SIZE],

@@ -29,6 +29,88 @@ using scalogreplication::ScalogReplicationRequest;
 using scalogreplication::ScalogReplicationResponse;
 
 class ScalogReplicationServiceImpl final : public ScalogReplicationService::Service {
+	class LocalCutTracker {
+		public:
+			LocalCutTracker() : local_cut_(0), sequentially_written_(0) {}
+
+			// Record a write and update local_cut
+			void recordWrite(size_t offset, size_t size, size_t number_of_messages) {
+				if (size == 0) return;
+
+				// Lock mutex
+				absl::MutexLock lock(&mutex_);
+
+				size_t end = offset + size;
+
+				// Find the first range that starts after our offset
+				auto next_it = ranges.upper_bound(offset);
+
+				// Keep track of the number of messages in the new range
+				size_t combined_num_messages = number_of_messages;
+				// Check if we can merge with the previous range
+				if (next_it != ranges.begin()) {
+					auto prev_it = std::prev(next_it);
+					if (prev_it->second.first >= offset) {
+						// Our range overlaps with the previous one
+						offset = prev_it->first;
+						end = std::max(end, prev_it->second.first);
+						combined_num_messages += prev_it->second.second;
+						ranges.erase(prev_it);
+					}
+				}
+
+				// Merge with any subsequent overlapping ranges
+				while (next_it != ranges.end() && next_it->first <= end) {
+					end = std::max(end, next_it->second.first);
+					combined_num_messages += next_it->second.second;
+					auto to_erase = next_it++;
+					ranges.erase(to_erase);
+				}
+
+				// Insert the merged range
+				ranges[offset] = std::make_pair(end, combined_num_messages);
+
+				updateSequentiallyWritten(number_of_messages);
+			}
+
+			size_t getLocalCut() {
+				absl::MutexLock lock(&mutex_);
+				return local_cut_;
+			}
+
+		private:
+		    // The pair contains the size as the first element and the number of messages as the second element.
+			std::map<size_t, std::pair<size_t, size_t>> ranges; // start -> end (exclusive)
+			size_t local_cut_;
+			size_t sequentially_written_;
+			absl::Mutex mutex_;
+
+			// Update the local cut value
+			void updateSequentiallyWritten(int64_t number_of_messages) {
+				if (ranges.empty() || ranges.begin()->first > 0) {
+					local_cut_ = 0;
+					sequentially_written_ = 0;
+					return;
+				}
+
+				// Start with the range that begins at offset 0
+				auto zero_range = ranges.begin();
+				size_t current_end = zero_range->second.first;
+				size_t current_num_messages = zero_range->second.second;
+
+				// Look for adjacent or overlapping ranges
+				auto it = std::next(zero_range);
+				while(it != ranges.end() && it->first <= current_end) {
+					current_end = std::max(current_end, it->second.first);
+					current_num_messages += it->second.second;
+					++it;
+				}
+
+				sequentially_written_ = current_end;
+				local_cut_ = current_num_messages;
+			}
+	};
+
 	public:
 		explicit ScalogReplicationServiceImpl(std::string base_filename, int broker_id)
 			: base_filename_(std::move(base_filename)), running_(true) {
@@ -37,6 +119,7 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 				}
 
 				broker_id_ = broker_id;
+				local_cut_tracker_ = std::make_unique<LocalCutTracker>();
 
 				std::string scalog_seq_address = scalog_global_sequencer_ip_ + ":" + std::to_string(SCALOG_SEQ_PORT);
 				std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
@@ -125,10 +208,11 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 
 			while (running_) {
 				LocalCut request;
-				request.set_local_cut(local_cut_);
+				request.set_local_cut(local_cut_tracker_->getLocalCut());
 				request.set_topic("");
 				request.set_broker_id(broker_id_);
 				request.set_epoch(local_epoch_);
+				request.set_replica_id(replica_id_);
 
 				// Send the LocalCut message to the server
 				if (!stream->Write(request)) {
@@ -169,30 +253,42 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 		}
 
 		void ScalogSequencer(absl::btree_map<int, int> &global_cut) {
-			// TODO(Tony) Figure out how to use mmap here
-			// const char* filename = "message_file.bin";
-			// int fd = open(filename, O_RDWR);
-			// if (fd < 0) {
-			// 	std::cerr << "Failed to open file " << filename 
-			// 			<< ": " << strerror(errno) << std::endl;
-			// 	return 1;
-			// }
+			static size_t seq = 0;
+			static off_t disk_offset = 0;
+			ScalogMessageHeader header_buffer;
 
-			// static size_t seq = 0;
-			// static MessageHeader* msg_to_order = nullptr;
+			for (auto &cut : global_cut) {
+				if (cut.first == broker_id_) {
+					for (int i = 0; i < cut.second; i++) {
+						ssize_t read_bytes = pread(fd_, &header_buffer, sizeof(header_buffer), disk_offset);
+						if (read_bytes != sizeof(header_buffer)) {
+							perror("Failed to read message header from file");
+							return;
+						}
+						header_buffer.total_order = seq;
+						std::atomic_thread_fence(std::memory_order_release);
 
-			// for(auto &cut : global_cut){
-			// 	if(cut.first == broker_id_){
-			// 		for(int i = 0; i<cut.second; i++){
-			// 			msg_to_order->total_order = seq;
-			// 			std::atomic_thread_fence(std::memory_order_release);
-			// 			msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
-			// 			seq++;
-			// 		}
-			// 	}else{
-			// 		seq += cut.second;
-			// 	}
-			// }
+						// Write the header back to the same file
+						ssize_t written = pwrite(fd_, &header_buffer, sizeof(header_buffer), disk_offset);
+						if (written == -1) {
+							throw std::system_error(errno, std::generic_category(), "Failed to write updated header file with order to file");
+						}
+						if (written != sizeof(header_buffer)) {
+							perror("Failed to write message header to file");
+							return;
+						}
+						if (fsync(fd_) == -1) {
+							throw std::system_error(errno, std::generic_category(), "Failed to fsync new message header to file");
+						}
+
+						disk_offset += header_buffer.paddedSize;
+						seq++;
+					}
+				} else {
+					// For messages not belonging to our broker, just update the sequence counter.
+					seq += cut.second;
+				}
+			}
 		}
 
 		void WriteRequest(const ScalogReplicationRequest& request) {
@@ -207,11 +303,7 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 						std::to_string(data.size()));
 			}
 
-			ssize_t bytes_written = pwrite(fd_, data.data(), size, offset);
-			//TODO(tony) update local cut
-			// Make sure that 
-			// 1. local cut ensures all prior messages are written (there can be holes b/c of multi-threaded request)
-			// 2. Local cut maintains the number of messages, not number of batches
+			ssize_t bytes_written = pwrite(fd_, data.data(), size, offset);			
 			if (bytes_written == -1) {
 				throw std::system_error(errno, std::generic_category(), "pwrite failed");
 			}
@@ -232,6 +324,8 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 				}
 				last_sync = now;
 			}
+
+			local_cut_tracker_->recordWrite(offset, bytes_written, num_msg);
 		}
 
 		Status CreateErrorResponse(ScalogReplicationResponse* response,
@@ -264,9 +358,9 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 		bool stop_reading_from_stream_ = false;
 
 		int broker_id_;
-
-		std::atomic<int> local_cut_ = 0;
-		std::atomic<int> local_epoch_ = 0;
+		int replica_id_ = 1;
+		int local_epoch_ = 0;
+		std::unique_ptr<LocalCutTracker> local_cut_tracker_;
 };
 
 ScalogReplicationManager::ScalogReplicationManager(int broker_id,

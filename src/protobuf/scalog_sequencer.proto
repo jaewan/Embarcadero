@@ -17,6 +17,7 @@ message LocalCut {
     string topic = 2;
     int64 broker_id = 3;
     int64 epoch = 4;
+    int64 replica_id = 5;
 }
 
 // Response containing the updated global cut

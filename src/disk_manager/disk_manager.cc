@@ -1,6 +1,4 @@
 #include "disk_manager.h"
-#include "corfu_replication_manager.h"
-#include "scalog_replication_manager.h"
 
 #include <unistd.h>
 #include <pwd.h>
