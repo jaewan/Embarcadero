@@ -178,7 +178,7 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 
 	private:
 		bool OpenOutputFile() {
-			fd_ = open(base_filename_.c_str(), O_WRONLY | O_CREAT, 0644);
+			fd_ = open(base_filename_.c_str(), O_RDWR | O_CREAT, 0644);
 			if (fd_ == -1) {
 				LOG(ERROR) << "Failed to open file: " << strerror(errno);
 				return false;
