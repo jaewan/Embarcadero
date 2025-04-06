@@ -718,6 +718,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Create batch header
 		Embarcadero::BatchHeader batch_header;
+		batch_header.client_id = client_id_;
 		batch_header.total_size = len;
 		batch_header.num_msg = len / static_cast<Embarcadero::MessageHeader*>(msg)->paddedSize;
 		batch_header.batch_seq = batch_seq;
