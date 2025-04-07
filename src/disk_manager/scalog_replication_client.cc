@@ -120,7 +120,6 @@ bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, size_t n
 		grpc::ClientContext context;
 		context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
 
-		LOG(INFO) << "About to call Replicate grpc";
 		// Call the RPC using our thread-local stub copy
 		grpc::Status status = local_stub->Replicate(&context, request, &response);
 
@@ -148,8 +147,6 @@ bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, size_t n
 			}
 		}
 	}
-
-	LOG(INFO) << "Successfully replicated data";
 
 	return success;
 }
