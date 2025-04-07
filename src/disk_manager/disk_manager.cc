@@ -112,6 +112,7 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 	num_io_threads_ = NUM_MAX_BROKERS;
 
 	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
+		// TODO(Tony) Figure out how to not initialize scalog replication manager if replication factor == 0
 		scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
 		return;
 	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
@@ -182,6 +183,10 @@ void DiskManager::CopyThread(){
 }
 
 void DiskManager::Replicate(TInode* tinode, TInode* replica_tinode, int replication_factor){
+	// if(sequencerType_ == heartbeat_system::SequencerType::SCALOG && replication_factor > 0 && !scalog_replication_manager_){
+		// scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
+	// }
+
 	size_t available_threads = num_io_threads_.load() - num_active_threads_.load();
 	int threads_needed = replication_factor - available_threads;
 	if(threads_needed > 0){

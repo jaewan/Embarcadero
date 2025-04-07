@@ -34,19 +34,19 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 			LocalCutTracker() : local_cut_(0), sequentially_written_(0) {}
 
 			// Record a write and update local_cut
-			void recordWrite(size_t offset, size_t size, size_t number_of_messages) {
+			void recordWrite(int64_t offset, int64_t size, int64_t number_of_messages) {
 				if (size == 0) return;
 
 				// Lock mutex
 				absl::MutexLock lock(&mutex_);
 
-				size_t end = offset + size;
+				int64_t end = offset + size;
 
 				// Find the first range that starts after our offset
 				auto next_it = ranges.upper_bound(offset);
 
 				// Keep track of the number of messages in the new range
-				size_t combined_num_messages = number_of_messages;
+				int64_t combined_num_messages = number_of_messages;
 				// Check if we can merge with the previous range
 				if (next_it != ranges.begin()) {
 					auto prev_it = std::prev(next_it);
@@ -70,23 +70,23 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 				// Insert the merged range
 				ranges[offset] = std::make_pair(end, combined_num_messages);
 
-				updateSequentiallyWritten(number_of_messages);
+				updateSequentiallyWritten();
 			}
 
-			size_t getLocalCut() {
+			int64_t getLocalCut() {
 				absl::MutexLock lock(&mutex_);
-				return local_cut_;
+				return local_cut_ - 1;
 			}
 
 		private:
 		    // The pair contains the size as the first element and the number of messages as the second element.
-			std::map<size_t, std::pair<size_t, size_t>> ranges; // start -> end (exclusive)
-			size_t local_cut_;
-			size_t sequentially_written_;
+			std::map<int64_t, std::pair<int64_t, int64_t>> ranges; // start -> end (exclusive)
+			int64_t local_cut_;
+			int64_t sequentially_written_;
 			absl::Mutex mutex_;
 
 			// Update the local cut value
-			void updateSequentiallyWritten(int64_t number_of_messages) {
+			void updateSequentiallyWritten() {
 				if (ranges.empty() || ranges.begin()->first > 0) {
 					local_cut_ = 0;
 					sequentially_written_ = 0;
@@ -95,8 +95,8 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 
 				// Start with the range that begins at offset 0
 				auto zero_range = ranges.begin();
-				size_t current_end = zero_range->second.first;
-				size_t current_num_messages = zero_range->second.second;
+				int64_t current_end = zero_range->second.first;
+				int64_t current_num_messages = zero_range->second.second;
 
 				// Look for adjacent or overlapping ranges
 				auto it = std::next(zero_range);
@@ -277,8 +277,18 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 							perror("Failed to write message header to file");
 							return;
 						}
-						if (fsync(fd_) == -1) {
-							throw std::system_error(errno, std::generic_category(), "Failed to fsync new message header to file");
+
+						static std::chrono::steady_clock::time_point last_sync =
+							std::chrono::steady_clock::now();
+
+						constexpr int flush_interval_sec = 5;
+
+						const auto now = std::chrono::steady_clock::now();
+						if (now - last_sync >= std::chrono::seconds(flush_interval_sec)) {
+							if (fsync(fd_) == -1) {
+								throw std::system_error(errno, std::generic_category(), "fsync failed");
+							}
+							last_sync = now;
 						}
 
 						disk_offset += header_buffer.paddedSize;

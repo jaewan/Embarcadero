@@ -377,18 +377,19 @@ Topic::Topic(
         
         GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
     } else if (seq_type == SCALOG) {
-		// TODO(Tony) change this to actual replica address
-        scalog_replication_client_ = std::make_unique<Scalog::ScalogReplicationClient>(
-            topic_name, 
-            replication_factor_, 
-            "localhost",
-            broker_id_ // broker_id used to determine the port
-        );
-        
-        if (!scalog_replication_client_->Connect()) {
-            LOG(ERROR) << "Scalog replication client failed to connect to replica";
+        if (replication_factor_ > 0) {
+            scalog_replication_client_ = std::make_unique<Scalog::ScalogReplicationClient>(
+                topic_name, 
+                replication_factor_, 
+                "localhost",
+                broker_id_ // broker_id used to determine the port
+            );
+            
+            if (!scalog_replication_client_->Connect()) {
+                LOG(ERROR) << "Scalog replication client failed to connect to replica";
+            }
         }
-		GetCXLBufferFunc = &Topic::ScalogGetCXLBuffer;
+        GetCXLBufferFunc = &Topic::ScalogGetCXLBuffer;
     } else {
         // Set buffer function based on order
         if (order_ == 3) {
