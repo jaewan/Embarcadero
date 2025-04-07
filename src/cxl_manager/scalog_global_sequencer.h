@@ -46,14 +46,14 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
 
 		/// Map of broker_id to replica_id to local cut
 		absl::Mutex global_cut_mu_;
-		absl::btree_map<int, absl::btree_map<int, int>> global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
+		absl::btree_map<int, absl::btree_map<int, int64_t>> global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
 
 		/// Used to keep track of # messages of each epoch so we can calculate the global cut
 		/// Map of broker_id to replica_id to logical offset
-		absl::btree_map<int, absl::btree_map<int, int>> logical_offsets_ ABSL_GUARDED_BY(global_cut_mu_);
+		absl::btree_map<int, absl::btree_map<int, int64_t>> logical_offsets_ ABSL_GUARDED_BY(global_cut_mu_);
 
 		/// Map of broker_id to replica_id last sent global cut
-		absl::btree_map<int, absl::btree_map<int, int>> last_sent_global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
+		absl::btree_map<int, absl::btree_map<int, int64_t>> last_sent_global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
 
         /// Lock needed to read and write to registered_brokers_
         absl::Mutex registered_brokers_mu_;
