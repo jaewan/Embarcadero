@@ -87,7 +87,6 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 				auto& stream_lock = std::get<1>(local_sequencer);
 
 				{
-					absl::MutexLock lock(stream_lock.get());
 					if (!stream->Write(global_cut)) {
 						std::cerr << "Error writing GlobalCut to the client" << std::endl;
 					}
@@ -132,12 +131,11 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 	while (!stop_reading_from_stream_) {
 		LocalCut request;
 		{
-			absl::MutexLock lock(stream_lock.get());
 			if (stream->Read(&request)) {
 				static char topic[TOPIC_NAME_SIZE];
 				memcpy(topic, request.topic().c_str(), request.topic().size());
 				int epoch = request.epoch();
-				int local_cut = request.local_cut();
+				int64_t local_cut = request.local_cut();
 				int broker_id = request.broker_id();
 				int replica_id = request.replica_id();
 
