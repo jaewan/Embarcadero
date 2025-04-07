@@ -327,7 +327,7 @@ class Buffer{
 				LOG(INFO) << "Buffer:" << write_buf_id_ << " full." << bufs_[write_buf_id_].len <<" Circle. This can be buggy as it does not check new head is read or not";
 				// Seal what is written now to move to next buffer
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[write_buf_id_].buffer + head);
-				batch_header->next_reader_head = 0;
+				batch_header->start_logical_offset = 0;
 				batch_header->batch_seq = batch_seq_.fetch_add(1);
 				batch_header->total_size = bufs_[write_buf_id_].tail - head - sizeof(Embarcadero::BatchHeader);
 				batch_header->num_msg = bufs_[write_buf_id_].num_msg;
@@ -344,7 +344,7 @@ class Buffer{
 			// Seal if written messages > BATCH_SIZE
 			if((bufs_[write_buf_id_].tail - head) >= BATCH_SIZE){
 				Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[write_buf_id_].buffer + head);
-				batch_header->next_reader_head = bufs_[write_buf_id_].tail;
+				batch_header->start_logical_offset = bufs_[write_buf_id_].tail;
 				batch_header->batch_seq = batch_seq_.fetch_add(1);
 				batch_header->total_size = bufs_[write_buf_id_].tail - head - sizeof(Embarcadero::BatchHeader);
 				batch_header->num_msg = bufs_[write_buf_id_].num_msg;
@@ -368,7 +368,7 @@ class Buffer{
 		void* Read(int bufIdx){
 			Embarcadero::BatchHeader *batch_header = (Embarcadero::BatchHeader*)((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].reader_head);
 			if(batch_header->total_size != 0 && batch_header->num_msg != 0){
-				bufs_[bufIdx].reader_head = batch_header->next_reader_head;
+				bufs_[bufIdx].reader_head = batch_header->start_logical_offset;
 				return (void*)batch_header;
 			}else{
 				if(!seal_from_read_){
@@ -382,7 +382,7 @@ class Buffer{
 						}
 					}
 					if(seal_exist){
-						bufs_[bufIdx].reader_head = batch_header->next_reader_head;
+						bufs_[bufIdx].reader_head = batch_header->start_logical_offset;
 						return (void*)batch_header;
 					}
 				}
@@ -390,7 +390,7 @@ class Buffer{
 				size_t head, tail, num_msg, batch_seq;
 				{
 				if(batch_header->batch_seq != 0 && batch_header->total_size != 0 && batch_header->num_msg != 0){
-					bufs_[bufIdx].reader_head = batch_header->next_reader_head;
+					bufs_[bufIdx].reader_head = batch_header->start_logical_offset;
 					return (void*)batch_header;
 				}
 				head = bufs_[bufIdx].writer_head;
@@ -409,7 +409,7 @@ class Buffer{
 				batch_header->batch_seq = batch_seq;
 				batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
 				batch_header->num_msg = num_msg;
-				batch_header->next_reader_head = tail;
+				batch_header->start_logical_offset = tail;
 				return (void*)batch_header;
 			}
 		}
