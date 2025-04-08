@@ -71,7 +71,6 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 
 					size_t num_replicas = entry.second.size();
 					if (num_replicas < num_replicas_per_broker_) {
-						LOG(INFO) << "Not enough replicas for broker " << entry.first << " to send global cut where num replicas is " << num_replicas_per_broker_;
 						global_cut.mutable_global_cut()->insert({entry.first, 0});
 						continue;
 					}

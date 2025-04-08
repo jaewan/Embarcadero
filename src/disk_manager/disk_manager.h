@@ -39,6 +39,7 @@ class DiskManager{
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
 		// Change this to get real-time num brokers
 		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
+		void StartScalogReplicaLocalSequencer();
 
 	private:
 		void ReplicateThread();
