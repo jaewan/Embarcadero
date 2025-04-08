@@ -13,10 +13,10 @@ using Embarcadero::MessageHeader;
 
 class ScalogLocalSequencer {
 	public:
-		ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager, int broker_id, void* cxl_addr);
+		ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager, int broker_id, void* cxl_addr, std::string topic_str);
 
 		/// Sends a register request to the global sequencer
-		void Register();
+		void Register(int replication_factor);
 
 		/// Send a local cut to the global seq after every interval
 		void SendLocalCut(std::string topic_str);

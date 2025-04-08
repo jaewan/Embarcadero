@@ -27,6 +27,7 @@ message GlobalCut {
 
 message RegisterBrokerRequest {
     int64 broker_id = 1;
+    int64 replication_factor = 2;
 }
 
 // Empty

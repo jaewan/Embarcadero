@@ -184,7 +184,7 @@ void DiskManager::CopyThread(){
 
 void DiskManager::Replicate(TInode* tinode, TInode* replica_tinode, int replication_factor){
 	// if(sequencerType_ == heartbeat_system::SequencerType::SCALOG && replication_factor > 0 && !scalog_replication_manager_){
-		// scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
+	// 	scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
 	// }
 
 	size_t available_threads = num_io_threads_.load() - num_active_threads_.load();

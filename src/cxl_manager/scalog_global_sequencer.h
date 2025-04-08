@@ -76,4 +76,7 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
 
         /// Mutex to protect local_sequencers_
         absl::Mutex stream_mu_;
+
+        // Replication factor
+        int num_replicas_per_broker_;
 };
