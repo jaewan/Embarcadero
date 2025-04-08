@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.16)
-cmake_policy(SET CMP0144 NEW)
 
 project(Embarcadero VERSION 0.1
         DESCRIPTION "Pubsub with disaggregated memory"
@@ -37,8 +36,6 @@ find_package(Mimalloc REQUIRED)
 find_package(gflags REQUIRED)
 find_package(glog REQUIRED)
 find_package(folly REQUIRED)
-
-add_subdirectory(third_party)
 
 # Setup source
 add_subdirectory(src)
