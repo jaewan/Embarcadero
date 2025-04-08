@@ -156,6 +156,8 @@ class CXLManager{
 		int epoch_to_order_ = 0;
 
 		void CXLIOThread(int tid);
+		inline void UpdateTInodeOrderandWritten(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
+				size_t msg_to_order);
 		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
 				size_t msg_to_order);
 		void Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic);
