@@ -242,8 +242,12 @@ int GenerateRandomNum() {
     
     // Define distribution for the range [NUM_MAX_BROKERS, 999999]
     std::uniform_int_distribution<int> dist(NUM_MAX_BROKERS, 999999);
+		int ret;
+		do{
+			ret = dist(gen);
+		}while(ret == 0); // Make sure 0 is not returned
     
-    return dist(gen);
+    return ret;
 }
 
 bool CheckAvailableCores() {
