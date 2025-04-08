@@ -655,7 +655,6 @@ void NetworkManager::SubscribeNetworkThread(
 						sub_state_[client_id]->last_addr, 
 						msg, 
 						messages_size)) {
-
 				// Split large messages into chunks for better flow control
 				while (messages_size > zero_copy_send_limit) {
 					struct LargeMsgRequest r;
@@ -754,6 +753,7 @@ bool NetworkManager::SendMessageData(
 size_t NetworkManager::GetOffsetToAck(const char* topic){
 	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
 	static const int replication_factor = tinode->replication_factor;
+	static const int order = tinode->order;
 	size_t min = std::numeric_limits<size_t>::max();
 	//TODO(Jae) For now it is static. This should be changed for failure
 	static const int num_brokers = get_num_brokers_callback_();
@@ -770,7 +770,11 @@ size_t NetworkManager::GetOffsetToAck(const char* topic){
 		}
 		return min;
 	}else{
-		return tinode->offsets[broker_id_].written;
+		if(order == 0){
+			return tinode->offsets[broker_id_].written;
+		}else{
+			return tinode->offsets[broker_id_].ordered;
+		}
 	}
 }
 
@@ -783,7 +787,6 @@ void NetworkManager::AckThread(const char* topic, int ack_fd) {
 	while (!stop_threads_) {
 		size_t ack = GetOffsetToAck(topic);
 		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
-			VLOG(3) << "[JAE_DEBUG] ack:" << ack;
 			next_to_ack_offset = ack + 1;
 			// Send offset acknowledgment
 			size_t acked_size = 0;
