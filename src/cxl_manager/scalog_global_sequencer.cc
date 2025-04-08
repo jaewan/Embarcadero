@@ -1,5 +1,6 @@
 #include "scalog_global_sequencer.h"
 
+// NOTE: The global sequencer will only begin sending global cuts after NUM_MAX_BROKERS have sent HandleRegisterBroker requests.
 ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
 	LOG(INFO) << "Starting Scalog global sequencer with interval: " << SCALOG_SEQ_LOCAL_CUT_INTERVAL;
 
@@ -34,6 +35,11 @@ grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* co
 	std::unique_lock<std::mutex> lock(mutex_);
 
     int broker_id = request->broker_id();
+
+	if (broker_id == 0) {
+		num_replicas_per_broker_ = request->replication_factor() + 1;
+	}
+
     {
         absl::WriterMutexLock lock(&registered_brokers_mu_);
         registered_brokers_.insert(broker_id);
@@ -51,6 +57,7 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 	while (!shutdown_requested_) {
 		GlobalCut global_cut;
 
+		// TODO(Tony) Might not need this lock or might be able to move it to right before we begin iterating through local_sequencers_ vector.
 		{
 			absl::MutexLock lock(&stream_mu_);
 			/// Convert global_cut_ to google::protobuf::Map<int64_t, int64_t>
@@ -63,7 +70,8 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 					}
 
 					size_t num_replicas = entry.second.size();
-					if (num_replicas < 2) {
+					if (num_replicas < num_replicas_per_broker_) {
+						LOG(INFO) << "Not enough replicas for broker " << entry.first << " to send global cut where num replicas is " << num_replicas_per_broker_;
 						global_cut.mutable_global_cut()->insert({entry.first, 0});
 						continue;
 					}

@@ -6,7 +6,7 @@ namespace Scalog {
 //Current logic proceeds epoch with all brokers at the same pace. 
 //If a broker fails, the entire cluster is stuck. If a failure is detected from the heartbeat, GetRegisteredBroker will return the alive brokers
 //after heartbeat_interval (failure is detected), if there is a change in the cluster, only proceed with the brokers
-ScalogLocalSequencer::ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager, int broker_id, void* cxl_addr) :
+ScalogLocalSequencer::ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager, int broker_id, void* cxl_addr, std::string topic_str) :
 	cxl_manager_(cxl_manager),
 	broker_id_(broker_id),
 	cxl_addr_(cxl_addr) {
@@ -17,8 +17,12 @@ ScalogLocalSequencer::ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager,
 	std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 	stub_ = ScalogSequencer::NewStub(channel);
 
+	static char topic[TOPIC_NAME_SIZE];
+	memcpy(topic, topic_str.data(), topic_str.size());
+	struct TInode *tinode = cxl_manager_->GetTInode(topic);
+
 	// Send register request to the global sequencer
-	Register();
+	Register(tinode->replication_factor);
 }
 
 void ScalogLocalSequencer::TerminateGlobalSequencer() {
@@ -32,9 +36,10 @@ void ScalogLocalSequencer::TerminateGlobalSequencer() {
 	}
 }
 
-void ScalogLocalSequencer::Register() {
+void ScalogLocalSequencer::Register(int replication_factor) {
 	RegisterBrokerRequest request;
 	request.set_broker_id(broker_id_);
+	request.set_replication_factor(replication_factor);
 
 	RegisterBrokerResponse response;
 	grpc::ClientContext context;

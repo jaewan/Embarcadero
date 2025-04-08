@@ -610,7 +610,7 @@ void CXLManager::Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int b
 
 void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
 	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
-	auto scalog_local_sequencer = std::make_unique<Scalog::ScalogLocalSequencer>(this, broker_id_, cxl_addr_);
+	auto scalog_local_sequencer = std::make_unique<Scalog::ScalogLocalSequencer>(this, broker_id_, cxl_addr_, topic_str);
 	scalog_local_sequencer->SendLocalCut(topic_str);
 }
 

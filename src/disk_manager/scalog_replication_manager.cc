@@ -125,7 +125,6 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 				std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 				stub_ = ScalogSequencer::NewStub(channel);
 
-				//TODO(Tony) spawn a new thread to send local cut in certain interval (as we already do in primary node) and give order to written messages
 				send_local_cut_thread_ = std::thread(&ScalogReplicationServiceImpl::SendLocalCut, this);
 			}
 
