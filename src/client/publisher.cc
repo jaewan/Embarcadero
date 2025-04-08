@@ -656,6 +656,9 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 		}
 
+		batch_header->client_id = client_id_;
+		batch_header->broker_id = broker_id;
+
 		// Get pointer to message data
 		void* msg = reinterpret_cast<uint8_t*>(batch_header) + sizeof(Embarcadero::BatchHeader);
 		len = batch_header->total_size;
@@ -718,6 +721,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Create batch header
 		Embarcadero::BatchHeader batch_header;
+		batch_header.broker_id = broker_id;
+		batch_header.client_id = client_id_;
 		batch_header.total_size = len;
 		batch_header.num_msg = len / static_cast<Embarcadero::MessageHeader*>(msg)->paddedSize;
 		batch_header.batch_seq = batch_seq;

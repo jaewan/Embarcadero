@@ -130,7 +130,7 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
             Embarcadero::BatchHeader* batch_header = 
                 reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[write_buf_id_].buffer + head);
             
-            batch_header->next_reader_head = 0;
+            batch_header->start_logical_offset = 0;
             batch_header->batch_seq = batch_seq_.fetch_add(1);
             batch_header->total_size = bufs_[write_buf_id_].tail - head - sizeof(Embarcadero::BatchHeader);
             batch_header->num_msg = bufs_[write_buf_id_].num_msg;
@@ -156,7 +156,7 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
             Embarcadero::BatchHeader* batch_header = 
                 reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[write_buf_id_].buffer + head);
             
-            batch_header->next_reader_head = bufs_[write_buf_id_].tail;
+            batch_header->start_logical_offset = bufs_[write_buf_id_].tail;
             batch_header->batch_seq = batch_seq_.fetch_add(1);
             batch_header->total_size = bufs_[write_buf_id_].tail - head - sizeof(Embarcadero::BatchHeader);
             batch_header->num_msg = bufs_[write_buf_id_].num_msg;
@@ -193,7 +193,7 @@ void* Buffer::Read(int bufIdx) {
     // Check if batch header contains valid data
     if (batch_header->total_size != 0 && batch_header->num_msg != 0) {
         // Valid batch found, update reader head and return batch
-        bufs_[bufIdx].reader_head = batch_header->next_reader_head;
+        bufs_[bufIdx].reader_head = batch_header->start_logical_offset;
         return static_cast<void*>(batch_header);
     } else {
         // No valid batch yet, check if we need to wait
@@ -212,7 +212,7 @@ void* Buffer::Read(int bufIdx) {
             
             if (seal_exist) {
                 // Valid batch became available, update reader head and return batch
-                bufs_[bufIdx].reader_head = batch_header->next_reader_head;
+                bufs_[bufIdx].reader_head = batch_header->start_logical_offset;
                 return static_cast<void*>(batch_header);
             }
         }
@@ -222,7 +222,7 @@ void* Buffer::Read(int bufIdx) {
         {
             // Check again in case data became available
             if (batch_header->batch_seq != 0 && batch_header->total_size != 0 && batch_header->num_msg != 0) {
-                bufs_[bufIdx].reader_head = batch_header->next_reader_head;
+                bufs_[bufIdx].reader_head = batch_header->start_logical_offset;
                 return static_cast<void*>(batch_header);
             }
             
@@ -250,7 +250,7 @@ void* Buffer::Read(int bufIdx) {
         final_batch_header->batch_seq = batch_seq;
         final_batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
         final_batch_header->num_msg = num_msg;
-        final_batch_header->next_reader_head = tail;
+        final_batch_header->start_logical_offset = tail;
         
         return static_cast<void*>(final_batch_header);
     }
