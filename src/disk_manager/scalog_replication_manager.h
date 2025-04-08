@@ -49,6 +49,8 @@ public:
     // Explicitly shutdown the server
     void Shutdown();
 
+    void StartSendLocalCut();
+
 private:
     std::unique_ptr<ScalogReplicationServiceImpl> service_;
     std::unique_ptr<grpc::Server> server_;

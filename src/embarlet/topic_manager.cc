@@ -138,6 +138,10 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 
     // Run sequencer if needed
     if (broker_id_ != 0 && tinode->seq_type == SCALOG) {
+        if (replication_factor > 0) {
+            disk_manager_.StartScalogReplicaLocalSequencer();
+        }
+
         cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
     }
 
@@ -255,6 +259,10 @@ bool TopicManager::CreateNewTopic(
         topic, order, replication_factor, replicate_tinode, seq_type);
         
     if (tinode) {
+        if (tinode->seq_type == SCALOG && replication_factor > 0) {
+            disk_manager_.StartScalogReplicaLocalSequencer();
+        }
+
         cxl_manager_.RunSequencer(topic, order, seq_type);
         return true;
     } else {

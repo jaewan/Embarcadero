@@ -124,12 +124,14 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 				std::string scalog_seq_address = scalog_global_sequencer_ip_ + ":" + std::to_string(SCALOG_SEQ_PORT);
 				std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 				stub_ = ScalogSequencer::NewStub(channel);
-
-				send_local_cut_thread_ = std::thread(&ScalogReplicationServiceImpl::SendLocalCut, this);
 			}
 
 		~ScalogReplicationServiceImpl() override {
 			Shutdown();
+		}
+
+		void StartSendLocalCutThread() {
+			send_local_cut_thread_ = std::thread(&ScalogReplicationServiceImpl::SendLocalCut, this);
 		}
 
 		void Shutdown() {
@@ -417,6 +419,10 @@ ScalogReplicationManager::ScalogReplicationManager(int broker_id,
 
 ScalogReplicationManager::~ScalogReplicationManager() {
 	Shutdown();
+}
+
+void ScalogReplicationManager::StartSendLocalCut() {
+	service_->StartSendLocalCutThread();
 }
 
 void ScalogReplicationManager::Wait() {
