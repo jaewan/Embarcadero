@@ -1,5 +1,4 @@
 #include "disk_manager.h"
-#include "corfu_replication_manager.h"
 
 #include <unistd.h>
 #include <pwd.h>
@@ -112,6 +111,8 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 						 sequencerType_(sequencerType){
 	num_io_threads_ = NUM_MAX_BROKERS;
 	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
+		scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
+		return;
 	}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 		corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>();
 		return;
@@ -161,7 +162,8 @@ DiskManager::~DiskManager(){
 }
 
 void DiskManager::CopyThread(){
-	if(sequencerType_ == heartbeat_system::SequencerType::SCALOG){
+	if(sequencerType_ == heartbeat_system::SequencerType::SCALOG && scalog_replication_manager_){
+		scalog_replication_manager_->Shutdown();
 		return;
 	}else if(sequencerType_ == heartbeat_system::SequencerType::CORFU){
 		corfu_replication_manager_->Shutdown();
@@ -176,6 +178,10 @@ void DiskManager::CopyThread(){
 		MemcpyRequest &req = optReq.value();
 		std::memcpy(req.addr, req.buf, req.len);
 	}
+}
+
+void DiskManager::StartScalogReplicaLocalSequencer() {
+	scalog_replication_manager_->StartSendLocalCut();
 }
 
 void DiskManager::Replicate(TInode* tinode, TInode* replica_tinode, int replication_factor){

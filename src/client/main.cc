@@ -4,6 +4,8 @@
 #include "test_utils.h"
 #include "result_writer.h"
 
+#define BATCH_OPTIMIZATION 1
+
 int main(int argc, char* argv[]) {
     // Initialize logging
     google::InitGoogleLogging(argv[0]);

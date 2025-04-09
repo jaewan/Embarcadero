@@ -13,7 +13,7 @@
 #include <heartbeat.grpc.pb.h>
 #include "../embarlet/heartbeat.h"
 #include <grpcpp/grpcpp.h>
-#include <scalog_sequencer.grpc.pb.h>
+#include "scalog_local_sequencer.h"
 
 namespace Embarcadero{
 
@@ -128,6 +128,9 @@ class CXLManager{
 
 		void SetEpochToOrder(int epoch){
 			epoch_to_order_ = epoch;
+		}
+		bool GetStopThreads(){
+			return stop_threads_;
 		}
 	private:
 		int broker_id_;
