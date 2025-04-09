@@ -62,7 +62,7 @@ function install_dependencies() {
         echo "Installing fmt library..."
         if [ -d "fmt" ]; then
             echo "fmt directory exists, cleaning..."
-            rm -rf fmt
+            sudo rm -rf fmt
         fi
         git clone --depth 1 --branch 10.1.1 https://github.com/fmtlib/fmt.git
         cd fmt
@@ -84,7 +84,7 @@ function setup_third_party() {
         echo "Installing glog library..."
         if [ -d "glog" ]; then
             echo "glog directory exists, cleaning..."
-            rm -rf glog
+            sudo rm -rf glog
         fi
         git clone --depth 1 --branch v0.6.0 https://github.com/google/glog.git
         cd glog
@@ -102,7 +102,7 @@ function setup_third_party() {
         echo "Installing folly library..."
         if [ -d "folly" ]; then
             echo "folly directory exists, cleaning..."
-            rm -rf folly
+            sudo rm -rf folly
         fi
         git clone --depth 1 --branch v2024.03.11.00 https://github.com/facebook/folly.git
         cd folly && mkdir -p build && cd build
@@ -120,7 +120,7 @@ function setup_third_party() {
         echo "Installing mimalloc library..."
         if [ -d "mimalloc" ]; then
             echo "mimalloc directory exists, cleaning..."
-            rm -rf mimalloc
+            sudo rm -rf mimalloc
         fi
         git clone --depth 1 --branch v2.1.7 https://github.com/microsoft/mimalloc.git
         cd mimalloc
@@ -139,7 +139,7 @@ function setup_third_party() {
 		echo "Installing cxxopts..."
 		if [ -d "cxxopts" ]; then
 			echo "cxxopts directory exists, cleaning..."
-			rm -rf cxxopts
+			sudo rm -rf cxxopts
 		fi
 		git clone --depth 1 --branch v3.2.0 https://github.com/jarro2783/cxxopts.git
 		cd cxxopts
@@ -180,6 +180,6 @@ function cleanup_third_party() {
     local dir=$1
     if [ -d "$dir" ]; then
         echo "Cleaning up $dir..."
-        rm -rf "$dir"
+        sudo rm -rf "$dir"
     fi
 }
