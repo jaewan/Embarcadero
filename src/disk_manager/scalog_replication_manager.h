@@ -17,8 +17,7 @@ namespace Scalog {
 
 class ScalogReplicationServiceImpl;
 
-// Orders are very important to avoid race conditions. 
-// If you change orders of elements, change how sequencers and combiner check written messages
+// TODO(Tony) Copied from cxl_manager's Message Header for now due to circular depedency issues.
 struct alignas(64) ScalogMessageHeader{
 	volatile size_t paddedSize; // This include message+padding+header size
 	void* segment_header;
