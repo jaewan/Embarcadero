@@ -110,7 +110,6 @@ DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory,
 						 log_to_memory_(log_to_memory),
 						 sequencerType_(sequencerType){
 	num_io_threads_ = NUM_MAX_BROKERS;
-
 	if(sequencerType == heartbeat_system::SequencerType::SCALOG){
 		scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
 		return;

@@ -23,6 +23,7 @@ class HeartBeatManager;
 class ScalogLocalSequencer;
 
 enum CXL_Type {Emul, Real};
+
 using heartbeat_system::SequencerType;
 using heartbeat_system::SequencerType::EMBARCADERO;
 using heartbeat_system::SequencerType::KAFKA;
@@ -63,26 +64,21 @@ struct alignas(64) TInode{
 		volatile int replication_factor;
 		SequencerType seq_type;
 	}__attribute__((aligned(64)));
-	/*
-	char topic[TOPIC_NAME_SIZE];
-	volatile uint8_t order;
-	volatile uint8_t replication_factor;
-	SequencerType seq_type;
-	 */
+
 	volatile offset_entry offsets[NUM_MAX_BROKERS];
 };
 
 struct alignas(64) BatchHeader{
 	size_t client_id;
 	// Fill from buffer
-	size_t next_reader_head; // used in publish buffer write, logical_offset in Sequencer4
 	size_t batch_seq;
 	size_t total_size;
 	size_t num_msg;
+	size_t start_logical_offset;
 	// Corfu variables
-	uint32_t broker_id; 	// Sequencer4: batch_ordered
-	uint32_t num_brokers;	// Sequencer4: all prev batches are ordered
-	size_t total_order;	// Sequencer4: relative offset to previous batch header
+	uint32_t broker_id;
+	uint32_t num_brokers;
+	size_t total_order;
 	size_t log_idx;	// Sequencer4: relative log offset to the payload of the batch and elative offset to last message
 };
 
@@ -121,16 +117,17 @@ class CXLManager{
 		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE],
 				void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
-														struct MessageHeader** msg_to_order, struct TInode *tinode);
-		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t ordered_offset) {
-			if(tinode->replicate_tinode){
-				struct TInode *replica_tinode = GetReplicaTInode(topic);
-				replica_tinode->offsets[broker].ordered = msg_logical_off;
-				replica_tinode->offsets[broker].ordered_offset = ordered_offset;
-			}
+				struct MessageHeader** msg_to_order, struct TInode *tinode);
 
-			tinode->offsets[broker].ordered = msg_logical_off;
-			tinode->offsets[broker].ordered_offset = ordered_offset;
+		/// Initializes the scalog sequencer service and starts the grpc server
+		void StartScalogLocalSequencer(std::string topic_str);
+
+		/// Receives the global cut from the head node
+		/// This function is called in the callback of the send local cut grpc call
+		void ScalogSequencer(const char* topic, absl::flat_hash_map<int, absl::btree_map<int, int>> &global_cut);
+
+		void SetEpochToOrder(int epoch){
+			epoch_to_order_ = epoch;
 		}
 		bool GetStopThreads(){
 			return stop_threads_;
@@ -153,15 +150,110 @@ class CXLManager{
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 		std::vector<std::thread> sequencer4_threads_;
 
+		// Scalog
+		std::string scalog_global_sequencer_ip_ = "192.168.60.172";
+		std::unique_ptr<ScalogLocalSequencer> scalog_local_sequencer_;
+		// std::atomic<int> scalog_local_sequencer_port_offset_{0};
+
+		/// Epoch to order
+		int epoch_to_order_ = 0;
+
 		void CXLIOThread(int tid);
+		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
+				size_t msg_to_order);
 		void Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic);
-		void Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int broker, MessageHeader* msg_to_order, 
-					absl::Mutex* mutex, size_t &seq, absl::flat_hash_map<size_t, size_t> &batch_seq);	
-		/// Initializes the scalog sequencer service and starts the grpc server
-		void StartScalogLocalSequencer(std::string topic_str);	
+		void Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int broker,
+				absl::Mutex* mutex, size_t &seq, absl::flat_hash_map<size_t, size_t> &batch_seq);
+
+		std::atomic<size_t> global_seq_{0};
+		// Map: client_id -> next expected batch_seq
+		absl::flat_hash_map<size_t, std::unique_ptr<std::atomic<size_t>>> next_expected_batch_seq_;
+		// Mutex ONLY for adding new clients to next_expected_batch_seq_
+		absl::Mutex client_seq_map_mutex_;
+		folly::MPMCQueue<BatchHeader*> ready_batches_queue_{1024*8};
+
+
+		class SequentialOrderTracker{
+			public:
+				SequentialOrderTracker()= default;
+				SequentialOrderTracker(int broker_id): broker_id_(broker_id){}
+				size_t InsertAndGetSequentiallyOrdered(size_t batch_start_offset, size_t size);
+
+
+				// Current Order 4 logic only assigns order with one thread per broker
+				// Thus, no coordination(lock) is needed within a broker with a single thread
+				void StorePhysicalOffset(size_t logical_offset , size_t physical_offset){
+					//absl::MutexLock lock(&offset_mu_);
+					end_offset_logical_to_physical_.emplace(logical_offset, physical_offset);
+				}
+
+				size_t GetSequentiallyOrdered(){
+					// Find the lateset squentially ordered message offset
+					if (ordered_ranges_.empty() || ordered_ranges_.begin()->first > 0) {
+						return 0;
+					}
+
+					return ordered_ranges_.begin()->second;
+				}
+
+				size_t GetPhysicalOffset(size_t logical_offset) {
+					//absl::MutexLock lock(&offset_mu_);
+					auto itr = end_offset_logical_to_physical_.find(logical_offset);
+					if(itr == end_offset_logical_to_physical_.end()){
+						return 0;
+					}else{
+						return itr->second;
+					}
+				}
+
+			private:
+				int broker_id_;
+				absl::Mutex range_mu_;
+				absl::Mutex offset_mu_;
+				std::map<size_t, size_t> ordered_ranges_ ABSL_GUARDED_BY(range_mu_); //start --> end logical_offset
+				absl::flat_hash_map<size_t, size_t> end_offset_logical_to_physical_ ABSL_GUARDED_BY(offset_mu_);
+		};
+		absl::flat_hash_map<size_t, std::unique_ptr<SequentialOrderTracker>> trackers_;
+
+		void BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_SIZE> topic);
+		bool ProcessSkipped(std::array<char, TOPIC_NAME_SIZE>& topic,
+				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches);
+		void AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *header);
+};
+
+class ScalogLocalSequencer {
+	public:
+		ScalogLocalSequencer(CXLManager* cxl_manager, int broker_id, void* cxl_addr, std::string scalog_seq_address);
+
+		/// Called when first starting the scalog local sequencer. It manages
+		/// the timing between each local cut
+		void LocalSequencer(std::string topic_str);
+
+		/// Sends a local cut to the global sequencer
+		void SendLocalCut(int local_cut, const char* topic);
+
+		/// Sends a register request to the global sequencer
+		void Register();
+
+		/// Sends a request to global sequencer to terminate itself
+		void TerminateGlobalSequencer();
+	private:
+		CXLManager* cxl_manager_;
+		int broker_id_;
+		void* cxl_addr_;
+		std::unique_ptr<ScalogSequencer::Stub> stub_;
+
+		/// Time between each local cut
+		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL);
+
+		/// The key is the current epoch and it contains another map of broker_id to local cut
+		absl::flat_hash_map<int, absl::btree_map<int, int>> global_cut_;
+
+		/// Local epoch
+		int local_epoch_ = 0;
 };
 
 } // End of namespace Embarcadero

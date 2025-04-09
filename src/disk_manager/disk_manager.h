@@ -32,7 +32,6 @@ struct MemcpyRequest{
 class DiskManager{
 	public:
 		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory,
-
 								heartbeat_system::SequencerType sequencerType, size_t queueCapacity = 64);
 		~DiskManager();
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
