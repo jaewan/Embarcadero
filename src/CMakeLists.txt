@@ -3,6 +3,7 @@ cmake_policy(SET CMP0144 NEW)
 include(cmake/heartbeat_grpc.cmake)
 include(cmake/scalog_sequencer_grpc.cmake)
 include(cmake/corfu_sequencer_grpc.cmake)
+include(cmake/scalog_replication_grpc.cmake)
 include(cmake/corfu_replication_grpc.cmake)
 
 find_package(folly REQUIRED)
@@ -51,6 +52,10 @@ add_executable(embarlet
     disk_manager/corfu_replication_manager.h
     disk_manager/corfu_replication_client.cc
     disk_manager/corfu_replication_client.h
+    disk_manager/scalog_replication_manager.cc
+    disk_manager/scalog_replication_manager.h
+    disk_manager/scalog_replication_client.cc
+    disk_manager/scalog_replication_client.h
     cxl_manager/cxl_manager.cc
     cxl_manager/cxl_manager.h
     network_manager/network_manager.cc
@@ -68,12 +73,13 @@ target_include_directories(embarlet PUBLIC
 
 target_link_libraries(embarlet
     numa
-    glog
+    glog::glog
     gflags
     mimalloc
     absl::flat_hash_map
 	scalog_sequencer_grpc_proto
 	corfu_replication_grpc_proto
+    scalog_replication_grpc_proto
 	heartbeat_grpc_proto
     cxxopts::cxxopts
     grpc++_reflection
@@ -110,7 +116,7 @@ target_include_directories(throughput_test PUBLIC
 )
 
 target_link_libraries(throughput_test
-    glog
+    glog::glog
     gflags
     mimalloc
     cxxopts::cxxopts
@@ -142,7 +148,7 @@ target_include_directories(scalog_global_sequencer PUBLIC
 )
 
 target_link_libraries(scalog_global_sequencer
-    glog
+    glog::glog
     absl::flat_hash_map
 	scalog_sequencer_grpc_proto
     grpc++
@@ -164,7 +170,7 @@ target_include_directories(corfu_global_sequencer PUBLIC
 )
 
 target_link_libraries(corfu_global_sequencer
-    glog
+    glog::glog
     absl::flat_hash_map
 	corfu_sequencer_grpc_proto
     grpc++

@@ -9,6 +9,7 @@
 #include "common/config.h"
 #include "../network_manager/network_manager.h"
 #include "corfu_replication_manager.h"
+#include "scalog_replication_manager.h"
 
 namespace Embarcadero{
 
@@ -37,6 +38,7 @@ class DiskManager{
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
 		// Change this to get real-time num brokers
 		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
+		void StartScalogReplicaLocalSequencer();
 
 	private:
 		void ReplicateThread();
@@ -54,6 +56,7 @@ class DiskManager{
 
 		NetworkManager *network_manager_;
 		std::unique_ptr<Corfu::CorfuReplicationManager> corfu_replication_manager_;
+		std::unique_ptr<Scalog::ScalogReplicationManager> scalog_replication_manager_;
 
 		std::atomic<int> offset_{0};
 		bool stop_threads_ = false;
