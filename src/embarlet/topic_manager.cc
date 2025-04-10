@@ -140,10 +140,14 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		topics_[topic]->Combiner();
 	}
 
-	// Run sequencer if needed
-	if (broker_id_ != 0 && tinode->seq_type == SCALOG) {
-		cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
-	}
+    // Run sequencer if needed
+    if (broker_id_ != 0 && tinode->seq_type == SCALOG) {
+        if (replication_factor > 0) {
+            disk_manager_.StartScalogReplicaLocalSequencer();
+        }
+
+        cxl_manager_.RunSequencer(topic, tinode->order, tinode->seq_type);
+    }
 
 	return tinode;
 }
@@ -250,22 +254,26 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 }
 
 bool TopicManager::CreateNewTopic(
-		const char topic[TOPIC_NAME_SIZE], 
-		int order, 
-		int replication_factor, 
-		bool replicate_tinode, 
-		SequencerType seq_type) {
+        const char topic[TOPIC_NAME_SIZE], 
+        int order, 
+        int replication_factor, 
+        bool replicate_tinode, 
+        SequencerType seq_type) {
+    
+    TInode* tinode = CreateNewTopicInternal(
+        topic, order, replication_factor, replicate_tinode, seq_type);
+        
+    if (tinode) {
+        if (tinode->seq_type == SCALOG && replication_factor > 0) {
+            disk_manager_.StartScalogReplicaLocalSequencer();
+        }
 
-	TInode* tinode = CreateNewTopicInternal(
-			topic, order, replication_factor, replicate_tinode, seq_type);
-
-	if (tinode) {
-		cxl_manager_.RunSequencer(topic, order, seq_type);
-		return true;
-	} else {
-		LOG(ERROR) << "Topic already exists!";
-		return false;
-	}
+        cxl_manager_.RunSequencer(topic, order, seq_type);
+        return true;
+    } else {
+        LOG(ERROR) << "Topic already exists!";
+        return false;
+    }
 }
 
 void TopicManager::DeleteTopic(const char topic[TOPIC_NAME_SIZE]) {
@@ -384,15 +392,17 @@ Topic::Topic(
 
 			GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
 		} else if (seq_type == SCALOG) {
-			// TODO(Jae) change this to actual replica address
-			corfu_replication_client_ = std::make_unique<Corfu::CorfuReplicationClient>(
+			if (replication_factor_ > 0) {
+				scalog_replication_client_ = std::make_unique<Scalog::ScalogReplicationClient>(
 					topic_name, 
 					replication_factor_, 
-					"127.0.0.1:" + std::to_string(CORFU_REP_PORT)
-					);
-
-			if (!corfu_replication_client_->Connect()) {
-				LOG(ERROR) << "Corfu replication client failed to connect to replica";
+					"localhost",
+					broker_id_ // broker_id used to determine the port
+				);
+				
+				if (!scalog_replication_client_->Connect()) {
+					LOG(ERROR) << "Scalog replication client failed to connect to replica";
+				}
 			}
 			GetCXLBufferFunc = &Topic::ScalogGetCXLBuffer;
 		} else {
@@ -722,13 +732,14 @@ std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(
 	return nullptr;
 }
 
-//TODO(Tony) Change the names appropriately to scalog from corfu
 std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
-		BatchHeader &batch_header,
-		const char topic[TOPIC_NAME_SIZE],
-		void* &log,
-		void* &segment_header,
-		size_t &logical_offset) {
+        BatchHeader &batch_header,
+        const char topic[TOPIC_NAME_SIZE],
+        void* &log,
+        void* &segment_header,
+        size_t &logical_offset) {
+    static std::atomic<size_t> batch_offset = 0;
+    batch_header.log_idx = batch_offset.fetch_add(batch_header.total_size); 
 
 	// Calculate addresses
 	const unsigned long long int segment_metadata = 
@@ -742,14 +753,15 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 	CheckSegmentBoundary(log, msg_size, segment_metadata);
 
 	// Return replication callback
-	return [this, batch_header](void* log_ptr, size_t /*placeholder*/) {
+	return [this, batch_header, log](void* log_ptr, size_t /*placeholder*/) {
 		// Handle replication if needed
-		if (replication_factor_ > 0 && corfu_replication_client_) {
-			corfu_replication_client_->ReplicateData(
-					batch_header.log_idx,
-					batch_header.total_size,
-					log_ptr
-					);
+		if (replication_factor_ > 0 && scalog_replication_client_) {
+				scalog_replication_client_->ReplicateData(
+						batch_header.log_idx,
+						batch_header.total_size,
+						batch_header.num_msg,
+						log
+				);
 		}
 	};
 }
