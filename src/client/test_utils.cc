@@ -202,7 +202,6 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
         
         // Synchronize with other clients
         synchronizer.fetch_sub(1);
-        VLOG(5) << "Waiting for other clients to initialize, " << synchronizer.load() << " remaining...";
         
         while (synchronizer.load() != 0) {
             std::this_thread::yield();
@@ -349,7 +348,7 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
         Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
                   num_threads_per_broker, message_size, q_size, order, seq_type);
         Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false);
-        
+
         // Initialize publisher
         p.Init(ack_level);
         
@@ -456,7 +455,7 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
         
         // Initialize publisher
         p.Init(ack_level);
-        
+
         // Set up progress tracking
         ProgressTracker progress(n, 1000);
         

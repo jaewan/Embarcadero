@@ -351,10 +351,8 @@ void* Buffer::Read(int bufIdx, size_t& len) {
 
 void Buffer::ReturnReads() {
     shutdown_ = true;
-    VLOG(5) << "Buffer reads returned, shutdown signal set";
 }
 
 void Buffer::WriteFinished() {
     seal_from_read_ = true;
-    VLOG(5) << "Buffer writing finished, seal from read signal set";
 }
