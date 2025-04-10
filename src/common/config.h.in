@@ -48,6 +48,7 @@ namespace Embarcadero{
 //********* Scalog configs *********
 #define SCALOG_SEQ_PORT 50051
 #define SCALOG_REP_PORT 50052
+#define SCLAOG_SEQUENCER_IP "192.168.60.173"
 
 #define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
 	

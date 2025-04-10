@@ -48,7 +48,7 @@ class ScalogLocalSequencer {
 		int local_epoch_ = 0;
 
 		// Global seq ip
-		std::string scalog_global_sequencer_ip_ = "128.110.219.89";
+		std::string scalog_global_sequencer_ip_ = SCLAOG_SEQUENCER_IP;
 
 		/// Flag to indicate if we should stop reading from the stream
 		bool stop_reading_from_stream_ = false;

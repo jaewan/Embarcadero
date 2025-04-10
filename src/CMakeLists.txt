@@ -1,5 +1,3 @@
-cmake_policy(SET CMP0144 NEW)
-
 include(cmake/heartbeat_grpc.cmake)
 include(cmake/scalog_sequencer_grpc.cmake)
 include(cmake/corfu_sequencer_grpc.cmake)
