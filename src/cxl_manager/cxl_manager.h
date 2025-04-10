@@ -13,7 +13,7 @@
 #include <heartbeat.grpc.pb.h>
 #include "../embarlet/heartbeat.h"
 #include <grpcpp/grpcpp.h>
-#include <scalog_sequencer.grpc.pb.h>
+#include "scalog_local_sequencer.h"
 
 namespace Embarcadero{
 
@@ -129,6 +129,19 @@ class CXLManager{
 		void SetEpochToOrder(int epoch){
 			epoch_to_order_ = epoch;
 		}
+		bool GetStopThreads(){
+			return stop_threads_;
+		}
+		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t ordered_offset){
+			if(tinode->replicate_tinode){
+				struct TInode *replica_tinode = GetReplicaTInode(topic);
+				replica_tinode->offsets[broker].ordered = msg_logical_off;
+				replica_tinode->offsets[broker].ordered_offset = ordered_offset;
+			}
+
+			tinode->offsets[broker].ordered = msg_logical_off;
+			tinode->offsets[broker].ordered_offset = ordered_offset;
+		}
 	private:
 		int broker_id_;
 		std::string head_ip_;
@@ -156,10 +169,11 @@ class CXLManager{
 		int epoch_to_order_ = 0;
 
 		void CXLIOThread(int tid);
+  
 		inline void UpdateTInodeOrderandWritten(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
 				size_t msg_to_order);
-		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
-				size_t msg_to_order);
+		// inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t msg_to_order);
+
 		void Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic);
