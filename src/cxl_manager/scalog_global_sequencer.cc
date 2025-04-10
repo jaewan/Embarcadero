@@ -10,7 +10,10 @@ ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
     builder.AddListeningPort(scalog_seq_address, grpc::InsecureServerCredentials());
     builder.RegisterService(this);
     scalog_server_ = builder.BuildAndStart();
-    scalog_server_->Wait();
+}
+
+void ScalogGlobalSequencer::Run() {
+	scalog_server_->Wait();
 }
 
 grpc::Status ScalogGlobalSequencer::HandleTerminateGlobalSequencer(grpc::ServerContext* context,
@@ -18,9 +21,12 @@ grpc::Status ScalogGlobalSequencer::HandleTerminateGlobalSequencer(grpc::ServerC
 	LOG(INFO) << "Terminating Scalog global sequencer";
 
     // Signal shutdown to waiting threads
-    shutdown_requested_ = true;
+	stop_reading_from_stream_ = true;
 
-    // auto deadline = std::chrono::system_clock::now();
+	if (global_cut_thread_.joinable()) {
+		global_cut_thread_.join();
+	}
+
 	std::thread([this]() {
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 		scalog_server_->Shutdown();
@@ -45,8 +51,7 @@ grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* co
         registered_brokers_.insert(broker_id);
 
 		if (registered_brokers_.size() == NUM_MAX_BROKERS) {
-			std::thread global_cut_thread(&ScalogGlobalSequencer::SendGlobalCut, this);
-			global_cut_thread.detach();
+			global_cut_thread_ = std::thread(&ScalogGlobalSequencer::SendGlobalCut, this);
 		}
     }
 
@@ -91,9 +96,7 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 
 			for (auto&stream : local_sequencers_) {
 				{
-					if (!stream->Write(global_cut)) {
-						std::cerr << "Error writing GlobalCut to the client" << std::endl;
-					}
+					if (!stream->Write(global_cut)) {}
 				}
 			}
 		}
@@ -108,29 +111,20 @@ grpc::Status ScalogGlobalSequencer::HandleSendLocalCut(grpc::ServerContext* cont
 
 	{
 		absl::MutexLock lock(&stream_mu_);
-        // Push a tuple containing the stream and its lock into local_sequencers_
         local_sequencers_.emplace_back(stream);
 	}
 
     std::thread receive_local_cut(&ScalogGlobalSequencer::ReceiveLocalCut, this, std::ref(stream));
+	receive_local_cut.join();
 
-	// Keep the stream open and active for the client (blocking call)
-	while (true) {
-		// Simulate keeping the stream alive, handling disconnection, etc.
-		if (context->IsCancelled()) {
-			break;
-		}
-		std::this_thread::yield();
-	}
-
-	stop_reading_from_stream_ = true;
+	return grpc::Status::OK; 
 }
 
 void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream) {
 	while (!stop_reading_from_stream_) {
 		LocalCut request;
 		{
-			if (stream->Read(&request)) {
+			if (stream && stream->Read(&request)) {
 				static char topic[TOPIC_NAME_SIZE];
 				memcpy(topic, request.topic().c_str(), request.topic().size());
 				int epoch = request.epoch();
@@ -152,12 +146,16 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 			}
 		}
 	}
+
+	shutdown_requested_ = true;
 }
 
 int main(int argc, char* argv[]){
     // Initialize scalog global sequencer
     std::string scalog_seq_address = std::string(SCLAOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
     ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
+
+	scalog_global_sequencer.Run();
 
     return 0;
 }

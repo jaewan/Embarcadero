@@ -14,6 +14,8 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
 
         void SendGlobalCut();
 
+        void Run();
+
         /// Receives a local cut from a local sequencer
             /// @param request Request containing the local cut and the epoch
             /// @param response Empty for now
@@ -79,4 +81,6 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
 
         // Replication factor
         int num_replicas_per_broker_;
+
+        std::thread global_cut_thread_;
 };
