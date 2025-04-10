@@ -30,7 +30,7 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
         grpc::Status HandleTerminateGlobalSequencer(grpc::ServerContext* context, const TerminateGlobalSequencerRequest* request, TerminateGlobalSequencerResponse* response);
 
         /// Keep track of the global cut and if all the local cuts have been received
-		void ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream, std::shared_ptr<absl::Mutex> stream_lock);
+		void ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream);
     private:
 		/// The head node keeps track of the global epoch and increments it whenever we complete a round of local cuts
 		int global_epoch_;
@@ -72,7 +72,7 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
 		std::chrono::microseconds global_cut_interval_ = std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL);
 
         /// Stream to send global cut to all local sequencers
-        std::vector<std::tuple<std::shared_ptr<grpc::ServerReaderWriter<GlobalCut, LocalCut>>, std::shared_ptr<absl::Mutex>>> local_sequencers_;
+        std::vector<grpc::ServerReaderWriter<GlobalCut, LocalCut>*> local_sequencers_ ABSL_GUARDED_BY(stream_mu_);
 
         /// Mutex to protect local_sequencers_
         absl::Mutex stream_mu_;

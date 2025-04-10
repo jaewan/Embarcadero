@@ -89,10 +89,7 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 				}
 			}
 
-			for (auto local_sequencer : local_sequencers_) {
-				auto& stream = std::get<0>(local_sequencer);
-				auto& stream_lock = std::get<1>(local_sequencer);
-
+			for (auto&stream : local_sequencers_) {
 				{
 					if (!stream->Write(global_cut)) {
 						std::cerr << "Error writing GlobalCut to the client" << std::endl;
@@ -109,18 +106,13 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 grpc::Status ScalogGlobalSequencer::HandleSendLocalCut(grpc::ServerContext* context,
 		grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream) {
 
-    // Create a lock associated with the stream
-    auto stream_lock = std::make_shared<absl::Mutex>();
-
-    auto shared_stream = std::shared_ptr<grpc::ServerReaderWriter<GlobalCut, LocalCut>>(stream);
-
 	{
 		absl::MutexLock lock(&stream_mu_);
         // Push a tuple containing the stream and its lock into local_sequencers_
-        local_sequencers_.emplace_back(shared_stream, stream_lock);
+        local_sequencers_.emplace_back(stream);
 	}
 
-    std::thread receive_local_cut(&ScalogGlobalSequencer::ReceiveLocalCut, this, std::ref(stream), stream_lock);
+    std::thread receive_local_cut(&ScalogGlobalSequencer::ReceiveLocalCut, this, std::ref(stream));
 
 	// Keep the stream open and active for the client (blocking call)
 	while (true) {
@@ -134,7 +126,7 @@ grpc::Status ScalogGlobalSequencer::HandleSendLocalCut(grpc::ServerContext* cont
 	stop_reading_from_stream_ = true;
 }
 
-void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream, std::shared_ptr<absl::Mutex> stream_lock) {
+void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream) {
 	while (!stop_reading_from_stream_) {
 		LocalCut request;
 		{
@@ -164,7 +156,7 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 
 int main(int argc, char* argv[]){
     // Initialize scalog global sequencer
-    std::string scalog_seq_address = SCLAOG_SEQUENCER_IP;
+    std::string scalog_seq_address = std::string(SCLAOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
     ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
 
     return 0;
