@@ -236,6 +236,21 @@ void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 	}
 }
 
+inline void CXLManager::UpdateTInodeOrderandWritten(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t ordered_offset){
+	if(tinode->replicate_tinode){
+		struct TInode *replica_tinode = GetReplicaTInode(topic);
+		replica_tinode->offsets[broker].ordered = msg_logical_off;
+		replica_tinode->offsets[broker].ordered_offset = ordered_offset;
+		replica_tinode->offsets[broker].written = msg_logical_off;
+		replica_tinode->offsets[broker].written_addr = ordered_offset;
+	}
+
+	tinode->offsets[broker].ordered = msg_logical_off;
+	tinode->offsets[broker].ordered_offset = ordered_offset;
+	tinode->offsets[broker].written = msg_logical_off;
+	tinode->offsets[broker].written_addr = ordered_offset;
+}
+
 // Sequence without respecting publish order
 void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic){
 	struct TInode *tinode = GetTInode(topic.data());
@@ -752,7 +767,7 @@ void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHead
 
 		// For latency, update per message. Can do this batch granularity after the loop
 		if(update_tinode){
-			UpdateTinodeOrder(topic.data(), tinode, broker, msg_header->logical_offset, (uint8_t*)msg_header - (uint8_t*)cxl_addr_);
+			UpdateTInodeOrderandWritten(topic.data(), tinode, broker, msg_header->logical_offset, (uint8_t*)msg_header - (uint8_t*)cxl_addr_);
 		}
 		last_msg_of_batch = msg_header;
 		msg_header = reinterpret_cast<MessageHeader*>(
@@ -778,7 +793,7 @@ void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHead
 				<< " LastMsgLogicalInBatch=" << last_msg_of_batch->logical_offset
 				<< ". THIS SHOULD NOT HAPPEN if lookup_offset is from the current batch OR locking is correct.";
 		}else{
-			UpdateTinodeOrder(topic.data(), tinode, broker, lookup_offset, addr);
+			UpdateTInodeOrderandWritten(topic.data(), tinode, broker, lookup_offset, addr);
 		}
 	}
 }
