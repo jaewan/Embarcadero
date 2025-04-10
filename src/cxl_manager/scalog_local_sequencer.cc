@@ -75,8 +75,7 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 
 		// Send the LocalCut message to the server
 		if (!stream->Write(request)) {
-			std::cerr << "Error writing LocalCut to the server" << std::endl;
-
+			std::cerr << "Stream to write local cut is closed, cleaning up..." << std::endl;
 			break;
 		}
 
