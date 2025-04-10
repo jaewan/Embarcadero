@@ -442,7 +442,7 @@ void NetworkManager::HandlePublishRequest(
 			ack_fd_ = ack_fd;
 			ack_connections_[handshake.client_id] = ack_fd;
 
-			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, ack_fd);
+			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd);
 		}
 	}
 
@@ -750,7 +750,7 @@ bool NetworkManager::SendMessageData(
 // Acknowledgment Handling
 //----------------------------------------------------------------------------
 
-size_t NetworkManager::GetOffsetToAck(const char* topic){
+size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
 	static const int replication_factor = tinode->replication_factor;
 	static const int order = tinode->order;
@@ -759,6 +759,13 @@ size_t NetworkManager::GetOffsetToAck(const char* topic){
 	static const int num_brokers = get_num_brokers_callback_();
 
 	if(replication_factor > 0){
+		if(ack_level == 1){
+			if(order == 0){
+				return tinode->offsets[broker_id_].written;
+			}else{
+				return tinode->offsets[broker_id_].ordered;
+			}
+		}
 		size_t r[replication_factor];
 
 		for (int i = 0; i < replication_factor; i++) {
@@ -778,14 +785,14 @@ size_t NetworkManager::GetOffsetToAck(const char* topic){
 	}
 }
 
-void NetworkManager::AckThread(const char* topic, int ack_fd) {
+void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd) {
 	struct epoll_event events[10];
 	char buf[1];
 
 	size_t next_to_ack_offset = 0;
 
 	while (!stop_threads_) {
-		size_t ack = GetOffsetToAck(topic);
+		size_t ack = GetOffsetToAck(topic, ack_level);
 		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
 			next_to_ack_offset = ack + 1;
 			// Send offset acknowledgment
