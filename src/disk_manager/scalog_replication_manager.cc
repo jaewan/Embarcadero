@@ -353,7 +353,7 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 		std::mutex file_mutex_;
 
 		// Global seq ip
-		std::string scalog_global_sequencer_ip_ = "128.110.219.89";
+		std::string scalog_global_sequencer_ip_ = SCLAOG_SEQUENCER_IP;
 
 		std::thread send_local_cut_thread_;
 

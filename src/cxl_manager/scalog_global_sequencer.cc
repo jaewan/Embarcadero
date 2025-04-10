@@ -164,7 +164,7 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 
 int main(int argc, char* argv[]){
     // Initialize scalog global sequencer
-    std::string scalog_seq_address = "128.110.219.89:50051";
+    std::string scalog_seq_address = SCLAOG_SEQUENCER_IP;
     ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
 
     return 0;
