@@ -14,6 +14,7 @@
 #include "../cxl_manager/cxl_manager.h"
 #include "../disk_manager/disk_manager.h"
 #include "../disk_manager/corfu_replication_client.h"
+#include "../disk_manager/scalog_replication_client.h"
 
 #ifndef CACHELINE_SIZE
 #define CACHELINE_SIZE 64
@@ -203,6 +204,7 @@ class Topic {
 
 		// Replication
 		std::unique_ptr<Corfu::CorfuReplicationClient> corfu_replication_client_;
+		std::unique_ptr<Scalog::ScalogReplicationClient> scalog_replication_client_;
 
 		// Offset tracking
 		size_t logical_offset_;
