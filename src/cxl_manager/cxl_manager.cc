@@ -221,6 +221,14 @@ void CXLManager::RunSequencer(const char topic[TOPIC_NAME_SIZE], int order, Sequ
 	}
 }
 
+void CXLManager::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers,
+                                         struct TInode *tinode) {
+    if (!get_registered_brokers_callback_(registered_brokers, nullptr /* msg_to_order removed */, tinode)) {
+			 LOG(ERROR) << "GetRegisteredBrokerSet: Callback failed to get registered brokers.";
+			 registered_brokers.clear(); // Ensure set is empty on failure
+    }
+}
+
 void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
 		struct MessageHeader** msg_to_order, struct TInode *tinode){
 	if(get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode)){
@@ -252,46 +260,126 @@ inline void CXLManager::UpdateTInodeOrderandWritten(char *topic, TInode* tinode,
 }
 
 // Sequence without respecting publish order
-void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic){
-	struct TInode *tinode = GetTInode(topic.data());
-	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
-	absl::btree_set<int> registered_brokers;
-	static size_t seq = 0;
+void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic) {
+    struct TInode *tinode = GetTInode(topic.data());
+    if (!tinode) {
+        LOG(ERROR) << "Sequencer1: Failed to get TInode for topic " << topic.data();
+        return;
+    }
 
-	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-	//auto last_updated = std::chrono::steady_clock::now();
+    // Local storage for message pointers, initialized to nullptr
+    struct MessageHeader* msg_to_order[NUM_MAX_BROKERS] = {nullptr};
+    absl::btree_set<int> registered_brokers;
+    absl::btree_set<int> initialized_brokers; // Track initialized brokers
+    static size_t seq = 0; // Sequencer counter
 
-	while(!stop_threads_){
-		//bool yield = true;
-		for(auto broker : registered_brokers){
-			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
-			size_t written = tinode->offsets[broker].written;
-			if(written == (size_t)-1){
-				continue;
-			}
-			while(!stop_threads_ && msg_logical_off <= written && msg_to_order[broker]->next_msg_diff != 0 
-					&& msg_to_order[broker]->logical_offset != (size_t)-1){
-				msg_to_order[broker]->total_order = seq;
-				seq++;
-				//std::atomic_thread_fence(std::memory_order_release);
-				UpdateTinodeOrder(topic.data(), tinode, broker , msg_logical_off, (uint8_t*)msg_to_order[broker] - (uint8_t*)cxl_addr_);
-				msg_to_order[broker] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker] + msg_to_order[broker]->next_msg_diff);
-				msg_logical_off++;
-				//yield = false;
-			}
-		}
-		/*
-			 if(yield){
-			 GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-			 last_updated = std::chrono::steady_clock::now();
-			 std::this_thread::yield();
-			 }else if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()
-			 - last_updated).count() >= HEARTBEAT_INTERVAL){
-			 GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
-			 last_updated = std::chrono::steady_clock::now();
-			 }
-			 */
-	}
+    // Get the initial set of registered brokers (without waiting)
+    GetRegisteredBrokerSet(registered_brokers, tinode);
+
+    if (registered_brokers.empty()) {
+        LOG(WARNING) << "Sequencer1: No registered brokers found for topic " << topic.data() << ". Sequencer might idle.";
+    }
+
+    while (!stop_threads_) {
+        bool processed_message = false; // Track if any work was done in this outer loop iteration
+
+        // TODO: If brokers can register dynamically, call GetRegisteredBrokerSet periodically
+        //       and update the registered_brokers set here.
+
+        for (auto broker_id : registered_brokers) {
+            // --- Dynamic Initialization Check ---
+            if (initialized_brokers.find(broker_id) == initialized_brokers.end()) {
+                // This broker hasn't been initialized yet, check its log offset NOW
+                size_t current_log_offset = tinode->offsets[broker_id].log_offset; // Read the current offset
+
+                if (current_log_offset == 0) {
+                    // Still not initialized, skip this broker for this iteration
+                    VLOG(5) << "Sequencer1: Broker " << broker_id << " log still uninitialized (offset=0), skipping.";
+                    continue;
+                } else {
+                    // Initialize Now!
+                    VLOG(5) << "Sequencer1: Initializing broker " << broker_id << " with log_offset=" << current_log_offset;
+                    msg_to_order[broker_id] = ((MessageHeader*)((uint8_t*)cxl_addr_ + current_log_offset));
+                    initialized_brokers.insert(broker_id); // Mark as initialized
+                    // Proceed to process messages below
+                }
+            }
+
+            // --- Process Messages if Initialized ---
+            // Ensure msg_to_order pointer is valid before dereferencing
+             if (msg_to_order[broker_id] == nullptr) {
+                  // This should ideally not happen if the logic above is correct, but safety check
+                  LOG(DFATAL) << "Sequencer1: msg_to_order[" << broker_id << "] is null despite being marked initialized!";
+                  continue;
+             }
+
+            // Read necessary volatile/shared values (consider atomics/locking if needed)
+            size_t current_written_offset = tinode->offsets[broker_id].written; // Where the broker has written up to (logical offset)
+            // Note: MessageHeader fields read below might also need volatile/atomic handling
+
+            // Check if broker has indicated completion/error
+            if (current_written_offset == static_cast<size_t>(-1)) {
+                // Broker might be done or encountered an error, skip it permanently?
+                // Or maybe just for this round? Depends on the meaning of -1.
+                VLOG(4) << "Sequencer1: Broker " << broker_id << " written offset is -1, skipping.";
+                continue;
+            }
+
+            // Get the logical offset embedded in the *current* message header we're pointing to
+            // This assumes logical_offset field correctly tracks message sequence within the broker's log
+             size_t msg_logical_off = msg_to_order[broker_id]->logical_offset;
+
+
+            // Inner loop to process available messages for this broker
+            while (!stop_threads_ &&
+                   msg_logical_off != static_cast<size_t>(-1) && // Check if current message is valid
+                   msg_logical_off <= current_written_offset && // Check if message offset has been written by broker
+                   msg_to_order[broker_id]->next_msg_diff != 0)  // Check if it links to a next message (validity)
+            {
+                 // Check if total order has already been assigned (e.g., by another sequencer replica?)
+                 // Need to define what indicates "not yet assigned". Using 0 might be risky if 0 is valid.
+                 // Let's assume unassigned is indicated by a specific value, e.g., -1 or max_size_t
+                 // For now, let's assume we always assign if the conditions above are met. Revisit if needed.
+
+                 VLOG(5) << "Sequencer1: Assigning seq=" << seq << " to broker=" << broker_id << ", logical_offset=" << msg_logical_off;
+                 msg_to_order[broker_id]->total_order = seq; // Assign sequence number
+                 // TODO: Ensure this write is visible (volatile, atomic, or fence)
+                 // std::atomic_thread_fence(std::memory_order_release); // Example fence if needed
+
+                 seq++; // Increment global sequence number
+
+                 // Update TInode about the latest processed message *for this broker*
+                 // Assuming UpdateTinodeOrder persists this information safely
+                 UpdateTinodeOrder(topic.data(), tinode, broker_id, msg_logical_off,
+                                   (uint8_t*)msg_to_order[broker_id] - (uint8_t*)cxl_addr_); // Pass CXL relative offset
+
+                 processed_message = true; // We did some work
+                 msg_to_order[broker_id] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker_id] + msg_to_order[broker_id]->next_msg_diff);
+                 msg_logical_off = msg_to_order[broker_id]->logical_offset;
+
+            } // End inner while loop for processing broker messages
+
+        } // End for loop iterating through registered_brokers
+
+        // If no messages were processed across all brokers, yield briefly
+        // This prevents busy-spinning when there's no new data.
+        if (!processed_message && !stop_threads_) {
+             // Check again if any uninitialized brokers became initialized
+             bool potentially_newly_initialized = false;
+              for(auto broker_id : registered_brokers) {
+                  if (initialized_brokers.find(broker_id) == initialized_brokers.end()) {
+                       if (tinode->offsets[broker_id].log_offset != 0) {
+                            potentially_newly_initialized = true;
+                            break;
+                       }
+                  }
+              }
+              if (!potentially_newly_initialized) {
+                  std::this_thread::yield();
+              }
+        }
+
+    } // End outer while(!stop_threads_)
 }
 
 // Order 2 with single thread
@@ -450,8 +538,7 @@ void CXLManager::Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic) {
 	struct TInode *tinode = GetTInode(topic.data());
 
 	absl::btree_set<int> registered_brokers;
-	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
-	GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+	GetRegisteredBrokerSet(registered_brokers, tinode);
 
 	global_seq_.store(0);
 
@@ -486,6 +573,11 @@ void CXLManager::Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic) {
 // This does not work with multi-segments as it advances to next messaeg with message's size
 void CXLManager::BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_SIZE> topic) {
 	struct TInode *tinode = GetTInode(topic.data());
+	// Wait until tinode of the broker is initialized by the broker
+	// Sequencer4 relies on GetRegisteredBrokerSet that does not wait
+	while(tinode->offsets[broker_id].log_offset == 0){
+		std::this_thread::yield();
+	}
 	// Get the starting point for this broker's batch header log
 	BatchHeader* current_batch_header = reinterpret_cast<BatchHeader*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode->offsets[broker_id].batch_headers_offset);
