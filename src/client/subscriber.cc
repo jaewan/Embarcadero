@@ -24,8 +24,6 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 		absl::MutexLock lock(&node_mutex_);
 		nodes_[0] = head_addr + ":" + std::to_string(PORT); // Assuming PORT is defined
 	}
-	VLOG(5) << "Subscriber initialized. Buffer size per connection (dual): "
-		<< (buffer_size_per_buffer_ * 2) / (1024*1024) << " MB total.";
 
 	// Start cluster probe thread (will call ManageBrokerConnections)
 	cluster_probe_thread_ = std::thread([this]() { this->SubscribeToClusterStatus(); });
@@ -37,27 +35,22 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 }
 
 Subscriber::~Subscriber() {
-	VLOG(1) << "Subscriber shutting down...";
 	Shutdown(); // Ensure shutdown is called
 	if (cluster_probe_thread_.joinable()) {
 		cluster_probe_thread_.join();
-		VLOG(1) << "Cluster probe thread joined.";
 	}
 	// Worker threads should be joined by ThreadInfo destructor when vector clears
 	{
 		absl::MutexLock lock(&worker_mutex_);
 		worker_threads_.clear(); // Triggers ThreadInfo destructors
-		VLOG(1) << "Worker threads cleared and joined.";
 	}
 	// ConnectionBuffers map cleared automatically (shared_ptr refs drop)
-	VLOG(1) << "Subscriber shutdown complete.";
 }
 
 void Subscriber::Shutdown() {
 	if (shutdown_.exchange(true)) { // Prevent double shutdown
 		return;
 	}
-	VLOG(1) << "Initiating Subscriber shutdown sequence...";
 
 	// Wake up any waiting consumer
 	consume_cv_.SignalAll();
@@ -77,12 +70,10 @@ void Subscriber::Shutdown() {
 	// Close all connection FDs to interrupt blocking recv calls
 	{
 		absl::MutexLock lock(&worker_mutex_);
-		VLOG(1) << "Closing " << worker_threads_.size() << " worker connections...";
 		for (const auto& info : worker_threads_) {
 			// Shut down the socket for reading and writing.
 			// This should cause recv() in the worker thread to return 0 or error.
 			if (info.fd >= 0) {
-				VLOG(2) << "Shutting down socket fd=" << info.fd;
 				// SHUT_RDWR immediately stops reads/writes
 				if (::shutdown(info.fd, SHUT_RDWR) < 0) {
 					LOG(WARNING) << "Failed to shutdown socket fd=" << info.fd << ": " << strerror(errno);
@@ -98,127 +89,237 @@ void Subscriber::Shutdown() {
 void Subscriber::RemoveConnection(int fd) {
 	absl::MutexLock lock(&connection_map_mutex_);
 	if (connections_.erase(fd)) {
-		VLOG(1) << "Removed connection resources for fd=" << fd;
 		// shared_ptr ref count drops. If 0, ConnectionBuffers is destroyed.
 	}
 }
 
 bool Subscriber::DEBUG_check_order(int order) {
-	VLOG(5) << "Checking message order with order level: " << order;
-	return true;
-	/*
+	//if (DEBUG_do_not_check_order_) {
+	//     LOG(INFO) << "DEBUG: Order checking explicitly disabled, skipping.";
+	//     return true;
+	//}
 
-	// Skip checks if disabled
-	if (DEBUG_do_not_check_order_) {
-	VLOG(5) << "Order checking disabled, skipping checks";
-	return true;
+	// 1. Aggregate all message headers from all connection buffers
+	std::vector<Embarcadero::MessageHeader> all_headers;
+	size_t total_bytes_parsed = 0;
+	// Aggregating message headers from all connections...
+	{ // Scope for locking the connection map
+		absl::MutexLock map_lock(&connection_map_mutex_);
+		all_headers.reserve(DEBUG_count_ / sizeof(Embarcadero::MessageHeader)); // Rough estimate
+
+		for (auto const& [fd, conn_ptr] : connections_) {
+			if (!conn_ptr) continue;
+
+			// Lock connection state to access buffers safely
+			// NOTE: This assumes no receiver thread is actively writing during the check.
+			// For a true debug check after run, this might be okay.
+			// If run concurrently, more complex synchronization or copying might be needed.
+			absl::MutexLock state_lock(&conn_ptr->state_mutex);
+
+			for (int buf_idx = 0; buf_idx < 2; ++buf_idx) {
+				const auto& buffer_state = conn_ptr->buffers[buf_idx];
+				// Use the current write_offset as the limit of valid data
+				size_t buffer_data_size = buffer_state.write_offset.load(std::memory_order_relaxed);
+				uint8_t* buffer_start_ptr = static_cast<uint8_t*>(buffer_state.buffer);
+
+				if (buffer_data_size == 0) continue;
+
+				VLOG(5) << "DEBUG: Parsing FD=" << fd << ", Buffer=" << buf_idx << ", Size=" << buffer_data_size;
+				size_t parse_offset = 0;
+				while (parse_offset < buffer_data_size) {
+					uint8_t* current_parse_ptr = buffer_start_ptr + parse_offset;
+					size_t remaining_in_buffer = buffer_data_size - parse_offset;
+
+					if (remaining_in_buffer < sizeof(Embarcadero::MessageHeader)) {
+						VLOG(5) << "DEBUG: Incomplete header at offset " << parse_offset << ", stopping parse for this buffer.";
+						break;
+					}
+					Embarcadero::MessageHeader* header = reinterpret_cast<Embarcadero::MessageHeader*>(current_parse_ptr);
+
+					// Basic validity check on header data (e.g., paddedSize)
+					size_t total_message_size = header->paddedSize;
+					if (total_message_size == 0) {
+						LOG(WARNING) << "DEBUG: Encountered header with paddedSize 0 at offset " << parse_offset << " in FD=" << fd << ", Buffer=" << buf_idx << ". Stopping parse for this buffer.";
+						break; // Avoid infinite loop
+					}
+					if (remaining_in_buffer < total_message_size) {
+						VLOG(5) << "DEBUG: Incomplete message (need " << total_message_size << ", have " << remaining_in_buffer << ") at offset " << parse_offset << ", stopping parse for this buffer.";
+						break;
+					}
+
+					// --- Full message identified ---
+					// Store a *copy* of the header
+					all_headers.push_back(*header);
+					total_bytes_parsed += total_message_size;
+
+					// Advance parse_offset
+					parse_offset += total_message_size;
+				} // End while(parse_offset < buffer_data_size)
+			} // End for buf_idx
+		} // End for connections
+	} // Release connection map lock
+
+	LOG(INFO) << "DEBUG: Aggregated " << all_headers.size() << " message headers (" << total_bytes_parsed << " bytes parsed).";
+
+	if (all_headers.empty()) {
+		LOG(WARNING) << "DEBUG: No message headers found to check.";
+		// Decide if this is an error or success based on expectations
+		return true; // Or false if messages were expected
 	}
 
-	int idx = 0;
-	bool order_correct = true;
+	bool overall_status = true; // Assume correct until proven otherwise
 
-	for (auto& msg_pair : messages_[idx]) {
-	// Get buffer and metadata
-	void* buf = msg_pair.first;
-	if (!buf) {
-	continue;
+	// 2. Order Level 0 Check: Logical Offset assignment
+	VLOG(3) << "DEBUG: --- Checking Order Level 0 (Logical Offset) ---";
+	for (const auto& header : all_headers) {
+		// Assuming -1 means unassigned (as per original code)
+		if (header.logical_offset == static_cast<size_t>(-1)) {
+			LOG(ERROR) << "DEBUG Check Failed (Level 0): Message client_order=" << header.client_order
+				<< ", client_id=" << header.client_id << " has unassigned logical_offset (-1).";
+			overall_status = false;
+			// Don't break, report all such errors
+		}
 	}
-
-	// First check: Verify logical offsets are assigned
-	Embarcadero::MessageHeader* header = static_cast<Embarcadero::MessageHeader*>(buf);
-
-	while (header->paddedSize != 0) {
-	if (header->logical_offset == static_cast<size_t>(-1)) {
-	LOG(ERROR) << "Message with client_order " << header->client_order 
-	<< " was not assigned a logical offset";
-	order_correct = false;
-	break;
-	}
-
-	// Move to next message
-	header = reinterpret_cast<Embarcadero::MessageHeader*>(
-	reinterpret_cast<uint8_t*>(header) + header->paddedSize);
-	}
-
-	// Skip further checks if order level is 0
 	if (order == 0) {
-	continue;
+		LOG(INFO) << "DEBUG: Order Level 0 check " << (overall_status ? "PASSED" : "FAILED");
+		return overall_status;
+	}
+	VLOG(3) << "DEBUG: Order Level 0 check " << (overall_status ? "passed" : "failed (continuing checks)");
+
+
+	// 3. Sort by Total Order for subsequent checks
+	VLOG(3) << "DEBUG: Sorting headers by total_order...";
+	std::sort(all_headers.begin(), all_headers.end(), [](const auto& a, const auto& b) {
+			// Handle potentially unassigned total_order if necessary (e.g., treat 0 specially?)
+			// Assuming assigned total_order starts from 0 or 1 if assigned.
+			return a.total_order < b.total_order;
+			});
+	VLOG(3) << "DEBUG: Sorting complete.";
+
+
+	// 4. Order Level 1 Check: Total Order assigned, uniqueness, contiguity
+	VLOG(3) << "DEBUG: --- Checking Order Level 1 (Total Order Assignment, Uniqueness, Contiguity) ---";
+	std::set<size_t> total_orders_seen;
+	bool contiguity_ok = true;
+	bool uniqueness_ok = true;
+	bool assignment_ok = true; // Check if total_order is assigned (if logical is)
+
+	if (all_headers.empty()) { // Should not happen if we passed aggregation check, but safety
+		LOG(WARNING) << "DEBUG Check (Level 1): No headers to check after sorting.";
+		return overall_status; // Return status from Level 0
 	}
 
-	// Second check: Verify total order is assigned
-	header = static_cast<Embarcadero::MessageHeader*>(buf);
-	absl::flat_hash_set<int> duplicate_checker;
-
-	while (header->paddedSize != 0) {
-	if (header->total_order == 0 && header->logical_offset != 0) {
-	LOG(ERROR) << "Message with client_order " << header->client_order 
-	<< " and logical offset " << header->logical_offset 
-	<< " was not assigned a total order";
-	order_correct = false;
-	break;
+	// Check first element (assuming sequence starts at 0)
+	// Note: Check if your system *can* assign total_order 0 legitimately.
+	if (all_headers[0].total_order != 0) {
+		// Allow total_order 0 only if logical_offset is also 0? Or maybe always allow 0?
+		// Let's assume 0 is the expected start if messages exist.
+		// If the first assigned offset is non-zero, this check needs adjustment.
+		// Let's just check for holes relative to the previous seen order.
+		VLOG(3) << "DEBUG Check (Level 1): First total_order is " << all_headers[0].total_order << " (expected 0 if sequence starts at 0).";
+		// contiguity_ok = false; // Don't fail just for this, check holes below.
 	}
 
-	// Check for duplicate total order values
-	if (duplicate_checker.contains(header->total_order)) {
-	LOG(ERROR) << "Duplicate total order detected: " << header->total_order 
-	<< " for message with client_order " << header->client_order;
-	order_correct = false;
-	} else {
-	duplicate_checker.insert(header->total_order);
-	}
+	for (size_t i = 0; i < all_headers.size(); ++i) {
+		const auto& header = all_headers[i]; // header is const MessageHeader&
 
-	// Move to next message
-	header = reinterpret_cast<Embarcadero::MessageHeader*>(
-	reinterpret_cast<uint8_t*>(header) + header->paddedSize);
-	}
+		// Create a non-volatile copy of the potentially volatile member
+		size_t current_total_order = header.total_order;
 
-	// Skip further checks if order level is 1
-	if (order == 1) {
-	continue;
-	}
+		// Check Assignment (if needed - using non-volatile copy)
+		// if (header.logical_offset != static_cast<size_t>(-1) && current_total_order == ???) { ... }
 
-	// Third check: For order level 3, verify total_order matches client_order
-	header = static_cast<Embarcadero::MessageHeader*>(buf);
-
-	while (header->paddedSize != 0) {
-		if (header->total_order != header->client_order) {
-			LOG(ERROR) << "Message with client_order " << header->client_order 
-				<< " has mismatched total_order " << header->total_order;
-			order_correct = false;
-			break;
+		// Check Uniqueness (using non-volatile copy)
+		if (!total_orders_seen.insert(current_total_order).second) { // <--- Use the copy here
+			LOG(ERROR) << "DEBUG Check Failed (Level 1): Duplicate total_order=" << current_total_order // Log the copy
+				<< " found (client_order=" << header.client_order << ", client_id=" << header.client_id << ").";
+			uniqueness_ok = false;
+			overall_status = false;
 		}
 
-		// Move to next message
-		header = reinterpret_cast<Embarcadero::MessageHeader*>(
-				reinterpret_cast<uint8_t*>(header) + header->paddedSize);
+		// Check Contiguity (using non-volatile copies)
+		if (i > 0) {
+			// Create a non-volatile copy of the previous total_order
+			size_t prev_total_order = all_headers[i-1].total_order;
+			if (current_total_order > prev_total_order + 1) { // <--- Compare copies
+				LOG(ERROR) << "DEBUG Check Failed (Level 1): Hole detected in total_order sequence. "
+					<< "Current=" << current_total_order << ", Previous=" << prev_total_order;
+				contiguity_ok = false;
+				overall_status = false;
+			}
+		}
 	}
-}
+	if (!assignment_ok || !uniqueness_ok || !contiguity_ok) {
+		VLOG(3) << "DEBUG: Order Level 1 check FAILED (Assignment=" << assignment_ok
+			<< ", Uniqueness=" << uniqueness_ok << ", Contiguity=" << contiguity_ok << ")";
+	} else {
+		VLOG(3) << "DEBUG: Order Level 1 check passed.";
+	}
 
-if (order_correct) {
-	VLOG(5) << "Order check passed for level " << order;
-} else {
-	LOG(ERROR) << "Order check failed for level " << order;
-}
+	if (order == 1) {
+		LOG(INFO) << "DEBUG: Order Level 1 check " << (overall_status ? "PASSED" : "FAILED");
+		return overall_status;
+	}
 
-return order_correct;
-*/
-}
 
+	// 5. Order Level >= 2 Check: Client Order Preservation
+	// Rule: For a given client_id, if m1.client_order < m2.client_order, then m1.total_order < m2.total_order.
+	// Check: Iterate through total_order sorted list. Ensure for each client, client_order is non-decreasing.
+	VLOG(3) << "DEBUG: --- Checking Order Level >= 2 (Client Order Preservation) ---";
+	std::map<int, size_t> last_client_order_for_client; // Map: client_id -> last seen client_order
+	bool client_order_preserved = true;
+
+	for (const auto& header : all_headers) { // Iterating sorted by total_order
+		int client_id = header.client_id;
+		size_t client_order = header.client_order;
+
+		auto it = last_client_order_for_client.find(client_id);
+		if (it != last_client_order_for_client.end()) {
+			// Client seen before, check order
+			if (client_order < it->second) {
+				// Violation! Current message has smaller client_order than a previous message from the same client
+				// (previous message must have had smaller total_order since list is sorted by total_order)
+				LOG(ERROR) << "DEBUG Check Failed (Level >=2): Client order violation for client_id=" << client_id
+					<< ". Current msg (total_order=" << header.total_order << ", client_order=" << client_order
+					<< ") has smaller client_order than previous msg (client_order=" << it->second << ").";
+				client_order_preserved = false;
+				overall_status = false;
+				// Keep checking for more errors? Or break? Let's continue.
+			}
+			// Update map with the latest client_order seen for this client *at this point in the total order*
+			// If multiple messages have the same total_order (shouldn't happen if level 1 passed), this check is ambiguous.
+			// Assuming level 1 passed (unique total orders):
+			it->second = client_order; // Update last seen order for this client
+		} else {
+			// First time seeing this client
+			last_client_order_for_client[client_id] = client_order;
+		}
+	}
+	if (!client_order_preserved) {
+		VLOG(3) << "DEBUG: Order Level >= 2 check FAILED.";
+	} else {
+		VLOG(3) << "DEBUG: Order Level >= 2 check passed.";
+	}
+
+
+	// Final Result
+	LOG(INFO) << "DEBUG: Order check for level " << order << " overall result: " << (overall_status ? "PASSED" : "FAILED");
+	return overall_status;
+}
 
 void Subscriber::StoreLatency() {
 	if (!measure_latency_) {
-		LOG(INFO) << "Latency measurement was not enabled.";
+		LOG(ERROR) << "Latency measurement was not enabled.";
 		return;
 	}
 
-	VLOG(1) << "Parsing buffers and processing recv log to calculate latencies...";
 
+	//Parsing buffers and processing recv log to calculate latencies
 	std::vector<long long> all_latencies_us; // Calculated latencies
 	size_t total_messages_parsed = 0;
 
 	{ // Scope for locking the connection map
 		absl::MutexLock map_lock(&connection_map_mutex_);
-		VLOG(2) << "Processing data from " << connections_.size() << " connections.";
 
 		for (auto const& [fd, conn_ptr] : connections_) {
 			if (!conn_ptr) continue;
@@ -231,7 +332,6 @@ void Subscriber::StoreLatency() {
 				VLOG(3) << "FD=" << fd << ": No recv log entries, skipping.";
 				continue;
 			}
-			VLOG(3) << "FD=" << fd << ": Processing " << recv_log.size() << " recv log entries.";
 
 			// --- Process both buffers for this connection ---
 			for (int buf_idx = 0; buf_idx < 2; ++buf_idx) {
@@ -314,10 +414,7 @@ void Subscriber::StoreLatency() {
 		return;
 	}
 
-	LOG(INFO) << "Parsed " << total_messages_parsed << " messages and calculated " << all_latencies_us.size() << " latency values.";
-
 	size_t count = all_latencies_us.size();
-	LOG(INFO) << "Collected " << count << " latency values (microseconds).";
 
 	// --- Calculate Statistics ---
 
@@ -349,7 +446,7 @@ void Subscriber::StoreLatency() {
 
 	// --- Generate and Write CDF Data Points ---
 	std::string cdf_filename = "cdf_latency_us.csv"; // Use .csv for easy import
-	LOG(INFO) << "Writing CDF data points to " << cdf_filename;
+	VLOG(3) << "Writing CDF data points to " << cdf_filename;
 	std::ofstream cdf_file(cdf_filename);
 	if (!cdf_file.is_open()) {
 		LOG(ERROR) << "Failed to open file for writing: " << cdf_filename;
@@ -578,8 +675,6 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		return;
 	}
 
-	VLOG(5) << "Worker (broker " << broker_id << ", fd " << fd_to_handle << "): Successfully subscribed.";
-
 	// --- Main receive loop (Simplified - Blocking recv) ---
 	while (!shutdown_) {
 		// 1. Get current write buffer location & space (same as before)
@@ -640,7 +735,6 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 
 		} else if (bytes_received == 0) {
 			// Handle disconnect (same as before, including potential final signal)
-			VLOG(1) << "Worker (fd=" << conn_buffers->fd << "): Broker disconnected (recv returned 0).";
 			size_t final_write_offset = conn_buffers->buffers[conn_buffers->current_write_idx.load()].write_offset.load();
 			if (final_write_offset > 0) {
 				absl::MutexLock lock(&conn_buffers->state_mutex);
@@ -720,7 +814,6 @@ void Subscriber::SubscribeToClusterStatus() {
 					for (const auto& addr : new_nodes_proto) {
 						int broker_id = GetBrokerId(addr);
 						if (nodes_.find(broker_id) == nodes_.end()) {
-							VLOG(5) << "Discovered new broker: ID=" << broker_id << ", Addr=" << addr;
 							nodes_[broker_id] = addr;
 							brokers_to_add.push_back({broker_id, addr});
 						}
@@ -762,8 +855,6 @@ void Subscriber::SubscribeToClusterStatus() {
 		}
 
 	} // End outer while(!shutdown_)
-
-	VLOG(5) << "SubscribeToClusterStatus thread finished.";
 }
 
 bool ConnectionBuffers::signal_and_attempt_swap(Subscriber* subscriber_instance) {
