@@ -2,152 +2,243 @@
 
 #include "common.h"
 
+class Subscriber;
+
+// State for a single buffer within the dual-buffer setup
+struct BufferState {
+	void* buffer = nullptr;
+	size_t capacity = 0;
+	std::atomic<size_t> write_offset{0}; // Receiver updates this
+																			 // Add other metadata if needed per buffer, e.g., message count start/end
+
+	BufferState(size_t cap) : capacity(cap) {
+		// Add MAP_POPULATE for potential performance benefit if system supports it well
+		buffer = mmap(nullptr, capacity, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS /*| MAP_POPULATE*/, -1, 0);
+		if (buffer == MAP_FAILED) {
+			LOG(ERROR) << "BufferState: Failed to mmap buffer of size " << capacity << ": " << strerror(errno);
+			buffer = nullptr;
+			throw std::runtime_error("Failed to mmap buffer");
+		}
+		VLOG(3) << "BufferState: Mapped buffer of size " << capacity << " at " << buffer;
+	}
+
+	~BufferState() {
+		if (buffer != nullptr && buffer != MAP_FAILED) {
+			VLOG(3) << "BufferState: Unmapping buffer of size " << capacity << " at " << buffer;
+			munmap(buffer, capacity);
+			buffer = nullptr;
+		}
+	}
+
+	// Delete copy/move constructors/assignments
+	BufferState(const BufferState&) = delete;
+	BufferState& operator=(const BufferState&) = delete;
+	BufferState(BufferState&&) = delete;
+	BufferState& operator=(BufferState&&) = delete;
+};
+
+struct TimestampPair {
+	long long send_time_nanos; // From message payload
+	std::chrono::steady_clock::time_point receive_time; // Captured on receive
+};
+
+// Manages the dual buffers and state for a single connection (FD)
+struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers> {
+	const int fd; // The socket FD this corresponds to
+	const int broker_id;
+	const size_t buffer_capacity;
+
+	BufferState buffers[2]; // The two buffers
+
+	std::atomic<int> current_write_idx{0}; // Index (0 or 1) of the buffer receiver is writing to
+	std::atomic<bool> write_buffer_ready_for_consumer{false}; // Flag set by receiver when write buffer is full/ready
+	std::atomic<bool> read_buffer_in_use_by_consumer{false};  // Flag set by consumer when it acquires read buffer
+
+	absl::Mutex state_mutex; // Protects swapping, flag coordination, and waiting
+	absl::CondVar consumer_can_consume_cv; // Notifies consumer a buffer *might* be ready
+	absl::CondVar receiver_can_write_cv; // Notifies receiver the *other* buffer is free
+
+	std::vector<std::pair<std::chrono::steady_clock::time_point, size_t>> recv_log ABSL_GUARDED_BY(state_mutex);
+
+
+	ConnectionBuffers(int f, int b_id, size_t cap_per_buffer) :
+		fd(f),
+		broker_id(b_id),
+		buffer_capacity(cap_per_buffer),
+		buffers{BufferState(cap_per_buffer), BufferState(cap_per_buffer)} // Initialize buffers
+	{
+		VLOG(2) << "ConnectionBuffers created for fd=" << fd << ", broker=" << broker_id;
+	}
+
+	~ConnectionBuffers() {
+		VLOG(2) << "ConnectionBuffers destroyed for fd=" << fd;
+		// Buffers get unmapped by BufferState destructor
+	}
+
+	// Delete copy/move constructors/assignments
+	ConnectionBuffers(const ConnectionBuffers&) = delete;
+	ConnectionBuffers& operator=(const ConnectionBuffers&) = delete;
+	ConnectionBuffers(ConnectionBuffers&&) = delete;
+	ConnectionBuffers& operator=(ConnectionBuffers&&) = delete;
+
+	// --- Helper methods ---
+
+	// Called by Receiver: Get pointer and available space in the CURRENT write buffer
+	std::pair<void*, size_t> get_write_location() {
+		int write_idx = current_write_idx.load(std::memory_order_acquire);
+		size_t current_offset = buffers[write_idx].write_offset.load(std::memory_order_relaxed);
+		if (current_offset >= buffers[write_idx].capacity) {
+			return {nullptr, 0}; // Buffer is full
+		}
+		return {static_cast<uint8_t*>(buffers[write_idx].buffer) + current_offset,
+			buffers[write_idx].capacity - current_offset};
+	}
+
+	// Called by Receiver: Update write offset after successful recv()
+	void advance_write_offset(size_t bytes_written) {
+		int write_idx = current_write_idx.load(std::memory_order_relaxed);
+		buffers[write_idx].write_offset.fetch_add(bytes_written, std::memory_order_relaxed);
+	}
+
+	// Called by Receiver: Signal that the current write buffer is ready and try to swap
+	// Returns true if swap was successful, false otherwise (consumer still busy)
+	bool signal_and_attempt_swap(Subscriber* subscriber_instance); // Implementation in .cc
+
+	// Called by Consumer: Try to acquire the buffer ready for reading
+	// Returns pointer to buffer state if acquired, nullptr otherwise.
+	// Sets read_buffer_in_use_by_consumer = true on success.
+	BufferState* acquire_read_buffer(); // Implementation in .cc
+
+	// Called by Consumer: Release the buffer after processing
+	// Resets read_buffer_in_use_by_consumer = false.
+	// Notifies receiver thread.
+	void release_read_buffer(BufferState* acquired_buffer); // Implementation in .cc
+
+};
+
+// Represents the data handed off to the consumer
+struct ConsumedData {
+	std::shared_ptr<ConnectionBuffers> connection; // Keep connection alive
+	BufferState* buffer_state = nullptr; // The specific buffer being consumed
+	size_t data_size = 0; // How much data is available in this buffer
+
+	// Pointer to the start of consumable data
+	const void* data() const {
+		return buffer_state ? buffer_state->buffer : nullptr;
+	}
+
+	// Must be called when consumer is finished with this data block
+	void release() {
+		if (connection && buffer_state) {
+			connection->release_read_buffer(buffer_state);
+		}
+		// Reset self
+		connection = nullptr;
+		buffer_state = nullptr;
+		data_size = 0;
+	}
+
+	// Check if this holds valid data
+	explicit operator bool() const {
+		return connection && buffer_state && data_size > 0;
+	}
+};
+
 /**
  * Subscriber class for receiving messages from the messaging system
  */
 class Subscriber {
-public:
-    /**
-     * Constructor for Subscriber
-     * @param head_addr Head broker address
-     * @param port Port
-     * @param topic Topic name
-     * @param measure_latency Whether to measure latency
-     */
-    Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency = false);
-    
-    /**
-     * Destructor - cleans up resources
-     */
-    ~Subscriber();
-    
-    /**
-     * Consumes a message
-     * @return Pointer to the consumed message
-     */
-    void* Consume();
-    
-    /**
-     * Consumes a batch of messages
-     * @return Pointer to the consumed batch
-     */
-    void* ConsumeBatch();
-    
-    /**
-     * Debug method to check message ordering
-     * @param order Order level to check
-     * @return true if order is correct, false otherwise
-     */
-    bool DEBUG_check_order(int order);
-    
-    /**
-     * Stores latency measurements to a file
-     */
-    void StoreLatency();
-    
-    /**
-     * Debug method to wait for a certain amount of data
-     * @param total_msg_size Total size of all messages
-     * @param msg_size Size of each message
-     */
-    void DEBUG_wait(size_t total_msg_size, size_t msg_size);
+	public:
+		// ... Constructor, destructor, other methods ...
+		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency=false);
+		~Subscriber(); // Important to manage shutdown and cleanup
 
-private:
-    std::string head_addr_;
-    std::string port_;
-    bool shutdown_;
-    bool connected_;
-    grpc::ClientContext context_;
-    std::unique_ptr<HeartBeat::Stub> stub_;
-    
-    // Broker management
+		// The method the application calls to get data
+		ConsumedData Consume(std::chrono::milliseconds timeout = std::chrono::milliseconds(0));
+
+		// Called by client code after test is finished
+		void StoreLatency();
+		void DEBUG_wait(size_t total_msg_size, size_t msg_size);
+		bool DEBUG_check_order(int order);
+		/**
+		 * Debug method to wait for a certain amount of data
+		 * @param total_msg_size Total size of all messages
+		 * @param msg_size Size of each message
+		 */
+		void Poll(size_t total_msg_size, size_t msg_size);
+
+
+		// Initiate shutdown
+		void Shutdown();
+
+	private:
+		friend class ConnectionBuffers; // Allow access to members if needed
+
+		// --- Connection & Thread Management ---
+		std::string head_addr_;
+		std::string port_;
+		std::unique_ptr<heartbeat_system::HeartBeat::Stub> stub_;
+		char topic_[TOPIC_NAME_SIZE];
+		int client_id_;
+		std::atomic<bool> shutdown_{false};
+		std::atomic<bool> connected_{false}; // Maybe more granular connection state needed
+
+		// Cluster state
 		absl::Mutex node_mutex_;
-    absl::flat_hash_map<int, std::string> nodes_ ABSL_GUARDED_BY(node_mutex_);
-    std::thread cluster_probe_thread_;
-		absl::Mutex worker_mutex_;
-		std::vector<std::pair<std::thread, int>> worker_threads_with_fds_ ABSL_GUARDED_BY(worker_mutex_);
+		absl::flat_hash_map<int, std::string> nodes_ ABSL_GUARDED_BY(node_mutex_);
+		std::thread cluster_probe_thread_;
 
-    char topic_[TOPIC_NAME_SIZE];
-    
-    bool measure_latency_;
-    size_t buffer_size_;
-    std::atomic<size_t> DEBUG_count_ = 0;
-    void* last_fetched_addr_;
-    int last_fetched_offset_;
-    int client_id_;
-    bool DEBUG_do_not_check_order_ = false;
+		// Worker thread management
+		struct ThreadInfo {
+			std::thread thread;
+			int fd; // Associated FD for cleanup
 
-    /**
-     * Thread for subscribing to messages
-     * @param epoll_fd Epoll file descriptor
-     * @param fd_to_msg Map of file descriptors to messages
-     */
-    void SubscribeThread(int epoll_fd, absl::flat_hash_map<int, std::pair<void*, msgIdx*>> fd_to_msg);
-    
-    /**
-     * Creates a connection to a broker
-     * @param broker_id Broker ID
-     * @param address Broker address
-     */
-    void BrokerHandlerThread(int broker_id, const std::string &address);
-    
-    /**
-     * Subscribes to cluster status updates
-     */
-    void SubscribeToClusterStatus();
-    
-    /**
-     * Polls cluster status periodically
-     */
-    void ClusterProbeLoop();
-		void ManageBrokerConnections(int broker_id, const std::string& address);
-    void ReceiveWorkerThread(Subscriber* subscriber_instance, int broker_id, int fd_to_handle);
-};
+			// Need custom move constructor/assignment if std::thread is directly included
+			ThreadInfo(std::thread t, int f) : thread(std::move(t)), fd(f) {}
+			ThreadInfo(ThreadInfo&& other) noexcept : thread(std::move(other.thread)), fd(other.fd) {}
+			ThreadInfo& operator=(ThreadInfo&& other) noexcept {
+				if (this != &other) {
+					if(thread.joinable()) thread.join(); // Join old thread if assigned over
+					thread = std::move(other.thread);
+					fd = other.fd;
+				}
+				return *this;
+			}
+			// Ensure thread is joined on destruction
+			~ThreadInfo() {
+				if (thread.joinable()) {
+					// Avoid logging from destructor if possible or make it thread-safe
+					// VLOG(5) << "Joining thread for fd " << fd;
+					thread.join();
+				}
+			}
+			// Delete copy operations
+			ThreadInfo(const ThreadInfo&) = delete;
+			ThreadInfo& operator=(const ThreadInfo&) = delete;
+		};
+		absl::Mutex worker_mutex_; // Protects worker_threads_ vector
+		std::vector<ThreadInfo> worker_threads_ ABSL_GUARDED_BY(worker_mutex_);
 
-// Helper for Buffer Management
-class ManagedConnectionResources {
-public:
-    void* buffer_ = nullptr;
-    msgIdx* msg_idx_ = nullptr;
-    size_t buffer_size_ = 0;
 
-    ManagedConnectionResources() = default;
+		// --- Buffer Management ---
+		const size_t buffer_size_per_buffer_; // Size for *each* of the two buffers per connection
+		absl::Mutex connection_map_mutex_; // Protects the map itself
+		absl::flat_hash_map<int, std::shared_ptr<ConnectionBuffers>> connections_ ABSL_GUARDED_BY(connection_map_mutex_);
+		absl::CondVar consume_cv_; // Global CV for consumer to wait on
 
-    ManagedConnectionResources(int broker_id, size_t buf_size) : buffer_size_(buf_size) {
-        buffer_ = mmap(nullptr, buffer_size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (buffer_ == MAP_FAILED) {
-             LOG(ERROR) << "Failed to mmap buffer: " << strerror(errno);
-             buffer_ = nullptr;
-             throw std::runtime_error("Failed to mmap buffer");
-        }
 
-        msg_idx_ = static_cast<msgIdx*>(malloc(sizeof(msgIdx)));
-        if (!msg_idx_) {
-             LOG(ERROR) << "Failed to allocate memory for msgIdx";
-             munmap(buffer_, buffer_size_);
-             buffer_ = nullptr;
-             throw std::runtime_error("Failed to allocate msgIdx");
-        }
-        new (msg_idx_) msgIdx(broker_id);
-    }
+		// --- Latency / Debug ---
+		bool measure_latency_;
+		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
 
-    ~ManagedConnectionResources() {
-        if (msg_idx_) {
-            msg_idx_->~msgIdx();
-            free(msg_idx_);
-            msg_idx_ = nullptr;
-        }
-        if (buffer_ != nullptr && buffer_ != MAP_FAILED) {
-            munmap(buffer_, buffer_size_);
-            buffer_ = nullptr;
-        }
-    }
 
-    ManagedConnectionResources(const ManagedConnectionResources&) = delete;
-    ManagedConnectionResources& operator=(const ManagedConnectionResources&) = delete;
-    ManagedConnectionResources(ManagedConnectionResources&&) = delete;
-    ManagedConnectionResources& operator=(ManagedConnectionResources&&) = delete;
+		// --- Private Methods ---
+		void SubscribeToClusterStatus(); // Runs in cluster_probe_thread_
+		void ManageBrokerConnections(int broker_id, const std::string& address); // Launches workers
+																																						 // Worker thread function (needs access to Subscriber instance)
+		void ReceiveWorkerThread(int broker_id, int fd_to_handle);
 
-    void* getBuffer() const { return buffer_; }
-    msgIdx* getMsgIdx() const { return msg_idx_; }
+		// Helper to remove connection resources
+		void RemoveConnection(int fd);
 };
