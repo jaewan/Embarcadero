@@ -29,6 +29,11 @@ using scalogreplication::ScalogReplicationRequest;
 using scalogreplication::ScalogReplicationResponse;
 
 class ScalogReplicationServiceImpl final : public ScalogReplicationService::Service {
+	struct WriteTask {
+		ScalogReplicationRequest request;
+		WriteTask(const ScalogReplicationRequest& req) : request(req) {}
+	};
+
 	class LocalCutTracker {
 		public:
 			LocalCutTracker() : local_cut_(0), sequentially_written_(0) {}
@@ -113,7 +118,7 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 
 	public:
 		explicit ScalogReplicationServiceImpl(std::string base_filename, int broker_id)
-			: base_filename_(std::move(base_filename)), running_(true) {
+			: base_filename_(std::move(base_filename)), running_(true), write_queue_(1024 * 8) {
 				if (!OpenOutputFile()) {
 					throw std::runtime_error("Failed to open replication file: " + base_filename_);
 				}
@@ -124,6 +129,8 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 				std::string scalog_seq_address = scalog_global_sequencer_ip_ + ":" + std::to_string(SCALOG_SEQ_PORT);
 				std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 				stub_ = ScalogSequencer::NewStub(channel);
+
+				writer_thread_ = std::thread(&ScalogReplicationServiceImpl::WriterLoop, this);
 			}
 
 		~ScalogReplicationServiceImpl() override {
@@ -137,6 +144,11 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 		void Shutdown() {
 			bool expected = true;
 			if (running_.compare_exchange_strong(expected, false)) {
+				write_queue_.write(WriteTask(ScalogReplicationRequest{})); // unblock queue
+				if (writer_thread_.joinable()) {
+					writer_thread_.join();
+				}
+
 				std::lock_guard<std::mutex> lock(file_mutex_);
 				CloseOutputFile();
 			}
@@ -151,30 +163,11 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 			if (!running_) {
 				return CreateErrorResponse(response, "Service is shutting down", Status::CANCELLED);
 			}
-
-			// Lock only for file operations
-			std::lock_guard<std::mutex> lock(file_mutex_);
-
-			// Double-check running flag after acquiring the lock (check-then-act pattern)
-			if (!running_) {
-				return CreateErrorResponse(response, "Service is shutting down", Status::CANCELLED);
+			if (!write_queue_.write(WriteTask(*request))) {
+				return CreateErrorResponse(response, "Write queue is full", Status::CANCELLED);
 			}
-
-			try {
-				if (fd_ == -1) {
-					if (!ReopenOutputFile()) {
-						return CreateErrorResponse(response, "Failed to reopen file", Status::CANCELLED);
-					}
-				}
-
-				WriteRequest(*request);
-
-				response->set_success(true);
-				return Status::OK;
-			} catch (const std::exception& e) {
-				LOG(ERROR) << "Exception during replication: " << e.what();
-				return CreateErrorResponse(response, std::string("Error: ") + e.what(), Status::CANCELLED);
-			}
+			response->set_success(true);
+			return Status::OK;
 		}
 
 	private:
@@ -196,6 +189,24 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 			if (fd_ != -1) {
 				close(fd_);
 				fd_ = -1;
+			}
+		}
+
+		void WriterLoop() {
+			while (running_) {
+				WriteTask task(ScalogReplicationRequest{});
+				if (!write_queue_.read(task)) continue;
+
+				std::lock_guard<std::mutex> file_lock(file_mutex_);
+				try {
+					if (fd_ == -1 && !ReopenOutputFile()) {
+						LOG(ERROR) << "Failed to reopen file";
+						continue;
+					}
+					WriteRequest(task.request);
+				} catch (const std::exception& e) {
+					LOG(ERROR) << "Write error: " << e.what();
+				}
 			}
 		}
 
@@ -350,6 +361,8 @@ class ScalogReplicationServiceImpl final : public ScalogReplicationService::Serv
 		int fd_ = -1;
 		std::atomic<bool> running_;
 		std::mutex file_mutex_;
+		folly::MPMCQueue<WriteTask> write_queue_;
+		std::thread writer_thread_;
 
 		// Global seq ip
 		std::string scalog_global_sequencer_ip_ = SCLAOG_SEQUENCER_IP;

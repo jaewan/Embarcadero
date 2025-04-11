@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <scalog_sequencer.grpc.pb.h>
+#include <folly/MPMCQueue.h>
 
 // Forward declarations
 namespace grpc {
