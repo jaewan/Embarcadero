@@ -29,7 +29,7 @@ ResultWriter::ResultWriter(const cxxopts::ParseResult& result)
     // Base data directory, changed from hardcoded value to a configurable location
     // This uses the default location if EMBARCADERO_DATA_DIR env var is not set
     const char* data_dir_env = std::getenv("EMBARCADERO_DATA_DIR");
-    std::string data_base_dir = data_dir_env ? data_dir_env : "/home/domin/Jae/Embarcadero/data/";
+    std::string data_base_dir = data_dir_env ? data_dir_env : "/home/domin/Embarcadero/data/";
     
     // Define test type paths based on configuration
     int test_num = result["test_number"].as<int>();

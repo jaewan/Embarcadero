@@ -3,13 +3,15 @@
 pushd ../build/bin/
 
 NUM_BROKERS=4
-
 NUM_TRIALS=3
-#orders=(0 1)
+test_cases=(5)
+msg_sizes=(128 256  512 1024 4096 16384 65536 262144 1048576)
+
+
+# Change these for Scalog and Corfu
 orders=(4)
-test_cases=(1)
-msg_sizes=(512 1024 4096 16384 65536 262144)
-#msg_sizes=(128 256  512 1024 4096 16384 65536 262144 1048576)
+ack=2
+sequencer=EMBARCADERO
 
 wait_for_signal() {
   while true; do
@@ -44,7 +46,7 @@ for test_case in "${test_cases[@]}"; do
 			echo "Running trial $trial with message size $msg_size"
 
 			# Start the processes
-			start_process "./embarlet --head"
+			start_process "./embarlet --head --$sequencer"
 			wait_for_signal
 			head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
 			sleep 3
@@ -52,10 +54,11 @@ for test_case in "${test_cases[@]}"; do
 			  start_process "./embarlet"
 			  wait_for_signal
 			done
+			sleep 3
 			#for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
 			 # wait_for_signal
 			#done
-			start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order"
+			start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack --sequencer $sequencer"
 
 			# Wait for all processes to finish
 			for pid in "${pids[@]}"; do
@@ -65,7 +68,7 @@ for test_case in "${test_cases[@]}"; do
 
 			echo "All processes have finished for trial $trial with message size $msg_size"
 			pids=()  # Clear the pids array for the next trial
-			sleep 5
+			sleep 3
 		  done
 		done
 	done

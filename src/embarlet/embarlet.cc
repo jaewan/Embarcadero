@@ -126,7 +126,11 @@ int main(int argc, char* argv[]) {
 		("head", "Head Node")
 		("follower", "Follower Address and Port", cxxopts::value<std::string>())
 		("scalog", "Run also as a Scalog Replica")
+		("SCALOG", "Run also as a Scalog Replica")
 		("corfu", "Run also as a Corfu Replica")
+		("CORFU", "Run also as a Corfu Replica")
+		("embarcadero", "Run as a Embarcadero Replica")
+		("EMBARCADERO", "Run as a Embarcadero Replica")
 		("e,emul", "Use emulation instead of CXL")
 		("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
 		("network_threads", "Number of network IO threads",
@@ -148,9 +152,9 @@ int main(int argc, char* argv[]) {
 		replicate_to_memory = false;
 	}
 
-	if (arguments.count("scalog")) {
+	if (arguments.count("scalog") || arguments.count("SCALOG")) {
 		sequencerType = heartbeat_system::SequencerType::SCALOG;
-	} else if (arguments.count("corfu")) {
+	} else if (arguments.count("corfu") || arguments.count("CORFU")) {
 		sequencerType = heartbeat_system::SequencerType::CORFU;
 	}
 
