@@ -118,6 +118,7 @@ class CXLManager{
 				void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 				struct MessageHeader** msg_to_order, struct TInode *tinode);
+		void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers, struct TInode *tinode);
 
 		/// Initializes the scalog sequencer service and starts the grpc server
 		void StartScalogLocalSequencer(std::string topic_str);
