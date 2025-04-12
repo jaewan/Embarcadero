@@ -222,11 +222,11 @@ void CXLManager::RunSequencer(const char topic[TOPIC_NAME_SIZE], int order, Sequ
 }
 
 void CXLManager::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers,
-                                         struct TInode *tinode) {
-    if (!get_registered_brokers_callback_(registered_brokers, nullptr /* msg_to_order removed */, tinode)) {
-			 LOG(ERROR) << "GetRegisteredBrokerSet: Callback failed to get registered brokers.";
-			 registered_brokers.clear(); // Ensure set is empty on failure
-    }
+		struct TInode *tinode) {
+	if (!get_registered_brokers_callback_(registered_brokers, nullptr /* msg_to_order removed */, tinode)) {
+		LOG(ERROR) << "GetRegisteredBrokerSet: Callback failed to get registered brokers.";
+		registered_brokers.clear(); // Ensure set is empty on failure
+	}
 }
 
 void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
@@ -261,125 +261,125 @@ inline void CXLManager::UpdateTInodeOrderandWritten(char *topic, TInode* tinode,
 
 // Sequence without respecting publish order
 void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic) {
-    struct TInode *tinode = GetTInode(topic.data());
-    if (!tinode) {
-        LOG(ERROR) << "Sequencer1: Failed to get TInode for topic " << topic.data();
-        return;
-    }
+	struct TInode *tinode = GetTInode(topic.data());
+	if (!tinode) {
+		LOG(ERROR) << "Sequencer1: Failed to get TInode for topic " << topic.data();
+		return;
+	}
 
-    // Local storage for message pointers, initialized to nullptr
-    struct MessageHeader* msg_to_order[NUM_MAX_BROKERS] = {nullptr};
-    absl::btree_set<int> registered_brokers;
-    absl::btree_set<int> initialized_brokers; // Track initialized brokers
-    static size_t seq = 0; // Sequencer counter
+	// Local storage for message pointers, initialized to nullptr
+	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS] = {nullptr};
+	absl::btree_set<int> registered_brokers;
+	absl::btree_set<int> initialized_brokers; // Track initialized brokers
+	static size_t seq = 0; // Sequencer counter
 
-    // Get the initial set of registered brokers (without waiting)
-    GetRegisteredBrokerSet(registered_brokers, tinode);
+	// Get the initial set of registered brokers (without waiting)
+	GetRegisteredBrokerSet(registered_brokers, tinode);
 
-    if (registered_brokers.empty()) {
-        LOG(WARNING) << "Sequencer1: No registered brokers found for topic " << topic.data() << ". Sequencer might idle.";
-    }
+	if (registered_brokers.empty()) {
+		LOG(WARNING) << "Sequencer1: No registered brokers found for topic " << topic.data() << ". Sequencer might idle.";
+	}
 
-    while (!stop_threads_) {
-        bool processed_message = false; // Track if any work was done in this outer loop iteration
+	while (!stop_threads_) {
+		bool processed_message = false; // Track if any work was done in this outer loop iteration
 
-        // TODO: If brokers can register dynamically, call GetRegisteredBrokerSet periodically
-        //       and update the registered_brokers set here.
+		// TODO: If brokers can register dynamically, call GetRegisteredBrokerSet periodically
+		//       and update the registered_brokers set here.
 
-        for (auto broker_id : registered_brokers) {
-            // --- Dynamic Initialization Check ---
-            if (initialized_brokers.find(broker_id) == initialized_brokers.end()) {
-                // This broker hasn't been initialized yet, check its log offset NOW
-                size_t current_log_offset = tinode->offsets[broker_id].log_offset; // Read the current offset
+		for (auto broker_id : registered_brokers) {
+			// --- Dynamic Initialization Check ---
+			if (initialized_brokers.find(broker_id) == initialized_brokers.end()) {
+				// This broker hasn't been initialized yet, check its log offset NOW
+				size_t current_log_offset = tinode->offsets[broker_id].log_offset; // Read the current offset
 
-                if (current_log_offset == 0) {
-                    // Still not initialized, skip this broker for this iteration
-                    VLOG(5) << "Sequencer1: Broker " << broker_id << " log still uninitialized (offset=0), skipping.";
-                    continue;
-                } else {
-                    // Initialize Now!
-                    VLOG(5) << "Sequencer1: Initializing broker " << broker_id << " with log_offset=" << current_log_offset;
-                    msg_to_order[broker_id] = ((MessageHeader*)((uint8_t*)cxl_addr_ + current_log_offset));
-                    initialized_brokers.insert(broker_id); // Mark as initialized
-                    // Proceed to process messages below
-                }
-            }
+				if (current_log_offset == 0) {
+					// Still not initialized, skip this broker for this iteration
+					VLOG(5) << "Sequencer1: Broker " << broker_id << " log still uninitialized (offset=0), skipping.";
+					continue;
+				} else {
+					// Initialize Now!
+					VLOG(5) << "Sequencer1: Initializing broker " << broker_id << " with log_offset=" << current_log_offset;
+					msg_to_order[broker_id] = ((MessageHeader*)((uint8_t*)cxl_addr_ + current_log_offset));
+					initialized_brokers.insert(broker_id); // Mark as initialized
+																								 // Proceed to process messages below
+				}
+			}
 
-            // --- Process Messages if Initialized ---
-            // Ensure msg_to_order pointer is valid before dereferencing
-             if (msg_to_order[broker_id] == nullptr) {
-                  // This should ideally not happen if the logic above is correct, but safety check
-                  LOG(DFATAL) << "Sequencer1: msg_to_order[" << broker_id << "] is null despite being marked initialized!";
-                  continue;
-             }
+			// --- Process Messages if Initialized ---
+			// Ensure msg_to_order pointer is valid before dereferencing
+			if (msg_to_order[broker_id] == nullptr) {
+				// This should ideally not happen if the logic above is correct, but safety check
+				LOG(DFATAL) << "Sequencer1: msg_to_order[" << broker_id << "] is null despite being marked initialized!";
+				continue;
+			}
 
-            // Read necessary volatile/shared values (consider atomics/locking if needed)
-            size_t current_written_offset = tinode->offsets[broker_id].written; // Where the broker has written up to (logical offset)
-            // Note: MessageHeader fields read below might also need volatile/atomic handling
+			// Read necessary volatile/shared values (consider atomics/locking if needed)
+			size_t current_written_offset = tinode->offsets[broker_id].written; // Where the broker has written up to (logical offset)
+																																					// Note: MessageHeader fields read below might also need volatile/atomic handling
 
-            // Check if broker has indicated completion/error
-            if (current_written_offset == static_cast<size_t>(-1)) {
-                // Broker might be done or encountered an error, skip it permanently?
-                // Or maybe just for this round? Depends on the meaning of -1.
-                VLOG(4) << "Sequencer1: Broker " << broker_id << " written offset is -1, skipping.";
-                continue;
-            }
+																																					// Check if broker has indicated completion/error
+			if (current_written_offset == static_cast<size_t>(-1)) {
+				// Broker might be done or encountered an error, skip it permanently?
+				// Or maybe just for this round? Depends on the meaning of -1.
+				VLOG(4) << "Sequencer1: Broker " << broker_id << " written offset is -1, skipping.";
+				continue;
+			}
 
-            // Get the logical offset embedded in the *current* message header we're pointing to
-            // This assumes logical_offset field correctly tracks message sequence within the broker's log
-             size_t msg_logical_off = msg_to_order[broker_id]->logical_offset;
+			// Get the logical offset embedded in the *current* message header we're pointing to
+			// This assumes logical_offset field correctly tracks message sequence within the broker's log
+			size_t msg_logical_off = msg_to_order[broker_id]->logical_offset;
 
 
-            // Inner loop to process available messages for this broker
-            while (!stop_threads_ &&
-                   msg_logical_off != static_cast<size_t>(-1) && // Check if current message is valid
-                   msg_logical_off <= current_written_offset && // Check if message offset has been written by broker
-                   msg_to_order[broker_id]->next_msg_diff != 0)  // Check if it links to a next message (validity)
-            {
-                 // Check if total order has already been assigned (e.g., by another sequencer replica?)
-                 // Need to define what indicates "not yet assigned". Using 0 might be risky if 0 is valid.
-                 // Let's assume unassigned is indicated by a specific value, e.g., -1 or max_size_t
-                 // For now, let's assume we always assign if the conditions above are met. Revisit if needed.
+			// Inner loop to process available messages for this broker
+			while (!stop_threads_ &&
+					msg_logical_off != static_cast<size_t>(-1) && // Check if current message is valid
+					msg_logical_off <= current_written_offset && // Check if message offset has been written by broker
+					msg_to_order[broker_id]->next_msg_diff != 0)  // Check if it links to a next message (validity)
+			{
+				// Check if total order has already been assigned (e.g., by another sequencer replica?)
+				// Need to define what indicates "not yet assigned". Using 0 might be risky if 0 is valid.
+				// Let's assume unassigned is indicated by a specific value, e.g., -1 or max_size_t
+				// For now, let's assume we always assign if the conditions above are met. Revisit if needed.
 
-                 VLOG(5) << "Sequencer1: Assigning seq=" << seq << " to broker=" << broker_id << ", logical_offset=" << msg_logical_off;
-                 msg_to_order[broker_id]->total_order = seq; // Assign sequence number
-                 // TODO: Ensure this write is visible (volatile, atomic, or fence)
-                 // std::atomic_thread_fence(std::memory_order_release); // Example fence if needed
+				VLOG(5) << "Sequencer1: Assigning seq=" << seq << " to broker=" << broker_id << ", logical_offset=" << msg_logical_off;
+				msg_to_order[broker_id]->total_order = seq; // Assign sequence number
+																										// TODO: Ensure this write is visible (volatile, atomic, or fence)
+																										// std::atomic_thread_fence(std::memory_order_release); // Example fence if needed
 
-                 seq++; // Increment global sequence number
+				seq++; // Increment global sequence number
 
-                 // Update TInode about the latest processed message *for this broker*
-                 // Assuming UpdateTinodeOrder persists this information safely
-                 UpdateTinodeOrder(topic.data(), tinode, broker_id, msg_logical_off,
-                                   (uint8_t*)msg_to_order[broker_id] - (uint8_t*)cxl_addr_); // Pass CXL relative offset
+				// Update TInode about the latest processed message *for this broker*
+				// Assuming UpdateTinodeOrder persists this information safely
+				UpdateTinodeOrder(topic.data(), tinode, broker_id, msg_logical_off,
+						(uint8_t*)msg_to_order[broker_id] - (uint8_t*)cxl_addr_); // Pass CXL relative offset
 
-                 processed_message = true; // We did some work
-                 msg_to_order[broker_id] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker_id] + msg_to_order[broker_id]->next_msg_diff);
-                 msg_logical_off = msg_to_order[broker_id]->logical_offset;
+				processed_message = true; // We did some work
+				msg_to_order[broker_id] = (struct MessageHeader*)((uint8_t*)msg_to_order[broker_id] + msg_to_order[broker_id]->next_msg_diff);
+				msg_logical_off = msg_to_order[broker_id]->logical_offset;
 
-            } // End inner while loop for processing broker messages
+			} // End inner while loop for processing broker messages
 
-        } // End for loop iterating through registered_brokers
+		} // End for loop iterating through registered_brokers
 
-        // If no messages were processed across all brokers, yield briefly
-        // This prevents busy-spinning when there's no new data.
-        if (!processed_message && !stop_threads_) {
-             // Check again if any uninitialized brokers became initialized
-             bool potentially_newly_initialized = false;
-              for(auto broker_id : registered_brokers) {
-                  if (initialized_brokers.find(broker_id) == initialized_brokers.end()) {
-                       if (tinode->offsets[broker_id].log_offset != 0) {
-                            potentially_newly_initialized = true;
-                            break;
-                       }
-                  }
-              }
-              if (!potentially_newly_initialized) {
-                  std::this_thread::yield();
-              }
-        }
+		// If no messages were processed across all brokers, yield briefly
+		// This prevents busy-spinning when there's no new data.
+		if (!processed_message && !stop_threads_) {
+			// Check again if any uninitialized brokers became initialized
+			bool potentially_newly_initialized = false;
+			for(auto broker_id : registered_brokers) {
+				if (initialized_brokers.find(broker_id) == initialized_brokers.end()) {
+					if (tinode->offsets[broker_id].log_offset != 0) {
+						potentially_newly_initialized = true;
+						break;
+					}
+				}
+			}
+			if (!potentially_newly_initialized) {
+				std::this_thread::yield();
+			}
+		}
 
-    } // End outer while(!stop_threads_)
+	} // End outer while(!stop_threads_)
 }
 
 // Order 2 with single thread
@@ -540,7 +540,7 @@ void CXLManager::Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic) {
 	absl::btree_set<int> registered_brokers;
 	GetRegisteredBrokerSet(registered_brokers, tinode);
 
-	global_seq_.store(0);
+	global_seq_ = 0;
 
 	absl::flat_hash_map<size_t, std::atomic<size_t>> next_expected_batch_seq; // client_id -> next expected batch_seq
 	folly::MPMCQueue<BatchHeader*> ready_batches_queue(1024);
@@ -586,7 +586,6 @@ void CXLManager::BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_
 		return;
 	}
 
-	size_t logical_offset = 0;
 	// client -> <batch_seq, header*>
 	absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>> skipped_batches; 
 
@@ -607,70 +606,54 @@ void CXLManager::BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_
 		size_t client_id = current_batch_header->client_id;
 		size_t batch_seq = current_batch_header->batch_seq;
 		bool ready_to_order = false;
-		std::atomic<size_t>* expected_seq_atomic_ptr = nullptr;
+		size_t expected_seq = 0;
+		size_t start_total_order = 0;
+		bool skip_batch = false;
 
-		// Give logical_offset to the first message in the batch header
-		// Writing it to message header can be overwritten by network thread
-		// Rest will be given by GlobalOrdererWorker
-		current_batch_header->start_logical_offset = logical_offset;
-		logical_offset += current_batch_header->num_msg;
-
-		// Check if client exists in the map
-		auto map_it = next_expected_batch_seq_.find(client_id);
-		// New client: Need to insert safely
-		if (map_it == next_expected_batch_seq_.end()) {
-			absl::MutexLock lock(&client_seq_map_mutex_);
-			// Double check after locking
-			map_it = next_expected_batch_seq_.find(client_id);
+		{
+			absl::MutexLock lock(&global_seq_batch_seq_mu_);
+			auto map_it = next_expected_batch_seq_.find(client_id);
 			if (map_it == next_expected_batch_seq_.end()) {
-				// Initialize expectation. Assume first batch is 0.
+				// New client
 				if (batch_seq == 0) {
-					auto new_atomic_ptr = std::make_unique<std::atomic<size_t>>(1); // Initialize to expect 1
-					expected_seq_atomic_ptr = new_atomic_ptr.get();
-					// Emplace the key and move the unique_ptr into the map
-					next_expected_batch_seq_.emplace(client_id, std::move(new_atomic_ptr));
+					expected_seq = 0;
+					start_total_order = global_seq_;
+					global_seq_ += header_to_process->num_msg;
+					next_expected_batch_seq_[client_id] = 1; // Expect 1 next
 					ready_to_order = true;
 				} else {
-					// First batch seen is not 0 - skip for now
-					skipped_batches[client_id][batch_seq] = header_to_process;
+					skip_batch = true;
+					ready_to_order = false;
+					VLOG(4) << "Scanner [B" << broker_id << "]: New client " << client_id << ", skipping non-zero first batch " << batch_seq;
 				}
 			} else {
-				// Another thread added it concurrently, fall through to normal check
-				expected_seq_atomic_ptr = map_it->second.get();
-			}
-		} else {
-			// Get next batch sequence to order
-			expected_seq_atomic_ptr = map_it->second.get();
-		}
-
-		// Proceed only if we have a valid pointer to the atomic counter
-		if (expected_seq_atomic_ptr) {
-			if (!ready_to_order) { // Only check CAS if not already deemed ready (new client case)
-				size_t expected_seq = expected_seq_atomic_ptr->load(std::memory_order_acquire);
+				// Existing client
+				expected_seq = map_it->second;
 				if (batch_seq == expected_seq) {
-					// Attempt to atomically increment the expected sequence
-					// TODO(Jae) have this in outer if
-					if (expected_seq_atomic_ptr->compare_exchange_strong(expected_seq, expected_seq + 1, std::memory_order_acq_rel)) {
-						ready_to_order = true;
-					} else {
-						// CAS failed - another scanner for the *same client* (if possible?) or spurious fail. Skip.
-						LOG(WARNING) << "Scanner [Broker " << broker_id << "]: CAS failed for client " << client_id << " batch " << batch_seq;
-						skipped_batches[client_id][batch_seq] = header_to_process;
-					}
+					start_total_order = global_seq_;
+					global_seq_ += header_to_process->num_msg;
+					map_it->second = expected_seq + 1;
+					ready_to_order = true;
 				} else if (batch_seq > expected_seq) {
-					// Out of order batch
-					skipped_batches[client_id][batch_seq] = header_to_process;
+					// Out of order batch, skip (outside lock)
+					skip_batch = true;
+					ready_to_order = false;
 				} else {
-					// Duplicate or older batch - ignore or log error
-					LOG(WARNING) << "Scanner [Broker " << broker_id << "]: Duplicate/old batch seq " 
+					// Duplicate or older batch - ignore
+					ready_to_order = false;
+					LOG(WARNING) << "Scanner [B" << broker_id << "]: Duplicate/old batch seq "
 						<< batch_seq << " detected from client " << client_id << " (expected " << expected_seq << ")";
 				}
 			}
 		}
 
+		if (skip_batch){
+			skipped_batches[client_id][batch_seq] = header_to_process;
+		}
+
 		// 3. Queue if ready
 		if (ready_to_order) {
-			AssignOrder(topic, header_to_process);
+			AssignOrder(topic, header_to_process, start_total_order);
 			ProcessSkipped(topic, skipped_batches);
 		}
 
@@ -685,54 +668,57 @@ void CXLManager::BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_
 bool CXLManager::ProcessSkipped(std::array<char, TOPIC_NAME_SIZE>& topic,
 		absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches){
 
-	bool ret = false;
+	bool processed_any = false;
 	auto client_skipped_it = skipped_batches.begin();
 	while (client_skipped_it != skipped_batches.end()){
 		size_t client_id = client_skipped_it->first;
 		auto& client_skipped_map = client_skipped_it->second; // Ref to btree_map
-		auto map_it = next_expected_batch_seq_.find(client_id);
-		if(map_it == next_expected_batch_seq_.end()){
-			return ret;
-		}
 
-		std::atomic<size_t>* expected_seq_atomic_ptr = map_it->second.get();
-		std::atomic<size_t>& expected_seq_atomic = *expected_seq_atomic_ptr;
-
+		size_t start_total_order;
 		bool batch_processed;
 		do {
 			batch_processed = false;
-			size_t expected_seq = expected_seq_atomic.load(std::memory_order_acquire);
-			auto batch_it = client_skipped_map.find(expected_seq); // Find in btree_map
+			size_t expected_seq;
+			BatchHeader* batch_header = nullptr;
+			auto batch_it = client_skipped_map.end();
+			{ // --- Critical section START ---
+				absl::MutexLock lock(&global_seq_batch_seq_mu_);
 
-			if (batch_it != client_skipped_map.end()) { // Check if found
-																									// Found the next expected batch in the skipped list
-																									// Attempt to atomically increment the expected sequence *again*
-				if (expected_seq_atomic.compare_exchange_strong(expected_seq, expected_seq + 1, std::memory_order_acq_rel)) {
-					BatchHeader* batch_header = batch_it->second;
-					client_skipped_map.erase(batch_it); // Remove from skipped map *after* CAS succeeds
-					AssignOrder(topic, batch_header);
+				auto map_it = next_expected_batch_seq_.find(client_id);
+				// If client somehow disappeared, stop (shouldn't happen)
+				if (map_it == next_expected_batch_seq_.end()) break;
 
-					batch_processed = true; // Indicate we should check again for the *next* sequence
-					ret = true;
+				expected_seq = map_it->second;
+				batch_it = client_skipped_map.find(expected_seq); // Find expected in skipped
+
+				if (batch_it != client_skipped_map.end()) {
+					// Found it! Reserve sequence and update expected batch number
+					batch_header = batch_it->second;
+					start_total_order = global_seq_;
+					global_seq_ += batch_header->num_msg;
+					map_it->second = expected_seq + 1;
+					batch_processed = true; // Mark to proceed outside lock
+					processed_any = true; // Mark that we did *some* work
+					VLOG(4) << "ProcessSkipped [B?]: Client " << client_id << ", processing skipped batch " << expected_seq << ", reserving seq [" << start_total_order << ", " << global_seq_ << ")";
 				} else {
-					// CAS failed - stop checking for now. Another thread might be processing.
-					break;
+					// Next expected not found in skipped map for this client, move to next client
+					break; // Exit inner do-while loop for this client
 				}
-			} else {
-				// The next expected batch is not in the skipped map, stop checking.
-				break;
 			}
+			if (batch_processed && batch_header) {
+				client_skipped_map.erase(batch_it); // Erase AFTER successful lock/update
+				AssignOrder(topic, batch_header, start_total_order);
+			}
+			// If batch_processed is true, loop again for same client in case next seq was also skipped
 		} while (batch_processed && !client_skipped_map.empty()); // Keep checking if we processed one
 
 		if (client_skipped_map.empty()) {
-			auto next_it = std::next(client_skipped_it);
-			skipped_batches.erase(client_skipped_it);
-			client_skipped_it = next_it;
+			skipped_batches.erase(client_skipped_it++);
 		}else{
 			++client_skipped_it;
 		}
-	}
-	return ret;
+	} 
+	return processed_any;
 }
 
 // Return sequentially ordered logical offset + 1 and 
@@ -795,9 +781,9 @@ size_t CXLManager::SequentialOrderTracker::InsertAndGetSequentiallyOrdered(size_
 	return current_end;
 }
 
-void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *batch_to_order) {
+void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *batch_to_order,
+		size_t start_total_order) {
 	TInode* tinode = GetTInode(topic.data());
-	static std::atomic<size_t> global_seq = 0;
 	int broker = batch_to_order->broker_id;
 
 	// **Assign Global Order using Atomic fetch_add**
@@ -822,7 +808,7 @@ void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHead
 		return;
 	}
 	auto tracker = tracker_it->second.get();
-	size_t seq = global_seq.fetch_add(batch_to_order->num_msg);
+	size_t seq = start_total_order;
 
 	size_t logical_offset = batch_to_order->start_logical_offset;
 	size_t batch_start_offset = logical_offset;

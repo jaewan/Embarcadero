@@ -70,16 +70,14 @@ struct alignas(64) TInode{
 
 struct alignas(64) BatchHeader{
 	size_t client_id;
-	// Fill from buffer
 	size_t batch_seq;
 	size_t total_size;
-	size_t num_msg;
 	size_t start_logical_offset;
-	// Corfu variables
 	uint32_t broker_id;
 	uint32_t num_brokers;
 	size_t total_order;
 	size_t log_idx;	// Sequencer4: relative log offset to the payload of the batch and elative offset to last message
+	size_t num_msg;
 };
 
 
@@ -182,11 +180,10 @@ class CXLManager{
 		void Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int broker,
 				absl::Mutex* mutex, size_t &seq, absl::flat_hash_map<size_t, size_t> &batch_seq);
 
-		std::atomic<size_t> global_seq_{0};
+		size_t global_seq_ = 0;
 		// Map: client_id -> next expected batch_seq
-		absl::flat_hash_map<size_t, std::unique_ptr<std::atomic<size_t>>> next_expected_batch_seq_;
-		// Mutex ONLY for adding new clients to next_expected_batch_seq_
-		absl::Mutex client_seq_map_mutex_;
+		absl::flat_hash_map<size_t, size_t> next_expected_batch_seq_;
+		absl::Mutex global_seq_batch_seq_mu_;;
 		folly::MPMCQueue<BatchHeader*> ready_batches_queue_{1024*8};
 
 
@@ -235,7 +232,7 @@ class CXLManager{
 		void BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_SIZE> topic);
 		bool ProcessSkipped(std::array<char, TOPIC_NAME_SIZE>& topic,
 				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches);
-		void AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *header);
+		void AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *header, size_t start_total_order);
 };
 
 class ScalogLocalSequencer {
