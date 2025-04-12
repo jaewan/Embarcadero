@@ -712,13 +712,15 @@ std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(
 		// Allocate space for batch header
 		batch_headers_log = reinterpret_cast<void*>(batch_headers_);
 		batch_headers_ += sizeof(BatchHeader);
+		logical_offset = logical_offset_;
+		logical_offset_ += batch_header.num_msg;
 	}
 
 	// Check for segment boundary
 	CheckSegmentBoundary(log, msg_size, segment_metadata);
 
 	// Update batch header fields
-	batch_header.start_logical_offset = 0;
+	batch_header.start_logical_offset = logical_offset;
 	batch_header.broker_id = broker_id_;
 	batch_header.num_brokers = 0;
 	batch_header.total_order = 0;
