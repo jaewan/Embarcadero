@@ -20,32 +20,24 @@ GRID_LINESTYLE = '--'
 def plot_multiple_latency_cdfs(csv_filenames, labels, output_prefix):
     """
     Reads latency CDF data from multiple CSV files and generates a single
-    publication-quality plot comparing them.
+    publication-quality plot comparing them. Axes limits adjust to data.
 
     Args:
         csv_filenames (list): A list of paths to the input CSV files.
                               Each file expected columns: 'Latency_us', 'CumulativeProbability'
         labels (list): A list of labels for the legend, corresponding to each csv_filename.
         output_prefix (str): Prefix for the output plot files (e.g., 'comparison_cdf').
-                               Generates PREFIX.pdf and PREFIX.png.
+                               Generates PREFIX.pdf
     """
     if len(csv_filenames) != len(labels):
         raise ValueError("Number of CSV files must match number of labels.")
 
     # --- Create the Plot Figure and Axes ---
-    # Do this *once* before plotting the lines
     plt.figure(figsize=(FIGURE_WIDTH_INCHES, FIGURE_HEIGHT_INCHES))
-
-    # Variables to track overall latency range across all files
-    min_overall_latency = float('inf')
-    max_overall_latency = float('-inf')
-    all_data_loaded = True # Flag to track if all files loaded successfully
 
     # --- Plot each CDF ---
     # Matplotlib will automatically cycle through colors.
-    # You can define specific colors/linestyles if needed:
-    # colors = plt.cm.viridis(np.linspace(0, 1, len(csv_filenames))) # Example colormap
-    # linestyles = ['-', '--', ':'] # Example linestyles
+    all_data_plotted = False # Track if at least one dataset was plotted
 
     for i, (csv_filename, label) in enumerate(zip(csv_filenames, labels)):
         try:
@@ -61,47 +53,64 @@ def plot_multiple_latency_cdfs(csv_filenames, labels, output_prefix):
             latency_us = data['Latency_us']
             probability = data['CumulativeProbability']
 
-            # Plot this CDF data with its label
-            # Add marker=... if you want markers, though usually not needed for CDFs
-            plt.plot(latency_us, probability, linewidth=LINE_WIDTH, label=label) # Use label for legend
-                     # color=colors[i], linestyle=linestyles[i % len(linestyles)]) # Optional manual style
+            # Filter out potential non-positive values for log scale if necessary
+            # (Though latency should ideally be > 0)
+            valid_data = data[latency_us > 0]
+            if len(valid_data) < len(data):
+                print(f"Warning: Filtered out {len(data) - len(valid_data)} non-positive latency values for '{label}'.")
 
-            # Update overall min/max latency (considering only positive latency for log scale)
-            current_min = latency_us[latency_us > 0].min() if (latency_us > 0).any() else float('inf')
-            current_max = latency_us.max()
-            min_overall_latency = min(min_overall_latency, current_min)
-            max_overall_latency = max(max_overall_latency, current_max)
+            if len(valid_data) == 0:
+                 print(f"Warning: No positive latency data to plot for '{label}'. Skipping.")
+                 continue
+
+
+            # Plot this CDF data with its label
+            plt.plot(
+                valid_data['Latency_us'],
+                valid_data['CumulativeProbability'],
+                linewidth=LINE_WIDTH,
+                label=label
+            )
+            all_data_plotted = True # Mark that we plotted something
+
+            # --- Removed min/max tracking - matplotlib will handle limits ---
 
         except FileNotFoundError:
             print(f"Error: Input CSV file not found at '{csv_filename}'. Skipping this file.")
-            all_data_loaded = False # Mark that at least one file failed
         except Exception as e:
             print(f"An error occurred processing {csv_filename}: {e}. Skipping this file.")
-            all_data_loaded = False # Mark that at least one file failed
 
     # --- Check if any data was actually plotted ---
-    if min_overall_latency == float('inf') or max_overall_latency == float('-inf'):
-         print("Error: No valid data could be plotted from the provided files.")
-         plt.close() # Close the empty figure
-         return
+    if not all_data_plotted:
+        print("Error: No valid data could be plotted from the provided files.")
+        plt.close() # Close the empty figure
+        return
 
     # --- Customize Appearance (after all lines are plotted) ---
     plt.xscale('log')
     plt.xlabel("Latency (microseconds)", fontsize=LABEL_FONTSIZE)
     plt.ylabel("Cumulative Probability (CDF)", fontsize=LABEL_FONTSIZE)
     plt.title("Comparison of End-to-End Latency CDFs", fontsize=TITLE_FONTSIZE) # Adjust title
-    plt.ylim(0, 1.05)
 
-    # Set X limits based on the overall range found
-    plt.xlim(left=min_overall_latency * 0.8, right=max_overall_latency * 1.2)
+    # Set Y limits appropriate for CDF (0 to 1)
+    # Give slight padding above 1.0 for visual clarity
+    plt.ylim(0, 1.01)
+
+    # --- REMOVED explicit plt.xlim() ---
+    # Let matplotlib determine the X limits automatically based on the plotted data range.
+    # It usually does a good job, especially with log scale.
 
     plt.xticks(fontsize=TICKS_FONTSIZE)
     plt.yticks(fontsize=TICKS_FONTSIZE)
     plt.grid(True, which='major', linestyle=GRID_LINESTYLE, alpha=GRID_ALPHA)
-    plt.tight_layout()
+    # Optional: Add minor grid lines for log scale if desired
+    # plt.grid(True, which='minor', linestyle=GRID_LINESTYLE, alpha=GRID_ALPHA*0.5)
 
     # --- Add Legend ---
     plt.legend(fontsize=LEGEND_FONTSIZE, loc='best') # 'loc' controls position
+
+    # Adjust layout to prevent labels overlapping
+    plt.tight_layout()
 
     # --- Save the Plot ---
     pdf_filename = output_prefix + ".pdf"
