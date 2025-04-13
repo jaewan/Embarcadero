@@ -1,0 +1,7 @@
+Timestamp(ms),EventDescription
+5476,"Data Send Fail Broker 2 errno=104"
+5476,"Data Send Fail Broker 2 errno=104"
+5476,"Reconnect Success Broker 1 (from 2)"
+5477,"Data Send Fail Broker 2 errno=104"
+5477,"Reconnect Success Broker 3 (from 2)"
+5478,"Reconnect Success Broker 0 (from 2)"
