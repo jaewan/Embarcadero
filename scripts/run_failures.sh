@@ -3,11 +3,11 @@
 pushd ../build/bin/
 
 NUM_BROKERS=4
-FAILURE_PERCENTAGE=0.2
+FAILURE_PERCENTAGE=0.15
 NUM_BROKERS_TO_KILL=1
 NUM_TRIALS=1
 test_cases=(4)
-msg_sizes=(1024)
+total_message_size=21474836480
 
 wait_for_signal() {
   while true; do
@@ -36,34 +36,37 @@ mkfifo script_signal_pipe
 
 # Run experiments for each message size
 for test_case in "${test_cases[@]}"; do
-	for msg_size in "${msg_sizes[@]}"; do
-	  for ((trial=1; trial<=NUM_TRIALS; trial++)); do
-		echo "Running trial $trial with message size $msg_size"
+  for ((trial=1; trial<=NUM_TRIALS; trial++)); do
+	echo "Running trial $trial with message size $msg_size"
 
-		# Start the processes
-		start_process "./embarlet --head"
-		wait_for_signal
-		head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
-		sleep 1
-		for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-		  start_process "./embarlet"
-		done
-		for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-		  wait_for_signal
-		done
-		start_process "./throughput_test -m $msg_size --record_results -t $test_case --num_brokers_to_kill $NUM_BROKERS_TO_KILL --failure_percentage $FAILURE_PERCENTAGE"
+	# Start the processes
+	start_process "./embarlet --head"
+	wait_for_signal
+	head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
+	sleep 1
+	for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
+	  start_process "./embarlet"
+	done
+	for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
+	  wait_for_signal
+	done
+	start_process "./throughput_test -s $total_message_size  --record_results -t $test_case --num_brokers_to_kill $NUM_BROKERS_TO_KILL --failure_percentage $FAILURE_PERCENTAGE"
 
-		# Wait for all processes to finish
-		for pid in "${pids[@]}"; do
-		  wait $pid
-		  echo "Process with PID $pid finished"
-		done
+	# Wait for all processes to finish
+	for pid in "${pids[@]}"; do
+	  wait $pid
+	  echo "Process with PID $pid finished"
+	done
 
-		echo "All processes have finished for trial $trial with message size $msg_size"
-		pids=()  # Clear the pids array for the next trial
-	  done
+	echo "All processes have finished for trial $trial with message size $msg_size"
+	pids=()  # Clear the pids array for the next trial
 	done
 done
 
 rm script_signal_pipe
+
+popd
+pushd ../data/failure/
+python3 ../../scripts/plot/plot_failure.py real_time_acked_throughput.csv failure --events failure_events.csv
+
 echo "All experiments have finished."

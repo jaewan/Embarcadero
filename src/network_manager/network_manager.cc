@@ -789,14 +789,53 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 	struct epoll_event events[10];
 	char buf[1];
 
+	// Send broker_id first so client can distinguish
+	size_t acked_size = 0;
+	while (acked_size < sizeof(broker_id_)) {
+		int n = epoll_wait(ack_efd_, events, 10, -1);
+
+		for (int i = 0; i < n; i++) {
+			if (events[i].events & EPOLLOUT) {
+				bool retry;
+				do {
+					retry = false;
+					ssize_t bytes_sent = send(
+							ack_fd, 
+							(char*)&broker_id_ + acked_size, 
+							sizeof(broker_id_) - acked_size, 
+							0);
+
+					if (bytes_sent < 0) {
+						if (errno == EAGAIN || errno == EWOULDBLOCK) {
+							retry = true;
+							continue;
+						} else if (errno == EINTR) {
+							retry = true;
+							continue;
+						} else {
+							LOG(ERROR) << "Offset acknowledgment failed: " << strerror(errno);
+							return;
+						}
+					} else {
+						acked_size += bytes_sent;
+					}
+				} while (retry && acked_size < sizeof(broker_id_));
+
+				if (acked_size >= sizeof(broker_id_)) {
+					break;  // All data sent
+				}
+			}
+		}
+	} // end of send loop
+
 	size_t next_to_ack_offset = 0;
 
 	while (!stop_threads_) {
 		size_t ack = GetOffsetToAck(topic, ack_level);
 		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
 			next_to_ack_offset = ack + 1;
+			acked_size = 0;
 			// Send offset acknowledgment
-			size_t acked_size = 0;
 			while (acked_size < sizeof(ack)) {
 				int n = epoll_wait(ack_efd_, events, 10, -1);
 
@@ -812,7 +851,6 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 									0);
 
 							if (bytes_sent < 0) {
-								LOG(INFO) << "[JAE_DEBUG] ack send returns:" << bytes_sent;
 								if (errno == EAGAIN || errno == EWOULDBLOCK) {
 									retry = true;
 									continue;
