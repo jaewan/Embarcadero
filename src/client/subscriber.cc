@@ -143,6 +143,15 @@ bool Subscriber::DEBUG_check_order(int order) {
 						break; // Avoid infinite loop
 					}
 					if (remaining_in_buffer < total_message_size) {
+						if (header->paddedSize != 4160) {
+							LOG(INFO) << "Total order: " << header->total_order
+								<< ", client_order: " << header->client_order
+								<< ", client_id: " << header->client_id
+								<< ", paddedSize: " << header->paddedSize
+								<< ", logical_offset: " << header->logical_offset
+								<< ", complete: " << header->complete;
+						}
+
 						VLOG(5) << "DEBUG: Incomplete message (need " << total_message_size << ", have " << remaining_in_buffer << ") at offset " << parse_offset << ", stopping parse for this buffer.";
 						break;
 					}
@@ -220,11 +229,29 @@ bool Subscriber::DEBUG_check_order(int order) {
 		// contiguity_ok = false; // Don't fail just for this, check holes below.
 	}
 
+	size_t min_client_order = std::numeric_limits<size_t>::max();
+	size_t max_client_order = 0;
+	size_t max_total_order = 0;
+	std::unordered_set<size_t> client_orders_seen;
+
 	for (size_t i = 0; i < all_headers.size(); ++i) {
 		const auto& header = all_headers[i]; // header is const MessageHeader&
 
 		// Create a non-volatile copy of the potentially volatile member
 		size_t current_total_order = header.total_order;
+		size_t current_client_order = header.client_order;
+
+		// Update statistics
+		min_client_order = std::min(min_client_order, current_client_order);
+		max_client_order = std::max(max_client_order, current_client_order);
+		max_total_order = std::max(max_total_order, current_total_order);
+
+		// Check if paddedSize is 4160
+		// if (header.paddedSize != 4160) {
+		// 	LOG(ERROR) << "DEBUG Check Failed (Level 1): Message client_order=" << header.client_order
+		// 		<< ", client_id=" << header.client_id << " has unexpected paddedSize=" << header.paddedSize;
+		// 	overall_status = false;
+		// }
 
 		// Check Assignment (if needed - using non-volatile copy)
 		// if (header.logical_offset != static_cast<size_t>(-1) && current_total_order == ???) { ... }
@@ -236,6 +263,17 @@ bool Subscriber::DEBUG_check_order(int order) {
 			uniqueness_ok = false;
 			overall_status = false;
 		}
+
+		// Check uniqueness of client_order
+		if (!client_orders_seen.insert(current_client_order).second) {
+			LOG(ERROR) << "DEBUG Check Failed (Level 1): Duplicate client_order=" << current_client_order
+				<< " found (total_order=" << current_total_order << ", client_id=" << header.client_id << ").";
+			uniqueness_ok = false;
+			overall_status = false;
+		}
+
+		// LOG(INFO) << "DEBUG: Checking total_order=" << current_total_order
+		// 	<< " (client_order=" << header.client_order << ", complete=" << header.complete << ", logical_offset=" << header.logical_offset << ")";
 
 		// Check Contiguity (using non-volatile copies)
 		if (i > 0) {
@@ -249,6 +287,14 @@ bool Subscriber::DEBUG_check_order(int order) {
 			}
 		}
 	}
+
+	// Summary logging
+	LOG(INFO) << "Header Summary:"
+		<< " Count=" << all_headers.size()
+		<< ", MinClientOrder=" << min_client_order
+		<< ", MaxClientOrder=" << max_client_order
+		<< ", MaxTotalOrder=" << max_total_order;
+
 	if (!assignment_ok || !uniqueness_ok || !contiguity_ok) {
 		VLOG(3) << "DEBUG: Order Level 1 check FAILED (Assignment=" << assignment_ok
 			<< ", Uniqueness=" << uniqueness_ok << ", Contiguity=" << contiguity_ok << ")";
