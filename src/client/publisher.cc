@@ -262,7 +262,6 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 		// Measuring loop
 		const int measurement_interval_ms = 5;
 		const double time_factor_gbps = (1000.0 / measurement_interval_ms) / (1024.0 * 1024.0 * 1024.0); // Factor to get GB/s
-		auto start_time = std::chrono::steady_clock::now();
 
 		while (!shutdown_) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(measurement_interval_ms));
@@ -365,7 +364,6 @@ void Publisher::EpollAckThread() {
 	// Variables for epoll event handling
 	const int max_events =  NUM_MAX_BROKERS > 0 ? NUM_MAX_BROKERS * 2 : 64;
 	std::vector<epoll_event> events(max_events);
-	size_t total_received = 0;
 	int EPOLL_TIMEOUT = 10;  // 1 millisecond timeout
 	std::map<int, int> client_sockets; // Map: client_fd -> broker_id (value is broker_id)
 
@@ -382,7 +380,7 @@ void Publisher::EpollAckThread() {
 	thread_count_.fetch_add(1); // Signal that initialization is complete
 
 	// Main epoll loop
-	while (!shutdown_ || total_received < client_order_) {
+	while (!shutdown_) {
 		int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
 
 		if (num_events < 0) {
@@ -510,8 +508,8 @@ void Publisher::EpollAckThread() {
 						if (acked_msg >= prev_acked || prev_acked == (size_t)-1) { // Check for valid cumulative value
 							size_t new_acked_msgs = acked_msg - prev_acked;
 							if (new_acked_msgs > 0) {
-								// Atomically update the per-broker counter
 								acked_messages_per_broker_[broker_id]+=new_acked_msgs;
+								ack_received_ += new_acked_msgs;
 								prev_ack_per_sock[client_sock] = acked_msg; // Update last value for this socket
 								VLOG(4) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << ") ACK messages: " 
 									<< acked_msg << " (+" << new_acked_msgs << ")";
