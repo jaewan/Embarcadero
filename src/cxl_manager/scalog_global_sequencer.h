@@ -70,9 +70,6 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
 		/// Flag to indicate if we should stop reading from the stream
 		std::atomic<bool> stop_reading_from_stream_{false};
 
-		/// Time between sending global cut
-		std::chrono::milliseconds global_cut_interval_ = std::chrono::milliseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL);
-
 		/// Stream to send global cut to all local sequencers
 		std::vector<grpc::ServerReaderWriter<GlobalCut, LocalCut>*> local_sequencers_ ABSL_GUARDED_BY(stream_mu_);
 
