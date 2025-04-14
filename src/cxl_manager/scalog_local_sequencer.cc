@@ -1,9 +1,9 @@
 #include "scalog_local_sequencer.h"
 
 namespace Scalog {
-    
+
 //TODO (tony) priority 2 (failure test)  make the scalog code failure prone.
-//Current logic proceeds epoch with all brokers at the same pace. 
+//Current logic proceeds epoch with all brokers at the same pace.
 //If a broker fails, the entire cluster is stuck. If a failure is detected from the heartbeat, GetRegisteredBroker will return the alive brokers
 //after heartbeat_interval (failure is detected), if there is a change in the cluster, only proceed with the brokers
 ScalogLocalSequencer::ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager, int broker_id, void* cxl_addr, std::string topic_str) :
@@ -94,7 +94,7 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 	if (broker_id_ == 0) {
 		LOG(INFO) << "Scalog Terminating global sequencer";
 		TerminateGlobalSequencer();
-	}	
+	}
 }
 
 void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWriter<LocalCut, GlobalCut>>& stream, std::string topic_str) {
@@ -122,7 +122,7 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<int, int> &global_cut) {
 	static char topic_char[TOPIC_NAME_SIZE];
 	static size_t seq = 0;
-	static TInode *tinode = nullptr; 
+	static TInode *tinode = nullptr;
 	static MessageHeader* msg_to_order = nullptr;
 	memcpy(topic_char, topic, TOPIC_NAME_SIZE);
 	if(tinode == nullptr){
@@ -130,6 +130,13 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 		msg_to_order = ((MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id_].log_offset));
 	}
 
+	static auto last_log_time = std::chrono::steady_clock::now();
+	static size_t written=0;
+			auto now = std::chrono::steady_clock::now();
+				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 3000) {
+					LOG(INFO) << "[DEBUG] [SCALOG] written:" << written;
+					last_log_time = std::chrono::steady_clock::now();
+				}
 	for(auto &cut : global_cut){
 		if(cut.first == broker_id_){
 			for(int i = 0; i<cut.second; i++){
@@ -140,6 +147,7 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 				tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
 				*/
 				cxl_manager_->UpdateTinodeOrder(topic_char, tinode, broker_id_, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
+				written = msg_to_order->logical_offset;
 				msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
 				seq++;
 			}

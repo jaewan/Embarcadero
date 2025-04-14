@@ -122,7 +122,7 @@ grpc::Status ScalogGlobalSequencer::HandleSendLocalCut(grpc::ServerContext* cont
     std::thread receive_local_cut(&ScalogGlobalSequencer::ReceiveLocalCut, this, std::ref(stream));
 	receive_local_cut.join();
 
-	return grpc::Status::OK; 
+	return grpc::Status::OK;
 }
 
 void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, LocalCut>* stream) {
@@ -145,7 +145,7 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 						last_sent_global_cut_[broker_id][replica_id] = -1;
 					} else {
 						global_cut_[broker_id][replica_id] = local_cut - last_sent_global_cut_[broker_id][replica_id];
-						logical_offsets_[broker_id][replica_id] = local_cut;	
+						logical_offsets_[broker_id][replica_id] = local_cut;
 					}
 				}
 			}

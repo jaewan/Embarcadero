@@ -30,7 +30,7 @@ namespace Embarcadero{
 
 #define NUM_DISK_IO_THREADS 1 
 #define NUM_NETWORK_IO_THREADS 8 
-#define NUM_SUB_CONNECTIONS 4
+#define NUM_SUB_CONNECTIONS 3
 #define ZERO_COPY_SEND_LIMIT 1UL<<23
 
 #define BATCH_SIZE (1UL<<19)
@@ -50,7 +50,7 @@ namespace Embarcadero{
 #define SCALOG_REP_PORT 50052
 #define SCLAOG_SEQUENCER_IP "192.168.60.173"
 
-#define SCALOG_SEQ_LOCAL_CUT_INTERVAL 5000
+#define SCALOG_SEQ_LOCAL_CUT_INTERVAL 100000
 	
 using GetNumBrokersCallback = std::function<int()>;
 using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers, 
