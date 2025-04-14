@@ -132,11 +132,11 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 
 	static auto last_log_time = std::chrono::steady_clock::now();
 	static size_t written=0;
-			auto now = std::chrono::steady_clock::now();
-				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 3000) {
-					LOG(INFO) << "[DEBUG] [SCALOG] written:" << written;
-					last_log_time = std::chrono::steady_clock::now();
-				}
+	auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 3000) {
+			LOG(INFO) << "[DEBUG] [SCALOG] written:" << written;
+			last_log_time = std::chrono::steady_clock::now();
+		}
 	for(auto &cut : global_cut){
 		if(cut.first == broker_id_){
 			for(int i = 0; i<cut.second; i++){

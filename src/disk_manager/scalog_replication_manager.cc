@@ -681,8 +681,8 @@ namespace Scalog {
 		// State for ScalogSequencer
 		std::atomic<size_t> next_global_sequence_number_{0}; // Start at 0
 		std::atomic<off_t> next_sequencing_disk_offset_{0}; // Start at 0
-																												// TODO: These atomics might need stronger ordering or locking if accessed/updated
-																												// from multiple places concurrently, but likely okay if only updated by ReceiveGlobalCut thread.
+		// TODO: These atomics might need stronger ordering or locking if accessed/updated
+		// from multiple places concurrently, but likely okay if only updated by ReceiveGlobalCut thread.
 
 	}; // End class ScalogReplicationServiceImpl
 
