@@ -100,7 +100,6 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWriter<LocalCut, GlobalCut>>& stream, std::string topic_str) {
 	static char topic[TOPIC_NAME_SIZE];
 	memcpy(topic, topic_str.data(), topic_str.size());
-	// static size_t global_epoch = 0;
 
 	int num_global_cuts = 0;
 	while (!stop_reading_from_stream_) {
@@ -110,11 +109,6 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 			for (const auto& entry : global_cut.global_cut()) {
 				global_cut_[static_cast<int>(entry.first)] = static_cast<int>(entry.second);
 			}
-
-			// if (global_cut.global_epoch() != global_epoch) {
-			// 	LOG(INFO) << "Global epoch mismatch: expected " << global_epoch << ", got " << global_cut.global_epoch();
-			// }
-			// global_epoch++;
 
 			ScalogSequencer(topic, global_cut_);
 
@@ -145,7 +139,6 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 				tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset;
 				tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
 				*/
-				// LOG(INFO) << "Sequence: " << seq << " for broker: " << broker_id_ << " msg:" << msg_to_order->logical_offset << " complete: " << msg_to_order->complete << " client order:" << msg_to_order->client_order;
 				cxl_manager_->UpdateTinodeOrder(topic_char, tinode, broker_id_, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
 				msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
 				seq++;
