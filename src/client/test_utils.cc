@@ -433,17 +433,19 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	bool steady_rate = result.count("steady_rate");
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 
+	size_t num_brokers = 4;
+
 	if (steady_rate) {
 		LOG(WARNING) << "Using steady rate mode, this works best with 4 brokers";
 	}
 
 	// Calculate send interval for rate limiting
-	size_t paddedMsgSizeWithHeader = ((((message_size + 64 - 1) / 64) * 64) + 64);
-	size_t send_interval = BATCH_SIZE / paddedMsgSizeWithHeader;
-	if (BATCH_SIZE % paddedMsgSizeWithHeader) {
-		send_interval += 1;
+	size_t padded = message_size % 64;
+	if (padded) {
+		padded = 64 - padded;
 	}
-	send_interval = send_interval * 4 * num_threads_per_broker;
+
+	size_t paddedMsgSizeWithHeader = message_size + padded + sizeof(Embarcadero::MessageHeader);
 
 	// Calculate number of messages
 	size_t n = total_message_size / message_size;
@@ -475,7 +477,10 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		auto start = std::chrono::high_resolution_clock::now();
 
 		// Publish messages with timestamps
+		size_t sent_bytes = 0;
+		size_t num_batch = num_brokers * num_threads_per_broker;
 		for (size_t i = 0; i < n; i++) {
+
 			// Capture current timestamp and embed it in the message
 			auto timestamp = std::chrono::steady_clock::now();
 			long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -487,17 +492,16 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 			// Send the message
 			p.Publish(message, message_size);
 
+			sent_bytes += paddedMsgSizeWithHeader;
 			// If using steady rate, pause periodically
-			if (steady_rate && (i % send_interval == 0)) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			if (steady_rate && (sent_bytes >= BATCH_SIZE)) {
+				sent_bytes = 0;
+				num_batch--;
+				if(num_batch == 0){
+					std::this_thread::sleep_for(std::chrono::nanoseconds(10000));
+					num_batch = num_brokers * num_threads_per_broker;
+				}
 			}
-
-			/*
-			// Update progress periodically
-			if (i % 1000 == 0) {
-			progress.Update(i);
-			}
-			*/
 		}
 
 		// Finalize publishing

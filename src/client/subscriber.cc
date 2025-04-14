@@ -332,7 +332,6 @@ void Subscriber::StoreLatency() {
 				VLOG(3) << "FD=" << fd << ": No recv log entries, skipping.";
 				continue;
 			}
-
 			// --- Process both buffers for this connection ---
 			for (int buf_idx = 0; buf_idx < 2; ++buf_idx) {
 				const auto& buffer_state = conn_ptr->buffers[buf_idx];
@@ -444,6 +443,21 @@ void Subscriber::StoreLatency() {
 	LOG(INFO) << "  99.9th P:" << p999_us;
 	LOG(INFO) << "  Max:     " << max_us;
 
+	std::string latency_filename = "latency_stats.csv";
+	std::ofstream latency_file(latency_filename);
+	if (!latency_file.is_open()) {
+		LOG(ERROR) << "Failed to open file for writing: " << latency_filename;
+	} else {
+		latency_file << "Average,Min,Median,p99,p999,Max\n"; 
+		latency_file << std::fixed << std::setprecision(3) << avg_us 
+			<< "," << min_us
+			<< "," << median_us
+			<< "," << p99_us
+			<< "," << p999_us
+			<< "," << max_us << "\n";
+		latency_file.close();
+	}
+
 	// --- Generate and Write CDF Data Points ---
 	std::string cdf_filename = "cdf_latency_us.csv"; // Use .csv for easy import
 	VLOG(3) << "Writing CDF data points to " << cdf_filename;
@@ -461,19 +475,6 @@ void Subscriber::StoreLatency() {
 			double cumulative_probability = static_cast<double>(i + 1) / count;
 
 			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability << "\n";
-
-			// Optimization: If you have many identical latency values, the CDF plot
-			// will have vertical jumps. You might only want to write unique points
-			// for a smaller file, but writing all points is fine for plotting.
-			// Example to write unique points only (more complex):
-			// if (i == 0 || all_latencies_us[i] != all_latencies_us[i - 1]) {
-			//    // Find the index of the last occurrence of this latency
-			//    auto upper = std::upper_bound(all_latencies_us.begin() + i, all_latencies_us.end(), current_latency);
-			//    size_t last_index = (upper - all_latencies_us.begin()) - 1;
-			//    double prob_at_last = static_cast<double>(last_index + 1) / count;
-			//    cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << prob_at_last << "\n";
-			//    i = last_index; // Skip to the next unique value
-			//}
 		}
 		cdf_file.close();
 	}
