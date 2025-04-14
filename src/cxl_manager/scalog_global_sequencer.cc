@@ -69,7 +69,7 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
 				// TODO(Tony) For now, ensure all local sequencers make connections to the global seq before we start distributing the global cut.
-				if (global_cut_.size() != (NUM_MAX_BROKERS * num_replicas_per_broker_)) {
+				if (global_cut_.size() != NUM_MAX_BROKERS) {
 					continue;
 				}
 
