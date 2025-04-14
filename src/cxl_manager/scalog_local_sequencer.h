@@ -38,9 +38,6 @@ class ScalogLocalSequencer {
 		void* cxl_addr_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
 
-		/// Time between each local cut
-		std::chrono::milliseconds local_cut_interval_ = std::chrono::milliseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL);
-
 		/// Map of broker_id to local cut
 		absl::btree_map<int, int> global_cut_;
 

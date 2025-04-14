@@ -83,7 +83,7 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 		local_epoch_++;
 
 		// Sleep until interval passes to send next local cut
-		std::this_thread::sleep_for(local_cut_interval_);
+		std::this_thread::sleep_for(std::chrono::milliseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL));
 	}
 
 	stream->WritesDone();
