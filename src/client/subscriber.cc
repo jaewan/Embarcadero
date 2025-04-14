@@ -249,6 +249,7 @@ bool Subscriber::DEBUG_check_order(int order) {
 			}
 		}
 	}
+	
 	if (!assignment_ok || !uniqueness_ok || !contiguity_ok) {
 		VLOG(3) << "DEBUG: Order Level 1 check FAILED (Assignment=" << assignment_ok
 			<< ", Uniqueness=" << uniqueness_ok << ", Contiguity=" << contiguity_ok << ")";
