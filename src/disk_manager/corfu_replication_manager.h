@@ -16,7 +16,8 @@ class CorfuReplicationServiceImpl;
 
 class CorfuReplicationManager {
 public:
-    CorfuReplicationManager(const std::string& address = "localhost",
+    CorfuReplicationManager(int broker_id,
+														const std::string& address = "localhost",
                             const std::string& port = "",
                             const std::string& log_file = "");
     ~CorfuReplicationManager();

@@ -691,12 +691,14 @@ namespace Scalog {
 			const std::string& port,
 			const std::string& log_file) {
 		try {
-			std::string base_filename = log_file.empty() ? "scalogreplication_log.dat" : log_file;
+			int disk_to_write = broker_id % NUM_DISKS ;
+			std::string base_dir = "../../.Replication/disk" + std::to_string(disk_to_write) + "/";
+			std::string base_filename = log_file.empty() ? base_dir+"scalog_replication_log"+std::to_string(broker_id) +".dat" : log_file;
 			service_ = std::make_unique<ScalogReplicationServiceImpl>(base_filename, broker_id);
 
 			std::string server_address = address + ":" + (port.empty() ? std::to_string(SCALOG_REP_PORT) : port);
 
-			LOG(INFO) << "Starting scalog replication manager at " << server_address;
+			//LOG(INFO) << "Starting scalog replication manager at " << server_address;
 
 			ServerBuilder builder;
 

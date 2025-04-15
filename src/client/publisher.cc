@@ -43,12 +43,12 @@ Publisher::~Publisher() {
 
 	// Wait for all threads to complete
 	for (auto& t : threads_) {
-		if (t.joinable()) {
+		if(t.joinable()){
 			t.join();
 		}
 	}
 
-	if (cluster_probe_thread_.joinable()) {
+	if(cluster_probe_thread_.joinable()){
 		cluster_probe_thread_.join();
 	}
 
@@ -63,6 +63,7 @@ Publisher::~Publisher() {
 	if (kill_brokers_thread_.joinable()) {
 		kill_brokers_thread_.join();
 	}
+	VLOG(3) << "Publisher destructor return";
 }
 
 void Publisher::Init(int ack_level) {
@@ -173,7 +174,7 @@ void Publisher::Poll(size_t n) {
 				}
 			}
 			if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
-				VLOG(5) << "Waiting for acknowledgments, received " << ack_received_ << " out of " << client_order_;
+				LOG(INFO) << "Waiting for acknowledgments, received " << ack_received_ << " out of " << client_order_;
 				last_log_time = now;
 			}
 			std::this_thread::yield();
