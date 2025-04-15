@@ -112,10 +112,10 @@ namespace Embarcadero{
 		sequencerType_(sequencerType){
 			num_io_threads_ = NUM_MAX_BROKERS;
 			if(sequencerType == heartbeat_system::SequencerType::SCALOG){
-				scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
+				scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, log_to_memory, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
 				return;
 			}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
-				corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>(broker_id);
+				corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>(broker_id, log_to_memory);
 				return;
 			}
 
@@ -271,9 +271,9 @@ namespace Embarcadero{
 						}
 						if(offset + req.len > log_capacity){
 							offset = 0;
-							LOG(ERROR) << "Consider increasing replica log size message_size:" << messages_size;
+							//LOG(ERROR) << "Consider increasing replica log size message_size:" << messages_size;
 						}
-						req.addr = (void*)((uint8_t*)log + offset);
+						req.addr = (void*)((uint8_t*)log_addr + offset);
 						req.buf = (void*)((uint8_t*)messages + offset);
 						req.fd = fd;
 						req.offset = disk_offset;
@@ -286,7 +286,7 @@ namespace Embarcadero{
 					}
 				}
 				if(log_to_memory_){
-					memcpy((uint8_t*)log_addr + offset, messages, messages_size);
+					memcpy((uint8_t*)log_addr, messages, messages_size);
 				}else{
 					pwrite(fd, messages, disk_offset, messages_size);
 				}
