@@ -38,8 +38,7 @@ ResultWriter::ResultWriter(const cxxopts::ParseResult& result)
     if (replication_factor > 0) {
         result_path = data_base_dir + "replication/";
         if (test_num == 2) {
-            LOG(ERROR) << "Replication and latency tests cannot be combined";
-            throw std::invalid_argument("Invalid test configuration");
+            LOG(WARNING) << "Replication and latency tests cannot be combined. Decide where to store results";
         }
     } else if (test_num != 2 && test_num != 4) {
         result_path = data_base_dir + "throughput/";

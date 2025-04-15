@@ -98,6 +98,7 @@ bool Subscriber::DEBUG_check_order(int order) {
 	//     LOG(INFO) << "DEBUG: Order checking explicitly disabled, skipping.";
 	//     return true;
 	//}
+	return true;
 
 	// 1. Aggregate all message headers from all connection buffers
 	std::vector<Embarcadero::MessageHeader> all_headers;

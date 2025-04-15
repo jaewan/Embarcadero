@@ -69,8 +69,8 @@ bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
 /**
  * Sets up an acknowledgment socket with connection retry logic
  */
-bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd, 
-		const struct sockaddr_in& client_address, 
+bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
+		const struct sockaddr_in& client_address,
 		uint32_t port) {
 	ack_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (ack_fd < 0) {
@@ -84,7 +84,7 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 	}
 
 	// Setup server address for connection
-	struct sockaddr_in server_addr; 
+	struct sockaddr_in server_addr;
 	memset(&server_addr, 0, sizeof(server_addr));
 	server_addr.sin_family = AF_INET;
 	server_addr.sin_port = htons(port);
@@ -103,8 +103,8 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 	int retries = 0;
 
 	while (retries < MAX_RETRIES) {
-		int connect_result = connect(ack_fd, 
-				reinterpret_cast<const sockaddr*>(&server_addr), 
+		int connect_result = connect(ack_fd,
+				reinterpret_cast<const sockaddr*>(&server_addr),
 				sizeof(server_addr));
 
 		if (connect_result == 0) {
@@ -181,7 +181,7 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 
 	struct epoll_event event;
 	event.data.fd = ack_fd;
-	event.events = EPOLLOUT; 
+	event.events = EPOLLOUT;
 	if (epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
 		LOG(ERROR) << "epoll_ctl failed for ack connection";
 		CleanupSocketAndEpoll(ack_fd, ack_efd_);
@@ -226,7 +226,7 @@ NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads)
 			// Busy wait until all threads are ready
 		}
 
-		VLOG(3) << "[NetworkManager]: Constructed with " << num_reqReceive_threads_ 
+		VLOG(3) << "[NetworkManager]: Constructed with " << num_reqReceive_threads_
 			<< " request threads for broker " << broker_id_;
 }
 
@@ -290,7 +290,7 @@ void NetworkManager::MainThread() {
 
 	// Bind socket with retry logic
 	while (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
-		LOG(ERROR) << "Error binding socket to port " << (PORT + broker_id_) 
+		LOG(ERROR) << "Error binding socket to port " << (PORT + broker_id_)
 			<< " for broker " << broker_id_ << ": " << strerror(errno);
 		sleep(5);  // Retry after delay
 	}
@@ -335,8 +335,8 @@ void NetworkManager::MainThread() {
 				struct sockaddr_in client_addr;
 				socklen_t client_addr_len = sizeof(client_addr);
 
-				req.client_socket = accept(server_socket, 
-						(struct sockaddr*)&client_addr, 
+				req.client_socket = accept(server_socket,
+						(struct sockaddr*)&client_addr,
 						&client_addr_len);
 
 				if (req.client_socket < 0) {
@@ -412,7 +412,7 @@ void NetworkManager::ReqReceiveThread() {
 //----------------------------------------------------------------------------
 
 void NetworkManager::HandlePublishRequest(
-		int client_socket, 
+		int client_socket,
 		const EmbarcaderoReq& handshake,
 		const struct sockaddr_in& client_address) {
 
@@ -466,9 +466,9 @@ void NetworkManager::HandlePublishRequest(
 
 		// Finish reading batch header if partial read
 		while (bytes_read < static_cast<ssize_t>(sizeof(BatchHeader))) {
-			ssize_t recv_ret = recv(client_socket, 
-					((uint8_t*)&batch_header) + bytes_read, 
-					sizeof(BatchHeader) - bytes_read, 
+			ssize_t recv_ret = recv(client_socket,
+					((uint8_t*)&batch_header) + bytes_read,
+					sizeof(BatchHeader) - bytes_read,
 					0);
 			if (recv_ret < 0) {
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
@@ -485,8 +485,8 @@ void NetworkManager::HandlePublishRequest(
 		size_t logical_offset;
 		SequencerType seq_type;
 
-		std::function<void(void*, size_t)> non_emb_seq_callback = 
-			cxl_manager_->GetCXLBuffer(batch_header, handshake.topic, buf, 
+		std::function<void(void*, size_t)> non_emb_seq_callback =
+			cxl_manager_->GetCXLBuffer(batch_header, handshake.topic, buf,
 					segment_header, logical_offset, seq_type);
 
 		if (!buf) {
@@ -564,7 +564,7 @@ void NetworkManager::HandlePublishRequest(
 //----------------------------------------------------------------------------
 
 void NetworkManager::HandleSubscribeRequest(
-		int client_socket, 
+		int client_socket,
 		const EmbarcaderoReq& handshake) {
 
 	// Configure socket for optimal throughput
@@ -628,9 +628,9 @@ void NetworkManager::HandleSubscribeRequest(
 }
 
 void NetworkManager::SubscribeNetworkThread(
-		int sock, 
-		int efd, 
-		const char* topic, 
+		int sock,
+		int efd,
+		const char* topic,
 		int client_id) {
 
 	size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
@@ -650,10 +650,10 @@ void NetworkManager::SubscribeNetworkThread(
 			absl::MutexLock lock(&sub_state_[client_id]->mu);
 
 			if (cxl_manager_->GetMessageAddr(
-						topic, 
-						sub_state_[client_id]->last_offset, 
-						sub_state_[client_id]->last_addr, 
-						msg, 
+						topic,
+						sub_state_[client_id]->last_offset,
+						sub_state_[client_id]->last_addr,
+						msg,
 						messages_size)) {
 				// Split large messages into chunks for better flow control
 				while (messages_size > zero_copy_send_limit) {
@@ -689,10 +689,10 @@ void NetworkManager::SubscribeNetworkThread(
 }
 
 bool NetworkManager::SendMessageData(
-		int sock_fd, 
-		int epoll_fd, 
-		void* buffer, 
-		size_t buffer_size, 
+		int sock_fd,
+		int epoll_fd,
+		void* buffer,
+		size_t buffer_size,
 		size_t& send_limit) {
 
 	size_t sent_bytes = 0;
@@ -732,7 +732,7 @@ bool NetworkManager::SendMessageData(
 					continue;
 				} else if (ret < 0) {
 					// Fatal error
-					LOG(ERROR) << "Error sending data: " << strerror(errno) 
+					LOG(ERROR) << "Error sending data: " << strerror(errno)
 						<< ", to_send: " << to_send;
 					return false;
 				}
@@ -800,9 +800,9 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 				do {
 					retry = false;
 					ssize_t bytes_sent = send(
-							ack_fd, 
-							(char*)&broker_id_ + acked_size, 
-							sizeof(broker_id_) - acked_size, 
+							ack_fd,
+							(char*)&broker_id_ + acked_size,
+							sizeof(broker_id_) - acked_size,
 							0);
 
 					if (bytes_sent < 0) {
@@ -829,9 +829,22 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 	} // end of send loop
 
 	size_t next_to_ack_offset = 0;
+	auto last_log_time = std::chrono::steady_clock::now();
 
 	while (!stop_threads_) {
 		size_t ack = GetOffsetToAck(topic, ack_level);
+		auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
+			LOG(INFO) << "Broker:" << broker_id_ << " Acknowledgments " << ack;
+	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+	int replication_factor = tinode->replication_factor;
+		for (int i = 0; i < replication_factor; i++) {
+			int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
+			LOG(INFO) <<"\t done:" <<  tinode->offsets[b].replication_done[broker_id_];
+		}
+			last_log_time = now;
+		}
+
 		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
 			next_to_ack_offset = ack + 1;
 			acked_size = 0;
@@ -845,9 +858,9 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 						do {
 							retry = false;
 							ssize_t bytes_sent = send(
-									ack_fd, 
-									(char*)&ack + acked_size, 
-									sizeof(ack) - acked_size, 
+									ack_fd,
+									(char*)&ack + acked_size,
+									sizeof(ack) - acked_size,
 									0);
 
 							if (bytes_sent < 0) {
