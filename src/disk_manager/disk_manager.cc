@@ -163,14 +163,26 @@ namespace Embarcadero{
 			corfu_replication_manager_->Shutdown();
 			return;
 		}
-		while(!stop_threads_){
-			std::optional<MemcpyRequest> optReq;
-			copyQueue_.blockingRead(optReq);
-			if(!optReq.has_value()){
-				return;
+		if(log_to_memory_){
+			while(!stop_threads_){
+				std::optional<MemcpyRequest> optReq;
+				copyQueue_.blockingRead(optReq);
+				if(!optReq.has_value()){
+					return;
+				}
+				MemcpyRequest &req = optReq.value();
+				std::memcpy(req.addr, req.buf, req.len);
 			}
-			MemcpyRequest &req = optReq.value();
-			std::memcpy(req.addr, req.buf, req.len);
+		}else{
+			while(!stop_threads_){
+				std::optional<MemcpyRequest> optReq;
+				copyQueue_.blockingRead(optReq);
+				if(!optReq.has_value()){
+					return;
+				}
+				MemcpyRequest &req = optReq.value();
+				pwrite(req.fd, req.buf, req.offset, req.len);
+			}
 		}
 	}
 
@@ -225,43 +237,10 @@ namespace Embarcadero{
 
 		void *log_addr = nullptr;
 		size_t log_capacity = (1UL<<30);
-		int map_fd = -1;
+		int fd = req.fd;
 
 		if(log_to_memory_){
 			log_addr = mi_malloc(log_capacity);
-		}else{
-			// Disk path: Memory map the file
-			map_fd = req.fd; // Use the fd passed in the request
-
-			// Set the initial file size
-			if (ftruncate(map_fd, log_capacity) == -1) {
-				LOG(ERROR) << "Failed to truncate log file for broker " << broker_id_
-					<< ", replication target " << req.broker_id << ": " << strerror(errno);
-				close(map_fd); // Close the file descriptor
-											 // Cleanup and exit thread
-				thread_count_.fetch_sub(1);
-				num_active_threads_.fetch_sub(1);
-				return; // Exit thread
-			}
-
-			// Map the file into memory
-			log_addr = mmap(NULL,                 // Let the kernel choose the address
-					log_capacity,         // Map the truncated size
-					PROT_READ | PROT_WRITE, // Allow reading and writing
-					MAP_SHARED,           // Changes are shared with the file
-					map_fd,               // File descriptor to map
-					0);                   // Offset within the file
-
-			if (log_addr == MAP_FAILED) {
-				LOG(ERROR) << "Failed to mmap log file for broker " << broker_id_
-					<< ", replication target " << req.broker_id << ": " << strerror(errno);
-				log_addr = nullptr; // Ensure log_addr is null on failure
-				close(map_fd);      // Close the file descriptor
-														// Cleanup and exit thread
-				thread_count_.fetch_sub(1);
-				num_active_threads_.fetch_sub(1);
-				return; // Exit thread
-			}
 		}
 
 		// Common variables for both memory and disk paths
@@ -274,6 +253,7 @@ namespace Embarcadero{
 		TInode* replica_tinode = req.replica_tinode;
 		bool replicate_tinode = req.tinode->replicate_tinode;
 		size_t offset = 0;
+		size_t disk_offset = 0;
 
 		while (!stop_threads_) {
 			// GetMessageAddr is not thread-safe, so it remains the serialization point
@@ -295,16 +275,23 @@ namespace Embarcadero{
 						}
 						req.addr = (void*)((uint8_t*)log + offset);
 						req.buf = (void*)((uint8_t*)messages + offset);
+						req.fd = fd;
+						req.offset = disk_offset;
 						copyQueue_.blockingWrite(req);
 
 						offset += req.len;
+						disk_offset += req.len;
 						messages_size -= req.len;
 						remaining -= req.len;
 					}
 				}
-				uint8_t* message_ptr = static_cast<uint8_t*>(messages);
-				memcpy(message_ptr + offset, messages, messages_size);
+				if(log_to_memory_){
+					memcpy((uint8_t*)log_addr + offset, messages, messages_size);
+				}else{
+					pwrite(fd, messages, disk_offset, messages_size);
+				}
 				offset = 0;
+				disk_offset += messages_size;
 				if(replicate_tinode){
 					replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = last_replicated_offset;
 				}
@@ -324,15 +311,8 @@ namespace Embarcadero{
 				if (msync(log_addr, current_offset, MS_SYNC) == -1) {
 					LOG(ERROR) << "Failed to msync log file for target " << req.broker_id << ": " << strerror(errno);
 				}
-				VLOG(2) << "[ReplicateThread " << req.broker_id << "]: Unmapping file.";
-				if (munmap(log_addr, log_capacity) == -1) {
-					LOG(ERROR) << "Failed to munmap log file for target " << req.broker_id << ": " << strerror(errno);
-				}
 			}
-			if (map_fd != -1) {
-				VLOG(2) << "[ReplicateThread " << req.broker_id << "]: Closing file descriptor.";
-				close(map_fd);
-			}
+			close(fd);
 		} else {
 			// Memory path cleanup
 			if (log_addr != nullptr) {
