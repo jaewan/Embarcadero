@@ -233,12 +233,16 @@ namespace Corfu {
 
 	CorfuReplicationManager::CorfuReplicationManager(
 			int broker_id,
+			bool log_to_memory,
 			const std::string& address,
 			const std::string& port,
 			const std::string& log_file) {
 		try {
 			int disk_to_write = broker_id % NUM_DISKS ;
 			std::string base_dir = "../../.Replication/disk" + std::to_string(disk_to_write) + "/";
+			if(log_to_memory){
+				base_dir = "/tmp/";
+			}
 			std::string base_filename = log_file.empty() ? base_dir+"corfu_replication_log"+std::to_string(broker_id) +".dat" : log_file;
 			service_ = std::make_unique<CorfuReplicationServiceImpl>(base_filename);
 
