@@ -27,6 +27,8 @@ struct MemcpyRequest{
     void* addr;
     void* buf;
     size_t len;
+		int fd;
+		size_t offset;
 };
 
 class DiskManager{
