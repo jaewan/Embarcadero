@@ -100,6 +100,7 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 					// Update all entries in last_sent_global_cut_[entry.first]
 					for (const auto& replica_entry : entry.second) {
 						last_sent_global_cut_[entry.first][replica_entry.first] = logical_offsets_[entry.first][min_entry->first];
+						global_cut_[entry.first][replica_entry.first] = global_cut_[entry.first][replica_entry.first] - min_entry->second;
 					}
 				}
 			}
