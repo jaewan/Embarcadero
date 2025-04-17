@@ -434,7 +434,6 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 
 	size_t num_brokers = 4;
-
 	if (steady_rate) {
 		LOG(WARNING) << "Using steady rate mode, this works best with 4 brokers";
 	}
@@ -478,30 +477,33 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 
 		// Publish messages with timestamps
 		size_t sent_bytes = 0;
-		size_t num_batch = num_brokers * num_threads_per_broker;
 		for (size_t i = 0; i < n; i++) {
 
-			// Capture current timestamp and embed it in the message
-			auto timestamp = std::chrono::steady_clock::now();
-			long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
-					timestamp.time_since_epoch()).count();
+			// If using steady rate, pause periodically
+			if (steady_rate && (sent_bytes >= (BATCH_SIZE*10))) {
+				std::this_thread::sleep_for(std::chrono::nanoseconds(1000));
+				sent_bytes = 0;
+				// Capture current timestamp and embed it in the message
+				auto timestamp = std::chrono::steady_clock::now();
+				long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
+						timestamp.time_since_epoch()).count();
 
-			// First part of message contains the timestamp
-			memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
+				// First part of message contains the timestamp
+				memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
+			}else{
+				// Capture current timestamp and embed it in the message
+				auto timestamp = std::chrono::steady_clock::now();
+				long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
+						timestamp.time_since_epoch()).count();
+
+				// First part of message contains the timestamp
+				memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
+			}
 
 			// Send the message
 			p.Publish(message, message_size);
 
 			sent_bytes += paddedMsgSizeWithHeader;
-			// If using steady rate, pause periodically
-			if (steady_rate && (sent_bytes >= BATCH_SIZE)) {
-				sent_bytes = 0;
-				num_batch--;
-				if(num_batch == 0){
-					std::this_thread::sleep_for(std::chrono::nanoseconds(10000));
-					num_batch = num_brokers * num_threads_per_broker;
-				}
-			}
 		}
 
 		// Finalize publishing
