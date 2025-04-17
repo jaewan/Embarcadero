@@ -6,7 +6,7 @@ NUM_BROKERS=4
 NUM_TRIALS=3
 test_cases=(5)
 #msg_sizes=(128 256 512 1024 4096 16384 65536 262144 1048576)
-msg_sizes=(128)
+msg_sizes=(128 256)
 REMOTE_IP="192.168.60.173"
 REMOTE_USER="domin"
 PASSLESS_ENTRY="~/.ssh/id_rsa"
@@ -89,12 +89,12 @@ for config in "${configs[@]}"; do
 			fi
 
           # Start the processes
-          start_process "./embarlet --head --$sequencer"
+          start_process "./embarlet --head --$sequencer --replicate_to_disk"
           wait_for_signal
           head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
           sleep 3
           for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-            start_process "./embarlet --$sequencer"
+            start_process "./embarlet --$sequencer --replicate_to_disk"
             wait_for_signal
           done
           sleep 5

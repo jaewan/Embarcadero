@@ -13,8 +13,8 @@ REMOTE_PID_FILE="/tmp/remote_seq.pid"
 
 # Define the configurations
 declare -a configs=(
-  "orders=(4); ack=1; sequencer=EMBARCADERO"
-  "orders=(2); ack=1; sequencer=CORFU"
+  "orders=(4); ack=2; sequencer=EMBARCADERO"
+  "orders=(2); ack=2; sequencer=CORFU"
   "orders=(1); ack=1; sequencer=SCALOG"
 )
 
@@ -58,7 +58,7 @@ stop_remote_sequencer() {
 EOF
 }
 
-# Run each configuration
+# Run each configuration steady
 for config in "${configs[@]}"; do
   echo "============================================================"
   echo "Running configuration: $config"
@@ -91,12 +91,12 @@ for order in "${orders[@]}"; do
   head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
   sleep 3
   for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-	start_process "./embarlet"
+	start_process "./embarlet --$sequencer"
 	wait_for_signal
   done
   sleep 3
 
-  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack --sequencer $sequencer"
+  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -r 1 --steady_rate"
 
   # Wait for all processes to finish
   for pid in "${pids[@]}"; do
@@ -113,7 +113,69 @@ for order in "${orders[@]}"; do
   sleep 3
 
   #python3 ../../scripts/plot/plot_latency.py cdf_latency_us.csv ../../data/latency/${sequencer}_latency
-  mv cdf_latency_us.csv ../../data/latency/${sequencer}_latency.csv
+  mv cdf_latency_us.csv ../../data/latency/steady/${sequencer}_latency.csv
+  mv latency_stats.csv ../../data/latency/steady/${sequencer}_latency_stats.csv
+  done
+done
+
+
+# Bursty
+for config in "${configs[@]}"; do
+  echo "============================================================"
+  echo "Running configuration: $config"
+  echo "============================================================"
+
+  # Evaluate the configuration string to set variables
+  eval "$config"
+
+  # Array to store process IDs
+  pids=()
+
+  rm -f script_signal_pipe
+  mkfifo script_signal_pipe
+
+  # Run experiments for each message size
+for order in "${orders[@]}"; do
+  for msg_size in "${msg_sizes[@]}"; do
+  echo "Running trial $trial with message size $msg_size | Order: $order | Ack: $ack | Sequencer: $sequencer"
+
+  # Start remote sequencer if needed
+	if [[ "$sequencer" == "CORFU" ]]; then
+	  start_remote_sequencer "corfu_global_sequencer"
+	elif [[ "$sequencer" == "SCALOG" ]]; then
+	  start_remote_sequencer "scalog_global_sequencer"
+	fi
+
+  # Start the processes
+  start_process "./embarlet --head --$sequencer"
+  wait_for_signal
+  head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
+  sleep 3
+  for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
+	start_process "./embarlet --$sequencer"
+	wait_for_signal
+  done
+  sleep 3
+
+  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -r 1"
+
+  # Wait for all processes to finish
+  for pid in "${pids[@]}"; do
+	wait $pid
+	echo "Process with PID $pid finished"
+  done
+
+  echo "All processes have finished for trial $trial with message size $msg_size"
+  pids=()  # Clear the pids array for the next trial
+  # Stop remote process after each trial
+  if [[ "$sequencer" == "CORFU" || "$sequencer" == "SCALOG" ]]; then
+	  stop_remote_sequencer
+  fi
+  sleep 3
+
+  #python3 ../../scripts/plot/plot_latency.py cdf_latency_us.csv ../../data/latency/${sequencer}_latency
+  mv cdf_latency_us.csv ../../data/latency/bursty/${sequencer}_latency.csv
+  mv latency_stats.csv ../../data/latency/bursty/${sequencer}_latency_stats.csv
   done
 done
 
@@ -123,6 +185,6 @@ done
 
 popd
 pushd ../data/latency/
-python3 ../../scripts/plot/plot_latency.py EMBARCADERO_latency.csv CORFU_latency.csv SCALOG_latency.csv latency
+python3 plot_latency.py latency
 
 echo "All experiments have finished."

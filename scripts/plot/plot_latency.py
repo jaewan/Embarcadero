@@ -2,7 +2,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import argparse
-import os # To help generate labels from filenames
+import os
+import matplotlib.ticker as mticker # Import the ticker module
+# from matplotlib.ticker import FuncFormatter # No longer needed
 
 # --- Configuration (Plot appearance settings) ---
 FIGURE_WIDTH_INCHES = 6
@@ -10,148 +12,182 @@ FIGURE_HEIGHT_INCHES = 4
 TITLE_FONTSIZE = 14
 LABEL_FONTSIZE = 12
 TICKS_FONTSIZE = 10
-LEGEND_FONTSIZE = 10 # Font size for the legend
+LEGEND_FONTSIZE = 9 # Slightly smaller legend font if needed for 6 entries
+LEGEND_COLUMNS = 2 # Arrange legend in columns if needed
 LINE_WIDTH = 1.5
 GRID_ALPHA = 0.6
 GRID_LINESTYLE = '--'
 
-# --- Plotting Function (Modified for multiple CDFs) ---
+# --- System and Rate Definitions ---
+# Define the systems and their corresponding base filenames
+SYSTEMS = {
+    "Corfu": "CORFU_latency.csv",
+    "Embarcadero": "EMBARCADERO_latency.csv",
+    "Scalog": "SCALOG_latency.csv"
+}
 
-def plot_multiple_latency_cdfs(csv_filenames, labels, output_prefix):
+# Define the rates, their directories, and the desired linestyles
+RATES = {
+    "Steady": {'dir': 'steady', 'linestyle': '-'}, # Solid line for steady
+    "Bursty": {'dir': 'bursty', 'linestyle': '--'}  # Dashed line for bursty
+}
+
+# Define consistent colors for each system
+SYSTEM_COLORS = {
+    "Corfu": "tab:blue",
+    "Embarcadero": "tab:orange",
+    "Scalog": "tab:green"
+}
+
+
+# --- Plotting Function (Modified for merged steady/bursty) ---
+
+def plot_merged_latency_cdfs(output_prefix):
     """
-    Reads latency CDF data from multiple CSV files and generates a single
-    publication-quality plot comparing them. Axes limits adjust to data.
+    Reads latency CDF data for multiple systems under steady and bursty rates
+    from predefined directories and generates a single merged plot.
+
+    Assumes data files are located like:
+    ./steady/CORFU_latency.csv
+    ./bursty/CORFU_latency.csv
+    ./steady/EMBARCADERO_latency.csv
+    etc.
 
     Args:
-        csv_filenames (list): A list of paths to the input CSV files.
-                              Each file expected columns: 'Latency_us', 'CumulativeProbability'
-        labels (list): A list of labels for the legend, corresponding to each csv_filename.
         output_prefix (str): Prefix for the output plot files (e.g., 'comparison_cdf').
-                               Generates PREFIX.pdf
+                               Generates PREFIX.pdf and PREFIX.png.
     """
-    if len(csv_filenames) != len(labels):
-        raise ValueError("Number of CSV files must match number of labels.")
 
     # --- Create the Plot Figure and Axes ---
     plt.figure(figsize=(FIGURE_WIDTH_INCHES, FIGURE_HEIGHT_INCHES))
 
-    # --- Plot each CDF ---
-    # Matplotlib will automatically cycle through colors.
-    all_data_plotted = False # Track if at least one dataset was plotted
+    # Variables to track overall latency range across all files
+    min_overall_latency = float('inf')
+    max_overall_latency = float('-inf')
+    plotted_anything = False # Flag to track if at least one curve was plotted
 
-    for i, (csv_filename, label) in enumerate(zip(csv_filenames, labels)):
-        try:
-            # Read the data using pandas
-            data = pd.read_csv(csv_filename)
-            print(f"Reading data for '{label}' from {csv_filename}...")
+    # --- Plot each system and rate ---
+    for rate_name, rate_info in RATES.items():         # New outer loop
+        for system_name, base_filename in SYSTEMS.items():
 
-            # Validate expected columns
-            if 'Latency_us' not in data.columns or 'CumulativeProbability' not in data.columns:
-                print(f"Warning: Skipping {csv_filename}. Missing required columns ('Latency_us', 'CumulativeProbability').")
-                continue # Skip this file
+            csv_filename = os.path.join(rate_info['dir'], base_filename)
+            legend_label = f"{system_name} ({rate_name})"
+            linestyle = rate_info['linestyle']
+            color = SYSTEM_COLORS.get(system_name, None) # Get color or None
 
-            latency_us = data['Latency_us']
-            probability = data['CumulativeProbability']
+            try:
+                # Read the data using pandas
+                data = pd.read_csv(csv_filename)
+                print(f"Reading data for '{legend_label}' from {csv_filename}...")
 
-            # Filter out potential non-positive values for log scale if necessary
-            # (Though latency should ideally be > 0)
-            valid_data = data[latency_us > 0]
-            if len(valid_data) < len(data):
-                print(f"Warning: Filtered out {len(data) - len(valid_data)} non-positive latency values for '{label}'.")
+                # Validate expected columns
+                if 'Latency_us' not in data.columns or 'CumulativeProbability' not in data.columns:
+                    print(f"Warning: Skipping {csv_filename}. Missing required columns ('Latency_us', 'CumulativeProbability').")
+                    continue # Skip this file/rate combination
 
-            if len(valid_data) == 0:
-                 print(f"Warning: No positive latency data to plot for '{label}'. Skipping.")
-                 continue
+                latency_us = data['Latency_us']
+                probability = data['CumulativeProbability']
 
+                # --- Plot this specific CDF ---
+                plt.plot(latency_us, probability,
+                         linewidth=LINE_WIDTH,
+                         label=legend_label,
+                         color=color,          # Use system color
+                         linestyle=linestyle)  # Use rate linestyle
 
-            # Plot this CDF data with its label
-            plt.plot(
-                valid_data['Latency_us'],
-                valid_data['CumulativeProbability'],
-                linewidth=LINE_WIDTH,
-                label=label
-            )
-            all_data_plotted = True # Mark that we plotted something
+                plotted_anything = True # Mark that we have plotted at least one line
 
-            # --- Removed min/max tracking - matplotlib will handle limits ---
+                # Update overall min/max latency (considering only positive latency for log scale)
+                current_min = latency_us[latency_us > 0].min() if (latency_us > 0).any() else float('inf')
+                current_max = latency_us.max()
+                min_overall_latency = min(min_overall_latency, current_min)
+                max_overall_latency = max(max_overall_latency, current_max)
 
-        except FileNotFoundError:
-            print(f"Error: Input CSV file not found at '{csv_filename}'. Skipping this file.")
-        except Exception as e:
-            print(f"An error occurred processing {csv_filename}: {e}. Skipping this file.")
+            except FileNotFoundError:
+                print(f"Warning: Input CSV file not found at '{csv_filename}'. Skipping this entry.")
+                # Continue processing other files/rates
+            except Exception as e:
+                print(f"An error occurred processing {csv_filename}: {e}. Skipping this entry.")
+                # Continue processing other files/rates
+
 
     # --- Check if any data was actually plotted ---
-    if not all_data_plotted:
-        print("Error: No valid data could be plotted from the provided files.")
-        plt.close() # Close the empty figure
-        return
+    if not plotted_anything:
+          print("Error: No valid data could be plotted from any files.")
+          plt.close() # Close the empty figure
+          return
 
     # --- Customize Appearance (after all lines are plotted) ---
     plt.xscale('log')
-    plt.xlabel("Latency (microseconds)", fontsize=LABEL_FONTSIZE)
+
+    # Use r'$\mu s$' for the microsecond symbol
+    plt.xlabel(r'Latency ($\mu s$, log scale)', fontsize=LABEL_FONTSIZE)
+
     plt.ylabel("Cumulative Probability (CDF)", fontsize=LABEL_FONTSIZE)
-    plt.title("Comparison of End-to-End Latency CDFs", fontsize=TITLE_FONTSIZE) # Adjust title
+    # plt.title("Latency CDF Comparison: Steady vs. Bursty Rate", fontsize=TITLE_FONTSIZE) # Optional title
+    plt.ylim(0, 1.05)
 
-    # Set Y limits appropriate for CDF (0 to 1)
-    # Give slight padding above 1.0 for visual clarity
-    plt.ylim(0, 1.01)
+    # Set X limits based on the overall range found (ensure min is positive for log)
+    safe_min_latency = max(min_overall_latency, 1e-1) # Avoid zero or negative for log limit
+    #plt.xlim(left=safe_min_latency * 0.8, right=max_overall_latency * 1.2)
+    plt.xlim(left=1e5, right=max_overall_latency * 1.2)
 
-    # --- REMOVED explicit plt.xlim() ---
-    # Let matplotlib determine the X limits automatically based on the plotted data range.
-    # It usually does a good job, especially with log scale.
+    # --- Explicit Tick Control for Log Scale ---
+    ax = plt.gca() # Get the current axes
+
+    # Set major ticks at powers of 10 (1, 10, 100, 1000...)
+    ax.xaxis.set_major_locator(mticker.LogLocator(base=10.0, subs=(1.0,)))
+
+    # Use LogFormatterMathtext to display powers of 10 (e.g., 10^3, 10^6)
+    ax.xaxis.set_major_formatter(mticker.LogFormatterMathtext(base=10.0))
+
+    # Minor ticks setup remains the same
+    ax.xaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=np.arange(2, 10) * .1))
+    ax.xaxis.set_minor_formatter(mticker.NullFormatter()) # No labels on minor ticks
+
+    # --- End Explicit Tick Control ---
 
     plt.xticks(fontsize=TICKS_FONTSIZE)
     plt.yticks(fontsize=TICKS_FONTSIZE)
+
+    # Grid setup remains the same
     plt.grid(True, which='major', linestyle=GRID_LINESTYLE, alpha=GRID_ALPHA)
-    # Optional: Add minor grid lines for log scale if desired
-    # plt.grid(True, which='minor', linestyle=GRID_LINESTYLE, alpha=GRID_ALPHA*0.5)
+    plt.grid(True, which='minor', linestyle=':', alpha=GRID_ALPHA * 0.5)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97]) # Adjust layout slightly if title is used or legend is large
 
     # --- Add Legend ---
-    plt.legend(fontsize=LEGEND_FONTSIZE, loc='best') # 'loc' controls position
-
-    # Adjust layout to prevent labels overlapping
-    plt.tight_layout()
+    # May need multiple columns if 6 entries make it too tall
+    plt.legend(fontsize=LEGEND_FONTSIZE, loc='best', ncol=LEGEND_COLUMNS)
 
     # --- Save the Plot ---
     pdf_filename = output_prefix + ".pdf"
+    png_filename = output_prefix + ".png"
 
     try:
         plt.savefig(pdf_filename, dpi=300, bbox_inches='tight')
-        print(f"Combined plot saved successfully to {pdf_filename}")
+        plt.savefig(png_filename, dpi=300, bbox_inches='tight')
+        print(f"Merged plot saved successfully to {pdf_filename} and {png_filename}")
     except Exception as e:
          print(f"Error saving plot files: {e}")
 
     # --- Close the plot figure ---
     plt.close()
 
-    # --- Display the Plot (Optional, commented out) ---
-    # plt.show()
-
 
 # --- Main execution block ---
 if __name__ == "__main__":
     # Set up argument parser
     parser = argparse.ArgumentParser(
-        description="Generate a single publication-quality plot comparing 3 latency CDFs.",
+        description="Generate a single plot comparing latency CDFs for multiple systems under steady and bursty rates.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Define command-line arguments (now 4 positional)
-    parser.add_argument("input_csv1", help="Path to the first input CSV file.")
-    parser.add_argument("input_csv2", help="Path to the second input CSV file.")
-    parser.add_argument("input_csv3", help="Path to the third input CSV file.")
-    parser.add_argument("output_prefix", help="Prefix for the output plot files (e.g., 'comparison_cdf').")
+    # Define command-line arguments (only output prefix needed now)
+    parser.add_argument("output_prefix", help="Prefix for the output plot files (e.g., 'rate_comparison_cdf').")
 
     # Parse arguments from the command line
     args = parser.parse_args()
 
-    # Create list of input files
-    input_files = [args.input_csv1, args.input_csv2, args.input_csv3]
-
-    # Generate labels for the legend (using filename without path/extension)
-    # You can customize this logic or pass labels explicitly if needed
-    labels = [os.path.basename(f).rsplit('.', 1)[0] for f in input_files]
-    print(f"Using labels for legend: {labels}")
-
-    # Run the plotting function with the provided arguments
-    plot_multiple_latency_cdfs(input_files, labels, args.output_prefix)
+    # Run the plotting function
+    plot_merged_latency_cdfs(args.output_prefix)

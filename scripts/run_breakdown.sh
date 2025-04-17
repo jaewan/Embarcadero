@@ -11,15 +11,17 @@ PASSLESS_ENTRY="~/.ssh/id_rsa"
 REMOTE_BIN_DIR="~/Jae/Embarcadero/build/bin"
 REMOTE_PID_FILE="/tmp/remote_seq.pid"
 
+echo -e "\e[31mYou must recompile Embarcadero with NUM_MAX_BROKERS 1 in both Emb and sequencer.\e[0m"
+
 # Define the configurations
 declare -a configs=(
-  "orders=(0); replication=0; sequencer=EMBARCADERO"
-  "orders=(4); replication=0; sequencer=EMBARCADERO"
-  "orders=(4); replication=1; sequencer=EMBARCADERO"
-  "orders=(2); replication=0; sequencer=CORFU"
-  "orders=(2); replication=1; sequencer=CORFU"
-  "orders=(1); replication=0; sequencer=SCALOG"
-  "orders=(1); replication=1; sequencer=SCALOG"
+  #"orders=(0); replication=0; ack=0; sequencer=EMBARCADERO"
+  #"orders=(4); replication=0; ack=0; sequencer=EMBARCADERO"
+  #"orders=(4); replication=1; ack=1; sequencer=EMBARCADERO"
+  #"orders=(2); replication=0; ack=0; sequencer=CORFU"
+  #"orders=(2); replication=1; ack=1; sequencer=CORFU"
+  "orders=(1); replication=0; ack=0; sequencer=SCALOG"
+  "orders=(1); replication=1; ack=1; sequencer=SCALOG"
 )
 
 wait_for_signal() {
@@ -80,7 +82,7 @@ for config in "${configs[@]}"; do
   # Run experiments for each message size
 for order in "${orders[@]}"; do
   for msg_size in "${msg_sizes[@]}"; do
-  echo "Running trial $trial with message size $msg_size | Order: $order | Replication: $replication | Sequencer: $sequencer"
+  echo "Running trial $trial with message size $msg_size | Order: $order | Replication: $replication | AckLevel: $ack | Sequencer: $sequencer"
 
   # Start remote sequencer if needed
 	if [[ "$sequencer" == "CORFU" ]]; then
@@ -95,12 +97,12 @@ for order in "${orders[@]}"; do
   head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
   sleep 3
   for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-	start_process "./embarlet"
+	start_process "./embarlet --$sequencer"
 	wait_for_signal
   done
   sleep 3
 
-  start_process "./throughput_test -m $msg_size -t $test_case -o $order -r $replication --sequencer $sequencer --steady_rate"
+  start_process "./throughput_test -m $msg_size -t $test_case -o $order -r $replication --sequencer $sequencer -a $ack"
 
   # Wait for all processes to finish
   for pid in "${pids[@]}"; do
