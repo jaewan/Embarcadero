@@ -199,6 +199,7 @@ class Topic {
 		int broker_id_;
 		struct MessageHeader* last_message_header_;
 		int order_;
+		int ack_level_;
 		heartbeat_system::SequencerType seq_type_;
 		void* cxl_addr_;
 
@@ -282,6 +283,7 @@ class TopicManager {
 				int order,
 				int replication_factor,
 				bool replicate_tinode,
+				int ack_level,
 				heartbeat_system::SequencerType seq_type);
 
 		/**
@@ -354,6 +356,7 @@ class TopicManager {
 				int order,
 				int replication_factor,
 				bool replicate_tinode,
+				int ack_level,
 				heartbeat_system::SequencerType seq_type);
 
 		/**

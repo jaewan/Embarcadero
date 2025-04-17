@@ -157,6 +157,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		int order,
 		int replication_factor,
 		bool replicate_tinode,
+		int ack_level,
 		SequencerType seq_type) {
 
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
@@ -192,6 +193,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		InitializeTInodeOffsets(tinode, segment_metadata, batch_headers_region, cxl_addr);
 		tinode->order = order;
 		tinode->replication_factor = replication_factor;
+		tinode->ack_level = ack_level;
 		tinode->replicate_tinode = replicate_tinode;
 		tinode->seq_type = seq_type;
 		memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
@@ -220,6 +222,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 					batch_headers_region, cxl_addr);
 			replica_tinode->order = order;
 			replica_tinode->replication_factor = replication_factor;
+			replica_tinode->ack_level = ack_level;
 			replica_tinode->replicate_tinode = replicate_tinode;
 			replica_tinode->seq_type = seq_type;
 			memcpy(replica_tinode->topic, replica_topic, TOPIC_NAME_SIZE);
@@ -258,10 +261,11 @@ bool TopicManager::CreateNewTopic(
         int order, 
         int replication_factor, 
         bool replicate_tinode, 
+				int ack_level,
         SequencerType seq_type) {
     
     TInode* tinode = CreateNewTopicInternal(
-        topic, order, replication_factor, replicate_tinode, seq_type);
+        topic, order, replication_factor, replicate_tinode, ack_level, seq_type);
         
     if (tinode) {
         if (tinode->seq_type == SCALOG && replication_factor > 0) {
@@ -370,6 +374,7 @@ Topic::Topic(
 		first_batch_headers_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) + 
 			tinode_->offsets[broker_id_].batch_headers_offset;
 
+		ack_level_ = tinode_->ack_level;
 		replication_factor_ = tinode_->replication_factor;
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
@@ -812,6 +817,26 @@ bool Topic::GetMessageAddr(
 		combined_offset = tinode_->offsets[broker_id_].ordered;
 		combined_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + 
 			tinode_->offsets[broker_id_].ordered_offset;
+		if(ack_level_ == 2){
+			//TODO(Jae) make replication also write written amount in the replication_done
+			size_t r[replication_factor_];
+			size_t min = (size_t)-1;
+			for (int i = 0; i < replication_factor_; i++) {
+				int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
+				r[i] = tinode_->offsets[b].replication_done[broker_id_];
+				if (min > r[i]) {
+					min = r[i];
+				}
+			}
+			if(min == (size_t)-1){
+				return false;
+			}
+			if(combined_offset != min){
+				combined_addr = reinterpret_cast<uint8_t*>(combined_addr) -
+		(reinterpret_cast<MessageHeader*>(combined_addr)->paddedSize * (combined_offset-min));
+				combined_offset = min;
+			}
+		}
 	} else {
 		combined_offset = written_logical_offset_;
 		combined_addr = written_physical_addr_;

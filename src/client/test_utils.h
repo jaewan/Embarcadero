@@ -49,19 +49,6 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char topic[TOPIC_NAME_SIZE]);
 
 /**
- * Creates a new topic
- * @param stub gRPC stub
- * @param topic Topic name
- * @param order Order level
- * @param seq_type Sequencer type
- * @param replication_factor Replication factor
- * @param replicate_tinode Whether to replicate tinode
- * @return true if successful, false otherwise
- */
-bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE], 
-                   int order, SequencerType seq_type, int replication_factor, bool replicate_tinode);
-
-/**
  * Kills a number of brokers
  * @param stub gRPC stub
  * @param num_brokers Number of brokers to kill

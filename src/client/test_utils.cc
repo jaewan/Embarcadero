@@ -542,43 +542,6 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	}
 }
 
-bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE], 
-		int order, SequencerType seq_type, int replication_factor, bool replicate_tinode) {
-	// Prepare request
-	grpc::ClientContext context;
-	heartbeat_system::CreateTopicRequest create_topic_req;
-	heartbeat_system::CreateTopicResponse create_topic_reply;
-
-	// Set request fields
-	create_topic_req.set_topic(topic);
-
-	// Special handling for Corfu sequencer
-	if (seq_type == SequencerType::CORFU) {
-		create_topic_req.set_order(0);
-	} else {
-		create_topic_req.set_order(order);
-	}
-
-	create_topic_req.set_replication_factor(replication_factor);
-	create_topic_req.set_replicate_tinode(replicate_tinode);
-	create_topic_req.set_sequencer_type(seq_type);
-
-	// Send request
-	grpc::Status status = stub->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
-
-	if (!status.ok()) {
-		LOG(ERROR) << "Failed to create topic: " << status.error_message();
-		return false;
-	}
-
-	if (!create_topic_reply.success()) {
-		LOG(ERROR) << "Server returned failure when creating topic";
-		return false;
-	}
-
-	return true;
-}
-
 bool KillBrokers(std::unique_ptr<HeartBeat::Stub>& stub, int num_brokers) {
 	LOG(INFO) << "Requesting to kill " << num_brokers << " brokers";
 

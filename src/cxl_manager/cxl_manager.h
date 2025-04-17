@@ -61,7 +61,8 @@ struct alignas(64) TInode{
 		char topic[TOPIC_NAME_SIZE];
 		volatile bool replicate_tinode = false;
 		volatile int order;
-		volatile int replication_factor;
+		volatile int32_t replication_factor;
+		volatile int32_t ack_level;
 		SequencerType seq_type;
 	}__attribute__((aligned(64)));
 

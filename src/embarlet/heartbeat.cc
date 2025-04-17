@@ -336,6 +336,7 @@ grpc::Status HeartBeatServiceImpl::CreateNewTopic(
 			static_cast<int>(request->order()),
 			static_cast<int>(request->replication_factor()),
 			static_cast<bool>(request->replicate_tinode()),
+			static_cast<int>(request->ack_level()),
 			request->sequencer_type()
 			);
 

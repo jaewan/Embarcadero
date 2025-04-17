@@ -50,6 +50,7 @@ int main(int argc, char* argv[]) {
     int num_brokers_to_kill = result["num_brokers_to_kill"].as<int>();
     std::atomic<int> synchronizer{num_clients};
     int test_num = result["test_number"].as<int>();
+    int ack_level = result["ack_level"].as<int>();
     SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
     FLAGS_v = result["log_level"].as<int>();
     
@@ -100,7 +101,7 @@ int main(int argc, char* argv[]) {
     switch (test_num) {
         case 0: {
             // Publish and Subscribe test
-            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode, ack_level);
             LOG(INFO) << "Running Publish and Subscribe: " << total_message_size;
             double pub_bandwidthMb = PublishThroughputTest(result, topic, synchronizer);
             sleep(3);
@@ -112,7 +113,7 @@ int main(int argc, char* argv[]) {
         case 1: {
             // E2E Throughput test
             LOG(INFO) << "Running E2E Throughput";
-            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode, ack_level);
             std::pair<double, double> bandwidths = E2EThroughputTest(result, topic);
             writer.SetPubResult(bandwidths.first);
             writer.SetE2EResult(bandwidths.second);
@@ -121,7 +122,7 @@ int main(int argc, char* argv[]) {
         case 2: {
             // E2E Latency test
             LOG(INFO) << "Running E2E Latency Test";
-            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode, ack_level);
             std::pair<double, double> bandwidths = LatencyTest(result, topic);
             writer.SetPubResult(bandwidths.first);
             writer.SetSubResult(bandwidths.second);
@@ -131,7 +132,7 @@ int main(int argc, char* argv[]) {
             // Parallel Publish test
             LOG(INFO) << "Running Parallel Publish Test num_clients:" << num_clients 
                       << ":" << num_threads_per_broker;
-            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode, ack_level);
             std::vector<std::thread> threads;
             std::vector<std::promise<double>> promises(num_clients);
             std::vector<std::future<double>> futures;
@@ -193,7 +194,7 @@ int main(int argc, char* argv[]) {
                 return KillBrokers(stub, num_brokers_to_kill);
             };
             
-            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode, ack_level);
             double pub_bandwidthMb = FailurePublishThroughputTest(result, topic, killbrokers);
             writer.SetPubResult(pub_bandwidthMb);
             break;
@@ -201,7 +202,7 @@ int main(int argc, char* argv[]) {
         case 5: {
             // Publish-only test
             LOG(INFO) << "Running Publish : " << total_message_size;
-            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode);
+            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode, ack_level);
             double pub_bandwidthMb = PublishThroughputTest(result, topic, synchronizer);
             writer.SetPubResult(pub_bandwidthMb);
             break;
