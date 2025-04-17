@@ -186,6 +186,11 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
     return true;
 }
 
+void Buffer::Flush() {
+    // Set flag to indicate flushing is needed
+    is_flushing_ = true;
+}
+
 void* Buffer::Read(int bufIdx) {
     Embarcadero::BatchHeader* batch_header = 
         reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].reader_head);
@@ -195,7 +200,31 @@ void* Buffer::Read(int bufIdx) {
         // Valid batch found, update reader head and return batch
         bufs_[bufIdx].reader_head = batch_header->start_logical_offset;
         return static_cast<void*>(batch_header);
-    } else {
+    } else if(is_flushing_ && bufs_[bufIdx].num_msg > 0){
+			size_t head, tail, num_msg, batch_seq;
+        {
+            head = bufs_[bufIdx].writer_head;
+            tail = bufs_[bufIdx].tail;
+            num_msg = bufs_[bufIdx].num_msg;
+
+            // Reset for next batch
+            bufs_[bufIdx].reader_head = tail;
+            bufs_[bufIdx].writer_head = tail;
+            bufs_[bufIdx].tail = tail + sizeof(Embarcadero::BatchHeader);
+            bufs_[bufIdx].num_msg = 0;
+            batch_seq = batch_seq_.fetch_add(1);
+        }
+
+        // Create flush batch header
+        Embarcadero::BatchHeader* flush_batch_header =
+            reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[bufIdx].buffer + head);
+        flush_batch_header->batch_seq = batch_seq;
+        flush_batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
+        flush_batch_header->num_msg = num_msg;
+        flush_batch_header->start_logical_offset = tail;
+
+        return static_cast<void*>(flush_batch_header);
+		}else {
         // No valid batch yet, check if we need to wait
         if (!seal_from_read_) {
             bool seal_exist = true;

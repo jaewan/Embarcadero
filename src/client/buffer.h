@@ -78,6 +78,8 @@ public:
      */
     void WriteFinished();
 
+		void Flush();
+		void ResetFlush() { is_flushing_ = false; }
 private:
     /**
      * Buffer structure with cache line alignment
@@ -113,4 +115,6 @@ private:
      * Advances the write buffer ID
      */
     void AdvanceWriteBufId();
+
+		bool is_flushing_ = false;
 };
