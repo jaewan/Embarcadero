@@ -297,6 +297,15 @@ void Publisher::WriteFinished() {
 	pubQue_.WriteFinished();
 }
 
+void Publisher::Flush() {
+    // Signal to the queue that we need to flush messages
+    pubQue_.Flush();
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Reset the flush flag after all threads have had a chance to process
+    pubQue_.ResetFlush();
+}
+
 void Publisher::EpollAckThread() {
 	if (ack_level_ < 1) {
 		return;

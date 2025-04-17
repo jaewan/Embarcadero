@@ -97,6 +97,13 @@ class Publisher {
 			return client_id_;
 		}
 
+		void Flush();
+
+		/**
+		 * Signals that writing is finished
+		 */
+		void WriteFinished();
+
 	private:
 		std::string head_addr_;
 		std::string port_;
@@ -163,11 +170,6 @@ class Publisher {
 		std::vector<std::thread> threads_;
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
-
-		/**
-		 * Signals that writing is finished
-		 */
-		void WriteFinished();
 
 		/**
 		 * Thread for handling acknowledgements using epoll
