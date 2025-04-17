@@ -17,6 +17,44 @@ heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
     throw std::runtime_error("Invalid SequencerType: " + value);
 }
 
+bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE],
+		int order, SequencerType seq_type, int replication_factor, bool replicate_tinode, int ack_level) {
+	// Prepare request
+	grpc::ClientContext context;
+	heartbeat_system::CreateTopicRequest create_topic_req;
+	heartbeat_system::CreateTopicResponse create_topic_reply;
+
+	// Set request fields
+	create_topic_req.set_topic(topic);
+
+	// Special handling for Corfu sequencer
+	if (seq_type == SequencerType::CORFU) {
+		create_topic_req.set_order(0);
+	} else {
+		create_topic_req.set_order(order);
+	}
+
+	create_topic_req.set_replication_factor(replication_factor);
+	create_topic_req.set_replicate_tinode(replicate_tinode);
+	create_topic_req.set_sequencer_type(seq_type);
+	create_topic_req.set_ack_level(ack_level);
+
+	// Send request
+	grpc::Status status = stub->CreateNewTopic(&context, create_topic_req, &create_topic_reply);
+
+	if (!status.ok()) {
+		LOG(ERROR) << "Failed to create topic: " << status.error_message();
+		return false;
+	}
+
+	if (!create_topic_reply.success()) {
+		LOG(ERROR) << "Server returned failure when creating topic";
+		return false;
+	}
+
+	return true;
+}
+
 void RemoveNodeFromClientInfo(heartbeat_system::ClientInfo& client_info, int32_t node_to_remove) {
     auto* nodes_info = client_info.mutable_nodes_info();
     

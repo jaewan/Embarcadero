@@ -202,7 +202,7 @@ int main(int argc, char* argv[]) {
 	heartbeat_manager.RegisterCreateTopicEntryCallback(
 			std::bind(&Embarcadero::TopicManager::CreateNewTopic, &topic_manager,
 				std::placeholders::_1, std::placeholders::_2, std::placeholders::_3,
-				std::placeholders::_4, std::placeholders::_5));
+				std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
 
 	if (is_head_node) {
 		cxl_manager.RegisterGetRegisteredBrokersCallback(

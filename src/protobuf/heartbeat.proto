@@ -71,10 +71,11 @@ message KillBrokersResponse{
 
 message CreateTopicRequest {
 	string topic = 1;
-	int32 order = 2;
-	int32 replication_factor = 3;
-	bool replicate_tinode = 4;
-	SequencerType sequencer_type = 5;
+	bool replicate_tinode = 2;
+	int32 order = 3;
+	int32 replication_factor = 4;
+	int32 ack_level = 5;
+	SequencerType sequencer_type = 6;
 }
 
 message CreateTopicResponse {

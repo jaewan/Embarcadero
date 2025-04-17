@@ -64,6 +64,19 @@ struct msgIdx {
 };
 
 /**
+ * Creates a new topic
+ * @param stub gRPC stub
+ * @param topic Topic name
+ * @param order Order level
+ * @param seq_type Sequencer type
+ * @param replication_factor Replication factor
+ * @param replicate_tinode Whether to replicate tinode
+ * @return true if successful, false otherwise
+ */
+bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE], 
+                   int order, SequencerType seq_type, int replication_factor, bool replicate_tinode, int ack_level);
+
+/**
  * Removes a node from ClientInfo
  */
 void RemoveNodeFromClientInfo(heartbeat_system::ClientInfo& client_info, int32_t node_to_remove);
