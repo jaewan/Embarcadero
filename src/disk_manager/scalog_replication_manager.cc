@@ -492,7 +492,8 @@ namespace Scalog {
 				// Increment the epoch
 				local_epoch_++;
 
-				std::this_thread::sleep_for(std::chrono::milliseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL));
+				//std::this_thread::sleep_for(std::chrono::milliseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL));
+				std::this_thread::sleep_for(std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL));
 			}
 
 			// Signal server no more writes are coming
