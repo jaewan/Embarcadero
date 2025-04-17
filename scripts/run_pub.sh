@@ -5,8 +5,7 @@ pushd ../build/bin/
 NUM_BROKERS=4
 NUM_TRIALS=3
 test_cases=(5)
-#msg_sizes=(128 256 512 1024 4096 16384 65536 262144 1048576)
-msg_sizes=(128)
+msg_sizes=(128 256 512 1024 4096 16384 65536 262144 1048576)
 REMOTE_IP="192.168.60.173"
 REMOTE_USER="domin"
 PASSLESS_ENTRY="~/.ssh/id_rsa"
@@ -16,8 +15,8 @@ REMOTE_PID_FILE="/tmp/remote_seq.pid"
 # Define the configurations
 declare -a configs=(
   "order=(4); ack=2; sequencer=EMBARCADERO"
-  #"order=(2); ack=2; sequencer=CORFU"
-  #"order=(1); ack=1; sequencer=SCALOG"
+  "order=(2); ack=2; sequencer=CORFU"
+  "order=(1); ack=1; sequencer=SCALOG"
 )
 
 wait_for_signal() {
