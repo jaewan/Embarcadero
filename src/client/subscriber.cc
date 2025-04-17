@@ -845,7 +845,7 @@ void Subscriber::SubscribeToClusterStatus() {
 			VLOG(5) << "Cluster status stream finished cleanly. Re-establishing after delay...";
 			std::this_thread::sleep_for(std::chrono::seconds(5));
 		} else if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
-			LOG(WARNING) << "Cluster status stream deadline exceeded. Re-establishing...";
+			//LOG(WARNING) << "Cluster status stream deadline exceeded. Re-establishing...";
 			// No extra delay needed, loop will restart immediately
 		} else if (status.error_code() == grpc::StatusCode::CANCELLED) {
 			// This might happen if TryCancel was called due to shutdown flag
