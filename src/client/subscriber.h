@@ -20,7 +20,6 @@ struct BufferState {
 			buffer = nullptr;
 			throw std::runtime_error("Failed to mmap buffer");
 		}
-		VLOG(3) << "BufferState: Mapped buffer of size " << capacity << " at " << buffer;
 	}
 
 	~BufferState() {
@@ -68,11 +67,11 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 		buffer_capacity(cap_per_buffer),
 		buffers{BufferState(cap_per_buffer), BufferState(cap_per_buffer)} // Initialize buffers
 	{
-		VLOG(2) << "ConnectionBuffers created for fd=" << fd << ", broker=" << broker_id;
+		//VLOG(2) << "ConnectionBuffers created for fd=" << fd << ", broker=" << broker_id;
 	}
 
 	~ConnectionBuffers() {
-		VLOG(2) << "ConnectionBuffers destroyed for fd=" << fd;
+		//VLOG(2) << "ConnectionBuffers destroyed for fd=" << fd;
 		// Buffers get unmapped by BufferState destructor
 	}
 
@@ -172,6 +171,27 @@ class Subscriber {
 		// Initiate shutdown
 		void Shutdown();
 
+		// --- Buffer Management (part 1/2) ---
+		// It is here for DKVS
+		absl::Mutex connection_map_mutex_; // Protects the map itself
+		absl::flat_hash_map<int, std::shared_ptr<ConnectionBuffers>> connections_ ABSL_GUARDED_BY(connection_map_mutex_);
+
+		void WaitUntilAllConnected(){
+			size_t num_connections = 0;
+			size_t expected = NUM_MAX_BROKERS * NUM_SUB_CONNECTIONS;
+			while (num_connections < expected) {
+				{
+					absl::MutexLock map_lock(&connection_map_mutex_);
+					num_connections = connections_.size();
+				}
+				if(num_connections < expected){
+					std::this_thread::yield();
+				}else{
+					break;
+				}
+			}
+		}
+
 	private:
 		friend class ConnectionBuffers; // Allow access to members if needed
 
@@ -221,10 +241,8 @@ class Subscriber {
 		std::vector<ThreadInfo> worker_threads_ ABSL_GUARDED_BY(worker_mutex_);
 
 
-		// --- Buffer Management ---
+		// --- Buffer Management (part 2/2)---
 		const size_t buffer_size_per_buffer_; // Size for *each* of the two buffers per connection
-		absl::Mutex connection_map_mutex_; // Protects the map itself
-		absl::flat_hash_map<int, std::shared_ptr<ConnectionBuffers>> connections_ ABSL_GUARDED_BY(connection_map_mutex_);
 		absl::CondVar consume_cv_; // Global CV for consumer to wait on
 
 

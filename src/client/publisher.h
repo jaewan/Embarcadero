@@ -93,6 +93,10 @@ class Publisher {
 			outfile.close();
 		}
 
+		int GetClientId(){
+			return client_id_;
+		}
+
 	private:
 		std::string head_addr_;
 		std::string port_;
