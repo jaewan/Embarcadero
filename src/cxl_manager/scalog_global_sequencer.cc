@@ -77,8 +77,9 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 				if (total_num_replicas != (NUM_MAX_BROKERS * num_replicas_per_broker_)) {
 					continue;
 				}
-
-				for (const auto& entry : global_cut_) {
+				
+				auto global_cut_copy = global_cut_;
+				for (const auto& entry : global_cut_copy) {
 					if (entry.second.empty()) {
 						global_cut.mutable_global_cut()->insert({entry.first, 0});
 						continue;
@@ -92,7 +93,7 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 
 					auto min_entry = std::min_element(entry.second.begin(), entry.second.end(),
 													[](const auto& a, const auto& b) {
-														return a.second < b.second;
+														return a.second < b.second || (a.second == b.second && &a > &b);
 													});
 
 					global_cut.mutable_global_cut()->insert({entry.first, min_entry->second});
