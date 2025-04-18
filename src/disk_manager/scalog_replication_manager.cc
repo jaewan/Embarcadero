@@ -73,7 +73,7 @@ namespace Scalog {
 					// Or if it's the last *written* number, return local_cut_ + 1?
 					// Returning local_cut_ - 1 seems odd if it starts at 0.
 					// Let's assume local_cut_ is the count for now.
-					return local_cut_;
+					return local_cut_ - 1;
 					// return local_cut_ - 1; // Original logic - double check intent
 				}
 
