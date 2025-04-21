@@ -625,7 +625,7 @@ namespace Scalog {
 					// *** Assuming for now we only care about advancing seq for other brokers ***
 					current_seq += num_messages;
 					// **** WARNING: Disk offset calculation might be wrong if file interleaves brokers ****
-					LOG_EVERY_N(WARNING, 100) << "Skipping disk offset advancement for foreign broker " << broker << ". Sequence number advanced.";
+					//LOG_EVERY_N(WARNING, 100) << "Skipping disk offset advancement for foreign broker " << broker << ". Sequence number advanced.";
 				}
 			} // End loop through global_cut map
 

@@ -71,6 +71,136 @@ struct Transaction {
 	absl::flat_hash_map<std::string, std::string> writeSet;  // Keys written
 };
 
+class ShardedKVStore {
+	private:
+		// Number of shards - use power of 2 for efficient modulo with bit masking
+		static const size_t NUM_SHARDS = 64;
+
+		struct Shard {
+			absl::flat_hash_map<std::string, std::string> data;
+			mutable std::shared_mutex mutex;
+
+			Shard() = default;
+
+			// Prevent copying and moving
+			Shard(const Shard&) = delete;
+			Shard& operator=(const Shard&) = delete;
+		};
+
+		std::array<Shard, NUM_SHARDS> shards;
+
+		inline size_t getShardIndex(const std::string& key) const {
+			// Simple hash function to determine shard
+			// Use bit masking for efficient modulo with power-of-2 shards
+			return std::hash<std::string>{}(key) & (NUM_SHARDS - 1);
+		}
+
+	public:
+		ShardedKVStore() = default;
+
+		// Prevent copying and moving
+		ShardedKVStore(const ShardedKVStore&) = delete;
+		ShardedKVStore& operator=(const ShardedKVStore&) = delete;
+
+		// Get a value by key
+		std::string get(const std::string& key) const {
+			size_t index = getShardIndex(key);
+			std::shared_lock<std::shared_mutex> lock(shards[index].mutex);
+
+			auto it = shards[index].data.find(key);
+			if (it != shards[index].data.end()) {
+				return it->second;
+			}
+			return "";
+		}
+
+		// Check if a key exists
+		bool contains(const std::string& key) const {
+			size_t index = getShardIndex(key);
+			std::shared_lock<std::shared_mutex> lock(shards[index].mutex);
+
+			return shards[index].data.contains(key);
+		}
+
+		// Put a key-value pair
+		void put(const std::string& key, const std::string& value) {
+			size_t index = getShardIndex(key);
+			std::unique_lock<std::shared_mutex> lock(shards[index].mutex);
+
+			shards[index].data[key] = value;
+		}
+
+		// Delete a key
+		bool remove(const std::string& key) {
+			size_t index = getShardIndex(key);
+			std::unique_lock<std::shared_mutex> lock(shards[index].mutex);
+
+			return shards[index].data.erase(key) > 0;
+		}
+
+		// Multi-get: retrieve multiple keys at once (more efficient than individual gets)
+		std::vector<std::pair<std::string, std::string>> multiGet(const std::vector<std::string>& keys) {
+			std::vector<std::pair<std::string, std::string>> results;
+			results.reserve(keys.size());
+
+			// Group keys by shard to minimize lock acquisitions
+			absl::flat_hash_map<size_t, std::vector<std::string>> keysByShard;
+			for (const auto& key : keys) {
+				keysByShard[getShardIndex(key)].push_back(key);
+			}
+
+			// Process each shard
+			for (const auto& [shardIdx, shardKeys] : keysByShard) {
+				std::shared_lock<std::shared_mutex> lock(shards[shardIdx].mutex);
+
+				for (const auto& key : shardKeys) {
+					auto it = shards[shardIdx].data.find(key);
+					if (it != shards[shardIdx].data.end()) {
+						results.emplace_back(key, it->second);
+					}
+				}
+			}
+
+			return results;
+		}
+
+		// Multi-put: store multiple key-value pairs at once
+		void multiPut(const std::vector<std::pair<std::string, std::string>>& keyValues) {
+			// Group key-values by shard
+			absl::flat_hash_map<size_t, std::vector<std::pair<std::string, std::string>>> kvByShard;
+			for (const auto& [key, value] : keyValues) {
+				kvByShard[getShardIndex(key)].emplace_back(key, value);
+			}
+
+			// Process each shard
+			for (const auto& [shardIdx, shardKvs] : kvByShard) {
+				std::unique_lock<std::shared_mutex> lock(shards[shardIdx].mutex);
+
+				for (const auto& [key, value] : shardKvs) {
+					shards[shardIdx].data[key] = value;
+				}
+			}
+		}
+
+		// Get total number of keys across all shards
+		size_t size() const {
+			size_t total = 0;
+			for (const auto& shard : shards) {
+				std::shared_lock<std::shared_mutex> lock(shard.mutex);
+				total += shard.data.size();
+			}
+			return total;
+		}
+
+		// Clear all data
+		void clear() {
+			for (auto& shard : shards) {
+				std::unique_lock<std::shared_mutex> lock(shard.mutex);
+				shard.data.clear();
+			}
+		}
+};
+
 class DistributedKVStore {
 	private:
 		// Last request ID
@@ -88,8 +218,7 @@ class DistributedKVStore {
 
 
 		// Local key-value store
-		absl::flat_hash_map<std::string, std::string> kv_store_;
-		std::shared_mutex kv_store_mutex_;  // Read-write lock for better read concurrency
+		ShardedKVStore kv_store_;
 
 		// Pending write operations waiting for results
 		absl::Mutex pending_ops_mutex_;
@@ -120,15 +249,17 @@ class DistributedKVStore {
 		// Consumer thread function to process log entries
 		void logConsumer(int fd, std::shared_ptr<ConnectionBuffers> conn_buffers);
 
-		// Wait until the local state has applied up to at least the given log position
-		void waitUntilApplied(uint64_t position);
+		void waitForSyncWithLog();
 
 	public:
 		// Constructor - now initializes the thread pool with a configurable number of threads
-		explicit DistributedKVStore(uint64_t id, SequencerType seq_type, size_t numThreads = 8);
+		explicit DistributedKVStore(SequencerType seq_type);
 
 		// Destructor
 		~DistributedKVStore();
+
+		// Wait until the local state has applied up to at least the given log position
+		void waitUntilApplied(size_t total_order);
 
 		// Put a value for a key (through the log). Return client_order from MessageHeader
 		size_t put(const std::string& key, const std::string& value);
@@ -138,6 +269,10 @@ class DistributedKVStore {
 
 		// Multi-key put operation (through the log)
 		size_t multiPut(const std::vector<KeyValue>& kvPairs);
+
+		std::string get(const std::string& key);
+
+		std::vector<std::pair<std::string, std::string>> multiGet(const std::vector<std::string>& keys);
 
 		// Get the current state of the key-value store (for debugging)
 		std::unordered_map<std::string, std::string> getState();
