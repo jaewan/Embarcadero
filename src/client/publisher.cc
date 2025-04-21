@@ -194,7 +194,7 @@ void Publisher::Poll(size_t n) {
 }
 
 void Publisher::DEBUG_check_send_finish() {
-	WriteFinished();
+	WriteFinishedOrPuased();
 	publish_finished_ = true;
 	pubQue_.ReturnReads();
 
@@ -209,7 +209,6 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 		double failure_percentage, 
 		std::function<bool()> killbrokers) {
 	kill_brokers_ = true;
-	VLOG(5) << "Setting up broker failure at " << failure_percentage << " of total messages";
 
 	measure_real_time_throughput_ = true;
 	size_t num_brokers = nodes_.size();
@@ -219,27 +218,22 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 		sent_bytes_per_broker_[i].store(0);
 		acked_messages_per_broker_[i] = 0;
 	}
-	LOG(INFO) << "[DEBUG] failure_percentage:" << failure_percentage << " num_brokers:" << num_brokers;
 
 	// Start thread to monitor progress and kill brokers at specified percentage
 	kill_brokers_thread_ = std::thread([=, this]() {
 		size_t bytes_to_kill_brokers = total_message_size * failure_percentage;
-		LOG(INFO) << "[DEBUG] Will kill brokers after sending " << bytes_to_kill_brokers << " bytes";
 
 		while (!shutdown_ && total_sent_bytes_ < bytes_to_kill_brokers) {
-			//std::this_thread::sleep_for(std::chrono::milliseconds(10));
 			std::this_thread::yield();
 		}
 
 		if (!shutdown_) {
-			LOG(INFO) << "Failure trigger reached (" << total_sent_bytes_ << " bytes sent), killing brokers";
 			killbrokers();
 		}
 	});
 
 	// Start thread to measure real-time throughput
 	real_time_throughput_measure_thread_ = std::thread([=, this]() {
-		LOG(INFO) << "[DEBUG]real_time_throughput_measure_thread_ spawned";
 		std::vector<size_t> prev_throughputs(num_brokers, 0);
 
 		// Open file for writing throughput data
@@ -248,15 +242,14 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 		std::string filename = home_dir + "/Embarcadero/data/failure/real_time_acked_throughput.csv";
 		std::ofstream throughputFile(filename);
 		if (!throughputFile.is_open()) {
-			LOG(ERROR) << "Failed to open file for writing throughput data: " << filename;
-			return;
+		LOG(ERROR) << "Failed to open file for writing throughput data: " << filename;
+		return;
 		}
-	LOG(INFO) << "[DEBUG] throughput measure thread open file:" << filename;
 
-		 // Write CSV header
+		// Write CSV header
 		throughputFile << "Timestamp(ms)"; // Add timestamp column
 		for (size_t i = 0; i < num_brokers; i++) {
-				throughputFile << ",Broker_" << i << "_GBps";
+		throughputFile << ",Broker_" << i << "_GBps";
 		}
 		throughputFile << ",Total_GBps\n";
 
@@ -270,7 +263,7 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 			auto now = std::chrono::steady_clock::now();
 			auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count();
 			throughputFile << timestamp_ms; // Write timestamp
-																			
+
 			for (size_t i = 0; i < num_brokers; i++) {
 				size_t bytes = acked_messages_per_broker_[i] * message_size;
 				size_t real_time_throughput = (bytes - prev_throughputs[i]);
@@ -293,17 +286,8 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 	});
 }
 
-void Publisher::WriteFinished() {
-	pubQue_.WriteFinished();
-}
-
-void Publisher::Flush() {
-    // Signal to the queue that we need to flush messages
-    pubQue_.Flush();
-		std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Reset the flush flag after all threads have had a chance to process
-    pubQue_.ResetFlush();
+void Publisher::WriteFinishedOrPuased() {
+	pubQue_.Seal();
 }
 
 void Publisher::EpollAckThread() {
@@ -387,180 +371,180 @@ void Publisher::EpollAckThread() {
 	std::map<int, ConnState> socket_state;
 	std::map<int, std::pair<int, size_t>> partial_id_reads; // fd -> {partial_id, bytes_read}
 
-	thread_count_.fetch_add(1); // Signal that initialization is complete
+thread_count_.fetch_add(1); // Signal that initialization is complete
 
-	// Main epoll loop
-	while (!shutdown_) {
-		int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
+// Main epoll loop
+while (!shutdown_) {
+	int num_events = epoll_wait(epoll_fd, events.data(), max_events, EPOLL_TIMEOUT);
 
-		if (num_events < 0) {
-			if (errno == EINTR) {
-				continue; // Interrupted, just retry
-			}
-			LOG(ERROR) << "AckThread: epoll_wait failed: " << strerror(errno);
-			break; // Exit loop on unrecoverable error
+	if (num_events < 0) {
+		if (errno == EINTR) {
+			continue; // Interrupted, just retry
 		}
-
-		for (int i = 0; i < num_events; i++) {
-			int current_fd = events[i].data.fd;
-			if (current_fd == server_sock) {
-				// Handle new connection
-				sockaddr_in client_addr;
-				socklen_t client_addr_len = sizeof(client_addr);
-				int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
-
-				if (client_sock == -1) {
-					if (errno == EAGAIN || errno == EWOULDBLOCK) {
-						// This can happen with level-triggered accept if already handled? Should be rare.
-						VLOG(2) << "AckThread: accept returned EAGAIN/EWOULDBLOCK";
-					} else {
-						LOG(ERROR) << "AckThread: Accept failed: " << strerror(errno);
-					}
-					continue;
-				}
-
-				// Set client socket to non-blocking mode
-				int flags = fcntl(client_sock, F_GETFL, 0);
-				if (flags == -1 || fcntl(client_sock, F_SETFL, flags | O_NONBLOCK) == -1) {
-					LOG(ERROR) << "Failed to set client socket to non-blocking: " << strerror(errno);
-					close(client_sock);
-					continue;
-				}
-
-				// Add client socket to epoll
-				event.events = EPOLLIN | EPOLLET;  // Edge-triggered mode
-				event.data.fd = client_sock;
-
-				if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
-					LOG(ERROR) << "Failed to add client socket to epoll: " << strerror(errno);
-					close(client_sock);
-				} else {
-					client_sockets[client_sock] = -1; // Temporarily store fd, broker_id is unknown (-1)
-					socket_state[client_sock] = ConnState::WAITING_FOR_ID; // Expect Broker ID first
-					partial_id_reads[client_sock] = {0, 0};
-					prev_ack_per_sock[client_sock] = (size_t)-1;
-				}
-			} else {
-				// Handle data from existing connection
-				int client_sock = current_fd;
-				ConnState current_state = socket_state[client_sock]; // if this fails, something's very wrong
-				bool connection_error_or_closed = false;
-
-				while (!connection_error_or_closed) {
-					if (current_state == ConnState::WAITING_FOR_ID){
-						// --- Try to Read Broker ID ---
-						int broker_id_buffer;
-						auto& partial_read = partial_id_reads[client_sock];
-						size_t needed = sizeof(broker_id_buffer) - partial_read.second;
-						ssize_t recv_ret = recv(client_sock,
-								(char*)&partial_read.first + partial_read.second, // Read into partial buffer
-								needed, 0);
-
-						if (recv_ret == 0) { connection_error_or_closed = true; break; }
-						if (recv_ret < 0) {
-							if (errno == EAGAIN || errno == EWOULDBLOCK) break; // No more data now
-							if (errno == EINTR) continue; // Retry read
-							LOG(ERROR) << "AckThread: recv error reading broker ID on fd " << client_sock << ": " << strerror(errno);
-							connection_error_or_closed = true; break;
-						}
-
-						partial_read.second += recv_ret; // Increment bytes read for ID
-
-						if (partial_read.second == sizeof(broker_id_buffer)) {
-							// Full ID received
-							broker_id_buffer = partial_read.first; // Get the ID
-							if (broker_id_buffer < 0 || broker_id_buffer >= (int)acked_messages_per_broker_.size()) {
-								LOG(ERROR) << "AckThread: Received invalid broker_id " << broker_id_buffer << " on fd " << client_sock;
-								connection_error_or_closed = true; break; // Invalid ID, close connection
-							}
-							VLOG(1) << "AckThread: Received Broker ID " << broker_id_buffer << " from fd=" << client_sock;
-							client_sockets[client_sock] = broker_id_buffer; // Update map value
-							socket_state[client_sock] = ConnState::READING_ACKS; // Transition state
-							current_state = ConnState::READING_ACKS; // Update local state for this loop
-																											 // Clear partial read state for this FD
-							partial_id_reads.erase(client_sock);
-							// Continue reading potential ACK data in the same loop iteration
-						}
-						// If ID still not complete, loop will try recv() again if more data indicated by epoll
-					}else if(current_state == ConnState::READING_ACKS){
-						size_t acked_num_msg_buffer; // Temporary buffer for one ACK
-																				 // TODO: Add buffering for partial ACK reads if needed, similar to ID read.
-																				 // For simplicity now, assume ACKs arrive fully or cause error/EAGAIN.
-						ssize_t recv_ret = recv(client_sock, &acked_num_msg_buffer, sizeof(acked_num_msg_buffer), 0);
-						if (recv_ret == 0) { connection_error_or_closed = true; break; }
-						if (recv_ret < 0) {
-							if (errno == EAGAIN || errno == EWOULDBLOCK) break; // No more data now
-							if (errno == EINTR) continue; // Retry read
-							LOG(ERROR) << "AckThread: recv error reading ACK bytes on fd " << client_sock << ": " << strerror(errno);
-							connection_error_or_closed = true; break;
-						}
-						if (recv_ret != sizeof(acked_num_msg_buffer)) {
-							// Partial ACK read - requires buffering logic like the ID part.
-							// For now, log warning and potentially close.
-							LOG(WARNING) << "AckThread: Received partial ACK (" << recv_ret << "/" << sizeof(acked_num_msg_buffer) << " bytes) on fd: " << client_sock << ". Discarding.";
-							// Decide if this constitutes an error state.
-							// connection_error_or_closed = true; break;
-							continue; // Or try reading more? Simple for now: discard and wait for next read event.
-						}
-
-						// --- Process Full ACK Bytes ---
-						size_t acked_msg = acked_num_msg_buffer;
-						int broker_id = client_sockets[client_sock]; // Get broker ID
-
-						// Check if broker_id is valid (should be if state is READING_ACKS)
-						if (broker_id < 0) {
-							LOG(ERROR) << "AckThread: Invalid broker_id (-1) for fd " << client_sock << " in READING_ACKS state.";
-							connection_error_or_closed = true; break;
-						}
-
-						size_t prev_acked = prev_ack_per_sock[client_sock]; // Assumes key exists
-
-						if (acked_msg >= prev_acked || prev_acked == (size_t)-1) { // Check for valid cumulative value
-							size_t new_acked_msgs = acked_msg - prev_acked;
-							if (new_acked_msgs > 0) {
-								acked_messages_per_broker_[broker_id]+=new_acked_msgs;
-								ack_received_ += new_acked_msgs;
-								prev_ack_per_sock[client_sock] = acked_msg; // Update last value for this socket
-								VLOG(4) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << ") ACK messages: " 
-									<< acked_msg << " (+" << new_acked_msgs << ")";
-							} else {
-								// Duplicate cumulative value, ignore.
-								VLOG(5) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << 
-									") Duplicate ACK messages received: " << acked_msg;
-							}
-						} else {
-							LOG(WARNING) << "AckThread: Received non-monotonic ACK bytes on fd " << client_sock
-								<< " (Broker " << broker_id << "). Received: " << acked_msg << ", Previous: " << prev_acked;
-						}
-						// Continue loop to read potentially more data from this socket event
-					}else{
-						LOG(ERROR) << "AckThread: Invalid state for fd " << client_sock;
-						connection_error_or_closed = true; 
-						break;
-					}
-				} // End outer `while (!connection_error_or_closed)` loop for EPOLLET
-				if(connection_error_or_closed){
-					VLOG(3) << "AckThread: Cleaning up connection fd=" << client_sock;
-					epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr); // Ignore error
-					close(client_sock);
-					client_sockets.erase(client_sock);
-					prev_ack_per_sock.erase(client_sock);
-					socket_state.erase(client_sock);
-					partial_id_reads.erase(client_sock); // Clean up partial ID state too
-				}
-			}//end else (handle data from existing connection)
-		}// End for loop through epoll events
-	}// End while(!shutdown_)
-
-	// Clean up client sockets
-	for (auto const& [sock_fd, broker_id] : client_sockets) {
-		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, sock_fd, nullptr);
-		close(sock_fd);
+		LOG(ERROR) << "AckThread: epoll_wait failed: " << strerror(errno);
+		break; // Exit loop on unrecoverable error
 	}
 
-	// Clean up epoll and server socket
-	close(epoll_fd);
-	close(server_sock);
+	for (int i = 0; i < num_events; i++) {
+		int current_fd = events[i].data.fd;
+		if (current_fd == server_sock) {
+			// Handle new connection
+			sockaddr_in client_addr;
+			socklen_t client_addr_len = sizeof(client_addr);
+			int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
+
+			if (client_sock == -1) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					// This can happen with level-triggered accept if already handled? Should be rare.
+					VLOG(2) << "AckThread: accept returned EAGAIN/EWOULDBLOCK";
+				} else {
+					LOG(ERROR) << "AckThread: Accept failed: " << strerror(errno);
+				}
+				continue;
+			}
+
+			// Set client socket to non-blocking mode
+			int flags = fcntl(client_sock, F_GETFL, 0);
+			if (flags == -1 || fcntl(client_sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+				LOG(ERROR) << "Failed to set client socket to non-blocking: " << strerror(errno);
+				close(client_sock);
+				continue;
+			}
+
+			// Add client socket to epoll
+			event.events = EPOLLIN | EPOLLET;  // Edge-triggered mode
+			event.data.fd = client_sock;
+
+			if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
+				LOG(ERROR) << "Failed to add client socket to epoll: " << strerror(errno);
+				close(client_sock);
+			} else {
+				client_sockets[client_sock] = -1; // Temporarily store fd, broker_id is unknown (-1)
+				socket_state[client_sock] = ConnState::WAITING_FOR_ID; // Expect Broker ID first
+				partial_id_reads[client_sock] = {0, 0};
+				prev_ack_per_sock[client_sock] = (size_t)-1;
+			}
+		} else {
+			// Handle data from existing connection
+			int client_sock = current_fd;
+			ConnState current_state = socket_state[client_sock]; // if this fails, something's very wrong
+			bool connection_error_or_closed = false;
+
+			while (!connection_error_or_closed) {
+				if (current_state == ConnState::WAITING_FOR_ID){
+					// --- Try to Read Broker ID ---
+					int broker_id_buffer;
+					auto& partial_read = partial_id_reads[client_sock];
+					size_t needed = sizeof(broker_id_buffer) - partial_read.second;
+					ssize_t recv_ret = recv(client_sock,
+							(char*)&partial_read.first + partial_read.second, // Read into partial buffer
+							needed, 0);
+
+					if (recv_ret == 0) { connection_error_or_closed = true; break; }
+					if (recv_ret < 0) {
+						if (errno == EAGAIN || errno == EWOULDBLOCK) break; // No more data now
+						if (errno == EINTR) continue; // Retry read
+						LOG(ERROR) << "AckThread: recv error reading broker ID on fd " << client_sock << ": " << strerror(errno);
+						connection_error_or_closed = true; break;
+					}
+
+					partial_read.second += recv_ret; // Increment bytes read for ID
+
+					if (partial_read.second == sizeof(broker_id_buffer)) {
+						// Full ID received
+						broker_id_buffer = partial_read.first; // Get the ID
+						if (broker_id_buffer < 0 || broker_id_buffer >= (int)acked_messages_per_broker_.size()) {
+							LOG(ERROR) << "AckThread: Received invalid broker_id " << broker_id_buffer << " on fd " << client_sock;
+							connection_error_or_closed = true; break; // Invalid ID, close connection
+						}
+						VLOG(1) << "AckThread: Received Broker ID " << broker_id_buffer << " from fd=" << client_sock;
+						client_sockets[client_sock] = broker_id_buffer; // Update map value
+						socket_state[client_sock] = ConnState::READING_ACKS; // Transition state
+						current_state = ConnState::READING_ACKS; // Update local state for this loop
+																										 // Clear partial read state for this FD
+						partial_id_reads.erase(client_sock);
+						// Continue reading potential ACK data in the same loop iteration
+					}
+					// If ID still not complete, loop will try recv() again if more data indicated by epoll
+				}else if(current_state == ConnState::READING_ACKS){
+					size_t acked_num_msg_buffer; // Temporary buffer for one ACK
+																			 // TODO: Add buffering for partial ACK reads if needed, similar to ID read.
+																			 // For simplicity now, assume ACKs arrive fully or cause error/EAGAIN.
+					ssize_t recv_ret = recv(client_sock, &acked_num_msg_buffer, sizeof(acked_num_msg_buffer), 0);
+					if (recv_ret == 0) { connection_error_or_closed = true; break; }
+					if (recv_ret < 0) {
+						if (errno == EAGAIN || errno == EWOULDBLOCK) break; // No more data now
+						if (errno == EINTR) continue; // Retry read
+						LOG(ERROR) << "AckThread: recv error reading ACK bytes on fd " << client_sock << ": " << strerror(errno);
+						connection_error_or_closed = true; break;
+					}
+					if (recv_ret != sizeof(acked_num_msg_buffer)) {
+						// Partial ACK read - requires buffering logic like the ID part.
+						// For now, log warning and potentially close.
+						LOG(WARNING) << "AckThread: Received partial ACK (" << recv_ret << "/" << sizeof(acked_num_msg_buffer) << " bytes) on fd: " << client_sock << ". Discarding.";
+						// Decide if this constitutes an error state.
+						// connection_error_or_closed = true; break;
+						continue; // Or try reading more? Simple for now: discard and wait for next read event.
+					}
+
+					// --- Process Full ACK Bytes ---
+					size_t acked_msg = acked_num_msg_buffer;
+					int broker_id = client_sockets[client_sock]; // Get broker ID
+
+					// Check if broker_id is valid (should be if state is READING_ACKS)
+					if (broker_id < 0) {
+						LOG(ERROR) << "AckThread: Invalid broker_id (-1) for fd " << client_sock << " in READING_ACKS state.";
+						connection_error_or_closed = true; break;
+					}
+
+					size_t prev_acked = prev_ack_per_sock[client_sock]; // Assumes key exists
+
+					if (acked_msg >= prev_acked || prev_acked == (size_t)-1) { // Check for valid cumulative value
+						size_t new_acked_msgs = acked_msg - prev_acked;
+						if (new_acked_msgs > 0) {
+							acked_messages_per_broker_[broker_id]+=new_acked_msgs;
+							ack_received_ += new_acked_msgs;
+							prev_ack_per_sock[client_sock] = acked_msg; // Update last value for this socket
+							VLOG(4) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << ") ACK messages: " 
+								<< acked_msg << " (+" << new_acked_msgs << ")";
+						} else {
+							// Duplicate cumulative value, ignore.
+							VLOG(5) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << 
+								") Duplicate ACK messages received: " << acked_msg;
+						}
+					} else {
+						LOG(WARNING) << "AckThread: Received non-monotonic ACK bytes on fd " << client_sock
+							<< " (Broker " << broker_id << "). Received: " << acked_msg << ", Previous: " << prev_acked;
+					}
+					// Continue loop to read potentially more data from this socket event
+				}else{
+					LOG(ERROR) << "AckThread: Invalid state for fd " << client_sock;
+					connection_error_or_closed = true; 
+					break;
+				}
+			} // End outer `while (!connection_error_or_closed)` loop for EPOLLET
+			if(connection_error_or_closed){
+				VLOG(3) << "AckThread: Cleaning up connection fd=" << client_sock;
+				epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr); // Ignore error
+				close(client_sock);
+				client_sockets.erase(client_sock);
+				prev_ack_per_sock.erase(client_sock);
+				socket_state.erase(client_sock);
+				partial_id_reads.erase(client_sock); // Clean up partial ID state too
+			}
+		}//end else (handle data from existing connection)
+	}// End for loop through epoll events
+}// End while(!shutdown_)
+
+// Clean up client sockets
+for (auto const& [sock_fd, broker_id] : client_sockets) {
+	epoll_ctl(epoll_fd, EPOLL_CTL_DEL, sock_fd, nullptr);
+	close(sock_fd);
+}
+
+// Clean up epoll and server socket
+close(epoll_fd);
+close(server_sock);
 }
 
 void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
@@ -694,7 +678,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				break;
 			} else {
 				// Short sleep to avoid busy waiting
-				std::this_thread::sleep_for(std::chrono::microseconds(1));
+				std::this_thread::yield();
 				continue;
 			}
 		}
@@ -834,7 +818,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			} catch (const std::exception& e) {
 				LOG(ERROR) << "Failed to send batch header to replacement broker: " << e.what();
 				std::string fail_msg2 = "Header Send Fail (Post-Reconnect) Broker " + std::to_string(new_broker_id) + " (" + e.what() + ")";
-			 	RecordFailureEvent(fail_msg2);
+				RecordFailureEvent(fail_msg2);
 				return;
 			}
 
@@ -884,7 +868,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				// Connection failure, switch to a different broker
 				LOG(WARNING) << "Send failed to broker " << broker_id << ": " << strerror(errno);
 				std::string fail_msg = "Data Send Fail Broker " + std::to_string(broker_id) + " errno=" + std::to_string(errno);
-			  RecordFailureEvent(fail_msg);
+				RecordFailureEvent(fail_msg);
 
 				int new_broker_id;
 				{

@@ -200,9 +200,18 @@ class Subscriber {
 		std::string port_;
 		std::unique_ptr<heartbeat_system::HeartBeat::Stub> stub_;
 		char topic_[TOPIC_NAME_SIZE];
-		int client_id_;
 		std::atomic<bool> shutdown_{false};
 		std::atomic<bool> connected_{false}; // Maybe more granular connection state needed
+
+		// --- Latency / Debug ---
+		bool measure_latency_;
+		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
+
+		// --- Buffer Management (part 2/2)---
+		const size_t buffer_size_per_buffer_; // Size for *each* of the two buffers per connection
+		absl::CondVar consume_cv_; // Global CV for consumer to wait on
+
+		int client_id_;
 
 		// Cluster state
 		absl::Mutex node_mutex_;
@@ -241,14 +250,6 @@ class Subscriber {
 		std::vector<ThreadInfo> worker_threads_ ABSL_GUARDED_BY(worker_mutex_);
 
 
-		// --- Buffer Management (part 2/2)---
-		const size_t buffer_size_per_buffer_; // Size for *each* of the two buffers per connection
-		absl::CondVar consume_cv_; // Global CV for consumer to wait on
-
-
-		// --- Latency / Debug ---
-		bool measure_latency_;
-		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
 
 
 		// --- Private Methods ---

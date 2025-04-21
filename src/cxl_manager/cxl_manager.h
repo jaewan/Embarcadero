@@ -75,8 +75,8 @@ struct alignas(64) BatchHeader{
 	size_t total_size;
 	size_t start_logical_offset;
 	uint32_t broker_id;
-	uint32_t num_brokers;
-	size_t total_order;
+	uint32_t num_brokers; // Stale, used in Order3 Sequencer which can be replaced by directly calling get_num_brokers.Consider changing this variable to seal for buffer write
+	size_t total_order; // Order given by Corfu
 	size_t log_idx;	// Sequencer4: relative log offset to the payload of the batch and elative offset to last message
 	size_t num_msg;
 };

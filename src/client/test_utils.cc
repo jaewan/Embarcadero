@@ -360,24 +360,12 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		// Initialize publisher
 		p.Init(ack_level);
 
-		/*
-		// Set up progress tracking
-		ProgressTracker progress(n, 1000);
-		*/
-
 		// Start timing for publishing
 		auto start = std::chrono::high_resolution_clock::now();
 
 		// Publish messages
 		for (size_t i = 0; i < n; i++) {
 			p.Publish(message, message_size);
-
-			/*
-			// Update progress periodically
-			if (i % 1000 == 0) {
-			progress.Update(i);
-			}
-			*/
 		}
 
 		// Finalize publishing
@@ -433,7 +421,6 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	bool steady_rate = result.count("steady_rate");
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 
-	size_t num_brokers = 4;
 	if (steady_rate) {
 		LOG(WARNING) << "Using steady rate mode, this works best with 4 brokers";
 	}
@@ -481,6 +468,7 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 
 			// If using steady rate, pause periodically
 			if (steady_rate && (sent_bytes >= (BATCH_SIZE*10))) {
+				p.WriteFinishedOrPuased();
 				std::this_thread::sleep_for(std::chrono::nanoseconds(1000));
 				sent_bytes = 0;
 				// Capture current timestamp and embed it in the message
