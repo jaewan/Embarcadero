@@ -47,6 +47,8 @@ public:
      * @return Pointer to the read data or nullptr if empty
      */
     void* Read(int bufIdx);
+
+		void Seal();
 #else
     /**
      * Writes a message to the buffer without batch optimization
@@ -78,8 +80,6 @@ public:
      */
     void WriteFinished();
 
-		void Flush();
-		void ResetFlush() { is_flushing_ = false; }
 private:
     /**
      * Buffer structure with cache line alignment
@@ -115,6 +115,4 @@ private:
      * Advances the write buffer ID
      */
     void AdvanceWriteBufId();
-
-		bool is_flushing_ = false;
 };

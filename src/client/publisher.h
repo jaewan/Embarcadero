@@ -97,12 +97,10 @@ class Publisher {
 			return client_id_;
 		}
 
-		void Flush();
-
 		/**
 		 * Signals that writing is finished
 		 */
-		void WriteFinished();
+		void WriteFinishedOrPuased();
 
 	private:
 		std::string head_addr_;
