@@ -105,7 +105,7 @@ LogEntry LogEntry::deserialize(const void* data, size_t client_id, size_t client
 }
 
 // DistributedKVStore implementation
-DistributedKVStore::DistributedKVStore(uint64_t id, SequencerType seq_type, size_t numThreads)
+DistributedKVStore::DistributedKVStore(SequencerType seq_type)
 	: last_request_id_(0),
 	last_applied_total_order_(0),
 	last_transaction_id_(0),
@@ -144,7 +144,6 @@ DistributedKVStore::DistributedKVStore(uint64_t id, SequencerType seq_type, size
 			for (const auto& [fd, conn_buffers] : subscriber_->connections_) {
 				// Spawn a consumer thread for each connection buffer
 				log_consumer_threads_.emplace_back(&DistributedKVStore::logConsumer, this, fd, conn_buffers);
-				LOG(INFO) << "Started log consumer thread for connection FD " << fd;
 			}
 			// Get iterate subscriber_->connections_ and spawn a thread to log_consumer_threads_ vector
 			// Have the thread to read a message -> desrialize the message -> call processLogEntry
@@ -171,82 +170,6 @@ DistributedKVStore::~DistributedKVStore() {
 	VLOG(3) <<"DistributedKVStore Destructed";
 }
 
-void DistributedKVStore::processLogEntry(const LogEntry& entry, size_t total_order) {
-
-	// First update the last applied index
-	// This MUST be done first to ensure reads can properly synchronize
-	{
-		absl::MutexLock lock(&apply_mutex_);
-		if (last_applied_total_order_ < total_order){
-			last_applied_total_order_ = total_order;
-		}
-	}
-
-	// Only process write operations - reads are handled locally
-	switch (entry.type) {
-		case OpType::PUT: {
-												// Process a single PUT operation
-												assert(entry.kvPairs.size() == 1);
-												const auto& kv = entry.kvPairs[0];
-
-
-												{
-													std::unique_lock<std::shared_mutex> lock(kv_store_mutex_);
-													kv_store_[kv.key] = kv.value;
-												}
-
-												// If this is our own request, complete the pending operation
-												completeOperation(entry.opId.requestId);
-												break;
-											}
-
-		case OpType::DELETE: {
-													 // Process a single DELETE operation
-													 assert(entry.kvPairs.size() == 1);
-													 const auto& kv = entry.kvPairs[0];
-
-													 std::cout << "DELETE operation: " << kv.key << std::endl;
-
-													 {
-														 std::unique_lock<std::shared_mutex> lock(kv_store_mutex_);
-														 kv_store_.erase(kv.key);
-													 }
-
-													 // If this is our own request, complete the pending operation
-													 completeOperation(entry.opId.requestId);
-													 break;
-												 }
-
-		case OpType::MULTI_PUT: {
-															// Process a multi-key PUT operation
-															std::cout << "MULTI_PUT operation with " << entry.kvPairs.size() << " pairs" << std::endl;
-
-															{
-																std::unique_lock<std::shared_mutex> lock(kv_store_mutex_);
-																for (const auto& kv : entry.kvPairs) {
-																	kv_store_[kv.key] = kv.value;
-																}
-															}
-
-															// If this is our own request, complete the pending operation
-															completeOperation(entry.opId.requestId);
-															break;
-														}
-
-		case OpType::BEGIN_TX:
-		case OpType::COMMIT_TX:
-		case OpType::ABORT_TX:
-														// Transaction operations would be processed here
-														// This is a simplified implementation without full transaction support
-														break;
-
-		default:
-														std::cerr << "Unknown operation type: " << static_cast<int>(entry.type) << std::endl;
-														break;
-	}
-}
-
-// Process a log entry directly from raw buffer without deserializing to LogEntry
 void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t size,
 		uint32_t client_id, size_t client_order,
 		size_t total_order) {
@@ -290,126 +213,198 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 
 	// Process based on operation type
 	switch (type) {
-		case OpType::PUT: {
-												// Process a single PUT operation
-												if (pairCount != 1) {
-													LOG(ERROR) << "Expected 1 KV pair for PUT, got " << pairCount;
-													return;
-												}
+		case OpType::PUT: 
+			{
+				// Process a single PUT operation
+				if (pairCount != 1) {
+					LOG(ERROR) << "Expected 1 KV pair for PUT, got " << pairCount;
+					return;
+				}
 
-												// Read the key
-												uint32_t keyLength;
-												if (offset + sizeof(keyLength) > size) return;
-												memcpy(&keyLength, buffer + offset, sizeof(keyLength));
-												offset += sizeof(keyLength);
+				// Read the key
+				uint32_t keyLength;
+				if (offset + sizeof(keyLength) > size) return;
+				memcpy(&keyLength, buffer + offset, sizeof(keyLength));
+				offset += sizeof(keyLength);
 
-												if (offset + keyLength > size) return;
-												std::string key(buffer + offset, keyLength);
-												offset += keyLength;
+				if (offset + keyLength > size) return;
+				std::string key(buffer + offset, keyLength);
+				offset += keyLength;
 
-												// Read the value
-												uint32_t valueLength;
-												if (offset + sizeof(valueLength) > size) return;
-												memcpy(&valueLength, buffer + offset, sizeof(valueLength));
-												offset += sizeof(valueLength);
+				// Read the value
+				uint32_t valueLength;
+				if (offset + sizeof(valueLength) > size) return;
+				memcpy(&valueLength, buffer + offset, sizeof(valueLength));
+				offset += sizeof(valueLength);
 
-												if (offset + valueLength > size) return;
-												std::string value(buffer + offset, valueLength);
-												offset += valueLength;
+				if (offset + valueLength > size) return;
+				std::string value(buffer + offset, valueLength);
+				offset += valueLength;
 
-												// Apply the operation
-												{
-													std::unique_lock<std::shared_mutex> lock(kv_store_mutex_);
-													kv_store_[key] = value;
-												}
+				// Apply the operation directly to the ShardedKVStore (no mutex needed!)
+				kv_store_.put(key, value);
 
-												// If this is our own request, complete the pending operation
-												completeOperation(client_order);
-												break;
-											}
+				// If this is our own request, complete the pending operation
+				completeOperation(client_order);
+				break;
+			}
 
-		case OpType::DELETE: {
-													 // Process a single DELETE operation
-													 if (pairCount != 1) {
-														 LOG(ERROR) << "Expected 1 KV pair for DELETE, got " << pairCount;
-														 return;
-													 }
+		case OpType::DELETE: 
+			{
+				// Process a single DELETE operation
+				if (pairCount != 1) {
+					LOG(ERROR) << "Expected 1 KV pair for DELETE, got " << pairCount;
+					return;
+				}
 
-													 // Read the key
-													 uint32_t keyLength;
-													 if (offset + sizeof(keyLength) > size) return;
-													 memcpy(&keyLength, buffer + offset, sizeof(keyLength));
-													 offset += sizeof(keyLength);
+				// Read the key
+				uint32_t keyLength;
+				if (offset + sizeof(keyLength) > size) return;
+				memcpy(&keyLength, buffer + offset, sizeof(keyLength));
+				offset += sizeof(keyLength);
 
-													 if (offset + keyLength > size) return;
-													 std::string key(buffer + offset, keyLength);
-													 offset += keyLength;
+				if (offset + keyLength > size) return;
+				std::string key(buffer + offset, keyLength);
+				offset += keyLength;
 
-													 // Skip the value (DELETE only needs the key)
-													 uint32_t valueLength;
-													 if (offset + sizeof(valueLength) > size) return;
-													 memcpy(&valueLength, buffer + offset, sizeof(valueLength));
-													 offset += sizeof(valueLength) + valueLength; // Skip value content
+				// Skip the value (DELETE only needs the key)
+				uint32_t valueLength;
+				if (offset + sizeof(valueLength) > size) return;
+				memcpy(&valueLength, buffer + offset, sizeof(valueLength));
+				offset += sizeof(valueLength) + valueLength; // Skip value content
 
-													 // Apply the operation
-													 {
-														 std::unique_lock<std::shared_mutex> lock(kv_store_mutex_);
-														 kv_store_.erase(key);
-													 }
+				// Apply the operation directly to the ShardedKVStore (no mutex needed!)
+				kv_store_.remove(key);
 
-													 // If this is our own request, complete the pending operation
-													 completeOperation(client_order);
-													 break;
-												 }
+				// If this is our own request, complete the pending operation
+				completeOperation(client_order);
+				break;
+			}
 
-		case OpType::MULTI_PUT: {
-															// Process multiple PUT operations
-															std::unique_lock<std::shared_mutex> lock(kv_store_mutex_);
+		case OpType::MULTI_PUT: 
+			{
+				// Process multiple PUT operations
+				std::vector<std::pair<std::string, std::string>> kvPairs;
+				kvPairs.reserve(pairCount);
 
-															for (uint32_t i = 0; i < pairCount; ++i) {
-																// Read key
-																uint32_t keyLength;
-																if (offset + sizeof(keyLength) > size) return;
-																memcpy(&keyLength, buffer + offset, sizeof(keyLength));
-																offset += sizeof(keyLength);
+				for (uint32_t i = 0; i < pairCount; ++i) {
+					// Read key
+					uint32_t keyLength;
+					if (offset + sizeof(keyLength) > size) return;
+					memcpy(&keyLength, buffer + offset, sizeof(keyLength));
+					offset += sizeof(keyLength);
 
-																if (offset + keyLength > size) return;
-																std::string key(buffer + offset, keyLength);
-																offset += keyLength;
+					if (offset + keyLength > size) return;
+					std::string key(buffer + offset, keyLength);
+					offset += keyLength;
 
-																// Read value
-																uint32_t valueLength;
-																if (offset + sizeof(valueLength) > size) return;
-																memcpy(&valueLength, buffer + offset, sizeof(valueLength));
-																offset += sizeof(valueLength);
+					// Read value
+					uint32_t valueLength;
+					if (offset + sizeof(valueLength) > size) return;
+					memcpy(&valueLength, buffer + offset, sizeof(valueLength));
+					offset += sizeof(valueLength);
 
-																if (offset + valueLength > size) return;
-																std::string value(buffer + offset, valueLength);
-																offset += valueLength;
+					if (offset + valueLength > size) return;
+					std::string value(buffer + offset, valueLength);
+					offset += valueLength;
 
-																// Apply each key-value pair
-																kv_store_[key] = value;
-															}
+					// Collect key-value pairs
+					kvPairs.emplace_back(key, value);
+				}
 
-															// If this is our own request, complete the pending operation
-															completeOperation(client_order);
-															break;
-														}
+				// Apply all key-value pairs in one call (efficient batching)
+				kv_store_.multiPut(kvPairs);
+
+				// If this is our own request, complete the pending operation
+				completeOperation(client_order);
+				break;
+			}
 
 		case OpType::BEGIN_TX:
 		case OpType::COMMIT_TX:
 		case OpType::ABORT_TX:
-														// Transaction operations would be processed here
-														// This is a simplified implementation without full transaction support
-														break;
+			// Transaction operations would be processed here
+			// This is a simplified implementation without full transaction support
+			break;
 
 		default:
-														LOG(ERROR) << "Unknown operation type: " << static_cast<int>(type);
-														break;
+			LOG(ERROR) << "Unknown operation type: " << static_cast<int>(type);
+			break;
+	}
+}
+
+// 3. Update the processLogEntry method if you're still using it
+void DistributedKVStore::processLogEntry(const LogEntry& entry, size_t total_order) {
+	// First update the last applied index
+	{
+		absl::MutexLock lock(&apply_mutex_);
+		if (last_applied_total_order_ < total_order) {
+			last_applied_total_order_ = total_order;
+		}
 	}
 
-	VLOG(3) << "Processed raw log entry with total order " << total_order
-		<< " from client " << client_id;
+	// Only process write operations - reads are handled locally
+	switch (entry.type) {
+		case OpType::PUT: 
+			{
+				// Process a single PUT operation
+				assert(entry.kvPairs.size() == 1);
+				const auto& kv = entry.kvPairs[0];
+
+				// Use the ShardedKVStore directly - no mutex needed here!
+				kv_store_.put(kv.key, kv.value);
+
+				// If this is our own request, complete the pending operation
+				completeOperation(entry.opId.requestId);
+				break;
+			}
+
+		case OpType::DELETE: 
+			{
+				// Process a single DELETE operation
+				assert(entry.kvPairs.size() == 1);
+				const auto& kv = entry.kvPairs[0];
+
+				VLOG(3) << "DELETE operation: " << kv.key;
+
+				// Use the ShardedKVStore directly - no mutex needed here!
+				kv_store_.remove(kv.key);
+
+				// If this is our own request, complete the pending operation
+				completeOperation(entry.opId.requestId);
+				break;
+			}
+
+		case OpType::MULTI_PUT: 
+			{
+				// Process a multi-key PUT operation
+				VLOG(3) << "MULTI_PUT operation with " << entry.kvPairs.size() << " pairs";
+
+				std::vector<std::pair<std::string, std::string>> keyValuePairs;
+				keyValuePairs.reserve(entry.kvPairs.size());
+
+				for (const auto& kv : entry.kvPairs) {
+					keyValuePairs.emplace_back(kv.key, kv.value);
+				}
+				// Use the batch operation for efficiency
+				kv_store_.multiPut(keyValuePairs);
+
+				// If this is our own request, complete the pending operation
+				completeOperation(entry.opId.requestId);
+				break;
+			}
+
+		case OpType::BEGIN_TX:
+		case OpType::COMMIT_TX:
+		case OpType::ABORT_TX:
+			// Transaction operations would be processed here
+			// This is a simplified implementation without full transaction support
+			break;
+
+		default:
+			LOG(ERROR) << "Unknown operation type: " << static_cast<int>(entry.type);
+			break;
+	}
 }
 
 void DistributedKVStore::completeOperation(OPID opId){
@@ -514,7 +509,6 @@ void DistributedKVStore::logConsumer(int fd, std::shared_ptr<ConnectionBuffers> 
 		// If no new data, wait a bit before checking again
 		if (parse_offset == current_write_offset) {
 			std::this_thread::yield();
-			//std::this_thred::sleep_for(std::chrono::microseconds(100));
 		}
 	}
 }
@@ -571,4 +565,39 @@ size_t DistributedKVStore::multiPut(const std::vector<KeyValue>& kvPairs) {
 	publisher_->Publish(serialized.data(), serialized.size());
 
 	return client_order;
+}
+
+void DistributedKVStore::waitForSyncWithLog(){
+	// Get last total_order from the shared log and wait until local KV store is up-to-date
+	return;
+}
+
+// Used by Client to wait for their submitted request
+// Usually client submits multiple requests, and call this on the last order
+// This only works when there's single client.
+// Change following function to track pending_ops_ if there's multi client
+void DistributedKVStore::waitUntilApplied(size_t total_order){
+	publisher_->WriteFinishedOrPuased();
+	while(total_order > last_applied_total_order_){
+		std::this_thread::yield();
+	}
+	LOG(INFO) << "client order:" << total_order << " applied:" << last_applied_total_order_;
+}
+
+std::string DistributedKVStore::get(const std::string& key) {
+	// Wait for all operations up to the desired point to be applied
+	waitForSyncWithLog(/* consistency requirement */);
+
+	// No need for kv_store_mutex_! The ShardedKVStore handles locking internally
+	return kv_store_.get(key);
+}
+
+// Multi-get operation
+std::vector<std::pair<std::string, std::string>> DistributedKVStore::multiGet(
+		const std::vector<std::string>& keys) {
+	// Wait for all operations up to the desired point to be applied
+	waitForSyncWithLog(/* consistency requirement */);
+
+	// Use ShardedKVStore's multiGet for better performance
+	return kv_store_.multiGet(keys);
 }
