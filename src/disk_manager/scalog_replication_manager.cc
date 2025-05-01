@@ -1,4 +1,6 @@
 #include "scalog_replication_manager.h"
+#include "../cxl_manager/cxl_datastructure.h"
+#include "scalog_replication.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/alarm.h>
@@ -15,11 +17,9 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
-#include <thread>
 #include <shared_mutex>
 #include <condition_variable>
 
-#include "scalog_replication.grpc.pb.h"
 
 namespace Scalog {
 
@@ -576,7 +576,7 @@ namespace Scalog {
 			off_t current_disk_offset = next_sequencing_disk_offset_;
 			size_t current_seq = next_global_sequence_number_;
 
-			ScalogMessageHeader header_buffer;
+			Embarcadero::MessageHeader header_buffer;
 
 			for (auto const& [broker, num_messages] : global_cut) {
 				VLOG(5) << "GlobalCut processing broker " << broker << " with " << num_messages << " messages.";
@@ -657,8 +657,8 @@ namespace Scalog {
 		// --- Member Variables ---
 		const std::string base_filename_;
 		int broker_id_;
-		int fd_; // File descriptor (protected by mutex)
 		std::atomic<bool> running_;
+		int fd_; // File descriptor (protected by mutex)
 		std::shared_mutex file_state_mutex_; // Mutex for fd_ state and file ops
 		folly::MPMCQueue<std::optional<WriteTask>> write_queue_; // Queue for tasks
 		std::vector<std::thread> writer_threads_; // Threads processing the queue

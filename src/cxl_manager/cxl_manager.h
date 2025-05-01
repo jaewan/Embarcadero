@@ -4,16 +4,18 @@
 #include <thread>
 #include <iostream>
 #include <optional>
+
 #include "folly/MPMCQueue.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_map.h"
-#include "common/config.h"
-#include "../embarlet/topic_manager.h"
-#include "../network_manager/network_manager.h"
+#include <grpcpp/grpcpp.h>
+
 #include <heartbeat.grpc.pb.h>
 #include "../embarlet/heartbeat.h"
-#include <grpcpp/grpcpp.h>
+#include "cxl_datastructure.h"
 #include "scalog_local_sequencer.h"
+#include "../embarlet/topic_manager.h"
+#include "../network_manager/network_manager.h"
 
 namespace Embarcadero{
 
@@ -23,78 +25,6 @@ class HeartBeatManager;
 class ScalogLocalSequencer;
 
 enum CXL_Type {Emul, Real};
-
-using heartbeat_system::SequencerType;
-using heartbeat_system::SequencerType::EMBARCADERO;
-using heartbeat_system::SequencerType::KAFKA;
-using heartbeat_system::SequencerType::SCALOG;
-using heartbeat_system::SequencerType::CORFU;
-
-/* CXL memory layout
- *
- * CXL is composed of three components; TINode, Bitmap, Segments
- * TINode region: First sizeof(TINode) * MAX_TOPIC
- * + Padding to make each region be aligned in cacheline
- * Bitmap region: Cacheline_size * NUM_MAX_BROKERS
- * BatchHeaders region: NUM_MAX_BROKERS * BATCHHEADERS_SIZE * MAX_TOPIC
- * Segment region: Rest. It is allocated to each brokers equally according to broker_id
- * 		Segment: 8Byte of segment metadata to store address of last ordered_offset from the segment, messages
- * 			Message: Header + paylod
- */
-
-struct alignas(64) offset_entry {
-	struct {
-		volatile size_t log_offset;
-		volatile size_t batch_headers_offset;
-		volatile size_t written;
-		volatile unsigned long long int written_addr;
-		volatile int replication_done[NUM_MAX_BROKERS];
-	}__attribute__((aligned(64)));
-	struct {
-		volatile int ordered;
-		volatile size_t ordered_offset; //relative offset to last ordered message header
-	}__attribute__((aligned(64)));
-};
-
-struct alignas(64) TInode{
-	struct {
-		char topic[TOPIC_NAME_SIZE];
-		volatile bool replicate_tinode = false;
-		volatile int order;
-		volatile int32_t replication_factor;
-		volatile int32_t ack_level;
-		SequencerType seq_type;
-	}__attribute__((aligned(64)));
-
-	volatile offset_entry offsets[NUM_MAX_BROKERS];
-};
-
-struct alignas(64) BatchHeader{
-	size_t client_id;
-	size_t batch_seq;
-	size_t total_size;
-	size_t start_logical_offset;
-	uint32_t broker_id;
-	uint32_t num_brokers; // Stale, used in Order3 Sequencer which can be replaced by directly calling get_num_brokers.Consider changing this variable to seal for buffer write
-	size_t total_order; // Order given by Corfu
-	size_t log_idx;	// Sequencer4: relative log offset to the payload of the batch and elative offset to last message
-	size_t num_msg;
-};
-
-
-// Orders are very important to avoid race conditions. 
-// If you change orders of elements, change how sequencers and combiner check written messages
-struct alignas(64) MessageHeader{
-	volatile size_t paddedSize; // This include message+padding+header size
-	void* segment_header;
-	size_t logical_offset;
-	volatile unsigned long long int next_msg_diff; // Relative to message_header, not cxl_addr_
-	volatile size_t total_order;
-	size_t client_order;
-	uint32_t client_id;
-	volatile uint32_t complete;
-	size_t size;
-};
 
 class CXLManager{
 	public:
@@ -106,9 +36,7 @@ class CXLManager{
 		void* GetNewBatchHeaderLog();
 		TInode* GetTInode(const char* topic);
 		TInode* GetReplicaTInode(const char* topic);
-		bool GetMessageAddr(const char* topic, size_t &last_offset,
-				void* &last_addr, void* &messages, size_t &messages_size);
-		void RunSequencer(const char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType);
+		void RunScalogSequencer(const char topic[TOPIC_NAME_SIZE]);
 		void* GetCXLAddr(){return cxl_addr_;}
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
@@ -169,7 +97,7 @@ class CXLManager{
 		int epoch_to_order_ = 0;
 
 		void CXLIOThread(int tid);
-  
+
 		inline void UpdateTInodeOrderandWritten(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
 				size_t msg_to_order);
 		// inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t msg_to_order);
@@ -177,9 +105,12 @@ class CXLManager{
 		void Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic);
+
 		void Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic);
-		void Sequencer4Worker(std::array<char, TOPIC_NAME_SIZE> topic, int broker,
-				absl::Mutex* mutex, size_t &seq, absl::flat_hash_map<size_t, size_t> &batch_seq);
+		void BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_SIZE> topic);
+		bool ProcessSkipped(std::array<char, TOPIC_NAME_SIZE>& topic,
+				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches);
+		void AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *header, size_t start_total_order);
 
 		size_t global_seq_ = 0;
 		// Map: client_id -> next expected batch_seq
@@ -230,10 +161,6 @@ class CXLManager{
 		};
 		absl::flat_hash_map<size_t, std::unique_ptr<SequentialOrderTracker>> trackers_;
 
-		void BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_SIZE> topic);
-		bool ProcessSkipped(std::array<char, TOPIC_NAME_SIZE>& topic,
-				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches);
-		void AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *header, size_t start_total_order);
 };
 
 class ScalogLocalSequencer {

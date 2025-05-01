@@ -63,6 +63,8 @@ add_executable(embarlet
     embarlet/heartbeat.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
+    embarlet/topic.cc
+    embarlet/topic.h
 )
 
 

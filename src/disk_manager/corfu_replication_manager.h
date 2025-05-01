@@ -2,8 +2,6 @@
 
 #include "common/config.h"
 #include <thread>
-#include <memory>
-#include <string>
 
 // Forward declarations
 namespace grpc {

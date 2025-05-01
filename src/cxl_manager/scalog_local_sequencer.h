@@ -1,13 +1,16 @@
 #ifndef SCALOG_LOCAL_SEQUENCER_H
 #define SCALOG_LOCAL_SEQUENCER_H
 
-#include "cxl_manager.h"
 #include "common/config.h"
+#include "cxl_datastructure.h"
 #include <scalog_sequencer.grpc.pb.h>
+
+namespace Embarcadero{
+	class CXLManager;
+}
 
 namespace Scalog {
 
-class CXLManager;
 using Embarcadero::TInode;
 using Embarcadero::MessageHeader;
 

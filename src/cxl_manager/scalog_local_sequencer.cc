@@ -1,4 +1,5 @@
 #include "scalog_local_sequencer.h"
+#include "cxl_manager.h"
 
 namespace Scalog {
 

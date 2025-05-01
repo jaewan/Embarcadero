@@ -8,8 +8,9 @@
 #include <heartbeat.grpc.pb.h>
 
 namespace Embarcadero{
+
 // the configured options and settings for Embarcadero
-#define Embarcadero_VERSION_MAJOR 0.1
+#define Embarcadero_VERSION_MAJOR 1.0
 #define Embarcadero_VERSION_MINOR 1
 
 #cmakedefine01 __INTEL__
@@ -41,7 +42,7 @@ namespace Embarcadero{
 //#define BATCH_SIZE 524800
 //#define BATCH_SIZE 1048640
 
-#define NUM_DISKS 2
+#define NUM_DISKS 2 //This must be set manually
 
 //********* Corfu configs *********
 #define CORFU_SEQ_PORT 50052
@@ -58,5 +59,7 @@ using GetNumBrokersCallback = std::function<int()>;
 using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers, 
 														struct MessageHeader** msg_to_order, struct TInode *tinode)>;
 using CreateTopicEntryCallback = std::function<bool(char*, int, int, bool, int, heartbeat_system::SequencerType)>;
+
 } // End of namespace Embarcadero
+
 #endif // CONFIG_H

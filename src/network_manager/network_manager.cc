@@ -1,4 +1,3 @@
-#include "network_manager.h"
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
@@ -7,13 +6,19 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <glog/logging.h>
 #include <cstring>
 #include <sstream>
 #include <limits>
 #include <chrono>
 #include <errno.h>
+
+#include <glog/logging.h>
 #include "mimalloc.h"
+
+#include "network_manager.h"
+#include "../disk_manager/disk_manager.h"
+#include "../cxl_manager/cxl_manager.h"
+#include "../embarlet/topic_manager.h"
 
 namespace Embarcadero {
 
@@ -228,7 +233,7 @@ NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads)
 
 		VLOG(3) << "[NetworkManager]: Constructed with " << num_reqReceive_threads_
 			<< " request threads for broker " << broker_id_;
-}
+	}
 
 NetworkManager::~NetworkManager() {
 	// Signal threads to stop
@@ -634,12 +639,16 @@ void NetworkManager::SubscribeNetworkThread(
 		int client_id) {
 
 	size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
+	int order = topic_manager_->GetTopicOrder(topic);
 
 	while (!stop_threads_) {
 		// Get message data to send
 		void* msg = nullptr;
 		size_t messages_size = 0;
 		struct LargeMsgRequest req;
+
+		// Order 4
+		size_t num_exported_batch = 0;
 
 		if (large_msg_queue_.read(req)) {
 			// Process from large message queue
@@ -649,30 +658,47 @@ void NetworkManager::SubscribeNetworkThread(
 			// Get new messages from CXL manager
 			absl::MutexLock lock(&sub_state_[client_id]->mu);
 
-			if (cxl_manager_->GetMessageAddr(
-						topic,
-						sub_state_[client_id]->last_offset,
-						sub_state_[client_id]->last_addr,
-						msg,
-						messages_size)) {
-				// Split large messages into chunks for better flow control
-				while (messages_size > zero_copy_send_limit) {
-					struct LargeMsgRequest r;
-					r.msg = msg;
+			//TODO(Jae) Change other order to work with GetBatchToExport
+			if (order == 4){
+				if (topic_manager_->GetBatchToExport(
+							topic,
+							num_exported_batch,
+							msg,
+							messages_size)){
+						struct LargeMsgRequest r;
+						r.msg = msg;
+						r.len = messages_size;
+						large_msg_queue_.blockingWrite(r);
+					}else{
+						std::this_thread::yield();
+						continue;
+					}
+				}else{
+					if (topic_manager_->GetMessageAddr(
+									topic,
+									sub_state_[client_id]->last_offset,
+									sub_state_[client_id]->last_addr,
+									msg,
+									messages_size)) {
+						// Split large messages into chunks for better flow control
+						while (messages_size > zero_copy_send_limit) {
+							struct LargeMsgRequest r;
+							r.msg = msg;
 
-					// Ensure we don't cut in the middle of a message
-					int mod = zero_copy_send_limit % ((MessageHeader*)msg)->paddedSize;
-					r.len = zero_copy_send_limit - mod;
+							// Ensure we don't cut in the middle of a message
+							int mod = zero_copy_send_limit % ((MessageHeader*)msg)->paddedSize;
+							r.len = zero_copy_send_limit - mod;
 
-					large_msg_queue_.blockingWrite(r);
-					msg = (uint8_t*)msg + r.len;
-					messages_size -= r.len;
+							large_msg_queue_.blockingWrite(r);
+							msg = (uint8_t*)msg + r.len;
+							messages_size -= r.len;
+						}
+					} else {
+						// No new messages, yield and try again
+						std::this_thread::yield();
+						continue;
+					}
 				}
-			} else {
-				// No new messages, yield and try again
-				std::this_thread::yield();
-				continue;
-			}
 		}
 
 		// Validate message size
@@ -836,12 +862,12 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
 			LOG(INFO) << "Broker:" << broker_id_ << " Acknowledgments " << ack;
-	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
-	int replication_factor = tinode->replication_factor;
-		for (int i = 0; i < replication_factor; i++) {
-			int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
-			LOG(INFO) <<"\t done:" <<  tinode->offsets[b].replication_done[broker_id_];
-		}
+			TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+			int replication_factor = tinode->replication_factor;
+			for (int i = 0; i < replication_factor; i++) {
+				int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
+				LOG(INFO) <<"\t done:" <<  tinode->offsets[b].replication_done[broker_id_];
+			}
 			last_log_time = now;
 		}
 
