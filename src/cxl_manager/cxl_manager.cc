@@ -176,48 +176,9 @@ void* CXLManager::GetNewBatchHeaderLog(){
 	return (uint8_t*)batchHeaders_  + offset*BATCHHEADERS_SIZE;
 }
 
-bool CXLManager::GetMessageAddr(const char* topic, size_t &last_offset,
-		void* &last_addr, void* &messages, size_t &messages_size){
-	return topic_manager_->GetMessageAddr(topic, last_offset, last_addr, messages, messages_size);
-}
-
-void CXLManager::RunSequencer(const char topic[TOPIC_NAME_SIZE], int order, SequencerType sequencerType){
-	if (order == 0)
-		return;
-	std::array<char, TOPIC_NAME_SIZE> topic_arr;
-	memcpy(topic_arr.data(), topic, TOPIC_NAME_SIZE);
-
-	switch(sequencerType){
-		case KAFKA: // Kafka is just a way to not run CombinerThread, not actual sequencer
-		case EMBARCADERO:
-			if (order == 1)
-				sequencerThreads_.emplace_back(&CXLManager::Sequencer1, this, topic_arr);
-			else if (order == 2)
-				sequencerThreads_.emplace_back(&CXLManager::Sequencer2, this, topic_arr);
-			else if (order == 3)
-				sequencerThreads_.emplace_back(&CXLManager::Sequencer3, this, topic_arr);
-			else if (order == 4){
-				sequencerThreads_.emplace_back(&CXLManager::Sequencer4, this, topic_arr);
-			}
-			break;
-		case SCALOG:
-			if (order == 1){
-				std::string topic_str(topic);
-				sequencerThreads_.emplace_back(&CXLManager::StartScalogLocalSequencer, this, topic_str);
-			}else if (order == 2)
-				LOG(ERROR) << "Order is set 2 at scalog";
-			break;
-		case CORFU:
-			if (order == 1)
-				LOG(ERROR) << "Order is set 1 at corfu";
-			else if (order == 2){
-				LOG(INFO) << "Order 2 for Corfu is right. But check Client library to change order to 0 in corfu as corfu is already ordered at publish";
-			}
-			break;
-		default:
-			LOG(ERROR) << "Unknown sequencer:" << sequencerType;
-			break;
-	}
+void CXLManager::RunScalogSequencer(const char topic[TOPIC_NAME_SIZE]){
+	std::string topic_str(topic);
+	sequencerThreads_.emplace_back(&CXLManager::StartScalogLocalSequencer, this, topic_str);
 }
 
 void CXLManager::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers,
@@ -801,18 +762,22 @@ void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHead
 		return;
 	}
 	MessageHeader *last_msg_of_batch = nullptr;
+	size_t seq = start_total_order;
+	batch_to_order->total_order = seq;
+
+	size_t logical_offset = batch_to_order->start_logical_offset;
+	size_t batch_start_offset = logical_offset;
+	/*
 	auto tracker_it = trackers_.find(broker);
 	if(tracker_it == trackers_.end()){
 		LOG(ERROR) << "Trackers for broker:" << broker << " not instantiated which cannot happen";
 		return;
 	}
 	auto tracker = tracker_it->second.get();
-	size_t seq = start_total_order;
-
-	size_t logical_offset = batch_to_order->start_logical_offset;
-	size_t batch_start_offset = logical_offset;
 	size_t contiguous_end_offset = tracker->InsertAndGetSequentiallyOrdered(batch_start_offset, batch_to_order->num_msg);
 	bool update_tinode = (contiguous_end_offset >= batch_start_offset + batch_to_order->num_msg);
+	*/
+	bool update_tinode = false;
 
 	for (size_t i = 0; i < num_messages; ++i) {
 		// 1. Wait for message completion (minimize this wait)
@@ -852,7 +817,9 @@ void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHead
 				);
 	} // End message loop
 
+	//tinode->offsets[broker_id].ordered_batch_header->emplace_back(*batch_to_order);
 
+	/*
 	// *** ALWAYS store the physical offset mapping for the last message of THIS batch ***
 	tracker->StorePhysicalOffset(last_msg_of_batch->logical_offset,
 			(uint8_t*)last_msg_of_batch - (uint8_t*)cxl_addr_);
@@ -873,6 +840,7 @@ void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHead
 			UpdateTInodeOrderandWritten(topic.data(), tinode, broker, lookup_offset, addr);
 		}
 	}
+	*/
 }
 
 void CXLManager::StartScalogLocalSequencer(std::string topic_str) {

@@ -7,14 +7,18 @@
 #include <optional>
 #include "folly/MPMCQueue.h"
 #include "common/config.h"
-#include "../network_manager/network_manager.h"
-#include "corfu_replication_manager.h"
-#include "scalog_replication_manager.h"
+
+// Forward Declarations
+namespace Corfu{
+	class CorfuReplicationManager;
+}
+namespace Scalog{
+	class ScalogReplicationManager;
+}
 
 namespace Embarcadero{
 
 namespace fs = std::filesystem;
-class NetworkManager;
 
 struct ReplicationRequest{
 	TInode* tinode;
@@ -36,7 +40,6 @@ class DiskManager{
 		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory,
 								heartbeat_system::SequencerType sequencerType, size_t queueCapacity = 64);
 		~DiskManager();
-		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
 		// Change this to get real-time num brokers
 		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
@@ -56,7 +59,6 @@ class DiskManager{
 		bool log_to_memory_;
 		heartbeat_system::SequencerType sequencerType_;
 
-		NetworkManager *network_manager_;
 		std::unique_ptr<Corfu::CorfuReplicationManager> corfu_replication_manager_;
 		std::unique_ptr<Scalog::ScalogReplicationManager> scalog_replication_manager_;
 

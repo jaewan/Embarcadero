@@ -7,9 +7,8 @@
 #include <random>
 #include <mutex>
 #include <atomic>
-#include "common/config.h"
 
-// Include the generated gRPC headers
+#include "common/config.h"
 #include "scalog_replication.grpc.pb.h"
 
 namespace grpc {
@@ -17,8 +16,6 @@ class Channel;
 }
 
 namespace Scalog {
-
-#define NUM_BROKERS 4
 
 /**
  * @brief Thread-safe client for the Scalog Replication Service

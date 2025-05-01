@@ -213,15 +213,20 @@ int main(int argc, char* argv[]) {
 	topic_manager.RegisterGetNumBrokersCallback(
 			std::bind(&heartbeat_system::HeartBeatManager::GetNumBrokers, &heartbeat_manager));
 
+	topic_manager.RegisterGetRegisteredBrokersCallback(
+				std::bind(&heartbeat_system::HeartBeatManager::GetRegisteredBrokers, &heartbeat_manager,
+					std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+
+
 	network_manager.RegisterGetNumBrokersCallback(
 			std::bind(&heartbeat_system::HeartBeatManager::GetNumBrokers, &heartbeat_manager));
 
 	// Connect managers
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);
-	disk_manager.SetNetworkManager(&network_manager);
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
+	network_manager.SetTopicManager(&topic_manager);
 
 	// Signal initialization completion
 	SignalScriptReady();

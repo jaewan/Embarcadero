@@ -1,6 +1,3 @@
-#include "disk_manager.h"
-#include "corfu_replication_manager.h"
-
 #include <unistd.h>
 #include <pwd.h>
 #include <sys/types.h>
@@ -9,8 +6,14 @@
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
-#include "mimalloc.h"
 #include <iostream>
+
+#include "mimalloc.h"
+
+#include "disk_manager.h"
+#include "scalog_replication_manager.h"
+#include "corfu_replication_manager.h"
+#include "../cxl_manager/cxl_datastructure.h"
 
 namespace Embarcadero{
 

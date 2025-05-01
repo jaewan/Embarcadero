@@ -1,4 +1,5 @@
 #include "scalog_global_sequencer.h"
+#include <glog/logging.h>
 
 // NOTE: The global sequencer will only begin sending global cuts after NUM_MAX_BROKERS have sent HandleRegisterBroker requests.
 ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {

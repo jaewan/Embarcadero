@@ -467,9 +467,9 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		for (size_t i = 0; i < n; i++) {
 
 			// If using steady rate, pause periodically
-			if (steady_rate && (sent_bytes >= (BATCH_SIZE*10))) {
+			if (steady_rate && (sent_bytes >= (BATCH_SIZE*4))) {
 				p.WriteFinishedOrPuased();
-				std::this_thread::sleep_for(std::chrono::nanoseconds(1000));
+				std::this_thread::sleep_for(std::chrono::microseconds(1500));
 				sent_bytes = 0;
 				// Capture current timestamp and embed it in the message
 				auto timestamp = std::chrono::steady_clock::now();

@@ -1,4 +1,5 @@
 #include "corfu_replication_manager.h"
+#include "corfu_replication.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/alarm.h>
@@ -16,8 +17,6 @@
 #include <cstring>
 #include <shared_mutex>
 #include <condition_variable>
-
-#include "corfu_replication.grpc.pb.h"
 
 namespace Corfu {
 
@@ -221,8 +220,8 @@ namespace Corfu {
     }
 
 			const std::string base_filename_;
-			int fd_ = -1;
 			std::atomic<bool> running_;
+			int fd_ = -1;
 			std::shared_mutex file_state_mutex_; // Use shared mutex
 
 			// For fsync thread

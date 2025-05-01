@@ -10,13 +10,12 @@
 #include "absl/container/flat_hash_map.h"
 
 #include "common/config.h"
-#include "../disk_manager/disk_manager.h"
-#include "../cxl_manager/cxl_manager.h"
 
 namespace Embarcadero {
 
 class CXLManager;
 class DiskManager;
+class TopicManager;
 
 enum ClientRequestType {Publish, Subscribe};
 
@@ -68,6 +67,7 @@ public:
     
     void SetDiskManager(DiskManager* disk_manager) { disk_manager_ = disk_manager; }
     void SetCXLManager(CXLManager* cxl_manager) { cxl_manager_ = cxl_manager; }
+    void SetTopicManager(TopicManager* topic_manager) { topic_manager_ = topic_manager; }
 		void RegisterGetNumBrokersCallback(GetNumBrokersCallback callback){
 			get_num_brokers_callback_ = callback;
 		}
@@ -114,6 +114,7 @@ private:
     // Manager dependencies
     CXLManager* cxl_manager_ = nullptr;
     DiskManager* disk_manager_ = nullptr;
+    TopicManager* topic_manager_ = nullptr;
 
 		Embarcadero::GetNumBrokersCallback get_num_brokers_callback_;
 };

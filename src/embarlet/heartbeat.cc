@@ -392,7 +392,7 @@ std::string HeartBeatServiceImpl::GetNextBrokerAddr(int broker_id) {
 int HeartBeatServiceImpl::GetNumBrokers () {
 	static size_t initial_num_node = nodes_.size();
 	if (initial_num_node != nodes_.size()) {
-		LOG(WARNING) << "Number of nodes in the Cluster changed";
+		//LOG(WARNING) << "Number of nodes in the Cluster changed";
 	}
 	return (int)nodes_.size();
 }

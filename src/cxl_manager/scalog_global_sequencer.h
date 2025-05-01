@@ -1,12 +1,13 @@
-#include <grpcpp/grpcpp.h>
 #include <condition_variable>
-#include <glog/logging.h>
+#include <thread>
+
+#include <grpcpp/grpcpp.h>
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/btree_map.h"
+
 #include <scalog_sequencer.grpc.pb.h>
 #include "common/config.h"
-#include <thread>
 
 class ScalogGlobalSequencer : public ScalogSequencer::Service {
 	public:
