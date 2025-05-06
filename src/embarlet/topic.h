@@ -241,18 +241,16 @@ class Topic {
 		
 		// Sequencing
 		// Ordered batch vector for efficient subscribe
-		std::vector<BatchHeader> ordered_batch_;
-
 		void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers);
 		void Sequencer4();
 		void BrokerScannerWorker(int broker_id);
 		bool ProcessSkipped(
-				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches);
-		void AssignOrder(BatchHeader *header, size_t start_total_order);
+				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
+				BatchHeader* &header_for_sub);
+		void AssignOrder(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);
 
 		size_t global_seq_ = 0;
 		absl::flat_hash_map<size_t, size_t> next_expected_batch_seq_;// client_id -> next expected batch_seq
 		absl::Mutex global_seq_batch_seq_mu_;;
-		folly::MPMCQueue<BatchHeader*> ready_batches_queue_{1024*8};
 };
 } // End of namespace Embarcadero

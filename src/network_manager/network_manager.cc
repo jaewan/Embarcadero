@@ -458,7 +458,7 @@ void NetworkManager::HandlePublishRequest(
 		// Read batch header
 		BatchHeader batch_header;
 		batch_header.client_id = handshake.client_id;
-		batch_header.num_brokers = handshake.num_msg;  // Used as num_brokers at publish time
+		batch_header.ordered = 0;
 
 		ssize_t bytes_read = recv(client_socket, &batch_header, sizeof(BatchHeader), 0);
 		if (bytes_read <= 0) {
@@ -647,34 +647,27 @@ void NetworkManager::SubscribeNetworkThread(
 		size_t messages_size = 0;
 		struct LargeMsgRequest req;
 
-		// Order 4
-		size_t num_exported_batch = 0;
-
 		if (large_msg_queue_.read(req)) {
 			// Process from large message queue
 			msg = req.msg;
 			messages_size = req.len;
+			VLOG(3) << "[DEBUG] poped from queue:" << messages_size;
 		} else {
 			// Get new messages from CXL manager
 			absl::MutexLock lock(&sub_state_[client_id]->mu);
 
 			//TODO(Jae) Change other order to work with GetBatchToExport
 			if (order == 4){
-				if (topic_manager_->GetBatchToExport(
+				if (!topic_manager_->GetBatchToExport(
 							topic,
-							num_exported_batch,
+							sub_state_[client_id]->last_offset,
 							msg,
 							messages_size)){
-						struct LargeMsgRequest r;
-						r.msg = msg;
-						r.len = messages_size;
-						large_msg_queue_.blockingWrite(r);
-					}else{
 						std::this_thread::yield();
 						continue;
 					}
-				}else{
-					if (topic_manager_->GetMessageAddr(
+			}else{
+				if (topic_manager_->GetMessageAddr(
 									topic,
 									sub_state_[client_id]->last_offset,
 									sub_state_[client_id]->last_addr,
@@ -693,12 +686,12 @@ void NetworkManager::SubscribeNetworkThread(
 							msg = (uint8_t*)msg + r.len;
 							messages_size -= r.len;
 						}
-					} else {
-						// No new messages, yield and try again
-						std::this_thread::yield();
-						continue;
-					}
+				} else {
+					// No new messages, yield and try again
+					std::this_thread::yield();
+					continue;
 				}
+			}
 		}
 
 		// Validate message size
