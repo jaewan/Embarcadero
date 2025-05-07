@@ -310,7 +310,7 @@ void* Buffer::Read(int bufIdx) {
 	while (batch_header->total_size == 0 || batch_header->num_msg == 0) {
 		auto current_time = std::chrono::steady_clock::now();
 		if (current_time - start_time > timeout) {
-			VLOG(4) << "Read wait timeout for buffer " << bufIdx;
+			// Read wait timeout for buffer
 			return nullptr; // Return null after timeout
 		}
 		std::this_thread::yield();
