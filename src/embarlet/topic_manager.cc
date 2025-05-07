@@ -354,15 +354,33 @@ bool TopicManager::GetMessageAddr(
 }
 
 int TopicManager::GetTopicOrder(const char* topic){
-	absl::ReaderMutexLock lock(&mutex_);
+	mutex_.ReaderLock();
 
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()) {
-		LOG(ERROR) << "Topic:" << topic << " Does not Exist!!";
-		// Not throwing error as subscribe can be called before topic creation
-		return 0;
+		const TInode* tinode = cxl_manager_.GetTInode(topic);
+		if (tinode && memcmp(topic, tinode->topic, TOPIC_NAME_SIZE) == 0) {
+			// Topic was created from another broker, create it locally
+			mutex_.ReaderUnlock();
+			CreateNewTopicInternal(topic);
+			mutex_.ReaderLock();
+			topic_itr = topics_.find(topic);
+
+			if (topic_itr == topics_.end()) {
+				LOG(ERROR) << "Topic:" << topic << " Does not Exist!!";
+				mutex_.ReaderUnlock();
+				return 0;
+			}
+		} else {
+			LOG(ERROR) << "[GetTopicOrder] Topic: " << topic 
+				<< " was not created before: " << tinode->topic
+				<< " memcmp: " << memcmp(topic, tinode->topic, TOPIC_NAME_SIZE);
+			mutex_.ReaderUnlock();
+			return 0;
+		}
 	}
 
+	mutex_.ReaderUnlock();
 	return topic_itr->second->GetOrder();
 }
 

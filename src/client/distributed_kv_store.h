@@ -247,7 +247,7 @@ class DistributedKVStore {
 		void completeOperation(OPID opId);
 
 		// Consumer thread function to process log entries
-		void logConsumer(int fd, std::shared_ptr<ConnectionBuffers> conn_buffers);
+		void logConsumer();
 
 		void waitForSyncWithLog();
 

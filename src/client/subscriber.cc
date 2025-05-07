@@ -930,6 +930,8 @@ void ConnectionBuffers::release_read_buffer(BufferState* acquired_buffer) {
 	receiver_can_write_cv.Signal();
 }
 
+// Return pointer to message header
+// Return in total_order
 void* Subscriber::Consume(int timeout_ms) {
     static size_t next_expected_order = 0;
 
@@ -967,8 +969,8 @@ void* Subscriber::Consume(int timeout_ms) {
 					}
 					next_expected_order++;
 					acquired_buffers[last_success_fd].second = (void*)((uint8_t*)header + header->paddedSize);
-					return static_cast<void*>(
-						(int8_t*)header + sizeof(Embarcadero::MessageHeader));
+					return static_cast<void*>(header);
+						//(int8_t*)header + sizeof(Embarcadero::MessageHeader));
 				}
 			}
 		}
@@ -993,8 +995,8 @@ void* Subscriber::Consume(int timeout_ms) {
 						next_expected_order++;
 						//acquired_buffers[fd].second = (void*)((uint8_t*)header + header->paddedSize);
 						pair.second = (void*)((uint8_t*)header + header->paddedSize);
-						return static_cast<void*>(
-							(int8_t*)header + sizeof(Embarcadero::MessageHeader));
+						return static_cast<void*>(header);
+							//(int8_t*)header + sizeof(Embarcadero::MessageHeader));
 					}
 				}else{
 					continue;
