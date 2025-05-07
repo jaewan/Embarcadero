@@ -139,15 +139,7 @@ DistributedKVStore::DistributedKVStore(SequencerType seq_type)
 		server_id_ = publisher_->GetClientId();
 
 		subscriber_->WaitUntilAllConnected(); // Asuume there exists NUM_MAX_BROKERS
-		{
-			absl::MutexLock map_lock(&subscriber_->connection_map_mutex_);
-			for (const auto& [fd, conn_buffers] : subscriber_->connections_) {
-				// Spawn a consumer thread for each connection buffer
-				log_consumer_threads_.emplace_back(&DistributedKVStore::logConsumer, this, fd, conn_buffers);
-			}
-			// Get iterate subscriber_->connections_ and spawn a thread to log_consumer_threads_ vector
-			// Have the thread to read a message -> desrialize the message -> call processLogEntry
-		}
+		log_consumer_threads_.emplace_back(&DistributedKVStore::logConsumer, this);
 	}
 
 DistributedKVStore::~DistributedKVStore() {
@@ -420,96 +412,39 @@ void DistributedKVStore::completeOperation(OPID opId){
 		 */
 }
 
-void DistributedKVStore::logConsumer(int fd, std::shared_ptr<ConnectionBuffers> conn_buffers) {
-	if (!conn_buffers) {
-		LOG(ERROR) << "Invalid connection buffer for FD " << fd;
-		return;
-	}
-
-	// For simplicity, we'll directly use the current write buffer (0)
-	// We're not implementing the dual buffer switch for now
-	const int buffer_idx = 0; // Use only the first buffer
-
-	// Track where we've parsed up to in the buffer
-	size_t parse_offset = 0;
-
+// Process messages in without caring total_order
+void DistributedKVStore::logConsumer() {
 	while (running_) {
-		// Get the current buffer state
-		BufferState& buffer = conn_buffers->buffers[buffer_idx];
-
-		// Get the current write offset (how much data has been written by the receiver)
-		size_t current_write_offset = buffer.write_offset.load(std::memory_order_acquire);
-
-		// Check if there's new data to process
-		if (current_write_offset > parse_offset) {
-			// Process new data in the buffer
-			uint8_t* buffer_start = static_cast<uint8_t*>(buffer.buffer);
-
-			// Process messages one by one
-			while (parse_offset + sizeof(Embarcadero::MessageHeader) <= current_write_offset) {
-				// Get a pointer to the message header
-				Embarcadero::MessageHeader* header = reinterpret_cast<Embarcadero::MessageHeader*>(buffer_start + parse_offset);
-
-				// Make sure the entire message is available
-				if (parse_offset + header->paddedSize > current_write_offset) {
-					// Partial message, wait for more data
-					break;
-				}
-
-				// Check if the message is complete (set by the broker)
-				if (header->complete != 1) {
-					// Message not yet marked as complete, wait
-					break;
-				}
-
-				// Extract the message payload (skip the header)
-				void* payload = buffer_start + parse_offset + sizeof(Embarcadero::MessageHeader);
-				size_t payload_size = header->size;
-
-				// Process the message only if it has a payload
-				if (payload_size > 0) {
-					try {
-						/*
-						// Deserialize the message into a LogEntry
-						LogEntry entry = LogEntry::deserialize(payload, header->client_id, header->client_order);
-
-						// Set the operation ID from the message header
-						entry.opId.clientId = header->client_id;
-						entry.opId.requestId = header->client_order;
-
-						// Process the log entry with the total ordering from the message
-						processLogEntry(entry, header->total_order);
-
-						VLOG(3) << "Processed log entry with total order " << header->total_order
-						<< " from client " << header->client_id;
-						*/
-						processLogEntryFromRawBuffer(
-								payload,
-								payload_size,
-								header->client_id,
-								header->client_order,
-								header->total_order
-								);
-					} catch (const std::exception& e) {
-						LOG(ERROR) << "Error processing message: " << e.what();
-					}
-				}
-
-				// Move to the next message
-				parse_offset += header->paddedSize;
-			}
-		} else if (current_write_offset < parse_offset) {
-			// This should not happen normally, but might indicate a buffer reset or rollover
-			LOG(WARNING) << "Write offset (" << current_write_offset
-				<< ") is less than parse offset (" << parse_offset
-				<< ") for FD " << fd;
-			parse_offset = current_write_offset;
-		}
-
-		// If no new data, wait a bit before checking again
-		if (parse_offset == current_write_offset) {
+		Embarcadero::MessageHeader *header =	(Embarcadero::MessageHeader*)subscriber_->Consume();
+		if(header == nullptr){
 			std::this_thread::yield();
+			continue;
 		}
+
+		// Extract the message payload (skip the header)
+		void* payload = (void*)((uint8_t*)header + sizeof(Embarcadero::MessageHeader));
+		size_t payload_size = header->size;
+		processLogEntryFromRawBuffer(
+				payload,
+				payload_size,
+				header->client_id,
+				header->client_order,
+				header->total_order
+		);
+		/*
+		// Deserialize the message into a LogEntry
+		LogEntry entry = LogEntry::deserialize(payload, header->client_id, header->client_order);
+
+		// Set the operation ID from the message header
+		entry.opId.clientId = header->client_id;
+		entry.opId.requestId = header->client_order;
+
+		// Process the log entry with the total ordering from the message
+		processLogEntry(entry, header->total_order);
+
+		VLOG(3) << "Processed log entry with total order " << header->total_order
+		<< " from client " << header->client_id;
+		*/
 	}
 }
 
