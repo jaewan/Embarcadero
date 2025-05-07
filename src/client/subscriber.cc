@@ -1,4 +1,5 @@
 #include "subscriber.h"
+#include "../cxl_manager/cxl_datastructure.h"
 #include <algorithm>
 #include <iomanip>
 #include <cmath>
@@ -94,19 +95,13 @@ void Subscriber::RemoveConnection(int fd) {
 }
 
 bool Subscriber::DEBUG_check_order(int order) {
-	//if (DEBUG_do_not_check_order_) {
-	//     LOG(INFO) << "DEBUG: Order checking explicitly disabled, skipping.";
-	//     return true;
-	//}
-	return true;
-
 	// 1. Aggregate all message headers from all connection buffers
 	std::vector<Embarcadero::MessageHeader> all_headers;
 	size_t total_bytes_parsed = 0;
 	// Aggregating message headers from all connections...
 	{ // Scope for locking the connection map
-		absl::MutexLock map_lock(&connection_map_mutex_);
-		all_headers.reserve(DEBUG_count_ / sizeof(Embarcadero::MessageHeader)); // Rough estimate
+		absl::ReaderMutexLock map_lock(&connection_map_mutex_);
+		//all_headers.reserve(DEBUG_count_ / sizeof(Embarcadero::MessageHeader)); // Rough estimate
 
 		for (auto const& [fd, conn_ptr] : connections_) {
 			if (!conn_ptr) continue;
@@ -176,7 +171,7 @@ bool Subscriber::DEBUG_check_order(int order) {
 		// Assuming -1 means unassigned (as per original code)
 		if (header.logical_offset == static_cast<size_t>(-1)) {
 			LOG(ERROR) << "DEBUG Check Failed (Level 0): Message client_order=" << header.client_order
-				<< ", client_id=" << header.client_id << " has unassigned logical_offset (-1).";
+				<< ", total_order=" << header.total_order << " has unassigned logical_offset (-1).";
 			overall_status = false;
 			// Don't break, report all such errors
 		}
@@ -244,7 +239,7 @@ bool Subscriber::DEBUG_check_order(int order) {
 			size_t prev_total_order = all_headers[i-1].total_order;
 			if (current_total_order > prev_total_order + 1) { // <--- Compare copies
 				LOG(ERROR) << "DEBUG Check Failed (Level 1): Hole detected in total_order sequence. "
-					<< "Current=" << current_total_order << ", Previous=" << prev_total_order;
+					<< "Current=" << current_total_order << ", Previous=" << prev_total_order << " client order:" << header.client_order;
 				contiguity_ok = false;
 				overall_status = false;
 			}
@@ -321,7 +316,7 @@ void Subscriber::StoreLatency() {
 	size_t total_messages_parsed = 0;
 
 	{ // Scope for locking the connection map
-		absl::MutexLock map_lock(&connection_map_mutex_);
+		absl::ReaderMutexLock map_lock(&connection_map_mutex_);
 
 		for (auto const& [fd, conn_ptr] : connections_) {
 			if (!conn_ptr) continue;
@@ -645,7 +640,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 	// --- Resource Allocation ---
 	std::shared_ptr<ConnectionBuffers> conn_buffers;
 	{
-		absl::MutexLock lock(&connection_map_mutex_);
+		absl::ReaderMutexLock lock(&connection_map_mutex_);
 		auto it = connections_.find(fd_to_handle);
 		if (it == connections_.end()) {
 			LOG(ERROR) << "Worker (fd=" << fd_to_handle << "): Could not find ConnectionBuffers in map.";
@@ -671,7 +666,8 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 	memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
 
 	if (send(conn_buffers->fd, &shake, sizeof(shake), 0) < static_cast<ssize_t>(sizeof(shake))) {
-		LOG(ERROR) << "Worker (broker " << broker_id << "): Failed to send subscription request on fd " << fd_to_handle << ": " << strerror(errno);
+		LOG(ERROR) << "Worker (broker " << broker_id << "): Failed to send subscription request on fd " 
+			<< fd_to_handle << ": " << strerror(errno);
 		// unique_ptr cleans up resources automatically when function returns
 		close(conn_buffers->fd);
 		RemoveConnection(conn_buffers->fd);
@@ -717,27 +713,17 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		if (bytes_received > 0) {
 			// 4. Advance write offset (BEFORE getting timestamp)
 			conn_buffers->advance_write_offset(bytes_received);
-
 			// 5. Record Timestamp and NEW Offset
-			auto recv_complete_time = std::chrono::steady_clock::now();
-			// Get the offset *after* the write
-			size_t current_end_offset = conn_buffers->buffers[conn_buffers->current_write_idx.load()].write_offset.load(std::memory_order_relaxed);
-
-			if (measure_latency_) { // Still use the flag
-															// Store the pair within the ConnectionBuffers
-				{
-					absl::MutexLock lock(&conn_buffers->state_mutex);
-					conn_buffers->recv_log.emplace_back(recv_complete_time, current_end_offset);
-				}
+			if (measure_latency_) {
+				absl::MutexLock lock(&conn_buffers->state_mutex);
+				auto recv_complete_time = std::chrono::steady_clock::now();
+				size_t current_end_offset = conn_buffers->buffers[conn_buffers->current_write_idx.load()].write_offset.load(std::memory_order_relaxed);
+				conn_buffers->recv_log.emplace_back(recv_complete_time, current_end_offset);
 			}
 
-			// Update global byte count (same as before)
 			DEBUG_count_.fetch_add(bytes_received, std::memory_order_relaxed);
-
-			// --- NO MESSAGE PARSING OR LATENCY CALCULATION HERE ---
-
 		} else if (bytes_received == 0) {
-			// Handle disconnect (same as before, including potential final signal)
+			// Handle disconnect 
 			size_t final_write_offset = conn_buffers->buffers[conn_buffers->current_write_idx.load()].write_offset.load();
 			if (final_write_offset > 0) {
 				absl::MutexLock lock(&conn_buffers->state_mutex);
@@ -747,7 +733,6 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 			}
 			break;
 		} else { // bytes_received < 0
-						 // Handle errors (same as before, including potential final signal)
 			if (errno == EINTR) continue;
 			if (shutdown_.load(std::memory_order_relaxed)) { /* log shutdown */ }
 			else { LOG(ERROR) << "Worker (fd=" << conn_buffers->fd << "): recv failed: " << strerror(errno); }
@@ -762,7 +747,6 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 
 	// --- Cleanup ---
 	close(fd_to_handle);
-	// unique_ptr<ManagedConnectionResources> 'resources' cleans up mmap/malloc automatically upon exit.
 
 	VLOG(5) << "Worker thread for broker " << broker_id << ", FD " << fd_to_handle << " finished.";
 }
@@ -946,54 +930,77 @@ void ConnectionBuffers::release_read_buffer(BufferState* acquired_buffer) {
 	receiver_can_write_cv.Signal();
 }
 
-ConsumedData Subscriber::Consume(std::chrono::milliseconds timeout) {
-	absl::MutexLock lock(&connection_map_mutex_); // Lock map while iterating
+void* Subscriber::Consume(int timeout_ms) {
+    static size_t next_expected_order = 0;
 
-	// Simple round-robin or just iterate start? Store last consumed FD?
-	// Let's just iterate for now.
+    // Optimization 1: Track last successful location to resume from there
+    static int last_success_fd = -1;
 
-	auto start_time = std::chrono::steady_clock::now();
-	do {
-		for (auto const& [fd, conn_ptr] : connections_) {
-			if (conn_ptr) {
-				// Attempt to acquire a read buffer from this connection
-				// acquire_read_buffer locks its own state mutex internally
-				BufferState* acquired_buffer = conn_ptr->acquire_read_buffer();
-				if (acquired_buffer) {
-					// Found a buffer! Prepare ConsumedData
-					ConsumedData result;
-					result.connection = conn_ptr; // Store shared_ptr to keep it alive
-					result.buffer_state = acquired_buffer;
-					result.data_size = acquired_buffer->write_offset.load(std::memory_order_relaxed); // Get size when acquired
+		// Assuming no new buffer is added after first Consume is called
+		// Assuming MessageHeader is written as beginning of a buffer (which may not be true in buffer 1)
+		// Assuming only buffer 0 is used
+		static absl::flat_hash_map<int, std::pair<std::shared_ptr<ConnectionBuffers>, void*>> acquired_buffers;
+		if(acquired_buffers.size() == 0){
+			absl::ReaderMutexLock map_lock(&connection_map_mutex_);
+			for (auto const& [fd, conn_ptr] : connections_) {
+				if (!conn_ptr) continue;
+				acquired_buffers[fd] = std::make_pair(conn_ptr, conn_ptr->buffers[0].buffer);
+			}
+		}
 
-					VLOG(3) << "Consume: Returning buffer " << (acquired_buffer == &conn_ptr->buffers[0] ? 0 : 1)
-						<< " from fd=" << fd << " with size=" << result.data_size;
-					return result; // Return the consumable data block
+		// First, try the last successful location if available
+		if (last_success_fd != -1){
+			auto const& pair = acquired_buffers[last_success_fd];
+			Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)pair.second;
+			std::pair<void*, size_t> written_loc = pair.first->get_write_location();
+			void* written_ptr = written_loc.first;
+			size_t written_offset = written_loc.second;
+			size_t written_size = (size_t)(static_cast<uint8_t*>(written_ptr) - (uint8_t*)header);
+			//TODO(Jae) this is buggy if write spans two buffers.
+			if(written_size >= sizeof(Embarcadero::MessageHeader)){
+				if(header->total_order == next_expected_order){
+					// Wait untill full message is received
+					while(written_size < header->paddedSize){
+						std::this_thread::yield();
+						written_loc = pair.first->get_write_location();
+						written_size = (size_t)(static_cast<uint8_t*>(written_loc.first) - (uint8_t*)header);
+					}
+					next_expected_order++;
+					acquired_buffers[last_success_fd].second = (void*)((uint8_t*)header + header->paddedSize);
+					return static_cast<void*>(
+						(int8_t*)header + sizeof(Embarcadero::MessageHeader));
 				}
 			}
-		} // End for loop through connections
-
-		// No buffer found in this pass. Wait?
-		if (timeout == std::chrono::milliseconds(0)) {
-			break; // Non-blocking: exit loop if nothing found first time
 		}
 
-		VLOG(5) << "Consume: No data ready, waiting...";
-		// Wait for a signal that *some* buffer *might* be ready
-		// Unlock map mutex while waiting on global CV
-		consume_cv_.WaitWithTimeout(&connection_map_mutex_, absl::Milliseconds(timeout.count()));
-		VLOG(5) << "Consume: Woke up from wait.";
+		// Iterate buffers
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+		do{
+			for (auto& [fd, pair] : acquired_buffers){
+				std::pair<void*, size_t> written_loc = pair.first->get_write_location();
+				void* written_ptr = written_loc.first;
+				Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)pair.second;
+				size_t written_size = (size_t)(static_cast<uint8_t*>(written_ptr) - (uint8_t*)header);
+				if(written_size >= sizeof(Embarcadero::MessageHeader)){
+					if(header->total_order == next_expected_order){
+						// Wait untill full message is received
+						while(written_size < header->paddedSize){
+							std::this_thread::yield();
+							written_loc = pair.first->get_write_location();
+							written_size = (size_t)(static_cast<uint8_t*>(written_loc.first) - (uint8_t*)header);
+						}
+						last_success_fd = fd;
+						next_expected_order++;
+						//acquired_buffers[fd].second = (void*)((uint8_t*)header + header->paddedSize);
+						pair.second = (void*)((uint8_t*)header + header->paddedSize);
+						return static_cast<void*>(
+							(int8_t*)header + sizeof(Embarcadero::MessageHeader));
+					}
+				}else{
+					continue;
+				}
+			}
+		}while(std::chrono::steady_clock::now() >= deadline);
 
-		// Check timeout
-		if (std::chrono::steady_clock::now() - start_time >= timeout) {
-			VLOG(4) << "Consume: Timeout expired.";
-			break; // Timeout expired
-		}
-		// If not timed out, loop again to check connections
-
-	} while (timeout > std::chrono::milliseconds(0)); // Loop only if timeout > 0
-
-
-	VLOG(4) << "Consume: Returning empty data block.";
-	return ConsumedData{}; // Return empty object if no data found or timeout
+    return nullptr;
 }

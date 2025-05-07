@@ -24,7 +24,6 @@ struct BufferState {
 
 	~BufferState() {
 		if (buffer != nullptr && buffer != MAP_FAILED) {
-			VLOG(3) << "BufferState: Unmapping buffer of size " << capacity << " at " << buffer;
 			munmap(buffer, capacity);
 			buffer = nullptr;
 		}
@@ -96,7 +95,8 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 
 	// Called by Receiver: Update write offset after successful recv()
 	void advance_write_offset(size_t bytes_written) {
-		int write_idx = current_write_idx.load(std::memory_order_relaxed);
+		//int write_idx = current_write_idx.load(std::memory_order_relaxed);
+		int write_idx = current_write_idx;
 		buffers[write_idx].write_offset.fetch_add(bytes_written, std::memory_order_relaxed);
 	}
 
@@ -154,7 +154,7 @@ class Subscriber {
 		~Subscriber(); // Important to manage shutdown and cleanup
 
 		// The method the application calls to get data
-		ConsumedData Consume(std::chrono::milliseconds timeout = std::chrono::milliseconds(0));
+		void* Consume(int timeout_ms = 1000);
 
 		// Called by client code after test is finished
 		void StoreLatency();
@@ -181,7 +181,7 @@ class Subscriber {
 			size_t expected = NUM_MAX_BROKERS * NUM_SUB_CONNECTIONS;
 			while (num_connections < expected) {
 				{
-					absl::MutexLock map_lock(&connection_map_mutex_);
+					absl::ReaderMutexLock map_lock(&connection_map_mutex_);
 					num_connections = connections_.size();
 				}
 				if(num_connections < expected){
