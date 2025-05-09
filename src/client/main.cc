@@ -214,6 +214,15 @@ int main(int argc, char* argv[]) {
             writer.SetSubResult(sub_bandwidthMb);
             break;
         }
+        case 7: {
+            // Publish and Subscribe test
+            CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode, ack_level);
+            LOG(INFO) << "Running Publish and Consume: " << total_message_size;
+            double pub_bandwidthMb = PublishThroughputTest(result, topic, synchronizer);
+            sleep(3);
+            double sub_bandwidthMb = ConsumeThroughputTest(result, topic);
+            break;
+        }
         default:
             LOG(ERROR) << "Invalid test number option:" << result["test_number"].as<int>();
             break;

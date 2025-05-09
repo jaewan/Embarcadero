@@ -60,6 +60,7 @@ class CXLManager{
 		bool GetStopThreads(){
 			return stop_threads_;
 		}
+
 		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t ordered_offset){
 			if(tinode->replicate_tinode){
 				struct TInode *replica_tinode = GetReplicaTInode(topic);
@@ -98,19 +99,10 @@ class CXLManager{
 
 		void CXLIOThread(int tid);
 
-		inline void UpdateTInodeOrderandWritten(char *topic, TInode* tinode, int broker, size_t msg_logical_off,
-				size_t msg_to_order);
-		// inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t msg_to_order);
 
 		void Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic);
 		void Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic);
-
-		void Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic);
-		void BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_SIZE> topic);
-		bool ProcessSkipped(std::array<char, TOPIC_NAME_SIZE>& topic,
-				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches);
-		void AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *header, size_t start_total_order);
 
 		size_t global_seq_ = 0;
 		// Map: client_id -> next expected batch_seq
