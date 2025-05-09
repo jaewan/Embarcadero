@@ -10,11 +10,11 @@
 #include <queue>
 #include <condition_variable>
 #include <glog/logging.h>
-#include <thread> 
+#include <thread>
 #include <csignal>
-#include <chrono> 
-#include <errno.h> 
-#include <cstring> 
+#include <chrono>
+#include <errno.h>
+#include <cstring>
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -44,8 +44,11 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 					batch_seq_per_clients_[client_id] = 0;  // Always start from 0
 					pending_requests_[client_id] = PriorityQueue();
 				}
-				if(idx_per_broker_.find(broker_id) == idx_per_broker_.end()){
+
+				// Initialize broker-specific data structures if this is the first request for this broker
+				if (idx_per_broker_.find(broker_id) == idx_per_broker_.end()) {
 					idx_per_broker_[broker_id] = 0;
+					batch_seq_per_broker_[broker_id] = 0;
 				}
 
 				// Check if this batch_seq has already been processed
@@ -57,7 +60,7 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 
 				// If this is not the next expected batch sequence, queue it
 				if (batch_seq != batch_seq_per_clients_[client_id]) {
-					std::promise<std::pair<uint64_t, uint64_t>> promise;
+					std::promise<std::tuple<uint64_t, uint64_t, uint64_t>> promise;
 					auto future = promise.get_future();
 
 					// Queue the request
@@ -70,8 +73,9 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 					// Wait for this request's turn
 					try {
 						auto result = future.get();
-						response->set_total_order(result.first);
-						response->set_log_idx(result.second);
+						response->set_total_order(std::get<0>(result));
+						response->set_log_idx(std::get<1>(result));
+						response->set_broker_batch_seq(std::get<2>(result));
 						return grpc::Status::OK;
 					} catch (const std::exception& e) {
 						LOG(ERROR) << "Error waiting for future: " << e.what();
@@ -80,12 +84,16 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 				}
 
 				// Process the current request (this is the expected batch_seq)
+				uint64_t broker_batch_seq = batch_seq_per_broker_[broker_id];
+
 				response->set_total_order(next_order_);
 				response->set_log_idx(idx_per_broker_[broker_id]);
+				response->set_broker_batch_seq(broker_batch_seq);
 
 				next_order_ += num_msg;
 				idx_per_broker_[broker_id] += total_size;
 				batch_seq_per_clients_[client_id]++;
+				batch_seq_per_broker_[broker_id]++;
 
 				// Process any pending requests that are now ready
 				ProcessPendingRequests(client_id);
@@ -97,7 +105,7 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 	private:
 		struct PendingRequest {
 			size_t batch_seq;
-			std::promise<std::pair<uint64_t, uint64_t>> promise;
+			std::promise<std::tuple<uint64_t, uint64_t, uint64_t>> promise; // total_order, log_idx, broker_batch_seq
 			size_t num_msg;
 			int broker_id;
 			size_t total_size;
@@ -108,6 +116,7 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 				return batch_seq > other.batch_seq;
 			}
 		};
+
 		struct ComparePendingRequestPtr {
 			bool operator()(const std::unique_ptr<PendingRequest>& a,
 					const std::unique_ptr<PendingRequest>& b) const
@@ -121,32 +130,40 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 					ComparePendingRequestPtr>;
 
 		void ProcessPendingRequests(size_t client_id) {
-        auto& queue = pending_requests_[client_id];
+			auto& queue = pending_requests_[client_id];
 
-        while (!queue.empty() &&
-               queue.top()->batch_seq == batch_seq_per_clients_[client_id]) {
-            // Access the top request
-            std::unique_ptr<PendingRequest> pending = std::move(const_cast<std::unique_ptr<PendingRequest>&>(queue.top()));
-            queue.pop();
+			while (!queue.empty() &&
+					queue.top()->batch_seq == batch_seq_per_clients_[client_id]) {
+				// Access the top request
+				std::unique_ptr<PendingRequest> pending = std::move(const_cast<std::unique_ptr<PendingRequest>&>(queue.top()));
+				queue.pop();
 
-            // Fulfill the promise for the request
-            pending->promise.set_value({next_order_, idx_per_broker_[pending->broker_id]});
+				// Get the broker batch sequence for this pending request
+				uint64_t broker_batch_seq = batch_seq_per_broker_[pending->broker_id];
 
-            // Update the next order and broker index
-            next_order_ += pending->num_msg;
-            idx_per_broker_[pending->broker_id] += pending->total_size;
+				// Fulfill the promise for the request with total_order, log_idx, and broker_batch_seq
+				pending->promise.set_value(std::make_tuple(next_order_, 
+							idx_per_broker_[pending->broker_id],
+							broker_batch_seq));
 
-            // Increment the client's batch sequence
-            batch_seq_per_clients_[client_id]++;
-        }
-    }
+				// Update the next order and broker index
+				next_order_ += pending->num_msg;
+				idx_per_broker_[pending->broker_id] += pending->total_size;
 
-    std::mutex mutex_;
-    absl::flat_hash_map<size_t, size_t> batch_seq_per_clients_; // Tracks next expected batch_seq per client
-    absl::flat_hash_map<size_t, size_t> idx_per_broker_;        // Tracks log index per broker
-    absl::flat_hash_map<size_t, PriorityQueue> pending_requests_; // Pending requests per client
-    absl::flat_hash_map<size_t, uint64_t> client_order_offset_;  // Tracks starting offset for each client
-    size_t next_order_ = 0; // The next global order value
+				// Increment the broker's batch sequence
+				batch_seq_per_broker_[pending->broker_id]++;
+
+				// Increment the client's batch sequence
+				batch_seq_per_clients_[client_id]++;
+			}
+		}
+
+		std::mutex mutex_;
+		absl::flat_hash_map<size_t, size_t> batch_seq_per_clients_; // Tracks next expected batch_seq per client
+		absl::flat_hash_map<int, size_t> idx_per_broker_;          // Tracks log index per broker
+		absl::flat_hash_map<int, size_t> batch_seq_per_broker_;    // Tracks broker-specific batch sequence
+		absl::flat_hash_map<size_t, PriorityQueue> pending_requests_; // Pending requests per client
+		size_t next_order_ = 0; // The next global order value
 };
 
 void RunServer() {

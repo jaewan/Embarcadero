@@ -773,6 +773,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
 	static const int replication_factor = tinode->replication_factor;
 	static const int order = tinode->order;
+	static const SequencerType seq_type = tinode->seq_type;
 	size_t min = std::numeric_limits<size_t>::max();
 	//TODO(Jae) For now it is static. This should be changed for failure
 	static const int num_brokers = get_num_brokers_callback_();
@@ -785,6 +786,12 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 				return tinode->offsets[broker_id_].ordered;
 			}
 		}
+
+		// Corfu ensures ordered set after replication so do not need to check replication factor
+		if(seq_type == CORFU){
+			return tinode->offsets[broker_id_].ordered;
+		}
+
 		size_t r[replication_factor];
 
 		for (int i = 0; i < replication_factor; i++) {

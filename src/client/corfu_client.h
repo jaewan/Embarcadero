@@ -86,6 +86,7 @@ class CorfuSequencerClient {
 
 			batch_header->total_order = response.total_order();
 			batch_header->log_idx = response.log_idx();
+			batch_header->batch_seq = response.broker_batch_seq();
 
 			return true;
 		}

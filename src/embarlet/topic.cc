@@ -92,7 +92,7 @@ Topic::Topic(
 
 
 		// Start combiner if needed
-		if (seq_type != KAFKA && order_ != 4) {
+		if (seq_type == CORFU || (seq_type != KAFKA && order_ != 4)) {
 			combiningThreads_.emplace_back(&Topic::CombinerThread, this);
 		}
 
@@ -102,7 +102,7 @@ Topic::Topic(
 				case KAFKA: // Kafka is just a way to not run CombinerThread, not actual sequencer
 				case EMBARCADERO:
 					if (order == 1)
-						LOG(ERROR) << "Sequencer 1 is not ported yet";
+						LOG(ERROR) << "Sequencer 1 is not ported yet from cxl_manager";
 						//sequencerThread_ = std::thread(&Topic::Sequencer1, this);
 					else if (order == 2)
 						LOG(ERROR) << "Sequencer 2 is not ported yet";
@@ -121,11 +121,11 @@ Topic::Topic(
 						LOG(ERROR) << "Order is set 2 at scalog";
 					break;
 				case CORFU:
-					if (order == 1)
-						LOG(ERROR) << "Order is set 1 at corfu";
-					else if (order == 2){
-						VLOG(3) << "Order 2 for Corfu is right";
-					}
+					if (order == 0 || order == 4)
+						VLOG(3) << "Order " << order << 
+							" for Corfu is right as messages are written ordered. Combiner combining is enough";
+					else 
+						LOG(ERROR) << "Wrong Order is set for corfu " << order;
 					break;
 				default:
 					LOG(ERROR) << "Unknown sequencer:" << seq_type;
@@ -438,7 +438,6 @@ void Topic::AssignOrder(BatchHeader *batch_to_order, size_t start_total_order, B
 				reinterpret_cast<uint8_t*>(msg_header) + current_padded_size
 				);
 	} // End message loop
-	//TODO(Jae) This does not work as now all batches are from sequencer node
 	header_for_sub->batch_off_to_export = (reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(header_for_sub));
 	header_for_sub->ordered = 1;
 	header_for_sub = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(header_for_sub) + sizeof(BatchHeader));
@@ -557,6 +556,7 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 	const unsigned long long int segment_metadata = 
 		reinterpret_cast<unsigned long long int>(current_segment_);
 	const size_t msg_size = batch_header.total_size;
+	BatchHeader* batch_header_log = reinterpret_cast<BatchHeader*>(batch_headers_);
 
 	// Get log address with batch offset
 	log = reinterpret_cast<void*>(log_addr_.load()
@@ -565,8 +565,18 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 	// Check for segment boundary issues
 	CheckSegmentBoundary(log, msg_size, segment_metadata);
 
+	batch_header_log[batch_header.batch_seq].batch_seq = batch_header.batch_seq;
+	batch_header_log[batch_header.batch_seq].total_size = batch_header.total_size;
+	batch_header_log[batch_header.batch_seq].broker_id = broker_id_;
+	batch_header_log[batch_header.batch_seq].ordered = 0;
+	batch_header_log[batch_header.batch_seq].batch_off_to_export = 0;
+	batch_header_log[batch_header.batch_seq].log_idx = static_cast<size_t>(
+			reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_)
+			);
+
 	// Return replication callback
 	return [this, batch_header, log](void* log_ptr, size_t /*placeholder*/) {
+		BatchHeader* batch_header_log = reinterpret_cast<BatchHeader*>(batch_headers_);
 		// Handle replication if needed
 		if (replication_factor_ > 0 && corfu_replication_client_) {
 			MessageHeader *header = (MessageHeader*)log;
@@ -592,6 +602,12 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 				tinode_->offsets[b].replication_done[broker_id_] = last_offset;
 			}
 		}
+		// This ensures in Corfu tinode.ordered collects the number of messages replicated
+		{
+			absl::MutexLock lock(&mutex_);
+			tinode_->offsets[broker_id_].ordered += batch_header.num_msg;
+		}
+		batch_header_log[batch_header.batch_seq].ordered = 1;
 	};
 }
 
