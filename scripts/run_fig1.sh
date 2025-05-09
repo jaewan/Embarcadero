@@ -16,7 +16,7 @@ REMOTE_PID_FILE="/tmp/remote_seq.pid"
 # Define the configurations
 declare -a configs=(
   "order=(4); ack=2; sequencer=EMBARCADERO"
-  #"order=(2); ack=2; sequencer=CORFU"
+  #"order=(4); ack=2; sequencer=CORFU"
   #"order=(1); ack=1; sequencer=SCALOG"
 )
 

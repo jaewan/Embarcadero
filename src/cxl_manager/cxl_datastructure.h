@@ -50,7 +50,7 @@ struct alignas(64) TInode{
 };
 
 struct alignas(64) BatchHeader{
-	size_t batch_seq;
+	size_t batch_seq; // Monotonically increasing from each client. Corfu sets in log's seq
 	size_t total_size;
 	size_t start_logical_offset;
 	uint32_t broker_id;

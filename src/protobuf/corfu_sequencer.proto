@@ -3,18 +3,19 @@ syntax = "proto3";
 package corfusequencer;
 
 service CorfuSequencer {
-  rpc GetTotalOrder (TotalOrderRequest) returns (TotalOrderResponse) {}
+	rpc GetTotalOrder (TotalOrderRequest) returns (TotalOrderResponse) {}
 }
 
 message TotalOrderRequest {
 	uint64 client_id = 1;
-  uint64 batchseq = 2;
-  uint64 num_msg = 3;
-  uint64 total_size = 4;
+	uint64 batchseq = 2;
+	uint64 num_msg = 3;
+	uint64 total_size = 4;
 	uint32 broker_id = 5;
 }
 
 message TotalOrderResponse {
-  uint64 total_order = 1;
+	uint64 total_order = 1;
 	uint64 log_idx = 2;
+	uint64 broker_batch_seq = 3;
 }
