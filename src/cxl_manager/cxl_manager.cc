@@ -204,23 +204,9 @@ void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 	}
 }
 
-inline void CXLManager::UpdateTInodeOrderandWritten(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t ordered_offset){
-	if(tinode->replicate_tinode){
-		struct TInode *replica_tinode = GetReplicaTInode(topic);
-		replica_tinode->offsets[broker].ordered = msg_logical_off;
-		replica_tinode->offsets[broker].ordered_offset = ordered_offset;
-		replica_tinode->offsets[broker].written = msg_logical_off;
-		replica_tinode->offsets[broker].written_addr = ordered_offset;
-	}
-
-	tinode->offsets[broker].ordered = msg_logical_off;
-	tinode->offsets[broker].ordered_offset = ordered_offset;
-	tinode->offsets[broker].written = msg_logical_off;
-	tinode->offsets[broker].written_addr = ordered_offset;
-}
-
 // Sequence without respecting publish order
 void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic) {
+	LOG(INFO) <<"[DEBUG] ************** Seqeuncer 1 **************";
 	struct TInode *tinode = GetTInode(topic.data());
 	if (!tinode) {
 		LOG(ERROR) << "Sequencer1: Failed to get TInode for topic " << topic.data();
@@ -344,6 +330,7 @@ void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic) {
 
 // Order 2 with single thread
 void CXLManager::Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic){
+	LOG(INFO) <<"[DEBUG] ************** Seqeucner2 **************";
 	struct TInode *tinode = GetTInode(topic.data());
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
@@ -441,6 +428,7 @@ void CXLManager::Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic){
 
 // Does not support multi-client, dynamic message size, dynamic batch 
 void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
+	LOG(INFO) <<"[DEBUG] ************** Seqeuncer 3 **************";
 	struct TInode *tinode = GetTInode(topic.data());
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;
@@ -492,193 +480,6 @@ void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
 			 }
 			 */
 	}
-}
-
-void CXLManager::Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic) {
-	struct TInode *tinode = GetTInode(topic.data());
-
-	absl::btree_set<int> registered_brokers;
-	GetRegisteredBrokerSet(registered_brokers, tinode);
-
-	global_seq_ = 0;
-
-	absl::flat_hash_map<size_t, std::atomic<size_t>> next_expected_batch_seq; // client_id -> next expected batch_seq
-	folly::MPMCQueue<BatchHeader*> ready_batches_queue(1024);
-
-	sequencer4_threads_.clear();
-
-	for (int broker_id : registered_brokers) {
-		trackers_.emplace(
-				broker_id,
-				std::make_unique<SequentialOrderTracker>(broker_id)
-				);
-		sequencer4_threads_.emplace_back(
-				&CXLManager::BrokerScannerWorker,
-				this, // Pass pointer to current object
-				broker_id,
-				topic // Pass topic by value (or const reference)
-				);
-	}
-
-	// Join worker threads
-	for(auto &t : sequencer4_threads_){
-		while(!t.joinable()){
-			std::this_thread::yield();
-		}
-		t.join();
-	}
-	sequencer4_threads_.clear(); // Clear after joining
-}
-
-// This does not work with multi-segments as it advances to next messaeg with message's size
-void CXLManager::BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_SIZE> topic) {
-	struct TInode *tinode = GetTInode(topic.data());
-	// Wait until tinode of the broker is initialized by the broker
-	// Sequencer4 relies on GetRegisteredBrokerSet that does not wait
-	while(tinode->offsets[broker_id].log_offset == 0){
-		std::this_thread::yield();
-	}
-	// Get the starting point for this broker's batch header log
-	BatchHeader* current_batch_header = reinterpret_cast<BatchHeader*>(
-			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode->offsets[broker_id].batch_headers_offset);
-	if (!current_batch_header) {
-		LOG(ERROR) << "Scanner [Broker " << broker_id << "]: Failed to calculate batch header start address.";
-		return;
-	}
-
-	// client -> <batch_seq, header*>
-	absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>> skipped_batches; 
-
-	while (!stop_threads_) {
-		// 1. Check for new Batch Header (Use memory_order_acquire for visibility)
-		volatile size_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
-
-		// No new batch written.
-		if (num_msg_check == 0 || current_batch_header->log_idx == 0) {
-			if(!ProcessSkipped(topic, skipped_batches)){
-				std::this_thread::yield();
-			}
-			continue;
-		}
-
-		// 2. Check if this batch is the next expected one for the client
-		BatchHeader* header_to_process = current_batch_header;
-		size_t client_id = current_batch_header->client_id;
-		size_t batch_seq = current_batch_header->batch_seq;
-		bool ready_to_order = false;
-		size_t expected_seq = 0;
-		size_t start_total_order = 0;
-		bool skip_batch = false;
-
-		{
-			absl::MutexLock lock(&global_seq_batch_seq_mu_);
-			auto map_it = next_expected_batch_seq_.find(client_id);
-			if (map_it == next_expected_batch_seq_.end()) {
-				// New client
-				if (batch_seq == 0) {
-					expected_seq = 0;
-					start_total_order = global_seq_;
-					global_seq_ += header_to_process->num_msg;
-					next_expected_batch_seq_[client_id] = 1; // Expect 1 next
-					ready_to_order = true;
-				} else {
-					skip_batch = true;
-					ready_to_order = false;
-					VLOG(4) << "Scanner [B" << broker_id << "]: New client " << client_id << ", skipping non-zero first batch " << batch_seq;
-				}
-			} else {
-				// Existing client
-				expected_seq = map_it->second;
-				if (batch_seq == expected_seq) {
-					start_total_order = global_seq_;
-					global_seq_ += header_to_process->num_msg;
-					map_it->second = expected_seq + 1;
-					ready_to_order = true;
-				} else if (batch_seq > expected_seq) {
-					// Out of order batch, skip (outside lock)
-					skip_batch = true;
-					ready_to_order = false;
-				} else {
-					// Duplicate or older batch - ignore
-					ready_to_order = false;
-					LOG(WARNING) << "Scanner [B" << broker_id << "]: Duplicate/old batch seq "
-						<< batch_seq << " detected from client " << client_id << " (expected " << expected_seq << ")";
-				}
-			}
-		}
-
-		if (skip_batch){
-			skipped_batches[client_id][batch_seq] = header_to_process;
-		}
-
-		// 3. Queue if ready
-		if (ready_to_order) {
-			AssignOrder(topic, header_to_process, start_total_order);
-			ProcessSkipped(topic, skipped_batches);
-		}
-
-		// 4. Advance to next batch header (handle segment/log wrap around)
-		current_batch_header = reinterpret_cast<BatchHeader*>(
-				reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader)
-				);
-	} // end of main while loop
-}
-
-// Helper to process skipped batches for a specific client after a batch was enqueued
-bool CXLManager::ProcessSkipped(std::array<char, TOPIC_NAME_SIZE>& topic,
-		absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches){
-
-	bool processed_any = false;
-	auto client_skipped_it = skipped_batches.begin();
-	while (client_skipped_it != skipped_batches.end()){
-		size_t client_id = client_skipped_it->first;
-		auto& client_skipped_map = client_skipped_it->second; // Ref to btree_map
-
-		size_t start_total_order;
-		bool batch_processed;
-		do {
-			batch_processed = false;
-			size_t expected_seq;
-			BatchHeader* batch_header = nullptr;
-			auto batch_it = client_skipped_map.end();
-			{ // --- Critical section START ---
-				absl::MutexLock lock(&global_seq_batch_seq_mu_);
-
-				auto map_it = next_expected_batch_seq_.find(client_id);
-				// If client somehow disappeared, stop (shouldn't happen)
-				if (map_it == next_expected_batch_seq_.end()) break;
-
-				expected_seq = map_it->second;
-				batch_it = client_skipped_map.find(expected_seq); // Find expected in skipped
-
-				if (batch_it != client_skipped_map.end()) {
-					// Found it! Reserve sequence and update expected batch number
-					batch_header = batch_it->second;
-					start_total_order = global_seq_;
-					global_seq_ += batch_header->num_msg;
-					map_it->second = expected_seq + 1;
-					batch_processed = true; // Mark to proceed outside lock
-					processed_any = true; // Mark that we did *some* work
-					VLOG(4) << "ProcessSkipped [B?]: Client " << client_id << ", processing skipped batch " << expected_seq << ", reserving seq [" << start_total_order << ", " << global_seq_ << ")";
-				} else {
-					// Next expected not found in skipped map for this client, move to next client
-					break; // Exit inner do-while loop for this client
-				}
-			}
-			if (batch_processed && batch_header) {
-				client_skipped_map.erase(batch_it); // Erase AFTER successful lock/update
-				AssignOrder(topic, batch_header, start_total_order);
-			}
-			// If batch_processed is true, loop again for same client in case next seq was also skipped
-		} while (batch_processed && !client_skipped_map.empty()); // Keep checking if we processed one
-
-		if (client_skipped_map.empty()) {
-			skipped_batches.erase(client_skipped_it++);
-		}else{
-			++client_skipped_it;
-		}
-	} 
-	return processed_any;
 }
 
 // Return sequentially ordered logical offset + 1 and 
@@ -739,108 +540,6 @@ size_t CXLManager::SequentialOrderTracker::InsertAndGetSequentiallyOrdered(size_
 	}
 
 	return current_end;
-}
-
-void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *batch_to_order,
-		size_t start_total_order) {
-	TInode* tinode = GetTInode(topic.data());
-	int broker = batch_to_order->broker_id;
-
-	// **Assign Global Order using Atomic fetch_add**
-	size_t num_messages = batch_to_order->num_msg;
-	if (num_messages == 0) {
-		LOG(WARNING) << "!!!! Orderer: Dequeued batch with zero messages. Skipping !!!";
-		return;
-	}
-
-	// Get pointer to the first message
-	MessageHeader* msg_header = reinterpret_cast<MessageHeader*>(
-			batch_to_order->log_idx + reinterpret_cast<uint8_t*>(cxl_addr_)
-			);
-	if (!msg_header) {
-		LOG(ERROR) << "Orderer: Failed to calculate message address for logical offset " << batch_to_order->log_idx;
-		return;
-	}
-	MessageHeader *last_msg_of_batch = nullptr;
-	size_t seq = start_total_order;
-	batch_to_order->total_order = seq;
-
-	size_t logical_offset = batch_to_order->start_logical_offset;
-	size_t batch_start_offset = logical_offset;
-	/*
-	auto tracker_it = trackers_.find(broker);
-	if(tracker_it == trackers_.end()){
-		LOG(ERROR) << "Trackers for broker:" << broker << " not instantiated which cannot happen";
-		return;
-	}
-	auto tracker = tracker_it->second.get();
-	size_t contiguous_end_offset = tracker->InsertAndGetSequentiallyOrdered(batch_start_offset, batch_to_order->num_msg);
-	bool update_tinode = (contiguous_end_offset >= batch_start_offset + batch_to_order->num_msg);
-	*/
-	bool update_tinode = false;
-
-	for (size_t i = 0; i < num_messages; ++i) {
-		// 1. Wait for message completion (minimize this wait)
-		// Use volatile read in the loop condition
-		volatile uint32_t* complete_ptr = &(reinterpret_cast<volatile MessageHeader*>(msg_header)->complete);
-		while (*complete_ptr == 0) {
-			if (stop_threads_) return;
-			std::this_thread::yield();
-		}
-
-		// 2. Read paddedSize AFTER completion check TODO(Jae) Get rid of this if error message is never shown
-		size_t current_padded_size = msg_header->paddedSize;
-		if (current_padded_size == 0) {
-			LOG(ERROR) << "Orderer: Message completed but paddedSize is 0! Batch client="
-				<< batch_to_order->client_id << " seq=" << batch_to_order->batch_seq
-				<< " msg_idx=" << i << ". Skipping rest of batch.";
-			break; // Stop processing this batch
-		}
-
-		// 3. Assign order and set next pointer difference
-		msg_header->logical_offset = logical_offset;
-		logical_offset++;
-		msg_header->total_order = seq;
-		seq++;
-		msg_header->next_msg_diff = current_padded_size;
-
-		// 4. Make total_order and next_msg_diff visible before readers might use them
-		//std::atomic_thread_fence(std::memory_order_release);
-
-		// For latency, update per message. Can do this batch granularity after the loop
-		if(update_tinode){
-			UpdateTInodeOrderandWritten(topic.data(), tinode, broker, msg_header->logical_offset, (uint8_t*)msg_header - (uint8_t*)cxl_addr_);
-		}
-		last_msg_of_batch = msg_header;
-		msg_header = reinterpret_cast<MessageHeader*>(
-				reinterpret_cast<uint8_t*>(msg_header) + current_padded_size
-				);
-	} // End message loop
-
-	//tinode->offsets[broker_id].ordered_batch_header->emplace_back(*batch_to_order);
-
-	/*
-	// *** ALWAYS store the physical offset mapping for the last message of THIS batch ***
-	tracker->StorePhysicalOffset(last_msg_of_batch->logical_offset,
-			(uint8_t*)last_msg_of_batch - (uint8_t*)cxl_addr_);
-
-	if(contiguous_end_offset > last_msg_of_batch->logical_offset + 1){ // contiguous_end_offset can be 0 so -1 has edge cases.
-		size_t lookup_offset = contiguous_end_offset - 1; // The logical offset of the absolute last message in the contiguous range from 0
-		size_t addr = tracker->GetPhysicalOffset(lookup_offset);
-
-		if (addr == 0) {
-			LOG(ERROR) << "end_offset_logical_to_physical_ still not found for CONTIGUOUS END offset:" << lookup_offset
-				<< ". ContiguousEnd=" << contiguous_end_offset
-				<< ". BatchClient=" << batch_to_order->client_id
-				<< " BatchSeq=" << batch_to_order->batch_seq
-				<< " BatchBroker=" << broker
-				<< " LastMsgLogicalInBatch=" << last_msg_of_batch->logical_offset
-				<< ". THIS SHOULD NOT HAPPEN if lookup_offset is from the current batch OR locking is correct.";
-		}else{
-			UpdateTInodeOrderandWritten(topic.data(), tinode, broker, lookup_offset, addr);
-		}
-	}
-	*/
 }
 
 void CXLManager::StartScalogLocalSequencer(std::string topic_str) {

@@ -213,22 +213,12 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 
 		VLOG(5) << "All clients ready, starting publish test";
 
-		// Create progress tracker
-		//ProgressTracker progress(n, 1000);
-
 		// Start timing
 		auto start = std::chrono::high_resolution_clock::now();
 
 		// Publish messages
 		for (size_t i = 0; i < n; i++) {
 			p.Publish(message, message_size);
-
-			// Update progress periodically
-			/*
-				 if (i % 1000 == 0) {
-				 progress.Update(i);
-				 }
-				 */
 		}
 
 		// Finalize publishing
@@ -267,13 +257,6 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
 
 	LOG(INFO) << "Starting subscribe throughput test for " << total_message_size << " bytes of data";
 
-	// Create progress tracker for the receiving process
-	/*
-		 size_t total_expected_bytes = total_message_size + (total_message_size / message_size) * 
-		 sizeof(Embarcadero::MessageHeader);
-		 ProgressTracker progress(total_expected_bytes, 2000);
-		 */
-
 	try {
 		// Start timing
 		auto start = std::chrono::high_resolution_clock::now();
@@ -301,6 +284,69 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
 		double receive_bandwidthMbps = (total_message_size / (1024 * 1024)) / receive_seconds;
 
 		LOG(INFO) << "Subscribe test completed in " << std::fixed << std::setprecision(2) 
+			<< seconds << " seconds (connection: " 
+			<< std::setprecision(2) << (seconds - receive_seconds) 
+			<< "s, receiving: " << std::setprecision(2) << receive_seconds << "s)";
+		LOG(INFO) << "Bandwidth: " << std::fixed << std::setprecision(2) << bandwidthMbps 
+			<< " MB/s (receiving only: " << receive_bandwidthMbps << " MB/s)";
+
+		// Check message ordering if requested
+		if (!s.DEBUG_check_order(order)) {
+			LOG(ERROR) << "Order check failed for order level " << order;
+		}
+
+		return bandwidthMbps;
+
+	} catch (const std::exception& e) {
+		LOG(ERROR) << "Exception during subscribe test: " << e.what();
+		return 0.0;
+	}
+}
+
+double ConsumeThroughputTest(const cxxopts::ParseResult& result, char topic[TOPIC_NAME_SIZE]) {
+	LogTestParameters("Consume Throughput Test", result);
+
+	// Extract test parameters
+	size_t message_size = result["size"].as<size_t>();
+	size_t total_message_size = result["total_message_size"].as<size_t>();
+	size_t n = total_message_size/message_size;
+	int order = result["order_level"].as<int>();
+
+	LOG(INFO) << "Starting consume throughput test for " << total_message_size << " bytes of data.\n"
+		<< "This only works with " << NUM_MAX_BROKERS << " brokers";
+
+	try {
+		// Start timing
+		auto start = std::chrono::high_resolution_clock::now();
+
+		// Create subscriber
+		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
+		s.WaitUntilAllConnected(); // Asuume there exists NUM_MAX_BROKERS
+
+		// Track start of the actual receiving process
+		auto receive_start = std::chrono::high_resolution_clock::now();
+
+		// Wait for all messages to be received
+		VLOG(5) << "Waiting to receive " << total_message_size << " bytes of data";
+
+		for(size_t i=0; i< n; i++){
+			while(s.Consume() == nullptr){
+				std::this_thread::yield();
+			}
+		}
+
+		// Calculate elapsed time and bandwidth
+		auto end = std::chrono::high_resolution_clock::now();
+		std::chrono::duration<double> elapsed = end - start;
+		std::chrono::duration<double> receive_elapsed = end - receive_start;
+
+
+		double seconds = elapsed.count();
+		double receive_seconds = receive_elapsed.count();
+		double bandwidthMbps = (total_message_size / (1024 * 1024)) / seconds;
+		double receive_bandwidthMbps = (total_message_size / (1024 * 1024)) / receive_seconds;
+
+		LOG(INFO) << "Consume test completed in " << std::fixed << std::setprecision(2) 
 			<< seconds << " seconds (connection: " 
 			<< std::setprecision(2) << (seconds - receive_seconds) 
 			<< "s, receiving: " << std::setprecision(2) << receive_seconds << "s)";

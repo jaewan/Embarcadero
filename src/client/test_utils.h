@@ -31,6 +31,7 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
  * @return Bandwidth in MBps
  */
 double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TOPIC_NAME_SIZE]);
+double ConsumeThroughputTest(const cxxopts::ParseResult& result, char topic[TOPIC_NAME_SIZE]);
 
 /**
  * Runs an end-to-end throughput test
