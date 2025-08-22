@@ -13,16 +13,18 @@ namespace Scalog {
 
 using Embarcadero::TInode;
 using Embarcadero::MessageHeader;
+using Embarcadero::BatchHeader;
 
 class ScalogLocalSequencer {
 	public:
-		ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager, int broker_id, void* cxl_addr, std::string topic_str);
+		ScalogLocalSequencer(TInode* tinode, int broker_id, 
+				void* cxl_addr, std::string topic_str, BatchHeader *batch_header);
 
 		/// Sends a register request to the global sequencer
 		void Register(int replication_factor);
 
 		/// Send a local cut to the global seq after every interval
-		void SendLocalCut(std::string topic_str);
+		void SendLocalCut(std::string topic_str, bool &stop_thread);
 
 		/// Sends a request to global sequencer to terminate itself
 		void TerminateGlobalSequencer();
@@ -35,10 +37,11 @@ class ScalogLocalSequencer {
 		void ScalogSequencer(const char* topic, absl::btree_map<int, int> &global_cut);
 
 	private:
-		Embarcadero::CXLManager* cxl_manager_;
+		TInode* tinode_;
 		int broker_id_;
 		int replica_id_ = 0;
 		void* cxl_addr_;
+		BatchHeader* batch_header_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
 
 		/// Map of broker_id to local cut

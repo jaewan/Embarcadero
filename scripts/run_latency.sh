@@ -4,7 +4,7 @@ pushd ../build/bin/
 
 NUM_BROKERS=4
 test_case=2
-msg_sizes=(1024)
+msg_size=1024
 REMOTE_IP="192.168.60.173"
 REMOTE_USER="domin"
 PASSLESS_ENTRY="~/.ssh/id_rsa"
@@ -13,9 +13,15 @@ REMOTE_PID_FILE="/tmp/remote_seq.pid"
 
 # Define the configurations
 declare -a configs=(
-  "orders=(4); ack=2; sequencer=EMBARCADERO"
-  "orders=(2); ack=2; sequencer=CORFU"
-  "orders=(1); ack=1; sequencer=SCALOG"
+  "order=4; sequencer=EMBARCADERO"
+  "order=2; sequencer=CORFU"
+  #"order=1; sequencer=SCALOG"
+)
+
+# Define the experiment modes
+declare -a modes=(
+  "steady"
+  #"bursty"
 )
 
 wait_for_signal() {
@@ -58,133 +64,87 @@ stop_remote_sequencer() {
 EOF
 }
 
-# Run each configuration steady
-for config in "${configs[@]}"; do
-  echo "============================================================"
-  echo "Running configuration: $config"
-  echo "============================================================"
+# Create output directories if they don't exist
+mkdir -p ../../data/latency/steady
+mkdir -p ../../data/latency/bursty
 
-  # Evaluate the configuration string to set variables
-  eval "$config"
+# Run each configuration for both steady and bursty modes
+for mode in "${modes[@]}"; do
+  echo "========================================================"
+  echo "Running experiments in $mode mode"
+  echo "========================================================"
 
-  # Array to store process IDs
-  pids=()
+  for config in "${configs[@]}"; do
+    echo "============================================================"
+    echo "Running configuration: $config"
+    echo "============================================================"
 
-  rm -f script_signal_pipe
-  mkfifo script_signal_pipe
+    # Evaluate the configuration string to set variables
+    eval "$config"
 
-  # Run experiments for each message size
-for order in "${orders[@]}"; do
-  for msg_size in "${msg_sizes[@]}"; do
-  echo "Running trial $trial with message size $msg_size | Order: $order | Ack: $ack | Sequencer: $sequencer"
+    # Array to store process IDs
+    pids=()
 
-  # Start remote sequencer if needed
+    rm -f script_signal_pipe
+    mkfifo script_signal_pipe
+
+    # Run experiments for each message size
+	echo "Running with message size $msg_size | Order: $order | Sequencer: $sequencer | Mode: $mode"
+
+	# Start remote sequencer if needed
 	if [[ "$sequencer" == "CORFU" ]]; then
 	  start_remote_sequencer "corfu_global_sequencer"
 	elif [[ "$sequencer" == "SCALOG" ]]; then
 	  start_remote_sequencer "scalog_global_sequencer"
 	fi
 
-  # Start the processes
-  start_process "./embarlet --head --$sequencer"
-  wait_for_signal
-  head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
-  sleep 3
-  for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-	start_process "./embarlet --$sequencer"
+	# Start the processes
+	start_process "./embarlet --head --$sequencer"
 	wait_for_signal
-  done
-  sleep 3
+	head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
+	sleep 3
+	for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
+	  start_process "./embarlet --$sequencer"
+	  wait_for_signal
+	done
+	sleep 3
 
-  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -r 1 --steady_rate"
-
-  # Wait for all processes to finish
-  for pid in "${pids[@]}"; do
-	wait $pid
-	echo "Process with PID $pid finished"
-  done
-
-  echo "All processes have finished for trial $trial with message size $msg_size"
-  pids=()  # Clear the pids array for the next trial
-  # Stop remote process after each trial
-  if [[ "$sequencer" == "CORFU" || "$sequencer" == "SCALOG" ]]; then
-	  stop_remote_sequencer
-  fi
-  sleep 3
-
-  #python3 ../../scripts/plot/plot_latency.py cdf_latency_us.csv ../../data/latency/${sequencer}_latency
-  mv cdf_latency_us.csv ../../data/latency/steady/${sequencer}_latency.csv
-  mv latency_stats.csv ../../data/latency/steady/${sequencer}_latency_stats.csv
-  done
-done
-
-
-# Bursty
-for config in "${configs[@]}"; do
-  echo "============================================================"
-  echo "Running configuration: $config"
-  echo "============================================================"
-
-  # Evaluate the configuration string to set variables
-  eval "$config"
-
-  # Array to store process IDs
-  pids=()
-
-  rm -f script_signal_pipe
-  mkfifo script_signal_pipe
-
-  # Run experiments for each message size
-for order in "${orders[@]}"; do
-  for msg_size in "${msg_sizes[@]}"; do
-  echo "Running trial $trial with message size $msg_size | Order: $order | Ack: $ack | Sequencer: $sequencer"
-
-  # Start remote sequencer if needed
-	if [[ "$sequencer" == "CORFU" ]]; then
-	  start_remote_sequencer "corfu_global_sequencer"
-	elif [[ "$sequencer" == "SCALOG" ]]; then
-	  start_remote_sequencer "scalog_global_sequencer"
+	# Run throughput test with or without --steady_rate based on mode
+	if [[ "$mode" == "steady" ]]; then
+	  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order --sequencer $sequencer -r 1 --steady_rate"
+	else
+	  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order --sequencer $sequencer -r 1"
 	fi
 
-  # Start the processes
-  start_process "./embarlet --head --$sequencer"
-  wait_for_signal
-  head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
-  sleep 3
-  for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-	start_process "./embarlet --$sequencer"
-	wait_for_signal
-  done
-  sleep 3
+	# Wait for all processes to finish
+	for pid in "${pids[@]}"; do
+	  wait $pid
+	  echo "Process with PID $pid finished"
+	done
 
-  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -r 1"
+	echo "All processes have finished for message size $msg_size in $mode mode"
+	pids=()  # Clear the pids array for the next trial
 
-  # Wait for all processes to finish
-  for pid in "${pids[@]}"; do
-	wait $pid
-	echo "Process with PID $pid finished"
-  done
-
-  echo "All processes have finished for trial $trial with message size $msg_size"
-  pids=()  # Clear the pids array for the next trial
-  # Stop remote process after each trial
-  if [[ "$sequencer" == "CORFU" || "$sequencer" == "SCALOG" ]]; then
+	# Stop remote process after each trial
+	if [[ "$sequencer" == "CORFU" || "$sequencer" == "SCALOG" ]]; then
 	  stop_remote_sequencer
-  fi
-  sleep 3
+	fi
+	sleep 3
 
-  #python3 ../../scripts/plot/plot_latency.py cdf_latency_us.csv ../../data/latency/${sequencer}_latency
-  mv cdf_latency_us.csv ../../data/latency/bursty/${sequencer}_latency.csv
-  mv latency_stats.csv ../../data/latency/bursty/${sequencer}_latency_stats.csv
+	# Move results to appropriate directory
+	mv cdf_latency_us.csv ../../data/latency/$mode/${sequencer}_latency.csv
+	mv latency_stats.csv ../../data/latency/$mode/${sequencer}_latency_stats.csv
+
+    rm -f script_signal_pipe
+    echo "Finished configuration: $config in $mode mode"
   done
 done
 
-  rm -f script_signal_pipe
-  echo "Finished configuration: $config"
-done
-
+# Plot results for this mode
 popd
 pushd ../data/latency/
 python3 plot_latency.py latency
+popd
+
 
 echo "All experiments have finished."

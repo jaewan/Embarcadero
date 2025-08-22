@@ -118,10 +118,10 @@ def plot_merged_latency_cdfs(output_prefix):
           return
 
     # --- Customize Appearance (after all lines are plotted) ---
-    plt.xscale('log')
+    #plt.xscale('log')
 
     # Use r'$\mu s$' for the microsecond symbol
-    plt.xlabel(r'Latency ($\mu s$, log scale)', fontsize=LABEL_FONTSIZE)
+    plt.xlabel(r'Latency ($\mu s$)', fontsize=LABEL_FONTSIZE)
 
     plt.ylabel("Cumulative Probability (CDF)", fontsize=LABEL_FONTSIZE)
     # plt.title("Latency CDF Comparison: Steady vs. Bursty Rate", fontsize=TITLE_FONTSIZE) # Optional title
@@ -130,20 +130,21 @@ def plot_merged_latency_cdfs(output_prefix):
     # Set X limits based on the overall range found (ensure min is positive for log)
     safe_min_latency = max(min_overall_latency, 1e-1) # Avoid zero or negative for log limit
     #plt.xlim(left=safe_min_latency * 0.8, right=max_overall_latency * 1.2)
-    plt.xlim(left=1e5, right=max_overall_latency * 1.2)
+    #plt.xlim(left=1e5, right=max_overall_latency * 1.2)
+    plt.xlim(left=0, right=max_overall_latency * 1.2)
 
     # --- Explicit Tick Control for Log Scale ---
-    ax = plt.gca() # Get the current axes
+    #ax = plt.gca() # Get the current axes
 
     # Set major ticks at powers of 10 (1, 10, 100, 1000...)
-    ax.xaxis.set_major_locator(mticker.LogLocator(base=10.0, subs=(1.0,)))
+    #ax.xaxis.set_major_locator(mticker.LogLocator(base=10.0, subs=(1.0,)))
 
     # Use LogFormatterMathtext to display powers of 10 (e.g., 10^3, 10^6)
-    ax.xaxis.set_major_formatter(mticker.LogFormatterMathtext(base=10.0))
+    #ax.xaxis.set_major_formatter(mticker.LogFormatterMathtext(base=10.0))
 
     # Minor ticks setup remains the same
-    ax.xaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=np.arange(2, 10) * .1))
-    ax.xaxis.set_minor_formatter(mticker.NullFormatter()) # No labels on minor ticks
+    #ax.xaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=np.arange(2, 10) * .1))
+    #ax.xaxis.set_minor_formatter(mticker.NullFormatter()) # No labels on minor ticks
 
     # --- End Explicit Tick Control ---
 

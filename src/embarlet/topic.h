@@ -61,6 +61,11 @@ class Topic {
 					thread.join();
 				}
 			}
+
+			if(sequencerThread_.joinable()){
+				sequencerThread_.join();
+			}
+
 			VLOG(3) << "[Topic]: \tDestructed";
 		}
 
@@ -131,6 +136,8 @@ class Topic {
 		 * Check and handle segment boundary crossing
 		 */
 		void CheckSegmentBoundary(void* log, size_t msgSize, unsigned long long int segment_metadata);
+
+		void StartScalogLocalSequencer();
 
 		// Function pointer type for GetCXLBuffer implementations
 		using GetCXLBufferFuncPtr = std::function<void(void*, size_t)> (Topic::*)(

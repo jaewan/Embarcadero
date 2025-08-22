@@ -15,8 +15,8 @@ echo -e "\e[31mYou must recompile Embarcadero with NUM_MAX_BROKERS 1 in both Emb
 
 # Define the configurations
 declare -a configs=(
-"orders=(4); ack=2; sequencer=EMBARCADERO"
-"orders=(2); ack=2; sequencer=CORFU"
+#"orders=(4); ack=2; sequencer=EMBARCADERO"
+#"orders=(2); ack=2; sequencer=CORFU"
 "orders=(1); ack=1; sequencer=SCALOG"
 )
 

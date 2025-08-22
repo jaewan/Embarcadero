@@ -7,10 +7,11 @@ namespace Scalog {
 //Current logic proceeds epoch with all brokers at the same pace.
 //If a broker fails, the entire cluster is stuck. If a failure is detected from the heartbeat, GetRegisteredBroker will return the alive brokers
 //after heartbeat_interval (failure is detected), if there is a change in the cluster, only proceed with the brokers
-ScalogLocalSequencer::ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager, int broker_id, void* cxl_addr, std::string topic_str) :
-	cxl_manager_(cxl_manager),
+ScalogLocalSequencer::ScalogLocalSequencer(TInode* tinode, int broker_id, void* cxl_addr, std::string topic_str, BatchHeader *batch_header) :
+	tinode_(tinode),
 	broker_id_(broker_id),
-	cxl_addr_(cxl_addr) {
+	cxl_addr_(cxl_addr),
+	batch_header_(batch_header){
 
 	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
 	int unique_port = SCALOG_SEQ_PORT;
@@ -20,10 +21,9 @@ ScalogLocalSequencer::ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager,
 
 	static char topic[TOPIC_NAME_SIZE];
 	memcpy(topic, topic_str.data(), topic_str.size());
-	struct TInode *tinode = cxl_manager_->GetTInode(topic);
 
 	// Send register request to the global sequencer
-	Register(tinode->replication_factor);
+	Register(tinode_->replication_factor);
 }
 
 void ScalogLocalSequencer::TerminateGlobalSequencer() {
@@ -51,21 +51,20 @@ void ScalogLocalSequencer::Register(int replication_factor) {
 	}
 }
 
-void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
+void ScalogLocalSequencer::SendLocalCut(std::string topic_str, bool &stop_thread){
 	static char topic[TOPIC_NAME_SIZE];
 	memcpy(topic, topic_str.data(), topic_str.size());
-	struct TInode *tinode = cxl_manager_->GetTInode(topic);
 
 	grpc::ClientContext context;
     std::unique_ptr<grpc::ClientReaderWriter<LocalCut, GlobalCut>> stream(
         stub_->HandleSendLocalCut(&context));
 
 	// Spawn a thread to receive global cuts, passing the stream by reference
-    std::thread receive_global_cut(&ScalogLocalSequencer::ReceiveGlobalCut, this, std::ref(stream), topic_str);
+	std::thread receive_global_cut(&ScalogLocalSequencer::ReceiveGlobalCut, this, std::ref(stream), topic_str);
 
-	while (!cxl_manager_->GetStopThreads()) {
-		/// Send epoch and tinode->offsets[broker_id_].written to global sequencer
-		int local_cut = tinode->offsets[broker_id_].written;
+	while (!stop_thread) {
+		/// Send epoch and tinode_->offsets[broker_id_].written to global sequencer
+		int local_cut = tinode_->offsets[broker_id_].written;
 
 		LocalCut request;
 		request.set_local_cut(local_cut);
@@ -84,7 +83,6 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str){
 		local_epoch_++;
 
 		// Sleep until interval passes to send next local cut
-		//std::this_thread::sleep_for(std::chrono::milliseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL));
 		std::this_thread::sleep_for(std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL));
 	}
 
@@ -126,9 +124,11 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 	static size_t seq = 0;
 	static TInode *tinode = nullptr;
 	static MessageHeader* msg_to_order = nullptr;
+	static size_t batch_header_idx = 0;
+
 	memcpy(topic_char, topic, TOPIC_NAME_SIZE);
 	if(tinode == nullptr){
-		tinode = cxl_manager_->GetTInode(topic);
+		tinode = tinode_;
 		msg_to_order = ((MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id_].log_offset));
 	}
 
@@ -139,19 +139,31 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 					LOG(INFO) << "[DEBUG] [SCALOG] written:" << written;
 					last_log_time = std::chrono::steady_clock::now();
 				}
+
+	size_t total_size = 0;
+	void* start_addr = (void*)msg_to_order;
 	for(auto &cut : global_cut){
 		if(cut.first == broker_id_){
 			for(int i = 0; i<cut.second; i++){
+				total_size += msg_to_order->paddedSize;
 				msg_to_order->total_order = seq;
 				std::atomic_thread_fence(std::memory_order_release);
-				/*
 				tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset;
 				tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
-				*/
-				cxl_manager_->UpdateTinodeOrder(topic_char, tinode, broker_id_, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
+				//cxl_manager_->UpdateTinodeOrder(topic_char, tinode, broker_id_, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
 				written = msg_to_order->logical_offset;
 				msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
 				seq++;
+				if(total_size >= BATCH_SIZE){
+					batch_header_[batch_header_idx].batch_off_to_export = 0;
+					batch_header_[batch_header_idx].total_size = total_size;
+					batch_header_[batch_header_idx].log_idx = static_cast<size_t>(
+							static_cast<uint8_t*>(start_addr) - static_cast<uint8_t*>(cxl_addr_));
+					batch_header_[batch_header_idx].ordered = 1;
+					batch_header_idx++;
+					start_addr = (void*)msg_to_order;
+					total_size = 0;
+				}
 			}
 		}else{
 			seq += cut.second;

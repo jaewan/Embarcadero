@@ -656,8 +656,7 @@ void NetworkManager::SubscribeNetworkThread(
 			// Get new messages from CXL manager
 			absl::MutexLock lock(&sub_state_[client_id]->mu);
 
-			//TODO(Jae) Change other order to work with GetBatchToExport
-			if (order == 4){
+			if (order > 0){
 				if (!topic_manager_->GetBatchToExport(
 							topic,
 							sub_state_[client_id]->last_offset,

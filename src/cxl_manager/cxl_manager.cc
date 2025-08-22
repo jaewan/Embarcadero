@@ -176,11 +176,6 @@ void* CXLManager::GetNewBatchHeaderLog(){
 	return (uint8_t*)batchHeaders_  + offset*BATCHHEADERS_SIZE;
 }
 
-void CXLManager::RunScalogSequencer(const char topic[TOPIC_NAME_SIZE]){
-	std::string topic_str(topic);
-	sequencerThreads_.emplace_back(&CXLManager::StartScalogLocalSequencer, this, topic_str);
-}
-
 void CXLManager::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers,
 		struct TInode *tinode) {
 	if (!get_registered_brokers_callback_(registered_brokers, nullptr /* msg_to_order removed */, tinode)) {
@@ -541,12 +536,5 @@ size_t CXLManager::SequentialOrderTracker::InsertAndGetSequentiallyOrdered(size_
 
 	return current_end;
 }
-
-void CXLManager::StartScalogLocalSequencer(std::string topic_str) {
-	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
-	auto scalog_local_sequencer = std::make_unique<Scalog::ScalogLocalSequencer>(this, broker_id_, cxl_addr_, topic_str);
-	scalog_local_sequencer->SendLocalCut(topic_str);
-}
-
 
 } // End of namespace Embarcadero
