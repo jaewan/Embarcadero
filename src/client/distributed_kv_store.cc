@@ -127,10 +127,10 @@ DistributedKVStore::DistributedKVStore(SequencerType seq_type)
 		} else if(SequencerType::SCALOG == seq_type){
 			order = 1;
 		} else if(SequencerType::CORFU == seq_type){
-			order = 2;
+			order = 4;
 		}
 
-		CreateNewTopic(stub_, topic, order, seq_type, 1, false, ack_level);
+		CreateNewTopic(stub_, topic, order, seq_type, 1/*replication_factor*/, false, ack_level);
 
 		subscriber_ = std::make_unique<Subscriber>("127.0.0.1", std::to_string(BROKER_PORT), topic);
 		publisher_ = std::make_unique<Publisher>(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
@@ -194,14 +194,6 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 	if (offset + sizeof(pairCount) > size) return;
 	memcpy(&pairCount, buffer + offset, sizeof(pairCount));
 	offset += sizeof(pairCount);
-
-	// First update the last applied index
-	{
-		absl::MutexLock lock(&apply_mutex_);
-		if (last_applied_total_order_ < total_order) {
-			last_applied_total_order_ = total_order;
-		}
-	}
 
 	// Process based on operation type
 	switch (type) {
@@ -323,18 +315,18 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 			LOG(ERROR) << "Unknown operation type: " << static_cast<int>(type);
 			break;
 	}
-}
 
-// 3. Update the processLogEntry method if you're still using it
-void DistributedKVStore::processLogEntry(const LogEntry& entry, size_t total_order) {
-	// First update the last applied index
+	// Update the last applied index
 	{
 		absl::MutexLock lock(&apply_mutex_);
 		if (last_applied_total_order_ < total_order) {
 			last_applied_total_order_ = total_order;
 		}
 	}
+}
 
+// 3. Update the processLogEntry method if you're still using it
+void DistributedKVStore::processLogEntry(const LogEntry& entry, size_t total_order) {
 	// Only process write operations - reads are handled locally
 	switch (entry.type) {
 		case OpType::PUT: 
@@ -397,6 +389,14 @@ void DistributedKVStore::processLogEntry(const LogEntry& entry, size_t total_ord
 			LOG(ERROR) << "Unknown operation type: " << static_cast<int>(entry.type);
 			break;
 	}
+	// Update the last applied index
+	{
+		absl::MutexLock lock(&apply_mutex_);
+		if (last_applied_total_order_ < total_order) {
+			last_applied_total_order_ = total_order;
+		}
+	}
+
 }
 
 void DistributedKVStore::completeOperation(OPID opId){
@@ -516,7 +516,6 @@ void DistributedKVStore::waitUntilApplied(size_t total_order){
 	while(total_order > last_applied_total_order_){
 		std::this_thread::yield();
 	}
-	LOG(INFO) << "client order:" << total_order << " applied:" << last_applied_total_order_;
 }
 
 std::string DistributedKVStore::get(const std::string& key) {

@@ -321,7 +321,7 @@ double ConsumeThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 
 		// Create subscriber
 		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
-		s.WaitUntilAllConnected(); // Asuume there exists NUM_MAX_BROKERS
+		s.WaitUntilAllConnected(); // Assume there exists NUM_MAX_BROKERS
 
 		// Track start of the actual receiving process
 		auto receive_start = std::chrono::high_resolution_clock::now();

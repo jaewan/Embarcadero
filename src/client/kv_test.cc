@@ -113,7 +113,7 @@ class KVStoreBenchmark {
 					// Collect batches for multi-put
 					std::vector<std::vector<KeyValue>> batches;
 
-					size_t total_ops = std::min(num_keys_, 10000UL); // Cap at 10K operations
+					size_t total_ops = std::min(num_keys_, 10000000000UL); // Cap at 100K operations
 					size_t num_batches = (total_ops + batch_size - 1) / batch_size;
 
 					for (size_t i = 0; i < num_batches; ++i) {
@@ -191,7 +191,7 @@ class KVStoreBenchmark {
 					// Collect batches for multi-get
 					std::vector<std::vector<std::string>> batches;
 
-					size_t total_ops = std::min(num_keys_, 10000UL); // Cap at 10K operations
+					size_t total_ops = std::min(num_keys_, 10000000000UL);
 					size_t num_batches = (total_ops + batch_size - 1) / batch_size;
 
 					for (size_t i = 0; i < num_batches; ++i) {
@@ -223,7 +223,7 @@ class KVStoreBenchmark {
 					}
 
 					auto end_time = std::chrono::high_resolution_clock::now();
-					auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+					auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
 
 					double latency_ms = static_cast<double>(duration.count()) / batches.size();
 					double throughput = (static_cast<double>(total_ops) / duration.count()) * 1000.0;
@@ -380,8 +380,8 @@ int main(int argc, char* argv[]) {
 		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
 		("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)",
 		 cxxopts::value<std::string>()->default_value("EMBARCADERO"))
-		("n,num_keys", "Number of keys for benchmark", cxxopts::value<size_t>()->default_value("10000"))
-		("v,value_size", "Size of values in bytes", cxxopts::value<size_t>()->default_value("256"))
+		("n,num_keys", "Number of keys for benchmark", cxxopts::value<size_t>()->default_value("100000"))
+		("v,value_size", "Size of values in bytes", cxxopts::value<size_t>()->default_value("128"))
 		("t,threads", "Number of threads for KV store", cxxopts::value<int>()->default_value("4"))
 		("min_batch", "Minimum batch size", cxxopts::value<size_t>()->default_value("1"))
 		("max_batch", "Maximum batch size", cxxopts::value<size_t>()->default_value("128"))

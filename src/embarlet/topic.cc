@@ -1,4 +1,5 @@
 #include "topic.h"
+#include "../cxl_manager/scalog_local_sequencer.h"
 
 #include <cstring>
 
@@ -116,6 +117,7 @@ Topic::Topic(
 					break;
 				case SCALOG:
 					if (order == 1){
+						sequencerThread_ = std::thread(&Topic::StartScalogLocalSequencer, this);
 						// Already started when creating topic instance from topic manager
 					}else if (order == 2)
 						LOG(ERROR) << "Order is set 2 at scalog";
@@ -133,6 +135,15 @@ Topic::Topic(
 			}
 	}
 }
+
+void Topic::StartScalogLocalSequencer() {
+	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
+	BatchHeader* batch_header = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	Scalog::ScalogLocalSequencer scalog_local_sequencer(tinode_, broker_id_, cxl_addr_, topic_name_, batch_header);
+	scalog_local_sequencer.SendLocalCut(topic_name_, stop_threads_);
+}
+
 
 inline void Topic::UpdateTInodeWritten(size_t written, size_t written_addr) {
 	// Update replica tinode if it exists

@@ -142,7 +142,6 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 
 	// Run sequencer if needed
 	if (tinode->seq_type == SCALOG) {
-		cxl_manager_.RunScalogSequencer(topic);
 		if (replication_factor > 0) {
 			disk_manager_.StartScalogReplicaLocalSequencer();
 		}
@@ -251,7 +250,6 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 	}
 	// Run sequencer if needed
 	if (tinode->seq_type == SCALOG) {
-		cxl_manager_.RunScalogSequencer(topic);
 		if (replication_factor > 0) {
 			disk_manager_.StartScalogReplicaLocalSequencer();
 		}
