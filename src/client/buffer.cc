@@ -20,14 +20,14 @@
  * ordering and state variables, without using explicit locks.
  *
  * WRITER-CONTROLLED VARIABLES:
- * - bufs_[i].tail: Current write position in the buffer
- * - bufs_[i].writer_head: Start position of the current batch
- * - bufs_[i].num_msg: Number of messages in the current batch
+ * - bufs_[i].prod.tail: Current write position in the buffer
+ * - bufs_[i].prod.writer_head: Start position of the current batch
+ * - bufs_[i].prod.num_msg: Number of messages in the current batch
  * - write_buf_id_: ID of the buffer currently being written to
  * - batch_seq_: Atomically incremented sequence number for batches
  *
  * READER-CONTROLLED VARIABLES:
- * - bufs_[i].reader_head: Position from which the reader is currently reading
+ * - bufs_[i].cons.reader_head: Position from which the reader is currently reading
  *   - This points to the batch header
  *
  * SYNCHRONIZATION POINTS:
@@ -160,7 +160,7 @@ bool Buffer::AddBuffers(size_t buf_size) {
 
 #ifdef BATCH_OPTIMIZATION
 		// In batch mode, initialize tail to leave space for batch header
-		bufs_[idx + i].tail = sizeof(Embarcadero::BatchHeader);
+		bufs_[idx + i].prod.tail.store(sizeof(Embarcadero::BatchHeader), std::memory_order_relaxed);
 #endif
 	}
 
@@ -197,8 +197,8 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 	{
 		size_t lockedIdx = write_buf_id_;
 		buffer = bufs_[write_buf_id_].buffer;
-		head = bufs_[write_buf_id_].writer_head;
-		tail = bufs_[write_buf_id_].tail;
+		head = bufs_[write_buf_id_].prod.writer_head.load(std::memory_order_relaxed);
+		tail = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed);
 
 		// Check if buffer is full and needs to be wrapped
 		if (tail + header_size + paddedSize + paddedSize /*buffer margin*/ > bufs_[lockedIdx].len) {
@@ -211,13 +211,13 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 
 			batch_header->start_logical_offset = 0;
 			batch_header->batch_seq = batch_seq_.fetch_add(1);
-			batch_header->total_size = bufs_[write_buf_id_].tail - head - sizeof(Embarcadero::BatchHeader);
-			batch_header->num_msg = bufs_[write_buf_id_].num_msg;
+			batch_header->total_size = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed) - head - sizeof(Embarcadero::BatchHeader);
+			batch_header->num_msg = bufs_[write_buf_id_].prod.num_msg.load(std::memory_order_relaxed);
 
 			// Reset buffer state for new batch
-			bufs_[write_buf_id_].num_msg = 0;
-			bufs_[write_buf_id_].writer_head = 0;
-			bufs_[write_buf_id_].tail = sizeof(Embarcadero::BatchHeader);
+			bufs_[write_buf_id_].prod.num_msg.store(0, std::memory_order_relaxed);
+			bufs_[write_buf_id_].prod.writer_head.store(0, std::memory_order_relaxed);
+			bufs_[write_buf_id_].prod.tail.store(sizeof(Embarcadero::BatchHeader), std::memory_order_relaxed);
 
 			// Move to next buffer
 			AdvanceWriteBufId();
@@ -239,11 +239,11 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 	//std::atomic_thread_fence(std::memory_order_release);
 
 	// Update buffer state
-	bufs_[write_buf_id_].tail += paddedSize;
-	bufs_[write_buf_id_].num_msg++;
+	bufs_[write_buf_id_].prod.tail.fetch_add(paddedSize, std::memory_order_relaxed);
+	bufs_[write_buf_id_].prod.num_msg.fetch_add(1, std::memory_order_relaxed);
 	
 	// Check if current batch has reached BATCH_SIZE and seal it
-	if ((bufs_[write_buf_id_].tail - head) >= BATCH_SIZE) {
+	if ((bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed) - head) >= BATCH_SIZE) {
 		Seal();
 	}
 
@@ -253,21 +253,21 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 
 void Buffer::Seal(){
 	size_t lockedIdx = write_buf_id_;
-	size_t head = bufs_[lockedIdx].writer_head;
+	size_t head = bufs_[lockedIdx].prod.writer_head.load(std::memory_order_relaxed);
 	// Check if any data written
-	if ((bufs_[lockedIdx].tail - head) > sizeof(Embarcadero::BatchHeader)) {
+	if ((bufs_[lockedIdx].prod.tail.load(std::memory_order_relaxed) - head) > sizeof(Embarcadero::BatchHeader)) {
 		Embarcadero::BatchHeader* batch_header = 
 			reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[lockedIdx].buffer + head);
 
-		batch_header->start_logical_offset = bufs_[lockedIdx].tail;
+		batch_header->start_logical_offset = bufs_[lockedIdx].prod.tail.load(std::memory_order_relaxed);
 		batch_header->batch_seq = batch_seq_.fetch_add(1);
-		batch_header->total_size = bufs_[lockedIdx].tail - head - sizeof(Embarcadero::BatchHeader);
-		batch_header->num_msg = bufs_[lockedIdx].num_msg;
+		batch_header->total_size = bufs_[lockedIdx].prod.tail.load(std::memory_order_relaxed) - head - sizeof(Embarcadero::BatchHeader);
+		batch_header->num_msg = bufs_[lockedIdx].prod.num_msg.load(std::memory_order_relaxed);
 
 		// Update buffer state for next batch
-		bufs_[lockedIdx].num_msg = 0;
-		bufs_[lockedIdx].writer_head = bufs_[lockedIdx].tail;
-		bufs_[lockedIdx].tail += sizeof(Embarcadero::BatchHeader);
+		bufs_[lockedIdx].prod.num_msg.store(0, std::memory_order_relaxed);
+		bufs_[lockedIdx].prod.writer_head.store(bufs_[lockedIdx].prod.tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		bufs_[lockedIdx].prod.tail.fetch_add(sizeof(Embarcadero::BatchHeader), std::memory_order_relaxed);
 
 		// Move to next buffer
 		AdvanceWriteBufId();
@@ -276,7 +276,7 @@ void Buffer::Seal(){
 
 void* Buffer::Read(int bufIdx) {
 	Embarcadero::BatchHeader* batch_header =
-		reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].reader_head);
+		reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].cons.reader_head.load(std::memory_order_relaxed));
 
 	// Check if batch header contains valid data
 	if (batch_header->total_size != 0 && batch_header->num_msg != 0) {
@@ -293,12 +293,12 @@ void* Buffer::Read(int bufIdx) {
 			return static_cast<void*>(batch_header);
 		}
 
-		bufs_[bufIdx].reader_head = next_head;
+		bufs_[bufIdx].cons.reader_head.store(next_head, std::memory_order_relaxed);
 		return static_cast<void*>(batch_header);
 	}
 
 	// No writing in this buffer. Do not busy wait
-	if (bufs_[bufIdx].writer_head == bufs_[bufIdx].tail) {
+	if (bufs_[bufIdx].prod.writer_head.load(std::memory_order_relaxed) == bufs_[bufIdx].prod.tail.load(std::memory_order_relaxed)) {
 		return nullptr;
 	}
 
@@ -316,7 +316,7 @@ void* Buffer::Read(int bufIdx) {
 		std::this_thread::yield();
 	}
 
-	bufs_[bufIdx].reader_head = batch_header->start_logical_offset;
+	bufs_[bufIdx].cons.reader_head.store(batch_header->start_logical_offset, std::memory_order_relaxed);
 	return static_cast<void*>(batch_header);
 }
 
@@ -353,28 +353,28 @@ bool Buffer::Write(int bufIdx, size_t client_order, char* msg, size_t len, size_
 void* Buffer::Read(int bufIdx, size_t& len) {
 	if (order_ == 3) {
 		// For order level 3, read fixed-size batches
-		while (!shutdown_ && bufs_[bufIdx].tail - bufs_[bufIdx].reader_head < BATCH_SIZE) {
+		while (!shutdown_ && bufs_[bufIdx].prod.tail.load(std::memory_order_relaxed) - bufs_[bufIdx].cons.reader_head.load(std::memory_order_relaxed) < BATCH_SIZE) {
 			std::this_thread::yield();
 		}
 
-		size_t head = bufs_[bufIdx].reader_head;
+		size_t head = bufs_[bufIdx].cons.reader_head.load(std::memory_order_relaxed);
 
 		// Memory barrier to ensure we see the latest data
 		//std::atomic_thread_fence(std::memory_order_acquire);
 
-		len = bufs_[bufIdx].tail - head;
+		len = bufs_[bufIdx].prod.tail.load(std::memory_order_relaxed) - head;
 		if (len == 0) {
 			return nullptr;
 		}
 
 		// For order level 3, always return a fixed batch size
 		len = BATCH_SIZE;
-		bufs_[bufIdx].reader_head += BATCH_SIZE;
+		bufs_[bufIdx].cons.reader_head.fetch_add(BATCH_SIZE, std::memory_order_relaxed);
 
 		return static_cast<void*>((uint8_t*)bufs_[bufIdx].buffer + head);
 	} else {
 		// For other order levels, read all available data
-		while (!shutdown_ && bufs_[bufIdx].tail <= bufs_[bufIdx].reader_head) {
+		while (!shutdown_ && bufs_[bufIdx].prod.tail.load(std::memory_order_relaxed) <= bufs_[bufIdx].cons.reader_head.load(std::memory_order_relaxed)) {
 			std::this_thread::yield();
 		}
 		/*
@@ -398,16 +398,16 @@ void* Buffer::Read(int bufIdx, size_t& len) {
 		}
 		*/
 
-		size_t head = bufs_[bufIdx].reader_head;
+		size_t head = bufs_[bufIdx].cons.reader_head.load(std::memory_order_relaxed);
 
 		// Memory barrier to ensure we see the latest data
 		//std::atomic_thread_fence(std::memory_order_acquire);
 
-		size_t tail = bufs_[bufIdx].tail;
+		size_t tail = bufs_[bufIdx].prod.tail.load(std::memory_order_relaxed);
 		len = tail - head;
 
 		// Update reader head to current tail
-		bufs_[bufIdx].reader_head = tail;
+		bufs_[bufIdx].cons.reader_head.store(tail, std::memory_order_relaxed);
 
 		return static_cast<void*>((uint8_t*)bufs_[bufIdx].buffer + head);
 	}

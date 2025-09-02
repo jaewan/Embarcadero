@@ -20,6 +20,7 @@
 
 // Project includes
 #include "common/config.h"
+#include "common/configuration.h"
 #include "heartbeat.h"
 #include "topic_manager.h"
 #include "../disk_manager/disk_manager.h"
@@ -136,12 +137,31 @@ int main(int argc, char* argv[]) {
 		("network_threads", "Number of network IO threads",
 		 cxxopts::value<int>()->default_value(std::to_string(NUM_NETWORK_IO_THREADS)))
 		("replicate_to_disk", "Replicate to Disk instead of Memory")
-		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"));
+		("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
+		("config", "Configuration file path", cxxopts::value<std::string>()->default_value("config/embarcadero.yaml"));
 
 	auto arguments = options.parse(argc, argv);
 
 	FLAGS_v = arguments["log_level"].as<int>();
 	FLAGS_logtostderr = 1; // log only to console, no files
+
+	// *************** Load Configuration *********************
+	Embarcadero::Configuration& config = Embarcadero::Configuration::getInstance();
+	std::string config_file = arguments["config"].as<std::string>();
+	
+	if (!config.loadFromFile(config_file)) {
+		LOG(ERROR) << "Failed to load configuration from " << config_file;
+		auto errors = config.getValidationErrors();
+		for (const auto& error : errors) {
+			LOG(ERROR) << "Config error: " << error;
+		}
+		return EXIT_FAILURE;
+	}
+	
+	// Override configuration with command line arguments
+	config.overrideFromCommandLine(argc, argv);
+	
+	LOG(INFO) << "Configuration loaded successfully from " << config_file;
 
 	// *************** Initializing Broker ********************** 
 	bool is_head_node = false;
@@ -206,16 +226,22 @@ int main(int argc, char* argv[]) {
 
 	if (is_head_node) {
 		cxl_manager.RegisterGetRegisteredBrokersCallback(
-				std::bind(&heartbeat_system::HeartBeatManager::GetRegisteredBrokers, &heartbeat_manager,
-					std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+				[&heartbeat_manager](absl::btree_set<int> &registered_brokers,
+					Embarcadero::MessageHeader** msg_to_order,
+					Embarcadero::TInode *tinode) -> int {
+					return heartbeat_manager.GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+				});
 	}
 
 	topic_manager.RegisterGetNumBrokersCallback(
 			std::bind(&heartbeat_system::HeartBeatManager::GetNumBrokers, &heartbeat_manager));
 
 	topic_manager.RegisterGetRegisteredBrokersCallback(
-				std::bind(&heartbeat_system::HeartBeatManager::GetRegisteredBrokers, &heartbeat_manager,
-					std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+			[&heartbeat_manager](absl::btree_set<int> &registered_brokers,
+				Embarcadero::MessageHeader** msg_to_order,
+				Embarcadero::TInode *tinode) -> int {
+				return heartbeat_manager.GetRegisteredBrokers(registered_brokers, msg_to_order, tinode);
+			});
 
 
 	network_manager.RegisterGetNumBrokersCallback(

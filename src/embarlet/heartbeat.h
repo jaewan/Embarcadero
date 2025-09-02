@@ -33,6 +33,12 @@
 #include "common/config.h"
 #include "../cxl_manager/cxl_manager.h"
 
+// Forward declarations
+namespace Embarcadero {
+    struct MessageHeader;
+    struct TInode;
+}
+
 using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;

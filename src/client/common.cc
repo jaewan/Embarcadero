@@ -46,6 +46,13 @@ bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAM
 		return false;
 	}
 
+	LOG(INFO) << "Topic created successfully: " << topic;
+	
+	// Give head node time to fully initialize TInode before followers access it
+	// This is important to avoid race conditions where publishers connect to
+	// follower brokers before the tinode is fully propagated
+	std::this_thread::sleep_for(std::chrono::milliseconds(500));
+	
 	return true;
 }
 

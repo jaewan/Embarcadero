@@ -2,6 +2,8 @@
 #include <random>
 #include <algorithm>
 #include <fstream>
+#include <chrono>
+#include <thread>
 
 Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, 
 		int num_threads_per_broker, size_t message_size, size_t queueSize, 
@@ -15,7 +17,8 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 	pubQue_(num_threads_per_broker_ * NUM_MAX_BROKERS, num_threads_per_broker_, client_id_, message_size, order),
 	seq_type_(seq_type),
 	sent_bytes_per_broker_(NUM_MAX_BROKERS),
-	acked_messages_per_broker_(NUM_MAX_BROKERS){
+	acked_messages_per_broker_(NUM_MAX_BROKERS),
+	start_time_(std::chrono::steady_clock::now()){  // Initialize start_time_ immediately
 
 		// Copy topic name
 		memcpy(topic_, topic, TOPIC_NAME_SIZE);
@@ -568,8 +571,14 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				return false;
 			}
 
-			auto [_addr, _port] = ParseAddressPort(it->second);
-			addr = _addr;
+			try {
+				auto [_addr, _port] = ParseAddressPort(it->second);
+				addr = _addr;
+			} catch (const std::exception& e) {
+				LOG(ERROR) << "Failed to parse address for broker " << brokerId 
+				           << ": " << it->second << " - " << e.what();
+				return false;
+			}
 			num_brokers = nodes_.size();
 		}
 
@@ -606,7 +615,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		Embarcadero::EmbarcaderoReq shake;
 		shake.client_req = Embarcadero::Publish;
 		shake.client_id = client_id_;
-		memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
+		memset(shake.topic, 0, sizeof(shake.topic));
+		memcpy(shake.topic, topic_, std::min<size_t>(TOPIC_NAME_SIZE - 1, sizeof(shake.topic) - 1));
 		shake.ack = ack_level_;
 		shake.port = ack_port_;
 		shake.num_msg = num_brokers;  // Using num_msg field to indicate number of brokers
@@ -987,8 +997,17 @@ void Publisher::SubscribeToClusterStatus() {
 		} else {
 			// Handle read error or end of stream
 			if (!shutdown_) {
-				LOG(WARNING) << "Cluster status stream ended, reconnecting...";
-				// Could implement reconnection logic here
+				static auto last_warning = std::chrono::steady_clock::now();
+				auto now = std::chrono::steady_clock::now();
+				
+				// Only log warning every 5 seconds to avoid spam
+				if (now - last_warning > std::chrono::seconds(5)) {
+					LOG(WARNING) << "Cluster status stream ended, reconnecting...";
+					last_warning = now;
+				}
+				
+				// Add a small delay before reconnecting to avoid tight loop
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			}
 		}
 	}

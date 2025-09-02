@@ -1,8 +1,10 @@
-#include <unistd.h>
+#include "topic_manager.h"
+#include <glog/logging.h>
 #include <cstring>
-#include <cstdint>
 #include <algorithm>
+#include "common/performance_utils.h"
 #include <immintrin.h>
+#include <xmmintrin.h>  // For _mm_pause()
 
 // Project includes
 #include "topic_manager.h"
@@ -93,8 +95,14 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	TInode* replica_tinode = nullptr;
 
+	// Validate that TInode has been initialized by head node
+	if (!tinode || tinode->topic[0] == 0) {
+		LOG(ERROR) << "TInode not properly initialized for topic: " << topic;
+		return nullptr;
+	}
+
 	{
-		absl::WriterMutexLock lock(&mutex_);
+		absl::WriterMutexLock lock(&topics_mutex_);
 
 		CHECK_LT(num_topics_, MAX_TOPIC_SIZE) 
 			<< "Creating too many topics, increase MAX_TOPIC_SIZE";
@@ -106,24 +114,37 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		void* cxl_addr = cxl_manager_.GetCXLAddr();
 		void* segment_metadata = cxl_manager_.GetNewSegment();
 		void* batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
+		
+		// Validate all pointers before using them
+		if (!segment_metadata) {
+			LOG(ERROR) << "Failed to allocate segment for topic: " << topic;
+			return nullptr;
+		}
+		if (!batch_headers_region) {
+			LOG(ERROR) << "Failed to allocate batch headers for topic: " << topic;
+			return nullptr;
+		}
 
 		// Handle replica if needed
 		if (tinode->replicate_tinode) {
 			replica_tinode = cxl_manager_.GetReplicaTInode(topic);
+			// Initialize this broker's offsets in the replica TInode
 			InitializeTInodeOffsets(replica_tinode, segment_metadata, 
 					batch_headers_region, cxl_addr);
 		}
 
+		// Initialize this broker's offsets in the main TInode
+		// Each broker needs its own entry in the offsets[NUM_MAX_BROKERS] array
 		InitializeTInodeOffsets(tinode, segment_metadata, batch_headers_region, cxl_addr);
 
 		// Create the topic
 		topics_[topic] = std::make_unique<Topic>(
 				[this]() { return cxl_manager_.GetNewSegment(); },
 				[this]() { return get_num_brokers_callback_(); },
-				[this](absl::btree_set<int> &registered_brokers, 
-														struct MessageHeader** msg_to_order, struct TInode *tinode) { 
-				return get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode); },
-				tinode,
+				GetRegisteredBrokersCallback([this](absl::btree_set<int> &registered_brokers, 
+														MessageHeader** msg_to_order, TInode *tinode) -> int { 
+				return get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode); }),
+				static_cast<void*>(tinode),
 				replica_tinode,
 				topic,
 				broker_id_,
@@ -161,20 +182,14 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	struct TInode* replica_tinode = nullptr;
 
-	// Check for name collision in tinode
-	const bool no_collision = std::all_of(
-			reinterpret_cast<const unsigned char*>(tinode->topic),
-			reinterpret_cast<const unsigned char*>(tinode->topic) + TOPIC_NAME_SIZE,
-			[](unsigned char c) { return c == 0; }
-			);
-
-	if (!no_collision) {
-		LOG(ERROR) << "Topic name collides: " << tinode->topic << " handle collision";
-		exit(1);
+	// Check for name collision in tinode: if already set to a different name, abort
+	if (tinode->topic[0] != 0 && strncmp(tinode->topic, topic, TOPIC_NAME_SIZE) != 0) {
+		LOG(ERROR) << "Topic name collides: " << tinode->topic;
+		return nullptr;
 	}
 
 	{
-		absl::WriterMutexLock lock(&mutex_);
+		absl::WriterMutexLock lock(&topics_mutex_);
 
 		CHECK_LT(num_topics_, MAX_TOPIC_SIZE) 
 			<< "Creating too many topics, increase MAX_TOPIC_SIZE";
@@ -186,6 +201,16 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		void* cxl_addr = cxl_manager_.GetCXLAddr();
 		void* segment_metadata = cxl_manager_.GetNewSegment();
 		void* batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
+		
+		// Validate all pointers before using them
+		if (!segment_metadata) {
+			LOG(ERROR) << "Failed to allocate segment for topic: " << topic;
+			return nullptr;
+		}
+		if (!batch_headers_region) {
+			LOG(ERROR) << "Failed to allocate batch headers for topic: " << topic;
+			return nullptr;
+		}
 
 		// Initialize tinode
 		InitializeTInodeOffsets(tinode, segment_metadata, batch_headers_region, cxl_addr);
@@ -194,26 +219,27 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		tinode->ack_level = ack_level;
 		tinode->replicate_tinode = replicate_tinode;
 		tinode->seq_type = seq_type;
-		memcpy(tinode->topic, topic, TOPIC_NAME_SIZE);
+		memset(tinode->topic, 0, TOPIC_NAME_SIZE);
+		memcpy(tinode->topic, topic, std::min<size_t>(TOPIC_NAME_SIZE - 1, strlen(topic)));
 
 		// Handle replica if needed
 		if (replicate_tinode) {
 			char replica_topic[TOPIC_NAME_SIZE] = {0};
-			memcpy(replica_topic, topic, TOPIC_NAME_SIZE);
-			memcpy(replica_topic + (TOPIC_NAME_SIZE - 7), "replica", 7);
+			memcpy(replica_topic, topic, std::min<size_t>(TOPIC_NAME_SIZE - 1, strlen(topic)));
+			const char* suffix = "replica";
+			size_t rep_len = strlen(replica_topic);
+			size_t suffix_len = strlen(suffix);
+			if (rep_len + suffix_len < TOPIC_NAME_SIZE) {
+				memcpy(replica_topic + rep_len, suffix, suffix_len);
+			} else {
+				memcpy(replica_topic + (TOPIC_NAME_SIZE - 1 - suffix_len), suffix, suffix_len);
+			}
 
 			replica_tinode = cxl_manager_.GetReplicaTInode(topic);
 
-			const bool replica_no_collision = std::all_of(
-					reinterpret_cast<const unsigned char*>(replica_tinode->topic),
-					reinterpret_cast<const unsigned char*>(replica_tinode->topic) + TOPIC_NAME_SIZE,
-					[](unsigned char c) { return c == 0; }
-					);
-
-			if (!replica_no_collision) {
-				LOG(ERROR) << "Replica topic name collides: " << replica_tinode->topic 
-					<< " handle collision";
-				exit(1);
+			if (replica_tinode->topic[0] != 0 && strncmp(replica_tinode->topic, replica_topic, TOPIC_NAME_SIZE) != 0) {
+				LOG(ERROR) << "Replica topic name collides: " << replica_tinode->topic;
+				return nullptr;
 			}
 
 			InitializeTInodeOffsets(replica_tinode, segment_metadata, 
@@ -223,17 +249,18 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 			replica_tinode->ack_level = ack_level;
 			replica_tinode->replicate_tinode = replicate_tinode;
 			replica_tinode->seq_type = seq_type;
-			memcpy(replica_tinode->topic, replica_topic, TOPIC_NAME_SIZE);
+			memset(replica_tinode->topic, 0, TOPIC_NAME_SIZE);
+			memcpy(replica_tinode->topic, replica_topic, std::min<size_t>(TOPIC_NAME_SIZE - 1, strlen(replica_topic)));
 		}
 
 		// Create the topic
 		topics_[topic] = std::make_unique<Topic>(
 				[this]() { return cxl_manager_.GetNewSegment(); },
 				[this]() { return get_num_brokers_callback_(); },
-				[this](absl::btree_set<int> &registered_brokers, 
-														struct MessageHeader** msg_to_order, struct TInode *tinode) { 
-				return get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode); },
-				tinode,
+				GetRegisteredBrokersCallback([this](absl::btree_set<int> &registered_brokers, 
+									MessageHeader** msg_to_order, TInode *tinode) -> int { 
+			return get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode); }),
+				static_cast<void*>(tinode),
 				replica_tinode,
 				topic,
 				broker_id_,
@@ -261,20 +288,22 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 bool TopicManager::CreateNewTopic(
         const char topic[TOPIC_NAME_SIZE], 
         int order, 
-        int replication_factor, 
-        bool replicate_tinode, 
-				int ack_level,
-        SequencerType seq_type) {
-    
-    TInode* tinode = CreateNewTopicInternal(
-        topic, order, replication_factor, replicate_tinode, ack_level, seq_type);
-        
-    if (tinode) {
-        return true;
-    } else {
-        LOG(ERROR) << "Topic already exists!";
-        return false;
-    }
+        int replication_factor,
+        bool replicate_tinode,
+        int ack_level,
+        heartbeat_system::SequencerType seq_type) {
+	
+	// Direct call without string interning overhead
+	struct TInode* tinode = CreateNewTopicInternal(
+		topic, order, replication_factor, 
+		replicate_tinode, ack_level, seq_type);
+		
+	if (tinode) {
+		return true;
+	} else {
+		LOG(ERROR) << "Topic already exists!";
+		return false;
+	}
 }
 
 void TopicManager::DeleteTopic(const char topic[TOPIC_NAME_SIZE]) {
@@ -288,31 +317,73 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		void* &segment_header, 
 		size_t &logical_offset, 
 		SequencerType &seq_type) {
-
+	
+	// Fast path: try to find topic without locking first
+	absl::ReaderMutexLock lock(&topics_mutex_);
 	auto topic_itr = topics_.find(topic);
 
 	if (topic_itr == topics_.end()) {
-		// Check if topic exists in CXL but not in local map
+		// Topic not found, need to check if it needs creation
+		lock.~ReaderMutexLock();
+		
 		const TInode* tinode = cxl_manager_.GetTInode(topic);
-		if (tinode && memcmp(topic, tinode->topic, TOPIC_NAME_SIZE) == 0) {
-			// Topic was created from another broker, create it locally
-			CreateNewTopicInternal(topic);
-			topic_itr = topics_.find(topic);
+		
+		// Fast busy-wait for tinode initialization (much faster than sleep)
+		int wait_count = 0;
+		const int max_wait = 10000; // 10000 iterations with pause
+		while ((!tinode || tinode->topic[0] == 0) && wait_count < max_wait) {
+			_mm_pause(); // CPU pause instruction for busy-wait
+			wait_count++;
+			
+			if (wait_count % 100 == 0) {
+				// Check if topic was created
+				absl::ReaderMutexLock check_lock(&topics_mutex_);
+				topic_itr = topics_.find(topic);
+				if (topic_itr != topics_.end()) {
+					// Topic was created while we were waiting
+					break;
+				}
+			}
+			tinode = cxl_manager_.GetTInode(topic);
+		}
+		
+		// If topic still doesn't exist after waiting, try to create it
+		if (topic_itr == topics_.end()) {
+			bool has_remote_topic = (tinode != nullptr) && (tinode->topic[0] != 0);
+			if (has_remote_topic) {
+				// Topic was created from another broker, create it locally
+				// Take write lock for creation
+				absl::WriterMutexLock write_lock(&topics_mutex_);
+				
+				// Double-check after acquiring exclusive lock
+				topic_itr = topics_.find(topic);
+				if (topic_itr == topics_.end()) {
+					CreateNewTopicInternal(topic);
+					topic_itr = topics_.find(topic);
+				}
 
-			if (topic_itr == topics_.end()) {
-				LOG(ERROR) << "Topic Entry was not created, something is wrong";
+				if (topic_itr == topics_.end()) {
+					LOG(ERROR) << "Failed to create topic: " << topic;
+					return nullptr;
+				}
+			} else {
+				LOG(ERROR) << "Topic not found: " << topic;
 				return nullptr;
 			}
 		} else {
-			LOG(ERROR) << "[GetCXLBuffer] Topic: " << topic 
-				<< " was not created before: " << tinode->topic
-				<< " memcmp: " << memcmp(topic, tinode->topic, TOPIC_NAME_SIZE);
-			return nullptr;
+			// Found topic while waiting, reacquire read lock
+			new (&lock) absl::ReaderMutexLock(&topics_mutex_);
+			topic_itr = topics_.find(topic);
+			if (topic_itr == topics_.end()) {
+				LOG(ERROR) << "Topic disappeared: " << topic;
+				return nullptr;
+			}
 		}
 	}
 
-	seq_type = topic_itr->second->GetSeqtype();
-	return topic_itr->second->GetCXLBuffer(
+	auto& topic_obj = topic_itr->second;
+	seq_type = topic_obj->GetSeqtype();
+	return topic_obj->GetCXLBuffer(
 			batch_header, topic, log, segment_header, logical_offset);
 }
 
@@ -322,7 +393,7 @@ bool TopicManager::GetBatchToExport(
 		void* &batch_addr,
 		size_t &batch_size) {
 
-	absl::ReaderMutexLock lock(&mutex_);
+	absl::ReaderMutexLock lock(&topics_mutex_);
 
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()) {
@@ -340,7 +411,7 @@ bool TopicManager::GetMessageAddr(
 		void* &messages, 
 		size_t &messages_size) {
 
-	absl::ReaderMutexLock lock(&mutex_);
+	absl::ReaderMutexLock lock(&topics_mutex_);
 
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()) {
@@ -352,33 +423,34 @@ bool TopicManager::GetMessageAddr(
 }
 
 int TopicManager::GetTopicOrder(const char* topic){
-	mutex_.ReaderLock();
+	topics_mutex_.ReaderLock();
 
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()) {
 		const TInode* tinode = cxl_manager_.GetTInode(topic);
-		if (tinode && memcmp(topic, tinode->topic, TOPIC_NAME_SIZE) == 0) {
+		// Relax creation criteria: if remote TInode has any non-empty name, create locally
+		bool has_remote_topic = (tinode != nullptr) && (tinode->topic[0] != 0);
+		if (has_remote_topic) {
 			// Topic was created from another broker, create it locally
-			mutex_.ReaderUnlock();
+			topics_mutex_.ReaderUnlock();
 			CreateNewTopicInternal(topic);
-			mutex_.ReaderLock();
+			topics_mutex_.ReaderLock();
 			topic_itr = topics_.find(topic);
 
 			if (topic_itr == topics_.end()) {
 				LOG(ERROR) << "Topic:" << topic << " Does not Exist!!";
-				mutex_.ReaderUnlock();
+				topics_mutex_.ReaderUnlock();
 				return 0;
 			}
 		} else {
 			LOG(ERROR) << "[GetTopicOrder] Topic: " << topic 
-				<< " was not created before: " << tinode->topic
-				<< " memcmp: " << memcmp(topic, tinode->topic, TOPIC_NAME_SIZE);
-			mutex_.ReaderUnlock();
+				<< " was not created before: " << (tinode ? tinode->topic : "null");
+			topics_mutex_.ReaderUnlock();
 			return 0;
 		}
 	}
 
-	mutex_.ReaderUnlock();
+	topics_mutex_.ReaderUnlock();
 	return topic_itr->second->GetOrder();
 }
 

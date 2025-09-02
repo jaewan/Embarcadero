@@ -13,6 +13,7 @@
 #include <numaif.h>
 #include <glog/logging.h>
 #include "mimalloc.h"
+#include "common/configuration.h"
 
 namespace Embarcadero{
 
@@ -162,14 +163,45 @@ TInode* CXLManager::GetReplicaTInode(const char* topic){
 
 void* CXLManager::GetNewSegment(){
 	//TODO(Jae) Implement bitmap
-	std::atomic<size_t> segment_count{0};
+	static std::atomic<size_t> segment_count{0};
+	
+	// Calculate max segments only once (static)
+	static size_t max_segments = []() {
+		size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+		size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
+		size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
+		TINode_Region_size += padding;
+		size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
+		size_t BatchHeaders_Region_size = NUM_MAX_BROKERS * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+		
+		// Get CXL size from configuration
+		size_t cxl_size = Embarcadero::Configuration::getInstance().config().cxl.size.get();
+		// Memory is divided among NUM_MAX_BROKERS slots regardless of how many are actually used
+		// This ensures consistent memory layout
+		size_t Segment_Region_size = (cxl_size - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size)/NUM_MAX_BROKERS;
+		size_t max_segs = Segment_Region_size / SEGMENT_SIZE;
+		
+		LOG(INFO) << "GetNewSegment: CXL_size=" << cxl_size
+		          << " NUM_MAX_BROKERS=" << NUM_MAX_BROKERS
+		          << " Segment_Region_size=" << Segment_Region_size 
+		          << " SEGMENT_SIZE=" << SEGMENT_SIZE 
+		          << " max_segments=" << max_segs;
+		return max_segs;
+	}();
+	
 	size_t offset = segment_count.fetch_add(1, std::memory_order_relaxed);
+	
+	if (offset >= max_segments) {
+		LOG(ERROR) << "Segment allocation overflow: offset=" << offset 
+		           << " max_segments=" << max_segments;
+		return nullptr;
+	}
 
 	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
 }
 
 void* CXLManager::GetNewBatchHeaderLog(){
-	std::atomic<size_t> batch_header_log_count{0};
+	static std::atomic<size_t> batch_header_log_count{0};
 	CHECK_LT(batch_header_log_count, MAX_TOPIC_SIZE) << "You are creating too many topics";
 	size_t offset = batch_header_log_count.fetch_add(1, std::memory_order_relaxed);
 
@@ -177,7 +209,7 @@ void* CXLManager::GetNewBatchHeaderLog(){
 }
 
 void CXLManager::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers,
-		struct TInode *tinode) {
+		TInode *tinode) {
 	if (!get_registered_brokers_callback_(registered_brokers, nullptr /* msg_to_order removed */, tinode)) {
 		LOG(ERROR) << "GetRegisteredBrokerSet: Callback failed to get registered brokers.";
 		registered_brokers.clear(); // Ensure set is empty on failure
@@ -185,7 +217,7 @@ void CXLManager::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers
 }
 
 void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, 
-		struct MessageHeader** msg_to_order, struct TInode *tinode){
+		MessageHeader** msg_to_order, TInode *tinode){
 	if(get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode)){
 		for(const auto &broker_id : registered_brokers){
 			// Wait for other brokers to initialize this topic. 

@@ -31,6 +31,33 @@ Topic::Topic(
 	written_logical_offset_((size_t)-1),
 	current_segment_(segment_metadata) {
 
+		// Validate tinode pointer first
+		if (!tinode_) {
+			LOG(FATAL) << "TInode is null for topic: " << topic_name;
+		}
+		
+		// Validate offsets before using them
+		if (tinode_->offsets[broker_id_].log_offset == 0) {
+			LOG(ERROR) << "Invalid log_offset for broker " << broker_id_ << " in topic: " << topic_name
+			           << ". Waiting for tinode initialization...";
+			
+			// Wait for tinode to be initialized with a timeout
+			int wait_count = 0;
+			const int max_wait = 100; // 10 seconds max wait (100 * 100ms)
+			while (tinode_->offsets[broker_id_].log_offset == 0 && wait_count < max_wait) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				wait_count++;
+			}
+			
+			if (tinode_->offsets[broker_id_].log_offset == 0) {
+				LOG(FATAL) << "Tinode not initialized after " << (max_wait * 100) 
+				           << "ms for broker " << broker_id_ << " in topic: " << topic_name;
+			}
+			
+			LOG(INFO) << "Tinode initialized after " << (wait_count * 100) 
+			          << "ms for broker " << broker_id_ << " in topic: " << topic_name;
+		}
+		
 		// Initialize addresses based on offsets
 		log_addr_.store(static_cast<unsigned long long int>(
 					reinterpret_cast<uintptr_t>(cxl_addr_) + tinode_->offsets[broker_id_].log_offset));
@@ -92,6 +119,9 @@ Topic::Topic(
 		}
 
 
+		// Ensure all initialization is complete before starting threads
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		
 		// Start combiner if needed
 		if (seq_type == CORFU || (seq_type != KAFKA && order_ != 4)) {
 			combiningThreads_.emplace_back(&Topic::CombinerThread, this);
@@ -158,6 +188,23 @@ inline void Topic::UpdateTInodeWritten(size_t written, size_t written_addr) {
 }
 
 void Topic::CombinerThread() {
+	// Validate first_message_addr_ before using it
+	if (!first_message_addr_ || first_message_addr_ == cxl_addr_) {
+		LOG(FATAL) << "Invalid first_message_addr_ in CombinerThread for topic: " << topic_name_
+		           << ". first_message_addr_=" << first_message_addr_ 
+		           << ", cxl_addr_=" << cxl_addr_
+		           << ", log_offset=" << tinode_->offsets[broker_id_].log_offset;
+		return;
+	}
+	
+	// Additional safety check - ensure we have enough space before the first message for the segment header
+	if (reinterpret_cast<uintptr_t>(first_message_addr_) < reinterpret_cast<uintptr_t>(cxl_addr_) + CACHELINE_SIZE) {
+		LOG(FATAL) << "first_message_addr_ too close to cxl_addr_ base, cannot access segment header safely. "
+		           << "first_message_addr_=" << first_message_addr_ 
+		           << ", cxl_addr_=" << cxl_addr_;
+		return;
+	}
+	
 	// Initialize header pointers
 	void* segment_header = reinterpret_cast<uint8_t*>(first_message_addr_) - CACHELINE_SIZE;
 	MessageHeader* header = reinterpret_cast<MessageHeader*>(first_message_addr_);

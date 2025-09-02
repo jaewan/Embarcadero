@@ -1,0 +1,1166 @@
+!_TAG_FILE_FORMAT	2	/extended format; --format=1 will not append ;" to lines/
+!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
+!_TAG_OUTPUT_EXCMD	mixed	/number, pattern, mixed, or combineV2/
+!_TAG_OUTPUT_FILESEP	slash	/slash or backslash/
+!_TAG_OUTPUT_MODE	u-ctags	/u-ctags or e-ctags/
+!_TAG_PATTERN_LENGTH_LIMIT	96	/0 for no limit/
+!_TAG_PROC_CWD	/home/domin/Embarcadero/src/	//
+!_TAG_PROGRAM_AUTHOR	Universal Ctags Team	//
+!_TAG_PROGRAM_NAME	Universal Ctags	/Derived from Exuberant Ctags/
+!_TAG_PROGRAM_URL	https://ctags.io/	/official site/
+!_TAG_PROGRAM_VERSION	5.9.0	//
+ABORT_TX	client/distributed_kv_store.h	/^	ABORT_TX$/;"	e	enum:OpType
+ALIGN_UP	client/common.h	/^#define ALIGN_UP(/;"	d
+ALIGN_UP	disk_manager/disk_manager.cc	/^#define ALIGN_UP(/;"	d	file:
+AckThread	network_manager/network_manager.cc	/^void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd) {$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+AddBuffers	client/buffer.cc	/^bool Buffer::AddBuffers(size_t buf_size) {$/;"	f	class:Buffer	typeref:typename:bool
+AddPublisherThreads	client/publisher.cc	/^bool Publisher::AddPublisherThreads(size_t num_threads, int broker_id) {$/;"	f	class:Publisher	typeref:typename:bool
+AdvanceWriteBufId	client/buffer.cc	/^void Buffer::AdvanceWriteBufId() {$/;"	f	class:Buffer	typeref:typename:void
+AssignOrder	cxl_manager/cxl_manager.cc	/^void CXLManager::AssignOrder(std::array<char, TOPIC_NAME_SIZE>& topic, BatchHeader *batch_to_ord/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+AssignOrder	embarlet/topic.cc	/^void Topic::AssignOrder(BatchHeader *batch_to_order, size_t start_total_order, BatchHeader* &hea/;"	f	class:Embarcadero::Topic	typeref:typename:void
+AsyncClientCall	embarlet/heartbeat.h	/^		struct AsyncClientCall {$/;"	s	class:heartbeat_system::FollowerNodeClient
+AttachCgroup	embarlet/embarlet.cc	/^bool AttachCgroup(int broker_id) {$/;"	f	namespace:__anonaa92e0c00111	typeref:typename:bool
+BATCHHEADERS_SIZE	common/config.h.in	/^#define BATCHHEADERS_SIZE /;"	d	file:
+BATCH_OPTIMIZATION	client/common.h	/^#define BATCH_OPTIMIZATION /;"	d
+BATCH_SIZE	common/config.h.in	/^#define BATCH_SIZE /;"	d	file:
+BEGIN_TX	client/distributed_kv_store.h	/^	BEGIN_TX,$/;"	e	enum:OpType
+BROKER_PORT	common/config.h.in	/^#define BROKER_PORT /;"	d	file:
+BatchHeader	cxl_manager/cxl_datastructure.h	/^struct alignas(64) BatchHeader{$/;"	s	namespace:Embarcadero
+BrokerInfo	protobuf/heartbeat.proto	/^message BrokerInfo {$/;"	m	package:heartbeat_system
+BrokerScannerWorker	cxl_manager/cxl_manager.cc	/^void CXLManager::BrokerScannerWorker(int broker_id, std::array<char, TOPIC_NAME_SIZE> topic) {$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+BrokerScannerWorker	embarlet/topic.cc	/^void Topic::BrokerScannerWorker(int broker_id) {$/;"	f	class:Embarcadero::Topic	typeref:typename:void
+Buf	client/buffer.h	/^        Buf() : writer_head(0), tail(0), num_msg(0), reader_head(0) {}$/;"	f	struct:Buffer::Buf
+Buf	client/buffer.h	/^    struct alignas(64) Buf {$/;"	s	class:Buffer
+Buffer	client/buffer.cc	/^Buffer::Buffer(size_t num_buf, size_t num_threads_per_broker, int client_id, size_t message_size/;"	f	class:Buffer
+Buffer	client/buffer.h	/^class Buffer {$/;"	c
+BufferState	client/subscriber.h	/^	BufferState(size_t cap) : capacity(cap) {$/;"	f	struct:BufferState
+BufferState	client/subscriber.h	/^struct BufferState {$/;"	s
+CACHELINE_SIZE	embarlet/topic.h	/^#define CACHELINE_SIZE /;"	d
+CACHELINE_SIZE	embarlet/topic_manager.h	/^#define CACHELINE_SIZE /;"	d
+CGROUP_BASE	embarlet/embarlet.cc	/^constexpr char CGROUP_BASE[] = "\/sys\/fs\/cgroup\/embarcadero_cgroup";$/;"	v	namespace:__anonaa92e0c00111	typeref:typename:char[]
+CGROUP_CORE	common/config.h.in	/^#define CGROUP_CORE /;"	d	file:
+CMAKE_CXX_FLAGS	CMakeLists.txt	/^        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")$/;"	v
+COMMIT_TX	client/distributed_kv_store.h	/^	COMMIT_TX,$/;"	e	enum:OpType
+CONFIG_H	common/config.h.in	/^#define CONFIG_H$/;"	d	file:
+CORFU	protobuf/heartbeat.proto	/^	CORFU = 3;$/;"	e	enum:heartbeat_system.SequencerType
+CORFU_REPLICATION_CLIENT_H_	disk_manager/corfu_replication_client.h	/^#define CORFU_REPLICATION_CLIENT_H_$/;"	d
+CORFU_REP_PORT	common/config.h.in	/^#define CORFU_REP_PORT /;"	d	file:
+CORFU_SEQUENCER_ADDR	client/common.h	/^#define CORFU_SEQUENCER_ADDR /;"	d
+CORFU_SEQ_PORT	common/config.h.in	/^#define CORFU_SEQ_PORT /;"	d	file:
+CXLManager	cxl_manager/cxl_manager.cc	/^CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):$/;"	f	class:Embarcadero::CXLManager
+CXLManager	cxl_manager/cxl_manager.h	/^class CXLManager{$/;"	c	namespace:Embarcadero
+CXL_EMUL_SIZE	common/config.h.in	/^#define CXL_EMUL_SIZE /;"	d	file:
+CXL_SIZE	common/config.h.in	/^#define CXL_SIZE /;"	d	file:
+CXL_Type	cxl_manager/cxl_manager.h	/^enum CXL_Type {Emul, Real};$/;"	g	namespace:Embarcadero
+CalculateBackoffMs	disk_manager/corfu_replication_client.cc	/^int CorfuReplicationClient::CalculateBackoffMs(int retry_attempt) {$/;"	f	class:Corfu::CorfuReplicationClient	typeref:typename:int
+CalculateBackoffMs	disk_manager/scalog_replication_client.cc	/^int ScalogReplicationClient::CalculateBackoffMs(int retry_attempt) {$/;"	f	class:Scalog::ScalogReplicationClient	typeref:typename:int
+CheckAvailableCores	client/common.cc	/^bool CheckAvailableCores() {$/;"	f	typeref:typename:bool
+CheckAvailableCores	embarlet/embarlet.cc	/^bool CheckAvailableCores() {$/;"	f	namespace:__anonaa92e0c00111	typeref:typename:bool
+CheckHeartBeatReply	embarlet/heartbeat.cc	/^bool FollowerNodeClient::CheckHeartBeatReply() {$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:bool
+CheckHeartbeats	embarlet/heartbeat.cc	/^void HeartBeatServiceImpl::CheckHeartbeats() {$/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:void
+CheckSegmentBoundary	embarlet/topic.cc	/^void Topic::CheckSegmentBoundary($/;"	f	class:Embarcadero::Topic	typeref:typename:void
+CleanupSocketAndEpoll	network_manager/network_manager.cc	/^inline void CleanupSocketAndEpoll(int socket_fd, int epoll_fd) {$/;"	f	namespace:Embarcadero	typeref:typename:void
+ClientInfo	protobuf/heartbeat.proto	/^message ClientInfo{$/;"	m	package:heartbeat_system
+ClientRequestType	network_manager/network_manager.h	/^enum ClientRequestType {Publish, Subscribe};$/;"	g	namespace:Embarcadero
+CloseOutputFile	disk_manager/corfu_replication_manager.cc	/^			void CloseOutputFile() {$/;"	f	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:void	file:
+CloseOutputFileInternal	disk_manager/scalog_replication_manager.cc	/^		void CloseOutputFileInternal() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:void	file:
+ClusterStatus	protobuf/heartbeat.proto	/^message ClusterStatus{$/;"	m	package:heartbeat_system
+CombinerThread	embarlet/topic.cc	/^void Topic::CombinerThread() {$/;"	f	class:Embarcadero::Topic	typeref:typename:void
+ComparePendingRequestPtr	cxl_manager/corfu_global_sequencer.cc	/^		struct ComparePendingRequestPtr {$/;"	s	class:CorfuSequencerImpl	file:
+ConfigureNonBlockingSocket	network_manager/network_manager.cc	/^bool NetworkManager::ConfigureNonBlockingSocket(int fd) {$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:bool
+ConnState	client/publisher.cc	/^	enum class ConnState { WAITING_FOR_ID, READING_ACKS };$/;"	g	function:Publisher::EpollAckThread	file:
+Connect	disk_manager/corfu_replication_client.cc	/^bool CorfuReplicationClient::Connect(int timeout_seconds) {$/;"	f	class:Corfu::CorfuReplicationClient	typeref:typename:bool
+Connect	disk_manager/scalog_replication_client.cc	/^bool ScalogReplicationClient::Connect(int timeout_seconds) {$/;"	f	class:Scalog::ScalogReplicationClient	typeref:typename:bool
+ConnectionBuffers	client/subscriber.h	/^	ConnectionBuffers(int f, int b_id, size_t cap_per_buffer) :$/;"	f	struct:ConnectionBuffers
+ConnectionBuffers	client/subscriber.h	/^struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers> {$/;"	s
+Consume	client/subscriber.cc	/^ConsumedData Subscriber::Consume(std::chrono::milliseconds timeout) {$/;"	f	class:Subscriber	typeref:typename:ConsumedData
+ConsumedData	client/subscriber.h	/^struct ConsumedData {$/;"	s
+CopyThread	disk_manager/disk_manager.cc	/^	void DiskManager::CopyThread(){$/;"	f	class:Embarcadero::DiskManager	typeref:typename:void
+Corfu	disk_manager/corfu_replication_client.cc	/^namespace Corfu {$/;"	n	file:
+Corfu	disk_manager/corfu_replication_client.h	/^namespace Corfu {$/;"	n
+Corfu	disk_manager/corfu_replication_manager.cc	/^namespace Corfu {$/;"	n	file:
+Corfu	disk_manager/corfu_replication_manager.h	/^namespace Corfu {$/;"	n
+Corfu	disk_manager/disk_manager.h	/^namespace Corfu{$/;"	n
+CorfuGetCXLBuffer	embarlet/topic.cc	/^std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer($/;"	f	class:Embarcadero::Topic	typeref:typename:std::function<void (void *,size_t)>
+CorfuReplicationClient	disk_manager/corfu_replication_client.cc	/^CorfuReplicationClient::CorfuReplicationClient(const char* topic, size_t replication_factor, con/;"	f	class:Corfu::CorfuReplicationClient
+CorfuReplicationClient	disk_manager/corfu_replication_client.h	/^class CorfuReplicationClient {$/;"	c	namespace:Corfu
+CorfuReplicationManager	disk_manager/corfu_replication_manager.cc	/^	CorfuReplicationManager::CorfuReplicationManager($/;"	f	class:Corfu::CorfuReplicationManager
+CorfuReplicationManager	disk_manager/corfu_replication_manager.h	/^class CorfuReplicationManager {$/;"	c	namespace:Corfu
+CorfuReplicationRequest	protobuf/corfu_replication.proto	/^message CorfuReplicationRequest {$/;"	m	package:corfureplication
+CorfuReplicationResponse	protobuf/corfu_replication.proto	/^message CorfuReplicationResponse {$/;"	m	package:corfureplication
+CorfuReplicationService	protobuf/corfu_replication.proto	/^service CorfuReplicationService {$/;"	s	package:corfureplication
+CorfuReplicationServiceImpl	disk_manager/corfu_replication_manager.cc	/^			explicit CorfuReplicationServiceImpl(std::string base_filename)$/;"	f	class:Corfu::CorfuReplicationServiceImpl	file:
+CorfuReplicationServiceImpl	disk_manager/corfu_replication_manager.cc	/^	class CorfuReplicationServiceImpl final : public CorfuReplicationService::Service {$/;"	c	namespace:Corfu	file:
+CorfuSequencer	protobuf/corfu_sequencer.proto	/^service CorfuSequencer {$/;"	s	package:corfusequencer
+CorfuSequencerClient	client/corfu_client.h	/^		CorfuSequencerClient(const std::string& server_address) $/;"	f	class:CorfuSequencerClient
+CorfuSequencerClient	client/corfu_client.h	/^class CorfuSequencerClient {$/;"	c
+CorfuSequencerImpl	cxl_manager/corfu_global_sequencer.cc	/^		CorfuSequencerImpl() {}$/;"	f	class:CorfuSequencerImpl	file:
+CorfuSequencerImpl	cxl_manager/corfu_global_sequencer.cc	/^class CorfuSequencerImpl final : public CorfuSequencer::Service {$/;"	c	file:
+CreateChannelLocked	disk_manager/corfu_replication_client.cc	/^void CorfuReplicationClient::CreateChannelLocked() {$/;"	f	class:Corfu::CorfuReplicationClient	typeref:typename:void
+CreateChannelLocked	disk_manager/scalog_replication_client.cc	/^void ScalogReplicationClient::CreateChannelLocked() {$/;"	f	class:Scalog::ScalogReplicationClient	typeref:typename:void
+CreateErrorResponse	disk_manager/corfu_replication_manager.cc	/^			Status CreateErrorResponse(CorfuReplicationResponse* response,$/;"	f	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:Status	file:
+CreateErrorResponse	disk_manager/scalog_replication_manager.cc	/^		Status CreateErrorResponse(ScalogReplicationResponse* response,$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:Status	file:
+CreateNewTopic	client/common.cc	/^bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE],$/;"	f	typeref:typename:bool
+CreateNewTopic	embarlet/heartbeat.cc	/^grpc::Status HeartBeatServiceImpl::CreateNewTopic($/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:grpc::Status
+CreateNewTopic	embarlet/topic_manager.cc	/^bool TopicManager::CreateNewTopic($/;"	f	class:Embarcadero::TopicManager	typeref:typename:bool
+CreateNewTopic	protobuf/heartbeat.proto	/^	rpc CreateNewTopic(CreateTopicRequest) returns (CreateTopicResponse);$/;"	r	service:heartbeat_system.HeartBeat	typeref:typename:CreateTopicResponse
+CreateNewTopicInternal	embarlet/topic_manager.cc	/^struct TInode* TopicManager::CreateNewTopicInternal($/;"	f	class:Embarcadero::TopicManager	typeref:struct:TInode *
+CreateNewTopicInternal	embarlet/topic_manager.cc	/^struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_SIZE]) {$/;"	f	class:Embarcadero::TopicManager	typeref:struct:TInode *
+CreateTopicEntryCallback	common/config.h.in	/^using CreateTopicEntryCallback = std::function<bool(char*, int, int, bool, int, heartbeat_system/;"	t	namespace:Embarcadero	file:
+CreateTopicRequest	protobuf/heartbeat.proto	/^message CreateTopicRequest {$/;"	m	package:heartbeat_system
+CreateTopicResponse	protobuf/heartbeat.proto	/^message CreateTopicResponse {$/;"	m	package:heartbeat_system
+DEBUG_check_order	client/subscriber.cc	/^bool Subscriber::DEBUG_check_order(int order) {$/;"	f	class:Subscriber	typeref:typename:bool
+DEBUG_check_send_finish	client/publisher.cc	/^void Publisher::DEBUG_check_send_finish() {$/;"	f	class:Publisher	typeref:typename:void
+DEBUG_count_	client/subscriber.h	/^		std::atomic<size_t> DEBUG_count_{0}; \/\/ Total bytes received across all connections$/;"	m	class:Subscriber	typeref:typename:std::atomic<size_t>
+DELETE	client/distributed_kv_store.h	/^	DELETE,$/;"	e	enum:OpType
+DISK_LOG_PATH_SUFFIX	disk_manager/disk_manager.cc	/^#define DISK_LOG_PATH_SUFFIX /;"	d	file:
+DISTRIBUTED_KV_STORE_H_	client/distributed_kv_store.h	/^#define DISTRIBUTED_KV_STORE_H_$/;"	d
+DeleteTopic	embarlet/topic_manager.cc	/^void TopicManager::DeleteTopic(const char topic[TOPIC_NAME_SIZE]) {$/;"	f	class:Embarcadero::TopicManager	typeref:typename:void
+DiskManager	disk_manager/disk_manager.cc	/^	DiskManager::DiskManager(int broker_id, void* cxl_addr, bool log_to_memory, $/;"	f	class:Embarcadero::DiskManager
+DiskManager	disk_manager/disk_manager.h	/^class DiskManager{$/;"	c	namespace:Embarcadero
+DistributedKVStore	client/distributed_kv_store.cc	/^DistributedKVStore::DistributedKVStore(SequencerType seq_type)$/;"	f	class:DistributedKVStore
+DistributedKVStore	client/distributed_kv_store.h	/^class DistributedKVStore {$/;"	c
+E2EThroughputTest	client/test_utils.cc	/^std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, char topic[TOPIC/;"	f	typeref:typename:std::pair<double,double>
+EMBARCADERO	protobuf/heartbeat.proto	/^	EMBARCADERO = 0;$/;"	e	enum:heartbeat_system.SequencerType
+EMBARCADERO_NETWORK_MANAGER_H_	network_manager/network_manager.h	/^#define EMBARCADERO_NETWORK_MANAGER_H_$/;"	d
+Embarcadero	common/config.h.in	/^namespace Embarcadero{$/;"	n	file:
+Embarcadero	cxl_manager/cxl_datastructure.h	/^namespace Embarcadero{$/;"	n
+Embarcadero	cxl_manager/cxl_manager.cc	/^namespace Embarcadero{$/;"	n	file:
+Embarcadero	cxl_manager/cxl_manager.h	/^namespace Embarcadero{$/;"	n
+Embarcadero	cxl_manager/scalog_local_sequencer.h	/^namespace Embarcadero{$/;"	n
+Embarcadero	disk_manager/disk_manager.cc	/^namespace Embarcadero{$/;"	n	file:
+Embarcadero	disk_manager/disk_manager.h	/^namespace Embarcadero{$/;"	n
+Embarcadero	embarlet/topic.cc	/^namespace Embarcadero {$/;"	n	file:
+Embarcadero	embarlet/topic.h	/^namespace Embarcadero {$/;"	n
+Embarcadero	embarlet/topic_manager.cc	/^namespace Embarcadero {$/;"	n	file:
+Embarcadero	embarlet/topic_manager.h	/^namespace Embarcadero {$/;"	n
+Embarcadero	network_manager/network_manager.cc	/^namespace Embarcadero {$/;"	n	file:
+Embarcadero	network_manager/network_manager.h	/^namespace Embarcadero {$/;"	n
+EmbarcaderoGetCXLBuffer	embarlet/topic.cc	/^std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer($/;"	f	class:Embarcadero::Topic	typeref:typename:std::function<void (void *,size_t)>
+EmbarcaderoReq	network_manager/network_manager.h	/^struct alignas(64) EmbarcaderoReq {$/;"	s	namespace:Embarcadero
+Embarcadero_VERSION_MAJOR	common/config.h.in	/^#define Embarcadero_VERSION_MAJOR /;"	d	file:
+Embarcadero_VERSION_MINOR	common/config.h.in	/^#define Embarcadero_VERSION_MINOR /;"	d	file:
+Emul	cxl_manager/cxl_manager.h	/^enum CXL_Type {Emul, Real};$/;"	e	enum:Embarcadero::CXL_Type
+EnqueueRequest	network_manager/network_manager.cc	/^void NetworkManager::EnqueueRequest(struct NetworkRequest request) {$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+EnsureConnected	disk_manager/corfu_replication_client.cc	/^bool CorfuReplicationClient::EnsureConnected() {$/;"	f	class:Corfu::CorfuReplicationClient	typeref:typename:bool
+EnsureConnected	disk_manager/scalog_replication_client.cc	/^bool ScalogReplicationClient::EnsureConnected() {$/;"	f	class:Scalog::ScalogReplicationClient	typeref:typename:bool
+EpollAckThread	client/publisher.cc	/^void Publisher::EpollAckThread() {$/;"	f	class:Publisher	typeref:typename:void
+FailBrokers	client/publisher.cc	/^void Publisher::FailBrokers(size_t total_message_size, size_t message_size,$/;"	f	class:Publisher	typeref:typename:void
+FailurePublishThroughputTest	client/test_utils.cc	/^double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPIC_NAME_SI/;"	f	typeref:typename:double
+FillClusterInfo	embarlet/heartbeat.cc	/^void HeartBeatServiceImpl::FillClusterInfo(HeartbeatResponse* reply, bool force_full_update) {$/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:void
+FillRandomData	client/test_utils.cc	/^void FillRandomData(char* buffer, size_t size) {$/;"	f	typeref:typename:void
+FollowerNodeClient	embarlet/heartbeat.cc	/^FollowerNodeClient::FollowerNodeClient($/;"	f	class:heartbeat_system::FollowerNodeClient
+FollowerNodeClient	embarlet/heartbeat.h	/^class FollowerNodeClient {$/;"	c	namespace:heartbeat_system
+FsyncLoop	disk_manager/corfu_replication_manager.cc	/^			void FsyncLoop() {$/;"	f	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:void	file:
+FsyncLoop	disk_manager/scalog_replication_manager.cc	/^		void FsyncLoop() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:void	file:
+GenerateClientId	client/corfu_client.h	/^		static size_t GenerateClientId() {$/;"	f	class:CorfuSequencerClient	typeref:typename:size_t
+GenerateRandomNum	client/common.cc	/^int GenerateRandomNum() {$/;"	f	typeref:typename:int
+GenerateUniqueId	embarlet/heartbeat.cc	/^std::string HeartBeatManager::GenerateUniqueId() {$/;"	f	class:heartbeat_system::HeartBeatManager	typeref:typename:std::string
+GetAddress	embarlet/heartbeat.cc	/^std::string HeartBeatManager::GetAddress() {$/;"	f	class:heartbeat_system::HeartBeatManager	typeref:typename:std::string
+GetAddress	embarlet/heartbeat.h	/^		std::string GetAddress() const { return address_; }$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::string
+GetBatchToExport	embarlet/topic.cc	/^bool Topic::GetBatchToExport($/;"	f	class:Embarcadero::Topic	typeref:typename:bool
+GetBatchToExport	embarlet/topic_manager.cc	/^bool TopicManager::GetBatchToExport($/;"	f	class:Embarcadero::TopicManager	typeref:typename:bool
+GetBrokerId	client/common.cc	/^int GetBrokerId(const std::string& input) {$/;"	f	typeref:typename:int
+GetBrokerId	embarlet/heartbeat.cc	/^int HeartBeatManager::GetBrokerId() {$/;"	f	class:heartbeat_system::HeartBeatManager	typeref:typename:int
+GetBrokerId	embarlet/heartbeat.h	/^		int GetBrokerId() { return broker_id_; }$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:int
+GetCXLAddr	cxl_manager/cxl_manager.h	/^		void* GetCXLAddr(){return cxl_addr_;}$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void *
+GetCXLBuffer	cxl_manager/cxl_manager.cc	/^std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(BatchHeader &batch_header,$/;"	f	class:Embarcadero::CXLManager	typeref:typename:std::function<void (void *,size_t)>
+GetCXLBuffer	embarlet/topic.h	/^		std::function<void(void*, size_t)> GetCXLBuffer($/;"	f	class:Embarcadero::Topic	typeref:typename:std::function<void (void *,size_t)>
+GetCXLBuffer	embarlet/topic_manager.cc	/^std::function<void(void*, size_t)> TopicManager::GetCXLBuffer($/;"	f	class:Embarcadero::TopicManager	typeref:typename:std::function<void (void *,size_t)>
+GetCXLBufferFunc	embarlet/topic.h	/^		GetCXLBufferFuncPtr GetCXLBufferFunc;$/;"	m	class:Embarcadero::Topic	typeref:typename:GetCXLBufferFuncPtr
+GetCXLBufferFuncPtr	embarlet/topic.h	/^		using GetCXLBufferFuncPtr = std::function<void(void*, size_t)> (Topic::*)($/;"	t	class:Embarcadero::Topic
+GetClientId	client/publisher.h	/^		int GetClientId(){$/;"	f	class:Publisher	typeref:typename:int
+GetClusterStatus	embarlet/heartbeat.cc	/^grpc::Status HeartBeatServiceImpl::GetClusterStatus($/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:grpc::Status
+GetClusterStatus	protobuf/heartbeat.proto	/^	rpc GetClusterStatus (ClientInfo) returns (ClusterStatus);$/;"	r	service:heartbeat_system.HeartBeat	typeref:typename:ClusterStatus
+GetElapsedSeconds	client/test_utils.cc	/^		double GetElapsedSeconds() const {$/;"	f	class:ProgressTracker	typeref:typename:double	file:
+GetMessageAddr	disk_manager/disk_manager.cc	/^	bool DiskManager::GetMessageAddr(TInode* tinode, int order, int broker_id, size_t &last_offset,$/;"	f	class:Embarcadero::DiskManager	typeref:typename:bool
+GetMessageAddr	embarlet/topic.cc	/^bool Topic::GetMessageAddr($/;"	f	class:Embarcadero::Topic	typeref:typename:bool
+GetMessageAddr	embarlet/topic_manager.cc	/^bool TopicManager::GetMessageAddr($/;"	f	class:Embarcadero::TopicManager	typeref:typename:bool
+GetNewBatchHeaderLog	cxl_manager/cxl_manager.cc	/^void* CXLManager::GetNewBatchHeaderLog(){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void *
+GetNewSegment	cxl_manager/cxl_manager.cc	/^void* CXLManager::GetNewSegment(){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void *
+GetNewSegmentCallback	embarlet/topic.h	/^using GetNewSegmentCallback = std::function<void*()>;$/;"	t	namespace:Embarcadero
+GetNextBrokerAddr	embarlet/heartbeat.cc	/^std::string FollowerNodeClient::GetNextBrokerAddr(int broker_id) {$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::string
+GetNextBrokerAddr	embarlet/heartbeat.cc	/^std::string HeartBeatManager::GetNextBrokerAddr(int broker_id) {$/;"	f	class:heartbeat_system::HeartBeatManager	typeref:typename:std::string
+GetNextBrokerAddr	embarlet/heartbeat.cc	/^std::string HeartBeatServiceImpl::GetNextBrokerAddr(int broker_id) {$/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:std::string
+GetNodeId	embarlet/heartbeat.h	/^		std::string GetNodeId() const { return node_id_; }$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::string
+GetNonblockingSock	client/common.cc	/^int GetNonblockingSock(char* broker_address, int port, bool send) {$/;"	f	typeref:typename:int
+GetNumBrokers	embarlet/heartbeat.cc	/^int FollowerNodeClient::GetNumBrokers() {$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:int
+GetNumBrokers	embarlet/heartbeat.cc	/^int HeartBeatManager::GetNumBrokers () {$/;"	f	class:heartbeat_system::HeartBeatManager	typeref:typename:int
+GetNumBrokers	embarlet/heartbeat.cc	/^int HeartBeatServiceImpl::GetNumBrokers () {$/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:int
+GetNumBrokersCallback	common/config.h.in	/^using GetNumBrokersCallback = std::function<int()>;$/;"	t	namespace:Embarcadero	file:
+GetOffsetToAck	network_manager/network_manager.cc	/^size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:size_t
+GetOrder	embarlet/topic.h	/^		int GetOrder(){ return order_; }$/;"	f	class:Embarcadero::Topic	typeref:typename:int
+GetPID	embarlet/heartbeat.cc	/^std::string HeartBeatManager::GetPID() {$/;"	f	class:heartbeat_system::HeartBeatManager	typeref:typename:std::string
+GetPhysicalOffset	cxl_manager/cxl_manager.h	/^				size_t GetPhysicalOffset(size_t logical_offset) {$/;"	f	class:Embarcadero::CXLManager::SequentialOrderTracker	typeref:typename:size_t
+GetRegisteredBrokerSet	cxl_manager/cxl_manager.cc	/^void CXLManager::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers,$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+GetRegisteredBrokerSet	embarlet/topic.cc	/^void Topic::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers){$/;"	f	class:Embarcadero::Topic	typeref:typename:void
+GetRegisteredBrokers	cxl_manager/cxl_manager.cc	/^void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers, $/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+GetRegisteredBrokers	embarlet/heartbeat.cc	/^int HeartBeatManager::GetRegisteredBrokers($/;"	f	class:heartbeat_system::HeartBeatManager	typeref:typename:int
+GetRegisteredBrokers	embarlet/heartbeat.cc	/^int HeartBeatServiceImpl::GetRegisteredBrokers($/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:int
+GetRegisteredBrokersCallback	common/config.h.in	/^using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers,/;"	t	namespace:Embarcadero	file:
+GetReplicaTInode	cxl_manager/cxl_manager.cc	/^TInode* CXLManager::GetReplicaTInode(const char* topic){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:TInode *
+GetSeqtype	embarlet/topic.h	/^		heartbeat_system::SequencerType GetSeqtype() const {$/;"	f	class:Embarcadero::Topic	typeref:typename:heartbeat_system::SequencerType
+GetSequentiallyOrdered	cxl_manager/cxl_manager.h	/^				size_t GetSequentiallyOrdered(){$/;"	f	class:Embarcadero::CXLManager::SequentialOrderTracker	typeref:typename:size_t
+GetStopThreads	cxl_manager/cxl_manager.h	/^		bool GetStopThreads(){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:bool
+GetTInode	cxl_manager/cxl_manager.cc	/^TInode* CXLManager::GetTInode(const char* topic){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:TInode *
+GetTopicIdx	embarlet/topic_manager.h	/^		int GetTopicIdx(const char topic[TOPIC_NAME_SIZE]) {$/;"	f	class:Embarcadero::TopicManager	typeref:typename:int
+GetTopicOrder	embarlet/topic_manager.cc	/^int TopicManager::GetTopicOrder(const char* topic){$/;"	f	class:Embarcadero::TopicManager	typeref:typename:int
+GetTotalOrder	client/corfu_client.h	/^		bool GetTotalOrder(Embarcadero::BatchHeader *batch_header){$/;"	f	class:CorfuSequencerClient	typeref:typename:bool
+GetTotalOrder	cxl_manager/corfu_global_sequencer.cc	/^		Status GetTotalOrder(ServerContext* context, const TotalOrderRequest* request,$/;"	f	class:CorfuSequencerImpl	typeref:typename:Status	file:
+GetTotalOrder	protobuf/corfu_sequencer.proto	/^  rpc GetTotalOrder (TotalOrderRequest) returns (TotalOrderResponse) {}$/;"	r	service:corfusequencer.CorfuSequencer	typeref:typename:TotalOrderResponse
+GlobalCut	protobuf/scalog_sequencer.proto	/^message GlobalCut {$/;"	m
+HEARTBEAT_INTERVAL	common/config.h.in	/^#define HEARTBEAT_INTERVAL /;"	d	file:
+HandlePublishRequest	network_manager/network_manager.cc	/^void NetworkManager::HandlePublishRequest($/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+HandleRegisterBroker	cxl_manager/scalog_global_sequencer.cc	/^grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* context,$/;"	f	class:ScalogGlobalSequencer	typeref:typename:grpc::Status
+HandleRegisterBroker	protobuf/scalog_sequencer.proto	/^    rpc HandleRegisterBroker(RegisterBrokerRequest) returns (RegisterBrokerResponse);$/;"	r	service:ScalogSequencer	typeref:typename:RegisterBrokerResponse
+HandleSendLocalCut	cxl_manager/scalog_global_sequencer.cc	/^grpc::Status ScalogGlobalSequencer::HandleSendLocalCut(grpc::ServerContext* context,$/;"	f	class:ScalogGlobalSequencer	typeref:typename:grpc::Status
+HandleSendLocalCut	protobuf/scalog_sequencer.proto	/^    rpc HandleSendLocalCut(stream LocalCut) returns (stream GlobalCut);$/;"	r	service:ScalogSequencer	typeref:typename:streamGlobalCut
+HandleSubscribeRequest	network_manager/network_manager.cc	/^void NetworkManager::HandleSubscribeRequest($/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+HandleTerminateGlobalSequencer	cxl_manager/scalog_global_sequencer.cc	/^grpc::Status ScalogGlobalSequencer::HandleTerminateGlobalSequencer(grpc::ServerContext* context,$/;"	f	class:ScalogGlobalSequencer	typeref:typename:grpc::Status
+HandleTerminateGlobalSequencer	protobuf/scalog_sequencer.proto	/^    rpc HandleTerminateGlobalSequencer(TerminateGlobalSequencerRequest) returns (TerminateGlobal/;"	r	service:ScalogSequencer	typeref:typename:TerminateGlobalSequencerResponse
+HeartBeat	protobuf/heartbeat.proto	/^service HeartBeat {$/;"	s	package:heartbeat_system
+HeartBeatLoop	embarlet/heartbeat.cc	/^void FollowerNodeClient::HeartBeatLoop() {$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:void
+HeartBeatManager	embarlet/heartbeat.cc	/^HeartBeatManager::HeartBeatManager(bool is_head_node, std::string head_address)$/;"	f	class:heartbeat_system::HeartBeatManager
+HeartBeatManager	embarlet/heartbeat.h	/^class HeartBeatManager {$/;"	c	namespace:heartbeat_system
+HeartBeatServiceImpl	embarlet/heartbeat.cc	/^HeartBeatServiceImpl::HeartBeatServiceImpl(std::string head_addr) {$/;"	f	class:heartbeat_system::HeartBeatServiceImpl
+HeartBeatServiceImpl	embarlet/heartbeat.h	/^class HeartBeatServiceImpl final : public HeartBeat::Service {$/;"	c	namespace:heartbeat_system
+Heartbeat	embarlet/heartbeat.cc	/^grpc::Status HeartBeatServiceImpl::Heartbeat($/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:grpc::Status
+Heartbeat	protobuf/heartbeat.proto	/^	rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);$/;"	r	service:heartbeat_system.HeartBeat	typeref:typename:HeartbeatResponse
+HeartbeatRequest	protobuf/heartbeat.proto	/^message HeartbeatRequest {$/;"	m	package:heartbeat_system
+HeartbeatResponse	protobuf/heartbeat.proto	/^message HeartbeatResponse {$/;"	m	package:heartbeat_system
+INCLUDE_CXL_MANGER_H_	cxl_manager/cxl_manager.h	/^#define INCLUDE_CXL_MANGER_H_$/;"	d
+INCLUDE_DISK_MANGER_H_	disk_manager/disk_manager.h	/^#define INCLUDE_DISK_MANGER_H_$/;"	d
+INCLUDE_HEARTBEAT_H	embarlet/heartbeat.h	/^#define INCLUDE_HEARTBEAT_H$/;"	d
+INCLUDE_TOPIC_MANAGER_H_	embarlet/topic_manager.h	/^#define INCLUDE_TOPIC_MANAGER_H_$/;"	d
+Init	client/publisher.cc	/^void Publisher::Init(int ack_level) {$/;"	f	class:Publisher	typeref:typename:void
+InitializeTInodeOffsets	embarlet/topic_manager.cc	/^void TopicManager::InitializeTInodeOffsets(TInode* tinode, $/;"	f	class:Embarcadero::TopicManager	typeref:typename:void
+InsertAndGetSequentiallyOrdered	cxl_manager/cxl_manager.cc	/^size_t CXLManager::SequentialOrderTracker::InsertAndGetSequentiallyOrdered(size_t offset, size_t/;"	f	class:Embarcadero::CXLManager::SequentialOrderTracker	typeref:typename:size_t
+IsConnected	disk_manager/corfu_replication_client.cc	/^bool CorfuReplicationClient::IsConnected() const {$/;"	f	class:Corfu::CorfuReplicationClient	typeref:typename:bool
+IsConnected	disk_manager/scalog_replication_client.cc	/^bool ScalogReplicationClient::IsConnected() const {$/;"	f	class:Scalog::ScalogReplicationClient	typeref:typename:bool
+IsConnectionAlive	network_manager/network_manager.cc	/^bool NetworkManager::IsConnectionAlive(int fd, char* buffer) {$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:bool
+IsHeadAlive	embarlet/heartbeat.h	/^		bool IsHeadAlive() const { return head_alive_; }$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:bool
+IsHeadNode	embarlet/topic_manager.h	/^		inline bool IsHeadNode() const {$/;"	f	class:Embarcadero::TopicManager	typeref:typename:bool
+KAFKA	protobuf/heartbeat.proto	/^	KAFKA = 1;$/;"	e	enum:heartbeat_system.SequencerType
+KVStoreBenchmark	client/kv_test.cc	/^		KVStoreBenchmark(DistributedKVStore& kv_store, size_t num_keys = 10000, size_t value_size = 10/;"	f	class:KVStoreBenchmark	file:
+KVStoreBenchmark	client/kv_test.cc	/^class KVStoreBenchmark {$/;"	c	file:
+KafkaGetCXLBuffer	embarlet/topic.cc	/^std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer($/;"	f	class:Embarcadero::Topic	typeref:typename:std::function<void (void *,size_t)>
+KeyValue	client/distributed_kv_store.h	/^struct KeyValue {$/;"	s
+KillBrokers	client/test_utils.cc	/^bool KillBrokers(std::unique_ptr<HeartBeat::Stub>& stub, int num_brokers) {$/;"	f	typeref:typename:bool
+KillBrokers	embarlet/heartbeat.cc	/^grpc::Status HeartBeatServiceImpl::KillBrokers($/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:grpc::Status
+KillBrokers	protobuf/heartbeat.proto	/^	rpc KillBrokers(KillBrokersRequest) returns (KillBrokersResponse);$/;"	r	service:heartbeat_system.HeartBeat	typeref:typename:KillBrokersResponse
+KillBrokersRequest	protobuf/heartbeat.proto	/^message KillBrokersRequest{$/;"	m	package:heartbeat_system
+KillBrokersResponse	protobuf/heartbeat.proto	/^message KillBrokersResponse{$/;"	m	package:heartbeat_system
+LargeMsgRequest	network_manager/network_manager.h	/^struct LargeMsgRequest {$/;"	s	namespace:Embarcadero
+LatencyTest	client/test_utils.cc	/^std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char topic[TOPIC_NAME_/;"	f	typeref:typename:std::pair<double,double>
+LocalCut	protobuf/scalog_sequencer.proto	/^message LocalCut {$/;"	m
+LocalCutTracker	disk_manager/scalog_replication_manager.cc	/^				LocalCutTracker() : local_cut_(0), sequentially_written_(0) {}$/;"	f	class:Scalog::ScalogReplicationServiceImpl::LocalCutTracker	file:
+LocalCutTracker	disk_manager/scalog_replication_manager.cc	/^		class LocalCutTracker {$/;"	c	class:Scalog::ScalogReplicationServiceImpl	file:
+LogEntry	client/distributed_kv_store.h	/^struct LogEntry {$/;"	s
+LogTestParameters	client/test_utils.cc	/^void LogTestParameters(const std::string& test_name, const cxxopts::ParseResult& result) {$/;"	f	typeref:typename:void
+MAX_TOPIC_SIZE	common/config.h.in	/^#define MAX_TOPIC_SIZE /;"	d	file:
+MSG_ZEROCOPY	client/common.h	/^#define MSG_ZEROCOPY /;"	d
+MULTI_GET	client/distributed_kv_store.h	/^	MULTI_GET,$/;"	e	enum:OpType
+MULTI_PUT	client/distributed_kv_store.h	/^	MULTI_PUT,$/;"	e	enum:OpType
+MainThread	network_manager/network_manager.cc	/^void NetworkManager::MainThread() {$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+ManageBrokerConnections	client/subscriber.cc	/^void Subscriber::ManageBrokerConnections(int broker_id, const std::string& address) {$/;"	f	class:Subscriber	typeref:typename:void
+MemcpyRequest	disk_manager/disk_manager.h	/^struct MemcpyRequest{$/;"	s	namespace:Embarcadero
+MessageHeader	cxl_manager/cxl_datastructure.h	/^struct alignas(64) MessageHeader{$/;"	s	namespace:Embarcadero
+NT_THRESHOLD	embarlet/topic_manager.cc	/^constexpr size_t NT_THRESHOLD = 128;$/;"	v	namespace:Embarcadero	typeref:typename:size_t
+NUM_DISKS	common/config.h.in	/^#define NUM_DISKS /;"	d	file:
+NUM_DISK_IO_THREADS	common/config.h.in	/^#define NUM_DISK_IO_THREADS /;"	d	file:
+NUM_MAX_BROKERS	common/config.h.in	/^#define NUM_MAX_BROKERS /;"	d	file:
+NUM_NETWORK_IO_THREADS	common/config.h.in	/^#define NUM_NETWORK_IO_THREADS /;"	d	file:
+NUM_SHARDS	client/distributed_kv_store.h	/^		static const size_t NUM_SHARDS = 64;$/;"	m	class:ShardedKVStore	typeref:typename:const size_t
+NUM_SUB_CONNECTIONS	common/config.h.in	/^#define NUM_SUB_CONNECTIONS /;"	d	file:
+NetworkManager	network_manager/network_manager.cc	/^NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads)$/;"	f	class:Embarcadero::NetworkManager
+NetworkManager	network_manager/network_manager.h	/^class NetworkManager {$/;"	c	namespace:Embarcadero
+NetworkRequest	network_manager/network_manager.h	/^struct NetworkRequest {$/;"	s	namespace:Embarcadero
+NodeEntry	embarlet/heartbeat.h	/^		struct NodeEntry {$/;"	s	class:heartbeat_system::FollowerNodeClient
+NodeEntry	embarlet/heartbeat.h	/^		struct NodeEntry {$/;"	s	class:heartbeat_system::HeartBeatServiceImpl
+NodeInfo	protobuf/heartbeat.proto	/^message NodeInfo {$/;"	m	package:heartbeat_system
+OPID	client/distributed_kv_store.h	/^using OPID = size_t;$/;"	t	typeref:typename:size_t
+OpType	client/distributed_kv_store.h	/^enum class OpType {$/;"	g
+OpenOutputFile	disk_manager/corfu_replication_manager.cc	/^			bool OpenOutputFile() {$/;"	f	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:bool	file:
+OpenOutputFile	disk_manager/scalog_replication_manager.cc	/^		bool OpenOutputFile() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:bool	file:
+OperationId	client/distributed_kv_store.h	/^struct OperationId {$/;"	s
+Order3GetCXLBuffer	embarlet/topic.cc	/^std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer($/;"	f	class:Embarcadero::Topic	typeref:typename:std::function<void (void *,size_t)>
+Order4GetCXLBuffer	embarlet/topic.cc	/^std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer($/;"	f	class:Embarcadero::Topic	typeref:typename:std::function<void (void *,size_t)>
+PORT	common/config.h.in	/^#define PORT /;"	d	file:
+PUT	client/distributed_kv_store.h	/^	PUT,$/;"	e	enum:OpType
+ParseAddressPort	client/common.cc	/^std::pair<std::string, int> ParseAddressPort(const std::string& input) {$/;"	f	typeref:typename:std::pair<std::string,int>
+PendingRequest	cxl_manager/corfu_global_sequencer.cc	/^		struct PendingRequest {$/;"	s	class:CorfuSequencerImpl	file:
+Poll	client/publisher.cc	/^void Publisher::Poll(size_t n) {$/;"	f	class:Publisher	typeref:typename:void
+Poll	client/subscriber.cc	/^void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {$/;"	f	class:Subscriber	typeref:typename:void
+PriorityQueue	cxl_manager/corfu_global_sequencer.cc	/^		using PriorityQueue = std::priority_queue<std::unique_ptr<PendingRequest>,$/;"	t	class:CorfuSequencerImpl	typeref:typename:std::priority_queue<std::unique_ptr<PendingRequest>,std::vector<std::unique_ptr<PendingRequest>>,ComparePendingRequestPtr>	file:
+ProcessClusterInfo	embarlet/heartbeat.cc	/^void FollowerNodeClient::ProcessClusterInfo(const HeartbeatResponse& reply) {$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:void
+ProcessPendingRequests	cxl_manager/corfu_global_sequencer.cc	/^		void ProcessPendingRequests(size_t client_id) {$/;"	f	class:CorfuSequencerImpl	typeref:typename:void	file:
+ProcessSkipped	cxl_manager/cxl_manager.cc	/^bool CXLManager::ProcessSkipped(std::array<char, TOPIC_NAME_SIZE>& topic,$/;"	f	class:Embarcadero::CXLManager	typeref:typename:bool
+ProcessSkipped	embarlet/topic.cc	/^bool Topic::ProcessSkipped(absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& s/;"	f	class:Embarcadero::Topic	typeref:typename:bool
+ProgressTracker	client/test_utils.cc	/^		ProgressTracker(size_t total_operations, size_t log_interval = 5000)$/;"	f	class:ProgressTracker	file:
+ProgressTracker	client/test_utils.cc	/^class ProgressTracker {$/;"	c	file:
+Publish	client/publisher.cc	/^void Publisher::Publish(char* message, size_t len) {$/;"	f	class:Publisher	typeref:typename:void
+Publish	network_manager/network_manager.h	/^enum ClientRequestType {Publish, Subscribe};$/;"	e	enum:Embarcadero::ClientRequestType
+PublishThread	client/publisher.cc	/^void Publisher::PublishThread(int broker_id, int pubQuesIdx) {$/;"	f	class:Publisher	typeref:typename:void
+PublishThroughputTest	client/test_utils.cc	/^double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPIC_NAME_SIZE], $/;"	f	typeref:typename:double
+Publisher	client/publisher.cc	/^Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, $/;"	f	class:Publisher
+Publisher	client/publisher.h	/^class Publisher {$/;"	c
+READING_ACKS	client/publisher.cc	/^	enum class ConnState { WAITING_FOR_ID, READING_ACKS };$/;"	e	enum:Publisher::EpollAckThread::ConnState	file:
+Read	client/buffer.cc	/^void* Buffer::Read(int bufIdx) {$/;"	f	class:Buffer	typeref:typename:void *
+Read	client/buffer.cc	/^void* Buffer::Read(int bufIdx, size_t& len) {$/;"	f	class:Buffer	typeref:typename:void *
+Real	cxl_manager/cxl_manager.h	/^enum CXL_Type {Emul, Real};$/;"	e	enum:Embarcadero::CXL_Type
+ReceiveGlobalCut	cxl_manager/scalog_local_sequencer.cc	/^void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWriter<LocalCut, G/;"	f	class:Scalog::ScalogLocalSequencer	typeref:typename:void
+ReceiveGlobalCut	disk_manager/scalog_replication_manager.cc	/^		void ReceiveGlobalCut(grpc::ClientReaderWriter<LocalCut, GlobalCut>* stream) {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:void	file:
+ReceiveLocalCut	cxl_manager/scalog_global_sequencer.cc	/^void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, LocalCut>* strea/;"	f	class:ScalogGlobalSequencer	typeref:typename:void
+ReceiveWorkerThread	client/subscriber.cc	/^void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {$/;"	f	class:Subscriber	typeref:typename:void
+Reconnect	disk_manager/corfu_replication_client.cc	/^bool CorfuReplicationClient::Reconnect(int timeout_seconds) {$/;"	f	class:Corfu::CorfuReplicationClient	typeref:typename:bool
+Reconnect	disk_manager/scalog_replication_client.cc	/^bool ScalogReplicationClient::Reconnect(int timeout_seconds) {$/;"	f	class:Scalog::ScalogReplicationClient	typeref:typename:bool
+RecordFailureEvent	client/publisher.h	/^		void RecordFailureEvent(const std::string& description) {$/;"	f	class:Publisher	typeref:typename:void
+RecordStartTime	client/publisher.h	/^		void RecordStartTime() {$/;"	f	class:Publisher	typeref:typename:void
+Register	cxl_manager/scalog_local_sequencer.cc	/^void ScalogLocalSequencer::Register(int replication_factor) {$/;"	f	class:Scalog::ScalogLocalSequencer	typeref:typename:void
+Register	embarlet/heartbeat.cc	/^void FollowerNodeClient::Register() {$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:void
+RegisterBrokerRequest	protobuf/scalog_sequencer.proto	/^message RegisterBrokerRequest {$/;"	m
+RegisterBrokerResponse	protobuf/scalog_sequencer.proto	/^message RegisterBrokerResponse {}$/;"	m
+RegisterCreateTopicEntryCallback	embarlet/heartbeat.cc	/^void HeartBeatManager::RegisterCreateTopicEntryCallback($/;"	f	class:heartbeat_system::HeartBeatManager	typeref:typename:void
+RegisterCreateTopicEntryCallback	embarlet/heartbeat.cc	/^void HeartBeatServiceImpl::RegisterCreateTopicEntryCallback($/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:void
+RegisterGetNumBrokersCallback	embarlet/topic_manager.h	/^		void RegisterGetNumBrokersCallback(GetNumBrokersCallback callback){$/;"	f	class:Embarcadero::TopicManager	typeref:typename:void
+RegisterGetNumBrokersCallback	network_manager/network_manager.h	/^		void RegisterGetNumBrokersCallback(GetNumBrokersCallback callback){$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+RegisterGetRegisteredBrokersCallback	cxl_manager/cxl_manager.h	/^		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+RegisterGetRegisteredBrokersCallback	embarlet/topic_manager.h	/^		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){$/;"	f	class:Embarcadero::TopicManager	typeref:typename:void
+RegisterNode	embarlet/heartbeat.cc	/^Status HeartBeatServiceImpl::RegisterNode($/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:Status
+RegisterNode	protobuf/heartbeat.proto	/^	rpc RegisterNode (NodeInfo) returns (RegistrationStatus);$/;"	r	service:heartbeat_system.HeartBeat	typeref:typename:RegistrationStatus
+RegistrationStatus	protobuf/heartbeat.proto	/^message RegistrationStatus {$/;"	m	package:heartbeat_system
+RemoveConnection	client/subscriber.cc	/^void Subscriber::RemoveConnection(int fd) {$/;"	f	class:Subscriber	typeref:typename:void
+RemoveNodeFromClientInfo	client/common.cc	/^void RemoveNodeFromClientInfo(heartbeat_system::ClientInfo& client_info, int32_t node_to_remove)/;"	f	typeref:typename:void
+ReopenOutputFile	disk_manager/corfu_replication_manager.cc	/^			bool ReopenOutputFile() {$/;"	f	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:bool	file:
+ReopenOutputFile	disk_manager/scalog_replication_manager.cc	/^		bool ReopenOutputFile() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:bool	file:
+Replicate	disk_manager/corfu_replication_manager.cc	/^			Status Replicate(ServerContext* context, const CorfuReplicationRequest* request,$/;"	f	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:Status	file:
+Replicate	disk_manager/disk_manager.cc	/^	void DiskManager::Replicate(TInode* tinode, TInode* replica_tinode, int replication_factor){$/;"	f	class:Embarcadero::DiskManager	typeref:typename:void
+Replicate	disk_manager/scalog_replication_manager.cc	/^		Status Replicate(ServerContext* context, const ScalogReplicationRequest* request,$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:Status	file:
+Replicate	protobuf/corfu_replication.proto	/^  rpc Replicate (CorfuReplicationRequest) returns (CorfuReplicationResponse) {}$/;"	r	service:corfureplication.CorfuReplicationService	typeref:typename:CorfuReplicationResponse
+Replicate	protobuf/scalog_replication.proto	/^  rpc Replicate (ScalogReplicationRequest) returns (ScalogReplicationResponse) {}$/;"	r	service:scalogreplication.ScalogReplicationService	typeref:typename:ScalogReplicationResponse
+ReplicateData	disk_manager/corfu_replication_client.cc	/^bool CorfuReplicationClient::ReplicateData(size_t offset, size_t size, void* data,$/;"	f	class:Corfu::CorfuReplicationClient	typeref:typename:bool
+ReplicateData	disk_manager/scalog_replication_client.cc	/^bool ScalogReplicationClient::ReplicateData(size_t offset, size_t size, size_t num_msg, void* da/;"	f	class:Scalog::ScalogReplicationClient	typeref:typename:bool
+ReplicateThread	disk_manager/disk_manager.cc	/^	void DiskManager::ReplicateThread(){$/;"	f	class:Embarcadero::DiskManager	typeref:typename:void
+ReplicationRequest	disk_manager/disk_manager.h	/^struct ReplicationRequest{$/;"	s	namespace:Embarcadero
+ReqReceiveThread	network_manager/network_manager.cc	/^void NetworkManager::ReqReceiveThread() {$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+ResultWriter	client/result_writer.cc	/^ResultWriter::ResultWriter(const cxxopts::ParseResult& result)$/;"	f	class:ResultWriter
+ResultWriter	client/result_writer.h	/^class ResultWriter {$/;"	c
+ReturnReads	client/buffer.cc	/^void Buffer::ReturnReads() {$/;"	f	class:Buffer	typeref:typename:void
+Run	cxl_manager/scalog_global_sequencer.cc	/^void ScalogGlobalSequencer::Run() {$/;"	f	class:ScalogGlobalSequencer	typeref:typename:void
+RunScalogSequencer	cxl_manager/cxl_manager.cc	/^void CXLManager::RunScalogSequencer(const char topic[TOPIC_NAME_SIZE]){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+RunServer	cxl_manager/corfu_global_sequencer.cc	/^void RunServer() {$/;"	f	typeref:typename:void
+SCALOG	protobuf/heartbeat.proto	/^	SCALOG = 2;$/;"	e	enum:heartbeat_system.SequencerType
+SCALOG_LOCAL_SEQUENCER_H	cxl_manager/scalog_local_sequencer.h	/^#define SCALOG_LOCAL_SEQUENCER_H$/;"	d
+SCALOG_REPLICATION_CLIENT_H_	disk_manager/scalog_replication_client.h	/^#define SCALOG_REPLICATION_CLIENT_H_$/;"	d
+SCALOG_REP_PORT	common/config.h.in	/^#define SCALOG_REP_PORT /;"	d	file:
+SCALOG_SEQ_LOCAL_CUT_INTERVAL	common/config.h.in	/^#define SCALOG_SEQ_LOCAL_CUT_INTERVAL /;"	d	file:
+SCALOG_SEQ_PORT	common/config.h.in	/^#define SCALOG_SEQ_PORT /;"	d	file:
+SCLAOG_SEQUENCER_IP	common/config.h.in	/^#define SCLAOG_SEQUENCER_IP /;"	d	file:
+SEGMENT_SIZE	common/config.h.in	/^#define SEGMENT_SIZE /;"	d	file:
+Scalog	cxl_manager/scalog_local_sequencer.cc	/^namespace Scalog {$/;"	n	file:
+Scalog	cxl_manager/scalog_local_sequencer.h	/^namespace Scalog {$/;"	n
+Scalog	disk_manager/disk_manager.h	/^namespace Scalog{$/;"	n
+Scalog	disk_manager/scalog_replication_client.cc	/^namespace Scalog {$/;"	n	file:
+Scalog	disk_manager/scalog_replication_client.h	/^namespace Scalog {$/;"	n
+Scalog	disk_manager/scalog_replication_manager.cc	/^namespace Scalog {$/;"	n	file:
+Scalog	disk_manager/scalog_replication_manager.h	/^namespace Scalog {$/;"	n
+ScalogGetCXLBuffer	embarlet/topic.cc	/^std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer($/;"	f	class:Embarcadero::Topic	typeref:typename:std::function<void (void *,size_t)>
+ScalogGlobalSequencer	cxl_manager/scalog_global_sequencer.cc	/^ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {$/;"	f	class:ScalogGlobalSequencer
+ScalogGlobalSequencer	cxl_manager/scalog_global_sequencer.h	/^class ScalogGlobalSequencer : public ScalogSequencer::Service {$/;"	c
+ScalogLocalSequencer	cxl_manager/cxl_manager.h	/^class ScalogLocalSequencer {$/;"	c	namespace:Embarcadero
+ScalogLocalSequencer	cxl_manager/scalog_local_sequencer.cc	/^ScalogLocalSequencer::ScalogLocalSequencer(Embarcadero::CXLManager* cxl_manager, int broker_id, /;"	f	class:Scalog::ScalogLocalSequencer
+ScalogLocalSequencer	cxl_manager/scalog_local_sequencer.h	/^class ScalogLocalSequencer {$/;"	c	namespace:Scalog
+ScalogReplicationClient	disk_manager/scalog_replication_client.cc	/^ScalogReplicationClient::ScalogReplicationClient(const char* topic, size_t replication_factor, c/;"	f	class:Scalog::ScalogReplicationClient
+ScalogReplicationClient	disk_manager/scalog_replication_client.h	/^class ScalogReplicationClient {$/;"	c	namespace:Scalog
+ScalogReplicationManager	disk_manager/scalog_replication_manager.cc	/^	ScalogReplicationManager::ScalogReplicationManager($/;"	f	class:Scalog::ScalogReplicationManager
+ScalogReplicationManager	disk_manager/scalog_replication_manager.h	/^class ScalogReplicationManager {$/;"	c	namespace:Scalog
+ScalogReplicationRequest	protobuf/scalog_replication.proto	/^message ScalogReplicationRequest {$/;"	m	package:scalogreplication
+ScalogReplicationResponse	protobuf/scalog_replication.proto	/^message ScalogReplicationResponse {$/;"	m	package:scalogreplication
+ScalogReplicationService	protobuf/scalog_replication.proto	/^service ScalogReplicationService {$/;"	s	package:scalogreplication
+ScalogReplicationServiceImpl	disk_manager/scalog_replication_manager.cc	/^		explicit ScalogReplicationServiceImpl(std::string base_filename, int broker_id)$/;"	f	class:Scalog::ScalogReplicationServiceImpl	file:
+ScalogReplicationServiceImpl	disk_manager/scalog_replication_manager.cc	/^	class ScalogReplicationServiceImpl final : public ScalogReplicationService::Service {$/;"	c	namespace:Scalog	file:
+ScalogSequencer	cxl_manager/scalog_local_sequencer.cc	/^void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<int, int> &global_/;"	f	class:Scalog::ScalogLocalSequencer	typeref:typename:void
+ScalogSequencer	disk_manager/scalog_replication_manager.cc	/^		void ScalogSequencer(absl::btree_map<int, int>& global_cut) {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:void	file:
+ScalogSequencer	protobuf/scalog_sequencer.proto	/^service ScalogSequencer {$/;"	s
+ScopedFD	embarlet/embarlet.cc	/^		explicit ScopedFD(int fd) : fd_(fd) {}$/;"	f	class:__anonaa92e0c00111::ScopedFD	file:
+ScopedFD	embarlet/embarlet.cc	/^class ScopedFD {$/;"	c	namespace:__anonaa92e0c00111	file:
+Seal	client/buffer.cc	/^void Buffer::Seal(){$/;"	f	class:Buffer	typeref:typename:void
+SendGlobalCut	cxl_manager/scalog_global_sequencer.cc	/^void ScalogGlobalSequencer::SendGlobalCut() {$/;"	f	class:ScalogGlobalSequencer	typeref:typename:void
+SendHeartbeat	embarlet/heartbeat.cc	/^void FollowerNodeClient::SendHeartbeat() {$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:void
+SendLocalCut	cxl_manager/scalog_local_sequencer.cc	/^void ScalogLocalSequencer::SendLocalCut(std::string topic_str){$/;"	f	class:Scalog::ScalogLocalSequencer	typeref:typename:void
+SendLocalCut	disk_manager/scalog_replication_manager.cc	/^		void SendLocalCut() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:void	file:
+SendMessageData	network_manager/network_manager.cc	/^bool NetworkManager::SendMessageData($/;"	f	class:Embarcadero::NetworkManager	typeref:typename:bool
+Sequencer1	cxl_manager/cxl_manager.cc	/^void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic) {$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+Sequencer2	cxl_manager/cxl_manager.cc	/^void CXLManager::Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+Sequencer3	cxl_manager/cxl_manager.cc	/^void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+Sequencer4	cxl_manager/cxl_manager.cc	/^void CXLManager::Sequencer4(std::array<char, TOPIC_NAME_SIZE> topic) {$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+Sequencer4	embarlet/topic.cc	/^void Topic::Sequencer4() {$/;"	f	class:Embarcadero::Topic	typeref:typename:void
+SequencerType	protobuf/heartbeat.proto	/^enum SequencerType{$/;"	g	package:heartbeat_system
+SequentialOrderTracker	cxl_manager/cxl_manager.h	/^				SequentialOrderTracker(int broker_id): broker_id_(broker_id){}$/;"	f	class:Embarcadero::CXLManager::SequentialOrderTracker
+SequentialOrderTracker	cxl_manager/cxl_manager.h	/^		class SequentialOrderTracker{$/;"	c	class:Embarcadero::CXLManager
+SetCXLManager	network_manager/network_manager.h	/^    void SetCXLManager(CXLManager* cxl_manager) { cxl_manager_ = cxl_manager; }$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+SetDiskManager	network_manager/network_manager.h	/^    void SetDiskManager(DiskManager* disk_manager) { disk_manager_ = disk_manager; }$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+SetE2EResult	client/result_writer.cc	/^void ResultWriter::SetE2EResult(double res) {$/;"	f	class:ResultWriter	typeref:typename:void
+SetEpochToOrder	cxl_manager/cxl_manager.h	/^		void SetEpochToOrder(int epoch){$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+SetHeadAlive	embarlet/heartbeat.h	/^		void SetHeadAlive(bool alive) { head_alive_ = alive; }$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:void
+SetNetworkManager	cxl_manager/cxl_manager.h	/^		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+SetPubResult	client/result_writer.cc	/^void ResultWriter::SetPubResult(double res) {$/;"	f	class:ResultWriter	typeref:typename:void
+SetServer	embarlet/heartbeat.cc	/^void HeartBeatServiceImpl::SetServer(std::shared_ptr<grpc::Server> server) {$/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:void
+SetSubResult	client/result_writer.cc	/^void ResultWriter::SetSubResult(double res) {$/;"	f	class:ResultWriter	typeref:typename:void
+SetTopicManager	cxl_manager/cxl_manager.h	/^		void SetTopicManager(TopicManager *topic_manager){topic_manager_ = topic_manager;}$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+SetTopicManager	network_manager/network_manager.h	/^    void SetTopicManager(TopicManager* topic_manager) { topic_manager_ = topic_manager; }$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+SetupAcknowledgmentSocket	network_manager/network_manager.cc	/^bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,$/;"	f	class:Embarcadero::NetworkManager	typeref:typename:bool
+Shard	client/distributed_kv_store.h	/^		struct Shard {$/;"	s	class:ShardedKVStore
+ShardedKVStore	client/distributed_kv_store.h	/^class ShardedKVStore {$/;"	c
+Shutdown	client/subscriber.cc	/^void Subscriber::Shutdown() {$/;"	f	class:Subscriber	typeref:typename:void
+Shutdown	disk_manager/corfu_replication_manager.cc	/^			void Shutdown() {$/;"	f	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:void	file:
+Shutdown	disk_manager/corfu_replication_manager.cc	/^	void CorfuReplicationManager::Shutdown() {$/;"	f	class:Corfu::CorfuReplicationManager	typeref:typename:void
+Shutdown	disk_manager/scalog_replication_manager.cc	/^		void Shutdown() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:void	file:
+Shutdown	disk_manager/scalog_replication_manager.cc	/^	void ScalogReplicationManager::Shutdown() {$/;"	f	class:Scalog::ScalogReplicationManager	typeref:typename:void
+SignalScriptReady	embarlet/embarlet.cc	/^void SignalScriptReady() {$/;"	f	namespace:__anonaa92e0c00111	typeref:typename:void
+StartScalogLocalSequencer	cxl_manager/cxl_manager.cc	/^void CXLManager::StartScalogLocalSequencer(std::string topic_str) {$/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+StartScalogReplicaLocalSequencer	disk_manager/disk_manager.cc	/^	void DiskManager::StartScalogReplicaLocalSequencer() {$/;"	f	class:Embarcadero::DiskManager	typeref:typename:void
+StartSendLocalCut	disk_manager/scalog_replication_manager.cc	/^	void ScalogReplicationManager::StartSendLocalCut() {$/;"	f	class:Scalog::ScalogReplicationManager	typeref:typename:void
+StartSendLocalCutThread	disk_manager/scalog_replication_manager.cc	/^		void StartSendLocalCutThread() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:void	file:
+StoreLatency	client/subscriber.cc	/^void Subscriber::StoreLatency() {$/;"	f	class:Subscriber	typeref:typename:void
+StorePhysicalOffset	cxl_manager/cxl_manager.h	/^				void StorePhysicalOffset(size_t logical_offset , size_t physical_offset){$/;"	f	class:Embarcadero::CXLManager::SequentialOrderTracker	typeref:typename:void
+Subscribe	network_manager/network_manager.h	/^enum ClientRequestType {Publish, Subscribe};$/;"	e	enum:Embarcadero::ClientRequestType
+SubscribeNetworkThread	network_manager/network_manager.cc	/^void NetworkManager::SubscribeNetworkThread($/;"	f	class:Embarcadero::NetworkManager	typeref:typename:void
+SubscribeThroughputTest	client/test_utils.cc	/^double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TOPIC_NAME_SIZE]) /;"	f	typeref:typename:double
+SubscribeToCluster	embarlet/heartbeat.cc	/^grpc::Status HeartBeatServiceImpl::SubscribeToCluster($/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:grpc::Status
+SubscribeToCluster	protobuf/heartbeat.proto	/^  rpc SubscribeToCluster (ClientInfo) returns (stream ClusterStatus);$/;"	r	service:heartbeat_system.HeartBeat	typeref:typename:streamClusterStatus
+SubscribeToClusterStatus	client/publisher.cc	/^void Publisher::SubscribeToClusterStatus() {$/;"	f	class:Publisher	typeref:typename:void
+SubscribeToClusterStatus	client/subscriber.cc	/^void Subscriber::SubscribeToClusterStatus() {$/;"	f	class:Subscriber	typeref:typename:void
+Subscriber	client/subscriber.cc	/^Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], boo/;"	f	class:Subscriber
+Subscriber	client/subscriber.h	/^class Subscriber {$/;"	c
+SubscriberState	network_manager/network_manager.h	/^struct SubscriberState {$/;"	s	namespace:Embarcadero
+TInode	cxl_manager/cxl_datastructure.h	/^struct alignas(64) TInode{$/;"	s	namespace:Embarcadero
+TOPIC_NAME_SIZE	common/config.h.in	/^#define TOPIC_NAME_SIZE /;"	d	file:
+TerminateCluster	embarlet/heartbeat.cc	/^grpc::Status HeartBeatServiceImpl::TerminateCluster($/;"	f	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:grpc::Status
+TerminateCluster	protobuf/heartbeat.proto	/^	rpc TerminateCluster(google.protobuf.Empty) returns (google.protobuf.Empty);$/;"	r	service:heartbeat_system.HeartBeat	typeref:typename:google.protobuf.Empty
+TerminateGlobalSequencer	cxl_manager/scalog_local_sequencer.cc	/^void ScalogLocalSequencer::TerminateGlobalSequencer() {$/;"	f	class:Scalog::ScalogLocalSequencer	typeref:typename:void
+TerminateGlobalSequencerRequest	protobuf/scalog_sequencer.proto	/^message TerminateGlobalSequencerRequest {}$/;"	m
+TerminateGlobalSequencerResponse	protobuf/scalog_sequencer.proto	/^message TerminateGlobalSequencerResponse {}$/;"	m
+ThreadInfo	client/subscriber.h	/^			ThreadInfo(ThreadInfo&& other) noexcept : thread(std::move(other.thread)), fd(other.fd) {}$/;"	f	struct:Subscriber::ThreadInfo
+ThreadInfo	client/subscriber.h	/^			ThreadInfo(std::thread t, int f) : thread(std::move(t)), fd(f) {}$/;"	f	struct:Subscriber::ThreadInfo
+ThreadInfo	client/subscriber.h	/^		struct ThreadInfo {$/;"	s	class:Subscriber
+TimestampPair	client/subscriber.h	/^struct TimestampPair {$/;"	s
+Topic	embarlet/topic.cc	/^Topic::Topic($/;"	f	class:Embarcadero::Topic
+Topic	embarlet/topic.h	/^class Topic {$/;"	c	namespace:Embarcadero
+TopicManager	embarlet/topic_manager.h	/^		TopicManager(CXLManager& cxl_manager, DiskManager& disk_manager, int broker_id) :$/;"	f	class:Embarcadero::TopicManager
+TopicManager	embarlet/topic_manager.h	/^class TopicManager {$/;"	c	namespace:Embarcadero
+TotalOrderRequest	protobuf/corfu_sequencer.proto	/^message TotalOrderRequest {$/;"	m	package:corfusequencer
+TotalOrderResponse	protobuf/corfu_sequencer.proto	/^message TotalOrderResponse {$/;"	m	package:corfusequencer
+Transaction	client/distributed_kv_store.h	/^struct Transaction {$/;"	s
+Update	client/test_utils.cc	/^		void Update(size_t current_operations) {$/;"	f	class:ProgressTracker	typeref:typename:void	file:
+UpdateTInodeOrderandWritten	cxl_manager/cxl_manager.cc	/^inline void CXLManager::UpdateTInodeOrderandWritten(char *topic, TInode* tinode, int broker, siz/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+UpdateTInodeWritten	embarlet/topic.cc	/^inline void Topic::UpdateTInodeWritten(size_t written, size_t written_addr) {$/;"	f	class:Embarcadero::Topic	typeref:typename:void
+UpdateTinodeOrder	cxl_manager/cxl_manager.h	/^		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off,/;"	f	class:Embarcadero::CXLManager	typeref:typename:void
+WAITING_FOR_ID	client/publisher.cc	/^	enum class ConnState { WAITING_FOR_ID, READING_ACKS };$/;"	e	enum:Publisher::EpollAckThread::ConnState	file:
+Wait	disk_manager/corfu_replication_manager.cc	/^	void CorfuReplicationManager::Wait() {$/;"	f	class:Corfu::CorfuReplicationManager	typeref:typename:void
+Wait	disk_manager/scalog_replication_manager.cc	/^	void ScalogReplicationManager::Wait() {$/;"	f	class:Scalog::ScalogReplicationManager	typeref:typename:void
+Wait	embarlet/heartbeat.cc	/^void FollowerNodeClient::Wait() {$/;"	f	class:heartbeat_system::FollowerNodeClient	typeref:typename:void
+Wait	embarlet/heartbeat.cc	/^void HeartBeatManager::Wait() {$/;"	f	class:heartbeat_system::HeartBeatManager	typeref:typename:void
+WaitUntilAllConnected	client/subscriber.h	/^		void WaitUntilAllConnected(){$/;"	f	class:Subscriber	typeref:typename:void
+Write	client/buffer.cc	/^bool Buffer::Write(int bufIdx, size_t client_order, char* msg, size_t len, size_t paddedSize) {$/;"	f	class:Buffer	typeref:typename:bool
+Write	client/buffer.cc	/^bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize) {$/;"	f	class:Buffer	typeref:typename:bool
+WriteFailureEventsToFile	client/publisher.h	/^		void WriteFailureEventsToFile(const std::string& filename) {$/;"	f	class:Publisher	typeref:typename:void
+WriteFinished	client/buffer.cc	/^void Buffer::WriteFinished() {$/;"	f	class:Buffer	typeref:typename:void
+WriteFinishedOrPuased	client/publisher.cc	/^void Publisher::WriteFinishedOrPuased() {$/;"	f	class:Publisher	typeref:typename:void
+WriteRequestInternal	disk_manager/corfu_replication_manager.cc	/^			void WriteRequestInternal(const CorfuReplicationRequest& request, int current_fd) const {$/;"	f	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:void	file:
+WriteTask	disk_manager/scalog_replication_manager.cc	/^			explicit WriteTask(const ScalogReplicationRequest& req) :$/;"	f	struct:Scalog::ScalogReplicationServiceImpl::WriteTask	file:
+WriteTask	disk_manager/scalog_replication_manager.cc	/^		struct WriteTask {$/;"	s	class:Scalog::ScalogReplicationServiceImpl	file:
+WriterLoop	disk_manager/scalog_replication_manager.cc	/^		void WriterLoop() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:void	file:
+ZERO_COPY_SEND_LIMIT	common/config.h.in	/^#define ZERO_COPY_SEND_LIMIT /;"	d	file:
+_GRPC_CPP_PLUGIN_EXECUTABLE	cmake/corfu_replication_grpc.cmake	/^set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)$/;"	v
+_GRPC_CPP_PLUGIN_EXECUTABLE	cmake/corfu_sequencer_grpc.cmake	/^set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)$/;"	v
+_GRPC_CPP_PLUGIN_EXECUTABLE	cmake/corfu_validator_grpc.cmake	/^  set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)$/;"	v
+_GRPC_CPP_PLUGIN_EXECUTABLE	cmake/heartbeat_grpc.cmake	/^set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)$/;"	v
+_GRPC_CPP_PLUGIN_EXECUTABLE	cmake/scalog_replication_grpc.cmake	/^set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)$/;"	v
+_GRPC_CPP_PLUGIN_EXECUTABLE	cmake/scalog_sequencer_grpc.cmake	/^set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:grpc_cpp_plugin>)$/;"	v
+_GRPC_GRPCPP	cmake/corfu_validator_grpc.cmake	/^set(_GRPC_GRPCPP grpc++)$/;"	v
+_ORCA_SERVICE	cmake/corfu_validator_grpc.cmake	/^set(_ORCA_SERVICE grpcpp_orca_service)$/;"	v
+_PROTOBUF_LIBPROTOBUF	cmake/corfu_validator_grpc.cmake	/^set(_PROTOBUF_LIBPROTOBUF libprotobuf)$/;"	v
+_PROTOBUF_PROTOC	cmake/corfu_replication_grpc.cmake	/^set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)$/;"	v
+_PROTOBUF_PROTOC	cmake/corfu_sequencer_grpc.cmake	/^set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)$/;"	v
+_PROTOBUF_PROTOC	cmake/corfu_validator_grpc.cmake	/^  set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)$/;"	v
+_PROTOBUF_PROTOC	cmake/heartbeat_grpc.cmake	/^set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)$/;"	v
+_PROTOBUF_PROTOC	cmake/scalog_replication_grpc.cmake	/^set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)$/;"	v
+_PROTOBUF_PROTOC	cmake/scalog_sequencer_grpc.cmake	/^set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)$/;"	v
+_REFLECTION	cmake/corfu_validator_grpc.cmake	/^set(_REFLECTION grpc++_reflection)$/;"	v
+__AMD__	CMakeLists.txt	/^        set(__AMD__ 1)$/;"	v
+__INTEL__	CMakeLists.txt	/^        set(__INTEL__ 1)$/;"	v
+__anon2c8375dc0102	cxl_manager/scalog_global_sequencer.cc	/^	std::thread([this]() {$/;"	f	function:ScalogGlobalSequencer::HandleTerminateGlobalSequencer	file:
+__anon2c8375dc0202	cxl_manager/scalog_global_sequencer.cc	/^													[](const auto& a, const auto& b) {$/;"	f	function:ScalogGlobalSequencer::SendGlobalCut	file:
+__anon2db97e350102	client/publisher.cc	/^		ack_thread_ = std::thread([this]() {$/;"	f	function:Publisher::Init	file:
+__anon2db97e350202	client/publisher.cc	/^	cluster_probe_thread_ = std::thread([this]() {$/;"	f	function:Publisher::Init	file:
+__anon2db97e350302	client/publisher.cc	/^	kill_brokers_thread_ = std::thread([=, this]() {$/;"	f	function:Publisher::FailBrokers	file:
+__anon2db97e350402	client/publisher.cc	/^	real_time_throughput_measure_thread_ = std::thread([=, this]() {$/;"	f	function:Publisher::FailBrokers	file:
+__anon2db97e350502	client/publisher.cc	/^	auto connect_to_server = [&](size_t brokerId) -> bool {$/;"	f	function:Publisher::PublishThread	typeref:typename:bool	file:
+__anon2db97e350602	client/publisher.cc	/^		auto send_batch_header = [&]() -> void {$/;"	f	function:Publisher::PublishThread	typeref:typename:void	file:
+__anon2db97e350702	client/publisher.cc	/^		auto send_batch_header = [&]() -> void {$/;"	f	function:Publisher::PublishThread	typeref:typename:void	file:
+__anon301b2ba20102	cxl_manager/corfu_global_sequencer.cc	/^	std::signal(SIGINT, [](int signal) {$/;"	f	function:RunServer	file:
+__anon46dc1a7c0108	cxl_manager/cxl_datastructure.h	/^	struct {$/;"	s	struct:Embarcadero::offset_entry
+__anon46dc1a7c0208	cxl_manager/cxl_datastructure.h	/^	struct {$/;"	s	struct:Embarcadero::offset_entry
+__anon46dc1a7c0308	cxl_manager/cxl_datastructure.h	/^	struct {$/;"	s	struct:Embarcadero::TInode
+__anon6dbdb86d0102	embarlet/topic_manager.cc	/^				[this]() { return cxl_manager_.GetNewSegment(); },$/;"	f	function:Embarcadero::TopicManager::CreateNewTopicInternal	file:
+__anon6dbdb86d0202	embarlet/topic_manager.cc	/^				[this]() { return get_num_brokers_callback_(); },$/;"	f	function:Embarcadero::TopicManager::CreateNewTopicInternal	file:
+__anon6dbdb86d0302	embarlet/topic_manager.cc	/^														struct MessageHeader** msg_to_order, struct TInode *tinode) { $/;"	f	function:Embarcadero::TopicManager::CreateNewTopicInternal	file:
+__anon6dbdb86d0402	embarlet/topic_manager.cc	/^			[](unsigned char c) { return c == 0; }$/;"	f	function:Embarcadero::TopicManager::CreateNewTopicInternal	file:
+__anon6dbdb86d0502	embarlet/topic_manager.cc	/^					[](unsigned char c) { return c == 0; }$/;"	f	function:Embarcadero::TopicManager::CreateNewTopicInternal	file:
+__anon6dbdb86d0602	embarlet/topic_manager.cc	/^				[this]() { return cxl_manager_.GetNewSegment(); },$/;"	f	function:Embarcadero::TopicManager::CreateNewTopicInternal	file:
+__anon6dbdb86d0702	embarlet/topic_manager.cc	/^				[this]() { return get_num_brokers_callback_(); },$/;"	f	function:Embarcadero::TopicManager::CreateNewTopicInternal	file:
+__anon6dbdb86d0802	embarlet/topic_manager.cc	/^														struct MessageHeader** msg_to_order, struct TInode *tinode) { $/;"	f	function:Embarcadero::TopicManager::CreateNewTopicInternal	file:
+__anon8d57cb5b0102	client/subscriber.cc	/^	cluster_probe_thread_ = std::thread([this]() { this->SubscribeToClusterStatus(); });$/;"	f	function:Subscriber::Subscriber	file:
+__anon8d57cb5b0202	client/subscriber.cc	/^	std::sort(all_headers.begin(), all_headers.end(), [](const auto& a, const auto& b) {$/;"	f	function:Subscriber::DEBUG_check_order	file:
+__anon96b47d390102	disk_manager/scalog_replication_manager.cc	/^				if (cv_fsync_.wait_for(lock, flush_interval, [this]{ return !running_.load(); })) {$/;"	f	function:Scalog::ScalogReplicationServiceImpl::FsyncLoop	file:
+__anon96b47d390202	disk_manager/scalog_replication_manager.cc	/^		server_thread_ = std::thread([this]() {$/;"	f	function:Scalog::ScalogReplicationManager::ScalogReplicationManager	file:
+__anonaa92e0c00111	embarlet/embarlet.cc	/^namespace {$/;"	n	file:
+__anonb9362d6c0102	client/main.cc	/^            sub_thread.emplace_back([&result, &topic, &sub_promise]() {$/;"	f	function:main	file:
+__anonb9362d6c0202	client/main.cc	/^                threads.emplace_back([&result, &topic, &synchronizer, &promises, i]() {$/;"	f	function:main	file:
+__anonb9362d6c0302	client/main.cc	/^            auto killbrokers = [&stub, num_brokers_to_kill]() {$/;"	f	function:main	file:
+__anoncdc568bf0102	disk_manager/corfu_replication_manager.cc	/^					if (cv_fsync_.wait_for(lock, flush_interval, [this]{ return !running_.load(); })) {$/;"	f	function:Corfu::CorfuReplicationServiceImpl::FsyncLoop	file:
+__anoncdc568bf0202	disk_manager/corfu_replication_manager.cc	/^		server_thread_ = std::thread([this]() {$/;"	f	function:Corfu::CorfuReplicationManager::CorfuReplicationManager	file:
+__anonddede5330102	embarlet/topic.cc	/^	return [this, start_logical_offset](void* log_ptr, size_t logical_offset) {$/;"	f	function:Embarcadero::Topic::KafkaGetCXLBuffer	file:
+__anonddede5330202	embarlet/topic.cc	/^	return [this, batch_header, log](void* log_ptr, size_t \/*placeholder*\/) {$/;"	f	function:Embarcadero::Topic::CorfuGetCXLBuffer	file:
+__anonddede5330302	embarlet/topic.cc	/^	return [this, batch_header, log](void* log_ptr, size_t \/*placeholder*\/) {$/;"	f	function:Embarcadero::Topic::ScalogGetCXLBuffer	file:
+__anonf2a750e40102	embarlet/heartbeat.cc	/^	heartbeat_thread_ = std::thread([this]() {$/;"	f	function:heartbeat_system::HeartBeatServiceImpl::HeartBeatServiceImpl	file:
+__anonf2a750e40202	embarlet/heartbeat.cc	/^				[writer](const std::shared_ptr<grpc::ServerWriter<ClusterStatus>>& w) {$/;"	f	function:heartbeat_system::HeartBeatServiceImpl::SubscribeToCluster	file:
+__anonf2a750e40302	embarlet/heartbeat.cc	/^	std::thread([this]() {$/;"	f	function:heartbeat_system::HeartBeatServiceImpl::TerminateCluster	file:
+__anonf2a750e40402	embarlet/heartbeat.cc	/^		heartbeat_thread_ = std::thread([this]() {$/;"	f	function:heartbeat_system::FollowerNodeClient::FollowerNodeClient	file:
+__anonf5e507220102	client/result_writer.cc	/^        auto formatBool = [](bool value) -> std::string {$/;"	f	function:ResultWriter::~ResultWriter	typeref:typename:std::string	file:
+__anonf5e507220202	client/result_writer.cc	/^        auto formatFloat = [](double value) -> std::string {$/;"	f	function:ResultWriter::~ResultWriter	typeref:typename:std::string	file:
+ack	network_manager/network_manager.h	/^    uint32_t ack;$/;"	m	struct:Embarcadero::EmbarcaderoReq	typeref:typename:uint32_t
+ack_connections_	network_manager/network_manager.h	/^    absl::flat_hash_map<size_t, int> ack_connections_;  \/\/ <client_id, ack_sock>$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:absl::flat_hash_map<size_t,int>
+ack_efd_	network_manager/network_manager.h	/^    int ack_efd_; \/\/ Epoll file descriptor for acknowledgments$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:int
+ack_fd_	network_manager/network_manager.h	/^    int ack_fd_ = -1; \/\/ Socket file descriptor for acknowledgments$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:int
+ack_level	client/result_writer.h	/^    int ack_level;$/;"	m	class:ResultWriter	typeref:typename:int
+ack_level	cxl_manager/cxl_datastructure.h	/^		volatile int32_t ack_level;$/;"	m	struct:Embarcadero::TInode::__anon46dc1a7c0308	typeref:typename:volatile int32_t
+ack_level	protobuf/heartbeat.proto	/^	int32 ack_level = 5;$/;"	f	message:heartbeat_system.CreateTopicRequest	typeref:typename:int32
+ack_level_	client/publisher.h	/^		int ack_level_;$/;"	m	class:Publisher	typeref:typename:int
+ack_level_	embarlet/topic.h	/^		int ack_level_;$/;"	m	class:Embarcadero::Topic	typeref:typename:int
+ack_mu_	network_manager/network_manager.h	/^    absl::Mutex ack_mu_;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:absl::Mutex
+ack_port_	client/publisher.h	/^		int ack_port_;$/;"	m	class:Publisher	typeref:typename:int
+ack_received_	client/publisher.h	/^		size_t ack_received_;$/;"	m	class:Publisher	typeref:typename:size_t
+ack_thread_	client/publisher.h	/^		std::thread ack_thread_;$/;"	m	class:Publisher	typeref:typename:std::thread
+acked_messages_per_broker_	client/publisher.h	/^		std::vector<size_t> acked_messages_per_broker_;$/;"	m	class:Publisher	typeref:typename:std::vector<size_t>
+acquire_read_buffer	client/subscriber.cc	/^BufferState* ConnectionBuffers::acquire_read_buffer() {$/;"	f	class:ConnectionBuffers	typeref:typename:BufferState *
+addr	disk_manager/disk_manager.h	/^    void* addr;$/;"	m	struct:Embarcadero::MemcpyRequest	typeref:typename:void *
+address	embarlet/heartbeat.h	/^			std::string address;$/;"	m	struct:heartbeat_system::FollowerNodeClient::NodeEntry	typeref:typename:std::string
+address	embarlet/heartbeat.h	/^			std::string address;$/;"	m	struct:heartbeat_system::HeartBeatServiceImpl::NodeEntry	typeref:typename:std::string
+address	protobuf/heartbeat.proto	/^	string address = 2;$/;"	f	message:heartbeat_system.NodeInfo	typeref:typename:string
+address	protobuf/heartbeat.proto	/^  string address = 2;$/;"	f	message:heartbeat_system.BrokerInfo	typeref:typename:string
+address_	embarlet/heartbeat.h	/^		std::string address_;$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::string
+advance_write_offset	client/subscriber.h	/^	void advance_write_offset(size_t bytes_written) {$/;"	f	struct:ConnectionBuffers	typeref:typename:void
+alarm	embarlet/heartbeat.h	/^			grpc::Alarm alarm;$/;"	m	struct:heartbeat_system::FollowerNodeClient::AsyncClientCall	typeref:typename:grpc::Alarm
+alive	protobuf/heartbeat.proto	/^	bool alive = 1;$/;"	f	message:heartbeat_system.HeartbeatResponse	typeref:typename:bool
+allocate_shm	cxl_manager/cxl_manager.cc	/^static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_size){$/;"	f	namespace:Embarcadero	typeref:typename:void *	file:
+apply_mutex_	client/distributed_kv_store.h	/^		absl::Mutex apply_mutex_;$/;"	m	class:DistributedKVStore	typeref:typename:absl::Mutex
+base_filename_	disk_manager/corfu_replication_manager.cc	/^			const std::string base_filename_;$/;"	m	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:const std::string	file:
+base_filename_	disk_manager/scalog_replication_manager.cc	/^		const std::string base_filename_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:const std::string	file:
+batchHeaders_	cxl_manager/cxl_manager.h	/^		void* batchHeaders_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:void *
+batch_headers_	embarlet/topic.h	/^		unsigned long long int batch_headers_;$/;"	m	class:Embarcadero::Topic	typeref:typename:unsigned long long int
+batch_headers_offset	cxl_manager/cxl_datastructure.h	/^		volatile size_t batch_headers_offset;$/;"	m	struct:Embarcadero::offset_entry::__anon46dc1a7c0108	typeref:typename:volatile size_t
+batch_seq	cxl_manager/corfu_global_sequencer.cc	/^			size_t batch_seq;$/;"	m	struct:CorfuSequencerImpl::PendingRequest	typeref:typename:size_t	file:
+batch_seq	cxl_manager/cxl_datastructure.h	/^	size_t batch_seq;$/;"	m	struct:Embarcadero::BatchHeader	typeref:typename:size_t
+batch_seq_	client/buffer.h	/^    std::atomic<size_t> batch_seq_{0};$/;"	m	class:Buffer	typeref:typename:std::atomic<size_t>
+batch_seq_per_clients_	cxl_manager/corfu_global_sequencer.cc	/^    absl::flat_hash_map<size_t, size_t> batch_seq_per_clients_; \/\/ Tracks next expected batch_/;"	m	class:CorfuSequencerImpl	typeref:typename:absl::flat_hash_map<size_t,size_t>	file:
+batchseq	protobuf/corfu_sequencer.proto	/^  uint64 batchseq = 2;$/;"	f	message:corfusequencer.TotalOrderRequest	typeref:typename:uint64
+bitmap_	cxl_manager/cxl_manager.h	/^		void* bitmap_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:void *
+broker_id	client/common.h	/^    int broker_id;$/;"	m	struct:msgIdx	typeref:typename:int
+broker_id	client/subscriber.h	/^	const int broker_id;$/;"	m	struct:ConnectionBuffers	typeref:typename:const int
+broker_id	cxl_manager/corfu_global_sequencer.cc	/^			int broker_id;$/;"	m	struct:CorfuSequencerImpl::PendingRequest	typeref:typename:int	file:
+broker_id	cxl_manager/cxl_datastructure.h	/^	uint32_t broker_id;$/;"	m	struct:Embarcadero::BatchHeader	typeref:typename:uint32_t
+broker_id	disk_manager/disk_manager.h	/^	int broker_id;$/;"	m	struct:Embarcadero::ReplicationRequest	typeref:typename:int
+broker_id	embarlet/heartbeat.h	/^			int broker_id;$/;"	m	struct:heartbeat_system::FollowerNodeClient::NodeEntry	typeref:typename:int
+broker_id	embarlet/heartbeat.h	/^			int broker_id;$/;"	m	struct:heartbeat_system::HeartBeatServiceImpl::NodeEntry	typeref:typename:int
+broker_id	protobuf/corfu_sequencer.proto	/^	uint32 broker_id = 5;$/;"	f	message:corfusequencer.TotalOrderRequest	typeref:typename:uint32
+broker_id	protobuf/heartbeat.proto	/^	int64 broker_id = 2;$/;"	f	message:heartbeat_system.RegistrationStatus	typeref:typename:int64
+broker_id	protobuf/heartbeat.proto	/^  int32 broker_id = 1;$/;"	f	message:heartbeat_system.BrokerInfo	typeref:typename:int32
+broker_id	protobuf/scalog_sequencer.proto	/^    int64 broker_id = 1;$/;"	f	message:RegisterBrokerRequest	typeref:typename:int64
+broker_id	protobuf/scalog_sequencer.proto	/^    int64 broker_id = 3;$/;"	f	message:LocalCut	typeref:typename:int64
+broker_id_	cxl_manager/cxl_manager.h	/^				int broker_id_;$/;"	m	class:Embarcadero::CXLManager::SequentialOrderTracker	typeref:typename:int
+broker_id_	cxl_manager/cxl_manager.h	/^		int broker_id_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:int
+broker_id_	cxl_manager/cxl_manager.h	/^		int broker_id_;$/;"	m	class:Embarcadero::ScalogLocalSequencer	typeref:typename:int
+broker_id_	cxl_manager/scalog_local_sequencer.h	/^		int broker_id_;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:int
+broker_id_	disk_manager/disk_manager.h	/^		int broker_id_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:int
+broker_id_	disk_manager/scalog_replication_client.h	/^    int broker_id_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:int
+broker_id_	disk_manager/scalog_replication_manager.cc	/^		int broker_id_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:int	file:
+broker_id_	embarlet/heartbeat.h	/^		int broker_id_{-1};$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:int
+broker_id_	embarlet/topic.h	/^		int broker_id_;$/;"	m	class:Embarcadero::Topic	typeref:typename:int
+broker_id_	embarlet/topic_manager.h	/^		int broker_id_;$/;"	m	class:Embarcadero::TopicManager	typeref:typename:int
+broker_id_	network_manager/network_manager.h	/^    int broker_id_;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:int
+brokers_	client/publisher.h	/^		std::vector<int> brokers_;$/;"	m	class:Publisher	typeref:typename:std::vector<int>
+buf	disk_manager/disk_manager.h	/^    void* buf;$/;"	m	struct:Embarcadero::MemcpyRequest	typeref:typename:void *
+buffer	client/buffer.h	/^        void* buffer;$/;"	m	struct:Buffer::Buf	typeref:typename:void *
+buffer	client/subscriber.h	/^	void* buffer = nullptr;$/;"	m	struct:BufferState	typeref:typename:void *
+buffer_capacity	client/subscriber.h	/^	const size_t buffer_capacity;$/;"	m	struct:ConnectionBuffers	typeref:typename:const size_t
+buffer_size_per_buffer_	client/subscriber.h	/^		const size_t buffer_size_per_buffer_; \/\/ Size for *each* of the two buffers per connection$/;"	m	class:Subscriber	typeref:typename:const size_t
+buffer_state	client/subscriber.h	/^	BufferState* buffer_state = nullptr; \/\/ The specific buffer being consumed$/;"	m	struct:ConsumedData	typeref:typename:BufferState *
+buffers	client/subscriber.h	/^	BufferState buffers[2]; \/\/ The two buffers$/;"	m	struct:ConnectionBuffers	typeref:typename:BufferState[2]
+bufs_	client/buffer.h	/^    std::vector<Buf> bufs_;$/;"	m	class:Buffer	typeref:typename:std::vector<Buf>
+capacity	client/subscriber.h	/^	size_t capacity = 0;$/;"	m	struct:BufferState	typeref:typename:size_t
+channel_	disk_manager/corfu_replication_client.h	/^    std::shared_ptr<grpc::Channel> channel_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::shared_ptr<grpc::Channel>
+channel_	disk_manager/scalog_replication_client.h	/^    std::shared_ptr<grpc::Channel> channel_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::shared_ptr<grpc::Channel>
+clear	client/distributed_kv_store.h	/^		void clear() {$/;"	f	class:ShardedKVStore	typeref:typename:void
+clientId	client/distributed_kv_store.h	/^	size_t clientId; \/\/ Use message header's client_id$/;"	m	struct:OperationId	typeref:typename:size_t
+client_id	cxl_manager/cxl_datastructure.h	/^	size_t client_id;$/;"	m	struct:Embarcadero::BatchHeader	typeref:typename:size_t
+client_id	cxl_manager/cxl_datastructure.h	/^	uint32_t client_id;$/;"	m	struct:Embarcadero::MessageHeader	typeref:typename:uint32_t
+client_id	network_manager/network_manager.h	/^    uint32_t client_id;$/;"	m	struct:Embarcadero::EmbarcaderoReq	typeref:typename:uint32_t
+client_id	protobuf/corfu_sequencer.proto	/^	uint64 client_id = 1;$/;"	f	message:corfusequencer.TotalOrderRequest	typeref:typename:uint64
+client_id_	client/corfu_client.h	/^		const size_t client_id_;$/;"	m	class:CorfuSequencerClient	typeref:typename:const size_t
+client_id_	client/publisher.h	/^		int client_id_;$/;"	m	class:Publisher	typeref:typename:int
+client_id_	client/subscriber.h	/^		int client_id_;$/;"	m	class:Subscriber	typeref:typename:int
+client_order	cxl_manager/cxl_datastructure.h	/^	size_t client_order;$/;"	m	struct:Embarcadero::MessageHeader	typeref:typename:size_t
+client_order_	client/publisher.h	/^		size_t client_order_ = 0;$/;"	m	class:Publisher	typeref:typename:size_t
+client_order_offset_	cxl_manager/corfu_global_sequencer.cc	/^    absl::flat_hash_map<size_t, uint64_t> client_order_offset_;  \/\/ Tracks starting offset for/;"	m	class:CorfuSequencerImpl	typeref:typename:absl::flat_hash_map<size_t,uint64_t>	file:
+client_req	network_manager/network_manager.h	/^    ClientRequestType client_req;$/;"	m	struct:Embarcadero::EmbarcaderoReq	typeref:typename:ClientRequestType
+client_socket	network_manager/network_manager.h	/^    int client_socket;$/;"	m	struct:Embarcadero::NetworkRequest	typeref:typename:int
+cluster_info	protobuf/heartbeat.proto	/^  repeated BrokerInfo cluster_info = 4;$/;"	f	message:heartbeat_system.HeartbeatResponse	typeref:typename:BrokerInfo
+cluster_mutex_	embarlet/heartbeat.h	/^		absl::Mutex cluster_mutex_;$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:absl::Mutex
+cluster_mutex_	embarlet/heartbeat.h	/^		absl::Mutex cluster_mutex_;$/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:absl::Mutex
+cluster_nodes_	embarlet/heartbeat.h	/^		absl::flat_hash_map<int, NodeEntry> cluster_nodes_;$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:absl::flat_hash_map<int,NodeEntry>
+cluster_probe_thread_	client/publisher.h	/^		std::thread cluster_probe_thread_;$/;"	m	class:Publisher	typeref:typename:std::thread
+cluster_probe_thread_	client/subscriber.h	/^		std::thread cluster_probe_thread_;$/;"	m	class:Subscriber	typeref:typename:std::thread
+cluster_version	protobuf/heartbeat.proto	/^	uint64 cluster_version = 2;$/;"	f	message:heartbeat_system.HeartbeatRequest	typeref:typename:uint64
+cluster_version	protobuf/heartbeat.proto	/^	uint64 cluster_version = 3;$/;"	f	message:heartbeat_system.HeartbeatResponse	typeref:typename:uint64
+cluster_version_	embarlet/heartbeat.h	/^		uint64_t cluster_version_{0} ABSL_GUARDED_BY(cluster_mutex_);  \/\/ Incremented when cluster c/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:uint64_t
+cluster_version_	embarlet/heartbeat.h	/^		uint64_t cluster_version_{0};$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:uint64_t
+combiningThreads_	embarlet/topic.h	/^		std::vector<std::thread> combiningThreads_;$/;"	m	class:Embarcadero::Topic	typeref:typename:std::vector<std::thread>
+complete	cxl_manager/cxl_datastructure.h	/^	volatile uint32_t complete;$/;"	m	struct:Embarcadero::MessageHeader	typeref:typename:volatile uint32_t
+completeOperation	client/distributed_kv_store.cc	/^void DistributedKVStore::completeOperation(OPID opId){$/;"	f	class:DistributedKVStore	typeref:typename:void
+connected_	client/publisher.h	/^		bool connected_{false};$/;"	m	class:Publisher	typeref:typename:bool
+connected_	client/subscriber.h	/^		std::atomic<bool> connected_{false}; \/\/ Maybe more granular connection state needed$/;"	m	class:Subscriber	typeref:typename:std::atomic<bool>
+connection	client/subscriber.h	/^	std::shared_ptr<ConnectionBuffers> connection; \/\/ Keep connection alive$/;"	m	struct:ConsumedData	typeref:typename:std::shared_ptr<ConnectionBuffers>
+connection_map_mutex_	client/subscriber.h	/^		absl::Mutex connection_map_mutex_; \/\/ Protects the map itself$/;"	m	class:Subscriber	typeref:typename:absl::Mutex
+consume_cv_	client/subscriber.h	/^		absl::CondVar consume_cv_; \/\/ Global CV for consumer to wait on$/;"	m	class:Subscriber	typeref:typename:absl::CondVar
+consumer_can_consume_cv	client/subscriber.h	/^	absl::CondVar consumer_can_consume_cv; \/\/ Notifies consumer a buffer *might* be ready$/;"	m	struct:ConnectionBuffers	typeref:typename:absl::CondVar
+contains	client/distributed_kv_store.h	/^		bool contains(const std::string& key) const {$/;"	f	class:ShardedKVStore	typeref:typename:bool
+context	embarlet/heartbeat.h	/^			grpc::ClientContext context;$/;"	m	struct:heartbeat_system::FollowerNodeClient::AsyncClientCall	typeref:typename:grpc::ClientContext
+context_	client/publisher.h	/^		grpc::ClientContext context_;$/;"	m	class:Publisher	typeref:typename:grpc::ClientContext
+copyQueue_	disk_manager/disk_manager.h	/^		folly::MPMCQueue<std::optional<MemcpyRequest>> copyQueue_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:folly::MPMCQueue<std::optional<MemcpyRequest>>
+corfu_client_	client/publisher.h	/^		std::unique_ptr<CorfuSequencerClient> corfu_client_;$/;"	m	class:Publisher	typeref:typename:std::unique_ptr<CorfuSequencerClient>
+corfu_global_sequencer	CMakeLists.txt	/^add_executable(corfu_global_sequencer$/;"	t
+corfu_replication_client_	embarlet/topic.h	/^		std::unique_ptr<Corfu::CorfuReplicationClient> corfu_replication_client_;$/;"	m	class:Embarcadero::Topic	typeref:typename:std::unique_ptr<Corfu::CorfuReplicationClient>
+corfu_replication_grpc_hdrs	cmake/corfu_replication_grpc.cmake	/^set(corfu_replication_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_replication.grpc.pb.h")$/;"	v
+corfu_replication_grpc_proto	cmake/corfu_replication_grpc.cmake	/^add_library(corfu_replication_grpc_proto$/;"	t
+corfu_replication_grpc_srcs	cmake/corfu_replication_grpc.cmake	/^set(corfu_replication_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_replication.grpc.pb.cc")$/;"	v
+corfu_replication_manager_	disk_manager/disk_manager.h	/^		std::unique_ptr<Corfu::CorfuReplicationManager> corfu_replication_manager_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:std::unique_ptr<Corfu::CorfuReplicationManager>
+corfu_replication_proto_hdrs	cmake/corfu_replication_grpc.cmake	/^set(corfu_replication_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_replication.pb.h")$/;"	v
+corfu_replication_proto_srcs	cmake/corfu_replication_grpc.cmake	/^set(corfu_replication_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_replication.pb.cc")$/;"	v
+corfu_sequencer_grpc_hdrs	cmake/corfu_sequencer_grpc.cmake	/^set(corfu_sequencer_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_sequencer.grpc.pb.h")$/;"	v
+corfu_sequencer_grpc_proto	cmake/corfu_sequencer_grpc.cmake	/^add_library(corfu_sequencer_grpc_proto$/;"	t
+corfu_sequencer_grpc_srcs	cmake/corfu_sequencer_grpc.cmake	/^set(corfu_sequencer_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_sequencer.grpc.pb.cc")$/;"	v
+corfu_sequencer_proto_hdrs	cmake/corfu_sequencer_grpc.cmake	/^set(corfu_sequencer_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_sequencer.pb.h")$/;"	v
+corfu_sequencer_proto_srcs	cmake/corfu_sequencer_grpc.cmake	/^set(corfu_sequencer_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_sequencer.pb.cc")$/;"	v
+corfu_validator_grpc_hdrs	cmake/corfu_validator_grpc.cmake	/^set(corfu_validator_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_validator.grpc.pb.h")$/;"	v
+corfu_validator_grpc_proto	cmake/corfu_validator_grpc.cmake	/^add_library(corfu_validator_grpc_proto$/;"	t
+corfu_validator_grpc_srcs	cmake/corfu_validator_grpc.cmake	/^set(corfu_validator_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_validator.grpc.pb.cc")$/;"	v
+corfu_validator_proto_hdrs	cmake/corfu_validator_grpc.cmake	/^set(corfu_validator_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_validator.pb.h")$/;"	v
+corfu_validator_proto_srcs	cmake/corfu_validator_grpc.cmake	/^set(corfu_validator_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}\/corfu_validator.pb.cc")$/;"	v
+corfureplication	protobuf/corfu_replication.proto	/^package corfureplication;$/;"	p
+corfusequencer	protobuf/corfu_sequencer.proto	/^package corfusequencer;$/;"	p
+cq_	embarlet/heartbeat.h	/^		grpc::CompletionQueue cq_;$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:grpc::CompletionQueue
+create_topic_entry_callback_	embarlet/heartbeat.h	/^		Embarcadero::CreateTopicEntryCallback create_topic_entry_callback_;$/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:Embarcadero::CreateTopicEntryCallback
+current_log_addr_	cxl_manager/cxl_manager.h	/^		void* current_log_addr_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:void *
+current_segment_	embarlet/topic.h	/^		void* current_segment_;$/;"	m	class:Embarcadero::Topic	typeref:typename:void *
+current_write_idx	client/subscriber.h	/^	std::atomic<int> current_write_idx{0}; \/\/ Index (0 or 1) of the buffer receiver is writing to$/;"	m	struct:ConnectionBuffers	typeref:typename:std::atomic<int>
+cv_	cxl_manager/scalog_global_sequencer.h	/^		std::condition_variable cv_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:std::condition_variable
+cv_fsync_	disk_manager/corfu_replication_manager.cc	/^			std::condition_variable cv_fsync_;$/;"	m	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:std::condition_variable	file:
+cv_fsync_	disk_manager/scalog_replication_manager.cc	/^		std::condition_variable cv_fsync_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::condition_variable	file:
+cxl_addr_	cxl_manager/cxl_manager.h	/^		void* cxl_addr_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:void *
+cxl_addr_	cxl_manager/cxl_manager.h	/^		void* cxl_addr_;$/;"	m	class:Embarcadero::ScalogLocalSequencer	typeref:typename:void *
+cxl_addr_	cxl_manager/scalog_local_sequencer.h	/^		void* cxl_addr_;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:void *
+cxl_addr_	disk_manager/disk_manager.h	/^		void* cxl_addr_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:void *
+cxl_addr_	embarlet/topic.h	/^		void* cxl_addr_;$/;"	m	class:Embarcadero::Topic	typeref:typename:void *
+cxl_manager_	cxl_manager/cxl_manager.h	/^		CXLManager* cxl_manager_;$/;"	m	class:Embarcadero::ScalogLocalSequencer	typeref:typename:CXLManager *
+cxl_manager_	cxl_manager/scalog_local_sequencer.h	/^		Embarcadero::CXLManager* cxl_manager_;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:Embarcadero::CXLManager *
+cxl_manager_	embarlet/topic_manager.h	/^		CXLManager& cxl_manager_;$/;"	m	class:Embarcadero::TopicManager	typeref:typename:CXLManager &
+cxl_manager_	network_manager/network_manager.h	/^    CXLManager* cxl_manager_ = nullptr;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:CXLManager *
+cxl_size_	cxl_manager/cxl_manager.h	/^		size_t cxl_size_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:size_t
+data	client/distributed_kv_store.h	/^			absl::flat_hash_map<std::string, std::string> data;$/;"	m	struct:ShardedKVStore::Shard	typeref:typename:absl::flat_hash_map<std::string,std::string>
+data	client/subscriber.h	/^	const void* data() const {$/;"	f	struct:ConsumedData	typeref:typename:const void *
+data	disk_manager/scalog_replication_manager.cc	/^			std::string data; \/\/ Store data by value$/;"	m	struct:Scalog::ScalogReplicationServiceImpl::WriteTask	typeref:typename:std::string	file:
+data	protobuf/corfu_replication.proto	/^  bytes data = 3;$/;"	f	message:corfureplication.CorfuReplicationRequest	typeref:typename:bytes
+data	protobuf/scalog_replication.proto	/^  bytes data = 4;$/;"	f	message:scalogreplication.ScalogReplicationRequest	typeref:typename:bytes
+data_size	client/subscriber.h	/^	size_t data_size = 0; \/\/ How much data is available in this buffer$/;"	m	struct:ConsumedData	typeref:typename:size_t
+default_huge_page_size	client/common.cc	/^unsigned long default_huge_page_size() {$/;"	f	typeref:typename:unsigned long
+default_huge_page_size	disk_manager/disk_manager.cc	/^	unsigned long default_huge_page_size(void){$/;"	f	namespace:Embarcadero	typeref:typename:unsigned long
+deserialize	client/distributed_kv_store.cc	/^LogEntry LogEntry::deserialize(const void* data, size_t client_id, size_t client_order) {  \/\/ /;"	f	class:LogEntry	typeref:typename:LogEntry
+disk_manager_	embarlet/topic_manager.h	/^		DiskManager& disk_manager_;$/;"	m	class:Embarcadero::TopicManager	typeref:typename:DiskManager &
+disk_manager_	network_manager/network_manager.h	/^    DiskManager* disk_manager_ = nullptr;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:DiskManager *
+e2eBandwidthMbps	client/result_writer.h	/^    double e2eBandwidthMbps = 0;$/;"	m	class:ResultWriter	typeref:typename:double
+embarlet	CMakeLists.txt	/^add_executable(embarlet $/;"	t
+epoch	protobuf/scalog_sequencer.proto	/^    int64 epoch = 4;$/;"	f	message:LocalCut	typeref:typename:int64
+epoch_to_order_	cxl_manager/cxl_manager.h	/^		int epoch_to_order_ = 0;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:int
+event_mutex_	client/publisher.h	/^		absl::Mutex event_mutex_;$/;"	m	class:Publisher	typeref:typename:absl::Mutex
+failure_percentage	client/result_writer.h	/^    double failure_percentage;$/;"	m	class:ResultWriter	typeref:typename:double
+fd	client/subscriber.h	/^			int fd; \/\/ Associated FD for cleanup$/;"	m	struct:Subscriber::ThreadInfo	typeref:typename:int
+fd	client/subscriber.h	/^	const int fd; \/\/ The socket FD this corresponds to$/;"	m	struct:ConnectionBuffers	typeref:typename:const int
+fd	disk_manager/disk_manager.h	/^		int fd;$/;"	m	struct:Embarcadero::MemcpyRequest	typeref:typename:int
+fd	disk_manager/disk_manager.h	/^	int fd;$/;"	m	struct:Embarcadero::ReplicationRequest	typeref:typename:int
+fd_	disk_manager/corfu_replication_manager.cc	/^			int fd_ = -1;$/;"	m	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:int	file:
+fd_	disk_manager/scalog_replication_manager.cc	/^		int fd_; \/\/ File descriptor (protected by mutex)$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:int	file:
+fd_	embarlet/embarlet.cc	/^		int fd_;$/;"	m	class:__anonaa92e0c00111::ScopedFD	typeref:typename:int	file:
+file_state_mutex_	disk_manager/corfu_replication_manager.cc	/^			std::shared_mutex file_state_mutex_; \/\/ Use shared mutex$/;"	m	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:std::shared_mutex	file:
+file_state_mutex_	disk_manager/scalog_replication_manager.cc	/^		std::shared_mutex file_state_mutex_; \/\/ Mutex for fd_ state and file ops$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::shared_mutex	file:
+first_batch_headers_addr_	embarlet/topic.h	/^		void* first_batch_headers_addr_;$/;"	m	class:Embarcadero::Topic	typeref:typename:void *
+first_message_addr_	embarlet/topic.h	/^		void* first_message_addr_;$/;"	m	class:Embarcadero::Topic	typeref:typename:void *
+follower_	embarlet/heartbeat.h	/^		std::unique_ptr<FollowerNodeClient> follower_;$/;"	m	class:heartbeat_system::HeartBeatManager	typeref:typename:std::unique_ptr<FollowerNodeClient>
+fsync_cv_mutex_	disk_manager/corfu_replication_manager.cc	/^			std::mutex fsync_cv_mutex_; \/\/ Mutex needed for condition variable wait$/;"	m	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:std::mutex	file:
+fsync_cv_mutex_	disk_manager/scalog_replication_manager.cc	/^		std::mutex fsync_cv_mutex_; \/\/ Mutex for fsync condition variable$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::mutex	file:
+fsync_thread_	disk_manager/corfu_replication_manager.cc	/^			std::thread fsync_thread_;$/;"	m	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:std::thread	file:
+fsync_thread_	disk_manager/scalog_replication_manager.cc	/^		std::thread fsync_thread_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::thread	file:
+gen_	client/kv_test.cc	/^		std::mt19937 gen_;$/;"	m	class:KVStoreBenchmark	typeref:typename:std::mt19937	file:
+generatePlottingScript	client/kv_test.cc	/^		void generatePlottingScript() {$/;"	f	class:KVStoreBenchmark	typeref:typename:void	file:
+generateRandomString	client/kv_test.cc	/^		std::string generateRandomString(size_t length) {$/;"	f	class:KVStoreBenchmark	typeref:typename:std::string	file:
+generateTestData	client/kv_test.cc	/^		void generateTestData() {$/;"	f	class:KVStoreBenchmark	typeref:typename:void	file:
+get	client/distributed_kv_store.cc	/^std::string DistributedKVStore::get(const std::string& key) {$/;"	f	class:DistributedKVStore	typeref:typename:std::string
+get	client/distributed_kv_store.h	/^		std::string get(const std::string& key) const {$/;"	f	class:ShardedKVStore	typeref:typename:std::string
+get	embarlet/embarlet.cc	/^		int get() const { return fd_; }$/;"	f	class:__anonaa92e0c00111::ScopedFD	typeref:typename:int	file:
+getLocalCut	disk_manager/scalog_replication_manager.cc	/^				int64_t getLocalCut() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl::LocalCutTracker	typeref:typename:int64_t	file:
+getSequentiallyWrittenOffset	disk_manager/scalog_replication_manager.cc	/^				int64_t getSequentiallyWrittenOffset() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl::LocalCutTracker	typeref:typename:int64_t	file:
+getShardIndex	client/distributed_kv_store.h	/^		inline size_t getShardIndex(const std::string& key) const {$/;"	f	class:ShardedKVStore	typeref:typename:size_t
+get_new_segment_callback_	embarlet/topic.h	/^		const GetNewSegmentCallback get_new_segment_callback_;$/;"	m	class:Embarcadero::Topic	typeref:typename:const GetNewSegmentCallback
+get_num_brokers_callback_	embarlet/topic.h	/^		const GetNumBrokersCallback get_num_brokers_callback_;$/;"	m	class:Embarcadero::Topic	typeref:typename:const GetNumBrokersCallback
+get_num_brokers_callback_	embarlet/topic_manager.h	/^		GetNumBrokersCallback get_num_brokers_callback_;$/;"	m	class:Embarcadero::TopicManager	typeref:typename:GetNumBrokersCallback
+get_num_brokers_callback_	network_manager/network_manager.h	/^		Embarcadero::GetNumBrokersCallback get_num_brokers_callback_;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:Embarcadero::GetNumBrokersCallback
+get_registered_brokers_callback_	cxl_manager/cxl_manager.h	/^		GetRegisteredBrokersCallback get_registered_brokers_callback_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:GetRegisteredBrokersCallback
+get_registered_brokers_callback_	embarlet/topic.h	/^		const GetRegisteredBrokersCallback get_registered_brokers_callback_;$/;"	m	class:Embarcadero::Topic	typeref:typename:const GetRegisteredBrokersCallback
+get_registered_brokers_callback_	embarlet/topic_manager.h	/^		GetRegisteredBrokersCallback get_registered_brokers_callback_;$/;"	m	class:Embarcadero::TopicManager	typeref:typename:GetRegisteredBrokersCallback
+get_write_location	client/subscriber.h	/^	std::pair<void*, size_t> get_write_location() {$/;"	f	struct:ConnectionBuffers	typeref:typename:std::pair<void *,size_t>
+global_cut	protobuf/scalog_sequencer.proto	/^    map<int64, int64> global_cut = 1;$/;"	f	message:GlobalCut	typeref:typename:map<int64,int64>
+global_cut_	cxl_manager/cxl_manager.h	/^		absl::flat_hash_map<int, absl::btree_map<int, int>> global_cut_;$/;"	m	class:Embarcadero::ScalogLocalSequencer	typeref:typename:absl::flat_hash_map<int,absl::btree_map<int,int>>
+global_cut_	cxl_manager/scalog_local_sequencer.h	/^		absl::btree_map<int, int> global_cut_;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:absl::btree_map<int,int>
+global_cut_mu_	cxl_manager/scalog_global_sequencer.h	/^		absl::Mutex global_cut_mu_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:absl::Mutex
+global_cut_thread_	cxl_manager/scalog_global_sequencer.h	/^		std::thread global_cut_thread_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:std::thread
+global_epoch_	cxl_manager/scalog_global_sequencer.h	/^		int global_epoch_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:int
+global_seq_	cxl_manager/cxl_manager.h	/^		size_t global_seq_ = 0;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:size_t
+global_seq_	embarlet/topic.h	/^		size_t global_seq_ = 0;$/;"	m	class:Embarcadero::Topic	typeref:typename:size_t
+global_seq_batch_seq_mu_	cxl_manager/cxl_manager.h	/^		absl::Mutex global_seq_batch_seq_mu_;;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:absl::Mutex
+global_seq_batch_seq_mu_	embarlet/topic.h	/^		absl::Mutex global_seq_batch_seq_mu_;;$/;"	m	class:Embarcadero::Topic	typeref:typename:absl::Mutex
+grpc	disk_manager/corfu_replication_client.h	/^namespace grpc {$/;"	n
+grpc	disk_manager/corfu_replication_manager.h	/^namespace grpc {$/;"	n
+grpc	disk_manager/scalog_replication_client.h	/^namespace grpc {$/;"	n
+grpc	disk_manager/scalog_replication_manager.h	/^namespace grpc {$/;"	n
+hash	client/distributed_kv_store.h	/^		struct hash<OperationId> {$/;"	s	namespace:std
+hashTopic	cxl_manager/cxl_manager.cc	/^inline int hashTopic(const char topic[TOPIC_NAME_SIZE]) {$/;"	f	namespace:Embarcadero	typeref:typename:int
+head_addr_	client/publisher.h	/^		std::string head_addr_;$/;"	m	class:Publisher	typeref:typename:std::string
+head_addr_	client/subscriber.h	/^		std::string head_addr_;$/;"	m	class:Subscriber	typeref:typename:std::string
+head_alive_	embarlet/heartbeat.h	/^		std::atomic<bool> head_alive_{true};$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::atomic<bool>
+head_ip_	cxl_manager/cxl_manager.h	/^		std::string head_ip_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:std::string
+header_	client/buffer.h	/^    Embarcadero::MessageHeader header_;$/;"	m	class:Buffer	typeref:typename:Embarcadero::MessageHeader
+heartbeat_grpc_hdrs	cmake/heartbeat_grpc.cmake	/^set(heartbeat_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/heartbeat.grpc.pb.h")$/;"	v
+heartbeat_grpc_proto	cmake/heartbeat_grpc.cmake	/^add_library(heartbeat_grpc_proto$/;"	t
+heartbeat_grpc_srcs	cmake/heartbeat_grpc.cmake	/^set(heartbeat_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}\/heartbeat.grpc.pb.cc")$/;"	v
+heartbeat_proto_hdrs	cmake/heartbeat_grpc.cmake	/^set(heartbeat_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/heartbeat.pb.h")$/;"	v
+heartbeat_proto_srcs	cmake/heartbeat_grpc.cmake	/^set(heartbeat_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}\/heartbeat.pb.cc")$/;"	v
+heartbeat_system	embarlet/heartbeat.cc	/^namespace heartbeat_system {$/;"	n	file:
+heartbeat_system	embarlet/heartbeat.h	/^namespace heartbeat_system {$/;"	n
+heartbeat_system	protobuf/heartbeat.proto	/^package heartbeat_system;$/;"	p
+heartbeat_thread_	embarlet/heartbeat.h	/^		std::thread heartbeat_thread_;$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::thread
+heartbeat_thread_	embarlet/heartbeat.h	/^		std::thread heartbeat_thread_;$/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:std::thread
+i_	client/buffer.h	/^    size_t i_ = 0;$/;"	m	class:Buffer	typeref:typename:size_t
+idx_per_broker_	cxl_manager/corfu_global_sequencer.cc	/^    absl::flat_hash_map<size_t, size_t> idx_per_broker_;        \/\/ Tracks log index per broker$/;"	m	class:CorfuSequencerImpl	typeref:typename:absl::flat_hash_map<size_t,size_t>	file:
+initialized	network_manager/network_manager.h	/^    bool initialized = false;$/;"	m	struct:Embarcadero::SubscriberState	typeref:typename:bool
+isValid	embarlet/embarlet.cc	/^		bool isValid() const { return fd_ >= 0; }$/;"	f	class:__anonaa92e0c00111::ScopedFD	typeref:typename:bool	file:
+is_connected_	disk_manager/corfu_replication_client.h	/^    std::atomic<bool> is_connected_{false};$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::atomic<bool>
+is_connected_	disk_manager/scalog_replication_client.h	/^    std::atomic<bool> is_connected_{false};$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::atomic<bool>
+is_head_node_	embarlet/heartbeat.h	/^		bool is_head_node_;$/;"	m	class:heartbeat_system::HeartBeatManager	typeref:typename:bool
+j_	client/buffer.h	/^    size_t j_ = 0;$/;"	m	class:Buffer	typeref:typename:size_t
+kafka_logical_offset_	embarlet/topic.h	/^		std::atomic<size_t> kafka_logical_offset_{0};$/;"	m	class:Embarcadero::Topic	typeref:typename:std::atomic<size_t>
+key	client/distributed_kv_store.h	/^	std::string key;$/;"	m	struct:KeyValue	typeref:typename:std::string
+kill_brokers_	client/publisher.h	/^		bool kill_brokers_ = false;$/;"	m	class:Publisher	typeref:typename:bool
+kill_brokers_thread_	client/publisher.h	/^		std::thread kill_brokers_thread_;$/;"	m	class:Publisher	typeref:typename:std::thread
+kvPairs	client/distributed_kv_store.h	/^	std::vector<KeyValue> kvPairs;  \/\/ Multiple pairs for multi-operations$/;"	m	struct:LogEntry	typeref:typename:std::vector<KeyValue>
+kv_store_	client/distributed_kv_store.h	/^		ShardedKVStore kv_store_;$/;"	m	class:DistributedKVStore	typeref:typename:ShardedKVStore
+kv_store_	client/kv_test.cc	/^		DistributedKVStore& kv_store_;$/;"	m	class:KVStoreBenchmark	typeref:typename:DistributedKVStore &	file:
+kv_test	CMakeLists.txt	/^add_executable(kv_test$/;"	t
+large_msg_queue_	network_manager/network_manager.h	/^    folly::MPMCQueue<struct LargeMsgRequest> large_msg_queue_;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:folly::MPMCQueue<struct LargeMsgRequest>
+last_addr	network_manager/network_manager.h	/^    void* last_addr; \/\/ Subscribe: address of last fetched message$/;"	m	struct:Embarcadero::EmbarcaderoReq	typeref:typename:void *
+last_addr	network_manager/network_manager.h	/^    void* last_addr;$/;"	m	struct:Embarcadero::SubscriberState	typeref:typename:void *
+last_applied_total_order_	client/distributed_kv_store.h	/^		std::atomic<uint64_t> last_applied_total_order_;$/;"	m	class:DistributedKVStore	typeref:typename:std::atomic<uint64_t>
+last_heartbeat	embarlet/heartbeat.h	/^			std::chrono::steady_clock::time_point last_heartbeat;$/;"	m	struct:heartbeat_system::HeartBeatServiceImpl::NodeEntry	typeref:typename:std::chrono::steady_clock::time_point
+last_log_time_	client/test_utils.cc	/^		std::chrono::high_resolution_clock::time_point last_log_time_;$/;"	m	class:ProgressTracker	typeref:typename:std::chrono::high_resolution_clock::time_point	file:
+last_message_header_	embarlet/topic.h	/^		struct MessageHeader* last_message_header_;$/;"	m	class:Embarcadero::Topic	typeref:struct:MessageHeader *
+last_offset	network_manager/network_manager.h	/^    size_t last_offset;$/;"	m	struct:Embarcadero::SubscriberState	typeref:typename:size_t
+last_request_id_	client/distributed_kv_store.h	/^		std::atomic<uint64_t> last_request_id_;$/;"	m	class:DistributedKVStore	typeref:typename:std::atomic<uint64_t>
+last_sequentially_replicated_	disk_manager/corfu_replication_client.h	/^		std::atomic<size_t> last_sequentially_replicated_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::atomic<size_t>
+last_transaction_id_	client/distributed_kv_store.h	/^		std::atomic<uint64_t> last_transaction_id_;$/;"	m	class:DistributedKVStore	typeref:typename:std::atomic<uint64_t>
+len	client/buffer.h	/^        size_t len;$/;"	m	struct:Buffer::Buf	typeref:typename:size_t
+len	disk_manager/disk_manager.h	/^    size_t len;$/;"	m	struct:Embarcadero::MemcpyRequest	typeref:typename:size_t
+len	network_manager/network_manager.h	/^    size_t len;$/;"	m	struct:Embarcadero::LargeMsgRequest	typeref:typename:size_t
+local_cut	protobuf/scalog_sequencer.proto	/^    int64 local_cut = 1;$/;"	f	message:LocalCut	typeref:typename:int64
+local_cut_	disk_manager/scalog_replication_manager.cc	/^				int64_t local_cut_; \/\/ Number of messages written contiguously from start?$/;"	m	class:Scalog::ScalogReplicationServiceImpl::LocalCutTracker	typeref:typename:int64_t	file:
+local_cut_interval_	cxl_manager/cxl_manager.h	/^		std::chrono::microseconds local_cut_interval_ = std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT/;"	m	class:Embarcadero::ScalogLocalSequencer	typeref:typename:std::chrono::microseconds
+local_cut_interval_	disk_manager/scalog_replication_manager.cc	/^		std::chrono::microseconds local_cut_interval_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::chrono::microseconds	file:
+local_cut_tracker_	disk_manager/scalog_replication_manager.cc	/^		std::unique_ptr<LocalCutTracker> local_cut_tracker_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::unique_ptr<LocalCutTracker>	file:
+local_epoch_	cxl_manager/cxl_manager.h	/^		int local_epoch_ = 0;$/;"	m	class:Embarcadero::ScalogLocalSequencer	typeref:typename:int
+local_epoch_	cxl_manager/scalog_local_sequencer.h	/^		int local_epoch_ = 0;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:int
+local_epoch_	disk_manager/scalog_replication_manager.cc	/^		std::atomic<int64_t> local_epoch_; \/\/ Use atomic for potential reads outside SendLocalCut? O/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::atomic<int64_t>	file:
+logConsumer	client/distributed_kv_store.cc	/^void DistributedKVStore::logConsumer(int fd, std::shared_ptr<ConnectionBuffers> conn_buffers) {$/;"	f	class:DistributedKVStore	typeref:typename:void
+log_addr_	embarlet/topic.h	/^		std::atomic<unsigned long long int> log_addr_;$/;"	m	class:Embarcadero::Topic	typeref:typename:std::atomic<unsigned long long int>
+log_consumer_threads_	client/distributed_kv_store.h	/^		std::vector<std::thread> log_consumer_threads_;$/;"	m	class:DistributedKVStore	typeref:typename:std::vector<std::thread>
+log_idx	cxl_manager/cxl_datastructure.h	/^	size_t log_idx;	\/\/ Sequencer4: relative log offset to the payload of the batch and elative of/;"	m	struct:Embarcadero::BatchHeader	typeref:typename:size_t
+log_idx	protobuf/corfu_sequencer.proto	/^	uint64 log_idx = 2;$/;"	f	message:corfusequencer.TotalOrderResponse	typeref:typename:uint64
+log_interval_	client/test_utils.cc	/^		size_t log_interval_;$/;"	m	class:ProgressTracker	typeref:typename:size_t	file:
+log_offset	cxl_manager/cxl_datastructure.h	/^		volatile size_t log_offset;$/;"	m	struct:Embarcadero::offset_entry::__anon46dc1a7c0108	typeref:typename:volatile size_t
+log_to_memory_	disk_manager/disk_manager.h	/^		bool log_to_memory_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:bool
+logical_offset	cxl_manager/cxl_datastructure.h	/^	size_t logical_offset;$/;"	m	struct:Embarcadero::MessageHeader	typeref:typename:size_t
+logical_offset_	embarlet/topic.h	/^		size_t logical_offset_;$/;"	m	class:Embarcadero::Topic	typeref:typename:size_t
+main	client/kv_test.cc	/^int main(int argc, char* argv[]) {$/;"	f	typeref:typename:int
+main	client/main.cc	/^int main(int argc, char* argv[]) {$/;"	f	typeref:typename:int
+main	cxl_manager/corfu_global_sequencer.cc	/^int main(int argc, char** argv) {$/;"	f	typeref:typename:int
+main	cxl_manager/scalog_global_sequencer.cc	/^int main(int argc, char* argv[]){$/;"	f	typeref:typename:int
+main	embarlet/embarlet.cc	/^int main(int argc, char* argv[]) {$/;"	f	typeref:typename:int
+measure_latency_	client/subscriber.h	/^		bool measure_latency_;$/;"	m	class:Subscriber	typeref:typename:bool
+measure_real_time_throughput_	client/publisher.h	/^		bool measure_real_time_throughput_ = false;$/;"	m	class:Publisher	typeref:typename:bool
+memcpy_nt	disk_manager/disk_manager.cc	/^	void memcpy_nt(void* dst, const void* src, size_t size) {$/;"	f	namespace:Embarcadero	typeref:typename:void
+message	protobuf/heartbeat.proto	/^	string message = 3;$/;"	f	message:heartbeat_system.RegistrationStatus	typeref:typename:string
+message_size	client/result_writer.h	/^    size_t message_size;$/;"	m	class:ResultWriter	typeref:typename:size_t
+message_size_	client/publisher.h	/^		size_t message_size_;$/;"	m	class:Publisher	typeref:typename:size_t
+mmap_large_buffer	client/common.cc	/^void* mmap_large_buffer(size_t need, size_t& allocated) {$/;"	f	typeref:typename:void *
+mmap_large_buffer	disk_manager/disk_manager.cc	/^	void *mmap_large_buffer(size_t need, size_t &allocated){$/;"	f	namespace:Embarcadero	typeref:typename:void *
+msg	network_manager/network_manager.h	/^    void* msg;$/;"	m	struct:Embarcadero::LargeMsgRequest	typeref:typename:void *
+msgIdx	client/common.h	/^    explicit msgIdx(int b) : broker_id(b) {}$/;"	f	struct:msgIdx
+msgIdx	client/common.h	/^struct msgIdx {$/;"	s
+mu	network_manager/network_manager.h	/^    absl::Mutex mu;$/;"	m	struct:Embarcadero::SubscriberState	typeref:typename:absl::Mutex
+multiGet	client/distributed_kv_store.cc	/^std::vector<std::pair<std::string, std::string>> DistributedKVStore::multiGet($/;"	f	class:DistributedKVStore	typeref:typename:std::vector<std::pair<std::string,std::string>>
+multiGet	client/distributed_kv_store.h	/^		std::vector<std::pair<std::string, std::string>> multiGet(const std::vector<std::string>& keys/;"	f	class:ShardedKVStore	typeref:typename:std::vector<std::pair<std::string,std::string>>
+multiPut	client/distributed_kv_store.cc	/^size_t DistributedKVStore::multiPut(const std::vector<KeyValue>& kvPairs) {$/;"	f	class:DistributedKVStore	typeref:typename:size_t
+multiPut	client/distributed_kv_store.h	/^		void multiPut(const std::vector<std::pair<std::string, std::string>>& keyValues) {$/;"	f	class:ShardedKVStore	typeref:typename:void
+mutex	client/distributed_kv_store.h	/^			mutable std::shared_mutex mutex;$/;"	m	struct:ShardedKVStore::Shard	typeref:typename:std::shared_mutex
+mutex_	client/kv_test.cc	/^		absl::Mutex mutex_;$/;"	m	class:KVStoreBenchmark	typeref:typename:absl::Mutex	file:
+mutex_	client/publisher.h	/^		absl::Mutex mutex_;$/;"	m	class:Publisher	typeref:typename:absl::Mutex
+mutex_	cxl_manager/corfu_global_sequencer.cc	/^    std::mutex mutex_;$/;"	m	class:CorfuSequencerImpl	typeref:typename:std::mutex	file:
+mutex_	cxl_manager/scalog_global_sequencer.h	/^		std::mutex mutex_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:std::mutex
+mutex_	disk_manager/corfu_replication_client.h	/^    mutable std::mutex mutex_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::mutex
+mutex_	disk_manager/scalog_replication_client.h	/^    mutable std::mutex mutex_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::mutex
+mutex_	disk_manager/scalog_replication_manager.cc	/^				absl::Mutex mutex_; \/\/ Mutex specific to this tracker$/;"	m	class:Scalog::ScalogReplicationServiceImpl::LocalCutTracker	typeref:typename:absl::Mutex	file:
+mutex_	embarlet/heartbeat.h	/^		absl::Mutex mutex_;$/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:absl::Mutex
+mutex_	embarlet/topic.h	/^		absl::Mutex mutex_;$/;"	m	class:Embarcadero::Topic	typeref:typename:absl::Mutex
+mutex_	embarlet/topic_manager.h	/^		absl::Mutex mutex_;$/;"	m	class:Embarcadero::TopicManager	typeref:typename:absl::Mutex
+network_manager_	cxl_manager/cxl_manager.h	/^		NetworkManager *network_manager_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:NetworkManager *
+network_mgr_addr	embarlet/heartbeat.h	/^			std::string network_mgr_addr;$/;"	m	struct:heartbeat_system::FollowerNodeClient::NodeEntry	typeref:typename:std::string
+network_mgr_addr	embarlet/heartbeat.h	/^			std::string network_mgr_addr;$/;"	m	struct:heartbeat_system::HeartBeatServiceImpl::NodeEntry	typeref:typename:std::string
+network_mgr_addr	protobuf/heartbeat.proto	/^  string network_mgr_addr = 3;$/;"	f	message:heartbeat_system.BrokerInfo	typeref:typename:string
+new_nodes	protobuf/heartbeat.proto	/^	repeated string new_nodes = 1;$/;"	f	message:heartbeat_system.ClusterStatus	typeref:typename:string
+next_expected_batch_seq_	cxl_manager/cxl_manager.h	/^		absl::flat_hash_map<size_t, size_t> next_expected_batch_seq_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:absl::flat_hash_map<size_t,size_t>
+next_expected_batch_seq_	embarlet/topic.h	/^		absl::flat_hash_map<size_t, size_t> next_expected_batch_seq_;\/\/ client_id -> next expected b/;"	m	class:Embarcadero::Topic	typeref:typename:absl::flat_hash_map<size_t,size_t>
+next_global_sequence_number_	disk_manager/scalog_replication_manager.cc	/^		std::atomic<size_t> next_global_sequence_number_{0}; \/\/ Start at 0$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::atomic<size_t>	file:
+next_msg_diff	cxl_manager/cxl_datastructure.h	/^	volatile unsigned long long int next_msg_diff; \/\/ Relative to message_header, not cxl_addr_$/;"	m	struct:Embarcadero::MessageHeader	typeref:typename:volatile unsigned long long int
+next_order_	cxl_manager/corfu_global_sequencer.cc	/^    size_t next_order_ = 0; \/\/ The next global order value$/;"	m	class:CorfuSequencerImpl	typeref:typename:size_t	file:
+next_sequencing_disk_offset_	disk_manager/scalog_replication_manager.cc	/^		std::atomic<off_t> next_sequencing_disk_offset_{0}; \/\/ Start at 0$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::atomic<off_t>	file:
+node_id	protobuf/heartbeat.proto	/^	string node_id = 1;$/;"	f	message:heartbeat_system.HeartbeatRequest	typeref:typename:string
+node_id	protobuf/heartbeat.proto	/^	string node_id = 1;$/;"	f	message:heartbeat_system.NodeInfo	typeref:typename:string
+node_id_	embarlet/heartbeat.h	/^		std::string node_id_;$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::string
+node_mutex_	client/subscriber.h	/^		absl::Mutex node_mutex_;$/;"	m	class:Subscriber	typeref:typename:absl::Mutex
+nodes_	client/publisher.h	/^		absl::flat_hash_map<int, std::string> nodes_;$/;"	m	class:Publisher	typeref:typename:absl::flat_hash_map<int,std::string>
+nodes_	embarlet/heartbeat.h	/^		absl::flat_hash_map<std::string, NodeEntry> nodes_;$/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:absl::flat_hash_map<std::string,NodeEntry>
+nodes_info	protobuf/heartbeat.proto	/^	repeated int32 nodes_info = 1;$/;"	f	message:heartbeat_system.ClientInfo	typeref:typename:int32
+nt_memcpy	embarlet/topic_manager.cc	/^void nt_memcpy(void* __restrict dst, const void* __restrict src, size_t size) {$/;"	f	namespace:Embarcadero	typeref:typename:void
+num_active_threads_	disk_manager/disk_manager.h	/^		std::atomic<size_t> num_active_threads_{0};$/;"	m	class:Embarcadero::DiskManager	typeref:typename:std::atomic<size_t>
+num_brokers	protobuf/heartbeat.proto	/^	int64 num_brokers = 1;$/;"	f	message:heartbeat_system.KillBrokersRequest	typeref:typename:int64
+num_brokers_to_kill	client/result_writer.h	/^    int num_brokers_to_kill;$/;"	m	class:ResultWriter	typeref:typename:int
+num_buf_	client/buffer.h	/^    std::atomic<size_t> num_buf_{0};$/;"	m	class:Buffer	typeref:typename:std::atomic<size_t>
+num_clients	client/result_writer.h	/^    int num_clients;$/;"	m	class:ResultWriter	typeref:typename:int
+num_io_threads_	disk_manager/disk_manager.h	/^		std::atomic<size_t> num_io_threads_{0};$/;"	m	class:Embarcadero::DiskManager	typeref:typename:std::atomic<size_t>
+num_keys_	client/kv_test.cc	/^		size_t num_keys_;$/;"	m	class:KVStoreBenchmark	typeref:typename:size_t	file:
+num_msg	client/buffer.h	/^        size_t num_msg;$/;"	m	struct:Buffer::Buf	typeref:typename:size_t
+num_msg	cxl_manager/corfu_global_sequencer.cc	/^			size_t num_msg;$/;"	m	struct:CorfuSequencerImpl::PendingRequest	typeref:typename:size_t	file:
+num_msg	cxl_manager/cxl_datastructure.h	/^	size_t num_msg;$/;"	m	struct:Embarcadero::BatchHeader	typeref:typename:size_t
+num_msg	disk_manager/scalog_replication_manager.cc	/^			int64_t num_msg;$/;"	m	struct:Scalog::ScalogReplicationServiceImpl::WriteTask	typeref:typename:int64_t	file:
+num_msg	network_manager/network_manager.h	/^    size_t num_msg;  \/\/ At Subscribe: used as last offset (set to -2 as sentinel value)$/;"	m	struct:Embarcadero::EmbarcaderoReq	typeref:typename:size_t
+num_msg	protobuf/corfu_sequencer.proto	/^  uint64 num_msg = 3;$/;"	f	message:corfusequencer.TotalOrderRequest	typeref:typename:uint64
+num_msg	protobuf/scalog_replication.proto	/^  int64 num_msg = 3;$/;"	f	message:scalogreplication.ScalogReplicationRequest	typeref:typename:int64
+num_replicas_per_broker_	cxl_manager/scalog_global_sequencer.h	/^		int num_replicas_per_broker_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:int
+num_reqReceive_threads_	network_manager/network_manager.h	/^    int num_reqReceive_threads_;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:int
+num_threads_	client/publisher.h	/^		std::atomic<int> num_threads_{0};$/;"	m	class:Publisher	typeref:typename:std::atomic<int>
+num_threads_per_broker	client/result_writer.h	/^    size_t num_threads_per_broker;$/;"	m	class:ResultWriter	typeref:typename:size_t
+num_threads_per_broker_	client/buffer.h	/^    size_t num_threads_per_broker_;$/;"	m	class:Buffer	typeref:typename:size_t
+num_threads_per_broker_	client/publisher.h	/^		size_t num_threads_per_broker_;$/;"	m	class:Publisher	typeref:typename:size_t
+num_topics_	embarlet/topic_manager.h	/^		size_t num_topics_;$/;"	m	class:Embarcadero::TopicManager	typeref:typename:size_t
+offset	client/common.h	/^    size_t offset = 0;$/;"	m	struct:msgIdx	typeref:typename:size_t
+offset	disk_manager/disk_manager.h	/^		size_t offset;$/;"	m	struct:Embarcadero::MemcpyRequest	typeref:typename:size_t
+offset	disk_manager/scalog_replication_manager.cc	/^			int64_t offset;$/;"	m	struct:Scalog::ScalogReplicationServiceImpl::WriteTask	typeref:typename:int64_t	file:
+offset	protobuf/corfu_replication.proto	/^  int64 offset = 1;$/;"	f	message:corfureplication.CorfuReplicationRequest	typeref:typename:int64
+offset	protobuf/scalog_replication.proto	/^  int64 offset = 1;$/;"	f	message:scalogreplication.ScalogReplicationRequest	typeref:typename:int64
+offset_	disk_manager/disk_manager.h	/^		std::atomic<int> offset_{0};$/;"	m	class:Embarcadero::DiskManager	typeref:typename:std::atomic<int>
+offset_entry	cxl_manager/cxl_datastructure.h	/^struct alignas(64) offset_entry {$/;"	s	namespace:Embarcadero
+offset_mu_	cxl_manager/cxl_manager.h	/^				absl::Mutex offset_mu_;$/;"	m	class:Embarcadero::CXLManager::SequentialOrderTracker	typeref:typename:absl::Mutex
+offsets	cxl_manager/cxl_datastructure.h	/^	volatile offset_entry offsets[NUM_MAX_BROKERS];$/;"	m	struct:Embarcadero::TInode	typeref:typename:volatile offset_entry[]
+opFinished	client/distributed_kv_store.h	/^		bool opFinished(OPID opId){$/;"	f	class:DistributedKVStore	typeref:typename:bool
+opId	client/distributed_kv_store.h	/^	OperationId opId; \/\/ This is already in message header.$/;"	m	struct:LogEntry	typeref:typename:OperationId
+operations_completed_	client/kv_test.cc	/^		std::atomic<size_t> operations_completed_{0};$/;"	m	class:KVStoreBenchmark	typeref:typename:std::atomic<size_t>	file:
+operator ()	client/distributed_kv_store.cc	/^size_t std::hash<OperationId>::operator()(const OperationId& id) const {$/;"	f	class:std::hash	typeref:typename:size_t
+operator ()	cxl_manager/corfu_global_sequencer.cc	/^			bool operator()(const std::unique_ptr<PendingRequest>& a,$/;"	f	struct:CorfuSequencerImpl::ComparePendingRequestPtr	typeref:typename:bool	file:
+operator <	cxl_manager/corfu_global_sequencer.cc	/^			bool operator<(const PendingRequest& other) const {$/;"	f	struct:CorfuSequencerImpl::PendingRequest	typeref:typename:bool	file:
+operator =	client/subscriber.h	/^			ThreadInfo& operator=(ThreadInfo&& other) noexcept {$/;"	f	struct:Subscriber::ThreadInfo	typeref:typename:ThreadInfo &
+operator ==	client/distributed_kv_store.cc	/^bool OperationId::operator==(const OperationId& other) const {$/;"	f	class:OperationId	typeref:typename:bool
+operator bool	client/subscriber.h	/^	explicit operator bool() const {$/;"	f	struct:ConsumedData
+order	client/result_writer.h	/^    int order;$/;"	m	class:ResultWriter	typeref:typename:int
+order	cxl_manager/cxl_datastructure.h	/^		volatile int order;$/;"	m	struct:Embarcadero::TInode::__anon46dc1a7c0308	typeref:typename:volatile int
+order	protobuf/heartbeat.proto	/^	int32 order = 3;$/;"	f	message:heartbeat_system.CreateTopicRequest	typeref:typename:int32
+order_	client/buffer.h	/^    int order_;$/;"	m	class:Buffer	typeref:typename:int
+order_	embarlet/topic.h	/^		int order_;$/;"	m	class:Embarcadero::Topic	typeref:typename:int
+ordered	cxl_manager/cxl_datastructure.h	/^		volatile int ordered;$/;"	m	struct:Embarcadero::offset_entry::__anon46dc1a7c0208	typeref:typename:volatile int
+ordered	cxl_manager/cxl_datastructure.h	/^	uint32_t ordered;$/;"	m	struct:Embarcadero::BatchHeader	typeref:typename:uint32_t
+ordered_offset	cxl_manager/cxl_datastructure.h	/^		volatile size_t ordered_offset; \/\/relative offset to last ordered message header$/;"	m	struct:Embarcadero::offset_entry::__anon46dc1a7c0208	typeref:typename:volatile size_t
+ordered_offset_	embarlet/topic.h	/^		size_t ordered_offset_;$/;"	m	class:Embarcadero::Topic	typeref:typename:size_t
+ordered_offset_addr_	embarlet/topic.h	/^		void* ordered_offset_addr_;$/;"	m	class:Embarcadero::Topic	typeref:typename:void *
+paddedSize	cxl_manager/cxl_datastructure.h	/^	volatile size_t paddedSize; \/\/ This include message+padding+header size$/;"	m	struct:Embarcadero::MessageHeader	typeref:typename:volatile size_t
+parseSequencerType	client/common.cc	/^heartbeat_system::SequencerType parseSequencerType(const std::string& value) {$/;"	f	typeref:typename:heartbeat_system::SequencerType
+pending_ops_mutex_	client/distributed_kv_store.h	/^		absl::Mutex pending_ops_mutex_;$/;"	m	class:DistributedKVStore	typeref:typename:absl::Mutex
+pending_requests_	cxl_manager/corfu_global_sequencer.cc	/^    absl::flat_hash_map<size_t, PriorityQueue> pending_requests_; \/\/ Pending requests per clie/;"	m	class:CorfuSequencerImpl	typeref:typename:absl::flat_hash_map<size_t,PriorityQueue>	file:
+populateStore	client/kv_test.cc	/^		void populateStore() {$/;"	f	class:KVStoreBenchmark	typeref:typename:void	file:
+port	network_manager/network_manager.h	/^    uint32_t port;$/;"	m	struct:Embarcadero::EmbarcaderoReq	typeref:typename:uint32_t
+port_	client/publisher.h	/^		std::string port_;$/;"	m	class:Publisher	typeref:typename:std::string
+port_	client/subscriber.h	/^		std::string port_;$/;"	m	class:Subscriber	typeref:typename:std::string
+prefix_path_	disk_manager/disk_manager.h	/^		fs::path prefix_path_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:fs::path
+processLogEntry	client/distributed_kv_store.cc	/^void DistributedKVStore::processLogEntry(const LogEntry& entry, size_t total_order) {$/;"	f	class:DistributedKVStore	typeref:typename:void
+processLogEntryFromRawBuffer	client/distributed_kv_store.cc	/^void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t size,$/;"	f	class:DistributedKVStore	typeref:typename:void
+promise	cxl_manager/corfu_global_sequencer.cc	/^			std::promise<std::pair<uint64_t, uint64_t>> promise;$/;"	m	struct:CorfuSequencerImpl::PendingRequest	typeref:typename:std::promise<std::pair<uint64_t,uint64_t>>	file:
+pubBandwidthMbps	client/result_writer.h	/^    double pubBandwidthMbps = 0;$/;"	m	class:ResultWriter	typeref:typename:double
+pubQue_	client/publisher.h	/^		Buffer pubQue_;$/;"	m	class:Publisher	typeref:typename:Buffer
+publish_finished_	client/publisher.h	/^		bool publish_finished_{false};$/;"	m	class:Publisher	typeref:typename:bool
+publisher_	client/distributed_kv_store.h	/^		std::unique_ptr<Publisher> publisher_;$/;"	m	class:DistributedKVStore	typeref:typename:std::unique_ptr<Publisher>
+put	client/distributed_kv_store.cc	/^size_t DistributedKVStore::put(const std::string& key, const std::string& value) {$/;"	f	class:DistributedKVStore	typeref:typename:size_t
+put	client/distributed_kv_store.h	/^		void put(const std::string& key, const std::string& value) {$/;"	f	class:ShardedKVStore	typeref:typename:void
+queueSize_	client/publisher.h	/^		size_t queueSize_;$/;"	m	class:Publisher	typeref:typename:size_t
+random_engine_	disk_manager/corfu_replication_client.h	/^    std::mt19937 random_engine_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::mt19937
+random_engine_	disk_manager/scalog_replication_client.h	/^    std::mt19937 random_engine_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::mt19937
+range_mu_	cxl_manager/cxl_manager.h	/^				absl::Mutex range_mu_;$/;"	m	class:Embarcadero::CXLManager::SequentialOrderTracker	typeref:typename:absl::Mutex
+ranges	disk_manager/scalog_replication_manager.cc	/^				std::map<int64_t, std::pair<int64_t, int64_t>> ranges;$/;"	m	class:Scalog::ScalogReplicationServiceImpl::LocalCutTracker	typeref:typename:std::map<int64_t,std::pair<int64_t,int64_t>>	file:
+readSet	client/distributed_kv_store.h	/^	absl::flat_hash_map<std::string, bool> readSet;  \/\/ Keys read$/;"	m	struct:Transaction	typeref:typename:absl::flat_hash_map<std::string,bool>
+read_buffer_in_use_by_consumer	client/subscriber.h	/^	std::atomic<bool> read_buffer_in_use_by_consumer{false};  \/\/ Flag set by consumer when it acq/;"	m	struct:ConnectionBuffers	typeref:typename:std::atomic<bool>
+reader_head	client/buffer.h	/^        size_t reader_head;$/;"	m	struct:Buffer::Buf	typeref:typename:size_t
+ready_batches_queue_	cxl_manager/cxl_manager.h	/^		folly::MPMCQueue<BatchHeader*> ready_batches_queue_{1024*8};$/;"	m	class:Embarcadero::CXLManager	typeref:typename:folly::MPMCQueue<BatchHeader * >
+real_time_throughput_measure_thread_	client/publisher.h	/^		std::thread real_time_throughput_measure_thread_;$/;"	m	class:Publisher	typeref:typename:std::thread
+receive_time	client/subscriber.h	/^	std::chrono::steady_clock::time_point receive_time; \/\/ Captured on receive$/;"	m	struct:TimestampPair	typeref:typename:std::chrono::steady_clock::time_point
+receiver_can_write_cv	client/subscriber.h	/^	absl::CondVar receiver_can_write_cv; \/\/ Notifies receiver the *other* buffer is free$/;"	m	struct:ConnectionBuffers	typeref:typename:absl::CondVar
+reconnect_mutex_	disk_manager/corfu_replication_client.h	/^    std::mutex reconnect_mutex_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::mutex
+reconnect_mutex_	disk_manager/scalog_replication_client.h	/^    std::mutex reconnect_mutex_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::mutex
+reconnection_in_progress_	disk_manager/corfu_replication_client.h	/^    std::atomic<bool> reconnection_in_progress_{false};$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::atomic<bool>
+reconnection_in_progress_	disk_manager/scalog_replication_client.h	/^    std::atomic<bool> reconnection_in_progress_{false};$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::atomic<bool>
+recordWrite	disk_manager/scalog_replication_manager.cc	/^				void recordWrite(int64_t offset, int64_t size, int64_t number_of_messages) {$/;"	f	class:Scalog::ScalogReplicationServiceImpl::LocalCutTracker	typeref:typename:void	file:
+record_result_	client/result_writer.h	/^    bool record_result_;$/;"	m	class:ResultWriter	typeref:typename:bool
+registered_brokers_	cxl_manager/scalog_global_sequencer.h	/^		absl::btree_set<int> registered_brokers_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:absl::btree_set<int>
+registered_brokers_mu_	cxl_manager/scalog_global_sequencer.h	/^		absl::Mutex registered_brokers_mu_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:absl::Mutex
+release	client/subscriber.h	/^	void release() {$/;"	f	struct:ConsumedData	typeref:typename:void
+release_read_buffer	client/subscriber.cc	/^void ConnectionBuffers::release_read_buffer(BufferState* acquired_buffer) {$/;"	f	class:ConnectionBuffers	typeref:typename:void
+remove	client/distributed_kv_store.h	/^		bool remove(const std::string& key) {$/;"	f	class:ShardedKVStore	typeref:typename:bool
+removed_nodes	protobuf/heartbeat.proto	/^	repeated int32 removed_nodes = 2;$/;"	f	message:heartbeat_system.ClusterStatus	typeref:typename:int32
+replica_id	protobuf/scalog_sequencer.proto	/^    int64 replica_id = 5;$/;"	f	message:LocalCut	typeref:typename:int64
+replica_id_	cxl_manager/scalog_local_sequencer.h	/^		int replica_id_ = 0;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:int
+replica_id_	disk_manager/scalog_replication_manager.cc	/^		int replica_id_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:int	file:
+replica_tinode	disk_manager/disk_manager.h	/^	TInode* replica_tinode;$/;"	m	struct:Embarcadero::ReplicationRequest	typeref:typename:TInode *
+replica_tinode_	embarlet/topic.h	/^		struct TInode* replica_tinode_;$/;"	m	class:Embarcadero::Topic	typeref:struct:TInode *
+replicate_tinode	client/result_writer.h	/^    bool replicate_tinode;$/;"	m	class:ResultWriter	typeref:typename:bool
+replicate_tinode	cxl_manager/cxl_datastructure.h	/^		volatile bool replicate_tinode = false;$/;"	m	struct:Embarcadero::TInode::__anon46dc1a7c0308	typeref:typename:volatile bool
+replicate_tinode	protobuf/heartbeat.proto	/^	bool replicate_tinode = 2;$/;"	f	message:heartbeat_system.CreateTopicRequest	typeref:typename:bool
+replication_done	cxl_manager/cxl_datastructure.h	/^		volatile int replication_done[NUM_MAX_BROKERS];$/;"	m	struct:Embarcadero::offset_entry::__anon46dc1a7c0108	typeref:typename:volatile int[]
+replication_factor	client/result_writer.h	/^    int replication_factor;$/;"	m	class:ResultWriter	typeref:typename:int
+replication_factor	cxl_manager/cxl_datastructure.h	/^		volatile int32_t replication_factor;$/;"	m	struct:Embarcadero::TInode::__anon46dc1a7c0308	typeref:typename:volatile int32_t
+replication_factor	protobuf/heartbeat.proto	/^	int32 replication_factor = 4;$/;"	f	message:heartbeat_system.CreateTopicRequest	typeref:typename:int32
+replication_factor	protobuf/scalog_sequencer.proto	/^    int64 replication_factor = 2;$/;"	f	message:RegisterBrokerRequest	typeref:typename:int64
+replication_factor_	disk_manager/corfu_replication_client.h	/^		size_t replication_factor_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:size_t
+replication_factor_	disk_manager/scalog_replication_client.h	/^		size_t replication_factor_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:size_t
+replication_factor_	embarlet/topic.h	/^		int replication_factor_;$/;"	m	class:Embarcadero::Topic	typeref:typename:int
+reply	embarlet/heartbeat.h	/^			HeartbeatResponse reply;$/;"	m	struct:heartbeat_system::FollowerNodeClient::AsyncClientCall	typeref:typename:HeartbeatResponse
+requestId	client/distributed_kv_store.h	/^	size_t requestId;\/\/ Use message header's client_order$/;"	m	struct:OperationId	typeref:typename:size_t
+requestQueue_	disk_manager/disk_manager.h	/^		folly::MPMCQueue<std::optional<struct ReplicationRequest>> requestQueue_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:folly::MPMCQueue<std::optional<struct ReplicationRequest>>
+request_queue_	network_manager/network_manager.h	/^    folly::MPMCQueue<std::optional<struct NetworkRequest>> request_queue_;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:folly::MPMCQueue<std::optional<struct NetworkRequest>>
+reset_cv_	cxl_manager/scalog_global_sequencer.h	/^		std::condition_variable reset_cv_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:std::condition_variable
+response_reader	embarlet/heartbeat.h	/^			std::unique_ptr<grpc::ClientAsyncResponseReader<HeartbeatResponse>> response_reader;$/;"	m	struct:heartbeat_system::FollowerNodeClient::AsyncClientCall	typeref:typename:std::unique_ptr<grpc::ClientAsyncResponseReader<HeartbeatResponse>>
+result_path	client/result_writer.h	/^    std::string result_path;$/;"	m	class:ResultWriter	typeref:typename:std::string
+rng_mutex_	disk_manager/corfu_replication_client.h	/^    mutable std::mutex rng_mutex_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::mutex
+rng_mutex_	disk_manager/scalog_replication_client.h	/^    mutable std::mutex rng_mutex_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::mutex
+runMultiGetBenchmark	client/kv_test.cc	/^		void runMultiGetBenchmark(const std::vector<size_t>& batch_sizes, int iterations = 5) {$/;"	f	class:KVStoreBenchmark	typeref:typename:void	file:
+runMultiGetWithLogReadMeasurement	client/kv_test.cc	/^		void runMultiGetWithLogReadMeasurement(const std::vector<size_t>& batch_sizes, int iterations /;"	f	class:KVStoreBenchmark	typeref:typename:void	file:
+runMultiPutBenchmark	client/kv_test.cc	/^		void runMultiPutBenchmark(const std::vector<size_t>& batch_sizes, int iterations = 5) {$/;"	f	class:KVStoreBenchmark	typeref:typename:void	file:
+running_	client/distributed_kv_store.h	/^		std::atomic<bool> running_;$/;"	m	class:DistributedKVStore	typeref:typename:std::atomic<bool>
+running_	disk_manager/corfu_replication_manager.cc	/^			std::atomic<bool> running_;$/;"	m	class:Corfu::CorfuReplicationServiceImpl	typeref:typename:std::atomic<bool>	file:
+running_	disk_manager/scalog_replication_manager.cc	/^		std::atomic<bool> running_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::atomic<bool>	file:
+scalog_global_sequencer	CMakeLists.txt	/^add_executable(scalog_global_sequencer$/;"	t
+scalog_global_sequencer_ip_	cxl_manager/cxl_manager.h	/^		std::string scalog_global_sequencer_ip_ = "192.168.60.172";$/;"	m	class:Embarcadero::CXLManager	typeref:typename:std::string
+scalog_global_sequencer_ip_	cxl_manager/scalog_local_sequencer.h	/^		std::string scalog_global_sequencer_ip_ = SCLAOG_SEQUENCER_IP;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:std::string
+scalog_global_sequencer_ip_	disk_manager/scalog_replication_manager.cc	/^		std::string scalog_global_sequencer_ip_; \/\/ = SCLAOG_SEQUENCER_IP; \/\/ Initialize in constr/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::string	file:
+scalog_local_sequencer_	cxl_manager/cxl_manager.h	/^		std::unique_ptr<ScalogLocalSequencer> scalog_local_sequencer_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:std::unique_ptr<ScalogLocalSequencer>
+scalog_replication_client_	embarlet/topic.h	/^		std::unique_ptr<Scalog::ScalogReplicationClient> scalog_replication_client_;$/;"	m	class:Embarcadero::Topic	typeref:typename:std::unique_ptr<Scalog::ScalogReplicationClient>
+scalog_replication_grpc_hdrs	cmake/scalog_replication_grpc.cmake	/^set(scalog_replication_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/scalog_replication.grpc.pb.h")$/;"	v
+scalog_replication_grpc_proto	cmake/scalog_replication_grpc.cmake	/^add_library(scalog_replication_grpc_proto$/;"	t
+scalog_replication_grpc_srcs	cmake/scalog_replication_grpc.cmake	/^set(scalog_replication_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}\/scalog_replication.grpc.pb.cc")$/;"	v
+scalog_replication_manager_	disk_manager/disk_manager.h	/^		std::unique_ptr<Scalog::ScalogReplicationManager> scalog_replication_manager_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:std::unique_ptr<Scalog::ScalogReplicationManager>
+scalog_replication_proto_hdrs	cmake/scalog_replication_grpc.cmake	/^set(scalog_replication_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/scalog_replication.pb.h")$/;"	v
+scalog_replication_proto_srcs	cmake/scalog_replication_grpc.cmake	/^set(scalog_replication_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}\/scalog_replication.pb.cc")$/;"	v
+scalog_sequencer_grpc_hdrs	cmake/scalog_sequencer_grpc.cmake	/^set(scalog_sequencer_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/scalog_sequencer.grpc.pb.h")$/;"	v
+scalog_sequencer_grpc_proto	cmake/scalog_sequencer_grpc.cmake	/^add_library(scalog_sequencer_grpc_proto$/;"	t
+scalog_sequencer_grpc_srcs	cmake/scalog_sequencer_grpc.cmake	/^set(scalog_sequencer_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}\/scalog_sequencer.grpc.pb.cc")$/;"	v
+scalog_sequencer_proto_hdrs	cmake/scalog_sequencer_grpc.cmake	/^set(scalog_sequencer_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}\/scalog_sequencer.pb.h")$/;"	v
+scalog_sequencer_proto_srcs	cmake/scalog_sequencer_grpc.cmake	/^set(scalog_sequencer_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}\/scalog_sequencer.pb.cc")$/;"	v
+scalog_server_	cxl_manager/scalog_global_sequencer.h	/^		std::unique_ptr<grpc::Server> scalog_server_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:std::unique_ptr<grpc::Server>
+scalogreplication	protobuf/scalog_replication.proto	/^package scalogreplication;$/;"	p
+seal_from_read_	client/buffer.h	/^    bool seal_from_read_{false};$/;"	m	class:Buffer	typeref:typename:bool
+segment_header	cxl_manager/cxl_datastructure.h	/^	void* segment_header;$/;"	m	struct:Embarcadero::MessageHeader	typeref:typename:void *
+segments_	cxl_manager/cxl_manager.h	/^		void* segments_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:void *
+send_local_cut_thread_	disk_manager/scalog_replication_manager.cc	/^		std::thread send_local_cut_thread_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::thread	file:
+send_time_nanos	client/subscriber.h	/^	long long send_time_nanos; \/\/ From message payload$/;"	m	struct:TimestampPair	typeref:typename:long long
+sent_bytes_per_broker_	client/publisher.h	/^		std::vector<std::atomic<size_t>> sent_bytes_per_broker_;$/;"	m	class:Publisher	typeref:typename:std::vector<std::atomic<size_t>>
+seq_type	client/result_writer.h	/^    std::string seq_type;$/;"	m	class:ResultWriter	typeref:typename:std::string
+seq_type	cxl_manager/cxl_datastructure.h	/^		SequencerType seq_type;$/;"	m	struct:Embarcadero::TInode::__anon46dc1a7c0308	typeref:typename:SequencerType
+seq_type_	client/publisher.h	/^		SequencerType seq_type_;$/;"	m	class:Publisher	typeref:typename:SequencerType
+seq_type_	embarlet/topic.h	/^		heartbeat_system::SequencerType seq_type_;$/;"	m	class:Embarcadero::Topic	typeref:typename:heartbeat_system::SequencerType
+sequencer4_threads_	cxl_manager/cxl_manager.h	/^		std::vector<std::thread> sequencer4_threads_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:std::vector<std::thread>
+sequencerThread_	embarlet/topic.h	/^		std::thread sequencerThread_;$/;"	m	class:Embarcadero::Topic	typeref:typename:std::thread
+sequencerThreads_	cxl_manager/cxl_manager.h	/^		std::vector<std::thread> sequencerThreads_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:std::vector<std::thread>
+sequencerType_	disk_manager/disk_manager.h	/^		heartbeat_system::SequencerType sequencerType_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:heartbeat_system::SequencerType
+sequencer_type	protobuf/heartbeat.proto	/^	SequencerType sequencer_type = 6;$/;"	f	message:heartbeat_system.CreateTopicRequest	typeref:typename:SequencerType
+sequentially_written_	disk_manager/scalog_replication_manager.cc	/^				int64_t sequentially_written_; \/\/ Offset written contiguously from start$/;"	m	class:Scalog::ScalogReplicationServiceImpl::LocalCutTracker	typeref:typename:int64_t	file:
+serialize	client/distributed_kv_store.cc	/^std::vector<char> LogEntry::serialize() const {$/;"	f	class:LogEntry	typeref:typename:std::vector<char>
+server_	disk_manager/corfu_replication_manager.h	/^    std::unique_ptr<grpc::Server> server_;$/;"	m	class:Corfu::CorfuReplicationManager	typeref:typename:std::unique_ptr<grpc::Server>
+server_	disk_manager/scalog_replication_manager.h	/^    std::unique_ptr<grpc::Server> server_;$/;"	m	class:Scalog::ScalogReplicationManager	typeref:typename:std::unique_ptr<grpc::Server>
+server_	embarlet/heartbeat.h	/^		std::shared_ptr<Server> server_;$/;"	m	class:heartbeat_system::HeartBeatManager	typeref:typename:std::shared_ptr<Server>
+server_	embarlet/heartbeat.h	/^		std::shared_ptr<Server> server_;$/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:std::shared_ptr<Server>
+server_address_	disk_manager/corfu_replication_client.h	/^    std::string server_address_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::string
+server_address_	disk_manager/scalog_replication_client.h	/^    std::string server_address_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::string
+server_id_	client/distributed_kv_store.h	/^		uint64_t server_id_;$/;"	m	class:DistributedKVStore	typeref:typename:uint64_t
+server_thread_	disk_manager/corfu_replication_manager.h	/^    std::thread server_thread_;$/;"	m	class:Corfu::CorfuReplicationManager	typeref:typename:std::thread
+server_thread_	disk_manager/scalog_replication_manager.h	/^    std::thread server_thread_;$/;"	m	class:Scalog::ScalogReplicationManager	typeref:typename:std::thread
+service_	disk_manager/corfu_replication_manager.h	/^    std::unique_ptr<CorfuReplicationServiceImpl> service_;$/;"	m	class:Corfu::CorfuReplicationManager	typeref:typename:std::unique_ptr<CorfuReplicationServiceImpl>
+service_	disk_manager/scalog_replication_manager.h	/^    std::unique_ptr<ScalogReplicationServiceImpl> service_;$/;"	m	class:Scalog::ScalogReplicationManager	typeref:typename:std::unique_ptr<ScalogReplicationServiceImpl>
+service_	embarlet/heartbeat.h	/^		std::unique_ptr<HeartBeatServiceImpl> service_;$/;"	m	class:heartbeat_system::HeartBeatManager	typeref:typename:std::unique_ptr<HeartBeatServiceImpl>
+shards	client/distributed_kv_store.h	/^		std::array<Shard, NUM_SHARDS> shards;$/;"	m	class:ShardedKVStore	typeref:typename:std::array<Shard,NUM_SHARDS>
+shutdown	protobuf/heartbeat.proto	/^	bool shutdown = 2;$/;"	f	message:heartbeat_system.HeartbeatResponse	typeref:typename:bool
+shutdown_	client/buffer.h	/^    bool shutdown_{false};$/;"	m	class:Buffer	typeref:typename:bool
+shutdown_	client/publisher.h	/^		bool shutdown_{false};$/;"	m	class:Publisher	typeref:typename:bool
+shutdown_	client/subscriber.h	/^		std::atomic<bool> shutdown_{false};$/;"	m	class:Subscriber	typeref:typename:std::atomic<bool>
+shutdown_	embarlet/heartbeat.h	/^		std::atomic<bool> shutdown_{false};$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::atomic<bool>
+shutdown_	embarlet/heartbeat.h	/^		std::atomic<bool> shutdown_{false};$/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:std::atomic<bool>
+shutdown_requested_	cxl_manager/scalog_global_sequencer.h	/^		std::atomic<bool> shutdown_requested_{false};$/;"	m	class:ScalogGlobalSequencer	typeref:typename:std::atomic<bool>
+signal_and_attempt_swap	client/subscriber.cc	/^bool ConnectionBuffers::signal_and_attempt_swap(Subscriber* subscriber_instance) {$/;"	f	class:ConnectionBuffers	typeref:typename:bool
+size	client/distributed_kv_store.h	/^		size_t size() const {$/;"	f	class:ShardedKVStore	typeref:typename:size_t
+size	cxl_manager/cxl_datastructure.h	/^	size_t size;$/;"	m	struct:Embarcadero::MessageHeader	typeref:typename:size_t
+size	disk_manager/scalog_replication_manager.cc	/^			int64_t size;$/;"	m	struct:Scalog::ScalogReplicationServiceImpl::WriteTask	typeref:typename:int64_t	file:
+size	protobuf/corfu_replication.proto	/^  int64 size = 2;$/;"	f	message:corfureplication.CorfuReplicationRequest	typeref:typename:int64
+size	protobuf/scalog_replication.proto	/^  int64 size = 2;$/;"	f	message:scalogreplication.ScalogReplicationRequest	typeref:typename:int64
+start_logical_offset	cxl_manager/cxl_datastructure.h	/^	size_t start_logical_offset; \/\/ Used as offset to ordered batch after at subscribe$/;"	m	struct:Embarcadero::BatchHeader	typeref:typename:size_t
+start_time_	client/publisher.h	/^		std::chrono::steady_clock::time_point start_time_;$/;"	m	class:Publisher	typeref:typename:std::chrono::steady_clock::time_point
+start_time_	client/test_utils.cc	/^		std::chrono::high_resolution_clock::time_point start_time_;$/;"	m	class:ProgressTracker	typeref:typename:std::chrono::high_resolution_clock::time_point	file:
+state_mutex	client/subscriber.h	/^	absl::Mutex state_mutex; \/\/ Protects swapping, flag coordination, and waiting$/;"	m	struct:ConnectionBuffers	typeref:typename:absl::Mutex
+status	embarlet/heartbeat.h	/^			Status status;$/;"	m	struct:heartbeat_system::FollowerNodeClient::AsyncClientCall	typeref:typename:Status
+std	client/distributed_kv_store.h	/^namespace std {$/;"	n
+stop_reading_from_stream_	cxl_manager/scalog_global_sequencer.h	/^		std::atomic<bool> stop_reading_from_stream_{false};$/;"	m	class:ScalogGlobalSequencer	typeref:typename:std::atomic<bool>
+stop_reading_from_stream_	cxl_manager/scalog_local_sequencer.h	/^		bool stop_reading_from_stream_ = false;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:bool
+stop_reading_from_stream_	disk_manager/scalog_replication_manager.cc	/^		std::atomic<bool> stop_reading_from_stream_; \/\/ Signal receiver thread$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::atomic<bool>	file:
+stop_threads_	cxl_manager/cxl_manager.h	/^		volatile bool stop_threads_ = false;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:volatile bool
+stop_threads_	disk_manager/disk_manager.h	/^		bool stop_threads_ = false;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:bool
+stop_threads_	embarlet/topic.h	/^		bool stop_threads_ = false;$/;"	m	class:Embarcadero::Topic	typeref:typename:bool
+stop_threads_	network_manager/network_manager.h	/^    bool stop_threads_ = false;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:bool
+stream_mu_	cxl_manager/scalog_global_sequencer.h	/^		absl::Mutex stream_mu_;$/;"	m	class:ScalogGlobalSequencer	typeref:typename:absl::Mutex
+stream_mu_	cxl_manager/scalog_local_sequencer.h	/^		absl::Mutex stream_mu_;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:absl::Mutex
+stub_	client/corfu_client.h	/^		std::unique_ptr<CorfuSequencer::Stub> stub_;$/;"	m	class:CorfuSequencerClient	typeref:typename:std::unique_ptr<CorfuSequencer::Stub>
+stub_	client/distributed_kv_store.h	/^		std::unique_ptr<HeartBeat::Stub> stub_;$/;"	m	class:DistributedKVStore	typeref:typename:std::unique_ptr<HeartBeat::Stub>
+stub_	client/publisher.h	/^		std::unique_ptr<HeartBeat::Stub> stub_;$/;"	m	class:Publisher	typeref:typename:std::unique_ptr<HeartBeat::Stub>
+stub_	client/subscriber.h	/^		std::unique_ptr<heartbeat_system::HeartBeat::Stub> stub_;$/;"	m	class:Subscriber	typeref:typename:std::unique_ptr<heartbeat_system::HeartBeat::Stub>
+stub_	cxl_manager/cxl_manager.h	/^		std::unique_ptr<ScalogSequencer::Stub> stub_;$/;"	m	class:Embarcadero::ScalogLocalSequencer	typeref:typename:std::unique_ptr<ScalogSequencer::Stub>
+stub_	cxl_manager/scalog_local_sequencer.h	/^		std::unique_ptr<ScalogSequencer::Stub> stub_;$/;"	m	class:Scalog::ScalogLocalSequencer	typeref:typename:std::unique_ptr<ScalogSequencer::Stub>
+stub_	disk_manager/corfu_replication_client.h	/^    std::unique_ptr<corfureplication::CorfuReplicationService::Stub> stub_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::unique_ptr<corfureplication::CorfuReplicationService::Stub>
+stub_	disk_manager/scalog_replication_client.h	/^    std::unique_ptr<scalogreplication::ScalogReplicationService::Stub> stub_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::unique_ptr<scalogreplication::ScalogReplicationService::Stub>
+stub_	disk_manager/scalog_replication_manager.cc	/^		std::unique_ptr<ScalogSequencer::Stub> stub_;$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::unique_ptr<ScalogSequencer::Stub>	file:
+stub_	embarlet/heartbeat.h	/^		std::unique_ptr<HeartBeat::Stub> stub_;$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::unique_ptr<HeartBeat::Stub>
+subBandwidthMbps	client/result_writer.h	/^    double subBandwidthMbps = 0;$/;"	m	class:ResultWriter	typeref:typename:double
+sub_mu_	network_manager/network_manager.h	/^    absl::Mutex sub_mu_;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:absl::Mutex
+sub_state_	network_manager/network_manager.h	/^    absl::flat_hash_map<int, std::unique_ptr<SubscriberState>> sub_state_;  \/\/ <client_id, sta/;"	m	class:Embarcadero::NetworkManager	typeref:typename:absl::flat_hash_map<int,std::unique_ptr<SubscriberState>>
+subscriber_	client/distributed_kv_store.h	/^		std::unique_ptr<Subscriber> subscriber_;$/;"	m	class:DistributedKVStore	typeref:typename:std::unique_ptr<Subscriber>
+subscriber_mutex_	embarlet/heartbeat.h	/^		absl::Mutex subscriber_mutex_;$/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:absl::Mutex
+subscribers_	embarlet/heartbeat.h	/^		std::vector<std::shared_ptr<grpc::ServerWriter<ClusterStatus>>> subscribers_;$/;"	m	class:heartbeat_system::HeartBeatServiceImpl	typeref:typename:std::vector<std::shared_ptr<grpc::ServerWriter<ClusterStatus>>>
+success	protobuf/corfu_replication.proto	/^  bool success = 1;$/;"	f	message:corfureplication.CorfuReplicationResponse	typeref:typename:bool
+success	protobuf/heartbeat.proto	/^	bool success = 1;$/;"	f	message:heartbeat_system.CreateTopicResponse	typeref:typename:bool
+success	protobuf/heartbeat.proto	/^	bool success = 1;$/;"	f	message:heartbeat_system.KillBrokersResponse	typeref:typename:bool
+success	protobuf/heartbeat.proto	/^	bool success = 1;$/;"	f	message:heartbeat_system.RegistrationStatus	typeref:typename:bool
+success	protobuf/scalog_replication.proto	/^  bool success = 1;$/;"	f	message:scalogreplication.ScalogReplicationResponse	typeref:typename:bool
+tail	client/buffer.h	/^        size_t tail;$/;"	m	struct:Buffer::Buf	typeref:typename:size_t
+test_complete_	client/kv_test.cc	/^		std::atomic<bool> test_complete_{false};$/;"	m	class:KVStoreBenchmark	typeref:typename:std::atomic<bool>	file:
+test_keys_	client/kv_test.cc	/^		std::vector<std::string> test_keys_;$/;"	m	class:KVStoreBenchmark	typeref:typename:std::vector<std::string>	file:
+test_values_	client/kv_test.cc	/^		std::vector<std::string> test_values_;$/;"	m	class:KVStoreBenchmark	typeref:typename:std::vector<std::string>	file:
+thread	client/subscriber.h	/^			std::thread thread;$/;"	m	struct:Subscriber::ThreadInfo	typeref:typename:std::thread
+thread_count_	client/publisher.h	/^		std::atomic<int> thread_count_{0};$/;"	m	class:Publisher	typeref:typename:std::atomic<int>
+thread_count_	disk_manager/disk_manager.h	/^		std::atomic<size_t> thread_count_{0};$/;"	m	class:Embarcadero::DiskManager	typeref:typename:std::atomic<size_t>
+thread_count_	network_manager/network_manager.h	/^    std::atomic<int> thread_count_{0};$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:std::atomic<int>
+threads_	client/publisher.h	/^		std::vector<std::thread> threads_;$/;"	m	class:Publisher	typeref:typename:std::vector<std::thread>
+threads_	disk_manager/disk_manager.h	/^		std::vector<std::thread> threads_;$/;"	m	class:Embarcadero::DiskManager	typeref:typename:std::vector<std::thread>
+threads_	network_manager/network_manager.h	/^    std::vector<std::thread> threads_;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:std::vector<std::thread>
+throughput_test	CMakeLists.txt	/^add_executable(throughput_test$/;"	t
+timestamps	client/common.h	/^    std::vector<std::pair<size_t, std::chrono::steady_clock::time_point>> timestamps;$/;"	m	struct:msgIdx	typeref:typename:std::vector<std::pair<size_t,std::chrono::steady_clock::time_point>>
+tinode	disk_manager/disk_manager.h	/^	TInode* tinode;$/;"	m	struct:Embarcadero::ReplicationRequest	typeref:typename:TInode *
+tinode_	embarlet/topic.h	/^		struct TInode* tinode_;$/;"	m	class:Embarcadero::Topic	typeref:struct:TInode *
+topic	cxl_manager/cxl_datastructure.h	/^		char topic[TOPIC_NAME_SIZE];$/;"	m	struct:Embarcadero::TInode::__anon46dc1a7c0308	typeref:typename:char[]
+topic	network_manager/network_manager.h	/^    char topic[32];  \/\/ Sized to maintain overall 64B alignment$/;"	m	struct:Embarcadero::EmbarcaderoReq	typeref:typename:char[32]
+topic	protobuf/heartbeat.proto	/^	string topic = 1;$/;"	f	message:heartbeat_system.CreateTopicRequest	typeref:typename:string
+topic	protobuf/scalog_sequencer.proto	/^    string topic = 2;$/;"	f	message:LocalCut	typeref:typename:string
+topic_	client/publisher.h	/^		char topic_[TOPIC_NAME_SIZE];$/;"	m	class:Publisher	typeref:typename:char[]
+topic_	client/subscriber.h	/^		char topic_[TOPIC_NAME_SIZE];$/;"	m	class:Subscriber	typeref:typename:char[]
+topic_	disk_manager/corfu_replication_client.h	/^		std::string topic_;$/;"	m	class:Corfu::CorfuReplicationClient	typeref:typename:std::string
+topic_	disk_manager/scalog_replication_client.h	/^		std::string topic_;$/;"	m	class:Scalog::ScalogReplicationClient	typeref:typename:std::string
+topic_manager_	cxl_manager/cxl_manager.h	/^		TopicManager *topic_manager_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:TopicManager *
+topic_manager_	network_manager/network_manager.h	/^    TopicManager* topic_manager_ = nullptr;$/;"	m	class:Embarcadero::NetworkManager	typeref:typename:TopicManager *
+topic_name_	embarlet/topic.h	/^		std::string topic_name_;$/;"	m	class:Embarcadero::Topic	typeref:typename:std::string
+topic_to_idx_	embarlet/topic_manager.h	/^		static const std::hash<std::string> topic_to_idx_;$/;"	m	class:Embarcadero::TopicManager	typeref:typename:const std::hash<std::string>
+topics_	embarlet/topic_manager.h	/^		absl::flat_hash_map<std::string, std::unique_ptr<Topic>> topics_;$/;"	m	class:Embarcadero::TopicManager	typeref:typename:absl::flat_hash_map<std::string,std::unique_ptr<Topic>>
+total_message_size	client/result_writer.h	/^    size_t total_message_size;$/;"	m	class:ResultWriter	typeref:typename:size_t
+total_ops_	client/test_utils.cc	/^		size_t total_ops_;$/;"	m	class:ProgressTracker	typeref:typename:size_t	file:
+total_order	cxl_manager/cxl_datastructure.h	/^	size_t total_order; \/\/ Order given by Corfu$/;"	m	struct:Embarcadero::BatchHeader	typeref:typename:size_t
+total_order	cxl_manager/cxl_datastructure.h	/^	volatile size_t total_order;$/;"	m	struct:Embarcadero::MessageHeader	typeref:typename:volatile size_t
+total_order	protobuf/corfu_sequencer.proto	/^  uint64 total_order = 1;$/;"	f	message:corfusequencer.TotalOrderResponse	typeref:typename:uint64
+total_sent_bytes_	client/publisher.h	/^		std::atomic<size_t> total_sent_bytes_{0};$/;"	m	class:Publisher	typeref:typename:std::atomic<size_t>
+total_size	cxl_manager/corfu_global_sequencer.cc	/^			size_t total_size;$/;"	m	struct:CorfuSequencerImpl::PendingRequest	typeref:typename:size_t	file:
+total_size	cxl_manager/cxl_datastructure.h	/^	size_t total_size;$/;"	m	struct:Embarcadero::BatchHeader	typeref:typename:size_t
+total_size	protobuf/corfu_sequencer.proto	/^  uint64 total_size = 4;$/;"	f	message:corfusequencer.TotalOrderRequest	typeref:typename:uint64
+trackers_	cxl_manager/cxl_manager.h	/^		absl::flat_hash_map<size_t, std::unique_ptr<SequentialOrderTracker>> trackers_;$/;"	m	class:Embarcadero::CXLManager	typeref:typename:absl::flat_hash_map<size_t,std::unique_ptr<SequentialOrderTracker>>
+transactionId	client/distributed_kv_store.h	/^	uint64_t transactionId;  \/\/ 0 if not part of a transaction$/;"	m	struct:LogEntry	typeref:typename:uint64_t
+transactions_mutex_	client/distributed_kv_store.h	/^		absl::Mutex transactions_mutex_;$/;"	m	class:DistributedKVStore	typeref:typename:absl::Mutex
+type	client/distributed_kv_store.h	/^	OpType type;$/;"	m	struct:LogEntry	typeref:typename:OpType
+updateSequentiallyWritten	disk_manager/scalog_replication_manager.cc	/^				void updateSequentiallyWritten() {$/;"	f	class:Scalog::ScalogReplicationServiceImpl::LocalCutTracker	typeref:typename:void	file:
+value	client/distributed_kv_store.h	/^	std::string value;$/;"	m	struct:KeyValue	typeref:typename:std::string
+value_size_	client/kv_test.cc	/^		size_t value_size_;$/;"	m	class:KVStoreBenchmark	typeref:typename:size_t	file:
+waitForSyncWithLog	client/distributed_kv_store.cc	/^void DistributedKVStore::waitForSyncWithLog(){$/;"	f	class:DistributedKVStore	typeref:typename:void
+waitUntilApplied	client/distributed_kv_store.cc	/^void DistributedKVStore::waitUntilApplied(size_t total_order){$/;"	f	class:DistributedKVStore	typeref:typename:void
+wait_called_	embarlet/heartbeat.h	/^		std::atomic<bool> wait_called_{false};$/;"	m	class:heartbeat_system::FollowerNodeClient	typeref:typename:std::atomic<bool>
+worker_mutex_	client/subscriber.h	/^		absl::Mutex worker_mutex_; \/\/ Protects worker_threads_ vector$/;"	m	class:Subscriber	typeref:typename:absl::Mutex
+writeSet	client/distributed_kv_store.h	/^	absl::flat_hash_map<std::string, std::string> writeSet;  \/\/ Keys written$/;"	m	struct:Transaction	typeref:typename:absl::flat_hash_map<std::string,std::string>
+write_buf_id_	client/buffer.h	/^    size_t write_buf_id_ = 0;$/;"	m	class:Buffer	typeref:typename:size_t
+write_buffer_ready_for_consumer	client/subscriber.h	/^	std::atomic<bool> write_buffer_ready_for_consumer{false}; \/\/ Flag set by receiver when write /;"	m	struct:ConnectionBuffers	typeref:typename:std::atomic<bool>
+write_offset	client/subscriber.h	/^	std::atomic<size_t> write_offset{0}; \/\/ Receiver updates this$/;"	m	struct:BufferState	typeref:typename:std::atomic<size_t>
+write_queue_	disk_manager/scalog_replication_manager.cc	/^		folly::MPMCQueue<std::optional<WriteTask>> write_queue_; \/\/ Queue for tasks$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:folly::MPMCQueue<std::optional<WriteTask>>	file:
+writer_head	client/buffer.h	/^        size_t writer_head;$/;"	m	struct:Buffer::Buf	typeref:typename:size_t
+writer_threads_	disk_manager/scalog_replication_manager.cc	/^		std::vector<std::thread> writer_threads_; \/\/ Threads processing the queue$/;"	m	class:Scalog::ScalogReplicationServiceImpl	typeref:typename:std::vector<std::thread>	file:
+writes	client/distributed_kv_store.h	/^	std::vector<KeyValue> writes;  \/\/ Pending writes$/;"	m	struct:Transaction	typeref:typename:std::vector<KeyValue>
+written	cxl_manager/cxl_datastructure.h	/^		volatile size_t written;$/;"	m	struct:Embarcadero::offset_entry::__anon46dc1a7c0108	typeref:typename:volatile size_t
+written_addr	cxl_manager/cxl_datastructure.h	/^		volatile unsigned long long int written_addr;$/;"	m	struct:Embarcadero::offset_entry::__anon46dc1a7c0108	typeref:typename:volatile unsigned long long int
+written_logical_offset_	embarlet/topic.h	/^		size_t written_logical_offset_;$/;"	m	class:Embarcadero::Topic	typeref:typename:size_t
+written_messages_range_	embarlet/topic.h	/^		absl::flat_hash_map<size_t, size_t> written_messages_range_;$/;"	m	class:Embarcadero::Topic	typeref:typename:absl::flat_hash_map<size_t,size_t>
+written_mutex_	embarlet/topic.h	/^		absl::Mutex written_mutex_;$/;"	m	class:Embarcadero::Topic	typeref:typename:absl::Mutex
+written_physical_addr_	embarlet/topic.h	/^		void* written_physical_addr_;$/;"	m	class:Embarcadero::Topic	typeref:typename:void *
+~AsyncClientCall	embarlet/heartbeat.h	/^			~AsyncClientCall() {$/;"	f	struct:heartbeat_system::FollowerNodeClient::AsyncClientCall
+~Buffer	client/buffer.cc	/^Buffer::~Buffer() {$/;"	f	class:Buffer
+~BufferState	client/subscriber.h	/^	~BufferState() {$/;"	f	struct:BufferState
+~CXLManager	cxl_manager/cxl_manager.cc	/^CXLManager::~CXLManager(){$/;"	f	class:Embarcadero::CXLManager
+~ConnectionBuffers	client/subscriber.h	/^	~ConnectionBuffers() {$/;"	f	struct:ConnectionBuffers
+~CorfuReplicationClient	disk_manager/corfu_replication_client.cc	/^CorfuReplicationClient::~CorfuReplicationClient() {$/;"	f	class:Corfu::CorfuReplicationClient
+~CorfuReplicationManager	disk_manager/corfu_replication_manager.cc	/^	CorfuReplicationManager::~CorfuReplicationManager() {$/;"	f	class:Corfu::CorfuReplicationManager
+~CorfuReplicationServiceImpl	disk_manager/corfu_replication_manager.cc	/^			~CorfuReplicationServiceImpl() override {$/;"	f	class:Corfu::CorfuReplicationServiceImpl	file:
+~DiskManager	disk_manager/disk_manager.cc	/^	DiskManager::~DiskManager(){$/;"	f	class:Embarcadero::DiskManager
+~DistributedKVStore	client/distributed_kv_store.cc	/^DistributedKVStore::~DistributedKVStore() {$/;"	f	class:DistributedKVStore
+~FollowerNodeClient	embarlet/heartbeat.cc	/^FollowerNodeClient::~FollowerNodeClient() {$/;"	f	class:heartbeat_system::FollowerNodeClient
+~HeartBeatServiceImpl	embarlet/heartbeat.cc	/^HeartBeatServiceImpl::~HeartBeatServiceImpl() {$/;"	f	class:heartbeat_system::HeartBeatServiceImpl
+~NetworkManager	network_manager/network_manager.cc	/^NetworkManager::~NetworkManager() {$/;"	f	class:Embarcadero::NetworkManager
+~Publisher	client/publisher.cc	/^Publisher::~Publisher() {$/;"	f	class:Publisher
+~ResultWriter	client/result_writer.cc	/^ResultWriter::~ResultWriter() {$/;"	f	class:ResultWriter
+~ScalogReplicationClient	disk_manager/scalog_replication_client.cc	/^ScalogReplicationClient::~ScalogReplicationClient() {$/;"	f	class:Scalog::ScalogReplicationClient
+~ScalogReplicationManager	disk_manager/scalog_replication_manager.cc	/^	ScalogReplicationManager::~ScalogReplicationManager() {$/;"	f	class:Scalog::ScalogReplicationManager
+~ScalogReplicationServiceImpl	disk_manager/scalog_replication_manager.cc	/^		~ScalogReplicationServiceImpl() override {$/;"	f	class:Scalog::ScalogReplicationServiceImpl	file:
+~ScopedFD	embarlet/embarlet.cc	/^		~ScopedFD() { if (fd_ >= 0) close(fd_); }$/;"	f	class:__anonaa92e0c00111::ScopedFD	file:
+~Subscriber	client/subscriber.cc	/^Subscriber::~Subscriber() {$/;"	f	class:Subscriber
+~ThreadInfo	client/subscriber.h	/^			~ThreadInfo() {$/;"	f	struct:Subscriber::ThreadInfo
+~Topic	embarlet/topic.h	/^		~Topic() {$/;"	f	class:Embarcadero::Topic
+~TopicManager	embarlet/topic_manager.h	/^		~TopicManager() {$/;"	f	class:Embarcadero::TopicManager

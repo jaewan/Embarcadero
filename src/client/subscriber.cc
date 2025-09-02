@@ -663,7 +663,8 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 	shake.client_id = client_id_;
 	shake.last_addr = 0;
 	shake.client_req = Embarcadero::Subscribe;
-	memcpy(shake.topic, topic_, TOPIC_NAME_SIZE);
+	memset(shake.topic, 0, sizeof(shake.topic));
+	memcpy(shake.topic, topic_, std::min<size_t>(TOPIC_NAME_SIZE - 1, sizeof(shake.topic) - 1));
 
 	if (send(conn_buffers->fd, &shake, sizeof(shake), 0) < static_cast<ssize_t>(sizeof(shake))) {
 		LOG(ERROR) << "Worker (broker " << broker_id << "): Failed to send subscription request on fd " 

@@ -132,9 +132,9 @@ DistributedKVStore::DistributedKVStore(SequencerType seq_type)
 
 		CreateNewTopic(stub_, topic, order, seq_type, 1/*replication_factor*/, false, ack_level);
 
-		subscriber_ = std::make_unique<Subscriber>("127.0.0.1", std::to_string(BROKER_PORT), topic);
-		publisher_ = std::make_unique<Publisher>(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
-				num_threads, 1024, (1UL<<33), order, seq_type);
+		subscriber_ = std::unique_ptr<Subscriber>(new Subscriber("127.0.0.1", std::to_string(BROKER_PORT), topic));
+		publisher_ = std::unique_ptr<Publisher>(new Publisher(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
+				num_threads, 1024, (1UL<<33), order, seq_type));
 		publisher_->Init(ack_level);
 		server_id_ = publisher_->GetClientId();
 

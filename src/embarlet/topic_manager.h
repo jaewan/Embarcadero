@@ -1,18 +1,26 @@
-#ifndef INCLUDE_TOPIC_MANAGER_H_
-#define INCLUDE_TOPIC_MANAGER_H_
+#pragma once
 
 // Standard library includes
 #include <bits/stdc++.h>
 
 // External library includes
-#include "absl/container/flat_hash_map.h"
-#include "absl/container/btree_set.h"
-#include "absl/synchronization/mutex.h"
-#include <glog/logging.h>
+#include <absl/container/flat_hash_map.h>
+#include <memory>
+#include <string>
+#include <vector>
+#include <functional>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <absl/container/btree_set.h>
 
-#include "../cxl_manager/cxl_datastructure.h"
-#include "topic.h"
 #include "common/config.h"
+#include "common/performance_utils.h"
+#include "common/fine_grained_lock.h"
+#include "topic.h"
+#include "cxl_manager/cxl_manager.h"
+#include "disk_manager/disk_manager.h"
 
 namespace Embarcadero {
 
@@ -188,7 +196,11 @@ class TopicManager {
 		DiskManager& disk_manager_;
 		static const std::hash<std::string> topic_to_idx_;
 		absl::flat_hash_map<std::string, std::unique_ptr<Topic>> topics_;
-		absl::Mutex mutex_;
+		
+		// Replace single mutex with striped locking for better concurrency
+		StripedLock<std::string, 128> topic_locks_;  // 128 stripes for fine-grained locking
+		absl::Mutex topics_mutex_;  // Only for global operations like iteration
+		
 		int broker_id_;
 		size_t num_topics_;
 		GetNumBrokersCallback get_num_brokers_callback_;
@@ -196,5 +208,3 @@ class TopicManager {
 }; // TopicManager
 
 } // End of namespace Embarcadero
-
-#endif // INCLUDE_TOPIC_MANAGER_H_
