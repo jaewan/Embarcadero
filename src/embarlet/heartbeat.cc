@@ -76,27 +76,10 @@ Status HeartBeatServiceImpl::RegisterNode(
 		}
 	}
 
-	// Update cluster version if needed
+	// Update cluster version if needed (streaming RPC will observe and push updates)
 	if (need_version_increment) {
 		absl::MutexLock lock(&cluster_mutex_);
 		cluster_version_++;
-
-		// Notify subscribers
-		ClusterStatus cluster_status;
-		absl::MutexLock lock_mutex(&mutex_);
-		for (const auto& node : nodes_) {
-			if (node.second.broker_id == nodes_[request->node_id()].broker_id) {
-				cluster_status.add_new_nodes(node.second.network_mgr_addr);
-				break;
-			}
-		}
-
-		absl::MutexLock subscribers_lock(&subscriber_mutex_);
-		for (auto& writer : subscribers_) {
-			if (writer) {
-				writer->Write(cluster_status);
-			}
-		}
 	}
 
 	return grpc::Status::OK;
@@ -165,33 +148,32 @@ grpc::Status HeartBeatServiceImpl::SubscribeToCluster(
 	// Send initial status
 	writer->Write(initial_status);
 
-	// Register this writer for future updates
-	std::shared_ptr<grpc::ServerWriter<ClusterStatus>> shared_writer =
-		std::make_shared<grpc::ServerWriter<ClusterStatus>>(*writer);
-
+	// Periodically push updates when cluster version changes
+	uint64_t last_sent_version = 0;
 	{
-		absl::MutexLock lock(&subscriber_mutex_);
-		subscribers_.push_back(shared_writer);
+		absl::MutexLock lock(&cluster_mutex_);
+		last_sent_version = cluster_version_;
 	}
 
-	// Keep the stream open and active for the client (blocking call)
 	while (!context->IsCancelled()) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-	}
 
-	// Cleanup the subscriber on disconnection
-	{
-		absl::MutexLock lock(&subscriber_mutex_);
-		auto it = std::find_if(
-				subscribers_.begin(),
-				subscribers_.end(),
-				[writer](const std::shared_ptr<grpc::ServerWriter<ClusterStatus>>& w) {
-				return w.get() == writer;
+		uint64_t current_version = 0;
+		{
+			absl::MutexLock lock(&cluster_mutex_);
+			current_version = cluster_version_;
+		}
+
+		if (current_version > last_sent_version) {
+			ClusterStatus update;
+			{
+				absl::MutexLock lock(&mutex_);
+				for (const auto& node_entry : nodes_) {
+					update.add_new_nodes(node_entry.second.network_mgr_addr);
 				}
-				);
-
-		if (it != subscribers_.end()) {
-			subscribers_.erase(it);
+			}
+			writer->Write(update);
+			last_sent_version = current_version;
 		}
 	}
 

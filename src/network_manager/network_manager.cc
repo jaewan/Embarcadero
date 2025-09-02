@@ -294,10 +294,17 @@ void NetworkManager::MainThread() {
 	server_address.sin_addr.s_addr = INADDR_ANY;
 
 	// Bind socket with retry logic
-	while (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
-		LOG(ERROR) << "Error binding socket to port " << (PORT + broker_id_)
-			<< " for broker " << broker_id_ << ": " << strerror(errno);
-		sleep(5);  // Retry after delay
+	{
+		int bind_attempts = 0;
+		while (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
+			LOG(ERROR) << "Error binding socket to port " << (PORT + broker_id_)
+				<< " for broker " << broker_id_ << ": " << strerror(errno);
+			if (++bind_attempts >= 6) {
+				close(server_socket);
+				return;
+			}
+			sleep(5);  // Retry after delay
+		}
 	}
 
 	// Start listening
@@ -306,6 +313,8 @@ void NetworkManager::MainThread() {
 		close(server_socket);
 		return;
 	}
+
+	listening_.store(true, std::memory_order_release);
 
 	// Create epoll instance
 	int epoll_fd = epoll_create1(0);
@@ -384,20 +393,27 @@ void NetworkManager::ReqReceiveThread() {
 		socklen_t client_address_len = sizeof(client_address);
 		getpeername(req.client_socket, (struct sockaddr*)&client_address, &client_address_len);
 
-		// Perform handshake to determine request type
-		EmbarcaderoReq handshake;
-		size_t to_read = sizeof(handshake);
+		// Perform handshake to determine request type (robust partial read)
+		EmbarcaderoReq handshake{};
+		size_t read_total = 0;
 
-		// Read handshake data completely
-		while (to_read > 0) {
-			int ret = recv(req.client_socket, &handshake, to_read, 0);
-			if (ret < 0) {
-				LOG(ERROR) << "Error receiving handshake: " << strerror(errno);
+		while (read_total < sizeof(handshake)) {
+			int ret = recv(req.client_socket,
+					reinterpret_cast<char*>(&handshake) + read_total,
+					sizeof(handshake) - read_total,
+					0);
+			if (ret <= 0) {
+				if (ret < 0) {
+					LOG(ERROR) << "Error receiving handshake: " << strerror(errno);
+				}
 				close(req.client_socket);
 				return;
 			}
-			to_read -= ret;
+			read_total += static_cast<size_t>(ret);
 		}
+
+		// Ensure topic string is terminated to avoid strlen overrun
+		handshake.topic[sizeof(handshake.topic) - 1] = '\0';
 
 		// Process based on request type
 		switch (handshake.client_req) {
@@ -531,14 +547,8 @@ void NetworkManager::HandlePublishRequest(
 					header->segment_header = segment_header;
 					header->next_msg_diff = header->paddedSize;
 
-					// Flush cache lines
-#ifdef __INTEL__
-					_mm_clflushopt(header);
-#elif defined(__AMD__)
-					_mm_clwb(header);
-#else
-					LOG(ERROR) << "Neither Intel nor AMD processor detected";
-#endif
+					// Don't flush on every message - batch processing will handle it
+					// This saves significant CPU cycles
 					logical_offset++;
 				}
 			}
@@ -554,6 +564,16 @@ void NetworkManager::HandlePublishRequest(
 
 		// Finalize batch processing
 		if (non_emb_seq_callback) {
+			// Batch flush for better performance (only for KAFKA mode)
+			if (seq_type == KAFKA && header) {
+				// Flush the last message header to ensure visibility
+#ifdef __INTEL__
+				_mm_clflushopt(header);
+#elif defined(__AMD__)
+				_mm_clwb(header);
+#endif
+			}
+			
 			non_emb_seq_callback((void*)header, logical_offset - 1);
 			if (seq_type == CORFU) {
 				//TODO(Jae) Replication ack

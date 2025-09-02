@@ -44,6 +44,8 @@ configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
 add_executable(embarlet 
     embarlet/embarlet.cc
+    common/configuration.cc
+    common/configuration.h
     disk_manager/disk_manager.cc
     disk_manager/disk_manager.h
     disk_manager/corfu_replication_manager.cc
@@ -71,6 +73,7 @@ add_executable(embarlet
 target_include_directories(embarlet PUBLIC
 	"${CMAKE_CURRENT_BINARY_DIR}"
   "${PROJECT_BINARY_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(embarlet
@@ -88,6 +91,7 @@ target_link_libraries(embarlet
     grpc++
     protobuf::libprotobuf
     ${FOLLY_LIBRARIES}
+    yaml-cpp
     Threads::Threads
 )
 
@@ -109,12 +113,15 @@ add_executable(throughput_test
     client/test_utils.cc
     client/test_utils.h
     client/main.cc
+    common/configuration.cc
+    common/configuration.h
 )
 
 target_include_directories(throughput_test PUBLIC
     "${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_BINARY_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/client"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(throughput_test
@@ -129,6 +136,7 @@ target_link_libraries(throughput_test
     protobuf::libprotobuf
     ${FOLLY_LIBRARIES}
     Threads::Threads
+    yaml-cpp
 )
 
 set_target_properties(throughput_test PROPERTIES
@@ -151,12 +159,15 @@ add_executable(kv_test
     client/buffer.cc
     client/buffer.h
     client/kv_test.cc
+    common/configuration.cc
+    common/configuration.h
 )
 
 target_include_directories(kv_test PUBLIC
     "${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_BINARY_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/client"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(kv_test
@@ -171,6 +182,7 @@ target_link_libraries(kv_test
     protobuf::libprotobuf
     ${FOLLY_LIBRARIES}
     Threads::Threads
+    yaml-cpp
 )
 
 set_target_properties(kv_test PROPERTIES
@@ -184,6 +196,8 @@ set_target_properties(kv_test PROPERTIES
 add_executable(scalog_global_sequencer
     cxl_manager/scalog_global_sequencer.cc
     cxl_manager/scalog_global_sequencer.h
+    common/configuration.cc
+    common/configuration.h
 )
 
 target_include_directories(scalog_global_sequencer PUBLIC
@@ -195,9 +209,9 @@ target_link_libraries(scalog_global_sequencer
     glog::glog
     absl::flat_hash_map
 	scalog_sequencer_grpc_proto
-    grpc++
     protobuf::libprotobuf
     Threads::Threads
+    yaml-cpp
 )
 
 set_target_properties(scalog_global_sequencer PROPERTIES
@@ -206,6 +220,8 @@ set_target_properties(scalog_global_sequencer PROPERTIES
 
 add_executable(corfu_global_sequencer
     cxl_manager/corfu_global_sequencer.cc
+    common/configuration.cc
+    common/configuration.h
 )
 
 target_include_directories(corfu_global_sequencer PUBLIC
@@ -220,9 +236,32 @@ target_link_libraries(corfu_global_sequencer
     grpc++
     protobuf::libprotobuf
     Threads::Threads
+    yaml-cpp
 )
 
 set_target_properties(corfu_global_sequencer PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Configuration test executable
+add_executable(config_test
+    common/config_example.cc
+    common/configuration.cc
+    common/configuration.h
+)
+
+target_include_directories(config_test PUBLIC
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+)
+
+target_link_libraries(config_test
+    glog::glog
+    yaml-cpp
+    Threads::Threads
+)
+
+set_target_properties(config_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 

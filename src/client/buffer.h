@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include <atomic>
 
 /**
  * Buffer class for managing message data
@@ -84,18 +85,24 @@ private:
     /**
      * Buffer structure with cache line alignment
      */
+    struct alignas(64) BufMetaProd {
+        std::atomic<size_t> writer_head{0};
+        std::atomic<size_t> tail{0};
+        std::atomic<size_t> num_msg{0};
+    };
+    struct alignas(64) BufMetaCons {
+        std::atomic<size_t> reader_head{0};
+    };
     struct alignas(64) Buf {
         // Static
         void* buffer;
         size_t len;
-        // Writer modify
-        size_t writer_head;
-        size_t tail;
-        size_t num_msg;
-        // Reader modify
-        size_t reader_head;
-        
-        Buf() : writer_head(0), tail(0), num_msg(0), reader_head(0) {}
+        // pad static region to cache line
+        char _pad_static_[64 - (sizeof(void*) + sizeof(size_t)) % 64];
+        // Writer modify (single writer)
+        BufMetaProd prod;
+        // Reader modify (single reader)
+        BufMetaCons cons;
     };
     
     std::vector<Buf> bufs_;

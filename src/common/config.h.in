@@ -5,59 +5,68 @@
 #include <cstddef>
 #include <functional>
 #include "absl/container/btree_set.h"
-#include <heartbeat.grpc.pb.h>
+#include "@PROJECT_SOURCE_DIR@/src/common/configuration.h"
+
+// Forward declarations
+namespace heartbeat_system {
+    enum SequencerType : int;
+}
+namespace Embarcadero {
+struct MessageHeader;
+struct TInode;
+}
 
 namespace Embarcadero{
 
-// the configured options and settings for Embarcadero
-#define Embarcadero_VERSION_MAJOR 1.0
-#define Embarcadero_VERSION_MINOR 1
+// Get configuration instance
+const Configuration& GetConfig();
+
+// Legacy macro definitions for backward compatibility
+// These will be deprecated in future versions
+#define Embarcadero_VERSION_MAJOR (Embarcadero::GetConfig().config().version.major.get())
+#define Embarcadero_VERSION_MINOR (Embarcadero::GetConfig().config().version.minor.get())
 
 #cmakedefine01 __INTEL__
 #cmakedefine01 __AMD__
 
-#define PORT 1214
-#define BROKER_PORT 12140
-#define HEARTBEAT_INTERVAL 3 // in seconds
-#define TOPIC_NAME_SIZE 31
-#define CGROUP_CORE 85
+#define PORT (Embarcadero::GetConfig().config().broker.port.get())
+#define BROKER_PORT (Embarcadero::GetConfig().config().broker.broker_port.get())
+#define HEARTBEAT_INTERVAL (Embarcadero::GetConfig().config().broker.heartbeat_interval.get())
+#define TOPIC_NAME_SIZE 256  // Fixed size for array declarations
+#define TOPIC_NAME_SIZE_CONFIG (Embarcadero::GetConfig().config().storage.topic_name_size.get())
+#define CGROUP_CORE (Embarcadero::GetConfig().config().broker.cgroup_core.get())
 
-#define NUM_MAX_BROKERS 4
-#define CXL_SIZE (1UL<<35)
-#define CXL_EMUL_SIZE (1UL<<35)
-#define MAX_TOPIC_SIZE 32
-#define SEGMENT_SIZE (1UL << 34)
-#define BATCHHEADERS_SIZE (1UL << 16)
+#define NUM_MAX_BROKERS 16  // Fixed size for compile-time array declarations
+#define NUM_MAX_BROKERS_CONFIG (Embarcadero::GetConfig().config().broker.max_brokers.get())
+#define CXL_SIZE (Embarcadero::GetConfig().config().cxl.size.get())
+#define CXL_EMUL_SIZE (Embarcadero::GetConfig().config().cxl.emulation_size.get())
+#define MAX_TOPIC_SIZE (Embarcadero::GetConfig().config().storage.max_topics.get())
+#define SEGMENT_SIZE (Embarcadero::GetConfig().config().storage.segment_size.get())
+#define BATCHHEADERS_SIZE (Embarcadero::GetConfig().config().storage.batch_headers_size.get())
 
-#define NUM_DISK_IO_THREADS 4
-#define NUM_NETWORK_IO_THREADS 8 
-#define NUM_SUB_CONNECTIONS 3
-#define ZERO_COPY_SEND_LIMIT 1UL<<23
+#define NUM_DISK_IO_THREADS (Embarcadero::GetConfig().config().network.disk_io_threads.get())
+#define NUM_NETWORK_IO_THREADS (Embarcadero::GetConfig().config().network.io_threads.get())
+#define NUM_SUB_CONNECTIONS (Embarcadero::GetConfig().config().network.sub_connections.get())
+#define ZERO_COPY_SEND_LIMIT (Embarcadero::GetConfig().config().network.zero_copy_send_limit.get())
 
-#define BATCH_SIZE (1UL<<19)
-//#define BATCH_SIZE  786432   
-//#define BATCH_SIZE  589824
-//#define BATCH_SIZE  557056
-//#define BATCH_SIZE 532480
-//#define BATCH_SIZE 524800
-//#define BATCH_SIZE 1048640
+#define BATCH_SIZE (Embarcadero::GetConfig().config().storage.batch_size.get())
 
-#define NUM_DISKS 2 //This must be set manually
+#define NUM_DISKS (Embarcadero::GetConfig().config().storage.num_disks.get())
 
 //********* Corfu configs *********
-#define CORFU_SEQ_PORT 50052
-#define CORFU_REP_PORT 50053
+#define CORFU_SEQ_PORT (Embarcadero::GetConfig().config().corfu.sequencer_port.get())
+#define CORFU_REP_PORT (Embarcadero::GetConfig().config().corfu.replication_port.get())
 
 //********* Scalog configs *********
-#define SCALOG_SEQ_PORT 50051
-#define SCALOG_REP_PORT 50052
-#define SCLAOG_SEQUENCER_IP "192.168.60.173"
+#define SCALOG_SEQ_PORT (Embarcadero::GetConfig().config().scalog.sequencer_port.get())
+#define SCALOG_REP_PORT (Embarcadero::GetConfig().config().scalog.replication_port.get())
+#define SCLAOG_SEQUENCER_IP (Embarcadero::GetConfig().config().scalog.sequencer_ip.get().c_str())
 
-#define SCALOG_SEQ_LOCAL_CUT_INTERVAL 100
+#define SCALOG_SEQ_LOCAL_CUT_INTERVAL (Embarcadero::GetConfig().config().scalog.local_cut_interval.get())
 	
 using GetNumBrokersCallback = std::function<int()>;
 using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers, 
-														struct MessageHeader** msg_to_order, struct TInode *tinode)>;
+														Embarcadero::MessageHeader** msg_to_order, Embarcadero::TInode *tinode)>;
 using CreateTopicEntryCallback = std::function<bool(char*, int, int, bool, int, heartbeat_system::SequencerType)>;
 
 } // End of namespace Embarcadero

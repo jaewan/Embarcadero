@@ -64,6 +64,7 @@ public:
      * Enqueues a network request for processing by worker threads
      */
     void EnqueueRequest(struct NetworkRequest request);
+    bool IsListening() const { return listening_.load(std::memory_order_acquire); }
     
     void SetDiskManager(DiskManager* disk_manager) { disk_manager_ = disk_manager; }
     void SetCXLManager(CXLManager* cxl_manager) { cxl_manager_ = cxl_manager; }
@@ -102,6 +103,7 @@ private:
     int num_reqReceive_threads_;
     std::atomic<int> thread_count_{0};
     bool stop_threads_ = false;
+    std::atomic<bool> listening_{false};
 
     // Acknowledgment management
     absl::flat_hash_map<size_t, int> ack_connections_;  // <client_id, ack_sock>

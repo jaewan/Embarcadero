@@ -1,0 +1,370 @@
+#include "message_ordering.h"
+#include "../cxl_manager/scalog_local_sequencer.h"
+#include <glog/logging.h>
+
+namespace Embarcadero {
+
+MessageOrdering::MessageOrdering(void* cxl_addr, TInode* tinode, int broker_id)
+    : cxl_addr_(cxl_addr),
+      tinode_(tinode),
+      broker_id_(broker_id) {}
+
+MessageOrdering::~MessageOrdering() {
+    StopSequencer();
+}
+
+void MessageOrdering::StartSequencer(SequencerType seq_type, int order, const std::string& topic_name) {
+    // Only head node runs sequencer
+    if (broker_id_ != 0) {
+        return;
+    }
+
+    switch (seq_type) {
+        case KAFKA:
+        case EMBARCADERO:
+            if (order == 1) {
+                LOG(ERROR) << "Sequencer 1 is not ported yet from cxl_manager";
+            } else if (order == 2) {
+                LOG(ERROR) << "Sequencer 2 is not ported yet";
+            } else if (order == 3) {
+                LOG(ERROR) << "Sequencer 3 is not ported yet";
+            } else if (order == 4) {
+                sequencer_thread_ = std::thread(&MessageOrdering::Sequencer4, this);
+            }
+            break;
+        case SCALOG:
+            if (order == 1) {
+                sequencer_thread_ = std::thread(&MessageOrdering::StartScalogLocalSequencer, this, topic_name);
+            } else if (order == 2) {
+                LOG(ERROR) << "Order is set 2 at scalog";
+            }
+            break;
+        case CORFU:
+            if (order == 0 || order == 4) {
+                VLOG(3) << "Order " << order << 
+                    " for Corfu is right as messages are written ordered. Combiner combining is enough";
+            } else {
+                LOG(ERROR) << "Wrong Order is set for corfu " << order;
+            }
+            break;
+        default:
+            LOG(ERROR) << "Unknown sequencer:" << seq_type;
+            break;
+    }
+}
+
+void MessageOrdering::StopSequencer() {
+    stop_threads_ = true;
+    if (sequencer_thread_.joinable()) {
+        sequencer_thread_.join();
+    }
+}
+
+void MessageOrdering::StartScalogLocalSequencer(const std::string& topic_name) {
+    BatchHeader* batch_header = reinterpret_cast<BatchHeader*>(
+        reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+    Scalog::ScalogLocalSequencer scalog_local_sequencer(tinode_, broker_id_, cxl_addr_, topic_name.c_str(), batch_header);
+    scalog_local_sequencer.SendLocalCut(topic_name.c_str(), stop_threads_);
+}
+
+void MessageOrdering::Sequencer4() {
+    absl::btree_set<int> registered_brokers;
+    if (get_registered_brokers_callback_) {
+        get_registered_brokers_callback_(registered_brokers, tinode_);
+    }
+
+    global_seq_ = 0;
+
+    std::vector<std::thread> sequencer4_threads;
+    for (int broker_id : registered_brokers) {
+        sequencer4_threads.emplace_back(
+            &MessageOrdering::BrokerScannerWorker,
+            this,
+            broker_id
+        );
+    }
+
+    for (auto& t : sequencer4_threads) {
+        while (!t.joinable()) {
+            std::this_thread::yield();
+        }
+        t.join();
+    }
+}
+
+void MessageOrdering::BrokerScannerWorker(int broker_id) {
+    // Wait until tinode of the broker is initialized
+    while (tinode_->offsets[broker_id].log_offset == 0) {
+        std::this_thread::yield();
+    }
+
+    BatchHeader* current_batch_header = reinterpret_cast<BatchHeader*>(
+        reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id].batch_headers_offset);
+    if (!current_batch_header) {
+        LOG(ERROR) << "Scanner [Broker " << broker_id << "]: Failed to calculate batch header start address.";
+        return;
+    }
+    BatchHeader* header_for_sub = current_batch_header;
+
+    absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>> skipped_batches;
+
+    while (!stop_threads_) {
+        volatile size_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
+
+        if (num_msg_check == 0 || current_batch_header->log_idx == 0) {
+            if (!ProcessSkipped(skipped_batches, header_for_sub)) {
+                std::this_thread::yield();
+            }
+            continue;
+        }
+
+        BatchHeader* header_to_process = current_batch_header;
+        size_t client_id = current_batch_header->client_id;
+        size_t batch_seq = current_batch_header->batch_seq;
+        bool ready_to_order = false;
+        size_t expected_seq = 0;
+        size_t start_total_order = 0;
+        bool skip_batch = false;
+
+        {
+            absl::MutexLock lock(&global_seq_batch_seq_mu_);
+            auto map_it = next_expected_batch_seq_.find(client_id);
+            if (map_it == next_expected_batch_seq_.end()) {
+                if (batch_seq == 0) {
+                    expected_seq = 0;
+                    start_total_order = global_seq_;
+                    global_seq_ += header_to_process->num_msg;
+                    next_expected_batch_seq_[client_id] = 1;
+                    ready_to_order = true;
+                } else {
+                    skip_batch = true;
+                    ready_to_order = false;
+                    VLOG(4) << "Scanner [B" << broker_id << "]: New client " << client_id 
+                            << ", skipping non-zero first batch " << batch_seq;
+                }
+            } else {
+                expected_seq = map_it->second;
+                if (batch_seq == expected_seq) {
+                    start_total_order = global_seq_;
+                    global_seq_ += header_to_process->num_msg;
+                    map_it->second = expected_seq + 1;
+                    ready_to_order = true;
+                } else if (batch_seq > expected_seq) {
+                    skip_batch = true;
+                    ready_to_order = false;
+                } else {
+                    ready_to_order = false;
+                    LOG(WARNING) << "Scanner [B" << broker_id << "]: Duplicate/old batch seq "
+                                 << batch_seq << " detected from client " << client_id 
+                                 << " (expected " << expected_seq << ")";
+                }
+            }
+        }
+
+        if (skip_batch) {
+            skipped_batches[client_id][batch_seq] = header_to_process;
+            VLOG(3) << "Scanner [B" << broker_id << "]: Skipping batch from client " << client_id 
+                    << ", batch_seq=" << batch_seq << ", expected=" << expected_seq
+                    << ", num_msg=" << header_to_process->num_msg;
+        }
+
+        if (ready_to_order) {
+            AssignOrder(header_to_process, start_total_order, header_for_sub);
+            VLOG(3) << "Scanner [B" << broker_id << "]: Ordered batch from client " << client_id 
+                    << ", batch_seq=" << batch_seq << ", total_order=[" << start_total_order 
+                    << ", " << (start_total_order + header_to_process->num_msg) << ")";
+            ProcessSkipped(skipped_batches, header_for_sub);
+        }
+
+        current_batch_header = reinterpret_cast<BatchHeader*>(
+            reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader)
+        );
+    }
+}
+
+bool MessageOrdering::ProcessSkipped(
+    absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
+    BatchHeader*& header_for_sub) {
+    
+    bool processed_any = false;
+    auto client_skipped_it = skipped_batches.begin();
+    while (client_skipped_it != skipped_batches.end()) {
+        size_t client_id = client_skipped_it->first;
+        auto& client_skipped_map = client_skipped_it->second;
+
+        size_t start_total_order;
+        bool batch_processed;
+        do {
+            batch_processed = false;
+            size_t expected_seq;
+            BatchHeader* batch_header = nullptr;
+            auto batch_it = client_skipped_map.end();
+            {
+                absl::MutexLock lock(&global_seq_batch_seq_mu_);
+
+                auto map_it = next_expected_batch_seq_.find(client_id);
+                if (map_it == next_expected_batch_seq_.end()) break;
+
+                expected_seq = map_it->second;
+                batch_it = client_skipped_map.find(expected_seq);
+
+                if (batch_it != client_skipped_map.end()) {
+                    batch_header = batch_it->second;
+                    start_total_order = global_seq_;
+                    global_seq_ += batch_header->num_msg;
+                    map_it->second = expected_seq + 1;
+                    batch_processed = true;
+                    processed_any = true;
+                    VLOG(4) << "ProcessSkipped [B?]: Client " << client_id 
+                            << ", processing skipped batch " << expected_seq 
+                            << ", reserving seq [" << start_total_order << ", " << global_seq_ << ")";
+                } else {
+                    break;
+                }
+            }
+            if (batch_processed && batch_header) {
+                client_skipped_map.erase(batch_it);
+                AssignOrder(batch_header, start_total_order, header_for_sub);
+            }
+        } while (batch_processed && !client_skipped_map.empty());
+
+        if (client_skipped_map.empty()) {
+            skipped_batches.erase(client_skipped_it++);
+        } else {
+            ++client_skipped_it;
+        }
+    }
+    return processed_any;
+}
+
+void MessageOrdering::AssignOrder(BatchHeader* batch_to_order, size_t start_total_order, BatchHeader*& header_for_sub) {
+    int broker = batch_to_order->broker_id;
+
+    size_t num_messages = batch_to_order->num_msg;
+    if (num_messages == 0) {
+        LOG(WARNING) << "!!!! Orderer: Dequeued batch with zero messages. Skipping !!!";
+        return;
+    }
+
+    MessageHeader* msg_header = reinterpret_cast<MessageHeader*>(
+        batch_to_order->log_idx + reinterpret_cast<uint8_t*>(cxl_addr_)
+    );
+    if (!msg_header) {
+        LOG(ERROR) << "Orderer: Failed to calculate message address for logical offset " << batch_to_order->log_idx;
+        return;
+    }
+    size_t seq = start_total_order;
+    batch_to_order->total_order = seq;
+
+    size_t logical_offset = batch_to_order->start_logical_offset;
+
+    for (size_t i = 0; i < num_messages; ++i) {
+        volatile uint32_t* complete_ptr = &(reinterpret_cast<volatile MessageHeader*>(msg_header)->complete);
+        while (*complete_ptr == 0) {
+            if (stop_threads_) return;
+            std::this_thread::yield();
+        }
+
+        size_t current_padded_size = msg_header->paddedSize;
+
+        msg_header->logical_offset = logical_offset;
+        logical_offset++;
+        msg_header->total_order = seq;
+        seq++;
+        msg_header->next_msg_diff = current_padded_size;
+
+        tinode_->offsets[broker].ordered++;
+        tinode_->offsets[broker].written++;
+
+        msg_header = reinterpret_cast<MessageHeader*>(
+            reinterpret_cast<uint8_t*>(msg_header) + current_padded_size
+        );
+    }
+    header_for_sub->batch_off_to_export = (reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(header_for_sub));
+    header_for_sub->ordered = 1;
+    header_for_sub = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(header_for_sub) + sizeof(BatchHeader));
+}
+
+// MessageCombiner implementation
+MessageCombiner::MessageCombiner(void* cxl_addr,
+                                 void* first_message_addr,
+                                 TInode* tinode,
+                                 TInode* replica_tinode,
+                                 int broker_id)
+    : cxl_addr_(cxl_addr),
+      first_message_addr_(first_message_addr),
+      tinode_(tinode),
+      replica_tinode_(replica_tinode),
+      broker_id_(broker_id) {}
+
+MessageCombiner::~MessageCombiner() {
+    Stop();
+}
+
+void MessageCombiner::Start() {
+    combiner_thread_ = std::thread(&MessageCombiner::CombinerThread, this);
+}
+
+void MessageCombiner::Stop() {
+    stop_thread_ = true;
+    if (combiner_thread_.joinable()) {
+        combiner_thread_.join();
+    }
+}
+
+void MessageCombiner::CombinerThread() {
+    void* segment_header = reinterpret_cast<uint8_t*>(first_message_addr_) - CACHELINE_SIZE;
+    MessageHeader* header = reinterpret_cast<MessageHeader*>(first_message_addr_);
+
+    while (!stop_thread_) {
+        while (header->complete == 0) {
+            if (stop_thread_) {
+                return;
+            }
+            std::this_thread::yield();
+        }
+
+#ifdef MULTISEGMENT
+        if (header->next_msg_diff != 0) {
+            header = reinterpret_cast<MessageHeader*>(
+                reinterpret_cast<uint8_t*>(header) + header->next_msg_diff);
+            segment_header = reinterpret_cast<uint8_t*>(header) - CACHELINE_SIZE;
+            continue;
+        }
+#endif
+
+        header->segment_header = segment_header;
+        header->logical_offset = logical_offset_;
+        header->next_msg_diff = header->paddedSize;
+
+        UpdateTInodeWritten(
+            logical_offset_,
+            static_cast<unsigned long long int>(
+                reinterpret_cast<uint8_t*>(header) - reinterpret_cast<uint8_t*>(cxl_addr_))
+        );
+
+        *reinterpret_cast<unsigned long long int*>(segment_header) =
+            static_cast<unsigned long long int>(
+                reinterpret_cast<uint8_t*>(header) - reinterpret_cast<uint8_t*>(segment_header)
+            );
+
+        written_logical_offset_ = logical_offset_;
+        written_physical_addr_ = reinterpret_cast<void*>(header);
+
+        header = reinterpret_cast<MessageHeader*>(
+            reinterpret_cast<uint8_t*>(header) + header->next_msg_diff);
+        logical_offset_++;
+    }
+}
+
+void MessageCombiner::UpdateTInodeWritten(size_t written, size_t written_addr) {
+    if (tinode_->replicate_tinode && replica_tinode_) {
+        replica_tinode_->offsets[broker_id_].written = written;
+        replica_tinode_->offsets[broker_id_].written_addr = written_addr;
+    }
+
+    tinode_->offsets[broker_id_].written = written;
+    tinode_->offsets[broker_id_].written_addr = written_addr;
+}
+
+} // namespace Embarcadero
