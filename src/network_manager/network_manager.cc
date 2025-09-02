@@ -811,6 +811,12 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 			return tinode->offsets[broker_id_].ordered;
 		}
 
+		// For order=4 with EMBARCADERO, use ordered count instead of replication_done
+		// because Sequencer4 updates ordered counters per broker
+		if(order == 4 && seq_type == EMBARCADERO){
+			return tinode->offsets[broker_id_].ordered;
+		}
+
 		size_t r[replication_factor];
 
 		for (int i = 0; i < replication_factor; i++) {

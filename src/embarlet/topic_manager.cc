@@ -73,10 +73,11 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	if (!tinode) return;
 
 	// Initialize offset values
-	tinode->offsets[broker_id_].ordered = -1;
-	tinode->offsets[broker_id_].written = -1;
+	// Start from 0 instead of -1 to allow initial acknowledgments
+	tinode->offsets[broker_id_].ordered = 0;
+	tinode->offsets[broker_id_].written = 0;
 	for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
-		tinode->offsets[broker_id_].replication_done[i] = -1;
+		tinode->offsets[broker_id_].replication_done[i] = 0;
 	}
 
 	// Calculate log offset using pointer difference plus CACHELINE_SIZE
