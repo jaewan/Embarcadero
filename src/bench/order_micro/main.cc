@@ -130,14 +130,23 @@ int main(int argc, char** argv) {
 
     // Layout per-broker areas: simplistic equal partitioning
     size_t batch_headers_bytes = 256 * 1024 * 1024; // enlarge headers region for sustained raw runs
+    // Split header space into input batch headers and export headers to avoid overlap corruption
+    const size_t bh_input_bytes = batch_headers_bytes / 2;
+    const size_t bh_export_bytes = batch_headers_bytes - bh_input_bytes;
     const size_t per_broker_log = (region_size - batch_headers_bytes) / std::max(brokers, 1);
     uint8_t* base = reinterpret_cast<uint8_t*>(region);
-    size_t per_broker_bh = batch_headers_bytes / std::max(brokers, 1);
-    uint8_t* bh_base = base;
+    const size_t per_broker_bh_input = bh_input_bytes / std::max(brokers, 1);
+    const size_t per_broker_bh_export = bh_export_bytes / std::max(brokers, 1);
+    uint8_t* bh_input_base = base;
+    uint8_t* bh_export_base = base + bh_input_bytes;
     uint8_t* log_base = base + batch_headers_bytes;
 
+    // Zero-initialize input/export header regions to avoid reading stale fields
+    std::memset(bh_input_base, 0, bh_input_bytes);
+    std::memset(bh_export_base, 0, bh_export_bytes);
+
     for (int b = 0; b < brokers; ++b) {
-        tinode->offsets[b].batch_headers_offset = static_cast<size_t>(bh_base + b * per_broker_bh - reinterpret_cast<uint8_t*>(region));
+        tinode->offsets[b].batch_headers_offset = static_cast<size_t>(bh_input_base + b * per_broker_bh_input - reinterpret_cast<uint8_t*>(region));
         tinode->offsets[b].log_offset = static_cast<size_t>(log_base + b * per_broker_log - reinterpret_cast<uint8_t*>(region));
         tinode->offsets[b].written = 0;
         tinode->offsets[b].ordered = 0;
@@ -184,22 +193,27 @@ int main(int argc, char** argv) {
         writers.emplace_back([&, b]() {
             uint8_t* broker_log_ptr = reinterpret_cast<uint8_t*>(region) + tinode->offsets[b].log_offset;
             uint8_t* broker_bh_ptr = reinterpret_cast<uint8_t*>(region) + tinode->offsets[b].batch_headers_offset;
+            uint8_t* broker_export_bh_ptr = bh_export_base + b * per_broker_bh_export;
             uint8_t* broker_log_begin = reinterpret_cast<uint8_t*>(region) + tinode->offsets[b].log_offset;
             uint8_t* broker_log_end = broker_log_begin + per_broker_log;
             size_t logical_offset_next = 0;
 
             const size_t msg_stride = padded_size;
-            size_t max_batches = (per_broker_bh / sizeof(BatchHeader));
+            size_t max_batches = (per_broker_bh_input / sizeof(BatchHeader));
             if (max_batches > 2) max_batches -= 2; // keep two spares to avoid pointer overlap
             const size_t batches_fit_in_log = (batch_size > 0) ? (per_broker_log / (batch_size * msg_stride)) : 0;
             if (batches_fit_in_log > 0) {
                 max_batches = std::min(max_batches, (batches_fit_in_log > 2 ? batches_fit_in_log - 2 : batches_fit_in_log));
             }
+            if (max_batches < 2) max_batches = 2; // ensure ring has at least 2 entries
             const size_t capacity_msgs = (batches_fit_in_log > 0 ? (batches_fit_in_log - 2 > 0 ? batches_fit_in_log - 2 : 0) : 0) * batch_size;
             // Inform orderer of our header ring to enable wrap-around scanning
 #ifdef BUILDING_ORDER_BENCH
             ordering.SetBenchBatchHeaderRing(b, reinterpret_cast<BatchHeader*>(broker_bh_ptr), max_batches);
-            ordering.SetBenchExportHeaderRing(b, reinterpret_cast<BatchHeader*>(broker_bh_ptr), max_batches);
+            size_t max_export_batches = (per_broker_bh_export / sizeof(BatchHeader));
+            if (max_export_batches > 2) max_export_batches -= 2;
+            if (max_export_batches < 2) max_export_batches = 2;
+            ordering.SetBenchExportHeaderRing(b, reinterpret_cast<BatchHeader*>(broker_export_bh_ptr), max_export_batches);
 #endif
             const double batch_interval_sec = (target_msgs_per_s > 0.0)
                 ? static_cast<double>(batch_size) / target_msgs_per_s
