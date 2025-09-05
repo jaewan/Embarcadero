@@ -102,6 +102,7 @@ public:
     // Configure bench behavior
     void SetBenchFlushMetadata(bool enabled) { bench_flush_metadata_ = enabled; }
     void SetBenchPinSequencerCpus(const std::vector<int>& cpus) { bench_seq_cpus_ = cpus; }
+    void SetBenchHeadersOnly(bool enabled) { bench_headers_only_ = enabled; }
 
     // Snapshot per-broker stats (copy out)
     void BenchGetStatsSnapshot(std::vector<std::pair<int, SequencerThreadStats>>& out_stats) {
@@ -116,13 +117,19 @@ public:
         absl::MutexLock l(&bench_ring_mu_);
         bench_batch_header_rings_[broker_id] = {start, num};
     }
+    void SetBenchExportHeaderRing(int broker_id, BatchHeader* start, size_t num) {
+        absl::MutexLock l(&bench_ring_mu_);
+        bench_export_header_rings_[broker_id] = {start, num};
+    }
 private:
     struct BenchRing { BatchHeader* start; size_t num; };
     absl::Mutex bench_ring_mu_;
     absl::flat_hash_map<int, BenchRing> bench_batch_header_rings_;
+    absl::flat_hash_map<int, BenchRing> bench_export_header_rings_;
 
     // Bench instrumentation
     bool bench_flush_metadata_ = false;
+    bool bench_headers_only_ = false;
     std::vector<int> bench_seq_cpus_;
     absl::Mutex bench_stats_mu_;
     absl::flat_hash_map<int, SequencerThreadStats> bench_stats_by_broker_;
