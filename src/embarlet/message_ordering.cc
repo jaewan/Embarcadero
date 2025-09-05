@@ -118,13 +118,38 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
         std::this_thread::yield();
     }
 
-    BatchHeader* current_batch_header = reinterpret_cast<BatchHeader*>(
+    BatchHeader* ring_start_default = reinterpret_cast<BatchHeader*>(
         reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id].batch_headers_offset);
+    BatchHeader* current_batch_header = ring_start_default;
+    BatchHeader* ring_end = nullptr;
+    // Export header ring (where we publish ordered entries)
+    BatchHeader* export_ring_start = ring_start_default;
+    BatchHeader* export_ring_end = nullptr;
+#ifdef BUILDING_ORDER_BENCH
+    {
+        absl::MutexLock l(&bench_ring_mu_);
+        auto it = bench_batch_header_rings_.find(broker_id);
+        if (it != bench_batch_header_rings_.end() && it->second.start != nullptr && it->second.num > 0) {
+            ring_start_default = it->second.start;
+            current_batch_header = ring_start_default;
+            ring_end = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(ring_start_default) + it->second.num * sizeof(BatchHeader));
+        }
+        auto it2 = bench_export_header_rings_.find(broker_id);
+        if (it2 != bench_export_header_rings_.end() && it2->second.start != nullptr && it2->second.num > 0) {
+            export_ring_start = it2->second.start;
+            export_ring_end = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(export_ring_start) + it2->second.num * sizeof(BatchHeader));
+        } else {
+            // Default export ring matches batch header ring if not provided
+            export_ring_start = ring_start_default;
+            export_ring_end = ring_end;
+        }
+    }
+#endif
     if (!current_batch_header) {
         LOG(ERROR) << "Scanner [Broker " << broker_id << "]: Failed to calculate batch header start address.";
         return;
     }
-    BatchHeader* header_for_sub = current_batch_header;
+    BatchHeader* header_for_sub = export_ring_start;
 #ifdef BUILDING_ORDER_BENCH
     SequencerThreadStats* stats_ptr = nullptr;
     {
@@ -142,6 +167,11 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
             if (!ProcessSkipped(skipped_batches, header_for_sub)) {
                 std::this_thread::yield();
             }
+            // advance to next header in the ring even if not ready
+            current_batch_header = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
+#ifdef BUILDING_ORDER_BENCH
+            if (ring_end && current_batch_header >= ring_end) current_batch_header = ring_start_default;
+#endif
             continue;
         }
 
@@ -150,6 +180,7 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
         if (stats_ptr) stats_ptr->num_batches_seen++;
 #endif
         size_t client_id = current_batch_header->client_id;
+        size_t client_key = (static_cast<size_t>(broker_id) << 32) | client_id;
         size_t batch_seq = current_batch_header->batch_seq;
         bool ready_to_order = false;
         size_t expected_seq = 0;
@@ -157,7 +188,7 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
         bool skip_batch = false;
 
         // Per-client sharded critical section with atomic global range reservation
-        ClientState* state = GetOrCreateClientState(client_id);
+        ClientState* state = GetOrCreateClientState(client_key);
         {
             auto lock_start = std::chrono::steady_clock::now();
             absl::MutexLock l(&state->mu);
@@ -192,7 +223,7 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
         }
 
         if (skip_batch) {
-            skipped_batches[client_id][batch_seq] = header_to_process;
+            skipped_batches[client_key][batch_seq] = header_to_process;
             VLOG(3) << "Scanner [B" << broker_id << "]: Skipping batch from client " << client_id 
                     << ", batch_seq=" << batch_seq << ", expected=" << expected_seq
                     << ", num_msg=" << header_to_process->num_msg;
@@ -228,6 +259,9 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
         current_batch_header = reinterpret_cast<BatchHeader*>(
             reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader)
         );
+#ifdef BUILDING_ORDER_BENCH
+        if (ring_end && current_batch_header >= ring_end) current_batch_header = ring_start_default;
+#endif
     }
 }
 
@@ -238,7 +272,7 @@ bool MessageOrdering::ProcessSkipped(
     bool processed_any = false;
     auto client_skipped_it = skipped_batches.begin();
     while (client_skipped_it != skipped_batches.end()) {
-        size_t client_id = client_skipped_it->first;
+        size_t client_key = client_skipped_it->first;
         auto& client_skipped_map = client_skipped_it->second;
 
         size_t start_total_order;
@@ -249,7 +283,7 @@ bool MessageOrdering::ProcessSkipped(
             BatchHeader* batch_header = nullptr;
             auto batch_it = client_skipped_map.end();
             {
-                ClientState* state = GetOrCreateClientState(client_id);
+                ClientState* state = GetOrCreateClientState(client_key);
                 auto lock_start = std::chrono::steady_clock::now();
                 absl::MutexLock l(&state->mu);
                 auto lock_end = std::chrono::steady_clock::now();
@@ -270,7 +304,7 @@ bool MessageOrdering::ProcessSkipped(
                     state->expected_seq = expected_seq + 1;
                     batch_processed = true;
                     processed_any = true;
-                    VLOG(4) << "ProcessSkipped [B?]: Client " << client_id 
+                    VLOG(4) << "ProcessSkipped [B?]: ClientKey " << client_key 
                             << ", processing skipped batch " << expected_seq 
                             << ", reserving seq [" << start_total_order << ", " << (start_total_order + batch_header->num_msg) << ")";
                 } else {
@@ -324,36 +358,54 @@ void MessageOrdering::AssignOrder(BatchHeader* batch_to_order, size_t start_tota
     size_t logical_offset = batch_to_order->start_logical_offset;
 
     for (size_t i = 0; i < num_messages; ++i) {
-        volatile uint32_t* complete_ptr = &(reinterpret_cast<volatile MessageHeader*>(msg_header)->complete);
-        while (*complete_ptr == 0) {
+        if (!bench_headers_only_) {
+            volatile uint32_t* complete_ptr = &(reinterpret_cast<volatile MessageHeader*>(msg_header)->complete);
+            while (*complete_ptr == 0) {
 #ifdef BUILDING_ORDER_BENCH
-            if (bench_flush_metadata_) {
-                // Best-effort CLFLUSH to simulate uncached read cost
-                asm volatile("clflush (%0)" :: "r"(complete_ptr));
-            }
+                if (bench_flush_metadata_) {
+                    // Best-effort CLFLUSH to simulate uncached read cost
+                    asm volatile("clflush (%0)" :: "r"(complete_ptr));
+                }
 #endif
-            if (stop_threads_) return;
-            std::this_thread::yield();
+                if (stop_threads_) return;
+                std::this_thread::yield();
+            }
+
+            size_t current_padded_size = msg_header->paddedSize;
+
+            msg_header->logical_offset = logical_offset;
+            logical_offset++;
+            msg_header->total_order = seq;
+            seq++;
+            msg_header->next_msg_diff = current_padded_size;
+
+            msg_header = reinterpret_cast<MessageHeader*>(
+                reinterpret_cast<uint8_t*>(msg_header) + current_padded_size
+            );
+        } else {
+            // Headers-only: skip touching per-message payloads/headers aside from advancing logical/seq
+            logical_offset += 1;
+            seq += 1;
         }
 
-        size_t current_padded_size = msg_header->paddedSize;
-
-        msg_header->logical_offset = logical_offset;
-        logical_offset++;
-        msg_header->total_order = seq;
-        seq++;
-        msg_header->next_msg_diff = current_padded_size;
-
-        // Update ordered once per message; do not advance written here (written is producer-side)
+        // Update ordered once per message
         tinode_->offsets[broker].ordered++;
-
-        msg_header = reinterpret_cast<MessageHeader*>(
-            reinterpret_cast<uint8_t*>(msg_header) + current_padded_size
-        );
     }
     header_for_sub->batch_off_to_export = (reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(header_for_sub));
     header_for_sub->ordered = 1;
     header_for_sub = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(header_for_sub) + sizeof(BatchHeader));
+#ifdef BUILDING_ORDER_BENCH
+    // Wrap export header pointer if we reached the end of its ring
+    {
+        absl::MutexLock l(&bench_ring_mu_);
+        auto it = bench_export_header_rings_.find(broker);
+        if (it != bench_export_header_rings_.end() && it->second.start) {
+            BatchHeader* start = it->second.start;
+            BatchHeader* end = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(start) + it->second.num * sizeof(BatchHeader));
+            if (end && header_for_sub >= end) header_for_sub = start;
+        }
+    }
+#endif
 }
 
 // MessageCombiner implementation

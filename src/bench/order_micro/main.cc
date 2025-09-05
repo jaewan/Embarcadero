@@ -51,6 +51,8 @@ int main(int argc, char** argv) {
         ("target_msgs_per_s", "Per-broker target message rate (0 = unlimited)", cxxopts::value<double>()->default_value("0"))
         ("use_real_cxl", "Use real CXL mapping via CXLManager (0/1)", cxxopts::value<int>()->default_value("1"))
         ("flush_metadata", "Flush metadata cachelines to emulate uncached reads (0/1)", cxxopts::value<int>()->default_value("0"))
+        ("pin_seq_cpus", "Comma-separated CPU list to pin sequencer threads (e.g., 0,2,4)", cxxopts::value<std::string>()->default_value(""))
+        ("headers_only", "Order without per-message memory touches (0/1)", cxxopts::value<int>()->default_value("1"))
         ("csv_out", "Write per-run CSV summary to this file", cxxopts::value<std::string>())
         ("per_thread_csv", "Write per-thread stats CSV to this file", cxxopts::value<std::string>())
         ("broker_head_ip", "Head IP for CXLManager (if needed)", cxxopts::value<std::string>()->default_value("127.0.0.1"))
@@ -82,6 +84,8 @@ int main(int argc, char** argv) {
     const bool write_thread_csv = result.count("per_thread_csv") > 0;
     const std::string csv_path = write_csv ? result["csv_out"].as<std::string>() : std::string();
     const std::string thread_csv_path = write_thread_csv ? result["per_thread_csv"].as<std::string>() : std::string();
+    const std::string pin_seq_cpus = result["pin_seq_cpus"].as<std::string>();
+    const bool headers_only = result["headers_only"].as<int>() != 0;
     const std::string head_ip = result["broker_head_ip"].as<std::string>();
 
     auto align_up = [](size_t x, size_t a) -> size_t {
@@ -150,6 +154,25 @@ int main(int argc, char** argv) {
     ordering.StartSequencer(SequencerType::EMBARCADERO, /*order=*/4, /*topic=*/"bench");
 #ifdef BUILDING_ORDER_BENCH
     ordering.SetBenchFlushMetadata(flush_metadata);
+    ordering.SetBenchHeadersOnly(headers_only);
+    if (!pin_seq_cpus.empty()) {
+        std::vector<int> cpus;
+        size_t start = 0;
+        while (start < pin_seq_cpus.size()) {
+            size_t comma = pin_seq_cpus.find(',', start);
+            std::string token = pin_seq_cpus.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            if (!token.empty()) {
+                try {
+                    cpus.push_back(std::stoi(token));
+                } catch (...) {}
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        if (!cpus.empty()) {
+            ordering.SetBenchPinSequencerCpus(cpus);
+        }
+    }
 #endif
 
     // Writer threads creating batches and messages
@@ -167,12 +190,17 @@ int main(int argc, char** argv) {
 
             const size_t msg_stride = padded_size;
             size_t max_batches = (per_broker_bh / sizeof(BatchHeader));
-            if (max_batches > 0) max_batches -= 1; // keep one spare
+            if (max_batches > 2) max_batches -= 2; // keep two spares to avoid pointer overlap
             const size_t batches_fit_in_log = (batch_size > 0) ? (per_broker_log / (batch_size * msg_stride)) : 0;
             if (batches_fit_in_log > 0) {
-                max_batches = std::min(max_batches, batches_fit_in_log - 1);
+                max_batches = std::min(max_batches, (batches_fit_in_log > 2 ? batches_fit_in_log - 2 : batches_fit_in_log));
             }
-            const size_t capacity_msgs = (batches_fit_in_log > 0 ? batches_fit_in_log - 1 : 0) * batch_size;
+            const size_t capacity_msgs = (batches_fit_in_log > 0 ? (batches_fit_in_log - 2 > 0 ? batches_fit_in_log - 2 : 0) : 0) * batch_size;
+            // Inform orderer of our header ring to enable wrap-around scanning
+#ifdef BUILDING_ORDER_BENCH
+            ordering.SetBenchBatchHeaderRing(b, reinterpret_cast<BatchHeader*>(broker_bh_ptr), max_batches);
+            ordering.SetBenchExportHeaderRing(b, reinterpret_cast<BatchHeader*>(broker_bh_ptr), max_batches);
+#endif
             const double batch_interval_sec = (target_msgs_per_s > 0.0)
                 ? static_cast<double>(batch_size) / target_msgs_per_s
                 : 0.0;
@@ -203,7 +231,7 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                auto* batch_header = reinterpret_cast<BatchHeader*>(broker_bh_ptr + batch_index * sizeof(BatchHeader));
+                auto* batch_header = reinterpret_cast<BatchHeader*>(broker_bh_ptr + (batch_index % max_batches) * sizeof(BatchHeader));
                 // Choose client
                 size_t client_id = static_cast<size_t>(rr_client);
                 rr_client = (rr_client + 1) % clients_per_broker;
@@ -284,8 +312,10 @@ int main(int argc, char** argv) {
     std::vector<size_t> prev_ordered(brokers, 0);
     std::cout << "Warmup for " << warmup_s << "s..." << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(warmup_s));
-    // Reset baselines at measurement start, and switch to full speed (raw)
-    full_speed.store(true, std::memory_order_relaxed);
+    // Reset baselines at measurement start. Switch to full speed only if unpaced.
+    if (target_msgs_per_s == 0.0) {
+        full_speed.store(true, std::memory_order_relaxed);
+    }
     for (int b = 0; b < brokers; ++b) prev_ordered[b] = tinode->offsets[b].ordered;
 
     // prev_ordered already initialized above
