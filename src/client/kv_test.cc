@@ -16,6 +16,7 @@ class KVStoreBenchmark {
 		std::vector<std::string> test_values_;
 		size_t num_keys_;
 		size_t value_size_;
+		size_t ops_per_iter_;
 		std::mt19937 gen_;
 		std::atomic<bool> test_complete_{false};
 		absl::Mutex mutex_;
@@ -51,10 +52,11 @@ class KVStoreBenchmark {
 		}
 
 	public:
-		KVStoreBenchmark(DistributedKVStore& kv_store, size_t num_keys = 10000, size_t value_size = 100)
+		KVStoreBenchmark(DistributedKVStore& kv_store, size_t num_keys = 10000, size_t value_size = 100, size_t ops_per_iter = 0)
 			: kv_store_(kv_store),
 			num_keys_(num_keys),
 			value_size_(value_size),
+			ops_per_iter_(ops_per_iter == 0 ? num_keys : ops_per_iter),
 			gen_(std::random_device{}()) {
 				generateTestData();
 			}
@@ -113,7 +115,7 @@ class KVStoreBenchmark {
 					// Collect batches for multi-put
 					std::vector<std::vector<KeyValue>> batches;
 
-					size_t total_ops = std::min(num_keys_, 10000000000UL); // Cap at 100K operations
+					size_t total_ops = ops_per_iter_;
 					size_t num_batches = (total_ops + batch_size - 1) / batch_size;
 
 					for (size_t i = 0; i < num_batches; ++i) {
@@ -123,8 +125,9 @@ class KVStoreBenchmark {
 
 						for (size_t j = start; j < end; ++j) {
 							KeyValue kv;
-							kv.key = keys_subset[j];
-							kv.value = values_subset[j];
+							size_t idx = j % num_keys_;
+							kv.key = keys_subset[idx];
+							kv.value = values_subset[idx];
 							batch.push_back(kv);
 						}
 
@@ -132,7 +135,7 @@ class KVStoreBenchmark {
 					}
 
 					// Execute and time the multi-put operations
-					auto start_time = std::chrono::high_resolution_clock::now();
+					auto start_time = std::chrono::steady_clock::now();
 
 					size_t last_request_id = 0;
 					for (const auto& batch : batches) {
@@ -141,11 +144,11 @@ class KVStoreBenchmark {
 
 					kv_store_.waitUntilApplied(last_request_id);
 
-					auto end_time = std::chrono::high_resolution_clock::now();
-					auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+					auto end_time = std::chrono::steady_clock::now();
+					std::chrono::duration<double> elapsed = end_time - start_time; // seconds
 
-					double latency_ms = static_cast<double>(duration.count()) / batches.size();
-					double throughput = (static_cast<double>(total_ops) / duration.count()) * 1000.0;
+					double latency_ms = (elapsed.count() * 1000.0) / static_cast<double>(batches.size());
+					double throughput = static_cast<double>(total_ops) / elapsed.count();
 
 					total_throughput += throughput;
 					total_latency += latency_ms;
@@ -191,7 +194,7 @@ class KVStoreBenchmark {
 					// Collect batches for multi-get
 					std::vector<std::vector<std::string>> batches;
 
-					size_t total_ops = std::min(num_keys_, 10000000000UL);
+					size_t total_ops = ops_per_iter_;
 					size_t num_batches = (total_ops + batch_size - 1) / batch_size;
 
 					for (size_t i = 0; i < num_batches; ++i) {
@@ -200,7 +203,8 @@ class KVStoreBenchmark {
 						size_t end = std::min(start + batch_size, total_ops);
 
 						for (size_t j = start; j < end; ++j) {
-							batch.push_back(keys_subset[j]);
+							size_t idx = j % num_keys_;
+							batch.push_back(keys_subset[idx]);
 						}
 
 						batches.push_back(std::move(batch));
@@ -210,7 +214,7 @@ class KVStoreBenchmark {
 					//kv_store_.waitForSyncWithLog();
 
 					// Execute and time the multi-get operations
-					auto start_time = std::chrono::high_resolution_clock::now();
+					auto start_time = std::chrono::steady_clock::now();
 
 					for (const auto& batch : batches) {
 						// Execute multi-get operation
@@ -222,11 +226,11 @@ class KVStoreBenchmark {
 						}
 					}
 
-					auto end_time = std::chrono::high_resolution_clock::now();
-					auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+					auto end_time = std::chrono::steady_clock::now();
+					std::chrono::duration<double> elapsed = end_time - start_time; // seconds
 
-					double latency_ms = static_cast<double>(duration.count()) / batches.size();
-					double throughput = (static_cast<double>(total_ops) / duration.count()) * 1000.0;
+					double latency_ms = (elapsed.count() * 1000.0) / static_cast<double>(batches.size());
+					double throughput = static_cast<double>(total_ops) / elapsed.count();
 
 					total_throughput += throughput;
 					total_latency += latency_ms;
@@ -386,7 +390,11 @@ int main(int argc, char* argv[]) {
 		("min_batch", "Minimum batch size", cxxopts::value<size_t>()->default_value("1"))
 		("max_batch", "Maximum batch size", cxxopts::value<size_t>()->default_value("128"))
 		("i,iterations", "Number of iterations per batch size", cxxopts::value<int>()->default_value("5"))
+		("pub_msg", "Publisher message size (bytes)", cxxopts::value<size_t>()->default_value("65536"))
+		("ack", "Publisher ack level", cxxopts::value<int>()->default_value("0"))
+		("pub_threads", "Publisher threads", cxxopts::value<int>()->default_value("3"))
 		("populate_only", "Only populate store, don't run benchmark", cxxopts::value<bool>()->default_value("false"))
+		("b,num_brokers", "Expected number of brokers (for connection timeout)", cxxopts::value<int>()->default_value("4"))
 		("h,help", "Print usage");
 
 	auto result = options.parse(argc, argv);
@@ -411,12 +419,19 @@ int main(int argc, char* argv[]) {
 	LOG(INFO) << "Value size: " << value_size << " bytes";
 	LOG(INFO) << "Batch size range: " << min_batch << " to " << max_batch;
 	LOG(INFO) << "Iterations per batch: " << iterations;
+	LOG(INFO) << "Expected brokers: " << result["num_brokers"].as<int>();
 
 	// Create the distributed KV store
-	DistributedKVStore kv_store(seq_type);
+	DistributedKVStore kv_store(
+			seq_type,
+			result["pub_threads"].as<int>(),
+			result["pub_msg"].as<size_t>(),
+			result["ack"].as<int>());
 
 	// Create and run the benchmark
-	KVStoreBenchmark benchmark(kv_store, num_keys, value_size);
+	// Increase ops per iteration to a large value to reduce timing noise (default: num_keys)
+	size_t ops_per_iter = std::max(num_keys, static_cast<size_t>(500000));
+	KVStoreBenchmark benchmark(kv_store, num_keys, value_size, ops_per_iter);
 
 	// Populate the store with initial data
 	benchmark.populateStore();

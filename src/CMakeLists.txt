@@ -243,6 +243,9 @@ set_target_properties(corfu_global_sequencer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Benchmarks and microtests
+add_subdirectory(bench)
+
 # Configuration test executable
 add_executable(config_test
     common/config_example.cc

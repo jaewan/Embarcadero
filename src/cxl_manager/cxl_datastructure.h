@@ -60,6 +60,9 @@ struct alignas(64) BatchHeader{
 	size_t log_idx;	// Sequencer4: relative log offset to the payload of the batch and elative offset to last message
 	uint32_t client_id;
 	uint32_t num_msg;
+#ifdef BUILDING_ORDER_BENCH
+    uint64_t publish_ts_ns;
+#endif
 };
 
 

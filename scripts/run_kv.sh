@@ -1,127 +1,162 @@
 #!/bin/bash
 
-pushd ../build/bin/
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")"/.. && pwd)"
+BUILD_DIR="$REPO_ROOT/build"
+BIN_DIR="$BUILD_DIR/bin"
 
 NUM_BROKERS=4
 REMOTE_IP="192.168.60.173"
 REMOTE_USER="domin"
-PASSLESS_ENTRY="~/.ssh/id_rsa"
-REMOTE_BIN_DIR="~/Jae/Embarcadero/build/bin"
+PASSLESS_ENTRY="$HOME/.ssh/id_rsa"
+REMOTE_BIN_DIR="/home/${REMOTE_USER}/Jae/Embarcadero/build/bin"
 REMOTE_PID_FILE="/tmp/remote_seq.pid"
 
 # Define the configurations
 declare -a configs=(
-  "sequencer=EMBARCADERO"
-  "sequencer=CORFU"
-  "sequencer=SCALOG"
+	"sequencer=EMBARCADERO"
+	"sequencer=CORFU"
+	"sequencer=SCALOG"
 )
 
 wait_for_signal() {
-  while true; do
-    read -r signal <script_signal_pipe
-    if [ "$signal" ]; then
-      echo "Received signal: $signal"
-      break
-    fi
-  done
+	local timeout_sec=${1:-20}
+	if command -v timeout >/dev/null 2>&1; then
+		if signal=$(timeout ${timeout_sec}s cat script_signal_pipe); then
+			echo "Received signal: ${signal}"
+		else
+			echo "No signal within ${timeout_sec}s, continuing..."
+		fi
+	else
+		# Fallback without timeout utility
+		local start_ts=$(date +%s)
+		while true; do
+			if read -r signal < script_signal_pipe; then
+				if [ "$signal" ]; then
+					echo "Received signal: $signal"
+					break
+				fi
+			fi
+			now=$(date +%s)
+			if [ $((now - start_ts)) -ge ${timeout_sec} ]; then
+				echo "No signal within ${timeout_sec}s, continuing..."
+				break
+			fi
+		done
+	fi
 }
 
 # Function to start a process
 start_process() {
-  local command=$1
-  $command &
-  pid=$!
-  echo "Started process with command '$command' and PID $pid"
-  pids+=($pid)
+	local command=$1
+	$command &
+	pid=$!
+	echo "Started process with command '$command' and PID $pid"
+	pids+=($pid)
 }
 
 start_remote_sequencer() {
-  local sequencer_bin=$1  # e.g., scalog_global_sequencer or corfu_global_sequencer
-  echo "Starting remote sequencer on $REMOTE_IP..."
-
-  ssh -o StrictHostKeyChecking=no -i "$PASSLESS_ENTRY" "$REMOTE_USER@$REMOTE_IP" bash <<EOF
-    cd $REMOTE_BIN_DIR
-    nohup ./$sequencer_bin > /tmp/${sequencer_bin}.log 2>&1 &
-    echo \$! > $REMOTE_PID_FILE
-EOF
+	local sequencer_bin=$1  # e.g., scalog_global_sequencer or corfu_global_sequencer
+	echo "Starting remote sequencer on $REMOTE_IP..."
+	ssh -o StrictHostKeyChecking=no -i "$PASSLESS_ENTRY" "$REMOTE_USER@$REMOTE_IP" "\
+		cd '$REMOTE_BIN_DIR' && \
+		nohup './$sequencer_bin' > '/tmp/${sequencer_bin}.log' 2>&1 & echo \$! > '$REMOTE_PID_FILE'"
 }
 
 stop_remote_sequencer() {
-  echo "Stopping remote sequencer on $REMOTE_IP..."
-  ssh -o StrictHostKeyChecking=no -i "$PASSLESS_ENTRY" "$REMOTE_USER@$REMOTE_IP" bash <<EOF
-    if [ -f $REMOTE_PID_FILE ]; then
-      kill \$(cat $REMOTE_PID_FILE) 2>/dev/null
-      rm -f $REMOTE_PID_FILE
-    fi
-EOF
+	echo "Stopping remote sequencer on $REMOTE_IP..."
+	ssh -o StrictHostKeyChecking=no -i "$PASSLESS_ENTRY" "$REMOTE_USER@$REMOTE_IP" "\
+		if [ -f '$REMOTE_PID_FILE' ]; then \
+			kill \$(cat '$REMOTE_PID_FILE') 2>/dev/null || true; \
+			rm -f '$REMOTE_PID_FILE'; \
+		fi"
 }
 
+# Build if needed
+mkdir -p "$BUILD_DIR"
+cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build "$BUILD_DIR" -j >/dev/null
+
 # Create output directories if they don't exist
-mkdir -p ../../data/kv/
+mkdir -p "$REPO_ROOT/data/kv/"
+
+pushd "$BIN_DIR" >/dev/null
 
 for config in "${configs[@]}"; do
 	echo "============================================================"
-    echo "Running configuration: $config"
-    echo "============================================================"
+	echo "Running configuration: $config"
+	echo "============================================================"
 
-    # Evaluate the configuration string to set variables
-    eval "$config"
+	# Evaluate the configuration string to set variables
+	eval "$config"
 
-    # Array to store process IDs
-    pids=()
+	# Array to store process IDs
+	pids=()
 
-    rm -f script_signal_pipe
-    mkfifo script_signal_pipe
+	rm -f script_signal_pipe || true
+	mkfifo script_signal_pipe
 
-    # Run experiments for each message size
-	echo "Running with message size $msg_size | Order: $order | Sequencer: $sequencer | Mode: $mode"
+	echo "Launching brokers for sequencer: $sequencer"
 
 	# Start remote sequencer if needed
 	if [[ "$sequencer" == "CORFU" ]]; then
-	  start_remote_sequencer "corfu_global_sequencer"
+		start_remote_sequencer "corfu_global_sequencer"
 	elif [[ "$sequencer" == "SCALOG" ]]; then
-	  start_remote_sequencer "scalog_global_sequencer"
+		start_remote_sequencer "scalog_global_sequencer"
 	fi
 
 	# Start the processes
-	start_process "./embarlet --head --$sequencer"
-	wait_for_signal
-	head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
-	sleep 3
+	start_process "./embarlet --head --$sequencer --config $REPO_ROOT/config/embarcadero.yaml"
+	wait_for_signal 20
+	sleep 1
 	for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-	  start_process "./embarlet --$sequencer"
-	  wait_for_signal
+		start_process "./embarlet --$sequencer --config $REPO_ROOT/config/embarcadero.yaml"
+		wait_for_signal 20
 	done
-	sleep 3
+	sleep 2
 
-	start_process "./kv_test --sequencer $sequencer"
+	start_process "./kv_test --sequencer $sequencer --num_brokers $NUM_BROKERS"
 
-	# Wait for all processes to finish
+	# Wait for kv_test to finish
+	kv_pid=${pids[-1]}
+	wait "$kv_pid"
+	echo "kv_test finished (PID $kv_pid)"
+
+	# Terminate brokers
 	for pid in "${pids[@]}"; do
-	  wait $pid
-	  echo "Process with PID $pid finished"
+		if [[ "$pid" != "$kv_pid" ]]; then
+			# Wait up to 20s for process to exit on its own
+			for i in {1..20}; do
+				if ! kill -0 "$pid" 2>/dev/null; then
+					break
+				fi
+				sleep 1
+			done
+			# If still running, send SIGTERM then SIGKILL as last resort
+			if kill -0 "$pid" 2>/dev/null; then
+				kill "$pid" 2>/dev/null || true
+				sleep 1
+				if kill -0 "$pid" 2>/dev/null; then
+					kill -9 "$pid" 2>/dev/null || true
+				fi
+			fi
+		fi
 	done
-
-	echo "All processes have finished for message size $msg_size in $mode mode"
-	pids=()  # Clear the pids array for the next trial
 
 	# Stop remote process after each trial
 	if [[ "$sequencer" == "CORFU" || "$sequencer" == "SCALOG" ]]; then
-	  stop_remote_sequencer
+		stop_remote_sequencer
 	fi
-	sleep 3
+	sleep 1
 
 	# Move results to appropriate directory
-	mv multi_get_results.csv ../../data/kv/${sequencer}_get.csv
-	mv multi_put_results.csv ../../data/kv/${sequencer}_put.csv
+	mv -f multi_get_results.csv "$REPO_ROOT/data/kv/${sequencer}_get.csv" || true
+	mv -f multi_put_results.csv "$REPO_ROOT/data/kv/${sequencer}_put.csv" || true
 
-    rm -f script_signal_pipe
+	rm -f script_signal_pipe || true
 done
 
-# Plot results for this mode
-popd
-pushd ../data/kv/
-python3 plot_kv.py
-popd
+popd >/dev/null
 
-echo "All experiments have finished."
+echo "All experiments have finished. Results in $REPO_ROOT/data/kv/."

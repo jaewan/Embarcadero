@@ -36,7 +36,7 @@ const Configuration& GetConfig();
 #define TOPIC_NAME_SIZE_CONFIG (Embarcadero::GetConfig().config().storage.topic_name_size.get())
 #define CGROUP_CORE (Embarcadero::GetConfig().config().broker.cgroup_core.get())
 
-#define NUM_MAX_BROKERS 16  // Fixed size for compile-time array declarations
+#define NUM_MAX_BROKERS 32  // Fixed size for compile-time array declarations
 #define NUM_MAX_BROKERS_CONFIG (Embarcadero::GetConfig().config().broker.max_brokers.get())
 #define CXL_SIZE (Embarcadero::GetConfig().config().cxl.size.get())
 #define CXL_EMUL_SIZE (Embarcadero::GetConfig().config().cxl.emulation_size.get())
