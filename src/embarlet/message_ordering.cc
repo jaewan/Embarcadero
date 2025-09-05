@@ -1,6 +1,11 @@
 #include "message_ordering.h"
+#ifndef BUILDING_ORDER_BENCH
 #include "../cxl_manager/scalog_local_sequencer.h"
+#endif
+#include "topic.h"
 #include <glog/logging.h>
+#include <chrono>
+#include <thread>
 
 namespace Embarcadero {
 
@@ -61,10 +66,16 @@ void MessageOrdering::StopSequencer() {
 }
 
 void MessageOrdering::StartScalogLocalSequencer(const std::string& topic_name) {
+#ifdef BUILDING_ORDER_BENCH
+    (void)topic_name;
+    return;
+#else
     BatchHeader* batch_header = reinterpret_cast<BatchHeader*>(
         reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
     Scalog::ScalogLocalSequencer scalog_local_sequencer(tinode_, broker_id_, cxl_addr_, topic_name.c_str(), batch_header);
-    scalog_local_sequencer.SendLocalCut(topic_name.c_str(), stop_threads_);
+    bool stop = stop_threads_.load(std::memory_order_relaxed);
+    scalog_local_sequencer.SendLocalCut(topic_name.c_str(), stop);
+#endif
 }
 
 void MessageOrdering::Sequencer4() {
@@ -78,9 +89,18 @@ void MessageOrdering::Sequencer4() {
     std::vector<std::thread> sequencer4_threads;
     for (int broker_id : registered_brokers) {
         sequencer4_threads.emplace_back(
-            &MessageOrdering::BrokerScannerWorker,
-            this,
-            broker_id
+            [this, broker_id]() {
+#ifdef BUILDING_ORDER_BENCH
+                // Optional pinning for sequencer threads
+                if (!bench_seq_cpus_.empty()) {
+                    cpu_set_t cpuset;
+                    CPU_ZERO(&cpuset);
+                    for (int cpu : bench_seq_cpus_) CPU_SET(cpu, &cpuset);
+                    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+                }
+#endif
+                BrokerScannerWorker(broker_id);
+            }
         );
     }
 
@@ -105,6 +125,13 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
         return;
     }
     BatchHeader* header_for_sub = current_batch_header;
+#ifdef BUILDING_ORDER_BENCH
+    SequencerThreadStats* stats_ptr = nullptr;
+    {
+        absl::MutexLock l(&bench_stats_mu_);
+        stats_ptr = &bench_stats_by_broker_[broker_id];
+    }
+#endif
 
     absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>> skipped_batches;
 
@@ -119,6 +146,9 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
         }
 
         BatchHeader* header_to_process = current_batch_header;
+#ifdef BUILDING_ORDER_BENCH
+        if (stats_ptr) stats_ptr->num_batches_seen++;
+#endif
         size_t client_id = current_batch_header->client_id;
         size_t batch_seq = current_batch_header->batch_seq;
         bool ready_to_order = false;
@@ -126,38 +156,38 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
         size_t start_total_order = 0;
         bool skip_batch = false;
 
+        // Per-client sharded critical section with atomic global range reservation
+        ClientState* state = GetOrCreateClientState(client_id);
         {
-            absl::MutexLock lock(&global_seq_batch_seq_mu_);
-            auto map_it = next_expected_batch_seq_.find(client_id);
-            if (map_it == next_expected_batch_seq_.end()) {
-                if (batch_seq == 0) {
-                    expected_seq = 0;
-                    start_total_order = global_seq_;
-                    global_seq_ += header_to_process->num_msg;
-                    next_expected_batch_seq_[client_id] = 1;
-                    ready_to_order = true;
-                } else {
-                    skip_batch = true;
-                    ready_to_order = false;
-                    VLOG(4) << "Scanner [B" << broker_id << "]: New client " << client_id 
-                            << ", skipping non-zero first batch " << batch_seq;
+            auto lock_start = std::chrono::steady_clock::now();
+            absl::MutexLock l(&state->mu);
+            auto lock_end = std::chrono::steady_clock::now();
+#ifdef BUILDING_ORDER_BENCH
+            if (stats_ptr) stats_ptr->lock_acquire_time_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(lock_end - lock_start).count();
+#endif
+            expected_seq = state->expected_seq;
+            if (batch_seq == expected_seq) {
+                start_total_order = global_seq_.fetch_add(header_to_process->num_msg, std::memory_order_relaxed);
+#ifdef BUILDING_ORDER_BENCH
+                if (stats_ptr) {
+                    stats_ptr->atomic_fetch_add_count++;
+                    stats_ptr->atomic_claimed_msgs += header_to_process->num_msg;
                 }
+#endif
+                state->expected_seq = expected_seq + 1;
+                ready_to_order = true;
+            } else if (batch_seq > expected_seq) {
+                skip_batch = true;
+#ifdef BUILDING_ORDER_BENCH
+                if (stats_ptr) stats_ptr->num_batches_skipped++;
+#endif
             } else {
-                expected_seq = map_it->second;
-                if (batch_seq == expected_seq) {
-                    start_total_order = global_seq_;
-                    global_seq_ += header_to_process->num_msg;
-                    map_it->second = expected_seq + 1;
-                    ready_to_order = true;
-                } else if (batch_seq > expected_seq) {
-                    skip_batch = true;
-                    ready_to_order = false;
-                } else {
-                    ready_to_order = false;
-                    LOG(WARNING) << "Scanner [B" << broker_id << "]: Duplicate/old batch seq "
-                                 << batch_seq << " detected from client " << client_id 
-                                 << " (expected " << expected_seq << ")";
-                }
+                LOG(WARNING) << "Scanner [B" << broker_id << "]: Duplicate/old batch seq "
+                             << batch_seq << " detected from client " << client_id
+                             << " (expected " << expected_seq << ")";
+#ifdef BUILDING_ORDER_BENCH
+                if (stats_ptr) stats_ptr->num_duplicates++;
+#endif
             }
         }
 
@@ -169,7 +199,26 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
         }
 
         if (ready_to_order) {
+#ifdef BUILDING_ORDER_BENCH
+            auto t0 = std::chrono::steady_clock::now();
+            // Record end-to-end batch ordering latency from publish to order
+            if (stats_ptr) {
+                uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
+                uint64_t pub_ns = 0;
+                pub_ns = header_to_process->publish_ts_ns;
+                if (pub_ns != 0 && now_ns >= pub_ns) {
+                    stats_ptr->batch_order_latency_ns.push_back(now_ns - pub_ns);
+                }
+            }
+#endif
             AssignOrder(header_to_process, start_total_order, header_for_sub);
+#ifdef BUILDING_ORDER_BENCH
+            auto t1 = std::chrono::steady_clock::now();
+            if (stats_ptr) {
+                stats_ptr->time_in_assign_order_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                stats_ptr->num_batches_ordered++;
+            }
+#endif
             VLOG(3) << "Scanner [B" << broker_id << "]: Ordered batch from client " << client_id 
                     << ", batch_seq=" << batch_seq << ", total_order=[" << start_total_order 
                     << ", " << (start_total_order + header_to_process->num_msg) << ")";
@@ -200,31 +249,47 @@ bool MessageOrdering::ProcessSkipped(
             BatchHeader* batch_header = nullptr;
             auto batch_it = client_skipped_map.end();
             {
-                absl::MutexLock lock(&global_seq_batch_seq_mu_);
-
-                auto map_it = next_expected_batch_seq_.find(client_id);
-                if (map_it == next_expected_batch_seq_.end()) break;
-
-                expected_seq = map_it->second;
+                ClientState* state = GetOrCreateClientState(client_id);
+                auto lock_start = std::chrono::steady_clock::now();
+                absl::MutexLock l(&state->mu);
+                auto lock_end = std::chrono::steady_clock::now();
+                expected_seq = state->expected_seq;
                 batch_it = client_skipped_map.find(expected_seq);
-
                 if (batch_it != client_skipped_map.end()) {
                     batch_header = batch_it->second;
-                    start_total_order = global_seq_;
-                    global_seq_ += batch_header->num_msg;
-                    map_it->second = expected_seq + 1;
+                    start_total_order = global_seq_.fetch_add(batch_header->num_msg, std::memory_order_relaxed);
+#ifdef BUILDING_ORDER_BENCH
+                    {
+                        absl::MutexLock l2(&bench_stats_mu_);
+                        auto& s = bench_stats_by_broker_[static_cast<int>(batch_header->broker_id)];
+                        s.lock_acquire_time_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(lock_end - lock_start).count();
+                        s.atomic_fetch_add_count++;
+                        s.atomic_claimed_msgs += batch_header->num_msg;
+                    }
+#endif
+                    state->expected_seq = expected_seq + 1;
                     batch_processed = true;
                     processed_any = true;
                     VLOG(4) << "ProcessSkipped [B?]: Client " << client_id 
                             << ", processing skipped batch " << expected_seq 
-                            << ", reserving seq [" << start_total_order << ", " << global_seq_ << ")";
+                            << ", reserving seq [" << start_total_order << ", " << (start_total_order + batch_header->num_msg) << ")";
                 } else {
-                    break;
+                    // no ready skipped batch
                 }
             }
             if (batch_processed && batch_header) {
                 client_skipped_map.erase(batch_it);
+                auto t0 = std::chrono::steady_clock::now();
                 AssignOrder(batch_header, start_total_order, header_for_sub);
+#ifdef BUILDING_ORDER_BENCH
+                auto t1 = std::chrono::steady_clock::now();
+                {
+                    absl::MutexLock l(&bench_stats_mu_);
+                    auto& s = bench_stats_by_broker_[static_cast<int>(batch_header->broker_id)];
+                    s.time_in_assign_order_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                    s.num_batches_ordered++;
+                }
+#endif
             }
         } while (batch_processed && !client_skipped_map.empty());
 
@@ -261,6 +326,12 @@ void MessageOrdering::AssignOrder(BatchHeader* batch_to_order, size_t start_tota
     for (size_t i = 0; i < num_messages; ++i) {
         volatile uint32_t* complete_ptr = &(reinterpret_cast<volatile MessageHeader*>(msg_header)->complete);
         while (*complete_ptr == 0) {
+#ifdef BUILDING_ORDER_BENCH
+            if (bench_flush_metadata_) {
+                // Best-effort CLFLUSH to simulate uncached read cost
+                asm volatile("clflush (%0)" :: "r"(complete_ptr));
+            }
+#endif
             if (stop_threads_) return;
             std::this_thread::yield();
         }
@@ -273,8 +344,8 @@ void MessageOrdering::AssignOrder(BatchHeader* batch_to_order, size_t start_tota
         seq++;
         msg_header->next_msg_diff = current_padded_size;
 
+        // Update ordered once per message; do not advance written here (written is producer-side)
         tinode_->offsets[broker].ordered++;
-        tinode_->offsets[broker].written++;
 
         msg_header = reinterpret_cast<MessageHeader*>(
             reinterpret_cast<uint8_t*>(msg_header) + current_padded_size
@@ -313,6 +384,7 @@ void MessageCombiner::Stop() {
 }
 
 void MessageCombiner::CombinerThread() {
+    // Use known cacheline size from topic.h
     void* segment_header = reinterpret_cast<uint8_t*>(first_message_addr_) - CACHELINE_SIZE;
     MessageHeader* header = reinterpret_cast<MessageHeader*>(first_message_addr_);
 
@@ -348,7 +420,7 @@ void MessageCombiner::CombinerThread() {
                 reinterpret_cast<uint8_t*>(header) - reinterpret_cast<uint8_t*>(segment_header)
             );
 
-        written_logical_offset_ = logical_offset_;
+        written_logical_offset_.store(logical_offset_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         written_physical_addr_ = reinterpret_cast<void*>(header);
 
         header = reinterpret_cast<MessageHeader*>(

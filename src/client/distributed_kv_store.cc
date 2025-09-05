@@ -16,39 +16,42 @@ size_t std::hash<OperationId>::operator()(const OperationId& id) const {
 
 // Serialize log entry to a byte array
 std::vector<char> LogEntry::serialize() const {
-	std::ostringstream oss;
-
-	// Write operation ID, Use message header's client_id and order instead
-	//oss.write(reinterpret_cast<const char*>(&opId.clientId), sizeof(opId.clientId));
-	//oss.write(reinterpret_cast<const char*>(&opId.requestId), sizeof(opId.requestId));
-
-	// Write operation type
-	uint8_t opTypeValue = static_cast<uint8_t>(type);
-	oss.write(reinterpret_cast<const char*>(&opTypeValue), sizeof(opTypeValue));
-
-	// Write transaction ID
-	oss.write(reinterpret_cast<const char*>(&transactionId), sizeof(transactionId));
-
-	// Write KV pairs count
-	uint32_t pairCount = static_cast<uint32_t>(kvPairs.size());
-	oss.write(reinterpret_cast<const char*>(&pairCount), sizeof(pairCount));
-
-	// Write each KV pair
+	// Compute total size: type(1) + txid(8) + pairCount(4) + sum of (keyLen(4)+key + valLen(4)+val)
+	size_t total_size = sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t);
 	for (const auto& kv : kvPairs) {
-		// Write key length and key
-		uint32_t keyLength = static_cast<uint32_t>(kv.key.length());
-		oss.write(reinterpret_cast<const char*>(&keyLength), sizeof(keyLength));
-		oss.write(kv.key.c_str(), keyLength);
-
-		// Write value length and value
-		uint32_t valueLength = static_cast<uint32_t>(kv.value.length());
-		oss.write(reinterpret_cast<const char*>(&valueLength), sizeof(valueLength));
-		oss.write(kv.value.c_str(), valueLength);
+		total_size += sizeof(uint32_t) + kv.key.size();
+		total_size += sizeof(uint32_t) + kv.value.size();
 	}
+	std::vector<char> out;
+	out.resize(total_size);
+	size_t offset = 0;
 
-	// Convert to vector<char>
-	std::string serialized = oss.str();
-	return std::vector<char>(serialized.begin(), serialized.end());
+	// type
+	uint8_t opTypeValue = static_cast<uint8_t>(type);
+	memcpy(out.data() + offset, &opTypeValue, sizeof(opTypeValue));
+	offset += sizeof(opTypeValue);
+	// txid
+	memcpy(out.data() + offset, &transactionId, sizeof(transactionId));
+	offset += sizeof(transactionId);
+	// pair count
+	uint32_t pairCount = static_cast<uint32_t>(kvPairs.size());
+	memcpy(out.data() + offset, &pairCount, sizeof(pairCount));
+	offset += sizeof(pairCount);
+
+	for (const auto& kv : kvPairs) {
+		uint32_t keyLength = static_cast<uint32_t>(kv.key.size());
+		memcpy(out.data() + offset, &keyLength, sizeof(keyLength));
+		offset += sizeof(keyLength);
+		memcpy(out.data() + offset, kv.key.data(), keyLength);
+		offset += keyLength;
+
+		uint32_t valueLength = static_cast<uint32_t>(kv.value.size());
+		memcpy(out.data() + offset, &valueLength, sizeof(valueLength));
+		offset += sizeof(valueLength);
+		memcpy(out.data() + offset, kv.value.data(), valueLength);
+		offset += valueLength;
+	}
+	return out;
 }
 
 // Deserialize from a byte array
@@ -105,7 +108,10 @@ LogEntry LogEntry::deserialize(const void* data, size_t client_id, size_t client
 }
 
 // DistributedKVStore implementation
-DistributedKVStore::DistributedKVStore(SequencerType seq_type)
+DistributedKVStore::DistributedKVStore(SequencerType seq_type,
+								 int publisher_threads,
+								 size_t publisher_message_size,
+								 int ack_level)
 	: last_request_id_(0),
 	last_applied_total_order_(0),
 	last_transaction_id_(0),
@@ -119,8 +125,7 @@ DistributedKVStore::DistributedKVStore(SequencerType seq_type)
 		stub_ = HeartBeat::NewStub(
 				grpc::CreateChannel("127.0.0.1:" + std::to_string(BROKER_PORT), 
 					grpc::InsecureChannelCredentials()));
-		int ack_level = 0;
-		int num_threads = 3;
+		int num_threads = publisher_threads;
 		int order = 0;
 		if(SequencerType::EMBARCADERO == seq_type){
 			order = 4;
@@ -134,32 +139,42 @@ DistributedKVStore::DistributedKVStore(SequencerType seq_type)
 
 		subscriber_ = std::unique_ptr<Subscriber>(new Subscriber("127.0.0.1", std::to_string(BROKER_PORT), topic));
 		publisher_ = std::unique_ptr<Publisher>(new Publisher(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
-				num_threads, 1024, (1UL<<33), order, seq_type));
+				num_threads, publisher_message_size, (1UL<<33), order, seq_type));
 		publisher_->Init(ack_level);
 		server_id_ = publisher_->GetClientId();
 
-		subscriber_->WaitUntilAllConnected(); // Asuume there exists NUM_MAX_BROKERS
+		// Wait until all brokers (as per runtime config) have established subscriber connections
+		subscriber_->WaitUntilAllConnected();
 		log_consumer_threads_.emplace_back(&DistributedKVStore::logConsumer, this);
 	}
 
 DistributedKVStore::~DistributedKVStore() {
-	publisher_->~Publisher();
-	subscriber_->~Subscriber();
-
-	// Terminate Embarcadero Cluster
-	google::protobuf::Empty request, response;
-	grpc::ClientContext context;
-	stub_->TerminateCluster(&context, request, &response);
-	VLOG(3) <<"DistributedKVStore Destructing";
-
+	VLOG(3) << "DistributedKVStore Destructing";
+	// Stop consumer loop and wake subscriber to exit
 	running_ = false;
-
-	for (auto &t: log_consumer_threads_){
+	if (subscriber_) {
+		subscriber_->Shutdown();
+	}
+	for (auto &t : log_consumer_threads_) {
 		if (t.joinable()) {
 			t.join();
 		}
 	}
-	VLOG(3) <<"DistributedKVStore Destructed";
+	log_consumer_threads_.clear();
+
+	// Terminate Embarcadero Cluster
+	google::protobuf::Empty request, response;
+	grpc::ClientContext context;
+	if (stub_) {
+		stub_->TerminateCluster(&context, request, &response);
+	}
+
+	// Release resources
+	publisher_.reset();
+	subscriber_.reset();
+	stub_.reset();
+
+	VLOG(3) << "DistributedKVStore Destructed";
 }
 
 void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t size,
@@ -229,7 +244,9 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				kv_store_.put(key, value);
 
 				// If this is our own request, complete the pending operation
-				completeOperation(client_order);
+				if (client_id == server_id_) {
+					completeOperation(client_order);
+				}
 				break;
 			}
 
@@ -261,14 +278,17 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				kv_store_.remove(key);
 
 				// If this is our own request, complete the pending operation
-				completeOperation(client_order);
+				if (client_id == server_id_) {
+					completeOperation(client_order);
+				}
 				break;
 			}
 
 		case OpType::MULTI_PUT: 
 			{
-				// Process multiple PUT operations
-				std::vector<std::pair<std::string, std::string>> kvPairs;
+				// Process multiple PUT operations with thread-local scratch to reduce allocs
+				thread_local std::vector<std::pair<std::string, std::string>> kvPairs;
+				kvPairs.clear();
 				kvPairs.reserve(pairCount);
 
 				for (uint32_t i = 0; i < pairCount; ++i) {
@@ -300,7 +320,9 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				kv_store_.multiPut(kvPairs);
 
 				// If this is our own request, complete the pending operation
-				completeOperation(client_order);
+				if (client_id == server_id_) {
+					completeOperation(client_order);
+				}
 				break;
 			}
 
@@ -417,6 +439,7 @@ void DistributedKVStore::logConsumer() {
 	while (running_) {
 		Embarcadero::MessageHeader *header =	(Embarcadero::MessageHeader*)subscriber_->Consume();
 		if(header == nullptr){
+			if (!running_) break;
 			std::this_thread::yield();
 			continue;
 		}
@@ -512,8 +535,9 @@ void DistributedKVStore::waitForSyncWithLog(){
 // This only works when there's single client.
 // Change following function to track pending_ops_ if there's multi client
 void DistributedKVStore::waitUntilApplied(size_t total_order){
+	// Now treat the argument as opid and wait for pending set to clear it
 	publisher_->WriteFinishedOrPuased();
-	while(total_order > last_applied_total_order_){
+	while (!opFinished(total_order)){
 		std::this_thread::yield();
 	}
 }

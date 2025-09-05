@@ -1,4 +1,7 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
+
+# Suppress deprecation warnings from bundled dependencies
+set(CMAKE_WARN_DEPRECATED OFF)
 
 project(Embarcadero VERSION 0.1
         DESCRIPTION "Pubsub with disaggregated memory"
@@ -16,6 +19,7 @@ set(CMAKE_PARALLEL_LEVEL 16)
 
 include(FetchContent)
 set(ABSL_ENABLE_INSTALL OFF) # Do NOT install Abseil
+set(ABSL_PROPAGATE_CXX_STD ON) # Suppress Abseil warning about C++ standard propagation
 set(gRPC_INSTALL OFF)       # Do NOT install gRPC
 set(protobuf_INSTALL OFF)  # Do NOT install Protobuf
 

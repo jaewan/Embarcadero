@@ -976,9 +976,9 @@ void* Subscriber::Consume(int timeout_ms) {
 			}
 		}
 
-		// Iterate buffers
+		// Iterate buffers with a timeout window
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-		do{
+		while (std::chrono::steady_clock::now() <= deadline) {
 			for (auto& [fd, pair] : acquired_buffers){
 				std::pair<void*, size_t> written_loc = pair.first->get_write_location();
 				void* written_ptr = written_loc.first;
@@ -1003,7 +1003,9 @@ void* Subscriber::Consume(int timeout_ms) {
 					continue;
 				}
 			}
-		}while(std::chrono::steady_clock::now() >= deadline);
+			// Reduce busy waiting
+			std::this_thread::yield();
+		}
 
     return nullptr;
 }

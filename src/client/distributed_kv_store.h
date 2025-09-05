@@ -253,7 +253,10 @@ class DistributedKVStore {
 
 	public:
 		// Constructor - now initializes the thread pool with a configurable number of threads
-		explicit DistributedKVStore(SequencerType seq_type);
+		explicit DistributedKVStore(SequencerType seq_type,
+								 int publisher_threads = 3,
+								 size_t publisher_message_size = (64 * 1024),
+								 int ack_level = 0);
 
 		// Destructor
 		~DistributedKVStore();
@@ -281,7 +284,8 @@ class DistributedKVStore {
 		uint64_t getLastAppliedIndex() const;
 
 		bool opFinished(OPID opId){
-			return last_applied_total_order_ >= opId;
+			absl::MutexLock lock(&pending_ops_mutex_);
+			return pending_ops_.find(opId) == pending_ops_.end();
 		}
 };
 

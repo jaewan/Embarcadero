@@ -178,18 +178,34 @@ class Subscriber {
 
 		void WaitUntilAllConnected(){
 			size_t num_connections = 0;
-			size_t expected = NUM_MAX_BROKERS * NUM_SUB_CONNECTIONS;
+			// Use runtime-configured broker count to avoid hanging when fewer than NUM_MAX_BROKERS are used
+			size_t expected = NUM_MAX_BROKERS_CONFIG * NUM_SUB_CONNECTIONS;
+			LOG(INFO) << "Waiting for " << expected << " connections (brokers=" << NUM_MAX_BROKERS_CONFIG 
+				<< ", sub_connections=" << NUM_SUB_CONNECTIONS << ")";
+			
+			auto start_time = std::chrono::steady_clock::now();
 			while (num_connections < expected) {
 				{
 					absl::ReaderMutexLock map_lock(&connection_map_mutex_);
 					num_connections = connections_.size();
 				}
 				if(num_connections < expected){
-					std::this_thread::yield();
+					auto now = std::chrono::steady_clock::now();
+					auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
+					if (elapsed.count() > 30) { // 30 second timeout
+						LOG(WARNING) << "Timeout waiting for connections. Got " << num_connections 
+							<< "/" << expected << " after " << elapsed.count() << " seconds";
+						break;
+					}
+					if (elapsed.count() % 5 == 0 && elapsed.count() > 0) {
+						LOG(INFO) << "Still waiting for connections: " << num_connections << "/" << expected;
+					}
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				}else{
 					break;
 				}
 			}
+			LOG(INFO) << "Connection wait complete: " << num_connections << "/" << expected;
 		}
 
 	private:
