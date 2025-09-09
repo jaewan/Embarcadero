@@ -63,10 +63,6 @@ private:
     absl::Mutex client_states_mu_;
     absl::flat_hash_map<size_t, std::unique_ptr<ClientState>> client_states_;
     ClientState* GetOrCreateClientState(size_t client_id) {
-        {
-            auto it = client_states_.find(client_id);
-            if (it != client_states_.end()) return it->second.get();
-        }
         absl::MutexLock g(&client_states_mu_);
         auto it = client_states_.find(client_id);
         if (it != client_states_.end()) return it->second.get();

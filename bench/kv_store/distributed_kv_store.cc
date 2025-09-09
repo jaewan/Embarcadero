@@ -3,6 +3,7 @@
 #include "distributed_kv_store.h"
 
 #include <sstream>
+#include <chrono>
 
 // OperationId implementation
 bool OperationId::operator==(const OperationId& other) const {
@@ -109,13 +110,13 @@ LogEntry LogEntry::deserialize(const void* data, size_t client_id, size_t client
 
 // DistributedKVStore implementation
 DistributedKVStore::DistributedKVStore(SequencerType seq_type,
-								 int publisher_threads,
-								 size_t publisher_message_size,
-								 int ack_level)
+							 int publisher_threads,
+							 size_t publisher_message_size,
+							 int ack_level)
 	: last_request_id_(0),
-	last_applied_total_order_(0),
-	last_transaction_id_(0),
-	running_(true) {
+		last_applied_total_order_(0),
+		last_transaction_id_(0),
+		running_(true) {
 
 		char topic[TOPIC_NAME_SIZE];
 		memset(topic, 0, TOPIC_NAME_SIZE);
@@ -146,7 +147,7 @@ DistributedKVStore::DistributedKVStore(SequencerType seq_type,
 		// Wait until all brokers (as per runtime config) have established subscriber connections
 		subscriber_->WaitUntilAllConnected();
 		log_consumer_threads_.emplace_back(&DistributedKVStore::logConsumer, this);
-	}
+}
 
 DistributedKVStore::~DistributedKVStore() {
 	VLOG(3) << "DistributedKVStore Destructing";
@@ -245,6 +246,15 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 
 				// If this is our own request, complete the pending operation
 				if (client_id == server_id_) {
+					{
+						absl::MutexLock l(&lat_mutex_);
+						auto it = op_start_ts_.find(opId.requestId);
+						if (it != op_start_ts_.end()) {
+							double dur_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it->second).count();
+							apply_latencies_ms_.push_back(dur_ms);
+							op_start_ts_.erase(it);
+						}
+					}
 					completeOperation(client_order);
 				}
 				break;
@@ -279,6 +289,15 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 
 				// If this is our own request, complete the pending operation
 				if (client_id == server_id_) {
+					{
+						absl::MutexLock l(&lat_mutex_);
+						auto it = op_start_ts_.find(opId.requestId);
+						if (it != op_start_ts_.end()) {
+							double dur_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it->second).count();
+							apply_latencies_ms_.push_back(dur_ms);
+							op_start_ts_.erase(it);
+						}
+					}
 					completeOperation(client_order);
 				}
 				break;
@@ -321,6 +340,15 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 
 				// If this is our own request, complete the pending operation
 				if (client_id == server_id_) {
+					{
+						absl::MutexLock l(&lat_mutex_);
+						auto it = op_start_ts_.find(opId.requestId);
+						if (it != op_start_ts_.end()) {
+							double dur_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it->second).count();
+							apply_latencies_ms_.push_back(dur_ms);
+							op_start_ts_.erase(it);
+						}
+					}
 					completeOperation(client_order);
 				}
 				break;
@@ -431,7 +459,7 @@ void DistributedKVStore::completeOperation(OPID opId){
 		 }else {
 		 LOG(ERROR) << "This operation does not belong to us";
 		 }
-		 */
+	 */
 }
 
 // Process messages in without caring total_order
@@ -490,9 +518,12 @@ size_t DistributedKVStore::put(const std::string& key, const std::string& value)
 		absl::MutexLock lock(&pending_ops_mutex_);
 		pending_ops_.insert(opid);
 	}
-
 	// Publish to log
 	auto serialized = entry.serialize();
+	{
+		absl::MutexLock l(&lat_mutex_);
+		op_start_ts_[opid] = std::chrono::steady_clock::now();
+	}
 	publisher_->Publish(serialized.data(), serialized.size());
 
 	return client_order;
@@ -517,9 +548,12 @@ size_t DistributedKVStore::multiPut(const std::vector<KeyValue>& kvPairs) {
 		absl::MutexLock lock(&pending_ops_mutex_);
 		pending_ops_.insert(opid);
 	}
-
 	// Publish to log
 	auto serialized = entry.serialize();
+	{
+		absl::MutexLock l(&lat_mutex_);
+		op_start_ts_[opid] = std::chrono::steady_clock::now();
+	}
 	publisher_->Publish(serialized.data(), serialized.size());
 
 	return client_order;
@@ -530,14 +564,15 @@ void DistributedKVStore::waitForSyncWithLog(){
 	return;
 }
 
-// Used by Client to wait for their submitted request
-// Usually client submits multiple requests, and call this on the last order
-// This only works when there's single client.
-// Change following function to track pending_ops_ if there's multi client
+void DistributedKVStore::waitForSyncWithLog(OPID min_client_opid){
+	while (!opFinished(min_client_opid)){
+		std::this_thread::yield();
+	}
+}
+
 void DistributedKVStore::waitUntilApplied(size_t total_order){
-	// Now treat the argument as opid and wait for pending set to clear it
-	publisher_->WriteFinishedOrPuased();
-	while (!opFinished(total_order)){
+	// Wait until the local KV store has applied up to at least total_order
+	while (getLastAppliedIndex() < total_order) {
 		std::this_thread::yield();
 	}
 }
@@ -558,4 +593,20 @@ std::vector<std::pair<std::string, std::string>> DistributedKVStore::multiGet(
 
 	// Use ShardedKVStore's multiGet for better performance
 	return kv_store_.multiGet(keys);
+}
+
+std::unordered_map<std::string, std::string> DistributedKVStore::getState() {
+	// Not implemented in this snippet
+	return {};
+}
+
+uint64_t DistributedKVStore::getLastAppliedIndex() const {
+	return last_applied_total_order_.load();
+}
+
+std::vector<double> DistributedKVStore::collectApplyLatenciesAndReset(){
+	absl::MutexLock l(&lat_mutex_);
+	std::vector<double> out;
+	out.swap(apply_latencies_ms_);
+	return out;
 }

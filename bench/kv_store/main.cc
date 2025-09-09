@@ -92,16 +92,18 @@ class KVStoreBenchmark {
 		// Run multi-put benchmark with varying batch sizes
 		void runMultiPutBenchmark(const std::vector<size_t>& batch_sizes, int iterations = 5) {
 			std::cout << "\nRunning Multi-Put Benchmark..." << std::endl;
-			std::cout << "-------------------------------------------------" << std::endl;
-			std::cout << "Batch Size | Throughput (ops/sec) | Latency (ms)" << std::endl;
-			std::cout << "-------------------------------------------------" << std::endl;
+			std::cout << "---------------------------------------------------------------------------------------------" << std::endl;
+			std::cout << "Batch Size | KV ops/sec | Log appends/sec | Avg batch latency (ms) | apply p50(ms) p95 p99" << std::endl;
+			std::cout << "---------------------------------------------------------------------------------------------" << std::endl;
 
 			std::ofstream csv_file("multi_put_results.csv");
-			csv_file << "batch_size,throughput_ops_per_sec,latency_ms" << std::endl;
+			csv_file << "batch_size,kv_throughput_ops_per_sec,log_appends_per_sec,avg_batch_latency_ms,apply_p50_ms,apply_p95_ms,apply_p99_ms" << std::endl;
 
 			for (size_t batch_size : batch_sizes) {
-				double total_throughput = 0.0;
-				double total_latency = 0.0;
+				double total_kv_throughput = 0.0;
+				double total_log_appends = 0.0;
+				double total_avg_batch_latency = 0.0;
+				std::vector<double> all_apply_latencies;
 
 				// Run multiple iterations to get reliable results
 				for (int iter = 0; iter < iterations; ++iter) {
@@ -147,26 +149,53 @@ class KVStoreBenchmark {
 					auto end_time = std::chrono::steady_clock::now();
 					std::chrono::duration<double> elapsed = end_time - start_time; // seconds
 
-					double latency_ms = (elapsed.count() * 1000.0) / static_cast<double>(batches.size());
-					double throughput = static_cast<double>(total_ops) / elapsed.count();
+					double avg_batch_latency_ms = (elapsed.count() * 1000.0) / static_cast<double>(batches.size());
+					double kv_throughput = static_cast<double>(total_ops) / elapsed.count();
+					double log_appends = static_cast<double>(num_batches) / elapsed.count();
 
-					total_throughput += throughput;
-					total_latency += latency_ms;
+					total_kv_throughput += kv_throughput;
+					total_log_appends += log_appends;
+					total_avg_batch_latency += avg_batch_latency_ms;
+
+					// Collect per-op apply latencies
+					auto lats = kv_store_.collectApplyLatenciesAndReset();
+					all_apply_latencies.insert(all_apply_latencies.end(), lats.begin(), lats.end());
 				}
 
 				// Calculate averages
-				double avg_throughput = total_throughput / iterations;
-				double avg_latency = total_latency / iterations;
+				double avg_kv_throughput = total_kv_throughput / iterations;
+				double avg_log_appends = total_log_appends / iterations;
+				double avg_batch_latency_ms = total_avg_batch_latency / iterations;
+
+				// Compute percentiles for apply latencies
+				auto percentile = [](std::vector<double>& v, double p) -> double {
+					if (v.empty()) return 0.0;
+					size_t n = v.size();
+					size_t idx = static_cast<size_t>(p * (n - 1));
+					std::nth_element(v.begin(), v.begin() + idx, v.end());
+					double val = v[idx];
+					return val;
+				};
+				// Work on a copy for multiple percentiles
+				std::vector<double> lcopy = all_apply_latencies;
+				double p50 = percentile(lcopy, 0.50);
+				lcopy = all_apply_latencies;
+				double p95 = percentile(lcopy, 0.95);
+				lcopy = all_apply_latencies;
+				double p99 = percentile(lcopy, 0.99);
 
 				std::cout << std::setw(10) << batch_size << " | "
-					<< std::setw(20) << std::fixed << std::setprecision(2) << avg_throughput << " | "
-					<< std::setw(12) << std::fixed << std::setprecision(2) << avg_latency << std::endl;
+					<< std::setw(12) << std::fixed << std::setprecision(2) << avg_kv_throughput << " | "
+					<< std::setw(16) << std::fixed << std::setprecision(2) << avg_log_appends << " | "
+					<< std::setw(20) << std::fixed << std::setprecision(2) << avg_batch_latency_ms << " | "
+					<< std::fixed << std::setprecision(2) << p50 << " " << p95 << " " << p99 << std::endl;
 
-				csv_file << batch_size << "," << avg_throughput << "," << avg_latency << std::endl;
+				csv_file << batch_size << "," << avg_kv_throughput << "," << avg_log_appends << "," << avg_batch_latency_ms
+						<< "," << p50 << "," << p95 << "," << p99 << std::endl;
 			}
 
 			csv_file.close();
-			std::cout << "-------------------------------------------------" << std::endl;
+			std::cout << "---------------------------------------------------------------------------------------------" << std::endl;
 			std::cout << "Results saved to multi_put_results.csv" << std::endl;
 		}
 

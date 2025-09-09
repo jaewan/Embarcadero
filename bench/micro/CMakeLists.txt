@@ -1,16 +1,18 @@
 cmake_minimum_required(VERSION 3.16)
 
+find_package(cxxopts REQUIRED)
+
 add_executable(order_micro_bench
-    order_micro/main.cc
-    ../embarlet/message_ordering.cc
+    order_micro_main.cc
     cxl_shm_wrapper.cc
-    ../common/configuration.cc
+    ../../src/embarlet/message_ordering.cc
+    ../../src/common/configuration.cc
 )
 
 target_include_directories(order_micro_bench PUBLIC
-    "${CMAKE_CURRENT_BINARY_DIR}/.."
+    "${CMAKE_CURRENT_BINARY_DIR}/../../src"
     "${PROJECT_BINARY_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src"
 )
 
 target_link_libraries(order_micro_bench
@@ -32,5 +34,3 @@ set_target_properties(order_micro_bench PROPERTIES
 )
 
 target_compile_definitions(order_micro_bench PRIVATE BUILDING_ORDER_BENCH)
-
-

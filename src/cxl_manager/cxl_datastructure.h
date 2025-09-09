@@ -61,6 +61,9 @@ struct alignas(64) BatchHeader{
 	uint32_t client_id;
 	uint32_t num_msg;
 #ifdef BUILDING_ORDER_BENCH
+	uint32_t gen;
+#endif
+#ifdef BUILDING_ORDER_BENCH
     uint64_t publish_ts_ns;
 #endif
 };

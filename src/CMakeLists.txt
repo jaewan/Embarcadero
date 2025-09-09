@@ -147,51 +147,6 @@ set_target_properties(throughput_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
-add_executable(kv_test
-	client/distributed_kv_store.cc
-	client/distributed_kv_store.h
-    client/publisher.cc
-    client/publisher.h
-    client/subscriber.cc
-    client/subscriber.h
-    client/common.cc
-    client/common.h
-    client/buffer.cc
-    client/buffer.h
-    client/kv_test.cc
-    common/configuration.cc
-    common/configuration.h
-)
-
-target_include_directories(kv_test PUBLIC
-    "${CMAKE_CURRENT_BINARY_DIR}"
-    "${PROJECT_BINARY_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/client"
-    "${CMAKE_CURRENT_SOURCE_DIR}"
-)
-
-target_link_libraries(kv_test
-    glog::glog
-    gflags
-    mimalloc
-    cxxopts::cxxopts
-    heartbeat_grpc_proto
-    corfu_sequencer_grpc_proto
-    grpc++_reflection
-    grpc++
-    protobuf::libprotobuf
-    ${FOLLY_LIBRARIES}
-    Threads::Threads
-    yaml-cpp
-)
-
-set_target_properties(kv_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-)
-
-set_target_properties(kv_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-)
 
 add_executable(scalog_global_sequencer
     cxl_manager/scalog_global_sequencer.cc
@@ -243,8 +198,6 @@ set_target_properties(corfu_global_sequencer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
-# Benchmarks and microtests
-add_subdirectory(bench)
 
 # Configuration test executable
 add_executable(config_test

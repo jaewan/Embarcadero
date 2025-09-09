@@ -46,6 +46,7 @@ find_package(yaml-cpp REQUIRED)
 
 # Add subdirectories
 add_subdirectory(src)
+add_subdirectory(bench)
 # add_subdirectory(test)  # Temporarily disabled to focus on main build
 
 # Benchmarks

@@ -5,15 +5,17 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/flat_hash_map.h"
 
-#include "common.h"
-#include "publisher.h"
-#include "subscriber.h"
+#include "client/common.h"
+#include "client/publisher.h"
+#include "client/subscriber.h"
 
 #include <shared_mutex>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
 #include <future>
+#include <chrono>
+#include <vector>
 
 // Unique identifier for operations
 struct OperationId {
@@ -237,6 +239,11 @@ class DistributedKVStore {
 		std::unique_ptr<Publisher> publisher_;
 		std::unique_ptr<Subscriber> subscriber_;
 
+		// Latency instrumentation
+		absl::Mutex lat_mutex_;
+		absl::flat_hash_map<OPID, std::chrono::steady_clock::time_point> op_start_ts_ ABSL_GUARDED_BY(lat_mutex_);
+		std::vector<double> apply_latencies_ms_ ABSL_GUARDED_BY(lat_mutex_);
+
 		// Process a log entry against the local state
 		void processLogEntry(const LogEntry& entry, uint64_t logPosition);
 		void processLogEntryFromRawBuffer(const void* data, size_t size,
@@ -287,6 +294,12 @@ class DistributedKVStore {
 			absl::MutexLock lock(&pending_ops_mutex_);
 			return pending_ops_.find(opId) == pending_ops_.end();
 		}
+
+		// Read-your-writes barrier
+		void waitForSyncWithLog(OPID min_client_opid);
+
+		// Collect and reset apply latencies
+		std::vector<double> collectApplyLatenciesAndReset();
 };
 
 #endif  // DISTRIBUTED_KV_STORE_H_
