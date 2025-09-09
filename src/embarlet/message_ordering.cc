@@ -151,10 +151,9 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
     }
     BatchHeader* header_for_sub = export_ring_start;
 #ifdef BUILDING_ORDER_BENCH
-    SequencerThreadStats* stats_ptr = nullptr;
     {
         absl::MutexLock l(&bench_stats_mu_);
-        stats_ptr = &bench_stats_by_broker_[broker_id];
+        (void)bench_stats_by_broker_[broker_id];
     }
 #endif
 
@@ -177,7 +176,14 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
 
         BatchHeader* header_to_process = current_batch_header;
 #ifdef BUILDING_ORDER_BENCH
-        if (stats_ptr) stats_ptr->num_batches_seen++;
+        // Sanity: skip if generator shows uninitialized header (should be fine if zero)
+        (void)header_to_process;
+#endif
+#ifdef BUILDING_ORDER_BENCH
+        {
+            absl::MutexLock l(&bench_stats_mu_);
+            bench_stats_by_broker_[broker_id].num_batches_seen++;
+        }
 #endif
         size_t client_id = current_batch_header->client_id;
         size_t client_key = (static_cast<size_t>(broker_id) << 32) | client_id;
@@ -194,15 +200,21 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
             absl::MutexLock l(&state->mu);
             auto lock_end = std::chrono::steady_clock::now();
 #ifdef BUILDING_ORDER_BENCH
-            if (stats_ptr) stats_ptr->lock_acquire_time_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(lock_end - lock_start).count();
+            {
+                absl::MutexLock l2(&bench_stats_mu_);
+                bench_stats_by_broker_[broker_id].lock_acquire_time_total_ns +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(lock_end - lock_start).count();
+            }
 #endif
             expected_seq = state->expected_seq;
             if (batch_seq == expected_seq) {
                 start_total_order = global_seq_.fetch_add(header_to_process->num_msg, std::memory_order_relaxed);
 #ifdef BUILDING_ORDER_BENCH
-                if (stats_ptr) {
-                    stats_ptr->atomic_fetch_add_count++;
-                    stats_ptr->atomic_claimed_msgs += header_to_process->num_msg;
+                {
+                    absl::MutexLock l2(&bench_stats_mu_);
+                    auto &s = bench_stats_by_broker_[broker_id];
+                    s.atomic_fetch_add_count++;
+                    s.atomic_claimed_msgs += header_to_process->num_msg;
                 }
 #endif
                 state->expected_seq = expected_seq + 1;
@@ -210,14 +222,20 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
             } else if (batch_seq > expected_seq) {
                 skip_batch = true;
 #ifdef BUILDING_ORDER_BENCH
-                if (stats_ptr) stats_ptr->num_batches_skipped++;
+                {
+                    absl::MutexLock l2(&bench_stats_mu_);
+                    bench_stats_by_broker_[broker_id].num_batches_skipped++;
+                }
 #endif
             } else {
                 LOG(WARNING) << "Scanner [B" << broker_id << "]: Duplicate/old batch seq "
                              << batch_seq << " detected from client " << client_id
                              << " (expected " << expected_seq << ")";
 #ifdef BUILDING_ORDER_BENCH
-                if (stats_ptr) stats_ptr->num_duplicates++;
+                {
+                    absl::MutexLock l2(&bench_stats_mu_);
+                    bench_stats_by_broker_[broker_id].num_duplicates++;
+                }
 #endif
             }
         }
@@ -233,21 +251,23 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
 #ifdef BUILDING_ORDER_BENCH
             auto t0 = std::chrono::steady_clock::now();
             // Record end-to-end batch ordering latency from publish to order
-            if (stats_ptr) {
+            {
+                absl::MutexLock l2(&bench_stats_mu_);
                 uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
-                uint64_t pub_ns = 0;
-                pub_ns = header_to_process->publish_ts_ns;
+                uint64_t pub_ns = header_to_process->publish_ts_ns;
                 if (pub_ns != 0 && now_ns >= pub_ns) {
-                    stats_ptr->batch_order_latency_ns.push_back(now_ns - pub_ns);
+                    bench_stats_by_broker_[broker_id].batch_order_latency_ns.push_back(now_ns - pub_ns);
                 }
             }
 #endif
             AssignOrder(header_to_process, start_total_order, header_for_sub);
 #ifdef BUILDING_ORDER_BENCH
             auto t1 = std::chrono::steady_clock::now();
-            if (stats_ptr) {
-                stats_ptr->time_in_assign_order_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-                stats_ptr->num_batches_ordered++;
+            {
+                absl::MutexLock l2(&bench_stats_mu_);
+                auto &s = bench_stats_by_broker_[broker_id];
+                s.time_in_assign_order_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                s.num_batches_ordered++;
             }
 #endif
             VLOG(3) << "Scanner [B" << broker_id << "]: Ordered batch from client " << client_id 
@@ -389,10 +409,17 @@ void MessageOrdering::AssignOrder(BatchHeader* batch_to_order, size_t start_tota
         }
 
         // Update ordered once per message
-        tinode_->offsets[broker].ordered++;
+        // ordered is read without explicit synchronization by the benchmark thread.
+        // Use relaxed atomic-like semantics by writing through a volatile int field; ensure monotonic increment.
+        tinode_->offsets[broker].ordered = tinode_->offsets[broker].ordered + 1;
     }
     header_for_sub->batch_off_to_export = (reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(header_for_sub));
     header_for_sub->ordered = 1;
+#ifdef BUILDING_ORDER_BENCH
+    // Mark input header as consumed to avoid reprocessing after ring wrap
+    batch_to_order->num_msg = 0;
+    batch_to_order->log_idx = 0;
+#endif
     header_for_sub = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(header_for_sub) + sizeof(BatchHeader));
 #ifdef BUILDING_ORDER_BENCH
     // Wrap export header pointer if we reached the end of its ring

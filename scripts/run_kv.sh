@@ -13,12 +13,24 @@ PASSLESS_ENTRY="$HOME/.ssh/id_rsa"
 REMOTE_BIN_DIR="/home/${REMOTE_USER}/Jae/Embarcadero/build/bin"
 REMOTE_PID_FILE="/tmp/remote_seq.pid"
 
+# Tunables (override via env)
+RUN_CONFIGS=${RUN_CONFIGS:-"EMBARCADERO,CORFU,SCALOG"}
+SKIP_REMOTE=${SKIP_REMOTE:-0}
+MIN_BATCH=${MIN_BATCH:-1}
+MAX_BATCH=${MAX_BATCH:-128}
+ITERATIONS=${ITERATIONS:-5}
+ACK=${ACK:-0}
+PUB_THREADS=${PUB_THREADS:-3}
+PUB_MSG=${PUB_MSG:-65536}
+VALUE_SIZE=${VALUE_SIZE:-128}
+NUM_KEYS=${NUM_KEYS:-100000}
+
 # Define the configurations
-declare -a configs=(
-	"sequencer=EMBARCADERO"
-	"sequencer=CORFU"
-	"sequencer=SCALOG"
-)
+IFS=',' read -r -a cfgs <<< "$RUN_CONFIGS"
+declare -a configs=()
+for c in "${cfgs[@]}"; do
+	configs+=("sequencer=$c")
+done
 
 wait_for_signal() {
 	local timeout_sec=${1:-20}
@@ -100,10 +112,14 @@ for config in "${configs[@]}"; do
 	echo "Launching brokers for sequencer: $sequencer"
 
 	# Start remote sequencer if needed
-	if [[ "$sequencer" == "CORFU" ]]; then
-		start_remote_sequencer "corfu_global_sequencer"
-	elif [[ "$sequencer" == "SCALOG" ]]; then
-		start_remote_sequencer "scalog_global_sequencer"
+	if [[ "$SKIP_REMOTE" != "1" ]]; then
+		if [[ "$sequencer" == "CORFU" ]]; then
+			start_remote_sequencer "corfu_global_sequencer"
+		elif [[ "$sequencer" == "SCALOG" ]]; then
+			start_remote_sequencer "scalog_global_sequencer"
+		fi
+	else
+		echo "SKIP_REMOTE=1 -> not starting remote sequencer for $sequencer"
 	fi
 
 	# Start the processes
@@ -116,12 +132,12 @@ for config in "${configs[@]}"; do
 	done
 	sleep 2
 
-	start_process "./kv_test --sequencer $sequencer --num_brokers $NUM_BROKERS"
+	start_process "./kv_store_bench --sequencer $sequencer --num_brokers $NUM_BROKERS --min_batch $MIN_BATCH --max_batch $MAX_BATCH --iterations $ITERATIONS --ack $ACK --pub_threads $PUB_THREADS --pub_msg $PUB_MSG --num_keys $NUM_KEYS --value_size $VALUE_SIZE"
 
-	# Wait for kv_test to finish
+	# Wait for kv_store_bench to finish
 	kv_pid=${pids[-1]}
 	wait "$kv_pid"
-	echo "kv_test finished (PID $kv_pid)"
+	echo "kv_store_bench finished (PID $kv_pid)"
 
 	# Terminate brokers
 	for pid in "${pids[@]}"; do
@@ -145,8 +161,10 @@ for config in "${configs[@]}"; do
 	done
 
 	# Stop remote process after each trial
-	if [[ "$sequencer" == "CORFU" || "$sequencer" == "SCALOG" ]]; then
-		stop_remote_sequencer
+	if [[ "$SKIP_REMOTE" != "1" ]]; then
+		if [[ "$sequencer" == "CORFU" || "$sequencer" == "SCALOG" ]]; then
+			stop_remote_sequencer
+		fi
 	fi
 	sleep 1
 
@@ -155,6 +173,11 @@ for config in "${configs[@]}"; do
 	mv -f multi_put_results.csv "$REPO_ROOT/data/kv/${sequencer}_put.csv" || true
 
 	rm -f script_signal_pipe || true
+DONE=$?
+if [[ $DONE -ne 0 ]]; then
+	echo "Warning: cleanup encountered a non-zero status ($DONE)"
+fi
+
 done
 
 popd >/dev/null

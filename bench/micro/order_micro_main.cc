@@ -159,6 +159,27 @@ int main(int argc, char** argv) {
         return true;
     });
 
+    // Pre-register input and export header rings so sequencer threads never publish into input ring
+#ifdef BUILDING_ORDER_BENCH
+    for (int b = 0; b < brokers; ++b) {
+        uint8_t* broker_bh_ptr = reinterpret_cast<uint8_t*>(region) + tinode->offsets[b].batch_headers_offset;
+        uint8_t* broker_export_bh_ptr = bh_export_base + b * per_broker_bh_export;
+        size_t max_batches = (per_broker_bh_input / sizeof(BatchHeader));
+        if (max_batches > 2) max_batches -= 2;
+        const size_t msg_stride = padded_size;
+        const size_t batches_fit_in_log = (batch_size > 0) ? (per_broker_log / (batch_size * msg_stride)) : 0;
+        if (batches_fit_in_log > 0) {
+            max_batches = std::min(max_batches, (batches_fit_in_log > 2 ? batches_fit_in_log - 2 : batches_fit_in_log));
+        }
+        if (max_batches < 2) max_batches = 2;
+        ordering.SetBenchBatchHeaderRing(b, reinterpret_cast<BatchHeader*>(broker_bh_ptr), max_batches);
+        size_t max_export_batches = (per_broker_bh_export / sizeof(BatchHeader));
+        if (max_export_batches > 2) max_export_batches -= 2;
+        if (max_export_batches < 2) max_export_batches = 2;
+        ordering.SetBenchExportHeaderRing(b, reinterpret_cast<BatchHeader*>(broker_export_bh_ptr), max_export_batches);
+    }
+#endif
+
     std::cout << "Starting Sequencer4 with " << brokers << " brokers" << std::endl;
     ordering.StartSequencer(SequencerType::EMBARCADERO, /*order=*/4, /*topic=*/"bench");
 #ifdef BUILDING_ORDER_BENCH
@@ -246,6 +267,10 @@ int main(int argc, char** argv) {
                 }
 
                 auto* batch_header = reinterpret_cast<BatchHeader*>(broker_bh_ptr + (batch_index % max_batches) * sizeof(BatchHeader));
+                // Prevent overwriting an unconsumed header slot
+                while (batch_header->num_msg != 0 && !stop_writers.load(std::memory_order_relaxed)) {
+                    std::this_thread::yield();
+                }
                 // Choose client
                 size_t client_id = static_cast<size_t>(rr_client);
                 rr_client = (rr_client + 1) % clients_per_broker;
@@ -300,6 +325,10 @@ int main(int argc, char** argv) {
                 batch_header->start_logical_offset = logical_offset_next;
                 batch_header->log_idx = static_cast<size_t>(first_msg_ptr - reinterpret_cast<uint8_t*>(region));
                 batch_header->total_size = batch_size * msg_stride;
+#ifdef BUILDING_ORDER_BENCH
+                batch_header->gen++;
+#endif
+                // publish num_msg last to mark header ready
                 batch_header->num_msg = static_cast<uint32_t>(batch_size);
 #ifdef BUILDING_ORDER_BENCH
                 batch_header->publish_ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -341,11 +370,11 @@ int main(int argc, char** argv) {
     for (int sec = 0; sec < duration_s; ++sec) {
         std::cout << "tick " << (sec+1) << "/" << duration_s << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        size_t sum = 0;
+        long long sum = 0;
         for (int b = 0; b < brokers; ++b) {
             size_t cur = tinode->offsets[b].ordered;
-            size_t delta = 0;
-            if (cur >= prev_ordered[b]) delta = cur - prev_ordered[b];
+            long long delta = static_cast<long long>(cur) - static_cast<long long>(prev_ordered[b]);
+            if (delta < 0) delta = 0; // guard against wrap/tearing
             sum += delta;
             prev_ordered[b] = cur;
         }
@@ -356,6 +385,7 @@ int main(int argc, char** argv) {
     for (int b = 0; b < brokers; ++b) end_sum += tinode->offsets[b].ordered;
     double avg = 0.0;
     if (duration_s > 0) {
+        // Retain console estimate based on ordered counters
         avg = static_cast<double>(end_sum - start_sum) / static_cast<double>(duration_s);
     }
     std::cout << "Average throughput msgs/s over " << duration_s << "s: " << static_cast<long long>(avg) << std::endl;
@@ -401,8 +431,9 @@ int main(int argc, char** argv) {
                     total_lock_ns += s.lock_acquire_time_total_ns;
                     total_assign_ns += s.time_in_assign_order_total_ns;
                 }
+                double avg_calc = duration_s > 0 ? static_cast<double>(total_claimed_msgs) / static_cast<double>(duration_s) : 0.0;
                 fprintf(f, "brokers,%d,clients_per_broker,%d,message_size,%zu,batch_size,%zu,pattern,%s,gap_ratio,%.3f,dup_ratio,%.3f,target_msgs_per_s,%.1f,throughput_avg,%.0f,total_batches,%lu,total_ordered,%lu,total_skipped,%lu,total_dups,%lu,atomic_fetch_add,%lu,claimed_msgs,%lu,total_lock_ns,%lu,total_assign_ns,%lu,p50_ns,%llu,p90_ns,%llu,p99_ns,%llu\n",
-                        brokers, clients_per_broker, payload_bytes, batch_size, pattern.c_str(), gap_ratio, dup_ratio, target_msgs_per_s, avg,
+                        brokers, clients_per_broker, payload_bytes, batch_size, pattern.c_str(), gap_ratio, dup_ratio, target_msgs_per_s, avg_calc,
                         total_batches, total_ordered, total_skipped, total_dups, total_fetch_add, total_claimed_msgs, total_lock_ns, total_assign_ns,
                         (unsigned long long)p50, (unsigned long long)p90, (unsigned long long)p99);
                 fclose(f);
