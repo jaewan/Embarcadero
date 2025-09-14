@@ -27,10 +27,30 @@ function clean_all() {
 }
 
 function hugepage_setup() {
-	echo 10420 | sudo tee /proc/sys/vm/nr_hugepages # 20GB of huge pages
-	sudo sysctl -w net.core.wmem_max=16777216  # 16 MB
-	sudo sysctl -w net.core.rmem_max=16777216  # 16 MB
-	sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216"
+	# Configurable HugeTLB (2MB pages) target in GB. Default: 24GB.
+	HUGETLB_GB=${HUGETLB_GB:-24}
+	PAGES=$(( (HUGETLB_GB * 1024) / 2 ))
+	
+	echo "Configuring HugeTLB: ${HUGETLB_GB}GB (${PAGES} pages of 2MB)"
+	# Set global nr_hugepages (system-wide pool)
+	echo ${PAGES} | sudo tee /proc/sys/vm/nr_hugepages >/dev/null
+
+	# Mount hugetlbfs if not already mounted
+	sudo mkdir -p /dev/hugepages
+	if ! mount | grep -q "on /dev/hugepages type hugetlbfs"; then
+		sudo mount -t hugetlbfs -o pagesize=2M none /dev/hugepages || true
+	fi
+
+	# Prefer THP madvise to reduce interference while still benefiting non-HugeTLB allocations
+	if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+		echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null || true
+	fi
+
+	# NIC/Socket buffer tuning
+	sudo sysctl -w net.core.wmem_max=134217728  # 128 MB
+	sudo sysctl -w net.core.rmem_max=134217728  # 128 MB
+	sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728"
+	sudo sysctl -w net.ipv4.tcp_rmem="4096 65536 134217728"
 }
 
 # Parse command line arguments

@@ -24,7 +24,7 @@ embarcadero:
 
   # Storage configuration
   storage:
-    segment_size: 4290772992     # Segment size (~3.995GB - fits within 4292867840 bytes available)
+    segment_size: 4294967296      # Segment size (4GB) to ensure >=1 segment per broker
     batch_headers_size: 65536    # Batch headers region size (64KB)
     batch_size: 524288           # Default batch size (512KB)
     num_disks: 2                 # Number of disks for storage

@@ -402,6 +402,8 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
 				num_threads_per_broker, message_size, q_size, order, seq_type);
 		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false);
+		// Ensure subscriber is connected to all brokers before starting publish
+		s.WaitUntilAllConnected();
 
 		// Initialize publisher
 		p.Init(ack_level);
