@@ -320,12 +320,14 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		SequencerType &seq_type) {
 	
 	// Fast path: try to find topic without locking first
-	absl::ReaderMutexLock lock(&topics_mutex_);
-	auto topic_itr = topics_.find(topic);
+	auto topic_itr = topics_.end();
+	{
+		absl::ReaderMutexLock lock(&topics_mutex_);
+		topic_itr = topics_.find(topic);
+	}
 
 	if (topic_itr == topics_.end()) {
 		// Topic not found, need to check if it needs creation
-		lock.~ReaderMutexLock();
 		
 		const TInode* tinode = cxl_manager_.GetTInode(topic);
 		
@@ -336,8 +338,9 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 			_mm_pause(); // CPU pause instruction for busy-wait
 			wait_count++;
 			
-			if (wait_count % 100 == 0) {
-				// Check if topic was created
+		if (wait_count % 100 == 0) {
+			// Check if topic was created
+			{
 				absl::ReaderMutexLock check_lock(&topics_mutex_);
 				topic_itr = topics_.find(topic);
 				if (topic_itr != topics_.end()) {
@@ -345,6 +348,7 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 					break;
 				}
 			}
+		}
 			tinode = cxl_manager_.GetTInode(topic);
 		}
 		
@@ -371,21 +375,23 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 				LOG(ERROR) << "Topic not found: " << topic;
 				return nullptr;
 			}
-		} else {
-			// Found topic while waiting, reacquire read lock
-			new (&lock) absl::ReaderMutexLock(&topics_mutex_);
-			topic_itr = topics_.find(topic);
-			if (topic_itr == topics_.end()) {
-				LOG(ERROR) << "Topic disappeared: " << topic;
-				return nullptr;
-			}
 		}
 	}
 
-	auto& topic_obj = topic_itr->second;
-	seq_type = topic_obj->GetSeqtype();
-	return topic_obj->GetCXLBuffer(
-			batch_header, topic, log, segment_header, logical_offset);
+	// Final lookup with proper locking
+	{
+		absl::ReaderMutexLock lock(&topics_mutex_);
+		topic_itr = topics_.find(topic);
+		if (topic_itr == topics_.end()) {
+			LOG(ERROR) << "Topic disappeared: " << topic;
+			return nullptr;
+		}
+		
+		auto& topic_obj = topic_itr->second;
+		seq_type = topic_obj->GetSeqtype();
+		return topic_obj->GetCXLBuffer(
+				batch_header, topic, log, segment_header, logical_offset);
+	}
 }
 
 bool TopicManager::GetBatchToExport(

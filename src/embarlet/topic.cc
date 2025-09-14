@@ -2,6 +2,8 @@
 #include "../cxl_manager/scalog_local_sequencer.h"
 
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 namespace Embarcadero {
 
@@ -208,14 +210,39 @@ void Topic::CombinerThread() {
 	// Initialize header pointers
 	void* segment_header = reinterpret_cast<uint8_t*>(first_message_addr_) - CACHELINE_SIZE;
 	MessageHeader* header = reinterpret_cast<MessageHeader*>(first_message_addr_);
+	
+	// Initialize the memory region to ensure it's safe to access
+	// Zero out the first message header to ensure complete=0 initially
+	memset(header, 0, sizeof(MessageHeader));
+	
+	LOG(INFO) << "CombinerThread started for topic: " << topic_name_ 
+	          << ", broker_id: " << broker_id_
+	          << ", first_message_addr: " << first_message_addr_
+	          << ", header: " << header;
 
 	while (!stop_threads_) {
-		// Wait for message to be completed
-		while (header->complete == 0) {
-			if (stop_threads_) {
-				return;
+		// Safe memory access with bounds checking
+		try {
+			// Validate header pointer before accessing
+			if (reinterpret_cast<uintptr_t>(header) < reinterpret_cast<uintptr_t>(cxl_addr_) ||
+			    reinterpret_cast<uintptr_t>(header) >= reinterpret_cast<uintptr_t>(cxl_addr_) + (1ULL << 36)) {
+				LOG(ERROR) << "CombinerThread: Invalid header pointer " << header 
+				           << " for topic " << topic_name_ << ", broker " << broker_id_;
+				break;
 			}
-			std::this_thread::yield();
+			
+			// Wait for message to be completed with safe memory access
+			volatile uint32_t* complete_ptr = &header->complete;
+			while (*complete_ptr == 0) {
+				if (stop_threads_) {
+					return;
+				}
+				std::this_thread::yield();
+			}
+		} catch (...) {
+			LOG(ERROR) << "CombinerThread: Exception accessing memory at " << header 
+			           << " for topic " << topic_name_ << ", broker " << broker_id_;
+			break;
 		}
 
 #ifdef MULTISEGMENT
@@ -253,9 +280,49 @@ void Topic::CombinerThread() {
 		written_logical_offset_ = logical_offset_;
 		written_physical_addr_ = reinterpret_cast<void*>(header);
 
-		// Move to next message
-		header = reinterpret_cast<MessageHeader*>(
+		// Move to next message with bounds checking and recovery
+		if (header->next_msg_diff == 0) {
+			// Just yield CPU, don't sleep - this is likely a timing issue
+			std::this_thread::yield();
+			continue;
+		}
+		
+		// Check for reasonable next_msg_diff values (should be between header size and max message size)
+		const size_t min_msg_size = sizeof(MessageHeader);
+		const size_t max_msg_size = 1024 * 1024; // 1MB max message size
+		if (header->next_msg_diff < min_msg_size || header->next_msg_diff > max_msg_size) {
+			// Log only occasionally to avoid spam
+			static thread_local size_t error_count = 0;
+			if (++error_count % 1000 == 1) {
+				LOG(WARNING) << "CombinerThread: Suspicious next_msg_diff=" << header->next_msg_diff 
+				             << " for topic " << topic_name_ << ", broker " << broker_id_
+				             << " (error #" << error_count << ")";
+			}
+			// Just yield CPU, don't sleep
+			std::this_thread::yield();
+			continue;
+		}
+		
+		MessageHeader* next_header = reinterpret_cast<MessageHeader*>(
 				reinterpret_cast<uint8_t*>(header) + header->next_msg_diff);
+		
+		// Validate next header pointer
+		if (reinterpret_cast<uintptr_t>(next_header) < reinterpret_cast<uintptr_t>(cxl_addr_) ||
+		    reinterpret_cast<uintptr_t>(next_header) >= reinterpret_cast<uintptr_t>(cxl_addr_) + (1ULL << 36)) {
+			// Log only occasionally to avoid spam
+			static thread_local size_t pointer_error_count = 0;
+			if (++pointer_error_count % 1000 == 1) {
+				LOG(WARNING) << "CombinerThread: Invalid next header pointer " << next_header 
+				           << " (diff=" << header->next_msg_diff << ") for topic " 
+				           << topic_name_ << ", broker " << broker_id_ 
+				           << " (error #" << pointer_error_count << ")";
+			}
+			// Just yield CPU, don't sleep
+			std::this_thread::yield();
+			continue;
+		}
+		
+		header = next_header;
 		logical_offset_++;
 	}
 }

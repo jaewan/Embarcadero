@@ -136,6 +136,9 @@ class TopicManager {
 			get_registered_brokers_callback_ = callback;
 		}
 
+		// Get a pointer to a topic object
+		Topic* GetTopic(const std::string& topic_name);
+
 	private:
 		/**
 		 * Internal implementation of topic creation

@@ -11,9 +11,8 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 	shutdown_(false),
 	connected_(false),
 	measure_latency_(measure_latency),
-	// Adjust size: This is now PER BUFFER. 8GB total per connection might be excessive.
-	// Maybe 1GB per buffer (2GB total per connection)? Needs tuning.
-	buffer_size_per_buffer_((1UL << 30)), // e.g., 1 GB per buffer
+	// Default per-buffer size: 512MB (tunable via EMBAR_SUB_BUFFER_MB)
+	buffer_size_per_buffer_((512UL << 20)),
 	client_id_(GenerateRandomNum())
 {
 	memcpy(topic_, topic, TOPIC_NAME_SIZE);
@@ -488,7 +487,7 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 	auto start = std::chrono::steady_clock::now();
 	auto last_log_time = start;
 
-	// Wait until all expected data is received
+	// Wait until all expected data is received (reduce spin to lower CPU contention)
 	while (DEBUG_count_ < total_data_size) {
 		std::this_thread::yield();
 
@@ -527,7 +526,8 @@ void Subscriber::ManageBrokerConnections(int broker_id, const std::string& addre
 
 	// Step 1: Create sockets and initiate non-blocking connect (Unchanged)
 	for (int i = 0; i < NUM_SUB_CONNECTIONS; ++i) {
-		int sock = GetNonblockingSock(addr_vec.data(), data_port, true);
+		// Subscriber sockets should be configured for receiving (SO_RCVBUF)
+		int sock = GetNonblockingSock(addr_vec.data(), data_port, false);
 		if (sock < 0) { /* ... error handling ... */ continue; }
 		pending_fds.push_back(sock);
 		epoll_event ev;
@@ -892,10 +892,7 @@ BufferState* ConnectionBuffers::acquire_read_buffer() {
 		// Check if the ready buffer is indeed the one the consumer should read
 		// This condition implies the receiver filled 'potential_read_idx' and marked it ready,
 		// OR receiver filled 'current_write_idx', marked it ready, BUT hasn't swapped yet because consumer was busy.
-		// We need to know WHICH buffer is ready. Let's assume write_buffer_ready_for_consumer
-		// refers to the buffer INDEXED by `potential_read_idx`. This needs careful state design.
-
-		// Let's simplify: Assume write_buffer_ready refers to the non-writing buffer if set.
+		// We need to know WHICH buffer is ready. Let's assume write_buffer_ready refers to the non-writing buffer if set.
 		BufferState* ready_buffer = &buffers[potential_read_idx];
 		if (ready_buffer->write_offset.load(std::memory_order_relaxed) > 0) { // Check if actually has data
 			read_buffer_in_use_by_consumer.store(true, std::memory_order_release);

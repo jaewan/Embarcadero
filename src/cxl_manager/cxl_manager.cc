@@ -100,8 +100,10 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
 		TINode_Region_size += padding;
 		size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
-		size_t BatchHeaders_Region_size = NUM_MAX_BROKERS * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
-		size_t Segment_Region_size = (cxl_size_ - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size)/NUM_MAX_BROKERS;
+		// Use configured max brokers consistently with GetNewSegment()
+		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
+		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+		size_t Segment_Region_size = (cxl_size_ - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size)/configured_max_brokers;
 		padding = Segment_Region_size%cacheline_size;
 		Segment_Region_size -= padding;
 
@@ -172,17 +174,18 @@ void* CXLManager::GetNewSegment(){
 		size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
 		TINode_Region_size += padding;
 		size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
-		size_t BatchHeaders_Region_size = NUM_MAX_BROKERS * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
-		
-		// Get CXL size from configuration
+		// Get configuration values
 		size_t cxl_size = Embarcadero::Configuration::getInstance().config().cxl.size.get();
-		// Memory is divided among NUM_MAX_BROKERS slots regardless of how many are actually used
+		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
+		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+		
+		// Memory is divided among configured broker slots regardless of how many are actually used
 		// This ensures consistent memory layout
-		size_t Segment_Region_size = (cxl_size - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size)/NUM_MAX_BROKERS;
+		size_t Segment_Region_size = (cxl_size - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size)/configured_max_brokers;
 		size_t max_segs = Segment_Region_size / SEGMENT_SIZE;
 		
 		LOG(INFO) << "GetNewSegment: CXL_size=" << cxl_size
-		          << " NUM_MAX_BROKERS=" << NUM_MAX_BROKERS
+		          << " CONFIGURED_MAX_BROKERS=" << configured_max_brokers
 		          << " Segment_Region_size=" << Segment_Region_size 
 		          << " SEGMENT_SIZE=" << SEGMENT_SIZE 
 		          << " max_segments=" << max_segs;

@@ -230,13 +230,15 @@ void MessageOrdering::BrokerScannerWorker(int broker_id) {
             } else {
                 LOG(WARNING) << "Scanner [B" << broker_id << "]: Duplicate/old batch seq "
                              << batch_seq << " detected from client " << client_id
-                             << " (expected " << expected_seq << ")";
+                             << " (expected " << expected_seq << ") - skipping";
 #ifdef BUILDING_ORDER_BENCH
                 {
                     absl::MutexLock l2(&bench_stats_mu_);
                     bench_stats_by_broker_[broker_id].num_duplicates++;
                 }
 #endif
+                // Skip this duplicate/old batch to avoid infinite loop
+                skip_batch = true;
             }
         }
 

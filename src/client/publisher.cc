@@ -846,8 +846,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			size_t remaining_bytes = len - sent_bytes;
 			size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
 
-			// Choose between regular send and zero-copy based on message size
-			int send_flags = (to_send >= (1UL << 16)) ? MSG_ZEROCOPY : 0;
+			// Use zero-copy for large sends
+			int send_flags = (to_send >= (1UL << 23)) ? MSG_ZEROCOPY : 0; // >= 8MB
 
 			bytesSent = send(sock, 
 					static_cast<uint8_t*>(msg) + sent_bytes, 

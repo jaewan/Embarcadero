@@ -169,6 +169,7 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
         }
     } else {
         // Configure for receiving
+        bufferSize = 128 * 1024 * 1024; // 128 MB receive buffer
         if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufferSize, sizeof(bufferSize)) == -1) {
             LOG(ERROR) << "setsockopt(SO_RCVBUF) failed: " << strerror(errno);
             close(sock);
@@ -238,26 +239,38 @@ void* mmap_large_buffer(size_t need, size_t& allocated) {
     // Align the needed size to the huge page size
     size_t aligned_size = ALIGN_UP(need, map_align);
     
-    // First attempt: try to use huge pages
-    buffer = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    // Default: try explicit HugeTLB first (most predictable/perf if pages are available)
+    bool use_hugetlb = true;
+    if (const char* env = getenv("EMBAR_USE_HUGETLB")) {
+        if (strcmp(env, "0") == 0) use_hugetlb = false;
+    }
+
+    if (use_hugetlb) {
+        // Attempt explicit HugeTLB allocation
+        buffer = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+        if (buffer == MAP_FAILED) {
+            VLOG(1) << "MAP_HUGETLB failed. Falling back to THP (madvise). "
+                    << "Provision sufficient hugepages or set EMBAR_USE_HUGETLB=0 to prefer THP.";
+        } else {
+            allocated = aligned_size;
+        }
+    }
 
     if (buffer == MAP_FAILED) {
-        LOG(INFO) << "MAP_HUGETLB allocation failed, falling back to regular pages. "
-                  << "Check /sys/kernel/mm/hugepages for optimal performance.";
-        
-        // Second attempt: use regular pages with pre-population
+        // Use regular pages with pre-population and request THP via madvise
         buffer = mmap(NULL, need, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-                     
         if (buffer == MAP_FAILED) {
             LOG(ERROR) << "mmap failed: " << strerror(errno);
             throw std::runtime_error("Failed to allocate memory");
         }
-        
         allocated = need;
-    } else {
-        allocated = aligned_size;
+#ifdef MADV_HUGEPAGE
+        if (madvise(buffer, allocated, MADV_HUGEPAGE) != 0) {
+            VLOG(1) << "madvise(MADV_HUGEPAGE) failed: " << strerror(errno);
+        }
+#endif
     }
     
     // Optional: try to lock the memory to prevent swapping

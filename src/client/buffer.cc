@@ -209,7 +209,7 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 			Embarcadero::BatchHeader* batch_header = 
 				reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[write_buf_id_].buffer + head);
 
-			batch_header->start_logical_offset = 0;
+			batch_header->start_logical_offset = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed);
 			batch_header->batch_seq = batch_seq_.fetch_add(1);
 			batch_header->total_size = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed) - head - sizeof(Embarcadero::BatchHeader);
 			batch_header->num_msg = bufs_[write_buf_id_].prod.num_msg.load(std::memory_order_relaxed);
