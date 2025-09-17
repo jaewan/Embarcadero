@@ -35,7 +35,7 @@ int main(int argc, char* argv[]) {
             cxxopts::value<double>()->default_value("0"))
         ("steady_rate", "Send message in steady rate")
         ("n,num_threads_per_broker", "Number of request threads_per_broker", 
-            cxxopts::value<size_t>()->default_value("1"));
+            cxxopts::value<size_t>()->default_value("4"));
     
     auto result = options.parse(argc, argv);
     

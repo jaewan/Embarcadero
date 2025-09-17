@@ -44,10 +44,14 @@ Publisher::~Publisher() {
 	shutdown_ = true;
 	context_.TryCancel();
 
-	// Wait for all threads to complete
+	// Wait for all threads to complete (only if not already joined)
 	for (auto& t : threads_) {
 		if(t.joinable()){
-			t.join();
+			try {
+				t.join();
+			} catch (const std::exception& e) {
+				LOG(ERROR) << "Exception in destructor joining thread: " << e.what();
+			}
 		}
 	}
 
@@ -66,14 +70,22 @@ Publisher::~Publisher() {
 	if (kill_brokers_thread_.joinable()) {
 		kill_brokers_thread_.join();
 	}
+
 	VLOG(3) << "Publisher destructor return";
 }
 
+
 void Publisher::Init(int ack_level) {
 	ack_level_ = ack_level;
+	
 
-	// Generate unique port for acknowledgment server
+	// Generate unique port for acknowledgment server with retry logic
 	ack_port_ = GenerateRandomNum();
+	
+	// Ensure port is in a safe range (avoid privileged ports and common services)
+	if (ack_port_ < 10000) {
+		ack_port_ += 10000;  // Move to safe range 10000+
+	}
 
 	// Start acknowledgment thread if needed
 	if (ack_level >= 1) {
@@ -108,6 +120,12 @@ void Publisher::Init(int ack_level) {
 	while (thread_count_.load() != num_threads_.load()) {
 		std::this_thread::yield();
 	}
+}
+
+void Publisher::WarmupBuffers() {
+	LOG(INFO) << "Pre-touching buffers to eliminate page fault variance...";
+	// Delegate to the Buffer class which has access to private members
+	pubQue_.WarmupBuffers();
 }
 
 void Publisher::Publish(char* message, size_t len) {
@@ -160,15 +178,36 @@ void Publisher::Poll(size_t n) {
 	publish_finished_ = true;
 	pubQue_.ReturnReads();
 
-	// Wait for all messages to be sent
+	// Wait for all messages to be queued
 	while (client_order_ < n) {
 		std::this_thread::yield();
 	}
 
+	// All messages queued, waiting for transmission to complete
+
+	// CRITICAL FIX: Use atomic flag to prevent double-join race conditions
+	if (!threads_joined_.exchange(true)) {
+		// Only join threads once
+		for (size_t i = 0; i < threads_.size(); ++i) {
+			if (threads_[i].joinable()) {
+				try {
+				// Joining publisher thread
+				threads_[i].join();
+				// Successfully joined publisher thread
+				} catch (const std::exception& e) {
+					LOG(ERROR) << "Exception joining publisher thread " << i << ": " << e.what();
+				}
+			}
+			// Publisher thread not joinable (already joined or detached)
+		}
+		// All publisher threads completed transmission
+	}
+	// Publisher threads already joined, skipping
+
 	// If acknowledgments are enabled, wait for all acks
 	if (ack_level_ >= 1) {
 		auto last_log_time = std::chrono::steady_clock::now();
-		VLOG(5) << "Waiting for acknowledgments, received " << ack_received_ << " out of " << client_order_;
+		// Waiting for acknowledgments
 		while (ack_received_ < client_order_) {
 			auto now = std::chrono::steady_clock::now();
 			if(kill_brokers_){
@@ -176,6 +215,7 @@ void Publisher::Poll(size_t n) {
 					break;
 				}
 			}
+			// Only log every 3 seconds to avoid spam
 			if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
 				LOG(INFO) << "Waiting for acknowledgments, received " << ack_received_ << " out of " << client_order_;
 				last_log_time = now;
@@ -187,13 +227,6 @@ void Publisher::Poll(size_t n) {
 	// Signal shutdown and cancel gRPC context
 	shutdown_ = true;
 	context_.TryCancel();
-
-	// Wait for all publisher threads to finish
-	for (auto& t : threads_) {
-		if (t.joinable()) {
-			t.join();
-		}
-	}
 }
 
 void Publisher::DEBUG_check_send_finish() {
@@ -201,11 +234,9 @@ void Publisher::DEBUG_check_send_finish() {
 	publish_finished_ = true;
 	pubQue_.ReturnReads();
 
-	for (auto& t : threads_) {
-		if (t.joinable()) {
-			t.join();
-		}
-	}
+	// CRITICAL FIX: Don't join threads here as Poll() will handle thread cleanup
+	// This prevents double-join issues and race conditions
+	// DEBUG_check_send_finish: Signaled publishing completion, threads will be joined in Poll()
 }
 
 void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
@@ -325,9 +356,34 @@ void Publisher::EpollAckThread() {
 	server_addr.sin_port = htons(ack_port_);
 	server_addr.sin_addr.s_addr = INADDR_ANY;
 
-	// Bind the socket
-	if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-		LOG(ERROR) << "Bind failed: " << strerror(errno);
+	// Bind the socket with retry logic for port conflicts
+	int bind_attempts = 0;
+	const int max_bind_attempts = 10;
+	while (bind_attempts < max_bind_attempts) {
+		if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0) {
+			break; // Bind successful
+		}
+		
+		if (errno == EADDRINUSE) {
+			// Port in use, try a different port
+			bind_attempts++;
+			ack_port_ = GenerateRandomNum();
+			if (ack_port_ < 10000) {
+				ack_port_ += 10000;
+			}
+			server_addr.sin_port = htons(ack_port_);
+			LOG(WARNING) << "Port " << (ack_port_ - 1) << " in use, trying port " << ack_port_ 
+			             << " (attempt " << bind_attempts << "/" << max_bind_attempts << ")";
+		} else {
+			// Other bind error
+			LOG(ERROR) << "Bind failed: " << strerror(errno);
+			close(server_sock);
+			return;
+		}
+	}
+	
+	if (bind_attempts >= max_bind_attempts) {
+		LOG(ERROR) << "Failed to bind after " << max_bind_attempts << " attempts";
 		close(server_sock);
 		return;
 	}
@@ -627,7 +683,21 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		size_t sent_bytes = 0;
 
 		while (!shutdown_ && running) {
-			int n = epoll_wait(efd, events, 10, -1);
+			// Use timeout instead of -1 to prevent indefinite hanging
+			int n = epoll_wait(efd, events, 10, 1000); // 1 second timeout
+			if (n == 0) {
+				// Timeout - check if we should continue
+				if (shutdown_ || publish_finished_) {
+				// PublishThread: Handshake interrupted by shutdown
+				break;
+				}
+				continue;
+			}
+			if (n < 0) {
+				if (errno == EINTR) continue;
+				LOG(ERROR) << "PublishThread: epoll_wait failed during handshake: " << strerror(errno);
+				break;
+			}
 			for (int i = 0; i < n; i++) {
 				if (events[i].events & EPOLLOUT) {
 					ssize_t bytesSent = send(sock, 
@@ -684,7 +754,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Skip if no batch is available
 		if (batch_header == nullptr || batch_header->total_size == 0) {
-			if (publish_finished_) {
+			if (publish_finished_ || shutdown_) {
+			// PublishThread exiting
 				break;
 			} else {
 				// Short sleep to avoid busy waiting
@@ -832,8 +903,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				return;
 			}
 
-			LOG(INFO) << "Thread " << pubQuesIdx << " redirected from broker:" << broker_id 
-				<< " to broker:" << new_broker_id << " after failure";
+			// Thread redirected from broker to new broker after failure
 
 			broker_id = new_broker_id;
 		}
@@ -846,8 +916,9 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			size_t remaining_bytes = len - sent_bytes;
 			size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
 
-			// Use zero-copy for large sends
-			int send_flags = (to_send >= (1UL << 23)) ? MSG_ZEROCOPY : 0; // >= 8MB
+		// PERF TUNED: Use MSG_ZEROCOPY for sends >= 64KB (Linux kernel optimal threshold)
+        // Below 64KB: zero-copy overhead > benefit. Above 64KB: significant performance gain
+        int send_flags = (to_send >= (64UL << 10)) ? MSG_ZEROCOPY : 0;
 
 			bytesSent = send(sock, 
 					static_cast<uint8_t*>(msg) + sent_bytes, 
@@ -872,8 +943,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					break;
 				}
 
-				// Reduce zero-copy size for backoff strategy
-				zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL << 6);
+				// OPTIMIZATION: Less aggressive backoff to maintain higher throughput
+				zero_copy_send_limit = std::max(zero_copy_send_limit * 3 / 4, 1UL << 16); // Reduce by 25%, min 64KB
 			} else if (bytesSent < 0) {
 				// Connection failure, switch to a different broker
 				LOG(WARNING) << "Send failed to broker " << broker_id << ": " << strerror(errno);
@@ -919,8 +990,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					return;
 				}
 
-				LOG(INFO) << "Thread " << pubQuesIdx << " redirected from broker:" << broker_id 
-					<< " to broker:" << new_broker_id << " after failure";
+				// Thread redirected from broker to new broker after failure
 
 				broker_id = new_broker_id;
 				sent_bytes = 0;
@@ -1002,8 +1072,8 @@ void Publisher::SubscribeToClusterStatus() {
 				
 				// Only log warning every 5 seconds to avoid spam
 				if (now - last_warning > std::chrono::seconds(5)) {
-					LOG(WARNING) << "Cluster status stream ended, reconnecting...";
-					last_warning = now;
+				// Cluster status stream ended, reconnecting...
+				last_warning = now;
 				}
 				
 				// Add a small delay before reconnecting to avoid tight loop

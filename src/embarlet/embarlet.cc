@@ -105,10 +105,16 @@ bool AttachCgroup(int broker_id) {
 }
 
 void SignalScriptReady() {
-	ScopedFD fd(open("script_signal_pipe", O_WRONLY));
+	// Use non-blocking mode to avoid deadlock if script isn't ready
+	ScopedFD fd(open("script_signal_pipe", O_WRONLY | O_NONBLOCK));
 	if (fd.isValid()) {
 		const char* signal = "ready";
-		write(fd.get(), signal, strlen(signal) + 1);
+		ssize_t result = write(fd.get(), signal, strlen(signal));
+		if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+			VLOG(1) << "Failed to signal script readiness: " << strerror(errno);
+		}
+	} else {
+		VLOG(1) << "Failed to open script_signal_pipe: " << strerror(errno);
 	}
 }
 

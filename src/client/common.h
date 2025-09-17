@@ -118,6 +118,7 @@ unsigned long default_huge_page_size(void);
  */
 void* mmap_large_buffer(size_t need, size_t& allocated);
 
+
 /**
  * Generates a random number for client IDs
  */
