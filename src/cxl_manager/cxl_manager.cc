@@ -132,9 +132,9 @@ CXLManager::~CXLManager(){
 
 std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(BatchHeader &batch_header,
 		const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header,
-		size_t &logical_offset, SequencerType &seq_type) {
+		size_t &logical_offset, SequencerType &seq_type, BatchHeader* &batch_header_location) {
 	return topic_manager_->GetCXLBuffer(batch_header, topic, log, segment_header,
-			logical_offset, seq_type);
+			logical_offset, seq_type, batch_header_location);
 }
 
 inline int hashTopic(const char topic[TOPIC_NAME_SIZE]) {
@@ -209,6 +209,60 @@ void* CXLManager::GetNewBatchHeaderLog(){
 	size_t offset = batch_header_log_count.fetch_add(1, std::memory_order_relaxed);
 
 	return (uint8_t*)batchHeaders_  + offset*BATCHHEADERS_SIZE;
+}
+
+// Phase 1.2: Memory layout calculation functions for PBR and GOI
+size_t CXLManager::CalculatePBROffset(int broker_id, int max_brokers) {
+	// PBR comes after existing BatchHeaders region
+	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+	size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
+	size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
+	TINode_Region_size += padding;
+	
+	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
+	size_t BatchHeaders_Region_size = max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+	
+	// PBR region starts after BatchHeaders
+	size_t PBR_Region_start = TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size;
+	
+	// Each broker gets its own PBR
+	return PBR_Region_start + broker_id * PBR_SIZE_PER_BROKER;
+}
+
+size_t CXLManager::CalculateGOIOffset(int max_brokers) {
+	// GOI comes after all PBRs
+	size_t last_pbr_offset = CalculatePBROffset(max_brokers - 1, max_brokers);
+	return last_pbr_offset + PBR_SIZE_PER_BROKER;
+}
+
+size_t CXLManager::CalculateBrokerLogOffset(int broker_id, int max_brokers) {
+	// BrokerLogs come after GOI
+	size_t goi_offset = CalculateGOIOffset(max_brokers);
+	size_t broker_logs_start = goi_offset + GOI_SIZE;
+	
+	// Each broker gets equal share of remaining memory for its log
+	// This is a placeholder - in Phase 2 we'll implement proper BrokerLog sizing
+	size_t remaining_memory = CXL_SIZE - broker_logs_start;
+	size_t broker_log_size = remaining_memory / max_brokers;
+	
+	return broker_logs_start + broker_id * broker_log_size;
+}
+
+size_t CXLManager::GetTotalMemoryRequirement(int max_brokers) {
+	// Calculate total memory needed for new layout
+	size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+	size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
+	size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
+	TINode_Region_size += padding;
+	
+	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
+	size_t BatchHeaders_Region_size = max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+	size_t PBR_Region_size = max_brokers * PBR_SIZE_PER_BROKER;
+	size_t GOI_Region_size = GOI_SIZE;
+	
+	// Minimum memory requirement (before BrokerLogs)
+	return TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size + 
+	       PBR_Region_size + GOI_Region_size;
 }
 
 void CXLManager::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers,
@@ -379,8 +433,8 @@ void CXLManager::Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic){
 		bool yield = true;
 		for(auto broker : registered_brokers){
 			size_t msg_logical_off = msg_to_order[broker]->logical_offset;
-			//This ensures the message is Combined (complete ensures it is fully received)
-			if(msg_to_order[broker]->complete == 1 && msg_logical_off != (size_t)-1 && msg_logical_off <= tinode->offsets[broker].written){
+		//This ensures the message is Combined (complete flag removed - legacy code)
+		if(/* msg_to_order[broker]->complete == 1 && */ msg_logical_off != (size_t)-1 && msg_logical_off <= tinode->offsets[broker].written){
 				yield = false;
 				queues[broker].push(msg_to_order[broker]);
 				int client = msg_to_order[broker]->client_id;
@@ -472,11 +526,13 @@ void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
 	while(!stop_threads_){
 		//bool yield = true;
 		for(auto broker : registered_brokers){
-			while(msg_to_order[broker]->complete == 0){
-				if(stop_threads_)
-					return;
-				std::this_thread::yield();
-			}
+		// NOTE: Legacy code - complete flag removed
+		// This busy-wait is no longer needed with batch-level completion
+		/* while(msg_to_order[broker]->complete == 0){
+			if(stop_threads_)
+				return;
+			std::this_thread::yield();
+		} */
 			size_t num_msg_per_batch = BATCH_SIZE / msg_to_order[broker]->paddedSize;
 			size_t msg_logical_off = (batch_seq/num_brokers)*num_msg_per_batch;
 			size_t n = msg_logical_off + num_msg_per_batch;

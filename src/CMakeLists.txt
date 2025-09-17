@@ -99,6 +99,9 @@ set_target_properties(embarlet PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Enable benchmark optimizations for embarlet (commented out due to segfault)
+# target_compile_definitions(embarlet PRIVATE BUILDING_ORDER_BENCH)
+
 add_executable(throughput_test
     client/common.cc
     client/common.h

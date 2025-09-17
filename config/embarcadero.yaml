@@ -26,17 +26,18 @@ embarcadero:
   storage:
     segment_size: 4294967296      # Segment size (4GB) to ensure >=1 segment per broker
     batch_headers_size: 65536    # Batch headers region size (64KB)
-    batch_size: 524288           # Default batch size (512KB)
+    batch_size: 2097152          # PERF TUNED: 2MB batch size - balances memory usage with network efficiency (~512 messages/batch)
+                              # Works optimally with 256MB buffers (128 batches per buffer before wrapping)
     num_disks: 2                 # Number of disks for storage
     max_topics: 32               # Maximum number of topics
     topic_name_size: 31          # Maximum topic name length
 
   # Network configuration
   network:
-    io_threads: 8                # Number of network IO threads
+    io_threads: 12               # UPDATED: Right-sized to match client connections (4 pub + 3 sub per broker + overhead)
     disk_io_threads: 4           # Number of disk IO threads
-    sub_connections: 3           # Number of subscriber connections
-    zero_copy_send_limit: 8388608  # Zero-copy send threshold (8MB)
+    sub_connections: 3           # Set to 3 connections per broker as requested
+    zero_copy_send_limit: 65536     # PERF TUNED: 64KB threshold - optimal for MSG_ZEROCOPY (Linux kernel sweet spot, works with 2MB batches)
 
   # Corfu sequencer configuration
   corfu:

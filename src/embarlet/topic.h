@@ -77,6 +77,12 @@ class Topic {
 				size_t &expected_batch_offset,
 				void* &batch_addr,
 				size_t &batch_size);
+		bool GetBatchToExportWithMetadata(
+				size_t &expected_batch_offset,
+				void* &batch_addr,
+				size_t &batch_size,
+				size_t &batch_total_order,
+				uint32_t &num_messages);
 		/**
 		 * Get the address and size of messages for a subscriber
 		 *
@@ -106,8 +112,9 @@ class Topic {
 				const char topic[TOPIC_NAME_SIZE],
 				void*& log,
 				void*& segment_header,
-				size_t& logical_offset) {
-			return (this->*GetCXLBufferFunc)(batch_header, topic, log, segment_header, logical_offset);
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location) {
+			return (this->*GetCXLBufferFunc)(batch_header, topic, log, segment_header, logical_offset, batch_header_location);
 		}
 
 		/**
@@ -145,7 +152,8 @@ class Topic {
 				const char topic[TOPIC_NAME_SIZE],
 				void*& log,
 				void*& segment_header,
-				size_t& logical_offset);
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location);
 
 		// Pointer to the appropriate GetCXLBuffer implementation
 		GetCXLBufferFuncPtr GetCXLBufferFunc;
@@ -156,42 +164,48 @@ class Topic {
 				const char topic[TOPIC_NAME_SIZE],
 				void*& log,
 				void*& segment_header,
-				size_t& logical_offset);
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location);
 
 		std::function<void(void*, size_t)> CorfuGetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
 				void*& log,
 				void*& segment_header,
-				size_t& logical_offset);
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location);
 
 		std::function<void(void*, size_t)> ScalogGetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
 				void*& log,
 				void*& segment_header,
-				size_t& logical_offset);
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location);
 
 		std::function<void(void*, size_t)> Order3GetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
 				void*& log,
 				void*& segment_header,
-				size_t& logical_offset);
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location);
 
 		std::function<void(void*, size_t)> Order4GetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
 				void*& log,
 				void*& segment_header,
-				size_t& logical_offset);
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location);
 
 		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
 				void*& log,
 				void*& segment_header,
-				size_t& logical_offset);
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location);
 
 		// Core members
 		const GetNewSegmentCallback get_new_segment_callback_;
@@ -250,11 +264,17 @@ class Topic {
 		// Ordered batch vector for efficient subscribe
 		void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers);
 		void Sequencer4();
+		void Sequencer5();  // Batch-level sequencer
 		void BrokerScannerWorker(int broker_id);
+		void BrokerScannerWorker5(int broker_id);  // Batch-level scanner
 		bool ProcessSkipped(
 				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
 				BatchHeader* &header_for_sub);
+		bool ProcessSkipped5(
+				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
+				BatchHeader* &header_for_sub);  // Batch-level version
 		void AssignOrder(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);
+		void AssignOrder5(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);  // Batch-level version
 
 		size_t global_seq_ = 0;
 		absl::flat_hash_map<size_t, size_t> next_expected_batch_seq_;// client_id -> next expected batch_seq

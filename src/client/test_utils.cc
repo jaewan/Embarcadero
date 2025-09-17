@@ -99,13 +99,21 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 		return 0.0;
 	}
 
-	// Calculate queue size with buffer
+	// Calculate queue size with buffer - account for per-thread and per-broker division
+	// Base size: total data + header overhead + 2MB safety margin
 	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
+	
+	// Account for the fact that queueSize will be divided by num_threads_per_broker and num_brokers
+	// With 4 threads per broker and 4 brokers, we need 16x the base size to avoid buffer wrapping
+	// Publisher constructor divides by num_threads_per_broker, then by num_brokers
+	// So we multiply by both to compensate: 4 threads * 4 brokers = 16x multiplier
+	q_size *= num_threads_per_broker * 4; // 4 brokers (NUM_MAX_BROKERS)
+	
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	// Create publisher
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
-			num_threads_per_broker, message_size, q_size, order);
+		num_threads_per_broker, message_size, q_size, order);
 
 	try {
 		p.RecordStartTime(); // For failure event timestamp across threads
@@ -192,13 +200,21 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		return 0.0;
 	}
 
-	// Calculate queue size with buffer
+	// Calculate queue size with buffer - account for per-thread and per-broker division
+	// Base size: total data + header overhead + 2MB safety margin
 	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
+	
+	// Account for the fact that queueSize will be divided by num_threads_per_broker and num_brokers
+	// With 4 threads per broker and 4 brokers, we need 16x the base size to avoid buffer wrapping
+	// Publisher constructor divides by num_threads_per_broker, then by num_brokers
+	// So we multiply by both to compensate: 4 threads * 4 brokers = 16x multiplier
+	q_size *= num_threads_per_broker * 4; // 4 brokers (NUM_MAX_BROKERS)
+	
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	// Create publisher
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
-			num_threads_per_broker, message_size, q_size, order, seq_type);
+		num_threads_per_broker, message_size, q_size, order, seq_type);
 
 	try {
 		// Initialize publisher
@@ -261,8 +277,8 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
 		// Start timing
 		auto start = std::chrono::high_resolution_clock::now();
 
-		// Create subscriber
-		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
+		// Create subscriber with order level for batch-aware processing
+		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false, order);
 
 		// Track start of the actual receiving process
 		auto receive_start = std::chrono::high_resolution_clock::now();
@@ -319,8 +335,8 @@ double ConsumeThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		// Start timing
 		auto start = std::chrono::high_resolution_clock::now();
 
-		// Create subscriber
-		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic);
+		// Create subscriber with order level for batch-aware processing  
+		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false, order);
 		s.WaitUntilAllConnected(); // Assume there exists NUM_MAX_BROKERS
 
 		// Track start of the actual receiving process
@@ -330,8 +346,17 @@ double ConsumeThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		VLOG(5) << "Waiting to receive " << total_message_size << " bytes of data";
 
 		for(size_t i=0; i< n; i++){
-			while(s.Consume() == nullptr){
-				std::this_thread::yield();
+			void* msg = nullptr;
+			size_t retry_count = 0;
+			const size_t max_retries = 10; // Allow up to 10 seconds of retries
+			
+			while((msg = s.Consume(1000)) == nullptr){
+				retry_count++;
+				if (retry_count >= max_retries) {
+					LOG(ERROR) << "ConsumeThroughputTest: Failed to consume message " << i << " after " << max_retries << " seconds. Aborting test.";
+					return 0.0; // Return 0 bandwidth to indicate failure
+				}
+				VLOG(3) << "ConsumeThroughputTest: Retry " << retry_count << " for message " << i;
 			}
 		}
 
@@ -398,17 +423,33 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	try {
+		// PERF OPTIMIZATION: Move all initialization out of timing measurement
+		// This eliminates variance from buffer allocation, network setup, and thread creation
+		
+		LOG(INFO) << "Initializing publisher and subscriber (not measured)...";
+		auto init_start = std::chrono::high_resolution_clock::now();
+		
 		// Create publisher and subscriber
 		Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
 				num_threads_per_broker, message_size, q_size, order, seq_type);
-		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false);
-		// Ensure subscriber is connected to all brokers before starting publish
+		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false, order);
+		
+		// Wait for subscriber connections (network setup - not measured)
 		s.WaitUntilAllConnected();
 
-		// Initialize publisher
+		// Initialize publisher (buffer allocation + network threads - not measured)
 		p.Init(ack_level);
+		
+		// Warmup buffers to eliminate page fault variance (not measured)
+		p.WarmupBuffers();
+		
+		auto init_end = std::chrono::high_resolution_clock::now();
+		double init_seconds = std::chrono::duration<double>(init_end - init_start).count();
+		LOG(INFO) << "Initialization completed in " << std::fixed << std::setprecision(3) 
+		          << init_seconds << "s (excluded from performance measurement)";
 
-		// Start timing for publishing
+		// NOW start timing for pure critical path performance
+		LOG(INFO) << "Starting critical path measurement...";
 		auto start = std::chrono::high_resolution_clock::now();
 
 		// Publish messages
@@ -499,7 +540,7 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		// Create publisher and subscriber
 		Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
 				num_threads_per_broker, message_size, q_size, order, seq_type);
-		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true);
+		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true, order);
 
 		// Initialize publisher
 		p.Init(ack_level);

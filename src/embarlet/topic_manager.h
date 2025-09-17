@@ -102,13 +102,21 @@ class TopicManager {
 				void*& log,
 				void*& segment_header,
 				size_t& logical_offset,
-				heartbeat_system::SequencerType& seq_type);
+				heartbeat_system::SequencerType& seq_type,
+				BatchHeader*& batch_header_location);
 
 		bool GetBatchToExport(
 				const char* topic,
 				size_t &expected_batch_offset,
 				void* &batch_addr,
 				size_t &batch_size);
+		bool GetBatchToExportWithMetadata(
+				const char* topic,
+				size_t &expected_batch_offset,
+				void* &batch_addr,
+				size_t &batch_size,
+				size_t &batch_total_order,
+				uint32_t &num_messages);
 		/**
 		 * Get message address and size for a topic
 		 *

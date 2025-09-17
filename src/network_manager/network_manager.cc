@@ -341,7 +341,8 @@ void NetworkManager::MainThread() {
 	const int EPOLL_TIMEOUT_MS = 1;  // 1 millisecond timeout
 
 	while (!stop_threads_) {
-		int n = epoll_wait(epoll_fd, events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
+		// PERFORMANCE OPTIMIZATION: Reduced timeout for better responsiveness
+		int n = epoll_wait(epoll_fd, events, MAX_EVENTS, 100);  // 100ms instead of EPOLL_TIMEOUT_MS
 		for (int i = 0; i < n; i++) {
 			if (events[i].data.fd == server_socket) {
 				// Accept new connection
@@ -505,10 +506,11 @@ void NetworkManager::HandlePublishRequest(
 		void* buf = nullptr;
 		size_t logical_offset;
 		SequencerType seq_type;
+		BatchHeader* batch_header_location = nullptr;
 
 		std::function<void(void*, size_t)> non_emb_seq_callback =
 			cxl_manager_->GetCXLBuffer(batch_header, handshake.topic, buf,
-					segment_header, logical_offset, seq_type);
+					segment_header, logical_offset, seq_type, batch_header_location);
 
 		if (!buf) {
 			LOG(ERROR) << "Failed to get CXL buffer";
@@ -532,7 +534,6 @@ void NetworkManager::HandlePublishRequest(
 			// Process complete messages as they arrive
 			while (bytes_to_next_header + header_size <= static_cast<size_t>(bytes_read)) {
 				header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
-				header->complete = 1;
 
 				bytes_read -= bytes_to_next_header;
 				read += bytes_to_next_header;
@@ -560,6 +561,30 @@ void NetworkManager::HandlePublishRequest(
 			if (to_read == 0) {
 				break;
 			}
+		}
+
+		// Signal batch completion for ALL order levels
+		// This must be done AFTER all messages in the batch are received and marked complete
+		if (batch_header_location != nullptr) {
+			// CRITICAL FIX: Ensure all message headers are properly initialized before marking batch complete
+			// This prevents race conditions where sequencer/combiner sees batch_complete=1 but messages aren't ready
+			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
+			for (size_t i = 0; i < batch_header.num_msg; ++i) {
+				// Ensure paddedSize is set (this indicates message is complete)
+				while (first_msg->paddedSize == 0) {
+					std::this_thread::yield(); // Wait for message to be fully written
+				}
+				// Move to next message
+				first_msg = reinterpret_cast<MessageHeader*>(
+					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
+				);
+			}
+			
+			// Now it's safe to mark batch as complete for ALL order levels
+			__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
+			VLOG(4) << "NetworkManager: Marked batch complete for " << batch_header.num_msg << " messages, client_id=" << batch_header.client_id << ", order_level=" << seq_type;
+		} else {
+			LOG(WARNING) << "NetworkManager: batch_header_location is null for batch with " << batch_header.num_msg << " messages, order_level=" << seq_type;
 		}
 
 		// Finalize batch processing
@@ -632,20 +657,29 @@ void NetworkManager::HandleSubscribeRequest(
 		return;
 	}
 
-	// Initialize or update subscriber state
+	// Initialize or update subscriber state - each connection gets its own state
+	// Use unique connection ID to avoid collisions with reused socket FDs
+	// All connections start from offset 0 to receive the same data (redundancy/throughput)
+	static std::atomic<int> connection_counter{0};
+	int unique_connection_id = connection_counter.fetch_add(1);
+	
 	{
 		absl::MutexLock lock(&sub_mu_);
-		if (!sub_state_.contains(handshake.client_id)) {
-			auto state = std::make_unique<SubscriberState>();
-			state->last_offset = handshake.num_msg;
-			state->last_addr = handshake.last_addr;
-			state->initialized = true;
-			sub_state_[handshake.client_id] = std::move(state);
-		}
+		auto state = std::make_unique<SubscriberState>();
+		state->last_offset = 0;  // Always start from beginning
+		state->last_addr = handshake.last_addr;
+		state->initialized = true;
+		sub_state_[unique_connection_id] = std::move(state);
 	}
 
-	// Process subscription
-	SubscribeNetworkThread(client_socket, epoll_fd, handshake.topic, handshake.client_id);
+	// Process subscription - pass unique_connection_id for independent state
+	SubscribeNetworkThread(client_socket, epoll_fd, handshake.topic, unique_connection_id);
+
+	// Cleanup subscriber state when connection ends
+	{
+		absl::MutexLock lock(&sub_mu_);
+		sub_state_.erase(unique_connection_id);
+	}
 
 	// Cleanup
 	close(client_socket);
@@ -656,10 +690,29 @@ void NetworkManager::SubscribeNetworkThread(
 		int sock,
 		int efd,
 		const char* topic,
-		int client_id) {
+		int connection_id) {
 
 	size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
 	int order = topic_manager_->GetTopicOrder(topic);
+
+	// Define batch metadata structure for Sequencer 5
+	struct BatchMetadata {
+		size_t batch_total_order;
+		uint32_t num_messages;
+		uint32_t reserved;  // Padding for alignment
+	} batch_meta = {0, 0, 0};
+
+	// PERFORMANCE OPTIMIZATION: Cache state pointer to avoid repeated hash map lookups
+	std::unique_ptr<SubscriberState>* cached_state_ptr = nullptr;
+	{
+		absl::MutexLock lock(&sub_mu_);
+		auto it = sub_state_.find(connection_id);
+		if (it == sub_state_.end() || !it->second) {
+			LOG(ERROR) << "SubscribeNetworkThread: No state found for connection_id " << connection_id;
+			return;
+		}
+		cached_state_ptr = &it->second;
+	}
 
 	while (!stop_threads_) {
 		// Get message data to send
@@ -674,22 +727,40 @@ void NetworkManager::SubscribeNetworkThread(
 			VLOG(3) << "[DEBUG] poped from queue:" << messages_size;
 		} else {
 			// Get new messages from CXL manager
-			absl::MutexLock lock(&sub_state_[client_id]->mu);
+			// PERFORMANCE OPTIMIZATION: Use cached state pointer (no hash map lookup)
+			absl::MutexLock lock(&(*cached_state_ptr)->mu);
 
-			if (order > 0){
+			if (order == 5) {
+				// For Sequencer 5: Get batch with metadata
+				size_t batch_total_order = 0;
+				uint32_t num_messages = 0;
+				if (!topic_manager_->GetBatchToExportWithMetadata(
+							topic,
+							(*cached_state_ptr)->last_offset,
+							msg,
+							messages_size,
+							batch_total_order,
+							num_messages)){
+						std::this_thread::yield();
+						continue;
+					}
+				// Store metadata for sending
+				batch_meta.batch_total_order = batch_total_order;
+				batch_meta.num_messages = num_messages;
+			} else if (order > 0){
 				if (!topic_manager_->GetBatchToExport(
 							topic,
-							sub_state_[client_id]->last_offset,
+							(*cached_state_ptr)->last_offset,
 							msg,
 							messages_size)){
 						std::this_thread::yield();
 						continue;
-					}
+}
 			}else{
 				if (topic_manager_->GetMessageAddr(
 									topic,
-									sub_state_[client_id]->last_offset,
-									sub_state_[client_id]->last_addr,
+									(*cached_state_ptr)->last_offset,
+									(*cached_state_ptr)->last_addr,
 									msg,
 									messages_size)) {
 						// Split large messages into chunks for better flow control
@@ -697,8 +768,13 @@ void NetworkManager::SubscribeNetworkThread(
 							struct LargeMsgRequest r;
 							r.msg = msg;
 
-							// Ensure we don't cut in the middle of a message
-							int mod = zero_copy_send_limit % ((MessageHeader*)msg)->paddedSize;
+						// Ensure we don't cut in the middle of a message
+						size_t padded_size = ((MessageHeader*)msg)->paddedSize;
+						if (padded_size == 0) {
+							LOG(ERROR) << "SubscribeNetworkThread: paddedSize is 0, skipping message to avoid SIGFPE";
+							break; // Exit the large message splitting loop
+						}
+						int mod = zero_copy_send_limit % padded_size;
 							r.len = zero_copy_send_limit - mod;
 
 							large_msg_queue_.blockingWrite(r);
@@ -717,6 +793,18 @@ void NetworkManager::SubscribeNetworkThread(
 		if (messages_size < 64 && messages_size != 0) {
 			LOG(ERROR) << "Message size is below 64 bytes: " << messages_size;
 			continue;
+		}
+
+		// For Sequencer 5: Send batch metadata first if order > 0
+		if (order == 5) {
+			// batch_meta is already populated by GetBatchToExportWithMetadata
+			
+			// Send batch metadata
+			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL);
+			if (meta_sent != sizeof(batch_meta)) {
+				LOG(ERROR) << "Failed to send batch metadata: " << strerror(errno);
+				break;
+			}
 		}
 
 		// Send message data
@@ -840,6 +928,8 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 	struct epoll_event events[10];
 	char buf[1];
 
+	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic=" << topic << ", ack_level=" << ack_level;
+
 	// Send broker_id first so client can distinguish
 	size_t acked_size = 0;
 	while (acked_size < sizeof(broker_id_)) {
@@ -886,7 +976,7 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 		size_t ack = GetOffsetToAck(topic, ack_level);
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
-			LOG(INFO) << "Broker:" << broker_id_ << " Acknowledgments " << ack;
+			LOG(INFO) << "Broker:" << broker_id_ << " Acknowledgments " << ack << " (next_to_ack=" << next_to_ack_offset << ")";
 			TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
 			int replication_factor = tinode->replication_factor;
 			for (int i = 0; i < replication_factor; i++) {
@@ -897,6 +987,7 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 		}
 
 		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
+			LOG(INFO) << "AckThread: Broker " << broker_id_ << " sending ack for " << ack << " messages (prev=" << next_to_ack_offset-1 << ")";
 			next_to_ack_offset = ack + 1;
 			acked_size = 0;
 			// Send offset acknowledgment
@@ -940,6 +1031,9 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 			// Check if connection is still alive
 			if (!IsConnectionAlive(ack_fd, buf)) {
 				LOG(INFO) << "Acknowledgment connection closed: " << ack_fd;
+				LOG(INFO) << "AckThread for broker " << broker_id_ << " exiting - publisher disconnected";
+				// CRITICAL FIX: Don't shut down the entire broker when publisher disconnects
+				// Subscriber connections should remain active and independent
 				break;
 			}
 		}

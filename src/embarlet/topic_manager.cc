@@ -317,7 +317,8 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		void* &log, 
 		void* &segment_header, 
 		size_t &logical_offset, 
-		SequencerType &seq_type) {
+		SequencerType &seq_type,
+		BatchHeader* &batch_header_location) {
 	
 	// Fast path: try to find topic without locking first
 	auto topic_itr = topics_.end();
@@ -390,7 +391,7 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		auto& topic_obj = topic_itr->second;
 		seq_type = topic_obj->GetSeqtype();
 		return topic_obj->GetCXLBuffer(
-				batch_header, topic, log, segment_header, logical_offset);
+				batch_header, topic, log, segment_header, logical_offset, batch_header_location);
 	}
 }
 
@@ -409,6 +410,25 @@ bool TopicManager::GetBatchToExport(
 	}
 
 	return topic_itr->second->GetBatchToExport(expected_batch_offset, batch_addr, batch_size);
+}
+
+bool TopicManager::GetBatchToExportWithMetadata(
+		const char* topic,
+		size_t &expected_batch_offset,
+		void* &batch_addr,
+		size_t &batch_size,
+		size_t &batch_total_order,
+		uint32_t &num_messages) {
+
+	absl::ReaderMutexLock lock(&topics_mutex_);
+
+	auto topic_itr = topics_.find(topic);
+	if (topic_itr == topics_.end()) {
+		// Not throwing error as subscribe can be called before topic creation
+		return false;
+	}
+
+	return topic_itr->second->GetBatchToExportWithMetadata(expected_batch_offset, batch_addr, batch_size, batch_total_order, num_messages);
 }
 
 bool TopicManager::GetMessageAddr(

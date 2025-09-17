@@ -53,6 +53,15 @@ const Configuration& GetConfig();
 
 #define NUM_DISKS (Embarcadero::GetConfig().config().storage.num_disks.get())
 
+// New configuration constants for Phase 1 migration
+// PBR (Pending Batch Ring) configuration
+#define PBR_ENTRIES_PER_BROKER 1024
+#define PBR_SIZE_PER_BROKER (PBR_ENTRIES_PER_BROKER * sizeof(Embarcadero::PendingBatchEntry))
+
+// GOI (Global Order Index) configuration  
+#define GOI_MAX_ENTRIES 65536
+#define GOI_SIZE (GOI_MAX_ENTRIES * sizeof(Embarcadero::GlobalOrderEntry))
+
 //********* Corfu configs *********
 #define CORFU_SEQ_PORT (Embarcadero::GetConfig().config().corfu.sequencer_port.get())
 #define CORFU_REP_PORT (Embarcadero::GetConfig().config().corfu.replication_port.get())

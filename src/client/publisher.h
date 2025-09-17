@@ -28,6 +28,7 @@ class Publisher {
 		 */
 		~Publisher();
 
+
 		/**
 		 * Initializes the publisher
 		 * @param ack_level Acknowledgement level
@@ -51,6 +52,13 @@ class Publisher {
 		 * Debug method to check if sending is finished
 		 */
 		void DEBUG_check_send_finish();
+
+		/**
+		 * PERF OPTIMIZATION: Pre-touch all allocated hugepage buffers to reduce variance
+		 * This ensures all virtual addresses are populated and hugepages are committed
+		 * Should be called after Init() but before performance measurement starts
+		 */
+		void WarmupBuffers();
 
 		/**
 		 * Simulates broker failures during operation
@@ -127,6 +135,8 @@ class Publisher {
 		std::thread kill_brokers_thread_;
 		bool kill_brokers_ = false;
 		std::chrono::steady_clock::time_point start_time_;
+		
+
 		absl::Mutex event_mutex_;
 		std::vector<std::pair<long long, std::string>> failure_events_ ABSL_GUARDED_BY(event_mutex_);
 
@@ -168,6 +178,7 @@ class Publisher {
 		std::vector<std::thread> threads_;
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
+		std::atomic<bool> threads_joined_{false};
 
 		/**
 		 * Thread for handling acknowledgements using epoll

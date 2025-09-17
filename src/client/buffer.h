@@ -81,6 +81,12 @@ public:
      */
     void WriteFinished();
 
+    /**
+     * PERF OPTIMIZATION: Pre-touch all allocated buffers to reduce variance
+     * This ensures all virtual addresses are populated and hugepages are committed
+     */
+    void WarmupBuffers();
+
 private:
     /**
      * Buffer structure with cache line alignment

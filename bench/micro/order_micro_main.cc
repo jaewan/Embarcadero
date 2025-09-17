@@ -314,7 +314,7 @@ int main(int argc, char** argv) {
                 auto* msg = reinterpret_cast<MessageHeader*>(first_msg_ptr);
                 for (size_t i = 0; i < batch_size; ++i) {
                     msg->paddedSize = msg_stride;
-                    msg->complete = 1; // publish message ready
+                    // Note: complete flag removed - using batch-level completion now
                     msg = reinterpret_cast<MessageHeader*>(reinterpret_cast<uint8_t*>(msg) + msg_stride);
                 }
 

@@ -151,11 +151,10 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
     }
 
     // Configure buffer size based on send/receive mode
-    int bufferSize = 16 * 1024 * 1024;  // 16 MB buffer
-    
     if (send) {
-        // Configure for sending
-        if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufferSize, sizeof(bufferSize)) == -1) {
+        // OPTIMIZATION: Increase send buffer to match receive buffer for better throughput
+        int sendBufferSize = 128 * 1024 * 1024;  // 128 MB send buffer (matches receive buffer)
+        if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize)) == -1) {
             LOG(ERROR) << "setsockopt(SO_SNDBUF) failed: " << strerror(errno);
             close(sock);
             return -1;
@@ -169,8 +168,8 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
         }
     } else {
         // Configure for receiving
-        bufferSize = 128 * 1024 * 1024; // 128 MB receive buffer
-        if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufferSize, sizeof(bufferSize)) == -1) {
+        int receiveBufferSize = 128 * 1024 * 1024; // 128 MB receive buffer
+        if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &receiveBufferSize, sizeof(receiveBufferSize)) == -1) {
             LOG(ERROR) << "setsockopt(SO_RCVBUF) failed: " << strerror(errno);
             close(sock);
             return -1;
@@ -232,12 +231,14 @@ unsigned long default_huge_page_size() {
     return hps;
 }
 
+
 void* mmap_large_buffer(size_t need, size_t& allocated) {
-    void* buffer;
+    void* buffer = nullptr;
     size_t map_align = default_huge_page_size();
     
     // Align the needed size to the huge page size
     size_t aligned_size = ALIGN_UP(need, map_align);
+    
     
     // Default: try explicit HugeTLB first (most predictable/perf if pages are available)
     bool use_hugetlb = true;
@@ -246,14 +247,29 @@ void* mmap_large_buffer(size_t need, size_t& allocated) {
     }
 
     if (use_hugetlb) {
-        // Attempt explicit HugeTLB allocation
-        buffer = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-        if (buffer == MAP_FAILED) {
-            VLOG(1) << "MAP_HUGETLB failed. Falling back to THP (madvise). "
-                    << "Provision sufficient hugepages or set EMBAR_USE_HUGETLB=0 to prefer THP.";
-        } else {
-            allocated = aligned_size;
+        // Attempt explicit HugeTLB allocation with retry logic for race conditions
+        const int max_retries = 3;
+        for (int retry = 0; retry < max_retries; retry++) {
+            buffer = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+            
+            if (buffer != MAP_FAILED) {
+                allocated = aligned_size;
+                if (retry > 0) {
+                    VLOG(2) << "MAP_HUGETLB succeeded on retry " << retry << " for " << aligned_size << " bytes";
+                }
+                break;
+            }
+            
+            // If this is not the last retry, wait a bit and try again
+            if (retry < max_retries - 1) {
+                VLOG(3) << "MAP_HUGETLB failed (retry " << retry << "), retrying: " << strerror(errno);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10 + retry * 5));
+            } else {
+                VLOG(1) << "MAP_HUGETLB failed after " << max_retries << " retries for " << aligned_size 
+                        << " bytes. Error: " << strerror(errno) << ". Falling back to THP (madvise). "
+                        << "Provision sufficient hugepages or set EMBAR_USE_HUGETLB=0 to prefer THP.";
+            }
         }
     }
 

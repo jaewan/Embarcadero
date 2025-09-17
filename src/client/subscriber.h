@@ -150,11 +150,12 @@ struct ConsumedData {
 class Subscriber {
 	public:
 		// ... Constructor, destructor, other methods ...
-		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency=false);
+		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency=false, int order_level=0);
 		~Subscriber(); // Important to manage shutdown and cleanup
 
 		// The method the application calls to get data
 		void* Consume(int timeout_ms = 1000);
+		void* ConsumeBatchAware(int timeout_ms = 1000);
 
 		// Called by client code after test is finished
 		void StoreLatency();
@@ -221,6 +222,7 @@ class Subscriber {
 
 		// --- Latency / Debug ---
 		bool measure_latency_;
+		int order_level_; // Store the order level for batch-aware processing
 		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
 
 		// --- Buffer Management (part 2/2)---

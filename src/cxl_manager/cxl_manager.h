@@ -39,10 +39,17 @@ class CXLManager{
 			get_registered_brokers_callback_ = callback;
 		}
 		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE],
-				void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type);
+				void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type, 
+				BatchHeader* &batch_header_location);
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 				MessageHeader** msg_to_order, TInode *tinode);
 		void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers, TInode *tinode);
+
+		// Phase 1.2: Memory layout calculation functions for PBR and GOI
+		static size_t CalculatePBROffset(int broker_id, int max_brokers);
+		static size_t CalculateGOIOffset(int max_brokers);
+		static size_t CalculateBrokerLogOffset(int broker_id, int max_brokers);
+		static size_t GetTotalMemoryRequirement(int max_brokers);
 
 		inline void UpdateTinodeOrder(char *topic, TInode* tinode, int broker, size_t msg_logical_off, size_t ordered_offset){
 			if(tinode->replicate_tinode){

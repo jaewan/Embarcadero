@@ -37,13 +37,18 @@ public:
 private:
     // Sequencer implementations
     void Sequencer4();
+    void Sequencer5();  // New batch-level sequencer
     void BrokerScannerWorker(int broker_id);
+    void BrokerScannerWorker5(int broker_id);  // New batch-level scanner
     void StartScalogLocalSequencer(const std::string& topic_name);
     
     // Helper methods for order assignment
     void AssignOrder(BatchHeader* batch_to_order, size_t start_total_order, BatchHeader*& header_for_sub);
+    void AssignOrder5(BatchHeader* batch_to_order, size_t start_total_order, BatchHeader*& header_for_sub);  // Batch-level only
     bool ProcessSkipped(absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
                        BatchHeader*& header_for_sub);
+    bool ProcessSkipped5(absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
+                        BatchHeader*& header_for_sub);  // Batch-level only
 
     // Member variables
     void* cxl_addr_;
