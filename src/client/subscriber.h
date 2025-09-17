@@ -153,9 +153,12 @@ class Subscriber {
 		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency=false, int order_level=0);
 		~Subscriber(); // Important to manage shutdown and cleanup
 
-		// The method the application calls to get data
+		// Legacy methods (unused but kept for compatibility)
 		void* Consume(int timeout_ms = 1000);
 		void* ConsumeBatchAware(int timeout_ms = 1000);
+
+		// For Sequencer 5: Process batch metadata and reconstruct message ordering
+		void ProcessSequencer5Data(uint8_t* data, size_t data_size, int fd);
 
 		// Called by client code after test is finished
 		void StoreLatency();

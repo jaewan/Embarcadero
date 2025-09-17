@@ -286,7 +286,8 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
 		// Wait for all messages to be received
 		VLOG(5) << "Waiting to receive " << total_message_size << " bytes of data";
 
-		// Wait for all data to be received
+		// All order levels use efficient passive polling
+		VLOG(3) << "Using passive polling for order level " << order;
 		s.Poll(total_message_size, message_size);
 
 		// Calculate elapsed time and bandwidth
@@ -418,8 +419,16 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		return std::make_pair(0.0, 0.0);
 	}
 
-	// Calculate queue size with buffer
+	// Calculate queue size with buffer - account for per-thread and per-broker division
+	// Base size: total data + header overhead + 2MB safety margin
 	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
+	
+	// CRITICAL FIX: Account for the fact that queueSize will be divided by num_threads_per_broker and num_brokers
+	// With 4 threads per broker and 4 brokers, we need 16x the base size to avoid buffer wrapping
+	// Publisher constructor divides by num_threads_per_broker, then by num_brokers
+	// So we multiply by both to compensate: 4 threads * 4 brokers = 16x multiplier
+	q_size *= num_threads_per_broker * 4; // 4 brokers (NUM_MAX_BROKERS)
+	
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 	try {
@@ -466,6 +475,10 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 
 		// Wait for all messages to be received by subscriber
 		LOG(INFO) << "Publishing complete, waiting for subscriber to receive all data...";
+		
+		// All order levels now use efficient passive polling
+		// Sequencer 5 logical reconstruction happens in receiver threads
+		VLOG(3) << "Using passive polling for order level " << order;
 		s.Poll(total_message_size, message_size);
 
 		// Record end-to-end end time

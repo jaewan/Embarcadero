@@ -224,9 +224,16 @@ void Publisher::Poll(size_t n) {
 		}
 	}
 
-	// Signal shutdown and cancel gRPC context
-	shutdown_ = true;
-	context_.TryCancel();
+	// IMPROVED: Graceful disconnect - keep gRPC context alive for subscriber
+	// Only set publish_finished flag, don't shutdown entire system
+	// The gRPC context remains active to support subscriber cluster management
+	// Publisher data connections are already closed by joined threads
+	
+	LOG(INFO) << "Publisher finished sending " << client_order_ << " messages, keeping cluster context alive for subscriber";
+	
+	// NOTE: We do NOT set shutdown_=true or cancel context here
+	// This allows the subscriber to continue using the cluster management infrastructure
+	// The context will be cleaned up when the Publisher object is destroyed
 }
 
 void Publisher::DEBUG_check_send_finish() {
@@ -1001,9 +1008,13 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		batch_seq += num_threads_.load();
 	}
 
-	// Clean up resources
-	if (sock >= 0) close(sock);
-	if (efd >= 0) close(efd);
+	// IMPROVED: Keep connections alive for subscriber
+	// Don't close data connections when publisher finishes - this would cause brokers to shutdown
+	// The connections will be cleaned up when the Publisher object is destroyed
+	// 
+	// NOTE: We intentionally do NOT close sock and efd here to keep broker connections alive
+	// This allows the subscriber to continue working after publisher finishes
+	// Resources will be cleaned up in the Publisher destructor
 }
 
 void Publisher::SubscribeToClusterStatus() {
