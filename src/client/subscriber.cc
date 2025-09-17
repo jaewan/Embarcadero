@@ -5,48 +5,8 @@
 #include <cmath>
 #include <numeric>
 
-// Batch metadata structure (matches NetworkManager)
-struct BatchMetadata {
-    size_t batch_total_order;
-    uint32_t num_messages;
-    uint32_t reserved;
-};
-
-// Helper function to process batch with metadata (static for file scope)
-static void ProcessBatchWithMetadata(void* buffer_start, size_t buffer_size, const BatchMetadata& batch_meta) {
-    uint8_t* current_ptr = static_cast<uint8_t*>(buffer_start);
-    size_t remaining_size = buffer_size;
-    size_t message_index = 0;
-    
-    VLOG(4) << "Processing batch: base_order=" << batch_meta.batch_total_order 
-            << ", num_messages=" << batch_meta.num_messages;
-    
-    while (remaining_size >= sizeof(Embarcadero::MessageHeader) && message_index < batch_meta.num_messages) {
-        Embarcadero::MessageHeader* header = reinterpret_cast<Embarcadero::MessageHeader*>(current_ptr);
-        
-        // Reconstruct total_order from batch metadata
-        header->total_order = batch_meta.batch_total_order + message_index;
-        
-        // Validate message size
-        if (header->paddedSize == 0 || header->paddedSize > remaining_size) {
-            LOG(WARNING) << "Invalid message size: " << header->paddedSize 
-                        << ", remaining: " << remaining_size;
-            break;
-        }
-        
-        VLOG(5) << "Reconstructed message " << message_index << " total_order=" << header->total_order;
-        
-        // Move to next message
-        current_ptr += header->paddedSize;
-        remaining_size -= header->paddedSize;
-        message_index++;
-    }
-    
-    if (message_index != batch_meta.num_messages) {
-        LOG(WARNING) << "Batch processing incomplete: processed " << message_index 
-                    << " out of " << batch_meta.num_messages;
-    }
-}
+// Sequencer 5: Logical reconstruction of message ordering from batch metadata
+// Messages arrive with total_order=0, batch metadata provides base total_order
 
 Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency, int order_level)
 	: head_addr_(head_addr),
@@ -55,14 +15,7 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 	connected_(false),
 	measure_latency_(measure_latency),
 	order_level_(order_level),
-	// PERF OPTIMIZED: 32MB per-buffer size for optimal performance/memory balance
-	// 
-	// SUBSCRIBER BUFFER OPTIMIZATION ANALYSIS:
-	// • Tested configurations: 4MB → 32MB → 1GB subscriber buffers
-	// • 32MB provides excellent performance with reasonable memory usage
-	// • 1GB buffers show no significant performance benefit over 32MB
-	// • Publisher buffer wrapping (256MB) is the remaining bottleneck, not subscriber
-	// • Memory usage: 12 connections × 2 buffers × 32MB = 768MB total (optimal)
+	// 16MB per-buffer size (32MB total per connection with dual buffers)
 	buffer_size_per_buffer_((16UL << 20)),
 	client_id_(GenerateRandomNum())
 {
@@ -759,50 +712,14 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 			}
 		}
 
-		// PERF OPTIMIZED: 2MB recv chunks chosen to reduce bandwidth gap
-		//
-		// RECEIVE OPTIMIZATION ANALYSIS:
-		// • Publisher: 256MB buffers sent via zero-copy TCP  
-		// • Previous subscriber: 256KB recv() = 1,024 syscalls per publisher buffer
-		// • Optimized subscriber: 2MB recv() = 128 syscalls per publisher buffer
-		// • Syscall reduction: 8x fewer recv() calls across 12 connections
-		// • Expected improvement: 15-20% bandwidth gain from reduced syscall overhead
-		size_t recv_chunk_size = std::min(available_space, static_cast<size_t>(1UL << 20)); // 1MB chunks
+		// Use 1MB receive chunks for optimal performance
+		size_t recv_chunk_size = std::min(available_space, static_cast<size_t>(1UL << 20));
 		ssize_t bytes_received = recv(conn_buffers->fd, write_ptr, recv_chunk_size, 0);
 
 		if (bytes_received > 0) {
-			// For Sequencer 5: Process messages to assign total_order immediately upon receipt
+			// For Sequencer 5: Process batch metadata and reconstruct message ordering in receiver thread
 			if (order_level_ == 5) {
-				void* buffer_start = static_cast<uint8_t*>(write_ptr);
-				size_t remaining_bytes = bytes_received;
-				static std::atomic<size_t> global_message_counter{0};
-				
-				VLOG(4) << "ReceiveWorker: Processing " << bytes_received << " bytes for Sequencer 5";
-				
-				while (remaining_bytes >= sizeof(Embarcadero::MessageHeader)) {
-					Embarcadero::MessageHeader* header = reinterpret_cast<Embarcadero::MessageHeader*>(buffer_start);
-					
-					// Wait for message to be complete (paddedSize set)
-					while (header->paddedSize == 0) {
-						std::this_thread::yield();
-					}
-					
-					if (header->paddedSize > remaining_bytes) {
-						// Incomplete message, will be processed in next iteration
-						break;
-					}
-					
-					// Assign total_order if not set (Sequencer 5 behavior)
-					if (header->total_order == 0) {
-						header->total_order = global_message_counter.fetch_add(1);
-						VLOG(5) << "ReceiveWorker: Assigned total_order=" << header->total_order 
-						       << " to message with paddedSize=" << header->paddedSize;
-					}
-					
-					// Move to next message
-					buffer_start = static_cast<uint8_t*>(buffer_start) + header->paddedSize;
-					remaining_bytes -= header->paddedSize;
-				}
+				ProcessSequencer5Data(static_cast<uint8_t*>(write_ptr), bytes_received, conn_buffers->fd);
 			}
 			
 			// 4. Advance write offset (BEFORE getting timestamp)
@@ -1025,11 +942,113 @@ void ConnectionBuffers::release_read_buffer(BufferState* acquired_buffer) {
 }
 
 
+// Batch metadata structure matching what the broker sends for Sequencer 5
+struct BatchMetadata {
+	size_t batch_total_order;  // Starting total_order for this batch
+	uint32_t num_messages;     // Number of messages in this batch
+	uint32_t reserved;         // Padding for alignment
+};
+
+// Per-connection state for tracking batch metadata parsing
+struct ConnectionBatchState {
+	bool has_pending_metadata = false;
+	BatchMetadata pending_metadata;
+	size_t metadata_bytes_read = 0;
+	size_t current_batch_messages_processed = 0;
+	size_t next_message_order_in_batch = 0;
+	size_t last_seen_total_order = 0;  // For validation and fallback
+};
+
+// Global state for batch metadata processing
+static absl::flat_hash_map<int, ConnectionBatchState> g_batch_states;
+static absl::Mutex g_batch_states_mutex;
+
+// ============================================================================
+// Sequencer 5: Logical Reconstruction Layer
+// ============================================================================
+// This method processes batch metadata and assigns sequential total_order
+// values to individual messages during data reception (not consumption).
+// This enables efficient Poll() usage for all order levels.
+// ============================================================================
+void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, int fd) {
+	absl::MutexLock batch_lock(&g_batch_states_mutex);
+	ConnectionBatchState& batch_state = g_batch_states[fd];
+	
+	size_t current_pos = 0;
+	
+	VLOG(5) << "ProcessSequencer5Data: Processing " << data_size << " bytes for fd=" << fd;
+	
+	while (current_pos < data_size) {
+		// Check if we need to read batch metadata
+		if (!batch_state.has_pending_metadata && 
+		    current_pos + sizeof(BatchMetadata) <= data_size) {
+			
+			BatchMetadata* potential_metadata = reinterpret_cast<BatchMetadata*>(data + current_pos);
+			
+			// Validate batch metadata
+			if (potential_metadata->reserved == 0 && 
+			    potential_metadata->num_messages > 0 && 
+			    potential_metadata->num_messages <= 10000 &&
+			    potential_metadata->batch_total_order < 100000000) {
+				
+				// Found valid batch metadata
+				batch_state.pending_metadata = *potential_metadata;
+				batch_state.has_pending_metadata = true;
+				batch_state.current_batch_messages_processed = 0;
+				batch_state.next_message_order_in_batch = potential_metadata->batch_total_order;
+				batch_state.last_seen_total_order = potential_metadata->batch_total_order;
+				
+				VLOG(3) << "ProcessSequencer5Data: Found batch metadata, total_order=" 
+				        << potential_metadata->batch_total_order << ", num_messages=" 
+				        << potential_metadata->num_messages << ", fd=" << fd;
+				
+				current_pos += sizeof(BatchMetadata);
+				continue;
+			}
+		}
+		
+		// Process messages
+		if (current_pos + sizeof(Embarcadero::MessageHeader) <= data_size) {
+			Embarcadero::MessageHeader* header = 
+				reinterpret_cast<Embarcadero::MessageHeader*>(data + current_pos);
+			
+			// Validate message header
+			if (header->paddedSize > 0 && header->paddedSize <= 1024*1024 &&
+			    current_pos + header->paddedSize <= data_size) {
+				
+				// Assign total_order from batch metadata
+				if (batch_state.has_pending_metadata && header->total_order == 0) {
+					header->total_order = batch_state.next_message_order_in_batch++;
+					batch_state.current_batch_messages_processed++;
+					
+					if (batch_state.current_batch_messages_processed >= 
+					    batch_state.pending_metadata.num_messages) {
+						batch_state.has_pending_metadata = false;
+					}
+					
+				VLOG(5) << "ProcessSequencer5Data: Assigned total_order=" << header->total_order 
+				        << " to message, fd=" << fd;
+				}
+				
+				current_pos += header->paddedSize;
+			} else {
+				// Invalid message header, skip ahead
+				current_pos += 64;
+			}
+		} else {
+			// Not enough data for a complete message header
+			break;
+		}
+	}
+}
+
 // Batch-aware consume method for Sequencer 5
 void* Subscriber::ConsumeBatchAware(int timeout_ms) {
     static size_t next_expected_order = 0;
     static std::map<size_t, void*> pending_messages; // Buffer out-of-order messages
     static constexpr size_t MAX_PENDING_MESSAGES = 1000; // Prevent unbounded growth
+    
+    VLOG(4) << "ConsumeBatchAware: Looking for message " << next_expected_order;
     
     // LOGICAL AGGREGATION LAYER: Persistent state for each connection
     // Each connection has parse offsets for both buffers: [buffer0_offset, buffer1_offset]
@@ -1094,14 +1113,54 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                 // Create non-volatile copy to avoid compiler issues
                 size_t current_total_order = header->total_order;
                 
-                // For Sequencer 5, assign total_order if uninitialized
-                if (current_total_order == 0) {
-                    // This is a heuristic - we assign based on arrival order
-                    static size_t auto_assigned_order = 0;
-                    current_total_order = auto_assigned_order++;
-                    header->total_order = current_total_order;
-                    VLOG(4) << "ConsumeBatchAware: Auto-assigned total_order=" << current_total_order;
-                }
+				// For Sequencer 5: Process batch metadata to reconstruct message ordering
+				// Messages arrive with batch metadata that tells us the starting total_order
+				if (order_level_ == 5) {
+					absl::MutexLock batch_lock(&g_batch_states_mutex);
+					ConnectionBatchState& batch_state = g_batch_states[fd];
+					
+					// Check if we need to read batch metadata first
+					if (!batch_state.has_pending_metadata && parse_offset % sizeof(BatchMetadata) == 0) {
+						// Try to read batch metadata
+						if (parse_offset + sizeof(BatchMetadata) <= write_offset) {
+							BatchMetadata* metadata = reinterpret_cast<BatchMetadata*>(
+								static_cast<uint8_t*>(buffer_start) + parse_offset);
+							batch_state.pending_metadata = *metadata;
+							batch_state.has_pending_metadata = true;
+							batch_state.current_batch_messages_processed = 0;
+							batch_state.next_message_order_in_batch = metadata->batch_total_order;
+							parse_offset += sizeof(BatchMetadata);
+							VLOG(4) << "ConsumeBatchAware: Read batch metadata, total_order=" 
+							        << metadata->batch_total_order << ", num_messages=" << metadata->num_messages;
+							continue; // Go to next iteration to read actual messages
+						}
+					}
+					
+					// Assign total_order based on batch metadata
+					if (batch_state.has_pending_metadata) {
+						current_total_order = batch_state.next_message_order_in_batch++;
+					header->total_order = current_total_order;
+						batch_state.current_batch_messages_processed++;
+						
+						// Check if we've processed all messages in this batch
+						if (batch_state.current_batch_messages_processed >= batch_state.pending_metadata.num_messages) {
+							batch_state.has_pending_metadata = false;
+							VLOG(4) << "ConsumeBatchAware: Finished processing batch of " 
+							        << batch_state.pending_metadata.num_messages << " messages";
+						}
+						
+						VLOG(5) << "ConsumeBatchAware: Assigned total_order=" << current_total_order 
+						        << " (message " << batch_state.current_batch_messages_processed 
+						        << "/" << batch_state.pending_metadata.num_messages << ")";
+					} else {
+						// No batch metadata available, this shouldn't happen for Sequencer 5
+						LOG(WARNING) << "ConsumeBatchAware: No batch metadata available for Sequencer 5 message";
+						current_total_order = 0; // Will be handled later
+					}
+				} else {
+					// Non-Sequencer 5: use existing total_order from message header
+					current_total_order = header->total_order;
+				}
                 
                 // If this is the next expected message, return it immediately
                 if (current_total_order == next_expected_order) {
@@ -1156,172 +1215,130 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
 // Return pointer to message header
 // Return in total_order
 void* Subscriber::Consume(int timeout_ms) {
-    // For order level 5, use batch-aware processing
-    if (order_level_ == 5) {
-        return ConsumeBatchAware(timeout_ms);
-    }
-    
-    // Original sequential processing for other order levels
     static size_t next_expected_order = 0;
 
-    // OPTIMIZATION: Smart connection routing and batch-aware prefetching
-    static int last_success_fd = -1;
-    static size_t consecutive_from_same_fd = 0;
-    static std::vector<int> connection_rotation;
-
-		// Assuming no new buffer is added after first Consume is called
-		// Assuming MessageHeader is written as beginning of a buffer (which may not be true in buffer 1)
-		// Assuming only buffer 0 is used
-		static absl::flat_hash_map<int, std::pair<std::shared_ptr<ConnectionBuffers>, void*>> acquired_buffers;
-		if(acquired_buffers.size() == 0){
+    // CRITICAL: Track currently acquired buffer to release on next call
+    static BufferState* currently_acquired_buffer = nullptr;
+    static std::shared_ptr<ConnectionBuffers> current_connection = nullptr;
+    
+    // Release previously acquired buffer if any
+    if (currently_acquired_buffer && current_connection) {
+        current_connection->release_read_buffer(currently_acquired_buffer);
+        currently_acquired_buffer = nullptr;
+        current_connection = nullptr;
+    }
+    
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::milliseconds(timeout_ms);
+    
+    // For Sequencer 5: Maintain per-connection batch state
+    static absl::Mutex g_batch_states_mutex;
+    static absl::flat_hash_map<int, ConnectionBatchState> g_batch_states;
+    
+    VLOG(3) << "Consume: Starting with timeout=" << timeout_ms << "ms, order_level=" << order_level_;
+    
+    while (std::chrono::steady_clock::now() - start_time < timeout) {
+        // Try to acquire data from any available connection
 			absl::ReaderMutexLock map_lock(&connection_map_mutex_);
 			for (auto const& [fd, conn_ptr] : connections_) {
 				if (!conn_ptr) continue;
-				acquired_buffers[fd] = std::make_pair(conn_ptr, conn_ptr->buffers[0].buffer);
-				connection_rotation.push_back(fd);
-			}
-		}
-
-		// OPTIMIZATION: Smart connection routing - try last successful connection first
-		if (last_success_fd != -1){
-			auto const& pair = acquired_buffers[last_success_fd];
-			Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)pair.second;
-			
-			// OPTIMIZATION: Cache write location to avoid repeated calls
-			std::pair<void*, size_t> written_loc = pair.first->get_write_location();
-			void* written_ptr = written_loc.first;
-			size_t written_size = (size_t)(static_cast<uint8_t*>(written_ptr) - (uint8_t*)header);
-			
-			if(written_size >= sizeof(Embarcadero::MessageHeader)){
-				// SEQUENCER 5 COMPATIBILITY: Handle uninitialized total_order
-				// If total_order is 0 or uninitialized, assign sequential values
-				static bool sequencer5_mode_detected = false;
-				if (!sequencer5_mode_detected && header->total_order == 0 && next_expected_order > 0) {
-					sequencer5_mode_detected = true;
-					VLOG(3) << "Detected Sequencer 5 mode - messages have uninitialized total_order";
-				}
-				
-				if (sequencer5_mode_detected && header->total_order == 0) {
-					// Assign sequential total_order for Sequencer 5
-					header->total_order = next_expected_order;
-					VLOG(5) << "Assigned total_order=" << next_expected_order << " to message";
-				}
-				
-				if(header->total_order == next_expected_order){
-					// OPTIMIZATION: Adaptive waiting instead of busy yield
-					size_t wait_iterations = 0;
-					while(written_size < header->paddedSize){
-						if (wait_iterations < 10) {
-							// Fast path: spin for immediate availability
-							std::this_thread::yield();
-						} else if (wait_iterations < 100) {
-							// Medium path: short sleep
-							std::this_thread::sleep_for(std::chrono::nanoseconds(100));
-						} else {
-							// Slow path: longer sleep to reduce CPU usage
-							std::this_thread::sleep_for(std::chrono::microseconds(1));
-						}
-						wait_iterations++;
-						written_loc = pair.first->get_write_location();
-						written_size = (size_t)(static_cast<uint8_t*>(written_loc.first) - (uint8_t*)header);
-					}
-					
-					next_expected_order++;
-					consecutive_from_same_fd++;
-					acquired_buffers[last_success_fd].second = (void*)((uint8_t*)header + header->paddedSize);
-					
-					// OPTIMIZATION: Prefetch next message location for better cache performance
-					__builtin_prefetch(acquired_buffers[last_success_fd].second, 0, 3);
-					
-					return static_cast<void*>(header);
-				}
-			}
-		}
-
-		// OPTIMIZATION: Smart connection search with rotation and batch awareness
-		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-		
-		// If we've had many consecutive messages from same connection, try others first
-		bool try_rotation = (consecutive_from_same_fd > 8);
-		
-		while (std::chrono::steady_clock::now() <= deadline) {
-			// OPTIMIZATION: Use connection rotation for better load balancing
-			auto search_order = try_rotation ? connection_rotation : std::vector<int>{last_success_fd};
-			if (!try_rotation && last_success_fd != -1) {
-				// Add other connections after trying last successful one
-				for (int fd : connection_rotation) {
-					if (fd != last_success_fd) {
-						search_order.push_back(fd);
-					}
-				}
-			}
-			
-			for (int fd : search_order) {
-				if (acquired_buffers.find(fd) == acquired_buffers.end()) continue;
-				
-				auto& pair = acquired_buffers[fd];
-				// OPTIMIZATION: Cache write location calculation
-				std::pair<void*, size_t> written_loc = pair.first->get_write_location();
-				void* written_ptr = written_loc.first;
-				Embarcadero::MessageHeader *header = (Embarcadero::MessageHeader*)pair.second;
-				size_t written_size = (size_t)(static_cast<uint8_t*>(written_ptr) - (uint8_t*)header);
-				
-				if(written_size >= sizeof(Embarcadero::MessageHeader)){
-					// SEQUENCER 5 COMPATIBILITY: Handle uninitialized total_order
-					// If total_order is 0 or uninitialized, assign sequential values
-					static bool sequencer5_mode_detected = false;
-					if (!sequencer5_mode_detected && header->total_order == 0 && next_expected_order > 0) {
-						sequencer5_mode_detected = true;
-						VLOG(3) << "Detected Sequencer 5 mode - messages have uninitialized total_order";
-					}
-					
-					if (sequencer5_mode_detected && header->total_order == 0) {
-						// Assign sequential total_order for Sequencer 5
-						header->total_order = next_expected_order;
-						VLOG(5) << "Assigned total_order=" << next_expected_order << " to message";
-					}
-					
-					if(header->total_order == next_expected_order){
-						// OPTIMIZATION: Adaptive waiting with exponential backoff
-						size_t wait_iterations = 0;
-						while(written_size < header->paddedSize){
-							if (wait_iterations < 5) {
-								std::this_thread::yield();
-							} else if (wait_iterations < 50) {
-								std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+            
+            // Try to acquire a buffer with data
+            BufferState* buffer = conn_ptr->acquire_read_buffer();
+            if (!buffer) continue; // No data available on this connection
+            
+            // We have data! Process it
+            size_t buffer_write_offset = buffer->write_offset.load(std::memory_order_acquire);
+            if (buffer_write_offset < sizeof(Embarcadero::MessageHeader)) {
+                // Not enough data for even a message header
+                conn_ptr->release_read_buffer(buffer);
+                continue;
+            }
+            
+            uint8_t* buffer_data = static_cast<uint8_t*>(buffer->buffer);
+            size_t current_pos = 0;
+            
+            VLOG(4) << "Consume: Processing buffer from fd=" << fd 
+                     << ", buffer_size=" << buffer_write_offset << ", order_level=" << order_level_;
+            
+            // For Sequencer 5: No initialization needed - receiver threads handle everything
+            
+            // CRITICAL FIX: Store messages to return later
+            void* message_to_return = nullptr;
+            
+            // Process ALL messages in the buffer before releasing it
+            while (current_pos + sizeof(Embarcadero::MessageHeader) <= buffer_write_offset) {
+                // Receiver threads already processed batch metadata - just parse messages
+                
+                // Parse message header directly
+                
+                Embarcadero::MessageHeader* header = 
+                    reinterpret_cast<Embarcadero::MessageHeader*>(buffer_data + current_pos);
+                
+                // Validate message header
+                if (header->paddedSize == 0 || header->paddedSize > 1024*1024) {
+                    // This might be batch metadata or corrupted data
+                    if (order_level_ == 5 && current_pos + sizeof(BatchMetadata) <= buffer_write_offset) {
+                        // Try skipping 16 bytes (batch metadata size)
+                        current_pos += sizeof(BatchMetadata);
 							} else {
-								std::this_thread::sleep_for(std::chrono::microseconds(1));
-							}
-							wait_iterations++;
-							written_loc = pair.first->get_write_location();
-							written_size = (size_t)(static_cast<uint8_t*>(written_loc.first) - (uint8_t*)header);
-						}
-						
-						// Update state for next iteration
-						last_success_fd = fd;
-						next_expected_order++;
-						consecutive_from_same_fd = (fd == last_success_fd) ? consecutive_from_same_fd + 1 : 1;
-						pair.second = (void*)((uint8_t*)header + header->paddedSize);
-						
-						// OPTIMIZATION: Prefetch next message for cache efficiency
-						__builtin_prefetch(pair.second, 0, 3);
-						
-						return static_cast<void*>(header);
-					}
-				}
-			}
-			
-			// OPTIMIZATION: Exponential backoff instead of constant yield
-			static size_t global_wait_count = 0;
-			if (global_wait_count < 10) {
-				std::this_thread::yield();
-			} else if (global_wait_count < 100) {
-				std::this_thread::sleep_for(std::chrono::nanoseconds(500));
+                        // Skip to next aligned position
+                        current_pos += 8;
+                    }
+                    continue;
+                }
+                
+                // Check if we have the complete message
+                if (current_pos + header->paddedSize > buffer_write_offset) {
+                    VLOG(4) << "Consume: Incomplete message at pos " << current_pos 
+                            << ", need " << header->paddedSize << " bytes, have " 
+                            << (buffer_write_offset - current_pos) << ", fd=" << fd;
+                    break; // Wait for more data
+                }
+                
+                // For Sequencer 5: total_order is already assigned by receiver threads
+                // No need to re-assign here
+                
+                // Check if this is a message we should consume
+                bool should_consume = false;
+                
+                // All order levels (including 5) now enforce strict sequential ordering
+                // since receiver threads already assigned correct total_order values
+                should_consume = (header->total_order == next_expected_order);
+                if (should_consume) {
+                    next_expected_order++;
+                }
+                
+                if (should_consume && message_to_return == nullptr) {
+                    // Mark this message to return (but continue processing the buffer)
+                    message_to_return = static_cast<void*>(header);
+                    VLOG(4) << "Consume: Will return message with total_order=" << header->total_order
+                            << ", paddedSize=" << header->paddedSize << ", fd=" << fd;
+                }
+                
+                // Move to next message in buffer
+                current_pos += header->paddedSize;
+            }
+            
+            // If we found a message to return, keep the buffer acquired
+            if (message_to_return != nullptr) {
+                // Store buffer reference for release on next call
+                currently_acquired_buffer = buffer;
+                current_connection = conn_ptr;
+                return message_to_return;
 			} else {
-				std::this_thread::sleep_for(std::chrono::microseconds(2));
+                // No message found in this buffer, release it
+                conn_ptr->release_read_buffer(buffer);
 			}
-			global_wait_count++;
+            
+            // No suitable message found in this buffer, release it
+            conn_ptr->release_read_buffer(buffer);
 		}
 
+        // No data available from any connection, wait a bit
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    
+    VLOG(3) << "Consume: Timeout reached after " << timeout_ms << "ms";
     return nullptr;
 }

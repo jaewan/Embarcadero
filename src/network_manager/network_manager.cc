@@ -566,20 +566,24 @@ void NetworkManager::HandlePublishRequest(
 		// Signal batch completion for ALL order levels
 		// This must be done AFTER all messages in the batch are received and marked complete
 		if (batch_header_location != nullptr) {
-			// CRITICAL FIX: Ensure all message headers are properly initialized before marking batch complete
-			// This prevents race conditions where sequencer/combiner sees batch_complete=1 but messages aren't ready
-			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
-			for (size_t i = 0; i < batch_header.num_msg; ++i) {
-				// Ensure paddedSize is set (this indicates message is complete)
-				while (first_msg->paddedSize == 0) {
-					std::this_thread::yield(); // Wait for message to be fully written
+			// For Sequencer 5, we only need to ensure the batch data is fully received
+			// We don't need to wait for individual message headers since Sequencer 5 works at batch level
+			TInode* tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
+			if (seq_type != EMBARCADERO || (tinode && tinode->order != 5)) {
+				// For Sequencer 4 and other modes: Ensure all message headers are properly initialized
+				MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
+				for (size_t i = 0; i < batch_header.num_msg; ++i) {
+					// Ensure paddedSize is set (this indicates message is complete)
+					while (first_msg->paddedSize == 0) {
+						std::this_thread::yield(); // Wait for message to be fully written
+					}
+					// Move to next message
+					first_msg = reinterpret_cast<MessageHeader*>(
+						reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
+					);
 				}
-				// Move to next message
-				first_msg = reinterpret_cast<MessageHeader*>(
-					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
-				);
 			}
-			
+			// For Sequencer 5, batch is complete once all data is received (to_read == 0)
 			// Now it's safe to mark batch as complete for ALL order levels
 			__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
 			VLOG(4) << "NetworkManager: Marked batch complete for " << batch_header.num_msg << " messages, client_id=" << batch_header.client_id << ", order_level=" << seq_type;
@@ -696,10 +700,11 @@ void NetworkManager::SubscribeNetworkThread(
 	int order = topic_manager_->GetTopicOrder(topic);
 
 	// Define batch metadata structure for Sequencer 5
+	// This metadata is sent before each batch to help subscribers reconstruct message ordering
 	struct BatchMetadata {
-		size_t batch_total_order;
-		uint32_t num_messages;
-		uint32_t reserved;  // Padding for alignment
+		size_t batch_total_order;  // Starting total_order for this batch
+		uint32_t num_messages;     // Number of messages in this batch
+		uint32_t reserved;         // Padding for alignment
 	} batch_meta = {0, 0, 0};
 
 	// PERFORMANCE OPTIMIZATION: Cache state pointer to avoid repeated hash map lookups
@@ -734,6 +739,7 @@ void NetworkManager::SubscribeNetworkThread(
 				// For Sequencer 5: Get batch with metadata
 				size_t batch_total_order = 0;
 				uint32_t num_messages = 0;
+				static int no_data_count = 0;
 				if (!topic_manager_->GetBatchToExportWithMetadata(
 							topic,
 							(*cached_state_ptr)->last_offset,
@@ -741,12 +747,20 @@ void NetworkManager::SubscribeNetworkThread(
 							messages_size,
 							batch_total_order,
 							num_messages)){
-						std::this_thread::yield();
-						continue;
+					no_data_count++;
+					if (no_data_count % 1000 == 0) {
+						LOG(INFO) << "SubscribeNetworkThread: No data available for export yet (count=" << no_data_count 
+						          << "), topic=" << topic << ", last_offset=" << (*cached_state_ptr)->last_offset;
 					}
+					std::this_thread::yield();
+					continue;
+				}
+				no_data_count = 0;  // Reset counter when data becomes available
 				// Store metadata for sending
 				batch_meta.batch_total_order = batch_total_order;
 				batch_meta.num_messages = num_messages;
+				LOG(INFO) << "SubscribeNetworkThread: Sending batch metadata, total_order=" << batch_total_order 
+				          << ", num_messages=" << num_messages << ", topic=" << topic;
 			} else if (order > 0){
 				if (!topic_manager_->GetBatchToExport(
 							topic,
@@ -899,9 +913,9 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 			return tinode->offsets[broker_id_].ordered;
 		}
 
-		// For order=4 with EMBARCADERO, use ordered count instead of replication_done
-		// because Sequencer4 updates ordered counters per broker
-		if(order == 4 && seq_type == EMBARCADERO){
+		// For order=4,5 with EMBARCADERO, use ordered count instead of replication_done
+		// because Sequencer4/5 updates ordered counters per broker
+		if((order == 4 || order == 5) && seq_type == EMBARCADERO){
 			return tinode->offsets[broker_id_].ordered;
 		}
 

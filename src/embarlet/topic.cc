@@ -1010,7 +1010,7 @@ bool Topic::GetBatchToExport(
 		void* &batch_addr,
 		size_t &batch_size) {
 	static BatchHeader* start_batch_header = reinterpret_cast<BatchHeader*>(
-			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 	BatchHeader* header = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * expected_batch_offset);
 	if (header->ordered == 0){
 		return false;
@@ -1030,22 +1030,44 @@ bool Topic::GetBatchToExportWithMetadata(
 		size_t &batch_total_order,
 		uint32_t &num_messages) {
 	static BatchHeader* start_batch_header = reinterpret_cast<BatchHeader*>(
-			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
-	BatchHeader* header = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * expected_batch_offset);
-	if (header->ordered == 0){
-		return false;
+		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	
+	// CRITICAL FIX for Sequencer 5: Search for next available ordered batch instead of expecting sequential order
+	// Sequencer 5 processes batches in arrival order, not necessarily sequential batch offset order
+	const size_t MAX_SEARCH_BATCHES = 1000;  // Reasonable upper bound to avoid infinite search
+	size_t search_offset = expected_batch_offset;
+	
+	for (size_t i = 0; i < MAX_SEARCH_BATCHES; ++i) {
+		BatchHeader* header = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * search_offset);
+		
+		// Check if this batch is ordered and ready for export
+		if (header->ordered == 1) {
+			// Found an ordered batch! Use it for export
+			header = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(header) + (int)(header->batch_off_to_export));
+			batch_size = header->total_size;
+			batch_addr = header->log_idx + reinterpret_cast<uint8_t*>(cxl_addr_);
+			
+			// Extract batch metadata for Sequencer 5
+			batch_total_order = header->total_order;
+			num_messages = header->num_msg;
+			
+			// Update expected_batch_offset to continue from the next position
+			expected_batch_offset = search_offset + 1;
+			
+			VLOG(4) << "GetBatchToExportWithMetadata: Found ordered batch at offset " << search_offset
+			        << ", total_order=" << batch_total_order << ", num_messages=" << num_messages;
+			return true;
+		}
+		
+		// Try next batch position
+		search_offset++;
 	}
-	header = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(header) + (int)(header->batch_off_to_export));
-	batch_size = header->total_size;
-	batch_addr = header->log_idx + reinterpret_cast<uint8_t*>(cxl_addr_);
 	
-	// Extract batch metadata for Sequencer 5
-	batch_total_order = header->total_order;
-	num_messages = header->num_msg;
-	
-	expected_batch_offset++;
-
-	return true;
+	// No ordered batches found in reasonable search range
+	VLOG(4) << "GetBatchToExportWithMetadata: No ordered batches found starting from offset " << expected_batch_offset;
+	return false;
 }
 
 /**
@@ -1207,6 +1229,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	BatchHeader* ring_start_default = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id].batch_headers_offset);
 	BatchHeader* current_batch_header = ring_start_default;
+	
 	BatchHeader* header_for_sub = ring_start_default;
 
 	absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>> skipped_batches;
@@ -1284,48 +1307,24 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		size_t start_total_order = 0;
 		bool skip_batch = false;
 
-		// OPTIMIZED: Batch-level sequencing with minimal critical section
+		// SIMPLIFIED: Process all batches as they arrive (like order level 0)
+		// No strict sequencing - just assign total_order and process immediately
 		{
 			absl::MutexLock lock(&global_seq_batch_seq_mu_);
+			start_total_order = global_seq_;
+			global_seq_ += header_to_process->num_msg;
+			ready_to_order = true;
+			skip_batch = false;
 			
-			// Fast path: Check if this is the expected batch for this client
-			auto map_it = next_expected_batch_seq_.find(client_id);
-			if (map_it != next_expected_batch_seq_.end() && batch_seq == map_it->second) {
-				// Expected batch - fast path
-				start_total_order = global_seq_;
-				global_seq_ += header_to_process->num_msg;
-				map_it->second = batch_seq + 1;
-				ready_to_order = true;
-			} else if (map_it == next_expected_batch_seq_.end() && batch_seq == 0) {
-				// New client starting at 0 - fast path
-				start_total_order = global_seq_;
-				global_seq_ += header_to_process->num_msg;
-				next_expected_batch_seq_[client_id] = 1;
-				ready_to_order = true;
-			} else {
-				// Slow path: out of order or duplicate
-				skip_batch = true;
-				ready_to_order = false;
-			}
+			VLOG(4) << "Scanner5 [B" << broker_id << "]: Processing batch from client " << client_id 
+					<< ", batch_seq=" << batch_seq << ", total_order=[" << start_total_order 
+					<< ", " << (start_total_order + header_to_process->num_msg) << ")";
 		}
 
-		if (skip_batch) {
-			skipped_batches[client_id][batch_seq] = header_to_process;
-			// Get expected sequence for logging
-			auto map_it = next_expected_batch_seq_.find(client_id);
-			size_t expected_for_log = (map_it != next_expected_batch_seq_.end()) ? map_it->second : 0;
-			VLOG(3) << "Scanner5 [B" << broker_id << "]: Skipping batch from client " << client_id 
-					<< ", batch_seq=" << batch_seq << ", expected=" << expected_for_log
-					<< ", num_msg=" << header_to_process->num_msg;
-		}
-
+		// Since we're not skipping batches anymore, always process
 		if (ready_to_order) {
 			AssignOrder5(header_to_process, start_total_order, header_for_sub);
 			total_batches_processed++;
-			VLOG(3) << "Scanner5 [B" << broker_id << "]: Ordered batch from client " << client_id 
-					<< ", batch_seq=" << batch_seq << ", total_order=[" << start_total_order 
-					<< ", " << (start_total_order + header_to_process->num_msg) << ")";
-			ProcessSkipped5(skipped_batches, header_for_sub);
 		}
 
 		// Periodic status logging
@@ -1336,14 +1335,19 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			last_log_time = now;
 		}
 		
-		// DIAGNOSTIC: Check if we've stopped processing new batches
+		// CRITICAL FIX: Handle accumulated skipped batches with timeout
 		static thread_local auto last_batch_time = std::chrono::steady_clock::now();
 		static thread_local size_t last_batch_count = 0;
+		static thread_local auto last_skip_cleanup = std::chrono::steady_clock::now();
 		
 		if (ready_to_order) {
 			last_batch_time = now;
 			last_batch_count = total_batches_processed;
-		} else if (std::chrono::duration_cast<std::chrono::seconds>(now - last_batch_time).count() >= 10) {
+		}
+		
+		// No gap processing needed since we process all batches immediately
+		
+		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_batch_time).count() >= 10) {
 			// No new batches for 10 seconds - check if we're missing final batches
 			if (tinode_->offsets[broker_id].ordered >= 655000 && tinode_->offsets[broker_id].ordered < 655360) {
 				LOG(WARNING) << "DIAGNOSTIC: BrokerScannerWorker5 [B" << broker_id << "] may be missing final batches. "
