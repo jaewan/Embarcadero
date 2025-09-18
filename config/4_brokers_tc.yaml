@@ -1,0 +1,54 @@
+# 4 Brokers TC Emulation Configuration
+# Optimized for TC emulation with 4 brokers and network throttling
+
+embarcadero:
+  version:
+    major: 1
+    minor: 0
+
+  broker:
+    port: 1214
+    broker_port: 12140
+    heartbeat_interval: 3
+    max_brokers: 4                    # CRITICAL: Set to 4 for this test
+    cgroup_core: 85
+
+  cxl:
+    size: 68719476736            # 64GB CXL memory
+    emulation_size: 34359738368  # 32GB emulation
+    device_path: "/dev/dax0.0"
+    numa_node: 2
+
+  storage:
+    segment_size: 8589934592      # 8GB per segment (4 × 8GB = 32GB total, fits in 64GB CXL)
+    batch_headers_size: 65536     # 64KB batch headers  
+    batch_size: 1048576           # 1MB batch size
+    num_disks: 2
+    max_topics: 32
+    topic_name_size: 31
+
+  network:
+    io_threads: 4                 # 4 network threads per broker
+    disk_io_threads: 4
+    sub_connections: 1            # 1 connection per broker for TC test
+    zero_copy_send_limit: 65536   # 64KB zero-copy threshold
+
+client:
+  publisher:
+    threads_per_broker: 1         # 1 thread per broker for TC test
+    buffer_size_mb: 768           # 768MB per thread (4 × 768MB = 3GB total)
+    batch_size_kb: 2048
+
+  subscriber:
+    connections_per_broker: 1     # 1 connection per broker for TC test
+    buffer_size_mb: 256
+
+  network:
+    connect_timeout_ms: 2000
+    send_timeout_ms: 5000
+    recv_timeout_ms: 5000
+
+  performance:
+    use_hugepages: true
+    numa_bind: false
+    zero_copy: true

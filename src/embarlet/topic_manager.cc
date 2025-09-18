@@ -320,6 +320,23 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		SequencerType &seq_type,
 		BatchHeader* &batch_header_location) {
 	
+	// DEADLOCK FIX: Only head broker creates topics to prevent concurrent creation deadlocks
+	struct TInode* tinode = cxl_manager_.GetTInode(topic);
+	if (!tinode || tinode->topic[0] == 0) {
+		if (broker_id_ != 0) {
+			// Non-head brokers wait for head to create the topic
+			LOG(INFO) << "Broker " << broker_id_ << " waiting for head broker to create topic: " << topic;
+			return nullptr;  // Return early, client will retry
+		}
+		// Only head broker creates new topics
+		LOG(INFO) << "Head broker creating new topic: " << topic;
+		tinode = CreateNewTopicInternal(topic, 0, 0, false, 0, EMBARCADERO);
+		if (!tinode) {
+			LOG(ERROR) << "Head broker failed to create topic: " << topic;
+			return nullptr;
+		}
+	}
+	
 	// Fast path: try to find topic without locking first
 	auto topic_itr = topics_.end();
 	{
@@ -328,54 +345,15 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 	}
 
 	if (topic_itr == topics_.end()) {
-		// Topic not found, need to check if it needs creation
-		
-		const TInode* tinode = cxl_manager_.GetTInode(topic);
-		
-		// Fast busy-wait for tinode initialization (much faster than sleep)
-		int wait_count = 0;
-		const int max_wait = 10000; // 10000 iterations with pause
-		while ((!tinode || tinode->topic[0] == 0) && wait_count < max_wait) {
-			_mm_pause(); // CPU pause instruction for busy-wait
-			wait_count++;
-			
-		if (wait_count % 100 == 0) {
-			// Check if topic was created
-			{
-				absl::ReaderMutexLock check_lock(&topics_mutex_);
-				topic_itr = topics_.find(topic);
-				if (topic_itr != topics_.end()) {
-					// Topic was created while we were waiting
-					break;
-				}
-			}
-		}
-			tinode = cxl_manager_.GetTInode(topic);
-		}
-		
-		// If topic still doesn't exist after waiting, try to create it
-		if (topic_itr == topics_.end()) {
-			bool has_remote_topic = (tinode != nullptr) && (tinode->topic[0] != 0);
-			if (has_remote_topic) {
-				// Topic was created from another broker, create it locally
-				// Take write lock for creation
-				absl::WriterMutexLock write_lock(&topics_mutex_);
-				
-				// Double-check after acquiring exclusive lock
-				topic_itr = topics_.find(topic);
-				if (topic_itr == topics_.end()) {
-					CreateNewTopicInternal(topic);
-					topic_itr = topics_.find(topic);
-				}
-
-				if (topic_itr == topics_.end()) {
-					LOG(ERROR) << "Failed to create topic: " << topic;
-					return nullptr;
-				}
-			} else {
-				LOG(ERROR) << "Topic not found: " << topic;
-				return nullptr;
-			}
+		// Topic not found locally, but should exist in CXL if head broker created it
+		// Create local reference to the existing CXL topic
+		tinode = CreateNewTopicInternal(topic);
+		if (tinode) {
+			absl::ReaderMutexLock lock(&topics_mutex_);
+			topic_itr = topics_.find(topic);
+		} else {
+			LOG(ERROR) << "Failed to create local topic reference for: " << topic;
+			return nullptr;
 		}
 	}
 

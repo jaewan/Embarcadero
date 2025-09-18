@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <numa.h>
 #include <numaif.h>
+#include <thread>
+#include <vector>
 #include <glog/logging.h>
 #include "mimalloc.h"
 #include "common/configuration.h"
@@ -38,22 +40,26 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 	}
 
 	if (cxl_fd < 0){
-		LOG(ERROR)<<"Opening CXL error";
+		LOG(ERROR)<<"Opening CXL error: " << strerror(errno);
 		return nullptr;
 	}
 	if(broker_id == 0 && !dev){
+		LOG(INFO) << "Head broker setting CXL file size to " << cxl_size << " bytes";
 		if (ftruncate(cxl_fd, cxl_size) == -1) {
-			LOG(ERROR) << "ftruncate failed";
+			LOG(ERROR) << "ftruncate failed: " << strerror(errno);
 			close(cxl_fd);
 			return nullptr;
 		}
+		LOG(INFO) << "ftruncate completed successfully";
 	}
+	LOG(INFO) << "Mapping CXL shared memory: " << cxl_size << " bytes";
 	addr = mmap(NULL, cxl_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd, 0);
 	close(cxl_fd);
 	if(addr == MAP_FAILED){
-		LOG(ERROR) << "Mapping CXL failed";
+		LOG(ERROR) << "Mapping CXL failed: " << strerror(errno);
 		return nullptr;
 	}
+	LOG(INFO) << "CXL mapping successful at address: " << addr;
 
 	if(cxl_type == Real && !dev && broker_id == 0){
 		// Create a bitmask for the NUMA node (numa node 2 should be the CXL memory)
@@ -61,19 +67,37 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 		numa_bitmask_setbit(bitmask, 2);
 
 		// Bind the memory to the specified NUMA node
-		if (mbind(addr, cxl_size, MPOL_BIND, bitmask->maskp, bitmask->size, MPOL_MF_MOVE | MPOL_MF_STRICT) == -1) {
-			LOG(ERROR)<< "mbind failed";
-			numa_free_nodemask(bitmask);
-			munmap(addr, cxl_size);
-			return nullptr;
+		// Remove MPOL_MF_STRICT to allow partial binding if some pages can't be moved
+		if (mbind(addr, cxl_size, MPOL_BIND, bitmask->maskp, bitmask->size, MPOL_MF_MOVE) == -1) {
+			LOG(WARNING) << "mbind failed, but continuing with best-effort NUMA binding: " << strerror(errno);
+			// Don't fail completely - continue with whatever NUMA binding we got
+		} else {
+			VLOG(3) << "Successfully bound " << cxl_size << " bytes to NUMA node 2";
 		}
 
 		numa_free_nodemask(bitmask);
 	}
 
 	if(broker_id == 0){
-		memset(addr, 0, cxl_size);
-		VLOG(3) << "Cleared CXL:" << cxl_size;
+		LOG(INFO) << "Head broker clearing CXL memory: " << cxl_size << " bytes";
+		// OPTIMIZATION: Use faster memory clearing with parallel chunks
+		const size_t chunk_size = 1024 * 1024 * 1024;  // 1GB chunks
+		const size_t num_chunks = (cxl_size + chunk_size - 1) / chunk_size;
+		
+		std::vector<std::thread> clear_threads;
+		for (size_t i = 0; i < num_chunks; ++i) {
+			clear_threads.emplace_back([addr, i, chunk_size, cxl_size]() {
+				size_t start = i * chunk_size;
+				size_t size = std::min(chunk_size, cxl_size - start);
+				memset((uint8_t*)addr + start, 0, size);
+			});
+		}
+		
+		// Wait for all threads to complete
+		for (auto& thread : clear_threads) {
+			thread.join();
+		}
+		LOG(INFO) << "CXL memory cleared successfully using " << num_chunks << " parallel threads";
 	}
 	return addr;
 }
@@ -83,11 +107,11 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	head_ip_(head_ip){
 		size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 
-		if (cxl_type == Real) {
-			cxl_size_ = CXL_SIZE;
-		} else {
-			cxl_size_ = CXL_EMUL_SIZE;
-		}
+	// CRITICAL FIX: All brokers must use the same CXL size for consistent memory layout
+	// Get the configured size from YAML to ensure consistency
+	cxl_size_ = Embarcadero::Configuration::getInstance().config().cxl.size.get();
+	
+	LOG(INFO) << "CXLManager: broker_id=" << broker_id << " using CXL size=" << cxl_size_ << " bytes";
 
 		// Initialize CXL
 		cxl_addr_ = allocate_shm(broker_id, cxl_type, cxl_size_);
@@ -164,11 +188,14 @@ TInode* CXLManager::GetReplicaTInode(const char* topic){
 }
 
 void* CXLManager::GetNewSegment(){
-	//TODO(Jae) Implement bitmap
-	static std::atomic<size_t> segment_count{0};
+	// Use per-broker segment allocation instead of global atomic counter
+	// This eliminates cross-process contention and provides proper isolation
 	
-	// Calculate max segments only once (static)
-	static size_t max_segments = []() {
+	// Calculate max segments per broker (static initialization)
+	static size_t max_segments_per_broker = 0;
+	static bool initialized = false;
+	
+	if (!initialized) {
 		size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
 		size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
 		size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
@@ -179,28 +206,32 @@ void* CXLManager::GetNewSegment(){
 		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
 		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
 		
-		// Memory is divided among configured broker slots regardless of how many are actually used
-		// This ensures consistent memory layout
-		size_t Segment_Region_size = (cxl_size - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size)/configured_max_brokers;
-		size_t max_segs = Segment_Region_size / SEGMENT_SIZE;
+		// Each broker gets its own segment region - no sharing needed
+		size_t Total_Segment_Region_size = (cxl_size - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size);
+		size_t Segment_Region_per_broker = Total_Segment_Region_size / configured_max_brokers;
+		max_segments_per_broker = Segment_Region_per_broker / SEGMENT_SIZE;
 		
-		LOG(INFO) << "GetNewSegment: CXL_size=" << cxl_size
+		LOG(INFO) << "GetNewSegment (Broker " << broker_id_ << "): CXL_size=" << cxl_size
 		          << " CONFIGURED_MAX_BROKERS=" << configured_max_brokers
-		          << " Segment_Region_size=" << Segment_Region_size 
+		          << " Segment_Region_per_broker=" << Segment_Region_per_broker 
 		          << " SEGMENT_SIZE=" << SEGMENT_SIZE 
-		          << " max_segments=" << max_segs;
-		return max_segs;
-	}();
+		          << " max_segments_per_broker=" << max_segments_per_broker;
+		initialized = true;
+	}
 	
-	size_t offset = segment_count.fetch_add(1, std::memory_order_relaxed);
+	// Per-broker segment counter (no cross-process contention!)
+	static std::atomic<size_t> broker_segment_count{0};
 	
-	if (offset >= max_segments) {
-		LOG(ERROR) << "Segment allocation overflow: offset=" << offset 
-		           << " max_segments=" << max_segments;
+	size_t offset = broker_segment_count.fetch_add(1, std::memory_order_relaxed);
+	
+	if (offset >= max_segments_per_broker) {
+		LOG(ERROR) << "Broker " << broker_id_ << " segment allocation overflow: offset=" << offset 
+		           << " max_segments_per_broker=" << max_segments_per_broker;
 		return nullptr;
 	}
 
-	return (uint8_t*)segments_ + offset*SEGMENT_SIZE;
+	// Return pointer to this broker's segment region + offset
+	return (uint8_t*)segments_ + offset * SEGMENT_SIZE;
 }
 
 void* CXLManager::GetNewBatchHeaderLog(){
