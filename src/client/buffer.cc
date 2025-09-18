@@ -134,7 +134,7 @@ bool Buffer::AddBuffers(size_t buf_size) {
        // • Accepts potential THP fallback to eliminate buffer wrapping overhead
        // • Buffer wrapping causes ~60% message loss (39.4% → 100% completion)
        // • 768MB ensures complete dataset fits without wrapping for optimal throughput
-       const static size_t optimal_size = (512UL << 20); // 512MB - prevent buffer wrapping
+       const static size_t optimal_size = (256UL << 20); // 256MB - test with fixed wrapping logic
 	buf_size = optimal_size;
 	
 	VLOG(3) << "Buffer::AddBuffers using optimized buffer size: " << (buf_size / (1024*1024)) 
@@ -260,31 +260,54 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 
 		// Check if buffer is full and needs to be wrapped
 		if (tail + header_size + paddedSize + paddedSize /*buffer margin*/ > bufs_[lockedIdx].len) {
-			LOG(INFO) << "Buffer:" << write_buf_id_ << " full. Size:" << bufs_[write_buf_id_].len 
-				<< ". Wrapping buffer. (Note: this may be buggy as it doesn't check if new head has been read)";
-
-			// Seal current batch before moving to next buffer
-			Embarcadero::BatchHeader* batch_header = 
-				reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[write_buf_id_].buffer + head);
-
-			batch_header->start_logical_offset = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed);
-			batch_header->batch_seq = batch_seq_.fetch_add(1);
-			batch_header->total_size = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed) - head - sizeof(Embarcadero::BatchHeader);
-			batch_header->num_msg = bufs_[write_buf_id_].prod.num_msg.load(std::memory_order_relaxed);
+			// FIXED: Check if reader has consumed data before wrapping
+			size_t reader_head = bufs_[lockedIdx].cons.reader_head.load(std::memory_order_relaxed);
 			
-			// Note: batch_complete will be set by NetworkManager when batch is received
-			// For locally created batches, sequencer will use fallback logic (checking paddedSize)
+			// If reader hasn't caught up, we need to wait or switch buffers
+			if (reader_head == 0) {
+				// Reader hasn't consumed any data - this buffer is still full
+				// Switch to next buffer instead of wrapping current one
+				VLOG(3) << "Buffer:" << write_buf_id_ << " full and reader hasn't consumed data. Switching to next buffer.";
+				
+				// Seal current batch before moving to next buffer
+				Embarcadero::BatchHeader* batch_header = 
+					reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[write_buf_id_].buffer + head);
 
-			// Reset buffer state for new batch
-			bufs_[write_buf_id_].prod.num_msg.store(0, std::memory_order_relaxed);
-			bufs_[write_buf_id_].prod.writer_head.store(0, std::memory_order_relaxed);
-			bufs_[write_buf_id_].prod.tail.store(sizeof(Embarcadero::BatchHeader), std::memory_order_relaxed);
+				batch_header->start_logical_offset = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed);
+				batch_header->batch_seq = batch_seq_.fetch_add(1);
+				batch_header->total_size = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed) - head - sizeof(Embarcadero::BatchHeader);
+				batch_header->num_msg = bufs_[write_buf_id_].prod.num_msg.load(std::memory_order_relaxed);
 
-			// Move to next buffer
-			AdvanceWriteBufId();
+				// Move to next buffer (don't reset this buffer - let reader consume it)
+				AdvanceWriteBufId();
 
-			// Recursive call to write to the new buffer
-			return Write(client_order, msg, len, paddedSize);
+				// Recursive call to write to the new buffer
+				return Write(client_order, msg, len, paddedSize);
+			} else {
+				// Reader has consumed some data - safe to wrap buffer
+				VLOG(3) << "Buffer:" << write_buf_id_ << " full. Reader consumed " << reader_head 
+				        << " bytes. Safe to wrap buffer.";
+
+				// Seal current batch before wrapping
+				Embarcadero::BatchHeader* batch_header = 
+					reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[write_buf_id_].buffer + head);
+
+				batch_header->start_logical_offset = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed);
+				batch_header->batch_seq = batch_seq_.fetch_add(1);
+				batch_header->total_size = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed) - head - sizeof(Embarcadero::BatchHeader);
+				batch_header->num_msg = bufs_[write_buf_id_].prod.num_msg.load(std::memory_order_relaxed);
+
+				// Reset buffer state for new batch (safe because reader consumed data)
+				bufs_[write_buf_id_].prod.num_msg.store(0, std::memory_order_relaxed);
+				bufs_[write_buf_id_].prod.writer_head.store(0, std::memory_order_relaxed);
+				bufs_[write_buf_id_].prod.tail.store(sizeof(Embarcadero::BatchHeader), std::memory_order_relaxed);
+				
+				// Reset reader head to indicate buffer is available for reuse
+				bufs_[write_buf_id_].cons.reader_head.store(0, std::memory_order_relaxed);
+
+				// Continue writing to same buffer (now wrapped)
+				return Write(client_order, msg, len, paddedSize);
+			}
 		}
 	}
 
@@ -296,17 +319,14 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 	memcpy(static_cast<void*>((uint8_t*)buffer + tail), &header_, header_size);
 	memcpy(static_cast<void*>((uint8_t*)buffer + tail + header_size), msg, len);
 
-	// Memory barrier to ensure data is visible to readers
-	//std::atomic_thread_fence(std::memory_order_release);
-
-	// Update buffer state
-	bufs_[write_buf_id_].prod.tail.fetch_add(paddedSize, std::memory_order_relaxed);
+	// Update buffer state - keep it simple and fast
+	size_t new_tail = bufs_[write_buf_id_].prod.tail.fetch_add(paddedSize, std::memory_order_relaxed) + paddedSize;
 	bufs_[write_buf_id_].prod.num_msg.fetch_add(1, std::memory_order_relaxed);
 	
 	// Check if current batch has reached BATCH_SIZE and seal it
-	// TUNED: Aggressive 1MB batch size for maximum cache efficiency with large messages
+	// OPTIMIZATION: Use the already calculated new_tail instead of loading again
 	const size_t EFFECTIVE_BATCH_SIZE = 1048576;  // 1MB - maximum cache efficiency
-	if ((bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed) - head) >= EFFECTIVE_BATCH_SIZE) {
+	if ((new_tail - head) >= EFFECTIVE_BATCH_SIZE) {
 		Seal();
 	}
 
