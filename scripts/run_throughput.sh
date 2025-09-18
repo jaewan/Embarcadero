@@ -35,8 +35,12 @@ EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1"
 NUM_BROKERS=4
 NUM_TRIALS=1
 test_cases=(1)
-#msg_sizes=(128 256  512 1024 4096 16384 65536 262144 1048576)
-msg_sizes=(4096)
+# Use MESSAGE_SIZE environment variable or default to multiple sizes
+if [ -n "$MESSAGE_SIZE" ]; then
+    msg_sizes=($MESSAGE_SIZE)
+else
+    msg_sizes=(128 1024 4096)
+fi
 
 
 # Change these for Scalog and Corfu

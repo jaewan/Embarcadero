@@ -1,0 +1,47 @@
+Connected to 10.0.0.1Connected to 
+10.0.0.3
+Connected to 10.0.0.2
+Connected to 10.0.0.4
+Connected to 10.0.0.5
+Connected to 10.0.0.6
+Connected to 10.0.0.7
+Connected to 10.0.0.8
+Connected to 10.0.0.9
+Connected to 10.0.0.10
+Connected to 10.0.0.11
+Connected to 10.0.0.13
+Connected to 10.0.0.12
+Connected to 10.0.0.14
+Connected to 10.0.0.15
+Connected to 10.0.0.16
+Connected to 10.0.0.17
+Connected to 10.0.0.18
+Connected to 10.0.0.20Connected to 
+10.0.0.19
+Finished sending to Finished sending to 10.0.0.110.0.0.4Finished sending to Finished sending to . Sent 10.0.0.3. Sent Finished sending to 10.0.0.2. Sent . Sent 10.0.0.5. Sent Finished sending to 10.0.0.6. Sent 23281270784 bytes. Throughput: 2279296204822773956608 bytes. Throughput:  bytes. Throughput: 23215538176 bytes. Throughput: 23157342208 bytes. Throughput: 18.2192 Gbps.
+18.625 Gbps.18.2344
+ Gbps.
+18.5724 Gbps.
+18.5259 Gbps.
+22930653184 bytes. Throughput: 18.3445 Gbps.
+Finished sending to 10.0.0.7. Sent 23162257408 bytes. Throughput: 18.5298 Gbps.
+Finished sending to 10.0.0.8. Sent 22764322816 bytes. Throughput: 18.2115 Gbps.
+Finished sending to 10.0.0.9. Sent Finished sending to 22758817792 bytes. Throughput: 10.0.0.10. Sent 23192862720 bytes. Throughput: 18.2071 Gbps.
+18.5543 Gbps.
+Finished sending to 10.0.0.11. Sent 22991929344 bytes. Throughput: 18.3935 Gbps.
+Finished sending to 10.0.0.13. Sent 22951690240 bytes. Throughput: 18.3614 Gbps.
+Finished sending to 10.0.0.14. Sent 22998089728 bytes. Throughput: Finished sending to 10.0.0.12. Sent 22867607552 bytes. Throughput: 18.3985 Gbps.
+18.2941 Gbps.
+Finished sending to 10.0.0.15. Sent 22992322560 bytes. Throughput: 18.3939 Gbps.
+Finished sending to 10.0.0.16. Sent 23460315136 bytes. Throughput: 18.7683 Gbps.
+Finished sending to 10.0.0.17. Sent 22974365696 bytes. Throughput: 18.3795 Gbps.
+Finished sending to 10.0.0.18. Sent 22944546816 bytes. Throughput: 18.3556 Gbps.
+Finished sending to 10.0.0.19. Sent 22759669760 bytes. Throughput: 18.2077 Gbps.
+Finished sending to 10.0.0.20. Sent 22924754944 bytes. Throughput: 18.3398 Gbps.
+
+-----------------------------------------------------
+Benchmark Complete
+Total duration: 10.0025 seconds
+Total data sent: 459895275520 bytes
+Aggregate throughput: 367.826 Gbps
+-----------------------------------------------------

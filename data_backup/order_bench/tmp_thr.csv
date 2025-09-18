@@ -1,0 +1,2 @@
+broker,0,num_seen,1537,num_ordered,1537,num_skipped,0,num_dups,0,fetch_add,1537,claimed_msgs,739297,lock_ns,61089,assign_ns,863324
+broker,0,num_seen,807599,num_ordered,31144,num_skipped,1,num_dups,776455,fetch_add,31144,claimed_msgs,14980264,lock_ns,27997298,assign_ns,13114992

@@ -1,0 +1,13 @@
+Throughput vs Brokers (msgs/s)
+flush=0:
+  brokers=1, throughput_avg=2498698
+  brokers=2, throughput_avg=3958005
+  brokers=3, throughput_avg=7275221
+  brokers=4, throughput_avg=9992054
+  brokers=5, throughput_avg=12500950
+  brokers=6, throughput_avg=15016050
+  brokers=7, throughput_avg=17494932
+
+At brokers=7:
+flush=0, throughput_avg=17494932, atomic_fetch_add/s=12469, total_skipped=115, total_dups=293857
+flush=0 slope msgs/s per broker ~ 2499372.2

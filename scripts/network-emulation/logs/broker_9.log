@@ -1,0 +1,5 @@
+Broker is listening on port 8080
+New connection accepted. Handling client.
+Client disconnected.
+Received 22758817792 bytes in 10.0001 seconds. Average speed: 17363.5 Mbps.
+Broker shutting down.

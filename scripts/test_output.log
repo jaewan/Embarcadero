@@ -1,0 +1,8 @@
+~/Embarcadero/build/bin ~/Embarcadero/scripts
+Cleaning up stale brokers and ports...
+Running trial 1 with message size 4096
+Started process with command './embarlet --config ../../config/embarcadero.yaml --head --EMBARCADERO > broker_0.log 2>&1' and PID 2478059
+Received signal: ready
+Started process with command './embarlet --config ../../config/embarcadero.yaml > broker_1.log 2>&1' and PID 2478302
+Received signal: ready
+Started process with command './embarlet --config ../../config/embarcadero.yaml > broker_2.log 2>&1' and PID 2478448

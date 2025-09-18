@@ -1,0 +1,1 @@
+scalog_replicate_synchronous_result.csv is the result of Scalog that replicate() gRPC is replied when WriteRequest() is synchronous. Meaning gRPC is returned after the replicate request is written to the disk. Scalog should be asynchronous

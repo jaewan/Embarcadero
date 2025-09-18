@@ -73,6 +73,8 @@
  */
 
 #include "buffer.h"
+#include <thread>
+#include <chrono>
 
 Buffer::Buffer(size_t num_buf, size_t num_threads_per_broker, int client_id, size_t message_size, int order) 
 	: bufs_(num_buf), 
@@ -269,6 +271,9 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 			batch_header->batch_seq = batch_seq_.fetch_add(1);
 			batch_header->total_size = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed) - head - sizeof(Embarcadero::BatchHeader);
 			batch_header->num_msg = bufs_[write_buf_id_].prod.num_msg.load(std::memory_order_relaxed);
+			
+			// Note: batch_complete will be set by NetworkManager when batch is received
+			// For locally created batches, sequencer will use fallback logic (checking paddedSize)
 
 			// Reset buffer state for new batch
 			bufs_[write_buf_id_].prod.num_msg.store(0, std::memory_order_relaxed);
@@ -299,8 +304,8 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 	bufs_[write_buf_id_].prod.num_msg.fetch_add(1, std::memory_order_relaxed);
 	
 	// Check if current batch has reached BATCH_SIZE and seal it
-	// RESTORED: Back to 4MB batch size that was working well
-	const size_t EFFECTIVE_BATCH_SIZE = 4194304;  // 4MB as specified in embarcadero.yaml
+	// TUNED: Aggressive 1MB batch size for maximum cache efficiency with large messages
+	const size_t EFFECTIVE_BATCH_SIZE = 1048576;  // 1MB - maximum cache efficiency
 	if ((bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed) - head) >= EFFECTIVE_BATCH_SIZE) {
 		Seal();
 	}
@@ -321,6 +326,9 @@ void Buffer::Seal(){
 		batch_header->batch_seq = batch_seq_.fetch_add(1);
 		batch_header->total_size = bufs_[lockedIdx].prod.tail.load(std::memory_order_relaxed) - head - sizeof(Embarcadero::BatchHeader);
 		batch_header->num_msg = bufs_[lockedIdx].prod.num_msg.load(std::memory_order_relaxed);
+		
+		// Note: batch_complete will be set by NetworkManager when batch is received  
+		// For locally created batches, sequencer will use fallback logic (checking paddedSize)
 		batch_header->batch_complete = 0;  // Initialize batch completion flag
 
 		// Final batch sealed
