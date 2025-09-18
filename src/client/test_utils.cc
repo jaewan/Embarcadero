@@ -1,4 +1,5 @@
 #include "test_utils.h"
+#include "../common/configuration.h"
 #include <chrono>
 #include <iomanip>
 #include <random>
@@ -15,6 +16,30 @@ void FillRandomData(char* buffer, size_t size) {
 	for (size_t i = 0; i < size; i++) {
 		buffer[i] = dist(gen);
 	}
+}
+
+// Helper function to calculate optimal queue size based on configuration
+size_t CalculateOptimalQueueSize(size_t num_threads_per_broker, size_t total_message_size, size_t message_size) {
+	const Embarcadero::Configuration& config = Embarcadero::Configuration::getInstance();
+	
+	// Get buffer size from configuration (convert MB to bytes)
+	size_t buffer_size_per_thread_bytes = config.config().client.publisher.buffer_size_mb.get() * 1024 * 1024;
+	
+	// Total buffer size = threads_per_broker * brokers * buffer_per_thread
+	size_t total_buffer_size = num_threads_per_broker * 4 * buffer_size_per_thread_bytes; // 4 brokers
+	
+	// Ensure we have enough buffer for the total message size + overhead
+	size_t header_overhead = (total_message_size / message_size) * 64; // 64 bytes per message header
+	size_t required_size = total_message_size + header_overhead + 2097152; // 2MB safety margin
+	
+	// Use the larger of configured buffer size or required size
+	size_t queue_size = std::max(total_buffer_size, required_size);
+	
+	LOG(INFO) << "Calculated queue size: " << (queue_size / (1024 * 1024)) << " MB "
+	          << "(config buffer: " << (total_buffer_size / (1024 * 1024)) << " MB, "
+	          << "required: " << (required_size / (1024 * 1024)) << " MB)";
+	
+	return std::max(queue_size, static_cast<size_t>(1024)); // Minimum 1KB
 }
 
 // Helper function to log test parameters
@@ -99,17 +124,8 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 		return 0.0;
 	}
 
-	// Calculate queue size with buffer - account for per-thread and per-broker division
-	// Base size: total data + header overhead + 2MB safety margin
-	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
-	
-	// Account for the fact that queueSize will be divided by num_threads_per_broker and num_brokers
-	// With 4 threads per broker and 4 brokers, we need 16x the base size to avoid buffer wrapping
-	// Publisher constructor divides by num_threads_per_broker, then by num_brokers
-	// So we multiply by both to compensate: 4 threads * 4 brokers = 16x multiplier
-	q_size *= num_threads_per_broker * 4; // 4 brokers (NUM_MAX_BROKERS)
-	
-	q_size = std::max(q_size, static_cast<size_t>(1024));
+	// Calculate optimal queue size based on configuration
+	size_t q_size = CalculateOptimalQueueSize(num_threads_per_broker, total_message_size, message_size);
 
 	// Create publisher
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
@@ -200,17 +216,8 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		return 0.0;
 	}
 
-	// Calculate queue size with buffer - account for per-thread and per-broker division
-	// Base size: total data + header overhead + 2MB safety margin
-	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
-	
-	// Account for the fact that queueSize will be divided by num_threads_per_broker and num_brokers
-	// With 4 threads per broker and 4 brokers, we need 16x the base size to avoid buffer wrapping
-	// Publisher constructor divides by num_threads_per_broker, then by num_brokers
-	// So we multiply by both to compensate: 4 threads * 4 brokers = 16x multiplier
-	q_size *= num_threads_per_broker * 4; // 4 brokers (NUM_MAX_BROKERS)
-	
-	q_size = std::max(q_size, static_cast<size_t>(1024));
+	// Calculate optimal queue size based on configuration
+	size_t q_size = CalculateOptimalQueueSize(num_threads_per_broker, total_message_size, message_size);
 
 	// Create publisher
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
@@ -419,17 +426,8 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		return std::make_pair(0.0, 0.0);
 	}
 
-	// Calculate queue size with buffer - account for per-thread and per-broker division
-	// Base size: total data + header overhead + 2MB safety margin
-	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
-	
-	// CRITICAL FIX: Account for the fact that queueSize will be divided by num_threads_per_broker and num_brokers
-	// With 4 threads per broker and 4 brokers, we need 16x the base size to avoid buffer wrapping
-	// Publisher constructor divides by num_threads_per_broker, then by num_brokers
-	// So we multiply by both to compensate: 4 threads * 4 brokers = 16x multiplier
-	q_size *= num_threads_per_broker * 4; // 4 brokers (NUM_MAX_BROKERS)
-	
-	q_size = std::max(q_size, static_cast<size_t>(1024));
+	// Calculate optimal queue size based on configuration
+	size_t q_size = CalculateOptimalQueueSize(num_threads_per_broker, total_message_size, message_size);
 
 	try {
 		// PERF OPTIMIZATION: Move all initialization out of timing measurement

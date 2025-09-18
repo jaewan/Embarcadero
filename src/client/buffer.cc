@@ -117,24 +117,24 @@ Buffer::~Buffer() {
 }
 
 bool Buffer::AddBuffers(size_t buf_size) {
-	// OPTIMIZED: 768MB buffer size - perfect for 10GB E2E throughput tests with 4 brokers
-	// 
-	// BUFFER SIZE RATIONALE FOR 768MB:
-	// • E2E test sends 10.7GB total across 4 brokers = 2.675GB per broker
-	// • 4 threads per broker × 768MB = 3.072GB buffer capacity per broker
-	// • This provides 15% safety margin (3.072GB > 2.675GB) without buffer wrapping
-	// • Total system memory: 16 buffers × 768MB = 12.3GB (sufficient for 10.7GB dataset)
-	//
-	// HUGEPAGE ALIGNMENT:
-	// • System hugepage size: 2MB (confirmed from /proc/meminfo)
-	// • 768MB ÷ 2MB = 384 hugepages (perfect alignment, no fragmentation)
-	// • May fall back to THP but performance impact is acceptable for no-wrap benefit
-	//
-	// PERFORMANCE TRADE-OFF:
-	// • Accepts potential THP fallback to eliminate buffer wrapping overhead
-	// • Buffer wrapping causes ~60% message loss (39.4% → 100% completion)
-	// • 768MB ensures complete dataset fits without wrapping for optimal throughput
-	const static size_t optimal_size = (768UL << 20); // 768MB - optimal for 10GB E2E tests
+       // OPTIMIZED: 768MB buffer size - perfect for 10GB E2E throughput tests with 4 brokers
+       // 
+       // BUFFER SIZE RATIONALE FOR 768MB:
+       // • E2E test sends 10.7GB total across 4 brokers = 2.675GB per broker
+       // • 4 threads per broker × 768MB = 3.072GB buffer capacity per broker
+       // • This provides 15% safety margin (3.072GB > 2.675GB) without buffer wrapping
+       // • Total system memory: 16 buffers × 768MB = 12.3GB (sufficient for 10.7GB dataset)
+       //
+       // HUGEPAGE ALIGNMENT:
+       // • System hugepage size: 2MB (confirmed from /proc/meminfo)
+       // • 768MB ÷ 2MB = 384 hugepages (perfect alignment, no fragmentation)
+       // • May fall back to THP but performance impact is acceptable for no-wrap benefit
+       //
+       // PERFORMANCE TRADE-OFF:
+       // • Accepts potential THP fallback to eliminate buffer wrapping overhead
+       // • Buffer wrapping causes ~60% message loss (39.4% → 100% completion)
+       // • 768MB ensures complete dataset fits without wrapping for optimal throughput
+       const static size_t optimal_size = (512UL << 20); // 512MB - prevent buffer wrapping
 	buf_size = optimal_size;
 	
 	VLOG(3) << "Buffer::AddBuffers using optimized buffer size: " << (buf_size / (1024*1024)) 

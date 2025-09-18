@@ -105,6 +105,32 @@ struct EmbarcaderoConfig {
         ConfigValue<bool> is_intel{false, "EMBARCADERO_PLATFORM_INTEL"};
         ConfigValue<bool> is_amd{false, "EMBARCADERO_PLATFORM_AMD"};
     } platform;
+
+    // Client configuration
+    struct Client {
+        struct Publisher {
+            ConfigValue<int> threads_per_broker{4, "EMBARCADERO_CLIENT_PUB_THREADS"};
+            ConfigValue<size_t> buffer_size_mb{768, "EMBARCADERO_CLIENT_PUB_BUFFER_MB"};
+            ConfigValue<size_t> batch_size_kb{2048, "EMBARCADERO_CLIENT_PUB_BATCH_KB"};
+        } publisher;
+
+        struct Subscriber {
+            ConfigValue<int> connections_per_broker{3, "EMBARCADERO_CLIENT_SUB_CONNECTIONS"};
+            ConfigValue<size_t> buffer_size_mb{256, "EMBARCADERO_CLIENT_SUB_BUFFER_MB"};
+        } subscriber;
+
+        struct Network {
+            ConfigValue<int> connect_timeout_ms{2000, "EMBARCADERO_CLIENT_CONNECT_TIMEOUT"};
+            ConfigValue<int> send_timeout_ms{5000, "EMBARCADERO_CLIENT_SEND_TIMEOUT"};
+            ConfigValue<int> recv_timeout_ms{5000, "EMBARCADERO_CLIENT_RECV_TIMEOUT"};
+        } network;
+
+        struct Performance {
+            ConfigValue<bool> use_hugepages{true, "EMBARCADERO_CLIENT_USE_HUGEPAGES"};
+            ConfigValue<bool> numa_bind{true, "EMBARCADERO_CLIENT_NUMA_BIND"};
+            ConfigValue<bool> zero_copy{true, "EMBARCADERO_CLIENT_ZERO_COPY"};
+        } performance;
+    } client;
 };
 
 /**

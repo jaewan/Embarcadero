@@ -56,3 +56,19 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
  * @return true if successful, false otherwise
  */
 bool KillBrokers(std::unique_ptr<HeartBeat::Stub>& stub, int num_brokers);
+
+/**
+ * Helper function to generate random message content
+ * @param buffer Buffer to fill
+ * @param size Size of buffer
+ */
+void FillRandomData(char* buffer, size_t size);
+
+/**
+ * Helper function to calculate optimal queue size based on configuration
+ * @param num_threads_per_broker Number of threads per broker
+ * @param total_message_size Total message size
+ * @param message_size Individual message size
+ * @return Optimal queue size in bytes
+ */
+size_t CalculateOptimalQueueSize(size_t num_threads_per_broker, size_t total_message_size, size_t message_size);

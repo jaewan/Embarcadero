@@ -145,6 +145,42 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (platform["is_intel"]) config_.platform.is_intel.set(platform["is_intel"].as<bool>());
                 if (platform["is_amd"]) config_.platform.is_amd.set(platform["is_amd"].as<bool>());
             }
+            
+            // Client
+            if (root["client"]) {
+                auto client = root["client"];
+                
+                // Publisher
+                if (client["publisher"]) {
+                    auto publisher = client["publisher"];
+                    if (publisher["threads_per_broker"]) config_.client.publisher.threads_per_broker.set(publisher["threads_per_broker"].as<int>());
+                    if (publisher["buffer_size_mb"]) config_.client.publisher.buffer_size_mb.set(publisher["buffer_size_mb"].as<size_t>());
+                    if (publisher["batch_size_kb"]) config_.client.publisher.batch_size_kb.set(publisher["batch_size_kb"].as<size_t>());
+                }
+                
+                // Subscriber
+                if (client["subscriber"]) {
+                    auto subscriber = client["subscriber"];
+                    if (subscriber["connections_per_broker"]) config_.client.subscriber.connections_per_broker.set(subscriber["connections_per_broker"].as<int>());
+                    if (subscriber["buffer_size_mb"]) config_.client.subscriber.buffer_size_mb.set(subscriber["buffer_size_mb"].as<size_t>());
+                }
+                
+                // Network
+                if (client["network"]) {
+                    auto network = client["network"];
+                    if (network["connect_timeout_ms"]) config_.client.network.connect_timeout_ms.set(network["connect_timeout_ms"].as<int>());
+                    if (network["send_timeout_ms"]) config_.client.network.send_timeout_ms.set(network["send_timeout_ms"].as<int>());
+                    if (network["recv_timeout_ms"]) config_.client.network.recv_timeout_ms.set(network["recv_timeout_ms"].as<int>());
+                }
+                
+                // Performance
+                if (client["performance"]) {
+                    auto performance = client["performance"];
+                    if (performance["use_hugepages"]) config_.client.performance.use_hugepages.set(performance["use_hugepages"].as<bool>());
+                    if (performance["numa_bind"]) config_.client.performance.numa_bind.set(performance["numa_bind"].as<bool>());
+                    if (performance["zero_copy"]) config_.client.performance.zero_copy.set(performance["zero_copy"].as<bool>());
+                }
+            }
         }
         
         return validateConfig();

@@ -1,0 +1,19 @@
+client:
+  publisher:
+    threads_per_broker: 4
+    buffer_size_mb: 768
+    batch_size_kb: 2048
+  
+  subscriber:
+    connections_per_broker: 3
+    buffer_size_mb: 256
+  
+  network:
+    connect_timeout_ms: 2000
+    send_timeout_ms: 5000
+    recv_timeout_ms: 5000
+  
+  performance:
+    use_hugepages: true
+    numa_bind: true
+    zero_copy: true

@@ -3,6 +3,7 @@
 #include "subscriber.h"
 #include "test_utils.h"
 #include "result_writer.h"
+#include "../common/configuration.h"
 
 int main(int argc, char* argv[]) {
     // Initialize logging
@@ -35,14 +36,37 @@ int main(int argc, char* argv[]) {
             cxxopts::value<double>()->default_value("0"))
         ("steady_rate", "Send message in steady rate")
         ("n,num_threads_per_broker", "Number of request threads_per_broker", 
-            cxxopts::value<size_t>()->default_value("4"));
+            cxxopts::value<size_t>()->default_value("4"))
+        ("config", "Configuration file path", cxxopts::value<std::string>()->default_value("config/client.yaml"));
     
     auto result = options.parse(argc, argv);
     
-    // Extract parameters
+    // *************** Load Configuration *********************
+    Embarcadero::Configuration& config = Embarcadero::Configuration::getInstance();
+    std::string config_file = result["config"].as<std::string>();
+    
+    if (!config.loadFromFile(config_file)) {
+        LOG(WARNING) << "Failed to load configuration from " << config_file << ", using defaults";
+        // Continue with defaults - don't fail
+    } else {
+        LOG(INFO) << "Configuration loaded successfully from " << config_file;
+    }
+    
+    // Extract parameters (with config override capability)
     size_t message_size = result["size"].as<size_t>();
     size_t total_message_size = result["total_message_size"].as<size_t>();
-    size_t num_threads_per_broker = result["num_threads_per_broker"].as<size_t>();
+    
+    // Use config value if command line argument is default
+    size_t num_threads_per_broker;
+    if (result["num_threads_per_broker"].count() == 0 || result["num_threads_per_broker"].as<size_t>() == 4) {
+        // Use config value
+        num_threads_per_broker = config.config().client.publisher.threads_per_broker.get();
+        LOG(INFO) << "Using threads_per_broker from config: " << num_threads_per_broker;
+    } else {
+        // Use command line value
+        num_threads_per_broker = result["num_threads_per_broker"].as<size_t>();
+        LOG(INFO) << "Using threads_per_broker from command line: " << num_threads_per_broker;
+    }
     int order = result["order_level"].as<int>();
     int replication_factor = result["replication_factor"].as<int>();
     bool replicate_tinode = result.count("replicate_tinode");
