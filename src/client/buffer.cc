@@ -73,6 +73,7 @@
  */
 
 #include "buffer.h"
+#include "../common/configuration.h"
 #include <thread>
 #include <chrono>
 
@@ -134,8 +135,10 @@ bool Buffer::AddBuffers(size_t buf_size) {
        // • Accepts potential THP fallback to eliminate buffer wrapping overhead
        // • Buffer wrapping causes ~60% message loss (39.4% → 100% completion)
        // • 768MB ensures complete dataset fits without wrapping for optimal throughput
-       const static size_t optimal_size = (256UL << 20); // 256MB - test with fixed wrapping logic
-	buf_size = optimal_size;
+       // Use configured buffer size from YAML instead of hard-coded value
+       const Embarcadero::Configuration& config = Embarcadero::Configuration::getInstance();
+       size_t configured_size = config.config().client.publisher.buffer_size_mb.get() * 1024 * 1024; // Convert MB to bytes
+       buf_size = configured_size;
 	
 	VLOG(3) << "Buffer::AddBuffers using optimized buffer size: " << (buf_size / (1024*1024)) 
 	        << "MB for reliable hugepage allocation and peak performance";
@@ -181,17 +184,12 @@ bool Buffer::AddBuffers(size_t buf_size) {
 }
 
 void Buffer::AdvanceWriteBufId() {
-	// Calculate number of brokers
-	size_t num_broker = num_buf_ / num_threads_per_broker_;
-
-	// Round-robin through buffers and threads
-	i_ = (i_ + 1) % num_broker;
-	if (i_ == 0) {
-		j_ = (j_ + 1) % num_threads_per_broker_;
-	}
-
-	// Calculate new write buffer ID
-	write_buf_id_ = i_ * num_threads_per_broker_ + j_;
+	// FIXED: Simple round-robin across all buffers to ensure even distribution
+	write_buf_id_ = (write_buf_id_ + 1) % num_buf_;
+	
+	// Calculate broker and thread from buffer ID
+	i_ = write_buf_id_ / num_threads_per_broker_;  // broker ID
+	j_ = write_buf_id_ % num_threads_per_broker_;  // thread ID within broker
 }
 
 void Buffer::WarmupBuffers() {

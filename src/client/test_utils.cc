@@ -22,22 +22,25 @@ void FillRandomData(char* buffer, size_t size) {
 size_t CalculateOptimalQueueSize(size_t num_threads_per_broker, size_t total_message_size, size_t message_size) {
 	const Embarcadero::Configuration& config = Embarcadero::Configuration::getInstance();
 	
-	// Get buffer size from configuration (convert MB to bytes)
-	size_t buffer_size_per_thread_bytes = config.config().client.publisher.buffer_size_mb.get() * 1024 * 1024;
+	// OPTIMIZED: Use 256MB constant per thread as determined from previous buffer optimization tests
+	// This eliminates buffer wrapping issues and provides optimal performance across all message sizes
+	const size_t OPTIMAL_BUFFER_SIZE_MB = 256;
+	size_t buffer_size_per_thread_bytes = OPTIMAL_BUFFER_SIZE_MB * 1024 * 1024; // 256MB per thread
 	
-	// Total buffer size = threads_per_broker * brokers * buffer_per_thread
-	size_t total_buffer_size = num_threads_per_broker * 4 * buffer_size_per_thread_bytes; // 4 brokers
+	// Total buffer size = threads_per_broker * brokers * 256MB_per_thread
+	size_t num_brokers = config.config().broker.max_brokers.get();
+	size_t total_buffer_size = num_threads_per_broker * num_brokers * buffer_size_per_thread_bytes;
 	
-	// Ensure we have enough buffer for the total message size + overhead
+	// For small messages that require more total buffer space, ensure minimum capacity
 	size_t header_overhead = (total_message_size / message_size) * 64; // 64 bytes per message header
-	size_t required_size = total_message_size + header_overhead + 2097152; // 2MB safety margin
+	size_t required_size = total_message_size + header_overhead + (2 * 1024 * 1024); // 2MB safety margin
 	
-	// Use the larger of configured buffer size or required size
+	// Always use the optimized 256MB per thread, but ensure it's sufficient for the dataset
 	size_t queue_size = std::max(total_buffer_size, required_size);
 	
-	LOG(INFO) << "Calculated queue size: " << (queue_size / (1024 * 1024)) << " MB "
-	          << "(config buffer: " << (total_buffer_size / (1024 * 1024)) << " MB, "
-	          << "required: " << (required_size / (1024 * 1024)) << " MB)";
+	LOG(INFO) << "Using optimized 256MB per thread: " << (total_buffer_size / (1024 * 1024)) << " MB total "
+	          << "(required for dataset: " << (required_size / (1024 * 1024)) << " MB, "
+	          << "final queue: " << (queue_size / (1024 * 1024)) << " MB)";
 	
 	return std::max(queue_size, static_cast<size_t>(1024)); // Minimum 1KB
 }

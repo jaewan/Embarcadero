@@ -1047,29 +1047,34 @@ void Publisher::SubscribeToClusterStatus() {
 					queueSize_ /= num_brokers;
 				}
 
-				// Add new brokers
+				// Add new brokers (don't call AddPublisherThreads here - will be called in connection loop)
 				for (const auto& addr : new_nodes) {
 					int broker_id = GetBrokerId(addr);
 					nodes_[broker_id] = addr;
 					brokers_.emplace_back(broker_id);
-
-					// Start publisher threads for this broker
-					if (!AddPublisherThreads(num_threads_per_broker_, broker_id)) {
-						LOG(ERROR) << "Failed to add publisher threads for broker " << broker_id;
-						return;
-					}
 				}
 
 				// Sort brokers for deterministic round-robin assignment
 				std::sort(brokers_.begin(), brokers_.end());
 			}
 
-			// If this is initial connection, handle head node
+			// If this is initial connection, connect to all brokers
 			if (!connected_) {
-				// Connect to head node
-				if (!AddPublisherThreads(num_threads_per_broker_, brokers_[0])) {
-					LOG(ERROR) << "Failed to add publisher threads for head broker";
-					return;
+				// Connect to all brokers (including head node)
+				for (int broker_id : brokers_) {
+					if (!AddPublisherThreads(num_threads_per_broker_, broker_id)) {
+						LOG(ERROR) << "Failed to add publisher threads for broker " << broker_id;
+						return;
+					}
+				}
+
+				// If no brokers were discovered, connect to head node (broker 0) as fallback
+				if (brokers_.empty()) {
+					if (!AddPublisherThreads(num_threads_per_broker_, 0)) {
+						LOG(ERROR) << "Failed to add publisher threads for head broker";
+						return;
+					}
+					brokers_.push_back(0);
 				}
 
 				// Signal that we're connected

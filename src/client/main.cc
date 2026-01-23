@@ -252,14 +252,18 @@ int main(int argc, char* argv[]) {
             break;
     }
     
+		/* TODO(Jae) call terminatecluster after test
+		 *  writer.~ResultWriter();
+      257 -
+      258 -    // Shutdown the cluster
+      259 -    google::protobuf::Empty request, response;
+      260 -    grpc::ClientContext context;
+      261 -    VLOG(5) << "Calling TerminateCluster";
+      262 -    stub->TerminateCluster(&context, request, &response);
+		 */
     // Clean up
-    writer.~ResultWriter();
-    
-    // Shutdown the cluster
-    google::protobuf::Empty request, response;
-    grpc::ClientContext context;
-    VLOG(5) << "Calling TerminateCluster";
-    stub->TerminateCluster(&context, request, &response);
-    
+    // Note: writer destructor will be called automatically when it goes out of scope
+    // TerminateCluster is skipped for testing - brokers should remain running
+
     return 0;
 }
