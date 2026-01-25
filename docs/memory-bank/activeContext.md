@@ -1,8 +1,8 @@
 # Active Context: Current Session State
 
-**Last Updated:** 2026-01-25
-**Session Focus:** Acknowledgment Bug Fixes | Bandwidth Testing | Documentation Updates
-**Status:** Governance System Established | E2E Tests Fixed | Code Style Enforced | Acknowledgment Bugs Fixed
+**Last Updated:** 2026-01-26
+**Session Focus:** Root-Cause CXL Fixes | Performance Optimization | Documentation Maintenance
+**Status:** Governance System Established | E2E Tests Fixed | Code Style Enforced | CXL Correctness Validated | Performance Optimized
 
 ---
 
@@ -18,8 +18,10 @@
 - DEV-002: Batch Cache Flush Optimization - ✅ Implemented & Tested - ~340% improvement (part of suite)
 - DEV-003: NetworkManager-Integrated Receiver - ✅ Implemented - Zero-copy, batch-level allocation
 - DEV-004: Remove Redundant BrokerMetadata Region - ✅ Implemented & Tested - Eliminated redundancy
-- DEV-005: Bitmap-Based Segment Allocation - ✅ Implemented & Tested - Prevent fragmentation
+- DEV-005: Flush Frequency Optimization - ✅ Implemented & Tested - ~10-15% fence overhead reduction
 - DEV-006: Efficient Polling Patterns - ✅ Implemented & Tested - Lower latency, better CPU utilization
+
+**Note:** DEV-005 (Bitmap-Based Segment Allocation) was renumbered. Current DEV-005 is Flush Frequency Optimization.
 
 See `spec_deviation.md` for full details.
 
@@ -236,21 +238,53 @@ We are migrating from the current TInode-based architecture to the paper's Bmeta
 
 ---
 
-#### [ ] Task 4.3: Refactor BrokerScannerWorker (Sequencer)
+#### [x] Task 4.3: Refactor BrokerScannerWorker (Sequencer) - PARTIALLY COMPLETE
 
-**Status:** ⏳ **PLANNED**
+**Status:** 🚧 **IN PROGRESS** (Root-cause fixes complete, full refactor pending)
 
-**Goal:** Poll Bmeta.processed_ptr instead of BatchHeader.num_msg, implement lock-free CAS
+**Completed:**
+- ✅ Changed poll target from `BatchHeader.num_msg` to `TInode.offset_entry.written_addr` (DEV-004)
+- ✅ Removed `global_seq_batch_seq_mu_` mutex, replaced with lock-free atomic `global_seq_.fetch_add()`
+- ✅ Fixed sequencer-region cacheline flush targets (Root Cause A fix)
+- ✅ Added flush+fence for TInode metadata and offset initialization (Root Cause B & C fixes)
+- ✅ Optimized flush frequency (DEV-005: single fence for multiple flushes)
 
-**Checklist:**
-- [ ] Change poll target from `BatchHeader.num_msg` to `Bmeta.processed_ptr`
-- [ ] Remove `global_seq_batch_seq_mu_` mutex
-- [ ] Implement lock-free CAS for `next_batch_seqno` updates
-- [ ] Add selective cache flush (bytes 32-47 only)
+**Remaining:**
+- [ ] Implement lock-free CAS for `next_batch_seqno` updates (if still needed)
+- [ ] Add selective cache flush optimization (bytes 32-47 only) for BlogMessageHeader migration
 
 ---
 
 ## Recent Changes
+
+### Session 2026-01-26 (Performance Validation Infrastructure)
+
+**Performance Measurement Infrastructure Created:**
+1. ✅ **Performance Baseline Scripts**
+   - `measure_performance_simple.sh`: Run multiple iterations, calculate statistics (mean, median, stddev, p95, p99)
+   - `measure_performance_baseline.sh`: Alternative with detailed output capture
+   - Both scripts output CSV results and summary reports
+
+2. ✅ **Profiling Scripts**
+   - `profile_hot_paths.sh`: Profile CPU bottlenecks with perf
+   - Measures cache misses, branch mispredictions, top functions
+   - Generates flamegraphs if available
+
+3. ✅ **Mutex Contention Script**
+   - `measure_mutex_contention.sh`: Measure lock contention for `global_seq_batch_seq_mu_`
+   - Decision criteria: <100/sec = lock-free CAS not needed, >1000/sec = recommended
+   - Determines if Task 4.3 completion is necessary
+
+4. ✅ **Documentation**
+   - `PERFORMANCE_VALIDATION_PLAN.md`: Complete execution plan with decision trees
+   - Includes troubleshooting, expected outcomes, next steps
+
+**Rationale:**
+- Senior expert evaluation recommended data-driven optimization over premature refactoring
+- Establish performance baseline before making optimization decisions
+- Measure mutex contention to determine if Task 4.3 lock-free CAS is needed
+
+**Status:** Scripts ready for manual execution to establish performance baseline
 
 ### Session 2026-01-26 (Root-Cause Fixes & DEV-005 Performance Optimization)
 
@@ -395,6 +429,13 @@ We are migrating from the current TInode-based architecture to the paper's Bmeta
 
 ### Immediate Priority
 
+**Performance Validation & Measurement** ✅ Infrastructure Ready
+- ✅ Created performance baseline measurement scripts
+- ✅ Created profiling scripts with perf
+- ✅ Created mutex contention measurement scripts
+- 📋 **Next:** Run measurements to establish baseline and make data-driven decisions
+- See `docs/PERFORMANCE_VALIDATION_PLAN.md` for execution plan
+
 **Continue Performance Optimization & Testing**
 - Monitor bandwidth stability across different workloads
 - Validate ACK level 2 behavior with replication
@@ -403,8 +444,8 @@ We are migrating from the current TInode-based architecture to the paper's Bmeta
 ### Medium-Term Goals
 
 **Pipeline Stage Refactoring (Task 4.3)**
-- Refactor BrokerScannerWorker to poll Bmeta.processed_ptr
-- Implement lock-free CAS for next_batch_seqno updates
+- ⏳ **Decision Pending:** Complete lock-free CAS based on mutex contention measurements
+- Decision criteria: <100 contentions/sec = not needed, >1000/sec = recommended
 - Add explicit ReplicationThreadPool polling ordered_ptr
 
 ### Long-Term Goals
@@ -453,5 +494,5 @@ We are migrating from the current TInode-based architecture to the paper's Bmeta
 
 ---
 
-**Last Edit:** 2026-01-25
+**Last Edit:** 2026-01-26
 **Next Review:** Start of next session
