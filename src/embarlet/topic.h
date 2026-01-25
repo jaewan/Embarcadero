@@ -1,6 +1,7 @@
 #pragma once
 
 #include <thread>
+#include <atomic>
 
 #include "../disk_manager/corfu_replication_client.h"
 #include "../disk_manager/scalog_replication_client.h"
@@ -277,16 +278,13 @@ class Topic {
 		void Sequencer5();  // Batch-level sequencer
 		void BrokerScannerWorker(int broker_id);
 		void BrokerScannerWorker5(int broker_id);  // Batch-level scanner
-		bool ProcessSkipped(
-				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
-				BatchHeader* &header_for_sub);
-		bool ProcessSkipped5(
-				absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
-				BatchHeader* &header_for_sub);  // Batch-level version
-		void AssignOrder(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);
-		void AssignOrder5(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);  // Batch-level version
+	bool ProcessSkipped(
+			absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
+			BatchHeader* &header_for_sub);
+	void AssignOrder(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);
+	void AssignOrder5(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);  // Batch-level version
 
-		size_t global_seq_ = 0;
+	std::atomic<size_t> global_seq_{0};
 		absl::flat_hash_map<size_t, size_t> next_expected_batch_seq_;// client_id -> next expected batch_seq
 		absl::Mutex global_seq_batch_seq_mu_;;
 };

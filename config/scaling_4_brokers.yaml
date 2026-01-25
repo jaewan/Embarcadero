@@ -1,0 +1,69 @@
+# Embarcadero Configuration - Scaling Experiment: 4 Brokers
+# Auto-generated for broker scaling experiment
+# Segment size: 4GB, Buffer size: 1024MB
+
+embarcadero:
+  version:
+    major: 1
+    minor: 0
+
+  broker:
+    port: 1214
+    broker_port: 12140
+    heartbeat_interval: 3
+    max_brokers: 4
+    cgroup_core: 85
+
+  cxl:
+    size: 68719476736            # CXL memory size (64GB)
+    emulation_size: 34359738368  # CXL emulation memory size (32GB)
+    device_path: "/dev/dax0.0"
+    numa_node: 2
+
+  storage:
+    segment_size: 4294967296  # 4GB per broker
+    batch_headers_size: 65536          # 64KB batch headers
+    batch_size: 2097152                # 2MB batch size
+    num_disks: 2
+    max_topics: 32
+    topic_name_size: 31
+
+  network:
+    io_threads: 4                # 4 network threads per broker
+    disk_io_threads: 4
+    sub_connections: 1           # Single connection model
+    zero_copy_send_limit: 65536
+
+  corfu:
+    sequencer_port: 50052
+    replication_port: 50053
+
+  scalog:
+    sequencer_port: 50051
+    replication_port: 50052
+    sequencer_ip: "192.168.60.173"
+    local_cut_interval: 100
+
+  platform:
+    is_intel: false
+    is_amd: false
+
+  client:
+    publisher:
+      threads_per_broker: 1        # Single thread per broker for consistency
+      buffer_size_mb: 1024
+      batch_size_kb: 2048
+      
+    subscriber:
+      connections_per_broker: 1    # Single connection per broker
+      buffer_size_mb: 1024
+      
+    network:
+      connect_timeout_ms: 5000     # Increased timeout for many brokers
+      send_timeout_ms: 10000
+      recv_timeout_ms: 10000
+      
+    performance:
+      use_hugepages: true
+      numa_bind: true
+      zero_copy: true

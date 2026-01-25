@@ -1,0 +1,69 @@
+# Optimized 20 Brokers Configuration for TC Emulation
+# Based on our 9.31GB/s optimization but scaled for 20 brokers
+
+embarcadero:
+  version:
+    major: 1
+    minor: 0
+
+  broker:
+    port: 1214
+    broker_port: 12140
+    heartbeat_interval: 5           # Increased heartbeat interval for 20 brokers
+    max_brokers: 20
+    cgroup_core: 85
+
+  cxl:
+    size: 68719476736            # 64GB CXL memory
+    emulation_size: 34359738368  # 32GB emulation
+    device_path: "/dev/dax0.0"
+    numa_node: 2
+
+  storage:
+    segment_size: 1073741824      # 1GB per segment (20 × 1GB = 20GB total, plenty of headroom)
+    batch_headers_size: 65536     # 64KB batch headers  
+    batch_size: 1048576           # 1MB batch size (optimized for our buffer system)
+    num_disks: 2
+    max_topics: 32
+    topic_name_size: 31
+
+  network:
+    io_threads: 4                 # 4 network threads per broker
+    disk_io_threads: 4
+    sub_connections: 1            # CRITICAL: 1 connection per broker for 20 brokers
+    zero_copy_send_limit: 65536   # 64KB zero-copy threshold
+
+  corfu:
+    sequencer_port: 50052
+    replication_port: 50053
+
+  scalog:
+    sequencer_port: 50051
+    replication_port: 50052
+    sequencer_ip: "192.168.60.173"
+    local_cut_interval: 100
+
+  platform:
+    is_intel: false
+    is_amd: false
+
+  # OPTIMIZED CLIENT CONFIGURATION FOR 20 BROKERS
+  client:
+    publisher:
+      threads_per_broker: 1        # CRITICAL: Only 1 thread per broker for 20 brokers
+      buffer_size_mb: 256          # 256MB per thread (optimal from previous tests): 20 threads × 256MB = 5.12GB total
+      batch_size_kb: 1024          # 1MB batch size matching storage config
+      
+    subscriber:
+      connections_per_broker: 1    # CRITICAL: 1 connection per broker for 20 brokers  
+      buffer_size_mb: 128          # Smaller subscriber buffers for 20 brokers
+      
+    network:
+      connect_timeout_ms: 5000     # Increased timeout for 20 broker connections
+      send_timeout_ms: 10000       # Increased send timeout
+      recv_timeout_ms: 10000       # Increased receive timeout
+      
+    performance:
+      use_hugepages: true
+      numa_bind: true
+      zero_copy: true

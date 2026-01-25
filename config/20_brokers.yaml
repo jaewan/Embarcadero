@@ -1,0 +1,82 @@
+# Embarcadero Configuration File - 20 Brokers Setup
+# This file contains all configurable parameters for the Embarcadero distributed message broker
+
+embarcadero:
+  # Version information
+  version:
+    major: 1
+    minor: 0
+
+  # Broker settings
+  broker:
+    port: 1214                    # Main broker port
+    broker_port: 12140           # Alternative broker port
+    heartbeat_interval: 3        # Heartbeat interval in seconds
+    max_brokers: 20              # Maximum number of brokers in cluster (UPDATED for 20 brokers)
+    cgroup_core: 85              # CPU core for cgroup assignment
+
+  # CXL memory configuration
+  cxl:
+    size: 68719476736            # CXL memory size (64GB)
+    emulation_size: 34359738368  # CXL emulation memory size (32GB)
+    device_path: "/dev/dax0.0"   # CXL device path
+    numa_node: 2                 # NUMA node for CXL memory
+
+  # Storage configuration
+  storage:
+    segment_size: 2147483648      # Segment size (2GB) - REDUCED to 2GB for 1 segment per broker
+    batch_headers_size: 65536    # Batch headers region size (64KB)
+    batch_size: 2097152          # PERF TUNED: 2MB batch size - balances memory usage with network efficiency (~512 messages/batch)
+                              # Works optimally with 256MB buffers (128 batches per buffer before wrapping)
+    num_disks: 2                 # Number of disks for storage
+    max_topics: 32               # Maximum number of topics
+    topic_name_size: 31          # Maximum topic name length
+
+  # Network configuration
+  network:
+    io_threads: 4                # REDUCED: 4 network threads per broker for optimized performance
+    disk_io_threads: 4           # Number of disk IO threads
+    sub_connections: 1           # REDUCED: 1 subscriber connection per broker for single connection model
+    zero_copy_send_limit: 65536     # PERF TUNED: 64KB threshold - optimal for MSG_ZEROCOPY (Linux kernel sweet spot, works with 2MB batches)
+
+  # Corfu sequencer configuration
+  corfu:
+    sequencer_port: 50052        # Corfu sequencer port
+    replication_port: 50053      # Corfu replication port
+
+  # Scalog sequencer configuration
+  scalog:
+    sequencer_port: 50051        # Scalog sequencer port
+    replication_port: 50052      # Scalog replication port
+    sequencer_ip: "192.168.60.173"  # Scalog sequencer IP address
+    local_cut_interval: 100      # Scalog local cut interval
+
+  # Platform detection
+  platform:
+    is_intel: false              # Intel platform flag
+    is_amd: false                # AMD platform flag
+
+  # Client configuration
+  client:
+    # Publisher configuration
+    publisher:
+      threads_per_broker: 1        # Number of publisher threads per broker (REDUCED from default 4 to 1)
+      buffer_size_mb: 768          # Buffer size in MB per publisher thread
+      batch_size_kb: 2048          # Batch size in KB (2MB)
+      
+    # Subscriber configuration  
+    subscriber:
+      connections_per_broker: 1    # REDUCED: 1 subscriber connection per broker for single connection model
+      buffer_size_mb: 256          # Buffer size in MB per subscriber connection
+      
+    # Network configuration
+    network:
+      connect_timeout_ms: 2000     # Connection timeout in milliseconds
+      send_timeout_ms: 5000        # Send timeout in milliseconds
+      recv_timeout_ms: 5000        # Receive timeout in milliseconds
+      
+    # Performance tuning
+    performance:
+      use_hugepages: true          # Enable hugepage support for better performance
+      numa_bind: true              # Enable NUMA binding for better memory locality
+      zero_copy: true              # Enable zero-copy networking where possible

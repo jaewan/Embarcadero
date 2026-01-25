@@ -431,7 +431,7 @@ void Topic::Sequencer4() {
 	absl::btree_set<int> registered_brokers;
 	GetRegisteredBrokerSet(registered_brokers);
 
-	global_seq_ = 0;
+	global_seq_.store(0, std::memory_order_relaxed);
 
 	std::vector<std::thread> sequencer4_threads;
 	for (int broker_id : registered_brokers) {
@@ -525,8 +525,9 @@ void Topic::BrokerScannerWorker(int broker_id) {
 				// New client
 				if (batch_seq == 0) {
 					expected_seq = 0;
-					start_total_order = global_seq_;
-					global_seq_ += header_to_process->num_msg;
+					start_total_order = global_seq_.fetch_add(
+						header_to_process->num_msg,
+						std::memory_order_relaxed);
 					next_expected_batch_seq_[client_id] = 1; // Expect 1 next
 					ready_to_order = true;
 				} else {
@@ -538,8 +539,9 @@ void Topic::BrokerScannerWorker(int broker_id) {
 				// Existing client
 				expected_seq = map_it->second;
 				if (batch_seq == expected_seq) {
-					start_total_order = global_seq_;
-					global_seq_ += header_to_process->num_msg;
+					start_total_order = global_seq_.fetch_add(
+						header_to_process->num_msg,
+						std::memory_order_relaxed);
 					map_it->second = expected_seq + 1;
 					ready_to_order = true;
 				} else if (batch_seq > expected_seq) {
@@ -602,12 +604,13 @@ bool Topic::ProcessSkipped(absl::flat_hash_map<size_t, absl::btree_map<size_t, B
 				if (batch_it != client_skipped_map.end()) {
 					// Found it! Reserve sequence and update expected batch number
 					batch_header = batch_it->second;
-					start_total_order = global_seq_;
-					global_seq_ += batch_header->num_msg;
+					start_total_order = global_seq_.fetch_add(
+						batch_header->num_msg,
+						std::memory_order_relaxed);
 					map_it->second = expected_seq + 1;
 					batch_processed = true; // Mark to proceed outside lock
 					processed_any = true; // Mark that we did *some* work
-					VLOG(4) << "ProcessSkipped [B?]: Client " << client_id << ", processing skipped batch " << expected_seq << ", reserving seq [" << start_total_order << ", " << global_seq_ << ")";
+					VLOG(4) << "ProcessSkipped [B?]: Client " << client_id << ", processing skipped batch " << expected_seq << ", reserving seq [" << start_total_order << ", " << (start_total_order + batch_header->num_msg) << ")";
 				} else {
 					// Next expected not found in skipped map for this client, move to next client
 					break; // Exit inner do-while loop for this client
@@ -698,7 +701,16 @@ void Topic::AssignOrder(BatchHeader *batch_to_order, size_t start_total_order, B
 		reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(cxl_addr_));
 	tinode_->offsets[broker].ordered_offset = ordered_offset;
 	
-	CXL::flush_cacheline(const_cast<const void*>(static_cast<volatile void*>(&tinode_->offsets[broker])));
+	// [[DEV-005: Optimize Flush Frequency]]
+	// CRITICAL FIX: Flush the SEQUENCER region cachelines (bytes 256-511)
+	// offset_entry is alignas(256) with two 256B sub-structs:
+	// - First 256B: broker region (written_addr, etc.)
+	// - Second 256B: sequencer region (ordered, ordered_offset) <- WE NEED TO FLUSH THIS
+	// Address of sequencer region is at broker region + 256 bytes
+	// 
+	// OPTIMIZATION: Combine flush before fence (removes per-batch overhead vs. paper design)
+	const void* seq_region = const_cast<const void*>(static_cast<const volatile void*>(&tinode_->offsets[broker].ordered));
+	CXL::flush_cacheline(seq_region);
 	CXL::store_fence();
 }
 
@@ -1270,7 +1282,7 @@ void Topic::Sequencer5() {
 	absl::btree_set<int> registered_brokers;
 	GetRegisteredBrokerSet(registered_brokers);
 
-	global_seq_ = 0;
+	global_seq_.store(0, std::memory_order_relaxed);
 
 	std::vector<std::thread> sequencer5_threads;
 	for (int broker_id : registered_brokers) {
@@ -1304,70 +1316,40 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	
 	BatchHeader* header_for_sub = ring_start_default;
 
-	absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>> skipped_batches;
-
-	size_t loop_count = 0;
 	size_t total_batches_processed = 0;
 	auto last_log_time = std::chrono::steady_clock::now();
+
+	// [[DEVIATION_004]] - Stage 3 (Global Ordering)
+	// Poll TInode.offset_entry.written_addr to detect new messages
+	// This aligns with the processing pipeline in Paper §3.3
+	// TInode.offset_entry.written_addr tracks the last processed message address
+	uint64_t last_processed_addr = __atomic_load_n(
+		reinterpret_cast<volatile uint64_t*>(&tinode_->offsets[broker_id].written_addr),
+		__ATOMIC_ACQUIRE);
 	
 	while (!stop_threads_) {
-		volatile size_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
+		// 1. Poll TInode.offset_entry.written_addr for new messages
+		// [[DEVIATION_004]] - Using offset_entry.written_addr instead of BatchHeader.num_msg
+		uint64_t current_processed_addr = __atomic_load_n(
+			reinterpret_cast<volatile uint64_t*>(&tinode_->offsets[broker_id].written_addr),
+			__ATOMIC_ACQUIRE);
 
-		// Debug: Log what we're seeing every 10M iterations
-		if (loop_count % 10000000 == 0 && loop_count > 0) {
-			VLOG(2) << "BrokerScannerWorker5 [B" << broker_id << "]: Sample values - num_msg=" 
-					<< num_msg_check << ", log_idx=" << current_batch_header->log_idx;
+		if (current_processed_addr == last_processed_addr) {
+			CXL::cpu_pause();  // Efficient spin
+			continue;
 		}
-		
-		// Validate batch header - check for reasonable message count (max 100000 messages per batch)
+
+		// 2. Check BatchHeader validity (still needed for ring buffer handling)
+		// No new batch written in the BatchHeader ring yet, even if processed_ptr moved
+		// This can happen if processed_ptr is updated before BatchHeader is fully visible
+		volatile size_t num_msg_check = current_batch_header->num_msg;
 		if (num_msg_check == 0 || current_batch_header->log_idx == 0 || num_msg_check > 100000) {
-			if (!ProcessSkipped5(skipped_batches, header_for_sub)) {
-				std::this_thread::yield();
-			}
-			
-			// Debug logging every 10000000 iterations
-			if (++loop_count % 10000000 == 0) {
-				VLOG(2) << "BrokerScannerWorker5 [B" << broker_id << "]: Still scanning, no batches found after " << loop_count << " iterations";
-			}
-			continue;  // DON'T advance pointer - wait for batch to become ready at current position
+			CXL::cpu_pause();
+			continue;
 		}
 
-		// OPTIMIZED: Batch completion check with fallback validation
-		// Only check completion for batches that look valid (reduces unnecessary atomic reads)
-		if (__builtin_expect(__atomic_load_n(&current_batch_header->batch_complete, __ATOMIC_ACQUIRE) == 0, 0)) {
-			// FALLBACK: Check if all messages in the batch have paddedSize set (alternative completion check)
-			// This handles edge cases where batch_complete flag is not set but messages are actually ready
-			bool all_messages_complete = true;
-			MessageHeader* msg_header = reinterpret_cast<MessageHeader*>(
-				reinterpret_cast<uint8_t*>(cxl_addr_) + current_batch_header->log_idx);
-			
-			for (size_t i = 0; i < num_msg_check && i < 10; ++i) {  // Check up to 10 messages for efficiency
-				if (msg_header->paddedSize == 0) {
-					all_messages_complete = false;
-					break;
-				}
-				if (i < num_msg_check - 1) {  // Don't advance past last message
-					msg_header = reinterpret_cast<MessageHeader*>(
-						reinterpret_cast<uint8_t*>(msg_header) + msg_header->paddedSize);
-				}
-			}
-			
-			if (!all_messages_complete) {
-				// Log waiting for completion every 1M iterations to debug hanging
-				static thread_local size_t wait_count = 0;
-				if (++wait_count % 1000000 == 0) {
-					LOG(WARNING) << "BrokerScannerWorker5 [B" << broker_id << "]: Waiting for batch completion, client_id=" 
-								<< current_batch_header->client_id << ", batch_seq=" << current_batch_header->batch_seq 
-								<< ", num_msg=" << num_msg_check << ", wait_iterations=" << wait_count;
-				}
-				std::this_thread::yield();
-				continue;  // DON'T advance pointer - wait for batch completion
-			} else {
-				// Messages are complete but batch_complete flag not set - log and proceed
-				LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: Processing batch without batch_complete flag (messages ready), client_id=" 
-						<< current_batch_header->client_id << ", batch_seq=" << current_batch_header->batch_seq;
-			}
-		}
+		// Update last_processed_addr after confirming BatchHeader is visible
+		last_processed_addr = current_processed_addr;
 
 		// Valid batch found
 		VLOG(3) << "BrokerScannerWorker5 [B" << broker_id << "]: Found valid batch with " << num_msg_check << " messages, batch_seq=" << current_batch_header->batch_seq << ", client_id=" << current_batch_header->client_id;
@@ -1375,29 +1357,20 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		BatchHeader* header_to_process = current_batch_header;
 		size_t client_id = current_batch_header->client_id;
 		size_t batch_seq = current_batch_header->batch_seq;
-		bool ready_to_order = false;
-		size_t start_total_order = 0;
-		bool skip_batch = false;
 
 		// SIMPLIFIED: Process all batches as they arrive (like order level 0)
 		// No strict sequencing - just assign total_order and process immediately
-		{
-			absl::MutexLock lock(&global_seq_batch_seq_mu_);
-			start_total_order = global_seq_;
-			global_seq_ += header_to_process->num_msg;
-			ready_to_order = true;
-			skip_batch = false;
-			
-			VLOG(4) << "Scanner5 [B" << broker_id << "]: Processing batch from client " << client_id 
-					<< ", batch_seq=" << batch_seq << ", total_order=[" << start_total_order 
-					<< ", " << (start_total_order + header_to_process->num_msg) << ")";
-		}
+		// Use lock-free atomic fetch_add for global_seq_
+		size_t start_total_order = global_seq_.fetch_add(
+			header_to_process->num_msg,
+			std::memory_order_relaxed);
 
-		// Since we're not skipping batches anymore, always process
-		if (ready_to_order) {
-			AssignOrder5(header_to_process, start_total_order, header_for_sub);
-			total_batches_processed++;
-		}
+		VLOG(4) << "Scanner5 [B" << broker_id << "]: Processing batch from client " << client_id 
+				<< ", batch_seq=" << batch_seq << ", total_order=[" << start_total_order 
+				<< ", " << (start_total_order + header_to_process->num_msg) << ")";
+
+		AssignOrder5(header_to_process, start_total_order, header_for_sub);
+		total_batches_processed++;
 
 		// Periodic status logging
 		auto now = std::chrono::steady_clock::now();
@@ -1406,124 +1379,12 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			          << " batches, current tinode.ordered=" << tinode_->offsets[broker_id].ordered;
 			last_log_time = now;
 		}
-		
-		// CRITICAL FIX: Handle accumulated skipped batches with timeout
-		static thread_local auto last_batch_time = std::chrono::steady_clock::now();
-		static thread_local size_t last_batch_count = 0;
-		static thread_local auto last_skip_cleanup = std::chrono::steady_clock::now();
-		
-		if (ready_to_order) {
-			last_batch_time = now;
-			last_batch_count = total_batches_processed;
-		}
-		
-		// No gap processing needed since we process all batches immediately
-		
-		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_batch_time).count() >= 10) {
-			// No new batches for 10 seconds - check if we're missing final batches
-			if (tinode_->offsets[broker_id].ordered >= 655000 && tinode_->offsets[broker_id].ordered < 655360) {
-				LOG(WARNING) << "DIAGNOSTIC: BrokerScannerWorker5 [B" << broker_id << "] may be missing final batches. "
-				             << "Current ordered=" << tinode_->offsets[broker_id].ordered << ", expected=655360. "
-				             << "Last batch processed 10+ seconds ago. Current batch info: num_msg=" << num_msg_check 
-				             << ", batch_seq=" << current_batch_header->batch_seq;
-				
-				// RECOVERY ATTEMPT: Try to find and process any remaining valid batches
-				// Look ahead in the ring buffer for batches that might have been missed
-				BatchHeader* search_header = current_batch_header;
-				for (int search_offset = 0; search_offset < 100; ++search_offset) {
-					volatile size_t search_num_msg = search_header->num_msg;
-					size_t num_msg_to_check = search_num_msg; // Copy to non-volatile for std::min
-					if (search_num_msg > 0 && search_num_msg < 1000 && search_header->log_idx > 0) {
-						// Found a potentially valid batch
-						LOG(INFO) << "RECOVERY: Found potential batch at offset " << search_offset 
-						          << ", num_msg=" << search_num_msg << ", batch_seq=" << search_header->batch_seq;
-						
-						// Try to process this batch using the fallback mechanism
-						MessageHeader* msg_header = reinterpret_cast<MessageHeader*>(
-							reinterpret_cast<uint8_t*>(cxl_addr_) + search_header->log_idx);
-						
-						bool batch_ready = true;
-						for (size_t i = 0; i < std::min(num_msg_to_check, (size_t)5); ++i) {
-							if (msg_header->paddedSize == 0) {
-								batch_ready = false;
-								break;
-							}
-							if (i < num_msg_to_check - 1) {
-								msg_header = reinterpret_cast<MessageHeader*>(
-									reinterpret_cast<uint8_t*>(msg_header) + msg_header->paddedSize);
-							}
-						}
-						
-						if (batch_ready) {
-							LOG(INFO) << "RECOVERY: Processing recovered batch with " << search_num_msg << " messages";
-							// Set current header to this batch and let the main loop process it
-							current_batch_header = search_header;
-							break;
-						}
-					}
-					
-					search_header = reinterpret_cast<BatchHeader*>(
-						reinterpret_cast<uint8_t*>(search_header) + sizeof(BatchHeader)
-					);
-				}
-				
-				last_batch_time = now; // Reset timer to avoid spam
-			}
-		}
 
+		// Advance to next batch header
 		current_batch_header = reinterpret_cast<BatchHeader*>(
 			reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader)
 		);
 	}
-}
-
-bool Topic::ProcessSkipped5(
-	absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
-	BatchHeader*& header_for_sub) {
-	
-	bool processed_any = false;
-	auto client_skipped_it = skipped_batches.begin();
-	while (client_skipped_it != skipped_batches.end()) {
-		size_t client_id = client_skipped_it->first;
-		auto& client_skipped_map = client_skipped_it->second;
-
-		size_t start_total_order;
-		bool batch_processed;
-		do {
-			batch_processed = false;
-			size_t expected_seq;
-			BatchHeader* batch_header = nullptr;
-			auto batch_it = client_skipped_map.end();
-			{
-				absl::MutexLock l(&global_seq_batch_seq_mu_);
-				auto it = next_expected_batch_seq_.find(client_id);
-				expected_seq = (it != next_expected_batch_seq_.end()) ? it->second : 0;
-				batch_it = client_skipped_map.find(expected_seq);
-				if (batch_it != client_skipped_map.end()) {
-					batch_header = batch_it->second;
-					start_total_order = global_seq_;
-					global_seq_ += batch_header->num_msg;
-					next_expected_batch_seq_[client_id] = expected_seq + 1;
-					batch_processed = true;
-					processed_any = true;
-					VLOG(4) << "ProcessSkipped5 [B?]: Client " << client_id 
-							<< ", processing skipped batch " << expected_seq 
-							<< ", reserving seq [" << start_total_order << ", " << (start_total_order + batch_header->num_msg) << ")";
-				}
-			}
-			if (batch_processed && batch_header) {
-				client_skipped_map.erase(batch_it);
-				AssignOrder5(batch_header, start_total_order, header_for_sub);
-			}
-		} while (batch_processed && !client_skipped_map.empty());
-
-		if (client_skipped_map.empty()) {
-			skipped_batches.erase(client_skipped_it++);
-		} else {
-			++client_skipped_it;
-		}
-	}
-	return processed_any;
 }
 
 void Topic::AssignOrder5(BatchHeader* batch_to_order, size_t start_total_order, BatchHeader*& header_for_sub) {
@@ -1541,6 +1402,33 @@ void Topic::AssignOrder5(BatchHeader* batch_to_order, size_t start_total_order, 
 	// Update ordered count by the number of messages in the batch
 	tinode_->offsets[broker].ordered = tinode_->offsets[broker].ordered + num_messages;
 
+	// [[DEVIATION_004]] - Update TInode.offset_entry.ordered_offset (Stage 3: Global Ordering)
+	// Paper §3.3 - Sequencer updates ordered_offset after assigning total_order
+	// This signals to Stage 4 (Replication) that the batch is ordered
+	// Using TInode.offset_entry.ordered_offset instead of Bmeta.seq.ordered_ptr
+	size_t ordered_offset = static_cast<size_t>(
+		reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(cxl_addr_));
+	tinode_->offsets[broker].ordered_offset = ordered_offset;
+
+	// [[DEV-005: Optimize Flush Frequency]]
+	// CRITICAL FIX: Flush the SEQUENCER region cachelines (bytes 256-511)
+	// offset_entry is alignas(256) with two 256B sub-structs:
+	// - First 256B: broker region (written_addr, etc.)
+	// - Second 256B: sequencer region (ordered, ordered_offset) <- WE NEED TO FLUSH THIS
+	// Address of sequencer region is at broker region + 256 bytes
+	// 
+	// OPTIMIZATION: Combine two flushes before single fence
+	// Both sequencer-region and BatchHeader flushes can precede the same fence
+	// This reduces serialization overhead vs. flush-fence-flush-fence pattern
+	const void* seq_region = const_cast<const void*>(static_cast<const volatile void*>(&tinode_->offsets[broker].ordered));
+	CXL::flush_cacheline(seq_region);
+	
+	// BatchHeader flush for total_order visibility (same cacheline as batch_to_order->total_order)
+	CXL::flush_cacheline(batch_to_order);
+	
+	// Single fence for both flushes - reduces fence overhead
+	CXL::store_fence();
+
 	// Set up export chain (GOI equivalent)
 	header_for_sub->batch_off_to_export = (reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(header_for_sub));
 	header_for_sub->ordered = 1;
@@ -1549,17 +1437,6 @@ void Topic::AssignOrder5(BatchHeader* batch_to_order, size_t start_total_order, 
 
 	VLOG(3) << "Orderer5: Assigned batch-level order " << start_total_order 
 			<< " to batch with " << num_messages << " messages from broker " << broker;
-
-	// [[DEVIATION_004]] - Update TInode.offset_entry.ordered_offset (Stage 3: Global Ordering)
-	// Paper §3.3 - Sequencer updates ordered_offset after assigning total_order
-	// This signals to Stage 4 (Replication) that the batch is ordered
-	// Using TInode.offset_entry.ordered_offset instead of Bmeta.seq.ordered_ptr
-	size_t ordered_offset = static_cast<size_t>(
-		reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(cxl_addr_));
-	tinode_->offsets[broker].ordered_offset = ordered_offset;
-	// Flush cache line after TInode update
-	CXL::flush_cacheline(const_cast<const void*>(static_cast<volatile void*>(&tinode_->offsets[broker])));
-	CXL::store_fence();
 }
 
 } // End of namespace Embarcadero

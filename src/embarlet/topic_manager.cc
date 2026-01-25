@@ -90,6 +90,13 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	const uintptr_t batch_headers_addr = reinterpret_cast<uintptr_t>(batch_headers_region);
 	tinode->offsets[broker_id_].batch_headers_offset = 
 		static_cast<size_t>(batch_headers_addr - cxl_base_addr);
+
+	// [[ROOT_CAUSE_B_FIX]] - Flush broker-specific offset initialization
+	// After each broker initializes its offsets[broker_id_] entries (log_offset/batch_headers_offset/written_addr)
+	// Flush the broker region (first 256B of offset_entry) so other threads see the values
+	const void* broker_region = const_cast<const void*>(static_cast<const volatile void*>(&tinode->offsets[broker_id_].log_offset));
+	CXL::flush_cacheline(broker_region);
+	CXL::store_fence();
 }
 
 struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_SIZE]) {
@@ -224,6 +231,12 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		memset(tinode->topic, 0, TOPIC_NAME_SIZE);
 		memcpy(tinode->topic, topic, std::min<size_t>(TOPIC_NAME_SIZE - 1, strlen(topic)));
 
+		// [[ROOT_CAUSE_B_FIX]] - Flush TInode metadata after head broker initialization
+		// Non-head brokers must see topic/order/ack_level/seq_type reliably
+		// Flush first 64B (cacheline) containing: topic, replicate_tinode, order, replication_factor, ack_level, seq_type
+		CXL::flush_cacheline(tinode);
+		CXL::store_fence();
+
 		// Handle replica if needed
 		if (replicate_tinode) {
 			char replica_topic[TOPIC_NAME_SIZE] = {0};
@@ -253,6 +266,10 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 			replica_tinode->seq_type = seq_type;
 			memset(replica_tinode->topic, 0, TOPIC_NAME_SIZE);
 			memcpy(replica_tinode->topic, replica_topic, std::min<size_t>(TOPIC_NAME_SIZE - 1, strlen(replica_topic)));
+
+			// [[ROOT_CAUSE_B_FIX]] - Also flush replica TInode metadata
+			CXL::flush_cacheline(replica_tinode);
+			CXL::store_fence();
 		}
 
 		// Create the topic
