@@ -4,6 +4,10 @@ Paper/
 build/
 .Replication/
 
+# Ignore large data files
+data_backup/
+tags
+
 # Ignore external dependencies
 !third_party/
 third_party/*
