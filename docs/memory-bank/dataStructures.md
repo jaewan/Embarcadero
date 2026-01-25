@@ -1,8 +1,8 @@
 # Data Structures: Memory Layout Reference
 
 **Document Purpose:** Canonical reference for all shared memory structures in Embarcadero
-**Status:** Current implementation + Paper spec target states
-**Last Updated:** 2026-01-23
+**Status:** Current implementation (TInode-based architecture per DEV-004)
+**Last Updated:** 2026-01-26
 
 ---
 
@@ -59,53 +59,69 @@ TInode size = 64 (header) + (NUM_MAX_BROKERS * 128)
 
 ---
 
-### 1.2 offset_entry (Current Implementation)
+### 1.2 offset_entry (Current Implementation - DEV-004)
 
-**Purpose:** Per-broker coordination metadata
-**Location:** `src/cxl_manager/cxl_datastructure.h:28717-28733`
-**Size:** 128 bytes (2 cache lines)
+**Purpose:** Per-broker coordination metadata (replaces separate BrokerMetadata region)
+**Location:** `src/cxl_manager/cxl_datastructure.h:27-42`
+**Size:** 512 bytes (8 cache lines, organized as two 256-byte aligned sub-structs)
+**Status:** ✅ **CURRENT** - This is the production structure (BrokerMetadata was removed per DEV-004)
 
 ```cpp
-struct alignas(64) offset_entry {
-    // --- Cache Line 0: Broker-Written Fields ---
-    volatile size_t log_offset;              // Offset 0 (8 bytes)
-    volatile size_t batch_headers_offset;    // Offset 8 (8 bytes)
-    volatile size_t written;                 // Offset 16 (8 bytes)
-    volatile unsigned long long written_addr;// Offset 24 (8 bytes)
-    volatile int replication_done[NUM_MAX_BROKERS]; // Offset 32 (80 bytes)
-    // Total: 112 bytes in cache line 0 (OVERFLOW: 48 bytes spill to line 1)
+struct alignas(256) offset_entry {
+    // --- Broker Region (Bytes 0-255): Broker-Written Fields ---
+    struct {
+        volatile size_t log_offset;              // Offset 0 (8 bytes)
+        volatile size_t batch_headers_offset;    // Offset 8 (8 bytes)
+        volatile size_t written;                 // Offset 16 (8 bytes)
+        volatile unsigned long long int written_addr; // Offset 24 (8 bytes)
+        volatile int replication_done[NUM_MAX_BROKERS]; // Offset 32 (80 bytes)
+        uint8_t _pad_broker[...];                // Padding to 256 bytes
+    } __attribute__((aligned(256)));  // Broker region: 256 bytes (4 cache lines)
 
-    // --- Cache Line 1: Sequencer-Written Fields ---
-    volatile int ordered;                    // Offset 64 (4 bytes)
-    volatile size_t ordered_offset;          // Offset 68 (8 bytes, misaligned)
-    // Padding to 128 bytes: 52 bytes
+    // --- Sequencer Region (Bytes 256-511): Sequencer-Written Fields ---
+    struct {
+        volatile int ordered;                    // Offset 256 (4 bytes)
+        volatile size_t ordered_offset;          // Offset 260 (8 bytes)
+        uint8_t _pad_sequencer[...];             // Padding to 256 bytes
+    } __attribute__((aligned(256)));  // Sequencer region: separate 256-byte block
 };
 ```
 
 **Byte Layout Visualization:**
 ```
-Cache Line 0 (Bytes 0-63):
-[log_offset][batch_headers_offset][written][written_addr][replication_done[0-7]]
+Broker Region (Bytes 0-255, 4 cache lines):
+Cache Line 0-3: [log_offset][batch_headers_offset][written][written_addr][replication_done[0-19]][padding]
 
-Cache Line 1 (Bytes 64-127):
-[replication_done[8-19]][ordered][ordered_offset][PADDING: 52 bytes]
+Sequencer Region (Bytes 256-511, 4 cache lines):
+Cache Line 4-7: [ordered][ordered_offset][padding]
 ```
 
-**CRITICAL ISSUE: False Sharing**
+**Cache-Line Separation:**
 ```
-Broker writes:  Bytes 0-111  (spans 2 cache lines!)
-Sequencer reads: Bytes 64-76  (reads from SAME cache line broker is writing to!)
+✅ Broker writes:  Bytes 0-255   (cache lines 0-3)
+✅ Sequencer writes: Bytes 256-511 (cache lines 4-7)
+✅ NO FALSE SHARING: Separate 256-byte aligned regions
 ```
 
-**Fix Required:** Split into separate structures on distinct cache lines.
+**Note:** This structure was kept instead of creating separate BrokerMetadata per DEV-004 decision.
 
 ---
 
-### 1.3 BrokerMetadata (Target - Paper Spec)
+### 1.3 BrokerMetadata (ARCHIVED - Removed per DEV-004)
 
-**Purpose:** Replace offset_entry with proper cache-line separation
-**Location:** NEW (to be added to cxl_datastructure.h)
-**Size:** 128 bytes (2 cache lines, strictly separated)
+**Status:** ❌ **REMOVED** - This structure was planned but removed per DEV-004 decision
+
+**Rationale:** 
+- `TInode.offset_entry` already provides the same functionality
+- Creating separate `BrokerMetadata` region was redundant
+- Current `offset_entry` structure (256-byte aligned sub-structs) provides sufficient cache-line separation
+- Decision documented in `spec_deviation.md` DEV-004
+
+**Migration Note:** All code now uses `TInode.offset_entry` directly:
+- `bmeta[broker].local.log_ptr` → `tinode->offsets[broker].log_offset`
+- `bmeta[broker].local.processed_ptr` → `tinode->offsets[broker].written_addr`
+- `bmeta[broker].seq.ordered_ptr` → `tinode->offsets[broker].ordered_offset`
+- `bmeta[broker].seq.ordered_seq` → `tinode->offsets[broker].ordered`
 
 ```cpp
 // Part 1: Broker Local Metadata (Cache Line 0)
@@ -150,30 +166,13 @@ BrokerSequencerMeta (Cache Line 1):
   Readers:  Owner broker, Subscribers (polling ordered_ptr)
 ```
 
-**Migration Strategy:**
-```cpp
-// Phase 1: Coexistence - Dual-write to both structures
-void UpdateBrokerState(size_t broker_id, size_t new_written) {
-    // Legacy path
-    tinode->offsets[broker_id].written = new_written;
+**Migration Status:** ✅ **COMPLETE** - No migration needed
 
-    // New path
-    bmeta[broker_id].local.processed_ptr = new_written;
-    CXL::flush_cacheline(&bmeta[broker_id].local);
-    CXL::store_fence();
-}
-
-// Phase 2: Switch readers to new structure
-uint64_t GetProcessedPtr(size_t broker_id) {
-    if (use_new_bmeta) {
-        return bmeta[broker_id].local.processed_ptr;
-    } else {
-        return tinode->offsets[broker_id].written;  // Fallback
-    }
-}
-
-// Phase 3: Deprecate TInode (after validation period)
-```
+**Current Implementation:**
+- All code uses `TInode.offset_entry` directly
+- No dual-write pattern needed
+- Single source of truth: `tinode->offsets[broker_id]`
+- Cache flushes target correct regions (broker vs sequencer) per Root Cause A fix
 
 ---
 

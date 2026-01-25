@@ -1,18 +1,20 @@
 # Embarcadero Topic Class Refactoring Migration Guide
 
-## ⚠️ Important Note
+## ⚠️ ARCHIVED - Alternative Architecture Reference
 
-**Status:** This document describes an **alternative/example architecture** (`TopicRefactored`) that exists alongside the production `Topic` class.
+**Status:** This document describes an **alternative/experimental architecture** (`TopicRefactored`) that is **NOT** the production implementation.
 
 - **Current Production Path:** The main codebase uses the monolithic `Topic` class (`src/embarlet/topic.h`, `src/embarlet/topic.cc`)
 - **Alternative Architecture:** `TopicRefactored` (`src/embarlet/topic_refactored.h`, `src/embarlet/topic_refactored.cc`) demonstrates a modular design with specialized components
-- **Purpose:** This guide is useful for:
-  - Understanding the modular architecture design
-  - Learning how to use the refactored components (`BufferManager`, `MessageOrdering`, `ReplicationManager`)
-  - Evaluating architectural alternatives
-  - Future migration planning
+- **Migration Status:** ❌ **NOT PLANNED** - Production system uses `Topic` class
+- **Purpose:** This guide is preserved for:
+  - Reference: Understanding alternative architectural patterns
+  - Learning: Example of modular component design
+  - Research: Evaluating architectural alternatives for future consideration
 
-**Note:** The production system continues to use the `Topic` class. Migration to `TopicRefactored` is not currently planned, but the components are available for reference and experimentation.
+**⚠️ DO NOT USE FOR PRODUCTION:** This is an experimental/alternative design. All production code should use the `Topic` class.
+
+**Last Updated:** 2026-01-26 (Marked as archived/alternative)
 
 ---
 

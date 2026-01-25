@@ -243,7 +243,8 @@ inline void store_fence() {
  *
  * Guarantees:
  * - All loads before this fence complete before loads after
- * - Ensures fresh read from CXL memory (not from cache)
+ * - Does NOT invalidate cache or force refetch from memory
+ * - For fresh reads from non-coherent CXL, use __atomic_load_n with ACQUIRE
  *
  * Implementation:
  * - x86-64: _mm_lfence() (load fence instruction)
@@ -294,15 +295,16 @@ inline void load_fence() {
  */
 inline void prefetch_cacheline(const void* addr, int locality = 3) {
 #ifdef __x86_64__
-    int hint;
+    // _MM_HINT_* are enum values that can be cast to int
+    int hint_val;
     switch (locality) {
-        case 0: hint = _MM_HINT_NTA; break;  // Non-temporal
-        case 1: hint = _MM_HINT_T1; break;   // L2 and above
-        case 2: hint = _MM_HINT_T2; break;   // L3 and above
+        case 0: hint_val = static_cast<int>(_MM_HINT_NTA); break;  // Non-temporal
+        case 1: hint_val = static_cast<int>(_MM_HINT_T1); break;   // L2 and above
+        case 2: hint_val = static_cast<int>(_MM_HINT_T2); break;   // L3 and above
         case 3: 
-        default: hint = _MM_HINT_T0; break;  // All cache levels (default)
+        default: hint_val = static_cast<int>(_MM_HINT_T0); break;  // All cache levels (default)
     }
-    _mm_prefetch(reinterpret_cast<const char*>(addr), hint);
+    _mm_prefetch(reinterpret_cast<const char*>(addr), static_cast<_mm_hint>(hint_val));
 #elif defined(__aarch64__)
     __builtin_prefetch(addr, 0, locality);
 #else

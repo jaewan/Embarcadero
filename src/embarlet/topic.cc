@@ -243,8 +243,7 @@ void Topic::DelegationThread() {
 	BatchHeader* current_batch = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 	
-	// Track the first batch header to detect when we've processed all available batches
-	BatchHeader* first_batch = current_batch;
+	// [[CRITICAL FIX: Removed Dead Code]] - first_batch variable was unused
 	size_t processed_batches = 0;
 	
 	// [[PERFORMANCE FIX]]: Batch flush optimization (DEV-002)
@@ -275,15 +274,23 @@ void Topic::DelegationThread() {
 					
 					// Read paddedSize first (needed for next message calculation)
 					size_t current_padded_size = msg_ptr->paddedSize;
-					msg_ptr->next_msg_diff = current_padded_size;
-
-					// [[DEV-007: Cache Prefetching]] - Prefetch next message header
-					// Prefetch next message while processing current (if not last message)
-					if (i < current_batch->num_msg - 1 && current_padded_size > 0) {
-						MessageHeader* next_msg = reinterpret_cast<MessageHeader*>(
-							reinterpret_cast<uint8_t*>(msg_ptr) + current_padded_size);
-						CXL::prefetch_cacheline(next_msg, 3);  // High locality
+					
+					// [[CRITICAL FIX: paddedSize Validation]] - Add bounds check to prevent out-of-bounds access
+					// Matches validation in legacy message-by-message path (line 378-389)
+					const size_t min_msg_size = sizeof(MessageHeader);
+					const size_t max_msg_size = 1024 * 1024; // 1MB max message size
+					if (current_padded_size < min_msg_size || current_padded_size > max_msg_size) {
+						static thread_local size_t error_count = 0;
+						if (++error_count % 1000 == 1) {
+							LOG(ERROR) << "DelegationThread: Invalid paddedSize=" << current_padded_size 
+							           << " for topic " << topic_name_ << ", broker " << broker_id_
+							           << " (error #" << error_count << ")";
+						}
+						CXL::cpu_pause();
+						break; // Exit message loop on corrupted data
 					}
+					
+					msg_ptr->next_msg_diff = current_padded_size;
 
 					// Update segment header
 					*reinterpret_cast<unsigned long long int*>(msg_ptr->segment_header) =
@@ -326,13 +333,13 @@ void Topic::DelegationThread() {
 			VLOG(3) << "DelegationThread: Processed batch " << processed_batches 
 			        << " with " << current_batch->num_msg << " messages";
 
-				// [[DEV-007: Cache Prefetching]] - Prefetch next batch header
-				// Reduces cache miss latency by prefetching data before it's needed
-				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
-					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
-				CXL::prefetch_cacheline(next_batch, 3);  // High locality (will access soon)
+				// [[CRITICAL FIX: Removed Prefetching]] - Batch headers are written by NetworkManager
+				// Prefetching remote-writer data can cause stale cache reads in non-coherent CXL
+				// See docs/INVESTIGATION_2026_01_26_CRITICAL_ISSUES.md Issue #1
 
 				// Move to next batch
+				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
 				current_batch = next_batch;
 				continue; // Skip the old message-by-message processing
 			}
@@ -1330,6 +1337,11 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id].batch_headers_offset);
 	BatchHeader* current_batch_header = ring_start_default;
 	
+	// [[CRITICAL FIX: Ring Buffer Boundary]] - Calculate ring end to prevent out-of-bounds access
+	// Each broker gets BATCHHEADERS_SIZE bytes per topic for batch headers
+	BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(ring_start_default) + BATCHHEADERS_SIZE);
+	
 	BatchHeader* header_for_sub = ring_start_default;
 
 	size_t total_batches_processed = 0;
@@ -1358,8 +1370,15 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		// 2. Check BatchHeader validity (still needed for ring buffer handling)
 		// No new batch written in the BatchHeader ring yet, even if processed_ptr moved
 		// This can happen if processed_ptr is updated before BatchHeader is fully visible
-		volatile size_t num_msg_check = current_batch_header->num_msg;
-		if (num_msg_check == 0 || current_batch_header->log_idx == 0 || num_msg_check > 100000) {
+		// [[CRITICAL FIX: Atomic Load]] - Use atomic load to ensure fresh read from CXL memory
+		// num_msg is written by NetworkManager (remote broker), must use atomic load for visibility
+		uint32_t num_msg_check = __atomic_load_n(
+			reinterpret_cast<volatile uint32_t*>(&reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg),
+			__ATOMIC_ACQUIRE);
+		size_t log_idx_check = __atomic_load_n(
+			reinterpret_cast<volatile size_t*>(&reinterpret_cast<volatile BatchHeader*>(current_batch_header)->log_idx),
+			__ATOMIC_ACQUIRE);
+		if (num_msg_check == 0 || log_idx_check == 0 || num_msg_check > 100000) {
 			CXL::cpu_pause();
 			continue;
 		}
@@ -1388,11 +1407,10 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		AssignOrder5(header_to_process, start_total_order, header_for_sub);
 		total_batches_processed++;
 
-		// [[DEV-007: Cache Prefetching]] - Prefetch next batch header while processing current
-		// Reduces cache miss latency by prefetching data before it's needed
-		BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
-			reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
-		CXL::prefetch_cacheline(next_batch_header, 3);  // High locality (will access soon)
+		// [[CRITICAL FIX: Removed Prefetching]] - Prefetching remote-writer data violates non-coherent CXL semantics
+		// Batch headers are written by NetworkManager (remote broker) and read by Sequencer (head broker)
+		// Prefetching can cache stale values, causing infinite polling loops
+		// See docs/INVESTIGATION_2026_01_26_CRITICAL_ISSUES.md Issue #1
 
 		// Periodic status logging
 		auto now = std::chrono::steady_clock::now();
@@ -1403,6 +1421,16 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		}
 
 		// Advance to next batch header
+		BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
+		
+		// [[CRITICAL FIX: Ring Buffer Boundary Check]] - Wrap around when reaching ring end
+		// Prevents out-of-bounds access and reading invalid memory
+		// See docs/INVESTIGATION_2026_01_26_CRITICAL_ISSUES.md Issue #2
+		if (next_batch_header >= ring_end) {
+			next_batch_header = ring_start_default;
+		}
+		
 		current_batch_header = next_batch_header;
 	}
 }

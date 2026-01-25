@@ -1,8 +1,8 @@
 # System Patterns: Migration Map
 
 **Document Purpose:** Migration roadmap from current implementation to NSDI '26 Paper Specification
-**Status:** Gap Analysis Complete | Phase 1 Complete | Phase 2 In Progress
-**Last Updated:** 2026-01-25
+**Status:** Gap Analysis Complete | Phase 1 Complete | Phase 2 In Progress (DEV-004 Complete)
+**Last Updated:** 2026-01-26
 
 ---
 
@@ -47,64 +47,46 @@ struct alignas(64) TInode {
 };
 ```
 
-**Issues:**
-- ⚠️ **ARCHITECTURAL DECISION NEEDED:** `offset_entry` has two cache-line-aligned structs, but they're in the same structure. Need to evaluate if this causes false sharing on real CXL hardware.
-- ⚠️ **REDUNDANCY:** Separate `BrokerMetadata` (Bmeta) was created, but `TInode` serves the same purpose. Should refactor `TInode` instead of maintaining both.
-- ✗ Single `written` field instead of separate `processed_ptr` (delegation) and `log_ptr` (receiver)
-- ⚠️ **SEGMENT ALLOCATION:** Current implementation uses per-broker contiguous allocation instead of bitmap, causing fragmentation (see Section 1.3)
+**Current State (2026-01-26):**
+- ✅ **DEV-004 COMPLETE:** Removed redundant `BrokerMetadata` region - `TInode.offset_entry` is the single source of truth
+- ✅ **Cache-line separation:** `offset_entry` uses 256-byte aligned sub-structs (broker region: 0-255, sequencer region: 256-511)
+- ✅ **No false sharing:** Broker and sequencer write to separate 256-byte regions (4 cache lines each)
+- ✅ **Segment allocation:** Bitmap-based allocation implemented (DEV-005, previously numbered differently)
+- ✅ **Root-cause fixes:** Correct cacheline flush targets, TInode metadata visibility, offset initialization visibility
 
-### Target State (Paper Spec Table 5)
+### Target State (Paper Spec Table 5) - ARCHIVED
 
-```cpp
-// TARGET: Split Bmeta per Single Writer Principle
+**Status:** ❌ **NOT IMPLEMENTED** - Decision made to keep `TInode.offset_entry` instead
 
-// Part 1: Local Struct (ONLY Owner Broker Writes)
-struct alignas(64) BrokerLocalMeta {
-    volatile uint64_t log_ptr;           // Pointer to start of Blog
-    volatile uint64_t processed_ptr;     // Last locally-ordered message
-    volatile uint32_t replication_done;  // Replication status counter
-    uint8_t padding[40];                 // Pad to 64 bytes
-};
+**Rationale (DEV-004):**
+- `TInode.offset_entry` already provides the same functionality as separate `BrokerMetadata`
+- Current structure (256-byte aligned sub-structs) provides sufficient cache-line separation
+- Creating separate `BrokerMetadata` region was redundant
+- All code now uses `TInode.offset_entry` directly
 
-// Part 2: Sequencer Struct (ONLY Sequencer Writes) - SEPARATE CACHE LINE
-struct alignas(64) BrokerSequencerMeta {
-    volatile uint64_t ordered_seq;       // Global seqno of last ordered msg
-    volatile uint64_t ordered_ptr;       // Pointer to end of last ordered msg
-    uint8_t padding[48];                 // Pad to 64 bytes
-};
+### Migration Path - COMPLETE
 
-// Combined Bmeta (per broker)
-struct BrokerMetadata {
-    BrokerLocalMeta local;      // Cache line 0 (broker writes)
-    BrokerSequencerMeta seq;    // Cache line 1 (sequencer writes)
-};
-```
+**✅ ARCHITECTURAL DECISION (2026-01-24, Completed 2026-01-25):**
+1. ✅ **TInode.offset_entry IS the metadata structure** - No separate Bmeta needed
+2. ✅ **Removed redundant BrokerMetadata region** - Eliminated dual-write overhead
+3. ✅ **Current structure is sufficient** - 256-byte aligned sub-structs prevent false sharing
+4. ✅ **All code migrated** - Field mappings completed, tests pass
+5. ✅ **Root-cause fixes applied** - Correct cacheline flush targets, visibility guarantees
 
-### Migration Path
-
-**⚠️ ARCHITECTURAL DECISION (2026-01-24):**
-After code review, identified that:
-1. **TInode IS Bmeta** - They serve the same purpose (per-broker metadata). Should rename TInode to Bmeta. Plan refactoring.
-2. **Current approach is redundant** - Created separate `BrokerMetadata` region, but `TInode.offset_entry` already tracks the same information
-3. **Better approach:** Refactor `TInode` structure to eliminate false sharing, rather than maintaining two separate structures
-
-**Revised Migration Path:**
-1. ✅ Keep `TInode` for backward compatibility (current)
-2. ✅ Add new `PendingBatchEntry` and `GlobalOrderEntry` (already done)
-3. ⚠️ **DECISION PENDING:** Refactor `TInode.offset_entry` to split broker/sequencer fields into separate cache lines
-4. ⚠️ **DECISION PENDING:** Remove redundant `BrokerMetadata` region (consolidate into TInode)
-5. ⏳ Evaluate if current `offset_entry` structure (two cache-line-aligned structs) is sufficient or needs refactoring
-6. ⏳ Performance test on real CXL hardware to verify no false sharing
+**Field Mappings (Current Implementation):**
+- `log_ptr` → `tinode->offsets[broker].log_offset`
+- `processed_ptr` → `tinode->offsets[broker].written_addr`
+- `ordered_ptr` → `tinode->offsets[broker].ordered_offset`
+- `ordered_seq` → `tinode->offsets[broker].ordered`
 
 **Memory Layout Diagram:**
 
 ```mermaid
 graph TD
-    subgraph "CURRENT: CXL Memory Layout"
-        A[TInode Region<br/>sizeof TInode * MAX_TOPIC] --> B[Bitmap Region<br/>CACHELINE * MAX_TOPIC<br/>⚠️ ALLOCATED BUT UNUSED]
-        B --> C[BatchHeaders Region<br/>NUM_BROKERS * BATCHHEADERS_SIZE]
-        C --> D[Bmeta Region<br/>BrokerMetadata * NUM_BROKERS<br/>⚠️ REDUNDANT WITH TINODE]
-        D --> E[Segment Region<br/>⚠️ PER-BROKER CONTIGUOUS<br/>CAUSES FRAGMENTATION]
+    subgraph "CURRENT: CXL Memory Layout (2026-01-26)"
+        A[TInode Region<br/>sizeof TInode * MAX_TOPIC<br/>✅ Contains offset_entry per broker] --> B[Bitmap Region<br/>CACHELINE * MAX_TOPIC<br/>✅ Used for segment allocation]
+        B --> C[BatchHeaders Region<br/>NUM_BROKERS * BATCHHEADERS_SIZE<br/>✅ Batch metadata ring buffer]
+        C --> E[Segment Region<br/>✅ SHARED POOL with bitmap<br/>✅ Prevents fragmentation]
     end
 
     subgraph "TARGET: Paper Spec Layout"
@@ -121,50 +103,55 @@ graph TD
 
 ## 2. Concurrency Model: Missing Primitives
 
-### Current State: Partial Fence Implementation
+### Current State: ✅ COMPLETE - Cache Primitives Implemented
 
-**Location:** src/embarlet/topic.cc:30897-30898
+**Status:** ✅ **IMPLEMENTED** (Task 1.1 & 1.2 Complete)
+
+**Location:** `src/common/performance_utils.h` (created)
 ```cpp
-// CURRENT: Generic memory barrier (insufficient for non-coherent CXL)
-__atomic_thread_fence(__ATOMIC_ACQUIRE);
+// ✅ IMPLEMENTED: Explicit cache line flush + store fence
+namespace CXL {
+    inline void flush_cacheline(const void* addr);  // _mm_clflushopt wrapper
+    inline void store_fence();                      // _mm_sfence wrapper
+    inline void load_fence();                       // _mm_lfence wrapper
+    inline void cpu_pause();                        // _mm_pause wrapper
+}
 ```
 
-**Location:** src/cxl_manager/cxl_manager.cc (NO CACHE FLUSHES FOUND)
-
-### Target State (Paper Spec Section 4)
-
-**Missing Primitives:**
-
+**Usage Pattern (Current Implementation):**
 ```cpp
-// REQUIRED: Explicit cache line flush + store fence (x86-64)
-
-// Writer Pattern (Delegation Thread, Sequencer)
+// Writer Pattern (Delegation Thread, Sequencer) - ✅ IMPLEMENTED
 void publish_to_cxl(MessageHeader* msg) {
     // 1. Write data
     msg->total_order = global_seq++;
 
-    // 2. MISSING: Flush cache line to CXL
-    _mm_clflushopt((void*)msg);  // ❌ NOT FOUND IN CODEBASE
+    // 2. ✅ Flush cache line to CXL
+    CXL::flush_cacheline(msg);
 
-    // 3. MISSING: Ensure flush completes before advancing pointer
-    _mm_sfence();                 // ❌ NOT FOUND IN CODEBASE
+    // 3. ✅ Ensure flush completes before advancing pointer
+    CXL::store_fence();
 
     // 4. Update pointer (monotonic)
-    bmeta->seq.ordered_ptr = (uint64_t)msg;
+    tinode->offsets[broker].ordered_offset = (uint64_t)msg;
 }
 
-// Reader Pattern (Sequencer polling broker, Subscriber polling)
-MessageHeader* poll_next_message(BrokerMetadata* bmeta) {
+// Reader Pattern (Sequencer polling broker) - ✅ IMPLEMENTED
+MessageHeader* poll_next_message(TInode* tinode, size_t broker) {
     volatile uint64_t ptr;
     do {
-        // Busy-wait poll (NO mutex allowed in hot path)
-        ptr = bmeta->local.processed_ptr;
-        _mm_pause();  // ✅ FOUND: std::this_thread::yield() used, but _mm_pause() is better
+        // ✅ Busy-wait poll with cpu_pause (DEV-006)
+        ptr = __atomic_load_n(&tinode->offsets[broker].written_addr, __ATOMIC_ACQUIRE);
+        CXL::cpu_pause();  // ✅ Better than yield() in hot paths
     } while (ptr == last_read_ptr);
 
     return (MessageHeader*)ptr;
 }
 ```
+
+**Optimizations Applied:**
+- ✅ DEV-002: Batch flush optimization (every 8 batches or 64KB)
+- ✅ DEV-005: Single fence for multiple flushes
+- ✅ DEV-006: cpu_pause() instead of yield() in polling loops
 
 ### Concurrency Rules (The "Laws")
 
