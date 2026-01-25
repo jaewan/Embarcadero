@@ -1,0 +1,48 @@
+---
+description: RLM VERIFICATION LOOP
+globs: *.py, *.cpp, *.h, *.cmake
+alwaysApply: false
+---
+# REINFORCEMENT LEARNING FROM MISTAKES (RLM)
+
+## TRIGGER
+When writing new logic or refactoring existing code.
+
+## PROTOCOL
+1.  **Prediction:** Write the code.
+2.  **Verification:**
+    - **Step A:** Check for an existing test in `tests/`.
+    - **Step B:** If none, create `tests/repro_temp.py`.
+    - **Step C:** Run the test.
+3.  **Correction:** If the test fails, analyze the error, fix the code, and re-run.
+4.  **Cleanup:** REQUIRED. Delete `tests/repro_temp.py` after success.
+
+## C++ BUILD CHECK
+- After editing any `.cpp` or `.h`, you MUST run the build command (e.g., `make` or `ninja`) to verify compilation before marking the task done.
+
+## EMBARCADERO-SPECIFIC CHECKS
+
+### When Modifying CXL Structs:
+- Run: `./scripts/verify_cache_alignment.sh` to check alignas(64)
+- If pahole available: `pahole -C StructName build/src/cxl_manager/*.a`
+- Verify: No false sharing between different writers
+
+### When Touching Hot Path:
+- Identify baseline: Run performance test before changes
+- After changes: Re-run test and compare
+- Performance markers: Look for `[[PERFORMANCE: HOT PATH]]` comments
+
+### When Changing Concurrency:
+- Update @threading annotations in header files
+- Document: Which thread/host writes which fields
+- Check: Writer annotations on shared fields are accurate
+
+### When Implementing Paper Spec:
+- Mark status: `[[PAPER_SPEC: Implemented]]` or `[[PAPER_SPEC: TODO]]`
+- Update: `docs/memory-bank/activeContext.md` with progress
+- Verify: Algorithm matches paper description
+
+### Pre-Commit Hook:
+- Installed at: `.git/hooks/pre-commit`
+- Checks: Cache alignment, manual destructors, missing flushes
+- Override: Only if false positive (document why)

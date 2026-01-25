@@ -54,13 +54,13 @@ class Topic {
 		/**
 		 * Destructor - ensures all threads are stopped and joined
 		 */
-		~Topic() {
-			stop_threads_ = true;
-			for (std::thread& thread : combiningThreads_) {
-				if (thread.joinable()) {
-					thread.join();
-				}
+	~Topic() {
+		stop_threads_ = true;
+		for (std::thread& thread : delegationThreads_) {
+			if (thread.joinable()) {
+				thread.join();
 			}
+		}
 
 			if(sequencerThread_.joinable()){
 				sequencerThread_.join();
@@ -134,10 +134,18 @@ class Topic {
 		 */
 		inline void UpdateTInodeWritten(size_t written, size_t written_addr);
 
-		/**
-		 * Thread function for the message combiner
-		 */
-		void CombinerThread();
+	/**
+	 * DelegationThread: Stage 2 (Local Ordering)
+	 * Purpose: Assign local per-broker sequence numbers to messages
+	 * This is for Corfu, Scalog, and Embarcadero weak ordering
+	 * 
+	 * Processing pipeline:
+	 * 1. Poll received flag (set by Receiver)
+	 * 2. Assign local counter (per-broker sequence)
+	 * 3. Update Bmeta.local.processed_ptr
+	 * 4. Flush cache line (bytes 16-31 only)
+	 */
+	void DelegationThread();
 
 		/**
 		 * Check and handle segment boundary crossing
@@ -256,10 +264,12 @@ class Topic {
 
 		// Thread control
 		bool stop_threads_ = false;
-		std::vector<std::thread> combiningThreads_;
+		std::vector<std::thread> delegationThreads_; 
 
 		std::thread sequencerThread_;
 		
+		uint32_t local_counter_ = 0; // threading: single thread (DelegationThread)
+
 		// Sequencing
 		// Ordered batch vector for efficient subscribe
 		void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers);

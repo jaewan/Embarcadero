@@ -67,7 +67,7 @@ public:
     bool IsListening() const { return listening_.load(std::memory_order_acquire); }
     
     void SetDiskManager(DiskManager* disk_manager) { disk_manager_ = disk_manager; }
-    void SetCXLManager(CXLManager* cxl_manager) { cxl_manager_ = cxl_manager; }
+    void SetCXLManager(CXLManager* cxl_manager);
     void SetTopicManager(TopicManager* topic_manager) { topic_manager_ = topic_manager; }
 		void RegisterGetNumBrokersCallback(GetNumBrokersCallback callback){
 			get_num_brokers_callback_ = callback;
@@ -81,7 +81,7 @@ private:
     // Thread handlers
     void MainThread();
     void ReqReceiveThread();
-    void AckThread(const char* topic, uint32_t ack_level, int ack_fd);
+    void AckThread(const char* topic, uint32_t ack_level, int ack_fd, int ack_efd);
     size_t GetOffsetToAck(const char* topic, uint32_t ack_level);
 	void SubscribeNetworkThread(int sock, int efd, const char* topic, int connection_id);
 
@@ -117,8 +117,7 @@ private:
     CXLManager* cxl_manager_ = nullptr;
     DiskManager* disk_manager_ = nullptr;
     TopicManager* topic_manager_ = nullptr;
-
-		Embarcadero::GetNumBrokersCallback get_num_brokers_callback_;
+    Embarcadero::GetNumBrokersCallback get_num_brokers_callback_;
 };
 
 } // namespace Embarcadero

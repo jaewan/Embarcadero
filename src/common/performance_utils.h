@@ -10,6 +10,14 @@
 #include <stdexcept>
 #include <atomic>
 #include <array>
+#include <cstdint>
+#include <chrono>
+
+// Architecture-specific intrinsics
+#ifdef __x86_64__
+#include <immintrin.h>  // For _mm_clflushopt, _mm_sfence, _mm_lfence
+#include <xmmintrin.h>  // For _mm_pause
+#endif
 
 namespace Embarcadero {
 
@@ -147,5 +155,219 @@ private:
     alignas(64) std::atomic<size_t> tail_;
     alignas(64) T buffer_[Size];
 };
+
+// Cache coherence primitives for non-coherent CXL memory
+// Note: DEV-002 (batched flushes) is planned but not yet implemented
+// See docs/memory-bank/spec_deviation.md DEV-002 for future optimization
+namespace CXL {
+
+/**
+ * @brief Flush a cache line containing the given address to CXL memory
+ *
+ * @threading Thread-safe (CPU instruction, no synchronization needed)
+ * @ownership Does not take ownership of addr (read-only parameter)
+ * @alignment Works on any address (automatically rounds down to cache line boundary)
+ * @paper_ref Paper §4.2 - Uses clflushopt for non-coherent CXL writes
+ *
+ * @param addr Pointer to any address within the cache line to flush
+ *
+ * Implementation:
+ * - x86-64: _mm_clflushopt (optimized, non-blocking flush)
+ * - ARM64: __builtin___clear_cache (DC CVAC instruction)
+ * - Generic: No-op (assumes cache-coherent memory)
+ *
+ * Performance: HOT PATH - Called millions of times per second
+ * Constraints: Must be followed by store_fence() for ordering guarantees
+ *
+ * Usage pattern (Paper spec):
+ *   msg_header->field = value;
+ *   CXL::flush_cacheline(msg_header);
+ *   CXL::store_fence();
+ *
+ * Future optimization (DEV-002):
+ *   Multiple field writes to same cache line → single flush
+ */
+inline void flush_cacheline(const void* addr) {
+#ifdef __x86_64__
+    // Safe cast: _mm_clflushopt doesn't modify memory, only flushes cache line
+    _mm_clflushopt(const_cast<void*>(addr));
+#elif defined(__aarch64__)
+    // ARM64: Clear cache for 64-byte aligned region
+    const uintptr_t aligned_addr = reinterpret_cast<uintptr_t>(addr) & ~63UL;
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(aligned_addr),
+        reinterpret_cast<char*>(aligned_addr + 64)
+    );
+#else
+    // Generic fallback: assume cache-coherent memory (no-op)
+    (void)addr;
+#endif
+}
+
+/**
+ * @brief Store fence - ensures all prior stores and flushes are visible
+ *
+ * @threading Thread-safe (CPU instruction)
+ * @ownership No ownership semantics
+ * @paper_ref Paper §4.2 - sfence after clflushopt for ordering
+ *
+ * Guarantees:
+ * - All stores before this fence complete before stores after
+ * - All cache flushes before this fence complete before stores after
+ * - Required after flush_cacheline() to ensure CXL visibility
+ *
+ * Implementation:
+ * - x86-64: _mm_sfence() (store fence instruction)
+ * - ARM64: dmb st (data memory barrier for stores)
+ * - Generic: __atomic_thread_fence(__ATOMIC_RELEASE)
+ *
+ * Performance: HOT PATH - Called after every cache flush
+ * Critical: Must be called after flush_cacheline() for correctness
+ */
+inline void store_fence() {
+#ifdef __x86_64__
+    _mm_sfence();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("dmb st" ::: "memory");
+#else
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
+}
+
+/**
+ * @brief Load fence - ensures all prior loads are visible
+ *
+ * @threading Thread-safe (CPU instruction)
+ * @ownership No ownership semantics
+ * @paper_ref Paper §4.2 - lfence for load ordering (used in polling loops)
+ *
+ * Guarantees:
+ * - All loads before this fence complete before loads after
+ * - Ensures fresh read from CXL memory (not from cache)
+ *
+ * Implementation:
+ * - x86-64: _mm_lfence() (load fence instruction)
+ * - ARM64: dmb ld (data memory barrier for loads)
+ * - Generic: __atomic_thread_fence(__ATOMIC_ACQUIRE)
+ *
+ * Performance: COLD PATH - Used in polling loops, not hot write path
+ */
+inline void load_fence() {
+#ifdef __x86_64__
+    _mm_lfence();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("dmb ld" ::: "memory");
+#else
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+#endif
+}
+
+/**
+ * @brief CPU pause hint for spin-wait loops
+ *
+ * @threading Thread-safe (CPU instruction)
+ * @ownership No ownership semantics
+ * @paper_ref Paper §3 - Polling loops in receiver/delegation threads
+ *
+ * Purpose:
+ * - Reduces power consumption during busy-wait
+ * - Improves performance on hyperthreaded CPUs
+ * - Prevents pipeline stalls in tight polling loops
+ *
+ * Implementation:
+ * - x86-64: _mm_pause() (PAUSE instruction)
+ * - ARM64: yield hint (YIELD instruction)
+ * - Generic: compiler barrier
+ *
+ * Performance: HOT PATH - Called in every iteration of polling loops
+ * Usage: Always use in busy-wait loops to avoid wasting CPU cycles
+ *
+ * Example:
+ *   while (!flag) {
+ *       CXL::cpu_pause();
+ *   }
+ */
+inline void cpu_pause() {
+#ifdef __x86_64__
+    _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    // Generic fallback: compiler barrier
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+/**
+ * @brief Read Time Stamp Counter - high-resolution CPU cycle timestamp
+ *
+ * @threading Thread-safe (CPU instruction, no synchronization needed)
+ * @ownership No ownership semantics
+ * @paper_ref Paper §3 - Timestamp fields in BlogMessageHeader (ts, processed_ts, ordered_ts)
+ *
+ * Purpose:
+ * - Provides high-resolution timestamps for latency measurements
+ * - CPU cycle-accurate timing (typically ~3-4 GHz = ~0.25-0.33 ns resolution)
+ * - Used in BlogMessageHeader for tracking message processing stages
+ *
+ * Returns:
+ * - uint64_t: Current value of CPU's Time Stamp Counter register
+ * - Monotonically increasing (except on CPU migration or frequency changes)
+ * - Wraps around after ~200 years at 3 GHz (2^64 / 3e9 seconds)
+ *
+ * Implementation:
+ * - x86-64: RDTSC instruction (via __rdtsc() intrinsic or inline assembly)
+ * - ARM64: System timer via CNTVCT_EL0 register (virtual counter)
+ * - Generic: std::chrono::steady_clock fallback (lower resolution)
+ *
+ * Performance: HOT PATH - Called for every message timestamp
+ * Constraints: Must be fast (<10 cycles ideally)
+ *
+ * Usage in BlogMessageHeader:
+ *   blog_hdr->ts = CXL::rdtsc();              // Receiver stage
+ *   blog_hdr->processed_ts = CXL::rdtsc();    // Delegation stage
+ *   blog_hdr->ordered_ts = CXL::rdtsc();      // Sequencer stage
+ *
+ * Note: TSC frequency may vary with CPU frequency scaling. For absolute time
+ * conversion, use TSC frequency calibration (not provided here - use for relative
+ * latency measurements only).
+ *
+ * Example latency calculation:
+ *   uint64_t start = CXL::rdtsc();
+ *   // ... do work ...
+ *   uint64_t end = CXL::rdtsc();
+ *   uint64_t cycles = end - start;
+ *   // Convert to nanoseconds: cycles / tsc_frequency_ghz
+ */
+inline uint64_t rdtsc() {
+#ifdef __x86_64__
+    // Use compiler intrinsic if available (GCC/Clang)
+    #if defined(__GNUC__) || defined(__clang__)
+        return __rdtsc();
+    #else
+        // Fallback to inline assembly
+        uint64_t low, high;
+        __asm__ __volatile__("rdtsc" : "=a"(low), "=d"(high));
+        return (high << 32) | low;
+    #endif
+#elif defined(__aarch64__)
+    // ARM64: Read virtual counter (CNTVCT_EL0)
+    // This provides a virtualized counter that's consistent across cores
+    uint64_t val;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+#else
+    // Generic fallback: Use steady_clock for cross-platform compatibility
+    // Note: Lower resolution than TSC, but provides monotonic timestamps
+    auto now = std::chrono::steady_clock::now();
+    auto duration = now.time_since_epoch();
+    auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+    // Scale to approximate TSC frequency (assume 3 GHz for conversion)
+    // This is approximate - for accurate measurements, use TSC on x86-64
+    return static_cast<uint64_t>(nanoseconds * 3);  // 3 GHz = 3 cycles per nanosecond
+#endif
+}
+
+} // namespace CXL
 
 } // namespace Embarcadero

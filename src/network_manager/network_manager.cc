@@ -19,6 +19,7 @@
 #include "../disk_manager/disk_manager.h"
 #include "../cxl_manager/cxl_manager.h"
 #include "../embarlet/topic_manager.h"
+#include "../common/performance_utils.h"
 
 namespace Embarcadero {
 
@@ -58,14 +59,31 @@ bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
 	// Enable socket reuse
 	int flag = 1;
 	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) < 0) {
-		LOG(ERROR) << "setsockopt(SO_REUSEADDR) failed: " << strerror(errno);
-		return false;
+		LOG(WARNING) << "setsockopt(SO_REUSEADDR) failed: " << strerror(errno);
+		// Non-fatal, continue (this shouldn't fail but don't kill the connection)
 	}
 
 	// Enable TCP_NODELAY (disable Nagle's algorithm)
 	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0) {
-		LOG(ERROR) << "setsockopt(TCP_NODELAY) failed: " << strerror(errno);
-		return false;
+		LOG(WARNING) << "setsockopt(TCP_NODELAY) failed: " << strerror(errno);
+		// Non-fatal, continue (latency may be slightly higher)
+	}
+
+	// Enable TCP_QUICKACK for low-latency ACKs
+	if (setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) != 0) {
+		LOG(WARNING) << "setsockopt(TCP_QUICKACK) failed: " << strerror(errno);
+		// Non-fatal, continue
+	}
+
+	// Increase socket buffers for high-throughput (32MB)
+	const int buffer_size = 32 * 1024 * 1024;  // 32 MB
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+		LOG(WARNING) << "setsockopt(SO_SNDBUF) failed: " << strerror(errno);
+		// Non-fatal, continue (will use default buffer size)
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+		LOG(WARNING) << "setsockopt(SO_RCVBUF) failed: " << strerror(errno);
+		// Non-fatal, continue (will use default buffer size)
 	}
 
 	return true;
@@ -176,6 +194,9 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 		return false;
 	}
 
+	// Close the connection-monitoring epoll before creating send-monitoring epoll
+	close(ack_efd_);
+
 	// Setup epoll for the connected socket
 	ack_efd_ = epoll_create1(0);
 	if (ack_efd_ == -1) {
@@ -253,6 +274,10 @@ NetworkManager::~NetworkManager() {
 	}
 
 	VLOG(3) << "[NetworkManager]: Destructed";
+}
+
+void NetworkManager::SetCXLManager(CXLManager* cxl_manager) {
+	cxl_manager_ = cxl_manager;
 }
 
 void NetworkManager::EnqueueRequest(struct NetworkRequest request) {
@@ -354,13 +379,13 @@ void NetworkManager::MainThread() {
 						(struct sockaddr*)&client_addr,
 						&client_addr_len);
 
-				if (req.client_socket < 0) {
-					LOG(ERROR) << "Error accepting connection: " << strerror(errno);
-					continue;
-				}
+			if (req.client_socket < 0) {
+				LOG(ERROR) << "Error accepting connection: " << strerror(errno);
+				continue;
+			}
 
-				// Enqueue the request for processing
-				request_queue_.blockingWrite(req);
+			// Enqueue the request for processing
+			request_queue_.blockingWrite(req);
 			}
 		}
 	}
@@ -455,16 +480,22 @@ void NetworkManager::HandlePublishRequest(
 		if (it != ack_connections_.end()) {
 			ack_fd = it->second;
 		} else {
-			// Create new acknowledgment connection
-			if (!SetupAcknowledgmentSocket(ack_fd, client_address, handshake.port)) {
-				close(client_socket);
-				return;
-			}
+		// Create new acknowledgment connection
+		// Capture ack_efd_ locally before starting thread to prevent race condition
+		int local_ack_efd = -1;
+		if (!SetupAcknowledgmentSocket(ack_fd, client_address, handshake.port)) {
+			close(client_socket);
+			return;
+		}
 
-			ack_fd_ = ack_fd;
-			ack_connections_[handshake.client_id] = ack_fd;
+		// Capture the ack_efd_ value immediately after setup, before it can be overwritten
+		local_ack_efd = ack_efd_;
+		
+		ack_fd_ = ack_fd;
+		ack_connections_[handshake.client_id] = ack_fd;
 
-			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd);
+		// Pass local_ack_efd to thread so it uses the correct epoll instance
+		threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd);
 		}
 	}
 
@@ -508,9 +539,11 @@ void NetworkManager::HandlePublishRequest(
 		SequencerType seq_type;
 		BatchHeader* batch_header_location = nullptr;
 
-		std::function<void(void*, size_t)> non_emb_seq_callback =
-			cxl_manager_->GetCXLBuffer(batch_header, handshake.topic, buf,
-					segment_header, logical_offset, seq_type, batch_header_location);
+		std::function<void(void*, size_t)> non_emb_seq_callback = nullptr;
+
+		// Use GetCXLBuffer for batch-level allocation and zero-copy receive
+		non_emb_seq_callback = cxl_manager_->GetCXLBuffer(batch_header, handshake.topic, buf,
+				segment_header, logical_offset, seq_type, batch_header_location);
 
 		if (!buf) {
 			LOG(ERROR) << "Failed to get CXL buffer";
@@ -891,14 +924,33 @@ bool NetworkManager::SendMessageData(
 //----------------------------------------------------------------------------
 
 size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
-	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
-	static const int replication_factor = tinode->replication_factor;
-	static const int order = tinode->order;
-	static const SequencerType seq_type = tinode->seq_type;
-	size_t min = std::numeric_limits<size_t>::max();
-	//TODO(Jae) For now it is static. This should be changed for failure
-	static const int num_brokers = get_num_brokers_callback_();
+	// Early return for ack_level 0 (no acknowledgments expected)
+	if (ack_level == 0) {
+		return (size_t)-1;  // Return sentinel value indicating no ack needed
+	}
 
+	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+	const int replication_factor = tinode->replication_factor;
+	const int order = tinode->order;
+	const SequencerType seq_type = tinode->seq_type;
+	const int num_brokers = get_num_brokers_callback_();
+	size_t min = std::numeric_limits<size_t>::max();
+
+	// Handle ack_level 2 explicitly (ack only after replication)
+	if (ack_level == 2 && replication_factor > 0) {
+		// ACK Level 2: Only acknowledge after full replication completes
+		size_t r[replication_factor];
+		for (int i = 0; i < replication_factor; i++) {
+			int b = (broker_id_ + num_brokers - i) % num_brokers;
+			r[i] = tinode->offsets[b].replication_done[broker_id_];
+			if (min > r[i]) {
+				min = r[i];
+			}
+		}
+		return min;
+	}
+
+	// ACK Level 1: Acknowledge after written to shared memory and ordered
 	if(replication_factor > 0){
 		if(ack_level == 1){
 			if(order == 0){
@@ -919,8 +971,8 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 			return tinode->offsets[broker_id_].ordered;
 		}
 
+		// Fallback: Check replication_done for other cases
 		size_t r[replication_factor];
-
 		for (int i = 0; i < replication_factor; i++) {
 			int b = (broker_id_ + num_brokers - i) % num_brokers;
 			r[i] = tinode->offsets[b].replication_done[broker_id_];
@@ -930,6 +982,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		}
 		return min;
 	}else{
+		// No replication: Acknowledge after written (order=0) or ordered (order>0)
 		if(order == 0){
 			return tinode->offsets[broker_id_].written;
 		}else{
@@ -938,7 +991,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	}
 }
 
-void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd) {
+void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd, int ack_efd) {
 	struct epoll_event events[10];
 	char buf[1];
 
@@ -947,7 +1000,21 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 	// Send broker_id first so client can distinguish
 	size_t acked_size = 0;
 	while (acked_size < sizeof(broker_id_)) {
-		int n = epoll_wait(ack_efd_, events, 10, -1);
+		// Add 5-second timeout to prevent infinite blocking if epoll fd is invalid
+		int n = epoll_wait(ack_efd, events, 10, 5000);  // 5 second timeout
+		
+		if (n == 0) {
+			LOG(ERROR) << "AckThread: Timeout sending broker_id for broker " << broker_id_;
+			close(ack_fd);
+			close(ack_efd);
+			return;
+		}
+		if (n < 0) {
+			LOG(ERROR) << "AckThread: epoll_wait failed: " << strerror(errno);
+			close(ack_fd);
+			close(ack_efd);
+			return;
+		}
 
 		for (int i = 0; i < n; i++) {
 			if (events[i].events & EPOLLOUT) {
@@ -987,9 +1054,26 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 	auto last_log_time = std::chrono::steady_clock::now();
 
 	while (!stop_threads_) {
-		size_t ack = GetOffsetToAck(topic, ack_level);
+		auto cycle_start = std::chrono::steady_clock::now();
+		constexpr auto SPIN_DURATION = std::chrono::microseconds(100);  // Spin for 100us to catch ACK updates
+
+		// Spin-then-sleep pattern to balance low latency and CPU efficiency
+		// Always spin for 100us first (catches ACK updates immediately)
+		// Then sleep for 1ms if no ACK is ready
+		bool found_ack = false;
+		while (std::chrono::steady_clock::now() - cycle_start < SPIN_DURATION) {
+			size_t ack = GetOffsetToAck(topic, ack_level);
+			if (ack != (size_t)-1 && next_to_ack_offset <= ack) {
+				found_ack = true;
+				break;  // ACK is ready, exit spin loop and send immediately
+			}
+			CXL::cpu_pause();  // Efficient spin-wait on CXL
+		}
+
+		// If no ACK found after spinning, log progress and sleep briefly
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
+			size_t ack = GetOffsetToAck(topic, ack_level);
 			LOG(INFO) << "Broker:" << broker_id_ << " Acknowledgments " << ack << " (next_to_ack=" << next_to_ack_offset << ")";
 			TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
 			int replication_factor = tinode->replication_factor;
@@ -1000,13 +1084,23 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 			last_log_time = now;
 		}
 
+		if (!found_ack) {
+			// No ACK ready after spinning, sleep briefly before next cycle
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			continue;  // Go back to top of loop to spin again
+		}
+
+		// ACK is ready, fetch it and send
+		size_t ack = GetOffsetToAck(topic, ack_level);
+
 		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
 			LOG(INFO) << "AckThread: Broker " << broker_id_ << " sending ack for " << ack << " messages (prev=" << next_to_ack_offset-1 << ")";
 			next_to_ack_offset = ack + 1;
 			acked_size = 0;
 			// Send offset acknowledgment
+			// Add timeout to epoll_wait to prevent infinite blocking
 			while (acked_size < sizeof(ack)) {
-				int n = epoll_wait(ack_efd_, events, 10, -1);
+				int n = epoll_wait(ack_efd_, events, 10, 100);
 
 				for (int i = 0; i < n; i++) {
 					if (events[i].events & EPOLLOUT) {

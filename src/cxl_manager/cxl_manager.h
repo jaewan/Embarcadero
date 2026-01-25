@@ -15,6 +15,7 @@
 #include "cxl_datastructure.h"
 #include "../embarlet/topic_manager.h"
 #include "../network_manager/network_manager.h"
+#include "../common/performance_utils.h"
 
 namespace Embarcadero{
 
@@ -60,6 +61,12 @@ class CXLManager{
 
 			tinode->offsets[broker].ordered = msg_logical_off;
 			tinode->offsets[broker].ordered_offset = ordered_offset;
+
+			// Flush cache line after TInode metadata update for CXL visibility
+			// Paper §4.2 - Flush & Poll principle: Writers must flush after writes to non-coherent CXL
+			// Note: DEV-002 (batched flushes) planned - could batch if multiple fields in same cache line
+			CXL::flush_cacheline(const_cast<const void*>(static_cast<volatile void*>(&tinode->offsets[broker])));
+			CXL::store_fence();
 		}
 
 	private:
@@ -78,6 +85,123 @@ class CXLManager{
 		void* current_log_addr_;
 		volatile bool stop_threads_ = false;
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
+		
+		// [[DEVIATION_005]] Future Multi-Node CXL Support: SegmentAllocator Abstraction
+		// Uncomment and implement when multi-node non-coherent CXL is available
+		/*
+		// Abstract allocation protocol for pluggable strategies
+		class SegmentAllocator {
+		public:
+			virtual ~SegmentAllocator() = default;
+			virtual void* AllocateSegment() = 0;
+			virtual void DeallocateSegment(void* segment) = 0;
+		};
+		
+		// Current implementation (cache-coherent atomic) - Phase 1
+		class AtomicBitmapAllocator : public SegmentAllocator {
+		private:
+			uint64_t* bitmap_;
+			void* segments_;
+			size_t total_segments_;
+			size_t bitmap_words_;
+			thread_local static size_t hint_;
+			
+		public:
+			AtomicBitmapAllocator(void* bitmap, void* segments, size_t total_segments)
+				: bitmap_(static_cast<uint64_t*>(bitmap))
+				, segments_(segments)
+				, total_segments_(total_segments)
+				, bitmap_words_((total_segments + 63) / 64) {}
+			
+			void* AllocateSegment() override {
+				// Current implementation (see GetNewSegment() above)
+				// Uses __atomic_fetch_or for lock-free allocation
+			}
+			
+			void DeallocateSegment(void* segment) override {
+				// Calculate segment index from address
+				// Clear corresponding bit in bitmap
+			}
+		};
+		
+		// Future implementation: Partitioned Bitmap (Option A)
+		// Each broker gets its own bitmap region (segments 0-31, 32-63, etc.)
+		// No cross-broker coordination needed
+		// Works on non-coherent CXL (no shared cache lines)
+		// Trade-off: One broker can't borrow from others if it runs out
+		class PartitionedBitmapAllocator : public SegmentAllocator {
+		private:
+			int broker_id_;
+			int max_brokers_;
+			uint64_t* bitmap_;  // Points to this broker's partition
+			void* segments_;
+			size_t segments_per_broker_;
+			
+		public:
+			PartitionedBitmapAllocator(int broker_id, int max_brokers, 
+			                          void* bitmap, void* segments, 
+			                          size_t total_segments)
+				: broker_id_(broker_id)
+				, max_brokers_(max_brokers)
+				, segments_per_broker_(total_segments / max_brokers) {
+				// Calculate this broker's bitmap partition
+				size_t bitmap_words_per_broker = (segments_per_broker_ + 63) / 64;
+				bitmap_ = static_cast<uint64_t*>(bitmap) + (broker_id * bitmap_words_per_broker);
+				segments_ = static_cast<uint8_t*>(segments) + (broker_id * segments_per_broker_ * SEGMENT_SIZE);
+			}
+			
+			void* AllocateSegment() override {
+				// Same atomic bitmap logic, but only scans this broker's partition
+				// No cross-broker coordination needed
+			}
+		};
+		
+		// Future implementation: Leader-Based Allocation (Option B)
+		// One broker (leader) allocates segments via network RPC
+		// Simple coordination model
+		// Network overhead (~30μs per allocation)
+		// Single point of failure (needs leader election)
+		class LeaderBasedAllocator : public SegmentAllocator {
+		private:
+			bool is_leader_;
+			int leader_broker_id_;
+			// Network client for RPC to leader
+			
+		public:
+			void* AllocateSegment() override {
+				if (is_leader_) {
+					return AllocateLocal();  // Use atomic bitmap
+				} else {
+					return RequestFromLeader();  // Network RPC
+				}
+			}
+		};
+		
+		// Future implementation: CXL 3.0 Hardware-Assisted Atomics (Option C)
+		// Hardware-assisted atomic operations (if available)
+		// Best of both worlds (fast + non-coherent)
+		// Requires CXL 3.0 hardware support
+		class CXL3AtomicAllocator : public SegmentAllocator {
+		public:
+			void* AllocateSegment() override {
+				// Use CXL 3.0 atomic operations (if available)
+				// Hardware handles cache coherence
+			}
+		};
+		
+		// CXLManager would use abstraction:
+		// std::unique_ptr<SegmentAllocator> allocator_;
+		// 
+		// In constructor:
+		// if (is_single_node_) {
+		//     allocator_ = std::make_unique<AtomicBitmapAllocator>(bitmap_, segments_, total_segments);
+		// } else if (use_partitioned_) {
+		//     allocator_ = std::make_unique<PartitionedBitmapAllocator>(broker_id_, max_brokers_, bitmap_, segments_, total_segments);
+		// } else {
+		//     allocator_ = std::make_unique<LeaderBasedAllocator>(is_leader_, leader_broker_id_);
+		// }
+		*/
+		
 
 
 		void Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic);

@@ -1,8 +1,8 @@
 # System Patterns: Migration Map
 
 **Document Purpose:** Migration roadmap from current implementation to NSDI '26 Paper Specification
-**Status:** Gap Analysis Complete | Implementation: Phase 1.1 In Progress
-**Last Updated:** 2026-01-23
+**Status:** Gap Analysis Complete | Phase 1 Complete | Phase 2 In Progress
+**Last Updated:** 2026-01-25
 
 ---
 
@@ -48,9 +48,10 @@ struct alignas(64) TInode {
 ```
 
 **Issues:**
-- ✗ `offset_entry` mixes broker-writable and sequencer-writable fields in first cache line
+- ⚠️ **ARCHITECTURAL DECISION NEEDED:** `offset_entry` has two cache-line-aligned structs, but they're in the same structure. Need to evaluate if this causes false sharing on real CXL hardware.
+- ⚠️ **REDUNDANCY:** Separate `BrokerMetadata` (Bmeta) was created, but `TInode` serves the same purpose. Should refactor `TInode` instead of maintaining both.
 - ✗ Single `written` field instead of separate `processed_ptr` (delegation) and `log_ptr` (receiver)
-- ✗ No explicit split between Local Struct and Sequencer Struct per Single Writer Principle
+- ⚠️ **SEGMENT ALLOCATION:** Current implementation uses per-broker contiguous allocation instead of bitmap, causing fragmentation (see Section 1.3)
 
 ### Target State (Paper Spec Table 5)
 
@@ -81,22 +82,29 @@ struct BrokerMetadata {
 
 ### Migration Path
 
-**Phase 1.2: Coexistence Strategy**
-1. ✅ Keep `TInode` for backward compatibility
-2. ✅ Add new `PendingBatchEntry` and `GlobalOrderEntry` (already done in cxl_datastructure.h:28781-28810)
-3. ⏳ Allocate `BrokerMetadata[NUM_MAX_BROKERS]` region in CXL
-4. ⏳ Dual-write: Update both `TInode.offsets[broker_id].written` AND `Bmeta[broker_id].local.processed_ptr`
-5. ⏳ Migrate readers to poll `Bmeta` instead of `TInode`
-6. ⏳ Deprecate `TInode` after validation period
+**⚠️ ARCHITECTURAL DECISION (2026-01-24):**
+After code review, identified that:
+1. **TInode IS Bmeta** - They serve the same purpose (per-broker metadata). Should rename TInode to Bmeta. Plan refactoring.
+2. **Current approach is redundant** - Created separate `BrokerMetadata` region, but `TInode.offset_entry` already tracks the same information
+3. **Better approach:** Refactor `TInode` structure to eliminate false sharing, rather than maintaining two separate structures
+
+**Revised Migration Path:**
+1. ✅ Keep `TInode` for backward compatibility (current)
+2. ✅ Add new `PendingBatchEntry` and `GlobalOrderEntry` (already done)
+3. ⚠️ **DECISION PENDING:** Refactor `TInode.offset_entry` to split broker/sequencer fields into separate cache lines
+4. ⚠️ **DECISION PENDING:** Remove redundant `BrokerMetadata` region (consolidate into TInode)
+5. ⏳ Evaluate if current `offset_entry` structure (two cache-line-aligned structs) is sufficient or needs refactoring
+6. ⏳ Performance test on real CXL hardware to verify no false sharing
 
 **Memory Layout Diagram:**
 
 ```mermaid
 graph TD
     subgraph "CURRENT: CXL Memory Layout"
-        A[TInode Region<br/>sizeof TInode * MAX_TOPIC] --> B[Bitmap Region<br/>CACHELINE * MAX_TOPIC]
+        A[TInode Region<br/>sizeof TInode * MAX_TOPIC] --> B[Bitmap Region<br/>CACHELINE * MAX_TOPIC<br/>⚠️ ALLOCATED BUT UNUSED]
         B --> C[BatchHeaders Region<br/>NUM_BROKERS * BATCHHEADERS_SIZE]
-        C --> D[Segment Region<br/>Divided equally per broker]
+        C --> D[Bmeta Region<br/>BrokerMetadata * NUM_BROKERS<br/>⚠️ REDUNDANT WITH TINODE]
+        D --> E[Segment Region<br/>⚠️ PER-BROKER CONTIGUOUS<br/>CAUSES FRAGMENTATION]
     end
 
     subgraph "TARGET: Paper Spec Layout"
@@ -164,7 +172,7 @@ MessageHeader* poll_next_message(BrokerMetadata* bmeta) {
 |------|------------------|----------------------|-----|
 | **Single Writer** | Cache line written by ≤1 host | `offset_entry` has mixed ownership | ❌ Split required |
 | **Monotonicity** | Pointers/counters only increase | ✅ Implemented (fetch_add) | ✅ Compliant |
-| **Flush & Poll** | `clflushopt` + `sfence` on write | ❌ Not found in codebase | ❌ **CRITICAL GAP** |
+| **Flush & Poll** | `clflushopt` + `sfence` on write | ✅ Implemented (DEV-002: Batch flush) | ✅ Compliant |
 | **No Locks in Hot Path** | Atomic polling only | ✅ Sequencer4 uses atomics | ✅ Compliant |
 
 ### Migration: Adding Cache Coherence Protocol
@@ -250,7 +258,7 @@ BrokerScannerWorker (per broker thread) {
 
 ```mermaid
 sequenceDiagram
-    participant R as Receiver Threads<br/>(Pool)
+    participant R as Receiver Threads<br/>(NetworkManager I/O)
     participant D as Delegation Thread<br/>(Single per Broker)
     participant S as Sequencer Thread<br/>(Per-Broker on Seq Host)
     participant Rep as Replication Threads<br/>(Pool)
@@ -279,10 +287,11 @@ sequenceDiagram
 
 **Phase 2.1: Refactor Sequencer4**
 
-1. **Extract Receiver Stage** (currently implicit in network_manager)
-   - Create explicit `ReceiverThreadPool` class
-   - Allocate Blog space via atomic increment
-   - Set `received` flag after zero-copy write
+1. **Enhance Receiver Stage** (currently in NetworkManager::ReqReceiveThread)
+   - **DECISION (DEV-003):** Keep receiver logic in NetworkManager, discard separate ReceiverThreadPool class
+   - Use `Bmeta.local.log_ptr` for batch-level atomic allocation (replaces Topic's mutex)
+   - Maintain zero-copy `recv()` directly into CXL memory
+   - Set `batch_complete` flag after batch receive (one flush per batch)
 
 2. **Formalize Delegation Thread** (currently `CombinerThread`)
    - Rename to `DelegationThread` for clarity
@@ -524,15 +533,16 @@ void SequencerFailover(SequencerCheckpoint* ckpt) {
 
 ## 7. Implementation Priorities
 
-### Phase 1: Foundation (Current - Q1 2026)
+### Phase 1: Foundation ✅ COMPLETE
 - [x] Add PendingBatchEntry, GlobalOrderEntry structures
-- [ ] Implement `BrokerMetadata` (Bmeta) allocation in CXL
-- [ ] Add cache flush primitives (`clflushopt`, `sfence`, `lfence`)
-- [ ] Dual-write to TInode + Bmeta for coexistence
+- [x] Add cache flush primitives (`clflushopt`, `sfence`, `lfence`) - ✅ Complete
+- [x] **ARCHITECTURAL DECISION:** Removed redundant Bmeta region - using TInode.offset_entry (DEV-004) - ✅ Complete
+- [x] Fix segment allocation to use bitmap (DEV-005) - ✅ Complete
 
-### Phase 2: Pipeline Refactor (Q1-Q2 2026)
-- [ ] Extract ReceiverThreadPool (explicit Stage 1)
-- [ ] Add cache flushes to DelegationThread (Stage 2)
+### Phase 2: Pipeline Refactor ⏳ IN PROGRESS
+- [x] ~~Extract ReceiverThreadPool~~ **DECISION: Keep receiver logic in NetworkManager (DEV-003)** - ✅ Complete
+- [x] Add cache flushes to DelegationThread (Stage 2) - ✅ Complete (DEV-002: Batch flush optimization)
+- [x] Rename CombinerThread to DelegationThread - ✅ Complete
 - [ ] Refactor BrokerScannerWorker to poll Bmeta.processed_ptr (Stage 3)
 - [ ] Add ReplicationThreadPool polling ordered_ptr (Stage 4)
 

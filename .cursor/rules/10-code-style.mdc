@@ -1,0 +1,428 @@
+---
+description: AI-READABLE CODE STANDARDS FOR EMBARCADERO
+globs:
+  - "*.cc"
+  - "*.h"
+  - "*.cpp"
+  - "*.sh"
+  - "*.yaml"
+alwaysApply: true
+---
+
+# EMBARCADERO CODE STYLE: OPTIMIZED FOR AI ASSISTANCE
+
+**Project:** Distributed shared log with CXL (non-cache-coherent memory)
+**Critical Constraint:** False sharing prevention, explicit cache coherence
+**Migration Target:** NSDI '26 Paper Spec (`docs/memory-bank/paper_spec.md`)
+
+---
+
+## 1. HEADER-FIRST DOCUMENTATION (C++)
+
+### Rule: The `.h` File Is the Contract
+
+**REQUIRED in ALL public functions:**
+```cpp
+/**
+ * @brief One-line summary
+ *
+ * @threading Thread-safe | Not thread-safe | Single-writer (specify which)
+ * @ownership Stack | Heap | CXL-shared | RAII (who owns result?)
+ * @alignment Critical if struct is CXL-resident or hot path
+ * @paper_ref Paper §X.Y if implementing spec algorithm
+ */
+```
+
+**Example:**
+```cpp
+/**
+ * @brief Allocates buffer in CXL memory for batch write
+ *
+ * @threading Called by receiver thread pool (N concurrent threads)
+ * @ownership Caller owns until Poll() completes
+ * @alignment Returns cache-line aligned (64B) pointer
+ * @paper_ref Paper §3.1 - Receiver Thread allocation
+ *
+ * @return Pointer to CXL buffer, nullptr if OOM
+ */
+void* AllocateBuffer(size_t size);
+```
+
+---
+
+## 2. CACHE-LINE SAFETY (CRITICAL)
+
+### Rule: All CXL Structs MUST Be Cache-Line Aligned
+
+**REQUIRED for shared memory:**
+```cpp
+struct alignas(64) MyStruct {
+    // Fields
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(MyStruct) % 64 == 0, "Must be 64B multiple");
+```
+
+**REQUIRED: Document writer of each field:**
+```cpp
+struct alignas(64) BrokerMeta {
+    // [[WRITER: Broker thread]]
+    volatile uint64_t log_ptr;
+    volatile uint64_t processed_ptr;
+
+    // [[WRITER: Sequencer thread]] ⚠️ MUST be different cache line!
+    volatile uint64_t ordered_seq;
+
+    uint8_t _pad[40];  // Explicit padding to 64B
+};
+```
+
+**FORBIDDEN: False Sharing**
+```cpp
+// ❌ WRONG: Two threads writing same cache line
+struct Bad {
+    uint64_t broker_field;    // Broker writes
+    uint64_t sequencer_field; // Sequencer writes (FALSE SHARING!)
+};
+```
+
+**Verification:** `pahole -C StructName build/src/cxl_manager/*.a`
+
+---
+
+## 3. CONCURRENCY ANNOTATIONS
+
+### Rule: Document Synchronization for Every Shared Variable
+
+```cpp
+class Publisher {
+private:
+    std::atomic<int> counter_;  // [[threading: atomic increment]]
+
+    mutable std::mutex mutex_;
+    int value_;                 // [[guarded_by: mutex_]]
+
+    int local_;                 // [[threading: single thread (writer)]]
+};
+```
+
+**For CXL memory:**
+```cpp
+struct MessageHeader {
+    volatile uint8_t received;  // [[writer: Receiver]] [[reader: Delegation]]
+    volatile uint32_t counter;  // [[writer: Delegation]] [[reader: Sequencer]]
+};
+```
+
+---
+
+## 4. CACHE FLUSH REQUIREMENT
+
+### Rule: All CXL Writes MUST Be Flushed
+
+**REQUIRED pattern:**
+```cpp
+#include "common/performance_utils.h"
+
+msg_header->received = 1;
+Embarcadero::CXL::flush_cacheline(msg_header);
+Embarcadero::CXL::store_fence();
+```
+
+**FORBIDDEN:**
+```cpp
+// ❌ WRONG: No flush (other host sees stale data!)
+msg_header->received = 1;
+```
+
+**Reference:** Paper §4 - Flush & Poll principle
+
+---
+
+## 5. OWNERSHIP & LIFECYCLE
+
+### Rule: NEVER Manually Call Destructors
+
+**FORBIDDEN:**
+```cpp
+// ❌ WRONG: Double-free!
+MyClass obj;
+obj.~MyClass();  // Manual call
+// Destructor called again on scope exit!
+```
+
+**CORRECT:** Let compiler handle RAII
+
+---
+
+## 6. ZERO-COPY DATA PATHS
+
+### Rule: No Heap Allocations in Hot Path
+
+**FORBIDDEN:**
+```cpp
+// ❌ WRONG: Heap allocation + double copy
+std::string payload(data, size);
+WriteToCXL(payload.data());
+```
+
+**REQUIRED:**
+```cpp
+// ✅ CORRECT: Single copy
+void* cxl = AllocateInCXL(size);
+memcpy(cxl, data, size);
+```
+
+---
+
+## 7. SEMANTIC HEADERS
+
+### Rule: Read `README.md` Before Modifying Directory
+
+**Locations with critical constraints:**
+- `src/cxl_manager/README.md` - The Four Laws
+- `docs/memory-bank/` - Paper spec, migration status
+
+**Example:** `src/cxl_manager/README.md` Law 2:
+> NEVER mix Broker and Sequencer fields in same cache line
+
+---
+
+## 8. SPECIFICATION COMPLIANCE & DEVIATIONS
+
+### Rule: Follow Specification Hierarchy
+
+**CRITICAL: Check in this order:**
+1. `docs/memory-bank/spec_deviation.md` - Approved improvements (overrides paper)
+2. `docs/memory-bank/paper_spec.md` - Reference design (if no deviation)
+3. Engineering judgment - Document as new deviation proposal
+
+### Markers for Implementation Status
+
+```cpp
+// [[DEVIATION_XXX: Cache Flush Optimization]]
+// See docs/memory-bank/spec_deviation.md DEV-XXX
+// Paper flushes per field, we batch flushes per cache line
+CXL::flush_cacheline(msg_header);  // Single flush for all fields
+
+// [[PAPER_SPEC: Implemented]] - Matches Table 5 exactly
+struct alignas(64) BrokerMetadata { ... };
+
+// [[PAPER_SPEC: TODO]] - Need to migrate to Bmeta
+struct TInode { ... };
+
+// [[DEVIATION_PROPOSAL_XXX: Better Batch Algorithm]]
+// Experimental - 15% faster, needs approval
+// If approved, move to spec_deviation.md
+void ProcessBatch() { ... }
+```
+
+### When to Propose a Deviation
+
+**Required conditions:**
+- [ ] Performance improvement >10% OR correctness fix
+- [ ] Tested both paper approach and new approach
+- [ ] Quantified performance difference
+- [ ] Documented risks and mitigation
+- [ ] Added entry to `spec_deviation.md`
+- [ ] Marked code with `[[DEVIATION_PROPOSAL_XXX]]`
+- [ ] Updated `activeContext.md` for human review
+
+**Process:**
+1. Implement paper design (if feasible) as baseline
+2. Implement your improvement
+3. Measure performance difference
+4. Add to `spec_deviation.md` with 🔬 Experimental status
+5. Mark code with `[[DEVIATION_PROPOSAL_XXX]]`
+6. Add to `activeContext.md` for team review
+7. After approval, change status to ✅ Implemented
+
+### FORBIDDEN: Silent Deviations
+
+**NEVER:**
+- Deviate from paper without documentation
+- Remove deviation markers to "clean up code"
+- Override documented deviation to "match paper"
+
+**Rule:** If you find the paper design suboptimal, **document the deviation** rather than silently changing it.
+
+---
+
+## 9. ASSERTIONS FOR CONSTRAINTS
+
+### Rule: Use Static Assertions, Not Comments
+
+```cpp
+// ✅ CORRECT
+struct alignas(64) Header {
+    uint64_t f1, f2;
+};
+static_assert(sizeof(Header) == 64, "Must fit in cache line");
+static_assert(offsetof(Header, f2) < 64, "All fields in line 0");
+```
+
+**Logging levels:**
+- `LOG(INFO)` - Major transitions
+- `LOG(WARNING)` - Unusual but handled
+- `LOG(ERROR)` - Unexpected errors
+- `VLOG(1)` - Debug details
+- `VLOG(5)` - Trace
+
+---
+
+## 10. FUNCTION NAMING
+
+### Rule: Names Document Side Effects
+
+```cpp
+size_t GetCount() const;         // Query (no side effects)
+void UpdateCounter(int delta);   // Mutation
+void EnqueueRequest(Req req);    // Async
+void WaitForCompletion();        // Blocking
+void* AllocateBuffer(size_t);    // Resource acquisition
+```
+
+---
+
+## 11. SHELL SCRIPT SAFETY
+
+### Rule: Error Handling Required
+
+```bash
+#!/bin/bash
+set -euo pipefail  # Exit on error, undefined vars, pipe fail
+
+cleanup() {
+    # Kill processes, clean temp files
+}
+trap cleanup EXIT INT TERM
+```
+
+---
+
+## 12. NO MAGIC NUMBERS
+
+**FORBIDDEN:**
+```cpp
+size_t cxl = 68719476736;  // What is this?
+```
+
+**REQUIRED:**
+```cpp
+constexpr size_t CXL_SIZE_GB = 64;
+constexpr size_t CXL_SIZE = CXL_SIZE_GB * 1024UL * 1024 * 1024;
+// Rationale: Paper uses 64GB. Can reduce to 4GB for tests.
+```
+
+---
+
+## 13. ERROR HANDLING
+
+### Rule: Document All Error Codes
+
+```cpp
+/**
+ * @return 0 on success
+ *         -ENOMEM if allocation fails
+ *         -EINVAL if size > MAX
+ *         -ECONNREFUSED if broker unreachable
+ */
+int PublishMessage(void* data, size_t size);
+```
+
+---
+
+## 14. MIGRATION MARKERS
+
+### Rule: Mark Old vs New Architecture
+
+```cpp
+// [[ARCHITECTURE: v0 (TInode)]] - Will replace with Bmeta
+struct TInode { ... };
+
+// [[ARCHITECTURE: v1 (Bmeta)]] - Target from Paper Table 5
+struct BrokerMetadata { ... };
+```
+
+**Dual-write during migration:**
+```cpp
+// [[MIGRATION: Dual-write]] Remove after 2 cycles
+tinode->field = value;  // v0
+bmeta->field = value;   // v1
+```
+
+---
+
+## 15. PERFORMANCE ANNOTATIONS
+
+### Rule: Mark Hot Path Functions
+
+```cpp
+// [[PERFORMANCE: HOT PATH]] - Millions of calls/sec
+// Constraints: No locks, no alloc, no syscalls
+void WriteHeader(MessageHeader* hdr);
+
+// [[PERFORMANCE: COLD PATH]] - Once per topic
+void CreateTopic(const char* name);
+```
+
+---
+
+## QUICK CHECKLIST
+
+### Before Modifying:
+- [ ] Read directory `README.md` if exists
+- [ ] Check `docs/memory-bank/activeContext.md`
+- [ ] Verify no false sharing if touching CXL
+- [ ] Check paper spec if implementing algorithm
+
+### Before Committing:
+- [ ] Run `pahole` on modified structs
+- [ ] Verify cache flushes after CXL writes
+- [ ] Update header documentation
+- [ ] Run build: `cd build && make -j$(nproc)`
+- [ ] Update `activeContext.md` if completing task
+
+---
+
+## EXAMPLE: COMPLIANT CODE
+
+```cpp
+// FILE: src/cxl_manager/buffer_allocator.h
+
+namespace Embarcadero {
+
+/**
+ * @brief Allocates cache-line aligned CXL buffers
+ *
+ * @threading Concurrent calls from receiver thread pool
+ * @ownership Caller owns until ReleaseBuffer()
+ * @alignment Returns 64B-aligned pointers
+ * @paper_ref Paper §3.1 - Receiver allocation
+ *
+ * Performance: HOT PATH (millions/sec)
+ * Constraints: Lock-free, O(1), no syscalls
+ */
+class BufferAllocator {
+public:
+    /**
+     * @param size Bytes (rounded to 64B)
+     * @return Buffer pointer, nullptr if exhausted
+     * @threading Concurrent-safe
+     */
+    void* Allocate(size_t size);  // [[PERF: <100ns p50]]
+
+    void Release(void* ptr);
+
+private:
+    std::atomic<uint64_t> offset_;  // [[threading: atomic]]
+    void* pool_;                    // [[threading: read-only after init]]
+};
+
+} // namespace Embarcadero
+```
+
+---
+
+**Last Updated:** 2026-01-24
+**See Also:** `docs/memory-bank/` for project context

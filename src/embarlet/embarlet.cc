@@ -2,6 +2,7 @@
 #include <thread>
 #include <functional>
 #include <iostream>
+#include <fstream>
 
 // System includes
 #include <fcntl.h>
@@ -115,6 +116,18 @@ void SignalScriptReady() {
 		}
 	} else {
 		VLOG(1) << "Failed to open script_signal_pipe: " << strerror(errno);
+	}
+
+	// Also write a ready file for scripts to poll (more robust than named pipes)
+	// File is named with PID to avoid conflicts between multiple test runs
+	std::string ready_file = "/tmp/embarlet_" + std::to_string(getpid()) + "_ready";
+	std::ofstream ready_stream(ready_file);
+	if (ready_stream.is_open()) {
+		ready_stream << "ready\n";
+		ready_stream.close();
+		VLOG(1) << "Wrote readiness signal to " << ready_file;
+	} else {
+		LOG(WARNING) << "Failed to write readiness signal file: " << ready_file;
 	}
 }
 

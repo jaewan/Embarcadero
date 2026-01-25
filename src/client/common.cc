@@ -150,6 +150,12 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
         return -1;
     }
 
+    // Enable TCP_QUICKACK for low-latency ACKs
+    if (setsockopt(sock, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) != 0) {
+        LOG(WARNING) << "setsockopt(TCP_QUICKACK) failed: " << strerror(errno);
+        // Non-fatal, continue
+    }
+
     // Configure buffer size based on send/receive mode
     if (send) {
         // OPTIMIZATION: Increase send buffer to match receive buffer for better throughput

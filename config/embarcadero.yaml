@@ -31,6 +31,8 @@ embarcadero:
     num_disks: 2                 # Number of disks for storage
     max_topics: 32               # Maximum number of topics
     topic_name_size: 31          # Maximum topic name length
+    use_new_bmeta: true          # Enable dual-write to BrokerMetadata (Bmeta)
+                              # Set to false to disable dual-write pattern during migration testing
 
   # Network configuration
   network:

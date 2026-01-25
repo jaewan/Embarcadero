@@ -1,7 +1,27 @@
-# Technical Specification: Embarcadero Implementation
+# Technical Specification: Embarcadero Reference Design
 
 **Source:** NSDI '26 Paper
-**Constraint Level:** CRITICAL (Must be strictly followed)
+**Authority:** Reference design - Check `spec_deviation.md` FIRST for approved improvements
+**Usage:** Follow this IF AND ONLY IF no deviation documented in `spec_deviation.md`
+
+---
+
+## ⚠️ IMPORTANT: Specification Hierarchy
+
+```
+1. spec_deviation.md (approved improvements) - CHECK THIS FIRST
+   ↓
+2. paper_spec.md (THIS FILE) - Reference design
+   ↓
+3. Engineering judgment - Document as deviation proposal
+```
+
+**If spec_deviation.md documents a different approach, that approach is the source of truth.**
+
+This file preserves the paper's original design as a reference point for:
+- Understanding the baseline architecture
+- Comparing deviations against the reference
+- Justifying why deviations are better
 
 ---
 

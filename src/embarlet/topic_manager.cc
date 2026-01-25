@@ -139,6 +139,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		InitializeTInodeOffsets(tinode, segment_metadata, batch_headers_region, cxl_addr);
 
 		// Create the topic
+		// [[DEVIATION_004]] - Using TInode.offset_entry instead of separate Bmeta region
 		topics_[topic] = std::make_unique<Topic>(
 				[this]() { return cxl_manager_.GetNewSegment(); },
 				[this]() { return get_num_brokers_callback_(); },
@@ -255,6 +256,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		}
 
 		// Create the topic
+		// [[DEVIATION_004]] - Using TInode.offset_entry instead of separate Bmeta region
 		topics_[topic] = std::make_unique<Topic>(
 				[this]() { return cxl_manager_.GetNewSegment(); },
 				[this]() { return get_num_brokers_callback_(); },

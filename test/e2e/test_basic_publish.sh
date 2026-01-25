@@ -115,6 +115,28 @@ wait_for_log_message() {
     return 1
 }
 
+wait_for_ready_file() {
+    local pid=$1
+    local timeout=$2
+    local start=$(date +%s)
+    local ready_file="/tmp/embarlet_${pid}_ready"
+
+    log_info "Waiting for ready signal from PID $pid (timeout: ${timeout}s)..."
+
+    while [ $(($(date +%s) - start)) -lt $timeout ]; do
+        if [ -f "$ready_file" ]; then
+            local elapsed=$(($(date +%s) - start))
+            log_info "Broker PID $pid ready after ${elapsed}s"
+            rm -f "$ready_file"  # Clean up signal file
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    log_error "Broker PID $pid failed to signal readiness in ${timeout}s"
+    return 1
+}
+
 check_log_for_errors() {
     local log_file=$1
     local component=$2
@@ -148,8 +170,9 @@ setup() {
     assert_file_exists "$CONFIG_DIR/embarcadero.yaml"
     assert_file_exists "$CONFIG_DIR/client.yaml"
 
-    # Clean up any stale processes
+    # Clean up any stale processes and ready signal files
     pkill -f "embarlet" 2>/dev/null || true
+    rm -f /tmp/embarlet_*_ready 2>/dev/null || true
     sleep 1
 
     # Enable hugepages
@@ -173,15 +196,13 @@ start_brokers() {
     BROKER_PIDS+=($head_pid)
     log_info "Head broker started with PID $head_pid"
 
-    # Wait for head broker to be ready (up to 90 seconds for 64GB CXL)
-    log_info "Waiting for head broker initialization (this may take 60-90s for 64GB CXL)..."
-    if ! wait_for_log_message "broker_0.log" "Ready to go" 90; then
+    # Wait for head broker to signal readiness (uses file-based polling)
+    # Timeout is generous to handle large CXL allocations (up to 120s for 64GB)
+    if ! wait_for_ready_file "$head_pid" 120; then
         log_error "Head broker failed to initialize"
         cat broker_0.log
         return 1
     fi
-
-    log_info "Head broker ready"
 
     # Verify head broker is still running
     if ! assert_process_running "$head_pid" "Head broker"; then
@@ -200,11 +221,9 @@ start_brokers() {
         BROKER_PIDS+=($broker_pid)
         log_info "Broker $i started with PID $broker_pid"
 
-        # Wait for registration
-        sleep 3
-
-        # Check if broker registered successfully
-        if ! wait_for_log_message "broker_$i.log" "Ready to go" 90; then
+        # Wait for broker to signal readiness
+        # Follower brokers should be much faster (no CXL allocation)
+        if ! wait_for_ready_file "$broker_pid" 30; then
             log_error "Broker $i failed to initialize"
             cat "broker_$i.log"
             return 1
@@ -216,8 +235,6 @@ start_brokers() {
             cat "broker_$i.log"
             return 1
         fi
-
-        log_info "Broker $i ready"
     done
 
     # Final cluster health check

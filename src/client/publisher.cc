@@ -107,7 +107,7 @@ void Publisher::Init(int ack_level) {
 
 	// Wait for connection to be established
 	while (!connected_) {
-		std::this_thread::yield();
+		Embarcadero::CXL::cpu_pause();
 	}
 
 	// Initialize Corfu sequencer if needed
@@ -179,8 +179,19 @@ void Publisher::Poll(size_t n) {
 	pubQue_.ReturnReads();
 
 	// Wait for all messages to be queued
+	// Use periodic spin-then-yield pattern for efficient polling
+	// Spin for 1ms blocks, then yield once to reduce CPU waste while maintaining low latency
+	constexpr auto SPIN_DURATION = std::chrono::milliseconds(1);
 	while (client_order_ < n) {
-		std::this_thread::yield();
+		auto spin_start = std::chrono::steady_clock::now();
+		// Spin block: high-frequency polling for 1ms
+		while (std::chrono::steady_clock::now() - spin_start < SPIN_DURATION && client_order_ < n) {
+			Embarcadero::CXL::cpu_pause();
+		}
+		// Yield once after spin to reduce CPU waste
+		if (client_order_ < n) {
+			std::this_thread::yield();
+		}
 	}
 
 	// All messages queued, waiting for transmission to complete
@@ -207,7 +218,7 @@ void Publisher::Poll(size_t n) {
 	// If acknowledgments are enabled, wait for all acks
 	if (ack_level_ >= 1) {
 		auto last_log_time = std::chrono::steady_clock::now();
-		// Waiting for acknowledgments
+		constexpr auto SPIN_DURATION = std::chrono::milliseconds(1);
 		while (ack_received_ < client_order_) {
 			auto now = std::chrono::steady_clock::now();
 			if(kill_brokers_){
@@ -220,7 +231,16 @@ void Publisher::Poll(size_t n) {
 				LOG(INFO) << "Waiting for acknowledgments, received " << ack_received_ << " out of " << client_order_;
 				last_log_time = now;
 			}
-			std::this_thread::yield();
+			
+			// Spin block: high-frequency polling for 1ms
+			auto spin_start = std::chrono::steady_clock::now();
+			while (std::chrono::steady_clock::now() - spin_start < SPIN_DURATION && ack_received_ < client_order_) {
+				Embarcadero::CXL::cpu_pause();
+			}
+			// Yield once after spin to reduce CPU waste
+			if (ack_received_ < client_order_) {
+				std::this_thread::yield();
+			}
 		}
 	}
 
@@ -354,6 +374,23 @@ void Publisher::EpollAckThread() {
 	// Disable Nagle's algorithm for better latency
 	if (setsockopt(server_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
 		LOG(ERROR) << "setsockopt(TCP_NODELAY) failed: " << strerror(errno);
+	}
+
+	// Enable TCP_QUICKACK for low-latency ACKs
+	if (setsockopt(server_sock, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) < 0) {
+		LOG(WARNING) << "setsockopt(TCP_QUICKACK) failed: " << strerror(errno);
+		// Non-fatal, continue
+	}
+
+	// Increase socket buffers for high-throughput (32MB)
+	const int buffer_size = 32 * 1024 * 1024;  // 32 MB
+	if (setsockopt(server_sock, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+		LOG(WARNING) << "setsockopt(SO_SNDBUF) failed: " << strerror(errno);
+		// Non-fatal, continue
+	}
+	if (setsockopt(server_sock, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+		LOG(WARNING) << "setsockopt(SO_RCVBUF) failed: " << strerror(errno);
+		// Non-fatal, continue
 	}
 
 	// Set up server address
@@ -764,11 +801,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			if (publish_finished_ || shutdown_) {
 			// PublishThread exiting
 				break;
-			} else {
-				// Short sleep to avoid busy waiting
-				std::this_thread::yield();
-				continue;
-			}
+		} else {
+			Embarcadero::CXL::cpu_pause();
+			continue;
+		}
 		}
 
 		batch_header->client_id = client_id_;

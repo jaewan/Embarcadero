@@ -1,7 +1,7 @@
 client:
   publisher:
     threads_per_broker: 4
-    buffer_size_mb: 768
+    buffer_size_mb: 256
     batch_size_kb: 2048
   
   subscriber:
