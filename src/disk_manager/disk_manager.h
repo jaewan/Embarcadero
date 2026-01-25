@@ -16,6 +16,12 @@ namespace Scalog{
 	class ScalogReplicationManager;
 }
 
+// Forward declarations for CXL data structures
+namespace Embarcadero {
+	struct BatchHeader;
+	struct TInode;
+}
+
 namespace Embarcadero{
 
 namespace fs = std::filesystem;
@@ -38,7 +44,7 @@ struct MemcpyRequest{
 class DiskManager{
 	public:
 		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory,
-								heartbeat_system::SequencerType sequencerType, size_t queueCapacity = 64);
+							heartbeat_system::SequencerType sequencerType, size_t queueCapacity = 64);
 		~DiskManager();
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
 		// Change this to get real-time num brokers
@@ -50,6 +56,14 @@ class DiskManager{
 		void CopyThread();
 		bool GetMessageAddr(TInode* tinode, int order, int broker_id, size_t &last_offset,
 			void* &last_addr, void* &messages, size_t &messages_size);
+		
+		// [[EXPLICIT_REPLICATION_STAGE4]] - Batch-based replication for EMBARCADERO sequencers
+		// Polls ordered batches from BatchHeader ring instead of message-based cursor
+		bool GetNextReplicationBatch(TInode* tinode, int broker_id, 
+			BatchHeader* &batch_ring_start, BatchHeader* &batch_ring_end,
+			BatchHeader* &current_batch, size_t &disk_offset,
+			void* &batch_payload, size_t &batch_payload_size, 
+			size_t &batch_start_logical_offset, size_t &batch_last_logical_offset);
 
 		std::vector<std::thread> threads_;
 		folly::MPMCQueue<std::optional<struct ReplicationRequest>> requestQueue_;

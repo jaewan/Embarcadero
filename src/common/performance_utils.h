@@ -19,6 +19,11 @@
 #include <xmmintrin.h>  // For _mm_pause
 #endif
 
+// Forward declaration for BlogMessageHeader (defined in cxl_datastructure.h)
+namespace Embarcadero {
+struct BlogMessageHeader;
+}
+
 namespace Embarcadero {
 
 // String interning pool for topic names to avoid repeated allocations
@@ -232,6 +237,86 @@ inline void store_fence() {
 #else
     __atomic_thread_fence(__ATOMIC_RELEASE);
 #endif
+}
+
+/**
+ * @brief Selective cache flush for BlogMessageHeader receiver region (bytes 0-15)
+ *
+ * @threading Thread-safe (CPU instruction, no synchronization needed)
+ * @ownership Does not take ownership of hdr (read-only parameter)
+ * @alignment Works on any BlogMessageHeader address
+ * @paper_ref Paper §2.B Table 4 - Receiver writes bytes 0-15 only
+ *
+ * @param hdr Pointer to BlogMessageHeader
+ *
+ * Flushes only the cache line containing bytes 0-15 (receiver region).
+ * This is more efficient than flushing the entire 64-byte header when only
+ * the receiver region has been modified.
+ *
+ * Performance: HOT PATH - Called after every message receive
+ * Usage: After writing size, received, ts fields
+ *
+ * Note: For BlogMessageHeader, bytes 0-15 are in the first cache line (bytes 0-63).
+ * All three regions (0-15, 16-31, 32-47) share the same cache line, so all three
+ * flush functions target the same cache line. The separate functions provide
+ * semantic clarity about which stage is flushing.
+ */
+inline void flush_blog_receiver_region(const BlogMessageHeader* hdr) {
+    // Bytes 0-15 are in the first cache line (bytes 0-63)
+    // Flush the cache line containing the header start
+    flush_cacheline(hdr);
+}
+
+/**
+ * @brief Selective cache flush for BlogMessageHeader delegation region (bytes 16-31)
+ *
+ * @threading Thread-safe (CPU instruction, no synchronization needed)
+ * @ownership Does not take ownership of hdr (read-only parameter)
+ * @alignment Works on any BlogMessageHeader address
+ * @paper_ref Paper §2.B Table 4 - Delegation writes bytes 16-31 only
+ *
+ * @param hdr Pointer to BlogMessageHeader
+ *
+ * Flushes only the cache line containing bytes 16-31 (delegation region).
+ * Bytes 16-31 are in the first cache line (bytes 0-63), so this flushes
+ * the same cache line as receiver region, but semantically indicates
+ * we're flushing the delegation fields.
+ *
+ * Performance: HOT PATH - Called after every message delegation
+ * Usage: After writing counter, flags, processed_ts fields
+ */
+inline void flush_blog_delegation_region(const BlogMessageHeader* hdr) {
+    // Bytes 16-31 are in the first cache line (bytes 0-63)
+    // Flush the cache line containing the header start
+    flush_cacheline(hdr);
+}
+
+/**
+ * @brief Selective cache flush for BlogMessageHeader sequencer region (bytes 32-47)
+ *
+ * @threading Thread-safe (CPU instruction, no synchronization needed)
+ * @ownership Does not take ownership of hdr (read-only parameter)
+ * @alignment Works on any BlogMessageHeader address
+ * @paper_ref Paper §2.B Table 4 - Sequencer writes bytes 32-47 only
+ *
+ * @param hdr Pointer to BlogMessageHeader
+ *
+ * Flushes only the cache line containing bytes 32-47 (sequencer region).
+ * Bytes 32-47 are in the first cache line (bytes 0-63), so this flushes
+ * the same cache line as receiver/delegation regions, but semantically indicates
+ * we're flushing the sequencer fields.
+ *
+ * Performance: HOT PATH - Called after every message ordering
+ * Usage: After writing total_order, ordered_ts fields
+ *
+ * Note: For BlogMessageHeader, all three regions (0-15, 16-31, 32-47) are in
+ * the same cache line, so all three flush functions target the same cache line.
+ * The separate functions provide semantic clarity about which stage is flushing.
+ */
+inline void flush_blog_sequencer_region(const BlogMessageHeader* hdr) {
+    // Bytes 32-47 are in the first cache line (bytes 0-63)
+    // Flush the cache line containing the header start
+    flush_cacheline(hdr);
 }
 
 /**

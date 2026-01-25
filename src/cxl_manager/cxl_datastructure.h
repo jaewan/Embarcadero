@@ -1,6 +1,10 @@
 #pragma once
 #include "common/config.h"
 #include <heartbeat.grpc.pb.h>
+#include <cstdlib>
+#include <string>
+#include <algorithm>
+#include <cctype>
 
 /* CXL memory layout
  *
@@ -206,7 +210,6 @@ namespace HeaderUtils {
 		}
 		
 		// Check if this is a MessageHeaderV2 (has version field at offset 0)
-		const MessageHeaderV2* v2_hdr = reinterpret_cast<const MessageHeaderV2*>(hdr);
 		// Version field is at offset 0, but we need to check if it's a valid version
 		uint16_t version_val = *reinterpret_cast<const uint16_t*>(hdr);
 		if (version_val == static_cast<uint16_t>(HeaderVersion::HEADER_V1) ||
@@ -294,6 +297,58 @@ namespace HeaderUtils {
 		v2_dest->client_id = client_id;
 		v2_dest->batch_seq = batch_seq;
 		v2_dest->_pad = 0;
+	}
+
+	/**
+	 * @brief Check if BlogMessageHeader should be used (feature flag)
+	 * @return true if BlogMessageHeader is enabled, false to use legacy MessageHeader
+	 * 
+	 * Currently checks environment variable EMBARCADERO_USE_BLOG_HEADER.
+	 * Future: Could check configuration file or compile-time flag.
+	 * 
+	 * Default: false (backward compatibility - use MessageHeader)
+	 */
+	inline bool ShouldUseBlogHeader() {
+		static bool cached = false;
+		static bool value = false;
+		if (!cached) {
+			const char* env_val = std::getenv("EMBARCADERO_USE_BLOG_HEADER");
+			if (env_val != nullptr) {
+				std::string val(env_val);
+				std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+				value = (val == "1" || val == "true" || val == "yes" || val == "on");
+			}
+			cached = true;
+		}
+		return value;
+	}
+
+	/**
+	 * @brief Initialize BlogMessageHeader receiver fields (bytes 0-15)
+	 * @param hdr Pointer to BlogMessageHeader
+	 * @param size Payload size in bytes
+	 * @param client_id Client identifier
+	 * @param batch_seq Batch sequence number
+	 * 
+	 * Sets receiver region fields and flushes cache line.
+	 * Must be called by receiver stage after allocating space and receiving payload.
+	 */
+	inline void InitBlogReceiverFields(BlogMessageHeader* hdr, uint32_t size,
+	                                   uint64_t client_id, uint32_t batch_seq) {
+		if (hdr == nullptr) return;
+
+		// Receiver fields (bytes 0-15)
+		hdr->size = size;
+		hdr->received = 1;  // Mark as received
+		// Note: ts will be set by receiver if timestamping is needed
+		// For now, leave as 0 (can be optimized later)
+
+		// Read-only metadata (bytes 48-63) - set at creation
+		hdr->client_id = client_id;
+		hdr->batch_seq = batch_seq;
+		hdr->_pad = 0;
+
+		// Delegation and sequencer fields remain 0 (will be set by respective stages)
 	}
 } // namespace HeaderUtils
 

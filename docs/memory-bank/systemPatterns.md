@@ -140,9 +140,10 @@ MessageHeader* poll_next_message(TInode* tinode, size_t broker) {
     volatile uint64_t ptr;
     do {
         // ✅ Busy-wait poll with cpu_pause (DEV-006)
-        ptr = __atomic_load_n(&tinode->offsets[broker].written_addr, __ATOMIC_ACQUIRE);
+        // Note: BrokerScannerWorker5 uses volatile reads (not atomic) - matches message_ordering.cc pattern
+        ptr = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
         CXL::cpu_pause();  // ✅ Better than yield() in hot paths
-    } while (ptr == last_read_ptr);
+    } while (ptr == 0);
 
     return (MessageHeader*)ptr;
 }

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <errno.h>
 #include <iostream>
+#include <chrono>
 
 #include "mimalloc.h"
 
@@ -14,6 +15,7 @@
 #include "scalog_replication_manager.h"
 #include "corfu_replication_manager.h"
 #include "../cxl_manager/cxl_datastructure.h"
+#include "../common/performance_utils.h"
 
 namespace Embarcadero{
 
@@ -248,59 +250,94 @@ namespace Embarcadero{
 
 		// Common variables for both memory and disk paths
 		size_t current_offset = 0; // Current write position within log_addr
-		size_t last_replicated_offset = 0; // Last offset successfully retrieved via GetMessageAddr
-		void* last_addr_ptr = nullptr; // Last address pointer from GetMessageAddr
-		void* messages = nullptr; // Buffer containing new messages
-		size_t messages_size = 0; // Size of new messages
 		int order = req.tinode->order;
 		TInode* replica_tinode = req.replica_tinode;
 		bool replicate_tinode = req.tinode->replicate_tinode;
 		size_t offset = 0;
 		size_t disk_offset = 0;
+		
+		// [[EXPLICIT_REPLICATION_STAGE4]] - Batch-based replication variables
+		BatchHeader* batch_ring_start = nullptr;
+		BatchHeader* batch_ring_end = nullptr;
+		BatchHeader* current_batch = nullptr;
+		void* batch_payload = nullptr;
+		size_t batch_payload_size = 0;
+		size_t batch_start_logical_offset = 0;
+		size_t batch_last_logical_offset = 0;
+		
+		// Periodic durability sync state
+		size_t bytes_since_sync = 0;
+		auto last_sync_time = std::chrono::steady_clock::now();
+		constexpr size_t kSyncBytesThreshold = 64 * 1024 * 1024; // 64 MiB
+		constexpr auto kSyncTimeThreshold = std::chrono::milliseconds(250); // 250 ms
 
 		while (!stop_threads_) {
-			// GetMessageAddr is not thread-safe, so it remains the serialization point
-			// for fetching messages from a specific primary broker (req.broker_id).
-			if (GetMessageAddr(req.tinode, order, req.broker_id, last_replicated_offset, last_addr_ptr, messages, messages_size)) {
-				if (messages_size > (1UL<<25)) {
-					size_t write_granularity = (1UL << 24); // 16 MiB chunks (adjust as needed)
-					size_t remaining = messages_size - write_granularity;
-					while(remaining){
-						MemcpyRequest req;
-						if(remaining >= write_granularity){
-							req.len = write_granularity;
-						}else{
-							req.len = remaining;
+			// [[EXPLICIT_REPLICATION_STAGE4]] - Use batch-based replication for all orders
+			// This works with ORDER=5 (batches) and older ORDER levels (message-based converted to batches)
+			if (GetNextReplicationBatch(req.tinode, req.broker_id,
+					batch_ring_start, batch_ring_end, current_batch, disk_offset,
+					batch_payload, batch_payload_size,
+					batch_start_logical_offset, batch_last_logical_offset)) {
+				
+				// Write batch payload to disk
+				if (batch_payload_size > 0) {
+					if(log_to_memory_){
+						memcpy((uint8_t*)log_addr + offset, batch_payload, batch_payload_size);
+						offset += batch_payload_size;
+						if (offset > log_capacity) offset = 0;
+					}else{
+						ssize_t written = pwrite(fd, batch_payload, batch_payload_size, disk_offset);
+						if (written <= 0) {
+							LOG(ERROR) << "pwrite failed for batch in broker " << req.broker_id << ": " << strerror(errno);
+							CXL::cpu_pause();
+							continue;
 						}
-						if(offset + req.len > log_capacity){
-							offset = 0;
-							//LOG(ERROR) << "Consider increasing replica log size message_size:" << messages_size;
+						bytes_since_sync += written;
+					}
+					disk_offset += batch_payload_size;
+				}
+				
+				// Check if periodic sync is needed
+				if (!log_to_memory_) {
+					auto now = std::chrono::steady_clock::now();
+					bool sync_needed = (bytes_since_sync >= kSyncBytesThreshold) ||
+					                   (now - last_sync_time >= kSyncTimeThreshold);
+					
+					if (sync_needed && bytes_since_sync > 0) {
+						if (fdatasync(fd) < 0) {
+							LOG(ERROR) << "fdatasync failed for broker " << req.broker_id << ": " << strerror(errno);
 						}
-						req.addr = (void*)((uint8_t*)log_addr + offset);
-						req.buf = (void*)((uint8_t*)messages + offset);
-						req.fd = fd;
-						req.offset = disk_offset;
-						copyQueue_.blockingWrite(req);
-
-						offset += req.len;
-						disk_offset += req.len;
-						messages_size -= req.len;
-						remaining -= req.len;
+						bytes_since_sync = 0;
+						last_sync_time = now;
 					}
 				}
-				if(log_to_memory_){
-					memcpy((uint8_t*)log_addr, messages, messages_size);
-				}else{
-					pwrite(fd, messages, disk_offset, messages_size);
-				}
-				offset = 0;
-				disk_offset += messages_size;
+				
+				// Update replication_done to signal ACK level 2
+				// [[EXPLICIT_REPLICATION_STAGE4]] - Flush after replication_done update
 				if(replicate_tinode){
-					replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = last_replicated_offset;
+					replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
 				}
-				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = last_replicated_offset;
+				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
+				
+				// Flush the updated replication_done so other hosts (ACK thread) can observe it under non-coherent CXL
+				const void* rep_done_addr = reinterpret_cast<const void*>(
+					const_cast<const int*>(&req.tinode->offsets[broker_id_].replication_done[req.broker_id]));
+				CXL::flush_cacheline(rep_done_addr);
+				CXL::store_fence();
+				
+				VLOG(3) << "[ReplicationThread B" << req.broker_id << "]: Replicated batch, last_offset=" 
+						<< batch_last_logical_offset << ", disk_offset=" << disk_offset;
+			} else {
+				CXL::cpu_pause();
 			}
 		} // End while(!stop_threads_)
+		
+		// Final sync if needed
+		if (!log_to_memory_ && bytes_since_sync > 0) {
+			if (fdatasync(fd) < 0) {
+				LOG(WARNING) << "Final fdatasync failed for broker " << req.broker_id << ": " << strerror(errno);
+			}
+		}
 
 		// --- Cleanup ---
 		VLOG(1) << "[ReplicateThread " << req.broker_id << "]: Stopping replication loop.";
@@ -328,6 +365,92 @@ namespace Embarcadero{
 		// Decrement counters (ensure this happens exactly once per thread exit)
 		thread_count_.fetch_sub(1);
 		num_active_threads_.fetch_sub(1);
+	}
+
+	/**
+	 * @brief Get next batch to replicate from CXL BatchHeader ring
+	 * 
+	 * [[EXPLICIT_REPLICATION_STAGE4]] - Batch-based replication
+	 * Polls the BatchHeader ring for ordered batches (ordered == 1)
+	 * Returns batch metadata and payload location in CXL
+	 * 
+	 * @threading Called by single ReplicateThread per primary broker
+	 * @ownership batch_ring_start/end allocated by GetNewBatchHeaderLog(), caller manages cursor
+	 * @alignment BatchHeader is 64-byte aligned
+	 * @paper_ref Paper §3.4 - Stage 4: Replication threads poll ordered batches
+	 * 
+	 * @return true if valid ordered batch found, false if no batch ready or cursor exhausted
+	 */
+	bool DiskManager::GetNextReplicationBatch(TInode* tinode, int broker_id,
+			BatchHeader* &batch_ring_start, BatchHeader* &batch_ring_end,
+			BatchHeader* &current_batch, size_t &disk_offset,
+			void* &batch_payload, size_t &batch_payload_size,
+			size_t &batch_start_logical_offset, size_t &batch_last_logical_offset) {
+		
+		// Initialize ring pointers on first call
+		if (batch_ring_start == nullptr) {
+			batch_ring_start = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(cxl_addr_) + tinode->offsets[broker_id].batch_headers_offset);
+			batch_ring_end = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(batch_ring_start) + BATCHHEADERS_SIZE);
+			current_batch = batch_ring_start;
+			disk_offset = 0;
+			VLOG(2) << "[GetNextReplicationBatch B" << broker_id << "]: Initialized ring at offset " 
+					<< tinode->offsets[broker_id].batch_headers_offset;
+		}
+		
+		// Scan for next ordered batch (match BrokerScannerWorker5 pattern)
+		// Use a reasonable upper bound to prevent infinite loops
+		size_t MAX_SCAN_ATTEMPTS = 10000;  // Up to ~10k batches per scan
+		for (size_t i = 0; i < MAX_SCAN_ATTEMPTS; ++i) {
+			// Read batch header fields as volatile (sender writes from remote broker)
+			volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->num_msg;
+			volatile uint32_t ordered_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->ordered;
+			volatile size_t total_size_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->total_size;
+			volatile size_t log_idx_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->log_idx;
+			volatile size_t start_logical_offset_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->start_logical_offset;
+			
+			// Bounds validation (match BrokerScannerWorker5 guards)
+			constexpr uint32_t MAX_REASONABLE_NUM_MSG = 100000;
+			bool batch_ready = (num_msg_check != 0 && 
+			                   ordered_check == 1 && 
+			                   total_size_check > 0 && 
+			                   log_idx_check > 0 && 
+			                   num_msg_check <= MAX_REASONABLE_NUM_MSG);
+			
+			if (batch_ready) {
+				// Batch is ordered and valid
+				batch_payload = reinterpret_cast<uint8_t*>(cxl_addr_) + log_idx_check;
+				batch_payload_size = total_size_check;
+				batch_start_logical_offset = start_logical_offset_check;
+				batch_last_logical_offset = start_logical_offset_check + num_msg_check - 1;
+				
+				VLOG(3) << "[GetNextReplicationBatch B" << broker_id << "]: Found ordered batch: "
+						<< "num_msg=" << num_msg_check << ", log_idx=" << log_idx_check 
+						<< ", payload_size=" << batch_payload_size
+						<< ", start_offset=" << batch_start_logical_offset;
+				
+				// Advance cursor for next iteration
+				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+				if (next_batch >= batch_ring_end) {
+					next_batch = batch_ring_start;
+				}
+				current_batch = next_batch;
+				return true;
+			}
+			
+			// Current batch not ready, advance and try next
+			BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+			if (next_batch >= batch_ring_end) {
+				next_batch = batch_ring_start;
+			}
+			current_batch = next_batch;
+		}
+		
+		// No ordered batch found in scan range
+		return false;
 	}
 
 	//This is a copy of Topic::GetMessageAddr changed to use tinode instead of topic variables

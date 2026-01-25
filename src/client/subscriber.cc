@@ -946,7 +946,8 @@ void ConnectionBuffers::release_read_buffer(BufferState* acquired_buffer) {
 struct BatchMetadata {
 	size_t batch_total_order;  // Starting total_order for this batch
 	uint32_t num_messages;     // Number of messages in this batch
-	uint32_t reserved;         // Padding for alignment
+	uint16_t header_version;   // Message header format version (1=MessageHeader, 2=BlogMessageHeader)
+	uint16_t flags;            // Reserved for future flags
 };
 
 // Per-connection state for tracking batch metadata parsing
@@ -986,7 +987,7 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, int fd) 
 			BatchMetadata* potential_metadata = reinterpret_cast<BatchMetadata*>(data + current_pos);
 			
 			// Validate batch metadata
-			if (potential_metadata->reserved == 0 && 
+			if (potential_metadata->header_version >= 1 && potential_metadata->header_version <= 2 &&
 			    potential_metadata->num_messages > 0 && 
 			    potential_metadata->num_messages <= 10000 &&
 			    potential_metadata->batch_total_order < 100000000) {
@@ -1000,40 +1001,84 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, int fd) 
 				
 				VLOG(3) << "ProcessSequencer5Data: Found batch metadata, total_order=" 
 				        << potential_metadata->batch_total_order << ", num_messages=" 
-				        << potential_metadata->num_messages << ", fd=" << fd;
+				        << potential_metadata->num_messages << ", header_version=" 
+				        << potential_metadata->header_version << ", fd=" << fd;
 				
 				current_pos += sizeof(BatchMetadata);
 				continue;
 			}
 		}
 		
-		// Process messages
+		// Process messages (v1 MessageHeader or v2 BlogMessageHeader)
 		if (current_pos + sizeof(Embarcadero::MessageHeader) <= data_size) {
-			Embarcadero::MessageHeader* header = 
-				reinterpret_cast<Embarcadero::MessageHeader*>(data + current_pos);
+			// For v2, BlogMessageHeader is also 64 bytes, so this size check is sufficient
+			void* msg_ptr = data + current_pos;
+			bool is_v2_header = (batch_state.pending_metadata.header_version == 2);
 			
-			// Validate message header
-			if (header->paddedSize > 0 && header->paddedSize <= 1024*1024 &&
-			    current_pos + header->paddedSize <= data_size) {
+			if (is_v2_header) {
+				// [[BLOG_HEADER: Parse BlogMessageHeader]]
+				Embarcadero::BlogMessageHeader* v2_hdr = 
+					reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg_ptr);
 				
-				// Assign total_order from batch metadata
-				if (batch_state.has_pending_metadata && header->total_order == 0) {
-					header->total_order = batch_state.next_message_order_in_batch++;
-					batch_state.current_batch_messages_processed++;
-					
-					if (batch_state.current_batch_messages_processed >= 
-					    batch_state.pending_metadata.num_messages) {
-						batch_state.has_pending_metadata = false;
-					}
-					
-				VLOG(5) << "ProcessSequencer5Data: Assigned total_order=" << header->total_order 
-				        << " to message, fd=" << fd;
+				// Compute padded size from v2 fields
+				size_t payload_size = v2_hdr->size;
+				size_t total_msg_size = sizeof(Embarcadero::BlogMessageHeader) + payload_size;
+				// Align to 64-byte boundary
+				if (total_msg_size % 64 != 0) {
+					total_msg_size += 64 - (total_msg_size % 64);
 				}
 				
-				current_pos += header->paddedSize;
+				// Validate message header
+				if (payload_size > 0 && payload_size <= 1024*1024 &&
+				    current_pos + total_msg_size <= data_size) {
+					
+					// Assign total_order from batch metadata
+					if (batch_state.has_pending_metadata && v2_hdr->total_order == 0) {
+						v2_hdr->total_order = batch_state.next_message_order_in_batch++;
+						batch_state.current_batch_messages_processed++;
+						
+						if (batch_state.current_batch_messages_processed >= 
+						    batch_state.pending_metadata.num_messages) {
+							batch_state.has_pending_metadata = false;
+						}
+						
+						VLOG(5) << "ProcessSequencer5Data: Assigned total_order=" << v2_hdr->total_order 
+						        << " to BlogMessageHeader, fd=" << fd;
+					}
+					
+					current_pos += total_msg_size;
+				} else {
+					// Invalid message header, skip ahead
+					current_pos += 64;
+				}
 			} else {
-				// Invalid message header, skip ahead
-				current_pos += 64;
+				// [[LEGACY: Parse MessageHeader v1]]
+				Embarcadero::MessageHeader* v1_hdr = 
+					reinterpret_cast<Embarcadero::MessageHeader*>(msg_ptr);
+				
+				// Validate message header
+				if (v1_hdr->paddedSize > 0 && v1_hdr->paddedSize <= 1024*1024 &&
+				    current_pos + v1_hdr->paddedSize <= data_size) {
+					
+					// Assign total_order from batch metadata
+					if (batch_state.has_pending_metadata && v1_hdr->total_order == 0) {
+						v1_hdr->total_order = batch_state.next_message_order_in_batch++;
+						batch_state.current_batch_messages_processed++;
+						
+						if (batch_state.current_batch_messages_processed >= 
+						    batch_state.pending_metadata.num_messages) {
+							batch_state.has_pending_metadata = false;
+						}
+						
+						VLOG(5) << "ProcessSequencer5Data: Assigned total_order=" << v1_hdr->total_order 
+						        << " to MessageHeader, fd=" << fd;
+					}
+					
+					current_pos += v1_hdr->paddedSize;
+				} else {
+					// Invalid message header, skip ahead
+					current_pos += 64;
+				}
 			}
 		} else {
 			// Not enough data for a complete message header
@@ -1098,20 +1143,12 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
             
             // Parse new messages from this connection
             while (parse_offset + sizeof(Embarcadero::MessageHeader) <= write_offset) {
-                Embarcadero::MessageHeader* header = reinterpret_cast<Embarcadero::MessageHeader*>(
-                    static_cast<uint8_t*>(buffer_start) + parse_offset);
+                // For v2 BlogMessageHeader, we need to know the header version from batch metadata
+                // Both v1 and v2 headers are 64 bytes, so initial size check is OK for both
                 
-                // Wait for paddedSize to be written
-                while (header->paddedSize == 0) {
-                    std::this_thread::yield();
-                }
-                
-                if (parse_offset + header->paddedSize > write_offset) {
-                    break; // Incomplete message
-                }
-                
-                // Create non-volatile copy to avoid compiler issues
-                size_t current_total_order = header->total_order;
+                bool is_v2_header = false;
+                size_t msg_total_size = 0;
+                size_t current_total_order = 0;
                 
 				// For Sequencer 5: Process batch metadata to reconstruct message ordering
 				// Messages arrive with batch metadata that tells us the starting total_order
@@ -1129,17 +1166,19 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
 							batch_state.has_pending_metadata = true;
 							batch_state.current_batch_messages_processed = 0;
 							batch_state.next_message_order_in_batch = metadata->batch_total_order;
+							is_v2_header = (metadata->header_version == 2);
 							parse_offset += sizeof(BatchMetadata);
 							VLOG(4) << "ConsumeBatchAware: Read batch metadata, total_order=" 
-							        << metadata->batch_total_order << ", num_messages=" << metadata->num_messages;
+							        << metadata->batch_total_order << ", num_messages=" << metadata->num_messages
+							        << ", header_version=" << metadata->header_version;
 							continue; // Go to next iteration to read actual messages
 						}
 					}
 					
 					// Assign total_order based on batch metadata
+					is_v2_header = (batch_state.pending_metadata.header_version == 2);
 					if (batch_state.has_pending_metadata) {
 						current_total_order = batch_state.next_message_order_in_batch++;
-					header->total_order = current_total_order;
 						batch_state.current_batch_messages_processed++;
 						
 						// Check if we've processed all messages in this batch
@@ -1159,16 +1198,55 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
 					}
 				} else {
 					// Non-Sequencer 5: use existing total_order from message header
-					current_total_order = header->total_order;
+					Embarcadero::MessageHeader* v1_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(
+						static_cast<uint8_t*>(buffer_start) + parse_offset);
+					current_total_order = v1_hdr->total_order;
+					msg_total_size = v1_hdr->paddedSize;
 				}
+				
+                // Compute message size based on header version
+                if (is_v2_header) {
+                    // [[BLOG_HEADER: Parse v2 header]]
+                    Embarcadero::BlogMessageHeader* v2_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(
+                        static_cast<uint8_t*>(buffer_start) + parse_offset);
+                    
+                    // Wait for received flag
+                    while (v2_hdr->received == 0) {
+                        std::this_thread::yield();
+                    }
+                    
+                    // Compute total size from v2 fields
+                    size_t payload_size = v2_hdr->size;
+                    msg_total_size = sizeof(Embarcadero::BlogMessageHeader) + payload_size;
+                    if (msg_total_size % 64 != 0) {
+                        msg_total_size += 64 - (msg_total_size % 64);
+                    }
+                } else {
+                    // [[LEGACY: Parse v1 header]]
+                    Embarcadero::MessageHeader* v1_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(
+                        static_cast<uint8_t*>(buffer_start) + parse_offset);
+                    
+                    // Wait for paddedSize to be written
+                    while (v1_hdr->paddedSize == 0) {
+                        std::this_thread::yield();
+                    }
+                    
+                    msg_total_size = v1_hdr->paddedSize;
+                }
+                
+                if (parse_offset + msg_total_size > write_offset) {
+                    break; // Incomplete message
+                }
                 
                 // If this is the next expected message, return it immediately
                 if (current_total_order == next_expected_order) {
-                    parse_offset += header->paddedSize; // Advance parse offset
+                    parse_offset += msg_total_size; // Advance parse offset
                     next_expected_order++;
                     
-                    VLOG(5) << "ConsumeBatchAware: Found and returning message " << (current_total_order);
-                    return static_cast<void*>(header);
+                    VLOG(5) << "ConsumeBatchAware: Found and returning message " << (current_total_order) 
+                            << " (header_version=" << (is_v2_header ? 2 : 1) << ")";
+                    void* msg_ptr = static_cast<uint8_t*>(buffer_start) + parse_offset - msg_total_size;
+                    return msg_ptr;
                 }
                 
                 // If it's a future message within reasonable range, buffer it
@@ -1177,7 +1255,8 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                     
                     // Only buffer if we don't already have this message
                     if (pending_messages.find(current_total_order) == pending_messages.end()) {
-                        pending_messages[current_total_order] = static_cast<void*>(header);
+                        void* msg_ptr = static_cast<uint8_t*>(buffer_start) + parse_offset;
+                        pending_messages[current_total_order] = msg_ptr;
                         found_new_message = true;
                         VLOG(5) << "ConsumeBatchAware: Buffered future message " << current_total_order 
                                << " (expecting " << next_expected_order << ") from fd=" << fd;
@@ -1187,7 +1266,7 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                         if (next_it != pending_messages.end()) {
                             void* result = next_it->second;
                             pending_messages.erase(next_it);
-                            parse_offset += header->paddedSize; // Advance parse offset
+                            parse_offset += msg_total_size; // Advance parse offset
                             next_expected_order++;
                             VLOG(5) << "ConsumeBatchAware: Immediately returning buffered message " 
                                    << (next_expected_order - 1);
@@ -1196,7 +1275,7 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                     }
                 }
                 
-                parse_offset += header->paddedSize; // Always advance parse offset
+                parse_offset += msg_total_size; // Always advance parse offset
             }
             } // End buffer loop
         } // End connection loop

@@ -596,33 +596,96 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-		// Signal batch completion for ALL order levels
-		// This must be done AFTER all messages in the batch are received and marked complete
-		if (batch_header_location != nullptr) {
-			// For Sequencer 5, we only need to ensure the batch data is fully received
-			// We don't need to wait for individual message headers since Sequencer 5 works at batch level
-			TInode* tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
-			if (seq_type != EMBARCADERO || (tinode && tinode->order != 5)) {
-				// For Sequencer 4 and other modes: Ensure all message headers are properly initialized
-				MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
-				for (size_t i = 0; i < batch_header.num_msg; ++i) {
-					// Ensure paddedSize is set (this indicates message is complete)
-					while (first_msg->paddedSize == 0) {
-						std::this_thread::yield(); // Wait for message to be fully written
-					}
-					// Move to next message
-					first_msg = reinterpret_cast<MessageHeader*>(
-						reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
-					);
-				}
-			}
-			// For Sequencer 5, batch is complete once all data is received (to_read == 0)
-			// Now it's safe to mark batch as complete for ALL order levels
-			__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
-			VLOG(4) << "NetworkManager: Marked batch complete for " << batch_header.num_msg << " messages, client_id=" << batch_header.client_id << ", order_level=" << seq_type;
-		} else {
-			LOG(WARNING) << "NetworkManager: batch_header_location is null for batch with " << batch_header.num_msg << " messages, order_level=" << seq_type;
+	// [[BLOG_HEADER: Convert MessageHeader→BlogMessageHeader for ORDER=5]]
+	// After batch is fully received, convert in-place for ORDER=5 to enable new header format
+	TInode* tinode = nullptr;
+	bool should_convert_to_blog = false;
+	if (seq_type == EMBARCADERO) {
+		tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
+		if (tinode && tinode->order == 5 && HeaderUtils::ShouldUseBlogHeader()) {
+			should_convert_to_blog = true;
 		}
+	}
+
+	if (should_convert_to_blog && batch_header.num_msg > 0) {
+		// Convert messages from MessageHeader to BlogMessageHeader format in-place
+		MessageHeader* current_msg = reinterpret_cast<MessageHeader*>(buf);
+		size_t flush_count = 0;
+
+		for (size_t i = 0; i < batch_header.num_msg; ++i) {
+			// Validate message header
+			if (current_msg->paddedSize == 0 || current_msg->paddedSize > 1024 * 1024) {
+				LOG(WARNING) << "NetworkManager: Skipping message " << i << " with invalid paddedSize=" << current_msg->paddedSize;
+				break;
+			}
+
+			// Extract payload size (paddedSize includes header + padding)
+			size_t header_size = sizeof(MessageHeader);
+			size_t total_with_header = current_msg->paddedSize;
+			size_t payload_size = (total_with_header > header_size) ? (total_with_header - header_size) : 0;
+
+			// Rewrite header in-place as BlogMessageHeader
+			BlogMessageHeader* v2_hdr = reinterpret_cast<BlogMessageHeader*>(current_msg);
+			
+			// [[PERFORMANCE: Zero-initialize to avoid partial writes]]
+			memset(v2_hdr, 0, sizeof(BlogMessageHeader));
+
+			// Write receiver region (bytes 0-15)
+			v2_hdr->size = static_cast<uint32_t>(payload_size);
+			v2_hdr->received = 1;  // Mark as received
+			v2_hdr->ts = 0;        // Optional: can be set to rdtsc() if needed
+
+			// Write read-only metadata (bytes 48-63)
+			v2_hdr->client_id = batch_header.client_id;
+			v2_hdr->batch_seq = batch_header.batch_seq;
+			v2_hdr->_pad = 0;
+
+			// Delegation and sequencer fields remain 0 (will be set by respective stages or not needed for ORDER=5)
+
+			// Flush receiver region cacheline
+			CXL::flush_blog_receiver_region(v2_hdr);
+			flush_count++;
+
+			// Move to next message using the original padded size (which is still correct)
+			if (i < batch_header.num_msg - 1) {
+				current_msg = reinterpret_cast<MessageHeader*>(
+					reinterpret_cast<uint8_t*>(current_msg) + total_with_header
+				);
+			}
+		}
+
+		// Single fence for all message header flushes (DEV-005 pattern: flush-flush-…-fence)
+		CXL::store_fence();
+		VLOG(3) << "NetworkManager: Converted " << flush_count << " messages to BlogMessageHeader format for ORDER=5";
+	}
+
+	// Signal batch completion for ALL order levels
+	// This must be done AFTER all messages in the batch are received and marked complete
+	// and AFTER conversion to BlogMessageHeader (if applicable)
+	if (batch_header_location != nullptr) {
+		// For Sequencer 5 with BlogHeader: conversion already done above
+		// For Sequencer 5 without BlogHeader or other modes: Ensure message validation
+		if (seq_type != EMBARCADERO || (tinode && tinode->order != 5) || !should_convert_to_blog) {
+			// For Sequencer 4 and other modes: Ensure all message headers are properly initialized
+			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
+			for (size_t i = 0; i < batch_header.num_msg; ++i) {
+				// Ensure paddedSize is set (this indicates message is complete)
+				while (first_msg->paddedSize == 0) {
+					std::this_thread::yield(); // Wait for message to be fully written
+				}
+				// Move to next message
+				first_msg = reinterpret_cast<MessageHeader*>(
+					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
+				);
+			}
+		}
+		// For Sequencer 5, batch is complete once all data is received (to_read == 0)
+		// Now it's safe to mark batch as complete for ALL order levels
+		__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
+		VLOG(4) << "NetworkManager: Marked batch complete for " << batch_header.num_msg << " messages, client_id=" << batch_header.client_id << ", order_level=" << seq_type;
+	} else {
+		LOG(WARNING) << "NetworkManager: batch_header_location is null for batch with " << batch_header.num_msg << " messages, order_level=" << seq_type;
+	}
 
 		// Finalize batch processing
 		if (non_emb_seq_callback) {
@@ -737,8 +800,9 @@ void NetworkManager::SubscribeNetworkThread(
 	struct BatchMetadata {
 		size_t batch_total_order;  // Starting total_order for this batch
 		uint32_t num_messages;     // Number of messages in this batch
-		uint32_t reserved;         // Padding for alignment
-	} batch_meta = {0, 0, 0};
+		uint16_t header_version;   // Message header format version (1=MessageHeader, 2=BlogMessageHeader)
+		uint16_t flags;            // Reserved for future flags
+	} batch_meta = {0, 0, 2, 0};  // Initialize header_version=2 for BlogMessageHeader
 
 	// PERFORMANCE OPTIMIZATION: Cache state pointer to avoid repeated hash map lookups
 	std::unique_ptr<SubscriberState>* cached_state_ptr = nullptr;
