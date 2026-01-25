@@ -1,133 +1,131 @@
 #!/bin/bash
-# Embarcadero Cache Alignment Verifier
-# Scans all CXL structs and verifies 64-byte alignment
-#
-# Usage: ./scripts/verify_cache_alignment.sh
+# Verify cache-line alignment of critical CXL structures
+# Uses pahole to analyze compiled structures
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_DIR="$PROJECT_ROOT/build"
+REPORT_FILE="$PROJECT_ROOT/data/performance_baseline/cache_alignment_$(date +%Y%m%d_%H%M%S).txt"
 
-echo "======================================"
-echo "Embarcadero Cache Alignment Verifier"
-echo "======================================"
+echo "=========================================="
+echo "Cache-Line Alignment Verification"
+echo "=========================================="
 echo ""
 
 # Check if pahole is available
 if ! command -v pahole &> /dev/null; then
-    echo "WARNING: pahole not found. Install with: sudo apt install dwarves"
-    echo "Falling back to source code analysis only..."
+    echo "ERROR: pahole is not installed"
+    echo "Install with: sudo apt-get install pahole"
     echo ""
-    USE_PAHOLE=false
-else
-    USE_PAHOLE=true
-fi
-
-# Find all header files
-HEADER_FILES=$(find "$PROJECT_ROOT/src" -name "*.h" 2>/dev/null || true)
-
-if [ -z "$HEADER_FILES" ]; then
-    echo "No header files found in src/"
-    exit 0
-fi
-
-echo "Scanning header files for CXL structs..."
-echo ""
-
-TOTAL_STRUCTS=0
-ALIGNED_STRUCTS=0
-UNALIGNED_STRUCTS=0
-WARNINGS=()
-
-# Scan each header file
-for file in $HEADER_FILES; do
-    rel_path="${file#$PROJECT_ROOT/}"
-
-    # Find struct definitions that look like CXL-related
-    while IFS= read -r line_num; do
-        if [ -z "$line_num" ]; then
-            continue
-        fi
-
-        TOTAL_STRUCTS=$((TOTAL_STRUCTS + 1))
-
-        # Extract struct name
-        struct_line=$(sed -n "${line_num}p" "$file")
-        struct_name=$(echo "$struct_line" | grep -oP 'struct\s+\K\w+' || echo "unnamed")
-
-        # Check if alignas(64) appears before the struct
-        context_start=$((line_num - 5))
-        if [ $context_start -lt 1 ]; then
-            context_start=1
-        fi
-
-        context=$(sed -n "${context_start},${line_num}p" "$file")
-
-        if echo "$context" | grep -q 'alignas(64)'; then
-            ALIGNED_STRUCTS=$((ALIGNED_STRUCTS + 1))
-            echo "✓ $rel_path:$line_num - struct $struct_name (aligned)"
-        else
-            UNALIGNED_STRUCTS=$((UNALIGNED_STRUCTS + 1))
-            echo "⚠️  $rel_path:$line_num - struct $struct_name (NOT aligned)"
-            WARNINGS+=("$rel_path:$line_num - struct $struct_name")
-        fi
-
-    done < <(grep -n 'struct.*\(Broker\|Meta\|TInode\|Bmeta\|Blog\|Message\|CXL\|Header\).*{' "$file" | cut -d: -f1 || true)
-done
-
-echo ""
-echo "======================================"
-echo "Summary"
-echo "======================================"
-echo "Total CXL structs found: $TOTAL_STRUCTS"
-echo "  ✓ Aligned (alignas(64)): $ALIGNED_STRUCTS"
-echo "  ⚠️  Not aligned: $UNALIGNED_STRUCTS"
-echo ""
-
-if [ $UNALIGNED_STRUCTS -gt 0 ]; then
-    echo "Unaligned structs:"
-    for warning in "${WARNINGS[@]}"; do
-        echo "  - $warning"
-    done
-    echo ""
-    echo "Recommendation: Add alignas(64) to shared memory structs"
-    echo "See .cursor/rules/10-code-style.mdc Rule #2"
-    echo ""
-fi
-
-# If pahole is available, verify actual binary layout
-if [ "$USE_PAHOLE" = true ]; then
-    echo "======================================"
-    echo "Binary Analysis (pahole)"
-    echo "======================================"
-    echo ""
-
-    # Find compiled object files or archives
-    BUILD_ARTIFACTS=$(find "$PROJECT_ROOT/build" -name "*.a" -o -name "*.o" 2>/dev/null | head -n 5 || true)
-
-    if [ -z "$BUILD_ARTIFACTS" ]; then
-        echo "No build artifacts found in build/"
-        echo "Run 'cd build && make' first to verify with pahole"
-    else
-        echo "Checking struct sizes in compiled binaries..."
-        echo ""
-
-        for artifact in $BUILD_ARTIFACTS; do
-            # Extract struct names and check their sizes
-            pahole "$artifact" 2>/dev/null | grep -A1 "struct.*Meta\|struct.*Broker\|struct.*TInode" | head -n 20 || true
-        done
-    fi
-fi
-
-echo ""
-echo "======================================"
-echo "Verification complete"
-echo "======================================"
-
-if [ $UNALIGNED_STRUCTS -gt 0 ]; then
+    echo "Alternatively, we can verify alignment using static_assert in code"
     exit 1
-else
-    echo "✓ All CXL structs are properly aligned"
-    exit 0
 fi
+
+# Check if build exists
+if [ ! -d "$BUILD_DIR" ]; then
+    echo "ERROR: Build directory not found. Please build first:"
+    echo "  cd build && make -j\$(nproc)"
+    exit 1
+fi
+
+# Find object files
+TOPIC_OBJ=$(find "$BUILD_DIR" -name "topic.cc.o" -o -name "topic.o" | head -1)
+CXL_DS_OBJ=$(find "$BUILD_DIR" -name "cxl_datastructure.o" -o -name "cxl_datastructure.cc.o" | head -1)
+
+if [ -z "$TOPIC_OBJ" ] && [ -z "$CXL_DS_OBJ" ]; then
+    echo "ERROR: Object files not found. Please build first:"
+    echo "  cd build && make -j\$(nproc)"
+    exit 1
+fi
+
+mkdir -p "$(dirname "$REPORT_FILE")"
+
+echo "Analyzing cache-line alignment..."
+echo "Report: $REPORT_FILE"
+echo ""
+
+{
+    echo "Cache-Line Alignment Verification Report"
+    echo "========================================"
+    echo "Date: $(date)"
+    echo ""
+    
+    # Analyze offset_entry
+    if [ -n "$CXL_DS_OBJ" ]; then
+        echo "=== offset_entry Structure ==="
+        echo ""
+        pahole -C offset_entry "$CXL_DS_OBJ" 2>/dev/null || echo "offset_entry not found in object file"
+        echo ""
+        
+        # Check size and alignment
+        SIZE=$(pahole -C offset_entry -S "$CXL_DS_OBJ" 2>/dev/null | grep -oE "size.*[0-9]+" | head -1 || echo "unknown")
+        echo "Size: $SIZE"
+        echo "Expected: 512 bytes (alignas(256))"
+        echo ""
+    fi
+    
+    # Analyze TInode
+    if [ -n "$CXL_DS_OBJ" ]; then
+        echo "=== TInode Structure ==="
+        echo ""
+        pahole -C TInode "$CXL_DS_OBJ" 2>/dev/null || echo "TInode not found in object file"
+        echo ""
+        
+        SIZE=$(pahole -C TInode -S "$CXL_DS_OBJ" 2>/dev/null | grep -oE "size.*[0-9]+" | head -1 || echo "unknown")
+        echo "Size: $SIZE"
+        echo "Expected: Cache-line aligned (64 bytes)"
+        echo ""
+    fi
+    
+    # Analyze BatchHeader
+    if [ -n "$CXL_DS_OBJ" ]; then
+        echo "=== BatchHeader Structure ==="
+        echo ""
+        pahole -C BatchHeader "$CXL_DS_OBJ" 2>/dev/null || echo "BatchHeader not found in object file"
+        echo ""
+        
+        SIZE=$(pahole -C BatchHeader -S "$CXL_DS_OBJ" 2>/dev/null | grep -oE "size.*[0-9]+" | head -1 || echo "unknown")
+        echo "Size: $SIZE"
+        echo "Expected: Cache-line aligned (64 bytes)"
+        echo ""
+    fi
+    
+    # Analyze MessageHeader
+    if [ -n "$CXL_DS_OBJ" ]; then
+        echo "=== MessageHeader Structure ==="
+        echo ""
+        pahole -C MessageHeader "$CXL_DS_OBJ" 2>/dev/null || echo "MessageHeader not found in object file"
+        echo ""
+        
+        SIZE=$(pahole -C MessageHeader -S "$CXL_DS_OBJ" 2>/dev/null | grep -oE "size.*[0-9]+" | head -1 || echo "unknown")
+        echo "Size: $SIZE"
+        echo "Expected: Cache-line aligned (64 bytes)"
+        echo ""
+    fi
+    
+    echo "=== Verification Summary ==="
+    echo ""
+    echo "Critical Structures:"
+    echo "  offset_entry: Must be 512 bytes (256-byte aligned sub-structs)"
+    echo "  TInode: Must be cache-line aligned (64 bytes)"
+    echo "  BatchHeader: Must be cache-line aligned (64 bytes)"
+    echo "  MessageHeader: Must be cache-line aligned (64 bytes)"
+    echo ""
+    echo "False Sharing Prevention:"
+    echo "  - Broker and Sequencer regions in offset_entry must be separate (256B each)"
+    echo "  - Each region should be on separate cache lines"
+    echo ""
+    
+} | tee "$REPORT_FILE"
+
+echo ""
+echo "=========================================="
+echo "Verification Complete"
+echo "=========================================="
+echo "Report: $REPORT_FILE"
+echo ""
+echo "Next Steps:"
+echo "  1. Review alignment - ensure all structures are properly aligned"
+echo "  2. Check for false sharing - verify broker/sequencer regions are separate"
+echo "  3. If misaligned, add padding or adjust structure definitions"

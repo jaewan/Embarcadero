@@ -315,9 +315,14 @@ void Topic::DelegationThread() {
 			VLOG(3) << "DelegationThread: Processed batch " << processed_batches 
 			        << " with " << current_batch->num_msg << " messages";
 
-				// Move to next batch
-				current_batch = reinterpret_cast<BatchHeader*>(
+				// [[DEV-007: Cache Prefetching]] - Prefetch next batch header
+				// Reduces cache miss latency by prefetching data before it's needed
+				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
 					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+				CXL::prefetch_cacheline(next_batch, 3);  // High locality (will access soon)
+
+				// Move to next batch
+				current_batch = next_batch;
 				continue; // Skip the old message-by-message processing
 			}
 		} else if (current_batch && current_batch->num_msg > 0) {
@@ -1372,6 +1377,12 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		AssignOrder5(header_to_process, start_total_order, header_for_sub);
 		total_batches_processed++;
 
+		// [[DEV-007: Cache Prefetching]] - Prefetch next batch header while processing current
+		// Reduces cache miss latency by prefetching data before it's needed
+		BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
+		CXL::prefetch_cacheline(next_batch_header, 3);  // High locality (will access soon)
+
 		// Periodic status logging
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 5) {
@@ -1381,9 +1392,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		}
 
 		// Advance to next batch header
-		current_batch_header = reinterpret_cast<BatchHeader*>(
-			reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader)
-		);
+		current_batch_header = next_batch_header;
 	}
 }
 

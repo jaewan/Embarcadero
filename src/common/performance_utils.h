@@ -263,6 +263,54 @@ inline void load_fence() {
 }
 
 /**
+ * @brief Cache prefetch hint - prefetch data into cache
+ *
+ * @threading Thread-safe (CPU instruction)
+ * @ownership No ownership semantics
+ * @paper_ref Performance optimization - prefetch next batch/message
+ *
+ * Purpose:
+ * - Prefetch data into cache before it's needed
+ * - Reduces cache miss latency in hot loops
+ * - Improves pipeline utilization
+ *
+ * @param addr Address to prefetch (will be rounded to cache line)
+ * @param locality Locality hint: 0=no locality, 1=low, 2=moderate, 3=high (default: 3)
+ *
+ * Implementation:
+ * - x86-64: _mm_prefetch() (PREFETCH instruction)
+ *   - Locality 0: _MM_HINT_NTA (non-temporal, all levels)
+ *   - Locality 1: _MM_HINT_T1 (L2 and above)
+ *   - Locality 2: _MM_HINT_T2 (L3 and above)
+ *   - Locality 3: _MM_HINT_T0 (all cache levels) - default
+ * - ARM64: __builtin_prefetch()
+ * - Generic: __builtin_prefetch()
+ *
+ * Performance: HOT PATH - Used in tight loops to prefetch next iteration
+ *
+ * Example:
+ *   // Prefetch next batch header while processing current
+ *   CXL::prefetch_cacheline(next_batch_header);
+ */
+inline void prefetch_cacheline(const void* addr, int locality = 3) {
+#ifdef __x86_64__
+    int hint;
+    switch (locality) {
+        case 0: hint = _MM_HINT_NTA; break;  // Non-temporal
+        case 1: hint = _MM_HINT_T1; break;   // L2 and above
+        case 2: hint = _MM_HINT_T2; break;   // L3 and above
+        case 3: 
+        default: hint = _MM_HINT_T0; break;  // All cache levels (default)
+    }
+    _mm_prefetch(reinterpret_cast<const char*>(addr), hint);
+#elif defined(__aarch64__)
+    __builtin_prefetch(addr, 0, locality);
+#else
+    __builtin_prefetch(addr, 0, locality);
+#endif
+}
+
+/**
  * @brief CPU pause hint for spin-wait loops
  *
  * @threading Thread-safe (CPU instruction)
