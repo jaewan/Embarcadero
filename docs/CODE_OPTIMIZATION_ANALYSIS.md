@@ -14,9 +14,22 @@ Static code analysis reveals several optimization opportunities. However, **data
 
 ## Mutex Usage Analysis
 
+### Critical Finding: Order Level 5 is Already Lock-Free! ✅
+
+**Key Insight:** When using `ORDER=5` (current configuration), the system uses `BrokerScannerWorker5`, which is **already fully lock-free**:
+- ✅ Uses `global_seq_.fetch_add()` (atomic, no mutex)
+- ✅ No `global_seq_batch_seq_mu_` usage
+- ✅ No FIFO validation (processes batches as they arrive)
+- ✅ Already optimized with DEV-005 (single fence)
+
+**Implication:** The mutex in `BrokerScannerWorker` (Sequencer4) is **not in the hot path** for order level 5. Lock-free CAS optimization would only benefit order level 4 users.
+
+---
+
 ### Current State: `global_seq_batch_seq_mu_` in BrokerScannerWorker (Sequencer4)
 
-**Location:** `src/embarlet/topic.cc:522, 595`
+**Location:** `src/embarlet/topic.cc:522, 595`  
+**Note:** Only used when `ORDER=4`, not used for `ORDER=5`
 
 **Usage Pattern:**
 ```cpp
