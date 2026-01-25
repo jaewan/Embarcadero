@@ -272,7 +272,18 @@ void Topic::DelegationThread() {
 					// Set required fields for each message
 					msg_ptr->logical_offset = logical_offset_;
 					msg_ptr->segment_header = reinterpret_cast<uint8_t*>(msg_ptr) - CACHELINE_SIZE;
-					msg_ptr->next_msg_diff = msg_ptr->paddedSize;
+					
+					// Read paddedSize first (needed for next message calculation)
+					size_t current_padded_size = msg_ptr->paddedSize;
+					msg_ptr->next_msg_diff = current_padded_size;
+
+					// [[DEV-007: Cache Prefetching]] - Prefetch next message header
+					// Prefetch next message while processing current (if not last message)
+					if (i < current_batch->num_msg - 1 && current_padded_size > 0) {
+						MessageHeader* next_msg = reinterpret_cast<MessageHeader*>(
+							reinterpret_cast<uint8_t*>(msg_ptr) + current_padded_size);
+						CXL::prefetch_cacheline(next_msg, 3);  // High locality
+					}
 
 					// Update segment header
 					*reinterpret_cast<unsigned long long int*>(msg_ptr->segment_header) =
@@ -282,7 +293,7 @@ void Topic::DelegationThread() {
 					// Move to next message in batch
 					if (i < current_batch->num_msg - 1) {
 						msg_ptr = reinterpret_cast<MessageHeader*>(
-							reinterpret_cast<uint8_t*>(msg_ptr) + msg_ptr->paddedSize);
+							reinterpret_cast<uint8_t*>(msg_ptr) + current_padded_size);
 					}
 					logical_offset_++;
 				}
