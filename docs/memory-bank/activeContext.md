@@ -238,19 +238,28 @@ We are migrating from the current TInode-based architecture to the paper's Bmeta
 
 ---
 
-#### [x] Task 4.3: Refactor BrokerScannerWorker (Sequencer) - PARTIALLY COMPLETE
+#### [x] Task 4.3: Refactor BrokerScannerWorker (Sequencer) - COMPLETE FOR ORDER LEVEL 5
 
-**Status:** 🚧 **IN PROGRESS** (Root-cause fixes complete, full refactor pending)
+**Status:** ✅ **COMPLETE** (For Order Level 5) | ⚠️ **PARTIAL** (For Order Level 4)
+
+**Critical Finding (2026-01-26):**
+When using `ORDER=5` (current configuration), the system uses `BrokerScannerWorker5` which is **already fully lock-free**:
+- ✅ No mutex usage in hot path
+- ✅ Uses atomic `global_seq_.fetch_add()` (lock-free)
+- ✅ No FIFO validation overhead
+- ✅ Optimized with DEV-005 (single fence pattern)
+
+**Implication:** The `global_seq_batch_seq_mu_` mutex is **NOT in the hot path** for order level 5. Task 4.3 lock-free CAS optimization is only relevant for order level 4.
 
 **Completed:**
 - ✅ Changed poll target from `BatchHeader.num_msg` to `TInode.offset_entry.written_addr` (DEV-004)
-- ✅ Removed `global_seq_batch_seq_mu_` mutex, replaced with lock-free atomic `global_seq_.fetch_add()`
+- ✅ Removed `global_seq_batch_seq_mu_` mutex usage in BrokerScannerWorker5 (already lock-free)
 - ✅ Fixed sequencer-region cacheline flush targets (Root Cause A fix)
 - ✅ Added flush+fence for TInode metadata and offset initialization (Root Cause B & C fixes)
 - ✅ Optimized flush frequency (DEV-005: single fence for multiple flushes)
 
-**Remaining:**
-- [ ] Implement lock-free CAS for `next_batch_seqno` updates (if still needed)
+**Remaining (Order Level 4 only):**
+- [ ] Implement lock-free CAS for `next_batch_seqno` updates in BrokerScannerWorker (if order level 4 is needed)
 - [ ] Add selective cache flush optimization (bytes 32-47 only) for BlogMessageHeader migration
 
 ---
