@@ -50,6 +50,7 @@ public:
     void* Read(int bufIdx);
 
 		void Seal();
+	void SealAll();
 #else
     /**
      * Writes a message to the buffer without batch optimization

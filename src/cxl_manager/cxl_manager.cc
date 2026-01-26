@@ -55,12 +55,60 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 		LOG(INFO) << "ftruncate completed successfully";
 	}
 	LOG(INFO) << "Mapping CXL shared memory: " << cxl_size << " bytes";
-	addr = mmap(NULL, cxl_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, cxl_fd, 0);
-	close(cxl_fd);
-	if(addr == MAP_FAILED){
+
+	const char* fixed_addr_env = std::getenv("EMBARCADERO_CXL_BASE_ADDR");
+	std::vector<uintptr_t> fixed_addrs;
+	if (fixed_addr_env && fixed_addr_env[0] != '\0') {
+		char* end = nullptr;
+		uintptr_t parsed = static_cast<uintptr_t>(std::strtoull(fixed_addr_env, &end, 0));
+		if (end && *end == '\0' && parsed != 0) {
+			fixed_addrs.push_back(parsed);
+		} else {
+			LOG(ERROR) << "Invalid EMBARCADERO_CXL_BASE_ADDR: " << fixed_addr_env;
+			close(cxl_fd);
+			return nullptr;
+		}
+	} else {
+		// Fallback addresses to keep all brokers on the same virtual base.
+		fixed_addrs = {
+			0x600000000000ULL,
+			0x500000000000ULL,
+			0x400000000000ULL
+		};
+	}
+
+	for (uintptr_t candidate : fixed_addrs) {
+#ifdef MAP_FIXED_NOREPLACE
+		addr = mmap(reinterpret_cast<void*>(candidate), cxl_size,
+		            PROT_READ | PROT_WRITE,
+		            MAP_SHARED | MAP_POPULATE | MAP_FIXED_NOREPLACE,
+		            cxl_fd, 0);
+#else
+		// Best-effort fallback if MAP_FIXED_NOREPLACE is unavailable.
+		addr = mmap(reinterpret_cast<void*>(candidate), cxl_size,
+		            PROT_READ | PROT_WRITE,
+		            MAP_SHARED | MAP_POPULATE | MAP_FIXED,
+		            cxl_fd, 0);
+#endif
+		if (addr != MAP_FAILED) {
+			if (addr != reinterpret_cast<void*>(candidate)) {
+				LOG(ERROR) << "CXL mapping did not honor requested address "
+				           << reinterpret_cast<void*>(candidate)
+				           << ", got " << addr;
+				munmap(addr, cxl_size);
+				addr = MAP_FAILED;
+				continue;
+			}
+			break;
+		}
+	}
+
+	if (addr == MAP_FAILED || addr == nullptr) {
 		LOG(ERROR) << "Mapping CXL failed: " << strerror(errno);
+		close(cxl_fd);
 		return nullptr;
 	}
+	close(cxl_fd);
 	LOG(INFO) << "CXL mapping successful at address: " << addr;
 
 	if(cxl_type == Real && !dev && broker_id == 0){

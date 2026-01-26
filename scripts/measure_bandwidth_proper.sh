@@ -92,7 +92,8 @@ run_test_iteration() {
     
     # Run test using run_throughput.sh (which calls throughput_test with --record_results)
     # run_throughput.sh expects to be run from project root and will cd to build/bin itself
-    if timeout 300 bash scripts/run_throughput.sh > /tmp/test_${blog_header}_${iteration}.log 2>&1; then
+    # Increased timeout to 600s (10 min) for 10GB tests - allows for broker startup, test execution, and ACK completion
+    if timeout 600 bash scripts/run_throughput.sh > /tmp/test_${blog_header}_${iteration}.log 2>&1; then
         
         # Extract bandwidth from CSV (the authoritative source)
         # Wait a moment for CSV to be written

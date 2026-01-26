@@ -26,31 +26,57 @@ using heartbeat_system::SequencerType::KAFKA;
 using heartbeat_system::SequencerType::SCALOG;
 using heartbeat_system::SequencerType::CORFU;
 
-// Separate broker-owned and sequencer-owned fields to prevent false sharing + correctness
-// Total: 512 bytes - two 256-byte regions
+// Separate broker-owned, replication-owned, and sequencer-owned fields to prevent false sharing
+// Total: 768 bytes - three independent 256-byte cache-line regions
 // [[WIDEN_REPLICATION_DONE]] replication_done changed from int[32] to uint64_t[32]
-struct alignas(512) offset_entry {
-	// Broker region: Cache line 0-3 (bytes 0-255)
+// [[OFFSET_ENTRY_V2]] - Restructured to enforce strict cache-line separation per writer
+// NOTE: Using flat layout (NOT nested structs) to avoid implicit alignment padding
+// NOTE: alignas(64) ensures each element in TInode.offsets[] array is cache-line aligned
+//       without inflating struct size (768 is already a multiple of 64)
+struct alignas(64) offset_entry {
+	// ============================================================================
+	// BROKER REGION: Cache lines 0-1 (bytes 0-255)
+	// [[WRITER: Broker thread only]] - Receives write stage
+	// ============================================================================
 	volatile size_t log_offset;              // +0 (8B)
 	volatile size_t batch_headers_offset;    // +8 (8B)
 	volatile size_t written;                 // +16 (8B)
 	volatile unsigned long long int written_addr; // +24 (8B)
-	// [[WIDEN_REPLICATION_DONE]] - Changed from int[NUM_MAX_BROKERS] to uint64_t[NUM_MAX_BROKERS]
-	// Each broker gets an 8-byte slot to store full-sized offsets
-	volatile uint64_t replication_done[NUM_MAX_BROKERS]; // +32 (256B: 8*32)
+	uint8_t _pad_broker[256 - 32];           // +32 (224B) - pad first region to 256B
 	
-	// Sequencer region: Cache line 4-7 (bytes 256-511)
-	// Broker region total = 32 + 256 = 288B (exceeds but will be separated by alignment)
-	volatile int ordered;                    // +288 (4B) - will be adjusted by alignment
-	volatile size_t ordered_offset;          // +292 (8B)
-	uint8_t _pad_sequencer[256 - 4 - 8];     // +300 (244B)
+	// ============================================================================
+	// REPLICATION_DONE REGION: Cache lines 2-3 (bytes 256-511)
+	// [[WRITER: Replication thread only]] - Replication progress tracking
+	// [[WIDEN_REPLICATION_DONE]] - Each broker gets an 8-byte uint64_t slot (was int[32])
+	// ============================================================================
+	volatile uint64_t replication_done[NUM_MAX_BROKERS]; // +256 (256B: 8*32 for 32 brokers)
+	
+	// ============================================================================
+	// SEQUENCER REGION: Cache lines 4-5 (bytes 512-767)
+	// [[WRITER: Sequencer thread only]] - Global ordering (Stage 3)
+	// ============================================================================
+	volatile uint64_t ordered;               // +512 (8B) - widened to avoid overflow on long runs
+	volatile size_t ordered_offset;          // +520 (8B)
+	uint8_t _pad_sequencer[256 - 8 - 8];     // +528 (240B) - pad to 256B
 };
 
-// Static verification - note: struct will be padded to 512B alignment
-static_assert(sizeof(offset_entry) >= 512, "offset_entry must be at least 512 bytes");
-static_assert(alignof(offset_entry) == 512, "offset_entry must be 512-byte aligned");
-// Cache separation is still effective: broker fields (first 288B) and sequencer fields are logically separate
-// even though they may be padded
+// Static verification: enforce cache-line separation and size constraints
+static_assert(sizeof(offset_entry) == 768, "offset_entry must be exactly 768 bytes (three 256B regions)");
+static_assert(alignof(offset_entry) == 64, "offset_entry must be 64-byte aligned");
+static_assert(offsetof(offset_entry, log_offset) == 0, "log_offset must be at offset 0");
+static_assert(offsetof(offset_entry, replication_done) == 256, "replication_done must be at offset 256 (separate cache line)");
+static_assert(offsetof(offset_entry, ordered) == 512, "ordered must be at offset 512 (separate cache line)");
+static_assert(offsetof(offset_entry, ordered_offset) == 520, "ordered_offset must be at offset 520 (after 4B padding)");
+
+// CRITICAL: Each element in offset_entry[NUM_MAX_BROKERS] array in TInode is 768 bytes.
+// With alignas(64), each element is guaranteed to be 64-byte aligned, which ensures:
+// 1. Cache-line alignment for all three regions (broker @ 0, replication @ 256, sequencer @ 512)
+// 2. No false sharing between different offset_entry elements in the array
+// 3. Predictable alignment when CXL memory is pre-allocated by CXLManager
+// 
+// Note: 768 bytes = 12 * 64 bytes, so alignas(64) doesn't inflate struct size.
+// Each region (256B) spans exactly 4 cache lines, providing natural isolation.
+// TInode.offsets[] array size: 768 * NUM_MAX_BROKERS = 24KB (not inflated to 32KB).
 
 struct alignas(64) TInode{
 	struct {
@@ -66,17 +92,19 @@ struct alignas(64) TInode{
 };
 
 struct alignas(64) BatchHeader{
+	// Keep readiness-critical fields in the first cache line for CXL visibility
 	size_t batch_seq; // Monotonically increasing from each client. Corfu sets in log's seq
-	size_t total_size;
-	size_t start_logical_offset;
-	uint32_t broker_id;
-	uint32_t ordered;
-	size_t batch_off_to_export;
-	size_t total_order;
-	size_t log_idx;	// Sequencer4: relative log offset to the payload of the batch and elative offset to last message
 	uint32_t client_id;
 	uint32_t num_msg;
 	volatile uint32_t batch_complete;  // Batch-level completion flag for Sequencer 5
+	uint32_t broker_id;
+	uint32_t ordered;
+	uint32_t _pad0;
+	size_t total_size;
+	size_t start_logical_offset;
+	size_t log_idx;	// Sequencer4: relative log offset to the payload of the batch and relative offset to last message
+	size_t total_order;
+	size_t batch_off_to_export;
 #ifdef BUILDING_ORDER_BENCH
 	uint32_t gen;
 #endif
@@ -84,6 +112,11 @@ struct alignas(64) BatchHeader{
     uint64_t publish_ts_ns;
 #endif
 };
+static_assert(sizeof(BatchHeader) % 64 == 0, "BatchHeader must be cache-line sized");
+static_assert(offsetof(BatchHeader, client_id) < 64, "client_id must be in first cache line");
+static_assert(offsetof(BatchHeader, num_msg) < 64, "num_msg must be in first cache line");
+static_assert(offsetof(BatchHeader, batch_complete) < 64, "batch_complete must be in first cache line");
+// Note: BATCHHEADERS_SIZE is runtime config, alignment verified at runtime in BrokerScannerWorker5
 
 
 // Orders are very important to avoid race conditions.

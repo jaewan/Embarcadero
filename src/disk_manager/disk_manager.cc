@@ -116,6 +116,16 @@ namespace Embarcadero{
 		log_to_memory_(log_to_memory),
 		sequencerType_(sequencerType){
 			num_io_threads_ = NUM_MAX_BROKERS;
+			
+			// [[OBSERVABILITY]] - Initialize replication metrics for all brokers
+			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+				replication_metrics_[i].batches_scanned.store(0, std::memory_order_relaxed);
+				replication_metrics_[i].batches_replicated.store(0, std::memory_order_relaxed);
+				replication_metrics_[i].pwrite_retries.store(0, std::memory_order_relaxed);
+				replication_metrics_[i].pwrite_errors.store(0, std::memory_order_relaxed);
+				replication_metrics_[i].last_replication_done.store(0, std::memory_order_relaxed);
+				replication_metrics_[i].last_advance_time = std::chrono::steady_clock::now();
+			}
 			if(sequencerType == heartbeat_system::SequencerType::SCALOG){
 				scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, log_to_memory, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
 				return;
@@ -160,6 +170,9 @@ namespace Embarcadero{
 		VLOG(3)<< "[DiskManager]: \tDestructed";
 	}
 
+	// [[LEGACY_CODE]] CopyThread appears unused in current Stage-4 batch-based replication
+	// No producers write to copyQueue_ except sentinel values for shutdown
+	// Kept for potential future use or compatibility with older replication paths
 	void DiskManager::CopyThread(){
 		if(sequencerType_ == heartbeat_system::SequencerType::SCALOG && scalog_replication_manager_){
 			scalog_replication_manager_->Shutdown();
@@ -186,7 +199,9 @@ namespace Embarcadero{
 					return;
 				}
 				MemcpyRequest &req = optReq.value();
-				pwrite(req.fd, req.buf, req.offset, req.len);
+				// [[FIX-PWRITE-ARGS]] - Correct argument order: pwrite(fd, buf, count, offset)
+				// Previous bug: pwrite(fd, buf, offset, len) was incorrect
+				pwrite(req.fd, req.buf, req.len, req.offset);
 			}
 		}
 	}
@@ -268,9 +283,13 @@ namespace Embarcadero{
 		constexpr auto kSyncTimeThreshold = std::chrono::milliseconds(250); // 250 ms
 		
 		// [[PERF_CLEANUPS]] - Scan backoff state (spin→sleep pattern for low-load efficiency)
-		auto last_batch_found = std::chrono::steady_clock::now();
 		constexpr auto kSpinDuration = std::chrono::microseconds(100);  // Spin for 100us
 		constexpr auto kSleepDuration = std::chrono::milliseconds(1);    // Then sleep for 1ms
+		
+		// [[OBSERVABILITY]] - Metrics tracking and periodic logging
+		ReplicationMetrics& metrics = replication_metrics_[req.broker_id];
+		auto last_metrics_log_time = std::chrono::steady_clock::now();
+		constexpr auto kMetricsLogInterval = std::chrono::seconds(10); // Log metrics every 10 seconds
 
 		while (!stop_threads_) {
 			// [[EXPLICIT_REPLICATION_STAGE4]] - Use batch-based replication for all orders
@@ -279,8 +298,6 @@ namespace Embarcadero{
 					batch_ring_start, batch_ring_end, current_batch, disk_offset,
 					batch_payload, batch_payload_size,
 					batch_start_logical_offset, batch_last_logical_offset)) {
-				
-				last_batch_found = std::chrono::steady_clock::now();  // Reset backoff timer
 				
 				// Flag to track if batch write succeeded
 				bool batch_write_success = true;
@@ -303,24 +320,28 @@ namespace Embarcadero{
 							
 							if (written < 0) {
 								// Error on pwrite
-								if (errno == EINTR) {
-									// Interrupted by signal; retry
-									VLOG(2) << "[ReplicateThread B" << req.broker_id << "]: pwrite interrupted (EINTR), retrying";
-									continue;
-								} else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-									// Non-blocking I/O would block; backoff and retry
-									VLOG(2) << "[ReplicateThread B" << req.broker_id << "]: pwrite would block (EAGAIN), backing off";
-									std::this_thread::sleep_for(std::chrono::microseconds(100));
-									continue;
+							if (errno == EINTR) {
+								// Interrupted by signal; retry
+								metrics.pwrite_retries.fetch_add(1, std::memory_order_relaxed);
+								VLOG(2) << "[ReplicateThread B" << req.broker_id << "]: pwrite interrupted (EINTR), retrying";
+								continue;
+							} else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+								// Non-blocking I/O would block; backoff and retry
+								metrics.pwrite_retries.fetch_add(1, std::memory_order_relaxed);
+								VLOG(2) << "[ReplicateThread B" << req.broker_id << "]: pwrite would block (EAGAIN), backing off";
+								std::this_thread::sleep_for(std::chrono::microseconds(100));
+								continue;
 								} else {
-									// Permanent error; log and mark batch as failed
-									LOG(ERROR) << "[ReplicateThread B" << req.broker_id << "]: pwrite failed at offset " 
+									// Permanent error; fail-fast and exit thread
+									metrics.pwrite_errors.fetch_add(1, std::memory_order_relaxed);
+									LOG(ERROR) << "[ReplicateThread B" << req.broker_id << "]: pwrite PERMANENT ERROR at offset " 
 										<< current_pos << " (written " << bytes_written_total << "/" << batch_payload_size 
 										<< " bytes): " << strerror(errno);
-									// DO NOT advance replication_done on error
+									LOG(ERROR) << "[ReplicateThread B" << req.broker_id << "]: Exiting replication thread due to permanent disk error";
+									// Set flag to exit outer loop
 									batch_write_success = false;
 									CXL::cpu_pause();
-									break;  // Exit write loop, skip replication_done update
+									break;  // Exit write loop
 								}
 							} else if (written == 0) {
 								// No bytes written, but no error; this is unusual but might happen
@@ -335,76 +356,115 @@ namespace Embarcadero{
 							}
 						}
 					}
+				}
+				
+				// CRITICAL: Only advance disk_offset after successful write
+				if (batch_write_success && batch_payload_size > 0) {
 					disk_offset += batch_payload_size;
 				}
 				
-				// Only proceed with sync and replication_done update if write succeeded
-				if (batch_write_success) {
-					// Check if periodic sync is needed
-					if (!log_to_memory_) {
-						auto now = std::chrono::steady_clock::now();
-						bool sync_needed = (bytes_since_sync >= kSyncBytesThreshold) ||
-						                   (now - last_sync_time >= kSyncTimeThreshold);
-						
-						if (sync_needed && bytes_since_sync > 0) {
-							if (fdatasync(fd) < 0) {
-								LOG(ERROR) << "fdatasync failed for broker " << req.broker_id << ": " << strerror(errno);
-							}
-							bytes_since_sync = 0;
-							last_sync_time = now;
+			// Only proceed with sync and replication_done update if write succeeded
+			if (batch_write_success) {
+				// [[PERIODIC_DURABILITY_SYNC]] - Periodic fdatasync policy for ack_level=2
+				// Syncs to disk when either:
+				// - 64 MiB written since last sync (kSyncBytesThreshold)
+				// - 250ms elapsed since last sync (kSyncTimeThreshold)
+				// This provides "eventual durability" semantics for ack_level=2
+				// Note: For stronger guarantees, consider configurable thresholds or explicit fsync() per batch
+				if (!log_to_memory_) {
+					auto now = std::chrono::steady_clock::now();
+					bool sync_needed = (bytes_since_sync >= kSyncBytesThreshold) ||
+					                   (now - last_sync_time >= kSyncTimeThreshold);
+					
+					if (sync_needed && bytes_since_sync > 0) {
+						if (fdatasync(fd) < 0) {
+							LOG(ERROR) << "fdatasync failed for broker " << req.broker_id << ": " << strerror(errno);
 						}
+						bytes_since_sync = 0;
+						last_sync_time = now;
 					}
+				}
+				
+				// Update replication_done to signal ACK level 2
+				// [[EXPLICIT_REPLICATION_STAGE4]] - Flush after replication_done update
+				// Only advance replication_done after full batch is successfully written to disk
+				TInode* replica_tinode = req.replica_tinode;
+				bool replicate_tinode = req.tinode->replicate_tinode;
+				if(replicate_tinode){
+					replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
+				}
+				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
+				
+				// Flush the updated replication_done so other hosts (ACK thread) can observe it under non-coherent CXL
+				const void* rep_done_addr = reinterpret_cast<const void*>(
+					const_cast<const uint64_t*>(&req.tinode->offsets[broker_id_].replication_done[req.broker_id]));
+				CXL::flush_cacheline(rep_done_addr);
+				
+				// [[FLUSH_DUAL_WRITE]] - If dual-writing to replica_tinode, flush that too for CXL visibility
+				if(replicate_tinode){
+					const void* replica_rep_done_addr = reinterpret_cast<const void*>(
+						const_cast<const uint64_t*>(&replica_tinode->offsets[broker_id_].replication_done[req.broker_id]));
+					CXL::flush_cacheline(replica_rep_done_addr);
+				}
+				
+				CXL::store_fence();
+				
+				// [[OBSERVABILITY]] - Update metrics after successful replication
+				metrics.batches_replicated.fetch_add(1, std::memory_order_relaxed);
+				metrics.last_replication_done.store(batch_last_logical_offset, std::memory_order_relaxed);
+				{
+					std::lock_guard<std::mutex> lock(metrics.metrics_mutex);
+					metrics.last_advance_time = std::chrono::steady_clock::now();
+				}
+				
+				VLOG(3) << "[ReplicationThread B" << req.broker_id << "]: Replicated batch, last_offset=" 
+						<< batch_last_logical_offset << ", disk_offset=" << disk_offset;
+				
+				// Periodic metrics logging
+				auto now = std::chrono::steady_clock::now();
+				if (now - last_metrics_log_time >= kMetricsLogInterval) {
+					uint64_t scanned = metrics.batches_scanned.load(std::memory_order_relaxed);
+					uint64_t replicated = metrics.batches_replicated.load(std::memory_order_relaxed);
+					uint64_t retries = metrics.pwrite_retries.load(std::memory_order_relaxed);
+					uint64_t errors = metrics.pwrite_errors.load(std::memory_order_relaxed);
+					uint64_t last_done = metrics.last_replication_done.load(std::memory_order_relaxed);
 					
-					// Update replication_done to signal ACK level 2
-					// [[EXPLICIT_REPLICATION_STAGE4]] - Flush after replication_done update
-					// Only advance replication_done after full batch is successfully written to disk
-					TInode* replica_tinode = req.replica_tinode;
-					bool replicate_tinode = req.tinode->replicate_tinode;
-					if(replicate_tinode){
-						replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
+					std::chrono::steady_clock::time_point last_advance;
+					{
+						std::lock_guard<std::mutex> lock(metrics.metrics_mutex);
+						last_advance = metrics.last_advance_time;
 					}
-					req.tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
+					auto time_since_advance = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_advance).count();
 					
-					// Flush the updated replication_done so other hosts (ACK thread) can observe it under non-coherent CXL
-					const void* rep_done_addr = reinterpret_cast<const void*>(
-						const_cast<const uint64_t*>(&req.tinode->offsets[broker_id_].replication_done[req.broker_id]));
-					CXL::flush_cacheline(rep_done_addr);
+					LOG(INFO) << "[ReplicationMetrics B" << req.broker_id << "]: "
+						<< "scanned=" << scanned << ", replicated=" << replicated 
+						<< ", pwrite_retries=" << retries << ", pwrite_errors=" << errors
+						<< ", last_replication_done=" << last_done
+						<< ", time_since_last_advance=" << time_since_advance << "ms";
 					
-					// [[FLUSH_DUAL_WRITE]] - If dual-writing to replica_tinode, flush that too for CXL visibility
-					if(replicate_tinode){
-						const void* replica_rep_done_addr = reinterpret_cast<const void*>(
-							const_cast<const uint64_t*>(&replica_tinode->offsets[broker_id_].replication_done[req.broker_id]));
-						CXL::flush_cacheline(replica_rep_done_addr);
-					}
-					
-					CXL::store_fence();
-					
-					VLOG(3) << "[ReplicationThread B" << req.broker_id << "]: Replicated batch, last_offset=" 
-							<< batch_last_logical_offset << ", disk_offset=" << disk_offset;
+					last_metrics_log_time = now;
 				}
 			} else {
+				// Batch write failed - for permanent errors, exit thread fail-fast
+				// The thread will clean up and exit below
+				LOG(ERROR) << "[ReplicateThread B" << req.broker_id << "]: Permanent disk write error, terminating replication thread";
+				break;  // Exit main loop
+			}
+			} else {
 				// [[PERF_CLEANUPS]] - Spin-then-sleep backoff when no batch found
-				// Similar to AckThread pattern: spin for 100us first, then sleep if nothing found
+				// CRITICAL: Do NOT call GetNextReplicationBatch() here!
+				// Calling it in the spin loop can advance the cursor without replicating the batch,
+				// which could drop batches and cause replication_done stalls.
+				//
+				// Pattern: Spin briefly with CPU pauses, then sleep. The outer loop will call
+				// GetNextReplicationBatch() again on next iteration.
 				auto spin_start = std::chrono::steady_clock::now();
-				bool found_batch = false;
-				
 				while (std::chrono::steady_clock::now() - spin_start < kSpinDuration) {
-					// Try one more time before sleeping
-					if (GetNextReplicationBatch(req.tinode, req.broker_id,
-							batch_ring_start, batch_ring_end, current_batch, disk_offset,
-							batch_payload, batch_payload_size,
-							batch_start_logical_offset, batch_last_logical_offset)) {
-						found_batch = true;
-						last_batch_found = std::chrono::steady_clock::now();
-						break;
-					}
-					CXL::cpu_pause();  // Efficient spin-wait on CXL
+					CXL::cpu_pause(); 
 				}
 				
-				// If still no batch after spinning, sleep briefly
-				if (!found_batch) {
-					std::this_thread::sleep_for(kSleepDuration);
-				}
+				// Sleep briefly to avoid 100% CPU during idle
+				std::this_thread::sleep_for(kSleepDuration);
 			}
 		} // End while(!stop_threads_)
 		
@@ -415,28 +475,28 @@ namespace Embarcadero{
 			}
 		}
 
-		// --- Cleanup ---
-		VLOG(1) << "[ReplicateThread " << req.broker_id << "]: Stopping replication loop.";
+	// --- Cleanup ---
+	VLOG(1) << "[ReplicateThread " << req.broker_id << "]: Stopping replication loop.";
 
-		// Cleanup based on log type
-		if (!log_to_memory_) {
-			// Disk (mmap) path cleanup
-			if (log_addr != nullptr && log_addr != MAP_FAILED) {
-				VLOG(2) << "[ReplicateThread " << req.broker_id << "]: Syncing mmaped file.";
-				// Ensure data is written to disk before closing
-				if (msync(log_addr, offset, MS_SYNC) == -1) {
-					LOG(ERROR) << "Failed to msync log file for target " << req.broker_id << ": " << strerror(errno);
-				}
-			}
-			close(fd);
-		} else {
-			// Memory path cleanup
-			if (log_addr != nullptr) {
-				VLOG(2) << "[ReplicateThread " << req.broker_id << "]: Freeing memory log.";
-				mi_free(log_addr); // Use the corresponding free function for mi_malloc
-			}
-			// req.fd should be -1 for memory path, no need to close
+	// Cleanup based on log type
+	if (!log_to_memory_) {
+		// Disk path cleanup - log_addr is malloc'd buffer, not mmap
+		// [[REFACTOR_DEAD_PATHS]] - Removed misleading msync() call
+		// log_addr in disk mode is a simple malloc'd buffer for staging (not used in final implementation)
+		// No need for msync since we use pwrite() directly to disk
+		if (log_addr != nullptr) {
+			VLOG(2) << "[ReplicateThread " << req.broker_id << "]: Freeing staging buffer.";
+			mi_free(log_addr);
 		}
+		close(fd);
+	} else {
+		// Memory path cleanup
+		if (log_addr != nullptr) {
+			VLOG(2) << "[ReplicateThread " << req.broker_id << "]: Freeing memory log.";
+			mi_free(log_addr); // Use the corresponding free function for mi_malloc
+		}
+		// req.fd should be -1 for memory path, no need to close
+	}
 
 		// Decrement counters (ensure this happens exactly once per thread exit)
 		thread_count_.fetch_sub(1);
@@ -476,9 +536,12 @@ namespace Embarcadero{
 		}
 		
 		// Scan for next ordered batch (match BrokerScannerWorker5 pattern)
-		// Use a reasonable upper bound to prevent infinite loops
-		size_t MAX_SCAN_ATTEMPTS = 10000;  // Up to ~10k batches per scan
+		// Use a reasonable upper bound to prevent excessive scanning under idle conditions
+		// The outer loop's backoff will sleep if no batch found, so we don't need aggressive scanning
+		size_t MAX_SCAN_ATTEMPTS = 256;  // Up to ~256 batches per scan
 		for (size_t i = 0; i < MAX_SCAN_ATTEMPTS; ++i) {
+			// [[OBSERVABILITY]] - Track batches scanned (increment on each iteration)
+			replication_metrics_[broker_id].batches_scanned.fetch_add(1, std::memory_order_relaxed);
 			// [[DEVIATION_006: Export Chain Semantics]] 
 			// Read ordered flag from the *slot* (like export does in Topic::GetBatchToExport)
 			volatile uint32_t ordered_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->ordered;
@@ -496,17 +559,17 @@ namespace Embarcadero{
 			
 			// ordered == 1: Follow the export chain to the actual batch header
 			// batch_off_to_export is a byte offset from current_batch to the real batch
-			volatile int64_t batch_off_to_export_check = 
+			volatile size_t batch_off_to_export_check = 
 				reinterpret_cast<volatile BatchHeader*>(current_batch)->batch_off_to_export;
 			
 			// Bounds validation for batch_off_to_export
 			// Must point within the batch ring and be aligned to BatchHeader size
-			if (batch_off_to_export_check < 0 || 
-			    batch_off_to_export_check >= static_cast<int64_t>(BATCHHEADERS_SIZE) ||
+			if (batch_off_to_export_check >= BATCHHEADERS_SIZE ||
 			    batch_off_to_export_check % sizeof(BatchHeader) != 0) {
 				LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
 					<< "]: Invalid batch_off_to_export=" << batch_off_to_export_check 
-					<< " (must be in [0, " << BATCHHEADERS_SIZE << ") and aligned)";
+					<< " (must be in [0, " << BATCHHEADERS_SIZE << ") and aligned to " 
+					<< sizeof(BatchHeader) << " bytes)";
 				// Advance and continue scanning
 				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
 					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
@@ -535,18 +598,29 @@ namespace Embarcadero{
 				continue;
 			}
 			
-			// Read batch metadata from the actual batch header
+			// Read batch metadata from the actual batch header with payload bounds checks
 			volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->num_msg;
 			volatile size_t total_size_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->total_size;
 			volatile size_t log_idx_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->log_idx;
 			volatile size_t start_logical_offset_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->start_logical_offset;
 			
 			// Bounds validation (match BrokerScannerWorker5 guards)
+			// Add payload location check to prevent out-of-bounds
 			constexpr uint32_t MAX_REASONABLE_NUM_MSG = 100000;
+			// [[FIX-HARDCODED-SIZE]] - Use configured CXL size instead of hardcoded 68GB
+			// This ensures bounds checks work correctly when CXL_SIZE is configured differently
+			const size_t cxl_max_size = CXL_SIZE;
+			
+			// Check payload doesn't exceed CXL bounds
+			// Note: log_idx_check is relative to cxl_addr_, so we validate against total CXL region size
+			bool payload_in_bounds = (log_idx_check < cxl_max_size && 
+			                          log_idx_check + total_size_check <= cxl_max_size);
+			
 			bool batch_ready = (num_msg_check != 0 && 
 			                   total_size_check > 0 && 
 			                   log_idx_check > 0 && 
-			                   num_msg_check <= MAX_REASONABLE_NUM_MSG);
+			                   num_msg_check <= MAX_REASONABLE_NUM_MSG &&
+			                   payload_in_bounds);
 			
 			if (batch_ready) {
 				// Batch is valid; use data from actual_batch
@@ -581,10 +655,14 @@ namespace Embarcadero{
 		}
 		
 		// No ordered batch found in scan range
+		// Note: batches_scanned counter is incremented inside the loop, so it's already updated
 		return false;
 	}
 
-	//This is a copy of Topic::GetMessageAddr changed to use tinode instead of topic variables
+	//[[LEGACY_CODE]] This is a legacy per-message replication path
+	// No longer used in Stage-4 batch-based replication
+	// Kept for reference/fallback only
+	// This is a copy of Topic::GetMessageAddr changed to use tinode instead of topic variables
 	bool DiskManager::GetMessageAddr(TInode* tinode, int order, int broker_id, size_t &last_offset,
 			void* &last_addr, void* &messages, size_t &messages_size){
 		size_t relative_off = tinode->offsets[broker_id].written_addr;;

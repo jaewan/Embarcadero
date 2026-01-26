@@ -276,11 +276,15 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 
 	// Update header with current message info
 	if (use_blog_header) {
-		// [[BLOG_HEADER: Populate BlogMessageHeader fields]]
-		// Receiver region (bytes 0-15) - set by publisher
+		// [[BLOG_HEADER: Populate BlogMessageHeader fields - Minimal Publisher Work]]
+		// Paper spec: Receiver (NetworkManager) sets receiver region fields (bytes 0-15)
+		// Publisher only sets size and metadata - avoid expensive operations like rdtsc()
+		// This reduces publisher-side overhead and aligns with paper's Stage 1 (Receiver) responsibility
 		blog_header_.size = static_cast<uint32_t>(len);  // Payload bytes only
-		blog_header_.received = 1;  // Mark as received by publisher
-		blog_header_.ts = Embarcadero::CXL::rdtsc();  // Receipt timestamp
+		// received and ts will be set by NetworkManager (receiver) when batch is actually received
+		// This avoids per-message rdtsc() overhead in publisher hot path
+		blog_header_.received = 0;  // Receiver will set to 1 when received
+		blog_header_.ts = 0;  // Receiver will set timestamp when received
 		
 		// Read-only metadata (bytes 48-63)
 		blog_header_.batch_seq = batch_seq_.load(std::memory_order_relaxed);
@@ -416,6 +420,41 @@ void Buffer::Seal(){
 	} else {
 		LOG(INFO) << "Buffer::Seal: No data to seal in buffer " << lockedIdx 
 		          << ", head=" << head << ", tail=" << bufs_[lockedIdx].prod.tail.load(std::memory_order_relaxed);
+	}
+}
+
+void Buffer::SealAll() {
+	const size_t total_bufs = num_buf_.load(std::memory_order_relaxed);
+	size_t sealed_buffers = 0;
+	size_t sealed_messages = 0;
+	size_t sealed_bytes = 0;
+	for (size_t idx = 0; idx < total_bufs; ++idx) {
+		size_t head = bufs_[idx].prod.writer_head.load(std::memory_order_relaxed);
+		size_t tail = bufs_[idx].prod.tail.load(std::memory_order_relaxed);
+		if ((tail - head) > sizeof(Embarcadero::BatchHeader)) {
+			Embarcadero::BatchHeader* batch_header =
+				reinterpret_cast<Embarcadero::BatchHeader*>(
+					reinterpret_cast<uint8_t*>(bufs_[idx].buffer) + head);
+
+			batch_header->start_logical_offset = tail;
+			batch_header->batch_seq = batch_seq_.fetch_add(1);
+			batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
+			batch_header->num_msg = bufs_[idx].prod.num_msg.load(std::memory_order_relaxed);
+			batch_header->batch_complete = 0;
+			sealed_buffers++;
+			sealed_messages += batch_header->num_msg;
+			sealed_bytes += batch_header->total_size;
+
+			// Reset buffer state for next batch
+			bufs_[idx].prod.num_msg.store(0, std::memory_order_relaxed);
+			bufs_[idx].prod.writer_head.store(tail, std::memory_order_relaxed);
+			bufs_[idx].prod.tail.fetch_add(sizeof(Embarcadero::BatchHeader), std::memory_order_relaxed);
+		}
+	}
+	if (sealed_buffers > 0) {
+		LOG(INFO) << "Buffer::SealAll sealed_buffers=" << sealed_buffers
+		          << " sealed_messages=" << sealed_messages
+		          << " sealed_bytes=" << sealed_bytes;
 	}
 }
 

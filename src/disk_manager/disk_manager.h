@@ -5,6 +5,8 @@
 #include <thread>
 #include <vector>
 #include <optional>
+#include <mutex>
+#include <chrono>
 #include "folly/MPMCQueue.h"
 #include "common/config.h"
 
@@ -82,6 +84,19 @@ class DiskManager{
 		std::atomic<size_t> num_io_threads_{0};
 		std::atomic<size_t> num_active_threads_{0};
 		fs::path prefix_path_;
+		
+		// [[OBSERVABILITY]] - Replication metrics for monitoring and debugging
+		// Per-broker counters (indexed by broker_id)
+		struct ReplicationMetrics {
+			std::atomic<uint64_t> batches_scanned{0};      // Total batches scanned in GetNextReplicationBatch
+			std::atomic<uint64_t> batches_replicated{0};   // Total batches successfully replicated
+			std::atomic<uint64_t> pwrite_retries{0};       // Total pwrite retries (EINTR/EAGAIN)
+			std::atomic<uint64_t> pwrite_errors{0};        // Total permanent pwrite errors
+			std::atomic<uint64_t> last_replication_done{0}; // Last replication_done value written
+			std::chrono::steady_clock::time_point last_advance_time; // When replication_done last advanced
+			std::mutex metrics_mutex; // Protects last_advance_time (non-atomic)
+		};
+		ReplicationMetrics replication_metrics_[NUM_MAX_BROKERS];
 };
 
 } // End of namespace Embarcadero

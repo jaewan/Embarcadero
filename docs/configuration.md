@@ -68,6 +68,50 @@ embarcadero:
     is_amd: false
 ```
 
+## Acknowledgment Levels (ack_level)
+
+Embarcadero supports three acknowledgment levels that control when publishers receive ACKs:
+
+### ack_level = 0
+**No acknowledgments**: Publisher never waits for ACKs. Fastest but no delivery guarantees.
+
+### ack_level = 1  
+**Memory acknowledgment**: Publisher receives ACK after message is:
+- Written to CXL shared memory
+- Globally ordered (if `order > 0`)
+
+**Durability**: Messages are in shared memory but **not yet durable** to disk. Suitable for high-throughput scenarios where some data loss is acceptable.
+
+### ack_level = 2
+**Replication acknowledgment**: Publisher receives ACK only after:
+- Message is written to CXL shared memory
+- Message is globally ordered
+- Message is **replicated to disk** on all replicas (up to `replication_factor`)
+
+**Durability Semantics**:
+- **Eventual durability within periodic sync window**
+- Default sync policy: `fdatasync()` every **250ms** OR every **64 MiB** written
+- This means `ack_level=2` provides "eventual durability" - data is durable within ~250ms, not immediately
+- For stronger guarantees (immediate fsync per batch), consider:
+  - Configurable sync thresholds (future enhancement)
+  - Explicit `fsync()` calls in replication path
+  - Alternative durability policies
+
+**Configuration**:
+- Set `replication_factor > 0` for replication to be active
+- Sync thresholds are currently hardcoded but documented in `src/disk_manager/disk_manager.cc`:
+  - `kSyncBytesThreshold = 64 * 1024 * 1024` (64 MiB)
+  - `kSyncTimeThreshold = 250ms`
+
+**Use Cases**:
+- **ack_level=1**: High-throughput logging, metrics, non-critical data
+- **ack_level=2**: Transaction logs, critical state, data requiring durability guarantees
+
+**Performance Trade-offs**:
+- `ack_level=0`: Lowest latency, highest throughput
+- `ack_level=1`: Moderate latency increase (~microseconds for ordering)
+- `ack_level=2`: Higher latency (~250ms worst-case for sync window), but provides durability
+
 ## Environment Variables
 
 All configuration values can be overridden using environment variables. The naming convention is:

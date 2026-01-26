@@ -463,6 +463,8 @@ void NetworkManager::HandlePublishRequest(
 		int client_socket,
 		const EmbarcaderoReq& handshake,
 		const struct sockaddr_in& client_address) {
+	static std::atomic<size_t> batches_received_complete{0};
+	static std::atomic<size_t> batches_marked_complete{0};
 
 	// Validate topic
 	if (strlen(handshake.topic) == 0) {
@@ -513,6 +515,11 @@ void NetworkManager::HandlePublishRequest(
 		if (bytes_read <= 0) {
 			if (bytes_read < 0) {
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
+			} else {
+				// bytes_read == 0 indicates connection closed by peer
+				LOG(WARNING) << "NetworkManager: Connection closed by publisher (client_id=" 
+				            << handshake.client_id << ", topic=" << handshake.topic 
+				            << "). No batch data received. This may indicate publisher failed to send or disconnected early.";
 			}
 			running = false;
 			break;
@@ -550,50 +557,93 @@ void NetworkManager::HandlePublishRequest(
 			LOG(ERROR) << "Failed to get CXL buffer";
 			break;
 		}
+		
+		if (batch_header_location == nullptr) {
+			LOG(WARNING) << "NetworkManager: GetCXLBuffer returned null batch_header_location for topic=" 
+			             << handshake.topic << " seq_type=" << static_cast<int>(seq_type)
+			             << " batch_seq=" << batch_header.batch_seq;
+		} else {
+			static thread_local size_t getcxl_logs = 0;
+			if (++getcxl_logs % 100 == 0) {
+				LOG(INFO) << "NetworkManager: GetCXLBuffer returned batch_header_location=" 
+				          << batch_header_location << " for batch_seq=" << batch_header.batch_seq
+				          << " num_msg=" << batch_header.num_msg;
+			}
+		}
 
-		// Receive message data
-		MessageHeader* header = nullptr;
+		// Receive message data (byte-accurate accounting only)
 		size_t read = 0;
-		size_t header_size = sizeof(MessageHeader);
-		size_t bytes_to_next_header = 0;
-
+		bool batch_data_complete = false;
 		while (running && !stop_threads_) {
 			bytes_read = recv(client_socket, (uint8_t*)buf + read, to_read, 0);
 			if (bytes_read < 0) {
 				LOG(ERROR) << "Error receiving message data: " << strerror(errno);
 				running = false;
-				return;
+				batch_data_complete = false;
+				break;
+			}
+			if (bytes_read == 0) {
+				LOG(WARNING) << "Connection closed while receiving message data (remaining=" << to_read 
+				            << ", received=" << read << " of " << batch_header.total_size 
+				            << " bytes). Batch incomplete - will not mark batch_complete or send ACK.";
+				running = false;
+				batch_data_complete = false;
+				break;
 			}
 
-			// Process complete messages as they arrive
-			while (bytes_to_next_header + header_size <= static_cast<size_t>(bytes_read)) {
-				header = (MessageHeader*)((uint8_t*)buf + read + bytes_to_next_header);
-
-				bytes_read -= bytes_to_next_header;
-				read += bytes_to_next_header;
-				to_read -= bytes_to_next_header;
-				bytes_to_next_header = header->paddedSize;
-
-				if (seq_type == KAFKA) {
-					header->logical_offset = logical_offset;
-					if (segment_header == nullptr) {
-						LOG(ERROR) << "segment_header is null!";
-					}
-					header->segment_header = segment_header;
-					header->next_msg_diff = header->paddedSize;
-
-					// Don't flush on every message - batch processing will handle it
-					// This saves significant CPU cycles
-					logical_offset++;
-				}
-			}
-
-			read += bytes_read;
-			to_read -= bytes_read;
-			bytes_to_next_header -= bytes_read;
+			read += static_cast<size_t>(bytes_read);
+			to_read -= static_cast<size_t>(bytes_read);
 
 			if (to_read == 0) {
+				batch_data_complete = true;
 				break;
+			}
+		}
+
+		// Only process batch if all data was received
+		if (!batch_data_complete) {
+			LOG(WARNING) << "NetworkManager: Batch incomplete (received " << read << " of " 
+			            << batch_header.total_size << " bytes) for batch_seq=" << batch_header.batch_seq
+			            << ". Closing connection to avoid stream desync.";
+			// Connection is now out-of-sync; close to avoid interpreting payload as next header.
+			running = false;
+			break;
+		}
+		size_t completed_batches = batches_received_complete.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (completed_batches <= 10 || completed_batches % 200 == 0) {
+			LOG(INFO) << "NetworkManager: batch_data_complete total=" << completed_batches
+			          << " last_batch_seq=" << batch_header.batch_seq
+			          << " client_id=" << batch_header.client_id
+			          << " total_size=" << batch_header.total_size;
+		}
+
+		// Post-receive parsing only where required
+		MessageHeader* header = nullptr;  // Last message header for callback
+		if (seq_type == KAFKA && batch_header.num_msg > 0) {
+			MessageHeader* current_header = reinterpret_cast<MessageHeader*>(buf);
+			size_t remaining = batch_header.total_size;
+			for (size_t i = 0; i < batch_header.num_msg; ++i) {
+				if (remaining < sizeof(MessageHeader)) {
+					LOG(WARNING) << "NetworkManager: KAFKA batch too small for header, remaining=" << remaining;
+					break;
+				}
+				if (current_header->paddedSize == 0 || current_header->paddedSize > remaining) {
+					LOG(WARNING) << "NetworkManager: KAFKA invalid paddedSize=" << current_header->paddedSize
+					             << " remaining=" << remaining;
+					break;
+				}
+				current_header->logical_offset = logical_offset;
+				if (segment_header == nullptr) {
+					LOG(ERROR) << "segment_header is null!";
+				}
+				current_header->segment_header = segment_header;
+				current_header->next_msg_diff = current_header->paddedSize;
+				logical_offset++;
+
+				remaining -= current_header->paddedSize;
+				header = current_header;  // Track last header for callback
+				current_header = reinterpret_cast<MessageHeader*>(
+					reinterpret_cast<uint8_t*>(current_header) + current_header->paddedSize);
 			}
 		}
 
@@ -610,9 +660,11 @@ void NetworkManager::HandlePublishRequest(
 	}
 
 	if (is_blog_header_enabled && batch_header.num_msg > 0) {
-		// [[BLOG_HEADER: Sanity check only (no conversion)]]
-		// Publisher already emitted v2 headers, just validate boundaries
+		// [[BLOG_HEADER: Receiver Stage - Set receiver region fields (bytes 0-15)]]
+		// Paper spec §3.1: Receiver sets received=1 and ts when payload write completes
+		// This is done here after batch is fully received (zero-copy into CXL)
 		BlogMessageHeader* current_msg = reinterpret_cast<BlogMessageHeader*>(buf);
+		uint64_t receive_timestamp = Embarcadero::CXL::rdtsc();  // Single timestamp for batch
 		
 		for (size_t i = 0; i < batch_header.num_msg; ++i) {
 			// Validate message header bounds
@@ -620,6 +672,10 @@ void NetworkManager::HandlePublishRequest(
 				VLOG(2) << "NetworkManager: Message " << i << " has invalid size=" << current_msg->size;
 				break;
 			}
+			
+			// Set receiver region fields (bytes 0-15) - Paper spec Stage 1
+			current_msg->received = 1;  // Mark as received
+			current_msg->ts = receive_timestamp;  // Receipt timestamp
 			
 			// Compute stride and verify alignment
 			size_t stride = wire::ComputeMessageStride(sizeof(BlogMessageHeader), current_msg->size);
@@ -635,23 +691,30 @@ void NetworkManager::HandlePublishRequest(
 				);
 			}
 		}
-		VLOG(3) << "NetworkManager: Validated " << batch_header.num_msg << " BlogMessageHeader messages for ORDER=5";
+		VLOG(3) << "NetworkManager: Set receiver fields for " << batch_header.num_msg << " BlogMessageHeader messages for ORDER=5";
 	}
 
 	// Signal batch completion for ALL order levels
 	// This must be done AFTER all messages in the batch are received and marked complete
-	if (batch_header_location != nullptr) {
+	// CRITICAL: Only mark batch_complete if all data was successfully received
+	if (batch_header_location != nullptr && batch_data_complete) {
 		// For Sequencer 5 with BlogHeader: messages already valid from publisher
 		// For other orders: Ensure message validation
 		if (seq_type != EMBARCADERO || (tinode && tinode->order != 5) || !is_blog_header_enabled) {
-			// For Sequencer 4 and other modes: Ensure all message headers are properly initialized
+			// For Sequencer 4 and other modes: Validate v1 headers without blocking
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
+			size_t remaining = batch_header.total_size;
 			for (size_t i = 0; i < batch_header.num_msg; ++i) {
-				// Ensure paddedSize is set (this indicates message is complete)
-				while (first_msg->paddedSize == 0) {
-					std::this_thread::yield(); // Wait for message to be fully written
+				if (remaining < sizeof(MessageHeader)) {
+					LOG(WARNING) << "NetworkManager: v1 batch too small for header, remaining=" << remaining;
+					break;
 				}
-				// Move to next message
+				if (first_msg->paddedSize == 0 || first_msg->paddedSize > remaining) {
+					LOG(WARNING) << "NetworkManager: v1 invalid paddedSize=" << first_msg->paddedSize
+					             << " remaining=" << remaining;
+					break;
+				}
+				remaining -= first_msg->paddedSize;
 				first_msg = reinterpret_cast<MessageHeader*>(
 					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
 				);
@@ -660,7 +723,32 @@ void NetworkManager::HandlePublishRequest(
 		// For Sequencer 5, batch is complete once all data is received (to_read == 0)
 		// Now it's safe to mark batch as complete for ALL order levels
 		__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
+		// [[CRITICAL: Flush batch_complete for non-coherent CXL visibility]]
+		// Sequencer (running on different broker/CPU) must see batch_complete update
+		// Without flush, sequencer will never see batch_complete=1 and batches won't be processed
+		CXL::flush_cacheline(batch_header_location);
+		// Flush the second cache line too to ensure all BatchHeader fields are visible
+		const void* batch_header_next_line = reinterpret_cast<const void*>(
+			reinterpret_cast<const uint8_t*>(batch_header_location) + 64);
+		CXL::flush_cacheline(batch_header_next_line);
+		CXL::store_fence();
+		size_t marked_batches = batches_marked_complete.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (marked_batches <= 10 || marked_batches % 200 == 0) {
+			LOG(INFO) << "NetworkManager: batch_complete stores=" << marked_batches
+			          << " last_batch_seq=" << batch_header.batch_seq
+			          << " client_id=" << batch_header.client_id;
+		}
 		VLOG(4) << "NetworkManager: Marked batch complete for " << batch_header.num_msg << " messages, client_id=" << batch_header.client_id << ", order_level=" << seq_type;
+		static thread_local size_t batch_complete_logs = 0;
+		// Log first 10 batches and then every 100 batches for diagnostics
+		if (++batch_complete_logs <= 10 || batch_complete_logs % 100 == 0) {
+			LOG(INFO) << "NetworkManager: batch_complete=1 batch_seq=" << batch_header.batch_seq
+			          << " num_msg=" << batch_header.num_msg
+			          << " total_size=" << batch_header.total_size
+			          << " log_idx=" << batch_header.log_idx
+			          << " client_id=" << batch_header.client_id
+			          << " (total_complete=" << batch_complete_logs << ")";
+		}
 	} else {
 		LOG(WARNING) << "NetworkManager: batch_header_location is null for batch with " << batch_header.num_msg << " messages, order_level=" << seq_type;
 	}
@@ -1009,6 +1097,11 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	// Handle ack_level 2 explicitly (ack only after replication)
 	if (ack_level == 2 && replication_factor > 0) {
 		// ACK Level 2: Only acknowledge after full replication completes
+		// [[ACK_LEVEL_2_SEMANTICS]] - Durability guarantee:
+		// - Messages are acknowledged only after being replicated to disk on all replicas
+		// - Durability is "within periodic sync window" (default: 250ms or 64MiB)
+		// - This means ack_level=2 provides eventual durability, not immediate fsync durability
+		// - For stronger guarantees, consider adding explicit fsync() calls or configurable sync policy
 		size_t r[replication_factor];
 		for (int i = 0; i < replication_factor; i++) {
 			int b = (broker_id_ + num_brokers - i) % num_brokers;
@@ -1067,24 +1160,68 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 
 	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic=" << topic << ", ack_level=" << ack_level;
 
+	constexpr int kBrokerIdEpollTimeoutMs = 5000;
+	constexpr int kAckEpollTimeoutMs = 100;
+	constexpr int kMaxConsecutiveTimeouts = 20;
+	constexpr int kMaxConsecutiveErrors = 5;
+
+	auto reset_ack_epoll = [&](const char* context) -> bool {
+		if (ack_efd >= 0) {
+			close(ack_efd);
+		}
+		ack_efd = epoll_create1(0);
+		if (ack_efd == -1) {
+			LOG(ERROR) << "AckThread: epoll_create1 failed in " << context << ": " << strerror(errno);
+			return false;
+		}
+		struct epoll_event event;
+		event.data.fd = ack_fd;
+		event.events = EPOLLOUT;
+		if (epoll_ctl(ack_efd, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
+			LOG(ERROR) << "AckThread: epoll_ctl failed in " << context << ": " << strerror(errno);
+			close(ack_efd);
+			ack_efd = -1;
+			return false;
+		}
+		return true;
+	};
+
 	// Send broker_id first so client can distinguish
 	size_t acked_size = 0;
+	int consecutive_timeouts = 0;
+	int consecutive_errors = 0;
 	while (acked_size < sizeof(broker_id_)) {
 		// Add 5-second timeout to prevent infinite blocking if epoll fd is invalid
-		int n = epoll_wait(ack_efd, events, 10, 5000);  // 5 second timeout
+		int n = epoll_wait(ack_efd, events, 10, kBrokerIdEpollTimeoutMs);
 		
 		if (n == 0) {
-			LOG(ERROR) << "AckThread: Timeout sending broker_id for broker " << broker_id_;
-			close(ack_fd);
-			close(ack_efd);
-			return;
+			consecutive_timeouts++;
+			LOG(WARNING) << "AckThread: Timeout sending broker_id for broker " << broker_id_
+			             << " (timeout " << consecutive_timeouts << "/" << kMaxConsecutiveTimeouts << ")";
+			if (consecutive_timeouts >= kMaxConsecutiveTimeouts) {
+				if (!reset_ack_epoll("broker_id_timeout")) {
+					close(ack_fd);
+					return;
+				}
+				consecutive_timeouts = 0;
+			}
+			continue;
 		}
 		if (n < 0) {
-			LOG(ERROR) << "AckThread: epoll_wait failed: " << strerror(errno);
-			close(ack_fd);
-			close(ack_efd);
-			return;
+			consecutive_errors++;
+			LOG(ERROR) << "AckThread: epoll_wait failed while sending broker_id: " << strerror(errno)
+			           << " (error " << consecutive_errors << "/" << kMaxConsecutiveErrors << ")";
+			if (consecutive_errors >= kMaxConsecutiveErrors) {
+				if (!reset_ack_epoll("broker_id_error")) {
+					close(ack_fd);
+					return;
+				}
+				consecutive_errors = 0;
+			}
+			continue;
 		}
+		consecutive_timeouts = 0;
+		consecutive_errors = 0;
 
 		for (int i = 0; i < n; i++) {
 			if (events[i].events & EPOLLOUT) {
@@ -1123,6 +1260,8 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 	size_t next_to_ack_offset = 0;
 	auto last_log_time = std::chrono::steady_clock::now();
 
+	consecutive_timeouts = 0;
+	consecutive_errors = 0;
 	while (!stop_threads_) {
 		auto cycle_start = std::chrono::steady_clock::now();
 		constexpr auto SPIN_DURATION = std::chrono::microseconds(100);  // Spin for 100us to catch ACK updates
@@ -1144,12 +1283,17 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
 			size_t ack = GetOffsetToAck(topic, ack_level);
-			LOG(INFO) << "Broker:" << broker_id_ << " Acknowledgments " << ack << " (next_to_ack=" << next_to_ack_offset << ")";
 			TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
-			int replication_factor = tinode->replication_factor;
-			for (int i = 0; i < replication_factor; i++) {
-				int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
-				LOG(INFO) <<"\t done:" <<  tinode->offsets[b].replication_done[broker_id_];
+			size_t ordered = tinode ? tinode->offsets[broker_id_].ordered : 0;
+			LOG(INFO) << "Broker:" << broker_id_ << " Acknowledgments " << ack
+			          << " (next_to_ack=" << next_to_ack_offset
+			          << ", ordered=" << ordered << ")";
+			if (tinode) {
+				int replication_factor = tinode->replication_factor;
+				for (int i = 0; i < replication_factor; i++) {
+					int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
+					LOG(INFO) <<"\t done:" <<  tinode->offsets[b].replication_done[broker_id_];
+				}
 			}
 			last_log_time = now;
 		}
@@ -1170,7 +1314,35 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 			// Send offset acknowledgment
 			// Add timeout to epoll_wait to prevent infinite blocking
 			while (acked_size < sizeof(ack)) {
-				int n = epoll_wait(ack_efd_, events, 10, 100);
+				int n = epoll_wait(ack_efd, events, 10, kAckEpollTimeoutMs);
+				if (n == 0) {
+					consecutive_timeouts++;
+					if (consecutive_timeouts >= kMaxConsecutiveTimeouts) {
+						LOG(WARNING) << "AckThread: repeated ACK send timeouts for broker " << broker_id_
+						             << ", resetting epoll";
+						if (!reset_ack_epoll("ack_timeout")) {
+							close(ack_fd);
+							return;
+						}
+						consecutive_timeouts = 0;
+					}
+					continue;
+				}
+				if (n < 0) {
+					consecutive_errors++;
+					LOG(ERROR) << "AckThread: epoll_wait failed while sending ack: " << strerror(errno)
+					           << " (error " << consecutive_errors << "/" << kMaxConsecutiveErrors << ")";
+					if (consecutive_errors >= kMaxConsecutiveErrors) {
+						if (!reset_ack_epoll("ack_error")) {
+							close(ack_fd);
+							return;
+						}
+						consecutive_errors = 0;
+					}
+					continue;
+				}
+				consecutive_timeouts = 0;
+				consecutive_errors = 0;
 
 				for (int i = 0; i < n; i++) {
 					if (events[i].events & EPOLLOUT) {
@@ -1217,5 +1389,8 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 		}
 	}// end of while loop
 	close(ack_fd);
+	if (ack_efd >= 0) {
+		close(ack_efd);
+	}
 }
 } // namespace Embarcadero

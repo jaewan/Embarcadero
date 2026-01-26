@@ -6,6 +6,10 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <unordered_map>
+#ifdef __x86_64__
+#include <immintrin.h>  // For _mm_lfence
+#endif
 
 namespace Embarcadero {
 
@@ -62,18 +66,18 @@ Topic::Topic(
 			          << "ms for broker " << broker_id_ << " in topic: " << topic_name;
 		}
 		
-		// Initialize addresses based on offsets
-		log_addr_.store(static_cast<unsigned long long int>(
-					reinterpret_cast<uintptr_t>(cxl_addr_) + tinode_->offsets[broker_id_].log_offset));
+	// Initialize addresses based on offsets
+	log_addr_.store(static_cast<unsigned long long int>(
+				reinterpret_cast<uintptr_t>(cxl_addr_) + tinode_->offsets[broker_id_].log_offset));
 
-		batch_headers_ = static_cast<unsigned long long int>(
-				reinterpret_cast<uintptr_t>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	batch_headers_ = static_cast<unsigned long long int>(
+			reinterpret_cast<uintptr_t>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 
-		first_message_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) + 
-			tinode_->offsets[broker_id_].log_offset;
+	first_message_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) + 
+		tinode_->offsets[broker_id_].log_offset;
 
-		first_batch_headers_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) + 
-			tinode_->offsets[broker_id_].batch_headers_offset;
+	first_batch_headers_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) + 
+		tinode_->offsets[broker_id_].batch_headers_offset;
 
 		ack_level_ = tinode_->ack_level;
 		replication_factor_ = tinode_->replication_factor;
@@ -961,9 +965,9 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 				int num_brokers = get_num_brokers_callback_();
 				int b = (broker_id_ + num_brokers - i) % num_brokers;
 				if (tinode_->replicate_tinode) {
-					replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
-				}
-				tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+				replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+			}
+			tinode_->offsets[b].replication_done[broker_id_] = last_offset;
 			}
 		}
 		// This ensures in Corfu tinode.ordered collects the number of messages replicated
@@ -1050,9 +1054,15 @@ std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(
 		// Allocate space in log
 		log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
 
-		// Allocate space for batch header
+		// Allocate space for batch header (wrap within ring)
 		batch_headers_log = reinterpret_cast<void*>(batch_headers_);
 		batch_headers_ += sizeof(BatchHeader);
+		const unsigned long long int batch_headers_start =
+			reinterpret_cast<unsigned long long int>(first_batch_headers_addr_);
+		const unsigned long long int batch_headers_end = batch_headers_start + BATCHHEADERS_SIZE;
+		if (batch_headers_ >= batch_headers_end) {
+			batch_headers_ = batch_headers_start;
+		}
 		logical_offset = logical_offset_;
 		logical_offset_ += batch_header.num_msg;
 	}
@@ -1139,9 +1149,15 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		// Allocate space in log
 		log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
 
-		// Allocate space for batch header
+		// Allocate space for batch header (wrap within ring)
 		batch_headers_log = reinterpret_cast<void*>(batch_headers_);
 		batch_headers_ += sizeof(BatchHeader);
+		const unsigned long long int batch_headers_start =
+			reinterpret_cast<unsigned long long int>(first_batch_headers_addr_);
+		const unsigned long long int batch_headers_end = batch_headers_start + BATCHHEADERS_SIZE;
+		if (batch_headers_ >= batch_headers_end) {
+			batch_headers_ = batch_headers_start;
+		}
 		logical_offset = logical_offset_;
 		logical_offset_ += batch_header.num_msg;
 	}
@@ -1408,6 +1424,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 
 	size_t total_batches_processed = 0;
 	auto last_log_time = std::chrono::steady_clock::now();
+	size_t idle_cycles = 0;
 
 	// [[CRITICAL FIX: Simplified Polling Logic]]
 	// Match message_ordering.cc pattern: Simply check num_msg and advance if not ready
@@ -1416,16 +1433,43 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	// See docs/CRITICAL_BUG_FOUND_2026_01_26.md
 	
 	while (!stop_threads_) {
+		static thread_local size_t scan_loops = 0;
+		static thread_local size_t ready_batches_seen = 0;
+		
+		// [[PERFORMANCE: Optimized Polling Strategy]]
+		// Paper spec: Readers poll monotonic state without expensive cache invalidation every iteration
+		// Use throttled cache invalidation: flush every 1000 iterations instead of every iteration
+		// This reduces clflushopt+sfence overhead by 1000x while still ensuring visibility
+		if (scan_loops % 1000 == 0) {
+			// Every 1000 iterations, invalidate cache to ensure we see remote writes
+			CXL::flush_cacheline(current_batch_header);
+			// Use load fence (lfence) for read-side, not store fence (sfence) which is for writes
+#ifdef __x86_64__
+			_mm_lfence();  // Load fence ensures subsequent reads see fresh data
+#else
+			std::atomic_thread_fence(std::memory_order_acquire);  // Portable fallback
+#endif
+		}
+
 		// Check current batch header (matches message_ordering.cc:600-617 pattern)
 		// num_msg is uint32_t in BatchHeader, so read as volatile uint32_t for type safety
 		// For non-coherent CXL: volatile prevents compiler caching; ACQUIRE doesn't help cache coherence
 		volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
+		// Use batch_complete as the authoritative readiness signal for ORDER=5
+		volatile uint32_t batch_complete_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->batch_complete;
 		// Read log_idx as volatile for consistency (written by remote broker via NetworkManager)
 		volatile size_t log_idx_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->log_idx;
 		
 		// Max reasonable: 2MB batch / 64B min message = ~32k messages, use 100k as safety limit
 		constexpr uint32_t MAX_REASONABLE_NUM_MSG = 100000;
-		if (num_msg_check == 0 || log_idx_check == 0 || num_msg_check > MAX_REASONABLE_NUM_MSG) {
+		// Use batch_complete as the authoritative readiness signal for Sequencer 5
+		bool batch_ready = (batch_complete_check == 1);
+		if (!batch_ready || num_msg_check == 0 || num_msg_check > MAX_REASONABLE_NUM_MSG) {
+			if (++scan_loops % 1000000 == 0) {
+				LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: waiting batch_complete="
+				          << batch_complete_check << " num_msg=" << num_msg_check
+				          << " log_idx=" << log_idx_check;
+			}
 			// Current batch not ready or invalid - advance to next (matches message_ordering.cc pattern)
 			// This is the key: always advance when not ready, don't wait for written_addr
 			BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
@@ -1434,14 +1478,35 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				next_batch_header = ring_start_default;
 			}
 			current_batch_header = next_batch_header;
-			CXL::cpu_pause();
+			++idle_cycles;
+			if (idle_cycles >= 1024) {
+				std::this_thread::sleep_for(std::chrono::microseconds(50));
+				idle_cycles = 0;
+			} else {
+				CXL::cpu_pause();
+			}
 			continue;
+		}
+		size_t ready_seen = ++ready_batches_seen;
+		if (ready_seen <= 10 || ready_seen % 200 == 0) {
+			LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: batch_ready_seen=" << ready_seen
+			          << " batch_seq=" << current_batch_header->batch_seq
+			          << " client_id=" << current_batch_header->client_id
+			          << " num_msg=" << num_msg_check;
 		}
 
 		// Batch is ready - process it
 
 		// Valid batch found - use the volatile values we already read
-		VLOG(3) << "BrokerScannerWorker5 [B" << broker_id << "]: Found valid batch with " << num_msg_check << " messages, batch_seq=" << current_batch_header->batch_seq << ", client_id=" << current_batch_header->client_id;
+		static thread_local size_t processed_logs = 0;
+		if (++processed_logs <= 10 || processed_logs % 100 == 0) {
+			LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: Found valid batch with " 
+			         << num_msg_check << " messages, batch_seq=" << current_batch_header->batch_seq 
+			         << ", client_id=" << current_batch_header->client_id
+			         << " (total_processed=" << processed_logs << ")";
+		} else {
+			VLOG(3) << "BrokerScannerWorker5 [B" << broker_id << "]: Found valid batch with " << num_msg_check << " messages, batch_seq=" << current_batch_header->batch_seq << ", client_id=" << current_batch_header->client_id;
+		}
 
 		BatchHeader* header_to_process = current_batch_header;
 		size_t client_id = current_batch_header->client_id;
@@ -1460,6 +1525,14 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 
 		AssignOrder5(header_to_process, start_total_order, header_for_sub);
 		total_batches_processed++;
+		idle_cycles = 0;
+
+		// Clear readiness marker so each slot is processed exactly once.
+		// Slot lifecycle: writer sets batch_complete=1 -> sequencer processes -> sequencer clears to 0.
+		header_to_process->batch_complete = 0;
+		header_to_process->num_msg = 0;
+		CXL::flush_cacheline(header_to_process);
+		CXL::store_fence();
 
 		// [[CRITICAL FIX: Removed Prefetching]] - Prefetching remote-writer data violates non-coherent CXL semantics
 		// Batch headers are written by NetworkManager (remote broker) and read by Sequencer (head broker)
@@ -1532,14 +1605,18 @@ void Topic::AssignOrder5(BatchHeader* batch_to_order, size_t start_total_order, 
 	tinode_->offsets[broker].ordered_offset = ordered_offset;
 
 	// [[DEV-005: Optimize Flush Frequency]]
-	// CRITICAL FIX: Flush the SEQUENCER region cachelines (bytes 256-511)
-	// offset_entry is alignas(256) with two 256B sub-structs:
-	// - First 256B: broker region (written_addr, etc.)
-	// - Second 256B: sequencer region (ordered, ordered_offset) <- WE NEED TO FLUSH THIS
-	// Address of sequencer region is at broker region + 256 bytes
-	// 
+	// Flush the SEQUENCER region cachelines (bytes 512-767 within 768B offset_entry)
+	// offset_entry layout (768 bytes total):
+	// - bytes 0-255: broker_region (log_offset, batch_headers_offset, written, written_addr, padding)
+	// - bytes 256-511: replication_done[NUM_MAX_BROKERS] (replication progress)
+	// - bytes 512-767: sequencer_region (ordered, ordered_offset, padding) <- WE NEED TO FLUSH THIS
+	//
+	// With flat layout (no nested structs), 'ordered' is at offset 512 relative to offset_entry base.
+	// CXL::flush_cacheline will flush the full 64B cache line containing 'ordered'.
+	// This ensures both 'ordered' and 'ordered_offset' (@ offset +8 from ordered) are visible.
+	//
 	// OPTIMIZATION: Combine two flushes before single fence
-	// Both sequencer-region and BatchHeader flushes can precede the same fence
+	// Both sequencer-fields and BatchHeader flushes can precede the same fence
 	// This reduces serialization overhead vs. flush-fence-flush-fence pattern
 	const void* seq_region = const_cast<const void*>(static_cast<const volatile void*>(&tinode_->offsets[broker].ordered));
 	CXL::flush_cacheline(seq_region);

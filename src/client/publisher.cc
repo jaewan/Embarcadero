@@ -80,12 +80,9 @@ void Publisher::Init(int ack_level) {
 	
 
 	// Generate unique port for acknowledgment server with retry logic
-	ack_port_ = GenerateRandomNum();
-	
-	// Ensure port is in a safe range (avoid privileged ports and common services)
-	if (ack_port_ < 10000) {
-		ack_port_ += 10000;  // Move to safe range 10000+
-	}
+	// Ensure port is always in safe range 10000-65535 (avoid privileged ports < 1024)
+	// Use modulo to ensure it fits in valid port range
+	ack_port_ = (GenerateRandomNum() % (65535 - 10000 + 1)) + 10000;
 
 	// Start acknowledgment thread if needed
 	if (ack_level >= 1) {
@@ -105,9 +102,37 @@ void Publisher::Init(int ack_level) {
 			this->SubscribeToClusterStatus();
 			});
 
-	// Wait for connection to be established
+	// Wait for connection to be established with timeout and logging
+	auto connection_start = std::chrono::steady_clock::now();
+	auto last_log_time = connection_start;
+	constexpr auto CONNECTION_TIMEOUT = std::chrono::seconds(60);
+	constexpr auto LOG_INTERVAL = std::chrono::seconds(5);
+	
 	while (!connected_) {
+		auto now = std::chrono::steady_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - connection_start);
+		
+		// Check for timeout
+		if (elapsed >= CONNECTION_TIMEOUT) {
+			LOG(ERROR) << "Publisher::Init() timed out waiting for cluster connection after " 
+			           << elapsed.count() << " seconds. This indicates gRPC SubscribeToCluster is failing.";
+			LOG(ERROR) << "Check broker gRPC service availability and network connectivity.";
+			break; // Exit to avoid infinite hang
+		}
+		
+		// Log progress every 5 seconds
+		if (now - last_log_time >= LOG_INTERVAL) {
+			LOG(WARNING) << "Publisher::Init() waiting for cluster connection... (" 
+			            << elapsed.count() << "s elapsed)";
+			last_log_time = now;
+		}
+		
 		Embarcadero::CXL::cpu_pause();
+	}
+	
+	if (!connected_) {
+		LOG(ERROR) << "Publisher::Init() failed - cluster connection was not established. "
+		          << "Publisher will not be able to send messages.";
 	}
 
 	// Initialize Corfu sequencer if needed
@@ -176,6 +201,8 @@ void Publisher::Publish(char* message, size_t len) {
 void Publisher::Poll(size_t n) {
 	// Signal that publishing is finished
 	publish_finished_ = true;
+	// Ensure the final partial batch is sealed before shutting down reads
+	WriteFinishedOrPuased();
 	pubQue_.ReturnReads();
 
 	// Wait for all messages to be queued
@@ -348,7 +375,7 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 }
 
 void Publisher::WriteFinishedOrPuased() {
-	pubQue_.Seal();
+	pubQue_.SealAll();
 }
 
 void Publisher::EpollAckThread() {
@@ -411,10 +438,8 @@ void Publisher::EpollAckThread() {
 		if (errno == EADDRINUSE) {
 			// Port in use, try a different port
 			bind_attempts++;
-			ack_port_ = GenerateRandomNum();
-			if (ack_port_ < 10000) {
-				ack_port_ += 10000;
-			}
+			// Ensure port is always in safe range 10000-65535
+			ack_port_ = (GenerateRandomNum() % (65535 - 10000 + 1)) + 10000;
 			server_addr.sin_port = htons(ack_port_);
 			LOG(WARNING) << "Port " << (ack_port_ - 1) << " in use, trying port " << ack_port_ 
 			             << " (attempt " << bind_attempts << "/" << max_bind_attempts << ")";
@@ -651,6 +676,10 @@ close(server_sock);
 }
 
 void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
+	static std::atomic<size_t> total_batches_sent{0};
+	static std::atomic<size_t> total_batches_attempted{0};
+	static std::atomic<size_t> total_batches_failed{0};
+
 	int sock = -1;
 	int efd = -1;
 
@@ -683,9 +712,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		}
 
 		// Create socket
+		LOG(INFO) << "PublishThread: Connecting to broker " << brokerId << " at " << addr << ":" << (PORT + brokerId);
 		sock = GetNonblockingSock(const_cast<char*>(addr.c_str()), PORT + brokerId);
 		if (sock < 0) {
-			LOG(ERROR) << "Failed to create socket to broker " << brokerId;
+			LOG(ERROR) << "PublishThread: Failed to create socket to broker " << brokerId << " at " << addr << ":" << (PORT + brokerId);
 			return false;
 		}
 
@@ -763,6 +793,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					} else {
 						sent_bytes += bytesSent;
 						if (sent_bytes == sizeof(shake)) {
+							LOG(INFO) << "PublishThread: Handshake sent successfully to broker " << brokerId 
+							         << " (client_id=" << client_id_ << ", topic=" << topic_ << ")";
 							running = false;
 							break;
 						}
@@ -771,20 +803,32 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 		}
 
+		if (sent_bytes != sizeof(shake)) {
+			LOG(ERROR) << "PublishThread: Handshake incomplete - sent " << sent_bytes 
+			          << " of " << sizeof(shake) << " bytes to broker " << brokerId;
+			return false;
+		}
+
 		return true;
 	};
 
 	// Connect to initial broker
+	LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Starting connection to broker " << broker_id;
 	if (!connect_to_server(broker_id)) {
-		LOG(ERROR) << "Failed to connect to broker " << broker_id;
+		LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Failed to connect to broker " << broker_id;
 		return;
 	}
+	LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Successfully connected to broker " << broker_id;
 
 	// Signal thread is initialized
 	thread_count_.fetch_add(1);
+	LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Thread initialized, thread_count=" << thread_count_.load();
 
 	// Track batch sequence for this thread
 	size_t batch_seq = pubQuesIdx;
+	
+	// Track if we've sent at least one batch (to ensure connection is used)
+	bool has_sent_batch = false;
 
 	// Main publishing loop
 	while (!shutdown_) {
@@ -799,13 +843,42 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		// Skip if no batch is available
 		if (batch_header == nullptr || batch_header->total_size == 0) {
 			if (publish_finished_ || shutdown_) {
-			// PublishThread exiting
+				// CRITICAL: Don't exit immediately if we haven't sent any batches yet
+				// This ensures the connection stays alive even if this thread got no batches
+				// NetworkManager expects to receive at least one batch header per connection
+				if (!has_sent_batch) {
+					LOG(WARNING) << "PublishThread[" << pubQuesIdx << "]: No batches to send, but keeping connection alive. "
+					            << "This thread may have been assigned to a buffer with no data.";
+					// Wait a bit to see if batches arrive, then exit gracefully
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				}
+				// PublishThread exiting
+				LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Exiting - publish_finished=" 
+				         << publish_finished_ << ", shutdown=" << shutdown_ 
+				         << ", has_sent_batch=" << has_sent_batch;
 				break;
 		} else {
+			// Log periodically when waiting for batches
+			static thread_local size_t wait_count = 0;
+			if (++wait_count % 100000 == 0) {
+				LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Waiting for batches from buffer " 
+				         << pubQuesIdx << " (wait_count=" << wait_count << ")";
+			}
 			Embarcadero::CXL::cpu_pause();
 			continue;
 		}
 		}
+
+		// Log when we successfully read a batch
+		static thread_local size_t batch_count = 0;
+		if (++batch_count % 100 == 0 || batch_count == 1) {
+			LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Read batch " << batch_count 
+			         << " from buffer " << pubQuesIdx 
+			         << " (batch_seq=" << batch_header->batch_seq 
+			         << ", num_msg=" << batch_header->num_msg 
+			         << ", total_size=" << batch_header->total_size << ")";
+		}
+		total_batches_attempted.fetch_add(1, std::memory_order_relaxed);
 
 		batch_header->client_id = client_id_;
 		batch_header->broker_id = broker_id;
@@ -900,7 +973,12 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		// Try to send batch header, handle failures
 		try {
 			send_batch_header();
+			if (batch_count % 100 == 0 || batch_count == 1) {
+				LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Sent batch header for batch " 
+				         << batch_count << " to broker " << broker_id;
+			}
 		} catch (const std::exception& e) {
+			total_batches_failed.fetch_add(1, std::memory_order_relaxed);
 			LOG(ERROR) << "Exception sending batch header: " << e.what();
 			std::string fail_msg = "Header Send Fail Broker " + std::to_string(broker_id) + " (" + e.what() + ")";
 			RecordFailureEvent(fail_msg); // Record event
@@ -940,6 +1018,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			try {
 				send_batch_header();
 			} catch (const std::exception& e) {
+				total_batches_failed.fetch_add(1, std::memory_order_relaxed);
 				LOG(ERROR) << "Failed to send batch header to replacement broker: " << e.what();
 				std::string fail_msg2 = "Header Send Fail (Post-Reconnect) Broker " + std::to_string(new_broker_id) + " (" + e.what() + ")";
 				RecordFailureEvent(fail_msg2);
@@ -955,7 +1034,14 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		size_t sent_bytes = 0;
 		size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
 
+		// CRITICAL: Ensure all batch data is sent before checking publish_finished_
+		// This prevents premature thread exit while data is still in flight
 		while (sent_bytes < len) {
+			// Check for shutdown but don't exit mid-send - finish sending current batch
+			if (shutdown_ && !publish_finished_) {
+				LOG(WARNING) << "PublishThread[" << pubQuesIdx << "]: Shutdown requested but batch not fully sent ("
+				           << sent_bytes << " of " << len << " bytes). Completing send...";
+			}
 			size_t remaining_bytes = len - sent_bytes;
 			size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
 
@@ -1040,6 +1126,28 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 		}
 
+		// Mark that we've sent at least one batch
+		has_sent_batch = true;
+		size_t total_sent = total_batches_sent.fetch_add(1, std::memory_order_relaxed) + 1;
+
+		// Log when batch is fully sent
+		if (batch_count % 100 == 0 || batch_count == 1) {
+			LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Fully sent batch " << batch_count 
+			         << " to broker " << broker_id << " (" << len << " bytes, sent_bytes=" << sent_bytes << ")";
+		}
+		if (total_sent % 500 == 0) {
+			LOG(INFO) << "Publisher: total_batches_sent=" << total_sent
+			          << " total_batches_attempted=" << total_batches_attempted.load(std::memory_order_relaxed)
+			          << " total_batches_failed=" << total_batches_failed.load(std::memory_order_relaxed);
+		}
+
+		// Verify all data was sent
+		if (sent_bytes != len) {
+			LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Batch send incomplete! Sent " 
+			          << sent_bytes << " of " << len << " bytes for batch " << batch_count 
+			          << " to broker " << broker_id;
+		}
+
 		// Update batch sequence for next iteration
 		batch_seq += num_threads_.load();
 	}
@@ -1051,6 +1159,9 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	// NOTE: We intentionally do NOT close sock and efd here to keep broker connections alive
 	// This allows the subscriber to continue working after publisher finishes
 	// Resources will be cleaned up in the Publisher destructor
+	LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Exiting main loop. Socket " << sock 
+	         << " kept open for ACKs. publish_finished=" << publish_finished_ 
+	         << ", shutdown=" << shutdown_;
 }
 
 void Publisher::SubscribeToClusterStatus() {
@@ -1066,12 +1177,22 @@ void Publisher::SubscribeToClusterStatus() {
 	}
 
 	// Create gRPC reader
+	LOG(INFO) << "SubscribeToCluster: Creating gRPC reader for cluster status subscription...";
 	std::unique_ptr<grpc::ClientReader<ClusterStatus>> reader(
 			stub_->SubscribeToCluster(&context_, client_info));
+	
+	if (!reader) {
+		LOG(ERROR) << "SubscribeToCluster: Failed to create gRPC reader. Check broker gRPC service availability.";
+		return;
+	}
+	
+	LOG(INFO) << "SubscribeToCluster: gRPC reader created successfully, waiting for cluster status...";
 
 	// Process cluster status updates
 	while (!shutdown_) {
 		if (reader->Read(&cluster_status)) {
+			LOG(INFO) << "SubscribeToCluster: Received cluster status update with " 
+			         << cluster_status.new_nodes_size() << " new nodes";
 			const auto& new_nodes = cluster_status.new_nodes();
 
 			if (!new_nodes.empty()) {
@@ -1096,8 +1217,12 @@ void Publisher::SubscribeToClusterStatus() {
 
 			// If this is initial connection, connect to all brokers
 			if (!connected_) {
+				LOG(INFO) << "SubscribeToCluster: Initial connection - connecting to " 
+				         << brokers_.size() << " brokers";
+				
 				// Connect to all brokers (including head node)
 				for (int broker_id : brokers_) {
+					LOG(INFO) << "SubscribeToCluster: Adding publisher threads for broker " << broker_id;
 					if (!AddPublisherThreads(num_threads_per_broker_, broker_id)) {
 						LOG(ERROR) << "Failed to add publisher threads for broker " << broker_id;
 						return;
@@ -1106,6 +1231,7 @@ void Publisher::SubscribeToClusterStatus() {
 
 				// If no brokers were discovered, connect to head node (broker 0) as fallback
 				if (brokers_.empty()) {
+					LOG(WARNING) << "SubscribeToCluster: No brokers discovered, using head broker (0) as fallback";
 					if (!AddPublisherThreads(num_threads_per_broker_, 0)) {
 						LOG(ERROR) << "Failed to add publisher threads for head broker";
 						return;
@@ -1115,17 +1241,30 @@ void Publisher::SubscribeToClusterStatus() {
 
 				// Signal that we're connected
 				connected_ = true;
+				LOG(INFO) << "SubscribeToCluster: Connection established successfully. connected_=true";
 			}
 		} else {
 			// Handle read error or end of stream
 			if (!shutdown_) {
 				static auto last_warning = std::chrono::steady_clock::now();
+				static size_t read_fail_count = 0;
 				auto now = std::chrono::steady_clock::now();
+				read_fail_count++;
 				
-				// Only log warning every 5 seconds to avoid spam
+				// Log warning every 5 seconds with failure count
 				if (now - last_warning > std::chrono::seconds(5)) {
-				// Cluster status stream ended, reconnecting...
-				last_warning = now;
+					LOG(WARNING) << "SubscribeToCluster: reader->Read() returned false (stream ended or error). "
+					            << "Failure count: " << read_fail_count 
+					            << ". This may indicate gRPC connection issues or broker unavailability.";
+					
+					// Check if we're still waiting for initial connection
+					if (!connected_) {
+						LOG(ERROR) << "SubscribeToCluster: Initial connection not established after " 
+						           << read_fail_count << " read attempts. "
+						           << "Check if head broker gRPC service is running and accessible.";
+					}
+					
+					last_warning = now;
 				}
 				
 				// Add a small delay before reconnecting to avoid tight loop

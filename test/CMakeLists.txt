@@ -18,10 +18,21 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
+add_test(
+    NAME e2e_explicit_replication_order5_ack2
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_explicit_replication_order5_ack2.sh
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
 # Set test properties
 set_tests_properties(e2e_basic_publish PROPERTIES
     TIMEOUT 300  # 5 minutes max
     LABELS "e2e;basic;smoke"
+)
+
+set_tests_properties(e2e_explicit_replication_order5_ack2 PROPERTIES
+    TIMEOUT 600  # 10 minutes max (replication may take longer)
+    LABELS "e2e;replication;order5;ack2"
 )
 
 # TODO: Unit tests (currently disabled, see archive/)

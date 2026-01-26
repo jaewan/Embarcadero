@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TESTS=(
     "test_basic_publish.sh"
+    "test_explicit_replication_order5_ack2.sh"
     # Add more tests here as they're created:
     # "test_ordering.sh"
     # "test_durability.sh"
