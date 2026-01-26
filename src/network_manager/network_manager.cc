@@ -833,31 +833,35 @@ void NetworkManager::SubscribeNetworkThread(
 			absl::MutexLock lock(&(*cached_state_ptr)->mu);
 
 			if (order == 5) {
-				// For Sequencer 5: Get batch with metadata
-				size_t batch_total_order = 0;
-				uint32_t num_messages = 0;
-				static int no_data_count = 0;
-				if (!topic_manager_->GetBatchToExportWithMetadata(
-							topic,
-							(*cached_state_ptr)->last_offset,
-							msg,
-							messages_size,
-							batch_total_order,
-							num_messages)){
-					no_data_count++;
-					if (no_data_count % 1000 == 0) {
-						LOG(INFO) << "SubscribeNetworkThread: No data available for export yet (count=" << no_data_count 
-						          << "), topic=" << topic << ", last_offset=" << (*cached_state_ptr)->last_offset;
-					}
-					std::this_thread::yield();
-					continue;
+			// For Sequencer 5: Get batch with metadata
+			size_t batch_total_order = 0;
+			uint32_t num_messages = 0;
+			static int no_data_count = 0;
+			if (!topic_manager_->GetBatchToExportWithMetadata(
+						topic,
+						(*cached_state_ptr)->last_offset,
+						msg,
+						messages_size,
+						batch_total_order,
+						num_messages)){
+				no_data_count++;
+				if (no_data_count % 1000 == 0) {
+					LOG(INFO) << "SubscribeNetworkThread: No data available for export yet (count=" << no_data_count 
+					          << "), topic=" << topic << ", last_offset=" << (*cached_state_ptr)->last_offset;
 				}
-				no_data_count = 0;  // Reset counter when data becomes available
-				// Store metadata for sending
-				batch_meta.batch_total_order = batch_total_order;
-				batch_meta.num_messages = num_messages;
-				LOG(INFO) << "SubscribeNetworkThread: Sending batch metadata, total_order=" << batch_total_order 
-				          << ", num_messages=" << num_messages << ", topic=" << topic;
+				std::this_thread::yield();
+				continue;
+			}
+			no_data_count = 0;  // Reset counter when data becomes available
+			// Store metadata for sending
+			batch_meta.batch_total_order = batch_total_order;
+			batch_meta.num_messages = num_messages;
+			// [[BLOG_HEADER: Set header_version based on feature flag]]
+			batch_meta.header_version = HeaderUtils::ShouldUseBlogHeader() ? 2 : 1;
+			batch_meta.flags = 0;
+			LOG(INFO) << "SubscribeNetworkThread: Sending batch metadata, total_order=" << batch_total_order 
+			          << ", num_messages=" << num_messages << ", header_version=" << batch_meta.header_version 
+			          << ", topic=" << topic;
 			} else if (order > 0){
 				if (!topic_manager_->GetBatchToExport(
 							topic,
@@ -867,22 +871,40 @@ void NetworkManager::SubscribeNetworkThread(
 						std::this_thread::yield();
 						continue;
 }
-			}else{
-				if (topic_manager_->GetMessageAddr(
-									topic,
-									(*cached_state_ptr)->last_offset,
-									(*cached_state_ptr)->last_addr,
-									msg,
-									messages_size)) {
-						// Split large messages into chunks for better flow control
-						while (messages_size > zero_copy_send_limit) {
-							struct LargeMsgRequest r;
-							r.msg = msg;
+		}else{
+			if (topic_manager_->GetMessageAddr(
+								topic,
+								(*cached_state_ptr)->last_offset,
+								(*cached_state_ptr)->last_addr,
+								msg,
+								messages_size)) {
+					// [[BLOG_HEADER: Split large messages with version-aware boundary]]
+					// Split large messages into chunks for better flow control
+					bool using_blog_header = HeaderUtils::ShouldUseBlogHeader();
+					
+					while (messages_size > zero_copy_send_limit) {
+						struct LargeMsgRequest r;
+						r.msg = msg;
 
 						// Ensure we don't cut in the middle of a message
-						size_t padded_size = ((MessageHeader*)msg)->paddedSize;
+						// For v2 BlogMessageHeader, compute size from BlogMessageHeader fields
+						size_t padded_size = 0;
+						if (using_blog_header) {
+							Embarcadero::BlogMessageHeader* v2_hdr = 
+								reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg);
+							// Compute padded size from v2 fields
+							size_t payload_size = v2_hdr->size;
+							padded_size = sizeof(Embarcadero::BlogMessageHeader) + payload_size;
+							if (padded_size % 64 != 0) {
+								padded_size += 64 - (padded_size % 64);
+							}
+						} else {
+							// v1 MessageHeader uses paddedSize
+							padded_size = ((MessageHeader*)msg)->paddedSize;
+						}
+						
 						if (padded_size == 0) {
-							LOG(ERROR) << "SubscribeNetworkThread: paddedSize is 0, skipping message to avoid SIGFPE";
+							LOG(ERROR) << "SubscribeNetworkThread: Invalid message size, skipping to avoid SIGFPE";
 							break; // Exit the large message splitting loop
 						}
 						int mod = zero_copy_send_limit % padded_size;
@@ -892,12 +914,12 @@ void NetworkManager::SubscribeNetworkThread(
 							msg = (uint8_t*)msg + r.len;
 							messages_size -= r.len;
 						}
-				} else {
-					// No new messages, yield and try again
-					std::this_thread::yield();
-					continue;
-				}
+			} else {
+				// No new messages, yield and try again
+				std::this_thread::yield();
+				continue;
 			}
+		}
 		}
 
 		// Validate message size
