@@ -249,10 +249,6 @@ namespace Embarcadero{
 		}
 
 		// Common variables for both memory and disk paths
-		size_t current_offset = 0; // Current write position within log_addr
-		int order = req.tinode->order;
-		TInode* replica_tinode = req.replica_tinode;
-		bool replicate_tinode = req.tinode->replicate_tinode;
 		size_t offset = 0;
 		size_t disk_offset = 0;
 		
@@ -270,6 +266,11 @@ namespace Embarcadero{
 		auto last_sync_time = std::chrono::steady_clock::now();
 		constexpr size_t kSyncBytesThreshold = 64 * 1024 * 1024; // 64 MiB
 		constexpr auto kSyncTimeThreshold = std::chrono::milliseconds(250); // 250 ms
+		
+		// [[PERF_CLEANUPS]] - Scan backoff state (spin→sleep pattern for low-load efficiency)
+		auto last_batch_found = std::chrono::steady_clock::now();
+		constexpr auto kSpinDuration = std::chrono::microseconds(100);  // Spin for 100us
+		constexpr auto kSleepDuration = std::chrono::milliseconds(1);    // Then sleep for 1ms
 
 		while (!stop_threads_) {
 			// [[EXPLICIT_REPLICATION_STAGE4]] - Use batch-based replication for all orders
@@ -279,56 +280,131 @@ namespace Embarcadero{
 					batch_payload, batch_payload_size,
 					batch_start_logical_offset, batch_last_logical_offset)) {
 				
-				// Write batch payload to disk
+				last_batch_found = std::chrono::steady_clock::now();  // Reset backoff timer
+				
+				// Flag to track if batch write succeeded
+				bool batch_write_success = true;
+				
+				// Write batch payload to disk (with proper short-write handling)
 				if (batch_payload_size > 0) {
 					if(log_to_memory_){
 						memcpy((uint8_t*)log_addr + offset, batch_payload, batch_payload_size);
 						offset += batch_payload_size;
 						if (offset > log_capacity) offset = 0;
 					}else{
-						ssize_t written = pwrite(fd, batch_payload, batch_payload_size, disk_offset);
-						if (written <= 0) {
-							LOG(ERROR) << "pwrite failed for batch in broker " << req.broker_id << ": " << strerror(errno);
-							CXL::cpu_pause();
-							continue;
+						// [[FIX-SHORT-WRITES]] - Handle partial writes and EINTR properly
+						size_t bytes_written_total = 0;
+						while (bytes_written_total < batch_payload_size) {
+							size_t bytes_remaining = batch_payload_size - bytes_written_total;
+							const uint8_t* src = reinterpret_cast<const uint8_t*>(batch_payload) + bytes_written_total;
+							off_t current_pos = disk_offset + bytes_written_total;
+							
+							ssize_t written = pwrite(fd, src, bytes_remaining, current_pos);
+							
+							if (written < 0) {
+								// Error on pwrite
+								if (errno == EINTR) {
+									// Interrupted by signal; retry
+									VLOG(2) << "[ReplicateThread B" << req.broker_id << "]: pwrite interrupted (EINTR), retrying";
+									continue;
+								} else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+									// Non-blocking I/O would block; backoff and retry
+									VLOG(2) << "[ReplicateThread B" << req.broker_id << "]: pwrite would block (EAGAIN), backing off";
+									std::this_thread::sleep_for(std::chrono::microseconds(100));
+									continue;
+								} else {
+									// Permanent error; log and mark batch as failed
+									LOG(ERROR) << "[ReplicateThread B" << req.broker_id << "]: pwrite failed at offset " 
+										<< current_pos << " (written " << bytes_written_total << "/" << batch_payload_size 
+										<< " bytes): " << strerror(errno);
+									// DO NOT advance replication_done on error
+									batch_write_success = false;
+									CXL::cpu_pause();
+									break;  // Exit write loop, skip replication_done update
+								}
+							} else if (written == 0) {
+								// No bytes written, but no error; this is unusual but might happen
+								LOG(WARNING) << "[ReplicateThread B" << req.broker_id << "]: pwrite returned 0";
+								// Backoff and retry
+								std::this_thread::sleep_for(std::chrono::microseconds(100));
+								continue;
+							} else {
+								// Partial or full write succeeded
+								bytes_written_total += written;
+								bytes_since_sync += written;
+							}
 						}
-						bytes_since_sync += written;
 					}
 					disk_offset += batch_payload_size;
 				}
 				
-				// Check if periodic sync is needed
-				if (!log_to_memory_) {
-					auto now = std::chrono::steady_clock::now();
-					bool sync_needed = (bytes_since_sync >= kSyncBytesThreshold) ||
-					                   (now - last_sync_time >= kSyncTimeThreshold);
-					
-					if (sync_needed && bytes_since_sync > 0) {
-						if (fdatasync(fd) < 0) {
-							LOG(ERROR) << "fdatasync failed for broker " << req.broker_id << ": " << strerror(errno);
+				// Only proceed with sync and replication_done update if write succeeded
+				if (batch_write_success) {
+					// Check if periodic sync is needed
+					if (!log_to_memory_) {
+						auto now = std::chrono::steady_clock::now();
+						bool sync_needed = (bytes_since_sync >= kSyncBytesThreshold) ||
+						                   (now - last_sync_time >= kSyncTimeThreshold);
+						
+						if (sync_needed && bytes_since_sync > 0) {
+							if (fdatasync(fd) < 0) {
+								LOG(ERROR) << "fdatasync failed for broker " << req.broker_id << ": " << strerror(errno);
+							}
+							bytes_since_sync = 0;
+							last_sync_time = now;
 						}
-						bytes_since_sync = 0;
-						last_sync_time = now;
 					}
+					
+					// Update replication_done to signal ACK level 2
+					// [[EXPLICIT_REPLICATION_STAGE4]] - Flush after replication_done update
+					// Only advance replication_done after full batch is successfully written to disk
+					TInode* replica_tinode = req.replica_tinode;
+					bool replicate_tinode = req.tinode->replicate_tinode;
+					if(replicate_tinode){
+						replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
+					}
+					req.tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
+					
+					// Flush the updated replication_done so other hosts (ACK thread) can observe it under non-coherent CXL
+					const void* rep_done_addr = reinterpret_cast<const void*>(
+						const_cast<const uint64_t*>(&req.tinode->offsets[broker_id_].replication_done[req.broker_id]));
+					CXL::flush_cacheline(rep_done_addr);
+					
+					// [[FLUSH_DUAL_WRITE]] - If dual-writing to replica_tinode, flush that too for CXL visibility
+					if(replicate_tinode){
+						const void* replica_rep_done_addr = reinterpret_cast<const void*>(
+							const_cast<const uint64_t*>(&replica_tinode->offsets[broker_id_].replication_done[req.broker_id]));
+						CXL::flush_cacheline(replica_rep_done_addr);
+					}
+					
+					CXL::store_fence();
+					
+					VLOG(3) << "[ReplicationThread B" << req.broker_id << "]: Replicated batch, last_offset=" 
+							<< batch_last_logical_offset << ", disk_offset=" << disk_offset;
 				}
-				
-				// Update replication_done to signal ACK level 2
-				// [[EXPLICIT_REPLICATION_STAGE4]] - Flush after replication_done update
-				if(replicate_tinode){
-					replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
-				}
-				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
-				
-				// Flush the updated replication_done so other hosts (ACK thread) can observe it under non-coherent CXL
-				const void* rep_done_addr = reinterpret_cast<const void*>(
-					const_cast<const int*>(&req.tinode->offsets[broker_id_].replication_done[req.broker_id]));
-				CXL::flush_cacheline(rep_done_addr);
-				CXL::store_fence();
-				
-				VLOG(3) << "[ReplicationThread B" << req.broker_id << "]: Replicated batch, last_offset=" 
-						<< batch_last_logical_offset << ", disk_offset=" << disk_offset;
 			} else {
-				CXL::cpu_pause();
+				// [[PERF_CLEANUPS]] - Spin-then-sleep backoff when no batch found
+				// Similar to AckThread pattern: spin for 100us first, then sleep if nothing found
+				auto spin_start = std::chrono::steady_clock::now();
+				bool found_batch = false;
+				
+				while (std::chrono::steady_clock::now() - spin_start < kSpinDuration) {
+					// Try one more time before sleeping
+					if (GetNextReplicationBatch(req.tinode, req.broker_id,
+							batch_ring_start, batch_ring_end, current_batch, disk_offset,
+							batch_payload, batch_payload_size,
+							batch_start_logical_offset, batch_last_logical_offset)) {
+						found_batch = true;
+						last_batch_found = std::chrono::steady_clock::now();
+						break;
+					}
+					CXL::cpu_pause();  // Efficient spin-wait on CXL
+				}
+				
+				// If still no batch after spinning, sleep briefly
+				if (!found_batch) {
+					std::this_thread::sleep_for(kSleepDuration);
+				}
 			}
 		} // End while(!stop_threads_)
 		
@@ -348,7 +424,7 @@ namespace Embarcadero{
 			if (log_addr != nullptr && log_addr != MAP_FAILED) {
 				VLOG(2) << "[ReplicateThread " << req.broker_id << "]: Syncing mmaped file.";
 				// Ensure data is written to disk before closing
-				if (msync(log_addr, current_offset, MS_SYNC) == -1) {
+				if (msync(log_addr, offset, MS_SYNC) == -1) {
 					LOG(ERROR) << "Failed to msync log file for target " << req.broker_id << ": " << strerror(errno);
 				}
 			}
@@ -403,23 +479,77 @@ namespace Embarcadero{
 		// Use a reasonable upper bound to prevent infinite loops
 		size_t MAX_SCAN_ATTEMPTS = 10000;  // Up to ~10k batches per scan
 		for (size_t i = 0; i < MAX_SCAN_ATTEMPTS; ++i) {
-			// Read batch header fields as volatile (sender writes from remote broker)
-			volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->num_msg;
+			// [[DEVIATION_006: Export Chain Semantics]] 
+			// Read ordered flag from the *slot* (like export does in Topic::GetBatchToExport)
 			volatile uint32_t ordered_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->ordered;
-			volatile size_t total_size_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->total_size;
-			volatile size_t log_idx_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->log_idx;
-			volatile size_t start_logical_offset_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->start_logical_offset;
+			
+			if (ordered_check != 1) {
+				// Current slot not yet ordered, advance and try next
+				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+				if (next_batch >= batch_ring_end) {
+					next_batch = batch_ring_start;
+				}
+				current_batch = next_batch;
+				continue;
+			}
+			
+			// ordered == 1: Follow the export chain to the actual batch header
+			// batch_off_to_export is a byte offset from current_batch to the real batch
+			volatile int64_t batch_off_to_export_check = 
+				reinterpret_cast<volatile BatchHeader*>(current_batch)->batch_off_to_export;
+			
+			// Bounds validation for batch_off_to_export
+			// Must point within the batch ring and be aligned to BatchHeader size
+			if (batch_off_to_export_check < 0 || 
+			    batch_off_to_export_check >= static_cast<int64_t>(BATCHHEADERS_SIZE) ||
+			    batch_off_to_export_check % sizeof(BatchHeader) != 0) {
+				LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
+					<< "]: Invalid batch_off_to_export=" << batch_off_to_export_check 
+					<< " (must be in [0, " << BATCHHEADERS_SIZE << ") and aligned)";
+				// Advance and continue scanning
+				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+				if (next_batch >= batch_ring_end) {
+					next_batch = batch_ring_start;
+				}
+				current_batch = next_batch;
+				continue;
+			}
+			
+			// Compute the actual batch header by following the offset
+			BatchHeader* actual_batch = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(current_batch) + batch_off_to_export_check);
+			
+			// Verify actual_batch is still within ring bounds
+			if (actual_batch < batch_ring_start || actual_batch >= batch_ring_end) {
+				LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
+					<< "]: Export chain points outside ring (offset=" << batch_off_to_export_check << ")";
+				// Advance and continue scanning
+				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+				if (next_batch >= batch_ring_end) {
+					next_batch = batch_ring_start;
+				}
+				current_batch = next_batch;
+				continue;
+			}
+			
+			// Read batch metadata from the actual batch header
+			volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->num_msg;
+			volatile size_t total_size_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->total_size;
+			volatile size_t log_idx_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->log_idx;
+			volatile size_t start_logical_offset_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->start_logical_offset;
 			
 			// Bounds validation (match BrokerScannerWorker5 guards)
 			constexpr uint32_t MAX_REASONABLE_NUM_MSG = 100000;
 			bool batch_ready = (num_msg_check != 0 && 
-			                   ordered_check == 1 && 
 			                   total_size_check > 0 && 
 			                   log_idx_check > 0 && 
 			                   num_msg_check <= MAX_REASONABLE_NUM_MSG);
 			
 			if (batch_ready) {
-				// Batch is ordered and valid
+				// Batch is valid; use data from actual_batch
 				batch_payload = reinterpret_cast<uint8_t*>(cxl_addr_) + log_idx_check;
 				batch_payload_size = total_size_check;
 				batch_start_logical_offset = start_logical_offset_check;
@@ -428,7 +558,8 @@ namespace Embarcadero{
 				VLOG(3) << "[GetNextReplicationBatch B" << broker_id << "]: Found ordered batch: "
 						<< "num_msg=" << num_msg_check << ", log_idx=" << log_idx_check 
 						<< ", payload_size=" << batch_payload_size
-						<< ", start_offset=" << batch_start_logical_offset;
+						<< ", start_offset=" << batch_start_logical_offset
+						<< ", batch_off_to_export=" << batch_off_to_export_check;
 				
 				// Advance cursor for next iteration
 				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
@@ -440,7 +571,7 @@ namespace Embarcadero{
 				return true;
 			}
 			
-			// Current batch not ready, advance and try next
+			// Actual batch not ready yet, advance slot and try next
 			BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
 				reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
 			if (next_batch >= batch_ring_end) {

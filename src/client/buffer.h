@@ -114,6 +114,7 @@ private:
     std::vector<Buf> bufs_;
     size_t num_threads_per_broker_;
     int order_;
+    int client_id_;  // [[BLOG_HEADER: Store client_id for BlogMessageHeader initialization]]
     size_t i_ = 0;
     size_t j_ = 0;
     
@@ -123,6 +124,7 @@ private:
     bool shutdown_{false};
     bool seal_from_read_{false};
     Embarcadero::MessageHeader header_;
+    Embarcadero::BlogMessageHeader blog_header_;  // [[BLOG_HEADER: BlogMessageHeader for ORDER=5 direct emission]]
     
     /**
      * Advances the write buffer ID

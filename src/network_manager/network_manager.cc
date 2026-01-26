@@ -20,6 +20,7 @@
 #include "../cxl_manager/cxl_manager.h"
 #include "../embarlet/topic_manager.h"
 #include "../common/performance_utils.h"
+#include "../common/wire_formats.h"
 
 namespace Embarcadero {
 
@@ -596,76 +597,53 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-	// [[BLOG_HEADER: Convert MessageHeader→BlogMessageHeader for ORDER=5]]
-	// After batch is fully received, convert in-place for ORDER=5 to enable new header format
+	// [[BLOG_HEADER: Lightweight sanity check (no per-message conversion)]]
+	// Since publisher now emits BlogMessageHeader directly when EMBARCADERO_USE_BLOG_HEADER=1,
+	// receiver no longer needs to convert v1→v2. Just validate boundaries and sizes.
 	TInode* tinode = nullptr;
-	bool should_convert_to_blog = false;
+	bool is_blog_header_enabled = false;
 	if (seq_type == EMBARCADERO) {
 		tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
 		if (tinode && tinode->order == 5 && HeaderUtils::ShouldUseBlogHeader()) {
-			should_convert_to_blog = true;
+			is_blog_header_enabled = true;
 		}
 	}
 
-	if (should_convert_to_blog && batch_header.num_msg > 0) {
-		// Convert messages from MessageHeader to BlogMessageHeader format in-place
-		MessageHeader* current_msg = reinterpret_cast<MessageHeader*>(buf);
-		size_t flush_count = 0;
-
+	if (is_blog_header_enabled && batch_header.num_msg > 0) {
+		// [[BLOG_HEADER: Sanity check only (no conversion)]]
+		// Publisher already emitted v2 headers, just validate boundaries
+		BlogMessageHeader* current_msg = reinterpret_cast<BlogMessageHeader*>(buf);
+		
 		for (size_t i = 0; i < batch_header.num_msg; ++i) {
-			// Validate message header
-			if (current_msg->paddedSize == 0 || current_msg->paddedSize > 1024 * 1024) {
-				LOG(WARNING) << "NetworkManager: Skipping message " << i << " with invalid paddedSize=" << current_msg->paddedSize;
+			// Validate message header bounds
+			if (current_msg->size == 0 || current_msg->size > wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+				VLOG(2) << "NetworkManager: Message " << i << " has invalid size=" << current_msg->size;
 				break;
 			}
-
-			// Extract payload size (paddedSize includes header + padding)
-			size_t header_size = sizeof(MessageHeader);
-			size_t total_with_header = current_msg->paddedSize;
-			size_t payload_size = (total_with_header > header_size) ? (total_with_header - header_size) : 0;
-
-			// Rewrite header in-place as BlogMessageHeader
-			BlogMessageHeader* v2_hdr = reinterpret_cast<BlogMessageHeader*>(current_msg);
 			
-			// [[PERFORMANCE: Zero-initialize to avoid partial writes]]
-			memset(v2_hdr, 0, sizeof(BlogMessageHeader));
-
-			// Write receiver region (bytes 0-15)
-			v2_hdr->size = static_cast<uint32_t>(payload_size);
-			v2_hdr->received = 1;  // Mark as received
-			v2_hdr->ts = 0;        // Optional: can be set to rdtsc() if needed
-
-			// Write read-only metadata (bytes 48-63)
-			v2_hdr->client_id = batch_header.client_id;
-			v2_hdr->batch_seq = batch_header.batch_seq;
-			v2_hdr->_pad = 0;
-
-			// Delegation and sequencer fields remain 0 (will be set by respective stages or not needed for ORDER=5)
-
-			// Flush receiver region cacheline
-			CXL::flush_blog_receiver_region(v2_hdr);
-			flush_count++;
-
-			// Move to next message using the original padded size (which is still correct)
+			// Compute stride and verify alignment
+			size_t stride = wire::ComputeMessageStride(sizeof(BlogMessageHeader), current_msg->size);
+			if (stride % 64 != 0) {
+				VLOG(2) << "NetworkManager: Message " << i << " stride " << stride << " not 64B aligned";
+				break;
+			}
+			
+			// Move to next message
 			if (i < batch_header.num_msg - 1) {
-				current_msg = reinterpret_cast<MessageHeader*>(
-					reinterpret_cast<uint8_t*>(current_msg) + total_with_header
+				current_msg = reinterpret_cast<BlogMessageHeader*>(
+					reinterpret_cast<uint8_t*>(current_msg) + stride
 				);
 			}
 		}
-
-		// Single fence for all message header flushes (DEV-005 pattern: flush-flush-…-fence)
-		CXL::store_fence();
-		VLOG(3) << "NetworkManager: Converted " << flush_count << " messages to BlogMessageHeader format for ORDER=5";
+		VLOG(3) << "NetworkManager: Validated " << batch_header.num_msg << " BlogMessageHeader messages for ORDER=5";
 	}
 
 	// Signal batch completion for ALL order levels
 	// This must be done AFTER all messages in the batch are received and marked complete
-	// and AFTER conversion to BlogMessageHeader (if applicable)
 	if (batch_header_location != nullptr) {
-		// For Sequencer 5 with BlogHeader: conversion already done above
-		// For Sequencer 5 without BlogHeader or other modes: Ensure message validation
-		if (seq_type != EMBARCADERO || (tinode && tinode->order != 5) || !should_convert_to_blog) {
+		// For Sequencer 5 with BlogHeader: messages already valid from publisher
+		// For other orders: Ensure message validation
+		if (seq_type != EMBARCADERO || (tinode && tinode->order != 5) || !is_blog_header_enabled) {
 			// For Sequencer 4 and other modes: Ensure all message headers are properly initialized
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			for (size_t i = 0; i < batch_header.num_msg; ++i) {
@@ -804,6 +782,11 @@ void NetworkManager::SubscribeNetworkThread(
 		uint16_t flags;            // Reserved for future flags
 	} batch_meta = {0, 0, 2, 0};  // Initialize header_version=2 for BlogMessageHeader
 
+	static_assert(sizeof(BatchMetadata) == sizeof(wire::BatchMetadata), 
+		"Local BatchMetadata must match wire::BatchMetadata");
+	static_assert(offsetof(BatchMetadata, header_version) == offsetof(wire::BatchMetadata, header_version),
+		"header_version field offset must match wire::BatchMetadata");
+
 	// PERFORMANCE OPTIMIZATION: Cache state pointer to avoid repeated hash map lookups
 	std::unique_ptr<SubscriberState>* cached_state_ptr = nullptr;
 	{
@@ -859,9 +842,10 @@ void NetworkManager::SubscribeNetworkThread(
 			// [[BLOG_HEADER: Set header_version based on feature flag]]
 			batch_meta.header_version = HeaderUtils::ShouldUseBlogHeader() ? 2 : 1;
 			batch_meta.flags = 0;
-			LOG(INFO) << "SubscribeNetworkThread: Sending batch metadata, total_order=" << batch_total_order 
-			          << ", num_messages=" << num_messages << ", header_version=" << batch_meta.header_version 
-			          << ", topic=" << topic;
+			// [[PERF: Demoted from LOG(INFO) to VLOG(2) - this is hot path per batch]]
+			VLOG(2) << "SubscribeNetworkThread: Sending batch metadata, total_order=" << batch_total_order 
+			        << ", num_messages=" << num_messages << ", header_version=" << batch_meta.header_version 
+			        << ", topic=" << topic;
 			} else if (order > 0){
 				if (!topic_manager_->GetBatchToExport(
 							topic,

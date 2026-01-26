@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "../common/wire_formats.h"
 
 class Subscriber;
 
@@ -59,6 +60,15 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 
 	std::vector<std::pair<std::chrono::steady_clock::time_point, size_t>> recv_log ABSL_GUARDED_BY(state_mutex);
 
+	// [[BLOG_HEADER: Per-connection batch state for ORDER=5 (no global mutex)]]
+	// Replaces the global g_batch_states map, eliminating mutex contention
+	struct BatchMetadataState {
+		bool has_pending_metadata = false;
+		Embarcadero::wire::BatchMetadata pending_metadata;
+		size_t current_batch_messages_processed = 0;
+		size_t next_message_order_in_batch = 0;
+	};
+	BatchMetadataState batch_metadata ABSL_GUARDED_BY(state_mutex);
 
 	ConnectionBuffers(int f, int b_id, size_t cap_per_buffer) :
 		fd(f),
@@ -157,8 +167,8 @@ class Subscriber {
 		void* Consume(int timeout_ms = 1000);
 		void* ConsumeBatchAware(int timeout_ms = 1000);
 
-		// For Sequencer 5: Process batch metadata and reconstruct message ordering
-		void ProcessSequencer5Data(uint8_t* data, size_t data_size, int fd);
+	// For Sequencer 5: Process batch metadata and reconstruct message ordering
+	void ProcessSequencer5Data(uint8_t* data, size_t data_size, std::shared_ptr<ConnectionBuffers> conn_buffers);
 
 		// Called by client code after test is finished
 		void StoreLatency();

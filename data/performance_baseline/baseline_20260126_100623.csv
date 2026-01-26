@@ -1,0 +1,2 @@
+iteration,bandwidth_mbps,duration_seconds,brokers_connected,status
+1,25.350625,25.350598,4,success

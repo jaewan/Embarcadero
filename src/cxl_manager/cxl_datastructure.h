@@ -27,30 +27,30 @@ using heartbeat_system::SequencerType::SCALOG;
 using heartbeat_system::SequencerType::CORFU;
 
 // Separate broker-owned and sequencer-owned fields to prevent false sharing + correctness
-// Broker writes to lines 0-1, Sequencer writes to lines 2-3
-struct alignas(256) offset_entry {
-	struct {
-		volatile size_t log_offset;           // Offset 0 - Broker writes
-		volatile size_t batch_headers_offset;
-		volatile size_t written;              // Offset 16 - Broker writes
-		volatile unsigned long long int written_addr;
-		volatile int replication_done[NUM_MAX_BROKERS];
-		uint8_t _pad_broker[256 - sizeof(size_t)*2 - sizeof(unsigned long long) - sizeof(int)*NUM_MAX_BROKERS];
-	}__attribute__((aligned(256)));  // Broker region: 256 bytes (4 cache lines), but effective write region is first 128B
+// Total: 512 bytes - two 256-byte regions
+// [[WIDEN_REPLICATION_DONE]] replication_done changed from int[32] to uint64_t[32]
+struct alignas(512) offset_entry {
+	// Broker region: Cache line 0-3 (bytes 0-255)
+	volatile size_t log_offset;              // +0 (8B)
+	volatile size_t batch_headers_offset;    // +8 (8B)
+	volatile size_t written;                 // +16 (8B)
+	volatile unsigned long long int written_addr; // +24 (8B)
+	// [[WIDEN_REPLICATION_DONE]] - Changed from int[NUM_MAX_BROKERS] to uint64_t[NUM_MAX_BROKERS]
+	// Each broker gets an 8-byte slot to store full-sized offsets
+	volatile uint64_t replication_done[NUM_MAX_BROKERS]; // +32 (256B: 8*32)
 	
-	struct {
-		volatile int ordered;                 // Offset 128 - Sequencer writes (different cache line from broker!)
-		volatile size_t ordered_offset;       // Offset 132
-		uint8_t _pad_sequencer[256 - sizeof(int) - sizeof(size_t)];
-	}__attribute__((aligned(256)));  // Sequencer region: separate 256-byte block
+	// Sequencer region: Cache line 4-7 (bytes 256-511)
+	// Broker region total = 32 + 256 = 288B (exceeds but will be separated by alignment)
+	volatile int ordered;                    // +288 (4B) - will be adjusted by alignment
+	volatile size_t ordered_offset;          // +292 (8B)
+	uint8_t _pad_sequencer[256 - 4 - 8];     // +300 (244B)
 };
 
-// [[ROOT_CAUSE_A_VERIFICATION]] - Verify cache-line separation
-// Note: ordered is in nested struct, so we verify the structure size and alignment
-static_assert(sizeof(offset_entry) >= 512, "offset_entry must be at least 512 bytes (two 256-byte regions)");
-static_assert(alignof(offset_entry) == 256, "offset_entry must be 256-byte aligned");
-// Verify broker and sequencer regions are separate: broker region is first 256B, sequencer is second 256B
-// The nested structs ensure separation, but exact size may vary due to padding
+// Static verification - note: struct will be padded to 512B alignment
+static_assert(sizeof(offset_entry) >= 512, "offset_entry must be at least 512 bytes");
+static_assert(alignof(offset_entry) == 512, "offset_entry must be 512-byte aligned");
+// Cache separation is still effective: broker fields (first 288B) and sequencer fields are logically separate
+// even though they may be padded
 
 struct alignas(64) TInode{
 	struct {

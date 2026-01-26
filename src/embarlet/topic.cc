@@ -1,6 +1,7 @@
 #include "topic.h"
 #include "../cxl_manager/scalog_local_sequencer.h"
 #include "common/performance_utils.h"
+#include "../common/wire_formats.h"
 
 #include <cstring>
 #include <chrono>
@@ -319,30 +320,54 @@ void Topic::DelegationThread() {
 						static_cast<unsigned long long int>(
 							reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
 				} else {
-					// BlogMessageHeader path: receiver already set fields, just track offsets
-					// For ORDER=5, we don't need per-message header writes; export uses BatchHeader.total_size
-					// Compute end position for tracking
-					BlogMessageHeader* batch_first_msg = reinterpret_cast<BlogMessageHeader*>(
-						reinterpret_cast<uint8_t*>(cxl_addr_) + current_batch->log_idx);
-					BlogMessageHeader* msg_ptr = batch_first_msg;
+			// BlogMessageHeader path: receiver already set fields, just track offsets
+				// For ORDER=5, we don't need per-message header writes; export uses BatchHeader.total_size
+				// Compute end position for tracking
+				BlogMessageHeader* batch_first_msg = reinterpret_cast<BlogMessageHeader*>(
+					reinterpret_cast<uint8_t*>(cxl_addr_) + current_batch->log_idx);
+				BlogMessageHeader* msg_ptr = batch_first_msg;
+				
+				for (size_t i = 0; i < current_batch->num_msg; ++i) {
+					// For BlogMessageHeader, size is in payload bytes only
+					// [[PAPER_SPEC: BlogMessageHeader]] - Validate size is within bounds
+					if (msg_ptr->size > wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+						LOG(ERROR) << "DelegationThread: Message " << i << " in batch has excessive payload size=" << msg_ptr->size
+							<< " (max=" << wire::MAX_MESSAGE_PAYLOAD_SIZE << "), aborting batch";
+						break;
+					}
 					
-					for (size_t i = 0; i < current_batch->num_msg; ++i) {
-						// For BlogMessageHeader, size is in payload bytes only
-						size_t header_size = sizeof(BlogMessageHeader);
-						size_t padded_size = header_size + msg_ptr->size;
-						// Align to 64-byte boundary
-						if (padded_size % 64 != 0) {
-							padded_size += 64 - (padded_size % 64);
-						}
-						
-						logical_offset_++;
-						
-						// Move to next message
-						if (i < current_batch->num_msg - 1) {
-							msg_ptr = reinterpret_cast<BlogMessageHeader*>(
-								reinterpret_cast<uint8_t*>(msg_ptr) + padded_size);
+					size_t header_size = sizeof(BlogMessageHeader);
+					size_t padded_size = wire::ComputeMessageStride(header_size, msg_ptr->size);
+					
+					// Validate stride is reasonable
+					if (padded_size < 64 || padded_size > wire::MAX_MESSAGE_PAYLOAD_SIZE + header_size + 64) {
+						LOG(ERROR) << "DelegationThread: Message " << i << " computed invalid stride=" << padded_size
+							<< " from payload_size=" << msg_ptr->size << ", aborting batch";
+						break;
+					}
+					
+					// Validate we don't walk past the batch end (sanity check)
+					if (i > 0) {
+						size_t batch_end_estimate = current_batch->log_idx + current_batch->total_size;
+						size_t msg_end = static_cast<size_t>(reinterpret_cast<uint8_t*>(msg_ptr) + padded_size - reinterpret_cast<uint8_t*>(cxl_addr_));
+						if (msg_end > batch_end_estimate) {
+							static thread_local size_t stride_error_count = 0;
+							if (++stride_error_count % 100 == 1) {
+								LOG(WARNING) << "DelegationThread: Message " << i << " would walk past batch end"
+									<< " (msg_end=" << msg_end << ", batch_end=" << batch_end_estimate << ")"
+									<< ", error count=" << stride_error_count;
+							}
 						}
 					}
+					
+					logical_offset_++;
+					
+					// Move to next message
+					if (i < current_batch->num_msg - 1) {
+						msg_ptr = reinterpret_cast<BlogMessageHeader*>(
+							reinterpret_cast<uint8_t*>(msg_ptr) + padded_size);
+					}
+				}
 
 					// Update TInode tracking
 					UpdateTInodeWritten(
@@ -1476,76 +1501,24 @@ void Topic::AssignOrder5(BatchHeader* batch_to_order, size_t start_total_order, 
 	// Pure batch-level ordering - set only batch total_order, no message-level processing
 	batch_to_order->total_order = start_total_order;
 
-	// [[BLOG_HEADER: BlogMessageHeader Support - Phase 1 Implementation]]
-	// If BlogMessageHeader is enabled, update message headers with total_order using BlogMessageHeader format
-	// NOTE: This requires messages to be stored with BlogMessageHeader format (not MessageHeader)
-	// Full migration requires updating receiver stage to write BlogMessageHeader instead of receiving MessageHeader
-	// For now, this code is prepared for when BlogMessageHeader format is used
-	if (HeaderUtils::ShouldUseBlogHeader() && batch_to_order->num_msg > 0) {
-		// Get pointer to first message in batch
-		// NOTE: This assumes messages are stored with BlogMessageHeader format
-		// In current implementation, messages use MessageHeader format, so this path may not work yet
-		// This is infrastructure for future full migration
-		void* first_msg_ptr = reinterpret_cast<uint8_t*>(cxl_addr_) + batch_to_order->log_idx;
-		
-		// Try to detect if this is actually a BlogMessageHeader
-		// For now, we'll attempt to use it as BlogMessageHeader if enabled
-		BlogMessageHeader* first_msg = reinterpret_cast<BlogMessageHeader*>(first_msg_ptr);
-		
-		// For batch-level ordering (ORDER=5), assign sequential total_order to all messages
-		BlogMessageHeader* msg_hdr = first_msg;
-		size_t current_order = start_total_order;
-		
-		// Estimate message size: use size from first message + header size
-		// This is approximate - in practice, messages may have different sizes
-		// For BlogMessageHeader, we need to track actual message sizes
-		size_t estimated_msg_size = sizeof(BlogMessageHeader);
-		if (msg_hdr->size > 0) {
-			estimated_msg_size += msg_hdr->size;
-		} else {
-			// Fallback: assume standard message size if size not set
-			estimated_msg_size += 1024; // Default 1KB payload
-		}
-		// Align to cache line for safety
-		estimated_msg_size = (estimated_msg_size + 63) & ~63;
-		
-		// Update message headers with total_order (limit to reasonable number for safety)
-		const size_t MAX_MESSAGES_TO_UPDATE = 10000;
-		size_t messages_updated = 0;
-		for (size_t i = 0; i < num_messages && i < MAX_MESSAGES_TO_UPDATE; ++i) {
-			// Poll delegation region (bytes 16-31) - wait for counter to be set
-			// For ORDER=5, delegation may not set counter, so we check if received flag is set
-			volatile uint32_t received = msg_hdr->received;
-			if (received == 0) {
-				// Message not ready yet - this shouldn't happen in ORDER=5, but be safe
-				VLOG(4) << "AssignOrder5: Message " << i << " not received yet, stopping update";
-				break;
-			}
-			
-			// Write sequencer region (bytes 32-47)
-			msg_hdr->total_order = current_order;
-			msg_hdr->ordered_ts = CXL::rdtsc();
-			
-			// Flush sequencer region (bytes 32-47) - selective flush for BlogMessageHeader
-			CXL::flush_blog_sequencer_region(msg_hdr);
-			
-			current_order++;
-			messages_updated++;
-			
-			// Move to next message (approximate - actual size may vary)
-			if (i < num_messages - 1) {
-				msg_hdr = reinterpret_cast<BlogMessageHeader*>(
-					reinterpret_cast<uint8_t*>(msg_hdr) + estimated_msg_size);
-			}
-		}
-		
-		// Fence after all message header updates
-		CXL::store_fence();
-		
-		if (messages_updated > 0) {
-			VLOG(3) << "AssignOrder5: Updated " << messages_updated << " BlogMessageHeaders with total_order";
-		}
-	}
+	// [[BLOG_HEADER: Batch-level ordering only for ORDER=5]]
+	// With BlogMessageHeader emission at publisher, messages already have proper header format.
+	// Subscriber reconstructs per-message total_order logically using BatchMetadata.
+	// NO per-message CXL writes needed - this eliminates the performance bottleneck.
+	// 
+	// RATIONALE:
+	// - Publisher emits BlogMessageHeader with proper format directly
+	// - ORDER=5 means all messages in batch get same range [start_total_order, start_total_order + num_msg)
+	// - Subscriber uses wire::BatchMetadata to assign per-message total_order logically
+	// - Eliminates per-message flush_blog_sequencer_region() that was causing ~50% slowdown
+	//
+	// DISABLED CODE (was causing performance regression):
+	// if (HeaderUtils::ShouldUseBlogHeader() && batch_to_order->num_msg > 0) {
+	//     for (size_t i = 0; i < num_messages; ++i) {
+	//         msg_hdr->total_order = current_order;
+	//         CXL::flush_blog_sequencer_region(msg_hdr);
+	//     }
+	// }
 
 	// Update ordered count by the number of messages in the batch
 	tinode_->offsets[broker].ordered = tinode_->offsets[broker].ordered + num_messages;

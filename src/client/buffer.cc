@@ -74,13 +74,17 @@
 
 #include "buffer.h"
 #include "../common/configuration.h"
+#include "../common/wire_formats.h"
+#include "../common/performance_utils.h"
+#include "../cxl_manager/cxl_datastructure.h"
 #include <thread>
 #include <chrono>
 
 Buffer::Buffer(size_t num_buf, size_t num_threads_per_broker, int client_id, size_t message_size, int order) 
 	: bufs_(num_buf), 
 	num_threads_per_broker_(num_threads_per_broker), 
-	order_(order) {
+	order_(order),
+	client_id_(client_id) {
 
 		// Initialize message header with provided values
 		header_.client_id = client_id;
@@ -101,10 +105,19 @@ Buffer::Buffer(size_t num_buf, size_t num_threads_per_broker, int client_id, siz
 		header_.logical_offset = static_cast<size_t>(-1); // Sentinel value
 		header_.next_msg_diff = 0;
 
+		// [[BLOG_HEADER: Initialize BlogMessageHeader template for ORDER=5 direct emission]]
+		// Only used if HeaderUtils::ShouldUseBlogHeader() is true and order_==5
+		if (Embarcadero::HeaderUtils::ShouldUseBlogHeader() && order_ == 5) {
+			memset(&blog_header_, 0, sizeof(blog_header_));
+			blog_header_.client_id = client_id;
+			blog_header_.received = 0;  // Will be set by publisher when message is ready
+		}
+
 		VLOG(5) << "Buffer created with " << num_buf << " buffers, " 
 			<< num_threads_per_broker << " threads per broker, "
 			<< "message size: " << message_size 
-			<< ", padded size: " << header_.paddedSize;
+			<< ", padded size: " << header_.paddedSize
+			<< (Embarcadero::HeaderUtils::ShouldUseBlogHeader() && order_ == 5 ? " (using BlogMessageHeader)" : "");
 	}
 
 Buffer::~Buffer() {
@@ -239,15 +252,50 @@ void Buffer::WarmupBuffers() {
 
 #ifdef BATCH_OPTIMIZATION
 bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize) {
-	static const size_t header_size = sizeof(Embarcadero::MessageHeader);
+	// [[BLOG_HEADER: Determine header format based on feature flag and order]]
+	bool use_blog_header = Embarcadero::HeaderUtils::ShouldUseBlogHeader() && order_ == 5;
+	static const size_t v1_header_size = sizeof(Embarcadero::MessageHeader);
+	static const size_t v2_header_size = sizeof(Embarcadero::BlogMessageHeader);
+	size_t header_size = use_blog_header ? v2_header_size : v1_header_size;
+	
+	// [[BLOG_HEADER: Compute stride based on header version]]
+	// V1: stride = header + payload, aligned to 64B
+	// V2: stride = 64B header + payload, aligned to 64B
+	// Both use the same alignment but V2 always starts at 64B
+	size_t stride;
+	if (use_blog_header) {
+		// V2: compute stride from payload bytes only
+		stride = Embarcadero::wire::ComputeMessageStride(v2_header_size, len);
+	} else {
+		// V1: use paddedSize (already aligned)
+		stride = paddedSize;
+	}
 
 	void* buffer;
 	size_t head, tail;
 
 	// Update header with current message info
-	header_.paddedSize = paddedSize;
-	header_.size = len;
-	header_.client_order = client_order;
+	if (use_blog_header) {
+		// [[BLOG_HEADER: Populate BlogMessageHeader fields]]
+		// Receiver region (bytes 0-15) - set by publisher
+		blog_header_.size = static_cast<uint32_t>(len);  // Payload bytes only
+		blog_header_.received = 1;  // Mark as received by publisher
+		blog_header_.ts = Embarcadero::CXL::rdtsc();  // Receipt timestamp
+		
+		// Read-only metadata (bytes 48-63)
+		blog_header_.batch_seq = batch_seq_.load(std::memory_order_relaxed);
+		
+		// Delegation and sequencer fields remain 0 (will be set by broker)
+		// blog_header_.counter = 0;
+		// blog_header_.processed_ts = 0;
+		// blog_header_.total_order = 0;
+		// blog_header_.ordered_ts = 0;
+	} else {
+		// [[V1: Legacy MessageHeader]]
+		header_.paddedSize = paddedSize;
+		header_.size = len;
+		header_.client_order = client_order;
+	}
 
 	// Critical section for buffer access
 	{
@@ -257,7 +305,7 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 		tail = bufs_[write_buf_id_].prod.tail.load(std::memory_order_relaxed);
 
 		// Check if buffer is full and needs to be wrapped
-		if (tail + header_size + paddedSize + paddedSize /*buffer margin*/ > bufs_[lockedIdx].len) {
+		if (tail + header_size + stride + stride /*buffer margin*/ > bufs_[lockedIdx].len) {
 			// FIXED: Check if reader has consumed data before wrapping
 			size_t reader_head = bufs_[lockedIdx].cons.reader_head.load(std::memory_order_relaxed);
 			
@@ -313,12 +361,19 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 	// If new message is very large (unlikely) it can degrade performance as a batch can be too large
 	// to send over network.
 	
-	// Write header and message to buffer
-	memcpy(static_cast<void*>((uint8_t*)buffer + tail), &header_, header_size);
-	memcpy(static_cast<void*>((uint8_t*)buffer + tail + header_size), msg, len);
+	// [[BLOG_HEADER: Write header and message based on version]]
+	if (use_blog_header) {
+		// V2: Write BlogMessageHeader directly
+		memcpy(static_cast<void*>((uint8_t*)buffer + tail), &blog_header_, v2_header_size);
+		memcpy(static_cast<void*>((uint8_t*)buffer + tail + v2_header_size), msg, len);
+	} else {
+		// V1: Write MessageHeader
+		memcpy(static_cast<void*>((uint8_t*)buffer + tail), &header_, v1_header_size);
+		memcpy(static_cast<void*>((uint8_t*)buffer + tail + v1_header_size), msg, len);
+	}
 
 	// Update buffer state - keep it simple and fast
-	size_t new_tail = bufs_[write_buf_id_].prod.tail.fetch_add(paddedSize, std::memory_order_relaxed) + paddedSize;
+	size_t new_tail = bufs_[write_buf_id_].prod.tail.fetch_add(stride, std::memory_order_relaxed) + stride;
 	bufs_[write_buf_id_].prod.num_msg.fetch_add(1, std::memory_order_relaxed);
 	
 	// Check if current batch has reached BATCH_SIZE and seal it
