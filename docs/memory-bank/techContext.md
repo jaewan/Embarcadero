@@ -1,8 +1,8 @@
 # Technical Context: Build & Runtime Environment
 
 **Document Purpose:** Complete technical stack reference for building, deploying, and debugging Embarcadero
-**Status:** Reverse-engineered from codebase (Jan 2026)
-**Last Updated:** 2026-01-23
+**Status:** Current implementation reference
+**Last Updated:** 2026-01-27
 
 ---
 

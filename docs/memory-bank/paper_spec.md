@@ -96,6 +96,12 @@ This file preserves the paper's original design as a reference point for:
 4.  **Global Order:** Write `total_order` into message header in `Blog`.
 5.  **Commit:** Update `Bmeta.ordered_ptr` and `Bmeta.ordered_seq`.
 
+**Implementation Status (2026-01-27):**
+- ✅ **ORDER=5 FIFO Validation:** Implemented per this spec in `BrokerScannerWorker5`
+- ✅ **Out-of-Order Handling:** Deferred batches stored in `skipped_batches_5_` map, processed via `ProcessSkipped5()` when predecessors arrive
+- ✅ **Correctness:** Matches paper spec exactly - per-client `batch_seq` ordering preserves client's local order in total order
+- ⚠️ **Note:** Current implementation uses mutex (`global_seq_batch_seq_mu_`) instead of CAS for `next_batch_seqno` updates (acceptable for correctness, CAS optimization possible in future)
+
 ### Stage 4: Replication
 
 **Replication Threads (Pool per Broker):**

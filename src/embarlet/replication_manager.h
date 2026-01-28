@@ -15,8 +15,28 @@ namespace Scalog {
 }
 
 /**
- * ReplicationManager handles all replication logic for different sequencer types
- * Extracted from Topic class to separate replication concerns
+ * ReplicationManager handles replication logic for CORFU and SCALOG sequencer types
+ * 
+ * [[PHASE_5_REFACTOR_LEGACY_PATHS]] - Ownership and Usage Clarification:
+ * 
+ * OWNERSHIP:
+ * - Used ONLY by TopicRefactored (refactored pipeline, not mainline)
+ * - Mainline Topic class uses DiskManager::ReplicateThread for EMBARCADERO sequencer
+ * - These are parallel architectures - not interchangeable
+ * 
+ * CURRENT STATUS:
+ * - TopicRefactored: Uses ReplicationManager (CORFU/SCALOG only)
+ * - Topic (mainline): Uses DiskManager::ReplicateThread (EMBARCADERO ORDER=5)
+ * 
+ * MIGRATION STATUS:
+ * - TopicRefactored is experimental/refactored code path
+ * - Mainline replication is DiskManager-based (authoritative for ORDER=5)
+ * - Do NOT mix ReplicationManager with mainline Topic/DiskManager replication
+ * 
+ * TODO: Decide on architecture:
+ * - Option A: Fully migrate to TopicRefactored + ReplicationManager (remove DiskManager replication)
+ * - Option B: Keep DiskManager replication, remove/archive ReplicationManager
+ * - Option C: Keep both but clearly document separation and ownership
  */
 class ReplicationManager {
 public:

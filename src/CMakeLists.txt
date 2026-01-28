@@ -42,7 +42,7 @@ endif()
 
 configure_file("common/config.h.in" "${PROJECT_BINARY_DIR}/common/config.h")
 
-add_executable(embarlet 
+add_executable(embarlet
     embarlet/embarlet.cc
     common/configuration.cc
     common/configuration.h
@@ -62,6 +62,8 @@ add_executable(embarlet
     cxl_manager/scalog_local_sequencer.h
     network_manager/network_manager.cc
     network_manager/network_manager.h
+    network_manager/staging_pool.cc
+    network_manager/staging_pool.h
     embarlet/heartbeat.cc
     embarlet/topic_manager.cc
     embarlet/topic_manager.h

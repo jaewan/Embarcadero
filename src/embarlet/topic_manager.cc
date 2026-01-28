@@ -91,11 +91,20 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	tinode->offsets[broker_id_].batch_headers_offset = 
 		static_cast<size_t>(batch_headers_addr - cxl_base_addr);
 
+	// [[STALL_1928_FIX]] Initialize consumed_through so producer can allocate slot 2+ without blocking.
+	// Semantics: "first byte past last consumed slot". BATCHHEADERS_SIZE means "all slots [0, size)
+	// are available" so GetCXLBuffer's check consumed >= slot_offset + sizeof(BatchHeader) passes
+	// until the ring fills. Sequencer overwrites this when it processes each batch.
+	tinode->offsets[broker_id_].batch_headers_consumed_through = BATCHHEADERS_SIZE;
+
 	// [[ROOT_CAUSE_B_FIX]] - Flush broker-specific offset initialization
 	// After each broker initializes its offsets[broker_id_] entries (log_offset/batch_headers_offset/written_addr)
 	// Flush the broker region (first 256B of offset_entry) so other threads see the values
 	const void* broker_region = const_cast<const void*>(static_cast<const volatile void*>(&tinode->offsets[broker_id_].log_offset));
 	CXL::flush_cacheline(broker_region);
+	// Flush sequencer region so producer (on any broker) sees batch_headers_consumed_through
+	const void* sequencer_region = const_cast<const void*>(static_cast<const volatile void*>(&tinode->offsets[broker_id_].batch_headers_consumed_through));
+	CXL::flush_cacheline(sequencer_region);
 	CXL::store_fence();
 }
 

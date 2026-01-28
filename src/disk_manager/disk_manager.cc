@@ -216,9 +216,15 @@ namespace Embarcadero{
 			num_io_threads_.fetch_add(threads_needed);
 			while(thread_count_.load() != num_io_threads_.load()){std::this_thread::yield();}
 		}
+		// [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
+		// replication_factor INCLUDES self (replication_factor=1 means local durability only)
+		// This ensures consistent replica selection across DiskManager and NetworkManager
+		// TODO: Get actual num_brokers instead of NUM_MAX_BROKERS (requires callback)
+		int num_brokers = NUM_MAX_BROKERS;  // Temporary: use MAX until we have get_num_brokers callback
+		
 		if(!log_to_memory_){
 			for(int i = 0; i< replication_factor; i++){
-				int b = (broker_id_ + i)%NUM_MAX_BROKERS;
+				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
 				int disk_to_write = b % NUM_DISKS ;
 				std::string base_dir = "../../.Replication/disk" + std::to_string(disk_to_write) + "/";
 				std::string base_filename = base_dir+"embarcadero_replication_log"+std::to_string(b) +".dat";
@@ -231,8 +237,7 @@ namespace Embarcadero{
 			}
 		}else{
 			for(int i = 0; i< replication_factor; i++){
-				//TODO(Jae) get current num brokers
-				int b = (broker_id_ + i)%NUM_MAX_BROKERS;
+				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
 				ReplicationRequest req = {tinode, replica_tinode, -1, b};
 				requestQueue_.blockingWrite(req);
 			}
@@ -254,6 +259,10 @@ namespace Embarcadero{
 
 		num_active_threads_.fetch_add(1);
 		const struct ReplicationRequest &req = optReq.value();
+		
+		// [[PHASE_0_INSTRUMENTATION]] - Log replication thread startup
+		LOG(INFO) << "[ReplicateThread]: Starting replication for broker_id=" << req.broker_id
+			<< " (replicating broker " << req.broker_id << "'s log)";
 
 		void *log_addr = nullptr;
 		size_t log_capacity = (1UL<<30);
@@ -436,6 +445,13 @@ namespace Embarcadero{
 					}
 					auto time_since_advance = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_advance).count();
 					
+					// [[PHASE_4_BOUNDED_TIMEOUTS]] - Stall detection: warn if scanning but not replicating
+					if (scanned > 0 && replicated == 0 && time_since_advance > 5000) {
+						LOG(WARNING) << "[ReplicationMetrics B" << req.broker_id << "]: STALL DETECTED - "
+							<< "scanned=" << scanned << " batches but replicated=0 for " 
+							<< time_since_advance << "ms. Replication may be stuck.";
+					}
+					
 					LOG(INFO) << "[ReplicationMetrics B" << req.broker_id << "]: "
 						<< "scanned=" << scanned << ", replicated=" << replicated 
 						<< ", pwrite_retries=" << retries << ", pwrite_errors=" << errors
@@ -539,14 +555,54 @@ namespace Embarcadero{
 		// Use a reasonable upper bound to prevent excessive scanning under idle conditions
 		// The outer loop's backoff will sleep if no batch found, so we don't need aggressive scanning
 		size_t MAX_SCAN_ATTEMPTS = 256;  // Up to ~256 batches per scan
+		
+		// [[PHASE_0_INSTRUMENTATION]] - Track ordered visibility for stall diagnosis
+		static thread_local size_t scan_iterations = 0;
+		static thread_local size_t ordered_hits = 0;
+		static thread_local size_t ordered_misses = 0;
+		static thread_local size_t consecutive_not_ordered = 0;
+		static thread_local auto last_diagnostic_log = std::chrono::steady_clock::now();
+		constexpr auto kDiagnosticLogInterval = std::chrono::seconds(5);
+		constexpr size_t kInvalidationThreshold = 1000;  // Invalidate after 1000 consecutive misses
+		
 		for (size_t i = 0; i < MAX_SCAN_ATTEMPTS; ++i) {
 			// [[OBSERVABILITY]] - Track batches scanned (increment on each iteration)
 			replication_metrics_[broker_id].batches_scanned.fetch_add(1, std::memory_order_relaxed);
+			scan_iterations++;
+			
+			// [[PHASE_1_FIX_READER_INVALIDATION]] - Periodic cache invalidation for non-coherent CXL
+			// On real non-coherent CXL, readers must invalidate their local cache to observe remote writes
+			// Pattern: After N consecutive "not ready" reads, invalidate the cache line and issue load fence
+			// This matches the pattern used in BrokerScannerWorker5 (topic.cc:1462-1466)
+			if (consecutive_not_ordered >= kInvalidationThreshold) {
+				CXL::flush_cacheline(current_batch);
+				// Flush second cache line if BatchHeader spans multiple cache lines
+				const void* batch_next_line = reinterpret_cast<const void*>(
+					reinterpret_cast<const uint8_t*>(current_batch) + 64);
+				CXL::flush_cacheline(batch_next_line);
+				CXL::load_fence();
+				consecutive_not_ordered = 0;
+			}
+			
 			// [[DEVIATION_006: Export Chain Semantics]] 
 			// Read ordered flag from the *slot* (like export does in Topic::GetBatchToExport)
 			volatile uint32_t ordered_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->ordered;
 			
+			// Calculate ring offset for diagnostics
+			size_t ring_offset = reinterpret_cast<uint8_t*>(current_batch) - reinterpret_cast<uint8_t*>(batch_ring_start);
+			
 			if (ordered_check != 1) {
+				ordered_misses++;
+				consecutive_not_ordered++;
+				// [[PHASE_0_INSTRUMENTATION]] - Periodic diagnostic logging
+				auto now = std::chrono::steady_clock::now();
+				if (now - last_diagnostic_log >= kDiagnosticLogInterval) {
+					LOG(INFO) << "[GetNextReplicationBatch B" << broker_id << "]: Scan stats: "
+						<< "iterations=" << scan_iterations << ", ordered_hits=" << ordered_hits
+						<< ", ordered_misses=" << ordered_misses << ", ring_offset=" << ring_offset
+						<< ", current_ordered=" << ordered_check << ", consecutive_not_ordered=" << consecutive_not_ordered;
+					last_diagnostic_log = now;
+				}
 				// Current slot not yet ordered, advance and try next
 				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
 					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
@@ -557,45 +613,57 @@ namespace Embarcadero{
 				continue;
 			}
 			
+			ordered_hits++;
+			consecutive_not_ordered = 0;  // Reset counter on success
+			
 			// ordered == 1: Follow the export chain to the actual batch header
-			// batch_off_to_export is a byte offset from current_batch to the real batch
+			// [[PHASE_2_SIMPLIFY_EXPORT]] - batch_off_to_export semantics:
+			// - batch_off_to_export == 0: This slot IS the export record (simplified ORDER=5 design)
+			// - batch_off_to_export != 0: Points to actual batch header (legacy export chain)
 			volatile size_t batch_off_to_export_check = 
 				reinterpret_cast<volatile BatchHeader*>(current_batch)->batch_off_to_export;
 			
-			// Bounds validation for batch_off_to_export
-			// Must point within the batch ring and be aligned to BatchHeader size
-			if (batch_off_to_export_check >= BATCHHEADERS_SIZE ||
-			    batch_off_to_export_check % sizeof(BatchHeader) != 0) {
-				LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
-					<< "]: Invalid batch_off_to_export=" << batch_off_to_export_check 
-					<< " (must be in [0, " << BATCHHEADERS_SIZE << ") and aligned to " 
-					<< sizeof(BatchHeader) << " bytes)";
-				// Advance and continue scanning
-				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
-					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
-				if (next_batch >= batch_ring_end) {
-					next_batch = batch_ring_start;
+			BatchHeader* actual_batch;
+			if (batch_off_to_export_check == 0) {
+				// Simplified design: same slot is the export record
+				actual_batch = current_batch;
+			} else {
+				// Legacy export chain: follow offset to actual batch header
+				// Bounds validation for batch_off_to_export
+				// Must point within the batch ring and be aligned to BatchHeader size
+				if (batch_off_to_export_check >= BATCHHEADERS_SIZE ||
+				    batch_off_to_export_check % sizeof(BatchHeader) != 0) {
+					LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
+						<< "]: Invalid batch_off_to_export=" << batch_off_to_export_check 
+						<< " (must be in [0, " << BATCHHEADERS_SIZE << ") and aligned to " 
+						<< sizeof(BatchHeader) << " bytes)";
+					// Advance and continue scanning
+					BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+					if (next_batch >= batch_ring_end) {
+						next_batch = batch_ring_start;
+					}
+					current_batch = next_batch;
+					continue;
 				}
-				current_batch = next_batch;
-				continue;
-			}
-			
-			// Compute the actual batch header by following the offset
-			BatchHeader* actual_batch = reinterpret_cast<BatchHeader*>(
-				reinterpret_cast<uint8_t*>(current_batch) + batch_off_to_export_check);
-			
-			// Verify actual_batch is still within ring bounds
-			if (actual_batch < batch_ring_start || actual_batch >= batch_ring_end) {
-				LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
-					<< "]: Export chain points outside ring (offset=" << batch_off_to_export_check << ")";
-				// Advance and continue scanning
-				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
-					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
-				if (next_batch >= batch_ring_end) {
-					next_batch = batch_ring_start;
+				
+				// Compute the actual batch header by following the offset
+				actual_batch = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(current_batch) + batch_off_to_export_check);
+				
+				// Verify actual_batch is still within ring bounds
+				if (actual_batch < batch_ring_start || actual_batch >= batch_ring_end) {
+					LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
+						<< "]: Export chain points outside ring (offset=" << batch_off_to_export_check << ")";
+					// Advance and continue scanning
+					BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+					if (next_batch >= batch_ring_end) {
+						next_batch = batch_ring_start;
+					}
+					current_batch = next_batch;
+					continue;
 				}
-				current_batch = next_batch;
-				continue;
 			}
 			
 			// Read batch metadata from the actual batch header with payload bounds checks
@@ -659,9 +727,12 @@ namespace Embarcadero{
 		return false;
 	}
 
-	//[[LEGACY_CODE]] This is a legacy per-message replication path
-	// No longer used in Stage-4 batch-based replication
-	// Kept for reference/fallback only
+	//[[PHASE_5_REFACTOR_LEGACY_PATHS]] - Legacy per-message replication path
+	// STATUS: DEPRECATED - No longer used in Stage-4 batch-based replication (ORDER=5)
+	// PURPOSE: Kept for reference/fallback only (may be used by older order levels)
+	// MIGRATION: All ORDER=5 replication uses GetNextReplicationBatch() instead
+	// OWNERSHIP: DiskManager maintains this for backward compatibility
+	// TODO: Remove or move to archive/legacy/ directory after confirming no other order levels use it
 	// This is a copy of Topic::GetMessageAddr changed to use tinode instead of topic variables
 	bool DiskManager::GetMessageAddr(TInode* tinode, int order, int broker_id, size_t &last_offset,
 			void* &last_addr, void* &messages, size_t &messages_size){

@@ -121,6 +121,13 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (network["disk_io_threads"]) config_.network.disk_io_threads.set(network["disk_io_threads"].as<int>());
                 if (network["sub_connections"]) config_.network.sub_connections.set(network["sub_connections"].as<int>());
                 if (network["zero_copy_send_limit"]) config_.network.zero_copy_send_limit.set(network["zero_copy_send_limit"].as<size_t>());
+
+                // Non-blocking I/O configuration
+                if (network["use_nonblocking"]) config_.network.use_nonblocking.set(network["use_nonblocking"].as<bool>());
+                if (network["staging_pool_buffer_size_mb"]) config_.network.staging_pool_buffer_size_mb.set(network["staging_pool_buffer_size_mb"].as<int>());
+                if (network["staging_pool_num_buffers"]) config_.network.staging_pool_num_buffers.set(network["staging_pool_num_buffers"].as<int>());
+                if (network["num_publish_receive_threads"]) config_.network.num_publish_receive_threads.set(network["num_publish_receive_threads"].as<int>());
+                if (network["num_cxl_allocation_workers"]) config_.network.num_cxl_allocation_workers.set(network["num_cxl_allocation_workers"].as<int>());
             }
             
             // Corfu
@@ -180,6 +187,40 @@ bool Configuration::loadFromFile(const std::string& filename) {
                     if (performance["numa_bind"]) config_.client.performance.numa_bind.set(performance["numa_bind"].as<bool>());
                     if (performance["zero_copy"]) config_.client.performance.zero_copy.set(performance["zero_copy"].as<bool>());
                 }
+            }
+        }
+
+        // Client-only config (e.g. config/client.yaml with top-level "client:")
+        // Ensures BATCH_SIZE (storage.batch_size) matches broker when client loads client.yaml.
+        // Broker uses embarcadero.yaml storage.batch_size; client must use same value for batch alignment.
+        if (yaml["client"]) {
+            auto client = yaml["client"];
+            if (client["publisher"]) {
+                auto publisher = client["publisher"];
+                if (publisher["threads_per_broker"]) config_.client.publisher.threads_per_broker.set(publisher["threads_per_broker"].as<int>());
+                if (publisher["buffer_size_mb"]) config_.client.publisher.buffer_size_mb.set(publisher["buffer_size_mb"].as<size_t>());
+                if (publisher["batch_size_kb"]) {
+                    size_t kb = publisher["batch_size_kb"].as<size_t>();
+                    config_.client.publisher.batch_size_kb.set(kb);
+                    config_.storage.batch_size.set(kb * 1024);  // BATCH_SIZE = batch_size_kb * 1024
+                }
+            }
+            if (client["subscriber"]) {
+                auto subscriber = client["subscriber"];
+                if (subscriber["connections_per_broker"]) config_.client.subscriber.connections_per_broker.set(subscriber["connections_per_broker"].as<int>());
+                if (subscriber["buffer_size_mb"]) config_.client.subscriber.buffer_size_mb.set(subscriber["buffer_size_mb"].as<size_t>());
+            }
+            if (client["network"]) {
+                auto net = client["network"];
+                if (net["connect_timeout_ms"]) config_.client.network.connect_timeout_ms.set(net["connect_timeout_ms"].as<int>());
+                if (net["send_timeout_ms"]) config_.client.network.send_timeout_ms.set(net["send_timeout_ms"].as<int>());
+                if (net["recv_timeout_ms"]) config_.client.network.recv_timeout_ms.set(net["recv_timeout_ms"].as<int>());
+            }
+            if (client["performance"]) {
+                auto perf = client["performance"];
+                if (perf["use_hugepages"]) config_.client.performance.use_hugepages.set(perf["use_hugepages"].as<bool>());
+                if (perf["numa_bind"]) config_.client.performance.numa_bind.set(perf["numa_bind"].as<bool>());
+                if (perf["zero_copy"]) config_.client.performance.zero_copy.set(perf["zero_copy"].as<bool>());
             }
         }
         

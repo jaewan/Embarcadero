@@ -1,7 +1,9 @@
 client:
   publisher:
     threads_per_broker: 4
-    buffer_size_mb: 256
+    # 768MB per thread × 16 threads = 12GB total buffer capacity
+    # Required for 10GB tests: 10GB / 16 threads = 625MB minimum
+    buffer_size_mb: 768
     batch_size_kb: 2048
   
   subscriber:

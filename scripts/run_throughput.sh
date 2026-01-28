@@ -1,14 +1,15 @@
 #!/bin/bash
+# Ensure we run from project root (works when invoked from any directory, e.g. measure_bandwidth_proper.sh)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 # Navigate to build/bin directory
-if [ -d "build/bin" ]; then
-    cd build/bin
-elif [ -d "../build/bin" ]; then
-    cd ../build/bin
-else
-    echo "Error: Cannot find build/bin directory"
+if [ ! -d "build/bin" ]; then
+    echo "Error: Cannot find build/bin directory (expected $PROJECT_ROOT/build/bin)"
     exit 1
 fi
+cd build/bin
 
 # Explicit config argument for binaries (relative to build/bin)
 CONFIG_ARG="--config ../../config/embarcadero.yaml"
@@ -36,7 +37,8 @@ EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1"
 
 NUM_BROKERS=4
 NUM_TRIALS=1
-test_cases=(5)
+# Use test type 1 (E2E) for validation - includes subscriber and DEBUG_check_order
+test_cases=(${TEST_TYPE:-1})
 # Use MESSAGE_SIZE environment variable or default to multiple sizes
 if [ -n "$MESSAGE_SIZE" ]; then
     msg_sizes=($MESSAGE_SIZE)
@@ -200,7 +202,7 @@ for test_case in "${test_cases[@]}"; do
 			# [[FIX]]: Include trial number in log filename to prevent overwriting
 			$EMBARLET_NUMA_BIND ./embarlet $CONFIG_ARG --head --$sequencer > broker_0_trial${trial}.log 2>&1 &
 			shell_pid=$!
-			sleep 2
+			sleep 1
 				# Find actual embarlet PID (numactl execs into embarlet, so child is embarlet)
 				head_pid=$(pgrep -f "embarlet.*--head" 2>/dev/null | head -1)
 				if [ -z "$head_pid" ]; then
@@ -213,8 +215,8 @@ for test_case in "${test_cases[@]}"; do
 				pids+=($head_pid)
 				echo "Started head broker with PID $head_pid"
 
-				# Wait for head broker to signal readiness (smart polling, not fixed sleep)
-				if ! wait_for_broker_ready "$head_pid" 120; then
+				# Wait for head broker to signal readiness (60s max; healthy startup ~5–15s)
+				if ! wait_for_broker_ready "$head_pid" 60; then
 					echo "Head broker failed to initialize, aborting trial"
 					# Kill all processes and skip to next trial
 					for pid in "${pids[@]}"; do
@@ -232,7 +234,7 @@ for test_case in "${test_cases[@]}"; do
 			  # [[FIX]]: Include trial number in log filename to prevent overwriting
 			  $EMBARLET_NUMA_BIND ./embarlet $CONFIG_ARG > broker_${i}_trial${trial}.log 2>&1 &
 			  broker_shell_pid=$!
-				  sleep 2
+				  sleep 1
 			  
 			  # [[FIX]]: Find the specific embarlet PID that's a child of this broker_shell_pid
 			  # This ensures we get the correct PID for THIS broker, not just any broker
@@ -295,8 +297,8 @@ for test_case in "${test_cases[@]}"; do
 				    continue
 				  fi
 
-				  # Wait for broker to signal readiness (should be fast, no CXL allocation)
-				  if ! wait_for_broker_ready "$broker_pid" 30; then
+				  # Wait for broker to signal readiness (15s max; healthy ~3–8s)
+				  if ! wait_for_broker_ready "$broker_pid" 15; then
 					  echo "Broker $i failed to initialize, aborting trial"
 					  for pid in "${pids[@]}"; do
 						  kill $pid 2>/dev/null || true

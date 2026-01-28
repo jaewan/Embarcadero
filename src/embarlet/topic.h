@@ -257,6 +257,10 @@ class Topic {
 		std::atomic<size_t> kafka_logical_offset_{0};
 		absl::flat_hash_map<size_t, size_t> written_messages_range_;
 
+		// Ring buffer metrics
+		std::atomic<uint64_t> ring_full_count_{0};
+		std::atomic<uint64_t> ring_full_last_log_time_{0};
+
 		// TInode cache
 		int replication_factor_;
 		void* ordered_offset_addr_;

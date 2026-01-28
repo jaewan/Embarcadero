@@ -10,6 +10,7 @@
 #include "absl/container/flat_hash_map.h"
 
 #include "common/config.h"
+#include "cxl_manager/cxl_datastructure.h"
 
 namespace Embarcadero {
 
@@ -44,6 +45,97 @@ struct SubscriberState {
     size_t last_offset;
     void* last_addr;
     bool initialized = false;
+};
+
+// Forward declarations for non-blocking architecture
+class StagingPool;
+
+/**
+ * Connection phase for non-blocking publish handling
+ */
+enum ConnectionPhase {
+    INIT,              // Initial state after connection accept
+    WAIT_HEADER,       // Waiting for complete batch header
+    WAIT_PAYLOAD,      // Waiting for complete payload data
+    WAIT_CXL,          // Waiting for CXL allocation (queued)
+    COMPLETE           // Batch processed, ready for next batch
+};
+
+/**
+ * Per-connection state for non-blocking publish handling
+ */
+struct ConnectionState {
+    int fd;                           // Socket file descriptor
+    ConnectionPhase phase;            // Current state machine phase
+
+    // Header tracking
+    BatchHeader batch_header;         // Partially or fully received header
+    size_t header_offset;             // Bytes received so far (0..64)
+
+    // Payload tracking
+    void* staging_buf;                // Staging buffer pointer (nullptr if not allocated)
+    size_t payload_offset;            // Bytes received so far
+
+    // Retry tracking for CXL allocation
+    int cxl_allocation_attempts;      // Exponential backoff counter
+
+    // Connection metadata
+    uint32_t client_id;
+    std::string topic;
+    bool epoll_registered;            // Whether socket is in epoll
+    EmbarcaderoReq handshake;         // Original handshake for topic/ack info
+
+    ConnectionState()
+        : fd(-1),
+          phase(INIT),
+          header_offset(0),
+          staging_buf(nullptr),
+          payload_offset(0),
+          cxl_allocation_attempts(0),
+          client_id(0),
+          epoll_registered(false) {
+        memset(&handshake, 0, sizeof(handshake));
+    }
+};
+
+/**
+ * Pending batch waiting for CXL allocation
+ */
+struct PendingBatch {
+    ConnectionState* conn_state;       // Connection that received this batch
+    void* staging_buf;                 // Staging buffer with payload
+    BatchHeader batch_header;          // Complete batch header
+    EmbarcaderoReq handshake;          // Original handshake for topic/ack info
+
+    PendingBatch()
+        : conn_state(nullptr),
+          staging_buf(nullptr) {}
+
+    PendingBatch(ConnectionState* cs, void* buf, const BatchHeader& bh, const EmbarcaderoReq& hs)
+        : conn_state(cs),
+          staging_buf(buf),
+          batch_header(bh),
+          handshake(hs) {}
+};
+
+/**
+ * New publish connection for non-blocking handling
+ */
+struct NewPublishConnection {
+    int fd;                           // Socket file descriptor
+    EmbarcaderoReq handshake;         // Handshake metadata
+    struct sockaddr_in client_address; // Client address for ACK setup
+
+    NewPublishConnection()
+        : fd(-1) {
+        memset(&handshake, 0, sizeof(handshake));
+        memset(&client_address, 0, sizeof(client_address));
+    }
+
+    NewPublishConnection(int socket_fd, const EmbarcaderoReq& hs, const struct sockaddr_in& addr)
+        : fd(socket_fd),
+          handshake(hs),
+          client_address(addr) {}
 };
 
 class NetworkManager {
@@ -85,18 +177,42 @@ private:
     size_t GetOffsetToAck(const char* topic, uint32_t ack_level);
 	void SubscribeNetworkThread(int sock, int efd, const char* topic, int connection_id);
 
+    // Non-blocking architecture thread handlers
+    void PublishReceiveThread();
+    void CXLAllocationWorker();
+
     // Request handling helpers
-    void HandlePublishRequest(int client_socket, const EmbarcaderoReq& handshake, 
+    void HandlePublishRequest(int client_socket, const EmbarcaderoReq& handshake,
                              const struct sockaddr_in& client_address);
     void HandleSubscribeRequest(int client_socket, const EmbarcaderoReq& handshake);
-    bool SendMessageData(int sock_fd, int epoll_fd, void* buffer, size_t buffer_size, 
+    bool SendMessageData(int sock_fd, int epoll_fd, void* buffer, size_t buffer_size,
                         size_t& send_limit);
     bool IsConnectionAlive(int fd, char* buffer);
+
+    // Non-blocking architecture helpers
+    bool DrainHeader(int fd, ConnectionState* state);
+    bool DrainPayload(int fd, ConnectionState* state);
+    void CheckStagingPoolRecovery(int epoll_fd, absl::flat_hash_map<int, std::unique_ptr<ConnectionState>>& connections);
+    void SetupPublishConnection(ConnectionState* state, const NewPublishConnection& conn);
     
     // Thread-safe queues
     folly::MPMCQueue<std::optional<struct NetworkRequest>> request_queue_;
     folly::MPMCQueue<struct LargeMsgRequest> large_msg_queue_;
-    
+
+    // Non-blocking architecture queues and state
+    std::unique_ptr<StagingPool> staging_pool_;
+    std::unique_ptr<folly::MPMCQueue<PendingBatch>> cxl_allocation_queue_;
+    std::unique_ptr<folly::MPMCQueue<NewPublishConnection>> publish_connection_queue_;
+
+    // Phase 3: Performance metrics (lock-free counters)
+    std::atomic<uint64_t> metric_connections_routed_{0};
+    std::atomic<uint64_t> metric_batches_drained_{0};
+    std::atomic<uint64_t> metric_batches_copied_{0};
+    std::atomic<uint64_t> metric_cxl_retries_{0};
+    std::atomic<uint64_t> metric_staging_exhausted_{0};
+    std::atomic<uint64_t> metric_ring_full_{0};  // CXL ring full events (non-blocking gating)
+    std::atomic<uint64_t> metric_batches_dropped_{0};  // Batches dropped (max retries exceeded)
+
     // Thread management
     int broker_id_;
     std::vector<std::thread> threads_;

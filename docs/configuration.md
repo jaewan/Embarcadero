@@ -68,6 +68,19 @@ embarcadero:
     is_amd: false
 ```
 
+## Batch Size Alignment (Client vs Broker)
+
+**Contract:** Brokers and throughput clients must use the same logical batch size for correct behavior and full ACKs.
+
+- **Broker:** `embarcadero.storage.batch_size` (e.g. 2097152 = 2 MB in `config/embarcadero.yaml`). Used for CXL allocation and sequencer batching.
+- **Client:** Throughput client uses `BATCH_SIZE` from config (see `src/common/config.h.in` → `storage.batch_size`) or, when using `config/client.yaml`, `client.publisher.batch_size_kb` (e.g. 2048 ⇒ 2 MB).
+
+**Recommendation:** Use one source of truth. For throughput tests, ensure:
+- Broker config: `storage.batch_size: 2097152` (2 MB).
+- Client config: `client.publisher.batch_size_kb: 2048` (2 MB), or ensure the client loads a config where `storage.batch_size` equals the broker’s value.
+
+Mismatch can cause under-filled batches, extra round-trips, or ring/ACK issues at high load.
+
 ## Acknowledgment Levels (ack_level)
 
 Embarcadero supports three acknowledgment levels that control when publishers receive ACKs:

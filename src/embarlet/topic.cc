@@ -1138,23 +1138,100 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		BatchHeader* &batch_header_location) {
 
 	// Calculate base addresses
-	const unsigned long long int segment_metadata = 
+	const unsigned long long int segment_metadata =
 		reinterpret_cast<unsigned long long int>(current_segment_);
 	const size_t msg_size = batch_header.total_size;
 	void* batch_headers_log;
 
 	{
+		// [[NON-BLOCKING RING GATING]]
+		// Check if the next slot is free before allocating.
+		// This prevents overwriting unconsumed batches when the ring is full.
+		// Unlike blocking gating (which caused NetworkManager threads to block and TCP timeouts),
+		// this approach returns nullptr immediately (fail-fast) and lets the caller retry.
+		// The non-blocking NetworkManager architecture (EMBARCADERO_USE_NONBLOCKING=true)
+		// with CXLAllocationWorker handles retries with exponential backoff.
+		const unsigned long long int batch_headers_start =
+			reinterpret_cast<unsigned long long int>(first_batch_headers_addr_);
+		const unsigned long long int batch_headers_end = batch_headers_start + BATCHHEADERS_SIZE;
+
 		absl::MutexLock lock(&mutex_);
 
+		// Calculate the byte offset of the next slot we're about to allocate
+		size_t next_slot_offset = static_cast<size_t>(batch_headers_ - batch_headers_start);
+
+		// Read batch_headers_consumed_through with cache invalidation (non-coherent CXL)
+		// The sequencer updates this field after processing each batch (topic.cc:1555)
+		// Semantics: "first byte past last consumed slot"
+		const void* consumed_through_addr = const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].batch_headers_consumed_through));
+		CXL::flush_cacheline(consumed_through_addr);
+		CXL::load_fence();
+		size_t consumed_through = tinode_->offsets[broker_id_].batch_headers_consumed_through;
+
+		// Check if the slot is free using circular buffer semantics.
+		// The ring buffer allows the producer to be up to (RING_SIZE - 1 slot) ahead of the consumer.
+		//
+		// Key insight: In a circular ring buffer, we track "in-flight" data (allocated but not consumed).
+		// Ring is full when in-flight + new_slot >= RING_SIZE.
+		//
+		// consumed_through semantics: "first byte past last consumed slot"
+		// - BATCHHEADERS_SIZE: Initialization sentinel meaning "all slots free"
+		// - Otherwise: bytes [0, consumed_through) have been processed by sequencer
+		//
+		// [[CRITICAL FIX]]: The old check "consumed_through >= next_slot_offset" was WRONG for circular buffers.
+		// It only passed when producer wrapped around and was behind consumer, which breaks normal operation
+		// where producer is ahead. Fixed to use proper circular buffer capacity calculation.
+		bool slot_free;
+		if (consumed_through == BATCHHEADERS_SIZE) {
+			// Initialization sentinel: all slots are free (sequencer hasn't started)
+			slot_free = true;
+		} else {
+			// Calculate bytes "in flight" (allocated by producer, not yet consumed by sequencer)
+			size_t in_flight;
+			if (next_slot_offset >= consumed_through) {
+				// Normal case: producer ahead of consumer (same lap around ring)
+				in_flight = next_slot_offset - consumed_through;
+			} else {
+				// Producer wrapped around to start, consumer still at end
+				in_flight = (BATCHHEADERS_SIZE - consumed_through) + next_slot_offset;
+			}
+			// Ring full if in-flight + new slot would completely fill the ring
+			// Use < (not <=) to leave one-slot gap for full/empty disambiguation
+			slot_free = (in_flight + sizeof(BatchHeader) < BATCHHEADERS_SIZE);
+		}
+
+		if (!slot_free) {
+			// Ring full - fail fast without allocating
+			// Caller (CXLAllocationWorker in non-blocking mode) will retry with exponential backoff
+			log = nullptr;
+			batch_header_location = nullptr;
+
+			// Update ring full metric with time-based throttling for logging
+			uint64_t count = ring_full_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+			uint64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+			uint64_t last_log = ring_full_last_log_time_.load(std::memory_order_relaxed);
+
+			// Log first 10 events, then throttle to once per 5 seconds
+			if (count <= 10 || (now_ns - last_log > 5000000000ULL)) {  // 5 seconds in nanoseconds
+				LOG(WARNING) << "EmbarcaderoGetCXLBuffer: Ring full for broker " << broker_id_
+				             << " topic=" << topic_name_
+				             << " (slot_offset=" << next_slot_offset
+				             << ", consumed_through=" << consumed_through
+				             << ", BATCHHEADERS_SIZE=" << BATCHHEADERS_SIZE
+				             << ", count=" << count << ")";
+				ring_full_last_log_time_.store(now_ns, std::memory_order_relaxed);
+			}
+			return nullptr;
+		}
+
+		// Slot is free - proceed with allocation
 		// Allocate space in log
 		log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
 
 		// Allocate space for batch header (wrap within ring)
 		batch_headers_log = reinterpret_cast<void*>(batch_headers_);
 		batch_headers_ += sizeof(BatchHeader);
-		const unsigned long long int batch_headers_start =
-			reinterpret_cast<unsigned long long int>(first_batch_headers_addr_);
-		const unsigned long long int batch_headers_end = batch_headers_start + BATCHHEADERS_SIZE;
 		if (batch_headers_ >= batch_headers_end) {
 			batch_headers_ = batch_headers_start;
 		}
@@ -1435,27 +1512,23 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	while (!stop_threads_) {
 		static thread_local size_t scan_loops = 0;
 		static thread_local size_t ready_batches_seen = 0;
-		
-		// [[PERFORMANCE: Optimized Polling Strategy]]
-		// Paper spec: Readers poll monotonic state without expensive cache invalidation every iteration
-		// Use throttled cache invalidation: flush every 1000 iterations instead of every iteration
-		// This reduces clflushopt+sfence overhead by 1000x while still ensuring visibility
-		if (scan_loops % 1000 == 0) {
-			// Every 1000 iterations, invalidate cache to ensure we see remote writes
-			CXL::flush_cacheline(current_batch_header);
-			// Use load fence (lfence) for read-side, not store fence (sfence) which is for writes
-#ifdef __x86_64__
-			_mm_lfence();  // Load fence ensures subsequent reads see fresh data
-#else
-			std::atomic_thread_fence(std::memory_order_acquire);  // Portable fallback
-#endif
-		}
+
+		// [[CRITICAL FIX: Always invalidate cache before reading batch_complete on non-coherent CXL]]
+		// CORRECTNESS: Writer (NetworkManager) writes batch_complete=1 + flush. Reader MUST invalidate
+		// before EVERY read to see remote writes. The "1000x overhead reduction" was a bug - it caused
+		// the sequencer to read stale cached batch_complete=0 for up to 999 iterations, missing batches.
+		// This is the root cause of ACK stalls: sequencer stops processing → no ordered updates → no ACKs.
+		// Trade-off: Correctness > CPU efficiency. Non-coherent CXL requires this overhead.
+		CXL::flush_cacheline(current_batch_header);
+		CXL::load_fence();
+		++scan_loops;
 
 		// Check current batch header (matches message_ordering.cc:600-617 pattern)
 		// num_msg is uint32_t in BatchHeader, so read as volatile uint32_t for type safety
 		// For non-coherent CXL: volatile prevents compiler caching; ACQUIRE doesn't help cache coherence
 		volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
 		// Use batch_complete as the authoritative readiness signal for ORDER=5
+		// [[CRITICAL: Read AFTER invalidation to ensure fresh value]]
 		volatile uint32_t batch_complete_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->batch_complete;
 		// Read log_idx as volatile for consistency (written by remote broker via NetworkManager)
 		volatile size_t log_idx_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->log_idx;
@@ -1465,10 +1538,13 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		// Use batch_complete as the authoritative readiness signal for Sequencer 5
 		bool batch_ready = (batch_complete_check == 1);
 		if (!batch_ready || num_msg_check == 0 || num_msg_check > MAX_REASONABLE_NUM_MSG) {
-			if (++scan_loops % 1000000 == 0) {
+			++idle_cycles;
+			// [[DIAGNOSTIC: Log more frequently after processing batches to catch 37.6% stall]]
+			if (++scan_loops % 100000 == 0 || (total_batches_processed > 450 && scan_loops % 10000 == 0)) {
 				LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: waiting batch_complete="
 				          << batch_complete_check << " num_msg=" << num_msg_check
-				          << " log_idx=" << log_idx_check;
+				          << " log_idx=" << log_idx_check << " slot_addr=" << std::hex << current_batch_header
+				          << std::dec << " total_processed=" << total_batches_processed;
 			}
 			// Current batch not ready or invalid - advance to next (matches message_ordering.cc pattern)
 			// This is the key: always advance when not ready, don't wait for written_addr
@@ -1527,11 +1603,27 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		total_batches_processed++;
 		idle_cycles = 0;
 
-		// Clear readiness marker so each slot is processed exactly once.
-		// Slot lifecycle: writer sets batch_complete=1 -> sequencer processes -> sequencer clears to 0.
+		// Clear batch_complete marker so producer can reuse this slot.
+		// [[CRITICAL: DO NOT clear num_msg - Stage-4 replication needs it!]]
+		// Slot lifecycle for ORDER=5:
+		//   1. Writer: Sets batch_complete=1, num_msg, total_size, log_idx, flushes
+		//   2. Sequencer: Reads batch, sets ordered=1, clears batch_complete=0, flushes (num_msg kept intact)
+		//   3. Replication: Reads ordered==1, num_msg, total_size, log_idx (uses num_msg to find batch)
+		//   4. Producer (on wrap): Checks batch_complete==0, overwrites slot
+		// If we clear num_msg in step 2, replication sees ordered==1 but num_msg==0 and skips the batch!
 		header_to_process->batch_complete = 0;
-		header_to_process->num_msg = 0;
+		// KEEP num_msg intact for replication!
 		CXL::flush_cacheline(header_to_process);
+		CXL::store_fence();
+
+		// [[CRITICAL FIX: Update consumed_through so producer can safely wrap the ring]]
+		// After processing this batch, update consumed_through to indicate this slot is now free.
+		// The producer checks consumed_through before allocating slots to avoid overwriting unconsumed slots.
+		size_t slot_offset = reinterpret_cast<uint8_t*>(header_to_process) -
+			reinterpret_cast<uint8_t*>(ring_start_default);
+		tinode_->offsets[broker_id].batch_headers_consumed_through = slot_offset + sizeof(BatchHeader);
+		CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(
+			&tinode_->offsets[broker_id].batch_headers_consumed_through)));
 		CXL::store_fence();
 
 		// [[CRITICAL FIX: Removed Prefetching]] - Prefetching remote-writer data violates non-coherent CXL semantics

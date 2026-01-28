@@ -162,7 +162,11 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 
 		// Finalize publishing
 		p.DEBUG_check_send_finish();
-		p.Poll(n);
+		if (!p.Poll(n)) {
+			LOG(ERROR) << "Publish test failed: ACK wait timed out";
+			delete[] message;
+			return 0.0;
+		}
 
 		p.WriteFailureEventsToFile("/home/domin/Embarcadero/data/failure/failure_events.csv");
 		// Calculate elapsed time and bandwidth
@@ -250,7 +254,11 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		// Finalize publishing
 		VLOG(5) << "Finished publishing from client";
 		p.DEBUG_check_send_finish();
-		p.Poll(n);
+		if (!p.Poll(n)) {
+			LOG(ERROR) << "Publish test failed: ACK wait timed out";
+			delete[] message;
+			return 0.0;
+		}
 
 		// Calculate elapsed time and bandwidth
 		auto end = std::chrono::high_resolution_clock::now();
@@ -469,7 +477,11 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 
 		// Finalize publishing
 		p.DEBUG_check_send_finish();
-		p.Poll(n);
+		if (!p.Poll(n)) {
+			LOG(ERROR) << "End-to-end test failed: ACK wait timed out";
+			delete[] message;
+			return std::make_pair(0.0, 0.0);
+		}
 
 		// Record publish end time
 		auto pub_end = std::chrono::high_resolution_clock::now();
@@ -493,7 +505,8 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		double e2e_seconds = std::chrono::duration<double>(end - start).count();
 		double e2eBandwidthMbps = ((message_size * n) / e2e_seconds) / (1024 * 1024);
 
-		// Check message ordering
+		// Check message ordering (add small delay to ensure buffers are stable)
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		s.DEBUG_check_order(order);
 
 		LOG(INFO) << "Publish completed in " << std::fixed << std::setprecision(2) 
@@ -599,7 +612,11 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 
 		// Finalize publishing
 		p.DEBUG_check_send_finish();
-		p.Poll(n);
+		if (!p.Poll(n)) {
+			LOG(ERROR) << "Latency test failed: ACK wait timed out";
+			delete[] message;
+			return std::make_pair(0.0, 0.0);
+		}
 
 		// Record publish end time
 		auto pub_end = std::chrono::high_resolution_clock::now();

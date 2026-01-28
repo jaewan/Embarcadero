@@ -54,10 +54,13 @@ struct alignas(64) offset_entry {
 	// ============================================================================
 	// SEQUENCER REGION: Cache lines 4-5 (bytes 512-767)
 	// [[WRITER: Sequencer thread only]] - Global ordering (Stage 3)
+	// [[LOCKFREE_RING]] batch_headers_consumed_through: sequencer writes, broker reads (with
+	// invalidate) before wrap; allows small ring without overwriting unconsumed slots.
 	// ============================================================================
-	volatile uint64_t ordered;               // +512 (8B) - widened to avoid overflow on long runs
-	volatile size_t ordered_offset;          // +520 (8B)
-	uint8_t _pad_sequencer[256 - 8 - 8];     // +528 (240B) - pad to 256B
+	volatile uint64_t ordered;                        // +512 (8B) - widened to avoid overflow on long runs
+	volatile size_t ordered_offset;                   // +520 (8B)
+	volatile size_t batch_headers_consumed_through;   // +528 (8B) - byte offset into batch header ring (exclusive)
+	uint8_t _pad_sequencer[256 - 8 - 8 - 8];         // +536 (232B) - pad to 256B
 };
 
 // Static verification: enforce cache-line separation and size constraints
@@ -67,6 +70,7 @@ static_assert(offsetof(offset_entry, log_offset) == 0, "log_offset must be at of
 static_assert(offsetof(offset_entry, replication_done) == 256, "replication_done must be at offset 256 (separate cache line)");
 static_assert(offsetof(offset_entry, ordered) == 512, "ordered must be at offset 512 (separate cache line)");
 static_assert(offsetof(offset_entry, ordered_offset) == 520, "ordered_offset must be at offset 520 (after 4B padding)");
+static_assert(offsetof(offset_entry, batch_headers_consumed_through) == 528, "batch_headers_consumed_through at 528");
 
 // CRITICAL: Each element in offset_entry[NUM_MAX_BROKERS] array in TInode is 768 bytes.
 // With alignas(64), each element is guaranteed to be 64-byte aligned, which ensures:
@@ -91,20 +95,55 @@ struct alignas(64) TInode{
 	volatile offset_entry offsets[NUM_MAX_BROKERS];
 };
 
+/**
+ * [[PHASE_2_BATCH_LIFECYCLE]] - BatchHeader lifecycle contract
+ * 
+ * Writer ownership and flush requirements (non-coherent CXL):
+ * 
+ * Stage 1 (Receiver/NetworkManager):
+ *   - Writes: batch_seq, client_id, num_msg, broker_id, total_size, start_logical_offset, log_idx
+ *   - Sets: batch_complete=1 (signals batch ready for sequencer)
+ *   - MUST flush: cacheline containing batch_complete (and second cacheline if BatchHeader spans >64B)
+ *   - MUST fence: CXL::store_fence() after flush
+ * 
+ * Stage 3 (Sequencer):
+ *   - Reads: batch_complete (polls until == 1)
+ *   - Writes: total_order, ordered=1, batch_off_to_export
+ *   - Clears: batch_complete=0 (prevents duplicate processing)
+ *   - MUST flush: cacheline containing ordered/batch_off_to_export (Stage-4 polls this)
+ *   - MUST fence: CXL::store_fence() after flush
+ * 
+ * Stage 4 (Replication):
+ *   - Reads: ordered (polls until == 1), batch_off_to_export, total_size, log_idx
+ *   - MUST invalidate: periodic cacheline invalidation + load_fence (every N misses)
+ *   - Writes: replication_done (via DiskManager, not directly to BatchHeader)
+ * 
+ * Stage 5 (ACK/Export):
+ *   - Reads: ordered (for export), replication_done (for ack_level=2)
+ *   - MUST invalidate: periodic cacheline invalidation for replication_done polling
+ * 
+ * Field semantics:
+ *   - batch_off_to_export==0: This slot IS the export record (simplified ORDER=5 design)
+ *   - batch_off_to_export!=0: Points to actual batch header (legacy export chain)
+ */
 struct alignas(64) BatchHeader{
+	// [[LIFECYCLE]]
+	// 1) NetworkManager writes header + payload, then sets batch_complete=1 (with flush+fence).
+	// 2) Sequencer processes batch and clears batch_complete=0 and num_msg=0 (with flush+fence).
+	// This prevents duplicate processing of ring slots under ABA reuse.
 	// Keep readiness-critical fields in the first cache line for CXL visibility
-	size_t batch_seq; // Monotonically increasing from each client. Corfu sets in log's seq
-	uint32_t client_id;
-	uint32_t num_msg;
-	volatile uint32_t batch_complete;  // Batch-level completion flag for Sequencer 5
-	uint32_t broker_id;
-	uint32_t ordered;
+	size_t batch_seq; // [[WRITER: NetworkManager]] Monotonically increasing from each client. Corfu sets in log's seq
+	uint32_t client_id; // [[WRITER: NetworkManager]]
+	uint32_t num_msg; // [[WRITER: NetworkManager]] Set by receiver, cleared by sequencer
+	volatile uint32_t batch_complete;  // [[WRITER: NetworkManager (set=1), Sequencer (clear=0)]] Batch-level completion flag for Sequencer 5
+	uint32_t broker_id; // [[WRITER: NetworkManager]]
+	uint32_t ordered; // [[WRITER: Sequencer]] Set to 1 when batch is globally ordered (Stage-4 polls this)
 	uint32_t _pad0;
-	size_t total_size;
-	size_t start_logical_offset;
-	size_t log_idx;	// Sequencer4: relative log offset to the payload of the batch and relative offset to last message
-	size_t total_order;
-	size_t batch_off_to_export;
+	size_t total_size; // [[WRITER: NetworkManager]]
+	size_t start_logical_offset; // [[WRITER: NetworkManager]]
+	size_t log_idx;	// [[WRITER: NetworkManager]] Sequencer4: relative log offset to the payload of the batch and relative offset to last message
+	size_t total_order; // [[WRITER: Sequencer]] Global sequence number assigned by sequencer
+	size_t batch_off_to_export; // [[WRITER: Sequencer]] Export chain offset (0=in-place, !=0=points to actual batch)
 #ifdef BUILDING_ORDER_BENCH
 	uint32_t gen;
 #endif
@@ -177,162 +216,6 @@ static_assert(offsetof(BlogMessageHeader, total_order) == 32, "Sequencer region 
 static_assert(offsetof(BlogMessageHeader, client_id) == 48, "Read-only metadata must start at byte 48");
 
 /**
- * Header version enumeration for migration support
- * Allows coexistence of legacy MessageHeader and new BlogMessageHeader
- */
-enum class HeaderVersion : uint16_t {
-	HEADER_V1 = 1,  // Legacy MessageHeader (current implementation)
-	HEADER_V2 = 2,  // Paper spec BlogMessageHeader (new implementation)
-};
-
-/**
- * [[PAPER_SPEC: Implemented]] - MessageHeaderV2: Versioned header wrapper for migration
- * Purpose: Enable coexistence of legacy MessageHeader and BlogMessageHeader during migration
- * 
- * Design: Stores version field at the beginning, followed by union of both header types
- * Note: Both MessageHeader and BlogMessageHeader are 64 bytes, so union is safe
- * 
- * Usage Pattern:
- *   MessageHeaderV2* hdr = ...;
- *   if (hdr->version == HeaderVersion::HEADER_V2) {
- *       BlogMessageHeader* v2 = &hdr->v2;
- *       // Use v2 fields
- *   } else {
- *       MessageHeader* v1 = &hdr->v1;
- *       // Use v1 fields
- *   }
- * 
- * Migration Strategy:
- * - Phase 1: Network receiver writes V1 headers (backward compatible)
- * - Phase 2: Network receiver writes V2 headers, sequencer reads both
- * - Phase 3: All code migrates to V2, deprecate V1
- */
-struct alignas(64) MessageHeaderV2 {
-	HeaderVersion version;  // Offset 0 (2 bytes) - Header version identifier
-	uint16_t _pad;         // Offset 2 (2 bytes) - Padding to align union
-	
-	// Union of both header types (both are 64 bytes, so union is safe)
-	union {
-		MessageHeader v1;        // Legacy header (current implementation)
-		BlogMessageHeader v2;    // New header (paper spec)
-	};
-};
-// Note: MessageHeaderV2 is 128 bytes due to alignment (version + pad + aligned union), spanning 2 cache lines
-// The union members are 64-byte aligned, so they start at offset 64
-static_assert(sizeof(MessageHeaderV2) >= 66, "MessageHeaderV2 must accommodate version + union");
-static_assert(offsetof(MessageHeaderV2, v1) == 64, "V1 header must be 64-byte aligned");
-static_assert(offsetof(MessageHeaderV2, v2) == 64, "V2 header must be 64-byte aligned");
-
-/**
- * Helper functions for versioned header access
- * These functions provide type-safe access to header fields based on version
- */
-namespace HeaderUtils {
-	/**
-	 * @brief Detect header version from raw pointer
-	 * @param hdr Pointer to header (may be MessageHeader, BlogMessageHeader, or MessageHeaderV2)
-	 * @return Detected version, or HEADER_V1 if unknown
-	 * 
-	 * Detection logic:
-	 * - If pointer is to MessageHeaderV2, read version field
-	 * - Otherwise, assume HEADER_V1 (legacy)
-	 */
-	inline HeaderVersion DetectVersion(const void* hdr) {
-		if (hdr == nullptr) {
-			return HeaderVersion::HEADER_V1;
-		}
-		
-		// Check if this is a MessageHeaderV2 (has version field at offset 0)
-		// Version field is at offset 0, but we need to check if it's a valid version
-		uint16_t version_val = *reinterpret_cast<const uint16_t*>(hdr);
-		if (version_val == static_cast<uint16_t>(HeaderVersion::HEADER_V1) ||
-		    version_val == static_cast<uint16_t>(HeaderVersion::HEADER_V2)) {
-			return static_cast<HeaderVersion>(version_val);
-		}
-		
-		// Default to V1 for legacy headers
-		return HeaderVersion::HEADER_V1;
-	}
-
-	/**
-	 * @brief Get V1 header pointer (legacy MessageHeader)
-	 * @param hdr Pointer to versioned header
-	 * @return Pointer to MessageHeader, or nullptr if invalid
-	 */
-	inline MessageHeader* GetV1Header(void* hdr) {
-		if (hdr == nullptr) return nullptr;
-		
-		HeaderVersion version = DetectVersion(hdr);
-		if (version == HeaderVersion::HEADER_V1) {
-			MessageHeaderV2* v2_hdr = reinterpret_cast<MessageHeaderV2*>(hdr);
-			if (v2_hdr->version == HeaderVersion::HEADER_V1) {
-				return &v2_hdr->v1;
-			}
-			// Direct MessageHeader pointer (not wrapped)
-			return reinterpret_cast<MessageHeader*>(hdr);
-		}
-		return nullptr;
-	}
-
-	/**
-	 * @brief Get V2 header pointer (BlogMessageHeader)
-	 * @param hdr Pointer to versioned header
-	 * @return Pointer to BlogMessageHeader, or nullptr if invalid
-	 */
-	inline BlogMessageHeader* GetV2Header(void* hdr) {
-		if (hdr == nullptr) return nullptr;
-		
-		HeaderVersion version = DetectVersion(hdr);
-		if (version == HeaderVersion::HEADER_V2) {
-			MessageHeaderV2* v2_hdr = reinterpret_cast<MessageHeaderV2*>(hdr);
-			return &v2_hdr->v2;
-		}
-		return nullptr;
-	}
-
-	/**
-	 * @brief Convert V1 header to V2 header (migration helper)
-	 * @param v1_source Source MessageHeader
-	 * @param v2_dest Destination BlogMessageHeader (must be pre-allocated)
-	 * @param client_id Client ID for V2 header
-	 * @param batch_seq Batch sequence for V2 header
-	 * 
-	 * Field mapping:
-	 * - v1.size → v2.size
-	 * - v1.total_order → v2.total_order
-	 * - v1.client_id → v2.client_id
-	 * - v1.client_order → v2.batch_seq (approximate)
-	 * - v2.received = 1 (assume already received)
-	 * - v2.counter = 0 (will be set by delegation)
-	 * - Timestamps set to current time
-	 */
-	inline void ConvertV1ToV2(const MessageHeader* v1_source, BlogMessageHeader* v2_dest,
-	                          uint64_t client_id, uint32_t batch_seq) {
-		if (v1_source == nullptr || v2_dest == nullptr) {
-			return;
-		}
-
-		// Receiver fields (bytes 0-15)
-		v2_dest->size = static_cast<uint32_t>(v1_source->size);
-		v2_dest->received = 1;  // Assume already received
-		v2_dest->ts = 0;  // Will be set by receiver if needed
-
-		// Delegation fields (bytes 16-31) - leave for delegation to set
-		v2_dest->counter = 0;
-		v2_dest->flags = 0;
-		v2_dest->processed_ts = 0;
-
-		// Sequencer fields (bytes 32-47)
-		v2_dest->total_order = v1_source->total_order;
-		v2_dest->ordered_ts = 0;  // Will be set by sequencer
-
-		// Read-only metadata (bytes 48-63)
-		v2_dest->client_id = client_id;
-		v2_dest->batch_seq = batch_seq;
-		v2_dest->_pad = 0;
-	}
-
-	/**
 	 * @brief Check if BlogMessageHeader should be used (feature flag)
 	 * @return true if BlogMessageHeader is enabled, false to use legacy MessageHeader
 	 * 
@@ -341,6 +224,7 @@ namespace HeaderUtils {
 	 * 
 	 * Default: false (backward compatibility - use MessageHeader)
 	 */
+namespace HeaderUtils {
 	inline bool ShouldUseBlogHeader() {
 		static bool cached = false;
 		static bool value = false;

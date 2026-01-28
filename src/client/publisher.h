@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include "common.h"
 #include "buffer.h"
 
@@ -37,16 +38,19 @@ class Publisher {
 
 		/**
 		 * Publishes a message
-		 * @param message Message data
+		 * @param message Message data (not owned; must remain valid until Poll() completes)
 		 * @param len Message length
+		 * @threading Call from application thread; client_order_ is atomic for concurrent Publish if needed
 		 */
 		void Publish(char* message, size_t len);
 
 		/**
-		 * Polls until n messages have been published
+		 * Polls until n messages have been published and (if ack_level>=1) acknowledged.
 		 * @param n Number of messages to wait for
+		 * @return true if all messages sent and ACKs received, false on timeout or error
+		 * @threading Call from same thread as Publish(); joins publisher threads on first successful call
 		 */
-		void Poll(size_t n);
+		bool Poll(size_t n);
 
 		/**
 		 * Debug method to check if sending is finished
@@ -117,15 +121,17 @@ class Publisher {
 		size_t num_threads_per_broker_;
 		std::atomic<int> num_threads_{0};
 		size_t message_size_;
-		size_t queueSize_;
+		size_t queueSize_;  // [[GUARDED_BY: mutex_]] when modified in SubscribeToClusterStatus
 		Buffer pubQue_;
 		SequencerType seq_type_;
 		std::unique_ptr<CorfuSequencerClient> corfu_client_;
 
-		bool shutdown_{false};
-		bool publish_finished_{false};
-		bool connected_{false};
-		size_t client_order_ = 0;
+		// [[CRITICAL: Atomic - written by destructor/Poll/DEBUG_check, read by PublishThread/SubscribeToCluster]]
+		std::atomic<bool> shutdown_{false};
+		std::atomic<bool> publish_finished_{false};
+		std::atomic<bool> connected_{false};
+		// [[CRITICAL: Atomic - Publish() increments, Poll() reads; ensures visibility across call sites]]
+		std::atomic<size_t> client_order_{0};
 
 		// Used to measure real-time throughput during failure benchmark
 		std::atomic<size_t> total_sent_bytes_{0};
@@ -133,7 +139,7 @@ class Publisher {
 		bool measure_real_time_throughput_ = false;
 		std::thread real_time_throughput_measure_thread_;
 		std::thread kill_brokers_thread_;
-		bool kill_brokers_ = false;
+		std::atomic<bool> kill_brokers_{false};  // FailBrokers writes, Poll reads; atomic if they run on different threads
 		std::chrono::steady_clock::time_point start_time_;
 		
 
@@ -173,8 +179,9 @@ class Publisher {
 		// Acknowledgement
 		int ack_level_;
 		int ack_port_;
-		size_t ack_received_;
-		std::vector<size_t> acked_messages_per_broker_;
+		// [[threading: EpollAckThread writes, Poll() reads]] — must be atomic for correctness
+		std::atomic<size_t> ack_received_{0};
+		std::vector<std::atomic<size_t>> acked_messages_per_broker_;
 		std::vector<std::thread> threads_;
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
@@ -211,7 +218,12 @@ class Publisher {
 		 * Adds publisher threads
 		 * @param num_threads Number of threads to add
 		 * @param broker_id Broker ID
+		 * @param queue_size Queue size to use (caller must pass consistent value, e.g. under mutex)
 		 * @return true if successful, false otherwise
 		 */
-		bool AddPublisherThreads(size_t num_threads, int broker_id);
+		bool AddPublisherThreads(size_t num_threads, int broker_id, size_t queue_size);
+
+		// [[Issue 7 fix]] Instance vars for SubscribeToClusterStatus error handling (was static)
+		std::chrono::steady_clock::time_point last_read_warning_;
+		size_t read_fail_count_{0};
 };

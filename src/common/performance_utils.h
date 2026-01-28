@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <chrono>
+#include <glog/logging.h>  // For CHECK_LT
 
 // Architecture-specific intrinsics
 #ifdef __x86_64__
@@ -504,5 +505,36 @@ inline uint64_t rdtsc() {
 }
 
 } // namespace CXL
+
+/**
+ * @brief Compute replication set for a given broker (replication_factor includes self)
+ *
+ * @threading Thread-safe (pure function, no shared state)
+ * @ownership No ownership semantics
+ * @paper_ref Paper §3.4 - Stage 4: Replication threads per broker
+ *
+ * Semantics: replication_factor INCLUDES self
+ * - replication_factor=1: {self} (local durability only)
+ * - replication_factor=2: {self, next_broker} (self + 1 replica)
+ * - replication_factor=N: {self, next_broker, ..., (self+N-1) % num_brokers}
+ *
+ * @param broker_id The broker whose replication set to compute
+ * @param replication_factor Number of replicas (including self)
+ * @param num_brokers Total number of brokers in cluster
+ * @param replica_index Index in [0, replication_factor) to get specific replica
+ * @return Broker ID of the replica at replica_index
+ *
+ * Example:
+ *   GetReplicationSetBroker(0, 2, 4, 0) -> 0 (self)
+ *   GetReplicationSetBroker(0, 2, 4, 1) -> 1 (next broker)
+ */
+inline int GetReplicationSetBroker(int broker_id, int replication_factor, int num_brokers, int replica_index) {
+	// Pattern: (broker_id + replica_index) % num_brokers
+	// This ensures self is always at index 0, next broker at index 1, etc.
+	if (replica_index >= replication_factor) {
+		LOG(FATAL) << "replica_index (" << replica_index << ") must be < replication_factor (" << replication_factor << ")";
+	}
+	return (broker_id + replica_index) % num_brokers;
+}
 
 } // namespace Embarcadero

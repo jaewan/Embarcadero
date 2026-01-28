@@ -766,9 +766,13 @@ This is a reasonable trade-off: strict fsync per batch has 100-1000x higher late
 
 ---
 
-**Last Updated:** 2026-01-26
+**Last Updated:** 2026-01-27
 **Total Active Deviations:** 8 (0 experimental, 8 implemented)
 **Total Reverted Deviations:** 0
+
+**Note:** ORDER=4 is not part of the supported correctness/perf matrix. See `known_limitations.md` for details.
+
+**ORDER=5 FIFO Validation:** ✅ **COMPLETE** (2026-01-27) - Per-client batch_seq ordering implemented. Matches paper spec §3.3 Stage 3, Step 2 exactly (no deviation needed). See `activeContext.md` Priority 3.1 for details.
 
 **Maintainer:** Engineering Team
 **Review Required:** Before each release

@@ -1,6 +1,7 @@
 #include "replication_manager.h"
 #include "../client/corfu_client.h"
 #include "../client/scalog_client.h"
+#include "../common/performance_utils.h"
 #include <glog/logging.h>
 
 namespace Embarcadero {
@@ -78,9 +79,12 @@ void ReplicationManager::UpdateReplicationDone(size_t last_offset, GetNumBrokers
         return;
     }
 
+    // [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
+    // Note: This is used by TopicRefactored (CORFU/SCALOG), not mainline ORDER=5
+    // Mainline ORDER=5 uses DiskManager::ReplicateThread which has its own replication_done updates
     int num_brokers = get_num_brokers();
     for (int i = 0; i < replication_factor_; i++) {
-        int b = (broker_id_ + num_brokers - i) % num_brokers;
+        int b = GetReplicationSetBroker(broker_id_, replication_factor_, num_brokers, i);
         if (tinode_->replicate_tinode && replica_tinode_) {
             replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
         }

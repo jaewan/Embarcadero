@@ -14,6 +14,14 @@ namespace Embarcadero {
 namespace wire {
 
 // ============================================================================
+// Configuration constants (bounds for validation)
+// ============================================================================
+
+static constexpr size_t MAX_MESSAGE_PAYLOAD_SIZE = 1024 * 1024;  // 1 MB max payload
+static constexpr size_t MAX_BATCH_MESSAGES = 10000;               // Max messages per batch
+static constexpr size_t MAX_BATCH_TOTAL_ORDER = 100000000;        // Sanity check on total_order
+
+// ============================================================================
 // Helper functions for boundary and size calculations
 // ============================================================================
 
@@ -39,6 +47,53 @@ inline constexpr size_t ComputeMessageStride(size_t header_size, size_t payload_
 }
 
 // ============================================================================
+// Header version helpers (ORDER=5 uses BatchMetadata.header_version)
+// ============================================================================
+
+static constexpr uint16_t HEADER_VERSION_V1 = 1;
+static constexpr uint16_t HEADER_VERSION_V2 = 2;
+static constexpr size_t V1_HEADER_SIZE = 64;  // MessageHeader size (aligned)
+static constexpr size_t V2_HEADER_SIZE = 64;  // BlogMessageHeader size (aligned)
+
+inline constexpr bool IsValidHeaderVersion(uint16_t version) {
+    return version == HEADER_VERSION_V1 || version == HEADER_VERSION_V2;
+}
+
+inline constexpr size_t MaxV1PaddedSize() {
+    return Align64(V1_HEADER_SIZE + MAX_MESSAGE_PAYLOAD_SIZE);
+}
+
+inline constexpr size_t ComputeStrideV2(size_t payload_size) {
+    return Align64(V2_HEADER_SIZE + payload_size);
+}
+
+inline constexpr bool ValidateV1PaddedSize(size_t padded_size, size_t remaining_bytes) {
+    return padded_size >= V1_HEADER_SIZE &&
+           padded_size <= MaxV1PaddedSize() &&
+           (padded_size % 64 == 0) &&
+           padded_size <= remaining_bytes;
+}
+
+inline constexpr bool ValidateV2Payload(size_t payload_size, size_t remaining_bytes) {
+    const size_t stride = ComputeStrideV2(payload_size);
+    return payload_size > 0 &&
+           payload_size <= MAX_MESSAGE_PAYLOAD_SIZE &&
+           stride <= remaining_bytes;
+}
+
+inline constexpr size_t ComputeStrideByVersion(uint16_t version,
+                                              size_t payload_size,
+                                              size_t padded_size) {
+    if (version == HEADER_VERSION_V2) {
+        return ComputeStrideV2(payload_size);
+    }
+    if (version == HEADER_VERSION_V1) {
+        return padded_size;
+    }
+    return 0;
+}
+
+// ============================================================================
 // BatchMetadata: shared wire format (ORDER=5)
 // ============================================================================
 
@@ -52,14 +107,6 @@ struct BatchMetadata {
 // Verify size and alignment are consistent across platforms
 static_assert(sizeof(BatchMetadata) == 16, "BatchMetadata must be exactly 16 bytes");
 static_assert(sizeof(size_t) == 8, "Assumes 64-bit size_t");
-
-// ============================================================================
-// Configuration constants (bounds for validation)
-// ============================================================================
-
-static constexpr size_t MAX_MESSAGE_PAYLOAD_SIZE = 1024 * 1024;  // 1 MB max payload
-static constexpr size_t MAX_BATCH_MESSAGES = 10000;               // Max messages per batch
-static constexpr size_t MAX_BATCH_TOTAL_ORDER = 100000000;        // Sanity check on total_order
 
 }  // namespace wire
 }  // namespace Embarcadero

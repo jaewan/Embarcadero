@@ -1,6 +1,7 @@
 #include "message_export.h"
 #include <glog/logging.h>
 #include <thread>
+#include "../common/performance_utils.h"
 
 namespace Embarcadero {
 
@@ -33,10 +34,14 @@ bool MessageExport::GetMessageAddr(size_t& last_offset,
             tinode_->offsets[broker_id_].ordered_offset;
         
         if (ack_level_ == 2) {
+            // [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
+            // replication_factor INCLUDES self (replication_factor=1 means local durability only)
+            // TODO: Get actual num_brokers instead of NUM_MAX_BROKERS (requires callback)
+            int num_brokers = NUM_MAX_BROKERS;  // Temporary: use MAX until we have get_num_brokers callback
             size_t r[replication_factor_];
             size_t min = static_cast<size_t>(-1);
             for (int i = 0; i < replication_factor_; i++) {
-                int b = (broker_id_ + NUM_MAX_BROKERS - i) % NUM_MAX_BROKERS;
+                int b = GetReplicationSetBroker(broker_id_, replication_factor_, num_brokers, i);
                 r[i] = tinode_->offsets[b].replication_done[broker_id_];
                 if (min > r[i]) {
                     min = r[i];

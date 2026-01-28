@@ -265,7 +265,7 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 	size_t stride;
 	if (use_blog_header) {
 		// V2: compute stride from payload bytes only
-		stride = Embarcadero::wire::ComputeMessageStride(v2_header_size, len);
+		stride = Embarcadero::wire::ComputeStrideV2(len);
 	} else {
 		// V1: use paddedSize (already aligned)
 		stride = paddedSize;
@@ -382,8 +382,13 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 	
 	// Check if current batch has reached BATCH_SIZE and seal it
 	// OPTIMIZATION: Use the already calculated new_tail instead of loading again
-	const size_t EFFECTIVE_BATCH_SIZE = 1048576;  // 1MB - maximum cache efficiency
+	const size_t EFFECTIVE_BATCH_SIZE = BATCH_SIZE;  // Config-driven batch size
 	if ((new_tail - head) >= EFFECTIVE_BATCH_SIZE) {
+		static thread_local size_t seal_logs = 0;
+		if (++seal_logs <= 5 || seal_logs % 1000 == 0) {
+			VLOG(3) << "Buffer::Write sealing batch at size=" << (new_tail - head)
+			        << " (EFFECTIVE_BATCH_SIZE=" << EFFECTIVE_BATCH_SIZE << ")";
+		}
 		Seal();
 	}
 
@@ -404,11 +409,14 @@ void Buffer::Seal(){
 		batch_header->total_size = bufs_[lockedIdx].prod.tail.load(std::memory_order_relaxed) - head - sizeof(Embarcadero::BatchHeader);
 		batch_header->num_msg = bufs_[lockedIdx].prod.num_msg.load(std::memory_order_relaxed);
 		
-		// Note: batch_complete will be set by NetworkManager when batch is received  
+		// Note: batch_complete will be set by NetworkManager when batch is received
 		// For locally created batches, sequencer will use fallback logic (checking paddedSize)
 		batch_header->batch_complete = 0;  // Initialize batch completion flag
 
-		// Final batch sealed
+		// [[FIX: Memory Barrier]] Release fence ensures all batch header writes are visible
+		// to reader threads before we update buffer state. Without this, readers may see
+		// stale batch_header fields on non-x86 architectures or with aggressive compiler opts.
+		std::atomic_thread_fence(std::memory_order_release);
 
 		// Update buffer state for next batch
 		bufs_[lockedIdx].prod.num_msg.store(0, std::memory_order_relaxed);
@@ -459,11 +467,16 @@ void Buffer::SealAll() {
 }
 
 void* Buffer::Read(int bufIdx) {
+	// [[FIX: Memory Ordering]] Use acquire to synchronize with writer's release fence
 	Embarcadero::BatchHeader* batch_header =
-		reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].cons.reader_head.load(std::memory_order_relaxed));
+		reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].cons.reader_head.load(std::memory_order_acquire));
 
 	// Check if batch header contains valid data
 	if (batch_header->total_size != 0 && batch_header->num_msg != 0) {
+		// [[FIX: Memory Barrier]] Acquire fence ensures we see all batch data written
+		// before total_size/num_msg were set. Pairs with writer's release fence in Seal().
+		std::atomic_thread_fence(std::memory_order_acquire);
+
 		// Valid batch found, update reader head and return batch
 		size_t next_head = batch_header->start_logical_offset;
 
@@ -488,16 +501,38 @@ void* Buffer::Read(int bufIdx) {
 
 	// Busy wait only when some messages are in the buffer.
 	// Wait for the batch to be sealed. (Either full batch written or sealed by Client)
-	// TODO(Jae) Replace checkcing total_size and num_msg if replace num_brokers in the batch header to seal
+	// [[LAST_PERCENT_ACK_FIX]] Use 2s timeout so we don't return nullptr before SealAll() runs.
+	// [[FIX: Exponential Backoff]] Reduces CPU waste from 3 of 4 threads spinning on empty buffers
+	// Phase 1: Fast spin (100 iters) - low latency when data arrives quickly
+	// Phase 2: Yield (1000 iters) - cooperative for concurrent threads
+	// Phase 3: Sleep - reduces CPU to ~25% vs constant yield()
 	auto start_time = std::chrono::steady_clock::now();
-	const auto timeout = std::chrono::milliseconds(100);
+	const auto timeout = std::chrono::seconds(2);
+	constexpr size_t SPIN_ITERS = 100;
+	constexpr size_t YIELD_ITERS = 1000;
+	constexpr size_t TIME_CHECK_INTERVAL = 1000;
+	size_t wait_iters = 0;
+
 	while (batch_header->total_size == 0 || batch_header->num_msg == 0) {
-		auto current_time = std::chrono::steady_clock::now();
-		if (current_time - start_time > timeout) {
-			// Read wait timeout for buffer
-			return nullptr; // Return null after timeout
+		++wait_iters;
+
+		if (wait_iters <= SPIN_ITERS) {
+			// Phase 1: Fast spin for low-latency response
+			Embarcadero::CXL::cpu_pause();
+		} else if (wait_iters <= YIELD_ITERS) {
+			// Phase 2: Yield to other threads
+			std::this_thread::yield();
+		} else {
+			// Phase 3: Brief sleep to reduce CPU waste
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+			// Only check time in sleep phase (expensive operation)
+			if ((wait_iters - YIELD_ITERS) % TIME_CHECK_INTERVAL == 0) {
+				if (std::chrono::steady_clock::now() - start_time > timeout) {
+					return nullptr;  // Read wait timeout for buffer
+				}
+			}
 		}
-		std::this_thread::yield();
 	}
 
 	bufs_[bufIdx].cons.reader_head.store(batch_header->start_logical_offset, std::memory_order_relaxed);

@@ -3,6 +3,7 @@
 #include "../cxl_manager/scalog_local_sequencer.h"
 #endif
 #include "topic.h"
+#include "../common/performance_utils.h"
 #include <glog/logging.h>
 #include <chrono>
 #include <thread>
@@ -411,6 +412,12 @@ void MessageOrdering::AssignOrder(BatchHeader* batch_to_order, size_t start_tota
         // Update ordered once per message
         // ordered is read without explicit synchronization by the benchmark thread.
         // Use relaxed atomic-like semantics by writing through a volatile int field; ensure monotonic increment.
+        // [[CRITICAL_FIX: Invalidate cache BEFORE reading in RMW on non-coherent CXL]]
+        // On non-coherent CXL, sequencer reads stale cached value, causing lost updates
+        volatile uint64_t* ordered_ptr = &tinode_->offsets[broker].ordered;
+        Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+            reinterpret_cast<const volatile void*>(ordered_ptr)));
+        Embarcadero::CXL::load_fence();
         tinode_->offsets[broker].ordered = tinode_->offsets[broker].ordered + 1;
     }
     header_for_sub->batch_off_to_export = (reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(header_for_sub));
@@ -807,6 +814,12 @@ void MessageOrdering::AssignOrder5(BatchHeader* batch_to_order, size_t start_tot
 
     // Update ordered count by the number of messages in the batch
     // This maintains compatibility with existing read path
+    // [[CRITICAL_FIX: Invalidate cache BEFORE reading in RMW on non-coherent CXL]]
+    // On non-coherent CXL, sequencer reads stale cached value, causing lost updates
+    volatile uint64_t* ordered_ptr = &tinode_->offsets[broker].ordered;
+    Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+        reinterpret_cast<const volatile void*>(ordered_ptr)));
+    Embarcadero::CXL::load_fence();
     tinode_->offsets[broker].ordered = tinode_->offsets[broker].ordered + num_messages;
 
     // Set up export chain (GOI equivalent)

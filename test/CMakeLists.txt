@@ -35,22 +35,47 @@ set_tests_properties(e2e_explicit_replication_order5_ack2 PROPERTIES
     LABELS "e2e;replication;order5;ack2"
 )
 
-# TODO: Unit tests (currently disabled, see archive/)
-# Uncomment when ready to re-enable unit tests
-#
-# find_package(GTest REQUIRED)
-#
-# add_executable(buffer_manager_test
-#     embarlet/buffer_manager_test.cc
-# )
-# target_link_libraries(buffer_manager_test
-#     PRIVATE
-#     GTest::GTest
-#     GTest::Main
-#     gmock
-#     embarlet_lib
-# )
-# add_test(NAME unit_buffer_manager COMMAND buffer_manager_test)
+# Unit tests
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(GTEST gtest)
+    if(GTEST_FOUND)
+        message(STATUS "GTest found via pkg-config, enabling unit tests")
+        
+        # BlogMessageHeader validation test
+        add_executable(blog_header_validation_test
+            embarlet/blog_header_validation_test.cc
+        )
+        target_include_directories(blog_header_validation_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(blog_header_validation_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        # Link against required libraries
+        # Link GTest main library explicitly
+        find_library(GTEST_MAIN_LIB gtest_main PATHS /usr/lib /usr/lib/x86_64-linux-gnu)
+        target_link_libraries(blog_header_validation_test PRIVATE 
+            ${GTEST_LIBRARIES} 
+            ${GTEST_MAIN_LIB}
+            absl::flat_hash_map
+            heartbeat_grpc_proto
+            protobuf::libprotobuf
+            pthread
+        )
+        
+        add_test(NAME unit_blog_header_validation COMMAND blog_header_validation_test)
+        set_tests_properties(unit_blog_header_validation PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;blog_header;validation"
+        )
+    else()
+        message(WARNING "GTest not found via pkg-config, unit tests disabled")
+    endif()
+else()
+    message(WARNING "pkg-config not found, unit tests disabled")
+endif()
 
 # Test output directory
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/test_output)

@@ -1,30 +1,30 @@
 Bandwidth Comparison Summary
 ============================
-Date: Mon Jan 26 11:47:26 AM KST 2026
+Date: Thu Jan 29 01:56:08 AM KST 2026
 Configuration:
   Order: 5, ACK: 1
   Message Size: 1024 bytes
   Total Message Size: 1073741824 bytes
-  Test Number: 1
+  Test Number: 5
   Iterations: 1
 
 Baseline (BlogHeader=0):
-  Mean: 7.82 MB/s
+  Mean: 453.96 MB/s
   StdDev: 0.00 MB/s
   CV: 0.00%
-  P95: 7.82 MB/s
+  P95: 453.96 MB/s
   Count: 1
-  Values: 07.824465
+  Values: 453.9562
 
 BlogHeader v2 (BlogHeader=1):
-  Mean: 18.23 MB/s
+  Mean: 455.78 MB/s
   StdDev: 0.00 MB/s
   CV: 0.00%
-  P95: 18.23 MB/s
+  P95: 455.78 MB/s
   Count: 1
-  Values: 18.227057
+  Values: 455.7793
 
 Comparison:
-  Ratio: 233.1%
-  Difference: 10.41 MB/s
+  Ratio: 100.4%
+  Difference: 1.82 MB/s
   Status: PASS

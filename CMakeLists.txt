@@ -17,6 +17,16 @@ set(CMAKE_CXX_FLAGS "-Wall -O3")
 set(CMAKE_INSTALL_MESSAGE LAZY)
 set(CMAKE_PARALLEL_LEVEL 16)
 
+# Enable x86-64 CLFLUSHOPT for CXL flush (performance_utils.h) — required by src and bench
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+	include(CheckCXXCompilerFlag)
+	check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
+	if(COMPILER_SUPPORTS_MARCH_NATIVE)
+		message(STATUS "Enabling -march=native for CXL intrinsics")
+		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+	endif()
+endif()
+
 include(FetchContent)
 set(ABSL_ENABLE_INSTALL OFF) # Do NOT install Abseil
 set(ABSL_PROPAGATE_CXX_STD ON) # Suppress Abseil warning about C++ standard propagation
@@ -44,10 +54,13 @@ find_package(folly REQUIRED)
 # Find yaml-cpp for configuration management
 find_package(yaml-cpp REQUIRED)
 
+# Enable CTest (required for add_test() in test/ and E2E scripts)
+enable_testing()
+
 # Add subdirectories
 add_subdirectory(src)
 add_subdirectory(bench)
-# add_subdirectory(test)  # Temporarily disabled to focus on main build
+add_subdirectory(test)
 
 # Benchmarks
 option(BUILD_BENCHMARKS "Build performance benchmarks" ON)

@@ -5,6 +5,8 @@
 #include <iomanip>
 #include <cmath>
 #include <numeric>
+#include <set>
+#include <tuple>
 
 // Sequencer 5: Logical reconstruction of message ordering from batch metadata
 // Messages arrive with total_order=0, batch metadata provides base total_order
@@ -100,27 +102,35 @@ void Subscriber::RemoveConnection(int fd) {
 	}
 }
 
+// Helper struct to store header data for validation (supports both V1 and V2)
+struct HeaderValidationData {
+	size_t total_order;
+	int client_id;
+	size_t client_order;  // For V1: client_order, for V2: derived from batch_seq
+	bool is_v2;
+	size_t size;          // For V2: payload size, for V1: paddedSize
+	uint64_t batch_seq;   // For V2: batch_seq, for V1: 0
+};
+
 bool Subscriber::DEBUG_check_order(int order) {
-	// 1. Aggregate all message headers from all connection buffers
-	std::vector<Embarcadero::MessageHeader> all_headers;
+	// 1. Aggregate all message headers from all connection buffers (V1 and V2)
+	std::vector<HeaderValidationData> all_headers;
 	size_t total_bytes_parsed = 0;
+	size_t v1_count = 0, v2_count = 0;
+	
 	// Aggregating message headers from all connections...
 	{ // Scope for locking the connection map
 		absl::ReaderMutexLock map_lock(&connection_map_mutex_);
-		//all_headers.reserve(DEBUG_count_ / sizeof(Embarcadero::MessageHeader)); // Rough estimate
 
 		for (auto const& [fd, conn_ptr] : connections_) {
 			if (!conn_ptr) continue;
 
 			// Lock connection state to access buffers safely
 			// NOTE: This assumes no receiver thread is actively writing during the check.
-			// For a true debug check after run, this might be okay.
-			// If run concurrently, more complex synchronization or copying might be needed.
 			absl::MutexLock state_lock(&conn_ptr->state_mutex);
 
 			for (int buf_idx = 0; buf_idx < 2; ++buf_idx) {
 				const auto& buffer_state = conn_ptr->buffers[buf_idx];
-				// Use the current write_offset as the limit of valid data
 				size_t buffer_data_size = buffer_state.write_offset.load(std::memory_order_relaxed);
 				uint8_t* buffer_start_ptr = static_cast<uint8_t*>(buffer_state.buffer);
 
@@ -128,29 +138,110 @@ bool Subscriber::DEBUG_check_order(int order) {
 
 				VLOG(5) << "DEBUG: Parsing FD=" << fd << ", Buffer=" << buf_idx << ", Size=" << buffer_data_size;
 				size_t parse_offset = 0;
+				
+				// Track batch metadata state for V2 header detection
+				bool has_batch_metadata = false;
+				uint16_t current_header_version = 1; // Default to V1
+				size_t messages_in_batch = 0;
+				size_t messages_processed = 0;
+				size_t current_batch_total_order = 0;
+				
 				while (parse_offset < buffer_data_size) {
 					uint8_t* current_parse_ptr = buffer_start_ptr + parse_offset;
 					size_t remaining_in_buffer = buffer_data_size - parse_offset;
 
+					// Check for BatchMetadata (16 bytes) before message headers
+					if (!has_batch_metadata && 
+					    remaining_in_buffer >= sizeof(Embarcadero::wire::BatchMetadata)) {
+						Embarcadero::wire::BatchMetadata* metadata = 
+							reinterpret_cast<Embarcadero::wire::BatchMetadata*>(current_parse_ptr);
+						
+					if (Embarcadero::wire::IsValidHeaderVersion(metadata->header_version) &&
+					    metadata->num_messages > 0 && 
+					    metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES) {
+							current_header_version = metadata->header_version;
+							messages_in_batch = metadata->num_messages;
+							messages_processed = 0;
+							current_batch_total_order = metadata->batch_total_order;
+							has_batch_metadata = true;
+							parse_offset += sizeof(Embarcadero::wire::BatchMetadata);
+							VLOG(5) << "DEBUG: Found batch metadata, header_version=" << current_header_version
+							        << ", num_messages=" << messages_in_batch;
+							continue;
+						}
+					}
+
+					// Need at least 64 bytes for either header type
 					if (remaining_in_buffer < sizeof(Embarcadero::MessageHeader)) {
 						VLOG(5) << "DEBUG: Incomplete header at offset " << parse_offset << ", stopping parse for this buffer.";
 						break;
 					}
-					Embarcadero::MessageHeader* header = reinterpret_cast<Embarcadero::MessageHeader*>(current_parse_ptr);
 
-					// Basic validity check on header data (e.g., paddedSize)
-					size_t total_message_size = header->paddedSize;
-					if (total_message_size == 0) {
-						break; // Avoid infinite loop with zero-sized messages
+					HeaderValidationData header_data;
+					size_t total_message_size = 0;
+					bool valid_header = false;
+
+					if (current_header_version == 2) {
+						// [[BLOG_HEADER: Parse V2 BlogMessageHeader]]
+						Embarcadero::BlogMessageHeader* v2_hdr = 
+							reinterpret_cast<Embarcadero::BlogMessageHeader*>(current_parse_ptr);
+						
+						// Validate payload size
+						if (Embarcadero::wire::ValidateV2Payload(v2_hdr->size, remaining_in_buffer)) {
+							total_message_size = Embarcadero::wire::ComputeStrideV2(v2_hdr->size);
+							
+							if (remaining_in_buffer >= total_message_size) {
+								header_data.is_v2 = true;
+								if (has_batch_metadata) {
+									header_data.total_order = current_batch_total_order + messages_processed;
+								} else {
+									header_data.total_order = v2_hdr->total_order;
+								}
+								header_data.client_id = static_cast<int>(v2_hdr->client_id);
+								header_data.client_order = v2_hdr->batch_seq; // Use batch_seq as client_order equivalent
+								header_data.size = v2_hdr->size;
+								header_data.batch_seq = v2_hdr->batch_seq;
+								valid_header = true;
+								v2_count++;
+								
+								if (has_batch_metadata) {
+									messages_processed++;
+									if (messages_processed >= messages_in_batch) {
+										has_batch_metadata = false; // Reset for next batch
+									}
+								}
+							}
+						}
+					} else {
+						// [[LEGACY: Parse V1 MessageHeader]]
+						Embarcadero::MessageHeader* v1_hdr = 
+							reinterpret_cast<Embarcadero::MessageHeader*>(current_parse_ptr);
+						
+					// Validate paddedSize
+					if (Embarcadero::wire::ValidateV1PaddedSize(v1_hdr->paddedSize, remaining_in_buffer)) {
+							total_message_size = v1_hdr->paddedSize;
+							
+							if (remaining_in_buffer >= total_message_size) {
+								header_data.is_v2 = false;
+								header_data.total_order = v1_hdr->total_order;
+								header_data.client_id = v1_hdr->client_id;
+								header_data.client_order = v1_hdr->client_order;
+								header_data.size = total_message_size;
+								header_data.batch_seq = 0;
+								valid_header = true;
+								v1_count++;
+							}
+						}
 					}
-					if (remaining_in_buffer < total_message_size) {
-						VLOG(5) << "DEBUG: Incomplete message (need " << total_message_size << ", have " << remaining_in_buffer << ") at offset " << parse_offset << ", stopping parse for this buffer.";
+
+					if (!valid_header || total_message_size == 0) {
+						VLOG(5) << "DEBUG: Invalid or incomplete message at offset " << parse_offset 
+						        << ", stopping parse for this buffer.";
 						break;
 					}
 
-					// --- Full message identified ---
-					// Store a *copy* of the header
-					all_headers.push_back(*header);
+					// Store header data
+					all_headers.push_back(header_data);
 					total_bytes_parsed += total_message_size;
 
 					// Advance parse_offset
@@ -159,100 +250,110 @@ bool Subscriber::DEBUG_check_order(int order) {
 			} // End for buf_idx
 		} // End for connections
 	} // Release connection map lock
-
-	// DEBUG: Aggregated message headers and bytes parsed
+	
+	LOG(INFO) << "DEBUG_check_order: Parsed " << all_headers.size() << " messages "
+	          << "(V1=" << v1_count << ", V2=" << v2_count << "), "
+	          << total_bytes_parsed << " total bytes";
 
 	if (all_headers.empty()) {
-		// No message headers found to check
-		return true; // Or false if messages were expected
+		LOG(WARNING) << "DEBUG_check_order: No message headers found to validate";
+		return true; // No messages to check
 	}
 
-	bool overall_status = true; // Assume correct until proven otherwise
+	// Deduplicate headers to avoid reprocessing duplicates across buffers
+	VLOG(3) << "DEBUG: Deduplicating headers before validation...";
+	std::set<std::tuple<int, size_t, uint64_t>> seen_messages;
+	auto dedup_it = std::remove_if(all_headers.begin(), all_headers.end(),
+		[&seen_messages](const auto& hdr) {
+			auto key = std::make_tuple(hdr.client_id, hdr.total_order, hdr.batch_seq);
+			if (seen_messages.find(key) != seen_messages.end()) {
+				VLOG(5) << "DEBUG: Removing duplicate message: client_id=" << hdr.client_id
+				        << ", total_order=" << hdr.total_order << ", batch_seq=" << hdr.batch_seq;
+				return true;
+			}
+			seen_messages.insert(key);
+			return false;
+		});
+	all_headers.erase(dedup_it, all_headers.end());
+	VLOG(3) << "DEBUG: After deduplication: " << all_headers.size() << " unique messages";
 
-	// 2. Order Level 0 Check: Logical Offset assignment
-	VLOG(3) << "DEBUG: --- Checking Order Level 0 (Logical Offset) ---";
-	for (const auto& header : all_headers) {
-		// Assuming -1 means unassigned (as per original code)
-		// DISABLED for batch-level ordering (Sequencer 5) - logical_offset may not be set due to race conditions
-		// if (header.logical_offset == static_cast<size_t>(-1)) {
-		//	LOG(ERROR) << "DEBUG Check Failed (Level 0): Message client_order=" << header.client_order
-		//		<< ", total_order=" << header.total_order << " has unassigned logical_offset (-1).";
-		//	overall_status = false;
-		//	// Don't break, report all such errors
-		// }
+	bool overall_status = true;
+
+	// 2. Order Level 0 Check: Basic header validity
+	VLOG(3) << "DEBUG: --- Checking Order Level 0 (Header Validity) ---";
+	for (const auto& hdr : all_headers) {
+		if (hdr.is_v2) {
+			// V2 validation: size should be within bounds
+			if (hdr.size == 0 || hdr.size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+				LOG(ERROR) << "DEBUG Check Failed (Level 0): Invalid V2 payload size=" << hdr.size;
+				overall_status = false;
+			}
+		} else {
+			// V1 validation: size should be reasonable
+			if (hdr.size == 0 || hdr.size > Embarcadero::wire::MaxV1PaddedSize()) {
+				LOG(ERROR) << "DEBUG Check Failed (Level 0): Invalid V1 paddedSize=" << hdr.size;
+				overall_status = false;
+			}
+		}
 	}
 	if (order == 0) {
 		LOG(INFO) << "DEBUG: Order Level 0 check " << (overall_status ? "PASSED" : "FAILED");
 		return overall_status;
 	}
-	VLOG(3) << "DEBUG: Order Level 0 check " << (overall_status ? "passed" : "failed (continuing checks)");
-
 
 	// 3. Sort by Total Order for subsequent checks
 	VLOG(3) << "DEBUG: Sorting headers by total_order...";
 	std::sort(all_headers.begin(), all_headers.end(), [](const auto& a, const auto& b) {
-			// Handle potentially unassigned total_order if necessary (e.g., treat 0 specially?)
-			// Assuming assigned total_order starts from 0 or 1 if assigned.
-			return a.total_order < b.total_order;
-			});
+		return a.total_order < b.total_order;
+	});
 	VLOG(3) << "DEBUG: Sorting complete.";
 
-
-	// 4. Order Level 1 Check: Total Order assigned, uniqueness, contiguity
+	// 5. Order Level 1 Check: Total Order assignment, uniqueness, contiguity
 	VLOG(3) << "DEBUG: --- Checking Order Level 1 (Total Order Assignment, Uniqueness, Contiguity) ---";
 	std::set<size_t> total_orders_seen;
 	bool contiguity_ok = true;
 	bool uniqueness_ok = true;
-	bool assignment_ok = true; // Check if total_order is assigned (if logical is)
 
-	if (all_headers.empty()) { // Should not happen if we passed aggregation check, but safety
-		return overall_status; // Return status from Level 0
+	if (all_headers.empty()) {
+		return overall_status;
 	}
 
-	// Check first element (assuming sequence starts at 0)
-	// Note: Check if your system *can* assign total_order 0 legitimately.
+	// Check first element
 	if (all_headers[0].total_order != 0) {
-		// Allow total_order 0 only if logical_offset is also 0? Or maybe always allow 0?
-		// Let's assume 0 is the expected start if messages exist.
-		// If the first assigned offset is non-zero, this check needs adjustment.
-		// Let's just check for holes relative to the previous seen order.
-		VLOG(3) << "DEBUG Check (Level 1): First total_order is " << all_headers[0].total_order << " (expected 0 if sequence starts at 0).";
-		// contiguity_ok = false; // Don't fail just for this, check holes below.
+		VLOG(3) << "DEBUG Check (Level 1): First total_order is " << all_headers[0].total_order 
+		        << " (expected 0 if sequence starts at 0).";
 	}
 
 	for (size_t i = 0; i < all_headers.size(); ++i) {
-		const auto& header = all_headers[i]; // header is const MessageHeader&
+		const auto& hdr = all_headers[i];
+		size_t current_total_order = hdr.total_order;
 
-		// Create a non-volatile copy of the potentially volatile member
-		size_t current_total_order = header.total_order;
+		// Check Uniqueness
+		if (!total_orders_seen.insert(current_total_order).second) {
+			LOG(ERROR) << "DEBUG Check Failed (Level 1): Duplicate total_order=" << current_total_order
+			           << " found (client_id=" << hdr.client_id 
+			           << ", client_order=" << hdr.client_order
+			           << ", is_v2=" << hdr.is_v2 << ")";
+			uniqueness_ok = false;
+			overall_status = false;
+		}
 
-		// Check Assignment (if needed - using non-volatile copy)
-		// if (header.logical_offset != static_cast<size_t>(-1) && current_total_order == ???) { ... }
-
-		// Check Uniqueness (using non-volatile copy) - DISABLED for batch-level ordering
-		// if (!total_orders_seen.insert(current_total_order).second) { // <--- Use the copy here
-		//	LOG(ERROR) << "DEBUG Check Failed (Level 1): Duplicate total_order=" << current_total_order // Log the copy
-		//		<< " found (client_order=" << header.client_order << ", client_id=" << header.client_id << ").";
-		//	uniqueness_ok = false;
-		//	overall_status = false;
-		// }
-
-		// Check Contiguity (using non-volatile copies) - DISABLED for batch-level ordering
-		// if (i > 0) {
-		//	// Create a non-volatile copy of the previous total_order
-		//	size_t prev_total_order = all_headers[i-1].total_order;
-		//	if (current_total_order > prev_total_order + 1) { // <--- Compare copies
-		//		LOG(ERROR) << "DEBUG Check Failed (Level 1): Hole detected in total_order sequence. "
-		//			<< "Current=" << current_total_order << ", Previous=" << prev_total_order << " client order:" << header.client_order;
-		//		contiguity_ok = false;
-		//		overall_status = false;
-		//	}
-		// }
+		// Check Contiguity (for non-batch ordering)
+		if (i > 0 && order < 5) { // Skip contiguity check for ORDER=5 (batch-level)
+			size_t prev_total_order = all_headers[i-1].total_order;
+			if (current_total_order > prev_total_order + 1) {
+				LOG(ERROR) << "DEBUG Check Failed (Level 1): Hole detected in total_order sequence. "
+				           << "Current=" << current_total_order << ", Previous=" << prev_total_order
+				           << " (client_id=" << hdr.client_id << ", client_order=" << hdr.client_order << ")";
+				contiguity_ok = false;
+				overall_status = false;
+			}
+		}
 	}
 	
-	if (!assignment_ok || !uniqueness_ok || !contiguity_ok) {
-		VLOG(3) << "DEBUG: Order Level 1 check FAILED (Assignment=" << assignment_ok
-			<< ", Uniqueness=" << uniqueness_ok << ", Contiguity=" << contiguity_ok << ")";
+	if (!uniqueness_ok || !contiguity_ok) {
+		VLOG(3) << "DEBUG: Order Level 1 check FAILED (Uniqueness=" << uniqueness_ok
+		        << ", Contiguity=" << contiguity_ok << ")";
 	} else {
 		VLOG(3) << "DEBUG: Order Level 1 check passed.";
 	}
@@ -262,51 +363,51 @@ bool Subscriber::DEBUG_check_order(int order) {
 		return overall_status;
 	}
 
+	// 6. Order Level >= 2 Check: Client Order Preservation
+	// [[ORDER=5: Batch-level ordering]] For ORDER=5, skip client_order checks because:
+	// - ORDER=5 uses batch-level ordering (all messages in a batch share batch_seq)
+	// - Messages within a batch don't have individual client_order
+	// - We only validate total_order uniqueness and contiguity (already checked in Level 1)
+	// For ORDER < 5: Check per-message client_order preservation
+	if (order < 5) {
+		VLOG(3) << "DEBUG: --- Checking Order Level >= 2 (Client Order Preservation) ---";
+		std::map<int, size_t> last_client_order_for_client;
+		bool client_order_preserved = true;
 
-	// 5. Order Level >= 2 Check: Client Order Preservation
-	// Rule: For a given client_id, if m1.client_order < m2.client_order, then m1.total_order < m2.total_order.
-	// Check: Iterate through total_order sorted list. Ensure for each client, client_order is non-decreasing.
-	VLOG(3) << "DEBUG: --- Checking Order Level >= 2 (Client Order Preservation) ---";
-	std::map<int, size_t> last_client_order_for_client; // Map: client_id -> last seen client_order
-	bool client_order_preserved = true;
+		for (const auto& hdr : all_headers) {
+			int client_id = hdr.client_id;
+			size_t client_order = hdr.client_order;
 
-	for (const auto& header : all_headers) { // Iterating sorted by total_order
-		int client_id = header.client_id;
-		size_t client_order = header.client_order;
-
-		auto it = last_client_order_for_client.find(client_id);
-	// Client order violation check - DISABLED for batch-level ordering
-	// if (it != last_client_order_for_client.end()) {
-	//	// Client seen before, check order
-	//	if (client_order < it->second) {
-	//		// Violation! Current message has smaller client_order than a previous message from the same client
-	//		// (previous message must have had smaller total_order since list is sorted by total_order)
-	//		LOG(ERROR) << "DEBUG Check Failed (Level >=2): Client order violation for client_id=" << client_id
-	//			<< ". Current msg (total_order=" << header.total_order << ", client_order=" << client_order
-	//			<< ") has smaller client_order than previous msg (client_order=" << it->second << ").";
-	//		client_order_preserved = false;
-	//		overall_status = false;
-	//		// Keep checking for more errors? Or break? Let's continue.
-	//	}
-	//	// Update map with the latest client_order seen for this client *at this point in the total order*
-	//	// If multiple messages have the same total_order (shouldn't happen if level 1 passed), this check is ambiguous.
-	//	// Assuming level 1 passed (unique total orders):
-	//	it->second = client_order; // Update last seen order for this client
-	// } else {
-	if (it == last_client_order_for_client.end()) {
-			// First time seeing this client
-			last_client_order_for_client[client_id] = client_order;
+			auto it = last_client_order_for_client.find(client_id);
+			if (it != last_client_order_for_client.end()) {
+				// Client seen before, check order
+				if (client_order < it->second) {
+					LOG(ERROR) << "DEBUG Check Failed (Level >=2): Client order violation for client_id=" << client_id
+					           << ". Current msg (total_order=" << hdr.total_order 
+					           << ", client_order=" << client_order
+					           << ", is_v2=" << hdr.is_v2
+					           << ") has smaller client_order than previous msg (client_order=" << it->second << ").";
+					client_order_preserved = false;
+					overall_status = false;
+				}
+				it->second = client_order;
+			} else {
+				// First time seeing this client
+				last_client_order_for_client[client_id] = client_order;
+			}
 		}
-	}
-	if (!client_order_preserved) {
-		VLOG(3) << "DEBUG: Order Level >= 2 check FAILED.";
+		if (!client_order_preserved) {
+			VLOG(3) << "DEBUG: Order Level >= 2 check FAILED.";
+		} else {
+			VLOG(3) << "DEBUG: Order Level >= 2 check passed.";
+		}
 	} else {
-		VLOG(3) << "DEBUG: Order Level >= 2 check passed.";
+		// ORDER=5: Batch-level ordering - skip per-message client_order checks
+		VLOG(3) << "DEBUG: --- Skipping Order Level >= 2 (Client Order Preservation) for ORDER=5 (batch-level ordering) ---";
+		VLOG(3) << "DEBUG: ORDER=5 uses batch-level ordering; total_order uniqueness already validated in Level 1.";
 	}
 
-
-	// Final Result
-	LOG(INFO) << "DEBUG: Order check for level " << order << " overall result: " << (overall_status ? "PASSED" : "FAILED");
+	LOG(INFO) << "DEBUG: Order Level " << order << " check " << (overall_status ? "PASSED" : "FAILED");
 	return overall_status;
 }
 
@@ -977,16 +1078,25 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::sha
 			Embarcadero::wire::BatchMetadata* potential_metadata = reinterpret_cast<Embarcadero::wire::BatchMetadata*>(data + current_pos);
 			
 			// Validate batch metadata
-			if (potential_metadata->header_version >= 1 && potential_metadata->header_version <= 2 &&
+			if (Embarcadero::wire::IsValidHeaderVersion(potential_metadata->header_version) &&
 			    potential_metadata->num_messages > 0 && 
 			    potential_metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
 			    potential_metadata->batch_total_order < Embarcadero::wire::MAX_BATCH_TOTAL_ORDER) {
 				
-				// Found valid batch metadata
+			// Found valid batch metadata
+			// [[FIX: Prevent duplicate batch processing]] Only start a new batch if we're not already processing one
+			// This prevents re-processing the same batch if ProcessSequencer5Data is called multiple times
+			if (!batch_state.has_pending_metadata) {
 				batch_state.pending_metadata = *potential_metadata;
 				batch_state.has_pending_metadata = true;
 				batch_state.current_batch_messages_processed = 0;
 				batch_state.next_message_order_in_batch = potential_metadata->batch_total_order;
+			} else {
+				// Already processing a batch - skip this metadata (might be duplicate or out-of-order)
+				VLOG(3) << "ProcessSequencer5Data: Skipping batch metadata (already processing batch), fd=" << fd;
+				current_pos += sizeof(Embarcadero::wire::BatchMetadata);
+				continue;
+			}
 				
 				VLOG(3) << "ProcessSequencer5Data: Found batch metadata, total_order=" 
 				        << potential_metadata->batch_total_order << ", num_messages=" 
@@ -1011,24 +1121,37 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::sha
 				
 				// Compute padded size from v2 fields using helper
 				size_t payload_size = v2_hdr->size;
-				size_t total_msg_size = Embarcadero::wire::ComputeMessageStride(sizeof(Embarcadero::BlogMessageHeader), payload_size);
+				size_t total_msg_size = Embarcadero::wire::ComputeStrideV2(payload_size);
 				
 				// Validate message header
-				if (payload_size > 0 && payload_size <= Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE &&
-				    current_pos + total_msg_size <= data_size) {
+				if (Embarcadero::wire::ValidateV2Payload(payload_size, data_size - current_pos)) {
 					
 					// Assign total_order from batch metadata
-					if (batch_state.has_pending_metadata && v2_hdr->total_order == 0) {
-						v2_hdr->total_order = batch_state.next_message_order_in_batch++;
-						batch_state.current_batch_messages_processed++;
+					// [[FIX: Prevent duplicate assignment]] Only assign if total_order is 0 AND we have pending metadata
+					// This prevents re-processing the same messages if ProcessSequencer5Data is called multiple times
+					if (batch_state.has_pending_metadata) {
+						if (v2_hdr->total_order == 0) {
+							// First time processing this message - assign total_order
+							v2_hdr->total_order = batch_state.next_message_order_in_batch++;
+							batch_state.current_batch_messages_processed++;
+							
+							VLOG(5) << "ProcessSequencer5Data: Assigned total_order=" << v2_hdr->total_order 
+							        << " to BlogMessageHeader, fd=" << fd;
+						} else {
+							// Message already has total_order - skip assignment but still count it
+							// This handles the case where the same buffer is processed multiple times
+							batch_state.current_batch_messages_processed++;
+							VLOG(5) << "ProcessSequencer5Data: Message already has total_order=" << v2_hdr->total_order 
+							        << ", skipping assignment, fd=" << fd;
+						}
 						
+						// Check if we've processed all messages in the batch
 						if (batch_state.current_batch_messages_processed >= 
 						    batch_state.pending_metadata.num_messages) {
 							batch_state.has_pending_metadata = false;
+							VLOG(3) << "ProcessSequencer5Data: Completed batch, processed " 
+							        << batch_state.current_batch_messages_processed << " messages, fd=" << fd;
 						}
-						
-						VLOG(5) << "ProcessSequencer5Data: Assigned total_order=" << v2_hdr->total_order 
-						        << " to BlogMessageHeader, fd=" << fd;
 					}
 					
 					current_pos += total_msg_size;
@@ -1042,22 +1165,34 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::sha
 					reinterpret_cast<Embarcadero::MessageHeader*>(msg_ptr);
 				
 				// Validate message header
-				if (v1_hdr->paddedSize > 0 && v1_hdr->paddedSize <= 1024*1024 &&
-				    current_pos + v1_hdr->paddedSize <= data_size) {
+				if (Embarcadero::wire::ValidateV1PaddedSize(v1_hdr->paddedSize, data_size - current_pos)) {
 					
-					// Assign total_order from batch metadata
-					if (batch_state.has_pending_metadata && v1_hdr->total_order == 0) {
+				// Assign total_order from batch metadata
+				// [[FIX: Prevent duplicate assignment]] Same logic as V2
+				if (batch_state.has_pending_metadata) {
+					if (v1_hdr->total_order == 0) {
+						// First time processing this message - assign total_order
 						v1_hdr->total_order = batch_state.next_message_order_in_batch++;
 						batch_state.current_batch_messages_processed++;
 						
-						if (batch_state.current_batch_messages_processed >= 
-						    batch_state.pending_metadata.num_messages) {
-							batch_state.has_pending_metadata = false;
-						}
-						
 						VLOG(5) << "ProcessSequencer5Data: Assigned total_order=" << v1_hdr->total_order 
-						        << " to MessageHeader, fd=" << fd;
+						        << " to MessageHeader (msg " << batch_state.current_batch_messages_processed 
+						        << "/" << batch_state.pending_metadata.num_messages << "), fd=" << fd;
+					} else {
+						// Message already has total_order - count it if within batch size
+						if (batch_state.current_batch_messages_processed < batch_state.pending_metadata.num_messages) {
+							batch_state.current_batch_messages_processed++;
+						}
 					}
+					
+					// Check if we've processed all messages in the batch
+					if (batch_state.current_batch_messages_processed >= 
+					    batch_state.pending_metadata.num_messages) {
+						batch_state.has_pending_metadata = false;
+						VLOG(3) << "ProcessSequencer5Data: Completed V1 batch, processed " 
+						        << batch_state.current_batch_messages_processed << " messages, fd=" << fd;
+					}
+				}
 					
 					current_pos += v1_hdr->paddedSize;
 				} else {
@@ -1203,7 +1338,8 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                                 static_cast<uint8_t*>(buffer_start) + parse_offset);
                         
                         // Validate payload size is within bounds
-                        if (v2_hdr->size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+                        const size_t remaining_bytes = write_offset - parse_offset;
+                        if (!Embarcadero::wire::ValidateV2Payload(v2_hdr->size, remaining_bytes)) {
                             static thread_local size_t size_error_count = 0;
                             if (++size_error_count % 1000 == 1) {
                                 LOG(ERROR) << "ConsumeBatchAware: Message payload size=" << v2_hdr->size 
@@ -1216,7 +1352,7 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                         }
                         
                         // Compute message stride: Align64(64 + payload_size)
-                        msg_total_size = Embarcadero::wire::ComputeMessageStride(sizeof(Embarcadero::BlogMessageHeader), v2_hdr->size);
+                        msg_total_size = Embarcadero::wire::ComputeStrideV2(v2_hdr->size);
                     } else {
                         // [[LEGACY: Parse v1 header]]
                         if (parse_offset + sizeof(Embarcadero::MessageHeader) > write_offset) {
@@ -1228,7 +1364,8 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                                 static_cast<uint8_t*>(buffer_start) + parse_offset);
                         
                         // Validate v1 paddedSize
-                        if (v1_hdr->paddedSize == 0 || v1_hdr->paddedSize > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE + sizeof(Embarcadero::MessageHeader)) {
+                        const size_t remaining_bytes = write_offset - parse_offset;
+                        if (!Embarcadero::wire::ValidateV1PaddedSize(v1_hdr->paddedSize, remaining_bytes)) {
                             static thread_local size_t v1_error_count = 0;
                             if (++v1_error_count % 1000 == 1) {
                                 LOG(ERROR) << "ConsumeBatchAware: Message v1 paddedSize=" << v1_hdr->paddedSize 
@@ -1366,7 +1503,8 @@ void* Subscriber::Consume(int timeout_ms) {
                     reinterpret_cast<Embarcadero::MessageHeader*>(buffer_data + current_pos);
                 
                 // Validate message header
-                if (header->paddedSize == 0 || header->paddedSize > 1024*1024) {
+                const size_t remaining_bytes = buffer_write_offset - current_pos;
+                if (!Embarcadero::wire::ValidateV1PaddedSize(header->paddedSize, remaining_bytes)) {
                     // This might be batch metadata or corrupted data
                     if (order_level_ == 5 && current_pos + sizeof(Embarcadero::wire::BatchMetadata) <= buffer_write_offset) {
                         // Try skipping 16 bytes (batch metadata size)
@@ -1379,10 +1517,10 @@ void* Subscriber::Consume(int timeout_ms) {
                 }
                 
                 // Check if we have the complete message
-                if (current_pos + header->paddedSize > buffer_write_offset) {
+                if (header->paddedSize > remaining_bytes) {
                     VLOG(4) << "Consume: Incomplete message at pos " << current_pos 
                             << ", need " << header->paddedSize << " bytes, have " 
-                            << (buffer_write_offset - current_pos) << ", fd=" << fd;
+                            << remaining_bytes << ", fd=" << fd;
                     break; // Wait for more data
                 }
                 

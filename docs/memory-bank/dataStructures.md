@@ -117,62 +117,13 @@ Cache Line 4-7: [ordered][ordered_offset][padding]
 - Current `offset_entry` structure (256-byte aligned sub-structs) provides sufficient cache-line separation
 - Decision documented in `spec_deviation.md` DEV-004
 
-**Migration Note:** All code now uses `TInode.offset_entry` directly:
+**Migration Status:** ✅ **COMPLETE** - All code uses `TInode.offset_entry` directly
+
+**Field Mappings:**
 - `bmeta[broker].local.log_ptr` → `tinode->offsets[broker].log_offset`
 - `bmeta[broker].local.processed_ptr` → `tinode->offsets[broker].written_addr`
 - `bmeta[broker].seq.ordered_ptr` → `tinode->offsets[broker].ordered_offset`
 - `bmeta[broker].seq.ordered_seq` → `tinode->offsets[broker].ordered`
-
-```cpp
-// Part 1: Broker Local Metadata (Cache Line 0)
-struct alignas(64) BrokerLocalMeta {
-    volatile uint64_t log_ptr;           // Offset 0 (8 bytes)
-    volatile uint64_t processed_ptr;     // Offset 8 (8 bytes)
-    volatile uint32_t replication_done;  // Offset 16 (4 bytes) - CHANGED: counter, not array
-    volatile uint32_t _reserved1;        // Offset 20 (4 bytes)
-    volatile uint64_t log_start;         // Offset 24 (8 bytes) - Starting address of Blog
-    volatile uint64_t batch_headers_ptr; // Offset 32 (8 bytes)
-    uint8_t padding[24];                 // Offset 40-63 (24 bytes)
-};
-static_assert(sizeof(BrokerLocalMeta) == 64, "Must fit in one cache line");
-
-// Part 2: Sequencer Metadata (Cache Line 1)
-struct alignas(64) BrokerSequencerMeta {
-    volatile uint64_t ordered_seq;       // Offset 0 (8 bytes) - Global sequence number
-    volatile uint64_t ordered_ptr;       // Offset 8 (8 bytes) - Pointer to last ordered msg
-    volatile uint64_t epoch;             // Offset 16 (8 bytes) - Sequencer epoch
-    volatile uint32_t status;            // Offset 24 (4 bytes) - 0=idle, 1=active, 2=failed
-    volatile uint32_t _reserved2;        // Offset 28 (4 bytes)
-    uint8_t padding[32];                 // Offset 32-63 (32 bytes)
-};
-static_assert(sizeof(BrokerSequencerMeta) == 64, "Must fit in one cache line");
-
-// Combined structure (2 cache lines)
-struct BrokerMetadata {
-    BrokerLocalMeta local;      // Cache line 0 (broker writes)
-    BrokerSequencerMeta seq;    // Cache line 1 (sequencer writes)
-};
-static_assert(sizeof(BrokerMetadata) == 128, "Must be exactly 2 cache lines");
-```
-
-**Ownership Model:**
-```
-BrokerLocalMeta (Cache Line 0):
-  Writers:  Owner broker ONLY
-  Readers:  Sequencer (polling processed_ptr), Replication threads
-
-BrokerSequencerMeta (Cache Line 1):
-  Writers:  Sequencer ONLY
-  Readers:  Owner broker, Subscribers (polling ordered_ptr)
-```
-
-**Migration Status:** ✅ **COMPLETE** - No migration needed
-
-**Current Implementation:**
-- All code uses `TInode.offset_entry` directly
-- No dual-write pattern needed
-- Single source of truth: `tinode->offsets[broker_id]`
-- Cache flushes target correct regions (broker vs sequencer) per Root Cause A fix
 
 ---
 
@@ -221,11 +172,12 @@ Sequencer writes: Bytes 32-39 (8 bytes) ← IN THE SAME CACHE LINE!
 
 ---
 
-### 2.2 BlogMessageHeader (Target - Paper Spec)
+### 2.2 BlogMessageHeader (Implemented - ORDER=5)
 
-**Purpose:** Cache-line partitioned message header
-**Location:** NEW
+**Purpose:** Cache-line partitioned message header (eliminates false sharing)
+**Location:** `src/cxl_manager/cxl_datastructure.h`
 **Size:** 64 bytes (strict partitioning)
+**Status:** ✅ **IMPLEMENTED** - Fully integrated for ORDER=5
 
 ```cpp
 struct alignas(64) BlogMessageHeader {
@@ -294,6 +246,18 @@ void OrderMessage(BlogMessageHeader* hdr, uint64_t global_seq) {
 
 **Key Improvement:** Each stage flushes ONLY its own cache-line portion (16-byte granularity).
 
+**Current Implementation (ORDER=5):**
+- ✅ Publisher emits BlogMessageHeader directly (zero-copy)
+- ✅ NetworkManager validates BlogMessageHeader (no conversion overhead)
+- ✅ Sequencer5 writes `total_order` to bytes 32-47
+- ✅ Subscriber parses BlogMessageHeader with version-aware logic
+- ✅ Performance: 11.7 GB/s (vs 10.8 GB/s baseline)
+
+**Limitations:**
+- ⚠️ Only validated for ORDER=5
+- ⚠️ ORDER=4 not supported (may hang - see `known_limitations.md`)
+- ✅ ORDER=0, ORDER=1, ORDER=3 use legacy MessageHeader
+
 ---
 
 ## 3. Batch Structures
@@ -303,22 +267,41 @@ void OrderMessage(BlogMessageHeader* hdr, uint64_t global_seq) {
 **Purpose:** Batch metadata for sequencer optimization
 **Location:** `src/cxl_manager/cxl_datastructure.h:28745-28763`
 **Size:** 64 bytes (1 cache line)
+**Status:** ✅ **CURRENT** - Used for ORDER=5 batch-level ordering
 
 ```cpp
 struct alignas(64) BatchHeader {
-    size_t batch_seq;                // Offset 0 (8 bytes) - Client batch sequence
+    size_t batch_seq;                // Offset 0 (8 bytes) - Client batch sequence (read-only after creation)
     size_t total_size;               // Offset 8 (8 bytes) - Total batch size
     size_t start_logical_offset;     // Offset 16 (8 bytes) - Starting offset
     uint32_t broker_id;              // Offset 24 (4 bytes)
-    uint32_t ordered;                // Offset 28 (4 bytes) - Sequencer flag
+    uint32_t ordered;                // Offset 28 (4 bytes) - Sequencer flag (legacy, not used for ORDER=5)
     size_t batch_off_to_export;      // Offset 32 (8 bytes)
-    size_t total_order;              // Offset 40 (8 bytes) - Sequencer writes
+    size_t total_order;              // Offset 40 (8 bytes) - Sequencer writes (starting total_order for batch)
     size_t log_idx;                  // Offset 48 (8 bytes) - Offset to Blog payload
-    uint32_t client_id;              // Offset 56 (4 bytes)
-    uint32_t num_msg;                // Offset 60 (4 bytes) - Message count
-    // Total: 64 bytes (no explicit batch_complete here in this view)
+    uint32_t client_id;              // Offset 56 (4 bytes) - Client identifier (read-only after creation)
+    uint32_t num_msg;                // Offset 60 (4 bytes) - Message count (read-only after creation)
+    volatile uint32_t batch_complete; // Extension: Completion flag (NetworkManager writes, Sequencer reads)
+    // Total: 64 bytes (base) + 4 bytes (extension) = 68 bytes
 };
 ```
+
+**Lifecycle (ORDER=5):**
+1. **Publisher Stage:** Sets `batch_seq`, `client_id`, `num_msg`, `log_idx` when batch is sealed
+2. **NetworkManager Stage (Receiver):** Sets `batch_complete = 1` after all messages received, flushes cacheline
+3. **Sequencer Stage (BrokerScannerWorker5):**
+   - Polls `batch_complete == 1` to detect ready batches
+   - Validates FIFO: Checks `batch_seq` against `next_expected_batch_seq_[client_id]`
+   - If in order: Assigns `total_order` range, processes batch
+   - If out of order: Defers to `skipped_batches_5_[client_id][batch_seq]`
+   - Clears `batch_complete = 0` after processing (marks slot as processed)
+4. **Subscriber Stage:** Reads `BatchHeader.total_order` to derive per-message `total_order` via `BatchMetadata`
+
+**FIFO Validation (ORDER=5):**
+- **Per-Client Ordering:** Each client's batches must be processed in `batch_seq` order (0, 1, 2, ...)
+- **Out-of-Order Handling:** Batches arriving out of order are deferred until their predecessors are processed
+- **Implementation:** `BrokerScannerWorker5` checks `batch_seq == next_expected_batch_seq_[client_id]` before assigning `total_order`
+- **Paper Reference:** Matches Paper §3.3 Stage 3, Step 2 - "Validate FIFO: Check batch seqno against `next_batch_seqno[client_id]` map"
 
 **Actual Size (with extensions):**
 ```cpp
