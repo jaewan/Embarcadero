@@ -578,8 +578,18 @@ void NetworkManager::HandlePublishRequest(
 		ack_fd_ = ack_fd;
 		ack_connections_[handshake.client_id] = ack_fd;
 
-		// Pass local_ack_efd to thread so it uses the correct epoll instance
-		threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd);
+		// [[CRITICAL: Validate topic before starting AckThread]]
+		// Empty topic → GetOffsetToAck returns wrong TInode → client ACK timeout
+		if (strlen(handshake.topic) == 0) {
+			LOG(ERROR) << "HandlePublishRequest: Empty topic in handshake for broker " << broker_id_
+			           << ", client_id=" << handshake.client_id << ". NOT starting AckThread!";
+			// Still keep connection open for publish, but ACKs will not work correctly
+		} else {
+			LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
+			          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id;
+			// Pass local_ack_efd to thread so it uses the correct epoll instance
+			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd);
+		}
 		}
 	}
 
@@ -1224,6 +1234,15 @@ bool NetworkManager::SendMessageData(
 //----------------------------------------------------------------------------
 
 size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
+	// [[CRITICAL: Validate topic is not empty]]
+	// Empty topic → wrong TInode → wrong ACKs → client timeout
+	// This can happen if AckThread is started with incorrect handshake.topic
+	if (!topic || strlen(topic) == 0) {
+		LOG(ERROR) << "GetOffsetToAck: Empty or null topic for broker " << broker_id_
+		           << " (ack_level=" << ack_level << ")";
+		return (size_t)-1;
+	}
+
 	// Early return for ack_level 0 (no acknowledgments expected)
 	if (ack_level == 0) {
 		return (size_t)-1;  // Return sentinel value indicating no ack needed
@@ -1231,6 +1250,8 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 
 	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
 	if (!tinode) {
+		LOG(WARNING) << "GetOffsetToAck: TInode not found for topic '" << topic
+		             << "' on broker " << broker_id_;
 		return (size_t)-1;  // Topic not found / defensive: GetTInode contract may change
 	}
 	const int replication_factor = tinode->replication_factor;
@@ -1350,7 +1371,18 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 	struct epoll_event events[10];
 	char buf[1];
 
-	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic=" << topic << ", ack_level=" << ack_level;
+	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic='" << topic
+	          << "' (len=" << (topic ? strlen(topic) : 0) << "), ack_level=" << ack_level;
+
+	// [[CRITICAL: Validate topic is not empty]]
+	// If topic is empty, GetOffsetToAck will use wrong TInode → wrong ACKs → client timeout
+	if (!topic || strlen(topic) == 0) {
+		LOG(ERROR) << "AckThread: Empty or null topic for broker " << broker_id_
+		           << ". Cannot send ACKs correctly. Exiting AckThread.";
+		close(ack_fd);
+		if (ack_efd >= 0) close(ack_efd);
+		return;
+	}
 
 	constexpr int kBrokerIdEpollTimeoutMs = 5000;
 	constexpr int kAckEpollTimeoutMs = 100;
@@ -1858,10 +1890,18 @@ void NetworkManager::SetupPublishConnection(ConnectionState* state, const NewPub
                 ack_fd_ = ack_fd;
                 ack_connections_[conn.handshake.client_id] = ack_fd;
 
-                // Launch ACK thread
-                threads_.emplace_back(&NetworkManager::AckThread, this,
-                                     conn.handshake.topic, conn.handshake.ack,
-                                     ack_fd, local_ack_efd);
+                // [[CRITICAL: Validate topic before starting AckThread]]
+                if (strlen(conn.handshake.topic) == 0) {
+                    LOG(ERROR) << "SetupPublishConnection: Empty topic in handshake for broker " << broker_id_
+                               << ", client_id=" << conn.handshake.client_id << ". NOT starting AckThread!";
+                } else {
+                    LOG(INFO) << "SetupPublishConnection: Starting AckThread for broker " << broker_id_
+                              << ", topic='" << conn.handshake.topic << "', client_id=" << conn.handshake.client_id;
+                    // Launch ACK thread
+                    threads_.emplace_back(&NetworkManager::AckThread, this,
+                                         conn.handshake.topic, conn.handshake.ack,
+                                         ack_fd, local_ack_efd);
+                }
 
                 VLOG(2) << "SetupPublishConnection: Created ACK connection for client_id="
                        << conn.handshake.client_id;

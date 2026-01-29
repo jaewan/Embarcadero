@@ -1563,26 +1563,28 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			}
 			continue;
 		}
+		// [[PERF: Reduce hot-path logging]]
+		// At high throughput (10k+ batches/sec), LOG(INFO) every 100-200 batches adds ~10% overhead
+		// Use VLOG for high-frequency logs; LOG(INFO) only for first few and periodic summary
 		size_t ready_seen = ++ready_batches_seen;
-		if (ready_seen <= 10 || ready_seen % 200 == 0) {
+		if (ready_seen <= 5) {
+			// Log first 5 batches at INFO level for startup diagnostics
 			LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: batch_ready_seen=" << ready_seen
 			          << " batch_seq=" << current_batch_header->batch_seq
 			          << " client_id=" << current_batch_header->client_id
 			          << " num_msg=" << num_msg_check;
+		} else {
+			// Use VLOG for high-frequency logs
+			VLOG(2) << "BrokerScannerWorker5 [B" << broker_id << "]: batch_ready_seen=" << ready_seen
+			        << " batch_seq=" << current_batch_header->batch_seq
+			        << " num_msg=" << num_msg_check;
 		}
 
 		// Batch is ready - process it
-
-		// Valid batch found - use the volatile values we already read
-		static thread_local size_t processed_logs = 0;
-		if (++processed_logs <= 10 || processed_logs % 100 == 0) {
-			LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: Found valid batch with " 
-			         << num_msg_check << " messages, batch_seq=" << current_batch_header->batch_seq 
-			         << ", client_id=" << current_batch_header->client_id
-			         << " (total_processed=" << processed_logs << ")";
-		} else {
-			VLOG(3) << "BrokerScannerWorker5 [B" << broker_id << "]: Found valid batch with " << num_msg_check << " messages, batch_seq=" << current_batch_header->batch_seq << ", client_id=" << current_batch_header->client_id;
-		}
+		VLOG(3) << "BrokerScannerWorker5 [B" << broker_id << "]: Processing batch with "
+		        << num_msg_check << " messages, batch_seq=" << current_batch_header->batch_seq
+		        << ", client_id=" << current_batch_header->client_id
+		        << " (total_processed=" << total_batches_processed + 1 << ")";
 
 		BatchHeader* header_to_process = current_batch_header;
 		size_t client_id = current_batch_header->client_id;

@@ -126,11 +126,11 @@ class Publisher {
 		SequencerType seq_type_;
 		std::unique_ptr<CorfuSequencerClient> corfu_client_;
 
-		// [[CRITICAL: Atomic - written by destructor/Poll/DEBUG_check, read by PublishThread/SubscribeToCluster]]
+		// [[Atomic - written by destructor/Poll/DEBUG_check, read by PublishThread/SubscribeToCluster]]
 		std::atomic<bool> shutdown_{false};
 		std::atomic<bool> publish_finished_{false};
 		std::atomic<bool> connected_{false};
-		// [[CRITICAL: Atomic - Publish() increments, Poll() reads; ensures visibility across call sites]]
+		// [[Atomic - Publish() increments, Poll() reads; ensures visibility across call sites]]
 		std::atomic<size_t> client_order_{0};
 
 		// Used to measure real-time throughput during failure benchmark
@@ -223,7 +223,7 @@ class Publisher {
 		 */
 		bool AddPublisherThreads(size_t num_threads, int broker_id, size_t queue_size);
 
-		// [[Issue 7 fix]] Instance vars for SubscribeToClusterStatus error handling (was static)
+		// Instance vars for SubscribeToClusterStatus error handling (was static)
 		std::chrono::steady_clock::time_point last_read_warning_;
 		size_t read_fail_count_{0};
 };

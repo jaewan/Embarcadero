@@ -412,7 +412,7 @@ void MessageOrdering::AssignOrder(BatchHeader* batch_to_order, size_t start_tota
         // Update ordered once per message
         // ordered is read without explicit synchronization by the benchmark thread.
         // Use relaxed atomic-like semantics by writing through a volatile int field; ensure monotonic increment.
-        // [[CRITICAL_FIX: Invalidate cache BEFORE reading in RMW on non-coherent CXL]]
+        // Invalidate cache BEFORE reading in RMW on non-coherent CXL]]
         // On non-coherent CXL, sequencer reads stale cached value, causing lost updates
         volatile uint64_t* ordered_ptr = &tinode_->offsets[broker].ordered;
         Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
@@ -814,7 +814,7 @@ void MessageOrdering::AssignOrder5(BatchHeader* batch_to_order, size_t start_tot
 
     // Update ordered count by the number of messages in the batch
     // This maintains compatibility with existing read path
-    // [[CRITICAL_FIX: Invalidate cache BEFORE reading in RMW on non-coherent CXL]]
+    // [[Invalidate cache BEFORE reading in RMW on non-coherent CXL]]
     // On non-coherent CXL, sequencer reads stale cached value, causing lost updates
     volatile uint64_t* ordered_ptr = &tinode_->offsets[broker].ordered;
     Embarcadero::CXL::flush_cacheline(const_cast<const void*>(

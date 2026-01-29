@@ -413,7 +413,7 @@ void Buffer::Seal(){
 		// For locally created batches, sequencer will use fallback logic (checking paddedSize)
 		batch_header->batch_complete = 0;  // Initialize batch completion flag
 
-		// [[FIX: Memory Barrier]] Release fence ensures all batch header writes are visible
+		// Release fence ensures all batch header writes are visible
 		// to reader threads before we update buffer state. Without this, readers may see
 		// stale batch_header fields on non-x86 architectures or with aggressive compiler opts.
 		std::atomic_thread_fence(std::memory_order_release);
@@ -467,13 +467,13 @@ void Buffer::SealAll() {
 }
 
 void* Buffer::Read(int bufIdx) {
-	// [[FIX: Memory Ordering]] Use acquire to synchronize with writer's release fence
+	// Use acquire to synchronize with writer's release fence
 	Embarcadero::BatchHeader* batch_header =
 		reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[bufIdx].buffer + bufs_[bufIdx].cons.reader_head.load(std::memory_order_acquire));
 
 	// Check if batch header contains valid data
 	if (batch_header->total_size != 0 && batch_header->num_msg != 0) {
-		// [[FIX: Memory Barrier]] Acquire fence ensures we see all batch data written
+		// Acquire fence ensures we see all batch data written
 		// before total_size/num_msg were set. Pairs with writer's release fence in Seal().
 		std::atomic_thread_fence(std::memory_order_acquire);
 
@@ -501,8 +501,8 @@ void* Buffer::Read(int bufIdx) {
 
 	// Busy wait only when some messages are in the buffer.
 	// Wait for the batch to be sealed. (Either full batch written or sealed by Client)
-	// [[LAST_PERCENT_ACK_FIX]] Use 2s timeout so we don't return nullptr before SealAll() runs.
-	// [[FIX: Exponential Backoff]] Reduces CPU waste from 3 of 4 threads spinning on empty buffers
+	// Use 2s timeout so we don't return nullptr before SealAll() runs.
+	// Reduces CPU waste from 3 of 4 threads spinning on empty buffers
 	// Phase 1: Fast spin (100 iters) - low latency when data arrives quickly
 	// Phase 2: Yield (1000 iters) - cooperative for concurrent threads
 	// Phase 3: Sleep - reduces CPU to ~25% vs constant yield()

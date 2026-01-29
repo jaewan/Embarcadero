@@ -1003,7 +1003,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				if (bytesSent < 0) {
 					if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
 						// Wait for socket to become writable
-						// [[FIX: Throughput]] 1ms timeout, larger event array
 						struct epoll_event events[64];
 						int n = epoll_wait(efd, events, 64, 1);
 
@@ -1149,7 +1148,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
 			} else if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
 				// Socket buffer full, wait for it to become writable
-				// [[FIX: Throughput]] 1ms timeout, larger event array
 				struct epoll_event events[64];
 				int n = epoll_wait(efd, events, 64, 1);
 
@@ -1158,7 +1156,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					break;
 				}
 
-				// [[FIX: Exponential Backoff]] Halve on congestion (was 75% linear reduction)
 				// Recovers faster after transient network pressure clears
 				zero_copy_send_limit = std::max(zero_copy_send_limit / 2, 1UL << 16); // Halve, min 64KB
 			} else if (bytesSent < 0) {
@@ -1217,15 +1214,14 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		has_sent_batch = true;
 		size_t total_sent = total_batches_sent.fetch_add(1, std::memory_order_relaxed) + 1;
 
-		// Log when batch is fully sent
 		if (batch_count % 100 == 0 || batch_count == 1) {
-			LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Fully sent batch " << batch_count 
-			         << " to broker " << broker_id << " (" << len << " bytes, sent_bytes=" << sent_bytes << ")";
+			VLOG(2) << "PublishThread[" << pubQuesIdx << "]: Fully sent batch " << batch_count
+			        << " to broker " << broker_id << " (" << len << " bytes, sent_bytes=" << sent_bytes << ")";
 		}
 		if (total_sent % 500 == 0) {
-			LOG(INFO) << "Publisher: total_batches_sent=" << total_sent
-			          << " total_batches_attempted=" << total_batches_attempted.load(std::memory_order_relaxed)
-			          << " total_batches_failed=" << total_batches_failed.load(std::memory_order_relaxed);
+			VLOG(2) << "Publisher: total_batches_sent=" << total_sent
+			        << " total_batches_attempted=" << total_batches_attempted.load(std::memory_order_relaxed)
+			        << " total_batches_failed=" << total_batches_failed.load(std::memory_order_relaxed);
 		}
 
 		// Verify all data was sent
@@ -1253,9 +1249,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 void Publisher::SubscribeToClusterStatus() {
 	heartbeat_system::ClusterStatus cluster_status;
-	read_fail_count_ = 0;  // [[Issue 7]] Reset on entry
+	read_fail_count_ = 0; 
 
-	// [[Issue 4]] Outer loop: re-establish reader when Read() fails or stream ends
 	while (!shutdown_.load(std::memory_order_acquire)) {
 		heartbeat_system::ClientInfo client_info;
 		{
@@ -1305,10 +1300,9 @@ void Publisher::SubscribeToClusterStatus() {
 			}
 
 			// If this is initial connection, connect to all brokers
-			if (!connected_.load(std::memory_order_acquire)) {  // [[CRITICAL_FIX: Atomic load]]
+			if (!connected_.load(std::memory_order_acquire)) { 
 				LOG(INFO) << "SubscribeToCluster: Initial connection - connecting to " 
 				         << brokers_.size() << " brokers";
-				// [[Issue 3]] Read queueSize_ under mutex before calling AddPublisherThreads
 				size_t qsize;
 				{ absl::MutexLock lock(&mutex_); qsize = queueSize_; }
 				bool all_connected = true;
@@ -1330,7 +1324,7 @@ void Publisher::SubscribeToClusterStatus() {
 					}
 				}
 
-				// Signal that we're connected (CRITICAL: Set even if reader->Read() fails later)
+				// Signal that we're connected 
 				if (all_connected) {
 					connected_.store(true, std::memory_order_release);  // [[CRITICAL_FIX: Atomic store with release semantics]]
 					LOG(INFO) << "SubscribeToCluster: Connection established successfully. connected_=true";
@@ -1353,7 +1347,6 @@ void Publisher::SubscribeToClusterStatus() {
 			}
 		}
 
-		// [[Issue 4]] Finish current reader before re-establishing
 		grpc::Status status = reader->Finish();
 		if (!status.ok() && !shutdown_.load(std::memory_order_acquire)) {
 			LOG(ERROR) << "SubscribeToCluster stream ended: " << status.error_message() << ". Re-establishing.";
@@ -1364,13 +1357,13 @@ void Publisher::SubscribeToClusterStatus() {
 }
 
 bool Publisher::AddPublisherThreads(size_t num_threads, int broker_id, size_t queue_size) {
-	// [[Issue 3]] Use queue_size parameter (caller reads under mutex)
+	// Use queue_size parameter (caller reads under mutex)
 	if (!pubQue_.AddBuffers(queue_size)) {
 		LOG(ERROR) << "Failed to add buffers for broker " << broker_id;
 		return false;
 	}
 
-	// [[Issue 5]] Create threads with cleanup on partial failure
+	// Create threads with cleanup on partial failure
 	size_t created = 0;
 	try {
 		for (size_t i = 0; i < num_threads; i++) {

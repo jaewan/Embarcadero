@@ -52,7 +52,7 @@ We are migrating from the current TInode-based architecture to the paper's Bmeta
 11. ✅ Task 4.2: Rename CombinerThread to DelegationThread (complete)
 12. ✅ Performance optimizations (DEV-006: cpu_pause, spin-then-yield patterns)
 13. ✅ NetworkManager bug fixes (file descriptor leaks, race conditions)
-14. ⚠️ **10 GB/s not yet achieved:** Batch-header ring overflow fixed (1 MB config); 10 GB run reaches 99.2% acks then stalls/killed. Last ~0.8% and 1 GB last ~4.6% still short. See `HANDOFF_ACK_AND_BANDWIDTH.md`, `BANDWIDTH_10GB_ASSESSMENT.md`.
+14. ⚠️ **10 GB/s not yet achieved:** Batch-header ring overflow fixed (1 MB config); 10 GB run reaches 99.2% acks then stalls/killed. Last ~0.8% and 1 GB last ~4.6% still short. 
 
 ---
 
