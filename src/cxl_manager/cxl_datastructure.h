@@ -1,24 +1,242 @@
 #pragma once
 #include "common/config.h"
+#include "common/performance_utils.h"  // For CXL:: namespace (flush_cacheline, load_fence)
 #include <heartbeat.grpc.pb.h>
 #include <cstdlib>
 #include <string>
 #include <algorithm>
 #include <cctype>
+#include <atomic>
 
-/* CXL memory layout
+/* CXL memory layout (v2.0 - Phase 1a + Phase 2)
  *
- * CXL is composed of three components; TINode, Bitmap, Segments
- * TINode region: First sizeof(TINode) * MAX_TOPIC
- * + Padding to make each region be aligned in cacheline
- * Bitmap region: Cacheline_size * NUM_MAX_BROKERS
- * BatchHeaders region: NUM_MAX_BROKERS * BATCHHEADERS_SIZE * MAX_TOPIC
- * Segment region: Rest. It is allocated to each brokers equally according to broker_id
- * 		Segment: 8Byte of segment metadata to store address of last ordered_offset from the segment, messages
- * 			Message: Header + paylod
+ * Reference: docs/CXL_MEMORY_LAYOUT_v2.md
+ *
+ * [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0x0 (128 bytes)
+ * [[PHASE_2_GOI_CV]]         CompletionVector at 0x1000 (4 KB), GOI at 0x2000 (16 GB)
+ *
+ * Offset Map (512 GB CXL module):
+ * ┌──────────────┬──────────┬──────────────────────────────────────────┐
+ * │ 0x0000_0000  │ 128 B    │ ControlBlock (Phase 1a: epoch fencing)   │
+ * │ 0x0000_1000  │ 4 KB     │ CompletionVector (Phase 2: ACK path)     │
+ * │ 0x0000_2000  │ 16 GB    │ GOI (Phase 2: chain replication)         │
+ * │ 0x4_0000_2000│ 1 GB     │ PBR/BatchHeaders (existing)              │
+ * │ 0x4_4000_2000│ ~495 GB  │ BLog (existing)                          │
+ * │ (legacy)     │ ~24 KB   │ TInode (to be deprecated in Phase 3)     │
+ * └──────────────┴──────────┴──────────────────────────────────────────┘
+ *
+ * Legacy regions (pre-Phase 2):
+ * - TINode region: sizeof(TInode) * MAX_TOPIC + padding
+ * - Bitmap region: Cacheline_size * NUM_MAX_BROKERS
+ * - BatchHeaders region: NUM_MAX_BROKERS * BATCHHEADERS_SIZE * MAX_TOPIC
+ * - Segment region: Rest
  */
 
 namespace Embarcadero{
+
+/**
+ * Control Block (128 bytes) — Phase 1a/3: Epoch fencing + cluster coordination
+ *
+ * **Location**: CXL offset 0x0 (first 128 bytes of CXL memory)
+ * **Purpose**: Cluster-wide coordination structure for epoch-based fencing, sequencer lease,
+ *              broker health tracking, and global sequence progress.
+ *
+ * **Alignment**: 128 bytes (2 cache lines) to avoid false sharing with adjacent structures.
+ *                Modern CPUs prefetch 128 bytes; 64-byte alignment risks invalidation conflicts
+ *                when head broker updates epoch and brokers read it concurrently.
+ *
+ * **Phase 1a (Zombie Fencing — §4.2.1)**:
+ *   - Head broker writes epoch=1 on initialization
+ *   - All brokers read ControlBlock.epoch periodically (e.g., every 100 batches)
+ *   - If broker's cached epoch < ControlBlock.epoch, broker is stale (partitioned)
+ *   - Stale brokers stop accepting batches → prevents PBR slot burn DoS
+ *
+ * **Phase 3 Extensions**:
+ *   - sequencer_lease: Heartbeat-based sequencer liveness (§4.2 Sequencer lease protocol)
+ *   - committed_seq: Highest global_seq durably written to GOI (§3.3 scatter-gather updater)
+ *   - broker_mask: Health bitmap for broker failure detection (§4.2 membership)
+ *
+ * **Threading Model**:
+ *   epoch:           W: head broker (on init/failover); R: all brokers (periodic poll)
+ *   sequencer_id:    W: membership service (on election); R: replicas, brokers (lease check)
+ *   sequencer_lease: W: active sequencer (renewal every ~40ms); R: watchdog, replicas
+ *   broker_mask:     W: membership service; R: sequencer (for recovery decisions)
+ *   num_brokers:     W: membership service; R: sequencer, brokers
+ *   committed_seq:   W: sequencer committed_seq updater thread (§3.3); R: replicas, subscribers
+ *
+ * **Ownership**:
+ *   - CXL shared memory; no single owner
+ *   - epoch: head broker owns initialization and failover updates
+ *   - sequencer_lease: active sequencer owns renewal; membership service owns election
+ *   - committed_seq: sequencer updater thread (single or scatter-gather mode)
+ *
+ * **Cache-line Safety**:
+ *   - All fields are std::atomic<> for non-coherent CXL memory access
+ *   - Writers must CXL::flush_cacheline() after writes (mandatory for CXL non-coherent)
+ *   - Readers must invalidate cache before reads (handled by CXL load operations)
+ *
+ * @threading See field-level threading annotations above
+ * @ownership CXL shared; head broker owns epoch init; sequencer owns lease/committed_seq
+ * @paper_ref Design §2.4 Control Block, §4.2.1 Zombie slot burn, §4.2 Sequencer lease,
+ *            §3.3 Scatter-gather committed_seq updater, §4.2.2 Sequencer-driven recovery
+ */
+struct alignas(128) ControlBlock {
+	// ──────────────────────────────────────────────────────────────────────────
+	// Epoch-based fencing (Phase 1a)
+	// ──────────────────────────────────────────────────────────────────────────
+	/**
+	 * Epoch number (monotonic, never decreases).
+	 * Incremented on: (1) initial head broker startup, (2) sequencer failover.
+	 * Brokers poll this field periodically (e.g., every 100 batches or 10ms).
+	 * If broker's cached epoch < ControlBlock.epoch, broker is a zombie (network partition).
+	 * Zombie brokers MUST stop accepting batches and exit/reconnect.
+	 *
+	 * @threading W: head broker (init, failover); R: all brokers (periodic, relaxed)
+	 * @invariant Monotonic: epoch[t+1] >= epoch[t]
+	 */
+	std::atomic<uint64_t> epoch{0};
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Sequencer lease protocol (Phase 3, §4.2)
+	// ──────────────────────────────────────────────────────────────────────────
+	/**
+	 * Sequencer identity (node ID or UUID).
+	 * Written by membership service when granting sequencer leadership.
+	 * 0 = no active sequencer (election in progress).
+	 *
+	 * @threading W: membership service (election); R: replicas, brokers (lease check)
+	 * @invariant Only one sequencer_id active per epoch
+	 */
+	std::atomic<uint64_t> sequencer_id{0};
+
+	/**
+	 * Sequencer lease expiry timestamp (nanoseconds since epoch, e.g., rdtsc or CLOCK_MONOTONIC).
+	 * Active sequencer renews every ~40ms (writes now_ns() + 100ms).
+	 * If now_ns() > sequencer_lease, sequencer is considered dead.
+	 * Membership service elects new sequencer, increments epoch.
+	 *
+	 * @threading W: active sequencer (renewal, CXL flush required); R: watchdog, membership
+	 * @invariant sequencer_lease[t+1] >= sequencer_lease[t] (monotonic during active tenure)
+	 */
+	std::atomic<uint64_t> sequencer_lease{0};
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Cluster membership (Phase 3, §4.2)
+	// ──────────────────────────────────────────────────────────────────────────
+	/**
+	 * Broker health bitmap (32 bits for 32 brokers max).
+	 * bit[i] = 1: broker i is healthy; bit[i] = 0: broker i failed or not registered.
+	 * Used by sequencer for recovery decisions (e.g., skip gap if broker dead).
+	 *
+	 * @threading W: membership service (health updates); R: sequencer (gap timeout logic)
+	 */
+	std::atomic<uint32_t> broker_mask{0};
+
+	/**
+	 * Number of active brokers in cluster.
+	 * Used for cluster size awareness (e.g., scatter-gather shard count, quota).
+	 *
+	 * @threading W: membership service; R: sequencer, brokers
+	 */
+	std::atomic<uint32_t> num_brokers{0};
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Global sequence progress (Phase 3, §3.3 scatter-gather)
+	// ──────────────────────────────────────────────────────────────────────────
+	/**
+	 * Highest global_seq durably written to GOI (contiguous prefix).
+	 * In single-sequencer mode (§3.2): updated after each epoch commit.
+	 * In scatter-gather mode (§3.3): updated by committed_seq updater thread.
+	 *
+	 * **Scatter-gather invariant**: committed_seq = min(shard_high_water[0..S-1])
+	 * where shard_high_water[s] = last GOI index written by logic thread s.
+	 * Using min() ensures [0, committed_seq] is gap-free in GOI.
+	 *
+	 * Replicas and brokers read committed_seq to determine safe read boundaries.
+	 * Subscribers can tail-read up to committed_seq without observing gaps.
+	 *
+	 * @threading W: sequencer committed_seq updater (single writer, periodic); R: replicas, subscribers
+	 * @invariant Monotonic: committed_seq[t+1] >= committed_seq[t]
+	 * @invariant [0, committed_seq] is fully written in GOI (no gaps)
+	 */
+	std::atomic<uint64_t> committed_seq{0};
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Padding to 128 bytes (prefetcher safety)
+	// ──────────────────────────────────────────────────────────────────────────
+	/**
+	 * Padding to reach 128 bytes total structure size.
+	 * Fields: 6 × 8 bytes + 2 × 4 bytes = 56 bytes (assuming std::atomic<T> == sizeof(T))
+	 * However, actual size depends on std::atomic alignment. Padding = 128 - actual_used.
+	 * static_assert below validates total size = 128 bytes.
+	 */
+	uint8_t _pad[80];
+};
+static_assert(sizeof(ControlBlock) == 128, "ControlBlock must be exactly 128 bytes");
+static_assert(alignof(ControlBlock) == 128, "ControlBlock must be 128-byte aligned");
+
+/**
+ * CompletionVectorEntry (128 bytes) — Phase 2: Efficient ACK path
+ *
+ * At CXL offset 0x1000 (4 KB array: 32 brokers × 128 bytes).
+ * Each broker has ONE 128-byte slot (avoids false sharing with 128B prefetching).
+ * Tail replica updates completed_pbr_head; broker polls ONLY its own slot.
+ *
+ * Performance: 8-byte read (vs 256-byte replication_done array) → 32× bandwidth reduction.
+ *
+ * @threading completed_pbr_head: tail replica writes (monotonic); broker reads
+ * @ownership CXL shared; tail replica owns writes per broker
+ * @paper_ref Design §3.4 Completion Vector, Gap Analysis §3.4 ACK Path Efficiency
+ *
+ * Sentinel: Head initializes completed_pbr_head to (uint64_t)-1; 0 = first batch completed.
+ */
+struct alignas(128) CompletionVectorEntry {
+	// Highest contiguous PBR index for this broker that is sequenced AND replicated
+	// Head initializes to (uint64_t)-1 (no progress); tail writes 0, 1, 2, ...
+	std::atomic<uint64_t> completed_pbr_head{0};  // [[writer: tail replica]]
+
+	uint8_t _pad[120];  // Pad to 128 bytes (prefetcher safety: avoid false sharing)
+};
+static_assert(sizeof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be exactly 128 bytes");
+static_assert(alignof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be 128-byte aligned");
+
+/**
+ * GOIEntry (64 bytes) — Phase 2: Global Order Index
+ *
+ * At CXL offset 0x2000 (16 GB array: 256M entries × 64 bytes).
+ * Sequencer writes GOI[global_seq]; replicas read GOI, copy data, increment num_replicated.
+ * Chain replication: replica R_i waits for num_replicated==i, increments to i+1 (token passing).
+ *
+ * @threading Sequencer writes all fields except num_replicated; replicas increment num_replicated
+ * @ownership Sequencer owns writes; replicas coordinate via num_replicated token
+ * @paper_ref Design §2.4 GOI Entry, §3.4 Chain Replication, Gap Analysis §3.3
+ */
+struct alignas(64) GOIEntry {
+	// The definitive ordering
+	uint64_t global_seq;                       // [[CRITICAL]] Sequential BATCH index (0, 1, 2, 3...) - used by replicas for polling
+	uint64_t batch_id;                         // Globally unique (broker_id | timestamp | counter)
+	uint64_t total_order;                      // Starting message sequence number (for message-level ordering)
+
+	// Payload location
+	uint16_t broker_id;                        // Which broker's BLog [0-31]
+	uint16_t epoch_sequenced;                  // Epoch when sequenced (for staleness detection)
+	uint64_t blog_offset;                      // Offset in BLog (64-bit: BLogs are ~15 GB each)
+	uint32_t payload_size;                     // Batch size in bytes
+	uint32_t message_count;                    // Number of messages in batch
+
+	// Replication progress (chain protocol)
+	std::atomic<uint32_t> num_replicated{0};   // 0..R (chain token: replica R_i waits for i, increments to i+1)
+
+	// Per-client ordering info (Level 5) — Populated by Phase 1b sequencer when Level 5 enabled
+	uint64_t client_id;                        // Source client (0 if Level 0)
+	uint64_t client_seq;                       // Client's sequence number (if Level 5)
+
+	// [[PHASE_2_FIX]] ACK path: Absolute PBR index for CV updater (CompletionVector[broker_id])
+	uint32_t pbr_index;                        // [[CRITICAL]] Absolute index (never wraps, monotonic) from BatchHeader.pbr_absolute_index
+	uint8_t _pad[4];                           // Pad toward 64 bytes (actual size may be 128 due to alignas(64)+atomic padding)
+};
+static_assert(sizeof(GOIEntry) <= 128 && sizeof(GOIEntry) % 64 == 0, "GOIEntry must be cache-line multiple (64 or 128)");
+static_assert(alignof(GOIEntry) == 64, "GOIEntry must be 64-byte aligned");
 
 using heartbeat_system::SequencerType;
 using heartbeat_system::SequencerType::EMBARCADERO;
@@ -138,7 +356,15 @@ struct alignas(64) BatchHeader{
 	volatile uint32_t batch_complete;  // [[WRITER: NetworkManager (set=1), Sequencer (clear=0)]] Batch-level completion flag for Sequencer 5
 	uint32_t broker_id; // [[WRITER: NetworkManager]]
 	uint32_t ordered; // [[WRITER: Sequencer]] Set to 1 when batch is globally ordered (Stage-4 polls this)
-	uint32_t _pad0;
+	uint16_t epoch_created; // [[WRITER: NetworkManager]] Epoch when batch was accepted (Phase 1a zombie fencing; sequencer can reject if stale)
+	uint16_t _pad0;
+
+	// [[PHASE_2]] Globally unique batch identifier for GOI deduplication and tracking
+	uint64_t batch_id; // [[WRITER: NetworkManager]] Format: (broker_id << 48) | (timestamp << 16) | counter
+
+	// [[PHASE_2_FIX]] Absolute PBR index (never wraps, monotonic) for CV tracking
+	uint64_t pbr_absolute_index; // [[WRITER: NetworkManager]] Monotonic per-broker batch counter
+
 	size_t total_size; // [[WRITER: NetworkManager]]
 	size_t start_logical_offset; // [[WRITER: NetworkManager]]
 	size_t log_idx;	// [[WRITER: NetworkManager]] Sequencer4: relative log offset to the payload of the batch and relative offset to last message
@@ -408,5 +634,66 @@ struct BrokerMetadata {
 static_assert(sizeof(BrokerMetadata) == 128, "BrokerMetadata must be exactly 2 cache lines");
 static_assert(alignof(BrokerMetadata) == 64, "BrokerMetadata must be 64-byte aligned");
 static_assert(offsetof(BrokerMetadata, seq) == 64, "Sequencer struct must start at cache line boundary");
+
+// [[PHASE_2]] CXL Memory Layout Constants
+constexpr size_t kCompletionVectorOffset = 0x1000;  // CompletionVector at 4 KB from CXL base
+constexpr size_t kGOIOffset = 0x2000;               // GOI at 8 KB from CXL base
+
+/**
+ * [[PHASE_2_ACK_HELPER]] Get replicated last offset from CompletionVector
+ *
+ * Reads CV for the given broker, translates PBR index → ring position → BatchHeader,
+ * and returns the last logical offset that has been fully replicated.
+ *
+ * @param cxl_addr Base CXL address
+ * @param tinode TInode for this topic
+ * @param broker_id Broker ID
+ * @param replicated_last_offset Output: Last replicated message offset (0-based), or (size_t)-1 if no progress
+ * @return true if replication has progressed, false otherwise
+ *
+ * @note Caller must ensure ack_level==2, replication_factor>0, seq_type==EMBARCADERO
+ * @note Performs CXL cache invalidation (non-coherent CXL)
+ */
+inline bool GetReplicatedLastOffsetFromCV(void* cxl_addr, TInode* tinode, int broker_id,
+                                           size_t& replicated_last_offset) {
+	CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+		reinterpret_cast<uint8_t*>(cxl_addr) + kCompletionVectorOffset);
+	CompletionVectorEntry* my_cv_entry = &cv[broker_id];
+
+	// Read CV (tail replica updates this after replication completes)
+	CXL::flush_cacheline(my_cv_entry);
+	CXL::load_fence();
+	uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
+
+	// Sentinel (uint64_t)-1 = no progress; 0 is valid (first batch completed)
+	if (completed_pbr_index == static_cast<uint64_t>(-1)) {
+		replicated_last_offset = static_cast<size_t>(-1);
+		return false;  // No replication progress yet
+	}
+
+	// Map absolute PBR index to ring position
+	BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(cxl_addr) + tinode->offsets[broker_id].batch_headers_offset);
+
+	size_t ring_size_bytes = BATCHHEADERS_SIZE;
+	size_t ring_size = ring_size_bytes / sizeof(BatchHeader);
+	size_t ring_position = completed_pbr_index % ring_size;
+	BatchHeader* completed_batch = ring_start + ring_position;
+
+	// Read batch header to get replicated logical offset range
+	CXL::flush_cacheline(completed_batch);
+	CXL::load_fence();
+	size_t start_offset = completed_batch->start_logical_offset;
+	uint32_t num_msg = completed_batch->num_msg;
+
+	// [[EDGE_CASE]] Handle num_msg == 0 (empty batch, should not happen in replication but be defensive)
+	if (num_msg == 0) {
+		replicated_last_offset = static_cast<size_t>(-1);
+		return false;  // Treat as no progress
+	}
+
+	replicated_last_offset = start_offset + num_msg - 1;  // Last message offset (0-based)
+	return true;
+}
 
 } // End of namespace Embarcadero

@@ -214,8 +214,12 @@ int main(int argc, char* argv[]) {
 		}
 	}
 
-	// *************** Initialize managers ********************** 
-	heartbeat_system::HeartBeatManager heartbeat_manager(is_head_node, head_addr);
+	// [[SEQUENCER_ONLY_HEAD_NODE]] - Check if this is a sequencer-only head node
+	// Must be checked before HeartBeatManager is created so it can advertise accepts_publishes
+	bool is_sequencer_node = config.isSequencerNode();
+
+	// *************** Initialize managers **********************
+	heartbeat_system::HeartBeatManager heartbeat_manager(is_head_node, head_addr, is_sequencer_node);
 	int broker_id = heartbeat_manager.GetBrokerId();
 	size_t colon_pos = head_addr.find(':');
 	std::string head_ip = head_addr.substr(0, colon_pos);
@@ -231,11 +235,13 @@ int main(int argc, char* argv[]) {
 	int num_network_io_threads = arguments["network_threads"].as<int>();
 
 	// Create and connect all manager components
+	// Note: is_sequencer_node was already fetched from config before HeartBeatManager creation
 	Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_ip);
 	Embarcadero::DiskManager disk_manager(broker_id, cxl_manager.GetCXLAddr(),
 			replicate_to_memory, sequencerType);
-	Embarcadero::NetworkManager network_manager(broker_id, num_network_io_threads);
-	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id);
+	// Skip networking on sequencer-only node (no client connections)
+	Embarcadero::NetworkManager network_manager(broker_id, num_network_io_threads, is_sequencer_node);
+	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id, is_sequencer_node);
 
 	// Register callbacks
 	heartbeat_manager.RegisterCreateTopicEntryCallback(

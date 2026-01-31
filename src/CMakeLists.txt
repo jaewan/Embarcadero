@@ -48,6 +48,8 @@ add_executable(embarlet
     common/configuration.h
     disk_manager/disk_manager.cc
     disk_manager/disk_manager.h
+    disk_manager/chain_replication.cc
+    disk_manager/chain_replication.h
     disk_manager/corfu_replication_manager.cc
     disk_manager/corfu_replication_manager.h
     disk_manager/corfu_replication_client.cc
@@ -68,6 +70,7 @@ add_executable(embarlet
     embarlet/topic_manager.cc
     embarlet/topic_manager.h
     embarlet/topic.cc
+	embarlet/goi_recovery_thread.cc
     embarlet/topic.h
 )
 

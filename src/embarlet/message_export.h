@@ -17,7 +17,8 @@ public:
                   int broker_id,
                   int order,
                   int ack_level,
-                  int replication_factor);
+                  int replication_factor,
+                  heartbeat_system::SequencerType seq_type);
 
     /**
      * Get message address and size for topic subscribers
@@ -57,6 +58,7 @@ private:
     int order_;
     int ack_level_;
     int replication_factor_;
+    heartbeat_system::SequencerType seq_type_;
 
     // Tracking for non-ordered messages
     std::atomic<size_t> written_logical_offset_{static_cast<size_t>(-1)};

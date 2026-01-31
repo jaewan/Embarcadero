@@ -30,6 +30,8 @@ message ClientInfo{
 message ClusterStatus{
 	repeated string new_nodes = 1;
 	repeated int32 removed_nodes = 2;
+	// [[SEQUENCER_ONLY_HEAD_NODE]] Full broker info including accepts_publishes for client filtering
+	repeated BrokerInfo broker_info = 3;
 }
 
 message NodeInfo {
@@ -41,6 +43,9 @@ message BrokerInfo {
   int32 broker_id = 1;
   string address = 2;
   string network_mgr_addr = 3;
+  // [[SEQUENCER_ONLY_HEAD_NODE]] False for sequencer-only node, true for data brokers
+  // Clients should only publish to brokers where accepts_publishes=true
+  bool accepts_publishes = 4;
 }
 
 message RegistrationStatus {

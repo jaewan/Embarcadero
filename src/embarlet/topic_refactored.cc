@@ -77,7 +77,8 @@ bool TopicRefactored::Initialize() {
         broker_id_,
         order_,
         ack_level_,
-        replication_factor_
+        replication_factor_,
+        seq_type_
     );
 
     // Initialize combiner for non-ordered messages

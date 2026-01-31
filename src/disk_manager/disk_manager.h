@@ -17,6 +17,9 @@ namespace Corfu{
 namespace Scalog{
 	class ScalogReplicationManager;
 }
+namespace Embarcadero {
+	class ChainReplicationManager;
+}
 
 // Forward declarations for CXL data structures
 namespace Embarcadero {
@@ -77,6 +80,7 @@ class DiskManager{
 
 		std::unique_ptr<Corfu::CorfuReplicationManager> corfu_replication_manager_;
 		std::unique_ptr<Scalog::ScalogReplicationManager> scalog_replication_manager_;
+		std::unique_ptr<Embarcadero::ChainReplicationManager> chain_replication_manager_;
 
 		std::atomic<int> offset_{0};
 		bool stop_threads_ = false;

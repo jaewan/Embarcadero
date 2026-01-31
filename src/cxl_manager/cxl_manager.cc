@@ -169,7 +169,15 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 			return;
 		}
 
-		// Initialize CXL memory regions
+			// [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0 (128 bytes)
+		// [[CXL_MEMORY_LAYOUT_v2]] PBR/BatchHeaders/TInode/Bitmap/Segments start AFTER Phase 2 metadata
+		// Layout: 0x0 ControlBlock | 0x1000 CompletionVector | 0x2000 GOI (16GB) | 0x4_0000_2000 PBR...
+		static constexpr size_t kPhase2MetadataEnd = 0x4'0000'2000ULL;  // 16 GB + 8 KB, end of GOI (docs/CXL_MEMORY_LAYOUT_v2.md)
+		control_block_ = reinterpret_cast<ControlBlock*>(cxl_addr_);
+		base_for_regions_ = reinterpret_cast<uint8_t*>(cxl_addr_) + kPhase2MetadataEnd;
+		uint8_t* base_for_regions = reinterpret_cast<uint8_t*>(base_for_regions_);
+
+		// Initialize CXL memory regions (TInode, Bitmap, BatchHeaders, Segments after Phase 2 region)
 		size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
 		size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
 		TINode_Region_size += padding;
@@ -185,20 +193,70 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		// See docs/memory-bank/spec_deviation.md DEV-005
 		
 		// Calculate total segment region size (shared pool for all brokers)
-		// Note: Bmeta region removed - TInode.offset_entry is used instead
-		size_t Segment_Region_size = (cxl_size_ - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size);
+		// Usable size = after Phase 2 metadata (ControlBlock + CV + GOI)
+		if (cxl_size_ < kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size) {
+			LOG(ERROR) << "CXL size " << cxl_size_ << " too small for layout v2: need at least "
+			           << (kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size)
+			           << " (Phase2 metadata + TInode + Bitmap + BatchHeaders)";
+			return;
+		}
+		size_t Segment_Region_size = (cxl_size_ - kPhase2MetadataEnd - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size);
 		padding = Segment_Region_size % cacheline_size;
 		Segment_Region_size -= padding;
 
-		bitmap_ = (uint8_t*)cxl_addr_ + TINode_Region_size;
-		batchHeaders_ = (uint8_t*)bitmap_ + Bitmap_Region_size;
+		bitmap_ = base_for_regions + TINode_Region_size;
+		batchHeaders_ = reinterpret_cast<uint8_t*>(bitmap_) + Bitmap_Region_size;
 		
 		// [[DEVIATION_004]] - Bmeta region removed, segments start after BatchHeaders
 		// Shared segment pool: All brokers allocate from the same region
 		// Bitmap coordinates allocation to prevent fragmentation
-		segments_ = (uint8_t*)batchHeaders_ + BatchHeaders_Region_size;
-		batchHeaders_ = (uint8_t*)batchHeaders_ + (broker_id_ * (BATCHHEADERS_SIZE * MAX_TOPIC_SIZE));
-		
+		segments_ = reinterpret_cast<uint8_t*>(batchHeaders_) + BatchHeaders_Region_size;
+		batchHeaders_ = reinterpret_cast<uint8_t*>(batchHeaders_) + (broker_id_ * (BATCHHEADERS_SIZE * MAX_TOPIC_SIZE));
+
+		// [[PHASE_1A_EPOCH_FENCING]] Head broker initializes ControlBlock (epoch-based fencing)
+		if (broker_id_ == 0) {
+			control_block_->epoch.store(1, std::memory_order_release);
+			CXL::flush_cacheline(control_block_);
+			CXL::store_fence();
+			LOG(INFO) << "CXLManager: ControlBlock initialized (epoch=1) for zombie fencing";
+		}
+
+		// [[PHASE_2_GOI_CV_ALLOCATION]] Allocate GOI and CompletionVector in CXL memory
+		// Memory layout per docs/CXL_MEMORY_LAYOUT_v2.md:
+		//   0x0000_0000: ControlBlock (128 B)
+		//   0x0000_1000: CompletionVector (4 KB)
+		//   0x0000_2000: GOI (16 GB)
+		static constexpr size_t kCompletionVectorOffset = 0x1000;  // 4 KB from base
+		static constexpr size_t kGOIOffset = 0x2000;               // 8 KB from base
+		static constexpr size_t kMaxGOIEntries = 256ULL * 1024 * 1024;  // 256M entries
+
+		completion_vector_ = reinterpret_cast<CompletionVectorEntry*>(
+			reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
+
+		goi_ = reinterpret_cast<GOIEntry*>(
+			reinterpret_cast<uint8_t*>(cxl_addr_) + kGOIOffset);
+
+		// Head broker initializes CompletionVector (GOI can be lazy-initialized - zeros are valid)
+		if (broker_id_ == 0) {
+			// Sentinel (uint64_t)-1 = no progress; 0 = first batch completed (so GetOffsetToAck can distinguish)
+			constexpr uint64_t kCVNoProgress = static_cast<uint64_t>(-1);
+			for (int i = 0; i < NUM_MAX_BROKERS; i++) {
+				completion_vector_[i].completed_pbr_head.store(kCVNoProgress, std::memory_order_release);
+			}
+
+			// Flush CV to CXL (4 KB = 64 cache lines, flush in batches)
+			for (int i = 0; i < NUM_MAX_BROKERS; i += 2) {  // 2 entries per 128-byte cacheline
+				CXL::flush_cacheline(&completion_vector_[i]);
+			}
+			CXL::store_fence();
+
+			LOG(INFO) << "CXLManager: Phase 2 initialized - CompletionVector (4 KB) and GOI (16 GB) allocated";
+			LOG(INFO) << "  - CompletionVector at offset 0x" << std::hex << kCompletionVectorOffset
+			          << " (" << NUM_MAX_BROKERS << " brokers × 128 bytes)";
+			LOG(INFO) << "  - GOI at offset 0x" << std::hex << kGOIOffset
+			          << " (" << std::dec << kMaxGOIEntries << " entries × 64 bytes = 16 GB)";
+		}
+
 		// Initialize bitmap to zero (broker 0 only, to avoid race conditions)
 		if (broker_id_ == 0) {
 			// Calculate bitmap size needed for segment allocation
@@ -267,7 +325,7 @@ TInode* CXLManager::GetTInode(const char* topic){
 	//static const std::hash<std::string> topic_to_idx;
 	//int TInode_idx = topic_to_idx(topic) % MAX_TOPIC_SIZE;
 	int TInode_idx = hashTopic(topic);
-	return (TInode*)((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
+	return (TInode*)((uint8_t*)base_for_regions_ + (TInode_idx * sizeof(struct TInode)));
 }
 
 TInode* CXLManager::GetReplicaTInode(const char* topic){
@@ -275,7 +333,7 @@ TInode* CXLManager::GetReplicaTInode(const char* topic){
 	memcpy(replica_topic, topic, TOPIC_NAME_SIZE);
 	memcpy((uint8_t*)replica_topic + (TOPIC_NAME_SIZE-7), "replica", 7); 
 	int TInode_idx = hashTopic(replica_topic);
-	return (TInode*)((uint8_t*)cxl_addr_ + (TInode_idx * sizeof(struct TInode)));
+	return (TInode*)((uint8_t*)base_for_regions_ + (TInode_idx * sizeof(struct TInode)));
 }
 
 /**
@@ -317,9 +375,8 @@ void* CXLManager::GetNewSegment(){
 		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
 		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
 		
-		// [[DEVIATION_004]] - Bmeta region removed, TInode.offset_entry used instead
-		// Calculate shared segment pool size
-		size_t Segment_Region_size = (cxl_size - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size);
+		// [[DEVIATION_004]] - Bmeta region removed; [[PHASE_1A]] subtract ControlBlock
+		size_t Segment_Region_size = (cxl_size - sizeof(ControlBlock) - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size);
 		padding = Segment_Region_size % cacheline_size;
 		Segment_Region_size -= padding;
 		

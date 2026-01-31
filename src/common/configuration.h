@@ -98,6 +98,13 @@ struct EmbarcaderoConfig {
         ConfigValue<int> num_publish_receive_threads{8, "EMBARCADERO_NUM_PUBLISH_RECEIVE_THREADS"};
         // Increased from 2 to 4 workers to match receive threads
         ConfigValue<int> num_cxl_allocation_workers{4, "EMBARCADERO_NUM_CXL_ALLOCATION_WORKERS"};
+
+        // Zero-copy receive path: recv() directly into CXL (no staging copy). Default false until migration validated.
+        // When true with use_nonblocking: PublishReceiveThread reserves CXL, recvs payload into CXL, marks complete in same thread.
+        ConfigValue<bool> recv_direct_to_cxl{false, "EMBARCADERO_RECV_DIRECT_TO_CXL"};
+        // PBR (batch header ring) backpressure: stop reading from TCP when utilization above high, resume when below low.
+        ConfigValue<int> pbr_high_watermark_pct{80, "EMBARCADERO_PBR_HIGH_WATERMARK_PCT"};
+        ConfigValue<int> pbr_low_watermark_pct{50, "EMBARCADERO_PBR_LOW_WATERMARK_PCT"};
     } network;
 
     // Corfu configuration
@@ -119,6 +126,19 @@ struct EmbarcaderoConfig {
         ConfigValue<bool> is_intel{false, "EMBARCADERO_PLATFORM_INTEL"};
         ConfigValue<bool> is_amd{false, "EMBARCADERO_PLATFORM_AMD"};
     } platform;
+
+    // Cluster configuration (sequencer-only head node architecture)
+    // See docs/memory-bank/SEQUENCER_ONLY_HEAD_NODE_DESIGN.md
+    struct Cluster {
+        // When true, this node runs only the sequencer (no data ingestion)
+        // The head broker (broker_id=0) skips allocating its own batch header ring
+        ConfigValue<bool> is_sequencer_node{false, "EMBARCADERO_IS_SEQUENCER_NODE"};
+        // Which broker ID runs the sequencer (typically 0)
+        ConfigValue<int> sequencer_broker_id{0, "EMBARCADERO_SEQUENCER_BROKER_ID"};
+        // Which broker IDs accept client writes (data brokers)
+        // Default: [1, 2, 3] when is_sequencer_node=true; empty otherwise
+        std::vector<int> data_broker_ids;
+    } cluster;
 
     // Client configuration
     struct Client {
@@ -173,6 +193,21 @@ public:
     size_t getBatchSize() const { return config_.storage.batch_size.get(); }
     int getMaxTopics() const { return config_.storage.max_topics.get(); }
     int getNetworkIOThreads() const { return config_.network.io_threads.get(); }
+
+    // Cluster configuration helpers
+    bool isSequencerNode() const { return config_.cluster.is_sequencer_node.get(); }
+    int getSequencerBrokerId() const { return config_.cluster.sequencer_broker_id.get(); }
+    // Returns data_broker_ids; if empty and is_sequencer_node, returns default [1,2,3]
+    std::vector<int> getDataBrokerIds() const {
+        if (!config_.cluster.data_broker_ids.empty()) {
+            return config_.cluster.data_broker_ids;
+        }
+        // Default for sequencer-only node: brokers 1, 2, 3 are data brokers
+        if (config_.cluster.is_sequencer_node.get()) {
+            return {1, 2, 3};
+        }
+        return {};
+    }
 
     // Validation
     bool validate() const;

@@ -350,6 +350,40 @@ inline void load_fence() {
 }
 
 /**
+ * @brief Full memory fence - orders all memory operations
+ *
+ * @threading Thread-safe (CPU instruction)
+ * @ownership No ownership semantics
+ * @paper_ref Paper §2.B - Non-coherent CXL requires strong ordering
+ *
+ * Guarantees:
+ * - All prior loads AND stores complete before subsequent operations
+ * - Required after CLFLUSHOPT to ensure cache invalidation completes before reads
+ * - CLFLUSHOPT is weakly ordered; LFENCE only orders loads, not CLFLUSHOPT
+ *
+ * Use case (non-coherent CXL reads):
+ *   flush_cacheline(addr);  // Invalidate local cache
+ *   full_fence();           // Wait for invalidation to complete
+ *   value = *addr;          // Now read gets fresh data from CXL
+ *
+ * Implementation:
+ * - x86-64: _mm_mfence() (MFENCE instruction)
+ * - ARM64: dmb sy (full data memory barrier)
+ * - Generic: __atomic_thread_fence(__ATOMIC_SEQ_CST)
+ *
+ * Performance: POLLING PATH - More expensive than load_fence, use only when needed
+ */
+inline void full_fence() {
+#ifdef __x86_64__
+    _mm_mfence();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("dmb sy" ::: "memory");
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+/**
  * @brief Cache prefetch hint - prefetch data into cache
  *
  * @threading Thread-safe (CPU instruction)

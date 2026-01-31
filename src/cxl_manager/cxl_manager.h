@@ -36,6 +36,12 @@ class CXLManager{
 		TInode* GetTInode(const char* topic);
 		TInode* GetReplicaTInode(const char* topic);
 		void* GetCXLAddr(){return cxl_addr_;}
+
+		// [[PHASE_2]] Accessors for GOI and CompletionVector
+		GOIEntry* GetGOI() { return goi_; }
+		CompletionVectorEntry* GetCompletionVector() { return completion_vector_; }
+		ControlBlock* GetControlBlock() { return control_block_; }
+
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
 		}
@@ -79,6 +85,10 @@ class CXLManager{
 		NetworkManager *network_manager_;
 
 		void* cxl_addr_;
+		ControlBlock* control_block_;                 // [[PHASE_1A]] At offset 0; epoch-based fencing
+		CompletionVectorEntry* completion_vector_;    // [[PHASE_2]] At offset 0x1000; ACK path (32 × 128B)
+		GOIEntry* goi_;                               // [[PHASE_2]] At offset 0x2000; 256M entries × 64B = 16GB
+		void* base_for_regions_;                      // [[PHASE_1A]] cxl_addr_ + sizeof(ControlBlock); TInode/bitmap/batchHeaders/segments base
 		void* bitmap_;
 		void* batchHeaders_;
 		void* segments_;

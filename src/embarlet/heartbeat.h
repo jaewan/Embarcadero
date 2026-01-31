@@ -59,7 +59,8 @@ namespace heartbeat_system {
 
 class HeartBeatServiceImpl final : public HeartBeat::Service {
 	public:
-		HeartBeatServiceImpl(std::string head_addr);
+		// [[SEQUENCER_ONLY_HEAD_NODE]] Added is_sequencer_node parameter
+		HeartBeatServiceImpl(std::string head_addr, bool is_sequencer_node = false);
 		~HeartBeatServiceImpl();
 
 		Status RegisterNode(ServerContext* context, const NodeInfo* request,
@@ -98,6 +99,8 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			std::string address;
 			std::string network_mgr_addr;
 			std::chrono::steady_clock::time_point last_heartbeat;
+			// [[SEQUENCER_ONLY_HEAD_NODE]] False for sequencer-only node, true for data brokers
+			bool accepts_publishes;
 		};
 
 		void CheckHeartbeats();
@@ -115,6 +118,8 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 		absl::Mutex cluster_mutex_;
 		uint64_t cluster_version_{0} ABSL_GUARDED_BY(cluster_mutex_);  // Incremented when cluster changes
 		Embarcadero::CreateTopicEntryCallback create_topic_entry_callback_;
+		// [[SEQUENCER_ONLY_HEAD_NODE]] True when this head node is sequencer-only (no data path)
+		bool is_sequencer_node_{false};
 };
 
 class FollowerNodeClient {
@@ -158,6 +163,8 @@ class FollowerNodeClient {
 			int broker_id;
 			std::string address;
 			std::string network_mgr_addr;
+			// [[SEQUENCER_ONLY_HEAD_NODE]] False for sequencer-only node, true for data brokers
+			bool accepts_publishes;
 		};
 
 		std::unique_ptr<HeartBeat::Stub> stub_;
@@ -176,7 +183,8 @@ class FollowerNodeClient {
 
 class HeartBeatManager {
 	public:
-		HeartBeatManager(bool is_head_node, std::string head_address);
+		// [[SEQUENCER_ONLY_HEAD_NODE]] Added is_sequencer_node parameter
+		HeartBeatManager(bool is_head_node, std::string head_address, bool is_sequencer_node = false);
 		void Wait();
 		int GetBrokerId();
 		int GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,

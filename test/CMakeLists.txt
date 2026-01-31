@@ -70,6 +70,58 @@ if(PkgConfig_FOUND)
             TIMEOUT 60
             LABELS "unit;blog_header;validation"
         )
+
+        # Phase 2 Integration Test
+        add_executable(phase2_integration_test
+            phase2_integration_test.cc
+        )
+        target_include_directories(phase2_integration_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(phase2_integration_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(phase2_integration_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            absl::flat_hash_map
+            heartbeat_grpc_proto
+            protobuf::libprotobuf
+            pthread
+        )
+
+        add_test(NAME unit_phase2_integration COMMAND phase2_integration_test)
+        set_tests_properties(unit_phase2_integration PROPERTIES
+            TIMEOUT 120
+            LABELS "unit;phase2;integration;production"
+        )
+
+        # Phase 3 Recovery Integration Test
+        add_executable(phase3_recovery_test
+            phase3_recovery_test.cc
+        )
+        target_include_directories(phase3_recovery_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(phase3_recovery_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(phase3_recovery_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            absl::flat_hash_map
+            heartbeat_grpc_proto
+            protobuf::libprotobuf
+            pthread
+        )
+
+        add_test(NAME unit_phase3_recovery COMMAND phase3_recovery_test)
+        set_tests_properties(unit_phase3_recovery PROPERTIES
+            TIMEOUT 180
+            LABELS "unit;phase3;recovery;integration;production"
+        )
     else()
         message(WARNING "GTest not found via pkg-config, unit tests disabled")
     endif()

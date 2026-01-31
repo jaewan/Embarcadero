@@ -192,34 +192,51 @@ class Subscriber {
 
 		void WaitUntilAllConnected(){
 			size_t num_connections = 0;
-			// Use runtime-configured broker count to avoid hanging when fewer than NUM_MAX_BROKERS are used
-			size_t expected = NUM_MAX_BROKERS_CONFIG * NUM_SUB_CONNECTIONS;
-			LOG(INFO) << "Waiting for " << expected << " connections (brokers=" << NUM_MAX_BROKERS_CONFIG 
-				<< ", sub_connections=" << NUM_SUB_CONNECTIONS << ")";
-			
+			// [[SEQUENCER_ONLY_HEAD_NODE]] Dynamically recalculate expected connections as cluster info arrives
+			// This correctly handles sequencer-only head nodes that don't accept subscriptions
+			size_t last_expected = 0;
+			LOG(INFO) << "Waiting for connections (brokers=" << NUM_MAX_BROKERS_CONFIG
+				<< ", sub_connections=" << NUM_SUB_CONNECTIONS << ", data_brokers=pending)";
+
 			auto start_time = std::chrono::steady_clock::now();
-			while (num_connections < expected) {
+			while (true) {
+				// Get current connection count
 				{
 					absl::ReaderMutexLock map_lock(&connection_map_mutex_);
 					num_connections = connections_.size();
 				}
-				if(num_connections < expected){
-					auto now = std::chrono::steady_clock::now();
-					auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
-					if (elapsed.count() > 30) { // 30 second timeout
-						LOG(WARNING) << "Timeout waiting for connections. Got " << num_connections 
-							<< "/" << expected << " after " << elapsed.count() << " seconds";
-						break;
-					}
-					if (elapsed.count() % 5 == 0 && elapsed.count() > 0) {
-						LOG(INFO) << "Still waiting for connections: " << num_connections << "/" << expected;
-					}
-					std::this_thread::sleep_for(std::chrono::milliseconds(100));
-				}else{
+
+				// Dynamically compute expected based on data broker count (updated by SubscribeToCluster)
+				size_t broker_count = data_broker_count_.load();
+				if (broker_count == 0) {
+					broker_count = NUM_MAX_BROKERS_CONFIG; // Fall back to config if not yet known
+				}
+				size_t expected = broker_count * NUM_SUB_CONNECTIONS;
+
+				// Log when expected changes (data broker info received)
+				if (expected != last_expected) {
+					LOG(INFO) << "Expected connections updated: " << expected
+						<< " (data_brokers=" << broker_count << ")";
+					last_expected = expected;
+				}
+
+				if (num_connections >= expected) {
 					break;
 				}
+
+				auto now = std::chrono::steady_clock::now();
+				auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
+				if (elapsed.count() > 30) { // 30 second timeout
+					LOG(WARNING) << "Timeout waiting for connections. Got " << num_connections
+						<< "/" << expected << " after " << elapsed.count() << " seconds";
+					break;
+				}
+				if (elapsed.count() % 5 == 0 && elapsed.count() > 0) {
+					LOG(INFO) << "Still waiting for connections: " << num_connections << "/" << expected;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			}
-			LOG(INFO) << "Connection wait complete: " << num_connections << "/" << expected;
+			LOG(INFO) << "Connection wait complete: " << num_connections << " connections";
 		}
 
 	private:
@@ -232,6 +249,8 @@ class Subscriber {
 		char topic_[TOPIC_NAME_SIZE];
 		std::atomic<bool> shutdown_{false};
 		std::atomic<bool> connected_{false}; // Maybe more granular connection state needed
+		// [[SEQUENCER_ONLY_HEAD_NODE]] Track actual data broker count (excludes sequencer-only nodes)
+		std::atomic<size_t> data_broker_count_{0};
 
 		// --- Latency / Debug ---
 		bool measure_latency_;

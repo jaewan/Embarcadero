@@ -55,6 +55,12 @@ embarcadero:
     num_publish_receive_threads: 8   # Epoll threads for socket draining (1 per 2 publishers)
     num_cxl_allocation_workers: 4    # Async CXL allocation workers (match receive threads)
 
+    # Zero-copy receive path (migration): recv() directly into CXL, no staging copy. Default false until validated.
+    # recv_direct_to_cxl: false
+    # PBR backpressure: stop reading TCP when ring above high %, resume when below low %.
+    # pbr_high_watermark_pct: 80
+    # pbr_low_watermark_pct: 50
+
   # Corfu sequencer configuration
   corfu:
     sequencer_port: 50052        # Corfu sequencer port

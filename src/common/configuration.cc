@@ -128,6 +128,9 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (network["staging_pool_num_buffers"]) config_.network.staging_pool_num_buffers.set(network["staging_pool_num_buffers"].as<int>());
                 if (network["num_publish_receive_threads"]) config_.network.num_publish_receive_threads.set(network["num_publish_receive_threads"].as<int>());
                 if (network["num_cxl_allocation_workers"]) config_.network.num_cxl_allocation_workers.set(network["num_cxl_allocation_workers"].as<int>());
+                if (network["recv_direct_to_cxl"]) config_.network.recv_direct_to_cxl.set(network["recv_direct_to_cxl"].as<bool>());
+                if (network["pbr_high_watermark_pct"]) config_.network.pbr_high_watermark_pct.set(network["pbr_high_watermark_pct"].as<int>());
+                if (network["pbr_low_watermark_pct"]) config_.network.pbr_low_watermark_pct.set(network["pbr_low_watermark_pct"].as<int>());
             }
             
             // Corfu
@@ -152,7 +155,20 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (platform["is_intel"]) config_.platform.is_intel.set(platform["is_intel"].as<bool>());
                 if (platform["is_amd"]) config_.platform.is_amd.set(platform["is_amd"].as<bool>());
             }
-            
+
+            // Cluster (sequencer-only head node architecture)
+            if (root["cluster"]) {
+                auto cluster = root["cluster"];
+                if (cluster["is_sequencer_node"]) config_.cluster.is_sequencer_node.set(cluster["is_sequencer_node"].as<bool>());
+                if (cluster["sequencer_broker_id"]) config_.cluster.sequencer_broker_id.set(cluster["sequencer_broker_id"].as<int>());
+                if (cluster["data_broker_ids"]) {
+                    config_.cluster.data_broker_ids.clear();
+                    for (const auto& id : cluster["data_broker_ids"]) {
+                        config_.cluster.data_broker_ids.push_back(id.as<int>());
+                    }
+                }
+            }
+
             // Client
             if (root["client"]) {
                 auto client = root["client"];

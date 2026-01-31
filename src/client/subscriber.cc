@@ -869,12 +869,8 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 }
 
 void Subscriber::SubscribeToClusterStatus() {
-	std::string initial_head_addr;
-	{
-		absl::MutexLock lock(&node_mutex_);
-		initial_head_addr = nodes_[0];
-	}
-	ManageBrokerConnections(0, initial_head_addr); // Start connections for head broker
+	// [[SEQUENCER_ONLY_HEAD_NODE]] Don't immediately connect to broker 0 - wait for cluster info
+	// to determine which brokers accept subscriptions (same as publishers)
 
 	while (!shutdown_) {
 		heartbeat_system::ClientInfo client_info;
@@ -910,22 +906,56 @@ void Subscriber::SubscribeToClusterStatus() {
 
 			// Process status if read succeeds
 			connected_ = true;
-			const auto& new_nodes_proto = cluster_status.new_nodes();
-			if (!new_nodes_proto.empty()) {
+
+			// [[SEQUENCER_ONLY_HEAD_NODE]] Use broker_info if available (includes accepts_publishes)
+			// Skip sequencer-only nodes that don't accept subscriptions
+			if (cluster_status.broker_info_size() > 0) {
 				std::vector<std::pair<int, std::string>> brokers_to_add;
+				size_t data_brokers = 0;  // Count data brokers for WaitUntilAllConnected
 				{ // Lock scope
 					absl::MutexLock lock(&node_mutex_);
-					for (const auto& addr : new_nodes_proto) {
-						int broker_id = GetBrokerId(addr);
+					for (const auto& bi : cluster_status.broker_info()) {
+						int broker_id = bi.broker_id();
+						std::string addr = bi.network_mgr_addr();
+						// Skip sequencer-only nodes (accepts_publishes=false also means no data to subscribe)
+						if (!bi.accepts_publishes()) {
+							LOG(INFO) << "SubscribeToCluster: Skipping broker " << broker_id
+							          << " (sequencer-only, no data)";
+							continue;
+						}
+						data_brokers++;
 						if (nodes_.find(broker_id) == nodes_.end()) {
 							nodes_[broker_id] = addr;
 							brokers_to_add.push_back({broker_id, addr});
+							LOG(INFO) << "SubscribeToCluster: Added data broker " << broker_id;
 						}
 					}
 				} // Lock released
+				// Update data broker count for WaitUntilAllConnected
+				data_broker_count_.store(data_brokers);
 				for(const auto& pair : brokers_to_add) {
 					std::thread manager_thread(&Subscriber::ManageBrokerConnections, this, pair.first, pair.second);
 					manager_thread.detach();
+				}
+			} else {
+				// Fallback to legacy new_nodes API (no filtering)
+				const auto& new_nodes_proto = cluster_status.new_nodes();
+				if (!new_nodes_proto.empty()) {
+					std::vector<std::pair<int, std::string>> brokers_to_add;
+					{ // Lock scope
+						absl::MutexLock lock(&node_mutex_);
+						for (const auto& addr : new_nodes_proto) {
+							int broker_id = GetBrokerId(addr);
+							if (nodes_.find(broker_id) == nodes_.end()) {
+								nodes_[broker_id] = addr;
+								brokers_to_add.push_back({broker_id, addr});
+							}
+						}
+					} // Lock released
+					for(const auto& pair : brokers_to_add) {
+						std::thread manager_thread(&Subscriber::ManageBrokerConnections, this, pair.first, pair.second);
+						manager_thread.detach();
+					}
 				}
 			} // End processing status
 		} // End inner loop

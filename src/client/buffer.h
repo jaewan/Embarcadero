@@ -88,6 +88,11 @@ public:
      */
     void WarmupBuffers();
 
+    /**
+     * Diagnostic: Dump per-buffer write statistics for debugging uneven distribution
+     */
+    void DumpBufferStats();
+
 private:
     /**
      * Buffer structure with cache line alignment

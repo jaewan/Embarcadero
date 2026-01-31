@@ -79,6 +79,7 @@
 #include "../cxl_manager/cxl_datastructure.h"
 #include <thread>
 #include <chrono>
+#include <iomanip>
 
 Buffer::Buffer(size_t num_buf, size_t num_threads_per_broker, int client_id, size_t message_size, int order) 
 	: bufs_(num_buf), 
@@ -197,9 +198,12 @@ bool Buffer::AddBuffers(size_t buf_size) {
 }
 
 void Buffer::AdvanceWriteBufId() {
+	// [[DEFENSIVE]] Avoid modulo-by-zero if Write/Seal runs before any AddBuffers (should not happen after Init() wait)
+	size_t n = num_buf_.load(std::memory_order_relaxed);
+	if (n == 0) return;
 	// FIXED: Simple round-robin across all buffers to ensure even distribution
-	write_buf_id_ = (write_buf_id_ + 1) % num_buf_;
-	
+	write_buf_id_ = (write_buf_id_ + 1) % n;
+
 	// Calculate broker and thread from buffer ID
 	i_ = write_buf_id_ / num_threads_per_broker_;  // broker ID
 	j_ = write_buf_id_ % num_threads_per_broker_;  // thread ID within broker
@@ -436,6 +440,11 @@ void Buffer::SealAll() {
 	size_t sealed_buffers = 0;
 	size_t sealed_messages = 0;
 	size_t sealed_bytes = 0;
+
+	// [[FIX: B3=0 ACKs]] Track per-buffer statistics to diagnose uneven distribution
+	std::vector<size_t> per_buffer_msgs(total_bufs, 0);
+	std::vector<size_t> per_buffer_bytes(total_bufs, 0);
+
 	for (size_t idx = 0; idx < total_bufs; ++idx) {
 		size_t head = bufs_[idx].prod.writer_head.load(std::memory_order_relaxed);
 		size_t tail = bufs_[idx].prod.tail.load(std::memory_order_relaxed);
@@ -452,17 +461,40 @@ void Buffer::SealAll() {
 			sealed_buffers++;
 			sealed_messages += batch_header->num_msg;
 			sealed_bytes += batch_header->total_size;
+			per_buffer_msgs[idx] = batch_header->num_msg;
+			per_buffer_bytes[idx] = batch_header->total_size;
 
 			// Reset buffer state for next batch
 			bufs_[idx].prod.num_msg.store(0, std::memory_order_relaxed);
 			bufs_[idx].prod.writer_head.store(tail, std::memory_order_relaxed);
 			bufs_[idx].prod.tail.fetch_add(sizeof(Embarcadero::BatchHeader), std::memory_order_relaxed);
 		}
+		// Also count already-written data (from tail position)
+		per_buffer_bytes[idx] += tail;
 	}
 	if (sealed_buffers > 0) {
 		LOG(INFO) << "Buffer::SealAll sealed_buffers=" << sealed_buffers
 		          << " sealed_messages=" << sealed_messages
 		          << " sealed_bytes=" << sealed_bytes;
+	}
+
+	// [[FIX: B3=0 ACKs]] Log per-broker buffer statistics (4 buffers per broker)
+	if (total_bufs >= 4) {
+		std::string per_broker_stats;
+		for (size_t broker = 0; broker < total_bufs / num_threads_per_broker_; broker++) {
+			size_t broker_msgs = 0;
+			size_t broker_bytes = 0;
+			for (size_t t = 0; t < num_threads_per_broker_; t++) {
+				size_t buf_idx = broker * num_threads_per_broker_ + t;
+				if (buf_idx < total_bufs) {
+					broker_msgs += per_buffer_msgs[buf_idx];
+					broker_bytes += per_buffer_bytes[buf_idx];
+				}
+			}
+			if (!per_broker_stats.empty()) per_broker_stats += " ";
+			per_broker_stats += "B" + std::to_string(broker) + "=" + std::to_string(broker_msgs) + "msgs";
+		}
+		LOG(INFO) << "Buffer::SealAll per-broker distribution (sealed only): " << per_broker_stats;
 	}
 }
 
@@ -635,6 +667,36 @@ void* Buffer::Read(int bufIdx, size_t& len) {
 
 void Buffer::ReturnReads() {
 	shutdown_ = true;
+}
+
+void Buffer::DumpBufferStats() {
+	const size_t total_bufs = num_buf_.load(std::memory_order_relaxed);
+	LOG(INFO) << "=== Buffer Statistics Dump ===";
+	LOG(INFO) << "Total buffers: " << total_bufs << ", threads_per_broker: " << num_threads_per_broker_;
+
+	size_t total_bytes_written = 0;
+	std::vector<size_t> per_broker_bytes(NUM_MAX_BROKERS, 0);
+
+	for (size_t idx = 0; idx < total_bufs; ++idx) {
+		size_t tail = bufs_[idx].prod.tail.load(std::memory_order_relaxed);
+		size_t broker_id = idx / num_threads_per_broker_;
+
+		// tail includes all data written to this buffer
+		per_broker_bytes[broker_id] += tail;
+		total_bytes_written += tail;
+
+		LOG(INFO) << "  Buffer[" << idx << "] (Broker " << broker_id << "): tail=" << tail
+		         << " bytes (" << (tail / 1024) << " KB)";
+	}
+
+	LOG(INFO) << "--- Per-Broker Summary ---";
+	for (size_t broker = 0; broker < total_bufs / num_threads_per_broker_; broker++) {
+		double pct = total_bytes_written > 0 ? (100.0 * per_broker_bytes[broker] / total_bytes_written) : 0;
+		LOG(INFO) << "  Broker " << broker << ": " << per_broker_bytes[broker] << " bytes ("
+		         << (per_broker_bytes[broker] / (1024*1024)) << " MB, " << std::fixed << std::setprecision(1) << pct << "%)";
+	}
+	LOG(INFO) << "  Total: " << total_bytes_written << " bytes (" << (total_bytes_written / (1024*1024)) << " MB)";
+	LOG(INFO) << "=== End Buffer Statistics ===";
 }
 
 void Buffer::WriteFinished() {

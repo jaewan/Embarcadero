@@ -88,8 +88,75 @@ When the ring is full, the producer (GetCXLBuffer) spins (invalidate, read `cons
 
 ---
 
-## 7. References
+## 7. Gap and min-contiguous (2026-01)
+
+**Problem:** The sequencer drains an epoch buffer that can have **gaps**: the scanner only pushes when `batch_complete=1`, so if slot 701 had `batch_complete=0` when we passed, the buffer may contain 700 and 702 but not 701. If we set `batch_headers_consumed_through = max(slot_offset + sizeof(BatchHeader))` across the epoch, we would advance past 702 and allow the producer to overwrite slot 701 (never processed) → batch loss and ACK stall.
+
+**Fix:** Use **min-contiguous** per broker. For each broker, initialise from the current CXL `batch_headers_consumed_through`; then when processing batches (already sorted by `(broker_id, slot_offset)`), advance only when `p.slot_offset == next_expected`, else leave unchanged so the producer cannot overwrite the gap. Implemented in `src/embarlet/topic.cc` EpochSequencerThread (`[[CONSUMED_THROUGH_FIX]]`).
+
+**Sentinel handling:** Initial value in CXL is `BATCHHEADERS_SIZE` (“all slots free”, see topic_manager.cc). For min-contiguous, that must be treated as `0` (next expected = slot 0), otherwise `slot_offset` (0, 64, …) never equals `BATCHHEADERS_SIZE` and `consumed_through` would never advance → producer would always see “all slots free” and overwrite unconsumed batches. Code: when reading from CXL, if `initial == BATCHHEADERS_SIZE` then set `initial = 0` before use (`[[SENTINEL]]`).
+
+**Bounded spin:** Scanner can see `batch_complete=0` for in-flight slots (receiver not done yet). If we advance immediately we create gaps → min-contiguous holds `consumed_through` → producer hits ring full. So when `!batch_ready && num_msg > 0` (likely in-flight), we spin briefly (e.g. 50 × cpu_pause, ~200ns) and re-check; if `batch_complete==1` we retry at top of loop (full invalidation) and process. Reduces gaps so `consumed_through` advances smoothly (`[[BOUNDED_SPIN]]` in BrokerScannerWorker5).
+
+---
+
+## 8. References
 
 - `src/cxl_manager/cxl_datastructure.h` — offset_entry layout
 - `src/embarlet/topic.cc` — EmbarcaderoGetCXLBuffer, BrokerScannerWorker5
 - `docs/memory-bank/BANDWIDTH_10GB_ASSESSMENT.md` — ring wrap issue and 1MB mitigation
+- §7 above — gap / min-contiguous semantics
+
+---
+
+## 9. B0 Local-Ring Cache Coherency (2026-01)
+
+**Problem:** §1 assumes writer (broker B) and reader (head’s BrokerScannerWorker5) are on **different** CPUs. For **B0’s ring only**, the writer (B0’s NetworkManager or CXLAllocationWorker) and the reader (B0’s BrokerScannerWorker5 for broker 0) run in the **same process** on the head broker. That creates a local cache-aliasing / visibility race: the scanner can read stale `num_msg` (and sometimes `batch_complete`) from the BatchHeader even after `CXL::flush_cacheline()` + `CXL::load_fence()` on the reader side.
+
+**Dev setup note:** In a single-server dev setup, each “broker” may be a separate process on the same machine; those processes are typically **cache coherent** to each other (same machine). The design still treats brokers as non-coherent (flush/invalidate) so it is correct for a future multi-node deployment. The B0 issue is **same-process** writer/reader for B0’s ring (one process runs both B0’s writer and all four scanners), so B0’s ring has tighter coupling than “different process on same machine.”
+
+**Evidence:** B0’s scanner reports ~1.88 msg/batch (e.g. 11,568 ordered / 6,161 batches) while B1/B2/B3 report ~700–1,355 msg/batch (expected ~1928). So B0’s scanner is effectively reading low or stale `num_msg` values; `ordered` is incremented by that value, so the deficit is in the read path, not in ordering logic.
+
+**Root cause (likely):** On the same node, the writer’s flush (clflushopt) and the scanner’s invalidate (same instruction) both target the same physical line. Visibility can still be wrong if (1) the writer’s flush is in flight when the scanner’s read is satisfied from a buffer that hasn’t applied the write yet, or (2) the scanner and writer share or alternate on the same core, so cache/ordering edges are tighter than for remote rings.
+
+**Fix attempts and side effects:**
+
+- **Extra invalidation for local ring only** (e.g. when `broker_id == 0`): B0 improved ~6× (e.g. 11K→69K ACKs) but **B3 regressed** (e.g. 254K→113K). Likely reason: **CPU contention**. All four BrokerScannerWorker5 threads run in the same process; adding extra flush+load_fence for B0’s scanner makes that thread heavier, so the scheduler gives less time to B1/B2/B3 scanners → B3’s progress drops. So the regression is indirect (resource contention), not a B3-specific bug.
+- **Two-stage read** (check `batch_complete` then re-invalidate then read `num_msg`): Broke the bounded-spin logic and led to 0 ACKs; reverted.
+- **Multi-cacheline flush** (e.g. flush both BatchHeader lines on every read): System hung or performed very poorly; reverted.
+
+**Architecture note:** BatchHeader is 64B-aligned; `num_msg` and `batch_complete` are in the first cache line (static_asserts in `cxl_datastructure.h`). The writer already flushes **both** cache lines of the BatchHeader when setting `batch_complete=1` (NetworkManager and CXLAllocationWorker). So the issue is not “BatchHeader spans multiple lines and we only flush one”; the issue is visibility on the **local** ring when reader and writer share the same process/CPU.
+
+**Recommended next steps (in order of preference):**
+
+1. **Thread pinning:** Pin B0’s BrokerScannerWorker5 (broker_id 0) to a different CPU core than the writer threads (NetworkManager / CXLAllocationWorker). This avoids same-core cache aliasing and doesn’t add read-side overhead for B1/B2/B3. No change to flush/invalidate logic.
+
+2. **Write-side ordering:** Ensure the writer’s view of the first cache line is committed before flush. After `__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE)`, add `CXL::store_fence()` **before** the first `flush_cacheline(batch_header_location)`, so all prior stores to that line (including the memcpy’d `num_msg`) are ordered before the flush. Then keep the existing double flush + store_fence after. This may help same-node visibility without touching the scanner.
+
+3. **Different sync for local vs remote:** Use a stronger read-side guarantee only when scanning the local ring (e.g. `broker_id == 0` on head): e.g. full seq_cst fence between invalidate and read, or a second invalidate+load_fence, but **combine with thread pinning** so the B0 scanner doesn’t starve B1/B2/B3 (e.g. pin B0 scanner to a dedicated core so extra work doesn’t steal CPU from other scanners).
+
+4. **Do not:** Rely on “extra invalidation for local ring” alone without pinning; it fixes B0 but regresses B3 due to contention. Do not add a second full cache-line flush on every scanner iteration for all brokers; that caused hang/poor performance.
+
+---
+
+### §9.1 Post-mortem: Why “thread pinning (core 0) + write-side store_fence” gave 0 ACKs
+
+When a fix yields **0 ACKs**, the pipeline is broken end-to-end (no batch is ever seen as ready, or the sequencer never runs, or deadlock). Likely causes for that specific combo:
+
+- **Pinning to core 0:** Core 0 often runs the OS / main thread. If B0’s scanner (or all four scanners) were pinned to core 0, then (a) the writer (NetworkManager / CXLAllocationWorker) may also be scheduled on core 0 → same-core contention and possible starvation of the writer, so `batch_complete=1` is never set or is delayed; or (b) EpochSequencerThread (which drains the epoch buffer) may run on core 0 → scanner and sequencer fight for one core → pipeline stalls. **Safer:** Pin only B0’s scanner to a **non-zero** core (e.g. 1 or 2, or the last core) that is **not** used by the writer or EpochSequencerThread. Do **not** pin all four scanners to the same core.
+
+- **Write-side store_fence:** Adding `CXL::store_fence()` **before** the first `flush_cacheline(batch_header_location)` is correct in principle (order all stores to the line before flush). If the fence was added **after** the flush, or in the wrong path (e.g. only in CXLAllocationWorker and not in NetworkManager receive path), then one writer path might not flush correctly and the scanner would never see `batch_complete=1` for that path. **Check:** store_fence must appear in **both** places that set `batch_complete=1` (NetworkManager and CXLAllocationWorker), and the sequence must be: store `batch_complete=1` → store_fence → flush line 1 → flush line 2 → store_fence.
+
+- **Interaction:** Pinning + fence together can hide a bug (e.g. fence in only one path); when reverted to baseline, always revert **both** so the baseline is unchanged before trying one change at a time.
+
+**Before trying pinning again:** (1) Confirm exactly which thread(s) were pinned and to which core(s). (2) Prefer pinning only the B0 scanner to a single **non-zero** core. (3) Try write-side store_fence **alone** (no pinning) first; if ACKs stay ~74%, the fence alone didn’t break the pipeline and the 0-ACK failure was likely pinning.
+
+---
+
+### §9.2 Conservative path (before more invasive fixes)
+
+1. **Diagnostic-only:** Add logging when B0’s scanner sees `batch_complete==1` and `num_msg < 100` (or `num_msg == 0`). No change to flush/fence or pinning. Run E2E and inspect logs to confirm B0 is reading low `num_msg` and how often. This validates the §9 hypothesis without touching the sync protocol.
+
+2. **One change at a time:** If trying fixes again: (a) add write-side store_fence only (both writer paths), run E2E; (b) if still ~74%, add pinning only for B0’s scanner to a **non-zero** core, run E2E; (c) never pin to core 0; never pin all scanners to one core.
+
+3. **Review failed implementations:** For each reverted fix, document: exact code change (file + line), which thread was pinned to which core, and order of operations (store vs fence vs flush). That makes it possible to see whether 0 ACKs came from pinning, from fence placement, or from an interaction.

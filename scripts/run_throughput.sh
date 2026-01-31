@@ -12,6 +12,9 @@ fi
 cd build/bin
 
 # Explicit config argument for binaries (relative to build/bin)
+# Head broker uses sequencer-only config (is_sequencer_node=true, accepts no publishes)
+# Follower brokers use standard config (data path only)
+HEAD_CONFIG_ARG="--config ../../config/embarcadero_sequencer_only.yaml"
 CONFIG_ARG="--config ../../config/embarcadero.yaml"
 
 # Cleanup any stale processes/ports from previous runs
@@ -191,6 +194,47 @@ wait_for_broker_ready() {
   return 1
 }
 
+# Wait for multiple brokers to signal readiness (for parallel follower startup)
+# Usage: wait_for_all_brokers_ready timeout pid1 pid2 pid3
+# Returns 0 when all have ready files, 1 on timeout or if any process dies
+wait_for_all_brokers_ready() {
+  local timeout=$1
+  shift
+  local pids=("$@")
+  local start_time=$(date +%s)
+  local elapsed=0
+  local n=${#pids[@]}
+
+  echo "Waiting for $n broker(s) to signal readiness (timeout: ${timeout}s, PIDs: ${pids[*]})..."
+
+  while [ $elapsed -lt $timeout ]; do
+    local all_ready=1
+    for expected_pid in "${pids[@]}"; do
+      local ready_file="/tmp/embarlet_${expected_pid}_ready"
+      if [ ! -f "$ready_file" ]; then
+        all_ready=0
+        # Check if process died
+        if ! kill -0 $expected_pid 2>/dev/null && [ $elapsed -ge 5 ]; then
+          echo "ERROR: Broker process $expected_pid died before signaling readiness"
+          return 1
+        fi
+      fi
+    done
+    if [ "$all_ready" = "1" ]; then
+      echo "All $n broker(s) ready after ${elapsed}s"
+      for expected_pid in "${pids[@]}"; do
+        rm -f "/tmp/embarlet_${expected_pid}_ready" 2>/dev/null || true
+      done
+      return 0
+    fi
+    sleep 0.1
+    elapsed=$(($(date +%s) - start_time))
+  done
+
+  echo "ERROR: Not all brokers signaled readiness in ${timeout}s (ready: $ready_count/$n)"
+  return 1
+}
+
 # Run experiments for each message size
 for test_case in "${test_cases[@]}"; do
 	for order in "${orders[@]}"; do
@@ -200,9 +244,10 @@ for test_case in "${test_cases[@]}"; do
 
 			# Start the processes
 			# [[FIX]]: Include trial number in log filename to prevent overwriting
-			$EMBARLET_NUMA_BIND ./embarlet $CONFIG_ARG --head --$sequencer > broker_0_trial${trial}.log 2>&1 &
+			# [[SEQUENCER_ONLY]]: Head broker uses sequencer-only config (no data path)
+			$EMBARLET_NUMA_BIND ./embarlet $HEAD_CONFIG_ARG --head --$sequencer > broker_0_trial${trial}.log 2>&1 &
 			shell_pid=$!
-			sleep 1
+			sleep 0.5
 				# Find actual embarlet PID (numactl execs into embarlet, so child is embarlet)
 				head_pid=$(pgrep -f "embarlet.*--head" 2>/dev/null | head -1)
 				if [ -z "$head_pid" ]; then
@@ -223,92 +268,49 @@ for test_case in "${test_cases[@]}"; do
 						kill $pid 2>/dev/null || true
 					done
 					pids=()
-					sleep 2
+					sleep 1
 					cleanup
 					continue
 				fi
 				
-				# Start follower brokers
-			# [[FIX]]: Track PIDs per broker to avoid non-deterministic pgrep results
-			for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-			  # [[FIX]]: Include trial number in log filename to prevent overwriting
-			  $EMBARLET_NUMA_BIND ./embarlet $CONFIG_ARG > broker_${i}_trial${trial}.log 2>&1 &
-			  broker_shell_pid=$!
-				  sleep 1
-			  
-			  # [[FIX]]: Find the specific embarlet PID that's a child of this broker_shell_pid
-			  # This ensures we get the correct PID for THIS broker, not just any broker
-			  broker_pid=""
-			  max_attempts=10
-			  attempt=0
-			  
-			  while [ -z "$broker_pid" ] && [ "${attempt:-0}" -lt "$max_attempts" ]; do
-				    # First try: direct child of shell_pid
-				    broker_pid=$(ps --ppid $broker_shell_pid -o pid=,comm= --no-headers 2>/dev/null | grep embarlet | awk '{print $1}' | head -1)
-				    
-				    # Second try: walk up process tree from all embarlet processes
-				    if [ -z "$broker_pid" ]; then
-				      all_embarlet_pids=$(pgrep -f "embarlet.*--config" 2>/dev/null | grep -v "embarlet.*--head")
-				      for pid in $all_embarlet_pids; do
-				        # Check if this pid is a descendant of broker_shell_pid
-				        current=$pid
-				        found=0
-				        for j in {1..5}; do
-				          parent=$(ps -o ppid= -p $current 2>/dev/null | tr -d ' ')
-				          if [ -z "$parent" ] || [ "$parent" = "1" ]; then
-				            break
-				          fi
-				          if [ "$parent" = "$broker_shell_pid" ]; then
-				            found=1
-				            break
-				          fi
-				          current=$parent
-				        done
-				        if [ "$found" = "1" ]; then
-				          broker_pid=$pid
-				          break
-				        fi
-				      done
-				    fi
-				    
-				    if [ -z "$broker_pid" ]; then
-				      sleep 0.2
-				      attempt=$((attempt + 1))
-				    fi
-				  done
-				  
-				  # Fallback: use shell_pid if we couldn't find embarlet
-				  [ -z "$broker_pid" ] && broker_pid=$broker_shell_pid
-				  
-				  # [[FIX]]: Verify this PID is not already in pids array (avoid duplicates)
-				  already_tracked=0
-				  for existing_pid in "${pids[@]}"; do
-				    if [ "$existing_pid" = "$broker_pid" ]; then
-				      already_tracked=1
-				      break
-				    fi
-				  done
-				  
-				  if [ "$already_tracked" = "0" ]; then
-				    pids+=($broker_pid)
-				    echo "Started broker $i with PID $broker_pid"
-				  else
-				    echo "WARNING: Broker $i PID $broker_pid already tracked, skipping"
-				    continue
-				  fi
-
-				  # Wait for broker to signal readiness (15s max; healthy ~3–8s)
-				  if ! wait_for_broker_ready "$broker_pid" 15; then
-					  echo "Broker $i failed to initialize, aborting trial"
-					  for pid in "${pids[@]}"; do
-						  kill $pid 2>/dev/null || true
-					  done
-					  pids=()
-					  sleep 2
-					  cleanup
-					  continue 2  # Skip to next trial
-				  fi
+				# Start follower brokers in parallel (saves ~4–6s vs sequential)
+				broker_shell_pids=()
+				for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
+				  $EMBARLET_NUMA_BIND ./embarlet $CONFIG_ARG > broker_${i}_trial${trial}.log 2>&1 &
+				  broker_shell_pids+=($!)
 				done
+				sleep 0.5
+				# Discover embarlet PIDs for each started process (one per shell PID)
+				follower_pids=()
+				for broker_shell_pid in "${broker_shell_pids[@]}"; do
+				  broker_pid=""
+				  all_embarlet_pids=$(pgrep -f "embarlet.*--config" 2>/dev/null | grep -v "embarlet.*--head" || true)
+				  for pid in $all_embarlet_pids; do
+				    current=$pid
+				    for j in {1..5}; do
+				      parent=$(ps -o ppid= -p $current 2>/dev/null | tr -d ' ')
+				      if [ -z "$parent" ] || [ "$parent" = "1" ]; then break; fi
+				      if [ "$parent" = "$broker_shell_pid" ]; then
+				        broker_pid=$pid
+				        break 2
+				      fi
+				      current=$parent
+				    done
+				  done
+				  [ -z "$broker_pid" ] && broker_pid=$(ps --ppid $broker_shell_pid -o pid= --no-headers 2>/dev/null | tr -d ' ' | head -1)
+				  [ -z "$broker_pid" ] && broker_pid=$broker_shell_pid
+				  follower_pids+=($broker_pid)
+				  pids+=($broker_pid)
+				done
+				echo "Started follower brokers with PIDs: ${follower_pids[*]}"
+				if ! wait_for_all_brokers_ready 20 "${follower_pids[@]}"; then
+				  echo "One or more followers failed to initialize, aborting trial"
+				  for pid in "${pids[@]}"; do kill $pid 2>/dev/null || true; done
+				  pids=()
+				  sleep 1
+				  cleanup
+				  continue 2
+				fi
 				echo "All brokers ready, cluster formed"
 
 				# Run throughput test in foreground; stream output to terminal
@@ -338,9 +340,9 @@ for test_case in "${test_cases[@]}"; do
 					mkdir -p "../../data/throughput/logs/trial_${trial}_$(date +%Y%m%d_%H%M%S)"
 					mv broker_*_trial${trial}.log ../../data/throughput/logs/trial_${trial}_$(date +%Y%m%d_%H%M%S)/ 2>/dev/null || true
 				fi
-				sleep 1
+				sleep 0.5
 				cleanup
-				sleep 2
+				sleep 1
 			done
 		done
 	done

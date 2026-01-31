@@ -169,6 +169,64 @@ void Publisher::Init(int ack_level) {
 		}
 		std::this_thread::yield();
 	}
+
+	// [[FIX: B3=0 ACKs]] Wait for all expected broker ACK connections to be established
+	// This prevents the race where publishing completes before all ACK connections are up
+	if (ack_level_ >= 1) {
+		constexpr auto ACK_CONNECTION_TIMEOUT = std::chrono::seconds(30);
+		auto ack_wait_start = std::chrono::steady_clock::now();
+		auto last_log_time = ack_wait_start;
+		int expected = expected_ack_brokers_.load(std::memory_order_acquire);
+
+		while (expected > 0) {
+			int connected_count;
+			{
+				absl::MutexLock lock(&mutex_);
+				connected_count = static_cast<int>(brokers_with_ack_connection_.size());
+			}
+
+			if (connected_count >= expected) {
+				LOG(INFO) << "Publisher::Init() All " << expected << " broker ACK connections established";
+				break;
+			}
+
+			auto now = std::chrono::steady_clock::now();
+			auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - ack_wait_start);
+
+			// Log progress every 2 seconds
+			if (now - last_log_time >= std::chrono::seconds(2)) {
+				LOG(INFO) << "Publisher::Init() Waiting for broker ACK connections: "
+				         << connected_count << " / " << expected << " (elapsed: " << elapsed.count() << "s)";
+				last_log_time = now;
+			}
+
+			if (elapsed >= ACK_CONNECTION_TIMEOUT) {
+				LOG(WARNING) << "Publisher::Init() ACK connection timeout after " << ACK_CONNECTION_TIMEOUT.count()
+				           << "s. Only " << connected_count << " of " << expected << " brokers connected. "
+				           << "Some brokers may not send ACKs (B*=0 ACK issue).";
+				// Log which brokers are missing
+				{
+					absl::MutexLock lock(&mutex_);
+					std::string connected_str, missing_str;
+					for (int bid : brokers_with_ack_connection_) {
+						if (!connected_str.empty()) connected_str += ", ";
+						connected_str += "B" + std::to_string(bid);
+					}
+					for (int bid : brokers_) {
+						if (brokers_with_ack_connection_.find(bid) == brokers_with_ack_connection_.end()) {
+							if (!missing_str.empty()) missing_str += ", ";
+							missing_str += "B" + std::to_string(bid);
+						}
+					}
+					LOG(WARNING) << "  Connected brokers: " << (connected_str.empty() ? "(none)" : connected_str);
+					LOG(WARNING) << "  Missing brokers: " << (missing_str.empty() ? "(none)" : missing_str);
+				}
+				break;
+			}
+
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+	}
 }
 
 void Publisher::WarmupBuffers() {
@@ -215,6 +273,10 @@ bool Publisher::Poll(size_t n) {
 	// If we set publish_finished_ first, threads that get nullptr from Read() may exit
 	// before we've called SealAll(), dropping the last batches.
 	WriteFinishedOrPuased();
+
+	// [[FIX: B3=0 ACKs]] Dump buffer statistics to diagnose uneven message distribution
+	pubQue_.DumpBufferStats();
+
 	pubQue_.ReturnReads();
 	publish_finished_.store(true, std::memory_order_release);
 
@@ -261,10 +323,10 @@ bool Publisher::Poll(size_t n) {
 		// [[CONFIG: Ack-wait spin]] 500µs spin when waiting for acks (burst-friendly); was 1ms.
 		constexpr auto SPIN_DURATION = std::chrono::microseconds(500);
 		
-		// [[PHASE_4_BOUNDED_TIMEOUTS]] - Configurable timeout for ACK waits
-		// Default 60s prevents infinite hang if broker fails; override via env var for tests
+		// Configurable timeout for ACK waits. Do not increase timeout for debugging—find root causes.
+		// Override via EMBARCADERO_ACK_TIMEOUT_SEC (0 = no timeout).
 		const char* timeout_env = std::getenv("EMBARCADERO_ACK_TIMEOUT_SEC");
-		int timeout_seconds = timeout_env ? std::atoi(timeout_env) : 60;  // 60s default for safety
+		int timeout_seconds = timeout_env ? std::atoi(timeout_env) : 10;  // 10s default
 		const auto timeout_duration = std::chrono::seconds(timeout_seconds);
 		// [[FIX: ACK Race Condition]] Capture target ONCE - never reload inside loop
 		// Reloading allowed concurrent Publish() calls to move the target, causing potential infinite wait
@@ -281,6 +343,10 @@ bool Publisher::Poll(size_t n) {
 					<< " (timeout=" << timeout_seconds << "s)";
 				LOG(ERROR) << "[Publisher ACK Diagnostics]: ack_level=" << ack_level_
 					<< ", last_ack_received=" << ack_received_ << ", client_order=" << target_acks;
+				LOG(ERROR) << "[Publisher Batch Stats]: total_batches_sent=" << total_batches_sent_.load(std::memory_order_relaxed)
+					<< " attempted=" << total_batches_attempted_.load(std::memory_order_relaxed)
+					<< " failed=" << total_batches_failed_.load(std::memory_order_relaxed)
+					<< " (sent_all=" << (total_batches_failed_.load(std::memory_order_relaxed) == 0 ? "yes" : "no") << ")";
 				// Per-broker counts to pinpoint which broker(s) are short
 				std::string per_broker;
 				for (size_t i = 0; i < acked_messages_per_broker_.size(); i++) {
@@ -297,8 +363,8 @@ bool Publisher::Poll(size_t n) {
 					break;
 				}
 			}
-			// Only log every 3 seconds to avoid spam; include per-broker acks for stall diagnosis
-			if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
+			// Log every 1s when debugging (5s timeout); include per-broker acks for stall diagnosis
+			if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
 				std::string per_broker;
 				for (size_t i = 0; i < acked_messages_per_broker_.size(); i++) {
 					if (i) per_broker += " ";
@@ -644,11 +710,20 @@ while (!shutdown_.load(std::memory_order_acquire)) {
 							LOG(ERROR) << "AckThread: Received invalid broker_id " << broker_id_buffer << " on fd " << client_sock;
 							connection_error_or_closed = true; break; // Invalid ID, close connection
 						}
-						VLOG(1) << "AckThread: Received Broker ID " << broker_id_buffer << " from fd=" << client_sock;
+						// [[B1_ACK_ZERO]] INFO so we can see which brokers' ACK connections reached the client
+						LOG(INFO) << "AckThread: Received Broker ID " << broker_id_buffer << " from fd=" << client_sock;
 						client_sockets[client_sock] = broker_id_buffer; // Update map value
 						socket_state[client_sock] = ConnState::READING_ACKS; // Transition state
 						current_state = ConnState::READING_ACKS; // Update local state for this loop
-																										 // Clear partial read state for this FD
+						// [[FIX: B3=0 ACKs]] Track that this broker has an ACK connection
+						{
+							absl::MutexLock lock(&mutex_);
+							brokers_with_ack_connection_.insert(broker_id_buffer);
+							LOG(INFO) << "AckThread: Broker " << broker_id_buffer << " ACK connection tracked. "
+							         << "Total ACK connections: " << brokers_with_ack_connection_.size()
+							         << " / expected: " << expected_ack_brokers_.load(std::memory_order_relaxed);
+						}
+						// Clear partial read state for this FD
 						partial_id_reads.erase(client_sock);
 						partial_ack_reads[client_sock] = {0, 0}; // Init ACK read buffer for this connection
 						// Continue reading potential ACK data in the same loop iteration
@@ -759,10 +834,6 @@ close(server_sock);
 }
 
 void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
-	static std::atomic<size_t> total_batches_sent{0};
-	static std::atomic<size_t> total_batches_attempted{0};
-	static std::atomic<size_t> total_batches_failed{0};
-
 	int sock = -1;
 	int efd = -1;
 
@@ -931,14 +1002,20 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				// This ensures the connection stays alive even if this thread got no batches
 				// NetworkManager expects to receive at least one batch header per connection
 				if (!has_sent_batch) {
-					LOG(WARNING) << "PublishThread[" << pubQuesIdx << "]: No batches to send, but keeping connection alive. "
-					            << "This thread may have been assigned to a buffer with no data.";
+					// [[FIX: B3=0 ACKs]] CRITICAL diagnostic - this thread got NO batches!
+					// This is the likely cause of B*=0 ACK issues
+					LOG(ERROR) << "PublishThread[" << pubQuesIdx << "] for BROKER " << broker_id
+					          << ": EXITING WITH ZERO BATCHES SENT! "
+					          << "This thread read from buffer " << pubQuesIdx << " but got no data. "
+					          << "publish_finished=" << publish_finished_.load(std::memory_order_relaxed)
+					          << ", shutdown=" << shutdown_.load(std::memory_order_relaxed);
 					// Wait a bit to see if batches arrive, then exit gracefully
 					std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				}
 				// PublishThread exiting
-				LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Exiting - publish_finished=" 
-				         << publish_finished_.load(std::memory_order_relaxed) << ", shutdown=" << shutdown_.load(std::memory_order_relaxed) 
+				LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Exiting - broker=" << broker_id
+				         << ", publish_finished=" << publish_finished_.load(std::memory_order_relaxed)
+				         << ", shutdown=" << shutdown_.load(std::memory_order_relaxed)
 				         << ", has_sent_batch=" << has_sent_batch;
 				break;
 		} else {
@@ -962,7 +1039,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			         << ", num_msg=" << batch_header->num_msg 
 			         << ", total_size=" << batch_header->total_size << ")";
 		}
-		total_batches_attempted.fetch_add(1, std::memory_order_relaxed);
+		total_batches_attempted_.fetch_add(1, std::memory_order_relaxed);
 
 		batch_header->client_id = client_id_;
 		batch_header->broker_id = broker_id;
@@ -1062,7 +1139,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				         << batch_count << " to broker " << broker_id;
 			}
 		} catch (const std::exception& e) {
-			total_batches_failed.fetch_add(1, std::memory_order_relaxed);
+			total_batches_failed_.fetch_add(1, std::memory_order_relaxed);
 			LOG(ERROR) << "Exception sending batch header: " << e.what();
 			std::string fail_msg = "Header Send Fail Broker " + std::to_string(broker_id) + " (" + e.what() + ")";
 			RecordFailureEvent(fail_msg); // Record event
@@ -1102,7 +1179,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			try {
 				send_batch_header();
 			} catch (const std::exception& e) {
-				total_batches_failed.fetch_add(1, std::memory_order_relaxed);
+				total_batches_failed_.fetch_add(1, std::memory_order_relaxed);
 				LOG(ERROR) << "Failed to send batch header to replacement broker: " << e.what();
 				std::string fail_msg2 = "Header Send Fail (Post-Reconnect) Broker " + std::to_string(new_broker_id) + " (" + e.what() + ")";
 				RecordFailureEvent(fail_msg2);
@@ -1212,7 +1289,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Mark that we've sent at least one batch
 		has_sent_batch = true;
-		size_t total_sent = total_batches_sent.fetch_add(1, std::memory_order_relaxed) + 1;
+		size_t total_sent = total_batches_sent_.fetch_add(1, std::memory_order_relaxed) + 1;
 
 		if (batch_count % 100 == 0 || batch_count == 1) {
 			VLOG(2) << "PublishThread[" << pubQuesIdx << "]: Fully sent batch " << batch_count
@@ -1220,8 +1297,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		}
 		if (total_sent % 500 == 0) {
 			VLOG(2) << "Publisher: total_batches_sent=" << total_sent
-			        << " total_batches_attempted=" << total_batches_attempted.load(std::memory_order_relaxed)
-			        << " total_batches_failed=" << total_batches_failed.load(std::memory_order_relaxed);
+			        << " total_batches_attempted=" << total_batches_attempted_.load(std::memory_order_relaxed)
+			        << " total_batches_failed=" << total_batches_failed_.load(std::memory_order_relaxed);
 		}
 
 		// Verify all data was sent
@@ -1249,7 +1326,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 void Publisher::SubscribeToClusterStatus() {
 	heartbeat_system::ClusterStatus cluster_status;
-	read_fail_count_ = 0; 
+	read_fail_count_ = 0;
 
 	while (!shutdown_.load(std::memory_order_acquire)) {
 		heartbeat_system::ClientInfo client_info;
@@ -1263,32 +1340,69 @@ void Publisher::SubscribeToClusterStatus() {
 		LOG(INFO) << "SubscribeToCluster: Creating gRPC reader for cluster status subscription...";
 		std::unique_ptr<grpc::ClientReader<ClusterStatus>> reader(
 				stub_->SubscribeToCluster(&context_, client_info));
-		
+
 		if (!reader) {
 			LOG(ERROR) << "SubscribeToCluster: Failed to create gRPC reader. Check broker gRPC service availability.";
 			std::this_thread::sleep_for(std::chrono::milliseconds(500));
 			continue;
 		}
-		
+
 		LOG(INFO) << "SubscribeToCluster: gRPC reader created successfully, waiting for cluster status...";
 
 		// Inner loop: process reads until Read() fails or shutdown
 		while (!shutdown_.load(std::memory_order_acquire)) {
 			if (reader->Read(&cluster_status)) {
-			LOG(INFO) << "SubscribeToCluster: Received cluster status update with " 
-			         << cluster_status.new_nodes_size() << " new nodes";
-			const auto& new_nodes = cluster_status.new_nodes();
+			// [[SEQUENCER_ONLY_HEAD_NODE]] Use broker_info if available (includes accepts_publishes)
+			// Fall back to new_nodes for backward compatibility with older brokers
+			bool use_broker_info = cluster_status.broker_info_size() > 0;
+			LOG(INFO) << "SubscribeToCluster: Received cluster status update with "
+			         << (use_broker_info ? cluster_status.broker_info_size() : cluster_status.new_nodes_size())
+			         << " brokers (using " << (use_broker_info ? "broker_info" : "new_nodes") << ")";
 
-			if (!new_nodes.empty()) {
+			// [[DIAGNOSTIC: Log each broker's accepts_publishes status]]
+			if (use_broker_info) {
+				for (const auto& bi : cluster_status.broker_info()) {
+					LOG(INFO) << "  Broker " << bi.broker_id() << ": accepts_publishes=" << bi.accepts_publishes();
+				}
+			}
+
+			if (use_broker_info) {
+				// [[SEQUENCER_ONLY_HEAD_NODE]] Treat broker_info as authoritative: set brokers_ and
+				// nodes_ only from brokers with accepts_publishes=true (avoids carrying over
+				// constructor-seeded broker 0 when head is sequencer-only).
+				absl::MutexLock lock(&mutex_);
+
+				brokers_.clear();
+				for (const auto& bi : cluster_status.broker_info()) {
+					int broker_id = bi.broker_id();
+					if (bi.accepts_publishes()) {
+						nodes_[broker_id] = bi.network_mgr_addr();
+						brokers_.emplace_back(broker_id);
+						LOG(INFO) << "SubscribeToCluster: Added broker " << broker_id
+						         << " (accepts_publishes=true)";
+					} else {
+						LOG(INFO) << "SubscribeToCluster: Skipping broker " << broker_id
+						         << " (accepts_publishes=false, sequencer-only node)";
+					}
+				}
+				std::sort(brokers_.begin(), brokers_.end());
+
+				int publishable_brokers = static_cast<int>(brokers_.size());
+				if (!connected_.load(std::memory_order_acquire) && publishable_brokers > 0) {
+					queueSize_ /= publishable_brokers;
+				}
+			} else if (!cluster_status.new_nodes().empty()) {
+				// Backward compatibility: use new_nodes if broker_info not available
+				const auto& new_nodes = cluster_status.new_nodes();
 				absl::MutexLock lock(&mutex_);
 
 				// Adjust queue size based on number of brokers on first connection
-				if (!connected_.load(std::memory_order_acquire)) {  // [[CRITICAL_FIX: Atomic load]]
+				if (!connected_.load(std::memory_order_acquire)) {
 					int num_brokers = 1 + new_nodes.size();
 					queueSize_ /= num_brokers;
 				}
 
-				// Add new brokers (don't call AddPublisherThreads here - will be called in connection loop)
+				// Add new brokers
 				for (const auto& addr : new_nodes) {
 					int broker_id = GetBrokerId(addr);
 					nodes_[broker_id] = addr;
@@ -1299,35 +1413,58 @@ void Publisher::SubscribeToClusterStatus() {
 				std::sort(brokers_.begin(), brokers_.end());
 			}
 
-			// If this is initial connection, connect to all brokers
-			if (!connected_.load(std::memory_order_acquire)) { 
-				LOG(INFO) << "SubscribeToCluster: Initial connection - connecting to " 
-				         << brokers_.size() << " brokers";
+			// [[FIX: B2=0 ACKs]] Add publisher threads for brokers that don't have them yet
+			// This handles both initial connection AND late-registering brokers
+			{
 				size_t qsize;
-				{ absl::MutexLock lock(&mutex_); qsize = queueSize_; }
-				bool all_connected = true;
-				for (int broker_id : brokers_) {
-					LOG(INFO) << "SubscribeToCluster: Adding publisher threads for broker " << broker_id;
-					if (!AddPublisherThreads(num_threads_per_broker_, broker_id, qsize)) {
-						LOG(ERROR) << "Failed to add publisher threads for broker " << broker_id;
-						all_connected = false;
-						break;
-					}
-				}
-				if (brokers_.empty()) {
-					LOG(WARNING) << "SubscribeToCluster: No brokers discovered, using head broker (0) as fallback";
-					if (!AddPublisherThreads(num_threads_per_broker_, 0, qsize)) {
-						LOG(ERROR) << "Failed to add publisher threads for head broker";
-						all_connected = false;
-					} else {
-						brokers_.push_back(0);
+				std::vector<int> brokers_needing_threads;
+				{
+					absl::MutexLock lock(&mutex_);
+					qsize = queueSize_;
+					for (int broker_id : brokers_) {
+						if (brokers_with_threads_.find(broker_id) == brokers_with_threads_.end()) {
+							brokers_needing_threads.push_back(broker_id);
+						}
 					}
 				}
 
-				// Signal that we're connected 
-				if (all_connected) {
-					connected_.store(true, std::memory_order_release);  // [[CRITICAL_FIX: Atomic store with release semantics]]
-					LOG(INFO) << "SubscribeToCluster: Connection established successfully. connected_=true";
+				if (!brokers_needing_threads.empty()) {
+					LOG(INFO) << "SubscribeToCluster: Adding publisher threads for "
+					         << brokers_needing_threads.size() << " broker(s)";
+					// [[FIX: B3=0 ACKs]] Set expected ACK brokers count for tracking
+					expected_ack_brokers_.store(static_cast<int>(brokers_needing_threads.size()), std::memory_order_release);
+					bool all_connected = true;
+					for (int broker_id : brokers_needing_threads) {
+						LOG(INFO) << "SubscribeToCluster: Adding publisher threads for broker " << broker_id;
+						if (!AddPublisherThreads(num_threads_per_broker_, broker_id, qsize)) {
+							LOG(ERROR) << "Failed to add publisher threads for broker " << broker_id;
+							all_connected = false;
+							break;
+						}
+						// Track that this broker now has threads
+						{
+							absl::MutexLock lock(&mutex_);
+							brokers_with_threads_.insert(broker_id);
+						}
+					}
+
+					// Signal that we're connected (only on first successful connection)
+					if (all_connected && !connected_.load(std::memory_order_acquire)) {
+						connected_.store(true, std::memory_order_release);
+						LOG(INFO) << "SubscribeToCluster: Connection established successfully. connected_=true";
+					}
+				} else if (!connected_.load(std::memory_order_acquire) && brokers_.empty()) {
+					// Fallback: no publishable brokers discovered, use head broker (0)
+					LOG(WARNING) << "SubscribeToCluster: No publishable brokers discovered, using head broker (0) as fallback";
+					if (!AddPublisherThreads(num_threads_per_broker_, 0, qsize)) {
+						LOG(ERROR) << "Failed to add publisher threads for head broker";
+					} else {
+						absl::MutexLock lock(&mutex_);
+						brokers_.push_back(0);
+						brokers_with_threads_.insert(0);
+						connected_.store(true, std::memory_order_release);
+						LOG(INFO) << "SubscribeToCluster: Connection established with fallback broker 0";
+					}
 				}
 			}
 			} else {

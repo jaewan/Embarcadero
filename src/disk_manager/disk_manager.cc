@@ -14,6 +14,7 @@
 #include "disk_manager.h"
 #include "scalog_replication_manager.h"
 #include "corfu_replication_manager.h"
+#include "chain_replication.h"
 #include "../cxl_manager/cxl_datastructure.h"
 #include "../common/performance_utils.h"
 
@@ -131,6 +132,43 @@ namespace Embarcadero{
 				return;
 			}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 				corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>(broker_id, log_to_memory);
+				return;
+			}else if(sequencerType == heartbeat_system::SequencerType::EMBARCADERO){
+				// [[PHASE_2]] Chain replication with GOI + CompletionVector
+				// Configuration via environment variables:
+				// - EMBARCADERO_REPLICA_ID: This broker's position in replication chain (0=head, f=tail)
+				// - EMBARCADERO_REPLICATION_FACTOR: Total number of replicas (including head)
+				// - EMBARCADERO_REPLICA_DISK_PATH: Disk path for replica data (optional)
+
+				const char* replica_id_env = getenv("EMBARCADERO_REPLICA_ID");
+				const char* replication_factor_env = getenv("EMBARCADERO_REPLICATION_FACTOR");
+				const char* disk_path_env = getenv("EMBARCADERO_REPLICA_DISK_PATH");
+
+				int replica_id = replica_id_env ? atoi(replica_id_env) : 0;
+				// Default 1 so single-replica (head-only) is the tail and updates CompletionVector; ack_level=2 works without env.
+				int replication_factor = replication_factor_env ? atoi(replication_factor_env) : 1;
+
+				// Default disk path: /tmp/embarcadero_replica_<broker_id>.dat
+				std::string disk_path;
+				if (disk_path_env) {
+					disk_path = disk_path_env;
+				} else {
+					disk_path = "/tmp/embarcadero_replica_" + std::to_string(broker_id_) + ".dat";
+				}
+
+				// Calculate GOI and CV addresses from cxl_addr_
+				GOIEntry* goi = reinterpret_cast<GOIEntry*>(
+					reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kGOIOffset);
+				CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+					reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kCompletionVectorOffset);
+
+				chain_replication_manager_ = std::make_unique<Embarcadero::ChainReplicationManager>(
+					replica_id, replication_factor, cxl_addr_, goi, cv, disk_path);
+				chain_replication_manager_->Start();
+
+				LOG(INFO) << "DiskManager: Chain replication enabled (replica_id=" << replica_id
+				          << ", replication_factor=" << replication_factor
+				          << ", disk=" << disk_path << ")";
 				return;
 			}
 

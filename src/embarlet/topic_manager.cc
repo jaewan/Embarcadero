@@ -121,7 +121,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 	{
 		absl::WriterMutexLock lock(&topics_mutex_);
 
-		CHECK_LT(num_topics_, MAX_TOPIC_SIZE) 
+		CHECK_LT(num_topics_, MAX_TOPIC_SIZE)
 			<< "Creating too many topics, increase MAX_TOPIC_SIZE";
 
 		if (topics_.find(topic) != topics_.end()) {
@@ -129,38 +129,63 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		}
 
 		void* cxl_addr = cxl_manager_.GetCXLAddr();
-		void* segment_metadata = cxl_manager_.GetNewSegment();
-		void* batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
-		
-		// Validate all pointers before using them
-		if (!segment_metadata) {
-			LOG(ERROR) << "Failed to allocate segment for topic: " << topic;
-			return nullptr;
-		}
-		if (!batch_headers_region) {
-			LOG(ERROR) << "Failed to allocate batch headers for topic: " << topic;
-			return nullptr;
-		}
+		void* segment_metadata = nullptr;
+		void* batch_headers_region = nullptr;
 
-		// Handle replica if needed
-		if (tinode->replicate_tinode) {
-			replica_tinode = cxl_manager_.GetReplicaTInode(topic);
-			// Initialize this broker's offsets in the replica TInode
-			InitializeTInodeOffsets(replica_tinode, segment_metadata, 
-					batch_headers_region, cxl_addr);
-		}
+		// [[SEQUENCER_ONLY_HEAD_NODE]] - Skip B0 allocation when is_sequencer_node
+		// Sequencer-only head node (broker_id=0) does not ingest data, so it has no
+		// segment or batch header ring. offsets[0] remains unused.
+		// See docs/memory-bank/SEQUENCER_ONLY_HEAD_NODE_DESIGN.md
+		const bool skip_allocation = is_sequencer_node_ && broker_id_ == 0;
 
-		// Initialize this broker's offsets in the main TInode
-		// Each broker needs its own entry in the offsets[NUM_MAX_BROKERS] array
-		InitializeTInodeOffsets(tinode, segment_metadata, batch_headers_region, cxl_addr);
+		if (!skip_allocation) {
+			segment_metadata = cxl_manager_.GetNewSegment();
+			batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
+
+			// Validate all pointers before using them
+			if (!segment_metadata) {
+				LOG(ERROR) << "Failed to allocate segment for topic: " << topic;
+				return nullptr;
+			}
+			if (!batch_headers_region) {
+				LOG(ERROR) << "Failed to allocate batch headers for topic: " << topic;
+				return nullptr;
+			}
+
+			// [[CRITICAL FIX: STALE_RING_DATA]] Zero out batch header ring to prevent false in-flight slots
+			// CXL memory may contain garbage data that looks like batches (num_msg>0, batch_complete=0).
+			// Without zeroing, the scanner will think these are in-flight batches and stall.
+			memset(batch_headers_region, 0, BATCHHEADERS_SIZE);
+			// Flush the zeroed memory to CXL (non-coherent)
+			for (size_t i = 0; i < BATCHHEADERS_SIZE; i += 64) {
+				CXL::flush_cacheline(reinterpret_cast<uint8_t*>(batch_headers_region) + i);
+			}
+			CXL::store_fence();
+			LOG(INFO) << "Zeroed batch header ring at " << batch_headers_region << " (" << BATCHHEADERS_SIZE << " bytes)";
+
+			// Handle replica if needed
+			if (tinode->replicate_tinode) {
+				replica_tinode = cxl_manager_.GetReplicaTInode(topic);
+				// Initialize this broker's offsets in the replica TInode
+				InitializeTInodeOffsets(replica_tinode, segment_metadata,
+						batch_headers_region, cxl_addr);
+			}
+
+			// Initialize this broker's offsets in the main TInode
+			// Each broker needs its own entry in the offsets[NUM_MAX_BROKERS] array
+			InitializeTInodeOffsets(tinode, segment_metadata, batch_headers_region, cxl_addr);
+		} else {
+			LOG(INFO) << "[SEQUENCER_ONLY] Skipping B0 allocation for topic: " << topic
+			          << " (sequencer-only head node)";
+		}
 
 		// Create the topic
 		// [[DEVIATION_004]] - Using TInode.offset_entry instead of separate Bmeta region
 		topics_[topic] = std::make_unique<Topic>(
 				[this]() { return cxl_manager_.GetNewSegment(); },
 				[this]() { return get_num_brokers_callback_(); },
-				GetRegisteredBrokersCallback([this](absl::btree_set<int> &registered_brokers, 
-														MessageHeader** msg_to_order, TInode *tinode) -> int { 
+				GetRegisteredBrokersCallback([this](absl::btree_set<int> &registered_brokers,
+														MessageHeader** msg_to_order, TInode *tinode) -> int {
 				return get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode); }),
 				static_cast<void*>(tinode),
 				replica_tinode,
@@ -169,20 +194,22 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 				tinode->order,
 				tinode->seq_type,
 				cxl_addr,
-				segment_metadata
+				segment_metadata  // nullptr for sequencer-only head node
 				);
 	}
 
-	// Handle replication if needed
-	int replication_factor = tinode->replication_factor;
-	if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
-		disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
-	}
+	// Handle replication if needed (skip for sequencer-only node)
+	if (!is_sequencer_node_ || broker_id_ != 0) {
+		int replication_factor = tinode->replication_factor;
+		if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
+			disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
+		}
 
-	// Run sequencer if needed
-	if (tinode->seq_type == SCALOG) {
-		if (replication_factor > 0) {
-			disk_manager_.StartScalogReplicaLocalSequencer();
+		// Run sequencer if needed
+		if (tinode->seq_type == SCALOG) {
+			if (replication_factor > 0) {
+				disk_manager_.StartScalogReplicaLocalSequencer();
+			}
 		}
 	}
 
@@ -206,10 +233,16 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		return nullptr;
 	}
 
+	// [[SEQUENCER_ONLY_HEAD_NODE]] - Skip B0 allocation when is_sequencer_node
+	// Sequencer-only head node (broker_id=0) does not ingest data, so it has no
+	// segment or batch header ring. offsets[0] remains unused.
+	// See docs/memory-bank/SEQUENCER_ONLY_HEAD_NODE_DESIGN.md
+	const bool skip_allocation = is_sequencer_node_ && broker_id_ == 0;
+
 	{
 		absl::WriterMutexLock lock(&topics_mutex_);
 
-		CHECK_LT(num_topics_, MAX_TOPIC_SIZE) 
+		CHECK_LT(num_topics_, MAX_TOPIC_SIZE)
 			<< "Creating too many topics, increase MAX_TOPIC_SIZE";
 
 		if (topics_.find(topic) != topics_.end()) {
@@ -217,21 +250,40 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		}
 
 		void* cxl_addr = cxl_manager_.GetCXLAddr();
-		void* segment_metadata = cxl_manager_.GetNewSegment();
-		void* batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
-		
-		// Validate all pointers before using them
-		if (!segment_metadata) {
-			LOG(ERROR) << "Failed to allocate segment for topic: " << topic;
-			return nullptr;
-		}
-		if (!batch_headers_region) {
-			LOG(ERROR) << "Failed to allocate batch headers for topic: " << topic;
-			return nullptr;
+		void* segment_metadata = nullptr;
+		void* batch_headers_region = nullptr;
+
+		if (!skip_allocation) {
+			segment_metadata = cxl_manager_.GetNewSegment();
+			batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
+
+			// Validate all pointers before using them
+			if (!segment_metadata) {
+				LOG(ERROR) << "Failed to allocate segment for topic: " << topic;
+				return nullptr;
+			}
+			if (!batch_headers_region) {
+				LOG(ERROR) << "Failed to allocate batch headers for topic: " << topic;
+				return nullptr;
+			}
+
+			// [[CRITICAL FIX: STALE_RING_DATA]] Zero out batch header ring to prevent false in-flight slots
+			memset(batch_headers_region, 0, BATCHHEADERS_SIZE);
+			for (size_t i = 0; i < BATCHHEADERS_SIZE; i += 64) {
+				CXL::flush_cacheline(reinterpret_cast<uint8_t*>(batch_headers_region) + i);
+			}
+			CXL::store_fence();
+			LOG(INFO) << "Zeroed batch header ring at " << batch_headers_region << " (" << BATCHHEADERS_SIZE << " bytes)";
+
+			// Initialize tinode offsets for this broker
+			InitializeTInodeOffsets(tinode, segment_metadata, batch_headers_region, cxl_addr);
+		} else {
+			LOG(INFO) << "[SEQUENCER_ONLY] Skipping B0 allocation for topic: " << topic
+			          << " (sequencer-only head node)";
 		}
 
-		// Initialize tinode
-		InitializeTInodeOffsets(tinode, segment_metadata, batch_headers_region, cxl_addr);
+		// Initialize tinode metadata (always, even for sequencer-only node)
+		// Data brokers need to see topic name, order, etc.
 		tinode->order = order;
 		tinode->replication_factor = replication_factor;
 		tinode->ack_level = ack_level;
@@ -246,8 +298,8 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		CXL::flush_cacheline(tinode);
 		CXL::store_fence();
 
-		// Handle replica if needed
-		if (replicate_tinode) {
+		// Handle replica if needed (skip for sequencer-only node - no data to replicate)
+		if (replicate_tinode && !skip_allocation) {
 			char replica_topic[TOPIC_NAME_SIZE] = {0};
 			memcpy(replica_topic, topic, std::min<size_t>(TOPIC_NAME_SIZE - 1, strlen(topic)));
 			const char* suffix = "replica";
@@ -266,7 +318,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 				return nullptr;
 			}
 
-			InitializeTInodeOffsets(replica_tinode, segment_metadata, 
+			InitializeTInodeOffsets(replica_tinode, segment_metadata,
 					batch_headers_region, cxl_addr);
 			replica_tinode->order = order;
 			replica_tinode->replication_factor = replication_factor;
@@ -286,8 +338,8 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		topics_[topic] = std::make_unique<Topic>(
 				[this]() { return cxl_manager_.GetNewSegment(); },
 				[this]() { return get_num_brokers_callback_(); },
-				GetRegisteredBrokersCallback([this](absl::btree_set<int> &registered_brokers, 
-									MessageHeader** msg_to_order, TInode *tinode) -> int { 
+				GetRegisteredBrokersCallback([this](absl::btree_set<int> &registered_brokers,
+									MessageHeader** msg_to_order, TInode *tinode) -> int {
 			return get_registered_brokers_callback_(registered_brokers, msg_to_order, tinode); }),
 				static_cast<void*>(tinode),
 				replica_tinode,
@@ -296,18 +348,20 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 				order,
 				seq_type,
 				cxl_addr,
-				segment_metadata
+				segment_metadata  // nullptr for sequencer-only head node
 				);
 	}
 
-	// Handle replication if needed
-	if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
-		disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
-	}
-	// Run sequencer if needed
-	if (tinode->seq_type == SCALOG) {
-		if (replication_factor > 0) {
-			disk_manager_.StartScalogReplicaLocalSequencer();
+	// Handle replication if needed (skip for sequencer-only node)
+	if (!skip_allocation) {
+		if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
+			disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
+		}
+		// Run sequencer if needed
+		if (tinode->seq_type == SCALOG) {
+			if (replication_factor > 0) {
+				disk_manager_.StartScalogReplicaLocalSequencer();
+			}
 		}
 	}
 

@@ -11,14 +11,16 @@ MessageExport::MessageExport(void* cxl_addr,
                            int broker_id,
                            int order,
                            int ack_level,
-                           int replication_factor)
+                           int replication_factor,
+                           heartbeat_system::SequencerType seq_type)
     : cxl_addr_(cxl_addr),
       first_message_addr_(first_message_addr),
       tinode_(tinode),
       broker_id_(broker_id),
       order_(order),
       ack_level_(ack_level),
-      replication_factor_(replication_factor) {}
+      replication_factor_(replication_factor),
+      seq_type_(seq_type) {}
 
 bool MessageExport::GetMessageAddr(size_t& last_offset,
                                   void*& last_addr,
@@ -33,27 +35,49 @@ bool MessageExport::GetMessageAddr(size_t& last_offset,
         combined_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + 
             tinode_->offsets[broker_id_].ordered_offset;
         
-        if (ack_level_ == 2) {
-            // [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
-            // replication_factor INCLUDES self (replication_factor=1 means local durability only)
-            // TODO: Get actual num_brokers instead of NUM_MAX_BROKERS (requires callback)
-            int num_brokers = NUM_MAX_BROKERS;  // Temporary: use MAX until we have get_num_brokers callback
-            size_t r[replication_factor_];
-            size_t min = static_cast<size_t>(-1);
-            for (int i = 0; i < replication_factor_; i++) {
-                int b = GetReplicationSetBroker(broker_id_, replication_factor_, num_brokers, i);
-                r[i] = tinode_->offsets[b].replication_done[broker_id_];
-                if (min > r[i]) {
-                    min = r[i];
+        if (ack_level_ == 2 && replication_factor_ > 0) {
+            // [[PHASE_2]] ACK Level 2: Wait for full replication before exposing messages to subscribers
+            // Use CompletionVector (8 bytes) instead of replication_done array (256 bytes)
+
+            if (seq_type_ == heartbeat_system::EMBARCADERO) {
+                // [[PHASE_2_CV_PATH]] Use shared helper to read CV and get replicated position
+                size_t replicated_last_offset;
+                if (!GetReplicatedLastOffsetFromCV(cxl_addr_, tinode_, broker_id_, replicated_last_offset)) {
+                    return false;  // No replication progress yet
                 }
-            }
-            if (min == static_cast<size_t>(-1)) {
-                return false;
-            }
-            if (combined_offset != min) {
-                combined_addr = reinterpret_cast<uint8_t*>(combined_addr) -
-                    (reinterpret_cast<MessageHeader*>(combined_addr)->paddedSize * (combined_offset - min));
-                combined_offset = min;
+
+                // Adjust combined_offset to not exceed replicated position
+                if (combined_offset > replicated_last_offset) {
+                    // Back up to replicated position
+                    combined_addr = reinterpret_cast<uint8_t*>(combined_addr) -
+                        (reinterpret_cast<MessageHeader*>(combined_addr)->paddedSize * (combined_offset - replicated_last_offset));
+                    combined_offset = replicated_last_offset;
+                }
+            } else {
+                // [[PHASE_1]] Legacy path: Use replication_done array for non-EMBARCADERO sequencers
+                int num_brokers = NUM_MAX_BROKERS;
+                size_t r[replication_factor_];
+                size_t min = static_cast<size_t>(-1);
+                for (int i = 0; i < replication_factor_; i++) {
+                    int b = GetReplicationSetBroker(broker_id_, replication_factor_, num_brokers, i);
+                    volatile uint64_t* rep_done_ptr = &tinode_->offsets[b].replication_done[broker_id_];
+                    CXL::flush_cacheline(const_cast<const void*>(
+                        reinterpret_cast<const volatile void*>(rep_done_ptr)));
+                    r[i] = *rep_done_ptr;
+                    if (min > r[i]) {
+                        min = r[i];
+                    }
+                }
+                CXL::load_fence();
+
+                if (min == static_cast<size_t>(-1)) {
+                    return false;
+                }
+                if (combined_offset != min) {
+                    combined_addr = reinterpret_cast<uint8_t*>(combined_addr) -
+                        (reinterpret_cast<MessageHeader*>(combined_addr)->paddedSize * (combined_offset - min));
+                    combined_offset = min;
+                }
             }
         }
     } else {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "absl/container/flat_hash_set.h"
 #include "common.h"
 #include "buffer.h"
 
@@ -132,6 +133,10 @@ class Publisher {
 		std::atomic<bool> connected_{false};
 		// [[Atomic - Publish() increments, Poll() reads; ensures visibility across call sites]]
 		std::atomic<size_t> client_order_{0};
+		// [[DIAGNOSTIC]] Batch stats (PublishThread writes, WaitForAcks logs on timeout)
+		std::atomic<size_t> total_batches_sent_{0};
+		std::atomic<size_t> total_batches_attempted_{0};
+		std::atomic<size_t> total_batches_failed_{0};
 
 		// Used to measure real-time throughput during failure benchmark
 		std::atomic<size_t> total_sent_bytes_{0};
@@ -174,6 +179,8 @@ class Publisher {
 		absl::flat_hash_map<int, std::string> nodes_;
 		absl::Mutex mutex_;
 		std::vector<int> brokers_;
+		// [[FIX: B2=0 ACKs]] Track which brokers have publisher threads to handle late registration
+		absl::flat_hash_set<int> brokers_with_threads_ ABSL_GUARDED_BY(mutex_);
 		char topic_[TOPIC_NAME_SIZE];
 
 		// Acknowledgement
@@ -186,6 +193,10 @@ class Publisher {
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
 		std::atomic<bool> threads_joined_{false};
+		// [[FIX: B3=0 ACKs]] Track which brokers have established ACK connections
+		// This allows us to detect when a broker's ACK connection is missing
+		absl::flat_hash_set<int> brokers_with_ack_connection_ ABSL_GUARDED_BY(mutex_);
+		std::atomic<int> expected_ack_brokers_{0};
 
 		/**
 		 * Thread for handling acknowledgements using epoll

@@ -111,11 +111,18 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 	}
 
 	// Setup server address for connection
+	// [[FIX: B1_ACK_ZERO]] Use inet_ntop (thread-safe) and explicit uint16_t port to avoid inet_ntoa/truncation issues
 	struct sockaddr_in server_addr;
 	memset(&server_addr, 0, sizeof(server_addr));
 	server_addr.sin_family = AF_INET;
-	server_addr.sin_port = htons(port);
-	server_addr.sin_addr.s_addr = inet_addr(inet_ntoa(client_address.sin_addr));
+	server_addr.sin_port = htons(static_cast<uint16_t>(port & 0xFFFFu));
+	char client_ip[INET_ADDRSTRLEN];
+	if (inet_ntop(AF_INET, &client_address.sin_addr, client_ip, sizeof(client_ip)) == nullptr) {
+		LOG(ERROR) << "SetupAcknowledgmentSocket: inet_ntop failed for broker " << broker_id_;
+		close(ack_fd);
+		return false;
+	}
+	server_addr.sin_addr.s_addr = inet_addr(client_ip);
 
 	// Create epoll for connection monitoring
 	ack_efd_ = epoll_create1(0);
@@ -135,12 +142,15 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 				sizeof(server_addr));
 
 		if (connect_result == 0) {
-			// Connection succeeded immediately
+			// Connection succeeded immediately (sync)
+			LOG(INFO) << "SetupAcknowledgmentSocket: Broker " << broker_id_
+			          << " ACK connection established to " << client_ip << ":" << port << " (sync)";
 			break;
 		}
 
 		if (errno != EINPROGRESS) {
-			LOG(ERROR) << "Connect failed: " << strerror(errno);
+			LOG(ERROR) << "SetupAcknowledgmentSocket: Broker " << broker_id_
+			           << " connect failed to " << client_ip << ":" << port << ": " << strerror(errno);
 			CleanupSocketAndEpoll(ack_fd, ack_efd_);
 			return false;
 		}
@@ -172,13 +182,17 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 
 			if (sock_error == 0) {
 				// Connection successful
+				LOG(INFO) << "SetupAcknowledgmentSocket: Broker " << broker_id_
+				          << " ACK connection established to " << client_ip << ":" << port << " (async)";
 				break;
 			} else {
-				LOG(ERROR) << "Connection failed: " << strerror(sock_error);
+				LOG(ERROR) << "SetupAcknowledgmentSocket: Broker " << broker_id_
+				           << " connection failed to " << client_ip << ":" << port << ": " << strerror(sock_error);
 			}
 		} else if (n == 0) {
 			// Timeout occurred
-			LOG(ERROR) << "Connection timed out, retrying...";
+			LOG(ERROR) << "SetupAcknowledgmentSocket: Broker " << broker_id_
+			           << " connection timed out to " << client_ip << ":" << port << ", retrying...";
 		} else {
 			// epoll_wait error
 			LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
@@ -193,7 +207,8 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 	}
 
 	if (retries == MAX_RETRIES) {
-		LOG(ERROR) << "Max retries reached. Connection failed.";
+		LOG(ERROR) << "SetupAcknowledgmentSocket: Broker " << broker_id_
+		           << " max retries reached connecting to " << client_ip << ":" << port << ". ACK channel will not work.";
 		CleanupSocketAndEpoll(ack_fd, ack_efd_);
 		return false;
 	}
@@ -237,11 +252,18 @@ bool NetworkManager::IsConnectionAlive(int fd, char* buffer) {
 // Constructor/Destructor
 //----------------------------------------------------------------------------
 
-NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads)
+NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads, bool skip_networking)
 	: request_queue_(64),
 	large_msg_queue_(10000),
 	broker_id_(broker_id),
 	num_reqReceive_threads_(num_reqReceive_threads) {
+
+		// [[SEQUENCER_ONLY_HEAD_NODE]] Skip all networking threads when skip_networking is true
+		// Sequencer-only head node does not accept client connections
+		if (skip_networking) {
+			LOG(INFO) << "[SEQUENCER_ONLY] NetworkManager: skip_networking=true, no listener/receiver threads";
+			return;
+		}
 
 		// Initialize non-blocking architecture if enabled
 		const auto& config = GetConfig().config();
@@ -588,7 +610,7 @@ void NetworkManager::HandlePublishRequest(
 			LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
 			          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id;
 			// Pass local_ack_efd to thread so it uses the correct epoll instance
-			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd);
+			threads_.emplace_back(&NetworkManager::AckThread, this, std::string(handshake.topic), handshake.ack, ack_fd, local_ack_efd);
 		}
 		}
 	}
@@ -1267,6 +1289,48 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		// - Messages are acknowledged only after being replicated to disk on all replicas
 		// - Durability is "within periodic sync window" (default: 250ms or 64MiB)
 		// - This means ack_level=2 provides eventual durability, not immediate fsync durability
+
+		// [[PHASE_2]] Use CompletionVector instead of replication_done array
+		// CV is 8 bytes (single uint64_t) vs 256 bytes (32×8 array) = 32× bandwidth reduction
+		if (seq_type == EMBARCADERO) {
+			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
+			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
+
+			// Read CV (tail replica updates this after replication completes)
+			CXL::flush_cacheline(my_cv_entry);
+			CXL::load_fence();
+			uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
+
+			// Sentinel (uint64_t)-1 = no progress; 0 is valid (first batch completed)
+			if (completed_pbr_index == static_cast<uint64_t>(-1)) {
+				return (size_t)-1;  // No replication progress yet
+			}
+
+			// [[PHASE_2_FIX]] pbr_index is now absolute (never wraps), map to ring position
+			BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + tinode->offsets[broker_id_].batch_headers_offset);
+
+			// Calculate ring size in number of BatchHeaders
+			size_t ring_size_bytes = BATCHHEADERS_SIZE;
+			size_t ring_size = ring_size_bytes / sizeof(BatchHeader);
+
+			// Map absolute pbr_index to ring position using modulo
+			size_t ring_position = completed_pbr_index % ring_size;
+			BatchHeader* completed_batch = ring_start + ring_position;
+
+			// Read batch header to get logical offset range
+			CXL::flush_cacheline(completed_batch);
+			CXL::load_fence();
+			size_t start_offset = completed_batch->start_logical_offset;
+			size_t num_msg = completed_batch->num_msg;
+			size_t last_offset = start_offset + num_msg - 1;
+
+			// [[ACK_LEVEL_2_COUNT_SEMANTICS]] - Client expects message COUNT, not last offset.
+			return last_offset + 1;  // Convert last_offset (0-based) to message count
+		}
+
+		// [[PHASE_1]] Legacy path: Poll replication_done array for non-EMBARCADERO sequencers
 		// [[PERF: Single loop - invalidate then read same broker]] (was 2*replication_factor iterations)
 		// Replication threads (DiskManager) write replication_done and flush; AckThread reads it.
 		// On non-coherent CXL, reader must invalidate cache to observe those writes.
@@ -1367,17 +1431,17 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	}
 }
 
-void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd, int ack_efd) {
+void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd, int ack_efd) {
 	struct epoll_event events[10];
 	char buf[1];
 
 	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic='" << topic
-	          << "' (len=" << (topic ? strlen(topic) : 0) << "), ack_level=" << ack_level;
+	          << "' (len=" << topic.size() << "), ack_level=" << ack_level;
 
 	// [[CRITICAL: Validate topic is not empty]]
 	// If topic is empty, GetOffsetToAck will use wrong TInode → wrong ACKs → client timeout
-	if (!topic || strlen(topic) == 0) {
-		LOG(ERROR) << "AckThread: Empty or null topic for broker " << broker_id_
+	if (topic.empty()) {
+		LOG(ERROR) << "AckThread: Empty topic for broker " << broker_id_
 		           << ". Cannot send ACKs correctly. Exiting AckThread.";
 		close(ack_fd);
 		if (ack_efd >= 0) close(ack_efd);
@@ -1481,6 +1545,9 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 		}
 	} // end of send loop
 
+	// [[DIAGNOSTIC: Confirm broker_id was sent to client]]
+	LOG(INFO) << "AckThread: Broker " << broker_id_ << " sent broker_id to client for topic='" << topic << "'";
+
 	size_t next_to_ack_offset = 0;
 	auto last_log_time = std::chrono::steady_clock::now();
 
@@ -1508,7 +1575,7 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 		// For ack_level=1 with ORDER > 0: Sequencer (head broker) writes ordered count, AckThread (this broker) reads it
 		// For ack_level=2: Replication threads write replication_done, AckThread reads it
 		// On non-coherent CXL, we must invalidate our local cache to observe remote writes
-		TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+		TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic.c_str());
 		if (tinode) {
 			size_t invalidation_threshold = (ack_level == 1 && tinode->order > 0) 
 				? kAck1InvalidationThreshold 
@@ -1555,7 +1622,7 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 		
 		while (std::chrono::steady_clock::now() - cycle_start < SPIN_DURATION) {
 			// GetOffsetToAck() invalidates cache internally - no need for separate invalidation
-			cached_ack = GetOffsetToAck(topic, ack_level);
+			cached_ack = GetOffsetToAck(topic.c_str(), ack_level);
 			if (cached_ack != (size_t)-1 && next_to_ack_offset <= cached_ack) {
 				found_ack = true;
 				consecutive_ack_stalls = 0;  // Reset on success
@@ -1574,7 +1641,7 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
 			// Use cached value from spin loop (or re-fetch if not available)
-			size_t ack = (cached_ack != (size_t)-1) ? cached_ack : GetOffsetToAck(topic, ack_level);
+			size_t ack = (cached_ack != (size_t)-1) ? cached_ack : GetOffsetToAck(topic.c_str(), ack_level);
 			size_t ordered = tinode ? tinode->offsets[broker_id_].ordered : 0;
 			
 			// [[PHASE_0_INSTRUMENTATION]] - Enhanced ACK diagnostics
@@ -1614,7 +1681,7 @@ void NetworkManager::AckThread(const char* topic, uint32_t ack_level, int ack_fd
 			const int drain_eff = drain_us > 0 ? drain_us : 1000;
 			auto drain_end = std::chrono::steady_clock::now() + std::chrono::microseconds(drain_eff);
 			while (std::chrono::steady_clock::now() < drain_end) {
-				cached_ack = GetOffsetToAck(topic, ack_level);
+				cached_ack = GetOffsetToAck(topic.c_str(), ack_level);
 				if (cached_ack != (size_t)-1 && next_to_ack_offset <= cached_ack) {
 					found_ack = true;
 					consecutive_ack_stalls = 0;
@@ -1899,7 +1966,7 @@ void NetworkManager::SetupPublishConnection(ConnectionState* state, const NewPub
                               << ", topic='" << conn.handshake.topic << "', client_id=" << conn.handshake.client_id;
                     // Launch ACK thread
                     threads_.emplace_back(&NetworkManager::AckThread, this,
-                                         conn.handshake.topic, conn.handshake.ack,
+                                         std::string(conn.handshake.topic), conn.handshake.ack,
                                          ack_fd, local_ack_efd);
                 }
 
@@ -2208,7 +2275,23 @@ void NetworkManager::CXLAllocationWorker() {
         metric_batches_copied_.fetch_add(1, std::memory_order_relaxed);
 
         // Mark batch complete (critical for sequencer visibility)
+        // [[CRITICAL FIX: OUT_OF_ORDER_BATCH_COMPLETION]]
+        // Set num_msg BEFORE batch_complete=1. The ring slot was allocated with num_msg=0
+        // to prevent scanner from seeing "in-flight" batches. Now that data copy is done,
+        // we atomically make the batch visible by setting both fields and flushing.
         if (batch_header_location != nullptr) {
+            // [[DIAGNOSTIC]] Verify num_msg is 0 in ring before we set it
+            uint32_t prev_num_msg = batch_header_location->num_msg;
+            if (prev_num_msg != 0) {
+                static std::atomic<int> diag_count{0};
+                if (++diag_count <= 10) {
+                    LOG(WARNING) << "CXLAllocationWorker: Ring slot had num_msg=" << prev_num_msg
+                                << " before completion (expected 0). batch_seq=" << batch.batch_header.batch_seq;
+                }
+            }
+            // First set num_msg (scanner checks num_msg>0 as prerequisite)
+            __atomic_store_n(&batch_header_location->num_msg, batch.batch_header.num_msg, __ATOMIC_RELEASE);
+            // Then set batch_complete=1 (authoritative readiness signal)
             __atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
             CXL::flush_cacheline(batch_header_location);
 

@@ -144,8 +144,10 @@ public:
      * Creates a network manager for the specified broker
      * @param broker_id The ID of this broker
      * @param num_reqReceive_threads Number of request receiving threads to create
+     * @param skip_networking If true, skip starting listener/receiver threads (sequencer-only mode)
      */
-    NetworkManager(int broker_id, int num_reqReceive_threads = NUM_NETWORK_IO_THREADS);
+    NetworkManager(int broker_id, int num_reqReceive_threads = NUM_NETWORK_IO_THREADS,
+                   bool skip_networking = false);
     
     /**
      * Destructor ensures clean shutdown of all threads
@@ -173,7 +175,8 @@ private:
     // Thread handlers
     void MainThread();
     void ReqReceiveThread();
-    void AckThread(const char* topic, uint32_t ack_level, int ack_fd, int ack_efd);
+    /** @param topic Copy of topic name (thread may start after handshake is gone). */
+    void AckThread(std::string topic, uint32_t ack_level, int ack_fd, int ack_efd);
     size_t GetOffsetToAck(const char* topic, uint32_t ack_level);
 	void SubscribeNetworkThread(int sock, int efd, const char* topic, int connection_id);
 
