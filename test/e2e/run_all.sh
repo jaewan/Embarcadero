@@ -9,6 +9,7 @@ TESTS=(
     "test_basic_publish.sh"
     "test_explicit_replication_order5_ack2.sh"
     "test_sequencer_only_topology.sh"
+    "test_order0_ack1.sh"
     # Add more tests here as they're created:
     # "test_ordering.sh"
     # "test_durability.sh"

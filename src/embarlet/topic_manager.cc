@@ -455,6 +455,77 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 	}
 }
 
+bool TopicManager::ReserveBLogSpace(const char* topic, size_t size, void*& log) {
+	// [[RECV_DIRECT_TO_CXL]] Mirror GetCXLBuffer topic-creation so direct path accepts new topics
+	struct TInode* tinode = cxl_manager_.GetTInode(topic);
+	if (!tinode || tinode->topic[0] == 0) {
+		if (broker_id_ != 0) return false;
+		tinode = CreateNewTopicInternal(topic, 0, 0, false, 0, EMBARCADERO);
+		if (!tinode) return false;
+	}
+	{
+		absl::ReaderMutexLock lock(&topics_mutex_);
+		auto topic_itr = topics_.find(topic);
+		if (topic_itr != topics_.end()) {
+			log = topic_itr->second->ReserveBLogSpace(size);
+			return (log != nullptr);
+		}
+	}
+	// Topic not in map yet; create and single lookup
+	tinode = CreateNewTopicInternal(topic);
+	if (!tinode) return false;
+	absl::ReaderMutexLock lock(&topics_mutex_);
+	auto topic_itr = topics_.find(topic);
+	if (topic_itr == topics_.end()) return false;
+	log = topic_itr->second->ReserveBLogSpace(size);
+	return (log != nullptr);
+}
+
+bool TopicManager::ReserveBLogSpace(Topic* topic_ptr, size_t size, void*& log, bool epoch_already_checked) {
+	if (!topic_ptr) return false;
+	log = topic_ptr->ReserveBLogSpace(size, epoch_already_checked);
+	return (log != nullptr);
+}
+
+Topic* TopicManager::GetTopic(const std::string& topic_name) {
+	absl::ReaderMutexLock lock(&topics_mutex_);
+	auto it = topics_.find(topic_name);
+	return (it == topics_.end()) ? nullptr : it->second.get();
+}
+
+bool TopicManager::IsPBRAboveHighWatermark(const char* topic, int high_pct) {
+	absl::ReaderMutexLock lock(&topics_mutex_);
+	auto it = topics_.find(topic);
+	if (it == topics_.end()) return false;
+	return it->second->IsPBRAboveHighWatermark(high_pct);
+}
+
+bool TopicManager::IsPBRAboveHighWatermark(Topic* topic_ptr, int high_pct) {
+	return topic_ptr ? topic_ptr->IsPBRAboveHighWatermark(high_pct) : false;
+}
+
+bool TopicManager::IsPBRBelowLowWatermark(const char* topic, int low_pct) {
+	absl::ReaderMutexLock lock(&topics_mutex_);
+	auto it = topics_.find(topic);
+	if (it == topics_.end()) return true;
+	return it->second->IsPBRBelowLowWatermark(low_pct);
+}
+
+bool TopicManager::ReservePBRSlotAndWriteEntry(const char* topic, BatchHeader& batch_header, void* log,
+		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location) {
+	// Topic must already exist (created by ReserveBLogSpace or prior GetCXLBuffer)
+	absl::ReaderMutexLock lock(&topics_mutex_);
+	auto it = topics_.find(topic);
+	if (it == topics_.end()) return false;
+	return it->second->ReservePBRSlotAndWriteEntry(batch_header, log, segment_header, logical_offset, batch_header_location);
+}
+
+bool TopicManager::ReservePBRSlotAndWriteEntry(Topic* topic_ptr, BatchHeader& batch_header, void* log,
+		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+		bool epoch_already_checked) {
+	return topic_ptr && topic_ptr->ReservePBRSlotAndWriteEntry(batch_header, log, segment_header, logical_offset, batch_header_location, epoch_already_checked);
+}
+
 bool TopicManager::GetBatchToExport(
 		const char* topic,
 		size_t &expected_batch_offset,

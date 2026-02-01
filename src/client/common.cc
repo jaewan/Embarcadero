@@ -46,7 +46,7 @@ bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAM
 		return false;
 	}
 
-	LOG(INFO) << "Topic created successfully: " << topic;
+	VLOG(1) << "Topic created successfully: " << topic;
 	
 	// Give head node time to fully initialize TInode before followers access it
 	// This is important to avoid race conditions where publishers connect to
@@ -165,7 +165,12 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
             close(sock);
             return -1;
         }
-        
+        int actual = 0;
+        socklen_t len = sizeof(actual);
+        if (getsockopt(sock, SOL_SOCKET, SO_SNDBUF, &actual, &len) == 0 && actual < sendBufferSize) {
+            LOG(WARNING) << "SO_SNDBUF capped: requested " << sendBufferSize << " got " << actual
+                        << ". Raise net.core.wmem_max (e.g. scripts/tune_kernel_buffers.sh)";
+        }
         // Enable zero-copy for sending
         if (setsockopt(sock, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
             LOG(ERROR) << "setsockopt(SO_ZEROCOPY) failed: " << strerror(errno);
@@ -179,6 +184,12 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
             LOG(ERROR) << "setsockopt(SO_RCVBUF) failed: " << strerror(errno);
             close(sock);
             return -1;
+        }
+        int actual = 0;
+        socklen_t len = sizeof(actual);
+        if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF, &actual, &len) == 0 && actual < receiveBufferSize) {
+            LOG(WARNING) << "SO_RCVBUF capped: requested " << receiveBufferSize << " got " << actual
+                        << ". Raise net.core.rmem_max (e.g. scripts/tune_kernel_buffers.sh)";
         }
     }
 

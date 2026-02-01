@@ -110,6 +110,19 @@ class TopicManager {
 				heartbeat_system::SequencerType& seq_type,
 				BatchHeader*& batch_header_location);
 
+		// [[RECV_DIRECT_TO_CXL]] Split allocation for zero-copy receive path
+		bool ReserveBLogSpace(const char* topic, size_t size, void*& log);
+		bool IsPBRAboveHighWatermark(const char* topic, int high_pct);
+		bool IsPBRBelowLowWatermark(const char* topic, int low_pct);
+		bool ReservePBRSlotAndWriteEntry(const char* topic, BatchHeader& batch_header, void* log,
+				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location);
+		// [[PERF]] Topic* overloads to avoid repeated topics_mutex_ lookup (use with cached Topic* from GetTopic)
+		bool IsPBRAboveHighWatermark(Topic* topic_ptr, int high_pct);
+		bool ReserveBLogSpace(Topic* topic_ptr, size_t size, void*& log, bool epoch_already_checked = false);
+		bool ReservePBRSlotAndWriteEntry(Topic* topic_ptr, BatchHeader& batch_header, void* log,
+				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
+
 		bool GetBatchToExport(
 				const char* topic,
 				size_t &expected_batch_offset,

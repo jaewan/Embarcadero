@@ -47,6 +47,17 @@ struct HoldEntry5 {
 };
 
 /**
+ * Lock-free PBR allocation state (128-bit for CMPXCHG16B on x86-64).
+ * Atomically allocates (slot_seq, logical_offset) to avoid ordering violations.
+ * @paper_ref docs/LOCKFREE_PBR_DESIGN.md §4.1
+ */
+struct alignas(16) PBRProducerState {
+	uint64_t next_slot_seq;   // Monotonic slot sequence (not byte offset)
+	uint64_t logical_offset; // Cumulative message count
+};
+static_assert(sizeof(PBRProducerState) == 16, "Must be 16 bytes for CMPXCHG16B");
+
+/**
  * Callback type for obtaining a new segment
  */
 using GetNewSegmentCallback = std::function<void*()>;
@@ -159,7 +170,25 @@ class Topic {
 
 		int GetOrder(){ return order_; }
 
+		/** [[Issue #3]] Single epoch check per batch: do once at batch start, pass epoch_already_checked to ReserveBLogSpace/ReservePBRSlotAndWriteEntry. Returns true if stale (caller must not allocate). */
+		bool CheckEpochOnce();
+		void* ReserveBLogSpace(size_t size, bool epoch_already_checked = false);
+		void RefreshPBRConsumedThroughCache();
+		bool IsPBRAboveHighWatermark(int high_pct);
+		bool IsPBRBelowLowWatermark(int low_pct);
+		/**
+		 * @brief Reserves one PBR slot and writes BatchHeader to CXL; caller then writes payload and flushes.
+		 * @threading Thread-safe: lock-free (128-bit CAS) when pbr_state_.is_lock_free(), else mutex-protected.
+		 * @ownership batch_header_location points into CXL; caller must flush before signalling completion.
+		 * @paper_ref docs/LOCKFREE_PBR_DESIGN.md §4; RECEIVE_PATH §3.1 (atomic PBR reserve).
+		 */
+		bool ReservePBRSlotAndWriteEntry(BatchHeader& batch_header, void* log,
+				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
+
 	private:
+		/** Lock-free PBR slot reservation (128-bit CAS). Returns false if ring full. @threading Concurrent. */
+		bool ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, size_t& out_logical_offset);
 		/**
 		 * Update the TInode's written offset and address
 		 */
@@ -171,12 +200,18 @@ class Topic {
 	 * This is for Corfu, Scalog, and Embarcadero weak ordering
 	 * 
 	 * Processing pipeline:
-	 * 1. Poll received flag (set by Receiver)
+	 * 1. Poll batch_complete on BatchHeader (gating; BlogMessageHeader::received is not used)
 	 * 2. Assign local counter (per-broker sequence)
 	 * 3. Update Bmeta.local.processed_ptr
 	 * 4. Flush cache line (bytes 16-31 only)
 	 */
 	void DelegationThread();
+
+		/**
+		 * [[RECV_DIRECT_TO_CXL]] Returns PBR ring utilization 0..100, or -1 if sequencer-only.
+		 * Uses cached consumed_through; refreshes every kPBRCacheRefreshInterval.
+		 */
+		int GetPBRUtilizationPct();
 
 		/**
 		 * Check and handle segment boundary crossing
@@ -302,6 +337,19 @@ class Topic {
 		std::atomic<uint64_t> ring_full_count_{0};
 		std::atomic<uint64_t> ring_full_last_log_time_{0};
 
+		// [[RECV_DIRECT_TO_CXL]] Cached PBR consumed_through and next_slot for watermark checks (avoids mutex in GetPBRUtilizationPct)
+		std::atomic<size_t> cached_pbr_consumed_through_{0};
+		std::atomic<size_t> cached_next_slot_offset_{0};
+		std::atomic<uint64_t> pbr_cache_refresh_counter_{0};
+		// Refresh consumed_through every 100 batches (~10–100μs at high throughput). Balances staleness (100 slots ≈ 20% of 512-slot ring) vs CXL read overhead. [[CODE_REVIEW Issue #7]]
+		static constexpr uint64_t kPBRCacheRefreshInterval = 100;
+
+		// [[LOCKFREE_PBR]] 128-bit CAS state; fallback to mutex when not lock-free (docs/LOCKFREE_PBR_DESIGN.md)
+		std::atomic<PBRProducerState> pbr_state_{{0, 0}};
+		std::atomic<uint64_t> cached_consumed_seq_{0};  // Slot sequence from consumed_through / sizeof(BatchHeader)
+		const size_t num_slots_;                         // BATCHHEADERS_SIZE / sizeof(BatchHeader), set in ctor
+		bool use_lock_free_pbr_{false};                  // True when pbr_state_.is_lock_free()
+
 		// TInode cache
 		int replication_factor_;
 		void* ordered_offset_addr_;
@@ -351,6 +399,8 @@ class Topic {
 		// [[PHASE_1A_EPOCH_FENCING]] Broker's view of ControlBlock.epoch; updated in RefreshBrokerEpochFromCXL
 		// [[THREADING]] Written by PublishReceiveThreads in GetCXLBuffer paths; must be atomic (no mutex on hot path)
 		std::atomic<uint64_t> broker_epoch_{0};
+		// [[Issue #3]] Epoch from last CheckEpochOnce() for use when epoch_already_checked=true in ReservePBRSlotAndWriteEntry
+		std::atomic<uint64_t> last_checked_epoch_{0};
 		// [[PHASE_1A_EPOCH_FENCING]] Counter for periodic epoch check (every kEpochCheckInterval batches; design §4.2.1 "e.g. every 100 batches")
 		std::atomic<uint64_t> epoch_check_counter_{0};
 		static constexpr uint64_t kEpochCheckInterval = 100;

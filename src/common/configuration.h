@@ -105,6 +105,8 @@ struct EmbarcaderoConfig {
         // PBR (batch header ring) backpressure: stop reading from TCP when utilization above high, resume when below low.
         ConfigValue<int> pbr_high_watermark_pct{80, "EMBARCADERO_PBR_HIGH_WATERMARK_PCT"};
         ConfigValue<int> pbr_low_watermark_pct{50, "EMBARCADERO_PBR_LOW_WATERMARK_PCT"};
+        // Publish pipeline profile (DrainPayloadToBuffer, etc.). When false, no timing/RecordProfile in hot path (higher throughput for benchmarks).
+        ConfigValue<bool> enable_publish_pipeline_profile{true, "EMBARCADERO_ENABLE_PUBLISH_PIPELINE_PROFILE"};
     } network;
 
     // Corfu configuration
@@ -163,6 +165,8 @@ struct EmbarcaderoConfig {
             ConfigValue<bool> use_hugepages{true, "EMBARCADERO_CLIENT_USE_HUGEPAGES"};
             ConfigValue<bool> numa_bind{true, "EMBARCADERO_CLIENT_NUMA_BIND"};
             ConfigValue<bool> zero_copy{true, "EMBARCADERO_CLIENT_ZERO_COPY"};
+            /** Lightweight publisher pipeline profile (buffer write + send). Default false to avoid overhead. */
+            ConfigValue<bool> enable_publisher_pipeline_profile{false, "EMBARCADERO_ENABLE_PUBLISHER_PIPELINE_PROFILE"};
         } performance;
     } client;
 };

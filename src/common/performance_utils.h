@@ -241,6 +241,16 @@ inline void store_fence() {
 }
 
 /**
+ * @brief Cast volatile pointer to const void* for flush_cacheline()
+ *
+ * Avoids verbose repeated pattern: const_cast<const void*>(reinterpret_cast<const volatile void*>(p))
+ */
+template <typename T>
+inline const void* ToFlushable(volatile T* p) {
+    return const_cast<const void*>(reinterpret_cast<const volatile void*>(p));
+}
+
+/**
  * @brief Selective cache flush for BlogMessageHeader receiver region (bytes 0-15)
  *
  * @threading Thread-safe (CPU instruction, no synchronization needed)
@@ -254,8 +264,8 @@ inline void store_fence() {
  * This is more efficient than flushing the entire 64-byte header when only
  * the receiver region has been modified.
  *
- * Performance: HOT PATH - Called after every message receive
- * Usage: After writing size, received, ts fields
+ * Performance: HOT PATH when receiver region is written.
+ * Usage: After writing size (and optionally received/ts if latency tracing enabled; received/ts are reserved for future use and not written on current hot path).
  *
  * Note: For BlogMessageHeader, bytes 0-15 are in the first cache line (bytes 0-63).
  * All three regions (0-15, 16-31, 32-47) share the same cache line, so all three

@@ -38,7 +38,7 @@ size_t CalculateOptimalQueueSize(size_t num_threads_per_broker, size_t total_mes
 	// Always use the optimized 256MB per thread, but ensure it's sufficient for the dataset
 	size_t queue_size = std::max(total_buffer_size, required_size);
 	
-	LOG(INFO) << "Using optimized 256MB per thread: " << (total_buffer_size / (1024 * 1024)) << " MB total "
+	VLOG(1) << "Using optimized 256MB per thread: " << (total_buffer_size / (1024 * 1024)) << " MB total "
 	          << "(required for dataset: " << (required_size / (1024 * 1024)) << " MB, "
 	          << "final queue: " << (queue_size / (1024 * 1024)) << " MB)";
 	
@@ -77,7 +77,7 @@ class ProgressTracker {
 				double rate = current_operations / (total_elapsed > 0 ? total_elapsed : 1);
 				double eta = (total_ops_ - current_operations) / (rate > 0 ? rate : 1);
 
-				LOG(INFO) << "Progress: " << std::fixed << std::setprecision(1) << progress_pct << "% "
+				VLOG(1) << "Progress: " << std::fixed << std::setprecision(1) << progress_pct << "% "
 					<< "(" << current_operations << "/" << total_ops_ << ") "
 					<< "Rate: " << std::setprecision(2) << rate << " ops/sec, "
 					<< "ETA: " << std::setprecision(0) << eta << " sec";
@@ -209,7 +209,7 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 	// Calculate number of messages
 	size_t n = total_message_size / message_size;
 
-	LOG(INFO) << "Starting publish throughput test with " << n << " messages"
+	VLOG(1) << "Starting publish throughput test with " << n << " messages"
 		<< " (" << total_message_size << " bytes total)"
 		<< ", client " << (num_clients - synchronizer.load() + 1) << " of " << num_clients;
 

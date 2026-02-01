@@ -44,6 +44,67 @@ inline void CleanupSocketAndEpoll(int socket_fd, int epoll_fd) {
 }
 
 /**
+ * Set SO_RCVBUF/SO_SNDBUF on an accepted payload socket so rcv_space is large.
+ * Called after accept(); without this, accepted sockets use kernel default (~43KB).
+ * @threading Called from MainThread (accept loop)
+ */
+static void SetAcceptedSocketBuffers(int fd) {
+	const int buffer_size = 32 * 1024 * 1024;  // 32 MB (match SetupPayloadSocket)
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+		LOG(WARNING) << "setsockopt(SO_RCVBUF) on accepted socket failed: " << strerror(errno);
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+		LOG(WARNING) << "setsockopt(SO_SNDBUF) on accepted socket failed: " << strerror(errno);
+	}
+	// [[DIAGNOSTIC]] Verify kernel actually applied the buffer sizes
+	int actual_rcv = 0, actual_snd = 0;
+	socklen_t len = sizeof(actual_rcv);
+	getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &len);
+	getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &len);
+	// Kernel doubles the value; we expect actual >= buffer_size
+	if (actual_rcv < buffer_size) {
+		LOG(WARNING) << "SO_RCVBUF capped: requested=" << buffer_size << " actual=" << actual_rcv
+		             << " (fd=" << fd << "). Check net.core.rmem_max";
+	}
+	LOG(INFO) << "SetAcceptedSocketBuffers fd=" << fd << " SO_RCVBUF=" << actual_rcv
+	          << " SO_SNDBUF=" << actual_snd;
+}
+
+// [[PERF]] Named constants for recovery loop (avoid magic numbers)
+static constexpr int kRecoveryCheckInterval = 100;  // Check every N epoll iterations
+static constexpr int kMaxPBRRetries = 20;           // WAIT_PBR_SLOT: recovery attempts before fallback handoff
+
+// [[KNOWN_DEVIATION]] offset_entry.written is volatile size_t in CXL; casting to (size_t*) for
+// __atomic_* is undefined in C++ (object is not an atomic type). GCC/clang support it in practice.
+// A standards-clean fix would require C++20 std::atomic_ref or changing CXL layout.
+void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, size_t logical_offset, uint32_t num_msg) {
+	if (!tinode) return;
+	const size_t new_written = logical_offset + num_msg;
+	volatile size_t* written_ptr = &tinode->offsets[broker_id_].written;
+	size_t current;
+	do {
+		current = __atomic_load_n((size_t*)written_ptr, __ATOMIC_ACQUIRE);
+		if (new_written <= current) break;
+	} while (!__atomic_compare_exchange_n(
+		(size_t*)written_ptr, &current, new_written,
+		false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE));
+	CXL::flush_cacheline(CXL::ToFlushable(written_ptr));
+}
+
+void NetworkManager::CompleteBatchInCXL(BatchHeader* batch_header_location, uint32_t num_msg, TInode* tinode, size_t logical_offset) {
+	// [[PERF]] Removed std::chrono profiling from hot path - adds ~100-200ns overhead per batch
+	if (!batch_header_location) return;
+	__atomic_store_n(&batch_header_location->num_msg, num_msg, __ATOMIC_RELEASE);
+	__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
+	CXL::flush_cacheline(batch_header_location);
+	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(batch_header_location) + 64);
+	if (tinode && tinode->order == 0) {
+		UpdateWrittenForOrder0(tinode, logical_offset, num_msg);
+	}
+	CXL::store_fence();
+}
+
+/**
  * Configures a socket for non-blocking operation with TCP optimizations
  */
 bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
@@ -84,10 +145,24 @@ bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
 	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_SNDBUF) failed: " << strerror(errno);
 		// Non-fatal, continue (will use default buffer size)
+	} else {
+		int actual = 0;
+		socklen_t len = sizeof(actual);
+		if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual, &len) == 0 && actual < buffer_size) {
+			LOG(WARNING) << "SO_SNDBUF capped: requested " << buffer_size << " got " << actual
+			             << ". Raise net.core.wmem_max (e.g. scripts/tune_kernel_buffers.sh)";
+		}
 	}
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_RCVBUF) failed: " << strerror(errno);
 		// Non-fatal, continue (will use default buffer size)
+	} else {
+		int actual = 0;
+		socklen_t len = sizeof(actual);
+		if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &len) == 0 && actual < buffer_size) {
+			LOG(WARNING) << "SO_RCVBUF capped: requested " << buffer_size << " got " << actual
+			             << ". Raise net.core.rmem_max (e.g. scripts/tune_kernel_buffers.sh)";
+		}
 	}
 
 	return true;
@@ -283,8 +358,10 @@ NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads, bool s
 			// Initialize publish connection queue (64 pending connections)
 			publish_connection_queue_ = std::make_unique<folly::MPMCQueue<NewPublishConnection>>(64);
 
+			bool recv_direct = config.network.recv_direct_to_cxl.get();
 			LOG(INFO) << "NetworkManager: Non-blocking mode enabled "
-			          << "(staging_pool=" << num_buffers << "×" << buffer_size_mb << "MB)";
+			          << "(staging_pool=" << num_buffers << "×" << buffer_size_mb << "MB, recv_direct_to_cxl="
+			          << (recv_direct ? "true" : "false") << ")";
 		} else {
 			LOG(INFO) << "NetworkManager: Using blocking mode (EMBARCADERO_USE_NONBLOCKING=0)";
 		}
@@ -327,6 +404,10 @@ NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads, bool s
 	}
 
 NetworkManager::~NetworkManager() {
+	// Log publish pipeline profile first (before joining threads) so it is emitted even if process is killed during shutdown
+	LogPublishPipelineProfile();
+	google::FlushLogFiles(google::GLOG_INFO);  // Ensure profile is on disk before join (SIGTERM during join can abort before flush)
+
 	// Signal threads to stop
 	stop_threads_ = true;
 
@@ -348,6 +429,63 @@ NetworkManager::~NetworkManager() {
 
 void NetworkManager::SetCXLManager(CXLManager* cxl_manager) {
 	cxl_manager_ = cxl_manager;
+}
+
+void NetworkManager::RecordProfile(PublishPipelineComponent c, uint64_t ns) {
+	if (c < 0 || c >= kNumPipelineComponents) return;
+	profile_total_ns_[c].fetch_add(ns, std::memory_order_relaxed);
+	profile_count_[c].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NetworkManager::LogPublishPipelineProfile() {
+	static const char* kComponentNames[] = {
+		"DrainHeader",
+		"ReserveBLogSpace",
+		"DrainPayloadToBuffer",
+		"ReservePBRSlotAndWriteEntry",
+		"CompleteBatchInCXL",
+		"GetCXLBuffer",
+		"CopyAndFlushPayload",
+	};
+	uint64_t total_ns = 0;
+	for (int c = 0; c < kNumPipelineComponents; ++c) {
+		total_ns += profile_total_ns_[c].load(std::memory_order_relaxed);
+	}
+	if (total_ns == 0) {
+		LOG(INFO) << "[PublishPipelineProfile] No samples yet.";
+		return;
+	}
+	LOG(INFO) << "[PublishPipelineProfile] === Aggregated time per component ===";
+	for (int c = 0; c < kNumPipelineComponents; ++c) {
+		uint64_t ns = profile_total_ns_[c].load(std::memory_order_relaxed);
+		uint64_t cnt = profile_count_[c].load(std::memory_order_relaxed);
+		uint64_t avg_ns = cnt ? (ns / cnt) : 0;
+		double pct = (100.0 * static_cast<double>(ns)) / static_cast<double>(total_ns);
+		LOG(INFO) << "[PublishPipelineProfile]   " << kComponentNames[c]
+			<< ": total=" << (ns / 1000) << " us, count=" << cnt
+			<< ", avg=" << avg_ns << " ns, " << pct << "% of pipeline time";
+	}
+	LOG(INFO) << "[PublishPipelineProfile]   TOTAL: " << (total_ns / 1000) << " us ("
+		<< (total_ns / 1e9) << " s) across all components";
+	LOG(INFO) << "[PublishPipelineProfile] ========================================";
+}
+
+void NetworkManager::EnsureCachedTopicValid(ConnectionState* state) {
+	if (!state || !cxl_manager_) return;
+	state->batch_count_since_validate++;
+	if (state->batch_count_since_validate >= kCachedTopicValidateInterval) {
+		state->batch_count_since_validate = 0;
+		Topic* fresh = cxl_manager_->GetTopicPtr(state->handshake.topic);
+		if (fresh != state->cached_topic)
+			state->cached_topic = fresh;
+	}
+}
+
+bool NetworkManager::CheckPBRWatermark(ConnectionState* state, int pct) {
+	if (!cxl_manager_ || !state) return false;
+	return state->cached_topic
+		? cxl_manager_->IsPBRAboveHighWatermark(static_cast<Topic*>(state->cached_topic), pct)
+		: cxl_manager_->IsPBRAboveHighWatermark(state->handshake.topic, pct);
 }
 
 void NetworkManager::EnqueueRequest(struct NetworkRequest request) {
@@ -445,14 +583,18 @@ void NetworkManager::MainThread() {
 				struct sockaddr_in client_addr;
 				socklen_t client_addr_len = sizeof(client_addr);
 
-				req.client_socket = accept(server_socket,
-						(struct sockaddr*)&client_addr,
-						&client_addr_len);
+			req.client_socket = accept(server_socket,
+					(struct sockaddr*)&client_addr,
+					&client_addr_len);
 
 			if (req.client_socket < 0) {
 				LOG(ERROR) << "Error accepting connection: " << strerror(errno);
 				continue;
 			}
+
+			// Apply large socket buffers so rcv_space is not ~43KB (kernel default).
+			// Without this, throughput is TCP-window limited (~884 MB/s).
+			SetAcceptedSocketBuffers(req.client_socket);
 
 			// Enqueue the request for processing
 			request_queue_.blockingWrite(req);
@@ -799,58 +941,13 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-	// [[BLOG_HEADER: Lightweight sanity check (no per-message conversion)]]
-	// Since publisher now emits BlogMessageHeader directly when EMBARCADERO_USE_BLOG_HEADER=1,
-	// receiver no longer needs to convert v1→v2. Just validate boundaries and sizes.
+	// Whether we're using BlogMessageHeader (Order 5 + env): used only to skip v1 validation when publisher sent v2.
 	TInode* tinode = nullptr;
 	bool is_blog_header_enabled = false;
 	if (seq_type == EMBARCADERO) {
 		tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
-		if (tinode && tinode->order == 5 && HeaderUtils::ShouldUseBlogHeader()) {
+		if (tinode && tinode->order == 5 && HeaderUtils::ShouldUseBlogHeader())
 			is_blog_header_enabled = true;
-		}
-	}
-
-	if (is_blog_header_enabled && batch_header.num_msg > 0) {
-		// [[BLOG_HEADER: Receiver Stage - Set receiver region fields (bytes 0-15)]]
-		// Paper spec §3.1: Receiver sets received=1 and ts when payload write completes
-		// This is done here after batch is fully received (zero-copy into CXL)
-		BlogMessageHeader* current_msg = reinterpret_cast<BlogMessageHeader*>(buf);
-		uint64_t receive_timestamp = Embarcadero::CXL::rdtsc();  // Single timestamp for batch
-		size_t remaining_bytes = batch_header.total_size;
-		
-		for (size_t i = 0; i < batch_header.num_msg; ++i) {
-			// Validate message header bounds
-			if (!wire::ValidateV2Payload(current_msg->size, remaining_bytes)) {
-				VLOG(2) << "NetworkManager: Message " << i << " has invalid size=" << current_msg->size;
-				break;
-			}
-			
-			// Set receiver region fields (bytes 0-15) - Paper spec Stage 1
-			current_msg->received = 1;  // Mark as received
-			current_msg->ts = receive_timestamp;  // Receipt timestamp
-			
-			// Compute stride and verify alignment
-			size_t stride = wire::ComputeStrideV2(current_msg->size);
-			if (stride % 64 != 0) {
-				VLOG(2) << "NetworkManager: Message " << i << " stride " << stride << " not 64B aligned";
-				break;
-			}
-			if (stride > remaining_bytes) {
-				VLOG(2) << "NetworkManager: Message " << i << " stride " << stride
-				        << " exceeds remaining_bytes " << remaining_bytes;
-				break;
-			}
-			
-			// Move to next message
-			if (i < batch_header.num_msg - 1) {
-				current_msg = reinterpret_cast<BlogMessageHeader*>(
-					reinterpret_cast<uint8_t*>(current_msg) + stride
-				);
-			}
-			remaining_bytes -= stride;
-		}
-		VLOG(3) << "NetworkManager: Set receiver fields for " << batch_header.num_msg << " BlogMessageHeader messages for ORDER=5";
 	}
 
 	// Signal batch completion for ALL order levels
@@ -1083,8 +1180,8 @@ void NetworkManager::SubscribeNetworkThread(
 						num_messages)){
 				no_data_count++;
 				if (no_data_count % 1000 == 0) {
-					LOG(INFO) << "SubscribeNetworkThread: No data available for export yet (count=" << no_data_count 
-					          << "), topic=" << topic << ", last_offset=" << (*cached_state_ptr)->last_offset;
+					VLOG(2) << "SubscribeNetworkThread: No data available for export yet (count=" << no_data_count 
+					        << "), topic=" << topic << ", last_offset=" << (*cached_state_ptr)->last_offset;
 				}
 				std::this_thread::yield();
 				continue;
@@ -1356,6 +1453,12 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	if(replication_factor > 0){
 		if(ack_level == 1){
 			if(order == 0){
+				// [[CRITICAL_FIX: Invalidate cache before reading written for ORDER=0]]
+				// UpdateWrittenForOrder0 flushes from writer; AckThread must invalidate to see it
+				volatile uint64_t* written_ptr = &tinode->offsets[broker_id_].written;
+				CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(written_ptr)));
+				CXL::load_fence();
 				return tinode->offsets[broker_id_].written;
 			}else{
 				// [[CRITICAL_FIX: Invalidate cache before reading ordered for ORDER > 0]]
@@ -1419,6 +1522,12 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	}else{
 		// No replication: Acknowledge after written (order=0) or ordered (order>0)
 		if(order == 0){
+			// [[CRITICAL_FIX: Invalidate cache before reading written for ORDER=0]]
+			// UpdateWrittenForOrder0 flushes from writer; AckThread must invalidate to see it
+			volatile uint64_t* written_ptr = &tinode->offsets[broker_id_].written;
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(written_ptr)));
+			CXL::load_fence();
 			return tinode->offsets[broker_id_].written;
 		}else{
 			// [[CRITICAL_FIX: Invalidate cache before reading ordered for ORDER > 0]]
@@ -1599,7 +1708,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 					// The sequencer region (ordered, ordered_offset) is at offset 512 within offset_entry
 					// [[PERF: Read AFTER invalidation, not before]] - Reading before flush defeats the purpose
 					volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
-					CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(ordered_ptr)));
+					CXL::flush_cacheline(CXL::ToFlushable(ordered_ptr));
 					CXL::load_fence();
 					// Now read the fresh value after invalidation
 					size_t ordered_after = *ordered_ptr;
@@ -1728,7 +1837,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 		}
 
 		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
-			LOG(INFO) << "AckThread: Broker " << broker_id_ << " sending ack for " << ack << " messages (prev=" << next_to_ack_offset-1 << ")";
+			VLOG(2) << "AckThread: Broker " << broker_id_ << " sending ack for " << ack << " messages (prev=" << next_to_ack_offset-1 << ")";
 			next_to_ack_offset = ack + 1;
 			acked_size = 0;
 			// Send offset acknowledgment
@@ -1823,6 +1932,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
  * @return true when header is complete, false if more data needed or error
  */
 bool NetworkManager::DrainHeader(int fd, ConnectionState* state) {
+    // [[PERF]] Removed std::chrono profiling from hot path
     size_t remaining = sizeof(BatchHeader) - state->header_offset;
 
     ssize_t n = recv(fd, reinterpret_cast<uint8_t*>(&state->batch_header) + state->header_offset,
@@ -1830,7 +1940,6 @@ bool NetworkManager::DrainHeader(int fd, ConnectionState* state) {
 
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // Will retry on next EPOLLIN
             return false;
         }
         LOG(ERROR) << "DrainHeader: recv failed: " << strerror(errno) << " (fd=" << fd << ")";
@@ -1850,7 +1959,6 @@ bool NetworkManager::DrainHeader(int fd, ConnectionState* state) {
                 << " batch_seq=" << state->batch_header.batch_seq
                 << " total_size=" << state->batch_header.total_size;
     }
-
     return complete;
 }
 
@@ -1898,11 +2006,72 @@ bool NetworkManager::DrainPayload(int fd, ConnectionState* state) {
 }
 
 /**
+ * Drains payload data into an arbitrary buffer (e.g. CXL) using non-blocking recv.
+ * [[RECV_DIRECT_TO_CXL]] Same logic as DrainPayload but destination is caller-provided.
+ * [[PERF]] Drains in a loop until EAGAIN or complete: profile showed ~20 recv() calls per batch
+ * (3749/184) because we previously did one recv per epoll wakeup; looping reduces syscalls and
+ * epoll round-trips per batch.
+ * @return true when payload is complete, false if more data needed or error
+ */
+bool NetworkManager::DrainPayloadToBuffer(int fd, ConnectionState* state, void* dest_buf) {
+    // [[PERF]] One timestamp around whole call (not per-iteration) so we can measure wall-clock % without hot-path overhead.
+    auto t0 = std::chrono::steady_clock::now();
+    if (!dest_buf) {
+        LOG(ERROR) << "DrainPayloadToBuffer: dest_buf is nullptr (fd=" << fd << ")";
+        return false;
+    }
+    uint8_t* dest = reinterpret_cast<uint8_t*>(dest_buf);
+    const size_t total_size = state->batch_header.total_size;
+
+    static thread_local size_t recv_calls_this_thread = 0;
+    static thread_local size_t batches_complete_this_thread = 0;
+    static thread_local size_t total_bytes_drained_this_thread = 0;
+
+    while (state->payload_offset < total_size) {
+        size_t remaining = total_size - state->payload_offset;
+        ssize_t n = recv(fd, dest + state->payload_offset, remaining, MSG_DONTWAIT);
+        recv_calls_this_thread++;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return false;
+            }
+            LOG(ERROR) << "DrainPayloadToBuffer: recv failed: " << strerror(errno) << " (fd=" << fd << ")";
+            return false;
+        }
+        if (n == 0) {
+            LOG(WARNING) << "DrainPayloadToBuffer: Connection closed, fd=" << fd;
+            return false;
+        }
+        state->payload_offset += static_cast<size_t>(n);
+    }
+
+    bool complete = (state->payload_offset == total_size);
+    if (complete) {
+        batches_complete_this_thread++;
+        total_bytes_drained_this_thread += total_size;
+        if (batches_complete_this_thread % 100 == 0) {
+            size_t avg_recv_per_batch = recv_calls_this_thread / batches_complete_this_thread;
+            size_t avg_bytes_per_recv = (recv_calls_this_thread > 0)
+                ? (total_bytes_drained_this_thread / recv_calls_this_thread) : 0;
+            LOG(INFO) << "[DrainPayloadToBuffer] Avg recv calls per batch (this thread): "
+                      << avg_recv_per_batch
+                      << ", avg bytes per recv: " << avg_bytes_per_recv
+                      << " (recv_calls=" << recv_calls_this_thread
+                      << " batches=" << batches_complete_this_thread << ")";
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        RecordProfile(kDrainPayloadToBuffer, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+        VLOG(3) << "DrainPayloadToBuffer: Complete. fd=" << fd << " batch_seq=" << state->batch_header.batch_seq;
+    }
+    return complete;
+}
+
+/**
  * Check if staging pool has recovered capacity and resume paused sockets
  */
 void NetworkManager::CheckStagingPoolRecovery(
         int epoll_fd,
-        absl::flat_hash_map<int, std::unique_ptr<ConnectionState>>& connections) {
+        absl::flat_hash_map<int, std::shared_ptr<ConnectionState>>& connections) {
 
     if (!staging_pool_) return;
 
@@ -1992,21 +2161,38 @@ void NetworkManager::PublishReceiveThread() {
     }
 
     struct epoll_event events[64];
-    absl::flat_hash_map<int, std::unique_ptr<ConnectionState>> connections;
+    absl::flat_hash_map<int, std::shared_ptr<ConnectionState>> connections;
 
     LOG(INFO) << "PublishReceiveThread started (epoll_fd=" << epoll_fd << ")";
 
-    // Phase 3: Batch recovery check counter for optimization
+    // Cache config once per thread (avoid hot-loop config access)
+    const bool recv_direct_cached = GetConfig().config().network.recv_direct_to_cxl.get();
+    const size_t max_batch_size_cached = GetConfig().config().storage.batch_size.get();
+    const int pbr_high_watermark_pct = GetConfig().config().network.pbr_high_watermark_pct.get();
+
+    // Phase 3: Batch recovery check counter for optimization (kRecoveryCheckInterval, kMaxPBRRetries at file scope)
     int recovery_check_counter = 0;
-    constexpr int RECOVERY_CHECK_INTERVAL = 100; // Check every 100 iterations
+
+    // Periodic profile log (every 10s) so profile is visible even when process is killed with SIGTERM (destructor may not run)
+    static std::atomic<std::chrono::steady_clock::time_point::rep> last_profile_log_epoch{0};
+    constexpr auto kProfileLogInterval = std::chrono::seconds(10);
 
     // Main event loop
     while (!stop_threads_) {
+        auto now = std::chrono::steady_clock::now();
+        auto now_rep = now.time_since_epoch().count();
+        auto last_rep = last_profile_log_epoch.load(std::memory_order_relaxed);
+        if (last_rep == 0 || (now - std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(last_rep))) >= kProfileLogInterval) {
+            if (last_profile_log_epoch.compare_exchange_strong(last_rep, now_rep, std::memory_order_relaxed)) {
+                LogPublishPipelineProfile();
+            }
+        }
+
         // Check for new publish connections to register
         NewPublishConnection new_conn;
         while (publish_connection_queue_ && publish_connection_queue_->read(new_conn)) {
-            // Create connection state
-            auto state = std::make_unique<ConnectionState>();
+            // Create connection state (shared_ptr so PendingBatch keeps it alive after connection teardown)
+            auto state = std::make_shared<ConnectionState>();
             state->fd = new_conn.fd;
             state->phase = WAIT_HEADER;
             state->client_id = new_conn.handshake.client_id;
@@ -2035,9 +2221,9 @@ void NetworkManager::PublishReceiveThread() {
 
             state->epoll_registered = true;
 
-            // Add to connections map (transfer ownership)
+            // Add to connections map (shared_ptr so PendingBatch keeps state alive after teardown)
             int fd = new_conn.fd;
-            connections[fd] = std::move(state);
+            connections[fd] = state;
 
             // Setup ACK connection if needed
             SetupPublishConnection(connections[fd].get(), new_conn);
@@ -2074,63 +2260,144 @@ void NetworkManager::PublishReceiveThread() {
             // Handle socket events
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                 LOG(WARNING) << "PublishReceiveThread: Socket error/hangup on fd=" << fd;
-
-                // Cleanup
-                if (state->staging_buf) {
-                    staging_pool_->Release(state->staging_buf);
+                if (state->cxl_buf) {
+                    metric_direct_cxl_connection_drop_with_buf_.fetch_add(1, std::memory_order_relaxed);
+                    size_t leaked = static_cast<size_t>(state->batch_header.total_size);
+                    metric_blog_leaked_bytes_.fetch_add(leaked, std::memory_order_relaxed);
+                    uint64_t total_leaked = metric_blog_leaked_bytes_.load(std::memory_order_relaxed);
+                    VLOG(1) << "PublishReceiveThread: fd=" << fd << " closed with cxl_buf set (BLog leak " << leaked << " bytes, total " << total_leaked << ")";
+                    if (total_leaked >= (1ULL << 20) && total_leaked - leaked < (1ULL << 20)) {
+                        LOG(WARNING) << "PublishReceiveThread: BLog leaked bytes above 1 MiB (total=" << total_leaked << ")";
+                    }
                 }
+                state->cxl_buf = nullptr;
+                if (state->staging_buf) staging_pool_->Release(state->staging_buf);
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
                 close(fd);
                 connections.erase(it);
                 continue;
             }
 
+            size_t max_batch_size = max_batch_size_cached;
+            if (staging_pool_) {
+                size_t staging_cap = staging_pool_->GetBufferSize();
+                if (staging_cap < max_batch_size) max_batch_size = staging_cap;
+            }
+
             if (events[i].events & EPOLLIN) {
-                switch (state->phase) {
+                switch (state->phase) {  // recv_direct_cached, max_batch_size from above
                     case WAIT_HEADER:
                         if (DrainHeader(fd, state)) {
-                            // Header complete, transition to payload phase
-                            state->phase = WAIT_PAYLOAD;
-
                             // Validate total_size
                             if (state->batch_header.total_size == 0 ||
-                                state->batch_header.total_size > staging_pool_->GetBufferSize()) {
+                                (staging_pool_ && state->batch_header.total_size > staging_pool_->GetBufferSize())) {
                                 LOG(ERROR) << "PublishReceiveThread: Invalid batch total_size="
                                           << state->batch_header.total_size;
-
-                                // Close connection
-                                if (state->staging_buf) {
-                                    staging_pool_->Release(state->staging_buf);
-                                }
+                                if (state->staging_buf) staging_pool_->Release(state->staging_buf);
                                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
                                 close(fd);
                                 connections.erase(it);
                                 continue;
                             }
 
-                            // Try to allocate staging buffer
-                            state->staging_buf = staging_pool_->Allocate(state->batch_header.total_size);
-                            if (!state->staging_buf) {
-                                // Backpressure: pause socket
-                                metric_staging_exhausted_.fetch_add(1, std::memory_order_relaxed);
-                                VLOG(2) << "PublishReceiveThread: Staging pool exhausted, pausing fd=" << fd;
-                                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-                                state->epoll_registered = false;
-                                // Will retry in CheckStagingPoolRecovery
+                            if (recv_direct_cached) {
+                                EnsureCachedTopicValid(state);
+                                if (CheckPBRWatermark(state, pbr_high_watermark_pct)) {
+                                    state->phase = WAIT_CXL;
+                                    state->epoll_registered = false;
+                                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                                    VLOG(2) << "PublishReceiveThread: PBR above " << pbr_high_watermark_pct
+                                           << "%, pausing fd=" << fd << " (direct-CXL backpressure)";
+                                } else {
+                                // [[Issue #3]] Single epoch check per batch: do once before ReserveBLogSpace when using cached_topic
+                                Topic* topic_ptr = state->cached_topic ? static_cast<Topic*>(state->cached_topic) : nullptr;
+                                if (topic_ptr && topic_ptr->CheckEpochOnce()) {
+                                    state->phase = WAIT_CXL;
+                                    state->epoll_registered = false;
+                                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                                    VLOG(2) << "PublishReceiveThread: Epoch stale, pausing fd=" << fd << " (direct-CXL)";
+                                } else {
+                                if (topic_ptr) state->epoch_checked_for_batch = true;
+                                void* log = nullptr;
+                                bool got_log;
+                                {
+                                    auto t0 = std::chrono::steady_clock::now();
+                                    got_log = topic_ptr
+                                        ? cxl_manager_->ReserveBLogSpace(topic_ptr, state->batch_header.total_size, log, true)
+                                        : cxl_manager_->ReserveBLogSpace(state->handshake.topic, state->batch_header.total_size, log);
+                                    auto t1 = std::chrono::steady_clock::now();
+                                    RecordProfile(kReserveBLogSpace, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+                                }
+                                if (!got_log || !log) {
+                                    state->epoch_checked_for_batch = false;
+                                    state->phase = WAIT_CXL;
+                                    state->epoll_registered = false;
+                                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                                    VLOG(2) << "PublishReceiveThread: Ring full, pausing fd=" << fd << " (direct-CXL)";
+                                } else {
+                                    state->cxl_buf = log;
+                                    state->phase = WAIT_PAYLOAD;
+                                }
+                                }
+                                }
+                            } else {
+                                state->phase = WAIT_PAYLOAD;
+                                state->staging_buf = staging_pool_->Allocate(state->batch_header.total_size);
+                                if (!state->staging_buf) {
+                                    metric_staging_exhausted_.fetch_add(1, std::memory_order_relaxed);
+                                    VLOG(2) << "PublishReceiveThread: Staging pool exhausted, pausing fd=" << fd;
+                                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                                    state->epoll_registered = false;
+                                }
                             }
                         }
                         break;
 
                     case WAIT_PAYLOAD:
-                        if (state->staging_buf && DrainPayload(fd, state)) {
+                        if (recv_direct_cached && state->cxl_buf) {
+                            if (DrainPayloadToBuffer(fd, state, state->cxl_buf)) {
+                                metric_batches_recv_direct_cxl_.fetch_add(1, std::memory_order_relaxed);
+                                void* cxl_buf = state->cxl_buf;
+                                BatchHeader batch_header = state->batch_header;
+                                EnsureCachedTopicValid(state);
+                                const char* topic = state->handshake.topic;
+                                void* segment_header = nullptr;
+                                size_t logical_offset = 0;
+                                BatchHeader* batch_header_location = nullptr;
+                                // Try PBR once; do not block. On failure, transition to WAIT_PBR_SLOT for recovery.
+                                bool pbr_ok;
+                                {
+                                    auto t0 = std::chrono::steady_clock::now();
+                                    pbr_ok = state->cached_topic
+                                        ? cxl_manager_->ReservePBRSlotAndWriteEntry(static_cast<Topic*>(state->cached_topic), batch_header, cxl_buf,
+                                                segment_header, logical_offset, batch_header_location, state->epoch_checked_for_batch)
+                                        : cxl_manager_->ReservePBRSlotAndWriteEntry(topic, batch_header, cxl_buf,
+                                                segment_header, logical_offset, batch_header_location);
+                                    state->epoch_checked_for_batch = false;
+                                    auto t1 = std::chrono::steady_clock::now();
+                                    RecordProfile(kReservePBRSlotAndWriteEntry, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+                                }
+                                state->epoch_checked_for_batch = false;
+                                if (!pbr_ok) {
+                                    state->phase = WAIT_PBR_SLOT;
+                                    state->pbr_retry_count = 1;
+                                    break;
+                                }
+                                state->logical_offset = logical_offset;
+                                state->batch_header_location = batch_header_location;
+                                TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+                                CompleteBatchInCXL(state->batch_header_location, batch_header.num_msg, tinode, state->logical_offset);
+                                state->cxl_buf = nullptr;
+                                state->batch_header_location = nullptr;
+                                state->payload_offset = 0;
+                                state->header_offset = 0;
+                                state->phase = WAIT_HEADER;
+                            }
+                        } else if (state->staging_buf && DrainPayload(fd, state)) {
                             // Payload complete, enqueue for CXL allocation
                             metric_batches_drained_.fetch_add(1, std::memory_order_relaxed);
 
-                            PendingBatch batch;
-                            batch.conn_state = state;
-                            batch.staging_buf = state->staging_buf;
-                            batch.batch_header = state->batch_header;
-                            batch.handshake = state->handshake;
+                            PendingBatch batch(it->second, state->staging_buf, state->batch_header, state->handshake);
 
                             if (!cxl_allocation_queue_->write(batch)) {
                                 LOG(ERROR) << "PublishReceiveThread: Failed to enqueue batch "
@@ -2150,6 +2417,10 @@ void NetworkManager::PublishReceiveThread() {
                         }
                         break;
 
+                    case WAIT_PBR_SLOT:
+                        // No EPOLLIN action; recovery loop retries PBR
+                        break;
+
                     default:
                         LOG(ERROR) << "PublishReceiveThread: Invalid phase=" << state->phase
                                   << " for fd=" << fd;
@@ -2159,18 +2430,98 @@ void NetworkManager::PublishReceiveThread() {
         }
 
         // Phase 3: Batched staging pool recovery (every N iterations)
-        // Reduces overhead when pool is healthy
-        if (++recovery_check_counter >= RECOVERY_CHECK_INTERVAL) {
+        if (++recovery_check_counter >= kRecoveryCheckInterval) {
             CheckStagingPoolRecovery(epoll_fd, connections);
+            if (recv_direct_cached) {
+                for (auto& [recovery_fd, recovery_state] : connections) {
+                    if (recovery_state->phase == WAIT_CXL && !recovery_state->epoll_registered) {
+                        const int backoff_exp = std::min(recovery_state->wait_cxl_retry_count, 4);
+                        const int backoff_interval = kRecoveryCheckInterval * (1 << backoff_exp);
+                        if ((recovery_check_counter % backoff_interval) != 0) continue;
+                        if (!recovery_state->cached_topic) recovery_state->cached_topic = cxl_manager_->GetTopicPtr(recovery_state->handshake.topic);
+                        bool above_wm = recovery_state->cached_topic
+                            ? cxl_manager_->IsPBRAboveHighWatermark(static_cast<Topic*>(recovery_state->cached_topic), pbr_high_watermark_pct)
+                            : cxl_manager_->IsPBRAboveHighWatermark(recovery_state->handshake.topic, pbr_high_watermark_pct);
+                        if (above_wm) continue;
+                        void* log = nullptr;
+                        bool got_log = recovery_state->cached_topic
+                            ? cxl_manager_->ReserveBLogSpace(static_cast<Topic*>(recovery_state->cached_topic), recovery_state->batch_header.total_size, log)
+                            : cxl_manager_->ReserveBLogSpace(recovery_state->handshake.topic, recovery_state->batch_header.total_size, log);
+                        if (got_log && log) {
+                            recovery_state->wait_cxl_retry_count = 0;
+                            struct epoll_event ev;
+                            ev.events = EPOLLIN | EPOLLET;
+                            ev.data.fd = recovery_fd;
+                            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, recovery_fd, &ev) == 0) {
+                                recovery_state->cxl_buf = log;
+                                recovery_state->phase = WAIT_PAYLOAD;
+                                recovery_state->epoll_registered = true;
+                                VLOG(2) << "PublishReceiveThread: Resumed fd=" << recovery_fd << " (direct-CXL)";
+                            } else {
+                                LOG(ERROR) << "PublishReceiveThread: epoll_ctl ADD failed fd=" << recovery_fd
+                                           << " " << strerror(errno) << " (BLog reserved, will retry next cycle)";
+                            }
+                        } else {
+                            recovery_state->wait_cxl_retry_count++;
+                        }
+                    }
+                    // WAIT_PBR_SLOT: retry PBR without blocking; after MAX_PBR_RETRIES hand off to worker
+                    if (recovery_state->phase == WAIT_PBR_SLOT && recovery_state->cxl_buf) {
+                        void* segment_header = nullptr;
+                        size_t logical_offset = 0;
+                        BatchHeader* batch_header_location = nullptr;
+                        EnsureCachedTopicValid(recovery_state.get());
+                        const char* topic = recovery_state->handshake.topic;
+                        bool pbr_ok = recovery_state->cached_topic
+                            ? cxl_manager_->ReservePBRSlotAndWriteEntry(static_cast<Topic*>(recovery_state->cached_topic), recovery_state->batch_header,
+                                    recovery_state->cxl_buf, segment_header, logical_offset, batch_header_location)
+                            : cxl_manager_->ReservePBRSlotAndWriteEntry(topic, recovery_state->batch_header,
+                                    recovery_state->cxl_buf, segment_header, logical_offset, batch_header_location);
+                        if (pbr_ok) {
+                            recovery_state->logical_offset = logical_offset;
+                            recovery_state->batch_header_location = batch_header_location;
+                            metric_batches_recv_direct_cxl_.fetch_add(1, std::memory_order_relaxed);
+                            TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+                            CompleteBatchInCXL(batch_header_location, recovery_state->batch_header.num_msg, tinode, logical_offset);
+                            recovery_state->cxl_buf = nullptr;
+                            recovery_state->batch_header_location = nullptr;
+                            recovery_state->payload_offset = 0;
+                            recovery_state->header_offset = 0;
+                            recovery_state->phase = WAIT_HEADER;
+                            recovery_state->pbr_retry_count = 0;
+                        } else {
+                            recovery_state->pbr_retry_count++;
+                            if (recovery_state->pbr_retry_count >= kMaxPBRRetries) {
+                                PendingBatch fallback(recovery_state, nullptr, recovery_state->batch_header, recovery_state->handshake);
+                                fallback.staging_buf = nullptr;
+                                fallback.cxl_buf_payload_already = recovery_state->cxl_buf;
+                                if (!cxl_allocation_queue_->write(fallback)) {
+                                    LOG(ERROR) << "PublishReceiveThread: PBR retries exhausted and queue full, fd=" << recovery_fd;
+                                    metric_direct_cxl_pbr_fallback_dropped_.fetch_add(1, std::memory_order_relaxed);
+                                }
+                                recovery_state->cxl_buf = nullptr;
+                                recovery_state->payload_offset = 0;
+                                recovery_state->header_offset = 0;
+                                recovery_state->phase = WAIT_HEADER;
+                                recovery_state->pbr_retry_count = 0;
+                            }
+                        }
+                    }
+                }
+            }
             recovery_check_counter = 0;
         }
     }
 
     // Cleanup
     for (auto& [fd, state] : connections) {
-        if (state->staging_buf) {
-            staging_pool_->Release(state->staging_buf);
+        if (state->cxl_buf) {
+            metric_direct_cxl_connection_drop_with_buf_.fetch_add(1, std::memory_order_relaxed);
+            size_t leaked = static_cast<size_t>(state->batch_header.total_size);
+            metric_blog_leaked_bytes_.fetch_add(leaked, std::memory_order_relaxed);
         }
+        state->cxl_buf = nullptr;
+        if (state->staging_buf) staging_pool_->Release(state->staging_buf);
         close(fd);
     }
     close(epoll_fd);
@@ -2196,48 +2547,81 @@ void NetworkManager::CXLAllocationWorker() {
             continue;
         }
 
-        // Allocate CXL buffer
+        // Allocate CXL buffer (or use existing when fallback set cxl_buf_payload_already)
         void* cxl_buf = nullptr;
         void* segment_header = nullptr;
-        size_t logical_offset;
+        size_t logical_offset = 0;
         SequencerType seq_type;
         BatchHeader* batch_header_location = nullptr;
+        std::function<void(void*, size_t)> callback;
 
-        std::function<void(void*, size_t)> callback = cxl_manager_->GetCXLBuffer(
-            batch.batch_header,
-            batch.handshake.topic,
-            cxl_buf,
-            segment_header,
-            logical_offset,
-            seq_type,
-            batch_header_location);
+        if (batch.cxl_buf_payload_already) {
+            // [[CRITICAL FIX]] Fallback path: payload already in CXL at this address; only reserve PBR slot and complete.
+            // Do NOT call GetCXLBuffer (would allocate new BLog and leak the existing buffer / corrupt subscriber data).
+            cxl_buf = batch.cxl_buf_payload_already;
+            const char* topic = batch.handshake.topic;
+            if (batch.conn_state) EnsureCachedTopicValid(batch.conn_state.get());
+            bool pbr_ok = (batch.conn_state && batch.conn_state->cached_topic)
+                ? cxl_manager_->ReservePBRSlotAndWriteEntry(static_cast<Topic*>(batch.conn_state->cached_topic), batch.batch_header, cxl_buf,
+                        segment_header, logical_offset, batch_header_location)
+                : cxl_manager_->ReservePBRSlotAndWriteEntry(topic, batch.batch_header, cxl_buf,
+                        segment_header, logical_offset, batch_header_location);
+            if (!pbr_ok) {
+                if (!cxl_allocation_queue_->write(batch)) {
+                    metric_batches_dropped_.fetch_add(1, std::memory_order_relaxed);
+                    LOG(ERROR) << "CXLAllocationWorker: Fallback batch PBR failed and re-enqueue full (batch_seq="
+                              << batch.batch_header.batch_seq << ")";
+                }
+                continue;
+            }
+            TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+            CompleteBatchInCXL(batch_header_location, batch.batch_header.num_msg, tinode, logical_offset);
+            batch.conn_state->cxl_allocation_attempts = 0;
+            if (batch.staging_buf) staging_pool_->Release(batch.staging_buf);
+            batches_processed.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        {
+            auto t0_get = std::chrono::steady_clock::now();
+            callback = cxl_manager_->GetCXLBuffer(
+                batch.batch_header,
+                batch.handshake.topic,
+                cxl_buf,
+                segment_header,
+                logical_offset,
+                seq_type,
+                batch_header_location);
+            auto t1_get = std::chrono::steady_clock::now();
+            RecordProfile(kGetCXLBuffer, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1_get - t0_get).count()));
+        }
 
         if (!cxl_buf) {
             // CXL ring full, retry with exponential backoff
-            batch.conn_state->cxl_allocation_attempts++;
+            if (batch.conn_state) batch.conn_state->cxl_allocation_attempts++;
             metric_cxl_retries_.fetch_add(1, std::memory_order_relaxed);
             metric_ring_full_.fetch_add(1, std::memory_order_relaxed);
 
             size_t ring_full_total = metric_ring_full_.load(std::memory_order_relaxed);
             if (ring_full_total <= 10 || ring_full_total % 1000 == 0) {
                 LOG(WARNING) << "CXLAllocationWorker: Ring full, retry attempt "
-                             << batch.conn_state->cxl_allocation_attempts
+                             << (batch.conn_state ? batch.conn_state->cxl_allocation_attempts : 0)
                              << " (batch_seq=" << batch.batch_header.batch_seq
                              << ", total_ring_full=" << ring_full_total << ")";
             }
 
-            if (batch.conn_state->cxl_allocation_attempts > 10) {
+            if (batch.conn_state && batch.conn_state->cxl_allocation_attempts > 10) {
                 metric_batches_dropped_.fetch_add(1, std::memory_order_relaxed);
                 size_t dropped = metric_batches_dropped_.load(std::memory_order_relaxed);
                 LOG(ERROR) << "CXLAllocationWorker: Dropping batch after 10 retries "
                           << "(batch_seq=" << batch.batch_header.batch_seq
                           << ", total_dropped=" << dropped << ")";
-                staging_pool_->Release(batch.staging_buf);
+                if (batch.staging_buf) staging_pool_->Release(batch.staging_buf);
                 continue;
             }
 
             // Exponential backoff: 100µs, 200µs, 400µs, 800µs, 1600µs
-            int backoff_exp = std::min(batch.conn_state->cxl_allocation_attempts, 4);
+            int backoff_exp = batch.conn_state ? std::min(batch.conn_state->cxl_allocation_attempts, 4) : 0;
             std::this_thread::sleep_for(std::chrono::microseconds(100 << backoff_exp));
 
             // Re-enqueue for retry
@@ -2246,13 +2630,14 @@ void NetworkManager::CXLAllocationWorker() {
                 size_t dropped = metric_batches_dropped_.load(std::memory_order_relaxed);
                 LOG(ERROR) << "CXLAllocationWorker: Failed to re-enqueue batch for retry "
                           << "(total_dropped=" << dropped << ")";
-                staging_pool_->Release(batch.staging_buf);
+                if (batch.staging_buf) staging_pool_->Release(batch.staging_buf);
             }
             continue;
         }
 
-        // Phase 3 Optimization: Pipelined copy and flush
-        // Copy in chunks and flush immediately for better cache utilization
+        // Phase 3 Optimization: Pipelined copy and flush (skip when payload already in CXL)
+        if (batch.staging_buf != nullptr) {
+        auto t0_copy = std::chrono::steady_clock::now();
         constexpr size_t CHUNK_SIZE = 256 * 1024; // 256KB chunks
         size_t total_size = batch.batch_header.total_size;
         uint8_t* dest = reinterpret_cast<uint8_t*>(cxl_buf);
@@ -2270,9 +2655,12 @@ void NetworkManager::CXLAllocationWorker() {
             }
         }
         CXL::store_fence();
+        auto t1_copy = std::chrono::steady_clock::now();
+        RecordProfile(kCopyAndFlushPayload, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1_copy - t0_copy).count()));
 
         // Phase 3: Track successful copy
         metric_batches_copied_.fetch_add(1, std::memory_order_relaxed);
+        }
 
         // Mark batch complete (critical for sequencer visibility)
         // [[CRITICAL FIX: OUT_OF_ORDER_BATCH_COMPLETION]]
@@ -2315,11 +2703,11 @@ void NetworkManager::CXLAllocationWorker() {
                       << "(batch_seq=" << batch.batch_header.batch_seq << ")";
         }
 
-        // Release staging buffer
-        staging_pool_->Release(batch.staging_buf);
+        // Release staging buffer (null when payload was already in CXL)
+        if (batch.staging_buf) staging_pool_->Release(batch.staging_buf);
 
-        // Reset retry counter
-        batch.conn_state->cxl_allocation_attempts = 0;
+        // Reset retry counter (conn_state may be null if connection was torn down)
+        if (batch.conn_state) batch.conn_state->cxl_allocation_attempts = 0;
 
         // Invoke callback if provided (for KAFKA mode)
         if (callback) {

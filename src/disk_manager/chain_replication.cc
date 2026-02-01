@@ -139,7 +139,7 @@ void ChainReplicationManager::ReplicationThread() {
               << batches_replicated << " batches";
 }
 
-void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint32_t pbr_index) {
+void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index) {
     // [[PHASE_2_FIX]] Tail replica tracks highest contiguous pbr_index per broker
     // CV[broker_id] is updated only when pbr_index is contiguous (monotonic, no gaps)
     // pbr_index is now absolute (never wraps) so contiguity tracking is simple

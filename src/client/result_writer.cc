@@ -176,14 +176,13 @@ ResultWriter::~ResultWriter() {
         if (subBandwidthMbps > 0) results.push_back({"Subscribe", subBandwidthMbps});
         if (e2eBandwidthMbps > 0) results.push_back({"End-to-end", e2eBandwidthMbps});
         
-        // Log result summary
-        LOG(INFO) << "Test results:";
+        // Log result summary (VLOG to reduce default log volume; bandwidth also logged in SetPubResult)
+        VLOG(1) << "Test results:";
         for (const auto& [name, value] : results) {
-            LOG(INFO) << "  " << name << " bandwidth: " << std::fixed << std::setprecision(2) 
-                      << value << " MB/s";
+            VLOG(1) << "  " << name << " bandwidth: " << std::fixed << std::setprecision(2)
+                    << value << " MB/s";
         }
-        
-        LOG(INFO) << "Results written to: " << result_path;
+        VLOG(1) << "Results written to: " << result_path;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Exception in ResultWriter destructor: " << e.what();
     }

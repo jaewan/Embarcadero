@@ -310,6 +310,43 @@ std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(BatchHeader &batch_h
 			logical_offset, seq_type, batch_header_location);
 }
 
+bool CXLManager::ReserveBLogSpace(const char* topic, size_t size, void*& log) {
+	return topic_manager_->ReserveBLogSpace(topic, size, log);
+}
+
+bool CXLManager::IsPBRAboveHighWatermark(const char* topic, int high_pct) {
+	return topic_manager_->IsPBRAboveHighWatermark(topic, high_pct);
+}
+
+bool CXLManager::IsPBRBelowLowWatermark(const char* topic, int low_pct) {
+	return topic_manager_->IsPBRBelowLowWatermark(topic, low_pct);
+}
+
+bool CXLManager::ReservePBRSlotAndWriteEntry(const char* topic, BatchHeader& batch_header, void* log,
+		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location) {
+	return topic_manager_->ReservePBRSlotAndWriteEntry(topic, batch_header, log,
+			segment_header, logical_offset, batch_header_location);
+}
+
+Topic* CXLManager::GetTopicPtr(const char* topic) {
+	return topic_manager_ ? topic_manager_->GetTopic(std::string(topic)) : nullptr;
+}
+
+bool CXLManager::IsPBRAboveHighWatermark(Topic* topic_ptr, int high_pct) {
+	return topic_manager_ && topic_manager_->IsPBRAboveHighWatermark(topic_ptr, high_pct);
+}
+
+bool CXLManager::ReserveBLogSpace(Topic* topic_ptr, size_t size, void*& log, bool epoch_already_checked) {
+	return topic_manager_ && topic_manager_->ReserveBLogSpace(topic_ptr, size, log, epoch_already_checked);
+}
+
+bool CXLManager::ReservePBRSlotAndWriteEntry(Topic* topic_ptr, BatchHeader& batch_header, void* log,
+		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+		bool epoch_already_checked) {
+	return topic_manager_ && topic_manager_->ReservePBRSlotAndWriteEntry(topic_ptr, batch_header, log,
+			segment_header, logical_offset, batch_header_location, epoch_already_checked);
+}
+
 inline int hashTopic(const char topic[TOPIC_NAME_SIZE]) {
 	unsigned int hash = 0;
 
@@ -564,7 +601,7 @@ void CXLManager::GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 
 // Sequence without respecting publish order
 void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic) {
-	LOG(INFO) <<"[DEBUG] ************** Seqeuncer 1 **************";
+	VLOG(5) << "[DEBUG] ************** Sequencer 1 **************";
 	struct TInode *tinode = GetTInode(topic.data());
 	if (!tinode) {
 		LOG(ERROR) << "Sequencer1: Failed to get TInode for topic " << topic.data();
@@ -791,7 +828,7 @@ void CXLManager::Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic){
 
 // Does not support multi-client, dynamic message size, dynamic batch 
 void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
-	LOG(INFO) <<"[DEBUG] ************** Seqeuncer 3 **************";
+	VLOG(5) << "[DEBUG] ************** Sequencer 3 **************";
 	struct TInode *tinode = GetTInode(topic.data());
 	struct MessageHeader* msg_to_order[NUM_MAX_BROKERS];
 	absl::btree_set<int> registered_brokers;

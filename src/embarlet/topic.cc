@@ -38,10 +38,9 @@ Topic::Topic(
 	cxl_addr_(cxl_addr),
 	logical_offset_(0),
 	written_logical_offset_((size_t)-1),
+	num_slots_(BATCHHEADERS_SIZE / sizeof(BatchHeader)),
 	current_segment_(segment_metadata),
 	// [[SEQUENCER_ONLY_HEAD_NODE]] Detect sequencer-only mode from nullptr segment
-	// When TopicManager creates Topic with segment_metadata=nullptr for broker 0,
-	// this node runs only the sequencer (no data ingestion path).
 	is_sequencer_only_(segment_metadata == nullptr && broker_id == 0) {
 
 		// Validate tinode pointer first
@@ -94,6 +93,20 @@ Topic::Topic(
 
 			first_batch_headers_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) +
 				tinode_->offsets[broker_id_].batch_headers_offset;
+			// [[CODE_REVIEW_FIX]] Initial cache = "all free" sentinel so watermark logic is correct before first refresh
+			cached_pbr_consumed_through_.store(BATCHHEADERS_SIZE, std::memory_order_release);
+			// [[LOCKFREE_PBR]] Consumed seq = 0 (all slots free; sequencer sentinel is BATCHHEADERS_SIZE bytes)
+			cached_consumed_seq_.store(0, std::memory_order_release);
+#if defined(__x86_64__) && defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16)
+			use_lock_free_pbr_ = true;  // [[CODE_REVIEW Issue #6]] Trust CMPXCHG16B on x86-64; some libs report false for 16B atomics
+#else
+			use_lock_free_pbr_ = pbr_state_.is_lock_free();
+#endif
+			if (num_slots_ == 0) {
+				LOG(ERROR) << "PBR num_slots_ is 0 for topic " << topic_name_
+					<< " (BATCHHEADERS_SIZE=" << BATCHHEADERS_SIZE
+					<< ", sizeof(BatchHeader)=" << sizeof(BatchHeader) << "); PBR reservation will fail.";
+			}
 		}
 
 		ack_level_ = tinode_->ack_level;
@@ -149,7 +162,10 @@ Topic::Topic(
 		
 	// Start delegation thread if needed (Stage 2: Local Ordering)
 	// Delegation Thread assigns local per-broker sequence numbers
-	if (seq_type == CORFU || (seq_type != KAFKA && order_ != 4)) {
+	// [[ORDER_0_ACK_OPTIMIZATION]] When order=0 and recv_direct_to_cxl, receive thread updates
+	// 'written' so ACKs work without DelegationThread; skip starting it.
+	bool skip_delegation_for_order0 = (order_ == 0 && GetConfig().config().network.recv_direct_to_cxl.get());
+	if (seq_type == CORFU || (seq_type != KAFKA && order_ != 4 && !skip_delegation_for_order0)) {
 		delegationThreads_.emplace_back(&Topic::DelegationThread, this);
 	}
 
@@ -1067,7 +1083,7 @@ std::pair<uint64_t, bool> Topic::RefreshBrokerEpochFromCXL(bool force_full_read)
 	}
 	ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
 	CXL::flush_cacheline(control_block);
-	CXL::full_fence();  // [[FIX: MFENCE required after CLFLUSHOPT for CXL read]]
+	CXL::load_fence();
 	uint64_t current_epoch = control_block->epoch.load(std::memory_order_acquire);
 	uint64_t prev_epoch = broker_epoch_.load(std::memory_order_acquire);
 	bool was_stale = (current_epoch > prev_epoch);
@@ -1202,13 +1218,6 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		void* &segment_header,
 		size_t &logical_offset,
 		BatchHeader* &batch_header_location) {
-	// [[DIAGNOSTIC]] Log entry to track allocation flow
-	static thread_local uint64_t call_count = 0;
-	uint64_t this_call = ++call_count;
-	if (this_call <= 10 || this_call % 1000 == 0) {
-		LOG(INFO) << "EmbarcaderoGetCXLBuffer ENTRY #" << this_call
-		          << " broker=" << broker_id_ << " batch_seq=" << batch_header.batch_seq;
-	}
 
 	// [[SEQUENCER_ONLY_HEAD_NODE]] Defense in depth: fail fast if called on sequencer-only Topic
 	// Sequencer-only node has no segment/batch header ring, offsets[0] is uninitialized.
@@ -1226,12 +1235,6 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 	bool force_full_read = (n % kEpochCheckInterval == 0);
 	auto [current_epoch, was_stale] = RefreshBrokerEpochFromCXL(force_full_read);
 	if (was_stale) {
-		// [[DIAGNOSTIC]] Log epoch staleness rejection
-		static thread_local uint64_t stale_count = 0;
-		if (++stale_count <= 10 || stale_count % 1000 == 0) {
-			LOG(WARNING) << "EmbarcaderoGetCXLBuffer: Epoch stale rejection #" << stale_count
-			             << " broker=" << broker_id_;
-		}
 		log = nullptr;
 		batch_header_location = nullptr;
 		return nullptr;
@@ -1266,7 +1269,7 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		const void* consumed_through_addr = const_cast<const void*>(
 			reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].batch_headers_consumed_through));
 		CXL::flush_cacheline(consumed_through_addr);
-		CXL::full_fence();  // [[FIX: MFENCE required after CLFLUSHOPT for CXL read]]
+		CXL::load_fence();
 		size_t consumed_through = tinode_->offsets[broker_id_].batch_headers_consumed_through;
 
 		// Check if the slot is free using circular buffer semantics.
@@ -1314,14 +1317,10 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 
 			// Log first 10 events, then throttle to once per 5 seconds
 			if (count <= 10 || (now_ns - last_log > 5000000000ULL)) {  // 5 seconds in nanoseconds
-				size_t in_flight_calc = (next_slot_offset >= consumed_through) ?
-					(next_slot_offset - consumed_through) :
-					(BATCHHEADERS_SIZE - consumed_through + next_slot_offset);
 				LOG(WARNING) << "EmbarcaderoGetCXLBuffer: Ring full for broker " << broker_id_
 				             << " topic=" << topic_name_
 				             << " (slot_offset=" << next_slot_offset
 				             << ", consumed_through=" << consumed_through
-				             << ", in_flight=" << in_flight_calc
 				             << ", BATCHHEADERS_SIZE=" << BATCHHEADERS_SIZE
 				             << ", count=" << count << ")";
 				ring_full_last_log_time_.store(now_ns, std::memory_order_relaxed);
@@ -1339,6 +1338,8 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		if (batch_headers_ >= batch_headers_end) {
 			batch_headers_ = batch_headers_start;
 		}
+		// [[FIX]] Update cache so GetPBRUtilizationPct() sees correct utilization for legacy path (recv_direct_to_cxl=false)
+		cached_next_slot_offset_.store(static_cast<size_t>(batch_headers_ - batch_headers_start), std::memory_order_release);
 		logical_offset = logical_offset_;
 		logical_offset_ += batch_header.num_msg;
 	}
@@ -1368,36 +1369,223 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 			reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_)
 			);
 
-	// [[CRITICAL FIX: OUT_OF_ORDER_BATCH_COMPLETION]]
-	// Store batch header to the batch header ring but with num_msg=0 initially.
-	// This prevents the scanner from seeing "in-flight" batches (num_msg>0, batch_complete=0).
-	// The CXLAllocationWorker will set the real num_msg after data copy completes.
-	//
-	// Problem this fixes: With 4 parallel CXLAllocationWorkers, batches complete out of order.
-	// If we write num_msg>0 immediately, gaps form in completion sequence, consumed_through
-	// can't advance past gaps, ring fills up, and we deadlock.
-	//
-	// With num_msg=0 initially: scanner sees slot as "empty", skips it. When data copy
-	// completes, num_msg is set to real value along with batch_complete=1. Scanner then
-	// sees the batch as ready and processes it. No gaps, no deadlock.
-	uint32_t real_num_msg = batch_header.num_msg;  // Save for later
-	batch_header.num_msg = 0;  // Write as "empty" initially
-	batch_header.batch_complete = 0;
+	// Store batch header to the batch header ring and initialize completion flag
 	memcpy(batch_headers_log, &batch_header, sizeof(BatchHeader));
-	// [[CRITICAL FIX: FLUSH_NUM_MSG_ZERO]] Flush the batch header with num_msg=0 to CXL
-	// Without this flush, the scanner on another node won't see num_msg=0; it will see
-	// stale data or the later num_msg=real_value write from CXLAllocationWorker.
-	// This ensures the "slot is empty" signal is visible before data copy completes.
-	CXL::flush_cacheline(batch_headers_log);
-	CXL::store_fence();
-
-	// Return the batch header location and the real num_msg for completion signaling
-	// The caller (CXLAllocationWorker) will set num_msg to real_num_msg when setting batch_complete=1
+	// Ensure batch_complete is initialized to 0 for Sequencer 5
+	reinterpret_cast<BatchHeader*>(batch_headers_log)->batch_complete = 0;
+	
+	// Return the batch header location for completion signaling
 	batch_header_location = reinterpret_cast<BatchHeader*>(batch_headers_log);
-	// Store real num_msg back in the passed-in batch_header so caller can use it
-	batch_header.num_msg = real_num_msg;
 
 	return nullptr;
+}
+
+// [[Issue #3]] Single epoch check per batch; call once at batch start, pass epoch_already_checked to ReserveBLogSpace/ReservePBRSlotAndWriteEntry.
+bool Topic::CheckEpochOnce() {
+	uint64_t n = epoch_check_counter_.fetch_add(1, std::memory_order_relaxed);
+	bool force_full_read = (n % kEpochCheckInterval == 0);
+	auto [current_epoch, was_stale] = RefreshBrokerEpochFromCXL(force_full_read);
+	last_checked_epoch_.store(current_epoch, std::memory_order_release);
+	return was_stale;
+}
+
+// [[RECV_DIRECT_TO_CXL]] Lock-free BLog allocation (~10ns). Returns nullptr if sequencer-only.
+// [[PHASE_1A_EPOCH_FENCING]] Design §4.2.1: refuse writes if broker epoch is stale (zombie broker).
+// [[Issue #3]] When epoch_already_checked true, skip epoch check (caller did CheckEpochOnce at batch start).
+void* Topic::ReserveBLogSpace(size_t size, bool epoch_already_checked) {
+	if (is_sequencer_only_) return nullptr;
+
+	if (!epoch_already_checked) {
+		uint64_t n = epoch_check_counter_.fetch_add(1, std::memory_order_relaxed);
+		bool force_full_read = (n % kEpochCheckInterval == 0);
+		auto [current_epoch, was_stale] = RefreshBrokerEpochFromCXL(force_full_read);
+		if (was_stale) return nullptr;
+	}
+
+	void* log = reinterpret_cast<void*>(log_addr_.fetch_add(size));
+	const unsigned long long int segment_metadata = reinterpret_cast<unsigned long long int>(current_segment_);
+	CheckSegmentBoundary(log, size, segment_metadata);
+	return log;
+}
+
+void Topic::RefreshPBRConsumedThroughCache() {
+	const void* consumed_through_addr = const_cast<const void*>(
+		reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].batch_headers_consumed_through));
+	CXL::flush_cacheline(consumed_through_addr);
+	CXL::load_fence();
+	size_t consumed = tinode_->offsets[broker_id_].batch_headers_consumed_through;
+	cached_pbr_consumed_through_.store(consumed, std::memory_order_release);
+	// [[LOCKFREE_PBR]] Drive cached_consumed_seq_ for lock-free path (sentinel BATCHHEADERS_SIZE → seq 0)
+	if (consumed == BATCHHEADERS_SIZE) {
+		cached_consumed_seq_.store(0, std::memory_order_release);
+	} else {
+		cached_consumed_seq_.store(static_cast<uint64_t>(consumed / sizeof(BatchHeader)), std::memory_order_release);
+	}
+}
+
+int Topic::GetPBRUtilizationPct() {
+	if (is_sequencer_only_) return -1;
+	if (!first_batch_headers_addr_) return -1;
+	uint64_t n = pbr_cache_refresh_counter_.fetch_add(1, std::memory_order_relaxed);
+	if (n % kPBRCacheRefreshInterval == 0) {
+		RefreshPBRConsumedThroughCache();
+	}
+	// [[LOCKFREE_PBR]] When lock-free path is active, next_slot is in pbr_state_; cached_next_slot_offset_ is not updated.
+	if (use_lock_free_pbr_) {
+		uint64_t consumed_seq = cached_consumed_seq_.load(std::memory_order_acquire);
+		uint64_t next_slot_seq = pbr_state_.load(std::memory_order_acquire).next_slot_seq;
+		uint64_t in_flight_slots = (next_slot_seq >= consumed_seq)
+			? (next_slot_seq - consumed_seq) : 0;
+		if (num_slots_ == 0) return 0;
+		return static_cast<int>((in_flight_slots * 100) / num_slots_);
+	}
+	size_t consumed = cached_pbr_consumed_through_.load(std::memory_order_acquire);
+	size_t next_slot_offset = cached_next_slot_offset_.load(std::memory_order_acquire);
+	size_t in_flight;
+	// [[FIX PBR_WATERMARK_ORDER0]] Sentinel BATCHHEADERS_SIZE = "all slots free" (same as EmbarcaderoGetCXLBuffer).
+	// For ORDER=0 no sequencer runs, so consumed_through stays at sentinel; must not treat next_slot_offset as in_flight.
+	if (consumed == BATCHHEADERS_SIZE) {
+		in_flight = 0;  // Sentinel = all free, no backpressure
+	} else {
+		if (next_slot_offset >= consumed) {
+			in_flight = next_slot_offset - consumed;
+		} else {
+			in_flight = (BATCHHEADERS_SIZE - consumed) + next_slot_offset;
+		}
+	}
+	return static_cast<int>((in_flight * 100) / BATCHHEADERS_SIZE);
+}
+
+bool Topic::IsPBRAboveHighWatermark(int high_pct) {
+	if (high_pct <= 0 || high_pct > 100) return false;
+	int util = GetPBRUtilizationPct();
+	return (util >= 0 && util >= high_pct);
+}
+
+bool Topic::IsPBRBelowLowWatermark(int low_pct) {
+	if (low_pct < 0 || low_pct > 100) return true;
+	int util = GetPBRUtilizationPct();
+	return (util < 0 || util <= low_pct);
+}
+
+bool Topic::ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, size_t& out_logical_offset) {
+	if (num_slots_ == 0) return false;  // Config/size mismatch; avoid % 0 below
+	uint64_t consumed_seq = cached_consumed_seq_.load(std::memory_order_acquire);
+	PBRProducerState current = pbr_state_.load(std::memory_order_acquire);
+	PBRProducerState next;
+	do {
+		uint64_t in_flight = (current.next_slot_seq >= consumed_seq)
+			? (current.next_slot_seq - consumed_seq) : 0;
+		if (in_flight >= num_slots_ - 1)
+			return false;
+		next.next_slot_seq = current.next_slot_seq + 1;
+		next.logical_offset = current.logical_offset + num_msg;
+	} while (!pbr_state_.compare_exchange_weak(
+		current, next,
+		std::memory_order_acq_rel,
+		std::memory_order_acquire));
+	size_t slot_index = static_cast<size_t>(current.next_slot_seq % num_slots_);
+	out_byte_offset = slot_index * sizeof(BatchHeader);
+	out_logical_offset = static_cast<size_t>(current.logical_offset);
+	return true;
+}
+
+bool Topic::ReservePBRSlotAndWriteEntry(BatchHeader& batch_header, void* log,
+		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+		bool epoch_already_checked) {
+	if (is_sequencer_only_) return false;
+	if (!first_batch_headers_addr_) return false;
+
+	uint64_t current_epoch;
+	if (!epoch_already_checked) {
+		uint64_t n = epoch_check_counter_.fetch_add(1, std::memory_order_relaxed);
+		bool force_full_read = (n % kEpochCheckInterval == 0);
+		auto [epoch, was_stale] = RefreshBrokerEpochFromCXL(force_full_read);
+		if (was_stale) return false;
+		current_epoch = epoch;
+	} else {
+		current_epoch = last_checked_epoch_.load(std::memory_order_acquire);
+	}
+
+	const unsigned long long int segment_metadata = reinterpret_cast<unsigned long long int>(current_segment_);
+	const size_t msg_size = batch_header.total_size;
+	void* batch_headers_log;
+
+	if (use_lock_free_pbr_) {
+		// [[LOCKFREE_PBR]] 128-bit CAS path; no CXL read here (cached_consumed_seq_ refreshed by GetPBRUtilizationPct).
+		// [[CODE_REVIEW Issue #4]] Lock-free path uses monotonic slot sequences (no wrap); in_flight = next_slot_seq - consumed_seq.
+		size_t byte_offset;
+		if (!ReservePBRSlotLockFree(batch_header.num_msg, byte_offset, logical_offset)) {
+			batch_header_location = nullptr;
+			return false;
+		}
+		batch_headers_log = reinterpret_cast<void*>(
+			reinterpret_cast<uintptr_t>(first_batch_headers_addr_) + byte_offset);
+	} else {
+		// [[CODE_REVIEW Issue #3]] Mutex fallback: refresh consumed_through only every kPBRCacheRefreshInterval batches (not every batch).
+		uint64_t n = pbr_cache_refresh_counter_.fetch_add(1, std::memory_order_relaxed);
+		if (n % kPBRCacheRefreshInterval == 0) {
+			RefreshPBRConsumedThroughCache();
+		}
+		const unsigned long long int batch_headers_start =
+			reinterpret_cast<unsigned long long int>(first_batch_headers_addr_);
+		const unsigned long long int batch_headers_end = batch_headers_start + BATCHHEADERS_SIZE;
+		{
+			absl::MutexLock lock(&mutex_);
+			size_t next_slot_offset = static_cast<size_t>(batch_headers_ - batch_headers_start);
+			size_t consumed_through = cached_pbr_consumed_through_.load(std::memory_order_acquire);
+
+			// [[CODE_REVIEW Issue #4]] Mutex path uses byte offsets that wrap; in_flight = bytes between consumed and next write.
+			bool slot_free;
+			if (consumed_through == BATCHHEADERS_SIZE) {
+				slot_free = true;
+			} else {
+				size_t in_flight;
+				if (next_slot_offset >= consumed_through) {
+					in_flight = next_slot_offset - consumed_through;
+				} else {
+					in_flight = (BATCHHEADERS_SIZE - consumed_through) + next_slot_offset;  // Wrap
+				}
+				slot_free = (in_flight + sizeof(BatchHeader) < BATCHHEADERS_SIZE);
+			}
+			if (!slot_free) {
+				batch_header_location = nullptr;
+				return false;
+			}
+
+			batch_headers_log = reinterpret_cast<void*>(batch_headers_);
+			batch_headers_ += sizeof(BatchHeader);
+			if (batch_headers_ >= batch_headers_end) {
+				batch_headers_ = batch_headers_start;
+			}
+			cached_next_slot_offset_.store(static_cast<size_t>(batch_headers_ - batch_headers_start), std::memory_order_release);
+			logical_offset = logical_offset_;
+			logical_offset_ += batch_header.num_msg;
+		}
+	}
+
+	CheckSegmentBoundary(log, msg_size, segment_metadata);
+	segment_header = current_segment_;
+
+	batch_header.start_logical_offset = logical_offset;
+	batch_header.broker_id = broker_id_;
+	batch_header.ordered = 0;
+	batch_header.total_order = 0;
+	static thread_local uint16_t batch_counter_tls = 0;  // [[CODE_REVIEW Issue #8]] Used in both lock-free and mutex paths
+	uint64_t timestamp = CXL::rdtsc() >> 16;
+	batch_header.batch_id = (static_cast<uint64_t>(broker_id_) << 48) |
+		((timestamp & 0xFFFFFFFF) << 16) | (batch_counter_tls++);
+	batch_header.pbr_absolute_index = broker_pbr_counters_[broker_id_].fetch_add(1, std::memory_order_relaxed);
+	batch_header.epoch_created = static_cast<uint16_t>(std::min(current_epoch, static_cast<uint64_t>(0xFFFF)));
+	batch_header.log_idx = static_cast<size_t>(
+		reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_));
+
+	// [[Issue #4]] Write batch header but do NOT flush here; sequencer must not see it until batch_complete=1.
+	// CompleteBatchInCXL flushes once when setting batch_complete (avoids 4 flushes + 2 fences per batch).
+	memcpy(batch_headers_log, &batch_header, sizeof(BatchHeader));
+	reinterpret_cast<BatchHeader*>(batch_headers_log)->batch_complete = 0;
+	batch_header_location = reinterpret_cast<BatchHeader*>(batch_headers_log);
+	return true;
 }
 
 /*
@@ -1409,12 +1597,9 @@ bool Topic::GetBatchToExport(
 		size_t &expected_batch_offset,
 		void* &batch_addr,
 		size_t &batch_size) {
-	static BatchHeader* start_batch_header = reinterpret_cast<BatchHeader*>(
-reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	BatchHeader* start_batch_header = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 	BatchHeader* header = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * expected_batch_offset);
-	// [[FIX: NON-COHERENT CXL]] Invalidate cache before reading header->ordered
-	CXL::flush_cacheline(header);
-	CXL::full_fence();
 	if (header->ordered == 0){
 		return false;
 	}
@@ -1432,64 +1617,20 @@ bool Topic::GetBatchToExportWithMetadata(
 		size_t &batch_size,
 		size_t &batch_total_order,
 		uint32_t &num_messages) {
-	// [[FIX: NON-COHERENT CXL]] Invalidate cache ONCE before reading batch_headers_offset
-	// (offset is set during topic init and never changes)
-	static thread_local bool cache_invalidated = false;
-	if (!cache_invalidated) {
-		CXL::flush_cacheline(const_cast<const void*>(static_cast<volatile void*>(&tinode_->offsets[broker_id_])));
-		CXL::full_fence();
-		cache_invalidated = true;
-	}
-
-	// Static is safe here: batch_headers_offset is immutable after topic creation
-	static BatchHeader* start_batch_header = reinterpret_cast<BatchHeader*>(
+	BatchHeader* start_batch_header = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
-
-	// [[DIAGNOSTIC]] Log initialization (once)
-	static thread_local bool logged_init = false;
-	if (!logged_init) {
-		size_t offset = tinode_->offsets[broker_id_].batch_headers_offset;
-		LOG(INFO) << "[EXPORT_INIT] B" << broker_id_
-		          << ": batch_headers_offset=0x" << std::hex << offset << std::dec
-		          << ", start_batch_header=" << start_batch_header
-		          << " (cxl_addr_=" << cxl_addr_ << ")";
-		logged_init = true;
-	}
 
 	// CRITICAL FIX for Sequencer 5: Search for next available ordered batch instead of expecting sequential order
 	// Sequencer 5 processes batches in arrival order, not necessarily sequential batch offset order
 	const size_t MAX_SEARCH_BATCHES = 1000;  // Reasonable upper bound to avoid infinite search
 	size_t search_offset = expected_batch_offset;
-
+	
 	for (size_t i = 0; i < MAX_SEARCH_BATCHES; ++i) {
 		BatchHeader* header = reinterpret_cast<BatchHeader*>(
 			reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * search_offset);
-
-		// [[FIX: NON-COHERENT CXL]] Invalidate BOTH cache lines before reading header fields
-		// - First cache line (offset 0-63): contains 'ordered' at offset 24
-		// - Second cache line (offset 64-127): contains 'batch_off_to_export' at offset 80
-		// The sequencer (B0) writes these to CXL, but data brokers have stale cached copies.
-		CXL::flush_cacheline(header);  // First cache line
-		CXL::flush_cacheline(reinterpret_cast<uint8_t*>(header) + 64);  // Second cache line
-		CXL::full_fence();
-
-		// [[DIAGNOSTIC]] Log read values occasionally (first 3 only to avoid hot-path spam)
-		// Also use volatile read for diagnostic to see actual memory value
-		uint32_t diag_ordered = *reinterpret_cast<volatile uint32_t*>(&header->ordered);
-		static thread_local uint64_t read_count = 0;
-		if (++read_count <= 3) {
-			size_t header_cxl_offset = reinterpret_cast<uint8_t*>(header) - reinterpret_cast<uint8_t*>(cxl_addr_);
-			LOG(INFO) << "[EXPORT_READ] B" << broker_id_ << " slot " << search_offset
-			          << ": header=" << header << " (CXL offset=0x" << std::hex << header_cxl_offset << std::dec << ")"
-			          << ", ordered=" << (int)diag_ordered
-			          << ", batch_off_to_export=" << header->batch_off_to_export
-			          << " (#" << read_count << ")";
-		}
-
+		
 		// Check if this batch is ordered and ready for export
-		// [[FIX: NON-COHERENT CXL]] Use volatile read to prevent compiler optimization
-		uint32_t ordered_val = *reinterpret_cast<volatile uint32_t*>(&header->ordered);
-		if (ordered_val == 1) {
+		if (header->ordered == 1) {
 			// Found an ordered batch! Use it for export
 			header = reinterpret_cast<BatchHeader*>(
 				reinterpret_cast<uint8_t*>(header) + (int)(header->batch_off_to_export));
@@ -1513,18 +1654,6 @@ bool Topic::GetBatchToExportWithMetadata(
 	}
 	
 	// No ordered batches found in reasonable search range
-	// [[FIX: EXPORT STARTUP RACE]] Reset to search from slot 0 if we've gone too far
-	// This handles the case where export starts before sequencer has written any ordered batches,
-	// advances past slot 0, and then misses data that was written to slot 0 later.
-	if (expected_batch_offset > 0) {
-		static thread_local uint64_t reset_count = 0;
-		if (++reset_count % 100 == 1) {
-			LOG(INFO) << "[EXPORT_RESET] B" << broker_id_
-			          << ": No ordered batches found at offset " << expected_batch_offset
-			          << ", resetting to slot 0 (reset #" << reset_count << ")";
-		}
-		expected_batch_offset = 0;  // Reset to beginning of ring
-	}
 	VLOG(4) << "GetBatchToExportWithMetadata: No ordered batches found starting from offset " << expected_batch_offset;
 	return false;
 }
@@ -1714,7 +1843,7 @@ void Topic::Sequencer5() {
 	// New sequencer writes epoch+1 to ControlBlock so zombies see new epoch and replicas reject stale entries
 	ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
 	CXL::flush_cacheline(control_block);
-	CXL::full_fence();  // [[FIX: MFENCE required after CLFLUSHOPT for CXL read]]
+	CXL::load_fence();
 	uint64_t prev_epoch = control_block->epoch.load(std::memory_order_acquire);
 	uint64_t new_epoch = prev_epoch + 1;
 	control_block->epoch.store(new_epoch, std::memory_order_release);
@@ -1735,33 +1864,9 @@ void Topic::Sequencer5() {
 		absl::MutexLock lock(&phase1b_header_for_sub_mu_);
 		phase1b_header_for_sub_.clear();
 		for (int broker_id : registered_brokers) {
-			// [[FIX: NON-COHERENT CXL]] Invalidate cache before reading batch_headers_offset
-			// Each broker writes its own offsets[broker_id] region to CXL, but the sequencer
-			// may have a stale cached value. Must invalidate to see the correct offset.
-			CXL::flush_cacheline(const_cast<const void*>(static_cast<volatile void*>(&tinode_->offsets[broker_id])));
-			CXL::full_fence();
-
-			size_t offset = tinode_->offsets[broker_id].batch_headers_offset;
-
-			// [[FIX: RACE CONDITION]] Skip brokers whose batch_headers_offset is 0
-			// This happens when the sequencer starts before data brokers have created their topics.
-			// CheckAndSpawnNewScanners will pick them up later once initialized.
-			if (offset == 0) {
-				LOG(WARNING) << "[PHASE1B_INIT] Broker " << broker_id
-				             << ": batch_headers_offset=0x0 (not yet initialized), skipping. "
-				             << "Will be added by dynamic detection.";
-				continue;
-			}
-
 			BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
-				reinterpret_cast<uint8_t*>(cxl_addr_) + offset);
+				reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id].batch_headers_offset);
 			phase1b_header_for_sub_[broker_id] = ring_start;
-
-			// [[DIAGNOSTIC]] Log export cursor initialization for debugging
-			LOG(INFO) << "[PHASE1B_INIT] Broker " << broker_id
-			          << ": batch_headers_offset=0x" << std::hex << offset << std::dec
-			          << ", ring_start=" << ring_start
-			          << " (cxl_addr_=" << cxl_addr_ << ")";
 		}
 	}
 
@@ -1770,17 +1875,12 @@ void Topic::Sequencer5() {
 
 	// [[FIX: B3=0 ACKs]] Use dynamic scanner management instead of fixed threads
 	// This allows late-registering brokers to be scanned
-	// [[FIX: RACE CONDITION 2]] Only spawn scanners for brokers that were successfully
-	// added to phase1b_header_for_sub_ (i.e., those with valid batch_headers_offset).
-	// Brokers that were skipped due to offset=0 will be picked up by CheckAndSpawnNewScanners.
 	{
 		absl::MutexLock lock(&scanner_management_mu_);
-		absl::MutexLock sub_lock(&phase1b_header_for_sub_mu_);
-		for (const auto& [broker_id, ring_start] : phase1b_header_for_sub_) {
+		for (int broker_id : registered_brokers) {
 			brokers_with_scanners_.insert(broker_id);
 			scanner_threads_.emplace_back(&Topic::BrokerScannerWorker5, this, broker_id);
-			LOG(INFO) << "Sequencer5: Started initial BrokerScannerWorker5 for broker " << broker_id
-			          << " (ring_start=" << ring_start << ")";
+			LOG(INFO) << "Sequencer5: Started initial BrokerScannerWorker5 for broker " << broker_id;
 		}
 	}
 
@@ -1897,17 +1997,9 @@ void Topic::EpochSequencerThread() {
 		// Reject batches with stale epoch_created so replicas never see zombie-sequencer data
 		ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
 		CXL::flush_cacheline(control_block);
-		CXL::full_fence();  // [[FIX: MFENCE required after CLFLUSHOPT for CXL read]]
+		CXL::load_fence();
 		uint64_t current_epoch = control_block->epoch.load(std::memory_order_acquire);
-		// [[FIX: ACK_STALL_10GB]] Disabled epoch filtering for now.
-		// The epoch_created value is set by data brokers reading control_block->epoch.
-		// Due to CXL cache staleness (only refreshed every 100 batches), epoch_created
-		// can lag significantly behind the sequencer's current_epoch, causing valid
-		// batches to be rejected. At 10GB/s throughput, the epoch can advance by thousands
-		// while data is in flight.
-		// TODO: Properly fix by having data brokers refresh epoch more frequently or
-		// using a different staleness detection mechanism.
-		constexpr uint16_t kMaxEpochAge = 60000;  // ~30 seconds at 500µs/epoch - effectively disabled
+		constexpr uint16_t kMaxEpochAge = 3;  // Design §4.2: reject if entry.epoch < current_epoch - MAX_EPOCH_AGE
 		batch_list.erase(
 			std::remove_if(batch_list.begin(), batch_list.end(),
 				[current_epoch, kMaxEpochAge](const PendingBatch5& p) {
@@ -1967,7 +2059,7 @@ void Topic::EpochSequencerThread() {
 			if (contiguous_consumed_per_broker.contains(b)) continue;
 			const volatile void* addr = reinterpret_cast<const volatile void*>(&tinode_->offsets[b].batch_headers_consumed_through);
 			CXL::flush_cacheline(const_cast<const void*>(addr));
-			CXL::full_fence();  // [[FIX: MFENCE required after CLFLUSHOPT for CXL read]]
+			CXL::load_fence();
 			size_t initial = tinode_->offsets[b].batch_headers_consumed_through;
 			// [[SENTINEL]] BATCHHEADERS_SIZE means "all slots free" (topic_manager.cc); for min-contiguous
 			// we need "next expected = slot 0", so convert sentinel to 0. Otherwise slot_offset (0,64,...)
@@ -2007,7 +2099,7 @@ void Topic::EpochSequencerThread() {
 
 			// [[PHASE_2_FIX]] Use absolute PBR index (from BatchHeader, generated at ingestion)
 			// This is monotonic and never wraps, ensuring CV contiguity
-			entry->pbr_index = static_cast<uint32_t>(p.hdr->pbr_absolute_index);
+			entry->pbr_index = p.hdr->pbr_absolute_index;
 
 			// Flush GOI entry to CXL (non-coherent memory requires explicit flush)
 
@@ -2032,25 +2124,8 @@ void Topic::EpochSequencerThread() {
 			auto it = phase1b_header_for_sub_.find(b);
 			if (it != phase1b_header_for_sub_.end()) {
 				BatchHeader* sub = it->second;
-				int64_t export_offset = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(sub);
-				sub->batch_off_to_export = export_offset;
+				sub->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(sub);
 				sub->ordered = 1;
-				// [[FIX: NON-COHERENT CXL]] Flush BOTH cache lines of BatchHeader
-				// - First cache line (offset 0-63): contains 'ordered' field at offset 24
-				// - Second cache line (offset 64-127): contains 'batch_off_to_export' at offset 80
-				// Data brokers need to see both fields to correctly export batches.
-				CXL::flush_cacheline(sub);  // First cache line
-				CXL::flush_cacheline(reinterpret_cast<uint8_t*>(sub) + 64);  // Second cache line
-
-				// [[DIAGNOSTIC]] Log export cursor writes (first 3 only to avoid hot-path spam)
-				static thread_local uint64_t order_log_count = 0;
-				if (++order_log_count <= 3) {
-					size_t sub_cxl_offset = reinterpret_cast<uint8_t*>(sub) - reinterpret_cast<uint8_t*>(cxl_addr_);
-					LOG(INFO) << "[PHASE1B_WRITE] B" << b << ": set ordered=1 at sub=" << sub
-					          << " (CXL offset=0x" << std::hex << sub_cxl_offset << std::dec
-					          << "), batch_off_to_export=" << export_offset
-					          << ", target p.hdr=" << p.hdr << " (#" << order_log_count << ")";
-				}
 				BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
 					reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[b].batch_headers_offset);
 				BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
@@ -2058,14 +2133,6 @@ void Topic::EpochSequencerThread() {
 				BatchHeader* next_sub = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(sub) + sizeof(BatchHeader));
 				if (next_sub >= ring_end) next_sub = ring_start;
 				it->second = next_sub;
-			} else {
-				// [[DIAGNOSTIC]] Log when phase1b map is missing broker entry
-				static thread_local uint64_t miss_count = 0;
-				if (++miss_count <= 10) {
-					LOG(WARNING) << "[PHASE1B_MISS] Broker " << b << " NOT FOUND in phase1b_header_for_sub_ "
-					             << "(map size=" << phase1b_header_for_sub_.size() << "). "
-					             << "This batch will NOT be marked for export! (#" << miss_count << ")";
-				}
 			}
 
 			p.hdr->batch_complete = 0;
@@ -2082,17 +2149,8 @@ void Topic::EpochSequencerThread() {
 
 		for (const auto& kv : contiguous_consumed_per_broker) {
 			int b = kv.first;
-			size_t old_val = tinode_->offsets[b].batch_headers_consumed_through;
 			tinode_->offsets[b].batch_headers_consumed_through = kv.second;
-			CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(
-				&tinode_->offsets[b].batch_headers_consumed_through)));
-			// [[DIAGNOSTIC]] Log consumed_through updates to track ring gating
-			static thread_local uint64_t log_count = 0;
-			if (++log_count <= 20 || log_count % 500 == 0) {
-				LOG(INFO) << "ProcessEpochBuffer: Updated consumed_through[B" << b << "] from "
-				          << old_val << " to " << kv.second
-				          << " (BATCHHEADERS_SIZE=" << BATCHHEADERS_SIZE << ")";
-			}
+			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].batch_headers_consumed_through));
 		}
 		CXL::store_fence();
 	}
@@ -2190,6 +2248,10 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	auto last_log_time = std::chrono::steady_clock::now();
 	size_t idle_cycles = 0;
 
+	// [[PEER_REVIEW #10]] Named constants for scanner wait/sleep (document 100µs in-flight wait, 50µs idle advance)
+	constexpr int kScannerSleepStuckSlotUs = 100;  // Sleep when retrying same in-flight slot (idle_cycles >= 1024)
+	constexpr int kScannerSleepIdleAdvanceUs = 50; // Sleep when advancing past empty slot
+
 	// [[CRITICAL FIX: Simplified Polling Logic]]
 	// Match message_ordering.cc pattern: Simply check num_msg and advance if not ready
 	// Don't use written_addr as polling signal - it causes complexity and bugs
@@ -2206,11 +2268,8 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		// the sequencer to read stale cached batch_complete=0 for up to 999 iterations, missing batches.
 		// This is the root cause of ACK stalls: sequencer stops processing → no ordered updates → no ACKs.
 		// Trade-off: Correctness > CPU efficiency. Non-coherent CXL requires this overhead.
-		// [[FIX: CLFLUSHOPT requires MFENCE not LFENCE]]
-		// CLFLUSHOPT is weakly ordered - it can be reordered past subsequent loads.
-		// LFENCE only orders prior loads, NOT CLFLUSHOPT. We need MFENCE (full_fence).
 		CXL::flush_cacheline(current_batch_header);
-		CXL::full_fence();
+		CXL::load_fence();
 
 		++scan_loops;
 
@@ -2230,28 +2289,66 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		bool batch_ready = (batch_complete_check == 1);
 		if (!batch_ready || num_msg_check == 0 || num_msg_check > MAX_REASONABLE_NUM_MSG) {
 			++idle_cycles;
-			// [[FIX: ACK_STALL - REMOVE IN-FLIGHT DETECTION]]
-			// Previously, we waited on "in-flight" slots (num_msg>0 but batch_complete=0).
-			// This caused deadlocks due to torn reads on non-coherent CXL:
-			//   - Data broker writes num_msg=REAL (atomic store to CPU cache)
-			//   - Data broker writes batch_complete=1 (atomic store to CPU cache)
-			//   - Data broker flushes (writes both to CXL)
-			// But scanner can see num_msg=REAL before batch_complete=1 if it invalidates+reads
-			// between the atomic stores and the flush. This is NOT a bug - it's how non-coherent
-			// CXL works. The stores update CPU cache immediately; CXL only sees values after flush.
-			//
-			// The fix: Use ONLY batch_complete as the readiness signal. Ignore num_msg for polling.
-			// - If batch_complete=0: slot not ready, advance to next slot
-			// - If batch_complete=1: slot ready, process it
-			// The ring is circular. If we skip a slot, we'll see it again on the next pass.
-			// When batch_complete becomes 1 (after flush), num_msg will also be correct.
+			// [[FIX: ACK_STALL_10GB]] When slot is "in-flight" (num_msg>0 but batch_complete=0),
+			// wait much longer before skipping. Skipping creates gaps → consumed_through stuck →
+			// ring full → stall. At 10GB throughput, batches can take >1µs to write.
+			// Old bounded spin (50 iterations ~200ns) was too short.
+			bool seen_complete_during_spin = false;
+			if (!batch_ready && num_msg_check > 0 && num_msg_check <= MAX_REASONABLE_NUM_MSG) {
+				// [[FIX]] Wait up to 100µs for in-flight batch to complete
+				// This is still much shorter than the epoch interval (500µs) but long enough
+				// for a batch write + flush to complete
+				constexpr int kSpinIterations = 500;  // ~2µs per iteration with cache invalidation
+				constexpr int kMaxWaitIterations = 50;  // 50 * 500 * ~4ns = ~100µs max
+				for (int wait = 0; wait < kMaxWaitIterations && !seen_complete_during_spin; ++wait) {
+					for (int spin = 0; spin < kSpinIterations; ++spin) {
+						CXL::cpu_pause();
+					}
+					// Re-invalidate cache and check
+					CXL::flush_cacheline(current_batch_header);
+					CXL::load_fence();
+					volatile uint32_t recheck = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->batch_complete;
+					if (recheck == 1) {
+						seen_complete_during_spin = true;
+					}
+				}
+				if (!seen_complete_during_spin) {
+					// Still not ready after 100µs - log this as it may indicate a problem
+					static thread_local uint64_t skip_count = 0;
+					if (++skip_count <= 10 || skip_count % 1000 == 0) {
+						LOG(WARNING) << "BrokerScannerWorker5 [B" << broker_id << "]: In-flight slot not ready after 100µs wait. "
+						            << "num_msg=" << num_msg_check << " batch_complete=0 "
+						            << "slot_addr=" << std::hex << current_batch_header << std::dec
+						            << " (skip_count=" << skip_count << ").";
+					}
+				}
+			}
+			if (seen_complete_during_spin) {
+				continue;  // Retry at top of loop: full invalidation then process
+			}
 
-			// [[DIAGNOSTIC: Log more frequently after processing batches to catch stall]]
+			// - If slot is in-flight (num_msg>0 but batch_complete=0), DON'T skip it!
+			//   Stay here and retry. Skipping creates gaps → consumed_through stuck → ring full → stall.
+			// - Only advance to next slot if this slot is truly empty (num_msg=0)
+			bool slot_is_in_flight = (num_msg_check > 0 && num_msg_check <= MAX_REASONABLE_NUM_MSG);
+			if (slot_is_in_flight) {
+				// DON'T skip - stay at this slot and retry (100µs sleep gives producer time to set batch_complete)
+				++idle_cycles;
+				if (idle_cycles >= 1024) {
+					std::this_thread::sleep_for(std::chrono::microseconds(100));
+					idle_cycles = 0;
+				} else {
+					CXL::cpu_pause();
+				}
+				continue;  // Retry same slot
+			}
+
+			// [[DIAGNOSTIC: VLOG to avoid hot-path overhead during throughput tests]]
 			if (++scan_loops % 100000 == 0 || (total_batches_processed > 450 && scan_loops % 10000 == 0)) {
-				LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: waiting batch_complete="
-				          << batch_complete_check << " num_msg=" << num_msg_check
-				          << " log_idx=" << log_idx_check << " slot_addr=" << std::hex << current_batch_header
-				          << std::dec << " total_processed=" << total_batches_processed;
+				VLOG(2) << "BrokerScannerWorker5 [B" << broker_id << "]: waiting batch_complete="
+				        << batch_complete_check << " num_msg=" << num_msg_check
+				        << " log_idx=" << log_idx_check << " slot_addr=" << std::hex << current_batch_header
+				        << std::dec << " total_processed=" << total_batches_processed;
 			}
 			// Slot is empty (num_msg=0) - advance to next slot
 			// This is safe because there's no batch data to lose
@@ -2263,7 +2360,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			current_batch_header = next_batch_header;
 			++idle_cycles;
 			if (idle_cycles >= 1024) {
-				std::this_thread::sleep_for(std::chrono::microseconds(50));
+				std::this_thread::sleep_for(std::chrono::microseconds(kScannerSleepIdleAdvanceUs));
 				idle_cycles = 0;
 			} else {
 				CXL::cpu_pause();
@@ -2310,11 +2407,11 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		total_batches_processed++;
 		idle_cycles = 0;
 
-		// Periodic status logging
+		// Periodic status logging (VLOG to avoid hot-path overhead during throughput tests)
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 5) {
-			LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: Processed " << total_batches_processed 
-			          << " batches, current tinode.ordered=" << tinode_->offsets[broker_id].ordered;
+			VLOG(2) << "BrokerScannerWorker5 [B" << broker_id << "]: Processed " << total_batches_processed 
+			        << " batches, current tinode.ordered=" << tinode_->offsets[broker_id].ordered;
 			last_log_time = now;
 		}
 

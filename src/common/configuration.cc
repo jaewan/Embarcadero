@@ -131,6 +131,7 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (network["recv_direct_to_cxl"]) config_.network.recv_direct_to_cxl.set(network["recv_direct_to_cxl"].as<bool>());
                 if (network["pbr_high_watermark_pct"]) config_.network.pbr_high_watermark_pct.set(network["pbr_high_watermark_pct"].as<int>());
                 if (network["pbr_low_watermark_pct"]) config_.network.pbr_low_watermark_pct.set(network["pbr_low_watermark_pct"].as<int>());
+                if (network["enable_publish_pipeline_profile"]) config_.network.enable_publish_pipeline_profile.set(network["enable_publish_pipeline_profile"].as<bool>());
             }
             
             // Corfu
@@ -202,6 +203,7 @@ bool Configuration::loadFromFile(const std::string& filename) {
                     if (performance["use_hugepages"]) config_.client.performance.use_hugepages.set(performance["use_hugepages"].as<bool>());
                     if (performance["numa_bind"]) config_.client.performance.numa_bind.set(performance["numa_bind"].as<bool>());
                     if (performance["zero_copy"]) config_.client.performance.zero_copy.set(performance["zero_copy"].as<bool>());
+                    if (performance["enable_publisher_pipeline_profile"]) config_.client.performance.enable_publisher_pipeline_profile.set(performance["enable_publisher_pipeline_profile"].as<bool>());
                 }
             }
         }
@@ -237,6 +239,7 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (perf["use_hugepages"]) config_.client.performance.use_hugepages.set(perf["use_hugepages"].as<bool>());
                 if (perf["numa_bind"]) config_.client.performance.numa_bind.set(perf["numa_bind"].as<bool>());
                 if (perf["zero_copy"]) config_.client.performance.zero_copy.set(perf["zero_copy"].as<bool>());
+                if (perf["enable_publisher_pipeline_profile"]) config_.client.performance.enable_publisher_pipeline_profile.set(perf["enable_publisher_pipeline_profile"].as<bool>());
             }
         }
         

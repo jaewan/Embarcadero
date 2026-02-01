@@ -73,6 +73,7 @@
  */
 
 #include "buffer.h"
+#include "publisher_profile.h"
 #include "../common/configuration.h"
 #include "../common/wire_formats.h"
 #include "../common/performance_utils.h"
@@ -256,6 +257,7 @@ void Buffer::WarmupBuffers() {
 
 #ifdef BATCH_OPTIMIZATION
 bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize) {
+	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 	// [[BLOG_HEADER: Determine header format based on feature flag and order]]
 	bool use_blog_header = Embarcadero::HeaderUtils::ShouldUseBlogHeader() && order_ == 5;
 	static const size_t v1_header_size = sizeof(Embarcadero::MessageHeader);
@@ -396,7 +398,12 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 		Seal();
 	}
 
-
+	{
+		auto t1 = std::chrono::steady_clock::now();
+		uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+		RecordPublisherProfile(kPublisherBufferWrite, ns);
+		RecordPublisherProfileBufferWriteBytes(stride);
+	}
 	return true;
 }
 
@@ -430,7 +437,7 @@ void Buffer::Seal(){
 		// Move to next buffer
 		AdvanceWriteBufId();
 	} else {
-		LOG(INFO) << "Buffer::Seal: No data to seal in buffer " << lockedIdx 
+		VLOG(2) << "Buffer::Seal: No data to seal in buffer " << lockedIdx 
 		          << ", head=" << head << ", tail=" << bufs_[lockedIdx].prod.tail.load(std::memory_order_relaxed);
 	}
 }
@@ -449,6 +456,12 @@ void Buffer::SealAll() {
 		size_t head = bufs_[idx].prod.writer_head.load(std::memory_order_relaxed);
 		size_t tail = bufs_[idx].prod.tail.load(std::memory_order_relaxed);
 		if ((tail - head) > sizeof(Embarcadero::BatchHeader)) {
+			// [[ACK_TIMEOUT_DIAG]] Log which buffer we seal and at what offset for root-cause check
+			size_t reader_head_at_seal = bufs_[idx].cons.reader_head.load(std::memory_order_relaxed);
+			LOG(INFO) << "Buffer::SealAll sealing buffer idx=" << idx << " head=" << head
+			          << " tail=" << tail << " reader_head=" << reader_head_at_seal
+			          << " match=" << (reader_head_at_seal == head ? "yes" : "NO");
+
 			Embarcadero::BatchHeader* batch_header =
 				reinterpret_cast<Embarcadero::BatchHeader*>(
 					reinterpret_cast<uint8_t*>(bufs_[idx].buffer) + head);
@@ -458,6 +471,9 @@ void Buffer::SealAll() {
 			batch_header->total_size = tail - head - sizeof(Embarcadero::BatchHeader);
 			batch_header->num_msg = bufs_[idx].prod.num_msg.load(std::memory_order_relaxed);
 			batch_header->batch_complete = 0;
+			// [[ACK_TIMEOUT_FIX]] Release fence immediately after sealing this buffer so the
+			// reader waiting in Read() sees total_size/num_msg without waiting for the loop end.
+			std::atomic_thread_fence(std::memory_order_release);
 			sealed_buffers++;
 			sealed_messages += batch_header->num_msg;
 			sealed_bytes += batch_header->total_size;
@@ -472,10 +488,15 @@ void Buffer::SealAll() {
 		// Also count already-written data (from tail position)
 		per_buffer_bytes[idx] += tail;
 	}
+
 	if (sealed_buffers > 0) {
-		LOG(INFO) << "Buffer::SealAll sealed_buffers=" << sealed_buffers
-		          << " sealed_messages=" << sealed_messages
-		          << " sealed_bytes=" << sealed_bytes;
+		// [[ACK_TIMEOUT_FIX]] Release fence so PublishThreads in Read()'s wait loop see our
+		// batch_header writes (total_size, num_msg). Seal() has the same fence; SealAll() was
+		// missing it, so readers could spin on stale total_size/num_msg and hit the 10s timeout.
+		std::atomic_thread_fence(std::memory_order_release);
+		VLOG(3) << "Buffer::SealAll sealed_buffers=" << sealed_buffers
+		        << " sealed_messages=" << sealed_messages
+		        << " sealed_bytes=" << sealed_bytes;
 	}
 
 	// [[FIX: B3=0 ACKs]] Log per-broker buffer statistics (4 buffers per broker)
@@ -494,7 +515,7 @@ void Buffer::SealAll() {
 			if (!per_broker_stats.empty()) per_broker_stats += " ";
 			per_broker_stats += "B" + std::to_string(broker) + "=" + std::to_string(broker_msgs) + "msgs";
 		}
-		LOG(INFO) << "Buffer::SealAll per-broker distribution (sealed only): " << per_broker_stats;
+		VLOG(3) << "Buffer::SealAll per-broker distribution (sealed only): " << per_broker_stats;
 	}
 }
 
@@ -531,34 +552,52 @@ void* Buffer::Read(int bufIdx) {
 		return nullptr;
 	}
 
+	// [[ACK_TIMEOUT_FIX]] Acquire fence so we see SealAll()'s writes to total_size/num_msg before waiting
+	std::atomic_thread_fence(std::memory_order_acquire);
 	// Busy wait only when some messages are in the buffer.
 	// Wait for the batch to be sealed. (Either full batch written or sealed by Client)
-	// Use 2s timeout so we don't return nullptr before SealAll() runs.
-	// Reduces CPU waste from 3 of 4 threads spinning on empty buffers
+	// [[ACK_TIMEOUT_FIX]] 10s timeout so readers don't return nullptr before SealAll() completes
 	// Phase 1: Fast spin (100 iters) - low latency when data arrives quickly
 	// Phase 2: Yield (1000 iters) - cooperative for concurrent threads
 	// Phase 3: Sleep - reduces CPU to ~25% vs constant yield()
+	// [[ACK_TIMEOUT_FIX]] Re-load reader_head each iteration so we follow writer after wrap (writer sets
+	// reader_head=0 on wrap; reader was stuck waiting on old slot and timed out). See ACK_TIMEOUT_INVESTIGATION §8.
 	auto start_time = std::chrono::steady_clock::now();
-	const auto timeout = std::chrono::seconds(2);
+	const auto timeout = std::chrono::seconds(10);
 	constexpr size_t SPIN_ITERS = 100;
 	constexpr size_t YIELD_ITERS = 1000;
 	constexpr size_t TIME_CHECK_INTERVAL = 1000;
 	size_t wait_iters = 0;
 
-	while (batch_header->total_size == 0 || batch_header->num_msg == 0) {
-		++wait_iters;
+	VLOG(1) << "Buffer::Read entering wait bufIdx=" << bufIdx
+	        << " reader_head=" << bufs_[bufIdx].cons.reader_head.load(std::memory_order_relaxed)
+	        << " writer_head=" << bufs_[bufIdx].prod.writer_head.load(std::memory_order_relaxed)
+	        << " tail=" << bufs_[bufIdx].prod.tail.load(std::memory_order_relaxed);
 
+	// Re-load reader_head each iteration and wait on that slot (volatile so we see writer's total_size/num_msg).
+	// When writer wraps it sets reader_head=0; we then wait on the batch at 0 instead of timing out at old offset.
+	// [[BANDWIDTH]] Use relaxed load most iterations; acquire every N so we eventually see wrap (reduces handoff cost).
+	constexpr size_t READER_HEAD_ACQUIRE_INTERVAL = 10;
+	while (true) {
+		size_t current_reader_head = (wait_iters % READER_HEAD_ACQUIRE_INTERVAL == 0)
+			? bufs_[bufIdx].cons.reader_head.load(std::memory_order_acquire)
+			: bufs_[bufIdx].cons.reader_head.load(std::memory_order_relaxed);
+		Embarcadero::BatchHeader* hdr =
+			reinterpret_cast<Embarcadero::BatchHeader*>((uint8_t*)bufs_[bufIdx].buffer + current_reader_head);
+		const auto* v_total_size = reinterpret_cast<const volatile size_t*>(&hdr->total_size);
+		const auto* v_num_msg = reinterpret_cast<const volatile uint32_t*>(&hdr->num_msg);
+		if (*v_total_size != 0 && *v_num_msg != 0) {
+			bufs_[bufIdx].cons.reader_head.store(hdr->start_logical_offset, std::memory_order_relaxed);
+			return static_cast<void*>(hdr);
+		}
+
+		++wait_iters;
 		if (wait_iters <= SPIN_ITERS) {
-			// Phase 1: Fast spin for low-latency response
 			Embarcadero::CXL::cpu_pause();
 		} else if (wait_iters <= YIELD_ITERS) {
-			// Phase 2: Yield to other threads
 			std::this_thread::yield();
 		} else {
-			// Phase 3: Brief sleep to reduce CPU waste
 			std::this_thread::sleep_for(std::chrono::microseconds(100));
-
-			// Only check time in sleep phase (expensive operation)
 			if ((wait_iters - YIELD_ITERS) % TIME_CHECK_INTERVAL == 0) {
 				if (std::chrono::steady_clock::now() - start_time > timeout) {
 					return nullptr;  // Read wait timeout for buffer
@@ -566,9 +605,6 @@ void* Buffer::Read(int bufIdx) {
 			}
 		}
 	}
-
-	bufs_[bufIdx].cons.reader_head.store(batch_header->start_logical_offset, std::memory_order_relaxed);
-	return static_cast<void*>(batch_header);
 }
 
 #else
@@ -671,8 +707,8 @@ void Buffer::ReturnReads() {
 
 void Buffer::DumpBufferStats() {
 	const size_t total_bufs = num_buf_.load(std::memory_order_relaxed);
-	LOG(INFO) << "=== Buffer Statistics Dump ===";
-	LOG(INFO) << "Total buffers: " << total_bufs << ", threads_per_broker: " << num_threads_per_broker_;
+	VLOG(2) << "=== Buffer Statistics Dump ===";
+	VLOG(2) << "Total buffers: " << total_bufs << ", threads_per_broker: " << num_threads_per_broker_;
 
 	size_t total_bytes_written = 0;
 	std::vector<size_t> per_broker_bytes(NUM_MAX_BROKERS, 0);
@@ -685,18 +721,18 @@ void Buffer::DumpBufferStats() {
 		per_broker_bytes[broker_id] += tail;
 		total_bytes_written += tail;
 
-		LOG(INFO) << "  Buffer[" << idx << "] (Broker " << broker_id << "): tail=" << tail
-		         << " bytes (" << (tail / 1024) << " KB)";
+		VLOG(2) << "  Buffer[" << idx << "] (Broker " << broker_id << "): tail=" << tail
+		       << " bytes (" << (tail / 1024) << " KB)";
 	}
 
-	LOG(INFO) << "--- Per-Broker Summary ---";
+	VLOG(2) << "--- Per-Broker Summary ---";
 	for (size_t broker = 0; broker < total_bufs / num_threads_per_broker_; broker++) {
 		double pct = total_bytes_written > 0 ? (100.0 * per_broker_bytes[broker] / total_bytes_written) : 0;
-		LOG(INFO) << "  Broker " << broker << ": " << per_broker_bytes[broker] << " bytes ("
-		         << (per_broker_bytes[broker] / (1024*1024)) << " MB, " << std::fixed << std::setprecision(1) << pct << "%)";
+		VLOG(2) << "  Broker " << broker << ": " << per_broker_bytes[broker] << " bytes ("
+		       << (per_broker_bytes[broker] / (1024*1024)) << " MB, " << std::fixed << std::setprecision(1) << pct << "%)";
 	}
-	LOG(INFO) << "  Total: " << total_bytes_written << " bytes (" << (total_bytes_written / (1024*1024)) << " MB)";
-	LOG(INFO) << "=== End Buffer Statistics ===";
+	VLOG(2) << "  Total: " << total_bytes_written << " bytes (" << (total_bytes_written / (1024*1024)) << " MB)";
+	VLOG(2) << "=== End Buffer Statistics ===";
 }
 
 void Buffer::WriteFinished() {

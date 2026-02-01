@@ -1,9 +1,9 @@
 client:
   publisher:
-    threads_per_broker: 4
-    # 768MB per thread × 16 threads = 12GB total buffer capacity
-    # Required for 10GB tests: 10GB / 16 threads = 625MB minimum
-    buffer_size_mb: 768
+    threads_per_broker: 3
+    # 1024 MB per buffer so 12 buffers (3 threads/broker × 4 brokers) hold 10 GB total (12 × 1 GB = 12 GB ≥ 10 GB).
+    # Min would be ceil(10/12) GB ≈ 854 MB; 1024 MB gives headroom so 10 GB test does not wrap.
+    buffer_size_mb: 1024
     batch_size_kb: 2048
   
   subscriber:
@@ -19,3 +19,5 @@ client:
     use_hugepages: true
     numa_bind: true
     zero_copy: true
+    # Lightweight publisher pipeline profile (buffer write + send). Set true to log at shutdown.
+    enable_publisher_pipeline_profile: true

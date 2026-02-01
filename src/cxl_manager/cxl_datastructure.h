@@ -232,8 +232,7 @@ struct alignas(64) GOIEntry {
 	uint64_t client_seq;                       // Client's sequence number (if Level 5)
 
 	// [[PHASE_2_FIX]] ACK path: Absolute PBR index for CV updater (CompletionVector[broker_id])
-	uint32_t pbr_index;                        // [[CRITICAL]] Absolute index (never wraps, monotonic) from BatchHeader.pbr_absolute_index
-	uint8_t _pad[4];                           // Pad toward 64 bytes (actual size may be 128 due to alignas(64)+atomic padding)
+	uint64_t pbr_index;                        // [[CRITICAL]] Absolute index (never wraps, monotonic) from BatchHeader.pbr_absolute_index
 };
 static_assert(sizeof(GOIEntry) <= 128 && sizeof(GOIEntry) % 64 == 0, "GOIEntry must be cache-line multiple (64 or 128)");
 static_assert(alignof(GOIEntry) == 64, "GOIEntry must be 64-byte aligned");
@@ -378,6 +377,7 @@ struct alignas(64) BatchHeader{
 #endif
 };
 static_assert(sizeof(BatchHeader) % 64 == 0, "BatchHeader must be cache-line sized");
+static_assert(sizeof(BatchHeader) == 128, "BatchHeader must be exactly 128 bytes (two cache lines); CompleteBatchInCXL flushes both");
 static_assert(offsetof(BatchHeader, client_id) < 64, "client_id must be in first cache line");
 static_assert(offsetof(BatchHeader, num_msg) < 64, "num_msg must be in first cache line");
 static_assert(offsetof(BatchHeader, batch_complete) < 64, "batch_complete must be in first cache line");
@@ -415,8 +415,8 @@ struct alignas(64) BlogMessageHeader {
 	// --- Bytes 0-15: Receiver Writes (Stage 1: Ingest) ---
 	// [[WRITER: Receiver Thread]] - All fields in bytes 0-15 written by receiver only
 	volatile uint32_t size;          // Offset 0 (4 bytes) - Payload size in bytes
-	volatile uint32_t received;      // Offset 4 (4 bytes) - Completion flag: 0=not received, 1=received
-	volatile uint64_t ts;            // Offset 8 (8 bytes) - Receipt timestamp (rdtsc())
+	volatile uint32_t received;      // Offset 4 (4 bytes) - Reserved for future: completion flag (not used now; gating uses BatchHeader::batch_complete). Can be used for latency tracing later.
+	volatile uint64_t ts;            // Offset 8 (8 bytes) - Reserved for future: receipt timestamp (rdtsc()). Can be used for latency tracing later; not written on hot path.
 
 	// --- Bytes 16-31: Delegation Writes (Stage 2: Local Ordering) ---
 	// [[WRITER: Delegation Thread]] - All fields in bytes 16-31 written by delegation only

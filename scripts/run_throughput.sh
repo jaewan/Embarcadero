@@ -29,6 +29,12 @@ cleanup() {
 
 cleanup
 
+# Kernel socket buffers: allow SO_RCVBUF/SO_SNDBUF (32 MB) to take effect (broker + client).
+# Run scripts/tune_kernel_buffers.sh with sudo if not already tuned.
+if [ -n "${EMBARCADERO_TUNE_KERNEL_BUFFERS:-}" ]; then
+  (cd "$PROJECT_ROOT" && ./scripts/tune_kernel_buffers.sh) || echo "Warning: kernel buffer tune failed (need sudo?). Continuing."
+fi
+
 # PERF OPTIMIZED: Enable hugepages by default for 9GB/s+ performance
 # Runtime hugepage allocation with 256MB buffers provides optimal performance
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
@@ -38,8 +44,8 @@ export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 # No CPU pinning - let OS schedule threads across all cores on node 1
 EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1"
 
-NUM_BROKERS=4
-NUM_TRIALS=1
+NUM_BROKERS=${NUM_BROKERS:-4}
+NUM_TRIALS=${NUM_TRIALS:-1}
 # Use test type 1 (E2E) for validation - includes subscriber and DEBUG_check_order
 test_cases=(${TEST_TYPE:-1})
 # Use MESSAGE_SIZE environment variable or default to multiple sizes
@@ -317,7 +323,7 @@ for test_case in "${test_cases[@]}"; do
 				# No NUMA binding for client - let OS optimize placement
 			# Total message size: 8GB (8589934592 bytes) for bandwidth measurement
 			# [[FIX]]: Capture exit code before if statement to report correctly
-			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -m $msg_size -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case -o $order -a $ack --sequencer $sequencer
+			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -m $msg_size -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -l 0
 			test_exit_code=$?
 			if [ $test_exit_code -ne 0 ]; then
 				echo "ERROR: Throughput test failed with exit code $test_exit_code"

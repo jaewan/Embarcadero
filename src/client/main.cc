@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
         LOG(WARNING) << "Failed to load configuration from " << config_file << ", using defaults";
         // Continue with defaults - don't fail
     } else {
-        LOG(INFO) << "Configuration loaded successfully from " << config_file;
+        VLOG(1) << "Configuration loaded successfully from " << config_file;
     }
     
     // Extract parameters (with config override capability)
@@ -225,7 +225,7 @@ int main(int argc, char* argv[]) {
         }
         case 5: {
             // Publish-only test
-            LOG(INFO) << "Running Publish : " << total_message_size;
+            VLOG(1) << "Running Publish : " << total_message_size;
             CreateNewTopic(stub, topic, order, seq_type, replication_factor, replicate_tinode, ack_level);
             double pub_bandwidthMb = PublishThroughputTest(result, topic, synchronizer);
             writer.SetPubResult(pub_bandwidthMb);

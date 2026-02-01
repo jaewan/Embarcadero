@@ -49,7 +49,7 @@ private:
     void ReplicationThread();
 
     // Tail replica updates CompletionVector
-    void UpdateCompletionVector(uint16_t broker_id, uint32_t pbr_index);
+    void UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index);
 
     int replica_id_;
     int replication_factor_;

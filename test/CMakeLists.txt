@@ -48,6 +48,7 @@ if(PkgConfig_FOUND)
         )
         target_include_directories(blog_header_validation_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
             ${CMAKE_BINARY_DIR}
             ${CMAKE_CURRENT_BINARY_DIR}
             ${GTEST_INCLUDE_DIRS}
@@ -77,6 +78,7 @@ if(PkgConfig_FOUND)
         )
         target_include_directories(phase2_integration_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
             ${CMAKE_BINARY_DIR}
             ${CMAKE_CURRENT_BINARY_DIR}
             ${GTEST_INCLUDE_DIRS}
@@ -103,6 +105,7 @@ if(PkgConfig_FOUND)
         )
         target_include_directories(phase3_recovery_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
             ${CMAKE_BINARY_DIR}
             ${CMAKE_CURRENT_BINARY_DIR}
             ${GTEST_INCLUDE_DIRS}
