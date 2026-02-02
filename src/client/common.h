@@ -106,6 +106,14 @@ int GetNonblockingSock(char* broker_address, int port, bool send = true);
 unsigned long default_huge_page_size(void);
 
 /**
+ * Check if enough HugeTLB pages are available for need_bytes.
+ * Reads /proc/meminfo for Hugepagesize and HugePages_Free.
+ * @param need_bytes Required bytes (e.g. 16 GB for QueueBuffer pool)
+ * @return true if HugePages_Free * Hugepagesize >= need_bytes
+ */
+bool CheckHugePagesAvailable(size_t need_bytes);
+
+/**
  * Macro to align a value up to the nearest multiple of align_to
  */
 #define ALIGN_UP(x, align_to) (((x) + ((align_to)-1)) & ~((align_to)-1))

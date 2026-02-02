@@ -248,6 +248,38 @@ unsigned long default_huge_page_size() {
     return hps;
 }
 
+bool CheckHugePagesAvailable(size_t need_bytes) {
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) {
+        LOG(WARNING) << "CheckHugePagesAvailable: cannot open /proc/meminfo";
+        return false;
+    }
+    unsigned long hps_kb = 0;
+    unsigned long free_pages = 0;
+    char* line = nullptr;
+    size_t len = 0;
+    while (getline(&line, &len, f) != -1) {
+        if (sscanf(line, "Hugepagesize: %lu kB", &hps_kb) == 1) { }
+        if (sscanf(line, "HugePages_Free: %lu", &free_pages) == 1) { }
+    }
+    free(line);
+    fclose(f);
+    if (hps_kb == 0) {
+        LOG(WARNING) << "CheckHugePagesAvailable: Hugepagesize not found in /proc/meminfo";
+        return false;
+    }
+    unsigned long free_bytes = free_pages * hps_kb * 1024UL;
+    bool ok = (free_bytes >= need_bytes);
+    if (ok) {
+        LOG(INFO) << "Hugepages: " << free_pages << " free × " << hps_kb << " kB = "
+                  << (free_bytes / (1024UL * 1024)) << " MB free; need " << (need_bytes / (1024UL * 1024)) << " MB";
+    } else {
+        LOG(WARNING) << "Hugepages: " << free_pages << " free × " << hps_kb << " kB = "
+                    << (free_bytes / (1024UL * 1024)) << " MB free; need " << (need_bytes / (1024UL * 1024))
+                    << " MB. Provision more (e.g. echo 8192 | sudo tee /proc/sys/vm/nr_hugepages) or set EMBAR_USE_HUGETLB=0 for THP.";
+    }
+    return ok;
+}
 
 void* mmap_large_buffer(size_t need, size_t& allocated) {
     void* buffer = nullptr;

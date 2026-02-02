@@ -122,7 +122,9 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 	num_threads_per_broker_(num_threads_per_broker),
 	message_size_(message_size),
 	queueSize_((num_threads_per_broker > 0) ? (queueSize / static_cast<size_t>(num_threads_per_broker)) : queueSize),
-	pubQue_(num_threads_per_broker_ * NUM_MAX_BROKERS, num_threads_per_broker_, client_id_, message_size, order),
+	// [[NEW_BUFFER_FIX]] Use config max_brokers for num_queues so pool is ~20 GB (e.g. 20 queues) not 128 GB (128 queues).
+	// See docs/NEW_BUFFER_BANDWIDTH_INVESTIGATION.md.
+	pubQue_(num_threads_per_broker_ * static_cast<size_t>(std::min(NUM_MAX_BROKERS, Embarcadero::GetConfig().config().broker.max_brokers.get())), num_threads_per_broker_, client_id_, message_size, order),
 	seq_type_(seq_type),
 	sent_bytes_per_broker_(NUM_MAX_BROKERS),
 	start_time_(std::chrono::steady_clock::now()),  // Initialize immediately; declaration order before acked_messages_per_broker_
@@ -150,7 +152,10 @@ Publisher::~Publisher() {
 	// Signal all threads to terminate [[CRITICAL: Atomic store for cross-thread visibility]]
 	publish_finished_.store(true, std::memory_order_release);
 	shutdown_.store(true, std::memory_order_release);
-	context_.TryCancel();
+	// Cancel current gRPC SubscribeToCluster call so cluster_probe_thread_ can exit (reader->Read() unblocks).
+	if (grpc::ClientContext* ctx = subscribe_context_.exchange(nullptr)) {
+		ctx->TryCancel();
+	}
 
 	// Wait for all threads to complete (only if not already joined)
 	for (auto& t : threads_) {
@@ -358,25 +363,9 @@ void Publisher::Publish(char* message, size_t len) {
 	size_t padded_total = len + padded + header_size;
 
 	size_t my_order = client_order_.fetch_add(1, std::memory_order_acq_rel);  // [[CRITICAL: Atomic RMW]]
-#ifdef BATCH_OPTIMIZATION
 	if (!pubQue_.Write(my_order, message, len, padded_total)) {
 		LOG(ERROR) << "Failed to write message to queue (client_order=" << my_order << ")";
 	}
-#else
-	const static size_t batch_size = BATCH_SIZE;
-	static size_t i = 0;
-	static size_t j = 0;
-	size_t n = batch_size / (padded_total);
-	if (n == 0) n = 1;
-	if (!pubQue_.Write(i, my_order, message, len, padded_total)) {
-		LOG(ERROR) << "Failed to write message to queue (client_order=" << my_order << ")";
-	}
-	j++;
-	if (j == n) {
-		i = (i + 1) % num_threads_.load();
-		j = 0;
-	}
-#endif
 
 	auto t1 = std::chrono::steady_clock::now();
 	uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
@@ -1102,12 +1091,12 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	};
 
 	// Connect to initial broker
-	LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Starting connection to broker " << broker_id;
+	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Starting connection to broker " << broker_id;
 	if (!connect_to_server(broker_id)) {
 		LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Failed to connect to broker " << broker_id;
 		return;
 	}
-	LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Successfully connected to broker " << broker_id;
+	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Successfully connected to broker " << broker_id;
 
 	// Signal thread is initialized
 	thread_count_.fetch_add(1);
@@ -1124,9 +1113,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		size_t len;
 		int bytesSent = 0;
 
-#ifdef BATCH_OPTIMIZATION
-		// Read a batch from the queue
-		Embarcadero::BatchHeader* batch_header = 
+		// Read a batch from the queue (QueueBuffer)
+		Embarcadero::BatchHeader* batch_header =
 			static_cast<Embarcadero::BatchHeader*>(pubQue_.Read(pubQuesIdx));
 
 		// Skip if no batch is available
@@ -1164,14 +1152,14 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		}
 		}
 
-		// Log when we successfully read a batch
+		// Batch count; log only at VLOG(3) to avoid affecting bandwidth measurement.
 		static thread_local size_t batch_count = 0;
 		if (++batch_count % 100 == 0 || batch_count == 1) {
-			LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: Read batch " << batch_count 
-			         << " from buffer " << pubQuesIdx 
-			         << " (batch_seq=" << batch_header->batch_seq 
-			         << ", num_msg=" << batch_header->num_msg 
-			         << ", total_size=" << batch_header->total_size << ")";
+			VLOG(3) << "PublishThread[" << pubQuesIdx << "]: Read batch " << batch_count
+			        << " from buffer " << pubQuesIdx
+			        << " (batch_seq=" << batch_header->batch_seq
+			        << ", num_msg=" << batch_header->num_msg
+			        << ", total_size=" << batch_header->total_size << ")";
 		}
 		total_batches_attempted_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1213,9 +1201,12 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 				if (bytesSent < 0) {
 					if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-						// Wait for socket to become writable (0ms: avoid adding latency per batch)
+						// Wait for socket to become writable so broker can recv() and drain kernel buffer.
+						// [[ROOT_CAUSE_FIX]] 0ms caused busy-loop; brokers blocked in recv(), ACK stall.
+						// Use 1ms so we yield and broker gets CPU; epoll returns when EPOLLOUT (writable).
+						static constexpr int EPOLL_WAIT_WRITABLE_MS = 1;
 						struct epoll_event events[64];
-						int n = epoll_wait(efd, events, 64, 0);
+						int n = epoll_wait(efd, events, 64, EPOLL_WAIT_WRITABLE_MS);
 
 						if (n == -1) {
 							LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
@@ -1231,39 +1222,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				}
 			}
 		};
-#else
-		// Non-batch mode
-		void* msg = pubQue_.Read(pubQuesIdx, len);
-		if (len == 0) {
-			break;
-		}
-
-		// Create batch header
-		Embarcadero::BatchHeader batch_header;
-		batch_header.broker_id = broker_id;
-		batch_header.client_id = client_id_;
-		batch_header.total_size = len;
-		batch_header.num_msg = len / static_cast<Embarcadero::MessageHeader*>(msg)->paddedSize;
-		batch_header.batch_seq = batch_seq;
-
-		// Function to send batch header
-		auto send_batch_header = [&]() -> void {
-			bytesSent = send(sock, reinterpret_cast<uint8_t*>(&batch_header), sizeof(batch_header), 0);
-
-			// Handle partial sends
-			while (bytesSent < static_cast<ssize_t>(sizeof(batch_header))) {
-				if (bytesSent < 0) {
-					LOG(ERROR) << "Batch send failed: " << strerror(errno);
-					throw std::runtime_error("send failed");
-				}
-
-				bytesSent += send(sock, 
-						reinterpret_cast<uint8_t*>(&batch_header) + bytesSent, 
-						sizeof(batch_header) - bytesSent, 
-						0);
-			}
-		};
-#endif
 
 		// Try to send batch header, handle failures
 		try {
@@ -1274,6 +1232,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 		} catch (const std::exception& e) {
 			total_batches_failed_.fetch_add(1, std::memory_order_relaxed);
+			pubQue_.ReleaseBatch(batch_header);
 			LOG(ERROR) << "Exception sending batch header: " << e.what();
 			std::string fail_msg = "Header Send Fail Broker " + std::to_string(broker_id) + " (" + e.what() + ")";
 			RecordFailureEvent(fail_msg); // Record event
@@ -1292,6 +1251,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 				// No brokers left
 				if (brokers_.empty()) {
+					pubQue_.ReleaseBatch(batch_header);
 					LOG(ERROR) << "No brokers available, thread exiting";
 					return;
 				}
@@ -1302,6 +1262,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 			// Connect to new broker
 			if (!connect_to_server(new_broker_id)) {
+				pubQue_.ReleaseBatch(batch_header);
 				RecordFailureEvent("Reconnect Fail Broker " + std::to_string(new_broker_id));
 				LOG(ERROR) << "Failed to connect to replacement broker " << new_broker_id;
 				return;
@@ -1314,6 +1275,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				send_batch_header();
 			} catch (const std::exception& e) {
 				total_batches_failed_.fetch_add(1, std::memory_order_relaxed);
+				pubQue_.ReleaseBatch(batch_header);
 				LOG(ERROR) << "Failed to send batch header to replacement broker: " << e.what();
 				std::string fail_msg2 = "Header Send Fail (Post-Reconnect) Broker " + std::to_string(new_broker_id) + " (" + e.what() + ")";
 				RecordFailureEvent(fail_msg2);
@@ -1341,9 +1303,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			size_t remaining_bytes = len - sent_bytes;
 			size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
 
-		// PERF TUNED: Use MSG_ZEROCOPY for sends >= 64KB (Linux kernel optimal threshold)
-        // Below 64KB: zero-copy overhead > benefit. Above 64KB: significant performance gain
-        int send_flags = (to_send >= (64UL << 10)) ? MSG_ZEROCOPY : 0;
+		// [[TEST]] Disable MSG_ZEROCOPY to check if it's causing issues
+        int send_flags = 0;
 
 			bytesSent = send(sock, 
 					static_cast<uint8_t*>(msg) + sent_bytes, 
@@ -1360,14 +1321,16 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
 			} else if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
 				::g_send_eagain_count.fetch_add(1, std::memory_order_relaxed);
-				// Socket buffer full, wait for it to become writable.
-				// 0ms: 1ms caused ACK timeout/0 MB/s when kernel buffers capped. If CPU too high after
-				// kernel tune, consider 1ms or spin-then-sleep (epoll_wait is ms-only).
+				// Socket buffer full; wait for writable so broker can recv() and drain.
+				// [[ROOT_CAUSE_FIX]] 0ms caused client busy-loop while brokers blocked in recv() → ACK stall.
+				// 1ms yields to broker; epoll returns when EPOLLOUT (kernel has space).
+				static constexpr int EPOLL_WAIT_WRITABLE_MS = 1;
 				struct epoll_event events[64];
-				int n = epoll_wait(efd, events, 64, 0);
+				int n = epoll_wait(efd, events, 64, EPOLL_WAIT_WRITABLE_MS);
 
 				if (n == -1) {
 					LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
+					pubQue_.ReleaseBatch(batch_header);
 					break;
 				}
 
@@ -1392,6 +1355,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 					// No brokers left
 					if (brokers_.empty()) {
+						pubQue_.ReleaseBatch(batch_header);
 						LOG(ERROR) << "No brokers available, thread exiting";
 						return;
 					}
@@ -1402,6 +1366,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 				// Connect to new broker
 				if (!connect_to_server(new_broker_id)) {
+					pubQue_.ReleaseBatch(batch_header);
 					RecordFailureEvent("Reconnect Fail Broker " + std::to_string(new_broker_id));
 					LOG(ERROR) << "Failed to connect to replacement broker " << new_broker_id;
 					return;
@@ -1413,6 +1378,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				try {
 					send_batch_header();
 				} catch (const std::exception& e) {
+					pubQue_.ReleaseBatch(batch_header);
 					LOG(ERROR) << "Failed to send batch header to replacement broker: " << e.what();
 					RecordFailureEvent("Header Send Fail (Post-Reconnect) Broker " + std::to_string(new_broker_id) + " (" + e.what() + ")");
 					return;
@@ -1452,6 +1418,9 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Update batch sequence for next iteration
 		batch_seq += num_threads_.load();
+
+		// Return batch to pool (QueueBuffer).
+		pubQue_.ReleaseBatch(batch_header);
 	}
 
 	// IMPROVED: Keep connections alive for subscriber
@@ -1480,8 +1449,11 @@ void Publisher::SubscribeToClusterStatus() {
 		}
 
 		LOG(INFO) << "SubscribeToCluster: Creating gRPC reader for cluster status subscription...";
+		// Use a fresh ClientContext per reader; gRPC forbids reusing a context for a new call.
+		grpc::ClientContext ctx;
+		subscribe_context_.store(&ctx);
 		std::unique_ptr<grpc::ClientReader<ClusterStatus>> reader(
-				stub_->SubscribeToCluster(&context_, client_info));
+				stub_->SubscribeToCluster(&ctx, client_info));
 
 		if (!reader) {
 			LOG(ERROR) << "SubscribeToCluster: Failed to create gRPC reader. Check broker gRPC service availability.";
@@ -1627,6 +1599,7 @@ void Publisher::SubscribeToClusterStatus() {
 		}
 
 		grpc::Status status = reader->Finish();
+		subscribe_context_.store(nullptr);  // Done with this context; next iteration uses a new one.
 		if (!status.ok() && !shutdown_.load(std::memory_order_acquire)) {
 			LOG(ERROR) << "SubscribeToCluster stream ended: " << status.error_message() << ". Re-establishing.";
 		}
@@ -1650,6 +1623,8 @@ bool Publisher::AddPublisherThreads(size_t num_threads, int broker_id, size_t qu
 			threads_.emplace_back(&Publisher::PublishThread, this, broker_id, thread_idx);
 			created++;
 		}
+		// So producer round-robins only over queues that have consumers (no ghost queues).
+		pubQue_.SetActiveQueues(static_cast<size_t>(num_threads_.load(std::memory_order_relaxed)));
 	} catch (const std::exception& e) {
 		LOG(ERROR) << "AddPublisherThreads: failed after " << created << " threads: " << e.what();
 		// Rollback: join created threads and revert num_threads_

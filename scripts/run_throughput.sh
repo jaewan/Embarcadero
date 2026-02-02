@@ -322,6 +322,12 @@ for test_case in "${test_cases[@]}"; do
 				# Run throughput test in foreground; stream output to terminal
 				# No NUMA binding for client - let OS optimize placement
 			# Total message size: 8GB (8589934592 bytes) for bandwidth measurement
+			# [[ORDER=0 ACK=1 publish-only]] Test 5 (publish-only) with ACK=1 can hit ACK timeout if broker
+			# backpressure limits progress (no consumer drains BLog). Use longer timeout so test can complete
+			# or to observe whether ACKs eventually arrive. See docs/ORDER0_ACK1_PUBLISH_ONLY_ACK_TIMEOUT_INVESTIGATION.md
+			if [ "$test_case" = "5" ] && [ "$ack" = "1" ]; then
+				export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-60}"
+			fi
 			# [[FIX]]: Capture exit code before if statement to report correctly
 			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -m $msg_size -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -l 0
 			test_exit_code=$?

@@ -3,7 +3,7 @@
 #include <atomic>
 #include "absl/container/flat_hash_set.h"
 #include "common.h"
-#include "buffer.h"
+#include "queue_buffer.h"
 
 /**
  * Publisher class for publishing messages to the messaging system
@@ -123,7 +123,7 @@ class Publisher {
 		std::atomic<int> num_threads_{0};
 		size_t message_size_;
 		size_t queueSize_;  // [[GUARDED_BY: mutex_]] when modified in SubscribeToClusterStatus
-		Buffer pubQue_;
+		QueueBuffer pubQue_;
 		SequencerType seq_type_;
 		std::unique_ptr<CorfuSequencerClient> corfu_client_;
 
@@ -170,8 +170,9 @@ class Publisher {
 		}
 
 
-		// Context for cluster probe
-		grpc::ClientContext context_;
+		// Context for cluster probe. Each SubscribeToCluster reader uses a local ClientContext;
+		// subscribe_context_ points to the current one so destructor can TryCancel() to unblock the thread.
+		std::atomic<grpc::ClientContext*> subscribe_context_{nullptr};
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::thread cluster_probe_thread_;
 

@@ -1246,89 +1246,55 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 	const size_t msg_size = batch_header.total_size;
 	void* batch_headers_log;
 
-	{
-		// [[NON-BLOCKING RING GATING]]
-		// Check if the next slot is free before allocating.
-		// This prevents overwriting unconsumed batches when the ring is full.
-		// Unlike blocking gating (which caused NetworkManager threads to block and TCP timeouts),
-		// this approach returns nullptr immediately (fail-fast) and lets the caller retry.
-		// The non-blocking NetworkManager architecture (EMBARCADERO_USE_NONBLOCKING=true)
-		// with CXLAllocationWorker handles retries with exponential backoff.
-		const unsigned long long int batch_headers_start =
-			reinterpret_cast<unsigned long long int>(first_batch_headers_addr_);
-		const unsigned long long int batch_headers_end = batch_headers_start + BATCHHEADERS_SIZE;
+	const unsigned long long int batch_headers_start =
+		reinterpret_cast<unsigned long long int>(first_batch_headers_addr_);
+	const unsigned long long int batch_headers_end = batch_headers_start + BATCHHEADERS_SIZE;
 
-		absl::MutexLock lock(&mutex_);
+	// [[PERF FIX]] Ring gating check moved OUTSIDE mutex for ORDER=0
+	// ORDER=0 doesn't use sequencer, so ring gating isn't strictly needed.
+	// For other orders, we still check but do the expensive CXL read outside the lock.
+	bool skip_ring_gating = (order_ == 0);
+	bool slot_free = true;
 
-		// Calculate the byte offset of the next slot we're about to allocate
-		size_t next_slot_offset = static_cast<size_t>(batch_headers_ - batch_headers_start);
-
-		// Read batch_headers_consumed_through with cache invalidation (non-coherent CXL)
-		// The sequencer updates this field after processing each batch (topic.cc:1555)
-		// Semantics: "first byte past last consumed slot"
+	if (!skip_ring_gating) {
+		// Read batch_headers_consumed_through OUTSIDE mutex (stale read is safe - worst case is
+		// thinking ring is fuller than it is, which just causes retry)
 		const void* consumed_through_addr = const_cast<const void*>(
 			reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].batch_headers_consumed_through));
 		CXL::flush_cacheline(consumed_through_addr);
 		CXL::load_fence();
 		size_t consumed_through = tinode_->offsets[broker_id_].batch_headers_consumed_through;
 
-		// Check if the slot is free using circular buffer semantics.
-		// The ring buffer allows the producer to be up to (RING_SIZE - 1 slot) ahead of the consumer.
-		//
-		// Key insight: In a circular ring buffer, we track "in-flight" data (allocated but not consumed).
-		// Ring is full when in-flight + new_slot >= RING_SIZE.
-		//
-		// consumed_through semantics: "first byte past last consumed slot"
-		// - BATCHHEADERS_SIZE: Initialization sentinel meaning "all slots free"
-		// - Otherwise: bytes [0, consumed_through) have been processed by sequencer
-		//
-		// [[CRITICAL FIX]]: The old check "consumed_through >= next_slot_offset" was WRONG for circular buffers.
-		// It only passed when producer wrapped around and was behind consumer, which breaks normal operation
-		// where producer is ahead. Fixed to use proper circular buffer capacity calculation.
-		bool slot_free;
-		if (consumed_through == BATCHHEADERS_SIZE) {
-			// Initialization sentinel: all slots are free (sequencer hasn't started)
-			slot_free = true;
-		} else {
-			// Calculate bytes "in flight" (allocated by producer, not yet consumed by sequencer)
+		// Approximate check - next_slot_offset read without lock is approximate but safe
+		size_t approx_next_slot = cached_next_slot_offset_.load(std::memory_order_acquire);
+
+		if (consumed_through != BATCHHEADERS_SIZE) {
 			size_t in_flight;
-			if (next_slot_offset >= consumed_through) {
-				// Normal case: producer ahead of consumer (same lap around ring)
-				in_flight = next_slot_offset - consumed_through;
+			if (approx_next_slot >= consumed_through) {
+				in_flight = approx_next_slot - consumed_through;
 			} else {
-				// Producer wrapped around to start, consumer still at end
-				in_flight = (BATCHHEADERS_SIZE - consumed_through) + next_slot_offset;
+				in_flight = (BATCHHEADERS_SIZE - consumed_through) + approx_next_slot;
 			}
-			// Ring full if in-flight + new slot would completely fill the ring
-			// Use < (not <=) to leave one-slot gap for full/empty disambiguation
-			slot_free = (in_flight + sizeof(BatchHeader) < BATCHHEADERS_SIZE);
+			// Add extra margin (2 slots) for approximation safety
+			slot_free = (in_flight + sizeof(BatchHeader) * 2 < BATCHHEADERS_SIZE);
 		}
 
 		if (!slot_free) {
-			// Ring full - fail fast without allocating
-			// Caller (CXLAllocationWorker in non-blocking mode) will retry with exponential backoff
 			log = nullptr;
 			batch_header_location = nullptr;
-
-			// Update ring full metric with time-based throttling for logging
 			uint64_t count = ring_full_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-			uint64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-			uint64_t last_log = ring_full_last_log_time_.load(std::memory_order_relaxed);
-
-			// Log first 10 events, then throttle to once per 5 seconds
-			if (count <= 10 || (now_ns - last_log > 5000000000ULL)) {  // 5 seconds in nanoseconds
-				LOG(WARNING) << "EmbarcaderoGetCXLBuffer: Ring full for broker " << broker_id_
-				             << " topic=" << topic_name_
-				             << " (slot_offset=" << next_slot_offset
-				             << ", consumed_through=" << consumed_through
-				             << ", BATCHHEADERS_SIZE=" << BATCHHEADERS_SIZE
-				             << ", count=" << count << ")";
-				ring_full_last_log_time_.store(now_ns, std::memory_order_relaxed);
+			if (count <= 10 || count % 10000 == 0) {
+				LOG(WARNING) << "EmbarcaderoGetCXLBuffer: Ring full (approx check) broker=" << broker_id_
+				             << " topic=" << topic_name_ << " count=" << count;
 			}
 			return nullptr;
 		}
+	}
 
-		// Slot is free - proceed with allocation
+	{
+		// Minimal critical section: just allocation
+		absl::MutexLock lock(&mutex_);
+
 		// Allocate space in log
 		log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
 
@@ -1338,7 +1304,7 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		if (batch_headers_ >= batch_headers_end) {
 			batch_headers_ = batch_headers_start;
 		}
-		// [[FIX]] Update cache so GetPBRUtilizationPct() sees correct utilization for legacy path (recv_direct_to_cxl=false)
+		// Update cache for approximate ring gating check
 		cached_next_slot_offset_.store(static_cast<size_t>(batch_headers_ - batch_headers_start), std::memory_order_release);
 		logical_offset = logical_offset_;
 		logical_offset_ += batch_header.num_msg;

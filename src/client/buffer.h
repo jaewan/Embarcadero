@@ -4,8 +4,11 @@
 #include <atomic>
 
 /**
- * Buffer class for managing message data
- * Provides thread-safe buffer management for publishers and subscribers
+ * Legacy in-place ring buffer. Primary publisher path uses QueueBuffer (queue_buffer.cc).
+ * Kept for buffer_benchmark comparison and possible rollback. Do not add new features here.
+ *
+ * Buffer class for managing message data.
+ * Provides thread-safe buffer management for publishers and subscribers.
  */
 class Buffer {
 public:
@@ -48,6 +51,13 @@ public:
      * @return Pointer to the read data or nullptr if empty
      */
     void* Read(int bufIdx);
+
+    /**
+     * No-op for Buffer (in-place ring). Required for QueueBuffer compatibility:
+     * consumer must call ReleaseBatch(batch) when done; Buffer does not use a pool.
+     * @param batch The pointer returned by Read(bufIdx); ignored
+     */
+    void ReleaseBatch(void* batch);
 
 		void Seal();
 	void SealAll();
@@ -136,4 +146,9 @@ private:
      * Advances the write buffer ID
      */
     void AdvanceWriteBufId();
+
+    /**
+     * Seals current batch in a single buffer only (for WriteToBuffer multi-producer path).
+     */
+    void SealBuffer(size_t buf_idx);
 };

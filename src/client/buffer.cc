@@ -1,6 +1,8 @@
 /**
- * Embarcadero Lock-Free Buffer System
- * ==================================
+ * Embarcadero Lock-Free Buffer System (LEGACY)
+ * ============================================
+ * Primary publisher path uses QueueBuffer (queue_buffer.cc). Kept for buffer_benchmark
+ * comparison and possible rollback. Do not add new features here.
  *
  * OVERVIEW:
  * This is a lock-free buffer implementation designed for a single-writer,

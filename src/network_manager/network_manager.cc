@@ -27,6 +27,9 @@
 
 namespace Embarcadero {
 
+// [[STALL_DIAG]] Threshold (µs) above which we log recv() as blocking stall (50 ms)
+static constexpr int64_t kRecvStallThresholdUs = 50 * 1000;
+
 //----------------------------------------------------------------------------
 // Utility Functions
 //----------------------------------------------------------------------------
@@ -55,6 +58,11 @@ static void SetAcceptedSocketBuffers(int fd) {
 	}
 	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_SNDBUF) on accepted socket failed: " << strerror(errno);
+	}
+	// [[CRITICAL FIX]] Disable Nagle's algorithm - was missing, causing latency!
+	int flag = 1;
+	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
+		LOG(WARNING) << "setsockopt(TCP_NODELAY) on accepted socket failed: " << strerror(errno);
 	}
 	// [[DIAGNOSTIC]] Verify kernel actually applied the buffer sizes
 	int actual_rcv = 0, actual_snd = 0;
@@ -766,7 +774,13 @@ void NetworkManager::HandlePublishRequest(
 		batch_header.client_id = handshake.client_id;
 		batch_header.ordered = 0;
 
+		auto t_recv_hdr_start = std::chrono::steady_clock::now();
 		ssize_t bytes_read = recv(client_socket, &batch_header, sizeof(BatchHeader), 0);
+		auto t_recv_hdr_end = std::chrono::steady_clock::now();
+		auto hdr_block_us = std::chrono::duration_cast<std::chrono::microseconds>(t_recv_hdr_end - t_recv_hdr_start).count();
+		if (hdr_block_us >= kRecvStallThresholdUs) {
+			LOG(WARNING) << "[STALL] recv batch header blocked " << (hdr_block_us / 1000) << "ms client_id=" << handshake.client_id << " bytes_read=" << bytes_read;
+		}
 		if (bytes_read <= 0) {
 			if (bytes_read < 0) {
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
@@ -782,10 +796,15 @@ void NetworkManager::HandlePublishRequest(
 
 		// Finish reading batch header if partial read
 		while (bytes_read < static_cast<ssize_t>(sizeof(BatchHeader))) {
+			auto t_partial = std::chrono::steady_clock::now();
 			ssize_t recv_ret = recv(client_socket,
 					((uint8_t*)&batch_header) + bytes_read,
 					sizeof(BatchHeader) - bytes_read,
 					0);
+			auto partial_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_partial).count();
+			if (partial_us >= kRecvStallThresholdUs) {
+				LOG(WARNING) << "[STALL] recv batch header (partial) blocked " << (partial_us / 1000) << "ms client_id=" << handshake.client_id << " recv_ret=" << recv_ret;
+			}
 			if (recv_ret < 0) {
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
 				running = false;
@@ -805,12 +824,14 @@ void NetworkManager::HandlePublishRequest(
 		std::function<void(void*, size_t)> non_emb_seq_callback = nullptr;
 
 		// Use GetCXLBuffer for batch-level allocation and zero-copy receive
-		// With ring gating enabled, this may return nullptr if ring is full
-		// Retry with exponential backoff instead of closing connection
-		constexpr int MAX_CXL_RETRIES_BLOCKING = 20;
-		int cxl_retry_count = 0;
+		// BLOCKING MODE: Wait indefinitely for ring space - NEVER close connection
+		static std::atomic<size_t> blocking_ring_full_count{0};
+		size_t wait_iterations = 0;
+		static std::atomic<size_t> perf_sample_counter{0};
 
-		while (cxl_retry_count < MAX_CXL_RETRIES_BLOCKING) {
+		auto t0 = std::chrono::high_resolution_clock::now();
+
+		while (!buf && !stop_threads_) {
 			non_emb_seq_callback = cxl_manager_->GetCXLBuffer(batch_header, handshake.topic, buf,
 					segment_header, logical_offset, seq_type, batch_header_location);
 
@@ -818,36 +839,32 @@ void NetworkManager::HandlePublishRequest(
 				break;  // Success
 			}
 
-			// Ring full - retry with exponential backoff
-			cxl_retry_count++;
-			static std::atomic<size_t> blocking_ring_full_count{0};
+			// Ring full - wait for consumer to make space
+			wait_iterations++;
 			size_t total_ring_full = blocking_ring_full_count.fetch_add(1, std::memory_order_relaxed) + 1;
 
-			if (cxl_retry_count >= MAX_CXL_RETRIES_BLOCKING) {
-				LOG(ERROR) << "NetworkManager (blocking): Failed to get CXL buffer after "
-				           << MAX_CXL_RETRIES_BLOCKING << " retries (ring full, total_count="
-				           << total_ring_full << "). Closing connection to client_id="
-				           << handshake.client_id;
-				break;
-			}
-
-			// Log first few and periodic retries
+			// Log first few waits and every 1000th wait
 			if (total_ring_full <= 10 || total_ring_full % 1000 == 0) {
-				LOG(WARNING) << "NetworkManager (blocking): Ring full, retry " << cxl_retry_count
-				             << " for client_id=" << handshake.client_id
-				             << " (total_ring_full=" << total_ring_full << ")";
+				LOG(WARNING) << "NetworkManager (blocking): Ring full, waiting for space "
+				             << "(client_id=" << handshake.client_id
+				             << ", wait_iterations=" << wait_iterations
+				             << ", total_ring_full=" << total_ring_full << ")";
 			}
 
-			// Exponential backoff: 1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 64ms, 128ms, ...
-			int backoff_ms = 1 << std::min(cxl_retry_count - 1, 7);
-			std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+			// Small sleep to avoid busy-wait (100µs = 0.1ms)
+			// This allows consumer threads to make progress
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
 		}
 
 		if (!buf) {
-			// Still failed after retries - close connection
+			// Only happens if stop_threads_ is set (shutdown)
+			LOG(WARNING) << "NetworkManager (blocking): Shutting down, closing connection to client_id="
+			             << handshake.client_id;
 			break;
 		}
 		
+		auto t1 = std::chrono::high_resolution_clock::now();
+
 		if (batch_header_location == nullptr) {
 			// [[SENIOR_ASSESSMENT_FIX]] Log ERROR + counter for ORDER=5 visibility; batch will not be sequenced
 			static std::atomic<size_t> batch_header_location_null_count{0};
@@ -865,10 +882,20 @@ void NetworkManager::HandlePublishRequest(
 		}
 
 		// Receive message data (byte-accurate accounting only)
+		auto t2 = std::chrono::high_resolution_clock::now();
 		size_t read = 0;
 		bool batch_data_complete = false;
+		static std::atomic<size_t> recv_payload_stall_count{0};
 		while (running && !stop_threads_) {
+			// [[REVERT]] Removed MSG_WAITALL - blocking for full batch may reduce parallelism
+			auto t_recv_payload = std::chrono::steady_clock::now();
 			bytes_read = recv(client_socket, (uint8_t*)buf + read, to_read, 0);
+			auto recv_payload_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_recv_payload).count();
+			if (recv_payload_us >= kRecvStallThresholdUs) {
+				size_t cnt = recv_payload_stall_count.fetch_add(1, std::memory_order_relaxed) + 1;
+				LOG(WARNING) << "[STALL] recv payload blocked " << (recv_payload_us / 1000) << "ms batch_seq=" << batch_header.batch_seq
+				             << " remaining=" << to_read << " total_stall_count=" << cnt;
+			}
 			if (bytes_read < 0) {
 				LOG(ERROR) << "Error receiving message data: " << strerror(errno);
 				running = false;
@@ -903,6 +930,16 @@ void NetworkManager::HandlePublishRequest(
 			break;
 		}
 		size_t completed_batches = batches_received_complete.fetch_add(1, std::memory_order_relaxed) + 1;
+		auto t3 = std::chrono::high_resolution_clock::now();
+
+		// [[PERF INSTRUMENTATION]] Log timing breakdown every 1000th batch
+		size_t sample_count = perf_sample_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (sample_count % 1000 == 0) {
+			auto getcxl_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+			auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+			auto recv_us = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
+			LOG(INFO) << "[PERF] Batch " << sample_count << ": GetCXLBuffer=" << getcxl_us << "us, Prep=" << prep_us << "us, Recv=" << recv_us << "us";
+		}
 		// [[PERF: VLOG for progress - LOG(INFO) every 200 was hot-path I/O]]
 		if (completed_batches <= 10 || completed_batches % 5000 == 0) {
 			VLOG(1) << "NetworkManager: batch_data_complete total=" << completed_batches
@@ -986,6 +1023,7 @@ void NetworkManager::HandlePublishRequest(
 		}
 		// For Sequencer 5, batch is complete once all data is received (to_read == 0)
 		// Now it's safe to mark batch as complete for ALL order levels
+		__atomic_store_n(&batch_header_location->num_msg, batch_header.num_msg, __ATOMIC_RELEASE);
 		__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
 		// [[CRITICAL: Flush batch_complete for non-coherent CXL visibility]]
 		// Sequencer (running on different broker/CPU) must see batch_complete update
@@ -996,6 +1034,12 @@ void NetworkManager::HandlePublishRequest(
 			reinterpret_cast<const uint8_t*>(batch_header_location) + 64);
 		CXL::flush_cacheline(batch_header_next_line);
 		CXL::store_fence();
+		// [[CRITICAL: ORDER=0 + ACK=1]] Blocking path must update written so GetOffsetToAck/AckThread can send ACKs.
+		// Non-blocking path uses CompleteBatchInCXL which calls UpdateWrittenForOrder0; blocking path does not,
+		// so written was never updated → GetOffsetToAck always returned 0 → client ACK timeout.
+		if (tinode && tinode->order == 0) {
+			UpdateWrittenForOrder0(tinode, logical_offset, batch_header.num_msg);
+		}
 		size_t marked_batches = batches_marked_complete.fetch_add(1, std::memory_order_relaxed) + 1;
 		// [[PERF: VLOG for progress - LOG(INFO) every 200 was hot-path I/O]]
 		if (marked_batches <= 10 || marked_batches % 5000 == 0) {
@@ -2689,6 +2733,14 @@ void NetworkManager::CXLAllocationWorker() {
             CXL::flush_cacheline(batch_header_next_line);
 
             CXL::store_fence();
+
+            // [[CRITICAL: ORDER=0 + ACK=1]] Copy-from-staging path must update written so GetOffsetToAck/AckThread send ACKs.
+            // Blocking path and direct-CXL path use CompleteBatchInCXL (which calls UpdateWrittenForOrder0); this path did not.
+            // See docs/PUBLISH_PIPELINE_EXPERT_ASSESSMENT.md §2.3.
+            TInode* tinode = (TInode*)cxl_manager_->GetTInode(batch.handshake.topic);
+            if (tinode && tinode->order == 0) {
+                UpdateWrittenForOrder0(tinode, logical_offset, batch.batch_header.num_msg);
+            }
 
             size_t processed = batches_processed.fetch_add(1, std::memory_order_relaxed) + 1;
             if (processed <= 10 || processed % 5000 == 0) {

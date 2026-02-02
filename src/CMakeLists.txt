@@ -113,6 +113,8 @@ add_executable(throughput_test
     client/common.h
     client/buffer.cc
     client/buffer.h
+    client/queue_buffer.cc
+    client/queue_buffer.h
     client/publisher.cc
     client/publisher.h
     client/subscriber.cc
@@ -156,6 +158,45 @@ set_target_properties(throughput_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Buffer-only throughput benchmark (no network). Isolates pubQue_/Buffer for serialization investigation.
+add_executable(buffer_benchmark
+    client/common.cc
+    client/common.h
+    client/buffer.cc
+    client/buffer.h
+    client/queue_buffer.cc
+    client/queue_buffer.h
+    test/publisher_profile_stub.cc
+    test/buffer_benchmark.cc
+    common/configuration.cc
+    common/configuration.h
+)
+
+target_include_directories(buffer_benchmark PUBLIC
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/client"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+target_link_libraries(buffer_benchmark
+    glog::glog
+    gflags
+    mimalloc
+    cxxopts::cxxopts
+    heartbeat_grpc_proto
+    corfu_sequencer_grpc_proto
+    grpc++_reflection
+    grpc++
+    protobuf::libprotobuf
+    ${FOLLY_LIBRARIES}
+    Threads::Threads
+    yaml-cpp
+)
+
+set_target_properties(buffer_benchmark PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
 
 add_executable(scalog_global_sequencer
     cxl_manager/scalog_global_sequencer.cc

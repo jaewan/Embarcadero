@@ -8,6 +8,8 @@ add_executable(kv_store_bench
     distributed_kv_store.h
     ../../src/client/publisher.cc
     ../../src/client/publisher.h
+    ../../src/client/queue_buffer.cc
+    ../../src/client/queue_buffer.h
     ../../src/client/subscriber.cc
     ../../src/client/subscriber.h
     ../../src/client/common.cc

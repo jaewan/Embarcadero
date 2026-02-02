@@ -298,6 +298,21 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		CXL::flush_cacheline(tinode);
 		CXL::store_fence();
 
+		// [[ORDER=0 ACK=1 FIX]] - Sequencer-only head skips InitializeTInodeOffsets, so offsets[].written
+		// (and ordered) are never set. AckThread on followers can run GetOffsetToAck before the follower
+		// has called GetCXLBuffer (which would InitializeTInodeOffsets for that broker). Initialize all
+		// brokers' written/ordered to 0 here so GetOffsetToAck and UpdateWrittenForOrder0 see defined values.
+		// See docs/ORDER0_ACK1_BLOCKING_PATH_EXPERT_ASSESSMENT.md.
+		if (skip_allocation) {
+			for (int i = 0; i < NUM_MAX_BROKERS; i++) {
+				tinode->offsets[i].written = 0;
+				tinode->offsets[i].ordered = 0;
+				CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(&tinode->offsets[i].written)));
+				CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(&tinode->offsets[i].ordered)));
+			}
+			CXL::store_fence();
+		}
+
 		// Handle replica if needed (skip for sequencer-only node - no data to replicate)
 		if (replicate_tinode && !skip_allocation) {
 			char replica_topic[TOPIC_NAME_SIZE] = {0};

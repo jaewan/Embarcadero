@@ -2,10 +2,12 @@
 #include "../cxl_manager/cxl_datastructure.h"
 #include "../common/wire_formats.h"
 #include <algorithm>
-#include <iomanip>
+#include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <numeric>
 #include <set>
+#include <stdexcept>
 #include <tuple>
 
 // Sequencer 5: Logical reconstruction of message ordering from batch metadata
@@ -595,19 +597,40 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 	VLOG(5) << "Subscriber::Poll - Expected: " << total_data_size << " bytes (" << num_msg << " messages), "
 	          << "padded_msg_size=" << msg_size << ", header_size=" << sizeof(Embarcadero::MessageHeader);
 
+	constexpr int POLL_TIMEOUT_SEC = 300;  // 5 min max so E2E test fails fast instead of hanging
+	constexpr int PROGRESS_LOG_INTERVAL_SEC = 30;
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(POLL_TIMEOUT_SEC);
+	auto last_progress_log = std::chrono::steady_clock::now();
+
 	// Reduce busy-wait overhead with adaptive sleeping
 	while (DEBUG_count_ < total_data_size) {
 		size_t current_count = DEBUG_count_.load(std::memory_order_relaxed);
-		if (current_count < total_data_size) {
-			// Adaptive sleep based on progress
-			double progress = static_cast<double>(current_count) / total_data_size;
-			if (progress < 0.1) {
-				std::this_thread::sleep_for(std::chrono::microseconds(10));
-			} else if (progress < 0.9) {
-				std::this_thread::sleep_for(std::chrono::microseconds(1));
-			} else {
-				std::this_thread::yield();
-			}
+		if (current_count >= total_data_size) break;
+
+		auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			double pct = total_data_size > 0 ? (100.0 * static_cast<double>(current_count)) / static_cast<double>(total_data_size) : 0;
+			LOG(ERROR) << "Subscriber::Poll timeout after " << POLL_TIMEOUT_SEC << "s: received "
+			           << current_count << " / " << total_data_size << " bytes (" << std::fixed << std::setprecision(1) << pct << "%)";
+			throw std::runtime_error("Subscriber poll timeout");
+		}
+		// Progress logging so we can see if data is flowing
+		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_log).count() >= PROGRESS_LOG_INTERVAL_SEC) {
+			last_progress_log = now;
+			double pct = total_data_size > 0 ? (100.0 * static_cast<double>(current_count)) / static_cast<double>(total_data_size) : 0;
+			int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(deadline - now).count());
+			LOG(INFO) << "Subscriber::Poll progress: " << current_count << " / " << total_data_size << " bytes ("
+			          << std::fixed << std::setprecision(1) << pct << "%), " << elapsed << "s until timeout";
+		}
+
+		// Adaptive sleep based on progress
+		double progress = static_cast<double>(current_count) / total_data_size;
+		if (progress < 0.1) {
+			std::this_thread::sleep_for(std::chrono::microseconds(10));
+		} else if (progress < 0.9) {
+			std::this_thread::sleep_for(std::chrono::microseconds(1));
+		} else {
+			std::this_thread::yield();
 		}
 	}
 }
