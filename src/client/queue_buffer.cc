@@ -252,8 +252,10 @@ std::pair<bool, size_t> QueueBuffer::Write(size_t client_order, char* msg, size_
 	}
 
 	uint8_t* base = reinterpret_cast<uint8_t*>(current_batch_);
-	// [[PERF]] Prefetch the cache line we're about to write (reduces write latency).
+	// [[PERF]] Prefetch ahead for streaming writes into 2MB batch: immediate line + next line + next message.
 	__builtin_prefetch(base + current_batch_tail_, 1, 3);
+	__builtin_prefetch(base + current_batch_tail_ + 64, 1, 2);
+	__builtin_prefetch(base + current_batch_tail_ + stride, 1, 1);
 	if (use_blog_header_) {
 		memcpy(base + current_batch_tail_, &blog_header_, header_size);
 		memcpy(base + current_batch_tail_ + header_size, msg, len);
