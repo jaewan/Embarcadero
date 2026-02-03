@@ -41,8 +41,8 @@ embarcadero:
 
   # Network configuration
   network:
-    io_threads: 12               # UPDATED: Right-sized to match client connections (4 pub + 3 sub per broker + overhead)
-    disk_io_threads: 4           # Number of disk IO threads
+    io_threads: 4                # REDUCED: 512 CPUs available, thread contention not the issue. Testing reduced thread count.
+    disk_io_threads: 2           # REDUCED: Testing if fewer disk threads help. Was 4, now 2.
     sub_connections: 3           # Set to 3 connections per broker as requested
     zero_copy_send_limit: 65536     # PERF TUNED: 64KB threshold - optimal for MSG_ZEROCOPY (Linux kernel sweet spot, works with 2MB batches)
 

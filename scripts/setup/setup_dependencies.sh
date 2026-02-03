@@ -27,8 +27,8 @@ function clean_all() {
 }
 
 function hugepage_setup() {
-	# Configurable HugeTLB (2MB pages) target in GB. Default: 24GB.
-	HUGETLB_GB=${HUGETLB_GB:-24}
+	# Configurable HugeTLB (2MB pages) target in GB. Default: 26GB so client QueueBuffer (12 queues × 1024 capacity × ~2MB slot) + brokers fit; 24GB was short by ~3MB (docs/HUGEPAGE_NEED_INVESTIGATION.md).
+	HUGETLB_GB=${HUGETLB_GB:-26}
 	PAGES=$(( (HUGETLB_GB * 1024) / 2 ))
 	
 	echo "Configuring HugeTLB: ${HUGETLB_GB}GB (${PAGES} pages of 2MB)"

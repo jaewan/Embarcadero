@@ -12,9 +12,14 @@ fi
 cd build/bin
 
 # Explicit config argument for binaries (relative to build/bin)
-# Head broker uses sequencer-only config (is_sequencer_node=true, accepts no publishes)
-# Follower brokers use standard config (data path only)
-HEAD_CONFIG_ARG="--config ../../config/embarcadero_sequencer_only.yaml"
+# Default: all 4 brokers are data ingestion brokers (no sequencer-only head).
+# Set ALL_INGESTION=0 to use sequencer-only head (broker 0 runs sequencer only; brokers 1,2,3 ingest).
+ALL_INGESTION=${ALL_INGESTION:-1}
+if [ -n "${ALL_INGESTION}" ] && [ "${ALL_INGESTION}" = "1" ]; then
+  HEAD_CONFIG_ARG="--config ../../config/embarcadero.yaml"
+else
+  HEAD_CONFIG_ARG="--config ../../config/embarcadero_sequencer_only.yaml"
+fi
 CONFIG_ARG="--config ../../config/embarcadero.yaml"
 
 # Cleanup any stale processes/ports from previous runs
@@ -322,14 +327,12 @@ for test_case in "${test_cases[@]}"; do
 				# Run throughput test in foreground; stream output to terminal
 				# No NUMA binding for client - let OS optimize placement
 			# Total message size: 8GB (8589934592 bytes) for bandwidth measurement
-			# [[ORDER=0 ACK=1 publish-only]] Test 5 (publish-only) with ACK=1 can hit ACK timeout if broker
-			# backpressure limits progress (no consumer drains BLog). Use longer timeout so test can complete
-			# or to observe whether ACKs eventually arrive. See docs/ORDER0_ACK1_PUBLISH_ONLY_ACK_TIMEOUT_INVESTIGATION.md
-			if [ "$test_case" = "5" ] && [ "$ack" = "1" ]; then
+			# Longer ACK timeout when ack=1 so test can complete (all-ingestion or backpressure can delay ACKs).
+			if [ "$ack" = "1" ]; then
 				export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-60}"
 			fi
-			# [[FIX]]: Capture exit code before if statement to report correctly
-			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -m $msg_size -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -l 0
+			# 3 threads per broker = 12 total (4 brokers). Pass -n 3 so E2E test and publisher both use 3.
+			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -n 3 -m $msg_size -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -l 0
 			test_exit_code=$?
 			if [ $test_exit_code -ne 0 ]; then
 				echo "ERROR: Throughput test failed with exit code $test_exit_code"

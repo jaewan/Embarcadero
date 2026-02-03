@@ -7,7 +7,6 @@
  */
 
 #include "queue_buffer.h"
-#include "publisher_profile.h"
 #include "../common/configuration.h"
 #include "../common/wire_formats.h"
 #include "../cxl_manager/cxl_datastructure.h"
@@ -48,7 +47,8 @@ QueueBuffer::QueueBuffer(size_t num_buf, size_t num_threads_per_broker, int clie
 	header_.logical_offset = static_cast<size_t>(-1);
 	header_.next_msg_diff = 0;
 
-	if (Embarcadero::HeaderUtils::ShouldUseBlogHeader() && order_ == 5) {
+	use_blog_header_ = (Embarcadero::HeaderUtils::ShouldUseBlogHeader() && order_ == 5);
+	if (use_blog_header_) {
 		memset(&blog_header_, 0, sizeof(blog_header_));
 		blog_header_.client_id = client_id;
 		blog_header_.received = 0;
@@ -58,7 +58,6 @@ QueueBuffer::QueueBuffer(size_t num_buf, size_t num_threads_per_broker, int clie
 	for (size_t i = 0; i < num_queues_; i++) {
 		queues_.push_back(std::make_unique<folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>>(kQueueCapacity));
 	}
-
 	VLOG(5) << "QueueBuffer created num_queues=" << num_queues_
 	        << " threads_per_broker=" << num_threads_per_broker_
 	        << " message_size=" << message_size;
@@ -82,6 +81,7 @@ bool QueueBuffer::AddBuffers(size_t /*buf_size*/) {
 	}
 
 	const size_t batch_size = BATCH_SIZE;
+	batch_size_cached_.store(batch_size, std::memory_order_release);
 	slot_size_ = AlignUp(sizeof(Embarcadero::BatchHeader) + batch_size, kAlign);
 	// Pool size: at least kPoolSizeBytes (16 GB), and at least 1 + num_queues_*kQueueCapacity slots for correctness.
 	// Same hugepage path as buffer.cc: mmap_large_buffer() uses MAP_HUGETLB (or THP fallback).
@@ -134,10 +134,11 @@ void QueueBuffer::AdvanceWriteBufId() {
 	write_buf_id_ = (write_buf_id_ + 1) % n;
 }
 
-void QueueBuffer::SealCurrentAndAdvance() {
-	if (!current_batch_) return;
+size_t QueueBuffer::SealCurrentAndAdvance() {
+	if (!current_batch_) return 0;
 	size_t data_size = current_batch_tail_ - sizeof(Embarcadero::BatchHeader);
-	if (data_size == 0) return;
+	if (data_size == 0) return 0;
+	size_t num_sealed = current_batch_num_msg_;
 
 	Embarcadero::BatchHeader* h = current_batch_;
 	// Start of payload in this slot (broker may overwrite with BLog logical offset)
@@ -149,27 +150,43 @@ void QueueBuffer::SealCurrentAndAdvance() {
 
 	std::atomic_thread_fence(std::memory_order_release);
 
-	// Push to SPSC queue with timeout to avoid infinite spin if consumer is stuck (expert review).
-	// [[PERF]] Call steady_clock::now() only every kQueueFullCheckInterval spins to reduce syscall rate.
-	constexpr int kQueueFullCheckInterval = 64;
-	folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>* q = queues_[write_buf_id_].get();
-	auto queue_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kQueueFullTimeoutMs);
-	bool logged = false;
-	int spin_count = 0;
-	while (!q->write(h)) {
-		if (++spin_count % kQueueFullCheckInterval == 0 &&
-		    std::chrono::steady_clock::now() > queue_deadline) {
-			if (!logged) {
-				LOG(ERROR) << "QueueBuffer: queue full timeout (consumer " << write_buf_id_ << " slow?)";
-				logged = true;
-			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(kQueueFullSleepMs));
-			queue_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kQueueFullTimeoutMs);
-		} else {
-			Embarcadero::CXL::cpu_pause();
+	// [[DEFLECT_WHEN_FULL]] Try current queue; if full, try next queue in round-robin until one accepts.
+	// Avoids blocking entire producer on one slow consumer. If all queues full, block on original queue.
+	const size_t n = active_queues_;
+	if (n == 0) return 0;
+	size_t start_id = write_buf_id_;
+	bool pushed = false;
+	for (size_t i = 0; i < n; i++) {
+		size_t idx = (start_id + i) % n;
+		folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>* q = queues_[idx].get();
+		if (q->write(h)) {
+			write_buf_id_ = (idx + 1) % n;
+			pushed = true;
+			break;
 		}
 	}
-	AdvanceWriteBufId();
+	if (!pushed) {
+		// All queues full: block on original queue (same as previous behavior).
+		constexpr int kQueueFullCheckInterval = 64;
+		folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>* q = queues_[start_id].get();
+		auto queue_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kQueueFullTimeoutMs);
+		bool logged = false;
+		int spin_count = 0;
+		while (!q->write(h)) {
+			if (++spin_count % kQueueFullCheckInterval == 0 &&
+			    std::chrono::steady_clock::now() > queue_deadline) {
+				if (!logged) {
+					LOG(ERROR) << "QueueBuffer: queue full timeout (consumer " << start_id << " slow?)";
+					logged = true;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(kQueueFullSleepMs));
+				queue_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kQueueFullTimeoutMs);
+			} else {
+				Embarcadero::CXL::cpu_pause();
+			}
+		}
+		write_buf_id_ = (start_id + 1) % n;
+	}
 
 	// Acquire next buffer from pool. [[PERF]] Spin with cpu_pause before yield.
 	Embarcadero::BatchHeader* next = nullptr;
@@ -182,7 +199,7 @@ void QueueBuffer::SealCurrentAndAdvance() {
 				LOG(ERROR) << "QueueBuffer: pool acquire timeout";
 				current_batch_ = nullptr;
 				current_batch_tail_ = 0;
-				return;
+				return num_sealed;
 			}
 			std::this_thread::yield();
 		} else {
@@ -192,24 +209,17 @@ void QueueBuffer::SealCurrentAndAdvance() {
 	current_batch_ = next;
 	current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
 	current_batch_num_msg_ = 0;
+	return num_sealed;
 }
 
-bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize) {
-	// [[PERF]] Cache profile_enabled once to avoid config lookup on every message.
-	if (profile_enabled_cached_ < 0) {
-		profile_enabled_cached_ = Embarcadero::Configuration::getInstance()
-			.config().client.performance.enable_publisher_pipeline_profile.get() ? 1 : 0;
-	}
-	const bool profile_enabled = (profile_enabled_cached_ == 1);
-	std::chrono::steady_clock::time_point t0 = profile_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-
-	bool use_blog_header = Embarcadero::HeaderUtils::ShouldUseBlogHeader() && order_ == 5;
+std::pair<bool, size_t> QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize) {
+	size_t sealed_count = 0;
 	const size_t v1_header_size = sizeof(Embarcadero::MessageHeader);
 	const size_t v2_header_size = sizeof(Embarcadero::BlogMessageHeader);
-	const size_t header_size = use_blog_header ? v2_header_size : v1_header_size;
-	size_t stride = use_blog_header ? Embarcadero::wire::ComputeStrideV2(len) : paddedSize;
+	const size_t header_size = use_blog_header_ ? v2_header_size : v1_header_size;
+	size_t stride = use_blog_header_ ? Embarcadero::wire::ComputeStrideV2(len) : paddedSize;
 
-	if (use_blog_header) {
+	if (use_blog_header_) {
 		blog_header_.size = static_cast<uint32_t>(len);
 		blog_header_.received = 0;
 		blog_header_.ts = 0;
@@ -226,7 +236,7 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 		while (!pool_->read(next)) {
 			if (std::chrono::steady_clock::now() > deadline) {
 				LOG(ERROR) << "QueueBuffer::Write pool exhausted";
-				return false;
+				return {false, sealed_count};
 			}
 			std::this_thread::yield();
 		}
@@ -237,14 +247,14 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 
 	// If this message would exceed the slot, seal first then write into new buffer.
 	if (current_batch_tail_ + stride > slot_size_) {
-		SealCurrentAndAdvance();
-		if (!current_batch_) return false;  // pool timeout
+		sealed_count += SealCurrentAndAdvance();
+		if (!current_batch_) return {false, sealed_count};  // pool timeout
 	}
 
 	uint8_t* base = reinterpret_cast<uint8_t*>(current_batch_);
 	// [[PERF]] Prefetch the cache line we're about to write (reduces write latency).
 	__builtin_prefetch(base + current_batch_tail_, 1, 3);
-	if (use_blog_header) {
+	if (use_blog_header_) {
 		memcpy(base + current_batch_tail_, &blog_header_, header_size);
 		memcpy(base + current_batch_tail_ + header_size, msg, len);
 	} else {
@@ -255,25 +265,21 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 	current_batch_num_msg_++;
 
 	const size_t batch_payload = current_batch_tail_ - sizeof(Embarcadero::BatchHeader);
-	if (batch_payload >= BATCH_SIZE) {
-		SealCurrentAndAdvance();
+	// Use cached BATCH_SIZE when set (AddBuffers ran); else fall back to macro (avoids sealing every msg when cache==0).
+	const size_t cached = batch_size_cached_.load(std::memory_order_acquire);
+	const size_t threshold = (cached != 0) ? cached : BATCH_SIZE;
+	if (batch_payload >= threshold) {
+		sealed_count += SealCurrentAndAdvance();
 	}
-
-	if (profile_enabled) {
-		uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-			std::chrono::steady_clock::now() - t0).count());
-		RecordPublisherProfile(kPublisherBufferWrite, ns);
-		RecordPublisherProfileBufferWriteBytes(stride);
-	}
-	return true;
+	return {true, sealed_count};
 }
 
 void QueueBuffer::Seal() {
 	SealCurrentAndAdvance();
 }
 
-void QueueBuffer::SealAll() {
-	SealCurrentAndAdvance();
+size_t QueueBuffer::SealAll() {
+	return SealCurrentAndAdvance();
 }
 
 void* QueueBuffer::Read(int bufIdx) {
@@ -349,14 +355,4 @@ void QueueBuffer::WarmupBuffers() {
 		}
 		if (region.second > 0) (void)p[region.second - 1];
 	}
-}
-
-void QueueBuffer::DumpBufferStats() {
-	VLOG(2) << "=== QueueBuffer Statistics ===";
-	VLOG(2) << "num_queues=" << num_queues_ << " pool_slots=" << pool_slots_;
-	for (size_t i = 0; i < num_queues_; i++) {
-		size_t depth = queues_[i]->sizeGuess();
-		VLOG(2) << "  queue[" << i << "] depth≈" << depth;
-	}
-	VLOG(2) << "=== End QueueBuffer Statistics ===";
 }

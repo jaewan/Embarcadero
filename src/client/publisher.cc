@@ -1,7 +1,7 @@
 #include "publisher.h"
 #include "publisher_profile.h"
 #include "common/config.h"
-#include <array>
+#include <cstring>
 #include <random>
 #include <algorithm>
 #include <fstream>
@@ -9,102 +9,20 @@
 #include <thread>
 #include <cstdlib>  // For getenv, atoi
 
-// Publisher pipeline profile: optional lightweight timing (buffer write + send)
-namespace {
-static std::atomic<bool> g_publisher_profile_enabled{false};
-static std::array<std::atomic<uint64_t>, kNumPublisherPipelineComponents> g_publisher_profile_total_ns{};
-static std::array<std::atomic<uint64_t>, kNumPublisherPipelineComponents> g_publisher_profile_count{};
-static std::atomic<uint64_t> g_publisher_profile_buffer_write_bytes{0};
-static std::atomic<uint64_t> g_publisher_profile_publish_total_bytes{0};
-static const char* const kPublisherProfileComponentNames[] = {
-	"BufferWrite",
-	"SendPayload",
-	"PublishTotal",
-};
-}  // namespace
-static std::chrono::steady_clock::time_point g_publisher_profile_first_write_time;
-static std::atomic<bool> g_publisher_profile_first_write_recorded{false};
-/** Count of send() returning EAGAIN/EWOULDBLOCK/ENOBUFS in payload send loop (diagnostic for drain bottleneck). */
-static std::atomic<uint64_t> g_send_eagain_count{0};
+// No-op stubs for profile API (used by buffer.cc and other callers).
+void RecordPublisherProfile(PublisherPipelineComponent /*c*/, uint64_t /*ns*/) {}
+void RecordPublisherProfileBufferWriteBytes(uint64_t /*bytes*/) {}
+void RecordPublisherProfilePublishBytes(uint64_t /*bytes*/) {}
+void SetPublisherProfileEnabled(bool /*enabled*/) {}
+void LogPublisherProfile() {}
 
-void RecordPublisherProfile(PublisherPipelineComponent c, uint64_t ns) {
-	if (!g_publisher_profile_enabled.load(std::memory_order_relaxed) || c < 0 || c >= kNumPublisherPipelineComponents) return;
-	g_publisher_profile_total_ns[c].fetch_add(ns, std::memory_order_relaxed);
-	g_publisher_profile_count[c].fetch_add(1, std::memory_order_relaxed);
-}
-
-void RecordPublisherProfileBufferWriteBytes(uint64_t bytes) {
-	if (!g_publisher_profile_enabled.load(std::memory_order_relaxed)) return;
-	if (!g_publisher_profile_first_write_recorded.exchange(true, std::memory_order_relaxed)) {
-		g_publisher_profile_first_write_time = std::chrono::steady_clock::now();
-	}
-	g_publisher_profile_buffer_write_bytes.fetch_add(bytes, std::memory_order_relaxed);
-}
-
-void RecordPublisherProfilePublishBytes(uint64_t bytes) {
-	if (!g_publisher_profile_enabled.load(std::memory_order_relaxed)) return;
-	g_publisher_profile_publish_total_bytes.fetch_add(bytes, std::memory_order_relaxed);
-}
-
-void SetPublisherProfileEnabled(bool enabled) {
-	g_publisher_profile_enabled.store(enabled, std::memory_order_relaxed);
-}
-
-void LogPublisherProfile() {
-	if (!g_publisher_profile_enabled.load(std::memory_order_relaxed)) return;
-	uint64_t total_ns = 0;
-	for (int c = 0; c < kNumPublisherPipelineComponents; ++c) {
-		total_ns += g_publisher_profile_total_ns[c].load(std::memory_order_relaxed);
-	}
-	if (total_ns == 0) {
-		LOG(INFO) << "[PublisherPipelineProfile] No samples yet.";
-		return;
-	}
-	LOG(INFO) << "[PublisherPipelineProfile] === Aggregated time per component ===";
-	for (int c = 0; c < kNumPublisherPipelineComponents; ++c) {
-		uint64_t ns = g_publisher_profile_total_ns[c].load(std::memory_order_relaxed);
-		uint64_t cnt = g_publisher_profile_count[c].load(std::memory_order_relaxed);
-		uint64_t avg_ns = cnt ? (ns / cnt) : 0;
-		double pct = (c != kPublisherPublishTotal && total_ns > 0) ? (100.0 * static_cast<double>(ns)) / static_cast<double>(total_ns) : 0.0;
-		LOG(INFO) << "[PublisherPipelineProfile]   " << kPublisherProfileComponentNames[c]
-			<< ": total=" << (ns / 1000) << " us, count=" << cnt
-			<< ", avg=" << avg_ns << " ns"
-			<< (c != kPublisherPublishTotal ? (" " + std::to_string(pct) + "% of pipeline time") : " (whole Publish() call)");
-	}
-	uint64_t buf_ns = g_publisher_profile_total_ns[kPublisherBufferWrite].load(std::memory_order_relaxed);
-	uint64_t buf_bytes = g_publisher_profile_buffer_write_bytes.load(std::memory_order_relaxed);
-	if (buf_ns > 0 && buf_bytes > 0) {
-		double buf_s = static_cast<double>(buf_ns) / 1e9;
-		double buf_mb_s = (static_cast<double>(buf_bytes) / (1024.0 * 1024.0)) / buf_s;
-		LOG(INFO) << "[PublisherPipelineProfile]   BufferWrite bandwidth: " << std::fixed << std::setprecision(2) << buf_mb_s << " MB/s (" << buf_bytes << " bytes in " << (buf_ns / 1000) << " us)";
-	}
-	if (buf_bytes > 0 && g_publisher_profile_first_write_recorded.load(std::memory_order_relaxed)) {
-		auto now = std::chrono::steady_clock::now();
-		double elapsed_s = std::chrono::duration<double>(now - g_publisher_profile_first_write_time).count();
-		if (elapsed_s > 0) {
-			double fill_rate_mb_s = (static_cast<double>(buf_bytes) / (1024.0 * 1024.0)) / elapsed_s;
-			LOG(INFO) << "[PublisherPipelineProfile]   Buffer fill rate (wall clock): " << std::fixed << std::setprecision(2) << fill_rate_mb_s << " MB/s (" << buf_bytes << " bytes in " << std::setprecision(3) << elapsed_s << " s)";
-		}
-	}
-	uint64_t pub_ns = g_publisher_profile_total_ns[kPublisherPublishTotal].load(std::memory_order_relaxed);
-	uint64_t pub_bytes = g_publisher_profile_publish_total_bytes.load(std::memory_order_relaxed);
-	if (pub_ns > 0 && pub_bytes > 0) {
-		double pub_s = static_cast<double>(pub_ns) / 1e9;
-		double pub_mb_s = (static_cast<double>(pub_bytes) / (1024.0 * 1024.0)) / pub_s;
-		LOG(INFO) << "[PublisherPipelineProfile]   Publish() bandwidth: " << std::fixed << std::setprecision(2) << pub_mb_s << " MB/s (" << pub_bytes << " bytes in " << (pub_ns / 1000) << " us)";
-	}
-	LOG(INFO) << "[PublisherPipelineProfile]   TOTAL: " << (total_ns / 1000) << " us ("
-		<< (total_ns / 1e9) << " s) across all components";
-	uint64_t eagain = g_send_eagain_count.load(std::memory_order_relaxed);
-	uint64_t send_batches = g_publisher_profile_count[kPublisherSendPayload].load(std::memory_order_relaxed);
-	if (send_batches > 0) {
-		LOG(INFO) << "[PublisherPipelineProfile]   Send EAGAIN/ENOBUFS count: " << eagain
-			<< ", SendPayload batches: " << send_batches
-			<< ", EAGAIN per batch: " << std::fixed << std::setprecision(2) << (static_cast<double>(eagain) / static_cast<double>(send_batches));
-	} else if (eagain > 0) {
-		LOG(INFO) << "[PublisherPipelineProfile]   Send EAGAIN/ENOBUFS count: " << eagain;
-	}
-	LOG(INFO) << "[PublisherPipelineProfile] ========================================";
+/** EAGAIN epoll wait timeout (ms). 0 = busy poll; 1 = yield 1ms. Env EMBARCADERO_EPOLL_WAIT_WRITABLE_MS (default 1). */
+static int GetEpollWaitWritableMs() {
+	static int cached = -1;
+	if (cached >= 0) return cached;
+	const char* env = std::getenv("EMBARCADERO_EPOLL_WAIT_WRITABLE_MS");
+	cached = (env && *env && std::atoi(env) == 0) ? 0 : 1;
+	return cached;
 }
 
 namespace {
@@ -152,6 +70,7 @@ Publisher::~Publisher() {
 	// Signal all threads to terminate [[CRITICAL: Atomic store for cross-thread visibility]]
 	publish_finished_.store(true, std::memory_order_release);
 	shutdown_.store(true, std::memory_order_release);
+	consumer_should_exit_.store(true, std::memory_order_release);
 	// Cancel current gRPC SubscribeToCluster call so cluster_probe_thread_ can exit (reader->Read() unblocks).
 	if (grpc::ClientContext* ctx = subscribe_context_.exchange(nullptr)) {
 		ctx->TryCancel();
@@ -184,21 +103,12 @@ Publisher::~Publisher() {
 		kill_brokers_thread_.join();
 	}
 
-	LogPublisherProfile();
-
-	if (g_send_eagain_count.load(std::memory_order_relaxed) > 0) {
-		LOG(INFO) << "[Send diagnostic] EAGAIN/ENOBUFS count: " << g_send_eagain_count.load(std::memory_order_relaxed);
-	}
-
 	VLOG(3) << "Publisher destructor return";
 }
 
 
 void Publisher::Init(int ack_level) {
 	ack_level_ = ack_level;
-
-	bool enable_publisher_profile = Embarcadero::GetConfig().config().client.performance.enable_publisher_pipeline_profile.get();
-	SetPublisherProfileEnabled(enable_publisher_profile);
 
 	// Generate unique port for acknowledgment server with retry logic
 	// Ensure port is always in safe range 10000-65535 (avoid privileged ports < 1024)
@@ -226,42 +136,54 @@ void Publisher::Init(int ack_level) {
 		thread_count_.store(0, std::memory_order_release);
 	}
 
-	// Start cluster status monitoring thread
-	cluster_probe_thread_ = std::thread([this]() {
-			this->SubscribeToClusterStatus();
-			});
+	// [[DEBUG_BUFFER_ISOLATION]] Skip cluster probe when buffer-only test (no send); reduces thread count for ablation.
+	if (!skip_send_for_buffer_test_) {
+		// Start cluster status monitoring thread
+		cluster_probe_thread_ = std::thread([this]() {
+				this->SubscribeToClusterStatus();
+				});
 
-	// Wait for connection to be established with timeout and logging
-	auto connection_start = std::chrono::steady_clock::now();
-	auto last_log_time = connection_start;
-	constexpr auto CONNECTION_TIMEOUT = std::chrono::seconds(60);
-	constexpr auto LOG_INTERVAL = std::chrono::seconds(5);
-	
-	while (!connected_.load(std::memory_order_acquire)) {  // [[CRITICAL_FIX: Atomic load with acquire semantics]]
-		auto now = std::chrono::steady_clock::now();
-		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - connection_start);
-		
-		// Check for timeout
-		if (elapsed >= CONNECTION_TIMEOUT) {
-			LOG(ERROR) << "Publisher::Init() timed out waiting for cluster connection after " 
-			           << elapsed.count() << " seconds. This indicates gRPC SubscribeToCluster is failing.";
-			LOG(ERROR) << "Check broker gRPC service availability and network connectivity.";
-			break; // Exit to avoid infinite hang
+		// Wait for connection to be established with timeout and logging
+		auto connection_start = std::chrono::steady_clock::now();
+		auto last_log_time = connection_start;
+		constexpr auto CONNECTION_TIMEOUT = std::chrono::seconds(60);
+		constexpr auto LOG_INTERVAL = std::chrono::seconds(5);
+
+		while (!connected_.load(std::memory_order_acquire)) {  // [[CRITICAL_FIX: Atomic load with acquire semantics]]
+			auto now = std::chrono::steady_clock::now();
+			auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - connection_start);
+
+			// Check for timeout
+			if (elapsed >= CONNECTION_TIMEOUT) {
+				LOG(ERROR) << "Publisher::Init() timed out waiting for cluster connection after "
+				           << elapsed.count() << " seconds. This indicates gRPC SubscribeToCluster is failing.";
+				LOG(ERROR) << "Check broker gRPC service availability and network connectivity.";
+				break; // Exit to avoid infinite hang
+			}
+
+			// Log progress every 5 seconds
+			if (now - last_log_time >= LOG_INTERVAL) {
+				LOG(WARNING) << "Publisher::Init() waiting for cluster connection... ("
+				            << elapsed.count() << "s elapsed)";
+				last_log_time = now;
+			}
+
+			Embarcadero::CXL::cpu_pause();
 		}
-		
-		// Log progress every 5 seconds
-		if (now - last_log_time >= LOG_INTERVAL) {
-			LOG(WARNING) << "Publisher::Init() waiting for cluster connection... (" 
-			            << elapsed.count() << "s elapsed)";
-			last_log_time = now;
+
+		if (!connected_.load(std::memory_order_acquire)) {  // [[CRITICAL_FIX: Atomic load]]
+			LOG(ERROR) << "Publisher::Init() failed - cluster connection was not established. "
+			          << "Publisher will not be able to send messages.";
 		}
-		
-		Embarcadero::CXL::cpu_pause();
-	}
-	
-	if (!connected_.load(std::memory_order_acquire)) {  // [[CRITICAL_FIX: Atomic load]]
-		LOG(ERROR) << "Publisher::Init() failed - cluster connection was not established. "
-		          << "Publisher will not be able to send messages.";
+	} else {
+		// Buffer isolation: no cluster probe; add publisher threads so queues are drained (same count as queues).
+		connected_.store(true, std::memory_order_release);
+		size_t total_threads = num_threads_per_broker_ * static_cast<size_t>(std::min(NUM_MAX_BROKERS, Embarcadero::GetConfig().config().broker.max_brokers.get()));
+		if (!AddPublisherThreads(total_threads, 0, queueSize_)) {
+			LOG(ERROR) << "DEBUG_BUFFER_ISOLATION: AddPublisherThreads failed";
+		} else {
+			LOG(INFO) << "DEBUG_BUFFER_ISOLATION: cluster probe disabled, " << total_threads << " consumer threads added for drain.";
+		}
 	}
 
 	// Initialize Corfu sequencer if needed
@@ -350,27 +272,38 @@ void Publisher::WarmupBuffers() {
 }
 
 void Publisher::Publish(char* message, size_t len) {
-	auto t0 = std::chrono::steady_clock::now();
-
-	// Calculate padding for 64-byte alignment
 	const static size_t header_size = sizeof(Embarcadero::MessageHeader);
+	/*
+	TODO(Jae): Check if below branch causes more overhead or help performance or doesn't affect performance
 	size_t padded = len % 64;
-	if (padded) {
-		padded = 64 - padded;
+    if (padded) {
+        padded = 64 - padded;
+	*/
+	size_t padded_total;
+	{
+		static thread_local size_t cached_len = 0;
+		static thread_local size_t cached_padded_total = 0;
+		if (cached_len == len && cached_padded_total != 0) {
+			padded_total = cached_padded_total;
+		} else {
+			size_t padded = len % 64;
+			if (padded) padded = 64 - padded;
+			padded_total = len + padded + header_size;
+			cached_len = len;
+			cached_padded_total = padded_total;
+		}
 	}
 
-	// Total size includes message, padding and header
-	size_t padded_total = len + padded + header_size;
-
-	size_t my_order = client_order_.fetch_add(1, std::memory_order_acq_rel);  // [[CRITICAL: Atomic RMW]]
-	if (!pubQue_.Write(my_order, message, len, padded_total)) {
+	// [[PERF]] Per-message order for header only (subscriber ordering). client_order_ updated per batch when sealed.
+	size_t my_order = next_publish_order_++;
+	auto [ok, sealed] = pubQue_.Write(my_order, message, len, padded_total);
+	if (!ok) {
 		LOG(ERROR) << "Failed to write message to queue (client_order=" << my_order << ")";
+	} else if (sealed > 0 && !skip_send_for_buffer_test_) {
+		// Buffer isolation: skip so producer has zero atomics (match 4.5 GB/s version).
+		client_order_.fetch_add(sealed, std::memory_order_release);
 	}
 
-	auto t1 = std::chrono::steady_clock::now();
-	uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-	RecordPublisherProfile(kPublisherPublishTotal, ns);
-	RecordPublisherProfilePublishBytes(padded_total);
 }
 
 bool Publisher::Poll(size_t n) {
@@ -379,16 +312,14 @@ bool Publisher::Poll(size_t n) {
 	// before we've called SealAll(), dropping the last batches.
 	WriteFinishedOrPuased();
 
-	// [[FIX: B3=0 ACKs]] Dump buffer statistics to diagnose uneven message distribution
-	pubQue_.DumpBufferStats();
 
 	pubQue_.ReturnReads();
 	publish_finished_.store(true, std::memory_order_release);
+	consumer_should_exit_.store(true, std::memory_order_release);
 
-	// Wait for all messages to be queued
-	// Use periodic spin-then-yield pattern for efficient polling
-	// Spin for 1ms blocks, then yield once to reduce CPU waste while maintaining low latency
-	constexpr auto SPIN_DURATION = std::chrono::milliseconds(1);
+	// [[BUFFER_ISOLATION]] Skip wait when buffer-only test (no client_order_ per message; avoid spin).
+	if (!skip_send_for_buffer_test_) {
+		constexpr auto SPIN_DURATION = std::chrono::milliseconds(1);
 		while (client_order_.load(std::memory_order_acquire) < n) {
 			auto spin_start = std::chrono::steady_clock::now();
 			const auto spin_end = spin_start + SPIN_DURATION;
@@ -399,6 +330,7 @@ bool Publisher::Poll(size_t n) {
 				std::this_thread::yield();
 			}
 		}
+	}
 
 	// All messages queued, waiting for transmission to complete
 
@@ -600,7 +532,73 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 }
 
 void Publisher::WriteFinishedOrPuased() {
-	pubQue_.SealAll();
+	size_t sealed = pubQue_.SealAll();
+	if (sealed > 0) {
+		client_order_.fetch_add(sealed, std::memory_order_release);
+	}
+}
+
+static bool DebugNetworkIsolationEnabled() {
+	const char* e = std::getenv("EMBARCADERO_DEBUG_NETWORK_ISOLATION");
+	return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+}
+
+double Publisher::RunNetworkIsolationTest(double duration_sec) {
+	if (!DebugNetworkIsolationEnabled()) {
+		LOG(ERROR) << "RunNetworkIsolationTest: set EMBARCADERO_DEBUG_NETWORK_ISOLATION=1";
+		return 0.0;
+	}
+	const size_t num_threads = threads_.size();
+	if (num_threads == 0) {
+		LOG(ERROR) << "RunNetworkIsolationTest: no publish threads (call after Init)";
+		return 0.0;
+	}
+	isolation_expected_ready_.store(num_threads, std::memory_order_release);
+	isolation_ready_count_.store(0, std::memory_order_release);
+	isolation_done_count_.store(0, std::memory_order_release);
+	isolation_thread_index_.store(0, std::memory_order_release);
+	isolation_go_.store(false, std::memory_order_release);
+	isolation_total_bytes_.store(0, std::memory_order_release);
+	run_isolation_now_.store(true, std::memory_order_release);
+
+	// Wait for all threads to reach barrier (ready_count == num_threads)
+	const auto barrier_timeout = std::chrono::seconds(30);
+	auto barrier_start = std::chrono::steady_clock::now();
+	while (isolation_ready_count_.load(std::memory_order_acquire) != num_threads) {
+		if (std::chrono::steady_clock::now() - barrier_start >= barrier_timeout) {
+			LOG(ERROR) << "RunNetworkIsolationTest: barrier timeout (ready="
+				<< isolation_ready_count_.load() << " expected=" << num_threads << ")";
+			run_isolation_now_.store(false, std::memory_order_release);
+			return 0.0;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	isolation_duration_sec_.store(duration_sec, std::memory_order_release);
+	isolation_start_ = std::chrono::steady_clock::now();
+	isolation_start_ns_.store(isolation_start_.time_since_epoch().count(), std::memory_order_release);
+	isolation_go_.store(true, std::memory_order_release);
+
+	// Wait for all threads to finish send loop
+	const auto done_timeout = std::chrono::seconds(static_cast<long>(duration_sec) + 120);
+	auto done_start = std::chrono::steady_clock::now();
+	while (isolation_done_count_.load(std::memory_order_acquire) != num_threads) {
+		if (std::chrono::steady_clock::now() - done_start >= done_timeout) {
+			LOG(ERROR) << "RunNetworkIsolationTest: done timeout (done="
+				<< isolation_done_count_.load() << " expected=" << num_threads << ")";
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	isolation_end_ = std::chrono::steady_clock::now();
+	run_isolation_now_.store(false, std::memory_order_release);
+
+	double elapsed_s = std::chrono::duration<double>(isolation_end_ - isolation_start_).count();
+	uint64_t total_bytes = isolation_total_bytes_.load(std::memory_order_relaxed);
+	double bandwidth_mbps = (elapsed_s > 0 && total_bytes > 0)
+		? ((static_cast<double>(total_bytes) / (1024.0 * 1024.0)) / elapsed_s) : 0.0;
+	LOG(INFO) << "[DEBUG_NETWORK_ISOLATION] duration=" << std::fixed << std::setprecision(2) << elapsed_s
+		<< " s, total_bytes=" << total_bytes << ", bandwidth=" << bandwidth_mbps << " MB/s";
+	return bandwidth_mbps;
 }
 
 void Publisher::EpollAckThread() {
@@ -959,6 +957,20 @@ close(server_sock);
 void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	int sock = -1;
 	int efd = -1;
+	int slow_consumer_queue = -1;
+	int slow_consumer_ms = 1;
+	{
+		const char* env = std::getenv("EMBARCADERO_SLOW_CONSUMER_QUEUE");
+		if (env && *env) {
+			slow_consumer_queue = std::atoi(env);
+			const char* ms_env = std::getenv("EMBARCADERO_SLOW_CONSUMER_MS");
+			if (ms_env && *ms_env) slow_consumer_ms = std::max(1, std::atoi(ms_env));
+			if (slow_consumer_queue >= 0 && static_cast<int>(pubQuesIdx) == slow_consumer_queue) {
+				LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: slow consumer injection active ("
+				          << slow_consumer_ms << "ms per batch)";
+			}
+		}
+	}
 
 	// Lambda function to establish connection to a broker
 	auto connect_to_server = [&](size_t brokerId) -> bool {
@@ -1090,13 +1102,16 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		return true;
 	};
 
-	// Connect to initial broker
-	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Starting connection to broker " << broker_id;
-	if (!connect_to_server(broker_id)) {
-		LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Failed to connect to broker " << broker_id;
-		return;
+	// [[DEBUG_BUFFER_ISOLATION]] Skip broker connection when buffer-only test; just drain queue.
+	if (!skip_send_for_buffer_test_) {
+		// Connect to initial broker
+		VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Starting connection to broker " << broker_id;
+		if (!connect_to_server(broker_id)) {
+			LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Failed to connect to broker " << broker_id;
+			return;
+		}
+		VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Successfully connected to broker " << broker_id;
 	}
-	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Successfully connected to broker " << broker_id;
 
 	// Signal thread is initialized
 	thread_count_.fetch_add(1);
@@ -1108,8 +1123,87 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	// Track if we've sent at least one batch (to ensure connection is used)
 	bool has_sent_batch = false;
 
-	// Main publishing loop
-	while (!shutdown_.load(std::memory_order_acquire)) {
+	// Main publishing loop. [[PERF]] One atomic (consumer_should_exit_) at loop top when !buffer_iso; when queue empty check same flag (set by Poll/destructor).
+	while (true) {
+		if (!skip_send_for_buffer_test_ && consumer_should_exit_.load(std::memory_order_acquire)) break;
+		// [[DEBUG_NETWORK_ISOLATION]] When enabled and run_isolation_now, send from single buffer (no queue). Skip in buffer isolation to avoid getenv() per batch.
+		if (!skip_send_for_buffer_test_ && DebugNetworkIsolationEnabled() && run_isolation_now_.load(std::memory_order_acquire)) {
+			static thread_local bool isolation_done = false;
+			if (!isolation_done) {
+				isolation_done = true;
+				const size_t batch_payload_size = Embarcadero::GetConfig().config().storage.batch_size.get();
+				const size_t buffer_size = sizeof(Embarcadero::BatchHeader) + batch_payload_size;
+				std::unique_ptr<uint8_t[]> debug_buf(new uint8_t[buffer_size]);
+				std::memset(debug_buf.get(), 0, buffer_size);
+				Embarcadero::BatchHeader* hdr = reinterpret_cast<Embarcadero::BatchHeader*>(debug_buf.get());
+				const size_t my_index = isolation_thread_index_.fetch_add(1, std::memory_order_relaxed);
+				const size_t num_threads = isolation_expected_ready_.load(std::memory_order_acquire);
+				isolation_ready_count_.fetch_add(1, std::memory_order_release);
+				while (isolation_ready_count_.load(std::memory_order_acquire) != num_threads) {
+					std::this_thread::yield();
+				}
+				while (!isolation_go_.load(std::memory_order_acquire)) {
+					std::this_thread::yield();
+				}
+				uint64_t thread_bytes = 0;
+				const uint32_t num_msg = static_cast<uint32_t>(batch_payload_size / message_size_);
+				const double duration_sec = isolation_duration_sec_.load(std::memory_order_acquire);
+				const uint64_t start_ns = isolation_start_ns_.load(std::memory_order_acquire);
+				size_t batch_idx = 0;
+				for (;; batch_idx++) {
+					auto now = std::chrono::steady_clock::now();
+					uint64_t now_ns = now.time_since_epoch().count();
+					double elapsed = (now_ns - start_ns) / 1e9;
+					if (elapsed >= duration_sec) break;
+					hdr->client_id = static_cast<uint32_t>(client_id_);
+					hdr->broker_id = static_cast<uint32_t>(broker_id);
+					hdr->batch_seq = my_index + num_threads * batch_idx;
+					hdr->total_size = batch_payload_size;
+					hdr->num_msg = num_msg;
+					hdr->batch_complete = 0;
+					hdr->ordered = 0;
+					hdr->start_logical_offset = 0;
+					hdr->log_idx = 0;
+					hdr->total_order = 0;
+					hdr->batch_off_to_export = 0;
+					hdr->epoch_created = 0;
+					hdr->batch_id = 0;
+					hdr->pbr_absolute_index = 0;
+					size_t total_sent = 0;
+					const size_t header_size = sizeof(Embarcadero::BatchHeader);
+					while (total_sent < header_size) {
+						ssize_t n = send(sock, reinterpret_cast<uint8_t*>(hdr) + total_sent, header_size - total_sent, 0);
+						if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+							struct epoll_event events[64];
+							epoll_wait(efd, events, 64, 1);
+							continue;
+						}
+						if (n <= 0) break;
+						total_sent += static_cast<size_t>(n);
+					}
+					if (total_sent != header_size) break;
+					size_t sent_bytes = 0;
+					uint8_t* payload = debug_buf.get() + header_size;
+					while (sent_bytes < batch_payload_size) {
+						size_t to_send = std::min(batch_payload_size - sent_bytes, static_cast<size_t>(65536));
+						ssize_t n = send(sock, payload + sent_bytes, to_send, 0);
+						if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+							struct epoll_event events[64];
+							epoll_wait(efd, events, 64, 1);
+							continue;
+						}
+						if (n <= 0) break;
+						sent_bytes += static_cast<size_t>(n);
+					}
+					if (sent_bytes != batch_payload_size) break;
+					thread_bytes += header_size + batch_payload_size;
+				}
+				isolation_total_bytes_.fetch_add(thread_bytes, std::memory_order_relaxed);
+				isolation_done_count_.fetch_add(1, std::memory_order_release);
+			}
+			continue;
+		}
+
 		size_t len;
 		int bytesSent = 0;
 
@@ -1119,7 +1213,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Skip if no batch is available
 		if (batch_header == nullptr || batch_header->total_size == 0) {
-			if (publish_finished_.load(std::memory_order_acquire) || shutdown_.load(std::memory_order_acquire)) {
+			if (consumer_should_exit_.load(std::memory_order_acquire)) {
 				// CRITICAL: Don't exit immediately if we haven't sent any batches yet
 				// This ensures the connection stays alive even if this thread got no batches
 				// NetworkManager expects to receive at least one batch header per connection
@@ -1134,6 +1228,13 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					// Wait a bit to see if batches arrive, then exit gracefully
 					std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				}
+				// [[CORRECTNESS]] Drain remaining batches before exit (match buffer_benchmark).
+				// Otherwise we exit with batches still in queue; buffer_isolation_consumed_ and timing are wrong.
+				while ((batch_header = static_cast<Embarcadero::BatchHeader*>(pubQue_.Read(pubQuesIdx))) != nullptr
+				       && batch_header->total_size != 0) {
+					has_sent_batch = true;
+					goto process_batch;
+				}
 				// PublishThread exiting
 				VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Exiting - broker=" << broker_id
 				        << ", publish_finished=" << publish_finished_.load(std::memory_order_relaxed)
@@ -1141,34 +1242,67 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				        << ", has_sent_batch=" << has_sent_batch;
 				break;
 		} else {
-			// Log periodically when waiting for batches (VLOG to avoid hot-path overhead)
-			static thread_local size_t wait_count = 0;
-			if (++wait_count % 100000 == 0) {
-				VLOG(2) << "PublishThread[" << pubQuesIdx << "]: Waiting for batches from buffer " 
-				        << pubQuesIdx << " (wait_count=" << wait_count << ")";
+			// [[PERF]] spin 128x before yield when waiting for batch.
+			static constexpr int kConsumerSpinCount = 128;
+			for (int s = 0; s < kConsumerSpinCount; s++) {
+				Embarcadero::CXL::cpu_pause();
 			}
-			Embarcadero::CXL::cpu_pause();
+			std::this_thread::yield();
 			continue;
 		}
 		}
 
-		// Batch count; log only at VLOG(3) to avoid affecting bandwidth measurement.
+	process_batch:
+		// Batch count for VLOG; in buffer isolation skip modulo/VLOG (batch_count still in scope for send path).
 		static thread_local size_t batch_count = 0;
-		if (++batch_count % 100 == 0 || batch_count == 1) {
+		++batch_count;
+		if (!skip_send_for_buffer_test_ && (batch_count % 100 == 0 || batch_count == 1)) {
 			VLOG(3) << "PublishThread[" << pubQuesIdx << "]: Read batch " << batch_count
 			        << " from buffer " << pubQuesIdx
 			        << " (batch_seq=" << batch_header->batch_seq
 			        << ", num_msg=" << batch_header->num_msg
 			        << ", total_size=" << batch_header->total_size << ")";
 		}
-		total_batches_attempted_.fetch_add(1, std::memory_order_relaxed);
+		// [[PERF]] Skip per-batch atomic unless ACK timeout diagnostics requested (E2E hot path = buffer isolation when disabled).
+		if (enable_batch_attempted_for_timeout_log_) {
+			total_batches_attempted_.fetch_add(1, std::memory_order_relaxed);
+		}
 
-		batch_header->client_id = client_id_;
-		batch_header->broker_id = broker_id;
+		// Skip header writes in buffer isolation (benchmark consumer doesn't touch batch).
+		if (!skip_send_for_buffer_test_) {
+			batch_header->client_id = client_id_;
+			batch_header->broker_id = broker_id;
+		}
 
 		// Get pointer to message data
 		void* msg = reinterpret_cast<uint8_t*>(batch_header) + sizeof(Embarcadero::BatchHeader);
 		len = batch_header->total_size;
+
+		// [[DEBUG_BUFFER_ISOLATION]] Skip send; measure buffer drain bandwidth only (E2E harness).
+		if (skip_send_for_buffer_test_) {
+			pubQue_.ReleaseBatch(batch_header);
+			has_sent_batch = true;  // So we don't log "EXITING WITH ZERO BATCHES SENT" (we drained, didn't send).
+			// Pipeline timing: record last_consume_ns when total consumed first reaches target (same as benchmark).
+			// [[PERF]] Batch updates to buffer_isolation_consumed_ to avoid per-batch atomic (same fix as total_batches_attempted_).
+			size_t target = buffer_isolation_target_bytes_;
+			if (target != 0) {
+				size_t total = batch_header->total_size;
+				static thread_local size_t consumed_acc = 0;
+				constexpr size_t kFlushEveryBytes = 2 * 1024 * 1024;  // 2MB; ~1 atomic per batch (batch_size typically 2MB)
+				consumed_acc += total;
+				if (consumed_acc >= kFlushEveryBytes) {
+					size_t prev = buffer_isolation_consumed_.fetch_add(consumed_acc, std::memory_order_relaxed);
+					if (prev < target && prev + consumed_acc >= target) {
+						uint64_t t = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+							std::chrono::steady_clock::now().time_since_epoch()).count());
+						uint64_t expected = 0;
+						buffer_isolation_last_consume_ns_.compare_exchange_strong(expected, t, std::memory_order_relaxed, std::memory_order_relaxed);
+					}
+					consumed_acc = 0;
+				}
+			}
+			continue;
+		}
 
 		// Function to send batch header
 		auto send_batch_header = [&]() -> void {
@@ -1291,7 +1425,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		size_t sent_bytes = 0;
 		size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
 
-		auto t0_send = std::chrono::steady_clock::now();
 		// CRITICAL: Ensure all batch data is sent before checking publish_finished_
 		// This prevents premature thread exit while data is still in flight
 		while (sent_bytes < len) {
@@ -1320,13 +1453,12 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				// Reset backoff after successful send
 				zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
 			} else if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-				::g_send_eagain_count.fetch_add(1, std::memory_order_relaxed);
 				// Socket buffer full; wait for writable so broker can recv() and drain.
 				// [[ROOT_CAUSE_FIX]] 0ms caused client busy-loop while brokers blocked in recv() → ACK stall.
-				// 1ms yields to broker; epoll returns when EPOLLOUT (kernel has space).
-				static constexpr int EPOLL_WAIT_WRITABLE_MS = 1;
+				// Default 1ms yields to broker. Env EMBARCADERO_EPOLL_WAIT_WRITABLE_MS=0 to test busy poll.
+				int wait_ms = GetEpollWaitWritableMs();
 				struct epoll_event events[64];
-				int n = epoll_wait(efd, events, 64, EPOLL_WAIT_WRITABLE_MS);
+				int n = epoll_wait(efd, events, 64, wait_ms);
 
 				if (n == -1) {
 					LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
@@ -1391,10 +1523,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 		}
 
-		{
-			auto t1_send = std::chrono::steady_clock::now();
-			RecordPublisherProfile(kPublisherSendPayload, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1_send - t0_send).count()));
-		}
 		// Mark that we've sent at least one batch
 		has_sent_batch = true;
 		size_t total_sent = total_batches_sent_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1421,6 +1549,11 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Return batch to pool (QueueBuffer).
 		pubQue_.ReleaseBatch(batch_header);
+
+		// Controlled experiment: simulate slow consumer (one queue blocks entire producer).
+		if (slow_consumer_queue >= 0 && static_cast<int>(pubQuesIdx) == slow_consumer_queue) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(slow_consumer_ms));
+		}
 	}
 
 	// IMPROVED: Keep connections alive for subscriber

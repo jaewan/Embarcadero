@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
 #include "absl/container/flat_hash_set.h"
 #include "common.h"
 #include "queue_buffer.h"
@@ -115,6 +116,34 @@ class Publisher {
 		 */
 		void WriteFinishedOrPuased();
 
+		/**
+		 * [[DEBUG_NETWORK_ISOLATION]] Run network-only throughput test: all publish threads
+		 * send from a single reused buffer (header updated per batch), no queue/producer.
+		 * Call after Init(). Returns bandwidth in MB/s. Gated by EMBARCADERO_DEBUG_NETWORK_ISOLATION=1.
+		 */
+		double RunNetworkIsolationTest(double duration_sec);
+
+		/**
+		 * [[DEBUG_BUFFER_ISOLATION]] When enabled, PublishThreads Read() and ReleaseBatch() without sending.
+		 * Use with test 5 + EMBARCADERO_DEBUG_BUFFER_ISOLATION=1 and ack_level=0. Call before Init().
+		 */
+		/** [[BUFFER_OPT]] When buffer isolation: PublishThreads drain queue only (no send). */
+		void SetBufferIsolationMode(bool enable) {
+			skip_send_for_buffer_test_ = enable;
+		}
+
+		/** Set target bytes for pipeline timing (first write to last consume). Call before Publish loop. */
+		void SetBufferIsolationTargetBytes(size_t target) { buffer_isolation_target_bytes_ = target; }
+		/** Reset consumed/last_consume for pipeline timing. Call at start of run. */
+		void ResetBufferIsolationTiming() {
+			buffer_isolation_consumed_.store(0, std::memory_order_relaxed);
+			buffer_isolation_last_consume_ns_.store(0, std::memory_order_relaxed);
+		}
+		/** Get last consume timestamp (ns since epoch) for pipeline bandwidth. */
+		uint64_t GetBufferIsolationLastConsumeNs() const {
+			return buffer_isolation_last_consume_ns_.load(std::memory_order_acquire);
+		}
+
 	private:
 		std::string head_addr_;
 		std::string port_;
@@ -128,11 +157,18 @@ class Publisher {
 		std::unique_ptr<CorfuSequencerClient> corfu_client_;
 
 		// [[Atomic - written by destructor/Poll/DEBUG_check, read by PublishThread/SubscribeToCluster]]
-		std::atomic<bool> shutdown_{false};
+		// [[PERF]] Cache-line separate from producer-hot data so 12 consumers spinning on these
+		// don't bounce the producer's cache line (next_publish_order_, client_order_).
+		alignas(64) std::atomic<bool> shutdown_{false};
 		std::atomic<bool> publish_finished_{false};
+		// Set true by Poll() and destructor; PublishThread checks only this (one load) when queue empty.
+		std::atomic<bool> consumer_should_exit_{false};
+		char pad_consumer_exit_[64 - 3];  // pad to next cache line
 		std::atomic<bool> connected_{false};
-		// [[Atomic - Publish() increments, Poll() reads; ensures visibility across call sites]]
+		// [[Atomic]] Total messages queued (updated per batch when sealed). Poll/ACK wait on it.
 		std::atomic<size_t> client_order_{0};
+		// Per-message order for header (single-threaded producer only; no atomic).
+		size_t next_publish_order_{0};
 		// [[DIAGNOSTIC]] Batch stats (PublishThread writes, WaitForAcks logs on timeout)
 		std::atomic<size_t> total_batches_sent_{0};
 		std::atomic<size_t> total_batches_attempted_{0};
@@ -198,6 +234,29 @@ class Publisher {
 		// This allows us to detect when a broker's ACK connection is missing
 		absl::flat_hash_set<int> brokers_with_ack_connection_ ABSL_GUARDED_BY(mutex_);
 		std::atomic<int> expected_ack_brokers_{0};
+
+		// [[DEBUG_NETWORK_ISOLATION]] Gated by EMBARCADERO_DEBUG_NETWORK_ISOLATION=1
+		std::atomic<bool> run_isolation_now_{false};
+		std::atomic<size_t> isolation_ready_count_{0};
+		std::atomic<size_t> isolation_done_count_{0};
+		std::atomic<size_t> isolation_expected_ready_{0};
+		std::atomic<size_t> isolation_thread_index_{0};  // Assigns unique index per thread for batch_seq
+		std::atomic<bool> isolation_go_{false};
+		std::atomic<double> isolation_duration_sec_{0};  // Set by RunNetworkIsolationTest before go_
+		std::atomic<uint64_t> isolation_start_ns_{0};    // Start time as ns since epoch (visible to all threads)
+		std::chrono::steady_clock::time_point isolation_start_;
+		std::chrono::steady_clock::time_point isolation_end_;
+		std::atomic<uint64_t> isolation_total_bytes_{0};
+
+		// [[DEBUG_BUFFER_ISOLATION]] When true, PublishThread skips send(); only Read() + ReleaseBatch().
+		bool skip_send_for_buffer_test_{false};
+		// When true, PublishThread updates total_batches_attempted_ (for ACK timeout log). Set from EMBARCADERO_ACK_TIMEOUT_DEBUG in Init(). Default false = same hot path as buffer isolation.
+		bool enable_batch_attempted_for_timeout_log_{false};
+		// Pipeline timing: target total bytes, consumed so far, last consume timestamp (ns since epoch).
+		size_t buffer_isolation_target_bytes_{0};
+		// [[PERF]] Own cache line so 12 consumers' fetch_add don't bounce other atomics.
+		alignas(64) std::atomic<uint64_t> buffer_isolation_consumed_{0};
+		std::atomic<uint64_t> buffer_isolation_last_consume_ns_{0};
 
 		/**
 		 * Thread for handling acknowledgements using epoll

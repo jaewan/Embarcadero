@@ -52,7 +52,7 @@ inline void CleanupSocketAndEpoll(int socket_fd, int epoll_fd) {
  * @threading Called from MainThread (accept loop)
  */
 static void SetAcceptedSocketBuffers(int fd) {
-	const int buffer_size = 32 * 1024 * 1024;  // 32 MB (match SetupPayloadSocket)
+	const int buffer_size = 256 * 1024 * 1024;  // 256 MB (match client; reduces EAGAIN at 10GB/s)
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_RCVBUF) on accepted socket failed: " << strerror(errno);
 	}
@@ -63,6 +63,10 @@ static void SetAcceptedSocketBuffers(int fd) {
 	int flag = 1;
 	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
 		LOG(WARNING) << "setsockopt(TCP_NODELAY) on accepted socket failed: " << strerror(errno);
+	}
+	// Enable TCP_QUICKACK so kernel sends ACKs immediately (reduces client RTT / backoff on blocking recv path)
+	if (setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) < 0) {
+		LOG(WARNING) << "setsockopt(TCP_QUICKACK) on accepted socket failed: " << strerror(errno);
 	}
 	// [[DIAGNOSTIC]] Verify kernel actually applied the buffer sizes
 	int actual_rcv = 0, actual_snd = 0;
@@ -148,8 +152,8 @@ bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
 		// Non-fatal, continue
 	}
 
-	// Increase socket buffers for high-throughput (32MB)
-	const int buffer_size = 32 * 1024 * 1024;  // 32 MB
+	// Increase socket buffers for high-throughput (128 MB; match SetAcceptedSocketBuffers)
+	const int buffer_size = 256 * 1024 * 1024;  // 256 MB
 	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_SNDBUF) failed: " << strerror(errno);
 		// Non-fatal, continue (will use default buffer size)
@@ -461,6 +465,12 @@ void NetworkManager::LogPublishPipelineProfile() {
 	}
 	if (total_ns == 0) {
 		LOG(INFO) << "[PublishPipelineProfile] No samples yet.";
+		// Still log key metrics for bandwidth diagnostics
+		uint64_t rf = metric_ring_full_.load(std::memory_order_relaxed);
+		uint64_t bd = metric_batches_dropped_.load(std::memory_order_relaxed);
+		if (rf > 0 || bd > 0) {
+			LOG(INFO) << "[BrokerMetrics] ring_full=" << rf << " batches_dropped=" << bd;
+		}
 		return;
 	}
 	LOG(INFO) << "[PublishPipelineProfile] === Aggregated time per component ===";
@@ -476,6 +486,18 @@ void NetworkManager::LogPublishPipelineProfile() {
 	LOG(INFO) << "[PublishPipelineProfile]   TOTAL: " << (total_ns / 1000) << " us ("
 		<< (total_ns / 1e9) << " s) across all components";
 	LOG(INFO) << "[PublishPipelineProfile] ========================================";
+
+	// Bandwidth diagnostics: key counters for regression analysis (EAGAIN is client-side)
+	uint64_t ring_full = metric_ring_full_.load(std::memory_order_relaxed);
+	uint64_t batches_dropped = metric_batches_dropped_.load(std::memory_order_relaxed);
+	uint64_t cxl_retries = metric_cxl_retries_.load(std::memory_order_relaxed);
+	uint64_t staging_exhausted = metric_staging_exhausted_.load(std::memory_order_relaxed);
+	if (ring_full > 0 || batches_dropped > 0 || cxl_retries > 0 || staging_exhausted > 0) {
+		LOG(INFO) << "[BrokerMetrics] ring_full=" << ring_full
+			<< " batches_dropped=" << batches_dropped
+			<< " cxl_retries=" << cxl_retries
+			<< " staging_exhausted=" << staging_exhausted;
+	}
 }
 
 void NetworkManager::EnsureCachedTopicValid(ConnectionState* state) {

@@ -159,7 +159,7 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
     // Configure buffer size based on send/receive mode
     if (send) {
         // OPTIMIZATION: Increase send buffer to match receive buffer for better throughput
-        int sendBufferSize = 128 * 1024 * 1024;  // 128 MB send buffer (matches receive buffer)
+        int sendBufferSize = 256 * 1024 * 1024;  // 256 MB send buffer (reduces EAGAIN at high throughput)
         if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize)) == -1) {
             LOG(ERROR) << "setsockopt(SO_SNDBUF) failed: " << strerror(errno);
             close(sock);
@@ -179,7 +179,7 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
         }
     } else {
         // Configure for receiving
-        int receiveBufferSize = 128 * 1024 * 1024; // 128 MB receive buffer
+        int receiveBufferSize = 256 * 1024 * 1024; // 256 MB receive buffer
         if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &receiveBufferSize, sizeof(receiveBufferSize)) == -1) {
             LOG(ERROR) << "setsockopt(SO_RCVBUF) failed: " << strerror(errno);
             close(sock);
@@ -272,11 +272,12 @@ bool CheckHugePagesAvailable(size_t need_bytes) {
     bool ok = (free_bytes >= need_bytes);
     if (ok) {
         LOG(INFO) << "Hugepages: " << free_pages << " free × " << hps_kb << " kB = "
-                  << (free_bytes / (1024UL * 1024)) << " MB free; need " << (need_bytes / (1024UL * 1024)) << " MB";
+                  << (free_bytes / (1024UL * 1024)) << " MB free; need " << (need_bytes / (1024UL * 1024))
+                  << " MB (OK)";
     } else {
         LOG(WARNING) << "Hugepages: " << free_pages << " free × " << hps_kb << " kB = "
                     << (free_bytes / (1024UL * 1024)) << " MB free; need " << (need_bytes / (1024UL * 1024))
-                    << " MB. Provision more (e.g. echo 8192 | sudo tee /proc/sys/vm/nr_hugepages) or set EMBAR_USE_HUGETLB=0 for THP.";
+                    << " MB. Provision more (e.g. echo 13312 | sudo tee /proc/sys/vm/nr_hugepages for ~26GB) or set EMBAR_USE_HUGETLB=0 for THP.";
     }
     return ok;
 }

@@ -1,6 +1,7 @@
 #include "test_utils.h"
 #include "../common/configuration.h"
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <random>
 #include <thread>
@@ -231,8 +232,25 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		num_threads_per_broker, message_size, q_size, order, seq_type);
 
 	try {
+		int test_num = result["test_number"].as<int>();
+		const char* debug_iso = std::getenv("EMBARCADERO_DEBUG_NETWORK_ISOLATION");
+		const char* buf_iso = std::getenv("EMBARCADERO_DEBUG_BUFFER_ISOLATION");
+		bool use_network_isolation = (test_num == 5 && debug_iso &&
+			(debug_iso[0] == '1' || debug_iso[0] == 'y' || debug_iso[0] == 'Y'));
+		bool use_buffer_isolation = (test_num == 5 && buf_iso &&
+			(buf_iso[0] == '1' || buf_iso[0] == 'y' || buf_iso[0] == 'Y'));
+
+		// [[DEBUG_BUFFER_ISOLATION]] Buffer-only in E2E: skip send(), terminate when PublishThreads drain (no ack wait).
+		if (use_buffer_isolation) {
+			ack_level = 0;
+			p.SetBufferIsolationMode(true);
+			LOG(INFO) << "DEBUG_BUFFER_ISOLATION: buffer-only in E2E (no send, terminate when PublishThreads drain)";
+		}
+
 		// Initialize publisher
 		p.Init(ack_level);
+		// Warmup buffers to eliminate page-fault variance (same as other throughput tests).
+		p.WarmupBuffers();
 
 		// Synchronize with other clients
 		synchronizer.fetch_sub(1);
@@ -246,29 +264,57 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		// Start timing
 		auto start = std::chrono::high_resolution_clock::now();
 
-		// Publish messages
-		for (size_t i = 0; i < n; i++) {
-			p.Publish(message, message_size);
+		// [[DEBUG_BUFFER_ISOLATION]] Pipeline timing: first write to last consume (same as buffer_benchmark).
+		uint64_t first_write_ns = 0;
+		if (use_buffer_isolation) {
+			p.SetBufferIsolationTargetBytes(total_message_size);
+			p.ResetBufferIsolationTiming();
 		}
 
-		// Finalize publishing
-		VLOG(5) << "Finished publishing from client";
-		p.DEBUG_check_send_finish();
-		if (!p.Poll(n)) {
-			LOG(ERROR) << "Publish test failed: ACK wait timed out";
-			delete[] message;
-			return 0.0;
+		double bandwidthMbps = 0.0;
+		if (use_network_isolation) {
+			LOG(INFO) << "DEBUG_NETWORK_ISOLATION: running network-only test (5s), no queue/producer";
+			bandwidthMbps = p.RunNetworkIsolationTest(5.0);
+			LOG(INFO) << "Publish test (network isolation) completed: " << std::fixed << std::setprecision(2) << bandwidthMbps << " MB/s";
+		} else {
+			// Publish messages
+			for (size_t i = 0; i < n; i++) {
+				if (use_buffer_isolation && i == 0) {
+					first_write_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+						std::chrono::steady_clock::now().time_since_epoch()).count());
+				}
+				p.Publish(message, message_size);
+			}
+
+			// Finalize publishing
+			VLOG(5) << "Finished publishing from client";
+			p.DEBUG_check_send_finish();
+			if (!p.Poll(n)) {
+				LOG(ERROR) << "Publish test failed: ACK wait timed out";
+				delete[] message;
+				return 0.0;
+			}
+
+			// Calculate elapsed time and bandwidth
+			auto end = std::chrono::high_resolution_clock::now();
+			std::chrono::duration<double> elapsed = end - start;
+			double seconds = elapsed.count();
+			bandwidthMbps = ((message_size * n) / seconds) / (1024 * 1024);
+
+			LOG(INFO) << "Publish test completed in " << std::fixed << std::setprecision(2) 
+				<< seconds << " seconds";
+			LOG(INFO) << "Bandwidth: " << std::fixed << std::setprecision(2) << bandwidthMbps << " MB/s";
+			if (use_buffer_isolation) {
+				LOG(INFO) << "DEBUG_BUFFER_ISOLATION: buffer-only bandwidth (no send, drain to PublishThreads): " << std::fixed << std::setprecision(2) << bandwidthMbps << " MB/s";
+				// Pipeline bandwidth = total_bytes / (last_consume_ns - first_write_ns), same definition as buffer_benchmark.
+				uint64_t last_consume_ns = p.GetBufferIsolationLastConsumeNs();
+				if (first_write_ns != 0 && last_consume_ns != 0 && last_consume_ns > first_write_ns) {
+					double pipeline_sec = static_cast<double>(last_consume_ns - first_write_ns) / 1e9;
+					double pipeline_mbps = (total_message_size / (1024.0 * 1024.0)) / pipeline_sec;
+					LOG(INFO) << "DEBUG_BUFFER_ISOLATION: pipeline bandwidth (first write to last consume): " << std::fixed << std::setprecision(2) << pipeline_mbps << " MB/s";
+				}
+			}
 		}
-
-		// Calculate elapsed time and bandwidth
-		auto end = std::chrono::high_resolution_clock::now();
-		std::chrono::duration<double> elapsed = end - start;
-		double seconds = elapsed.count();
-		double bandwidthMbps = ((message_size * n) / seconds) / (1024 * 1024);
-
-		LOG(INFO) << "Publish test completed in " << std::fixed << std::setprecision(2) 
-			<< seconds << " seconds";
-		LOG(INFO) << "Bandwidth: " << std::fixed << std::setprecision(2) << bandwidthMbps << " MB/s";
 
 		// Clean up
 		delete[] message;

@@ -17,9 +17,11 @@
 #include "folly/ProducerConsumerQueue.h"
 #include "folly/MPMCQueue.h"
 #include <atomic>
-#include <memory>
-#include <vector>
 #include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <utility>
+#include <vector>
 
 class QueueBuffer {
 public:
@@ -45,9 +47,9 @@ public:
 
 	/**
 	 * Append one message to current batch; round-robins by write_buf_id_. Seals batch when >= BATCH_SIZE.
-	 * @return true on success; false if pool exhausted (blocks with timeout in current impl)
+	 * @return {success, messages_sealed_this_call} so caller can update client_order_ per batch.
 	 */
-	bool Write(size_t client_order, char* msg, size_t len, size_t paddedSize);
+	std::pair<bool, size_t> Write(size_t client_order, char* msg, size_t len, size_t paddedSize);
 
 	/**
 	 * Dequeue next batch for consumer bufIdx. Returns BatchHeader* or nullptr if empty (or shutdown).
@@ -62,9 +64,9 @@ public:
 
 	/**
 	 * Seal the current batch (if any) so no data is left unqueued.
-	 * QueueBuffer has a single current batch; SealAll() seals it once (same as Seal()).
+	 * @return number of messages in the batch sealed (0 if none).
 	 */
-	void SealAll();
+	size_t SealAll();
 
 	/**
 	 * Signal that no more Write() will be called; Read() may return nullptr when queue empty.
@@ -84,14 +86,12 @@ public:
 	void SetActiveQueues(size_t active_count);
 
 	/**
-	 * Pre-touch pool memory to reduce measurement variance.
+	 * Pre-touch pool memory (hugepage regions) to fault pages in and reduce measurement variance.
+	 * Call explicitly after AddBuffers() and before the hot path. Not done inside AddBuffers()
+	 * so callers control when/how (e.g. after thread binding, or skip in tests that don't care).
 	 */
 	void WarmupBuffers();
 
-	/**
-	 * Diagnostic: per-queue depth and pool free count.
-	 */
-	void DumpBufferStats();
 
 	/**
 	 * Return a batch buffer to the pool after consumer is done. Must be called with the pointer
@@ -109,6 +109,8 @@ private:
 	int order_;
 	int client_id_;
 	size_t message_size_;
+	// [[PERF]] Cached at construction; avoid ShouldUseBlogHeader() + order check on every Write().
+	bool use_blog_header_{false};
 
 	// N SPSC queues (producer pushes to queues_[write_buf_id_], consumer bufIdx pops from queues_[bufIdx])
 	std::vector<std::unique_ptr<folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>>> queues_;
@@ -119,8 +121,11 @@ private:
 	// Batch buffer pool (MPMC: producer acquires, consumers release via ReleaseBatch)
 	std::unique_ptr<folly::MPMCQueue<Embarcadero::BatchHeader*>> pool_;
 	std::vector<std::pair<void*, size_t>> batch_buffers_region_;  // (base, size) for munmap
-	size_t slot_size_{0};   // sizeof(BatchHeader) + BATCH_SIZE, 64B aligned
+	size_t slot_size_{0};   // sizeof(BatchHeader) + batch_size_cached_, 64B aligned
 	size_t pool_slots_{0};
+	// Cached BATCH_SIZE once in AddBuffers; avoid GetConfig().get() + getenv() on every Write().
+	// Atomic so producer (Write) sees value set by cluster-probe thread (AddBuffers).
+	std::atomic<size_t> batch_size_cached_{0};
 
 	size_t write_buf_id_{0};
 	std::atomic<size_t> batch_seq_{0};
@@ -137,16 +142,14 @@ private:
 	Embarcadero::BatchHeader* current_batch_{nullptr};
 	size_t current_batch_tail_{0};  // bytes written in current slot (start at sizeof(BatchHeader))
 	size_t current_batch_num_msg_{0};  // message count for current batch (for BatchHeader::num_msg)
-	// [[PERF]] Cached once to avoid config read on every Write(); -1 = not yet set.
-	int profile_enabled_cached_{-1};
 
 	// Message header templates (same as Buffer)
 	Embarcadero::MessageHeader header_;
 	Embarcadero::BlogMessageHeader blog_header_;
 
 	void AdvanceWriteBufId();
-	/** Seal current batch and push to queues_[write_buf_id_], then advance and get new buffer. */
-	void SealCurrentAndAdvance();
+	/** Seal current batch and push to queues_[write_buf_id_], then advance and get new buffer. Returns num_msg in batch sealed (0 if none). */
+	size_t SealCurrentAndAdvance();
 	/** Debug: true iff batch is a slot base in one of our regions (for ReleaseBatch validation). */
 	bool IsValidPoolPointer(void* batch) const;
 };

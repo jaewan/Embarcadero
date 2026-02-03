@@ -75,7 +75,6 @@
  */
 
 #include "buffer.h"
-#include "publisher_profile.h"
 #include "../common/configuration.h"
 #include "../common/wire_formats.h"
 #include "../common/performance_utils.h"
@@ -259,7 +258,6 @@ void Buffer::WarmupBuffers() {
 
 #ifdef BATCH_OPTIMIZATION
 bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize) {
-	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 	// [[BLOG_HEADER: Determine header format based on feature flag and order]]
 	bool use_blog_header = Embarcadero::HeaderUtils::ShouldUseBlogHeader() && order_ == 5;
 	static const size_t v1_header_size = sizeof(Embarcadero::MessageHeader);
@@ -400,12 +398,6 @@ bool Buffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize
 		Seal();
 	}
 
-	{
-		auto t1 = std::chrono::steady_clock::now();
-		uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-		RecordPublisherProfile(kPublisherBufferWrite, ns);
-		RecordPublisherProfileBufferWriteBytes(stride);
-	}
 	return true;
 }
 
