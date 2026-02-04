@@ -1,3 +1,4 @@
+#include <chrono>
 #include <string>
 #include <thread>
 #include <functional>
@@ -278,6 +279,28 @@ int main(int argc, char* argv[]) {
 	network_manager.SetCXLManager(&cxl_manager);
 	network_manager.SetDiskManager(&disk_manager);
 	network_manager.SetTopicManager(&topic_manager);
+
+	// [[FIX: 9/12 subscriber connections]] Only signal "ready" when the data port is actually
+	// listening. NetworkManager constructor returns when MainThread has *started*, but MainThread
+	// may still be in bind()/listen() (bind retries with sleep(5)). Signaling ready before
+	// listen() causes clients to connect too early → connection refused → one broker shows 0/3
+	// subscriber connections (9/12 total). For sequencer-only nodes we skip networking so
+	// IsListening() stays false; do not wait in that case.
+	if (!is_sequencer_node) {
+		const int listen_wait_seconds = 30;
+		const int poll_ms = 100;
+		int waited_ms = 0;
+		while (!network_manager.IsListening() && waited_ms < listen_wait_seconds * 1000) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+			waited_ms += poll_ms;
+			if (waited_ms % 5000 == 0 && waited_ms > 0) {
+				LOG(INFO) << "Waiting for data port to listen (broker " << broker_id << ")... " << (waited_ms / 1000) << "s";
+			}
+		}
+		if (!network_manager.IsListening()) {
+			LOG(ERROR) << "Data port did not start listening within " << listen_wait_seconds << "s (broker " << broker_id << ")";
+		}
+	}
 
 	// Signal initialization completion
 	SignalScriptReady();

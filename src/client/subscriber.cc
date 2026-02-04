@@ -947,8 +947,9 @@ void Subscriber::SubscribeToClusterStatus() {
 							continue;
 						}
 						data_brokers++;
-						if (nodes_.find(broker_id) == nodes_.end()) {
-							nodes_[broker_id] = addr;
+						nodes_[broker_id] = addr;  // Always update (e.g. broker 0 pre-set in ctor)
+						// Spawn ManageBrokerConnections for every data broker we haven't started yet (including broker 0)
+						if (brokers_connection_started_.insert(broker_id).second) {
 							brokers_to_add.push_back({broker_id, addr});
 							LOG(INFO) << "SubscribeToCluster: Added data broker " << broker_id;
 						}

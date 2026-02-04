@@ -266,6 +266,8 @@ class Subscriber {
 		// Cluster state
 		absl::Mutex node_mutex_;
 		absl::flat_hash_map<int, std::string> nodes_ ABSL_GUARDED_BY(node_mutex_);
+		// Brokers we've already spawned ManageBrokerConnections for (so we connect to broker 0 too; nodes_[0] is pre-set in ctor)
+		absl::flat_hash_set<int> brokers_connection_started_ ABSL_GUARDED_BY(node_mutex_);
 		std::thread cluster_probe_thread_;
 
 		// Worker thread management
