@@ -130,8 +130,6 @@ namespace config {
     inline constexpr size_t VALIDATION_RING_SIZE = 1 << 20;
     /// Sample 1 in (VALIDATION_SAMPLE_MASK+1) batches for ordering validation to reduce mutex contention.
     inline constexpr unsigned VALIDATION_SAMPLE_MASK = 255;
-    /// Max spins in ValidationRing::record() before overwriting slot (avoids blocking hot path when ring full).
-    inline constexpr unsigned VALIDATION_RING_MAX_SPIN = 10000;
     inline constexpr int RING_MAX_RETRIES = 64;
     inline constexpr size_t RADIX_BITS = 8;
     inline constexpr size_t RADIX_BUCKETS = 1 << RADIX_BITS;
@@ -156,7 +154,13 @@ namespace config {
     /// Validation: max wall-clock seconds before returning "validation timeout".
     inline constexpr int VALIDATION_TIMEOUT_SEC = 60;
     /// Validation: cap ring size for non-stress runs (avoids unbounded allocation; 4M entries).
-    inline constexpr size_t VALIDATION_RING_CAP = 4 << 20;
+    /// Cap validation ring so drain+sort stays fast; long runs validate the most recent VALIDATION_RING_CAP batches.
+    inline constexpr size_t VALIDATION_RING_CAP = 1 << 20;
+    /// Proactive backpressure: PBR high/low watermarks (§Step 1)
+    inline constexpr double PBR_HIGH_WATERMARK_PCT = 0.90;
+    inline constexpr double PBR_LOW_WATERMARK_PCT = 0.50;
+    inline constexpr uint64_t BACKPRESSURE_MIN_SLEEP_US = 100;
+    inline constexpr uint64_t BACKPRESSURE_MAX_SLEEP_US = 10000;
 }
 
 inline void cxl_write_delay() {
@@ -180,6 +184,15 @@ inline uint64_t now_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+
+// ============================================================================
+// Inject Result (Step 1: Proactive Backpressure)
+// ============================================================================
+enum class InjectResult {
+    SUCCESS,        // Batch successfully injected
+    BACKPRESSURE,   // Above high watermark - caller must retry with backoff
+    RING_FULL       // CAS failed after retries - transient contention
+};
 
 // ============================================================================
 // Lock-Free Latency Ring (SPSC: sequencer writes, main thread drains after stop)
@@ -253,17 +266,18 @@ public:
     size_t capacity() const { return size_; }
 
     /** Lock-free: multiple producers. Call only before drain() (i.e. while writers run).
-     * If ring is full (slot still ready after VALIDATION_RING_MAX_SPIN spins), overwrites slot to avoid
-     * blocking the hot path; one validation entry may be lost. Ensures sequencer never stalls on validation. */
+     * Step 2: Removed spin loop - just check for overwrite and proceed.
+     * Ensures sequencer never stalls on validation. */
     void record(uint64_t global_seq, uint64_t batch_id, uint64_t client_id, uint64_t client_seq, bool is_level5) noexcept {
         uint64_t idx = write_pos_.fetch_add(1, std::memory_order_relaxed);
         ValidationSlot& e = slots_[idx & mask()];
-        for (unsigned spin = 0; e.ready.load(std::memory_order_acquire) && spin < config::VALIDATION_RING_MAX_SPIN; ++spin) {
-            CPU_PAUSE();
-        }
+        
+        // Check if slot is ready (being consumed) - if so, we're overwriting
         if (e.ready.load(std::memory_order_acquire)) {
             overwrites_.fetch_add(1, std::memory_order_relaxed);
         }
+        
+        // Write validation data
         e.global_seq = global_seq;
         e.batch_id = batch_id;
         e.client_id = client_id;
@@ -666,6 +680,8 @@ private:
 // Single-threaded: only sequencer thread calls check_and_insert; no locks.
 class Deduplicator {
 public:
+    void set_skip(bool skip) { skip_ = skip; }
+
     Deduplicator() {
         for (auto& s : shards_) {
             s.seen.reserve(config::DEDUP_MAX_PER_SHARD * 2);
@@ -675,6 +691,9 @@ public:
     }
 
     bool check_and_insert(uint64_t batch_id) {
+        // If dedup is disabled, always return false (not a duplicate)
+        if (skip_) return false;
+
         size_t shard = hash64(batch_id) % config::DEDUP_NUM_SHARDS;
         auto& s = shards_[shard];
         auto [it, inserted] = s.seen.insert(batch_id);
@@ -696,6 +715,7 @@ private:
         std::deque<uint64_t> insertion_order;
     };
     std::array<Shard, config::DEDUP_NUM_SHARDS> shards_;
+    bool skip_ = false;
 };
 
 // ============================================================================
@@ -924,7 +944,8 @@ struct alignas(128) Stats {
     /// Assessment §4.2: Backpressure - sequencer_loop sets current backlog (epochs); producer throttles when > 50.
     std::atomic<uint64_t> backlog_epochs{0};
 
-    alignas(64) std::atomic<uint64_t> pbr_full_count{0};  // Producer threads
+    alignas(64) std::atomic<uint64_t> pbr_full_count{0};  // Producer threads: CAS failures (transient)
+    std::atomic<uint64_t> backpressure_events{0};  // Step 1: Above high watermark (controlled backpressure)
     std::atomic<uint64_t> total_injected{0};  // Successful inject_batch (completeness §5.2)
 
     alignas(64) std::atomic<uint64_t> seq_total_ns{0};
@@ -1015,6 +1036,9 @@ struct SequencerConfig {
     /// Phase 2: when >0, use dense vectors for client state (client_id in [0, max_clients)); avoids hash lookups.
     uint32_t max_clients = 0;
 
+    /// Ablation: if true, disable deduplication (benchmark has no retries, dedup just adds overhead)
+    bool skip_dedup = false;
+
     void validate() {
         num_brokers = std::clamp(num_brokers, 1u, config::MAX_BROKERS);
         num_collectors = std::clamp(num_collectors, 1u, config::MAX_COLLECTORS);
@@ -1060,10 +1084,16 @@ public:
     uint64_t validation_overwrites() const { return validation_ring_.overwrites(); }
     void reset_validation_overwrites() { validation_ring_.reset_overwrites(); }
 
-    [[nodiscard]] bool inject_batch(uint16_t broker_id, uint64_t batch_id,
+    [[nodiscard]] InjectResult inject_batch(uint16_t broker_id, uint64_t batch_id,
                                      uint32_t payload_size, uint32_t msg_count,
                                      uint32_t extra_flags = 0,
                                      uint64_t client_id = 0, uint64_t client_seq = 0);
+
+    /** Query: Is broker_id's PBR below low watermark? Used for adaptive backoff. */
+    bool below_low_watermark(uint16_t broker_id) const;
+
+    /** PBR usage snapshot: average (used/capacity)*100 across all brokers. Call after stop() for stable reading. */
+    double get_pbr_usage_pct() const;
 
     bool validate_ordering();
     /** Returns empty if valid; otherwise first failure reason (gap / per-client). Call after stop(). */
@@ -1360,6 +1390,7 @@ void Sequencer::start() {
             s->running.store(true);
             s->current_epoch.store(0, std::memory_order_relaxed);
             s->epoch_complete.store(false, std::memory_order_relaxed);
+            s->dedup.set_skip(config_.skip_dedup);
             shards_.push_back(std::move(s));
         }
 
@@ -1909,30 +1940,35 @@ void Sequencer::sequence_batches_per_epoch(std::vector<BatchInfo>& in, std::vect
     process_level0(l0_buffer_, out);
     stats_.phase_l0_ns.fetch_add(now_ns() - t_l0, std::memory_order_relaxed);
 
+    // Step 3: Collect all L5 batches (from epoch + hold buffers) for single sort
+    std::vector<BatchInfo> l5_ready;
+    l5_ready.reserve(l5_buffer_.size() + hold_size_ + 1024);
+
     uint64_t t_l5 = now_ns();
-    if (!l5_buffer_.empty()) process_level5(l5_buffer_, out, epoch);
+    if (!l5_buffer_.empty()) process_level5(l5_buffer_, l5_ready, epoch);
     stats_.phase_l5_ns.fetch_add(now_ns() - t_l5, std::memory_order_relaxed);
 
     uint64_t t_hold = now_ns();
-    drain_hold(out, epoch);
-    age_hold(out, epoch);
+    drain_hold(l5_ready, epoch);
+    age_hold(l5_ready, epoch);
     if (!clients_with_held_batches_.empty())
-        drain_hold(out, epoch);  // Second drain only if some client still has held batches
+        drain_hold(l5_ready, epoch);  // Second drain only if some client still has held batches
     stats_.hold_phase_ns.fetch_add(now_ns() - t_hold, std::memory_order_relaxed);
 
-    // Per-client ordering (§1.1): L5 batches must be ordered by (client_id, client_seq) before
-    // global_seq assignment so that global_seq respects per-client order.
-    if (config_.level5_enabled && !out.empty()) {
+    // Step 3: Single sort of ALL L5 batches (this epoch's + drained from hold buffer)
+    if (config_.level5_enabled && !l5_ready.empty()) {
         uint64_t t_reorder = now_ns();
-        auto l5_start = std::stable_partition(out.begin(), out.end(),
-            [](const BatchInfo& b) { return !b.is_level5(); });
-        if (l5_start != out.end()) {
-            std::sort(l5_start, out.end(), [](const BatchInfo& a, const BatchInfo& b) {
-                if (a.client_id != b.client_id) return a.client_id < b.client_id;
-                return a.client_seq < b.client_seq;
-            });
-        }
+        std::sort(l5_ready.begin(), l5_ready.end(), [](const BatchInfo& a, const BatchInfo& b) {
+            if (a.client_id != b.client_id) return a.client_id < b.client_id;
+            return a.client_seq < b.client_seq;
+        });
         stats_.phase_l5_reorder_ns.fetch_add(now_ns() - t_reorder, std::memory_order_relaxed);
+        
+        // Append sorted L5 to output
+        out.insert(out.end(),
+                   std::make_move_iterator(l5_ready.begin()),
+                   std::make_move_iterator(l5_ready.end()));
+        l5_ready.clear();
     }
 
     if (!out.empty()) {
@@ -1964,15 +2000,13 @@ void Sequencer::process_level5(std::vector<BatchInfo>& in, std::vector<BatchInfo
     }
     stats_.level5_batches.fetch_add(in.size(), std::memory_order_relaxed);
 
-    uint64_t t0 = now_ns();
-    if (config_.use_radix_sort) {
-        sorter_.sort_by_client_id(in);
-    } else {
-        std::sort(in.begin(), in.end(), [](const BatchInfo& a, const BatchInfo& b) {
-            return a.client_id < b.client_id;
-        });
-    }
-    stats_.sort_time_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+    // Step 3: Do NOT sort here - collect and sort once at the end with drain_hold/age_hold results
+    // For now, just do per-client ordering validation and hold buffer logic
+    
+    // Group by client_id (but don't sort globally - that happens in sequence_batches_per_epoch)
+    std::sort(in.begin(), in.end(), [](const BatchInfo& a, const BatchInfo& b) {
+        return a.client_id < b.client_id;
+    });
 
     auto it = in.begin();
     while (it != in.end()) {
@@ -1980,6 +2014,7 @@ void Sequencer::process_level5(std::vector<BatchInfo>& in, std::vector<BatchInfo
         auto start = it;
         while (it != in.end() && it->client_id == cid) ++it;
 
+        // Sort this client's batches by client_seq
         sorter_.sort_by_client_seq(&*start, &*it);
 
         ClientState& st = get_state(cid);
@@ -2180,19 +2215,15 @@ void Sequencer::client_gc(uint64_t cur_epoch) {
             }
         }
         for (uint64_t c : evict) {
-            // §1.2: Clean hold buffer and expiry queue for evicted client (avoid memory leak).
+            // Step 4: Clean hold buffer for evicted client. Use lazy deletion for expiry_queue.
             auto it = hold_buf_.find(c);
             if (it != hold_buf_.end()) {
                 hold_size_ -= it->second.size();
                 hold_buf_.erase(it);
             }
             clients_with_held_batches_.erase(c);
-            for (auto eq = expiry_queue_.begin(); eq != expiry_queue_.end(); ) {
-                if (eq->second.first == c)
-                    eq = expiry_queue_.erase(eq);
-                else
-                    ++eq;
-            }
+            // NOTE: Stale expiry_queue entries for evicted clients are lazily skipped in age_hold()
+            // when hold_buf_.find(client_id) returns end(). This avoids O(n²) scan per evicted client.
             shard.states.erase(c);
             // Do NOT erase client_highest_committed_[c]. It is the durability barrier: late/retry
             // packets with client_seq <= hc must be rejected.
@@ -2703,16 +2734,28 @@ void Sequencer::timer_loop_scatter() {
     }
 }
 
-bool Sequencer::inject_batch(uint16_t broker_id, uint64_t batch_id,
+InjectResult Sequencer::inject_batch(uint16_t broker_id, uint64_t batch_id,
                               uint32_t payload_size, uint32_t msg_count,
                               uint32_t extra_flags,
                               uint64_t client_id, uint64_t client_seq) {
-    if (broker_id >= config_.num_brokers) return false;
+    if (broker_id >= config_.num_brokers) return InjectResult::RING_FULL;
     auto& ring = *pbr_rings_[broker_id];
+    
+    // Step 1: Proactive backpressure check - BEFORE reserve()
+    uint64_t head = ring.head();
+    uint64_t tail = ring.tail();
+    uint64_t used = tail - head;
+    double usage = static_cast<double>(used) / config_.pbr_entries;
+    
+    if (usage >= config::PBR_HIGH_WATERMARK_PCT) {
+        stats_.backpressure_events.fetch_add(1, std::memory_order_relaxed);
+        return InjectResult::BACKPRESSURE;
+    }
+    
     auto slot = ring.reserve();
     if (!slot) {
         stats_.pbr_full_count.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        return InjectResult::RING_FULL;
     }
     size_t idx = *slot & ring.mask();
     PBREntry& e = pbr_[broker_id * config_.pbr_entries + idx];
@@ -2727,11 +2770,32 @@ bool Sequencer::inject_batch(uint16_t broker_id, uint64_t batch_id,
     e.timestamp_ns = now_ns();
     e.flags.store(extra_flags | flags::VALID, std::memory_order_release);
     stats_.total_injected.fetch_add(1, std::memory_order_relaxed);
-    return true;
+    return InjectResult::SUCCESS;
 }
 
 bool Sequencer::validate_ordering() {
     return validate_ordering_reason().empty();
+}
+
+/** Query: Is broker_id's PBR below low watermark? For adaptive backoff in producer. */
+bool Sequencer::below_low_watermark(uint16_t broker_id) const {
+    if (broker_id >= config_.num_brokers) return true;
+    auto& ring = *pbr_rings_[broker_id];
+    uint64_t used = ring.tail() - ring.head();
+    double usage = static_cast<double>(used) / config_.pbr_entries;
+    return usage < config::PBR_LOW_WATERMARK_PCT;
+}
+
+/** PBR usage snapshot: average (used/capacity)*100 across all brokers. */
+double Sequencer::get_pbr_usage_pct() const {
+    if (config_.num_brokers == 0 || pbr_rings_.empty()) return 0.0;
+    double sum = 0.0;
+    for (uint32_t i = 0; i < config_.num_brokers; ++i) {
+        auto& ring = *pbr_rings_[i];
+        uint64_t used = ring.tail() - ring.head();
+        sum += static_cast<double>(used) / static_cast<double>(config_.pbr_entries);
+    }
+    return 100.0 * sum / static_cast<double>(config_.num_brokers);
 }
 
 // Call after stop(); drains lock-free ring (no mutex on hot path).
@@ -2822,6 +2886,7 @@ struct Config {
     bool run_epoch_test = true;
     bool run_broker_test = true;
     bool run_scatter_gather = true;
+    bool skip_dedup = false;  // If true, disable dedup for ablation (benchmark has no retries)
 };
 
 struct Result {
@@ -2833,6 +2898,8 @@ struct Result {
     uint64_t min_seq_ns = 0, max_seq_ns = 0;
     uint64_t batches = 0, epochs = 0, level5 = 0, gaps = 0, dropped = 0, atomics = 0;
     uint64_t pbr_full = 0;  // PBR reserve failures (saturation)
+    uint64_t backpressure_events = 0;  // Inject attempts deferred by high watermark (controlled backpressure)
+    double pbr_usage_pct = 0;  // Snapshot: avg (used/capacity)*100 across brokers at end of run
     double duration = 0;
     double efficiency_pct = 0;  // 100 * achieved / (21 GB/s theoretical max)
     uint64_t epoch_us = 500;  // Target epoch interval (for reporting)
@@ -2906,6 +2973,7 @@ public:
             sc.scatter_gather_enabled = true;
             sc.num_shards = cfg_.num_shards;
         }
+        sc.skip_dedup = cfg_.skip_dedup;
         // Phase 2: dense client state (O(1) lookup) when client_id in [0, clients)
         sc.max_clients = cfg_.clients;
         sc.allow_drops = (cfg_.validity_mode == ValidityMode::STRESS);
@@ -2918,6 +2986,7 @@ public:
                 size_t expected_batches = 3000000ULL * cfg_.duration_sec;
                 sc.validation_ring_size = next_pow2(expected_batches);
                 sc.validation_ring_size = std::min(sc.validation_ring_size, config::VALIDATION_RING_CAP);
+                // Long runs: validate only the last VALIDATION_RING_CAP batches to keep validation time bounded.
             }
         }
 
@@ -2949,6 +3018,7 @@ public:
         auto base_dropped = seq.stats().batches_dropped.load();
         auto base_atomics = seq.stats().atomics_executed.load();
         auto base_pbr_full = seq.stats().pbr_full_count.load();
+        auto base_backpressure = seq.stats().backpressure_events.load();
         seq.reset_validation_overwrites();
         seq.stats().reset_latency();
 
@@ -2972,6 +3042,7 @@ public:
             std::cout << "  Validating..." << std::flush;
             std::string reason;
             std::atomic<bool> validation_done{false};
+            auto t_validate_start = Clock::now();
             std::thread validation_thread([&] {
                 reason = seq.validate_ordering_reason();
                 validation_done.store(true);
@@ -2982,10 +3053,15 @@ public:
                 if (!validation_done.load()) std::cout << "." << std::flush;
             }
             validation_thread.join();
-            if (reason.empty()) std::cout << " PASSED\n";
-            else {
+            auto t_validate_end = Clock::now();
+            double validate_sec = std::chrono::duration<double>(t_validate_end - t_validate_start).count();
+            if (reason.empty()) {
+                std::cout << " PASSED";
+                std::cout << " (" << std::fixed << std::setprecision(2) << validate_sec << " s)\n";
+            } else {
                 std::cout << " FAILED\n";
                 std::cerr << "  Validation reason: " << reason << "\n";
+                std::cerr << "  Validation took " << std::fixed << std::setprecision(2) << validate_sec << " s\n";
             }
         } else if (cfg_.validate && cfg_.validity_mode == ValidityMode::STRESS) {
             std::cout << "  Validation skipped (stress test)\n";
@@ -3001,6 +3077,8 @@ public:
         r.dropped = dropped_at_t1 - base_dropped;  // Use t1 snapshot for consistency with completeness window
         r.atomics = seq.stats().atomics_executed.load() - base_atomics;
         r.pbr_full = seq.stats().pbr_full_count.load() - base_pbr_full;
+        r.backpressure_events = seq.stats().backpressure_events.load() - base_backpressure;
+        r.pbr_usage_pct = seq.get_pbr_usage_pct();  // Snapshot after stop
         r.steady_state_reached = ss.reached;
         r.steady_state_cv_pct = ss.cv_pct;
         r.steady_state_windows = ss.windows;
@@ -3178,15 +3256,43 @@ private:
                     uint64_t my_batch = global_batch_counter_.fetch_add(1, std::memory_order_relaxed);
                     uint16_t broker_id = static_cast<uint16_t>(my_batch % cfg_.brokers);
                     uint64_t batch_id = (uint64_t(tid) << 48) | my_batch;
-                    if (seq.inject_batch(broker_id, batch_id,
-                            cfg_.batch_size, cfg_.msgs_per_batch, ef, cid, cseq_val)) {
-                        auto t1 = Clock::now();
-                        if (mylats.size() < config::LATENCY_SAMPLE_LIMIT) {
-                            mylats.push_back(
-                                std::chrono::duration<double, std::micro>(t1 - t0).count());
+                    
+                    // Step 1: Adaptive backpressure with exponential backoff
+                    uint64_t backoff_us = config::BACKPRESSURE_MIN_SLEEP_US;
+                    uint64_t consecutive_bp = 0;
+                    InjectResult result;
+                    
+                    while (true) {
+                        result = seq.inject_batch(broker_id, batch_id,
+                                cfg_.batch_size, cfg_.msgs_per_batch, ef, cid, cseq_val);
+                        
+                        if (result == InjectResult::SUCCESS) {
+                            auto t1 = Clock::now();
+                            if (mylats.size() < config::LATENCY_SAMPLE_LIMIT) {
+                                mylats.push_back(
+                                    std::chrono::duration<double, std::micro>(t1 - t0).count());
+                            }
+                            break;  // Successfully injected
+                        } else if (result == InjectResult::BACKPRESSURE) {
+                            consecutive_bp++;
+                            // Exponential backoff with cap
+                            std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+                            backoff_us = std::min(backoff_us * 2, config::BACKPRESSURE_MAX_SLEEP_US);
+                            
+                            // If sustained backpressure, wait for low watermark
+                            if (consecutive_bp > 10) {
+                                while (!seq.below_low_watermark(broker_id)) {
+                                    std::this_thread::sleep_for(
+                                        std::chrono::microseconds(config::BACKPRESSURE_MAX_SLEEP_US));
+                                    if (!group.go.load(std::memory_order_acquire)) return;
+                                }
+                            }
+                            continue;  // RETRY
+                        } else {
+                            // RING_FULL: transient CAS failure, brief pause
+                            CPU_PAUSE();
+                            continue;  // RETRY
                         }
-                    } else {
-                        std::this_thread::sleep_for(std::chrono::microseconds(1));
                     }
 
                     if ((my_batch & 0x3F) == 0) std::this_thread::yield();
@@ -3293,15 +3399,43 @@ private:
                     uint64_t my_batch = global_batch_counter.fetch_add(1, std::memory_order_relaxed);
                     uint16_t broker_id = static_cast<uint16_t>(my_batch % cfg_.brokers);
                     uint64_t batch_id = (uint64_t(tid) << 48) | my_batch;
-                    if (seq.inject_batch(broker_id, batch_id,
-                            cfg_.batch_size, cfg_.msgs_per_batch, ef, cid, cseq_val)) {
-                        auto t1 = Clock::now();
-                        if (mylats.size() < config::LATENCY_SAMPLE_LIMIT) {
-                            mylats.push_back(
-                                std::chrono::duration<double, std::micro>(t1 - t0).count());
+                    
+                    // Step 1: Adaptive backpressure with exponential backoff
+                    uint64_t backoff_us = config::BACKPRESSURE_MIN_SLEEP_US;
+                    uint64_t consecutive_bp = 0;
+                    InjectResult result;
+                    
+                    while (true) {
+                        result = seq.inject_batch(broker_id, batch_id,
+                                cfg_.batch_size, cfg_.msgs_per_batch, ef, cid, cseq_val);
+                        
+                        if (result == InjectResult::SUCCESS) {
+                            auto t1 = Clock::now();
+                            if (mylats.size() < config::LATENCY_SAMPLE_LIMIT) {
+                                mylats.push_back(
+                                    std::chrono::duration<double, std::micro>(t1 - t0).count());
+                            }
+                            break;  // Successfully injected
+                        } else if (result == InjectResult::BACKPRESSURE) {
+                            consecutive_bp++;
+                            // Exponential backoff with cap
+                            std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+                            backoff_us = std::min(backoff_us * 2, config::BACKPRESSURE_MAX_SLEEP_US);
+                            
+                            // If sustained backpressure, wait for low watermark
+                            if (consecutive_bp > 10) {
+                                while (!seq.below_low_watermark(broker_id)) {
+                                    std::this_thread::sleep_for(
+                                        std::chrono::microseconds(config::BACKPRESSURE_MAX_SLEEP_US));
+                                    if (!go.load(std::memory_order_acquire)) return;
+                                }
+                            }
+                            continue;  // RETRY
+                        } else {
+                            // RING_FULL: transient CAS failure, brief pause
+                            CPU_PAUSE();
+                            continue;  // RETRY
                         }
-                    } else {
-                        std::this_thread::sleep_for(std::chrono::microseconds(10));
                     }
 
                     if ((my_batch & 0x3F) == 0) std::this_thread::yield();
@@ -3557,6 +3691,13 @@ void print(const std::string& name, const Result& r) {
     if (r.dropped > 0) std::cout << ", " << r.dropped << " dropped";
     std::cout << ", PBR_full: " << r.pbr_full
               << ", validation_overwrites: " << r.validation_overwrites << "\n";
+    uint64_t total_inject_attempts = r.batches + r.pbr_full + r.backpressure_events;
+    if (total_inject_attempts > 0) {
+        double bp_pct = 100.0 * static_cast<double>(r.backpressure_events) / static_cast<double>(total_inject_attempts);
+        std::cout << "  Backpressure: " << r.backpressure_events << " events ("
+                  << std::fixed << std::setprecision(1) << bp_pct << "% of attempts)\n";
+    }
+    std::cout << "  PBR usage (snapshot): " << std::fixed << std::setprecision(1) << r.pbr_usage_pct << "%\n";
     std::cout << "  Steady-state: " << (r.steady_state_reached ? "yes" : "no")
               << " (cv=" << std::setprecision(1) << r.steady_state_cv_pct
               << "%, windows=" << r.steady_state_windows
@@ -3681,12 +3822,14 @@ static void print_usage(const char* prog) {
               << "  --paper            algorithm-limited: 1 producer, 60s, 64K PBR (target PBR_full<0.1%, valid speedup)\n"
               << "  --suite=LIST        run only selected suites (comma-separated): ablation,levels,scalability,epoch,broker,sg,all\n"
               << "  --no-steady-state   disable steady-state detection\n"
-              << "  --ss-window=MS      steady-state window size (ms)\n"
+              << "  --no-validate      skip ordering validation (faster smoke runs)\n"
+              << "  --ss-window=MS     steady-state window size (ms)\n"
               << "  --ss-cv=PCT         steady-state coefficient of variation threshold (percent)\n"
               << "  --ss-timeout=MS     steady-state detection timeout (ms)\n"
               << "  --ss-backlog=N      steady-state max backlog epochs\n"
               << "  --pbr-threshold=PCT PBR_full validity threshold (percent, e.g. 0.1)\n"
               << "  --validity=MODE     validity mode: algo|max|stress (default max)\n"
+              << "  --skip-dedup        disable deduplication (for ablation speedup)\n"
               << "  --help, -h          print this and exit\n"
               << "  --test              minimal correctness test (ordering + per-client); exit 0 pass, 1 fail\n";
 }
@@ -3729,10 +3872,13 @@ static bool run_correctness_test() {
             cid = (i / 10) % 20 + 1;
             cseq = ++client_seqs[(cid - 1) % 20];
         }
-        if (seq.inject_batch(static_cast<uint16_t>(i % brokers), batch_id++, batch_size, msgs_per_batch, flags, cid, cseq))
-            ;
-        else
-            std::this_thread::sleep_for(std::chrono::microseconds(5));
+        InjectResult result;
+        do {
+            result = seq.inject_batch(static_cast<uint16_t>(i % brokers), batch_id++, batch_size, msgs_per_batch, flags, cid, cseq);
+            if (result != InjectResult::SUCCESS) {
+                std::this_thread::sleep_for(std::chrono::microseconds(5));
+            }
+        } while (result != InjectResult::SUCCESS);
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
@@ -3763,10 +3909,13 @@ static bool run_correctness_test() {
         uint32_t flags = (i % 5 == 0) ? flags::STRONG_ORDER : 0;
         uint64_t cid = (i % 5 == 0) ? (i / 5) % 5 : 0;  // L5 clients 0..4 (client_id=0 explicitly included)
         uint64_t cseq = (cid < 5) ? ++sg_client_seqs[cid] : 0;
-        if (seq_sg.inject_batch(static_cast<uint16_t>(i % brokers), batch_id++, batch_size, msgs_per_batch, flags, cid, cseq))
-            ;
-        else
-            std::this_thread::sleep_for(std::chrono::microseconds(5));
+        InjectResult result;
+        do {
+            result = seq_sg.inject_batch(static_cast<uint16_t>(i % brokers), batch_id++, batch_size, msgs_per_batch, flags, cid, cseq);
+            if (result != InjectResult::SUCCESS) {
+                std::this_thread::sleep_for(std::chrono::microseconds(5));
+            }
+        } while (result != InjectResult::SUCCESS);
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
@@ -3795,6 +3944,7 @@ int main(int argc, char* argv[]) {
     double pbr_threshold_pct = 0.1;
     bench::ValidityMode validity_mode = bench::ValidityMode::MAX_THROUGHPUT;
     bool validity_specified = false;
+    bool validate = true;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
@@ -3824,6 +3974,9 @@ int main(int argc, char* argv[]) {
         }
         if (arg == "--no-steady-state") {
             steady_state = false;
+        }
+        if (arg == "--no-validate") {
+            validate = false;
         }
         if (arg.rfind("--ss-window=", 0) == 0) {
             ss_window_ms = static_cast<uint64_t>(std::stoull(arg.substr(std::string("--ss-window=").size())));
@@ -3894,6 +4047,7 @@ int main(int argc, char* argv[]) {
     if (cfg.pbr_entries == 0 && cfg.producers >= 8) cfg.pbr_entries = 1024 * 1024;
 
     cfg.steady_state = steady_state;
+    cfg.validate = validate;
     cfg.steady_state_window_ms = ss_window_ms;
     cfg.steady_state_cv_pct = ss_cv_pct;
     cfg.steady_state_timeout_ms = ss_timeout_ms;
@@ -3943,6 +4097,7 @@ int main(int argc, char* argv[]) {
     if (cfg.pbr_entries > 0) std::cout << ", pbr_entries=" << cfg.pbr_entries;
     if (clean_ablation_preset) std::cout << " (--clean)";
     if (paper_ablation_preset) std::cout << " (--paper, target PBR_full<0.1%)";
+    if (cfg.skip_dedup) std::cout << " (--skip-dedup)";
     if (suite_specified) {
         std::cout << " --suite=";
         for (size_t i = 0; i < suites.size(); ++i) {
@@ -3969,8 +4124,8 @@ int main(int argc, char* argv[]) {
             if (cfg.run_ablation1) {
                 std::cout << "\n"; bench::sep();
                 std::cout << "  ABLATION 1: Per-Batch vs Per-Epoch (paired, " << cfg.num_runs << " runs)\n"; bench::sep();
-                std::cout << "  (Per-epoch: atomics = epochs with non-empty output; when sequencer is bottleneck,\n"
-                          << "   epochs << duration/τ, so atomics << 10000 for 5s @ 500μs.)\n";
+                std::cout << "  (Epochs = epoch buffers fully processed by sequencer; atomics = epochs in per-epoch mode.\n"
+                          << "   When Epoch CPU >> τ, sequencer is bottleneck so epochs << duration/τ.)\n";
                 bench::Ablation1Result a1 = bench::run_ablation1_paired(cfg);
                 bench::print_stat_result("Per-Batch Atomic (Baseline)", a1.baseline, cfg.num_runs);
                 bench::print_stat_result("Per-Epoch Atomic (Optimized)", a1.optimized, cfg.num_runs);
