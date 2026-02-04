@@ -1,0 +1,25 @@
+
+=================================================================
+  EMBARCADERO SEQUENCER - ABLATION STUDY
+=================================================================
+
+Config: 4 brokers, 1 producers, 60s, 10% L5, 5 runs, std::sort, validate=yes, pbr_entries=65536 (--paper, target PBR_full<0.1%)
+
+=================================================================
+  ABLATION 1: Per-Batch vs Per-Epoch (paired, 5 runs)
+=================================================================
+  (Per-epoch: atomics = epochs with non-empty output; when sequencer is bottleneck,
+   epochs << duration/τ, so atomics << 10000 for 5s @ 500μs.)
+  Warmup... done
+  Running...[PROFILE] merge=61 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=218 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=185 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=186 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=218 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=283 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=281 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=315 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=324 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=314 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=346 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)
+[PROFILE] merge=314 partition=0 l0=0 l5=0 hold=0 μs/epoch (avg over 100 epochs)

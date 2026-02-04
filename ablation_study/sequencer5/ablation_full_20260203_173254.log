@@ -1,0 +1,754 @@
+
+=================================================================
+  EMBARCADERO SEQUENCER - ABLATION STUDY
+=================================================================
+
+Config: 4 brokers, 8 producers, 10s, 10% L5, 5 runs, std::sort, validate=yes
+
+=================================================================
+  ABLATION 1: Per-Batch vs Per-Epoch (paired, 5 runs)
+=================================================================
+  (Per-epoch: atomics = epochs with non-empty output; when sequencer is bottleneck,
+   epochs << duration/τ, so atomics << 10000 for 5s @ 500μs.)
+  Warmup... done
+  Running...[PHASE] merge=497μs l5=36136μs other=636μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=454μs l5=34591μs other=588μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating... PASSED
+  WARNING: PBR_full=821195 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=524μs l5=35048μs other=576μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=466μs l5=34078μs other=549μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=355μs l5=27166μs other=433μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=851133 (4.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=806168 (11.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=533μs l5=36025μs other=582μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=460μs l5=34285μs other=548μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating... PASSED
+  WARNING: PBR_full=839528 (4.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=634μs l5=36813μs other=582μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=523μs l5=34733μs other=546μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=393μs l5=27194μs other=451μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=833092 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=454μs l5=37324μs other=572μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=395μs l5=35539μs other=540μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=302μs l5=27710μs other=420μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=861472 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=561μs l5=39243μs other=638μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=467μs l5=36882μs other=596μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=340μs l5=27780μs other=445μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=880241 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=980592 (10.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=1099513 (40.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=450μs l5=39746μs other=641μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=410μs l5=37846μs other=601μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating... PASSED
+  WARNING: PBR_full=862168 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=444μs l5=39503μs other=635μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=401μs l5=36475μs other=593μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=298μs l5=27472μs other=443μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=898758 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=383μs l5=40141μs other=762μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=401μs l5=42712μs other=714μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating... PASSED
+[PHASE] merge=286μs l5=29989μs other=504μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+  WARNING: PBR_full=864171 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+-----------------------------------------------------------------
+  Per-Batch Atomic (Baseline) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.85 M/s [0.16, 1.91] ±0.74 M/s (40.1% of median)
+  P99 Latency: 1.13 μs [1.12, 1.62]
+  Atomics: 12866752  Epochs: 209  Gaps: 0  PBR_full: 903554
+  Efficiency: 9.0% of theoretical max (21 GB/s)
+-----------------------------------------------------------------
+  Per-Epoch Atomic (Optimized) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.86 M/s [0.84, 1.97] ±0.41 M/s (22.3% of median)
+  P99 Latency: 1.16 μs [1.09, 1.57]
+  Atomics: 190  Epochs: 244  Gaps: 0  PBR_full: 881586
+  Efficiency: 9.1% of theoretical max (21 GB/s)
+
+  >>> SPEEDUP: 1.04× [0.45, 11.74] (±4.24)
+  >>> ATOMIC REDUCTION: 67720×
+
+=================================================================
+  Level 0 (Total Order)
+=================================================================
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=1033051 (69.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=523μs l5=39038μs other=677μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=445μs l5=36252μs other=601μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=329μs l5=27641μs other=467μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=872458 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=823775 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=823775 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=377μs l5=39173μs other=794μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=384μs l5=36954μs other=696μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=284μs l5=27707μs other=513μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=862790 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=940557 (13.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=420μs l5=39597μs other=658μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=370μs l5=36935μs other=581μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=273μs l5=27532μs other=430μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=866157 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+-----------------------------------------------------------------
+  Level 0 (Total Order) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.86 M/s [0.00, 1.88] ±0.79 M/s (42.5% of median)
+  P99 Latency: 1.13 μs [0.00, 1.16]
+  Atomics: 147  Epochs: 201  Gaps: 0  PBR_full: 873147
+  Efficiency: 9.1% of theoretical max (21 GB/s)
+
+=================================================================
+  Mixed 10% L5
+=================================================================
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=935956 (19.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=483μs l5=56053μs other=967μs
+[L5 BREAKDOWN] sort=0.8% hold=11.9% other=87.3%
+ done
+  Validating...[PHASE] merge=407μs l5=48519μs other=877μs
+[L5 BREAKDOWN] sort=0.8% hold=12.8% other=86.4%
+ FAILED
+  WARNING: PBR_full=876499 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=484μs l5=50786μs other=830μs
+[L5 BREAKDOWN] sort=0.8% hold=11.8% other=87.4%
+ done
+  Validating...[PHASE] merge=454μs l5=47387μs other=812μs
+[L5 BREAKDOWN] sort=0.8% hold=12.8% other=86.3%
+ FAILED
+  WARNING: PBR_full=890069 (4.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=530μs l5=52926μs other=826μs
+[L5 BREAKDOWN] sort=0.8% hold=11.7% other=87.5%
+ done
+  Validating...[PHASE] merge=461μs l5=47485μs other=779μs
+[L5 BREAKDOWN] sort=0.8% hold=12.8% other=86.4%
+ FAILED
+  WARNING: PBR_full=877859 (4.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=533μs l5=54643μs other=825μs
+[L5 BREAKDOWN] sort=0.8% hold=11.7% other=87.4%
+ done
+  Validating...[PHASE] merge=459μs l5=48299μs other=772μs
+[L5 BREAKDOWN] sort=0.8% hold=12.9% other=86.3%
+ FAILED
+  WARNING: PBR_full=858394 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=513μs l5=55055μs other=828μs
+[L5 BREAKDOWN] sort=0.8% hold=12.2% other=86.9%
+ done
+  Validating...[PHASE] merge=423μs l5=48377μs other=806μs
+[L5 BREAKDOWN] sort=0.8% hold=13.2% other=86.0%
+ FAILED
+  WARNING: PBR_full=848424 (4.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+-----------------------------------------------------------------
+  Mixed 10% L5 (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.84 M/s [1.80, 1.87] ±0.03 M/s (1.6% of median)
+  P99 Latency: 1.16 μs [1.10, 1.35]
+  Atomics: 182  Epochs: 257  Gaps: 1062861  PBR_full: 870249
+  Efficiency: 9.0% of theoretical max (21 GB/s)
+
+=================================================================
+  Stress Test (100% L5)
+=================================================================
+  Warmup... done
+  Running...[PHASE] merge=500μs l5=88978μs other=1051μs
+[L5 BREAKDOWN] sort=4.8% hold=18.8% other=76.3%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=954799 (8.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=516μs l5=88076μs other=739μs
+[L5 BREAKDOWN] sort=4.7% hold=22.8% other=72.5%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=950460 (8.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=616μs l5=92382μs other=893μs
+[L5 BREAKDOWN] sort=5.0% hold=18.2% other=76.8%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=940100 (8.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=515μs l5=80669μs other=839μs
+[L5 BREAKDOWN] sort=5.4% hold=21.1% other=73.5%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=923777 (7.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=545μs l5=87425μs other=851μs
+[L5 BREAKDOWN] sort=4.8% hold=17.6% other=77.7%
+ done
+  Validating...[PHASE] merge=292μs l5=48019μs other=502μs
+[L5 BREAKDOWN] sort=4.7% hold=18.0% other=77.3%
+ FAILED
+  WARNING: PBR_full=954248 (9.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=438μs l5=88230μs other=869μs
+[L5 BREAKDOWN] sort=4.7% hold=19.4% other=75.9%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=939163 (8.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+-----------------------------------------------------------------
+  Stress Test (100% L5) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 0.98 M/s [0.91, 1.17] ±0.09 M/s (8.7% of median)
+  P99 Latency: 1.18 μs [1.17, 1.20]
+  Atomics: 104  Epochs: 133  Gaps: 10493581  Dropped: 7484580  PBR_full: 941549
+  Efficiency: 4.8% of theoretical max (21 GB/s)
+
+=================================================================
+  SCALABILITY: Threads (median of 5 runs)
+=================================================================
+ Threads     Batches/s  [min, max]      MB/s   P99 μs
+-----------------------------------------------------------------
+  Warmup... done
+  Running...[PHASE] merge=467μs l5=32016μs other=451μs
+[L5 BREAKDOWN] sort=0.9% hold=7.3% other=91.8%
+ done
+  Validating...[PHASE] merge=340μs l5=20873μs other=323μs
+[L5 BREAKDOWN] sort=0.9% hold=8.0% other=91.1%
+ FAILED
+  Warmup... done
+  Running...[PHASE] merge=388μs l5=30646μs other=1077μs
+[L5 BREAKDOWN] sort=0.9% hold=6.6% other=92.5%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running...[PHASE] merge=345μs l5=32068μs other=462μs
+[L5 BREAKDOWN] sort=0.9% hold=8.8% other=90.3%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running...[PHASE] merge=305μs l5=32286μs other=447μs
+[L5 BREAKDOWN] sort=0.9% hold=7.7% other=91.4%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=44528 (2.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+       1       1673969 [416269, 1692781]   1714.14 MB/s 0.6 μs
+  Warmup... done
+  Running...[PHASE] merge=408μs l5=42018μs other=635μs
+[L5 BREAKDOWN] sort=0.8% hold=11.1% other=88.1%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running...[PHASE] merge=437μs l5=42453μs other=626μs
+[L5 BREAKDOWN] sort=0.8% hold=10.9% other=88.2%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=90975 (1.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=87649 (1.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=105944 (40.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=639μs l5=40430μs other=980μs
+[L5 BREAKDOWN] sort=0.8% hold=10.9% other=88.3%
+ done
+  Validating... FAILED
+       2       1630785 [31202, 1824855]   1669.92 MB/s 0.6 μs
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=196258 (6.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=476μs l5=45121μs other=726μs
+[L5 BREAKDOWN] sort=0.7% hold=12.3% other=87.0%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=189825 (2.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=204081 (2.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=594μs l5=45389μs other=751μs
+[L5 BREAKDOWN] sort=0.8% hold=11.5% other=87.7%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=196609 (2.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=580μs l5=45119μs other=879μs
+[L5 BREAKDOWN] sort=0.7% hold=12.0% other=87.3%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=198993 (2.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=442μs l5=47291μs other=725μs
+[L5 BREAKDOWN] sort=0.7% hold=11.9% other=87.4%
+ FAILED
+  WARNING: PBR_full=196496 (2.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       4       1821320 [1766837, 1872655]   1865.03 MB/s 0.7 μs
+  Warmup... done
+  Running...[PHASE] merge=634μs l5=45854μs other=742μs
+[L5 BREAKDOWN] sort=0.8% hold=11.7% other=87.4%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=425948 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=444μs l5=48023μs other=706μs
+[L5 BREAKDOWN] sort=0.8% hold=11.7% other=87.4%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=415120 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=420μs l5=45513μs other=858μs
+[L5 BREAKDOWN] sort=0.8% hold=12.0% other=87.1%
+ FAILED
+  WARNING: PBR_full=429314 (4.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=529μs l5=46436μs other=703μs
+[L5 BREAKDOWN] sort=0.8% hold=11.8% other=87.4%
+ FAILED
+  WARNING: PBR_full=427359 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=414μs l5=45350μs other=721μs
+[L5 BREAKDOWN] sort=0.8% hold=12.3% other=86.9%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=433744 (4.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=939μs l5=47677μs other=762μs
+[L5 BREAKDOWN] sort=0.7% hold=12.1% other=87.1%
+ FAILED
+  WARNING: PBR_full=437676 (5.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       8       1766651 [1587611, 1862593]   1809.05 MB/s 1.2 μs
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=859975 (24.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=908239 (8.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=903943 (8.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=898651 (8.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=914150 (8.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=958μs l5=49261μs other=1285μs
+[L5 BREAKDOWN] sort=0.8% hold=9.5% other=89.6%
+ FAILED
+  WARNING: PBR_full=943672 (9.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+      16       1870255 [1769730, 1963725]   1915.14 MB/s 2.1 μs
+
+=================================================================
+  EPOCH IMPACT (Seq = CPU time to process one epoch)
+=================================================================
+Epoch(μs)     Batches/s Epoch CPU (μs)
+-----------------------------------------------------------------
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=400μs l5=48521μs other=817μs
+[L5 BREAKDOWN] sort=0.8% hold=13.9% other=85.3%
+ FAILED
+  WARNING: PBR_full=422856 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       100       1794010         31283.9
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=407μs l5=45760μs other=867μs
+[L5 BREAKDOWN] sort=0.8% hold=12.3% other=86.9%
+ FAILED
+  WARNING: PBR_full=443488 (4.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       250       1732060         28857.0
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=400602 (6.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       500       1088550         54277.0
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=437570 (4.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+      1000       1750582         54711.8
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=397μs l5=48042μs other=831μs
+[L5 BREAKDOWN] sort=0.8% hold=12.0% other=87.2%
+ FAILED
+  WARNING: PBR_full=439762 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+      2000       1846696         30989.7
+
+=================================================================
+  BROKER SCALABILITY
+=================================================================
+   Brokers     Batches/s      MB/s
+-----------------------------------------------------------------
+  Warmup... done
+  Running...[PHASE] merge=87μs l5=8188μs other=160μs
+[L5 BREAKDOWN] sort=0.9% hold=2.5% other=96.6%
+[PHASE] merge=85μs l5=9604μs other=161μs
+[L5 BREAKDOWN] sort=0.8% hold=7.6% other=91.5%
+[PHASE] merge=90μs l5=10949μs other=179μs
+[L5 BREAKDOWN] sort=0.8% hold=9.8% other=89.4%
+ done
+  Validating...[PHASE] merge=77μs l5=9587μs other=156μs
+[L5 BREAKDOWN] sort=0.8% hold=10.4% other=88.8%
+ FAILED
+  WARNING: PBR_full=335167 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+         1       1404215   1437.92
+  Warmup... done
+  Running...[PHASE] merge=225μs l5=20562μs other=280μs
+[L5 BREAKDOWN] sort=0.8% hold=7.7% other=91.5%
+ done
+  Validating...[PHASE] merge=343μs l5=21683μs other=339μs
+[L5 BREAKDOWN] sort=0.7% hold=11.3% other=88.0%
+ FAILED
+  WARNING: PBR_full=371651 (4.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+         2       1458800   1493.81
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=421782 (4.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+         4       1633268   1672.47
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=410300 (57.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+         8         61004     62.47
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=440173 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+        16       1848971   1893.35
+
+=================================================================
+  ABLATION: Single-Thread vs Scatter-Gather
+=================================================================
+  Shards    Throughput   Speedup Efficiency
+-----------------------------------------------------------------
+  Warmup... done
+  Running...[PHASE] merge=589μs l5=51793μs other=804μs
+[L5 BREAKDOWN] sort=0.8% hold=11.6% other=87.6%
+ done
+  Validating...[PHASE] merge=487μs l5=47239μs other=800μs
+[L5 BREAKDOWN] sort=0.8% hold=12.6% other=86.6%
+ FAILED
+  WARNING: PBR_full=824610 (4.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       1       1828820    1.00×         8.9%
+  Warmup...[SG_WRITER] epochs=100 writer_phase_total_us=17414 avg_us_per_epoch=174
+[SG_WRITER] epochs=200 writer_phase_total_us=17444 avg_us_per_epoch=87
+[SG_WRITER] epochs=300 writer_phase_total_us=17478 avg_us_per_epoch=58
+[SG_WRITER] epochs=400 writer_phase_total_us=17511 avg_us_per_epoch=43
+[SG_WRITER] epochs=500 writer_phase_total_us=17544 avg_us_per_epoch=35
+[SG_WRITER] epochs=600 writer_phase_total_us=17578 avg_us_per_epoch=29
+[SG_WRITER] epochs=700 writer_phase_total_us=17611 avg_us_per_epoch=25
+[SG_WRITER] epochs=800 writer_phase_total_us=17644 avg_us_per_epoch=22
+[SG_WRITER] epochs=900 writer_phase_total_us=17677 avg_us_per_epoch=19
+[SG_WRITER] epochs=1000 writer_phase_total_us=17710 avg_us_per_epoch=17
+[SG_WRITER] epochs=1100 writer_phase_total_us=17744 avg_us_per_epoch=16
+[SG_WRITER] epochs=1200 writer_phase_total_us=17777 avg_us_per_epoch=14
+[SG_WRITER] epochs=1300 writer_phase_total_us=17810 avg_us_per_epoch=13
+[SG_WRITER] epochs=1400 writer_phase_total_us=17844 avg_us_per_epoch=12
+[SG_WRITER] epochs=1500 writer_phase_total_us=17877 avg_us_per_epoch=11
+[SG_WRITER] epochs=1600 writer_phase_total_us=17911 avg_us_per_epoch=11
+[SG_WRITER] epochs=1700 writer_phase_total_us=17944 avg_us_per_epoch=10
+[SG_WRITER] epochs=1800 writer_phase_total_us=17977 avg_us_per_epoch=9
+ done
+  Running...[SG_WRITER] epochs=1900 writer_phase_total_us=5 avg_us_per_epoch=0
+[SG_WRITER] epochs=2000 writer_phase_total_us=37 avg_us_per_epoch=0
+[SG_WRITER] epochs=2100 writer_phase_total_us=70 avg_us_per_epoch=0
+[SG_WRITER] epochs=2200 writer_phase_total_us=104 avg_us_per_epoch=0
+[SG_WRITER] epochs=2300 writer_phase_total_us=137 avg_us_per_epoch=0
+[SG_WRITER] epochs=2400 writer_phase_total_us=170 avg_us_per_epoch=0
+[SG_WRITER] epochs=2500 writer_phase_total_us=204 avg_us_per_epoch=0
+[SG_WRITER] epochs=2600 writer_phase_total_us=238 avg_us_per_epoch=0
+[SG_WRITER] epochs=2700 writer_phase_total_us=272 avg_us_per_epoch=0
+[SG_WRITER] epochs=2800 writer_phase_total_us=305 avg_us_per_epoch=0
+[SG_WRITER] epochs=2900 writer_phase_total_us=338 avg_us_per_epoch=0
+[SG_WRITER] epochs=3000 writer_phase_total_us=372 avg_us_per_epoch=0
+[SG_WRITER] epochs=3100 writer_phase_total_us=405 avg_us_per_epoch=0
+[SG_WRITER] epochs=3200 writer_phase_total_us=439 avg_us_per_epoch=0
+[SG_WRITER] epochs=3300 writer_phase_total_us=473 avg_us_per_epoch=0
+[SG_WRITER] epochs=3400 writer_phase_total_us=506 avg_us_per_epoch=0
+[SG_WRITER] epochs=3500 writer_phase_total_us=539 avg_us_per_epoch=0
+[SG_WRITER] epochs=3600 writer_phase_total_us=573 avg_us_per_epoch=0
+[SG_WRITER] epochs=3700 writer_phase_total_us=606 avg_us_per_epoch=0
+[SG_WRITER] epochs=3800 writer_phase_total_us=640 avg_us_per_epoch=0
+[SG_WRITER] epochs=3900 writer_phase_total_us=673 avg_us_per_epoch=0
+[SG_WRITER] epochs=4000 writer_phase_total_us=707 avg_us_per_epoch=0
+[SG_WRITER] epochs=4100 writer_phase_total_us=740 avg_us_per_epoch=0
+[SG_WRITER] epochs=4200 writer_phase_total_us=774 avg_us_per_epoch=0
+[SG_WRITER] epochs=4300 writer_phase_total_us=807 avg_us_per_epoch=0
+[SG_WRITER] epochs=4400 writer_phase_total_us=841 avg_us_per_epoch=0
+[SG_WRITER] epochs=4500 writer_phase_total_us=874 avg_us_per_epoch=0
+[SG_WRITER] epochs=4600 writer_phase_total_us=908 avg_us_per_epoch=0
+[SG_WRITER] epochs=4700 writer_phase_total_us=941 avg_us_per_epoch=0
+[SG_WRITER] epochs=4800 writer_phase_total_us=975 avg_us_per_epoch=0
+[SG_WRITER] epochs=4900 writer_phase_total_us=1009 avg_us_per_epoch=0
+[SG_WRITER] epochs=5000 writer_phase_total_us=1042 avg_us_per_epoch=0
+[SG_WRITER] epochs=5100 writer_phase_total_us=1076 avg_us_per_epoch=0
+[SG_WRITER] epochs=5200 writer_phase_total_us=1110 avg_us_per_epoch=0
+[SG_WRITER] epochs=5300 writer_phase_total_us=1143 avg_us_per_epoch=0
+[SG_WRITER] epochs=5400 writer_phase_total_us=1176 avg_us_per_epoch=0
+[SG_WRITER] epochs=5500 writer_phase_total_us=1210 avg_us_per_epoch=0
+[SG_WRITER] epochs=5600 writer_phase_total_us=1243 avg_us_per_epoch=0
+[SG_WRITER] epochs=5700 writer_phase_total_us=1277 avg_us_per_epoch=0
+[SG_WRITER] epochs=5800 writer_phase_total_us=1310 avg_us_per_epoch=0
+[SG_WRITER] epochs=5900 writer_phase_total_us=1343 avg_us_per_epoch=0
+[SG_WRITER] epochs=6000 writer_phase_total_us=1376 avg_us_per_epoch=0
+[SG_WRITER] epochs=6100 writer_phase_total_us=1410 avg_us_per_epoch=0
+[SG_WRITER] epochs=6200 writer_phase_total_us=1443 avg_us_per_epoch=0
+[SG_WRITER] epochs=6300 writer_phase_total_us=1476 avg_us_per_epoch=0
+[SG_WRITER] epochs=6400 writer_phase_total_us=1510 avg_us_per_epoch=0
+[SG_WRITER] epochs=6500 writer_phase_total_us=1543 avg_us_per_epoch=0
+[SG_WRITER] epochs=6600 writer_phase_total_us=1576 avg_us_per_epoch=0
+[SG_WRITER] epochs=6700 writer_phase_total_us=1609 avg_us_per_epoch=0
+[SG_WRITER] epochs=6800 writer_phase_total_us=1643 avg_us_per_epoch=0
+[SG_WRITER] epochs=6900 writer_phase_total_us=1676 avg_us_per_epoch=0
+[SG_WRITER] epochs=7000 writer_phase_total_us=1710 avg_us_per_epoch=0
+[SG_WRITER] epochs=7100 writer_phase_total_us=1743 avg_us_per_epoch=0
+[SG_WRITER] epochs=7200 writer_phase_total_us=1777 avg_us_per_epoch=0
+[SG_WRITER] epochs=7300 writer_phase_total_us=1811 avg_us_per_epoch=0
+[SG_WRITER] epochs=7400 writer_phase_total_us=1844 avg_us_per_epoch=0
+[SG_WRITER] epochs=7500 writer_phase_total_us=1878 avg_us_per_epoch=0
+[SG_WRITER] epochs=7600 writer_phase_total_us=1911 avg_us_per_epoch=0
+[SG_WRITER] epochs=7700 writer_phase_total_us=1945 avg_us_per_epoch=0
+[SG_WRITER] epochs=7800 writer_phase_total_us=1978 avg_us_per_epoch=0
+[SG_WRITER] epochs=7900 writer_phase_total_us=2011 avg_us_per_epoch=0
+[SG_WRITER] epochs=8000 writer_phase_total_us=2045 avg_us_per_epoch=0
+[SG_WRITER] epochs=8100 writer_phase_total_us=2079 avg_us_per_epoch=0
+[SG_WRITER] epochs=8200 writer_phase_total_us=2112 avg_us_per_epoch=0
+[SG_WRITER] epochs=8300 writer_phase_total_us=2145 avg_us_per_epoch=0
+[SG_WRITER] epochs=8400 writer_phase_total_us=2179 avg_us_per_epoch=0
+[SG_WRITER] epochs=8500 writer_phase_total_us=2213 avg_us_per_epoch=0
+[SG_WRITER] epochs=8600 writer_phase_total_us=2247 avg_us_per_epoch=0
+[SG_WRITER] epochs=8700 writer_phase_total_us=2281 avg_us_per_epoch=0
+[SG_WRITER] epochs=8800 writer_phase_total_us=2314 avg_us_per_epoch=0
+[SG_WRITER] epochs=8900 writer_phase_total_us=2347 avg_us_per_epoch=0
+[SG_WRITER] epochs=9000 writer_phase_total_us=2380 avg_us_per_epoch=0
+[SG_WRITER] epochs=9100 writer_phase_total_us=2414 avg_us_per_epoch=0
+[SG_WRITER] epochs=9200 writer_phase_total_us=2447 avg_us_per_epoch=0
+[SG_WRITER] epochs=9300 writer_phase_total_us=2481 avg_us_per_epoch=0
+[SG_WRITER] epochs=9400 writer_phase_total_us=2514 avg_us_per_epoch=0
+[SG_WRITER] epochs=9500 writer_phase_total_us=2548 avg_us_per_epoch=0
+[SG_WRITER] epochs=9600 writer_phase_total_us=2582 avg_us_per_epoch=0
+[SG_WRITER] epochs=9700 writer_phase_total_us=2615 avg_us_per_epoch=0
+[SG_WRITER] epochs=9800 writer_phase_total_us=2649 avg_us_per_epoch=0
+[SG_WRITER] epochs=9900 writer_phase_total_us=2682 avg_us_per_epoch=0
+[SG_WRITER] epochs=10000 writer_phase_total_us=2716 avg_us_per_epoch=0
+[SG_WRITER] epochs=10100 writer_phase_total_us=2749 avg_us_per_epoch=0
+[SG_WRITER] epochs=10200 writer_phase_total_us=2782 avg_us_per_epoch=0
+[SG_WRITER] epochs=10300 writer_phase_total_us=2816 avg_us_per_epoch=0
+[SG_WRITER] epochs=10400 writer_phase_total_us=2850 avg_us_per_epoch=0
+[SG_WRITER] epochs=10500 writer_phase_total_us=2883 avg_us_per_epoch=0
+[SG_WRITER] epochs=10600 writer_phase_total_us=2917 avg_us_per_epoch=0
+[SG_WRITER] epochs=10700 writer_phase_total_us=2951 avg_us_per_epoch=0
+[SG_WRITER] epochs=10800 writer_phase_total_us=2985 avg_us_per_epoch=0
+[SG_WRITER] epochs=10900 writer_phase_total_us=3018 avg_us_per_epoch=0
+[SG_WRITER] epochs=11000 writer_phase_total_us=3052 avg_us_per_epoch=0
+[SG_WRITER] epochs=11100 writer_phase_total_us=3086 avg_us_per_epoch=0
+[SG_WRITER] epochs=11200 writer_phase_total_us=3119 avg_us_per_epoch=0
+[SG_WRITER] epochs=11300 writer_phase_total_us=3153 avg_us_per_epoch=0
+[SG_WRITER] epochs=11400 writer_phase_total_us=3187 avg_us_per_epoch=0
+[SG_WRITER] epochs=11500 writer_phase_total_us=3220 avg_us_per_epoch=0
+[SG_WRITER] epochs=11600 writer_phase_total_us=3254 avg_us_per_epoch=0
+[SG_WRITER] epochs=11700 writer_phase_total_us=3287 avg_us_per_epoch=0
+[SG_WRITER] epochs=11800 writer_phase_total_us=3321 avg_us_per_epoch=0
+[SG_WRITER] epochs=11900 writer_phase_total_us=3355 avg_us_per_epoch=0
+[SG_WRITER] epochs=12000 writer_phase_total_us=3389 avg_us_per_epoch=0
+[SG_WRITER] epochs=12100 writer_phase_total_us=3422 avg_us_per_epoch=0
+[SG_WRITER] epochs=12200 writer_phase_total_us=3456 avg_us_per_epoch=0
+[SG_WRITER] epochs=12300 writer_phase_total_us=3490 avg_us_per_epoch=0
+[SG_WRITER] epochs=12400 writer_phase_total_us=3524 avg_us_per_epoch=0
+[SG_WRITER] epochs=12500 writer_phase_total_us=3557 avg_us_per_epoch=0
+[SG_WRITER] epochs=12600 writer_phase_total_us=3590 avg_us_per_epoch=0
+[SG_WRITER] epochs=12700 writer_phase_total_us=3623 avg_us_per_epoch=0
+[SG_WRITER] epochs=12800 writer_phase_total_us=3656 avg_us_per_epoch=0
+[SG_WRITER] epochs=12900 writer_phase_total_us=3691 avg_us_per_epoch=0
+[SG_WRITER] epochs=13000 writer_phase_total_us=3724 avg_us_per_epoch=0
+[SG_WRITER] epochs=13100 writer_phase_total_us=3757 avg_us_per_epoch=0
+[SG_WRITER] epochs=13200 writer_phase_total_us=3791 avg_us_per_epoch=0
+[SG_WRITER] epochs=13300 writer_phase_total_us=3824 avg_us_per_epoch=0
+[SG_WRITER] epochs=13400 writer_phase_total_us=3858 avg_us_per_epoch=0
+[SG_WRITER] epochs=13500 writer_phase_total_us=3891 avg_us_per_epoch=0
+[SG_WRITER] epochs=13600 writer_phase_total_us=3923 avg_us_per_epoch=0
+[SG_WRITER] epochs=13700 writer_phase_total_us=3953 avg_us_per_epoch=0
+[SG_WRITER] epochs=13800 writer_phase_total_us=3983 avg_us_per_epoch=0
+[SG_WRITER] epochs=13900 writer_phase_total_us=4014 avg_us_per_epoch=0
+[SG_WRITER] epochs=14000 writer_phase_total_us=4044 avg_us_per_epoch=0
+[SG_WRITER] epochs=14100 writer_phase_total_us=4074 avg_us_per_epoch=0
+[SG_WRITER] epochs=14200 writer_phase_total_us=4105 avg_us_per_epoch=0
+[SG_WRITER] epochs=14300 writer_phase_total_us=4135 avg_us_per_epoch=0
+[SG_WRITER] epochs=14400 writer_phase_total_us=4165 avg_us_per_epoch=0
+[SG_WRITER] epochs=14500 writer_phase_total_us=4196 avg_us_per_epoch=0
+[SG_WRITER] epochs=14600 writer_phase_total_us=4225 avg_us_per_epoch=0
+[SG_WRITER] epochs=14700 writer_phase_total_us=4255 avg_us_per_epoch=0
+[SG_WRITER] epochs=14800 writer_phase_total_us=4285 avg_us_per_epoch=0
+[SG_WRITER] epochs=14900 writer_phase_total_us=4315 avg_us_per_epoch=0
+[SG_WRITER] epochs=15000 writer_phase_total_us=4345 avg_us_per_epoch=0
+[SG_WRITER] epochs=15100 writer_phase_total_us=4375 avg_us_per_epoch=0
+[SG_WRITER] epochs=15200 writer_phase_total_us=4405 avg_us_per_epoch=0
+[SG_WRITER] epochs=15300 writer_phase_total_us=4435 avg_us_per_epoch=0
+[SG_WRITER] epochs=15400 writer_phase_total_us=4466 avg_us_per_epoch=0
+[SG_WRITER] epochs=15500 writer_phase_total_us=4496 avg_us_per_epoch=0
+[SG_WRITER] epochs=15600 writer_phase_total_us=4526 avg_us_per_epoch=0
+[SG_WRITER] epochs=15700 writer_phase_total_us=4556 avg_us_per_epoch=0
+[SG_WRITER] epochs=15800 writer_phase_total_us=4585 avg_us_per_epoch=0
+[SG_WRITER] epochs=15900 writer_phase_total_us=4615 avg_us_per_epoch=0
+[SG_WRITER] epochs=16000 writer_phase_total_us=4645 avg_us_per_epoch=0
+[SG_WRITER] epochs=16100 writer_phase_total_us=4675 avg_us_per_epoch=0
+[SG_WRITER] epochs=16200 writer_phase_total_us=4705 avg_us_per_epoch=0
+[SG_WRITER] epochs=16300 writer_phase_total_us=4736 avg_us_per_epoch=0
+[SG_WRITER] epochs=16400 writer_phase_total_us=4766 avg_us_per_epoch=0
+[SG_WRITER] epochs=16500 writer_phase_total_us=4795 avg_us_per_epoch=0
+[SG_WRITER] epochs=16600 writer_phase_total_us=4825 avg_us_per_epoch=0
+[SG_WRITER] epochs=16700 writer_phase_total_us=4854 avg_us_per_epoch=0
+[SG_WRITER] epochs=16800 writer_phase_total_us=4884 avg_us_per_epoch=0
+[SG_WRITER] epochs=16900 writer_phase_total_us=4914 avg_us_per_epoch=0
+[SG_WRITER] epochs=17000 writer_phase_total_us=4944 avg_us_per_epoch=0
+[SG_WRITER] epochs=17100 writer_phase_total_us=4974 avg_us_per_epoch=0
+[SG_WRITER] epochs=17200 writer_phase_total_us=5005 avg_us_per_epoch=0
+[SG_WRITER] epochs=17300 writer_phase_total_us=5034 avg_us_per_epoch=0
+[SG_WRITER] epochs=17400 writer_phase_total_us=5064 avg_us_per_epoch=0
+[SG_WRITER] epochs=17500 writer_phase_total_us=5094 avg_us_per_epoch=0
+[SG_WRITER] epochs=17600 writer_phase_total_us=5124 avg_us_per_epoch=0
+[SG_WRITER] epochs=17700 writer_phase_total_us=5154 avg_us_per_epoch=0
+[SG_WRITER] epochs=17800 writer_phase_total_us=5183 avg_us_per_epoch=0
+[SG_WRITER] epochs=17900 writer_phase_total_us=5213 avg_us_per_epoch=0
+[SG_WRITER] epochs=18000 writer_phase_total_us=5243 avg_us_per_epoch=0
+[SG_WRITER] epochs=18100 writer_phase_total_us=5273 avg_us_per_epoch=0
+[SG_WRITER] epochs=18200 writer_phase_total_us=5303 avg_us_per_epoch=0
+[SG_WRITER] epochs=18300 writer_phase_total_us=5333 avg_us_per_epoch=0
+[SG_WRITER] epochs=18400 writer_phase_total_us=5363 avg_us_per_epoch=0
+[SG_WRITER] epochs=18500 writer_phase_total_us=5393 avg_us_per_epoch=0
+[SG_WRITER] epochs=18600 writer_phase_total_us=5423 avg_us_per_epoch=0
+[SG_WRITER] epochs=18700 writer_phase_total_us=5453 avg_us_per_epoch=0
+[SG_WRITER] epochs=18800 writer_phase_total_us=5483 avg_us_per_epoch=0
+[SG_WRITER] epochs=18900 writer_phase_total_us=5512 avg_us_per_epoch=0
+[SG_WRITER] epochs=19000 writer_phase_total_us=5542 avg_us_per_epoch=0
+[SG_WRITER] epochs=19100 writer_phase_total_us=5572 avg_us_per_epoch=0
+[SG_WRITER] epochs=19200 writer_phase_total_us=5602 avg_us_per_epoch=0
+[SG_WRITER] epochs=19300 writer_phase_total_us=5632 avg_us_per_epoch=0
+[SG_WRITER] epochs=19400 writer_phase_total_us=5662 avg_us_per_epoch=0
+[SG_WRITER] epochs=19500 writer_phase_total_us=5692 avg_us_per_epoch=0
+[SG_WRITER] epochs=19600 writer_phase_total_us=5722 avg_us_per_epoch=0
+[SG_WRITER] epochs=19700 writer_phase_total_us=5752 avg_us_per_epoch=0
+[SG_WRITER] epochs=19800 writer_phase_total_us=5782 avg_us_per_epoch=0
+[SG_WRITER] epochs=19900 writer_phase_total_us=5812 avg_us_per_epoch=0
+[SG_WRITER] epochs=20000 writer_phase_total_us=5842 avg_us_per_epoch=0
+[SG_WRITER] epochs=20100 writer_phase_total_us=5872 avg_us_per_epoch=0
+[SG_WRITER] epochs=20200 writer_phase_total_us=5902 avg_us_per_epoch=0
+[SG_WRITER] epochs=20300 writer_phase_total_us=5932 avg_us_per_epoch=0
+[SG_WRITER] epochs=20400 writer_phase_total_us=5962 avg_us_per_epoch=0
+[SG_WRITER] epochs=20500 writer_phase_total_us=5992 avg_us_per_epoch=0
+[SG_WRITER] epochs=20600 writer_phase_total_us=6022 avg_us_per_epoch=0
+[SG_WRITER] epochs=20700 writer_phase_total_us=6052 avg_us_per_epoch=0
+[SG_WRITER] epochs=20800 writer_phase_total_us=6082 avg_us_per_epoch=0
+[SG_WRITER] epochs=20900 writer_phase_total_us=6112 avg_us_per_epoch=0
+[SG_WRITER] epochs=21000 writer_phase_total_us=6141 avg_us_per_epoch=0
+[SG_WRITER] epochs=21100 writer_phase_total_us=6172 avg_us_per_epoch=0
+[SG_WRITER] epochs=21200 writer_phase_total_us=6202 avg_us_per_epoch=0
+[SG_WRITER] epochs=21300 writer_phase_total_us=6231 avg_us_per_epoch=0
+[SG_WRITER] epochs=21400 writer_phase_total_us=6261 avg_us_per_epoch=0

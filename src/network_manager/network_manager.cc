@@ -892,12 +892,14 @@ void NetworkManager::HandlePublishRequest(
 		auto t1 = std::chrono::high_resolution_clock::now();
 
 		if (batch_header_location == nullptr) {
-			// [[SENIOR_ASSESSMENT_FIX]] Log ERROR + counter for ORDER=5 visibility; batch will not be sequenced
-			static std::atomic<size_t> batch_header_location_null_count{0};
-			size_t cnt = batch_header_location_null_count.fetch_add(1, std::memory_order_relaxed) + 1;
-			LOG(ERROR) << "NetworkManager: GetCXLBuffer returned null batch_header_location (count=" << cnt
-			           << ") topic=" << handshake.topic << " seq_type=" << static_cast<int>(seq_type)
-			           << " batch_seq=" << batch_header.batch_seq << " — batch will not be sequenced or acked";
+			if (seq_type != EMBARCADERO) {
+				// [[SENIOR_ASSESSMENT_FIX]] Log ERROR + counter for ORDER=5 visibility; batch will not be sequenced
+				static std::atomic<size_t> batch_header_location_null_count{0};
+				size_t cnt = batch_header_location_null_count.fetch_add(1, std::memory_order_relaxed) + 1;
+				LOG(ERROR) << "NetworkManager: GetCXLBuffer returned null batch_header_location (count=" << cnt
+				           << ") topic=" << handshake.topic << " seq_type=" << static_cast<int>(seq_type)
+				           << " batch_seq=" << batch_header.batch_seq << " — batch will not be sequenced or acked";
+			}
 		} else {
 			static thread_local size_t getcxl_logs = 0;
 			if (++getcxl_logs % 10000 == 0) {
@@ -974,6 +976,61 @@ void NetworkManager::HandlePublishRequest(
 			        << " total_size=" << batch_header.total_size;
 		}
 
+	// [[DESIGN: PBR reserve after receive]] Reserve PBR slot only after payload is fully received.
+	// This ensures no BLog space is wasted if PBR is full: the payload is buffered in the BLog,
+	// but if PBR backpressure fails post-recv, the connection closes, not wasting network bandwidth.
+	if (seq_type == EMBARCADERO) {
+		static std::atomic<size_t> post_recv_ring_full_count{0};
+		size_t post_recv_attempts = 0;
+		// Retry post-recv PBR reservation with exponential backoff (max 10 seconds)
+		int sleep_ms = 1;  // Start at 1 ms
+		auto post_recv_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (!batch_header_location && !stop_threads_) {
+			if (cxl_manager_->ReservePBRSlotAfterRecv(handshake.topic, batch_header, buf,
+					segment_header, logical_offset, batch_header_location)) {
+				break;  // Success
+			}
+			post_recv_attempts++;
+			size_t total_failures = post_recv_ring_full_count.fetch_add(1, std::memory_order_relaxed) + 1;
+			
+			// Log every 10 failures or first 5
+			if (total_failures <= 5 || total_failures % 10 == 0) {
+				LOG(WARNING) << "NetworkManager (post-recv PBR): Ring backpressure "
+				             << "(client_id=" << handshake.client_id
+				             << " batch_seq=" << batch_header.batch_seq
+				             << " attempt=" << post_recv_attempts
+				             << " total_backpressure=" << total_failures << ")";
+			}
+			
+			// Check deadline; if exceeded, close connection (avoid blocking forever)
+			if (std::chrono::steady_clock::now() >= post_recv_deadline) {
+				LOG(ERROR) << "NetworkManager: PBR backpressure timeout (10s) for batch_seq="
+				           << batch_header.batch_seq << " client_id=" << handshake.client_id
+				           << " — closing connection to prevent indefinite stall";
+				running = false;
+				break;
+			}
+			
+			// Exponential backoff: 1ms, 2ms, 4ms, 8ms, ...max 100ms
+			std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+			sleep_ms = std::min(100, sleep_ms * 2);
+		}
+		
+		if (!batch_header_location) {
+			// Either deadline exceeded or stop_threads_ set
+			if (stop_threads_) {
+				VLOG(1) << "NetworkManager: Shutdown during post-recv PBR reservation for batch_seq="
+				        << batch_header.batch_seq;
+			} else {
+				LOG(ERROR) << "NetworkManager: PBR reservation failed for batch_seq="
+				           << batch_header.batch_seq << " client_id=" << handshake.client_id
+				           << " after " << post_recv_attempts << " attempts";
+			}
+			running = false;
+			break;
+		}
+	}
+
 		// Post-receive parsing only where required
 		MessageHeader* header = nullptr;  // Last message header for callback
 		if (seq_type == KAFKA && batch_header.num_msg > 0) {
@@ -1047,18 +1104,17 @@ void NetworkManager::HandlePublishRequest(
 				);
 			}
 		}
-		// For Sequencer 5, batch is complete once all data is received (to_read == 0)
-		// Now it's safe to mark batch as complete for ALL order levels
-		__atomic_store_n(&batch_header_location->num_msg, batch_header.num_msg, __ATOMIC_RELEASE);
-		__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
-		// [[CRITICAL: Flush batch_complete for non-coherent CXL visibility]]
-		// Sequencer (running on different broker/CPU) must see batch_complete update
-		// Without flush, sequencer will never see batch_complete=1 and batches won't be processed
-		CXL::flush_cacheline(batch_header_location);
-		// Flush the second cache line too to ensure all BatchHeader fields are visible
+		// [[DESIGN: Write PBR entry only after full receive]] Batch is fully in blog; write the
+		// complete BatchHeader to the PBR slot once. No batch_complete flag needed: sequencer
+		// uses num_msg>0 as readiness. Slot was zeroed in GetCXLBuffer so sequencer sees 0 until now.
+		// [[PERF: Batch flush pattern]] Write both cachelines, then single fence for both.
+		memcpy(batch_header_location, &batch_header, sizeof(BatchHeader));
 		const void* batch_header_next_line = reinterpret_cast<const void*>(
 			reinterpret_cast<const uint8_t*>(batch_header_location) + 64);
+		// [[CRITICAL: CXL Non-coherent]] Flush BOTH cachelines (BatchHeader is 128B = 2 cachelines)
+		CXL::flush_cacheline(batch_header_location);
 		CXL::flush_cacheline(batch_header_next_line);
+		// [[PERF: Amortized fence]] Single fence after both flushes (vs fence after each flush)
 		CXL::store_fence();
 		// [[CRITICAL: ORDER=0 + ACK=1]] Blocking path must update written so GetOffsetToAck/AckThread can send ACKs.
 		// Non-blocking path uses CompleteBatchInCXL which calls UpdateWrittenForOrder0; blocking path does not,
@@ -1238,7 +1294,8 @@ void NetworkManager::SubscribeNetworkThread(
 				absl::MutexLock lock(&(*cached_state_ptr)->mu);
 				local_offset = (*cached_state_ptr)->last_offset;
 			}
-			if (order == 5) {
+			// Order 2 (total order) and Order 5 (strong order): use batch metadata so subscriber gets total_order
+			if (order == 5 || order == 2) {
 				size_t batch_total_order = 0;
 				uint32_t num_messages = 0;
 				if (!topic_manager_->GetBatchToExportWithMetadata(
@@ -1257,7 +1314,7 @@ void NetworkManager::SubscribeNetworkThread(
 				}
 				batch_meta.batch_total_order = batch_total_order;
 				batch_meta.num_messages = num_messages;
-				batch_meta.header_version = (order == 5 && HeaderUtils::ShouldUseBlogHeader()) ? 2 : 1;
+				batch_meta.header_version = ((order == 5 || order == 2) && HeaderUtils::ShouldUseBlogHeader()) ? 2 : 1;
 				batch_meta.flags = 0;
 				VLOG(2) << "SubscribeNetworkThread: Sending batch metadata, total_order=" << batch_total_order
 				        << ", num_messages=" << num_messages << ", topic=" << topic;
@@ -1293,7 +1350,7 @@ void NetworkManager::SubscribeNetworkThread(
 				(*cached_state_ptr)->last_addr = local_addr;
 			}
 			// [[BLOG_HEADER: Split large messages with version-aware boundary]]
-			bool using_blog_header = (order == 5 && HeaderUtils::ShouldUseBlogHeader());
+			bool using_blog_header = ((order == 5 || order == 2) && HeaderUtils::ShouldUseBlogHeader());
 			while (messages_size > zero_copy_send_limit) {
 				struct LargeMsgRequest r;
 				r.msg = msg;
@@ -1336,11 +1393,9 @@ void NetworkManager::SubscribeNetworkThread(
 			continue;
 		}
 
-		// For Sequencer 5: Send batch metadata first if order > 0
-		if (order == 5) {
+		// Order 2 and Order 5: Send batch metadata first (total_order, num_messages) for order-aware consume
+		if (order == 5 || order == 2) {
 			// batch_meta is already populated by GetBatchToExportWithMetadata
-			
-			// Send batch metadata
 			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL);
 			if (meta_sent != sizeof(batch_meta)) {
 				LOG(ERROR) << "Failed to send batch metadata: " << strerror(errno);

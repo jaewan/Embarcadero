@@ -1,5 +1,9 @@
 ## Embarcadero Sequencer Ablation Study
 
+**Status (2026-02):** This document contains legacy example numbers and is **not** authoritative for paper figures.  
+Use the latest logs produced by `./run_paper_matrix.sh` and only report runs marked valid by the benchmark (no `[INVALID RUN]` or `[INVALID COMPARISON]`).  
+Validity now depends on `--validity=algo|max|stress`; headline results should come from non-lossy modes.
+
 ### Experimental Setup
 
 **Configuration:** 4 brokers, 8 producer threads, 1KB batches, 10 messages/batch, τ=500μs epochs.  

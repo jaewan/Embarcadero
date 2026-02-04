@@ -1,0 +1,256 @@
+
+=================================================================
+  EMBARCADERO SEQUENCER - ABLATION STUDY
+=================================================================
+
+Config: 4 brokers, 1 producers, 10s, 10% L5, 5 runs, std::sort, validate=yes, steady_state=yes, pbr_threshold=0.1%, validity=max, pbr_entries=4194304 --suite=ablation,levels,scalability
+
+=================================================================
+  ABLATION 1: Per-Batch vs Per-Epoch (paired, 5 runs)
+=================================================================
+  (Per-epoch: atomics = epochs with non-empty output; when sequencer is bottleneck,
+   epochs << duration/τ, so atomics << 10000 for 5s @ 500μs.)
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=124876 (0.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 6254495 (injected=27516638, accounted=21262143)
+  [SANITY WARN] P99 latency 904.6 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.6% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=126577 (0.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 13856774 (injected=34053136, accounted=20196362)
+  [SANITY WARN] P99 latency 8366.2 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.7% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=116471 (0.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 14765984 (injected=36993343, accounted=22227359)
+  [SANITY WARN] P99 latency 8843.2 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.6% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=146894 (2.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=25309292, accounted=8532076)
+  [SANITY WARN] P99 latency 10481.5 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 2.4% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=134020 (0.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 8136075 (injected=29477131, accounted=21341056)
+  [SANITY WARN] P99 latency 2074.7 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.7% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=120096 (0.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 13002970 (injected=34971971, accounted=21969001)
+  [SANITY WARN] P99 latency 8496.0 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.6% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=113029 (0.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 15130009 (injected=40742195, accounted=25612186)
+  [SANITY WARN] P99 latency 8639.2 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.5% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=135721 (1.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=26211665, accounted=9434449)
+  [SANITY WARN] P99 latency 10249.2 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 1.9% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=115583 (0.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=39775879, accounted=22998663)
+  [SANITY WARN] P99 latency 8738.5 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.6% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=122413 (0.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 14747002 (injected=35012915, accounted=20265913)
+  [SANITY WARN] P99 latency 9993.6 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.7% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=119505 (0.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=40925965, accounted=24148749)
+  [SANITY WARN] P99 latency 6593.0 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.6% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=130181 (0.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 12623441 (injected=34025981, accounted=21402540)
+  [SANITY WARN] P99 latency 9156.5 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.7% exceeds threshold 0.1%.
+-----------------------------------------------------------------
+  Per-Batch Atomic (Baseline) (5/5 valid runs)
+-----------------------------------------------------------------
+  Throughput: 2.05 M/s [1.95, 2.22] ±0.09 M/s (cv 4.4%, 95% CI ±0.1 M/s)
+  P99 Latency: 8639209.27 μs [2074707.57, 8843199.58]
+  Atomics: 24238972  Epochs: 7  Gaps: 0  PBR_full: 119721
+  Efficiency: 10.0% of theoretical max (21 GB/s)
+-----------------------------------------------------------------
+  Per-Epoch Atomic (Optimized) (5/5 valid runs)
+-----------------------------------------------------------------
+  Throughput: 1.74 M/s [0.61, 1.84] ±0.57 M/s (cv 32.6%, 95% CI ±0.5 M/s)
+  P99 Latency: 9993627.96 μs [8496036.19, 10481534.83]
+  Atomics: 5  Epochs: 5  Gaps: 0  PBR_full: 131061
+  Efficiency: 8.5% of theoretical max (21 GB/s)
+
+  >>> SPEEDUP: [INVALID COMPARISON] One or both modes were PBR-bound; speedup only computed when PBR saturation < 0.10%.
+  >>> ATOMIC REDUCTION: 4847794×
+
+=================================================================
+  Level 0 (Total Order)
+=================================================================
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=133586 (1.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=31638756, accounted=14861540)
+  [SANITY WARN] P99 latency 10714.7 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 1.1% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=138885 (1.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=29302387, accounted=12525171)
+  [SANITY WARN] P99 latency 10472.0 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 1.5% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=118927 (0.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16022399 (injected=37778412, accounted=21756013)
+  [SANITY WARN] P99 latency 6167.3 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.6% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=124001 (0.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 10781793 (injected=31933107, accounted=21151314)
+  [SANITY WARN] P99 latency 9576.1 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.7% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=137715 (1.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=31711310, accounted=14934094)
+  [SANITY WARN] P99 latency 10856.0 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 1.3% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=123776 (0.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=38217072, accounted=21439856)
+  [SANITY WARN] P99 latency 8745.7 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 0.7% exceeds threshold 0.1%.
+-----------------------------------------------------------------
+  Level 0 (Total Order) (5/5 valid runs)
+-----------------------------------------------------------------
+  Throughput: 1.81 M/s [0.94, 1.83] ±0.40 M/s (cv 22.2%, 95% CI ±0.4 M/s)
+  P99 Latency: 9576126.84 μs [6167294.73, 10856007.98]
+  Atomics: 5  Epochs: 5  Gaps: 0  PBR_full: 128660
+  Efficiency: 8.8% of theoretical max (21 GB/s)
+
+=================================================================
+  Mixed 10% L5
+=================================================================
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=147948 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  [INVALID RUN] Zero throughput in non-stress mode.
+  WARNING: PBR_full=147948 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777229 (injected=19693425, accounted=2916196)
+  [SANITY WARN] P99 latency 17742.7 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 100.0% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=150267 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  [INVALID RUN] Zero throughput in non-stress mode.
+  WARNING: PBR_full=150267 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=19807687, accounted=3030471)
+  [SANITY WARN] P99 latency 13940.3 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 100.0% exceeds threshold 0.1%.
+  [RUN SKIPPED] invalid run (steady-state/saturation/sanity failure)
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=133773 (1.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 15396601 (injected=27771909, accounted=12375308)
+  [SANITY WARN] P99 latency 19091.6 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 1.4% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=134926 (2.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=24460428, accounted=7683212)
+  [SANITY WARN] P99 latency 21162.8 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 2.4% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=1)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=144576 (4.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=22058972, accounted=5281756)
+  [SANITY WARN] P99 latency 19891.4 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 4.0% exceeds threshold 0.1%.
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=127843 (1.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS WARN] large in-flight at t1: 16777216 (injected=27134506, accounted=10357290)
+  [SANITY WARN] P99 latency 20919.0 ms is high; system is backlogged.
+  [SANITY WARN] PBR full 1.5% exceeds threshold 0.1%.
+  [WARN] Valid runs 4/5 (invalid runs excluded from stats)
+-----------------------------------------------------------------
+  Mixed 10% L5 (4/5 valid runs)
+-----------------------------------------------------------------
+  Throughput: 0.68 M/s [0.35, 0.94] ±0.23 M/s (cv 34.2%, 95% CI ±0.2 M/s)
+  P99 Latency: 20405223.13 μs [19091613.99, 21162827.67]
+  Atomics: 4  Epochs: 4  Gaps: 0  PBR_full: 135279
+  Efficiency: 3.3% of theoretical max (21 GB/s)
+
+=================================================================
+  Stress Test (100% L5)
+=================================================================
+  Warmup... done
+  Steady-state... reached (cv=0.0%, backlog_max=0)
+  Running... done

@@ -54,11 +54,16 @@ class CXLManager{
 		bool IsPBRBelowLowWatermark(const char* topic, int low_pct);
 		bool ReservePBRSlotAndWriteEntry(const char* topic, BatchHeader& batch_header, void* log,
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location);
+		bool ReservePBRSlotAfterRecv(const char* topic, BatchHeader& batch_header, void* log,
+				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location);
 		// [[PERF]] Get Topic* once per connection to avoid 3× topics_mutex_ per batch
 		Topic* GetTopicPtr(const char* topic);
 		bool IsPBRAboveHighWatermark(Topic* topic_ptr, int high_pct);
 		bool ReserveBLogSpace(Topic* topic_ptr, size_t size, void*& log, bool epoch_already_checked = false);
 		bool ReservePBRSlotAndWriteEntry(Topic* topic_ptr, BatchHeader& batch_header, void* log,
+				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
+		bool ReservePBRSlotAfterRecv(Topic* topic_ptr, BatchHeader& batch_header, void* log,
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
 		void GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,

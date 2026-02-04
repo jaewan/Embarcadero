@@ -116,10 +116,15 @@ class TopicManager {
 		bool IsPBRBelowLowWatermark(const char* topic, int low_pct);
 		bool ReservePBRSlotAndWriteEntry(const char* topic, BatchHeader& batch_header, void* log,
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location);
+		bool ReservePBRSlotAfterRecv(const char* topic, BatchHeader& batch_header, void* log,
+				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location);
 		// [[PERF]] Topic* overloads to avoid repeated topics_mutex_ lookup (use with cached Topic* from GetTopic)
 		bool IsPBRAboveHighWatermark(Topic* topic_ptr, int high_pct);
 		bool ReserveBLogSpace(Topic* topic_ptr, size_t size, void*& log, bool epoch_already_checked = false);
 		bool ReservePBRSlotAndWriteEntry(Topic* topic_ptr, BatchHeader& batch_header, void* log,
+				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
+		bool ReservePBRSlotAfterRecv(Topic* topic_ptr, BatchHeader& batch_header, void* log,
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
 

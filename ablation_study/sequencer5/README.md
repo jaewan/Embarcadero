@@ -2,6 +2,8 @@
 
 Standalone sequencer implementation and benchmark for OSDI/SOSP/SIGCOMM-level ablation: correctness-first dedup, MPSC ring (multiple producers per broker), Level 5 sliding window, hold-buffer emit, ordering validation, and **per-batch vs per-epoch atomic** comparison. Aligns with **docs/EMBARCADERO_DEFINITIVE_DESIGN.md**.
 
+**Conference-quality gate:** See **OSDI_SOSP_QUALITY_CHECKLIST.md** for how to confirm implementation and ablation results meet OSDI/SOSP standards (correctness, statistics, reproducibility, honest interpretation).
+
 ## Key Operations (from document analysis)
 
 The sequencer supports:
@@ -12,6 +14,12 @@ The sequencer supports:
 4. **Level 0 ordering** — Total order only, no per-client guarantees, maximum throughput.
 5. **Level 5 ordering** — Per-client FIFO ordering with hold buffer and gap handling.
 6. **GOI writing** — Commit sequenced batches to Global Order Index.
+
+### Order 5 semantics and "declared lost"
+
+- **Guarantee:** If client C sends M1 before M2 (by client_seq), then M1.global_seq < M2.global_seq, or M1 is **declared lost**.
+- **Declared lost:** A batch is dropped from the hold buffer after it has waited **HOLD_MAX_WAIT_EPOCHS** (3) without becoming `next_expected`. It is **never** written to the GOI. So "lost" means "never in the log," not "in GOI with a gap."
+- **Client-observable:** At-most-once delivery per client_seq; gaps in client_seq are allowed after the timeout (e.g. seq=1, 3 committed; seq=2 was lost).
 
 ## Data Structures in CXL Memory (document §2.4)
 
@@ -30,7 +38,7 @@ The sequencer supports:
 - **Level 5 sliding window**: Per-client circular window + `window_set` for O(1) duplicate detection; no bitset collision.
 - **Level 5 sort**: O(n) LSD radix sort by `client_id` (8×8-bit passes); insertion sort for small per-client `client_seq` groups. Threshold 256: below that, `std::sort` is used. No external deps (Boost/ska_sort optional elsewhere).
 - **Hold buffer**: Expired batches are **emitted** (appended to output) and client state updated; no silent drop.
-- **Ordering validation**: `validate_ordering()` checks monotonicity and gap-freedom of committed global_seq; run after each test when `validate=true`.
+- **Ordering validation**: `validate_ordering()` checks monotonicity and gap-freedom of committed global_seq, and **per-client order** (for Level 5: within each client_id, global_seq order matches client_seq order); run after each test when `validate=true`.
 - **Dual mode (ablation)**: `PER_BATCH_ATOMIC` (baseline, one fetch_add per batch) vs `PER_EPOCH_ATOMIC` (one fetch_add per epoch). Main reports speedup and atomic reduction.
 - **In-benchmark latency**: `PBREntry::timestamp_ns` set on inject; samples (inject→committed) collected and reported. Not paper e2e (no network/replication).
 - **State machine**: IDLE → COLLECTING → SEALED → SEQUENCED → COMMITTED; PBR heads advanced after sequencing; memory barriers on broker_max_pbr.
@@ -52,6 +60,10 @@ The sequencer supports:
 
 ---
 
+## Phase 2: Performance Fidelity (mandatory before paper numbers)
+
+Before generating ablation/paper numbers, the three performance items in **PHASE2_PERFORMANCE.md** must be in place so results reflect sequencer protocol cost, not allocator/cache artifacts. All three are implemented: padded atomics for shard watermarks, dense client state when `max_clients` is set, and pre-allocation of hot-path vectors.
+
 ## Caveats and methodology (reviewer responses)
 
 | Concern | Response |
@@ -64,23 +76,74 @@ The sequencer supports:
 | **100% L5: 40–78% gaps, 38–57× slower** | With producer affinity, gap rate and throughput reflect **real** per-client ordering cost (hold buffer, reordering). 100% L5 is a stress test; typical workloads use a small L5 fraction. |
 | **Missing: Scalog/Corfu, real CXL, multi-node** | Ablation scope is single-node, in-memory sequencer logic. Baselines and CXL/multi-node belong in the full paper evaluation. |
 
+## Scope and limitations (panel assessment)
+
+- **Recovery:** Recovery (e.g. ClientState rebuild from GOI, gap detection after partial write) is specified in the design/plan but **not evaluated** in this benchmark. The benchmark does not inject crashes or test failover.
+- **CXL:** Memory is allocated via `mmap`/`aligned_alloc` (local DRAM). This measures **sequencer logic and layout**, not actual CXL latency or bandwidth. For paper claims about "CXL performance," a CXL-backed run is required separately.
+- **Valid experiments:** Runs where PBR reserve failures (PBR_full) exceed 1% of attempts may be saturation-bound; the benchmark warns and you should interpret throughput accordingly (e.g. use larger `pbr_entries` or fewer producers).
+
+### Known limitations / failure semantics
+
+| Scenario | Behavior | Note |
+|----------|----------|------|
+| **PBR full** | Batch is dropped; `pbr_full_count` incremented. | Producers outpace sequencer; backpressure is via PBR reserve failure. Use larger `pbr_entries` or fewer producers. |
+| **Writer slow (scatter-gather)** | All shards block each epoch until the writer finishes. | Scatter-gather throughput is upper-bounded by writer throughput (GOI write). |
+| **Hot shard** | One shard gets most traffic if client_id distribution is skewed. | Ablation assumes roughly uniform client_id distribution; skewed workloads may underutilize shards. |
+
+### Supported limits and growth
+
+- **Brokers:** 1..32 (config `MAX_BROKERS`). Do not exceed without changing the code (PBR/collector arrays).
+- **Scatter-gather shards:** 1..32 (`num_shards`; coordinator array size).
+- **client_highest_committed:** Unbounded in this benchmark (no eviction). Production integration would need TTL or eviction (e.g. same policy as client_states) to avoid unbounded memory growth over long runs with many clients.
+
+### Validation and long runs
+
+- `validate_ordering_reason()` runs over up to `MAX_VALIDATION_ENTRIES` (10M) committed batches. For long runs with validation on, this can be memory- and CPU-heavy. A future improvement could cap validation to the last N entries (e.g. 100k) and document that "validation covers the most recent N batches."
+
+### Production integration (observability)
+
+- For production, you would add: per-shard queue depth and processing time (to detect skew), histograms of epoch processing time (tail latency), and a simple health signal (e.g. last epoch completed within 2× epoch_us). The benchmark focuses on correctness and ablation; observability is out of scope here.
+
 ## Build and run
 
 ```bash
 mkdir build && cd build
 cmake ..
 make
-./sequencer5_benchmark [brokers] [producers] [duration_sec] [level5_ratio] [num_runs] [use_radix_sort]
+./sequencer5_benchmark [brokers] [producers] [duration_sec] [level5_ratio] [num_runs] [use_radix_sort] [scatter_gather] [num_shards] [scatter_gather_only] [pbr_entries]
+./sequencer5_benchmark --help   # full usage
+./sequencer5_benchmark --test  # minimal correctness test (ordering + per-client)
+./sequencer5_benchmark --paper # algorithm-limited (1 producer, 60s, 64K PBR)
 ```
 
 - **num_runs** (default 5): Runs per test. If ≥ 2, results report median, [min, max], and ±stddev.
 - **use_radix_sort** (default 0): 0 = std::sort (recommended), 1 = radix sort (A/B test).
+- **scatter_gather** (default 0): 1 = scatter-gather mode.
+- **num_shards** (default 8): Shards when scatter_gather=1 (1..32).
+- **scatter_gather_only** (default 0): 1 = run only scatter-gather scaling test (fast iteration).
+- **validity mode** (default max): `--validity=algo|max|stress`.
 
 **Examples:**
 
 - Quick single run: `./sequencer5_benchmark 4 8 10 0.1 1 0`
 - Publication-ready (5 runs, std::sort): `./sequencer5_benchmark 4 8 10 0.1 5 0`
 - A/B radix vs std::sort: `./sequencer5_benchmark 4 8 10 0.1 5 1`
+- Scatter-gather only (quick): `./sequencer5_benchmark 4 4 3 0.0 2 0 0 8 1`
+- Correctness test: `./sequencer5_benchmark --test`
+
+**Paper-ready runs:** Use only runs where the benchmark does **not** print `[INVALID RUN]` or `[INVALID COMPARISON]`. Target: **PBR Full < 0.1%** and **no drops** for headline suites. Use `--validity=algo` for strict algorithm-comparison (steady-state required); use `--validity=max` for open-loop max-throughput (latency warnings only).
+
+- **`--paper`** — 1 producer, 60 s, 64K PBR (algorithm-limited; target PBR_full < 0.1%):  
+  `./sequencer5_benchmark --paper --validity=algo`
+- **`--clean`** — 2 producers, 4M PBR (sequencer as bottleneck):  
+  `./sequencer5_benchmark --clean --validity=algo`
+- **Explicit (single producer, long run):**  
+  `./sequencer5_benchmark 4 1 60 0.1 5 0 0 8 0 65536`
+- **Scatter-gather (open-loop max throughput):**  
+  `./sequencer5_benchmark 4 2 30 0.1 5 0 1 8 1 4194304 --validity=max`
+
+**Repeatable paper matrix:**  
+`./run_paper_matrix.sh` (writes logs to `ablation_study/sequencer5/logs/`)\n\n**Publication profiles (recommended):**\n- **Profile 1 (algorithm ablation, strict validity):** `./run_profiles.sh` or `PROFILE=algo ./run_profiles.sh`\n- **Profile 2 (max throughput, open-loop):** `PROFILE=max ./run_profiles.sh`\n- **Profile 3 (scatter-gather scaling):** `PROFILE=sg ./run_profiles.sh`\n\nDefaults use larger PBR sizes to avoid saturation; override with `PBR=...`, `RUNS=...`, `DURATION=...`, `PRODUCERS=...`, `SHARDS=...`.
 
 ## Results interpretation (5-run publication test)
 
@@ -116,8 +179,8 @@ Full run: `./sequencer5_benchmark 4 8 10 0.1 5 0`. Example output (median, [min,
 
 ### Level 5 “inversion” (100% L5 vs 10% L5)
 
-- **100% L5** can report similar or slightly higher throughput than **10% L5** because at 100% L5 the hold buffer saturates: many batches are **dropped** (and many **gaps** skipped). Throughput counts only **successfully sequenced** batches; the system is not “faster,” it is **dropping** more traffic.
-- Always read **Gaps** and **Dropped** with L5: high values mean the system is under stress, not that it is handling L5 more efficiently. **10% L5** is the typical workload; **100% L5** is a stress test.
+- **100% L5** is a stress test. If you run with `--validity=stress`, drops may be allowed and throughput can appear higher because traffic is not fully retained. Do not compare stress-mode throughput to headline runs.
+- Always read **Gaps** and **Dropped** with L5 in stress mode; high values mean the system is under overload, not that it is handling L5 more efficiently. **10% L5** is the typical workload.
 
 ### Statistical power
 

@@ -1,0 +1,13 @@
+
+=================================================================
+  EMBARCADERO SEQUENCER - ABLATION STUDY
+=================================================================
+
+Config: 4 brokers, 8 producers, 10s, 10% L5, 5 runs, std::sort, validate=yes, pbr_entries=1048576
+
+=================================================================
+  ABLATION 1: Per-Batch vs Per-Epoch (paired, 5 runs)
+=================================================================
+  (Per-epoch: atomics = epochs with non-empty output; when sequencer is bottleneck,
+   epochs << duration/τ, so atomics << 10000 for 5s @ 500μs.)
+  Warmup...

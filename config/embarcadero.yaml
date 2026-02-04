@@ -41,7 +41,7 @@ embarcadero:
 
   # Network configuration
   network:
-    io_threads: 4                # REDUCED: 512 CPUs available, thread contention not the issue. Testing reduced thread count.
+    io_threads: 6               # ReqReceive threads: must be >= threads_per_broker + sub_connections (3+3=6) so every inbound connection gets a thread; was 4 → 9/12 subscriber timeouts
     disk_io_threads: 2           # REDUCED: Testing if fewer disk threads help. Was 4, now 2.
     sub_connections: 3           # Set to 3 connections per broker as requested
     zero_copy_send_limit: 65536     # PERF TUNED: 64KB threshold - optimal for MSG_ZEROCOPY (Linux kernel sweet spot, works with 2MB batches)

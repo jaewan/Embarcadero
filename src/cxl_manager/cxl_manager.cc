@@ -328,6 +328,12 @@ bool CXLManager::ReservePBRSlotAndWriteEntry(const char* topic, BatchHeader& bat
 			segment_header, logical_offset, batch_header_location);
 }
 
+bool CXLManager::ReservePBRSlotAfterRecv(const char* topic, BatchHeader& batch_header, void* log,
+		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location) {
+	return topic_manager_->ReservePBRSlotAfterRecv(topic, batch_header, log,
+			segment_header, logical_offset, batch_header_location);
+}
+
 Topic* CXLManager::GetTopicPtr(const char* topic) {
 	return topic_manager_ ? topic_manager_->GetTopic(std::string(topic)) : nullptr;
 }
@@ -344,6 +350,13 @@ bool CXLManager::ReservePBRSlotAndWriteEntry(Topic* topic_ptr, BatchHeader& batc
 		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 		bool epoch_already_checked) {
 	return topic_manager_ && topic_manager_->ReservePBRSlotAndWriteEntry(topic_ptr, batch_header, log,
+			segment_header, logical_offset, batch_header_location, epoch_already_checked);
+}
+
+bool CXLManager::ReservePBRSlotAfterRecv(Topic* topic_ptr, BatchHeader& batch_header, void* log,
+		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+		bool epoch_already_checked) {
+	return topic_manager_ && topic_manager_->ReservePBRSlotAfterRecv(topic_ptr, batch_header, log,
 			segment_header, logical_offset, batch_header_location, epoch_already_checked);
 }
 

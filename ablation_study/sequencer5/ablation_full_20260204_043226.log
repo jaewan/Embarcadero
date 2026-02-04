@@ -1,0 +1,94 @@
+
+=================================================================
+  EMBARCADERO SEQUENCER - ABLATION STUDY
+=================================================================
+
+Config: 4 brokers, 8 producers, 10s, 10% L5, 5 runs, std::sort, validate=yes
+
+=================================================================
+  ABLATION 1: Per-Batch vs Per-Epoch (paired, 5 runs)
+=================================================================
+  (Per-epoch: atomics = epochs with non-empty output; when sequencer is bottleneck,
+   epochs << duration/τ, so atomics << 10000 for 5s @ 500μs.)
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=658748 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS FAIL] injected=15419153 but sequenced+dropped=14410139 (diff 1009014, threshold 154191)
+  [SANITY FAIL] P99 latency 5180.2 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1440845.8 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.4% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=794869 (4.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [SANITY FAIL] P99 latency 2714.7 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1591139.2 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.8% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=857009 (5.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS FAIL] injected=13994184 but sequenced+dropped=15772735 (diff -1778551, threshold 139941)
+  [SANITY FAIL] P99 latency 2988.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1577108.8 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.2% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=839681 (5.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [SANITY FAIL] P99 latency 2852.1 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1526833.6 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.2% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=831839 (5.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [SANITY FAIL] P99 latency 4309.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1508221.5 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.2% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=825738 (5.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [SANITY FAIL] P99 latency 5549.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1509412.6 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.2% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=845782 (5.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS FAIL] injected=14215537 but sequenced+dropped=15954907 (diff -1739370, threshold 142155)
+  [SANITY FAIL] P99 latency 5402.9 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1595265.2 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.0% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=675610 (4.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [SANITY FAIL] P99 latency 2880.0 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1502512.7 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.3% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=795197 (5.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [SANITY FAIL] P99 latency 2790.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1402694.5 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.4% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=843770 (5.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [SANITY FAIL] P99 latency 3926.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1378756.3 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.8% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=783424 (5.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [COMPLETENESS FAIL] injected=13797454 but sequenced+dropped=14332426 (diff -534972, threshold 137974)
+  [SANITY FAIL] P99 latency 6425.0 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1433049.6 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.2% indicates saturation.
+  Warmup...

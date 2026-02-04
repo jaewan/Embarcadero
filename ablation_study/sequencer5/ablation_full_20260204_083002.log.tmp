@@ -1,0 +1,704 @@
+
+=================================================================
+  EMBARCADERO SEQUENCER - ABLATION STUDY
+=================================================================
+
+Config: 4 brokers, 8 producers, 10s, 10% L5, 5 runs, std::sort, validate=yes, pbr_entries=4194304
+
+=================================================================
+  ABLATION 1: Per-Batch vs Per-Epoch (paired, 5 runs)
+=================================================================
+  (Per-epoch: atomics = epochs with non-empty output; when sequencer is bottleneck,
+   epochs << duration/τ, so atomics << 10000 for 5s @ 500μs.)
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=243664 (1.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 14383764 (injected=31046018, accounted=16662254)
+  [SANITY FAIL] P99 latency 8140.1 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1664630.6 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 1.4% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=640670 (4.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11604146 (injected=27179368, accounted=15575222)
+  [SANITY FAIL] P99 latency 11004.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1557207.4 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.0% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=744339 (7.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13862271 (injected=22535242, accounted=8672971)
+  [SANITY FAIL] P99 latency 9079.1 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 867201.7 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 7.9% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=664261 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11431022 (injected=26469404, accounted=15038382)
+  [SANITY FAIL] P99 latency 11109.1 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1503623.7 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.2% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=747253 (8.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13596573 (injected=21482531, accounted=7885958)
+  [SANITY FAIL] P99 latency 8487.5 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 788476.9 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 8.7% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=674683 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11557355 (injected=26227514, accounted=14670159)
+  [SANITY FAIL] P99 latency 12657.6 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1466802.4 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.4% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=745372 (9.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13361658 (injected=20737243, accounted=7375585)
+  [SANITY FAIL] P99 latency 8284.9 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 737447.5 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 9.2% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=780958 (9.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11894404 (injected=19470716, accounted=7576312)
+  [SANITY FAIL] P99 latency 10319.8 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 757514.1 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 9.3% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=745264 (7.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 12495395 (injected=22262881, accounted=9767486)
+  [SANITY FAIL] P99 latency 8465.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 975378.8 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 7.1% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=669596 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 12119775 (injected=26288285, accounted=14168510)
+  [SANITY FAIL] P99 latency 12590.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1416634.1 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.5% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=765315 (10.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 14175872 (injected=20761887, accounted=6586015)
+  [SANITY FAIL] P99 latency 8289.5 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 658495.5 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 10.4% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=667781 (5.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13669614 (injected=26176779, accounted=12507165)
+  [SANITY FAIL] P99 latency 12372.8 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1250528.2 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.1% indicates saturation.
+-----------------------------------------------------------------
+  Per-Batch Atomic (Baseline) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 0.79 M/s [0.66, 0.98] ±0.11 M/s (13.8% of median)
+  P99 Latency: 8465305.21 μs [8284863.85, 9079104.70]
+  Atomics: 18591972  Epochs: 5  Gaps: 0  PBR_full: 749508
+  Efficiency: 3.8% of theoretical max (21 GB/s)
+-----------------------------------------------------------------
+  Per-Epoch Atomic (Optimized) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.42 M/s [0.76, 1.50] ±0.27 M/s (19.4% of median)
+  P99 Latency: 12372784.32 μs [10319847.82, 12657638.77]
+  Atomics: 4  Epochs: 5  Gaps: 0  PBR_full: 691455
+  Efficiency: 6.9% of theoretical max (21 GB/s)
+
+  >>> SPEEDUP: [INVALID COMPARISON] One or both modes were PBR-bound; speedup only computed when PBR saturation < 1%.
+  >>> ATOMIC REDUCTION: 4647993×
+
+=================================================================
+  Level 0 (Total Order)
+=================================================================
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=738246 (6.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11817105 (injected=21806690, accounted=9989585)
+  [SANITY FAIL] P99 latency 10739.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 998846.9 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 6.9% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=682642 (5.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13996716 (injected=25004000, accounted=11007284)
+  [SANITY FAIL] P99 latency 11649.0 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1100554.2 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.8% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=662287 (4.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 12034777 (injected=26609464, accounted=14574687)
+  [SANITY FAIL] P99 latency 12107.6 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1457243.8 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.3% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=683927 (5.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13582378 (injected=24993512, accounted=11411134)
+  [SANITY FAIL] P99 latency 16034.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1140985.7 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.7% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=687714 (5.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13067358 (injected=25015279, accounted=11947921)
+  [SANITY FAIL] P99 latency 11709.1 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1194603.4 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.4% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=671803 (5.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13344550 (injected=24326780, accounted=10982230)
+  [SANITY FAIL] P99 latency 11039.5 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1098046.7 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.8% indicates saturation.
+-----------------------------------------------------------------
+  Level 0 (Total Order) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.14 M/s [1.10, 1.46] ±0.13 M/s (11.8% of median)
+  P99 Latency: 11709068.61 μs [11039503.31, 16034404.09]
+  Atomics: 4  Epochs: 5  Gaps: 0  PBR_full: 677674
+  Efficiency: 5.6% of theoretical max (21 GB/s)
+
+=================================================================
+  Mixed 10% L5
+=================================================================
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=793600 (11.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11683835 (injected=17962400, accounted=6278565)
+  [SANITY FAIL] P99 latency 19626.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 627786.4 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 11.2% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=830111 (14.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11978244 (injected=16777216, accounted=4798972)
+  [SANITY FAIL] P99 latency 16189.8 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 479825.6 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 14.7% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=776586 (11.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11770149 (injected=17959128, accounted=6188979)
+  [SANITY FAIL] P99 latency 19663.5 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 618802.8 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 11.1% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=800696 (12.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11593062 (injected=17227933, accounted=5634871)
+  [SANITY FAIL] P99 latency 18586.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 562912.5 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 12.4% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=793162 (23.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 14218534 (injected=16777216, accounted=2558682)
+  [SANITY FAIL] P99 latency 13147.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 255624.5 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 23.7% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=817075 (25.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 14365762 (injected=16777216, accounted=2411454)
+  [SANITY FAIL] P99 latency 13815.5 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 241103.9 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 25.3% indicates saturation.
+-----------------------------------------------------------------
+  Mixed 10% L5 (5 runs)
+-----------------------------------------------------------------
+  Throughput: 0.48 M/s [0.24, 0.62] ±0.16 M/s (32.5% of median)
+  P99 Latency: 16189787.06 μs [13147256.29, 19663509.07]
+  Atomics: 3  Epochs: 3  Gaps: 0  PBR_full: 803526
+  Efficiency: 2.3% of theoretical max (21 GB/s)
+
+=================================================================
+  Stress Test (100% L5)
+=================================================================
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=903698 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=903698 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11361164 (injected=11361164, accounted=0)
+  [SANITY FAIL] P99 latency 97613.7 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 0.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 100.0% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=920339 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=920339 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 10585872 (injected=10585872, accounted=0)
+  [SANITY FAIL] P99 latency 43204.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 0.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 100.0% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=887620 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=887620 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 10771900 (injected=10771900, accounted=0)
+  [SANITY FAIL] P99 latency 25809.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 0.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 100.0% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=892820 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=892820 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 10805277 (injected=10805277, accounted=0)
+  [SANITY FAIL] P99 latency 155709.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 0.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 100.0% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=922028 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=922028 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 10896461 (injected=10896461, accounted=0)
+  [SANITY FAIL] P99 latency 151673.2 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 0.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 100.0% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=930291 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=930291 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 10806397 (injected=10806397, accounted=0)
+  [SANITY FAIL] P99 latency 155185.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 0.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 100.0% indicates saturation.
+-----------------------------------------------------------------
+  Stress Test (100% L5) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 0.00 M/s [0.00, 0.00] ±0.00 M/s (0.0% of median)
+  P99 Latency: 151673218.10 μs [25809378.42, 155709263.35]
+  Atomics: 1  Epochs: 1  Gaps: 187  PBR_full: 910619
+
+=================================================================
+  SCALABILITY: Threads (median of 5 runs)
+=================================================================
+ Threads     Batches/s  [min, max]      MB/s   P99 μs
+-----------------------------------------------------------------
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 7353134 (injected=12166060, accounted=4812926)
+  [SANITY FAIL] P99 latency 3510.8 ms is unreasonable; system is backlogged.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 6365896 (injected=12537560, accounted=6171664)
+  [SANITY FAIL] P99 latency 6498.5 ms is unreasonable; system is backlogged.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 6399303 (injected=13011288, accounted=6611985)
+  [SANITY FAIL] P99 latency 7484.8 ms is unreasonable; system is backlogged.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 5593233 (injected=12137570, accounted=6544337)
+  [SANITY FAIL] P99 latency 6363.4 ms is unreasonable; system is backlogged.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 6066465 (injected=12362876, accounted=6296411)
+  [SANITY FAIL] P99 latency 6144.2 ms is unreasonable; system is backlogged.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 7128654 (injected=12278218, accounted=5149564)
+  [SANITY FAIL] P99 latency 3792.8 ms is unreasonable; system is backlogged.
+       1       1259183 [1029810, 1322296]   1289.40 MB/s 6363373.1 μs
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 12009154 (injected=16325058, accounted=4315904)
+  [SANITY FAIL] P99 latency 7239.5 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 863089.7 << expected min ~1000000 batches/s.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 12399394 (injected=15878515, accounted=3479121)
+  [SANITY FAIL] P99 latency 4262.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 695745.2 << expected min ~1000000 batches/s.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 11363169 (injected=15454279, accounted=4091110)
+  [SANITY FAIL] P99 latency 4864.6 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 818123.8 << expected min ~1000000 batches/s.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 12700865 (injected=16021402, accounted=3320537)
+  [SANITY FAIL] P99 latency 4090.0 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 664033.6 << expected min ~1000000 batches/s.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 10324325 (injected=15807693, accounted=5483368)
+  [SANITY FAIL] P99 latency 9667.1 ms is unreasonable; system is backlogged.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 11446200 (injected=15692411, accounted=4246211)
+  [SANITY FAIL] P99 latency 5945.7 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 849143.2 << expected min ~1000000 batches/s.
+       2        818124 [664034, 1096551]    837.76 MB/s 4864606.2 μs
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=90358 (2.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 15147939 (injected=18686215, accounted=3538276)
+  [SANITY FAIL] P99 latency 6902.0 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 707536.5 << expected min ~2000000 batches/s.
+  [SANITY FAIL] PBR full 2.5% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=67333 (1.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13998497 (injected=19980205, accounted=5981708)
+  [SANITY FAIL] P99 latency 17961.5 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1196149.1 << expected min ~2000000 batches/s.
+  [SANITY FAIL] PBR full 1.1% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=77403 (1.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 14005785 (injected=19847379, accounted=5841594)
+  [SANITY FAIL] P99 latency 15722.0 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1168124.7 << expected min ~2000000 batches/s.
+  [SANITY FAIL] PBR full 1.3% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=89474 (2.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 15478071 (injected=18587840, accounted=3109769)
+  [SANITY FAIL] P99 latency 6862.1 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 621853.5 << expected min ~2000000 batches/s.
+  [SANITY FAIL] PBR full 2.8% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=78427 (1.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 14407109 (injected=19619016, accounted=5211907)
+  [SANITY FAIL] P99 latency 15474.6 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1042224.1 << expected min ~2000000 batches/s.
+  [SANITY FAIL] PBR full 1.5% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=70783 (1.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13994343 (injected=19181594, accounted=5187251)
+  [SANITY FAIL] P99 latency 8975.8 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1037281.1 << expected min ~2000000 batches/s.
+  [SANITY FAIL] PBR full 1.3% indicates saturation.
+       4       1042224 [621853, 1196149]   1067.24 MB/s 15474624.4 μs
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=376522 (4.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 1081202 (injected=9408551, accounted=8327349)
+  [SANITY FAIL] P99 latency 2914.2 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1663013.9 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.3% indicates saturation.
+  [SANITY FAIL] Drop rate 0.12% is too high for a log system.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=394936 (5.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 2476876 (injected=8861083, accounted=6384207)
+  [SANITY FAIL] P99 latency 3063.9 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1276452.8 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.8% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=400631 (6.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 2423915 (injected=8641414, accounted=6217499)
+  [SANITY FAIL] P99 latency 3182.5 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1241467.6 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 6.1% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=366290 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 1722010 (injected=10118745, accounted=8396735)
+  [SANITY FAIL] P99 latency 2986.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1678857.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.2% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=377486 (3.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS FAIL] accounted > injected: injected=9356124 sequenced+dropped=9402979 (diff -46855)
+  [SANITY FAIL] P99 latency 2828.8 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1873924.2 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 3.9% indicates saturation.
+  [SANITY FAIL] Drop rate 0.11% is too high for a log system.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=381530 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 492328 (injected=9094582, accounted=8602254)
+  [SANITY FAIL] P99 latency 2756.0 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1719919.9 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.2% indicates saturation.
+       8       1678857 [1241468, 1873924]   1719.15 MB/s 2986426.7 μs
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=840310 (12.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 3154609 (injected=8829598, accounted=5674989)
+  [SANITY FAIL] P99 latency 2824.7 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1134418.8 << expected min ~8000000 batches/s.
+  [SANITY FAIL] PBR full 12.9% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=836009 (10.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 2083564 (injected=8965576, accounted=6882012)
+  [SANITY FAIL] P99 latency 3204.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1371378.8 << expected min ~8000000 batches/s.
+  [SANITY FAIL] PBR full 10.8% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=835279 (13.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 3364011 (injected=8881919, accounted=5517908)
+  [SANITY FAIL] P99 latency 5682.0 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1102982.5 << expected min ~8000000 batches/s.
+  [SANITY FAIL] PBR full 13.1% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=801372 (8.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 844309 (injected=9437490, accounted=8593181)
+  [SANITY FAIL] P99 latency 1782.8 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1711062.9 << expected min ~8000000 batches/s.
+  [SANITY FAIL] PBR full 8.5% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=809319 (12.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 3188488 (injected=9026223, accounted=5837735)
+  [SANITY FAIL] P99 latency 5982.4 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1166888.9 << expected min ~8000000 batches/s.
+  [SANITY FAIL] PBR full 12.2% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=828762 (12.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 3176966 (injected=8918495, accounted=5741529)
+  [SANITY FAIL] P99 latency 2881.6 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1147687.4 << expected min ~8000000 batches/s.
+  [SANITY FAIL] PBR full 12.6% indicates saturation.
+      16       1166889 [1102983, 1711063]   1194.89 MB/s 3204353.6 μs
+
+=================================================================
+  EPOCH IMPACT (Seq = CPU time to process one epoch)
+=================================================================
+Epoch(μs)     Batches/s Epoch CPU (μs)
+-----------------------------------------------------------------
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=260901 (5.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11900134 (injected=16777216, accounted=4877082)
+  [SANITY FAIL] P99 latency 16704.2 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 974297.9 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.1% indicates saturation.
+       100        974298       6559750.7
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=271538 (6.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13046064 (injected=16777216, accounted=3731152)
+  [SANITY FAIL] P99 latency 17745.6 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 746005.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 6.8% indicates saturation.
+       250        746005       6600875.3
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=310901 (8.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11400139 (injected=14702691, accounted=3302552)
+  [SANITY FAIL] P99 latency 8478.7 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 660307.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 8.6% indicates saturation.
+       500        660307       2822961.9
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=255393 (7.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 13264689 (injected=16777216, accounted=3512527)
+  [SANITY FAIL] P99 latency 18325.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 679315.7 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 7.0% indicates saturation.
+  [SANITY FAIL] Drop rate 3.38% is too high for a log system.
+      1000        679316       6610397.1
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=263491 (6.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 12768011 (injected=16777216, accounted=4009205)
+  [SANITY FAIL] P99 latency 16391.6 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 801590.8 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 6.2% indicates saturation.
+      2000        801591       6314862.3
+
+=================================================================
+  BROKER SCALABILITY
+=================================================================
+   Brokers     Batches/s      MB/s
+-----------------------------------------------------------------
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=384557 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [SANITY FAIL] P99 latency 2750.0 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1764706.8 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 4.2% indicates saturation.
+         1       1764707   1807.06
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=439469 (10.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 3150691 (injected=6903189, accounted=3752498)
+  [SANITY FAIL] P99 latency 7643.7 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 749165.3 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 10.5% indicates saturation.
+         2        749165    767.15
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=274512 (5.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11908629 (injected=16777216, accounted=4868587)
+  [SANITY FAIL] P99 latency 16147.6 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 973418.2 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 5.3% indicates saturation.
+         4        973418    996.78
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=40160 (1.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 30413199 (injected=33554432, accounted=3141233)
+  [SANITY FAIL] P99 latency 20304.7 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 627165.9 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 1.3% indicates saturation.
+         8        627166    642.22
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  [COMPLETENESS WARN] large in-flight at t1: 31433097 (injected=34767532, accounted=3334435)
+  [SANITY FAIL] P99 latency 8069.5 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 666696.5 << expected min ~4000000 batches/s.
+        16        666697    682.70
+
+=================================================================
+  ABLATION: Single-Thread vs Scatter-Gather
+=================================================================
+  Shards    Throughput   Speedup Efficiency
+-----------------------------------------------------------------
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=802617 (12.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 11605999 (injected=17246308, accounted=5640309)
+  [SANITY FAIL] P99 latency 19295.3 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 563938.6 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 12.5% indicates saturation.
+       1        563939    1.00×         2.7%
+  Warmup... done
+  Running...

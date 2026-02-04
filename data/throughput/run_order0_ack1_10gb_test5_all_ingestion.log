@@ -1,0 +1,76 @@
+Cleaning up stale brokers and ports...
+Running trial 1 with message size 1024
+Started head broker with PID 1162393
+Waiting for broker to signal readiness (timeout: 60s, PID: 1162393)...
+Broker ready! Found ready file: /tmp/embarlet_1162393_ready (PID: 1162393) after 8s
+Started follower brokers with PIDs: 1162897 1162898 1162899
+Waiting for 3 broker(s) to signal readiness (timeout: 20s, PIDs: 1162897 1162898 1162899)...
+All 3 broker(s) ready after 0s
+All brokers ready, cluster formed
+I20260202 13:11:02.441020 1163277 main.cc:64] Using threads_per_broker from config: 3
+I20260202 13:11:02.981626 1163277 test_utils.cc:50] 
+
+===== Publish Throughput Test =====
+	  Message size: 1024 bytes
+	  Total message size: 10737418240 bytes
+	  Threads per broker: 4
+	  ACK level: 1
+	  Order level: 0
+	  Sequencer: EMBARCADERO
+I20260202 13:11:02.982998 1163317 publisher.cc:1451] SubscribeToCluster: Creating gRPC reader for cluster status subscription...
+I20260202 13:11:02.984700 1163317 publisher.cc:1472] SubscribeToCluster: Received cluster status update with 4 brokers (using broker_info)
+I20260202 13:11:02.984756 1163317 publisher.cc:1495] SubscribeToCluster: Added broker 0 (accepts_publishes=true)
+I20260202 13:11:02.984773 1163317 publisher.cc:1495] SubscribeToCluster: Added broker 2 (accepts_publishes=true)
+I20260202 13:11:02.984786 1163317 publisher.cc:1495] SubscribeToCluster: Added broker 1 (accepts_publishes=true)
+I20260202 13:11:02.984797 1163317 publisher.cc:1495] SubscribeToCluster: Added broker 3 (accepts_publishes=true)
+I20260202 13:11:02.984810 1163317 publisher.cc:1552] SubscribeToCluster: Adding publisher threads for broker 0
+W20260202 13:11:02.985916 1163317 common.cc:277] Hugepages: 6144 free × 2048 kB = 12288 MB free; need 32772 MB. Provision more (e.g. echo 8192 | sudo tee /proc/sys/vm/nr_hugepages) or set EMBAR_USE_HUGETLB=0 for THP.
+W20260202 13:11:07.982914 1163277 publisher.cc:254] Publisher::Init() waiting for cluster connection... (5s elapsed)
+W20260202 13:11:12.982916 1163277 publisher.cc:254] Publisher::Init() waiting for cluster connection... (10s elapsed)
+I20260202 13:11:15.489663 1163317 publisher.cc:1552] SubscribeToCluster: Adding publisher threads for broker 1
+I20260202 13:11:15.489720 1163339 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 0 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.489746 1163340 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 0 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.489926 1163341 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 0 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.490136 1163317 publisher.cc:1552] SubscribeToCluster: Adding publisher threads for broker 2
+I20260202 13:11:15.489988 1163342 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 0 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.490276 1163343 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 1 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.490306 1163345 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 1 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.490319 1163344 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 1 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.490471 1163346 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 1 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.490829 1163348 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 2 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.490731 1163317 publisher.cc:1552] SubscribeToCluster: Adding publisher threads for broker 3
+I20260202 13:11:15.491183 1163350 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 2 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.491184 1163316 publisher.cc:837] AckThread: Received Broker ID 0 from fd=34
+I20260202 13:11:15.491485 1163354 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 3 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.491564 1163317 publisher.cc:1568] SubscribeToCluster: Connection established successfully. connected_=true
+I20260202 13:11:15.491571 1163353 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 3 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.490962 1163349 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 2 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.490772 1163347 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 2 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.491854 1163356 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 3 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.491536 1163316 publisher.cc:837] AckThread: Received Broker ID 1 from fd=43
+I20260202 13:11:15.491791 1163355 publisher.cc:1074] PublishThread: Handshake sent successfully to broker 3 (client_id=105643, topic=TestTopic)
+I20260202 13:11:15.492167 1163316 publisher.cc:837] AckThread: Received Broker ID 2 from fd=58
+I20260202 13:11:15.492790 1163316 publisher.cc:837] AckThread: Received Broker ID 3 from fd=66
+I20260202 13:11:15.542383 1163277 publisher.cc:303] Publisher::Init() All 4 broker ACK connections established
+I20260202 13:11:25.387836 1163277 publisher.cc:501] Publisher finished sending 10485760 messages, keeping cluster context alive for subscriber
+I20260202 13:11:25.387895 1163277 test_utils.cc:269] Publish test completed in 9.85 seconds
+I20260202 13:11:25.387919 1163277 test_utils.cc:271] Bandwidth: 1040.08 MB/s
+I20260202 13:11:25.388787 1163277 publisher.cc:63] [PublisherPipelineProfile] === Aggregated time per component ===
+I20260202 13:11:25.388801 1163277 publisher.cc:69] [PublisherPipelineProfile]   BufferWrite: total=2930062 us, count=10485760, avg=279 ns 14.877235% of pipeline time
+I20260202 13:11:25.388813 1163277 publisher.cc:69] [PublisherPipelineProfile]   SendPayload: total=7328187 us, count=5442, avg=1346598 ns 37.208482% of pipeline time
+I20260202 13:11:25.388819 1163277 publisher.cc:69] [PublisherPipelineProfile]   PublishTotal: total=9436689 us, count=10485760, avg=899 ns (whole Publish() call)
+I20260202 13:11:25.388825 1163277 publisher.cc:79] [PublisherPipelineProfile]   BufferWrite bandwidth: 3713.23 MB/s (11408506880 bytes in 2930062 us)
+I20260202 13:11:25.388832 1163277 publisher.cc:86] [PublisherPipelineProfile]   Buffer fill rate (wall clock): 1104.98 MB/s (11408506880 bytes in 9.846 s)
+I20260202 13:11:25.388839 1163277 publisher.cc:94] [PublisherPipelineProfile]   Publish() bandwidth: 1152.95 MB/s (11408506880 bytes in 9436689 us)
+I20260202 13:11:25.388844 1163277 publisher.cc:96] [PublisherPipelineProfile]   TOTAL: 19694939 us (19.6949 s) across all components
+I20260202 13:11:25.388850 1163277 publisher.cc:101] [PublisherPipelineProfile]   Send EAGAIN/ENOBUFS count: 0, SendPayload batches: 5442, EAGAIN per batch: 0.00
+I20260202 13:11:25.388856 1163277 publisher.cc:107] [PublisherPipelineProfile] ========================================
+I20260202 13:11:28.040293 1163277 result_writer.cc:193] Publish bandwidth: 1040.08 MB/s
+Test completed, cleaning up broker processes...
+Terminated broker process with PID 1162393
+Terminated broker process with PID 1162897
+Terminated broker process with PID 1162898
+Terminated broker process with PID 1162899
+All processes have finished for trial 1 with message size 1024
+Cleaning up stale brokers and ports...
+All experiments have finished.

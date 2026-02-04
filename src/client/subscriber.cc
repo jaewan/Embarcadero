@@ -366,12 +366,10 @@ bool Subscriber::DEBUG_check_order(int order) {
 	}
 
 	// 6. Order Level >= 2 Check: Client Order Preservation
-	// [[ORDER=5: Batch-level ordering]] For ORDER=5, skip client_order checks because:
-	// - ORDER=5 uses batch-level ordering (all messages in a batch share batch_seq)
-	// - Messages within a batch don't have individual client_order
-	// - We only validate total_order uniqueness and contiguity (already checked in Level 1)
-	// For ORDER < 5: Check per-message client_order preservation
-	if (order < 5) {
+	// [[ORDER=5: Batch-level ordering]] For ORDER=5, skip client_order checks (batch-level, total_order only).
+	// [[ORDER=2: Total order only]] For ORDER=2, skip client_order checks (design: no per-client guarantee).
+	// For ORDER 0,1,3,4: Check per-message client_order preservation
+	if (order < 5 && order != 2) {
 		VLOG(3) << "DEBUG: --- Checking Order Level >= 2 (Client Order Preservation) ---";
 		std::map<int, size_t> last_client_order_for_client;
 		bool client_order_preserved = true;
@@ -842,9 +840,9 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		ssize_t bytes_received = recv(conn_buffers->fd, write_ptr, recv_chunk_size, 0);
 
 		if (bytes_received > 0) {
-			// [[BLOG_HEADER: Process ORDER=5 batch metadata in receiver thread]]
-			// Uses per-connection state to avoid global mutex contention
-			if (order_level_ == 5) {
+			// [[BLOG_HEADER: Process ORDER=2/5 batch metadata in receiver thread]]
+			// Order 2 (total order) and Order 5 (strong order) both send batch metadata; assign total_order per message
+			if (order_level_ == 5 || order_level_ == 2) {
 				ProcessSequencer5Data(static_cast<uint8_t*>(write_ptr), bytes_received, conn_buffers);
 			}
 			
@@ -1514,7 +1512,7 @@ void* Subscriber::Consume(int timeout_ms) {
                 const size_t remaining_bytes = buffer_write_offset - current_pos;
                 if (!Embarcadero::wire::ValidateV1PaddedSize(header->paddedSize, remaining_bytes)) {
                     // This might be batch metadata or corrupted data
-                    if (order_level_ == 5 && current_pos + sizeof(Embarcadero::wire::BatchMetadata) <= buffer_write_offset) {
+                    if ((order_level_ == 5 || order_level_ == 2) && current_pos + sizeof(Embarcadero::wire::BatchMetadata) <= buffer_write_offset) {
                         // Try skipping 16 bytes (batch metadata size)
                         current_pos += sizeof(Embarcadero::wire::BatchMetadata);
 							} else {

@@ -318,15 +318,18 @@ struct alignas(64) TInode{
  * Writer ownership and flush requirements (non-coherent CXL):
  * 
  * Stage 1 (Receiver/NetworkManager):
- *   - Writes: batch_seq, client_id, num_msg, broker_id, total_size, start_logical_offset, log_idx
- *   - Sets: batch_complete=1 (signals batch ready for sequencer)
- *   - MUST flush: cacheline containing batch_complete (and second cacheline if BatchHeader spans >64B)
+ *   - Reserve BLog, recv payload into CXL, then reserve PBR slot (post-recv).
+ *   - Slot is zeroed on reserve to avoid stale reads (num_msg=0 until publish).
+ *   - Writes full BatchHeader once after recv: batch_seq, client_id, num_msg, broker_id, total_size,
+ *     start_logical_offset, log_idx, epoch_created, batch_id, pbr_absolute_index.
+ *   - Readiness = num_msg>0 for blocking path (no batch_complete needed).
+ *   - MUST flush: both cachelines of BatchHeader
  *   - MUST fence: CXL::store_fence() after flush
  * 
  * Stage 3 (Sequencer):
- *   - Reads: batch_complete (polls until == 1)
+ *   - Reads: num_msg>0 as readiness (blocking path); batch_complete still used by async paths.
  *   - Writes: total_order, ordered=1, batch_off_to_export
- *   - Clears: batch_complete=0 (prevents duplicate processing)
+ *   - Clears: batch_complete=0, num_msg=0 (prevents duplicate processing / ABA reuse)
  *   - MUST flush: cacheline containing ordered/batch_off_to_export (Stage-4 polls this)
  *   - MUST fence: CXL::store_fence() after flush
  * 
@@ -345,7 +348,7 @@ struct alignas(64) TInode{
  */
 struct alignas(64) BatchHeader{
 	// [[LIFECYCLE]]
-	// 1) NetworkManager writes header + payload, then sets batch_complete=1 (with flush+fence).
+	// 1) NetworkManager reserves PBR after recv, zeroes slot, writes full header, flush+fence.
 	// 2) Sequencer processes batch and clears batch_complete=0 and num_msg=0 (with flush+fence).
 	// This prevents duplicate processing of ring slots under ABA reuse.
 	// Keep readiness-critical fields in the first cache line for CXL visibility

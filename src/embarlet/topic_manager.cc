@@ -535,10 +535,25 @@ bool TopicManager::ReservePBRSlotAndWriteEntry(const char* topic, BatchHeader& b
 	return it->second->ReservePBRSlotAndWriteEntry(batch_header, log, segment_header, logical_offset, batch_header_location);
 }
 
+bool TopicManager::ReservePBRSlotAfterRecv(const char* topic, BatchHeader& batch_header, void* log,
+		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location) {
+	// Topic must already exist (created by ReserveBLogSpace or prior GetCXLBuffer)
+	absl::ReaderMutexLock lock(&topics_mutex_);
+	auto it = topics_.find(topic);
+	if (it == topics_.end()) return false;
+	return it->second->ReservePBRSlotAfterRecv(batch_header, log, segment_header, logical_offset, batch_header_location);
+}
+
 bool TopicManager::ReservePBRSlotAndWriteEntry(Topic* topic_ptr, BatchHeader& batch_header, void* log,
 		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 		bool epoch_already_checked) {
 	return topic_ptr && topic_ptr->ReservePBRSlotAndWriteEntry(batch_header, log, segment_header, logical_offset, batch_header_location, epoch_already_checked);
+}
+
+bool TopicManager::ReservePBRSlotAfterRecv(Topic* topic_ptr, BatchHeader& batch_header, void* log,
+		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+		bool epoch_already_checked) {
+	return topic_ptr && topic_ptr->ReservePBRSlotAfterRecv(batch_header, log, segment_header, logical_offset, batch_header_location, epoch_already_checked);
 }
 
 bool TopicManager::GetBatchToExport(

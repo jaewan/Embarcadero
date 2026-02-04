@@ -1,0 +1,7 @@
+message_size,total_message_size,num_threads_per_broker,ack_level,order,replication_factor,replicate_tinode,num_clients,num_brokers_to_kill,failure_percentage,sequencer_type,pub_bandwidth_mbps,sub_bandwidth_mbps,e2e_bandwidth_mbps
+1024,8589934592,3,1,0,0,false,1,0,0,EMBARCADERO,11752.2068,8597.5026,0
+1024,10737418240,3,1,0,0,false,1,0,0,EMBARCADERO,9775.5808,8328.2731,0
+1024,10737418240,3,1,0,0,false,1,0,0,EMBARCADERO,5535.7531,17184.8835,0
+1024,10737418240,3,1,0,0,false,1,0,0,EMBARCADERO,9070.0606,12222.8103,0
+1024,10737418240,3,1,0,0,false,1,0,0,EMBARCADERO,9874.9440,16845.6194,0
+1024,10737418240,3,1,0,0,false,1,0,0,EMBARCADERO,10224.8386,17129.8865,0

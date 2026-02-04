@@ -1,0 +1,39 @@
+
+=================================================================
+  EMBARCADERO SEQUENCER - ABLATION STUDY
+=================================================================
+
+Config: 4 brokers, 8 producers, 10s, 10% L5, 5 runs, std::sort, validate=yes, pbr_entries=1048576
+
+=================================================================
+  ABLATION 1: Per-Batch vs Per-Epoch (paired, 5 runs)
+=================================================================
+  (Per-epoch: atomics = epochs with non-empty output; when sequencer is bottleneck,
+   epochs << duration/τ, so atomics << 10000 for 5s @ 500μs.)
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=515849 (2.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [COMPLETENESS WARN] large in-flight at t1: 2957244 (injected=22131585, accounted=19174341)
+  [SANITY FAIL] P99 latency 4357.1 ms is unreasonable; system is backlogged.
+  [SANITY FAIL] Throughput 1916823.1 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 2.6% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=796868 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=796868 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [SANITY FAIL] Throughput 0.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 100.0% indicates saturation.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=808512 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=808512 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  [INVALID RUN] PBR saturation > 1%; results do not reflect sequencer algorithm performance.
+  [SANITY FAIL] Throughput 0.0 << expected min ~4000000 batches/s.
+  [SANITY FAIL] PBR full 100.0% indicates saturation.
+  Warmup... done
+  Running...

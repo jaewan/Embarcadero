@@ -1,0 +1,479 @@
+
+=================================================================
+  EMBARCADERO SEQUENCER - ABLATION STUDY
+=================================================================
+
+Config: 4 brokers, 8 producers, 10s, 10% L5, 5 runs, std::sort, validate=yes
+
+=================================================================
+  ABLATION 1: Per-Batch vs Per-Epoch (paired, 5 runs)
+=================================================================
+  (Per-epoch: atomics = epochs with non-empty output; when sequencer is bottleneck,
+   epochs << duration/τ, so atomics << 10000 for 5s @ 500μs.)
+  Warmup... done
+  Running...[PHASE] merge=506μs l5=37526μs other=655μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=445μs l5=34764μs other=580μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=341μs l5=27614μs other=463μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=798785 (4.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=522μs l5=36934μs other=584μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=445μs l5=35343μs other=553μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=333μs l5=27452μs other=424μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=807392 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=724μs l5=45981μs other=1075μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=593μs l5=42071μs other=937μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating... PASSED
+  WARNING: PBR_full=909786 (5.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=488μs l5=38737μs other=705μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=436μs l5=37330μs other=629μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=323μs l5=27575μs other=457μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=909903 (4.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=964615 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=964615 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=817113 (21.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=610μs l5=38719μs other=666μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=471μs l5=36124μs other=604μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=348μs l5=27495μs other=456μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=883639 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=374μs l5=38604μs other=601μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=372μs l5=36529μs other=566μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=279μs l5=27750μs other=428μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=891820 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: PBR_full=808099 (45.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=376μs l5=38387μs other=591μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=343μs l5=35829μs other=555μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=279μs l5=27883μs other=428μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=886072 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=799186 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=799186 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=510μs l5=37629μs other=593μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=417μs l5=35297μs other=552μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=320μs l5=27505μs other=446μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=778938 (4.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+-----------------------------------------------------------------
+  Per-Batch Atomic (Baseline) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 0.10 M/s [0.00, 1.90] ±0.86 M/s (902.7% of median)
+  P99 Latency: 1.08 μs [0.00, 1.24]
+  Atomics: 7335905  Epochs: 125  Gaps: 0  PBR_full: 873065
+  Efficiency: 8.1% of theoretical max (21 GB/s)
+-----------------------------------------------------------------
+  Per-Epoch Atomic (Optimized) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.88 M/s [0.30, 1.90] ±0.63 M/s (33.6% of median)
+  P99 Latency: 1.17 μs [1.12, 1.29]
+  Atomics: 187  Epochs: 259  Gaps: 0  PBR_full: 856769
+  Efficiency: 9.1% of theoretical max (21 GB/s)
+
+  >>> SPEEDUP: 1.10× [0.99, 19.94] (±8.91)
+  >>> ATOMIC REDUCTION: 39229×
+
+=================================================================
+  Level 0 (Total Order)
+=================================================================
+  Warmup... done
+  Running...[PHASE] merge=427μs l5=39226μs other=626μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=378μs l5=36660μs other=567μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating... PASSED
+  WARNING: PBR_full=890759 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=515μs l5=38651μs other=602μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=432μs l5=36646μs other=566μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=332μs l5=27787μs other=425μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=893074 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... PASSED
+  WARNING: Zero throughput. PBR_full=816913 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=816913 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=523μs l5=40544μs other=930μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=473μs l5=42089μs other=901μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=336μs l5=28987μs other=621μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=892537 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=370μs l5=37662μs other=572μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=365μs l5=35711μs other=553μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=280μs l5=27803μs other=425μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=900221 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=413μs l5=38118μs other=604μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+[PHASE] merge=367μs l5=35774μs other=559μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ done
+  Validating...[PHASE] merge=284μs l5=27662μs other=429μs
+[L5 BREAKDOWN] sort=0.0% hold=0.0% other=100.0%
+ PASSED
+  WARNING: PBR_full=887358 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+-----------------------------------------------------------------
+  Level 0 (Total Order) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.87 M/s [0.00, 1.91] ±0.75 M/s (40.3% of median)
+  P99 Latency: 1.14 μs [0.00, 1.22]
+  Atomics: 177  Epochs: 250  Gaps: 0  PBR_full: 878020
+  Efficiency: 9.2% of theoretical max (21 GB/s)
+
+=================================================================
+  Mixed 10% L5
+=================================================================
+  Warmup... done
+  Running...[PHASE] merge=468μs l5=51785μs other=893μs
+[L5 BREAKDOWN] sort=0.8% hold=11.6% other=87.6%
+ done
+  Validating...[PHASE] merge=409μs l5=47345μs other=827μs
+[L5 BREAKDOWN] sort=0.8% hold=12.7% other=86.5%
+ FAILED
+  WARNING: PBR_full=894761 (4.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=864527 (10.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=506μs l5=54302μs other=819μs
+[L5 BREAKDOWN] sort=0.8% hold=12.2% other=86.9%
+ done
+  Validating...[PHASE] merge=426μs l5=48004μs other=806μs
+[L5 BREAKDOWN] sort=0.8% hold=13.0% other=86.2%
+ FAILED
+  WARNING: PBR_full=883355 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=437μs l5=49368μs other=754μs
+[L5 BREAKDOWN] sort=0.9% hold=11.3% other=87.8%
+ done
+  Validating...[PHASE] merge=426μs l5=47652μs other=797μs
+[L5 BREAKDOWN] sort=0.8% hold=12.7% other=86.5%
+ FAILED
+  WARNING: PBR_full=890616 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=748μs l5=57508μs other=884μs
+[L5 BREAKDOWN] sort=0.8% hold=11.9% other=87.3%
+ done
+  Validating...[PHASE] merge=601μs l5=47037μs other=824μs
+[L5 BREAKDOWN] sort=0.8% hold=13.0% other=86.2%
+ FAILED
+  WARNING: PBR_full=906112 (5.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=490μs l5=53800μs other=800μs
+[L5 BREAKDOWN] sort=0.8% hold=11.8% other=87.4%
+ done
+  Validating...[PHASE] merge=432μs l5=48302μs other=802μs
+[L5 BREAKDOWN] sort=0.8% hold=12.8% other=86.4%
+ FAILED
+  WARNING: PBR_full=854314 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+-----------------------------------------------------------------
+  Mixed 10% L5 (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.84 M/s [0.77, 1.88] ±0.42 M/s (23.0% of median)
+  P99 Latency: 1.17 μs [1.15, 1.25]
+  Atomics: 160  Epochs: 222  Gaps: 884220  PBR_full: 879784
+  Efficiency: 9.0% of theoretical max (21 GB/s)
+
+=================================================================
+  Stress Test (100% L5)
+=================================================================
+  Warmup... done
+  Running...[PHASE] merge=487μs l5=81684μs other=873μs
+[L5 BREAKDOWN] sort=5.1% hold=19.2% other=75.7%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=923973 (8.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=519μs l5=91927μs other=777μs
+[L5 BREAKDOWN] sort=4.9% hold=17.8% other=77.3%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=940548 (9.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=452μs l5=80630μs other=800μs
+[L5 BREAKDOWN] sort=5.4% hold=21.2% other=73.4%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=915772 (7.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=530μs l5=90437μs other=901μs
+[L5 BREAKDOWN] sort=4.8% hold=18.4% other=76.8%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=934232 (8.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=444μs l5=80635μs other=889μs
+[L5 BREAKDOWN] sort=5.3% hold=19.7% other=75.0%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=913664 (7.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=840493 (9.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+-----------------------------------------------------------------
+  Stress Test (100% L5) (5 runs)
+-----------------------------------------------------------------
+  Throughput: 1.00 M/s [0.81, 1.17] ±0.13 M/s (13.2% of median)
+  P99 Latency: 1.18 μs [1.15, 1.38]
+  Atomics: 106  Epochs: 113  Gaps: 10257243  Dropped: 7540903  PBR_full: 908941
+  Efficiency: 4.9% of theoretical max (21 GB/s)
+
+=================================================================
+  SCALABILITY: Threads (median of 5 runs)
+=================================================================
+ Threads     Batches/s  [min, max]      MB/s   P99 μs
+-----------------------------------------------------------------
+  Warmup... done
+  Running...[PHASE] merge=326μs l5=32775μs other=451μs
+[L5 BREAKDOWN] sort=0.9% hold=7.4% other=91.7%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running...[PHASE] merge=453μs l5=31305μs other=482μs
+[L5 BREAKDOWN] sort=0.9% hold=7.8% other=91.3%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running...[PHASE] merge=384μs l5=24959μs other=365μs
+[L5 BREAKDOWN] sort=0.9% hold=4.1% other=95.0%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running...[PHASE] merge=458μs l5=24357μs other=346μs
+[L5 BREAKDOWN] sort=0.9% hold=4.1% other=95.0%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running...[PHASE] merge=289μs l5=30956μs other=429μs
+[L5 BREAKDOWN] sort=0.9% hold=7.0% other=92.1%
+ done
+  Validating...[PHASE] merge=182μs l5=20252μs other=303μs
+[L5 BREAKDOWN] sort=0.9% hold=8.4% other=90.7%
+ FAILED
+  Warmup... done
+  Running...[PHASE] merge=770μs l5=34981μs other=598μs
+[L5 BREAKDOWN] sort=0.8% hold=8.3% other=90.9%
+ done
+  Validating... FAILED
+       1       1433501 [1183147, 1675125]   1467.90 MB/s 0.6 μs
+  Warmup... done
+  Running...[PHASE] merge=512μs l5=45304μs other=739μs
+[L5 BREAKDOWN] sort=0.7% hold=10.7% other=88.5%
+ done
+  Validating... FAILED
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=87609 (1.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=681μs l5=42360μs other=807μs
+[L5 BREAKDOWN] sort=0.8% hold=10.9% other=88.2%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=88874 (1.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: Zero throughput. PBR_full=105161 (if high: PBR saturated - try larger pbr_entries or fewer producers).
+  WARNING: PBR_full=105161 (100.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=509μs l5=44073μs other=855μs
+[L5 BREAKDOWN] sort=0.8% hold=12.1% other=87.1%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=87461 (1.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=90906 (1.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       2       1389304 [0, 1728028]   1422.65 MB/s 0.6 μs
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=192417 (3.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=421μs l5=45053μs other=693μs
+[L5 BREAKDOWN] sort=0.8% hold=11.2% other=88.0%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=189680 (2.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=490μs l5=47777μs other=790μs
+[L5 BREAKDOWN] sort=0.7% hold=11.7% other=87.5%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=192119 (2.0% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=507μs l5=45266μs other=655μs
+[L5 BREAKDOWN] sort=0.7% hold=12.0% other=87.3%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=192540 (2.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=194074 (6.3% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=188900 (2.1% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       4       1776016 [575818, 1853166]   1818.64 MB/s 0.8 μs
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=558μs l5=45359μs other=742μs
+[L5 BREAKDOWN] sort=0.8% hold=11.9% other=87.2%
+ FAILED
+  WARNING: PBR_full=414927 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=443μs l5=48394μs other=739μs
+[L5 BREAKDOWN] sort=0.8% hold=11.9% other=87.3%
+ FAILED
+  WARNING: PBR_full=417886 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=411549 (46.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=415μs l5=45465μs other=751μs
+[L5 BREAKDOWN] sort=0.9% hold=11.9% other=87.2%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=423601 (4.5% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=481μs l5=47556μs other=1007μs
+[L5 BREAKDOWN] sort=0.8% hold=11.7% other=87.5%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=417220 (4.2% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running...[PHASE] merge=427μs l5=45460μs other=711μs
+[L5 BREAKDOWN] sort=0.8% hold=11.6% other=87.5%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=422955 (4.4% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       8       1789988 [94012, 1881376]   1832.95 MB/s 1.2 μs
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=908502 (8.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=906229 (8.9% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=891474 (7.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=902774 (8.6% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=850237 (7.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=911714 (9.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+      16       1897855 [1680667, 2120041]   1943.40 MB/s 2.0 μs
+
+=================================================================
+  EPOCH IMPACT (Seq = CPU time to process one epoch)
+=================================================================
+Epoch(μs)     Batches/s Epoch CPU (μs)
+-----------------------------------------------------------------
+  Warmup... done
+  Running... done
+  Validating... FAILED
+  WARNING: PBR_full=417126 (26.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       100        229217         52055.2
+  Warmup... done
+  Running...[PHASE] merge=453μs l5=45606μs other=779μs
+[L5 BREAKDOWN] sort=0.8% hold=12.8% other=86.4%
+ done
+  Validating... FAILED
+  WARNING: PBR_full=427342 (4.7% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       250       1687955         28049.1
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=491μs l5=45856μs other=801μs
+[L5 BREAKDOWN] sort=0.8% hold=12.3% other=86.9%
+ FAILED
+  WARNING: PBR_full=425173 (4.8% of attempts). Run may be saturation-bound; consider larger pbr_entries or fewer producers for interpretable throughput.
+       500       1678265         29469.7
+  Warmup... done
+  Running... done
+  Validating...[PHASE] merge=422μs l5=45766μs other=901μs
+[L5 BREAKDOWN] sort=0.8% hold=11.9% other=87.2%

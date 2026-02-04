@@ -187,6 +187,15 @@ class Topic {
 		bool ReservePBRSlotAndWriteEntry(BatchHeader& batch_header, void* log,
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
+		/**
+		 * @brief Reserves one PBR slot after payload recv; caller writes BatchHeader once after.
+		 * @threading Thread-safe: lock-free (128-bit CAS) when pbr_state_.is_lock_free(), else mutex-protected.
+		 * @ownership batch_header_location points into CXL; caller must write header + flush.
+		 * @paper_ref docs/EMBARCADERO_DEFINITIVE_DESIGN.md §3.1 (receive then PBR commit).
+		 */
+		bool ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
+				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
 
 	private:
 		/** Lock-free PBR slot reservation (128-bit CAS). Returns false if ring full. @threading Concurrent. */
@@ -382,6 +391,8 @@ class Topic {
 		void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers);
 		void Sequencer4();
 		void Sequencer5();  // Batch-level sequencer (Phase 1b: epoch pipeline + Level 5 hold buffer)
+		void Sequencer2();  // Order 2: Total order, no per-client state; uses same epoch pipeline, EpochSequencerThread2
+		void EpochSequencerThread2(); // Order 2: Same pipeline as EpochSequencerThread but no Level 5 partition; all batches → ready
 		void BrokerScannerWorker(int broker_id);
 		void BrokerScannerWorker5(int broker_id);  // Batch-level scanner (Phase 1b: pushes to epoch buffer)
 		void EpochDriverThread();   // [[PHASE_1B]] Advances epoch_index_ every kEpochUs
@@ -411,8 +422,10 @@ class Topic {
 		static constexpr unsigned kEpochUs = 500;
 		std::atomic<uint64_t> epoch_index_{0};
 		std::atomic<uint64_t> last_sequenced_epoch_{0};
-		std::vector<PendingBatch5> epoch_buffers_[3];
-		absl::Mutex epoch_buffer_mutex_;
+	// [[PERF: Lock-free epoch buffers]] Per-broker buffers avoid contention on single mutex.
+	// Each BrokerScannerWorker writes to its own buffer; EpochSequencerThread merges all buffers.
+	absl::flat_hash_map<int, std::vector<PendingBatch5>> per_scanner_buffers_[3];
+	absl::Mutex per_scanner_buffers_mu_;  // Only used for merging, not on hot path of scanner
 		std::thread epoch_driver_thread_;
 		// [[PHASE_1B]] Level 5 hold buffer + per-client state (§3.2)
 		absl::flat_hash_map<size_t, ClientState5> level5_client_state_;
