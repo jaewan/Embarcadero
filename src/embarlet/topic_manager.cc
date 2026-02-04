@@ -415,7 +415,8 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		void* &segment_header, 
 		size_t &logical_offset, 
 		SequencerType &seq_type,
-		BatchHeader* &batch_header_location) {
+		BatchHeader* &batch_header_location,
+		bool epoch_already_checked) {
 	
 	// DEADLOCK FIX: Only head broker creates topics to prevent concurrent creation deadlocks
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
@@ -466,7 +467,7 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		auto& topic_obj = topic_itr->second;
 		seq_type = topic_obj->GetSeqtype();
 		return topic_obj->GetCXLBuffer(
-				batch_header, topic, log, segment_header, logical_offset, batch_header_location);
+				batch_header, topic, log, segment_header, logical_offset, batch_header_location, epoch_already_checked);
 	}
 }
 

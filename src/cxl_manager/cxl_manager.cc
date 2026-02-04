@@ -305,9 +305,10 @@ CXLManager::~CXLManager(){
 
 std::function<void(void*, size_t)> CXLManager::GetCXLBuffer(BatchHeader &batch_header,
 		const char topic[TOPIC_NAME_SIZE], void* &log, void* &segment_header,
-		size_t &logical_offset, SequencerType &seq_type, BatchHeader* &batch_header_location) {
+		size_t &logical_offset, SequencerType &seq_type, BatchHeader* &batch_header_location,
+		bool epoch_already_checked) {
 	return topic_manager_->GetCXLBuffer(batch_header, topic, log, segment_header,
-			logical_offset, seq_type, batch_header_location);
+			logical_offset, seq_type, batch_header_location, epoch_already_checked);
 }
 
 bool CXLManager::ReserveBLogSpace(const char* topic, size_t size, void*& log) {

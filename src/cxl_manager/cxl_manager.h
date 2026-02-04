@@ -47,7 +47,7 @@ class CXLManager{
 		}
 		std::function<void(void*, size_t)> GetCXLBuffer(BatchHeader &batch_header, const char topic[TOPIC_NAME_SIZE],
 				void* &log, void* &segment_header, size_t &logical_offset, SequencerType &seq_type, 
-				BatchHeader* &batch_header_location);
+				BatchHeader* &batch_header_location, bool epoch_already_checked = false);
 		// [[RECV_DIRECT_TO_CXL]] Split allocation for zero-copy receive path
 		bool ReserveBLogSpace(const char* topic, size_t size, void*& log);
 		bool IsPBRAboveHighWatermark(const char* topic, int high_pct);

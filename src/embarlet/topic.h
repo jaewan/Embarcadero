@@ -157,8 +157,9 @@ class Topic {
 				void*& log,
 				void*& segment_header,
 				size_t& logical_offset,
-				BatchHeader*& batch_header_location) {
-			return (this->*GetCXLBufferFunc)(batch_header, topic, log, segment_header, logical_offset, batch_header_location);
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false) {
+			return (this->*GetCXLBufferFunc)(batch_header, topic, log, segment_header, logical_offset, batch_header_location, epoch_already_checked);
 		}
 
 		/**
@@ -248,7 +249,8 @@ class Topic {
 				void*& log,
 				void*& segment_header,
 				size_t& logical_offset,
-				BatchHeader*& batch_header_location);
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked);
 
 		// Pointer to the appropriate GetCXLBuffer implementation
 		GetCXLBufferFuncPtr GetCXLBufferFunc;
@@ -260,7 +262,8 @@ class Topic {
 				void*& log,
 				void*& segment_header,
 				size_t& logical_offset,
-				BatchHeader*& batch_header_location);
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
 
 		std::function<void(void*, size_t)> CorfuGetCXLBuffer(
 				BatchHeader& batch_header,
@@ -268,7 +271,8 @@ class Topic {
 				void*& log,
 				void*& segment_header,
 				size_t& logical_offset,
-				BatchHeader*& batch_header_location);
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
 
 		std::function<void(void*, size_t)> ScalogGetCXLBuffer(
 				BatchHeader& batch_header,
@@ -276,7 +280,8 @@ class Topic {
 				void*& log,
 				void*& segment_header,
 				size_t& logical_offset,
-				BatchHeader*& batch_header_location);
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
 
 		std::function<void(void*, size_t)> Order3GetCXLBuffer(
 				BatchHeader& batch_header,
@@ -284,7 +289,8 @@ class Topic {
 				void*& log,
 				void*& segment_header,
 				size_t& logical_offset,
-				BatchHeader*& batch_header_location);
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
 
 		std::function<void(void*, size_t)> Order4GetCXLBuffer(
 				BatchHeader& batch_header,
@@ -292,7 +298,8 @@ class Topic {
 				void*& log,
 				void*& segment_header,
 				size_t& logical_offset,
-				BatchHeader*& batch_header_location);
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
 
 		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(
 				BatchHeader& batch_header,
@@ -300,7 +307,8 @@ class Topic {
 				void*& log,
 				void*& segment_header,
 				size_t& logical_offset,
-				BatchHeader*& batch_header_location);
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
 
 		// Core members
 		const GetNewSegmentCallback get_new_segment_callback_;
@@ -422,10 +430,10 @@ class Topic {
 		static constexpr unsigned kEpochUs = 500;
 		std::atomic<uint64_t> epoch_index_{0};
 		std::atomic<uint64_t> last_sequenced_epoch_{0};
-	// [[PERF: Lock-free epoch buffers]] Per-broker buffers avoid contention on single mutex.
-	// Each BrokerScannerWorker writes to its own buffer; EpochSequencerThread merges all buffers.
+	// Per-broker buffers; EpochSequencerThread merges once per epoch.
+	// [[CORRECTNESS]] per_scanner_buffers_mu_ protects both scanner push_back and merge/clear.
 	absl::flat_hash_map<int, std::vector<PendingBatch5>> per_scanner_buffers_[3];
-	absl::Mutex per_scanner_buffers_mu_;  // Only used for merging, not on hot path of scanner
+	absl::Mutex per_scanner_buffers_mu_;
 		std::thread epoch_driver_thread_;
 		// [[PHASE_1B]] Level 5 hold buffer + per-client state (§3.2)
 		absl::flat_hash_map<size_t, ClientState5> level5_client_state_;

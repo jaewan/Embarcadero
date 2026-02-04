@@ -849,6 +849,10 @@ void NetworkManager::HandlePublishRequest(
 
 		std::function<void(void*, size_t)> non_emb_seq_callback = nullptr;
 
+		// [[Issue #3]] Get Topic* once per batch for single epoch check and ReservePBRSlotAfterRecv(Topic*, ..., epoch_checked).
+		Topic* topic_ptr = cxl_manager_->GetTopicPtr(handshake.topic);
+		bool epoch_checked_this_batch = false;
+
 		// Use GetCXLBuffer for batch-level allocation and zero-copy receive
 		// BLOCKING MODE: Wait indefinitely for ring space - NEVER close connection
 		static std::atomic<size_t> blocking_ring_full_count{0};
@@ -858,8 +862,20 @@ void NetworkManager::HandlePublishRequest(
 		auto t0 = std::chrono::high_resolution_clock::now();
 
 		while (!buf && !stop_threads_) {
+			// [[Issue #3]] Single epoch check per batch: do once for EMBARCADERO, then pass epoch_checked to GetCXLBuffer and ReservePBRSlotAfterRecv.
+			if (topic_ptr && topic_ptr->GetSeqtype() == EMBARCADERO) {
+				if (!epoch_checked_this_batch) {
+					if (topic_ptr->CheckEpochOnce()) {
+						std::this_thread::sleep_for(std::chrono::milliseconds(100));
+						continue;
+					}
+					epoch_checked_this_batch = true;
+				}
+			} else {
+				epoch_checked_this_batch = false;
+			}
 			non_emb_seq_callback = cxl_manager_->GetCXLBuffer(batch_header, handshake.topic, buf,
-					segment_header, logical_offset, seq_type, batch_header_location);
+					segment_header, logical_offset, seq_type, batch_header_location, epoch_checked_this_batch);
 
 			if (buf != nullptr) {
 				break;  // Success
@@ -891,9 +907,10 @@ void NetworkManager::HandlePublishRequest(
 		
 		auto t1 = std::chrono::high_resolution_clock::now();
 
+		// [[DESIGN: PBR reserve after receive]] For EMBARCADERO, GetCXLBuffer only allocates BLog (buf);
+		// batch_header_location is intentionally null here and is set later by ReservePBRSlotAfterRecv.
 		if (batch_header_location == nullptr) {
 			if (seq_type != EMBARCADERO) {
-				// [[SENIOR_ASSESSMENT_FIX]] Log ERROR + counter for ORDER=5 visibility; batch will not be sequenced
 				static std::atomic<size_t> batch_header_location_null_count{0};
 				size_t cnt = batch_header_location_null_count.fetch_add(1, std::memory_order_relaxed) + 1;
 				LOG(ERROR) << "NetworkManager: GetCXLBuffer returned null batch_header_location (count=" << cnt
@@ -986,8 +1003,12 @@ void NetworkManager::HandlePublishRequest(
 		int sleep_ms = 1;  // Start at 1 ms
 		auto post_recv_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 		while (!batch_header_location && !stop_threads_) {
-			if (cxl_manager_->ReservePBRSlotAfterRecv(handshake.topic, batch_header, buf,
-					segment_header, logical_offset, batch_header_location)) {
+			bool ok = topic_ptr
+				? cxl_manager_->ReservePBRSlotAfterRecv(topic_ptr, batch_header, buf,
+						segment_header, logical_offset, batch_header_location, epoch_checked_this_batch)
+				: cxl_manager_->ReservePBRSlotAfterRecv(handshake.topic, batch_header, buf,
+						segment_header, logical_offset, batch_header_location);
+			if (ok) {
 				break;  // Success
 			}
 			post_recv_attempts++;

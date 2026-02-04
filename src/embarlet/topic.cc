@@ -884,7 +884,8 @@ std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(
 		void* &log, 
 		void* &segment_header, 
 		size_t &logical_offset,
-		BatchHeader* &batch_header_location) {
+		BatchHeader* &batch_header_location,
+		bool /*epoch_already_checked*/) {
 
 	// Set batch header location to nullptr (not used by Kafka sequencer)
 	batch_header_location = nullptr;
@@ -965,7 +966,8 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 		void* &log,
 		void* &segment_header,
 		size_t &logical_offset,
-		BatchHeader* &batch_header_location) {
+		BatchHeader* &batch_header_location,
+		bool /*epoch_already_checked*/) {
 
 	// Set batch header location to nullptr (not used by Corfu sequencer)
 	batch_header_location = nullptr;
@@ -1035,7 +1037,8 @@ std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(
 		void* &log,
 		void* &segment_header,
 		size_t &logical_offset,
-		BatchHeader* &batch_header_location) {
+		BatchHeader* &batch_header_location,
+		bool /*epoch_already_checked*/) {
 
 	// Set batch header location to nullptr (not used by Order3 sequencer)
 	batch_header_location = nullptr;
@@ -1106,7 +1109,8 @@ std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(
 		void* &log,
 		void* &segment_header,
 		size_t &logical_offset,
-		BatchHeader* &batch_header_location) {
+		BatchHeader* &batch_header_location,
+		bool /*epoch_already_checked*/) {
 
 	// [[PHASE_1A_EPOCH_FENCING]] Periodic epoch check (§4.2.1 "e.g. every 100 batches"); refuse one batch when stale
 	uint64_t n = epoch_check_counter_.fetch_add(1, std::memory_order_relaxed);
@@ -1185,7 +1189,8 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
         void* &log,
         void* &segment_header,
         size_t &logical_offset,
-        BatchHeader* &batch_header_location) {
+        BatchHeader* &batch_header_location,
+        bool /*epoch_already_checked*/) {
     
     // Set batch header location to nullptr (not used by Scalog sequencer)
     batch_header_location = nullptr;
@@ -1224,7 +1229,8 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		void* &log,
 		void* &segment_header,
 		size_t &logical_offset,
-		BatchHeader* &batch_header_location) {
+		BatchHeader* &batch_header_location,
+		bool epoch_already_checked) {
 
 	// [[SEQUENCER_ONLY_HEAD_NODE]] Defense in depth: fail fast if called on sequencer-only Topic
 	// Sequencer-only node has no segment/batch header ring, offsets[0] is uninitialized.
@@ -1237,14 +1243,16 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		return nullptr;
 	}
 
-	// [[PHASE_1A_EPOCH_FENCING]] Periodic epoch check (§4.2.1 "e.g. every 100 batches"); refuse one batch when stale
-	uint64_t n = epoch_check_counter_.fetch_add(1, std::memory_order_relaxed);
-	bool force_full_read = (n % kEpochCheckInterval == 0);
-	auto [current_epoch, was_stale] = RefreshBrokerEpochFromCXL(force_full_read);
-	if (was_stale) {
-		log = nullptr;
-		batch_header_location = nullptr;
-		return nullptr;
+	// [[Issue #3]] When caller did CheckEpochOnce at batch start, skip duplicate epoch check.
+	if (!epoch_already_checked) {
+		uint64_t n = epoch_check_counter_.fetch_add(1, std::memory_order_relaxed);
+		bool force_full_read = (n % kEpochCheckInterval == 0);
+		auto [current_epoch, was_stale] = RefreshBrokerEpochFromCXL(force_full_read);
+		if (was_stale) {
+			log = nullptr;
+			batch_header_location = nullptr;
+			return nullptr;
+		}
 	}
 
 	// Calculate base addresses
@@ -2729,8 +2737,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		pending.slot_offset = slot_offset;
 		pending.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
 		{
-			// [[PERF: Per-scanner buffers]] Write to broker-specific buffer (lock-free on hot path).
-			// EpochSequencerThread merges all buffers once per epoch.
+			// [[CORRECTNESS]] Serialize with EpochSequencerThread merge/clear to avoid data race.
+			// Load epoch inside lock so we never push to a buffer the sequencer has already merged/drained.
+			absl::MutexLock lock(&per_scanner_buffers_mu_);
 			uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 			per_scanner_buffers_[epoch % 3][broker_id].push_back(pending);
 		}

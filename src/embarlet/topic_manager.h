@@ -108,7 +108,8 @@ class TopicManager {
 				void*& segment_header,
 				size_t& logical_offset,
 				heartbeat_system::SequencerType& seq_type,
-				BatchHeader*& batch_header_location);
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
 
 		// [[RECV_DIRECT_TO_CXL]] Split allocation for zero-copy receive path
 		bool ReserveBLogSpace(const char* topic, size_t size, void*& log);
