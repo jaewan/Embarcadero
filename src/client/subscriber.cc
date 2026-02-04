@@ -1114,149 +1114,103 @@ void ConnectionBuffers::release_read_buffer(BufferState* acquired_buffer) {
 // Each connection tracks its own batch metadata state independently.
 // ============================================================================
 void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::shared_ptr<ConnectionBuffers> conn_buffers) {
-	// [[BLOG_HEADER: Use per-connection batch state (no global mutex)]]
-	absl::MutexLock batch_lock(&conn_buffers->state_mutex);
-	ConnectionBuffers::BatchMetadataState& batch_state = conn_buffers->batch_metadata;
-	
+	// Copy batch state in/out so we hold state_mutex only at start and end (reduces contention with consumer/swap).
+	ConnectionBuffers::BatchMetadataState batch_state;
+	{
+		absl::MutexLock batch_lock(&conn_buffers->state_mutex);
+		batch_state = conn_buffers->batch_metadata;
+	}
+
 	size_t current_pos = 0;
 	int fd = conn_buffers->fd;
-	
+
 	VLOG(5) << "ProcessSequencer5Data: Processing " << data_size << " bytes for fd=" << fd;
-	
+
 	while (current_pos < data_size) {
-		// Check if we need to read batch metadata
-		if (!batch_state.has_pending_metadata && 
+		if (!batch_state.has_pending_metadata &&
 		    current_pos + sizeof(Embarcadero::wire::BatchMetadata) <= data_size) {
-			
-			Embarcadero::wire::BatchMetadata* potential_metadata = reinterpret_cast<Embarcadero::wire::BatchMetadata*>(data + current_pos);
-			
-			// Validate batch metadata
+
+			Embarcadero::wire::BatchMetadata* potential_metadata =
+				reinterpret_cast<Embarcadero::wire::BatchMetadata*>(data + current_pos);
+
 			if (Embarcadero::wire::IsValidHeaderVersion(potential_metadata->header_version) &&
-			    potential_metadata->num_messages > 0 && 
+			    potential_metadata->num_messages > 0 &&
 			    potential_metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
 			    potential_metadata->batch_total_order < Embarcadero::wire::MAX_BATCH_TOTAL_ORDER) {
-				
-			// Found valid batch metadata
-			// [[FIX: Prevent duplicate batch processing]] Only start a new batch if we're not already processing one
-			// This prevents re-processing the same batch if ProcessSequencer5Data is called multiple times
-			if (!batch_state.has_pending_metadata) {
+
 				batch_state.pending_metadata = *potential_metadata;
 				batch_state.has_pending_metadata = true;
 				batch_state.current_batch_messages_processed = 0;
 				batch_state.next_message_order_in_batch = potential_metadata->batch_total_order;
-			} else {
-				// Already processing a batch - skip this metadata (might be duplicate or out-of-order)
-				VLOG(3) << "ProcessSequencer5Data: Skipping batch metadata (already processing batch), fd=" << fd;
-				current_pos += sizeof(Embarcadero::wire::BatchMetadata);
-				continue;
-			}
-				
-				VLOG(3) << "ProcessSequencer5Data: Found batch metadata, total_order=" 
-				        << potential_metadata->batch_total_order << ", num_messages=" 
-				        << potential_metadata->num_messages << ", header_version=" 
-				        << potential_metadata->header_version << ", fd=" << fd;
-				
+
+				VLOG(3) << "ProcessSequencer5Data: Found batch metadata, total_order="
+				        << potential_metadata->batch_total_order << ", num_messages="
+				        << potential_metadata->num_messages << ", fd=" << fd;
+
 				current_pos += sizeof(Embarcadero::wire::BatchMetadata);
 				continue;
 			}
 		}
-		
-		// Process messages (v1 MessageHeader or v2 BlogMessageHeader)
+
 		if (current_pos + sizeof(Embarcadero::MessageHeader) <= data_size) {
-			// For v2, BlogMessageHeader is also 64 bytes, so this size check is sufficient
 			void* msg_ptr = data + current_pos;
-			bool is_v2_header = (batch_state.pending_metadata.header_version == 2);
-			
+			bool is_v2_header = (batch_state.has_pending_metadata &&
+			                    batch_state.pending_metadata.header_version == 2);
+
 			if (is_v2_header) {
-				// [[BLOG_HEADER: Parse BlogMessageHeader]]
-				Embarcadero::BlogMessageHeader* v2_hdr = 
+				Embarcadero::BlogMessageHeader* v2_hdr =
 					reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg_ptr);
-				
-				// Compute padded size from v2 fields using helper
 				size_t payload_size = v2_hdr->size;
 				size_t total_msg_size = Embarcadero::wire::ComputeStrideV2(payload_size);
-				
-				// Validate message header
+
 				if (Embarcadero::wire::ValidateV2Payload(payload_size, data_size - current_pos)) {
-					
-					// Assign total_order from batch metadata
-					// [[FIX: Prevent duplicate assignment]] Only assign if total_order is 0 AND we have pending metadata
-					// This prevents re-processing the same messages if ProcessSequencer5Data is called multiple times
 					if (batch_state.has_pending_metadata) {
 						if (v2_hdr->total_order == 0) {
-							// First time processing this message - assign total_order
 							v2_hdr->total_order = batch_state.next_message_order_in_batch++;
 							batch_state.current_batch_messages_processed++;
-							
-							VLOG(5) << "ProcessSequencer5Data: Assigned total_order=" << v2_hdr->total_order 
-							        << " to BlogMessageHeader, fd=" << fd;
 						} else {
-							// Message already has total_order - skip assignment but still count it
-							// This handles the case where the same buffer is processed multiple times
 							batch_state.current_batch_messages_processed++;
-							VLOG(5) << "ProcessSequencer5Data: Message already has total_order=" << v2_hdr->total_order 
-							        << ", skipping assignment, fd=" << fd;
 						}
-						
-						// Check if we've processed all messages in the batch
-						if (batch_state.current_batch_messages_processed >= 
+						if (batch_state.current_batch_messages_processed >=
 						    batch_state.pending_metadata.num_messages) {
 							batch_state.has_pending_metadata = false;
-							VLOG(3) << "ProcessSequencer5Data: Completed batch, processed " 
-							        << batch_state.current_batch_messages_processed << " messages, fd=" << fd;
 						}
 					}
-					
 					current_pos += total_msg_size;
 				} else {
-					// Invalid message header, skip ahead
 					current_pos += 64;
 				}
 			} else {
-				// [[LEGACY: Parse MessageHeader v1]]
-				Embarcadero::MessageHeader* v1_hdr = 
+				Embarcadero::MessageHeader* v1_hdr =
 					reinterpret_cast<Embarcadero::MessageHeader*>(msg_ptr);
-				
-				// Validate message header
+
 				if (Embarcadero::wire::ValidateV1PaddedSize(v1_hdr->paddedSize, data_size - current_pos)) {
-					
-				// Assign total_order from batch metadata
-				// [[FIX: Prevent duplicate assignment]] Same logic as V2
-				if (batch_state.has_pending_metadata) {
-					if (v1_hdr->total_order == 0) {
-						// First time processing this message - assign total_order
-						v1_hdr->total_order = batch_state.next_message_order_in_batch++;
-						batch_state.current_batch_messages_processed++;
-						
-						VLOG(5) << "ProcessSequencer5Data: Assigned total_order=" << v1_hdr->total_order 
-						        << " to MessageHeader (msg " << batch_state.current_batch_messages_processed 
-						        << "/" << batch_state.pending_metadata.num_messages << "), fd=" << fd;
-					} else {
-						// Message already has total_order - count it if within batch size
-						if (batch_state.current_batch_messages_processed < batch_state.pending_metadata.num_messages) {
+					if (batch_state.has_pending_metadata) {
+						if (v1_hdr->total_order == 0) {
+							v1_hdr->total_order = batch_state.next_message_order_in_batch++;
+							batch_state.current_batch_messages_processed++;
+						} else if (batch_state.current_batch_messages_processed <
+						           batch_state.pending_metadata.num_messages) {
 							batch_state.current_batch_messages_processed++;
 						}
+						if (batch_state.current_batch_messages_processed >=
+						    batch_state.pending_metadata.num_messages) {
+							batch_state.has_pending_metadata = false;
+						}
 					}
-					
-					// Check if we've processed all messages in the batch
-					if (batch_state.current_batch_messages_processed >= 
-					    batch_state.pending_metadata.num_messages) {
-						batch_state.has_pending_metadata = false;
-						VLOG(3) << "ProcessSequencer5Data: Completed V1 batch, processed " 
-						        << batch_state.current_batch_messages_processed << " messages, fd=" << fd;
-					}
-				}
-					
 					current_pos += v1_hdr->paddedSize;
 				} else {
-					// Invalid message header, skip ahead
 					current_pos += 64;
 				}
 			}
 		} else {
-			// Not enough data for a complete message header
 			break;
 		}
+	}
+
+	{
+		absl::MutexLock batch_lock(&conn_buffers->state_mutex);
+		conn_buffers->batch_metadata = batch_state;
 	}
 }
 
@@ -1607,12 +1561,8 @@ void* Subscriber::Consume(int timeout_ms) {
                 currently_acquired_buffer = buffer;
                 current_connection = conn_ptr;
                 return message_to_return;
-			} else {
-                // No message found in this buffer, release it
-                conn_ptr->release_read_buffer(buffer);
-			}
-            
-            // No suitable message found in this buffer, release it
+            }
+            // No message found in this buffer, release it (single release only)
             conn_ptr->release_read_buffer(buffer);
 		}
 

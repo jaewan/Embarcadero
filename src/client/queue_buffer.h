@@ -109,7 +109,6 @@ private:
 	int order_;
 	int client_id_;
 	size_t message_size_;
-	// [[PERF]] Cached at construction; avoid ShouldUseBlogHeader() + order check on every Write().
 	bool use_blog_header_{false};
 
 	// N SPSC queues (producer pushes to queues_[write_buf_id_], consumer bufIdx pops from queues_[bufIdx])

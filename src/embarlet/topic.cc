@@ -4,8 +4,10 @@
 #include "../common/wire_formats.h"
 
 #include <algorithm>
-#include <cstring>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #ifdef __x86_64__
@@ -1762,12 +1764,39 @@ bool Topic::GetMessageAddr(
 	}
 #else
 	// Single-segment logic for determining message size and last offset
-	messages_size = reinterpret_cast<uint8_t*>(combined_addr) -
+	size_t full_size = reinterpret_cast<uint8_t*>(combined_addr) -
 		reinterpret_cast<uint8_t*>(start_msg_header) +
 		reinterpret_cast<MessageHeader*>(combined_addr)->paddedSize;
 
-	last_offset = reinterpret_cast<MessageHeader*>(combined_addr)->logical_offset;
-	last_addr = combined_addr;
+	// Order 0: cap export at 2MB per call to reduce mutex/send overhead (batch message export)
+	constexpr size_t kMaxExportBatchBytes = 2UL << 20;
+	if (order_ == 0 && full_size > kMaxExportBatchBytes) {
+		MessageHeader* cur = start_msg_header;
+		size_t accumulated = 0;
+		MessageHeader* stop_at = nullptr;
+		while (cur != combined_addr) {
+			size_t step = cur->paddedSize;
+			if (step == 0) break;
+			if (accumulated + step > kMaxExportBatchBytes) break;
+			accumulated += step;
+			stop_at = cur;
+			cur = reinterpret_cast<MessageHeader*>(reinterpret_cast<uint8_t*>(cur) + step);
+		}
+		if (stop_at != nullptr) {
+			last_offset = stop_at->logical_offset;
+			last_addr = stop_at;
+			messages_size = reinterpret_cast<uint8_t*>(stop_at) -
+				reinterpret_cast<uint8_t*>(start_msg_header) + stop_at->paddedSize;
+		} else {
+			messages_size = full_size;
+			last_offset = reinterpret_cast<MessageHeader*>(combined_addr)->logical_offset;
+			last_addr = combined_addr;
+		}
+	} else {
+		messages_size = full_size;
+		last_offset = reinterpret_cast<MessageHeader*>(combined_addr)->logical_offset;
+		last_addr = combined_addr;
+	}
 #endif
 
 	return true;
@@ -1981,6 +2010,7 @@ void Topic::EpochSequencerThread() {
 		}
 
 		// Partition Level 0 (client_id==0) vs Level 5 (client_id!=0)
+		// Skipped markers now carry real client_id/batch_seq and go through level5 so hold buffer can advance (§3.2)
 		std::vector<PendingBatch5> level0, level5;
 		for (PendingBatch5& p : batch_list) {
 			if (p.client_id == 0) {
@@ -2042,6 +2072,19 @@ void Topic::EpochSequencerThread() {
 			reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kGOIOffset);
 
 		for (PendingBatch5& p : ready) {
+			// [[CONSUMED_THROUGH_SKIP]] Skipped slot: only advance consumed_through so ring can drain
+			// [[CONSUMED_THROUGH_SKIP]] Skipped slot: advance consumed_through so ring can drain.
+			// [[SKIP_THE_GAP]] Accept slot_offset >= next_expected (skip the gap). Empty slots before
+			// this one have no data; we're already discarding this batch, so advancing loses nothing.
+			if (p.skipped) {
+				int b = p.broker_id;
+				size_t& next_expected = contiguous_consumed_per_broker[b];
+				if (p.slot_offset >= next_expected) {
+					next_expected = p.slot_offset + sizeof(BatchHeader);
+				}
+				continue;
+			}
+
 			p.hdr->total_order = next_order;
 
 			// [[PHASE_2_FIX]] Use sequential batch counter for GOI indexing (NOT message count)
@@ -2119,6 +2162,23 @@ void Topic::EpochSequencerThread() {
 			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].batch_headers_consumed_through));
 		}
 		CXL::store_fence();
+
+		// [[ACK_TIMEOUT_ORDER5]] Periodic epoch summary every 5s for stall diagnosis (H3/H4)
+		{
+			static thread_local auto last_epoch_summary_time = std::chrono::steady_clock::now();
+			auto now = std::chrono::steady_clock::now();
+			if (std::chrono::duration_cast<std::chrono::seconds>(now - last_epoch_summary_time).count() >= 5) {
+				size_t hb = 0;
+				{ absl::MutexLock lock(&level5_state_mu_); hb = hold_buffer_size_; }
+				LOG(INFO) << "[EpochSeq] epoch=" << last << " processed=" << ready.size()
+					<< " consumed_through=[B0:" << tinode_->offsets[0].batch_headers_consumed_through
+					<< " B1:" << tinode_->offsets[1].batch_headers_consumed_through
+					<< " B2:" << tinode_->offsets[2].batch_headers_consumed_through
+					<< " B3:" << tinode_->offsets[3].batch_headers_consumed_through << "]"
+					<< " hold_buffer=" << hb;
+				last_epoch_summary_time = now;
+			}
+		}
 	}
 }
 
@@ -2137,6 +2197,16 @@ void Topic::ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector
 
 		ClientState5& state = level5_client_state_[client_id];
 		for (auto jt = it; jt != group_end; ++jt) {
+			// [[HOLD_BUFFER_SKIP]] Skipped (in-flight) batch: advance next_expected so held batches for this client can be released
+			if (jt->skipped) {
+				if (jt->batch_seq == state.next_expected) {
+					state.next_expected = jt->batch_seq + 1;
+					state.highest_sequenced = jt->batch_seq;
+					state.recent_window.set(jt->batch_seq % 128);
+				}
+				ready.push_back(*jt);  // EpochSequencerThread still advances consumed_through for this marker
+				continue;
+			}
 			size_t seq = jt->batch_seq;
 			bool dup = (seq <= state.highest_sequenced && state.recent_window.test(seq % 128));
 			if (dup) continue;
@@ -2212,11 +2282,24 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 
 	size_t total_batches_processed = 0;
 	auto last_log_time = std::chrono::steady_clock::now();
+	auto scanner_heartbeat_time = last_log_time;  // [[ACK_TIMEOUT_ORDER5]] Per-scanner 5s heartbeat for stall diagnosis
 	size_t idle_cycles = 0;
 
 	// [[PEER_REVIEW #10]] Named constants for scanner wait/sleep (document 100µs in-flight wait, 50µs idle advance)
 	constexpr int kScannerSleepStuckSlotUs = 100;  // Sleep when retrying same in-flight slot (idle_cycles >= 1024)
 	constexpr int kScannerSleepIdleAdvanceUs = 50; // Sleep when advancing past empty slot
+
+	// [[ACK_TIMEOUT_ORDER5]] Time-bounded skip for permanently in-flight slots (see docs/ACK_TIMEOUT_ORDER5_ANALYSIS.md)
+	// If a slot stays num_msg>0 but batch_complete=0 for this long, skip it to unblock ACK pipeline
+	static int kInFlightSkipSec = []() {
+		const char* e = std::getenv("EMBARCADERO_SCANNER_INFLIGHT_SKIP_SEC");
+		int val = (e && *e) ? std::atoi(e) : 3;
+		return (val > 0) ? val : 3;  // Never use 0 (would disable skip)
+	}();
+	BatchHeader* in_flight_stuck_slot = nullptr;
+	auto in_flight_stuck_since = std::chrono::steady_clock::now();  // Avoid epoch; first slot will set real time
+	size_t consecutive_in_flight_iters = 0;  // Fallback: skip after N iters if wall-clock fails
+	constexpr size_t kInFlightSkipIterFallback = 50000;
 
 	// [[CRITICAL FIX: Simplified Polling Logic]]
 	// Match message_ordering.cc pattern: Simply check num_msg and advance if not ready
@@ -2253,6 +2336,19 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		constexpr uint32_t MAX_REASONABLE_NUM_MSG = 100000;
 		// Use batch_complete as the authoritative readiness signal for Sequencer 5
 		bool batch_ready = (batch_complete_check == 1);
+		// [[ACK_TIMEOUT_ORDER5]] Per-scanner heartbeat every 5s for stall diagnosis (H1/H2/H5)
+		{
+			auto now = std::chrono::steady_clock::now();
+			if (std::chrono::duration_cast<std::chrono::seconds>(now - scanner_heartbeat_time).count() >= 5) {
+				const char* state_str = batch_ready ? "READY" : (num_msg_check > 0 ? "IN_FLIGHT" : "EMPTY");
+				long stuck_s = (in_flight_stuck_slot == current_batch_header)
+					? static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(now - in_flight_stuck_since).count()) : 0;
+				LOG(INFO) << "[Scanner B" << broker_id << "] slot=" << std::hex << current_batch_header << std::dec
+					<< " num_msg=" << num_msg_check << " batch_complete=" << batch_complete_check
+					<< " state=" << state_str << " stuck_time=" << stuck_s << "s processed=" << total_batches_processed;
+				scanner_heartbeat_time = now;
+			}
+		}
 		if (!batch_ready || num_msg_check == 0 || num_msg_check > MAX_REASONABLE_NUM_MSG) {
 			++idle_cycles;
 			// [[FIX: ACK_STALL_10GB]] When slot is "in-flight" (num_msg>0 but batch_complete=0),
@@ -2293,12 +2389,64 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				continue;  // Retry at top of loop: full invalidation then process
 			}
 
-			// - If slot is in-flight (num_msg>0 but batch_complete=0), DON'T skip it!
+			// - If slot is in-flight (num_msg>0 but batch_complete=0), DON'T skip it immediately!
 			//   Stay here and retry. Skipping creates gaps → consumed_through stuck → ring full → stall.
-			// - Only advance to next slot if this slot is truly empty (num_msg=0)
+			// - [[ACK_TIMEOUT_ORDER5]] After kInFlightSkipSec seconds, skip to unblock ACK pipeline
+			//   (see docs/ACK_TIMEOUT_ORDER5_ANALYSIS.md). Creates a gap for that batch but avoids permanent stall.
 			bool slot_is_in_flight = (num_msg_check > 0 && num_msg_check <= MAX_REASONABLE_NUM_MSG);
 			if (slot_is_in_flight) {
-				// DON'T skip - stay at this slot and retry (100µs sleep gives producer time to set batch_complete)
+				auto now = std::chrono::steady_clock::now();
+				if (current_batch_header != in_flight_stuck_slot) {
+					in_flight_stuck_slot = current_batch_header;
+					in_flight_stuck_since = now;
+					consecutive_in_flight_iters = 0;
+				}
+				consecutive_in_flight_iters++;
+				auto elapsed = now - in_flight_stuck_since;
+				bool skip_by_time = (elapsed >= std::chrono::seconds(kInFlightSkipSec));
+				bool skip_by_iters = (consecutive_in_flight_iters >= kInFlightSkipIterFallback);
+				if (skip_by_time || skip_by_iters) {
+					LOG(WARNING) << "BrokerScannerWorker5 [B" << broker_id << "]: Skipping stuck in-flight slot after "
+					            << (skip_by_time ? (std::to_string(kInFlightSkipSec) + "s") : (std::to_string(consecutive_in_flight_iters) + " iters (fallback)"))
+					            << " (num_msg=" << num_msg_check << " batch_complete=0 "
+					            << "slot_addr=" << std::hex << current_batch_header << std::dec
+					            << "). ACK pipeline unblocked; this batch will not be ordered.";
+					// [[CONSUMED_THROUGH_SKIP]] Push skipped marker so EpochSequencerThread advances consumed_through
+					// (otherwise ring stays "full" and broker can't allocate → more in-flight slots → feedback loop)
+					// [[HOLD_BUFFER_SKIP]] Carry original client_id and batch_seq so ProcessLevel5Batches can advance
+					// next_expected and release held batches for that client (avoid hold-buffer deadlock).
+					size_t slot_off = reinterpret_cast<uint8_t*>(current_batch_header) -
+						reinterpret_cast<uint8_t*>(ring_start_default);
+					PendingBatch5 marker;
+					marker.hdr = nullptr;  // Skipped: slot may be overwritten after consumed_through advances; do not dereference
+					marker.broker_id = broker_id;
+					marker.slot_offset = slot_off;
+					marker.num_msg = 0;
+					marker.skipped = true;
+					marker.client_id = current_batch_header->client_id;
+					marker.batch_seq = current_batch_header->batch_seq;
+					// [[CRITICAL]] Use control_block->epoch (same as staleness check). In-flight header is not flushed by broker (Issue #4) so current_batch_header->epoch_created may be stale.
+					{
+						ControlBlock* cb = reinterpret_cast<ControlBlock*>(cxl_addr_);
+						CXL::flush_cacheline(cb);
+						CXL::load_fence();
+						uint64_t ce = cb->epoch.load(std::memory_order_acquire);
+						marker.epoch_created = static_cast<uint16_t>(std::min(ce, static_cast<uint64_t>(0xFFFF)));
+					}
+					{
+						absl::MutexLock lock(&epoch_buffer_mutex_);
+						epoch_buffers_[epoch_index_.load(std::memory_order_acquire) % 3].push_back(marker);
+					}
+					BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
+					if (next_batch_header >= ring_end) next_batch_header = ring_start_default;
+					current_batch_header = next_batch_header;
+					in_flight_stuck_slot = nullptr;
+					consecutive_in_flight_iters = 0;
+					idle_cycles = 0;
+					continue;
+				}
+				// DON'T skip yet - stay at this slot and retry (100µs sleep gives producer time to set batch_complete)
 				++idle_cycles;
 				if (idle_cycles >= 1024) {
 					std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -2308,6 +2456,8 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				}
 				continue;  // Retry same slot
 			}
+			in_flight_stuck_slot = nullptr;  // Not in-flight; reset so next stuck slot gets fresh timer
+			consecutive_in_flight_iters = 0;
 
 			// [[DIAGNOSTIC: VLOG to avoid hot-path overhead during throughput tests]]
 			if (++scan_loops % 100000 == 0 || (total_batches_processed > 450 && scan_loops % 10000 == 0)) {
@@ -2349,6 +2499,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			        << " batch_seq=" << current_batch_header->batch_seq
 			        << " num_msg=" << num_msg_check;
 		}
+
+		// [[ACK_TIMEOUT_ORDER5]] Reset stuck-slot tracker when we successfully process a batch
+		in_flight_stuck_slot = nullptr;
 
 		// [[PHASE_1B]] Batch ready: push to epoch buffer; EpochSequencerThread will assign order and commit
 		VLOG(3) << "BrokerScannerWorker5 [B" << broker_id << "]: Collecting batch with "

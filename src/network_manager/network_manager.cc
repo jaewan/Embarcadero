@@ -13,6 +13,10 @@
 #include <chrono>
 #include <errno.h>
 
+#ifndef MSG_ZEROCOPY
+#define MSG_ZEROCOPY 0x4000000
+#endif
+
 #include <glog/logging.h>
 #include "mimalloc.h"
 
@@ -1144,7 +1148,7 @@ void NetworkManager::HandleSubscribeRequest(
 
 	struct epoll_event event;
 	event.data.fd = client_socket;
-	event.events = EPOLLOUT;
+	event.events = EPOLLOUT | EPOLLET;  // Edge-triggered: send until EAGAIN then wait (reduces epoll_wait syscalls)
 	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &event) < 0) {
 		LOG(ERROR) << "epoll_ctl failed: " << strerror(errno);
 		close(client_socket);
@@ -1228,105 +1232,100 @@ void NetworkManager::SubscribeNetworkThread(
 			messages_size = req.len;
 			VLOG(3) << "[DEBUG] poped from queue:" << messages_size;
 		} else {
-			// Get new messages from CXL manager
-			// PERFORMANCE OPTIMIZATION: Use cached state pointer (no hash map lookup)
-			absl::MutexLock lock(&(*cached_state_ptr)->mu);
-
+			// Get new messages from CXL manager. Narrow mutex: copy-out, call without lock, copy-in.
+			size_t local_offset;
+			{
+				absl::MutexLock lock(&(*cached_state_ptr)->mu);
+				local_offset = (*cached_state_ptr)->last_offset;
+			}
 			if (order == 5) {
-			// For Sequencer 5: Get batch with metadata
-			size_t batch_total_order = 0;
-			uint32_t num_messages = 0;
-			static int no_data_count = 0;
-			if (!topic_manager_->GetBatchToExportWithMetadata(
-						topic,
-						(*cached_state_ptr)->last_offset,
-						msg,
-						messages_size,
-						batch_total_order,
-						num_messages)){
-				no_data_count++;
-				if (no_data_count % 1000 == 0) {
-					VLOG(2) << "SubscribeNetworkThread: No data available for export yet (count=" << no_data_count 
-					        << "), topic=" << topic << ", last_offset=" << (*cached_state_ptr)->last_offset;
+				size_t batch_total_order = 0;
+				uint32_t num_messages = 0;
+				if (!topic_manager_->GetBatchToExportWithMetadata(
+							topic,
+							local_offset,
+							msg,
+							messages_size,
+							batch_total_order,
+							num_messages)){
+					std::this_thread::yield();
+					continue;
 				}
+				{
+					absl::MutexLock lock(&(*cached_state_ptr)->mu);
+					(*cached_state_ptr)->last_offset = local_offset;
+				}
+				batch_meta.batch_total_order = batch_total_order;
+				batch_meta.num_messages = num_messages;
+				batch_meta.header_version = (order == 5 && HeaderUtils::ShouldUseBlogHeader()) ? 2 : 1;
+				batch_meta.flags = 0;
+				VLOG(2) << "SubscribeNetworkThread: Sending batch metadata, total_order=" << batch_total_order
+				        << ", num_messages=" << num_messages << ", topic=" << topic;
+			} else if (order > 0) {
+				if (!topic_manager_->GetBatchToExport(
+							topic,
+							local_offset,
+							msg,
+							messages_size)){
+					std::this_thread::yield();
+					continue;
+				}
+				{
+					absl::MutexLock lock(&(*cached_state_ptr)->mu);
+					(*cached_state_ptr)->last_offset = local_offset;
+				}
+			} else {
+			// Order 0: copy-out, call GetMessageAddr without holding mutex (it may spin on next_msg_diff), then copy-in
+			size_t local_offset;
+			void* local_addr = nullptr;
+			{
+				absl::MutexLock lock(&(*cached_state_ptr)->mu);
+				local_offset = (*cached_state_ptr)->last_offset;
+				local_addr = (*cached_state_ptr)->last_addr;
+			}
+			if (!topic_manager_->GetMessageAddr(topic, local_offset, local_addr, msg, messages_size)) {
 				std::this_thread::yield();
 				continue;
 			}
-			no_data_count = 0;  // Reset counter when data becomes available
-			// Store metadata for sending
-			batch_meta.batch_total_order = batch_total_order;
-			batch_meta.num_messages = num_messages;
-			// [[BLOG_HEADER: Set header_version based on feature flag]]
-			batch_meta.header_version = (order == 5 && HeaderUtils::ShouldUseBlogHeader()) ? 2 : 1;
-			batch_meta.flags = 0;
-			// [[PERF: Demoted from LOG(INFO) to VLOG(2) - this is hot path per batch]]
-			VLOG(2) << "SubscribeNetworkThread: Sending batch metadata, total_order=" << batch_total_order 
-			        << ", num_messages=" << num_messages << ", header_version=" << batch_meta.header_version 
-			        << ", topic=" << topic;
-			} else if (order > 0){
-				if (!topic_manager_->GetBatchToExport(
-							topic,
-							(*cached_state_ptr)->last_offset,
-							msg,
-							messages_size)){
-						std::this_thread::yield();
-						continue;
-}
-		}else{
-			if (topic_manager_->GetMessageAddr(
-								topic,
-								(*cached_state_ptr)->last_offset,
-								(*cached_state_ptr)->last_addr,
-								msg,
-								messages_size)) {
-					// [[BLOG_HEADER: Split large messages with version-aware boundary]]
-					// Split large messages into chunks for better flow control
-					bool using_blog_header = (order == 5 && HeaderUtils::ShouldUseBlogHeader());
-					
-					while (messages_size > zero_copy_send_limit) {
-						struct LargeMsgRequest r;
-						r.msg = msg;
-
-						// Ensure we don't cut in the middle of a message
-						// For v2 BlogMessageHeader, compute size from BlogMessageHeader fields
-						size_t padded_size = 0;
-						if (using_blog_header) {
-							Embarcadero::BlogMessageHeader* v2_hdr = 
-								reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg);
-							// Compute padded size from v2 fields
-							size_t payload_size = v2_hdr->size;
-							if (!wire::ValidateV2Payload(payload_size, messages_size)) {
-								LOG(ERROR) << "SubscribeNetworkThread: Invalid v2 payload_size=" << payload_size
-								           << " for splitting, messages_size=" << messages_size;
-								break;
-							}
-							padded_size = wire::ComputeStrideV2(payload_size);
-						} else {
-							// v1 MessageHeader uses paddedSize
-							MessageHeader* v1_hdr = reinterpret_cast<MessageHeader*>(msg);
-							if (!wire::ValidateV1PaddedSize(v1_hdr->paddedSize, messages_size)) {
-								LOG(ERROR) << "SubscribeNetworkThread: Invalid v1 paddedSize=" << v1_hdr->paddedSize
-								           << " for splitting, messages_size=" << messages_size;
-								break;
-							}
-							padded_size = v1_hdr->paddedSize;
-						}
-						
-						if (padded_size == 0) {
-							LOG(ERROR) << "SubscribeNetworkThread: Invalid message size, skipping to avoid SIGFPE";
-							break; // Exit the large message splitting loop
-						}
-						int mod = zero_copy_send_limit % padded_size;
-							r.len = zero_copy_send_limit - mod;
-
-							large_msg_queue_.blockingWrite(r);
-							msg = (uint8_t*)msg + r.len;
-							messages_size -= r.len;
-						}
-			} else {
-				// No new messages, yield and try again
-				std::this_thread::yield();
-				continue;
+			{
+				absl::MutexLock lock(&(*cached_state_ptr)->mu);
+				(*cached_state_ptr)->last_offset = local_offset;
+				(*cached_state_ptr)->last_addr = local_addr;
+			}
+			// [[BLOG_HEADER: Split large messages with version-aware boundary]]
+			bool using_blog_header = (order == 5 && HeaderUtils::ShouldUseBlogHeader());
+			while (messages_size > zero_copy_send_limit) {
+				struct LargeMsgRequest r;
+				r.msg = msg;
+				size_t padded_size = 0;
+				if (using_blog_header) {
+					Embarcadero::BlogMessageHeader* v2_hdr =
+						reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg);
+					size_t payload_size = v2_hdr->size;
+					if (!wire::ValidateV2Payload(payload_size, messages_size)) {
+						LOG(ERROR) << "SubscribeNetworkThread: Invalid v2 payload_size=" << payload_size
+						           << " for splitting, messages_size=" << messages_size;
+						break;
+					}
+					padded_size = wire::ComputeStrideV2(payload_size);
+				} else {
+					MessageHeader* v1_hdr = reinterpret_cast<MessageHeader*>(msg);
+					if (!wire::ValidateV1PaddedSize(v1_hdr->paddedSize, messages_size)) {
+						LOG(ERROR) << "SubscribeNetworkThread: Invalid v1 paddedSize=" << v1_hdr->paddedSize
+						           << " for splitting, messages_size=" << messages_size;
+						break;
+					}
+					padded_size = v1_hdr->paddedSize;
+				}
+				if (padded_size == 0) {
+					LOG(ERROR) << "SubscribeNetworkThread: Invalid message size, skipping to avoid SIGFPE";
+					break;
+				}
+				int mod = zero_copy_send_limit % padded_size;
+				r.len = zero_copy_send_limit - mod;
+				large_msg_queue_.blockingWrite(r);
+				msg = (uint8_t*)msg + r.len;
+				messages_size -= r.len;
 			}
 		}
 		}
@@ -1366,45 +1365,38 @@ bool NetworkManager::SendMessageData(
 	size_t sent_bytes = 0;
 
 	while (sent_bytes < buffer_size) {
-		// Wait for socket to be writable
+		// Edge-triggered: send until EAGAIN (or done), then wait once for EPOLLOUT
+		while (sent_bytes < buffer_size) {
+			size_t remaining_bytes = buffer_size - sent_bytes;
+			size_t to_send = std::min(remaining_bytes, send_limit);
+			int send_flags = 0;
+			if (to_send >= (1UL << 16)) {
+				send_flags = MSG_ZEROCOPY;
+			}
+			int ret = send(sock_fd, (uint8_t*)buffer + sent_bytes, to_send, send_flags);
+
+			if (ret > 0) {
+				sent_bytes += ret;
+				send_limit = ZERO_COPY_SEND_LIMIT;
+			} else if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+				send_limit = std::max(send_limit / 2, 1UL << 16);
+				break;  // Wait for epoll
+			} else if (ret < 0) {
+				LOG(ERROR) << "Error sending data: " << strerror(errno) << ", to_send: " << to_send;
+				return false;
+			}
+		}
+		if (sent_bytes >= buffer_size) {
+			break;
+		}
 		struct epoll_event events[10];
 		int n = epoll_wait(epoll_fd, events, 10, -1);
-
 		if (n == -1) {
 			LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
 			return false;
 		}
-
 		for (int i = 0; i < n; ++i) {
-			if (events[i].events & EPOLLOUT) {
-				// Calculate how much to send in this iteration
-				size_t remaining_bytes = buffer_size - sent_bytes;
-				size_t to_send = std::min(remaining_bytes, send_limit);
-
-				// Send data
-				int ret;
-				if (to_send < 1UL << 16) { // < 64KB
-					ret = send(sock_fd, (uint8_t*)buffer + sent_bytes, to_send, 0);
-				} else {
-					ret = send(sock_fd, (uint8_t*)buffer + sent_bytes, to_send, 0);
-					// Could use MSG_ZEROCOPY for large messages if needed
-				}
-
-				if (ret > 0) {
-					// Data sent successfully
-					sent_bytes += ret;
-					send_limit = ZERO_COPY_SEND_LIMIT;  // Reset to default
-				} else if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-					// Would block, reduce send size and retry
-					send_limit = std::max(send_limit / 2, 1UL << 16);  // Cap at 64K
-					continue;
-				} else if (ret < 0) {
-					// Fatal error
-					LOG(ERROR) << "Error sending data: " << strerror(errno)
-						<< ", to_send: " << to_send;
-					return false;
-				}
-			} else if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+			if (events[i].events & (EPOLLERR | EPOLLHUP)) {
 				LOG(INFO) << "Socket error or hang-up";
 				return false;
 			}

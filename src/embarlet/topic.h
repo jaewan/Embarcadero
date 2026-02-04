@@ -35,6 +35,8 @@ struct PendingBatch5 {
 	size_t batch_seq{0};
 	size_t slot_offset{0};  // For commit order (consumed_through per broker)
 	uint16_t epoch_created{0};  // [[PHASE_1A]] For sequencer-side epoch validation (§4.2)
+	// [[CONSUMED_THROUGH_SKIP]] When true, scanner skipped this slot (in-flight); sequencer only advances consumed_through
+	bool skipped{false};
 };
 struct ClientState5 {
 	uint64_t next_expected{0};

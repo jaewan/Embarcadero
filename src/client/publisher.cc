@@ -1064,7 +1064,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					// Wait a bit to see if batches arrive, then exit gracefully
 					std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				}
-				// [[CORRECTNESS]] Drain remaining batches before exit.
+				// Drain remaining batches before exit.
 				while ((batch_header = static_cast<Embarcadero::BatchHeader*>(pubQue_.Read(pubQuesIdx))) != nullptr
 				       && batch_header->total_size != 0) {
 					has_sent_batch = true;
