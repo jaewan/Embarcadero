@@ -719,6 +719,130 @@ private:
 };
 
 // ============================================================================
+// FastDeduplicator: Zero-allocation deduplication
+// ============================================================================
+// Design: Open-addressing hash table + circular ring for FIFO eviction.
+// All memory pre-allocated; zero malloc/free on hot path.
+//
+// Performance: O(1) average insert/lookup, ~10-50ns per operation.
+// Memory: 24 MB (2M hash entries + 1M ring entries).
+
+class FastDeduplicator {
+public:
+    static constexpr size_t TABLE_SIZE = 1ULL << 21;  // 2M entries
+    static constexpr size_t TABLE_MASK = TABLE_SIZE - 1;
+    static constexpr size_t RING_SIZE = 1ULL << 20;   // 1M entries
+    static constexpr size_t RING_MASK = RING_SIZE - 1;
+    static constexpr uint32_t MAX_PROBES = 128;
+    static constexpr uint64_t EMPTY = 0xFFFFFFFFFFFFFFFFULL;
+    static constexpr uint64_t TOMBSTONE = 0xFFFFFFFFFFFFFFFEULL;
+
+private:
+    alignas(64) std::vector<uint64_t> table_;
+    alignas(64) std::vector<uint64_t> ring_;
+    size_t ring_head_ = 0;
+    size_t count_ = 0;
+    bool skip_ = false;
+#ifndef NDEBUG
+    std::thread::id owner_thread_;
+    bool owner_set_ = false;
+#endif
+
+public:
+    FastDeduplicator() : table_(TABLE_SIZE, EMPTY), ring_(RING_SIZE, EMPTY) {}
+
+    void set_skip(bool skip) noexcept { skip_ = skip; }
+
+    // Returns true if duplicate (already seen), false if new
+    // Single-threaded: only sequencer thread may call this.
+    [[nodiscard]] bool check_and_insert(uint64_t batch_id) noexcept {
+#ifndef NDEBUG
+        if (!owner_set_) {
+            owner_thread_ = std::this_thread::get_id();
+            owner_set_ = true;
+        }
+        assert(std::this_thread::get_id() == owner_thread_ &&
+               "FastDeduplicator accessed from multiple threads!");
+#endif
+        if (skip_) return false;
+        if (batch_id >= TOMBSTONE) [[unlikely]] return false;
+
+        const uint64_t h = hash64(batch_id);
+        size_t idx = h & TABLE_MASK;
+        size_t insert_at = static_cast<size_t>(-1);
+
+#ifndef NDEBUG
+        assert(idx < TABLE_SIZE && "Table index out of bounds");
+#endif
+
+        for (uint32_t probe = 0; probe < MAX_PROBES; ++probe) {
+            uint64_t entry = table_[idx];
+
+            if (entry == batch_id) return true;  // Duplicate
+
+            if (entry == EMPTY) {
+                if (insert_at == static_cast<size_t>(-1)) insert_at = idx;
+                break;
+            }
+
+            if (entry == TOMBSTONE && insert_at == static_cast<size_t>(-1)) {
+                insert_at = idx;
+            }
+
+            idx = (idx + 1) & TABLE_MASK;  // TABLE_MASK keeps idx in [0, TABLE_SIZE-1]
+        }
+
+        if (insert_at == static_cast<size_t>(-1)) [[unlikely]] return false;
+
+        // Evict if at capacity. Ensure count_ never exceeds RING_SIZE.
+        if (count_ >= RING_SIZE) {
+            // Oldest slot in FIFO order: (ring_head_ - count_) mod RING_SIZE.
+            size_t oldest = (ring_head_ + RING_SIZE - count_) & RING_MASK;
+#ifndef NDEBUG
+            assert(oldest < RING_SIZE && "Ring oldest index out of bounds");
+#endif
+            uint64_t old_id = ring_[oldest];
+            if (old_id != EMPTY && old_id < TOMBSTONE) {
+                size_t old_idx = hash64(old_id) & TABLE_MASK;
+                for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+                    if (table_[old_idx] == old_id) {
+                        table_[old_idx] = TOMBSTONE;
+                        break;
+                    }
+                    if (table_[old_idx] == EMPTY) break;
+                    old_idx = (old_idx + 1) & TABLE_MASK;
+                }
+            }
+            ring_[oldest] = EMPTY;
+            --count_;
+        }
+
+        table_[insert_at] = batch_id;
+#ifndef NDEBUG
+        assert(ring_head_ < RING_SIZE && "Ring head out of bounds");
+#endif
+        ring_[ring_head_] = batch_id;
+        ring_head_ = (ring_head_ + 1) & RING_MASK;
+        ++count_;
+#ifndef NDEBUG
+        assert(count_ <= RING_SIZE && "FastDeduplicator count_ invariant");
+#endif
+
+        return false;  // New entry
+    }
+
+private:
+    static uint64_t hash64(uint64_t x) noexcept {
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ULL;
+        x ^= x >> 33;
+        return x;
+    }
+};
+
+// ============================================================================
 // Per-shard state and coordinator (plan §2.3–2.4) — after ShardQueue, Deduplicator
 // ============================================================================
 
@@ -960,9 +1084,13 @@ struct alignas(128) Stats {
     std::atomic<uint64_t> l5_time_ns{0};    // Phase: process_level5 + drain_hold + age_hold
     std::atomic<uint64_t> writer_phase_ns{0};  // Scatter-gather: gather+sort+write GOI per epoch
     // Assessment §2.1: Phase timing for bottleneck profiling (per-epoch cumulative; print every 100 epochs).
+    std::atomic<uint64_t> phase_count_ns{0};   // Count total from collectors
+    std::atomic<uint64_t> phase_reserve_ns{0};  // merge_buffer_.reserve(total)
+    std::atomic<uint64_t> phase_merge_ns{0};   // Insert/move collector buffers into merge
     std::atomic<uint64_t> phase_partition_ns{0};
     std::atomic<uint64_t> phase_l0_ns{0};
     std::atomic<uint64_t> phase_l5_ns{0};
+    std::atomic<uint64_t> phase_assign_ns{0};   // fetch_add + assign global_seq loop
     std::atomic<uint64_t> phase_l5_reorder_ns{0};  // stable_partition + L5 tail sort in per-epoch path
     std::atomic<uint64_t> phase_l0_dedup_ns{0};    // Deduplicator cost inside process_level0
 
@@ -987,9 +1115,13 @@ struct alignas(128) Stats {
         sort_time_ns = 0;
         hold_phase_ns = 0;
         writer_phase_ns = 0;
+        phase_count_ns = 0;
+        phase_reserve_ns = 0;
+        phase_merge_ns = 0;
         phase_partition_ns = 0;
         phase_l0_ns = 0;
         phase_l5_ns = 0;
+        phase_assign_ns = 0;
         phase_l5_reorder_ns = 0;
         phase_l0_dedup_ns = 0;
         latency_ring.reset();
@@ -1036,8 +1168,24 @@ struct SequencerConfig {
     /// Phase 2: when >0, use dense vectors for client state (client_id in [0, max_clients)); avoids hash lookups.
     uint32_t max_clients = 0;
 
-    /// Ablation: if true, disable deduplication (benchmark has no retries, dedup just adds overhead)
+    /// Ablation: if true, disable deduplication.
+    ///
+    /// RATIONALE FOR ABLATION STUDIES:
+    /// The benchmark generates globally unique batch_ids:
+    ///   batch_id = (thread_id << 48) | atomic_counter
+    /// Therefore, duplicates never occur in the benchmark.
+    ///
+    /// Deduplication is needed in PRODUCTION for client retries,
+    /// but is orthogonal to the per-batch vs per-epoch comparison.
+    /// For algorithm ablation, --skip-dedup produces valid results
+    /// that isolate the sequencing algorithm performance.
+    ///
+    /// For end-to-end system evaluation (including retry handling),
+    /// run without this flag using FastDeduplicator.
     bool skip_dedup = false;
+
+    /// Use FastDeduplicator instead of legacy Deduplicator (single-threaded path).
+    bool use_fast_dedup = true;
 
     void validate() {
         num_brokers = std::clamp(num_brokers, 1u, config::MAX_BROKERS);
@@ -1223,7 +1371,17 @@ private:
     std::mutex epoch_mtx_;
     std::condition_variable epoch_cv_;
 
-    Deduplicator dedup_;
+    Deduplicator legacy_dedup_;
+    FastDeduplicator fast_dedup_;
+
+    /// Single-threaded path: dispatch to fast or legacy dedup per config.
+    bool check_dedup(uint64_t batch_id) {
+        if (config_.skip_dedup) return false;
+        if (config_.use_fast_dedup)
+            return fast_dedup_.check_and_insert(batch_id);
+        return legacy_dedup_.check_and_insert(batch_id);
+    }
+
     RadixSorter sorter_;
     std::vector<BatchInfo> merge_buffer_;
     std::vector<BatchInfo> ready_buffer_;
@@ -1413,7 +1571,16 @@ void Sequencer::start() {
         return;
     }
 
-    // Single-threaded path
+    // Single-threaded path: apply skip_dedup to both deduplicators (scatter-gather sets it per-shard above)
+    legacy_dedup_.set_skip(config_.skip_dedup);
+    fast_dedup_.set_skip(config_.skip_dedup);
+
+    // Improvement instruction Task A Step 7: pre-allocate hot-path buffers in start() to avoid malloc in process_epoch
+    merge_buffer_.reserve(config::MAX_BATCHES_PER_EPOCH);
+    ready_buffer_.reserve(config::MAX_BATCHES_PER_EPOCH);
+    l0_buffer_.reserve(config::MAX_BATCHES_PER_EPOCH);
+    l5_buffer_.reserve(config::MAX_BATCHES_PER_EPOCH);
+
     std::vector<std::vector<int>> assignments(config_.num_collectors);
     for (uint32_t i = 0; i < config_.num_brokers; ++i) {
         assignments[i % config_.num_collectors].push_back(int(i));
@@ -1758,35 +1925,8 @@ void Sequencer::sequencer_loop() {
         stats_.record_seq_latency(ns);
         uint64_t epochs_done = stats_.epochs_completed.fetch_add(1, std::memory_order_relaxed) + 1;
 
-        // Assessment §2.1: Phase profile every 100 epochs (diagnostic; set SEQUENCER_PROFILE_PHASE=1 to enable).
-        if (epochs_done % 100 == 0 && epochs_done >= 100) {
-            uint64_t merge_ns = stats_.merge_time_ns.load(std::memory_order_relaxed);
-            uint64_t part_ns = stats_.phase_partition_ns.load(std::memory_order_relaxed);
-            uint64_t l0_ns = stats_.phase_l0_ns.load(std::memory_order_relaxed);
-            uint64_t l5_ns = stats_.phase_l5_ns.load(std::memory_order_relaxed);
-            uint64_t hold_ns = stats_.hold_phase_ns.load(std::memory_order_relaxed);
-            uint64_t l5_reorder_ns = stats_.phase_l5_reorder_ns.load(std::memory_order_relaxed);
-            uint64_t l0_dedup_ns = stats_.phase_l0_dedup_ns.load(std::memory_order_relaxed);
-            uint64_t window = 100;
-            std::cerr << "[PROFILE] merge=" << (merge_ns / window / 1000)
-                      << " partition=" << (part_ns / window / 1000)
-                      << " l0=" << (l0_ns / window / 1000)
-                      << " l5=" << (l5_ns / window / 1000)
-                      << " l5_reorder=" << (l5_reorder_ns / window / 1000)
-                      << " l0_dedup=" << (l0_dedup_ns / window / 1000)
-                      << " hold=" << (hold_ns / window / 1000)
-                      << " μs/epoch (avg over " << window << " epochs)\n";
-            stats_.merge_time_ns.store(0, std::memory_order_relaxed);
-            stats_.phase_partition_ns.store(0, std::memory_order_relaxed);
-            stats_.phase_l0_ns.store(0, std::memory_order_relaxed);
-            stats_.phase_l5_ns.store(0, std::memory_order_relaxed);
-            stats_.phase_l5_reorder_ns.store(0, std::memory_order_relaxed);
-            stats_.phase_l0_dedup_ns.store(0, std::memory_order_relaxed);
-            stats_.hold_phase_ns.store(0, std::memory_order_relaxed);
-        }
-
 #ifdef SEQUENCER_DEBUG_TIMING
-        // Phase timing (after record so total/merge/l5/count refer to same epoch count)
+        // Run before phase profile exchange(0) so we read cumulative stats (code review fix).
         uint64_t count = stats_.seq_count.load(std::memory_order_relaxed);
         if (count > 0 && (count % 100) == 0) {
             uint64_t merge = stats_.merge_time_ns.load(std::memory_order_relaxed);
@@ -1808,6 +1948,37 @@ void Sequencer::sequencer_loop() {
             }
         }
 #endif
+
+        // Assessment §2.1: Phase profile every 100 epochs (improvement_instruction Task A).
+        if (epochs_done % 100 == 0 && epochs_done >= 100) {
+            const uint64_t window = 100;
+            uint64_t count_ns = stats_.phase_count_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t reserve_ns = stats_.phase_reserve_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t merge_ns = stats_.phase_merge_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t part_ns = stats_.phase_partition_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t l0_ns = stats_.phase_l0_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t l5_ns = stats_.phase_l5_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t assign_ns = stats_.phase_assign_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t merge_total_ns = stats_.merge_time_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t l5_reorder_ns = stats_.phase_l5_reorder_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t l0_dedup_ns = stats_.phase_l0_dedup_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t hold_ns = stats_.hold_phase_ns.exchange(0, std::memory_order_relaxed);
+            uint64_t total_phase_ns = count_ns + reserve_ns + merge_ns + part_ns + l0_ns + l5_ns + assign_ns;
+            std::cerr << "[PHASE μs/epoch] count=" << (count_ns / window / 1000)
+                      << " reserve=" << (reserve_ns / window / 1000)
+                      << " merge=" << (merge_ns / window / 1000)
+                      << " partition=" << (part_ns / window / 1000)
+                      << " L0=" << (l0_ns / window / 1000)
+                      << " L5=" << (l5_ns / window / 1000)
+                      << " assign=" << (assign_ns / window / 1000)
+                      << " TOTAL=" << (total_phase_ns / window / 1000)
+                      << " (avg over " << window << " epochs)\n";
+            std::cerr << "[PROFILE] merge_total=" << (merge_total_ns / window / 1000)
+                      << " l5_reorder=" << (l5_reorder_ns / window / 1000)
+                      << " l0_dedup=" << (l0_dedup_ns / window / 1000)
+                      << " hold=" << (hold_ns / window / 1000)
+                      << " μs/epoch\n";
+        }
 
         for (uint32_t i = 0; i < config_.num_brokers; ++i) {
             uint64_t committed = buf.broker_committed_pbr[i].load(std::memory_order_acquire);
@@ -1835,18 +2006,17 @@ void Sequencer::process_epoch(EpochBuffer& buf) {
     merge_buffer_.clear();
     ready_buffer_.clear();
 
-    // Phase 2: avoid realloc in hot path — reserve once up to max
-    if (merge_buffer_.capacity() < config::MAX_BATCHES_PER_EPOCH) merge_buffer_.reserve(config::MAX_BATCHES_PER_EPOCH);
-    if (ready_buffer_.capacity() < config::MAX_BATCHES_PER_EPOCH) ready_buffer_.reserve(config::MAX_BATCHES_PER_EPOCH);
-    if (l0_buffer_.capacity() < config::MAX_BATCHES_PER_EPOCH) l0_buffer_.reserve(config::MAX_BATCHES_PER_EPOCH);
-    if (l5_buffer_.capacity() < config::MAX_BATCHES_PER_EPOCH) l5_buffer_.reserve(config::MAX_BATCHES_PER_EPOCH);
+    // Buffers pre-allocated in start() (single-threaded path) to avoid realloc in hot path
 
-    uint64_t t_merge0 = now_ns();
+    // Phase timing: count -> reserve -> merge (improvement_instruction Task A)
+    uint64_t t0 = now_ns();
     size_t total = 0;
     for (uint32_t i = 0; i < config_.num_collectors; ++i) {
         total += buf.collectors[i].batches.size();
     }
+    uint64_t t1 = now_ns();
     merge_buffer_.reserve(total);
+    uint64_t t2 = now_ns();
     for (uint32_t i = 0; i < config_.num_collectors; ++i) {
         auto& v = buf.collectors[i].batches;
         merge_buffer_.insert(merge_buffer_.end(),
@@ -1854,7 +2024,11 @@ void Sequencer::process_epoch(EpochBuffer& buf) {
                              std::make_move_iterator(v.end()));
         v.clear();
     }
-    stats_.merge_time_ns.fetch_add(now_ns() - t_merge0, std::memory_order_relaxed);
+    uint64_t t3 = now_ns();
+    stats_.phase_count_ns.fetch_add(t1 - t0, std::memory_order_relaxed);
+    stats_.phase_reserve_ns.fetch_add(t2 - t1, std::memory_order_relaxed);
+    stats_.phase_merge_ns.fetch_add(t3 - t2, std::memory_order_relaxed);
+    stats_.merge_time_ns.fetch_add(t3 - t0, std::memory_order_relaxed);
 
     uint64_t t_seq0 = now_ns();
     ready_buffer_.reserve(merge_buffer_.size() + 1024);
@@ -1892,7 +2066,7 @@ void Sequencer::sequence_batches_per_batch(std::vector<BatchInfo>& in, std::vect
         }
     }
     for (auto& b : l0_buffer_) {
-        if (!dedup_.check_and_insert(b.batch_id)) {
+        if (!check_dedup(b.batch_id)) {
             b.global_seq = global_seq_.fetch_add(1, std::memory_order_relaxed);
             stats_.atomics_executed.fetch_add(1, std::memory_order_relaxed);
             out.push_back(std::move(b));
@@ -1971,21 +2145,29 @@ void Sequencer::sequence_batches_per_epoch(std::vector<BatchInfo>& in, std::vect
         l5_ready.clear();
     }
 
+    uint64_t t_assign0 = now_ns();
     if (!out.empty()) {
         uint64_t base = global_seq_.fetch_add(out.size(), std::memory_order_relaxed);
         stats_.atomics_executed.fetch_add(1, std::memory_order_relaxed);
         for (size_t i = 0; i < out.size(); ++i) out[i].global_seq = base + i;
     }
+    stats_.phase_assign_ns.fetch_add(now_ns() - t_assign0, std::memory_order_relaxed);
 }
 
 // Level 0 = no per-client order; Level 5 = strong per-client order (see Order levels comment above).
 void Sequencer::process_level0(std::vector<BatchInfo>& in, std::vector<BatchInfo>& out) {
     uint64_t t0 = now_ns();
+    static constexpr unsigned kLogFirstNDuplicateBatchIds = 10;  // For investigating unexpected duplicates
+    static std::atomic<unsigned> duplicate_log_count{0};
     for (auto& b : in) {
-        if (!dedup_.check_and_insert(b.batch_id)) {
+        if (!check_dedup(b.batch_id)) {
             out.push_back(std::move(b));
         } else {
             stats_.duplicates.fetch_add(1, std::memory_order_relaxed);
+            unsigned n = duplicate_log_count.fetch_add(1, std::memory_order_relaxed);
+            if (n < kLogFirstNDuplicateBatchIds)
+                std::cerr << "[DEDUP] duplicate batch_id=" << b.batch_id << " (tid=" << (b.batch_id >> 48)
+                          << " local=" << (b.batch_id & ((1ULL << 48) - 1)) << ")\n";
         }
     }
     stats_.phase_l0_dedup_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
@@ -2035,7 +2217,7 @@ void Sequencer::process_level5(std::vector<BatchInfo>& in, std::vector<BatchInfo
             }
             // seq > hc and !is_duplicate => seq >= next_expected. Emit in order or hold.
             if (b.client_seq == st.next_expected) {
-                if (!dedup_.check_and_insert(b.batch_id)) {
+                if (!check_dedup(b.batch_id)) {
                     out.push_back(std::move(b));
                     hc = std::max(hc, b.client_seq);
                     st.mark_sequenced(b.client_seq);
@@ -2108,7 +2290,7 @@ void Sequencer::drain_hold(std::vector<BatchInfo>& out, uint64_t epoch) {
                 --hold_size_;
                 continue;
             }
-            bool is_dup = dedup_.check_and_insert(it->second.batch.batch_id);
+            bool is_dup = check_dedup(it->second.batch.batch_id);
             if (!is_dup) {
                 out.push_back(std::move(it->second.batch));
                 hc = std::max(hc, seq);
@@ -2173,7 +2355,7 @@ void Sequencer::age_hold(std::vector<BatchInfo>& out, uint64_t current_epoch) {
         stats_.gaps_skipped.fetch_add(ent.seq - st.next_expected, std::memory_order_relaxed);
         st.next_expected = ent.seq + 1;
         st.mark_sequenced(ent.seq);
-        if (!dedup_.check_and_insert(ent.batch.batch_id)) {
+        if (!check_dedup(ent.batch.batch_id)) {
             out.push_back(std::move(ent.batch));
             hc = std::max(hc, ent.seq);
         }
@@ -2887,6 +3069,7 @@ struct Config {
     bool run_broker_test = true;
     bool run_scatter_gather = true;
     bool skip_dedup = false;  // If true, disable dedup for ablation (benchmark has no retries)
+    bool use_fast_dedup = true;  // If false, use legacy Deduplicator (--legacy-dedup)
 };
 
 struct Result {
@@ -2897,11 +3080,11 @@ struct Result {
     double avg_seq_ns = 0;
     uint64_t min_seq_ns = 0, max_seq_ns = 0;
     uint64_t batches = 0, epochs = 0, level5 = 0, gaps = 0, dropped = 0, atomics = 0;
+    uint64_t duplicates = 0;  // Batches rejected by dedup (0 when --skip-dedup)
     uint64_t pbr_full = 0;  // PBR reserve failures (saturation)
     uint64_t backpressure_events = 0;  // Inject attempts deferred by high watermark (controlled backpressure)
     double pbr_usage_pct = 0;  // Snapshot: avg (used/capacity)*100 across brokers at end of run
     double duration = 0;
-    double efficiency_pct = 0;  // 100 * achieved / (21 GB/s theoretical max)
     uint64_t epoch_us = 500;  // Target epoch interval (for reporting)
     bool pbr_saturated = false;  // true if PBR full % > threshold (run invalid for algorithm comparison)
     bool steady_state_reached = false;
@@ -2945,7 +3128,6 @@ struct MultiRunResult {
     StatResult throughput;
     StatResult latency_p99;
     double median_mb_sec = 0;
-    double median_efficiency_pct = 0;  // 100 * throughput / (21 GB/s theoretical max)
     uint64_t total_atomics = 0;
     uint64_t total_epochs = 0;   // Epochs completed (per-epoch: atomics == epochs with non-empty output)
     uint64_t total_gaps = 0;
@@ -2974,6 +3156,7 @@ public:
             sc.num_shards = cfg_.num_shards;
         }
         sc.skip_dedup = cfg_.skip_dedup;
+        sc.use_fast_dedup = cfg_.use_fast_dedup;
         // Phase 2: dense client state (O(1) lookup) when client_id in [0, clients)
         sc.max_clients = cfg_.clients;
         sc.allow_drops = (cfg_.validity_mode == ValidityMode::STRESS);
@@ -3016,6 +3199,7 @@ public:
         auto base_level5 = seq.stats().level5_batches.load();
         auto base_gaps = seq.stats().gaps_skipped.load();
         auto base_dropped = seq.stats().batches_dropped.load();
+        auto base_duplicates = seq.stats().duplicates.load();
         auto base_atomics = seq.stats().atomics_executed.load();
         auto base_pbr_full = seq.stats().pbr_full_count.load();
         auto base_backpressure = seq.stats().backpressure_events.load();
@@ -3075,6 +3259,7 @@ public:
         r.level5 = seq.stats().level5_batches.load() - base_level5;
         r.gaps = seq.stats().gaps_skipped.load() - base_gaps;
         r.dropped = dropped_at_t1 - base_dropped;  // Use t1 snapshot for consistency with completeness window
+        r.duplicates = seq.stats().duplicates.load() - base_duplicates;
         r.atomics = seq.stats().atomics_executed.load() - base_atomics;
         r.pbr_full = seq.stats().pbr_full_count.load() - base_pbr_full;
         r.backpressure_events = seq.stats().backpressure_events.load() - base_backpressure;
@@ -3133,11 +3318,6 @@ public:
                 r.valid = false;
             }
         }
-
-        // Efficiency vs theoretical max (21 GB/s CXL bandwidth)
-        const double theoretical_max_batches_sec = 21e9 / static_cast<double>(cfg_.batch_size);
-        r.efficiency_pct = (theoretical_max_batches_sec > 0)
-            ? (100.0 * r.batches_sec / theoretical_max_batches_sec) : 0;
 
         // Assessment §5.2: Completeness - no silent loss.
         // Use global invariant so backlog drain doesn't cause false failures.
@@ -3465,11 +3645,9 @@ MultiRunResult run_multiple(const Config& cfg) {
     Runner(cfg).run();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    std::vector<double> throughputs, latencies, mb_secs, efficiencies;
+    std::vector<double> throughputs, latencies, mb_secs;
     uint64_t atomics = 0, epochs = 0, gaps = 0, dropped = 0, pbr_full = 0;
     uint64_t valid_runs = 0;
-
-    const double theoretical_max = (cfg.batch_size > 0) ? (21e9 / static_cast<double>(cfg.batch_size)) : 0;
 
     for (int i = 0; i < cfg.num_runs; ++i) {
         Result r = Runner(cfg).run();
@@ -3478,8 +3656,6 @@ MultiRunResult run_multiple(const Config& cfg) {
             throughputs.push_back(r.batches_sec);
             latencies.push_back(r.p99_us);
             mb_secs.push_back(r.mb_sec);
-            if (theoretical_max > 0 && r.batches_sec > 0)
-                efficiencies.push_back(100.0 * r.batches_sec / theoretical_max);
             atomics += r.atomics;
             epochs += r.epochs;
             gaps += r.gaps;
@@ -3497,11 +3673,6 @@ MultiRunResult run_multiple(const Config& cfg) {
         std::sort(mb_secs.begin(), mb_secs.end());
         size_t n = mb_secs.size();
         out.median_mb_sec = (n % 2) ? mb_secs[n / 2] : (mb_secs[n / 2 - 1] + mb_secs[n / 2]) / 2.0;
-    }
-    if (!efficiencies.empty()) {
-        std::sort(efficiencies.begin(), efficiencies.end());
-        size_t n = efficiencies.size();
-        out.median_efficiency_pct = (n % 2) ? efficiencies[n / 2] : (efficiencies[n / 2 - 1] + efficiencies[n / 2]) / 2.0;
     }
     const uint64_t nr = std::max<uint64_t>(1, valid_runs);
     out.total_atomics = atomics / nr;
@@ -3552,13 +3723,12 @@ Ablation1Result run_ablation1_paired(const Config& cfg) {
     Runner(c_optimized).run();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    std::vector<double> base_throughputs, base_latencies, base_mb, base_eff, opt_eff;
+    std::vector<double> base_throughputs, base_latencies, base_mb;
     std::vector<double> opt_throughputs, opt_latencies, opt_mb;
     std::vector<double> speedups;
     uint64_t base_atomics = 0, base_epochs = 0, base_gaps = 0, base_dropped = 0, base_pbr = 0;
     uint64_t opt_atomics = 0, opt_epochs = 0, opt_gaps = 0, opt_dropped = 0, opt_pbr = 0;
     uint64_t base_valid = 0, opt_valid = 0;
-    const double theoretical_max = (cfg.batch_size > 0) ? (21e9 / static_cast<double>(cfg.batch_size)) : 0;
 
     for (int i = 0; i < cfg.num_runs; ++i) {
         Result r_base = Runner(c_baseline).run();
@@ -3568,8 +3738,6 @@ Ablation1Result run_ablation1_paired(const Config& cfg) {
             base_throughputs.push_back(r_base.batches_sec);
             base_latencies.push_back(r_base.p99_us);
             base_mb.push_back(r_base.mb_sec);
-            if (theoretical_max > 0 && r_base.batches_sec > 0)
-                base_eff.push_back(100.0 * r_base.batches_sec / theoretical_max);
             base_atomics += r_base.atomics;
             base_epochs += r_base.epochs;
             base_gaps += r_base.gaps;
@@ -3581,8 +3749,6 @@ Ablation1Result run_ablation1_paired(const Config& cfg) {
             opt_throughputs.push_back(r_opt.batches_sec);
             opt_latencies.push_back(r_opt.p99_us);
             opt_mb.push_back(r_opt.mb_sec);
-            if (theoretical_max > 0 && r_opt.batches_sec > 0)
-                opt_eff.push_back(100.0 * r_opt.batches_sec / theoretical_max);
             opt_atomics += r_opt.atomics;
             opt_epochs += r_opt.epochs;
             opt_gaps += r_opt.gaps;
@@ -3612,11 +3778,6 @@ Ablation1Result run_ablation1_paired(const Config& cfg) {
         size_t n = base_mb.size();
         out.baseline.median_mb_sec = (n % 2) ? base_mb[n / 2] : (base_mb[n / 2 - 1] + base_mb[n / 2]) / 2.0;
     }
-    if (!base_eff.empty()) {
-        std::sort(base_eff.begin(), base_eff.end());
-        size_t n = base_eff.size();
-        out.baseline.median_efficiency_pct = (n % 2) ? base_eff[n / 2] : (base_eff[n / 2 - 1] + base_eff[n / 2]) / 2.0;
-    }
     out.optimized.throughput = StatResult::compute(opt_throughputs);
     out.optimized.latency_p99 = StatResult::compute(opt_latencies);
     out.optimized.total_atomics = opt_atomics / opt_nr;
@@ -3631,16 +3792,49 @@ Ablation1Result run_ablation1_paired(const Config& cfg) {
         size_t n = opt_mb.size();
         out.optimized.median_mb_sec = (n % 2) ? opt_mb[n / 2] : (opt_mb[n / 2 - 1] + opt_mb[n / 2]) / 2.0;
     }
-    if (!opt_eff.empty()) {
-        std::sort(opt_eff.begin(), opt_eff.end());
-        size_t n = opt_eff.size();
-        out.optimized.median_efficiency_pct = (n % 2) ? opt_eff[n / 2] : (opt_eff[n / 2 - 1] + opt_eff[n / 2]) / 2.0;
-    }
     if (!speedups.empty())
         out.speedup = StatResult::compute(speedups);
     if (out.optimized.total_atomics > 0)
         out.atomic_reduction = static_cast<double>(out.baseline.total_atomics) / out.optimized.total_atomics;
     return out;
+}
+
+void print_ablation_table(const Ablation1Result& a1, int num_runs) {
+    std::cout << "\n";
+    std::cout << "┌─────────────────────────────────────────────────────────────┐\n";
+    std::cout << "│           ABLATION 1: Epoch Batching Effectiveness          │\n";
+    std::cout << "├─────────────────┬──────────────┬──────────────┬─────────────┤\n";
+    std::cout << "│ Metric          │ Per-Batch    │ Per-Epoch    │ Improvement │\n";
+    std::cout << "├─────────────────┼──────────────┼──────────────┼─────────────┤\n";
+
+    std::cout << std::fixed;
+    std::cout << "│ Throughput (M/s)│ "
+              << std::setw(12) << std::setprecision(2) << (a1.baseline.throughput.median / 1e6)
+              << " │ "
+              << std::setw(12) << std::setprecision(2) << (a1.optimized.throughput.median / 1e6)
+              << " │ "
+              << std::setw(10) << std::setprecision(2) << a1.speedup.median << "× │\n";
+
+    std::cout << "│ P99 Latency (ms)│ "
+              << std::setw(12) << std::setprecision(2) << (a1.baseline.latency_p99.median / 1000)
+              << " │ "
+              << std::setw(12) << std::setprecision(2) << (a1.optimized.latency_p99.median / 1000)
+              << " │ "
+              << std::setw(10) << std::setprecision(2)
+              << (a1.optimized.latency_p99.median > 0 ? a1.baseline.latency_p99.median / a1.optimized.latency_p99.median : 0) << "× │\n";
+
+    std::cout << "│ Atomics/run     │ "
+              << std::setw(12) << a1.baseline.total_atomics
+              << " │ "
+              << std::setw(12) << a1.optimized.total_atomics
+              << " │ "
+              << std::setw(9) << std::setprecision(0) << a1.atomic_reduction << "× │\n";
+
+    std::cout << "├─────────────────┴──────────────┴──────────────┴─────────────┤\n";
+    std::cout << "│ Valid runs: " << a1.baseline.valid_runs << "/" << num_runs
+              << " (baseline), " << a1.optimized.valid_runs << "/" << num_runs
+              << " (optimized)                  │\n";
+    std::cout << "└─────────────────────────────────────────────────────────────┘\n";
 }
 
 void print_stat_result(const std::string& name, const MultiRunResult& r, int num_runs) {
@@ -3664,10 +3858,6 @@ void print_stat_result(const std::string& name, const MultiRunResult& r, int num
     if (r.total_dropped > 0) std::cout << "  Dropped: " << r.total_dropped;
     std::cout << "  PBR_full: " << r.total_pbr_full;
     std::cout << "\n";
-    if (r.median_efficiency_pct > 0) {
-        std::cout << std::setprecision(1)
-                  << "  Efficiency: " << r.median_efficiency_pct << "% of theoretical max (21 GB/s)\n";
-    }
 }
 
 void print(const std::string& name, const Result& r) {
@@ -3689,6 +3879,7 @@ void print(const std::string& name, const Result& r) {
               << r.level5 << " L5, " << r.gaps << " gaps";
     if (r.atomics > 0) std::cout << ", " << r.atomics << " atomics";
     if (r.dropped > 0) std::cout << ", " << r.dropped << " dropped";
+    std::cout << ", " << r.duplicates << " duplicates";
     std::cout << ", PBR_full: " << r.pbr_full
               << ", validation_overwrites: " << r.validation_overwrites << "\n";
     uint64_t total_inject_attempts = r.batches + r.pbr_full + r.backpressure_events;
@@ -3702,10 +3893,6 @@ void print(const std::string& name, const Result& r) {
               << " (cv=" << std::setprecision(1) << r.steady_state_cv_pct
               << "%, windows=" << r.steady_state_windows
               << ", backlog_max=" << r.backlog_max << ")\n";
-    if (r.efficiency_pct > 0) {
-        std::cout << std::setprecision(1)
-                  << "  Efficiency: " << r.efficiency_pct << "% of theoretical max (21 GB/s)\n";
-    }
 }
 
 void scalability_test(const Config& base) {
@@ -3799,6 +3986,70 @@ void scatter_gather_scaling_test(const Config& base) {
     }
 }
 
+void benchmark_dedup_implementations() {
+    std::cout << "\n";
+    sep();
+    std::cout << "  DEDUP IMPLEMENTATION COMPARISON\n";
+    sep();
+
+    const size_t N = 1000000;  // 1M operations
+    std::vector<uint64_t> batch_ids(N);
+    for (size_t i = 0; i < N; ++i) {
+        batch_ids[i] = (uint64_t(i % 16) << 48) | i;  // Simulate real batch_ids
+    }
+
+    {
+        embarcadero::Deduplicator dedup;
+        auto t0 = std::chrono::steady_clock::now();
+        for (uint64_t id : batch_ids) {
+            (void) dedup.check_and_insert(id);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << "  Legacy Deduplicator: " << std::fixed << std::setprecision(2)
+                  << ms << " ms for " << N << " ops ("
+                  << (N / ms / 1000) << " M ops/s)\n";
+    }
+
+    {
+        embarcadero::FastDeduplicator dedup;
+        auto t0 = std::chrono::steady_clock::now();
+        for (uint64_t id : batch_ids) {
+            (void) dedup.check_and_insert(id);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << "  Fast Deduplicator:   " << std::fixed << std::setprecision(2)
+                  << ms << " ms for " << N << " ops ("
+                  << (N / ms / 1000) << " M ops/s)\n";
+    }
+
+    sep();
+}
+
+/** Improvement instruction Task B Step 5: Stress FastDeduplicator eviction path (fill past RING_SIZE). */
+bool test_fast_deduplicator() {
+    using namespace embarcadero;
+    FastDeduplicator dedup;
+
+    // New insert
+    if (dedup.check_and_insert(1)) return false;  // 1 is new
+    // Duplicate
+    if (!dedup.check_and_insert(1)) return false;  // 1 is duplicate
+
+    // Fill to RING_SIZE + 100 to force eviction of oldest entries (1, 2, ... 100)
+    const size_t RING_SIZE = FastDeduplicator::RING_SIZE;
+    for (uint64_t i = 2; i <= RING_SIZE + 100; ++i) {
+        if (dedup.check_and_insert(i)) return false;  // Each must be new
+    }
+
+    // Entry 1 should have been evicted; re-insert must be seen as new
+    if (dedup.check_and_insert(1)) return false;  // 1 evicted, so new again
+    if (!dedup.check_and_insert(1)) return false;  // Now duplicate
+
+    return true;
+}
+
 }  // namespace bench
 
 // ============================================================================
@@ -3829,7 +4080,10 @@ static void print_usage(const char* prog) {
               << "  --ss-backlog=N      steady-state max backlog epochs\n"
               << "  --pbr-threshold=PCT PBR_full validity threshold (percent, e.g. 0.1)\n"
               << "  --validity=MODE     validity mode: algo|max|stress (default max)\n"
-              << "  --skip-dedup        disable deduplication (for ablation speedup)\n"
+              << "  --skip-dedup        disable deduplication (valid for algorithm ablation; see config comment)\n"
+              << "  --legacy-dedup      use legacy Deduplicator instead of FastDeduplicator\n"
+              << "  --bench-dedup       run dedup implementation micro-benchmark and exit\n"
+              << "  --test-dedup        run FastDeduplicator eviction stress test and exit (0 pass, 1 fail)\n"
               << "  --help, -h          print this and exit\n"
               << "  --test              minimal correctness test (ordering + per-client); exit 0 pass, 1 fail\n";
 }
@@ -3934,6 +4188,7 @@ int main(int argc, char* argv[]) {
 
     bool clean_ablation_preset = false;
     bool paper_ablation_preset = false;
+    bool paper_mode_preset = false;
     bool suite_specified = false;
     std::vector<std::string> suites;
     bool steady_state = true;
@@ -3945,11 +4200,24 @@ int main(int argc, char* argv[]) {
     bench::ValidityMode validity_mode = bench::ValidityMode::MAX_THROUGHPUT;
     bool validity_specified = false;
     bool validate = true;
+    bool skip_dedup_cli = false;
+    bool legacy_dedup_cli = false;
+    uint64_t epoch_us_cli = 0;  // 0 = use default
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
+        }
+        if (arg == "--bench-dedup") {
+            bench::benchmark_dedup_implementations();
+            return 0;
+        }
+        if (arg == "--test-dedup") {
+            std::cout << "  Running FastDeduplicator eviction test...\n";
+            bool pass = bench::test_fast_deduplicator();
+            std::cout << "  " << (pass ? "PASSED" : "FAILED") << "\n";
+            return pass ? 0 : 1;
         }
         if (arg == "--test") {
             std::cout << "  Running minimal correctness test...\n";
@@ -3962,6 +4230,9 @@ int main(int argc, char* argv[]) {
         }
         if (arg == "--paper") {
             paper_ablation_preset = true;
+        }
+        if (arg == "--paper-mode") {
+            paper_mode_preset = true;
         }
         if (arg.rfind("--suite=", 0) == 0) {
             suite_specified = true;
@@ -4008,6 +4279,15 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
+        if (arg == "--skip-dedup") {
+            skip_dedup_cli = true;
+        }
+        if (arg == "--legacy-dedup") {
+            legacy_dedup_cli = true;
+        }
+        if (arg.rfind("--epoch-us=", 0) == 0) {
+            epoch_us_cli = static_cast<uint64_t>(std::stoull(arg.substr(std::string("--epoch-us=").size())));
+        }
     }
 
     std::cout << "\n";
@@ -4030,6 +4310,9 @@ int main(int argc, char* argv[]) {
         size_t v = static_cast<size_t>(std::atoll(argv[10]));
         if (v > 0) cfg.pbr_entries = v;
     }
+    if (skip_dedup_cli) cfg.skip_dedup = true;
+    if (legacy_dedup_cli) cfg.use_fast_dedup = false;
+    if (epoch_us_cli != 0) cfg.epoch_us = epoch_us_cli;
     if (clean_ablation_preset) {
         cfg.producers = 2;
         cfg.pbr_entries = embarcadero::config::CLEAN_ABLATION_PBR_ENTRIES;
@@ -4039,6 +4322,24 @@ int main(int argc, char* argv[]) {
         cfg.producers = 1;
         cfg.duration_sec = 60;
         cfg.pbr_entries = 64 * 1024;  // 64K per broker: algorithm-limited, target PBR_full < 0.1%
+    }
+    if (paper_mode_preset) {
+        cfg.brokers = 4;
+        cfg.producers = 2;
+        cfg.duration_sec = 30;
+        cfg.num_runs = 5;
+        cfg.level5_ratio = 0.0;
+        cfg.skip_dedup = true;
+        cfg.pbr_entries = embarcadero::config::CLEAN_ABLATION_PBR_ENTRIES;
+        cfg.validate = true;
+        cfg.steady_state = true;
+        validity_mode = bench::ValidityMode::ALGORITHM;
+        cfg.run_ablation1 = true;
+        cfg.run_levels = false;
+        cfg.run_scalability = false;
+        cfg.run_epoch_test = false;
+        cfg.run_broker_test = false;
+        cfg.run_scatter_gather = false;
     }
     if (!validity_specified && (clean_ablation_preset || paper_ablation_preset)) {
         validity_mode = bench::ValidityMode::ALGORITHM;
@@ -4097,7 +4398,9 @@ int main(int argc, char* argv[]) {
     if (cfg.pbr_entries > 0) std::cout << ", pbr_entries=" << cfg.pbr_entries;
     if (clean_ablation_preset) std::cout << " (--clean)";
     if (paper_ablation_preset) std::cout << " (--paper, target PBR_full<0.1%)";
+    if (paper_mode_preset) std::cout << " (--paper-mode)";
     if (cfg.skip_dedup) std::cout << " (--skip-dedup)";
+    if (!cfg.use_fast_dedup) std::cout << " (--legacy-dedup)";
     if (suite_specified) {
         std::cout << " --suite=";
         for (size_t i = 0; i < suites.size(); ++i) {
@@ -4127,6 +4430,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "  (Epochs = epoch buffers fully processed by sequencer; atomics = epochs in per-epoch mode.\n"
                           << "   When Epoch CPU >> τ, sequencer is bottleneck so epochs << duration/τ.)\n";
                 bench::Ablation1Result a1 = bench::run_ablation1_paired(cfg);
+                bench::print_ablation_table(a1, cfg.num_runs);
                 bench::print_stat_result("Per-Batch Atomic (Baseline)", a1.baseline, cfg.num_runs);
                 bench::print_stat_result("Per-Epoch Atomic (Optimized)", a1.optimized, cfg.num_runs);
                 std::cout << std::fixed << std::setprecision(2);

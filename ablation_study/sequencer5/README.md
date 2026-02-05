@@ -2,7 +2,35 @@
 
 Standalone sequencer implementation and benchmark for OSDI/SOSP/SIGCOMM-level ablation: correctness-first dedup, MPSC ring (multiple producers per broker), Level 5 sliding window, hold-buffer emit, ordering validation, and **per-batch vs per-epoch atomic** comparison. Aligns with **docs/EMBARCADERO_DEFINITIVE_DESIGN.md**.
 
-**Conference-quality gate:** See **OSDI_SOSP_QUALITY_CHECKLIST.md** for how to confirm implementation and ablation results meet OSDI/SOSP standards (correctness, statistics, reproducibility, honest interpretation).
+## Repository layout
+
+| Path | Purpose |
+|------|---------|
+| `sequencer5_benchmark.cc` | Single-file benchmark and sequencer logic |
+| `CMakeLists.txt` | Build (standalone) |
+| `validate.sh` | Correctness test + short ablation |
+| `run_scalability_experiments.sh` | Reproduce scalability results (vary producers/brokers) |
+| `ABLATION_RESULTS.md` | Summary of results; numbers match canonical logs |
+| `improvement_instruction.md` | Profiling and FastDeduplicator fix instructions |
+| `logs/` | Result logs (see below) |
+
+## Results
+
+- **Canonical result logs:** `logs/scalability_20260205_083244/` (6 runs: vary producers 2/4/8, vary brokers 2/4/8), `logs/profile_20260205_080856.log` (phase profiling), `logs/PROFILE_AND_STABILITY_RESULTS.md` (profiling summary and FastDeduplicator stability).
+- **Summary and tables:** **ABLATION_RESULTS.md** (throughput, speedup, atomic reduction per config).
+
+## Reproducing results
+
+```bash
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release   # or RelWithDebInfo for profiling
+make sequencer5_benchmark
+
+./sequencer5_benchmark --test          # Correctness
+./sequencer5_benchmark --test-dedup    # FastDeduplicator stress test
+cd .. && ./run_scalability_experiments.sh   # Writes to logs/scalability_<timestamp>/
+./validate.sh                          # Full validation (Phase 1 + 2a/2b)
+```
 
 ## Key Operations (from document analysis)
 
@@ -108,13 +136,60 @@ Before generating ablation/paper numbers, the three performance items in **PHASE
 
 ```bash
 mkdir build && cd build
-cmake ..
-make
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make sequencer5_benchmark
 ./sequencer5_benchmark [brokers] [producers] [duration_sec] [level5_ratio] [num_runs] [use_radix_sort] [scatter_gather] [num_shards] [scatter_gather_only] [pbr_entries]
 ./sequencer5_benchmark --help   # full usage
-./sequencer5_benchmark --test  # minimal correctness test (ordering + per-client)
-./sequencer5_benchmark --paper # algorithm-limited (1 producer, 60s, 64K PBR)
+./sequencer5_benchmark --test   # minimal correctness test (ordering + per-client)
+./sequencer5_benchmark --paper  # algorithm-limited (1 producer, 60s, 64K PBR)
+./sequencer5_benchmark --paper-mode   # paper-ready ablation (recommended for publication)
 ```
+
+### Paper-ready ablation (--paper-mode)
+
+**Purpose:** Compare per-batch vs per-epoch atomic batching:
+
+| Mode       | Atomics per epoch |
+|-----------|-------------------|
+| Per-Batch | N (one per batch) |
+| Per-Epoch | 1                 |
+
+**Quick start (publication):**
+
+```bash
+./sequencer5_benchmark --paper-mode
+```
+
+This runs: 4 brokers, 2 producers, 30 s, 5 runs, L0 only, `--skip-dedup`, ablation-1 only. Output includes a boxed **ABLATION 1: Epoch Batching Effectiveness** table.
+
+**Expected results (example):**
+
+| Metric          | Per-Batch | Per-Epoch | Improvement |
+|-----------------|-----------|-----------|-------------|
+| Throughput (M/s)| ~4.8      | ~5.5      | 1.1–1.2×    |
+| P99 Latency (ms)| ~40       | ~35       | 1.1–1.2×    |
+| Atomics/run     | ~325M     | ~10K      | **~30,944×**|
+
+**Options (paper runs):**
+
+| Flag           | Description |
+|----------------|-------------|
+| `--paper-mode` | Paper-ready settings (recommended) |
+| `--skip-dedup` | Skip deduplication (valid for algorithm comparison; see FAQ) |
+| `--clean`      | Large PBR for bottleneck isolation (2 producers, 4M PBR) |
+| `--legacy-dedup` | Use legacy Deduplicator (default: FastDeduplicator) |
+| `--bench-dedup`  | Run dedup micro-benchmark and exit |
+
+**Understanding results:**
+
+- **Valid runs:** Should be 5/5. Invalid means system wasn’t stable (steady-state or saturation).
+- **Atomics reduction:** Key metric; expect ~30,000×.
+- **Speedup:** Modest (1.1–1.2×) because atomics aren’t the only cost.
+
+**FAQ**
+
+- **Why use `--skip-dedup`?** The benchmark generates unique `batch_id`s (`(thread_id << 48) | counter`), so dedup finds no duplicates. Skipping dedup is valid for comparing the sequencing algorithm; for end-to-end evaluation with retries, run without `--skip-dedup` (FastDeduplicator is default).
+- **Why is speedup only 1.1–1.2× with ~30,000× fewer atomics?** Atomics are cheap (~20–50 ns). The main costs are memory copies, epoch transitions, and collector polling. The contribution is **simplicity and atomic reduction**, not raw throughput gain.
 
 - **num_runs** (default 5): Runs per test. If ≥ 2, results report median, [min, max], and ±stddev.
 - **use_radix_sort** (default 0): 0 = std::sort (recommended), 1 = radix sort (A/B test).
@@ -142,8 +217,7 @@ make
 - **Scatter-gather (open-loop max throughput):**  
   `./sequencer5_benchmark 4 2 30 0.1 5 0 1 8 1 4194304 --validity=max`
 
-**Repeatable paper matrix:**  
-`./run_paper_matrix.sh` (writes logs to `ablation_study/sequencer5/logs/`)\n\n**Publication profiles (recommended):**\n- **Profile 1 (algorithm ablation, strict validity):** `./run_profiles.sh` or `PROFILE=algo ./run_profiles.sh`\n- **Profile 2 (max throughput, open-loop):** `PROFILE=max ./run_profiles.sh`\n- **Profile 3 (scatter-gather scaling):** `PROFILE=sg ./run_profiles.sh`\n\nDefaults use larger PBR sizes to avoid saturation; override with `PBR=...`, `RUNS=...`, `DURATION=...`, `PRODUCERS=...`, `SHARDS=...`.
+**Repeatable scalability (vary producers and brokers):** From repo root, `./run_scalability_experiments.sh`; results go to `logs/scalability_<timestamp>/`.
 
 ## Results interpretation (5-run publication test)
 

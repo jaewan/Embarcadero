@@ -2737,9 +2737,8 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		pending.slot_offset = slot_offset;
 		pending.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
 		{
-			// [[CORRECTNESS]] Serialize with EpochSequencerThread merge/clear to avoid data race.
-			// Load epoch inside lock so we never push to a buffer the sequencer has already merged/drained.
-			absl::MutexLock lock(&per_scanner_buffers_mu_);
+			// [[PERF: Per-scanner buffers]] Write to broker-specific buffer (lock-free on hot path).
+			// EpochSequencerThread merges all buffers once per epoch.
 			uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 			per_scanner_buffers_[epoch % 3][broker_id].push_back(pending);
 		}

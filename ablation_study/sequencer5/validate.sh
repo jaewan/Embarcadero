@@ -5,6 +5,7 @@
 # Usage:
 #   ./validate.sh           # Full: Phase1 + Phase2a + Phase2b
 #   FAST=1 ./validate.sh    # Quick: Phase1 only (~30 s)
+#   SMOKE=1 ./validate.sh   # Phase1 + one short ablation with --no-validate (~20 s total)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,6 +47,27 @@ if [ "$ELAPSED" -gt "$EXPECT_TEST_S" ]; then
 fi
 
 [ "${FAST:-0}" = "1" ] && { echo ""; echo "FAST mode: skipping Phase 2a and 2b."; echo "Validation (Phase 1) complete."; exit 0; }
+
+# -----------------------------------------------------------------------------
+# Phase 1b (optional): Smoke run with --no-validate to verify throughput path quickly
+# -----------------------------------------------------------------------------
+if [ "${SMOKE:-0}" = "1" ]; then
+    EXPECT_SMOKE_S=25
+    echo ""
+    echo "=============================================="
+    echo "Phase 1b: Smoke (1 run, 2s, --no-validate)"
+    echo "  EXPECTED RUNTIME: ${EXPECT_SMOKE_S} s  (kill if significantly longer)"
+    echo "=============================================="
+    START=$(date +%s)
+    $BIN 4 1 2 0.1 1 0 0 8 0 16777216 --suite=ablation --no-validate || { echo "FAIL: smoke run"; exit 1; }
+    ELAPSED=$(($(date +%s) - START))
+    echo "  Elapsed: ${ELAPSED} s"
+    [ "$ELAPSED" -gt "$EXPECT_SMOKE_S" ] && echo "  WARNING: Exceeded expected ${EXPECT_SMOKE_S} s"
+    echo ""
+    echo "SMOKE mode: skipping full Phase 2a and 2b."
+    echo "Validation complete."
+    exit 0
+fi
 
 # -----------------------------------------------------------------------------
 # Phase 2a: Single-threaded ablation + levels + scalability (short)

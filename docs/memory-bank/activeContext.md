@@ -426,31 +426,43 @@ Replaced message-based replication cursor with batch-based polling that is compa
 
 ## Recent Changes
 
-### Session 2026-02-04 (Dedup Flag Implementation & Performance Analysis)
+### Session 2026-02-04 (Dedup Flag: Fixes and Correct L0-Only Verification)
 
-**Dedup Skip Flag Fixed:**
-1. ✅ **Fixed --skip-dedup flag implementation** - Flag was set but never checked in `check_and_insert()`
-   - Added early return when `skip_=true` to bypass entire dedup algorithm
-   - Now `--skip-dedup` works as intended for ablation studies
+**Fixes applied (investigation had been flawed):**
+1. ✅ **`check_and_insert()` now respects skip** - Added early return when `skip_=true` so dedup is actually bypassed.
+2. ✅ **Central dedup gets skip in single-threaded path** - `dedup_.set_skip(config_.skip_dedup)` added in `start()` for non–scatter-gather mode (scatter-gather already set it per-shard).
+3. ✅ **--skip-dedup parsed from CLI** - The flag was documented and passed to `SequencerConfig` but **never set from argv**; added `skip_dedup_cli` and `if (skip_dedup_cli) cfg.skip_dedup = true`.
+4. ✅ **Diagnostics** - One-time stderr message when skip is active; Result reports `duplicates` so we can verify 0 when skip is on.
 
-2. ✅ **Performance analysis of dedup skip:**
-   - **Baseline (WITHOUT --skip-dedup):** 256K batches/s, 4.95% drop rate, 1.2% efficiency
-   - **With --skip-dedup:** 156K batches/s, 48.85% drop rate, 0.8% efficiency
-   - **Finding:** Dedup is ESSENTIAL for correctness, not overhead!
-   - Skipping dedup causes catastrophic drop rate increase (4.95% → 48.85%)
-   - This proves dedup algorithm provides important batch validation/deduplication service
+**Correct test scenario (L0 only, not stress):**
+- Dedup affects `process_level0()`. Previous verification used **100% L5 stress**, where L5 path dominates; that was the wrong scenario.
+- **Correct run:** `./sequencer5_benchmark 4 2 30 0.0 1 0 0 8 0 0 --validity=max --suite=levels` vs same with `--skip-dedup`.
 
-3. ✅ **Commit:** "Fix: Implement --skip-dedup flag in Deduplicator" (commit 3c22dbe)
+**L0-only results (Level 0 test only):**
+| | Baseline | With --skip-dedup |
+|--|--|--|
+| **l0_dedup** | ~62,000 μs/epoch | ~1,200 μs/epoch (**~98% reduction**) |
+| **duplicates** | 195 | **0** (confirms skip works) |
+| **Throughput** | ~2.53M batches/s | ~3.46M batches/s (**~37% higher**) |
 
-**Implications:**
-- Dedup algorithm is NOT a performance bottleneck to optimize away
-- The 50-74ms l0_dedup time measured is not "wasted" - it's essential batching/validation work
-- Future optimizations should focus on OTHER stages, not removing dedup
+**Conclusion:** On **L0 workload**, dedup is a real bottleneck: skipping it cuts l0_dedup by ~98% and increases throughput by ~37%. The earlier conclusion ("dedup is essential; don't remove it") was based on **stress mode (100% L5)**, where the drop-rate explosion was from a different cause (hold buffer / L5 path), not from removing dedup on the L0 path.
 
-**Files Modified:**
-- `ablation_study/sequencer5/sequencer5_benchmark.cc` - Added `if (skip_) return false;` check
+**Yellow flags and remaining questions:**
+- **Why only 37% throughput gain?** The 51× reduction in l0_dedup implies dedup was ~27% of total epoch time; merge, partition, and GOI writes account for the rest. Dedup was *a* bottleneck, not the only one.
+- **62ms vs 19ms l0_dedup:** Baseline 62ms (L0 levels test) differs from the ~19ms cited in Ablation 1—likely different workload or measurement conditions; worth aligning for consistency.
+- **195 duplicates with unique batch_ids?** With `batch_id = (tid<<48)|counter`, duplicates in theory shouldn't occur. Possible causes: counter wraparound, dedup false positives (hash collisions), or harness bug. At 0.00025% of batches this is negligible but worth investigating. **Done:** First 10 duplicate batch_ids are now logged to stderr in `process_level0()` when duplicates occur (see `kLogFirstNDuplicateBatchIds`).
+- **Does skip-dedup fix validity (P99 below 100ms)?** Full Ablation 1 with `--skip-dedup` should be run to completion to confirm runs become valid.
 
-**Status:** Dedup flag now correctly functional; confirms dedup is essential for system stability
+**Recommended next steps:**
+1. **Run Ablation 1 with --skip-dedup to completion** and check validity (P99, steady-state):
+   ```bash
+   ./sequencer5_benchmark 4 1 60 0.1 5 0 0 8 0 0 --paper --skip-dedup --suite=ablation
+   ```
+2. **Investigate the 195 duplicates:** Run L0 baseline (no skip), capture stderr; inspect the logged duplicate batch_ids (tid + local counter) for wraparound or patterns.
+3. **If Ablation 1 passes with skip-dedup:** Consider a zero-allocation FastDeduplicator for production; `--skip-dedup` remains for ablation only.
+4. **Paper framing:** Deduplication is configurable (for production retry handling); for controlled ablation it can be disabled; with it disabled, L0 throughput improves ~37% and l0 processing time drops ~98%.
+
+**Status:** --skip-dedup is implemented and verified on L0-only runs. Duplicate batch_id logging added for investigation. Use L0 (level5_ratio=0.0) for dedup ablation; do not interpret stress-mode runs as dedup validation.
 
 ### Session 2026-01-27 (ORDER=5 FIFO Validation Complete)
 
