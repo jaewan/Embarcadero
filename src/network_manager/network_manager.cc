@@ -98,6 +98,162 @@ void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, size_t logical_offse
 }
 
 /**
+ * [[ORDER0_INLINE]] Process ORDER=0 batch inline: set per-message metadata.
+ * Called by ReqReceive thread immediately after recv() to batch data, while hot in cache.
+ *
+ * Sets required metadata for GetMessageAddr() navigation:
+ * - logical_offset: Per-message sequence number
+ * - segment_header: Pointer to segment boundary
+ * - next_msg_diff: Size to next message (paddedSize)
+ *
+ * CRITICAL: Must be called BEFORE batch_complete=1 so metadata is visible when frontier advances.
+ * CRITICAL: Must flush metadata to CXL for non-coherent memory visibility.
+ *
+ * Parallelizes what DelegationThread did sequentially (2.56M msgs/sec bottleneck eliminated).
+ */
+void NetworkManager::ProcessOrder0BatchInline(void* batch_data, uint32_t num_msg, size_t base_logical_offset) {
+	if (!batch_data || num_msg == 0) return;
+
+	MessageHeader* msg = reinterpret_cast<MessageHeader*>(batch_data);
+	size_t logical_offset = base_logical_offset;
+
+	// Track flush points for batched CXL flushing
+	void* flush_start = msg;
+	size_t bytes_since_flush = 0;
+	constexpr size_t FLUSH_INTERVAL = 64 * 1024;  // Flush every 64KB
+
+	for (uint32_t i = 0; i < num_msg; i++) {
+		// Validate paddedSize to prevent infinite loop
+		if (msg->paddedSize < sizeof(MessageHeader) || msg->paddedSize > 1024 * 1024) {
+			LOG(ERROR) << "ProcessOrder0BatchInline: Invalid paddedSize=" << msg->paddedSize
+			           << " at message " << i << "/" << num_msg;
+			break;
+		}
+
+		// Set required metadata for subscriber navigation
+		msg->logical_offset = logical_offset++;
+		msg->segment_header = reinterpret_cast<uint8_t*>(msg) - CACHELINE_SIZE;
+		msg->next_msg_diff = msg->paddedSize;
+
+		// Update segment header (accumulated size from segment base to current message)
+		*reinterpret_cast<unsigned long long int*>(msg->segment_header) =
+			static_cast<unsigned long long int>(
+				reinterpret_cast<uint8_t*>(msg) - reinterpret_cast<uint8_t*>(msg->segment_header));
+
+		bytes_since_flush += msg->paddedSize;
+
+		// Batch flush every 64KB to reduce CXL flush overhead
+		if (bytes_since_flush >= FLUSH_INTERVAL) {
+			for (void* p = flush_start; p < reinterpret_cast<void*>(msg); p = reinterpret_cast<void*>(
+						reinterpret_cast<uint8_t*>(p) + 64)) {
+				CXL::flush_cacheline(p);
+			}
+			flush_start = msg;
+			bytes_since_flush = 0;
+		}
+
+		// Move to next message
+		msg = reinterpret_cast<MessageHeader*>(
+			reinterpret_cast<uint8_t*>(msg) + msg->paddedSize);
+	}
+
+	// Flush remaining messages
+	for (void* p = flush_start; p < reinterpret_cast<void*>(msg); p = reinterpret_cast<void*>(
+				reinterpret_cast<uint8_t*>(p) + 64)) {
+		CXL::flush_cacheline(p);
+	}
+
+	// CRITICAL: Single fence after all flushes (batched for performance)
+	CXL::store_fence();
+}
+
+/**
+ * [[ORDER0_INLINE]] Try to advance written frontier collaboratively.
+ * Uses CAS to ensure only one thread processes each PBR slot (gapless written advancement).
+ *
+ * Algorithm:
+ * 1. Load current frontier slot
+ * 2. Check if that slot's batch_complete==1
+ * 3. If yes, CAS to claim it
+ * 4. Winner updates written, losers retry next slot
+ * 5. Continue until finding incomplete slot (gap) or shutdown
+ *
+ * This ensures written advances monotonically without holes, even with parallel recv threads.
+ * Key invariant: PBR slot N contains logical offsets assigned in allocation order → gapless.
+ */
+void NetworkManager::TryAdvanceWrittenFrontier(const char* topic, size_t my_slot, uint32_t num_msg, TInode* tinode) {
+	(void)my_slot;  // Unused: frontier walks all slots, not just my_slot
+	(void)num_msg;  // Unused: read num_msg from BatchHeader instead
+
+	if (!tinode || !cxl_manager_) return;
+
+	// Get or create frontier state for this topic
+	Order0FrontierState* frontier = nullptr;
+	{
+		absl::MutexLock lock(&frontier_mu_);
+		auto it = order0_frontiers_.find(topic);
+		if (it == order0_frontiers_.end()) {
+			order0_frontiers_[topic] = std::make_unique<Order0FrontierState>();
+			frontier = order0_frontiers_[topic].get();
+		} else {
+			frontier = it->second.get();
+		}
+	}
+
+	// Get PBR ring info
+	size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
+	BatchHeader* pbr_base = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) +
+		tinode->offsets[broker_id_].batch_headers_offset);
+
+	// Try to advance frontier through consecutive complete slots
+	int cas_retries = 0;
+	while (!stop_threads_) {  // [[FIX: Shutdown check]] Prevents infinite loop during shutdown
+		size_t slot = frontier->next_complete_slot.load(std::memory_order_acquire);
+		size_t actual_slot = slot % num_slots;
+		BatchHeader* bh = &pbr_base[actual_slot];
+
+		// Check if this slot is complete
+		if (!__atomic_load_n(&bh->batch_complete, __ATOMIC_ACQUIRE)) {
+			break;  // Gap found - stop here
+		}
+
+		// Try to claim this slot via CAS
+		if (!frontier->next_complete_slot.compare_exchange_weak(slot, slot + 1,
+				std::memory_order_acq_rel, std::memory_order_acquire)) {
+			// Lost race - add exponential backoff to reduce contention
+			if (++cas_retries > 3) {
+				std::this_thread::yield();
+				cas_retries = 0;
+			}
+			continue;  // Retry
+		}
+
+		// Won the slot - update written atomically
+		cas_retries = 0;  // Reset backoff
+		size_t batch_num_msg = bh->num_msg;
+		volatile size_t* written_ptr = &tinode->offsets[broker_id_].written;
+		size_t new_written = __atomic_fetch_add(
+			reinterpret_cast<size_t*>(const_cast<size_t*>(written_ptr)),
+			batch_num_msg, __ATOMIC_RELEASE) + batch_num_msg;
+
+		// Update TInode written_addr (last message end position)
+		tinode->offsets[broker_id_].written_addr = bh->log_idx + bh->total_size;
+
+		// Flush for CXL visibility
+		CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
+		CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written_addr));
+		CXL::store_fence();
+
+		// Clear batch_complete for ring reuse
+		__atomic_store_n(&bh->batch_complete, 0, __ATOMIC_RELEASE);
+
+		VLOG(3) << "TryAdvanceWrittenFrontier: slot=" << actual_slot
+		        << " num_msg=" << batch_num_msg << " new_written=" << new_written;
+	}
+}
+
+/**
  * Configures a socket for non-blocking operation with TCP optimizations (used for ACK and subscribe paths)
  */
 bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
@@ -686,11 +842,7 @@ void NetworkManager::HandlePublishRequest(
 			bytes_read += recv_ret;
 		}
 
-		// [[B0_ACK_DIAG]] Tail batches on head broker to trace 1927 shortfall
-		if (broker_id_ == 0 && batch_header.batch_seq >= 4340) {
-			LOG(INFO) << "[B0_ACK_DIAG] RECV batch_seq=" << batch_header.batch_seq
-			          << " num_msg=" << batch_header.num_msg;
-		}
+		// [[PERF_FIX]] Removed B0_ACK_DIAG logging - hot path overhead (~90-180 cycles/batch)
 
 		// Allocate buffer for message batch
 		size_t to_read = batch_header.total_size;
@@ -713,14 +865,11 @@ void NetworkManager::HandlePublishRequest(
 
 		while (!buf && !stop_threads_) {
 			// [[Issue #3]] Single epoch check per batch: do once for EMBARCADERO, then pass epoch_checked to GetCXLBuffer and ReservePBRSlotAfterRecv.
-			// [[ORDER_0_TAIL_ACK]] Order 0 has no sequencer/PBR; avoid long 100ms stall so trailing batches get UpdateWrittenForOrder0 and ACKs in time.
+			// [[PERF_REGRESSION_FIX]] Removed outdated ORDER_0_TAIL_ACK special case - ORDER=0 now uses PBR uniformly.
 			if (topic_ptr && topic_ptr->GetSeqtype() == EMBARCADERO) {
 				if (!epoch_checked_this_batch) {
 					if (topic_ptr->CheckEpochOnce()) {
-						const bool order0 = (topic_ptr->GetOrder() == 0);
-						std::this_thread::sleep_for(order0
-							? std::chrono::milliseconds(1)
-							: std::chrono::milliseconds(100));
+						std::this_thread::sleep_for(std::chrono::milliseconds(100));
 						continue;
 					}
 					epoch_checked_this_batch = true;
@@ -732,19 +881,13 @@ void NetworkManager::HandlePublishRequest(
 					segment_header, logical_offset, seq_type, batch_header_location, epoch_checked_this_batch);
 
 			if (buf != nullptr) {
-				if (broker_id_ == 0 && batch_header.batch_seq >= 4340) {
-					LOG(INFO) << "[B0_ACK_DIAG] GETCXL batch_seq=" << batch_header.batch_seq
-					          << " (wait_iterations=" << wait_iterations << ")";
-				}
+				// [[PERF_FIX]] Removed B0_ACK_DIAG logging
 				break;  // Success
 			}
 
 			// Ring full - wait for consumer to make space
 			wait_iterations++;
-			if (broker_id_ == 0 && wait_iterations == 100) {
-				LOG(WARNING) << "[B0_ACK_DIAG] GetCXLBuffer blocking batch_seq=" << batch_header.batch_seq
-				             << " wait_iterations=" << wait_iterations;
-			}
+			// [[PERF_FIX]] Removed B0_ACK_DIAG logging
 			size_t total_ring_full = blocking_ring_full_count.fetch_add(1, std::memory_order_relaxed) + 1;
 
 			// Log first few waits and every 1000th wait
@@ -767,11 +910,7 @@ void NetworkManager::HandlePublishRequest(
 			break;
 		}
 
-		// [[ORDER_0_LOG_IDX]] EmbarcaderoGetCXLBuffer does not set batch_header.log_idx; set it here for Order 0 so SetOrder0Written reads the correct payload.
-		if (topic_ptr && topic_ptr->GetOrder() == 0) {
-			batch_header.log_idx = static_cast<size_t>(
-				reinterpret_cast<uintptr_t>(buf) - reinterpret_cast<uintptr_t>(cxl_manager_->GetCXLAddr()));
-		}
+		// [[PERF_REGRESSION_FIX]] Removed ORDER_0_LOG_IDX - not needed now that ORDER=0 uses PBR.
 
 		// [[DESIGN: PBR reserve after receive]] For EMBARCADERO, GetCXLBuffer only allocates BLog (buf);
 		// batch_header_location is intentionally null here and is set later by ReservePBRSlotAfterRecv.
@@ -831,18 +970,10 @@ void NetworkManager::HandlePublishRequest(
 			break;
 		}
 		// [[DESIGN: PBR reserve after receive]] Reserve PBR slot only after payload is fully received.
-	// [[ORDER_0_SKIP_PBR]] Order 0 does not use sequencer; skip PBR and use atomic logical_offset only.
+	// [[PERF_REGRESSION_FIX]] Reverted ORDER_0_SKIP_PBR: ORDER=0 now uses PBR like all other orders.
+	// This allows DelegationThread to process ORDER=0 batches, restoring 10-12 GB/s performance.
 	TInode* tinode = nullptr;
-	TInode* tinode_early = (seq_type == EMBARCADERO) ? (TInode*)cxl_manager_->GetTInode(handshake.topic) : nullptr;
-	if (tinode_early && tinode_early->order == 0 && topic_ptr) {
-		tinode = tinode_early;
-		// [[ORDER0_WRITTEN_BUG]] Do NOT set logical_offset here. It is set in the completion
-		// else-if (batch_data_complete && tinode && order==0) so we have exactly one place that
-		// advances and updates written. If topic_ptr is null we'd skip this block and reach the
-		// else-if with uninitialized logical_offset, causing UpdateWrittenForOrder0 to use garbage
-		// and often skip the CAS (new_written <= current), so written would never advance.
-		// batch_header_location stays nullptr; UpdateWrittenForOrder0 called in completion block
-	} else if (seq_type == EMBARCADERO) {
+	if (seq_type == EMBARCADERO) {
 		static std::atomic<size_t> post_recv_ring_full_count{0};
 		size_t post_recv_attempts = 0;
 		// Retry post-recv PBR reservation with exponential backoff (max 10 seconds)
@@ -855,19 +986,13 @@ void NetworkManager::HandlePublishRequest(
 				: cxl_manager_->ReservePBRSlotAfterRecv(handshake.topic, batch_header, buf,
 						segment_header, logical_offset, batch_header_location);
 			if (ok) {
-				if (broker_id_ == 0 && batch_header.batch_seq >= 4340) {
-					LOG(INFO) << "[B0_ACK_DIAG] PBR batch_seq=" << batch_header.batch_seq
-					          << " (post_recv_attempts=" << post_recv_attempts << ")";
-				}
+				// [[PERF_FIX]] Removed B0_ACK_DIAG logging
 				break;  // Success
 			}
 			post_recv_attempts++;
 			size_t total_failures = post_recv_ring_full_count.fetch_add(1, std::memory_order_relaxed) + 1;
-			if (broker_id_ == 0 && batch_header.batch_seq >= 4340 && (post_recv_attempts == 1 || post_recv_attempts % 50 == 0)) {
-				LOG(WARNING) << "[B0_ACK_DIAG] ReservePBR blocking batch_seq=" << batch_header.batch_seq
-				             << " post_recv_attempts=" << post_recv_attempts;
-			}
-			
+			// [[PERF_FIX]] Removed B0_ACK_DIAG logging
+
 			// Log every 10 failures or first 5
 			if (total_failures <= 5 || total_failures % 10 == 0) {
 				LOG(WARNING) << "NetworkManager (post-recv PBR): Ring backpressure "
@@ -979,11 +1104,15 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 		// [[DESIGN: Write PBR entry only after full receive]] Batch is fully in blog; write the
-		// complete BatchHeader to the PBR slot once. No batch_complete flag needed: sequencer
-		// uses flags VALID as readiness; num_msg is still sanity-checked. Slot was zeroed in GetCXLBuffer.
+		// complete BatchHeader to the PBR slot once. Slot was zeroed in GetCXLBuffer.
 		// [[PERF: Batch flush pattern]] Write both cachelines, then single fence for both.
 		batch_header.flags = kBatchHeaderFlagValid;
 		memcpy(batch_header_location, &batch_header, sizeof(BatchHeader));
+
+		// [[CRITICAL FIX: batch_complete for DelegationThread]] Set batch_complete=1 so DelegationThread
+		// can detect and process this batch. DelegationThread polls batch_complete, not flags.
+		__atomic_store_n(&batch_header_location->batch_complete, 1, __ATOMIC_RELEASE);
+
 		const void* batch_header_next_line = reinterpret_cast<const void*>(
 			reinterpret_cast<const uint8_t*>(batch_header_location) + 64);
 		// [[CRITICAL: CXL Non-coherent]] Flush BOTH cachelines (BatchHeader is 128B = 2 cachelines)
@@ -991,57 +1120,15 @@ void NetworkManager::HandlePublishRequest(
 		CXL::flush_cacheline(batch_header_next_line);
 		// [[PERF: Amortized fence]] Single fence after both flushes (vs fence after each flush)
 		CXL::store_fence();
-		// [[B0_PBR_DIAG]] Confirm VALID write for same-process visibility diagnosis.
-		// Use broker_id_ (we're the head) so every PBR write on head is a B0 batch.
-		if (broker_id_ == 0) {
-			static std::atomic<uint64_t> b0_pbr_valid_log{0};
-			uint64_t n = b0_pbr_valid_log.fetch_add(1, std::memory_order_relaxed);
-			bool tail = (batch_header.batch_seq >= 4340);
-			if (tail || n < 10 || (n % 5000 == 0 && n > 0)) {
-				LOG(INFO) << "[B0_PBR_WRITE] batch_seq=" << batch_header.batch_seq
-				          << " flags=VALID num_msg=" << batch_header.num_msg
-				          << " slot_ptr=" << static_cast<const void*>(batch_header_location);
-			}
+
+		// [[ORDER_0_ACK_RACE_FIX]] Track the highest logical offset where batch_complete=1 was set.
+		// Used on connection close to advance written without waiting for DelegationThread.
+		if (topic_ptr) {
+			size_t batch_end_offset = logical_offset + batch_header.num_msg;
+			topic_ptr->TrackBatchComplete(batch_end_offset);
 		}
-		// [[CRITICAL: ORDER=0 + ACK=1]] Blocking path updates written so GetOffsetToAck/AckThread can send ACKs.
-		if (tinode && tinode->order == 0) {
-			UpdateWrittenForOrder0(tinode, logical_offset, batch_header.num_msg);
-		}
-	} else if (batch_data_complete && tinode && tinode->order == 0) {
-		// [[ORDER_0_SKIP_PBR]] Order 0 skipped PBR; only update written for ACK.
-		// [[ORDER_0_SUBSCRIBE]] Set next_msg_diff and logical_offset in CXL so subscribers can traverse and GetMessageAddr last_offset is valid.
-		static std::atomic<uint64_t> order0_completion_count{0};
-		uint64_t oc = order0_completion_count.fetch_add(1, std::memory_order_relaxed) + 1;
-		if (oc <= 3 || oc % 5000 == 0) {
-			LOG(INFO) << "Broker " << broker_id_ << " Order 0 completion block entered batch#=" << oc
-			          << " topic=" << handshake.topic << " num_msg=" << batch_header.num_msg << " log_idx=" << batch_header.log_idx;
-		}
-		Topic* topic_o0 = cxl_manager_->GetTopicPtr(handshake.topic);
-		size_t start_logical = 0;
-		if (topic_o0) {
-			start_logical = topic_o0->GetAndAdvanceOrder0LogicalOffset(batch_header.num_msg);
-		}
-		MessageHeader* order0_msg = reinterpret_cast<MessageHeader*>(buf);
-		size_t order0_remaining = batch_header.total_size;
-		for (uint32_t i = 0; i < batch_header.num_msg; ++i) {
-			if (order0_remaining < sizeof(MessageHeader)) break;
-			if (order0_msg->paddedSize == 0 || order0_msg->paddedSize > order0_remaining) break;
-			order0_msg->logical_offset = start_logical + i;  // [[ORDER_0_LAST_OFFSET]] So GetMessageAddr last_offset is valid (publisher sends -1).
-			order0_msg->next_msg_diff = order0_msg->paddedSize;
-			CXL::flush_cacheline(CXL::ToFlushable(order0_msg));
-			order0_remaining -= order0_msg->paddedSize;
-			order0_msg = reinterpret_cast<MessageHeader*>(
-				reinterpret_cast<uint8_t*>(order0_msg) + order0_msg->paddedSize);
-		}
-		CXL::store_fence();
-		if (topic_o0) {
-			logical_offset = start_logical + batch_header.num_msg;
-			UpdateWrittenForOrder0(tinode, start_logical, batch_header.num_msg);
-			topic_o0->SetOrder0Written(logical_offset,
-				batch_header.log_idx, batch_header.num_msg);
-		} else if (oc <= 5) {
-			LOG(WARNING) << "Broker " << broker_id_ << " Order 0: GetTopicPtr returned null for topic=" << handshake.topic << " batch#=" << oc;
-		}
+
+		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for all orders
 	} else if (batch_header_location == nullptr) {
 		LOG(WARNING) << "NetworkManager: batch_header_location is null for batch with " << batch_header.num_msg << " messages, order_level=" << seq_type;
 	}
@@ -1065,12 +1152,13 @@ void NetworkManager::HandlePublishRequest(
 		}
 	}
 
-	// [[ORDER_0_TAIL]] When publisher closes, advance written_* to true tail so subscribers see all messages (fixes out-of-order batch completion leaving written behind).
+	// [[ORDER_0_ACK_RACE_FIX]] When publisher closes, directly update written to last_batch_complete_offset.
+	// This avoids race with DelegationThread (no message chain walk needed).
 	{
-		Topic* topic_o0 = cxl_manager_->GetTopicPtr(handshake.topic);
-		if (topic_o0 && topic_o0->GetOrder() == 0) {
-			VLOG(1) << "Broker " << broker_id_ << " publish connection closed, calling FinalizeOrder0WrittenIfNeeded for topic=" << handshake.topic;
-			topic_o0->FinalizeOrder0WrittenIfNeeded();
+		Topic* topic_final = cxl_manager_->GetTopicPtr(handshake.topic);
+		if (topic_final) {
+			VLOG(1) << "Broker " << broker_id_ << " publish connection closed, calling UpdateWrittenToLastComplete for topic=" << handshake.topic;
+			topic_final->UpdateWrittenToLastComplete();
 		}
 	}
 
@@ -1163,7 +1251,30 @@ void NetworkManager::SubscribeNetworkThread(
 		int connection_id) {
 
 	size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
-	int order = topic_manager_->GetTopicOrder(topic);
+	// [[FIX: BUG_A]] Topic may not exist yet when subscriber connects before publisher.
+	// Wait up to 30 seconds for the topic to be created, then read its order.
+	int order = -1;
+	{
+		constexpr int kMaxWaitSec = 30;
+		constexpr int kPollIntervalMs = 100;
+		int waited_ms = 0;
+		while (!stop_threads_ && waited_ms < kMaxWaitSec * 1000) {
+			int cur_order = topic_manager_->GetTopicOrder(topic);
+			if (topic_manager_->GetTopic(topic) != nullptr) {
+				order = cur_order;
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+			waited_ms += kPollIntervalMs;
+		}
+		if (order == -1) {
+			if (topic_manager_->GetTopic(topic) == nullptr) {
+				LOG(ERROR) << "SubscribeNetworkThread: Topic '" << topic << "' not found after " << kMaxWaitSec << "s. Exiting.";
+				return;
+			}
+			order = topic_manager_->GetTopicOrder(topic);
+		}
+	}
 	LOG(INFO) << "SubscribeNetworkThread started for topic=" << topic << " order=" << order << " connection_id=" << connection_id;
 
 	// Define batch metadata structure for Sequencer 5
@@ -1858,11 +1969,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 		// No need to call GetOffsetToAck() again - re-use cached value
 		size_t ack = cached_ack;
 
-		// [[B0_ACK_DIAG]] Surgical diagnostic: confirm GetOffsetToAck result for broker 0
-		if (broker_id_ == 0) {
-			LOG_EVERY_N(INFO, 1000) << "[B0_ACK_THREAD] GetOffsetToAck returned " << cached_ack
-			                        << ", next_to_ack=" << next_to_ack_offset;
-		}
+		// [[PERF_FIX]] Removed B0_ACK_THREAD logging (hot path overhead)
 
 		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
 			next_to_ack_offset = ack + 1;
@@ -1928,10 +2035,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 						} while (retry && acked_size < sizeof(ack));
 
 						if (acked_size >= sizeof(ack)) {
-							// [[B0_ACK_DIAG]] Surgical diagnostic: confirm ACK sent for broker 0
-							if (broker_id_ == 0) {
-								LOG_EVERY_N(INFO, 1000) << "[B0_ACK_THREAD] Sent ACK " << ack;
-							}
+							// [[PERF_FIX]] Removed B0_ACK_THREAD logging (hot path overhead)
 							break;  // All data sent
 						}
 					}

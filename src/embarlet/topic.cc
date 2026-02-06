@@ -173,9 +173,8 @@ Topic::Topic(
 		
 	// Start delegation thread if needed (Stage 2: Local Ordering)
 	// Delegation Thread assigns local per-broker sequence numbers
-	// [[ORDER_0_ACK_OPTIMIZATION]] Order=0: receive thread writes directly to BLog and updates
-	// 'written', so ACKs work without DelegationThread; skip starting it.
-	bool skip_delegation_for_order0 = (order_ == 0);
+	// [[REVERT]] DelegationThread now runs for ORDER=0 (restored to 981dd61 behavior)
+	bool skip_delegation_for_order0 = false;  // Use DelegationThread for all orders
 	if (seq_type == CORFU || (seq_type != KAFKA && order_ != 4 && !skip_delegation_for_order0)) {
 		delegationThreads_.emplace_back(&Topic::DelegationThread, this);
 	}
@@ -379,7 +378,7 @@ void Topic::DelegationThread() {
 
 					// Update TInode and tracking with the last message in the batch
 					UpdateTInodeWritten(
-						logical_offset_ - 1, 
+						logical_offset_ - 1,
 						static_cast<unsigned long long int>(
 							reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
 				} else {
@@ -455,17 +454,23 @@ void Topic::DelegationThread() {
 			}
 
 			processed_batches++;
-			VLOG(3) << "DelegationThread: Processed batch " << processed_batches 
-			        << " with " << current_batch->num_msg << " messages";
+			// [[PERF_FIX]] Removed VLOG(3) from hot path - logged every batch (too frequent)
 
 			// [[CRITICAL FIX: Removed Prefetching]] - Batch headers are written by NetworkManager
 			// Prefetching remote-writer data can cause stale cache reads in non-coherent CXL
 			// See docs/INVESTIGATION_2026_01_26_CRITICAL_ISSUES.md Issue #1
 
-			// Move to next batch
-			BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
-				reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
-			current_batch = next_batch;
+			// [[PERF_FIX: Ring wrap-around]] Move to next batch with proper ring wrap
+			BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+			size_t current_offset = reinterpret_cast<uint8_t*>(current_batch) - reinterpret_cast<uint8_t*>(ring_start);
+			size_t next_offset = current_offset + sizeof(BatchHeader);
+			// Wrap to beginning if we've reached the end of the ring
+			if (next_offset >= BATCHHEADERS_SIZE) {
+				next_offset = 0;
+			}
+			current_batch = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(ring_start) + next_offset);
 			continue; // Skip the old message-by-message processing
 		}
 		} else if (current_batch && current_batch->num_msg > 0) {
@@ -1459,6 +1464,51 @@ void Topic::FinalizeOrder0WrittenIfNeeded() {
 	}
 }
 
+// [[ORDER_0_ACK_RACE_FIX]] Update last_batch_complete_offset when batch_complete=1 is set
+void Topic::TrackBatchComplete(size_t logical_offset_end) {
+	// Use atomic max to handle concurrent updates from multiple receive threads
+	size_t current = last_batch_complete_offset_.load(std::memory_order_relaxed);
+	while (logical_offset_end > current) {
+		if (last_batch_complete_offset_.compare_exchange_weak(current, logical_offset_end,
+		                                                       std::memory_order_release,
+		                                                       std::memory_order_relaxed)) {
+			break;
+		}
+	}
+}
+
+// [[ORDER_0_ACK_RACE_FIX]] Directly update written to last_batch_complete_offset without walking message chain
+void Topic::UpdateWrittenToLastComplete() {
+	size_t target = last_batch_complete_offset_.load(std::memory_order_acquire);
+	if (target == 0) {
+		VLOG(1) << "UpdateWrittenToLastComplete topic=" << topic_name_ << " broker=" << broker_id_
+		        << " skip (no batches completed)";
+		return;
+	}
+
+	// Update TInode written offset directly (no message chain walk needed!)
+	TInode* tinode = tinode_;
+	if (!tinode) {
+		LOG(WARNING) << "UpdateWrittenToLastComplete topic=" << topic_name_ << " broker=" << broker_id_
+		             << " skip (tinode is null)";
+		return;
+	}
+
+	// Update written atomically (DelegationThread may also update concurrently)
+	size_t current_written = tinode->offsets[broker_id_].written;
+	if (target > current_written) {
+		tinode->offsets[broker_id_].written = target;
+		CXL::flush_cacheline(&tinode->offsets[broker_id_].written);
+		CXL::store_fence();
+		LOG(INFO) << "UpdateWrittenToLastComplete topic=" << topic_name_ << " broker=" << broker_id_
+		          << " advanced written from " << current_written << " to " << target
+		          << " (+" << (target - current_written) << " messages)";
+	} else {
+		VLOG(1) << "UpdateWrittenToLastComplete topic=" << topic_name_ << " broker=" << broker_id_
+		        << " skip (written=" << current_written << " already >= target=" << target << ")";
+	}
+}
+
 int Topic::GetPBRUtilizationPct() {
 	if (is_sequencer_only_) return -1;
 	if (!first_batch_headers_addr_) return -1;
@@ -1823,12 +1873,29 @@ bool Topic::GetBatchToExportWithMetadata(
 	uint32_t ring_num_messages = 0;
 	size_t next_pbr = expected_batch_offset;
 
+	// [[EXPORT_DIAG]] Log struct layout once per process to verify CV/ring addressing
+	{
+		static bool layout_logged = false;
+		if (!layout_logged) {
+			size_t bh_off = tinode_->offsets[broker_id_].batch_headers_offset;
+			LOG(ERROR) << "[STRUCT_LAYOUT B" << broker_id_ << "]"
+			           << " sizeof(CompletionVectorEntry)=" << sizeof(CompletionVectorEntry)
+			           << " offsetof(completed_pbr_head)=" << offsetof(CompletionVectorEntry, completed_pbr_head)
+			           << " offsetof(completed_logical_offset)=" << offsetof(CompletionVectorEntry, completed_logical_offset)
+			           << " sizeof(BatchHeader)=" << sizeof(BatchHeader)
+			           << " kCompletionVectorOffset=" << kCompletionVectorOffset
+			           << " cxl_addr_=" << cxl_addr_
+			           << " batch_headers_offset=" << bh_off;
+			layout_logged = true;
+		}
+	}
+
 	if (num_slots_ > 0 && cxl_addr_) {
 		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
 		CompletionVectorEntry* my_cv = &cv[broker_id_];
 		CXL::flush_cacheline(my_cv);
-		CXL::load_fence();
+		CXL::full_fence();  // MFENCE orders CLFLUSHOPT before loads (per Intel SDM §11.12)
 		uint64_t completed_pbr_head = my_cv->completed_pbr_head.load(std::memory_order_acquire);
 		constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
 
@@ -1913,6 +1980,71 @@ bool Topic::GetBatchToExportWithMetadata(
 		expected_batch_offset = next_pbr + 1;
 		return true;
 	}
+
+	// [[EXPORT_DIAG]] Log why export failed every ~2s to identify CV/slot/tinode mismatch on non-head brokers
+	{
+		static thread_local uint64_t diag_fail_count = 0;
+		static thread_local auto last_diag_time = std::chrono::steady_clock::now();
+		diag_fail_count++;
+
+		auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_diag_time).count() >= 2) {
+			CompletionVectorEntry* cv_diag = reinterpret_cast<CompletionVectorEntry*>(
+				reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
+			CompletionVectorEntry* my_cv_diag = &cv_diag[broker_id_];
+			CXL::flush_cacheline(my_cv_diag);
+			CXL::full_fence();
+			uint64_t diag_pbr_head = my_cv_diag->completed_pbr_head.load(std::memory_order_acquire);
+			uint64_t diag_logical = my_cv_diag->completed_logical_offset.load(std::memory_order_acquire);
+
+			uint64_t diag_ordered = 0;
+			uint64_t diag_pbr_idx = 0;
+			size_t diag_total_size = 0;
+			uint32_t diag_flags = 0;
+			uint32_t diag_num_msg = 0;
+			size_t diag_off_to_export = 0;
+			if (num_slots_ > 0 && cxl_addr_) {
+				size_t slot = expected_batch_offset % num_slots_;
+				BatchHeader* start_bh = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+				BatchHeader* hdr_diag = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(start_bh) + sizeof(BatchHeader) * slot);
+				CXL::flush_cacheline(hdr_diag);
+				CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(hdr_diag) + 64);
+				CXL::full_fence();
+				diag_ordered = hdr_diag->ordered;
+				diag_pbr_idx = hdr_diag->pbr_absolute_index;
+				diag_total_size = hdr_diag->total_size;
+				diag_flags = hdr_diag->flags;
+				diag_num_msg = hdr_diag->num_msg;
+				diag_off_to_export = hdr_diag->batch_off_to_export;
+			}
+
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_])));
+			CXL::full_fence();
+			size_t diag_tinode_ordered = tinode_->offsets[broker_id_].ordered;
+
+			LOG(ERROR) << "[EXPORT_DIAG B" << broker_id_ << "]"
+			           << " fails=" << diag_fail_count
+			           << " next_pbr=" << expected_batch_offset
+			           << " | CV: pbr_head=" << diag_pbr_head
+			           << " logical_offset=" << diag_logical
+			           << " | SLOT: ordered=" << diag_ordered
+			           << " pbr_abs_idx=" << diag_pbr_idx
+			           << " flags=" << diag_flags
+			           << " num_msg=" << diag_num_msg
+			           << " total_size=" << diag_total_size
+			           << " off_to_export=" << diag_off_to_export
+			           << " | TINODE: ordered=" << diag_tinode_ordered
+			           << " | num_slots=" << num_slots_
+			           << " kNoProgress=" << static_cast<uint64_t>(-1);
+
+			last_diag_time = now;
+			diag_fail_count = 0;
+		}
+	}
+
 	return false;
 }
 
@@ -2035,9 +2167,19 @@ bool Topic::GetMessageAddr(
 				}
 			}
 		}
-	} else {
-		combined_offset = written_logical_offset_;
-		combined_addr = written_physical_addr_;
+	} else {  // order_ == 0
+		// [[FIX: Read from TInode (CXL shared memory), not stale class members]]
+		// This matches GetOffsetToAck's approach (single source of truth)
+		volatile size_t* written_ptr = &tinode_->offsets[broker_id_].written;
+		CXL::flush_cacheline(const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(written_ptr)));
+		CXL::flush_cacheline(const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].written_addr)));
+		CXL::full_fence();  // Ensure flush completes before reads
+
+		combined_offset = tinode_->offsets[broker_id_].written;
+		combined_addr = reinterpret_cast<void*>(
+			reinterpret_cast<uint8_t*>(cxl_addr_) + static_cast<size_t>(tinode_->offsets[broker_id_].written_addr));
 	}
 
 	// Check if we have new messages. For Order 0, last_offset=(size_t)-1 means unset (publisher sent sentinel); ignore for this check.
@@ -2100,15 +2242,13 @@ bool Topic::GetMessageAddr(
 	} else {
 		// Start from first message.
 		if (order_ == 0) {
-			// [[FIX: ORDER0_CHAIN_HEAD]] For Order 0 we MUST have order0_first_physical_addr_
-			// to start the chain correctly. first_message_addr_ points to whichever batch
-			// allocated first, which may not be logical batch 0.
-			if (order0_first_physical_addr_ == nullptr) {
-				VLOG(2) << "GetMessageAddr: Order 0 chain head not ready (order0_first_physical_addr_=nullptr) "
-				        << "broker=" << broker_id_ << " topic=" << topic_name_;
+			// [[FIX: BUG_B]] Use first_message_addr_ (set at Topic construction from TInode)
+			// instead of order0_first_physical_addr_ (set by removed SetOrder0Written call).
+			if (first_message_addr_ == nullptr) {
+				VLOG(2) << "GetMessageAddr: Order 0 chain head not ready (first_message_addr_=nullptr) ";
 				return false;
 			}
-			start_msg_header = static_cast<MessageHeader*>(order0_first_physical_addr_);
+			start_msg_header = static_cast<MessageHeader*>(first_message_addr_);
 		} else {
 			if (combined_addr <= last_addr) {
 				LOG(ERROR) << "GetMessageAddr: Invalid address relationship";
@@ -2555,6 +2695,9 @@ void Topic::EpochSequencerThread2() {
 				BatchHeader* sub = it->second;
 				sub->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(sub);
 				sub->ordered = 1;
+				// [[FIX: Flush sub to CXL so non-head brokers see ordered=1]]
+				CXL::flush_cacheline(sub);
+				CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(sub) + 64);
 				BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
 					reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[b].batch_headers_offset);
 				BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
@@ -2733,6 +2876,9 @@ void Topic::EpochSequencerThread2() {
 				BatchHeader* sub = it->second;
 				sub->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(sub);
 				sub->ordered = 1;
+				// [[FIX: Flush sub to CXL for non-head broker visibility]]
+				CXL::flush_cacheline(sub);
+				CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(sub) + 64);
 				BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
 					reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[b].batch_headers_offset);
 				BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
@@ -3753,13 +3899,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 
 	// [[CXL_BATCH_INVALIDATE]] Invalidate a window of K slots once per window instead of every slot.
 	// CORRECTNESS: We only advance current_batch_header after processing (ready or skip). So when
-	// slot_in_window == 0 we invalidate slots [current, current+K-1] (with ring wrap); the next
-	// read of current_batch_header sees fresh data. After advancing, slot_in_window increments;
-	// we do not invalidate again until we've advanced K slots (slot_in_window wraps to 0).
-	// When stuck on a slot we do not advance, so slot_in_window stays 0 and we re-invalidate every
-	// iteration (correct: we must see when the slot becomes valid).
-	constexpr int kInvalidationWindowSlots = 16;
-	int slot_in_window = 0;
+	// [[REVERT TO 981dd61]] Removed windowed invalidation - not needed with per-iteration invalidation
+	// constexpr int kInvalidationWindowSlots = 16;  // UNUSED
+	// int slot_in_window = 0;  // UNUSED
 
 	// [[CRITICAL FIX: Simplified Polling Logic]]
 	// Simply check num_msg and advance if not ready.
@@ -3770,31 +3912,16 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		static thread_local size_t scan_loops = 0;
 		static thread_local size_t ready_batches_seen = 0;
 
-		// [[CXL_BATCH_INVALIDATE]] At start of each window, invalidate next K cache lines then one fence.
-		// When stuck on same slot, slot_in_window remains 0 so we re-invalidate every time (correct).
-		if (slot_in_window == 0) {
-			for (int i = 0; i < kInvalidationWindowSlots; ++i) {
-				size_t slot_off = (reinterpret_cast<uint8_t*>(current_batch_header) -
-					reinterpret_cast<uint8_t*>(ring_start_default) + static_cast<size_t>(i) * sizeof(BatchHeader))
-					% BATCHHEADERS_SIZE;
-				BatchHeader* h = reinterpret_cast<BatchHeader*>(
-					reinterpret_cast<uint8_t*>(ring_start_default) + slot_off);
-				CXL::flush_cacheline(h);
-			}
-			CXL::load_fence();
-		}
+		// [PHASE-0 FIX] Invalidate BOTH cache lines of 128-byte BatchHeader.
+		// BatchHeader is 128 bytes = 2 cache lines. Writer (HandlePublishRequest) flushes both.
+		// Without this, fields in bytes 64-127 (log_idx, start_logical_offset, etc.) read
+		// stale zeros from ReservePBRSlotAfterRecv's memset(0). When client_id reads as 0,
+		// all batches bypass Level 5 processing, silently disabling Order 5 per-client ordering.
+		CXL::flush_cacheline(current_batch_header);
+		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(current_batch_header) + 64);
+		CXL::load_fence();
 
 		++scan_loops;
-
-		// [[CXL_CACHE_INVALIDATION]] For CXL access (same-process or cross-process), ensure cache
-		// line containing flags is invalidated before reading so we see VALID written by
-		// NetworkManager. B0 on head: same-process as writer → use stronger invalidation (clflush).
-		if (broker_id == 0) {
-			CXL::invalidate_cacheline_for_read(current_batch_header);
-		} else {
-			CXL::flush_cacheline(current_batch_header);
-		}
-		CXL::full_fence();
 
 		// Check current batch header using num_msg + VALID flag gating
 		// num_msg is uint32_t in BatchHeader, so read as volatile uint32_t for type safety
@@ -3846,7 +3973,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 
 			uint64_t waited_us = (loop_now_ns - hole_wait_start_ns) / 1000;
 			if (waited_us < kMaxHoleWaitUs) {
-				slot_in_window = 0;  // Re-invalidate next iter (we did not advance)
+				// slot_in_window = 0;  // REMOVED: windowed invalidation
 				++idle_cycles;
 				if (idle_cycles >= kIdleCyclesThreshold) {
 					std::this_thread::sleep_for(std::chrono::microseconds(kScannerRetrySleepUs));
@@ -3872,7 +3999,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 							goto force_skip_claimed;
 						}
 					}
-					slot_in_window = 0;
+					// slot_in_window = 0;  // REMOVED
 					std::this_thread::sleep_for(std::chrono::microseconds(kScannerRetrySleepUs));
 					continue;
 				}
@@ -3929,13 +4056,13 @@ force_skip_claimed:
 							reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
 						if (next_batch_header >= ring_end) next_batch_header = ring_start_default;
 						current_batch_header = next_batch_header;
-						slot_in_window = (slot_in_window + 1) % kInvalidationWindowSlots;
+						// slot_in_window = (slot_in_window + 1) % kInvalidationWindowSlots;  // REMOVED
 						if (idle_cycles >= kIdleCyclesThreshold) {
 							std::this_thread::sleep_for(std::chrono::microseconds(kScannerSleepIdleAdvanceUs));
 							idle_cycles = 0;
 						}
 					} else {
-						slot_in_window = 0;
+						// slot_in_window = 0;  // REMOVED
 						std::this_thread::sleep_for(std::chrono::microseconds(kScannerRetrySleepUs));
 					}
 				}
@@ -4006,13 +4133,13 @@ force_skip_claimed:
 						reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
 					if (next_batch_header >= ring_end) next_batch_header = ring_start_default;
 					current_batch_header = next_batch_header;
-					slot_in_window = (slot_in_window + 1) % kInvalidationWindowSlots;
+					// slot_in_window = (slot_in_window + 1) % kInvalidationWindowSlots;  // REMOVED
 					if (idle_cycles >= kIdleCyclesThreshold) {
 						std::this_thread::sleep_for(std::chrono::microseconds(kScannerSleepIdleAdvanceUs));
 						idle_cycles = 0;
 					}
 				} else {
-					slot_in_window = 0;  // Re-invalidate next iter (we did not advance)
+					// slot_in_window = 0;  // REMOVED: windowed invalidation
 					std::this_thread::sleep_for(std::chrono::microseconds(kScannerRetrySleepUs));
 					skipped_slot_ptr = nullptr;  // Did not advance, no re-check
 				}
@@ -4169,7 +4296,7 @@ force_skip_claimed:
 	}
 	
 	current_batch_header = next_batch_header;
-	slot_in_window = (slot_in_window + 1) % kInvalidationWindowSlots;
+	// slot_in_window = (slot_in_window + 1) % kInvalidationWindowSlots;  // REMOVED
 	}
 
 	// [[B0_ACK_FIX]] Drain phase: after stop_threads_, process any remaining ready batches so the

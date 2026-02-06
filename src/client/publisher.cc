@@ -299,9 +299,10 @@ bool Publisher::Poll(size_t n) {
 	// before we've called SealAll(), dropping the last batches.
 	WriteFinishedOrPaused();
 
-	pubQue_.ReturnReads();
+	// Signal threads before releasing queue resources
 	publish_finished_.store(true, std::memory_order_release);
 	consumer_should_exit_.store(true, std::memory_order_release);
+	pubQue_.ReturnReads();
 
 	constexpr auto SPIN_DURATION = std::chrono::milliseconds(1);
 	while (client_order_.load(std::memory_order_acquire) < n) {
@@ -836,9 +837,10 @@ process_client_fd:;
 					partial_ack_reads[client_sock] = {0, 0}; // Reset for next ACK
 					int broker_id = client_sockets[client_sock]; // Get broker ID
 
-					// Check if broker_id is valid (should be if state is READING_ACKS)
-					if (broker_id < 0) {
-						LOG(ERROR) << "AckThread: Invalid broker_id (-1) for fd " << client_sock << " in READING_ACKS state.";
+					// [[CRITICAL FIX: Validate broker_id bounds]] Check for FD reuse corruption
+					if (broker_id < 0 || broker_id >= (int)acked_messages_per_broker_.size()) {
+						LOG(ERROR) << "AckThread: Invalid broker_id=" << broker_id << " for fd=" << client_sock
+						           << " (FD reuse or corruption). Closing connection.";
 						connection_error_or_closed = true; break;
 					}
 
@@ -868,9 +870,7 @@ process_client_fd:;
 								        << " total_ack_received=" << (prev_total + new_acked_msgs)
 								        << " (count=" << ack_process_count << ")";
 							}
-							// [[B0_ACK_DIAG]] Surgical diagnostic: confirm publisher receives and credits ACKs per broker
-							LOG_EVERY_N(INFO, 1000) << "[PUB_ACK] Broker " << broker_id << " ack=" << acked_msg
-							                        << " (+" << new_acked_msgs << ")";
+							
 							acked_messages_per_broker_[broker_id].fetch_add(new_acked_msgs, std::memory_order_release);
 							ack_received_.fetch_add(new_acked_msgs, std::memory_order_release);
 							prev_ack_per_sock[client_sock] = acked_msg; // Update last value for this socket
@@ -906,11 +906,16 @@ process_client_fd:;
 	}// End for loop through epoll events
 }// End while(!shutdown_)
 
-// Clean up client sockets
+// [[CRITICAL FIX: Clean up all ACK state]] Prevent FD reuse corruption in future runs
 for (auto const& [sock_fd, broker_id] : client_sockets) {
 	epoll_ctl(epoll_fd, EPOLL_CTL_DEL, sock_fd, nullptr);
 	close(sock_fd);
 }
+client_sockets.clear();
+prev_ack_per_sock.clear();
+socket_state.clear();
+partial_id_reads.clear();
+partial_ack_reads.clear();
 
 // Clean up epoll and server socket
 close(epoll_fd);
@@ -1272,9 +1277,14 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			size_t remaining_bytes = len - sent_bytes;
 			size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
 
-		// [[TEST]] Disable MSG_ZEROCOPY to check if it's causing issues
-        int send_flags = 0;
+		// Use MSG_ZEROCOPY for large sends to reduce CPU overhead.
+		int send_flags = 0;
 
+			if (to_send >= (1UL << 16)) {
+				send_flags = MSG_ZEROCOPY;
+			} else {
+				send_flags = 0;
+			}
 			bytesSent = send(sock.get(), 
 					static_cast<uint8_t*>(msg) + sent_bytes, 
 					to_send, 

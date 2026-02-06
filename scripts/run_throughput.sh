@@ -40,16 +40,6 @@ cleanup() {
 
 cleanup
 
-# Kernel socket buffers: REQUIRED for 10-12 GB/s. Without this, Linux caps SO_RCVBUF/SO_SNDBUF to ~208KB.
-# Attempt tuning by default so ORDER=0 ACK=1 10GB can reach 10+ GB/s. Set EMBARCADERO_SKIP_KERNEL_TUNE=1 to skip.
-if [ -z "${EMBARCADERO_SKIP_KERNEL_TUNE:-}" ]; then
-  if (cd "$PROJECT_ROOT" && ./scripts/tune_kernel_buffers.sh 2>/dev/null); then
-    echo "Kernel socket buffers tuned for high throughput (10+ GB/s)."
-  else
-    echo "Note: Kernel buffer tune skipped or failed (need: sudo ./scripts/tune_kernel_buffers.sh). For 10-12 GB/s run that once."
-  fi
-fi
-
 # PERF OPTIMIZED: Enable hugepages by default for 9GB/s+ performance
 # Runtime hugepage allocation with 256MB buffers provides optimal performance
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
@@ -374,12 +364,12 @@ for test_case in "${test_cases[@]}"; do
 
 			echo "All processes have finished for trial $trial with message size $msg_size"
 
-			# Clear pids array and clean up log files from this trial
+			# Clear pids array and save broker logs for inspection (especially on subscribe timeout)
 			pids=()
-			if [ -d "../../data/throughput/logs" ]; then
-				mkdir -p "../../data/throughput/logs/trial_${trial}_$(date +%Y%m%d_%H%M%S)"
-				mv broker_*_trial${trial}.log ../../data/throughput/logs/trial_${trial}_$(date +%Y%m%d_%H%M%S)/ 2>/dev/null || true
-			fi
+			mkdir -p "../../data/throughput/logs"
+			log_subdir="../../data/throughput/logs/trial_${trial}_$(date +%Y%m%d_%H%M%S)"
+			mkdir -p "$log_subdir"
+			mv broker_*_trial${trial}.log "$log_subdir"/ 2>/dev/null || true
 			sleep 0.5
 			cleanup
 			sleep 1

@@ -87,3 +87,4 @@ message_size,total_message_size,num_threads_per_broker,ack_level,order,replicati
 1024,8589934592,3,1,2,0,false,1,0,0,EMBARCADERO,0,0,0
 1024,8589934592,3,1,2,0,false,1,0,0,EMBARCADERO,0,0,0
 1024,8589934592,3,1,2,0,false,1,0,0,EMBARCADERO,0,0,0
+1024,8589934592,4,1,0,0,false,1,0,0,EMBARCADERO,0,0,0

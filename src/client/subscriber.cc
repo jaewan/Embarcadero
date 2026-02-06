@@ -617,6 +617,16 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 			double pct = total_data_size > 0 ? (100.0 * static_cast<double>(current_count)) / static_cast<double>(total_data_size) : 0;
 			LOG(ERROR) << "Subscriber::Poll timeout after " << POLL_TIMEOUT_SEC << "s: received "
 			           << current_count << " / " << total_data_size << " bytes (" << std::fixed << std::setprecision(1) << pct << "%)";
+			// Log per-broker bytes to identify which broker(s) stopped sending (no broker logs needed)
+			std::ostringstream broker_breakdown;
+			broker_breakdown << "Per-broker bytes at timeout: [";
+			for (size_t i = 0; i < per_broker_bytes_.size(); ++i) {
+				size_t b = per_broker_bytes_[i].load(std::memory_order_relaxed);
+				if (i > 0) broker_breakdown << " ";
+				broker_breakdown << "B" << i << "=" << b;
+			}
+			broker_breakdown << "]";
+			LOG(ERROR) << broker_breakdown.str();
 			throw std::runtime_error("Subscriber poll timeout");
 		}
 		// Progress logging during long Poll (e.g. large E2E test)

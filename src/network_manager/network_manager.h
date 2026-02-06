@@ -52,6 +52,14 @@ struct SubscriberState {
 };
 
 /**
+ * Frontier state for ORDER=0 inline processing.
+ * Tracks next PBR slot to process for gapless written advancement.
+ */
+struct Order0FrontierState {
+    std::atomic<size_t> next_complete_slot{0};  // Next PBR slot expected to complete (gapless advancement)
+};
+
+/**
  * Publish pipeline components for profiling (single blocking path: recv → BLog).
  */
 enum PublishPipelineComponent : int {
@@ -114,6 +122,10 @@ private:
     // [[PERF]] Blocking path: update written for Order 0 so ACK path advances
     void UpdateWrittenForOrder0(TInode* tinode, size_t logical_offset, uint32_t num_msg);
 
+    // [[ORDER0_INLINE]] Inline parallel processing: set per-message metadata + advance written frontier
+    void ProcessOrder0BatchInline(void* batch_data, uint32_t num_msg, size_t base_logical_offset);
+    void TryAdvanceWrittenFrontier(const char* topic, size_t my_slot, uint32_t num_msg, TInode* tinode);
+
     // [[PERF]] Publish pipeline profiling: per-component time (ns) and count, report aggregated at end
     void RecordProfile(PublishPipelineComponent c, uint64_t ns);
     void LogPublishPipelineProfile();
@@ -143,6 +155,10 @@ private:
     absl::flat_hash_map<int, std::unique_ptr<SubscriberState>> sub_state_;  // <client_id, state>
     int ack_efd_; // Epoll file descriptor for acknowledgments
     int ack_fd_ = -1; // Socket file descriptor for acknowledgments
+
+    // ORDER=0 inline processing: frontier state per topic for gapless written advancement
+    absl::Mutex frontier_mu_;
+    absl::flat_hash_map<std::string, std::unique_ptr<Order0FrontierState>> order0_frontiers_;
     
     // Manager dependencies
     CXLManager* cxl_manager_ = nullptr;

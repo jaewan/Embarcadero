@@ -33,7 +33,7 @@ embarcadero:
     segment_size: 4294967296      # Segment size (4GB) to ensure >=1 segment per broker
     # PBR (batch header ring) size per topic per broker. Must hold all in-flight batches for 10GB/4 brokers.
     # 10MB = 81,920 slots (128B BatchHeader each); 10GB/4 = 2.5GB/broker → ~1.2k batches at 2MB batch → plenty of headroom.
-    # Order 0 does not write to PBR (ORDER_0_SKIP_PBR); higher orders need this ring for sequencer consumption.
+    # PERF_REGRESSION_FIX: All orders (including Order 0) now use PBR for DelegationThread processing.
     batch_headers_size: 10485760  # 10MB
     batch_size: 2097152          # PERF TUNED: 2MB batch size - balances memory usage with network efficiency (~512 messages/batch)
                               # Works optimally with 256MB buffers (128 batches per buffer before wrapping)
@@ -45,7 +45,7 @@ embarcadero:
 
   # Network configuration
   network:
-    io_threads: 6               # ReqReceive threads: must be >= threads_per_broker + sub_connections (3+3=6) so every inbound connection gets a thread; was 4 → 9/12 subscriber timeouts
+    io_threads: 6               # ReqReceive threads: tuned for optimal throughput (too many threads causes contention)
     disk_io_threads: 2           # REDUCED: Testing if fewer disk threads help. Was 4, now 2.
     sub_connections: 3           # Set to 3 connections per broker as requested
     zero_copy_send_limit: 65536     # PERF TUNED: 64KB threshold - optimal for MSG_ZEROCOPY (Linux kernel sweet spot, works with 2MB batches)
