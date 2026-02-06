@@ -143,12 +143,15 @@ class Publisher {
 		size_t next_publish_order_{0};
 		// [[DIAGNOSTIC]] Batch stats (PublishThread writes, WaitForAcks logs on timeout)
 		std::atomic<size_t> total_batches_sent_{0};
+		std::atomic<size_t> total_messages_sent_{0};  // Sum of num_msg over all fully-sent batches
 		std::atomic<size_t> total_batches_attempted_{0};
 		std::atomic<size_t> total_batches_failed_{0};
 
 		// Used to measure real-time throughput during failure benchmark
 		std::atomic<size_t> total_sent_bytes_{0};
 		std::vector<std::atomic<size_t>> sent_bytes_per_broker_;
+		// [[ACK_DIAG]] Per-broker message count sent (PublishThread writes); log vs acked on timeout
+		std::vector<std::atomic<size_t>> sent_messages_per_broker_;
 		bool measure_real_time_throughput_ = false;
 		std::thread real_time_throughput_measure_thread_;
 		std::thread kill_brokers_thread_;

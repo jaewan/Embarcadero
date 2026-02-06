@@ -1636,7 +1636,6 @@ bool Topic::ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
 		reinterpret_cast<const uint8_t*>(batch_headers_log) + 64);
 	CXL::flush_cacheline(batch_header_next_line);
 	CXL::store_fence();
-	// [[B0_PBR_DIAG]] Confirm NetworkManager writes are visible to scanner (same-process).
 	if (broker_id_ == 0) {
 		static std::atomic<uint64_t> b0_pbr_claimed_log{0};
 		uint64_t n = b0_pbr_claimed_log.fetch_add(1, std::memory_order_relaxed);
@@ -2544,19 +2543,14 @@ void Topic::EpochSequencerThread2() {
 				goi_timestamps_[ring_pos].timestamp_ns.store(now_ns, std::memory_order_release);
 			}
 
-			next_order += p.num_msg;
+		next_order += p.num_msg;
 
-			int b = p.broker_id;
-			tinode_->offsets[b].ordered += p.num_msg;
-			if (b == 0 && p.batch_seq >= 4340) {
-				LOG(INFO) << "[B0_ACK_DIAG] ORDERED batch_seq=" << p.batch_seq
-				          << " num_msg=" << p.num_msg
-				          << " new_ordered=" << tinode_->offsets[b].ordered;
-			}
-			tinode_->offsets[b].ordered_offset = static_cast<size_t>(
-				reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
+		int b = p.broker_id;
+		tinode_->offsets[b].ordered += p.num_msg;
+		tinode_->offsets[b].ordered_offset = static_cast<size_t>(
+			reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
 
-			auto it = phase1b_header_for_sub_.find(b);
+		auto it = phase1b_header_for_sub_.find(b);
 			if (it != phase1b_header_for_sub_.end()) {
 				BatchHeader* sub = it->second;
 				sub->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(sub);
@@ -2727,19 +2721,14 @@ void Topic::EpochSequencerThread2() {
 				goi_timestamps_[ring_pos].timestamp_ns.store(now_ns, std::memory_order_release);
 			}
 
-			next_order += p.num_msg;
+		next_order += p.num_msg;
 
-			int b = p.broker_id;
-			tinode_->offsets[b].ordered += p.num_msg;
-			if (b == 0 && p.batch_seq >= 4340) {
-				LOG(INFO) << "[B0_ACK_DIAG] ORDERED batch_seq=" << p.batch_seq
-				          << " num_msg=" << p.num_msg
-				          << " new_ordered=" << tinode_->offsets[b].ordered;
-			}
-			tinode_->offsets[b].ordered_offset = static_cast<size_t>(
-				reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
+		int b = p.broker_id;
+		tinode_->offsets[b].ordered += p.num_msg;
+		tinode_->offsets[b].ordered_offset = static_cast<size_t>(
+			reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
 
-			auto it = phase1b_header_for_sub_.find(b);
+		auto it = phase1b_header_for_sub_.find(b);
 			if (it != phase1b_header_for_sub_.end()) {
 				BatchHeader* sub = it->second;
 				sub->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(sub);
@@ -3813,16 +3802,15 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
 		uint32_t flags = __atomic_load_n(&current_batch_header->flags, __ATOMIC_ACQUIRE);
 		bool is_claimed = (flags & kBatchHeaderFlagClaimed) != 0;
-		bool is_valid = (flags & kBatchHeaderFlagValid) != 0;
+	bool is_valid = (flags & kBatchHeaderFlagValid) != 0;
 
-		// [[B0_PBR_DIAG]] Log what scanner sees for same-process visibility diagnosis.
-		if (broker_id == 0) {
-			size_t slot_off = reinterpret_cast<uint8_t*>(current_batch_header) -
-				reinterpret_cast<uint8_t*>(ring_start_default);
-			LOG_EVERY_N(INFO, 100) << "[B0_SCANNER_READ] slot_offset=" << slot_off
-				<< " num_msg=" << num_msg_check << " flags=" << flags
-				<< " is_valid=" << is_valid << " is_claimed=" << is_claimed;
-		}
+	if (broker_id == 0) {
+		size_t slot_off = reinterpret_cast<uint8_t*>(current_batch_header) -
+			reinterpret_cast<uint8_t*>(ring_start_default);
+		LOG_EVERY_N(INFO, 100) << "[B0_SCANNER_READ] slot_offset=" << slot_off
+			<< " num_msg=" << num_msg_check << " flags=" << flags
+			<< " is_valid=" << is_valid << " is_claimed=" << is_claimed;
+	}
 
 		// Max reasonable: 2MB batch / 64B min message = ~32k messages, use 100k as safety limit
 		constexpr uint32_t MAX_REASONABLE_NUM_MSG = 100000;
@@ -3980,29 +3968,21 @@ force_skip_claimed:
 			++holes_skipped;
 			++idle_cycles;
 			
-			// Log hole skips periodically for diagnostics; always log B0 skips for ACK shortfall diagnosis
-			if (broker_id == 0) {
-				uint64_t read_batch_seq = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->batch_seq;
-				LOG(WARNING) << "[B0_ACK_DIAG] SCANNER_SKIP hole at slot "
-					<< (reinterpret_cast<uint8_t*>(current_batch_header) - reinterpret_cast<uint8_t*>(ring_start_default))
-					<< " num_msg=" << num_msg_check << " is_claimed=" << is_claimed
-					<< " batch_seq_from_slot=" << read_batch_seq
-					<< " total_holes=" << holes_skipped;
-			}
-			if (holes_skipped % kHoleSkipLogInterval == 1 || is_claimed) {
-				LOG(WARNING) << "[Scanner B" << broker_id << "] Skipped hole at slot "
-					<< std::hex << current_batch_header << std::dec
-					<< " after " << kMaxHoleWaitUs << "μs wait (num_msg=" << num_msg_check
-					<< ", batch_complete=" << batch_complete_check
-					<< ", is_claimed=" << is_claimed
-					<< ", total_holes=" << holes_skipped << ")";
-			}
-			
+		// Log hole skips periodically for diagnostics
+		if (holes_skipped % kHoleSkipLogInterval == 1 || is_claimed) {
+			LOG(WARNING) << "[Scanner B" << broker_id << "] Skipped hole at slot "
+				<< std::hex << current_batch_header << std::dec
+				<< " after " << kMaxHoleWaitUs << "μs wait (num_msg=" << num_msg_check
+				<< ", batch_complete=" << batch_complete_check
+				<< ", is_claimed=" << is_claimed
+				<< ", total_holes=" << holes_skipped << ")";
+		}
+		
 			// [[BUG_FIX #3: consumed_through gap prevention]]
 			// Push a SKIP marker to epoch buffer so EpochSequencerThread advances consumed_through.
 			// Must advance scanner so broker can allocate (consumed_through moves past this slot).
 			// H1 (RefreshPBRConsumedThroughCache before allocate) ensures broker sees fresh consumed and does not allocate a slot we already passed.
-			BatchHeader* skipped_slot_ptr = (broker_id == 0) ? current_batch_header : nullptr;
+			BatchHeader* skipped_slot_ptr = current_batch_header;  // All brokers: re-check for CXL visibility (B1/B2/B3) or same-process race (B0)
 			{
 				size_t slot_offset = reinterpret_cast<uint8_t*>(current_batch_header) -
 					reinterpret_cast<uint8_t*>(ring_start_default);
@@ -4037,13 +4017,21 @@ force_skip_claimed:
 					skipped_slot_ptr = nullptr;  // Did not advance, no re-check
 				}
 			}
-		// [[B0_SKIP_FIX]] Same-process producer may write to the skipped slot immediately after
-		// we advance consumed_through. Re-check once so we don't lose that batch (1927 shortfall).
-		// Only B0 has this race (head node is same-process); tail nodes B1-3 are remote (no race).
-		if (broker_id == 0 && skipped_slot_ptr && !stop_threads_) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(20));
-			CXL::invalidate_cacheline_for_read(skipped_slot_ptr);
-			CXL::full_fence();
+		// [[SKIP_FIX]] Re-check skipped slot: B0 same-process race; B1/B2/B3 CXL visibility delay.
+		// After advancing, producer may have written (B0) or CXL write may not be visible yet (B1-B3).
+		if (skipped_slot_ptr && !stop_threads_) {
+			if (broker_id == 0) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+				CXL::invalidate_cacheline_for_read(skipped_slot_ptr);
+				CXL::full_fence();
+			} else {
+				// Remote brokers: stronger CXL visibility (double invalidate + longer delay)
+				CXL::flush_cacheline(CXL::ToFlushable(skipped_slot_ptr));
+				CXL::full_fence();
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				CXL::flush_cacheline(CXL::ToFlushable(skipped_slot_ptr));
+				CXL::full_fence();
+			}
 			uint32_t re_flags = __atomic_load_n(&skipped_slot_ptr->flags, __ATOMIC_ACQUIRE);
 			volatile uint32_t re_num = reinterpret_cast<volatile BatchHeader*>(skipped_slot_ptr)->num_msg;
 			if ((re_flags & kBatchHeaderFlagValid) && re_num > 0 && re_num <= MAX_REASONABLE_NUM_MSG) {
@@ -4051,7 +4039,7 @@ force_skip_claimed:
 					reinterpret_cast<uint8_t*>(ring_start_default);
 				PendingBatch5 pending;
 				pending.hdr = skipped_slot_ptr;
-				pending.broker_id = 0;
+				pending.broker_id = broker_id;
 				pending.num_msg = re_num;
 				pending.client_id = skipped_slot_ptr->client_id;
 				pending.batch_seq = skipped_slot_ptr->batch_seq;
@@ -4062,10 +4050,10 @@ force_skip_claimed:
 					uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 					EpochBuffer5& buf = epoch_buffers_[epoch % 3];
 					if (buf.enter_collection()) {
-						buf.per_broker[0].push_back(pending);
+						buf.per_broker[broker_id].push_back(pending);
 						buf.exit_collection();
 						total_batches_processed++;
-						LOG(INFO) << "[B0_SKIP_FIX] Re-check found batch in skipped slot slot_off="
+						LOG(INFO) << "[SKIP_FIX] [B" << broker_id << "] Re-check found batch in skipped slot slot_off="
 						          << re_slot_off << " batch_seq=" << pending.batch_seq << " num_msg=" << re_num;
 						break;
 						}
@@ -4076,14 +4064,9 @@ force_skip_claimed:
 			continue;
 		}
 
-		// Batch is ready - reset hole wait state
-		hole_wait_start_ns = 0;
-		// [[B0_ACK_DIAG]] Tail batches to trace 1927 shortfall
-		if (broker_id == 0 && current_batch_header->batch_seq >= 4340) {
-			LOG(INFO) << "[B0_ACK_DIAG] SCANNER_READY batch_seq=" << current_batch_header->batch_seq
-			          << " num_msg=" << num_msg_check;
-		}
-		// [[PERF: Reduce hot-path logging]]
+	// Batch is ready - reset hole wait state
+	hole_wait_start_ns = 0;
+	// [[PERF: Reduce hot-path logging]]
 		// At high throughput (10k+ batches/sec), LOG(INFO) every 100-200 batches adds ~10% overhead
 		// Use VLOG for high-frequency logs; LOG(INFO) only for first few and periodic summary
 		size_t ready_seen = ++ready_batches_seen;

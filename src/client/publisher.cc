@@ -1,6 +1,7 @@
 #include "publisher.h"
 #include "publisher_profile.h"
 #include "common/config.h"
+#include "common/scoped_fd.h"
 #include <cstring>
 #include <random>
 #include <algorithm>
@@ -45,6 +46,7 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 	pubQue_(num_threads_per_broker_ * static_cast<size_t>(std::min(NUM_MAX_BROKERS, Embarcadero::GetConfig().config().broker.max_brokers.get())), num_threads_per_broker_, client_id_, message_size, order),
 	seq_type_(seq_type),
 	sent_bytes_per_broker_(NUM_MAX_BROKERS),
+	sent_messages_per_broker_(NUM_MAX_BROKERS),
 	start_time_(std::chrono::steady_clock::now()),  // Initialize immediately; declaration order before acked_messages_per_broker_
 	acked_messages_per_broker_(NUM_MAX_BROKERS){
 
@@ -258,7 +260,6 @@ void Publisher::Init(int ack_level) {
 }
 
 void Publisher::WarmupBuffers() {
-	VLOG(1) << "Pre-touching buffers to eliminate page fault variance...";
 	// Delegate to the Buffer class which has access to private members
 	pubQue_.WarmupBuffers();
 }
@@ -333,8 +334,7 @@ bool Publisher::Poll(size_t n) {
 		}
 		// All publisher threads completed transmission
 	}
-	// Publisher threads already joined, skipping
-
+	
 	// If acknowledgments are enabled, wait for all acks
 	if (ack_level_ >= 1) {
 		auto wait_start_time = std::chrono::steady_clock::now();
@@ -342,10 +342,10 @@ bool Publisher::Poll(size_t n) {
 		// [[CONFIG: Ack-wait spin]] 500µs spin when waiting for acks (burst-friendly); was 1ms.
 		constexpr auto SPIN_DURATION = std::chrono::microseconds(500);
 		
-		// Configurable timeout for ACK waits. Do not increase timeout for debugging—find root causes.
-		// Override via EMBARCADERO_ACK_TIMEOUT_SEC (0 = no timeout).
+		// Configurable timeout for ACK waits. Override via EMBARCADERO_ACK_TIMEOUT_SEC (0 = no timeout).
+		// ORDER=2/5 need sequencer + CXL propagation; 10s is too short for 8GB+. Default 120s when ack>=1.
 		const char* timeout_env = std::getenv("EMBARCADERO_ACK_TIMEOUT_SEC");
-		int timeout_seconds = timeout_env ? std::atoi(timeout_env) : 10;  // 10s default
+		int timeout_seconds = timeout_env ? std::atoi(timeout_env) : 120;  // 120s default for ack_level>=1
 		const auto timeout_duration = std::chrono::seconds(timeout_seconds);
 		// [[FIX: ACK Race Condition]] Capture target ONCE - never reload inside loop
 		// Reloading allowed concurrent Publish() calls to move the target, causing potential infinite wait
@@ -366,11 +366,18 @@ bool Publisher::Poll(size_t n) {
 					<< " attempted=" << total_batches_attempted_.load(std::memory_order_relaxed)
 					<< " failed=" << total_batches_failed_.load(std::memory_order_relaxed)
 					<< " (sent_all=" << (total_batches_failed_.load(std::memory_order_relaxed) == 0 ? "yes" : "no") << ")";
-				// Per-broker counts to pinpoint which broker(s) are short
+				// Per-broker counts to pinpoint which broker(s) are short (sent vs acked)
 				std::string per_broker;
 				for (size_t i = 0; i < acked_messages_per_broker_.size(); i++) {
+					size_t sent = i < sent_messages_per_broker_.size() ? sent_messages_per_broker_[i].load(std::memory_order_relaxed) : 0;
+					size_t acked = acked_messages_per_broker_[i].load(std::memory_order_relaxed);
 					if (i) per_broker += " ";
-					per_broker += "B" + std::to_string(i) + "=" + std::to_string(acked_messages_per_broker_[i].load(std::memory_order_relaxed));
+					per_broker += "B" + std::to_string(i) + "=" + std::to_string(acked);
+					if (sent != 0 || acked != 0) {
+						per_broker += "(sent=" + std::to_string(sent);
+						if (sent > acked) per_broker += ",short=" + std::to_string(sent - acked);
+						per_broker += ")";
+					}
 				}
 				LOG(ERROR) << "[Publisher ACK Per-Broker]: " << per_broker;
 				// Return failure - caller should handle timeout appropriately
@@ -382,14 +389,13 @@ bool Publisher::Poll(size_t n) {
 					break;
 				}
 			}
-			// Log every 1s when debugging (5s timeout); include per-broker acks for stall diagnosis
 			if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
 				std::string per_broker;
 				for (size_t i = 0; i < acked_messages_per_broker_.size(); i++) {
 					if (i) per_broker += " ";
 					per_broker += "B" + std::to_string(i) + "=" + std::to_string(acked_messages_per_broker_[i].load(std::memory_order_relaxed));
 				}
-				LOG(INFO) << "Waiting for acknowledgments, received " << ack_received_.load(std::memory_order_relaxed) << " out of " << target_acks
+				VLOG(1) << "Waiting for acknowledgments, received " << ack_received_.load(std::memory_order_relaxed) << " out of " << target_acks
 					<< " (elapsed: " << elapsed.count() << "s"
 					<< (timeout_seconds > 0 ? ", timeout: " + std::to_string(timeout_seconds) + "s" : "") << ") [" << per_broker << "]";
 				last_log_time = now;
@@ -403,7 +409,34 @@ bool Publisher::Poll(size_t n) {
 			}
 			if (ack_received_.load(std::memory_order_acquire) < target_acks) {
 				std::this_thread::yield();
+		}
+	}
+		// Only treat as success if we actually received ACKs for all messages
+		const size_t received = ack_received_.load(std::memory_order_relaxed);
+		if (received < target_acks) {
+			LOG(ERROR) << "[Publisher ACK Failure]: Did not receive ACKs for all messages. received="
+			           << received << " target=" << target_acks << " short=" << (target_acks - received);
+			std::string per_broker;
+			for (size_t i = 0; i < acked_messages_per_broker_.size(); i++) {
+				size_t sent = i < sent_messages_per_broker_.size() ? sent_messages_per_broker_[i].load(std::memory_order_relaxed) : 0;
+				size_t acked = acked_messages_per_broker_[i].load(std::memory_order_relaxed);
+				if (i) per_broker += " ";
+				per_broker += "B" + std::to_string(i) + "=" + std::to_string(acked);
+				if (sent != 0 || acked != 0) {
+					per_broker += "(sent=" + std::to_string(sent);
+					if (sent > acked) per_broker += ",short=" + std::to_string(sent - acked);
+					per_broker += ")";
+				}
 			}
+			LOG(ERROR) << "[Publisher ACK Per-Broker]: " << per_broker;
+			return false;
+		}
+		LOG(INFO) << "[ACK_VERIFY] received=" << received << " target=" << target_acks << " 100%";
+		// [[ORDER_0_TAIL_ACK]] Drain so EpollAckThread can read in-flight ACKs before we return.
+		const char* drain_env = std::getenv("EMBARCADERO_ACK_DRAIN_MS");
+		int drain_ms = drain_env ? std::atoi(drain_env) : 50;
+		if (drain_ms > 0) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
 		}
 	}
 
@@ -440,9 +473,10 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 	measure_real_time_throughput_ = true;
 	size_t num_brokers = nodes_.size();
 
-	// Initialize counters for sent bytes
+	// Initialize counters for sent bytes and sent messages
 	for (size_t i = 0; i < num_brokers; i++) {
 		sent_bytes_per_broker_[i].store(0);
+		sent_messages_per_broker_[i].store(0);
 		acked_messages_per_broker_[i] = 0;
 	}
 
@@ -711,9 +745,16 @@ while (!shutdown_.load(std::memory_order_acquire)) {
 				socket_state[client_sock] = ConnState::WAITING_FOR_ID; // Expect Broker ID first
 				partial_id_reads[client_sock] = {0, 0};
 				prev_ack_per_sock[client_sock] = (size_t)-1;
+				// [[EPOLLET_RACE_FIX]] With EPOLLET, data that arrives *before* EPOLL_CTL_ADD never
+				// triggers EPOLLIN. On loopback (B0, same machine) the broker can send broker_id
+				// before we register the fd → socket stuck in WAITING_FOR_ID forever → B0=0 ACKs.
+				// Drain any data already present by processing this fd immediately (same path as below).
+				current_fd = client_sock;
+				goto process_client_fd;
 			}
 		} else {
-			// Handle data from existing connection
+			// Handle data from existing connection (also reached via goto from EPOLLET race fix)
+process_client_fd:;
 			int client_sock = current_fd;
 			// [[DEFENSIVE]] Stale event for fd we already closed (e.g. EPOLL_CTL_DEL race).
 			if (client_sockets.find(client_sock) == client_sockets.end()) {
@@ -827,6 +868,9 @@ while (!shutdown_.load(std::memory_order_acquire)) {
 								        << " total_ack_received=" << (prev_total + new_acked_msgs)
 								        << " (count=" << ack_process_count << ")";
 							}
+							// [[B0_ACK_DIAG]] Surgical diagnostic: confirm publisher receives and credits ACKs per broker
+							LOG_EVERY_N(INFO, 1000) << "[PUB_ACK] Broker " << broker_id << " ack=" << acked_msg
+							                        << " (+" << new_acked_msgs << ")";
 							acked_messages_per_broker_[broker_id].fetch_add(new_acked_msgs, std::memory_order_release);
 							ack_received_.fetch_add(new_acked_msgs, std::memory_order_release);
 							prev_ack_per_sock[client_sock] = acked_msg; // Update last value for this socket
@@ -874,10 +918,11 @@ close(server_sock);
 }
 
 void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
-	int sock = -1;
-	int efd = -1;
+	ScopedFd sock, efd;  // [[Phase 2.2]] RAII: closed when thread returns or on reassignment
 	int slow_consumer_queue = -1;
 	int slow_consumer_ms = 1;
+	size_t sent_msgs = 0;
+	size_t sent_batches = 0;
 	{
 		const char* env = std::getenv("EMBARCADERO_SLOW_CONSUMER_QUEUE");
 		if (env && *env) {
@@ -893,9 +938,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 	// Lambda function to establish connection to a broker
 	auto connect_to_server = [&](size_t brokerId) -> bool {
-		// Close existing connections if any
-		if (sock >= 0) close(sock);
-		if (efd >= 0) close(efd);
+		// Reassigning sock/efd closes previous fds via ScopedFd move assignment
 
 		// Get broker address
 		std::string addr;
@@ -921,31 +964,28 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Create socket
 		VLOG(1) << "PublishThread: Connecting to broker " << brokerId << " at " << addr << ":" << (PORT + brokerId);
-		sock = GetNonblockingSock(const_cast<char*>(addr.c_str()), PORT + brokerId);
-		if (sock < 0) {
+		sock = ScopedFd(GetNonblockingSock(const_cast<char*>(addr.c_str()), PORT + brokerId));
+		if (sock.get() < 0) {
 			LOG(ERROR) << "PublishThread: Failed to create socket to broker " << brokerId << " at " << addr << ":" << (PORT + brokerId);
 			return false;
 		}
 
 		// Create epoll instance
-		efd = epoll_create1(0);
-		if (efd < 0) {
+		efd = ScopedFd(epoll_create1(0));
+		if (efd.get() < 0) {
 			LOG(ERROR) << "epoll_create1 failed: " << strerror(errno);
-			close(sock);
-			sock = -1;
+			sock = ScopedFd();
 			return false;
 		}
 
 		// Register socket with epoll
 		struct epoll_event event;
-		event.data.fd = sock;
+		event.data.fd = sock.get();
 		event.events = EPOLLOUT;
-		if (epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event) != 0) {
+		if (epoll_ctl(efd.get(), EPOLL_CTL_ADD, sock.get(), &event) != 0) {
 			LOG(ERROR) << "epoll_ctl failed: " << strerror(errno);
-			close(sock);
-			close(efd);
-			sock = -1;
-			efd = -1;
+			sock = ScopedFd();
+			efd = ScopedFd();
 			return false;
 		}
 
@@ -967,7 +1007,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		while (!shutdown_.load(std::memory_order_acquire) && running) {
 			// [[FIX: Throughput]] 1ms timeout instead of 1000ms for fast response
-			int n = epoll_wait(efd, events, 64, 1);
+			int n = epoll_wait(efd.get(), events, 64, 1);
 			if (n == 0) {
 				// Timeout - check if we should continue
 				if (shutdown_.load(std::memory_order_acquire) || publish_finished_.load(std::memory_order_acquire)) {
@@ -983,7 +1023,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 			for (int i = 0; i < n; i++) {
 				if (events[i].events & EPOLLOUT) {
-					ssize_t bytesSent = send(sock, 
+					ssize_t bytesSent = send(sock.get(), 
 							reinterpret_cast<int8_t*>(&shake) + sent_bytes, 
 							sizeof(shake) - sent_bytes, 
 							0);
@@ -992,10 +1032,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 						if (errno != EAGAIN && errno != EWOULDBLOCK) {
 							LOG(ERROR) << "Handshake send failed: " << strerror(errno);
 							running = false;
-							close(sock);
-							close(efd);
-							sock = -1;
-							efd = -1;
+							sock = ScopedFd();
+							efd = ScopedFd();
 							return false;
 						}
 						// EAGAIN/EWOULDBLOCK are expected in non-blocking mode
@@ -1036,10 +1074,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	// Track if we've sent at least one batch (to ensure connection is used)
 	bool has_sent_batch = false;
 
-	// Main publishing loop. [[PERF]] One atomic (consumer_should_exit_) at loop top; when queue empty check same flag (set by Poll/destructor).
+	// Main publishing loop. [[CRITICAL: DRAIN_BEFORE_EXIT]] Do NOT break at loop top on consumer_should_exit_.
+	// Doing so would exit without draining the queue, leaving batches unsent and causing ACK timeout (~0.03% shortfall).
+	// Only exit when we get nullptr from Read() AND consumer_should_exit_ is set, after draining any remaining batches.
 	while (true) {
-		if (consumer_should_exit_.load(std::memory_order_acquire)) break;
-
 		size_t len;
 		int bytesSent = 0;
 
@@ -1047,7 +1085,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		Embarcadero::BatchHeader* batch_header =
 			static_cast<Embarcadero::BatchHeader*>(pubQue_.Read(pubQuesIdx));
 
-		// Skip if no batch is available
+		// No batch available: exit only if shutdown requested and queue is drained.
 		if (batch_header == nullptr || batch_header->total_size == 0) {
 			if (consumer_should_exit_.load(std::memory_order_acquire)) {
 				// CRITICAL: Don't exit immediately if we haven't sent any batches yet
@@ -1090,13 +1128,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	process_batch:
 		static thread_local size_t batch_count = 0;
 		++batch_count;
-		if (batch_count % 100 == 0 || batch_count == 1) {
-			VLOG(3) << "PublishThread[" << pubQuesIdx << "]: Read batch " << batch_count
-			        << " from buffer " << pubQuesIdx
-			        << " (batch_seq=" << batch_header->batch_seq
-			        << ", num_msg=" << batch_header->num_msg
-			        << ", total_size=" << batch_header->total_size << ")";
-		}
+		
 		if (enable_batch_attempted_for_timeout_log_) {
 			total_batches_attempted_.fetch_add(1, std::memory_order_relaxed);
 		}
@@ -1132,7 +1164,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			const size_t header_size = sizeof(Embarcadero::BatchHeader);
 
 			while (total_sent < header_size) {
-				bytesSent = send(sock, 
+				bytesSent = send(sock.get(), 
 						reinterpret_cast<uint8_t*>(batch_header) + total_sent, 
 						header_size - total_sent, 
 						0);
@@ -1144,7 +1176,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 						// Use 1ms so we yield and broker gets CPU; epoll returns when EPOLLOUT (writable).
 						static constexpr int EPOLL_WAIT_WRITABLE_MS = 1;
 						struct epoll_event events[64];
-						int n = epoll_wait(efd, events, 64, EPOLL_WAIT_WRITABLE_MS);
+						int n = epoll_wait(efd.get(), events, 64, EPOLL_WAIT_WRITABLE_MS);
 
 						if (n == -1) {
 							LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
@@ -1243,7 +1275,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		// [[TEST]] Disable MSG_ZEROCOPY to check if it's causing issues
         int send_flags = 0;
 
-			bytesSent = send(sock, 
+			bytesSent = send(sock.get(), 
 					static_cast<uint8_t*>(msg) + sent_bytes, 
 					to_send, 
 					send_flags);
@@ -1262,7 +1294,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				// Default 1ms yields to broker. Env EMBARCADERO_EPOLL_WAIT_WRITABLE_MS=0 to test busy poll.
 				int wait_ms = GetEpollWaitWritableMs();
 				struct epoll_event events[64];
-				int n = epoll_wait(efd, events, 64, wait_ms);
+				int n = epoll_wait(efd.get(), events, 64, wait_ms);
 
 				if (n == -1) {
 					LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
@@ -1330,16 +1362,12 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		// Mark that we've sent at least one batch
 		has_sent_batch = true;
 		size_t total_sent = total_batches_sent_.fetch_add(1, std::memory_order_relaxed) + 1;
+		total_messages_sent_.fetch_add(batch_header->num_msg, std::memory_order_relaxed);
+		sent_messages_per_broker_[broker_id].fetch_add(batch_header->num_msg, std::memory_order_relaxed);
+		sent_batches += 1;
+		sent_msgs += batch_header->num_msg;
 
-		if (batch_count % 100 == 0 || batch_count == 1) {
-			VLOG(2) << "PublishThread[" << pubQuesIdx << "]: Fully sent batch " << batch_count
-			        << " to broker " << broker_id << " (" << len << " bytes, sent_bytes=" << sent_bytes << ")";
-		}
-		if (total_sent % 500 == 0) {
-			VLOG(2) << "Publisher: total_batches_sent=" << total_sent
-			        << " total_batches_attempted=" << total_batches_attempted_.load(std::memory_order_relaxed)
-			        << " total_batches_failed=" << total_batches_failed_.load(std::memory_order_relaxed);
-		}
+		
 
 		// Verify all data was sent
 		if (sent_bytes != len) {
@@ -1364,7 +1392,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	// NOTE: We intentionally do NOT close sock and efd here to keep broker connections alive
 	// This allows the subscriber to continue working after publisher finishes
 	// Resources will be cleaned up in the Publisher destructor
-	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Exiting main loop. Socket " << sock
+	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Exiting main loop. Socket " << sock.get()
 	        << " kept open for ACKs. publish_finished=" << publish_finished_.load(std::memory_order_relaxed)
 	        << ", shutdown=" << shutdown_.load(std::memory_order_relaxed);
 }

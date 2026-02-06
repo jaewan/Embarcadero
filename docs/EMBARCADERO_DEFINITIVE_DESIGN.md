@@ -416,6 +416,22 @@ Acknowledgments are independent of order level. The client negotiates **ack_leve
 
 **Implementation note:** The broker's AckThread (or equivalent) polls the appropriate source (written, ordered, or CV) and sends the cumulative offset on the ACK connection. Order level and ack_level are independent: e.g. Order 0 + ack_level=1 uses written; Order 2 + ack_level=1 uses ordered; any order + ack_level=2 uses CV.
 
+### 2.3.2 Known Limitation: Hold Buffer Volatility (Order 5)
+
+When a batch enters the hold buffer (gap detected), its PBR slot is freed (consumed_through advanced) so the ring doesn't deadlock. The batch metadata is held in sequencer RAM. If the sequencer crashes during the hold window (≤1.5 ms default, configurable via hold_timeout_epochs × epoch_us), held batches are lost:
+
+- **PBR slot:** freed (reusable)
+- **Hold buffer:** volatile (lost on crash)
+- **GOI entry:** not yet written
+- **BLog data:** still present but unreferenced
+
+These batches are declared "lost" per Property 2b (§5.1). Clients with ack_level ≥ 1 will not have received ACKs for these batches and should retry.
+
+**Mitigation options (future work):**
+1. Checkpoint hold buffer to CXL periodically (adds ~50 μs per checkpoint)
+2. Scan BLog on recovery for unreferenced batches (adds recovery time)
+3. Accept the loss (default — 1.5 ms window is negligible)
+
 ### 2.4 Data Structures
 
 All structures are at least 64-byte aligned for atomic cache-line operations on non-coherent memory. **Control Block and Completion Vector** use **128-byte alignment** to avoid false sharing with adjacent structures: modern CPUs often prefetch 128 bytes (2 cache lines); 64-byte layout can cause ping-pong invalidations when one broker writes CV[i] and another reads CV[i±1]. CXL latency is high—avoid extra cache effects.
@@ -571,6 +587,8 @@ Precondition: Broker i owns BLog[i] and PBR[i] exclusively (Axiom A3)
 * Note that at step3, we can use RDMA by returning offset to the client in step 2 but since we do not know if RDMA is possible with multi-node CXL memory, we stick to TCP design. DMA to CXL here means in TCP recv() the broker is receiving directly to CXL buffer.
 
 * PBR entry makes the receive atomic (either network or CXL can fail during recv()).
+
+* **PBR slot lifecycle and scanner correctness (Order 5 / batch-header ring implementations):** In implementations where the broker reserves a PBR slot before writing the full entry (e.g. two-phase: reserve → mark slot "claimed" → write payload → mark "valid"), the sequencer's collector/scanner **must never skip** a slot that is in the reserved/claimed state. Skipping such a slot (e.g. after a timeout) causes the batch to be lost from the ordering pipeline and leads to ACK stalls. The scanner must wait (without time-bound skip) until the slot becomes valid or is explicitly treated as empty. 
 
 * **Wait-free broker (design decision):** The broker never enforces ordering. PBR is strictly first-come-first-served: each network thread reserves BLog space, receives payload, then appends one PBR entry with a single atomic fetch_add on the PBR tail. No mutex, no per-client queue, no sorting at the broker. Ordering—including per-client order for Order 5—is enforced entirely at the sequencer, which can sort batches (e.g., radix sort in L2 cache) without throttling the ingest path. Adding a broker-side lock to preserve PBR order would cap throughput at ~1–2M ops/sec and waste CXL bandwidth; the expert consensus is to keep the broker a "firehose."
 

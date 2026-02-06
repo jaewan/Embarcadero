@@ -211,6 +211,27 @@ inline void flush_cacheline(const void* addr) {
 }
 
 /**
+ * @brief Invalidate cache line before read (same-process CXL visibility).
+ *
+ * Use when reader and writer are in the same process: clflushopt in the reader
+ * may not force a fresh fetch. clflush is serializing and ensures the line is
+ * evicted so the next load fetches from memory/CXL.
+ * Use for B0 scanner on the head node (same process as NetworkManager writer).
+ */
+inline void invalidate_cacheline_for_read(const void* addr) {
+#ifdef __x86_64__
+    _mm_clflush(const_cast<void*>(addr));
+#elif defined(__aarch64__)
+    const uintptr_t aligned_addr = reinterpret_cast<uintptr_t>(addr) & ~63UL;
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(aligned_addr),
+        reinterpret_cast<char*>(aligned_addr + 64));
+#else
+    (void)addr;
+#endif
+}
+
+/**
  * @brief Store fence - ensures all prior stores and flushes are visible
  *
  * @threading Thread-safe (CPU instruction)

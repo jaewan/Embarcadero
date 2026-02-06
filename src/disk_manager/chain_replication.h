@@ -18,7 +18,8 @@ namespace Embarcadero {
  *   3. Replicas serialize ACKs via num_replicated token:
  *      - Replica R_i waits for num_replicated == i
  *      - Replica R_i increments num_replicated = i + 1 (passes token to next)
- *   4. Tail replica (R_f) updates CompletionVector after replication
+ *   4. Tail replica (R_f) updates CompletionVector after replication (ack_level=2).
+ *      Sequencer may also advance CV (ack_level=1); both use max semantics (design §3.4).
  *
  * Benefits:
  *   - Parallel data copy (low latency)
@@ -49,7 +50,7 @@ private:
     void ReplicationThread();
 
     // Tail replica updates CompletionVector
-    void UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index);
+    void UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count);
 
     int replica_id_;
     int replication_factor_;

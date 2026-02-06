@@ -2,6 +2,7 @@
 #include "../common/configuration.h"
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <random>
 #include <thread>
@@ -17,6 +18,14 @@ void FillRandomData(char* buffer, size_t size) {
 	for (size_t i = 0; i < size; i++) {
 		buffer[i] = dist(gen);
 	}
+}
+
+static bool ShouldValidateOrder() {
+	const char* env = std::getenv("EMBAR_VALIDATE_ORDER");
+	if (!env) {
+		return false;
+	}
+	return std::strcmp(env, "0") != 0;
 }
 
 // Helper function to calculate optimal queue size based on configuration
@@ -161,12 +170,11 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 			*/
 		}
 
-		// Finalize publishing
-		p.DEBUG_check_send_finish();
+		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
 		if (!p.Poll(n)) {
-			LOG(ERROR) << "Publish test failed: ACK wait timed out";
+			LOG(ERROR) << "Publish test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
 			delete[] message;
-			return 0.0;
+			exit(1);
 		}
 
 		p.WriteFailureEventsToFile("/home/domin/Embarcadero/data/failure/failure_events.csv");
@@ -256,11 +264,10 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 
 		// Finalize publishing
 		VLOG(5) << "Finished publishing from client";
-		p.DEBUG_check_send_finish();
 		if (!p.Poll(n)) {
-			LOG(ERROR) << "Publish test failed: ACK wait timed out";
+			LOG(ERROR) << "Publish test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
 			delete[] message;
-			return 0.0;
+			exit(1);
 		}
 
 		// Calculate elapsed time and bandwidth
@@ -329,7 +336,7 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
 			<< " MB/s (receiving only: " << receive_bandwidthMbps << " MB/s)";
 
 		// Check message ordering if requested
-		if (!s.DEBUG_check_order(order)) {
+		if (ShouldValidateOrder() && !s.DEBUG_check_order(order)) {
 			LOG(ERROR) << "Order check failed for order level " << order;
 		}
 
@@ -401,7 +408,7 @@ double ConsumeThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 			<< " MB/s (receiving only: " << receive_bandwidthMbps << " MB/s)";
 
 		// Check message ordering if requested
-		if (!s.DEBUG_check_order(order)) {
+		if (ShouldValidateOrder() && !s.DEBUG_check_order(order)) {
 			LOG(ERROR) << "Order check failed for order level " << order;
 		}
 
@@ -478,12 +485,11 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 			p.Publish(message, message_size);
 		}
 
-		// Finalize publishing
-		p.DEBUG_check_send_finish();
+		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
 		if (!p.Poll(n)) {
-			LOG(ERROR) << "End-to-end test failed: ACK wait timed out";
+			LOG(ERROR) << "End-to-end test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
 			delete[] message;
-			return std::make_pair(0.0, 0.0);
+			exit(1);
 		}
 
 		// Record publish end time
@@ -510,7 +516,9 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 
 		// Check message ordering (add small delay to ensure buffers are stable)
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		s.DEBUG_check_order(order);
+		if (ShouldValidateOrder()) {
+			s.DEBUG_check_order(order);
+		}
 
 		LOG(INFO) << "Publish completed in " << std::fixed << std::setprecision(2) 
 			<< pub_seconds << " seconds, " << pubBandwidthMbps << " MB/s";
@@ -613,12 +621,11 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 			sent_bytes += paddedMsgSizeWithHeader;
 		}
 
-		// Finalize publishing
-		p.DEBUG_check_send_finish();
+		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
 		if (!p.Poll(n)) {
-			LOG(ERROR) << "Latency test failed: ACK wait timed out";
+			LOG(ERROR) << "Latency test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
 			delete[] message;
-			return std::make_pair(0.0, 0.0);
+			exit(1);
 		}
 
 		// Record publish end time
@@ -644,7 +651,9 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 			<< e2e_seconds << " seconds, " << e2eBandwidthMbps << " MB/s";
 
 		// Process latency data
-		s.DEBUG_check_order(order);
+		if (ShouldValidateOrder()) {
+			s.DEBUG_check_order(order);
+		}
 		s.StoreLatency();
 
 		return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);

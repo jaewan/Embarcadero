@@ -4,6 +4,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Throughput test: all brokers are data ingestion (no sequencer-only head).
+# This ensures broker 0 accepts publishes; required for Order 0/5 ACK=1 to get ACKs from all brokers.
+export ALL_INGESTION=1
+# Force head (broker 0) to be an ingestion broker so it gets PBR and advances CompletionVector (fixes B0 ACKs=0).
+[ -n "${ALL_INGESTION}" ] && [ "${ALL_INGESTION}" = "1" ] && export EMBARCADERO_IS_SEQUENCER_NODE=0
+
 # Navigate to build/bin directory
 if [ ! -d "build/bin" ]; then
     echo "Error: Cannot find build/bin directory (expected $PROJECT_ROOT/build/bin)"
@@ -12,8 +18,8 @@ fi
 cd build/bin
 
 # Explicit config argument for binaries (relative to build/bin)
-# Default: all 4 brokers are data ingestion brokers (no sequencer-only head).
-# Set ALL_INGESTION=0 to use sequencer-only head (broker 0 runs sequencer only; brokers 1,2,3 ingest).
+# ALL_INGESTION=1 (set above): head uses embarcadero.yaml, all 4 brokers accept publishes.
+# To use sequencer-only head (broker 0 no data path), run with ALL_INGESTION=0 in env before this script.
 ALL_INGESTION=${ALL_INGESTION:-1}
 if [ -n "${ALL_INGESTION}" ] && [ "${ALL_INGESTION}" = "1" ]; then
   HEAD_CONFIG_ARG="--config ../../config/embarcadero.yaml"
@@ -34,10 +40,14 @@ cleanup() {
 
 cleanup
 
-# Kernel socket buffers: allow SO_RCVBUF/SO_SNDBUF (32 MB) to take effect (broker + client).
-# Run scripts/tune_kernel_buffers.sh with sudo if not already tuned.
-if [ -n "${EMBARCADERO_TUNE_KERNEL_BUFFERS:-}" ]; then
-  (cd "$PROJECT_ROOT" && ./scripts/tune_kernel_buffers.sh) || echo "Warning: kernel buffer tune failed (need sudo?). Continuing."
+# Kernel socket buffers: REQUIRED for 10-12 GB/s. Without this, Linux caps SO_RCVBUF/SO_SNDBUF to ~208KB.
+# Attempt tuning by default so ORDER=0 ACK=1 10GB can reach 10+ GB/s. Set EMBARCADERO_SKIP_KERNEL_TUNE=1 to skip.
+if [ -z "${EMBARCADERO_SKIP_KERNEL_TUNE:-}" ]; then
+  if (cd "$PROJECT_ROOT" && ./scripts/tune_kernel_buffers.sh 2>/dev/null); then
+    echo "Kernel socket buffers tuned for high throughput (10+ GB/s)."
+  else
+    echo "Note: Kernel buffer tune skipped or failed (need: sudo ./scripts/tune_kernel_buffers.sh). For 10-12 GB/s run that once."
+  fi
 fi
 
 # PERF OPTIMIZED: Enable hugepages by default for 9GB/s+ performance
@@ -331,36 +341,51 @@ for test_case in "${test_cases[@]}"; do
 			if [ "$ack" = "1" ]; then
 				export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-60}"
 			fi
-			# 3 threads per broker = 12 total (4 brokers). Pass -n 3 so E2E test and publisher both use 3.
-			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -n 3 -m $msg_size -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -l 0
-			test_exit_code=$?
+			# Threads per broker: use 1 when NUM_BROKERS=1; otherwise 4 for 10+ GB/s (was 3; 4×4=16 threads saturates better).
+			THREADS_PER_BROKER=${THREADS_PER_BROKER:-$([ "$NUM_BROKERS" = "1" ] && echo 1 || echo 4)}
+			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $msg_size -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -l 0 2>&1 | tee "throughput_test_trial${trial}.log"
+			test_exit_code=${PIPESTATUS[0]}
 			if [ $test_exit_code -ne 0 ]; then
 				echo "ERROR: Throughput test failed with exit code $test_exit_code"
 				# Still clean up brokers even if test failed
 			fi
-
-				# Test completed - now clean up broker processes
-				echo "Test completed, cleaning up broker processes..."
+			# Test completed - graceful shutdown so brokers can drain (EpochSequencerThread2, etc.)
+			echo "Test completed, sending SIGTERM to broker processes for graceful shutdown..."
+			for pid in "${pids[@]}"; do
+				kill -TERM "$pid" 2>/dev/null || true
+			done
+			# Wait up to 10s for brokers to exit (drain can take ~3s, plus cleanup)
+			for i in 1 2 3 4 5 6 7 8 9 10; do
+				all_gone=true
 				for pid in "${pids[@]}"; do
-				  kill $pid 2>/dev/null || true
-				  echo "Terminated broker process with PID $pid"
+					kill -0 "$pid" 2>/dev/null && all_gone=false || true
 				done
-
-				echo "All processes have finished for trial $trial with message size $msg_size"
-
-				# [[FIX]]: Clear pids array and clean up log files from this trial
-				pids=()
-				# Move log files to results directory to prevent overwriting in next trial
-				if [ -d "../../data/throughput/logs" ]; then
-					mkdir -p "../../data/throughput/logs/trial_${trial}_$(date +%Y%m%d_%H%M%S)"
-					mv broker_*_trial${trial}.log ../../data/throughput/logs/trial_${trial}_$(date +%Y%m%d_%H%M%S)/ 2>/dev/null || true
-				fi
-				sleep 0.5
-				cleanup
+				$all_gone && break
 				sleep 1
 			done
+			for pid in "${pids[@]}"; do
+				if kill -0 "$pid" 2>/dev/null; then
+					echo "Broker PID $pid did not exit in 10s, sending SIGKILL"
+					kill -9 "$pid" 2>/dev/null || true
+				else
+					echo "Broker PID $pid exited gracefully"
+				fi
+			done
+
+			echo "All processes have finished for trial $trial with message size $msg_size"
+
+			# Clear pids array and clean up log files from this trial
+			pids=()
+			if [ -d "../../data/throughput/logs" ]; then
+				mkdir -p "../../data/throughput/logs/trial_${trial}_$(date +%Y%m%d_%H%M%S)"
+				mv broker_*_trial${trial}.log ../../data/throughput/logs/trial_${trial}_$(date +%Y%m%d_%H%M%S)/ 2>/dev/null || true
+			fi
+			sleep 0.5
+			cleanup
+			sleep 1
+		done
 		done
 	done
- done
+done
 
 echo "All experiments have finished."

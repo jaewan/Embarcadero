@@ -58,9 +58,6 @@ QueueBuffer::QueueBuffer(size_t num_buf, size_t num_threads_per_broker, int clie
 	for (size_t i = 0; i < num_queues_; i++) {
 		queues_.push_back(std::make_unique<folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>>(kQueueCapacity));
 	}
-	VLOG(5) << "QueueBuffer created num_queues=" << num_queues_
-	        << " threads_per_broker=" << num_threads_per_broker_
-	        << " message_size=" << message_size;
 }
 
 QueueBuffer::~QueueBuffer() {
@@ -135,9 +132,13 @@ void QueueBuffer::AdvanceWriteBufId() {
 }
 
 size_t QueueBuffer::SealCurrentAndAdvance() {
-	if (!current_batch_) return 0;
+	if (!current_batch_) {
+		return 0;
+	}
 	size_t data_size = current_batch_tail_ - sizeof(Embarcadero::BatchHeader);
-	if (data_size == 0) return 0;
+	if (data_size == 0) {
+		return 0;
+	}
 	size_t num_sealed = current_batch_num_msg_;
 
 	Embarcadero::BatchHeader* h = current_batch_;
@@ -300,6 +301,19 @@ void* QueueBuffer::Read(int bufIdx) {
 		return batch;
 	}
 	if (write_finished_.load(std::memory_order_acquire) || shutdown_.load(std::memory_order_acquire)) {
+		// [[DRAIN_ON_SHUTDOWN]] Drain queue before returning nullptr so PublishThread sends
+		// the final batch(es) pushed by SealAll() just before ReturnReads().
+		static constexpr int kShutdownDrainTries = 64;
+		for (int i = 0; i < kShutdownDrainTries; ++i) {
+			if (queues_[static_cast<size_t>(bufIdx)]->read(batch)) {
+				(void)__atomic_load_n(reinterpret_cast<const size_t*>(&batch->total_size), __ATOMIC_ACQUIRE);
+				(void)__atomic_load_n(reinterpret_cast<const uint32_t*>(&batch->num_msg), __ATOMIC_ACQUIRE);
+				std::atomic_thread_fence(std::memory_order_acquire);
+				__builtin_prefetch(reinterpret_cast<const char*>(batch) + sizeof(Embarcadero::BatchHeader), 0, 3);
+				return batch;
+			}
+			if ((i % 16) == 0) std::this_thread::yield();
+		}
 		return nullptr;
 	}
 	return nullptr;
@@ -347,7 +361,6 @@ void QueueBuffer::SetActiveQueues(size_t active_count) {
 }
 
 void QueueBuffer::WarmupBuffers() {
-	VLOG(2) << "QueueBuffer::WarmupBuffers touching pool...";
 	for (auto& region : batch_buffers_region_) {
 		if (!region.first || region.second == 0) continue;
 		volatile char* p = static_cast<volatile char*>(region.first);

@@ -2,6 +2,10 @@
 
 #include "common.h"
 #include "../common/wire_formats.h"
+#include <array>
+#include <map>
+#include <memory>
+#include <vector>
 
 class Subscriber;
 
@@ -256,6 +260,8 @@ class Subscriber {
 		bool measure_latency_;
 		int order_level_; // Store the order level for batch-aware processing
 		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
+		// Per-broker byte counters for debugging subscribe stall (which broker underperforms)
+		std::array<std::atomic<size_t>, NUM_MAX_BROKERS> per_broker_bytes_{};
 
 		// --- Buffer Management (part 2/2)---
 		const size_t buffer_size_per_buffer_; // Size for *each* of the two buffers per connection
@@ -301,6 +307,30 @@ class Subscriber {
 		absl::Mutex worker_mutex_; // Protects worker_threads_ vector
 		std::vector<ThreadInfo> worker_threads_ ABSL_GUARDED_BY(worker_mutex_);
 
+		// --- Order-aware consume state (Order 2/5) ---
+		struct OwnedMessage {
+			std::vector<uint8_t> data;
+			uint16_t header_version = Embarcadero::wire::HEADER_VERSION_V1;
+		};
+
+		struct StreamParseState {
+			std::vector<uint8_t> buffer;
+			bool has_pending_metadata = false;
+			Embarcadero::wire::BatchMetadata pending_metadata{};
+			size_t current_batch_messages_processed = 0;
+			size_t next_message_order_in_batch = 0;
+		};
+
+		size_t next_expected_order_{0};
+		std::map<size_t, std::unique_ptr<OwnedMessage>> pending_messages_;
+		std::unique_ptr<OwnedMessage> last_returned_;
+		absl::flat_hash_map<int, StreamParseState> parse_states_;
+
+		// --- Order < 2 consume state (per-Subscriber, not static) ---
+		size_t next_expected_order_weak_{0};
+		BufferState* consume_acquired_buffer_{nullptr};
+		std::shared_ptr<ConnectionBuffers> consume_acquired_connection_{nullptr};
+
 
 
 
@@ -309,6 +339,7 @@ class Subscriber {
 		void ManageBrokerConnections(int broker_id, const std::string& address); // Launches workers
 																																						 // Worker thread function (needs access to Subscriber instance)
 		void ReceiveWorkerThread(int broker_id, int fd_to_handle);
+		void* ConsumeOrdered(int timeout_ms);
 
 		// Helper to remove connection resources
 		void RemoveConnection(int fd);

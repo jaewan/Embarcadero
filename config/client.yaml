@@ -1,6 +1,6 @@
 client:
   publisher:
-    threads_per_broker: 3
+    threads_per_broker: 4   # 4 for 10+ GB/s; was 3
     # 1024 MB per buffer so 12 buffers (3 threads/broker × 4 brokers) hold 10 GB total (12 × 1 GB = 12 GB ≥ 10 GB).
     # Min would be ceil(10/12) GB ≈ 854 MB; 1024 MB gives headroom so 10 GB test does not wrap.
     buffer_size_mb: 1024

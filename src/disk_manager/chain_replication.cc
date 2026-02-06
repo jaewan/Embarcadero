@@ -119,9 +119,11 @@ void ChainReplicationManager::ReplicationThread() {
                 << " incremented num_replicated to " << (replica_id_ + 1)
                 << " for GOI[" << goi_index << "]";
 
-        // [[PHASE_2_CV_UPDATER]] Tail replica updates CompletionVector
+        // [[PHASE_2_CV_UPDATER]] ack_level=2: Tail replica advances CompletionVector after replication.
+        // Sequencer (ack_level=1) may also advance the same CV slot; both use max semantics (CAS only
+        // advances). See docs/COMPLETION_VECTOR_ACK_LEVELS.md and cxl_datastructure.h CompletionVectorEntry.
         if (replica_id_ == replication_factor_ - 1) {  // I'm the tail
-            UpdateCompletionVector(entry->broker_id, entry->pbr_index);
+            UpdateCompletionVector(entry->broker_id, entry->pbr_index, entry->cumulative_message_count);
         }
 
         // Advance to next GOI entry
@@ -139,19 +141,29 @@ void ChainReplicationManager::ReplicationThread() {
               << batches_replicated << " batches";
 }
 
-void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index) {
-    // [[PHASE_2_FIX]] Tail replica tracks highest contiguous pbr_index per broker
-    // CV[broker_id] is updated only when pbr_index is contiguous (monotonic, no gaps)
-    // pbr_index is now absolute (never wraps) so contiguity tracking is simple
+void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count) {
+    // [[PHASE_2_CV_UPDATER]] Tail replica (ack_level=2) advances CV after replicating batch to disk.
+    // Max semantics: CAS only advances when pbr_index > cur; sequencer (ack_level=1) may have already
+    // advanced the same slot — we never regress. CV[broker_id] = highest contiguous pbr_index.
 
     uint64_t& cv_state = broker_cv_state_[broker_id];
 
     // [[PHASE_2_FIX]] Handle initial case (cv_state starts at 0, first batch is pbr_index=0)
     if (cv_state == 0 && pbr_index == 0) {
         // First batch for this broker
-        cv_[broker_id].completed_pbr_head.store(pbr_index, std::memory_order_release);
-        CXL::flush_cacheline(&cv_[broker_id]);
-        CXL::store_fence();
+        // [[ACK_RACE_FIX]] Use atomic max: Sequencer (ACK=1) might have already advanced CV.
+        // We must not regress CV if Sequencer is ahead.
+        uint64_t cur = cv_[broker_id].completed_pbr_head.load(std::memory_order_acquire);
+        constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
+        while (cur == kNoProgress || pbr_index > cur) {
+            if (cv_[broker_id].completed_pbr_head.compare_exchange_strong(cur, pbr_index, std::memory_order_release)) {
+                cv_[broker_id].completed_logical_offset.store(cumulative_msg_count, std::memory_order_release);
+                CXL::flush_cacheline(&cv_[broker_id]);
+                CXL::store_fence();
+                break;
+            }
+            // Retry with updated cur
+        }
         cv_state = pbr_index;
         VLOG(3) << "CV_UPDATER: Broker " << broker_id << " first batch, CV=" << pbr_index;
         return;
@@ -160,9 +172,17 @@ void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint64_
     // Check if this batch is the next expected (contiguous)
     if (pbr_index == cv_state + 1) {
         // Update CV (monotonic)
-        cv_[broker_id].completed_pbr_head.store(pbr_index, std::memory_order_release);
-        CXL::flush_cacheline(&cv_[broker_id]);
-        CXL::store_fence();
+        // [[ACK_RACE_FIX]] Use atomic max
+        uint64_t cur = cv_[broker_id].completed_pbr_head.load(std::memory_order_acquire);
+        constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
+        while (cur == kNoProgress || pbr_index > cur) {
+            if (cv_[broker_id].completed_pbr_head.compare_exchange_strong(cur, pbr_index, std::memory_order_release)) {
+                cv_[broker_id].completed_logical_offset.store(cumulative_msg_count, std::memory_order_release);
+                CXL::flush_cacheline(&cv_[broker_id]);
+                CXL::store_fence();
+                break;
+            }
+        }
 
         // Update local tracker
         cv_state = pbr_index;

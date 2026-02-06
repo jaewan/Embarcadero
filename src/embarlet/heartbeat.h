@@ -129,6 +129,7 @@ class FollowerNodeClient {
 
 		~FollowerNodeClient();
 		void Wait();
+		void RequestShutdown();
 		int GetNumBrokers();
 		bool IsHeadAlive() const { return head_alive_; }
 		void SetHeadAlive(bool alive) { head_alive_ = alive; }
@@ -186,6 +187,7 @@ class HeartBeatManager {
 		// [[SEQUENCER_ONLY_HEAD_NODE]] Added is_sequencer_node parameter
 		HeartBeatManager(bool is_head_node, std::string head_address, bool is_sequencer_node = false);
 		void Wait();
+		void RequestShutdown();
 		int GetBrokerId();
 		int GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 				struct Embarcadero::MessageHeader** msg_to_order,

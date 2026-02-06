@@ -520,6 +520,11 @@ void FollowerNodeClient::Wait() {
 	}
 }
 
+void FollowerNodeClient::RequestShutdown() {
+	shutdown_ = true;
+	cq_.Shutdown();
+}
+
 int FollowerNodeClient::GetNumBrokers() {
 	static size_t initial_num_node = cluster_nodes_.size();
 	if (initial_num_node != cluster_nodes_.size()) {
@@ -720,6 +725,14 @@ void HeartBeatManager::Wait() {
 		server_->Wait();
 	} else {
 		follower_->Wait();
+	}
+}
+
+void HeartBeatManager::RequestShutdown() {
+	if (is_head_node_) {
+		if (server_) server_->Shutdown();
+	} else {
+		if (follower_) follower_->RequestShutdown();
 	}
 }
 

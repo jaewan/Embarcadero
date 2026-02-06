@@ -6,6 +6,7 @@
 #include <fstream>
 
 // System includes
+#include <csignal>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -132,12 +133,25 @@ void SignalScriptReady() {
 	}
 }
 
+// [[GRACEFUL_SHUTDOWN]] Set by SIGTERM/SIGINT so main can request shutdown and let destructors run
+// (Topic/NetworkManager set stop_threads_ in destructors → EpochSequencerThread2 drain runs).
+static volatile std::sig_atomic_t g_shutdown_requested = 0;
+
+static void ShutdownSignalHandler(int signum) {
+	(void)signum;
+	g_shutdown_requested = 1;
+}
+
 } // end of namespace
 
 int main(int argc, char* argv[]) {
 	// Initialize logging
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
+
+	// [[GRACEFUL_SHUTDOWN]] Handle SIGTERM/SIGINT so brokers can drain and exit cleanly
+	std::signal(SIGTERM, ShutdownSignalHandler);
+	std::signal(SIGINT, ShutdownSignalHandler);
 
 	// Parse command line arguments
 	std::string head_addr = "127.0.0.1:" + std::to_string(BROKER_PORT);
@@ -306,8 +320,16 @@ int main(int argc, char* argv[]) {
 	SignalScriptReady();
 	LOG(INFO) << "Embarcadero initialized. Ready to go";
 
-	// *************** Wait unless there's a failure ********************** 
-	heartbeat_manager.Wait();
+	// *************** Wait until shutdown requested (SIGTERM/SIGINT) **********************
+	// Run Wait() in a thread so we can poll g_shutdown_requested and call RequestShutdown(),
+	// allowing destructors to run (stop_threads_ set → EpochSequencerThread2 drain, etc.).
+	std::thread wait_thread([&heartbeat_manager]() { heartbeat_manager.Wait(); });
+	while (g_shutdown_requested == 0) {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+	}
+	LOG(INFO) << "Shutdown requested, stopping heartbeat and joining threads...";
+	heartbeat_manager.RequestShutdown();
+	if (wait_thread.joinable()) wait_thread.join();
 
 	LOG(INFO) << "Embarcadero Terminating";
 	return EXIT_SUCCESS;

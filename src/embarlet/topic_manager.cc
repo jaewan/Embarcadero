@@ -137,6 +137,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		// segment or batch header ring. offsets[0] remains unused.
 		// See docs/memory-bank/SEQUENCER_ONLY_HEAD_NODE_DESIGN.md
 		const bool skip_allocation = is_sequencer_node_ && broker_id_ == 0;
+		LOG(INFO) << "[TopicManager] CreateNewTopicInternal: broker_id=" << broker_id_
+		          << " is_sequencer_node=" << is_sequencer_node_
+		          << " skip_allocation=" << skip_allocation;
 
 		if (!skip_allocation) {
 			segment_metadata = cxl_manager_.GetNewSegment();
@@ -174,6 +177,10 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 			// Initialize this broker's offsets in the main TInode
 			// Each broker needs its own entry in the offsets[NUM_MAX_BROKERS] array
 			InitializeTInodeOffsets(tinode, segment_metadata, batch_headers_region, cxl_addr);
+			
+			LOG(INFO) << "[TopicManager] Initialized offsets for broker " << broker_id_
+			          << ": batch_headers_offset=" << tinode->offsets[broker_id_].batch_headers_offset
+			          << " log_offset=" << tinode->offsets[broker_id_].log_offset;
 		} else {
 			LOG(INFO) << "[SEQUENCER_ONLY] Skipping B0 allocation for topic: " << topic
 			          << " (sequencer-only head node)";
@@ -418,21 +425,18 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		BatchHeader* &batch_header_location,
 		bool epoch_already_checked) {
 	
-	// DEADLOCK FIX: Only head broker creates topics to prevent concurrent creation deadlocks
+	// DEADLOCK FIX: Only head broker creates topics to prevent concurrent creation deadlocks.
+	// [[B0_ACK_BUG1_ROOT_CAUSE]] Do NOT create topic here with order=0. If we do, the topic is
+	// created with Order 0 semantics; when the client wanted Order 5, Sequencer5 never starts,
+	// B0 scanner is never spawned, and CV[0] never advances -> B0=0 ACKs. Client must call
+	// CreateNewTopic (with desired order) first; we return nullptr so the client retries until
+	// the topic exists (created by the heartbeat CreateNewTopic RPC).
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	if (!tinode || tinode->topic[0] == 0) {
-		if (broker_id_ != 0) {
-			// Non-head brokers wait for head to create the topic
-			LOG(INFO) << "Broker " << broker_id_ << " waiting for head broker to create topic: " << topic;
-			return nullptr;  // Return early, client will retry
-		}
-		// Only head broker creates new topics
-		LOG(INFO) << "Head broker creating new topic: " << topic;
-		tinode = CreateNewTopicInternal(topic, 0, 0, false, 0, EMBARCADERO);
-		if (!tinode) {
-			LOG(ERROR) << "Head broker failed to create topic: " << topic;
-			return nullptr;
-		}
+		// Topic not yet created - client should have called CreateNewTopic first; retry will succeed
+		VLOG(1) << "Topic " << topic << " not yet created (broker_id=" << broker_id_
+		        << "). Client should call CreateNewTopic first; returning nullptr for retry.";
+		return nullptr;
 	}
 	
 	// Fast path: try to find topic without locking first
@@ -472,12 +476,11 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 }
 
 bool TopicManager::ReserveBLogSpace(const char* topic, size_t size, void*& log) {
-	// [[RECV_DIRECT_TO_CXL]] Mirror GetCXLBuffer topic-creation so direct path accepts new topics
+	// [[RECV_DIRECT_TO_CXL]] Topic must already exist (created by CreateNewTopic with correct order).
+	// Do not create here with order=0 - see ACK_PIPELINE_BUG1_B0_ROOT_CAUSE.md
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	if (!tinode || tinode->topic[0] == 0) {
-		if (broker_id_ != 0) return false;
-		tinode = CreateNewTopicInternal(topic, 0, 0, false, 0, EMBARCADERO);
-		if (!tinode) return false;
+		return false;  // Client retry until CreateNewTopic has run
 	}
 	{
 		absl::ReaderMutexLock lock(&topics_mutex_);

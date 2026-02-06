@@ -1,7 +1,7 @@
 #!/bin/bash
 # End-to-End Test: Order 0 with ACK Level 1
 # Validates that ACKs work without sequencer (lowest-latency path).
-# When recv_direct_to_cxl is true, receive thread updates 'written' so
+# Receive thread writes directly to BLog and updates 'written', so
 # AckThread can send ACKs without DelegationThread/sequencer hop.
 
 set -euo pipefail
@@ -13,12 +13,13 @@ BIN_DIR="$BUILD_DIR/bin"
 CONFIG_DIR="$PROJECT_ROOT/config"
 TEST_OUTPUT_DIR="$BUILD_DIR/test_output"
 
-TEST_NAME="order0_ack1"
+# Allow override from env for Order5 ACK1: ORDER=5 ACK_LEVEL=1 ./test_order0_ack1.sh
+ORDER="${ORDER:-0}"
+ACK_LEVEL="${ACK_LEVEL:-1}"
+TEST_NAME="order${ORDER}_ack${ACK_LEVEL}"
 NUM_BROKERS=4
 MESSAGE_SIZE=1024
 TOTAL_MESSAGES=10000
-ORDER=0
-ACK_LEVEL=1
 NUMA_BIND="numactl --cpunodebind=1 --membind=1"
 
 RED='\033[0;31m'
@@ -174,7 +175,7 @@ start_brokers() {
 }
 
 run_client_test() {
-    log_info "Running Order 0 + ACK Level 1 publish test..."
+    log_info "Running Order $ORDER + ACK Level $ACK_LEVEL publish test..."
     log_info "Config: ORDER=$ORDER, ACK_LEVEL=$ACK_LEVEL, ${MESSAGE_SIZE}B messages, ${TOTAL_MESSAGES} total"
     local total_size=$((MESSAGE_SIZE * TOTAL_MESSAGES))
     "$BIN_DIR/throughput_test" \
@@ -202,7 +203,7 @@ run_client_test() {
         cat client.log
         return 1
     fi
-    log_info "Client test completed successfully (Order 0 + ack_level=1)"
+    log_info "Client test completed successfully (Order $ORDER + ack_level=$ACK_LEVEL)"
 }
 
 verify_broker_health() {
@@ -220,7 +221,7 @@ verify_broker_health() {
 
 main() {
     echo "=========================================="
-    echo "E2E Test: Order 0 + ACK Level 1"
+    echo "E2E Test: Order $ORDER + ACK Level $ACK_LEVEL"
     echo "=========================================="
     setup
     start_brokers || return 1

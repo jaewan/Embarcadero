@@ -2,6 +2,12 @@
 # This file contains all configurable parameters for the Embarcadero distributed message broker
 
 embarcadero:
+  # Cluster: all brokers are ingestion brokers (broker 0 runs sequencer + data path)
+  cluster:
+    is_sequencer_node: false     # Head (broker 0) also ingests; B0 gets PBR ring and CV advances
+    sequencer_broker_id: 0
+    data_broker_ids: [0, 1, 2, 3]  # All 4 brokers accept publishes
+
   # Version information
   version:
     major: 1
@@ -25,12 +31,10 @@ embarcadero:
   # Storage configuration
   storage:
     segment_size: 4294967296      # Segment size (4GB) to ensure >=1 segment per broker
-    # WORKAROUND: 10MB ring to prevent wrap-around when many batches are deferred due to
-    # out-of-order arrival. With ORDER=5 FIFO validation, batches arriving out of order
-    # are deferred in skipped_batches_5_, and if the ring wraps before they're processed,
-    # their headers get overwritten, causing ACK stall at ~37%.
-    # 10MB = 81,920 slots/broker; 10GB ~1,359 batches/broker → plenty of headroom.
-    batch_headers_size: 10485760  # 10MB (was 1MB)
+    # PBR (batch header ring) size per topic per broker. Must hold all in-flight batches for 10GB/4 brokers.
+    # 10MB = 81,920 slots (128B BatchHeader each); 10GB/4 = 2.5GB/broker → ~1.2k batches at 2MB batch → plenty of headroom.
+    # Order 0 does not write to PBR (ORDER_0_SKIP_PBR); higher orders need this ring for sequencer consumption.
+    batch_headers_size: 10485760  # 10MB
     batch_size: 2097152          # PERF TUNED: 2MB batch size - balances memory usage with network efficiency (~512 messages/batch)
                               # Works optimally with 256MB buffers (128 batches per buffer before wrapping)
     num_disks: 2                 # Number of disks for storage
@@ -46,15 +50,7 @@ embarcadero:
     sub_connections: 3           # Set to 3 connections per broker as requested
     zero_copy_send_limit: 65536     # PERF TUNED: 64KB threshold - optimal for MSG_ZEROCOPY (Linux kernel sweet spot, works with 2MB batches)
 
-    # Publish receive path: default = blocking recv() directly to BLog (CXL), no staging.
-    # PERF: use_nonblocking=false gives blocking recv into CXL (11GB/s in 51ddb5b); true = epoll path (regressed).
-    use_nonblocking: false      # false = blocking recv direct to CXL (default); true = epoll + optional staging
-    # Following settings only used when use_nonblocking=true
-    staging_pool_buffer_size_mb: 4
-    staging_pool_num_buffers: 128
-    num_publish_receive_threads: 8
-    num_cxl_allocation_workers: 4
-    recv_direct_to_cxl: false
+    # Publish path: blocking recv() directly to BLog (CXL). No staging; single code path.
     # PBR backpressure: stop reading TCP when ring above high %, resume when below low %.
     # pbr_high_watermark_pct: 80
     # pbr_low_watermark_pct: 50

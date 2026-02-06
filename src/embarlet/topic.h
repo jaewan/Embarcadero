@@ -3,8 +3,11 @@
 #include <thread>
 #include <atomic>
 #include <utility>
-#include <bitset>
+#include <mutex>
+#include <condition_variable>
+#include <array>
 #include <map>
+#include <memory>
 #include <vector>
 #include <deque>
 
@@ -12,6 +15,9 @@
 #include "../disk_manager/scalog_replication_client.h"
 #include "../cxl_manager/cxl_datastructure.h"
 #include "common/config.h"
+#include "sequencer_utils.h"
+
+#include "absl/container/flat_hash_set.h"
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -27,6 +33,19 @@ namespace Embarcadero {
 #endif
 
 // [[PHASE_1B]] Epoch-batched sequencing + Level 5 hold buffer (design §3.2)
+/** Copy of batch metadata at hold time; ring slot may be reused so we never read p.hdr when from_hold. */
+struct HoldBatchMetadata {
+	size_t log_idx{0};
+	size_t total_size{0};
+	uint64_t batch_id{0};
+	size_t batch_seq{0};
+	uint64_t pbr_absolute_index{0};
+	size_t client_id{0};
+	uint16_t epoch_created{0};
+	int broker_id{0};
+	uint32_t num_msg{0};
+	size_t start_logical_offset{0};
+};
 struct PendingBatch5 {
 	struct BatchHeader* hdr{nullptr};
 	int broker_id{0};
@@ -37,15 +56,89 @@ struct PendingBatch5 {
 	uint16_t epoch_created{0};  // [[PHASE_1A]] For sequencer-side epoch validation (§4.2)
 	// [[CONSUMED_THROUGH_SKIP]] When true, scanner skipped this slot (in-flight); sequencer only advances consumed_through
 	bool skipped{false};
+	// [[RING_ORDER]] Globally increasing sequence from BrokerScannerWorker5; fixes wrap-around sort order
+	uint64_t scanner_seq{0};
+	// [[HOLD_MARKER]] Placeholder when batch moved to hold; sequencer advances consumed_through only
+	bool is_held_marker{false};
+	// [[FROM_HOLD]] Batch was drained from hold; use hold_meta (not hdr) for GOI/export; ring slot may be reused
+	bool from_hold{false};
+	// [[FROM_HOLD]] When from_hold is true, use this copy (filled at hold time) instead of hdr
+	HoldBatchMetadata hold_meta;
 };
-struct ClientState5 {
-	uint64_t next_expected{0};
-	uint64_t highest_sequenced{0};
-	std::bitset<128> recent_window;  // Duplicate detection
+/** Export metadata for batches ordered from hold (ring slot already advanced). */
+struct OrderedHoldExportEntry {
+	size_t log_idx{0};
+	size_t batch_size{0};
+	size_t total_order{0};
+	uint32_t num_messages{0};
 };
+using ClientState5 = OptimizedClientState;
 struct HoldEntry5 {
 	PendingBatch5 batch;
-	int wait_epochs{0};
+	HoldBatchMetadata meta;  // Copy at hold time so we never read ring after consumed_through advances
+};
+struct ExpiredHoldEntry {
+	size_t client_id{0};
+	size_t seq{0};
+	PendingBatch5 batch;
+	HoldBatchMetadata meta;
+};
+
+// [[PHASE_1B]] Epoch buffer state machine to prevent concurrent merge/write.
+struct EpochBuffer5 {
+	enum class State : uint32_t { IDLE, COLLECTING, SEALED };
+
+	std::atomic<State> state{State::IDLE};
+	std::atomic<uint32_t> active_collectors{0};
+	std::mutex seal_mutex;
+	std::condition_variable seal_cv;
+	std::array<std::vector<PendingBatch5>, NUM_MAX_BROKERS> per_broker;
+
+	bool enter_collection() {
+		State cur = state.load(std::memory_order_acquire);
+		if (cur != State::COLLECTING) return false;
+		active_collectors.fetch_add(1, std::memory_order_acq_rel);
+		if (state.load(std::memory_order_acquire) != State::COLLECTING) {
+			uint32_t prev = active_collectors.fetch_sub(1, std::memory_order_acq_rel);
+			if (prev == 1) {
+				std::lock_guard<std::mutex> lk(seal_mutex);
+				seal_cv.notify_all();
+			}
+			return false;
+		}
+		return true;
+	}
+
+	void exit_collection() {
+		uint32_t prev = active_collectors.fetch_sub(1, std::memory_order_acq_rel);
+		if (prev == 1) {
+			std::lock_guard<std::mutex> lk(seal_mutex);
+			seal_cv.notify_all();
+		}
+	}
+
+	bool seal() {
+		State expected = State::COLLECTING;
+		if (!state.compare_exchange_strong(expected, State::SEALED, std::memory_order_acq_rel)) {
+			return false;
+		}
+		std::unique_lock<std::mutex> lk(seal_mutex);
+		seal_cv.wait(lk, [this] {
+			return active_collectors.load(std::memory_order_acquire) == 0;
+		});
+		return true;
+	}
+
+	void reset_and_start() {
+		for (auto& v : per_broker) v.clear();
+		active_collectors.store(0, std::memory_order_relaxed);
+		state.store(State::COLLECTING, std::memory_order_release);
+	}
+
+	bool is_available() const {
+		State s = state.load(std::memory_order_acquire);
+		return s == State::IDLE;
+	}
 };
 
 /**
@@ -95,6 +188,14 @@ class Topic {
 		 */
 	~Topic() {
 		stop_threads_ = true;
+		for (auto& shard : level5_shards_) {
+			if (shard) {
+				std::lock_guard<std::mutex> lock(shard->mu);
+				shard->stop = true;
+				shard->has_work = true;
+			}
+			if (shard) shard->cv.notify_one();
+		}
 		for (std::thread& thread : delegationThreads_) {
 			if (thread.joinable()) {
 				thread.join();
@@ -108,6 +209,11 @@ class Topic {
 			// [[PHASE_3]] Join GOI recovery thread if running
 			if(goi_recovery_thread_.joinable()){
 				goi_recovery_thread_.join();
+			}
+			for (std::thread& thread : level5_shard_threads_) {
+				if (thread.joinable()) {
+					thread.join();
+				}
 			}
 
 			VLOG(3) << "[Topic]: \tDestructed";
@@ -173,6 +279,15 @@ class Topic {
 
 		int GetOrder(){ return order_; }
 
+		/** [[ORDER_0_SKIP_PBR]] For order 0 we do not write to PBR. Returns start logical offset for this batch and advances by num_msg. */
+		size_t GetAndAdvanceOrder0LogicalOffset(uint32_t num_msg);
+
+		/** [[ORDER_0_SUBSCRIBE]] Update written_logical_offset_ and written_physical_addr_ so GetMessageAddr can serve subscribers. Call after next_msg_diff is set for the batch. */
+		void SetOrder0Written(size_t cumulative_logical_offset, size_t blog_offset, uint32_t num_msg);
+
+		/** [[ORDER_0_TAIL]] When publish connection closes, advance written_* to order0_next_logical_offset_ so subscribers see full tail (fixes out-of-order batch completion leaving written behind). */
+		void FinalizeOrder0WrittenIfNeeded();
+
 		/** [[Issue #3]] Single epoch check per batch: do once at batch start, pass epoch_already_checked to ReserveBLogSpace/ReservePBRSlotAndWriteEntry. Returns true if stale (caller must not allocate). */
 		bool CheckEpochOnce();
 		void* ReserveBLogSpace(size_t size, bool epoch_already_checked = false);
@@ -205,6 +320,20 @@ class Topic {
 		 * Update the TInode's written offset and address
 		 */
 		inline void UpdateTInodeWritten(size_t written, size_t written_addr);
+		/**
+		 * [[PHASE_2_CV_EXPORT]] Advance CompletionVector for this broker so ack_level=1 export can proceed without waiting for replication.
+		 * Sequencer calls after writing GOI entry; uses atomic max so tail replica (ack_level=2) can also advance CV.
+		 * @param broker_id Broker ID
+		 * @param pbr_index Absolute PBR index of the completed batch
+		 * @param cumulative_msg_count Cumulative message count (ACK offset) for this batch
+		 */
+		void AdvanceCVForSequencer(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count);
+		/**
+		 * [[PHASE_3]] Publish the contiguous GOI prefix via ControlBlock.committed_seq.
+		 * Single sequencer: update after writing GOI entries for an epoch.
+		 */
+		/** Update control_block->committed_seq to last GOI index written (contiguous prefix; design §3.2/§3.3). */
+		void UpdateCommittedSeq(uint64_t last_goi_index);
 
 	/**
 	 * DelegationThread: Stage 2 (Local Ordering)
@@ -331,8 +460,9 @@ class Topic {
 
 		// Offset tracking
 		size_t logical_offset_;
-		size_t written_logical_offset_;
-		void* written_physical_addr_;
+		size_t written_logical_offset_ = static_cast<size_t>(-1);  // Sentinel: "not set"
+		void* written_physical_addr_ = nullptr;
+		void* order0_first_physical_addr_ = nullptr;  // [[ORDER_0]] Start of message chain (set on first SetOrder0Written); first_message_addr_ may be wrong for Order 0
 		std::atomic<unsigned long long int> log_addr_;
 		unsigned long long int batch_headers_;
 
@@ -368,6 +498,9 @@ class Topic {
 		std::atomic<uint64_t> cached_consumed_seq_{0};  // Slot sequence from consumed_through / sizeof(BatchHeader)
 		const size_t num_slots_;                         // BATCHHEADERS_SIZE / sizeof(BatchHeader), set in ctor
 		bool use_lock_free_pbr_{false};                  // True when pbr_state_.is_lock_free()
+
+		// [[ORDER_0_SKIP_PBR]] Monotonic logical offset for order 0; no PBR slot written, only written count updated
+		std::atomic<size_t> order0_next_logical_offset_{0};
 
 		// TInode cache
 		int replication_factor_;
@@ -405,15 +538,26 @@ class Topic {
 		void BrokerScannerWorker5(int broker_id);  // Batch-level scanner (Phase 1b: pushes to epoch buffer)
 		void EpochDriverThread();   // [[PHASE_1B]] Advances epoch_index_ every kEpochUs
 		void EpochSequencerThread(); // [[PHASE_1B]] Processes closed epochs: one fetch_add per epoch, Level 5, commit
+		struct Level5ShardState;  // forward declaration; defined below
 		void ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector<PendingBatch5>& ready);
+		void ProcessLevel5BatchesShard(Level5ShardState& shard,
+			std::vector<PendingBatch5>& level5,
+			std::vector<PendingBatch5>& ready);
+		void ClientGc(Level5ShardState& shard);
+		bool CheckAndInsertBatchId(Level5ShardState& shard, uint64_t batch_id);
+		void Level5ShardWorker(size_t shard_id);
+		void InitLevel5Shards();
+		size_t GetTotalHoldBufferSize();
 	bool ProcessSkipped(
 			absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
 			BatchHeader* &header_for_sub);
 	void AssignOrder(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);
 	void AssignOrder5(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);  // Batch-level version
 
-	std::atomic<size_t> global_seq_{0};  // Message-level sequence (total messages sequenced)
-	std::atomic<uint64_t> global_batch_seq_{0};  // [[PHASE_2_FIX]] Batch-level sequence for GOI indexing (0, 1, 2, 3...)
+	// [[NAMING]] total_order space: next message sequence to assign (design: message-level order for subscribers).
+	std::atomic<size_t> global_seq_{0};
+	// [[NAMING]] GOI index: next slot in GOI array (0, 1, 2, ...). Used as GOIEntry index; committed_seq tracks max written.
+	std::atomic<uint64_t> global_batch_seq_{0};
 		absl::flat_hash_map<size_t, size_t> next_expected_batch_seq_;// client_id -> next expected batch_seq
 		absl::Mutex global_seq_batch_seq_mu_;;
 
@@ -430,22 +574,50 @@ class Topic {
 		static constexpr unsigned kEpochUs = 500;
 		std::atomic<uint64_t> epoch_index_{0};
 		std::atomic<uint64_t> last_sequenced_epoch_{0};
-	// Per-broker buffers; EpochSequencerThread merges once per epoch.
-	// [[CORRECTNESS]] per_scanner_buffers_mu_ protects both scanner push_back and merge/clear.
-	absl::flat_hash_map<int, std::vector<PendingBatch5>> per_scanner_buffers_[3];
-	absl::Mutex per_scanner_buffers_mu_;
+	// Epoch buffers for safe collection/sequencing (no concurrent merge/write).
+	EpochBuffer5 epoch_buffers_[3];
 		std::thread epoch_driver_thread_;
 		// [[PHASE_1B]] Level 5 hold buffer + per-client state (§3.2)
-		absl::flat_hash_map<size_t, ClientState5> level5_client_state_;
-		absl::Mutex level5_state_mu_;
-		std::map<size_t, std::map<size_t, HoldEntry5>> hold_buffer_;  // client_id -> (client_seq -> entry)
-		size_t hold_buffer_size_{0};
-		static constexpr size_t kHoldBufferMaxEntries = 10000;
+		struct Level5ShardState {
+			std::mutex mu;
+			std::condition_variable cv;
+			bool has_work{false};
+			bool done{false};
+			bool stop{false};
+			std::vector<PendingBatch5> input;
+			std::vector<PendingBatch5> ready;
+			absl::flat_hash_map<size_t, ClientState5> client_state;
+			absl::flat_hash_map<size_t, uint64_t> client_highest_committed;
+			std::map<size_t, std::map<size_t, HoldEntry5>> hold_buffer;  // client_id -> (client_seq -> entry)
+			size_t hold_buffer_size{0};
+			std::multimap<uint64_t, std::pair<size_t, size_t>> hold_expiry_queue;
+			absl::flat_hash_set<size_t> clients_with_held_batches;
+			std::vector<ExpiredHoldEntry> expired_hold_buffer;
+			std::vector<PendingBatch5> deferred_level5;
+			FastDeduplicator dedup;
+			RadixSorter<PendingBatch5> radix_sorter;
+		};
+		size_t level5_num_shards_{1};
+		std::vector<std::unique_ptr<Level5ShardState>> level5_shards_;
+		std::vector<std::thread> level5_shard_threads_;
+		std::atomic<bool> level5_shards_started_{false};
+		static constexpr size_t kHoldBufferMaxEntries = 100000;
 		static constexpr int kMaxWaitEpochs = 3;
-		uint64_t current_epoch_for_hold_{0};  // Epoch counter for hold_buffer_.tick_epoch()
+		static constexpr uint64_t kClientTtlEpochs = 20000;
+		static constexpr uint64_t kClientGcEpochInterval = 1024;
+		static constexpr size_t kDeferredL5MaxEntries = kHoldBufferMaxEntries * 2;
+		std::atomic<uint64_t> current_epoch_for_hold_{0};  // Epoch for hold buffer expiry; atomic for shard workers
+		static constexpr size_t kDedupMaxEntries = 1 << 20;
+		absl::flat_hash_set<uint64_t> recent_batch_ids_;
+		std::deque<uint64_t> recent_batch_id_order_;
 		// [[PHASE_1B]] Export chain: per-broker subscription pointer (set by EpochSequencerThread on commit)
 		absl::flat_hash_map<int, BatchHeader*> phase1b_header_for_sub_;
 		absl::Mutex phase1b_header_for_sub_mu_;
+		// [[RING_ORDER]] Monotonic sequence for scanner_seq (BrokerScannerWorker5); fixes wrap-around sort
+		std::atomic<uint64_t> next_scanner_seq_{0};
+		// [[FROM_HOLD]] Batches ordered from hold buffer; export path serves these before ring (ring slot was advanced)
+		absl::flat_hash_map<int, std::deque<OrderedHoldExportEntry>> ordered_from_hold_;
+		absl::Mutex ordered_from_hold_mu_;
 
 		// [[PHASE_2_FIX]] Per-broker absolute PBR counters (never wrap, for CV tracking)
 		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> broker_pbr_counters_{};

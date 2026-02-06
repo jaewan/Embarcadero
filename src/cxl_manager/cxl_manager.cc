@@ -225,7 +225,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		// Memory layout per docs/CXL_MEMORY_LAYOUT_v2.md:
 		//   0x0000_0000: ControlBlock (128 B)
 		//   0x0000_1000: CompletionVector (4 KB)
-		//   0x0000_2000: GOI (16 GB)
+		//   0x0000_2000: GOI (32 GB) - [[SIZE_UPDATE]] 128 bytes per entry
 		static constexpr size_t kCompletionVectorOffset = 0x1000;  // 4 KB from base
 		static constexpr size_t kGOIOffset = 0x2000;               // 8 KB from base
 		static constexpr size_t kMaxGOIEntries = 256ULL * 1024 * 1024;  // 256M entries
@@ -242,19 +242,20 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 			constexpr uint64_t kCVNoProgress = static_cast<uint64_t>(-1);
 			for (int i = 0; i < NUM_MAX_BROKERS; i++) {
 				completion_vector_[i].completed_pbr_head.store(kCVNoProgress, std::memory_order_release);
+				completion_vector_[i].completed_logical_offset.store(0, std::memory_order_release);
 			}
 
-			// Flush CV to CXL (4 KB = 64 cache lines, flush in batches)
-			for (int i = 0; i < NUM_MAX_BROKERS; i += 2) {  // 2 entries per 128-byte cacheline
+			// Flush CV to CXL (4 KB = 32 cache lines, flush in batches)
+			for (int i = 0; i < NUM_MAX_BROKERS; i++) {  // 1 entry per 128-byte cacheline (was 2)
 				CXL::flush_cacheline(&completion_vector_[i]);
 			}
 			CXL::store_fence();
 
-			LOG(INFO) << "CXLManager: Phase 2 initialized - CompletionVector (4 KB) and GOI (16 GB) allocated";
+			LOG(INFO) << "CXLManager: Phase 2 initialized - CompletionVector (4 KB) and GOI (32 GB) allocated";
 			LOG(INFO) << "  - CompletionVector at offset 0x" << std::hex << kCompletionVectorOffset
 			          << " (" << NUM_MAX_BROKERS << " brokers × 128 bytes)";
 			LOG(INFO) << "  - GOI at offset 0x" << std::hex << kGOIOffset
-			          << " (" << std::dec << kMaxGOIEntries << " entries × 64 bytes = 16 GB)";
+			          << " (" << std::dec << kMaxGOIEntries << " entries × 128 bytes = 32 GB)";
 		}
 
 		// Initialize bitmap to zero (broker 0 only, to avoid race conditions)

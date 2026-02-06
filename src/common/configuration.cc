@@ -122,13 +122,6 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (network["sub_connections"]) config_.network.sub_connections.set(network["sub_connections"].as<int>());
                 if (network["zero_copy_send_limit"]) config_.network.zero_copy_send_limit.set(network["zero_copy_send_limit"].as<size_t>());
 
-                // Non-blocking I/O configuration
-                if (network["use_nonblocking"]) config_.network.use_nonblocking.set(network["use_nonblocking"].as<bool>());
-                if (network["staging_pool_buffer_size_mb"]) config_.network.staging_pool_buffer_size_mb.set(network["staging_pool_buffer_size_mb"].as<int>());
-                if (network["staging_pool_num_buffers"]) config_.network.staging_pool_num_buffers.set(network["staging_pool_num_buffers"].as<int>());
-                if (network["num_publish_receive_threads"]) config_.network.num_publish_receive_threads.set(network["num_publish_receive_threads"].as<int>());
-                if (network["num_cxl_allocation_workers"]) config_.network.num_cxl_allocation_workers.set(network["num_cxl_allocation_workers"].as<int>());
-                if (network["recv_direct_to_cxl"]) config_.network.recv_direct_to_cxl.set(network["recv_direct_to_cxl"].as<bool>());
                 if (network["pbr_high_watermark_pct"]) config_.network.pbr_high_watermark_pct.set(network["pbr_high_watermark_pct"].as<int>());
                 if (network["pbr_low_watermark_pct"]) config_.network.pbr_low_watermark_pct.set(network["pbr_low_watermark_pct"].as<int>());
                 if (network["enable_publish_pipeline_profile"]) config_.network.enable_publish_pipeline_profile.set(network["enable_publish_pipeline_profile"].as<bool>());

@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 
@@ -45,6 +46,12 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 
 Subscriber::~Subscriber() {
 	Shutdown(); // Ensure shutdown is called
+	// Release any buffer held by Consume() for order < 2 (per-instance state)
+	if (consume_acquired_buffer_ && consume_acquired_connection_) {
+		consume_acquired_connection_->release_read_buffer(consume_acquired_buffer_);
+		consume_acquired_buffer_ = nullptr;
+		consume_acquired_connection_.reset();
+	}
 	if (cluster_probe_thread_.joinable()) {
 		cluster_probe_thread_.join();
 	}
@@ -595,8 +602,8 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 	VLOG(5) << "Subscriber::Poll - Expected: " << total_data_size << " bytes (" << num_msg << " messages), "
 	          << "padded_msg_size=" << msg_size << ", header_size=" << sizeof(Embarcadero::MessageHeader);
 
-	constexpr int POLL_TIMEOUT_SEC = 300;  // 5 min max so E2E test fails fast instead of hanging
-	constexpr int PROGRESS_LOG_INTERVAL_SEC = 30;
+	constexpr int POLL_TIMEOUT_SEC = 15;  // 15s to allow full drain for Order 0 subscribe (10GB+)
+	constexpr int PROGRESS_LOG_INTERVAL_SEC = 5;  // Progress log interval during Poll
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(POLL_TIMEOUT_SEC);
 	auto last_progress_log = std::chrono::steady_clock::now();
 
@@ -612,13 +619,22 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 			           << current_count << " / " << total_data_size << " bytes (" << std::fixed << std::setprecision(1) << pct << "%)";
 			throw std::runtime_error("Subscriber poll timeout");
 		}
-		// Progress logging so we can see if data is flowing
+		// Progress logging during long Poll (e.g. large E2E test)
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_log).count() >= PROGRESS_LOG_INTERVAL_SEC) {
 			last_progress_log = now;
 			double pct = total_data_size > 0 ? (100.0 * static_cast<double>(current_count)) / static_cast<double>(total_data_size) : 0;
 			int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(deadline - now).count());
-			LOG(INFO) << "Subscriber::Poll progress: " << current_count << " / " << total_data_size << " bytes ("
-			          << std::fixed << std::setprecision(1) << pct << "%), " << elapsed << "s until timeout";
+			std::ostringstream broker_stats;
+			broker_stats << "Per-broker bytes: [";
+			for (size_t i = 0; i < per_broker_bytes_.size(); ++i) {
+				size_t b = per_broker_bytes_[i].load(std::memory_order_relaxed);
+				if (b > 0 || i < 4) {
+					broker_stats << "B" << i << "=" << b << " ";
+				}
+			}
+			broker_stats << "]";
+			VLOG(1) << "Subscriber::Poll progress: " << current_count << " / " << total_data_size << " bytes ("
+			        << std::fixed << std::setprecision(1) << pct << "%), " << elapsed << "s until timeout. " << broker_stats.str();
 		}
 
 		// Adaptive sleep based on progress
@@ -857,6 +873,9 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 			}
 
 			DEBUG_count_.fetch_add(bytes_received, std::memory_order_relaxed);
+			if (broker_id >= 0 && static_cast<size_t>(broker_id) < per_broker_bytes_.size()) {
+				per_broker_bytes_[broker_id].fetch_add(static_cast<size_t>(bytes_received), std::memory_order_relaxed);
+			}
 		} else if (bytes_received == 0) {
 			// Handle disconnect 
 			LOG(WARNING) << "ReceiveWorkerThread fd=" << conn_buffers->fd << " received 0 bytes (connection closed)";
@@ -1451,18 +1470,18 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
 
 // Return pointer to message header
 // Return in total_order
+// [[FIX: Multi-subscriber]] Uses per-instance state (next_expected_order_weak_, consume_acquired_*)
+// so multiple Subscriber instances or threads don't share one ordering state or buffer.
 void* Subscriber::Consume(int timeout_ms) {
-    static size_t next_expected_order = 0;
+    if (order_level_ >= 2) {
+        return ConsumeOrdered(timeout_ms);
+    }
 
-    // CRITICAL: Track currently acquired buffer to release on next call
-    static BufferState* currently_acquired_buffer = nullptr;
-    static std::shared_ptr<ConnectionBuffers> current_connection = nullptr;
-    
-    // Release previously acquired buffer if any
-    if (currently_acquired_buffer && current_connection) {
-        current_connection->release_read_buffer(currently_acquired_buffer);
-        currently_acquired_buffer = nullptr;
-        current_connection = nullptr;
+    // Release previously acquired buffer if any (per-instance state)
+    if (consume_acquired_buffer_ && consume_acquired_connection_) {
+        consume_acquired_connection_->release_read_buffer(consume_acquired_buffer_);
+        consume_acquired_buffer_ = nullptr;
+        consume_acquired_connection_.reset();
     }
     
     auto start_time = std::chrono::steady_clock::now();
@@ -1538,9 +1557,9 @@ void* Subscriber::Consume(int timeout_ms) {
                 
                 // All order levels (including 5) now enforce strict sequential ordering
                 // since receiver threads already assigned correct total_order values
-                should_consume = (header->total_order == next_expected_order);
+                should_consume = (header->total_order == next_expected_order_weak_);
                 if (should_consume) {
-                    next_expected_order++;
+                    next_expected_order_weak_++;
                 }
                 
                 if (should_consume && message_to_return == nullptr) {
@@ -1554,11 +1573,10 @@ void* Subscriber::Consume(int timeout_ms) {
                 current_pos += header->paddedSize;
             }
             
-            // If we found a message to return, keep the buffer acquired
+            // If we found a message to return, keep the buffer acquired (per-instance state)
             if (message_to_return != nullptr) {
-                // Store buffer reference for release on next call
-                currently_acquired_buffer = buffer;
-                current_connection = conn_ptr;
+                consume_acquired_buffer_ = buffer;
+                consume_acquired_connection_ = conn_ptr;
                 return message_to_return;
             }
             // No message found in this buffer, release it (single release only)
@@ -1571,4 +1589,165 @@ void* Subscriber::Consume(int timeout_ms) {
     
     VLOG(3) << "Consume: Timeout reached after " << timeout_ms << "ms";
     return nullptr;
+}
+
+void* Subscriber::ConsumeOrdered(int timeout_ms) {
+	auto start_time = std::chrono::steady_clock::now();
+	auto timeout = std::chrono::milliseconds(timeout_ms);
+
+	// Release previously returned owned message (valid until next Consume call)
+	last_returned_.reset();
+
+	auto parse_stream = [&](StreamParseState& state) {
+		constexpr size_t kMaxStreamBufferBytes = 64UL << 20; // 64 MB safety cap
+		if (state.buffer.size() > kMaxStreamBufferBytes) {
+			LOG(WARNING) << "ConsumeOrdered: stream buffer exceeded cap, dropping "
+			             << state.buffer.size() << " bytes";
+			state.buffer.clear();
+			state.has_pending_metadata = false;
+			state.current_batch_messages_processed = 0;
+			state.next_message_order_in_batch = 0;
+			return;
+		}
+
+		size_t pos = 0;
+		const size_t buf_size = state.buffer.size();
+		while (pos < buf_size) {
+			if (!state.has_pending_metadata) {
+				if (buf_size - pos < sizeof(Embarcadero::wire::BatchMetadata)) {
+					break;
+				}
+				const auto* meta = reinterpret_cast<const Embarcadero::wire::BatchMetadata*>(
+					state.buffer.data() + pos);
+				if (Embarcadero::wire::IsValidHeaderVersion(meta->header_version) &&
+				    meta->num_messages > 0 &&
+				    meta->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
+				    meta->batch_total_order < Embarcadero::wire::MAX_BATCH_TOTAL_ORDER) {
+					state.pending_metadata = *meta;
+					state.has_pending_metadata = true;
+					state.current_batch_messages_processed = 0;
+					state.next_message_order_in_batch = meta->batch_total_order;
+					pos += sizeof(Embarcadero::wire::BatchMetadata);
+					continue;
+				}
+				// Resync: advance by 8 bytes to find next metadata boundary
+				pos += 8;
+				continue;
+			}
+
+			const uint16_t header_version = state.pending_metadata.header_version;
+			if (header_version == Embarcadero::wire::HEADER_VERSION_V2) {
+				if (buf_size - pos < sizeof(Embarcadero::BlogMessageHeader)) {
+					break;
+				}
+				const auto* hdr = reinterpret_cast<const Embarcadero::BlogMessageHeader*>(
+					state.buffer.data() + pos);
+				const size_t payload_size = hdr->size;
+				if (!Embarcadero::wire::ValidateV2Payload(payload_size, buf_size - pos)) {
+					// Resync on invalid header
+					pos += 8;
+					continue;
+				}
+				const size_t stride = Embarcadero::wire::ComputeStrideV2(payload_size);
+				if (buf_size - pos < stride) {
+					break;
+				}
+
+				auto msg = std::make_unique<OwnedMessage>();
+				msg->header_version = header_version;
+				msg->data.assign(state.buffer.begin() + pos, state.buffer.begin() + pos + stride);
+				auto* msg_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg->data.data());
+				if (msg_hdr->total_order == 0) {
+					msg_hdr->total_order = state.next_message_order_in_batch;
+				}
+				size_t total_order = msg_hdr->total_order;
+				state.next_message_order_in_batch = total_order + 1;
+				state.current_batch_messages_processed++;
+				pending_messages_.try_emplace(total_order, std::move(msg));
+
+				if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
+					state.has_pending_metadata = false;
+				}
+				pos += stride;
+				continue;
+			}
+
+			// Header version v1 (MessageHeader)
+			if (buf_size - pos < sizeof(Embarcadero::MessageHeader)) {
+				break;
+			}
+			const auto* hdr = reinterpret_cast<const Embarcadero::MessageHeader*>(
+				state.buffer.data() + pos);
+			const size_t padded_size = hdr->paddedSize;
+			if (!Embarcadero::wire::ValidateV1PaddedSize(padded_size, buf_size - pos)) {
+				pos += 8;
+				continue;
+			}
+			if (buf_size - pos < padded_size) {
+				break;
+			}
+
+			auto msg = std::make_unique<OwnedMessage>();
+			msg->header_version = header_version;
+			msg->data.assign(state.buffer.begin() + pos, state.buffer.begin() + pos + padded_size);
+			auto* msg_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(msg->data.data());
+			if (msg_hdr->total_order == 0) {
+				msg_hdr->total_order = state.next_message_order_in_batch;
+			}
+			size_t total_order = msg_hdr->total_order;
+			state.next_message_order_in_batch = total_order + 1;
+			state.current_batch_messages_processed++;
+			pending_messages_.try_emplace(total_order, std::move(msg));
+
+			if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
+				state.has_pending_metadata = false;
+			}
+			pos += padded_size;
+		}
+
+		if (pos > 0) {
+			state.buffer.erase(state.buffer.begin(), state.buffer.begin() + pos);
+		}
+	};
+
+	while (std::chrono::steady_clock::now() - start_time < timeout) {
+		// Pull any available buffers into per-connection stream buffers
+		{
+			absl::ReaderMutexLock map_lock(&connection_map_mutex_);
+			for (auto const& [fd, conn_ptr] : connections_) {
+				if (!conn_ptr) continue;
+				BufferState* buffer = conn_ptr->acquire_read_buffer();
+				if (!buffer) continue;
+				size_t buffer_write_offset = buffer->write_offset.load(std::memory_order_acquire);
+				if (buffer_write_offset > 0) {
+					auto& state = parse_states_[fd];
+					uint8_t* data = static_cast<uint8_t*>(buffer->buffer);
+					state.buffer.insert(state.buffer.end(), data, data + buffer_write_offset);
+				}
+				conn_ptr->release_read_buffer(buffer);
+			}
+		}
+
+		// Parse available data
+		for (auto& kv : parse_states_) {
+			parse_stream(kv.second);
+		}
+
+		// Return next expected message if ready
+		auto it = pending_messages_.find(next_expected_order_);
+		if (it != pending_messages_.end()) {
+			last_returned_ = std::move(it->second);
+			pending_messages_.erase(it);
+			void* ret = last_returned_ ? static_cast<void*>(last_returned_->data.data()) : nullptr;
+			if (ret) {
+				next_expected_order_++;
+				return ret;
+			}
+		}
+
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+
+	VLOG(3) << "ConsumeOrdered: Timeout reached after " << timeout_ms << "ms";
+	return nullptr;
 }

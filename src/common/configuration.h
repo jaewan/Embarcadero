@@ -71,7 +71,8 @@ struct EmbarcaderoConfig {
     // Storage configuration
     struct Storage {
         ConfigValue<size_t> segment_size{1UL << 34, "EMBARCADERO_SEGMENT_SIZE"};
-        ConfigValue<size_t> batch_headers_size{1UL << 16, "EMBARCADERO_BATCH_HEADERS_SIZE"};
+        // 10MB = 81,920 slots (128B each); holds 10GB/4 brokers (~2.5GB each) at ~2MB batch size. 64KB was too small → PBR full → ACK timeout.
+        ConfigValue<size_t> batch_headers_size{10UL * 1024 * 1024, "EMBARCADERO_BATCH_HEADERS_SIZE"};
         ConfigValue<size_t> batch_size{1UL << 19, "EMBARCADERO_BATCH_SIZE"};
         ConfigValue<int> num_disks{2, "EMBARCADERO_NUM_DISKS"};
         ConfigValue<int> max_topics{32, "EMBARCADERO_MAX_TOPICS"};
@@ -85,23 +86,6 @@ struct EmbarcaderoConfig {
         ConfigValue<int> sub_connections{3, "EMBARCADERO_SUB_CONNECTIONS"};
         ConfigValue<size_t> zero_copy_send_limit{1UL << 23, "EMBARCADERO_ZERO_COPY_LIMIT"};
 
-        // Non-blocking I/O configuration
-        // ENABLED BY DEFAULT for high throughput (10GB/s target)
-        // Non-blocking mode uses epoll + staging pool to decouple socket draining from CXL allocation
-        // This prevents mutex contention and TCP timeouts that occur in blocking mode
-        ConfigValue<bool> use_nonblocking{true, "EMBARCADERO_USE_NONBLOCKING"};
-        // 4MB so batches up to ~2.1MB (1928 msgs × 1KB + header) fit; 2MB was too small (Invalid batch total_size)
-        ConfigValue<int> staging_pool_buffer_size_mb{4, "EMBARCADERO_STAGING_POOL_BUFFER_SIZE_MB"};
-        // 128 buffers × 4MB = 512MB total for 10GB workload
-        ConfigValue<int> staging_pool_num_buffers{128, "EMBARCADERO_STAGING_POOL_NUM_BUFFERS"};
-        // Increased from 4 to 8 threads (1 thread per 2 publishers)
-        ConfigValue<int> num_publish_receive_threads{8, "EMBARCADERO_NUM_PUBLISH_RECEIVE_THREADS"};
-        // Increased from 2 to 4 workers to match receive threads
-        ConfigValue<int> num_cxl_allocation_workers{4, "EMBARCADERO_NUM_CXL_ALLOCATION_WORKERS"};
-
-        // Zero-copy receive path: recv() directly into CXL (no staging copy). Default false until migration validated.
-        // When true with use_nonblocking: PublishReceiveThread reserves CXL, recvs payload into CXL, marks complete in same thread.
-        ConfigValue<bool> recv_direct_to_cxl{false, "EMBARCADERO_RECV_DIRECT_TO_CXL"};
         // PBR (batch header ring) backpressure: stop reading from TCP when utilization above high, resume when below low.
         ConfigValue<int> pbr_high_watermark_pct{80, "EMBARCADERO_PBR_HIGH_WATERMARK_PCT"};
         ConfigValue<int> pbr_low_watermark_pct{50, "EMBARCADERO_PBR_LOW_WATERMARK_PCT"};

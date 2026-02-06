@@ -180,42 +180,59 @@ static_assert(alignof(ControlBlock) == 128, "ControlBlock must be 128-byte align
  *
  * At CXL offset 0x1000 (4 KB array: 32 brokers × 128 bytes).
  * Each broker has ONE 128-byte slot (avoids false sharing with 128B prefetching).
- * Tail replica updates completed_pbr_head; broker polls ONLY its own slot.
+ * Broker polls ONLY its own slot for export/ACK.
+ *
+ * WRITERS (max semantics — design §3.4):
+ * - ack_level=1: Sequencer advances completed_pbr_head after assigning order (batch visible for export).
+ * - ack_level=2: Tail replica advances the SAME slot after replicating the batch to disk.
+ * Both use atomic max (CAS: only advance when new value > cur). No regression; safe concurrent writes.
  *
  * Performance: 8-byte read (vs 256-byte replication_done array) → 32× bandwidth reduction.
  *
- * @threading completed_pbr_head: tail replica writes (monotonic); broker reads
- * @ownership CXL shared; tail replica owns writes per broker
+ * @threading completed_pbr_head: sequencer and/or tail replica write (monotonic); broker reads
+ * @ownership CXL shared; sequencer (ack_level=1) and tail replica (ack_level=2) may both write
  * @paper_ref Design §3.4 Completion Vector, Gap Analysis §3.4 ACK Path Efficiency
  *
  * Sentinel: Head initializes completed_pbr_head to (uint64_t)-1; 0 = first batch completed.
  */
 struct alignas(128) CompletionVectorEntry {
-	// Highest contiguous PBR index for this broker that is sequenced AND replicated
-	// Head initializes to (uint64_t)-1 (no progress); tail writes 0, 1, 2, ...
-	std::atomic<uint64_t> completed_pbr_head{0};  // [[writer: tail replica]]
+	// Highest contiguous PBR index for this broker (sequenced; for ack_level=2 also replicated)
+	// [[writer: sequencer for ack_level=1; tail replica for ack_level=2 — max semantics]]
+	std::atomic<uint64_t> completed_pbr_head{0};
 
-	uint8_t _pad[120];  // Pad to 128 bytes (prefetcher safety: avoid false sharing)
+	// [[ACK_OPTIMIZATION]] Cumulative message count (ACK offset) corresponding to completed_pbr_head.
+	// Updated atomically with (or strictly after) completed_pbr_head.
+	// Readers can read this directly to get ACK count without dereferencing the PBR ring.
+	std::atomic<uint64_t> completed_logical_offset{0};
+
+	uint8_t _pad[112];  // Pad to 128 bytes (128 - 8 - 8 = 112)
 };
 static_assert(sizeof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be exactly 128 bytes");
 static_assert(alignof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be 128-byte aligned");
 
 /**
- * GOIEntry (64 bytes) — Phase 2: Global Order Index
+ * GOIEntry (128 bytes) — Phase 2: Global Order Index
  *
- * At CXL offset 0x2000 (16 GB array: 256M entries × 64 bytes).
- * Sequencer writes GOI[global_seq]; replicas read GOI, copy data, increment num_replicated.
+ * At CXL offset 0x2000 (32 GB array: 256M entries × 128 bytes).
+ * Sequencer writes GOI[goi_index]; replicas read GOI by goi_index, copy data, increment num_replicated.
  * Chain replication: replica R_i waits for num_replicated==i, increments to i+1 (token passing).
+ *
+ * NAMING (design §2.4):
+ * - GOI index = position in GOI array (0, 1, 2, ...). Stored in global_seq. Used by replicas to poll
+ *   next entry and by committed_seq to denote contiguous prefix written.
+ * - total_order = message-level sequence for subscribers (batch B has messages [total_order, total_order+num_msg)).
+ *   Subscriber consumes in total_order order; BatchMetadata.batch_total_order is this value.
  *
  * @threading Sequencer writes all fields except num_replicated; replicas increment num_replicated
  * @ownership Sequencer owns writes; replicas coordinate via num_replicated token
  * @paper_ref Design §2.4 GOI Entry, §3.4 Chain Replication, Gap Analysis §3.3
  */
-struct alignas(64) GOIEntry {
-	// The definitive ordering
-	uint64_t global_seq;                       // [[CRITICAL]] Sequential BATCH index (0, 1, 2, 3...) - used by replicas for polling
+struct alignas(128) GOIEntry {
+	// GOI index: position in GOI array (0, 1, 2, ...). Replicas poll GOI[goi_index]; committed_seq is max valid index.
+	uint64_t global_seq;                       // [[GOI_INDEX]] Same as array index for this entry
 	uint64_t batch_id;                         // Globally unique (broker_id | timestamp | counter)
-	uint64_t total_order;                      // Starting message sequence number (for message-level ordering)
+	// Message order: starting total_order for this batch; subscriber consumes in this order (design §2.3 Order 5).
+	uint64_t total_order;                      // [[MESSAGE_ORDER]] Starting message sequence (BatchMetadata.batch_total_order)
 
 	// Payload location
 	uint16_t broker_id;                        // Which broker's BLog [0-31]
@@ -233,9 +250,15 @@ struct alignas(64) GOIEntry {
 
 	// [[PHASE_2_FIX]] ACK path: Absolute PBR index for CV updater (CompletionVector[broker_id])
 	uint64_t pbr_index;                        // [[CRITICAL]] Absolute index (never wraps, monotonic) from BatchHeader.pbr_absolute_index
+
+	// [[ACK_OPTIMIZATION]] Cumulative message count for this broker (start_logical_offset + num_msg).
+	// Allows Tail Replica to update CV with message count without reading BatchHeader from ring.
+	uint64_t cumulative_message_count;
+	
+	uint8_t _pad[40];                          // Pad to 128 bytes (128 - 88 = 40)
 };
-static_assert(sizeof(GOIEntry) <= 128 && sizeof(GOIEntry) % 64 == 0, "GOIEntry must be cache-line multiple (64 or 128)");
-static_assert(alignof(GOIEntry) == 64, "GOIEntry must be 64-byte aligned");
+static_assert(sizeof(GOIEntry) == 128, "GOIEntry must be exactly 128 bytes");
+static_assert(alignof(GOIEntry) == 128, "GOIEntry must be 128-byte aligned");
 
 using heartbeat_system::SequencerType;
 using heartbeat_system::SequencerType::EMBARCADERO;
@@ -322,12 +345,12 @@ struct alignas(64) TInode{
  *   - Slot is zeroed on reserve to avoid stale reads (num_msg=0 until publish).
  *   - Writes full BatchHeader once after recv: batch_seq, client_id, num_msg, broker_id, total_size,
  *     start_logical_offset, log_idx, epoch_created, batch_id, pbr_absolute_index.
- *   - Readiness = num_msg>0 for blocking path (no batch_complete needed).
+ *   - Readiness = flags has VALID (num_msg>0 is still validated for sanity).
  *   - MUST flush: both cachelines of BatchHeader
  *   - MUST fence: CXL::store_fence() after flush
  * 
  * Stage 3 (Sequencer):
- *   - Reads: num_msg>0 as readiness (blocking path); batch_complete still used by async paths.
+ *   - Reads: flags VALID as readiness (blocking path); batch_complete still used by async paths.
  *   - Writes: total_order, ordered=1, batch_off_to_export
  *   - Clears: batch_complete=0, num_msg=0 (prevents duplicate processing / ABA reuse)
  *   - MUST flush: cacheline containing ordered/batch_off_to_export (Stage-4 polls this)
@@ -346,6 +369,9 @@ struct alignas(64) TInode{
  *   - batch_off_to_export==0: This slot IS the export record (simplified ORDER=5 design)
  *   - batch_off_to_export!=0: Points to actual batch header (legacy export chain)
  */
+constexpr uint32_t kBatchHeaderFlagClaimed = 1u << 0;
+constexpr uint32_t kBatchHeaderFlagValid = 1u << 1;
+
 struct alignas(64) BatchHeader{
 	// [[LIFECYCLE]]
 	// 1) NetworkManager reserves PBR after recv, zeroes slot, writes full header, flush+fence.
@@ -358,6 +384,7 @@ struct alignas(64) BatchHeader{
 	volatile uint32_t batch_complete;  // [[WRITER: NetworkManager (set=1), Sequencer (clear=0)]] Batch-level completion flag for Sequencer 5
 	uint32_t broker_id; // [[WRITER: NetworkManager]]
 	uint32_t ordered; // [[WRITER: Sequencer]] Set to 1 when batch is globally ordered (Stage-4 polls this)
+	uint32_t flags; // [[WRITER: NetworkManager]] CLAIMED/VALID flags for scanner readiness
 	uint16_t epoch_created; // [[WRITER: NetworkManager]] Epoch when batch was accepted (Phase 1a zombie fencing; sequencer can reject if stale)
 	uint16_t _pad0;
 
@@ -384,6 +411,7 @@ static_assert(sizeof(BatchHeader) == 128, "BatchHeader must be exactly 128 bytes
 static_assert(offsetof(BatchHeader, client_id) < 64, "client_id must be in first cache line");
 static_assert(offsetof(BatchHeader, num_msg) < 64, "num_msg must be in first cache line");
 static_assert(offsetof(BatchHeader, batch_complete) < 64, "batch_complete must be in first cache line");
+static_assert(offsetof(BatchHeader, flags) < 64, "flags must be in first cache line");
 // Note: BATCHHEADERS_SIZE is runtime config, alignment verified at runtime in BrokerScannerWorker5
 
 
@@ -645,8 +673,8 @@ constexpr size_t kGOIOffset = 0x2000;               // GOI at 8 KB from CXL base
 /**
  * [[PHASE_2_ACK_HELPER]] Get replicated last offset from CompletionVector
  *
- * Reads CV for the given broker, translates PBR index → ring position → BatchHeader,
- * and returns the last logical offset that has been fully replicated.
+ * Reads CV for the given broker (for ack_level=2 the tail replica advances CV after replication;
+ * see docs/COMPLETION_VECTOR_ACK_LEVELS.md). Translates PBR index → ring position → BatchHeader.
  *
  * @param cxl_addr Base CXL address
  * @param tinode TInode for this topic
