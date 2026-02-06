@@ -172,10 +172,26 @@ Topic::Topic(
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		
 	// Start delegation thread if needed (Stage 2: Local Ordering)
-	// Delegation Thread assigns local per-broker sequence numbers
-	// [[REVERT]] DelegationThread now runs for ORDER=0 (restored to 981dd61 behavior)
-	bool skip_delegation_for_order0 = false;  // Use DelegationThread for all orders
-	if (seq_type == CORFU || (seq_type != KAFKA && order_ != 4 && !skip_delegation_for_order0)) {
+	// [PHASE-1] Skip DelegationThread for Order 5 and Order 2 with EMBARCADERO sequencer.
+	// Reason 1: Order 5/2 subscribers use GetBatchToExportWithMetadata (GOI/CV-based),
+	//           not GetMessageAddr (which needs DelegationThread's written/written_addr).
+	// Reason 2: DelegationThread and BrokerScannerWorker5 both read the same PBR ring,
+	//           causing CXL cache line invalidation ping-pong (~30% scanner latency hit).
+	// Reason 3: DelegationThread has a ring-wrap bug (Phase 9) that doesn't affect Order 5/2
+	//           if DelegationThread is disabled.
+	bool skip_delegation = false;
+	if (order_ == 5 && seq_type == EMBARCADERO) {
+		skip_delegation = true;
+		LOG(INFO) << "Topic " << topic_name_ << ": DelegationThread disabled for Order 5 "
+		          << "(subscribers use GetBatchToExportWithMetadata; eliminates scanner contention)";
+	}
+	if (order_ == 2 && seq_type == EMBARCADERO) {
+		skip_delegation = true;
+		LOG(INFO) << "Topic " << topic_name_ << ": DelegationThread disabled for Order 2 "
+		          << "(subscribers use GetBatchToExportWithMetadata)";
+	}
+	if (!skip_delegation &&
+	    (seq_type == CORFU || (seq_type != KAFKA && order_ != 4))) {
 		delegationThreads_.emplace_back(&Topic::DelegationThread, this);
 	}
 
@@ -305,6 +321,12 @@ void Topic::DelegationThread() {
 	// Initialize batch header pointer to match EmbarcaderoGetCXLBuffer allocation
 	BatchHeader* current_batch = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+
+	// [PHASE-9] Ring boundaries for wrap check (prevents OOB read after ring wrap)
+	BatchHeader* delegation_ring_start = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	BatchHeader* delegation_ring_end = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(delegation_ring_start) + BATCHHEADERS_SIZE);
 	
 	// [[CRITICAL FIX: Removed Dead Code]] - first_batch variable was unused
 	size_t processed_batches = 0;
@@ -460,17 +482,13 @@ void Topic::DelegationThread() {
 			// Prefetching remote-writer data can cause stale cache reads in non-coherent CXL
 			// See docs/INVESTIGATION_2026_01_26_CRITICAL_ISSUES.md Issue #1
 
-			// [[PERF_FIX: Ring wrap-around]] Move to next batch with proper ring wrap
-			BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
-				reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
-			size_t current_offset = reinterpret_cast<uint8_t*>(current_batch) - reinterpret_cast<uint8_t*>(ring_start);
-			size_t next_offset = current_offset + sizeof(BatchHeader);
-			// Wrap to beginning if we've reached the end of the ring
-			if (next_offset >= BATCHHEADERS_SIZE) {
-				next_offset = 0;
+			// [PHASE-9] Ring wrap: advance to next slot, wrap to start if past end
+			BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+			if (next_batch >= delegation_ring_end) {
+				next_batch = delegation_ring_start;
 			}
-			current_batch = reinterpret_cast<BatchHeader*>(
-				reinterpret_cast<uint8_t*>(ring_start) + next_offset);
+			current_batch = next_batch;
 			continue; // Skip the old message-by-message processing
 		}
 		} else if (current_batch && current_batch->num_msg > 0) {
@@ -1498,7 +1516,7 @@ void Topic::UpdateWrittenToLastComplete() {
 	size_t current_written = tinode->offsets[broker_id_].written;
 	if (target > current_written) {
 		tinode->offsets[broker_id_].written = target;
-		CXL::flush_cacheline(&tinode->offsets[broker_id_].written);
+		CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(&tinode->offsets[broker_id_].written)));
 		CXL::store_fence();
 		LOG(INFO) << "UpdateWrittenToLastComplete topic=" << topic_name_ << " broker=" << broker_id_
 		          << " advanced written from " << current_written << " to " << target
@@ -1815,7 +1833,8 @@ bool Topic::GetBatchToExport(
 	BatchHeader* header = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * slot_index);
 	// [[CXL_NON_COHERENT]] Invalidate before reading ordered so export sees sequencer writes
 	CXL::flush_cacheline(header);
-	CXL::load_fence();
+	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(header) + 64);
+	CXL::full_fence();  // MFENCE required: CLFLUSHOPT only ordered by MFENCE (Intel SDM §8.2.5)
 	if (header->ordered == 0) {
 		return false;
 	}
@@ -1835,7 +1854,7 @@ bool Topic::GetBatchToExport(
 	// [[CXL_NON_COHERENT]] Invalidate actual batch so we see sequencer-written total_size/log_idx
 	CXL::flush_cacheline(actual);
 	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(actual) + 64);
-	CXL::load_fence();
+	CXL::full_fence();  // MFENCE required for CLFLUSHOPT ordering
 	header = actual;
 	batch_size = header->total_size;
 	batch_addr = header->log_idx + reinterpret_cast<uint8_t*>(cxl_addr_);
@@ -1850,15 +1869,14 @@ bool Topic::GetBatchToExportWithMetadata(
 		size_t &batch_size,
 		size_t &batch_total_order,
 		uint32_t &num_messages) {
-	// [[EXPORT_BY_TOTAL_ORDER]] Peek hold queue (merge by total_order so export order is globally correct)
+	// [[EXPORT_BY_TOTAL_ORDER]] [PHASE-8] Unbounded queue peek (mutex protected)
 	bool have_hold = false;
 	size_t hold_total_order = 0;
 	OrderedHoldExportEntry hold_front;
 	{
-		absl::MutexLock lock(&ordered_from_hold_mu_);
-		auto it = ordered_from_hold_.find(broker_id_);
-		if (it != ordered_from_hold_.end() && !it->second.empty()) {
-			hold_front = it->second.front();
+		absl::MutexLock lock(&hold_export_queues_[broker_id_].mu);
+		if (!hold_export_queues_[broker_id_].q.empty()) {
+			hold_front = hold_export_queues_[broker_id_].q.front();
 			have_hold = true;
 			hold_total_order = hold_front.total_order;
 		}
@@ -1907,7 +1925,7 @@ bool Topic::GetBatchToExportWithMetadata(
 				reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * slot);
 			CXL::flush_cacheline(header);
 			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(header) + 64);
-			CXL::load_fence();
+			CXL::full_fence();  // MFENCE required: CLFLUSHOPT only ordered by MFENCE (Intel SDM §8.2.5)
 			if (header->ordered == 1 && header->pbr_absolute_index == next_pbr) {
 				// Resolve export chain (batch_off_to_export 0 = in-place)
 				BatchHeader* actual = header;
@@ -1922,7 +1940,7 @@ bool Topic::GetBatchToExportWithMetadata(
 						if (actual >= start_batch_header && actual < ring_end) {
 							CXL::flush_cacheline(actual);
 							CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(actual) + 64);
-							CXL::load_fence();
+							CXL::full_fence();  // MFENCE required for CLFLUSHOPT ordering
 						} else {
 							actual = header;
 						}
@@ -1940,11 +1958,11 @@ bool Topic::GetBatchToExportWithMetadata(
 	// Return batch with smaller total_order (or only available source)
 	if (have_hold && have_ring) {
 		if (hold_total_order <= ring_total_order) {
-			absl::MutexLock lock(&ordered_from_hold_mu_);
-			auto it = ordered_from_hold_.find(broker_id_);
-			if (it != ordered_from_hold_.end() && !it->second.empty()) {
-				it->second.pop_front();
-				if (it->second.empty()) ordered_from_hold_.erase(it);
+			{
+				absl::MutexLock lock(&hold_export_queues_[broker_id_].mu);
+				if (!hold_export_queues_[broker_id_].q.empty()) {
+					hold_export_queues_[broker_id_].q.pop_front();
+				}
 			}
 			batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + hold_front.log_idx;
 			batch_size = hold_front.batch_size;
@@ -1960,11 +1978,11 @@ bool Topic::GetBatchToExportWithMetadata(
 		return true;
 	}
 	if (have_hold) {
-		absl::MutexLock lock(&ordered_from_hold_mu_);
-		auto it = ordered_from_hold_.find(broker_id_);
-		if (it != ordered_from_hold_.end() && !it->second.empty()) {
-			it->second.pop_front();
-			if (it->second.empty()) ordered_from_hold_.erase(it);
+		{
+			absl::MutexLock lock(&hold_export_queues_[broker_id_].mu);
+			if (!hold_export_queues_[broker_id_].q.empty()) {
+				hold_export_queues_[broker_id_].q.pop_front();
+			}
 		}
 		batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + hold_front.log_idx;
 		batch_size = hold_front.batch_size;
@@ -2082,6 +2100,68 @@ void Topic::AdvanceCVForSequencer(uint16_t broker_id, uint64_t pbr_index, uint64
 			break;
 		}
 	}
+}
+
+void Topic::AccumulateCVUpdate(
+		uint16_t broker_id,
+		uint64_t pbr_index,
+		uint64_t cumulative_msg_count,
+		absl::flat_hash_map<int, uint64_t>& max_cumulative,
+		absl::flat_hash_map<int, uint64_t>& max_pbr_index) {
+	// [PHASE-3] Local accumulation: no CXL access, no fence
+	auto [it_cum, _1] = max_cumulative.try_emplace(static_cast<int>(broker_id), 0);
+	if (cumulative_msg_count > it_cum->second) {
+		it_cum->second = cumulative_msg_count;
+	}
+	auto [it_pbr, _2] = max_pbr_index.try_emplace(static_cast<int>(broker_id), 0);
+	if (pbr_index > it_pbr->second) {
+		it_pbr->second = pbr_index;
+	}
+}
+
+void Topic::FlushAccumulatedCV(
+		const absl::flat_hash_map<int, uint64_t>& max_cumulative,
+		const absl::flat_hash_map<int, uint64_t>& max_pbr_index) {
+	// [PHASE-3] O(brokers) CXL writes + 1 fence (was O(batches) fences)
+	CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
+	constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
+
+	for (const auto& [broker_id, cumulative] : max_cumulative) {
+		CompletionVectorEntry* entry = &cv[broker_id];
+
+		// [PANEL C3/R3] On non-coherent CXL, relaxed load can read from local cache (stale).
+		// Invalidate + load_fence before reading so we see the last flushed value (our own or tail's).
+		CXL::flush_cacheline(entry);
+		CXL::load_fence();
+
+		if (ack_level_ <= 1) {
+			// Sequencer is the ONLY CV writer for ack_level <= 1. Store if we advance.
+			uint64_t cur = entry->completed_logical_offset.load(std::memory_order_acquire);
+			if (cumulative > cur) {
+				entry->completed_logical_offset.store(cumulative, std::memory_order_release);
+			}
+		} else {
+			// ack_level == 2: tail replica also writes CV. Use CAS.
+			for (;;) {
+				uint64_t cur = entry->completed_logical_offset.load(std::memory_order_acquire);
+				if (cumulative <= cur) break;
+				if (entry->completed_logical_offset.compare_exchange_strong(
+						cur, cumulative, std::memory_order_release)) break;
+			}
+		}
+
+		auto pbr_it = max_pbr_index.find(broker_id);
+		if (pbr_it != max_pbr_index.end()) {
+			uint64_t cur_pbr = entry->completed_pbr_head.load(std::memory_order_acquire);
+			if (cur_pbr == kNoProgress || pbr_it->second > cur_pbr) {
+				entry->completed_pbr_head.store(pbr_it->second, std::memory_order_release);
+			}
+		}
+
+		CXL::flush_cacheline(entry);
+	}
+	CXL::store_fence();
 }
 
 void Topic::UpdateCommittedSeq(uint64_t last_goi_index) {
@@ -2569,6 +2649,12 @@ void Topic::EpochSequencerThread2() {
 			std::this_thread::sleep_for(std::chrono::microseconds(10));
 			continue;
 		}
+		// [PHASE-10a] Pre-allocate batch_list to avoid realloc during insert
+		{
+			size_t total = 0;
+			for (const auto& v : buf.per_broker) total += v.size();
+			batch_list.reserve(total);
+		}
 		for (auto& v : buf.per_broker) {
 			batch_list.insert(batch_list.end(),
 				std::make_move_iterator(v.begin()),
@@ -2635,8 +2721,26 @@ void Topic::EpochSequencerThread2() {
 		}
 		absl::MutexLock header_lock(&phase1b_header_for_sub_mu_);
 
+		// [PHASE-3] Accumulate CV updates locally; flush once after loop
+		absl::flat_hash_map<int, uint64_t> cv_max_cumulative;
+		absl::flat_hash_map<int, uint64_t> cv_max_pbr_index;
+		// [PHASE-4] Accumulate per-broker tinode updates
+		absl::flat_hash_map<int, size_t> ordered_increment;
+		absl::flat_hash_map<int, size_t> last_ordered_offset;
+		uint64_t epoch_timestamp_ns = 0;
+		if (replication_factor_ > 0) {
+			epoch_timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+		}
+
 		GOIEntry* goi = reinterpret_cast<GOIEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kGOIOffset);
+
+		// [PANEL C2/P1] O(1) atomics per epoch: reserve GOI indices once (§3.2)
+		size_t num_goi_order2 = 0;
+		for (const PendingBatch5& p : ready) if (!p.skipped) num_goi_order2++;
+		uint64_t base_batch_index_order2 = global_batch_seq_.fetch_add(num_goi_order2, std::memory_order_relaxed);
+		size_t goi_idx_order2 = 0;
 
 		for (PendingBatch5& p : ready) {
 			if (p.skipped) {
@@ -2653,41 +2757,41 @@ void Topic::EpochSequencerThread2() {
 
 			p.hdr->total_order = next_order;
 
-			uint64_t batch_index = global_batch_seq_.fetch_add(1, std::memory_order_relaxed);
+			uint64_t batch_index = base_batch_index_order2 + goi_idx_order2++;
 
 			GOIEntry* entry = &goi[batch_index];
 			entry->global_seq = batch_index;
 			entry->total_order = next_order;
-			entry->batch_id = p.hdr->batch_id;
+			entry->batch_id = p.cached_batch_id;
 			entry->broker_id = static_cast<uint16_t>(p.broker_id);
 			entry->epoch_sequenced = p.epoch_created;
-			entry->blog_offset = p.hdr->log_idx;
-			entry->payload_size = static_cast<uint32_t>(p.hdr->total_size);
+			entry->blog_offset = p.cached_log_idx;
+			entry->payload_size = static_cast<uint32_t>(p.cached_total_size);
 			entry->message_count = static_cast<uint32_t>(p.num_msg);
 			entry->num_replicated.store(0, std::memory_order_release);
 			entry->client_id = p.client_id;
 			entry->client_seq = p.hdr->batch_seq;
-			entry->pbr_index = p.hdr->pbr_absolute_index;
-			entry->cumulative_message_count = p.hdr->start_logical_offset + p.num_msg;
+			entry->pbr_index = p.cached_pbr_absolute_index;
+			entry->cumulative_message_count = p.cached_start_logical_offset + p.num_msg;
 
 			// Flush GOI entry so replicas/recovery see it on non-coherent CXL
 			CXL::flush_cacheline(entry);
-			AdvanceCVForSequencer(static_cast<uint16_t>(p.broker_id), p.hdr->pbr_absolute_index,
-				p.hdr->start_logical_offset + p.num_msg);
+			AccumulateCVUpdate(static_cast<uint16_t>(p.broker_id), p.cached_pbr_absolute_index,
+				p.cached_start_logical_offset + p.num_msg,
+				cv_max_cumulative, cv_max_pbr_index);
 
 			if (replication_factor_ > 0) {
-				uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-					std::chrono::steady_clock::now().time_since_epoch()).count();
 				size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
 				goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
-				goi_timestamps_[ring_pos].timestamp_ns.store(now_ns, std::memory_order_release);
+				goi_timestamps_[ring_pos].timestamp_ns.store(epoch_timestamp_ns, std::memory_order_release);
 			}
 
 		next_order += p.num_msg;
 
 		int b = p.broker_id;
-		tinode_->offsets[b].ordered += p.num_msg;
-		tinode_->offsets[b].ordered_offset = static_cast<size_t>(
+		// [PHASE-4] Accumulate locally (no CXL write per batch)
+		ordered_increment[b] += p.num_msg;
+		last_ordered_offset[b] = static_cast<size_t>(
 			reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
 
 		auto it = phase1b_header_for_sub_.find(b);
@@ -2718,22 +2822,32 @@ void Topic::EpochSequencerThread2() {
 				if (next_expected >= BATCHHEADERS_SIZE) next_expected = BATCHHEADERS_SIZE;
 			}
 		}
-		CXL::store_fence();
+		// [PHASE-4] Write accumulated tinode updates: O(brokers) CXL writes
+		for (const auto& [b, inc] : ordered_increment) {
+			tinode_->offsets[b].ordered += inc;
+			tinode_->offsets[b].ordered_offset = last_ordered_offset[b];
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(&tinode_->offsets[b].ordered)));
+			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].ordered_offset));
+		}
+		// [PHASE-3] Single fence for all CV updates
+		FlushAccumulatedCV(cv_max_cumulative, cv_max_pbr_index);
+		CXL::full_fence();  // MFENCE ensures CLFLUSHOPT data globally visible (Intel SDM §8.2.5)
 
 		for (const auto& kv : contiguous_consumed_per_broker) {
 			int b = kv.first;
 			tinode_->offsets[b].batch_headers_consumed_through = kv.second;
 			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].batch_headers_consumed_through));
 		}
-		CXL::store_fence();
+		CXL::full_fence();  // MFENCE for CXL global visibility
 	}
 
 	// [[TAIL_STALL_FIX]] Drain remaining sealed epochs before exit.
 	// EpochDriverThread seals the final epoch after exiting its main loop; we must process it
 	// so last_sequenced_epoch_ catches up and tinode->offsets[b].ordered is updated → ACKs sent.
-	// Deadline: 3 seconds (accounts for EpochDriverThread sealing delays + processing time).
+	// Deadline: 5 seconds (accounts for EpochDriverThread sealing delays + processing time).
 	LOG(INFO) << "EpochSequencerThread2: Draining remaining sealed epochs before exit";
-	auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+	auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 	while (std::chrono::steady_clock::now() < drain_deadline) {
 		uint64_t last = last_sequenced_epoch_.load(std::memory_order_acquire);
 		uint64_t current = epoch_index_.load(std::memory_order_acquire);
@@ -2754,6 +2868,12 @@ void Topic::EpochSequencerThread2() {
 		if (buf.state.load(std::memory_order_acquire) != EpochBuffer5::State::SEALED) {
 			std::this_thread::sleep_for(std::chrono::microseconds(100));
 			continue;
+		}
+		// [PHASE-10a] Pre-allocate batch_list
+		{
+			size_t total = 0;
+			for (const auto& v : buf.per_broker) total += v.size();
+			batch_list.reserve(total);
 		}
 		LOG(INFO) << "EpochSequencerThread2 Drain: Processing epoch " << last << " (buffer " << buffer_idx << ")";
 		for (auto& v : buf.per_broker) {
@@ -2818,8 +2938,20 @@ void Topic::EpochSequencerThread2() {
 		}
 		absl::MutexLock header_lock(&phase1b_header_for_sub_mu_);
 
+		// [PHASE-3/4] Drain loop: same accumulation pattern as main loop
+		absl::flat_hash_map<int, uint64_t> drain_cv_max_cumulative;
+		absl::flat_hash_map<int, uint64_t> drain_cv_max_pbr_index;
+		absl::flat_hash_map<int, size_t> drain_ordered_increment;
+		absl::flat_hash_map<int, size_t> drain_last_ordered_offset;
+
 		GOIEntry* goi = reinterpret_cast<GOIEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kGOIOffset);
+
+		// [PANEL C2/P1] O(1) atomics per epoch (drain loop)
+		size_t drain_num_goi = 0;
+		for (const PendingBatch5& p : ready) if (!p.skipped) drain_num_goi++;
+		uint64_t drain_base_batch_index = global_batch_seq_.fetch_add(drain_num_goi, std::memory_order_relaxed);
+		size_t drain_goi_idx = 0;
 
 		for (PendingBatch5& p : ready) {
 			if (p.skipped) {
@@ -2835,26 +2967,27 @@ void Topic::EpochSequencerThread2() {
 
 			p.hdr->total_order = next_order;
 
-			uint64_t batch_index = global_batch_seq_.fetch_add(1, std::memory_order_relaxed);
+			uint64_t batch_index = drain_base_batch_index + drain_goi_idx++;
 
 			GOIEntry* entry = &goi[batch_index];
 			entry->global_seq = batch_index;
 			entry->total_order = next_order;
-			entry->batch_id = p.hdr->batch_id;
+			entry->batch_id = p.cached_batch_id;
 			entry->broker_id = static_cast<uint16_t>(p.broker_id);
 			entry->epoch_sequenced = p.epoch_created;
-			entry->blog_offset = p.hdr->log_idx;
-			entry->payload_size = static_cast<uint32_t>(p.hdr->total_size);
+			entry->blog_offset = p.cached_log_idx;
+			entry->payload_size = static_cast<uint32_t>(p.cached_total_size);
 			entry->message_count = static_cast<uint32_t>(p.num_msg);
 			entry->num_replicated.store(0, std::memory_order_release);
 			entry->client_id = p.client_id;
 			entry->client_seq = p.hdr->batch_seq;
-			entry->pbr_index = p.hdr->pbr_absolute_index;
-			entry->cumulative_message_count = p.hdr->start_logical_offset + p.num_msg;
+			entry->pbr_index = p.cached_pbr_absolute_index;
+			entry->cumulative_message_count = p.cached_start_logical_offset + p.num_msg;
 
 			CXL::flush_cacheline(entry);
-			AdvanceCVForSequencer(static_cast<uint16_t>(p.broker_id), p.hdr->pbr_absolute_index,
-				p.hdr->start_logical_offset + p.num_msg);
+			AccumulateCVUpdate(static_cast<uint16_t>(p.broker_id), p.cached_pbr_absolute_index,
+				p.cached_start_logical_offset + p.num_msg,
+				drain_cv_max_cumulative, drain_cv_max_pbr_index);
 
 			if (replication_factor_ > 0) {
 				uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2867,8 +3000,8 @@ void Topic::EpochSequencerThread2() {
 		next_order += p.num_msg;
 
 		int b = p.broker_id;
-		tinode_->offsets[b].ordered += p.num_msg;
-		tinode_->offsets[b].ordered_offset = static_cast<size_t>(
+		drain_ordered_increment[b] += p.num_msg;
+		drain_last_ordered_offset[b] = static_cast<size_t>(
 			reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
 
 		auto it = phase1b_header_for_sub_.find(b);
@@ -2889,7 +3022,6 @@ void Topic::EpochSequencerThread2() {
 			}
 
 			p.hdr->batch_complete = 0;
-			CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(&tinode_->offsets[b].ordered)));
 			CXL::flush_cacheline(p.hdr);
 			size_t& next_expected = contiguous_consumed_per_broker[b];
 			if (p.slot_offset == next_expected ||
@@ -2898,14 +3030,22 @@ void Topic::EpochSequencerThread2() {
 				if (next_expected >= BATCHHEADERS_SIZE) next_expected = BATCHHEADERS_SIZE;
 			}
 		}
-		CXL::store_fence();
+		for (const auto& [b, inc] : drain_ordered_increment) {
+			tinode_->offsets[b].ordered += inc;
+			tinode_->offsets[b].ordered_offset = drain_last_ordered_offset[b];
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(&tinode_->offsets[b].ordered)));
+			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].ordered_offset));
+		}
+		FlushAccumulatedCV(drain_cv_max_cumulative, drain_cv_max_pbr_index);
+		CXL::full_fence();  // MFENCE ensures CLFLUSHOPT data globally visible (Intel SDM §8.2.5)
 
 		for (const auto& kv : contiguous_consumed_per_broker) {
 			int b = kv.first;
 			tinode_->offsets[b].batch_headers_consumed_through = kv.second;
 			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].batch_headers_consumed_through));
 		}
-		CXL::store_fence();
+		CXL::full_fence();  // MFENCE for CXL global visibility
 	}
 	LOG(INFO) << "EpochSequencerThread2: Drain complete, last_sequenced="
 	          << last_sequenced_epoch_.load(std::memory_order_acquire);
@@ -2967,17 +3107,21 @@ void Topic::EpochDriverThread() {
 			
 			// Give scanners a LONGER window to push all late-arriving batches
 			// The 1,927 message shortfall indicates some ready batches haven't been pushed yet
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			// [PANEL FIX] Increase window from 100ms to 6000ms to allow full drain
+			// (BrokerScannerWorker5 drain deadline is 5s, so we must wait longer)
+			std::this_thread::sleep_for(std::chrono::milliseconds(6000));
 			
-			// [[DOUBLE_SEAL]] Seal the late-arriving epoch too
+			// [[DOUBLE_SEAL]] Seal the late-arriving epoch too.
+			// [PANEL C4] Do NOT advance epoch_index_ to next_epoch+1: that would direct scanners to
+			// buffer (next_epoch+1)%3 which was not reset, causing use-after-recycle. Sequencer
+			// still processes both final_epoch and next_epoch; we wait for last_sequenced >= final_epoch+2 below.
 			if (next_buf.seal()) {
-				epoch_index_.store(next_epoch + 1, std::memory_order_release);
 				LOG(INFO) << "EpochDriverThread: Sealed late-arriving epoch " << next_epoch;
 			}
 		}
 		
 		// Wait for sequencer to process both final and late-arriving epochs (extended deadline)
-		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(6000);
 		uint64_t target_seq = final_epoch + 2;  // Expect sequencer to process both epochs
 		while (last_sequenced_epoch_.load(std::memory_order_acquire) < target_seq &&
 		       std::chrono::steady_clock::now() < deadline) {
@@ -3058,6 +3202,12 @@ void Topic::EpochSequencerThread() {
 		if (buf.state.load(std::memory_order_acquire) != EpochBuffer5::State::SEALED) {
 			std::this_thread::sleep_for(std::chrono::microseconds(10));
 			continue;
+		}
+		// [PHASE-10a] Pre-allocate batch_list
+		{
+			size_t total = 0;
+			for (const auto& v : buf.per_broker) total += v.size();
+			batch_list.reserve(total);
 		}
 		for (auto& v : buf.per_broker) {
 			batch_list.insert(batch_list.end(),
@@ -3175,14 +3325,31 @@ void Topic::EpochSequencerThread() {
 			return a.scanner_seq < b.scanner_seq;
 		});
 
-		// [[PHASE1B_LOCK_REDUCTION]] Two-pass commit: GOI + CV outside lock; export chain + clear under lock.
-		struct ExportUpdate {
-			int broker_id;
-			BatchHeader* hdr;
-			size_t slot_offset;
-		};
-		std::vector<ExportUpdate> export_updates;
-		export_updates.reserve(ready.size());
+		// [PHASE-3] Accumulate CV updates locally; merge Level 5 shard CV updates
+		absl::flat_hash_map<int, uint64_t> cv_max_cumulative;
+		absl::flat_hash_map<int, uint64_t> cv_max_pbr_index;
+		for (auto& shard_ptr : level5_shards_) {
+			if (!shard_ptr) continue;
+			for (const auto& [bid, cum] : shard_ptr->cv_max_cumulative) {
+				auto [it, _] = cv_max_cumulative.try_emplace(bid, 0);
+				if (cum > it->second) it->second = cum;
+			}
+			for (const auto& [bid, pbr] : shard_ptr->cv_max_pbr_index) {
+				auto [it, _] = cv_max_pbr_index.try_emplace(bid, 0);
+				if (pbr > it->second) it->second = pbr;
+			}
+		}
+		// [PHASE-4] Accumulate per-broker tinode updates
+		absl::flat_hash_map<int, size_t> ordered_increment;
+		absl::flat_hash_map<int, size_t> last_ordered_offset;
+		uint64_t epoch_timestamp_ns = 0;
+		if (replication_factor_ > 0) {
+			epoch_timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+		}
+
+		// [PHASE-7] Single-pass commit: hold lock for entire epoch; export chain inline with GOI/CV/tinode.
+		absl::MutexLock header_lock(&phase1b_header_for_sub_mu_);
 
 		size_t next_order = base_order;  // message order (total_order) for next batch
 		GOIEntry* goi = reinterpret_cast<GOIEntry*>(
@@ -3190,7 +3357,15 @@ void Topic::EpochSequencerThread() {
 		uint64_t last_written_goi_index = 0;  // last GOI array index written (for committed_seq)
 		bool wrote_goi = false;
 
-		// Pass 1: GOI, CV, tinode (no phase1b_header_for_sub_mu_)
+		// [PANEL C2/P1] O(1) atomics per epoch: reserve GOI indices once (§3.2)
+		size_t num_goi_order5 = 0;
+		for (const PendingBatch5& p : ready) {
+			if (p.skipped || p.is_held_marker) continue;
+			if (p.from_hold || p.hdr != nullptr) num_goi_order5++;
+		}
+		uint64_t base_batch_index_order5 = global_batch_seq_.fetch_add(num_goi_order5, std::memory_order_relaxed);
+		size_t goi_idx_order5 = 0;
+
 		for (PendingBatch5& p : ready) {
 			// [[CONSUMED_THROUGH_SKIP]] Skipped slot: only advance consumed_through so ring can drain
 			if (p.skipped) {
@@ -3210,7 +3385,7 @@ void Topic::EpochSequencerThread() {
 			// [[FROM_HOLD]] Batch drained from hold: use hold_meta (ring slot may be reused); update ordered_offset
 			if (p.from_hold) {
 				const HoldBatchMetadata& m = p.hold_meta;
-				uint64_t batch_index = global_batch_seq_.fetch_add(1, std::memory_order_relaxed);
+				uint64_t batch_index = base_batch_index_order5 + goi_idx_order5++;
 				GOIEntry* entry = &goi[batch_index];
 				entry->global_seq = batch_index;
 				entry->total_order = next_order;
@@ -3228,29 +3403,30 @@ void Topic::EpochSequencerThread() {
 				CXL::flush_cacheline(entry);
 				wrote_goi = true;
 				last_written_goi_index = batch_index;
-				AdvanceCVForSequencer(static_cast<uint16_t>(m.broker_id), m.pbr_absolute_index,
-					m.start_logical_offset + m.num_msg);
+				AccumulateCVUpdate(static_cast<uint16_t>(m.broker_id), m.pbr_absolute_index,
+					m.start_logical_offset + m.num_msg,
+					cv_max_cumulative, cv_max_pbr_index);
 				if (replication_factor_ > 0) {
-					uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-						std::chrono::steady_clock::now().time_since_epoch()).count();
 					size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
 					goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
-					goi_timestamps_[ring_pos].timestamp_ns.store(now_ns, std::memory_order_release);
+					goi_timestamps_[ring_pos].timestamp_ns.store(epoch_timestamp_ns, std::memory_order_release);
 				}
 				int b = m.broker_id;
-				tinode_->offsets[b].ordered += m.num_msg;
-				// [[ORDERED_OFFSET]] So subscribers/replication see progress (log_idx = batch payload start in CXL)
-				tinode_->offsets[b].ordered_offset = m.log_idx;
-				CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(&tinode_->offsets[b].ordered)));
-				CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].ordered_offset));
+				// [PHASE-4] Accumulate from_hold tinode updates
+				ordered_increment[b] += m.num_msg;
+				last_ordered_offset[b] = m.log_idx;
 				{
 					OrderedHoldExportEntry ex;
 					ex.log_idx = m.log_idx;
 					ex.batch_size = m.total_size;
 					ex.total_order = next_order;
 					ex.num_messages = m.num_msg;
-					absl::MutexLock oh_lock(&ordered_from_hold_mu_);
-					ordered_from_hold_[b].push_back(ex);
+					// [PANEL FIX] Use per-broker mutex + deque to allow unbounded growth
+					// (required for throughput test with no subscriber).
+					{
+						absl::MutexLock lock(&hold_export_queues_[b].mu);
+						hold_export_queues_[b].q.push_back(ex);
+					}
 				}
 				next_order += m.num_msg;
 				continue;
@@ -3268,78 +3444,85 @@ void Topic::EpochSequencerThread() {
 			}
 			p.hdr->total_order = next_order;
 
-			uint64_t batch_index = global_batch_seq_.fetch_add(1, std::memory_order_relaxed);
+			uint64_t batch_index = base_batch_index_order5 + goi_idx_order5++;
 			GOIEntry* entry = &goi[batch_index];
 			entry->global_seq = batch_index;
 			entry->total_order = next_order;
-			entry->batch_id = p.hdr->batch_id;
+			entry->batch_id = p.cached_batch_id;
 			entry->broker_id = static_cast<uint16_t>(p.broker_id);
 			entry->epoch_sequenced = p.epoch_created;
-			entry->blog_offset = p.hdr->log_idx;
-			entry->payload_size = static_cast<uint32_t>(p.hdr->total_size);
+			entry->blog_offset = p.cached_log_idx;
+			entry->payload_size = static_cast<uint32_t>(p.cached_total_size);
 			entry->message_count = static_cast<uint32_t>(p.num_msg);
 			entry->num_replicated.store(0, std::memory_order_release);
 			entry->client_id = p.client_id;
 			entry->client_seq = p.hdr->batch_seq;
-			entry->pbr_index = p.hdr->pbr_absolute_index;
-			entry->cumulative_message_count = p.hdr->start_logical_offset + p.num_msg;
+			entry->pbr_index = p.cached_pbr_absolute_index;
+			entry->cumulative_message_count = p.cached_start_logical_offset + p.num_msg;
 			CXL::flush_cacheline(entry);
 			wrote_goi = true;
 			last_written_goi_index = batch_index;
-			AdvanceCVForSequencer(static_cast<uint16_t>(p.broker_id), p.hdr->pbr_absolute_index,
-				p.hdr->start_logical_offset + p.num_msg);
+			AccumulateCVUpdate(static_cast<uint16_t>(p.broker_id), p.cached_pbr_absolute_index,
+				p.cached_start_logical_offset + p.num_msg,
+				cv_max_cumulative, cv_max_pbr_index);
 			if (replication_factor_ > 0) {
-				uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-					std::chrono::steady_clock::now().time_since_epoch()).count();
 				size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
 				goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
-				goi_timestamps_[ring_pos].timestamp_ns.store(now_ns, std::memory_order_release);
+				goi_timestamps_[ring_pos].timestamp_ns.store(epoch_timestamp_ns, std::memory_order_release);
 			}
 			next_order += p.num_msg;
 
 			int b = p.broker_id;
-			tinode_->offsets[b].ordered += p.num_msg;
-			tinode_->offsets[b].ordered_offset = static_cast<size_t>(
+			// [PHASE-4] Accumulate tinode updates
+			ordered_increment[b] += p.num_msg;
+			last_ordered_offset[b] = static_cast<size_t>(
 				reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
-			CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(&tinode_->offsets[b].ordered)));
-			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].ordered_offset));
 
-			export_updates.push_back({b, p.hdr, p.slot_offset});
-		}
-
-		// Pass 2: export chain and hdr clear only (lock held only for this)
-		{
-			absl::MutexLock header_lock(&phase1b_header_for_sub_mu_);
-			for (const ExportUpdate& u : export_updates) {
-				int b = u.broker_id;
-				BatchHeader* hdr = u.hdr;
-				size_t slot_offset = u.slot_offset;
+			// [PHASE-7] Inline export chain (single pass)
+			{
 				auto it = phase1b_header_for_sub_.find(b);
 				if (it != phase1b_header_for_sub_.end()) {
 					BatchHeader* sub = it->second;
-					sub->batch_off_to_export = reinterpret_cast<uint8_t*>(hdr) - reinterpret_cast<uint8_t*>(sub);
+					sub->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) -
+						reinterpret_cast<uint8_t*>(sub);
 					sub->ordered = 1;
 					CXL::flush_cacheline(sub);
+					CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(sub) + 64);
 					BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
-						reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[b].batch_headers_offset);
+						reinterpret_cast<uint8_t*>(cxl_addr_) +
+						tinode_->offsets[b].batch_headers_offset);
 					BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
 						reinterpret_cast<uint8_t*>(ring_start) + BATCHHEADERS_SIZE);
-					BatchHeader* next_sub = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(sub) + sizeof(BatchHeader));
+					BatchHeader* next_sub = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(sub) + sizeof(BatchHeader));
 					if (next_sub >= ring_end) next_sub = ring_start;
 					it->second = next_sub;
 				}
-				hdr->batch_complete = 0;
-				__atomic_store_n(&hdr->flags, 0u, __ATOMIC_RELEASE);
-				CXL::flush_cacheline(hdr);
-				CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(hdr) + 64);
+				p.hdr->batch_complete = 0;
+				__atomic_store_n(&p.hdr->flags, 0u, __ATOMIC_RELEASE);
+				CXL::flush_cacheline(p.hdr);
+				CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(p.hdr) + 64);
 				size_t& next_expected = contiguous_consumed_per_broker[b];
-				next_expected = slot_offset + sizeof(BatchHeader);
+				next_expected = p.slot_offset + sizeof(BatchHeader);
 			}
 		}
 
-		if (wrote_goi) {
-			UpdateCommittedSeq(last_written_goi_index);
+		// [PHASE-4] Write accumulated tinode updates
+		for (const auto& [b, inc] : ordered_increment) {
+			tinode_->offsets[b].ordered += inc;
+			tinode_->offsets[b].ordered_offset = last_ordered_offset[b];
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(&tinode_->offsets[b].ordered)));
+			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].ordered_offset));
 		}
+		// [PHASE-10d] Inline committed_seq update before FlushAccumulatedCV so one fence covers it
+		if (wrote_goi) {
+			ControlBlock* cb = reinterpret_cast<ControlBlock*>(cxl_addr_);
+			cb->committed_seq.store(last_written_goi_index, std::memory_order_release);
+			CXL::flush_cacheline(cb);
+		}
+		// [PHASE-3] Single fence for all CV updates
+		FlushAccumulatedCV(cv_max_cumulative, cv_max_pbr_index);
 
 		// Advance consumed_through for all remaining slots that were processed but not ready
 		// [[WRAP_FIX]] Handle ring wrap: when next_expected==BATCHHEADERS_SIZE, slot 0 is the next expected.
@@ -3383,6 +3566,332 @@ void Topic::EpochSequencerThread() {
 				last_epoch_summary_time = now;
 			}
 		}
+	}
+
+	// [[TAIL_STALL_FIX]] Drain remaining sealed epochs before exit.
+	LOG(INFO) << "EpochSequencerThread: Draining remaining sealed epochs before exit";
+	auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (std::chrono::steady_clock::now() < drain_deadline) {
+		uint64_t last = last_sequenced_epoch_.load(std::memory_order_acquire);
+		uint64_t current = epoch_index_.load(std::memory_order_acquire);
+		if (last >= current) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			current = epoch_index_.load(std::memory_order_acquire);
+			if (last >= current) {
+				LOG(INFO) << "EpochSequencerThread: Caught up (last=" << last << " current=" << current 
+				          << "), exiting drain loop early";
+				break;
+			}
+		}
+		size_t buffer_idx = last % 3;
+		std::vector<PendingBatch5> batch_list;
+		EpochBuffer5& buf = epoch_buffers_[buffer_idx];
+		if (buf.state.load(std::memory_order_acquire) != EpochBuffer5::State::SEALED) {
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
+			continue;
+		}
+		{
+			size_t total = 0;
+			for (const auto& v : buf.per_broker) total += v.size();
+			batch_list.reserve(total);
+		}
+		LOG(INFO) << "EpochSequencerThread Drain: Processing epoch " << last << " (buffer " << buffer_idx << ")";
+		for (auto& v : buf.per_broker) {
+			batch_list.insert(batch_list.end(),
+				std::make_move_iterator(v.begin()),
+				std::make_move_iterator(v.end()));
+			v.clear();
+		}
+		buf.state.store(EpochBuffer5::State::IDLE, std::memory_order_release);
+		last_sequenced_epoch_.store(last + 1, std::memory_order_release);
+		current_epoch_for_hold_.store(last + 1, std::memory_order_release);
+
+		ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
+		CXL::flush_cacheline(control_block);
+		CXL::load_fence();
+		uint64_t current_epoch = control_block->epoch.load(std::memory_order_acquire);
+		constexpr uint16_t kMaxEpochAge = 3;
+		batch_list.erase(
+			std::remove_if(batch_list.begin(), batch_list.end(),
+				[current_epoch, kMaxEpochAge](const PendingBatch5& p) {
+					if (p.skipped) return false;
+					uint16_t cur = static_cast<uint16_t>(current_epoch & 0xFFFF);
+					uint16_t created = p.epoch_created;
+					uint16_t age = (cur - created) & 0xFFFF;
+					return age > kMaxEpochAge;
+				}),
+			batch_list.end());
+
+		absl::flat_hash_map<int, size_t> contiguous_consumed_per_broker;
+		for (const PendingBatch5& p : batch_list) {
+			int b = p.broker_id;
+			if (contiguous_consumed_per_broker.contains(b)) continue;
+			const volatile void* addr = reinterpret_cast<const volatile void*>(&tinode_->offsets[b].batch_headers_consumed_through);
+			CXL::flush_cacheline(const_cast<const void*>(addr));
+			CXL::load_fence();
+			size_t initial = tinode_->offsets[b].batch_headers_consumed_through;
+			if (initial == BATCHHEADERS_SIZE) {
+				initial = 0;
+			}
+			contiguous_consumed_per_broker[b] = initial;
+		}
+
+		std::vector<PendingBatch5> level0, level5;
+		for (PendingBatch5& p : batch_list) {
+			if (p.client_id == 0) {
+				level0.push_back(std::move(p));
+			} else {
+				level5.push_back(std::move(p));
+			}
+		}
+
+		std::vector<PendingBatch5> ready_level5;
+		ProcessLevel5Batches(level5, ready_level5);
+
+		std::vector<PendingBatch5> ready;
+		for (PendingBatch5& p : level0) ready.push_back(std::move(p));
+		for (PendingBatch5& p : ready_level5) ready.push_back(std::move(p));
+
+		if (ready.empty()) {
+			for (const PendingBatch5& p : batch_list) {
+				int b = p.broker_id;
+				size_t& next_expected = contiguous_consumed_per_broker[b];
+				if (p.slot_offset >= next_expected ||
+				    (next_expected == BATCHHEADERS_SIZE && p.slot_offset == 0)) {
+					next_expected = p.slot_offset + sizeof(BatchHeader);
+					if (next_expected >= BATCHHEADERS_SIZE) next_expected = BATCHHEADERS_SIZE;
+				}
+			}
+			for (const auto& kv : contiguous_consumed_per_broker) {
+				int b = kv.first;
+				tinode_->offsets[b].batch_headers_consumed_through = kv.second;
+				CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].batch_headers_consumed_through));
+			}
+			CXL::store_fence();
+			continue;
+		}
+
+		size_t total_msg = 0;
+		for (const PendingBatch5& p : ready) total_msg += p.num_msg;
+		size_t base_order = global_seq_.fetch_add(total_msg, std::memory_order_relaxed);
+
+		std::sort(ready.begin(), ready.end(), [](const PendingBatch5& a, const PendingBatch5& b) {
+			if (a.broker_id != b.broker_id) return a.broker_id < b.broker_id;
+			return a.scanner_seq < b.scanner_seq;
+		});
+
+		absl::flat_hash_map<int, uint64_t> drain_cv_max_cumulative;
+		absl::flat_hash_map<int, uint64_t> drain_cv_max_pbr_index;
+		for (auto& shard_ptr : level5_shards_) {
+			if (!shard_ptr) continue;
+			for (const auto& [bid, cum] : shard_ptr->cv_max_cumulative) {
+				auto [it, _] = drain_cv_max_cumulative.try_emplace(bid, 0);
+				if (cum > it->second) it->second = cum;
+			}
+			for (const auto& [bid, pbr] : shard_ptr->cv_max_pbr_index) {
+				auto [it, _] = drain_cv_max_pbr_index.try_emplace(bid, 0);
+				if (pbr > it->second) it->second = pbr;
+			}
+		}
+
+		absl::flat_hash_map<int, size_t> drain_ordered_increment;
+		absl::flat_hash_map<int, size_t> drain_last_ordered_offset;
+		uint64_t epoch_timestamp_ns = 0;
+		if (replication_factor_ > 0) {
+			epoch_timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+		}
+
+		absl::MutexLock header_lock(&phase1b_header_for_sub_mu_);
+
+		size_t next_order = base_order;
+		GOIEntry* goi = reinterpret_cast<GOIEntry*>(
+			reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kGOIOffset);
+		uint64_t last_written_goi_index = 0;
+		bool wrote_goi = false;
+
+		size_t num_goi_order5 = 0;
+		for (const PendingBatch5& p : ready) {
+			if (p.skipped || p.is_held_marker) continue;
+			if (p.from_hold || p.hdr != nullptr) num_goi_order5++;
+		}
+		uint64_t base_batch_index_order5 = global_batch_seq_.fetch_add(num_goi_order5, std::memory_order_relaxed);
+		size_t goi_idx_order5 = 0;
+
+		for (PendingBatch5& p : ready) {
+			if (p.skipped) {
+				int b = p.broker_id;
+				size_t& next_expected = contiguous_consumed_per_broker[b];
+				next_expected = p.slot_offset + sizeof(BatchHeader);
+				continue;
+			}
+			if (p.is_held_marker) {
+				int b = p.broker_id;
+				size_t& next_expected = contiguous_consumed_per_broker[b];
+				next_expected = p.slot_offset + sizeof(BatchHeader);
+				continue;
+			}
+
+			if (p.from_hold) {
+				const HoldBatchMetadata& m = p.hold_meta;
+				uint64_t batch_index = base_batch_index_order5 + goi_idx_order5++;
+				GOIEntry* entry = &goi[batch_index];
+				entry->global_seq = batch_index;
+				entry->total_order = next_order;
+				entry->batch_id = m.batch_id;
+				entry->broker_id = static_cast<uint16_t>(m.broker_id);
+				entry->epoch_sequenced = m.epoch_created;
+				entry->blog_offset = m.log_idx;
+				entry->payload_size = static_cast<uint32_t>(m.total_size);
+				entry->message_count = static_cast<uint32_t>(m.num_msg);
+				entry->num_replicated.store(0, std::memory_order_release);
+				entry->client_id = m.client_id;
+				entry->client_seq = m.batch_seq;
+				entry->pbr_index = m.pbr_absolute_index;
+				entry->cumulative_message_count = m.start_logical_offset + m.num_msg;
+				CXL::flush_cacheline(entry);
+				wrote_goi = true;
+				last_written_goi_index = batch_index;
+				AccumulateCVUpdate(static_cast<uint16_t>(m.broker_id), m.pbr_absolute_index,
+					m.start_logical_offset + m.num_msg,
+					drain_cv_max_cumulative, drain_cv_max_pbr_index);
+				if (replication_factor_ > 0) {
+					size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
+					goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
+					goi_timestamps_[ring_pos].timestamp_ns.store(epoch_timestamp_ns, std::memory_order_release);
+				}
+				int b = m.broker_id;
+				drain_ordered_increment[b] += m.num_msg;
+				drain_last_ordered_offset[b] = m.log_idx;
+				{
+					OrderedHoldExportEntry ex;
+					ex.log_idx = m.log_idx;
+					ex.batch_size = m.total_size;
+					ex.total_order = next_order;
+					ex.num_messages = m.num_msg;
+					// [PANEL FIX] Use per-broker mutex + deque to allow unbounded growth
+					// (required for throughput test with no subscriber).
+					{
+						absl::MutexLock lock(&hold_export_queues_[b].mu);
+						hold_export_queues_[b].q.push_back(ex);
+					}
+				}
+				next_order += m.num_msg;
+				continue;
+			}
+
+			if (!p.hdr) {
+				int b = p.broker_id;
+				size_t& next_expected = contiguous_consumed_per_broker[b];
+				next_expected = p.slot_offset + sizeof(BatchHeader);
+				if (next_expected >= BATCHHEADERS_SIZE) next_expected = BATCHHEADERS_SIZE;
+				continue;
+			}
+			p.hdr->total_order = next_order;
+
+			uint64_t batch_index = base_batch_index_order5 + goi_idx_order5++;
+			GOIEntry* entry = &goi[batch_index];
+			entry->global_seq = batch_index;
+			entry->total_order = next_order;
+			entry->batch_id = p.cached_batch_id;
+			entry->broker_id = static_cast<uint16_t>(p.broker_id);
+			entry->epoch_sequenced = p.epoch_created;
+			entry->blog_offset = p.cached_log_idx;
+			entry->payload_size = static_cast<uint32_t>(p.cached_total_size);
+			entry->message_count = static_cast<uint32_t>(p.num_msg);
+			entry->num_replicated.store(0, std::memory_order_release);
+			entry->client_id = p.client_id;
+			entry->client_seq = p.hdr->batch_seq;
+			entry->pbr_index = p.cached_pbr_absolute_index;
+			entry->cumulative_message_count = p.cached_start_logical_offset + p.num_msg;
+			CXL::flush_cacheline(entry);
+			wrote_goi = true;
+			last_written_goi_index = batch_index;
+			AccumulateCVUpdate(static_cast<uint16_t>(p.broker_id), p.cached_pbr_absolute_index,
+				p.cached_start_logical_offset + p.num_msg,
+				drain_cv_max_cumulative, drain_cv_max_pbr_index);
+			if (replication_factor_ > 0) {
+				size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
+				goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
+				goi_timestamps_[ring_pos].timestamp_ns.store(epoch_timestamp_ns, std::memory_order_release);
+			}
+			next_order += p.num_msg;
+
+			int b = p.broker_id;
+			drain_ordered_increment[b] += p.num_msg;
+			drain_last_ordered_offset[b] = static_cast<size_t>(
+				reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
+
+			{
+				auto it = phase1b_header_for_sub_.find(b);
+				if (it != phase1b_header_for_sub_.end()) {
+					BatchHeader* sub = it->second;
+					sub->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) -
+						reinterpret_cast<uint8_t*>(sub);
+					sub->ordered = 1;
+					CXL::flush_cacheline(sub);
+					CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(sub) + 64);
+					BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(cxl_addr_) +
+						tinode_->offsets[b].batch_headers_offset);
+					BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(ring_start) + BATCHHEADERS_SIZE);
+					BatchHeader* next_sub = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(sub) + sizeof(BatchHeader));
+					if (next_sub >= ring_end) next_sub = ring_start;
+					it->second = next_sub;
+				}
+				p.hdr->batch_complete = 0;
+				__atomic_store_n(&p.hdr->flags, 0u, __ATOMIC_RELEASE);
+				CXL::flush_cacheline(p.hdr);
+				CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(p.hdr) + 64);
+				size_t& next_expected = contiguous_consumed_per_broker[b];
+				next_expected = p.slot_offset + sizeof(BatchHeader);
+			}
+		}
+
+		for (const auto& [b, inc] : drain_ordered_increment) {
+			tinode_->offsets[b].ordered += inc;
+			tinode_->offsets[b].ordered_offset = drain_last_ordered_offset[b];
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(&tinode_->offsets[b].ordered)));
+			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].ordered_offset));
+		}
+		if (wrote_goi) {
+			ControlBlock* cb = reinterpret_cast<ControlBlock*>(cxl_addr_);
+			cb->committed_seq.store(last_written_goi_index, std::memory_order_release);
+			CXL::flush_cacheline(cb);
+		}
+		FlushAccumulatedCV(drain_cv_max_cumulative, drain_cv_max_pbr_index);
+
+		for (const PendingBatch5& p : batch_list) {
+			int b = p.broker_id;
+			size_t& next_expected = contiguous_consumed_per_broker[b];
+			if (p.slot_offset >= next_expected ||
+			    (next_expected == BATCHHEADERS_SIZE && p.slot_offset == 0)) {
+				next_expected = p.slot_offset + sizeof(BatchHeader);
+				if (next_expected >= BATCHHEADERS_SIZE) next_expected = BATCHHEADERS_SIZE;
+			}
+		}
+
+		CXL::store_fence();
+
+		for (const auto& kv : contiguous_consumed_per_broker) {
+			int b = kv.first;
+			tinode_->offsets[b].batch_headers_consumed_through = kv.second;
+			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].batch_headers_consumed_through));
+		}
+		CXL::store_fence();
+	}
+
+	// [[SHARD_SHUTDOWN]] Signal Level 5 workers to exit
+	for (auto& shard : level5_shards_) {
+		if (!shard) continue;
+		{
+			std::lock_guard<std::mutex> lock(shard->mu);
+			shard->stop = true;
+		}
+		shard->cv.notify_one();
 	}
 }
 
@@ -3461,7 +3970,10 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			std::make_move_iterator(shard.deferred_level5.end()));
 		shard.deferred_level5.clear();
 	}
-	
+	// [PHASE-3] Clear shard CV accumulation for this invocation
+	shard.cv_max_cumulative.clear();
+	shard.cv_max_pbr_index.clear();
+
 	// [[SKIP_MARKER_FILTER]] Extract skip markers before sorting/grouping.
 	// Skip markers (from BrokerScannerWorker5 hole-skip) have client_id=SIZE_MAX.
 	// They don't need per-client FIFO tracking - just push directly to ready
@@ -3472,7 +3984,56 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		ready.push_back(std::move(*it));
 	}
 	level5.erase(skip_partition, level5.end());
-	
+
+	// [PHASE-6] Fast path: single client, no held batches, no deferred.
+	// Skip radix sort, dedup check, and hold buffer management when possible.
+	if (shard.hold_buffer_size == 0 &&
+	    shard.deferred_level5.empty() &&
+	    !level5.empty()) {
+		bool single_client = true;
+		size_t first_client = level5[0].client_id;
+		for (size_t i = 1; i < level5.size(); ++i) {
+			if (level5[i].client_id != first_client) {
+				single_client = false;
+				break;
+			}
+		}
+		if (single_client) {
+			if (level5.size() > 1) {
+				std::sort(level5.begin(), level5.end(),
+					[](const PendingBatch5& a, const PendingBatch5& b) {
+						return a.batch_seq < b.batch_seq;
+					});
+			}
+			ClientState5& state = shard.client_state[first_client];
+			state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+			uint64_t& hc = shard.client_highest_committed
+				.try_emplace(first_client, UINT64_MAX).first->second;
+			uint64_t next_exp_saved = state.next_expected;
+			bool all_in_order = true;
+			for (const auto& p : level5) {
+				if (p.batch_seq != state.next_expected) {
+					all_in_order = false;
+					break;
+				}
+				state.next_expected++;
+			}
+			if (all_in_order) {
+				state.next_expected = next_exp_saved;  // Restore for mark_sequenced/advance
+				for (auto& p : level5) {
+					state.mark_sequenced(p.batch_seq);
+					state.advance_next_expected();
+					hc = (hc == UINT64_MAX) ? static_cast<uint64_t>(p.batch_seq)
+					    : std::max(hc, static_cast<uint64_t>(p.batch_seq));
+					ready.push_back(std::move(p));
+				}
+				ClientGc(shard);
+				return;
+			}
+			state.next_expected = next_exp_saved;  // Fall through to slow path
+		}
+	}
+
 	shard.radix_sorter.sort_by_client_id(level5);
 
 	for (auto it = level5.begin(); it != level5.end(); ) {
@@ -3497,45 +4058,33 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					state.next_expected = seq + 1;
 				}
 				// [[B0_ACK_FIX]] Advance CV even for late-arriving batches skipped as "already committed".
-				// Level 5 ordering (per-client FIFO) is separate from ACK tracking (per-broker CV).
-				// The data IS in BLog; publisher must see progress for this broker.
+				// [PHASE-3] Accumulate into shard maps; flushed with epoch CV
 				if (jt->hdr) {
-					AdvanceCVForSequencer(static_cast<uint16_t>(jt->broker_id),
-						jt->hdr->pbr_absolute_index,
-						jt->hdr->start_logical_offset + jt->num_msg);
+					AccumulateCVUpdate(static_cast<uint16_t>(jt->broker_id),
+						jt->cached_pbr_absolute_index,
+						jt->cached_start_logical_offset + jt->num_msg,
+						shard.cv_max_cumulative, shard.cv_max_pbr_index);
 					VLOG(1) << "[L5_SKIP_COMMITTED] B" << jt->broker_id << " seq=" << seq
 					        << " (late; CV advanced for ACK)";
 				}
 				continue;
 			}
+			// [PHASE-6] In-order batch (seq == next_expected): cannot be duplicate of any
+			// committed batch; dedup only needed for batches released from hold.
 			if (seq == state.next_expected) {
-				bool dup = CheckAndInsertBatchId(shard, jt->hdr->batch_id);
 				state.mark_sequenced(seq);
 				state.advance_next_expected();
-				// [[B0_L5_DEBUG]] See if B0 batches go to ready or are dropped as duplicate
-				if (jt->broker_id == 0) {
-					static std::atomic<uint64_t> b0_ready_dup_log_count{0};
-					uint64_t nd = b0_ready_dup_log_count.fetch_add(1, std::memory_order_relaxed);
-					if (nd < 30 || (nd % 5000 == 0 && nd > 0)) {
-						LOG(INFO) << "[L5_READY] B0 seq=" << seq << " dup=" << dup
-						          << " (to_ready=" << (!dup) << " count=" << (nd + 1) << ")";
-					}
-				}
-				if (dup && jt->broker_id == 0) {
-					LOG(WARNING) << "[DEDUP] B0 batch dropped as duplicate batch_id=" << jt->hdr->batch_id << " seq=" << seq;
-				}
-				if (!dup) {
-					ready.push_back(*jt);
-					hc = (hc == UINT64_MAX) ? seq : std::max(hc, static_cast<uint64_t>(seq));
-				}
+				ready.push_back(*jt);
+				hc = (hc == UINT64_MAX) ? seq : std::max(hc, static_cast<uint64_t>(seq));
 			} else if (seq < state.next_expected) {
 				// [[B0_ACK_FIX]] Late-arriving batch (next_expected already advanced, e.g. by expiry).
-				// Still advance CV so this broker's ACK progress is visible; otherwise B0 ACKs stay 0.
+				// [PHASE-3] Accumulate into shard maps
 				state.mark_sequenced(seq);
 				if (jt->hdr) {
-					AdvanceCVForSequencer(static_cast<uint16_t>(jt->broker_id),
-						jt->hdr->pbr_absolute_index,
-						jt->hdr->start_logical_offset + jt->num_msg);
+					AccumulateCVUpdate(static_cast<uint16_t>(jt->broker_id),
+						jt->cached_pbr_absolute_index,
+						jt->cached_start_logical_offset + jt->num_msg,
+						shard.cv_max_cumulative, shard.cv_max_pbr_index);
 					VLOG(1) << "[L5_LATE] B" << jt->broker_id << " seq=" << seq
 					        << " next_expected=" << state.next_expected << " (CV advanced for ACK)";
 				}
@@ -3577,17 +4126,17 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				{
 					HoldEntry5 he;
 					he.batch = *jt;
-					// [[HOLD_METADATA_COPY]] Copy at hold time; ring slot may be reused after marker advances consumed_through
-					he.meta.log_idx = jt->hdr->log_idx;
-					he.meta.total_size = jt->hdr->total_size;
-					he.meta.batch_id = jt->hdr->batch_id;
+					// [[HOLD_METADATA_COPY]] [PHASE-5] Use cached metadata (L1-hot at scanner time)
+					he.meta.log_idx = jt->cached_log_idx;
+					he.meta.total_size = jt->cached_total_size;
+					he.meta.batch_id = jt->cached_batch_id;
 					he.meta.batch_seq = jt->batch_seq;
-					he.meta.pbr_absolute_index = jt->hdr->pbr_absolute_index;
+					he.meta.pbr_absolute_index = jt->cached_pbr_absolute_index;
 					he.meta.client_id = jt->client_id;
 					he.meta.epoch_created = jt->epoch_created;
 					he.meta.broker_id = jt->broker_id;
 					he.meta.num_msg = jt->num_msg;
-					he.meta.start_logical_offset = jt->hdr->start_logical_offset;
+					he.meta.start_logical_offset = jt->cached_start_logical_offset;
 					client_map.emplace(seq, he);
 					shard.hold_buffer_size++;
 					shard.clients_with_held_batches.insert(client_id);
@@ -3708,10 +4257,11 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			// we'd leave next_expected behind and hold valid in-order batches forever.
 			if (ent.seq >= state.next_expected)
 				state.next_expected = ent.seq + 1;
-			// [[B0_ACK_FIX]] Advance CV for expired/skipped entries so broker ACK progress is visible.
-			AdvanceCVForSequencer(static_cast<uint16_t>(ent.batch.broker_id),
+			// [[B0_ACK_FIX]] [PHASE-3] Accumulate CV for expired/skipped entries into shard maps
+			AccumulateCVUpdate(static_cast<uint16_t>(ent.batch.broker_id),
 				ent.meta.pbr_absolute_index,
-				ent.meta.start_logical_offset + ent.meta.num_msg);
+				ent.meta.start_logical_offset + ent.meta.num_msg,
+				shard.cv_max_cumulative, shard.cv_max_pbr_index);
 			VLOG(1) << "[L5_EXPIRED_SKIP] B" << ent.batch.broker_id << " seq=" << ent.seq
 			        << " (CV advanced for ACK)";
 			continue;
@@ -3808,8 +4358,10 @@ void Topic::Level5ShardWorker(size_t shard_id) {
 		std::vector<PendingBatch5> input;
 		{
 			std::unique_lock<std::mutex> lock(shard.mu);
-			shard.cv.wait(lock, [&]() { return shard.has_work || shard.stop || stop_threads_; });
-			if ((shard.stop || stop_threads_) && !shard.has_work) {
+			// [PANEL FIX] Ignore stop_threads_: worker must stay alive until EpochSequencerThread
+			// finishes drain and sets shard.stop. Otherwise workers exit early and drain fails.
+			shard.cv.wait(lock, [&]() { return shard.has_work || shard.stop; });
+			if (shard.stop && !shard.has_work) {
 				break;
 			}
 			shard.has_work = false;
@@ -3914,9 +4466,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 
 		// [PHASE-0 FIX] Invalidate BOTH cache lines of 128-byte BatchHeader.
 		// BatchHeader is 128 bytes = 2 cache lines. Writer (HandlePublishRequest) flushes both.
-		// Without this, fields in bytes 64-127 (log_idx, start_logical_offset, etc.) read
-		// stale zeros from ReservePBRSlotAfterRecv's memset(0). When client_id reads as 0,
-		// all batches bypass Level 5 processing, silently disabling Order 5 per-client ordering.
+		// Without this, fields in bytes 64-127 (batch_id, pbr_absolute_index, log_idx, etc.) read
+		// stale zeros from ReservePBRSlotAfterRecv's memset(0). When client_id or metadata read wrong,
+		// Level 5 processing can be silently broken.
 		CXL::flush_cacheline(current_batch_header);
 		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(current_batch_header) + 64);
 		CXL::load_fence();
@@ -4010,7 +4562,10 @@ force_skip_claimed:
 					bool recheck_ready = false;
 					for (int recheck = 0; recheck < 5 && !recheck_ready; ++recheck) {
 						std::this_thread::sleep_for(std::chrono::milliseconds(50));
+						// [PHASE-0 FIX] Both cache lines for re-check
 						CXL::invalidate_cacheline_for_read(current_batch_header);
+						CXL::invalidate_cacheline_for_read(
+							reinterpret_cast<const uint8_t*>(current_batch_header) + 64);
 						CXL::full_fence();
 						uint32_t re_flags = __atomic_load_n(&current_batch_header->flags, __ATOMIC_ACQUIRE);
 						volatile uint32_t re_num = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
@@ -4076,7 +4631,10 @@ force_skip_claimed:
 				bool recheck_ready = false;
 				for (int recheck = 0; recheck < 5 && !recheck_ready; ++recheck) {
 					std::this_thread::sleep_for(std::chrono::milliseconds(50));
+					// [PHASE-0 FIX] Both cache lines for re-check
 					CXL::invalidate_cacheline_for_read(current_batch_header);
+					CXL::invalidate_cacheline_for_read(
+						reinterpret_cast<const uint8_t*>(current_batch_header) + 64);
 					CXL::full_fence();
 					uint32_t re_flags = __atomic_load_n(&current_batch_header->flags, __ATOMIC_ACQUIRE);
 					volatile uint32_t re_num = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
@@ -4145,18 +4703,24 @@ force_skip_claimed:
 				}
 			}
 		// [[SKIP_FIX]] Re-check skipped slot: B0 same-process race; B1/B2/B3 CXL visibility delay.
-		// After advancing, producer may have written (B0) or CXL write may not be visible yet (B1-B3).
+		// [PHASE-0 FIX] Re-check with both cache lines invalidated
 		if (skipped_slot_ptr && !stop_threads_) {
 			if (broker_id == 0) {
 				std::this_thread::sleep_for(std::chrono::milliseconds(20));
 				CXL::invalidate_cacheline_for_read(skipped_slot_ptr);
+				CXL::invalidate_cacheline_for_read(
+					reinterpret_cast<const uint8_t*>(skipped_slot_ptr) + 64);
 				CXL::full_fence();
 			} else {
 				// Remote brokers: stronger CXL visibility (double invalidate + longer delay)
 				CXL::flush_cacheline(CXL::ToFlushable(skipped_slot_ptr));
+				CXL::flush_cacheline(
+					reinterpret_cast<const uint8_t*>(skipped_slot_ptr) + 64);
 				CXL::full_fence();
 				std::this_thread::sleep_for(std::chrono::milliseconds(50));
 				CXL::flush_cacheline(CXL::ToFlushable(skipped_slot_ptr));
+				CXL::flush_cacheline(
+					reinterpret_cast<const uint8_t*>(skipped_slot_ptr) + 64);
 				CXL::full_fence();
 			}
 			uint32_t re_flags = __atomic_load_n(&skipped_slot_ptr->flags, __ATOMIC_ACQUIRE);
@@ -4173,6 +4737,11 @@ force_skip_claimed:
 				pending.slot_offset = re_slot_off;
 				pending.epoch_created = static_cast<uint16_t>(skipped_slot_ptr->epoch_created);
 				pending.scanner_seq = next_scanner_seq_.fetch_add(1, std::memory_order_relaxed);
+				pending.cached_log_idx = skipped_slot_ptr->log_idx;
+				pending.cached_total_size = skipped_slot_ptr->total_size;
+				pending.cached_batch_id = skipped_slot_ptr->batch_id;
+				pending.cached_pbr_absolute_index = skipped_slot_ptr->pbr_absolute_index;
+				pending.cached_start_logical_offset = skipped_slot_ptr->start_logical_offset;
 				for (int r = 0; r < 5000; ++r) {
 					uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 					EpochBuffer5& buf = epoch_buffers_[epoch % 3];
@@ -4226,6 +4795,12 @@ force_skip_claimed:
 	pending.slot_offset = slot_offset;
 	pending.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
 	pending.scanner_seq = next_scanner_seq_.fetch_add(1, std::memory_order_relaxed);
+	// [PHASE-5] Cache metadata while in L1 (just invalidated both cache lines above)
+	pending.cached_log_idx = current_batch_header->log_idx;
+	pending.cached_total_size = current_batch_header->total_size;
+	pending.cached_batch_id = current_batch_header->batch_id;
+	pending.cached_pbr_absolute_index = current_batch_header->pbr_absolute_index;
+	pending.cached_start_logical_offset = current_batch_header->start_logical_offset;
 
 	// [[COMPLETE_DATA_LOSS_FIX]] Once batch is ready, it MUST be pushed to epoch buffer
 	// before advancing the scanner position. This ensures no batches are lost during shutdown.
@@ -4265,12 +4840,15 @@ force_skip_claimed:
 		}
 		
 		if (!pushed) {
-			LOG(ERROR) << "[PUSH_FAILURE] BrokerScannerWorker5 [B" << broker_id 
-			           << "] Failed to push batch after " << kMaxRetries << " retries. "
-			           << "Batch will be LOST: batch_seq=" << pending.batch_seq;
-			// Increment lost count for diagnostics
-			static std::atomic<uint64_t> lost_batches{0};
-			lost_batches.fetch_add(1, std::memory_order_relaxed);
+			// [PANEL C5] Do not advance: retry same slot next iteration (Property 5: Progress).
+			// Advancing would lose the batch (PBR slot never sequenced). Sleep then retry.
+			LOG(ERROR) << "[PUSH_FAILURE] BrokerScannerWorker5 [B" << broker_id
+			           << "] Failed to push batch after " << kMaxRetries << " retries; will retry slot (batch_seq="
+			           << pending.batch_seq << "). Do not advancing scanner.";
+			static std::atomic<uint64_t> push_retry_count{0};
+			push_retry_count.fetch_add(1, std::memory_order_relaxed);
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			continue;
 		}
 	}
 	total_batches_processed++;
@@ -4310,10 +4888,15 @@ force_skip_claimed:
 	LOG(INFO) << "BrokerScannerWorker5 [B" << broker_id << "]: Starting drain (up to " << kDrainDurationMs << " ms)";
 
 	while (std::chrono::steady_clock::now() < drain_deadline) {
+		// [PHASE-0 FIX] Invalidate both cache lines in drain phase
 		if (broker_id == 0) {
 			CXL::invalidate_cacheline_for_read(current_batch_header);
+			CXL::invalidate_cacheline_for_read(
+				reinterpret_cast<const uint8_t*>(current_batch_header) + 64);
 		} else {
 			CXL::flush_cacheline(current_batch_header);
+			CXL::flush_cacheline(
+				reinterpret_cast<const uint8_t*>(current_batch_header) + 64);
 		}
 		CXL::full_fence();
 		volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
@@ -4333,6 +4916,11 @@ force_skip_claimed:
 			pending.slot_offset = slot_offset;
 			pending.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
 			pending.scanner_seq = next_scanner_seq_.fetch_add(1, std::memory_order_relaxed);
+			pending.cached_log_idx = current_batch_header->log_idx;
+			pending.cached_total_size = current_batch_header->total_size;
+			pending.cached_batch_id = current_batch_header->batch_id;
+			pending.cached_pbr_absolute_index = current_batch_header->pbr_absolute_index;
+			pending.cached_start_logical_offset = current_batch_header->start_logical_offset;
 
 			bool pushed = false;
 			for (int r = 0; r < 5000 && !pushed; ++r) {
@@ -4349,8 +4937,11 @@ force_skip_claimed:
 				}
 			}
 			if (!pushed) {
+				// [PANEL C5] Do not advance: retry same slot next iteration (Property 5: Progress).
 				LOG(WARNING) << "BrokerScannerWorker5 [B" << broker_id << "] drain: failed to push batch_seq="
-				             << current_batch_header->batch_seq << " after retries";
+				             << current_batch_header->batch_seq << " after retries; will retry slot";
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				continue;
 			}
 		}
 

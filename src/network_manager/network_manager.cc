@@ -1867,19 +1867,30 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 		// GetOffsetToAck() handles invalidation correctly, so we don't need it here
 		
 		// [[SENIOR_REVIEW_FIX: Cache GetOffsetToAck() result to avoid redundant calls]]
-		// GetOffsetToAck() invalidates cache internally, so we cache the result
-		// and re-use it for logging and ACK decision to avoid redundant invalidations
+		// [PHASE-2] Reduced CXL polling: check every ~50μs instead of continuous spin.
+		// Previous: ~1000 CXL invalidations per 500μs spin = 2M/sec/broker = 512 MB/s CXL waste.
+		// New: ~10 CXL invalidations per 500μs spin = 20K/sec/broker = ~1.3 MB/s CXL.
+		// Trade-off: ACK latency increases by up to 50μs (negligible vs epoch time of 500μs).
+		constexpr auto CXL_POLL_INTERVAL = std::chrono::microseconds(50);
+		auto next_poll = cycle_start;
 		size_t cached_ack = (size_t)-1;
 		
 		while (std::chrono::steady_clock::now() - cycle_start < SPIN_DURATION) {
-			// GetOffsetToAck() invalidates cache internally - no need for separate invalidation
-			cached_ack = GetOffsetToAck(topic.c_str(), ack_level);
-			if (cached_ack != (size_t)-1 && next_to_ack_offset <= cached_ack) {
-				found_ack = true;
-				consecutive_ack_stalls = 0;  // Reset on success
-				break;  // ACK is ready, exit spin loop and send immediately
+			auto now = std::chrono::steady_clock::now();
+			if (now >= next_poll) {
+				cached_ack = GetOffsetToAck(topic.c_str(), ack_level);
+				if (cached_ack != (size_t)-1 && next_to_ack_offset <= cached_ack) {
+					found_ack = true;
+					consecutive_ack_stalls = 0;
+					break;
+				}
+				next_poll = now + CXL_POLL_INTERVAL;
 			}
-			CXL::cpu_pause();  // Efficient spin-wait on CXL
+			// Between polls, yield CPU (don't busy-spin on CXL)
+			CXL::cpu_pause();
+			CXL::cpu_pause();
+			CXL::cpu_pause();
+			CXL::cpu_pause();  // ~40ns of pause before next time check
 		}
 		
 		if (!found_ack) {
@@ -1931,13 +1942,22 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 			}();
 			const int drain_eff = drain_us > 0 ? drain_us : 1000;
 			auto drain_end = std::chrono::steady_clock::now() + std::chrono::microseconds(drain_eff);
+			// [PHASE-2] Reduced drain polling
+			auto next_drain_poll = std::chrono::steady_clock::now();
 			while (std::chrono::steady_clock::now() < drain_end) {
-				cached_ack = GetOffsetToAck(topic.c_str(), ack_level);
-				if (cached_ack != (size_t)-1 && next_to_ack_offset <= cached_ack) {
-					found_ack = true;
-					consecutive_ack_stalls = 0;
-					break;
+				auto now = std::chrono::steady_clock::now();
+				if (now >= next_drain_poll) {
+					cached_ack = GetOffsetToAck(topic.c_str(), ack_level);
+					if (cached_ack != (size_t)-1 && next_to_ack_offset <= cached_ack) {
+						found_ack = true;
+						consecutive_ack_stalls = 0;
+						break;
+					}
+					next_drain_poll = now + CXL_POLL_INTERVAL;
 				}
+				CXL::cpu_pause();
+				CXL::cpu_pause();
+				CXL::cpu_pause();
 				CXL::cpu_pause();
 			}
 		}

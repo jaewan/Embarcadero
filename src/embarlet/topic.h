@@ -64,6 +64,12 @@ struct PendingBatch5 {
 	bool from_hold{false};
 	// [[FROM_HOLD]] When from_hold is true, use this copy (filled at hold time) instead of hdr
 	HoldBatchMetadata hold_meta;
+	// [PHASE-5] Metadata cached at scanner time (L1-hot after invalidation); avoids cold CXL reads in hold/GOI path
+	size_t cached_log_idx{0};
+	size_t cached_total_size{0};
+	uint64_t cached_batch_id{0};
+	uint64_t cached_pbr_absolute_index{0};
+	size_t cached_start_logical_offset{0};
 };
 /** Export metadata for batches ordered from hold (ring slot already advanced). */
 struct OrderedHoldExportEntry {
@@ -72,6 +78,8 @@ struct OrderedHoldExportEntry {
 	size_t total_order{0};
 	uint32_t num_messages{0};
 };
+
+
 using ClientState5 = OptimizedClientState;
 struct HoldEntry5 {
 	PendingBatch5 batch;
@@ -334,6 +342,16 @@ class Topic {
 		 * @param cumulative_msg_count Cumulative message count (ACK offset) for this batch
 		 */
 		void AdvanceCVForSequencer(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count);
+		// [PHASE-3] Per-broker CV accumulation for single-fence commit
+		void AccumulateCVUpdate(
+			uint16_t broker_id,
+			uint64_t pbr_index,
+			uint64_t cumulative_msg_count,
+			absl::flat_hash_map<int, uint64_t>& max_cumulative,
+			absl::flat_hash_map<int, uint64_t>& max_pbr_index);
+		void FlushAccumulatedCV(
+			const absl::flat_hash_map<int, uint64_t>& max_cumulative,
+			const absl::flat_hash_map<int, uint64_t>& max_pbr_index);
 		/**
 		 * [[PHASE_3]] Publish the contiguous GOI prefix via ControlBlock.committed_seq.
 		 * Single sequencer: update after writing GOI entries for an epoch.
@@ -607,6 +625,9 @@ class Topic {
 			std::vector<PendingBatch5> deferred_level5;
 			FastDeduplicator dedup;
 			RadixSorter<PendingBatch5> radix_sorter;
+			// [PHASE-3] Per-shard CV accumulation for late/expired batches
+			absl::flat_hash_map<int, uint64_t> cv_max_cumulative;
+			absl::flat_hash_map<int, uint64_t> cv_max_pbr_index;
 		};
 		size_t level5_num_shards_{1};
 		std::vector<std::unique_ptr<Level5ShardState>> level5_shards_;
@@ -626,9 +647,14 @@ class Topic {
 		absl::Mutex phase1b_header_for_sub_mu_;
 		// [[RING_ORDER]] Monotonic sequence for scanner_seq (BrokerScannerWorker5); fixes wrap-around sort
 		std::atomic<uint64_t> next_scanner_seq_{0};
-		// [[FROM_HOLD]] Batches ordered from hold buffer; export path serves these before ring (ring slot was advanced)
-		absl::flat_hash_map<int, std::deque<OrderedHoldExportEntry>> ordered_from_hold_;
-		absl::Mutex ordered_from_hold_mu_;
+		// [PHASE-8-REVISED] Per-broker unbounded queues for from-hold batch export.
+		// Replaces SPSC ring to avoid deadlock when no subscriber consumes (throughput test).
+		// Uses per-broker mutex to minimize contention (vs global mutex).
+		struct PerBrokerHoldQueue {
+			absl::Mutex mu;
+			std::deque<OrderedHoldExportEntry> q;
+		};
+		std::array<PerBrokerHoldQueue, NUM_MAX_BROKERS> hold_export_queues_{};
 
 		// [[PHASE_2_FIX]] Per-broker absolute PBR counters (never wrap, for CV tracking)
 		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> broker_pbr_counters_{};
