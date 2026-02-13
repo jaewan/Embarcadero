@@ -59,6 +59,7 @@ embarcadero:
 
   # Corfu sequencer configuration
   corfu:
+    sequencer_ip: "127.0.0.1"    # Corfu sequencer IP address (localhost)
     sequencer_port: 50052        # Corfu sequencer port
     replication_port: 50053      # Corfu replication port
 

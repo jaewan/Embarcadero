@@ -37,7 +37,7 @@
 #define MSG_ZEROCOPY    0x4000000
 #endif
 
-#define CORFU_SEQUENCER_ADDR "192.168.60.173:"
+#define CORFU_SEQUENCER_ADDR "127.0.0.1:"
 // Define if batch optimization is enabled
 #define BATCH_OPTIMIZATION 1
 

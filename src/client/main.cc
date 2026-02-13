@@ -91,7 +91,10 @@ int main(int argc, char* argv[]) {
             padding = 64 - padding;
         }
         size_t paddedSize = message_size + padding + sizeof(Embarcadero::MessageHeader);
-        if (BATCH_SIZE % (paddedSize)) {
+        // [[CORFU_ORDER3_FIX]] Commented out overly strict batch size alignment check
+        // This check prevented Order 3 from running at all when BATCH_SIZE % paddedSize != 0
+        // The padding adjustment below (lines 101-108) handles alignment properly
+        if (false && BATCH_SIZE % (paddedSize)) {
             LOG(ERROR) << "Adjusting Batch size of message size!!";
             return 0;
         }

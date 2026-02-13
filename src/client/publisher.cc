@@ -5,10 +5,13 @@
 #include <cstring>
 #include <random>
 #include <algorithm>
-#include <fstream>
 #include <chrono>
-#include <thread>
+#include <cmath>
 #include <cstdlib>  // For getenv, atoi
+#include <fstream>
+#include <iomanip>
+#include <numeric>
+#include <thread>
 
 // No-op stubs for profile API (used by buffer.cc and other callers).
 void RecordPublisherProfile(PublisherPipelineComponent /*c*/, uint64_t /*ns*/) {}
@@ -48,7 +51,9 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 	sent_bytes_per_broker_(NUM_MAX_BROKERS),
 	sent_messages_per_broker_(NUM_MAX_BROKERS),
 	start_time_(std::chrono::steady_clock::now()),  // Initialize immediately; declaration order before acked_messages_per_broker_
-	acked_messages_per_broker_(NUM_MAX_BROKERS){
+	acked_messages_per_broker_(NUM_MAX_BROKERS),
+	send_records_per_broker_(NUM_MAX_BROKERS),
+	send_records_mutexes_(NUM_MAX_BROKERS){
 
 		// Copy topic name
 		memcpy(topic_, topic, TOPIC_NAME_SIZE);
@@ -106,6 +111,107 @@ Publisher::~Publisher() {
 	}
 
 	VLOG(3) << "Publisher destructor return";
+}
+
+void Publisher::RecordPublishSend(int broker_id, size_t end_count) {
+	if (!record_results_ || ack_level_ < 1 || end_count == 0) {
+		return;
+	}
+	BatchSendRecord record{end_count, std::chrono::steady_clock::now()};
+	{
+		std::lock_guard<std::mutex> lock(send_records_mutexes_[broker_id]);
+		send_records_per_broker_[broker_id].push_back(record);
+	}
+}
+
+void Publisher::ProcessPublishAckLatency(int broker_id, size_t acked_msg) {
+	if (!record_results_ || ack_level_ < 1) {
+		return;
+	}
+	std::vector<long long> local_latencies;
+	const auto now = std::chrono::steady_clock::now();
+	{
+		std::lock_guard<std::mutex> lock(send_records_mutexes_[broker_id]);
+		auto& records = send_records_per_broker_[broker_id];
+		// Multiple PublishThreads can push to the same broker, so records are not
+		// necessarily ordered by end_count. Remove all records with end_count <= acked_msg.
+		std::deque<BatchSendRecord> remaining;
+		for (auto& record : records) {
+			if (record.end_count <= acked_msg) {
+				auto latency = std::chrono::duration_cast<std::chrono::microseconds>(now - record.sent_time).count();
+				local_latencies.push_back(latency);
+			} else {
+				remaining.push_back(std::move(record));
+			}
+		}
+		records = std::move(remaining);
+	}
+	if (!local_latencies.empty()) {
+		std::lock_guard<std::mutex> lock(publish_latency_mutex_);
+		publish_latencies_us_.insert(publish_latencies_us_.end(), local_latencies.begin(), local_latencies.end());
+	}
+}
+
+void Publisher::WritePublishLatencyResults() {
+	if (!record_results_ || ack_level_ < 1) {
+		return;
+	}
+	std::vector<long long> latencies_copy;
+	{
+		std::lock_guard<std::mutex> lock(publish_latency_mutex_);
+		latencies_copy = publish_latencies_us_;
+	}
+	if (latencies_copy.empty()) {
+		LOG(WARNING) << "No publish latency values could be calculated.";
+		return;
+	}
+
+	std::sort(latencies_copy.begin(), latencies_copy.end());
+	const size_t count = latencies_copy.size();
+	const long double sum = std::accumulate(latencies_copy.begin(), latencies_copy.end(), 0.0L);
+	const long long min_us = latencies_copy.front();
+	const long long max_us = latencies_copy.back();
+	const long long median_us = latencies_copy[count / 2];
+	const long long p99_us = latencies_copy[static_cast<size_t>(std::floor(0.99 * count))];
+	const long long p999_us = latencies_copy[static_cast<size_t>(std::floor(0.999 * count))];
+	const long double avg_us = sum / static_cast<long double>(count);
+
+	LOG(INFO) << "Publish Latency Statistics (us):";
+	LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << avg_us;
+	LOG(INFO) << "  Min:     " << min_us;
+	LOG(INFO) << "  Median:  " << median_us;
+	LOG(INFO) << "  99th P:  " << p99_us;
+	LOG(INFO) << "  99.9th P:" << p999_us;
+	LOG(INFO) << "  Max:     " << max_us;
+
+	const std::string latency_filename = "pub_latency_stats.csv";
+	std::ofstream latency_file(latency_filename);
+	if (!latency_file.is_open()) {
+		LOG(ERROR) << "Failed to open file for writing: " << latency_filename;
+	} else {
+		latency_file << "Average,Min,Median,p99,p999,Max\n";
+		latency_file << std::fixed << std::setprecision(3) << avg_us
+			<< "," << min_us
+			<< "," << median_us
+			<< "," << p99_us
+			<< "," << p999_us
+			<< "," << max_us << "\n";
+		latency_file.close();
+	}
+
+	const std::string cdf_filename = "pub_cdf_latency_us.csv";
+	std::ofstream cdf_file(cdf_filename);
+	if (!cdf_file.is_open()) {
+		LOG(ERROR) << "Failed to open file for writing: " << cdf_filename;
+	} else {
+		cdf_file << "Latency_us,CumulativeProbability\n";
+		for (size_t i = 0; i < count; ++i) {
+			const long long current_latency = latencies_copy[i];
+			const double cumulative_probability = static_cast<double>(i + 1) / count;
+			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability << "\n";
+		}
+		cdf_file.close();
+	}
 }
 
 
@@ -445,6 +551,7 @@ bool Publisher::Poll(size_t n) {
 	// Only set publish_finished flag, don't shutdown entire system
 	// The gRPC context remains active to support subscriber cluster management
 	// Publisher data connections are already closed by joined threads
+	WritePublishLatencyResults();
 	
 	LOG(INFO) << "Publisher finished sending " << client_order_.load(std::memory_order_relaxed) << " messages, keeping cluster context alive for subscriber";
 	
@@ -871,6 +978,7 @@ process_client_fd:;
 								        << " (count=" << ack_process_count << ")";
 							}
 							
+						ProcessPublishAckLatency(broker_id, acked_msg);
 							acked_messages_per_broker_[broker_id].fetch_add(new_acked_msgs, std::memory_order_release);
 							ack_received_.fetch_add(new_acked_msgs, std::memory_order_release);
 							prev_ack_per_sock[client_sock] = acked_msg; // Update last value for this socket
@@ -1152,6 +1260,9 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				batch_header->broker_id = broker_id;
 				corfu_client_->GetTotalOrder(batch_header);
 
+			VLOG(2) << "Publisher: Got total_order=" << batch_header->total_order
+			        << " for batch with " << batch_header->num_msg << " messages";
+
 				// Update total order for each message in the batch
 				Embarcadero::MessageHeader* header = static_cast<Embarcadero::MessageHeader*>(msg);
 				size_t total_order = batch_header->total_order;
@@ -1373,7 +1484,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		has_sent_batch = true;
 		size_t total_sent = total_batches_sent_.fetch_add(1, std::memory_order_relaxed) + 1;
 		total_messages_sent_.fetch_add(batch_header->num_msg, std::memory_order_relaxed);
-		sent_messages_per_broker_[broker_id].fetch_add(batch_header->num_msg, std::memory_order_relaxed);
+		size_t prev_sent = sent_messages_per_broker_[broker_id].fetch_add(
+			batch_header->num_msg, std::memory_order_relaxed);
+		size_t end_count = prev_sent + batch_header->num_msg;
+		RecordPublishSend(broker_id, end_count);
 		sent_batches += 1;
 		sent_msgs += batch_header->num_msg;
 

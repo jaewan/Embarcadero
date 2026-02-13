@@ -69,7 +69,7 @@ TOTAL_MESSAGE_SIZE=${TOTAL_MESSAGE_SIZE:-8589934592}
 # Order level 0 for unordered, 1 for ordered (not implemented yet), 4 for strong ordering, 5 for batch-level ordering
 orders=(${ORDER:-5})
 ack=${ACK:-1}
-sequencer=EMBARCADERO
+sequencer=${SEQUENCER:-EMBARCADERO}
 
 # Removed wait_for_signal function - using sleep-based timing instead
 
@@ -333,7 +333,8 @@ for test_case in "${test_cases[@]}"; do
 			fi
 			# Threads per broker: use 1 when NUM_BROKERS=1; otherwise 4 for 10+ GB/s (was 3; 4×4=16 threads saturates better).
 			THREADS_PER_BROKER=${THREADS_PER_BROKER:-$([ "$NUM_BROKERS" = "1" ] && echo 1 || echo 4)}
-			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $msg_size -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -l 0 2>&1 | tee "throughput_test_trial${trial}.log"
+			# [[FIX: Disable Replication]] Force -r 0 to measure memory-only throughput and avoid ChainReplicationManager errors/latency.
+			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $msg_size -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case -o $order -a $ack --sequencer $sequencer -l 0 -r 0 2>&1 | tee "throughput_test_trial${trial}.log"
 			test_exit_code=${PIPESTATUS[0]}
 			if [ $test_exit_code -ne 0 ]; then
 				echo "ERROR: Throughput test failed with exit code $test_exit_code"

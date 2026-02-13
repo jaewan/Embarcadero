@@ -80,11 +80,16 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 		tinode->offsets[broker_id_].replication_done[i] = 0;
 	}
 
-	// Calculate log offset using pointer difference plus CACHELINE_SIZE
+	// Calculate log offset using pointer difference plus alignment for O_DIRECT
 	const uintptr_t segment_addr = reinterpret_cast<uintptr_t>(segment_metadata);
 	const uintptr_t cxl_base_addr = reinterpret_cast<uintptr_t>(cxl_addr);
+	// [[FIX: O_DIRECT Alignment]] Align log start to 4KB.
+	// Segment header is at segment_addr; skip it and align.
+	// Assuming SegmentHeader fits in 4KB (it's small).
+	size_t start_offset = CACHELINE_SIZE;
+	size_t aligned_start = (start_offset + 4095) & ~4095;
 	tinode->offsets[broker_id_].log_offset = 
-		static_cast<size_t>(segment_addr + CACHELINE_SIZE - cxl_base_addr);
+		static_cast<size_t>(segment_addr + aligned_start - cxl_base_addr);
 
 	// Calculate batch headers offset using pointer difference
 	const uintptr_t batch_headers_addr = reinterpret_cast<uintptr_t>(batch_headers_region);
@@ -230,6 +235,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		bool replicate_tinode,
 		int ack_level,
 		SequencerType seq_type) {
+
+	LOG(INFO) << "CreateNewTopicInternal: topic=" << topic << " order=" << order 
+	          << " replication_factor=" << replication_factor << " ack_level=" << ack_level;
 
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	struct TInode* replica_tinode = nullptr;

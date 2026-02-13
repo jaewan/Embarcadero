@@ -980,9 +980,12 @@ void NetworkManager::HandlePublishRequest(
 		int sleep_ms = 1;  // Start at 1 ms
 		auto post_recv_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 		while (!batch_header_location && !stop_threads_) {
+			// [[FIX: Force Epoch Refresh]] Pass false for epoch_already_checked to force ReservePBRSlotAfterRecv
+			// to refresh the epoch from CXL. This ensures that if recv() blocked for a long time,
+			// we don't stamp the batch with a stale epoch that gets dropped by the sequencer.
 			bool ok = topic_ptr
 				? cxl_manager_->ReservePBRSlotAfterRecv(topic_ptr, batch_header, buf,
-						segment_header, logical_offset, batch_header_location, epoch_checked_this_batch)
+						segment_header, logical_offset, batch_header_location, false)
 				: cxl_manager_->ReservePBRSlotAfterRecv(handshake.topic, batch_header, buf,
 						segment_header, logical_offset, batch_header_location);
 			if (ok) {
@@ -1107,6 +1110,8 @@ void NetworkManager::HandlePublishRequest(
 		// complete BatchHeader to the PBR slot once. Slot was zeroed in GetCXLBuffer.
 		// [[PERF: Batch flush pattern]] Write both cachelines, then single fence for both.
 		batch_header.flags = kBatchHeaderFlagValid;
+	// [[CORFU_ORDER3]] Skip batch_header_location operations if nullptr (Order 3 doesn't use it)
+	if (batch_header_location != nullptr) {
 		memcpy(batch_header_location, &batch_header, sizeof(BatchHeader));
 
 		// [[CRITICAL FIX: batch_complete for DelegationThread]] Set batch_complete=1 so DelegationThread
@@ -1120,6 +1125,7 @@ void NetworkManager::HandlePublishRequest(
 		CXL::flush_cacheline(batch_header_next_line);
 		// [[PERF: Amortized fence]] Single fence after both flushes (vs fence after each flush)
 		CXL::store_fence();
+	}
 
 		// [[ORDER_0_ACK_RACE_FIX]] Track the highest logical offset where batch_complete=1 was set.
 		// Used on connection close to advance written without waiting for DelegationThread.
@@ -1573,6 +1579,20 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		CXL::full_fence();  // CXL visibility: MFENCE orders CLFLUSHOPT completion before read
 
 		uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
+		// [ACK_DIAG] Log what we return to publisher (throttled: every ~2s per broker)
+		{
+			static thread_local std::atomic<uint64_t> ack_diag_count{0};
+			static thread_local std::chrono::steady_clock::time_point ack_diag_last{};
+			uint64_t n = ack_diag_count.fetch_add(1, std::memory_order_relaxed);
+			auto now = std::chrono::steady_clock::now();
+			if (n == 0 || std::chrono::duration_cast<std::chrono::seconds>(now - ack_diag_last).count() >= 2) {
+				ack_diag_last = now;
+				LOG(INFO) << "[ACK_DIAG] GetOffsetToAck broker_id=" << broker_id_
+					<< " topic=" << (topic ? topic : "")
+					<< " completed_logical_offset=" << completed_logical_offset
+					<< " (return=" << (completed_logical_offset == 0 ? "0_or_-1" : "offset") << ")";
+			}
+		}
 		if (completed_logical_offset == 0) {
 			uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
 			if (completed_pbr_index == static_cast<uint64_t>(-1)) {

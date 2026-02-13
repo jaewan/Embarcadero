@@ -143,6 +143,7 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 	// Create publisher
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
 		num_threads_per_broker, message_size, q_size, order);
+	p.SetRecordResults(result.count("record_results") > 0);
 
 	try {
 		p.RecordStartTime(); // For failure event timestamp across threads
@@ -238,6 +239,9 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 	// Create publisher
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
 		num_threads_per_broker, message_size, q_size, order, seq_type);
+		p.SetRecordResults(result.count("record_results") > 0);
+		p.SetRecordResults(result.count("record_results") > 0);
+	p.SetRecordResults(result.count("record_results") > 0);
 
 	try {
 		// Initialize publisher

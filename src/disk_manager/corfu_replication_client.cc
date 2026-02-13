@@ -12,6 +12,10 @@ namespace Corfu {
 CorfuReplicationClient::CorfuReplicationClient(const char* topic, size_t replication_factor, const std::string& server_address)
 	: topic_(topic), replication_factor_(replication_factor), server_address_(server_address) {
 
+		LOG(INFO) << "CORFU Replication Client: topic=" << topic
+		          << ", replication_factor=" << replication_factor
+		          << ", server=" << server_address;
+
 		// Initialize sequential replication guarantee
 		last_sequentially_replicated_.store(0);
 
@@ -28,6 +32,7 @@ CorfuReplicationClient::CorfuReplicationClient(const char* topic, size_t replica
 		}
 	}
 
+
 CorfuReplicationClient::~CorfuReplicationClient() {
 	// No need to explicitly clean up channel or stub
 	// They will be released by their respective smart pointers
@@ -39,6 +44,7 @@ bool CorfuReplicationClient::Connect(int timeout_seconds) {
 		return true;
 	}
 
+
 	// Acquire lock for connection attempt
 	std::lock_guard<std::mutex> lock(mutex_);
 
@@ -47,10 +53,12 @@ bool CorfuReplicationClient::Connect(int timeout_seconds) {
 		return true;
 	}
 
+
 	// Check if we need to recreate the channel
 	if (!channel_ || !stub_) {
 		CreateChannelLocked();
 	}
+
 
 	// Wait for the channel to connect
 	auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(timeout_seconds);
@@ -61,6 +69,7 @@ bool CorfuReplicationClient::Connect(int timeout_seconds) {
 	} else {
 		LOG(ERROR) << "Failed to connect to server at " << server_address_ << " within timeout";
 	}
+
 
 	return connected;
 }
@@ -73,6 +82,7 @@ bool CorfuReplicationClient::ReplicateData(size_t offset, size_t size, void* dat
 			return false;
 		}
 	}
+
 
 	// Create request - no shared state accessed here
 	corfureplication::CorfuReplicationRequest request;
@@ -96,10 +106,12 @@ bool CorfuReplicationClient::ReplicateData(size_t offset, size_t size, void* dat
 		local_stub = corfureplication::CorfuReplicationService::NewStub(channel_);
 	}
 
+
 	// Retry loop
 	for (int retry = 0; retry <= max_retries; retry++) {
 		if (retry > 0) {
-			LOG(INFO) << "Retry attempt " << retry << " for request ID: " << offset;
+			LOG(WARNING) << "CORFU replication failed (attempt " << retry << "/" << max_retries
+			             << ") for offset " << offset << ", retrying...";
 
 			// Calculate backoff with jitter - thread-safe
 			int sleep_ms = CalculateBackoffMs(retry);
@@ -145,6 +157,7 @@ bool CorfuReplicationClient::ReplicateData(size_t offset, size_t size, void* dat
 		}
 	}
 
+
 	while (true) {
 		size_t expected = offset;
 		if (last_sequentially_replicated_.compare_exchange_weak(expected, offset + size)) {
@@ -152,6 +165,7 @@ bool CorfuReplicationClient::ReplicateData(size_t offset, size_t size, void* dat
 		}
 		std::this_thread::yield();
 	}
+
 
 	return success;
 }
@@ -170,6 +184,7 @@ bool CorfuReplicationClient::Reconnect(int timeout_seconds) {
 		// By the time we get the lock, reconnection should be complete
 		return is_connected_.load(std::memory_order_acquire);
 	}
+
 
 	// We are responsible for reconnection
 	{
@@ -191,6 +206,7 @@ bool CorfuReplicationClient::Reconnect(int timeout_seconds) {
 
 		return connected;
 	}
+
 }
 
 void CorfuReplicationClient::CreateChannelLocked() {
@@ -204,6 +220,7 @@ bool CorfuReplicationClient::EnsureConnected() {
 	if (!is_connected_.load(std::memory_order_relaxed)) {
 		return Connect();
 	}
+
 	return true;
 }
 
@@ -222,6 +239,7 @@ int CorfuReplicationClient::CalculateBackoffMs(int retry_attempt) {
 		std::uniform_int_distribution<int> dist(0, delay / 5);
 		jitter = dist(random_engine_);
 	}
+
 
 	return delay + jitter;
 }

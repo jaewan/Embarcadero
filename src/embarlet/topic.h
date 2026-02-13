@@ -445,6 +445,16 @@ class Topic {
 				BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
 
+	// CORFU Order 3 implementation (external sequencer, no DelegationThread)
+	std::function<void(void*, size_t)> CorfuOrder3GetCXLBuffer(
+			BatchHeader& batch_header,
+			const char topic[TOPIC_NAME_SIZE],
+			void*& log,
+			void*& segment_header,
+			size_t& logical_offset,
+			BatchHeader*& batch_header_location,
+			bool epoch_already_checked = false);
+
 		std::function<void(void*, size_t)> Order4GetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
@@ -603,6 +613,7 @@ class Topic {
 		static constexpr unsigned kEpochUs = 500;
 		std::atomic<uint64_t> epoch_index_{0};
 		std::atomic<uint64_t> last_sequenced_epoch_{0};
+		std::atomic<bool> epoch_driver_done_{false}; // [[SHUTDOWN_SYNC]] Signals EpochDriverThread has finished sealing
 	// Epoch buffers for safe collection/sequencing (no concurrent merge/write).
 	EpochBuffer5 epoch_buffers_[3];
 		std::thread epoch_driver_thread_;

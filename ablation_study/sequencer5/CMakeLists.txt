@@ -22,18 +22,26 @@ if(TSAN)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=thread")
 endif()
 
+# CXL memory: enable CLWB for GOI/committed_seq writeback (real CXL hardware). cmake -DCXL_CLWB=ON ..
+option(CXL_CLWB "Build with CXL writeback (CLWB) for real CXL memory" OFF)
+
 add_executable(sequencer5_benchmark sequencer5_benchmark.cc)
 if(ASAN OR TSAN)
   target_compile_options(sequencer5_benchmark PRIVATE -Wall -O1 -g)
 else()
-  target_compile_options(sequencer5_benchmark PRIVATE -Wall -O3)
+  target_compile_options(sequencer5_benchmark PRIVATE -Wall -O3 -msse4.2)
+endif()
+if(CXL_CLWB)
+  target_compile_definitions(sequencer5_benchmark PRIVATE EMBARCADERO_CXL_CLWB=1)
+  target_compile_options(sequencer5_benchmark PRIVATE -mclwb)
 endif()
 target_link_libraries(sequencer5_benchmark PRIVATE pthread)
 
-# Optional: link libnuma on Linux for NUMA-aware allocation fallback
+# Real CXL: NUMA node 2 (coreless CXL) via shm_open + mbind (from src/cxl_manager allocate_shm logic)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_library(NUMA_LIB numa)
   if(NUMA_LIB)
     target_link_libraries(sequencer5_benchmark PRIVATE ${NUMA_LIB})
+    target_compile_definitions(sequencer5_benchmark PRIVATE HAVE_LIBNUMA=1)
   endif()
 endif()

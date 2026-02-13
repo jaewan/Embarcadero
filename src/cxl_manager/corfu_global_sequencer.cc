@@ -36,13 +36,16 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 			size_t total_size = request->total_size();
 			int broker_id = request->broker_id();
 
+			// [[CORFU_FIX]] Use composite key (client_id, broker_id) since each broker has independent batch_seq
+			uint64_t client_broker_key = (static_cast<uint64_t>(client_id) << 32) | static_cast<uint64_t>(broker_id);
+
 			{
 				std::unique_lock<std::mutex> lock(mutex_);
 
 				// Initialize client's batch sequence if this is the first request
-				if (batch_seq_per_clients_.find(client_id) == batch_seq_per_clients_.end()) {
-					batch_seq_per_clients_[client_id] = 0;  // Always start from 0
-					pending_requests_[client_id] = PriorityQueue();
+				if (batch_seq_per_clients_.find(client_broker_key) == batch_seq_per_clients_.end()) {
+					batch_seq_per_clients_[client_broker_key] = 0;  // Always start from 0
+					pending_requests_[client_broker_key] = PriorityQueue();
 				}
 
 				// Initialize broker-specific data structures if this is the first request for this broker
@@ -52,19 +55,19 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 				}
 
 				// Check if this batch_seq has already been processed
-				if (batch_seq < batch_seq_per_clients_[client_id]) {
+				if (batch_seq < batch_seq_per_clients_[client_broker_key]) {
 					LOG(WARNING) << "Duplicate or already processed batch_seq " << batch_seq
-						<< " for client " << client_id;
+						<< " for client " << client_id << " broker " << broker_id;
 					return Status(grpc::StatusCode::INVALID_ARGUMENT, "Batch sequence already processed");
 				}
 
 				// If this is not the next expected batch sequence, queue it
-				if (batch_seq != batch_seq_per_clients_[client_id]) {
+				if (batch_seq != batch_seq_per_clients_[client_broker_key]) {
 					std::promise<std::tuple<uint64_t, uint64_t, uint64_t>> promise;
 					auto future = promise.get_future();
 
 					// Queue the request
-					pending_requests_[client_id].push(std::make_unique<PendingRequest>(PendingRequest{
+					pending_requests_[client_broker_key].push(std::make_unique<PendingRequest>(PendingRequest{
 								batch_seq, std::move(promise), num_msg, broker_id, total_size}));
 
 					// Release the lock while waiting
@@ -92,11 +95,11 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 
 				next_order_ += num_msg;
 				idx_per_broker_[broker_id] += total_size;
-				batch_seq_per_clients_[client_id]++;
+				batch_seq_per_clients_[client_broker_key]++;
 				batch_seq_per_broker_[broker_id]++;
 
 				// Process any pending requests that are now ready
-				ProcessPendingRequests(client_id);
+				ProcessPendingRequests(client_id, broker_id, client_broker_key);
 			}
 
 			return Status::OK;
@@ -129,11 +132,11 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 					std::vector<std::unique_ptr<PendingRequest>>,
 					ComparePendingRequestPtr>;
 
-		void ProcessPendingRequests(size_t client_id) {
-			auto& queue = pending_requests_[client_id];
+		void ProcessPendingRequests(size_t client_id, int broker_id, uint64_t client_broker_key) {
+			auto& queue = pending_requests_[client_broker_key];
 
 			while (!queue.empty() &&
-					queue.top()->batch_seq == batch_seq_per_clients_[client_id]) {
+					queue.top()->batch_seq == batch_seq_per_clients_[client_broker_key]) {
 				// Access the top request
 				std::unique_ptr<PendingRequest> pending = std::move(const_cast<std::unique_ptr<PendingRequest>&>(queue.top()));
 				queue.pop();
@@ -142,7 +145,7 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 				uint64_t broker_batch_seq = batch_seq_per_broker_[pending->broker_id];
 
 				// Fulfill the promise for the request with total_order, log_idx, and broker_batch_seq
-				pending->promise.set_value(std::make_tuple(next_order_, 
+				pending->promise.set_value(std::make_tuple(next_order_,
 							idx_per_broker_[pending->broker_id],
 							broker_batch_seq));
 
@@ -154,7 +157,7 @@ class CorfuSequencerImpl final : public CorfuSequencer::Service {
 				batch_seq_per_broker_[pending->broker_id]++;
 
 				// Increment the client's batch sequence
-				batch_seq_per_clients_[client_id]++;
+				batch_seq_per_clients_[client_broker_key]++;
 			}
 		}
 

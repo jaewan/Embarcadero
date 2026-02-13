@@ -1,7 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <vector>
 #include "absl/container/flat_hash_set.h"
 #include "common.h"
 #include "queue_buffer.h"
@@ -37,6 +41,12 @@ class Publisher {
 		 * @param ack_level Acknowledgement level
 		 */
 		void Init(int ack_level);
+
+		/**
+		 * Enables recording publish latency outputs when record_results is set.
+		 * @param record_results true to collect publish latency samples and write CSVs
+		 */
+		void SetRecordResults(bool record_results) { record_results_ = record_results; }
 
 		/**
 		 * Publishes a message
@@ -212,6 +222,24 @@ class Publisher {
 
 		// When true, PublishThread updates total_batches_attempted_ (for ACK timeout log). Set from EMBARCADERO_ACK_TIMEOUT_DEBUG in Init().
 		bool enable_batch_attempted_for_timeout_log_{false};
+
+		struct BatchSendRecord {
+			size_t end_count;
+			std::chrono::steady_clock::time_point sent_time;
+		};
+
+		// [[threading: PublishThread writes, EpollAckThread reads]] Protected by per-broker mutex.
+		std::vector<std::deque<BatchSendRecord>> send_records_per_broker_;
+		std::vector<std::mutex> send_records_mutexes_;
+
+		// [[threading: EpollAckThread writes, Poll reads]] Protected by publish_latency_mutex_.
+		std::vector<long long> publish_latencies_us_;
+		std::mutex publish_latency_mutex_;
+		bool record_results_{false};
+
+		void RecordPublishSend(int broker_id, size_t end_count);
+		void ProcessPublishAckLatency(int broker_id, size_t acked_msg);
+		void WritePublishLatencyResults();
 
 		/**
 		 * Thread for handling acknowledgements using epoll

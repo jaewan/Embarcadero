@@ -1,10 +1,12 @@
 #!/bin/bash
+set -euo pipefail
 
 pushd ../build/bin/
 
 NUM_BROKERS=4
 test_case=2
 msg_size=1024
+ack_level=1
 REMOTE_IP="192.168.60.173"
 REMOTE_USER="domin"
 PASSLESS_ENTRY="~/.ssh/id_rsa"
@@ -111,9 +113,9 @@ for mode in "${modes[@]}"; do
 
 	# Run throughput test with or without --steady_rate based on mode
 	if [[ "$mode" == "steady" ]]; then
-	  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order --sequencer $sequencer -r 1 --steady_rate"
+	  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack_level --sequencer $sequencer -r 1 --steady_rate"
 	else
-	  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order --sequencer $sequencer -r 1"
+	  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack_level --sequencer $sequencer -r 1"
 	fi
 
 	# Wait for all processes to finish
@@ -132,8 +134,18 @@ for mode in "${modes[@]}"; do
 	sleep 3
 
 	# Move results to appropriate directory
-	mv cdf_latency_us.csv ../../data/latency/$mode/${sequencer}_latency.csv
-	mv latency_stats.csv ../../data/latency/$mode/${sequencer}_latency_stats.csv
+	if [[ -f cdf_latency_us.csv ]]; then
+	  mv cdf_latency_us.csv ../../data/latency/$mode/${sequencer}_latency.csv
+	fi
+	if [[ -f latency_stats.csv ]]; then
+	  mv latency_stats.csv ../../data/latency/$mode/${sequencer}_latency_stats.csv
+	fi
+	if [[ -f pub_cdf_latency_us.csv ]]; then
+	  mv pub_cdf_latency_us.csv ../../data/latency/$mode/${sequencer}_pub_latency.csv
+	fi
+	if [[ -f pub_latency_stats.csv ]]; then
+	  mv pub_latency_stats.csv ../../data/latency/$mode/${sequencer}_pub_latency_stats.csv
+	fi
 
     rm -f script_signal_pipe
     echo "Finished configuration: $config in $mode mode"

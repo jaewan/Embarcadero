@@ -416,6 +416,8 @@ Acknowledgments are independent of order level. The client negotiates **ack_leve
 
 **Implementation note:** The broker's AckThread (or equivalent) polls the appropriate source (written, ordered, or CV) and sends the cumulative offset on the ACK connection. Order level and ack_level are independent: e.g. Order 0 + ack_level=1 uses written; Order 2 + ack_level=1 uses ordered; any order + ack_level=2 uses CV.
 
+**Publish latency measurement:** To measure publish latency (client send -> ACK), record the timestamp when a batch is fully sent on the client and compute the delta when the cumulative ACK for that broker advances past that batch. Because ACKs are cumulative per broker, the client should correlate ACK values with per-broker message counts (e.g., batch end_count) to attribute a send time to the ACK. This requires ack_level >= 1.
+
 ### 2.3.2 Known Limitation: Hold Buffer Volatility (Order 5)
 
 When a batch enters the hold buffer (gap detected), its PBR slot is freed (consumed_through advanced) so the ring doesn't deadlock. The batch metadata is held in sequencer RAM. If the sequencer crashes during the hold window (≤1.5 ms default, configurable via hold_timeout_epochs × epoch_us), held batches are lost:

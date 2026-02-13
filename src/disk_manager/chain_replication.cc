@@ -85,10 +85,13 @@ void ChainReplicationManager::ReplicationThread() {
         size_t payload_size = entry->payload_size;
 
         // Write to local disk
-        ssize_t written = pwrite(disk_fd_, payload, payload_size, disk_offset);
-        if (written != static_cast<ssize_t>(payload_size)) {
+        // [[FIX: O_DIRECT Alignment]] Write aligned size to match allocation padding and satisfy O_DIRECT.
+        // We write the payload + padding (garbage) to keep disk_offset aligned.
+        size_t write_size = (payload_size + 4095) & ~4095;
+        ssize_t written = pwrite(disk_fd_, payload, write_size, disk_offset);
+        if (written != static_cast<ssize_t>(write_size)) {
             LOG(ERROR) << "ChainReplicationManager: pwrite failed, wrote " << written
-                       << " expected " << payload_size << " errno=" << errno;
+                       << " expected " << write_size << " errno=" << errno;
             continue;  // Retry same entry
         }
 
@@ -97,9 +100,9 @@ void ChainReplicationManager::ReplicationThread() {
 
         VLOG(3) << "ChainReplicationManager: Replica " << replica_id_
                 << " copied GOI[" << goi_index << "] broker=" << entry->broker_id
-                << " size=" << payload_size << " to disk_offset=" << disk_offset;
+                << " size=" << payload_size << " (aligned=" << write_size << ") to disk_offset=" << disk_offset;
 
-        disk_offset += payload_size;
+        disk_offset += write_size;
 
         // [[PHASE_2_CHAIN_PROTOCOL]] Step 2: Token-passing via num_replicated
         // Wait for my turn (previous replica must increment first)
