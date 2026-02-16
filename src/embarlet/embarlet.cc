@@ -134,7 +134,7 @@ void SignalScriptReady() {
 }
 
 // [[GRACEFUL_SHUTDOWN]] Set by SIGTERM/SIGINT so main can request shutdown and let destructors run
-// (Topic/NetworkManager set stop_threads_ in destructors → EpochSequencerThread2 drain runs).
+// (Topic/NetworkManager set stop_threads_ in destructors → EpochSequencerThread drain runs).
 static volatile std::sig_atomic_t g_shutdown_requested = 0;
 
 static void ShutdownSignalHandler(int signum) {
@@ -329,7 +329,7 @@ int main(int argc, char* argv[]) {
 
 	// *************** Wait until shutdown requested (SIGTERM/SIGINT) **********************
 	// Run Wait() in a thread so we can poll g_shutdown_requested and call RequestShutdown(),
-	// allowing destructors to run (stop_threads_ set → EpochSequencerThread2 drain, etc.).
+	// allowing destructors to run (stop_threads_ set → EpochSequencerThread drain, etc.).
 	std::thread wait_thread([&heartbeat_manager]() { heartbeat_manager.Wait(); });
 		while (g_shutdown_requested == 0) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));

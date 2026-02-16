@@ -587,8 +587,7 @@ class Topic {
 		void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers);
 		void Sequencer4();
 		void Sequencer5();  // Batch-level sequencer (Phase 1b: epoch pipeline + Level 5 hold buffer)
-		void Sequencer2();  // Order 2: Total order, no per-client state; uses same epoch pipeline, EpochSequencerThread2
-		void EpochSequencerThread2(); // Order 2: Same pipeline as EpochSequencerThread but no Level 5 partition; all batches → ready
+		void Sequencer2();  // Order 2: Total order, no per-client state;
 		void BrokerScannerWorker(int broker_id);
 		void BrokerScannerWorker5(int broker_id);  // Batch-level scanner (Phase 1b: pushes to epoch buffer)
 		void EpochDriverThread();   // [[PHASE_1B]] Advances epoch_index_ every kEpochUs

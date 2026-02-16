@@ -328,7 +328,7 @@ for test_case in "${test_cases[@]}"; do
 				overall_status=1
 				# Still clean up brokers even if test failed
 			fi
-			# Test completed - graceful shutdown so brokers can drain (EpochSequencerThread2, etc.)
+			# Test completed - graceful shutdown so brokers can drain (EpochSequencerThread, etc.)
 			echo "Test completed, sending SIGTERM to broker processes for graceful shutdown..."
 			for pid in "${pids[@]}"; do
 				kill -TERM "$pid" 2>/dev/null || true
