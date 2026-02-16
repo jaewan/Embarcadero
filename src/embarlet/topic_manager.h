@@ -62,8 +62,11 @@ class TopicManager {
 		 * Destructor
 		 */
 		~TopicManager() {
+			Shutdown();
 			VLOG(3) << "\t[TopicManager]\tDestructed";
 		}
+		/** Idempotent explicit shutdown hook used by broker main to control stop order. */
+		void Shutdown();
 
 		/**
 		 * Create a new topic with specified parameters
@@ -119,6 +122,7 @@ class TopicManager {
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location);
 		bool ReservePBRSlotAfterRecv(const char* topic, BatchHeader& batch_header, void* log,
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location);
+		bool PublishPBRSlotAfterRecv(const char* topic, const BatchHeader& batch_header, BatchHeader* batch_header_location);
 		// [[PERF]] Topic* overloads to avoid repeated topics_mutex_ lookup (use with cached Topic* from GetTopic)
 		bool IsPBRAboveHighWatermark(Topic* topic_ptr, int high_pct);
 		bool ReserveBLogSpace(Topic* topic_ptr, size_t size, void*& log, bool epoch_already_checked = false);
@@ -128,6 +132,7 @@ class TopicManager {
 		bool ReservePBRSlotAfterRecv(Topic* topic_ptr, BatchHeader& batch_header, void* log,
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
+		bool PublishPBRSlotAfterRecv(Topic* topic_ptr, const BatchHeader& batch_header, BatchHeader* batch_header_location);
 
 		bool GetBatchToExport(
 				const char* topic,
@@ -241,6 +246,8 @@ class TopicManager {
 		size_t num_topics_;
 		GetNumBrokersCallback get_num_brokers_callback_;
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
+		std::atomic<bool> shutting_down_{false};
+		std::atomic<bool> shutdown_done_{false};
 }; // TopicManager
 
 } // End of namespace Embarcadero

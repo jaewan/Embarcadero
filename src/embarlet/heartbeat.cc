@@ -5,6 +5,20 @@
 
 namespace heartbeat_system {
 
+static std::string MaybeForceGrpcIPv4Address(const std::string& address) {
+	const char* env = std::getenv("EMBAR_FORCE_GRPC_IPV4");
+	// Default on: avoids IPv6 socket creation path that can fail with EPERM in restricted envs.
+	const bool force_ipv4 = !env || std::strcmp(env, "0") != 0;
+	if (!force_ipv4) return address;
+	if (address.rfind("ipv4:", 0) == 0 ||
+	    address.rfind("ipv6:", 0) == 0 ||
+	    address.rfind("dns:", 0) == 0 ||
+	    address.rfind("unix:", 0) == 0) {
+		return address;
+	}
+	return "ipv4:" + address;
+}
+
 //
 // HeartBeatServiceImpl implementation
 //
@@ -700,22 +714,25 @@ void FollowerNodeClient::ProcessClusterInfo(const HeartbeatResponse& reply) {
 
 HeartBeatManager::HeartBeatManager(bool is_head_node, std::string head_address, bool is_sequencer_node)
 	: is_head_node_(is_head_node) {
+		const std::string grpc_head_address = MaybeForceGrpcIPv4Address(head_address);
 
-		if (is_head_node) {
-			// [[SEQUENCER_ONLY_HEAD_NODE]] Pass is_sequencer_node to service
-			service_ = std::make_unique<HeartBeatServiceImpl>(GetAddress(), is_sequencer_node);
+	if (is_head_node) {
+		// [[SEQUENCER_ONLY_HEAD_NODE]] Pass is_sequencer_node to service
+		service_ = std::make_unique<HeartBeatServiceImpl>(GetAddress(), is_sequencer_node);
 
-			grpc::ServerBuilder builder;
-			builder.AddListeningPort(head_address, grpc::InsecureServerCredentials());
-			builder.RegisterService(service_.get());
-			server_ = builder.BuildAndStart();
+		grpc::ServerBuilder builder;
+		// Keep server bind address in canonical host:port form.
+		// gRPC AddListeningPort does not consistently accept resolver prefixes (e.g. "ipv4:").
+		builder.AddListeningPort(head_address, grpc::InsecureServerCredentials());
+		builder.RegisterService(service_.get());
+		server_ = builder.BuildAndStart();
 
 			service_->SetServer(server_);
 		} else {
 			follower_ = std::make_unique<FollowerNodeClient>(
 					GetPID(),
 					GetAddress(),
-					grpc::CreateChannel(head_address, grpc::InsecureChannelCredentials())
+					grpc::CreateChannel(grpc_head_address, grpc::InsecureChannelCredentials())
 					);
 		}
 	}

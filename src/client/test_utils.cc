@@ -236,43 +236,76 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 	// Calculate optimal queue size based on configuration
 	size_t q_size = CalculateOptimalQueueSize(num_threads_per_broker, total_message_size, message_size);
 
-	// Create publisher
-	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
-		num_threads_per_broker, message_size, q_size, order, seq_type);
+		// Create publisher
+		Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
+			num_threads_per_broker, message_size, q_size, order, seq_type);
 		p.SetRecordResults(result.count("record_results") > 0);
-		p.SetRecordResults(result.count("record_results") > 0);
-	p.SetRecordResults(result.count("record_results") > 0);
 
-	try {
-		// Initialize publisher
-		p.Init(ack_level);
-		// Warmup buffers to eliminate page-fault variance (same as other throughput tests).
-		p.WarmupBuffers();
+		try {
+			// Initialize publisher
+			p.Init(ack_level);
+			// [TRIAGE] Explicit phase logs to pinpoint post-init hangs.
+			LOG(INFO) << "[PublishPhase] init_complete";
+			// Warmup buffers to eliminate page-fault variance (same as other throughput tests).
+			auto warmup_start = std::chrono::steady_clock::now();
+			LOG(INFO) << "[PublishPhase] warmup_start";
+			p.WarmupBuffers();
+			auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - warmup_start).count();
+			LOG(INFO) << "[PublishPhase] warmup_done duration_ms=" << warmup_ms;
 
-		// Synchronize with other clients
-		synchronizer.fetch_sub(1);
+			// Synchronize with other clients
+			int prev = synchronizer.fetch_sub(1, std::memory_order_acq_rel);
+			LOG(INFO) << "[PublishPhase] sync_decrement prev=" << prev
+			          << " now=" << synchronizer.load(std::memory_order_acquire);
+			const char* sync_timeout_env = std::getenv("EMBAR_PUBLISH_SYNC_TIMEOUT_SEC");
+			int sync_timeout_sec = sync_timeout_env ? std::atoi(sync_timeout_env) : 30;
+			auto sync_start = std::chrono::steady_clock::now();
+			auto last_sync_log = sync_start;
 
-		while (synchronizer.load() != 0) {
-			std::this_thread::yield();
-		}
+			while (synchronizer.load(std::memory_order_acquire) != 0) {
+				auto now = std::chrono::steady_clock::now();
+				auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(now - sync_start).count();
+				if (now - last_sync_log >= std::chrono::seconds(2)) {
+					LOG(WARNING) << "[PublishPhase] sync_wait remaining="
+					             << synchronizer.load(std::memory_order_relaxed)
+					             << " elapsed_sec=" << elapsed_sec;
+					last_sync_log = now;
+				}
+				if (sync_timeout_sec > 0 && elapsed_sec >= sync_timeout_sec) {
+					LOG(ERROR) << "[PublishPhase] sync_wait_timeout after " << sync_timeout_sec
+					           << "s remaining=" << synchronizer.load(std::memory_order_relaxed);
+					delete[] message;
+					return 0.0;
+				}
+				std::this_thread::yield();
+			}
+			LOG(INFO) << "[PublishPhase] sync_complete";
 
-		VLOG(5) << "All clients ready, starting publish test";
+			VLOG(5) << "All clients ready, starting publish test";
+			LOG(INFO) << "[PublishPhase] publish_loop_start total_messages=" << n;
 
-		// Start timing
-		auto start = std::chrono::high_resolution_clock::now();
+			// Start timing
+			auto start = std::chrono::high_resolution_clock::now();
 
-		// Publish messages
-		for (size_t i = 0; i < n; i++) {
-			p.Publish(message, message_size);
-		}
+			// Publish messages
+			for (size_t i = 0; i < n; i++) {
+				p.Publish(message, message_size);
+				if (i == 0) {
+					LOG(INFO) << "[PublishPhase] first_publish_enqueued";
+				}
+			}
+			LOG(INFO) << "[PublishPhase] publish_loop_done";
 
-		// Finalize publishing
-		VLOG(5) << "Finished publishing from client";
-		if (!p.Poll(n)) {
-			LOG(ERROR) << "Publish test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
-			delete[] message;
-			exit(1);
-		}
+			// Finalize publishing
+			VLOG(5) << "Finished publishing from client";
+			LOG(INFO) << "[PublishPhase] poll_start target=" << n;
+			if (!p.Poll(n)) {
+				LOG(ERROR) << "Publish test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
+				delete[] message;
+				exit(1);
+			}
+			LOG(INFO) << "[PublishPhase] poll_done";
 
 		// Calculate elapsed time and bandwidth
 		auto end = std::chrono::high_resolution_clock::now();

@@ -21,28 +21,89 @@
 
 namespace Embarcadero{
 
+static std::string GetCxlShmName() {
+	const char* env = std::getenv("EMBARCADERO_CXL_SHM_NAME");
+	if (env && env[0] != '\0') {
+		return std::string(env);
+	}
+	// Use per-user shared memory object to avoid permission conflicts with stale objects
+	// created by different users.
+	return "/CXL_SHARED_FILE_" + std::to_string(static_cast<unsigned long>(getuid()));
+}
+
+static std::string GetCxlFallbackFilePath(const std::string& shm_name) {
+	std::string sanitized = shm_name;
+	for (char& c : sanitized) {
+		if (c == '/') {
+			c = '_';
+		}
+	}
+	return "/tmp/embarcadero_cxl" + sanitized;
+}
+
+static int OpenCxlBackingFd(const std::string& shm_name) {
+	int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
+	if (fd >= 0) {
+		return fd;
+	}
+
+	const int shm_errno = errno;
+	LOG(WARNING) << "shm_open failed for " << shm_name << ": " << strerror(shm_errno);
+
+	if (shm_errno == EACCES || shm_errno == EPERM) {
+		const std::string fallback_path = GetCxlFallbackFilePath(shm_name);
+		fd = open(fallback_path.c_str(), O_CREAT | O_RDWR, 0666);
+		if (fd >= 0) {
+			LOG(WARNING) << "Using file-backed CXL region at " << fallback_path;
+			return fd;
+		}
+		LOG(ERROR) << "Fallback file open also failed: " << strerror(errno);
+	}
+
+	errno = shm_errno;
+	return -1;
+}
+
 static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_size){
 	void *addr = nullptr;
-	int cxl_fd;
+	int cxl_fd = -1;
 	bool dev = false;
+	const std::string shm_name = GetCxlShmName();
 	if(cxl_type == Real){
 		if(std::filesystem::exists("/dev/dax0.0")){
-			dev = true;
-			cxl_fd = open("/dev/dax0.0", O_RDWR);
-		}else{
-			if(numa_available() == -1){
-				LOG(ERROR) << "Cannot allocate from real CXL";
-				return nullptr;
-			}else{
-				cxl_fd = shm_open("/CXL_SHARED_FILE", O_CREAT | O_RDWR, 0666);
+			int dax_fd = open("/dev/dax0.0", O_RDWR);
+			if (dax_fd >= 0) {
+				// Validate DAX device size to avoid SIGBUS when mapping more than device has
+				off_t device_size = lseek(dax_fd, 0, SEEK_END);
+				if (device_size < 0 || static_cast<size_t>(device_size) < cxl_size) {
+					LOG(ERROR) << "/dev/dax0.0 size " << (device_size >= 0 ? std::to_string(device_size) : "unknown")
+					          << " < required CXL size " << cxl_size << "; use shm or increase device / reduce config cxl.size";
+					close(dax_fd);
+				} else {
+					dev = true;
+					cxl_fd = dax_fd;
+				}
+			} else {
+				LOG(WARNING) << "Failed to open /dev/dax0.0: " << strerror(errno)
+				             << ". Falling back to shm object " << shm_name;
 			}
 		}
+			if (cxl_fd < 0) {
+				if(numa_available() == -1){
+					LOG(ERROR) << "Cannot allocate from real CXL and NUMA is unavailable";
+					return nullptr;
+				}
+				cxl_fd = OpenCxlBackingFd(shm_name);
+			}else{
+				// Keep /dev/dax path as-is.
+			}
 	}else{
-		cxl_fd = shm_open("/CXL_SHARED_FILE", O_CREAT | O_RDWR, 0666);
+		cxl_fd = OpenCxlBackingFd(shm_name);
 	}
 
 	if (cxl_fd < 0){
-		LOG(ERROR)<<"Opening CXL error: " << strerror(errno);
+		LOG(ERROR)<<"Opening CXL error: " << strerror(errno)
+		          << " (shm_name=" << shm_name << ")";
 		return nullptr;
 	}
 	if(broker_id == 0 && !dev){
@@ -54,7 +115,12 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 		}
 		LOG(INFO) << "ftruncate completed successfully";
 	}
-	LOG(INFO) << "Mapping CXL shared memory: " << cxl_size << " bytes";
+	// Zero-core CXL NUMA path: mmap without MAP_POPULATE, then mbind to CXL node, then memset.
+	// Pages are allocated on first touch (memset) on the CXL node. Script must use membind=1,2
+	// so the process is allowed to allocate on node 2; otherwise mbind/first-touch can SIGBUS or OOM.
+	const bool will_mbind = (cxl_type == Real && !dev && broker_id == 0);
+	LOG(INFO) << "Mapping CXL shared memory: " << cxl_size << " bytes"
+	          << (will_mbind ? " (lazy populate after mbind to CXL node)" : " (MAP_POPULATE)");
 
 	const char* fixed_addr_env = std::getenv("EMBARCADERO_CXL_BASE_ADDR");
 	std::vector<uintptr_t> fixed_addrs;
@@ -81,13 +147,13 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 #ifdef MAP_FIXED_NOREPLACE
 		addr = mmap(reinterpret_cast<void*>(candidate), cxl_size,
 		            PROT_READ | PROT_WRITE,
-		            MAP_SHARED | MAP_POPULATE | MAP_FIXED_NOREPLACE,
+		            MAP_SHARED | (will_mbind ? 0 : static_cast<int>(MAP_POPULATE)) | MAP_FIXED_NOREPLACE,
 		            cxl_fd, 0);
 #else
 		// Best-effort fallback if MAP_FIXED_NOREPLACE is unavailable.
 		addr = mmap(reinterpret_cast<void*>(candidate), cxl_size,
 		            PROT_READ | PROT_WRITE,
-		            MAP_SHARED | MAP_POPULATE | MAP_FIXED,
+		            MAP_SHARED | (will_mbind ? 0 : MAP_POPULATE) | MAP_FIXED,
 		            cxl_fd, 0);
 #endif
 		if (addr != MAP_FAILED) {
@@ -111,18 +177,36 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 	close(cxl_fd);
 	LOG(INFO) << "CXL mapping successful at address: " << addr;
 
-	if(cxl_type == Real && !dev && broker_id == 0){
-		// Create a bitmask for the NUMA node (numa node 2 should be the CXL memory)
-		struct bitmask* bitmask = numa_allocate_nodemask();
-		numa_bitmask_setbit(bitmask, 2);
+	if (cxl_type == Real && !dev && broker_id == 0) {
+		// Bind the shm-backed region to the zero-core CXL NUMA node (config cxl.numa_node).
+		// Requires run_throughput.sh to use numactl --membind=1,2 so the process can use node 2.
+		int cxl_numa_node = Configuration::getInstance().config().cxl.numa_node.get();
 
-		// Bind the memory to the specified NUMA node
-		// Remove MPOL_MF_STRICT to allow partial binding if some pages can't be moved
-		if (mbind(addr, cxl_size, MPOL_BIND, bitmask->maskp, bitmask->size, MPOL_MF_MOVE) == -1) {
-			LOG(WARNING) << "mbind failed, but continuing with best-effort NUMA binding: " << strerror(errno);
-			// Don't fail completely - continue with whatever NUMA binding we got
+		// Check if the CXL NUMA node has enough memory for the requested size
+		long long node_total_kb = -1;
+		long long node_free_kb = -1;
+		long long node_size_bytes = numa_node_size64(cxl_numa_node, &node_free_kb);
+		if (node_size_bytes < 0) {
+			LOG(WARNING) << "Cannot query size of NUMA node " << cxl_numa_node << ": " << strerror(errno)
+			             << ". Continuing with mbind attempt.";
 		} else {
-			VLOG(3) << "Successfully bound " << cxl_size << " bytes to NUMA node 2";
+			long long node_size_bytes = node_size_bytes * 1024;  // convert KB to bytes
+			if (static_cast<size_t>(node_size_bytes) < cxl_size) {
+				LOG(WARNING) << "NUMA node " << cxl_numa_node << " has only " << node_size_bytes
+				             << " bytes total, but cxl.size=" << cxl_size << " bytes requested."
+				             << " Reduce cxl.size in config or SIGBUS may occur during memset."
+				             << " Free memory: " << (node_free_kb * 1024) << " bytes.";
+			}
+		}
+
+		struct bitmask* bitmask = numa_allocate_nodemask();
+		numa_bitmask_setbit(bitmask, cxl_numa_node);
+
+		if (mbind(addr, cxl_size, MPOL_BIND, bitmask->maskp, bitmask->size, MPOL_MF_MOVE) == -1) {
+			LOG(WARNING) << "mbind to NUMA node " << cxl_numa_node << " failed: " << strerror(errno)
+			             << ". Ensure run_throughput.sh uses --membind=1,2 so CXL node is allowed.";
+		} else {
+			LOG(INFO) << "CXL region bound to NUMA node " << cxl_numa_node << " (" << cxl_size << " bytes)";
 		}
 
 		numa_free_nodemask(bitmask);

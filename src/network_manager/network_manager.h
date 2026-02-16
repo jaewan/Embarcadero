@@ -84,6 +84,8 @@ public:
      * Destructor ensures clean shutdown of all threads
      */
     ~NetworkManager();
+    /** Idempotent explicit shutdown hook used by broker main to control stop order. */
+    void Shutdown();
 
     /**
      * Enqueues a network request for processing by worker threads
@@ -145,8 +147,9 @@ private:
     std::vector<std::thread> threads_;
     int num_reqReceive_threads_;
     std::atomic<int> thread_count_{0};
-    bool stop_threads_ = false;
+    std::atomic<bool> stop_threads_{false};
     std::atomic<bool> listening_{false};
+    std::atomic<bool> shutdown_started_{false};
 
     // Acknowledgment management
     absl::flat_hash_map<size_t, int> ack_connections_;  // <client_id, ack_sock>

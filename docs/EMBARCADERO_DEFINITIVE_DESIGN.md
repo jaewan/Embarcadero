@@ -385,14 +385,18 @@ GUARANTEE:
   then M1.global_seq < M2.global_seq (or M1 declared lost).
 
 MECHANISM:
-  Sequencer tracks per-client state (next_expected_seq).
-  Out-of-order batches held in reorder buffer.
-  Gap timeout forces progress.
+  Sequencer tracks per-client state (next_expected_seq) per shard worker (§3.2.1).
+  Out-of-order batches are resolved by three layers: (1) intra-cycle sort
+  resolves ~90% of reordering at ~1μs; (2) cross-cycle hold buffer resolves
+  ~9% at ~30–100μs; (3) wall-clock timeout (default 5ms, covering P99.9
+  intra-rack TCP retransmit) emits SKIP markers for unresolvable gaps.
+  See §3.2 process_level5 for the full protocol.
 
 PERFORMANCE:
   Potential HOL blocking during broker failures/slowdowns.
   ~15% throughput overhead for 100% strong-order clients.
-  Tail latency bounded by gap timeout (configurable, default 1.5ms).
+  Tail latency bounded by gap timeout (configurable, default 5ms;
+  justified by TCP RTO_MIN=1–2ms + margin).
 
 USE CASES:
   State machine replication, distributed databases, transactions.
@@ -420,7 +424,7 @@ Acknowledgments are independent of order level. The client negotiates **ack_leve
 
 ### 2.3.2 Known Limitation: Hold Buffer Volatility (Order 5)
 
-When a batch enters the hold buffer (gap detected), its PBR slot is freed (consumed_through advanced) so the ring doesn't deadlock. The batch metadata is held in sequencer RAM. If the sequencer crashes during the hold window (≤1.5 ms default, configurable via hold_timeout_epochs × epoch_us), held batches are lost:
+When a batch enters the hold buffer (gap detected), its PBR slot is freed (consumed_through advanced) so the ring doesn't deadlock. The batch metadata is held in sequencer RAM. If the sequencer crashes during the hold window (≤5 ms default, configurable via order5.base_timeout_ms), held batches are lost:
 
 - **PBR slot:** freed (reusable)
 - **Hold buffer:** volatile (lost on crash)
@@ -432,7 +436,7 @@ These batches are declared "lost" per Property 2b (§5.1). Clients with ack_leve
 **Mitigation options (future work):**
 1. Checkpoint hold buffer to CXL periodically (adds ~50 μs per checkpoint)
 2. Scan BLog on recovery for unreferenced batches (adds recovery time)
-3. Accept the loss (default — 1.5 ms window is negligible)
+3. Accept the loss (default — 5 ms window is negligible)
 
 ### 2.4 Data Structures
 
@@ -485,8 +489,10 @@ static_assert(sizeof(PBREntry) == 64);
 // Flag constants
 constexpr uint32_t FLAG_VALID        = 1u << 31;  // Entry is valid
 constexpr uint32_t FLAG_STRONG_ORDER = 1u << 0;   // Order 5 ordering
-constexpr uint32_t FLAG_RETRY        = 1u << 1;   // Client retry
 constexpr uint32_t FLAG_RECOVERY     = 1u << 2;   // Recovered from failed broker
+constexpr uint32_t FLAG_SKIP_MARKER  = 1u << 3;  // GOI-only: gap declared lost (Order 5)
+constexpr uint32_t FLAG_RANGE_SKIP   = 1u << 4;  // With SKIP_MARKER: message_count = skip range size
+constexpr uint32_t FLAG_NOP         = 1u << 5;  // GOI-only: placeholder for duplicate batch CV advancement
 ```
 
 #### GOI Entry (64 bytes) — Global Order Index
@@ -514,14 +520,16 @@ struct alignas(64) GOIEntry {
 
     // ACK path: PBR index for this broker (used by CV updater to advance CompletionVector[broker_id])
     uint32_t pbr_index;        // Index in PBR[broker_id] for this batch
-    uint8_t _pad[4];
+    uint32_t flags;            // FLAG_* constants (Order 5: FLAG_NOP, FLAG_SKIP_MARKER, FLAG_RANGE_SKIP)
 };
 static_assert(sizeof(GOIEntry) == 64);
 ```
 
+**Special GOI entry types (Order 5):** A GOI entry may be a normal batch, a SKIP marker (FLAG_SKIP_MARKER; no BLog payload; broker_id=0, pbr_index=0; CV updater must not advance CV for SKIP), or a NOP (FLAG_NOP; valid broker_id and pbr_index, zero payload). All carry valid global_seq and flow through replication. See §3.4 for replica and CV handling.
+
 ### 2.5 Memory Layout
 
-All offsets are contiguous; no region overlaps. **Hex notation:** Underscore groups digits for readability (e.g. `0x4_0000_2000` = 4×2³² + 0x2000 = 16 GB + 8 KB). GOI is 16 GB, so it ends at 0x4_0000_2000; PBR starts there; BLogs start at 0x4_4000_2000.
+All offsets are contiguous; no region overlaps. **Hex notation:** Underscore groups digits for readability (e.g. `0x4_0000_2000` = 4×2³² + 0x2000 = 16 GB + 8 KB). GOI is 16 GB, so it ends at 0x4_0000_2000; PBR starts there; the checkpoint region sits between PBR and BLog; BLogs start at 0x4_5000_2000.
 
 ```
 CXL Memory Module (512 GB):
@@ -538,12 +546,16 @@ CXL Memory Module (512 GB):
 │ 0x4000_2000     │ 1 GB    │ PBR[0..31]: 32 rings × 512K entries × 64 bytes    │
 │                 │         │ Ends at 0x4400_2000 (replicated to secondary)    │
 ├─────────────────┼─────────┼──────────────────────────────────────────────────┤
-│ 0x4400_2000     │ ~495 GB │ BLog[0..31]: 32 circular logs × ~15 GB each       │
+│ 0x4400_2000     │ 16 MB   │ Sequencer Checkpoint: Order 5 per-client state     │
+│                 │         │ (double-buffered, 2 × 8 MB)                      │
+│                 │         │ Ends at 0x4500_2000 (replicated with metadata)   │
+├─────────────────┼─────────┼──────────────────────────────────────────────────┤
+│ 0x4500_2000     │ ~494 GB │ BLog[0..31]: 32 circular logs × ~15 GB each     │
 │                 │         │ (NOT replicated in CXL; replicated to disk)      │
 └────────────────────────────────────────────────────────────────────────────┘
 
 Replication Strategy:
-  - Control Block, GOI, PBRs: Chain-replicated across CXL modules (metadata). See §4.2.4 for chain protocol.
+  - Control Block, GOI, PBRs, Checkpoint: Chain-replicated across CXL modules (metadata). See §4.2.4 for chain protocol.
   - BLogs: Replicated to replica nodes' local disks (bulk data)
 ```
 
@@ -590,7 +602,7 @@ Precondition: Broker i owns BLog[i] and PBR[i] exclusively (Axiom A3)
 
 * PBR entry makes the receive atomic (either network or CXL can fail during recv()).
 
-* **PBR slot lifecycle and scanner correctness (Order 5 / batch-header ring implementations):** In implementations where the broker reserves a PBR slot before writing the full entry (e.g. two-phase: reserve → mark slot "claimed" → write payload → mark "valid"), the sequencer's collector/scanner **must never skip** a slot that is in the reserved/claimed state. Skipping such a slot (e.g. after a timeout) causes the batch to be lost from the ordering pipeline and leads to ACK stalls. The scanner must wait (without time-bound skip) until the slot becomes valid or is explicitly treated as empty. 
+* **PBR slot lifecycle and scanner correctness:** In implementations where the broker reserves a PBR slot before writing the full entry (e.g. two-phase: reserve → mark slot "claimed" → write payload → mark "valid"), the sequencer's collector tracks how long a slot remains reserved-but-not-valid. If a slot remains invalid for longer than a configurable timeout (default: 10 seconds, far exceeding any live broker's write latency and the membership service's heartbeat timeout), the collector clears the slot and advances past it. Under normal operation (&lt;200 ns write latency), the collector retries on the next pass without advancing. See sequencer specification (Appendix F) §4.1 for implementation. 
 
 * **Wait-free broker (design decision):** The broker never enforces ordering. PBR is strictly first-come-first-served: each network thread reserves BLog space, receives payload, then appends one PBR entry with a single atomic fetch_add on the PBR tail. No mutex, no per-client queue, no sorting at the broker. Ordering—including per-client order for Order 5—is enforced entirely at the sequencer, which can sort batches (e.g., radix sort in L2 cache) without throttling the ingest path. Adding a broker-side lock to preserve PBR order would cap throughput at ~1–2M ops/sec and waste CXL bandwidth; the expert consensus is to keep the broker a "firehose."
 
@@ -650,7 +662,9 @@ void Broker::ingest(Connection& conn) {
 }
 ```
 
-### 3.2 Epoch-Based Sequencing Protocol (Primary Design)
+### 3.2 Epoch-Based Sequencing Protocol (Order 2 Baseline)
+
+> **Scope:** This section describes the baseline sequencer for Order 2 workloads with ≤4 brokers. When Order 5 is enabled, the shard-worker architecture (§3.2.1 and the sequencer specification, Appendix F) replaces this design. The core insight—amortized atomics via batch sequence reservation—is shared.
 
 The sequencer uses a triple-buffered epoch pipeline to eliminate atomic bottlenecks. This design uses a single sequencer thread and one atomic fetch_add per epoch; for higher scaling (e.g., many more PBRs or batch rates beyond current needs), see §3.3 (Parallel Scatter-Gather Sequencer).
 
@@ -682,7 +696,7 @@ KEY INSIGHT:
   Embarcadero: O(1) atomic operation per EPOCH (amortized over ~1000 batches)
 ```
 
-**Algorithm:**
+**Algorithm (Order 2 only):**
 ```cpp
 class Sequencer {
     // Triple-buffered epoch state
@@ -695,23 +709,6 @@ class Sequencer {
 
     std::atomic<uint64_t> global_seq_{0};
     std::atomic<uint16_t> collecting_epoch_{0};
-
-    // Per-client state for Order 5 ordering
-    struct ClientState {
-        uint64_t next_expected;
-        uint64_t highest_sequenced;
-        std::bitset<128> recent_window;  // Duplicate detection
-    };
-    std::array<HashMap<uint64_t, ClientState>, 16> client_shards_;  // Sharded
-
-    // Reorder buffer for Order 5
-    struct HoldBuffer {
-        HashMap<uint64_t, std::map<uint64_t, BatchInfo>> by_client;
-        size_t total_entries{0};
-        static constexpr size_t MAX_ENTRIES = 10000;
-        static constexpr int MAX_WAIT_EPOCHS = 3;
-    };
-    HoldBuffer hold_buffer_;
 
 public:
     void collector_thread(int collector_id, std::span<int> my_pbrs) {
@@ -754,27 +751,12 @@ public:
             all.insert(all.end(), recovery_buffer_.begin(), recovery_buffer_.end());
             recovery_buffer_.clear();
 
-            // Partition by ordering level
-            std::vector<BatchInfo> level0, level5;
-            for (auto& b : all) {
-                if (b.flags & FLAG_STRONG_ORDER) {
-                    level5.push_back(b);
-                } else {
-                    level0.push_back(b);
-                }
-            }
-
-            // Process Order 0/1/2 (simple: just filter duplicates)
+            // Order 2: all non-duplicate batches to ready list. Order 5: see §3.2.1 and Appendix F.
             std::vector<BatchInfo> ready;
-            for (auto& b : level0) {
+            for (auto& b : all) {
                 if (!is_duplicate_batch_id(b.batch_id)) {
                     ready.push_back(b);
                 }
-            }
-
-            // Process Order 5 (complex: per-client ordering)
-            if (!level5.empty()) {
-                process_level5(level5, ready);
             }
 
             // === THE KEY OPTIMIZATION ===
@@ -790,70 +772,6 @@ public:
             buf.sequenced = std::move(ready);
             buf.state = State::READY_TO_COMMIT;
             next_to_sequence++;
-        }
-    }
-
-    void process_level5(std::vector<BatchInfo>& batches,
-                        std::vector<BatchInfo>& ready) {
-        // Radix sort by client_id: O(n) for 64-bit keys
-        radix_sort(batches, [](const BatchInfo& b) { return b.client_id; });
-
-        // Process each client's batches
-        auto it = batches.begin();
-        while (it != batches.end()) {
-            uint64_t client_id = it->client_id;
-            auto group_end = std::find_if(it, batches.end(),
-                [client_id](const BatchInfo& b) { return b.client_id != client_id; });
-
-            process_client_group(client_id, it, group_end, ready);
-            it = group_end;
-        }
-
-        // Drain hold buffer
-        drain_hold_buffer(ready);
-
-        // Age out old entries
-        hold_buffer_.tick_epoch();
-    }
-
-    void process_client_group(uint64_t client_id,
-                              BatchIter begin, BatchIter end,
-                              std::vector<BatchInfo>& ready) {
-        // Get or create client state
-        auto& state = get_client_state(client_id);
-
-        // Sort within group by client_seq (typically 1-5 batches)
-        std::sort(begin, end, [](const auto& a, const auto& b) {
-            return a.client_seq < b.client_seq;
-        });
-
-        for (auto it = begin; it != end; ++it) {
-            // Duplicate detection
-            if (it->client_seq <= state.highest_sequenced) {
-                if (state.recent_window.test(it->client_seq % 128)) {
-                    continue;  // Duplicate
-                }
-            }
-
-            // In-sequence check
-            if (it->client_seq == state.next_expected) {
-                ready.push_back(*it);
-                state.next_expected++;
-                state.highest_sequenced = it->client_seq;
-                state.recent_window.set(it->client_seq % 128);
-            }
-            // Gap detected
-            else if (it->client_seq > state.next_expected) {
-                if (should_wait_for_gap(client_id, state.next_expected)) {
-                    hold_buffer_.add(client_id, *it);
-                } else {
-                    // Timeout: skip gap
-                    emit_gap_warning(client_id, state.next_expected,
-                                     it->client_seq - 1);
-                    ready.push_back(*it);
-                    state.next_expected = it->client_seq + 1;
-                }
-            }
         }
     }
 
@@ -881,6 +799,7 @@ public:
                     .client_id = batch.client_id,
                     .client_seq = batch.client_seq,
                     .pbr_index = batch.pbr_index,  // For CV updater (CompletionVector[broker_id])
+                    .flags = batch.flags,
                 };
                 goi_[batch.global_seq] = entry;
             }
@@ -903,6 +822,37 @@ public:
     }
 };
 ```
+
+### 3.2.1 Shard-Worker Sequencer (Required for Order 5)
+
+When Order 5 is enabled (or when scaling beyond 4 brokers), the epoch pipeline (§3.2) is replaced by a continuous shard-worker architecture. All Order 2 batches are also processed through this path.
+
+**Thread model:**
+```
+Collector threads (C, default 4):
+  - Poll PBRs continuously
+  - Route batches to shard workers via SPSC queues:
+    Order 5: shard = hash(client_id) % S  (correctness: same client → same shard)
+    Order 2: shard = round_robin++ % S     (load balance)
+
+Shard workers (S, default 1 for ≤4 brokers, 8 for 8+):
+  - Drain SPSC queues (one per collector), dedup, partition by order level
+  - Order 2: append to ready list (O(1) per batch)
+  - Order 5: three-layer gap resolution (sequencer spec §5.3–5.5)
+  - Commit: fetch_add(ready.size()) on global_seq, write GOI, push CompletedRange
+
+committed_seq updater (1):
+  - Merges CompletedRanges via min-heap
+  - Advances committed_seq to highest gap-free GOI prefix
+  - Tracks replication floor for anti-wraparound (I-WRAP)
+  - Runs periodic checkpoint and reconciliation watchdog
+```
+
+This replaces the single sequencer thread and single GOI writer thread from §3.2. Each shard worker owns a disjoint set of clients (by hash), so per-client ordering is embarrassingly parallel.
+
+**Note:** When Order 5 is enabled and the shard-worker sequencer is in use, Order 2 batches may share shards with Order 5 batches. If a shard worker stalls on Order 5 gap resolution (e.g., timeout), committed_seq advancement for co-located Order 2 batches is also delayed. This does not affect Order 2 correctness, only committed_seq latency. Mitigation: increase num_shards to reduce co-location, or use separate sequencer instances (future work).
+
+See the sequencer specification (Appendix F) for full implementation.
 
 ### 3.3 Parallel Scatter-Gather Sequencer (Required for Line-Rate)
 
@@ -943,11 +893,11 @@ PBR (per broker, unordered)     GOI (global, ordered)
 #### Phase 2: Logic threads (CPU bound)
 
 - **Threads:** S logic threads (shards), e.g., 8. Each logic thread owns one shard queue and its own per-client state (for Order 5).
-- **Job (per epoch or per batch drain):**
+- **Job (continuous drain; no epoch boundary):**
   1. **Drain** shard queue into a local buffer.
   2. **Partition** by Order 0/1/2 vs Order 5 (using FLAG_STRONG_ORDER).
   3. **Order 0/1/2:** Deduplicate by batch_id; order is arrival order within shard. For Order 2, sequencer non-blocking, constantly iterates PBRs.
-  4. **Order 5:** Radix sort by client_id, then sort by client_seq within each client; gap check (next_expected_seq), hold buffer for gaps, timeout to skip gap and force progress.
+  4. **Order 5:** Same three-layer processing as §3.2.1 / sequencer spec (sort, gap detection with hold buffer, wall-clock timeout for SKIP). Hash(client_id) routing ensures each shard gets a disjoint subset of clients, so per-client processing is embarrassingly parallel.
   5. **Count** ready entries, e.g., `count = ready.size()`.
 
 #### Phase 3: Atomic commit and GOI write
@@ -955,9 +905,11 @@ PBR (per broker, unordered)     GOI (global, ordered)
 - Each logic thread performs **one** atomic on the **global** sequence counter:
   - `my_base_seq = global_seq.fetch_add(count, memory_order_relaxed)`.
 - The logic thread then writes its `count` entries to GOI at indices `[my_base_seq, my_base_seq + count)` using sequential, non-contentious CXL writes. **Crucially, each GOI entry written must include the `pbr_index` from the original PBR entry (as in §3.2); this preserves the link required for the Completion Vector (ACK path) to function.** No other thread writes to that range (ranges are disjoint by construction).
-- **Memory fence** after writing the last entry in the range so that replicas observe a gap-free prefix up to `my_base_seq + count - 1`. A **helper thread** (or the logic threads via per-shard high-water marks) must update `control_block->committed_seq` so that it equals the **contiguous written prefix**: `committed_seq = min over shards of (shard_high_water[s])`, where each shard's high-water is the last index it has written (`my_base_seq + count`). Using the **minimum** ensures no replica or broker ACK thread observes a gap: [0, committed_seq] is fully written. (Using the maximum would be wrong: it would allow ACKing past indices not yet written by the slowest shard.)
+- **Memory fence** after writing the last entry in the range so that replicas observe a gap-free prefix up to `my_base_seq + count - 1`.
 
-**Who updates committed_seq and when:** Use a **dedicated committed_seq updater thread**. After each logic thread writes its GOI range, it updates a shared array (in sequencer local memory) `shard_high_water[my_shard] = my_base_seq + count`. The updater thread runs in a tight loop (e.g. every 10–50 μs) or is triggered by logic threads via a condition: it reads all `shard_high_water[s]`, computes `new_committed = min(shard_high_water[0..S-1])`, and writes `control_block->committed_seq = max(control_block->committed_seq, new_committed)` (monotonic). Only this thread writes `committed_seq`; replicas and brokers read it. Alternatively, a **single writer** can be elected among logic threads (e.g. shard 0) that periodically performs the same min over shard_high_water and updates committed_seq. The key invariant: [0, committed_seq] is fully written in GOI with no gaps.
+**Who updates committed_seq and when:** A **dedicated committed_seq updater thread** (sequencer spec §7). Each shard worker, after writing its GOI range, pushes a `CompletedRange{start, end}` to a dynamically-growing MPSC queue. The updater drains this queue into a min-heap ordered by range start, and advances committed_seq through the contiguous prefix. A **reconciliation watchdog** (e.g. every 5 seconds) scans the GOI directly to detect and repair stalls caused by lost CompletedRange entries.
+
+**Anti-wraparound guard (I-WRAP):** Before fetch_add, each shard worker checks that `current_global + count - replication_floor < GOI_SIZE * high_pct` (e.g. 90%). If exceeded, the worker stalls until replicas catch up (replication_floor advances). See sequencer spec §6.1.
 
 #### Correctness
 
@@ -979,6 +931,21 @@ In scatter-gather, each logic thread holds **ClientState** (next_expected_seq, d
 3. Only then start draining PBRs and assigning new global_seqs. New batches from a client will have client_seq ≥ next_expected (or be duplicates in the window).
 
 ClientState must not be stored solely in RAM if sequencer failover is required; replay from GOI (or a persistent checkpoint of the same) is the recovery path.
+
+**Per-client state checkpointing (Order 5):** The sequencer periodically checkpoints the per-client next_expected map to the dedicated 16 MB CXL region (§2.5). The checkpoint is double-buffered (two 8 MB slots); one is always valid. On failover, the new sequencer loads the checkpoint and replays the GOI tail from the checkpoint's committed_seq forward, rebuilding per-client state. Without checkpointing, the full GOI tail must be replayed, which may take minutes for large systems. With checkpointing (e.g. every 60 s), recovery adds ~5 ms of checkpoint loading on top of lease-wait.
+
+**Order 5 failover recovery time budget:**
+
+| Phase | Typical | Worst Case |
+|-------|---------|------------|
+| Lease-wait | ~60 ms | 110 ms |
+| GOI scan + truncation | ~1 ms | 25 ms |
+| Client state rebuild (with checkpoint) | ~5 ms | ~50 ms |
+| Client state rebuild (without checkpoint) | ~50 ms | ~200 ms |
+| Step 4b: Collector cursor init | &lt;1 ms | &lt;1 ms |
+| Step 4c: Replication floor init | &lt;200 μs | 20 ms |
+| **Total (with checkpoint)** | **~70 ms** | **~185 ms** |
+| **Total (without checkpoint)** | **~115 ms** | **~335 ms** |
 
 #### When to use
 
@@ -1073,6 +1040,31 @@ CORRECTNESS:
   - fsync before increment (durability before ack)
   - Single-writer per CV entry (last replica); brokers only read their own slot (zero GOI scan)
 ```
+
+#### Replica Handling of Special GOI Entries (Order 5)
+
+Order 5 sequencing may produce two special GOI entry types that replicas and the CV updater must handle:
+
+**NOP entries (FLAG_NOP):** Emitted when a duplicate batch is detected. The entry has valid broker_id and pbr_index (the real PBR slot the duplicate occupied) but zero payload. Replicas skip the BLog copy (no data exists). The CV updater MUST advance CV[broker_id] past pbr_index—this is the NOP's sole purpose. Without it, the duplicate's PBR slot would never be reflected in CV, causing permanent ACK stall for that broker.
+
+**SKIP markers (FLAG_SKIP_MARKER):** Emitted when a per-client gap is declared lost. The entry has broker_id=0 (backward-compatible with old replicas that don't check FLAG_SKIP_MARKER; CV[0] already ≥ 0 in any running system), pbr_index=0, zero payload. Replicas skip BLog copy and advance num_replicated normally. The CV updater MUST NOT advance any broker's CV for SKIP markers (no real PBR slot; check FLAG_SKIP_MARKER and return).
+
+CV update pseudocode:
+
+```cpp
+void update_cv_for_entry(GOIEntry& entry) {
+    if (entry.flags & FLAG_SKIP_MARKER) return;  // No PBR slot
+    if (entry.flags & FLAG_NOP) {
+        // NOP: advance CV for the duplicate's PBR slot
+        update_completion_vector(entry.broker_id, entry.pbr_index);
+        return;
+    }
+    // Normal batch
+    update_completion_vector(entry.broker_id, entry.pbr_index);
+}
+```
+
+**Deployment constraint:** The tail replica (CV updater) must be upgraded to recognize FLAG_SKIP_MARKER and FLAG_NOP before the sequencer is upgraded to emit them. Upgrade order: (1) non-tail replicas, (2) tail replica, (3) sequencer.
 
 #### Replication and Order 5 (hold buffer) interaction
 
@@ -1200,51 +1192,39 @@ EMBARCADERO'S SOLUTION:
 
 1. BOUNDED HOLD BUFFER
    - max_entries = 10,000
-   - max_wait_epochs = 3 (~1.5ms at τ=500μs)
+   - base_timeout_ms = 5 (wall-clock gap timeout)
 
-2. GAP DETECTION WITH BROKER AWARENESS
-   on_gap_detected(client_id, expected_seq):
-     broker = expected_broker(client_id, expected_seq)
-
-     if broker.status == HEALTHY:
-       // Probably in flight, wait briefly
-       hold_buffer.add(batch)
-
-     elif broker.status == SUSPECT:
-       // Check PBR (still in CXL!)
-       if found_in_pbr(broker, client_id, expected_seq):
-         recovery_buffer.add(entry)  // Will be sequenced
-         hold_buffer.add(batch)      // Wait for recovery
-       else:
-         // Lost before PBR write
-         if client_retry_expected():
-           hold_buffer.add(batch)
-         else:
-           skip_gap()  // Force progress
-
-     elif broker.status == DEAD:
-       skip_gap()  // Recovery didn't find it
+2. GAP RESOLUTION IS LAYERED (no broker-status inspection)
+   - **Sort (Layer 1):** Intra-cycle jitter resolved by sorting batches by (client_id, client_seq).
+     Cost: ~1 μs for typical drain sizes (<100 entries). Handles ~90% of reordering.
+   - **Hold + Cascade (Layer 2):** Cross-cycle gaps buffered until the missing batch arrives.
+     When it does, cascade_release drains all contiguously held batches.
+     Cost: ~30–100 μs. Handles ~9% of reordering.
+   - **Timeout (Layer 3):** Wall-clock timeout (default 5 ms). Emits SKIP marker (range-skip if gap > 1).
+     Forces progress. Handles ~1% (TCP loss, broker degradation).
 
 3. TIMEOUT FORCES PROGRESS
-   every epoch:
-     for entry in hold_buffer:
-       if entry.wait_epochs > MAX_WAIT_EPOCHS:
-         emit_gap_warning(entry)
-         skip_gap(entry)
-         ready.append(entry)
+   expire_held_entries(ready) runs each cycle; entries held longer than base_timeout_ms
+   trigger range-skip markers and cascade_release.
 ```
 
 ### 4.3.1 Sequencer failover: hold buffer and client state recovery
 
 On sequencer crash, **hold buffer** and **per-client state** (next_expected_seq, dedupe window) are volatile; they are **not** persisted in CXL. Recovery options:
 
-| Approach | Complexity | Recovery time | Notes |
+| Approach | Complexity | Recovery Time | Notes |
 |----------|------------|---------------|-------|
-| **Rebuild from GOI replay** | Low | O(tail size) | Replay GOI tail (e.g. last 10K batches); for each (client_id, client_seq) set next_expected = max_seen + 1; hold buffer starts empty. New sequencer then drains PBR; duplicates discarded by dedupe window. |
-| **Checkpoint to CXL** | Medium | Instant | Periodically write (epoch, client_state_snapshot) to a dedicated CXL region; on failover, load snapshot and replay only since checkpoint. |
-| **Primary-backup sequencer** | High | Near-zero | Backup replays PBR/GOI in lockstep; on primary failure, backup has warm state. |
+| **Checkpoint + GOI replay (recommended)** | Medium | ~70–185 ms | Load checkpoint; replay GOI since checkpoint committed_seq. See §3.3 Per-client state checkpointing. |
+| **Full GOI replay (no checkpoint)** | Low | ~115–335 ms | Replay last N entries; accept-first-seen for unknown clients. |
+| **Primary-backup sequencer** | High | Near-zero | Future work. |
 
-**Design choice:** Embarcadero uses **rebuild from GOI replay** (§3.3 Sequencer Sharding & Recovery). No checkpoint or primary-backup in the base design. On startup, the new sequencer (1) optionally truncates GOI if partial write detected (§3.3 Scatter-gather crash recovery), (2) replays the GOI tail to rebuild ClientState per shard, (3) starts collecting from PBR. Batches that were in the old hold buffer reappear in PBR (they were never written to GOI); they are re-collected and re-ordered; duplicate batch_ids are discarded. Liveness: gap timeouts on the new sequencer eventually advance; no batch is stuck forever.
+**Design choice:** For Order 5 production, **checkpoint + GOI replay** is recommended. On startup, the new sequencer (1) optionally truncates GOI if partial write detected (§3.3 Scatter-gather crash recovery), (2) loads the checkpoint from the 16 MB CXL region (§2.5) and replays the GOI tail from the checkpoint's committed_seq to rebuild ClientState, or (3) if no valid checkpoint, replays the GOI tail (e.g. last 100K entries) and uses accept-first-seen for unknown clients. Batches that were in the old hold buffer reappear in PBR; they are re-collected and re-ordered; duplicate batch_ids are discarded. Liveness: gap timeouts on the new sequencer eventually advance; no batch is stuck forever.
+
+**Accept-first-seen:** After recovery, clients not found in the checkpoint or replay window are handled by **accept-first-seen**: the sequencer initializes next_expected to the client_seq of the first batch seen for that client. This prevents false SKIPs when a client starts from a non-zero sequence number or was absent from the recovery window.
+
+**Step 4b: Initialize collector cursors.** For each broker i, set `collector_cursor[i] = CV[i].completed_pbr_head + 1`. Entries between this cursor and PBR[i].tail are re-processed; dedup discards already-sequenced batches. Cost: &lt;1 ms (32 CV reads). Without this, collectors might re-read the entire PBR from index 0, causing massive duplicate processing.
+
+**Step 4c: Initialize replication floor.** Backward scan from committed_seq: find the first GOI entry where num_replicated &lt; replication_factor. Set replication_floor_cursor to that index. This prevents the anti-wraparound guard from stalling on phantom under-replication. Cost: O(replication_lag) × 200 ns, typically &lt;200 μs. **Correctness assumption:** Chain replication processes GOI entries in strictly increasing index order, so if entry i is fully replicated, all j &lt; i are also fully replicated.
 
 ---
 
@@ -1272,13 +1252,16 @@ On sequencer crash, **hold buffer** and **per-client state** (next_expected_seq,
 3. Timeout declares M1 lost, unblocks M2
 
 **Property 2b: Declared-Lost Semantics (Order 5)**
-When the sequencer skips a gap (timeout), the skipped client_seqs are **never** assigned a global_seq and never appear in the GOI. Thus:
+When the sequencer skips a gap, a SKIP marker entry is written to the GOI with a valid global_seq:
 ```
-∀ client C: if client_seq s is declared lost (skip_gap), then
-  ∄ batch B in GOI with B.client_id=C ∧ B.client_seq=s, and
-  ∀ batch B' from C with B'.client_seq > s: B'.global_seq is assigned and B' ∈ GOI.
+∃ exactly one GOI entry E with E.client_id=C ∧ (E.flags & FLAG_SKIP_MARKER)
+  ∧ E.client_seq ≤ s < E.client_seq + skip_count(E),
+  where skip_count(E) = E.message_count if (E.flags & FLAG_RANGE_SKIP) else 1.
+E carries a valid global_seq and no BLog payload.
+∀ batch B from C with B.client_seq ≥ E.client_seq + skip_count(E) in GOI:
+  B.global_seq > E.global_seq.
 ```
-No later batch from the same client can receive a smaller global_seq than a batch that was skipped. Subscribers never observe reversed order: they see either (M1, M2) in order or M2 only (M1 was lost).
+SKIP markers are permanent. Subscribers see them in global_seq order and can distinguish "batch lost" from "batch never sent." The GOI contract now includes entries without BLog payloads (SKIP and NOP).
 
 **Property 3: Durability**
 ```
@@ -1333,6 +1316,13 @@ I6: ∀ PBR entry E, ∀ reader R:
 I7: ∀ Order 5 client C, ∀ M1, M2 from C in GOI:
     M1.client_seq < M2.client_seq ⟹ M1.global_seq < M2.global_seq
     (Per-client order preserved through sequencing and replication; subscribers see same order)
+
+I-VIS (GOI visibility fence): No component reads or acts on GOI[i] for i > committed_seq.
+I-WRAP (anti-wraparound): global_seq - replication_floor < GOI_SIZE at all times.
+I-CLIENT (Order 5): After recovery, for every active Order 5 client C, next_expected[C] is correct (from checkpoint, GOI replay, or accept-first-seen).
+PROP-SKIP (Order 5): SKIP markers are permanent. A skipped client_seq never appears as a real batch in the GOI.
+I-PROC (Process Integrity): All sequencer threads (collectors, shard workers, committed_seq updater) run in a single OS process. If any thread terminates unexpectedly, the process exits and recovery (§4.3.1) rebuilds all volatile state from CXL. No partial-process recovery is attempted.
+I-COLLECT (Collector Restart Safety): After recovery, collector_cursor[i] = CV[i].completed_pbr_head + 1. Entries between this cursor and PBR[i].tail are re-processed; dedup discards already-sequenced batches.
 ```
 
 **End-to-end:** Per-client order is preserved from client submission through PBR, sequencer (including hold buffer and gap handling), GOI write, replication, and CV-based ACK. Subscribers reading in global_seq order observe Order 5 order. No component reorders batches from the same client after the sequencer assigns global_seq.
@@ -1360,7 +1350,7 @@ Where:
   S_capacity = ~500K batches/epoch × 2000 epochs/s = 1B batches/s
 ```
 
-**Latency model:**
+**Latency model (Order 0/2):**
 ```
 L_total = L_network + L_ingest + L_epoch_wait + L_sequence + L_replicate + L_ack
 
@@ -1373,7 +1363,23 @@ Where:
   L_ack = 100-200 μs (broker to client)
 
   L_total ≈ 1.1 - 2.0 ms (Order 0/2)
-  L_total ≈ 1.2 - 4.0 ms (Order 5 with gaps)
+```
+
+**Order 5 latency model (with shard-worker sequencer, §3.2.1):**
+```
+L_total_order5 = L_network + L_ingest + L_sequencer_pickup
+                 + L_order5_resolution + L_replicate + L_ack
+
+Where:
+  L_sequencer_pickup = 15-50 μs (continuous drain, no epoch boundary)
+  L_order5_resolution =
+    0 μs          (90% of batches: resolved by sort within drain)
+    30-100 μs     (9% of batches: resolved by hold buffer across drains)
+    5,000 μs      (1% of batches: timeout; SKIP emitted)
+
+  L_total_order5 ≈ 0.85 - 1.55 ms (no gaps; ~200 μs lower than Order 2 epoch pipeline)
+  L_total_order5 ≈ 1.0 - 1.7 ms (gaps resolved by hold buffer)
+  L_total_order5 ≈ 6.0 - 7.0 ms (gaps resolved by timeout; worst case)
 ```
 
 ### 6.2 Measured Performance
@@ -1395,7 +1401,7 @@ Where:
 |------|-----|-----|-------|-----------|----------|
 | Order 0/2 | 1.52ms | 1.68ms | 1.95ms | 5.3× lower | 2.3× lower |
 | Order 5 (no gaps) | 1.58ms | 1.75ms | 2.10ms | 5.1× lower | 2.2× lower |
-| Order 5 (with gaps) | 1.65ms | 2.50ms | 3.80ms | 3.2× lower | 1.5× lower |
+| Order 5 (with gaps) | 1.65ms | 2.50ms | ≤ base_timeout_ms + pipeline (~5ms default) | 3.2× lower | 1.5× lower |
 
 **Scalability:**
 
@@ -1491,10 +1497,10 @@ EPOCH BATCHING (Embarcadero):
 - Unbounded tail latency
 - Cascade failures
 
-**Bounded (3 epochs, 1.5ms) ensures:**
+**Bounded (5 ms wall-clock, default base_timeout_ms) ensures:**
 - Predictable memory: max 10K entries × 64 bytes = 640KB
-- Bounded latency: max +1.5ms on P99.9
-- Graceful degradation: gaps logged, progress continues
+- Bounded latency: max +5 ms on P99.9
+- Graceful degradation: gaps logged via SKIP markers, progress continues
 
 ---
 
@@ -1586,17 +1592,32 @@ embarcadero:
     numa_node: 2
 
   sequencer:
-    mode: single               # "single" (§3.2) or "scatter_gather" (§3.3); default single for ≤4 brokers
-    epoch_us: 500              # τ = 500μs
+    mode: single               # "single" (§3.2) or "shard_worker" (§3.2.1) or "scatter_gather" (§3.3)
+    epoch_us: 500              # τ = 500μs (Order 2 epoch pipeline only; ignored in shard_worker mode)
     collectors: 4              # Parallel collector threads
+    num_shards: 1              # Shard workers (1 for ≤4 brokers; 8 for 8+ or Order 5)
+    spsc_queue_capacity: 32768 # Per (collector, shard) queue size
 
   ordering:
     default_order: 0            # Order 0 (no global order) or 2 (total order)
-    order5_enabled: true       # Opt-in Order 5 (strong order)
-    max_clients: 100000        # Max Order 5 clients
-    hold_buffer_size: 10000    # Max held batches
-    hold_timeout_epochs: 3     # Gap timeout (~1.5ms)
-    client_ttl_sec: 300        # Client state GC
+    order5_enabled: true        # Opt-in Order 5 (strong order)
+    max_clients: 100000         # Max Order 5 clients
+    hold_buffer_size: 10000     # Max held batches
+    base_timeout_ms: 5          # Order 5: wall-clock gap timeout
+    dedupe_window: 4096         # Order 5: per-shard batch_id ring size
+    client_ttl_sec: 300         # Client state GC
+
+  # Order 5 recovery
+  recovery:
+    checkpoint_interval_sec: 60   # Mandatory for production Order 5
+    checkpoint_location: "cxl"     # "cxl" (16 MB reserved) or "disk"
+    goi_replay_entries: 100000     # Fallback if no checkpoint
+
+  safety:
+    goi_wraparound_high_pct: 90    # Stall shard workers when GOI usage exceeds this
+    goi_wraparound_low_pct: 80     # Resume after dropping below this
+    stuck_slot_timeout_sec: 10     # Clear invalid PBR slots after this duration
+    committed_seq_reconcile_sec: 5 # Reconciliation watchdog interval
 
   replication:
     factor: 2
@@ -1653,15 +1674,23 @@ public:
 // === BATCH ===
 
 struct Batch {
-    uint64_t global_seq;              // First message's global sequence
-    uint64_t client_id;               // Source client (0 if Order 0)
-    uint64_t client_seq;              // Client sequence (Order 5 only)
-    uint16_t broker_id;               // Source broker
+    uint64_t global_seq;               // First message's global sequence
+    uint64_t client_id;                 // Source client (0 if Order 0)
+    uint64_t client_seq;                // Client sequence (Order 5 only)
+    uint16_t broker_id;                 // Source broker
+    uint32_t flags;                     // FLAG_* (Order 5: SKIP_MARKER, RANGE_SKIP)
+    uint32_t message_count;             // Number of messages; for SKIP+RANGE_SKIP = skip range size
     std::vector<Message> messages;
 
     // Per-message global sequence
     uint64_t message_seq(size_t i) const {
         return global_seq + i;
+    }
+
+    // Order 5: SKIP marker detection
+    bool is_skip() const { return flags & FLAG_SKIP_MARKER; }
+    uint32_t skip_count() const {
+        return (flags & FLAG_RANGE_SKIP) ? message_count : 1;
     }
 };
 ```
@@ -1685,6 +1714,20 @@ embarcadero_hold_buffer_entries
 embarcadero_hold_buffer_timeouts_total
 embarcadero_gaps_skipped_total
 embarcadero_duplicates_rejected_total
+
+# Order 5: Hold buffer
+embarcadero_sequencer_hold_buffer_entries{shard}
+embarcadero_sequencer_hold_buffer_age_ms{shard, quantile}
+embarcadero_sequencer_cascade_release_depth{shard, quantile}
+
+# Order 5: SKIP / NOP
+embarcadero_sequencer_skip_total{shard, reason="timeout|overflow"}
+embarcadero_sequencer_nop_entries_total{shard}
+
+# Order 5: Checkpointing
+embarcadero_sequencer_checkpoint_write_duration_us
+embarcadero_sequencer_checkpoint_age_sec
+embarcadero_sequencer_checkpoint_client_count
 
 # Replication
 embarcadero_replication_lag_batches
@@ -1718,6 +1761,16 @@ embarcadero_cxl_write_latency_ns{quantile="0.5|0.99"}
 | **Epoch** | Fixed time window for batch sequencing (~500μs) |
 | **Hold Buffer** | Reorder buffer for Order 5 gap handling |
 | **HOL Blocking** | Head-of-line blocking — fast messages blocked by slow ones |
+| **NOP entry** | GOI entry with FLAG_NOP. Placeholder for a duplicate batch's PBR slot so Completion Vector can advance. Valid broker_id and pbr_index; zero payload. Order 5 artifact. |
+| **SKIP marker** | GOI entry with FLAG_SKIP_MARKER. Declares one or more client_seq values permanently lost. broker_id=0 (backward-compatible sentinel); no BLog payload; valid global_seq. May have FLAG_RANGE_SKIP with message_count = number of skipped seqs. Order 5 artifact. |
+| **Accept-first-seen** | Policy for unknown Order 5 clients: initialize next_expected to the client_seq of the first batch seen, rather than 0. Prevents false SKIPs after recovery. |
+| **Replication floor** | Highest contiguous GOI index fully replicated (num_replicated ≥ replication_factor). Used by anti-wraparound guard. |
+| **Cascade release** | When a gap-filling batch arrives and advances next_expected, all contiguously held batches behind it are released from the hold buffer in sequence. O(1) per batch with deque. |
+| **Shard worker** | Per-shard sequencer thread that processes Order 2/5 batches, assigns global_seq, and writes GOI entries. Owns disjoint client set via hash(client_id). |
+| **SPSC queue** | Single-Producer Single-Consumer lock-free queue between a collector and a shard worker. Eliminates contention on the communication path. |
+| **CompletedRange** | (start, end) pair pushed by a shard worker after writing GOI entries. The committed_seq updater merges these via min-heap. |
+| **Drain cycle** | One iteration of a shard worker's main loop: drain queues → dedup → process Order 2/5 → commit → expire held. Continuous (no epoch boundary). |
+| **Reconciliation watchdog** | Safety net in the committed_seq updater that periodically scans the GOI directly to detect and repair stalled committed_seq advancement. |
 
 ### Appendix E: Design notes (minor)
 
@@ -1729,7 +1782,11 @@ embarcadero_cxl_write_latency_ns{quantile="0.5|0.99"}
 
 **epoch_sequenced / epoch_created (uint16_t wraparound):** Both GOIEntry and PBREntry use `uint16_t` for epoch. At τ=500 μs, 65536 epochs ≈ 32.77 s before wraparound. Entries are processed and replicated in milliseconds, so no entry lives long enough for wraparound to matter. When comparing epochs (e.g. staleness check), use **modular arithmetic** (e.g. `(current - entry) & 0xFFFF` for “age” within a window) or document that epochs are compared only when both are within 2^15 of each other.
 
-**Sequencer helper functions (pseudocode):** §3.2 references `drain_hold_buffer(ready)`, `hold_buffer_.tick_epoch()`, `is_duplicate_batch_id(batch_id)`, `should_wait_for_gap()`. These are implementation details; semantics are implied by the algorithm (drain held batches when in-order, age hold buffer each epoch, dedupe by batch_id, wait vs skip per broker status and timeout). Implementations will define them accordingly.
+**Sequencer helper functions (pseudocode):** §3.2 references `cascade_release`, `emit_nop`, `add_to_hold_buffer`, `expire_held_entries`, `get_or_init_next_expected`. The complete Order 5 protocol (deduplication, hold buffer overflow protection, three-layer gap resolution, SKIP/NOP emission) is in the sequencer specification (Appendix F). Implementations will define these accordingly.
+
+**Accept-first-seen rationale (Order 5):** After sequencer recovery, a client may not appear in the checkpoint or GOI replay window. Initializing next_expected=0 would cause false SKIPs for clients starting at higher sequence numbers. Accept-first-seen initializes next_expected to the first client_seq observed, eliminating false SKIPs. Trade-off: if the client truly had earlier batches (e.g., before an outage), those are already in the GOI and do not need re-sequencing.
+
+**NOP entries vs out-of-band CV updates:** An out-of-band mechanism (sequencer directly writes CV for duplicates) would violate the single-writer property of CV (tail replica is sole writer). NOP entries flow through the normal GOI → replication → CV pipeline, preserving the invariant.
 
 ### Appendix F: Related design documents
 
@@ -1737,6 +1794,7 @@ This document is the **authoritative conceptual and protocol reference**. The fo
 
 | Document | Purpose | When to use |
 |----------|---------|-------------|
+| **Sequencer specification** (e.g. docs/SEQUENCER_SPEC.md or ablation_study/sequencer5/new_design.md) | Complete Order 5 sequencing protocol: shard-worker architecture, three-layer gap resolution, SKIP/NOP emission, hold buffer management, checkpointing, recovery. **Supersedes §3.2 for Order 5;** §3.2 is Order 2 baseline only. | Implementing or debugging Order 5 sequencing; shard-worker thread model; gap resolution layers; sequencer failover. |
 | **docs/CXL_MEMORY_LAYOUT_v2.md** | Exact CXL offsets, struct definitions, per-region access patterns, alignment. | Implementing or changing CXL layout; debugging layout/offset bugs; onboarding. |
 | **docs/memory-bank/LOCKFREE_BATCH_HEADER_RING_DESIGN.md** | Lock-free PBR ring protocol: `batch_headers_consumed_through`, producer wrap semantics, min-contiguous/gap handling, B0 same-process cache coherency. | Implementing or fixing scanner/allocator; understanding ring wrap and ACK stall causes. |
 | **docs/memory-bank/SEQUENCER_ONLY_HEAD_NODE_DESIGN.md** | Sequencer-only head topology: no data ingest on head, `data_broker_ids`, heartbeat contract, startup. | Deploying or testing sequencer-only head; resolving B0 coherency via topology. |
@@ -1745,4 +1803,6 @@ This document is the **authoritative conceptual and protocol reference**. The fo
 
 ---
 
-*Document version 2.2. Updates: Order levels 0/1/2/5 with numeric naming; Order 0 Option A (network path updates written after PBR write); Order 2 recommendation (non-blocking sequencer, constantly iterate PBRs); ACK levels (ack_level 0/1/2) specified; Glossary and key references updated to Order 0/5 and ack_level. Prior: 2.1 blog_offset, memory layout, scatter-gather, PBR wraparound, sequencer lease, replication–Order 5 ACK semantics, subscriber read modes, invariant I7.*
+*Document version 2.4. Updates: §3.2 scoped to Order 2 baseline; §3.2.1 shard-worker sequencer (required for Order 5); inline Order 5 code removed from §3.2; committed_seq updater (CompletedRange + min-heap, reconciliation watchdog); anti-wraparound guard; recovery Steps 4b/4c (collector cursor, replication floor); I-PROC, I-COLLECT; Order 5 latency with L_sequencer_pickup (15–50 μs); stuck-slot timeout (10 s); SKIP broker_id=0; Appendix A safety/config, Appendix D glossary (shard worker, SPSC, CompletedRange, drain cycle, reconciliation watchdog). Prior: 2.3.*
+Entry.flags; 16 MB checkpoint region; NOP/SKIP replica and CV handling; Property 2b (PROP-SKIP); invariants I-CLIENT, PROP-SKIP, I-VIS, I-WRAP; Order 5 latency model; base_timeout_ms (5 ms); checkpointing and accept-first-seen; Appendix config, metrics, glossary, design notes, related docs. Prior: 2.2.*
+ checkpointing and accept-first-seen; Appendix config, metrics, glossary, design notes, related docs. Prior: 2.2.*

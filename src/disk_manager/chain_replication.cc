@@ -42,6 +42,10 @@ ChainReplicationManager::~ChainReplicationManager() {
 }
 
 void ChainReplicationManager::Start() {
+    if (cxl_addr_ == nullptr || goi_ == nullptr || cv_ == nullptr) {
+        LOG(ERROR) << "ChainReplicationManager: invalid pointers, not starting replication thread";
+        return;
+    }
     stop_.store(false, std::memory_order_release);
     replication_thread_ = std::thread(&ChainReplicationManager::ReplicationThread, this);
     LOG(INFO) << "ChainReplicationManager: Started replication thread";

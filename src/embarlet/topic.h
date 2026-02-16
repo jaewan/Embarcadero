@@ -10,6 +10,7 @@
 #include <memory>
 #include <vector>
 #include <deque>
+#include <queue>
 
 #include "../disk_manager/corfu_replication_client.h"
 #include "../disk_manager/scalog_replication_client.h"
@@ -30,6 +31,12 @@ namespace Embarcadero {
 
 #ifndef CACHELINE_SIZE
 #define CACHELINE_SIZE 64
+#endif
+
+#ifdef NDEBUG
+static constexpr bool kEnableDiagnostics = false;
+#else
+static constexpr bool kEnableDiagnostics = true;
 #endif
 
 // [[PHASE_1B]] Epoch-batched sequencing + Level 5 hold buffer (design §3.2)
@@ -84,6 +91,7 @@ using ClientState5 = OptimizedClientState;
 struct HoldEntry5 {
 	PendingBatch5 batch;
 	HoldBatchMetadata meta;  // Copy at hold time so we never read ring after consumed_through advances
+	uint64_t hold_start_ns{0};
 };
 struct ExpiredHoldEntry {
 	size_t client_id{0};
@@ -195,7 +203,9 @@ class Topic {
 		 * Destructor - ensures all threads are stopped and joined
 		 */
 	~Topic() {
-		stop_threads_ = true;
+		stop_threads_.store(true, std::memory_order_release);
+		committed_seq_updater_stop_.store(true, std::memory_order_release);
+		committed_seq_updater_cv_.notify_all();
 		for (auto& shard : level5_shards_) {
 			if (shard) {
 				std::lock_guard<std::mutex> lock(shard->mu);
@@ -217,6 +227,9 @@ class Topic {
 			// [[PHASE_3]] Join GOI recovery thread if running
 			if(goi_recovery_thread_.joinable()){
 				goi_recovery_thread_.join();
+			}
+			if (committed_seq_updater_thread_.joinable()) {
+				committed_seq_updater_thread_.join();
 			}
 			for (std::thread& thread : level5_shard_threads_) {
 				if (thread.joinable()) {
@@ -326,6 +339,12 @@ class Topic {
 		bool ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
+		/**
+		 * @brief Publish a fully received batch into its reserved PBR slot.
+		 * Writes BatchHeader, marks batch_complete, and flushes both cachelines for CXL visibility.
+		 * @return true on success, false if inputs are invalid.
+		 */
+		bool PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader* batch_header_location);
 
 	private:
 		/** Lock-free PBR slot reservation (128-bit CAS). Returns false if ring full. @threading Concurrent. */
@@ -344,20 +363,17 @@ class Topic {
 		void AdvanceCVForSequencer(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count);
 		// [PHASE-3] Per-broker CV accumulation for single-fence commit
 		void AccumulateCVUpdate(
-			uint16_t broker_id,
-			uint64_t pbr_index,
-			uint64_t cumulative_msg_count,
-			absl::flat_hash_map<int, uint64_t>& max_cumulative,
-			absl::flat_hash_map<int, uint64_t>& max_pbr_index);
+				uint16_t broker_id,
+				uint64_t pbr_index,
+				uint64_t cumulative_msg_count,
+				std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
+				std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
 		void FlushAccumulatedCV(
-			const absl::flat_hash_map<int, uint64_t>& max_cumulative,
-			const absl::flat_hash_map<int, uint64_t>& max_pbr_index);
-		/**
-		 * [[PHASE_3]] Publish the contiguous GOI prefix via ControlBlock.committed_seq.
-		 * Single sequencer: update after writing GOI entries for an epoch.
-		 */
-		/** Update control_block->committed_seq to last GOI index written (contiguous prefix; design §3.2/§3.3). */
-		void UpdateCommittedSeq(uint64_t last_goi_index);
+				const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
+				const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
+		void EnqueueCompletedRange(uint64_t start, uint64_t end);
+		void CommittedSeqUpdaterThread();
+		void ResetCompletedRangeQueue();
 
 	/**
 	 * DelegationThread: Stage 2 (Local Ordering)
@@ -552,7 +568,7 @@ class Topic {
 		size_t ordered_offset_;
 
 		// Thread control
-		bool stop_threads_ = false;
+		std::atomic<bool> stop_threads_{false};
 		std::vector<std::thread> delegationThreads_;
 
 		std::thread sequencerThread_;
@@ -605,6 +621,8 @@ class Topic {
 		std::atomic<uint64_t> broker_epoch_{0};
 		// [[Issue #3]] Epoch from last CheckEpochOnce() for use when epoch_already_checked=true in ReservePBRSlotAndWriteEntry
 		std::atomic<uint64_t> last_checked_epoch_{0};
+		// [PHASE-2B] Shared atomic for sequencer to avoid cold CXL read of ControlBlock.epoch
+		std::atomic<uint64_t> cached_epoch_{0};
 		// [[PHASE_1A_EPOCH_FENCING]] Counter for periodic epoch check (every kEpochCheckInterval batches; design §4.2.1 "e.g. every 100 batches")
 		std::atomic<uint64_t> epoch_check_counter_{0};
 		static constexpr uint64_t kEpochCheckInterval = 100;
@@ -614,6 +632,8 @@ class Topic {
 		std::atomic<uint64_t> epoch_index_{0};
 		std::atomic<uint64_t> last_sequenced_epoch_{0};
 		std::atomic<bool> epoch_driver_done_{false}; // [[SHUTDOWN_SYNC]] Signals EpochDriverThread has finished sealing
+		// [[B0_TAIL_FIX]] When set, next ProcessLevel5BatchesShard treats all hold entries as expired (shutdown drain).
+		std::atomic<bool> force_expire_hold_on_next_process_{false};
 	// Epoch buffers for safe collection/sequencing (no concurrent merge/write).
 	EpochBuffer5 epoch_buffers_[3];
 		std::thread epoch_driver_thread_;
@@ -628,12 +648,13 @@ class Topic {
 			std::vector<PendingBatch5> ready;
 			absl::flat_hash_map<size_t, ClientState5> client_state;
 			absl::flat_hash_map<size_t, uint64_t> client_highest_committed;
-			std::map<size_t, std::map<size_t, HoldEntry5>> hold_buffer;  // client_id -> (client_seq -> entry)
+			absl::flat_hash_map<size_t, absl::flat_hash_map<size_t, HoldEntry5>> hold_buffer;  // client_id -> (client_seq -> entry)
 			size_t hold_buffer_size{0};
-			std::multimap<uint64_t, std::pair<size_t, size_t>> hold_expiry_queue;
 			absl::flat_hash_set<size_t> clients_with_held_batches;
 			std::vector<ExpiredHoldEntry> expired_hold_buffer;
+			std::vector<std::pair<size_t, size_t>> expired_hold_keys_buffer;
 			std::vector<PendingBatch5> deferred_level5;
+			std::vector<std::vector<PendingBatch5>> per_shard_cache;
 			FastDeduplicator dedup;
 			RadixSorter<PendingBatch5> radix_sorter;
 			// [PHASE-3] Per-shard CV accumulation for late/expired batches
@@ -645,19 +666,17 @@ class Topic {
 		std::vector<std::thread> level5_shard_threads_;
 		std::atomic<bool> level5_shards_started_{false};
 		static constexpr size_t kHoldBufferMaxEntries = 100000;
-		static constexpr int kMaxWaitEpochs = 3;
+		static constexpr uint64_t kOrder5BaseTimeoutNs = 5ULL * 1000 * 1000;  // 5ms wall-clock timeout
 		static constexpr uint64_t kClientTtlEpochs = 20000;
 		static constexpr uint64_t kClientGcEpochInterval = 1024;
 		static constexpr size_t kDeferredL5MaxEntries = kHoldBufferMaxEntries * 2;
 		std::atomic<uint64_t> current_epoch_for_hold_{0};  // Epoch for hold buffer expiry; atomic for shard workers
-		static constexpr size_t kDedupMaxEntries = 1 << 20;
-		absl::flat_hash_set<uint64_t> recent_batch_ids_;
-		std::deque<uint64_t> recent_batch_id_order_;
 		// [[PHASE_1B]] Export chain: per-broker subscription pointer (set by EpochSequencerThread on commit)
 		absl::flat_hash_map<int, BatchHeader*> phase1b_header_for_sub_;
 		absl::Mutex phase1b_header_for_sub_mu_;
 		// [[RING_ORDER]] Monotonic sequence for scanner_seq (BrokerScannerWorker5); fixes wrap-around sort
 		std::atomic<uint64_t> next_scanner_seq_{0};
+		std::vector<std::vector<PendingBatch5>> level5_per_shard_cache_;
 		// [PHASE-8-REVISED] Per-broker unbounded queues for from-hold batch export.
 		// Replaces SPSC ring to avoid deadlock when no subscriber consumes (throughput test).
 		// Uses per-broker mutex to minimize contention (vs global mutex).
@@ -693,5 +712,28 @@ class Topic {
 	// [[PHASE_3]] Recovery parameters (§4.2.2)
 	static constexpr uint64_t kChainReplicationTimeoutNs = 10'000'000;  // 10ms (10× expected ~1ms chain latency)
 	static constexpr uint64_t kRecoveryScanIntervalNs = 1'000'000;      // 1ms scan interval
+
+	struct CompletedRange {
+		uint64_t start{0};  // inclusive
+		uint64_t end{0};    // exclusive
+		bool operator>(const CompletedRange& other) const { return start > other.start; }
+	};
+	struct CompletedRangeSlot {
+		CompletedRange data{};
+		std::atomic<bool> ready{false};
+	};
+	static constexpr size_t kCompletedRangesRingCap = 65536;  // Power of 2
+	static constexpr size_t kCompletedRangesRingMask = kCompletedRangesRingCap - 1;
+	std::thread committed_seq_updater_thread_;
+	std::mutex committed_seq_updater_mu_;  // Event wait mutex (ring data itself is lock-free)
+	std::condition_variable committed_seq_updater_cv_;
+	std::array<CompletedRangeSlot, kCompletedRangesRingCap> completed_ranges_ring_{};
+	alignas(64) std::atomic<uint64_t> completed_ranges_head_{0};
+	alignas(64) std::atomic<uint64_t> completed_ranges_tail_{0};
+	std::atomic<bool> committed_seq_updater_stop_{false};
+	std::atomic<uint64_t> completed_ranges_enqueue_retries_{0};
+	std::atomic<uint64_t> completed_ranges_enqueue_wait_ns_{0};
+	std::atomic<uint64_t> completed_ranges_max_depth_{0};
+	std::atomic<uint64_t> committed_updater_pending_peak_{0};
 };
 } // End of namespace Embarcadero

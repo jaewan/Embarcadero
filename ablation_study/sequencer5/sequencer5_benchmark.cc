@@ -4607,6 +4607,10 @@ struct TraceRunResult {
 namespace {
 constexpr uint64_t TRACE_DEFAULT_WARMUP_MS = 2000;
 constexpr uint64_t TRACE_DEFAULT_MEASURE_MS = 5000;
+/// Capped injection rate (per broker) for scaling/ablation so we measure sequencer capacity, not PBR collapse. 500K/broker => 2 M/s total for 4 brokers.
+constexpr uint64_t TRACE_CAP_RATE_PER_BROKER = 500000ULL;
+/// Lower cap for Order 5 (heavier path) to avoid hold-buffer livelock and get meaningful sort/hold/skip stats.
+constexpr uint64_t TRACE_ORDER5_CAP_RATE_PER_BROKER = 200000ULL;
 
 StatResult compute_stats(const std::vector<double>& values) {
     std::vector<double> copy = values;
@@ -4841,9 +4845,9 @@ void run_ablation1_trace_deconfounded(const Config& cfg) {
         speedups.reserve(static_cast<size_t>(runs));
         for (int run = 0; run < runs; ++run) {
             sc.mode = SequencerMode::PER_BATCH_ATOMIC;
-            double t_batch = run_single_trace(sc, traces);
+            double t_batch = run_single_trace(sc, traces, TRACE_CAP_RATE_PER_BROKER);
             sc.mode = SequencerMode::PER_EPOCH_ATOMIC;
-            double t_epoch = run_single_trace(sc, traces);
+            double t_epoch = run_single_trace(sc, traces, TRACE_CAP_RATE_PER_BROKER);
             batch_runs.push_back(t_batch);
             epoch_runs.push_back(t_epoch);
             if (t_batch > 0) speedups.push_back(t_epoch / t_batch);
@@ -4872,6 +4876,7 @@ void run_trace_benchmark(const Config& cfg) {
     std::cout << "  sustained trace mode (refill threads), "
               << (TRACE_DEFAULT_WARMUP_MS / 1000.0) << "s warmup + "
               << (TRACE_DEFAULT_MEASURE_MS / 1000.0) << "s measure\n";
+    std::cout << "  scaling/ablation: capped injection " << (TRACE_CAP_RATE_PER_BROKER / 1000) << " K/broker (Order 2); Order 5: " << (TRACE_ORDER5_CAP_RATE_PER_BROKER / 1000) << " K/broker\n";
 
     tc.level5_ratio = 0.0;
     run_trace_saturation_sweep(cfg, TraceGenerator().generate(tc));
@@ -4898,7 +4903,7 @@ void run_trace_benchmark(const Config& cfg) {
         int runs = std::max(1, cfg.num_runs);
         tputs.reserve(static_cast<size_t>(runs));
         for (int run = 0; run < runs; ++run) {
-            double t = run_single_trace(sc, traces);
+            double t = run_single_trace(sc, traces, TRACE_CAP_RATE_PER_BROKER);
             tputs.push_back(t);
         }
         StatResult t_stats = compute_stats(tputs);
@@ -4938,7 +4943,7 @@ void run_trace_benchmark(const Config& cfg) {
         std::vector<double> holds;
         bool all_valid = true;
         for (int run = 0; run < std::max(1, cfg.num_runs); ++run) {
-            TraceRunResult result = run_single_trace_detailed(sc, traces);
+            TraceRunResult result = run_single_trace_detailed(sc, traces, TRACE_ORDER5_CAP_RATE_PER_BROKER);
             tputs.push_back(result.throughput);
             p99s.push_back(result.p99_us);
             skips.push_back(static_cast<double>(result.timeout_skipped));
@@ -4992,7 +4997,7 @@ void run_trace_benchmark(const Config& cfg) {
         std::vector<double> skips;
         bool all_valid = true;
         for (int run = 0; run < std::max(1, cfg.num_runs); ++run) {
-            TraceRunResult result = run_single_trace_detailed(sc, traces);
+            TraceRunResult result = run_single_trace_detailed(sc, traces, TRACE_ORDER5_CAP_RATE_PER_BROKER);
             tputs.push_back(result.throughput);
             p99s.push_back(result.p99_us);
             hold_peaks.push_back(static_cast<double>(result.hold_peak));
@@ -5041,9 +5046,9 @@ void run_trace_benchmark(const Config& cfg) {
         speedups.reserve(static_cast<size_t>(runs));
         for (int r = 0; r < runs; ++r) {
             sc.mode = SequencerMode::PER_BATCH_ATOMIC;
-            double t_batch = run_single_trace(sc, traces);
+            double t_batch = run_single_trace(sc, traces, TRACE_CAP_RATE_PER_BROKER);
             sc.mode = SequencerMode::PER_EPOCH_ATOMIC;
-            double t_epoch = run_single_trace(sc, traces);
+            double t_epoch = run_single_trace(sc, traces, TRACE_CAP_RATE_PER_BROKER);
             batch_runs.push_back(t_batch);
             epoch_runs.push_back(t_epoch);
             if (t_batch > 0) speedups.push_back(t_epoch / t_batch);

@@ -134,6 +134,10 @@ namespace Embarcadero{
 				corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>(broker_id, log_to_memory);
 				return;
 			}else if(sequencerType == heartbeat_system::SequencerType::EMBARCADERO){
+				if (cxl_addr_ == nullptr) {
+					LOG(ERROR) << "DiskManager: cxl_addr is null, disabling chain replication startup";
+					return;
+				}
 				// [[PHASE_2]] Chain replication with GOI + CompletionVector
 				// Configuration via environment variables:
 				// - EMBARCADERO_REPLICA_ID: This broker's position in replication chain (0=head, f=tail)

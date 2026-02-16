@@ -7,20 +7,19 @@
 #include <xmmintrin.h>  // For _mm_pause()
 
 // Project includes
-#include "topic_manager.h"
 #include "../cxl_manager/cxl_manager.h"
 #include "../disk_manager/disk_manager.h"
 
 namespace Embarcadero {
 
-constexpr size_t NT_THRESHOLD = 128;
+constexpr size_t NT_THRESHOLD = 4096; // [[P5]] Increase threshold to 4KB to avoid cache pollution for small batches
 
 /**
  * Non-temporal memory copy function optimized for large data transfers
  * Uses streaming stores to bypass cache for large copies
  */
 void nt_memcpy(void* __restrict dst, const void* __restrict src, size_t size) {
-	static const size_t CACHE_LINE_SIZE = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+	static constexpr size_t CACHE_LINE_SIZE = 64;
 
 	// For small copies, use standard memcpy
 	if (size < NT_THRESHOLD) {
@@ -61,6 +60,15 @@ void nt_memcpy(void* __restrict dst, const void* __restrict src, size_t size) {
 	if (remaining > 0) {
 		memcpy(aligned_dst, aligned_src, remaining);
 	}
+}
+
+void TopicManager::Shutdown() {
+	if (shutdown_done_.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	shutting_down_.store(true, std::memory_order_release);
+	absl::WriterMutexLock lock(&topics_mutex_);
+	topics_.clear();
 }
 
 /**
@@ -114,6 +122,7 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 }
 
 struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_SIZE]) {
+	if (shutting_down_.load(std::memory_order_acquire)) return nullptr;
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	TInode* replica_tinode = nullptr;
 
@@ -235,6 +244,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		bool replicate_tinode,
 		int ack_level,
 		SequencerType seq_type) {
+	if (shutting_down_.load(std::memory_order_acquire)) return nullptr;
 
 	LOG(INFO) << "CreateNewTopicInternal: topic=" << topic << " order=" << order 
 	          << " replication_factor=" << replication_factor << " ack_level=" << ack_level;
@@ -405,6 +415,7 @@ bool TopicManager::CreateNewTopic(
         bool replicate_tinode,
         int ack_level,
         heartbeat_system::SequencerType seq_type) {
+	if (shutting_down_.load(std::memory_order_acquire)) return false;
 	
 	// Direct call without string interning overhead
 	struct TInode* tinode = CreateNewTopicInternal(
@@ -432,6 +443,7 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		SequencerType &seq_type,
 		BatchHeader* &batch_header_location,
 		bool epoch_already_checked) {
+	if (shutting_down_.load(std::memory_order_acquire)) return nullptr;
 	
 	// DEADLOCK FIX: Only head broker creates topics to prevent concurrent creation deadlocks.
 	// [[B0_ACK_BUG1_ROOT_CAUSE]] Do NOT create topic here with order=0. If we do, the topic is
@@ -484,6 +496,7 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 }
 
 bool TopicManager::ReserveBLogSpace(const char* topic, size_t size, void*& log) {
+	if (shutting_down_.load(std::memory_order_acquire)) return false;
 	// [[RECV_DIRECT_TO_CXL]] Topic must already exist (created by CreateNewTopic with correct order).
 	// Do not create here with order=0 - see ACK_PIPELINE_BUG1_B0_ROOT_CAUSE.md
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
@@ -515,6 +528,7 @@ bool TopicManager::ReserveBLogSpace(Topic* topic_ptr, size_t size, void*& log, b
 }
 
 Topic* TopicManager::GetTopic(const std::string& topic_name) {
+	if (shutting_down_.load(std::memory_order_acquire)) return nullptr;
 	absl::ReaderMutexLock lock(&topics_mutex_);
 	auto it = topics_.find(topic_name);
 	return (it == topics_.end()) ? nullptr : it->second.get();
@@ -556,6 +570,13 @@ bool TopicManager::ReservePBRSlotAfterRecv(const char* topic, BatchHeader& batch
 	return it->second->ReservePBRSlotAfterRecv(batch_header, log, segment_header, logical_offset, batch_header_location);
 }
 
+bool TopicManager::PublishPBRSlotAfterRecv(const char* topic, const BatchHeader& batch_header, BatchHeader* batch_header_location) {
+	absl::ReaderMutexLock lock(&topics_mutex_);
+	auto it = topics_.find(topic);
+	if (it == topics_.end()) return false;
+	return it->second->PublishPBRSlotAfterRecv(batch_header, batch_header_location);
+}
+
 bool TopicManager::ReservePBRSlotAndWriteEntry(Topic* topic_ptr, BatchHeader& batch_header, void* log,
 		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 		bool epoch_already_checked) {
@@ -566,6 +587,10 @@ bool TopicManager::ReservePBRSlotAfterRecv(Topic* topic_ptr, BatchHeader& batch_
 		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 		bool epoch_already_checked) {
 	return topic_ptr && topic_ptr->ReservePBRSlotAfterRecv(batch_header, log, segment_header, logical_offset, batch_header_location, epoch_already_checked);
+}
+
+bool TopicManager::PublishPBRSlotAfterRecv(Topic* topic_ptr, const BatchHeader& batch_header, BatchHeader* batch_header_location) {
+	return topic_ptr && topic_ptr->PublishPBRSlotAfterRecv(batch_header, batch_header_location);
 }
 
 bool TopicManager::GetBatchToExport(

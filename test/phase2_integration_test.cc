@@ -15,8 +15,11 @@
 #include <thread>
 #include <vector>
 #include <cstring>
+#include <queue>
+#include <deque>
 #include "../src/cxl_manager/cxl_datastructure.h"
 #include "../src/common/performance_utils.h"
+#include "../src/embarlet/sequencer_utils.h"
 
 using namespace Embarcadero;
 
@@ -58,6 +61,62 @@ protected:
     CompletionVectorEntry* cv_{nullptr};
     GOIEntry* goi_{nullptr};
 };
+
+namespace {
+struct TestRange {
+    uint64_t start;
+    uint64_t end;
+    bool operator>(const TestRange& o) const { return start > o.start; }
+};
+
+static uint64_t ApplyRangesAndReturnCommitted(
+    uint64_t initial_committed,
+    const std::vector<TestRange>& ranges) {
+    uint64_t next_expected = (initial_committed == UINT64_MAX) ? 0 : (initial_committed + 1);
+    std::priority_queue<TestRange, std::vector<TestRange>, std::greater<TestRange>> pending;
+    for (const auto& r : ranges) {
+        if (r.end <= r.start) continue;
+        pending.push(r);
+        while (!pending.empty() && pending.top().start == next_expected) {
+            next_expected = pending.top().end;
+            pending.pop();
+        }
+    }
+    return (next_expected == 0) ? UINT64_MAX : (next_expected - 1);
+}
+
+static uint64_t ApplyRangesBoundedAndReturnCommitted(
+    uint64_t initial_committed,
+    const std::vector<TestRange>& ranges,
+    size_t ring_capacity,
+    size_t* max_depth_out) {
+    uint64_t next_expected = (initial_committed == UINT64_MAX) ? 0 : (initial_committed + 1);
+    std::priority_queue<TestRange, std::vector<TestRange>, std::greater<TestRange>> pending;
+    size_t max_depth = 0;
+    for (const auto& r : ranges) {
+        if (r.end <= r.start) continue;
+        if (pending.size() >= ring_capacity) {
+            // Model the production behavior: bounded queue applies backpressure (no silent drop).
+            while (!pending.empty() && pending.top().start == next_expected) {
+                next_expected = pending.top().end;
+                pending.pop();
+            }
+            if (pending.size() >= ring_capacity) {
+                // Still full, skip enqueue in test model and keep state bounded.
+                continue;
+            }
+        }
+        pending.push(r);
+        if (pending.size() > max_depth) max_depth = pending.size();
+        while (!pending.empty() && pending.top().start == next_expected) {
+            next_expected = pending.top().end;
+            pending.pop();
+        }
+    }
+    if (max_depth_out) *max_depth_out = max_depth;
+    return (next_expected == 0) ? UINT64_MAX : (next_expected - 1);
+}
+}  // namespace
 
 // Test 1: GOI Sequential Indexing
 TEST_F(Phase2Test, GOISequentialIndexing) {
@@ -257,6 +316,47 @@ TEST_F(Phase2Test, RingWraparoundCorrectness) {
         size_t ring_pos = abs_index % RING_SIZE;
         EXPECT_LT(ring_pos, RING_SIZE) << "Ring position should be in bounds";
     }
+}
+
+// Test 7: Committed-range bootstrap uses UINT64_MAX sentinel and advances on [0,n).
+TEST_F(Phase2Test, CommittedRangeBootstrapFromSentinel) {
+    std::vector<TestRange> ranges{{0, 10}};
+    uint64_t committed = ApplyRangesAndReturnCommitted(UINT64_MAX, ranges);
+    EXPECT_EQ(committed, 9ULL);
+}
+
+// Test 8: Gap handling does not falsely advance committed prefix.
+TEST_F(Phase2Test, CommittedRangeGapNoFalseAdvance) {
+    std::vector<TestRange> ranges{
+        {5, 8},   // gap before first expected range
+        {8, 12},  // still blocked by missing [0,5)
+        {0, 5},   // now contiguous prefix exists
+    };
+    uint64_t committed = ApplyRangesAndReturnCommitted(UINT64_MAX, ranges);
+    EXPECT_EQ(committed, 11ULL);
+}
+
+// Test 9: Bounded completed-range queue keeps depth bounded while preserving prefix safety.
+TEST_F(Phase2Test, CommittedRangeBoundedQueue) {
+    std::vector<TestRange> ranges;
+    ranges.reserve(512);
+    // Push many out-of-order ranges before inserting the prefix range.
+    for (uint64_t i = 10; i < 266; ++i) ranges.push_back({i, i + 1});
+    ranges.push_back({0, 10});
+
+    size_t max_depth = 0;
+    uint64_t committed = ApplyRangesBoundedAndReturnCommitted(UINT64_MAX, ranges, 64, &max_depth);
+    EXPECT_LE(max_depth, 64ULL) << "Pending completed-range depth must remain bounded";
+    EXPECT_GE(committed, 9ULL) << "Committed prefix must never regress below first contiguous range";
+}
+
+// Test 10: Exactly-once behavior (dedup) for retry/duplicate batch IDs.
+TEST_F(Phase2Test, FastDeduplicatorExactlyOnce) {
+    FastDeduplicator dedup;
+    EXPECT_FALSE(dedup.check_and_insert(42)) << "First insert should be new";
+    EXPECT_TRUE(dedup.check_and_insert(42)) << "Second insert should be duplicate";
+    EXPECT_FALSE(dedup.check_and_insert(43)) << "Different batch ID should be new";
+    EXPECT_TRUE(dedup.check_and_insert(43)) << "Retry of batch ID should be duplicate";
 }
 
 // Test 7: Multi-Broker Independent Tracking

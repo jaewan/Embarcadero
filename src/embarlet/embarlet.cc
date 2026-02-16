@@ -251,9 +251,13 @@ int main(int argc, char* argv[]) {
 
 	// Create and connect all manager components
 	// Note: is_sequencer_node was already fetched from config before HeartBeatManager creation
-	Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_ip);
-	Embarcadero::DiskManager disk_manager(broker_id, cxl_manager.GetCXLAddr(),
-			replicate_to_memory, sequencerType);
+		Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_ip);
+		if (cxl_manager.GetCXLAddr() == nullptr) {
+			LOG(ERROR) << "CXL initialization failed for broker " << broker_id << ", aborting startup";
+			return EXIT_FAILURE;
+		}
+		Embarcadero::DiskManager disk_manager(broker_id, cxl_manager.GetCXLAddr(),
+				replicate_to_memory, sequencerType);
 	// Skip networking on sequencer-only node (no client connections)
 	Embarcadero::NetworkManager network_manager(broker_id, num_network_io_threads, is_sequencer_node);
 	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id, is_sequencer_node);
@@ -300,9 +304,9 @@ int main(int argc, char* argv[]) {
 	// listen() causes clients to connect too early → connection refused → one broker shows 0/3
 	// subscriber connections (9/12 total). For sequencer-only nodes we skip networking so
 	// IsListening() stays false; do not wait in that case.
-	if (!is_sequencer_node) {
-		const int listen_wait_seconds = 30;
-		const int poll_ms = 100;
+		if (!is_sequencer_node) {
+			const int listen_wait_seconds = 30;
+			const int poll_ms = 100;
 		int waited_ms = 0;
 		while (!network_manager.IsListening() && waited_ms < listen_wait_seconds * 1000) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
@@ -310,11 +314,14 @@ int main(int argc, char* argv[]) {
 			if (waited_ms % 5000 == 0 && waited_ms > 0) {
 				LOG(INFO) << "Waiting for data port to listen (broker " << broker_id << ")... " << (waited_ms / 1000) << "s";
 			}
+			}
+			if (!network_manager.IsListening()) {
+				LOG(ERROR) << "Data port did not start listening within " << listen_wait_seconds << "s (broker " << broker_id << ")";
+				network_manager.Shutdown();
+				topic_manager.Shutdown();
+				return EXIT_FAILURE;
+			}
 		}
-		if (!network_manager.IsListening()) {
-			LOG(ERROR) << "Data port did not start listening within " << listen_wait_seconds << "s (broker " << broker_id << ")";
-		}
-	}
 
 	// Signal initialization completion
 	SignalScriptReady();
@@ -324,12 +331,15 @@ int main(int argc, char* argv[]) {
 	// Run Wait() in a thread so we can poll g_shutdown_requested and call RequestShutdown(),
 	// allowing destructors to run (stop_threads_ set → EpochSequencerThread2 drain, etc.).
 	std::thread wait_thread([&heartbeat_manager]() { heartbeat_manager.Wait(); });
-	while (g_shutdown_requested == 0) {
-		std::this_thread::sleep_for(std::chrono::seconds(1));
-	}
-	LOG(INFO) << "Shutdown requested, stopping heartbeat and joining threads...";
-	heartbeat_manager.RequestShutdown();
-	if (wait_thread.joinable()) wait_thread.join();
+		while (g_shutdown_requested == 0) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+		LOG(INFO) << "Shutdown requested, stopping heartbeat and joining threads...";
+		heartbeat_manager.RequestShutdown();
+		// Explicit shutdown ordering to avoid late network callbacks touching destroyed Topic objects.
+		network_manager.Shutdown();
+		topic_manager.Shutdown();
+		if (wait_thread.joinable()) wait_thread.join();
 
 	LOG(INFO) << "Embarcadero Terminating";
 	return EXIT_SUCCESS;
