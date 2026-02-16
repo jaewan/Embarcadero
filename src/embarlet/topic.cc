@@ -48,28 +48,15 @@ Topic::Topic(
 	logical_offset_(0),
 	written_logical_offset_((size_t)-1),
 	num_slots_(BATCHHEADERS_SIZE / sizeof(BatchHeader)),
-	current_segment_(segment_metadata),
-	// [[SEQUENCER_ONLY_HEAD_NODE]] Detect sequencer-only mode from nullptr segment
-	is_sequencer_only_(segment_metadata == nullptr && broker_id == 0) {
+	current_segment_(segment_metadata) {
 
 		// Validate tinode pointer first
 		if (!tinode_) {
 			LOG(FATAL) << "TInode is null for topic: " << topic_name;
 		}
 
-		// [[SEQUENCER_ONLY_HEAD_NODE]] Skip offset validation for sequencer-only head node
-		// Sequencer-only node has no segment/batch header ring allocated, offsets[0] is unused
-		if (is_sequencer_only_) {
-			LOG(INFO) << "[SEQUENCER_ONLY] Topic " << topic_name << " created in sequencer-only mode"
-			          << " (broker_id=" << broker_id << ", no local data path)";
-			// Initialize addresses to nullptr/0 since we have no local ring
-			log_addr_.store(0);
-			batch_headers_ = 0;
-			first_message_addr_ = nullptr;
-			first_batch_headers_addr_ = nullptr;
-		} else {
-			// Normal path: validate offsets before using them
-			if (tinode_->offsets[broker_id_].log_offset == 0) {
+		// Validate offsets before using them
+		if (tinode_->offsets[broker_id_].log_offset == 0) {
 				LOG(ERROR) << "Invalid log_offset for broker " << broker_id_ << " in topic: " << topic_name
 				           << ". Waiting for tinode initialization...";
 
@@ -90,32 +77,31 @@ Topic::Topic(
 				          << "ms for broker " << broker_id_ << " in topic: " << topic_name;
 			}
 
-			// Initialize addresses based on offsets
-			log_addr_.store(static_cast<unsigned long long int>(
-						reinterpret_cast<uintptr_t>(cxl_addr_) + tinode_->offsets[broker_id_].log_offset));
+		// Initialize addresses based on offsets
+		log_addr_.store(static_cast<unsigned long long int>(
+					reinterpret_cast<uintptr_t>(cxl_addr_) + tinode_->offsets[broker_id_].log_offset));
 
-			batch_headers_ = static_cast<unsigned long long int>(
-					reinterpret_cast<uintptr_t>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+		batch_headers_ = static_cast<unsigned long long int>(
+				reinterpret_cast<uintptr_t>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 
-			first_message_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) +
-				tinode_->offsets[broker_id_].log_offset;
+		first_message_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) +
+			tinode_->offsets[broker_id_].log_offset;
 
-			first_batch_headers_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) +
-				tinode_->offsets[broker_id_].batch_headers_offset;
-			// [[CODE_REVIEW_FIX]] Initial cache = "all free" sentinel so watermark logic is correct before first refresh
-			cached_pbr_consumed_through_.store(BATCHHEADERS_SIZE, std::memory_order_release);
-			// [[LOCKFREE_PBR]] Consumed seq = 0 (all slots free; sequencer sentinel is BATCHHEADERS_SIZE bytes)
-			cached_consumed_seq_.store(0, std::memory_order_release);
+		first_batch_headers_addr_ = reinterpret_cast<uint8_t*>(cxl_addr_) +
+			tinode_->offsets[broker_id_].batch_headers_offset;
+		// [[CODE_REVIEW_FIX]] Initial cache = "all free" sentinel so watermark logic is correct before first refresh
+		cached_pbr_consumed_through_.store(BATCHHEADERS_SIZE, std::memory_order_release);
+		// [[LOCKFREE_PBR]] Consumed seq = 0 (all slots free; sequencer sentinel is BATCHHEADERS_SIZE bytes)
+		cached_consumed_seq_.store(0, std::memory_order_release);
 #if defined(__x86_64__) && defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16)
-			use_lock_free_pbr_ = true;  // [[CODE_REVIEW Issue #6]] Trust CMPXCHG16B on x86-64; some libs report false for 16B atomics
+		use_lock_free_pbr_ = true;  // [[CODE_REVIEW Issue #6]] Trust CMPXCHG16B on x86-64; some libs report false for 16B atomics
 #else
-			use_lock_free_pbr_ = pbr_state_.is_lock_free();
+		use_lock_free_pbr_ = pbr_state_.is_lock_free();
 #endif
-			if (num_slots_ == 0) {
-				LOG(ERROR) << "PBR num_slots_ is 0 for topic " << topic_name_
-					<< " (BATCHHEADERS_SIZE=" << BATCHHEADERS_SIZE
-					<< ", sizeof(BatchHeader)=" << sizeof(BatchHeader) << "); PBR reservation will fail.";
-			}
+		if (num_slots_ == 0) {
+			LOG(ERROR) << "PBR num_slots_ is 0 for topic " << topic_name_
+				<< " (BATCHHEADERS_SIZE=" << BATCHHEADERS_SIZE
+				<< ", sizeof(BatchHeader)=" << sizeof(BatchHeader) << "); PBR reservation will fail.";
 		}
 
 		ack_level_ = tinode_->ack_level;
@@ -297,11 +283,6 @@ inline void Topic::UpdateTInodeWritten(size_t written, size_t written_addr) {
  * Ownership: Writes to BlogMessageHeader bytes 16-31 (delegation region)
  */
 void Topic::DelegationThread() {
-	// [[SEQUENCER_ONLY_HEAD_NODE]] No local log on sequencer-only node - nothing to delegate
-	if (is_sequencer_only_) {
-		VLOG(1) << "DelegationThread: sequencer-only topic " << topic_name_ << ", no local delegation";
-		return;
-	}
 	// Validate first_message_addr_ before using it
 	if (!first_message_addr_ || first_message_addr_ == cxl_addr_) {
 		LOG(FATAL) << "Invalid first_message_addr_ in DelegationThread for topic: " << topic_name_
@@ -1410,17 +1391,6 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		BatchHeader* &batch_header_location,
 		bool epoch_already_checked) {
 
-	// [[SEQUENCER_ONLY_HEAD_NODE]] Defense in depth: fail fast if called on sequencer-only Topic
-	// Sequencer-only node has no segment/batch header ring, offsets[0] is uninitialized.
-	// NetworkManager is not started so this shouldn't be called, but guard against future misuse.
-	if (is_sequencer_only_) {
-		LOG(ERROR) << "[SEQUENCER_ONLY] EmbarcaderoGetCXLBuffer called on sequencer-only Topic "
-		           << topic_name_ << " - this should not happen";
-		log = nullptr;
-		batch_header_location = nullptr;
-		return nullptr;
-	}
-
 	// [[Issue #3]] When caller did CheckEpochOnce at batch start, skip duplicate epoch check.
 	if (!epoch_already_checked) {
 		uint64_t n = epoch_check_counter_.fetch_add(1, std::memory_order_relaxed);
@@ -1508,12 +1478,10 @@ bool Topic::CheckEpochOnce() {
 	return was_stale;
 }
 
-// [[RECV_DIRECT_TO_CXL]] Lock-free BLog allocation (~10ns). Returns nullptr if sequencer-only.
+// [[RECV_DIRECT_TO_CXL]] Lock-free BLog allocation (~10ns).
 // [[PHASE_1A_EPOCH_FENCING]] Design §4.2.1: refuse writes if broker epoch is stale (zombie broker).
 // [[Issue #3]] When epoch_already_checked true, skip epoch check (caller did CheckEpochOnce at batch start).
 void* Topic::ReserveBLogSpace(size_t size, bool epoch_already_checked) {
-	if (is_sequencer_only_) return nullptr;
-
 	if (!epoch_already_checked) {
 		uint64_t n = epoch_check_counter_.fetch_add(1, std::memory_order_relaxed);
 		bool force_full_read = (n % kEpochCheckInterval == 0);
@@ -1699,7 +1667,6 @@ void Topic::UpdateWrittenToLastComplete() {
 }
 
 int Topic::GetPBRUtilizationPct() {
-	if (is_sequencer_only_) return -1;
 	if (!first_batch_headers_addr_) return -1;
 	uint64_t n = pbr_cache_refresh_counter_.fetch_add(1, std::memory_order_relaxed);
 	if (n % kPBRCacheRefreshInterval == 0) {
@@ -1779,7 +1746,6 @@ bool Topic::ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, si
 bool Topic::ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
 		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 		bool epoch_already_checked) {
-	if (is_sequencer_only_) return false;
 	if (!first_batch_headers_addr_) return false;
 
 	uint64_t current_epoch;
@@ -1908,7 +1874,6 @@ bool Topic::PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader
 bool Topic::ReservePBRSlotAndWriteEntry(BatchHeader& batch_header, void* log,
 		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 		bool epoch_already_checked) {
-	if (is_sequencer_only_) return false;
 	if (!first_batch_headers_addr_) return false;
 
 	uint64_t current_epoch;
@@ -2785,21 +2750,6 @@ void Topic::Sequencer5() {
 		         << "WARNING: Brokers not in this list will NOT be scanned!";
 	}
 
-	// [[SEQUENCER_ONLY_HEAD_NODE]] Filter out broker 0 when sequencer-only
-	// Sequencer-only head node has no B0 ring allocated, so don't spawn scanner for B0
-	if (is_sequencer_only_) {
-		registered_brokers.erase(0);
-		LOG(INFO) << "[SEQUENCER_ONLY] Sequencer5: filtered out B0 from scanner set, scanning brokers: "
-		          << [&]() {
-		              std::string s;
-		              for (int b : registered_brokers) s += std::to_string(b) + " ";
-		              return s;
-		          }();
-		LOG(INFO) << "[B0_ACK_DEBUG] Sequencer5: B0 will NOT be scanned -> CV[0] will never advance -> B0 ACKs stay 0";
-	} else {
-		LOG(INFO) << "[B0_ACK_DEBUG] Sequencer5: B0 included in scanner set (not sequencer-only); B0 batches will be committed and CV[0] can advance";
-	}
-
 	// [[PHASE_1A_EPOCH_FENCING]] Epoch increment on sequencer start (§4.2)
 	// New sequencer writes epoch+1 to ControlBlock so zombies see new epoch and replicas reject stale entries
 	ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
@@ -2890,11 +2840,6 @@ void Topic::Sequencer2() {
 			broker_list += "B" + std::to_string(b);
 		}
 		LOG(INFO) << "Sequencer2: registered_brokers at startup = [" << broker_list << "] (count=" << registered_brokers.size() << ")";
-	}
-
-	if (is_sequencer_only_) {
-		registered_brokers.erase(0);
-		LOG(INFO) << "[SEQUENCER_ONLY] Sequencer2: filtered out B0 from scanner set";
 	}
 
 	ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
@@ -3053,11 +2998,6 @@ void Topic::CheckAndSpawnNewScanners() {
 	// Get current registered brokers
 	absl::btree_set<int> current_brokers;
 	GetRegisteredBrokerSet(current_brokers);
-
-	// [[SEQUENCER_ONLY_HEAD_NODE]] Filter out B0 if sequencer-only
-	if (is_sequencer_only_) {
-		current_brokers.erase(0);
-	}
 
 	// Check for new brokers and spawn scanners
 	absl::MutexLock lock(&scanner_management_mu_);

@@ -1552,7 +1552,7 @@ void Publisher::SubscribeToClusterStatus() {
 		// Inner loop: process reads until Read() fails or shutdown
 		while (!shutdown_.load(std::memory_order_acquire)) {
 			if (reader->Read(&cluster_status)) {
-			// [[SEQUENCER_ONLY_HEAD_NODE]] Use broker_info if available (includes accepts_publishes)
+			// Use broker_info if available (includes accepts_publishes)
 			// Fall back to new_nodes for backward compatibility with older brokers
 			bool use_broker_info = cluster_status.broker_info_size() > 0;
 			LOG(INFO) << "SubscribeToCluster: Received cluster status update with "
@@ -1567,9 +1567,7 @@ void Publisher::SubscribeToClusterStatus() {
 			}
 
 			if (use_broker_info) {
-				// [[SEQUENCER_ONLY_HEAD_NODE]] Treat broker_info as authoritative: set brokers_ and
-				// nodes_ only from brokers with accepts_publishes=true (avoids carrying over
-				// constructor-seeded broker 0 when head is sequencer-only).
+				// Treat broker_info as authoritative: set brokers_ and nodes_ from brokers with accepts_publishes=true
 				absl::MutexLock lock(&mutex_);
 
 				brokers_.clear();
@@ -1582,7 +1580,7 @@ void Publisher::SubscribeToClusterStatus() {
 						         << " (accepts_publishes=true)";
 					} else {
 						VLOG(1) << "SubscribeToCluster: Skipping broker " << broker_id
-						         << " (accepts_publishes=false, sequencer-only node)";
+						         << " (accepts_publishes=false)";
 					}
 				}
 				std::sort(brokers_.begin(), brokers_.end());

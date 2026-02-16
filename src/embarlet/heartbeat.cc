@@ -23,24 +23,17 @@ static std::string MaybeForceGrpcIPv4Address(const std::string& address) {
 // HeartBeatServiceImpl implementation
 //
 
-HeartBeatServiceImpl::HeartBeatServiceImpl(std::string head_addr, bool is_sequencer_node)
-	: is_sequencer_node_(is_sequencer_node) {
+HeartBeatServiceImpl::HeartBeatServiceImpl(std::string head_addr) {
 	// Insert head node to the nodes_ map
 	int head_broker_id = 0;
 	std::string head_network_addr = head_addr + ":" + std::to_string(PORT + head_broker_id);
-
-	// [[SEQUENCER_ONLY_HEAD_NODE]] Head node does not accept publishes if it's sequencer-only
-	bool head_accepts_publishes = !is_sequencer_node;
-	if (is_sequencer_node) {
-		LOG(INFO) << "[SEQUENCER_ONLY] HeartBeatService: head node (broker_id=0) accepts_publishes=false";
-	}
 
 	nodes_["0"] = {
 		head_broker_id,
 		head_addr,
 		head_network_addr,
 		std::chrono::steady_clock::now(),
-		head_accepts_publishes
+		true  // head always accepts publishes
 	};
 
 	// Start a thread to check follower node heartbeats
@@ -82,7 +75,6 @@ Status HeartBeatServiceImpl::RegisterNode(
 			VLOG(3) << "Registering node:" << request->address() << " broker:" << broker_id;
 			std::string network_mgr_addr = request->address() + ":" + std::to_string(broker_id + PORT);
 
-			// [[SEQUENCER_ONLY_HEAD_NODE]] All follower (data) brokers accept publishes
 			nodes_[request->node_id()] = {
 				broker_id,
 				request->address(),
@@ -161,8 +153,7 @@ grpc::Status HeartBeatServiceImpl::SubscribeToCluster(
 		for (const auto& node_entry : nodes_) {
 			int broker_id = node_entry.second.broker_id;
 
-			// [[SEQUENCER_ONLY_HEAD_NODE]] Always include full broker_info for every broker so
-			// client can treat it as authoritative (e.g. B0 accepts_publishes=false when sequencer-only).
+			// Include full broker_info for every broker so client can treat it as authoritative.
 			auto* broker_info = initial_status.add_broker_info();
 			broker_info->set_broker_id(broker_id);
 			broker_info->set_address(node_entry.second.address);
@@ -210,7 +201,7 @@ grpc::Status HeartBeatServiceImpl::SubscribeToCluster(
 			{
 				absl::MutexLock lock(&mutex_);
 				for (const auto& node_entry : nodes_) {
-					// [[SEQUENCER_ONLY_HEAD_NODE]] Include full broker info with accepts_publishes
+					// Include full broker info with accepts_publishes
 					update.add_new_nodes(node_entry.second.network_mgr_addr);
 					auto* broker_info = update.add_broker_info();
 					broker_info->set_broker_id(node_entry.second.broker_id);
@@ -484,7 +475,7 @@ void HeartBeatServiceImpl::FillClusterInfo(HeartbeatResponse* reply, bool force_
 			broker_info->set_broker_id(node_entry.second.broker_id);
 			broker_info->set_address(node_entry.second.address);
 			broker_info->set_network_mgr_addr(node_entry.second.network_mgr_addr);
-			// [[SEQUENCER_ONLY_HEAD_NODE]] Include accepts_publishes for client filtering
+			// Include accepts_publishes for client filtering
 			broker_info->set_accepts_publishes(node_entry.second.accepts_publishes);
 		}
 	}
@@ -695,7 +686,7 @@ void FollowerNodeClient::ProcessClusterInfo(const HeartbeatResponse& reply) {
 				entry.broker_id = broker_info.broker_id();
 				entry.address = broker_info.address();
 				entry.network_mgr_addr = broker_info.network_mgr_addr();
-				// [[SEQUENCER_ONLY_HEAD_NODE]] Parse accepts_publishes
+				// Parse accepts_publishes
 				entry.accepts_publishes = broker_info.accepts_publishes();
 
 				cluster_nodes_[entry.broker_id] = entry;
@@ -712,13 +703,12 @@ void FollowerNodeClient::ProcessClusterInfo(const HeartbeatResponse& reply) {
 // HeartBeatManager implementation
 //
 
-HeartBeatManager::HeartBeatManager(bool is_head_node, std::string head_address, bool is_sequencer_node)
+HeartBeatManager::HeartBeatManager(bool is_head_node, std::string head_address)
 	: is_head_node_(is_head_node) {
 		const std::string grpc_head_address = MaybeForceGrpcIPv4Address(head_address);
 
 	if (is_head_node) {
-		// [[SEQUENCER_ONLY_HEAD_NODE]] Pass is_sequencer_node to service
-		service_ = std::make_unique<HeartBeatServiceImpl>(GetAddress(), is_sequencer_node);
+		service_ = std::make_unique<HeartBeatServiceImpl>(GetAddress());
 
 		grpc::ServerBuilder builder;
 		// Keep server bind address in canonical host:port form.

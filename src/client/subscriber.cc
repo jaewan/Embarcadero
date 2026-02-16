@@ -919,7 +919,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 }
 
 void Subscriber::SubscribeToClusterStatus() {
-	// [[SEQUENCER_ONLY_HEAD_NODE]] Don't immediately connect to broker 0 - wait for cluster info
+	// Wait for cluster info before connecting to brokers
 	// to determine which brokers accept subscriptions (same as publishers)
 
 	while (!shutdown_) {
@@ -957,8 +957,8 @@ void Subscriber::SubscribeToClusterStatus() {
 			// Process status if read succeeds
 			connected_ = true;
 
-			// [[SEQUENCER_ONLY_HEAD_NODE]] Use broker_info if available (includes accepts_publishes)
-			// Skip sequencer-only nodes that don't accept subscriptions
+			// Use broker_info if available (includes accepts_publishes)
+			// Skip brokers that do not accept subscriptions
 			if (cluster_status.broker_info_size() > 0) {
 				std::vector<std::pair<int, std::string>> brokers_to_add;
 				size_t data_brokers = 0;  // Count data brokers for WaitUntilAllConnected
@@ -967,10 +967,9 @@ void Subscriber::SubscribeToClusterStatus() {
 					for (const auto& bi : cluster_status.broker_info()) {
 						int broker_id = bi.broker_id();
 						std::string addr = bi.network_mgr_addr();
-						// Skip sequencer-only nodes (accepts_publishes=false also means no data to subscribe)
 						if (!bi.accepts_publishes()) {
 							LOG(INFO) << "SubscribeToCluster: Skipping broker " << broker_id
-							          << " (sequencer-only, no data)";
+							          << " (no data)";
 							continue;
 						}
 						data_brokers++;

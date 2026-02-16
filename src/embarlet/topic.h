@@ -561,10 +561,6 @@ class Topic {
 		int replication_factor_;
 		void* ordered_offset_addr_;
 		void* current_segment_;
-		// [[SEQUENCER_ONLY_HEAD_NODE]] True when this Topic runs only the sequencer (no local data path)
-		// Detected from segment_metadata==nullptr && broker_id==0. Must be declared after current_segment_
-		// to match initializer list order.
-		bool is_sequencer_only_;
 		size_t ordered_offset_;
 
 		// Thread control

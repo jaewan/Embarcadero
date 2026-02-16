@@ -113,16 +113,8 @@ struct EmbarcaderoConfig {
         ConfigValue<bool> is_amd{false, "EMBARCADERO_PLATFORM_AMD"};
     } platform;
 
-    // Cluster configuration (sequencer-only head node architecture)
-    // See docs/memory-bank/SEQUENCER_ONLY_HEAD_NODE_DESIGN.md
     struct Cluster {
-        // When true, this node runs only the sequencer (no data ingestion)
-        // The head broker (broker_id=0) skips allocating its own batch header ring
-        ConfigValue<bool> is_sequencer_node{false, "EMBARCADERO_IS_SEQUENCER_NODE"};
-        // Which broker ID runs the sequencer (typically 0)
         ConfigValue<int> sequencer_broker_id{0, "EMBARCADERO_SEQUENCER_BROKER_ID"};
-        // Which broker IDs accept client writes (data brokers)
-        // Default: [1, 2, 3] when is_sequencer_node=true; empty otherwise
         std::vector<int> data_broker_ids;
     } cluster;
 
@@ -183,18 +175,9 @@ public:
     int getNetworkIOThreads() const { return config_.network.io_threads.get(); }
 
     // Cluster configuration helpers
-    bool isSequencerNode() const { return config_.cluster.is_sequencer_node.get(); }
     int getSequencerBrokerId() const { return config_.cluster.sequencer_broker_id.get(); }
-    // Returns data_broker_ids; if empty and is_sequencer_node, returns default [1,2,3]
     std::vector<int> getDataBrokerIds() const {
-        if (!config_.cluster.data_broker_ids.empty()) {
-            return config_.cluster.data_broker_ids;
-        }
-        // Default for sequencer-only node: brokers 1, 2, 3 are data brokers
-        if (config_.cluster.is_sequencer_node.get()) {
-            return {1, 2, 3};
-        }
-        return {};
+        return config_.cluster.data_broker_ids;
     }
 
     // Validation

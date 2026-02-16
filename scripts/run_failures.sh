@@ -12,12 +12,7 @@ fi
 cd build/bin
 
 # Config for brokers (same as run_throughput.sh)
-ALL_INGESTION=${ALL_INGESTION:-1}
-if [ -n "${ALL_INGESTION}" ] && [ "${ALL_INGESTION}" = "1" ]; then
-  HEAD_CONFIG_ARG="--config ../../config/embarcadero.yaml"
-else
-  HEAD_CONFIG_ARG="--config ../../config/embarcadero_sequencer_only.yaml"
-fi
+HEAD_CONFIG_ARG="--config ../../config/embarcadero.yaml"
 CONFIG_ARG="--config ../../config/embarcadero.yaml"
 
 # Cleanup any stale processes/ports from previous runs

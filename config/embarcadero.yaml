@@ -2,11 +2,9 @@
 # This file contains all configurable parameters for the Embarcadero distributed message broker
 
 embarcadero:
-  # Cluster: all brokers are ingestion brokers (broker 0 runs sequencer + data path)
   cluster:
-    is_sequencer_node: false     # Head (broker 0) also ingests; B0 gets PBR ring and CV advances
     sequencer_broker_id: 0
-    data_broker_ids: [0, 1, 2, 3]  # All 4 brokers accept publishes
+    data_broker_ids: [0, 1, 2, 3]  # Brokers that accept publishes
 
   # Version information
   version:

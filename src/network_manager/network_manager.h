@@ -75,10 +75,8 @@ public:
      * Creates a network manager for the specified broker
      * @param broker_id The ID of this broker
      * @param num_reqReceive_threads Number of request receiving threads to create
-     * @param skip_networking If true, skip starting listener/receiver threads (sequencer-only mode)
      */
-    NetworkManager(int broker_id, int num_reqReceive_threads = NUM_NETWORK_IO_THREADS,
-                   bool skip_networking = false);
+    NetworkManager(int broker_id, int num_reqReceive_threads = NUM_NETWORK_IO_THREADS);
     
     /**
      * Destructor ensures clean shutdown of all threads

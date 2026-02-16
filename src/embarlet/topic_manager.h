@@ -44,18 +44,13 @@ class TopicManager {
 		 * @param cxl_manager Reference to CXL memory manager
 		 * @param disk_manager Reference to disk storage manager
 		 * @param broker_id ID of the broker
-		 * @param is_sequencer_node If true, this node runs only the sequencer (no data path)
-		 *        When is_sequencer_node && broker_id==0, skip allocating segment/batch header ring
 		 */
-		TopicManager(CXLManager& cxl_manager, DiskManager& disk_manager, int broker_id,
-		             bool is_sequencer_node = false) :
+		TopicManager(CXLManager& cxl_manager, DiskManager& disk_manager, int broker_id) :
 			cxl_manager_(cxl_manager),
 			disk_manager_(disk_manager),
 			broker_id_(broker_id),
-			is_sequencer_node_(is_sequencer_node),
 			num_topics_(0) {
-				VLOG(3) << "\t[TopicManager]\t\tConstructed (is_sequencer_node="
-				        << is_sequencer_node_ << ")";
+				VLOG(3) << "\t[TopicManager]\t\tConstructed";
 			}
 
 		/**
@@ -242,7 +237,6 @@ class TopicManager {
 		absl::Mutex topics_mutex_;  // Only for global operations like iteration
 
 		int broker_id_;
-		bool is_sequencer_node_;  // If true, skip B0 allocation (sequencer-only head node)
 		size_t num_topics_;
 		GetNumBrokersCallback get_num_brokers_callback_;
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;

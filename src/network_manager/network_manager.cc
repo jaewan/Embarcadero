@@ -476,18 +476,11 @@ bool NetworkManager::IsConnectionAlive(int fd, char* buffer) {
 // Constructor/Destructor
 //----------------------------------------------------------------------------
 
-NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads, bool skip_networking)
+NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads)
 	: request_queue_(64),
 	large_msg_queue_(10000),
 	broker_id_(broker_id),
 	num_reqReceive_threads_(num_reqReceive_threads) {
-
-		// [[SEQUENCER_ONLY_HEAD_NODE]] Skip all networking threads when skip_networking is true
-		// Sequencer-only head node does not accept client connections
-		if (skip_networking) {
-			LOG(INFO) << "[SEQUENCER_ONLY] NetworkManager: skip_networking=true, no listener/receiver threads";
-			return;
-		}
 
 		// Single path: blocking recv direct to BLog (no staging, no non-blocking epoll)
 		LOG(INFO) << "NetworkManager: Blocking recv direct to BLog (single code path)";

@@ -196,8 +196,8 @@ class Subscriber {
 
 		void WaitUntilAllConnected(){
 			size_t num_connections = 0;
-			// [[SEQUENCER_ONLY_HEAD_NODE]] Dynamically recalculate expected connections as cluster info arrives
-			// This correctly handles sequencer-only head nodes that don't accept subscriptions
+			// Dynamically recalculate expected connections as cluster info arrives
+			// Recalculate expected connections as cluster info arrives
 			size_t last_expected = 0;
 			LOG(INFO) << "Waiting for connections (brokers=" << NUM_MAX_BROKERS_CONFIG
 				<< ", sub_connections=" << NUM_SUB_CONNECTIONS << ", data_brokers=pending)";
@@ -253,7 +253,7 @@ class Subscriber {
 		char topic_[TOPIC_NAME_SIZE];
 		std::atomic<bool> shutdown_{false};
 		std::atomic<bool> connected_{false}; // Maybe more granular connection state needed
-		// [[SEQUENCER_ONLY_HEAD_NODE]] Track actual data broker count (excludes sequencer-only nodes)
+		// Track actual data broker count
 		std::atomic<size_t> data_broker_count_{0};
 
 		// --- Latency / Debug ---

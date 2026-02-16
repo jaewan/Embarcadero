@@ -229,12 +229,8 @@ int main(int argc, char* argv[]) {
 		}
 	}
 
-	// [[SEQUENCER_ONLY_HEAD_NODE]] - Check if this is a sequencer-only head node
-	// Must be checked before HeartBeatManager is created so it can advertise accepts_publishes
-	bool is_sequencer_node = config.isSequencerNode();
-
 	// *************** Initialize managers **********************
-	heartbeat_system::HeartBeatManager heartbeat_manager(is_head_node, head_addr, is_sequencer_node);
+	heartbeat_system::HeartBeatManager heartbeat_manager(is_head_node, head_addr);
 	int broker_id = heartbeat_manager.GetBrokerId();
 	size_t colon_pos = head_addr.find(':');
 	std::string head_ip = head_addr.substr(0, colon_pos);
@@ -250,7 +246,6 @@ int main(int argc, char* argv[]) {
 	int num_network_io_threads = arguments["network_threads"].as<int>();
 
 	// Create and connect all manager components
-	// Note: is_sequencer_node was already fetched from config before HeartBeatManager creation
 		Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_ip);
 		if (cxl_manager.GetCXLAddr() == nullptr) {
 			LOG(ERROR) << "CXL initialization failed for broker " << broker_id << ", aborting startup";
@@ -258,9 +253,8 @@ int main(int argc, char* argv[]) {
 		}
 		Embarcadero::DiskManager disk_manager(broker_id, cxl_manager.GetCXLAddr(),
 				replicate_to_memory, sequencerType);
-	// Skip networking on sequencer-only node (no client connections)
-	Embarcadero::NetworkManager network_manager(broker_id, num_network_io_threads, is_sequencer_node);
-	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id, is_sequencer_node);
+	Embarcadero::NetworkManager network_manager(broker_id, num_network_io_threads);
+	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id);
 
 	// Register callbacks
 	heartbeat_manager.RegisterCreateTopicEntryCallback(
@@ -298,30 +292,23 @@ int main(int argc, char* argv[]) {
 	network_manager.SetDiskManager(&disk_manager);
 	network_manager.SetTopicManager(&topic_manager);
 
-	// [[FIX: 9/12 subscriber connections]] Only signal "ready" when the data port is actually
-	// listening. NetworkManager constructor returns when MainThread has *started*, but MainThread
-	// may still be in bind()/listen() (bind retries with sleep(5)). Signaling ready before
-	// listen() causes clients to connect too early → connection refused → one broker shows 0/3
-	// subscriber connections (9/12 total). For sequencer-only nodes we skip networking so
-	// IsListening() stays false; do not wait in that case.
-		if (!is_sequencer_node) {
-			const int listen_wait_seconds = 30;
-			const int poll_ms = 100;
-		int waited_ms = 0;
-		while (!network_manager.IsListening() && waited_ms < listen_wait_seconds * 1000) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
-			waited_ms += poll_ms;
-			if (waited_ms % 5000 == 0 && waited_ms > 0) {
-				LOG(INFO) << "Waiting for data port to listen (broker " << broker_id << ")... " << (waited_ms / 1000) << "s";
-			}
-			}
-			if (!network_manager.IsListening()) {
-				LOG(ERROR) << "Data port did not start listening within " << listen_wait_seconds << "s (broker " << broker_id << ")";
-				network_manager.Shutdown();
-				topic_manager.Shutdown();
-				return EXIT_FAILURE;
-			}
+	// Only signal "ready" when the data port is actually listening.
+	const int listen_wait_seconds = 30;
+	const int poll_ms = 100;
+	int waited_ms = 0;
+	while (!network_manager.IsListening() && waited_ms < listen_wait_seconds * 1000) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+		waited_ms += poll_ms;
+		if (waited_ms % 5000 == 0 && waited_ms > 0) {
+			LOG(INFO) << "Waiting for data port to listen (broker " << broker_id << ")... " << (waited_ms / 1000) << "s";
 		}
+	}
+	if (!network_manager.IsListening()) {
+		LOG(ERROR) << "Data port did not start listening within " << listen_wait_seconds << "s (broker " << broker_id << ")";
+		network_manager.Shutdown();
+		topic_manager.Shutdown();
+		return EXIT_FAILURE;
+	}
 
 	// Signal initialization completion
 	SignalScriptReady();

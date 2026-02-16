@@ -4,11 +4,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-# Throughput test: all brokers are data ingestion (no sequencer-only head).
-# This ensures broker 0 accepts publishes; required for Order 0/5 ACK=1 to get ACKs from all brokers.
-export ALL_INGESTION=1
-# Force head (broker 0) to be an ingestion broker so it gets PBR and advances CompletionVector (fixes B0 ACKs=0).
-[ -n "${ALL_INGESTION}" ] && [ "${ALL_INGESTION}" = "1" ] && export EMBARCADERO_IS_SEQUENCER_NODE=0
+# Throughput test: all brokers are data ingestion (head and followers use same config).
 
 # Navigate to build/bin directory
 if [ ! -d "build/bin" ]; then
@@ -24,15 +20,8 @@ if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
 fi
 echo "Using EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME}"
 
-# Explicit config argument for binaries (relative to build/bin)
-# ALL_INGESTION=1 (set above): head uses embarcadero.yaml, all 4 brokers accept publishes.
-# To use sequencer-only head (broker 0 no data path), run with ALL_INGESTION=0 in env before this script.
-ALL_INGESTION=${ALL_INGESTION:-1}
-if [ -n "${ALL_INGESTION}" ] && [ "${ALL_INGESTION}" = "1" ]; then
-  HEAD_CONFIG_ARG="--config ../../config/embarcadero.yaml"
-else
-  HEAD_CONFIG_ARG="--config ../../config/embarcadero_sequencer_only.yaml"
-fi
+# Config for all brokers (relative to build/bin)
+HEAD_CONFIG_ARG="--config ../../config/embarcadero.yaml"
 CONFIG_ARG="--config ../../config/embarcadero.yaml"
 
 # Cleanup any stale processes/ports from previous runs.
@@ -258,7 +247,6 @@ for test_case in "${test_cases[@]}"; do
 
 			# Start the processes
 			# [[FIX]]: Use start_process so we get actual embarlet PID → fast ready check via /tmp/embarlet_${pid}_ready
-			# [[SEQUENCER_ONLY]]: Head broker uses sequencer-only config (no data path)
 			pid_file="/tmp/embarlet_head_pid"
 			start_process "$EMBARLET_NUMA_BIND ./embarlet $HEAD_CONFIG_ARG --head --$sequencer > broker_0_trial${trial}.log 2>&1"
 			head_pid=$(cat "$pid_file" 2>/dev/null | tr -d '\n ' || echo "")

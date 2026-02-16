@@ -150,10 +150,8 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (platform["is_amd"]) config_.platform.is_amd.set(platform["is_amd"].as<bool>());
             }
 
-            // Cluster (sequencer-only head node architecture)
             if (root["cluster"]) {
                 auto cluster = root["cluster"];
-                if (cluster["is_sequencer_node"]) config_.cluster.is_sequencer_node.set(cluster["is_sequencer_node"].as<bool>());
                 if (cluster["sequencer_broker_id"]) config_.cluster.sequencer_broker_id.set(cluster["sequencer_broker_id"].as<int>());
                 if (cluster["data_broker_ids"]) {
                     config_.cluster.data_broker_ids.clear();
