@@ -14,20 +14,44 @@ namespace Embarcadero {
 
 constexpr size_t NT_THRESHOLD = 4096; // [[P5]] Increase threshold to 4KB to avoid cache pollution for small batches
 
+/** 32 bytes = one AVX2 vector; two per 64-byte cache line. */
+static constexpr size_t AVX2_VECTOR_SIZE = 32;
+
 /**
- * Non-temporal memory copy function optimized for large data transfers
- * Uses streaming stores to bypass cache for large copies
+ * AVX2 inner loop: 2 x 32-byte streaming stores per 64-byte cache line.
+ * Only called when __builtin_cpu_supports("avx2") is true.
+ * Compiled with target("avx2") so the rest of nt_memcpy can be built without -mavx2 for fallback.
+ */
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2")))
+static void nt_memcpy_avx2_loop(uint8_t* __restrict dst, const uint8_t* __restrict src, size_t num_lines) {
+	constexpr size_t CACHE_LINE_SIZE = 64;
+	// 2 x 32-byte vectors per cache line
+	for (size_t i = 0; i < num_lines; i++) {
+		__m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+		__m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + AVX2_VECTOR_SIZE));
+		_mm256_stream_si256(reinterpret_cast<__m256i*>(dst), a);
+		_mm256_stream_si256(reinterpret_cast<__m256i*>(dst + AVX2_VECTOR_SIZE), b);
+		src += CACHE_LINE_SIZE;
+		dst += CACHE_LINE_SIZE;
+	}
+}
+#endif
+
+/**
+ * Non-temporal memory copy optimized for large data transfers.
+ * Uses streaming stores to bypass cache. Prefers AVX2 (32-byte) when available,
+ * otherwise SSE2 (16-byte). Works on all x86-64 CPUs; AVX2 used on Intel Haswell+
+ * and AMD Excavator+ (2013+).
  */
 void nt_memcpy(void* __restrict dst, const void* __restrict src, size_t size) {
 	static constexpr size_t CACHE_LINE_SIZE = 64;
 
-	// For small copies, use standard memcpy
 	if (size < NT_THRESHOLD) {
 		memcpy(dst, src, size);
 		return;
 	}
 
-	// Handle unaligned portion at the beginning
 	const uintptr_t dst_addr = reinterpret_cast<uintptr_t>(dst);
 	const size_t unaligned_bytes = (CACHE_LINE_SIZE - dst_addr % CACHE_LINE_SIZE) % CACHE_LINE_SIZE;
 	const size_t initial_bytes = std::min(unaligned_bytes, size);
@@ -39,24 +63,40 @@ void nt_memcpy(void* __restrict dst, const void* __restrict src, size_t size) {
 	uint8_t* aligned_dst = static_cast<uint8_t*>(dst) + initial_bytes;
 	const uint8_t* aligned_src = static_cast<const uint8_t*>(src) + initial_bytes;
 	size_t remaining = size - initial_bytes;
-
-	// Process cache-line-aligned data with non-temporal stores
 	const size_t num_lines = remaining / CACHE_LINE_SIZE;
-	const size_t vectors_per_line = CACHE_LINE_SIZE / sizeof(__m128i);
+	remaining -= num_lines * CACHE_LINE_SIZE;
 
-	for (size_t i = 0; i < num_lines; i++) {
-		for (size_t j = 0; j < vectors_per_line; j++) {
-			const __m128i data = _mm_loadu_si128(
-					reinterpret_cast<const __m128i*>(aligned_src + j * sizeof(__m128i)));
-			_mm_stream_si128(
-					reinterpret_cast<__m128i*>(aligned_dst + j * sizeof(__m128i)), data);
-		}
-		aligned_src += CACHE_LINE_SIZE;
-		aligned_dst += CACHE_LINE_SIZE;
-		remaining -= CACHE_LINE_SIZE;
+#if defined(__x86_64__) || defined(_M_X64)
+	// One-time runtime detection: use AVX2 if available (most modern servers have it).
+	static bool avx2_checked = false;
+	static bool use_avx2 = false;
+	if (!avx2_checked) {
+		__builtin_cpu_init();
+		use_avx2 = __builtin_cpu_supports("avx2");
+		avx2_checked = true;
 	}
 
-	// Copy any remaining bytes
+	if (use_avx2 && num_lines > 0) {
+		nt_memcpy_avx2_loop(aligned_dst, aligned_src, num_lines);
+		aligned_dst += num_lines * CACHE_LINE_SIZE;
+		aligned_src += num_lines * CACHE_LINE_SIZE;
+	} else
+#endif
+	{
+		// SSE2 fallback: 4 x 16-byte per cache line (works on all x86-64).
+		const size_t vectors_per_line = CACHE_LINE_SIZE / sizeof(__m128i);
+		for (size_t i = 0; i < num_lines; i++) {
+			for (size_t j = 0; j < vectors_per_line; j++) {
+				const __m128i data = _mm_loadu_si128(
+						reinterpret_cast<const __m128i*>(aligned_src + j * sizeof(__m128i)));
+				_mm_stream_si128(
+						reinterpret_cast<__m128i*>(aligned_dst + j * sizeof(__m128i)), data);
+			}
+			aligned_src += CACHE_LINE_SIZE;
+			aligned_dst += CACHE_LINE_SIZE;
+		}
+	}
+
 	if (remaining > 0) {
 		memcpy(aligned_dst, aligned_src, remaining);
 	}

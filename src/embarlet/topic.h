@@ -666,9 +666,13 @@ class Topic {
 		static constexpr uint64_t kClientGcEpochInterval = 1024;
 		static constexpr size_t kDeferredL5MaxEntries = kHoldBufferMaxEntries * 2;
 		std::atomic<uint64_t> current_epoch_for_hold_{0};  // Epoch for hold buffer expiry; atomic for shard workers
-		// [[PHASE_1B]] Export chain: per-broker subscription pointer (set by EpochSequencerThread on commit)
-		absl::flat_hash_map<int, BatchHeader*> phase1b_header_for_sub_;
-		absl::Mutex phase1b_header_for_sub_mu_;
+		// Export chain: per-broker cursor into batch header ring (set by EpochSequencerThread on commit).
+		// Fixed array for O(1) indexed access; nullptr = no ring for that broker (e.g. sequencer-only B0).
+		std::array<BatchHeader*, NUM_MAX_BROKERS> export_cursor_by_broker_{};
+		absl::Mutex export_cursor_mu_;
+
+		/** Initializes the export chain cursor for a specific broker (ring_start). Idempotent. */
+		void InitExportCursorForBroker(int broker_id);
 		// [[RING_ORDER]] Monotonic sequence for scanner_seq (BrokerScannerWorker5); fixes wrap-around sort
 		std::atomic<uint64_t> next_scanner_seq_{0};
 		std::vector<std::vector<PendingBatch5>> level5_per_shard_cache_;
