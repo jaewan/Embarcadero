@@ -15,19 +15,30 @@
  */
 class Publisher {
 	public:
-		/**
-		 * Constructor for Publisher
-		 * @param topic Topic name
-		 * @param head_addr Head broker address
-		 * @param port Port
-		 * @param num_threads_per_broker Number of threads per broker
-		 * @param message_size Size of messages
-		 * @param queueSize Queue size
-		 * @param order Order level
-		 * @param seq_type Sequencer type
-		 */
-		Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, 
-				int num_threads_per_broker, size_t message_size, size_t queueSize, 
+	/**
+	 * Cache-line aligned structure to prevent false sharing between broker statistics.
+	 * Each broker gets its own cache line containing all its statistics.
+	 */
+	struct alignas(64) BrokerStats {
+		std::atomic<size_t> sent_bytes{0};
+		std::atomic<size_t> sent_messages{0};
+		size_t acked_messages{0};  // Not atomic - only updated by ACK thread
+		char _padding[64 - 2 * sizeof(std::atomic<size_t>) - sizeof(size_t)];
+	};
+
+	/**
+	 * Constructor for Publisher
+	 * @param topic Topic name
+	 * @param head_addr Head broker address
+	 * @param port Port
+	 * @param num_threads_per_broker Number of threads per broker
+	 * @param message_size Size of messages
+	 * @param queueSize Queue size
+	 * @param order Order level
+	 * @param seq_type Sequencer type
+	 */
+	Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port,
+				int num_threads_per_broker, size_t message_size, size_t queueSize,
 				int order, SequencerType seq_type = heartbeat_system::SequencerType::EMBARCADERO);
 
 		/**
@@ -138,14 +149,13 @@ class Publisher {
 		SequencerType seq_type_;
 		std::unique_ptr<CorfuSequencerClient> corfu_client_;
 
-		// [[Atomic - written by destructor/Poll/DEBUG_check, read by PublishThread/SubscribeToCluster]]
-		// [[PERF]] Cache-line separate from producer-hot data so 12 consumers spinning on these
-		// don't bounce the producer's cache line (next_publish_order_, client_order_).
-		alignas(64) std::atomic<bool> shutdown_{false};
-		std::atomic<bool> publish_finished_{false};
-		// Set true by Poll() and destructor; PublishThread checks only this (one load) when queue empty.
-		std::atomic<bool> consumer_should_exit_{false};
-		char pad_consumer_exit_[64 - 3];  // pad to next cache line
+	// [[THREAD_SAFETY_FIX]] Atomic variables with relaxed ordering for minimal overhead thread coordination
+	// [[PERF]] Cache-line separate from producer-hot data so consumers don't bounce cache lines
+	alignas(64) std::atomic<bool> shutdown_{false};
+	std::atomic<bool> publish_finished_{false};
+	// Set true by Poll() and destructor; PublishThread checks only this (one load) when queue empty.
+	std::atomic<bool> consumer_should_exit_{false};
+	char pad_consumer_exit_[64 - 3 * sizeof(std::atomic<bool>)];  // pad to next cache line
 		std::atomic<bool> connected_{false};
 		// [[Atomic]] Total messages queued (updated per batch when sealed). Poll/ACK wait on it.
 		std::atomic<size_t> client_order_{0};
@@ -159,9 +169,8 @@ class Publisher {
 
 		// Used to measure real-time throughput during failure benchmark
 		std::atomic<size_t> total_sent_bytes_{0};
-		std::vector<std::atomic<size_t>> sent_bytes_per_broker_;
-		// [[ACK_DIAG]] Per-broker message count sent (PublishThread writes); log vs acked on timeout
-		std::vector<std::atomic<size_t>> sent_messages_per_broker_;
+		// [[CACHE_LINE_FIX]] Cache-line aligned per-broker statistics to prevent false sharing
+		std::vector<BrokerStats> broker_stats_;
 		bool measure_real_time_throughput_ = false;
 		std::thread real_time_throughput_measure_thread_;
 		std::thread kill_brokers_thread_;
@@ -210,7 +219,6 @@ class Publisher {
 		int ack_port_;
 		// [[threading: EpollAckThread writes, Poll() reads]] — must be atomic for correctness
 		std::atomic<size_t> ack_received_{0};
-		std::vector<std::atomic<size_t>> acked_messages_per_broker_;
 		std::vector<std::thread> threads_;
 		std::thread ack_thread_;
 		std::atomic<int> thread_count_{0};
