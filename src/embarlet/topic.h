@@ -200,10 +200,17 @@ class Topic {
 				void* cxl_addr, void* segment_metadata);
 
 		/**
+		 * Start the topic's threads after construction is complete.
+		 * This method creates and starts all necessary threads for the topic.
+		 */
+		void Start();
+
+		/**
 		 * Destructor - ensures all threads are stopped and joined
 		 */
 	~Topic() {
-		stop_threads_.store(true, std::memory_order_release);
+		stop_threads_.store(true, std::memory_order_release);  // Atomic assignment for shutdown
+		stop_threads_volatile_ = true;  // Volatile copy for legacy interfaces
 		committed_seq_updater_stop_.store(true, std::memory_order_release);
 		committed_seq_updater_cv_.notify_all();
 		for (auto& shard : level5_shards_) {
@@ -349,6 +356,9 @@ class Topic {
 	private:
 		/** Lock-free PBR slot reservation (128-bit CAS). Returns false if ring full. @threading Concurrent. */
 		bool ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, size_t& out_logical_offset);
+		/** [[P2.3]] Shared core: epoch check, slot allocation, CheckSegmentBoundary, segment_header, batch_header metadata. Caller writes slot (minimal or full). */
+		bool ReservePBRSlotCore(BatchHeader& batch_header, void* log, bool epoch_already_checked,
+				void*& batch_headers_log, size_t& logical_offset, void*& segment_header);
 		/**
 		 * Update the TInode's written offset and address
 		 */
@@ -537,15 +547,15 @@ class Topic {
 		std::atomic<uint64_t> ring_full_last_log_time_{0};
 
 		// [[RECV_DIRECT_TO_CXL]] Cached PBR consumed_through and next_slot for watermark checks (avoids mutex in GetPBRUtilizationPct)
-		std::atomic<size_t> cached_pbr_consumed_through_{0};
-		std::atomic<size_t> cached_next_slot_offset_{0};
-		std::atomic<uint64_t> pbr_cache_refresh_counter_{0};
+		alignas(64) std::atomic<size_t> cached_pbr_consumed_through_{0};
+		alignas(64) std::atomic<size_t> cached_next_slot_offset_{0};
+		alignas(64) std::atomic<uint64_t> pbr_cache_refresh_counter_{0};
 		// Refresh consumed_through every 100 batches (~10–100μs at high throughput). Balances staleness (100 slots ≈ 20% of 512-slot ring) vs CXL read overhead. [[CODE_REVIEW Issue #7]]
 		static constexpr uint64_t kPBRCacheRefreshInterval = 100;
 
 		// [[LOCKFREE_PBR]] 128-bit CAS state; fallback to mutex when not lock-free (docs/LOCKFREE_PBR_DESIGN.md)
-		std::atomic<PBRProducerState> pbr_state_{{0, 0}};
-		std::atomic<uint64_t> cached_consumed_seq_{0};  // Slot sequence from consumed_through / sizeof(BatchHeader)
+		alignas(64) std::atomic<PBRProducerState> pbr_state_{{0, 0}};
+		alignas(64) std::atomic<uint64_t> cached_consumed_seq_{0};  // Slot sequence from consumed_through / sizeof(BatchHeader)
 		const size_t num_slots_;                         // BATCHHEADERS_SIZE / sizeof(BatchHeader), set in ctor
 		bool use_lock_free_pbr_{false};                  // True when pbr_state_.is_lock_free()
 
@@ -564,7 +574,8 @@ class Topic {
 		size_t ordered_offset_;
 
 		// Thread control
-		std::atomic<bool> stop_threads_{false};
+		std::atomic<bool> stop_threads_{false};  // Atomic for thread-safe shutdown
+		volatile bool stop_threads_volatile_{false};  // Volatile copy for legacy interfaces
 		std::vector<std::thread> delegationThreads_;
 
 		std::thread sequencerThread_;
@@ -578,55 +589,63 @@ class Topic {
 		
 		uint32_t local_counter_ = 0; // threading: single thread (DelegationThread)
 
-		// Sequencing
-		// Ordered batch vector for efficient subscribe
-		void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers);
-		void Sequencer4();
-		void Sequencer5();  // Batch-level sequencer (Phase 1b: epoch pipeline + Level 5 hold buffer)
-		void Sequencer2();  // Order 2: Total order, no per-client state;
-		void BrokerScannerWorker(int broker_id);
-		void BrokerScannerWorker5(int broker_id);  // Batch-level scanner (Phase 1b: pushes to epoch buffer)
-		void EpochDriverThread();   // [[PHASE_1B]] Advances epoch_index_ every kEpochUs
-		void EpochSequencerThread(); // [[PHASE_1B]] Processes closed epochs: one fetch_add per epoch, Level 5, commit
-		struct Level5ShardState;  // forward declaration; defined below
-		void ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector<PendingBatch5>& ready);
-		void ProcessLevel5BatchesShard(Level5ShardState& shard,
-			std::vector<PendingBatch5>& level5,
-			std::vector<PendingBatch5>& ready);
-		void ClientGc(Level5ShardState& shard);
-		bool CheckAndInsertBatchId(Level5ShardState& shard, uint64_t batch_id);
-		void Level5ShardWorker(size_t shard_id);
-		void InitLevel5Shards();
-		size_t GetTotalHoldBufferSize();
+	// Sequencing
+	// Ordered batch vector for efficient subscribe
+	void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers);
+	void Sequencer4();
+	void Sequencer5();  // Batch-level sequencer (Phase 1b: epoch pipeline + Level 5 hold buffer)
+	void Sequencer2();  // Order 2: Total order, no per-client state;
+	void BrokerScannerWorker(int broker_id);
+	void BrokerScannerWorker5(int broker_id);  // Batch-level scanner (Phase 1b: pushes to epoch buffer)
+	void EpochDriverThread();   // [[PHASE_1B]] Advances epoch_index_ every kEpochUs
+	void EpochSequencerThread(); // [[PHASE_1B]] Processes closed epochs: one fetch_add per epoch, Level 5, commit
+	void CommitEpoch(std::vector<PendingBatch5>& ready,
+		std::vector<const PendingBatch5*>& by_slot,
+		std::array<size_t, NUM_MAX_BROKERS>& contiguous_consumed_per_broker,
+		std::array<bool, NUM_MAX_BROKERS>& broker_seen_in_epoch,
+		std::array<uint64_t, NUM_MAX_BROKERS>& cv_max_cumulative,
+		std::array<uint64_t, NUM_MAX_BROKERS>& cv_max_pbr_index,
+		std::vector<PendingBatch5>& batch_list,
+		bool is_drain_mode);
+	struct Level5ShardState;  // forward declaration; defined below
+	void ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector<PendingBatch5>& ready);
+	void ProcessLevel5BatchesShard(Level5ShardState& shard,
+		std::vector<PendingBatch5>& level5,
+		std::vector<PendingBatch5>& ready);
+	void ClientGc(Level5ShardState& shard);
+	bool CheckAndInsertBatchId(Level5ShardState& shard, uint64_t batch_id);
+	void Level5ShardWorker(size_t shard_id);
+	void InitLevel5Shards();
+	size_t GetTotalHoldBufferSize();
 	bool ProcessSkipped(
-			absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
-			BatchHeader* &header_for_sub);
+		absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
+		BatchHeader* &header_for_sub);
 	void AssignOrder(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);
 	void AssignOrder5(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);  // Batch-level version
 
 	// [[NAMING]] total_order space: next message sequence to assign (design: message-level order for subscribers).
-	std::atomic<size_t> global_seq_{0};
+	alignas(64) std::atomic<size_t> global_seq_{0};
 	// [[NAMING]] GOI index: next slot in GOI array (0, 1, 2, ...). Used as GOIEntry index; committed_seq tracks max written.
-	std::atomic<uint64_t> global_batch_seq_{0};
+	alignas(64) std::atomic<uint64_t> global_batch_seq_{0};
 		absl::flat_hash_map<size_t, size_t> next_expected_batch_seq_;// client_id -> next expected batch_seq
 		absl::Mutex global_seq_batch_seq_mu_;;
 
 		// [[PHASE_1A_EPOCH_FENCING]] Broker's view of ControlBlock.epoch; updated in RefreshBrokerEpochFromCXL
 		// [[THREADING]] Written by PublishReceiveThreads in GetCXLBuffer paths; must be atomic (no mutex on hot path)
-		std::atomic<uint64_t> broker_epoch_{0};
+		alignas(64) std::atomic<uint64_t> broker_epoch_{0};
 		// [[Issue #3]] Epoch from last CheckEpochOnce() for use when epoch_already_checked=true in ReservePBRSlotAndWriteEntry
-		std::atomic<uint64_t> last_checked_epoch_{0};
+		alignas(64) std::atomic<uint64_t> last_checked_epoch_{0};
 		// [PHASE-2B] Shared atomic for sequencer to avoid cold CXL read of ControlBlock.epoch
-		std::atomic<uint64_t> cached_epoch_{0};
+		alignas(64) std::atomic<uint64_t> cached_epoch_{0};
 		// [[PHASE_1A_EPOCH_FENCING]] Counter for periodic epoch check (every kEpochCheckInterval batches; design §4.2.1 "e.g. every 100 batches")
-		std::atomic<uint64_t> epoch_check_counter_{0};
+		alignas(64) std::atomic<uint64_t> epoch_check_counter_{0};
 		static constexpr uint64_t kEpochCheckInterval = 100;
 
 		// [[PHASE_1B]] Epoch-batched sequencing (§3.2): one atomic per epoch
 		static constexpr unsigned kEpochUs = 500;
-		std::atomic<uint64_t> epoch_index_{0};
-		std::atomic<uint64_t> last_sequenced_epoch_{0};
-		std::atomic<bool> epoch_driver_done_{false}; // [[SHUTDOWN_SYNC]] Signals EpochDriverThread has finished sealing
+		alignas(64) std::atomic<uint64_t> epoch_index_{0};
+		alignas(64) std::atomic<uint64_t> last_sequenced_epoch_{0};
+		volatile bool epoch_driver_done_{false}; // [[SHUTDOWN_SYNC]] Signals EpochDriverThread has finished sealing - non-atomic for performance
 		// [[B0_TAIL_FIX]] When set, next ProcessLevel5BatchesShard treats all hold entries as expired (shutdown drain).
 		std::atomic<bool> force_expire_hold_on_next_process_{false};
 	// Epoch buffers for safe collection/sequencing (no concurrent merge/write).
@@ -665,7 +684,7 @@ class Topic {
 		static constexpr uint64_t kClientTtlEpochs = 20000;
 		static constexpr uint64_t kClientGcEpochInterval = 1024;
 		static constexpr size_t kDeferredL5MaxEntries = kHoldBufferMaxEntries * 2;
-		std::atomic<uint64_t> current_epoch_for_hold_{0};  // Epoch for hold buffer expiry; atomic for shard workers
+		alignas(64) std::atomic<uint64_t> current_epoch_for_hold_{0};  // Epoch for hold buffer expiry; atomic for shard workers
 		// Export chain: per-broker cursor into batch header ring (set by EpochSequencerThread on commit).
 		// Fixed array for O(1) indexed access; nullptr = no ring for that broker (e.g. sequencer-only B0).
 		std::array<BatchHeader*, NUM_MAX_BROKERS> export_cursor_by_broker_{};
@@ -674,7 +693,7 @@ class Topic {
 		/** Initializes the export chain cursor for a specific broker (ring_start). Idempotent. */
 		void InitExportCursorForBroker(int broker_id);
 		// [[RING_ORDER]] Monotonic sequence for scanner_seq (BrokerScannerWorker5); fixes wrap-around sort
-		std::atomic<uint64_t> next_scanner_seq_{0};
+		alignas(64) std::atomic<uint64_t> next_scanner_seq_{0};
 		std::vector<std::vector<PendingBatch5>> level5_per_shard_cache_;
 		// [PHASE-8-REVISED] Per-broker unbounded queues for from-hold batch export.
 		// Replaces SPSC ring to avoid deadlock when no subscriber consumes (throughput test).
@@ -708,6 +727,15 @@ class Topic {
 	std::thread goi_recovery_thread_;
 	void GOIRecoveryThread();  // [[PHASE_3]] Monitor num_replicated and recover stalled chains
 
+	// Helper method to advance consumed_through for processed slots
+	// [[WRAP_FIX]] Handle ring wrap: when next_expected==BATCHHEADERS_SIZE, slot 0 is the next expected.
+	void AdvanceConsumedThroughForProcessedSlots(
+		const std::vector<PendingBatch5>& batch_list,
+		std::array<size_t, NUM_MAX_BROKERS>& contiguous_consumed_per_broker,
+		const std::array<bool, NUM_MAX_BROKERS>& broker_seen_in_epoch,
+		const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_cumulative,
+		const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_pbr_index);
+
 	// [[PHASE_3]] Recovery parameters (§4.2.2)
 	static constexpr uint64_t kChainReplicationTimeoutNs = 10'000'000;  // 10ms (10× expected ~1ms chain latency)
 	static constexpr uint64_t kRecoveryScanIntervalNs = 1'000'000;      // 1ms scan interval
@@ -734,5 +762,9 @@ class Topic {
 	std::atomic<uint64_t> completed_ranges_enqueue_wait_ns_{0};
 	std::atomic<uint64_t> completed_ranges_max_depth_{0};
 	std::atomic<uint64_t> committed_updater_pending_peak_{0};
+
+	// Per-topic sequencers: avoid static locals that cause shared state between topics
+	std::atomic<size_t> scalog_batch_offset_{0};  // For ScalogGetCXLBuffer (was static local)
+	size_t cached_num_brokers_{0};  // For Order3GetCXLBuffer (was static local)
 };
 } // End of namespace Embarcadero

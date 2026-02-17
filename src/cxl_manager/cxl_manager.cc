@@ -183,7 +183,6 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 		int cxl_numa_node = Configuration::getInstance().config().cxl.numa_node.get();
 
 		// Check if the CXL NUMA node has enough memory for the requested size
-		long long node_total_kb = -1;
 		long long node_free_kb = -1;
 		long long node_size_bytes = numa_node_size64(cxl_numa_node, &node_free_kb);
 		if (node_size_bytes < 0) {

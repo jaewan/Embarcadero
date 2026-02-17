@@ -24,7 +24,7 @@ class TopicManager;
 
 enum ClientRequestType {Publish, Subscribe};
 
-struct NetworkRequest {
+struct alignas(64) NetworkRequest {
     int client_socket;
 };
 
@@ -39,7 +39,7 @@ struct alignas(64) EmbarcaderoReq {
     char topic[32];  // Sized to maintain overall 64B alignment
 };
 
-struct LargeMsgRequest {
+struct alignas(64) LargeMsgRequest {
     void* msg;
     size_t len;
 };
@@ -54,20 +54,13 @@ struct SubscriberState {
 /**
  * Frontier state for ORDER=0 inline processing.
  * Tracks next PBR slot to process for gapless written advancement.
+ * Must be cache-aligned to prevent false sharing between topics.
  */
-struct Order0FrontierState {
+struct alignas(128) Order0FrontierState {
     std::atomic<size_t> next_complete_slot{0};  // Next PBR slot expected to complete (gapless advancement)
+    char _padding[128 - sizeof(std::atomic<size_t>)];  // Prevent false sharing
 };
 
-/**
- * Publish pipeline components for profiling (single blocking path: recv → BLog).
- */
-enum PublishPipelineComponent : int {
-	kRecvHeader = 0,
-	kReserveBLogSpace,
-	kRecvPayload,
-	kNumPipelineComponents
-};
 
 class NetworkManager {
 public:
@@ -106,8 +99,8 @@ private:
     // Thread handlers
     void MainThread();
     void ReqReceiveThread();
-    /** @param topic Copy of topic name (thread may start after handshake is gone). */
-    void AckThread(std::string topic, uint32_t ack_level, int ack_fd, int ack_efd);
+    /** @param topic_cstr Topic name (converted to std::string internally for thread safety). */
+    void AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd);
     size_t GetOffsetToAck(const char* topic, uint32_t ack_level);
 	void SubscribeNetworkThread(int sock, int efd, const char* topic, int connection_id);
 
@@ -122,30 +115,20 @@ private:
     // [[PERF]] Blocking path: update written for Order 0 so ACK path advances
     void UpdateWrittenForOrder0(TInode* tinode, size_t logical_offset, uint32_t num_msg);
 
-    // [[ORDER0_INLINE]] Inline parallel processing: set per-message metadata + advance written frontier
-    void ProcessOrder0BatchInline(void* batch_data, uint32_t num_msg, size_t base_logical_offset);
+    // ORDER=0 per-message metadata is set by Topic::DelegationThread (not here).
     void TryAdvanceWrittenFrontier(const char* topic, size_t my_slot, uint32_t num_msg, TInode* tinode);
-
-    // [[PERF]] Publish pipeline profiling: per-component time (ns) and count, report aggregated at end
-    void RecordProfile(PublishPipelineComponent c, uint64_t ns);
-    void LogPublishPipelineProfile();
 
     // Thread-safe queues
     folly::MPMCQueue<std::optional<struct NetworkRequest>> request_queue_;
     folly::MPMCQueue<struct LargeMsgRequest> large_msg_queue_;
 
-    // Publish pipeline profile: total_ns and count per component (thread-safe). When false, no timing/RecordProfile in hot path.
-    bool enable_pipeline_profile_{true};
-    std::array<std::atomic<uint64_t>, kNumPipelineComponents> profile_total_ns_{};
-    std::array<std::atomic<uint64_t>, kNumPipelineComponents> profile_count_{};
-    static constexpr uint64_t kProfileLogIntervalBatches = 5000;  // Log profile every N batches (0 = only at shutdown)
 
     // Thread management
     int broker_id_;
     std::vector<std::thread> threads_;
     int num_reqReceive_threads_;
     std::atomic<int> thread_count_{0};
-    std::atomic<bool> stop_threads_{false};
+    std::atomic<bool> stop_threads_{false};  // Atomic for correctness - volatile was dangerous
     std::atomic<bool> listening_{false};
     std::atomic<bool> shutdown_started_{false};
 
@@ -153,7 +136,7 @@ private:
     absl::flat_hash_map<size_t, int> ack_connections_;  // <client_id, ack_sock>
     absl::Mutex ack_mu_;
     absl::Mutex sub_mu_;
-    absl::flat_hash_map<int, std::unique_ptr<SubscriberState>> sub_state_;  // <client_id, state>
+    std::vector<std::unique_ptr<SubscriberState>> sub_state_;  // <connection_id, state> - dense IDs
     int ack_efd_; // Epoll file descriptor for acknowledgments
     int ack_fd_ = -1; // Socket file descriptor for acknowledgments
 

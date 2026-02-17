@@ -402,5 +402,5 @@ bool CheckAvailableCores() {
     }
     LOG(INFO) << oss.str();
     
-    return num_cores == CGROUP_CORE;
+    return num_cores == static_cast<size_t>(CGROUP_CORE);
 }

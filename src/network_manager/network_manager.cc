@@ -68,23 +68,23 @@ static void SetAcceptedSocketBuffers(int fd) {
 	if (setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) < 0) {
 		LOG(WARNING) << "setsockopt(TCP_QUICKACK) on accepted socket failed: " << strerror(errno);
 	}
+	// Enable SO_BUSY_POLL for ultra-low latency (kernel polls socket queue directly)
+	int busy_poll = 50;  // microseconds to busy poll
+	if (setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll)) < 0) {
+		// SO_BUSY_POLL may not be available on all kernels, so don't treat as fatal
+		LOG(WARNING) << "setsockopt(SO_BUSY_POLL) on accepted socket failed (may not be supported): " << strerror(errno);
+	}
 	// [[DIAGNOSTIC]] Verify kernel actually applied the buffer sizes
 	int actual_rcv = 0, actual_snd = 0;
 	socklen_t len = sizeof(actual_rcv);
 	getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &len);
 	getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &len);
-	// Kernel doubles the value; we expect actual >= buffer_size
-	if (actual_rcv < buffer_size) {
-		LOG(WARNING) << "SO_RCVBUF capped: requested=" << buffer_size << " actual=" << actual_rcv
-		             << " (fd=" << fd << "). Check net.core.rmem_max";
-	}
-	LOG(INFO) << "SetAcceptedSocketBuffers fd=" << fd << " SO_RCVBUF=" << actual_rcv
-	          << " SO_SNDBUF=" << actual_snd;
 }
 
 // [[PERF]] Named constants for recovery loop (avoid magic numbers)
 static constexpr int kRecoveryCheckInterval = 100;  // Check every N epoll iterations
 static constexpr int kMaxPBRRetries = 20;           // WAIT_PBR_SLOT: recovery attempts before fallback handoff
+
 
 // [[Phase 3.2]] written is cumulative (monotonic); fetch_add is sufficient. CXL layout uses
 // volatile size_t; __atomic_fetch_add is the correct way to get atomic RMW (GCC/clang extension).
@@ -97,75 +97,7 @@ void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, size_t logical_offse
 	CXL::store_fence();  // Required for CXL visibility; reader (AckThread) must see updated written
 }
 
-/**
- * [[ORDER0_INLINE]] Process ORDER=0 batch inline: set per-message metadata.
- * Called by ReqReceive thread immediately after recv() to batch data, while hot in cache.
- *
- * Sets required metadata for GetMessageAddr() navigation:
- * - logical_offset: Per-message sequence number
- * - segment_header: Pointer to segment boundary
- * - next_msg_diff: Size to next message (paddedSize)
- *
- * CRITICAL: Must be called BEFORE batch_complete=1 so metadata is visible when frontier advances.
- * CRITICAL: Must flush metadata to CXL for non-coherent memory visibility.
- *
- * Parallelizes what DelegationThread did sequentially (2.56M msgs/sec bottleneck eliminated).
- */
-void NetworkManager::ProcessOrder0BatchInline(void* batch_data, uint32_t num_msg, size_t base_logical_offset) {
-	if (!batch_data || num_msg == 0) return;
 
-	MessageHeader* msg = reinterpret_cast<MessageHeader*>(batch_data);
-	size_t logical_offset = base_logical_offset;
-
-	// Track flush points for batched CXL flushing
-	void* flush_start = msg;
-	size_t bytes_since_flush = 0;
-	constexpr size_t FLUSH_INTERVAL = 64 * 1024;  // Flush every 64KB
-
-	for (uint32_t i = 0; i < num_msg; i++) {
-		// Validate paddedSize to prevent infinite loop
-		if (msg->paddedSize < sizeof(MessageHeader) || msg->paddedSize > 1024 * 1024) {
-			LOG(ERROR) << "ProcessOrder0BatchInline: Invalid paddedSize=" << msg->paddedSize
-			           << " at message " << i << "/" << num_msg;
-			break;
-		}
-
-		// Set required metadata for subscriber navigation
-		msg->logical_offset = logical_offset++;
-		msg->segment_header = reinterpret_cast<uint8_t*>(msg) - CACHELINE_SIZE;
-		msg->next_msg_diff = msg->paddedSize;
-
-		// Update segment header (accumulated size from segment base to current message)
-		*reinterpret_cast<unsigned long long int*>(msg->segment_header) =
-			static_cast<unsigned long long int>(
-				reinterpret_cast<uint8_t*>(msg) - reinterpret_cast<uint8_t*>(msg->segment_header));
-
-		bytes_since_flush += msg->paddedSize;
-
-		// Batch flush every 64KB to reduce CXL flush overhead
-		if (bytes_since_flush >= FLUSH_INTERVAL) {
-			for (void* p = flush_start; p < reinterpret_cast<void*>(msg); p = reinterpret_cast<void*>(
-						reinterpret_cast<uint8_t*>(p) + 64)) {
-				CXL::flush_cacheline(p);
-			}
-			flush_start = msg;
-			bytes_since_flush = 0;
-		}
-
-		// Move to next message
-		msg = reinterpret_cast<MessageHeader*>(
-			reinterpret_cast<uint8_t*>(msg) + msg->paddedSize);
-	}
-
-	// Flush remaining messages
-	for (void* p = flush_start; p < reinterpret_cast<void*>(msg); p = reinterpret_cast<void*>(
-				reinterpret_cast<uint8_t*>(p) + 64)) {
-		CXL::flush_cacheline(p);
-	}
-
-	// CRITICAL: Single fence after all flushes (batched for performance)
-	CXL::store_fence();
-}
 
 /**
  * [[ORDER0_INLINE]] Try to advance written frontier collaboratively.
@@ -208,7 +140,7 @@ void NetworkManager::TryAdvanceWrittenFrontier(const char* topic, size_t my_slot
 
 	// Try to advance frontier through consecutive complete slots
 	int cas_retries = 0;
-	while (!stop_threads_.load(std::memory_order_acquire)) {  // [[FIX: Shutdown check]] Prevents infinite loop during shutdown
+	while (!stop_threads_) {  // [[FIX: Shutdown check]] Prevents infinite loop during shutdown
 		size_t slot = frontier->next_complete_slot.load(std::memory_order_acquire);
 		size_t actual_slot = slot % num_slots;
 		BatchHeader* bh = &pbr_base[actual_slot];
@@ -233,9 +165,9 @@ void NetworkManager::TryAdvanceWrittenFrontier(const char* topic, size_t my_slot
 		cas_retries = 0;  // Reset backoff
 		size_t batch_num_msg = bh->num_msg;
 		volatile size_t* written_ptr = &tinode->offsets[broker_id_].written;
-		size_t new_written = __atomic_fetch_add(
+		__atomic_fetch_add(
 			reinterpret_cast<size_t*>(const_cast<size_t*>(written_ptr)),
-			batch_num_msg, __ATOMIC_RELEASE) + batch_num_msg;
+			batch_num_msg, __ATOMIC_RELEASE);
 
 		// Update TInode written_addr (last message end position)
 		tinode->offsets[broker_id_].written_addr = bh->log_idx + bh->total_size;
@@ -247,9 +179,6 @@ void NetworkManager::TryAdvanceWrittenFrontier(const char* topic, size_t my_slot
 
 		// Clear batch_complete for ring reuse
 		__atomic_store_n(&bh->batch_complete, 0, __ATOMIC_RELEASE);
-
-		VLOG(3) << "TryAdvanceWrittenFrontier: slot=" << actual_slot
-		        << " num_msg=" << batch_num_msg << " new_written=" << new_written;
 	}
 }
 
@@ -287,6 +216,12 @@ bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
 	if (setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) != 0) {
 		LOG(WARNING) << "setsockopt(TCP_QUICKACK) failed: " << strerror(errno);
 		// Non-fatal, continue
+	}
+	// Enable SO_BUSY_POLL for ultra-low latency (kernel polls socket queue directly)
+	int busy_poll = 50;  // microseconds to busy poll
+	if (setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll)) < 0) {
+		// SO_BUSY_POLL may not be available on all kernels, so don't treat as fatal
+		LOG(WARNING) << "setsockopt(SO_BUSY_POLL) failed (may not be supported): " << strerror(errno);
 	}
 
 	// Increase socket buffers for high-throughput (128 MB; match SetAcceptedSocketBuffers)
@@ -497,23 +432,16 @@ NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads)
 		while (thread_count_.load() != (1 + num_reqReceive_threads_)) {
 			// Busy wait until all threads are ready
 		}
-
-		VLOG(3) << "[NetworkManager]: Constructed with " << num_reqReceive_threads_
-			<< " request threads for broker " << broker_id_;
 	}
 
 NetworkManager::~NetworkManager() {
 	Shutdown();
-	VLOG(3) << "[NetworkManager]: Destructed";
 }
 
 void NetworkManager::Shutdown() {
 	if (shutdown_started_.exchange(true, std::memory_order_acq_rel)) {
 		return;
 	}
-	// Log publish pipeline profile first (before joining threads) so it is emitted even if process is killed during shutdown
-	LogPublishPipelineProfile();
-	google::FlushLogFiles(google::GLOG_INFO);  // Ensure profile is on disk before join (SIGTERM during join can abort before flush)
 
 	// Signal threads to stop
 	stop_threads_.store(true, std::memory_order_release);
@@ -550,40 +478,6 @@ void NetworkManager::SetCXLManager(CXLManager* cxl_manager) {
 	cxl_manager_ = cxl_manager;
 }
 
-void NetworkManager::RecordProfile(PublishPipelineComponent c, uint64_t ns) {
-	if (c < 0 || c >= kNumPipelineComponents) return;
-	profile_total_ns_[c].fetch_add(ns, std::memory_order_relaxed);
-	profile_count_[c].fetch_add(1, std::memory_order_relaxed);
-}
-
-void NetworkManager::LogPublishPipelineProfile() {
-	static const char* kComponentNames[] = {
-		"RecvHeader",
-		"ReserveBLogSpace",
-		"RecvPayload",
-	};
-	uint64_t total_ns = 0;
-	for (int c = 0; c < kNumPipelineComponents; ++c) {
-		total_ns += profile_total_ns_[c].load(std::memory_order_relaxed);
-	}
-	if (total_ns == 0) {
-		LOG(INFO) << "[PublishPipelineProfile] No samples yet.";
-		return;
-	}
-	LOG(INFO) << "[PublishPipelineProfile] === Aggregated time per component ===";
-	for (int c = 0; c < kNumPipelineComponents; ++c) {
-		uint64_t ns = profile_total_ns_[c].load(std::memory_order_relaxed);
-		uint64_t cnt = profile_count_[c].load(std::memory_order_relaxed);
-		uint64_t avg_ns = cnt ? (ns / cnt) : 0;
-		double pct = (100.0 * static_cast<double>(ns)) / static_cast<double>(total_ns);
-		LOG(INFO) << "[PublishPipelineProfile]   " << kComponentNames[c]
-			<< ": total=" << (ns / 1000) << " us, count=" << cnt
-			<< ", avg=" << avg_ns << " ns, " << pct << "% of pipeline time";
-	}
-	LOG(INFO) << "[PublishPipelineProfile]   TOTAL: " << (total_ns / 1000) << " us ("
-		<< (total_ns / 1e9) << " s) across all components";
-	LOG(INFO) << "[PublishPipelineProfile] ========================================";
-}
 
 void NetworkManager::EnqueueRequest(struct NetworkRequest request) {
 	request_queue_.blockingWrite(request);
@@ -669,7 +563,7 @@ void NetworkManager::MainThread() {
 	const int MAX_EVENTS = 16;
 	struct epoll_event events[MAX_EVENTS];
 
-	while (!stop_threads_.load(std::memory_order_acquire)) {
+	while (!stop_threads_) {
 		// PERFORMANCE OPTIMIZATION: Reduced timeout for better responsiveness
 		int n = epoll_wait(epoll_fd, events, MAX_EVENTS, 100);
 		for (int i = 0; i < n; i++) {
@@ -711,7 +605,7 @@ void NetworkManager::ReqReceiveThread() {
 	thread_count_.fetch_add(1, std::memory_order_relaxed);
 	std::optional<struct NetworkRequest> opt_req;
 
-	while (!stop_threads_.load(std::memory_order_acquire)) {
+	while (!stop_threads_) {
 		// Wait for a new request
 		request_queue_.blockingRead(opt_req);
 
@@ -744,20 +638,20 @@ void NetworkManager::ReqReceiveThread() {
 			if (ret <= 0) {
 				if (ret < 0) {
 					if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
-					    !stop_threads_.load(std::memory_order_acquire)) {
+					    !stop_threads_) {
 						continue;
 					}
 					LOG(ERROR) << "Error receiving handshake: " << strerror(errno);
 				}
 				close(req.client_socket);
-				if (stop_threads_.load(std::memory_order_acquire)) {
+				if (stop_threads_) {
 					break;
 				}
 				return;
 			}
 			read_total += static_cast<size_t>(ret);
 		}
-		if (stop_threads_.load(std::memory_order_acquire)) {
+		if (stop_threads_) {
 			close(req.client_socket);
 			break;
 		}
@@ -786,7 +680,7 @@ void NetworkManager::HandlePublishRequest(
 		int client_socket,
 		const EmbarcaderoReq& handshake,
 		const struct sockaddr_in& client_address) {
-	if (stop_threads_.load(std::memory_order_acquire)) {
+	if (stop_threads_) {
 		close(client_socket);
 		return;
 	}
@@ -838,7 +732,7 @@ void NetworkManager::HandlePublishRequest(
 			LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
 			          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id;
 			// Pass local_ack_efd to thread so it uses the correct epoll instance
-			threads_.emplace_back(&NetworkManager::AckThread, this, std::string(handshake.topic), handshake.ack, ack_fd, local_ack_efd);
+			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd);
 		}
 		}
 	}
@@ -846,7 +740,7 @@ void NetworkManager::HandlePublishRequest(
 	// Process message batches
 	bool running = true;
 
-	while (running && !stop_threads_.load(std::memory_order_acquire)) {
+	while (running && !stop_threads_) {
 		// Read batch header
 		BatchHeader batch_header;
 		batch_header.client_id = handshake.client_id;
@@ -856,7 +750,7 @@ void NetworkManager::HandlePublishRequest(
 		if (bytes_read <= 0) {
 			if (bytes_read < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
-				    !stop_threads_.load(std::memory_order_acquire)) {
+				    !stop_threads_) {
 					continue;
 				}
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
@@ -878,7 +772,7 @@ void NetworkManager::HandlePublishRequest(
 					0);
 			if (recv_ret < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
-				    !stop_threads_.load(std::memory_order_acquire)) {
+				    !stop_threads_) {
 					continue;
 				}
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
@@ -887,11 +781,9 @@ void NetworkManager::HandlePublishRequest(
 			}
 			bytes_read += recv_ret;
 		}
-		if (stop_threads_.load(std::memory_order_acquire)) {
+		if (stop_threads_) {
 			break;
 		}
-
-		// [[PERF_FIX]] Removed B0_ACK_DIAG logging - hot path overhead (~90-180 cycles/batch)
 
 		// Allocate buffer for message batch
 		size_t to_read = batch_header.total_size;
@@ -909,11 +801,10 @@ void NetworkManager::HandlePublishRequest(
 
 		// Use GetCXLBuffer for batch-level allocation and zero-copy receive
 		// BLOCKING MODE: Wait indefinitely for ring space - NEVER close connection
-		static std::atomic<size_t> blocking_ring_full_count{0};
 		size_t wait_iterations = 0;
 
-		while (!buf && !stop_threads_.load(std::memory_order_acquire)) {
-			if (stop_threads_.load(std::memory_order_acquire)) {
+		while (!buf && !stop_threads_) {
+			if (stop_threads_) {
 				break;
 			}
 			// [[Issue #3]] Single epoch check per batch: do once for EMBARCADERO, then pass epoch_checked to GetCXLBuffer and ReservePBRSlotAfterRecv.
@@ -933,26 +824,14 @@ void NetworkManager::HandlePublishRequest(
 					segment_header, logical_offset, seq_type, batch_header_location, epoch_checked_this_batch);
 
 			if (buf != nullptr) {
-				// [[PERF_FIX]] Removed B0_ACK_DIAG logging
 				break;  // Success
 			}
 
 			// Ring full - wait for consumer to make space
 			wait_iterations++;
-			// [[PERF_FIX]] Removed B0_ACK_DIAG logging
-			size_t total_ring_full = blocking_ring_full_count.fetch_add(1, std::memory_order_relaxed) + 1;
-
-			// Log first few waits and then sparsely to avoid hot-path log amplification.
-			if (total_ring_full <= 3 || total_ring_full % 100000 == 0) {
-				LOG(WARNING) << "NetworkManager (blocking): Ring full, waiting for space "
-				             << "(client_id=" << handshake.client_id
-				             << ", wait_iterations=" << wait_iterations
-				             << ", total_ring_full=" << total_ring_full << ")";
-			}
-
-			// Small sleep to avoid busy-wait (100µs = 0.1ms)
-			// This allows consumer threads to make progress
-			std::this_thread::sleep_for(std::chrono::microseconds(100));
+			// [[FIX_RING_FULL_YIELD]] Use yield() immediately for ring full - consumer needs CPU time.
+			// Ring full means consumer is slow, so yield to allow consumer threads to catch up.
+			std::this_thread::yield();
 		}
 
 		if (!buf) {
@@ -975,22 +854,17 @@ void NetworkManager::HandlePublishRequest(
 				           << " batch_seq=" << batch_header.batch_seq << " — batch will not be sequenced or acked";
 			}
 		} else {
-			static thread_local size_t getcxl_logs = 0;
-			if (++getcxl_logs % 10000 == 0) {
-				VLOG(1) << "NetworkManager: GetCXLBuffer batch_header_location=" << batch_header_location
-				        << " batch_seq=" << batch_header.batch_seq << " num_msg=" << batch_header.num_msg
-				        << " (log_count=" << getcxl_logs << ")";
-			}
+			// batch_header_location is set
 		}
 
 		// Receive message data (byte-accurate accounting only)
 		size_t read = 0;
 		bool batch_data_complete = false;
-		while (running && !stop_threads_.load(std::memory_order_acquire)) {
+		while (running && !stop_threads_) {
 			bytes_read = recv(client_socket, (uint8_t*)buf + read, to_read, 0);
 			if (bytes_read < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
-				    !stop_threads_.load(std::memory_order_acquire)) {
+				    !stop_threads_) {
 					continue;
 				}
 				LOG(ERROR) << "Error receiving message data: " << strerror(errno);
@@ -1029,13 +903,12 @@ void NetworkManager::HandlePublishRequest(
 	// [[PERF_REGRESSION_FIX]] Reverted ORDER_0_SKIP_PBR: ORDER=0 now uses PBR like all other orders.
 	// This allows DelegationThread to process ORDER=0 batches, restoring 10-12 GB/s performance.
 	TInode* tinode = nullptr;
-	if (seq_type == EMBARCADERO) {
-		static std::atomic<size_t> post_recv_ring_full_count{0};
+		if (seq_type == EMBARCADERO) {
 		size_t post_recv_attempts = 0;
 		// Retry post-recv PBR reservation with exponential backoff (max 10 seconds)
 		int sleep_ms = 1;  // Start at 1 ms
 		auto post_recv_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-		while (!batch_header_location && !stop_threads_.load(std::memory_order_acquire)) {
+		while (!batch_header_location && !stop_threads_) {
 			// [[FIX: Force Epoch Refresh]] Pass false for epoch_already_checked to force ReservePBRSlotAfterRecv
 			// to refresh the epoch from CXL. This ensures that if recv() blocked for a long time,
 			// we don't stamp the batch with a stale epoch that gets dropped by the sequencer.
@@ -1045,22 +918,9 @@ void NetworkManager::HandlePublishRequest(
 				: cxl_manager_->ReservePBRSlotAfterRecv(handshake.topic, batch_header, buf,
 						segment_header, logical_offset, batch_header_location);
 			if (ok) {
-				// [[PERF_FIX]] Removed B0_ACK_DIAG logging
 				break;  // Success
 			}
 			post_recv_attempts++;
-			size_t total_failures = post_recv_ring_full_count.fetch_add(1, std::memory_order_relaxed) + 1;
-			// [[PERF_FIX]] Removed B0_ACK_DIAG logging
-
-			// Log first few failures and then sparsely to reduce contention from warning logs.
-			if (total_failures <= 3 || total_failures % 10000 == 0) {
-				LOG(WARNING) << "NetworkManager (post-recv PBR): Ring backpressure "
-				             << "(client_id=" << handshake.client_id
-				             << " batch_seq=" << batch_header.batch_seq
-				             << " attempt=" << post_recv_attempts
-				             << " total_backpressure=" << total_failures << ")";
-			}
-			
 			// Check deadline; if exceeded, close connection (avoid blocking forever)
 			if (std::chrono::steady_clock::now() >= post_recv_deadline) {
 				LOG(ERROR) << "NetworkManager: PBR backpressure timeout (10s) for batch_seq="
@@ -1070,14 +930,19 @@ void NetworkManager::HandlePublishRequest(
 				break;
 			}
 			
-			// Exponential backoff: 1ms, 2ms, 4ms, 8ms, ...max 100ms
-			std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+			// [[FIX_BACKOFF_ADAPTIVE]] Use adaptive backoff: yield for small delays, sleep for large ones.
+			// Network issues need thread cooperation, but very long delays should actually sleep.
+			if (sleep_ms <= 1) {
+				std::this_thread::yield();
+			} else {
+				std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+			}
 			sleep_ms = std::min(100, sleep_ms * 2);
 		}
 		
 		if (!batch_header_location) {
 			// Either deadline exceeded or stop_threads_ set
-			if (stop_threads_.load(std::memory_order_acquire)) {
+			if (stop_threads_) {
 				VLOG(1) << "NetworkManager: Shutdown during post-recv PBR reservation for batch_seq="
 				        << batch_header.batch_seq;
 			} else {
@@ -1208,7 +1073,7 @@ void NetworkManager::HandlePublishRequest(
 			
 			non_emb_seq_callback((void*)header, logical_offset - 1);
 			if (seq_type == CORFU) {
-				//TODO(Jae) Replication ack
+				// Replication ack not implemented
 			}
 		}
 	}
@@ -1218,7 +1083,6 @@ void NetworkManager::HandlePublishRequest(
 	{
 		Topic* topic_final = cxl_manager_->GetTopicPtr(handshake.topic);
 		if (topic_final) {
-			VLOG(1) << "Broker " << broker_id_ << " publish connection closed, calling UpdateWrittenToLastComplete for topic=" << handshake.topic;
 			topic_final->UpdateWrittenToLastComplete();
 		}
 	}
@@ -1284,6 +1148,10 @@ void NetworkManager::HandleSubscribeRequest(
 	
 	{
 		absl::MutexLock lock(&sub_mu_);
+		// Ensure vector is large enough for this connection_id
+		if (sub_state_.size() <= static_cast<size_t>(unique_connection_id)) {
+			sub_state_.resize(unique_connection_id + 1);
+		}
 		auto state = std::make_unique<SubscriberState>();
 		state->last_offset = 0;  // Always start from beginning
 		state->last_addr = handshake.last_addr;
@@ -1297,7 +1165,9 @@ void NetworkManager::HandleSubscribeRequest(
 	// Cleanup subscriber state when connection ends
 	{
 		absl::MutexLock lock(&sub_mu_);
-		sub_state_.erase(unique_connection_id);
+		if (static_cast<size_t>(unique_connection_id) < sub_state_.size()) {
+			sub_state_[unique_connection_id].reset();
+		}
 	}
 
 	// Cleanup
@@ -1319,7 +1189,7 @@ void NetworkManager::SubscribeNetworkThread(
 		constexpr int kMaxWaitSec = 30;
 		constexpr int kPollIntervalMs = 100;
 		int waited_ms = 0;
-		while (!stop_threads_.load(std::memory_order_acquire) && waited_ms < kMaxWaitSec * 1000) {
+		while (!stop_threads_ && waited_ms < kMaxWaitSec * 1000) {
 			int cur_order = topic_manager_->GetTopicOrder(topic);
 			if (topic_manager_->GetTopic(topic) != nullptr) {
 				order = cur_order;
@@ -1352,19 +1222,18 @@ void NetworkManager::SubscribeNetworkThread(
 	static_assert(offsetof(BatchMetadata, header_version) == offsetof(wire::BatchMetadata, header_version),
 		"header_version field offset must match wire::BatchMetadata");
 
-	// PERFORMANCE OPTIMIZATION: Cache state pointer to avoid repeated hash map lookups
+	// PERFORMANCE OPTIMIZATION: Cache state pointer to avoid repeated vector lookups
 	std::unique_ptr<SubscriberState>* cached_state_ptr = nullptr;
 	{
 		absl::MutexLock lock(&sub_mu_);
-		auto it = sub_state_.find(connection_id);
-		if (it == sub_state_.end() || !it->second) {
+		if (static_cast<size_t>(connection_id) >= sub_state_.size() || !sub_state_[connection_id]) {
 			LOG(ERROR) << "SubscribeNetworkThread: No state found for connection_id " << connection_id;
 			return;
 		}
-		cached_state_ptr = &it->second;
+		cached_state_ptr = &sub_state_[connection_id];
 	}
 
-	while (!stop_threads_.load(std::memory_order_acquire)) {
+	while (!stop_threads_) {
 		// Get message data to send
 		void* msg = nullptr;
 		size_t messages_size = 0;
@@ -1377,7 +1246,6 @@ void NetworkManager::SubscribeNetworkThread(
 			// Process from large message queue
 			msg = req.msg;
 			messages_size = req.len;
-			VLOG(3) << "[DEBUG] poped from queue:" << messages_size;
 		} else {
 			// Get new messages from CXL manager. Narrow mutex: copy-out, call without lock, copy-in.
 			size_t local_offset;
@@ -1407,8 +1275,6 @@ void NetworkManager::SubscribeNetworkThread(
 				batch_meta.num_messages = num_messages;
 				batch_meta.header_version = ((order == 5 || order == 2) && HeaderUtils::ShouldUseBlogHeader()) ? 2 : 1;
 				batch_meta.flags = 0;
-				VLOG(2) << "SubscribeNetworkThread: Sending batch metadata, total_order=" << batch_total_order
-				        << ", num_messages=" << num_messages << ", topic=" << topic;
 			} else if (order > 0) {
 				if (!topic_manager_->GetBatchToExport(
 							topic,
@@ -1459,8 +1325,7 @@ void NetworkManager::SubscribeNetworkThread(
 		}
 
 		if (messages_size > 0) {
-			VLOG(2) << "Broker " << broker_id_ << " sending subscribe data: " << messages_size
-			        << " bytes (topic=" << topic << " order=" << order << ")";
+			// Send message data
 		}
 
 		// Send message data
@@ -1714,9 +1579,12 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	}
 }
 
-void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd, int ack_efd) {
+void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd) {
 	struct epoll_event events[10];
 	char buf[1];
+
+	// Create std::string for internal use (required by GetOffsetToAck interface)
+	std::string topic(topic_cstr ? topic_cstr : "");
 
 	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic='" << topic
 	          << "' (len=" << topic.size() << "), ack_level=" << ack_level;
@@ -1762,7 +1630,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 	int consecutive_timeouts = 0;
 	int consecutive_errors = 0;
 	while (acked_size < sizeof(broker_id_)) {
-		if (stop_threads_.load(std::memory_order_acquire)) {
+		if (stop_threads_) {
 			break;
 		}
 		// Add 5-second timeout to prevent infinite blocking if epoll fd is invalid
@@ -1773,7 +1641,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 			LOG(WARNING) << "AckThread: Timeout sending broker_id for broker " << broker_id_
 			             << " (timeout " << consecutive_timeouts << "/" << kMaxConsecutiveTimeouts << ")";
 			if (consecutive_timeouts >= kMaxConsecutiveTimeouts) {
-				if (stop_threads_.load(std::memory_order_acquire)) break;
+				if (stop_threads_) break;
 				if (!reset_ack_epoll("broker_id_timeout")) {
 					close(ack_fd);
 					return;
@@ -1787,7 +1655,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 			LOG(ERROR) << "AckThread: epoll_wait failed while sending broker_id: " << strerror(errno)
 			           << " (error " << consecutive_errors << "/" << kMaxConsecutiveErrors << ")";
 			if (consecutive_errors >= kMaxConsecutiveErrors) {
-				if (stop_threads_.load(std::memory_order_acquire)) break;
+				if (stop_threads_) break;
 				if (!reset_ack_epoll("broker_id_error")) {
 					close(ack_fd);
 					return;
@@ -1804,7 +1672,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 				bool retry;
 				do {
 					retry = false;
-					if (stop_threads_.load(std::memory_order_acquire)) break;
+					if (stop_threads_) break;
 					ssize_t bytes_sent = send(
 							ack_fd,
 							(char*)&broker_id_ + acked_size,
@@ -1838,160 +1706,40 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 	LOG(INFO) << "AckThread: Broker " << broker_id_ << " sent broker_id to client for topic='" << topic << "'";
 
 	size_t next_to_ack_offset = 0;
-	auto last_log_time = std::chrono::steady_clock::now();
-	static const bool kAckDiag = []() {
-		const char* env = std::getenv("EMBARCADERO_ACK_DIAG");
-		return env && std::strcmp(env, "0") != 0;
-	}();
-	const int spin_us = []() {
-		const char* e = std::getenv("EMBARCADERO_ACK_SPIN_US");
-		return e ? std::atoi(e) : 500;
-	}();
-	const int drain_us = []() {
-		const char* e = std::getenv("EMBARCADERO_ACK_DRAIN_US");
-		return e ? std::atoi(e) : 1000;
-	}();
-	const int sleep_light_us = []() {
-		const char* e = std::getenv("EMBARCADERO_ACK_SLEEP_LIGHT_US");
-		return e ? std::atoi(e) : 100;
-	}();
-	const int sleep_heavy_ms = []() {
-		const char* e = std::getenv("EMBARCADERO_ACK_SLEEP_HEAVY_MS");
-		return e ? std::atoi(e) : 1;
-	}();
-	const size_t heavy_sleep_stall_threshold = []() {
-		const char* e = std::getenv("EMBARCADERO_ACK_HEAVY_SLEEP_STALL_THRESHOLD");
-		return e ? static_cast<size_t>(std::atoi(e)) : 200u;
-	}();
-	const auto SPIN_DURATION = std::chrono::microseconds(spin_us > 0 ? spin_us : 500);
-	const int drain_eff_us = drain_us > 0 ? drain_us : 1000;
-	const int sleep_light_eff_us = sleep_light_us > 0 ? sleep_light_us : 100;
-	const int sleep_heavy_eff_ms = sleep_heavy_ms > 0 ? sleep_heavy_ms : 1;
 
 	consecutive_timeouts = 0;
 	consecutive_errors = 0;
 	size_t consecutive_ack_stalls = 0;
 	
-		while (!stop_threads_.load(std::memory_order_acquire)) {
-		auto cycle_start = std::chrono::steady_clock::now();
-
-		// Spin-then-sleep: spin first to catch ACK updates; only sleep when no progress.
-		// Sleep duration is adaptive: light when recently active, heavy when long idle (stall threshold).
+		while (!stop_threads_) {
+		// Simplified polling: single check per iteration to reduce cache operations
+		// Trade-off: slightly higher ACK latency (~100μs) for much lower CXL traffic
 		bool found_ack = false;
-		
-		// [[SENIOR_REVIEW_FIX: Removed redundant cache invalidation from spin loop]]
-		// GetOffsetToAck() already invalidates cache internally before reading ordered
-		// Having periodic invalidation here causes DOUBLE invalidation (redundant!)
-		// Performance impact: Unnecessary clflushopt + lfence overhead
-		// GetOffsetToAck() handles invalidation correctly, so we don't need it here
-		
-		// [[SENIOR_REVIEW_FIX: Cache GetOffsetToAck() result to avoid redundant calls]]
-		// [PHASE-2] Reduced CXL polling: check every ~50μs instead of continuous spin.
-		// Previous: ~1000 CXL invalidations per 500μs spin = 2M/sec/broker = 512 MB/s CXL waste.
-		// New: ~10 CXL invalidations per 500μs spin = 20K/sec/broker = ~1.3 MB/s CXL.
-		// Trade-off: ACK latency increases by up to 50μs (negligible vs epoch time of 500μs).
-		constexpr auto CXL_POLL_INTERVAL = std::chrono::microseconds(50);
-		auto next_poll = cycle_start;
-		size_t cached_ack = (size_t)-1;
-		
-		while (std::chrono::steady_clock::now() - cycle_start < SPIN_DURATION) {
-			auto now = std::chrono::steady_clock::now();
-			if (now >= next_poll) {
-				cached_ack = GetOffsetToAck(topic.c_str(), ack_level);
-				if (cached_ack != (size_t)-1 && next_to_ack_offset <= cached_ack) {
-					found_ack = true;
-					consecutive_ack_stalls = 0;
-					break;
-				}
-				next_poll = now + CXL_POLL_INTERVAL;
-			}
-			// Between polls, yield CPU (don't busy-spin on CXL)
-			CXL::cpu_pause();
-			CXL::cpu_pause();
-			CXL::cpu_pause();
-			CXL::cpu_pause();  // ~40ns of pause before next time check
+		size_t current_ack = GetOffsetToAck(topic.c_str(), ack_level);
+
+		if (current_ack != (size_t)-1 && next_to_ack_offset <= current_ack) {
+			found_ack = true;
+			consecutive_ack_stalls = 0;
 		}
 		
 		if (!found_ack) {
 			consecutive_ack_stalls++;
-		}
-
-		// If no ACK found after spinning, log progress and sleep briefly
-		// [[SENIOR_REVIEW_FIX: Use cached GetOffsetToAck() result]]
-		// [[PERF: Reuse tinode from top of cycle - avoid second GetTInode() in 3s log block]]
-		auto now = std::chrono::steady_clock::now();
-		if (kAckDiag &&
-		    std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
-			// Use cached value from spin loop (or re-fetch if not available)
-			size_t ack = (cached_ack != (size_t)-1) ? cached_ack : GetOffsetToAck(topic.c_str(), ack_level);
-			TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic.c_str());
-			size_t ordered = tinode ? tinode->offsets[broker_id_].ordered : 0;
-			
-			// [[PHASE_0_INSTRUMENTATION]] - Enhanced ACK diagnostics
-			LOG(INFO) << "Broker:" << broker_id_ << " Acknowledgments " << ack
-			          << " (next_to_ack=" << next_to_ack_offset
-			          << ", ordered=" << ordered << ", ack_level=" << ack_level << ")";
-			if (tinode) {
-				int replication_factor = tinode->replication_factor;
-				int num_brokers = get_num_brokers_callback_();
-				LOG(INFO) << "[AckThread B" << broker_id_ << "]: Replication set (factor=" 
-					<< replication_factor << ", num_brokers=" << num_brokers << "):";
-				for (int i = 0; i < replication_factor; i++) {
-					int b = GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
-					size_t rep_done = tinode->offsets[b].replication_done[broker_id_];
-					LOG(INFO) << "\t  broker[" << b << "].replication_done[" << broker_id_ << "]=" << rep_done;
+			// Simplified backoff: brief pause, then yield after 20 consecutive stalls
+			if (consecutive_ack_stalls < 20) {
+				// Brief pause for responsiveness
+				for (int i = 0; i < 100; ++i) {
+					CXL::cpu_pause();
 				}
-				// Log min calculation for ack_level=2
-				if (ack_level == 2 && replication_factor > 0) {
-					size_t min_rep_done = std::numeric_limits<size_t>::max();
-					for (int i = 0; i < replication_factor; i++) {
-						int b = GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
-						size_t r = tinode->offsets[b].replication_done[broker_id_];
-						if (min_rep_done > r) min_rep_done = r;
-					}
-					LOG(INFO) << "\t  min(replication_done)=" << min_rep_done << " (used for ack_level=2)";
-				}
-			}
-			last_log_time = now;
-		}
-
-		if (!found_ack) {
-			auto drain_end = std::chrono::steady_clock::now() + std::chrono::microseconds(drain_eff_us);
-			// [PHASE-2] Reduced drain polling
-			auto next_drain_poll = std::chrono::steady_clock::now();
-			while (std::chrono::steady_clock::now() < drain_end) {
-				auto now = std::chrono::steady_clock::now();
-				if (now >= next_drain_poll) {
-					cached_ack = GetOffsetToAck(topic.c_str(), ack_level);
-					if (cached_ack != (size_t)-1 && next_to_ack_offset <= cached_ack) {
-						found_ack = true;
-						consecutive_ack_stalls = 0;
-						break;
-					}
-					next_drain_poll = now + CXL_POLL_INTERVAL;
-				}
-				CXL::cpu_pause();
-				CXL::cpu_pause();
-				CXL::cpu_pause();
-				CXL::cpu_pause();
-			}
-		}
-		if (!found_ack) {
-			if (consecutive_ack_stalls < heavy_sleep_stall_threshold) {
-				std::this_thread::sleep_for(std::chrono::microseconds(sleep_light_eff_us));
 			} else {
-				std::this_thread::sleep_for(std::chrono::milliseconds(sleep_heavy_eff_ms));
+				// Yield after many consecutive stalls to prevent starvation
+				std::this_thread::yield();
+				consecutive_ack_stalls = 0;
 			}
 			continue;
 		}
 
-		// ACK is ready, fetch it and send
-		// [[SENIOR_REVIEW_FIX: Use cached GetOffsetToAck() result from spin loop]]
-		// We found ACK in spin loop, so cached_ack is valid and fresh
-		// No need to call GetOffsetToAck() again - re-use cached value
-		size_t ack = cached_ack;
-
-		// [[PERF_FIX]] Removed B0_ACK_THREAD logging (hot path overhead)
+		// ACK is ready, use the value we already fetched
+		size_t ack = current_ack;
 
 		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
 			next_to_ack_offset = ack + 1;
@@ -1999,12 +1747,12 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 			// Send offset acknowledgment
 			// Add timeout to epoll_wait to prevent infinite blocking
 			while (acked_size < sizeof(ack)) {
-				if (stop_threads_.load(std::memory_order_acquire)) break;
+				if (stop_threads_) break;
 				int n = epoll_wait(ack_efd, events, 10, kAckEpollTimeoutMs);
 				if (n == 0) {
 					consecutive_timeouts++;
 					if (consecutive_timeouts >= kMaxConsecutiveTimeouts) {
-						if (stop_threads_.load(std::memory_order_acquire)) break;
+						if (stop_threads_) break;
 						LOG(WARNING) << "AckThread: repeated ACK send timeouts for broker " << broker_id_
 						             << ", resetting epoll";
 						if (!reset_ack_epoll("ack_timeout")) {
@@ -2020,7 +1768,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 					LOG(ERROR) << "AckThread: epoll_wait failed while sending ack: " << strerror(errno)
 					           << " (error " << consecutive_errors << "/" << kMaxConsecutiveErrors << ")";
 					if (consecutive_errors >= kMaxConsecutiveErrors) {
-						if (stop_threads_.load(std::memory_order_acquire)) break;
+						if (stop_threads_) break;
 						if (!reset_ack_epoll("ack_error")) {
 							close(ack_fd);
 							return;
@@ -2037,7 +1785,7 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 						bool retry;
 						do {
 							retry = false;
-							if (stop_threads_.load(std::memory_order_acquire)) break;
+							if (stop_threads_) break;
 							ssize_t bytes_sent = send(
 									ack_fd,
 									(char*)&ack + acked_size,
@@ -2061,7 +1809,6 @@ void NetworkManager::AckThread(std::string topic, uint32_t ack_level, int ack_fd
 						} while (retry && acked_size < sizeof(ack));
 
 						if (acked_size >= sizeof(ack)) {
-							// [[PERF_FIX]] Removed B0_ACK_THREAD logging (hot path overhead)
 							break;  // All data sent
 						}
 					}

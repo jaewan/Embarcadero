@@ -64,9 +64,10 @@ Subscriber::~Subscriber() {
 }
 
 void Subscriber::Shutdown() {
-	if (shutdown_.exchange(true)) { // Prevent double shutdown
+	if (shutdown_) { // Prevent double shutdown
 		return;
 	}
+	shutdown_ = true;
 
 	// Wake up any waiting consumer
 	consume_cv_.SignalAll();
@@ -847,15 +848,15 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 				// Wait logic (manual loop using receiver_can_write_cv) remains the same
 				{
 					absl::MutexLock lock(&conn_buffers->state_mutex);
-					if (shutdown_.load(std::memory_order_relaxed)) break;
-					while (! (shutdown_.load(std::memory_order_relaxed) ||
+					if (shutdown_) break;
+					while (! (shutdown_ ||
 								!conn_buffers->read_buffer_in_use_by_consumer.load(std::memory_order_acquire)) )
 					{
 						conn_buffers->receiver_can_write_cv.Wait(&conn_buffers->state_mutex);
 					}
 				}
 				VLOG(4) << "Worker (fd=" << conn_buffers->fd << "): Wait loop finished.";
-				if (shutdown_.load(std::memory_order_relaxed)) break;
+				if (shutdown_) break;
 				VLOG(4) << "Worker (fd=" << conn_buffers->fd << "): Consumer released buffer, continuing loop.";
 				continue;
 			}
@@ -899,7 +900,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 			break;
 		} else { // bytes_received < 0
 			if (errno == EINTR) continue;
-			if (shutdown_.load(std::memory_order_relaxed)) { /* log shutdown */ }
+			if (shutdown_) { /* log shutdown */ }
 			else { LOG(ERROR) << "Worker (fd=" << conn_buffers->fd << "): recv failed: " << strerror(errno); }
 			size_t final_write_offset_err = conn_buffers->buffers[conn_buffers->current_write_idx.load()].write_offset.load();
 			if (final_write_offset_err > 0) { /* signal final buffer */ }

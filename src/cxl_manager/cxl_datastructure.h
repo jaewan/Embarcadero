@@ -196,8 +196,9 @@ static_assert(alignof(ControlBlock) == 128, "ControlBlock must be 128-byte align
  * Sentinel: Head initializes completed_pbr_head to (uint64_t)-1; 0 = first batch completed.
  */
 struct alignas(128) CompletionVectorEntry {
-	// Highest contiguous PBR index for this broker (sequenced; for ack_level=2 also replicated)
-	// [[writer: sequencer for ack_level=1; tail replica for ack_level=2 — max semantics]]
+	// [[PERF_CRITICAL]] Highest contiguous PBR index for this broker
+	// Cache line isolation prevents false sharing between broker threads
+	// CXL: 200-500ns latency makes alignment critical for 10GB/s performance
 	std::atomic<uint64_t> completed_pbr_head{0};
 
 	// [[ACK_OPTIMIZATION]] Cumulative message count (ACK offset) corresponding to completed_pbr_head.
@@ -205,7 +206,9 @@ struct alignas(128) CompletionVectorEntry {
 	// Readers can read this directly to get ACK count without dereferencing the PBR ring.
 	std::atomic<uint64_t> completed_logical_offset{0};
 
-	uint8_t _pad[112];  // Pad to 128 bytes (128 - 8 - 8 = 112)
+	// [[PERF_CRITICAL]] Explicit padding ensures no false sharing with adjacent entries
+	// Modern CPUs prefetch 128+ bytes; misalignment causes ping-pong invalidations
+	uint8_t _explicit_pad[112];
 };
 static_assert(sizeof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be exactly 128 bytes");
 static_assert(alignof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be 128-byte aligned");
@@ -342,7 +345,8 @@ struct alignas(64) TInode{
  * 
  * Stage 1 (Receiver/NetworkManager):
  *   - Reserve BLog, recv payload into CXL, then reserve PBR slot (post-recv).
- *   - Slot is zeroed on reserve to avoid stale reads (num_msg=0 until publish).
+ *   - Slot receives minimal init on reserve (CLAIMED, batch_complete=0, num_msg=0) so scanner
+ *     does not see it as ready until full header is published (no full zero required).
  *   - Writes full BatchHeader once after recv: batch_seq, client_id, num_msg, broker_id, total_size,
  *     start_logical_offset, log_idx, epoch_created, batch_id, pbr_absolute_index.
  *   - Readiness = flags has VALID (num_msg>0 is still validated for sanity).
@@ -374,7 +378,8 @@ constexpr uint32_t kBatchHeaderFlagValid = 1u << 1;
 
 struct alignas(64) BatchHeader{
 	// [[LIFECYCLE]]
-	// 1) NetworkManager reserves PBR after recv, zeroes slot, writes full header, flush+fence.
+	// 1) NetworkManager reserves PBR after recv, minimal-init slot (CLAIMED, batch_complete=0, num_msg=0),
+	//    then writes full header once, flush+fence.
 	// 2) Sequencer processes batch and clears batch_complete=0 and num_msg=0 (with flush+fence).
 	// This prevents duplicate processing of ring slots under ABA reuse.
 	// Keep readiness-critical fields in the first cache line for CXL visibility
@@ -389,7 +394,7 @@ struct alignas(64) BatchHeader{
 	uint16_t _pad0;
 
 	// [[PHASE_2]] Globally unique batch identifier for GOI deduplication and tracking
-	uint64_t batch_id; // [[WRITER: NetworkManager]] Format: (broker_id << 48) | (timestamp << 16) | counter
+	uint64_t batch_id; // [[WRITER: NetworkManager]] Format: (broker_id << 48) | pbr_absolute_index (P2.1)
 
 	// [[PHASE_2_FIX]] Absolute PBR index (never wraps, monotonic) for CV tracking
 	uint64_t pbr_absolute_index; // [[WRITER: NetworkManager]] Monotonic per-broker batch counter
@@ -669,6 +674,11 @@ static_assert(offsetof(BrokerMetadata, seq) == 64, "Sequencer struct must start 
 // [[PHASE_2]] CXL Memory Layout Constants
 constexpr size_t kCompletionVectorOffset = 0x1000;  // CompletionVector at 4 KB from CXL base
 constexpr size_t kGOIOffset = 0x2000;               // GOI at 8 KB from CXL base
+
+// [[PERF_CRITICAL]] Verify CompletionVector alignment to prevent cache line false sharing
+// CXL latency is 200-500ns; cache line misalignment can cause 5-10x degradation
+static_assert(kCompletionVectorOffset % 128 == 0, "CompletionVector must be 128-byte aligned for cache performance");
+static_assert(sizeof(CompletionVectorEntry) == 128, "CompletionVectorEntry size must be 128 bytes for alignment");
 
 /**
  * [[PHASE_2_ACK_HELPER]] Get replicated last offset from CompletionVector

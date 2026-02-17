@@ -12,7 +12,7 @@
 
 namespace Embarcadero {
 
-constexpr size_t NT_THRESHOLD = 4096; // [[P5]] Increase threshold to 4KB to avoid cache pollution for small batches
+constexpr size_t NT_THRESHOLD = 256; // [[P5_FIX]] Lower threshold for CXL - non-temporal stores bypass cache, better for write-once log data
 
 /** 32 bytes = one AVX2 vector; two per 64-byte cache line. */
 static constexpr size_t AVX2_VECTOR_SIZE = 32;
@@ -243,6 +243,15 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 				cxl_addr,
 				segment_metadata
 				);
+
+		// Start the topic's threads using factory pattern
+		try {
+			topics_[topic]->Start();
+		} catch (const std::exception& e) {
+			LOG(ERROR) << "Failed to start topic " << topic << ": " << e.what();
+			topics_.erase(topic);  // Clean up failed topic
+			return nullptr;
+		}
 	}
 
 	// Handle replication if needed
@@ -387,6 +396,15 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 				cxl_addr,
 				segment_metadata
 				);
+
+		// Start the topic's threads using factory pattern
+		try {
+			topics_[topic]->Start();
+		} catch (const std::exception& e) {
+			LOG(ERROR) << "Failed to start topic " << topic << ": " << e.what();
+			topics_.erase(topic);  // Clean up failed topic
+			return nullptr;
+		}
 	}
 
 	// Handle replication if needed

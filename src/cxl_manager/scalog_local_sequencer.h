@@ -25,7 +25,7 @@ class ScalogLocalSequencer {
 		void Register(int replication_factor);
 
 		/// Send a local cut to the global seq after every interval
-		void SendLocalCut(std::string topic_str, std::atomic<bool>& stop_thread);
+		void SendLocalCut(std::string topic_str, volatile bool& stop_thread);
 
 		/// Sends a request to global sequencer to terminate itself
 		void TerminateGlobalSequencer();

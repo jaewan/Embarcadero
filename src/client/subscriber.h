@@ -251,7 +251,7 @@ class Subscriber {
 		std::string port_;
 		std::unique_ptr<heartbeat_system::HeartBeat::Stub> stub_;
 		char topic_[TOPIC_NAME_SIZE];
-		std::atomic<bool> shutdown_{false};
+		volatile bool shutdown_{false};  // Non-atomic for performance - shutdown coordination
 		std::atomic<bool> connected_{false}; // Maybe more granular connection state needed
 		// Track actual data broker count
 		std::atomic<size_t> data_broker_count_{0};

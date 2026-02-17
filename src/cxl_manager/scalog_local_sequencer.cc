@@ -51,7 +51,7 @@ void ScalogLocalSequencer::Register(int replication_factor) {
 	}
 }
 
-void ScalogLocalSequencer::SendLocalCut(std::string topic_str, std::atomic<bool>& stop_thread){
+void ScalogLocalSequencer::SendLocalCut(std::string topic_str, volatile bool& stop_thread){
 	static char topic[TOPIC_NAME_SIZE];
 	memcpy(topic, topic_str.data(), topic_str.size());
 
@@ -62,7 +62,7 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str, std::atomic<bool>
 	// Spawn a thread to receive global cuts, passing the stream by reference
 	std::thread receive_global_cut(&ScalogLocalSequencer::ReceiveGlobalCut, this, std::ref(stream), topic_str);
 
-	while (!stop_thread.load(std::memory_order_acquire)) {
+	while (!stop_thread) {
 		/// Send epoch and tinode_->offsets[broker_id_].written to global sequencer
 		int local_cut = tinode_->offsets[broker_id_].written;
 
