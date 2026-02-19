@@ -97,6 +97,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 			int broker_id;
 			std::string address;
 			std::string network_mgr_addr;
+			std::chrono::steady_clock::time_point registration_time;
 			std::chrono::steady_clock::time_point last_heartbeat;
 			bool accepts_publishes;  // Always true (all brokers accept publishes)
 		};

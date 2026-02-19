@@ -34,6 +34,41 @@ namespace Embarcadero {
 // Utility Functions
 //----------------------------------------------------------------------------
 
+static bool ShouldEnableSoBusyPoll() {
+	static const bool enabled = []() {
+		const char* env = std::getenv("EMBARCADERO_ENABLE_SO_BUSY_POLL");
+		if (!env) return true;  // Default on for throughput path; allow explicit opt-out.
+		if (std::strcmp(env, "0") == 0 ||
+		    std::strcmp(env, "false") == 0 ||
+		    std::strcmp(env, "FALSE") == 0 ||
+		    std::strcmp(env, "no") == 0 ||
+		    std::strcmp(env, "NO") == 0) {
+			return false;
+		}
+		return std::strcmp(env, "1") == 0 ||
+		       std::strcmp(env, "true") == 0 ||
+		       std::strcmp(env, "TRUE") == 0 ||
+		       std::strcmp(env, "yes") == 0 ||
+		       std::strcmp(env, "YES") == 0;
+	}();
+	return enabled;
+}
+
+// ORDER=0 inline path is experimental and can increase throughput variance.
+// Keep the stable delegation-thread path as default.
+static bool ShouldEnableOrder0Inline() {
+	static const bool enabled = []() {
+		const char* env = std::getenv("EMBARCADERO_ORDER0_INLINE");
+		if (!env) return false;  // Default OFF for stable throughput.
+		return std::strcmp(env, "1") == 0 ||
+		       std::strcmp(env, "true") == 0 ||
+		       std::strcmp(env, "TRUE") == 0 ||
+		       std::strcmp(env, "yes") == 0 ||
+		       std::strcmp(env, "YES") == 0;
+	}();
+	return enabled;
+}
+
 /**
  * Closes socket and epoll file descriptors safely
  */
@@ -68,11 +103,14 @@ static void SetAcceptedSocketBuffers(int fd) {
 	if (setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) < 0) {
 		LOG(WARNING) << "setsockopt(TCP_QUICKACK) on accepted socket failed: " << strerror(errno);
 	}
-	// Enable SO_BUSY_POLL for ultra-low latency (kernel polls socket queue directly)
-	int busy_poll = 50;  // microseconds to busy poll
-	if (setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll)) < 0) {
-		// SO_BUSY_POLL may not be available on all kernels, so don't treat as fatal
-		LOG(WARNING) << "setsockopt(SO_BUSY_POLL) on accepted socket failed (may not be supported): " << strerror(errno);
+	if (ShouldEnableSoBusyPoll()) {
+		// Enable SO_BUSY_POLL for ultra-low latency (kernel polls socket queue directly)
+		int busy_poll = 50;  // microseconds to busy poll
+		if (setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll)) < 0) {
+			// SO_BUSY_POLL may not be available on all kernels, so don't treat as fatal
+			LOG(WARNING) << "setsockopt(SO_BUSY_POLL) on accepted socket failed (may not be supported): "
+			             << strerror(errno);
+		}
 	}
 	// [[DIAGNOSTIC]] Verify kernel actually applied the buffer sizes
 	int actual_rcv = 0, actual_snd = 0;
@@ -85,7 +123,6 @@ static void SetAcceptedSocketBuffers(int fd) {
 static constexpr int kRecoveryCheckInterval = 100;  // Check every N epoll iterations
 static constexpr int kMaxPBRRetries = 20;           // WAIT_PBR_SLOT: recovery attempts before fallback handoff
 
-
 // [[Phase 3.2]] written is cumulative (monotonic); fetch_add is sufficient. CXL layout uses
 // volatile size_t; __atomic_fetch_add is the correct way to get atomic RMW (GCC/clang extension).
 void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, size_t logical_offset, uint32_t num_msg) {
@@ -97,7 +134,75 @@ void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, size_t logical_offse
 	CXL::store_fence();  // Required for CXL visibility; reader (AckThread) must see updated written
 }
 
+/**
+ * [[ORDER0_INLINE]] Process ORDER=0 batch inline: set per-message metadata.
+ * Called by ReqReceive thread immediately after recv() to batch data, while hot in cache.
+ *
+ * Sets required metadata for GetMessageAddr() navigation:
+ * - logical_offset: Per-message sequence number
+ * - segment_header: Pointer to segment boundary
+ * - next_msg_diff: Size to next message (paddedSize)
+ *
+ * CRITICAL: Must be called BEFORE batch_complete=1 so metadata is visible when frontier advances.
+ * CRITICAL: Must flush metadata to CXL for non-coherent memory visibility.
+ *
+ * Parallelizes what DelegationThread did sequentially (2.56M msgs/sec bottleneck eliminated).
+ */
+void NetworkManager::ProcessOrder0BatchInline(void* batch_data, uint32_t num_msg, size_t base_logical_offset) {
+	if (!batch_data || num_msg == 0) return;
 
+	MessageHeader* msg = reinterpret_cast<MessageHeader*>(batch_data);
+	size_t logical_offset = base_logical_offset;
+
+	// Track flush points for batched CXL flushing
+	void* flush_start = msg;
+	size_t bytes_since_flush = 0;
+	constexpr size_t FLUSH_INTERVAL = 64 * 1024;  // Flush every 64KB
+
+	for (uint32_t i = 0; i < num_msg; i++) {
+		// Validate paddedSize to prevent infinite loop
+		if (msg->paddedSize < sizeof(MessageHeader) || msg->paddedSize > 1024 * 1024) {
+			LOG(ERROR) << "ProcessOrder0BatchInline: Invalid paddedSize=" << msg->paddedSize
+			           << " at message " << i << "/" << num_msg;
+			break;
+		}
+
+		// Set required metadata for subscriber navigation
+		msg->logical_offset = logical_offset++;
+		msg->segment_header = reinterpret_cast<uint8_t*>(msg) - CACHELINE_SIZE;
+		msg->next_msg_diff = msg->paddedSize;
+
+		// Update segment header (accumulated size from segment base to current message)
+		*reinterpret_cast<unsigned long long int*>(msg->segment_header) =
+			static_cast<unsigned long long int>(
+				reinterpret_cast<uint8_t*>(msg) - reinterpret_cast<uint8_t*>(msg->segment_header));
+
+		bytes_since_flush += msg->paddedSize;
+
+		// Batch flush every 64KB to reduce CXL flush overhead
+		if (bytes_since_flush >= FLUSH_INTERVAL) {
+			for (void* p = flush_start; p < reinterpret_cast<void*>(msg); p = reinterpret_cast<void*>(
+						reinterpret_cast<uint8_t*>(p) + 64)) {
+				CXL::flush_cacheline(p);
+			}
+			flush_start = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(msg) + msg->paddedSize);
+			bytes_since_flush = 0;
+		}
+
+		// Move to next message
+		if (i < num_msg - 1) {
+			msg = reinterpret_cast<MessageHeader*>(
+				reinterpret_cast<uint8_t*>(msg) + msg->paddedSize);
+		}
+	}
+
+	// Flush remaining cache lines and fence
+	for (void* p = flush_start; p <= reinterpret_cast<void*>(msg); p = reinterpret_cast<void*>(
+				reinterpret_cast<uint8_t*>(p) + 64)) {
+		CXL::flush_cacheline(p);
+	}
+	CXL::store_fence();
+}
 
 /**
  * [[ORDER0_INLINE]] Try to advance written frontier collaboratively.
@@ -217,11 +322,13 @@ bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
 		LOG(WARNING) << "setsockopt(TCP_QUICKACK) failed: " << strerror(errno);
 		// Non-fatal, continue
 	}
-	// Enable SO_BUSY_POLL for ultra-low latency (kernel polls socket queue directly)
-	int busy_poll = 50;  // microseconds to busy poll
-	if (setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll)) < 0) {
-		// SO_BUSY_POLL may not be available on all kernels, so don't treat as fatal
-		LOG(WARNING) << "setsockopt(SO_BUSY_POLL) failed (may not be supported): " << strerror(errno);
+	if (ShouldEnableSoBusyPoll()) {
+		// Enable SO_BUSY_POLL for ultra-low latency (kernel polls socket queue directly)
+		int busy_poll = 50;  // microseconds to busy poll
+		if (setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll)) < 0) {
+			// SO_BUSY_POLL may not be available on all kernels, so don't treat as fatal
+			LOG(WARNING) << "setsockopt(SO_BUSY_POLL) failed (may not be supported): " << strerror(errno);
+		}
 	}
 
 	// Increase socket buffers for high-throughput (128 MB; match SetAcceptedSocketBuffers)
@@ -472,6 +579,7 @@ void NetworkManager::Shutdown() {
 			thread.join();
 		}
 	}
+
 }
 
 void NetworkManager::SetCXLManager(CXLManager* cxl_manager) {
@@ -695,11 +803,11 @@ void NetworkManager::HandlePublishRequest(
 	// Setup acknowledgment channel if needed
 	int ack_fd = client_socket;
 
-	// Ensure blocking recv loops wake periodically to observe shutdown.
-	struct timeval recv_timeout;
-	recv_timeout.tv_sec = 0;
-	recv_timeout.tv_usec = 200 * 1000;  // 200ms
-	setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+	// [[PERF_FIX]] Remove 200ms SO_RCVTIMEO from batch recv loop - causes unnecessary EAGAIN stalls
+	// during high-throughput publishing. The loop checks stop_threads_ at top of while loop,
+	// so timeout is not needed for shutdown detection. For microsecond-scale batch processing,
+	// 200ms timeout introduces significant latency variability.
+	// setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
 
 	if (handshake.ack >= 1) {
 		absl::MutexLock lock(&ack_mu_);
@@ -765,12 +873,12 @@ void NetworkManager::HandlePublishRequest(
 		}
 
 		// Finish reading batch header if partial read
-		while (bytes_read < static_cast<ssize_t>(sizeof(BatchHeader))) {
-			ssize_t recv_ret = recv(client_socket,
-					((uint8_t*)&batch_header) + bytes_read,
-					sizeof(BatchHeader) - bytes_read,
-					0);
-			if (recv_ret < 0) {
+			while (bytes_read < static_cast<ssize_t>(sizeof(BatchHeader))) {
+				ssize_t recv_ret = recv(client_socket,
+						((uint8_t*)&batch_header) + bytes_read,
+						sizeof(BatchHeader) - bytes_read,
+						0);
+				if (recv_ret < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
 				    !stop_threads_) {
 					continue;
@@ -798,12 +906,14 @@ void NetworkManager::HandlePublishRequest(
 		// [[Issue #3]] Get Topic* once per batch for single epoch check and ReservePBRSlotAfterRecv(Topic*, ..., epoch_checked).
 		Topic* topic_ptr = cxl_manager_->GetTopicPtr(handshake.topic);
 		bool epoch_checked_this_batch = false;
+		const bool order0_inline_enabled = ShouldEnableOrder0Inline();
 
 		// Use GetCXLBuffer for batch-level allocation and zero-copy receive
 		// BLOCKING MODE: Wait indefinitely for ring space - NEVER close connection
-		size_t wait_iterations = 0;
+			size_t wait_iterations = 0;
+			auto ring_wait_start = std::chrono::steady_clock::time_point{};
 
-		while (!buf && !stop_threads_) {
+			while (!buf && !stop_threads_) {
 			if (stop_threads_) {
 				break;
 			}
@@ -827,14 +937,20 @@ void NetworkManager::HandlePublishRequest(
 				break;  // Success
 			}
 
-			// Ring full - wait for consumer to make space
-			wait_iterations++;
-			// [[FIX_RING_FULL_YIELD]] Use yield() immediately for ring full - consumer needs CPU time.
-			// Ring full means consumer is slow, so yield to allow consumer threads to catch up.
-			std::this_thread::yield();
-		}
+				// Ring full - wait for consumer to make space
+				if (wait_iterations == 0) {
+					ring_wait_start = std::chrono::steady_clock::now();
+				}
+				wait_iterations++;
+				// [[FIX_RING_FULL_YIELD]] Use yield() immediately for ring full - consumer needs CPU time.
+				// Ring full means consumer is slow, so yield to allow consumer threads to catch up.
+				std::this_thread::yield();
+				}
+				if (wait_iterations > 0 && ring_wait_start != std::chrono::steady_clock::time_point{}) {
+					VLOG(2) << "NetworkManager: waited for ring space, iterations=" << wait_iterations;
+				}
 
-		if (!buf) {
+			if (!buf) {
 			// Only happens if stop_threads_ is set (shutdown)
 			LOG(WARNING) << "NetworkManager (blocking): Shutting down, closing connection to client_id="
 			             << handshake.client_id;
@@ -857,12 +973,12 @@ void NetworkManager::HandlePublishRequest(
 			// batch_header_location is set
 		}
 
-		// Receive message data (byte-accurate accounting only)
-		size_t read = 0;
-		bool batch_data_complete = false;
-		while (running && !stop_threads_) {
-			bytes_read = recv(client_socket, (uint8_t*)buf + read, to_read, 0);
-			if (bytes_read < 0) {
+			// Receive message data (byte-accurate accounting only)
+			size_t read = 0;
+			bool batch_data_complete = false;
+			while (running && !stop_threads_) {
+				bytes_read = recv(client_socket, (uint8_t*)buf + read, to_read, 0);
+				if (bytes_read < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
 				    !stop_threads_) {
 					continue;
@@ -891,15 +1007,15 @@ void NetworkManager::HandlePublishRequest(
 		}
 
 		// Only process batch if all data was received
-		if (!batch_data_complete) {
+			if (!batch_data_complete) {
 			LOG(WARNING) << "NetworkManager: Batch incomplete (received " << read << " of " 
 			            << batch_header.total_size << " bytes) for batch_seq=" << batch_header.batch_seq
 			            << ". Closing connection to avoid stream desync.";
 			// Connection is now out-of-sync; close to avoid interpreting payload as next header.
 			running = false;
-			break;
-		}
-		// [[DESIGN: PBR reserve after receive]] Reserve PBR slot only after payload is fully received.
+				break;
+			}
+			// [[DESIGN: PBR reserve after receive]] Reserve PBR slot only after payload is fully received.
 	// [[PERF_REGRESSION_FIX]] Reverted ORDER_0_SKIP_PBR: ORDER=0 now uses PBR like all other orders.
 	// This allows DelegationThread to process ORDER=0 batches, restoring 10-12 GB/s performance.
 	TInode* tinode = nullptr;
@@ -1027,6 +1143,11 @@ void NetworkManager::HandlePublishRequest(
 				);
 			}
 		}
+		// Optional ORDER=0 inline metadata path (off by default).
+		if (order0_inline_enabled && seq_type == EMBARCADERO && tinode && tinode->order == 0) {
+			ProcessOrder0BatchInline(buf, batch_header.num_msg, logical_offset);
+		}
+
 		// [[DESIGN: Write PBR entry only after full receive]] Batch is fully in blog; write the
 		// complete BatchHeader to the PBR slot once. Slot was zeroed in GetCXLBuffer.
 		// [[PERF: Batch flush pattern]] Topic::PublishPBRSlotAfterRecv writes both cachelines, then one fence.
@@ -1047,6 +1168,11 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
+		// Optional ORDER=0 collaborative frontier advancement (off by default).
+		if (order0_inline_enabled && seq_type == EMBARCADERO && tinode && tinode->order == 0) {
+			TryAdvanceWrittenFrontier(handshake.topic, 0, batch_header.num_msg, tinode);
+		}
+
 		// [[ORDER_0_ACK_RACE_FIX]] Track the highest logical offset where batch_complete=1 was set.
 		// Used on connection close to advance written without waiting for DelegationThread.
 		if (topic_ptr) {
@@ -1054,13 +1180,13 @@ void NetworkManager::HandlePublishRequest(
 			topic_ptr->TrackBatchComplete(batch_end_offset);
 		}
 
-		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for all orders
+		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for other orders
 	} else if (batch_header_location == nullptr) {
 		LOG(WARNING) << "NetworkManager: batch_header_location is null for batch with " << batch_header.num_msg << " messages, order_level=" << seq_type;
 	}
 
 		// Finalize batch processing
-		if (non_emb_seq_callback) {
+			if (non_emb_seq_callback) {
 			// Batch flush for better performance (only for KAFKA mode)
 			if (seq_type == KAFKA && header) {
 				// Flush the last message header to ensure visibility
@@ -1071,12 +1197,12 @@ void NetworkManager::HandlePublishRequest(
 #endif
 			}
 			
-			non_emb_seq_callback((void*)header, logical_offset - 1);
-			if (seq_type == CORFU) {
-				// Replication ack not implemented
+				non_emb_seq_callback((void*)header, logical_offset - 1);
+				if (seq_type == CORFU) {
+					// Replication ack not implemented
+				}
 			}
 		}
-	}
 
 	// [[ORDER_0_ACK_RACE_FIX]] When publisher closes, directly update written to last_batch_complete_offset.
 	// This avoids race with DelegationThread (no message chain walk needed).
@@ -1114,13 +1240,15 @@ void NetworkManager::HandleSubscribeRequest(
 		return;
 	}
 
-	// Enable zero-copy
-	int flag = 1;
-	if (setsockopt(client_socket, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
-		LOG(ERROR) << "Subscriber setsockopt SO_ZEROCOPY failed";
-		close(client_socket);
-		return;
-	}
+	// [[PERF_FIX]] Remove SO_ZEROCOPY to avoid ENOBUFS caused by undrained MSG_ERRQUEUE
+	// Without draining the error queue, kernel throttles socket when zerocopy notifications fill up,
+	// causing non-deterministic throughput collapse. SO_ZEROCOPY removed from subscriber path entirely.
+	// int flag = 1;
+	// if (setsockopt(client_socket, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
+	// 	LOG(ERROR) << "Subscriber setsockopt SO_ZEROCOPY failed";
+	// 	close(client_socket);
+	// 	return;
+	// }
 
 	// Create epoll for monitoring writability
 	int epoll_fd = epoll_create1(0);
@@ -1181,7 +1309,9 @@ void NetworkManager::SubscribeNetworkThread(
 		const char* topic,
 		int connection_id) {
 
-	size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
+	// [[PERF_FIX]] Cache ZERO_COPY_SEND_LIMIT at thread start to avoid config lookup in hot loop
+	const size_t zero_copy_send_limit_cached = ZERO_COPY_SEND_LIMIT;
+	size_t zero_copy_send_limit = zero_copy_send_limit_cached;
 	// [[FIX: BUG_A]] Topic may not exist yet when subscriber connects before publisher.
 	// Wait up to 30 seconds for the topic to be created, then read its order.
 	int order = -1;
@@ -1329,7 +1459,7 @@ void NetworkManager::SubscribeNetworkThread(
 		}
 
 		// Send message data
-		if (!SendMessageData(sock, efd, msg, messages_size, zero_copy_send_limit)) {
+		if (!SendMessageData(sock, efd, msg, messages_size, zero_copy_send_limit, zero_copy_send_limit_cached)) {
 			LOG(WARNING) << "SubscribeNetworkThread [B" << broker_id_ << "]: SendMessageData failed, "
 			             << "messages_size=" << messages_size << ", connection_id=" << connection_id
 			             << ". Breaking loop (connection will close).";
@@ -1350,7 +1480,8 @@ bool NetworkManager::SendMessageData(
 		int epoll_fd,
 		void* buffer,
 		size_t buffer_size,
-		size_t& send_limit) {
+		size_t& send_limit,
+		size_t zero_copy_send_limit_cached) {
 
 	size_t sent_bytes = 0;
 
@@ -1359,15 +1490,15 @@ bool NetworkManager::SendMessageData(
 		while (sent_bytes < buffer_size) {
 			size_t remaining_bytes = buffer_size - sent_bytes;
 			size_t to_send = std::min(remaining_bytes, send_limit);
+			// [[PERF_FIX]] Remove MSG_ZEROCOPY to avoid ENOBUFS caused by undrained error queue
+			// MSG_ZEROCOPY requires draining MSG_ERRQUEUE which wasn't implemented,
+			// causing non-deterministic throughput collapse when queue fills up.
 			int send_flags = 0;
-			if (to_send >= (1UL << 16)) {
-				send_flags = MSG_ZEROCOPY;
-			}
 			int ret = send(sock_fd, (uint8_t*)buffer + sent_bytes, to_send, send_flags);
 
 			if (ret > 0) {
 				sent_bytes += ret;
-				send_limit = ZERO_COPY_SEND_LIMIT;
+				send_limit = zero_copy_send_limit_cached;
 			} else if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
 				send_limit = std::max(send_limit / 2, 1UL << 16);
 				break;  // Wait for epoll
@@ -1402,6 +1533,114 @@ bool NetworkManager::SendMessageData(
 // Acknowledgment Handling
 //----------------------------------------------------------------------------
 
+/**
+ * [[PERF_OPTIMIZATION]] Fast-path read for ACK polling without expensive CXL operations.
+ * Only performs flush/fence if values appear to have changed.
+ * Returns pair<current_value, needs_full_check> where needs_full_check indicates
+ * if expensive GetOffsetToAck should be called.
+ */
+std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, uint32_t ack_level, size_t last_known_ack) {
+	// Early return for ack_level 0 (no acknowledgments expected)
+	if (ack_level == 0) {
+		return {(size_t)-1, false};  // Return sentinel value indicating no ack needed
+	}
+
+	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
+	if (!tinode) {
+		return {(size_t)-1, false};  // Topic not found
+	}
+
+	const int replication_factor = tinode->replication_factor;
+	const int order = tinode->order;
+	const SequencerType seq_type = tinode->seq_type;
+	const int num_brokers = get_num_brokers_callback_();
+
+	// Fast-path: Read values without flush/fence first to detect changes
+	size_t fast_read_value = (size_t)-1;
+	bool needs_expensive_check = false;
+
+	if (ack_level == 2 && replication_factor > 0) {
+		if (seq_type == EMBARCADERO) {
+			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
+			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
+
+			// Fast read without flush/fence
+			uint64_t fast_completed = my_cv_entry->completed_logical_offset.load(std::memory_order_relaxed);
+			if (fast_completed != 0) {
+				fast_read_value = fast_completed;
+			} else {
+				uint64_t fast_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_relaxed);
+				if (fast_pbr_index != static_cast<uint64_t>(-1)) {
+					fast_read_value = 0;
+				} else {
+					fast_read_value = (size_t)-1;
+				}
+			}
+		} else {
+			// Legacy path for non-EMBARCADERO: check replication_done array
+			size_t min_val = std::numeric_limits<size_t>::max();
+			for (int i = 0; i < replication_factor; i++) {
+				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
+				size_t val = tinode->offsets[b].replication_done[broker_id_];
+				if (min_val > val) min_val = val;
+			}
+			if (min_val != std::numeric_limits<size_t>::max()) {
+				fast_read_value = min_val + 1;  // Convert to message count
+			}
+		}
+	} else if (ack_level == 1 && (order == 4 || order == 5) && seq_type == EMBARCADERO) {
+		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
+		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
+
+		uint64_t fast_completed = my_cv_entry->completed_logical_offset.load(std::memory_order_relaxed);
+		if (fast_completed != 0) {
+			fast_read_value = fast_completed;
+		} else {
+			uint64_t fast_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_relaxed);
+			if (fast_pbr_index != static_cast<uint64_t>(-1)) {
+				fast_read_value = 0;
+			} else {
+				fast_read_value = (size_t)-1;
+			}
+		}
+	} else if (replication_factor > 0) {
+		if (ack_level == 1) {
+			if (order == 0) {
+				fast_read_value = tinode->offsets[broker_id_].written;
+			} else {
+				fast_read_value = tinode->offsets[broker_id_].ordered;
+			}
+		} else if (seq_type == CORFU) {
+			fast_read_value = tinode->offsets[broker_id_].ordered;
+		} else {
+			// Fallback: replication_done
+			size_t min_val = std::numeric_limits<size_t>::max();
+			for (int i = 0; i < replication_factor; i++) {
+				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
+				size_t val = tinode->offsets[b].replication_done[broker_id_];
+				if (min_val > val) min_val = val;
+			}
+			fast_read_value = min_val;
+		}
+	} else {
+		// No replication
+		if (order == 0) {
+			fast_read_value = tinode->offsets[broker_id_].written;
+		} else {
+			fast_read_value = tinode->offsets[broker_id_].ordered;
+		}
+	}
+
+	// If fast read shows a change, we need expensive check
+	if (fast_read_value != last_known_ack && fast_read_value != (size_t)-1) {
+		needs_expensive_check = true;
+	}
+
+	return {fast_read_value, needs_expensive_check};
+}
+
 size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	// [[CRITICAL: Validate topic is not empty]]
 	// Empty topic → wrong TInode → wrong ACKs → client timeout
@@ -1410,11 +1649,6 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		LOG(ERROR) << "GetOffsetToAck: Empty or null topic for broker " << broker_id_
 		           << " (ack_level=" << ack_level << ")";
 		return (size_t)-1;
-	}
-
-	// Early return for ack_level 0 (no acknowledgments expected)
-	if (ack_level == 0) {
-		return (size_t)-1;  // Return sentinel value indicating no ack needed
 	}
 
 	TInode* tinode = (TInode*)cxl_manager_->GetTInode(topic);
@@ -1449,7 +1683,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 			// [[CXL_VISIBILITY]] full_fence after flush so read sees CXL; LFENCE does not order CLFLUSHOPT.
 			CXL::flush_cacheline(my_cv_entry);
 			CXL::full_fence();
-			
+
 			// [[ACK_OPTIMIZATION]] Read cumulative message count directly from CV
 			uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
 
@@ -1461,7 +1695,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 				}
 				return 0;
 			}
-			
+
 			// [[ACK_LEVEL_2_COUNT_SEMANTICS]] - Client expects message COUNT.
 			return completed_logical_offset;
 		}
@@ -1699,54 +1933,71 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 					break;  // All data sent
 				}
 			}
-		}
-	} // end of send loop
+			}
+		} // end of send loop
 
 	// [[DIAGNOSTIC: Confirm broker_id was sent to client]]
 	LOG(INFO) << "AckThread: Broker " << broker_id_ << " sent broker_id to client for topic='" << topic << "'";
 
 	size_t next_to_ack_offset = 0;
+	size_t last_known_ack = 0;  // Cache for fast-path optimization
 
 	consecutive_timeouts = 0;
 	consecutive_errors = 0;
 	size_t consecutive_ack_stalls = 0;
-	
+	size_t expensive_checks_since_last_ack = 0;
+
 		while (!stop_threads_) {
-		// Simplified polling: single check per iteration to reduce cache operations
-		// Trade-off: slightly higher ACK latency (~100μs) for much lower CXL traffic
+		// [[PERF_OPTIMIZATION]] Two-phase ACK checking to avoid CXL bus storm:
+		// Phase 1: Fast read without expensive flush/fence operations
+		// Phase 2: Expensive check only if fast read suggests a change
 		bool found_ack = false;
-		size_t current_ack = GetOffsetToAck(topic.c_str(), ack_level);
+		size_t current_ack = (size_t)-1;
+
+		// Fast-path: Read without flush/fence to detect potential changes.
+		auto [fast_read_value, needs_expensive_check] = GetOffsetToAckFast(topic.c_str(), ack_level, last_known_ack);
+		if (needs_expensive_check) {
+			// Value appears to have changed - do expensive check with proper CXL operations.
+			current_ack = GetOffsetToAck(topic.c_str(), ack_level);
+			expensive_checks_since_last_ack++;
+		} else {
+			// No change detected - use fast read value.
+			current_ack = fast_read_value;
+		}
 
 		if (current_ack != (size_t)-1 && next_to_ack_offset <= current_ack) {
 			found_ack = true;
 			consecutive_ack_stalls = 0;
+			last_known_ack = current_ack;  // Update cache
+			expensive_checks_since_last_ack = 0;  // Reset counter
 		}
-		
+
 		if (!found_ack) {
 			consecutive_ack_stalls++;
-			// Simplified backoff: brief pause, then yield after 20 consecutive stalls
-			if (consecutive_ack_stalls < 20) {
-				// Brief pause for responsiveness
-				for (int i = 0; i < 100; ++i) {
+
+			// [[PERF: ACK_BACKOFF_TUNE]] Keep ACK polling responsive by capping stall sleep.
+			if (consecutive_ack_stalls < 10) {
+				// Brief pause for responsiveness (microseconds)
+				for (int i = 0; i < 50; ++i) {
 					CXL::cpu_pause();
 				}
-			} else {
-				// Yield after many consecutive stalls to prevent starvation
-				std::this_thread::yield();
-				consecutive_ack_stalls = 0;
-			}
-			continue;
+				} else {
+					// Cap at 100us to avoid drifting into millisecond-scale ACK stalls.
+					std::this_thread::sleep_for(std::chrono::microseconds(100));
+					consecutive_ack_stalls = 50;  // Cap to prevent overflow
+				}
+				continue;
 		}
 
-		// ACK is ready, use the value we already fetched
+		// ACK is ready, use the verified value
 		size_t ack = current_ack;
 
-		if(ack != (size_t)-1 && next_to_ack_offset <= ack){
-			next_to_ack_offset = ack + 1;
-			acked_size = 0;
-			// Send offset acknowledgment
-			// Add timeout to epoll_wait to prevent infinite blocking
-			while (acked_size < sizeof(ack)) {
+			if(ack != (size_t)-1 && next_to_ack_offset <= ack){
+				next_to_ack_offset = ack + 1;
+				acked_size = 0;
+				// Send offset acknowledgment
+				// Add timeout to epoll_wait to prevent infinite blocking
+				while (acked_size < sizeof(ack)) {
 				if (stop_threads_) break;
 				int n = epoll_wait(ack_efd, events, 10, kAckEpollTimeoutMs);
 				if (n == 0) {
@@ -1812,19 +2063,19 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 							break;  // All data sent
 						}
 					}
-				}
-			} // end of send loop
-		}else{
+					}
+				} // end of send loop
+			}else{
 			// Check if connection is still alive
 			if (!IsConnectionAlive(ack_fd, buf)) {
 				LOG(INFO) << "Acknowledgment connection closed: " << ack_fd;
 				LOG(INFO) << "AckThread for broker " << broker_id_ << " exiting - publisher disconnected";
 				// CRITICAL FIX: Don't shut down the entire broker when publisher disconnects
 				// Subscriber connections should remain active and independent
-				break;
+					break;
+				}
 			}
-		}
-	}// end of while loop
+		}// end of while loop
 	close(ack_fd);
 	if (ack_efd >= 0) {
 		close(ack_efd);

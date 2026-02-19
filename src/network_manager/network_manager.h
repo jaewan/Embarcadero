@@ -9,6 +9,7 @@
 #include <vector>
 #include <optional>
 #include <functional>
+#include <utility>
 #include "folly/MPMCQueue.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/container/flat_hash_map.h"
@@ -102,6 +103,7 @@ private:
     /** @param topic_cstr Topic name (converted to std::string internally for thread safety). */
     void AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd);
     size_t GetOffsetToAck(const char* topic, uint32_t ack_level);
+    std::pair<size_t, bool> GetOffsetToAckFast(const char* topic, uint32_t ack_level, size_t last_known_ack);
 	void SubscribeNetworkThread(int sock, int efd, const char* topic, int connection_id);
 
     // Request handling helpers
@@ -109,13 +111,17 @@ private:
                              const struct sockaddr_in& client_address);
     void HandleSubscribeRequest(int client_socket, const EmbarcaderoReq& handshake);
     bool SendMessageData(int sock_fd, int epoll_fd, void* buffer, size_t buffer_size,
-                        size_t& send_limit);
+                        size_t& send_limit, size_t zero_copy_send_limit_cached);
     bool IsConnectionAlive(int fd, char* buffer);
 
     // [[PERF]] Blocking path: update written for Order 0 so ACK path advances
     void UpdateWrittenForOrder0(TInode* tinode, size_t logical_offset, uint32_t num_msg);
 
-    // ORDER=0 per-message metadata is set by Topic::DelegationThread (not here).
+    // Process ORDER=0 batch inline: set per-message metadata.
+    // Called by ReqReceive thread immediately after recv() to batch data, while hot in cache.
+    void ProcessOrder0BatchInline(void* batch_data, uint32_t num_msg, size_t base_logical_offset);
+
+    // ORDER=0 written frontier is advanced collaboratively from network threads.
     void TryAdvanceWrittenFrontier(const char* topic, size_t my_slot, uint32_t num_msg, TInode* tinode);
 
     // Thread-safe queues

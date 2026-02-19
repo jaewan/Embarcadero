@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+# NOTE: This script requires recompilation with COLLECT_LATENCY_STATS macro defined
+# to enable latency measurement functionality. Build with:
+#   cmake -DCOLLECT_LATENCY_STATS=ON ..
+# Without this macro, latency collection is completely compiled out for optimal performance.
+
 pushd ../build/bin/
 
 NUM_BROKERS=4

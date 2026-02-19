@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <mutex>
@@ -53,11 +54,13 @@ class Publisher {
 		 */
 		void Init(int ack_level);
 
-		/**
-		 * Enables recording publish latency outputs when record_results is set.
-		 * @param record_results true to collect publish latency samples and write CSVs
-		 */
+#ifdef COLLECT_LATENCY_STATS
+	/**
+	 * Enables recording publish latency outputs when record_results is set.
+	 * @param record_results true to collect publish latency samples and write CSVs
+	 */
 		void SetRecordResults(bool record_results) { record_results_ = record_results; }
+#endif
 
 		/**
 		 * Publishes a message
@@ -166,6 +169,25 @@ class Publisher {
 		std::atomic<size_t> total_messages_sent_{0};  // Sum of num_msg over all fully-sent batches
 		std::atomic<size_t> total_batches_attempted_{0};
 		std::atomic<size_t> total_batches_failed_{0};
+		// Queue/producer diagnostics (enabled with EMBARCADERO_QUEUE_DIAG=1).
+		std::atomic<uint64_t> diag_publish_calls_{0};
+		std::atomic<uint64_t> diag_publish_write_ns_{0};
+		std::atomic<uint64_t> diag_publish_write_ns_max_{0};
+		std::atomic<uint64_t> diag_publish_gap_ns_{0};
+		std::atomic<uint64_t> diag_publish_gap_ns_max_{0};
+		std::atomic<uint64_t> diag_publish_gap_over_10us_{0};
+		std::atomic<uint64_t> diag_publish_gap_over_50us_{0};
+		std::atomic<uint64_t> diag_publish_gap_over_200us_{0};
+		std::atomic<uint64_t> diag_last_publish_end_ns_{0};
+		std::atomic<uint64_t> diag_consumer_empty_reads_{0};
+		std::atomic<uint64_t> diag_consumer_wait_ns_{0};
+		std::atomic<uint64_t> diag_consumer_wait_ns_max_{0};
+		std::atomic<uint64_t> diag_consumer_yields_{0};
+		std::atomic<uint64_t> diag_consumer_batches_{0};
+		std::atomic<uint64_t> diag_consumer_messages_{0};
+		std::atomic<uint64_t> diag_send_eagain_events_{0};
+		std::atomic<uint64_t> diag_send_eagain_wait_ns_{0};
+		std::atomic<uint64_t> diag_send_eagain_wait_ns_max_{0};
 
 		// Used to measure real-time throughput during failure benchmark
 		std::atomic<size_t> total_sent_bytes_{0};
@@ -231,6 +253,7 @@ class Publisher {
 		// When true, PublishThread updates total_batches_attempted_ (for ACK timeout log). Set from EMBARCADERO_ACK_TIMEOUT_DEBUG in Init().
 		bool enable_batch_attempted_for_timeout_log_{false};
 
+#ifdef COLLECT_LATENCY_STATS
 		struct BatchSendRecord {
 			size_t end_count;
 			std::chrono::steady_clock::time_point sent_time;
@@ -239,7 +262,9 @@ class Publisher {
 		// [[threading: PublishThread writes, EpollAckThread reads]] Protected by per-broker mutex.
 		std::vector<std::deque<BatchSendRecord>> send_records_per_broker_;
 		std::vector<std::mutex> send_records_mutexes_;
+#endif
 
+#ifdef COLLECT_LATENCY_STATS
 		// [[threading: EpollAckThread writes, Poll reads]] Protected by publish_latency_mutex_.
 		std::vector<long long> publish_latencies_us_;
 		std::mutex publish_latency_mutex_;
@@ -248,6 +273,7 @@ class Publisher {
 		void RecordPublishSend(int broker_id, size_t end_count);
 		void ProcessPublishAckLatency(int broker_id, size_t acked_msg);
 		void WritePublishLatencyResults();
+#endif
 
 		/**
 		 * Thread for handling acknowledgements using epoll
@@ -265,6 +291,7 @@ class Publisher {
 		 * Subscribes to cluster status updates
 		 */
 		void SubscribeToClusterStatus();
+		void LogPublisherQueueDiagnostics() const;
 
 		/**
 		 * Adds publisher threads

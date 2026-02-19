@@ -57,6 +57,15 @@ find_package(yaml-cpp REQUIRED)
 # Enable CTest (required for add_test() in test/ and E2E scripts)
 enable_testing()
 
+# Option to enable latency statistics collection (compile-time removal for performance)
+option(COLLECT_LATENCY_STATS "Enable latency statistics collection (adds overhead)" OFF)
+if(COLLECT_LATENCY_STATS)
+    add_compile_definitions(COLLECT_LATENCY_STATS)
+    message(STATUS "Latency statistics collection enabled")
+else()
+    message(STATUS "Latency statistics collection disabled (optimal performance)")
+endif()
+
 # Add subdirectories
 add_subdirectory(src)
 add_subdirectory(bench)

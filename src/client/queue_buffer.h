@@ -17,9 +17,11 @@
 #include "folly/ProducerConsumerQueue.h"
 #include "folly/MPMCQueue.h"
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -92,6 +94,10 @@ public:
 	 */
 	void WarmupBuffers();
 
+	/**
+	 * Emit aggregated queue diagnostics (enabled with EMBARCADERO_QUEUE_DIAG=1).
+	 */
+	void LogQueueDiagnostics() const;
 
 	/**
 	 * Return a batch buffer to the pool after consumer is done. Must be called with the pointer
@@ -113,6 +119,10 @@ private:
 
 	// N SPSC queues (producer pushes to queues_[write_buf_id_], consumer bufIdx pops from queues_[bufIdx])
 	std::vector<std::unique_ptr<folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>>> queues_;
+	// Per-queue wait primitives for event-driven consumer wakeup when queues are empty.
+	std::unique_ptr<std::mutex[]> queue_wait_mutexes_;
+	std::unique_ptr<std::condition_variable[]> queue_wait_cvs_;
+	std::unique_ptr<std::atomic<uint64_t>[]> queue_epochs_;
 	// Per-queue capacity; pool sized so 1 + num_queues_*kQueueCapacity slots exist.
 	// [[ROOT_CAUSE_FIX]] 256 was too small for 10GB test. 512 helped; 1024 gives more headroom when broker recv is slow (docs/NEW_BUFFER_BANDWIDTH_INVESTIGATION.md).
 	static constexpr size_t kQueueCapacity = 1024;
@@ -136,7 +146,6 @@ private:
 	char _pad_batch_seq_[kCacheLineBytes - sizeof(std::atomic<size_t>)]{};
 	std::atomic<bool> write_finished_{false};
 	std::atomic<bool> shutdown_{false};
-
 	// Current batch being filled (producer only)
 	Embarcadero::BatchHeader* current_batch_{nullptr};
 	size_t current_batch_tail_{0};  // bytes written in current slot (start at sizeof(BatchHeader))
@@ -146,7 +155,29 @@ private:
 	Embarcadero::MessageHeader header_;
 	Embarcadero::BlogMessageHeader blog_header_;
 
+	struct QueueDiagCounters {
+		std::atomic<uint64_t> write_calls{0};
+		std::atomic<uint64_t> write_pool_wait_events{0};
+		std::atomic<uint64_t> write_pool_wait_ns{0};
+		std::atomic<uint64_t> write_pool_wait_ns_max{0};
+		std::atomic<uint64_t> seal_calls{0};
+		std::atomic<uint64_t> sealed_messages{0};
+		std::atomic<uint64_t> rr_deflections{0};
+		std::atomic<uint64_t> all_queues_full_events{0};
+		std::atomic<uint64_t> queue_full_wait_ns{0};
+		std::atomic<uint64_t> queue_full_wait_ns_max{0};
+		std::atomic<uint64_t> seal_pool_wait_events{0};
+		std::atomic<uint64_t> seal_pool_wait_ns{0};
+		std::atomic<uint64_t> seal_pool_wait_ns_max{0};
+		std::atomic<uint64_t> seal_pool_timeouts{0};
+		std::atomic<uint64_t> read_success{0};
+		std::atomic<uint64_t> read_empty{0};
+	};
+	QueueDiagCounters diag_;
+
 	void AdvanceWriteBufId();
+	void NotifyQueueDataReady(size_t queue_idx);
+	void NotifyAllWaiters();
 	/** Seal current batch and push to queues_[write_buf_id_], then advance and get new buffer. Returns num_msg in batch sealed (0 if none). */
 	size_t SealCurrentAndAdvance();
 	/** Debug: true iff batch is a slot base in one of our regions (for ReleaseBatch validation). */

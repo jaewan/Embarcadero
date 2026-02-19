@@ -28,11 +28,13 @@ HeartBeatServiceImpl::HeartBeatServiceImpl(std::string head_addr) {
 	int head_broker_id = 0;
 	std::string head_network_addr = head_addr + ":" + std::to_string(PORT + head_broker_id);
 
+	auto now = std::chrono::steady_clock::now();
 	nodes_["0"] = {
 		head_broker_id,
 		head_addr,
 		head_network_addr,
-		std::chrono::steady_clock::now(),
+		now,  // registration_time
+		now,  // last_heartbeat
 		true  // head always accepts publishes
 	};
 
@@ -75,11 +77,13 @@ Status HeartBeatServiceImpl::RegisterNode(
 			VLOG(3) << "Registering node:" << request->address() << " broker:" << broker_id;
 			std::string network_mgr_addr = request->address() + ":" + std::to_string(broker_id + PORT);
 
+			auto now = std::chrono::steady_clock::now();
 			nodes_[request->node_id()] = {
 				broker_id,
 				request->address(),
 				network_mgr_addr,
-				std::chrono::steady_clock::now(),
+				now,  // registration_time
+				now,  // last_heartbeat
 				true  // accepts_publishes = true for all data brokers
 			};
 
@@ -420,6 +424,7 @@ int HeartBeatServiceImpl::GetNumBrokers () {
 
 void HeartBeatServiceImpl::CheckHeartbeats() {
 	static const int timeout_seconds = HEARTBEAT_INTERVAL * 3;
+	static const int startup_grace_period_seconds = 60;  // Don't check heartbeats for first 60 seconds after registration
 	bool cluster_changed = false;
 
 	while (!shutdown_) {
@@ -437,12 +442,25 @@ void HeartBeatServiceImpl::CheckHeartbeats() {
 					continue;
 				}
 
+				// Skip heartbeat checks for brokers that registered recently
+				auto time_since_registration = std::chrono::duration_cast<std::chrono::seconds>(
+						now - it->second.registration_time
+						).count();
+				if (time_since_registration < startup_grace_period_seconds) {
+					VLOG(2) << "Skipping heartbeat check for node " << it->first
+					         << " (registered " << time_since_registration << "s ago, grace period: "
+					         << startup_grace_period_seconds << "s)";
+					++it;
+					continue;
+				}
+
 				auto time_since_last_heartbeat = std::chrono::duration_cast<std::chrono::seconds>(
 						now - it->second.last_heartbeat
 						).count();
 
 				if (time_since_last_heartbeat > timeout_seconds) {
-					LOG(INFO) << "Node " << it->first << " is dead";
+					LOG(INFO) << "Node " << it->first << " is dead (last heartbeat "
+					          << time_since_last_heartbeat << "s ago, timeout: " << timeout_seconds << "s)";
 					auto key_to_erase = it->first;
 					++it;
 					nodes_.erase(key_to_erase);

@@ -171,12 +171,14 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
             LOG(WARNING) << "SO_SNDBUF capped: requested " << sendBufferSize << " got " << actual
                         << ". Raise net.core.wmem_max (e.g. scripts/tune_kernel_buffers.sh)";
         }
-        // Enable zero-copy for sending
-        if (setsockopt(sock, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
-            LOG(ERROR) << "setsockopt(SO_ZEROCOPY) failed: " << strerror(errno);
-            close(sock);
-            return -1;
-        }
+        // [[PERF_FIX]] Remove SO_ZEROCOPY to avoid ENOBUFS caused by undrained MSG_ERRQUEUE
+        // Without draining the error queue, kernel throttles socket when zerocopy notifications fill up,
+        // causing non-deterministic throughput collapse. MSG_ZEROCOPY removed from send path entirely.
+        // if (setsockopt(sock, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
+        //     LOG(ERROR) << "setsockopt(SO_ZEROCOPY) failed: " << strerror(errno);
+        //     close(sock);
+        //     return -1;
+        // }
     } else {
         // Configure for receiving
         int receiveBufferSize = 256 * 1024 * 1024; // 256 MB receive buffer
@@ -305,6 +307,8 @@ void* mmap_large_buffer(size_t need, size_t& allocated) {
             
             if (buffer != MAP_FAILED) {
                 allocated = aligned_size;
+                LOG(INFO) << "mmap_large_buffer: MAP_HUGETLB success for " << aligned_size
+                          << " bytes (retry=" << retry << ")";
                 if (retry > 0) {
                     VLOG(2) << "MAP_HUGETLB succeeded on retry " << retry << " for " << aligned_size << " bytes";
                 }
@@ -324,6 +328,8 @@ void* mmap_large_buffer(size_t need, size_t& allocated) {
     }
 
     if (buffer == MAP_FAILED) {
+        LOG(WARNING) << "mmap_large_buffer: MAP_HUGETLB unavailable, falling back to THP/madvise path"
+                     << " for " << need << " bytes";
         // Use regular pages with pre-population and request THP via madvise
         buffer = mmap(NULL, need, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);

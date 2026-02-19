@@ -63,8 +63,6 @@ struct PendingBatch5 {
 	uint16_t epoch_created{0};  // [[PHASE_1A]] For sequencer-side epoch validation (§4.2)
 	// [[CONSUMED_THROUGH_SKIP]] When true, scanner skipped this slot (in-flight); sequencer only advances consumed_through
 	bool skipped{false};
-	// [[RING_ORDER]] Globally increasing sequence from BrokerScannerWorker5; fixes wrap-around sort order
-	uint64_t scanner_seq{0};
 	// [[HOLD_MARKER]] Placeholder when batch moved to hold; sequencer advances consumed_through only
 	bool is_held_marker{false};
 	// [[FROM_HOLD]] Batch was drained from hold; use hold_meta (not hdr) for GOI/export; ring slot may be reused
@@ -101,33 +99,45 @@ struct ExpiredHoldEntry {
 };
 
 // [[PHASE_1B]] Epoch buffer state machine to prevent concurrent merge/write.
-struct EpochBuffer5 {
+struct alignas(64) EpochBuffer5 {
 	enum class State : uint32_t { IDLE, COLLECTING, SEALED };
 
 	std::atomic<State> state{State::IDLE};
-	std::atomic<uint32_t> active_collectors{0};
+	std::atomic<bool> broker_active[NUM_MAX_BROKERS];
 	std::mutex seal_mutex;
 	std::condition_variable seal_cv;
-	std::array<std::vector<PendingBatch5>, NUM_MAX_BROKERS> per_broker;
+	std::array<std::deque<PendingBatch5>, NUM_MAX_BROKERS> per_broker;
 
-	bool enter_collection() {
+	EpochBuffer5() {
+		for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+			broker_active[i].store(false, std::memory_order_relaxed);
+		}
+	}
+
+	bool enter_collection(int broker_id) {
+		if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS) return false;
+
 		State cur = state.load(std::memory_order_acquire);
 		if (cur != State::COLLECTING) return false;
-		active_collectors.fetch_add(1, std::memory_order_acq_rel);
+
+		broker_active[broker_id].store(true, std::memory_order_release);
+
+		// Double-check state after marking active (prevent race where state changed)
 		if (state.load(std::memory_order_acquire) != State::COLLECTING) {
-			uint32_t prev = active_collectors.fetch_sub(1, std::memory_order_acq_rel);
-			if (prev == 1) {
-				std::lock_guard<std::mutex> lk(seal_mutex);
-				seal_cv.notify_all();
-			}
+			broker_active[broker_id].store(false, std::memory_order_release);
+			std::lock_guard<std::mutex> lk(seal_mutex);
+			seal_cv.notify_all();
 			return false;
 		}
 		return true;
 	}
 
-	void exit_collection() {
-		uint32_t prev = active_collectors.fetch_sub(1, std::memory_order_acq_rel);
-		if (prev == 1) {
+	void exit_collection(int broker_id) {
+		if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS) return;
+		broker_active[broker_id].store(false, std::memory_order_release);
+
+		// Only notify sealer if we're in SEALED state (optimization to avoid unnecessary lock contention)
+		if (state.load(std::memory_order_acquire) == State::SEALED) {
 			std::lock_guard<std::mutex> lk(seal_mutex);
 			seal_cv.notify_all();
 		}
@@ -140,14 +150,19 @@ struct EpochBuffer5 {
 		}
 		std::unique_lock<std::mutex> lk(seal_mutex);
 		seal_cv.wait(lk, [this] {
-			return active_collectors.load(std::memory_order_acquire) == 0;
+			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+				if (broker_active[i].load(std::memory_order_acquire)) return false;
+			}
+			return true;
 		});
 		return true;
 	}
 
 	void reset_and_start() {
 		for (auto& v : per_broker) v.clear();
-		active_collectors.store(0, std::memory_order_relaxed);
+		for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+			broker_active[i].store(false, std::memory_order_relaxed);
+		}
 		state.store(State::COLLECTING, std::memory_order_release);
 	}
 
@@ -692,8 +707,6 @@ class Topic {
 
 		/** Initializes the export chain cursor for a specific broker (ring_start). Idempotent. */
 		void InitExportCursorForBroker(int broker_id);
-		// [[RING_ORDER]] Monotonic sequence for scanner_seq (BrokerScannerWorker5); fixes wrap-around sort
-		alignas(64) std::atomic<uint64_t> next_scanner_seq_{0};
 		std::vector<std::vector<PendingBatch5>> level5_per_shard_cache_;
 		// [PHASE-8-REVISED] Per-broker unbounded queues for from-hold batch export.
 		// Replaces SPSC ring to avoid deadlock when no subscriber consumes (throughput test).

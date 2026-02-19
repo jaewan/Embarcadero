@@ -26,7 +26,9 @@ int main(int argc, char* argv[]) {
         ("c,run_cgroup", "Run within cgroup", cxxopts::value<int>()->default_value("0"))
         ("r,replication_factor", "Replication factor", cxxopts::value<int>()->default_value("0"))
         ("replicate_tinode", "Replicate Tinode for Disaggregated memory fault tolerance")
+#ifdef COLLECT_LATENCY_STATS
         ("record_results", "Record Results in a csv file")
+#endif
         ("t,test_number", "Test to run. 0:pub/sub 1:E2E 2:Latency 3:Parallel", 
             cxxopts::value<int>()->default_value("0"))
         ("p,parallel_client", "Number of parallel clients", cxxopts::value<int>()->default_value("1"))

@@ -1,6 +1,7 @@
 #include "cxl_manager.h"
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <filesystem>
 #include <queue>
 #include <tuple>
@@ -20,6 +21,8 @@
 #include "common/performance_utils.h"
 
 namespace Embarcadero{
+
+static constexpr size_t kPhase2MetadataEnd = 0x4'0000'2000ULL;  // 16 GB + 8 KB, end of GOI
 
 static std::string GetCxlShmName() {
 	const char* env = std::getenv("EMBARCADERO_CXL_SHM_NAME");
@@ -62,6 +65,18 @@ static int OpenCxlBackingFd(const std::string& shm_name) {
 
 	errno = shm_errno;
 	return -1;
+}
+
+static bool MetadataOnlyZeroingEnabled() {
+	const char* env = std::getenv("EMBARCADERO_CXL_ZERO_MODE");
+	if (!env || env[0] == '\0') {
+		return false;
+	}
+	std::string mode(env);
+	for (char& ch : mode) {
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	}
+	return mode == "metadata" || mode == "meta" || mode == "metadata_only";
 }
 
 static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_size){
@@ -115,12 +130,11 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 		}
 		LOG(INFO) << "ftruncate completed successfully";
 	}
-	// Zero-core CXL NUMA path: mmap without MAP_POPULATE, then mbind to CXL node, then memset.
-	// Pages are allocated on first touch (memset) on the CXL node. Script must use membind=1,2
-	// so the process is allowed to allocate on node 2; otherwise mbind/first-touch can SIGBUS or OOM.
+	// For real CXL on head broker, keep mapping lazy and bind before first-touch.
 	const bool will_mbind = (cxl_type == Real && !dev && broker_id == 0);
 	LOG(INFO) << "Mapping CXL shared memory: " << cxl_size << " bytes"
-	          << (will_mbind ? " (lazy populate after mbind to CXL node)" : " (MAP_POPULATE)");
+	          << (will_mbind ? " (lazy populate after mbind to CXL node)"
+	                         : " (MAP_POPULATE)");
 
 	const char* fixed_addr_env = std::getenv("EMBARCADERO_CXL_BASE_ADDR");
 	std::vector<uintptr_t> fixed_addrs;
@@ -177,51 +191,51 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 	close(cxl_fd);
 	LOG(INFO) << "CXL mapping successful at address: " << addr;
 
-	if (cxl_type == Real && !dev && broker_id == 0) {
-		// Bind the shm-backed region to the zero-core CXL NUMA node (config cxl.numa_node).
-		// Requires run_throughput.sh to use numactl --membind=1,2 so the process can use node 2.
+	if (will_mbind) {
+		// Bind the shm-backed region to the configured CXL NUMA node before first-touch.
 		int cxl_numa_node = Configuration::getInstance().config().cxl.numa_node.get();
-
-		// Check if the CXL NUMA node has enough memory for the requested size
-		long long node_free_kb = -1;
-		long long node_size_bytes = numa_node_size64(cxl_numa_node, &node_free_kb);
-		if (node_size_bytes < 0) {
-			LOG(WARNING) << "Cannot query size of NUMA node " << cxl_numa_node << ": " << strerror(errno)
-			             << ". Continuing with mbind attempt.";
-		} else {
-			long long node_size_bytes = node_size_bytes * 1024;  // convert KB to bytes
-			if (static_cast<size_t>(node_size_bytes) < cxl_size) {
-				LOG(WARNING) << "NUMA node " << cxl_numa_node << " has only " << node_size_bytes
-				             << " bytes total, but cxl.size=" << cxl_size << " bytes requested."
-				             << " Reduce cxl.size in config or SIGBUS may occur during memset."
-				             << " Free memory: " << (node_free_kb * 1024) << " bytes.";
-			}
-		}
-
 		struct bitmask* bitmask = numa_allocate_nodemask();
 		numa_bitmask_setbit(bitmask, cxl_numa_node);
-
 		if (mbind(addr, cxl_size, MPOL_BIND, bitmask->maskp, bitmask->size, MPOL_MF_MOVE) == -1) {
-			LOG(WARNING) << "mbind to NUMA node " << cxl_numa_node << " failed: " << strerror(errno)
-			             << ". Ensure run_throughput.sh uses --membind=1,2 so CXL node is allowed.";
+			LOG(WARNING) << "mbind to NUMA node " << cxl_numa_node
+			             << " failed: " << strerror(errno)
+			             << ". Ensure runner uses numactl --membind including CXL node.";
 		} else {
-			LOG(INFO) << "CXL region bound to NUMA node " << cxl_numa_node << " (" << cxl_size << " bytes)";
+			LOG(INFO) << "CXL region bound to NUMA node " << cxl_numa_node
+			          << " (" << cxl_size << " bytes)";
 		}
-
 		numa_free_nodemask(bitmask);
 	}
 
 	if(broker_id == 0){
-		LOG(INFO) << "Head broker clearing CXL memory: " << cxl_size << " bytes";
+		size_t clear_bytes = cxl_size;
+		bool metadata_only = MetadataOnlyZeroingEnabled();
+		if (metadata_only) {
+			size_t cacheline_size = static_cast<size_t>(sysconf(_SC_LEVEL1_DCACHE_LINESIZE));
+			size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
+			size_t padding = TINode_Region_size % cacheline_size;
+			if (padding != 0) {
+				TINode_Region_size += (cacheline_size - padding);
+			}
+			size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
+			size_t BatchHeaders_Region_size = NUM_MAX_BROKERS_CONFIG * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+			size_t metadata_bytes = kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size;
+			clear_bytes = std::min(cxl_size, metadata_bytes);
+			LOG(INFO) << "Head broker clearing CXL metadata only: " << clear_bytes
+			          << " bytes (set EMBARCADERO_CXL_ZERO_MODE=full to clear full region)";
+		} else {
+			LOG(INFO) << "Head broker clearing full CXL memory: " << cxl_size << " bytes";
+		}
+
 		// OPTIMIZATION: Use faster memory clearing with parallel chunks
 		const size_t chunk_size = 1024 * 1024 * 1024;  // 1GB chunks
-		const size_t num_chunks = (cxl_size + chunk_size - 1) / chunk_size;
+		const size_t num_chunks = (clear_bytes + chunk_size - 1) / chunk_size;
 		
 		std::vector<std::thread> clear_threads;
 		for (size_t i = 0; i < num_chunks; ++i) {
-			clear_threads.emplace_back([addr, i, chunk_size, cxl_size]() {
+			clear_threads.emplace_back([addr, i, chunk_size, clear_bytes]() {
 				size_t start = i * chunk_size;
-				size_t size = std::min(chunk_size, cxl_size - start);
+				size_t size = std::min(chunk_size, clear_bytes - start);
 				memset((uint8_t*)addr + start, 0, size);
 			});
 		}
@@ -230,7 +244,8 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 		for (auto& thread : clear_threads) {
 			thread.join();
 		}
-		LOG(INFO) << "CXL memory cleared successfully using " << num_chunks << " parallel threads";
+		LOG(INFO) << "CXL memory clear complete (" << clear_bytes << " bytes) using "
+		          << num_chunks << " parallel threads";
 	}
 	return addr;
 }
@@ -255,7 +270,6 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 			// [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0 (128 bytes)
 		// [[CXL_MEMORY_LAYOUT_v2]] PBR/BatchHeaders/TInode/Bitmap/Segments start AFTER Phase 2 metadata
 		// Layout: 0x0 ControlBlock | 0x1000 CompletionVector | 0x2000 GOI (16GB) | 0x4_0000_2000 PBR...
-		static constexpr size_t kPhase2MetadataEnd = 0x4'0000'2000ULL;  // 16 GB + 8 KB, end of GOI (docs/CXL_MEMORY_LAYOUT_v2.md)
 		control_block_ = reinterpret_cast<ControlBlock*>(cxl_addr_);
 		base_for_regions_ = reinterpret_cast<uint8_t*>(cxl_addr_) + kPhase2MetadataEnd;
 		uint8_t* base_for_regions = reinterpret_cast<uint8_t*>(base_for_regions_);

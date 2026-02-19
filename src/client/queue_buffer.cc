@@ -14,6 +14,7 @@
 #include <chrono>
 #include <thread>
 #include <cstring>
+#include <cstdlib>
 #include <sys/mman.h>
 
 namespace {
@@ -26,6 +27,21 @@ namespace {
 	constexpr size_t kPoolSizeBytes = 16ULL * 1024 * 1024 * 1024;  // 16 GB
 	inline size_t AlignUp(size_t size, size_t align) {
 		return (size + align - 1) & ~(align - 1);
+	}
+	inline bool QueueDiagEnabled() {
+		static const bool enabled = []() {
+			const char* env = std::getenv("EMBARCADERO_QUEUE_DIAG");
+			return env && env[0] && env[0] != '0';
+		}();
+		return enabled;
+	}
+	inline uint64_t NowNs() {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count());
+	}
+	inline void UpdateMax(std::atomic<uint64_t>& dst, uint64_t value) {
+		uint64_t prev = dst.load(std::memory_order_relaxed);
+		while (value > prev && !dst.compare_exchange_weak(prev, value, std::memory_order_relaxed)) {}
 	}
 }
 
@@ -57,6 +73,12 @@ QueueBuffer::QueueBuffer(size_t num_buf, size_t num_threads_per_broker, int clie
 	queues_.reserve(num_queues_);
 	for (size_t i = 0; i < num_queues_; i++) {
 		queues_.push_back(std::make_unique<folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>>(kQueueCapacity));
+	}
+	queue_wait_mutexes_ = std::make_unique<std::mutex[]>(num_queues_);
+	queue_wait_cvs_ = std::make_unique<std::condition_variable[]>(num_queues_);
+	queue_epochs_ = std::make_unique<std::atomic<uint64_t>[]>(num_queues_);
+	for (size_t i = 0; i < num_queues_; ++i) {
+		queue_epochs_[i].store(0, std::memory_order_relaxed);
 	}
 }
 
@@ -131,9 +153,25 @@ void QueueBuffer::AdvanceWriteBufId() {
 	write_buf_id_ = (write_buf_id_ + 1) % n;
 }
 
+void QueueBuffer::NotifyQueueDataReady(size_t queue_idx) {
+	if (queue_idx >= num_queues_) return;
+	queue_epochs_[queue_idx].fetch_add(1, std::memory_order_release);
+	queue_wait_cvs_[queue_idx].notify_one();
+}
+
+void QueueBuffer::NotifyAllWaiters() {
+	for (size_t i = 0; i < num_queues_; ++i) {
+		queue_wait_cvs_[i].notify_all();
+	}
+}
+
 size_t QueueBuffer::SealCurrentAndAdvance() {
 	if (!current_batch_) {
 		return 0;
+	}
+	const bool diag = QueueDiagEnabled();
+	if (diag) {
+		diag_.seal_calls.fetch_add(1, std::memory_order_relaxed);
 	}
 	size_t data_size = current_batch_tail_ - sizeof(Embarcadero::BatchHeader);
 	if (data_size == 0) {
@@ -157,20 +195,31 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 	if (n == 0) return 0;
 	size_t start_id = write_buf_id_;
 	bool pushed = false;
+	size_t pushed_idx = start_id;
 	for (size_t i = 0; i < n; i++) {
 		size_t idx = (start_id + i) % n;
 		folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>* q = queues_[idx].get();
 		if (q->write(h)) {
 			write_buf_id_ = (idx + 1) % n;
 			pushed = true;
+			pushed_idx = idx;
+			NotifyQueueDataReady(idx);
 			break;
 		}
+	}
+	if (diag && pushed_idx != start_id) {
+		diag_.rr_deflections.fetch_add(1, std::memory_order_relaxed);
 	}
 	if (!pushed) {
 		// All queues full: block on original queue (same as previous behavior).
 		constexpr int kQueueFullCheckInterval = 64;
 		folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>* q = queues_[start_id].get();
 		auto queue_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kQueueFullTimeoutMs);
+		uint64_t full_wait_start_ns = 0;
+		if (diag) {
+			diag_.all_queues_full_events.fetch_add(1, std::memory_order_relaxed);
+			full_wait_start_ns = NowNs();
+		}
 		bool logged = false;
 		int spin_count = 0;
 		while (!q->write(h)) {
@@ -186,6 +235,12 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 				Embarcadero::CXL::cpu_pause();
 			}
 		}
+		if (diag) {
+			uint64_t waited = NowNs() - full_wait_start_ns;
+			diag_.queue_full_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+			UpdateMax(diag_.queue_full_wait_ns_max, waited);
+		}
+		NotifyQueueDataReady(start_id);
 		write_buf_id_ = (start_id + 1) % n;
 	}
 
@@ -194,10 +249,25 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 	constexpr int kPoolSpinBeforeYield = 128;
 	int pool_spin = 0;
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPoolAcquireTimeoutMs);
+	uint64_t pool_wait_start_ns = 0;
+	bool pool_waiting = false;
 	while (!pool_->read(next)) {
+		if (diag && !pool_waiting) {
+			pool_waiting = true;
+			pool_wait_start_ns = NowNs();
+			diag_.seal_pool_wait_events.fetch_add(1, std::memory_order_relaxed);
+		}
 		if (++pool_spin % kPoolSpinBeforeYield == 0) {
 			if (std::chrono::steady_clock::now() > deadline) {
 				LOG(ERROR) << "QueueBuffer: pool acquire timeout";
+				if (diag) {
+					diag_.seal_pool_timeouts.fetch_add(1, std::memory_order_relaxed);
+					if (pool_waiting) {
+						uint64_t waited = NowNs() - pool_wait_start_ns;
+						diag_.seal_pool_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+						UpdateMax(diag_.seal_pool_wait_ns_max, waited);
+					}
+				}
 				current_batch_ = nullptr;
 				current_batch_tail_ = 0;
 				return num_sealed;
@@ -207,6 +277,14 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 			Embarcadero::CXL::cpu_pause();
 		}
 	}
+	if (diag) {
+		diag_.sealed_messages.fetch_add(num_sealed, std::memory_order_relaxed);
+		if (pool_waiting) {
+			uint64_t waited = NowNs() - pool_wait_start_ns;
+			diag_.seal_pool_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+			UpdateMax(diag_.seal_pool_wait_ns_max, waited);
+		}
+	}
 	current_batch_ = next;
 	current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
 	current_batch_num_msg_ = 0;
@@ -214,6 +292,10 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 }
 
 std::pair<bool, size_t> QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize) {
+	const bool diag = QueueDiagEnabled();
+	if (diag) {
+		diag_.write_calls.fetch_add(1, std::memory_order_relaxed);
+	}
 	size_t sealed_count = 0;
 	const size_t v1_header_size = sizeof(Embarcadero::MessageHeader);
 	const size_t v2_header_size = sizeof(Embarcadero::BlogMessageHeader);
@@ -234,12 +316,29 @@ std::pair<bool, size_t> QueueBuffer::Write(size_t client_order, char* msg, size_
 	if (!current_batch_) {
 		Embarcadero::BatchHeader* next = nullptr;
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPoolAcquireTimeoutMs);
+		uint64_t pool_wait_start_ns = 0;
+		bool pool_waiting = false;
 		while (!pool_->read(next)) {
+			if (diag && !pool_waiting) {
+				pool_waiting = true;
+				pool_wait_start_ns = NowNs();
+				diag_.write_pool_wait_events.fetch_add(1, std::memory_order_relaxed);
+			}
 			if (std::chrono::steady_clock::now() > deadline) {
 				LOG(ERROR) << "QueueBuffer::Write pool exhausted";
+				if (diag && pool_waiting) {
+					uint64_t waited = NowNs() - pool_wait_start_ns;
+					diag_.write_pool_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+					UpdateMax(diag_.write_pool_wait_ns_max, waited);
+				}
 				return {false, sealed_count};
 			}
 			std::this_thread::yield();
+		}
+		if (diag && pool_waiting) {
+			uint64_t waited = NowNs() - pool_wait_start_ns;
+			diag_.write_pool_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+			UpdateMax(diag_.write_pool_wait_ns_max, waited);
 		}
 		current_batch_ = next;
 		current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
@@ -287,9 +386,14 @@ size_t QueueBuffer::SealAll() {
 
 void* QueueBuffer::Read(int bufIdx) {
 	if (bufIdx < 0 || static_cast<size_t>(bufIdx) >= num_queues_) return nullptr;
+	const bool diag = QueueDiagEnabled();
+	const size_t idx = static_cast<size_t>(bufIdx);
 
 	Embarcadero::BatchHeader* batch = nullptr;
-	if (queues_[static_cast<size_t>(bufIdx)]->read(batch)) {
+	if (queues_[idx]->read(batch)) {
+		if (diag) {
+			diag_.read_success.fetch_add(1, std::memory_order_relaxed);
+		}
 		// Force acquire so we see the producer's writes (total_size, num_msg, etc.) from
 		// SealCurrentAndAdvance. Folly's queue may not guarantee full acquire on the data;
 		// an explicit load of a written field pairs with the producer's release fence.
@@ -300,12 +404,63 @@ void* QueueBuffer::Read(int bufIdx) {
 		__builtin_prefetch(reinterpret_cast<const char*>(batch) + sizeof(Embarcadero::BatchHeader), 0, 3);
 		return batch;
 	}
+	while (!write_finished_.load(std::memory_order_acquire) &&
+	       !shutdown_.load(std::memory_order_acquire)) {
+		// Empty queue fast path: short spin + event-driven wait avoids yield storms under producer starvation.
+		static constexpr int kReadSpinCount = 64;
+		for (int i = 0; i < kReadSpinCount; ++i) {
+			Embarcadero::CXL::cpu_pause();
+		}
+		if (queues_[idx]->read(batch)) {
+			if (diag) {
+				diag_.read_success.fetch_add(1, std::memory_order_relaxed);
+			}
+			(void)__atomic_load_n(reinterpret_cast<const size_t*>(&batch->total_size), __ATOMIC_ACQUIRE);
+			(void)__atomic_load_n(reinterpret_cast<const uint32_t*>(&batch->num_msg), __ATOMIC_ACQUIRE);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			__builtin_prefetch(reinterpret_cast<const char*>(batch) + sizeof(Embarcadero::BatchHeader), 0, 3);
+			return batch;
+		}
+
+		uint64_t observed_epoch = queue_epochs_[idx].load(std::memory_order_acquire);
+		if (queues_[idx]->read(batch)) {
+			if (diag) {
+				diag_.read_success.fetch_add(1, std::memory_order_relaxed);
+			}
+			(void)__atomic_load_n(reinterpret_cast<const size_t*>(&batch->total_size), __ATOMIC_ACQUIRE);
+			(void)__atomic_load_n(reinterpret_cast<const uint32_t*>(&batch->num_msg), __ATOMIC_ACQUIRE);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			__builtin_prefetch(reinterpret_cast<const char*>(batch) + sizeof(Embarcadero::BatchHeader), 0, 3);
+			return batch;
+		}
+
+		std::unique_lock<std::mutex> lock(queue_wait_mutexes_[idx]);
+		queue_wait_cvs_[idx].wait_for(lock, std::chrono::microseconds(50), [&]() {
+			return shutdown_.load(std::memory_order_acquire) ||
+				write_finished_.load(std::memory_order_acquire) ||
+				queue_epochs_[idx].load(std::memory_order_acquire) != observed_epoch;
+		});
+		lock.unlock();
+		if (queues_[idx]->read(batch)) {
+			if (diag) {
+				diag_.read_success.fetch_add(1, std::memory_order_relaxed);
+			}
+			(void)__atomic_load_n(reinterpret_cast<const size_t*>(&batch->total_size), __ATOMIC_ACQUIRE);
+			(void)__atomic_load_n(reinterpret_cast<const uint32_t*>(&batch->num_msg), __ATOMIC_ACQUIRE);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			__builtin_prefetch(reinterpret_cast<const char*>(batch) + sizeof(Embarcadero::BatchHeader), 0, 3);
+			return batch;
+		}
+	}
 	if (write_finished_.load(std::memory_order_acquire) || shutdown_.load(std::memory_order_acquire)) {
 		// [[DRAIN_ON_SHUTDOWN]] Drain queue before returning nullptr so PublishThread sends
 		// the final batch(es) pushed by SealAll() just before ReturnReads().
 		static constexpr int kShutdownDrainTries = 64;
 		for (int i = 0; i < kShutdownDrainTries; ++i) {
-			if (queues_[static_cast<size_t>(bufIdx)]->read(batch)) {
+			if (queues_[idx]->read(batch)) {
+				if (diag) {
+					diag_.read_success.fetch_add(1, std::memory_order_relaxed);
+				}
 				(void)__atomic_load_n(reinterpret_cast<const size_t*>(&batch->total_size), __ATOMIC_ACQUIRE);
 				(void)__atomic_load_n(reinterpret_cast<const uint32_t*>(&batch->num_msg), __ATOMIC_ACQUIRE);
 				std::atomic_thread_fence(std::memory_order_acquire);
@@ -314,7 +469,13 @@ void* QueueBuffer::Read(int bufIdx) {
 			}
 			if ((i % 16) == 0) std::this_thread::yield();
 		}
+		if (diag) {
+			diag_.read_empty.fetch_add(1, std::memory_order_relaxed);
+		}
 		return nullptr;
+	}
+	if (diag) {
+		diag_.read_empty.fetch_add(1, std::memory_order_relaxed);
 	}
 	return nullptr;
 }
@@ -348,12 +509,54 @@ void QueueBuffer::ReleaseBatch(void* batch) {
 	pool_->write(static_cast<Embarcadero::BatchHeader*>(batch));
 }
 
+void QueueBuffer::LogQueueDiagnostics() const {
+	if (!QueueDiagEnabled()) {
+		return;
+	}
+	const uint64_t write_calls = diag_.write_calls.load(std::memory_order_relaxed);
+	const uint64_t seal_calls = diag_.seal_calls.load(std::memory_order_relaxed);
+	const uint64_t sealed_messages = diag_.sealed_messages.load(std::memory_order_relaxed);
+	const uint64_t rr_deflections = diag_.rr_deflections.load(std::memory_order_relaxed);
+	const uint64_t all_queues_full = diag_.all_queues_full_events.load(std::memory_order_relaxed);
+	const uint64_t queue_full_wait_ns = diag_.queue_full_wait_ns.load(std::memory_order_relaxed);
+	const uint64_t queue_full_wait_ns_max = diag_.queue_full_wait_ns_max.load(std::memory_order_relaxed);
+	const uint64_t write_pool_wait_events = diag_.write_pool_wait_events.load(std::memory_order_relaxed);
+	const uint64_t write_pool_wait_ns = diag_.write_pool_wait_ns.load(std::memory_order_relaxed);
+	const uint64_t write_pool_wait_ns_max = diag_.write_pool_wait_ns_max.load(std::memory_order_relaxed);
+	const uint64_t seal_pool_wait_events = diag_.seal_pool_wait_events.load(std::memory_order_relaxed);
+	const uint64_t seal_pool_wait_ns = diag_.seal_pool_wait_ns.load(std::memory_order_relaxed);
+	const uint64_t seal_pool_wait_ns_max = diag_.seal_pool_wait_ns_max.load(std::memory_order_relaxed);
+	const uint64_t seal_pool_timeouts = diag_.seal_pool_timeouts.load(std::memory_order_relaxed);
+	const uint64_t read_success = diag_.read_success.load(std::memory_order_relaxed);
+	const uint64_t read_empty = diag_.read_empty.load(std::memory_order_relaxed);
+
+	LOG(INFO) << "[ORDER0_ACK1_QUEUE_BUFFER_DIAG]"
+	          << " write_calls=" << write_calls
+	          << " seal_calls=" << seal_calls
+	          << " sealed_messages=" << sealed_messages
+	          << " rr_deflections=" << rr_deflections
+	          << " all_queues_full_events=" << all_queues_full
+	          << " queue_full_wait_us=" << (queue_full_wait_ns / 1000)
+	          << " queue_full_wait_us_max=" << (queue_full_wait_ns_max / 1000)
+	          << " write_pool_wait_events=" << write_pool_wait_events
+	          << " write_pool_wait_us=" << (write_pool_wait_ns / 1000)
+	          << " write_pool_wait_us_max=" << (write_pool_wait_ns_max / 1000)
+	          << " seal_pool_wait_events=" << seal_pool_wait_events
+	          << " seal_pool_wait_us=" << (seal_pool_wait_ns / 1000)
+	          << " seal_pool_wait_us_max=" << (seal_pool_wait_ns_max / 1000)
+	          << " seal_pool_timeouts=" << seal_pool_timeouts
+	          << " read_success=" << read_success
+	          << " read_empty=" << read_empty;
+}
+
 void QueueBuffer::WriteFinished() {
 	write_finished_.store(true, std::memory_order_release);
+	NotifyAllWaiters();
 }
 
 void QueueBuffer::ReturnReads() {
 	shutdown_.store(true, std::memory_order_release);
+	NotifyAllWaiters();
 }
 
 void QueueBuffer::SetActiveQueues(size_t active_count) {

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -13,7 +14,6 @@
 
 namespace Embarcadero {
 
-// [[ORDER5_ACK_STALL]] Use BatchHeader flags to mark CLAIMED/VALID; scanner never skips CLAIMED slots.
 static inline uint64_t SteadyNowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -173,9 +173,9 @@ void Topic::Start() {
 		LOG(INFO) << "Topic " << topic_name_ << ": DelegationThread disabled for CORFU Order 3 "
 		          << "(external sequencer assigns order before publish)";
 	}
-	if (!skip_delegation &&
-	    (seq_type_ == CORFU || (seq_type_ != KAFKA && order_ != 4))) {
-		delegationThreads_.emplace_back(&Topic::DelegationThread, this);
+		if (!skip_delegation &&
+		    (seq_type_ == CORFU || (seq_type_ != KAFKA && order_ != 4))) {
+			delegationThreads_.emplace_back(&Topic::DelegationThread, this);
 	}
 
 	// Head node runs sequencer
@@ -335,17 +335,17 @@ void Topic::DelegationThread() {
 					// MessageHeader path: set required fields for each message
 					MessageHeader* batch_first_msg = reinterpret_cast<MessageHeader*>(
 						reinterpret_cast<uint8_t*>(cxl_addr_) + current_batch->log_idx);
-					
+
 					// Process all messages in this batch efficiently
 					MessageHeader* msg_ptr = batch_first_msg;
 					for (size_t i = 0; i < current_batch->num_msg; ++i) {
 						// Set required fields for each message
 						msg_ptr->logical_offset = logical_offset_;
 						msg_ptr->segment_header = reinterpret_cast<uint8_t*>(msg_ptr) - CACHELINE_SIZE;
-						
+
 						// Read paddedSize first (needed for next message calculation)
 						size_t current_padded_size = msg_ptr->paddedSize;
-						
+
 						// [[CRITICAL FIX: paddedSize Validation]] - Add bounds check to prevent out-of-bounds access
 						// Matches validation in legacy message-by-message path (line 378-389)
 						const size_t min_msg_size = sizeof(MessageHeader);
@@ -353,14 +353,14 @@ void Topic::DelegationThread() {
 						if (current_padded_size < min_msg_size || current_padded_size > max_msg_size) {
 							static thread_local size_t error_count = 0;
 							if (++error_count % 1000 == 1) {
-								LOG(ERROR) << "DelegationThread: Invalid paddedSize=" << current_padded_size 
+								LOG(ERROR) << "DelegationThread: Invalid paddedSize=" << current_padded_size
 								           << " for topic " << topic_name_ << ", broker " << broker_id_
 								           << " (error #" << error_count << ")";
 							}
 							CXL::cpu_pause();
 							break; // Exit message loop on corrupted data
 						}
-						
+
 						msg_ptr->next_msg_diff = current_padded_size;
 
 						// Update segment header
@@ -373,6 +373,7 @@ void Topic::DelegationThread() {
 							msg_ptr = reinterpret_cast<MessageHeader*>(
 								reinterpret_cast<uint8_t*>(msg_ptr) + current_padded_size);
 						}
+
 						logical_offset_++;
 					}
 
@@ -2849,7 +2850,14 @@ void Topic::EpochDriverThread() {
 			auto collect_deadline = std::chrono::steady_clock::now() + kFinalCollectionBudget;
 			int quiescent_checks = 0;
 			while (std::chrono::steady_clock::now() < collect_deadline) {
-				if (next_buf.active_collectors.load(std::memory_order_acquire) == 0) {
+				bool any_active = false;
+				for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+					if (next_buf.broker_active[i].load(std::memory_order_acquire)) {
+						any_active = true;
+						break;
+					}
+				}
+				if (!any_active) {
 					if (++quiescent_checks >= 20) break;  // ~2ms quiescent (20 * 100us)
 				} else {
 					quiescent_checks = 0;
@@ -3682,7 +3690,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					PendingBatch5 marker;
 					marker.broker_id = jt->broker_id;
 					marker.slot_offset = jt->slot_offset;
-					marker.scanner_seq = jt->scanner_seq;
 					marker.is_held_marker = true;
 					marker.hdr = nullptr;
 					marker.num_msg = 0;
@@ -4014,14 +4021,17 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		CXL::load_fence();
 
 		// Check current batch header using num_msg + VALID flag gating
-		// num_msg is uint32_t in BatchHeader, so read as volatile uint32_t for type safety
-		// For non-coherent CXL: volatile prevents compiler caching; ACQUIRE doesn't help cache coherence
-		volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
+		// [[RACE_FIX]] Read flags with ACQUIRE first to ensure we see producer's writes.
 		uint32_t flags = __atomic_load_n(&current_batch_header->flags, __ATOMIC_ACQUIRE);
 		bool is_claimed = (flags & kBatchHeaderFlagClaimed) != 0;
 		bool is_valid = (flags & kBatchHeaderFlagValid) != 0;
 
+		// num_msg is uint32_t in BatchHeader, so read as volatile uint32_t for type safety
+		// For non-coherent CXL: volatile prevents compiler caching; ACQUIRE doesn't help cache coherence
+		volatile uint32_t num_msg_check = 0;
 		if (is_valid) {
+			num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
+
 			// [P2] Only invalidate second cacheline if batch is valid
 			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(current_batch_header) + 64);
 			CXL::load_fence();
@@ -4097,13 +4107,12 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 						skip_marker.slot_offset = current_slot_offset;
 						skip_marker.epoch_created = 0;
 						skip_marker.skipped = true;
-						skip_marker.scanner_seq = next_scanner_seq_.fetch_add(1, std::memory_order_relaxed);
 
 						uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 						EpochBuffer5& buf = epoch_buffers_[epoch % 3];
-						if (buf.enter_collection()) {
+						if (buf.enter_collection(broker_id)) {
 							buf.per_broker[broker_id].push_back(skip_marker);
-							buf.exit_collection();
+							buf.exit_collection(broker_id);
 								BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
 									reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
 								if (next_batch_header >= ring_end) next_batch_header = ring_start_default;
@@ -4210,13 +4219,12 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 					skip_marker.slot_offset = slot_offset;
 					skip_marker.epoch_created = 0;
 					skip_marker.skipped = true;
-					skip_marker.scanner_seq = next_scanner_seq_.fetch_add(1, std::memory_order_relaxed);
 
 					uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 					EpochBuffer5& buf = epoch_buffers_[epoch % 3];
-					if (buf.enter_collection()) {
+					if (buf.enter_collection(broker_id)) {
 						buf.per_broker[broker_id].push_back(skip_marker);
-						buf.exit_collection();
+						buf.exit_collection(broker_id);
 							BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
 								reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
 							if (next_batch_header >= ring_end) next_batch_header = ring_start_default;
@@ -4260,7 +4268,6 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	pending.batch_seq = current_batch_header->batch_seq;
 	pending.slot_offset = slot_offset;
 	pending.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
-	pending.scanner_seq = next_scanner_seq_.fetch_add(1, std::memory_order_relaxed);
 	// [PHASE-5] Cache metadata while in L1 (just invalidated both cache lines above)
 	pending.cached_log_idx = current_batch_header->log_idx;
 	pending.cached_total_size = current_batch_header->total_size;
@@ -4280,10 +4287,10 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 			EpochBuffer5& buf = epoch_buffers_[epoch % 3];
 			
-			if (buf.enter_collection()) {
+			if (buf.enter_collection(broker_id)) {
 				// Successfully entered collection; push the batch.
 				buf.per_broker[broker_id].push_back(pending);
-				buf.exit_collection();
+				buf.exit_collection(broker_id);
 				pushed = true;
 			} else {
 				// Buffer sealed; wait briefly for next epoch to be available for collection
@@ -4351,9 +4358,16 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		CXL::flush_cacheline(
 			reinterpret_cast<const uint8_t*>(current_batch_header) + 64);
 		CXL::load_fence();
-		volatile uint32_t num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
+		
+		// [[RACE_FIX]] Read flags with ACQUIRE first
 		uint32_t flags = __atomic_load_n(&current_batch_header->flags, __ATOMIC_ACQUIRE);
 		bool is_valid = (flags & kBatchHeaderFlagValid) != 0;
+		
+		volatile uint32_t num_msg_check = 0;
+		if (is_valid) {
+			num_msg_check = reinterpret_cast<volatile BatchHeader*>(current_batch_header)->num_msg;
+		}
+		
 		bool batch_ready = is_valid && (num_msg_check > 0 && num_msg_check <= kMaxReasonableNumMsg);
 
 		if (batch_ready) {
@@ -4367,7 +4381,6 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			pending.batch_seq = current_batch_header->batch_seq;
 			pending.slot_offset = slot_offset;
 			pending.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
-			pending.scanner_seq = next_scanner_seq_.fetch_add(1, std::memory_order_relaxed);
 			pending.cached_log_idx = current_batch_header->log_idx;
 			pending.cached_total_size = current_batch_header->total_size;
 			pending.cached_batch_id = current_batch_header->batch_id;
@@ -4378,9 +4391,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			for (int r = 0; r < 5000 && !pushed; ++r) {
 				uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 				EpochBuffer5& buf = epoch_buffers_[epoch % 3];
-				if (buf.enter_collection()) {
+				if (buf.enter_collection(broker_id)) {
 					buf.per_broker[broker_id].push_back(pending);
-					buf.exit_collection();
+					buf.exit_collection(broker_id);
 					pushed = true;
 					drain_pushed++;
 					total_batches_processed++;
