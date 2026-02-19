@@ -3,7 +3,6 @@
 #include "common/config.h"
 #include "common/scoped_fd.h"
 #include "absl/container/flat_hash_map.h"
-#include "absl/cleanup/cleanup.h"
 #include <cstring>
 #include <random>
 #include <algorithm>
@@ -24,24 +23,6 @@ static int GetEpollWaitWritableMs() {
 	const char* env = std::getenv("EMBARCADERO_EPOLL_WAIT_WRITABLE_MS");
 	cached = (env && *env && std::atoi(env) == 0) ? 0 : 1;
 	return cached;
-}
-
-static bool QueueDiagEnabled() {
-	static const bool enabled = []() {
-		const char* env = std::getenv("EMBARCADERO_QUEUE_DIAG");
-		return env && env[0] && env[0] != '0';
-	}();
-	return enabled;
-}
-
-static uint64_t NowNs() {
-	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-		std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-
-static void UpdateMax(std::atomic<uint64_t>& dst, uint64_t value) {
-	uint64_t prev = dst.load(std::memory_order_relaxed);
-	while (value > prev && !dst.compare_exchange_weak(prev, value, std::memory_order_relaxed)) {}
 }
 
 namespace {
@@ -394,55 +375,19 @@ void Publisher::WarmupBuffers() {
 }
 
 void Publisher::Publish(char* message, size_t len) {
-	const bool queue_diag = QueueDiagEnabled();
-	uint64_t write_start_ns = 0;
-	if (queue_diag) {
-		write_start_ns = NowNs();
-		diag_publish_calls_.fetch_add(1, std::memory_order_relaxed);
-		uint64_t prev_end_ns = diag_last_publish_end_ns_.load(std::memory_order_relaxed);
-		if (prev_end_ns != 0 && write_start_ns > prev_end_ns) {
-			uint64_t gap_ns = write_start_ns - prev_end_ns;
-			diag_publish_gap_ns_.fetch_add(gap_ns, std::memory_order_relaxed);
-			UpdateMax(diag_publish_gap_ns_max_, gap_ns);
-			if (gap_ns >= 10'000) diag_publish_gap_over_10us_.fetch_add(1, std::memory_order_relaxed);
-			if (gap_ns >= 50'000) diag_publish_gap_over_50us_.fetch_add(1, std::memory_order_relaxed);
-			if (gap_ns >= 200'000) diag_publish_gap_over_200us_.fetch_add(1, std::memory_order_relaxed);
-		}
-	}
-
-	const static size_t header_size = sizeof(Embarcadero::MessageHeader);
-	// Padding and total size are cached per-thread for the hot path.
-	size_t padded_total;
-	{
-		static thread_local size_t cached_len = 0;
-		static thread_local size_t cached_padded_total = 0;
-		if (cached_len == len && cached_padded_total != 0) {
-			padded_total = cached_padded_total;
-		} else {
-			size_t padded = len % 64;
-			if (padded) padded = 64 - padded;
-			padded_total = len + padded + header_size;
-			cached_len = len;
-			cached_padded_total = padded_total;
-		}
-	}
+	constexpr size_t kHeaderSize = sizeof(Embarcadero::MessageHeader);
+	// Branchless 64-byte payload alignment for the hot path.
+	const size_t padded_total = ((len + 63) & ~static_cast<size_t>(63)) + kHeaderSize;
 
 	// [[PERF]] Per-message order for header only (subscriber ordering). client_order_ updated per batch when sealed.
 	size_t my_order = next_publish_order_++;
-	auto [ok, sealed] = pubQue_.Write(my_order, message, len, padded_total);
+	size_t sealed = 0;
+	bool ok = pubQue_.Write(my_order, message, len, padded_total, sealed);
 	if (!ok) {
 		LOG(ERROR) << "Failed to write message to queue (client_order=" << my_order << ")";
 	} else if (sealed > 0) {
 		client_order_.fetch_add(sealed, std::memory_order_release);
 	}
-	if (queue_diag) {
-		uint64_t write_end_ns = NowNs();
-		uint64_t write_ns = write_end_ns - write_start_ns;
-		diag_publish_write_ns_.fetch_add(write_ns, std::memory_order_relaxed);
-		UpdateMax(diag_publish_write_ns_max_, write_ns);
-		diag_last_publish_end_ns_.store(write_end_ns, std::memory_order_relaxed);
-	}
-
 }
 
 bool Publisher::Poll(size_t n) {
@@ -488,11 +433,6 @@ bool Publisher::Poll(size_t n) {
 		// All publisher threads completed transmission
 	}
 
-	if (QueueDiagEnabled()) {
-		LogPublisherQueueDiagnostics();
-		pubQue_.LogQueueDiagnostics();
-	}
-	
 	// If acknowledgments are enabled, wait for all acks
 	if (ack_level_ >= 1) {
 		auto wait_start_time = std::chrono::steady_clock::now();
@@ -713,51 +653,6 @@ void Publisher::WriteFinishedOrPaused() {
 	if (sealed > 0) {
 		client_order_.fetch_add(sealed, std::memory_order_release);
 	}
-}
-
-void Publisher::LogPublisherQueueDiagnostics() const {
-	if (!QueueDiagEnabled()) {
-		return;
-	}
-
-	const uint64_t publish_calls = diag_publish_calls_.load(std::memory_order_relaxed);
-	const uint64_t publish_write_ns = diag_publish_write_ns_.load(std::memory_order_relaxed);
-	const uint64_t publish_write_ns_max = diag_publish_write_ns_max_.load(std::memory_order_relaxed);
-	const uint64_t publish_gap_ns = diag_publish_gap_ns_.load(std::memory_order_relaxed);
-	const uint64_t publish_gap_ns_max = diag_publish_gap_ns_max_.load(std::memory_order_relaxed);
-	const uint64_t gap_over_10us = diag_publish_gap_over_10us_.load(std::memory_order_relaxed);
-	const uint64_t gap_over_50us = diag_publish_gap_over_50us_.load(std::memory_order_relaxed);
-	const uint64_t gap_over_200us = diag_publish_gap_over_200us_.load(std::memory_order_relaxed);
-	const uint64_t empty_reads = diag_consumer_empty_reads_.load(std::memory_order_relaxed);
-	const uint64_t consumer_wait_ns = diag_consumer_wait_ns_.load(std::memory_order_relaxed);
-	const uint64_t consumer_wait_ns_max = diag_consumer_wait_ns_max_.load(std::memory_order_relaxed);
-	const uint64_t consumer_yields = diag_consumer_yields_.load(std::memory_order_relaxed);
-	const uint64_t consumer_batches = diag_consumer_batches_.load(std::memory_order_relaxed);
-	const uint64_t consumer_messages = diag_consumer_messages_.load(std::memory_order_relaxed);
-	const uint64_t send_eagain_events = diag_send_eagain_events_.load(std::memory_order_relaxed);
-	const uint64_t send_eagain_wait_ns = diag_send_eagain_wait_ns_.load(std::memory_order_relaxed);
-	const uint64_t send_eagain_wait_ns_max = diag_send_eagain_wait_ns_max_.load(std::memory_order_relaxed);
-
-	LOG(INFO) << "[ORDER0_ACK1_PUBLISHER_QUEUE]"
-	          << " publish_calls=" << publish_calls
-	          << " publish_write_us=" << (publish_write_ns / 1000)
-	          << " publish_write_us_avg=" << (publish_calls ? (publish_write_ns / publish_calls) / 1000 : 0)
-	          << " publish_write_us_max=" << (publish_write_ns_max / 1000)
-	          << " publish_gap_us=" << (publish_gap_ns / 1000)
-	          << " publish_gap_us_avg=" << (publish_calls > 1 ? (publish_gap_ns / (publish_calls - 1)) / 1000 : 0)
-	          << " publish_gap_us_max=" << (publish_gap_ns_max / 1000)
-	          << " publish_gap_over_10us=" << gap_over_10us
-	          << " publish_gap_over_50us=" << gap_over_50us
-	          << " publish_gap_over_200us=" << gap_over_200us
-	          << " empty_reads=" << empty_reads
-	          << " consumer_wait_us=" << (consumer_wait_ns / 1000)
-	          << " consumer_wait_us_max=" << (consumer_wait_ns_max / 1000)
-	          << " consumer_yields=" << consumer_yields
-	          << " consumer_batches=" << consumer_batches
-	          << " consumer_messages=" << consumer_messages
-	          << " send_eagain_events=" << send_eagain_events
-	          << " send_eagain_wait_us=" << (send_eagain_wait_ns / 1000)
-	          << " send_eagain_wait_us_max=" << (send_eagain_wait_ns_max / 1000);
 }
 
 void Publisher::EpollAckThread() {
@@ -1133,46 +1028,8 @@ close(server_sock);
 
 void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	ScopedFd sock, efd;  // [[Phase 2.2]] RAII: closed when thread returns or on reassignment
-	int slow_consumer_queue = -1;
-	int slow_consumer_ms = 1;
 	size_t sent_msgs = 0;
 	size_t sent_batches = 0;
-	const bool queue_diag = QueueDiagEnabled();
-	uint64_t local_empty_reads = 0;
-	uint64_t local_empty_wait_ns = 0;
-	uint64_t local_empty_wait_ns_max = 0;
-	uint64_t local_empty_yields = 0;
-	uint64_t local_batches = 0;
-	uint64_t local_messages = 0;
-	uint64_t local_send_eagain_events = 0;
-	uint64_t local_send_eagain_wait_ns = 0;
-	uint64_t local_send_eagain_wait_ns_max = 0;
-	auto queue_diag_cleanup = absl::MakeCleanup([&]() {
-		if (!queue_diag) {
-			return;
-		}
-		diag_consumer_empty_reads_.fetch_add(local_empty_reads, std::memory_order_relaxed);
-		diag_consumer_wait_ns_.fetch_add(local_empty_wait_ns, std::memory_order_relaxed);
-		UpdateMax(diag_consumer_wait_ns_max_, local_empty_wait_ns_max);
-		diag_consumer_yields_.fetch_add(local_empty_yields, std::memory_order_relaxed);
-		diag_consumer_batches_.fetch_add(local_batches, std::memory_order_relaxed);
-		diag_consumer_messages_.fetch_add(local_messages, std::memory_order_relaxed);
-		diag_send_eagain_events_.fetch_add(local_send_eagain_events, std::memory_order_relaxed);
-		diag_send_eagain_wait_ns_.fetch_add(local_send_eagain_wait_ns, std::memory_order_relaxed);
-		UpdateMax(diag_send_eagain_wait_ns_max_, local_send_eagain_wait_ns_max);
-	});
-	{
-		const char* env = std::getenv("EMBARCADERO_SLOW_CONSUMER_QUEUE");
-		if (env && *env) {
-			slow_consumer_queue = std::atoi(env);
-			const char* ms_env = std::getenv("EMBARCADERO_SLOW_CONSUMER_MS");
-			if (ms_env && *ms_env) slow_consumer_ms = std::max(1, std::atoi(ms_env));
-			if (slow_consumer_queue >= 0 && static_cast<int>(pubQuesIdx) == slow_consumer_queue) {
-				LOG(INFO) << "PublishThread[" << pubQuesIdx << "]: slow consumer injection active ("
-				          << slow_consumer_ms << "ms per batch)";
-			}
-		}
-	}
 
 	// Lambda function to establish connection to a broker
 	auto connect_to_server = [&](size_t brokerId) -> bool {
@@ -1355,34 +1212,17 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				break;
 			} else {
 				// [[PERF]] spin 128x before yield when waiting for batch.
-				uint64_t wait_start_ns = 0;
-				if (queue_diag) {
-					local_empty_reads++;
-					wait_start_ns = NowNs();
-				}
 				static constexpr int kConsumerSpinCount = 128;
 				for (int s = 0; s < kConsumerSpinCount; s++) {
 					Embarcadero::CXL::cpu_pause();
 				}
 				consecutive_empty_reads++;
-				bool yielded = false;
 				// Reduce scheduler churn when producer is far behind: after sustained empties,
 				// sleep briefly instead of yielding every poll loop.
 				if (consecutive_empty_reads >= 2048) {
 					std::this_thread::sleep_for(std::chrono::microseconds(2));
 				} else {
 					std::this_thread::yield();
-					yielded = true;
-				}
-				if (queue_diag) {
-					if (yielded) {
-						local_empty_yields++;
-					}
-					uint64_t waited = NowNs() - wait_start_ns;
-					local_empty_wait_ns += waited;
-					if (waited > local_empty_wait_ns_max) {
-						local_empty_wait_ns_max = waited;
-					}
 				}
 				continue;
 			}
@@ -1392,10 +1232,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		consecutive_empty_reads = 0;
 		static thread_local size_t batch_count = 0;
 		++batch_count;
-		if (queue_diag) {
-			local_batches++;
-			local_messages += batch_header->num_msg;
-		}
 		
 		if (enable_batch_attempted_for_timeout_log_) {
 			total_batches_attempted_.fetch_add(1, std::memory_order_relaxed);
@@ -1564,27 +1400,15 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 				// Reset backoff after successful send
 				zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
-			} else if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-				// Socket buffer full; wait for writable so broker can recv() and drain.
-				// [[ROOT_CAUSE_FIX]] 0ms caused client busy-loop while brokers blocked in recv() → ACK stall.
-				// Default 1ms yields to broker. Env EMBARCADERO_EPOLL_WAIT_WRITABLE_MS=0 to test busy poll.
-				uint64_t eagain_wait_start_ns = 0;
-				if (queue_diag) {
-					local_send_eagain_events++;
-					eagain_wait_start_ns = NowNs();
-				}
-				int wait_ms = GetEpollWaitWritableMs();
-				struct epoll_event events[64];
-				int n = epoll_wait(efd.get(), events, 64, wait_ms);
-				if (queue_diag) {
-					uint64_t waited = NowNs() - eagain_wait_start_ns;
-					local_send_eagain_wait_ns += waited;
-					if (waited > local_send_eagain_wait_ns_max) {
-						local_send_eagain_wait_ns_max = waited;
-					}
-				}
+				} else if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+					// Socket buffer full; wait for writable so broker can recv() and drain.
+					// [[ROOT_CAUSE_FIX]] 0ms caused client busy-loop while brokers blocked in recv() → ACK stall.
+					// Default 1ms yields to broker. Env EMBARCADERO_EPOLL_WAIT_WRITABLE_MS=0 to test busy poll.
+					int wait_ms = GetEpollWaitWritableMs();
+					struct epoll_event events[64];
+					int n = epoll_wait(efd.get(), events, 64, wait_ms);
 
-				if (n == -1) {
+					if (n == -1) {
 					LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
 					pubQue_.ReleaseBatch(batch_header);
 					break;
@@ -1674,10 +1498,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		// Return batch to pool (QueueBuffer).
 		pubQue_.ReleaseBatch(batch_header);
 
-		// Controlled experiment: simulate slow consumer (one queue blocks entire producer).
-		if (slow_consumer_queue >= 0 && static_cast<int>(pubQuesIdx) == slow_consumer_queue) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(slow_consumer_ms));
-		}
 	}
 
 	// IMPROVED: Keep connections alive for subscriber

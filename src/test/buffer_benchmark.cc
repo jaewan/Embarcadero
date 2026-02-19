@@ -181,13 +181,14 @@ static double RunWriteOnlyNew(size_t num_buffers, size_t total_bytes, size_t mes
 
 	std::vector<char> msg(message_size, 'x');
 	auto t0 = std::chrono::steady_clock::now();
-	for (size_t i = 0; i < num_messages; i++) {
-		auto [ok, sealed] = buf.Write(static_cast<size_t>(i), msg.data(), message_size, padded_size);
-		if (!ok) {
-			LOG(ERROR) << "QueueBuffer Write failed at message " << i;
-			return 0.0;
+		for (size_t i = 0; i < num_messages; i++) {
+			size_t sealed = 0;
+			bool ok = buf.Write(static_cast<size_t>(i), msg.data(), message_size, padded_size, sealed);
+			if (!ok) {
+				LOG(ERROR) << "QueueBuffer Write failed at message " << i;
+				return 0.0;
+			}
 		}
-	}
 	buf.SealAll();
 	buf.WriteFinished();
 	auto t1 = std::chrono::steady_clock::now();
@@ -204,7 +205,8 @@ static double Run1Producer1Consumer1BufferNew(QueueBuffer& buf, size_t total_byt
 	std::thread producer([&]() {
 		std::vector<char> msg(message_size, 'x');
 		for (size_t i = 0; i < num_messages; i++) {
-			auto [ok, sealed] = buf.Write(static_cast<size_t>(i), msg.data(), message_size, padded_size);
+			size_t sealed = 0;
+			bool ok = buf.Write(static_cast<size_t>(i), msg.data(), message_size, padded_size, sealed);
 			if (!ok) {
 				LOG(ERROR) << "QueueBuffer Write failed at message " << i;
 				break;
@@ -266,7 +268,8 @@ static double Run1PublisherNConsumersNBuffersNew(QueueBuffer& buf, size_t total_
 				uint64_t expected = 0;
 				first_write_ns.compare_exchange_strong(expected, t, std::memory_order_relaxed, std::memory_order_relaxed);
 			}
-			auto [ok, sealed] = buf.Write(static_cast<size_t>(i), msg.data(), message_size, padded_size);
+			size_t sealed = 0;
+			bool ok = buf.Write(static_cast<size_t>(i), msg.data(), message_size, padded_size, sealed);
 			if (!ok) {
 				LOG(ERROR) << "QueueBuffer Write failed at message " << i;
 				break;
@@ -375,7 +378,8 @@ static double Run1PublisherNConsumersNBuffersE2ELike(
 				padded_total = len + padded + header_size;
 			}
 			size_t my_order = use_atomic ? client_order.fetch_add(1, std::memory_order_acq_rel) : i;
-			auto [ok, sealed] = buf.Write(my_order, msg.data(), message_size, padded_total);
+			size_t sealed = 0;
+			bool ok = buf.Write(my_order, msg.data(), message_size, padded_total, sealed);
 			if (!ok) {
 				LOG(ERROR) << "QueueBuffer Write failed at message " << i;
 				break;

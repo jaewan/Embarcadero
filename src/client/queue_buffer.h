@@ -49,9 +49,10 @@ public:
 
 	/**
 	 * Append one message to current batch; round-robins by write_buf_id_. Seals batch when >= BATCH_SIZE.
-	 * @return {success, messages_sealed_this_call} so caller can update client_order_ per batch.
+	 * @param sealed_out Number of messages sealed by this call (for caller's client_order_ update).
+	 * @return true on success.
 	 */
-	std::pair<bool, size_t> Write(size_t client_order, char* msg, size_t len, size_t paddedSize);
+	bool Write(size_t client_order, char* msg, size_t len, size_t paddedSize, size_t& sealed_out);
 
 	/**
 	 * Dequeue next batch for consumer bufIdx. Returns BatchHeader* or nullptr if empty (or shutdown).
@@ -93,11 +94,6 @@ public:
 	 * so callers control when/how (e.g. after thread binding, or skip in tests that don't care).
 	 */
 	void WarmupBuffers();
-
-	/**
-	 * Emit aggregated queue diagnostics (enabled with EMBARCADERO_QUEUE_DIAG=1).
-	 */
-	void LogQueueDiagnostics() const;
 
 	/**
 	 * Return a batch buffer to the pool after consumer is done. Must be called with the pointer
@@ -154,26 +150,6 @@ private:
 	// Message header templates (same as Buffer)
 	Embarcadero::MessageHeader header_;
 	Embarcadero::BlogMessageHeader blog_header_;
-
-	struct QueueDiagCounters {
-		std::atomic<uint64_t> write_calls{0};
-		std::atomic<uint64_t> write_pool_wait_events{0};
-		std::atomic<uint64_t> write_pool_wait_ns{0};
-		std::atomic<uint64_t> write_pool_wait_ns_max{0};
-		std::atomic<uint64_t> seal_calls{0};
-		std::atomic<uint64_t> sealed_messages{0};
-		std::atomic<uint64_t> rr_deflections{0};
-		std::atomic<uint64_t> all_queues_full_events{0};
-		std::atomic<uint64_t> queue_full_wait_ns{0};
-		std::atomic<uint64_t> queue_full_wait_ns_max{0};
-		std::atomic<uint64_t> seal_pool_wait_events{0};
-		std::atomic<uint64_t> seal_pool_wait_ns{0};
-		std::atomic<uint64_t> seal_pool_wait_ns_max{0};
-		std::atomic<uint64_t> seal_pool_timeouts{0};
-		std::atomic<uint64_t> read_success{0};
-		std::atomic<uint64_t> read_empty{0};
-	};
-	QueueDiagCounters diag_;
 
 	void AdvanceWriteBufId();
 	void NotifyQueueDataReady(size_t queue_idx);

@@ -169,26 +169,6 @@ class Publisher {
 		std::atomic<size_t> total_messages_sent_{0};  // Sum of num_msg over all fully-sent batches
 		std::atomic<size_t> total_batches_attempted_{0};
 		std::atomic<size_t> total_batches_failed_{0};
-		// Queue/producer diagnostics (enabled with EMBARCADERO_QUEUE_DIAG=1).
-		std::atomic<uint64_t> diag_publish_calls_{0};
-		std::atomic<uint64_t> diag_publish_write_ns_{0};
-		std::atomic<uint64_t> diag_publish_write_ns_max_{0};
-		std::atomic<uint64_t> diag_publish_gap_ns_{0};
-		std::atomic<uint64_t> diag_publish_gap_ns_max_{0};
-		std::atomic<uint64_t> diag_publish_gap_over_10us_{0};
-		std::atomic<uint64_t> diag_publish_gap_over_50us_{0};
-		std::atomic<uint64_t> diag_publish_gap_over_200us_{0};
-		std::atomic<uint64_t> diag_last_publish_end_ns_{0};
-		std::atomic<uint64_t> diag_consumer_empty_reads_{0};
-		std::atomic<uint64_t> diag_consumer_wait_ns_{0};
-		std::atomic<uint64_t> diag_consumer_wait_ns_max_{0};
-		std::atomic<uint64_t> diag_consumer_yields_{0};
-		std::atomic<uint64_t> diag_consumer_batches_{0};
-		std::atomic<uint64_t> diag_consumer_messages_{0};
-		std::atomic<uint64_t> diag_send_eagain_events_{0};
-		std::atomic<uint64_t> diag_send_eagain_wait_ns_{0};
-		std::atomic<uint64_t> diag_send_eagain_wait_ns_max_{0};
-
 		// Used to measure real-time throughput during failure benchmark
 		std::atomic<size_t> total_sent_bytes_{0};
 		// [[CACHE_LINE_FIX]] Cache-line aligned per-broker statistics to prevent false sharing
@@ -291,7 +271,6 @@ class Publisher {
 		 * Subscribes to cluster status updates
 		 */
 		void SubscribeToClusterStatus();
-		void LogPublisherQueueDiagnostics() const;
 
 		/**
 		 * Adds publisher threads
