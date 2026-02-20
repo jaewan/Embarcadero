@@ -93,6 +93,8 @@ export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 # NUMA: CPU on node 1; allow memory on nodes 1 and 2 so mbind(..., node_2) in cxl_manager works.
 # Zero-core CXL is on node 2; script must use --membind=1,2 or first-touch after mbind can SIGBUS/OOM.
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
+# Client/publisher pinned to node 0 for consistent separation from broker CPUs.
+CLIENT_NUMA_BIND="${CLIENT_NUMA_BIND:-numactl --cpunodebind=0 --membind=0}"
 
 # CRITICAL: Check huge page availability before each trial to diagnose variability
 # Insufficient huge pages causes fallback to slow malloc, leading to 2GB/s vs 7GB/s variability
@@ -515,25 +517,25 @@ for test_case in "${test_cases[@]}"; do
 				fi
 				echo "All brokers ready, cluster formed"
 
-			# Run throughput test in foreground; stream output to terminal
-			# No NUMA binding for client - let OS optimize placement
-			# Total message size: 8GB (8589934592 bytes) for bandwidth measurement
-			# Longer ACK timeout when ack=1 so test can complete (all-ingestion or backpressure can delay ACKs).
-			# [[Phase B]] Order 5 has B0 tail-ACK convergence issues; use 180s for order=5, 120s otherwise.
-			if [ "$ack" = "1" ]; then
-				if [ "$order" = "5" ]; then
-					export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-180}"
-				else
-					export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-120}"
+				# Run throughput test in foreground; stream output to terminal.
+				# Client process is bound to node 0 via CLIENT_NUMA_BIND.
+				# Total message size: 8GB (8589934592 bytes) for bandwidth measurement
+				# Longer ACK timeout when ack=1 so test can complete (all-ingestion or backpressure can delay ACKs).
+				# [[Phase B]] Order 5 has B0 tail-ACK convergence issues; use 180s for order=5, 120s otherwise.
+				if [ "$ack" = "1" ]; then
+					if [ "$order" = "5" ]; then
+						export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-180}"
+					else
+						export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-120}"
+					fi
 				fi
-			fi
-			# Threads per broker: use 1 when NUM_BROKERS=1; otherwise 4 for 10+ GB/s (was 3; 4×4=16 threads saturates better).
-			THREADS_PER_BROKER=${THREADS_PER_BROKER:-$([ "$NUM_BROKERS" = "1" ] && echo 1 || echo 4)}
+				# Threads per broker: use 1 when NUM_BROKERS=1; otherwise 4 for 10+ GB/s (was 3; 4×4=16 threads saturates better).
+				THREADS_PER_BROKER=${THREADS_PER_BROKER:-$([ "$NUM_BROKERS" = "1" ] && echo 1 || echo 4)}
 
-			# [[PERF: Removed --record_results]] Latency collection adds overhead and is only needed for research analysis, not bandwidth benchmarks
-			echo "=== Starting Throughput Test Trial $trial ==="
-			test_start=$(date +%s.%N)
-			stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $msg_size -s $TOTAL_MESSAGE_SIZE -t $test_case -o $order -a $ack --sequencer $sequencer -l 0 -r 0 2>&1 | tee "throughput_test_trial${trial}.log"
+				# [[PERF: Removed --record_results]] Latency collection adds overhead and is only needed for research analysis, not bandwidth benchmarks
+				echo "=== Starting Throughput Test Trial $trial ==="
+				test_start=$(date +%s.%N)
+				stdbuf -oL -eL $CLIENT_NUMA_BIND ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $msg_size -s $TOTAL_MESSAGE_SIZE -t $test_case -o $order -a $ack --sequencer $sequencer -l 0 -r 0 2>&1 | tee "throughput_test_trial${trial}.log"
 			test_exit_code=${PIPESTATUS[0]}
 			test_end=$(date +%s.%N)
 			test_duration=$(echo "$test_end - $test_start" | bc 2>/dev/null || echo "0")

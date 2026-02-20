@@ -17,6 +17,8 @@ REMOTE_USER="domin"
 PASSLESS_ENTRY="~/.ssh/id_rsa"
 REMOTE_BIN_DIR="~/Jae/Embarcadero/build/bin"
 REMOTE_PID_FILE="/tmp/remote_seq.pid"
+EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
+CLIENT_NUMA_BIND="${CLIENT_NUMA_BIND:-numactl --cpunodebind=0 --membind=0}"
 
 # Define the configurations
 declare -a configs=(
@@ -106,21 +108,21 @@ for mode in "${modes[@]}"; do
 	fi
 
 	# Start the processes
-	start_process "./embarlet --head --$sequencer"
+	start_process "$EMBARLET_NUMA_BIND ./embarlet --head --$sequencer"
 	wait_for_signal
 	head_pid=${pids[-1]}  # Get the PID of the ./embarlet --head process
 	sleep 3
 	for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-	  start_process "./embarlet --$sequencer"
+	  start_process "$EMBARLET_NUMA_BIND ./embarlet --$sequencer"
 	  wait_for_signal
 	done
 	sleep 3
 
 	# Run throughput test with or without --steady_rate based on mode
 	if [[ "$mode" == "steady" ]]; then
-	  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack_level --sequencer $sequencer -r 1 --steady_rate"
+	  start_process "$CLIENT_NUMA_BIND ./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack_level --sequencer $sequencer -r 1 --steady_rate"
 	else
-	  start_process "./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack_level --sequencer $sequencer -r 1"
+	  start_process "$CLIENT_NUMA_BIND ./throughput_test -m $msg_size --record_results -t $test_case -o $order -a $ack_level --sequencer $sequencer -r 1"
 	fi
 
 	# Wait for all processes to finish
