@@ -1,20 +1,23 @@
 #include "corfu_sequencer.grpc.pb.h"
 #include "common/config.h"
-#include "absl/container/flat_hash_map.h"
+#include "../common/performance_utils.h"
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
+#include <array>
+#include <memory>
 #include <mutex>
-#include <future>
+#include <shared_mutex>
 #include <string>
-#include <queue>
-#include <condition_variable>
 #include <glog/logging.h>
 #include <thread>
 #include <csignal>
 #include <chrono>
 #include <errno.h>
 #include <cstring>
+
+#include "absl/container/flat_hash_map.h"
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -26,166 +29,103 @@ using corfusequencer::TotalOrderResponse;
 
 class CorfuSequencerImpl final : public CorfuSequencer::Service {
 	public:
-		CorfuSequencerImpl() {}
+		CorfuSequencerImpl() {
+			for (auto& v : idx_per_broker_) v.store(0, std::memory_order_relaxed);
+			for (auto& v : batch_seq_per_broker_) v.store(0, std::memory_order_relaxed);
+		}
 
 		Status GetTotalOrder(ServerContext* context, const TotalOrderRequest* request,
 				TotalOrderResponse* response) override {
-			size_t client_id = request->client_id();
-			size_t batch_seq = request->batchseq();
-			size_t num_msg = request->num_msg();
-			size_t total_size = request->total_size();
-			int broker_id = request->broker_id();
+			const uint64_t client_id = request->client_id();
+			const uint64_t batch_seq = request->batchseq();
+			const uint64_t num_msg = request->num_msg();
+			const uint64_t total_size = request->total_size();
+			const int broker_id = request->broker_id();
 
-			// [[CORFU_FIX]] Use composite key (client_id, broker_id) since each broker has independent batch_seq
-			uint64_t client_broker_key = (static_cast<uint64_t>(client_id) << 32) | static_cast<uint64_t>(broker_id);
-
-			{
-				std::unique_lock<std::mutex> lock(mutex_);
-
-				// Initialize client's batch sequence if this is the first request
-				if (batch_seq_per_clients_.find(client_broker_key) == batch_seq_per_clients_.end()) {
-					batch_seq_per_clients_[client_broker_key] = 0;  // Always start from 0
-					pending_requests_[client_broker_key] = PriorityQueue();
-				}
-
-				// Initialize broker-specific data structures if this is the first request for this broker
-				if (idx_per_broker_.find(broker_id) == idx_per_broker_.end()) {
-					idx_per_broker_[broker_id] = 0;
-					batch_seq_per_broker_[broker_id] = 0;
-				}
-
-				// Check if this batch_seq has already been processed
-				if (batch_seq < batch_seq_per_clients_[client_broker_key]) {
-					LOG(WARNING) << "Duplicate or already processed batch_seq " << batch_seq
-						<< " for client " << client_id << " broker " << broker_id;
-					return Status(grpc::StatusCode::INVALID_ARGUMENT, "Batch sequence already processed");
-				}
-
-				// If this is not the next expected batch sequence, queue it
-				if (batch_seq != batch_seq_per_clients_[client_broker_key]) {
-					std::promise<std::tuple<uint64_t, uint64_t, uint64_t>> promise;
-					auto future = promise.get_future();
-
-					// Queue the request
-					pending_requests_[client_broker_key].push(std::make_unique<PendingRequest>(PendingRequest{
-								batch_seq, std::move(promise), num_msg, broker_id, total_size}));
-
-					// Release the lock while waiting
-					lock.unlock();
-
-					// Wait for this request's turn
-					try {
-						auto result = future.get();
-						response->set_total_order(std::get<0>(result));
-						response->set_log_idx(std::get<1>(result));
-						response->set_broker_batch_seq(std::get<2>(result));
-						return grpc::Status::OK;
-					} catch (const std::exception& e) {
-						LOG(ERROR) << "Error waiting for future: " << e.what();
-						return Status(grpc::StatusCode::INTERNAL, e.what());
-					}
-				}
-
-				// Process the current request (this is the expected batch_seq)
-				uint64_t broker_batch_seq = batch_seq_per_broker_[broker_id];
-
-				response->set_total_order(next_order_);
-				response->set_log_idx(idx_per_broker_[broker_id]);
-				response->set_broker_batch_seq(broker_batch_seq);
-
-				next_order_ += num_msg;
-				idx_per_broker_[broker_id] += total_size;
-				batch_seq_per_clients_[client_broker_key]++;
-				batch_seq_per_broker_[broker_id]++;
-
-				// Process any pending requests that are now ready
-				ProcessPendingRequests(client_id, broker_id, client_broker_key);
+			// [[PHASE_8]] Bounds check for broker_id and sanity check for request fields
+			if (broker_id < 0 || broker_id >= kMaxBrokers) {
+				return Status(grpc::StatusCode::INVALID_ARGUMENT, "broker_id out of range");
 			}
+			if (num_msg == 0 || total_size == 0) {
+				return Status(grpc::StatusCode::INVALID_ARGUMENT, "Invalid num_msg or total_size");
+			}
+
+			const uint64_t client_broker_key =
+				(static_cast<uint64_t>(client_id) << 32) | static_cast<uint64_t>(broker_id);
+
+			ClientBrokerState* state = GetOrCreateState(client_broker_key);
+
+			std::unique_lock<std::mutex> client_lock(state->mu);
+
+			if (batch_seq < state->expected_batch_seq) {
+				return Status(grpc::StatusCode::INVALID_ARGUMENT, "Batch sequence already processed");
+			}
+
+			if (batch_seq != state->expected_batch_seq) {
+				return Status(grpc::StatusCode::UNAVAILABLE, "Out of order batch sequence, please retry");
+			}
+
+			uint64_t start_order = next_order_.fetch_add(num_msg, std::memory_order_relaxed);
+			uint64_t log_offset = idx_per_broker_[broker_id].fetch_add(total_size, std::memory_order_relaxed);
+			uint64_t bbseq = batch_seq_per_broker_[broker_id].fetch_add(1, std::memory_order_relaxed);
+
+			state->expected_batch_seq++;
+
+			response->set_total_order(start_order);
+			response->set_log_idx(log_offset);
+			response->set_broker_batch_seq(bbseq);
+
+			// [[PHASE_8]] CXL Flush Rule: Ensure all sequencer state changes are visible
+			// Although this is a network service, we follow the project's consistency rule
+			// for all ordering-critical state updates.
+			Embarcadero::CXL::store_fence();
 
 			return Status::OK;
 		}
 
 	private:
-		struct PendingRequest {
-			size_t batch_seq;
-			std::promise<std::tuple<uint64_t, uint64_t, uint64_t>> promise; // total_order, log_idx, broker_batch_seq
-			size_t num_msg;
-			int broker_id;
-			size_t total_size;
+		static constexpr int kMaxBrokers = NUM_MAX_BROKERS;
 
-			// Comparison operator for priority queue (lower batch_seq has higher priority)
-			bool operator<(const PendingRequest& other) const {
-				// Higher batch_seq has lower priority (reverse order for priority_queue)
-				return batch_seq > other.batch_seq;
-			}
+		struct alignas(64) ClientBrokerState {
+			std::mutex mu;
+			uint64_t expected_batch_seq{0};
 		};
 
-		struct ComparePendingRequestPtr {
-			bool operator()(const std::unique_ptr<PendingRequest>& a,
-					const std::unique_ptr<PendingRequest>& b) const
+		std::atomic<uint64_t> next_order_{0};
+		std::array<std::atomic<uint64_t>, kMaxBrokers> idx_per_broker_;
+		std::array<std::atomic<uint64_t>, kMaxBrokers> batch_seq_per_broker_;
+
+		std::shared_mutex client_map_mu_;
+		absl::flat_hash_map<uint64_t, std::unique_ptr<ClientBrokerState>> client_state_;
+
+		ClientBrokerState* GetOrCreateState(uint64_t key) {
 			{
-				return a->batch_seq > b->batch_seq;
+				std::shared_lock<std::shared_mutex> rlock(client_map_mu_);
+				auto it = client_state_.find(key);
+				if (it != client_state_.end()) {
+					return it->second.get();
+				}
 			}
-		};
-
-		using PriorityQueue = std::priority_queue<std::unique_ptr<PendingRequest>,
-					std::vector<std::unique_ptr<PendingRequest>>,
-					ComparePendingRequestPtr>;
-
-		void ProcessPendingRequests(size_t client_id, int broker_id, uint64_t client_broker_key) {
-			auto& queue = pending_requests_[client_broker_key];
-
-			while (!queue.empty() &&
-					queue.top()->batch_seq == batch_seq_per_clients_[client_broker_key]) {
-				// Access the top request
-				std::unique_ptr<PendingRequest> pending = std::move(const_cast<std::unique_ptr<PendingRequest>&>(queue.top()));
-				queue.pop();
-
-				// Get the broker batch sequence for this pending request
-				uint64_t broker_batch_seq = batch_seq_per_broker_[pending->broker_id];
-
-				// Fulfill the promise for the request with total_order, log_idx, and broker_batch_seq
-				pending->promise.set_value(std::make_tuple(next_order_,
-							idx_per_broker_[pending->broker_id],
-							broker_batch_seq));
-
-				// Update the next order and broker index
-				next_order_ += pending->num_msg;
-				idx_per_broker_[pending->broker_id] += pending->total_size;
-
-				// Increment the broker's batch sequence
-				batch_seq_per_broker_[pending->broker_id]++;
-
-				// Increment the client's batch sequence
-				batch_seq_per_clients_[client_broker_key]++;
+			{
+				std::unique_lock<std::shared_mutex> wlock(client_map_mu_);
+				auto [it, inserted] = client_state_.emplace(key, nullptr);
+				if (inserted) {
+					it->second = std::make_unique<ClientBrokerState>();
+				}
+				return it->second.get();
 			}
 		}
-
-		std::mutex mutex_;
-		absl::flat_hash_map<size_t, size_t> batch_seq_per_clients_; // Tracks next expected batch_seq per client
-		absl::flat_hash_map<int, size_t> idx_per_broker_;          // Tracks log index per broker
-		absl::flat_hash_map<int, size_t> batch_seq_per_broker_;    // Tracks broker-specific batch sequence
-		absl::flat_hash_map<size_t, PriorityQueue> pending_requests_; // Pending requests per client
-		size_t next_order_ = 0; // The next global order value
 };
 
 void RunServer() {
-	// Read the port number from config.h
 	const std::string server_address = "0.0.0.0:" + std::to_string(CORFU_SEQ_PORT);
 
-	// Create an instance of the service implementation
 	CorfuSequencerImpl service;
 
-	// Create a gRPC server
 	grpc::ServerBuilder builder;
-
-	// Set the server to listen on the specified address and port
 	builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-
-	// Register the service implementation with the server
 	builder.RegisterService(&service);
 
-	// Build the server
 	std::unique_ptr<Server> server(builder.BuildAndStart());
 	if (!server) {
 		LOG(ERROR) << "Failed to start the server on port " << CORFU_SEQ_PORT;
@@ -194,23 +134,19 @@ void RunServer() {
 
 	LOG(INFO) << "Server listening on " << server_address;
 
-	// Set up signal handler for graceful shutdown
 	std::signal(SIGINT, [](int signal) {
 			LOG(INFO) << "Received shutdown signal";
 			exit(0);
 			});
 
-	// Wait for the server to shut down
 	server->Wait();
 }
 
 int main(int argc, char** argv) {
-	// Initialize Logging
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
-	FLAGS_logtostderr = 1; // Log only to console (no files)
+	FLAGS_logtostderr = 1;
 
-	// Run the server
 	RunServer();
 
 	return 0;

@@ -131,7 +131,9 @@ namespace Embarcadero{
 				scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, log_to_memory, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
 				return;
 			}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
-				corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>(broker_id, log_to_memory);
+				LOG(INFO) << "[CORFU_DEBUG] DiskManager: creating CorfuReplicationManager (broker_id=" << broker_id << ", cxl_addr=" << cxl_addr_ << ")";
+				corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>(broker_id, log_to_memory, cxl_addr_);
+				LOG(INFO) << "[CORFU_DEBUG] DiskManager: CorfuReplicationManager created";
 				return;
 			}else if(sequencerType == heartbeat_system::SequencerType::EMBARCADERO){
 				if (cxl_addr_ == nullptr) {

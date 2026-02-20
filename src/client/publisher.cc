@@ -1,5 +1,6 @@
 #include "publisher.h"
 #include "publisher_profile.h"
+#include "latency_stats.h"
 #include "common/config.h"
 #include "common/scoped_fd.h"
 #include "absl/container/flat_hash_map.h"
@@ -11,7 +12,6 @@
 #include <cstdlib>  // For getenv, atoi
 #include <fstream>
 #include <iomanip>
-#include <numeric>
 #include <thread>
 
 // [[CODE_CLEANUP]] Removed no-op profiling stubs - if profiling is needed, implement properly
@@ -112,14 +112,28 @@ Publisher::~Publisher() {
 }
 
 #ifdef COLLECT_LATENCY_STATS
-void Publisher::RecordPublishSend(int broker_id, size_t end_count) {
+void Publisher::RecordPublishSend(
+		int broker_id,
+		size_t end_count,
+		const std::chrono::steady_clock::time_point& submit_time) {
 	if (!record_results_ || ack_level_ < 1 || end_count == 0) {
 		return;
 	}
-	BatchSendRecord record{end_count, std::chrono::steady_clock::now()};
+	BatchSendRecord record{end_count, std::chrono::steady_clock::now(), submit_time};
 	{
 		std::lock_guard<std::mutex> lock(send_records_mutexes_[broker_id]);
-		send_records_per_broker_[broker_id].push_back(record);
+		auto& records = send_records_per_broker_[broker_id];
+		// Keep records sorted by end_count so ACK processing can pop_front in O(k).
+		if (records.empty() || record.end_count >= records.back().end_count) {
+			records.push_back(record);
+		} else {
+			publish_latency_out_of_order_inserts_.fetch_add(1, std::memory_order_relaxed);
+			auto it = std::upper_bound(records.begin(), records.end(), record.end_count,
+				[](size_t target_end_count, const BatchSendRecord& candidate) {
+					return target_end_count < candidate.end_count;
+				});
+			records.insert(it, record);
+		}
 	}
 }
 #endif
@@ -129,27 +143,34 @@ void Publisher::ProcessPublishAckLatency(int broker_id, size_t acked_msg) {
 	if (!record_results_ || ack_level_ < 1) {
 		return;
 	}
-	std::vector<long long> local_latencies;
+	std::vector<long long> local_send_to_ack_latencies;
+	std::vector<long long> local_submit_to_ack_latencies;
 	const auto now = std::chrono::steady_clock::now();
 	{
 		std::lock_guard<std::mutex> lock(send_records_mutexes_[broker_id]);
 		auto& records = send_records_per_broker_[broker_id];
-		// Multiple PublishThreads can push to the same broker, so records are not
-		// necessarily ordered by end_count. Remove all records with end_count <= acked_msg.
-		std::deque<BatchSendRecord> remaining;
-		for (auto& record : records) {
-			if (record.end_count <= acked_msg) {
-				auto latency = std::chrono::duration_cast<std::chrono::microseconds>(now - record.sent_time).count();
-				local_latencies.push_back(latency);
-			} else {
-				remaining.push_back(std::move(record));
-			}
+		while (!records.empty() && records.front().end_count <= acked_msg) {
+			const auto send_to_ack_latency = std::chrono::duration_cast<std::chrono::microseconds>(
+					now - records.front().sent_time).count();
+			const auto submit_to_ack_latency = std::chrono::duration_cast<std::chrono::microseconds>(
+					now - records.front().submit_time).count();
+			local_send_to_ack_latencies.push_back(send_to_ack_latency);
+			local_submit_to_ack_latencies.push_back(submit_to_ack_latency);
+			records.pop_front();
 		}
-		records = std::move(remaining);
 	}
-	if (!local_latencies.empty()) {
+	if (!local_send_to_ack_latencies.empty()) {
 		std::lock_guard<std::mutex> lock(publish_latency_mutex_);
-		publish_latencies_us_.insert(publish_latencies_us_.end(), local_latencies.begin(), local_latencies.end());
+		publish_send_to_ack_latencies_us_.insert(
+				publish_send_to_ack_latencies_us_.end(),
+				local_send_to_ack_latencies.begin(),
+				local_send_to_ack_latencies.end());
+		publish_submit_to_ack_latencies_us_.insert(
+				publish_submit_to_ack_latencies_us_.end(),
+				local_submit_to_ack_latencies.begin(),
+				local_submit_to_ack_latencies.end());
+		publish_send_to_ack_batch_samples_recorded_.fetch_add(local_send_to_ack_latencies.size(), std::memory_order_relaxed);
+		publish_submit_to_ack_batch_samples_recorded_.fetch_add(local_submit_to_ack_latencies.size(), std::memory_order_relaxed);
 	}
 }
 #endif
@@ -159,46 +180,107 @@ void Publisher::WritePublishLatencyResults() {
 	if (!record_results_ || ack_level_ < 1) {
 		return;
 	}
-	std::vector<long long> latencies_copy;
+	std::vector<long long> send_to_ack_latencies_copy;
+	std::vector<long long> submit_to_ack_latencies_copy;
 	{
 		std::lock_guard<std::mutex> lock(publish_latency_mutex_);
-		latencies_copy = publish_latencies_us_;
+		send_to_ack_latencies_copy = publish_send_to_ack_latencies_us_;
+		submit_to_ack_latencies_copy = publish_submit_to_ack_latencies_us_;
 	}
-	if (latencies_copy.empty()) {
-		LOG(WARNING) << "No publish latency values could be calculated.";
+	if (send_to_ack_latencies_copy.empty() || submit_to_ack_latencies_copy.empty()) {
+		LOG(WARNING) << "No publish latency values could be calculated for one or more metrics.";
 		return;
 	}
 
-	std::sort(latencies_copy.begin(), latencies_copy.end());
-	const size_t count = latencies_copy.size();
-	const long double sum = std::accumulate(latencies_copy.begin(), latencies_copy.end(), 0.0L);
-	const long long min_us = latencies_copy.front();
-	const long long max_us = latencies_copy.back();
-	const long long median_us = latencies_copy[count / 2];
-	const long long p99_us = latencies_copy[static_cast<size_t>(std::floor(0.99 * count))];
-	const long long p999_us = latencies_copy[static_cast<size_t>(std::floor(0.999 * count))];
-	const long double avg_us = sum / static_cast<long double>(count);
+	std::sort(send_to_ack_latencies_copy.begin(), send_to_ack_latencies_copy.end());
+	std::sort(submit_to_ack_latencies_copy.begin(), submit_to_ack_latencies_copy.end());
+	const auto send_to_ack_summary = Embarcadero::LatencyStats::ComputeSummary(send_to_ack_latencies_copy);
+	const auto submit_to_ack_summary = Embarcadero::LatencyStats::ComputeSummary(submit_to_ack_latencies_copy);
+	const size_t send_to_ack_samples_recorded = publish_send_to_ack_batch_samples_recorded_.load(std::memory_order_relaxed);
+	const size_t submit_to_ack_samples_recorded = publish_submit_to_ack_batch_samples_recorded_.load(std::memory_order_relaxed);
+	const size_t acked_messages = ack_received_.load(std::memory_order_relaxed);
+	const size_t total_batches_sent = total_batches_sent_.load(std::memory_order_relaxed);
+	if (send_to_ack_summary.count > total_batches_sent || submit_to_ack_summary.count > total_batches_sent) {
+		LOG(WARNING) << "Publish ACK batch latency samples exceed total sent batches: send_samples="
+		             << send_to_ack_summary.count << " submit_samples=" << submit_to_ack_summary.count
+		             << " total_batches_sent=" << total_batches_sent;
+	}
+	if (send_to_ack_samples_recorded != send_to_ack_summary.count) {
+		LOG(WARNING) << "Publish send->ack sample counter mismatch: counter=" << send_to_ack_samples_recorded
+		             << " summarized=" << send_to_ack_summary.count;
+	}
+	if (submit_to_ack_samples_recorded != submit_to_ack_summary.count) {
+		LOG(WARNING) << "Publish submit->ack sample counter mismatch: counter=" << submit_to_ack_samples_recorded
+		             << " summarized=" << submit_to_ack_summary.count;
+	}
 
-	LOG(INFO) << "Publish Latency Statistics (us):";
-	LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << avg_us;
-	LOG(INFO) << "  Min:     " << min_us;
-	LOG(INFO) << "  Median:  " << median_us;
-	LOG(INFO) << "  99th P:  " << p99_us;
-	LOG(INFO) << "  99.9th P:" << p999_us;
-	LOG(INFO) << "  Max:     " << max_us;
+	LOG(INFO) << "Publish Submit->ACK Batch Latency Statistics (us):";
+	LOG(INFO) << "  Count:   " << submit_to_ack_summary.count;
+	LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << submit_to_ack_summary.average_us;
+	LOG(INFO) << "  Min:     " << submit_to_ack_summary.min_us;
+	LOG(INFO) << "  P50:     " << submit_to_ack_summary.p50_us;
+	LOG(INFO) << "  P99:     " << submit_to_ack_summary.p99_us;
+	LOG(INFO) << "  P99.9:   " << submit_to_ack_summary.p999_us;
+	LOG(INFO) << "  Max:     " << submit_to_ack_summary.max_us;
+	LOG(INFO) << "  Semantics: append_submit_to_ack batch latency (sample granularity=batch)";
+	LOG(INFO) << "  Invariant: batch_samples <= total_batches_sent (samples=" << submit_to_ack_summary.count
+	          << ", total_batches_sent=" << total_batches_sent << ")";
+	LOG(INFO) << "Publish Send->ACK Batch Latency Statistics (us):";
+	LOG(INFO) << "  Count:   " << send_to_ack_summary.count;
+	LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << send_to_ack_summary.average_us;
+	LOG(INFO) << "  Min:     " << send_to_ack_summary.min_us;
+	LOG(INFO) << "  P50:     " << send_to_ack_summary.p50_us;
+	LOG(INFO) << "  P99:     " << send_to_ack_summary.p99_us;
+	LOG(INFO) << "  P99.9:   " << send_to_ack_summary.p999_us;
+	LOG(INFO) << "  Max:     " << send_to_ack_summary.max_us;
+	LOG(INFO) << "  Semantics: append_send_to_ack batch latency (sample granularity=batch)";
+	LOG(INFO) << "  Submit timestamps missing (fallback to send timestamp): "
+	          << publish_submit_time_missing_.load(std::memory_order_relaxed);
 
 	const std::string latency_filename = "pub_latency_stats.csv";
 	std::ofstream latency_file(latency_filename);
 	if (!latency_file.is_open()) {
 		LOG(ERROR) << "Failed to open file for writing: " << latency_filename;
 	} else {
-		latency_file << "Average,Min,Median,p99,p999,Max\n";
-		latency_file << std::fixed << std::setprecision(3) << avg_us
-			<< "," << min_us
-			<< "," << median_us
-			<< "," << p99_us
-			<< "," << p999_us
-			<< "," << max_us << "\n";
+		latency_file << "Average,Min,Median,p90,p95,p99,p999,Max,Count,Metric,Unit,PercentileMethod,Granularity,SampleCountMeaning,AckedMessages,TotalBatchesSent,OutOfOrderInserts,MissingSubmitTimestamps\n";
+		latency_file << std::fixed << std::setprecision(3) << submit_to_ack_summary.average_us
+			<< "," << submit_to_ack_summary.min_us
+			<< "," << submit_to_ack_summary.p50_us
+			<< "," << submit_to_ack_summary.p90_us
+			<< "," << submit_to_ack_summary.p95_us
+			<< "," << submit_to_ack_summary.p99_us
+			<< "," << submit_to_ack_summary.p999_us
+			<< "," << submit_to_ack_summary.max_us
+			<< "," << submit_to_ack_summary.count
+			<< ",append_submit_to_ack_batch_latency"
+			<< ",us"
+			<< "," << Embarcadero::LatencyStats::kPercentileMethod
+			<< ",batch"
+			<< ",samples=count_of_fully_acked_batches"
+			<< "," << acked_messages
+			<< "," << total_batches_sent
+			<< "," << publish_latency_out_of_order_inserts_.load(std::memory_order_relaxed)
+			<< "," << publish_submit_time_missing_.load(std::memory_order_relaxed)
+			<< "\n";
+		latency_file << std::fixed << std::setprecision(3) << send_to_ack_summary.average_us
+			<< "," << send_to_ack_summary.min_us
+			<< "," << send_to_ack_summary.p50_us
+			<< "," << send_to_ack_summary.p90_us
+			<< "," << send_to_ack_summary.p95_us
+			<< "," << send_to_ack_summary.p99_us
+			<< "," << send_to_ack_summary.p999_us
+			<< "," << send_to_ack_summary.max_us
+			<< "," << send_to_ack_summary.count
+			<< ",append_send_to_ack_batch_latency"
+			<< ",us"
+			<< "," << Embarcadero::LatencyStats::kPercentileMethod
+			<< ",batch"
+			<< ",samples=count_of_fully_acked_batches"
+			<< "," << acked_messages
+			<< "," << total_batches_sent
+			<< "," << publish_latency_out_of_order_inserts_.load(std::memory_order_relaxed)
+			<< "," << publish_submit_time_missing_.load(std::memory_order_relaxed)
+			<< "\n";
 		latency_file.close();
 	}
 
@@ -207,11 +289,18 @@ void Publisher::WritePublishLatencyResults() {
 	if (!cdf_file.is_open()) {
 		LOG(ERROR) << "Failed to open file for writing: " << cdf_filename;
 	} else {
-		cdf_file << "Latency_us,CumulativeProbability\n";
-		for (size_t i = 0; i < count; ++i) {
-			const long long current_latency = latencies_copy[i];
-			const double cumulative_probability = static_cast<double>(i + 1) / count;
-			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability << "\n";
+		cdf_file << "Latency_us,CumulativeProbability,Metric\n";
+		for (size_t i = 0; i < submit_to_ack_summary.count; ++i) {
+			const long long current_latency = submit_to_ack_latencies_copy[i];
+			const double cumulative_probability = static_cast<double>(i + 1) / submit_to_ack_summary.count;
+			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
+			         << ",append_submit_to_ack_batch_latency\n";
+		}
+		for (size_t i = 0; i < send_to_ack_summary.count; ++i) {
+			const long long current_latency = send_to_ack_latencies_copy[i];
+			const double cumulative_probability = static_cast<double>(i + 1) / send_to_ack_summary.count;
+			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
+			         << ",append_send_to_ack_batch_latency\n";
 		}
 		cdf_file.close();
 	}
@@ -416,9 +505,9 @@ bool Publisher::Poll(size_t n) {
 	// All messages queued, waiting for transmission to complete
 
 	// CRITICAL FIX: Use atomic flag to prevent double-join race conditions
-	if (!threads_joined_.exchange(true)) {
-		// Only join threads once
-		for (size_t i = 0; i < threads_.size(); ++i) {
+		if (!threads_joined_.exchange(true)) {
+			// Only join threads once
+			for (size_t i = 0; i < threads_.size(); ++i) {
 			if (threads_[i].joinable()) {
 				try {
 				// Joining publisher thread
@@ -430,11 +519,17 @@ bool Publisher::Poll(size_t n) {
 			}
 			// Publisher thread not joinable (already joined or detached)
 		}
-		// All publisher threads completed transmission
-	}
+			// All publisher threads completed transmission
+		}
+		const size_t zero_batch_threads = zero_batch_publish_threads_.load(std::memory_order_relaxed);
+		if (zero_batch_threads > 0) {
+			LOG(WARNING) << "[Publisher Thread Distribution] " << zero_batch_threads
+			             << " publish thread(s) exited without sending a batch. "
+			             << "This can occur with skewed queue/thread assignment and is not a failure by itself.";
+		}
 
-	// If acknowledgments are enabled, wait for all acks
-	if (ack_level_ >= 1) {
+		// If acknowledgments are enabled, wait for all acks
+		if (ack_level_ >= 1) {
 		auto wait_start_time = std::chrono::steady_clock::now();
 		auto last_log_time = wait_start_time;
 		// [[CONFIG: Ack-wait spin]] 500µs spin when waiting for acks (burst-friendly); was 1ms.
@@ -468,7 +563,7 @@ bool Publisher::Poll(size_t n) {
 				std::string per_broker;
 				for (size_t i = 0; i < broker_stats_.size(); i++) {
 					size_t sent = broker_stats_[i].sent_messages.load(std::memory_order_relaxed);
-					size_t acked = broker_stats_[i].acked_messages;
+					size_t acked = broker_stats_[i].acked_messages.load(std::memory_order_relaxed);
 					if (i) per_broker += " ";
 					per_broker += "B" + std::to_string(i) + "=" + std::to_string(acked);
 					if (sent != 0 || acked != 0) {
@@ -491,7 +586,7 @@ bool Publisher::Poll(size_t n) {
 				std::string per_broker;
 				for (size_t i = 0; i < broker_stats_.size(); i++) {
 					if (i) per_broker += " ";
-					per_broker += "B" + std::to_string(i) + "=" + std::to_string(broker_stats_[i].acked_messages);
+					per_broker += "B" + std::to_string(i) + "=" + std::to_string(broker_stats_[i].acked_messages.load(std::memory_order_relaxed));
 				}
 				VLOG(1) << "Waiting for acknowledgments, received " << ack_received_.load(std::memory_order_relaxed) << " out of " << target_acks
 					<< " (elapsed: " << elapsed.count() << "s"
@@ -517,7 +612,7 @@ bool Publisher::Poll(size_t n) {
 			std::string per_broker;
 			for (size_t i = 0; i < broker_stats_.size(); i++) {
 				size_t sent = broker_stats_[i].sent_messages.load(std::memory_order_relaxed);
-				size_t acked = broker_stats_[i].acked_messages;
+				size_t acked = broker_stats_[i].acked_messages.load(std::memory_order_relaxed);
 				if (i) per_broker += " ";
 				per_broker += "B" + std::to_string(i) + "=" + std::to_string(acked);
 				if (sent != 0 || acked != 0) {
@@ -578,7 +673,7 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 	for (size_t i = 0; i < num_brokers; i++) {
 		broker_stats_[i].sent_bytes.store(0);
 		broker_stats_[i].sent_messages.store(0);
-		broker_stats_[i].acked_messages = 0;
+		broker_stats_[i].acked_messages.store(0, std::memory_order_relaxed);
 	}
 
 	// Start thread to monitor progress and kill brokers at specified percentage
@@ -627,7 +722,7 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 			throughputFile << timestamp_ms; // Write timestamp
 
 			for (size_t i = 0; i < num_brokers; i++) {
-				size_t bytes = broker_stats_[i].acked_messages * message_size;
+				size_t bytes = broker_stats_[i].acked_messages.load(std::memory_order_relaxed) * message_size;
 				size_t real_time_throughput = (bytes - prev_throughputs[i]);
 
 				// Convert to GB/s for CSV
@@ -961,25 +1056,12 @@ process_client_fd:;
 							new_acked_msgs = acked_msg - prev_acked;
 						}
 						if (new_acked_msgs > 0) {
-							// [[DIAGNOSTIC: Log ACK processing]]
-							static thread_local size_t ack_process_count = 0;
-							size_t prev_total = ack_received_.load(std::memory_order_relaxed);
-							if (++ack_process_count % 100 == 0 || prev_total % 10000 == 0) {
-								VLOG(2) << "EpollAckThread: B" << broker_id << " acked_msg=" << acked_msg 
-								        << " prev_acked=" << (prev_acked == (size_t)-1 ? -1 : (int64_t)prev_acked)
-								        << " new_acked=" << new_acked_msgs 
-								        << " total_ack_received=" << (prev_total + new_acked_msgs)
-								        << " (count=" << ack_process_count << ")";
-							}
-							
 #ifdef COLLECT_LATENCY_STATS
 								ProcessPublishAckLatency(broker_id, acked_msg);
 #endif
-							broker_stats_[broker_id].acked_messages += new_acked_msgs;  // Not atomic - single writer
+							broker_stats_[broker_id].acked_messages.fetch_add(new_acked_msgs, std::memory_order_relaxed);
 							ack_received_.fetch_add(new_acked_msgs, std::memory_order_release);
 							prev_ack_per_sock[client_sock] = acked_msg; // Update last value for this socket
-							VLOG(4) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << ") ACK messages: " 
-								<< acked_msg << " (+" << new_acked_msgs << ")";
 						} else {
 							// Duplicate cumulative value, ignore.
 							VLOG(5) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << 
@@ -1187,17 +1269,15 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				// CRITICAL: Don't exit immediately if we haven't sent any batches yet
 				// This ensures the connection stays alive even if this thread got no batches
 				// NetworkManager expects to receive at least one batch header per connection
-				if (!has_sent_batch) {
-					// [[FIX: B3=0 ACKs]] CRITICAL diagnostic - this thread got NO batches!
-					// This is the likely cause of B*=0 ACK issues
-					LOG(ERROR) << "PublishThread[" << pubQuesIdx << "] for BROKER " << broker_id
-					          << ": EXITING WITH ZERO BATCHES SENT! "
-					          << "This thread read from buffer " << pubQuesIdx << " but got no data. "
-					          << "publish_finished=" << publish_finished_.load(std::memory_order_relaxed)
-					          << ", shutdown=" << shutdown_.load(std::memory_order_relaxed);
-					// Wait a bit to see if batches arrive, then exit gracefully
-					std::this_thread::sleep_for(std::chrono::milliseconds(100));
-				}
+					if (!has_sent_batch) {
+						zero_batch_publish_threads_.fetch_add(1, std::memory_order_relaxed);
+						VLOG(1) << "PublishThread[" << pubQuesIdx << "] for BROKER " << broker_id
+						        << ": exiting with zero batches sent "
+						        << "(publish_finished=" << publish_finished_.load(std::memory_order_relaxed)
+						        << ", shutdown=" << shutdown_.load(std::memory_order_relaxed) << ")";
+						// Wait a bit to see if batches arrive, then exit gracefully
+						std::this_thread::sleep_for(std::chrono::milliseconds(100));
+					}
 				// Drain remaining batches before exit.
 				while ((batch_header = static_cast<Embarcadero::BatchHeader*>(pubQue_.Read(pubQuesIdx))) != nullptr
 				       && batch_header->total_size != 0) {
@@ -1229,9 +1309,17 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		}
 
 	process_batch:
-		consecutive_empty_reads = 0;
-		static thread_local size_t batch_count = 0;
-		++batch_count;
+			consecutive_empty_reads = 0;
+			static thread_local size_t batch_count = 0;
+			++batch_count;
+#ifdef COLLECT_LATENCY_STATS
+			auto submit_time = std::chrono::steady_clock::now();
+			if (!pubQue_.GetBatchSubmitTime(batch_header, &submit_time)) {
+				// Fallback keeps metric available even if seal metadata is missing for this batch.
+				submit_time = std::chrono::steady_clock::now();
+				publish_submit_time_missing_.fetch_add(1, std::memory_order_relaxed);
+			}
+#endif
 		
 		if (enable_batch_attempted_for_timeout_log_) {
 			total_batches_attempted_.fetch_add(1, std::memory_order_relaxed);
@@ -1249,7 +1337,17 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			// Handle sequencer-specific batch header processing
 			if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
 				batch_header->broker_id = broker_id;
-				corfu_client_->GetTotalOrder(batch_header);
+				// [[CORFU_FIX]] Sequencer expects per-broker batch_seq (0,1,2,...), not global.
+				// Use per-broker counter so each broker's batches are sequenced correctly.
+				if (broker_id >= 0 && broker_id < kMaxCorfuBrokers) {
+					// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker (Phase 2C).
+					// This ensures in-order delivery to the sequencer, eliminating UNAVAILABLE retries.
+					std::lock_guard<std::mutex> lock(corfu_seq_per_broker_lock_[broker_id]);
+					batch_header->batch_seq = corfu_batch_seq_per_broker_[broker_id].fetch_add(1, std::memory_order_relaxed);
+					corfu_client_->GetTotalOrder(batch_header);
+				} else {
+					corfu_client_->GetTotalOrder(batch_header);
+				}
 
 			VLOG(2) << "Publisher: Got total_order=" << batch_header->total_order
 			        << " for batch with " << batch_header->num_msg << " messages";
@@ -1479,7 +1577,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			batch_header->num_msg, std::memory_order_relaxed);
 		size_t end_count = prev_sent + batch_header->num_msg;
 #ifdef COLLECT_LATENCY_STATS
-		RecordPublishSend(broker_id, end_count);
+		RecordPublishSend(broker_id, end_count, submit_time);
 #else
 		(void)end_count;
 #endif

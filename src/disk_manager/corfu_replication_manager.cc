@@ -31,8 +31,8 @@ namespace Corfu {
 
 	class CorfuReplicationServiceImpl final : public CorfuReplicationService::Service {
 		public:
-			explicit CorfuReplicationServiceImpl(std::string base_filename)
-				: base_filename_(std::move(base_filename)), running_(true), fd_(-1) {
+			explicit CorfuReplicationServiceImpl(std::string base_filename, void* cxl_addr)
+				: base_filename_(std::move(base_filename)), cxl_addr_(cxl_addr), running_(true), fd_(-1) {
 					if (!OpenOutputFile()) {
 						throw std::runtime_error("Failed to open replication file: " + base_filename_);
 					}
@@ -122,29 +122,28 @@ namespace Corfu {
 			}
 
 			void WriteRequestInternal(const CorfuReplicationRequest& request, int current_fd) const {
-				const auto& data = request.data();
-				int64_t offset = request.offset();
-				int64_t size = request.size();
+				uint64_t log_idx = request.log_idx();
+				uint64_t size = request.size();
 
-				if (data.size() != static_cast<size_t>(size)) {
-					throw std::runtime_error("Size mismatch: request.size() = " +
-							std::to_string(size) + ", but data.size() = " +
-							std::to_string(data.size()));
+				if (!cxl_addr_) {
+					throw std::runtime_error("CXL address not initialized in ReplicationService");
 				}
 
+				// Phase 4 fix: Read directly from CXL memory instead of protobuf bytes
+				void* source_addr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(cxl_addr_) + log_idx);
+
 				// Use the passed file descriptor
-				ssize_t bytes_written = pwrite(current_fd, data.data(), size, offset);
+				ssize_t bytes_written = pwrite(current_fd, source_addr, size, log_idx);
 
 				if (bytes_written == -1) {
 					// Throw system_error to include errno
 					throw std::system_error(errno, std::generic_category(), "pwrite failed for fd " + std::to_string(current_fd));
 				}
-				if (bytes_written != size) {
+				if (static_cast<size_t>(bytes_written) != size) {
 					// This usually indicates a problem (e.g., disk full), treat as error
 					throw std::runtime_error("Incomplete pwrite: expected " + std::to_string(size) +
 							", wrote " + std::to_string(bytes_written) + " for fd " + std::to_string(current_fd));
 				}
-				// VLOG(5) << "Successfully wrote " << bytes_written << " bytes at offset " << offset; // Optional verbose logging
 			}
 
 
@@ -220,6 +219,7 @@ namespace Corfu {
     }
 
 			const std::string base_filename_;
+			void* const cxl_addr_;
 			std::atomic<bool> running_;
 			int fd_ = -1;
 			std::shared_mutex file_state_mutex_; // Use shared mutex
@@ -233,9 +233,11 @@ namespace Corfu {
 	CorfuReplicationManager::CorfuReplicationManager(
 			int broker_id,
 			bool log_to_memory,
+			void* cxl_addr,
 			const std::string& address,
 			const std::string& port,
 			const std::string& log_file) {
+		LOG(INFO) << "[CORFU_DEBUG] CorfuReplicationManager ctor start (broker_id=" << broker_id << ")";
 		try {
 			int disk_to_write = broker_id % NUM_DISKS ;
 			std::string base_dir = "../../.Replication/disk" + std::to_string(disk_to_write) + "/";
@@ -243,7 +245,9 @@ namespace Corfu {
 				base_dir = "/tmp/";
 			}
 			std::string base_filename = log_file.empty() ? base_dir+"corfu_replication_log"+std::to_string(broker_id) +".dat" : log_file;
-			service_ = std::make_unique<CorfuReplicationServiceImpl>(base_filename);
+			LOG(INFO) << "[CORFU_DEBUG] CorfuReplicationManager: creating CorfuReplicationServiceImpl (base_filename=" << base_filename << ")";
+			service_ = std::make_unique<CorfuReplicationServiceImpl>(base_filename, cxl_addr);
+			LOG(INFO) << "[CORFU_DEBUG] CorfuReplicationManager: service created";
 
 			std::string server_address = address + ":" + (port.empty() ? std::to_string(CORFU_REP_PORT) : port);
 			ServerBuilder builder;
@@ -256,13 +260,14 @@ namespace Corfu {
 			//builder.SetMaxReceiveMessageSize(16 * 1024 * 1024); // 16MB
 			//builder.SetMaxSendMessageSize(16 * 1024 * 1024);    // 16MB
 
+			LOG(INFO) << "[CORFU_DEBUG] CorfuReplicationManager: binding gRPC server to " << server_address;
 			auto server = builder.BuildAndStart();
 			if (!server) {
 				throw std::runtime_error("Failed to start gRPC server");
 			}
 			server_ = std::move(server);
 
-			VLOG(5) << "Corfu replication server listening on " << server_address;
+			LOG(INFO) << "[CORFU_DEBUG] CorfuReplicationManager: gRPC server listening on " << server_address;
 		} catch (const std::exception& e) {
 			LOG(ERROR) << "Failed to initialize replication manager: " << e.what();
 			Shutdown();
@@ -274,6 +279,7 @@ namespace Corfu {
 				server_->Wait();
 				}
 		});
+		LOG(INFO) << "[CORFU_DEBUG] CorfuReplicationManager: constructor complete";
 	}
 
 	CorfuReplicationManager::~CorfuReplicationManager() {

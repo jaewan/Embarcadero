@@ -53,6 +53,7 @@ cleanup() {
   echo "Cleaning up stale brokers and ports..."
   pkill -9 -f "./embarlet" >/dev/null 2>&1 || true
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
+  pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
   # Clean up any stale ready signal files
   rm -f /tmp/embarlet_*_ready 2>/dev/null || true
   # Clean up PID files
@@ -165,6 +166,13 @@ orders=(${ORDER:-5})
 ack=${ACK:-1}
 sequencer=${SEQUENCER:-EMBARCADERO}
 QUIET=${QUIET:-0}
+
+# [[CORFU]] Skip numactl by default - avoids broker OOM on systems where membind=1,2 limits CXL allocation.
+# Set EMBARLET_NUMA_BIND="numactl ..." before running to override if your topology needs it.
+if [[ "$sequencer" == "CORFU" ]] && [[ -z "${EMBARLET_NUMA_BIND_FORCE:-}" ]]; then
+  EMBARLET_NUMA_BIND=""
+  CLIENT_NUMA_BIND=""
+fi
 
 # Removed wait_for_signal function - using sleep-based timing instead
 
@@ -467,6 +475,21 @@ for test_case in "${test_cases[@]}"; do
 					echo "Please fix the issues above and re-run the test."
 					continue
 				fi
+
+			# [[CORFU]] Start Corfu sequencer before brokers when using CORFU (Order 3)
+			if [[ "$sequencer" == "CORFU" ]]; then
+			  if ! pgrep -f "corfu_global_sequencer" >/dev/null 2>&1; then
+			    echo "Starting corfu_global_sequencer..."
+			    ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
+			    sleep 2
+			    if ! pgrep -f "corfu_global_sequencer" >/dev/null 2>&1; then
+			      echo "ERROR: Failed to start corfu_global_sequencer"
+			      overall_status=1
+			      continue 2
+			    fi
+			    echo "corfu_global_sequencer started"
+			  fi
+			fi
 
 			# Start the processes
 			# [[FIX]]: Use start_process so we get actual embarlet PID → fast ready check via /tmp/embarlet_${pid}_ready

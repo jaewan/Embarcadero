@@ -27,6 +27,8 @@
 #include <glog/logging.h>
 #include "folly/MPMCQueue.h"
 
+#include <functional>
+
 namespace Embarcadero {
 
 #ifndef CACHELINE_SIZE
@@ -228,6 +230,7 @@ class Topic {
 		stop_threads_volatile_ = true;  // Volatile copy for legacy interfaces
 		committed_seq_updater_stop_.store(true, std::memory_order_release);
 		committed_seq_updater_cv_.notify_all();
+		
 		for (auto& shard : level5_shards_) {
 			if (shard) {
 				std::lock_guard<std::mutex> lock(shard->mu);
@@ -237,6 +240,13 @@ class Topic {
 			if (shard) shard->cv.notify_one();
 		}
 		for (std::thread& thread : delegationThreads_) {
+			if (thread.joinable()) {
+				thread.join();
+			}
+		}
+
+		// [[PHASE_5]] Join Corfu callback threads
+		for (std::thread& thread : corfu_callback_threads_) {
 			if (thread.joinable()) {
 				thread.join();
 			}
@@ -589,7 +599,7 @@ class Topic {
 		size_t ordered_offset_;
 
 		// Thread control
-		std::atomic<bool> stop_threads_{false};  // Atomic for thread-safe shutdown
+		alignas(64) std::atomic<bool> stop_threads_{false};  // Atomic for thread-safe shutdown
 		volatile bool stop_threads_volatile_{false};  // Volatile copy for legacy interfaces
 		std::vector<std::thread> delegationThreads_;
 
@@ -778,6 +788,31 @@ class Topic {
 
 	// Per-topic sequencers: avoid static locals that cause shared state between topics
 	std::atomic<size_t> scalog_batch_offset_{0};  // For ScalogGetCXLBuffer (was static local)
-	size_t cached_num_brokers_{0};  // For Order3GetCXLBuffer (was static local)
+		size_t cached_num_brokers_{0};  // For Order3GetCXLBuffer (was static local)
+
+		// [[PHASE_5]] Corfu Order 3 Callback Thread Pool
+		// Offloads callback work (spin-wait, replication, CV advance) from NetworkManager threads
+		// to avoid starvation under high concurrency.
+		struct CorfuCallbackTask {
+			std::function<void(void*, size_t)> callback;
+			void* log_ptr;
+			size_t size;
+		};
+		folly::MPMCQueue<CorfuCallbackTask> corfu_callback_queue_{1024};
+		std::vector<std::thread> corfu_callback_threads_;
+		void CorfuCallbackWorker();
+
+		// [[PHASE_7]] Corfu Order 3 Completion Tracking
+		// Tracks contiguous completion of PBR slots to advance CV monotonically.
+		// Replaces the race-prone direct CV advance in Phase 5.
+		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> next_cv_advance_pbr_{};
+		struct PBRCompletionSlot {
+			std::atomic<bool> completed{false};
+			uint64_t cumulative_msg_count{0};
+		};
+		// Use a large enough ring to handle in-flight batches (e.g., 64K slots)
+		static constexpr size_t kPBRCompletionRingSize = 65536;
+		std::array<std::unique_ptr<std::array<PBRCompletionSlot, kPBRCompletionRingSize>>, NUM_MAX_BROKERS> pbr_completion_rings_;
+		void AdvanceCVContiguous(int broker_id);
 };
 } // End of namespace Embarcadero

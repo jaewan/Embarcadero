@@ -89,6 +89,17 @@ Topic::Topic(
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
 
+		// [[PHASE_7]] Initialize Corfu Order 3 completion tracking
+		if (order_ == 3 && seq_type_ == CORFU) {
+			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+				next_cv_advance_pbr_[i].store(0, std::memory_order_relaxed);
+				pbr_completion_rings_[i] = std::make_unique<std::array<PBRCompletionSlot, kPBRCompletionRingSize>>();
+				for (size_t j = 0; j < kPBRCompletionRingSize; ++j) {
+					(*pbr_completion_rings_[i])[j].completed.store(false, std::memory_order_relaxed);
+				}
+			}
+		}
+
 		// Set appropriate get buffer function based on sequencer type
 		if (seq_type == KAFKA) {
 			GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
@@ -172,6 +183,14 @@ void Topic::Start() {
 		skip_delegation = true;
 		LOG(INFO) << "Topic " << topic_name_ << ": DelegationThread disabled for CORFU Order 3 "
 		          << "(external sequencer assigns order before publish)";
+		
+		// [[PHASE_5]] Start Corfu Order 3 Callback Thread Pool
+		const int num_callback_threads = 8;
+		for (int i = 0; i < num_callback_threads; ++i) {
+			corfu_callback_threads_.emplace_back(&Topic::CorfuCallbackWorker, this);
+		}
+		LOG(INFO) << "Topic " << topic_name_ << ": Started " << num_callback_threads 
+		          << " Corfu callback worker threads";
 	}
 		if (!skip_delegation &&
 		    (seq_type_ == CORFU || (seq_type_ != KAFKA && order_ != 4))) {
@@ -253,6 +272,29 @@ inline void Topic::UpdateTInodeWritten(size_t written, size_t written_addr) {
 	tinode_->offsets[broker_id_].written_addr = written_addr;
 }
 
+void Topic::AdvanceCVContiguous(int broker_id) {
+	auto& ring = *pbr_completion_rings_[broker_id];
+	uint64_t next_pbr = next_cv_advance_pbr_[broker_id].load(std::memory_order_acquire);
+	
+	while (true) {
+		size_t ring_idx = next_pbr % kPBRCompletionRingSize;
+		if (!ring[ring_idx].completed.load(std::memory_order_acquire)) {
+			break;
+		}
+		
+		uint64_t cumulative = ring[ring_idx].cumulative_msg_count;
+		
+		// Advance the physical CompletionVector in CXL
+		AdvanceCVForSequencer(static_cast<uint16_t>(broker_id), next_pbr, cumulative);
+		
+		// Clear slot for future reuse
+		ring[ring_idx].completed.store(false, std::memory_order_release);
+		
+		next_pbr++;
+		next_cv_advance_pbr_[broker_id].store(next_pbr, std::memory_order_release);
+	}
+}
+
 /**
  * DelegationThread: Stage 2 (Local Ordering)
  * 
@@ -300,13 +342,12 @@ void Topic::DelegationThread() {
 	BatchHeader* current_batch = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 
-	// [PHASE-9] Ring boundaries for wrap check (prevents OOB read after ring wrap)
+	// [PHASE-8] Ring boundaries for wrap check (prevents OOB read after ring wrap)
 	BatchHeader* delegation_ring_start = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 	BatchHeader* delegation_ring_end = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(delegation_ring_start) + BATCHHEADERS_SIZE);
 	
-	// [[CRITICAL FIX: Removed Dead Code]] - first_batch variable was unused
 	size_t processed_batches = 0;
 	
 	// [[PERFORMANCE FIX]]: Batch flush optimization (DEV-002)
@@ -316,17 +357,17 @@ void Topic::DelegationThread() {
 	constexpr size_t BYTE_FLUSH_INTERVAL = 64 * 1024;  // Flush every 64KB
 	size_t batches_since_flush = 0;
 	size_t bytes_since_flush = 0;
-	
+		
 		// DelegationThread: Starting batch processing
 
 	while (!stop_threads_) {
 		// NEW: Try batch-based processing first
-		if (current_batch && __atomic_load_n(&current_batch->batch_complete, __ATOMIC_ACQUIRE)) {
-			// DelegationThread: Found completed batch
-			// Process this completed batch
-			if (current_batch->num_msg > 0) {
-				// [[BLOG_HEADER: Gate ORDER=5 per-message writes when BlogHeader is enabled]]
-				bool skip_per_message_writes = (order_ == 5 && HeaderUtils::ShouldUseBlogHeader());
+			if (current_batch && __atomic_load_n(&current_batch->batch_complete, __ATOMIC_ACQUIRE)) {
+				// DelegationThread: Found completed batch
+				// Process this completed batch
+				if (current_batch->num_msg > 0) {
+					// [[BLOG_HEADER: Gate ORDER=5 per-message writes when BlogHeader is enabled]]
+					bool skip_per_message_writes = (order_ == 5 && HeaderUtils::ShouldUseBlogHeader());
 
 				// For BlogMessageHeader, receiver already set the required fields; delegation doesn't need to write
 				// For MessageHeader, delegation needs to set logical_offset/segment_header/next_msg_diff
@@ -534,9 +575,9 @@ void Topic::DelegationThread() {
 					reinterpret_cast<uint8_t*>(header) - reinterpret_cast<uint8_t*>(segment_header)
 					);
 
-		// Update tracking variables
-		written_logical_offset_ = logical_offset_;
-		written_physical_addr_ = reinterpret_cast<void*>(header);
+			// Update tracking variables
+			written_logical_offset_ = logical_offset_;
+			written_physical_addr_ = reinterpret_cast<void*>(header);
 
 		// Move to next message using validated padded_size
 		MessageHeader* next_header = reinterpret_cast<MessageHeader*>(
@@ -1048,13 +1089,19 @@ std::function<void(void*, size_t)> Topic::CorfuOrder3GetCXLBuffer(
 	// CORFU Order 3: No DelegationThread, no sequencer
 	// Publisher already assigned total_order via corfu_client_->GetTotalOrder()
 
-	// CRITICAL FIX: Allocate PBR slot for ACK pipeline
-	// Even though Order 3 doesn't use DelegationThread, NetworkManager needs
-	// batch_header_location to set batch_complete=1 for ACKs
+	// [[CORFU_ORDER3_SLOT_FIX]] Allocate PBR slot by receive order, not batch_seq.
+	// Multi-thread publishers share client_id and batch_seq → slot collision (e.g. stall at pbr=4).
+	// Use monotonic pbr so each batch gets unique slot; PublishPBRSlotAfterRecv copies our pbr.
+	uint64_t pbr_idx = broker_pbr_counters_[broker_id_].fetch_add(1, std::memory_order_relaxed);
+	batch_header.pbr_absolute_index = pbr_idx;
+	batch_header.batch_id = (static_cast<uint64_t>(broker_id_) << 48) | pbr_idx;
+
 	BatchHeader* batch_header_ring = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
+	size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
 
-	batch_header_location = &batch_header_ring[batch_header.batch_seq % (BATCHHEADERS_SIZE / sizeof(BatchHeader))];
+	batch_header_location = &batch_header_ring[slot_idx];
 
 	// [[CRITICAL FIX]] Clear batch_complete before reusing PBR slot
 	// When slots are reused (batch_seq wraps around), stale batch_complete=1 from
@@ -1068,106 +1115,152 @@ std::function<void(void*, size_t)> Topic::CorfuOrder3GetCXLBuffer(
 	BatchHeader* batch_header_log = reinterpret_cast<BatchHeader*>(batch_headers_);
 
 	// Allocate log space at offset assigned by CORFU sequencer
-	log = reinterpret_cast<void*>(log_addr_.load() + batch_header.log_idx);
+	size_t log_offset = batch_header.log_idx;
+	// [[PHASE_8]] Bounds check: ensure log_idx is within the allocated log region
+	// Max log size is 128GB (hardcoded for now, should be from config)
+	if (log_offset >= (128ULL << 30)) {
+		LOG(ERROR) << "CORFU Order 3: log_idx " << log_offset << " out of bounds!";
+		return nullptr;
+	}
+	log = reinterpret_cast<void*>(log_addr_.load() + log_offset);
 
 	// Check for segment boundary issues
 	CheckSegmentBoundary(log, msg_size, segment_metadata);
 
 	// Store batch metadata in CXL batch header ring
-	// *** CRITICAL FIX: Preserve total_order from publisher! ***
-	batch_header_log[batch_header.batch_seq].batch_seq = batch_header.batch_seq;
-	batch_header_log[batch_header.batch_seq].total_size = batch_header.total_size;
-	batch_header_log[batch_header.batch_seq].num_msg = batch_header.num_msg;
-	batch_header_log[batch_header.batch_seq].broker_id = broker_id_;
-	batch_header_log[batch_header.batch_seq].ordered = 0;
-	batch_header_log[batch_header.batch_seq].batch_off_to_export = 0;
-	batch_header_log[batch_header.batch_seq].log_idx = static_cast<size_t>(
+	batch_header_log[slot_idx].batch_seq = batch_header.batch_seq;
+	batch_header_log[slot_idx].total_size = batch_header.total_size;
+	batch_header_log[slot_idx].num_msg = batch_header.num_msg;
+	batch_header_log[slot_idx].broker_id = broker_id_;
+	batch_header_log[slot_idx].ordered = 0;
+	batch_header_log[slot_idx].batch_off_to_export = 0;
+	batch_header_log[slot_idx].log_idx = static_cast<size_t>(
 		reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_));
-	batch_header_log[batch_header.batch_seq].total_order = batch_header.total_order;  // CRITICAL!
-
-	// [TEST4.1] Verify total_order is saved
-	VLOG(1) << "[TEST4.1] SAVED total_order=" << batch_header.total_order
-	        << " for batch_seq=" << batch_header.batch_seq
-	        << " (broker_id=" << broker_id_ << ")";
+	batch_header_log[slot_idx].total_order = batch_header.total_order;
+	batch_header_log[slot_idx].pbr_absolute_index = pbr_idx;
 
 	// Flush batch header to CXL
-	CXL::flush_cacheline(&batch_header_log[batch_header.batch_seq]);
+	CXL::flush_cacheline(&batch_header_log[slot_idx]);
 	CXL::store_fence();
 
-	// Return replication callback
-	return [this, batch_header, log, batch_header_location](void* log_ptr, size_t /*placeholder*/) {
-		BatchHeader* batch_header_log = reinterpret_cast<BatchHeader*>(batch_headers_);
+	// [[PHASE_5]] Offload callback work to thread pool to avoid NM starvation.
+	return [this, batch_header, slot_idx, pbr_idx, log, batch_header_location](void* log_ptr, size_t size) {
+		CorfuCallbackTask task = {
+			.callback = [this, batch_header, slot_idx, pbr_idx, log, batch_header_location](void* /*l*/, size_t /*s*/) {
+				BatchHeader* batch_header_log = reinterpret_cast<BatchHeader*>(batch_headers_);
 
-		// Keep header pointer for later use (replication tracking needs logical_offset)
-		MessageHeader *header = reinterpret_cast<MessageHeader*>(log);
+				// Keep header pointer for later use (replication tracking needs logical_offset)
+				MessageHeader *header = reinterpret_cast<MessageHeader*>(log);
 
-		// [[CORFU_ORDER3_FIX]] Wait for NetworkManager to set batch_complete flag
-		// This is more reliable than polling next_msg_diff because NetworkManager
-		// explicitly flushes batch_complete to CXL after writing all messages
-		const int MAX_SPINS = 10000000;  // ~10ms timeout at 1GHz
-		int spin_count = 0;
+				// Wait for NetworkManager to set batch_complete flag
+				// This is more reliable than polling next_msg_diff because NetworkManager
+				// explicitly flushes batch_complete to CXL after writing all messages
+				const int MAX_SPINS = 10000000;  // ~10ms timeout at 1GHz
+				int spin_count = 0;
 
-		while (spin_count < MAX_SPINS) {
-			// Flush cacheline to see NetworkManager's batch_complete write
-			CXL::flush_cacheline(batch_header_location);
-			CXL::load_fence();
+				while (spin_count < MAX_SPINS) {
+					// Only flush cacheline periodically to avoid CXL bus storm (Phase 2 fix)
+					if (spin_count % 1000 == 0) {
+						CXL::flush_cacheline(batch_header_location);
+						CXL::load_fence();
+					}
 
-			if (__atomic_load_n(&batch_header_location->batch_complete, __ATOMIC_ACQUIRE) == 1) {
-				break;  // Batch complete
-			}
+					if (__atomic_load_n(&batch_header_location->batch_complete, __ATOMIC_ACQUIRE) == 1) {
+						break;  // Batch complete
+					}
 
-			CXL::cpu_pause();
-			spin_count++;
-		}
-
-		if (__atomic_load_n(&batch_header_location->batch_complete, __ATOMIC_ACQUIRE) != 1) {
-			LOG(ERROR) << "CORFU Order 3: Batch completion timeout after " << spin_count
-			           << " spins (batch_seq=" << batch_header.batch_seq << ")";
-			return;
-		}
-
-		// Handle replication if needed
-		if (replication_factor_ > 0 && corfu_replication_client_) {
-			corfu_replication_client_->ReplicateData(
-				batch_header.log_idx,
-				batch_header.total_size,
-				log
-			);
-
-			// Mark replication done for all replicas
-			size_t last_offset = header->logical_offset + batch_header.num_msg - 1;
-			for (int i = 0; i < replication_factor_; i++) {
-				int num_brokers = get_num_brokers_callback_();
-				int b = (broker_id_ + num_brokers - i) % num_brokers;
-
-				if (tinode_->replicate_tinode) {
-					replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+					CXL::cpu_pause();
+					spin_count++;
 				}
-				tinode_->offsets[b].replication_done[broker_id_] = last_offset;
-			}
 
-			// Flush replication_done updates to CXL
-			CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].replication_done)));
-			CXL::store_fence();
-		}
+				if (__atomic_load_n(&batch_header_location->batch_complete, __ATOMIC_ACQUIRE) != 1) {
+					LOG(ERROR) << "CORFU Order 3: Batch completion timeout after " << spin_count
+					           << " spins (batch_seq=" << batch_header.batch_seq << ")";
+					return;
+				}
 
-		// Update tinode.ordered to track highest total_order replicated
-		// FIXED: Use actual total_order range, not just count
-		{
-			absl::MutexLock lock(&mutex_);
-			size_t batch_max_order = batch_header.total_order + batch_header.num_msg - 1;
-			size_t current_ordered = __atomic_load_n(&tinode_->offsets[broker_id_].ordered, __ATOMIC_ACQUIRE);
+				// Handle replication if needed
+				if (replication_factor_ > 0 && corfu_replication_client_) {
+					corfu_replication_client_->ReplicateData(
+						batch_header.log_idx,
+						batch_header.total_size,
+						log
+					);
 
-			if (batch_max_order > current_ordered) {
-				__atomic_store_n(&tinode_->offsets[broker_id_].ordered, batch_max_order, __ATOMIC_RELEASE);
-			}
-		}
+					// Mark replication done for all replicas
+					size_t last_offset = header->logical_offset + batch_header.num_msg - 1;
+					for (int i = 0; i < replication_factor_; i++) {
+						int num_brokers = get_num_brokers_callback_();
+						int b = (broker_id_ + num_brokers - i) % num_brokers;
 
-		// Mark batch as ordered
-		batch_header_log[batch_header.batch_seq].ordered = 1;
-		CXL::flush_cacheline(&batch_header_log[batch_header.batch_seq]);
+						if (tinode_->replicate_tinode) {
+							replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+						}
+						tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+					}
+
+					// Flush replication_done updates to CXL
+					CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].replication_done)));
+					CXL::store_fence();
+				}
+
+				// Update tinode.ordered to track how many messages this broker has successfully processed.
+				// The Publisher's AckThread expects a cumulative count of messages per broker, not global total_order.
+				// Use atomic fetch_add instead of mutex — this is a simple cumulative counter and the mutex
+				// was serializing all ACK progress for the broker (P7 in corfu_problems.md).
+				__atomic_fetch_add(
+					const_cast<uint64_t*>(&tinode_->offsets[broker_id_].ordered),
+					static_cast<uint64_t>(batch_header.num_msg), __ATOMIC_RELEASE);
+				CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered)));
+				CXL::store_fence();
+
+		// Mark batch as ordered (use slot_idx, not batch_seq)
+		batch_header_log[slot_idx].ordered = 1;
+		CXL::flush_cacheline(&batch_header_log[slot_idx]);
 		CXL::store_fence();
+
+		// [[PHASE_8]] Push to from-hold export queue for subscriber visibility.
+		// Replaces the lock-free ring to avoid deadlock when no subscriber consumes.
+		{
+			absl::MutexLock lock(&hold_export_queues_[broker_id_].mu);
+			hold_export_queues_[broker_id_].q.push_back({
+				.log_idx = batch_header.log_idx,
+				.batch_size = batch_header.total_size,
+				.total_order = batch_header.total_order,
+				.num_messages = batch_header.num_msg
+			});
+		}
+
+				// [[CORFU_ORDER3_CV_FIX]] Advance CompletionVector so subscriber can export batches.
+				// Order 5 has Sequencer advance CV; Order 3 has no Sequencer—we advance here when batch completes.
+				// [[PHASE_7]] Use contiguous advance to ensure monotonicity under out-of-order completion.
+				size_t cumulative = tinode_->offsets[broker_id_].ordered;
+				auto& ring = *pbr_completion_rings_[broker_id_];
+				size_t ring_idx = pbr_idx % kPBRCompletionRingSize;
+				ring[ring_idx].cumulative_msg_count = cumulative;
+				ring[ring_idx].completed.store(true, std::memory_order_release);
+				
+				AdvanceCVContiguous(broker_id_);
+			},
+			.log_ptr = log_ptr,
+			.size = size
+		};
+		while (!corfu_callback_queue_.write(std::move(task))) {
+			std::this_thread::yield();
+		}
 	};
+}
+
+void Topic::CorfuCallbackWorker() {
+	while (!stop_threads_) {
+		CorfuCallbackTask task;
+		if (corfu_callback_queue_.read(task)) {
+			task.callback(task.log_ptr, task.size);
+		} else {
+			std::this_thread::yield();
+		}
+	}
 }
 
 std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(
@@ -1820,6 +1913,7 @@ bool Topic::PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader
 	if (!batch_header_location) return false;
 
 	BatchHeader published = batch_header;
+	// [[CORFU_ORDER3]] pbr_absolute_index already set in CorfuOrder3GetCXLBuffer (before recv).
 	// Keep CLAIMED set after publish so scanners never misclassify a published slot as empty tail
 	// if num_msg visibility lags on non-coherent CXL.
 	published.flags |= kBatchHeaderFlagClaimed;

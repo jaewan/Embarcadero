@@ -86,8 +86,7 @@ bool CorfuReplicationClient::ReplicateData(size_t offset, size_t size, void* dat
 
 	// Create request - no shared state accessed here
 	corfureplication::CorfuReplicationRequest request;
-	request.set_offset(offset);
-	request.set_data(std::string(static_cast<char*>(data), size));
+	request.set_log_idx(offset);
 	request.set_size(size);
 
 	// Create response object - local to this call

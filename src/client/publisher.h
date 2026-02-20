@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -23,8 +24,8 @@ class Publisher {
 	struct alignas(64) BrokerStats {
 		std::atomic<size_t> sent_bytes{0};
 		std::atomic<size_t> sent_messages{0};
-		size_t acked_messages{0};  // Not atomic - only updated by ACK thread
-		char _padding[64 - 2 * sizeof(std::atomic<size_t>) - sizeof(size_t)];
+		std::atomic<size_t> acked_messages{0};
+		char _padding[64 - 3 * sizeof(std::atomic<size_t>)];
 	};
 
 	/**
@@ -151,6 +152,11 @@ class Publisher {
 		QueueBuffer pubQue_;
 		SequencerType seq_type_;
 		std::unique_ptr<CorfuSequencerClient> corfu_client_;
+		// [[CORFU]] Per-broker batch sequence for GetTotalOrder; sequencer expects 0,1,2,... per (client,broker)
+		static constexpr int kMaxCorfuBrokers = 32;
+		std::array<std::atomic<size_t>, kMaxCorfuBrokers> corfu_batch_seq_per_broker_{};
+		// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker to eliminate out-of-order retries (Phase 2C).
+		std::array<std::mutex, kMaxCorfuBrokers> corfu_seq_per_broker_lock_{};
 
 	// [[THREAD_SAFETY_FIX]] Atomic variables with relaxed ordering for minimal overhead thread coordination
 	// [[PERF]] Cache-line separate from producer-hot data so consumers don't bounce cache lines
@@ -169,6 +175,7 @@ class Publisher {
 		std::atomic<size_t> total_messages_sent_{0};  // Sum of num_msg over all fully-sent batches
 		std::atomic<size_t> total_batches_attempted_{0};
 		std::atomic<size_t> total_batches_failed_{0};
+		std::atomic<size_t> zero_batch_publish_threads_{0};
 		// Used to measure real-time throughput during failure benchmark
 		std::atomic<size_t> total_sent_bytes_{0};
 		// [[CACHE_LINE_FIX]] Cache-line aligned per-broker statistics to prevent false sharing
@@ -233,10 +240,11 @@ class Publisher {
 		// When true, PublishThread updates total_batches_attempted_ (for ACK timeout log). Set from EMBARCADERO_ACK_TIMEOUT_DEBUG in Init().
 		bool enable_batch_attempted_for_timeout_log_{false};
 
-#ifdef COLLECT_LATENCY_STATS
+	#ifdef COLLECT_LATENCY_STATS
 		struct BatchSendRecord {
 			size_t end_count;
 			std::chrono::steady_clock::time_point sent_time;
+			std::chrono::steady_clock::time_point submit_time;
 		};
 
 		// [[threading: PublishThread writes, EpollAckThread reads]] Protected by per-broker mutex.
@@ -246,14 +254,19 @@ class Publisher {
 
 #ifdef COLLECT_LATENCY_STATS
 		// [[threading: EpollAckThread writes, Poll reads]] Protected by publish_latency_mutex_.
-		std::vector<long long> publish_latencies_us_;
+		std::vector<long long> publish_send_to_ack_latencies_us_;
+		std::vector<long long> publish_submit_to_ack_latencies_us_;
 		std::mutex publish_latency_mutex_;
+		std::atomic<size_t> publish_send_to_ack_batch_samples_recorded_{0};
+		std::atomic<size_t> publish_submit_to_ack_batch_samples_recorded_{0};
+		std::atomic<size_t> publish_latency_out_of_order_inserts_{0};
+		std::atomic<size_t> publish_submit_time_missing_{0};
 		bool record_results_{false};
 
-		void RecordPublishSend(int broker_id, size_t end_count);
+		void RecordPublishSend(int broker_id, size_t end_count, const std::chrono::steady_clock::time_point& submit_time);
 		void ProcessPublishAckLatency(int broker_id, size_t acked_msg);
 		void WritePublishLatencyResults();
-#endif
+	#endif
 
 		/**
 		 * Thread for handling acknowledgements using epoll
