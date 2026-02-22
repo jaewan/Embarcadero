@@ -69,6 +69,26 @@ static bool ShouldEnableOrder0Inline() {
 	return enabled;
 }
 
+static bool ShouldEnableOrder5Trace() {
+	static const bool enabled = []() {
+		const char* env = std::getenv("EMBARCADERO_ORDER5_TRACE");
+		if (!env) return false;
+		if (std::strcmp(env, "0") == 0 ||
+		    std::strcmp(env, "false") == 0 ||
+		    std::strcmp(env, "FALSE") == 0 ||
+		    std::strcmp(env, "no") == 0 ||
+		    std::strcmp(env, "NO") == 0) {
+			return false;
+		}
+		return std::strcmp(env, "1") == 0 ||
+		       std::strcmp(env, "true") == 0 ||
+		       std::strcmp(env, "TRUE") == 0 ||
+		       std::strcmp(env, "yes") == 0 ||
+		       std::strcmp(env, "YES") == 0;
+	}();
+	return enabled;
+}
+
 /**
  * Closes socket and epoll file descriptors safely
  */
@@ -125,12 +145,24 @@ static constexpr int kMaxPBRRetries = 20;           // WAIT_PBR_SLOT: recovery a
 
 // [[Phase 3.2]] written is cumulative (monotonic); fetch_add is sufficient. CXL layout uses
 // volatile size_t; __atomic_fetch_add is the correct way to get atomic RMW (GCC/clang extension).
-void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, size_t logical_offset, uint32_t num_msg) {
-	(void)logical_offset;
+void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, uint64_t written_addr, uint32_t num_msg) {
 	if (!tinode) return;
 	volatile size_t* written_ptr = &tinode->offsets[broker_id_].written;
 	__atomic_fetch_add(reinterpret_cast<size_t*>(const_cast<size_t*>(written_ptr)), num_msg, __ATOMIC_RELEASE);
+
+	// Track highest visible write address monotonically to avoid regressions with concurrent recv threads.
+	volatile unsigned long long* written_addr_ptr = &tinode->offsets[broker_id_].written_addr;
+	unsigned long long cur_addr = __atomic_load_n(
+		const_cast<unsigned long long*>(written_addr_ptr), __ATOMIC_ACQUIRE);
+	const unsigned long long target_addr = static_cast<unsigned long long>(written_addr);
+	while (target_addr > cur_addr &&
+	       !__atomic_compare_exchange_n(const_cast<unsigned long long*>(written_addr_ptr),
+	                                   &cur_addr, target_addr, false,
+	                                   __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+	}
+
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
+	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written_addr));
 	CXL::store_fence();  // Required for CXL visibility; reader (AckThread) must see updated written
 }
 
@@ -1168,14 +1200,14 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-		// Optional ORDER=0 collaborative frontier advancement (off by default).
-		if (order0_inline_enabled && seq_type == EMBARCADERO && tinode && tinode->order == 0) {
-			TryAdvanceWrittenFrontier(handshake.topic, 0, batch_header.num_msg, tinode);
+		// ORDER=0 ACK cursor owner: network ingest path is the single source of truth for written.
+		if (seq_type == EMBARCADERO && tinode && tinode->order == 0) {
+			const uint64_t batch_end_addr = static_cast<uint64_t>(batch_header.log_idx + batch_header.total_size);
+			UpdateWrittenForOrder0(tinode, batch_end_addr, batch_header.num_msg);
 		}
-
-		// [[ORDER_0_ACK_RACE_FIX]] Track the highest logical offset where batch_complete=1 was set.
-		// Used on connection close to advance written without waiting for DelegationThread.
-		if (topic_ptr) {
+		// ORDER=4 only: retain close-time tail fallback tracking for legacy order-4 export path.
+		// ORDER=5 must keep ACK and export frontiers coupled (sequencer-owned), so do not track here.
+		if (topic_ptr && seq_type == EMBARCADERO && tinode && tinode->order == 4) {
 			size_t batch_end_offset = logical_offset + batch_header.num_msg;
 			topic_ptr->TrackBatchComplete(batch_end_offset);
 		}
@@ -1204,9 +1236,11 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-	// [[ORDER_0_ACK_RACE_FIX]] When publisher closes, directly update written to last_batch_complete_offset.
-	// This avoids race with DelegationThread (no message chain walk needed).
-	{
+	// ORDER=4 only: keep historical close-time tail fallback used by legacy order-4 path.
+	// ORDER=0 stays single-writer in ingest path.
+	// ORDER=5 must not use close-time override, otherwise ACK can outrun export frontier.
+	TInode* topic_tinode = reinterpret_cast<TInode*>(cxl_manager_->GetTInode(handshake.topic));
+	if (topic_tinode && topic_tinode->seq_type == EMBARCADERO && topic_tinode->order == 4) {
 		Topic* topic_final = cxl_manager_->GetTopicPtr(handshake.topic);
 		if (topic_final) {
 			topic_final->UpdateWrittenToLastComplete();
@@ -1353,14 +1387,14 @@ void NetworkManager::SubscribeNetworkThread(
 		"header_version field offset must match wire::BatchMetadata");
 
 	// PERFORMANCE OPTIMIZATION: Cache state pointer to avoid repeated vector lookups
-	std::unique_ptr<SubscriberState>* cached_state_ptr = nullptr;
+	SubscriberState* cached_state = nullptr;
 	{
 		absl::MutexLock lock(&sub_mu_);
 		if (static_cast<size_t>(connection_id) >= sub_state_.size() || !sub_state_[connection_id]) {
 			LOG(ERROR) << "SubscribeNetworkThread: No state found for connection_id " << connection_id;
 			return;
 		}
-		cached_state_ptr = &sub_state_[connection_id];
+		cached_state = sub_state_[connection_id].get();
 	}
 
 	while (!stop_threads_) {
@@ -1380,11 +1414,11 @@ void NetworkManager::SubscribeNetworkThread(
 			// Get new messages from CXL manager. Narrow mutex: copy-out, call without lock, copy-in.
 			size_t local_offset;
 			{
-				absl::MutexLock lock(&(*cached_state_ptr)->mu);
-				local_offset = (*cached_state_ptr)->last_offset;
+				absl::MutexLock lock(&cached_state->mu);
+				local_offset = cached_state->last_offset;
 			}
-			// Order 2 (total order) and Order 5 (strong order): use batch metadata so subscriber gets total_order
-			if (order == 5 || order == 2) {
+			// Order 2 (total order), Order 3 (Corfu), and Order 5 (strong order): use batch metadata so subscriber gets total_order
+			if (order == 5 || order == 2 || order == 3) {
 				size_t batch_total_order = 0;
 				uint32_t num_messages = 0;
 				if (!topic_manager_->GetBatchToExportWithMetadata(
@@ -1398,12 +1432,12 @@ void NetworkManager::SubscribeNetworkThread(
 					continue;
 				}
 				{
-					absl::MutexLock lock(&(*cached_state_ptr)->mu);
-					(*cached_state_ptr)->last_offset = local_offset;
+					absl::MutexLock lock(&cached_state->mu);
+					cached_state->last_offset = local_offset;
 				}
 				batch_meta.batch_total_order = batch_total_order;
 				batch_meta.num_messages = num_messages;
-				batch_meta.header_version = ((order == 5 || order == 2) && HeaderUtils::ShouldUseBlogHeader()) ? 2 : 1;
+				batch_meta.header_version = ((order == 5 || order == 2 || order == 3) && HeaderUtils::ShouldUseBlogHeader()) ? 2 : 1;
 				batch_meta.flags = 0;
 			} else if (order > 0) {
 				if (!topic_manager_->GetBatchToExport(
@@ -1415,17 +1449,17 @@ void NetworkManager::SubscribeNetworkThread(
 					continue;
 				}
 				{
-					absl::MutexLock lock(&(*cached_state_ptr)->mu);
-					(*cached_state_ptr)->last_offset = local_offset;
+					absl::MutexLock lock(&cached_state->mu);
+					cached_state->last_offset = local_offset;
 				}
 			} else {
 			// Order 0: copy-out, call GetMessageAddr without holding mutex (it may spin on next_msg_diff), then copy-in
 			size_t local_offset;
 			void* local_addr = nullptr;
 			{
-				absl::MutexLock lock(&(*cached_state_ptr)->mu);
-				local_offset = (*cached_state_ptr)->last_offset;
-				local_addr = (*cached_state_ptr)->last_addr;
+				absl::MutexLock lock(&cached_state->mu);
+				local_offset = cached_state->last_offset;
+				local_addr = cached_state->last_addr;
 			}
 			if (!topic_manager_->GetMessageAddr(topic, local_offset, local_addr, msg, messages_size)) {
 				std::this_thread::yield();
@@ -1444,8 +1478,8 @@ void NetworkManager::SubscribeNetworkThread(
 			continue;
 		}
 
-		// Order 2 and Order 5: Send batch metadata first (total_order, num_messages) for order-aware consume
-		if (order == 5 || order == 2) {
+		// Order 2, Order 3, and Order 5: Send batch metadata first (total_order, num_messages) for order-aware consume
+		if (order == 5 || order == 2 || order == 3) {
 			// batch_meta is already populated by GetBatchToExportWithMetadata
 			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL);
 			if (meta_sent != sizeof(batch_meta)) {
@@ -1468,9 +1502,9 @@ void NetworkManager::SubscribeNetworkThread(
 
 		// [[BUG_FIX: STATE_AFTER_SEND]] Advance state only after successful send (Order 0).
 		if (order == 0 && order0_pending_offset != static_cast<size_t>(-1)) {
-			absl::MutexLock lock(&(*cached_state_ptr)->mu);
-			(*cached_state_ptr)->last_offset = order0_pending_offset;
-			(*cached_state_ptr)->last_addr = order0_pending_addr;
+			absl::MutexLock lock(&cached_state->mu);
+			cached_state->last_offset = order0_pending_offset;
+			cached_state->last_addr = order0_pending_addr;
 		}
 	}
 }
@@ -1560,40 +1594,11 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 	bool needs_expensive_check = false;
 
 	if (ack_level == 2 && replication_factor > 0) {
-		if (seq_type == EMBARCADERO) {
-			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
-				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
-			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
-
-			// Fast read without flush/fence
-			uint64_t fast_completed = my_cv_entry->completed_logical_offset.load(std::memory_order_relaxed);
-			if (fast_completed != 0) {
-				fast_read_value = fast_completed;
-			} else {
-				uint64_t fast_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_relaxed);
-				if (fast_pbr_index != static_cast<uint64_t>(-1)) {
-					fast_read_value = 0;
-				} else {
-					fast_read_value = (size_t)-1;
-				}
-			}
-		} else {
-			// Legacy path for non-EMBARCADERO: check replication_done array
-			size_t min_val = std::numeric_limits<size_t>::max();
-			for (int i = 0; i < replication_factor; i++) {
-				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
-				size_t val = tinode->offsets[b].replication_done[broker_id_];
-				if (min_val > val) min_val = val;
-			}
-			if (min_val != std::numeric_limits<size_t>::max()) {
-				fast_read_value = min_val + 1;  // Convert to message count
-			}
-		}
-	} else if (ack_level == 1 && (order == 4 || order == 5) && seq_type == EMBARCADERO) {
 		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
 
+		// Fast read without flush/fence
 		uint64_t fast_completed = my_cv_entry->completed_logical_offset.load(std::memory_order_relaxed);
 		if (fast_completed != 0) {
 			fast_read_value = fast_completed;
@@ -1604,6 +1609,19 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 			} else {
 				fast_read_value = (size_t)-1;
 			}
+		}
+	} else if (ack_level == 1 && seq_type == EMBARCADERO && (order == 4 || order == 5)) {
+		// ORDER=4/5 ACK source is CV cumulative frontier (sequencer-owned, head-advanced).
+		// Followers must not ack from local ordered/written, which can lag or stay zero.
+		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
+		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
+		uint64_t fast_completed = my_cv_entry->completed_logical_offset.load(std::memory_order_relaxed);
+		if (fast_completed != 0) {
+			fast_read_value = fast_completed;
+		} else {
+			uint64_t fast_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_relaxed);
+			fast_read_value = (fast_pbr_index != static_cast<uint64_t>(-1)) ? 0 : static_cast<size_t>(-1);
 		}
 	} else if (replication_factor > 0) {
 		if (ack_level == 1) {
@@ -1663,6 +1681,26 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	const int num_brokers = get_num_brokers_callback_();
 	size_t min = std::numeric_limits<size_t>::max();
 
+	// ORDER=4/5 ACK level 1: ack from CV cumulative frontier (sequencer-owned).
+	if (ack_level == 1 && seq_type == EMBARCADERO && (order == 4 || order == 5)) {
+		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
+		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
+
+		CXL::flush_cacheline(my_cv_entry);
+		CXL::full_fence();
+
+		uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
+		if (completed_logical_offset == 0) {
+			uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
+			if (completed_pbr_index == static_cast<uint64_t>(-1)) {
+				return static_cast<size_t>(-1);
+			}
+			return 0;
+		}
+		return completed_logical_offset;
+	}
+
 	// Handle ack_level 2 explicitly (ack only after replication)
 	if (ack_level == 2 && replication_factor > 0) {
 		// ACK Level 2: Only acknowledge after full replication completes
@@ -1671,75 +1709,29 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		// - Durability is "within periodic sync window" (default: 250ms or 64MiB)
 		// - This means ack_level=2 provides eventual durability, not immediate fsync durability
 
-		// [[PHASE_2]] Use CompletionVector instead of replication_done array (design §3.4).
-		// For ack_level=2 the tail replica advances CV after replication; max semantics with sequencer.
-		// See docs/COMPLETION_VECTOR_ACK_LEVELS.md.
-		if (seq_type == EMBARCADERO) {
-			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
-				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
-			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
-
-			// Read CV (tail replica updates after replication; sequencer may also advance for ack_level=1)
-			// [[CXL_VISIBILITY]] full_fence after flush so read sees CXL; LFENCE does not order CLFLUSHOPT.
-			CXL::flush_cacheline(my_cv_entry);
-			CXL::full_fence();
-
-			// [[ACK_OPTIMIZATION]] Read cumulative message count directly from CV
-			uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
-
-			// Sentinel check via pbr_head
-			if (completed_logical_offset == 0) {
-				uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
-				if (completed_pbr_index == static_cast<uint64_t>(-1)) {
-					return (size_t)-1;  // No replication progress yet
-				}
-				return 0;
-			}
-
-			// [[ACK_LEVEL_2_COUNT_SEMANTICS]] - Client expects message COUNT.
-			return completed_logical_offset;
-		}
-
-		// [[PHASE_1]] Legacy path: Poll replication_done array for non-EMBARCADERO sequencers
-		// [[PERF: Single loop - invalidate then read same broker]] (was 2*replication_factor iterations)
-		// Replication threads (DiskManager) write replication_done and flush; AckThread reads it.
-		// On non-coherent CXL, reader must invalidate cache to observe those writes.
-		size_t r[replication_factor];
-		for (int i = 0; i < replication_factor; i++) {
-			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
-			volatile uint64_t* rep_done_ptr = &tinode->offsets[b].replication_done[broker_id_];
-			CXL::flush_cacheline(const_cast<const void*>(
-				reinterpret_cast<const volatile void*>(rep_done_ptr)));
-			CXL::full_fence();  // Ensure invalidation completes before read (CXL visibility)
-			r[i] = *rep_done_ptr;  // Read after invalidation
-			if (min > r[i]) min = r[i];
-		}
-		// [[ACK_LEVEL_2_COUNT_SEMANTICS]] - Client expects message COUNT, not last offset.
-		// replication_done stores last_logical_offset (0-based). For N messages, last_offset = N-1.
-		if (min == std::numeric_limits<size_t>::max()) {
-			return (size_t)-1;  // No replication progress yet
-		}
-		return min + 1;  // Convert last_offset (0-based) to message count
-	}
-
-	// [[B0_ACK_FIX]] ACK Level 1 + ORDER=4/5 + EMBARCADERO: Use CompletionVector REGARDLESS of replication_factor.
-	// When replication_factor==0 we were taking the else branch and returning tinode->offsets[0].ordered,
-	// which has same-process visibility bug (B0 on head never sees sequencer's updates). CV path fixes that.
-	if (ack_level == 1 && (order == 4 || order == 5) && seq_type == EMBARCADERO) {
+		// CV is the sole source of replication ACK progress. Tail replica advances it on contiguous frontier.
 		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
-		CXL::flush_cacheline(my_cv_entry);
-		CXL::full_fence();  // CXL visibility: MFENCE orders CLFLUSHOPT completion before read
 
+		// Read CV (tail replica updates after replication; sequencer may also advance for ack_level=1)
+		// [[CXL_VISIBILITY]] full_fence after flush so read sees CXL; LFENCE does not order CLFLUSHOPT.
+		CXL::flush_cacheline(my_cv_entry);
+		CXL::full_fence();
+
+		// [[ACK_OPTIMIZATION]] Read cumulative message count directly from CV
 		uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
+
+		// Sentinel check via pbr_head
 		if (completed_logical_offset == 0) {
 			uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
 			if (completed_pbr_index == static_cast<uint64_t>(-1)) {
-				return (size_t)-1;
+				return (size_t)-1;  // No replication progress yet
 			}
 			return 0;
 		}
+
+		// [[ACK_LEVEL_2_COUNT_SEMANTICS]] - Client expects cumulative message COUNT.
 		return completed_logical_offset;
 	}
 
@@ -1941,11 +1933,23 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 
 	size_t next_to_ack_offset = 0;
 	size_t last_known_ack = 0;  // Cache for fast-path optimization
+	size_t last_trace_sent_ack = static_cast<size_t>(-1);
+	TInode* trace_tinode = nullptr;
+	bool trace_order5_ack = false;
+	if (ShouldEnableOrder5Trace()) {
+		trace_tinode = (TInode*)cxl_manager_->GetTInode(topic.c_str());
+		if (trace_tinode && trace_tinode->order == 5 &&
+		    trace_tinode->seq_type == EMBARCADERO && ack_level == 1) {
+			trace_order5_ack = true;
+		}
+	}
 
 	consecutive_timeouts = 0;
 	consecutive_errors = 0;
 	size_t consecutive_ack_stalls = 0;
 	size_t expensive_checks_since_last_ack = 0;
+	size_t fast_polls_without_full_check = 0;
+	constexpr size_t kMaxFastPollsBeforeFullCheck = 256;
 
 		while (!stop_threads_) {
 		// [[PERF_OPTIMIZATION]] Two-phase ACK checking to avoid CXL bus storm:
@@ -1956,13 +1960,16 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 
 		// Fast-path: Read without flush/fence to detect potential changes.
 		auto [fast_read_value, needs_expensive_check] = GetOffsetToAckFast(topic.c_str(), ack_level, last_known_ack);
-		if (needs_expensive_check) {
+		const bool force_full_check = (fast_polls_without_full_check >= kMaxFastPollsBeforeFullCheck);
+		if (needs_expensive_check || force_full_check) {
 			// Value appears to have changed - do expensive check with proper CXL operations.
 			current_ack = GetOffsetToAck(topic.c_str(), ack_level);
 			expensive_checks_since_last_ack++;
+			fast_polls_without_full_check = 0;
 		} else {
 			// No change detected - use fast read value.
 			current_ack = fast_read_value;
+			fast_polls_without_full_check++;
 		}
 
 		if (current_ack != (size_t)-1 && next_to_ack_offset <= current_ack) {
@@ -1993,6 +2000,35 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		size_t ack = current_ack;
 
 			if(ack != (size_t)-1 && next_to_ack_offset <= ack){
+				if (trace_order5_ack && ack != last_trace_sent_ack) {
+					CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+						reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
+					CompletionVectorEntry* my_cv = &cv[broker_id_];
+					CXL::flush_cacheline(my_cv);
+					CXL::full_fence();
+					uint64_t cv_logical = my_cv->completed_logical_offset.load(std::memory_order_acquire);
+					uint64_t cv_pbr = my_cv->completed_pbr_head.load(std::memory_order_acquire);
+					CXL::flush_cacheline(const_cast<const void*>(
+						reinterpret_cast<const volatile void*>(&trace_tinode->offsets[broker_id_])));
+					CXL::full_fence();
+					size_t ordered = trace_tinode->offsets[broker_id_].ordered;
+					size_t consumed = trace_tinode->offsets[broker_id_].batch_headers_consumed_through;
+					size_t written = trace_tinode->offsets[broker_id_].written;
+					LOG(INFO) << "[ORDER5_TRACE_ACK B" << broker_id_ << "]"
+					          << " ack_send=" << ack
+					          << " cv_logical=" << cv_logical
+					          << " cv_pbr_head=" << cv_pbr
+					          << " tinode_ordered=" << ordered
+					          << " tinode_written=" << written
+					          << " consumed_through=" << consumed
+					          << " next_to_ack_offset=" << next_to_ack_offset;
+					if (ack > ordered) {
+						LOG(ERROR) << "[ORDER5_TRACE_ACK_INVARIANT B" << broker_id_ << "]"
+						           << " ack_send=" << ack
+						           << " exceeds tinode_ordered=" << ordered;
+					}
+					last_trace_sent_ack = ack;
+				}
 				next_to_ack_offset = ack + 1;
 				acked_size = 0;
 				// Send offset acknowledgment

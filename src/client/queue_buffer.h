@@ -24,6 +24,10 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#ifdef COLLECT_LATENCY_STATS
+#include <chrono>
+#include <unordered_map>
+#endif
 
 class QueueBuffer {
 public:
@@ -103,6 +107,14 @@ public:
 	 */
 	void ReleaseBatch(void* batch);
 
+#ifdef COLLECT_LATENCY_STATS
+	/**
+	 * Lookup producer-side submit timestamp for a dequeued batch.
+	 * Returns true if timestamp metadata exists.
+	 */
+	bool GetBatchSubmitTime(void* batch, std::chrono::steady_clock::time_point* out_time);
+#endif
+
 private:
 	size_t num_queues_;
 	// Number of queues actually used for round-robin (min(num_queues_, num_consumers)). Avoids pushing to ghost queues.
@@ -146,6 +158,9 @@ private:
 	Embarcadero::BatchHeader* current_batch_{nullptr};
 	size_t current_batch_tail_{0};  // bytes written in current slot (start at sizeof(BatchHeader))
 	size_t current_batch_num_msg_{0};  // message count for current batch (for BatchHeader::num_msg)
+#ifdef COLLECT_LATENCY_STATS
+	std::chrono::steady_clock::time_point current_batch_first_submit_time_{};
+#endif
 
 	// Message header templates (same as Buffer)
 	Embarcadero::MessageHeader header_;
@@ -158,4 +173,9 @@ private:
 	size_t SealCurrentAndAdvance();
 	/** Debug: true iff batch is a slot base in one of our regions (for ReleaseBatch validation). */
 	bool IsValidPoolPointer(void* batch) const;
+
+#ifdef COLLECT_LATENCY_STATS
+	mutable std::mutex batch_submit_time_mutex_;
+	std::unordered_map<void*, std::chrono::steady_clock::time_point> batch_submit_time_;
+#endif
 };

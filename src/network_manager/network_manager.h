@@ -114,8 +114,8 @@ private:
                         size_t& send_limit, size_t zero_copy_send_limit_cached);
     bool IsConnectionAlive(int fd, char* buffer);
 
-    // [[PERF]] Blocking path: update written for Order 0 so ACK path advances
-    void UpdateWrittenForOrder0(TInode* tinode, size_t logical_offset, uint32_t num_msg);
+    // [[PERF]] Order 0 ACK cursor owner: network ingest path updates cumulative message count.
+    void UpdateWrittenForOrder0(TInode* tinode, uint64_t written_addr, uint32_t num_msg);
 
     // Process ORDER=0 batch inline: set per-message metadata.
     // Called by ReqReceive thread immediately after recv() to batch data, while hot in cache.

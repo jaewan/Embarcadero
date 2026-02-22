@@ -149,6 +149,7 @@ class Publisher {
 		std::atomic<int> num_threads_{0};
 		size_t message_size_;
 		size_t queueSize_;  // [[GUARDED_BY: mutex_]] when modified in SubscribeToClusterStatus
+		int order_level_;
 		QueueBuffer pubQue_;
 		SequencerType seq_type_;
 		std::unique_ptr<CorfuSequencerClient> corfu_client_;

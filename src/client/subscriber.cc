@@ -1,11 +1,10 @@
 #include "subscriber.h"
+#include "latency_stats.h"
 #include "../cxl_manager/cxl_datastructure.h"
 #include "../common/wire_formats.h"
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <iomanip>
-#include <numeric>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -478,38 +477,25 @@ void Subscriber::StoreLatency() {
 					memcpy(&send_nanos_since_epoch, payload_ptr, sizeof(long long));
 					std::chrono::steady_clock::time_point send_time{std::chrono::nanoseconds(send_nanos_since_epoch)};
 
-					// 4. Find Approximate Receive Time from recv_log
-					// Find the *first* recv log entry whose end_offset is >= message_end_offset
-					std::chrono::steady_clock::time_point approx_receive_time = recv_log.back().first; // Default to last timestamp if not found earlier
-					bool found_ts = false;
-					for(const auto& log_entry : recv_log) {
-						// CRITICAL ASSUMPTION: Offsets in recv_log correspond to THIS buffer.
-						// This breaks if the log contains offsets from the *other* buffer
-						// unless offsets are absolute across swaps, which they aren't here.
-						// TODO: This correlation logic needs refinement if buffer swaps happened!
-						// For simplicity now, assume log offsets roughly match buffer content offsets,
-						// which is only true if only one buffer was significantly used or swaps were clean.
-
-						// Let's ignore the offset correlation for now as it's complex with swaps,
-						// and just use the timestamp of the *last* recv as a rough upper bound.
-						// A better approach would require storing buffer_idx with log entries
-						// or absolute stream offsets.
-
-						// Correct search:
-						// if (log_entry.second >= message_end_offset_in_buffer) {
-						//      approx_receive_time = log_entry.first;
-						//      found_ts = true;
-						//      break;
-						// }
+					// 4. Find exact receive time from recv_log for this buffer generation.
+					// We parse the final resident bytes in this buffer, so use its current generation.
+					const uint64_t target_generation = conn_ptr->buffer_generation[buf_idx];
+					const RecvLogEntry* matched_entry = nullptr;
+					for (const auto& log_entry : recv_log) {
+						if (log_entry.buffer_idx != buf_idx) continue;
+						if (log_entry.buffer_generation != target_generation) continue;
+						if (log_entry.end_offset >= message_end_offset_in_buffer) {
+							matched_entry = &log_entry;
+							break;
+						}
 					}
-					// Using last timestamp as placeholder due to complexity:
-					approx_receive_time = recv_log.back().first;
-
 
 					// 5. Calculate Latency
-					auto latency_duration = approx_receive_time - send_time;
-					long long latency_micros = std::chrono::duration_cast<std::chrono::microseconds>(latency_duration).count();
-					all_latencies_us.push_back(latency_micros);
+					if (matched_entry != nullptr) {
+						auto latency_duration = matched_entry->receive_time - send_time;
+						long long latency_micros = std::chrono::duration_cast<std::chrono::microseconds>(latency_duration).count();
+						all_latencies_us.push_back(latency_micros);
+					}
 
 					// 6. Advance parse_offset
 					parse_offset += total_message_size;
@@ -524,49 +510,46 @@ void Subscriber::StoreLatency() {
 		LOG(WARNING) << "No latency values could be calculated.";
 		return;
 	}
-
-	size_t count = all_latencies_us.size();
+	if (all_latencies_us.size() != total_messages_parsed) {
+		LOG(WARNING) << "Latency sample mismatch: parsed=" << total_messages_parsed
+		             << " mapped_samples=" << all_latencies_us.size()
+		             << ". Some messages could not be correlated to recv-log entries.";
+	}
 
 	// --- Calculate Statistics ---
-
-	// Sort for Min, Max, Median, Percentiles
+	// Sort once and use a shared percentile policy with publisher stats.
 	std::sort(all_latencies_us.begin(), all_latencies_us.end());
-
-	// Average
-	long double sum = std::accumulate(all_latencies_us.begin(), all_latencies_us.end(), 0.0L);
-	long double avg_us = sum / count;
-
-	long long min_us = all_latencies_us.front();
-	long long max_us = all_latencies_us.back();
-	long long median_us = all_latencies_us[count / 2]; // Simple median
-
-	// Percentiles (e.g., 99th, 99.9th)
-	long long p99_us = all_latencies_us[static_cast<size_t>(std::floor(0.99 * count))];
-	long long p999_us = all_latencies_us[static_cast<size_t>(std::floor(0.999 * count))];
-	// Note: For exact percentile definitions (e.g., nearest rank, interpolation),
-	// you might need a more sophisticated calculation, especially for small counts.
+	const auto summary = Embarcadero::LatencyStats::ComputeSummary(all_latencies_us);
 
 	// --- Log Results ---
-	LOG(INFO) << "Latency Statistics (us):";
-	LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << avg_us;
-	LOG(INFO) << "  Min:     " << min_us;
-	LOG(INFO) << "  Median:  " << median_us;
-	LOG(INFO) << "  99th P:  " << p99_us;
-	LOG(INFO) << "  99.9th P:" << p999_us;
-	LOG(INFO) << "  Max:     " << max_us;
+	LOG(INFO) << "Publish->Deliver Latency Statistics (us):";
+	LOG(INFO) << "  Count:   " << summary.count;
+	LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << summary.average_us;
+	LOG(INFO) << "  Min:     " << summary.min_us;
+	LOG(INFO) << "  P50:     " << summary.p50_us;
+	LOG(INFO) << "  P99:     " << summary.p99_us;
+	LOG(INFO) << "  P99.9:   " << summary.p999_us;
+	LOG(INFO) << "  Max:     " << summary.max_us;
 
 	std::string latency_filename = "latency_stats.csv";
 	std::ofstream latency_file(latency_filename);
 	if (!latency_file.is_open()) {
 		LOG(ERROR) << "Failed to open file for writing: " << latency_filename;
 	} else {
-		latency_file << "Average,Min,Median,p99,p999,Max\n"; 
-		latency_file << std::fixed << std::setprecision(3) << avg_us 
-			<< "," << min_us
-			<< "," << median_us
-			<< "," << p99_us
-			<< "," << p999_us
-			<< "," << max_us << "\n";
+		latency_file << "Average,Min,Median,p90,p95,p99,p999,Max,Count,Metric,Unit,PercentileMethod,Granularity\n";
+		latency_file << std::fixed << std::setprecision(3) << summary.average_us
+			<< "," << summary.min_us
+			<< "," << summary.p50_us
+			<< "," << summary.p90_us
+			<< "," << summary.p95_us
+			<< "," << summary.p99_us
+			<< "," << summary.p999_us
+			<< "," << summary.max_us
+			<< "," << summary.count
+			<< ",publish_to_deliver_latency"
+			<< ",us"
+			<< "," << Embarcadero::LatencyStats::kPercentileMethod
+			<< ",message\n";
 		latency_file.close();
 	}
 
@@ -577,16 +560,17 @@ void Subscriber::StoreLatency() {
 	if (!cdf_file.is_open()) {
 		LOG(ERROR) << "Failed to open file for writing: " << cdf_filename;
 	} else {
-		cdf_file << "Latency_us,CumulativeProbability\n"; // CSV Header
+		cdf_file << "Latency_us,CumulativeProbability,Metric\n"; // CSV Header
 
 		// Iterate through the SORTED latencies
-		for (size_t i = 0; i < count; ++i) {
+		for (size_t i = 0; i < summary.count; ++i) {
 			long long current_latency = all_latencies_us[i];
 			// Cumulative probability = (number of points <= current_latency) / total_points
 			// Since it's sorted, this is (index + 1) / count
-			double cumulative_probability = static_cast<double>(i + 1) / count;
+			double cumulative_probability = static_cast<double>(i + 1) / summary.count;
 
-			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability << "\n";
+			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
+			         << ",publish_to_deliver_latency\n";
 		}
 		cdf_file.close();
 	}
@@ -596,12 +580,12 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 	VLOG(5) << "Waiting to receive " << total_msg_size << " bytes of data with message size " << msg_size;
 
 	// Calculate expected total data size based on padded message size
-	msg_size = ((msg_size + 64 - 1) / 64) * 64;
-	size_t num_msg = total_msg_size / msg_size;
-	size_t total_data_size = num_msg * (sizeof(Embarcadero::MessageHeader) + msg_size);
+	const size_t num_msg = total_msg_size / msg_size;
+	const size_t padded_msg_size = ((msg_size + 64 - 1) / 64) * 64;
+	size_t total_data_size = num_msg * (sizeof(Embarcadero::MessageHeader) + padded_msg_size);
 
 	VLOG(5) << "Subscriber::Poll - Expected: " << total_data_size << " bytes (" << num_msg << " messages), "
-	          << "padded_msg_size=" << msg_size << ", header_size=" << sizeof(Embarcadero::MessageHeader);
+	          << "padded_msg_size=" << padded_msg_size << ", header_size=" << sizeof(Embarcadero::MessageHeader);
 
 	constexpr int POLL_TIMEOUT_SEC = 15;  // 15s to allow full drain for Order 0 subscribe (10GB+)
 	constexpr int PROGRESS_LOG_INTERVAL_SEC = 5;  // Progress log interval during Poll
@@ -879,8 +863,15 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 			if (measure_latency_) {
 				absl::MutexLock lock(&conn_buffers->state_mutex);
 				auto recv_complete_time = std::chrono::steady_clock::now();
-				size_t current_end_offset = conn_buffers->buffers[conn_buffers->current_write_idx.load()].write_offset.load(std::memory_order_relaxed);
-				conn_buffers->recv_log.emplace_back(recv_complete_time, current_end_offset);
+				const int write_idx = conn_buffers->current_write_idx.load(std::memory_order_relaxed);
+				size_t current_end_offset = conn_buffers->buffers[write_idx].write_offset.load(std::memory_order_relaxed);
+				const uint64_t generation = conn_buffers->buffer_generation[write_idx];
+				conn_buffers->recv_log.push_back(RecvLogEntry{
+					.receive_time = recv_complete_time,
+					.buffer_idx = write_idx,
+					.buffer_generation = generation,
+					.end_offset = current_end_offset
+				});
 			}
 
 			DEBUG_count_.fetch_add(bytes_received, std::memory_order_relaxed);
@@ -1065,6 +1056,9 @@ bool ConnectionBuffers::signal_and_attempt_swap(Subscriber* subscriber_instance)
 	if (!read_buffer_in_use_by_consumer.load(std::memory_order_acquire)) {
 		// Swap successful! Reset the new write buffer's state.
 		current_write_idx.store(read_idx, std::memory_order_release);
+		// Offset resets to 0 on a reused buffer; advance generation so recv-log
+		// correlation can distinguish this reuse epoch.
+		buffer_generation[read_idx] += 1;
 		buffers[read_idx].write_offset.store(0, std::memory_order_relaxed);
 		// We don't reset write_buffer_ready_for_consumer here; that happens
 		// when the *consumer acquires* the buffer (now buffers[write_idx]).

@@ -169,6 +169,13 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 
 	std::atomic_thread_fence(std::memory_order_release);
 
+#ifdef COLLECT_LATENCY_STATS
+	{
+		std::lock_guard<std::mutex> lock(batch_submit_time_mutex_);
+		batch_submit_time_[h] = current_batch_first_submit_time_;
+	}
+#endif
+
 	// [[DEFLECT_WHEN_FULL]] Try current queue; if full, try next queue in round-robin until one accepts.
 	// Avoids blocking entire producer on one slow consumer. If all queues full, block on original queue.
 	const size_t n = active_queues_;
@@ -230,6 +237,9 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 	current_batch_ = next;
 	current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
 	current_batch_num_msg_ = 0;
+#ifdef COLLECT_LATENCY_STATS
+	current_batch_first_submit_time_ = {};
+#endif
 	return num_sealed;
 }
 
@@ -262,10 +272,13 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 			}
 			std::this_thread::yield();
 		}
-		current_batch_ = next;
-		current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
-		current_batch_num_msg_ = 0;
-	}
+			current_batch_ = next;
+			current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
+			current_batch_num_msg_ = 0;
+#ifdef COLLECT_LATENCY_STATS
+			current_batch_first_submit_time_ = {};
+#endif
+		}
 
 	// If this message would exceed the slot, seal first then write into new buffer.
 	if (current_batch_tail_ + stride > slot_size_) {
@@ -284,6 +297,11 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 	} else {
 		memcpy(base + current_batch_tail_, &header_, header_size);
 		memcpy(base + current_batch_tail_ + header_size, msg, len);
+	}
+	if (current_batch_num_msg_ == 0) {
+#ifdef COLLECT_LATENCY_STATS
+		current_batch_first_submit_time_ = std::chrono::steady_clock::now();
+#endif
 	}
 	current_batch_tail_ += stride;
 	current_batch_num_msg_++;
@@ -405,10 +423,31 @@ void QueueBuffer::ReleaseBatch(void* batch) {
 		return;
 	}
 #endif
+#ifdef COLLECT_LATENCY_STATS
+	{
+		std::lock_guard<std::mutex> lock(batch_submit_time_mutex_);
+		batch_submit_time_.erase(batch);
+	}
+#endif
 	// [[DESIGN]] No memset: buffer is internal; we send to broker with batch total_size only.
 	// Only unoverwritten bytes are padding; nobody reads padding. memset would add cost with no benefit.
 	pool_->write(static_cast<Embarcadero::BatchHeader*>(batch));
 }
+
+#ifdef COLLECT_LATENCY_STATS
+bool QueueBuffer::GetBatchSubmitTime(void* batch, std::chrono::steady_clock::time_point* out_time) {
+	if (!batch || !out_time) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(batch_submit_time_mutex_);
+	auto it = batch_submit_time_.find(batch);
+	if (it == batch_submit_time_.end()) {
+		return false;
+	}
+	*out_time = it->second;
+	return true;
+}
+#endif
 
 void QueueBuffer::WriteFinished() {
 	write_finished_.store(true, std::memory_order_release);

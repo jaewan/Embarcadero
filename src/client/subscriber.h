@@ -3,6 +3,7 @@
 #include "common.h"
 #include "../common/wire_formats.h"
 #include <array>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <vector>
@@ -46,6 +47,13 @@ struct TimestampPair {
 	std::chrono::steady_clock::time_point receive_time; // Captured on receive
 };
 
+struct RecvLogEntry {
+	std::chrono::steady_clock::time_point receive_time;
+	int buffer_idx;
+	uint64_t buffer_generation;
+	size_t end_offset;
+};
+
 // Manages the dual buffers and state for a single connection (FD)
 struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers> {
 	const int fd; // The socket FD this corresponds to
@@ -62,7 +70,10 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	absl::CondVar consumer_can_consume_cv; // Notifies consumer a buffer *might* be ready
 	absl::CondVar receiver_can_write_cv; // Notifies receiver the *other* buffer is free
 
-	std::vector<std::pair<std::chrono::steady_clock::time_point, size_t>> recv_log ABSL_GUARDED_BY(state_mutex);
+	std::vector<RecvLogEntry> recv_log ABSL_GUARDED_BY(state_mutex);
+	// Increments when a buffer is reset for reuse; needed to disambiguate offsets
+	// across buffer swaps when correlating per-message receive timestamps.
+	std::array<uint64_t, 2> buffer_generation ABSL_GUARDED_BY(state_mutex) = {0, 0};
 
 	// [[BLOG_HEADER: Per-connection batch state for ORDER=5 (no global mutex)]]
 	// Replaces the global g_batch_states map, eliminating mutex contention

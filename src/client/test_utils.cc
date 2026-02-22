@@ -9,6 +9,7 @@
 #include <fstream>
 #include <numeric>
 #include <algorithm>
+#include <vector>
 
 // Helper function to generate random message content
 void FillRandomData(char* buffer, size_t size) {
@@ -597,8 +598,8 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		<< " (" << total_message_size << " bytes total)"
 		<< (steady_rate ? ", using steady rate" : "");
 
-	// Allocate message buffer
-	char message[message_size];
+	// Allocate message buffer on heap-backed vector to avoid large stack allocations.
+	std::vector<char> message(message_size);
 
 	// Calculate queue size with buffer
 	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
@@ -608,6 +609,9 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		// Create publisher and subscriber
 		Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
 				num_threads_per_broker, message_size, q_size, order, seq_type);
+#ifdef COLLECT_LATENCY_STATS
+		p.SetRecordResults(result.count("record_results") > 0);
+#endif
 		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true, order);
 
 		// Initialize publisher
@@ -634,7 +638,7 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 						timestamp.time_since_epoch()).count();
 
 				// First part of message contains the timestamp
-				memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
+				memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
 			}else{
 				// Capture current timestamp and embed it in the message
 				auto timestamp = std::chrono::steady_clock::now();
@@ -642,11 +646,11 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 						timestamp.time_since_epoch()).count();
 
 				// First part of message contains the timestamp
-				memcpy(message, &nanoseconds_since_epoch, sizeof(long long));
+				memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
 			}
 
 			// Send the message
-			p.Publish(message, message_size);
+			p.Publish(message.data(), message_size);
 
 			sent_bytes += paddedMsgSizeWithHeader;
 		}
@@ -654,7 +658,6 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
 		if (!p.Poll(n)) {
 			LOG(ERROR) << "Latency test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
-			delete[] message;
 			exit(1);
 		}
 

@@ -561,18 +561,33 @@ void FollowerNodeClient::Register() {
 	node_info.set_node_id(node_id_);
 	node_info.set_address(address_);
 
-	RegistrationStatus reply;
-	grpc::ClientContext context;
+	constexpr int kRegisterMaxAttempts = 100;
+	constexpr auto kRegisterRetrySleep = std::chrono::milliseconds(100);
 
-	grpc::Status status = stub_->RegisterNode(&context, node_info, &reply);
+	for (int attempt = 1; attempt <= kRegisterMaxAttempts && !shutdown_.load(); ++attempt) {
+		RegistrationStatus reply;
+		grpc::ClientContext context;
+		grpc::Status status = stub_->RegisterNode(&context, node_info, &reply);
 
-	if (status.ok() && reply.success()) {
-		LOG(INFO) << "Node registered: " << reply.message();
-		broker_id_ = reply.broker_id();
-	} else {
-		LOG(ERROR) << "Failed to register node: " << reply.message();
-		// Consider setting head_alive_ to false or retrying
+		if (status.ok() && reply.success()) {
+			LOG(INFO) << "Node registered: " << reply.message()
+			          << " (broker_id=" << reply.broker_id() << ", attempt=" << attempt << ")";
+			broker_id_ = reply.broker_id();
+			return;
+		}
+
+		if (attempt == 1 || attempt % 10 == 0) {
+			LOG(WARNING) << "Register retry attempt " << attempt
+			             << " failed: grpc_status="
+			             << (status.ok() ? "OK" : status.error_message())
+			             << " reply_success=" << (reply.success() ? "true" : "false")
+			             << " reply_message='" << reply.message() << "'";
+		}
+		std::this_thread::sleep_for(kRegisterRetrySleep);
 	}
+
+	LOG(ERROR) << "Failed to register node after " << kRegisterMaxAttempts
+	           << " attempts. broker_id remains " << broker_id_;
 }
 
 void FollowerNodeClient::SendHeartbeat() {

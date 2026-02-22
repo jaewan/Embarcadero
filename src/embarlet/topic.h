@@ -11,6 +11,7 @@
 #include <vector>
 #include <deque>
 #include <queue>
+#include <chrono>
 
 #include "../disk_manager/corfu_replication_client.h"
 #include "../disk_manager/scalog_replication_client.h"
@@ -151,12 +152,20 @@ struct alignas(64) EpochBuffer5 {
 			return false;
 		}
 		std::unique_lock<std::mutex> lk(seal_mutex);
-		seal_cv.wait(lk, [this] {
+		constexpr auto kSealWaitBudget = std::chrono::milliseconds(2);
+		bool quiesced = seal_cv.wait_for(lk, kSealWaitBudget, [this] {
 			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
 				if (broker_active[i].load(std::memory_order_acquire)) return false;
 			}
 			return true;
 		});
+		if (!quiesced) {
+			// Liveness-first rollback: avoid permanent SEALED dead zone when a collector
+			// flag gets stuck. Driver/scanners will retry sealing.
+			state.store(State::COLLECTING, std::memory_order_release);
+			seal_cv.notify_all();
+			return false;
+		}
 		return true;
 	}
 
@@ -670,7 +679,12 @@ class Topic {
 		static constexpr unsigned kEpochUs = 500;
 		alignas(64) std::atomic<uint64_t> epoch_index_{0};
 		alignas(64) std::atomic<uint64_t> last_sequenced_epoch_{0};
-		volatile bool epoch_driver_done_{false}; // [[SHUTDOWN_SYNC]] Signals EpochDriverThread has finished sealing - non-atomic for performance
+		std::atomic<bool> epoch_driver_done_{false}; // [[SHUTDOWN_SYNC]] Cross-thread flag: EpochDriverThread finished sealing
+		// ORDER=5 phase diagnostics (scanner push vs sequencer commit), enabled via EMBARCADERO_ORDER5_PHASE_DIAG.
+		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> scanner_pushed_batches_{};
+		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> scanner_pushed_msgs_{};
+		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> sequencer_committed_batches_{};
+		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> sequencer_committed_msgs_{};
 		// [[B0_TAIL_FIX]] When set, next ProcessLevel5BatchesShard treats all hold entries as expired (shutdown drain).
 		std::atomic<bool> force_expire_hold_on_next_process_{false};
 	// Epoch buffers for safe collection/sequencing (no concurrent merge/write).
@@ -687,7 +701,7 @@ class Topic {
 			std::vector<PendingBatch5> ready;
 			absl::flat_hash_map<size_t, ClientState5> client_state;
 			absl::flat_hash_map<size_t, uint64_t> client_highest_committed;
-			absl::flat_hash_map<size_t, absl::flat_hash_map<size_t, HoldEntry5>> hold_buffer;  // client_id -> (client_seq -> entry)
+			absl::flat_hash_map<size_t, std::map<size_t, HoldEntry5>> hold_buffer;  // client_id -> ordered(client_seq -> entry)
 			size_t hold_buffer_size{0};
 			absl::flat_hash_set<size_t> clients_with_held_batches;
 			std::vector<ExpiredHoldEntry> expired_hold_buffer;

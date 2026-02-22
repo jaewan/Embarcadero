@@ -211,6 +211,9 @@ int main(int argc, char* argv[]) {
 	} else if (arguments.count("corfu") || arguments.count("CORFU")) {
 		sequencerType = heartbeat_system::SequencerType::CORFU;
 	}
+	// [[CORFU_DEBUG]] Trace startup to pinpoint broker death
+	LOG(INFO) << "[CORFU_DEBUG] sequencerType=" << (sequencerType == heartbeat_system::SequencerType::CORFU ? "CORFU" :
+	      sequencerType == heartbeat_system::SequencerType::SCALOG ? "SCALOG" : "EMBARCADERO");
 
 	if (arguments.count("head")) {
 		is_head_node = true;
@@ -251,8 +254,10 @@ int main(int argc, char* argv[]) {
 			LOG(ERROR) << "CXL initialization failed for broker " << broker_id << ", aborting startup";
 			return EXIT_FAILURE;
 		}
+		LOG(INFO) << "[CORFU_DEBUG] CXLManager OK, creating DiskManager (broker_id=" << broker_id << ")";
 		Embarcadero::DiskManager disk_manager(broker_id, cxl_manager.GetCXLAddr(),
 				replicate_to_memory, sequencerType);
+		LOG(INFO) << "[CORFU_DEBUG] DiskManager constructed";
 	Embarcadero::NetworkManager network_manager(broker_id, num_network_io_threads);
 	Embarcadero::TopicManager topic_manager(cxl_manager, disk_manager, broker_id);
 
@@ -292,6 +297,8 @@ int main(int argc, char* argv[]) {
 	network_manager.SetDiskManager(&disk_manager);
 	network_manager.SetTopicManager(&topic_manager);
 
+	LOG(INFO) << "[CORFU_DEBUG] Managers connected, waiting for data port to listen";
+
 	// Only signal "ready" when the data port is actually listening.
 	const int listen_wait_seconds = 30;
 	const int poll_ms = 100;
@@ -311,6 +318,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	// Signal initialization completion
+	LOG(INFO) << "[CORFU_DEBUG] Data port listening, signaling ready";
 	SignalScriptReady();
 	LOG(INFO) << "Embarcadero initialized. Ready to go";
 
