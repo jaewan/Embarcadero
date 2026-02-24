@@ -156,10 +156,29 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
         // Non-fatal, continue
     }
 
+    // TCP_USER_TIMEOUT: abort connection if sent data is unacknowledged for this many ms.
+    // Without this, TCP retransmission backoff (200+400+800=1.4s on localhost) delays
+    // failure detection when a broker dies with an empty receive buffer (FIN path).
+#ifndef TCP_USER_TIMEOUT
+#define TCP_USER_TIMEOUT 18
+#endif
+    {
+        static const int tcp_user_timeout_ms = [] {
+            const char* env = getenv("EMBARCADERO_TCP_USER_TIMEOUT_MS");
+            return env ? std::atoi(env) : 500;
+        }();
+        if (tcp_user_timeout_ms > 0) {
+            if (setsockopt(sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                           &tcp_user_timeout_ms, sizeof(tcp_user_timeout_ms)) != 0) {
+                LOG(WARNING) << "setsockopt(TCP_USER_TIMEOUT) failed: " << strerror(errno);
+            }
+        }
+    }
+
     // Configure buffer size based on send/receive mode
     if (send) {
         // OPTIMIZATION: Increase send buffer to match receive buffer for better throughput
-        int sendBufferSize = 256 * 1024 * 1024;  // 256 MB send buffer (reduces EAGAIN at high throughput)
+        int sendBufferSize = 16 * 1024 * 1024;  // 16MB: fast failure detection while sustaining >10 GB/s
         if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize)) == -1) {
             LOG(ERROR) << "setsockopt(SO_SNDBUF) failed: " << strerror(errno);
             close(sock);

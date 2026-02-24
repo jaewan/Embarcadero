@@ -93,6 +93,12 @@ public:
 	void SetActiveQueues(size_t active_count);
 
 	/**
+	 * Mark a queue as inactive (e.g. after a broker failure).
+	 * The producer will stop pushing new batches to this queue.
+	 */
+	void MarkQueueInactive(size_t queue_idx);
+
+	/**
 	 * Pre-touch pool memory (hugepage regions) to fault pages in and reduce measurement variance.
 	 * Call explicitly after AddBuffers() and before the hot path. Not done inside AddBuffers()
 	 * so callers control when/how (e.g. after thread binding, or skip in tests that don't care).
@@ -131,6 +137,7 @@ private:
 	std::unique_ptr<std::mutex[]> queue_wait_mutexes_;
 	std::unique_ptr<std::condition_variable[]> queue_wait_cvs_;
 	std::unique_ptr<std::atomic<uint64_t>[]> queue_epochs_;
+	std::unique_ptr<std::atomic<bool>[]> queue_active_;
 	// Per-queue capacity; pool sized so 1 + num_queues_*kQueueCapacity slots exist.
 	// [[ROOT_CAUSE_FIX]] 256 was too small for 10GB test. 512 helped; 1024 gives more headroom when broker recv is slow (docs/NEW_BUFFER_BANDWIDTH_INVESTIGATION.md).
 	static constexpr size_t kQueueCapacity = 1024;

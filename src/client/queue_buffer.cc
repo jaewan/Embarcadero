@@ -61,8 +61,10 @@ QueueBuffer::QueueBuffer(size_t num_buf, size_t num_threads_per_broker, int clie
 	queue_wait_mutexes_ = std::make_unique<std::mutex[]>(num_queues_);
 	queue_wait_cvs_ = std::make_unique<std::condition_variable[]>(num_queues_);
 	queue_epochs_ = std::make_unique<std::atomic<uint64_t>[]>(num_queues_);
+	queue_active_ = std::make_unique<std::atomic<bool>[]>(num_queues_);
 	for (size_t i = 0; i < num_queues_; ++i) {
 		queue_epochs_[i].store(0, std::memory_order_relaxed);
+		queue_active_[i].store(true, std::memory_order_relaxed);
 	}
 }
 
@@ -180,10 +182,19 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 	// Avoids blocking entire producer on one slow consumer. If all queues full, block on original queue.
 	const size_t n = active_queues_;
 	if (n == 0) return 0;
+
+	auto queue_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kQueueFullTimeoutMs);
+	bool logged = false;
+	int spin_count = 0;
+
+retry_push:
 	size_t start_id = write_buf_id_;
 	bool pushed = false;
 	for (size_t i = 0; i < n; i++) {
 		size_t idx = (start_id + i) % n;
+		if (!queue_active_[idx].load(std::memory_order_relaxed)) {
+			continue;
+		}
 		folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>* q = queues_[idx].get();
 		if (q->write(h)) {
 			write_buf_id_ = (idx + 1) % n;
@@ -193,27 +204,45 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 		}
 	}
 	if (!pushed) {
-		// All queues full: block on original queue (same as previous behavior).
+		// All active queues full: keep polling all active queues instead of blocking on just one.
+		// This prevents head-of-line blocking if one queue's consumer is dead but hasn't timed out yet.
+		bool found_active = false;
+		for(size_t i=0; i<n; i++) {
+			if (queue_active_[i].load(std::memory_order_relaxed)) {
+				found_active = true;
+				break;
+			}
+		}
+		if (!found_active) {
+			LOG(ERROR) << "QueueBuffer: all queues inactive. Cannot push batch.";
+			ReleaseBatch(h);
+			current_batch_ = nullptr;
+			current_batch_tail_ = 0;
+			return num_sealed;
+		}
+
 		constexpr int kQueueFullCheckInterval = 64;
-		folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>* q = queues_[start_id].get();
-		auto queue_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kQueueFullTimeoutMs);
-		bool logged = false;
-		int spin_count = 0;
-		while (!q->write(h)) {
-			if (++spin_count % kQueueFullCheckInterval == 0 &&
-			    std::chrono::steady_clock::now() > queue_deadline) {
+		if (++spin_count % kQueueFullCheckInterval == 0) {
+			if (shutdown_.load(std::memory_order_relaxed)) {
+				ReleaseBatch(h);
+				current_batch_ = nullptr;
+				current_batch_tail_ = 0;
+				return num_sealed;
+			}
+			if (std::chrono::steady_clock::now() > queue_deadline) {
 				if (!logged) {
-					LOG(ERROR) << "QueueBuffer: queue full timeout (consumer " << start_id << " slow?)";
+					LOG(WARNING) << "QueueBuffer: all active queues full (producers outpaced consumers). Retrying...";
 					logged = true;
 				}
 				std::this_thread::sleep_for(std::chrono::milliseconds(kQueueFullSleepMs));
 				queue_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kQueueFullTimeoutMs);
 			} else {
-				Embarcadero::CXL::cpu_pause();
+				std::this_thread::yield();
 			}
+		} else {
+			Embarcadero::CXL::cpu_pause();
 		}
-		NotifyQueueDataReady(start_id);
-		write_buf_id_ = (start_id + 1) % n;
+		goto retry_push;
 	}
 
 	// Acquire next buffer from pool. [[PERF]] Spin with cpu_pause before yield.
@@ -222,6 +251,11 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 	int pool_spin = 0;
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPoolAcquireTimeoutMs);
 	while (!pool_->read(next)) {
+		if (shutdown_.load(std::memory_order_relaxed)) {
+			current_batch_ = nullptr;
+			current_batch_tail_ = 0;
+			return num_sealed;
+		}
 		if (++pool_spin % kPoolSpinBeforeYield == 0) {
 			if (std::chrono::steady_clock::now() > deadline) {
 				LOG(ERROR) << "QueueBuffer: pool acquire timeout";
@@ -461,6 +495,12 @@ void QueueBuffer::ReturnReads() {
 
 void QueueBuffer::SetActiveQueues(size_t active_count) {
 	active_queues_ = (active_count <= num_queues_) ? active_count : num_queues_;
+}
+
+void QueueBuffer::MarkQueueInactive(size_t queue_idx) {
+	if (queue_active_ && queue_idx < num_queues_) {
+		queue_active_[queue_idx].store(false, std::memory_order_relaxed);
+	}
 }
 
 void QueueBuffer::WarmupBuffers() {

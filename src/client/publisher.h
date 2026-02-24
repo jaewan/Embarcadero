@@ -136,6 +136,22 @@ class Publisher {
 			return client_id_;
 		}
 
+		size_t GetAckReceived() const {
+			return ack_received_.load(std::memory_order_relaxed);
+		}
+		
+		bool GetShutdown() const {
+			return shutdown_.load(std::memory_order_relaxed);
+		}
+
+		bool IsKillBrokersActive() const {
+			return kill_brokers_.load(std::memory_order_relaxed);
+		}
+
+		bool IsThrottleRelaxed() const {
+			return throttle_relaxed_.load(std::memory_order_relaxed);
+		}
+
 		/**
 		 * Signals that writing is finished
 		 */
@@ -184,7 +200,10 @@ class Publisher {
 		bool measure_real_time_throughput_ = false;
 		std::thread real_time_throughput_measure_thread_;
 		std::thread kill_brokers_thread_;
-		std::atomic<bool> kill_brokers_{false};  // FailBrokers writes, Poll reads; atomic if they run on different threads
+	std::atomic<bool> kill_brokers_{false};  // FailBrokers writes, Poll reads; atomic if they run on different threads
+	std::atomic<bool> throttle_relaxed_{false};  // Set after killbrokers() returns; publish loop skips backpressure
+	static constexpr int kMaxBrokerIds = 32;
+	std::array<std::atomic<bool>, kMaxBrokerIds> broker_killed_{};  // Per-broker kill signal for fast PublishThread abort
 		std::chrono::steady_clock::time_point start_time_;
 		
 
@@ -246,6 +265,7 @@ class Publisher {
 			size_t end_count;
 			std::chrono::steady_clock::time_point sent_time;
 			std::chrono::steady_clock::time_point submit_time;
+			bool has_submit_time;
 		};
 
 		// [[threading: PublishThread writes, EpollAckThread reads]] Protected by per-broker mutex.
@@ -264,7 +284,11 @@ class Publisher {
 		std::atomic<size_t> publish_submit_time_missing_{0};
 		bool record_results_{false};
 
-		void RecordPublishSend(int broker_id, size_t end_count, const std::chrono::steady_clock::time_point& submit_time);
+		void RecordPublishSend(
+			int broker_id,
+			size_t end_count,
+			const std::chrono::steady_clock::time_point& submit_time,
+			bool has_submit_time);
 		void ProcessPublishAckLatency(int broker_id, size_t acked_msg);
 		void WritePublishLatencyResults();
 	#endif

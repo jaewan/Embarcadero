@@ -107,11 +107,12 @@ inline void CleanupSocketAndEpoll(int socket_fd, int epoll_fd) {
  * @threading Called from MainThread (accept loop)
  */
 static void SetAcceptedSocketBuffers(int fd) {
-	const int buffer_size = 256 * 1024 * 1024;  // 256 MB (match client; reduces EAGAIN at 10GB/s)
-	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+	const int rcv_buffer_size = 8 * 1024 * 1024;  // 8MB recv: broker reads fast so small buffer is fine; keeps failure detection <100ms
+	const int snd_buffer_size = 16 * 1024 * 1024;  // 16MB send: sufficient for ACK path
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv_buffer_size, sizeof(rcv_buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_RCVBUF) on accepted socket failed: " << strerror(errno);
 	}
-	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd_buffer_size, sizeof(snd_buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_SNDBUF) on accepted socket failed: " << strerror(errno);
 	}
 	// [[CRITICAL FIX]] Disable Nagle's algorithm - was missing, causing latency!
@@ -147,22 +148,27 @@ static constexpr int kMaxPBRRetries = 20;           // WAIT_PBR_SLOT: recovery a
 // volatile size_t; __atomic_fetch_add is the correct way to get atomic RMW (GCC/clang extension).
 void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, uint64_t written_addr, uint32_t num_msg) {
 	if (!tinode) return;
-	volatile size_t* written_ptr = &tinode->offsets[broker_id_].written;
-	__atomic_fetch_add(reinterpret_cast<size_t*>(const_cast<size_t*>(written_ptr)), num_msg, __ATOMIC_RELEASE);
 
-	// Track highest visible write address monotonically to avoid regressions with concurrent recv threads.
+	// [[RACE_CONDITION_FIX]] Update written_addr BEFORE written!
+	// If written is updated first, a subscriber reading concurrently might see the
+	// new written (combined_offset) but the old written_addr. It would return the
+	// old data, but falsely set last_offset = new_written, permanently missing the
+	// new data because it thinks it has already caught up to new_written!
 	volatile unsigned long long* written_addr_ptr = &tinode->offsets[broker_id_].written_addr;
 	unsigned long long cur_addr = __atomic_load_n(
 		const_cast<unsigned long long*>(written_addr_ptr), __ATOMIC_ACQUIRE);
 	const unsigned long long target_addr = static_cast<unsigned long long>(written_addr);
 	while (target_addr > cur_addr &&
-	       !__atomic_compare_exchange_n(const_cast<unsigned long long*>(written_addr_ptr),
-	                                   &cur_addr, target_addr, false,
-	                                   __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+		   !__atomic_compare_exchange_n(const_cast<unsigned long long*>(written_addr_ptr),
+										&cur_addr, target_addr, false,
+										__ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
 	}
 
-	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
+	volatile size_t* written_ptr = &tinode->offsets[broker_id_].written;
+	__atomic_fetch_add(reinterpret_cast<size_t*>(const_cast<size_t*>(written_ptr)), num_msg, __ATOMIC_RELEASE);
+
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written_addr));
+	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
 	CXL::store_fence();  // Required for CXL visibility; reader (AckThread) must see updated written
 }
 
@@ -886,7 +892,7 @@ void NetworkManager::HandlePublishRequest(
 		batch_header.client_id = handshake.client_id;
 		batch_header.ordered = 0;
 
-		ssize_t bytes_read = recv(client_socket, &batch_header, sizeof(BatchHeader), 0);
+		ssize_t bytes_read = recv(client_socket, &batch_header, sizeof(BatchHeader), MSG_NOSIGNAL);
 		if (bytes_read <= 0) {
 			if (bytes_read < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
@@ -896,32 +902,44 @@ void NetworkManager::HandlePublishRequest(
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
 			} else {
 				// bytes_read == 0 indicates connection closed by peer
-				LOG(WARNING) << "NetworkManager: Connection closed by publisher (client_id=" 
+				// In failure test, publishers close the connection intentionally when their broker fails and they switch.
+				VLOG(1) << "NetworkManager: Connection closed by publisher (client_id=" 
 				            << handshake.client_id << ", topic=" << handshake.topic 
-				            << "). No batch data received. This may indicate publisher failed to send or disconnected early.";
+				            << "). Normal termination if publisher is re-routing or shutting down.";
 			}
 			running = false;
 			break;
 		}
 
 		// Finish reading batch header if partial read
-			while (bytes_read < static_cast<ssize_t>(sizeof(BatchHeader))) {
-				ssize_t recv_ret = recv(client_socket,
-						((uint8_t*)&batch_header) + bytes_read,
-						sizeof(BatchHeader) - bytes_read,
-						0);
-				if (recv_ret < 0) {
+		while (bytes_read < static_cast<ssize_t>(sizeof(BatchHeader))) {
+			ssize_t recv_ret = recv(client_socket,
+					((uint8_t*)&batch_header) + bytes_read,
+					sizeof(BatchHeader) - bytes_read,
+					MSG_NOSIGNAL);
+			if (recv_ret < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
 				    !stop_threads_) {
 					continue;
 				}
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
 				running = false;
-				return;
+				break;
+			}
+			if (recv_ret == 0) {
+				LOG(WARNING) << "NetworkManager: Connection closed by publisher during partial batch header read.";
+				running = false;
+				break;
 			}
 			bytes_read += recv_ret;
 		}
-		if (stop_threads_) {
+		if (!running || stop_threads_) {
+			break;
+		}
+
+		if (batch_header.total_size == 0) {
+			LOG(WARNING) << "NetworkManager: Received batch with total_size=0, closing connection.";
+			running = false;
 			break;
 		}
 
@@ -1005,12 +1023,12 @@ void NetworkManager::HandlePublishRequest(
 			// batch_header_location is set
 		}
 
-			// Receive message data (byte-accurate accounting only)
-			size_t read = 0;
-			bool batch_data_complete = false;
-			while (running && !stop_threads_) {
-				bytes_read = recv(client_socket, (uint8_t*)buf + read, to_read, 0);
-				if (bytes_read < 0) {
+		// Receive message data (byte-accurate accounting only)
+		size_t read = 0;
+		bool batch_data_complete = false;
+		while (running && !stop_threads_) {
+			bytes_read = recv(client_socket, (uint8_t*)buf + read, to_read, MSG_NOSIGNAL);
+			if (bytes_read < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
 				    !stop_threads_) {
 					continue;

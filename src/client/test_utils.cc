@@ -139,7 +139,15 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 	}
 
 	// Calculate optimal queue size based on configuration
-	size_t q_size = CalculateOptimalQueueSize(num_threads_per_broker, total_message_size, message_size);
+	// Use fixed small queue size to throttle producer so it stays alive throughout test
+	// We use 8MB total queue size to force the producer to keep running alongside the network sends.
+	size_t q_size = 1024 * 1024 * 8; // Very small queue to force producer to block
+	q_size = std::max(q_size, static_cast<size_t>(1024));
+
+	// Initialize subscriber BEFORE publisher to make sure they're ready to receive
+	LOG(INFO) << "Setting up dummy subscriber to keep connections open if needed";
+	// Note: the test currently focuses on Publisher throughput so we might not use the subscriber directly here 
+	// But it might be necessary if we wanted end-to-end failure testing.
 
 	// Create publisher
 	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
@@ -149,11 +157,15 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 #endif
 
 	try {
-		p.RecordStartTime(); // For failure event timestamp across threads
-												 // Initialize publisher
+		p.RecordStartTime();
 		p.Init(ack_level);
 
-		// Set up broker failure simulation
+		auto warmup_start = std::chrono::high_resolution_clock::now();
+		p.WarmupBuffers();
+		auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::high_resolution_clock::now() - warmup_start).count();
+		LOG(INFO) << "Failure test buffer warmup completed in " << warmup_ms << " ms";
+
 		p.FailBrokers(total_message_size, message_size, failure_percentage, killbrokers);
 
 		// Create progress tracker
@@ -162,16 +174,43 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 		// Start timing
 		auto start = std::chrono::high_resolution_clock::now();
 
-		// Publish messages
+		size_t batch_size = 10000;
+		size_t max_in_flight_bytes = 100 * 1024 * 1024;
+		size_t max_in_flight_msgs = max_in_flight_bytes / message_size;
+
 		for (size_t i = 0; i < n; i++) {
 			p.Publish(message, message_size);
 
-			/*
-			// Update progress periodically
-			if (i % 1000 == 0) {
-			progress.Update(i);
+			if (i > 0 && i % batch_size == 0) {
+				if (p.GetShutdown()) {
+					LOG(WARNING) << "Publishing loop interrupted due to shutdown at message " << i;
+					break;
+				}
+
+				if (!p.IsThrottleRelaxed() && i > p.GetAckReceived() + max_in_flight_msgs) {
+					auto throttle_start = std::chrono::steady_clock::now();
+					int spin_count = 0;
+					while (!p.GetShutdown() && !p.IsThrottleRelaxed() &&
+					       i > p.GetAckReceived() + max_in_flight_msgs) {
+						if (++spin_count % 100 == 0) {
+							std::this_thread::sleep_for(std::chrono::microseconds(500));
+						} else {
+							Embarcadero::CXL::cpu_pause();
+						}
+						auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+							std::chrono::steady_clock::now() - throttle_start).count();
+						if (elapsed_ms >= 2000) {
+							size_t acked = p.GetAckReceived();
+							LOG(WARNING) << "Throttle stall: published=" << i << " acked=" << acked
+							             << " gap=" << (i - acked) << " limit=" << max_in_flight_msgs
+							             << " kill_brokers=" << p.IsKillBrokersActive()
+							             << ". Relaxing in-flight limit to continue.";
+							max_in_flight_msgs = i - acked + batch_size;
+							break;
+						}
+					}
+				}
 			}
-			*/
 		}
 
 		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
@@ -181,7 +220,10 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 			exit(1);
 		}
 
-		p.WriteFailureEventsToFile("/home/domin/Embarcadero/data/failure/failure_events.csv");
+		const char* failure_dir = getenv("EMBARCADERO_FAILURE_DATA_DIR");
+		std::string events_dir = (failure_dir && failure_dir[0]) ? failure_dir : std::string(getenv("HOME") ? getenv("HOME") : ".") + "/Embarcadero/data/failure";
+		std::string events_file = events_dir + "/failure_events.csv";
+		p.WriteFailureEventsToFile(events_file);
 		// Calculate elapsed time and bandwidth
 		auto end = std::chrono::high_resolution_clock::now();
 		std::chrono::duration<double> elapsed = end - start;

@@ -587,7 +587,16 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 	VLOG(5) << "Subscriber::Poll - Expected: " << total_data_size << " bytes (" << num_msg << " messages), "
 	          << "padded_msg_size=" << padded_msg_size << ", header_size=" << sizeof(Embarcadero::MessageHeader);
 
-	constexpr int POLL_TIMEOUT_SEC = 15;  // 15s to allow full drain for Order 0 subscribe (10GB+)
+	// Configurable timeout via environment variable to support varying test scales
+	int POLL_TIMEOUT_SEC = 15; // default
+	if (const char* env_timeout = std::getenv("EMBARCADERO_E2E_TIMEOUT_SEC")) {
+		try {
+			POLL_TIMEOUT_SEC = std::stoi(env_timeout);
+			LOG(INFO) << "Subscriber::Poll using configured timeout: " << POLL_TIMEOUT_SEC << "s";
+		} catch (...) {
+			LOG(WARNING) << "Invalid EMBARCADERO_E2E_TIMEOUT_SEC, falling back to 15s";
+		}
+	}
 	constexpr int PROGRESS_LOG_INTERVAL_SEC = 5;  // Progress log interval during Poll
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(POLL_TIMEOUT_SEC);
 	auto last_progress_log = std::chrono::steady_clock::now();

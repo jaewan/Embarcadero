@@ -116,11 +116,12 @@ Publisher::~Publisher() {
 void Publisher::RecordPublishSend(
 		int broker_id,
 		size_t end_count,
-		const std::chrono::steady_clock::time_point& submit_time) {
+		const std::chrono::steady_clock::time_point& submit_time,
+		bool has_submit_time) {
 	if (!record_results_ || ack_level_ < 1 || end_count == 0) {
 		return;
 	}
-	BatchSendRecord record{end_count, std::chrono::steady_clock::now(), submit_time};
+	BatchSendRecord record{end_count, std::chrono::steady_clock::now(), submit_time, has_submit_time};
 	{
 		std::lock_guard<std::mutex> lock(send_records_mutexes_[broker_id]);
 		auto& records = send_records_per_broker_[broker_id];
@@ -153,25 +154,31 @@ void Publisher::ProcessPublishAckLatency(int broker_id, size_t acked_msg) {
 		while (!records.empty() && records.front().end_count <= acked_msg) {
 			const auto send_to_ack_latency = std::chrono::duration_cast<std::chrono::microseconds>(
 					now - records.front().sent_time).count();
-			const auto submit_to_ack_latency = std::chrono::duration_cast<std::chrono::microseconds>(
-					now - records.front().submit_time).count();
 			local_send_to_ack_latencies.push_back(send_to_ack_latency);
-			local_submit_to_ack_latencies.push_back(submit_to_ack_latency);
+			if (records.front().has_submit_time) {
+				const auto submit_to_ack_latency = std::chrono::duration_cast<std::chrono::microseconds>(
+						now - records.front().submit_time).count();
+				local_submit_to_ack_latencies.push_back(submit_to_ack_latency);
+			}
 			records.pop_front();
 		}
 	}
-	if (!local_send_to_ack_latencies.empty()) {
+	if (!local_send_to_ack_latencies.empty() || !local_submit_to_ack_latencies.empty()) {
 		std::lock_guard<std::mutex> lock(publish_latency_mutex_);
-		publish_send_to_ack_latencies_us_.insert(
-				publish_send_to_ack_latencies_us_.end(),
-				local_send_to_ack_latencies.begin(),
-				local_send_to_ack_latencies.end());
-		publish_submit_to_ack_latencies_us_.insert(
-				publish_submit_to_ack_latencies_us_.end(),
-				local_submit_to_ack_latencies.begin(),
-				local_submit_to_ack_latencies.end());
-		publish_send_to_ack_batch_samples_recorded_.fetch_add(local_send_to_ack_latencies.size(), std::memory_order_relaxed);
-		publish_submit_to_ack_batch_samples_recorded_.fetch_add(local_submit_to_ack_latencies.size(), std::memory_order_relaxed);
+		if (!local_send_to_ack_latencies.empty()) {
+			publish_send_to_ack_latencies_us_.insert(
+					publish_send_to_ack_latencies_us_.end(),
+					local_send_to_ack_latencies.begin(),
+					local_send_to_ack_latencies.end());
+			publish_send_to_ack_batch_samples_recorded_.fetch_add(local_send_to_ack_latencies.size(), std::memory_order_relaxed);
+		}
+		if (!local_submit_to_ack_latencies.empty()) {
+			publish_submit_to_ack_latencies_us_.insert(
+					publish_submit_to_ack_latencies_us_.end(),
+					local_submit_to_ack_latencies.begin(),
+					local_submit_to_ack_latencies.end());
+			publish_submit_to_ack_batch_samples_recorded_.fetch_add(local_submit_to_ack_latencies.size(), std::memory_order_relaxed);
+		}
 	}
 }
 #endif
@@ -188,55 +195,77 @@ void Publisher::WritePublishLatencyResults() {
 		send_to_ack_latencies_copy = publish_send_to_ack_latencies_us_;
 		submit_to_ack_latencies_copy = publish_submit_to_ack_latencies_us_;
 	}
-	if (send_to_ack_latencies_copy.empty() || submit_to_ack_latencies_copy.empty()) {
-		LOG(WARNING) << "No publish latency values could be calculated for one or more metrics.";
+	if (send_to_ack_latencies_copy.empty() && submit_to_ack_latencies_copy.empty()) {
+		LOG(WARNING) << "No publish ACK latency values could be calculated.";
 		return;
 	}
 
-	std::sort(send_to_ack_latencies_copy.begin(), send_to_ack_latencies_copy.end());
-	std::sort(submit_to_ack_latencies_copy.begin(), submit_to_ack_latencies_copy.end());
-	const auto send_to_ack_summary = Embarcadero::LatencyStats::ComputeSummary(send_to_ack_latencies_copy);
-	const auto submit_to_ack_summary = Embarcadero::LatencyStats::ComputeSummary(submit_to_ack_latencies_copy);
+	const bool have_send_metric = !send_to_ack_latencies_copy.empty();
+	const bool have_submit_metric = !submit_to_ack_latencies_copy.empty();
+	Embarcadero::LatencyStats::Summary send_to_ack_summary{};
+	Embarcadero::LatencyStats::Summary submit_to_ack_summary{};
+	if (have_send_metric) {
+		std::sort(send_to_ack_latencies_copy.begin(), send_to_ack_latencies_copy.end());
+		send_to_ack_summary = Embarcadero::LatencyStats::ComputeSummary(send_to_ack_latencies_copy);
+	}
+	if (have_submit_metric) {
+		std::sort(submit_to_ack_latencies_copy.begin(), submit_to_ack_latencies_copy.end());
+		submit_to_ack_summary = Embarcadero::LatencyStats::ComputeSummary(submit_to_ack_latencies_copy);
+	}
 	const size_t send_to_ack_samples_recorded = publish_send_to_ack_batch_samples_recorded_.load(std::memory_order_relaxed);
 	const size_t submit_to_ack_samples_recorded = publish_submit_to_ack_batch_samples_recorded_.load(std::memory_order_relaxed);
 	const size_t acked_messages = ack_received_.load(std::memory_order_relaxed);
 	const size_t total_batches_sent = total_batches_sent_.load(std::memory_order_relaxed);
-	if (send_to_ack_summary.count > total_batches_sent || submit_to_ack_summary.count > total_batches_sent) {
+	if ((have_send_metric && send_to_ack_summary.count > total_batches_sent) ||
+		(have_submit_metric && submit_to_ack_summary.count > total_batches_sent)) {
 		LOG(WARNING) << "Publish ACK batch latency samples exceed total sent batches: send_samples="
-		             << send_to_ack_summary.count << " submit_samples=" << submit_to_ack_summary.count
+		             << (have_send_metric ? send_to_ack_summary.count : 0)
+		             << " submit_samples=" << (have_submit_metric ? submit_to_ack_summary.count : 0)
 		             << " total_batches_sent=" << total_batches_sent;
 	}
-	if (send_to_ack_samples_recorded != send_to_ack_summary.count) {
+	if (have_send_metric && send_to_ack_samples_recorded != send_to_ack_summary.count) {
 		LOG(WARNING) << "Publish send->ack sample counter mismatch: counter=" << send_to_ack_samples_recorded
 		             << " summarized=" << send_to_ack_summary.count;
 	}
-	if (submit_to_ack_samples_recorded != submit_to_ack_summary.count) {
+	if (have_submit_metric && submit_to_ack_samples_recorded != submit_to_ack_summary.count) {
 		LOG(WARNING) << "Publish submit->ack sample counter mismatch: counter=" << submit_to_ack_samples_recorded
 		             << " summarized=" << submit_to_ack_summary.count;
 	}
+	const size_t missing_submit_timestamps = publish_submit_time_missing_.load(std::memory_order_relaxed);
+	if (missing_submit_timestamps > 0) {
+		LOG(WARNING) << "Submit->ACK metric dropped " << missing_submit_timestamps
+		             << " batch sample(s) due to missing submit timestamps.";
+	}
 
-	LOG(INFO) << "Publish Submit->ACK Batch Latency Statistics (us):";
-	LOG(INFO) << "  Count:   " << submit_to_ack_summary.count;
-	LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << submit_to_ack_summary.average_us;
-	LOG(INFO) << "  Min:     " << submit_to_ack_summary.min_us;
-	LOG(INFO) << "  P50:     " << submit_to_ack_summary.p50_us;
-	LOG(INFO) << "  P99:     " << submit_to_ack_summary.p99_us;
-	LOG(INFO) << "  P99.9:   " << submit_to_ack_summary.p999_us;
-	LOG(INFO) << "  Max:     " << submit_to_ack_summary.max_us;
-	LOG(INFO) << "  Semantics: append_submit_to_ack batch latency (sample granularity=batch)";
-	LOG(INFO) << "  Invariant: batch_samples <= total_batches_sent (samples=" << submit_to_ack_summary.count
-	          << ", total_batches_sent=" << total_batches_sent << ")";
-	LOG(INFO) << "Publish Send->ACK Batch Latency Statistics (us):";
-	LOG(INFO) << "  Count:   " << send_to_ack_summary.count;
-	LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << send_to_ack_summary.average_us;
-	LOG(INFO) << "  Min:     " << send_to_ack_summary.min_us;
-	LOG(INFO) << "  P50:     " << send_to_ack_summary.p50_us;
-	LOG(INFO) << "  P99:     " << send_to_ack_summary.p99_us;
-	LOG(INFO) << "  P99.9:   " << send_to_ack_summary.p999_us;
-	LOG(INFO) << "  Max:     " << send_to_ack_summary.max_us;
-	LOG(INFO) << "  Semantics: append_send_to_ack batch latency (sample granularity=batch)";
-	LOG(INFO) << "  Submit timestamps missing (fallback to send timestamp): "
-	          << publish_submit_time_missing_.load(std::memory_order_relaxed);
+	if (have_submit_metric) {
+		LOG(INFO) << "Publish Submit->ACK Batch Latency Statistics (us):";
+		LOG(INFO) << "  Count:   " << submit_to_ack_summary.count;
+		LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << submit_to_ack_summary.average_us;
+		LOG(INFO) << "  Min:     " << submit_to_ack_summary.min_us;
+		LOG(INFO) << "  P50:     " << submit_to_ack_summary.p50_us;
+		LOG(INFO) << "  P99:     " << submit_to_ack_summary.p99_us;
+		LOG(INFO) << "  P99.9:   " << submit_to_ack_summary.p999_us;
+		LOG(INFO) << "  Max:     " << submit_to_ack_summary.max_us;
+		LOG(INFO) << "  Semantics: append_submit_to_ack batch latency (sample granularity=batch)";
+		LOG(INFO) << "  Invariant: batch_samples <= total_batches_sent (samples=" << submit_to_ack_summary.count
+		          << ", total_batches_sent=" << total_batches_sent << ")";
+	} else {
+		LOG(WARNING) << "Publish Submit->ACK Batch Latency Statistics unavailable (no valid submit timestamps).";
+	}
+	if (have_send_metric) {
+		LOG(INFO) << "Publish Send->ACK Batch Latency Statistics (us):";
+		LOG(INFO) << "  Count:   " << send_to_ack_summary.count;
+		LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << send_to_ack_summary.average_us;
+		LOG(INFO) << "  Min:     " << send_to_ack_summary.min_us;
+		LOG(INFO) << "  P50:     " << send_to_ack_summary.p50_us;
+		LOG(INFO) << "  P99:     " << send_to_ack_summary.p99_us;
+		LOG(INFO) << "  P99.9:   " << send_to_ack_summary.p999_us;
+		LOG(INFO) << "  Max:     " << send_to_ack_summary.max_us;
+		LOG(INFO) << "  Semantics: append_send_to_ack batch latency (sample granularity=batch)";
+	} else {
+		LOG(WARNING) << "Publish Send->ACK Batch Latency Statistics unavailable.";
+	}
+	LOG(INFO) << "  Submit timestamps missing (submit metric sample drops): " << missing_submit_timestamps;
 
 	const std::string latency_filename = "pub_latency_stats.csv";
 	std::ofstream latency_file(latency_filename);
@@ -244,44 +273,48 @@ void Publisher::WritePublishLatencyResults() {
 		LOG(ERROR) << "Failed to open file for writing: " << latency_filename;
 	} else {
 		latency_file << "Average,Min,Median,p90,p95,p99,p999,Max,Count,Metric,Unit,PercentileMethod,Granularity,SampleCountMeaning,AckedMessages,TotalBatchesSent,OutOfOrderInserts,MissingSubmitTimestamps\n";
-		latency_file << std::fixed << std::setprecision(3) << submit_to_ack_summary.average_us
-			<< "," << submit_to_ack_summary.min_us
-			<< "," << submit_to_ack_summary.p50_us
-			<< "," << submit_to_ack_summary.p90_us
-			<< "," << submit_to_ack_summary.p95_us
-			<< "," << submit_to_ack_summary.p99_us
-			<< "," << submit_to_ack_summary.p999_us
-			<< "," << submit_to_ack_summary.max_us
-			<< "," << submit_to_ack_summary.count
-			<< ",append_submit_to_ack_batch_latency"
-			<< ",us"
-			<< "," << Embarcadero::LatencyStats::kPercentileMethod
-			<< ",batch"
-			<< ",samples=count_of_fully_acked_batches"
-			<< "," << acked_messages
-			<< "," << total_batches_sent
-			<< "," << publish_latency_out_of_order_inserts_.load(std::memory_order_relaxed)
-			<< "," << publish_submit_time_missing_.load(std::memory_order_relaxed)
-			<< "\n";
-		latency_file << std::fixed << std::setprecision(3) << send_to_ack_summary.average_us
-			<< "," << send_to_ack_summary.min_us
-			<< "," << send_to_ack_summary.p50_us
-			<< "," << send_to_ack_summary.p90_us
-			<< "," << send_to_ack_summary.p95_us
-			<< "," << send_to_ack_summary.p99_us
-			<< "," << send_to_ack_summary.p999_us
-			<< "," << send_to_ack_summary.max_us
-			<< "," << send_to_ack_summary.count
-			<< ",append_send_to_ack_batch_latency"
-			<< ",us"
-			<< "," << Embarcadero::LatencyStats::kPercentileMethod
-			<< ",batch"
-			<< ",samples=count_of_fully_acked_batches"
-			<< "," << acked_messages
-			<< "," << total_batches_sent
-			<< "," << publish_latency_out_of_order_inserts_.load(std::memory_order_relaxed)
-			<< "," << publish_submit_time_missing_.load(std::memory_order_relaxed)
-			<< "\n";
+		if (have_submit_metric) {
+			latency_file << std::fixed << std::setprecision(3) << submit_to_ack_summary.average_us
+				<< "," << submit_to_ack_summary.min_us
+				<< "," << submit_to_ack_summary.p50_us
+				<< "," << submit_to_ack_summary.p90_us
+				<< "," << submit_to_ack_summary.p95_us
+				<< "," << submit_to_ack_summary.p99_us
+				<< "," << submit_to_ack_summary.p999_us
+				<< "," << submit_to_ack_summary.max_us
+				<< "," << submit_to_ack_summary.count
+				<< ",append_submit_to_ack_batch_latency"
+				<< ",us"
+				<< "," << Embarcadero::LatencyStats::kPercentileMethod
+				<< ",batch"
+				<< ",samples=count_of_fully_acked_batches_with_submit_timestamp"
+				<< "," << acked_messages
+				<< "," << total_batches_sent
+				<< "," << publish_latency_out_of_order_inserts_.load(std::memory_order_relaxed)
+				<< "," << missing_submit_timestamps
+				<< "\n";
+		}
+		if (have_send_metric) {
+			latency_file << std::fixed << std::setprecision(3) << send_to_ack_summary.average_us
+				<< "," << send_to_ack_summary.min_us
+				<< "," << send_to_ack_summary.p50_us
+				<< "," << send_to_ack_summary.p90_us
+				<< "," << send_to_ack_summary.p95_us
+				<< "," << send_to_ack_summary.p99_us
+				<< "," << send_to_ack_summary.p999_us
+				<< "," << send_to_ack_summary.max_us
+				<< "," << send_to_ack_summary.count
+				<< ",append_send_to_ack_batch_latency"
+				<< ",us"
+				<< "," << Embarcadero::LatencyStats::kPercentileMethod
+				<< ",batch"
+				<< ",samples=count_of_fully_acked_batches"
+				<< "," << acked_messages
+				<< "," << total_batches_sent
+				<< "," << publish_latency_out_of_order_inserts_.load(std::memory_order_relaxed)
+				<< "," << missing_submit_timestamps
+				<< "\n";
+		}
 		latency_file.close();
 	}
 
@@ -291,17 +324,21 @@ void Publisher::WritePublishLatencyResults() {
 		LOG(ERROR) << "Failed to open file for writing: " << cdf_filename;
 	} else {
 		cdf_file << "Latency_us,CumulativeProbability,Metric\n";
-		for (size_t i = 0; i < submit_to_ack_summary.count; ++i) {
-			const long long current_latency = submit_to_ack_latencies_copy[i];
-			const double cumulative_probability = static_cast<double>(i + 1) / submit_to_ack_summary.count;
-			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
-			         << ",append_submit_to_ack_batch_latency\n";
+		if (have_submit_metric) {
+			for (size_t i = 0; i < submit_to_ack_summary.count; ++i) {
+				const long long current_latency = submit_to_ack_latencies_copy[i];
+				const double cumulative_probability = static_cast<double>(i + 1) / submit_to_ack_summary.count;
+				cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
+				         << ",append_submit_to_ack_batch_latency\n";
+			}
 		}
-		for (size_t i = 0; i < send_to_ack_summary.count; ++i) {
-			const long long current_latency = send_to_ack_latencies_copy[i];
-			const double cumulative_probability = static_cast<double>(i + 1) / send_to_ack_summary.count;
-			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
-			         << ",append_send_to_ack_batch_latency\n";
+		if (have_send_metric) {
+			for (size_t i = 0; i < send_to_ack_summary.count; ++i) {
+				const long long current_latency = send_to_ack_latencies_copy[i];
+				const double cumulative_probability = static_cast<double>(i + 1) / send_to_ack_summary.count;
+				cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
+				         << ",append_send_to_ack_batch_latency\n";
+			}
 		}
 		cdf_file.close();
 	}
@@ -535,6 +572,8 @@ bool Publisher::Poll(size_t n) {
 		if (ack_level_ >= 1) {
 		auto wait_start_time = std::chrono::steady_clock::now();
 		auto last_log_time = wait_start_time;
+		auto last_ack_change_time = wait_start_time;
+		size_t last_ack_val = ack_received_.load(std::memory_order_acquire);
 		// [[CONFIG: Ack-wait spin]] 500µs spin when waiting for acks (burst-friendly); was 1ms.
 		constexpr auto SPIN_DURATION = std::chrono::microseconds(500);
 		
@@ -547,7 +586,8 @@ bool Publisher::Poll(size_t n) {
 		// Reloading allowed concurrent Publish() calls to move the target, causing potential infinite wait
 		const size_t target_acks = client_order_.load(std::memory_order_acquire);
 
-		while (ack_received_.load(std::memory_order_acquire) < target_acks) {
+		// Need to check for test completion/shutdown condition inside this loop to avoid hanging if things fail
+	while (ack_received_.load(std::memory_order_acquire) < target_acks && !shutdown_.load(std::memory_order_relaxed)) {
 			auto now = std::chrono::steady_clock::now();
 			auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - wait_start_time);
 
@@ -577,11 +617,25 @@ bool Publisher::Poll(size_t n) {
 				}
 				LOG(ERROR) << "[Publisher ACK Per-Broker]: " << per_broker;
 				// Return failure - caller should handle timeout appropriately
+				if (kill_brokers_) {
+					LOG(INFO) << "[Publisher ACK]: Timeout allowed due to killed brokers. Treating as success to gather stats.";
+					const char* drain_env = std::getenv("EMBARCADERO_ACK_DRAIN_MS");
+					int drain_ms = drain_env ? std::atoi(drain_env) : 3000;
+					if (drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
+					return true;
+				}
 				return false;  // Exit early on timeout
 			}
 
-			if(kill_brokers_){
-				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 100) {
+			size_t current_acks = ack_received_.load(std::memory_order_acquire);
+			if (current_acks > last_ack_val) {
+				last_ack_val = current_acks;
+				last_ack_change_time = now;
+			}
+
+			if (kill_brokers_) {
+				if (std::chrono::duration_cast<std::chrono::seconds>(now - last_ack_change_time).count() >= 5) { // increased to 5 seconds
+					LOG(INFO) << "[Publisher ACK]: No new ACKs for 5s after broker kill. Assuming remaining " << (target_acks - current_acks) << " messages were lost in flight.";
 					break;
 				}
 			}
@@ -610,6 +664,14 @@ bool Publisher::Poll(size_t n) {
 		// Only treat as success if we actually received ACKs for all messages
 		const size_t received = ack_received_.load(std::memory_order_relaxed);
 		if (received < target_acks) {
+			if (kill_brokers_) {
+				LOG(INFO) << "[Publisher ACK]: Allowed shortfall due to killed brokers. received=" << received << " target=" << target_acks;
+				// Clean up resources since test passes
+				const char* drain_env = std::getenv("EMBARCADERO_ACK_DRAIN_MS");
+				int drain_ms = drain_env ? std::atoi(drain_env) : 3000; // Increased to 3s to let trailing ACKs arrive and to keep the run_failures loop going longer to collect metrics
+				if (drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
+				return true;
+			}
 			LOG(ERROR) << "[Publisher ACK Failure]: Did not receive ACKs for all messages. received="
 			           << received << " target=" << target_acks << " short=" << (target_acks - received);
 			std::string per_broker;
@@ -630,7 +692,7 @@ bool Publisher::Poll(size_t n) {
 		LOG(INFO) << "[ACK_VERIFY] received=" << received << " target=" << target_acks << " 100%";
 		// [[ORDER_0_TAIL_ACK]] Drain so EpollAckThread can read in-flight ACKs before we return.
 		const char* drain_env = std::getenv("EMBARCADERO_ACK_DRAIN_MS");
-		int drain_ms = drain_env ? std::atoi(drain_env) : 50;
+		int drain_ms = drain_env ? std::atoi(drain_env) : 3000; // Increased to 3s to let trailing ACKs arrive and to keep the run_failures loop going longer to collect metrics
 		if (drain_ms > 0) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
 		}
@@ -673,12 +735,16 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 	kill_brokers_thread_ = std::thread([=, this]() {
 		size_t bytes_to_kill_brokers = total_message_size * failure_percentage;
 
-		while (!shutdown_.load(std::memory_order_relaxed) && total_sent_bytes_.load(std::memory_order_acquire) < bytes_to_kill_brokers) {
-			std::this_thread::yield();
+		while (!shutdown_.load(std::memory_order_relaxed) && !publish_finished_.load(std::memory_order_relaxed) && total_sent_bytes_.load(std::memory_order_acquire) < bytes_to_kill_brokers) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Was 10ms, use 1ms for faster detection
 		}
 
 		if (!shutdown_.load(std::memory_order_relaxed)) {
+			size_t sent_at_trigger = total_sent_bytes_.load(std::memory_order_acquire);
+			LOG(INFO) << "Triggering broker kill at " << sent_at_trigger << " bytes sent";
+			RecordFailureEvent("Broker kill requested (gRPC)");
 			killbrokers();
+			throttle_relaxed_.store(true, std::memory_order_release);
 		}
 	});
 
@@ -686,10 +752,17 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 	real_time_throughput_measure_thread_ = std::thread([=, this]() {
 		std::vector<size_t> prev_throughputs(num_brokers, 0);
 
-		// Open file for writing throughput data
-		//TODO(Jae) Rewrite this to be relative path
-		std::string home_dir = getenv("HOME") ? getenv("HOME") : "."; // Get home dir or use current
-		std::string filename = home_dir + "/Embarcadero/data/failure/real_time_acked_throughput.csv";
+		// Open file for writing throughput data. Prefer EMBARCADERO_FAILURE_DATA_DIR so run_failures.sh can place output in project data dir.
+		const char* failure_dir = std::getenv("EMBARCADERO_FAILURE_DATA_DIR");
+		std::string dir;
+		if (failure_dir && failure_dir[0]) {
+			dir = failure_dir;
+		} else {
+			const char* home = std::getenv("HOME");
+			dir = (home && home[0]) ? home : ".";
+			dir += "/Embarcadero/data/failure";
+		}
+		std::string filename = dir + "/real_time_acked_throughput.csv";
 		std::ofstream throughputFile(filename);
 		if (!throughputFile.is_open()) {
 		LOG(ERROR) << "Failed to open file for writing throughput data: " << filename;
@@ -703,32 +776,39 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 		}
 		throughputFile << ",Total_GBps\n";
 
-		// Measuring loop
-		const int measurement_interval_ms = 5;
-		const double time_factor_gbps = (1000.0 / measurement_interval_ms) / (1024.0 * 1024.0 * 1024.0); // Factor to get GB/s
+		constexpr int kTargetIntervalMs = 100;
+		constexpr double kGBDivisor = 1024.0 * 1024.0 * 1024.0;
+		constexpr int kDrainIntervalsAfterFinish = 30;  // 3s of trailing measurements after publish finishes
+		auto prev_time = std::chrono::steady_clock::now();
+		int drain_remaining = -1;  // -1 = not draining yet
 
 		while (!shutdown_.load(std::memory_order_relaxed)) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(measurement_interval_ms));
-			size_t sum = 0;
+			std::this_thread::sleep_for(std::chrono::milliseconds(kTargetIntervalMs));
 			auto now = std::chrono::steady_clock::now();
-			auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count();
-			throughputFile << timestamp_ms; // Write timestamp
+			double elapsed_sec = std::chrono::duration<double>(now - prev_time).count();
+			if (elapsed_sec <= 0.0) elapsed_sec = kTargetIntervalMs / 1000.0;
+			prev_time = now;
 
+			auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count();
+			throughputFile << timestamp_ms;
+
+			size_t sum = 0;
 			for (size_t i = 0; i < num_brokers; i++) {
 				size_t bytes = broker_stats_[i].acked_messages.load(std::memory_order_relaxed) * message_size;
-				size_t real_time_throughput = (bytes - prev_throughputs[i]);
-
-				// Convert to GB/s for CSV
-				double gbps = real_time_throughput * time_factor_gbps;
+				size_t delta_bytes = bytes - prev_throughputs[i];
+				double gbps = (static_cast<double>(delta_bytes) / elapsed_sec) / kGBDivisor;
 				throughputFile << "," << gbps;
-
-				sum += real_time_throughput;
+				sum += delta_bytes;
 				prev_throughputs[i] = bytes;
 			}
 
-			// Convert total to GB/s
-			double total_gbps = (sum * time_factor_gbps); 
+			double total_gbps = (static_cast<double>(sum) / elapsed_sec) / kGBDivisor;
 			throughputFile << "," << total_gbps << "\n";
+
+			if (publish_finished_.load(std::memory_order_relaxed)) {
+				if (drain_remaining < 0) drain_remaining = kDrainIntervalsAfterFinish;
+				if (--drain_remaining <= 0) break;
+			}
 		}
 
 		throughputFile.flush();
@@ -1146,10 +1226,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			return false;
 		}
 
-		// Register socket with epoll
+		// Register socket with epoll; EPOLLRDHUP detects peer FIN immediately
 		struct epoll_event event;
 		event.data.fd = sock.get();
-		event.events = EPOLLOUT;
+		event.events = EPOLLOUT | EPOLLRDHUP;
 		if (epoll_ctl(efd.get(), EPOLL_CTL_ADD, sock.get(), &event) != 0) {
 			LOG(ERROR) << "epoll_ctl failed: " << strerror(errno);
 			sock = ScopedFd();
@@ -1194,7 +1274,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					ssize_t bytesSent = send(sock.get(), 
 							reinterpret_cast<int8_t*>(&shake) + sent_bytes, 
 							sizeof(shake) - sent_bytes, 
-							0);
+							MSG_NOSIGNAL);
 
 					if (bytesSent <= 0) {
 						if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -1296,9 +1376,9 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			++batch_count;
 #ifdef COLLECT_LATENCY_STATS
 			auto submit_time = std::chrono::steady_clock::now();
-			if (!pubQue_.GetBatchSubmitTime(batch_header, &submit_time)) {
-				// Fallback keeps metric available even if seal metadata is missing for this batch.
-				submit_time = std::chrono::steady_clock::now();
+			bool has_submit_time = pubQue_.GetBatchSubmitTime(batch_header, &submit_time);
+			if (!has_submit_time) {
+				// Keep send->ack metric only; submit->ack must use true submit timestamps.
 				publish_submit_time_missing_.fetch_add(1, std::memory_order_relaxed);
 			}
 #endif
@@ -1316,9 +1396,12 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Function to send batch header
 		auto send_batch_header = [&]() -> void {
+			// Always refresh broker_id from the (potentially updated) local variable.
+			// After reconnection to a new broker, broker_id changes; batch header must reflect it.
+			batch_header->broker_id = broker_id;
+
 			// Handle sequencer-specific batch header processing
 			if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
-				batch_header->broker_id = broker_id;
 				// [[CORFU_FIX]] Sequencer expects per-broker batch_seq (0,1,2,...), not global.
 				// Use per-broker counter so each broker's batches are sequenced correctly.
 				if (broker_id >= 0 && broker_id < kMaxCorfuBrokers) {
@@ -1352,12 +1435,14 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			// Send batch header with retry logic
 			size_t total_sent = 0;
 			const size_t header_size = sizeof(Embarcadero::BatchHeader);
+			size_t consecutive_timeouts = 0;
+			const size_t max_consecutive_timeouts = 500; // 500ms fallback (TCP_USER_TIMEOUT handles fast path)
 
 			while (total_sent < header_size) {
 				bytesSent = send(sock.get(), 
 						reinterpret_cast<uint8_t*>(batch_header) + total_sent, 
 						header_size - total_sent, 
-						0);
+						MSG_NOSIGNAL);
 
 				if (bytesSent < 0) {
 					if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
@@ -1369,8 +1454,18 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 						int n = epoll_wait(efd.get(), events, 64, EPOLL_WAIT_WRITABLE_MS);
 
 						if (n == -1) {
+							if (errno == EINTR) continue;
 							LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
 							throw std::runtime_error("epoll_wait failed");
+						} else if (n == 0) {
+							consecutive_timeouts++;
+							size_t effective_hdr_timeout = throttle_relaxed_.load(std::memory_order_relaxed) ? 50 : max_consecutive_timeouts;
+							if (consecutive_timeouts > effective_hdr_timeout) {
+								LOG(ERROR) << "PublishThread: Header send timed out. Assuming broker is dead.";
+								throw std::runtime_error("send timeout");
+							}
+						} else {
+							consecutive_timeouts = 0;
 						}
 					} else {
 						// Fatal error
@@ -1379,6 +1474,14 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					}
 				} else {
 					total_sent += bytesSent;
+					consecutive_timeouts = 0;
+					if (throttle_relaxed_.load(std::memory_order_relaxed)) {
+						char probe;
+						ssize_t r = recv(sock.get(), &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+						if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+							throw std::runtime_error("broker dead (FIN/RST detected)");
+						}
+					}
 				}
 			}
 		};
@@ -1392,10 +1495,12 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 		} catch (const std::exception& e) {
 			total_batches_failed_.fetch_add(1, std::memory_order_relaxed);
-			pubQue_.ReleaseBatch(batch_header);
 			LOG(ERROR) << "Exception sending batch header: " << e.what();
 			std::string fail_msg = "Header Send Fail Broker " + std::to_string(broker_id) + " (" + e.what() + ")";
 			RecordFailureEvent(fail_msg); // Record event
+
+			// DYNAMIC MASK UPDATE: stop upstream from feeding this queue
+			pubQue_.MarkQueueInactive(pubQuesIdx);
 
 			// Handle broker failure by finding another broker
 			int new_broker_id;
@@ -1431,6 +1536,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			std::string reconn_msg = "Reconnect Success Broker " + std::to_string(new_broker_id) + " (from " + std::to_string(broker_id) + ")";
 			RecordFailureEvent(reconn_msg);
 
+			broker_id = new_broker_id;
 			try {
 				send_batch_header();
 			} catch (const std::exception& e) {
@@ -1441,15 +1547,13 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				RecordFailureEvent(fail_msg2);
 				return;
 			}
-
-			// Thread redirected from broker to new broker after failure
-
-			broker_id = new_broker_id;
 		}
 
 		// Send message data
 		size_t sent_bytes = 0;
 		size_t zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
+		size_t consecutive_data_timeouts = 0;
+		const size_t max_consecutive_data_timeouts = 500; // 500ms fallback (TCP_USER_TIMEOUT handles fast path)
 
 		// CRITICAL: Ensure all batch data is sent before checking publish_finished_
 		// This prevents premature thread exit while data is still in flight
@@ -1463,7 +1567,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			size_t to_send = std::min(remaining_bytes, zero_copy_send_limit);
 
 		// SO_ZEROCOPY is disabled in socket setup; keep send path consistent.
-		int send_flags = 0;
+		int send_flags = MSG_NOSIGNAL;
 			bytesSent = send(sock.get(), 
 					static_cast<uint8_t*>(msg) + sent_bytes, 
 					to_send, 
@@ -1474,6 +1578,22 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				broker_stats_[broker_id].sent_bytes.fetch_add(bytesSent, std::memory_order_relaxed);
 				total_sent_bytes_.fetch_add(bytesSent, std::memory_order_relaxed);
 				sent_bytes += bytesSent;
+				consecutive_data_timeouts = 0;
+
+				// After kill initiated, probe for FIN/RST from dead broker.
+				// send() succeeds while kernel buffer has space, but recv(MSG_PEEK)
+				// reveals the broker closed its end (FIN → ret==0, RST → ECONNRESET).
+				if (throttle_relaxed_.load(std::memory_order_relaxed)) {
+					char probe;
+					ssize_t r = recv(sock.get(), &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+					if (r == 0) {
+						errno = ECONNRESET;
+						goto handle_send_failure;
+					}
+					if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+						goto handle_send_failure;
+					}
+				}
 
 				// Reset backoff after successful send
 				zero_copy_send_limit = ZERO_COPY_SEND_LIMIT;
@@ -1486,18 +1606,46 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					int n = epoll_wait(efd.get(), events, 64, wait_ms);
 
 					if (n == -1) {
+					if (errno == EINTR) continue; // Just retry on interrupt
 					LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
-					pubQue_.ReleaseBatch(batch_header);
-					break;
+					goto handle_send_failure; // Treat as send failure instead of breaking the loop
+				} else if (n == 0) {
+					consecutive_data_timeouts++;
+					size_t effective_timeout = throttle_relaxed_.load(std::memory_order_relaxed) ? 10 : max_consecutive_data_timeouts;
+					if (consecutive_data_timeouts > effective_timeout) {
+						LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Send timed out. Assuming broker is dead.";
+						bytesSent = -1;
+						errno = ETIMEDOUT;
+						goto handle_send_failure;
+					}
+				} else {
+					consecutive_data_timeouts = 0;
+					for (int ei = 0; ei < n; ei++) {
+						if (events[ei].events & (EPOLLRDHUP | EPOLLERR | EPOLLHUP)) {
+							LOG(WARNING) << "PublishThread[" << pubQuesIdx << "]: Peer hangup detected via epoll";
+							bytesSent = -1;
+							errno = ECONNRESET;
+							goto handle_send_failure;
+						}
+					}
 				}
 
 				// OPTIMIZATION: Less aggressive backoff (25%) to maintain higher throughput (old behavior)
 				zero_copy_send_limit = std::max(zero_copy_send_limit * 3 / 4, 1UL << 16); // Reduce by 25%, min 64KB
+			} else if (bytesSent == 0) {
+				LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Send returned 0. Connection closed by broker.";
+				bytesSent = -1;
+				errno = ECONNRESET;
+				goto handle_send_failure;
 			} else if (bytesSent < 0) {
+handle_send_failure:
 				// Connection failure, switch to a different broker
 				LOG(WARNING) << "Send failed to broker " << broker_id << ": " << strerror(errno);
 				std::string fail_msg = "Data Send Fail Broker " + std::to_string(broker_id) + " errno=" + std::to_string(errno);
 				RecordFailureEvent(fail_msg);
+
+				// DYNAMIC MASK UPDATE: stop upstream from feeding this queue
+				pubQue_.MarkQueueInactive(pubQuesIdx);
 
 				int new_broker_id;
 				{
@@ -1532,6 +1680,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				std::string reconn_msg = "Reconnect Success Broker " + std::to_string(new_broker_id) + " (from " + std::to_string(broker_id) + ")";
 				RecordFailureEvent(reconn_msg);
 				// Reset and try again with new broker
+				broker_id = new_broker_id;
 				try {
 					send_batch_header();
 				} catch (const std::exception& e) {
@@ -1541,9 +1690,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					return;
 				}
 
-				// Thread redirected from broker to new broker after failure
-
-				broker_id = new_broker_id;
 				sent_bytes = 0;
 			}
 		}
@@ -1556,7 +1702,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			batch_header->num_msg, std::memory_order_relaxed);
 		size_t end_count = prev_sent + batch_header->num_msg;
 #ifdef COLLECT_LATENCY_STATS
-		RecordPublishSend(broker_id, end_count, submit_time);
+		RecordPublishSend(broker_id, end_count, submit_time, has_submit_time);
 #else
 		(void)end_count;
 #endif

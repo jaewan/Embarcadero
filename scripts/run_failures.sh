@@ -1,6 +1,7 @@
 #!/bin/bash
 # Broker failure test: start cluster, run throughput_test with mid-run broker kill, then plot.
 # Ensure we run from project root (works when invoked from any directory).
+set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -11,7 +12,7 @@ if [ ! -d "build/bin" ]; then
 fi
 cd build/bin
 
-# Config for brokers (same as run_throughput.sh)
+# Config for brokers
 HEAD_CONFIG_ARG="--config ../../config/embarcadero.yaml"
 CONFIG_ARG="--config ../../config/embarcadero.yaml"
 
@@ -31,23 +32,54 @@ if [ -n "${EMBARCADERO_TUNE_KERNEL_BUFFERS:-}" ]; then
 fi
 
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
-EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1}"
+
+# Auto-detect NUMA: use numactl only if available and >1 NUMA node exists.
+# Override with EMBARLET_NUMA_BIND="" to disable entirely.
+if [ -z "${EMBARLET_NUMA_BIND+x}" ]; then
+  if command -v numactl &>/dev/null && [ "$(numactl --hardware 2>/dev/null | grep -c 'available:.*nodes')" -gt 0 ]; then
+    numa_nodes=$(numactl --hardware 2>/dev/null | awk '/^available:/{print $2}')
+    if [ "${numa_nodes:-1}" -gt 1 ]; then
+      EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1"
+      echo "NUMA detected ($numa_nodes nodes). Using: $EMBARLET_NUMA_BIND"
+    else
+      EMBARLET_NUMA_BIND=""
+      echo "Single NUMA node detected. Running without NUMA binding."
+    fi
+  else
+    EMBARLET_NUMA_BIND=""
+    echo "numactl not found or NUMA not available. Running without NUMA binding."
+  fi
+fi
 
 # --- Failure test parameters ---
 NUM_BROKERS=${NUM_BROKERS:-4}
-FAILURE_PERCENTAGE=${FAILURE_PERCENTAGE:-0.15}
+FAILURE_PERCENTAGE=${FAILURE_PERCENTAGE:-0.5}
 NUM_BROKERS_TO_KILL=${NUM_BROKERS_TO_KILL:-1}
 NUM_TRIALS=${NUM_TRIALS:-1}
 test_cases=(4)
-# 20 GiB total message size (same order of magnitude as original 21474836480)
 TOTAL_MESSAGE_SIZE=${TOTAL_MESSAGE_SIZE:-21474836480}
 ORDER=${ORDER:-0}
 ack=${ACK:-1}
-sequencer=EMBARCADERO
+sequencer=${SEQUENCER:-EMBARCADERO}
+MESSAGE_SIZE=${MESSAGE_SIZE:-1024}
 
-# Ensure failure data directory exists (client writes real_time_acked_throughput.csv and failure_events.csv here)
-FAILURE_DATA_DIR="$PROJECT_ROOT/data/failure"
+# Ensure failure data directory exists (absolute path so client can write there)
+FAILURE_DATA_DIR="$(cd "$PROJECT_ROOT" && pwd)/data/failure"
 mkdir -p "$FAILURE_DATA_DIR"
+# Client writes to this dir when env is set (see publisher.cc, test_utils.cc)
+export EMBARCADERO_FAILURE_DATA_DIR="$FAILURE_DATA_DIR"
+
+echo "===== Failure Benchmark Configuration ====="
+echo "  Brokers:          $NUM_BROKERS"
+echo "  Kill:             $NUM_BROKERS_TO_KILL broker(s) at ${FAILURE_PERCENTAGE} of data"
+echo "  Total data:       $TOTAL_MESSAGE_SIZE bytes"
+echo "  Message size:     $MESSAGE_SIZE bytes"
+echo "  Order:            $ORDER"
+echo "  ACK level:        $ack"
+echo "  Sequencer:        $sequencer"
+echo "  Trials:           $NUM_TRIALS"
+echo "  Output dir:       $FAILURE_DATA_DIR"
+echo "============================================"
 
 # Wait for a single broker to signal readiness (file-based, non-blocking)
 wait_for_broker_ready() {
@@ -110,6 +142,7 @@ wait_for_all_brokers_ready() {
   while [ $elapsed -lt $timeout ]; do
     local all_ready=1
     for expected_pid in "${pids[@]}"; do
+      [ -z "$expected_pid" ] && continue
       if [ ! -f "/tmp/embarlet_${expected_pid}_ready" ]; then
         all_ready=0
         if ! kill -0 "$expected_pid" 2>/dev/null && [ $elapsed -ge 5 ]; then
@@ -135,20 +168,17 @@ wait_for_all_brokers_ready() {
 # --- Run failure trials ---
 for test_case in "${test_cases[@]}"; do
   for ((trial=1; trial<=NUM_TRIALS; trial++)); do
-    echo "=== Failure trial $trial / $NUM_TRIALS (test_case=$test_case, kill $NUM_BROKERS_TO_KILL broker(s) at ${FAILURE_PERCENTAGE}% of data) ==="
+    echo ""
+    echo "================================================================="
+    echo "=== Failure trial $trial / $NUM_TRIALS (test_case=$test_case, kill $NUM_BROKERS_TO_KILL broker(s) at ${FAILURE_PERCENTAGE} of data) ==="
+    echo "================================================================="
 
     pids=()
-    # Start head broker
+    # Start head broker; $! is the PID of the background embarlet process
     $EMBARLET_NUMA_BIND ./embarlet $HEAD_CONFIG_ARG --head --$sequencer > broker_0_trial${trial}.log 2>&1 &
-    shell_pid=$!
-    sleep 0.5
-    head_pid=$(pgrep -f "embarlet.*--head" 2>/dev/null | head -1)
-    if [ -z "$head_pid" ]; then
-      child=$(ps --ppid $shell_pid -o pid=,comm= --no-headers 2>/dev/null | grep embarlet | awk '{print $1}')
-      [ -n "$child" ] && head_pid=$child || head_pid=$shell_pid
-    fi
+    head_pid=$!
     pids+=($head_pid)
-    echo "Started head broker with PID $head_pid"
+    echo "Started head broker with PID $head_pid (log: broker_0_trial${trial}.log)"
 
     if ! wait_for_broker_ready "$head_pid" 60; then
       echo "Head broker failed to initialize, aborting trial"
@@ -158,6 +188,7 @@ for test_case in "${test_cases[@]}"; do
       continue
     fi
 
+    echo "Starting follower brokers..."
     # Start follower brokers in parallel
     broker_shell_pids=()
     for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
@@ -165,58 +196,54 @@ for test_case in "${test_cases[@]}"; do
       broker_shell_pids+=($!)
     done
     sleep 0.5
-    follower_pids=()
-    for broker_shell_pid in "${broker_shell_pids[@]}"; do
-      broker_pid=""
-      for pid in $(pgrep -f "embarlet.*--config" 2>/dev/null | grep -v "embarlet.*--head" || true); do
-        current=$pid
-        for j in 1 2 3 4 5; do
-          parent=$(ps -o ppid= -p $current 2>/dev/null | tr -d ' ')
-          [ -z "$parent" ] || [ "$parent" = "1" ] && break
-          if [ "$parent" = "$broker_shell_pid" ]; then
-            broker_pid=$pid
-            break 2
-          fi
-          current=$parent
-        done
-      done
-      [ -z "$broker_pid" ] && broker_pid=$(ps --ppid $broker_shell_pid -o pid= --no-headers 2>/dev/null | tr -d ' ' | head -1)
-      [ -z "$broker_pid" ] && broker_pid=$broker_shell_pid
-      follower_pids+=($broker_pid)
-      pids+=($broker_pid)
-    done
-    echo "Started follower brokers with PIDs: ${follower_pids[*]}"
+    # $! from each "cmd &" is the PID of that process; use them directly as follower PIDs
+    follower_pids=("${broker_shell_pids[@]}")
+    for pid in "${follower_pids[@]}"; do pids+=($pid); done
+    echo "Started follower brokers with PIDs: ${follower_pids[*]} (waiting up to 90s for ready)"
 
-    if ! wait_for_all_brokers_ready 20 "${follower_pids[@]}"; then
-      echo "One or more followers failed to initialize, aborting trial"
+    if ! wait_for_all_brokers_ready 90 "${follower_pids[@]}"; then
+      echo "One or more followers failed to initialize (timeout 90s), aborting trial"
       for pid in "${pids[@]}"; do kill $pid 2>/dev/null || true; done
       pids=()
       cleanup
       continue
     fi
-    echo "All brokers ready, cluster formed. Starting failure throughput test..."
+    echo "All $NUM_BROKERS brokers ready, cluster formed."
 
     # Longer ACK timeout when ack>=1 (failure + redirect can delay ACKs)
     if [ "$ack" != "0" ]; then
-      export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-90}"
+      export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-120}"
     fi
     THREADS_PER_BROKER=${THREADS_PER_BROKER:-$([ "$NUM_BROKERS" = "1" ] && echo 1 || echo 3)}
 
-    # Run failure test in foreground (test_case 4 = broker failure at publish)
-    stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m ${MESSAGE_SIZE:-1024} \
+    echo "Starting failure throughput test..."
+    echo "  threads_per_broker=$THREADS_PER_BROKER, message_size=$MESSAGE_SIZE"
+    echo "  Throughput/events will be written to: $FAILURE_DATA_DIR"
+
+    # Run failure test with timeout to prevent infinite hang (Bug: publish loop can stall on ACK backpressure)
+    CLIENT_LOG="client_failure_trial${trial}.log"
+    CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-300}  # 5 minutes max
+    set +e
+    timeout --signal=TERM --kill-after=10 "$CLIENT_TIMEOUT" \
+      stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml \
+      -n $THREADS_PER_BROKER -m $MESSAGE_SIZE \
       -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case \
       --num_brokers_to_kill $NUM_BROKERS_TO_KILL --failure_percentage $FAILURE_PERCENTAGE \
-      -o $ORDER -a $ack --sequencer $sequencer -l 0
-    test_exit_code=$?
+      -o $ORDER -a $ack --sequencer $sequencer -l 0 2>&1 | tee "$CLIENT_LOG"
+    test_exit_code=${PIPESTATUS[0]}
+    set -e
+
     if [ $test_exit_code -ne 0 ]; then
-      echo "ERROR: Failure throughput test exited with code $test_exit_code"
+      echo "WARNING: Failure throughput test exited with code $test_exit_code"
+      echo "  Check $CLIENT_LOG and broker logs for details."
+    else
+      echo "Failure throughput test completed successfully."
     fi
 
     # Clean up broker processes
-    echo "Test completed, cleaning up broker processes..."
+    echo "Cleaning up broker processes..."
     for pid in "${pids[@]}"; do
-      kill $pid 2>/dev/null || true
-      echo "Terminated broker PID $pid"
+      kill $pid 2>/dev/null && echo "  Terminated broker PID $pid" || echo "  Broker PID $pid already exited"
     done
     pids=()
     sleep 0.5
@@ -225,19 +252,37 @@ for test_case in "${test_cases[@]}"; do
   done
 done
 
-# Plot results (client writes CSV under data/failure when HOME or path is set; plot from project root)
-if [ -f "$FAILURE_DATA_DIR/real_time_acked_throughput.csv" ]; then
-  echo "Plotting failure run results..."
-  python3 "$PROJECT_ROOT/scripts/plot/plot_failure.py" \
-    "$FAILURE_DATA_DIR/real_time_acked_throughput.csv" failure \
-    --events "$FAILURE_DATA_DIR/failure_events.csv" 2>/dev/null || true
-else
-  echo "No real_time_acked_throughput.csv found in $FAILURE_DATA_DIR (client may write to \$HOME/Embarcadero/data/failure). Skipping plot."
-  if [ -n "$HOME" ] && [ -f "$HOME/Embarcadero/data/failure/real_time_acked_throughput.csv" ]; then
+# Plot results
+echo ""
+echo "===== Plotting Results ====="
+THROUGHPUT_CSV="$FAILURE_DATA_DIR/real_time_acked_throughput.csv"
+EVENTS_CSV="$FAILURE_DATA_DIR/failure_events.csv"
+
+if [ -f "$THROUGHPUT_CSV" ]; then
+  echo "Found throughput data: $THROUGHPUT_CSV"
+  if [ -f "$EVENTS_CSV" ]; then
+    echo "Found event data: $EVENTS_CSV"
     python3 "$PROJECT_ROOT/scripts/plot/plot_failure.py" \
-      "$HOME/Embarcadero/data/failure/real_time_acked_throughput.csv" failure \
-      --events "$HOME/Embarcadero/data/failure/failure_events.csv" 2>/dev/null || true
+      "$THROUGHPUT_CSV" "$FAILURE_DATA_DIR/failure" \
+      --events "$EVENTS_CSV" 2>&1 || echo "Warning: plot generation failed"
+  else
+    python3 "$PROJECT_ROOT/scripts/plot/plot_failure.py" \
+      "$THROUGHPUT_CSV" "$FAILURE_DATA_DIR/failure" 2>&1 || echo "Warning: plot generation failed"
+  fi
+else
+  echo "No throughput CSV found at $THROUGHPUT_CSV"
+  # Fallback: check HOME-relative path (client writes to $HOME/Embarcadero/data/failure/)
+  ALT_CSV="$HOME/Embarcadero/data/failure/real_time_acked_throughput.csv"
+  ALT_EVENTS="$HOME/Embarcadero/data/failure/failure_events.csv"
+  if [ -f "$ALT_CSV" ]; then
+    echo "Found throughput data at alternate path: $ALT_CSV"
+    python3 "$PROJECT_ROOT/scripts/plot/plot_failure.py" \
+      "$ALT_CSV" "$FAILURE_DATA_DIR/failure" \
+      --events "$ALT_EVENTS" 2>&1 || echo "Warning: plot generation failed"
+  else
+    echo "No throughput data found. Skipping plot."
   fi
 fi
 
+echo ""
 echo "All failure experiments have finished."

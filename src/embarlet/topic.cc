@@ -2645,21 +2645,36 @@ bool Topic::GetMessageAddr(
 	if (last_addr != nullptr) {
 		start_msg_header = static_cast<MessageHeader*>(last_addr);
 
-		// [[CXL_VISIBILITY]] Invalidate cache before reading next_msg_diff (writer may be in same process, different core)
-		CXL::flush_cacheline(CXL::ToFlushable(start_msg_header));
-		CXL::load_fence();
-
-		// Wait for message to be combined if necessary
-		while (start_msg_header->next_msg_diff == 0) {
+		if (order_ == 0) {
+			// [[CXL_VISIBILITY]] Invalidate cache before reading paddedSize
 			CXL::flush_cacheline(CXL::ToFlushable(start_msg_header));
 			CXL::load_fence();
-			std::this_thread::yield();
-		}
 
-		// Move to next message
-		start_msg_header = reinterpret_cast<MessageHeader*>(
-				reinterpret_cast<uint8_t*>(start_msg_header) + start_msg_header->next_msg_diff
-				);
+			// Wait for message to be written if necessary (paddedSize is set by publisher)
+			while (start_msg_header->paddedSize == 0) {
+				CXL::flush_cacheline(CXL::ToFlushable(start_msg_header));
+				CXL::load_fence();
+				std::this_thread::yield();
+			}
+
+			// We DO NOT move start_msg_header for order 0! It is ALREADY pointing to the next unread message!
+		} else {
+			// [[CXL_VISIBILITY]] Invalidate cache before reading next_msg_diff (writer may be in same process, different core)
+			CXL::flush_cacheline(CXL::ToFlushable(start_msg_header));
+			CXL::load_fence();
+
+			// Wait for message to be combined if necessary
+			while (start_msg_header->next_msg_diff == 0) {
+				CXL::flush_cacheline(CXL::ToFlushable(start_msg_header));
+				CXL::load_fence();
+				std::this_thread::yield();
+			}
+
+			// Move to next message
+			start_msg_header = reinterpret_cast<MessageHeader*>(
+					reinterpret_cast<uint8_t*>(start_msg_header) + start_msg_header->next_msg_diff
+					);
+		}
 	} else {
 		// Start from first message.
 		if (order_ == 0) {
@@ -2717,6 +2732,7 @@ bool Topic::GetMessageAddr(
 	}
 
 #ifdef MULTISEGMENT
+	LOG(FATAL) << "MULTISEGMENT IS DEFINED!";
 	// Multi-segment logic for determining message size and last offset
 	unsigned long long int* segment_offset_ptr =
 		static_cast<unsigned long long int*>(start_msg_header->segment_header);
@@ -2742,9 +2758,14 @@ bool Topic::GetMessageAddr(
 	}
 #else
 	// Single-segment logic for determining message size and last offset
-	size_t full_size = reinterpret_cast<uint8_t*>(combined_addr) -
-		reinterpret_cast<uint8_t*>(start_msg_header) +
-		reinterpret_cast<MessageHeader*>(combined_addr)->paddedSize;
+	size_t full_size;
+	if (order_ == 0) {
+		full_size = reinterpret_cast<uint8_t*>(combined_addr) - reinterpret_cast<uint8_t*>(start_msg_header);
+	} else {
+		full_size = reinterpret_cast<uint8_t*>(combined_addr) -
+			reinterpret_cast<uint8_t*>(start_msg_header) +
+			reinterpret_cast<MessageHeader*>(combined_addr)->paddedSize;
+	}
 
 	// Order 0: cap export at 2MB per call to reduce mutex/send overhead (batch message export)
 	constexpr size_t kMaxExportBatchBytes = 2UL << 20;
@@ -2764,35 +2785,41 @@ bool Topic::GetMessageAddr(
 			// [[CXL_VISIBILITY]] Ensure we see writer's logical_offset (completion runs on receive path).
 			CXL::flush_cacheline(CXL::ToFlushable(stop_at));
 			CXL::load_fence();
-			last_offset = stop_at->logical_offset;
-			// [[FIX: FOLLOWER_CAUGHT_UP]] Never set last_offset=combined_offset in cap path when
-			// logical_offset is -1 (stale cache or unset). That falsely marks "caught up" and
-			// stops sending after ~12 MB. Use conservative value so next call returns more.
-			if (last_offset == static_cast<size_t>(-1))
+			if (order_ == 0) {
 				last_offset = (combined_offset > 0) ? (combined_offset - 1) : 0;
-			last_addr = stop_at;
+				// For order 0, last_addr should always be the NEXT message to read
+				last_addr = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(stop_at) + stop_at->paddedSize);
+			} else {
+				last_offset = stop_at->logical_offset;
+				if (last_offset == static_cast<size_t>(-1))
+					last_offset = (combined_offset > 0) ? (combined_offset - 1) : 0;
+				last_addr = stop_at;
+			}
 			messages_size = reinterpret_cast<uint8_t*>(stop_at) -
 				reinterpret_cast<uint8_t*>(start_msg_header) + stop_at->paddedSize;
 		} else {
 			CXL::flush_cacheline(CXL::ToFlushable(combined_addr));
 			CXL::load_fence();
-			last_offset = reinterpret_cast<MessageHeader*>(combined_addr)->logical_offset;
-			if (last_offset == static_cast<size_t>(-1))
-				last_offset = (combined_offset > 0) ? (combined_offset - 1) : 0;
+			if (order_ == 0) {
+				last_offset = combined_offset;
+			} else {
+				last_offset = reinterpret_cast<MessageHeader*>(combined_addr)->logical_offset;
+			}
 			last_addr = combined_addr;
 			messages_size = full_size;
 		}
 	} else {
 		CXL::flush_cacheline(CXL::ToFlushable(combined_addr));
 		CXL::load_fence();
-		last_offset = reinterpret_cast<MessageHeader*>(combined_addr)->logical_offset;
-		if (order_ == 0 && last_offset == static_cast<size_t>(-1))
-			last_offset = (combined_offset > 0) ? (combined_offset - 1) : 0;
+		if (order_ == 0) {
+			last_offset = combined_offset;
+		} else {
+			last_offset = reinterpret_cast<MessageHeader*>(combined_addr)->logical_offset;
+		}
 		last_addr = combined_addr;
 		messages_size = full_size;
 	}
 #endif
-
 
 	return true;
 }
