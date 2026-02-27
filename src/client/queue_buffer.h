@@ -176,6 +176,8 @@ private:
 	void AdvanceWriteBufId();
 	void NotifyQueueDataReady(size_t queue_idx);
 	void NotifyAllWaiters();
+	/** Acquire next writable batch from pool and reset local producer state. */
+	bool AcquireNextBatchFromPool(bool stop_on_shutdown, const char* context);
 	/** Seal current batch and push to queues_[write_buf_id_], then advance and get new buffer. Returns num_msg in batch sealed (0 if none). */
 	size_t SealCurrentAndAdvance();
 	/** Debug: true iff batch is a slot base in one of our regions (for ReleaseBatch validation). */

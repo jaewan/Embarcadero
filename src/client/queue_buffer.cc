@@ -123,6 +123,8 @@ bool QueueBuffer::AddBuffers(size_t /*buf_size*/) {
 	for (size_t i = 0; i < slots_this_region; i++) {
 		Embarcadero::BatchHeader* slot = reinterpret_cast<Embarcadero::BatchHeader*>(
 			reinterpret_cast<uint8_t*>(region) + i * slot_size_);
+		// Zero-initialize to prevent stale data (paddedSize=0) from recycled batches
+		memset(slot, 0, slot_size_);
 		pool_->write(slot);
 	}
 
@@ -149,6 +151,51 @@ void QueueBuffer::NotifyAllWaiters() {
 	for (size_t i = 0; i < num_queues_; ++i) {
 		queue_wait_cvs_[i].notify_all();
 	}
+}
+
+bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* context) {
+	if (!pool_) {
+		LOG(ERROR) << "QueueBuffer::" << (context ? context : "AcquireNextBatchFromPool")
+		           << " called before pool initialization";
+		current_batch_ = nullptr;
+		current_batch_tail_ = 0;
+		current_batch_num_msg_ = 0;
+		return false;
+	}
+	Embarcadero::BatchHeader* next = nullptr;
+	constexpr int kPoolSpinBeforeYield = 128;
+	int pool_spin = 0;
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPoolAcquireTimeoutMs);
+	while (!pool_->read(next)) {
+		if (stop_on_shutdown && shutdown_.load(std::memory_order_relaxed)) {
+			current_batch_ = nullptr;
+			current_batch_tail_ = 0;
+			current_batch_num_msg_ = 0;
+			return false;
+		}
+		if (++pool_spin % kPoolSpinBeforeYield == 0) {
+			if (std::chrono::steady_clock::now() > deadline) {
+				LOG(ERROR) << "QueueBuffer::" << (context ? context : "AcquireNextBatchFromPool")
+				           << " pool acquire timeout";
+				current_batch_ = nullptr;
+				current_batch_tail_ = 0;
+				current_batch_num_msg_ = 0;
+				return false;
+			}
+			std::this_thread::yield();
+		} else {
+			Embarcadero::CXL::cpu_pause();
+		}
+	}
+	current_batch_ = next;
+	// Defensive clear for recycled buffers so stale headers/payload are never observed.
+	memset(current_batch_, 0, slot_size_);
+	current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
+	current_batch_num_msg_ = 0;
+#ifdef COLLECT_LATENCY_STATS
+	current_batch_first_submit_time_ = {};
+#endif
+	return true;
 }
 
 size_t QueueBuffer::SealCurrentAndAdvance() {
@@ -245,35 +292,9 @@ retry_push:
 		goto retry_push;
 	}
 
-	// Acquire next buffer from pool. [[PERF]] Spin with cpu_pause before yield.
-	Embarcadero::BatchHeader* next = nullptr;
-	constexpr int kPoolSpinBeforeYield = 128;
-	int pool_spin = 0;
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPoolAcquireTimeoutMs);
-	while (!pool_->read(next)) {
-		if (shutdown_.load(std::memory_order_relaxed)) {
-			current_batch_ = nullptr;
-			current_batch_tail_ = 0;
-			return num_sealed;
-		}
-		if (++pool_spin % kPoolSpinBeforeYield == 0) {
-			if (std::chrono::steady_clock::now() > deadline) {
-				LOG(ERROR) << "QueueBuffer: pool acquire timeout";
-				current_batch_ = nullptr;
-				current_batch_tail_ = 0;
-				return num_sealed;
-			}
-			std::this_thread::yield();
-		} else {
-			Embarcadero::CXL::cpu_pause();
-		}
+	if (!AcquireNextBatchFromPool(/*stop_on_shutdown=*/true, "SealCurrentAndAdvance")) {
+		return num_sealed;
 	}
-	current_batch_ = next;
-	current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
-	current_batch_num_msg_ = 0;
-#ifdef COLLECT_LATENCY_STATS
-	current_batch_first_submit_time_ = {};
-#endif
 	return num_sealed;
 }
 
@@ -297,22 +318,10 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 	}
 
 	if (!current_batch_) {
-		Embarcadero::BatchHeader* next = nullptr;
-		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPoolAcquireTimeoutMs);
-		while (!pool_->read(next)) {
-			if (std::chrono::steady_clock::now() > deadline) {
-				LOG(ERROR) << "QueueBuffer::Write pool exhausted";
-				return false;
-			}
-			std::this_thread::yield();
+		if (!AcquireNextBatchFromPool(/*stop_on_shutdown=*/false, "Write")) {
+			return false;
 		}
-			current_batch_ = next;
-			current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
-			current_batch_num_msg_ = 0;
-#ifdef COLLECT_LATENCY_STATS
-			current_batch_first_submit_time_ = {};
-#endif
-		}
+	}
 
 	// If this message would exceed the slot, seal first then write into new buffer.
 	if (current_batch_tail_ + stride > slot_size_) {

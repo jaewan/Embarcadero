@@ -20,51 +20,59 @@ static inline uint64_t SteadyNowNs() {
 		std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+static bool IsEnvFalseValue(const char* value) {
+	if (!value || !value[0]) return false;
+	return std::strcmp(value, "0") == 0 ||
+	       std::strcmp(value, "false") == 0 ||
+	       std::strcmp(value, "FALSE") == 0 ||
+	       std::strcmp(value, "no") == 0 ||
+	       std::strcmp(value, "NO") == 0;
+}
+
+static bool IsEnvTrueValue(const char* value) {
+	if (!value || !value[0]) return false;
+	return std::strcmp(value, "1") == 0 ||
+	       std::strcmp(value, "true") == 0 ||
+	       std::strcmp(value, "TRUE") == 0 ||
+	       std::strcmp(value, "yes") == 0 ||
+	       std::strcmp(value, "YES") == 0;
+}
+
+static bool ReadEnvBoolStrict(const char* env_name, bool default_value) {
+	const char* env = std::getenv(env_name);
+	if (!env) return default_value;
+	if (IsEnvFalseValue(env)) return false;
+	return IsEnvTrueValue(env);
+}
+
+static bool ReadEnvBoolLenient(const char* env_name, bool default_value) {
+	const char* env = std::getenv(env_name);
+	if (!env) return default_value;
+	return !IsEnvFalseValue(env);
+}
+
+static uint64_t ReadEnvPositiveMsToNs(const char* env_name, uint64_t default_ns) {
+	const char* env = std::getenv(env_name);
+	if (!env || !env[0]) return default_ns;
+	long ms = std::strtol(env, nullptr, 10);
+	if (ms <= 0) return default_ns;
+	return static_cast<uint64_t>(ms) * 1000ULL * 1000ULL;
+}
+
 static bool ShouldEnableOrder5Trace() {
-	static const bool enabled = []() {
-		const char* env = std::getenv("EMBARCADERO_ORDER5_TRACE");
-		if (!env) return false;
-		if (std::strcmp(env, "0") == 0 ||
-		    std::strcmp(env, "false") == 0 ||
-		    std::strcmp(env, "FALSE") == 0 ||
-		    std::strcmp(env, "no") == 0 ||
-		    std::strcmp(env, "NO") == 0) {
-			return false;
-		}
-		return std::strcmp(env, "1") == 0 ||
-		       std::strcmp(env, "true") == 0 ||
-		       std::strcmp(env, "TRUE") == 0 ||
-		       std::strcmp(env, "yes") == 0 ||
-		       std::strcmp(env, "YES") == 0;
-	}();
+	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_TRACE", false);
 	return enabled;
 }
 
 static bool ShouldEnableOrder5PhaseDiag() {
-	static const bool enabled = []() {
-		const char* env = std::getenv("EMBARCADERO_ORDER5_PHASE_DIAG");
-		if (!env) return false;
-		if (std::strcmp(env, "0") == 0 ||
-		    std::strcmp(env, "false") == 0 ||
-		    std::strcmp(env, "FALSE") == 0 ||
-		    std::strcmp(env, "no") == 0 ||
-		    std::strcmp(env, "NO") == 0) {
-			return false;
-		}
-		return true;
-	}();
+	static const bool enabled = ReadEnvBoolLenient("EMBARCADERO_ORDER5_PHASE_DIAG", false);
 	return enabled;
 }
 
 static uint64_t GetOrder5HoldTimeoutNs() {
-	static const uint64_t timeout_ns = []() -> uint64_t {
-		constexpr uint64_t kDefaultNs = 100ULL * 1000 * 1000;  // 100ms default
-		const char* env = std::getenv("EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS");
-		if (!env || !env[0]) return kDefaultNs;
-		long ms = std::strtol(env, nullptr, 10);
-		if (ms <= 0) return kDefaultNs;
-		return static_cast<uint64_t>(ms) * 1000ULL * 1000ULL;
-	}();
+	constexpr uint64_t kDefaultNs = 100ULL * 1000 * 1000;  // 100ms default
+	static const uint64_t timeout_ns =
+		ReadEnvPositiveMsToNs("EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS", kDefaultNs);
 	return timeout_ns;
 }
 
@@ -385,10 +393,6 @@ void Topic::DelegationThread() {
 	// Initialize header pointers
 	void* segment_header = reinterpret_cast<uint8_t*>(first_message_addr_) - CACHELINE_SIZE;
 	MessageHeader* header = reinterpret_cast<MessageHeader*>(first_message_addr_);
-
-	// Initialize the memory region to ensure it's safe to access
-	// Zero out the first message header to ensure complete=0 initially
-	memset(header, 0, sizeof(MessageHeader));
 
 	// DelegationThread started for topic
 
