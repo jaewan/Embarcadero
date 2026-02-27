@@ -32,6 +32,7 @@ if [ -n "${EMBARCADERO_TUNE_KERNEL_BUFFERS:-}" ]; then
 fi
 
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
+export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-failure}
 
 # Auto-detect NUMA: use numactl only if available and >1 NUMA node exists.
 # Override with EMBARLET_NUMA_BIND="" to disable entirely.
