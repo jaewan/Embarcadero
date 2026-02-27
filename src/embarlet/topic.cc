@@ -59,6 +59,14 @@ static uint64_t ReadEnvPositiveMsToNs(const char* env_name, uint64_t default_ns)
 	return static_cast<uint64_t>(ms) * 1000ULL * 1000ULL;
 }
 
+static bool ShouldEnableDelegationLegacyFallback() {
+	// Legacy message-by-message delegation path is retained only as an emergency
+	// compatibility fallback. Batch-based delegation is the default and supported path.
+	static const bool enabled =
+		ReadEnvBoolLenient("EMBARCADERO_ENABLE_LEGACY_DELEGATION_FALLBACK", false);
+	return enabled;
+}
+
 static bool ShouldEnableOrder5Trace() {
 	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_TRACE", false);
 	return enabled;
@@ -416,6 +424,11 @@ void Topic::DelegationThread() {
 	constexpr size_t BYTE_FLUSH_INTERVAL = 64 * 1024;  // Flush every 64KB
 	size_t batches_since_flush = 0;
 	size_t bytes_since_flush = 0;
+	const bool legacy_fallback_enabled = ShouldEnableDelegationLegacyFallback();
+	if (legacy_fallback_enabled) {
+		LOG(WARNING) << "DelegationThread: legacy message-by-message fallback enabled via "
+		             << "EMBARCADERO_ENABLE_LEGACY_DELEGATION_FALLBACK; this path is deprecated.";
+	}
 
 		// DelegationThread: Starting batch processing
 
@@ -570,6 +583,12 @@ void Topic::DelegationThread() {
 		}
 		} else if (current_batch && current_batch->num_msg > 0) {
 		// DelegationThread: Waiting for batch completion (reduced logging)
+		}
+
+		// Legacy fallback is opt-in only. Keep it out of default hot path.
+		if (!legacy_fallback_enabled) {
+			CXL::cpu_pause();
+			continue;
 		}
 
 		// FALLBACK: Old message-by-message processing for compatibility
