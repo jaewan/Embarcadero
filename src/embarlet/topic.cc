@@ -475,6 +475,9 @@ void Topic::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers){
 	}
 }
 
+// [[ORDER5_PERF_GUARD]]
+// Legacy Order4 implementation is intentionally kept in this TU.
+// Runtime rejects Order4, but removing these functions caused measurable ORDER=5 throughput regression.
 void Topic::Sequencer4() {
 	absl::btree_set<int> registered_brokers;
 	GetRegisteredBrokerSet(registered_brokers);
@@ -1199,6 +1202,7 @@ std::pair<uint64_t, bool> Topic::RefreshBrokerEpochFromCXL(bool force_full_read)
 	return {current_epoch, was_stale};
 }
 
+// [[ORDER5_PERF_GUARD]] See Sequencer4() note above.
 std::function<void(void*, size_t)> Topic::Order4GetCXLBuffer(
 		BatchHeader &batch_header,
 		const char topic[TOPIC_NAME_SIZE],

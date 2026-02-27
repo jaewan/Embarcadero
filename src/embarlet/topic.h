@@ -509,6 +509,10 @@ class Topic {
 			BatchHeader*& batch_header_location,
 			bool epoch_already_checked = false);
 
+		// [[ORDER5_PERF_GUARD]]
+		// Legacy Order4 helpers are intentionally kept in this translation unit because
+		// removing them changed code layout and regressed ORDER=5 throughput materially.
+		// Runtime still rejects Order4 topics (see TopicManager/client checks).
 		std::function<void(void*, size_t)> Order4GetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
@@ -615,9 +619,11 @@ class Topic {
 	// Sequencing
 	// Ordered batch vector for efficient subscribe
 	void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers);
+	// [[ORDER5_PERF_GUARD]] See note above: retained for code-layout stability.
 	void Sequencer4();
 	void Sequencer5();  // Batch-level sequencer (Phase 1b: epoch pipeline + Level 5 hold buffer)
 	void Sequencer2();  // Order 2: Total order, no per-client state;
+	// [[ORDER5_PERF_GUARD]] See note above: retained for code-layout stability.
 	void BrokerScannerWorker(int broker_id);
 	void BrokerScannerWorker5(int broker_id);  // Batch-level scanner (Phase 1b: pushes to epoch buffer)
 	void EpochDriverThread();   // [[PHASE_1B]] Advances epoch_index_ every kEpochUs
@@ -640,9 +646,11 @@ class Topic {
 	void Level5ShardWorker(size_t shard_id);
 	void InitLevel5Shards();
 	size_t GetTotalHoldBufferSize();
+	// [[ORDER5_PERF_GUARD]] See note above: retained for code-layout stability.
 	bool ProcessSkipped(
 		absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
 		BatchHeader* &header_for_sub);
+	// [[ORDER5_PERF_GUARD]] See note above: retained for code-layout stability.
 	void AssignOrder(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);
 	void AssignOrder5(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);  // Batch-level version
 
