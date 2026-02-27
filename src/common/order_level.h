@@ -25,8 +25,4 @@ inline int CanonicalizeOrderLevelCompat(int order) {
 	return IsLegacyOrder4(order) ? kOrderStrong : order;
 }
 
-inline bool ShouldRejectLegacyOrder4() {
-	return true;
-}
-
 }  // namespace Embarcadero
