@@ -22,8 +22,8 @@ namespace {
 	constexpr size_t kQueueFullSleepMs = 1;
 	constexpr size_t kMaxRegions = 4;  // allow multiple AddBuffers(); pool capacity = pool_slots_ * kMaxRegions
 	constexpr size_t kAlign = 64;
-	/** Target batch pool size (hugepage-backed, same as buffer.cc via mmap_large_buffer). */
-	constexpr size_t kPoolSizeBytes = 16ULL * 1024 * 1024 * 1024;  // 16 GB
+	/** Default target batch pool size (hugepage-backed, same as buffer.cc via mmap_large_buffer). */
+	constexpr size_t kDefaultPoolSizeBytes = 16ULL * 1024 * 1024 * 1024;  // 16 GB
 	inline size_t AlignUp(size_t size, size_t align) {
 		return (size + align - 1) & ~(align - 1);
 	}
@@ -77,7 +77,7 @@ QueueBuffer::~QueueBuffer() {
 	batch_buffers_region_.clear();
 }
 
-bool QueueBuffer::AddBuffers(size_t /*buf_size*/) {
+bool QueueBuffer::AddBuffers(size_t buf_size) {
 	// Publisher calls AddBuffers once per broker from the gRPC (SubscribeToCluster) thread.
 	// Each call used to allocate ~16 GB and block for many seconds, so 3 brokers = 60+ s block → Init() timeout.
 	// One region already provides enough slots (1 + num_queues_*kQueueCapacity); subsequent calls are no-ops.
@@ -88,11 +88,13 @@ bool QueueBuffer::AddBuffers(size_t /*buf_size*/) {
 	const size_t batch_size = BATCH_SIZE;
 	batch_size_cached_.store(batch_size, std::memory_order_release);
 	slot_size_ = AlignUp(sizeof(Embarcadero::BatchHeader) + batch_size, kAlign);
-	// Pool size: at least kPoolSizeBytes (16 GB), and at least 1 + num_queues_*kQueueCapacity slots for correctness.
+	// Pool size: at least the default target (16 GB), at least caller hint (buf_size),
+	// and at least 1 + num_queues_*kQueueCapacity slots for correctness.
 	// Same hugepage path as buffer.cc: mmap_large_buffer() uses MAP_HUGETLB (or THP fallback).
 	const size_t min_slots = std::max<size_t>(256, num_queues_ * kQueueCapacity + 1);
-	const size_t slots_for_16gb = static_cast<size_t>(kPoolSizeBytes / slot_size_);
-	const size_t slots_this_region = std::max(min_slots, slots_for_16gb);
+	const size_t target_pool_bytes = std::max(kDefaultPoolSizeBytes, buf_size);
+	const size_t slots_for_target = static_cast<size_t>(target_pool_bytes / slot_size_);
+	const size_t slots_this_region = std::max(min_slots, slots_for_target);
 
 	// First call: set pool_slots_ and create pool with capacity for kMaxRegions
 	if (!pool_) {

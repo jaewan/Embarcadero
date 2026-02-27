@@ -45,8 +45,9 @@ public:
 
 	/**
 	 * Allocate batch buffer pool (hugepage-backed, same as buffer.cc via mmap_large_buffer).
-	 * Pool size is at least 12 GB (kPoolSizeBytes) for microbenchmarks, or enough slots for num_queues_*kQueueCapacity+1.
-	 * @param buf_size Ignored; pool size and queue capacity derived from config and num_buf
+	 * Pool size is at least the default target plus any caller-provided hint, and
+	 * enough slots for num_queues_*kQueueCapacity+1.
+	 * @param buf_size Size hint from caller (bytes)
 	 * @return true on success
 	 */
 	bool AddBuffers(size_t buf_size);
