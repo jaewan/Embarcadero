@@ -1383,7 +1383,7 @@ bool Topic::ReservePBRSlotAndWriteEntry(BatchHeader& batch_header, void* log,
 /*
  * Return one Ordered or Processed batch at a time
  * Current implementation expects ordered_batch is set accordingly (processed or ordered)
- * Should only call with Order 4 for now
+ * Used by legacy export/readers that consume ordered batch headers.
  */
 bool Topic::GetBatchToExport(
 		size_t &expected_batch_offset,

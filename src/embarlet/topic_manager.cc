@@ -284,7 +284,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 
 	LOG(INFO) << "CreateNewTopicInternal: topic=" << topic << " order=" << order 
 	          << " replication_factor=" << replication_factor << " ack_level=" << ack_level;
-	if (IsLegacyOrder4(order)) {
+	if (order == kOrderLegacyStrong) {
 		LOG(ERROR) << "CreateNewTopicInternal: rejecting deprecated Order 4 for topic '" << topic
 		           << "'; use Order 5 for strong ordering.";
 		return nullptr;
@@ -435,7 +435,7 @@ bool TopicManager::CreateNewTopic(
         int ack_level,
         heartbeat_system::SequencerType seq_type) {
 	if (shutting_down_.load(std::memory_order_acquire)) return false;
-	if (IsLegacyOrder4(order)) {
+	if (order == kOrderLegacyStrong) {
 		LOG(ERROR) << "CreateNewTopic: rejecting deprecated Order 4 for topic '" << topic
 		           << "'; use Order 5 for strong ordering.";
 		return false;

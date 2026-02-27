@@ -13,16 +13,4 @@ inline bool IsCanonicalOrderLevel(int order) {
 	return order == kOrderUnordered || order == kOrderTotal || order == kOrderStrong;
 }
 
-inline bool IsLegacyOrder4(int order) {
-	return order == kOrderLegacyStrong;
-}
-
-inline bool IsStrongOrderingLevelCompat(int order) {
-	return order == kOrderStrong || IsLegacyOrder4(order);
-}
-
-inline int CanonicalizeOrderLevelCompat(int order) {
-	return IsLegacyOrder4(order) ? kOrderStrong : order;
-}
-
 }  // namespace Embarcadero
