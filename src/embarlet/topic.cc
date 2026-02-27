@@ -22,14 +22,6 @@ static inline uint64_t SteadyNowNs() {
 		std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-static bool ShouldEnableDelegationLegacyFallback() {
-	// Legacy message-by-message delegation path is retained only as an emergency
-	// compatibility fallback. Batch-based delegation is the default and supported path.
-	static const bool enabled =
-		ReadEnvBoolLenient("EMBARCADERO_ENABLE_LEGACY_DELEGATION_FALLBACK", false);
-	return enabled;
-}
-
 static bool ShouldEnableOrder5Trace() {
 	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_TRACE", false);
 	return enabled;
@@ -348,31 +340,8 @@ void Topic::AdvanceCVContiguous(int broker_id) {
  * Ownership: Writes to BlogMessageHeader bytes 16-31 (delegation region)
  */
 void Topic::DelegationThread() {
-	// Validate first_message_addr_ before using it
-	if (!first_message_addr_ || first_message_addr_ == cxl_addr_) {
-		LOG(FATAL) << "Invalid first_message_addr_ in DelegationThread for topic: " << topic_name_
-		           << ". first_message_addr_=" << first_message_addr_
-		           << ", cxl_addr_=" << cxl_addr_
-		           << ", log_offset=" << tinode_->offsets[broker_id_].log_offset;
-		return;
-	}
-
-	// Additional safety check - ensure we have enough space before the first message for the segment header
-	if (reinterpret_cast<uintptr_t>(first_message_addr_) < reinterpret_cast<uintptr_t>(cxl_addr_) + CACHELINE_SIZE) {
-		LOG(FATAL) << "first_message_addr_ too close to cxl_addr_ base, cannot access segment header safely. "
-		           << "first_message_addr_=" << first_message_addr_
-		           << ", cxl_addr_=" << cxl_addr_;
-		return;
-	}
-
-	// Initialize header pointers
-	void* segment_header = reinterpret_cast<uint8_t*>(first_message_addr_) - CACHELINE_SIZE;
-	MessageHeader* header = reinterpret_cast<MessageHeader*>(first_message_addr_);
-
-	// DelegationThread started for topic
-
-	// NEW APPROACH: Use batch-based processing instead of message-by-message
-	// Initialize batch header pointer to match EmbarcaderoGetCXLBuffer allocation
+	// Delegation is batch-based only. Legacy message-by-message fallback was
+	// removed to keep one maintained execution path.
 	BatchHeader* current_batch = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 
@@ -382,54 +351,30 @@ void Topic::DelegationThread() {
 	BatchHeader* delegation_ring_end = reinterpret_cast<BatchHeader*>(
 		reinterpret_cast<uint8_t*>(delegation_ring_start) + BATCHHEADERS_SIZE);
 
-	size_t processed_batches = 0;
-
 	// [[PERFORMANCE FIX]]: Batch flush optimization (DEV-002)
-	// Flush every 8 batches or every 64KB of data, whichever comes first
-	// This reduces flush overhead from ~10M flushes/sec to ~1.25M flushes/sec
-	constexpr size_t BATCH_FLUSH_INTERVAL = 8;  // Flush every 8 batches
-	constexpr size_t BYTE_FLUSH_INTERVAL = 64 * 1024;  // Flush every 64KB
+	// Flush every 8 batches or every 64KB of data, whichever comes first.
+	constexpr size_t BATCH_FLUSH_INTERVAL = 8;
+	constexpr size_t BYTE_FLUSH_INTERVAL = 64 * 1024;
 	size_t batches_since_flush = 0;
 	size_t bytes_since_flush = 0;
-	const bool legacy_fallback_enabled = ShouldEnableDelegationLegacyFallback();
-	if (legacy_fallback_enabled) {
-		LOG(WARNING) << "DelegationThread: legacy message-by-message fallback enabled via "
-		             << "EMBARCADERO_ENABLE_LEGACY_DELEGATION_FALLBACK; this path is deprecated.";
-	}
-
-		// DelegationThread: Starting batch processing
 
 	while (!stop_threads_) {
-		// NEW: Try batch-based processing first
-			if (current_batch && __atomic_load_n(&current_batch->batch_complete, __ATOMIC_ACQUIRE)) {
-				// DelegationThread: Found completed batch
-				// Process this completed batch
-				if (current_batch->num_msg > 0) {
-					// [[BLOG_HEADER: Gate ORDER=5 per-message writes when BlogHeader is enabled]]
-					bool skip_per_message_writes = (order_ == 5 && HeaderUtils::ShouldUseBlogHeader());
-
-				// For BlogMessageHeader, receiver already set the required fields; delegation doesn't need to write
-				// For MessageHeader, delegation needs to set logical_offset/segment_header/next_msg_diff
+		if (current_batch && __atomic_load_n(&current_batch->batch_complete, __ATOMIC_ACQUIRE)) {
+			if (current_batch->num_msg > 0) {
+				// [[BLOG_HEADER: Gate ORDER=5 per-message writes when BlogHeader is enabled]]
+				bool skip_per_message_writes = (order_ == 5 && HeaderUtils::ShouldUseBlogHeader());
 
 				if (!skip_per_message_writes) {
-					// MessageHeader path: set required fields for each message
 					MessageHeader* batch_first_msg = reinterpret_cast<MessageHeader*>(
 						reinterpret_cast<uint8_t*>(cxl_addr_) + current_batch->log_idx);
-
-					// Process all messages in this batch efficiently
 					MessageHeader* msg_ptr = batch_first_msg;
 					for (size_t i = 0; i < current_batch->num_msg; ++i) {
-						// Set required fields for each message
 						msg_ptr->logical_offset = logical_offset_;
 						msg_ptr->segment_header = reinterpret_cast<uint8_t*>(msg_ptr) - CACHELINE_SIZE;
 
-						// Read paddedSize first (needed for next message calculation)
 						size_t current_padded_size = msg_ptr->paddedSize;
-
-						// [[CRITICAL FIX: paddedSize Validation]] - Add bounds check to prevent out-of-bounds access
-						// Matches validation in legacy message-by-message path (line 378-389)
 						const size_t min_msg_size = sizeof(MessageHeader);
-						const size_t max_msg_size = 1024 * 1024; // 1MB max message size
+						const size_t max_msg_size = 1024 * 1024;
 						if (current_padded_size < min_msg_size || current_padded_size > max_msg_size) {
 							static thread_local size_t error_count = 0;
 							if (++error_count % 1000 == 1) {
@@ -438,17 +383,14 @@ void Topic::DelegationThread() {
 								           << " (error #" << error_count << ")";
 							}
 							CXL::cpu_pause();
-							break; // Exit message loop on corrupted data
+							break;
 						}
 
 						msg_ptr->next_msg_diff = current_padded_size;
-
-						// Update segment header
 						*reinterpret_cast<unsigned long long int*>(msg_ptr->segment_header) =
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(msg_ptr->segment_header));
 
-						// Move to next message in batch
 						if (i < current_batch->num_msg - 1) {
 							msg_ptr = reinterpret_cast<MessageHeader*>(
 								reinterpret_cast<uint8_t*>(msg_ptr) + current_padded_size);
@@ -457,64 +399,54 @@ void Topic::DelegationThread() {
 						logical_offset_++;
 					}
 
-						// ORDER=0 written is owned by NetworkManager ingest path.
-						if (order_ != 0) {
-							UpdateTInodeWritten(
-								logical_offset_ - 1,
-								static_cast<unsigned long long int>(
-									reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
-						}
+					if (order_ != 0) {
+						UpdateTInodeWritten(
+							logical_offset_ - 1,
+							static_cast<unsigned long long int>(
+								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
+					}
 				} else {
-			// BlogMessageHeader path: receiver already set fields, just track offsets
-				// For ORDER=5, we don't need per-message header writes; export uses BatchHeader.total_size
-				// Compute end position for tracking
-				BlogMessageHeader* batch_first_msg = reinterpret_cast<BlogMessageHeader*>(
-					reinterpret_cast<uint8_t*>(cxl_addr_) + current_batch->log_idx);
-				BlogMessageHeader* msg_ptr = batch_first_msg;
+					BlogMessageHeader* batch_first_msg = reinterpret_cast<BlogMessageHeader*>(
+						reinterpret_cast<uint8_t*>(cxl_addr_) + current_batch->log_idx);
+					BlogMessageHeader* msg_ptr = batch_first_msg;
+					for (size_t i = 0; i < current_batch->num_msg; ++i) {
+						if (msg_ptr->size > wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+							LOG(ERROR) << "DelegationThread: Message " << i
+							           << " in batch has excessive payload size=" << msg_ptr->size
+							           << " (max=" << wire::MAX_MESSAGE_PAYLOAD_SIZE << "), aborting batch";
+							break;
+						}
 
-				for (size_t i = 0; i < current_batch->num_msg; ++i) {
-					// For BlogMessageHeader, size is in payload bytes only
-					// [[PAPER_SPEC: BlogMessageHeader]] - Validate size is within bounds
-					if (msg_ptr->size > wire::MAX_MESSAGE_PAYLOAD_SIZE) {
-						LOG(ERROR) << "DelegationThread: Message " << i << " in batch has excessive payload size=" << msg_ptr->size
-							<< " (max=" << wire::MAX_MESSAGE_PAYLOAD_SIZE << "), aborting batch";
-						break;
-					}
+						size_t header_size = sizeof(BlogMessageHeader);
+						size_t padded_size = wire::ComputeMessageStride(header_size, msg_ptr->size);
+						if (padded_size < 64 || padded_size > wire::MAX_MESSAGE_PAYLOAD_SIZE + header_size + 64) {
+							LOG(ERROR) << "DelegationThread: Message " << i
+							           << " computed invalid stride=" << padded_size
+							           << " from payload_size=" << msg_ptr->size << ", aborting batch";
+							break;
+						}
 
-					size_t header_size = sizeof(BlogMessageHeader);
-					size_t padded_size = wire::ComputeMessageStride(header_size, msg_ptr->size);
-
-					// Validate stride is reasonable
-					if (padded_size < 64 || padded_size > wire::MAX_MESSAGE_PAYLOAD_SIZE + header_size + 64) {
-						LOG(ERROR) << "DelegationThread: Message " << i << " computed invalid stride=" << padded_size
-							<< " from payload_size=" << msg_ptr->size << ", aborting batch";
-						break;
-					}
-
-					// Validate we don't walk past the batch end (sanity check)
-					if (i > 0) {
-						size_t batch_end_estimate = current_batch->log_idx + current_batch->total_size;
-						size_t msg_end = static_cast<size_t>(reinterpret_cast<uint8_t*>(msg_ptr) + padded_size - reinterpret_cast<uint8_t*>(cxl_addr_));
-						if (msg_end > batch_end_estimate) {
-							static thread_local size_t stride_error_count = 0;
-							if (++stride_error_count % 100 == 1) {
-								LOG(WARNING) << "DelegationThread: Message " << i << " would walk past batch end"
-									<< " (msg_end=" << msg_end << ", batch_end=" << batch_end_estimate << ")"
-									<< ", error count=" << stride_error_count;
+						if (i > 0) {
+							size_t batch_end_estimate = current_batch->log_idx + current_batch->total_size;
+							size_t msg_end = static_cast<size_t>(
+								reinterpret_cast<uint8_t*>(msg_ptr) + padded_size - reinterpret_cast<uint8_t*>(cxl_addr_));
+							if (msg_end > batch_end_estimate) {
+								static thread_local size_t stride_error_count = 0;
+								if (++stride_error_count % 100 == 1) {
+									LOG(WARNING) << "DelegationThread: Message " << i << " would walk past batch end"
+									             << " (msg_end=" << msg_end << ", batch_end=" << batch_end_estimate << ")"
+									             << ", error count=" << stride_error_count;
+								}
 							}
 						}
+
+						logical_offset_++;
+						if (i < current_batch->num_msg - 1) {
+							msg_ptr = reinterpret_cast<BlogMessageHeader*>(
+								reinterpret_cast<uint8_t*>(msg_ptr) + padded_size);
+						}
 					}
 
-					logical_offset_++;
-
-					// Move to next message
-					if (i < current_batch->num_msg - 1) {
-						msg_ptr = reinterpret_cast<BlogMessageHeader*>(
-							reinterpret_cast<uint8_t*>(msg_ptr) + padded_size);
-					}
-				}
-
-					// ORDER=0 written is owned by NetworkManager ingest path.
 					if (order_ != 0) {
 						UpdateTInodeWritten(
 							logical_offset_ - 1,
@@ -522,23 +454,16 @@ void Topic::DelegationThread() {
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
 					}
 				}
+			}
 
-			// [[PERFORMANCE FIX]]: Batch flush optimization (DEV-002)
-			// Flush every N batches or every 64KB, whichever comes first
-			// This reduces flush overhead while maintaining CXL visibility
 			batches_since_flush++;
 			bytes_since_flush += current_batch->total_size;
-
 			if (batches_since_flush >= BATCH_FLUSH_INTERVAL || bytes_since_flush >= BYTE_FLUSH_INTERVAL) {
-				// Flush cache line after TInode update for CXL visibility
-				// Flush & Poll principle: Writers must flush after writes to non-coherent CXL
 				CXL::flush_cacheline(const_cast<const void*>(static_cast<volatile void*>(&tinode_->offsets[broker_id_])));
 				CXL::store_fence();
 				batches_since_flush = 0;
 				bytes_since_flush = 0;
 			}
-
-			processed_batches++;
 
 			BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
 				reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
@@ -546,112 +471,10 @@ void Topic::DelegationThread() {
 				next_batch = delegation_ring_start;
 			}
 			current_batch = next_batch;
-			continue; // Skip the old message-by-message processing
-		}
-		} else if (current_batch && current_batch->num_msg > 0) {
-		// DelegationThread: Waiting for batch completion (reduced logging)
-		}
-
-		// Legacy fallback is opt-in only. Keep it out of default hot path.
-		if (!legacy_fallback_enabled) {
-			CXL::cpu_pause();
 			continue;
 		}
 
-		// FALLBACK: Old message-by-message processing for compatibility
-		// Safe memory access with bounds checking
-		try {
-			// Validate header pointer before accessing
-			if (reinterpret_cast<uintptr_t>(header) < reinterpret_cast<uintptr_t>(cxl_addr_) ||
-			    reinterpret_cast<uintptr_t>(header) >= reinterpret_cast<uintptr_t>(cxl_addr_) + (1ULL << 36)) {
-				LOG(ERROR) << "DelegationThread: Invalid header pointer " << header
-				           << " for topic " << topic_name_ << ", broker " << broker_id_;
-				break;
-			}
-		} catch (...) {
-			LOG(ERROR) << "DelegationThread: Exception accessing memory at " << header
-			           << " for topic " << topic_name_ << ", broker " << broker_id_;
-			break;
-		}
-
-
-		// [[DEVIATION_004]] - Using TInode.offset_entry instead of Bmeta. Should rename TInode to Bmeta
-		// Legacy path: Poll MessageHeader.paddedSize (current implementation)
-		// TInode.offset_entry.log_offset tracks the start of the broker's log
-		// TInode.offset_entry.written_addr tracks the last processed message
-
-		// Wait for message to be complete before processing
-		volatile size_t padded_size;
-		do {
-			if (stop_threads_) return;
-		// Use memory barrier to ensure fresh read from memory
-		__atomic_thread_fence(__ATOMIC_ACQUIRE);
-		padded_size = header->paddedSize;
-		if (padded_size == 0) {
-			CXL::cpu_pause();
-		}
-		} while (padded_size == 0);
-
-		// Additional validation: ensure paddedSize is reasonable
-		const size_t min_msg_size = sizeof(MessageHeader);
-		const size_t max_msg_size = 1024 * 1024; // 1MB max message size
-		if (padded_size < min_msg_size || padded_size > max_msg_size) {
-			static thread_local size_t error_count = 0;
-			if (++error_count % 1000 == 1) {
-				LOG(ERROR) << "DelegationThread: Invalid paddedSize=" << padded_size
-			           << " for topic " << topic_name_ << ", broker " << broker_id_
-			           << " (error #" << error_count << ")";
-		}
 		CXL::cpu_pause();
-		continue;
-		}
-
-		// Update message metadata
-		header->segment_header = segment_header;
-		header->logical_offset = logical_offset_;
-		header->next_msg_diff = padded_size;
-
-			// ORDER=0 written is owned by NetworkManager ingest path.
-			if (order_ != 0) {
-				UpdateTInodeWritten(
-						logical_offset_,
-						static_cast<unsigned long long int>(
-							reinterpret_cast<uint8_t*>(header) - reinterpret_cast<uint8_t*>(cxl_addr_))
-						);
-			}
-
-		// Update segment header
-		*reinterpret_cast<unsigned long long int*>(segment_header) =
-			static_cast<unsigned long long int>(
-					reinterpret_cast<uint8_t*>(header) - reinterpret_cast<uint8_t*>(segment_header)
-					);
-
-			// Update tracking variables
-			written_logical_offset_ = logical_offset_;
-			written_physical_addr_ = reinterpret_cast<void*>(header);
-
-		// Move to next message using validated padded_size
-		MessageHeader* next_header = reinterpret_cast<MessageHeader*>(
-				reinterpret_cast<uint8_t*>(header) + padded_size);
-
-		// Validate next header pointer
-		if (reinterpret_cast<uintptr_t>(next_header) < reinterpret_cast<uintptr_t>(cxl_addr_) ||
-		    reinterpret_cast<uintptr_t>(next_header) >= reinterpret_cast<uintptr_t>(cxl_addr_) + (1ULL << 36)) {
-			// Log only occasionally to avoid spam
-			static thread_local size_t pointer_error_count = 0;
-			if (++pointer_error_count % 1000 == 1) {
-				LOG(WARNING) << "DelegationThread: Invalid next header pointer " << next_header
-				           << " (diff=" << header->next_msg_diff << ") for topic "
-				           << topic_name_ << ", broker " << broker_id_
-				           << " (error #" << pointer_error_count << ")";
-			}
-			// Just yield CPU, don't sleep
-			std::this_thread::yield();
-			continue;
-		}
-
-		header = next_header;
-		logical_offset_++;
 	}
 }
 
