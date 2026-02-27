@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdlib>
-
 namespace Embarcadero {
 
 inline constexpr int kOrderUnordered = 0;
@@ -28,12 +26,7 @@ inline int CanonicalizeOrderLevelCompat(int order) {
 }
 
 inline bool ShouldRejectLegacyOrder4() {
-	static const bool reject = []() {
-		const char* env = std::getenv("EMBARCADERO_REJECT_LEGACY_ORDER4");
-		if (!env) return false;
-		return env[0] == '1';
-	}();
-	return reject;
+	return true;
 }
 
 }  // namespace Embarcadero

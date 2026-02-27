@@ -287,7 +287,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 	if (IsLegacyOrder4(order)) {
 		if (ShouldRejectLegacyOrder4()) {
 			LOG(ERROR) << "CreateNewTopicInternal: rejecting deprecated Order 4 for topic '" << topic
-			           << "' because EMBARCADERO_REJECT_LEGACY_ORDER4=1";
+			           << "'; use Order 5 for strong ordering.";
 			return nullptr;
 		}
 		LOG(WARNING) << "CreateNewTopicInternal: topic '" << topic
@@ -441,7 +441,7 @@ bool TopicManager::CreateNewTopic(
 	if (shutting_down_.load(std::memory_order_acquire)) return false;
 	if (IsLegacyOrder4(order) && ShouldRejectLegacyOrder4()) {
 		LOG(ERROR) << "CreateNewTopic: rejecting deprecated Order 4 for topic '" << topic
-		           << "' because EMBARCADERO_REJECT_LEGACY_ORDER4=1";
+		           << "'; use Order 5 for strong ordering.";
 		return false;
 	}
 	
