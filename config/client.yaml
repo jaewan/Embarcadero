@@ -13,6 +13,12 @@ client:
     tcp_user_timeout_ms_throughput: 500
     tcp_user_timeout_ms_failure: 200
     tcp_user_timeout_ms_latency: 500
+    ack_timeout_sec_throughput: 120
+    ack_timeout_sec_failure: 120
+    ack_timeout_sec_latency: 120
+    epoll_wait_writable_ms_throughput: 1
+    epoll_wait_writable_ms_failure: 0
+    epoll_wait_writable_ms_latency: 1
 
   publisher:
     threads_per_broker: 3   # Optimal config matching 981dd61 (10-12 GB/s)

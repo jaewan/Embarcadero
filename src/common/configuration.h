@@ -138,6 +138,14 @@ struct EmbarcaderoConfig {
             ConfigValue<int> tcp_user_timeout_ms_throughput{500, "EMBARCADERO_TCP_USER_TIMEOUT_MS_THROUGHPUT"};
             ConfigValue<int> tcp_user_timeout_ms_failure{200, "EMBARCADERO_TCP_USER_TIMEOUT_MS_FAILURE"};
             ConfigValue<int> tcp_user_timeout_ms_latency{500, "EMBARCADERO_TCP_USER_TIMEOUT_MS_LATENCY"};
+            // ACK wait timeout by mode (seconds).
+            ConfigValue<int> ack_timeout_sec_throughput{120, "EMBARCADERO_ACK_TIMEOUT_SEC_THROUGHPUT"};
+            ConfigValue<int> ack_timeout_sec_failure{120, "EMBARCADERO_ACK_TIMEOUT_SEC_FAILURE"};
+            ConfigValue<int> ack_timeout_sec_latency{120, "EMBARCADERO_ACK_TIMEOUT_SEC_LATENCY"};
+            // EAGAIN epoll wait for publisher send path (ms). 0 = busy poll.
+            ConfigValue<int> epoll_wait_writable_ms_throughput{1, "EMBARCADERO_EPOLL_WAIT_WRITABLE_MS_THROUGHPUT"};
+            ConfigValue<int> epoll_wait_writable_ms_failure{0, "EMBARCADERO_EPOLL_WAIT_WRITABLE_MS_FAILURE"};
+            ConfigValue<int> epoll_wait_writable_ms_latency{1, "EMBARCADERO_EPOLL_WAIT_WRITABLE_MS_LATENCY"};
         } runtime;
 
         struct Publisher {

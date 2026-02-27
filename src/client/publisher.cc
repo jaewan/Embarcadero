@@ -25,15 +25,6 @@
 
 // [[CODE_CLEANUP]] Removed no-op profiling stubs - if profiling is needed, implement properly
 
-/** EAGAIN epoll wait timeout (ms). 0 = busy poll; 1 = yield 1ms. Env EMBARCADERO_EPOLL_WAIT_WRITABLE_MS (default 1). */
-static int GetEpollWaitWritableMs() {
-	static int cached = -1;
-	if (cached >= 0) return cached;
-	const char* env = std::getenv("EMBARCADERO_EPOLL_WAIT_WRITABLE_MS");
-	cached = (env && *env && std::atoi(env) == 0) ? 0 : 1;
-	return cached;
-}
-
 namespace {
 constexpr int kAckPortMin = 10000;
 constexpr int kAckPortMax = 65535;
@@ -374,10 +365,16 @@ void Publisher::Init(int ack_level) {
 	runtime_mode_ = NormalizeRuntimeMode(runtime_cfg.mode.get());
 	if (runtime_mode_ == "failure") {
 		ack_drain_ms_success_ = runtime_cfg.ack_drain_ms_failure.get();
+		ack_timeout_seconds_ = runtime_cfg.ack_timeout_sec_failure.get();
+		epoll_wait_writable_ms_ = runtime_cfg.epoll_wait_writable_ms_failure.get();
 	} else if (runtime_mode_ == "latency") {
 		ack_drain_ms_success_ = runtime_cfg.ack_drain_ms_latency.get();
+		ack_timeout_seconds_ = runtime_cfg.ack_timeout_sec_latency.get();
+		epoll_wait_writable_ms_ = runtime_cfg.epoll_wait_writable_ms_latency.get();
 	} else {
 		ack_drain_ms_success_ = runtime_cfg.ack_drain_ms_throughput.get();
+		ack_timeout_seconds_ = runtime_cfg.ack_timeout_sec_throughput.get();
+		epoll_wait_writable_ms_ = runtime_cfg.epoll_wait_writable_ms_throughput.get();
 	}
 	ack_drain_ms_failure_ = runtime_cfg.ack_drain_ms_failure.get();
 
@@ -387,10 +384,21 @@ void Publisher::Init(int ack_level) {
 		ack_drain_ms_success_ = drain_ms;
 		ack_drain_ms_failure_ = drain_ms;
 	}
+	if (const char* timeout_env = std::getenv("EMBARCADERO_ACK_TIMEOUT_SEC")) {
+		ack_timeout_seconds_ = std::atoi(timeout_env);
+	}
+	if (const char* epoll_wait_env = std::getenv("EMBARCADERO_EPOLL_WAIT_WRITABLE_MS")) {
+		epoll_wait_writable_ms_ = std::atoi(epoll_wait_env);
+	}
+	if (epoll_wait_writable_ms_ < 0) {
+		epoll_wait_writable_ms_ = 0;
+	}
 
 	LOG(INFO) << "Publisher runtime mode=" << runtime_mode_
 	          << " ack_drain_ms_success=" << ack_drain_ms_success_
-	          << " ack_drain_ms_failure=" << ack_drain_ms_failure_;
+	          << " ack_drain_ms_failure=" << ack_drain_ms_failure_
+	          << " ack_timeout_sec=" << ack_timeout_seconds_
+	          << " epoll_wait_writable_ms=" << epoll_wait_writable_ms_;
 
 	// When set, PublishThread updates total_batches_attempted_ so ACK timeout log shows attempted count.
 	const char* ack_debug = std::getenv("EMBARCADERO_ACK_TIMEOUT_DEBUG");
@@ -620,10 +628,8 @@ bool Publisher::Poll(size_t n) {
 		// [[CONFIG: Ack-wait spin]] 500µs spin when waiting for acks (burst-friendly); was 1ms.
 		constexpr auto SPIN_DURATION = std::chrono::microseconds(500);
 		
-		// Configurable timeout for ACK waits. Override via EMBARCADERO_ACK_TIMEOUT_SEC (0 = no timeout).
-		// ORDER=2/5 need sequencer + CXL propagation; 10s is too short for 8GB+. Default 120s when ack>=1.
-		const char* timeout_env = std::getenv("EMBARCADERO_ACK_TIMEOUT_SEC");
-		int timeout_seconds = timeout_env ? std::atoi(timeout_env) : 120;  // 120s default for ack_level>=1
+		// Configurable timeout for ACK waits. Runtime policy resolved once in Init().
+		int timeout_seconds = ack_timeout_seconds_;
 		const auto timeout_duration = std::chrono::seconds(timeout_seconds);
 		// [[FIX: ACK Race Condition]] Capture target ONCE - never reload inside loop
 		// Reloading allowed concurrent Publish() calls to move the target, causing potential infinite wait
@@ -1640,8 +1646,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				} else if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
 					// Socket buffer full; wait for writable so broker can recv() and drain.
 					// [[ROOT_CAUSE_FIX]] 0ms caused client busy-loop while brokers blocked in recv() → ACK stall.
-					// Default 1ms yields to broker. Env EMBARCADERO_EPOLL_WAIT_WRITABLE_MS=0 to test busy poll.
-					int wait_ms = GetEpollWaitWritableMs();
+					// Runtime policy resolved once in Init(); 0 means busy poll.
+					int wait_ms = epoll_wait_writable_ms_;
 					struct epoll_event events[64];
 					int n = epoll_wait(efd.get(), events, 64, wait_ms);
 

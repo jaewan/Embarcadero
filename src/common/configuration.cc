@@ -183,6 +183,12 @@ bool Configuration::loadFromFile(const std::string& filename) {
                     if (runtime["tcp_user_timeout_ms_throughput"]) config_.client.runtime.tcp_user_timeout_ms_throughput.set(runtime["tcp_user_timeout_ms_throughput"].as<int>());
                     if (runtime["tcp_user_timeout_ms_failure"]) config_.client.runtime.tcp_user_timeout_ms_failure.set(runtime["tcp_user_timeout_ms_failure"].as<int>());
                     if (runtime["tcp_user_timeout_ms_latency"]) config_.client.runtime.tcp_user_timeout_ms_latency.set(runtime["tcp_user_timeout_ms_latency"].as<int>());
+                    if (runtime["ack_timeout_sec_throughput"]) config_.client.runtime.ack_timeout_sec_throughput.set(runtime["ack_timeout_sec_throughput"].as<int>());
+                    if (runtime["ack_timeout_sec_failure"]) config_.client.runtime.ack_timeout_sec_failure.set(runtime["ack_timeout_sec_failure"].as<int>());
+                    if (runtime["ack_timeout_sec_latency"]) config_.client.runtime.ack_timeout_sec_latency.set(runtime["ack_timeout_sec_latency"].as<int>());
+                    if (runtime["epoll_wait_writable_ms_throughput"]) config_.client.runtime.epoll_wait_writable_ms_throughput.set(runtime["epoll_wait_writable_ms_throughput"].as<int>());
+                    if (runtime["epoll_wait_writable_ms_failure"]) config_.client.runtime.epoll_wait_writable_ms_failure.set(runtime["epoll_wait_writable_ms_failure"].as<int>());
+                    if (runtime["epoll_wait_writable_ms_latency"]) config_.client.runtime.epoll_wait_writable_ms_latency.set(runtime["epoll_wait_writable_ms_latency"].as<int>());
                 }
                 
                 // Publisher
@@ -239,6 +245,12 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (runtime["tcp_user_timeout_ms_throughput"]) config_.client.runtime.tcp_user_timeout_ms_throughput.set(runtime["tcp_user_timeout_ms_throughput"].as<int>());
                 if (runtime["tcp_user_timeout_ms_failure"]) config_.client.runtime.tcp_user_timeout_ms_failure.set(runtime["tcp_user_timeout_ms_failure"].as<int>());
                 if (runtime["tcp_user_timeout_ms_latency"]) config_.client.runtime.tcp_user_timeout_ms_latency.set(runtime["tcp_user_timeout_ms_latency"].as<int>());
+                if (runtime["ack_timeout_sec_throughput"]) config_.client.runtime.ack_timeout_sec_throughput.set(runtime["ack_timeout_sec_throughput"].as<int>());
+                if (runtime["ack_timeout_sec_failure"]) config_.client.runtime.ack_timeout_sec_failure.set(runtime["ack_timeout_sec_failure"].as<int>());
+                if (runtime["ack_timeout_sec_latency"]) config_.client.runtime.ack_timeout_sec_latency.set(runtime["ack_timeout_sec_latency"].as<int>());
+                if (runtime["epoll_wait_writable_ms_throughput"]) config_.client.runtime.epoll_wait_writable_ms_throughput.set(runtime["epoll_wait_writable_ms_throughput"].as<int>());
+                if (runtime["epoll_wait_writable_ms_failure"]) config_.client.runtime.epoll_wait_writable_ms_failure.set(runtime["epoll_wait_writable_ms_failure"].as<int>());
+                if (runtime["epoll_wait_writable_ms_latency"]) config_.client.runtime.epoll_wait_writable_ms_latency.set(runtime["epoll_wait_writable_ms_latency"].as<int>());
             }
             if (client["publisher"]) {
                 auto publisher = client["publisher"];
@@ -415,6 +427,16 @@ bool Configuration::validate() const {
         config_.client.runtime.tcp_user_timeout_ms_failure.get() < 0 ||
         config_.client.runtime.tcp_user_timeout_ms_latency.get() < 0) {
         validation_errors_.push_back("client.runtime tcp_user_timeout_ms_* must be >= 0");
+    }
+    if (config_.client.runtime.ack_timeout_sec_throughput.get() < 0 ||
+        config_.client.runtime.ack_timeout_sec_failure.get() < 0 ||
+        config_.client.runtime.ack_timeout_sec_latency.get() < 0) {
+        validation_errors_.push_back("client.runtime ack_timeout_sec_* must be >= 0");
+    }
+    if (config_.client.runtime.epoll_wait_writable_ms_throughput.get() < 0 ||
+        config_.client.runtime.epoll_wait_writable_ms_failure.get() < 0 ||
+        config_.client.runtime.epoll_wait_writable_ms_latency.get() < 0) {
+        validation_errors_.push_back("client.runtime epoll_wait_writable_ms_* must be >= 0");
     }
     
     return validation_errors_.empty();

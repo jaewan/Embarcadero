@@ -249,6 +249,8 @@ class Publisher {
 		std::string runtime_mode_{"throughput"};
 		int ack_drain_ms_success_{50};
 		int ack_drain_ms_failure_{3000};
+		int ack_timeout_seconds_{120};
+		int epoll_wait_writable_ms_{1};
 		// [[threading: EpollAckThread writes, Poll() reads]] — must be atomic for correctness
 		std::atomic<size_t> ack_received_{0};
 		std::vector<std::thread> threads_;
