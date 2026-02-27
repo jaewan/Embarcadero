@@ -58,13 +58,6 @@ static int RuntimeSocketRcvBufBytes() {
 	return static_cast<int>(runtime.socket_recv_buffer_bytes_throughput.get());
 }
 
-// ORDER=0 inline path is experimental and can increase throughput variance.
-// Keep the stable delegation-thread path as default.
-static bool ShouldEnableOrder0Inline() {
-	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER0_INLINE", false);
-	return enabled;
-}
-
 static bool ShouldEnableOrder5Trace() {
 	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_TRACE", false);
 	return enabled;
@@ -157,76 +150,6 @@ void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, uint64_t written_add
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written_addr));
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
 	CXL::store_fence();  // Required for CXL visibility; reader (AckThread) must see updated written
-}
-
-/**
- * [[ORDER0_INLINE]] Process ORDER=0 batch inline: set per-message metadata.
- * Called by ReqReceive thread immediately after recv() to batch data, while hot in cache.
- *
- * Sets required metadata for GetMessageAddr() navigation:
- * - logical_offset: Per-message sequence number
- * - segment_header: Pointer to segment boundary
- * - next_msg_diff: Size to next message (paddedSize)
- *
- * CRITICAL: Must be called BEFORE batch_complete=1 so metadata is visible when frontier advances.
- * CRITICAL: Must flush metadata to CXL for non-coherent memory visibility.
- *
- * Parallelizes what DelegationThread did sequentially (2.56M msgs/sec bottleneck eliminated).
- */
-void NetworkManager::ProcessOrder0BatchInline(void* batch_data, uint32_t num_msg, size_t base_logical_offset) {
-	if (!batch_data || num_msg == 0) return;
-
-	MessageHeader* msg = reinterpret_cast<MessageHeader*>(batch_data);
-	size_t logical_offset = base_logical_offset;
-
-	// Track flush points for batched CXL flushing
-	void* flush_start = msg;
-	size_t bytes_since_flush = 0;
-	constexpr size_t FLUSH_INTERVAL = 64 * 1024;  // Flush every 64KB
-
-	for (uint32_t i = 0; i < num_msg; i++) {
-		// Validate paddedSize to prevent infinite loop
-		if (msg->paddedSize < sizeof(MessageHeader) || msg->paddedSize > 1024 * 1024) {
-			LOG(ERROR) << "ProcessOrder0BatchInline: Invalid paddedSize=" << msg->paddedSize
-			           << " at message " << i << "/" << num_msg;
-			break;
-		}
-
-		// Set required metadata for subscriber navigation
-		msg->logical_offset = logical_offset++;
-		msg->segment_header = reinterpret_cast<uint8_t*>(msg) - CACHELINE_SIZE;
-		msg->next_msg_diff = msg->paddedSize;
-
-		// Update segment header (accumulated size from segment base to current message)
-		*reinterpret_cast<unsigned long long int*>(msg->segment_header) =
-			static_cast<unsigned long long int>(
-				reinterpret_cast<uint8_t*>(msg) - reinterpret_cast<uint8_t*>(msg->segment_header));
-
-		bytes_since_flush += msg->paddedSize;
-
-		// Batch flush every 64KB to reduce CXL flush overhead
-		if (bytes_since_flush >= FLUSH_INTERVAL) {
-			for (void* p = flush_start; p < reinterpret_cast<void*>(msg); p = reinterpret_cast<void*>(
-						reinterpret_cast<uint8_t*>(p) + 64)) {
-				CXL::flush_cacheline(p);
-			}
-			flush_start = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(msg) + msg->paddedSize);
-			bytes_since_flush = 0;
-		}
-
-		// Move to next message
-		if (i < num_msg - 1) {
-			msg = reinterpret_cast<MessageHeader*>(
-				reinterpret_cast<uint8_t*>(msg) + msg->paddedSize);
-		}
-	}
-
-	// Flush remaining cache lines and fence
-	for (void* p = flush_start; p <= reinterpret_cast<void*>(msg); p = reinterpret_cast<void*>(
-				reinterpret_cast<uint8_t*>(p) + 64)) {
-		CXL::flush_cacheline(p);
-	}
-	CXL::store_fence();
 }
 
 /**
@@ -867,7 +790,6 @@ void NetworkManager::HandlePublishRequest(
 		// [[Issue #3]] Get Topic* once per batch for single epoch check and ReservePBRSlotAfterRecv(Topic*, ..., epoch_checked).
 		Topic* topic_ptr = cxl_manager_->GetTopicPtr(handshake.topic);
 		bool epoch_checked_this_batch = false;
-		const bool order0_inline_enabled = ShouldEnableOrder0Inline();
 
 		// Use GetCXLBuffer for batch-level allocation and zero-copy receive
 		// BLOCKING MODE: Wait indefinitely for ring space - NEVER close connection
@@ -1104,11 +1026,6 @@ void NetworkManager::HandlePublishRequest(
 				);
 			}
 		}
-		// Optional ORDER=0 inline metadata path (off by default).
-		if (order0_inline_enabled && seq_type == EMBARCADERO && tinode && tinode->order == 0) {
-			ProcessOrder0BatchInline(buf, batch_header.num_msg, logical_offset);
-		}
-
 		// [[DESIGN: Write PBR entry only after full receive]] Batch is fully in blog; write the
 		// complete BatchHeader to the PBR slot once. Slot was zeroed in GetCXLBuffer.
 		// [[PERF: Batch flush pattern]] Topic::PublishPBRSlotAfterRecv writes both cachelines, then one fence.

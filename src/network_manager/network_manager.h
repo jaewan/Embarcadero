@@ -106,10 +106,6 @@ private:
     // [[PERF]] Order 0 ACK cursor owner: network ingest path updates cumulative message count.
     void UpdateWrittenForOrder0(TInode* tinode, uint64_t written_addr, uint32_t num_msg);
 
-    // Process ORDER=0 batch inline: set per-message metadata.
-    // Called by ReqReceive thread immediately after recv() to batch data, while hot in cache.
-    void ProcessOrder0BatchInline(void* batch_data, uint32_t num_msg, size_t base_logical_offset);
-
     // Thread-safe queues
     folly::MPMCQueue<std::optional<struct NetworkRequest>> request_queue_;
     folly::MPMCQueue<struct LargeMsgRequest> large_msg_queue_;
