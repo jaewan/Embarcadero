@@ -27,6 +27,7 @@
 #include "../embarlet/topic_manager.h"
 #include "../common/config.h"
 #include "../common/order_level.h"
+#include "../common/env_flags.h"
 #include "../common/performance_utils.h"
 #include "../common/wire_formats.h"
 
@@ -37,22 +38,7 @@ namespace Embarcadero {
 //----------------------------------------------------------------------------
 
 static bool ShouldEnableSoBusyPoll() {
-	static const bool enabled = []() {
-		const char* env = std::getenv("EMBARCADERO_ENABLE_SO_BUSY_POLL");
-		if (!env) return true;  // Default on for throughput path; allow explicit opt-out.
-		if (std::strcmp(env, "0") == 0 ||
-		    std::strcmp(env, "false") == 0 ||
-		    std::strcmp(env, "FALSE") == 0 ||
-		    std::strcmp(env, "no") == 0 ||
-		    std::strcmp(env, "NO") == 0) {
-			return false;
-		}
-		return std::strcmp(env, "1") == 0 ||
-		       std::strcmp(env, "true") == 0 ||
-		       std::strcmp(env, "TRUE") == 0 ||
-		       std::strcmp(env, "yes") == 0 ||
-		       std::strcmp(env, "YES") == 0;
-	}();
+	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ENABLE_SO_BUSY_POLL", true);
 	return enabled;
 }
 
@@ -75,35 +61,12 @@ static int RuntimeSocketRcvBufBytes() {
 // ORDER=0 inline path is experimental and can increase throughput variance.
 // Keep the stable delegation-thread path as default.
 static bool ShouldEnableOrder0Inline() {
-	static const bool enabled = []() {
-		const char* env = std::getenv("EMBARCADERO_ORDER0_INLINE");
-		if (!env) return false;  // Default OFF for stable throughput.
-		return std::strcmp(env, "1") == 0 ||
-		       std::strcmp(env, "true") == 0 ||
-		       std::strcmp(env, "TRUE") == 0 ||
-		       std::strcmp(env, "yes") == 0 ||
-		       std::strcmp(env, "YES") == 0;
-	}();
+	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER0_INLINE", false);
 	return enabled;
 }
 
 static bool ShouldEnableOrder5Trace() {
-	static const bool enabled = []() {
-		const char* env = std::getenv("EMBARCADERO_ORDER5_TRACE");
-		if (!env) return false;
-		if (std::strcmp(env, "0") == 0 ||
-		    std::strcmp(env, "false") == 0 ||
-		    std::strcmp(env, "FALSE") == 0 ||
-		    std::strcmp(env, "no") == 0 ||
-		    std::strcmp(env, "NO") == 0) {
-			return false;
-		}
-		return std::strcmp(env, "1") == 0 ||
-		       std::strcmp(env, "true") == 0 ||
-		       std::strcmp(env, "TRUE") == 0 ||
-		       std::strcmp(env, "yes") == 0 ||
-		       std::strcmp(env, "YES") == 0;
-	}();
+	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_TRACE", false);
 	return enabled;
 }
 
