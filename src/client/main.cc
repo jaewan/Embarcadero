@@ -4,6 +4,7 @@
 #include "test_utils.h"
 #include "result_writer.h"
 #include "../common/configuration.h"
+#include "../common/order_level.h"
 
 int main(int argc, char* argv[]) {
     // Initialize logging
@@ -70,6 +71,9 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "Using threads_per_broker from command line: " << num_threads_per_broker;
     }
     int order = result["order_level"].as<int>();
+    if (Embarcadero::IsLegacyOrder4(order)) {
+        LOG(WARNING) << "Order 4 is deprecated compatibility mode; prefer Order 5.";
+    }
     int replication_factor = result["replication_factor"].as<int>();
     bool replicate_tinode = result.count("replicate_tinode");
     int num_clients = result["parallel_client"].as<int>();

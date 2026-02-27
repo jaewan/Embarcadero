@@ -3,6 +3,7 @@
 #include <cstring>
 #include <algorithm>
 #include "common/performance_utils.h"
+#include "common/order_level.h"
 #include <immintrin.h>
 #include <xmmintrin.h>  // For _mm_pause()
 
@@ -283,6 +284,15 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 
 	LOG(INFO) << "CreateNewTopicInternal: topic=" << topic << " order=" << order 
 	          << " replication_factor=" << replication_factor << " ack_level=" << ack_level;
+	if (IsLegacyOrder4(order)) {
+		if (ShouldRejectLegacyOrder4()) {
+			LOG(ERROR) << "CreateNewTopicInternal: rejecting deprecated Order 4 for topic '" << topic
+			           << "' because EMBARCADERO_REJECT_LEGACY_ORDER4=1";
+			return nullptr;
+		}
+		LOG(WARNING) << "CreateNewTopicInternal: topic '" << topic
+		             << "' uses deprecated Order 4 compatibility mode; canonical strong order is Order 5.";
+	}
 
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	struct TInode* replica_tinode = nullptr;
@@ -429,6 +439,11 @@ bool TopicManager::CreateNewTopic(
         int ack_level,
         heartbeat_system::SequencerType seq_type) {
 	if (shutting_down_.load(std::memory_order_acquire)) return false;
+	if (IsLegacyOrder4(order) && ShouldRejectLegacyOrder4()) {
+		LOG(ERROR) << "CreateNewTopic: rejecting deprecated Order 4 for topic '" << topic
+		           << "' because EMBARCADERO_REJECT_LEGACY_ORDER4=1";
+		return false;
+	}
 	
 	// Direct call without string interning overhead
 	struct TInode* tinode = CreateNewTopicInternal(

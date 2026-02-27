@@ -2,6 +2,7 @@
 #include "../cxl_manager/scalog_local_sequencer.h"
 #include "common/performance_utils.h"
 #include "../common/wire_formats.h"
+#include "../common/order_level.h"
 
 #include <algorithm>
 #include <array>
@@ -209,16 +210,16 @@ Topic::Topic(
 				}
 			}
 			GetCXLBufferFunc = &Topic::ScalogGetCXLBuffer;
-		} else {
-			// Set buffer function based on order
-			if (order_ == 3) {
-				GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
-			} else if (order_ == 4) {
-				GetCXLBufferFunc = &Topic::Order4GetCXLBuffer;
 			} else {
-				GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
+				// Set buffer function based on order
+				if (order_ == 3) {
+					GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
+				} else if (IsLegacyOrder4(order_)) {
+					GetCXLBufferFunc = &Topic::Order4GetCXLBuffer;
+				} else {
+					GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
+				}
 			}
-		}
 
 
 		// Constructor completes initialization without starting threads
@@ -228,6 +229,10 @@ Topic::Topic(
 void Topic::Start() {
 	// Ensure all initialization is complete before starting threads
 	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	if (IsLegacyOrder4(order_)) {
+		LOG(WARNING) << "Topic " << topic_name_
+		             << ": running deprecated Order 4 compatibility mode; canonical strong order is Order 5.";
+	}
 
 	// Start delegation thread if needed (Stage 2: Local Ordering)
 	// [PHASE-1] Skip DelegationThread for Order 5 and Order 2 with EMBARCADERO sequencer.
@@ -1795,7 +1800,8 @@ void Topic::UpdateWrittenToLastComplete() {
 		// [[B0_TAIL_ACK_FIX]] Order 4 only: optionally advance CompletionVector on close.
 		// Order 5 must keep ACK/export coupled to sequencer frontier; close-time CV overrides
 		// can ACK data that is not export-visible yet.
-		if (ack_level_ == 1 && order_ == 4 && seq_type_ == heartbeat_system::SequencerType::EMBARCADERO) {
+			if (ack_level_ == 1 && IsLegacyOrder4(order_) &&
+			    seq_type_ == heartbeat_system::SequencerType::EMBARCADERO) {
 			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 				reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
 			CompletionVectorEntry* entry = &cv[broker_id_];

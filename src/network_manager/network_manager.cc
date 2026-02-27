@@ -26,6 +26,7 @@
 #include "../cxl_manager/cxl_datastructure.h"
 #include "../embarlet/topic_manager.h"
 #include "../common/config.h"
+#include "../common/order_level.h"
 #include "../common/performance_utils.h"
 #include "../common/wire_formats.h"
 
@@ -1658,7 +1659,7 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 				fast_read_value = (size_t)-1;
 			}
 		}
-	} else if (ack_level == 1 && seq_type == EMBARCADERO && (order == 4 || order == 5)) {
+	} else if (ack_level == 1 && seq_type == EMBARCADERO && IsStrongOrderingLevelCompat(order)) {
 		// ORDER=4/5 ACK source is CV cumulative frontier (sequencer-owned, head-advanced).
 		// Followers must not ack from local ordered/written, which can lag or stay zero.
 		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
@@ -1730,7 +1731,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	size_t min = std::numeric_limits<size_t>::max();
 
 	// ORDER=4/5 ACK level 1: ack from CV cumulative frontier (sequencer-owned).
-	if (ack_level == 1 && seq_type == EMBARCADERO && (order == 4 || order == 5)) {
+	if (ack_level == 1 && seq_type == EMBARCADERO && IsStrongOrderingLevelCompat(order)) {
 		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
