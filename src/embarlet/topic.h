@@ -350,12 +350,6 @@ class Topic {
 		/** [[ORDER_0_TAIL]] When publish connection closes, advance written_* to order0_next_logical_offset_ so subscribers see full tail (fixes out-of-order batch completion leaving written behind). */
 		void FinalizeOrder0WrittenIfNeeded();
 
-		/** [[ORDER_0_ACK_RACE_FIX]] Directly update written offset to last_batch_complete_offset without walking message chain. Used on connection close to avoid race with DelegationThread. */
-		void UpdateWrittenToLastComplete();
-
-		/** [[ORDER_0_ACK_RACE_FIX]] Update last_batch_complete_offset when batch_complete=1 is set. Thread-safe (atomic). */
-		void TrackBatchComplete(size_t logical_offset_end);
-
 		/** [[Issue #3]] Single epoch check per batch: do once at batch start, pass epoch_already_checked to ReserveBLogSpace/ReservePBRSlotAndWriteEntry. Returns true if stale (caller must not allocate). */
 		bool CheckEpochOnce();
 		void* ReserveBLogSpace(size_t size, bool epoch_already_checked = false);
@@ -595,11 +589,6 @@ class Topic {
 
 		// [[ORDER_0_SKIP_PBR]] Monotonic logical offset for order 0; no PBR slot written, only written count updated
 		std::atomic<size_t> order0_next_logical_offset_{0};
-
-		// [[ORDER_0_ACK_RACE_FIX]] Track highest logical offset where batch_complete=1 was set (for all orders).
-		// Used on connection close to advance written without walking message chain (avoids race with DelegationThread).
-		// Per-broker tracking: each receive thread updates this, finalization uses it to set written directly.
-		std::atomic<size_t> last_batch_complete_offset_{0};
 
 		// TInode cache
 		int replication_factor_;
