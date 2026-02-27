@@ -201,6 +201,7 @@ public:
     size_t getBatchSize() const { return config_.storage.batch_size.get(); }
     int getMaxTopics() const { return config_.storage.max_topics.get(); }
     int getNetworkIOThreads() const { return config_.network.io_threads.get(); }
+    std::string getRuntimeMode() const;
 
     // Cluster configuration helpers
     int getSequencerBrokerId() const { return config_.cluster.sequencer_broker_id.get(); }

@@ -30,17 +30,6 @@ constexpr int kAckPortMin = 10000;
 constexpr int kAckPortMax = 65535;
 constexpr int kAckPortRange = kAckPortMax - kAckPortMin + 1;
 
-std::string NormalizeRuntimeMode(std::string mode) {
-	std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
-		return static_cast<char>(std::tolower(c));
-	});
-	if (mode == "throughput" || mode == "failure" || mode == "latency") {
-		return mode;
-	}
-	LOG(WARNING) << "Unknown client.runtime.mode='" << mode
-	             << "' (expected throughput|failure|latency). Falling back to throughput.";
-	return "throughput";
-}
 }  // namespace
 
 Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, 
@@ -362,7 +351,7 @@ void Publisher::Init(int ack_level) {
 	ack_level_ = ack_level;
 
 	const auto& runtime_cfg = Embarcadero::GetConfig().config().client.runtime;
-	runtime_mode_ = NormalizeRuntimeMode(runtime_cfg.mode.get());
+	runtime_mode_ = Embarcadero::GetConfig().getRuntimeMode();
 	if (runtime_mode_ == "failure") {
 		ack_drain_ms_success_ = runtime_cfg.ack_drain_ms_failure.get();
 		ack_timeout_seconds_ = runtime_cfg.ack_timeout_sec_failure.get();

@@ -8,8 +8,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
-#include <algorithm>
-#include <cctype>
 #include <sstream>
 #include <limits>
 #include <chrono>
@@ -57,19 +55,9 @@ static bool ShouldEnableSoBusyPoll() {
 	return enabled;
 }
 
-static std::string NormalizeRuntimeMode(std::string mode) {
-	std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
-		return static_cast<char>(std::tolower(c));
-	});
-	if (mode == "throughput" || mode == "failure" || mode == "latency") {
-		return mode;
-	}
-	return "throughput";
-}
-
 static int RuntimeSocketSndBufBytes() {
 	const auto& runtime = GetConfig().config().client.runtime;
-	const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+	const std::string mode = GetConfig().getRuntimeMode();
 	if (mode == "failure") return static_cast<int>(runtime.socket_send_buffer_bytes_failure.get());
 	if (mode == "latency") return static_cast<int>(runtime.socket_send_buffer_bytes_latency.get());
 	return static_cast<int>(runtime.socket_send_buffer_bytes_throughput.get());
@@ -77,7 +65,7 @@ static int RuntimeSocketSndBufBytes() {
 
 static int RuntimeSocketRcvBufBytes() {
 	const auto& runtime = GetConfig().config().client.runtime;
-	const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+	const std::string mode = GetConfig().getRuntimeMode();
 	if (mode == "failure") return static_cast<int>(runtime.socket_recv_buffer_bytes_failure.get());
 	if (mode == "latency") return static_cast<int>(runtime.socket_recv_buffer_bytes_latency.get());
 	return static_cast<int>(runtime.socket_recv_buffer_bytes_throughput.get());

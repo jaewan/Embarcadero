@@ -72,6 +72,17 @@ Configuration& Configuration::getInstance() {
     return instance;
 }
 
+std::string Configuration::getRuntimeMode() const {
+    std::string mode = config_.client.runtime.mode.get();
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mode == "throughput" || mode == "failure" || mode == "latency") {
+        return mode;
+    }
+    return "throughput";
+}
+
 bool Configuration::loadFromFile(const std::string& filename) {
     try {
         YAML::Node yaml = YAML::LoadFile(filename);
@@ -406,9 +417,11 @@ bool Configuration::validate() const {
     }
 
     // Runtime mode validation
-    {
+    if (getRuntimeMode() != config_.client.runtime.mode.get()) {
         std::string mode = config_.client.runtime.mode.get();
-        std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+        std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
         if (mode != "throughput" && mode != "failure" && mode != "latency") {
             validation_errors_.push_back("client.runtime.mode must be one of: throughput, failure, latency");
         }

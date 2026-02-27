@@ -1,25 +1,13 @@
 #include "common.h"
-#include <algorithm>
-#include <cctype>
 
 namespace {
-std::string NormalizeRuntimeMode(std::string mode) {
-    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (mode == "throughput" || mode == "failure" || mode == "latency") {
-        return mode;
-    }
-    return "throughput";
-}
-
 const Embarcadero::EmbarcaderoConfig::Client::Runtime& RuntimeConfig() {
     return Embarcadero::GetConfig().config().client.runtime;
 }
 
 size_t RuntimeSendBufferBytes() {
     const auto& runtime = RuntimeConfig();
-    const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+    const std::string mode = Embarcadero::GetConfig().getRuntimeMode();
     if (mode == "failure") return runtime.socket_send_buffer_bytes_failure.get();
     if (mode == "latency") return runtime.socket_send_buffer_bytes_latency.get();
     return runtime.socket_send_buffer_bytes_throughput.get();
@@ -27,7 +15,7 @@ size_t RuntimeSendBufferBytes() {
 
 size_t RuntimeRecvBufferBytes() {
     const auto& runtime = RuntimeConfig();
-    const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+    const std::string mode = Embarcadero::GetConfig().getRuntimeMode();
     if (mode == "failure") return runtime.socket_recv_buffer_bytes_failure.get();
     if (mode == "latency") return runtime.socket_recv_buffer_bytes_latency.get();
     return runtime.socket_recv_buffer_bytes_throughput.get();
@@ -35,7 +23,7 @@ size_t RuntimeRecvBufferBytes() {
 
 int RuntimeTcpUserTimeoutMs() {
     const auto& runtime = RuntimeConfig();
-    const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+    const std::string mode = Embarcadero::GetConfig().getRuntimeMode();
     if (mode == "failure") return runtime.tcp_user_timeout_ms_failure.get();
     if (mode == "latency") return runtime.tcp_user_timeout_ms_latency.get();
     return runtime.tcp_user_timeout_ms_throughput.get();
