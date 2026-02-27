@@ -52,17 +52,6 @@ struct SubscriberState {
     bool initialized = false;
 };
 
-/**
- * Frontier state for ORDER=0 inline processing.
- * Tracks next PBR slot to process for gapless written advancement.
- * Must be cache-aligned to prevent false sharing between topics.
- */
-struct alignas(128) Order0FrontierState {
-    std::atomic<size_t> next_complete_slot{0};  // Next PBR slot expected to complete (gapless advancement)
-    char _padding[128 - sizeof(std::atomic<size_t>)];  // Prevent false sharing
-};
-
-
 class NetworkManager {
 public:
     /**
@@ -121,9 +110,6 @@ private:
     // Called by ReqReceive thread immediately after recv() to batch data, while hot in cache.
     void ProcessOrder0BatchInline(void* batch_data, uint32_t num_msg, size_t base_logical_offset);
 
-    // ORDER=0 written frontier is advanced collaboratively from network threads.
-    void TryAdvanceWrittenFrontier(const char* topic, size_t my_slot, uint32_t num_msg, TInode* tinode);
-
     // Thread-safe queues
     folly::MPMCQueue<std::optional<struct NetworkRequest>> request_queue_;
     folly::MPMCQueue<struct LargeMsgRequest> large_msg_queue_;
@@ -146,10 +132,6 @@ private:
     int ack_efd_; // Epoll file descriptor for acknowledgments
     int ack_fd_ = -1; // Socket file descriptor for acknowledgments
 
-    // ORDER=0 inline processing: frontier state per topic for gapless written advancement
-    absl::Mutex frontier_mu_;
-    absl::flat_hash_map<std::string, std::unique_ptr<Order0FrontierState>> order0_frontiers_;
-    
     // Manager dependencies
     CXLManager* cxl_manager_ = nullptr;
     DiskManager* disk_manager_ = nullptr;
