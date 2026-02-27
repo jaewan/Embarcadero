@@ -509,6 +509,15 @@ class Topic {
 			BatchHeader*& batch_header_location,
 			bool epoch_already_checked = false);
 
+		std::function<void(void*, size_t)> Order4GetCXLBuffer(
+				BatchHeader& batch_header,
+				const char topic[TOPIC_NAME_SIZE],
+				void*& log,
+				void*& segment_header,
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
+
 		std::function<void(void*, size_t)> EmbarcaderoGetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
@@ -606,8 +615,10 @@ class Topic {
 	// Sequencing
 	// Ordered batch vector for efficient subscribe
 	void GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers);
+	void Sequencer4();
 	void Sequencer5();  // Batch-level sequencer (Phase 1b: epoch pipeline + Level 5 hold buffer)
 	void Sequencer2();  // Order 2: Total order, no per-client state;
+	void BrokerScannerWorker(int broker_id);
 	void BrokerScannerWorker5(int broker_id);  // Batch-level scanner (Phase 1b: pushes to epoch buffer)
 	void EpochDriverThread();   // [[PHASE_1B]] Advances epoch_index_ every kEpochUs
 	void EpochSequencerThread(); // [[PHASE_1B]] Processes closed epochs: one fetch_add per epoch, Level 5, commit
@@ -629,6 +640,10 @@ class Topic {
 	void Level5ShardWorker(size_t shard_id);
 	void InitLevel5Shards();
 	size_t GetTotalHoldBufferSize();
+	bool ProcessSkipped(
+		absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
+		BatchHeader* &header_for_sub);
+	void AssignOrder(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);
 	void AssignOrder5(BatchHeader *header, size_t start_total_order, BatchHeader* &header_for_sub);  // Batch-level version
 
 	// [[NAMING]] total_order space: next message sequence to assign (design: message-level order for subscribers).
