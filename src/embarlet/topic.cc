@@ -168,8 +168,6 @@ Topic::Topic(
 				// Set buffer function based on order
 				if (order_ == 3) {
 					GetCXLBufferFunc = &Topic::Order3GetCXLBuffer;
-				} else if (IsLegacyOrder4(order_)) {
-					GetCXLBufferFunc = &Topic::Order4GetCXLBuffer;
 				} else {
 					GetCXLBufferFunc = &Topic::EmbarcaderoGetCXLBuffer;
 				}
@@ -183,11 +181,6 @@ Topic::Topic(
 void Topic::Start() {
 	// Ensure all initialization is complete before starting threads
 	std::this_thread::sleep_for(std::chrono::milliseconds(10));
-	if (IsLegacyOrder4(order_)) {
-		LOG(WARNING) << "Topic " << topic_name_
-		             << ": running deprecated Order 4 compatibility mode; canonical strong order is Order 5.";
-	}
-
 	// Start delegation thread if needed (Stage 2: Local Ordering)
 	// [PHASE-1] Skip DelegationThread for Order 5 and Order 2 with EMBARCADERO sequencer.
 	// Reason 1: Order 5/2 subscribers use GetBatchToExportWithMetadata (GOI/CV-based),
@@ -222,8 +215,7 @@ void Topic::Start() {
 		LOG(INFO) << "Topic " << topic_name_ << ": Started " << num_callback_threads
 		          << " Corfu callback worker threads";
 	}
-		if (!skip_delegation &&
-		    (seq_type_ == CORFU || (seq_type_ != KAFKA && order_ != 4))) {
+		if (!skip_delegation && seq_type_ != KAFKA) {
 			delegationThreads_.emplace_back(&Topic::DelegationThread, this);
 	}
 
@@ -247,9 +239,6 @@ void Topic::Start() {
 				else if (order_ == 3)
 					LOG(ERROR) << "Sequencer 3 is not ported yet";
 					//sequencerThread_ = std::thread(&Topic::Sequencer3, this);
-				else if (order_ == 4){
-					sequencerThread_ = std::thread(&Topic::Sequencer4, this);
-				}
 				else if (order_ == 5){
 					LOG(INFO) << "Creating Sequencer5 thread for order level 5";
 				// [[PHASE_3]] Start GOI recovery thread for monitoring chain replication
@@ -268,7 +257,7 @@ void Topic::Start() {
 					LOG(ERROR) << "Order is set 2 at scalog";
 				break;
 			case CORFU:
-				if (order_ == 0 || order_ == 3 || order_ == 4)
+				if (order_ == 0 || order_ == 3)
 					VLOG(3) << "Order " << order_ <<
 						" for Corfu is right as messages are written ordered. Combiner combining is enough";
 				else
