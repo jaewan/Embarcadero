@@ -1051,13 +1051,6 @@ void NetworkManager::HandlePublishRequest(
 			const uint64_t batch_end_addr = static_cast<uint64_t>(batch_header.log_idx + batch_header.total_size);
 			UpdateWrittenForOrder0(tinode, batch_end_addr, batch_header.num_msg);
 		}
-		// ORDER=4 only: retain close-time tail fallback tracking for legacy order-4 export path.
-		// ORDER=5 must keep ACK and export frontiers coupled (sequencer-owned), so do not track here.
-		if (topic_ptr && seq_type == EMBARCADERO && tinode && tinode->order == 4) {
-			size_t batch_end_offset = logical_offset + batch_header.num_msg;
-			topic_ptr->TrackBatchComplete(batch_end_offset);
-		}
-
 		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for other orders
 	} else if (batch_header_location == nullptr) {
 		LOG(WARNING) << "NetworkManager: batch_header_location is null for batch with " << batch_header.num_msg << " messages, order_level=" << seq_type;
@@ -1081,17 +1074,6 @@ void NetworkManager::HandlePublishRequest(
 				}
 			}
 		}
-
-	// ORDER=4 only: keep historical close-time tail fallback used by legacy order-4 path.
-	// ORDER=0 stays single-writer in ingest path.
-	// ORDER=5 must not use close-time override, otherwise ACK can outrun export frontier.
-	TInode* topic_tinode = reinterpret_cast<TInode*>(cxl_manager_->GetTInode(handshake.topic));
-	if (topic_tinode && topic_tinode->seq_type == EMBARCADERO && topic_tinode->order == 4) {
-		Topic* topic_final = cxl_manager_->GetTopicPtr(handshake.topic);
-		if (topic_final) {
-			topic_final->UpdateWrittenToLastComplete();
-		}
-	}
 
 	close(client_socket);
 }
