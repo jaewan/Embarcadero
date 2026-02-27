@@ -288,8 +288,13 @@ Embarcadero is built on three axioms:
 
 ### 2.3 Ordering Modes
 
-Embarcadero provides **order levels** (numeric): Order 0, Order 1, Order 2, and Order 5. Each level defines what ordering guarantee the log provides and how the sequencer (if any) and broker metadata are updated.
+Embarcadero provides **order levels** (numeric): Order 0, Order 1, Order 2, and Order 5 as the canonical model. The current implementation also carries a legacy `Order 4` compatibility path used by existing scripts and deployments.
 (In paper do not mention about other ordering levels but just order 2 weak ordering and order 5 strong ordering)
+
+**Implementation status (current tree):**
+- `Order 2` and `Order 5` use the epoch/scanner sequencer pipeline.
+- `Order 4` remains a legacy compatibility mode and should be treated as transitional (not the target long-term API).
+- `Order 0` has two implementations: a stable default path using delegation processing, and an experimental inline path controlled by `EMBARCADERO_ORDER0_INLINE`.
 
 #### Order 0: No Global Ordering
 
@@ -303,16 +308,16 @@ NO GUARANTEE:
   No per-client order.
 
 MECHANISM:
-  No sequencer. The broker (network path) that commits a batch into the PBR
-  SHALL update that broker's written offset (and optionally written_addr)
-  in the same execution context, after the PBR entry is visible in CXL
-  (store + flush + fence). This is "Option A": the writer of the data
-  updates the visibility counter so ACK (ack_level=1) can advance without
-  a separate sequencer or delegation thread.
+  Target architecture: no sequencer. The broker (network path) that commits
+  a batch into the PBR updates that broker's written offset (and optionally
+  written_addr) after the PBR entry is visible in CXL (store + flush + fence).
+  This is "Option A": the writer of the data updates the visibility counter
+  so ACK (ack_level=1) can advance without a separate sequencer.
 
-  Implementation: The thread that reserves PBR slot, writes the PBR entry,
-  and flushes it SHALL then update TInode.offsets[broker_id].written
-  (monotonic) and, if used, written_addr. No Sequencer 0 thread.
+  Current implementation detail: `Order 0` defaults to the stable delegation
+  path. The inline network-owner path is available behind
+  `EMBARCADERO_ORDER0_INLINE` and is intended to converge to the default once
+  operational stability is proven across environments.
 
 PERFORMANCE:
   Lowest latency for ACK (no sequencer hop).
@@ -367,6 +372,10 @@ MECHANISM:
   each broker read PBR tail/head, consume contiguous ready entries, assign
   global_seq, write GOI, advance consumed pointer; then next broker.
 
+  Current implementation note: `Order 2` runs on the same epoch/scanner
+  infrastructure used by `Order 5` (without per-client hold logic), but
+  must preserve the same non-blocking progress property.
+
 PERFORMANCE:
   Zero HOL blocking.
   Maximum throughput for total order.
@@ -409,16 +418,16 @@ Acknowledgments are independent of order level. The client negotiates **ack_leve
 | ack_level | When ACK is sent | Guarantee at ACK time |
 |-----------|-------------------|------------------------|
 | **0** | Never | Fire-and-forget; no ACKs. Broker may still track for backpressure. |
-| **1** | After visibility in CXL | For **Order 0**: after broker has updated `written` (PBR commit). For **Order 1/2/5**: after sequencer has assigned order (broker reads `ordered` or equivalent). Message is visible to sequencer/subscribers; not necessarily durable. |
+| **1** | After visibility in CXL | For **Order 0**: after broker has updated `written` (PBR commit). For **Order 1/2**: after sequencer has assigned order (`ordered`). For **Order 4/5 (Embarcadero sequencer)**: from Completion Vector cumulative frontier (sequencer-owned). Message is visible to sequencer/subscribers; not necessarily durable. |
 | **2** | After replication | Tail replica has updated CompletionVector; batch is durable (replicated to disk on replica set). Client can treat ACK as durability guarantee. |
 
 **Semantics:**
 
 - **ack_level = 0:** Broker does not send ACKs. `GetOffsetToAck` returns sentinel (no ack). Used for maximum throughput when loss is acceptable.
-- **ack_level = 1:** Broker sends cumulative offset when its **written** (Order 0) or **ordered** (Order 1/2/5) count advances. One ACK per (broker, topic) represents "all messages up to this offset are visible in CXL (and ordered if order > 0)."
+- **ack_level = 1:** Broker sends cumulative offset when its **written** (Order 0), **ordered** (Order 1/2), or **CV frontier** (Order 4/5 on Embarcadero sequencer) advances. One ACK per (broker, topic) represents "all messages up to this offset are visible in CXL (and ordered if order > 0)."
 - **ack_level = 2:** Broker sends cumulative offset when CompletionVector for that broker advances (tail has replicated the batch). One ACK per (broker, topic) represents "all messages up to this offset are durable."
 
-**Implementation note:** The broker's AckThread (or equivalent) polls the appropriate source (written, ordered, or CV) and sends the cumulative offset on the ACK connection. Order level and ack_level are independent: e.g. Order 0 + ack_level=1 uses written; Order 2 + ack_level=1 uses ordered; any order + ack_level=2 uses CV.
+**Implementation note:** The broker's AckThread (or equivalent) polls the appropriate source (written, ordered, or CV) and sends the cumulative offset on the ACK connection. Order level and ack_level are independent: e.g. Order 0 + ack_level=1 uses written; Order 2 + ack_level=1 uses ordered; Order 4/5 (Embarcadero) + ack_level=1 uses CV; any order + ack_level=2 uses CV.
 
 **Publish latency measurement:** To measure publish latency (client send -> ACK), record the timestamp when a batch is fully sent on the client and compute the delta when the cumulative ACK for that broker advances past that batch. Because ACKs are cumulative per broker, the client should correlate ACK values with per-broker message counts (e.g., batch end_count) to attribute a send time to the ACK. This requires ack_level >= 1.
 
