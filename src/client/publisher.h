@@ -77,7 +77,7 @@ class Publisher {
 		 * @return true if all messages sent and ACKs received, false on timeout or error
 		 * @threading Call from same thread as Publish(); joins publisher threads on first successful call
 		 */
-		bool Poll(size_t n);
+		bool Poll(size_t n, bool include_tail_drain = true);
 
 		/**
 		 * Debug method to check if sending is finished

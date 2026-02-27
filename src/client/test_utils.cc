@@ -337,7 +337,7 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 
 			// Finalize publishing
 			VLOG(5) << "Finished publishing from client";
-				if (!p.Poll(n)) {
+				if (!p.Poll(n, false)) {
 					LOG(ERROR) << "Publish test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
 					delete[] message;
 					exit(1);
@@ -559,7 +559,7 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		}
 
 		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
-		if (!p.Poll(n)) {
+		if (!p.Poll(n, false)) {
 			LOG(ERROR) << "End-to-end test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
 			delete[] message;
 			exit(1);

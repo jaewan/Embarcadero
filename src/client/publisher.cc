@@ -568,7 +568,7 @@ void Publisher::Publish(char* message, size_t len) {
 	}
 }
 
-bool Publisher::Poll(size_t n) {
+bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	// [[LAST_PERCENT_ACK_FIX]] Seal and return reads before signaling finished.
 	// If we set publish_finished_ first, threads that get nullptr from Read() may exit
 	// before we've called SealAll(), dropping the last batches.
@@ -669,7 +669,7 @@ bool Publisher::Poll(size_t n) {
 				if (kill_brokers_) {
 					LOG(INFO) << "[Publisher ACK]: Timeout allowed due to killed brokers. Treating as success to gather stats.";
 					int drain_ms = ack_drain_ms_failure_;
-					if (drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
+					if (include_tail_drain && drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
 					return true;
 				}
 				return false;  // Exit early on timeout
@@ -716,7 +716,7 @@ bool Publisher::Poll(size_t n) {
 					LOG(INFO) << "[Publisher ACK]: Allowed shortfall due to killed brokers. received=" << received << " target=" << target_acks;
 					// Clean up resources since test passes
 					int drain_ms = ack_drain_ms_failure_;
-					if (drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
+					if (include_tail_drain && drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
 					return true;
 				}
 			LOG(ERROR) << "[Publisher ACK Failure]: Did not receive ACKs for all messages. received="
@@ -739,9 +739,9 @@ bool Publisher::Poll(size_t n) {
 			LOG(INFO) << "[ACK_VERIFY] received=" << received << " target=" << target_acks << " 100%";
 			// [[ORDER_0_TAIL_ACK]] Drain so EpollAckThread can read in-flight ACKs before we return.
 			int drain_ms = ack_drain_ms_success_;
-			if (drain_ms > 0) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
-			}
+				if (include_tail_drain && drain_ms > 0) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
+				}
 	}
 
 	// IMPROVED: Graceful disconnect - keep gRPC context alive for subscriber
