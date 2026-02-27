@@ -1,4 +1,6 @@
 #include "configuration.h"
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
@@ -164,6 +166,15 @@ bool Configuration::loadFromFile(const std::string& filename) {
             // Client
             if (root["client"]) {
                 auto client = root["client"];
+
+                // Runtime
+                if (client["runtime"]) {
+                    auto runtime = client["runtime"];
+                    if (runtime["mode"]) config_.client.runtime.mode.set(runtime["mode"].as<std::string>());
+                    if (runtime["ack_drain_ms_throughput"]) config_.client.runtime.ack_drain_ms_throughput.set(runtime["ack_drain_ms_throughput"].as<int>());
+                    if (runtime["ack_drain_ms_failure"]) config_.client.runtime.ack_drain_ms_failure.set(runtime["ack_drain_ms_failure"].as<int>());
+                    if (runtime["ack_drain_ms_latency"]) config_.client.runtime.ack_drain_ms_latency.set(runtime["ack_drain_ms_latency"].as<int>());
+                }
                 
                 // Publisher
                 if (client["publisher"]) {
@@ -204,6 +215,13 @@ bool Configuration::loadFromFile(const std::string& filename) {
         // Broker uses embarcadero.yaml storage.batch_size; client must use same value for batch alignment.
         if (yaml["client"]) {
             auto client = yaml["client"];
+            if (client["runtime"]) {
+                auto runtime = client["runtime"];
+                if (runtime["mode"]) config_.client.runtime.mode.set(runtime["mode"].as<std::string>());
+                if (runtime["ack_drain_ms_throughput"]) config_.client.runtime.ack_drain_ms_throughput.set(runtime["ack_drain_ms_throughput"].as<int>());
+                if (runtime["ack_drain_ms_failure"]) config_.client.runtime.ack_drain_ms_failure.set(runtime["ack_drain_ms_failure"].as<int>());
+                if (runtime["ack_drain_ms_latency"]) config_.client.runtime.ack_drain_ms_latency.set(runtime["ack_drain_ms_latency"].as<int>());
+            }
             if (client["publisher"]) {
                 auto publisher = client["publisher"];
                 if (publisher["threads_per_broker"]) config_.client.publisher.threads_per_broker.set(publisher["threads_per_broker"].as<int>());
@@ -355,6 +373,15 @@ bool Configuration::validate() const {
     // Platform validation
     if (config_.platform.is_intel.get() && config_.platform.is_amd.get()) {
         validation_errors_.push_back("Cannot be both Intel and AMD platform");
+    }
+
+    // Runtime mode validation
+    {
+        std::string mode = config_.client.runtime.mode.get();
+        std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+        if (mode != "throughput" && mode != "failure" && mode != "latency") {
+            validation_errors_.push_back("client.runtime.mode must be one of: throughput, failure, latency");
+        }
     }
     
     return validation_errors_.empty();

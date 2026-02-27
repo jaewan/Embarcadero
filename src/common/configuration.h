@@ -120,6 +120,15 @@ struct EmbarcaderoConfig {
 
     // Client configuration
     struct Client {
+        struct Runtime {
+            // Supported modes: throughput, failure, latency
+            ConfigValue<std::string> mode{"throughput", "EMBARCADERO_RUNTIME_MODE"};
+            // Default ACK drain after successful publish completion in each mode.
+            ConfigValue<int> ack_drain_ms_throughput{50, "EMBARCADERO_ACK_DRAIN_MS_THROUGHPUT"};
+            ConfigValue<int> ack_drain_ms_failure{3000, "EMBARCADERO_ACK_DRAIN_MS_FAILURE"};
+            ConfigValue<int> ack_drain_ms_latency{50, "EMBARCADERO_ACK_DRAIN_MS_LATENCY"};
+        } runtime;
+
         struct Publisher {
             ConfigValue<int> threads_per_broker{4, "EMBARCADERO_CLIENT_PUB_THREADS"};
             ConfigValue<size_t> buffer_size_mb{768, "EMBARCADERO_CLIENT_PUB_BUFFER_MB"};

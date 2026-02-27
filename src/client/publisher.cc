@@ -9,10 +9,19 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>  // For getenv, atoi
 #include <fstream>
 #include <iomanip>
 #include <thread>
+#include <limits>
+#include <mutex>
+#include <netdb.h>
+#include <numeric>
+#include <optional>
+#include <set>
+#include <shared_mutex>
+#include <stdexcept>
 
 // [[CODE_CLEANUP]] Removed no-op profiling stubs - if profiling is needed, implement properly
 
@@ -29,6 +38,18 @@ namespace {
 constexpr int kAckPortMin = 10000;
 constexpr int kAckPortMax = 65535;
 constexpr int kAckPortRange = kAckPortMax - kAckPortMin + 1;
+
+std::string NormalizeRuntimeMode(std::string mode) {
+	std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+		return static_cast<char>(std::tolower(c));
+	});
+	if (mode == "throughput" || mode == "failure" || mode == "latency") {
+		return mode;
+	}
+	LOG(WARNING) << "Unknown client.runtime.mode='" << mode
+	             << "' (expected throughput|failure|latency). Falling back to throughput.";
+	return "throughput";
+}
 }  // namespace
 
 Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, 
@@ -349,6 +370,28 @@ void Publisher::WritePublishLatencyResults() {
 void Publisher::Init(int ack_level) {
 	ack_level_ = ack_level;
 
+	const auto& runtime_cfg = Embarcadero::GetConfig().config().client.runtime;
+	runtime_mode_ = NormalizeRuntimeMode(runtime_cfg.mode.get());
+	if (runtime_mode_ == "failure") {
+		ack_drain_ms_success_ = runtime_cfg.ack_drain_ms_failure.get();
+	} else if (runtime_mode_ == "latency") {
+		ack_drain_ms_success_ = runtime_cfg.ack_drain_ms_latency.get();
+	} else {
+		ack_drain_ms_success_ = runtime_cfg.ack_drain_ms_throughput.get();
+	}
+	ack_drain_ms_failure_ = runtime_cfg.ack_drain_ms_failure.get();
+
+	// Backward-compatible global override.
+	if (const char* drain_env = std::getenv("EMBARCADERO_ACK_DRAIN_MS")) {
+		int drain_ms = std::atoi(drain_env);
+		ack_drain_ms_success_ = drain_ms;
+		ack_drain_ms_failure_ = drain_ms;
+	}
+
+	LOG(INFO) << "Publisher runtime mode=" << runtime_mode_
+	          << " ack_drain_ms_success=" << ack_drain_ms_success_
+	          << " ack_drain_ms_failure=" << ack_drain_ms_failure_;
+
 	// When set, PublishThread updates total_batches_attempted_ so ACK timeout log shows attempted count.
 	const char* ack_debug = std::getenv("EMBARCADERO_ACK_TIMEOUT_DEBUG");
 	enable_batch_attempted_for_timeout_log_ = (ack_debug && ack_debug[0] && (ack_debug[0] == '1' || ack_debug[0] == 'y' || ack_debug[0] == 'Y'));
@@ -619,8 +662,7 @@ bool Publisher::Poll(size_t n) {
 				// Return failure - caller should handle timeout appropriately
 				if (kill_brokers_) {
 					LOG(INFO) << "[Publisher ACK]: Timeout allowed due to killed brokers. Treating as success to gather stats.";
-					const char* drain_env = std::getenv("EMBARCADERO_ACK_DRAIN_MS");
-					int drain_ms = drain_env ? std::atoi(drain_env) : 3000;
+					int drain_ms = ack_drain_ms_failure_;
 					if (drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
 					return true;
 				}
@@ -663,15 +705,14 @@ bool Publisher::Poll(size_t n) {
 	}
 		// Only treat as success if we actually received ACKs for all messages
 		const size_t received = ack_received_.load(std::memory_order_relaxed);
-		if (received < target_acks) {
-			if (kill_brokers_) {
-				LOG(INFO) << "[Publisher ACK]: Allowed shortfall due to killed brokers. received=" << received << " target=" << target_acks;
-				// Clean up resources since test passes
-				const char* drain_env = std::getenv("EMBARCADERO_ACK_DRAIN_MS");
-				int drain_ms = drain_env ? std::atoi(drain_env) : 3000; // Increased to 3s to let trailing ACKs arrive and to keep the run_failures loop going longer to collect metrics
-				if (drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
-				return true;
-			}
+			if (received < target_acks) {
+				if (kill_brokers_) {
+					LOG(INFO) << "[Publisher ACK]: Allowed shortfall due to killed brokers. received=" << received << " target=" << target_acks;
+					// Clean up resources since test passes
+					int drain_ms = ack_drain_ms_failure_;
+					if (drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
+					return true;
+				}
 			LOG(ERROR) << "[Publisher ACK Failure]: Did not receive ACKs for all messages. received="
 			           << received << " target=" << target_acks << " short=" << (target_acks - received);
 			std::string per_broker;
@@ -689,13 +730,12 @@ bool Publisher::Poll(size_t n) {
 			LOG(ERROR) << "[Publisher ACK Per-Broker]: " << per_broker;
 			return false;
 		}
-		LOG(INFO) << "[ACK_VERIFY] received=" << received << " target=" << target_acks << " 100%";
-		// [[ORDER_0_TAIL_ACK]] Drain so EpollAckThread can read in-flight ACKs before we return.
-		const char* drain_env = std::getenv("EMBARCADERO_ACK_DRAIN_MS");
-		int drain_ms = drain_env ? std::atoi(drain_env) : 3000; // Increased to 3s to let trailing ACKs arrive and to keep the run_failures loop going longer to collect metrics
-		if (drain_ms > 0) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
-		}
+			LOG(INFO) << "[ACK_VERIFY] received=" << received << " target=" << target_acks << " 100%";
+			// [[ORDER_0_TAIL_ACK]] Drain so EpollAckThread can read in-flight ACKs before we return.
+			int drain_ms = ack_drain_ms_success_;
+			if (drain_ms > 0) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
+			}
 	}
 
 	// IMPROVED: Graceful disconnect - keep gRPC context alive for subscriber

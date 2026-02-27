@@ -1,4 +1,10 @@
 client:
+  runtime:
+    mode: throughput
+    ack_drain_ms_throughput: 50
+    ack_drain_ms_failure: 3000
+    ack_drain_ms_latency: 50
+
   publisher:
     threads_per_broker: 3   # Optimal config matching 981dd61 (10-12 GB/s)
     # 1024 MB per buffer so 12 buffers (3 threads/broker × 4 brokers) hold 10 GB total (12 × 1 GB = 12 GB ≥ 10 GB).
