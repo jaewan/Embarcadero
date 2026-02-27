@@ -34,7 +34,7 @@ public:
                        size_t& messages_size);
 
     /**
-     * Get batch to export (for Order 4)
+     * Get batch to export from ordered batch-header metadata.
      * @param expected_batch_offset Expected batch offset
      * @param batch_addr Output: batch address
      * @param batch_size Output: batch size

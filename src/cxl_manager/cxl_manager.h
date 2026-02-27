@@ -250,8 +250,8 @@ class CXLManager{
 				size_t InsertAndGetSequentiallyOrdered(size_t batch_start_offset, size_t size);
 
 
-				// Current Order 4 logic only assigns order with one thread per broker
-				// Thus, no coordination(lock) is needed within a broker with a single thread
+				// Ordering is assigned by one thread per broker in this tracker.
+				// Thus, no intra-broker lock is required here.
 				void StorePhysicalOffset(size_t logical_offset , size_t physical_offset){
 					//absl::MutexLock lock(&offset_mu_);
 					end_offset_logical_to_physical_.emplace(logical_offset, physical_offset);
