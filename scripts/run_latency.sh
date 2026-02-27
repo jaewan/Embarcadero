@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-latency}
 
 # NOTE: This script requires recompilation with COLLECT_LATENCY_STATS macro defined
 # to enable latency measurement functionality. Build with:

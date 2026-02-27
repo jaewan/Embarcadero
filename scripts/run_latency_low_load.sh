@@ -1,4 +1,5 @@
 #!/bin/bash
+export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-latency}
 
 pushd ../build/bin/
 

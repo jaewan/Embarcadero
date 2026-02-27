@@ -3,6 +3,7 @@
 # Runs ORDER=5 latency tests for multiple message sizes
 
 set -euo pipefail
+export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-latency}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
