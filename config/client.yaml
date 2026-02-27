@@ -4,6 +4,15 @@ client:
     ack_drain_ms_throughput: 50
     ack_drain_ms_failure: 3000
     ack_drain_ms_latency: 50
+    socket_send_buffer_bytes_throughput: 268435456
+    socket_send_buffer_bytes_failure: 16777216
+    socket_send_buffer_bytes_latency: 16777216
+    socket_recv_buffer_bytes_throughput: 268435456
+    socket_recv_buffer_bytes_failure: 16777216
+    socket_recv_buffer_bytes_latency: 16777216
+    tcp_user_timeout_ms_throughput: 500
+    tcp_user_timeout_ms_failure: 200
+    tcp_user_timeout_ms_latency: 500
 
   publisher:
     threads_per_broker: 3   # Optimal config matching 981dd61 (10-12 GB/s)

@@ -174,6 +174,15 @@ bool Configuration::loadFromFile(const std::string& filename) {
                     if (runtime["ack_drain_ms_throughput"]) config_.client.runtime.ack_drain_ms_throughput.set(runtime["ack_drain_ms_throughput"].as<int>());
                     if (runtime["ack_drain_ms_failure"]) config_.client.runtime.ack_drain_ms_failure.set(runtime["ack_drain_ms_failure"].as<int>());
                     if (runtime["ack_drain_ms_latency"]) config_.client.runtime.ack_drain_ms_latency.set(runtime["ack_drain_ms_latency"].as<int>());
+                    if (runtime["socket_send_buffer_bytes_throughput"]) config_.client.runtime.socket_send_buffer_bytes_throughput.set(runtime["socket_send_buffer_bytes_throughput"].as<size_t>());
+                    if (runtime["socket_send_buffer_bytes_failure"]) config_.client.runtime.socket_send_buffer_bytes_failure.set(runtime["socket_send_buffer_bytes_failure"].as<size_t>());
+                    if (runtime["socket_send_buffer_bytes_latency"]) config_.client.runtime.socket_send_buffer_bytes_latency.set(runtime["socket_send_buffer_bytes_latency"].as<size_t>());
+                    if (runtime["socket_recv_buffer_bytes_throughput"]) config_.client.runtime.socket_recv_buffer_bytes_throughput.set(runtime["socket_recv_buffer_bytes_throughput"].as<size_t>());
+                    if (runtime["socket_recv_buffer_bytes_failure"]) config_.client.runtime.socket_recv_buffer_bytes_failure.set(runtime["socket_recv_buffer_bytes_failure"].as<size_t>());
+                    if (runtime["socket_recv_buffer_bytes_latency"]) config_.client.runtime.socket_recv_buffer_bytes_latency.set(runtime["socket_recv_buffer_bytes_latency"].as<size_t>());
+                    if (runtime["tcp_user_timeout_ms_throughput"]) config_.client.runtime.tcp_user_timeout_ms_throughput.set(runtime["tcp_user_timeout_ms_throughput"].as<int>());
+                    if (runtime["tcp_user_timeout_ms_failure"]) config_.client.runtime.tcp_user_timeout_ms_failure.set(runtime["tcp_user_timeout_ms_failure"].as<int>());
+                    if (runtime["tcp_user_timeout_ms_latency"]) config_.client.runtime.tcp_user_timeout_ms_latency.set(runtime["tcp_user_timeout_ms_latency"].as<int>());
                 }
                 
                 // Publisher
@@ -221,6 +230,15 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (runtime["ack_drain_ms_throughput"]) config_.client.runtime.ack_drain_ms_throughput.set(runtime["ack_drain_ms_throughput"].as<int>());
                 if (runtime["ack_drain_ms_failure"]) config_.client.runtime.ack_drain_ms_failure.set(runtime["ack_drain_ms_failure"].as<int>());
                 if (runtime["ack_drain_ms_latency"]) config_.client.runtime.ack_drain_ms_latency.set(runtime["ack_drain_ms_latency"].as<int>());
+                if (runtime["socket_send_buffer_bytes_throughput"]) config_.client.runtime.socket_send_buffer_bytes_throughput.set(runtime["socket_send_buffer_bytes_throughput"].as<size_t>());
+                if (runtime["socket_send_buffer_bytes_failure"]) config_.client.runtime.socket_send_buffer_bytes_failure.set(runtime["socket_send_buffer_bytes_failure"].as<size_t>());
+                if (runtime["socket_send_buffer_bytes_latency"]) config_.client.runtime.socket_send_buffer_bytes_latency.set(runtime["socket_send_buffer_bytes_latency"].as<size_t>());
+                if (runtime["socket_recv_buffer_bytes_throughput"]) config_.client.runtime.socket_recv_buffer_bytes_throughput.set(runtime["socket_recv_buffer_bytes_throughput"].as<size_t>());
+                if (runtime["socket_recv_buffer_bytes_failure"]) config_.client.runtime.socket_recv_buffer_bytes_failure.set(runtime["socket_recv_buffer_bytes_failure"].as<size_t>());
+                if (runtime["socket_recv_buffer_bytes_latency"]) config_.client.runtime.socket_recv_buffer_bytes_latency.set(runtime["socket_recv_buffer_bytes_latency"].as<size_t>());
+                if (runtime["tcp_user_timeout_ms_throughput"]) config_.client.runtime.tcp_user_timeout_ms_throughput.set(runtime["tcp_user_timeout_ms_throughput"].as<int>());
+                if (runtime["tcp_user_timeout_ms_failure"]) config_.client.runtime.tcp_user_timeout_ms_failure.set(runtime["tcp_user_timeout_ms_failure"].as<int>());
+                if (runtime["tcp_user_timeout_ms_latency"]) config_.client.runtime.tcp_user_timeout_ms_latency.set(runtime["tcp_user_timeout_ms_latency"].as<int>());
             }
             if (client["publisher"]) {
                 auto publisher = client["publisher"];
@@ -382,6 +400,21 @@ bool Configuration::validate() const {
         if (mode != "throughput" && mode != "failure" && mode != "latency") {
             validation_errors_.push_back("client.runtime.mode must be one of: throughput, failure, latency");
         }
+    }
+
+    // Runtime socket/tcp values must be positive (or non-negative for timeout).
+    if (config_.client.runtime.socket_send_buffer_bytes_throughput.get() == 0 ||
+        config_.client.runtime.socket_send_buffer_bytes_failure.get() == 0 ||
+        config_.client.runtime.socket_send_buffer_bytes_latency.get() == 0 ||
+        config_.client.runtime.socket_recv_buffer_bytes_throughput.get() == 0 ||
+        config_.client.runtime.socket_recv_buffer_bytes_failure.get() == 0 ||
+        config_.client.runtime.socket_recv_buffer_bytes_latency.get() == 0) {
+        validation_errors_.push_back("client.runtime socket buffer bytes must be > 0");
+    }
+    if (config_.client.runtime.tcp_user_timeout_ms_throughput.get() < 0 ||
+        config_.client.runtime.tcp_user_timeout_ms_failure.get() < 0 ||
+        config_.client.runtime.tcp_user_timeout_ms_latency.get() < 0) {
+        validation_errors_.push_back("client.runtime tcp_user_timeout_ms_* must be >= 0");
     }
     
     return validation_errors_.empty();

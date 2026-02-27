@@ -1,4 +1,46 @@
 #include "common.h"
+#include <algorithm>
+#include <cctype>
+
+namespace {
+std::string NormalizeRuntimeMode(std::string mode) {
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mode == "throughput" || mode == "failure" || mode == "latency") {
+        return mode;
+    }
+    return "throughput";
+}
+
+const Embarcadero::EmbarcaderoConfig::Client::Runtime& RuntimeConfig() {
+    return Embarcadero::GetConfig().config().client.runtime;
+}
+
+size_t RuntimeSendBufferBytes() {
+    const auto& runtime = RuntimeConfig();
+    const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+    if (mode == "failure") return runtime.socket_send_buffer_bytes_failure.get();
+    if (mode == "latency") return runtime.socket_send_buffer_bytes_latency.get();
+    return runtime.socket_send_buffer_bytes_throughput.get();
+}
+
+size_t RuntimeRecvBufferBytes() {
+    const auto& runtime = RuntimeConfig();
+    const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+    if (mode == "failure") return runtime.socket_recv_buffer_bytes_failure.get();
+    if (mode == "latency") return runtime.socket_recv_buffer_bytes_latency.get();
+    return runtime.socket_recv_buffer_bytes_throughput.get();
+}
+
+int RuntimeTcpUserTimeoutMs() {
+    const auto& runtime = RuntimeConfig();
+    const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+    if (mode == "failure") return runtime.tcp_user_timeout_ms_failure.get();
+    if (mode == "latency") return runtime.tcp_user_timeout_ms_latency.get();
+    return runtime.tcp_user_timeout_ms_throughput.get();
+}
+}  // namespace
 
 heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
     static const std::unordered_map<std::string, heartbeat_system::SequencerType> sequencerMap = {
@@ -163,10 +205,10 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
 #define TCP_USER_TIMEOUT 18
 #endif
     {
-        static const int tcp_user_timeout_ms = [] {
-            const char* env = getenv("EMBARCADERO_TCP_USER_TIMEOUT_MS");
-            return env ? std::atoi(env) : 500;
-        }();
+        int tcp_user_timeout_ms = RuntimeTcpUserTimeoutMs();
+        if (const char* env = getenv("EMBARCADERO_TCP_USER_TIMEOUT_MS")) {
+            tcp_user_timeout_ms = std::atoi(env);
+        }
         if (tcp_user_timeout_ms > 0) {
             if (setsockopt(sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
                            &tcp_user_timeout_ms, sizeof(tcp_user_timeout_ms)) != 0) {
@@ -177,8 +219,10 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
 
     // Configure buffer size based on send/receive mode
     if (send) {
-        // OPTIMIZATION: Increase send buffer to match receive buffer for better throughput
-        int sendBufferSize = 16 * 1024 * 1024;  // 16MB: fast failure detection while sustaining >10 GB/s
+        int sendBufferSize = static_cast<int>(RuntimeSendBufferBytes());
+        if (const char* env = getenv("EMBARCADERO_SOCKET_SNDBUF_BYTES")) {
+            sendBufferSize = std::atoi(env);
+        }
         if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize)) == -1) {
             LOG(ERROR) << "setsockopt(SO_SNDBUF) failed: " << strerror(errno);
             close(sock);
@@ -200,7 +244,10 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
         // }
     } else {
         // Configure for receiving
-        int receiveBufferSize = 256 * 1024 * 1024; // 256 MB receive buffer
+        int receiveBufferSize = static_cast<int>(RuntimeRecvBufferBytes());
+        if (const char* env = getenv("EMBARCADERO_SOCKET_RCVBUF_BYTES")) {
+            receiveBufferSize = std::atoi(env);
+        }
         if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &receiveBufferSize, sizeof(receiveBufferSize)) == -1) {
             LOG(ERROR) << "setsockopt(SO_RCVBUF) failed: " << strerror(errno);
             close(sock);

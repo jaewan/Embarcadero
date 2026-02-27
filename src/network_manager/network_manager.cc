@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <limits>
 #include <chrono>
@@ -25,6 +27,7 @@
 #include "../cxl_manager/cxl_manager.h"
 #include "../cxl_manager/cxl_datastructure.h"
 #include "../embarlet/topic_manager.h"
+#include "../common/config.h"
 #include "../common/performance_utils.h"
 #include "../common/wire_formats.h"
 
@@ -52,6 +55,32 @@ static bool ShouldEnableSoBusyPoll() {
 		       std::strcmp(env, "YES") == 0;
 	}();
 	return enabled;
+}
+
+static std::string NormalizeRuntimeMode(std::string mode) {
+	std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+		return static_cast<char>(std::tolower(c));
+	});
+	if (mode == "throughput" || mode == "failure" || mode == "latency") {
+		return mode;
+	}
+	return "throughput";
+}
+
+static int RuntimeSocketSndBufBytes() {
+	const auto& runtime = GetConfig().config().client.runtime;
+	const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+	if (mode == "failure") return static_cast<int>(runtime.socket_send_buffer_bytes_failure.get());
+	if (mode == "latency") return static_cast<int>(runtime.socket_send_buffer_bytes_latency.get());
+	return static_cast<int>(runtime.socket_send_buffer_bytes_throughput.get());
+}
+
+static int RuntimeSocketRcvBufBytes() {
+	const auto& runtime = GetConfig().config().client.runtime;
+	const std::string mode = NormalizeRuntimeMode(runtime.mode.get());
+	if (mode == "failure") return static_cast<int>(runtime.socket_recv_buffer_bytes_failure.get());
+	if (mode == "latency") return static_cast<int>(runtime.socket_recv_buffer_bytes_latency.get());
+	return static_cast<int>(runtime.socket_recv_buffer_bytes_throughput.get());
 }
 
 // ORDER=0 inline path is experimental and can increase throughput variance.
@@ -107,8 +136,14 @@ inline void CleanupSocketAndEpoll(int socket_fd, int epoll_fd) {
  * @threading Called from MainThread (accept loop)
  */
 static void SetAcceptedSocketBuffers(int fd) {
-	const int rcv_buffer_size = 8 * 1024 * 1024;  // 8MB recv: broker reads fast so small buffer is fine; keeps failure detection <100ms
-	const int snd_buffer_size = 16 * 1024 * 1024;  // 16MB send: sufficient for ACK path
+	int rcv_buffer_size = RuntimeSocketRcvBufBytes();
+	int snd_buffer_size = RuntimeSocketSndBufBytes();
+	if (const char* env = std::getenv("EMBARCADERO_SOCKET_RCVBUF_BYTES")) {
+		rcv_buffer_size = std::atoi(env);
+	}
+	if (const char* env = std::getenv("EMBARCADERO_SOCKET_SNDBUF_BYTES")) {
+		snd_buffer_size = std::atoi(env);
+	}
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv_buffer_size, sizeof(rcv_buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_RCVBUF) on accepted socket failed: " << strerror(errno);
 	}
@@ -369,27 +404,34 @@ bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
 		}
 	}
 
-	// Increase socket buffers for high-throughput (128 MB; match SetAcceptedSocketBuffers)
-	const int buffer_size = 256 * 1024 * 1024;  // 256 MB
-	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+	// Keep non-blocking connection socket policy aligned with accepted payload sockets.
+	int snd_buffer_size = RuntimeSocketSndBufBytes();
+	int rcv_buffer_size = RuntimeSocketRcvBufBytes();
+	if (const char* env = std::getenv("EMBARCADERO_SOCKET_SNDBUF_BYTES")) {
+		snd_buffer_size = std::atoi(env);
+	}
+	if (const char* env = std::getenv("EMBARCADERO_SOCKET_RCVBUF_BYTES")) {
+		rcv_buffer_size = std::atoi(env);
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd_buffer_size, sizeof(snd_buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_SNDBUF) failed: " << strerror(errno);
 		// Non-fatal, continue (will use default buffer size)
 	} else {
 		int actual = 0;
 		socklen_t len = sizeof(actual);
-		if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual, &len) == 0 && actual < buffer_size) {
-			LOG(WARNING) << "SO_SNDBUF capped: requested " << buffer_size << " got " << actual
+		if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual, &len) == 0 && actual < snd_buffer_size) {
+			LOG(WARNING) << "SO_SNDBUF capped: requested " << snd_buffer_size << " got " << actual
 			             << ". Raise net.core.wmem_max (e.g. scripts/tune_kernel_buffers.sh)";
 		}
 	}
-	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv_buffer_size, sizeof(rcv_buffer_size)) < 0) {
 		LOG(WARNING) << "setsockopt(SO_RCVBUF) failed: " << strerror(errno);
 		// Non-fatal, continue (will use default buffer size)
 	} else {
 		int actual = 0;
 		socklen_t len = sizeof(actual);
-		if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &len) == 0 && actual < buffer_size) {
-			LOG(WARNING) << "SO_RCVBUF capped: requested " << buffer_size << " got " << actual
+		if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &len) == 0 && actual < rcv_buffer_size) {
+			LOG(WARNING) << "SO_RCVBUF capped: requested " << rcv_buffer_size << " got " << actual
 			             << ". Raise net.core.rmem_max (e.g. scripts/tune_kernel_buffers.sh)";
 		}
 	}

@@ -127,6 +127,17 @@ struct EmbarcaderoConfig {
             ConfigValue<int> ack_drain_ms_throughput{50, "EMBARCADERO_ACK_DRAIN_MS_THROUGHPUT"};
             ConfigValue<int> ack_drain_ms_failure{3000, "EMBARCADERO_ACK_DRAIN_MS_FAILURE"};
             ConfigValue<int> ack_drain_ms_latency{50, "EMBARCADERO_ACK_DRAIN_MS_LATENCY"};
+            // Socket buffer policy by mode. Throughput mode uses larger buffers.
+            ConfigValue<size_t> socket_send_buffer_bytes_throughput{256UL * 1024 * 1024, "EMBARCADERO_SOCKET_SNDBUF_BYTES_THROUGHPUT"};
+            ConfigValue<size_t> socket_send_buffer_bytes_failure{16UL * 1024 * 1024, "EMBARCADERO_SOCKET_SNDBUF_BYTES_FAILURE"};
+            ConfigValue<size_t> socket_send_buffer_bytes_latency{16UL * 1024 * 1024, "EMBARCADERO_SOCKET_SNDBUF_BYTES_LATENCY"};
+            ConfigValue<size_t> socket_recv_buffer_bytes_throughput{256UL * 1024 * 1024, "EMBARCADERO_SOCKET_RCVBUF_BYTES_THROUGHPUT"};
+            ConfigValue<size_t> socket_recv_buffer_bytes_failure{16UL * 1024 * 1024, "EMBARCADERO_SOCKET_RCVBUF_BYTES_FAILURE"};
+            ConfigValue<size_t> socket_recv_buffer_bytes_latency{16UL * 1024 * 1024, "EMBARCADERO_SOCKET_RCVBUF_BYTES_LATENCY"};
+            // TCP_USER_TIMEOUT by mode (ms). Lower for failure detection.
+            ConfigValue<int> tcp_user_timeout_ms_throughput{500, "EMBARCADERO_TCP_USER_TIMEOUT_MS_THROUGHPUT"};
+            ConfigValue<int> tcp_user_timeout_ms_failure{200, "EMBARCADERO_TCP_USER_TIMEOUT_MS_FAILURE"};
+            ConfigValue<int> tcp_user_timeout_ms_latency{500, "EMBARCADERO_TCP_USER_TIMEOUT_MS_LATENCY"};
         } runtime;
 
         struct Publisher {
