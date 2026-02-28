@@ -2733,12 +2733,29 @@ void Topic::Sequencer2() {
 void Topic::EpochDriverThread() {
 	LOG(INFO) << "EpochDriverThread started (epoch_us=" << kEpochUs << ")";
 	constexpr uint64_t kNewBrokerCheckInterval = 20000;  // Check every 20000 epochs (~10 s at 500 µs/epoch)
+	const auto epoch_duration = std::chrono::microseconds(kEpochUs);
+	auto next_seal_deadline = std::chrono::steady_clock::now() + epoch_duration;
 	uint64_t epoch_count = 0;
 	const bool order5_phase_diag = (order_ == 5 && ShouldEnableOrder5PhaseDiag());
 	auto last_driver_diag = std::chrono::steady_clock::now();
 	while (!stop_threads_) {
-		// [[FIX_EPOCH_PAUSE]] Replace 500us sleep with tight cpu_pause loop for microsecond-scale epoch sealing.
-		// At 10GB/s, 500us delays cause 500KB backlogs. Use adaptive pause/yield for responsiveness.
+		// Pace sealing to the configured epoch duration to preserve batching efficiency.
+		auto now = std::chrono::steady_clock::now();
+		if (now < next_seal_deadline) {
+			auto remaining = next_seal_deadline - now;
+			if (remaining > std::chrono::microseconds(50)) {
+				std::this_thread::sleep_for(remaining - std::chrono::microseconds(25));
+			} else {
+				CXL::cpu_pause();
+			}
+			continue;
+		}
+		next_seal_deadline += epoch_duration;
+		if (now - next_seal_deadline > epoch_duration) {
+			// If delayed (e.g., scheduler pause), re-anchor deadline to avoid catch-up bursts.
+			next_seal_deadline = now + epoch_duration;
+		}
+
 		constexpr int kMaxIterations = 50000; // Prevent infinite spinning
 		int iterations = 0;
 		while (!stop_threads_ && iterations < kMaxIterations) {
