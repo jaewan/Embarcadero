@@ -15,6 +15,8 @@ ACK=${ACK:-1}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
 THREADS_PER_BROKER=${THREADS_PER_BROKER:-$([ "$NUM_BROKERS" = "1" ] && echo 1 || echo 4)}
 QUIET=${QUIET:-0}
+TRIAL_MAX_ATTEMPTS=${TRIAL_MAX_ATTEMPTS:-3}
+BROKER_SETTLE_MS=${BROKER_SETTLE_MS:-300}
 
 # --- Environment Setup ---
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
@@ -64,13 +66,7 @@ wait_for_brokers() {
   done
 }
 
-# --- Main Execution ---
-overall_status=0
-cleanup
-
-for ((trial=1; trial<=NUM_TRIALS; trial++)); do
-  echo "=== Trial $trial ($SEQUENCER Order $ORDER, $NUM_BROKERS brokers, msg=$MESSAGE_SIZE) ==="
-  
+start_cluster() {
   # Start Sequencer if needed
   if [[ "$SEQUENCER" == "CORFU" ]]; then
     ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
@@ -78,28 +74,64 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
   fi
 
   # Start Brokers
-  # Head
   $EMBARLET_NUMA_BIND ./embarlet --config ../../config/embarcadero.yaml --head --$SEQUENCER > broker_0.log 2>&1 &
-
-  # Followers
   for ((i=1; i<NUM_BROKERS; i++)); do
     $EMBARLET_NUMA_BIND ./embarlet --config ../../config/embarcadero.yaml > broker_$i.log 2>&1 &
   done
 
   if ! wait_for_brokers 60 $NUM_BROKERS; then
     echo "ERROR: Brokers failed to start"
-    overall_status=1
-    cleanup
-    continue
+    return 1
   fi
   rm -f /tmp/embarlet_*_ready
 
-  # Run Test
-  echo "Running throughput test (type $TEST_TYPE)..."
-  $CLIENT_NUMA_BIND ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $TOTAL_MESSAGE_SIZE -t $TEST_TYPE -o $ORDER -a $ACK --sequencer $SEQUENCER -l 0 -r 0
-  [ ${PIPESTATUS[0]} -ne 0 ] && overall_status=1
+  # Give brokers a short settle window to reduce topic-create races.
+  if [ "$BROKER_SETTLE_MS" -gt 0 ]; then
+    sleep "$(awk "BEGIN { printf \"%.3f\", ${BROKER_SETTLE_MS}/1000.0 }")"
+  fi
+  return 0
+}
 
-  cleanup
+# --- Main Execution ---
+overall_status=0
+cleanup
+
+for ((trial=1; trial<=NUM_TRIALS; trial++)); do
+  echo "=== Trial $trial ($SEQUENCER Order $ORDER, $NUM_BROKERS brokers, msg=$MESSAGE_SIZE) ==="
+  trial_success=0
+  for ((attempt=1; attempt<=TRIAL_MAX_ATTEMPTS; attempt++)); do
+    [ "$QUIET" != "1" ] && echo "Trial $trial attempt $attempt/$TRIAL_MAX_ATTEMPTS"
+    if ! start_cluster; then
+      overall_status=1
+      cleanup
+      continue
+    fi
+
+    echo "Running throughput test (type $TEST_TYPE)..."
+    TRIAL_LOG="$(mktemp /tmp/throughput_trial_${trial}_${attempt}_XXXX.log)"
+    $CLIENT_NUMA_BIND ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $TOTAL_MESSAGE_SIZE -t $TEST_TYPE -o $ORDER -a $ACK --sequencer $SEQUENCER -l 0 -r 0 2>&1 | tee "$TRIAL_LOG"
+    cmd_status=${PIPESTATUS[0]}
+
+    if grep -q "Bandwidth:" "$TRIAL_LOG"; then
+      trial_success=1
+      rm -f "$TRIAL_LOG"
+      cleanup
+      break
+    fi
+
+    echo "WARNING: Trial $trial attempt $attempt did not produce bandwidth output (exit=$cmd_status)."
+    if grep -q "Server returned failure when creating topic" "$TRIAL_LOG"; then
+      echo "WARNING: Detected topic-creation race; retrying trial."
+    fi
+    tail -n 20 "$TRIAL_LOG"
+    rm -f "$TRIAL_LOG"
+    cleanup
+  done
+
+  if [ "$trial_success" -ne 1 ]; then
+    echo "ERROR: Trial $trial failed after $TRIAL_MAX_ATTEMPTS attempts."
+    overall_status=1
+  fi
 done
 
 echo "Done."
