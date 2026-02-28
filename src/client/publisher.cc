@@ -572,7 +572,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 
 	const bool low_payload_poll_mode = (n <= 1000000);
 	const auto queue_spin_duration = low_payload_poll_mode
-		? std::chrono::microseconds(100)
+		? std::chrono::microseconds(25)
 		: std::chrono::milliseconds(1);
 	uint32_t queue_wait_loops = 0;
 	while (client_order_.load(std::memory_order_acquire) < n) {
@@ -622,7 +622,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 		size_t last_ack_val = ack_received_.load(std::memory_order_acquire);
 		// Keep low-payload tail latency tight while preserving large-payload behavior.
 		const auto ack_spin_duration = low_payload_poll_mode
-			? std::chrono::microseconds(100)
+			? std::chrono::microseconds(25)
 			: std::chrono::microseconds(500);
 		uint32_t ack_wait_loops = 0;
 		
