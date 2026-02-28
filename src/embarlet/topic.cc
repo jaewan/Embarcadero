@@ -2731,9 +2731,20 @@ void Topic::Sequencer2() {
 }
 
 void Topic::EpochDriverThread() {
-	LOG(INFO) << "EpochDriverThread started (epoch_us=" << kEpochUs << ")";
+	unsigned epoch_us = kEpochUs;
+	if (const char* env = std::getenv("EMBAR_ORDER5_EPOCH_US")) {
+		char* end = nullptr;
+		unsigned long parsed = std::strtoul(env, &end, 10);
+		if (end != env && *end == '\0' && parsed >= 100 && parsed <= 5000) {
+			epoch_us = static_cast<unsigned>(parsed);
+		} else {
+			LOG(WARNING) << "Ignoring invalid EMBAR_ORDER5_EPOCH_US='" << env
+			             << "' (expected integer in [100, 5000]); using default " << kEpochUs;
+		}
+	}
+	LOG(INFO) << "EpochDriverThread started (epoch_us=" << epoch_us << ")";
 	constexpr uint64_t kNewBrokerCheckInterval = 20000;  // Check every 20000 epochs (~10 s at 500 µs/epoch)
-	const auto epoch_duration = std::chrono::microseconds(kEpochUs);
+	const auto epoch_duration = std::chrono::microseconds(epoch_us);
 	auto next_seal_deadline = std::chrono::steady_clock::now() + epoch_duration;
 	uint64_t epoch_count = 0;
 	const bool order5_phase_diag = (order_ == 5 && ShouldEnableOrder5PhaseDiag());
