@@ -63,6 +63,11 @@ static bool ShouldEnableOrder5Trace() {
 	return enabled;
 }
 
+static bool ShouldEnableAckJitterTrace() {
+	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ACK_JITTER_TRACE", false);
+	return enabled;
+}
+
 /**
  * Closes socket and epoll file descriptors safely
  */
@@ -1761,6 +1766,8 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 
 	size_t next_to_ack_offset = 0;
 	size_t last_known_ack = 0;  // Cache for fast-path optimization
+	const bool ack_jitter_trace = ShouldEnableAckJitterTrace();
+	auto ack_trace_last_send = std::chrono::steady_clock::now();
 	size_t last_trace_sent_ack = static_cast<size_t>(-1);
 	TInode* trace_tinode = nullptr;
 	bool trace_order5_ack = false;
@@ -1777,9 +1784,14 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	size_t consecutive_ack_stalls = 0;
 	size_t expensive_checks_since_last_ack = 0;
 	size_t fast_polls_without_full_check = 0;
+	size_t loops_since_last_send = 0;
+	size_t forced_full_checks_since_last_send = 0;
+	size_t fast_checks_since_last_send = 0;
+	size_t stall_sleep_since_last_send = 0;
 	constexpr size_t kMaxFastPollsBeforeFullCheck = 256;
 
 		while (!stop_threads_) {
+		loops_since_last_send++;
 		// [[PERF_OPTIMIZATION]] Two-phase ACK checking to avoid CXL bus storm:
 		// Phase 1: Fast read without expensive flush/fence operations
 		// Phase 2: Expensive check only if fast read suggests a change
@@ -1793,10 +1805,14 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 			// Value appears to have changed - do expensive check with proper CXL operations.
 			current_ack = GetOffsetToAck(topic.c_str(), ack_level);
 			expensive_checks_since_last_ack++;
+			if (force_full_check) {
+				forced_full_checks_since_last_send++;
+			}
 			fast_polls_without_full_check = 0;
 		} else {
 			// No change detected - use fast read value.
 			current_ack = fast_read_value;
+			fast_checks_since_last_send++;
 			fast_polls_without_full_check++;
 		}
 
@@ -1816,19 +1832,36 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 				for (int i = 0; i < 50; ++i) {
 					CXL::cpu_pause();
 				}
-				} else {
-					// Cap at 100us to avoid drifting into millisecond-scale ACK stalls.
-					std::this_thread::sleep_for(std::chrono::microseconds(100));
-					consecutive_ack_stalls = 50;  // Cap to prevent overflow
-				}
-				continue;
+					} else {
+						// Cap at 100us to avoid drifting into millisecond-scale ACK stalls.
+						std::this_thread::sleep_for(std::chrono::microseconds(100));
+						stall_sleep_since_last_send++;
+						consecutive_ack_stalls = 50;  // Cap to prevent overflow
+					}
+					continue;
 		}
 
 		// ACK is ready, use the verified value
 		size_t ack = current_ack;
 
-			if(ack != (size_t)-1 && next_to_ack_offset <= ack){
-				if (trace_order5_ack && ack != last_trace_sent_ack) {
+				if(ack != (size_t)-1 && next_to_ack_offset <= ack){
+					if (ack_jitter_trace) {
+						auto now = std::chrono::steady_clock::now();
+						double delta_ms = std::chrono::duration_cast<std::chrono::microseconds>(now - ack_trace_last_send).count() / 1000.0;
+						LOG(INFO) << "[ACK_JITTER_TRACE B" << broker_id_ << "] ack=" << ack
+						          << " next=" << next_to_ack_offset
+						          << " delta_ms=" << delta_ms
+						          << " loops=" << loops_since_last_send
+						          << " fast_checks=" << fast_checks_since_last_send
+						          << " forced_full_checks=" << forced_full_checks_since_last_send
+						          << " stall_sleeps=" << stall_sleep_since_last_send;
+						ack_trace_last_send = now;
+						loops_since_last_send = 0;
+						forced_full_checks_since_last_send = 0;
+						fast_checks_since_last_send = 0;
+						stall_sleep_since_last_send = 0;
+					}
+					if (trace_order5_ack && ack != last_trace_sent_ack) {
 					CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 						reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 					CompletionVectorEntry* my_cv = &cv[broker_id_];

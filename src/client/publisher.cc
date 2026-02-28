@@ -558,6 +558,7 @@ void Publisher::Publish(char* message, size_t len) {
 }
 
 bool Publisher::Poll(size_t n, bool include_tail_drain) {
+	const bool ack_jitter_trace = (std::getenv("EMBARCADERO_ACK_JITTER_TRACE") != nullptr);
 	// [[LAST_PERCENT_ACK_FIX]] Seal and return reads before signaling finished.
 	// If we set publish_finished_ first, threads that get nullptr from Read() may exit
 	// before we've called SealAll(), dropping the last batches.
@@ -737,6 +738,15 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			return false;
 		}
 			LOG(INFO) << "[ACK_VERIFY] received=" << received << " target=" << target_acks << " 100%";
+			if (ack_jitter_trace) {
+				const auto ack_wait_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::steady_clock::now() - wait_start_time).count() / 1000.0;
+				LOG(INFO) << "[POLL_ACK_TRACE] target=" << target_acks
+				          << " received=" << received
+				          << " wait_ms=" << ack_wait_ms
+				          << " wait_loops=" << ack_wait_loops
+				          << " low_payload_mode=" << (low_payload_poll_mode ? 1 : 0);
+			}
 			// [[ORDER_0_TAIL_ACK]] Drain so EpollAckThread can read in-flight ACKs before we return.
 			int drain_ms = ack_drain_ms_success_;
 				if (include_tail_drain && drain_ms > 0) {
