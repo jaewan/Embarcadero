@@ -570,15 +570,21 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	publish_finished_.store(true, std::memory_order_relaxed);
 	consumer_should_exit_.store(true, std::memory_order_relaxed);
 
-	constexpr auto SPIN_DURATION = std::chrono::milliseconds(1);
+	const bool low_payload_poll_mode = (n <= 1000000);
+	const auto queue_spin_duration = low_payload_poll_mode
+		? std::chrono::microseconds(100)
+		: std::chrono::milliseconds(1);
+	uint32_t queue_wait_loops = 0;
 	while (client_order_.load(std::memory_order_acquire) < n) {
 		auto spin_start = std::chrono::steady_clock::now();
-		const auto spin_end = spin_start + SPIN_DURATION;
+		const auto spin_end = spin_start + queue_spin_duration;
 		while (std::chrono::steady_clock::now() < spin_end && client_order_.load(std::memory_order_acquire) < n) {
 			Embarcadero::CXL::cpu_pause();
 		}
 		if (client_order_.load(std::memory_order_acquire) < n) {
-			std::this_thread::yield();
+			if (!low_payload_poll_mode || ((++queue_wait_loops & 0x3F) == 0)) {
+				std::this_thread::yield();
+			}
 		}
 	}
 
@@ -614,8 +620,11 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 		auto last_log_time = wait_start_time;
 		auto last_ack_change_time = wait_start_time;
 		size_t last_ack_val = ack_received_.load(std::memory_order_acquire);
-		// [[CONFIG: Ack-wait spin]] 500µs spin when waiting for acks (burst-friendly); was 1ms.
-		constexpr auto SPIN_DURATION = std::chrono::microseconds(500);
+		// Keep low-payload tail latency tight while preserving large-payload behavior.
+		const auto ack_spin_duration = low_payload_poll_mode
+			? std::chrono::microseconds(100)
+			: std::chrono::microseconds(500);
+		uint32_t ack_wait_loops = 0;
 		
 		// Configurable timeout for ACK waits. Runtime policy resolved once in Init().
 		int timeout_seconds = ack_timeout_seconds_;
@@ -690,12 +699,14 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 
 			// [[REMOVED: co = client_order_.load()]] - This caused the race condition!
 			auto spin_start = std::chrono::steady_clock::now();
-			const auto spin_end = spin_start + SPIN_DURATION;
+			const auto spin_end = spin_start + ack_spin_duration;
 			while (std::chrono::steady_clock::now() < spin_end && ack_received_.load(std::memory_order_acquire) < target_acks) {
 				Embarcadero::CXL::cpu_pause();
 			}
 			if (ack_received_.load(std::memory_order_acquire) < target_acks) {
-				std::this_thread::yield();
+				if (!low_payload_poll_mode || ((++ack_wait_loops & 0x3F) == 0)) {
+					std::this_thread::yield();
+				}
 		}
 	}
 		// Only treat as success if we actually received ACKs for all messages
