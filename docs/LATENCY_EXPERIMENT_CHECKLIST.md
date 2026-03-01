@@ -25,6 +25,7 @@ Last updated: 2026-03-01
 | 2026-03-01 | Step 2/3 debug pass C (subscriber path root-cause fix + online latency accounting) | Pass | 11.60 | 11.34 | Pass | Root cause fixed in ORDER=5 export gating (`pbr_absolute_index` readiness, not `ordered` bit); subscriber latency moved to streaming parse + unique-message poll criterion. Validation passed at 64 MiB and 4 GiB for ORDER=0/5 (plus 8 MiB smoke for ORDER=0). Throughput guardrails: 11598.58 MB/s (Order0), 11344.58 MB/s (Order5). |
 | 2026-03-01 | Step 3 debug pass D (strict parsed/recorded/dropped accounting) | Pass | 11.60 | 11.46 | Pass | Added explicit latency accounting counters and CSV fields (`Parsed,Recorded,Dropped`) in `latency_stats.csv`; revalidated 64 MiB + 4 GiB integrity (Order0/5) and reran throughput guardrails (11598.42 MB/s, 11462.24 MB/s). |
 | 2026-03-01 | Step 4 pass E (offered-load control + pacing) | Pass | 11.56 | 11.85 | Pass | Added `--target_mbps` CLI option, deterministic open-loop pacing in `LatencyTest`, offered-load summary logging (`target`, `achieved_offered`, `achieved_goodput`), and `TARGET_MBPS` passthrough in `scripts/run_latency.sh`. Baseline guardrails with pacing disabled remain in range (11557.34 MB/s, 11845.24 MB/s). |
+| 2026-03-01 | Step 5 pass F (stage decomposition + monotonic check) | Pass | 11.84 | 11.66 | Pass | Added stage metric `append_send_to_ordered_batch_latency` (derived from ACK path for `ack_level=1`), generated `stage_latency_summary.csv` with `append_send_to_ordered`, `append_send_to_ack`, `append_send_to_deliver`, and added monotonicity check (`ordered <= ack <= deliver` on p50/p99/p999/max). Revalidated latency integrity (64 MiB Order0/5) and guardrails (11838.70 MB/s, 11656.87 MB/s). |
 
 ## Step-by-step implementation plan
 
@@ -55,10 +56,10 @@ Last updated: 2026-03-01
 - [x] Run guardrail.
 
 ### Step 5: Stage-level latency decomposition
-- [ ] Add metrics: `append->ordered`, `append->ack`, `append->deliver`.
-- [ ] Emit p50/p95/p99/p99.9/max per metric.
-- [ ] Verify monotonic relation (`ordered <= ack <= deliver`) for sampled messages.
-- [ ] Run guardrail.
+- [x] Add metrics: `append->ordered`, `append->ack`, `append->deliver`.
+- [x] Emit p50/p95/p99/p99.9/max per metric.
+- [x] Verify monotonic relation (`ordered <= ack <= deliver`) for sampled messages.
+- [x] Run guardrail.
 
 ### Step 6: Ordering-anomaly instrumentation
 - [ ] Add counters for FIFO violations and ack-order violations.

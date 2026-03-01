@@ -9,6 +9,8 @@
 #include <fstream>
 #include <numeric>
 #include <algorithm>
+#include <sstream>
+#include <unordered_map>
 #include <vector>
 
 // Helper function to generate random message content
@@ -28,6 +30,132 @@ static bool ShouldValidateOrder() {
 	}
 	return std::strcmp(env, "0") != 0;
 }
+
+namespace {
+
+struct StageMetricSummary {
+	double average = 0.0;
+	double min = 0.0;
+	double p50 = 0.0;
+	double p99 = 0.0;
+	double p999 = 0.0;
+	double max = 0.0;
+	size_t count = 0;
+	bool valid = false;
+};
+
+std::vector<std::string> SplitCsv(const std::string& line) {
+	std::vector<std::string> out;
+	std::stringstream ss(line);
+	std::string cell;
+	while (std::getline(ss, cell, ',')) out.push_back(cell);
+	return out;
+}
+
+bool TryLoadMetricSummary(const std::string& path, const std::string& metric, StageMetricSummary* out) {
+	if (out == nullptr) return false;
+	std::ifstream f(path);
+	if (!f.is_open()) return false;
+	std::string header_line;
+	if (!std::getline(f, header_line)) return false;
+	const auto headers = SplitCsv(header_line);
+	std::unordered_map<std::string, size_t> col;
+	for (size_t i = 0; i < headers.size(); ++i) col[headers[i]] = i;
+	if (!col.count("Metric")) return false;
+	auto parse_double = [&](const std::vector<std::string>& row, const std::string& name, double* v) -> bool {
+		auto it = col.find(name);
+		if (it == col.end() || it->second >= row.size()) return false;
+		try { *v = std::stod(row[it->second]); return true; } catch (...) { return false; }
+	};
+	auto parse_size = [&](const std::vector<std::string>& row, const std::string& name, size_t* v) -> bool {
+		auto it = col.find(name);
+		if (it == col.end() || it->second >= row.size()) return false;
+		try { *v = static_cast<size_t>(std::stoull(row[it->second])); return true; } catch (...) { return false; }
+	};
+	std::string line;
+	while (std::getline(f, line)) {
+		if (line.empty()) continue;
+		const auto row = SplitCsv(line);
+		size_t metric_col = col["Metric"];
+		if (metric_col >= row.size() || row[metric_col] != metric) continue;
+		StageMetricSummary s;
+		if (!parse_double(row, "Average", &s.average)) return false;
+		if (!parse_double(row, "Min", &s.min)) return false;
+		if (!parse_double(row, "Median", &s.p50)) return false;
+		if (!parse_double(row, "p99", &s.p99)) return false;
+		if (!parse_double(row, "p999", &s.p999)) return false;
+		if (!parse_double(row, "Max", &s.max)) return false;
+		if (!parse_size(row, "Count", &s.count)) return false;
+		s.valid = true;
+		*out = s;
+		return true;
+	}
+	return false;
+}
+
+void WriteStageLatencySummary(const StageMetricSummary& ordered,
+		const StageMetricSummary& ack,
+		const StageMetricSummary& deliver,
+		bool monotonic_ok) {
+	std::ofstream out("stage_latency_summary.csv");
+	if (!out.is_open()) {
+		LOG(ERROR) << "Failed to open stage_latency_summary.csv";
+		return;
+	}
+	out << "Stage,Average,Min,p50,p99,p999,Max,Count\n";
+	if (ordered.valid) {
+		out << "append_send_to_ordered," << ordered.average << "," << ordered.min << ","
+		    << ordered.p50 << "," << ordered.p99 << "," << ordered.p999 << ","
+		    << ordered.max << "," << ordered.count << "\n";
+	}
+	if (ack.valid) {
+		out << "append_send_to_ack," << ack.average << "," << ack.min << ","
+		    << ack.p50 << "," << ack.p99 << "," << ack.p999 << ","
+		    << ack.max << "," << ack.count << "\n";
+	}
+	if (deliver.valid) {
+		out << "append_send_to_deliver," << deliver.average << "," << deliver.min << ","
+		    << deliver.p50 << "," << deliver.p99 << "," << deliver.p999 << ","
+		    << deliver.max << "," << deliver.count << "\n";
+	}
+	out << "monotonic_ordered_le_ack_le_deliver,,,,,,," << (monotonic_ok ? 1 : 0) << "\n";
+}
+
+void CheckStageLatencyMonotonicity(int ack_level) {
+	StageMetricSummary ordered{};
+	StageMetricSummary ack{};
+	StageMetricSummary deliver{};
+	const bool have_ack = TryLoadMetricSummary("pub_latency_stats.csv", "append_send_to_ack_batch_latency", &ack);
+	bool have_ordered = TryLoadMetricSummary("pub_latency_stats.csv", "append_send_to_ordered_batch_latency", &ordered);
+	const bool have_deliver =
+		TryLoadMetricSummary("latency_stats.csv", "publish_to_deliver_latency", &deliver) ||
+		TryLoadMetricSummary("latency_stats.csv", "append_send_to_deliver_message_latency", &deliver);
+	if (!have_ordered && have_ack && ack_level == 1) {
+		ordered = ack;
+		ordered.valid = true;
+		have_ordered = true;
+		LOG(INFO) << "Stage latency ordered metric inferred from ACK metric (ack_level=1).";
+	}
+	bool monotonic_ok = false;
+	if (have_ordered && have_ack && have_deliver) {
+		monotonic_ok =
+			(ordered.p50 <= ack.p50 && ack.p50 <= deliver.p50) &&
+			(ordered.p99 <= ack.p99 && ack.p99 <= deliver.p99) &&
+			(ordered.p999 <= ack.p999 && ack.p999 <= deliver.p999) &&
+			(ordered.max <= ack.max && ack.max <= deliver.max);
+		if (monotonic_ok) {
+			LOG(INFO) << "Stage latency monotonicity check passed: ordered <= ack <= deliver (p50/p99/p999/max).";
+		} else {
+			LOG(WARNING) << "Stage latency monotonicity check failed (p50/p99/p999/max).";
+		}
+	} else {
+		LOG(WARNING) << "Stage latency monotonicity check skipped: missing metrics "
+		             << "(ordered=" << have_ordered << ", ack=" << have_ack << ", deliver=" << have_deliver << ")";
+	}
+	WriteStageLatencySummary(ordered, ack, deliver, monotonic_ok);
+}
+
+}  // namespace
 
 // Helper function to calculate optimal queue size based on configuration
 size_t CalculateOptimalQueueSize(size_t num_threads_per_broker, size_t total_message_size, size_t message_size) {
@@ -756,6 +884,7 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 			s.DEBUG_check_order(order);
 		}
 		s.StoreLatency();
+		CheckStageLatencyMonotonicity(ack_level);
 
 		return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);
 

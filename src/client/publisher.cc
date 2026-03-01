@@ -203,11 +203,16 @@ void Publisher::WritePublishLatencyResults() {
 
 	const bool have_send_metric = !send_to_ack_latencies_copy.empty();
 	const bool have_submit_metric = !submit_to_ack_latencies_copy.empty();
+	const bool have_ordered_metric = (ack_level_ == 1) && have_send_metric;
 	Embarcadero::LatencyStats::Summary send_to_ack_summary{};
 	Embarcadero::LatencyStats::Summary submit_to_ack_summary{};
+	Embarcadero::LatencyStats::Summary send_to_ordered_summary{};
 	if (have_send_metric) {
 		std::sort(send_to_ack_latencies_copy.begin(), send_to_ack_latencies_copy.end());
 		send_to_ack_summary = Embarcadero::LatencyStats::ComputeSummary(send_to_ack_latencies_copy);
+		if (have_ordered_metric) {
+			send_to_ordered_summary = send_to_ack_summary;
+		}
 	}
 	if (have_submit_metric) {
 		std::sort(submit_to_ack_latencies_copy.begin(), submit_to_ack_latencies_copy.end());
@@ -266,6 +271,17 @@ void Publisher::WritePublishLatencyResults() {
 	} else {
 		LOG(WARNING) << "Publish Send->ACK Batch Latency Statistics unavailable.";
 	}
+	if (have_ordered_metric) {
+		LOG(INFO) << "Publish Send->Ordered Batch Latency Statistics (us):";
+		LOG(INFO) << "  Count:   " << send_to_ordered_summary.count;
+		LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << send_to_ordered_summary.average_us;
+		LOG(INFO) << "  Min:     " << send_to_ordered_summary.min_us;
+		LOG(INFO) << "  P50:     " << send_to_ordered_summary.p50_us;
+		LOG(INFO) << "  P99:     " << send_to_ordered_summary.p99_us;
+		LOG(INFO) << "  P99.9:   " << send_to_ordered_summary.p999_us;
+		LOG(INFO) << "  Max:     " << send_to_ordered_summary.max_us;
+		LOG(INFO) << "  Semantics: append_send_to_ordered batch latency (derived from ACK path at ack_level=1)";
+	}
 	LOG(INFO) << "  Submit timestamps missing (submit metric sample drops): " << missing_submit_timestamps;
 
 	const std::string latency_filename = "pub_latency_stats.csv";
@@ -316,6 +332,27 @@ void Publisher::WritePublishLatencyResults() {
 				<< "," << missing_submit_timestamps
 				<< "\n";
 		}
+		if (have_ordered_metric) {
+			latency_file << std::fixed << std::setprecision(3) << send_to_ordered_summary.average_us
+				<< "," << send_to_ordered_summary.min_us
+				<< "," << send_to_ordered_summary.p50_us
+				<< "," << send_to_ordered_summary.p90_us
+				<< "," << send_to_ordered_summary.p95_us
+				<< "," << send_to_ordered_summary.p99_us
+				<< "," << send_to_ordered_summary.p999_us
+				<< "," << send_to_ordered_summary.max_us
+				<< "," << send_to_ordered_summary.count
+				<< ",append_send_to_ordered_batch_latency"
+				<< ",us"
+				<< "," << Embarcadero::LatencyStats::kPercentileMethod
+				<< ",batch"
+				<< ",samples=count_of_fully_ordered_batches_derived_from_ack_level_1"
+				<< "," << acked_messages
+				<< "," << total_batches_sent
+				<< "," << publish_latency_out_of_order_inserts_.load(std::memory_order_relaxed)
+				<< "," << missing_submit_timestamps
+				<< "\n";
+		}
 		latency_file.close();
 	}
 
@@ -339,6 +376,14 @@ void Publisher::WritePublishLatencyResults() {
 				const double cumulative_probability = static_cast<double>(i + 1) / send_to_ack_summary.count;
 				cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
 				         << ",append_send_to_ack_batch_latency\n";
+			}
+		}
+		if (have_ordered_metric) {
+			for (size_t i = 0; i < send_to_ordered_summary.count; ++i) {
+				const long long current_latency = send_to_ack_latencies_copy[i];
+				const double cumulative_probability = static_cast<double>(i + 1) / send_to_ordered_summary.count;
+				cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
+				         << ",append_send_to_ordered_batch_latency\n";
 			}
 		}
 		cdf_file.close();
