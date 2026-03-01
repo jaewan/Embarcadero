@@ -79,6 +79,18 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	uint32_t latency_messages_in_batch ABSL_GUARDED_BY(state_mutex) = 0;
 	uint32_t latency_messages_processed ABSL_GUARDED_BY(state_mutex) = 0;
 	std::vector<std::pair<long long, long long>> latency_samples ABSL_GUARDED_BY(state_mutex);
+	struct LatencyParseDiag {
+		uint64_t parse_calls = 0;
+		uint64_t parse_input_bytes = 0;
+		uint64_t metadata_detected = 0;
+		uint64_t parsed_messages = 0;
+		uint64_t parse_break_short_header = 0;
+		uint64_t parse_break_incomplete_message = 0;
+		uint64_t parse_break_invalid_size = 0;
+		uint64_t parse_break_no_progress = 0;
+		uint64_t samples_added = 0;
+		uint64_t samples_rejected_implausible_ts = 0;
+	} latency_diag ABSL_GUARDED_BY(state_mutex);
 	// Increments when a buffer is reset for reuse; needed to disambiguate offsets
 	// across buffer swaps when correlating per-message receive timestamps.
 	std::array<uint64_t, 2> buffer_generation ABSL_GUARDED_BY(state_mutex) = {0, 0};

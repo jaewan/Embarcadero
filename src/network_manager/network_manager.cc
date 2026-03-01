@@ -68,6 +68,11 @@ static bool ShouldEnableAckJitterTrace() {
 	return enabled;
 }
 
+static bool ShouldEnableCorfuLatencyDiag() {
+	static const bool enabled = ReadEnvBoolLenient("EMBARCADERO_CORFU_LATENCY_DIAG", false);
+	return enabled;
+}
+
 /**
  * Closes socket and epoll file descriptors safely
  */
@@ -1204,6 +1209,7 @@ void NetworkManager::SubscribeNetworkThread(
 		}
 	}
 	LOG(INFO) << "SubscribeNetworkThread started for topic=" << topic << " order=" << order << " connection_id=" << connection_id;
+	const bool corfu_latency_diag = ShouldEnableCorfuLatencyDiag();
 
 	// Define batch metadata structure for Sequencer 5
 	// This metadata is sent before each batch to help subscribers reconstruct message ordering
@@ -1229,6 +1235,14 @@ void NetworkManager::SubscribeNetworkThread(
 		}
 		cached_state = sub_state_[connection_id].get();
 	}
+
+	uint64_t export_no_data_loops = 0;
+	uint64_t export_batches = 0;
+	uint64_t export_bytes = 0;
+	uint64_t export_messages = 0;
+	uint64_t metadata_send_failures = 0;
+	uint64_t payload_send_failures = 0;
+	uint64_t meta_sent_bytes = 0;
 
 	while (!stop_threads_) {
 		// Get message data to send
@@ -1261,6 +1275,7 @@ void NetworkManager::SubscribeNetworkThread(
 							messages_size,
 							batch_total_order,
 							num_messages)){
+					export_no_data_loops++;
 					std::this_thread::yield();
 					continue;
 				}
@@ -1272,12 +1287,16 @@ void NetworkManager::SubscribeNetworkThread(
 				batch_meta.num_messages = num_messages;
 				batch_meta.header_version = ((order == 5 || order == 2 || order == 3) && HeaderUtils::ShouldUseBlogHeader()) ? 2 : 1;
 				batch_meta.flags = 0;
+				export_batches++;
+				export_bytes += messages_size;
+				export_messages += num_messages;
 			} else if (order > 0) {
 				if (!topic_manager_->GetBatchToExport(
 							topic,
 							local_offset,
 							msg,
 							messages_size)){
+					export_no_data_loops++;
 					std::this_thread::yield();
 					continue;
 				}
@@ -1317,8 +1336,10 @@ void NetworkManager::SubscribeNetworkThread(
 			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL);
 			if (meta_sent != sizeof(batch_meta)) {
 				LOG(ERROR) << "Failed to send batch metadata: " << strerror(errno);
+				metadata_send_failures++;
 				break;
 			}
+			meta_sent_bytes += static_cast<uint64_t>(meta_sent);
 		}
 
 		if (messages_size > 0) {
@@ -1330,6 +1351,7 @@ void NetworkManager::SubscribeNetworkThread(
 			LOG(WARNING) << "SubscribeNetworkThread [B" << broker_id_ << "]: SendMessageData failed, "
 			             << "messages_size=" << messages_size << ", connection_id=" << connection_id
 			             << ". Breaking loop (connection will close).";
+			payload_send_failures++;
 			break;  // Connection error - state not advanced, so reconnect can retry from same position
 		}
 
@@ -1339,6 +1361,27 @@ void NetworkManager::SubscribeNetworkThread(
 			cached_state->last_offset = order0_pending_offset;
 			cached_state->last_addr = order0_pending_addr;
 		}
+
+		if (corfu_latency_diag && (order == 2 || order == 3) &&
+		    (export_batches <= 3 || export_batches % 20000 == 0)) {
+			LOG(INFO) << "Corfu subscribe export diag [B" << broker_id_ << " conn=" << connection_id
+			          << "]: batches=" << export_batches
+			          << " bytes=" << export_bytes
+			          << " messages=" << export_messages
+			          << " no_data_loops=" << export_no_data_loops
+			          << " meta_sent_bytes=" << meta_sent_bytes;
+		}
+	}
+
+	if ((order == 2 || order == 3) || corfu_latency_diag) {
+		LOG(INFO) << "SubscribeNetworkThread summary [B" << broker_id_ << " conn=" << connection_id
+		          << " order=" << order << "]: batches=" << export_batches
+		          << " bytes=" << export_bytes
+		          << " messages=" << export_messages
+		          << " no_data_loops=" << export_no_data_loops
+		          << " meta_send_failures=" << metadata_send_failures
+		          << " payload_send_failures=" << payload_send_failures
+		          << " meta_sent_bytes=" << meta_sent_bytes;
 	}
 }
 

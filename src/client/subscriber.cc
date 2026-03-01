@@ -133,6 +133,8 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
                                int order_level,
                                const std::chrono::steady_clock::time_point& recv_time) {
 	if (conn == nullptr || data == nullptr || len == 0) return;
+	conn->latency_diag.parse_calls++;
+	conn->latency_diag.parse_input_bytes += len;
 
 	auto& pending = conn->latency_parse_pending;
 	pending.insert(pending.end(), data, data + len);
@@ -152,6 +154,7 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 			    metadata->num_messages > 0 &&
 			    metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES) {
 				conn->latency_has_batch_metadata = true;
+				conn->latency_diag.metadata_detected++;
 				conn->latency_header_version = metadata->header_version;
 				conn->latency_messages_in_batch = metadata->num_messages;
 				conn->latency_messages_processed = 0;
@@ -160,7 +163,10 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 			}
 		}
 
-		if (remaining < sizeof(Embarcadero::MessageHeader)) break;
+		if (remaining < sizeof(Embarcadero::MessageHeader)) {
+			conn->latency_diag.parse_break_short_header++;
+			break;
+		}
 
 		size_t total_message_size = 0;
 		size_t header_size = sizeof(Embarcadero::MessageHeader);
@@ -182,7 +188,15 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 			}
 		}
 
-		if (!valid_message || total_message_size == 0) break;
+		if (!valid_message || total_message_size == 0) {
+			if (total_message_size == 0) {
+				conn->latency_diag.parse_break_invalid_size++;
+			} else {
+				conn->latency_diag.parse_break_incomplete_message++;
+			}
+			break;
+		}
+		conn->latency_diag.parsed_messages++;
 
 		if (total_message_size >= header_size + sizeof(long long)) {
 			long long send_nanos_since_epoch = 0;
@@ -199,6 +213,9 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 				long long latency_micros =
 					std::chrono::duration_cast<std::chrono::microseconds>(recv_time - send_time).count();
 				conn->latency_samples.emplace_back(send_nanos_since_epoch, latency_micros);
+				conn->latency_diag.samples_added++;
+			} else {
+				conn->latency_diag.samples_rejected_implausible_ts++;
 			}
 		}
 
@@ -214,7 +231,10 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		}
 	}
 
-	if (parse_offset == 0) return;
+	if (parse_offset == 0) {
+		conn->latency_diag.parse_break_no_progress++;
+		return;
+	}
 	if (parse_offset >= pending.size()) {
 		pending.clear();
 		return;
@@ -699,6 +719,53 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 			}
 			broker_breakdown << "]";
 			LOG(ERROR) << broker_breakdown.str();
+			if (measure_latency_) {
+				uint64_t diag_parse_calls = 0;
+				uint64_t diag_input_bytes = 0;
+				uint64_t diag_metadata = 0;
+				uint64_t diag_parsed_messages = 0;
+				uint64_t diag_samples_added = 0;
+				uint64_t diag_rejected_ts = 0;
+				uint64_t diag_break_short = 0;
+				uint64_t diag_break_incomplete = 0;
+				uint64_t diag_break_invalid = 0;
+				uint64_t diag_break_no_progress = 0;
+				std::vector<std::pair<int, std::shared_ptr<ConnectionBuffers>>> snapshot;
+				{
+					absl::ReaderMutexLock map_lock(&connection_map_mutex_);
+					snapshot.reserve(connections_.size() + closed_connections_.size());
+					for (const auto& [fd, conn] : connections_) {
+						if (conn) snapshot.emplace_back(fd, conn);
+					}
+					for (const auto& conn : closed_connections_) {
+						if (conn) snapshot.emplace_back(conn->fd, conn);
+					}
+				}
+				for (const auto& [fd, conn] : snapshot) {
+					(void)fd;
+					absl::MutexLock lock(&conn->state_mutex);
+					diag_parse_calls += conn->latency_diag.parse_calls;
+					diag_input_bytes += conn->latency_diag.parse_input_bytes;
+					diag_metadata += conn->latency_diag.metadata_detected;
+					diag_parsed_messages += conn->latency_diag.parsed_messages;
+					diag_samples_added += conn->latency_diag.samples_added;
+					diag_rejected_ts += conn->latency_diag.samples_rejected_implausible_ts;
+					diag_break_short += conn->latency_diag.parse_break_short_header;
+					diag_break_incomplete += conn->latency_diag.parse_break_incomplete_message;
+					diag_break_invalid += conn->latency_diag.parse_break_invalid_size;
+					diag_break_no_progress += conn->latency_diag.parse_break_no_progress;
+				}
+				LOG(ERROR) << "Subscriber::Poll latency decode diag: parse_calls=" << diag_parse_calls
+				           << " input_bytes=" << diag_input_bytes
+				           << " metadata_detected=" << diag_metadata
+				           << " parsed_messages=" << diag_parsed_messages
+				           << " samples_added=" << diag_samples_added
+				           << " rejected_implausible_ts=" << diag_rejected_ts
+				           << " break_short_header=" << diag_break_short
+				           << " break_incomplete_msg=" << diag_break_incomplete
+				           << " break_invalid_size=" << diag_break_invalid
+				           << " break_no_progress=" << diag_break_no_progress;
+			}
 			throw std::runtime_error("Subscriber poll timeout");
 		}
 		// Progress logging during long Poll (e.g. large E2E test)
