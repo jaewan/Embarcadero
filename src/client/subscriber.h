@@ -71,6 +71,14 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	absl::CondVar receiver_can_write_cv; // Notifies receiver the *other* buffer is free
 
 	std::vector<RecvLogEntry> recv_log ABSL_GUARDED_BY(state_mutex);
+	// Incremental latency parsing state so StoreLatency() does not depend on
+	// retention of full connection buffers across swaps.
+	std::vector<uint8_t> latency_parse_pending ABSL_GUARDED_BY(state_mutex);
+	bool latency_has_batch_metadata ABSL_GUARDED_BY(state_mutex) = false;
+	uint16_t latency_header_version ABSL_GUARDED_BY(state_mutex) = Embarcadero::wire::HEADER_VERSION_V1;
+	uint32_t latency_messages_in_batch ABSL_GUARDED_BY(state_mutex) = 0;
+	uint32_t latency_messages_processed ABSL_GUARDED_BY(state_mutex) = 0;
+	std::vector<std::pair<long long, long long>> latency_samples ABSL_GUARDED_BY(state_mutex);
 	// Increments when a buffer is reset for reuse; needed to disambiguate offsets
 	// across buffer swaps when correlating per-message receive timestamps.
 	std::array<uint64_t, 2> buffer_generation ABSL_GUARDED_BY(state_mutex) = {0, 0};
@@ -84,6 +92,7 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 		size_t next_message_order_in_batch = 0;
 	};
 	BatchMetadataState batch_metadata ABSL_GUARDED_BY(state_mutex);
+
 
 	ConnectionBuffers(int f, int b_id, size_t cap_per_buffer) :
 		fd(f),
@@ -204,6 +213,8 @@ class Subscriber {
 		// It is here for DKVS
 		absl::Mutex connection_map_mutex_; // Protects the map itself
 		absl::flat_hash_map<int, std::shared_ptr<ConnectionBuffers>> connections_ ABSL_GUARDED_BY(connection_map_mutex_);
+		// Keep disconnected connections alive for post-run latency parsing.
+		std::vector<std::shared_ptr<ConnectionBuffers>> closed_connections_ ABSL_GUARDED_BY(connection_map_mutex_);
 
 		void WaitUntilAllConnected(){
 			size_t num_connections = 0;
@@ -271,6 +282,9 @@ class Subscriber {
 		bool measure_latency_;
 		int order_level_; // Store the order level for batch-aware processing
 		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
+		std::atomic<size_t> latency_unique_message_count_{0}; // Unique send timestamps seen during receive
+		absl::Mutex latency_seen_mutex_;
+		absl::flat_hash_set<long long> latency_seen_send_ns_ ABSL_GUARDED_BY(latency_seen_mutex_);
 		// Per-broker byte counters for debugging subscribe stall (which broker underperforms)
 		std::array<std::atomic<size_t>, NUM_MAX_BROKERS> per_broker_bytes_{};
 

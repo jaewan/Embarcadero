@@ -38,6 +38,8 @@ int main(int argc, char* argv[]) {
         ("failure_percentage", "When to fail brokers, after what percentages of messages sent", 
             cxxopts::value<double>()->default_value("0"))
         ("steady_rate", "Send message in steady rate")
+        ("target_mbps", "Target offered load for latency mode (MB/s). 0 disables pacing",
+            cxxopts::value<double>()->default_value("0"))
         ("n,num_threads_per_broker", "Number of request threads_per_broker", 
             cxxopts::value<size_t>()->default_value("4"))
         ("config", "Configuration file path", cxxopts::value<std::string>()->default_value("config/client.yaml"));

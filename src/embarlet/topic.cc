@@ -1863,7 +1863,12 @@ bool Topic::GetBatchToExportWithMetadata(
 			ring_slot_pbr_idx = header->pbr_absolute_index;
 			ring_slot_flags = header->flags;
 			ring_slot_num_msg = header->num_msg;
-			if (header->ordered == 1 && header->pbr_absolute_index == next_pbr) {
+			// ORDER=5 export readiness is driven by CompletionVector (sequencer completion),
+			// not by local per-slot ordered bit on non-head brokers.
+			// Non-head brokers can have ordered==0 while CV has already advanced.
+			if (header->pbr_absolute_index == next_pbr &&
+			    header->num_msg > 0 &&
+			    header->total_size > 0) {
 				// Resolve export chain (batch_off_to_export 0 = in-place)
 				BatchHeader* actual = header;
 				if (header->batch_off_to_export != 0) {

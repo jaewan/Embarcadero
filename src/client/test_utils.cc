@@ -619,6 +619,10 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	int ack_level = result["ack_level"].as<int>();
 	int order = result["order_level"].as<int>();
 	bool steady_rate = result.count("steady_rate");
+	double target_mbps = 0.0;
+	if (result.count("target_mbps")) {
+		target_mbps = result["target_mbps"].as<double>();
+	}
 	SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
 
 	if (steady_rate) {
@@ -638,7 +642,8 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 
 	LOG(INFO) << "Starting latency test with " << n << " messages"
 		<< " (" << total_message_size << " bytes total)"
-		<< (steady_rate ? ", using steady rate" : "");
+		<< (steady_rate ? ", using steady rate" : "")
+		<< (target_mbps > 0.0 ? ", target_offered_load=" + std::to_string(target_mbps) + " MB/s" : "");
 
 	// Allocate message buffer on heap-backed vector to avoid large stack allocations.
 	std::vector<char> message(message_size);
@@ -647,23 +652,27 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
-	try {
-		// Create publisher and subscriber
-		Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
-				num_threads_per_broker, message_size, q_size, order, seq_type);
+		try {
+			// Create publisher and subscriber
+			Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
+					num_threads_per_broker, message_size, q_size, order, seq_type);
 #ifdef COLLECT_LATENCY_STATS
-		p.SetRecordResults(result.count("record_results") > 0);
+			p.SetRecordResults(result.count("record_results") > 0);
 #endif
-		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true, order);
+			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true, order);
+			s.WaitUntilAllConnected();
 
-		// Initialize publisher
-		p.Init(ack_level);
+			// Initialize publisher
+			p.Init(ack_level);
 
 		// Set up progress tracking
 		//ProgressTracker progress(n, 1000);
 
 		// Start timing
 		auto start = std::chrono::high_resolution_clock::now();
+		const auto pace_start = std::chrono::steady_clock::now();
+		const double target_bytes_per_sec = (target_mbps > 0.0) ? (target_mbps * 1024.0 * 1024.0) : 0.0;
+		uint64_t offered_bytes = 0;
 
 		// Publish messages with timestamps
 		size_t sent_bytes = 0;
@@ -692,10 +701,20 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 			}
 
 			// Send the message
+			if (target_bytes_per_sec > 0.0) {
+				const double expected_ns = (static_cast<double>(offered_bytes) * 1e9) / target_bytes_per_sec;
+				auto target_time = pace_start + std::chrono::nanoseconds(static_cast<long long>(expected_ns));
+				auto now = std::chrono::steady_clock::now();
+				if (target_time > now) {
+					std::this_thread::sleep_until(target_time);
+				}
+			}
 			p.Publish(message.data(), message_size);
+			offered_bytes += paddedMsgSizeWithHeader;
 
 			sent_bytes += paddedMsgSizeWithHeader;
 		}
+		auto publish_dispatch_end = std::chrono::steady_clock::now();
 
 		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
 		if (!p.Poll(n)) {
@@ -719,11 +738,18 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 
 		double pubBandwidthMbps = (total_message_size / (1024 * 1024)) / pub_seconds;
 		double e2eBandwidthMbps = (total_message_size / (1024 * 1024)) / e2e_seconds;
+		double offered_seconds = std::chrono::duration<double>(publish_dispatch_end - pace_start).count();
+		double achieved_offered_mbps = offered_seconds > 0.0
+			? (static_cast<double>(offered_bytes) / (1024.0 * 1024.0)) / offered_seconds
+			: 0.0;
 
 		LOG(INFO) << "Publish completed in " << std::fixed << std::setprecision(2) 
 			<< pub_seconds << " seconds, " << pubBandwidthMbps << " MB/s";
 		LOG(INFO) << "End-to-end completed in " << std::fixed << std::setprecision(2) 
 			<< e2e_seconds << " seconds, " << e2eBandwidthMbps << " MB/s";
+		LOG(INFO) << "Latency offered-load summary: target=" << target_mbps
+		          << " MB/s, achieved_offered=" << achieved_offered_mbps
+		          << " MB/s, achieved_goodput=" << e2eBandwidthMbps << " MB/s";
 
 		// Process latency data
 		if (ShouldValidateOrder()) {
