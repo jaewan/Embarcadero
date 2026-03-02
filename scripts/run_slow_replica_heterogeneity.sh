@@ -202,7 +202,7 @@ if run_mode "baseline" "0"; then
   ordered=$(extract_metric "$OUTDIR/baseline/stage_latency_summary.csv" "append_send_to_ordered" 4)
   ackm=$(extract_metric "$OUTDIR/baseline/stage_latency_summary.csv" "append_send_to_ack" 4)
   deliver=$(extract_metric "$OUTDIR/baseline/stage_latency_summary.csv" "append_send_to_deliver" 4)
-  bw=$(grep -oP 'Bandwidth:\s*\K[0-9.]+(?=\s*MB/s)|Publish completed in .* \K[0-9.]+(?=\s*MB/s)' "$OUTDIR/baseline"/run_attempt*.log 2>/dev/null | tail -1 || true)
+  bw=$(grep -h -oP 'Bandwidth:\s*\K[0-9.]+(?=\s*MB/s)|Publish completed in .* \K[0-9.]+(?=\s*MB/s)' "$OUTDIR/baseline"/run_attempt*.log 2>/dev/null | tail -1 || true)
   [ -z "$bw" ] && bw="NA"
   echo "baseline,PASS,$ordered,$ackm,$deliver,$bw," >> "$OUTDIR/summary.csv"
 else
@@ -213,7 +213,7 @@ if run_mode "slow_injected" "1"; then
   ordered=$(extract_metric "$OUTDIR/slow_injected/stage_latency_summary.csv" "append_send_to_ordered" 4)
   ackm=$(extract_metric "$OUTDIR/slow_injected/stage_latency_summary.csv" "append_send_to_ack" 4)
   deliver=$(extract_metric "$OUTDIR/slow_injected/stage_latency_summary.csv" "append_send_to_deliver" 4)
-  bw=$(grep -oP 'Bandwidth:\s*\K[0-9.]+(?=\s*MB/s)|Publish completed in .* \K[0-9.]+(?=\s*MB/s)' "$OUTDIR/slow_injected"/run_attempt*.log 2>/dev/null | tail -1 || true)
+  bw=$(grep -h -oP 'Bandwidth:\s*\K[0-9.]+(?=\s*MB/s)|Publish completed in .* \K[0-9.]+(?=\s*MB/s)' "$OUTDIR/slow_injected"/run_attempt*.log 2>/dev/null | tail -1 || true)
   [ -z "$bw" ] && bw="NA"
   echo "slow_injected,PASS,$ordered,$ackm,$deliver,$bw,slow_broker_index=$SLOW_BROKER_INDEX pause_sec=$PAUSE_SEC" >> "$OUTDIR/summary.csv"
 else

@@ -13,7 +13,21 @@ TEST_TYPE=${TEST_TYPE:-1}
 ORDER=${ORDER:-5}
 ACK=${ACK:-1}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
-THREADS_PER_BROKER=${THREADS_PER_BROKER:-$([ "$NUM_BROKERS" = "1" ] && echo 1 || echo 4)}
+if [[ "$SEQUENCER" == "CORFU" && "$ORDER" != "2" ]]; then
+  echo "ERROR: CORFU is restricted to ORDER=2 in this implementation (got ORDER=$ORDER)."
+  exit 1
+fi
+if [ -z "${THREADS_PER_BROKER:-}" ]; then
+  if [ "$NUM_BROKERS" = "1" ]; then
+    THREADS_PER_BROKER=1
+  elif [ "$TOTAL_MESSAGE_SIZE" -le $((1024 * 1024 * 1024)) ]; then
+    # Small-payload runs are more stable with fewer publisher threads.
+    THREADS_PER_BROKER=3
+  else
+    # Large-payload throughput saturates best with 4 threads per broker.
+    THREADS_PER_BROKER=4
+  fi
+fi
 QUIET=${QUIET:-0}
 TRIAL_MAX_ATTEMPTS=${TRIAL_MAX_ATTEMPTS:-3}
 BROKER_SETTLE_MS=${BROKER_SETTLE_MS:-300}
@@ -112,11 +126,25 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
     $CLIENT_NUMA_BIND ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $TOTAL_MESSAGE_SIZE -t $TEST_TYPE -o $ORDER -a $ACK --sequencer $SEQUENCER -l 0 -r 0 2>&1 | tee "$TRIAL_LOG"
     cmd_status=${PIPESTATUS[0]}
 
-    if grep -q "Bandwidth:" "$TRIAL_LOG"; then
-      trial_success=1
-      rm -f "$TRIAL_LOG"
-      cleanup
-      break
+    if [[ "$TEST_TYPE" == "2" ]]; then
+      # Latency runs don't print "Bandwidth:"; require successful completion markers
+      # and reject known timeout/exception signatures.
+      if [[ "$cmd_status" -eq 0 ]] &&
+         grep -q "End-to-end completed in" "$TRIAL_LOG" &&
+         grep -q "Latency accounting:" "$TRIAL_LOG" &&
+         ! grep -q -E "Exception during latency test|Subscriber::Poll timeout|Subscriber poll timeout" "$TRIAL_LOG"; then
+        trial_success=1
+        rm -f "$TRIAL_LOG"
+        cleanup
+        break
+      fi
+    else
+      if grep -q "Bandwidth:" "$TRIAL_LOG"; then
+        trial_success=1
+        rm -f "$TRIAL_LOG"
+        cleanup
+        break
+      fi
     fi
 
     echo "WARNING: Trial $trial attempt $attempt did not produce bandwidth output (exit=$cmd_status)."
