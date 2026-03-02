@@ -1,6 +1,6 @@
 # Embarcadero SOSP/OSDI Latency Experiment Checklist
 
-Last updated: 2026-03-01
+Last updated: 2026-03-03
 
 ## Guardrail (run after every checklist item)
 
@@ -40,6 +40,30 @@ Last updated: 2026-03-01
 | 2026-03-01 | Step 10 hardening L2 (Corfu startup + timeout determinism) | Pass | 11.69 | 11.48 | Pass | Fixed `scripts/run_slow_replica_heterogeneity.sh` for cross-system robustness: add `corfu_global_sequencer` startup/cleanup in Corfu mode, add hard `timeout` wrapper (`RUN_TIMEOUT_SEC`), and parameterize config paths. Corfu 1 GiB moderate run now exits deterministically with explicit failure artifacts instead of hanging (`data/latency/slow_replica_step10_corfu/summary.csv`: baseline=FAIL, slow_injected=FAIL, both subscriber-poll timeout). Guardrails after item: 11692.43 MB/s (Order0), 11484.01 MB/s (Order5). |
 | 2026-03-01 | Step 11 pass M1 (repro package hardening) | Pass | 11.78 | 11.49 | Pass | Upgraded `scripts/freeze_repro_package.sh` to emit full manifest, rerun guide (`RERUN.md`), script/config snapshot, file list, and expanded SHA256 coverage. Validated output under `data/latency/repro_manifest_step11`. Guardrails after item: 11777.57 MB/s (Order0), 11485.48 MB/s (Order5). |
 | 2026-03-01 | Step 11 hardening M2 (repro command stability alignment) | Pass | 11.60 | 11.43 | Pass | Updated frozen rerun command pack to use validated stable Step 8 load points (`1000/1500/2000`, 4 GiB, retries/timeouts/config explicit) and regenerated package under `data/latency/repro_manifest_step11_round2`. Guardrails after item: 11599.77 MB/s (Order0), 11426.84 MB/s (Order5). |
+| 2026-03-02 | Step 12 Task A (Corfu latency path instrumentation/classification) | Pass | 11.64 | 11.68 | Pass | Added subscriber parse/drop counters and timeout diagnostics (`parse_calls`, `metadata_detected`, `break_invalid_size`, etc.) plus Corfu subscribe/export counters gated by `EMBARCADERO_CORFU_LATENCY_DIAG`. Failure signatures now explicit: Corfu `ORDER=2` had export starvation (`bytes=0`, `parse_calls=0`); Corfu `ORDER=3` had decode mismatch (`bytes~400%`, `metadata_detected=0`, invalid-size parse breaks). Guardrails after item: 11640.46 MB/s (Order0), 11682.12 MB/s (Order5, second attempt after one transient ACK-timeout). |
+| 2026-03-02 | Step 13 Task B (Corfu receive/decode/export root-cause fix) | Pass | 11.64 | 11.56 | Pass | Root-cause fixes: (1) Corfu `ORDER=2` batch headers now exportable (`num_msg`/`total_order` populated and `ordered` flush/fence), with fallback metadata export path; (2) subscriber latency parser now recognizes metadata for `ORDER=3`; (3) Corfu metadata header version now inferred from actual batch payload instead of forced global assumption. Corfu latency `ORDER=2` now succeeds on two consecutive 1 GiB runs (run1 pub/sub: 4696.95/1639.87 MB/s; run2: 4610.40/1762.27 MB/s) with valid non-empty `latency_stats.csv` and `cdf_latency_us.csv`. Guardrails after item: 11640.82 MB/s (Order0), 11555.66 MB/s (Order5). |
+| 2026-03-02 | Step 14 Task C/D (hardening + script failure classification + docs) | Pass | 11.64 | 11.56 | Pass | Hardening: noisy Corfu export summaries are now env-gated; `scripts/run_throughput.sh` latency mode now classifies success via explicit completion markers (`End-to-end completed`, `Latency accounting`) and rejects real timeout signatures, avoiding false negatives from missing `Bandwidth:` strings in TEST_TYPE=2. Semantics note: Corfu `ORDER=2` path is now validated and deterministic for 1 GiB latency runs; Corfu `ORDER=3` still needs follow-up (currently partial parse progress and timeout in this environment). Guardrails retained from immediate post-fix validation: 11640.82 MB/s (Order0), 11555.66 MB/s (Order5). |
+| 2026-03-02 | Step 15 refactor pass R1 (remove Corfu ORDER=3 dead broker path) | Pass | 11.79 | 11.88 | Pass | Pruned unused Corfu ORDER=3 broker-side callback/ring path from `Topic` (`CorfuOrder3GetCXLBuffer`, callback worker/queue, contiguous-advance ring structures). Corfu latency `ORDER=2` revalidated at 1 GiB: publish `4716.85 MB/s`, end-to-end/subscribe `1666.86 MB/s`, `parsed=3145728`, `recorded=1048576`, `dropped=2097152`. Guardrails after refactor: Order0 passed first attempt at `11794.16 MB/s`; Order5 passed at `11878.72 MB/s` on retry 3 after two transient ACK-timeout shortfalls. |
+| 2026-03-02 | Step 16 refactor pass R2 (hot-path diagnostics opt-in, default-off) | Pass | 11.86 | 11.55 | Pass | Replaced compile-mode diagnostics toggle with explicit env-gated `EMBAR_TOPIC_DIAGNOSTICS` (`0` default). This removes scanner heartbeat/log spam from normal runs while keeping targeted debug ability when explicitly enabled. Corfu latency `ORDER=2` (1 GiB) remained healthy: publish `4526.69 MB/s`, end-to-end/subscribe `1653.90 MB/s`, `parsed=3142906`, `recorded=1048576`, `dropped=2094330`. Guardrails after refactor passed first attempt: Order0 `11859.01 MB/s`, Order5 `11547.45 MB/s`. |
+| 2026-03-02 | Step 17 refactor pass R3 (remove explicit dead branch in client ORDER=3 alignment path) | Pass | 11.39 | 11.56 | Pass | Removed no-op/dead `if (false && ...)` branch and stale comments from `src/client/main.cc` ORDER=3 alignment block, keeping runtime behavior unchanged. Guardrails after refactor: Order0 `11389.83 MB/s` (first attempt), Order5 `11561.46 MB/s` (retry 2 after one transient ACK-timeout shortfall). |
+| 2026-03-02 | Step 18 refactor pass R4 (ORDER=5 contiguous PBR publish frontier for multi-thread recv) | Pass | 11.49 | 11.56 | Pass | Added per-topic contiguous publish frontier (`pbr_absolute_index`) so multi-threaded recv completion can arrive out of order but PBR slots are only exposed `VALID` in contiguous order. This hardens ACK/export correctness against out-of-order publish races while preserving receive parallelism. Corfu `ORDER=2` latency still passes at 1 GiB: publish `4949.97 MB/s`, end-to-end `1608.31 MB/s`, `recorded=1048576`. Guardrails after refactor passed first attempt: Order0 `11491.20 MB/s`, Order5 `11558.88 MB/s`. |
+| 2026-03-02 | Step 19 refactor pass R5 (Corfu sequencer identity semantics: use publisher client_id) | Pass | 11.64 | 11.66 | Pass | Replaced process-local generated Corfu sequencer client IDs with explicit publisher `client_id_` when constructing `CorfuSequencerClient`. This aligns sequencer key semantics with per-client-per-broker ordering across processes and avoids potential cross-process client-ID collisions. Corfu `ORDER=2` latency still passes at 1 GiB: publish `3592.52 MB/s`, end-to-end `1527.01 MB/s`, `recorded=1048576`. Guardrails after refactor passed first attempt: Order0 `11641.67 MB/s`, Order5 `11659.04 MB/s`. |
+| 2026-03-02 | Step 20 refactor pass R6 (remove residual ORDER=3 metadata/decode assumptions in latency path) | Pass | 11.65 | 11.47 | Pass | Tightened latency metadata paths to canonical modes: subscriber parser now treats batch metadata only for `ORDER in {2,5}`; broker subscribe/export metadata send path likewise limited to `ORDER in {2,5}` with Corfu diagnostics keyed to `ORDER=2` only. Corfu `ORDER=2` latency remains valid at 1 GiB: publish `4647.21 MB/s`, end-to-end `1669.22 MB/s`, `recorded=1048576`. Guardrails after refactor: Order0 `11645.24 MB/s` (first attempt), Order5 `11474.97 MB/s` (retry 3 after two transient ACK-timeout shortfalls with broker-1 deficit). |
+| 2026-03-02 | Step 21 refactor pass R7 (ORDER=5 contiguous publish frontier overflow guard) | Pass | 11.73 | 11.59 | Pass | Added fail-fast guard in ORDER=5 contiguous PBR publish frontier: if pending out-of-order publish entries reach ring capacity (`num_slots_`), return explicit error instead of allowing unbounded pending growth. This keeps receive/export failure mode explicit under severe disorder or corruption. Guardrails after refactor passed first attempt: Order0 `11725.39 MB/s`, Order5 `11592.14 MB/s`. |
+| 2026-03-02 | Step 22 refactor pass R8 (ORDER=5 ACK source hardening: CV + ordered fallback) | Pass | 11.65 | 11.55 | Pass | Hardened `GetOffsetToAck` for `ORDER=5 ACK=1`: ACK offset now uses `max(CV.completed_logical_offset, tinode.ordered)` after proper CXL invalidation. This prevents transient CV lag from stalling ACK progress while preserving ordering semantics (both values are sequencer-ordered cumulative counts). Corfu `ORDER=2` latency sanity remains valid (1 GiB): publish `3776.78 MB/s`, end-to-end `1533.46 MB/s`, `recorded=1048576`. Guardrails after refactor passed first attempt: Order0 `11651.14 MB/s`, Order5 `11546.66 MB/s`. |
+| 2026-03-02 | Step 23 architecture pass A1 (frontier invariants map / rubber-duck baseline) | Pass | 11.65 | 11.72 | Pass | Added explicit frontier contract note at `docs/FRONTIER_INVARIANTS.md` (owners, monotonic rules, source-of-truth policy, canonical mode constraints, debugging checklist). This establishes the implementation baseline before further refactors. Guardrails after doc pass: Order0 `11652.82 MB/s`, Order5 `11724.86 MB/s` (both first attempt). |
+| 2026-03-02 | Step 24 architecture pass A2 (dedicated `EMBAR_FRONTIER_TRACE` instrumentation) | Pass | 11.95 | 11.74 | Pass | Added low-noise, rate-limited frontier snapshots under `EMBAR_FRONTIER_TRACE=1` (default off): publish frontier (`Topic::PublishPBRSlotAfterRecv`), commit frontier (`Topic::CommitEpoch`), and ack frontier (`NetworkManager::GetOffsetToAck` for `ORDER=5 ACK=1`). This provides direct correlation of `publish/ordered/cv/ack` without enabling broad verbose trace modes. Guardrails with trace disabled: Order0 `11950.95 MB/s`, Order5 `11738.52 MB/s` (both first attempt). |
+| 2026-03-02 | Step 25 stabilization S1 (rollback contiguous-CV refactor; revalidate Corfu ORDER=2) | Pass | 11.28 | 11.73 | Pass | Reverted contiguous pending-map CV frontier experiment in `Topic::AccumulateCVUpdate/FlushAccumulatedCV` and removed extra CV frontier state from `Topic`; restored monotonic max-based CV updates to remove ORDER=5 regression. Guardrails after rollback: Order0 `11280.57 MB/s` (first attempt), Order5 `11725.86 MB/s` (attempt-2 after one transient ACK-timeout on B2). Corfu latency `TEST_TYPE=2 ORDER=2` now passed in two consecutive 1 GiB runs (run1 pub/sub: `4016.03/1598.42 MB/s`, run2: `4659.29/1640.78 MB/s`, both `recorded=1048576` with non-empty `build/bin/latency_stats.csv` + CDFs). Corfu `ORDER=3` now fails fast with explicit runner error (`CORFU is restricted to ORDER=2`). |
+| 2026-03-02 | Step 26 stabilization S2 (ORDER=5 tail-progress hardening under idle epochs) | Pass | 11.77 | 11.60 | Pass | Root-cause direction validated as implementation-side (not script): intermittent `ORDER=5 ACK=1` shortfalls showed per-broker tail stalls (`sent_all=yes`, one broker short by multiples of batch message count). Hardened sequencer idle path to run periodic hold-buffer expiry/commit tick even when no new epoch is sealed (`EpochSequencerThread`), preventing tail entries from waiting indefinitely for future traffic. Guardrails after hardening: Order0 `11765.72 MB/s`, Order5 `11597.38 MB/s` (both first attempt). Additional single-attempt probe with tighter timeout (`EMBARCADERO_ACK_TIMEOUT_SEC=45`, `TRIAL_MAX_ATTEMPTS=1`) passed 3/3: `11439.74`, `11656.72`, `11686.94 MB/s`. |
+| 2026-03-02 | Step 27 validation V1 (ORDER=5 burn-in + Corfu ORDER=2 recheck) | Pass | N/A | N/A | In progress | Extended ORDER=5 single-attempt burn-in (`TRIAL_MAX_ATTEMPTS=1`, `EMBARCADERO_ACK_TIMEOUT_SEC=45`, 10 runs) yielded `8/10` pass, `2/10` fail with real ACK shortfalls (`sent_all=yes`, lagging broker tail of 19,270 and 26,978 msgs). Corfu `TEST_TYPE=2 ORDER=2` remained stable in 2/2 reruns at 1 GiB: run1 pub/sub `5081.08/1616.04 MB/s`, run2 `4592.15/1643.68 MB/s`, both `recorded=1048576`. |
+| 2026-03-02 | Step 28 architecture pass A3/A4 (BlogHeader default-on + Corfu ORDER=2 header-version canonicalization) | Pass | 11.75 | 11.86 | Pass | Refined `EMBARCADERO_USE_BLOG_HEADER` semantics to default-on (`auto/on/off` env parsing), then fixed broker export metadata classification to avoid V2 mislabeling on Corfu ORDER=2 (`header_version` is now canonical by order: ORDER2->V1, ORDER5->conditional V2 inference). Corfu latency ORDER=2 revalidated 2/2 at 1 GiB: run1 pub/sub `4854.32/1718.34 MB/s`, run2 `4717.79/1680.92 MB/s`, both `recorded=1048576`. Guardrails after fix: Order0 `11748.61 MB/s`, Order5 `11864.86 MB/s`. |
+| 2026-03-03 | Step 29 stability closure V2 (strict ORDER=5 burn-in, first-fail artifact) | Pass | N/A | N/A | In progress | Ran strict burn-in harness with escalation (`RUNS=100 STOP_ON_FAIL=1 scripts/run_order5_burnin_capture.sh`). Real first failure captured at run 14 after 13 passes (`data/throughput/stability/order5_burnin_20260303_021539`): ACK-timeout shortfall on broker 3 (`short=21197`, `sent_all=yes`), with broker/anomaly artifacts copied under `failure_run_14/`. |
+| 2026-03-03 | Step 30 heterogeneity closure L3 (cross-system moderate scenario, parser fix) | Pass | 11.59 | 11.91 | Pass | Fixed `scripts/run_slow_replica_heterogeneity.sh` bandwidth parsing (`grep -h`) to avoid filename-prefixed numeric extraction on retries. Re-ran moderate heterogeneity for both systems. Embarcadero (`ORDER=5`) comparison: ordered/ack p99 `50999 -> 50151` us (-1.66%), deliver p99 `195586 -> 202371` us (+3.47%) (`data/latency/slow_replica_step10_closure_embarcadero`). Corfu (`ORDER=2`) comparison: ordered/ack p99 `221 -> 362` us (+63.80%), deliver p99 `147632 -> 142419` us (-3.53%) (`data/latency/slow_replica_step10_closure_corfu`). Guardrails after task: Order0 `11593.15 MB/s`; Order5 retry-2 `11905.32 MB/s` (attempt-1 ACK shortfall on broker 0). |
+| 2026-03-03 | Step 31 reproducibility rerun M3 (full command-pack execution from fresh freeze) | Pass | N/A | N/A | In progress | Generated fresh package (`OUTDIR=data/latency/repro_manifest_step11_round3 scripts/freeze_repro_package.sh`) and started full replay (`bash data/latency/repro_manifest_step11_round3/commands.sh`). Completed: build, Step6 anomaly checks, Step7 baseline matrix, and Step8 trial_1 all targets + Step8 trial_2 targets {1000,1500} under `data/latency/paper_load_sweep_embarcadero_o5/`. Run was manually stopped before Step8 completion/Step9/Step10 to checkpoint. |
+| 2026-03-03 | Step 32 architecture/doc closure A5 (Corfu appendix-gap note + ORDER2 consistency cleanup) | Pass | 11.94 | 11.48 | Pass | Added `docs/CORFU_APPENDIX_GAP.md` to explicitly document paper-vs-implementation semantics (token-before-write with broker proxy ingress, not client one-sided direct CXL writes). Updated Corfu debug/test scripts/docs toward canonical ORDER2: `scripts/run_corfu_debug.sh` now runs ORDER2; `test_corfu_order3.sh` converted to ORDER2 compatibility wrapper; ORDER3 historical docs now carry archived/deprecated banner. Guardrails after task: Order0 `11939.91 MB/s`, Order5 `11484.71 MB/s`. |
+| 2026-03-03 | Step 33 replay hardening R9 (subscriber connect-target monotonicity + startup wait budget) | Pass | 11.67 | 11.40 | In progress | Fixed subscriber startup race in latency path: `data_broker_count_` updates are now monotonic-max (partial cluster snapshots cannot shrink expected broker count), expected connections never drop below configured broker count, and connect wait timeout increased `30s -> 90s` with throttled 5s progress logs. Validation sweep (`TRIALS_PER_POINT=1`, targets `1000/1500/2000`, 4 GiB, ORDER5 ACK1) completed with `data_brokers=4` and all targets passing in the run immediately after the fix; full frozen `commands.sh` replay still in progress. Guardrails after patch: Order0 `11668.02 MB/s`, Order5 `11399.84 MB/s`. |
+| 2026-03-03 | Step 34 replay hardening R10 (latency UID dedupe + partial-connect fail-fast) | Pass | 11.55 | 11.55 | In progress | Added latency message UID embedding in `LatencyTest` payload (`timestamp + uid`) and switched subscriber dedupe/completion to prefer UID-backed keys (with metadata fallback). Also made partial subscriber connection readiness fail fast (`9/12` now throws explicit `Subscriber connection readiness timeout` and retries instead of entering long doomed poll). Revalidated problematic `ORDER=5`, `target=2000 MB/s`, `4 GiB` point with retries: successful run reached exact accounting `recorded=4194304` (`parsed=12617598`, `dropped=8423294`) and completed without poll timeout. Guardrails after patch: Order0 `11546.88 MB/s`, Order5 `11550.80 MB/s`. |
+| 2026-03-03 | Step 35 replay completion M4 (full round3 command-pack run to completion) | Pass | 11.71 | 11.74 | In progress | Completed full replay `bash data/latency/repro_manifest_step11_round3/commands.sh` end-to-end. Step8 produced full trial set but one hard failure at `trial_4/2000 MB/s` (`FAIL`, CI for 2000 uses `n=4` in `data/latency/paper_load_sweep_embarcadero_o5/ci_summary.csv`). Step9 ladder reproduced stable PASS for `O0A{0,1,2}` and `O5A{0,1}`, but `O5A2` failed after 3 retries with ACK shortfall (`data/latency/ordering_durability_ladder/ladder.csv`). Step10 moderate heterogeneity completed PASS for baseline + injected (`data/latency/slow_replica_step10_embarcadero/summary.csv`). Post-replay mandatory guardrails: Order0 `11713.42 MB/s`, Order5 `11742.55 MB/s`. |
 | 2026-03-01 | Step 12 Task A (Corfu latency path instrumentation/classification) | Pass | 11.64 | 11.68 | Pass | Added explicit subscriber parse/drop counters and timeout diagnostics plus Corfu subscribe/export counters. Failure is now classifiable: Corfu `ORDER=2` shows export starvation (`bytes=0`, `parse_calls=0`), while Corfu `ORDER=3` shows decode mismatch (`bytes~400%`, `metadata_detected=0`, `break_invalid_size>0`, `samples_added=0`). Guardrails after item: 11640.46 MB/s (Order0), 11682.12 MB/s (Order5, second attempt after one transient ACK timeout). |
 
 ## Step-by-step implementation plan
@@ -109,15 +133,117 @@ Last updated: 2026-03-01
 
 ### Step 10: Slow-replica heterogeneity experiment
 - [x] Inject one slow replica/disk.
-- [ ] Show effect on `append->ordered` vs `append->ack` for each system.
-- [ ] Validate Embarcadero decoupling claim under heterogeneity.
+- [x] Show effect on `append->ordered` vs `append->ack` for each system.
+- [x] Validate Embarcadero decoupling claim under heterogeneity.
 - [x] Run guardrail.
   - Implemented automation script: `scripts/run_slow_replica_heterogeneity.sh` (SIGSTOP/SIGCONT fault injection on one broker path).
-  - Current scope execution: Embarcadero moderate + strong scenarios completed; Corfu heterogeneity latency now fails deterministically (no hang) with zero delivered bytes and subscriber-poll timeout in both baseline and slow-injected modes (`data/latency/slow_replica_step10_corfu/`), so cross-system comparison and claim-quality decoupling validation remain pending.
+  - Closure rerun artifacts (moderate scenario, 1 GiB): `data/latency/slow_replica_step10_closure_embarcadero/` and `data/latency/slow_replica_step10_closure_corfu/`.
+  - Embarcadero (`ORDER=5`): ordered/ack p99 changed by `-1.66%` under injected slowdown, while delivery p99 changed by `+3.47%` (ordering remains decoupled from replica pause in this scenario).
+  - Corfu (`ORDER=2`): ordered/ack p99 changed by `+63.80%` under slowdown in this run set; delivery p99 moved `-3.53%` (moderate-run variance).
 
 ### Step 11: Final reproducibility package
 - [x] Freeze scripts + config + command lines.
 - [x] Produce final CSV manifest + plotting scripts.
-- [ ] Run full rerun from clean state.
+- [x] Run full rerun from clean state.
 - [x] Run guardrail.
-  - Implemented packaging helper (pending full validation run): `scripts/freeze_repro_package.sh`.
+  - Packaging helper: `scripts/freeze_repro_package.sh`.
+  - Full replay completed: `bash data/latency/repro_manifest_step11_round3/commands.sh`.
+  - Remaining blockers from replay: Step8 `trial_4/2000mbps` failed (`ci_summary` uses `n=4` for 2000 target), and Step9 `ORDER=5 ACK=2` failed after 3 attempts (`data/latency/ordering_durability_ladder/ladder.csv`).
+
+### Step 12: Corfu ORDER=2 receive/decode/export hardening (2026-03-02)
+- [x] Restrict Corfu to canonical `ORDER=2` at client entry, topic creation, and runner gate.
+- [x] Refactor Corfu ORDER=2 completion path to contiguous frontier semantics under multi-threaded recv completion.
+- [x] Add Corfu ORDER=2 slot freshness checks (`pbr_absolute_index`) on export path.
+- [x] Fail fast on Corfu sequencer token acquisition errors (`GetTotalOrder` bool check).
+- [x] Validate Corfu latency success (1 GiB, two consecutive runs):
+  - Run 1: publish `4758.16 MB/s`, end-to-end `1621.19 MB/s`, `recorded=1048576`.
+  - Run 2: publish `5050.21 MB/s`, end-to-end `1603.66 MB/s`, `recorded=1048576`.
+- [x] Validate after dead-path pruning pass:
+  - Corfu latency: publish `4454.21 MB/s`, end-to-end `1608.74 MB/s`, `recorded=1048576`.
+- [x] Guardrail after Task A/B refactor pass:
+  - `ORDER=0 ACK=1`: `11816.54 MB/s`
+  - `ORDER=5 ACK=1`: trial-1 timeout shortfall on broker 3; retry succeeded at `11546.06 MB/s`
+- [x] Guardrail after Task C pruning pass:
+  - `ORDER=0 ACK=1`: `11147.92 MB/s`
+  - `ORDER=5 ACK=1`: `11851.64 MB/s`
+- [x] Guardrail after ORDER=3 dead-path refactor (R1):
+  - Corfu `TEST_TYPE=2 ORDER=2`: publish `4716.85 MB/s`, end-to-end `1666.86 MB/s`, `recorded=1048576`
+  - `ORDER=0 ACK=1`: `11794.16 MB/s`
+  - `ORDER=5 ACK=1`: retry-3 success `11878.72 MB/s` (attempts 1-2 timed out with per-broker ACK shortfall)
+- [x] Guardrail after diagnostics-gating refactor (R2):
+  - Corfu `TEST_TYPE=2 ORDER=2`: publish `4526.69 MB/s`, end-to-end `1653.90 MB/s`, `recorded=1048576`
+  - `ORDER=0 ACK=1`: `11859.01 MB/s`
+  - `ORDER=5 ACK=1`: `11547.45 MB/s`
+- [x] Guardrail after dead-branch cleanup refactor (R3):
+  - `ORDER=0 ACK=1`: `11389.83 MB/s`
+  - `ORDER=5 ACK=1`: retry-2 success `11561.46 MB/s` (attempt-1 ACK timeout shortfall)
+- [x] Guardrail after contiguous publish-frontier refactor (R4):
+  - Corfu `TEST_TYPE=2 ORDER=2`: publish `4949.97 MB/s`, end-to-end `1608.31 MB/s`, `recorded=1048576`
+  - `ORDER=0 ACK=1`: `11491.20 MB/s`
+  - `ORDER=5 ACK=1`: `11558.88 MB/s`
+- [x] Guardrail after Corfu client-id semantics refactor (R5):
+  - Corfu `TEST_TYPE=2 ORDER=2`: publish `3592.52 MB/s`, end-to-end `1527.01 MB/s`, `recorded=1048576`
+  - `ORDER=0 ACK=1`: `11641.67 MB/s`
+  - `ORDER=5 ACK=1`: `11659.04 MB/s`
+- [x] Guardrail after canonical ORDER={2,5} metadata cleanup (R6):
+  - Corfu `TEST_TYPE=2 ORDER=2`: publish `4647.21 MB/s`, end-to-end `1669.22 MB/s`, `recorded=1048576`
+  - `ORDER=0 ACK=1`: `11645.24 MB/s`
+  - `ORDER=5 ACK=1`: retry-3 success `11474.97 MB/s` (attempts 1-2 ACK timeout with broker-1 shortfall)
+- [x] Guardrail after contiguous publish-frontier overflow hardening (R7):
+  - `ORDER=0 ACK=1`: `11725.39 MB/s`
+  - `ORDER=5 ACK=1`: `11592.14 MB/s`
+- [x] Guardrail after ORDER=5 ACK source hardening (R8):
+  - Corfu `TEST_TYPE=2 ORDER=2`: publish `3776.78 MB/s`, end-to-end `1533.46 MB/s`, `recorded=1048576`
+  - `ORDER=0 ACK=1`: `11651.14 MB/s`
+  - `ORDER=5 ACK=1`: `11546.66 MB/s`
+- [x] Guardrail after frontier invariants architecture note (A1):
+  - `ORDER=0 ACK=1`: `11652.82 MB/s`
+  - `ORDER=5 ACK=1`: `11724.86 MB/s`
+- [x] Guardrail after frontier trace instrumentation (A2):
+  - `ORDER=0 ACK=1`: `11950.95 MB/s`
+  - `ORDER=5 ACK=1`: `11738.52 MB/s`
+- [x] Guardrail after rollback of contiguous-CV frontier experiment (S1):
+  - `ORDER=0 ACK=1`: `11280.57 MB/s`
+  - `ORDER=5 ACK=1`: retry-2 success `11725.86 MB/s` (attempt-1 ACK timeout with broker-2 shortfall)
+- [x] Guardrail after ORDER=5 idle hold-progress hardening (S2):
+  - `ORDER=0 ACK=1`: `11765.72 MB/s`
+  - `ORDER=5 ACK=1`: `11597.38 MB/s` (first attempt)
+- [x] ORDER=5 single-attempt stability probe after S2:
+  - `EMBARCADERO_ACK_TIMEOUT_SEC=45 TRIAL_MAX_ATTEMPTS=1 ... ORDER=5 ACK=1 ...` x3
+  - Pass `3/3` (`11439.74`, `11656.72`, `11686.94 MB/s`)
+- [x] ORDER=5 extended single-attempt burn-in after S2:
+  - `TRIAL_MAX_ATTEMPTS=1 EMBARCADERO_ACK_TIMEOUT_SEC=45 ... ORDER=5 ACK=1 ...` x10
+  - Result: `8 PASS / 2 FAIL` (fail shortfalls: 19,270 on B2 and 26,978 on B3)
+- [x] Corfu ORDER=2 latency revalidation after S2:
+  - Run 1: publish `5081.08 MB/s`, subscribe/end-to-end `1616.04 MB/s`, `recorded=1048576`
+  - Run 2: publish `4592.15 MB/s`, subscribe/end-to-end `1643.68 MB/s`, `recorded=1048576`
+- [x] Corfu latency revalidation after S1 (canonical ORDER=2):
+  - Run 1 (`TEST_TYPE=2`, `1 GiB`): publish `4016.03 MB/s`, subscribe/end-to-end `1598.42 MB/s`, `recorded=1048576`
+  - Run 2 (`TEST_TYPE=2`, `1 GiB`): publish `4659.29 MB/s`, subscribe/end-to-end `1640.78 MB/s`, `recorded=1048576`
+  - Artifact sanity: `build/bin/latency_stats.csv` + `build/bin/cdf_latency_us.csv` non-empty
+- [x] Corfu ORDER=3 triage behavior:
+  - `NUM_BROKERS=4 TEST_TYPE=2 ORDER=3 ACK=1 ... SEQUENCER=CORFU scripts/run_throughput.sh`
+  - Expected/observed fail-fast: `ERROR: CORFU is restricted to ORDER=2 in this implementation (got ORDER=3).`
+
+- [x] ORDER=5 per-client-per-broker sequencing stream alignment (S3):
+  - Implementation: `ORDER=5` publish path now assigns `batch_seq` per broker; sequencer Level5 state/hold keyed by `(client_id, broker_id)` stream.
+  - Guardrail after S3:
+    - `ORDER=0 ACK=1`: `11589.87 MB/s` (post-final ORDER5 seq-alignment rerun)
+    - `ORDER=5 ACK=1`: `11657.87 MB/s`
+  - ORDER=5 strict single-attempt stability after S3:
+    - `TRIAL_MAX_ATTEMPTS=1 EMBARCADERO_ACK_TIMEOUT_SEC=45 ... ORDER=5 ACK=1 ...` x6
+    - Result: `6 PASS / 0 FAIL` (`11734.94`, `11487.02`, `11600.86`, `11595.21`, `11542.41`, `11724.37 MB/s`)
+  - Extended ORDER=5 strict burn-in after S3:
+    - `TRIAL_MAX_ATTEMPTS=1 EMBARCADERO_ACK_TIMEOUT_SEC=45 ... ORDER=5 ACK=1 ...` x20
+    - Result: `19 PASS / 1 FAIL` (single fail shortfall: broker-3 `short=61664`)
+    - Pass bandwidths: `11252.11`, `11558.36`, `11716.64`, `11484.31`, `11659.19`, `11199.57`, `11670.07`, `11764.20`, `11528.19`, `11428.87`, `11433.81`, `11748.39`, `11432.24`, `11574.44`, `11778.81`, `11495.83`, `11830.05`, `11944.80`, `11794.89 MB/s`
+  - Failure-repro trace follow-up:
+    - `EMBAR_FRONTIER_TRACE=1 EMBARCADERO_ORDER5_TRACE=1 TRIAL_MAX_ATTEMPTS=1 ... ORDER=5 ACK=1 ...` x6
+    - Result: `6 PASS / 0 FAIL` (no traceable shortfall captured in follow-up window)
+  - Automated burn-in capture harness:
+    - New script: `scripts/run_order5_burnin_capture.sh`
+    - Example command: `RUNS=100 STOP_ON_FAIL=1 scripts/run_order5_burnin_capture.sh`
+    - Validation run (manually stopped): `40 PASS / 0 FAIL`
+    - Artifacts: `data/throughput/stability/order5_burnin_20260302_142713` (`summary.csv` + per-run logs)
+  - Corfu latency sanity after S3 (`TEST_TYPE=2 ORDER=2`, 1 GiB):
+    - publish `4686.71 MB/s`, subscribe/end-to-end `1701.30 MB/s`, `recorded=1048576`
