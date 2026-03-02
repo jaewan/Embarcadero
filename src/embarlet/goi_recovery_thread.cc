@@ -35,6 +35,15 @@ namespace Embarcadero {
 void Topic::GOIRecoveryThread() {
 	LOG(INFO) << "GOIRecoveryThread started for topic " << topic_name_;
 
+	// Recovery is meaningful only for a multi-replica chain. For rf<=1 there is
+	// no next replica to unblock; force-incrementing num_replicated in that mode
+	// can acknowledge batches that were never replicated.
+	if (replication_factor_ <= 1) {
+		LOG(INFO) << "GOIRecoveryThread disabled for topic " << topic_name_
+		          << " (replication_factor=" << replication_factor_ << ")";
+		return;
+	}
+
 	// Get GOI pointer (same as sequencer uses)
 	GOIEntry* goi = reinterpret_cast<GOIEntry*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kGOIOffset);
@@ -100,6 +109,16 @@ void Topic::GOIRecoveryThread() {
 				goi_entry->num_replicated.store(new_value, std::memory_order_release);
 				CXL::flush_cacheline(goi_entry);
 				CXL::store_fence();
+
+				// If recovery moves this entry to "fully replicated", there is no
+				// replica thread left to advance CV for ACK=2. Promote CV here so
+				// ACK frontier cannot stall on a recovered tail token.
+				if (new_value >= static_cast<uint32_t>(replication_factor_)) {
+					AdvanceCVForSequencer(
+						goi_entry->broker_id,
+						goi_entry->pbr_index,
+						goi_entry->cumulative_message_count);
+				}
 
 				LOG(INFO) << "GOI[" << goi_idx << "] recovered: num_replicated incremented to "
 				          << new_value << ". Replica R_" << (new_value) << " unblocked.";

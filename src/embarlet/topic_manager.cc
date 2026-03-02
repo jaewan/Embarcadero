@@ -294,6 +294,11 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		           << topic << "', order=" << order << ")";
 		return nullptr;
 	}
+	if (seq_type == EMBARCADERO && ack_level == 2 && replication_factor <= 0) {
+		LOG(ERROR) << "CreateNewTopicInternal: ACK level 2 requires replication_factor>0 "
+		           << "(topic='" << topic << "', replication_factor=" << replication_factor << ")";
+		return nullptr;
+	}
 
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	struct TInode* replica_tinode = nullptr;

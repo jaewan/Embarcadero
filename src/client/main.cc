@@ -91,6 +91,17 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "Corfu supports only ORDER=2 in this implementation (got ORDER=" << order << ").";
         return -1;
     }
+
+    // ACK level 2 is defined as "after replication". Running ACK=2 with
+    // replication_factor=0 silently degrades semantics and causes confusing
+    // timeout behavior. Keep legacy scripts working by promoting to 1 replica.
+    if (seq_type == heartbeat_system::SequencerType::EMBARCADERO &&
+        ack_level == 2 && replication_factor <= 0) {
+        LOG(WARNING) << "ACK level 2 requires replication_factor>0; "
+                     << "promoting replication_factor from " << replication_factor
+                     << " to 1.";
+        replication_factor = 1;
+    }
     
     // Check if cgroup is properly set up
     if (result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()) {

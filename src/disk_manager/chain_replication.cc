@@ -7,6 +7,9 @@
 #include "../cxl_manager/cxl_datastructure.h"  // CXL namespace
 
 namespace Embarcadero {
+namespace {
+constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
+}
 
 ChainReplicationManager::ChainReplicationManager(
     int replica_id,
@@ -32,6 +35,9 @@ ChainReplicationManager::ChainReplicationManager(
     LOG(INFO) << "ChainReplicationManager: replica_id=" << replica_id
               << " replication_factor=" << replication_factor
               << " disk=" << disk_path;
+
+    broker_cv_state_.fill(kNoProgress);
+    broker_cv_state_initialized_.fill(false);
 }
 
 ChainReplicationManager::~ChainReplicationManager() {
@@ -154,60 +160,67 @@ void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint64_
     // advanced the same slot — we never regress. CV[broker_id] = highest contiguous pbr_index.
 
     uint64_t& cv_state = broker_cv_state_[broker_id];
+    bool& cv_state_initialized = broker_cv_state_initialized_[broker_id];
+    auto& pending = broker_cv_pending_[broker_id];
 
-    // [[PHASE_2_FIX]] Handle initial case (cv_state starts at 0, first batch is pbr_index=0)
-    if (cv_state == 0 && pbr_index == 0) {
-        // First batch for this broker
-        // [[ACK_RACE_FIX]] Use atomic max: Sequencer (ACK=1) might have already advanced CV.
-        // We must not regress CV if Sequencer is ahead.
+    auto publish_cv_max = [&](uint64_t index, uint64_t cumulative) {
         uint64_t cur = cv_[broker_id].completed_pbr_head.load(std::memory_order_acquire);
-        constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
-        while (cur == kNoProgress || pbr_index > cur) {
-            if (cv_[broker_id].completed_pbr_head.compare_exchange_strong(cur, pbr_index, std::memory_order_release)) {
-                cv_[broker_id].completed_logical_offset.store(cumulative_msg_count, std::memory_order_release);
-                CXL::flush_cacheline(&cv_[broker_id]);
-                CXL::store_fence();
+        while (cur == kNoProgress || index > cur) {
+            if (cv_[broker_id].completed_pbr_head.compare_exchange_strong(
+                    cur, index, std::memory_order_release)) {
                 break;
             }
-            // Retry with updated cur
         }
+        uint64_t cur_logical = cv_[broker_id].completed_logical_offset.load(std::memory_order_acquire);
+        while (cumulative > cur_logical) {
+            if (cv_[broker_id].completed_logical_offset.compare_exchange_strong(
+                    cur_logical, cumulative, std::memory_order_release)) {
+                break;
+            }
+        }
+        CXL::flush_cacheline(&cv_[broker_id]);
+        CXL::store_fence();
+    };
+
+    if (!cv_state_initialized) {
+        // Seed local contiguous tracker from shared CV in case this topic/run
+        // does not start at pbr_index 0.
+        uint64_t seeded = cv_[broker_id].completed_pbr_head.load(std::memory_order_acquire);
+        cv_state = seeded;
+        cv_state_initialized = true;
+    }
+
+    if (cv_state == kNoProgress) {
+        // No known progress yet: first observed replicated pbr defines baseline.
+        publish_cv_max(pbr_index, cumulative_msg_count);
         cv_state = pbr_index;
-        VLOG(3) << "CV_UPDATER: Broker " << broker_id << " first batch, CV=" << pbr_index;
+        VLOG(3) << "CV_UPDATER: Broker " << broker_id
+                << " first observed batch, CV=" << pbr_index;
+    } else if (pbr_index <= cv_state) {
+        VLOG(4) << "CV_UPDATER: Broker " << broker_id << " pbr_index=" << pbr_index
+                << " already completed (cv_state=" << cv_state << ")";
+        return;
+    } else if (pbr_index == cv_state + 1) {
+        publish_cv_max(pbr_index, cumulative_msg_count);
+        cv_state = pbr_index;
+        VLOG(3) << "CV_UPDATER: Broker " << broker_id << " CV updated to pbr_index=" << pbr_index;
+    } else {
+        pending[pbr_index] = std::max(pending[pbr_index], cumulative_msg_count);
+        VLOG(4) << "CV_UPDATER: Broker " << broker_id << " gap buffered, pbr_index=" << pbr_index
+                << " cv_state=" << cv_state;
         return;
     }
 
-    // Check if this batch is the next expected (contiguous)
-    if (pbr_index == cv_state + 1) {
-        // Update CV (monotonic)
-        // [[ACK_RACE_FIX]] Use atomic max
-        uint64_t cur = cv_[broker_id].completed_pbr_head.load(std::memory_order_acquire);
-        constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
-        while (cur == kNoProgress || pbr_index > cur) {
-            if (cv_[broker_id].completed_pbr_head.compare_exchange_strong(cur, pbr_index, std::memory_order_release)) {
-                cv_[broker_id].completed_logical_offset.store(cumulative_msg_count, std::memory_order_release);
-                CXL::flush_cacheline(&cv_[broker_id]);
-                CXL::store_fence();
-                break;
-            }
+    while (true) {
+        const uint64_t next = cv_state + 1;
+        auto it = pending.find(next);
+        if (it == pending.end()) {
+            break;
         }
-
-        // Update local tracker
-        cv_state = pbr_index;
-
-        VLOG(3) << "CV_UPDATER: Broker " << broker_id << " CV updated to pbr_index=" << pbr_index;
-    } else if (pbr_index <= cv_state) {
-        // Already completed (duplicate or reordered), ignore
-        VLOG(4) << "CV_UPDATER: Broker " << broker_id << " pbr_index=" << pbr_index
-                << " already completed (cv_state=" << cv_state << ")";
-    } else {
-        // Gap detected (pbr_index > cv_state + 1)
-        // This can happen if sequencer processes batches out of pbr_index order
-        // [[PHASE_2_FIX]] With absolute indices, gaps are true ordering issues (not ring wraparound)
-        VLOG(4) << "CV_UPDATER: Broker " << broker_id << " gap detected, pbr_index=" << pbr_index
-                << " cv_state=" << cv_state << " (waiting for contiguous)";
-
-        // TODO: Track out-of-order entries and update CV when gap fills
-        // For now, CV will lag until contiguous batches arrive
+        publish_cv_max(next, it->second);
+        cv_state = next;
+        pending.erase(it);
+        VLOG(4) << "CV_UPDATER: Broker " << broker_id << " drained buffered pbr_index=" << next;
     }
 }
 
