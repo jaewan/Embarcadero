@@ -12,6 +12,7 @@
 #include <deque>
 #include <queue>
 #include <chrono>
+#include <cstdlib>
 
 #include "../disk_manager/corfu_replication_client.h"
 #include "../disk_manager/scalog_replication_client.h"
@@ -22,11 +23,10 @@
 #include "absl/container/flat_hash_set.h"
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/container/flat_hash_set.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/container/btree_map.h"
 #include "absl/container/btree_set.h"
 #include <glog/logging.h>
-#include "folly/MPMCQueue.h"
 
 #include <functional>
 
@@ -36,11 +36,13 @@ namespace Embarcadero {
 #define CACHELINE_SIZE 64
 #endif
 
-#ifdef NDEBUG
-static constexpr bool kEnableDiagnostics = false;
-#else
-static constexpr bool kEnableDiagnostics = true;
-#endif
+inline bool TopicDiagnosticsEnabled() {
+	static const bool enabled = []() {
+		const char* env = std::getenv("EMBAR_TOPIC_DIAGNOSTICS");
+		return env != nullptr && std::atoi(env) > 0;
+	}();
+	return enabled;
+}
 
 // [[PHASE_1B]] Epoch-batched sequencing + Level 5 hold buffer (design §3.2)
 /** Copy of batch metadata at hold time; ring slot may be reused so we never read p.hdr when from_hold. */
@@ -99,6 +101,41 @@ struct ExpiredHoldEntry {
 	size_t seq{0};
 	PendingBatch5 batch;
 	HoldBatchMetadata meta;
+};
+
+// Tracks what has been emitted per client without assuming dense, monotonic commits.
+// This avoids false "already committed" drops when gaps/timeouts reorder releases.
+struct ClientEmitTracker {
+	uint64_t contiguous_max{UINT64_MAX};
+	absl::btree_set<uint64_t> pending;
+
+	bool IsEmitted(uint64_t seq) const {
+		if (contiguous_max != UINT64_MAX && seq <= contiguous_max) return true;
+		return pending.find(seq) != pending.end();
+	}
+
+	void MarkEmitted(uint64_t seq) {
+		if (contiguous_max == UINT64_MAX) {
+			if (seq == 0) {
+				contiguous_max = 0;
+				return;
+			}
+			pending.insert(seq);
+			return;
+		}
+		if (seq <= contiguous_max) return;
+		if (seq == contiguous_max + 1) {
+			contiguous_max = seq;
+			while (true) {
+				auto it = pending.find(contiguous_max + 1);
+				if (it == pending.end()) break;
+				contiguous_max = *it;
+				pending.erase(it);
+			}
+			return;
+		}
+		pending.insert(seq);
+	}
 };
 
 // [[PHASE_1B]] Epoch buffer state machine to prevent concurrent merge/write.
@@ -254,13 +291,6 @@ class Topic {
 			}
 		}
 
-		// [[PHASE_5]] Join Corfu callback threads
-		for (std::thread& thread : corfu_callback_threads_) {
-			if (thread.joinable()) {
-				thread.join();
-			}
-		}
-
 			if(sequencerThread_.joinable()){
 				sequencerThread_.join();
 			}
@@ -277,6 +307,7 @@ class Topic {
 					thread.join();
 				}
 			}
+			WriteOrder5AnomalyCountersCsv();
 
 			VLOG(3) << "[Topic]: \tDestructed";
 		}
@@ -380,10 +411,13 @@ class Topic {
 		 * @return true on success, false if inputs are invalid.
 		 */
 		bool PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader* batch_header_location);
+		/** Request one-shot aggressive expiry of ORDER=5 hold buffer on next Level5 processing pass. */
+		void RequestOrder5HoldExpiryOnce();
 
-	private:
-		/** Lock-free PBR slot reservation (128-bit CAS). Returns false if ring full. @threading Concurrent. */
-		bool ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, size_t& out_logical_offset);
+		private:
+			bool PublishPBRSlotDirect(const BatchHeader& batch_header, BatchHeader* batch_header_location);
+			/** Lock-free PBR slot reservation (128-bit CAS). Returns false if ring full. @threading Concurrent. */
+			bool ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, size_t& out_logical_offset);
 		/** [[P2.3]] Shared core: epoch check, slot allocation, CheckSegmentBoundary, segment_header, batch_header metadata. Caller writes slot (minimal or full). */
 		bool ReservePBRSlotCore(BatchHeader& batch_header, void* log, bool epoch_already_checked,
 				void*& batch_headers_log, size_t& logical_offset, void*& segment_header);
@@ -480,6 +514,7 @@ class Topic {
 				size_t& logical_offset,
 				BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
+		void RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_msg);
 
 		std::function<void(void*, size_t)> ScalogGetCXLBuffer(
 				BatchHeader& batch_header,
@@ -498,16 +533,6 @@ class Topic {
 				size_t& logical_offset,
 				BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
-
-	// CORFU Order 3 implementation (external sequencer, no DelegationThread)
-	std::function<void(void*, size_t)> CorfuOrder3GetCXLBuffer(
-			BatchHeader& batch_header,
-			const char topic[TOPIC_NAME_SIZE],
-			void*& log,
-			void*& segment_header,
-			size_t& logical_offset,
-			BatchHeader*& batch_header_location,
-			bool epoch_already_checked = false);
 
 		// [[ORDER5_PERF_GUARD]]
 		// Legacy Order4 helpers are intentionally kept in this translation unit because
@@ -565,6 +590,11 @@ class Topic {
 		// Order 3 specific data structures
 		absl::flat_hash_map<size_t, absl::flat_hash_map<size_t, void*>> skipped_batch_ ABSL_GUARDED_BY(mutex_);
 		absl::flat_hash_map<size_t, size_t> order3_client_batch_ ABSL_GUARDED_BY(mutex_);
+		// Corfu ORDER=2 completion tracking: recv completion can be out-of-order across network threads.
+		// We only advance ordered/ACK frontier when contiguous batch_seq is complete.
+		absl::Mutex corfu_order2_mu_;
+		uint64_t corfu_order2_next_seq_ ABSL_GUARDED_BY(corfu_order2_mu_) = 0;
+		absl::btree_map<uint64_t, uint32_t> corfu_order2_completed_ ABSL_GUARDED_BY(corfu_order2_mu_);
 
 		// Synchronization
 		absl::Mutex mutex_;
@@ -646,6 +676,7 @@ class Topic {
 	void Level5ShardWorker(size_t shard_id);
 	void InitLevel5Shards();
 	size_t GetTotalHoldBufferSize();
+	void WriteOrder5AnomalyCountersCsv() const;
 	// [[ORDER5_PERF_GUARD]] See note above: retained for code-layout stability.
 	bool ProcessSkipped(
 		absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
@@ -682,6 +713,13 @@ class Topic {
 		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> scanner_pushed_msgs_{};
 		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> sequencer_committed_batches_{};
 		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> sequencer_committed_msgs_{};
+		std::atomic<uint64_t> order5_fifo_violations_{0};
+		std::atomic<uint64_t> order5_ack_order_violations_{0};
+		std::atomic<uint64_t> order5_skipped_batches_{0};
+		std::atomic<uint64_t> order5_scanner_timeout_skips_{0};
+		std::atomic<uint64_t> order5_hold_timeout_skips_{0};
+		std::atomic<uint64_t> order5_hold_buffer_forced_skips_{0};
+		std::atomic<uint64_t> order5_stale_epoch_skips_{0};
 		// [[B0_TAIL_FIX]] When set, next ProcessLevel5BatchesShard treats all hold entries as expired (shutdown drain).
 		std::atomic<bool> force_expire_hold_on_next_process_{false};
 	// Epoch buffers for safe collection/sequencing (no concurrent merge/write).
@@ -697,7 +735,7 @@ class Topic {
 			std::vector<PendingBatch5> input;
 			std::vector<PendingBatch5> ready;
 			absl::flat_hash_map<size_t, ClientState5> client_state;
-			absl::flat_hash_map<size_t, uint64_t> client_highest_committed;
+			absl::flat_hash_map<size_t, ClientEmitTracker> client_emitted_tracker;
 			absl::flat_hash_map<size_t, std::map<size_t, HoldEntry5>> hold_buffer;  // client_id -> ordered(client_seq -> entry)
 			size_t hold_buffer_size{0};
 			absl::flat_hash_set<size_t> clients_with_held_batches;
@@ -740,6 +778,14 @@ class Topic {
 
 		// [[PHASE_2_FIX]] Per-broker absolute PBR counters (never wrap, for CV tracking)
 		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> broker_pbr_counters_{};
+			// Multi-threaded recv can finish out-of-order; only expose contiguous ORDER=5 PBR slots to scanner/export.
+			struct PendingPBRPublish {
+				BatchHeader header;
+				BatchHeader* slot{nullptr};
+			};
+			absl::Mutex pbr_publish_mu_;
+			uint64_t next_pbr_publish_seq_ ABSL_GUARDED_BY(pbr_publish_mu_) = 0;
+			absl::btree_map<uint64_t, PendingPBRPublish> pending_pbr_publish_ ABSL_GUARDED_BY(pbr_publish_mu_);
 
 	// [[PHASE_3]] Sequencer-driven recovery (§4.2.2): Detect stalled chain replication
 	/**
@@ -801,29 +847,5 @@ class Topic {
 	std::atomic<size_t> scalog_batch_offset_{0};  // For ScalogGetCXLBuffer (was static local)
 		size_t cached_num_brokers_{0};  // For Order3GetCXLBuffer (was static local)
 
-		// [[PHASE_5]] Corfu Order 3 Callback Thread Pool
-		// Offloads callback work (spin-wait, replication, CV advance) from NetworkManager threads
-		// to avoid starvation under high concurrency.
-		struct CorfuCallbackTask {
-			std::function<void(void*, size_t)> callback;
-			void* log_ptr;
-			size_t size;
-		};
-		folly::MPMCQueue<CorfuCallbackTask> corfu_callback_queue_{1024};
-		std::vector<std::thread> corfu_callback_threads_;
-		void CorfuCallbackWorker();
-
-		// [[PHASE_7]] Corfu Order 3 Completion Tracking
-		// Tracks contiguous completion of PBR slots to advance CV monotonically.
-		// Replaces the race-prone direct CV advance in Phase 5.
-		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> next_cv_advance_pbr_{};
-		struct PBRCompletionSlot {
-			std::atomic<bool> completed{false};
-			uint64_t cumulative_msg_count{0};
-		};
-		// Use a large enough ring to handle in-flight batches (e.g., 64K slots)
-		static constexpr size_t kPBRCompletionRingSize = 65536;
-		std::array<std::unique_ptr<std::array<PBRCompletionSlot, kPBRCompletionRingSize>>, NUM_MAX_BROKERS> pbr_completion_rings_;
-		void AdvanceCVContiguous(int broker_id);
 };
 } // End of namespace Embarcadero

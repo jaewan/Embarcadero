@@ -10,6 +10,7 @@
 #include <cstring>
 #include <sstream>
 #include <limits>
+#include <algorithm>
 #include <chrono>
 #include <errno.h>
 
@@ -65,6 +66,11 @@ static bool ShouldEnableOrder5Trace() {
 
 static bool ShouldEnableAckJitterTrace() {
 	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ACK_JITTER_TRACE", false);
+	return enabled;
+}
+
+static bool ShouldEnableFrontierTrace() {
+	static const bool enabled = ReadEnvBoolLenient("EMBAR_FRONTIER_TRACE", false);
 	return enabled;
 }
 
@@ -729,6 +735,7 @@ void NetworkManager::HandlePublishRequest(
 
 	// Process message batches
 	bool running = true;
+	bool publisher_disconnected = false;
 
 	while (running && !stop_threads_) {
 		// Read batch header
@@ -750,6 +757,7 @@ void NetworkManager::HandlePublishRequest(
 				VLOG(1) << "NetworkManager: Connection closed by publisher (client_id=" 
 				            << handshake.client_id << ", topic=" << handshake.topic 
 				            << "). Normal termination if publisher is re-routing or shutting down.";
+				publisher_disconnected = true;
 			}
 			running = false;
 			break;
@@ -772,6 +780,7 @@ void NetworkManager::HandlePublishRequest(
 			}
 			if (recv_ret == 0) {
 				LOG(WARNING) << "NetworkManager: Connection closed by publisher during partial batch header read.";
+				publisher_disconnected = true;
 				running = false;
 				break;
 			}
@@ -1062,9 +1071,10 @@ void NetworkManager::HandlePublishRequest(
 			UpdateWrittenForOrder0(tinode, batch_end_addr, batch_header.num_msg);
 		}
 		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for other orders
-	} else if (batch_header_location == nullptr) {
-		LOG(WARNING) << "NetworkManager: batch_header_location is null for batch with " << batch_header.num_msg << " messages, order_level=" << seq_type;
-	}
+		} else if (batch_header_location == nullptr && seq_type == EMBARCADERO) {
+			LOG(WARNING) << "NetworkManager: batch_header_location is null for batch with "
+			             << batch_header.num_msg << " messages, seq_type=EMBARCADERO";
+		}
 
 		// Finalize batch processing
 			if (non_emb_seq_callback) {
@@ -1084,6 +1094,12 @@ void NetworkManager::HandlePublishRequest(
 				}
 			}
 		}
+
+	if (publisher_disconnected && cxl_manager_ && handshake.topic[0] != '\0') {
+		if (Topic* topic = cxl_manager_->GetTopicPtr(handshake.topic)) {
+			topic->RequestOrder5HoldExpiryOnce();
+		}
+	}
 
 	close(client_socket);
 }
@@ -1264,8 +1280,8 @@ void NetworkManager::SubscribeNetworkThread(
 				absl::MutexLock lock(&cached_state->mu);
 				local_offset = cached_state->last_offset;
 			}
-			// Order 2 (total order), Order 3 (Corfu), and Order 5 (strong order): use batch metadata so subscriber gets total_order
-			if (order == 5 || order == 2 || order == 3) {
+			// Order 2 (Corfu total order) and Order 5 (Embarcadero strong order): include batch metadata for subscriber ordering.
+			if (order == 5 || order == 2) {
 				size_t batch_total_order = 0;
 				uint32_t num_messages = 0;
 				if (!topic_manager_->GetBatchToExportWithMetadata(
@@ -1285,7 +1301,21 @@ void NetworkManager::SubscribeNetworkThread(
 				}
 				batch_meta.batch_total_order = batch_total_order;
 				batch_meta.num_messages = num_messages;
-				batch_meta.header_version = ((order == 5 || order == 2 || order == 3) && HeaderUtils::ShouldUseBlogHeader()) ? 2 : 1;
+				uint16_t header_version = wire::HEADER_VERSION_V1;
+				// Canonical header semantics:
+				// - ORDER=2 (Corfu): always exports MessageHeader (v1)
+				// - ORDER=5 (Embarcadero strong order): may export BlogMessageHeader (v2) when enabled
+				if (order == 5 &&
+				    HeaderUtils::ShouldUseBlogHeader() &&
+				    msg != nullptr &&
+				    messages_size >= sizeof(BlogMessageHeader)) {
+					auto* first_v2 = reinterpret_cast<BlogMessageHeader*>(msg);
+					if (wire::ValidateV2Payload(first_v2->size, messages_size) &&
+					    wire::ComputeStrideV2(first_v2->size) <= messages_size) {
+						header_version = wire::HEADER_VERSION_V2;
+					}
+				}
+				batch_meta.header_version = header_version;
 				batch_meta.flags = 0;
 				export_batches++;
 				export_bytes += messages_size;
@@ -1330,8 +1360,8 @@ void NetworkManager::SubscribeNetworkThread(
 			continue;
 		}
 
-		// Order 2, Order 3, and Order 5: Send batch metadata first (total_order, num_messages) for order-aware consume
-		if (order == 5 || order == 2 || order == 3) {
+		// Order 2 and Order 5: send batch metadata first (total_order, num_messages) for order-aware consume.
+		if (order == 5 || order == 2) {
 			// batch_meta is already populated by GetBatchToExportWithMetadata
 			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL);
 			if (meta_sent != sizeof(batch_meta)) {
@@ -1362,7 +1392,7 @@ void NetworkManager::SubscribeNetworkThread(
 			cached_state->last_addr = order0_pending_addr;
 		}
 
-		if (corfu_latency_diag && (order == 2 || order == 3) &&
+		if (corfu_latency_diag && order == 2 &&
 		    (export_batches <= 3 || export_batches % 20000 == 0)) {
 			LOG(INFO) << "Corfu subscribe export diag [B" << broker_id_ << " conn=" << connection_id
 			          << "]: batches=" << export_batches
@@ -1373,7 +1403,7 @@ void NetworkManager::SubscribeNetworkThread(
 		}
 	}
 
-	if ((order == 2 || order == 3) || corfu_latency_diag) {
+	if (corfu_latency_diag) {
 		LOG(INFO) << "SubscribeNetworkThread summary [B" << broker_id_ << " conn=" << connection_id
 		          << " order=" << order << "]: batches=" << export_batches
 		          << " bytes=" << export_bytes
@@ -1567,14 +1597,34 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		CXL::full_fence();
 
 		uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
+		volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
+		CXL::flush_cacheline(const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(ordered_ptr)));
+		CXL::load_fence();
+		const uint64_t ordered_count = tinode->offsets[broker_id_].ordered;
+
 		if (completed_logical_offset == 0) {
 			uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
-			if (completed_pbr_index == static_cast<uint64_t>(-1)) {
+			if (completed_pbr_index == static_cast<uint64_t>(-1) && ordered_count == 0) {
 				return static_cast<size_t>(-1);
 			}
-			return 0;
 		}
-		return completed_logical_offset;
+		const size_t ack_frontier = static_cast<size_t>(std::max(completed_logical_offset, ordered_count));
+		if (ShouldEnableFrontierTrace()) {
+			static thread_local uint64_t last_frontier_log_ns = 0;
+			const uint64_t now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count());
+			if (now_ns - last_frontier_log_ns >= 1'000'000'000ULL) {
+				uint64_t cv_pbr_head = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
+				LOG(INFO) << "[FRONTIER_TRACE_ACK B" << broker_id_ << "]"
+				          << " ack_frontier=" << ack_frontier
+				          << " cv_logical=" << completed_logical_offset
+				          << " cv_pbr_head=" << cv_pbr_head
+				          << " tinode_ordered=" << ordered_count;
+				last_frontier_log_ns = now_ns;
+			}
+		}
+		return ack_frontier;
 	}
 
 	// Handle ack_level 2 explicitly (ack only after replication)

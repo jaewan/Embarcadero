@@ -172,6 +172,7 @@ class Publisher {
 		// [[CORFU]] Per-broker batch sequence for GetTotalOrder; sequencer expects 0,1,2,... per (client,broker)
 		static constexpr int kMaxCorfuBrokers = 32;
 		std::array<std::atomic<size_t>, kMaxCorfuBrokers> corfu_batch_seq_per_broker_{};
+		std::array<std::atomic<size_t>, kMaxCorfuBrokers> order5_batch_seq_per_broker_{};
 		// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker to eliminate out-of-order retries (Phase 2C).
 		std::array<std::mutex, kMaxCorfuBrokers> corfu_seq_per_broker_lock_{};
 

@@ -505,7 +505,8 @@ void Publisher::Init(int ack_level) {
 	// Initialize Corfu sequencer if needed
 	if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
 		corfu_client_ = std::make_unique<CorfuSequencerClient>(
-				CORFU_SEQUENCER_ADDR + std::to_string(CORFU_SEQ_PORT));
+				CORFU_SEQUENCER_ADDR + std::to_string(CORFU_SEQ_PORT),
+				static_cast<uint64_t>(client_id_));
 	}
 
 	// [[Issue 6]] Wait for all publisher threads to initialize with timeout
@@ -1502,21 +1503,31 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			batch_header->broker_id = broker_id;
 
 			// Handle sequencer-specific batch header processing
-			if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
-				// [[CORFU_FIX]] Sequencer expects per-broker batch_seq (0,1,2,...), not global.
-				// Use per-broker counter so each broker's batches are sequenced correctly.
-				if (broker_id >= 0 && broker_id < kMaxCorfuBrokers) {
-					// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker (Phase 2C).
-					// This ensures in-order delivery to the sequencer, eliminating UNAVAILABLE retries.
-					std::lock_guard<std::mutex> lock(corfu_seq_per_broker_lock_[broker_id]);
-					batch_header->batch_seq = corfu_batch_seq_per_broker_[broker_id].fetch_add(1, std::memory_order_relaxed);
-					corfu_client_->GetTotalOrder(batch_header);
-				} else {
-					corfu_client_->GetTotalOrder(batch_header);
-				}
+				if (seq_type_ == heartbeat_system::SequencerType::EMBARCADERO && order_level_ == 5) {
+					// ORDER=5 sequencer tracks FIFO per (client, broker) stream.
+					// Use per-broker batch sequence to avoid synthetic cross-broker gaps.
+					if (broker_id >= 0 && broker_id < kMaxCorfuBrokers) {
+						batch_header->batch_seq = order5_batch_seq_per_broker_[broker_id].fetch_add(1, std::memory_order_relaxed);
+					}
+				} else if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
+					// [[CORFU_FIX]] Sequencer expects per-broker batch_seq (0,1,2,...), not global.
+					// Use per-broker counter so each broker's batches are sequenced correctly.
+					bool got_total_order = false;
+					if (broker_id >= 0 && broker_id < kMaxCorfuBrokers) {
+						// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker (Phase 2C).
+						// This ensures in-order delivery to the sequencer, eliminating UNAVAILABLE retries.
+						std::lock_guard<std::mutex> lock(corfu_seq_per_broker_lock_[broker_id]);
+						batch_header->batch_seq = corfu_batch_seq_per_broker_[broker_id].fetch_add(1, std::memory_order_relaxed);
+						got_total_order = corfu_client_->GetTotalOrder(batch_header);
+					} else {
+						got_total_order = corfu_client_->GetTotalOrder(batch_header);
+					}
+					if (!got_total_order) {
+						throw std::runtime_error("corfu sequencer GetTotalOrder failed");
+					}
 
-			VLOG(2) << "Publisher: Got total_order=" << batch_header->total_order
-			        << " for batch with " << batch_header->num_msg << " messages";
+				VLOG(2) << "Publisher: Got total_order=" << batch_header->total_order
+				        << " for batch with " << batch_header->num_msg << " messages";
 
 				// Update total order for each message in the batch
 				Embarcadero::MessageHeader* header = static_cast<Embarcadero::MessageHeader*>(msg);
@@ -1530,8 +1541,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				}
 			}
 
-			// ORDER=5 EMBARCADERO keeps QueueBuffer-assigned batch_seq (global per client).
-			// Rewriting to a per-broker sequence breaks per-client FIFO tracking in Sequencer5.
+			// ORDER=5 EMBARCADERO now uses per-broker batch_seq to match broker-local stream sequencing.
 
 			// Send batch header with retry logic
 			size_t total_sent = 0;

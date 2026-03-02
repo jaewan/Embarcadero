@@ -289,6 +289,11 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		           << "'; use Order 5 for strong ordering.";
 		return nullptr;
 	}
+	if (seq_type == CORFU && order != kOrderTotal) {
+		LOG(ERROR) << "CreateNewTopicInternal: Corfu supports only ORDER=2 (topic='"
+		           << topic << "', order=" << order << ")";
+		return nullptr;
+	}
 
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	struct TInode* replica_tinode = nullptr;
@@ -438,6 +443,11 @@ bool TopicManager::CreateNewTopic(
 	if (order == kOrderLegacyStrong) {
 		LOG(ERROR) << "CreateNewTopic: rejecting deprecated Order 4 for topic '" << topic
 		           << "'; use Order 5 for strong ordering.";
+		return false;
+	}
+	if (seq_type == CORFU && order != kOrderTotal) {
+		LOG(ERROR) << "CreateNewTopic: Corfu supports only ORDER=2 (topic='"
+		           << topic << "', order=" << order << ")";
 		return false;
 	}
 	

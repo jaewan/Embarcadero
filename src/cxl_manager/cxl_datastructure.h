@@ -481,21 +481,31 @@ static_assert(offsetof(BlogMessageHeader, client_id) == 48, "Read-only metadata 
 	 * @brief Check if BlogMessageHeader should be used (feature flag)
 	 * @return true if BlogMessageHeader is enabled, false to use legacy MessageHeader
 	 * 
-	 * Currently checks environment variable EMBARCADERO_USE_BLOG_HEADER.
-	 * Future: Could check configuration file or compile-time flag.
+	 * Controlled by environment variable EMBARCADERO_USE_BLOG_HEADER.
 	 * 
-	 * Default: false (backward compatibility - use MessageHeader)
+	 * Values:
+	 * - unset / "auto": enable BlogMessageHeader by default
+	 * - "1"/"true"/"yes"/"on": enable
+	 * - "0"/"false"/"no"/"off": disable
+	 * 
+	 * Default: true (ORDER=5 fast path)
 	 */
 namespace HeaderUtils {
 	inline bool ShouldUseBlogHeader() {
 		static bool cached = false;
-		static bool value = false;
+		static bool value = true;
 		if (!cached) {
 			const char* env_val = std::getenv("EMBARCADERO_USE_BLOG_HEADER");
 			if (env_val != nullptr) {
 				std::string val(env_val);
 				std::transform(val.begin(), val.end(), val.begin(), ::tolower);
-				value = (val == "1" || val == "true" || val == "yes" || val == "on");
+				if (val == "auto" || val.empty()) {
+					value = true;
+				} else if (val == "1" || val == "true" || val == "yes" || val == "on") {
+					value = true;
+				} else if (val == "0" || val == "false" || val == "no" || val == "off") {
+					value = false;
+				}
 			}
 			cached = true;
 		}

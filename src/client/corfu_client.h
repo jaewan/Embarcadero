@@ -18,10 +18,10 @@ using corfusequencer::TotalOrderResponse;
 
 class CorfuSequencerClient {
 	public:
-		CorfuSequencerClient(const std::string& server_address) 
+		CorfuSequencerClient(const std::string& server_address, uint64_t client_id) 
 			: stub_(CorfuSequencer::NewStub(
-						grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials()))),
-			client_id_(GenerateClientId()){}
+					grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials()))),
+			client_id_(client_id){}
 
 		// Get total order for a batch of messages
 		bool GetTotalOrder(Embarcadero::BatchHeader *batch_header){
@@ -72,11 +72,6 @@ class CorfuSequencerClient {
 		}
 
 	private:
-		static size_t GenerateClientId() {
-			static std::atomic<size_t> next_id(0);
-			return next_id++;
-		}
-
 		std::unique_ptr<CorfuSequencer::Stub> stub_;
-		const size_t client_id_;
+		const uint64_t client_id_;
 };

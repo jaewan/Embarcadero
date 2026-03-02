@@ -86,6 +86,11 @@ int main(int argc, char* argv[]) {
     int ack_level = result["ack_level"].as<int>();
     SequencerType seq_type = parseSequencerType(result["sequencer"].as<std::string>());
     FLAGS_v = result["log_level"].as<int>();
+
+    if (seq_type == heartbeat_system::SequencerType::CORFU && order != Embarcadero::kOrderTotal) {
+        LOG(ERROR) << "Corfu supports only ORDER=2 in this implementation (got ORDER=" << order << ").";
+        return -1;
+    }
     
     // Check if cgroup is properly set up
     if (result["run_cgroup"].as<int>() > 0 && !CheckAvailableCores()) {
@@ -93,20 +98,13 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     
-    // Special handling for order level 3
+    // Legacy alignment path retained for non-Corfu ORDER=3 experiments.
     if (order == 3) {
         size_t padding = message_size % 64;
         if (padding) {
             padding = 64 - padding;
         }
         size_t paddedSize = message_size + padding + sizeof(Embarcadero::MessageHeader);
-        // [[CORFU_ORDER3_FIX]] Commented out overly strict batch size alignment check
-        // This check prevented Order 3 from running at all when BATCH_SIZE % paddedSize != 0
-        // The padding adjustment below (lines 101-108) handles alignment properly
-        if (false && BATCH_SIZE % (paddedSize)) {
-            LOG(ERROR) << "Adjusting Batch size of message size!!";
-            return 0;
-        }
         
         size_t n = total_message_size / message_size;
         size_t total_payload = n * paddedSize;
