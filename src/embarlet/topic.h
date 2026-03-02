@@ -87,6 +87,7 @@ struct OrderedHoldExportEntry {
 	size_t batch_size{0};
 	size_t total_order{0};
 	uint32_t num_messages{0};
+	uint64_t pbr_absolute_index{0};
 };
 
 

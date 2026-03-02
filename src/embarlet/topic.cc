@@ -1870,18 +1870,31 @@ bool Topic::GetBatchToExportWithMetadata(
 		last_log_ns = now_ns;
 	};
 
-	// Choose hold-vs-ring with one hold-queue lock scope (avoids TOCTOU with concurrent consumers).
+	// Choose hold-vs-ring with hold entries tied to expected PBR frontier.
+	// This prevents duplicate export of the same batch via hold and ring paths.
 	bool return_hold = false;
-	{
-		absl::MutexLock lock(&hold_export_queues_[broker_id_].mu);
-		if (!hold_export_queues_[broker_id_].q.empty()) {
-			have_hold = true;
-			hold_front = hold_export_queues_[broker_id_].q.front();
-			hold_total_order = hold_front.total_order;
-			if (!have_ring || hold_total_order <= ring_total_order) {
-				hold_export_queues_[broker_id_].q.pop_front();
-				return_hold = true;
+	while (true) {
+		bool dropped_stale_hold = false;
+		{
+			absl::MutexLock lock(&hold_export_queues_[broker_id_].mu);
+			have_hold = false;
+			if (!hold_export_queues_[broker_id_].q.empty()) {
+				hold_front = hold_export_queues_[broker_id_].q.front();
+				hold_total_order = hold_front.total_order;
+				have_hold = true;
+				if (hold_front.pbr_absolute_index < next_pbr) {
+					// Stale hold entry already covered by ring/CV progress.
+					hold_export_queues_[broker_id_].q.pop_front();
+					dropped_stale_hold = true;
+				} else if (hold_front.pbr_absolute_index == next_pbr &&
+				           (!have_ring || hold_total_order <= ring_total_order)) {
+					hold_export_queues_[broker_id_].q.pop_front();
+					return_hold = true;
+				}
 			}
+		}
+		if (return_hold || !dropped_stale_hold) {
+			break;
 		}
 	}
 	if (return_hold) {
@@ -1889,6 +1902,7 @@ bool Topic::GetBatchToExportWithMetadata(
 		batch_size = hold_front.batch_size;
 		batch_total_order = hold_front.total_order;
 		num_messages = hold_front.num_messages;
+		expected_batch_offset = next_pbr + 1;
 		trace_export("hit", "hold");
 		return true;
 	}
@@ -3046,6 +3060,7 @@ void Topic::CommitEpoch(
 				ex.batch_size = m.total_size;
 				ex.total_order = next_order;
 				ex.num_messages = m.num_msg;
+				ex.pbr_absolute_index = m.pbr_absolute_index;
 				{
 					absl::MutexLock lock(&hold_export_queues_[b].mu);
 					hold_export_queues_[b].q.push_back(ex);

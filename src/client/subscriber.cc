@@ -20,12 +20,18 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 	shutdown_(false),
 	connected_(false),
 	measure_latency_(measure_latency),
+	sub_connections_per_broker_(measure_latency ? 1 : static_cast<size_t>(NUM_SUB_CONNECTIONS)),
 	order_level_(order_level),
 	// 16MB per-buffer size (32MB total per connection with dual buffers)
 	buffer_size_per_buffer_((16UL << 20)),
 	client_id_(GenerateRandomNum())
 {
 	memcpy(topic_, topic, TOPIC_NAME_SIZE);
+	if (measure_latency_ && NUM_SUB_CONNECTIONS > 1) {
+		LOG(INFO) << "Latency mode: reducing subscriber connections per broker from "
+		          << NUM_SUB_CONNECTIONS << " to " << sub_connections_per_broker_
+		          << " to avoid duplicate export traffic.";
+	}
 	std::string grpc_addr = head_addr + ":" + port;
 	// Consider managing stub_ lifecycle (e.g., unique_ptr) if Subscriber owns it
 	stub_ = heartbeat_system::HeartBeat::NewStub(grpc::CreateChannel(grpc_addr, grpc::InsecureChannelCredentials()));
@@ -149,6 +155,11 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 	pending.insert(pending.end(), data, data + len);
 
 	const bool parse_batch_metadata = (order_level == 5 || order_level == 2);
+	const bool uid_batch_diag_enabled = (std::getenv("EMBAR_UID_BATCH_DIAG") != nullptr);
+	const uint16_t expected_header_version =
+		(order_level == 5 && Embarcadero::HeaderUtils::ShouldUseBlogHeader())
+			? Embarcadero::wire::HEADER_VERSION_V2
+			: Embarcadero::wire::HEADER_VERSION_V1;
 	size_t parse_offset = 0;
 
 	while (parse_offset < pending.size()) {
@@ -159,18 +170,29 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		    !conn->latency_has_batch_metadata &&
 		    remaining >= sizeof(Embarcadero::wire::BatchMetadata)) {
 			auto* metadata = reinterpret_cast<Embarcadero::wire::BatchMetadata*>(current_parse_ptr);
-			if (Embarcadero::wire::IsValidHeaderVersion(metadata->header_version) &&
-			    metadata->num_messages > 0 &&
-			    metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES) {
+			const bool header_ok = (metadata->header_version == expected_header_version);
+			const bool batch_shape_ok =
+				metadata->num_messages > 0 &&
+				metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
+				metadata->batch_total_order < Embarcadero::wire::MAX_BATCH_TOTAL_ORDER &&
+				metadata->flags == 0;
+			if (header_ok && batch_shape_ok) {
 				conn->latency_has_batch_metadata = true;
 					conn->latency_diag.metadata_detected++;
 					conn->latency_header_version = metadata->header_version;
 					conn->latency_messages_in_batch = metadata->num_messages;
 					conn->latency_messages_processed = 0;
 					conn->latency_batch_total_order = metadata->batch_total_order;
+					conn->latency_batch_first_uid = 0;
+					conn->latency_batch_last_uid = 0;
+					conn->latency_batch_uid_seen = 0;
 					parse_offset += sizeof(Embarcadero::wire::BatchMetadata);
 					continue;
-				}
+			}
+			// Resync: metadata-sized chunk present but invalid at this offset.
+			// Advance by 8B to find the next plausible metadata boundary.
+			parse_offset += 8;
+			continue;
 		}
 
 		if (remaining < sizeof(Embarcadero::MessageHeader)) {
@@ -230,7 +252,16 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 						std::chrono::duration_cast<std::chrono::microseconds>(recv_time - send_time).count();
 					uint64_t dedupe_key = static_cast<uint64_t>(send_nanos_since_epoch);
 					if (msg_uid != 0) {
-						dedupe_key = Mix64(msg_uid);
+						if (uid_batch_diag_enabled && parse_batch_metadata && conn->latency_has_batch_metadata) {
+							if (conn->latency_batch_uid_seen == 0) {
+								conn->latency_batch_first_uid = msg_uid;
+							}
+							conn->latency_batch_last_uid = msg_uid;
+							conn->latency_batch_uid_seen++;
+						}
+						// Use both UID and embedded send timestamp.
+						// UID alone can collide if upstream accidentally reuses payload identifiers.
+						dedupe_key = Mix64(msg_uid) ^ Mix64(static_cast<uint64_t>(send_nanos_since_epoch));
 					} else if (parse_batch_metadata && conn->latency_has_batch_metadata) {
 						// Combine metadata identity with send timestamp to avoid key collisions.
 						const uint64_t batch_local_index =
@@ -250,6 +281,16 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		if (parse_batch_metadata && conn->latency_has_batch_metadata) {
 			conn->latency_messages_processed++;
 				if (conn->latency_messages_processed >= conn->latency_messages_in_batch) {
+					if (uid_batch_diag_enabled) {
+						ConnectionBuffers::BatchUidDiagEntry e;
+						e.broker_id = conn->broker_id;
+						e.batch_total_order = conn->latency_batch_total_order;
+						e.num_messages = conn->latency_messages_in_batch;
+						e.first_uid = conn->latency_batch_first_uid;
+						e.last_uid = conn->latency_batch_last_uid;
+						e.uid_seen = conn->latency_batch_uid_seen;
+						conn->latency_batch_uid_diag.push_back(e);
+					}
 					conn->latency_has_batch_metadata = false;
 					conn->latency_header_version = Embarcadero::wire::HEADER_VERSION_V1;
 					conn->latency_messages_in_batch = 0;
@@ -793,6 +834,48 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 				           << " break_incomplete_msg=" << diag_break_incomplete
 				           << " break_invalid_size=" << diag_break_invalid
 				           << " break_no_progress=" << diag_break_no_progress;
+				if (std::getenv("EMBAR_UID_BATCH_DIAG") != nullptr) {
+					std::unordered_map<std::string, size_t> signature_counts;
+					size_t total_batch_diag = 0;
+					size_t uid_count_mismatch = 0;
+					for (const auto& [fd, conn] : snapshot) {
+						(void)fd;
+						absl::MutexLock lock(&conn->state_mutex);
+						for (const auto& e : conn->latency_batch_uid_diag) {
+							total_batch_diag++;
+							if (e.uid_seen != e.num_messages) {
+								uid_count_mismatch++;
+							}
+							std::ostringstream key;
+							key << "B" << e.broker_id
+							    << ":to=" << e.batch_total_order
+							    << ":n=" << e.num_messages
+							    << ":u0=" << e.first_uid
+							    << ":u1=" << e.last_uid;
+							signature_counts[key.str()]++;
+						}
+					}
+					size_t duplicate_signature_entries = 0;
+					std::vector<std::pair<std::string, size_t>> dup_entries;
+					dup_entries.reserve(signature_counts.size());
+					for (const auto& [k, c] : signature_counts) {
+						if (c > 1) {
+							duplicate_signature_entries += (c - 1);
+							dup_entries.emplace_back(k, c);
+						}
+					}
+					std::sort(dup_entries.begin(), dup_entries.end(),
+					          [](const auto& a, const auto& b) { return a.second > b.second; });
+					LOG(ERROR) << "UID batch diag: total_batches=" << total_batch_diag
+					           << " unique_signatures=" << signature_counts.size()
+					           << " duplicate_signature_entries=" << duplicate_signature_entries
+					           << " uid_count_mismatch_batches=" << uid_count_mismatch;
+					const size_t kMaxReport = 12;
+					for (size_t i = 0; i < dup_entries.size() && i < kMaxReport; ++i) {
+						LOG(ERROR) << "UID batch diag duplicate[" << i << "]: count="
+						           << dup_entries[i].second << " sig=" << dup_entries[i].first;
+					}
+				}
 			}
 			throw std::runtime_error("Subscriber poll timeout");
 		}
@@ -855,7 +938,7 @@ void Subscriber::ManageBrokerConnections(int broker_id, const std::string& addre
 	if (conn_epoll_fd < 0) { /* ... error handling ... */ return; }
 
 	// Step 1: Create sockets and initiate non-blocking connect (Unchanged)
-	for (int i = 0; i < NUM_SUB_CONNECTIONS; ++i) {
+	for (size_t i = 0; i < sub_connections_per_broker_; ++i) {
 		// Subscriber sockets should be configured for receiving (SO_RCVBUF)
 		int sock = GetNonblockingSock(addr_vec.data(), data_port, false);
 		if (sock < 0) { /* ... error handling ... */ continue; }
@@ -872,9 +955,12 @@ void Subscriber::ManageBrokerConnections(int broker_id, const std::string& addre
 	if (pending_fds.empty()) { /* ... error handling ... */ close(conn_epoll_fd); return; }
 
 	// Step 2: Wait for connection results (Unchanged)
-	epoll_event events[NUM_SUB_CONNECTIONS];
+	std::vector<epoll_event> events(sub_connections_per_broker_);
 	const int CONNECT_TIMEOUT_MS = 2000;
-	int num_ready = epoll_wait(conn_epoll_fd, events, NUM_SUB_CONNECTIONS, CONNECT_TIMEOUT_MS);
+	int num_ready = epoll_wait(conn_epoll_fd,
+	                          events.data(),
+	                          static_cast<int>(events.size()),
+	                          CONNECT_TIMEOUT_MS);
 
 	// Step 3: Check connection status (Unchanged)
 	for (int n = 0; n < num_ready; ++n) {

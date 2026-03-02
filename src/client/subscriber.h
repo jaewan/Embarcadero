@@ -86,6 +86,18 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	uint32_t latency_messages_processed ABSL_GUARDED_BY(state_mutex) = 0;
 	uint64_t latency_batch_total_order ABSL_GUARDED_BY(state_mutex) = 0;
 	std::vector<LatencySample> latency_samples ABSL_GUARDED_BY(state_mutex);
+	struct BatchUidDiagEntry {
+		int broker_id = -1;
+		uint64_t batch_total_order = 0;
+		uint32_t num_messages = 0;
+		uint64_t first_uid = 0;
+		uint64_t last_uid = 0;
+		uint32_t uid_seen = 0;
+	};
+	std::vector<BatchUidDiagEntry> latency_batch_uid_diag ABSL_GUARDED_BY(state_mutex);
+	uint64_t latency_batch_first_uid ABSL_GUARDED_BY(state_mutex) = 0;
+	uint64_t latency_batch_last_uid ABSL_GUARDED_BY(state_mutex) = 0;
+	uint32_t latency_batch_uid_seen ABSL_GUARDED_BY(state_mutex) = 0;
 	struct LatencyParseDiag {
 		uint64_t parse_calls = 0;
 		uint64_t parse_input_bytes = 0;
@@ -237,14 +249,14 @@ class Subscriber {
 
 			void WaitUntilAllConnected(){
 				size_t num_connections = 0;
-				size_t final_expected = static_cast<size_t>(NUM_MAX_BROKERS_CONFIG) * NUM_SUB_CONNECTIONS;
+				size_t final_expected = static_cast<size_t>(NUM_MAX_BROKERS_CONFIG) * sub_connections_per_broker_;
 				// Dynamically recalculate expected connections as cluster info arrives
 				// Recalculate expected connections as cluster info arrives
 				size_t last_expected = 0;
 				const int connect_timeout_sec = 90;
 				int last_progress_log_sec = -1;
 				LOG(INFO) << "Waiting for connections (brokers=" << NUM_MAX_BROKERS_CONFIG
-					<< ", sub_connections=" << NUM_SUB_CONNECTIONS << ", data_brokers=pending)";
+					<< ", sub_connections=" << sub_connections_per_broker_ << ", data_brokers=pending)";
 
 			auto start_time = std::chrono::steady_clock::now();
 			while (true) {
@@ -260,7 +272,7 @@ class Subscriber {
 				if (broker_count < static_cast<size_t>(NUM_MAX_BROKERS_CONFIG)) {
 					broker_count = NUM_MAX_BROKERS_CONFIG;
 				}
-				size_t expected = broker_count * NUM_SUB_CONNECTIONS;
+				size_t expected = broker_count * sub_connections_per_broker_;
 				final_expected = expected;
 
 				// Log when expected changes (data broker info received)
@@ -312,6 +324,7 @@ class Subscriber {
 
 		// --- Latency / Debug ---
 		bool measure_latency_;
+		size_t sub_connections_per_broker_;
 		int order_level_; // Store the order level for batch-aware processing
 		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
 		std::atomic<size_t> latency_unique_message_count_{0}; // Unique message keys seen during receive

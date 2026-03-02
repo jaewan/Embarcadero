@@ -1303,17 +1303,12 @@ void NetworkManager::SubscribeNetworkThread(
 				batch_meta.num_messages = num_messages;
 				uint16_t header_version = wire::HEADER_VERSION_V1;
 				// Canonical header semantics:
-				// - ORDER=2 (Corfu): always exports MessageHeader (v1)
-				// - ORDER=5 (Embarcadero strong order): may export BlogMessageHeader (v2) when enabled
-				if (order == 5 &&
-				    HeaderUtils::ShouldUseBlogHeader() &&
-				    msg != nullptr &&
-				    messages_size >= sizeof(BlogMessageHeader)) {
-					auto* first_v2 = reinterpret_cast<BlogMessageHeader*>(msg);
-					if (wire::ValidateV2Payload(first_v2->size, messages_size) &&
-					    wire::ComputeStrideV2(first_v2->size) <= messages_size) {
-						header_version = wire::HEADER_VERSION_V2;
-					}
+				// - ORDER=2 (Corfu): always MessageHeader (v1)
+				// - ORDER=5 (Embarcadero): header format is mode-driven, not payload-sniffed.
+				//   Payload sniffing here can transiently misclassify a batch and cause subscriber
+				//   decode to drop an entire batch with a wrong header version.
+				if (order == 5 && HeaderUtils::ShouldUseBlogHeader()) {
+					header_version = wire::HEADER_VERSION_V2;
 				}
 				batch_meta.header_version = header_version;
 				batch_meta.flags = 0;
