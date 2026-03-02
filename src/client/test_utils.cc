@@ -807,26 +807,34 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		for (size_t i = 0; i < n; i++) {
 
 			// If using steady rate, pause periodically
-			if (steady_rate && (sent_bytes >= (BATCH_SIZE*4))) {
-				p.WriteFinishedOrPaused();
-				std::this_thread::sleep_for(std::chrono::microseconds(1500));
-				sent_bytes = 0;
+				if (steady_rate && (sent_bytes >= (BATCH_SIZE*4))) {
+					p.WriteFinishedOrPaused();
+					std::this_thread::sleep_for(std::chrono::microseconds(1500));
+					sent_bytes = 0;
+					// Capture current timestamp and embed it in the message
+				auto timestamp = std::chrono::steady_clock::now();
+				long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
+						timestamp.time_since_epoch()).count();
+
+					// First part of message contains the timestamp
+					memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
+					if (message_size >= sizeof(long long) + sizeof(uint64_t)) {
+						const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
+						memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
+					}
+				}else{
 				// Capture current timestamp and embed it in the message
 				auto timestamp = std::chrono::steady_clock::now();
 				long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
 						timestamp.time_since_epoch()).count();
 
-				// First part of message contains the timestamp
-				memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
-			}else{
-				// Capture current timestamp and embed it in the message
-				auto timestamp = std::chrono::steady_clock::now();
-				long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
-						timestamp.time_since_epoch()).count();
-
-				// First part of message contains the timestamp
-				memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
-			}
+					// First part of message contains the timestamp
+					memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
+					if (message_size >= sizeof(long long) + sizeof(uint64_t)) {
+						const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
+						memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
+					}
+				}
 
 			// Send the message
 			if (target_bytes_per_sec > 0.0) {

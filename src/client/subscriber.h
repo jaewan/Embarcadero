@@ -54,6 +54,12 @@ struct RecvLogEntry {
 	size_t end_offset;
 };
 
+struct LatencySample {
+	uint64_t dedupe_key;
+	long long send_time_nanos;
+	long long latency_us;
+};
+
 // Manages the dual buffers and state for a single connection (FD)
 struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers> {
 	const int fd; // The socket FD this corresponds to
@@ -78,7 +84,8 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	uint16_t latency_header_version ABSL_GUARDED_BY(state_mutex) = Embarcadero::wire::HEADER_VERSION_V1;
 	uint32_t latency_messages_in_batch ABSL_GUARDED_BY(state_mutex) = 0;
 	uint32_t latency_messages_processed ABSL_GUARDED_BY(state_mutex) = 0;
-	std::vector<std::pair<long long, long long>> latency_samples ABSL_GUARDED_BY(state_mutex);
+	uint64_t latency_batch_total_order ABSL_GUARDED_BY(state_mutex) = 0;
+	std::vector<LatencySample> latency_samples ABSL_GUARDED_BY(state_mutex);
 	struct LatencyParseDiag {
 		uint64_t parse_calls = 0;
 		uint64_t parse_input_bytes = 0;
@@ -228,13 +235,16 @@ class Subscriber {
 		// Keep disconnected connections alive for post-run latency parsing.
 		std::vector<std::shared_ptr<ConnectionBuffers>> closed_connections_ ABSL_GUARDED_BY(connection_map_mutex_);
 
-		void WaitUntilAllConnected(){
-			size_t num_connections = 0;
-			// Dynamically recalculate expected connections as cluster info arrives
-			// Recalculate expected connections as cluster info arrives
-			size_t last_expected = 0;
-			LOG(INFO) << "Waiting for connections (brokers=" << NUM_MAX_BROKERS_CONFIG
-				<< ", sub_connections=" << NUM_SUB_CONNECTIONS << ", data_brokers=pending)";
+			void WaitUntilAllConnected(){
+				size_t num_connections = 0;
+				size_t final_expected = static_cast<size_t>(NUM_MAX_BROKERS_CONFIG) * NUM_SUB_CONNECTIONS;
+				// Dynamically recalculate expected connections as cluster info arrives
+				// Recalculate expected connections as cluster info arrives
+				size_t last_expected = 0;
+				const int connect_timeout_sec = 90;
+				int last_progress_log_sec = -1;
+				LOG(INFO) << "Waiting for connections (brokers=" << NUM_MAX_BROKERS_CONFIG
+					<< ", sub_connections=" << NUM_SUB_CONNECTIONS << ", data_brokers=pending)";
 
 			auto start_time = std::chrono::steady_clock::now();
 			while (true) {
@@ -244,12 +254,14 @@ class Subscriber {
 					num_connections = connections_.size();
 				}
 
-				// Dynamically compute expected based on data broker count (updated by SubscribeToCluster)
+				// Keep expected connections monotonic and never below configured broker count.
+				// Cluster status updates can arrive as partial snapshots during startup.
 				size_t broker_count = data_broker_count_.load();
-				if (broker_count == 0) {
-					broker_count = NUM_MAX_BROKERS_CONFIG; // Fall back to config if not yet known
+				if (broker_count < static_cast<size_t>(NUM_MAX_BROKERS_CONFIG)) {
+					broker_count = NUM_MAX_BROKERS_CONFIG;
 				}
 				size_t expected = broker_count * NUM_SUB_CONNECTIONS;
+				final_expected = expected;
 
 				// Log when expected changes (data broker info received)
 				if (expected != last_expected) {
@@ -264,18 +276,26 @@ class Subscriber {
 
 				auto now = std::chrono::steady_clock::now();
 				auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
-				if (elapsed.count() > 30) { // 30 second timeout
-					LOG(WARNING) << "Timeout waiting for connections. Got " << num_connections
-						<< "/" << expected << " after " << elapsed.count() << " seconds";
-					break;
+					if (elapsed.count() > connect_timeout_sec) {
+						LOG(WARNING) << "Timeout waiting for connections. Got " << num_connections
+							<< "/" << expected << " after " << elapsed.count()
+							<< " seconds (timeout=" << connect_timeout_sec << "s)";
+						break;
+					}
+					const int elapsed_sec = static_cast<int>(elapsed.count());
+					if (elapsed_sec > 0 && (elapsed_sec % 5) == 0 && elapsed_sec != last_progress_log_sec) {
+						LOG(INFO) << "Still waiting for connections: " << num_connections << "/" << expected;
+						last_progress_log_sec = elapsed_sec;
+					}
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				}
-				if (elapsed.count() % 5 == 0 && elapsed.count() > 0) {
-					LOG(INFO) << "Still waiting for connections: " << num_connections << "/" << expected;
+				LOG(INFO) << "Connection wait complete: " << num_connections << " connections";
+				if (num_connections < final_expected) {
+					throw std::runtime_error(
+						"Subscriber connection readiness timeout: got " +
+						std::to_string(num_connections) + "/" + std::to_string(final_expected));
 				}
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			}
-			LOG(INFO) << "Connection wait complete: " << num_connections << " connections";
-		}
 
 	private:
 		friend class ConnectionBuffers; // Allow access to members if needed
@@ -294,9 +314,9 @@ class Subscriber {
 		bool measure_latency_;
 		int order_level_; // Store the order level for batch-aware processing
 		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
-		std::atomic<size_t> latency_unique_message_count_{0}; // Unique send timestamps seen during receive
+		std::atomic<size_t> latency_unique_message_count_{0}; // Unique message keys seen during receive
 		absl::Mutex latency_seen_mutex_;
-		absl::flat_hash_set<long long> latency_seen_send_ns_ ABSL_GUARDED_BY(latency_seen_mutex_);
+		absl::flat_hash_set<uint64_t> latency_seen_send_ns_ ABSL_GUARDED_BY(latency_seen_mutex_);
 		// Per-broker byte counters for debugging subscribe stall (which broker underperforms)
 		std::array<std::atomic<size_t>, NUM_MAX_BROKERS> per_broker_bytes_{};
 

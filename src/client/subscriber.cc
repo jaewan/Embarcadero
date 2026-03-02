@@ -127,6 +127,15 @@ struct HeaderValidationData {
 
 namespace {
 
+inline uint64_t Mix64(uint64_t x) {
+	x ^= x >> 30;
+	x *= 0xbf58476d1ce4e5b9ULL;
+	x ^= x >> 27;
+	x *= 0x94d049bb133111ebULL;
+	x ^= x >> 31;
+	return x;
+}
+
 void ParseLatencySamplesLocked(ConnectionBuffers* conn,
                                const uint8_t* data,
                                size_t len,
@@ -154,13 +163,14 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 			    metadata->num_messages > 0 &&
 			    metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES) {
 				conn->latency_has_batch_metadata = true;
-				conn->latency_diag.metadata_detected++;
-				conn->latency_header_version = metadata->header_version;
-				conn->latency_messages_in_batch = metadata->num_messages;
-				conn->latency_messages_processed = 0;
-				parse_offset += sizeof(Embarcadero::wire::BatchMetadata);
-				continue;
-			}
+					conn->latency_diag.metadata_detected++;
+					conn->latency_header_version = metadata->header_version;
+					conn->latency_messages_in_batch = metadata->num_messages;
+					conn->latency_messages_processed = 0;
+					conn->latency_batch_total_order = metadata->batch_total_order;
+					parse_offset += sizeof(Embarcadero::wire::BatchMetadata);
+					continue;
+				}
 		}
 
 		if (remaining < sizeof(Embarcadero::MessageHeader)) {
@@ -198,38 +208,56 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		}
 		conn->latency_diag.parsed_messages++;
 
-		if (total_message_size >= header_size + sizeof(long long)) {
-			long long send_nanos_since_epoch = 0;
-			memcpy(&send_nanos_since_epoch, current_parse_ptr + header_size, sizeof(long long));
-			const long long recv_nanos_since_epoch =
-				std::chrono::duration_cast<std::chrono::nanoseconds>(recv_time.time_since_epoch()).count();
-			constexpr long long kMaxPastWindowNs = 60LL * 60LL * 1000LL * 1000LL * 1000LL; // 1 hour
+			if (total_message_size >= header_size + sizeof(long long)) {
+				long long send_nanos_since_epoch = 0;
+				memcpy(&send_nanos_since_epoch, current_parse_ptr + header_size, sizeof(long long));
+				uint64_t msg_uid = 0;
+				if (total_message_size >= header_size + sizeof(long long) + sizeof(uint64_t)) {
+					memcpy(&msg_uid,
+					       current_parse_ptr + header_size + sizeof(long long),
+					       sizeof(uint64_t));
+				}
+				const long long recv_nanos_since_epoch =
+					std::chrono::duration_cast<std::chrono::nanoseconds>(recv_time.time_since_epoch()).count();
+				constexpr long long kMaxPastWindowNs = 60LL * 60LL * 1000LL * 1000LL * 1000LL; // 1 hour
 			constexpr long long kMaxFutureSkewNs = 1LL * 1000LL * 1000LL * 1000LL; // 1 second
 			const bool plausible_timestamp =
 				send_nanos_since_epoch >= (recv_nanos_since_epoch - kMaxPastWindowNs) &&
 				send_nanos_since_epoch <= (recv_nanos_since_epoch + kMaxFutureSkewNs);
-			if (plausible_timestamp) {
-				std::chrono::steady_clock::time_point send_time{std::chrono::nanoseconds(send_nanos_since_epoch)};
-				long long latency_micros =
-					std::chrono::duration_cast<std::chrono::microseconds>(recv_time - send_time).count();
-				conn->latency_samples.emplace_back(send_nanos_since_epoch, latency_micros);
-				conn->latency_diag.samples_added++;
-			} else {
-				conn->latency_diag.samples_rejected_implausible_ts++;
+				if (plausible_timestamp) {
+					std::chrono::steady_clock::time_point send_time{std::chrono::nanoseconds(send_nanos_since_epoch)};
+					long long latency_micros =
+						std::chrono::duration_cast<std::chrono::microseconds>(recv_time - send_time).count();
+					uint64_t dedupe_key = static_cast<uint64_t>(send_nanos_since_epoch);
+					if (msg_uid != 0) {
+						dedupe_key = Mix64(msg_uid);
+					} else if (parse_batch_metadata && conn->latency_has_batch_metadata) {
+						// Combine metadata identity with send timestamp to avoid key collisions.
+						const uint64_t batch_local_index =
+							(conn->latency_batch_total_order << 16) |
+							static_cast<uint64_t>(conn->latency_messages_processed & 0xFFFFu);
+						dedupe_key = Mix64(batch_local_index) ^ Mix64(static_cast<uint64_t>(send_nanos_since_epoch));
+					}
+					conn->latency_samples.push_back(
+						LatencySample{dedupe_key, send_nanos_since_epoch, latency_micros});
+					conn->latency_diag.samples_added++;
+				} else {
+					conn->latency_diag.samples_rejected_implausible_ts++;
 			}
 		}
 
 		parse_offset += total_message_size;
 		if (parse_batch_metadata && conn->latency_has_batch_metadata) {
 			conn->latency_messages_processed++;
-			if (conn->latency_messages_processed >= conn->latency_messages_in_batch) {
-				conn->latency_has_batch_metadata = false;
-				conn->latency_header_version = Embarcadero::wire::HEADER_VERSION_V1;
-				conn->latency_messages_in_batch = 0;
-				conn->latency_messages_processed = 0;
+				if (conn->latency_messages_processed >= conn->latency_messages_in_batch) {
+					conn->latency_has_batch_metadata = false;
+					conn->latency_header_version = Embarcadero::wire::HEADER_VERSION_V1;
+					conn->latency_messages_in_batch = 0;
+					conn->latency_messages_processed = 0;
+					conn->latency_batch_total_order = 0;
+				}
 			}
 		}
-	}
 
 	if (parse_offset == 0) {
 		conn->latency_diag.parse_break_no_progress++;
@@ -550,7 +578,7 @@ void Subscriber::StoreLatency() {
 
 	std::vector<long long> all_latencies_us;
 	size_t total_messages_parsed = 0;
-	std::unordered_map<long long, long long> best_latency_by_send_ns;
+	std::unordered_map<uint64_t, long long> best_latency_by_message_key;
 
 	std::vector<std::pair<int, std::shared_ptr<ConnectionBuffers>>> connections_to_parse;
 	{
@@ -573,17 +601,17 @@ void Subscriber::StoreLatency() {
 		absl::MutexLock state_lock(&conn_ptr->state_mutex);
 		for (const auto& sample : conn_ptr->latency_samples) {
 			total_messages_parsed++;
-			auto it = best_latency_by_send_ns.find(sample.first);
-			if (it == best_latency_by_send_ns.end()) {
-				best_latency_by_send_ns.emplace(sample.first, sample.second);
-			} else if (sample.second < it->second) {
-				it->second = sample.second;
+			auto it = best_latency_by_message_key.find(sample.dedupe_key);
+			if (it == best_latency_by_message_key.end()) {
+				best_latency_by_message_key.emplace(sample.dedupe_key, sample.latency_us);
+			} else if (sample.latency_us < it->second) {
+				it->second = sample.latency_us;
 			}
 		}
 	} // End for connections
 
-	all_latencies_us.reserve(best_latency_by_send_ns.size());
-	for (const auto& entry : best_latency_by_send_ns) {
+	all_latencies_us.reserve(best_latency_by_message_key.size());
+	for (const auto& entry : best_latency_by_message_key) {
 		all_latencies_us.push_back(entry.second);
 	}
 	const size_t recorded_samples = all_latencies_us.size();
@@ -1049,13 +1077,13 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 				                        static_cast<size_t>(bytes_received),
 				                        order_level_,
 				                        recv_complete_time);
-				if (conn_buffers->latency_samples.size() > samples_before) {
-					absl::MutexLock dedupe_lock(&latency_seen_mutex_);
-					for (size_t i = samples_before; i < conn_buffers->latency_samples.size(); ++i) {
-						if (latency_seen_send_ns_.insert(conn_buffers->latency_samples[i].first).second) {
-							latency_unique_message_count_.fetch_add(1, std::memory_order_relaxed);
+					if (conn_buffers->latency_samples.size() > samples_before) {
+						absl::MutexLock dedupe_lock(&latency_seen_mutex_);
+						for (size_t i = samples_before; i < conn_buffers->latency_samples.size(); ++i) {
+							if (latency_seen_send_ns_.insert(conn_buffers->latency_samples[i].dedupe_key).second) {
+								latency_unique_message_count_.fetch_add(1, std::memory_order_relaxed);
+							}
 						}
-					}
 				}
 			}
 
@@ -1158,8 +1186,14 @@ void Subscriber::SubscribeToClusterStatus() {
 						}
 					}
 				} // Lock released
-				// Update data broker count for WaitUntilAllConnected
-				data_broker_count_.store(data_brokers);
+					// Keep observed data-broker count monotonic; startup snapshots can be partial.
+					size_t observed = data_broker_count_.load(std::memory_order_relaxed);
+					while (observed < data_brokers &&
+						   !data_broker_count_.compare_exchange_weak(
+							   observed, data_brokers,
+							   std::memory_order_release,
+							   std::memory_order_relaxed)) {
+					}
 				for(const auto& pair : brokers_to_add) {
 					std::thread manager_thread(&Subscriber::ManageBrokerConnections, this, pair.first, pair.second);
 					manager_thread.detach();
