@@ -1495,20 +1495,34 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 	bool needs_expensive_check = false;
 
 	if (ack_level == 2 && replication_factor > 0) {
-		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
-			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
-		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
+		// ORDER=5 (strong ordering): ACK2 frontier is CompletionVector (GOI/chain-replication path).
+		// Non-ORDER5: use legacy replication_done frontier (batch ring replication path).
+		if (seq_type == EMBARCADERO && order == kOrderStrong) {
+			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
+			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
 
-		// Fast read without flush/fence
-		uint64_t fast_completed = my_cv_entry->completed_logical_offset.load(std::memory_order_relaxed);
-		if (fast_completed != 0) {
-			fast_read_value = fast_completed;
-		} else {
-			uint64_t fast_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_relaxed);
-			if (fast_pbr_index != static_cast<uint64_t>(-1)) {
-				fast_read_value = 0;
+			// Fast read without flush/fence
+			uint64_t fast_completed = my_cv_entry->completed_logical_offset.load(std::memory_order_relaxed);
+			if (fast_completed != 0) {
+				fast_read_value = fast_completed;
 			} else {
-				fast_read_value = (size_t)-1;
+				uint64_t fast_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_relaxed);
+				if (fast_pbr_index != static_cast<uint64_t>(-1)) {
+					fast_read_value = 0;
+				} else {
+					fast_read_value = (size_t)-1;
+				}
+			}
+		} else {
+			size_t min_val = std::numeric_limits<size_t>::max();
+			for (int i = 0; i < replication_factor; i++) {
+				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
+				size_t val = tinode->offsets[b].replication_done[broker_id_];
+				if (min_val > val) min_val = val;
+			}
+			if (min_val != std::numeric_limits<size_t>::max()) {
+				fast_read_value = min_val + 1;  // replication_done is last offset; ACK expects count
 			}
 		}
 	} else if (ack_level == 1 && seq_type == EMBARCADERO && order == kOrderStrong) {
@@ -1630,30 +1644,49 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		// - Durability is "within periodic sync window" (default: 250ms or 64MiB)
 		// - This means ack_level=2 provides eventual durability, not immediate fsync durability
 
-		// CV is the sole source of replication ACK progress. Tail replica advances it on contiguous frontier.
-		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
-			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
-		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
+		// ORDER=5 (strong ordering): ACK2 frontier is CompletionVector (GOI/chain-replication path).
+		// Non-ORDER5: ACK2 frontier is legacy replication_done[] minimum across replication set.
+		if (seq_type == EMBARCADERO && order == kOrderStrong) {
+			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
+			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
 
-		// Read CV (tail replica updates after replication; sequencer may also advance for ack_level=1)
-		// [[CXL_VISIBILITY]] full_fence after flush so read sees CXL; LFENCE does not order CLFLUSHOPT.
-		CXL::flush_cacheline(my_cv_entry);
-		CXL::full_fence();
+			// Read CV (tail replica updates after replication; sequencer may also advance for ack_level=1)
+			// [[CXL_VISIBILITY]] full_fence after flush so read sees CXL; LFENCE does not order CLFLUSHOPT.
+			CXL::flush_cacheline(my_cv_entry);
+			CXL::full_fence();
 
-		// [[ACK_OPTIMIZATION]] Read cumulative message count directly from CV
-		uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
+			// [[ACK_OPTIMIZATION]] Read cumulative message count directly from CV
+			uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
 
-		// Sentinel check via pbr_head
-		if (completed_logical_offset == 0) {
-			uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
-			if (completed_pbr_index == static_cast<uint64_t>(-1)) {
-				return (size_t)-1;  // No replication progress yet
+			// Sentinel check via pbr_head
+			if (completed_logical_offset == 0) {
+				uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
+				if (completed_pbr_index == static_cast<uint64_t>(-1)) {
+					return (size_t)-1;  // No replication progress yet
+				}
+				return 0;
 			}
-			return 0;
+
+			// [[ACK_LEVEL_2_COUNT_SEMANTICS]] - Client expects cumulative message COUNT.
+			return completed_logical_offset;
 		}
 
-		// [[ACK_LEVEL_2_COUNT_SEMANTICS]] - Client expects cumulative message COUNT.
-		return completed_logical_offset;
+		// Legacy non-ORDER5 replication frontier path.
+		size_t r[replication_factor];
+		for (int i = 0; i < replication_factor; i++) {
+			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
+			volatile uint64_t* rep_done_ptr = &tinode->offsets[b].replication_done[broker_id_];
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(rep_done_ptr)));
+			CXL::full_fence();
+			r[i] = *rep_done_ptr;
+			if (min > r[i]) min = r[i];
+		}
+		if (min == std::numeric_limits<size_t>::max()) {
+			return (size_t)-1;
+		}
+		return min + 1;  // Convert last offset to message count
 	}
 
 	// ACK Level 1: Acknowledge after written to shared memory and ordered (order 0/1/2 or non-EMBARCADERO)

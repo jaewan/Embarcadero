@@ -16,6 +16,7 @@
 #include "corfu_replication_manager.h"
 #include "chain_replication.h"
 #include "../cxl_manager/cxl_datastructure.h"
+#include "../common/order_level.h"
 #include "../common/performance_utils.h"
 
 namespace Embarcadero{
@@ -250,15 +251,27 @@ namespace Embarcadero{
 		}
 	}
 
-	void DiskManager::Replicate(TInode* tinode, TInode* replica_tinode, int replication_factor){
-		size_t available_threads = num_io_threads_.load() - num_active_threads_.load();
-		int threads_needed = replication_factor - available_threads;
-		if(threads_needed > 0){
-			for(int i=0; i < threads_needed; i++){
+	void DiskManager::Replicate(TInode* topic_inode, TInode* replica_tinode, int replication_factor){
+		// ORDER=5 (strong) on EMBARCADERO uses GOI + chain replication + CompletionVector.
+		// Do not start legacy batch-ring replication workers on this path.
+		if (sequencerType_ == heartbeat_system::SequencerType::EMBARCADERO &&
+		    topic_inode != nullptr && topic_inode->order == kOrderStrong) {
+			return;
+		}
+
+		// Ensure we have at least one replication worker per requested replica stream.
+		// For EMBARCADERO, constructor may return early after chain-replication setup, so
+		// relying on configured thread capacity (num_io_threads_) is insufficient.
+		size_t running_threads = thread_count_.load(std::memory_order_acquire);
+		if (running_threads < static_cast<size_t>(replication_factor)) {
+			size_t target_threads = static_cast<size_t>(replication_factor);
+			size_t threads_needed = target_threads - running_threads;
+			for (size_t i = 0; i < threads_needed; i++) {
 				threads_.emplace_back(&DiskManager::ReplicateThread, this);
 			}
-			num_io_threads_.fetch_add(threads_needed);
-			while(thread_count_.load() != num_io_threads_.load()){std::this_thread::yield();}
+			while (thread_count_.load(std::memory_order_acquire) < target_threads) {
+				std::this_thread::yield();
+			}
 		}
 		// [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
 		// replication_factor INCLUDES self (replication_factor=1 means local durability only)
@@ -276,13 +289,13 @@ namespace Embarcadero{
 				if(fd == -1){
 					LOG(ERROR) << "File open for replication failed:" << strerror(errno);
 				}
-				ReplicationRequest req = {tinode, replica_tinode, fd, b};
+					ReplicationRequest req = {topic_inode, replica_tinode, fd, b};
 				requestQueue_.blockingWrite(req);
 			}
 		}else{
 			for(int i = 0; i< replication_factor; i++){
 				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
-				ReplicationRequest req = {tinode, replica_tinode, -1, b};
+					ReplicationRequest req = {topic_inode, replica_tinode, -1, b};
 				requestQueue_.blockingWrite(req);
 			}
 		}
@@ -631,20 +644,27 @@ namespace Embarcadero{
 			// [[DEVIATION_006: Export Chain Semantics]] 
 			// Read ordered flag from the *slot* (like export does in Topic::GetBatchToExport)
 			volatile uint32_t ordered_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->ordered;
+			volatile int batch_complete_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->batch_complete;
+			TInode* source_inode = tinode;
+			bool slot_ready_for_replication = (source_inode->order == 0)
+				? (batch_complete_check == 1)
+				: (ordered_check == 1);
 			
 			// Calculate ring offset for diagnostics
 			size_t ring_offset = reinterpret_cast<uint8_t*>(current_batch) - reinterpret_cast<uint8_t*>(batch_ring_start);
 			
-			if (ordered_check != 1) {
+			if (!slot_ready_for_replication) {
 				ordered_misses++;
 				consecutive_not_ordered++;
 				// [[PHASE_0_INSTRUMENTATION]] - Periodic diagnostic logging
 				auto now = std::chrono::steady_clock::now();
 				if (now - last_diagnostic_log >= kDiagnosticLogInterval) {
 					LOG(INFO) << "[GetNextReplicationBatch B" << broker_id << "]: Scan stats: "
-						<< "iterations=" << scan_iterations << ", ordered_hits=" << ordered_hits
-						<< ", ordered_misses=" << ordered_misses << ", ring_offset=" << ring_offset
-						<< ", current_ordered=" << ordered_check << ", consecutive_not_ordered=" << consecutive_not_ordered;
+							<< "iterations=" << scan_iterations << ", ordered_hits=" << ordered_hits
+							<< ", ordered_misses=" << ordered_misses << ", ring_offset=" << ring_offset
+							<< ", current_ordered=" << ordered_check
+							<< ", current_batch_complete=" << batch_complete_check
+							<< ", consecutive_not_ordered=" << consecutive_not_ordered;
 					last_diagnostic_log = now;
 				}
 				// Current slot not yet ordered, advance and try next
