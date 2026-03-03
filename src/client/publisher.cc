@@ -1197,8 +1197,10 @@ process_client_fd:;
 					}
 					partial.second += static_cast<size_t>(recv_ret);
 					if (partial.second != sizeof(size_t)) {
-						// Partial ACK still in progress, wait for more data
-						break;
+						// EPOLLET requires draining socket data until EAGAIN.
+						// If we break here, remaining bytes may never trigger a new edge,
+						// stranding an ACK fragment and stalling cumulative progress.
+						continue;
 					}
 
 					// --- Process Full ACK Value ---
