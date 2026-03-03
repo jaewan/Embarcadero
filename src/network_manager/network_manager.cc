@@ -1531,7 +1531,7 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
-		uint64_t fast_completed = my_cv_entry->completed_logical_offset.load(std::memory_order_relaxed);
+		uint64_t fast_completed = my_cv_entry->sequencer_logical_offset.load(std::memory_order_relaxed);
 		if (fast_completed != 0) {
 			fast_read_value = fast_completed;
 		} else {
@@ -1605,7 +1605,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		CXL::flush_cacheline(my_cv_entry);
 		CXL::full_fence();
 
-		uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
+		uint64_t completed_logical_offset = my_cv_entry->sequencer_logical_offset.load(std::memory_order_acquire);
 		volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
 		CXL::flush_cacheline(const_cast<const void*>(
 			reinterpret_cast<const volatile void*>(ordered_ptr)));
@@ -1988,7 +1988,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 					CompletionVectorEntry* my_cv = &cv[broker_id_];
 					CXL::flush_cacheline(my_cv);
 					CXL::full_fence();
-					uint64_t cv_logical = my_cv->completed_logical_offset.load(std::memory_order_acquire);
+					uint64_t cv_logical = my_cv->sequencer_logical_offset.load(std::memory_order_acquire);
 					uint64_t cv_pbr = my_cv->completed_pbr_head.load(std::memory_order_acquire);
 					CXL::flush_cacheline(const_cast<const void*>(
 						reinterpret_cast<const volatile void*>(&trace_tinode->offsets[broker_id_])));

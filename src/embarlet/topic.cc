@@ -1991,16 +1991,16 @@ void Topic::AdvanceCVForSequencer(uint16_t broker_id, uint64_t pbr_index, uint64
 
 	// [[B0_ACK_FIX]] Advance on cumulative_msg_count (ACK offset), not pbr_index. Late-arriving batches
 	// (e.g. seq=0 after seq=1,2 expired) have lower pbr_index but must still advance ACK so broker sees progress.
-	// completed_pbr_head remains max-only for export ordering; completed_logical_offset is the ACK source of truth.
+	// completed_pbr_head remains max-only for export ordering; sequencer_logical_offset is the ACK1 source of truth.
 	CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
 	CompletionVectorEntry* entry = &cv[broker_id];
 	constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
-	// Advance logical offset (ACK) when this batch extends the cumulative count
+	// Advance sequencer logical offset (ACK1 frontier) when this batch extends the cumulative count
 	for (;;) {
-		uint64_t cur_offset = entry->completed_logical_offset.load(std::memory_order_acquire);
+		uint64_t cur_offset = entry->sequencer_logical_offset.load(std::memory_order_acquire);
 		if (cumulative_msg_count <= cur_offset) break;
-		if (entry->completed_logical_offset.compare_exchange_strong(cur_offset, cumulative_msg_count, std::memory_order_release)) {
+		if (entry->sequencer_logical_offset.compare_exchange_strong(cur_offset, cumulative_msg_count, std::memory_order_release)) {
 			// Optionally advance pbr_head for export (monotonic; don't regress)
 			uint64_t cur_pbr = entry->completed_pbr_head.load(std::memory_order_acquire);
 			if (cur_pbr == kNoProgress || pbr_index > cur_pbr) {
@@ -2045,7 +2045,7 @@ void Topic::FlushAccumulatedCV(
 		CXL::load_fence();
 
 		// Do not gate sequencer progress on topic-level ack_level. Client ack policy is per-connection.
-		uint64_t cur = entry->completed_logical_offset.load(std::memory_order_acquire);
+		uint64_t cur = entry->sequencer_logical_offset.load(std::memory_order_acquire);
 		const uint64_t prev_cur = cur;
 		uint64_t cur_pbr = entry->completed_pbr_head.load(std::memory_order_acquire);
 		const uint64_t prev_pbr = cur_pbr;
@@ -2055,7 +2055,7 @@ void Topic::FlushAccumulatedCV(
 		uint64_t post_cumulative = prev_cur;
 		uint64_t post_pbr = prev_pbr;
 		if (cumulative > cur) {
-			entry->completed_logical_offset.store(cumulative, std::memory_order_release);
+			entry->sequencer_logical_offset.store(cumulative, std::memory_order_release);
 			advanced_logical = true;
 			post_cumulative = cumulative;
 		}
