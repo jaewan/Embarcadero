@@ -273,15 +273,54 @@ namespace Embarcadero{
 				std::this_thread::yield();
 			}
 		}
-		// [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
-		// replication_factor INCLUDES self (replication_factor=1 means local durability only)
-		// This ensures consistent replica selection across DiskManager and NetworkManager
-		// TODO: Get actual num_brokers instead of NUM_MAX_BROKERS (requires callback)
-		int num_brokers = NUM_MAX_BROKERS;  // Temporary: use MAX until we have get_num_brokers callback
+		// Resolve live broker count (required for correct modulo replication set computation).
+		int num_brokers = NUM_MAX_BROKERS;
+		if (get_num_brokers_callback_) {
+			const int live_brokers = get_num_brokers_callback_();
+			if (live_brokers > 0 && live_brokers <= NUM_MAX_BROKERS) {
+				num_brokers = live_brokers;
+			}
+		}
+		if (num_brokers <= 0) {
+			LOG(WARNING) << "DiskManager::Replicate: invalid num_brokers=" << num_brokers
+			             << ", falling back to NUM_MAX_BROKERS";
+			num_brokers = NUM_MAX_BROKERS;
+		}
+
+		int effective_replication_factor = replication_factor;
+		if (effective_replication_factor > num_brokers) {
+			LOG(WARNING) << "DiskManager::Replicate: replication_factor=" << replication_factor
+			             << " exceeds num_brokers=" << num_brokers
+			             << ", clamping to " << num_brokers;
+			effective_replication_factor = num_brokers;
+		}
+		if (effective_replication_factor <= 0) {
+			return;
+		}
+
+		// For source broker S, ACK2 reads min across forward set {S, S+1, ..., S+rf-1}.
+		// Therefore local broker L must replicate exactly those sources S where L is in S's set:
+		// S in {L, L-1, ..., L-(rf-1)}.
+		std::vector<int> source_brokers;
+		source_brokers.reserve(static_cast<size_t>(effective_replication_factor));
+		for (int i = 0; i < effective_replication_factor; ++i) {
+			source_brokers.push_back((broker_id_ + num_brokers - i) % num_brokers);
+		}
+		std::string source_brokers_str = "[";
+		for (size_t i = 0; i < source_brokers.size(); ++i) {
+			if (i > 0) source_brokers_str += ",";
+			source_brokers_str += std::to_string(source_brokers[i]);
+		}
+		source_brokers_str += "]";
+		LOG(INFO) << "DiskManager::Replicate broker=" << broker_id_
+		          << " num_brokers=" << num_brokers
+		          << " replication_factor=" << replication_factor
+		          << " effective_replication_factor=" << effective_replication_factor
+		          << " source_brokers=" << source_brokers_str;
 		
 		if(!log_to_memory_){
-			for(int i = 0; i< replication_factor; i++){
-				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
+			for(int i = 0; i< effective_replication_factor; i++){
+				int b = source_brokers[i];
 				int disk_to_write = b % NUM_DISKS ;
 				std::string base_dir = "../../.Replication/disk" + std::to_string(disk_to_write) + "/";
 				std::string base_filename = base_dir+"embarcadero_replication_log"+std::to_string(b) +".dat";
@@ -289,13 +328,13 @@ namespace Embarcadero{
 				if(fd == -1){
 					LOG(ERROR) << "File open for replication failed:" << strerror(errno);
 				}
-					ReplicationRequest req = {topic_inode, replica_tinode, fd, b};
+				ReplicationRequest req = {topic_inode, replica_tinode, fd, b};
 				requestQueue_.blockingWrite(req);
 			}
 		}else{
-			for(int i = 0; i< replication_factor; i++){
-				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
-					ReplicationRequest req = {topic_inode, replica_tinode, -1, b};
+			for(int i = 0; i< effective_replication_factor; i++){
+				int b = source_brokers[i];
+				ReplicationRequest req = {topic_inode, replica_tinode, -1, b};
 				requestQueue_.blockingWrite(req);
 			}
 		}
@@ -598,14 +637,30 @@ namespace Embarcadero{
 		
 		// Initialize ring pointers on first call
 		if (batch_ring_start == nullptr) {
+			volatile size_t* source_batch_headers_offset_ptr = &tinode->offsets[broker_id].batch_headers_offset;
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(source_batch_headers_offset_ptr)));
+			CXL::load_fence();
+			const size_t source_batch_headers_offset = *source_batch_headers_offset_ptr;
+			if (source_batch_headers_offset == 0) {
+				static thread_local uint64_t source_not_ready_polls = 0;
+				source_not_ready_polls++;
+				if (source_not_ready_polls <= 5 || (source_not_ready_polls % 2000) == 0) {
+					LOG(INFO) << "[GetNextReplicationBatch B" << broker_id
+					          << "]: source offsets not ready yet (batch_headers_offset=0, polls="
+					          << source_not_ready_polls << ")";
+				}
+				return false;
+			}
+
 			batch_ring_start = reinterpret_cast<BatchHeader*>(
-				reinterpret_cast<uint8_t*>(cxl_addr_) + tinode->offsets[broker_id].batch_headers_offset);
+				reinterpret_cast<uint8_t*>(cxl_addr_) + source_batch_headers_offset);
 			batch_ring_end = reinterpret_cast<BatchHeader*>(
 				reinterpret_cast<uint8_t*>(batch_ring_start) + BATCHHEADERS_SIZE);
 			current_batch = batch_ring_start;
 			disk_offset = 0;
 			VLOG(2) << "[GetNextReplicationBatch B" << broker_id << "]: Initialized ring at offset " 
-					<< tinode->offsets[broker_id].batch_headers_offset;
+					<< source_batch_headers_offset;
 		}
 		
 		// Scan for next ordered batch (match BrokerScannerWorker5 pattern)

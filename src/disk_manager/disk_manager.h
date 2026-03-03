@@ -49,8 +49,11 @@ struct MemcpyRequest{
 class DiskManager{
 	public:
 		DiskManager(int broker_id, void* cxl_manager, bool log_to_memory,
-							heartbeat_system::SequencerType sequencerType, size_t queueCapacity = 64);
+				heartbeat_system::SequencerType sequencerType, size_t queueCapacity = 64);
 		~DiskManager();
+		void RegisterGetNumBrokersCallback(GetNumBrokersCallback callback){
+			get_num_brokers_callback_ = callback;
+		}
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
 		// Change this to get real-time num brokers
 		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
@@ -88,6 +91,7 @@ class DiskManager{
 		std::atomic<size_t> num_io_threads_{0};
 		std::atomic<size_t> num_active_threads_{0};
 		fs::path prefix_path_;
+		GetNumBrokersCallback get_num_brokers_callback_;
 		
 		// [[OBSERVABILITY]] - Replication metrics for monitoring and debugging
 		// Per-broker counters (indexed by broker_id)

@@ -290,6 +290,9 @@ int main(int argc, char* argv[]) {
 	network_manager.RegisterGetNumBrokersCallback(
 			std::bind(&heartbeat_system::HeartBeatManager::GetNumBrokers, &heartbeat_manager));
 
+	disk_manager.RegisterGetNumBrokersCallback(
+			std::bind(&heartbeat_system::HeartBeatManager::GetNumBrokers, &heartbeat_manager));
+
 	// Connect managers
 	cxl_manager.SetTopicManager(&topic_manager);
 	cxl_manager.SetNetworkManager(&network_manager);
