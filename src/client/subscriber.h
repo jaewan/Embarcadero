@@ -265,6 +265,12 @@ class Subscriber {
 					absl::ReaderMutexLock map_lock(&connection_map_mutex_);
 					num_connections = connections_.size();
 				}
+				// Heartbeat snapshots can be partial during startup. Proactively
+				// bootstrap configured broker connections so readiness doesn't
+				// depend on seeing every broker in cluster-status immediately.
+				if (num_connections < final_expected) {
+					StartMissingConfiguredBrokerConnections();
+				}
 
 				// Keep expected connections monotonic and never below configured broker count.
 				// Cluster status updates can arrive as partial snapshots during startup.
@@ -311,6 +317,7 @@ class Subscriber {
 
 	private:
 		friend class ConnectionBuffers; // Allow access to members if needed
+		void StartMissingConfiguredBrokerConnections();
 
 		// --- Connection & Thread Management ---
 		std::string head_addr_;
@@ -328,6 +335,7 @@ class Subscriber {
 		int order_level_; // Store the order level for batch-aware processing
 		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
 		std::atomic<size_t> latency_unique_message_count_{0}; // Unique message keys seen during receive
+		std::atomic<size_t> latency_parsed_message_count_{0}; // Parsed latency messages seen during receive
 		absl::Mutex latency_seen_mutex_;
 		absl::flat_hash_set<uint64_t> latency_seen_send_ns_ ABSL_GUARDED_BY(latency_seen_mutex_);
 		// Per-broker byte counters for debugging subscribe stall (which broker underperforms)

@@ -259,9 +259,10 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 							conn->latency_batch_last_uid = msg_uid;
 							conn->latency_batch_uid_seen++;
 						}
-						// Use both UID and embedded send timestamp.
-						// UID alone can collide if upstream accidentally reuses payload identifiers.
-						dedupe_key = Mix64(msg_uid) ^ Mix64(static_cast<uint64_t>(send_nanos_since_epoch));
+						// Use raw UID as dedupe identity when available.
+						// Combining UID/timestamp via XOR hashing is not injective for correlated
+						// sequences and can produce false collisions at scale.
+						dedupe_key = msg_uid;
 					} else if (parse_batch_metadata && conn->latency_has_batch_metadata) {
 						// Combine metadata identity with send timestamp to avoid key collisions.
 						const uint64_t batch_local_index =
@@ -619,6 +620,7 @@ void Subscriber::StoreLatency() {
 
 	std::vector<long long> all_latencies_us;
 	size_t total_messages_parsed = 0;
+	const bool dedupe_latency_samples = (std::getenv("EMBARCADERO_DEDUPE_LATENCY") != nullptr);
 	std::unordered_map<uint64_t, long long> best_latency_by_message_key;
 
 	std::vector<std::pair<int, std::shared_ptr<ConnectionBuffers>>> connections_to_parse;
@@ -642,6 +644,10 @@ void Subscriber::StoreLatency() {
 		absl::MutexLock state_lock(&conn_ptr->state_mutex);
 		for (const auto& sample : conn_ptr->latency_samples) {
 			total_messages_parsed++;
+			if (!dedupe_latency_samples) {
+				all_latencies_us.push_back(sample.latency_us);
+				continue;
+			}
 			auto it = best_latency_by_message_key.find(sample.dedupe_key);
 			if (it == best_latency_by_message_key.end()) {
 				best_latency_by_message_key.emplace(sample.dedupe_key, sample.latency_us);
@@ -651,9 +657,11 @@ void Subscriber::StoreLatency() {
 		}
 	} // End for connections
 
-	all_latencies_us.reserve(best_latency_by_message_key.size());
-	for (const auto& entry : best_latency_by_message_key) {
-		all_latencies_us.push_back(entry.second);
+	if (dedupe_latency_samples) {
+		all_latencies_us.reserve(best_latency_by_message_key.size());
+		for (const auto& entry : best_latency_by_message_key) {
+			all_latencies_us.push_back(entry.second);
+		}
 	}
 	const size_t recorded_samples = all_latencies_us.size();
 	const size_t dropped_samples = (total_messages_parsed >= recorded_samples)
@@ -671,7 +679,8 @@ void Subscriber::StoreLatency() {
 	const auto summary = Embarcadero::LatencyStats::ComputeSummary(all_latencies_us);
 	LOG(INFO) << "Latency accounting: parsed=" << total_messages_parsed
 	          << " recorded=" << recorded_samples
-	          << " dropped=" << dropped_samples;
+	          << " dropped=" << dropped_samples
+	          << " dedupe=" << (dedupe_latency_samples ? "on" : "off");
 
 	// --- Log Results ---
 	LOG(INFO) << "Publish->Deliver Latency Statistics (us):";
@@ -756,13 +765,15 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(POLL_TIMEOUT_SEC);
 	auto last_progress_log = std::chrono::steady_clock::now();
 
-	const bool wait_on_unique_messages = measure_latency_;
-	const size_t target_unique_messages = num_msg;
+	const bool wait_on_latency_messages = measure_latency_;
+	const size_t target_latency_messages = num_msg;
 	// Reduce busy-wait overhead with adaptive sleeping
 	while (true) {
 		size_t current_count = DEBUG_count_.load(std::memory_order_relaxed);
 		size_t current_unique = latency_unique_message_count_.load(std::memory_order_relaxed);
-		bool done = wait_on_unique_messages ? (current_unique >= target_unique_messages)
+		size_t current_parsed = latency_parsed_message_count_.load(std::memory_order_relaxed);
+		bool done = wait_on_latency_messages ? (current_parsed >= target_latency_messages &&
+		                                       current_count >= total_data_size)
 		                                   : (current_count >= total_data_size);
 		if (done) break;
 
@@ -771,13 +782,17 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 			double byte_pct = total_data_size > 0
 				? (100.0 * static_cast<double>(current_count)) / static_cast<double>(total_data_size)
 				: 0;
-			double unique_pct = target_unique_messages > 0
-				? (100.0 * static_cast<double>(current_unique)) / static_cast<double>(target_unique_messages)
+			double unique_pct = target_latency_messages > 0
+				? (100.0 * static_cast<double>(current_unique)) / static_cast<double>(target_latency_messages)
+				: 0;
+			double parsed_pct = target_latency_messages > 0
+				? (100.0 * static_cast<double>(current_parsed)) / static_cast<double>(target_latency_messages)
 				: 0;
 			LOG(ERROR) << "Subscriber::Poll timeout after " << POLL_TIMEOUT_SEC << "s: bytes "
 			           << current_count << " / " << total_data_size << " (" << std::fixed << std::setprecision(1) << byte_pct
-			           << "%), unique_messages " << current_unique << " / " << target_unique_messages
-			           << " (" << unique_pct << "%)";
+			           << "%), parsed_messages " << current_parsed << " / " << target_latency_messages
+			           << " (" << parsed_pct << "%), unique_messages " << current_unique << " / "
+			           << target_latency_messages << " (" << unique_pct << "%)";
 			// Log per-broker bytes to identify which broker(s) stopped sending (no broker logs needed)
 			std::ostringstream broker_breakdown;
 			broker_breakdown << "Per-broker bytes at timeout: [";
@@ -885,8 +900,11 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 			double byte_pct = total_data_size > 0
 				? (100.0 * static_cast<double>(current_count)) / static_cast<double>(total_data_size)
 				: 0;
-			double unique_pct = target_unique_messages > 0
-				? (100.0 * static_cast<double>(current_unique)) / static_cast<double>(target_unique_messages)
+			double unique_pct = target_latency_messages > 0
+				? (100.0 * static_cast<double>(current_unique)) / static_cast<double>(target_latency_messages)
+				: 0;
+			double parsed_pct = target_latency_messages > 0
+				? (100.0 * static_cast<double>(current_parsed)) / static_cast<double>(target_latency_messages)
 				: 0;
 			int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(deadline - now).count());
 			std::ostringstream broker_stats;
@@ -899,15 +917,16 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 			}
 			broker_stats << "]";
 			VLOG(1) << "Subscriber::Poll progress: bytes " << current_count << " / " << total_data_size << " ("
-			        << std::fixed << std::setprecision(1) << byte_pct << "%), unique_messages "
-			        << current_unique << " / " << target_unique_messages << " (" << unique_pct
-			        << "%), " << elapsed << "s until timeout. " << broker_stats.str();
+			        << std::fixed << std::setprecision(1) << byte_pct << "%), parsed_messages "
+			        << current_parsed << " / " << target_latency_messages << " (" << parsed_pct
+			        << "%), unique_messages " << current_unique << " / " << target_latency_messages
+			        << " (" << unique_pct << "%), " << elapsed << "s until timeout. " << broker_stats.str();
 		}
 
 		// Adaptive sleep based on progress
-		double progress = wait_on_unique_messages
-			? (target_unique_messages > 0
-				? static_cast<double>(current_unique) / static_cast<double>(target_unique_messages)
+		double progress = wait_on_latency_messages
+			? (target_latency_messages > 0
+				? static_cast<double>(current_parsed) / static_cast<double>(target_latency_messages)
 				: 1.0)
 			: (total_data_size > 0
 				? static_cast<double>(current_count) / static_cast<double>(total_data_size)
@@ -922,9 +941,36 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 	}
 }
 
+void Subscriber::StartMissingConfiguredBrokerConnections() {
+	std::vector<std::pair<int, std::string>> brokers_to_add;
+	{
+		absl::MutexLock lock(&node_mutex_);
+		for (int broker_id = 0; broker_id < NUM_MAX_BROKERS_CONFIG; ++broker_id) {
+			const std::string fallback_addr =
+				head_addr_ + ":" + std::to_string(PORT + broker_id);
+			nodes_[broker_id] = fallback_addr;
+			if (brokers_connection_started_.insert(broker_id).second) {
+				brokers_to_add.emplace_back(broker_id, fallback_addr);
+			}
+		}
+	}
+	for (const auto& [broker_id, addr] : brokers_to_add) {
+		LOG(INFO) << "Bootstrap: starting connection manager for configured broker "
+		          << broker_id << " at " << addr;
+		std::thread manager_thread(&Subscriber::ManageBrokerConnections, this, broker_id, addr);
+		manager_thread.detach();
+	}
+}
+
 void Subscriber::ManageBrokerConnections(int broker_id, const std::string& address) {
 	auto [addr_str, port_str] = ParseAddressPort(address);
 	int data_port = PORT + broker_id; // Use the base data port
+	auto allow_broker_retry = [&](const char* reason) {
+		absl::MutexLock lock(&node_mutex_);
+		brokers_connection_started_.erase(broker_id);
+		LOG(WARNING) << "ManageBrokerConnections: broker " << broker_id
+		             << " connection setup failed (" << reason << "), will allow retry.";
+	};
 
 	// Create a mutable copy
 	std::vector<char> addr_vec(addr_str.begin(), addr_str.end());
@@ -952,53 +998,78 @@ void Subscriber::ManageBrokerConnections(int broker_id, const std::string& addre
 		}
 	}
 
-	if (pending_fds.empty()) { /* ... error handling ... */ close(conn_epoll_fd); return; }
+	if (pending_fds.empty()) {
+		close(conn_epoll_fd);
+		allow_broker_retry("no_pending_sockets");
+		return;
+	}
 
-	// Step 2: Wait for connection results (Unchanged)
+	// Step 2/3: Wait for connection results with bounded retry window.
+	// A single epoll_wait(2s) can drop late-but-valid connects and cause 3/4 readiness.
 	std::vector<epoll_event> events(sub_connections_per_broker_);
-	const int CONNECT_TIMEOUT_MS = 2000;
-	int num_ready = epoll_wait(conn_epoll_fd,
-	                          events.data(),
-	                          static_cast<int>(events.size()),
-	                          CONNECT_TIMEOUT_MS);
+	constexpr int CONNECT_TIMEOUT_MS = 5000;
+	constexpr int EPOLL_SLICE_MS = 200;
+	const auto connect_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(CONNECT_TIMEOUT_MS);
+	auto mark_handled = [&](int sock) {
+		for (size_t i = 0; i < pending_fds.size(); ++i) {
+			if (pending_fds[i] == sock) {
+				pending_fds[i] = -1;
+				break;
+			}
+		}
+	};
 
-	// Step 3: Check connection status (Unchanged)
-	for (int n = 0; n < num_ready; ++n) {
-		int sock = events[n].data.fd;
-		if (events[n].events & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+	while (std::chrono::steady_clock::now() < connect_deadline) {
+		bool has_unresolved = false;
+		for (int sock : pending_fds) {
+			if (sock != -1) {
+				has_unresolved = true;
+				break;
+			}
+		}
+		if (!has_unresolved) break;
+
+		int num_ready = epoll_wait(conn_epoll_fd,
+		                           events.data(),
+		                           static_cast<int>(events.size()),
+		                           EPOLL_SLICE_MS);
+		if (num_ready <= 0) {
+			continue;
+		}
+
+		for (int n = 0; n < num_ready; ++n) {
+			int sock = events[n].data.fd;
+			if (!(events[n].events & (EPOLLOUT | EPOLLERR | EPOLLHUP))) {
+				continue;
+			}
 			int error = 0;
 			socklen_t len = sizeof(error);
 			if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
-				LOG(WARNING) << "Connection failed for socket " << sock << ": " << strerror(error ? error : ETIMEDOUT);
+				LOG(WARNING) << "Connection failed for socket " << sock << ": "
+				             << strerror(error ? error : ETIMEDOUT);
 				close(sock);
-				for(size_t i=0; i<pending_fds.size(); ++i) if(pending_fds[i] == sock) pending_fds[i] = -1;
-			} else {
-				VLOG(5) << "Socket " << sock << " connected successfully to broker " << broker_id;
-				int flags = fcntl(sock, F_GETFL, 0);
-				if (flags == -1) {
-					LOG(ERROR) << "fcntl F_GETFL failed for connected socket " << sock << ": " << strerror(errno);
-					close(sock); // Close socket if we can't change flags
-											 // Mark as handled/failed in pending_fds (important if you iterate pending_fds later)
-					for(size_t i=0; i<pending_fds.size(); ++i) if(pending_fds[i] == sock) pending_fds[i] = -1;
-					continue; // Skip this socket
-				}
-
-				flags &= ~O_NONBLOCK; // Remove the non-blocking flag using bitwise AND with complement
-
-				if (fcntl(sock, F_SETFL, flags) == -1) {
-					LOG(ERROR) << "fcntl F_SETFL failed to set blocking mode for socket " << sock << ": " << strerror(errno);
-					close(sock); // Close socket if we can't change flags
-											 // Mark as handled/failed in pending_fds
-					for(size_t i=0; i<pending_fds.size(); ++i) if(pending_fds[i] == sock) pending_fds[i] = -1;
-					continue; // Skip this socket
-				}
-				// *** END OF ADDED BLOCK ***
-
-
-				connected_fds.push_back(sock);
-				// Mark as connected in pending_fds
-				for(size_t i=0; i<pending_fds.size(); ++i) if(pending_fds[i] == sock) pending_fds[i] = -1; // Mark as handled
+				mark_handled(sock);
+				continue;
 			}
+
+			VLOG(5) << "Socket " << sock << " connected successfully to broker " << broker_id;
+			int flags = fcntl(sock, F_GETFL, 0);
+			if (flags == -1) {
+				LOG(ERROR) << "fcntl F_GETFL failed for connected socket " << sock << ": " << strerror(errno);
+				close(sock);
+				mark_handled(sock);
+				continue;
+			}
+			flags &= ~O_NONBLOCK;
+			if (fcntl(sock, F_SETFL, flags) == -1) {
+				LOG(ERROR) << "fcntl F_SETFL failed to set blocking mode for socket " << sock << ": " << strerror(errno);
+				close(sock);
+				mark_handled(sock);
+				continue;
+			}
+
+			connected_fds.push_back(sock);
+			mark_handled(sock);
 		}
 	}
 
@@ -1015,6 +1086,7 @@ void Subscriber::ManageBrokerConnections(int broker_id, const std::string& addre
 
 	if (connected_fds.empty()) {
 		LOG(ERROR) << "No successful connections established to broker " << broker_id;
+		allow_broker_retry("no_successful_connections");
 		return;
 	}
 
@@ -1151,6 +1223,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 				const int write_idx = conn_buffers->current_write_idx.load(std::memory_order_relaxed);
 				size_t current_end_offset = conn_buffers->buffers[write_idx].write_offset.load(std::memory_order_relaxed);
 				const uint64_t generation = conn_buffers->buffer_generation[write_idx];
+				const uint64_t parsed_before = conn_buffers->latency_diag.parsed_messages;
 				const size_t samples_before = conn_buffers->latency_samples.size();
 				conn_buffers->recv_log.push_back(RecvLogEntry{
 					.receive_time = recv_complete_time,
@@ -1163,13 +1236,19 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 				                        static_cast<size_t>(bytes_received),
 				                        order_level_,
 				                        recv_complete_time);
-					if (conn_buffers->latency_samples.size() > samples_before) {
-						absl::MutexLock dedupe_lock(&latency_seen_mutex_);
-						for (size_t i = samples_before; i < conn_buffers->latency_samples.size(); ++i) {
-							if (latency_seen_send_ns_.insert(conn_buffers->latency_samples[i].dedupe_key).second) {
-								latency_unique_message_count_.fetch_add(1, std::memory_order_relaxed);
-							}
+				const uint64_t parsed_after = conn_buffers->latency_diag.parsed_messages;
+				if (parsed_after > parsed_before) {
+					latency_parsed_message_count_.fetch_add(
+						static_cast<size_t>(parsed_after - parsed_before),
+						std::memory_order_relaxed);
+				}
+				if (conn_buffers->latency_samples.size() > samples_before) {
+					absl::MutexLock dedupe_lock(&latency_seen_mutex_);
+					for (size_t i = samples_before; i < conn_buffers->latency_samples.size(); ++i) {
+						if (latency_seen_send_ns_.insert(conn_buffers->latency_samples[i].dedupe_key).second) {
+							latency_unique_message_count_.fetch_add(1, std::memory_order_relaxed);
 						}
+					}
 				}
 			}
 
@@ -1252,7 +1331,7 @@ void Subscriber::SubscribeToClusterStatus() {
 			// Skip brokers that do not accept subscriptions
 			if (cluster_status.broker_info_size() > 0) {
 				std::vector<std::pair<int, std::string>> brokers_to_add;
-				size_t data_brokers = 0;  // Count data brokers for WaitUntilAllConnected
+				absl::flat_hash_set<int> unique_data_brokers;
 				{ // Lock scope
 					absl::MutexLock lock(&node_mutex_);
 					for (const auto& bi : cluster_status.broker_info()) {
@@ -1263,7 +1342,11 @@ void Subscriber::SubscribeToClusterStatus() {
 							          << " (no data)";
 							continue;
 						}
-						data_brokers++;
+						const bool inserted_unique = unique_data_brokers.insert(broker_id).second;
+						if (!inserted_unique) {
+							LOG(WARNING) << "SubscribeToCluster: Duplicate broker_info entry for broker "
+							             << broker_id << ", using latest address " << addr;
+						}
 						nodes_[broker_id] = addr;  // Always update (e.g. broker 0 pre-set in ctor)
 						// Spawn ManageBrokerConnections for every data broker we haven't started yet (including broker 0)
 						if (brokers_connection_started_.insert(broker_id).second) {
@@ -1272,6 +1355,7 @@ void Subscriber::SubscribeToClusterStatus() {
 						}
 					}
 				} // Lock released
+					const size_t data_brokers = unique_data_brokers.size();
 					// Keep observed data-broker count monotonic; startup snapshots can be partial.
 					size_t observed = data_broker_count_.load(std::memory_order_relaxed);
 					while (observed < data_brokers &&
