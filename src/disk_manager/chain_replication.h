@@ -4,8 +4,6 @@
 #include <atomic>
 #include <thread>
 #include <vector>
-#include <array>
-#include <map>
 #include "../cxl_manager/cxl_datastructure.h"
 
 namespace Embarcadero {
@@ -66,13 +64,6 @@ private:
     std::atomic<bool> stop_{false};
     std::thread replication_thread_;
 
-    // Tail replica tracks per-broker highest contiguous pbr_index.
-    // A pending map is needed because GOI replication completion can arrive
-    // out of order per broker; without this we can permanently lose contiguous
-    // frontier advancement for ACK level 2.
-    std::array<uint64_t, NUM_MAX_BROKERS> broker_cv_state_{};
-    std::array<bool, NUM_MAX_BROKERS> broker_cv_state_initialized_{};
-    std::array<std::map<uint64_t, uint64_t>, NUM_MAX_BROKERS> broker_cv_pending_{};
 };
 
 } // namespace Embarcadero

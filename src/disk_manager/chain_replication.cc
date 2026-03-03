@@ -35,9 +35,6 @@ ChainReplicationManager::ChainReplicationManager(
     LOG(INFO) << "ChainReplicationManager: replica_id=" << replica_id
               << " replication_factor=" << replication_factor
               << " disk=" << disk_path;
-
-    broker_cv_state_.fill(kNoProgress);
-    broker_cv_state_initialized_.fill(false);
 }
 
 ChainReplicationManager::~ChainReplicationManager() {
@@ -155,73 +152,28 @@ void ChainReplicationManager::ReplicationThread() {
 }
 
 void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count) {
-    // [[PHASE_2_CV_UPDATER]] Tail replica (ack_level=2) advances CV after replicating batch to disk.
-    // Max semantics: CAS only advances when pbr_index > cur; sequencer (ack_level=1) may have already
-    // advanced the same slot — we never regress. CV[broker_id] = highest contiguous pbr_index.
-
-    uint64_t& cv_state = broker_cv_state_[broker_id];
-    bool& cv_state_initialized = broker_cv_state_initialized_[broker_id];
-    auto& pending = broker_cv_pending_[broker_id];
-
-    auto publish_cv_max = [&](uint64_t index, uint64_t cumulative) {
-        uint64_t cur = cv_[broker_id].completed_pbr_head.load(std::memory_order_acquire);
-        while (cur == kNoProgress || index > cur) {
-            if (cv_[broker_id].completed_pbr_head.compare_exchange_strong(
-                    cur, index, std::memory_order_release)) {
-                break;
-            }
-        }
-        uint64_t cur_logical = cv_[broker_id].completed_logical_offset.load(std::memory_order_acquire);
-        while (cumulative > cur_logical) {
-            if (cv_[broker_id].completed_logical_offset.compare_exchange_strong(
-                    cur_logical, cumulative, std::memory_order_release)) {
-                break;
-            }
-        }
-        CXL::flush_cacheline(&cv_[broker_id]);
-        CXL::store_fence();
-    };
-
-    if (!cv_state_initialized) {
-        // Seed local contiguous tracker from shared CV in case this topic/run
-        // does not start at pbr_index 0.
-        uint64_t seeded = cv_[broker_id].completed_pbr_head.load(std::memory_order_acquire);
-        cv_state = seeded;
-        cv_state_initialized = true;
-    }
-
-    if (cv_state == kNoProgress) {
-        // No known progress yet: first observed replicated pbr defines baseline.
-        publish_cv_max(pbr_index, cumulative_msg_count);
-        cv_state = pbr_index;
-        VLOG(3) << "CV_UPDATER: Broker " << broker_id
-                << " first observed batch, CV=" << pbr_index;
-    } else if (pbr_index <= cv_state) {
-        VLOG(4) << "CV_UPDATER: Broker " << broker_id << " pbr_index=" << pbr_index
-                << " already completed (cv_state=" << cv_state << ")";
-        return;
-    } else if (pbr_index == cv_state + 1) {
-        publish_cv_max(pbr_index, cumulative_msg_count);
-        cv_state = pbr_index;
-        VLOG(3) << "CV_UPDATER: Broker " << broker_id << " CV updated to pbr_index=" << pbr_index;
-    } else {
-        pending[pbr_index] = std::max(pending[pbr_index], cumulative_msg_count);
-        VLOG(4) << "CV_UPDATER: Broker " << broker_id << " gap buffered, pbr_index=" << pbr_index
-                << " cv_state=" << cv_state;
-        return;
-    }
-
-    while (true) {
-        const uint64_t next = cv_state + 1;
-        auto it = pending.find(next);
-        if (it == pending.end()) {
+    // Tail replica owns ACK2 durability frontier.
+    // Use max semantics directly on both fields:
+    // - completed_pbr_head: export/recovery visibility
+    // - completed_logical_offset: durable ACK2 frontier (message count)
+    uint64_t cur = cv_[broker_id].completed_pbr_head.load(std::memory_order_acquire);
+    while (cur == kNoProgress || pbr_index > cur) {
+        if (cv_[broker_id].completed_pbr_head.compare_exchange_strong(
+                cur, pbr_index, std::memory_order_release)) {
             break;
         }
-        publish_cv_max(next, it->second);
-        cv_state = next;
-        pending.erase(it);
-        VLOG(4) << "CV_UPDATER: Broker " << broker_id << " drained buffered pbr_index=" << next;
     }
+
+    uint64_t cur_logical = cv_[broker_id].completed_logical_offset.load(std::memory_order_acquire);
+    while (cumulative_msg_count > cur_logical) {
+        if (cv_[broker_id].completed_logical_offset.compare_exchange_strong(
+                cur_logical, cumulative_msg_count, std::memory_order_release)) {
+            break;
+        }
+    }
+
+    CXL::flush_cacheline(&cv_[broker_id]);
+    CXL::store_fence();
 }
 
 } // namespace Embarcadero
