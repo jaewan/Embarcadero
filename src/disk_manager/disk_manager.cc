@@ -740,7 +740,7 @@ namespace Embarcadero{
 		// a dropped/never-materialized slot (e.g., incomplete/aborted batch). Recover by jumping
 		// to the smallest observed ahead index so replication can continue making progress.
 		constexpr size_t kAheadGapRecoveryThresholdDefault = 4096;
-		constexpr size_t kAheadGapRecoveryThresholdUnified = 512;
+		constexpr size_t kAheadGapRecoveryThresholdUnified = 128;
 		const size_t ahead_gap_recovery_threshold =
 			ShouldUseUnifiedReplicationPath() ? kAheadGapRecoveryThresholdUnified
 			                                  : kAheadGapRecoveryThresholdDefault;
