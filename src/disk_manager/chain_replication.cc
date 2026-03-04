@@ -220,7 +220,9 @@ void ChainReplicationManager::ReplicationThread() {
     std::array<uint64_t, NUM_MAX_BROKERS> token_poll_not_before_ns{};
     // Bound speculative copy-ahead so token/CV progression stays close to data ingest.
     // Large pending windows create heavy token re-poll churn with little throughput benefit.
-    constexpr size_t kMaxPendingTokenUpdates = 512;
+    // Keep a deeper in-flight window so data copy can stay ahead while token ownership catches up.
+    // A shallow window throttles role>0 replicas into token-wait stalls under ORDER=5 ACK2 load.
+    constexpr size_t kMaxPendingTokenUpdates = 8192;
     ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
 
     auto pending_total = [&pending_by_source]() -> size_t {
@@ -459,7 +461,9 @@ void ChainReplicationManager::ReplicationThread() {
                 token_loop_no_progress++;
             }
             if (pending_total() > 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                // Pending work exists but token ownership is not ready yet; short sleep avoids
+                // burning CPU without adding tens-of-microseconds ACK2 jitter.
+                std::this_thread::sleep_for(std::chrono::microseconds(2));
             } else {
                 std::this_thread::yield();
             }

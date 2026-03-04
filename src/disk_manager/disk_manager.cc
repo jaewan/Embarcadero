@@ -799,14 +799,18 @@ namespace Embarcadero{
 				// Simplified design: same slot is the export record
 				actual_batch = current_batch;
 			} else {
-				// Legacy export chain: follow offset to actual batch header
-				// Bounds validation for batch_off_to_export
-				// Must point within the batch ring and be aligned to BatchHeader size
-				if (batch_off_to_export_check >= BATCHHEADERS_SIZE ||
-				    batch_off_to_export_check % sizeof(BatchHeader) != 0) {
+				// Legacy export chain: follow offset to actual batch header.
+				// ORDER=5 may write a wrapped negative delta (stored in unsigned field),
+				// so decode as signed and normalize into ring range.
+				const int64_t export_off = static_cast<int64_t>(batch_off_to_export_check);
+				const bool aligned = (export_off % static_cast<int64_t>(sizeof(BatchHeader))) == 0;
+				const bool in_ring_span = (export_off > -static_cast<int64_t>(BATCHHEADERS_SIZE) &&
+				                           export_off < static_cast<int64_t>(BATCHHEADERS_SIZE));
+				if (!aligned || !in_ring_span) {
 					LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
-						<< "]: Invalid batch_off_to_export=" << batch_off_to_export_check 
-						<< " (must be in [0, " << BATCHHEADERS_SIZE << ") and aligned to " 
+						<< "]: Invalid batch_off_to_export=" << batch_off_to_export_check
+						<< " signed=" << export_off
+						<< " (must map within +/-" << BATCHHEADERS_SIZE << " and align to "
 						<< sizeof(BatchHeader) << " bytes)";
 						// Advance and continue scanning
 						BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
@@ -818,14 +822,22 @@ namespace Embarcadero{
 					continue;
 				}
 				
-				// Compute the actual batch header by following the offset
+				// Compute wrapped target offset in ring.
+				const int64_t ring_size = static_cast<int64_t>(BATCHHEADERS_SIZE);
+				const int64_t cur_off = static_cast<int64_t>(
+					reinterpret_cast<uint8_t*>(current_batch) - reinterpret_cast<uint8_t*>(batch_ring_start));
+				int64_t target_off = (cur_off + export_off) % ring_size;
+				if (target_off < 0) {
+					target_off += ring_size;
+				}
 				actual_batch = reinterpret_cast<BatchHeader*>(
-					reinterpret_cast<uint8_t*>(current_batch) + batch_off_to_export_check);
+					reinterpret_cast<uint8_t*>(batch_ring_start) + target_off);
 				
 				// Verify actual_batch is still within ring bounds
 				if (actual_batch < batch_ring_start || actual_batch >= batch_ring_end) {
 					LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
-						<< "]: Export chain points outside ring (offset=" << batch_off_to_export_check << ")";
+						<< "]: Export chain points outside ring (offset=" << batch_off_to_export_check
+						<< ", signed=" << export_off << ")";
 						// Advance and continue scanning
 						BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
 							reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
