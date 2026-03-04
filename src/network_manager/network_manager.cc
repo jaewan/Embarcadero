@@ -1679,15 +1679,14 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		}
 
 		// Legacy non-ORDER5 replication frontier path.
-		size_t r[replication_factor];
 		for (int i = 0; i < replication_factor; i++) {
 			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
 			volatile uint64_t* rep_done_ptr = &tinode->offsets[b].replication_done[broker_id_];
 			CXL::flush_cacheline(const_cast<const void*>(
 				reinterpret_cast<const volatile void*>(rep_done_ptr)));
 			CXL::full_fence();
-			r[i] = *rep_done_ptr;
-			if (min > r[i]) min = r[i];
+			const size_t val = *rep_done_ptr;
+			if (min > val) min = val;
 		}
 		if (min == std::numeric_limits<size_t>::max()) {
 			return (size_t)-1;
@@ -1734,12 +1733,11 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		// because Sequencer4/5 updates ordered counters per broker
 		// Fallback: Check replication_done for other cases
 		// [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
-		size_t r[replication_factor];
 		for (int i = 0; i < replication_factor; i++) {
 			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
-			r[i] = tinode->offsets[b].replication_done[broker_id_];
-			if (min > r[i]) {
-				min = r[i];
+			const size_t val = tinode->offsets[b].replication_done[broker_id_];
+			if (min > val) {
+				min = val;
 			}
 		}
 		return min;
