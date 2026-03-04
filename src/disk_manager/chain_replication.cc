@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <sstream>
 #include <algorithm>
+#include <mutex>
+#include <condition_variable>
 #include <glog/logging.h>
 #include "../common/performance_utils.h"
 #include "../cxl_manager/cxl_datastructure.h"  // CXL namespace
@@ -218,6 +220,14 @@ void ChainReplicationManager::ReplicationThread() {
     size_t pending_peak = 0;
     std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> pending_by_source;
     std::array<uint64_t, NUM_MAX_BROKERS> token_poll_not_before_ns{};
+    std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> write_queues;
+    std::array<std::mutex, NUM_MAX_BROKERS> write_mu;
+    std::array<std::condition_variable, NUM_MAX_BROKERS> write_cv;
+    std::mutex completed_mu;
+    std::deque<PendingTokenUpdate> completed_writes;
+    std::atomic<size_t> queued_writes{0};
+    std::atomic<bool> write_error{false};
+    std::vector<std::thread> write_workers;
     // Bound speculative copy-ahead so token/CV progression stays close to data ingest.
     // Large pending windows create heavy token re-poll churn with little throughput benefit.
     // Keep a deeper in-flight window so data copy can stay ahead while token ownership catches up.
@@ -231,11 +241,71 @@ void ChainReplicationManager::ReplicationThread() {
         return n;
     };
 
+    auto pending_and_inflight = [&]() -> size_t {
+        return pending_total() + queued_writes.load(std::memory_order_acquire);
+    };
+
+    // Parallel data-copy workers (one queue per source broker) while token/CV stays serialized here.
+    for (int src = 0; src < num_brokers_; ++src) {
+        write_workers.emplace_back([&, src]() {
+            while (true) {
+                PendingTokenUpdate task;
+                {
+                    std::unique_lock<std::mutex> lk(write_mu[src]);
+                    write_cv[src].wait(lk, [&] {
+                        return stop_.load(std::memory_order_acquire) || !write_queues[src].empty();
+                    });
+                    if (write_queues[src].empty()) {
+                        if (stop_.load(std::memory_order_acquire)) {
+                            break;
+                        }
+                        continue;
+                    }
+                    task = std::move(write_queues[src].front());
+                    write_queues[src].pop_front();
+                }
+
+                GOIEntry* entry = &goi_[task.goi_index];
+                const size_t payload_size = static_cast<size_t>(entry->payload_size);
+                const size_t write_size = (payload_size + 4095) & ~4095;
+                const size_t src_idx = static_cast<size_t>(src);
+                const int write_fd = source_disk_fds_[src_idx];
+                const size_t write_off = source_disk_offsets_[src_idx];
+                source_disk_offsets_[src_idx] += write_size;
+                void* payload = reinterpret_cast<uint8_t*>(cxl_addr_) + entry->blog_offset;
+
+                ssize_t written = -1;
+                while (true) {
+                    written = pwrite(write_fd, payload, write_size, write_off);
+                    if (written == static_cast<ssize_t>(write_size)) {
+                        break;
+                    }
+                    if (written < 0 && (errno == EINTR || errno == EAGAIN)) {
+                        continue;
+                    }
+                    LOG(ERROR) << "ChainReplicationManager: pwrite failed, wrote " << written
+                               << " expected " << write_size << " errno=" << errno
+                               << " goi_index=" << task.goi_index
+                               << " source_broker=" << src;
+                    write_error.store(true, std::memory_order_release);
+                    stop_.store(true, std::memory_order_release);
+                    break;
+                }
+
+                if (!write_error.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lk(completed_mu);
+                    completed_writes.push_back(std::move(task));
+                }
+                queued_writes.fetch_sub(1, std::memory_order_release);
+            }
+        });
+    }
+
     while (!stop_.load(std::memory_order_acquire)) {
         bool made_progress = false;
 
         // Stage 1: ingest GOI entries and copy payloads without waiting on token progression.
-        while (pending_total() < kMaxPendingTokenUpdates) {
+        while (pending_and_inflight() < kMaxPendingTokenUpdates) {
             const uint64_t goi_index = next_goi_index_.load(std::memory_order_relaxed);
 
             // Only consume GOI entries that are in the sequencer-committed contiguous prefix.
@@ -323,18 +393,6 @@ void ChainReplicationManager::ReplicationThread() {
                 break;
             }
 
-            void* payload = reinterpret_cast<uint8_t*>(cxl_addr_) + entry->blog_offset;
-            const size_t write_size = (payload_size + 4095) & ~4095;
-            const size_t write_off = source_disk_offsets_[src_idx];
-            const int write_fd = source_disk_fds_[src_idx];
-            const ssize_t written = pwrite(write_fd, payload, write_size, write_off);
-            if (written != static_cast<ssize_t>(write_size)) {
-                LOG(ERROR) << "ChainReplicationManager: pwrite failed, wrote " << written
-                           << " expected " << write_size << " errno=" << errno
-                           << " goi_index=" << goi_index;
-                break;  // Retry this same GOI index on next loop.
-            }
-
             PendingTokenUpdate pending_update;
             pending_update.goi_index = goi_index;
             pending_update.source_broker = static_cast<uint16_t>(source_broker);
@@ -343,13 +401,31 @@ void ChainReplicationManager::ReplicationThread() {
             pending_update.cumulative_msg_count = entry->cumulative_message_count;
             pending_update.role = static_cast<uint16_t>(my_role);
 
-            source_disk_offsets_[src_idx] += write_size;
+            {
+                std::lock_guard<std::mutex> lk(write_mu[source_broker]);
+                write_queues[source_broker].push_back(std::move(pending_update));
+            }
+            write_cv[source_broker].notify_one();
+            queued_writes.fetch_add(1, std::memory_order_release);
             next_goi_index_.fetch_add(1, std::memory_order_relaxed);
+            made_progress = true;
+        }
+
+        // Stage 2a: move completed writes into token-serialization stage.
+        while (true) {
+            PendingTokenUpdate completed;
+            {
+                std::lock_guard<std::mutex> lk(completed_mu);
+                if (completed_writes.empty()) break;
+                completed = std::move(completed_writes.front());
+                completed_writes.pop_front();
+            }
             batches_replicated++;
             made_progress = true;
 
-            // Role-0 owns first token step; do it inline (no queue churn).
-            if (pending_update.role == 0) {
+            GOIEntry* entry = &goi_[completed.goi_index];
+            if (completed.role == 0) {
+                // Role-0 owns first token step.
                 RefreshGOIToken(entry);
                 token_checks++;
                 uint16_t token = static_cast<uint16_t>(entry->num_replicated.load(std::memory_order_acquire));
@@ -364,27 +440,26 @@ void ChainReplicationManager::ReplicationThread() {
                 }
                 if (replication_factor_ == 1 &&
                     token >= static_cast<uint16_t>(replication_factor_)) {
-                    UpdateCompletionVector(pending_update.owner_broker,
-                                           pending_update.pbr_index,
-                                           pending_update.cumulative_msg_count);
+                    UpdateCompletionVector(completed.owner_broker,
+                                           completed.pbr_index,
+                                           completed.cumulative_msg_count);
                 }
-                continue;
-            }
-
-            // Roles >0 must wait for predecessor token; track by source broker and poll only queue head.
-            const int owner = static_cast<int>(pending_update.owner_broker);
-            if (owner < 0 || owner >= NUM_MAX_BROKERS) {
-                entries_invalid_source++;
-                continue;
-            }
-            pending_by_source[owner].push_back(std::move(pending_update));
-            const size_t cur_pending = pending_total();
-            if (cur_pending > pending_peak) {
-                pending_peak = cur_pending;
+            } else {
+                // Roles >0 must wait for predecessor token; track by source broker and poll queue head.
+                const int owner = static_cast<int>(completed.owner_broker);
+                if (owner < 0 || owner >= NUM_MAX_BROKERS) {
+                    entries_invalid_source++;
+                    continue;
+                }
+                pending_by_source[owner].push_back(std::move(completed));
+                const size_t cur_pending = pending_total();
+                if (cur_pending > pending_peak) {
+                    pending_peak = cur_pending;
+                }
             }
         }
 
-        // Stage 2: token progression and ACK2 frontier update.
+        // Stage 2b: token progression and ACK2 frontier update.
         // Poll only queue heads per source; this avoids O(total_pending) repoll churn under wait.
         constexpr uint64_t kWaitPollBackoffNs = 1'000;  // 1us
         const uint64_t now_ns = SteadyNowNs();
@@ -457,10 +532,10 @@ void ChainReplicationManager::ReplicationThread() {
         }
 
         if (!made_progress) {
-            if (pending_total() > 0) {
+            if (pending_total() > 0 || queued_writes.load(std::memory_order_acquire) > 0) {
                 token_loop_no_progress++;
             }
-            if (pending_total() > 0) {
+            if (pending_total() > 0 || queued_writes.load(std::memory_order_acquire) > 0) {
                 // Pending work exists but token ownership is not ready yet; short sleep avoids
                 // burning CPU without adding tens-of-microseconds ACK2 jitter.
                 std::this_thread::sleep_for(std::chrono::microseconds(2));
@@ -468,6 +543,14 @@ void ChainReplicationManager::ReplicationThread() {
                 std::this_thread::yield();
             }
         }
+    }
+
+    stop_.store(true, std::memory_order_release);
+    for (int src = 0; src < num_brokers_; ++src) {
+        write_cv[src].notify_all();
+    }
+    for (auto& t : write_workers) {
+        if (t.joinable()) t.join();
     }
 
     LOG(INFO) << "ChainReplicationManager: Replication thread exiting, replicated "
