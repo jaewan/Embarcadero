@@ -25,7 +25,6 @@ struct PendingTokenUpdate {
     uint64_t pbr_index{0};
     uint64_t cumulative_msg_count{0};
     uint16_t role{0};
-    bool bypass_counted{false};
     bool cv_updated{false};
 };
 
@@ -208,16 +207,9 @@ void ChainReplicationManager::ReplicationThread() {
               << replica_id_ << ")";
 
     uint64_t batches_replicated = 0;
-    uint64_t entries_skipped_not_member = 0;
-    uint64_t entries_token_bypassed = 0;
     uint64_t entries_invalid_source = 0;
     uint64_t entries_suspicious_payload = 0;
     uint64_t last_progress_log_batches = 0;
-    uint64_t token_checks = 0;
-    uint64_t token_waits = 0;
-    uint64_t token_progressions = 0;
-    uint64_t token_loop_no_progress = 0;
-    size_t pending_peak = 0;
     std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> pending_by_source;
     std::array<uint64_t, NUM_MAX_BROKERS> token_poll_not_before_ns{};
     std::array<uint64_t, NUM_MAX_BROKERS> token_wait_backoff_ns{};
@@ -237,7 +229,11 @@ void ChainReplicationManager::ReplicationThread() {
     constexpr size_t kMaxPendingTokenUpdates = 8192;
     constexpr uint64_t kMinWaitPollBackoffNs = 1'000;    // 1us
     constexpr uint64_t kMaxWaitPollBackoffNs = 64'000;   // 64us
+    constexpr uint64_t kControlRefreshIntervalEntries = 256;
     ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
+    uint64_t cached_committed_seq = UINT64_MAX;
+    uint16_t cached_epoch = 0;
+    uint64_t last_control_refresh_goi = 0;
 
     auto pending_total = [&pending_by_source]() -> size_t {
         size_t n = 0;
@@ -249,6 +245,14 @@ void ChainReplicationManager::ReplicationThread() {
         return pending_total() + queued_writes.load(std::memory_order_acquire);
     };
     token_wait_backoff_ns.fill(kMinWaitPollBackoffNs);
+    auto refresh_control_state = [&](uint64_t goi_index) {
+        CXL::flush_cacheline(control_block);
+        CXL::load_fence();
+        cached_committed_seq = control_block->committed_seq.load(std::memory_order_acquire);
+        cached_epoch = static_cast<uint16_t>(
+            control_block->epoch.load(std::memory_order_acquire) & 0xFFFFu);
+        last_control_refresh_goi = goi_index;
+    };
 
     // Parallel data-copy workers (one queue per source broker) while token/CV stays serialized here.
     for (int src = 0; src < num_brokers_; ++src) {
@@ -313,17 +317,16 @@ void ChainReplicationManager::ReplicationThread() {
         while (pending_and_inflight() < kMaxPendingTokenUpdates) {
             const uint64_t goi_index = next_goi_index_.load(std::memory_order_relaxed);
 
+            if (cached_committed_seq == UINT64_MAX ||
+                goi_index > cached_committed_seq ||
+                goi_index - last_control_refresh_goi >= kControlRefreshIntervalEntries) {
+                refresh_control_state(goi_index);
+            }
             // Only consume GOI entries that are in the sequencer-committed contiguous prefix.
-            // This avoids misclassifying zero-initialized/stale slots (e.g., GOI[0].global_seq==0)
-            // as published entries before the current run commits them.
-            CXL::flush_cacheline(control_block);
-            CXL::load_fence();
-            const uint64_t committed_seq = control_block->committed_seq.load(std::memory_order_acquire);
-            if (committed_seq == UINT64_MAX || goi_index > committed_seq) {
+            if (cached_committed_seq == UINT64_MAX || goi_index > cached_committed_seq) {
                 break;
             }
-            const uint16_t current_epoch = static_cast<uint16_t>(
-                control_block->epoch.load(std::memory_order_acquire) & 0xFFFFu);
+            const uint16_t current_epoch = cached_epoch;
 
             GOIEntry* entry = &goi_[goi_index];
             RefreshGOIEntry(entry);
@@ -338,7 +341,7 @@ void ChainReplicationManager::ReplicationThread() {
                     if (entries_invalid_source <= 8 || (entries_invalid_source % 1024) == 0) {
                         LOG(WARNING) << "ChainReplicationManager: skipping stale GOI entry with global_seq mismatch"
                                      << " goi_index=" << goi_index
-                                     << " committed_seq=" << committed_seq
+                                     << " committed_seq=" << cached_committed_seq
                                      << " observed_global_seq=" << entry->global_seq
                                      << " entry_epoch=" << entry->epoch_sequenced
                                      << " current_epoch=" << current_epoch;
@@ -364,7 +367,7 @@ void ChainReplicationManager::ReplicationThread() {
                                      << " payload_size=" << payload_size
                                      << " message_count=" << message_count
                                      << " global_seq=" << entry->global_seq
-                                     << " committed_seq=" << committed_seq
+                                     << " committed_seq=" << cached_committed_seq
                                      << " entry_epoch=" << entry->epoch_sequenced
                                      << " current_epoch=" << current_epoch;
                     }
@@ -385,7 +388,6 @@ void ChainReplicationManager::ReplicationThread() {
             }
 
             if (my_role < 0) {
-                entries_skipped_not_member++;
                 next_goi_index_.fetch_add(1, std::memory_order_relaxed);
                 made_progress = true;
                 continue;
@@ -432,16 +434,12 @@ void ChainReplicationManager::ReplicationThread() {
             if (completed.role == 0) {
                 // Role-0 owns first token step.
                 RefreshGOIToken(entry);
-                token_checks++;
                 uint16_t token = static_cast<uint16_t>(entry->num_replicated.load(std::memory_order_acquire));
                 if (token == 0) {
                     entry->num_replicated.store(static_cast<uint16_t>(1), std::memory_order_release);
                     CXL::flush_cacheline(entry);
                     CXL::store_fence();
                     token = 1;
-                    token_progressions++;
-                } else if (token > 0) {
-                    entries_token_bypassed++;
                 }
                 if (replication_factor_ == 1 &&
                     token >= static_cast<uint16_t>(replication_factor_)) {
@@ -457,10 +455,6 @@ void ChainReplicationManager::ReplicationThread() {
                     continue;
                 }
                 pending_by_source[owner].push_back(std::move(completed));
-                const size_t cur_pending = pending_total();
-                if (cur_pending > pending_peak) {
-                    pending_peak = cur_pending;
-                }
             }
         }
 
@@ -479,11 +473,9 @@ void ChainReplicationManager::ReplicationThread() {
                 PendingTokenUpdate& h = q.front();
                 GOIEntry* entry = &goi_[h.goi_index];
                 RefreshGOIToken(entry);
-                token_checks++;
 
                 uint16_t token = static_cast<uint16_t>(entry->num_replicated.load(std::memory_order_acquire));
                 if (token < h.role) {
-                    token_waits++;
                     const uint64_t backoff = token_wait_backoff_ns[src];
                     token_poll_not_before_ns[src] = now_ns + backoff;
                     token_wait_backoff_ns[src] = std::min(backoff << 1, kMaxWaitPollBackoffNs);
@@ -496,11 +488,7 @@ void ChainReplicationManager::ReplicationThread() {
                     CXL::flush_cacheline(entry);
                     CXL::store_fence();
                     token = static_cast<uint16_t>(h.role + 1);
-                    token_progressions++;
                     made_progress = true;
-                } else if (!h.bypass_counted) {
-                    entries_token_bypassed++;
-                    h.bypass_counted = true;
                 }
 
                 if (h.role == static_cast<uint16_t>(replication_factor_ - 1) &&
@@ -536,22 +524,12 @@ void ChainReplicationManager::ReplicationThread() {
                       << " replicated " << batches_replicated
                       << " batches"
                       << " pending=" << pending_total()
-                      << " pending_peak=" << pending_peak
-                      << " skipped_not_member=" << entries_skipped_not_member
-                      << " token_bypassed=" << entries_token_bypassed
-                      << " token_checks=" << token_checks
-                      << " token_waits=" << token_waits
-                      << " token_progressions=" << token_progressions
-                      << " token_idle_loops=" << token_loop_no_progress
                       << " invalid_source=" << entries_invalid_source
                       << " suspicious_payload=" << entries_suspicious_payload;
             last_progress_log_batches = batches_replicated;
         }
 
         if (!made_progress) {
-            if (pending_total() > 0 || queued_writes.load(std::memory_order_acquire) > 0) {
-                token_loop_no_progress++;
-            }
             if (pending_total() > 0 || queued_writes.load(std::memory_order_acquire) > 0) {
                 // Pending work exists but token ownership is not ready yet; short sleep avoids
                 // burning CPU without adding tens-of-microseconds ACK2 jitter.
