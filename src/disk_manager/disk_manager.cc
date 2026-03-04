@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <iostream>
 #include <chrono>
+#include <limits>
 
 #include "mimalloc.h"
 
@@ -724,15 +725,30 @@ namespace Embarcadero{
 		static thread_local size_t scan_iterations = 0;
 		static thread_local size_t ordered_hits = 0;
 		static thread_local size_t ordered_misses = 0;
+		static thread_local size_t batch_ready_invalid = 0;
+		static thread_local size_t pbr_match_hits = 0;
+		static thread_local size_t pbr_stale_hits = 0;
+		static thread_local size_t pbr_ahead_hits = 0;
+		static thread_local uint64_t pbr_gap_candidate_expected = std::numeric_limits<uint64_t>::max();
+		static thread_local size_t pbr_gap_ahead_observations = 0;
+		static thread_local uint64_t pbr_gap_min_ahead = std::numeric_limits<uint64_t>::max();
 		static thread_local size_t consecutive_not_ordered = 0;
 		static thread_local auto last_diagnostic_log = std::chrono::steady_clock::now();
 		constexpr auto kDiagnosticLogInterval = std::chrono::seconds(5);
 		constexpr size_t kInvalidationThreshold = 1000;  // Invalidate after 1000 consecutive misses
+		// If we repeatedly observe only "ahead" PBRs, the expected index likely corresponds to
+		// a dropped/never-materialized slot (e.g., incomplete/aborted batch). Recover by jumping
+		// to the smallest observed ahead index so replication can continue making progress.
+		constexpr size_t kAheadGapRecoveryThresholdDefault = 4096;
+		constexpr size_t kAheadGapRecoveryThresholdUnified = 512;
+		const size_t ahead_gap_recovery_threshold =
+			ShouldUseUnifiedReplicationPath() ? kAheadGapRecoveryThresholdUnified
+			                                  : kAheadGapRecoveryThresholdDefault;
 		
 		for (size_t i = 0; i < MAX_SCAN_ATTEMPTS; ++i) {
 			// [[OBSERVABILITY]] - Track batches scanned (increment on each iteration)
-			replication_metrics_[broker_id].batches_scanned.fetch_add(1, std::memory_order_relaxed);
-			scan_iterations++;
+				replication_metrics_[broker_id].batches_scanned.fetch_add(1, std::memory_order_relaxed);
+				scan_iterations++;
 			
 			// [[PHASE_1_FIX_READER_INVALIDATION]] - Periodic cache invalidation for non-coherent CXL
 			// On real non-coherent CXL, readers must invalidate their local cache to observe remote writes
@@ -765,15 +781,20 @@ namespace Embarcadero{
 				consecutive_not_ordered++;
 				// [[PHASE_0_INSTRUMENTATION]] - Periodic diagnostic logging
 				auto now = std::chrono::steady_clock::now();
-				if (now - last_diagnostic_log >= kDiagnosticLogInterval) {
-					LOG(INFO) << "[GetNextReplicationBatch B" << broker_id << "]: Scan stats: "
-							<< "iterations=" << scan_iterations << ", ordered_hits=" << ordered_hits
-							<< ", ordered_misses=" << ordered_misses << ", ring_offset=" << ring_offset
-							<< ", current_ordered=" << ordered_check
-							<< ", current_batch_complete=" << batch_complete_check
-							<< ", consecutive_not_ordered=" << consecutive_not_ordered;
-					last_diagnostic_log = now;
-				}
+					if (now - last_diagnostic_log >= kDiagnosticLogInterval) {
+						LOG(INFO) << "[GetNextReplicationBatch B" << broker_id << "]: Scan stats: "
+								<< "iterations=" << scan_iterations << ", ordered_hits=" << ordered_hits
+								<< ", ordered_misses=" << ordered_misses << ", ring_offset=" << ring_offset
+								<< ", current_ordered=" << ordered_check
+								<< ", current_batch_complete=" << batch_complete_check
+								<< ", consecutive_not_ordered=" << consecutive_not_ordered
+								<< ", batch_ready_invalid=" << batch_ready_invalid
+								<< ", pbr_match_hits=" << pbr_match_hits
+								<< ", pbr_stale_hits=" << pbr_stale_hits
+								<< ", pbr_ahead_hits=" << pbr_ahead_hits
+								<< ", next_expected_pbr=" << next_expected_pbr_index;
+						last_diagnostic_log = now;
+					}
 					// Current slot not yet ordered, advance and try next
 					BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
 						reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
@@ -873,8 +894,14 @@ namespace Embarcadero{
 			                   log_idx_check > 0 && 
 			                   num_msg_check <= MAX_REASONABLE_NUM_MSG &&
 			                   payload_in_bounds);
-			
+			if (!batch_ready) {
+				batch_ready_invalid++;
+			}
 			if (batch_ready && pbr_absolute_index_check == next_expected_pbr_index) {
+				pbr_match_hits++;
+				pbr_gap_candidate_expected = std::numeric_limits<uint64_t>::max();
+				pbr_gap_ahead_observations = 0;
+				pbr_gap_min_ahead = std::numeric_limits<uint64_t>::max();
 				// Batch is valid; use data from actual_batch
 				batch_payload = reinterpret_cast<uint8_t*>(cxl_addr_) + log_idx_check;
 				batch_payload_size = total_size_check;
@@ -900,6 +927,7 @@ namespace Embarcadero{
 			}
 
 			if (batch_ready && pbr_absolute_index_check < next_expected_pbr_index) {
+				pbr_stale_hits++;
 				// Duplicate/stale slot. Advance cursor and continue scanning.
 				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
 					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
@@ -908,6 +936,31 @@ namespace Embarcadero{
 				}
 				current_batch = next_batch;
 				continue;
+			}
+			if (batch_ready && pbr_absolute_index_check > next_expected_pbr_index) {
+				pbr_ahead_hits++;
+				if (pbr_gap_candidate_expected != next_expected_pbr_index) {
+					pbr_gap_candidate_expected = next_expected_pbr_index;
+					pbr_gap_ahead_observations = 0;
+					pbr_gap_min_ahead = std::numeric_limits<uint64_t>::max();
+				}
+				pbr_gap_ahead_observations++;
+				if (pbr_absolute_index_check < pbr_gap_min_ahead) {
+					pbr_gap_min_ahead = pbr_absolute_index_check;
+				}
+				if (pbr_gap_ahead_observations >= ahead_gap_recovery_threshold &&
+				    pbr_gap_min_ahead != std::numeric_limits<uint64_t>::max()) {
+					LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id
+					             << "]: recovering from persistent PBR gap, expected="
+					             << next_expected_pbr_index
+					             << " min_observed_ahead=" << pbr_gap_min_ahead
+					             << " ahead_observations=" << pbr_gap_ahead_observations
+					             << " threshold=" << ahead_gap_recovery_threshold;
+					next_expected_pbr_index = pbr_gap_min_ahead;
+					pbr_gap_candidate_expected = std::numeric_limits<uint64_t>::max();
+					pbr_gap_ahead_observations = 0;
+					pbr_gap_min_ahead = std::numeric_limits<uint64_t>::max();
+				}
 			}
 			
 				// Actual batch not ready yet, advance slot and try next
