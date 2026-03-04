@@ -221,6 +221,7 @@ void ChainReplicationManager::ReplicationThread() {
     std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> pending_by_source;
     std::array<uint64_t, NUM_MAX_BROKERS> token_poll_not_before_ns{};
     std::array<uint64_t, NUM_MAX_BROKERS> token_wait_backoff_ns{};
+    int token_scan_start_src = 0;
     std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> write_queues;
     std::array<std::mutex, NUM_MAX_BROKERS> write_mu;
     std::array<std::condition_variable, NUM_MAX_BROKERS> write_cv;
@@ -466,11 +467,14 @@ void ChainReplicationManager::ReplicationThread() {
         // Stage 2b: token progression and ACK2 frontier update.
         // Poll only queue heads per source; this avoids O(total_pending) repoll churn under wait.
         const uint64_t now_ns = SteadyNowNs();
-        for (int src = 0; src < NUM_MAX_BROKERS; ++src) {
+        constexpr int kMaxPerSourceTokenOpsPerPass = 32;
+        for (int i = 0; i < num_brokers_; ++i) {
+            const int src = (token_scan_start_src + i) % num_brokers_;
             if (token_poll_not_before_ns[src] != 0 && now_ns < token_poll_not_before_ns[src]) {
                 continue;
             }
             auto& q = pending_by_source[src];
+            int ops_this_src = 0;
             while (!q.empty()) {
                 PendingTokenUpdate& h = q.front();
                 GOIEntry* entry = &goi_[h.goi_index];
@@ -512,10 +516,17 @@ void ChainReplicationManager::ReplicationThread() {
                     (h.role != static_cast<uint16_t>(replication_factor_ - 1)) || h.cv_updated;
                 if (token_stage_done && tail_cv_done) {
                     q.pop_front();
+                    ops_this_src++;
+                    if (ops_this_src >= kMaxPerSourceTokenOpsPerPass) {
+                        break;
+                    }
                     continue;
                 }
                 break;
             }
+        }
+        if (num_brokers_ > 0) {
+            token_scan_start_src = (token_scan_start_src + 1) % num_brokers_;
         }
 
         // Periodic logging
