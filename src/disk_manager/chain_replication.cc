@@ -214,6 +214,7 @@ void ChainReplicationManager::ReplicationThread() {
     std::array<uint64_t, NUM_MAX_BROKERS> token_poll_not_before_ns{};
     std::array<uint64_t, NUM_MAX_BROKERS> token_wait_backoff_ns{};
     int token_scan_start_src = 0;
+    std::vector<int8_t> source_role_map;
     std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> write_queues;
     std::array<std::mutex, NUM_MAX_BROKERS> write_mu;
     std::array<std::condition_variable, NUM_MAX_BROKERS> write_cv;
@@ -245,6 +246,19 @@ void ChainReplicationManager::ReplicationThread() {
         return pending_total() + queued_writes.load(std::memory_order_acquire);
     };
     token_wait_backoff_ns.fill(kMinWaitPollBackoffNs);
+    source_role_map.assign(static_cast<size_t>(std::max(0, num_brokers_)), static_cast<int8_t>(-1));
+    for (int src = 0; src < num_brokers_; ++src) {
+        int8_t role = -1;
+        for (int i = 0; i < replication_factor_; ++i) {
+            const int replica_broker = Embarcadero::GetReplicationSetBroker(
+                src, replication_factor_, num_brokers_, i);
+            if (replica_broker == local_broker_id_) {
+                role = static_cast<int8_t>(i);
+                break;
+            }
+        }
+        source_role_map[static_cast<size_t>(src)] = role;
+    }
     auto refresh_control_state = [&](uint64_t goi_index) {
         CXL::flush_cacheline(control_block);
         CXL::load_fence();
@@ -377,15 +391,10 @@ void ChainReplicationManager::ReplicationThread() {
                 break;
             }
 
-            int my_role = -1;
-            for (int i = 0; i < replication_factor_; ++i) {
-                const int replica_broker = Embarcadero::GetReplicationSetBroker(
-                    source_broker, replication_factor_, num_brokers_, i);
-                if (replica_broker == local_broker_id_) {
-                    my_role = i;
-                    break;
-                }
-            }
+            const int my_role = (source_broker >= 0 &&
+                                 source_broker < static_cast<int>(source_role_map.size()))
+                                    ? static_cast<int>(source_role_map[static_cast<size_t>(source_broker)])
+                                    : -1;
 
             if (my_role < 0) {
                 next_goi_index_.fetch_add(1, std::memory_order_relaxed);
