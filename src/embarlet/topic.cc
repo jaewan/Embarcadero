@@ -43,11 +43,20 @@ static inline uint64_t MakeClientBrokerStreamKey(size_t client_id, int broker_id
 	       static_cast<uint16_t>(broker_id & 0xFFFF);
 }
 
-static uint64_t GetOrder5HoldTimeoutNs() {
-	constexpr uint64_t kDefaultNs = 100ULL * 1000 * 1000;  // 100ms default
-	static const uint64_t timeout_ns =
-		ReadEnvPositiveMsToNs("EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS", kDefaultNs);
-	return timeout_ns;
+static uint64_t GetOrder5HoldTimeoutNs(bool replicated_ack2_mode) {
+	if (const char* env = std::getenv("EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS")) {
+		char* end = nullptr;
+		unsigned long parsed = std::strtoul(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0) {
+			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
+		}
+		LOG(WARNING) << "Ignoring invalid EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS='" << env
+		             << "'; using runtime default";
+	}
+	// ACK=2 with replication can legitimately queue longer in hold while durability frontier advances.
+	// 100ms is too aggressive and causes avoidable forced expiry/reordering under load.
+	const uint64_t default_ms = replicated_ack2_mode ? 2000ULL : 100ULL;
+	return default_ms * 1000ULL * 1000ULL;
 }
 
 Topic::Topic(
@@ -2938,12 +2947,6 @@ void Topic::CommitEpoch(
 	// Sorting is done in main loop and drain loop to preserve consumed_through contiguity.
 	// [PHASE-4] Accumulate per-broker tinode updates
 	// Replace hash maps with arrays for better performance
-	uint64_t epoch_timestamp_ns = 0;
-	if (replication_factor_ > 0) {
-		epoch_timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-			std::chrono::steady_clock::now().time_since_epoch()).count();
-	}
-
 	// [PHASE-7] Single-pass commit: hold lock for entire epoch; export chain inline with GOI/CV/tinode.
 	absl::MutexLock header_lock(&export_cursor_mu_);
 
@@ -2970,39 +2973,41 @@ void Topic::CommitEpoch(
 		uint64_t batch_index = base_batch_index_order5 + goi_idx_order5++;
 		GOIEntry* entry = &goi[batch_index];
 
-		if (p.from_hold) {
-			const HoldBatchMetadata& m = p.hold_meta;
-			entry->global_seq = batch_index;
-			entry->total_order = next_order;
-			entry->batch_id = m.batch_id;
-			entry->broker_id = static_cast<uint16_t>(m.broker_id);
+			if (p.from_hold) {
+				const HoldBatchMetadata& m = p.hold_meta;
+				entry->total_order = next_order;
+				entry->batch_id = m.batch_id;
+				entry->broker_id = static_cast<uint16_t>(m.broker_id);
 			entry->epoch_sequenced = m.epoch_created;
 			entry->blog_offset = m.log_idx;
 			entry->payload_size = static_cast<uint32_t>(m.total_size);
 			entry->message_count = static_cast<uint32_t>(m.num_msg);
 			entry->num_replicated.store(0, std::memory_order_release);
-			entry->client_id = m.client_id;
-			entry->client_seq = m.batch_seq;
-			entry->pbr_index = m.pbr_absolute_index;
-			entry->cumulative_message_count = m.start_logical_offset + m.num_msg;
-			next_order += m.num_msg;
-		} else if (p.hdr != nullptr) {
-			p.hdr->total_order = next_order;
-			entry->global_seq = batch_index;
-			entry->total_order = next_order;
-			entry->batch_id = p.cached_batch_id;
+				entry->client_id = m.client_id;
+				entry->client_seq = m.batch_seq;
+				entry->pbr_index = m.pbr_absolute_index;
+				entry->cumulative_message_count = m.start_logical_offset + m.num_msg;
+				// Publish GOI index last so readers never treat a partially-written entry as valid.
+				entry->global_seq = batch_index;
+				next_order += m.num_msg;
+			} else if (p.hdr != nullptr) {
+				p.hdr->total_order = next_order;
+				entry->total_order = next_order;
+				entry->batch_id = p.cached_batch_id;
 			entry->broker_id = static_cast<uint16_t>(p.broker_id);
 			entry->epoch_sequenced = p.epoch_created;
 			entry->blog_offset = p.cached_log_idx;
 			entry->payload_size = static_cast<uint32_t>(p.cached_total_size);
 			entry->message_count = static_cast<uint32_t>(p.num_msg);
 			entry->num_replicated.store(0, std::memory_order_release);
-			entry->client_id = p.client_id;
-			entry->client_seq = p.hdr->batch_seq;
-			entry->pbr_index = p.cached_pbr_absolute_index;
-			entry->cumulative_message_count = p.cached_start_logical_offset + p.num_msg;
-			next_order += p.num_msg;
-		}
+				entry->client_id = p.client_id;
+				entry->client_seq = p.hdr->batch_seq;
+				entry->pbr_index = p.cached_pbr_absolute_index;
+				entry->cumulative_message_count = p.cached_start_logical_offset + p.num_msg;
+				// Publish GOI index last so readers never treat a partially-written entry as valid.
+				entry->global_seq = batch_index;
+				next_order += p.num_msg;
+			}
 		CXL::flush_cacheline(entry);
 		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);
 	}
@@ -3044,12 +3049,12 @@ void Topic::CommitEpoch(
 
 		if (p.from_hold) {
 			const HoldBatchMetadata& m = p.hold_meta;
-			AccumulateCVUpdate(static_cast<uint16_t>(m.broker_id), m.pbr_absolute_index, m.start_logical_offset + m.num_msg, cv_max_cumulative, cv_max_pbr_index);
-			if (replication_factor_ > 0) {
-				size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
-				goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
-				goi_timestamps_[ring_pos].timestamp_ns.store(epoch_timestamp_ns, std::memory_order_release);
-			}
+				AccumulateCVUpdate(static_cast<uint16_t>(m.broker_id), m.pbr_absolute_index, m.start_logical_offset + m.num_msg, cv_max_cumulative, cv_max_pbr_index);
+				if (replication_factor_ > 0) {
+					size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
+					goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
+					goi_timestamps_[ring_pos].timestamp_ns.store(SteadyNowNs(), std::memory_order_release);
+				}
 			int b = m.broker_id;
 			ordered_increment[b] += m.num_msg;
 			last_ordered_offset[b] = m.log_idx;
@@ -3070,12 +3075,12 @@ void Topic::CommitEpoch(
 			if (m.broker_id >= 0 && m.broker_id < static_cast<int>(committed_this_epoch.size()))
 				committed_this_epoch[m.broker_id]++;
 		} else {
-			AccumulateCVUpdate(static_cast<uint16_t>(p.broker_id), p.cached_pbr_absolute_index, p.cached_start_logical_offset + p.num_msg, cv_max_cumulative, cv_max_pbr_index);
-			if (replication_factor_ > 0) {
-				size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
-				goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
-				goi_timestamps_[ring_pos].timestamp_ns.store(epoch_timestamp_ns, std::memory_order_release);
-			}
+				AccumulateCVUpdate(static_cast<uint16_t>(p.broker_id), p.cached_pbr_absolute_index, p.cached_start_logical_offset + p.num_msg, cv_max_cumulative, cv_max_pbr_index);
+				if (replication_factor_ > 0) {
+					size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
+					goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
+					goi_timestamps_[ring_pos].timestamp_ns.store(SteadyNowNs(), std::memory_order_release);
+				}
 			next_order += p.num_msg;
 			int b = p.broker_id;
 			ordered_increment[b] += p.num_msg;
@@ -3968,7 +3973,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		const size_t min_seq = front_it->first;
 		const auto& front = front_it->second;
 		if (force_expire_hold_on_next_process_.load(std::memory_order_acquire) ||
-		    now_ns - front.hold_start_ns >= GetOrder5HoldTimeoutNs()) {
+		    now_ns - front.hold_start_ns >= GetOrder5HoldTimeoutNs(ack_level_ == 2 && replication_factor_ > 0)) {
 			shard.expired_hold_keys_buffer.emplace_back(cid, min_seq);
 		}
 	}

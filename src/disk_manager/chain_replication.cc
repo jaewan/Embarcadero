@@ -1,7 +1,9 @@
 #include "chain_replication.h"
 #include <fcntl.h>
 #include <unistd.h>
+#include <chrono>
 #include <cstring>
+#include <deque>
 #include <glog/logging.h>
 #include "../common/performance_utils.h"
 #include "../cxl_manager/cxl_datastructure.h"  // CXL namespace
@@ -9,17 +11,38 @@
 namespace Embarcadero {
 namespace {
 constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
+
+struct PendingTokenUpdate {
+    uint64_t goi_index{0};
+    uint16_t source_broker{0};
+    uint16_t owner_broker{0};
+    uint64_t pbr_index{0};
+    uint64_t cumulative_msg_count{0};
+    uint16_t role{0};
+    bool bypass_counted{false};
+    bool cv_updated{false};
+};
+
+inline void RefreshGOIEntry(GOIEntry* entry) {
+    CXL::flush_cacheline(entry);
+    CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);
+    CXL::load_fence();
+}
 }
 
 ChainReplicationManager::ChainReplicationManager(
     int replica_id,
     int replication_factor,
+    int local_broker_id,
+    int num_brokers,
     void* cxl_addr,
     GOIEntry* goi,
     CompletionVectorEntry* cv,
     const std::string& disk_path)
     : replica_id_(replica_id)
     , replication_factor_(replication_factor)
+    , local_broker_id_(local_broker_id)
+    , num_brokers_(num_brokers)
     , cxl_addr_(cxl_addr)
     , goi_(goi)
     , cv_(cv)
@@ -33,6 +56,8 @@ ChainReplicationManager::ChainReplicationManager(
     }
 
     LOG(INFO) << "ChainReplicationManager: replica_id=" << replica_id
+              << " local_broker_id=" << local_broker_id
+              << " num_brokers=" << num_brokers
               << " replication_factor=" << replication_factor
               << " disk=" << disk_path;
 }
@@ -67,88 +92,148 @@ void ChainReplicationManager::ReplicationThread() {
               << replica_id_ << ")";
 
     uint64_t batches_replicated = 0;
+    uint64_t entries_skipped_not_member = 0;
+    uint64_t entries_token_bypassed = 0;
+    uint64_t entries_invalid_source = 0;
+    uint64_t entries_suspicious_payload = 0;
     size_t disk_offset = 0;
+    std::deque<PendingTokenUpdate> pending;
+    constexpr size_t kMaxPendingTokenUpdates = 4096;
 
     while (!stop_.load(std::memory_order_acquire)) {
-        uint64_t goi_index = next_goi_index_.load(std::memory_order_relaxed);
-        GOIEntry* entry = &goi_[goi_index];
+        bool made_progress = false;
 
-        // [[CRITICAL_FIX: Invalidate cache before reading GOI entry]]
-        // Sequencer (head broker) writes GOI; replication thread must invalidate to see updates.
-        // Without this, replication thread may never see entry->global_seq and spin forever.
-        CXL::flush_cacheline(entry);
-        CXL::load_fence();
+        // Stage 1: ingest GOI entries and copy payloads without waiting on token progression.
+        while (pending.size() < kMaxPendingTokenUpdates) {
+            const uint64_t goi_index = next_goi_index_.load(std::memory_order_relaxed);
+            GOIEntry* entry = &goi_[goi_index];
+            RefreshGOIEntry(entry);
 
-        // Check if sequencer has written this entry (global_seq == goi_index means valid)
-        if (entry->global_seq != goi_index) {
-            // Entry not yet written by sequencer, yield
-            std::this_thread::yield();
-            continue;
-        }
-
-        // [[PHASE_2_CHAIN_PROTOCOL]] Step 1: Copy data in PARALLEL (all replicas do this)
-        // Calculate BLog payload address
-        void* payload = reinterpret_cast<uint8_t*>(cxl_addr_) + entry->blog_offset;
-        size_t payload_size = entry->payload_size;
-
-        // Write to local disk
-        // [[FIX: O_DIRECT Alignment]] Write aligned size to match allocation padding and satisfy O_DIRECT.
-        // We write the payload + padding (garbage) to keep disk_offset aligned.
-        size_t write_size = (payload_size + 4095) & ~4095;
-        ssize_t written = pwrite(disk_fd_, payload, write_size, disk_offset);
-        if (written != static_cast<ssize_t>(write_size)) {
-            LOG(ERROR) << "ChainReplicationManager: pwrite failed, wrote " << written
-                       << " expected " << write_size << " errno=" << errno;
-            continue;  // Retry same entry
-        }
-
-        // Ensure data is durable (fsync for reliability, can batch later for performance)
-        fsync(disk_fd_);
-
-        VLOG(3) << "ChainReplicationManager: Replica " << replica_id_
-                << " copied GOI[" << goi_index << "] broker=" << entry->broker_id
-                << " size=" << payload_size << " (aligned=" << write_size << ") to disk_offset=" << disk_offset;
-
-        disk_offset += write_size;
-
-        // [[PHASE_2_CHAIN_PROTOCOL]] Step 2: Token-passing via num_replicated
-        // Wait for my turn (previous replica must increment first)
-        while (entry->num_replicated.load(std::memory_order_acquire) != static_cast<uint16_t>(replica_id_)) {
-            if (stop_.load(std::memory_order_acquire)) {
-                return;  // Exit if stopping
+            // global_seq is written last by sequencer; mismatch means entry is not ready yet.
+            if (entry->global_seq != goi_index) {
+                break;
             }
-            std::this_thread::yield();
+
+            const int source_broker = static_cast<int>(entry->broker_id);
+            const size_t payload_size = entry->payload_size;
+            const uint32_t message_count = entry->message_count;
+            if (source_broker < 0 || source_broker >= num_brokers_ ||
+                payload_size == 0 || message_count == 0) {
+                entries_suspicious_payload++;
+                if (entries_suspicious_payload <= 8 || (entries_suspicious_payload % 1024) == 0) {
+                    LOG(WARNING) << "ChainReplicationManager: GOI entry not ready or invalid metadata"
+                                 << " goi_index=" << goi_index
+                                 << " source_broker=" << source_broker
+                                 << " num_brokers=" << num_brokers_
+                                 << " payload_size=" << payload_size
+                                 << " message_count=" << message_count
+                                 << " global_seq=" << entry->global_seq;
+                }
+                break;
+            }
+
+            int my_role = -1;
+            for (int i = 0; i < replication_factor_; ++i) {
+                const int replica_broker = Embarcadero::GetReplicationSetBroker(
+                    source_broker, replication_factor_, num_brokers_, i);
+                if (replica_broker == local_broker_id_) {
+                    my_role = i;
+                    break;
+                }
+            }
+
+            if (my_role < 0) {
+                entries_skipped_not_member++;
+                next_goi_index_.fetch_add(1, std::memory_order_relaxed);
+                made_progress = true;
+                continue;
+            }
+
+            void* payload = reinterpret_cast<uint8_t*>(cxl_addr_) + entry->blog_offset;
+            const size_t write_size = (payload_size + 4095) & ~4095;
+            const ssize_t written = pwrite(disk_fd_, payload, write_size, disk_offset);
+            if (written != static_cast<ssize_t>(write_size)) {
+                LOG(ERROR) << "ChainReplicationManager: pwrite failed, wrote " << written
+                           << " expected " << write_size << " errno=" << errno
+                           << " goi_index=" << goi_index;
+                break;  // Retry this same GOI index on next loop.
+            }
+
+            PendingTokenUpdate pending_update;
+            pending_update.goi_index = goi_index;
+            pending_update.source_broker = static_cast<uint16_t>(source_broker);
+            pending_update.owner_broker = entry->broker_id;
+            pending_update.pbr_index = entry->pbr_index;
+            pending_update.cumulative_msg_count = entry->cumulative_message_count;
+            pending_update.role = static_cast<uint16_t>(my_role);
+            pending.push_back(pending_update);
+
+            disk_offset += write_size;
+            next_goi_index_.fetch_add(1, std::memory_order_relaxed);
+            batches_replicated++;
+            made_progress = true;
         }
 
-        // My turn - increment token to pass to next replica
-        entry->num_replicated.store(static_cast<uint16_t>(replica_id_ + 1), std::memory_order_release);
-        CXL::flush_cacheline(entry);
-        CXL::store_fence();
+        // Stage 2: token progression and ACK2 frontier update.
+        for (auto it = pending.begin(); it != pending.end();) {
+            GOIEntry* entry = &goi_[it->goi_index];
+            RefreshGOIEntry(entry);
 
-        VLOG(3) << "ChainReplicationManager: Replica " << replica_id_
-                << " incremented num_replicated to " << (replica_id_ + 1)
-                << " for GOI[" << goi_index << "]";
+            uint16_t token = static_cast<uint16_t>(entry->num_replicated.load(std::memory_order_acquire));
 
-        // [[PHASE_2_CV_UPDATER]] ack_level=2: Tail replica advances CompletionVector after replication.
-        // Sequencer (ack_level=1) may also advance the same CV slot; both use max semantics (CAS only
-        // advances). See docs/COMPLETION_VECTOR_ACK_LEVELS.md and cxl_datastructure.h CompletionVectorEntry.
-        if (replica_id_ == replication_factor_ - 1) {  // I'm the tail
-            UpdateCompletionVector(entry->broker_id, entry->pbr_index, entry->cumulative_message_count);
+            if (token == it->role) {
+                entry->num_replicated.store(static_cast<uint16_t>(it->role + 1), std::memory_order_release);
+                CXL::flush_cacheline(entry);
+                CXL::store_fence();
+                token = static_cast<uint16_t>(it->role + 1);
+                made_progress = true;
+            } else if (token > it->role && !it->bypass_counted) {
+                entries_token_bypassed++;
+                it->bypass_counted = true;
+            }
+
+            if (it->role == static_cast<uint16_t>(replication_factor_ - 1) &&
+                token >= static_cast<uint16_t>(replication_factor_) &&
+                !it->cv_updated) {
+                UpdateCompletionVector(it->owner_broker, it->pbr_index, it->cumulative_msg_count);
+                it->cv_updated = true;
+                made_progress = true;
+            }
+
+            const bool token_stage_done = token >= static_cast<uint16_t>(it->role + 1);
+            const bool tail_cv_done = (it->role != static_cast<uint16_t>(replication_factor_ - 1)) || it->cv_updated;
+            if (token_stage_done && tail_cv_done) {
+                it = pending.erase(it);
+                continue;
+            }
+
+            ++it;
         }
-
-        // Advance to next GOI entry
-        next_goi_index_.fetch_add(1, std::memory_order_relaxed);
-        batches_replicated++;
 
         // Periodic logging
         if (batches_replicated % 1000 == 0) {
             LOG(INFO) << "ChainReplicationManager: Replica " << replica_id_
-                      << " replicated " << batches_replicated << " batches";
+                      << " replicated " << batches_replicated
+                      << " batches"
+                      << " pending=" << pending.size()
+                      << " skipped_not_member=" << entries_skipped_not_member
+                      << " token_bypassed=" << entries_token_bypassed
+                      << " invalid_source=" << entries_invalid_source
+                      << " suspicious_payload=" << entries_suspicious_payload;
+        }
+
+        if (!made_progress) {
+            if (!pending.empty()) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            } else {
+                std::this_thread::yield();
+            }
         }
     }
 
     LOG(INFO) << "ChainReplicationManager: Replication thread exiting, replicated "
-              << batches_replicated << " batches";
+              << batches_replicated << " batches"
+              << " pending_final=" << pending.size();
 }
 
 void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count) {

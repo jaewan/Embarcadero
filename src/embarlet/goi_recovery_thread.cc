@@ -3,19 +3,21 @@
 
 #include "topic.h"
 #include "../common/performance_utils.h"
+#include "../common/env_flags.h"
 #include <chrono>
+#include <unordered_map>
 #include <glog/logging.h>
 
 namespace Embarcadero {
 
 /**
  * GOIRecoveryThread monitors GOI entries for stalled chain replication.
- * Scans recent GOI writes (tracked in lock-free ring buffer) and recovers stalled chains.
+ * Scans recent GOI writes (tracked in lock-free ring buffer) and reports/recovers stalled chains.
  *
  * Design:
  * - Sequencer writes GOI entry, then records (goi_index, timestamp) in lock-free ring
  * - Recovery thread scans ring every 1ms looking for entries older than timeout
- * - If num_replicated < target after timeout, increment to unblock chain
+ * - If num_replicated < target after timeout, classify as stalled and handle per policy
  *
  * Performance:
  * - NO mutex on sequencer hot path (lock-free ring write)
@@ -27,10 +29,12 @@ namespace Embarcadero {
  * @paper_ref Design §4.2.2 Sequencer-Driven Replica Recovery (Stalled Chain)
  *
  * Protocol:
- * 1. Failure detection: Scan ring for entries older than 10ms with num_replicated < target
- * 2. Fault identification: Read num_replicated; if value is k, replica R_k failed
- * 3. Recovery: Increment num_replicated from k to k+1 (monotonic CXL write + flush)
- * 4. Membership notification: Report failed replica (TODO: integrate with membership service)
+ * 1. Failure detection: Scan ring for entries older than timeout with num_replicated < target
+ * 2. Stability check: Require unchanged num_replicated across multiple scans before classifying stalled
+ * 3. Policy:
+ *    - default (safe): monitor-only, do not mutate replication token
+ *    - optional (unsafe): increment num_replicated from k to k+1
+ * 4. Membership notification: TODO (not implemented)
  */
 void Topic::GOIRecoveryThread() {
 	LOG(INFO) << "GOIRecoveryThread started for topic " << topic_name_;
@@ -50,8 +54,21 @@ void Topic::GOIRecoveryThread() {
 
 	// Recovery statistics
 	uint64_t total_scans = 0;
+	uint64_t total_stalls = 0;
 	uint64_t total_recoveries = 0;
 	uint64_t last_stats_log_time_ns = 0;
+	struct StallState {
+		uint32_t last_replicated{0};
+		uint64_t first_stalled_ns{0};
+	};
+	std::unordered_map<uint64_t, StallState> stall_state;
+
+	const bool unsafe_recovery_enabled =
+		ReadEnvBoolLenient("EMBARCADERO_ENABLE_UNSAFE_CHAIN_RECOVERY", false);
+	if (unsafe_recovery_enabled) {
+		LOG(WARNING) << "GOIRecoveryThread: UNSAFE recovery enabled. "
+		             << "This may acknowledge batches without full proven durability.";
+	}
 
 	while (!stop_threads_) {
 		auto scan_start = std::chrono::steady_clock::now();
@@ -86,58 +103,54 @@ void Topic::GOIRecoveryThread() {
 
 			// Read current num_replicated (replicas increment this after copying data)
 			CXL::flush_cacheline(goi_entry);
+			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(goi_entry) + 64);
 			CXL::load_fence();
+			if (goi_entry->global_seq != goi_idx ||
+			    goi_entry->payload_size == 0 ||
+			    goi_entry->message_count == 0) {
+				// Entry not fully published yet; keep timestamp for next scan.
+				continue;
+			}
 			uint32_t current_replicated = goi_entry->num_replicated.load(std::memory_order_acquire);
 
 			// Check if replication is stuck
+			bool recovered_this_scan = false;
 			if (current_replicated < static_cast<uint32_t>(replication_factor_)) {
-				// STALLED CHAIN DETECTED
-				// Replica R_k (where k = current_replicated) failed to increment
-				uint32_t failed_replica_id = current_replicated;
-
-				LOG(WARNING) << "GOI[" << goi_idx << "] stalled: num_replicated=" << current_replicated
-				             << " (expected " << replication_factor_ << ") after "
-				             << (elapsed_ns / 1'000'000) << "ms. Replica R_" << failed_replica_id
-				             << " failed. Unblocking chain...";
-
-				// RECOVERY: Increment num_replicated to unblock next replica
-				// This is safe because:
-				// 1. Replica R_k is dead (timeout exceeded)
-				// 2. Data is already copied by R_k (it died AFTER copy, BEFORE increment)
-				// 3. Monotonic increment: current_replicated → current_replicated + 1
-				uint32_t new_value = current_replicated + 1;
-				goi_entry->num_replicated.store(new_value, std::memory_order_release);
-				CXL::flush_cacheline(goi_entry);
-				CXL::store_fence();
-
-				// If recovery moves this entry to "fully replicated", there is no
-				// replica thread left to advance CV for ACK=2. Promote CV here so
-				// ACK frontier cannot stall on a recovered tail token.
-				if (new_value >= static_cast<uint32_t>(replication_factor_)) {
-					AdvanceCVForSequencer(
-						goi_entry->broker_id,
-						goi_entry->pbr_index,
-						goi_entry->cumulative_message_count);
+				StallState& st = stall_state[goi_idx];
+				if (st.first_stalled_ns == 0 || st.last_replicated != current_replicated) {
+					st.last_replicated = current_replicated;
+					st.first_stalled_ns = now_ns;
+					continue;
+				}
+				const uint64_t stalled_ns = now_ns - st.first_stalled_ns;
+				if (stalled_ns < kChainReplicationTimeoutNs) {
+					continue;
 				}
 
-				LOG(INFO) << "GOI[" << goi_idx << "] recovered: num_replicated incremented to "
-				          << new_value << ". Replica R_" << (new_value) << " unblocked.";
+				total_stalls++;
 
-				// TODO: Report failed replica to membership service
-				// Example: membership_service_->ReportReplicaFailure(failed_replica_id, goi_idx);
-				// For now, just log it. Membership integration is future work.
-				LOG(ERROR) << "Replica R_" << failed_replica_id << " declared FAILED "
-				           << "(membership notification not implemented yet)";
+				if (unsafe_recovery_enabled) {
+					uint32_t new_value = current_replicated + 1;
+					goi_entry->num_replicated.store(new_value, std::memory_order_release);
+					CXL::flush_cacheline(goi_entry);
+					CXL::store_fence();
+					total_recoveries++;
+					stall_state.erase(goi_idx);
+					recovered_this_scan = true;
 
-				total_recoveries++;
+					LOG(WARNING) << "GOI[" << goi_idx << "] UNSAFE recovered: num_replicated "
+					             << current_replicated << " -> " << new_value;
+				}
+			} else {
+				stall_state.erase(goi_idx);
 			}
 
-			// Clear timestamp only if slot wasn't reused by sequencer (race-safe)
-			// Sequencer can overwrite this ring slot with a new (goi_index, timestamp) before we clear.
-			// CAS: clear only if value still matches; if sequencer overwrote, CAS fails and we skip.
-			uint64_t expected = timestamp_ns;
-			goi_timestamps_[ring_pos].timestamp_ns.compare_exchange_strong(
-				expected, 0, std::memory_order_release, std::memory_order_relaxed);
+			// Clear completed entries (and unsafe-recovered entries) from scan ring.
+			if (current_replicated >= static_cast<uint32_t>(replication_factor_) || recovered_this_scan) {
+				uint64_t expected = timestamp_ns;
+				goi_timestamps_[ring_pos].timestamp_ns.compare_exchange_strong(
+					expected, 0, std::memory_order_release, std::memory_order_relaxed);
+			}
 		}
 
 		total_scans++;
@@ -145,6 +158,7 @@ void Topic::GOIRecoveryThread() {
 		// Log statistics every 10 seconds
 		if (now_ns - last_stats_log_time_ns > 10'000'000'000ULL) {
 			LOG(INFO) << "GOIRecoveryThread stats: " << total_scans << " scans, "
+			          << total_stalls << " stalls, "
 			          << total_recoveries << " recoveries since start";
 			last_stats_log_time_ns = now_ns;
 		}
@@ -158,7 +172,9 @@ void Topic::GOIRecoveryThread() {
 	}
 
 	LOG(INFO) << "GOIRecoveryThread stopped for topic " << topic_name_
-	          << " (total_scans=" << total_scans << ", total_recoveries=" << total_recoveries << ")";
+	          << " (total_scans=" << total_scans
+	          << ", total_stalls=" << total_stalls
+	          << ", total_recoveries=" << total_recoveries << ")";
 }
 
 } // namespace Embarcadero

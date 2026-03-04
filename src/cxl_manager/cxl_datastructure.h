@@ -239,6 +239,8 @@ static_assert(alignof(CompletionVectorEntry) == 128, "CompletionVectorEntry must
  */
 struct alignas(128) GOIEntry {
 	// GOI index: position in GOI array (0, 1, 2, ...). Replicas poll GOI[goi_index]; committed_seq is max valid index.
+	// Publication protocol: sequencer writes all other fields first, then writes global_seq last.
+	// Readers must treat global_seq mismatch as "entry not ready".
 	uint64_t global_seq;                       // [[GOI_INDEX]] Same as array index for this entry
 	uint64_t batch_id;                         // Globally unique (broker_id | timestamp | counter)
 	// Message order: starting total_order for this batch; subscriber consumes in this order (design §2.3 Order 5).

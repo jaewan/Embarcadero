@@ -818,7 +818,9 @@ class Topic {
 		const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_pbr_index);
 
 	// [[PHASE_3]] Recovery parameters (§4.2.2)
-	static constexpr uint64_t kChainReplicationTimeoutNs = 10'000'000;  // 10ms (10× expected ~1ms chain latency)
+		// Recovery timeout for declaring a chain replica stalled.
+		// Keep this high to avoid false positives under sustained ACK2 throughput.
+		static constexpr uint64_t kChainReplicationTimeoutNs = 5'000'000'000;  // 5s
 	static constexpr uint64_t kRecoveryScanIntervalNs = 1'000'000;      // 1ms scan interval
 
 	struct CompletedRange {
