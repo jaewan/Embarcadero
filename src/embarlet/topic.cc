@@ -3986,7 +3986,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		const size_t min_seq = front_it->first;
 		const auto& front = front_it->second;
 		if (force_expire_hold_on_next_process_.load(std::memory_order_acquire) ||
-		    now_ns - front.hold_start_ns >= GetOrder5HoldTimeoutNs(ack_level_ == 2 && replication_factor_ > 0)) {
+		    now_ns - front.hold_start_ns >= GetOrder5HoldTimeoutNs(replication_factor_ > 0)) {
 			shard.expired_hold_keys_buffer.emplace_back(cid, min_seq);
 		}
 	}

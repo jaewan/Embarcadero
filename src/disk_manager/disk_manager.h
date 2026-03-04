@@ -70,6 +70,7 @@ class DiskManager{
 		bool GetNextReplicationBatch(TInode* tinode, int broker_id, 
 			BatchHeader* &batch_ring_start, BatchHeader* &batch_ring_end,
 			BatchHeader* &current_batch, size_t &disk_offset,
+			uint64_t &next_expected_pbr_index,
 			void* &batch_payload, size_t &batch_payload_size, 
 			size_t &batch_start_logical_offset, size_t &batch_last_logical_offset);
 

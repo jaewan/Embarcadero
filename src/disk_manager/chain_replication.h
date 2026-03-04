@@ -4,6 +4,7 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <array>
 #include "../cxl_manager/cxl_datastructure.h"
 
 namespace Embarcadero {
@@ -30,6 +31,8 @@ public:
     ChainReplicationManager(
         int replica_id,             // My replica ID (0 = head, f = tail)
         int replication_factor,     // Total replicas (f+1)
+        int local_broker_id,        // Local broker id
+        int num_brokers,            // Live broker count for replication-set mapping
         void* cxl_addr,             // CXL base address
         GOIEntry* goi,              // GOI pointer
         CompletionVectorEntry* cv,  // CompletionVector pointer
@@ -53,12 +56,17 @@ private:
 
     int replica_id_;
     int replication_factor_;
+    int local_broker_id_;
+    int num_brokers_;
     void* cxl_addr_;
     GOIEntry* goi_;
     CompletionVectorEntry* cv_;
 
-    int disk_fd_;
     std::string disk_path_;
+    std::vector<int> source_disk_fds_;
+    std::vector<std::string> source_disk_paths_;
+    std::vector<size_t> source_disk_offsets_;
+    std::vector<std::string> disk_dirs_;
 
     std::atomic<uint64_t> next_goi_index_{0};  // Next GOI entry to replicate
     std::atomic<bool> stop_{false};

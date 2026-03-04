@@ -26,7 +26,7 @@ namespace Embarcadero{
 
 	static bool ShouldUseUnifiedReplicationPath() {
 		static const bool enabled =
-			ReadEnvBoolLenient("EMBARCADERO_UNIFIED_REPLICATION_PATH", true);
+			ReadEnvBoolLenient("EMBARCADERO_UNIFIED_REPLICATION_PATH", false);
 		return enabled;
 	}
 
@@ -275,7 +275,10 @@ namespace Embarcadero{
 				MemcpyRequest &req = optReq.value();
 				// [[FIX-PWRITE-ARGS]] - Correct argument order: pwrite(fd, buf, count, offset)
 				// Previous bug: pwrite(fd, buf, offset, len) was incorrect
-				pwrite(req.fd, req.buf, req.len, req.offset);
+				ssize_t written = pwrite(req.fd, req.buf, req.len, req.offset);
+				if (written < 0) {
+					LOG(ERROR) << "CopyThread pwrite failed: " << strerror(errno);
+				}
 			}
 		}
 	}
@@ -410,6 +413,7 @@ namespace Embarcadero{
 		size_t batch_payload_size = 0;
 		size_t batch_start_logical_offset = 0;
 		size_t batch_last_logical_offset = 0;
+		uint64_t next_expected_pbr_index = 0;
 		
 		// Periodic durability sync state
 		size_t bytes_since_sync = 0;
@@ -431,6 +435,7 @@ namespace Embarcadero{
 			// This works with ORDER=5 (batches) and older ORDER levels (message-based converted to batches)
 			if (GetNextReplicationBatch(req.tinode, req.broker_id,
 					batch_ring_start, batch_ring_end, current_batch, disk_offset,
+					next_expected_pbr_index,
 					batch_payload, batch_payload_size,
 					batch_start_logical_offset, batch_last_logical_offset)) {
 				
@@ -525,28 +530,44 @@ namespace Embarcadero{
 				// Only advance replication_done after full batch is successfully written to disk
 				TInode* replica_tinode = req.replica_tinode;
 				bool replicate_tinode = req.tinode->replicate_tinode;
-				if(replicate_tinode){
-					replica_tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
+				volatile uint64_t* rep_done_ptr = &req.tinode->offsets[broker_id_].replication_done[req.broker_id];
+				const uint64_t prev_rep_done = *rep_done_ptr;
+				bool rep_done_advanced = false;
+				if (batch_last_logical_offset > prev_rep_done) {
+					*rep_done_ptr = batch_last_logical_offset;
+					rep_done_advanced = true;
 				}
-				req.tinode->offsets[broker_id_].replication_done[req.broker_id] = batch_last_logical_offset;
-				
-				// Flush the updated replication_done so other hosts (ACK thread) can observe it under non-coherent CXL
-				const void* rep_done_addr = reinterpret_cast<const void*>(
-					const_cast<const uint64_t*>(&req.tinode->offsets[broker_id_].replication_done[req.broker_id]));
-				CXL::flush_cacheline(rep_done_addr);
-				
-				// [[FLUSH_DUAL_WRITE]] - If dual-writing to replica_tinode, flush that too for CXL visibility
+
+				// [[FLUSH_DUAL_WRITE]] - If dual-writing to replica_tinode, keep the mirror non-regressing too.
+				bool replica_rep_done_advanced = false;
 				if(replicate_tinode){
+					volatile uint64_t* replica_rep_done_ptr =
+						&replica_tinode->offsets[broker_id_].replication_done[req.broker_id];
+					const uint64_t prev_replica_rep_done = *replica_rep_done_ptr;
+					if (batch_last_logical_offset > prev_replica_rep_done) {
+						*replica_rep_done_ptr = batch_last_logical_offset;
+						replica_rep_done_advanced = true;
+					}
+				}
+
+				// Flush only when we advanced a frontier value.
+				if (rep_done_advanced) {
+					const void* rep_done_addr = reinterpret_cast<const void*>(
+						const_cast<const uint64_t*>(&req.tinode->offsets[broker_id_].replication_done[req.broker_id]));
+					CXL::flush_cacheline(rep_done_addr);
+				}
+				if (replica_rep_done_advanced) {
 					const void* replica_rep_done_addr = reinterpret_cast<const void*>(
 						const_cast<const uint64_t*>(&replica_tinode->offsets[broker_id_].replication_done[req.broker_id]));
 					CXL::flush_cacheline(replica_rep_done_addr);
 				}
-				
-				CXL::store_fence();
+				if (rep_done_advanced || replica_rep_done_advanced) {
+					CXL::store_fence();
+				}
 				
 				// [[OBSERVABILITY]] - Update metrics after successful replication
 				metrics.batches_replicated.fetch_add(1, std::memory_order_relaxed);
-				metrics.last_replication_done.store(batch_last_logical_offset, std::memory_order_relaxed);
+				metrics.last_replication_done.store(*rep_done_ptr, std::memory_order_relaxed);
 				{
 					std::lock_guard<std::mutex> lock(metrics.metrics_mutex);
 					metrics.last_advance_time = std::chrono::steady_clock::now();
@@ -662,6 +683,7 @@ namespace Embarcadero{
 	bool DiskManager::GetNextReplicationBatch(TInode* tinode, int broker_id,
 			BatchHeader* &batch_ring_start, BatchHeader* &batch_ring_end,
 			BatchHeader* &current_batch, size_t &disk_offset,
+			uint64_t &next_expected_pbr_index,
 			void* &batch_payload, size_t &batch_payload_size,
 			size_t &batch_start_logical_offset, size_t &batch_last_logical_offset) {
 		
@@ -820,6 +842,7 @@ namespace Embarcadero{
 			volatile size_t total_size_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->total_size;
 			volatile size_t log_idx_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->log_idx;
 			volatile size_t start_logical_offset_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->start_logical_offset;
+			volatile uint64_t pbr_absolute_index_check = reinterpret_cast<volatile BatchHeader*>(actual_batch)->pbr_absolute_index;
 			
 			// Bounds validation (match BrokerScannerWorker5 guards)
 			// Add payload location check to prevent out-of-bounds
@@ -839,18 +862,20 @@ namespace Embarcadero{
 			                   num_msg_check <= MAX_REASONABLE_NUM_MSG &&
 			                   payload_in_bounds);
 			
-			if (batch_ready) {
+			if (batch_ready && pbr_absolute_index_check == next_expected_pbr_index) {
 				// Batch is valid; use data from actual_batch
 				batch_payload = reinterpret_cast<uint8_t*>(cxl_addr_) + log_idx_check;
 				batch_payload_size = total_size_check;
 				batch_start_logical_offset = start_logical_offset_check;
 				batch_last_logical_offset = start_logical_offset_check + num_msg_check - 1;
+				next_expected_pbr_index++;
 				
 				VLOG(3) << "[GetNextReplicationBatch B" << broker_id << "]: Found ordered batch: "
 						<< "num_msg=" << num_msg_check << ", log_idx=" << log_idx_check 
 						<< ", payload_size=" << batch_payload_size
 						<< ", start_offset=" << batch_start_logical_offset
-						<< ", batch_off_to_export=" << batch_off_to_export_check;
+						<< ", batch_off_to_export=" << batch_off_to_export_check
+						<< ", pbr_abs=" << pbr_absolute_index_check;
 				
 				// Advance cursor for next iteration
 				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
@@ -860,6 +885,17 @@ namespace Embarcadero{
 				}
 				current_batch = next_batch;
 				return true;
+			}
+
+			if (batch_ready && pbr_absolute_index_check < next_expected_pbr_index) {
+				// Duplicate/stale slot. Advance cursor and continue scanning.
+				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+				if (next_batch >= batch_ring_end) {
+					next_batch = batch_ring_start;
+				}
+				current_batch = next_batch;
+				continue;
 			}
 			
 				// Actual batch not ready yet, advance slot and try next
