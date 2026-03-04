@@ -1923,23 +1923,31 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		bool found_ack = false;
 		size_t current_ack = (size_t)-1;
 
-		// Fast-path: Read without flush/fence to detect potential changes.
-		auto [fast_read_value, needs_expensive_check] = GetOffsetToAckFast(topic.c_str(), ack_level, last_known_ack);
-		const bool force_full_check = (fast_polls_without_full_check >= kMaxFastPollsBeforeFullCheck);
-		if (needs_expensive_check || force_full_check) {
-			// Value appears to have changed - do expensive check with proper CXL operations.
-			current_ack = GetOffsetToAck(topic.c_str(), ack_level);
-			expensive_checks_since_last_ack++;
-			if (force_full_check) {
-				forced_full_checks_since_last_send++;
+			if (ack_level == 2) {
+				// ACK=2 durability frontier is correctness-critical under non-coherent CXL;
+				// always perform full visibility check to avoid stale fast-path reads.
+				current_ack = GetOffsetToAck(topic.c_str(), ack_level);
+				expensive_checks_since_last_ack++;
+				fast_polls_without_full_check = 0;
+			} else {
+				// Fast-path: Read without flush/fence to detect potential changes.
+				auto [fast_read_value, needs_expensive_check] = GetOffsetToAckFast(topic.c_str(), ack_level, last_known_ack);
+				const bool force_full_check = (fast_polls_without_full_check >= kMaxFastPollsBeforeFullCheck);
+				if (needs_expensive_check || force_full_check) {
+					// Value appears to have changed - do expensive check with proper CXL operations.
+					current_ack = GetOffsetToAck(topic.c_str(), ack_level);
+					expensive_checks_since_last_ack++;
+					if (force_full_check) {
+						forced_full_checks_since_last_send++;
+					}
+					fast_polls_without_full_check = 0;
+				} else {
+					// No change detected - use fast read value.
+					current_ack = fast_read_value;
+					fast_checks_since_last_send++;
+					fast_polls_without_full_check++;
+				}
 			}
-			fast_polls_without_full_check = 0;
-		} else {
-			// No change detected - use fast read value.
-			current_ack = fast_read_value;
-			fast_checks_since_last_send++;
-			fast_polls_without_full_check++;
-		}
 
 		if (current_ack != (size_t)-1 && next_to_ack_offset <= current_ack) {
 			found_ack = true;
