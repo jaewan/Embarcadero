@@ -220,6 +220,7 @@ void ChainReplicationManager::ReplicationThread() {
     size_t pending_peak = 0;
     std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> pending_by_source;
     std::array<uint64_t, NUM_MAX_BROKERS> token_poll_not_before_ns{};
+    std::array<uint64_t, NUM_MAX_BROKERS> token_wait_backoff_ns{};
     std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> write_queues;
     std::array<std::mutex, NUM_MAX_BROKERS> write_mu;
     std::array<std::condition_variable, NUM_MAX_BROKERS> write_cv;
@@ -233,6 +234,8 @@ void ChainReplicationManager::ReplicationThread() {
     // Keep a deeper in-flight window so data copy can stay ahead while token ownership catches up.
     // A shallow window throttles role>0 replicas into token-wait stalls under ORDER=5 ACK2 load.
     constexpr size_t kMaxPendingTokenUpdates = 8192;
+    constexpr uint64_t kMinWaitPollBackoffNs = 1'000;    // 1us
+    constexpr uint64_t kMaxWaitPollBackoffNs = 64'000;   // 64us
     ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
 
     auto pending_total = [&pending_by_source]() -> size_t {
@@ -244,6 +247,7 @@ void ChainReplicationManager::ReplicationThread() {
     auto pending_and_inflight = [&]() -> size_t {
         return pending_total() + queued_writes.load(std::memory_order_acquire);
     };
+    token_wait_backoff_ns.fill(kMinWaitPollBackoffNs);
 
     // Parallel data-copy workers (one queue per source broker) while token/CV stays serialized here.
     for (int src = 0; src < num_brokers_; ++src) {
@@ -461,7 +465,6 @@ void ChainReplicationManager::ReplicationThread() {
 
         // Stage 2b: token progression and ACK2 frontier update.
         // Poll only queue heads per source; this avoids O(total_pending) repoll churn under wait.
-        constexpr uint64_t kWaitPollBackoffNs = 1'000;  // 1us
         const uint64_t now_ns = SteadyNowNs();
         for (int src = 0; src < NUM_MAX_BROKERS; ++src) {
             if (token_poll_not_before_ns[src] != 0 && now_ns < token_poll_not_before_ns[src]) {
@@ -477,10 +480,13 @@ void ChainReplicationManager::ReplicationThread() {
                 uint16_t token = static_cast<uint16_t>(entry->num_replicated.load(std::memory_order_acquire));
                 if (token < h.role) {
                     token_waits++;
-                    token_poll_not_before_ns[src] = now_ns + kWaitPollBackoffNs;
+                    const uint64_t backoff = token_wait_backoff_ns[src];
+                    token_poll_not_before_ns[src] = now_ns + backoff;
+                    token_wait_backoff_ns[src] = std::min(backoff << 1, kMaxWaitPollBackoffNs);
                     break;  // Head not ready yet; later entries for same source are unlikely to be ready.
                 }
                 token_poll_not_before_ns[src] = 0;
+                token_wait_backoff_ns[src] = kMinWaitPollBackoffNs;
                 if (token == h.role) {
                     entry->num_replicated.store(static_cast<uint16_t>(h.role + 1), std::memory_order_release);
                     CXL::flush_cacheline(entry);
