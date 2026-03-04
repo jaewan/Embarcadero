@@ -467,7 +467,7 @@ void ChainReplicationManager::ReplicationThread() {
         // Stage 2b: token progression and ACK2 frontier update.
         // Poll only queue heads per source; this avoids O(total_pending) repoll churn under wait.
         const uint64_t now_ns = SteadyNowNs();
-        constexpr int kMaxPerSourceTokenOpsPerPass = 32;
+        constexpr int kMaxPerSourceTokenOpsPerPass = 8;
         for (int i = 0; i < num_brokers_; ++i) {
             const int src = (token_scan_start_src + i) % num_brokers_;
             if (token_poll_not_before_ns[src] != 0 && now_ns < token_poll_not_before_ns[src]) {
