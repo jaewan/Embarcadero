@@ -3013,25 +3013,38 @@ void Topic::CommitEpoch(
 	}
 
 	// 2. Flush export chain and BatchHeaders
-	for (PendingBatch5& p : ready) {
-		if (p.skipped || p.is_held_marker || p.from_hold || p.hdr == nullptr) continue;
-		int b = p.broker_id;
-		if (b >= 0 && b < NUM_MAX_BROKERS) {
-			BatchHeader* cur = export_cursor_by_broker_[b];
-			if (cur != nullptr) {
-				cur->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cur);
-				cur->ordered = 1;
-				CXL::flush_cacheline(cur);
-				CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(cur) + 64);
-				BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[b].batch_headers_offset);
-				BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(ring_start) + BATCHHEADERS_SIZE);
-				BatchHeader* next_cursor = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(cur) + sizeof(BatchHeader));
-				if (next_cursor >= ring_end) next_cursor = ring_start;
-				export_cursor_by_broker_[b] = next_cursor;
+		for (PendingBatch5& p : ready) {
+			if (p.skipped || p.is_held_marker || p.from_hold || p.hdr == nullptr) continue;
+			int b = p.broker_id;
+			if (b >= 0 && b < NUM_MAX_BROKERS) {
+				const size_t batch_headers_offset = tinode_->offsets[b].batch_headers_offset;
+				if (batch_headers_offset != 0) {
+					BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(cxl_addr_) + batch_headers_offset);
+					BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(ring_start) + BATCHHEADERS_SIZE);
+					BatchHeader* cur = export_cursor_by_broker_[b];
+
+					// Late topic creation on non-head brokers can leave an old/null cursor.
+					// Rebind to ring_start once batch_headers_offset is published.
+					if (cur == nullptr || cur < ring_start || cur >= ring_end) {
+						cur = ring_start;
+						export_cursor_by_broker_[b] = cur;
+					}
+
+					cur->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cur);
+					cur->ordered = 1;
+					CXL::flush_cacheline(cur);
+					CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(cur) + 64);
+
+					BatchHeader* next_cursor = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(cur) + sizeof(BatchHeader));
+					if (next_cursor >= ring_end) next_cursor = ring_start;
+					export_cursor_by_broker_[b] = next_cursor;
+				}
 			}
-		}
-		p.hdr->batch_complete = 0;
-		__atomic_store_n(&p.hdr->flags, 0u, __ATOMIC_RELEASE);
+			p.hdr->batch_complete = 0;
+			__atomic_store_n(&p.hdr->flags, 0u, __ATOMIC_RELEASE);
 		CXL::flush_cacheline(p.hdr);
 		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(p.hdr) + 64);
 	}

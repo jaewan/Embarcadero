@@ -17,11 +17,18 @@
 #include "chain_replication.h"
 #include "../cxl_manager/cxl_datastructure.h"
 #include "../common/order_level.h"
+#include "../common/env_flags.h"
 #include "../common/performance_utils.h"
 
 namespace Embarcadero{
 
 #define DISK_LOG_PATH_SUFFIX ".Replication/disk"
+
+	static bool ShouldUseUnifiedReplicationPath() {
+		static const bool enabled =
+			ReadEnvBoolLenient("EMBARCADERO_UNIFIED_REPLICATION_PATH", true);
+		return enabled;
+	}
 
 	void memcpy_nt(void* dst, const void* src, size_t size) {
 		// Cast the input pointers to the appropriate types
@@ -152,8 +159,21 @@ namespace Embarcadero{
 				const char* disk_path_env = getenv("EMBARCADERO_REPLICA_DISK_PATH");
 
 				int replica_id = replica_id_env ? atoi(replica_id_env) : 0;
-				// Default 1 so single-replica (head-only) is the tail and updates CompletionVector; ack_level=2 works without env.
-				int replication_factor = replication_factor_env ? atoi(replication_factor_env) : 1;
+				// Default 0: replication threads are disabled unless explicitly configured.
+				// This keeps ACK=1 / non-replicated runs free of chain-replication overhead.
+				int replication_factor = replication_factor_env ? atoi(replication_factor_env) : 0;
+				int num_brokers = 4;
+				if (const char* env = getenv("NUM_BROKERS")) {
+					int parsed = atoi(env);
+					if (parsed > 0 && parsed <= NUM_MAX_BROKERS) {
+						num_brokers = parsed;
+					}
+				} else if (const char* env = getenv("EMBARCADERO_NUM_BROKERS")) {
+					int parsed = atoi(env);
+					if (parsed > 0 && parsed <= NUM_MAX_BROKERS) {
+						num_brokers = parsed;
+					}
+				}
 
 				// Default disk path: /tmp/embarcadero_replica_<broker_id>.dat
 				std::string disk_path;
@@ -169,13 +189,22 @@ namespace Embarcadero{
 				CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 					reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kCompletionVectorOffset);
 
-				chain_replication_manager_ = std::make_unique<Embarcadero::ChainReplicationManager>(
-					replica_id, replication_factor, cxl_addr_, goi, cv, disk_path);
-				chain_replication_manager_->Start();
+				if (replication_factor > 0 && !ShouldUseUnifiedReplicationPath()) {
+					chain_replication_manager_ = std::make_unique<Embarcadero::ChainReplicationManager>(
+						replica_id, replication_factor, broker_id_, num_brokers, cxl_addr_, goi, cv, disk_path);
+					chain_replication_manager_->Start();
 
-				LOG(INFO) << "DiskManager: Chain replication enabled (replica_id=" << replica_id
-				          << ", replication_factor=" << replication_factor
-				          << ", disk=" << disk_path << ")";
+					LOG(INFO) << "DiskManager: Chain replication enabled (replica_id=" << replica_id
+					          << ", broker_id=" << broker_id_
+					          << ", num_brokers=" << num_brokers
+					          << ", replication_factor=" << replication_factor
+					          << ", disk=" << disk_path << ")";
+				} else {
+					LOG(INFO) << "DiskManager: Chain replication disabled (replication_factor="
+					          << replication_factor
+					          << ", unified_replication_path=" << ShouldUseUnifiedReplicationPath()
+					          << ")";
+				}
 				return;
 			}
 
@@ -255,7 +284,8 @@ namespace Embarcadero{
 		// ORDER=5 (strong) on EMBARCADERO uses GOI + chain replication + CompletionVector.
 		// Do not start legacy batch-ring replication workers on this path.
 		if (sequencerType_ == heartbeat_system::SequencerType::EMBARCADERO &&
-		    topic_inode != nullptr && topic_inode->order == kOrderStrong) {
+		    topic_inode != nullptr && topic_inode->order == kOrderStrong &&
+		    !ShouldUseUnifiedReplicationPath()) {
 			return;
 		}
 
@@ -701,9 +731,9 @@ namespace Embarcadero{
 			volatile uint32_t ordered_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->ordered;
 			volatile int batch_complete_check = reinterpret_cast<volatile BatchHeader*>(current_batch)->batch_complete;
 			TInode* source_inode = tinode;
-			bool slot_ready_for_replication = (source_inode->order == 0)
-				? (batch_complete_check == 1)
-				: (ordered_check == 1);
+				bool slot_ready_for_replication = (source_inode->order == 0)
+					? (batch_complete_check == 1)
+					: (ordered_check == 1);
 			
 			// Calculate ring offset for diagnostics
 			size_t ring_offset = reinterpret_cast<uint8_t*>(current_batch) - reinterpret_cast<uint8_t*>(batch_ring_start);
@@ -722,9 +752,9 @@ namespace Embarcadero{
 							<< ", consecutive_not_ordered=" << consecutive_not_ordered;
 					last_diagnostic_log = now;
 				}
-				// Current slot not yet ordered, advance and try next
-				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
-					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+					// Current slot not yet ordered, advance and try next
+					BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
 				if (next_batch >= batch_ring_end) {
 					next_batch = batch_ring_start;
 				}
@@ -756,9 +786,9 @@ namespace Embarcadero{
 						<< "]: Invalid batch_off_to_export=" << batch_off_to_export_check 
 						<< " (must be in [0, " << BATCHHEADERS_SIZE << ") and aligned to " 
 						<< sizeof(BatchHeader) << " bytes)";
-					// Advance and continue scanning
-					BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
-						reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+						// Advance and continue scanning
+						BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+							reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
 					if (next_batch >= batch_ring_end) {
 						next_batch = batch_ring_start;
 					}
@@ -774,9 +804,9 @@ namespace Embarcadero{
 				if (actual_batch < batch_ring_start || actual_batch >= batch_ring_end) {
 					LOG(WARNING) << "[GetNextReplicationBatch B" << broker_id 
 						<< "]: Export chain points outside ring (offset=" << batch_off_to_export_check << ")";
-					// Advance and continue scanning
-					BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
-						reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+						// Advance and continue scanning
+						BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+							reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
 					if (next_batch >= batch_ring_end) {
 						next_batch = batch_ring_start;
 					}
@@ -832,9 +862,9 @@ namespace Embarcadero{
 				return true;
 			}
 			
-			// Actual batch not ready yet, advance slot and try next
-			BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
-				reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
+				// Actual batch not ready yet, advance slot and try next
+				BatchHeader* next_batch = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(current_batch) + sizeof(BatchHeader));
 			if (next_batch >= batch_ring_end) {
 				next_batch = batch_ring_start;
 			}

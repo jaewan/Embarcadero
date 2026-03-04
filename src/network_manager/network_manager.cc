@@ -79,6 +79,12 @@ static bool ShouldEnableCorfuLatencyDiag() {
 	return enabled;
 }
 
+static bool ShouldUseUnifiedReplicationPath() {
+	static const bool enabled =
+		ReadEnvBoolLenient("EMBARCADERO_UNIFIED_REPLICATION_PATH", true);
+	return enabled;
+}
+
 /**
  * Closes socket and epoll file descriptors safely
  */
@@ -1497,7 +1503,7 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 	if (ack_level == 2 && replication_factor > 0) {
 		// ORDER=5 (strong ordering): ACK2 frontier is CompletionVector (GOI/chain-replication path).
 		// Non-ORDER5: use legacy replication_done frontier (batch ring replication path).
-		if (seq_type == EMBARCADERO && order == kOrderStrong) {
+		if (seq_type == EMBARCADERO && order == kOrderStrong && !ShouldUseUnifiedReplicationPath()) {
 			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
@@ -1646,7 +1652,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 
 		// ORDER=5 (strong ordering): ACK2 frontier is CompletionVector (GOI/chain-replication path).
 		// Non-ORDER5: ACK2 frontier is legacy replication_done[] minimum across replication set.
-		if (seq_type == EMBARCADERO && order == kOrderStrong) {
+			if (seq_type == EMBARCADERO && order == kOrderStrong && !ShouldUseUnifiedReplicationPath()) {
 			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
