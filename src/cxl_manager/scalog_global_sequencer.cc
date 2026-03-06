@@ -14,6 +14,10 @@ ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
 }
 
 void ScalogGlobalSequencer::Run() {
+	if (!scalog_server_) {
+		LOG(ERROR) << "gRPC server failed to start (check bind address/port)";
+		return;
+	}
 	scalog_server_->Wait();
 }
 
@@ -51,7 +55,7 @@ grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* co
         absl::WriterMutexLock lock(&registered_brokers_mu_);
         registered_brokers_.insert(broker_id);
 
-		if (registered_brokers_.size() == NUM_MAX_BROKERS) {
+		if ((int)registered_brokers_.size() == NUM_MAX_BROKERS_CONFIG) {
 			global_cut_thread_ = std::thread(&ScalogGlobalSequencer::SendGlobalCut, this);
 		}
     }
@@ -75,7 +79,7 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 					total_num_replicas += replica_map.size();
 				}
 
-				if (total_num_replicas != (NUM_MAX_BROKERS * num_replicas_per_broker_)) {
+				if (total_num_replicas != ((size_t)NUM_MAX_BROKERS_CONFIG * num_replicas_per_broker_)) {
 					continue;
 				}
 				
@@ -149,7 +153,7 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 				{
 					absl::WriterMutexLock lock(&global_cut_mu_);
 					if (epoch == 0) {
-						global_cut_[broker_id][replica_id] = local_cut + 1;
+						global_cut_[broker_id][replica_id] = local_cut;
 						logical_offsets_[broker_id][replica_id] = local_cut;
 						last_sent_global_cut_[broker_id][replica_id] = -1;
 					} else {
@@ -166,7 +170,7 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 
 int main(int argc, char* argv[]){
     // Initialize scalog global sequencer
-    std::string scalog_seq_address = std::string(SCLAOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
+    std::string scalog_seq_address = std::string(SCALOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
     ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
 
 	scalog_global_sequencer.Run();

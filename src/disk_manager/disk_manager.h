@@ -55,6 +55,8 @@ class DiskManager{
 		// Change this to get real-time num brokers
 		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
 		void StartScalogReplicaLocalSequencer();
+		// [[CXL_SCALOG]] Start CXL-based replica: polls CXL directly, no gRPC data push.
+		void StartScalogCXLReplication(TInode* tinode);
 
 	private:
 		void ReplicateThread();
