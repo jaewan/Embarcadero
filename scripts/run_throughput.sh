@@ -12,7 +12,9 @@ MESSAGE_SIZE=${MESSAGE_SIZE:-1024}
 TEST_TYPE=${TEST_TYPE:-1}
 ORDER=${ORDER:-5}
 ACK=${ACK:-1}
+REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
+SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-0}
 THREADS_PER_BROKER=${THREADS_PER_BROKER:-$([ "$NUM_BROKERS" = "1" ] && echo 1 || echo 4)}
 QUIET=${QUIET:-0}
 TRIAL_MAX_ATTEMPTS=${TRIAL_MAX_ATTEMPTS:-3}
@@ -30,7 +32,7 @@ fi
 # NUMA binding
 EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
 CLIENT_NUMA_BIND="numactl --cpunodebind=0 --membind=0"
-if [[ "$SEQUENCER" == "CORFU" ]]; then
+if [[ "$SEQUENCER" == "CORFU" || "$SEQUENCER" == "SCALOG" ]]; then
   EMBARLET_NUMA_BIND=""
   CLIENT_NUMA_BIND=""
 fi
@@ -76,7 +78,7 @@ start_cluster() {
   # Start Brokers
   $EMBARLET_NUMA_BIND ./embarlet --config ../../config/embarcadero.yaml --head --$SEQUENCER > broker_0.log 2>&1 &
   for ((i=1; i<NUM_BROKERS; i++)); do
-    $EMBARLET_NUMA_BIND ./embarlet --config ../../config/embarcadero.yaml > broker_$i.log 2>&1 &
+    $EMBARLET_NUMA_BIND ./embarlet --config ../../config/embarcadero.yaml --$SEQUENCER > broker_$i.log 2>&1 &
   done
 
   if ! wait_for_brokers 60 $NUM_BROKERS; then
@@ -97,7 +99,9 @@ overall_status=0
 cleanup
 
 for ((trial=1; trial<=NUM_TRIALS; trial++)); do
-  echo "=== Trial $trial ($SEQUENCER Order $ORDER, $NUM_BROKERS brokers, msg=$MESSAGE_SIZE) ==="
+  CXL_TAG=""
+  [[ "${SCALOG_CXL_MODE:-0}" == "1" ]] && CXL_TAG="-CXL"
+  echo "=== Trial $trial ($SEQUENCER${CXL_TAG} Order $ORDER, $NUM_BROKERS brokers, msg=$MESSAGE_SIZE) ==="
   trial_success=0
   for ((attempt=1; attempt<=TRIAL_MAX_ATTEMPTS; attempt++)); do
     [ "$QUIET" != "1" ] && echo "Trial $trial attempt $attempt/$TRIAL_MAX_ATTEMPTS"
@@ -109,7 +113,7 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
 
     echo "Running throughput test (type $TEST_TYPE)..."
     TRIAL_LOG="$(mktemp /tmp/throughput_trial_${trial}_${attempt}_XXXX.log)"
-    $CLIENT_NUMA_BIND ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $TOTAL_MESSAGE_SIZE -t $TEST_TYPE -o $ORDER -a $ACK --sequencer $SEQUENCER -l 0 -r 0 2>&1 | tee "$TRIAL_LOG"
+    $CLIENT_NUMA_BIND ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $TOTAL_MESSAGE_SIZE -t $TEST_TYPE -o $ORDER -a $ACK --sequencer $SEQUENCER -l 0 -r $REPLICATION_FACTOR 2>&1 | tee "$TRIAL_LOG"
     cmd_status=${PIPESTATUS[0]}
 
     if grep -q "Bandwidth:" "$TRIAL_LOG"; then
