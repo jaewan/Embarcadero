@@ -162,6 +162,8 @@ int main(int argc, char* argv[]) {
 		("follower", "Follower Address and Port", cxxopts::value<std::string>())
 		("scalog", "Run also as a Scalog Replica")
 		("SCALOG", "Run also as a Scalog Replica")
+		("scalog_cxl", "Run Scalog with CXL-direct replication (no data push over network)")
+		("SCALOG_CXL", "Run Scalog with CXL-direct replication (no data push over network)")
 		("corfu", "Run also as a Corfu Replica")
 		("CORFU", "Run also as a Corfu Replica")
 		("embarcadero", "Run as a Embarcadero Replica")
@@ -206,7 +208,8 @@ int main(int argc, char* argv[]) {
 		replicate_to_memory = false;
 	}
 
-	if (arguments.count("scalog") || arguments.count("SCALOG")) {
+	if (arguments.count("scalog") || arguments.count("SCALOG") ||
+	    arguments.count("scalog_cxl") || arguments.count("SCALOG_CXL")) {
 		sequencerType = heartbeat_system::SequencerType::SCALOG;
 	} else if (arguments.count("corfu") || arguments.count("CORFU")) {
 		sequencerType = heartbeat_system::SequencerType::CORFU;

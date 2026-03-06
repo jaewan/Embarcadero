@@ -41115,7 +41115,7 @@ This section contains the contents of the repository's files.
 37: 		/// Local epoch
 38: 		int local_epoch_ = 0;
 39: 		// Global seq ip
-40: 		std::string scalog_global_sequencer_ip_ = SCLAOG_SEQUENCER_IP;
+40: 		std::string scalog_global_sequencer_ip_ = SCALOG_SEQUENCER_IP;
 41: 		/// Flag to indicate if we should stop reading from the stream
 42: 		bool stop_reading_from_stream_ = false;
 43: 		/// Lock for streams
@@ -44805,7 +44805,7 @@ This section contains the contents of the repository's files.
 69: //********* Scalog configs *********
 70: #define SCALOG_SEQ_PORT (Embarcadero::GetConfig().config().scalog.sequencer_port.get())
 71: #define SCALOG_REP_PORT (Embarcadero::GetConfig().config().scalog.replication_port.get())
-72: #define SCLAOG_SEQUENCER_IP (Embarcadero::GetConfig().config().scalog.sequencer_ip.get().c_str())
+72: #define SCALOG_SEQUENCER_IP (Embarcadero::GetConfig().config().scalog.sequencer_ip.get().c_str())
 73: 
 74: #define SCALOG_SEQ_LOCAL_CUT_INTERVAL (Embarcadero::GetConfig().config().scalog.local_cut_interval.get())
 75: 	
@@ -45676,7 +45676,7 @@ This section contains the contents of the repository's files.
 134: 			}
 135: 			local_cut_tracker_ = std::make_unique<LocalCutTracker>();
 136: 			// Setup gRPC channel to sequencer (error handling recommended)
-137: 			std::string scalog_seq_address = std::string(SCLAOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
+137: 			std::string scalog_seq_address = std::string(SCALOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
 138: 			std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 139: 			stub_ = ScalogSequencer::NewStub(channel); // Assuming this is the correct Stub type
 140: 			VLOG(1) << "Starting writer threads...";
@@ -46113,7 +46113,7 @@ This section contains the contents of the repository's files.
 571: 		std::condition_variable cv_fsync_;
 572: 		std::mutex fsync_cv_mutex_; // Mutex for fsync condition variable
 573: 		// Local/Global Cut members
-574: 		std::string scalog_global_sequencer_ip_; // = SCLAOG_SEQUENCER_IP; // Initialize in constructor list if possible
+574: 		std::string scalog_global_sequencer_ip_; // = SCALOG_SEQUENCER_IP; // Initialize in constructor list if possible
 575: 		std::thread send_local_cut_thread_;
 576: 		std::chrono::microseconds local_cut_interval_;
 577: 		// absl::btree_map<int, int> global_cut_; // Not needed if processed per-message
@@ -46953,7 +46953,7 @@ This section contains the contents of the repository's files.
 132: }
 133: int main(int argc, char* argv[]){
 134:     // Initialize scalog global sequencer
-135:     std::string scalog_seq_address = std::string(SCLAOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
+135:     std::string scalog_seq_address = std::string(SCALOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
 136:     ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
 137: 	scalog_global_sequencer.Run();
 138:     return 0;

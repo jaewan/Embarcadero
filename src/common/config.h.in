@@ -69,7 +69,7 @@ const Configuration& GetConfig();
 //********* Scalog configs *********
 #define SCALOG_SEQ_PORT (Embarcadero::GetConfig().config().scalog.sequencer_port.get())
 #define SCALOG_REP_PORT (Embarcadero::GetConfig().config().scalog.replication_port.get())
-#define SCLAOG_SEQUENCER_IP (Embarcadero::GetConfig().config().scalog.sequencer_ip.get().c_str())
+#define SCALOG_SEQUENCER_IP (Embarcadero::GetConfig().config().scalog.sequencer_ip.get().c_str())
 
 #define SCALOG_SEQ_LOCAL_CUT_INTERVAL (Embarcadero::GetConfig().config().scalog.local_cut_interval.get())
 	
