@@ -5,7 +5,6 @@
 #include <thread>
 #include <vector>
 #include <array>
-#include <map>
 #include "../cxl_manager/cxl_datastructure.h"
 
 namespace Embarcadero {
@@ -32,6 +31,8 @@ public:
     ChainReplicationManager(
         int replica_id,             // My replica ID (0 = head, f = tail)
         int replication_factor,     // Total replicas (f+1)
+        int local_broker_id,        // Local broker id
+        int num_brokers,            // Live broker count for replication-set mapping
         void* cxl_addr,             // CXL base address
         GOIEntry* goi,              // GOI pointer
         CompletionVectorEntry* cv,  // CompletionVector pointer
@@ -55,24 +56,22 @@ private:
 
     int replica_id_;
     int replication_factor_;
+    int local_broker_id_;
+    int num_brokers_;
     void* cxl_addr_;
     GOIEntry* goi_;
     CompletionVectorEntry* cv_;
 
-    int disk_fd_;
     std::string disk_path_;
+    std::vector<int> source_disk_fds_;
+    std::vector<std::string> source_disk_paths_;
+    std::vector<size_t> source_disk_offsets_;
+    std::vector<std::string> disk_dirs_;
 
     std::atomic<uint64_t> next_goi_index_{0};  // Next GOI entry to replicate
     std::atomic<bool> stop_{false};
     std::thread replication_thread_;
 
-    // Tail replica tracks per-broker highest contiguous pbr_index.
-    // A pending map is needed because GOI replication completion can arrive
-    // out of order per broker; without this we can permanently lose contiguous
-    // frontier advancement for ACK level 2.
-    std::array<uint64_t, NUM_MAX_BROKERS> broker_cv_state_{};
-    std::array<bool, NUM_MAX_BROKERS> broker_cv_state_initialized_{};
-    std::array<std::map<uint64_t, uint64_t>, NUM_MAX_BROKERS> broker_cv_pending_{};
 };
 
 } // namespace Embarcadero

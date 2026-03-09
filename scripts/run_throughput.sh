@@ -12,6 +12,7 @@ MESSAGE_SIZE=${MESSAGE_SIZE:-1024}
 TEST_TYPE=${TEST_TYPE:-1}
 ORDER=${ORDER:-5}
 ACK=${ACK:-1}
+REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
 if [[ "$SEQUENCER" == "CORFU" && "$ORDER" != "2" ]]; then
   echo "ERROR: CORFU is restricted to ORDER=2 in this implementation (got ORDER=$ORDER)."
@@ -36,6 +37,7 @@ BROKER_SETTLE_MS=${BROKER_SETTLE_MS:-300}
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
+export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-$REPLICATION_FACTOR}
 if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
   export EMBARCADERO_CXL_SHM_NAME="/CXL_SHARED_THROUGHPUT_${UID}"
   shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
@@ -80,6 +82,41 @@ wait_for_brokers() {
   done
 }
 
+inspect_replication_layout() {
+  if [ "${REPLICATION_FACTOR:-0}" -le 1 ]; then
+    return
+  fi
+  local repl_root="$PROJECT_ROOT/.Replication"
+  if [ ! -d "$repl_root" ]; then
+    echo "WARNING: replication root '$repl_root' not found; cannot verify multi-disk placement."
+    return
+  fi
+
+  mapfile -t repl_dirs < <(find "$repl_root" -maxdepth 1 -type d -name 'disk*' | sort)
+  if [ "${#repl_dirs[@]}" -lt 2 ]; then
+    echo "WARNING: fewer than 2 replication directories under '$repl_root'; real multi-disk striping is unlikely."
+    return
+  fi
+
+  local -A seen_devs=()
+  local -A dir_to_dev=()
+  for d in "${repl_dirs[@]}"; do
+    local dev
+    dev=$(df -P "$d" 2>/dev/null | awk 'NR==2 {print $1}')
+    if [ -n "$dev" ]; then
+      seen_devs["$dev"]=1
+      dir_to_dev["$d"]="$dev"
+    fi
+  done
+
+  if [ "${#seen_devs[@]}" -lt 2 ]; then
+    echo "WARNING: replication directories share one backing device; ACK2 replication throughput is placement-limited."
+    for d in "${repl_dirs[@]}"; do
+      echo "  $d -> ${dir_to_dev[$d]:-unknown}"
+    done
+  fi
+}
+
 start_cluster() {
   # Start Sequencer if needed
   if [[ "$SEQUENCER" == "CORFU" ]]; then
@@ -109,6 +146,7 @@ start_cluster() {
 # --- Main Execution ---
 overall_status=0
 cleanup
+inspect_replication_layout
 
 for ((trial=1; trial<=NUM_TRIALS; trial++)); do
   echo "=== Trial $trial ($SEQUENCER Order $ORDER, $NUM_BROKERS brokers, msg=$MESSAGE_SIZE) ==="
@@ -123,7 +161,7 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
 
     echo "Running throughput test (type $TEST_TYPE)..."
     TRIAL_LOG="$(mktemp /tmp/throughput_trial_${trial}_${attempt}_XXXX.log)"
-    $CLIENT_NUMA_BIND ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $TOTAL_MESSAGE_SIZE -t $TEST_TYPE -o $ORDER -a $ACK --sequencer $SEQUENCER -l 0 -r 0 2>&1 | tee "$TRIAL_LOG"
+    $CLIENT_NUMA_BIND ./throughput_test --config ../../config/client.yaml -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $TOTAL_MESSAGE_SIZE -t $TEST_TYPE -o $ORDER -a $ACK --sequencer $SEQUENCER -l 0 -r $REPLICATION_FACTOR 2>&1 | tee "$TRIAL_LOG"
     cmd_status=${PIPESTATUS[0]}
 
     if [[ "$TEST_TYPE" == "2" ]]; then

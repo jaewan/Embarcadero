@@ -183,14 +183,18 @@ static_assert(alignof(ControlBlock) == 128, "ControlBlock must be 128-byte align
  * Broker polls ONLY its own slot for export/ACK.
  *
  * WRITERS (max semantics — design §3.4):
- * - ack_level=1: Sequencer advances completed_pbr_head after assigning order (batch visible for export).
- * - ack_level=2: Tail replica advances the SAME slot after replicating the batch to disk.
- * Both use atomic max (CAS: only advance when new value > cur). No regression; safe concurrent writes.
+ * - ack_level=1: Sequencer advances completed_pbr_head and sequencer_logical_offset
+ *   (ordered/export ACK frontier).
+ * - ack_level=2: Tail replica advances completed_logical_offset
+ *   (durable ACK frontier after replication).
+ * All updates are monotonic (CAS/store-max style); no regression.
  *
  * Performance: 8-byte read (vs 256-byte replication_done array) → 32× bandwidth reduction.
  *
  * @threading completed_pbr_head: sequencer and/or tail replica write (monotonic); broker reads
- * @ownership CXL shared; sequencer (ack_level=1) and tail replica (ack_level=2) may both write
+ * @threading sequencer_logical_offset: sequencer writes (monotonic); broker reads
+ * @threading completed_logical_offset: tail replica writes (monotonic); broker reads
+ * @ownership CXL shared; ownership split by frontier semantics above
  * @paper_ref Design §3.4 Completion Vector, Gap Analysis §3.4 ACK Path Efficiency
  *
  * Sentinel: Head initializes completed_pbr_head to (uint64_t)-1; 0 = first batch completed.
@@ -202,13 +206,16 @@ struct alignas(128) CompletionVectorEntry {
 	std::atomic<uint64_t> completed_pbr_head{0};
 
 	// [[ACK_OPTIMIZATION]] Cumulative message count (ACK offset) corresponding to completed_pbr_head.
-	// Updated atomically with (or strictly after) completed_pbr_head.
-	// Readers can read this directly to get ACK count without dereferencing the PBR ring.
+	// Sequencer-owned ordered/export frontier (ACK1 for ORDER=5).
+	// Readers can use this directly without dereferencing the PBR ring.
+	std::atomic<uint64_t> sequencer_logical_offset{0};
+
+	// Durable replication frontier (ACK2). Tail replica advances only after replication completes.
 	std::atomic<uint64_t> completed_logical_offset{0};
 
 	// [[PERF_CRITICAL]] Explicit padding ensures no false sharing with adjacent entries
 	// Modern CPUs prefetch 128+ bytes; misalignment causes ping-pong invalidations
-	uint8_t _explicit_pad[112];
+	uint8_t _explicit_pad[104];
 };
 static_assert(sizeof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be exactly 128 bytes");
 static_assert(alignof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be 128-byte aligned");
@@ -232,6 +239,8 @@ static_assert(alignof(CompletionVectorEntry) == 128, "CompletionVectorEntry must
  */
 struct alignas(128) GOIEntry {
 	// GOI index: position in GOI array (0, 1, 2, ...). Replicas poll GOI[goi_index]; committed_seq is max valid index.
+	// Publication protocol: sequencer writes all other fields first, then writes global_seq last.
+	// Readers must treat global_seq mismatch as "entry not ready".
 	uint64_t global_seq;                       // [[GOI_INDEX]] Same as array index for this entry
 	uint64_t batch_id;                         // Globally unique (broker_id | timestamp | counter)
 	// Message order: starting total_order for this batch; subscriber consumes in this order (design §2.3 Order 5).

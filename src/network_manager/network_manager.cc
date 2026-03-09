@@ -79,6 +79,12 @@ static bool ShouldEnableCorfuLatencyDiag() {
 	return enabled;
 }
 
+static bool ShouldUseUnifiedReplicationPath() {
+	static const bool enabled =
+		ReadEnvBoolLenient("EMBARCADERO_UNIFIED_REPLICATION_PATH", false);
+	return enabled;
+}
+
 /**
  * Closes socket and epoll file descriptors safely
  */
@@ -1497,7 +1503,7 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 	if (ack_level == 2 && replication_factor > 0) {
 		// ORDER=5 (strong ordering): ACK2 frontier is CompletionVector (GOI/chain-replication path).
 		// Non-ORDER5: use legacy replication_done frontier (batch ring replication path).
-		if (seq_type == EMBARCADERO && order == kOrderStrong) {
+		if (seq_type == EMBARCADERO && order == kOrderStrong && !ShouldUseUnifiedReplicationPath()) {
 			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
@@ -1531,7 +1537,7 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 		CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
-		uint64_t fast_completed = my_cv_entry->completed_logical_offset.load(std::memory_order_relaxed);
+		uint64_t fast_completed = my_cv_entry->sequencer_logical_offset.load(std::memory_order_relaxed);
 		if (fast_completed != 0) {
 			fast_read_value = fast_completed;
 		} else {
@@ -1605,7 +1611,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		CXL::flush_cacheline(my_cv_entry);
 		CXL::full_fence();
 
-		uint64_t completed_logical_offset = my_cv_entry->completed_logical_offset.load(std::memory_order_acquire);
+		uint64_t completed_logical_offset = my_cv_entry->sequencer_logical_offset.load(std::memory_order_acquire);
 		volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
 		CXL::flush_cacheline(const_cast<const void*>(
 			reinterpret_cast<const volatile void*>(ordered_ptr)));
@@ -1646,7 +1652,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 
 		// ORDER=5 (strong ordering): ACK2 frontier is CompletionVector (GOI/chain-replication path).
 		// Non-ORDER5: ACK2 frontier is legacy replication_done[] minimum across replication set.
-		if (seq_type == EMBARCADERO && order == kOrderStrong) {
+			if (seq_type == EMBARCADERO && order == kOrderStrong && !ShouldUseUnifiedReplicationPath()) {
 			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 				reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + Embarcadero::kCompletionVectorOffset);
 			CompletionVectorEntry* my_cv_entry = &cv[broker_id_];
@@ -1673,15 +1679,14 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		}
 
 		// Legacy non-ORDER5 replication frontier path.
-		size_t r[replication_factor];
 		for (int i = 0; i < replication_factor; i++) {
 			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
 			volatile uint64_t* rep_done_ptr = &tinode->offsets[b].replication_done[broker_id_];
 			CXL::flush_cacheline(const_cast<const void*>(
 				reinterpret_cast<const volatile void*>(rep_done_ptr)));
 			CXL::full_fence();
-			r[i] = *rep_done_ptr;
-			if (min > r[i]) min = r[i];
+			const size_t val = *rep_done_ptr;
+			if (min > val) min = val;
 		}
 		if (min == std::numeric_limits<size_t>::max()) {
 			return (size_t)-1;
@@ -1728,12 +1733,11 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		// because Sequencer4/5 updates ordered counters per broker
 		// Fallback: Check replication_done for other cases
 		// [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
-		size_t r[replication_factor];
 		for (int i = 0; i < replication_factor; i++) {
 			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
-			r[i] = tinode->offsets[b].replication_done[broker_id_];
-			if (min > r[i]) {
-				min = r[i];
+			const size_t val = tinode->offsets[b].replication_done[broker_id_];
+			if (min > val) {
+				min = val;
 			}
 		}
 		return min;
@@ -1919,23 +1923,24 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		bool found_ack = false;
 		size_t current_ack = (size_t)-1;
 
-		// Fast-path: Read without flush/fence to detect potential changes.
-		auto [fast_read_value, needs_expensive_check] = GetOffsetToAckFast(topic.c_str(), ack_level, last_known_ack);
-		const bool force_full_check = (fast_polls_without_full_check >= kMaxFastPollsBeforeFullCheck);
-		if (needs_expensive_check || force_full_check) {
-			// Value appears to have changed - do expensive check with proper CXL operations.
-			current_ack = GetOffsetToAck(topic.c_str(), ack_level);
-			expensive_checks_since_last_ack++;
-			if (force_full_check) {
-				forced_full_checks_since_last_send++;
+			// Fast-path: Read without flush/fence to detect potential changes.
+			// Safe for ACK2 because durability frontiers are monotonic; stale reads can only delay ACKs.
+			auto [fast_read_value, needs_expensive_check] = GetOffsetToAckFast(topic.c_str(), ack_level, last_known_ack);
+			const bool force_full_check = (fast_polls_without_full_check >= kMaxFastPollsBeforeFullCheck);
+			if (needs_expensive_check || force_full_check) {
+				// Value appears to have changed - do expensive check with proper CXL operations.
+				current_ack = GetOffsetToAck(topic.c_str(), ack_level);
+				expensive_checks_since_last_ack++;
+				if (force_full_check) {
+					forced_full_checks_since_last_send++;
+				}
+				fast_polls_without_full_check = 0;
+			} else {
+				// No change detected - use fast read value.
+				current_ack = fast_read_value;
+				fast_checks_since_last_send++;
+				fast_polls_without_full_check++;
 			}
-			fast_polls_without_full_check = 0;
-		} else {
-			// No change detected - use fast read value.
-			current_ack = fast_read_value;
-			fast_checks_since_last_send++;
-			fast_polls_without_full_check++;
-		}
 
 		if (current_ack != (size_t)-1 && next_to_ack_offset <= current_ack) {
 			found_ack = true;
@@ -1988,7 +1993,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 					CompletionVectorEntry* my_cv = &cv[broker_id_];
 					CXL::flush_cacheline(my_cv);
 					CXL::full_fence();
-					uint64_t cv_logical = my_cv->completed_logical_offset.load(std::memory_order_acquire);
+					uint64_t cv_logical = my_cv->sequencer_logical_offset.load(std::memory_order_acquire);
 					uint64_t cv_pbr = my_cv->completed_pbr_head.load(std::memory_order_acquire);
 					CXL::flush_cacheline(const_cast<const void*>(
 						reinterpret_cast<const volatile void*>(&trace_tinode->offsets[broker_id_])));

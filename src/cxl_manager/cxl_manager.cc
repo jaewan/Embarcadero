@@ -339,6 +339,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 			constexpr uint64_t kCVNoProgress = static_cast<uint64_t>(-1);
 			for (int i = 0; i < NUM_MAX_BROKERS; i++) {
 				completion_vector_[i].completed_pbr_head.store(kCVNoProgress, std::memory_order_release);
+				completion_vector_[i].sequencer_logical_offset.store(0, std::memory_order_release);
 				completion_vector_[i].completed_logical_offset.store(0, std::memory_order_release);
 			}
 
