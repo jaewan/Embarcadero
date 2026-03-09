@@ -142,13 +142,13 @@ ChainReplicationManager::ChainReplicationManager(
         std::filesystem::create_directories(dir, ec);
         const std::string file_path = dir + "/replica_b" + std::to_string(local_broker_id_) +
                                       "_src" + std::to_string(src) + ".dat";
-        int fd = open(file_path.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0644);
+        int fd = open(file_path.c_str(), O_CREAT | O_RDWR, 0644);
         if (fd < 0) {
             // Fallback to /tmp so replication remains available even if configured directory
             // permissions are restrictive on this host.
             const std::string fallback_path = "/tmp/replica_b" + std::to_string(local_broker_id_) +
                                               "_src" + std::to_string(src) + ".dat";
-            fd = open(fallback_path.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0644);
+            fd = open(fallback_path.c_str(), O_CREAT | O_RDWR, 0644);
             if (fd < 0) {
                 LOG(FATAL) << "Failed to open replication disk file: " << file_path
                            << " and fallback: " << fallback_path
@@ -290,24 +290,23 @@ void ChainReplicationManager::ReplicationThread() {
 
                 GOIEntry* entry = &goi_[task.goi_index];
                 const size_t payload_size = static_cast<size_t>(entry->payload_size);
-                const size_t write_size = (payload_size + 4095) & ~4095;
                 const size_t src_idx = static_cast<size_t>(src);
                 const int write_fd = source_disk_fds_[src_idx];
                 const size_t write_off = source_disk_offsets_[src_idx];
-                source_disk_offsets_[src_idx] += write_size;
+                source_disk_offsets_[src_idx] += payload_size;
                 void* payload = reinterpret_cast<uint8_t*>(cxl_addr_) + entry->blog_offset;
 
                 ssize_t written = -1;
                 while (true) {
-                    written = pwrite(write_fd, payload, write_size, write_off);
-                    if (written == static_cast<ssize_t>(write_size)) {
+                    written = pwrite(write_fd, payload, payload_size, write_off);
+                    if (written == static_cast<ssize_t>(payload_size)) {
                         break;
                     }
                     if (written < 0 && (errno == EINTR || errno == EAGAIN)) {
                         continue;
                     }
                     LOG(ERROR) << "ChainReplicationManager: pwrite failed, wrote " << written
-                               << " expected " << write_size << " errno=" << errno
+                               << " expected " << payload_size << " errno=" << errno
                                << " goi_index=" << task.goi_index
                                << " source_broker=" << src;
                     write_error.store(true, std::memory_order_release);
