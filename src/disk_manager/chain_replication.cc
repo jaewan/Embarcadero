@@ -12,11 +12,13 @@
 #include <condition_variable>
 #include <glog/logging.h>
 #include "../common/performance_utils.h"
+#include "../common/env_flags.h"
 #include "../cxl_manager/cxl_datastructure.h"  // CXL namespace
 
 namespace Embarcadero {
 namespace {
 constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
+constexpr size_t kDefaultInMemSinkBytesPerSource = 256UL * 1024UL * 1024UL;  // 256 MiB
 
 struct PendingTokenUpdate {
     uint64_t goi_index{0};
@@ -55,6 +57,46 @@ inline uint64_t SteadyNowNs() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+inline bool ShouldUseInMemorySink() {
+    static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_CHAIN_REPLICATION_INMEM", false);
+    return enabled;
+}
+
+inline size_t InMemorySinkBytesPerSource() {
+    static const size_t bytes = []() {
+        const char* env = std::getenv("EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE");
+        if (!env || !env[0]) return kDefaultInMemSinkBytesPerSource;
+        char* end = nullptr;
+        unsigned long long v = std::strtoull(env, &end, 10);
+        if (end == env || v < 4096ULL) return kDefaultInMemSinkBytesPerSource;
+        return static_cast<size_t>(v);
+    }();
+    return bytes;
+}
+
+inline bool ShouldCopyInMemorySinkPayload() {
+    static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY", false);
+    return enabled;
+}
+
+inline void CopyIntoRing(std::vector<uint8_t>& ring, size_t& write_pos, const void* src, size_t len) {
+    if (ring.empty() || len == 0) return;
+    const size_t cap = ring.size();
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(src);
+    if (len >= cap) {
+        // Keep the latest 'cap' bytes if payload is larger than ring capacity.
+        std::memcpy(ring.data(), p + (len - cap), cap);
+        write_pos = 0;
+        return;
+    }
+    const size_t first = std::min(len, cap - write_pos);
+    std::memcpy(ring.data() + write_pos, p, first);
+    if (first < len) {
+        std::memcpy(ring.data(), p + first, len - first);
+    }
+    write_pos = (write_pos + len) % cap;
+}
+
 }
 
 ChainReplicationManager::ChainReplicationManager(
@@ -77,11 +119,13 @@ ChainReplicationManager::ChainReplicationManager(
     source_disk_fds_.assign(static_cast<size_t>(std::max(0, num_brokers_)), -1);
     source_disk_paths_.assign(static_cast<size_t>(std::max(0, num_brokers_)), std::string());
     source_disk_offsets_.assign(static_cast<size_t>(std::max(0, num_brokers_)), 0);
+    const bool in_memory_sink = ShouldUseInMemorySink();
 
-    if (const char* dirs_env = std::getenv("EMBARCADERO_REPLICA_DISK_DIRS")) {
+    const char* dirs_env = std::getenv("EMBARCADERO_REPLICA_DISK_DIRS");
+    if (!in_memory_sink && dirs_env) {
         disk_dirs_ = SplitCsv(dirs_env);
     }
-    if (disk_dirs_.empty()) {
+    if (!in_memory_sink && disk_dirs_.empty()) {
         if (const char* root_env = std::getenv("EMBARCADERO_REPLICA_DISK_ROOT")) {
             std::error_code ec;
             for (const auto& e : std::filesystem::directory_iterator(root_env, ec)) {
@@ -95,7 +139,7 @@ ChainReplicationManager::ChainReplicationManager(
             }
         }
     }
-    if (disk_dirs_.empty()) {
+    if (!in_memory_sink && disk_dirs_.empty()) {
         // Best-effort auto-discovery for local dev/bench scripts.
         const std::array<std::string, 3> defaults = {
             "../../.Replication",
@@ -117,26 +161,32 @@ ChainReplicationManager::ChainReplicationManager(
             if (!disk_dirs_.empty()) break;
         }
     }
-    std::sort(disk_dirs_.begin(), disk_dirs_.end());
-    disk_dirs_.erase(std::unique(disk_dirs_.begin(), disk_dirs_.end()), disk_dirs_.end());
-    // Keep only writable directories (some mounts may be root-owned in dev envs).
-    std::vector<std::string> writable_dirs;
-    writable_dirs.reserve(disk_dirs_.size());
-    for (const auto& d : disk_dirs_) {
-        if (d.empty()) continue;
-        if (::access(d.c_str(), W_OK | X_OK) == 0) {
-            writable_dirs.push_back(d);
-        } else {
-            LOG(WARNING) << "ChainReplicationManager: skipping non-writable replication dir: " << d;
+    if (!in_memory_sink) {
+        std::sort(disk_dirs_.begin(), disk_dirs_.end());
+        disk_dirs_.erase(std::unique(disk_dirs_.begin(), disk_dirs_.end()), disk_dirs_.end());
+        // Keep only writable directories (some mounts may be root-owned in dev envs).
+        std::vector<std::string> writable_dirs;
+        writable_dirs.reserve(disk_dirs_.size());
+        for (const auto& d : disk_dirs_) {
+            if (d.empty()) continue;
+            if (::access(d.c_str(), W_OK | X_OK) == 0) {
+                writable_dirs.push_back(d);
+            } else {
+                LOG(WARNING) << "ChainReplicationManager: skipping non-writable replication dir: " << d;
+            }
         }
-    }
-    disk_dirs_.swap(writable_dirs);
-    if (disk_dirs_.empty()) {
-        // Fallback to directory of explicit disk_path.
-        disk_dirs_.push_back(std::filesystem::path(disk_path_).parent_path().string());
+        disk_dirs_.swap(writable_dirs);
+        if (disk_dirs_.empty()) {
+            // Fallback to directory of explicit disk_path.
+            disk_dirs_.push_back(std::filesystem::path(disk_path_).parent_path().string());
+        }
     }
 
     for (int src = 0; src < num_brokers_; ++src) {
+        if (in_memory_sink) {
+            source_disk_paths_[static_cast<size_t>(src)] = "[in-memory-sink]";
+            continue;
+        }
         const std::string& dir = disk_dirs_[static_cast<size_t>(src) % disk_dirs_.size()];
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
@@ -163,12 +213,18 @@ ChainReplicationManager::ChainReplicationManager(
         source_disk_fds_[static_cast<size_t>(src)] = fd;
     }
 
+    if (in_memory_sink) {
+        LOG(WARNING) << "ChainReplicationManager: benchmark in-memory sink enabled via "
+                     << "EMBARCADERO_CHAIN_REPLICATION_INMEM=1; ACK2 no longer implies disk durability.";
+    }
+
     LOG(INFO) << "ChainReplicationManager: replica_id=" << replica_id
               << " local_broker_id=" << local_broker_id
               << " num_brokers=" << num_brokers
               << " replication_factor=" << replication_factor
               << " disk_path=" << disk_path
-              << " disk_dirs=" << disk_dirs_.size();
+              << " disk_dirs=" << disk_dirs_.size()
+              << " in_memory_sink=" << in_memory_sink;
     for (int src = 0; src < num_brokers_; ++src) {
         LOG(INFO) << "ChainReplicationManager: source " << src
                   << " -> " << source_disk_paths_[static_cast<size_t>(src)];
@@ -223,6 +279,20 @@ void ChainReplicationManager::ReplicationThread() {
     std::atomic<size_t> queued_writes{0};
     std::atomic<bool> write_error{false};
     std::vector<std::thread> write_workers;
+    const bool in_memory_sink = ShouldUseInMemorySink();
+    const bool in_memory_copy = in_memory_sink && ShouldCopyInMemorySinkPayload();
+    std::vector<std::vector<uint8_t>> in_memory_buffers;
+    std::vector<size_t> in_memory_write_pos;
+    if (in_memory_sink) {
+        in_memory_write_pos.assign(static_cast<size_t>(std::max(0, num_brokers_)), 0);
+    }
+    if (in_memory_copy) {
+        const size_t sink_bytes = InMemorySinkBytesPerSource();
+        in_memory_buffers.resize(static_cast<size_t>(std::max(0, num_brokers_)));
+        for (int src = 0; src < num_brokers_; ++src) {
+            in_memory_buffers[static_cast<size_t>(src)].resize(sink_bytes);
+        }
+    }
     // Bound speculative copy-ahead so token/CV progression stays close to data ingest.
     // Large pending windows create heavy token re-poll churn with little throughput benefit.
     // Keep a deeper in-flight window so data copy can stay ahead while token ownership catches up.
@@ -291,32 +361,41 @@ void ChainReplicationManager::ReplicationThread() {
                 GOIEntry* entry = &goi_[task.goi_index];
                 const size_t payload_size = static_cast<size_t>(entry->payload_size);
                 const size_t src_idx = static_cast<size_t>(src);
-                const int write_fd = source_disk_fds_[src_idx];
-                const size_t write_off = source_disk_offsets_[src_idx];
-                source_disk_offsets_[src_idx] += payload_size;
                 void* payload = reinterpret_cast<uint8_t*>(cxl_addr_) + entry->blog_offset;
-
-                ssize_t written = -1;
-                while (true) {
-                    written = pwrite(write_fd, payload, payload_size, write_off);
-                    if (written == static_cast<ssize_t>(payload_size)) {
-                        break;
+                if (in_memory_sink) {
+                    if (in_memory_copy) {
+                        CopyIntoRing(in_memory_buffers[src_idx], in_memory_write_pos[src_idx], payload, payload_size);
+                    } else {
+                        // Benchmark-only fast sink path: account bytes without full payload copy.
+                        in_memory_write_pos[src_idx] += payload_size;
                     }
-                    if (written < 0 && (errno == EINTR || errno == EAGAIN)) {
-                        continue;
-                    }
-                    LOG(ERROR) << "ChainReplicationManager: pwrite failed, wrote " << written
-                               << " expected " << payload_size << " errno=" << errno
-                               << " goi_index=" << task.goi_index
-                               << " source_broker=" << src;
-                    write_error.store(true, std::memory_order_release);
-                    stop_.store(true, std::memory_order_release);
-                    break;
-                }
-
-                if (!write_error.load(std::memory_order_acquire)) {
                     std::lock_guard<std::mutex> lk(completed_mu);
                     completed_writes.push_back(std::move(task));
+                } else {
+                    const int write_fd = source_disk_fds_[src_idx];
+                    const size_t write_off = source_disk_offsets_[src_idx];
+                    source_disk_offsets_[src_idx] += payload_size;
+                    ssize_t written = -1;
+                    while (true) {
+                        written = pwrite(write_fd, payload, payload_size, write_off);
+                        if (written == static_cast<ssize_t>(payload_size)) {
+                            break;
+                        }
+                        if (written < 0 && (errno == EINTR || errno == EAGAIN)) {
+                            continue;
+                        }
+                        LOG(ERROR) << "ChainReplicationManager: pwrite failed, wrote " << written
+                                   << " expected " << payload_size << " errno=" << errno
+                                   << " goi_index=" << task.goi_index
+                                   << " source_broker=" << src;
+                        write_error.store(true, std::memory_order_release);
+                        stop_.store(true, std::memory_order_release);
+                        break;
+                    }
+                    if (!write_error.load(std::memory_order_acquire)) {
+                        std::lock_guard<std::mutex> lk(completed_mu);
+                        completed_writes.push_back(std::move(task));
+                    }
                 }
                 queued_writes.fetch_sub(1, std::memory_order_release);
             }
@@ -402,7 +481,8 @@ void ChainReplicationManager::ReplicationThread() {
             }
 
             const size_t src_idx = static_cast<size_t>(source_broker);
-            if (src_idx >= source_disk_fds_.size() || source_disk_fds_[src_idx] < 0) {
+            if (!in_memory_sink &&
+                (src_idx >= source_disk_fds_.size() || source_disk_fds_[src_idx] < 0)) {
                 LOG(ERROR) << "ChainReplicationManager: invalid source disk mapping for source_broker="
                            << source_broker;
                 break;
