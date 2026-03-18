@@ -6,9 +6,14 @@
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
+#include <algorithm>
+#include <array>
+#include <filesystem>
 #include <iostream>
 #include <chrono>
 #include <limits>
+#include <sstream>
+#include <vector>
 
 #include "mimalloc.h"
 
@@ -29,6 +34,76 @@ namespace Embarcadero{
 		static const bool enabled =
 			ReadEnvBoolLenient("EMBARCADERO_UNIFIED_REPLICATION_PATH", false);
 		return enabled;
+	}
+
+	static std::vector<std::string> SplitCsvDirs(const char* csv) {
+		std::vector<std::string> dirs;
+		if (csv == nullptr) {
+			return dirs;
+		}
+		std::stringstream ss(csv);
+		std::string item;
+		while (std::getline(ss, item, ',')) {
+			if (!item.empty()) {
+				dirs.push_back(item);
+			}
+		}
+		return dirs;
+	}
+
+	static std::vector<std::string> ResolveWritableReplicationDirs() {
+		std::vector<std::string> dirs;
+		if (const char* dirs_env = std::getenv("EMBARCADERO_REPLICA_DISK_DIRS")) {
+			dirs = SplitCsvDirs(dirs_env);
+		}
+		if (dirs.empty()) {
+			if (const char* root_env = std::getenv("EMBARCADERO_REPLICA_DISK_ROOT")) {
+				std::error_code ec;
+				for (const auto& e : std::filesystem::directory_iterator(root_env, ec)) {
+					if (ec) break;
+					if (!e.is_directory()) continue;
+					const std::string n = e.path().filename().string();
+					if (n.rfind("disk", 0) == 0) {
+						dirs.push_back(e.path().string());
+					}
+				}
+			}
+		}
+		if (dirs.empty()) {
+			const std::array<std::string, 3> defaults = {
+				"../../.Replication",
+				"../.Replication",
+				".Replication"
+			};
+			for (const auto& root : defaults) {
+				std::error_code ec;
+				if (!std::filesystem::exists(root, ec) || ec) continue;
+				for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+					if (ec) break;
+					if (!e.is_directory()) continue;
+					const std::string n = e.path().filename().string();
+					if (n.rfind("disk", 0) == 0) {
+						dirs.push_back(e.path().string());
+					}
+				}
+				if (!dirs.empty()) break;
+			}
+		}
+
+		std::sort(dirs.begin(), dirs.end());
+		dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+
+		std::vector<std::string> writable_dirs;
+		writable_dirs.reserve(dirs.size());
+		for (const auto& d : dirs) {
+			if (d.empty()) continue;
+			if (::access(d.c_str(), W_OK | X_OK) == 0) {
+				writable_dirs.push_back(d);
+			} else {
+				LOG(WARNING) << "DiskManager: skipping non-writable replication dir: " << d;
+			}
+		}
+		return writable_dirs;
 	}
 
 	void memcpy_nt(void* dst, const void* src, size_t size) {
@@ -353,14 +428,24 @@ namespace Embarcadero{
 		          << " source_brokers=" << source_brokers_str;
 		
 		if(!log_to_memory_){
+			const std::vector<std::string> replication_dirs = ResolveWritableReplicationDirs();
+			if (replication_dirs.empty()) {
+				LOG(FATAL) << "DiskManager::Replicate: no writable replication directories available";
+			}
 			for(int i = 0; i< effective_replication_factor; i++){
 				int b = source_brokers[i];
-				int disk_to_write = b % NUM_DISKS ;
-				std::string base_dir = "../../.Replication/disk" + std::to_string(disk_to_write) + "/";
-				std::string base_filename = base_dir+"embarcadero_replication_log"+std::to_string(b) +".dat";
+				const std::string& base_dir = replication_dirs[static_cast<size_t>(b) % replication_dirs.size()];
+				std::error_code ec;
+				std::filesystem::create_directories(base_dir, ec);
+				if (ec) {
+					LOG(FATAL) << "DiskManager::Replicate: failed to create replication dir " << base_dir
+					           << " error=" << ec.message();
+				}
+				std::string base_filename = base_dir+"/embarcadero_replication_log"+std::to_string(b) +".dat";
 				int fd = open(base_filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
 				if(fd == -1){
-					LOG(ERROR) << "File open for replication failed:" << strerror(errno);
+					LOG(FATAL) << "DiskManager::Replicate: file open failed for " << base_filename
+					           << " error=" << strerror(errno);
 				}
 				ReplicationRequest req = {topic_inode, replica_tinode, fd, b};
 				requestQueue_.blockingWrite(req);
