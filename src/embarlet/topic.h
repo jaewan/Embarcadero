@@ -721,8 +721,9 @@ class Topic {
 		std::atomic<uint64_t> order5_hold_timeout_skips_{0};
 		std::atomic<uint64_t> order5_hold_buffer_forced_skips_{0};
 		std::atomic<uint64_t> order5_stale_epoch_skips_{0};
-		// [[B0_TAIL_FIX]] When set, next ProcessLevel5BatchesShard treats all hold entries as expired (shutdown drain).
-		std::atomic<bool> force_expire_hold_on_next_process_{false};
+		// Disconnect/shutdown tail drain: keep force-expiring hold frontiers for a short bounded window
+		// so late-visible batches are not stranded behind a one-shot expiry pulse.
+		std::atomic<uint64_t> force_expire_hold_until_ns_{0};
 	// Epoch buffers for safe collection/sequencing (no concurrent merge/write).
 	EpochBuffer5 epoch_buffers_[3];
 		std::thread epoch_driver_thread_;

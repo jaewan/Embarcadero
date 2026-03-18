@@ -1632,7 +1632,13 @@ bool Topic::PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader
 
 void Topic::RequestOrder5HoldExpiryOnce() {
 	if (seq_type_ == EMBARCADERO && order_ == kOrderStrong) {
-		force_expire_hold_on_next_process_.store(true, std::memory_order_release);
+		constexpr uint64_t kDisconnectForceExpireWindowNs = 250'000'000ULL;  // 250 ms
+		const uint64_t new_deadline = SteadyNowNs() + kDisconnectForceExpireWindowNs;
+		uint64_t cur_deadline = force_expire_hold_until_ns_.load(std::memory_order_acquire);
+		while (cur_deadline < new_deadline &&
+		       !force_expire_hold_until_ns_.compare_exchange_weak(
+		           cur_deadline, new_deadline, std::memory_order_release, std::memory_order_acquire)) {
+		}
 	}
 }
 
@@ -2131,7 +2137,7 @@ void Topic::EnqueueCompletedRange(uint64_t start, uint64_t end) {
 		} else {
 			completed_ranges_enqueue_retries_.fetch_add(1, std::memory_order_relaxed);
 			++spins;
-			if ((spins & 0x3F) == 0) {
+				if ((spins & 0x3F) == 0) {
 				std::this_thread::yield();
 			} else {
 				std::this_thread::sleep_for(std::chrono::microseconds(1));
@@ -2742,15 +2748,21 @@ void Topic::EpochDriverThread() {
 			EpochBuffer5& cur_buf = epoch_buffers_[cur % 3];
 			// Recovery path: if current epoch is already SEALED and no index advance occurred,
 			// re-establish a COLLECTING buffer so scanners cannot livelock on sealed/idle states.
-			if (cur_buf.state.load(std::memory_order_acquire) == EpochBuffer5::State::SEALED) {
-				uint64_t last_seq = last_sequenced_epoch_.load(std::memory_order_acquire);
-				uint64_t next = cur + 1;
-				EpochBuffer5& next_buf = epoch_buffers_[next % 3];
-				EpochBuffer5::State next_state = next_buf.state.load(std::memory_order_acquire);
-				if (next_state == EpochBuffer5::State::COLLECTING) {
-					epoch_index_.store(next, std::memory_order_release);
-					break;
-				}
+				if (cur_buf.state.load(std::memory_order_acquire) == EpochBuffer5::State::SEALED) {
+					uint64_t last_seq = last_sequenced_epoch_.load(std::memory_order_acquire);
+					uint64_t next = cur + 1;
+					EpochBuffer5& next_buf = epoch_buffers_[next % 3];
+					EpochBuffer5::State next_state = next_buf.state.load(std::memory_order_acquire);
+					if (next_state == EpochBuffer5::State::SEALED && last_seq >= cur) {
+						// Tail case: scanners can populate and a prior driver pass can seal the successor
+						// before epoch_index advances. Move forward so the sequencer can consume it.
+						epoch_index_.store(next, std::memory_order_release);
+						break;
+					}
+					if (next_state == EpochBuffer5::State::COLLECTING) {
+						epoch_index_.store(next, std::memory_order_release);
+						break;
+					}
 				if (next_state == EpochBuffer5::State::IDLE && last_seq >= cur) {
 					next_buf.reset_and_start();
 					epoch_index_.store(next, std::memory_order_release);
@@ -2764,12 +2776,16 @@ void Topic::EpochDriverThread() {
 				// COLLECTING successor before returning. Waiting only for IDLE can deadlock
 				// if the successor is already COLLECTING.
 				int wait_iterations = 0;
-				while (!stop_threads_) {
-					EpochBuffer5::State next_state = next_buf.state.load(std::memory_order_acquire);
-					if (next_state == EpochBuffer5::State::COLLECTING) {
-						epoch_index_.store(next, std::memory_order_release);
-						break;
-					}
+					while (!stop_threads_) {
+						EpochBuffer5::State next_state = next_buf.state.load(std::memory_order_acquire);
+						if (next_state == EpochBuffer5::State::SEALED) {
+							epoch_index_.store(next, std::memory_order_release);
+							break;
+						}
+						if (next_state == EpochBuffer5::State::COLLECTING) {
+							epoch_index_.store(next, std::memory_order_release);
+							break;
+						}
 					if (next_state == EpochBuffer5::State::IDLE) {
 						next_buf.reset_and_start();
 						epoch_index_.store(next, std::memory_order_release);
@@ -3276,11 +3292,14 @@ void Topic::EpochSequencerThread() {
 	auto run_idle_hold_tick = [&]() {
 		if (order_ != kOrderStrong || seq_type_ != EMBARCADERO) return;
 		const uint64_t now_ns = SteadyNowNs();
-		if (now_ns - last_idle_hold_tick_ns < 1'000'000ULL || GetTotalHoldBufferSize() == 0) return;
+		const bool force_expire_active =
+			now_ns < force_expire_hold_until_ns_.load(std::memory_order_acquire);
+		const size_t hold_before = GetTotalHoldBufferSize();
+		if (now_ns - last_idle_hold_tick_ns < 1'000'000ULL) return;
+		if (hold_before == 0 && !force_expire_active) return;
 		std::vector<PendingBatch5> idle_level5_empty;
 		std::vector<PendingBatch5> idle_ready_level5;
 		ProcessLevel5Batches(idle_level5_empty, idle_ready_level5);
-		force_expire_hold_on_next_process_.store(false, std::memory_order_release);
 		if (!idle_ready_level5.empty()) {
 			std::array<size_t, NUM_MAX_BROKERS> idle_contiguous_consumed{};
 			std::array<bool, NUM_MAX_BROKERS> idle_broker_seen{};
@@ -3423,9 +3442,8 @@ void Topic::EpochSequencerThread() {
 			}
 		}
 
-		// Process Level 5: hold buffer + gap timeout (§3.2)
-		ProcessLevel5Batches(level5, ready_level5);
-		force_expire_hold_on_next_process_.store(false, std::memory_order_release);
+			// Process Level 5: hold buffer + gap timeout (§3.2)
+			ProcessLevel5Batches(level5, ready_level5);
 
 		// Merge Level 0 + Level 5 ready; preserve order for stable commit (we sort by broker+slot later)
 		if (level5.empty() && ready_level5.empty()) {
@@ -3479,13 +3497,13 @@ void Topic::EpochSequencerThread() {
 			if (epoch_driver_done_.load(std::memory_order_acquire)) {
 				// [[B0_TAIL_FIX]] Force-expire any remaining hold buffer so CV is advanced for tail ACKs.
 				size_t hb = GetTotalHoldBufferSize();
-				if (hb > 0) {
-					LOG(INFO) << "EpochSequencerThread: Final hold-buffer drain (size=" << hb << ") before exit";
-					force_expire_hold_on_next_process_.store(true, std::memory_order_release);
-					std::vector<PendingBatch5> level5_empty, ready_level5;
-					ProcessLevel5Batches(level5_empty, ready_level5);
-					force_expire_hold_on_next_process_.store(false, std::memory_order_release);
-					if (!ready_level5.empty()) {
+					if (hb > 0) {
+						LOG(INFO) << "EpochSequencerThread: Final hold-buffer drain (size=" << hb << ") before exit";
+						force_expire_hold_until_ns_.store(
+							SteadyNowNs() + 20'000'000ULL, std::memory_order_release);
+						std::vector<PendingBatch5> level5_empty, ready_level5;
+						ProcessLevel5Batches(level5_empty, ready_level5);
+						if (!ready_level5.empty()) {
 						std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_cumulative{};
 						std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_pbr_index{};
 						for (auto& shard_ptr : level5_shards_) {
@@ -3592,9 +3610,8 @@ void Topic::EpochSequencerThread() {
 			}
 		}
 
-		std::vector<PendingBatch5> ready_level5;
-		ProcessLevel5Batches(level5, ready_level5);
-		force_expire_hold_on_next_process_.store(false, std::memory_order_release);
+			std::vector<PendingBatch5> ready_level5;
+			ProcessLevel5Batches(level5, ready_level5);
 
 		std::vector<PendingBatch5> ready;
 		for (PendingBatch5& p : level0) ready.push_back(std::move(p));
@@ -4027,14 +4044,21 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	shard.expired_hold_buffer.clear();
 	shard.expired_hold_keys_buffer.clear();
 	shard.expired_hold_keys_buffer.reserve(shard.clients_with_held_batches.size());
+	const bool force_expire_all_frontiers =
+		now_ns < force_expire_hold_until_ns_.load(std::memory_order_acquire);
 	for (size_t cid : shard.clients_with_held_batches) {
 		auto map_it = shard.hold_buffer.find(cid);
 		if (map_it == shard.hold_buffer.end() || map_it->second.empty()) continue;
+		if (force_expire_all_frontiers) {
+			for (const auto& [seq, _] : map_it->second) {
+				shard.expired_hold_keys_buffer.emplace_back(cid, seq);
+			}
+			continue;
+		}
 		const auto front_it = map_it->second.begin();  // ordered map: front is min sequence
 		const size_t min_seq = front_it->first;
 		const auto& front = front_it->second;
-		if (force_expire_hold_on_next_process_.load(std::memory_order_acquire) ||
-		    now_ns - front.hold_start_ns >= GetOrder5HoldTimeoutNs(replication_factor_ > 0)) {
+		if (now_ns - front.hold_start_ns >= GetOrder5HoldTimeoutNs(replication_factor_ > 0)) {
 			shard.expired_hold_keys_buffer.emplace_back(cid, min_seq);
 		}
 	}
