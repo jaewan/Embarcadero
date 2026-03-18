@@ -26,7 +26,6 @@ struct OptimizedClientState {
 	std::array<bool, kWindowSize> window_seen{};
 
 	bool is_duplicate(uint64_t seq) const {
-		if (seq < next_expected) return true;
 		if (seq < window_base) return true;
 		if (seq >= window_base + kWindowSize) return false;
 		return window_seen[seq % kWindowSize];

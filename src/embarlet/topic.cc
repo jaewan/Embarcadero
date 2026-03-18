@@ -2842,56 +2842,69 @@ void Topic::EpochDriverThread() {
 	          << " last_sequenced=" << last_sequenced_epoch_.load(std::memory_order_acquire);
 	EpochBuffer5& final_buf = epoch_buffers_[final_epoch % 3];
 	if (final_buf.seal()) {
-		// After sealing final epoch, reset the NEXT buffer to COLLECTING so scanners can push
-		// late batches that became ready during shutdown.
-		LOG(INFO) << "EpochDriverThread: Resetting next buffer for late-arriving batches";
-		uint64_t next_epoch = final_epoch + 1;
-		EpochBuffer5& next_buf = epoch_buffers_[next_epoch % 3];
-
-		// Keep shutdown bounded: do not exceed test-script grace timeout.
+		// After sealing the final steady-state epoch, keep sealing a small bounded number
+		// of shutdown collection epochs so batches that become visible during disconnect/drain
+		// are not stranded in a trailing COLLECTING buffer.
+		LOG(INFO) << "EpochDriverThread: Resetting trailing buffers for late-arriving batches";
 		constexpr auto kFinalCollectionBudget = std::chrono::milliseconds(1800);
 		constexpr auto kFinalSequencerBudget = std::chrono::milliseconds(1800);
+		constexpr int kMaxTrailingEpochs = 3;
+		uint64_t target_seq = final_epoch + 1;
+		auto collect_deadline = std::chrono::steady_clock::now() + kFinalCollectionBudget;
 
-		// Wait briefly for next buffer to become reusable.
-		auto buf_avail_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-		while (!next_buf.is_available() &&
-		       std::chrono::steady_clock::now() < buf_avail_deadline) {
-			std::this_thread::sleep_for(std::chrono::microseconds(10));
-		}
+		for (int step = 0; step < kMaxTrailingEpochs; ++step) {
+			uint64_t next_epoch = target_seq;
+			EpochBuffer5& next_buf = epoch_buffers_[next_epoch % 3];
+			auto buf_avail_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+			while (!next_buf.is_available() &&
+			       std::chrono::steady_clock::now() < buf_avail_deadline) {
+				std::this_thread::sleep_for(std::chrono::microseconds(10));
+			}
+			if (!next_buf.is_available()) {
+				break;
+			}
 
-		if (next_buf.is_available()) {
 			next_buf.reset_and_start();
 			epoch_index_.store(next_epoch, std::memory_order_release);
-			LOG(INFO) << "EpochDriverThread: Next buffer (epoch " << next_epoch << ") ready for collection";
+			LOG(INFO) << "EpochDriverThread: Trailing epoch " << next_epoch << " ready for collection";
 
-			// Adaptive wait for late arrivals: exit early once collectors are quiescent.
-			auto collect_deadline = std::chrono::steady_clock::now() + kFinalCollectionBudget;
 			int quiescent_checks = 0;
+			bool saw_activity = false;
 			while (std::chrono::steady_clock::now() < collect_deadline) {
 				bool any_active = false;
 				for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
 					if (next_buf.broker_active[i].load(std::memory_order_acquire)) {
 						any_active = true;
+						saw_activity = true;
 						break;
 					}
 				}
 				if (!any_active) {
-					if (++quiescent_checks >= 20) break;  // ~2ms quiescent (20 * 100us)
+					if (++quiescent_checks >= 20) break;  // ~2ms quiescent
 				} else {
 					quiescent_checks = 0;
 				}
 				std::this_thread::sleep_for(std::chrono::microseconds(100));
 			}
 
-			// Seal late-arrival epoch too (do not advance epoch_index_ past this).
-			if (next_buf.seal()) {
-				LOG(INFO) << "EpochDriverThread: Sealed late-arriving epoch " << next_epoch;
+			if (!next_buf.seal()) {
+				break;
+			}
+
+			size_t buffered_batches = 0;
+			for (const auto& q : next_buf.per_broker) buffered_batches += q.size();
+			LOG(INFO) << "EpochDriverThread: Sealed trailing epoch " << next_epoch
+			          << " (buffered_batches=" << buffered_batches
+			          << ", saw_activity=" << (saw_activity ? "yes" : "no") << ")";
+			target_seq = next_epoch + 1;
+
+			if (!saw_activity && buffered_batches == 0) {
+				break;
 			}
 		}
 
-		// Wait for sequencer to process final and late-arriving epochs; bounded for fast shutdown.
+		// Wait for sequencer to process final and trailing epochs; bounded for fast shutdown.
 		auto deadline = std::chrono::steady_clock::now() + kFinalSequencerBudget;
-		uint64_t target_seq = final_epoch + 2;  // Expect sequencer to process both epochs
 		while (last_sequenced_epoch_.load(std::memory_order_acquire) < target_seq &&
 		       std::chrono::steady_clock::now() < deadline) {
 			std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -2968,6 +2981,13 @@ void Topic::CommitEpoch(
 	}
 	uint64_t base_batch_index_order5 = global_batch_seq_.fetch_add(num_goi_order5, std::memory_order_relaxed);
 	size_t goi_idx_order5 = 0;
+	std::array<uint64_t, NUM_MAX_BROKERS> goi_cumulative_tracker{};
+	std::array<uint64_t, NUM_MAX_BROKERS> cv_cumulative_tracker{};
+	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
+		const uint64_t base = tinode_->offsets[b].ordered;
+		goi_cumulative_tracker[b] = base;
+		cv_cumulative_tracker[b] = base;
+	}
 
 	// [COMMIT_DIAG] Count batches committed per broker this epoch
 	std::array<size_t, 8> committed_this_epoch{};
@@ -2981,6 +3001,11 @@ void Topic::CommitEpoch(
 
 			if (p.from_hold) {
 				const HoldBatchMetadata& m = p.hold_meta;
+				const int owner_broker = m.broker_id;
+				const uint64_t cumulative_msg_count =
+					(owner_broker >= 0 && owner_broker < NUM_MAX_BROKERS)
+						? (goi_cumulative_tracker[owner_broker] += m.num_msg)
+						: static_cast<uint64_t>(m.num_msg);
 				entry->total_order = next_order;
 				entry->batch_id = m.batch_id;
 				entry->broker_id = static_cast<uint16_t>(m.broker_id);
@@ -2992,11 +3017,16 @@ void Topic::CommitEpoch(
 				entry->client_id = m.client_id;
 				entry->client_seq = m.batch_seq;
 				entry->pbr_index = m.pbr_absolute_index;
-				entry->cumulative_message_count = m.start_logical_offset + m.num_msg;
+				entry->cumulative_message_count = cumulative_msg_count;
 				// Publish GOI index last so readers never treat a partially-written entry as valid.
 				entry->global_seq = batch_index;
 				next_order += m.num_msg;
 			} else if (p.hdr != nullptr) {
+				const int owner_broker = p.broker_id;
+				const uint64_t cumulative_msg_count =
+					(owner_broker >= 0 && owner_broker < NUM_MAX_BROKERS)
+						? (goi_cumulative_tracker[owner_broker] += p.num_msg)
+						: static_cast<uint64_t>(p.num_msg);
 				p.hdr->total_order = next_order;
 				entry->total_order = next_order;
 				entry->batch_id = p.cached_batch_id;
@@ -3009,7 +3039,7 @@ void Topic::CommitEpoch(
 				entry->client_id = p.client_id;
 				entry->client_seq = p.hdr->batch_seq;
 				entry->pbr_index = p.cached_pbr_absolute_index;
-				entry->cumulative_message_count = p.cached_start_logical_offset + p.num_msg;
+				entry->cumulative_message_count = cumulative_msg_count;
 				// Publish GOI index last so readers never treat a partially-written entry as valid.
 				entry->global_seq = batch_index;
 				next_order += p.num_msg;
@@ -3068,7 +3098,12 @@ void Topic::CommitEpoch(
 
 		if (p.from_hold) {
 			const HoldBatchMetadata& m = p.hold_meta;
-				AccumulateCVUpdate(static_cast<uint16_t>(m.broker_id), m.pbr_absolute_index, m.start_logical_offset + m.num_msg, cv_max_cumulative, cv_max_pbr_index);
+				const int owner_broker = m.broker_id;
+				const uint64_t cumulative_msg_count =
+					(owner_broker >= 0 && owner_broker < NUM_MAX_BROKERS)
+						? (cv_cumulative_tracker[owner_broker] += m.num_msg)
+						: static_cast<uint64_t>(m.num_msg);
+				AccumulateCVUpdate(static_cast<uint16_t>(m.broker_id), m.pbr_absolute_index, cumulative_msg_count, cv_max_cumulative, cv_max_pbr_index);
 				if (replication_factor_ > 0) {
 					size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
 					goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
@@ -3094,7 +3129,12 @@ void Topic::CommitEpoch(
 			if (m.broker_id >= 0 && m.broker_id < static_cast<int>(committed_this_epoch.size()))
 				committed_this_epoch[m.broker_id]++;
 		} else {
-				AccumulateCVUpdate(static_cast<uint16_t>(p.broker_id), p.cached_pbr_absolute_index, p.cached_start_logical_offset + p.num_msg, cv_max_cumulative, cv_max_pbr_index);
+				const int owner_broker = p.broker_id;
+				const uint64_t cumulative_msg_count =
+					(owner_broker >= 0 && owner_broker < NUM_MAX_BROKERS)
+						? (cv_cumulative_tracker[owner_broker] += p.num_msg)
+						: static_cast<uint64_t>(p.num_msg);
+				AccumulateCVUpdate(static_cast<uint16_t>(p.broker_id), p.cached_pbr_absolute_index, cumulative_msg_count, cv_max_cumulative, cv_max_pbr_index);
 				if (replication_factor_ > 0) {
 					size_t ring_pos = goi_timestamp_write_pos_.fetch_add(1, std::memory_order_relaxed) % kGOITimestampRingSize;
 					goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
@@ -3233,12 +3273,34 @@ void Topic::EpochSequencerThread() {
 		          << ",commit_b=" << sequencer_committed_batches_[3].load(std::memory_order_relaxed)
 		          << ",ordered=" << tinode_->offsets[3].ordered << ")";
 	};
+	auto run_idle_hold_tick = [&]() {
+		if (order_ != kOrderStrong || seq_type_ != EMBARCADERO) return;
+		const uint64_t now_ns = SteadyNowNs();
+		if (now_ns - last_idle_hold_tick_ns < 1'000'000ULL || GetTotalHoldBufferSize() == 0) return;
+		std::vector<PendingBatch5> idle_level5_empty;
+		std::vector<PendingBatch5> idle_ready_level5;
+		ProcessLevel5Batches(idle_level5_empty, idle_ready_level5);
+		force_expire_hold_on_next_process_.store(false, std::memory_order_release);
+		if (!idle_ready_level5.empty()) {
+			std::array<size_t, NUM_MAX_BROKERS> idle_contiguous_consumed{};
+			std::array<bool, NUM_MAX_BROKERS> idle_broker_seen{};
+			std::array<uint64_t, NUM_MAX_BROKERS> idle_cv_max_cumulative{};
+			std::array<uint64_t, NUM_MAX_BROKERS> idle_cv_max_pbr_index{};
+			std::vector<const PendingBatch5*> idle_by_slot;
+			std::vector<PendingBatch5> idle_batch_list;
+			CommitEpoch(idle_ready_level5, idle_by_slot, idle_contiguous_consumed, idle_broker_seen,
+			           idle_cv_max_cumulative, idle_cv_max_pbr_index, idle_batch_list,
+			           /*is_drain_mode=*/false);
+		}
+		last_idle_hold_tick_ns = now_ns;
+	};
 
 	while (!stop_threads_) {
 		emit_phase_diag("loop");
 		uint64_t last = last_sequenced_epoch_.load(std::memory_order_acquire);
 		uint64_t current = epoch_index_.load(std::memory_order_acquire);
 		if (last >= current) {
+			run_idle_hold_tick();
 			// [[FIX_SEQUENCER_WAIT_PAUSE]] Replace sleep_for with cpu_pause for epoch waiting.
 			CXL::cpu_pause();
 			CXL::cpu_pause();
@@ -3249,27 +3311,7 @@ void Topic::EpochSequencerThread() {
 		if (buf.state.load(std::memory_order_acquire) != EpochBuffer5::State::SEALED) {
 			// Tail-progress tick: when no epoch is sealed, still age/expire hold-buffer entries
 			// so final batches do not wait indefinitely for new input traffic.
-			if (order_ == kOrderStrong && seq_type_ == EMBARCADERO) {
-				const uint64_t now_ns = SteadyNowNs();
-				if (now_ns - last_idle_hold_tick_ns >= 1'000'000ULL && GetTotalHoldBufferSize() > 0) {
-					std::vector<PendingBatch5> idle_level5_empty;
-					std::vector<PendingBatch5> idle_ready_level5;
-					ProcessLevel5Batches(idle_level5_empty, idle_ready_level5);
-					force_expire_hold_on_next_process_.store(false, std::memory_order_release);
-					if (!idle_ready_level5.empty()) {
-						std::array<size_t, NUM_MAX_BROKERS> idle_contiguous_consumed{};
-						std::array<bool, NUM_MAX_BROKERS> idle_broker_seen{};
-						std::array<uint64_t, NUM_MAX_BROKERS> idle_cv_max_cumulative{};
-						std::array<uint64_t, NUM_MAX_BROKERS> idle_cv_max_pbr_index{};
-						std::vector<const PendingBatch5*> idle_by_slot;
-						std::vector<PendingBatch5> idle_batch_list;
-						CommitEpoch(idle_ready_level5, idle_by_slot, idle_contiguous_consumed, idle_broker_seen,
-						           idle_cv_max_cumulative, idle_cv_max_pbr_index, idle_batch_list,
-						           /*is_drain_mode=*/false);
-					}
-					last_idle_hold_tick_ns = now_ns;
-				}
-			}
+			run_idle_hold_tick();
 			// [[FIX_BUFFER_STATE_PAUSE]] Replace sleep_for with cpu_pause for buffer state waiting.
 			CXL::cpu_pause();
 			CXL::cpu_pause();
