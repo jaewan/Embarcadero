@@ -88,15 +88,20 @@ inspect_replication_layout() {
   if [ "${REPLICATION_FACTOR:-0}" -le 1 ]; then
     return
   fi
-  local repl_root="$PROJECT_ROOT/.Replication"
-  if [ ! -d "$repl_root" ]; then
-    echo "WARNING: replication root '$repl_root' not found; cannot verify multi-disk placement."
-    return
+  local -a repl_dirs=()
+  if [ -n "${EMBARCADERO_REPLICA_DISK_DIRS:-}" ]; then
+    IFS=',' read -r -a repl_dirs <<< "${EMBARCADERO_REPLICA_DISK_DIRS}"
+  else
+    local repl_root="$PROJECT_ROOT/.Replication"
+    if [ ! -d "$repl_root" ]; then
+      echo "WARNING: replication root '$repl_root' not found; cannot verify multi-disk placement."
+      return
+    fi
+    mapfile -t repl_dirs < <(find "$repl_root" -maxdepth 1 -type d -name 'disk*' | sort)
   fi
 
-  mapfile -t repl_dirs < <(find "$repl_root" -maxdepth 1 -type d -name 'disk*' | sort)
   if [ "${#repl_dirs[@]}" -lt 2 ]; then
-    echo "WARNING: fewer than 2 replication directories under '$repl_root'; real multi-disk striping is unlikely."
+    echo "WARNING: fewer than 2 replication directories configured; real multi-disk striping is unlikely."
     return
   fi
 

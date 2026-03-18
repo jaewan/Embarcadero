@@ -20,15 +20,18 @@ mkdir -p "$SNAPSHOT_DIR/scripts/plot" "$SNAPSHOT_DIR/config" "$SNAPSHOT_DIR/docs
   echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "git_commit=$(git rev-parse HEAD)"
   echo "git_branch=$(git rev-parse --abbrev-ref HEAD)"
+  echo "replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}"
   echo "git_status_short_begin"
   git status --short
   echo "git_status_short_end"
   echo "cmake_cache_collect_latency=$(grep -E '^COLLECT_LATENCY_STATS:' build/CMakeCache.txt 2>/dev/null || true)"
 } > "$MANIFEST"
 
-cat > "$COMMANDS" <<'EOF'
+cat > "$COMMANDS" <<EOF
 #!/bin/bash
 set -euo pipefail
+
+export EMBARCADERO_REPLICA_DISK_DIRS="${EMBARCADERO_REPLICA_DISK_DIRS:-}"
 
 # Build
 cmake -S . -B build -DCOLLECT_LATENCY_STATS=ON
@@ -37,13 +40,17 @@ cmake --build build -j
 # Step 6 (ORDER=5 anomaly checks)
 scripts/run_order5_anomaly_checks.sh
 
-# Step 7 (Scalog deferred in current scope)
-MATRIX="EMBARCADERO:0:1:none:unordered_visible_ack EMBARCADERO:5:1:none:per_client_fifo_ack CORFU:2:1:chain:total_order_ack" \
-  scripts/run_baseline_matrix.sh
+# Step 7 (Scalog deferred in current scope; direct runner commands on current tree)
+NUM_BROKERS=4 TEST_TYPE=5 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/run_throughput.sh
+NUM_BROKERS=4 TEST_TYPE=5 ORDER=5 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/run_throughput.sh
+NUM_BROKERS=4 TEST_TYPE=5 ORDER=2 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=CORFU scripts/run_throughput.sh
 
-# Step 8 (validated stable frontier points in this environment)
-TRIALS_PER_POINT=5 SWEEP_TARGETS="1000 1500 2000" TOTAL_BYTES=4294967296 ORDER=5 ACK=1 SEQUENCER=EMBARCADERO CONFIG=config/embarcadero.yaml CLIENT_CONFIG=config/client.yaml POINT_MAX_ATTEMPTS=2 SWEEP_TIMEOUT_CAP_SEC=180 \
-  scripts/run_paper_latency_load_sweep.sh
+# Step 8 (validated stable frontier points in this environment; current tree uses direct sweep runner)
+for trial in 1 2 3 4 5; do
+  SWEEP_TARGETS="1000 1500 2000" TOTAL_BYTES=4294967296 ORDER=5 ACK=1 SEQUENCER=EMBARCADERO CONFIG=config/embarcadero.yaml CLIENT_CONFIG=config/client.yaml POINT_MAX_ATTEMPTS=2 SWEEP_TIMEOUT_CAP_SEC=180 \
+    OUTDIR="data/latency/paper_load_sweep_embarcadero_o5_repro/trial_\${trial}" \
+    scripts/run_throughput_latency_sweep.sh
+done
 
 # Step 9 (Embarcadero canonical ordering ladder)
 SEQUENCER=EMBARCADERO ORDERS="0 5" ACK_LEVELS="0 1 2" TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 NUM_BROKERS=4 TEST_TYPE=5 THREADS_PER_BROKER=4 \
@@ -56,33 +63,48 @@ EOF
 
 chmod +x "$COMMANDS"
 
+hash_if_exists() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    sha256sum "$path"
+  else
+    echo "MISSING $path"
+  fi
+}
+
 {
-  sha256sum scripts/run_order5_anomaly_checks.sh
-  sha256sum scripts/run_baseline_matrix.sh
-  sha256sum scripts/run_paper_latency_load_sweep.sh
-  sha256sum scripts/run_throughput_latency_sweep.sh
-  sha256sum scripts/run_ordering_durability_ladder.sh
-  sha256sum scripts/run_slow_replica_heterogeneity.sh
-  sha256sum scripts/freeze_repro_package.sh
-  sha256sum scripts/plot/aggregate_latency_sweep_ci.py
-  sha256sum scripts/plot/plot_throughput_latency.py
-  sha256sum config/embarcadero.yaml
-  sha256sum config/client.yaml
-  sha256sum docs/LATENCY_EXPERIMENT_CHECKLIST.md
+  hash_if_exists scripts/run_order5_anomaly_checks.sh
+  hash_if_exists scripts/run_throughput.sh
+  hash_if_exists scripts/run_throughput_latency_sweep.sh
+  hash_if_exists scripts/run_ordering_durability_ladder.sh
+  hash_if_exists scripts/run_slow_replica_heterogeneity.sh
+  hash_if_exists scripts/freeze_repro_package.sh
+  hash_if_exists scripts/plot/aggregate_latency_sweep_ci.py
+  hash_if_exists scripts/plot/plot_latency.py
+  hash_if_exists config/embarcadero.yaml
+  hash_if_exists config/client.yaml
+  hash_if_exists docs/LATENCY_EXPERIMENT_CHECKLIST.md
 } > "$HASHES"
 
-cp scripts/run_order5_anomaly_checks.sh "$SNAPSHOT_DIR/scripts/"
-cp scripts/run_baseline_matrix.sh "$SNAPSHOT_DIR/scripts/"
-cp scripts/run_paper_latency_load_sweep.sh "$SNAPSHOT_DIR/scripts/"
-cp scripts/run_throughput_latency_sweep.sh "$SNAPSHOT_DIR/scripts/"
-cp scripts/run_ordering_durability_ladder.sh "$SNAPSHOT_DIR/scripts/"
-cp scripts/run_slow_replica_heterogeneity.sh "$SNAPSHOT_DIR/scripts/"
-cp scripts/freeze_repro_package.sh "$SNAPSHOT_DIR/scripts/"
-cp scripts/plot/aggregate_latency_sweep_ci.py "$SNAPSHOT_DIR/scripts/plot/"
-cp scripts/plot/plot_throughput_latency.py "$SNAPSHOT_DIR/scripts/plot/"
-cp config/embarcadero.yaml "$SNAPSHOT_DIR/config/"
-cp config/client.yaml "$SNAPSHOT_DIR/config/"
-cp docs/LATENCY_EXPERIMENT_CHECKLIST.md "$SNAPSHOT_DIR/docs/"
+copy_if_exists() {
+  local src="$1"
+  local dst="$2"
+  if [ -f "$src" ]; then
+    cp "$src" "$dst"
+  fi
+}
+
+copy_if_exists scripts/run_order5_anomaly_checks.sh "$SNAPSHOT_DIR/scripts/"
+copy_if_exists scripts/run_throughput.sh "$SNAPSHOT_DIR/scripts/"
+copy_if_exists scripts/run_throughput_latency_sweep.sh "$SNAPSHOT_DIR/scripts/"
+copy_if_exists scripts/run_ordering_durability_ladder.sh "$SNAPSHOT_DIR/scripts/"
+copy_if_exists scripts/run_slow_replica_heterogeneity.sh "$SNAPSHOT_DIR/scripts/"
+copy_if_exists scripts/freeze_repro_package.sh "$SNAPSHOT_DIR/scripts/"
+copy_if_exists scripts/plot/aggregate_latency_sweep_ci.py "$SNAPSHOT_DIR/scripts/plot/"
+copy_if_exists scripts/plot/plot_latency.py "$SNAPSHOT_DIR/scripts/plot/"
+copy_if_exists config/embarcadero.yaml "$SNAPSHOT_DIR/config/"
+copy_if_exists config/client.yaml "$SNAPSHOT_DIR/config/"
+copy_if_exists docs/LATENCY_EXPERIMENT_CHECKLIST.md "$SNAPSHOT_DIR/docs/"
 
 find "$SNAPSHOT_DIR" -type f | sort > "$FILES"
 
