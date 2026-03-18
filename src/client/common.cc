@@ -339,7 +339,7 @@ bool CheckHugePagesAvailable(size_t need_bytes) {
 }
 
 void* mmap_large_buffer(size_t need, size_t& allocated) {
-    void* buffer = nullptr;
+    void* buffer = MAP_FAILED;
     size_t map_align = default_huge_page_size();
     
     // Align the needed size to the huge page size

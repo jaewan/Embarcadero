@@ -16,6 +16,7 @@ MESSAGE_SIZE=${MESSAGE_SIZE:-1024}
 TOTAL_BYTES=${TOTAL_BYTES:-524288000}    # 500MB per data point
 ORDER=${ORDER:-0}
 ACK=${ACK:-1}
+REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
 THREADS_PER_BROKER=${THREADS_PER_BROKER:-$([ "$NUM_BROKERS" = "1" ] && echo 1 || echo 3)}
 CONFIG=${CONFIG:-config/embarcadero.yaml}
@@ -34,8 +35,11 @@ mkdir -p "$OUTDIR"
 # --- Environment ---
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-metadata}
+export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-$REPLICATION_FACTOR}
 if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
-  export EMBARCADERO_CXL_SHM_NAME="/CXL_SHARED_SWEEP_${UID}"
+  export EMBARCADERO_CXL_SHM_NAME="/CXL_SHARED_EXPERIMENT_${UID}"
+  shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
+  rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
 fi
 
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
@@ -64,6 +68,7 @@ cleanup() {
   pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
   rm -f /tmp/embarlet_*_ready 2>/dev/null
   if [ "$remove_cxl" = "true" ]; then
+    shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
     rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
   fi
   # Wait for TCP TIME_WAIT on the broker data port to clear
@@ -115,16 +120,16 @@ start_brokers() {
     fi
     rm -f /tmp/embarlet_*_ready
 
+    # Launch followers one at a time to avoid concurrent MAP_POPULATE pressure
+    # on the 64 GiB shared-memory region.
     for ((i=1; i<NUM_BROKERS; i++)); do
       $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" > /tmp/embarlet_${i}.log 2>&1 &
+      if ! wait_for_brokers 180 1; then
+        cleanup
+        return 1
+      fi
+      rm -f /tmp/embarlet_*_ready
     done
-
-    # Wait for the remaining followers (head ready file already consumed).
-    local followers=$((NUM_BROKERS - 1))
-    if ! wait_for_brokers 180 "$followers"; then
-      cleanup
-      return 1
-    fi
   else
     if ! wait_for_brokers 120 1; then
       cleanup
@@ -175,6 +180,7 @@ for target in $SWEEP_TARGETS; do
       -t 2
       -o "$ORDER"
       -a "$ACK"
+      -r "$REPLICATION_FACTOR"
       --sequencer "$SEQUENCER"
       --target_mbps "$target"
       --record_results

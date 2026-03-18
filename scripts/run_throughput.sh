@@ -39,8 +39,9 @@ export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
 export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-$REPLICATION_FACTOR}
 if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
-  export EMBARCADERO_CXL_SHM_NAME="/CXL_SHARED_THROUGHPUT_${UID}"
+  export EMBARCADERO_CXL_SHM_NAME="/CXL_SHARED_EXPERIMENT_${UID}"
   shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
+  rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
 fi
 
 # NUMA binding
@@ -61,6 +62,7 @@ cleanup() {
   pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1
   rm -f /tmp/embarlet_*_ready 2>/dev/null
   shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
+  rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
   sleep 1
 }
 
