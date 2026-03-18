@@ -2234,6 +2234,11 @@ bool Topic::GetMessageAddr(
 		void* &last_addr,
 		void* &messages,
 		size_t &messages_size) {
+	auto advance_order0_cursor = [&](void* payload_end_addr) -> void* {
+		const size_t align = (replication_factor_ > 0) ? 4096UL : 64UL;
+		uintptr_t addr = reinterpret_cast<uintptr_t>(payload_end_addr);
+		return reinterpret_cast<void*>((addr + align - 1) & ~(align - 1));
+	};
 
 	// Determine current read position based on order
 	size_t combined_offset;
@@ -2302,6 +2307,12 @@ bool Topic::GetMessageAddr(
 		combined_offset = tinode_->offsets[broker_id_].written;
 		combined_addr = reinterpret_cast<void*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + static_cast<size_t>(tinode_->offsets[broker_id_].written_addr));
+
+		// No order-0 messages have become visible yet. Starting from first_message_addr_
+		// here can export garbage from a freshly allocated segment before the first batch arrives.
+		if (combined_offset == 0 && last_addr == nullptr) {
+			return false;
+		}
 	}
 
 	// Check if we have new messages. For Order 0, last_offset=(size_t)-1 means unset (publisher sent sentinel); ignore for this check.
@@ -2412,19 +2423,8 @@ bool Topic::GetMessageAddr(
 			messages = static_cast<void*>(start_msg_header);
 		} else {
 			VLOG(2) << "GetMessageAddr: paddedSize=0 at start_msg_header=" << (void*)start_msg_header
-			        << " broker=" << broker_id_ << " topic=" << topic_name_ << " (skipping after re-read)";
-			size_t skip = start_msg_header->next_msg_diff;
-			if (skip == 0) skip = sizeof(MessageHeader) + 64;  // minimal stride fallback
-			MessageHeader* next_msg = reinterpret_cast<MessageHeader*>(
-				reinterpret_cast<uint8_t*>(start_msg_header) + skip);
-			if (next_msg <= combined_addr) {
-				last_addr = next_msg;
-				last_offset = (combined_offset > 0) ? (combined_offset - 1) : 0;
-			} else {
-				// Skip would go past tail; mark as caught up.
-				last_addr = combined_addr;
-				last_offset = combined_offset;
-			}
+			        << " broker=" << broker_id_ << " topic=" << topic_name_
+			        << " (message not visible yet; retrying without advancing cursor)";
 			return false;
 		}
 	} else {
@@ -2475,8 +2475,13 @@ bool Topic::GetMessageAddr(
 		size_t accumulated = 0;
 		MessageHeader* stop_at = nullptr;
 		while (cur != combined_addr) {
+			CXL::flush_cacheline(CXL::ToFlushable(cur));
+			CXL::load_fence();
 			size_t step = cur->paddedSize;
-			if (step == 0) break;
+			if (step == 0) {
+				// Message header not visible yet; do not advance cursor based on stale metadata.
+				break;
+			}
 			if (accumulated + step > kMaxExportBatchBytes) break;
 			accumulated += step;
 			stop_at = cur;
@@ -2487,9 +2492,15 @@ bool Topic::GetMessageAddr(
 			CXL::flush_cacheline(CXL::ToFlushable(stop_at));
 			CXL::load_fence();
 			if (order_ == 0) {
-				last_offset = (combined_offset > 0) ? (combined_offset - 1) : 0;
-				// For order 0, last_addr should always be the NEXT message to read
-				last_addr = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(stop_at) + stop_at->paddedSize);
+				// ORDER=0 uses last_offset as the next unread logical offset/cumulative
+				// count, not the last exported message's logical offset. If we leave this
+				// one behind, the next call treats the end pointer as unread data instead
+				// of reporting "caught up" until newer writes appear.
+				last_offset = stop_at->logical_offset + 1;
+				// ORDER=0 batches are allocated in aligned BLog chunks. Advancing only to
+				// payload end strands the cursor in the post-payload alignment gap.
+				last_addr = advance_order0_cursor(
+					reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(stop_at) + stop_at->paddedSize));
 			} else {
 				last_offset = stop_at->logical_offset;
 				if (last_offset == static_cast<size_t>(-1))
@@ -2499,25 +2510,20 @@ bool Topic::GetMessageAddr(
 			messages_size = reinterpret_cast<uint8_t*>(stop_at) -
 				reinterpret_cast<uint8_t*>(start_msg_header) + stop_at->paddedSize;
 		} else {
-			CXL::flush_cacheline(CXL::ToFlushable(combined_addr));
-			CXL::load_fence();
-			if (order_ == 0) {
-				last_offset = combined_offset;
-			} else {
-				last_offset = reinterpret_cast<MessageHeader*>(combined_addr)->logical_offset;
-			}
-			last_addr = combined_addr;
-			messages_size = full_size;
+			// No fully visible message was available for export yet. Keep the cursor unchanged
+			// and retry instead of speculatively consuming the whole written frontier.
+			return false;
 		}
 	} else {
 		CXL::flush_cacheline(CXL::ToFlushable(combined_addr));
 		CXL::load_fence();
 		if (order_ == 0) {
 			last_offset = combined_offset;
+			last_addr = advance_order0_cursor(combined_addr);
 		} else {
 			last_offset = reinterpret_cast<MessageHeader*>(combined_addr)->logical_offset;
+			last_addr = combined_addr;
 		}
-		last_addr = combined_addr;
 		messages_size = full_size;
 	}
 #endif

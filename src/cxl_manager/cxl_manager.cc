@@ -67,6 +67,14 @@ static int OpenCxlBackingFd(const std::string& shm_name) {
 	return -1;
 }
 
+static bool ShouldPopulateCxlMapping() {
+	const char* env = std::getenv("EMBARCADERO_CXL_MAP_POPULATE");
+	if (!env || env[0] == '\0') {
+		return true;
+	}
+	return !(strcmp(env, "0") == 0 || strcasecmp(env, "false") == 0 || strcasecmp(env, "no") == 0);
+}
+
 static bool MetadataOnlyZeroingEnabled() {
 	const char* env = std::getenv("EMBARCADERO_CXL_ZERO_MODE");
 	if (!env || env[0] == '\0') {
@@ -132,9 +140,10 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 	}
 	// For real CXL on head broker, keep mapping lazy and bind before first-touch.
 	const bool will_mbind = (cxl_type == Real && !dev && broker_id == 0);
+	const bool use_map_populate = !will_mbind && ShouldPopulateCxlMapping();
 	LOG(INFO) << "Mapping CXL shared memory: " << cxl_size << " bytes"
 	          << (will_mbind ? " (lazy populate after mbind to CXL node)"
-	                         : " (MAP_POPULATE)");
+	                         : (use_map_populate ? " (MAP_POPULATE)" : " (lazy populate)"));
 
 	const char* fixed_addr_env = std::getenv("EMBARCADERO_CXL_BASE_ADDR");
 	std::vector<uintptr_t> fixed_addrs;
@@ -161,13 +170,13 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 #ifdef MAP_FIXED_NOREPLACE
 		addr = mmap(reinterpret_cast<void*>(candidate), cxl_size,
 		            PROT_READ | PROT_WRITE,
-		            MAP_SHARED | (will_mbind ? 0 : static_cast<int>(MAP_POPULATE)) | MAP_FIXED_NOREPLACE,
+		            MAP_SHARED | (use_map_populate ? static_cast<int>(MAP_POPULATE) : 0) | MAP_FIXED_NOREPLACE,
 		            cxl_fd, 0);
 #else
 		// Best-effort fallback if MAP_FIXED_NOREPLACE is unavailable.
 		addr = mmap(reinterpret_cast<void*>(candidate), cxl_size,
 		            PROT_READ | PROT_WRITE,
-		            MAP_SHARED | (will_mbind ? 0 : MAP_POPULATE) | MAP_FIXED,
+		            MAP_SHARED | (use_map_populate ? MAP_POPULATE : 0) | MAP_FIXED,
 		            cxl_fd, 0);
 #endif
 		if (addr != MAP_FAILED) {

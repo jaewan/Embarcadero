@@ -35,6 +35,7 @@ mkdir -p "$OUTDIR"
 # --- Environment ---
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-metadata}
+export EMBARCADERO_CXL_MAP_POPULATE=${EMBARCADERO_CXL_MAP_POPULATE:-0}
 export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-$REPLICATION_FACTOR}
 if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
   export EMBARCADERO_CXL_SHM_NAME="/CXL_SHARED_EXPERIMENT_${UID}"
@@ -102,6 +103,7 @@ wait_for_brokers() {
 }
 
 start_brokers() {
+  rm -f /tmp/embarlet_*_ready 2>/dev/null || true
   if [[ "$SEQUENCER" == "CORFU" ]]; then
     ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
     sleep 1
