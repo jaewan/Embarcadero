@@ -1,6 +1,6 @@
 # Embarcadero SOSP/OSDI Latency Experiment Checklist
 
-Last updated: 2026-03-03
+Last updated: 2026-03-19
 
 ## Guardrail (run after every checklist item)
 
@@ -69,6 +69,7 @@ Last updated: 2026-03-03
 | 2026-03-03 | Step 9 rerun S6 (ladder postfix) | Pass | 11.07 | 11.96 | Blocked | Ladder rerun hit deterministic regression at `ORDER=0 ACK=2`: ACK timeout with `received=0/10485760` and per-broker shortfall equal to sent counts on all brokers (reproduced with `TRIAL_MAX_ATTEMPTS=1`, `EMBARCADERO_ACK_TIMEOUT_SEC=60`). `ORDER=5 ACK=2` remains healthy (`11720.74 MB/s`). Partial ladder artifact: `data/latency/ordering_durability_ladder_postfix/ladder.csv` currently contains PASS for `O0A0=11706.92`, `O0A1=11855.34`; `O0A2` blocked. Post-attempt guardrails: Order0 `11074.03 MB/s` (low outlier), Order5 `11960.36 MB/s`. |
 | 2026-03-03 | Step 10 closure S7 (heterogeneity postfix moderate scenario) | Pass | 11.44 | 11.86 | Pass | Ran moderate heterogeneity baseline/injected at `1 GiB`, `ORDER=5 ACK=1` with one paused broker (`+4s`). Summary: `data/latency/slow_replica_step10_postfix_embarcadero/summary.csv`; comparison shows ordered/ack p99 `50024 -> 50069` us (`+0.09%`), deliver p99 `201764 -> 206467` us (`+2.331%`), supporting decoupling trend. Post-item guardrails: Order0 `11440.24 MB/s`, Order5 `11861.90 MB/s`. |
 | 2026-03-03 | Step 11 closure S8 (fresh repro package freeze) | Pass | 11.44 | 11.86 | In progress | Generated fresh package: `data/latency/repro_manifest_step11_postfix/` (`manifest.txt`, `commands.sh`, `script_hashes.txt`, `RERUN.md`, `files_snapshot.txt`). Full command-pack replay is currently blocked on Step 9 due deterministic `ORDER=0 ACK=2` regression above; fix required before claiming full reproducibility replay closure on latest code line. |
+| 2026-03-19 | Step 9/11 continuation S9 (ORDER=0 ACK=2 latency/export fix revalidation) | Pass | 12.13 | 11.68 | In progress | Landed `d12f44c` and revalidated the repaired replicated path. `ORDER=0 ACK=2 RF=2` now passes throughput (`5180.24 MB/s`) and 1 GiB latency sanity at `target=1000 MB/s` (publish/e2e `677.79/677.77 MB/s`, `parsed=recorded=1048576`, `dropped=0`). Matching `ORDER=5 ACK=2 RF=2` latency sanity also passes (`895.83/895.80 MB/s`, exact accounting), but 10 GiB throughput remains unstable on the latest line: most recent single-attempt rerun timed out at `10481906/10485760`, with brokers `B1/B2` each short by one `1927`-message chunk. Fresh current-line ACK1 guardrails: Order0 `12127.72 MB/s`; latest clean Order5 ACK1 pass on the same fix line `11676.50 MB/s` (subsequent rerun re-hit the known shortfall/hang). |
 | 2026-03-01 | Step 12 Task A (Corfu latency path instrumentation/classification) | Pass | 11.64 | 11.68 | Pass | Added explicit subscriber parse/drop counters and timeout diagnostics plus Corfu subscribe/export counters. Failure is now classifiable: Corfu `ORDER=2` shows export starvation (`bytes=0`, `parse_calls=0`), while Corfu `ORDER=3` shows decode mismatch (`bytes~400%`, `metadata_detected=0`, `break_invalid_size>0`, `samples_added=0`). Guardrails after item: 11640.46 MB/s (Order0), 11682.12 MB/s (Order5, second attempt after one transient ACK timeout). |
 
 ## Step-by-step implementation plan
@@ -128,14 +129,14 @@ Last updated: 2026-03-03
   - Aggregated CI file confirms `n=5` per point for e2e throughput and latency quantiles.
 
 ### Step 9: Ordering/durability ladder experiment
-- [x] Run matrix across order levels and ack levels.
+- [ ] Run matrix across order levels and ack levels.
 - [x] Quantify strong-order overhead vs total-order mode.
-- [x] Confirm expected overhead envelope.
+- [ ] Confirm expected overhead envelope.
 - [x] Run guardrail.
-  - Implemented automation script: `scripts/run_ordering_durability_ladder.sh`.
+  - Historical notes reference `scripts/run_ordering_durability_ladder.sh`, but that helper is not present in the current tree; latest postfix verification used direct `scripts/run_throughput.sh` commands plus targeted latency sweep points.
   - Current run scope (Scalog deferred): Embarcadero canonical ordering levels (`order=0,5`) plus Corfu total-order reference point (`order=2, ack=1`) for cross-mode overhead quantification.
-  - Previous instability (`order=5, ack=2` ACK timeout shortfall) is now mitigated by Step 36 fixes; keep this point in ongoing regression suite to confirm long-run stability.
-  - Latest postfix rerun status: **blocked** by a new deterministic `order=0, ack=2` failure (`ack_received=0` across all brokers despite `sent_all=yes`). See `data/latency/ordering_durability_ladder_postfix/`.
+  - `order=0, ack=2` is repaired on the latest code line: throughput passes at `5180.24 MB/s`, and 1 GiB latency sanity passes at `target=1000 MB/s` with exact accounting (`parsed=recorded=1048576`, `dropped=0`).
+  - `order=5, ack=2` still needs closure on the latest line: 1 GiB latency sanity passes (`895.80 MB/s`, exact accounting), but the latest 10 GiB throughput rerun failed with ACK shortfall (`10481906/10485760`, `B1/B2 short=1927` each). Full ladder closure remains blocked on this point.
 
 ### Step 10: Slow-replica heterogeneity experiment
 - [x] Inject one slow replica/disk.
@@ -150,11 +151,12 @@ Last updated: 2026-03-03
 ### Step 11: Final reproducibility package
 - [x] Freeze scripts + config + command lines.
 - [x] Produce final CSV manifest + plotting scripts.
-- [x] Run full rerun from clean state.
+- [ ] Run full rerun from clean state.
 - [x] Run guardrail.
   - Packaging helper: `scripts/freeze_repro_package.sh`.
-  - Full replay completed: `bash data/latency/repro_manifest_step11_round3/commands.sh`.
-  - Remaining blocker from replay/current recheck: Step8 `target=2000 MB/s` remains unstable (`ci_summary` at `n=4` in replay output; focused recheck `trial_1/summary.csv` is `FAIL` after retries).
+  - Historical full replay completed on the older `round3` package: `bash data/latency/repro_manifest_step11_round3/commands.sh`.
+  - The latest code line has new experiment-affecting changes (`79712dd`, `d12f44c`), so replay closure must be re-run from a fresh freeze before we claim final reproducibility.
+  - Current blocker is no longer `ORDER=0 ACK=2`; it is the remaining `ORDER=5 ACK=2` throughput shortfall on the latest line, which prevents honest Step 9/11 closure.
 
 ### Step 12: Corfu ORDER=2 receive/decode/export hardening (2026-03-02)
 - [x] Restrict Corfu to canonical `ORDER=2` at client entry, topic creation, and runner gate.
