@@ -53,9 +53,10 @@ static uint64_t GetOrder5HoldTimeoutNs(bool replicated_ack2_mode) {
 		LOG(WARNING) << "Ignoring invalid EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS='" << env
 		             << "'; using runtime default";
 	}
-	// ACK=2 with replication can legitimately queue longer in hold while durability frontier advances.
-	// 100ms is too aggressive and causes avoidable forced expiry/reordering under load.
-	const uint64_t default_ms = replicated_ack2_mode ? 2000ULL : 100ULL;
+	// Keep the default hold timeout tight enough that replicated ORDER=5 runs do not
+	// accumulate a large disconnect-time expiry wave. The force-expire window still
+	// handles final tail drain explicitly.
+	const uint64_t default_ms = 100ULL;
 	return default_ms * 1000ULL * 1000ULL;
 }
 
@@ -2644,10 +2645,22 @@ void Topic::EpochDriverThread() {
 		while (!stop_threads_ && iterations < kMaxIterations) {
 			uint64_t cur = epoch_index_.load(std::memory_order_acquire);
 			EpochBuffer5& cur_buf = epoch_buffers_[cur % 3];
+			uint64_t last_seq = last_sequenced_epoch_.load(std::memory_order_acquire);
+			EpochBuffer5::State cur_state = cur_buf.state.load(std::memory_order_acquire);
+			// Recovery path: epoch_index must always point at a collectable epoch. If it points at
+			// an IDLE buffer, scanners have nowhere to publish and the sequencer can stall forever.
+			if (cur_state == EpochBuffer5::State::IDLE) {
+				if (cur_buf.reset_and_start()) {
+					break;
+				}
+				cur_state = cur_buf.state.load(std::memory_order_acquire);
+				if (cur_state == EpochBuffer5::State::COLLECTING) {
+					break;
+				}
+			}
 			// Recovery path: if current epoch is already SEALED and no index advance occurred,
 			// re-establish a COLLECTING buffer so scanners cannot livelock on sealed/idle states.
-				if (cur_buf.state.load(std::memory_order_acquire) == EpochBuffer5::State::SEALED) {
-					uint64_t last_seq = last_sequenced_epoch_.load(std::memory_order_acquire);
+				if (cur_state == EpochBuffer5::State::SEALED) {
 					uint64_t next = cur + 1;
 					EpochBuffer5& next_buf = epoch_buffers_[next % 3];
 					EpochBuffer5::State next_state = next_buf.state.load(std::memory_order_acquire);
@@ -4597,19 +4610,32 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			// move epoch_index to an IDLE successor and start collection there.
 			if ((retry_count % 256) == 0) {
 				uint64_t cur_epoch = epoch_index_.load(std::memory_order_acquire);
-				uint64_t last_seq = last_sequenced_epoch_.load(std::memory_order_acquire);
 				EpochBuffer5& cur_buf = epoch_buffers_[cur_epoch % 3];
-				if (cur_buf.state.load(std::memory_order_acquire) == EpochBuffer5::State::SEALED &&
-				    last_seq >= cur_epoch) {
+				EpochBuffer5::State cur_state = cur_buf.state.load(std::memory_order_acquire);
+				if (cur_state == EpochBuffer5::State::IDLE) {
+					cur_buf.reset_and_start();
+				} else if (cur_state == EpochBuffer5::State::SEALED) {
+					uint64_t last_seq = last_sequenced_epoch_.load(std::memory_order_acquire);
+					if (last_seq < cur_epoch) {
+						// Sequencer has not yet consumed the sealed epoch; do not skip ahead.
+						CXL::cpu_pause();
+						++retry_count;
+						if (retry_count % 100 == 0) {
+							std::this_thread::sleep_for(std::chrono::microseconds(10));
+						}
+						continue;
+					}
 					for (int step = 1; step <= 2; ++step) {
 						uint64_t cand_epoch = cur_epoch + static_cast<uint64_t>(step);
 						EpochBuffer5& cand = epoch_buffers_[cand_epoch % 3];
 						if (cand.state.load(std::memory_order_acquire) != EpochBuffer5::State::IDLE) continue;
 						if (!cand.reset_and_start()) {
-							break;
+							continue;
 						}
 						uint64_t expected = cur_epoch;
-						epoch_index_.compare_exchange_strong(expected, cand_epoch, std::memory_order_release);
+						if (!epoch_index_.compare_exchange_strong(expected, cand_epoch, std::memory_order_release)) {
+							cand.state.store(EpochBuffer5::State::IDLE, std::memory_order_release);
+						}
 						break;
 					}
 				}
