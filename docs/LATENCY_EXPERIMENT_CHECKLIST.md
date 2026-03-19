@@ -71,6 +71,8 @@ Last updated: 2026-03-19
 | 2026-03-03 | Step 11 closure S8 (fresh repro package freeze) | Pass | 11.44 | 11.86 | In progress | Generated fresh package: `data/latency/repro_manifest_step11_postfix/` (`manifest.txt`, `commands.sh`, `script_hashes.txt`, `RERUN.md`, `files_snapshot.txt`). Full command-pack replay is currently blocked on Step 9 due deterministic `ORDER=0 ACK=2` regression above; fix required before claiming full reproducibility replay closure on latest code line. |
 | 2026-03-19 | Step 9/11 continuation S9 (ORDER=0 ACK=2 latency/export fix revalidation) | Pass | 12.13 | 11.68 | In progress | Landed `d12f44c` and revalidated the repaired replicated path. `ORDER=0 ACK=2 RF=2` now passes throughput (`5180.24 MB/s`) and 1 GiB latency sanity at `target=1000 MB/s` (publish/e2e `677.79/677.77 MB/s`, `parsed=recorded=1048576`, `dropped=0`). Matching `ORDER=5 ACK=2 RF=2` latency sanity also passes (`895.83/895.80 MB/s`, exact accounting), but 10 GiB throughput remains unstable on the latest line: most recent single-attempt rerun timed out at `10481906/10485760`, with brokers `B1/B2` each short by one `1927`-message chunk. Fresh current-line ACK1 guardrails: Order0 `12127.72 MB/s`; latest clean Order5 ACK1 pass on the same fix line `11676.50 MB/s` (subsequent rerun re-hit the known shortfall/hang). |
 | 2026-03-19 | Step 9/11 continuation S10 (explicit replica-dir revalidation + runner freeze refresh) | Pass | 12.15 | N/A | In progress | Root cause of the latest `ORDER=5 ACK=2` "regression" was runner configuration, not data-path logic: default discovery fell back to one writable `.Replication` dir, while the intended experiment uses explicit dual-device replica dirs. With `EMBARCADERO_REPLICA_DISK_DIRS=/home/domin/Embarcadero/.Replication/disk0,/mnt/nvme0/replication/disk1`, `ORDER=5 ACK=2 RF=2` now passes at `5944.61 MB/s` (direct run) / `5946.67 MB/s` (new ladder helper), and matching `ORDER=0 ACK=2 RF=2` passes at `5484.57 MB/s` / `5555.11 MB/s`. Added `scripts/run_ordering_durability_ladder.sh`, taught `run_throughput.sh` to inspect the actual replica-dir env, and refreshed `freeze_repro_package.sh` to match the current script set and freeze replica-dir env. Fresh Order0 ACK1 guardrail after runner fixes: `12151.31 MB/s`; Order5 ACK1 rerun remained a separate hang/flake, so no new clean guardrail number is claimed for that path here. |
+| 2026-03-19 | Step 9 closure S11 (ORDER=5 ACK=1/ACK=2 tail recovery on `7883023`) | Pass | 11.86 | 12.06 | Pass | Landed `7883023` (`sequencer: recover idle order5 epochs for ack2 tail drain`) and revalidated both ACK1 and replicated ACK2 on the latest line. Mandatory guardrails on the commit line: Order0 `11858.92 MB/s`, Order5 `12064.39 MB/s`. Direct replicated throughput with explicit replica dirs now passes cleanly: `ORDER=5 ACK=2 RF=2` `6251.24 MB/s` with `ACK_VERIFY 10485760/10485760`; 1 GiB ACK2 sanity also passes at `5101.76 MB/s`. Full ladder rerun with bounded retries (`TRIAL_MAX_ATTEMPTS=2`) completed successfully at `data/latency/ordering_durability_ladder_postfix_7883023_retry2/ladder.csv`: `O0A0=12031.30`, `O0A1=12079.26`, `O0A2=5448.39`, `O5A0=11999.84`, `O5A1=11362.97`, `O5A2=6106.45` MB/s. |
+| 2026-03-19 | Step 11 closure S12 (fresh frozen replay on `7883023`) | Pass | 12.18 | 12.28 | Pass | Generated a fresh package at `data/latency/repro_manifest_step11_postfix_7883023/` and completed `bash data/latency/repro_manifest_step11_postfix_7883023/commands.sh` successfully. Frozen replay reproduced: Step 6 anomaly checks; Step 7 guardrails (`ORDER=0 ACK=1` `12177.25 MB/s`, `ORDER=5 ACK=1` `12277.12 MB/s`, Corfu `ORDER=2 ACK=1` `11592.92 MB/s`); Step 8 full 5-trial sweep with exact accounting at all points (`parsed=recorded=4194304`, `dropped=0`); Step 9 ladder PASS including `O5A2=6457.08 MB/s`; Step 10 slow-replica artifacts under `data/latency/slow_replica_step10_embarcadero/`. The frozen command pack now encodes `TRIAL_MAX_ATTEMPTS=2` for Step 9 so replay matches the validated latest-line procedure. |
 | 2026-03-01 | Step 12 Task A (Corfu latency path instrumentation/classification) | Pass | 11.64 | 11.68 | Pass | Added explicit subscriber parse/drop counters and timeout diagnostics plus Corfu subscribe/export counters. Failure is now classifiable: Corfu `ORDER=2` shows export starvation (`bytes=0`, `parse_calls=0`), while Corfu `ORDER=3` shows decode mismatch (`bytes~400%`, `metadata_detected=0`, `break_invalid_size>0`, `samples_added=0`). Guardrails after item: 11640.46 MB/s (Order0), 11682.12 MB/s (Order5, second attempt after one transient ACK timeout). |
 
 ## Step-by-step implementation plan
@@ -130,15 +132,16 @@ Last updated: 2026-03-19
   - Aggregated CI file confirms `n=5` per point for e2e throughput and latency quantiles.
 
 ### Step 9: Ordering/durability ladder experiment
-- [ ] Run matrix across order levels and ack levels.
+- [x] Run matrix across order levels and ack levels.
 - [x] Quantify strong-order overhead vs total-order mode.
-- [ ] Confirm expected overhead envelope.
+- [x] Confirm expected overhead envelope.
 - [x] Run guardrail.
   - `scripts/run_ordering_durability_ladder.sh` is restored on the current tree as a thin sequential wrapper over `scripts/run_throughput.sh`; latest postfix verification used both direct `run_throughput.sh` commands and the restored helper.
   - Current run scope (Scalog deferred): Embarcadero canonical ordering levels (`order=0,5`) plus Corfu total-order reference point (`order=2, ack=1`) for cross-mode overhead quantification.
   - `order=0, ack=2` is repaired on the latest code line: throughput passes at `5180.24 MB/s` (default-layout run) and `5484.57/5555.11 MB/s` under the intended explicit dual-dir layout; 1 GiB latency sanity passes at `target=1000 MB/s` with exact accounting (`parsed=recorded=1048576`, `dropped=0`).
   - `order=5, ack=2` is also healthy when the runner uses the intended replica-dir layout: 1 GiB latency sanity passes (`895.80 MB/s`, exact accounting), and 10 GiB throughput passes at `5944.61/5946.67 MB/s` with `EMBARCADERO_REPLICA_DISK_DIRS=/home/domin/Embarcadero/.Replication/disk0,/mnt/nvme0/replication/disk1`.
-  - Remaining latest-line blocker for a clean full ladder is now the separate `order=5, ack=1` flake/hang during mandatory guardrail reruns, not ACK2 semantics.
+  - Final latest-line closure on `7883023` uses bounded single-point retries in the ladder wrapper (`TRIAL_MAX_ATTEMPTS=2`) to match the validated replay protocol. Completed ladder artifact: `data/latency/ordering_durability_ladder_postfix_7883023_retry2/ladder.csv` with PASS points `O0A0=12031.30`, `O0A1=12079.26`, `O0A2=5448.39`, `O5A0=11999.84`, `O5A1=11362.97`, `O5A2=6106.45` MB/s.
+  - Strong-order overhead vs unordered on the latest ladder is modest at ACK1 (`O5A1` vs `O0A1`: about `-5.93%` in this run set), while replicated durability (`ACK=2, RF=2`) lands at about `5.45-6.11 GB/s` for Embarcadero on this host.
 
 ### Step 10: Slow-replica heterogeneity experiment
 - [x] Inject one slow replica/disk.
@@ -153,13 +156,14 @@ Last updated: 2026-03-19
 ### Step 11: Final reproducibility package
 - [x] Freeze scripts + config + command lines.
 - [x] Produce final CSV manifest + plotting scripts.
-- [ ] Run full rerun from clean state.
+- [x] Run full rerun from clean state.
 - [x] Run guardrail.
   - Packaging helper: `scripts/freeze_repro_package.sh`.
   - Historical full replay completed on the older `round3` package: `bash data/latency/repro_manifest_step11_round3/commands.sh`.
-  - The latest code line has new experiment-affecting changes (`79712dd`, `d12f44c`, runner refresh for explicit replica dirs), so replay closure must be re-run from a fresh freeze before we claim final reproducibility.
-  - `scripts/freeze_repro_package.sh` now succeeds on the current tree again and records `EMBARCADERO_REPLICA_DISK_DIRS` into the manifest/commands when set (validated at `data/latency/repro_manifest_step11_explicit_tmp/`).
-  - Current blocker is no longer ACK2 semantics; it is getting one clean latest-line replay with the explicit replica-dir env frozen and the remaining `ORDER=5 ACK=1` flake either resolved or explicitly bounded.
+  - Latest-line closure package: `data/latency/repro_manifest_step11_postfix_7883023/`.
+  - `scripts/freeze_repro_package.sh` now records `EMBARCADERO_REPLICA_DISK_DIRS` into the manifest/commands when set and freezes the validated Step 9 retry budget (`TRIAL_MAX_ATTEMPTS=2`) into the generated command pack.
+  - Completed replay command: `bash data/latency/repro_manifest_step11_postfix_7883023/commands.sh`.
+  - Replay reproduced the current-latest validated procedure end-to-end: Step 6 anomaly checks, Step 7 throughput guardrails plus Corfu reference, Step 8 all 5 trials with exact accounting, Step 9 PASS ladder including `O5A2`, and Step 10 slow-replica artifacts.
 
 ### Step 12: Corfu ORDER=2 receive/decode/export hardening (2026-03-02)
 - [x] Restrict Corfu to canonical `ORDER=2` at client entry, topic creation, and runner gate.

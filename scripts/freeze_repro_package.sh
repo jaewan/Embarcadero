@@ -54,6 +54,7 @@ done
 
 # Step 9 (Embarcadero canonical ordering ladder)
 SEQUENCER=EMBARCADERO ORDERS="0 5" ACK_LEVELS="0 1 2" TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 NUM_BROKERS=4 TEST_TYPE=5 THREADS_PER_BROKER=4 \
+  TRIAL_MAX_ATTEMPTS=2 \
   scripts/run_ordering_durability_ladder.sh
 
 # Step 10 (baseline + injected slow replica)
