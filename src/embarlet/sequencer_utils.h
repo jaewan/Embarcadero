@@ -26,7 +26,11 @@ struct OptimizedClientState {
 	std::array<bool, kWindowSize> window_seen{};
 
 	bool is_duplicate(uint64_t seq) const {
-		if (seq < window_base) return true;
+		// Late ORDER=5 batches can legitimately arrive after next_expected/window_base have
+		// advanced due to gap-skip or forced expiry. Those batches still need to flow through
+		// emitted-tracker logic so the sequencer can emit them once for ACK/export progress.
+		// Treat only the active window bitmap as authoritative duplicate state here.
+		if (seq < window_base) return false;
 		if (seq >= window_base + kWindowSize) return false;
 		return window_seen[seq % kWindowSize];
 	}

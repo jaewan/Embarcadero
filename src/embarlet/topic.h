@@ -141,11 +141,12 @@ struct ClientEmitTracker {
 
 // [[PHASE_1B]] Epoch buffer state machine to prevent concurrent merge/write.
 struct alignas(64) EpochBuffer5 {
-	enum class State : uint32_t { IDLE, COLLECTING, SEALED };
+	enum class State : uint32_t { IDLE, RESETTING, COLLECTING, SEALED };
 
 	std::atomic<State> state{State::IDLE};
 	std::atomic<bool> broker_active[NUM_MAX_BROKERS];
 	std::mutex seal_mutex;
+	std::mutex data_mu;
 	std::condition_variable seal_cv;
 	std::array<std::deque<PendingBatch5>, NUM_MAX_BROKERS> per_broker;
 
@@ -207,12 +208,20 @@ struct alignas(64) EpochBuffer5 {
 		return true;
 	}
 
-	void reset_and_start() {
-		for (auto& v : per_broker) v.clear();
+	bool reset_and_start() {
+		State expected = State::IDLE;
+		if (!state.compare_exchange_strong(expected, State::RESETTING, std::memory_order_acq_rel)) {
+			return false;
+		}
+		{
+			std::lock_guard<std::mutex> lock(data_mu);
+			for (auto& v : per_broker) v.clear();
+		}
 		for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
 			broker_active[i].store(false, std::memory_order_relaxed);
 		}
 		state.store(State::COLLECTING, std::memory_order_release);
+		return true;
 	}
 
 	bool is_available() const {
@@ -757,7 +766,7 @@ class Topic {
 		std::atomic<bool> level5_shards_started_{false};
 		static constexpr size_t kHoldBufferMaxEntries = 100000;
 		static constexpr uint64_t kOrder5BaseTimeoutNs = 5ULL * 1000 * 1000;  // 5ms wall-clock timeout
-		static constexpr uint64_t kClientTtlEpochs = 20000;
+		static constexpr uint64_t kClientTtlEpochs = 1'000'000;
 		static constexpr uint64_t kClientGcEpochInterval = 1024;
 		static constexpr size_t kDeferredL5MaxEntries = kHoldBufferMaxEntries * 2;
 		alignas(64) std::atomic<uint64_t> current_epoch_for_hold_{0};  // Epoch for hold buffer expiry; atomic for shard workers
@@ -780,14 +789,6 @@ class Topic {
 
 		// [[PHASE_2_FIX]] Per-broker absolute PBR counters (never wrap, for CV tracking)
 		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> broker_pbr_counters_{};
-			// Multi-threaded recv can finish out-of-order; only expose contiguous ORDER=5 PBR slots to scanner/export.
-			struct PendingPBRPublish {
-				BatchHeader header;
-				BatchHeader* slot{nullptr};
-			};
-			absl::Mutex pbr_publish_mu_;
-			uint64_t next_pbr_publish_seq_ ABSL_GUARDED_BY(pbr_publish_mu_) = 0;
-			absl::btree_map<uint64_t, PendingPBRPublish> pending_pbr_publish_ ABSL_GUARDED_BY(pbr_publish_mu_);
 
 	// [[PHASE_3]] Sequencer-driven recovery (§4.2.2): Detect stalled chain replication
 	/**

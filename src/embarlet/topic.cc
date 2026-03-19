@@ -59,6 +59,18 @@ static uint64_t GetOrder5HoldTimeoutNs(bool replicated_ack2_mode) {
 	return default_ms * 1000ULL * 1000ULL;
 }
 
+// Once an ORDER=5 batch is copied into the hold buffer, its original ring slot must stop
+// looking publishable immediately. The eventual from-hold commit cannot safely clear p.hdr,
+// because the ring slot may already have been reused by then.
+static inline void InvalidateOrder5HeldSlot(BatchHeader* hdr) {
+	if (!hdr) return;
+	hdr->batch_complete = 0;
+	__atomic_store_n(&hdr->flags, 0u, __ATOMIC_RELEASE);
+	CXL::flush_cacheline(hdr);
+	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(hdr) + 64);
+	CXL::store_fence();
+}
+
 Topic::Topic(
 		GetNewSegmentCallback get_new_segment,
 		GetNumBrokersCallback get_num_brokers_callback,
@@ -1585,46 +1597,11 @@ bool Topic::PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader
 	if (!batch_header_location) return false;
 
 	if (seq_type_ == EMBARCADERO && order_ == kOrderStrong) {
-		absl::MutexLock lock(&pbr_publish_mu_);
-		if (num_slots_ > 0 && pending_pbr_publish_.size() >= num_slots_) {
-			LOG(ERROR) << "PublishPBRSlotAfterRecv pending frontier overflow: broker=" << broker_id_
-			           << " pending=" << pending_pbr_publish_.size()
-			           << " num_slots=" << num_slots_
-			           << " next_expected_seq=" << next_pbr_publish_seq_
-			           << " incoming_seq=" << batch_header.pbr_absolute_index;
-			return false;
-		}
-		PendingPBRPublish pending{batch_header, batch_header_location};
-		auto [it, inserted] = pending_pbr_publish_.emplace(batch_header.pbr_absolute_index, pending);
-		if (!inserted) {
-			LOG(ERROR) << "PublishPBRSlotAfterRecv duplicate pbr_absolute_index="
-			           << batch_header.pbr_absolute_index << " broker=" << broker_id_;
-			return false;
-		}
-
-		while (true) {
-			auto next_it = pending_pbr_publish_.find(next_pbr_publish_seq_);
-			if (next_it == pending_pbr_publish_.end()) {
-				break;
-			}
-			if (!PublishPBRSlotDirect(next_it->second.header, next_it->second.slot)) {
-				return false;
-			}
-			pending_pbr_publish_.erase(next_it);
-			++next_pbr_publish_seq_;
-		}
-		if (ShouldEnableFrontierTrace()) {
-			static thread_local uint64_t last_frontier_log_ns = 0;
-			const uint64_t now_ns = SteadyNowNs();
-			if (now_ns - last_frontier_log_ns >= 1'000'000'000ULL) {
-				LOG(INFO) << "[FRONTIER_TRACE_PUBLISH B" << broker_id_ << "]"
-				          << " next_publish_seq=" << next_pbr_publish_seq_
-				          << " pending=" << pending_pbr_publish_.size()
-				          << " incoming_seq=" << batch_header.pbr_absolute_index;
-				last_frontier_log_ns = now_ns;
-			}
-		}
-		return true;
+		// ORDER=5 already tolerates out-of-arrival-order batches in the sequencer via per-stream
+		// hold/expiry logic. Delaying slot publication until pbr_absolute_index becomes contiguous
+		// can strand a large tail of fully received batches behind one missing index. Make each
+		// completed batch visible immediately and let the sequencer/CV path recover contiguity.
+		return PublishPBRSlotDirect(batch_header, batch_header_location);
 	}
 
 	return PublishPBRSlotDirect(batch_header, batch_header_location);
@@ -1632,7 +1609,8 @@ bool Topic::PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader
 
 void Topic::RequestOrder5HoldExpiryOnce() {
 	if (seq_type_ == EMBARCADERO && order_ == kOrderStrong) {
-		constexpr uint64_t kDisconnectForceExpireWindowNs = 250'000'000ULL;  // 250 ms
+		const uint64_t kDisconnectForceExpireWindowNs =
+			(replication_factor_ > 0) ? 90'000'000'000ULL : 250'000'000ULL;
 		const uint64_t new_deadline = SteadyNowNs() + kDisconnectForceExpireWindowNs;
 		uint64_t cur_deadline = force_expire_hold_until_ns_.load(std::memory_order_acquire);
 		while (cur_deadline < new_deadline &&
@@ -1766,23 +1744,6 @@ bool Topic::GetBatchToExportWithMetadata(
 	uint64_t ring_slot_pbr_idx = 0;
 	uint32_t ring_slot_flags = 0;
 	uint32_t ring_slot_num_msg = 0;
-
-	// [[EXPORT_DIAG]] Log struct layout once per process only when ORDER5 trace is enabled.
-	if (trace_order5) {
-		static bool layout_logged = false;
-		if (!layout_logged) {
-			size_t bh_off = tinode_->offsets[broker_id_].batch_headers_offset;
-			LOG(INFO) << "[STRUCT_LAYOUT B" << broker_id_ << "]"
-			           << " sizeof(CompletionVectorEntry)=" << sizeof(CompletionVectorEntry)
-			           << " offsetof(completed_pbr_head)=" << offsetof(CompletionVectorEntry, completed_pbr_head)
-			           << " offsetof(completed_logical_offset)=" << offsetof(CompletionVectorEntry, completed_logical_offset)
-			           << " sizeof(BatchHeader)=" << sizeof(BatchHeader)
-			           << " kCompletionVectorOffset=" << kCompletionVectorOffset
-			           << " cxl_addr_=" << cxl_addr_
-			           << " batch_headers_offset=" << bh_off;
-			layout_logged = true;
-		}
-	}
 
 	if (num_slots_ > 0 && cxl_addr_) {
 		CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
@@ -1931,69 +1892,6 @@ bool Topic::GetBatchToExportWithMetadata(
 		return true;
 	}
 
-	// [[EXPORT_DIAG]] Log why export failed every ~2s only when ORDER5 trace is enabled.
-	if (trace_order5) {
-		static thread_local uint64_t diag_fail_count = 0;
-		static thread_local auto last_diag_time = std::chrono::steady_clock::now();
-		diag_fail_count++;
-
-		auto now = std::chrono::steady_clock::now();
-		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_diag_time).count() >= 2) {
-			CompletionVectorEntry* cv_diag = reinterpret_cast<CompletionVectorEntry*>(
-				reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
-			CompletionVectorEntry* my_cv_diag = &cv_diag[broker_id_];
-			CXL::flush_cacheline(my_cv_diag);
-			CXL::full_fence();
-			uint64_t diag_pbr_head = my_cv_diag->completed_pbr_head.load(std::memory_order_acquire);
-			uint64_t diag_logical = my_cv_diag->completed_logical_offset.load(std::memory_order_acquire);
-
-			uint64_t diag_ordered = 0;
-			uint64_t diag_pbr_idx = 0;
-			size_t diag_total_size = 0;
-			uint32_t diag_flags = 0;
-			uint32_t diag_num_msg = 0;
-			size_t diag_off_to_export = 0;
-			if (num_slots_ > 0 && cxl_addr_) {
-				size_t slot = expected_batch_offset % num_slots_;
-				BatchHeader* start_bh = reinterpret_cast<BatchHeader*>(
-					reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
-				BatchHeader* hdr_diag = reinterpret_cast<BatchHeader*>(
-					reinterpret_cast<uint8_t*>(start_bh) + sizeof(BatchHeader) * slot);
-				CXL::flush_cacheline(hdr_diag);
-				CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(hdr_diag) + 64);
-				CXL::full_fence();
-				diag_ordered = hdr_diag->ordered;
-				diag_pbr_idx = hdr_diag->pbr_absolute_index;
-				diag_total_size = hdr_diag->total_size;
-				diag_flags = hdr_diag->flags;
-				diag_num_msg = hdr_diag->num_msg;
-				diag_off_to_export = hdr_diag->batch_off_to_export;
-			}
-
-			CXL::flush_cacheline(const_cast<const void*>(
-				reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_])));
-			CXL::full_fence();
-			size_t diag_tinode_ordered = tinode_->offsets[broker_id_].ordered;
-
-				LOG(INFO) << "[EXPORT_DIAG B" << broker_id_ << "]"
-				           << " fails=" << diag_fail_count
-			           << " next_pbr=" << expected_batch_offset
-			           << " | CV: pbr_head=" << diag_pbr_head
-			           << " logical_offset=" << diag_logical
-			           << " | SLOT: ordered=" << diag_ordered
-			           << " pbr_abs_idx=" << diag_pbr_idx
-			           << " flags=" << diag_flags
-			           << " num_msg=" << diag_num_msg
-			           << " total_size=" << diag_total_size
-			           << " off_to_export=" << diag_off_to_export
-			           << " | TINODE: ordered=" << diag_tinode_ordered
-			           << " | num_slots=" << num_slots_
-			           << " kNoProgress=" << static_cast<uint64_t>(-1);
-
-			last_diag_time = now;
-			diag_fail_count = 0;
-		}
-	}
 	trace_export("miss", "none");
 
 	return false;
@@ -2581,7 +2479,7 @@ void Topic::Sequencer5() {
 	for (int i = 0; i < 3; i++) {
 		epoch_buffers_[i].state.store(EpochBuffer5::State::IDLE, std::memory_order_relaxed);
 	}
-	epoch_buffers_[0].reset_and_start();
+	CHECK(epoch_buffers_[0].reset_and_start());
 
 	// Init per-broker export chain cursors (array: O(1) access in commit path)
 	export_cursor_by_broker_.fill(nullptr);
@@ -2665,7 +2563,7 @@ void Topic::Sequencer2() {
 	for (int i = 0; i < 3; i++) {
 		epoch_buffers_[i].state.store(EpochBuffer5::State::IDLE, std::memory_order_relaxed);
 	}
-	epoch_buffers_[0].reset_and_start();
+	CHECK(epoch_buffers_[0].reset_and_start());
 
 	export_cursor_by_broker_.fill(nullptr);
 	for (int broker_id : registered_brokers) {
@@ -2764,7 +2662,10 @@ void Topic::EpochDriverThread() {
 						break;
 					}
 				if (next_state == EpochBuffer5::State::IDLE && last_seq >= cur) {
-					next_buf.reset_and_start();
+					if (!next_buf.reset_and_start()) {
+						++iterations;
+						continue;
+					}
 					epoch_index_.store(next, std::memory_order_release);
 					break;
 				}
@@ -2787,7 +2688,14 @@ void Topic::EpochDriverThread() {
 							break;
 						}
 					if (next_state == EpochBuffer5::State::IDLE) {
-						next_buf.reset_and_start();
+						if (!next_buf.reset_and_start()) {
+							CXL::cpu_pause();
+							++wait_iterations;
+							if ((wait_iterations % 8192) == 0) {
+								std::this_thread::yield();
+							}
+							continue;
+						}
 						epoch_index_.store(next, std::memory_order_release);
 						break;
 					}
@@ -2815,6 +2723,7 @@ void Topic::EpochDriverThread() {
 						auto state_to_cstr = [](EpochBuffer5::State s) {
 							switch (s) {
 								case EpochBuffer5::State::IDLE: return "IDLE";
+								case EpochBuffer5::State::RESETTING: return "RESETTING";
 								case EpochBuffer5::State::COLLECTING: return "COLLECTING";
 								case EpochBuffer5::State::SEALED: return "SEALED";
 							}
@@ -2862,9 +2771,11 @@ void Topic::EpochDriverThread() {
 		// of shutdown collection epochs so batches that become visible during disconnect/drain
 		// are not stranded in a trailing COLLECTING buffer.
 		LOG(INFO) << "EpochDriverThread: Resetting trailing buffers for late-arriving batches";
-		constexpr auto kFinalCollectionBudget = std::chrono::milliseconds(1800);
-		constexpr auto kFinalSequencerBudget = std::chrono::milliseconds(1800);
-		constexpr int kMaxTrailingEpochs = 3;
+		const auto kFinalCollectionBudget =
+			(replication_factor_ > 0) ? std::chrono::seconds(12) : std::chrono::milliseconds(1800);
+		const auto kFinalSequencerBudget =
+			(replication_factor_ > 0) ? std::chrono::seconds(12) : std::chrono::milliseconds(1800);
+		const int kMaxTrailingEpochs = (replication_factor_ > 0) ? 64 : 3;
 		uint64_t target_seq = final_epoch + 1;
 		auto collect_deadline = std::chrono::steady_clock::now() + kFinalCollectionBudget;
 
@@ -2880,7 +2791,9 @@ void Topic::EpochDriverThread() {
 				break;
 			}
 
-			next_buf.reset_and_start();
+			if (!next_buf.reset_and_start()) {
+				break;
+			}
 			epoch_index_.store(next_epoch, std::memory_order_release);
 			LOG(INFO) << "EpochDriverThread: Trailing epoch " << next_epoch << " ready for collection";
 
@@ -2909,12 +2822,14 @@ void Topic::EpochDriverThread() {
 
 			size_t buffered_batches = 0;
 			for (const auto& q : next_buf.per_broker) buffered_batches += q.size();
+			const size_t held_batches = GetTotalHoldBufferSize();
 			LOG(INFO) << "EpochDriverThread: Sealed trailing epoch " << next_epoch
 			          << " (buffered_batches=" << buffered_batches
+			          << ", held_batches=" << held_batches
 			          << ", saw_activity=" << (saw_activity ? "yes" : "no") << ")";
 			target_seq = next_epoch + 1;
 
-			if (!saw_activity && buffered_batches == 0) {
+			if (!saw_activity && buffered_batches == 0 && held_batches == 0) {
 				break;
 			}
 		}
@@ -3250,6 +3165,7 @@ void Topic::EpochSequencerThread() {
 		auto state_to_cstr = [](EpochBuffer5::State s) {
 			switch (s) {
 				case EpochBuffer5::State::IDLE: return "IDLE";
+				case EpochBuffer5::State::RESETTING: return "RESETTING";
 				case EpochBuffer5::State::COLLECTING: return "COLLECTING";
 				case EpochBuffer5::State::SEALED: return "SEALED";
 			}
@@ -3343,14 +3259,18 @@ void Topic::EpochSequencerThread() {
 		// [PHASE-10a] Pre-allocate batch_list
 		{
 			size_t total = 0;
+			std::lock_guard<std::mutex> data_lock(buf.data_mu);
 			for (const auto& v : buf.per_broker) total += v.size();
 			batch_list.reserve(total);
 		}
-		for (auto& v : buf.per_broker) {
-			batch_list.insert(batch_list.end(),
-				std::make_move_iterator(v.begin()),
-				std::make_move_iterator(v.end()));
-			v.clear();
+		{
+			std::lock_guard<std::mutex> data_lock(buf.data_mu);
+			for (auto& v : buf.per_broker) {
+				batch_list.insert(batch_list.end(),
+					std::make_move_iterator(v.begin()),
+					std::make_move_iterator(v.end()));
+				v.clear();
+			}
 		}
 
 		// [[PERF_OPTIMIZATION]] Minimal prefetching for batch_list processing
@@ -3504,34 +3424,29 @@ void Topic::EpochSequencerThread() {
 						std::vector<PendingBatch5> level5_empty, ready_level5;
 						ProcessLevel5Batches(level5_empty, ready_level5);
 						if (!ready_level5.empty()) {
-						std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_cumulative{};
-						std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_pbr_index{};
-						for (auto& shard_ptr : level5_shards_) {
-							if (!shard_ptr) continue;
-							for (const auto& [bid, cum] : shard_ptr->cv_max_cumulative) {
-								if (bid >= 0 && bid < NUM_MAX_BROKERS && cum > drain_cv_max_cumulative[bid])
-									drain_cv_max_cumulative[bid] = cum;
+							std::array<size_t, NUM_MAX_BROKERS> drain_contiguous_consumed{};
+							std::array<bool, NUM_MAX_BROKERS> drain_broker_seen{};
+							for (const PendingBatch5& p : ready_level5) {
+								int b = p.from_hold ? p.hold_meta.broker_id : p.broker_id;
+								if (b < 0 || b >= NUM_MAX_BROKERS || drain_broker_seen[b]) continue;
+								const volatile void* addr = reinterpret_cast<const volatile void*>(
+									&tinode_->offsets[b].batch_headers_consumed_through);
+								CXL::flush_cacheline(const_cast<const void*>(addr));
+								CXL::load_fence();
+								size_t initial = tinode_->offsets[b].batch_headers_consumed_through;
+								if (initial == BATCHHEADERS_SIZE) initial = 0;
+								drain_contiguous_consumed[b] = initial;
+								drain_broker_seen[b] = true;
 							}
-							for (const auto& [bid, pbr] : shard_ptr->cv_max_pbr_index) {
-								if (bid >= 0 && bid < NUM_MAX_BROKERS && pbr > drain_cv_max_pbr_index[bid])
-									drain_cv_max_pbr_index[bid] = pbr;
-							}
+							std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_cumulative{};
+							std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_pbr_index{};
+							std::vector<const PendingBatch5*> drain_by_slot;
+							std::vector<PendingBatch5> empty_batch_list;
+							CommitEpoch(ready_level5, drain_by_slot, drain_contiguous_consumed, drain_broker_seen,
+							           drain_cv_max_cumulative, drain_cv_max_pbr_index,
+							           empty_batch_list, /*is_drain_mode=*/true);
 						}
-						for (PendingBatch5& p : ready_level5) {
-							if (p.skipped || p.is_held_marker) continue;
-							if (p.from_hold) {
-								const HoldBatchMetadata& m = p.hold_meta;
-								AccumulateCVUpdate(static_cast<uint16_t>(m.broker_id), m.pbr_absolute_index,
-									m.start_logical_offset + m.num_msg, drain_cv_max_cumulative, drain_cv_max_pbr_index);
-							} else if (p.hdr) {
-								AccumulateCVUpdate(static_cast<uint16_t>(p.broker_id), p.cached_pbr_absolute_index,
-									p.cached_start_logical_offset + p.num_msg, drain_cv_max_cumulative, drain_cv_max_pbr_index);
-							}
 						}
-						FlushAccumulatedCV(drain_cv_max_cumulative, drain_cv_max_pbr_index);
-						CXL::store_fence();
-					}
-				}
 				LOG(INFO) << "EpochSequencerThread: Caught up (last=" << last << " current=" << current
 				          << ") and driver done, exiting drain loop";
 				break;
@@ -3548,15 +3463,19 @@ void Topic::EpochSequencerThread() {
 		}
 		{
 			size_t total = 0;
+			std::lock_guard<std::mutex> data_lock(buf.data_mu);
 			for (const auto& v : buf.per_broker) total += v.size();
 			batch_list.reserve(total);
 		}
 		LOG(INFO) << "EpochSequencerThread Drain: Processing epoch " << last << " (buffer " << buffer_idx << ")";
-		for (auto& v : buf.per_broker) {
-			batch_list.insert(batch_list.end(),
-				std::make_move_iterator(v.begin()),
-				std::make_move_iterator(v.end()));
-			v.clear();
+		{
+			std::lock_guard<std::mutex> data_lock(buf.data_mu);
+			for (auto& v : buf.per_broker) {
+				batch_list.insert(batch_list.end(),
+					std::make_move_iterator(v.begin()),
+					std::make_move_iterator(v.end()));
+				v.clear();
+			}
 		}
 		buf.state.store(EpochBuffer5::State::IDLE, std::memory_order_release);
 		last_sequenced_epoch_.store(last + 1, std::memory_order_release);
@@ -3671,6 +3590,16 @@ void Topic::ClientGc(Level5ShardState& shard) {
 	for (const auto& kv : shard.client_state) {
 		const size_t cid = kv.first;
 		const ClientState5& st = kv.second;
+		auto hold_it = shard.hold_buffer.find(cid);
+		if (hold_it != shard.hold_buffer.end() && !hold_it->second.empty()) {
+			continue;
+		}
+		if (shard.clients_with_held_batches.contains(cid)) {
+			continue;
+		}
+		if (!shard.deferred_level5.empty()) {
+			continue;
+		}
 		if (epoch > st.last_epoch && epoch - st.last_epoch > kClientTtlEpochs) {
 			evict.push_back(cid);
 		}
@@ -3791,7 +3720,10 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				}
 				for (PendingBatch5* p : vec) {
 					size_t seq = p->batch_seq;
-					if (state.is_duplicate(seq)) continue;
+					if (state.is_duplicate(seq) &&
+					    emitted.IsEmitted(static_cast<uint64_t>(seq))) {
+						continue;
+					}
 					if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
 						state.mark_sequenced(seq);
 						if (seq >= state.next_expected) state.next_expected = seq + 1;
@@ -3805,8 +3737,10 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					if (seq == state.next_expected) {
 						state.mark_sequenced(seq);
 						state.advance_next_expected();
-						emitted.MarkEmitted(static_cast<uint64_t>(seq));
-						ready.push_back(std::move(*p));
+						if (!CheckAndInsertBatchId(shard, p->cached_batch_id)) {
+							emitted.MarkEmitted(static_cast<uint64_t>(seq));
+							ready.push_back(std::move(*p));
+						}
 					} else if (seq < state.next_expected) {
 						state.mark_sequenced(seq);
 						if (!CheckAndInsertBatchId(shard, p->cached_batch_id)) {
@@ -3850,6 +3784,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						stream_map.emplace(seq, he);
 						shard.hold_buffer_size++;
 						shard.clients_with_held_batches.insert(stream_key);
+						InvalidateOrder5HeldSlot(p->hdr);
 
 						PendingBatch5 marker;
 						marker.broker_id = p->broker_id;
@@ -3898,7 +3833,10 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 
 			for (auto jt = bit; jt != broker_end; ++jt) {
 				size_t seq = jt->batch_seq;
-				if (state.is_duplicate(seq)) continue;
+				if (state.is_duplicate(seq) &&
+				    emitted.IsEmitted(static_cast<uint64_t>(seq))) {
+					continue;
+				}
 				if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
 					state.mark_sequenced(seq);
 					if (seq >= state.next_expected) {
@@ -3916,8 +3854,10 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				if (seq == state.next_expected) {
 					state.mark_sequenced(seq);
 					state.advance_next_expected();
-					emitted.MarkEmitted(static_cast<uint64_t>(seq));
-					ready.push_back(std::move(*jt));
+					if (!CheckAndInsertBatchId(shard, jt->cached_batch_id)) {
+						emitted.MarkEmitted(static_cast<uint64_t>(seq));
+						ready.push_back(std::move(*jt));
+					}
 				} else if (seq < state.next_expected) {
 					state.mark_sequenced(seq);
 					if (!CheckAndInsertBatchId(shard, jt->cached_batch_id)) {
@@ -3970,6 +3910,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					stream_map.emplace(seq, he);
 					shard.hold_buffer_size++;
 					shard.clients_with_held_batches.insert(stream_key);
+					InvalidateOrder5HeldSlot(jt->hdr);
 
 					PendingBatch5 marker;
 					marker.broker_id = jt->broker_id;
@@ -4345,9 +4286,36 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	constexpr size_t kHeartbeatIterations = 1000000; // [[PERF_OPTIMIZATION]] ~1M iterations at 1M/sec = ~1s heartbeat
 	// [[Phase 2.1]] Bounded CLAIMED wait: prevent permanent liveness failure if broker dies mid-write
 	constexpr uint64_t kClaimedHealthCheckIntervalUs = 1ULL * 1000 * 1000;  // Check every 1s
+	const size_t slot_count = BATCHHEADERS_SIZE / sizeof(BatchHeader);
+	constexpr size_t kMaxScannerLeadSlots = 256;
+	std::vector<uint64_t> last_pushed_pbr_index_per_slot(slot_count, std::numeric_limits<uint64_t>::max());
 
 
 	while (!stop_threads_) {
+		// If sequencer has already advanced the authoritative consumed frontier beyond our current
+		// scanner cursor, jump forward. Otherwise the scanner can keep replaying an already-processed
+		// prefix whose slots still look locally readable.
+		{
+			const void* consumed_addr = const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(
+					&tinode_->offsets[broker_id].batch_headers_consumed_through));
+			CXL::flush_cacheline(consumed_addr);
+			CXL::load_fence();
+			size_t consumed = tinode_->offsets[broker_id].batch_headers_consumed_through;
+			if (consumed == BATCHHEADERS_SIZE) consumed = 0;
+			if (consumed < BATCHHEADERS_SIZE && (consumed % sizeof(BatchHeader)) == 0) {
+				const size_t consumed_slot = consumed / sizeof(BatchHeader);
+				const size_t current_slot = static_cast<size_t>(scanner_slot_seq % slot_count);
+				const size_t forward = (consumed_slot + slot_count - current_slot) % slot_count;
+				if (forward > 0 && forward < (slot_count / 2)) {
+					current_batch_header = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(ring_start_default) + consumed);
+					scanner_slot_seq += forward;
+					hole_wait_start_ns = 0;
+					idle_cycles = 0;
+				}
+			}
+		}
 
 		// [[PERF_CRITICAL]] Conservative prefetching to hide CXL latency (200-500ns)
 		// Prefetch 2 slots ahead (256 bytes) - matches original tuning for optimal CXL performance
@@ -4407,6 +4375,26 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			// Only truly empty slots (!VALID && !CLAIMED) are tail.
 			// VALID-with-bad-num_msg is treated as in-flight metadata visibility lag and follows bounded wait.
 			if (!is_claimed && !is_valid) {
+				// Re-sync to the authoritative consumed frontier when the scanner lands on an
+				// already-processed empty slot after wrap/skip/drain progress elsewhere.
+				const void* consumed_addr = const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(
+						&tinode_->offsets[broker_id].batch_headers_consumed_through));
+				CXL::flush_cacheline(consumed_addr);
+				CXL::load_fence();
+				size_t consumed = tinode_->offsets[broker_id].batch_headers_consumed_through;
+				if (consumed == BATCHHEADERS_SIZE) consumed = 0;
+				if (consumed < BATCHHEADERS_SIZE && (consumed % sizeof(BatchHeader)) == 0) {
+					BatchHeader* consumed_header = reinterpret_cast<BatchHeader*>(
+						reinterpret_cast<uint8_t*>(ring_start_default) + consumed);
+					if (consumed_header != current_batch_header) {
+						current_batch_header = consumed_header;
+						scanner_slot_seq = static_cast<uint64_t>(consumed / sizeof(BatchHeader));
+						hole_wait_start_ns = 0;
+						idle_cycles = 0;
+						continue;
+					}
+				}
 				hole_wait_start_ns = 0;
 				++idle_cycles;
 				if (idle_cycles >= kIdleCyclesThreshold) {
@@ -4506,7 +4494,10 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 					uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 					EpochBuffer5& buf = epoch_buffers_[epoch % 3];
 					if (buf.enter_collection(broker_id)) {
-						buf.per_broker[broker_id].push_back(skip_marker);
+						{
+							std::lock_guard<std::mutex> data_lock(buf.data_mu);
+							buf.per_broker[broker_id].push_back(skip_marker);
+						}
 						buf.exit_collection(broker_id);
 							BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
 								reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
@@ -4540,7 +4531,6 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		VLOG(3) << "BrokerScannerWorker5 [B" << broker_id << "]: Collecting batch with "
 		        << num_msg_check << " messages, batch_seq=" << current_batch_header->batch_seq
 		        << ", client_id=" << current_batch_header->client_id;
-
 	size_t slot_offset = reinterpret_cast<uint8_t*>(current_batch_header) -
 		reinterpret_cast<uint8_t*>(ring_start_default);
 	PendingBatch5 pending;
@@ -4558,6 +4548,29 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	pending.cached_pbr_absolute_index = current_batch_header->pbr_absolute_index;
 	pending.cached_start_logical_offset = current_batch_header->start_logical_offset;
 
+	// A valid slot stays readable until the sequencer clears it. Under backlog the scanner can
+	// wrap and revisit that same header before consumed_through catches up, which re-enqueues the
+	// exact same batch many times. Suppress scanner-side duplicates using the published
+	// per-broker absolute PBR index recorded in the slot.
+	const size_t slot_index = slot_offset / sizeof(BatchHeader);
+	if (slot_index < last_pushed_pbr_index_per_slot.size() &&
+	    last_pushed_pbr_index_per_slot[slot_index] == pending.cached_pbr_absolute_index) {
+		const void* consumed_addr = const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(
+				&tinode_->offsets[broker_id].batch_headers_consumed_through));
+		CXL::flush_cacheline(consumed_addr);
+		CXL::load_fence();
+		size_t consumed = tinode_->offsets[broker_id].batch_headers_consumed_through;
+		if (consumed == BATCHHEADERS_SIZE) consumed = 0;
+		if (consumed < BATCHHEADERS_SIZE && (consumed % sizeof(BatchHeader)) == 0) {
+			current_batch_header = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(ring_start_default) + consumed);
+			scanner_slot_seq = static_cast<uint64_t>(consumed / sizeof(BatchHeader));
+		}
+		std::this_thread::yield();
+		continue;
+	}
+
 	// [[COMPLETE_DATA_LOSS_FIX]] Once batch is ready, it MUST be pushed to epoch buffer
 	// before advancing the scanner position. This ensures no batches are lost during shutdown.
 	// Spin-wait until we successfully push to an available epoch buffer.
@@ -4572,7 +4585,10 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				EpochBuffer5& buf = epoch_buffers_[(epoch + static_cast<uint64_t>(i)) % 3];
 				if (!buf.enter_collection(broker_id)) continue;
 				// Successfully entered collection; push the batch.
-				buf.per_broker[broker_id].push_back(pending);
+				{
+					std::lock_guard<std::mutex> data_lock(buf.data_mu);
+					buf.per_broker[broker_id].push_back(pending);
+				}
 				buf.exit_collection(broker_id);
 				pushed = true;
 			}
@@ -4589,7 +4605,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 						uint64_t cand_epoch = cur_epoch + static_cast<uint64_t>(step);
 						EpochBuffer5& cand = epoch_buffers_[cand_epoch % 3];
 						if (cand.state.load(std::memory_order_acquire) != EpochBuffer5::State::IDLE) continue;
-						cand.reset_and_start();
+						if (!cand.reset_and_start()) {
+							break;
+						}
 						uint64_t expected = cur_epoch;
 						epoch_index_.compare_exchange_strong(expected, cand_epoch, std::memory_order_release);
 						break;
@@ -4614,6 +4632,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				auto state_to_cstr = [](EpochBuffer5::State s) {
 					switch (s) {
 						case EpochBuffer5::State::IDLE: return "IDLE";
+						case EpochBuffer5::State::RESETTING: return "RESETTING";
 						case EpochBuffer5::State::COLLECTING: return "COLLECTING";
 						case EpochBuffer5::State::SEALED: return "SEALED";
 					}
@@ -4640,6 +4659,26 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	total_batches_processed++;
 	scanner_pushed_batches_[broker_id].fetch_add(1, std::memory_order_relaxed);
 	scanner_pushed_msgs_[broker_id].fetch_add(static_cast<uint64_t>(pending.num_msg), std::memory_order_relaxed);
+	if (slot_index < last_pushed_pbr_index_per_slot.size()) {
+		last_pushed_pbr_index_per_slot[slot_index] = pending.cached_pbr_absolute_index;
+	}
+	{
+		const void* consumed_addr = const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(
+				&tinode_->offsets[broker_id].batch_headers_consumed_through));
+		CXL::flush_cacheline(consumed_addr);
+		CXL::load_fence();
+		size_t consumed = tinode_->offsets[broker_id].batch_headers_consumed_through;
+		if (consumed == BATCHHEADERS_SIZE) consumed = 0;
+		if (consumed < BATCHHEADERS_SIZE && (consumed % sizeof(BatchHeader)) == 0) {
+			const size_t consumed_slot = consumed / sizeof(BatchHeader);
+			const size_t next_slot = static_cast<size_t>(scanner_slot_seq % slot_count);
+			const size_t lead = (next_slot + slot_count - consumed_slot) % slot_count;
+			if (lead > kMaxScannerLeadSlots) {
+				std::this_thread::yield();
+			}
+		}
+	}
 	idle_cycles = 0;
 
 	// Periodic status logging (VLOG to avoid hot-path overhead during throughput tests)
@@ -4713,7 +4752,10 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				uint64_t epoch = epoch_index_.load(std::memory_order_acquire);
 				EpochBuffer5& buf = epoch_buffers_[epoch % 3];
 				if (buf.enter_collection(broker_id)) {
-					buf.per_broker[broker_id].push_back(pending);
+					{
+						std::lock_guard<std::mutex> data_lock(buf.data_mu);
+						buf.per_broker[broker_id].push_back(pending);
+					}
 					buf.exit_collection(broker_id);
 					pushed = true;
 					drain_pushed++;
@@ -4758,24 +4800,44 @@ void Topic::AdvanceConsumedThroughForProcessedSlots(
     const std::array<bool, NUM_MAX_BROKERS>& broker_seen_in_epoch,
     const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_cumulative,
     const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_pbr_index) {
-
-	std::vector<const PendingBatch5*> by_slot;
-	by_slot.reserve(batch_list.size());
-	for (const PendingBatch5& p : batch_list) by_slot.push_back(&p);
-	std::sort(by_slot.begin(), by_slot.end(),
-		[](const PendingBatch5* a, const PendingBatch5* b) {
-			if (a->broker_id != b->broker_id) return a->broker_id < b->broker_id;
-			return a->slot_offset < b->slot_offset;
-		});
-	for (const PendingBatch5* p : by_slot) {
-		int b = p->broker_id;
-		if (b < 0 || b >= NUM_MAX_BROKERS) continue;
-		size_t& next_expected = contiguous_consumed_per_broker[b];
-		if (p->slot_offset == next_expected ||
-		    (next_expected == BATCHHEADERS_SIZE && p->slot_offset == 0)) {
-			next_expected = p->slot_offset + sizeof(BatchHeader);
-			if (next_expected >= BATCHHEADERS_SIZE) next_expected = BATCHHEADERS_SIZE;
+	if (batch_list.empty()) {
+		if (cv_max_cumulative && cv_max_pbr_index) {
+			FlushAccumulatedCV(*cv_max_cumulative, *cv_max_pbr_index);
 		}
+		CXL::store_fence();
+		return;
+	}
+
+	const size_t slot_size = sizeof(BatchHeader);
+	const size_t slot_count = BATCHHEADERS_SIZE / slot_size;
+	std::array<std::vector<uint8_t>, NUM_MAX_BROKERS> processed_slots;
+	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
+		if (broker_seen_in_epoch[b]) {
+			processed_slots[b].assign(slot_count, 0);
+		}
+	}
+	for (const PendingBatch5& p : batch_list) {
+		int b = p.broker_id;
+		if (b < 0 || b >= NUM_MAX_BROKERS || !broker_seen_in_epoch[b]) continue;
+		if (p.slot_offset >= BATCHHEADERS_SIZE) continue;
+		if ((p.slot_offset % slot_size) != 0) continue;
+		processed_slots[b][p.slot_offset / slot_size] = 1;
+	}
+	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
+		if (!broker_seen_in_epoch[b]) continue;
+		size_t next_expected = contiguous_consumed_per_broker[b];
+		if (next_expected == BATCHHEADERS_SIZE || next_expected >= BATCHHEADERS_SIZE) {
+			next_expected = 0;
+		}
+		if ((next_expected % slot_size) != 0) continue;
+		size_t next_slot = next_expected / slot_size;
+		size_t advanced = 0;
+		while (advanced < slot_count && processed_slots[b][next_slot]) {
+			next_slot = (next_slot + 1) % slot_count;
+			advanced++;
+		}
+		contiguous_consumed_per_broker[b] =
+			(next_slot == 0) ? BATCHHEADERS_SIZE : (next_slot * slot_size);
 	}
 	// Write back consumed_through advances
 	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
