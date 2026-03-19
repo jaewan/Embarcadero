@@ -47,6 +47,7 @@ function build_and_install_cmake_project() {
 
 function install_dependencies() {
     local packages=(
+        "cmake"
         "build-essential"
         "git"
         "numactl"
