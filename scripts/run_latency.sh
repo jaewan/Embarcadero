@@ -5,6 +5,7 @@ export EMBARCADERO_RUNTIME_MODE="${EMBARCADERO_RUNTIME_MODE:-latency}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/lib/broker_lifecycle.sh"
 BIN_DIR="$PROJECT_ROOT/build/bin"
 DATA_DIR="$PROJECT_ROOT/data/latency"
 
@@ -31,6 +32,7 @@ REMOTE_PID_FILE="${REMOTE_PID_FILE:-/tmp/remote_seq.pid}"
 
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
 CLIENT_NUMA_BIND="${CLIENT_NUMA_BIND:-numactl --cpunodebind=0 --membind=0}"
+broker_init_paths
 
 # Canonical order levels:
 # - EMBARCADERO strong ordering => order=5
@@ -81,6 +83,23 @@ stop_remote_sequencer() {
 EOF
 }
 
+start_brokers() {
+  if broker_is_remote_mode; then
+    echo "Using remote broker host: $REMOTE_BROKER_HOST"
+    broker_ensure_cluster "$NUM_BROKERS" 120 "$sequencer"
+    return $?
+  fi
+
+  start_process "$EMBARLET_NUMA_BIND ./embarlet --head --$sequencer"
+  wait_for_signal
+
+  for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
+    start_process "$EMBARLET_NUMA_BIND ./embarlet --$sequencer"
+    wait_for_signal
+  done
+  return 0
+}
+
 mkdir -p "$DATA_DIR"
 
 pushd "$BIN_DIR" >/dev/null
@@ -112,20 +131,16 @@ for mode in "${modes[@]}"; do
         start_remote_sequencer "scalog_global_sequencer"
       fi
 
-      start_process "$EMBARLET_NUMA_BIND ./embarlet --head --$sequencer"
-      wait_for_signal
-      sleep 3
+      if ! start_brokers; then
+        echo "ERROR: broker startup failed"
+        exit 1
+      fi
 
-      for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-        start_process "$EMBARLET_NUMA_BIND ./embarlet --$sequencer"
-        wait_for_signal
-      done
-      sleep 3
-
+      local_head_addr="${EMBARCADERO_HEAD_ADDR:-${REMOTE_HEAD_ADDR:-127.0.0.1}}"
       if [[ "$mode" == "steady" ]]; then
-        start_process "$CLIENT_NUMA_BIND ./throughput_test -m $MSG_SIZE -s $TOTAL_MESSAGE_SIZE --record_results -t $TEST_CASE -o $order -a $ACK_LEVEL --sequencer $sequencer -r 1 --steady_rate --target_mbps $TARGET_MBPS"
+        start_process "$CLIENT_NUMA_BIND ./throughput_test --config $CLIENT_CONFIG_ABS --head_addr $local_head_addr -m $MSG_SIZE -s $TOTAL_MESSAGE_SIZE --record_results -t $TEST_CASE -o $order -a $ACK_LEVEL --sequencer $sequencer -r 1 --steady_rate --target_mbps $TARGET_MBPS"
       else
-        start_process "$CLIENT_NUMA_BIND ./throughput_test -m $MSG_SIZE -s $TOTAL_MESSAGE_SIZE --record_results -t $TEST_CASE -o $order -a $ACK_LEVEL --sequencer $sequencer -r 1 --target_mbps $TARGET_MBPS"
+        start_process "$CLIENT_NUMA_BIND ./throughput_test --config $CLIENT_CONFIG_ABS --head_addr $local_head_addr -m $MSG_SIZE -s $TOTAL_MESSAGE_SIZE --record_results -t $TEST_CASE -o $order -a $ACK_LEVEL --sequencer $sequencer -r 1 --target_mbps $TARGET_MBPS"
       fi
 
       for pid in "${pids[@]}"; do
@@ -136,7 +151,6 @@ for mode in "${modes[@]}"; do
       if [[ "$sequencer" == "CORFU" || "$sequencer" == "SCALOG" ]]; then
         stop_remote_sequencer
       fi
-      sleep 3
 
       TRIAL_DIR="$DATA_DIR/$mode/$RUN_ID/${sequencer}_order${order}_ack${ACK_LEVEL}_msg${MSG_SIZE}_bytes${TOTAL_MESSAGE_SIZE}_trial${trial}"
       mkdir -p "$TRIAL_DIR"

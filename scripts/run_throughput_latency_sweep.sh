@@ -8,6 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/lib/broker_lifecycle.sh"
 cd "$PROJECT_ROOT"
 
 # --- Configuration ---
@@ -45,6 +46,7 @@ fi
 
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
 CLIENT_NUMA_BIND="${CLIENT_NUMA_BIND:-numactl --cpunodebind=0 --membind=0}"
+broker_init_paths
 
 # Timeout: base 30s + 2s per 10MB.  The broker→subscriber export path for
 # Order 0 can be slow (~8 MB/s aggregate) under heavy write load, so we
@@ -103,6 +105,12 @@ wait_for_brokers() {
 }
 
 start_brokers() {
+  if broker_is_remote_mode; then
+    echo "  Using remote broker host: $REMOTE_BROKER_HOST"
+    broker_ensure_cluster "$NUM_BROKERS" 120 "$SEQUENCER"
+    return $?
+  fi
+
   rm -f /tmp/embarlet_*_ready 2>/dev/null || true
   if [[ "$SEQUENCER" == "CORFU" ]]; then
     ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
@@ -139,7 +147,7 @@ start_brokers() {
     fi
   fi
   rm -f /tmp/embarlet_*_ready
-  sleep 5
+  return 0
 }
 
 # --- Summary CSV header ---
@@ -175,7 +183,7 @@ for target in $SWEEP_TARGETS; do
     TEST_LOG="/tmp/throughput_test_${target}.log"
     cmd=(
       ./throughput_test
-      --config "../../${CLIENT_CONFIG}"
+      --config "$CLIENT_CONFIG_ABS"
       -n "$THREADS_PER_BROKER"
       -m "$MESSAGE_SIZE"
       -s "$TOTAL_BYTES"
@@ -188,6 +196,9 @@ for target in $SWEEP_TARGETS; do
       --record_results
       -l 0
     )
+    if broker_is_remote_mode; then
+      cmd+=(--head_addr "${EMBARCADERO_HEAD_ADDR:-$REMOTE_HEAD_ADDR}")
+    fi
     if command -v timeout >/dev/null 2>&1; then
       if $CLIENT_NUMA_BIND timeout "${RUN_TIMEOUT_SEC}s" "${cmd[@]}" >"$TEST_LOG" 2>&1; then
         run_ok=1
