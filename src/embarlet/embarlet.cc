@@ -217,8 +217,17 @@ int main(int argc, char* argv[]) {
 
 	if (arguments.count("head")) {
 		is_head_node = true;
+		if (const char* env_head = std::getenv("EMBARCADERO_HEAD_ADDR")) {
+			if (env_head[0] != '\0') {
+				head_addr = std::string(env_head) + ":" + std::to_string(BROKER_PORT);
+			}
+		}
 	} else if (arguments.count("follower")) {
 		head_addr = arguments["follower"].as<std::string>();
+	} else if (const char* env_head = std::getenv("EMBARCADERO_HEAD_ADDR")) {
+		if (env_head[0] != '\0') {
+			head_addr = std::string(env_head) + ":" + std::to_string(BROKER_PORT);
+		}
 	} else {
 		LOG(INFO) << "head_addr is set to default: " << head_addr;
 	}
