@@ -31,6 +31,18 @@ static bool ShouldValidateOrder() {
 	return std::strcmp(env, "0") != 0;
 }
 
+static std::string GetHeadAddr(const cxxopts::ParseResult& result) {
+	if (result.count("head_addr") > 0) {
+		const std::string addr = result["head_addr"].as<std::string>();
+		if (!addr.empty()) return addr;
+	}
+	const char* env_addr = std::getenv("EMBARCADERO_HEAD_ADDR");
+	if (env_addr != nullptr && env_addr[0] != '\0') {
+		return std::string(env_addr);
+	}
+	return "127.0.0.1";
+}
+
 namespace {
 
 struct StageMetricSummary {
@@ -278,7 +290,7 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 	// But it might be necessary if we wanted end-to-end failure testing.
 
 	// Create publisher
-	Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
+	Publisher p(topic, GetHeadAddr(result), std::to_string(BROKER_PORT),
 		num_threads_per_broker, message_size, q_size, order);
 #ifdef COLLECT_LATENCY_STATS
 	p.SetRecordResults(result.count("record_results") > 0);
@@ -410,7 +422,7 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 	size_t q_size = CalculateOptimalQueueSize(num_threads_per_broker, total_message_size, message_size);
 
 		// Create publisher
-		Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
+		Publisher p(topic, GetHeadAddr(result), std::to_string(BROKER_PORT),
 			num_threads_per_broker, message_size, q_size, order, seq_type);
 	#ifdef COLLECT_LATENCY_STATS
 	p.SetRecordResults(result.count("record_results") > 0);
@@ -507,7 +519,7 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
 		auto start = std::chrono::high_resolution_clock::now();
 
 		// Create subscriber with order level for batch-aware processing
-		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false, order);
+		Subscriber s(GetHeadAddr(result), std::to_string(BROKER_PORT), topic, false, order);
 
 		// Track start of the actual receiving process
 		auto receive_start = std::chrono::high_resolution_clock::now();
@@ -566,7 +578,7 @@ double ConsumeThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		auto start = std::chrono::high_resolution_clock::now();
 
 		// Create subscriber with order level for batch-aware processing  
-		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false, order);
+		Subscriber s(GetHeadAddr(result), std::to_string(BROKER_PORT), topic, false, order);
 		s.WaitUntilAllConnected(); // Assume there exists NUM_MAX_BROKERS
 
 		// Track start of the actual receiving process
@@ -659,9 +671,9 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		auto init_start = std::chrono::high_resolution_clock::now();
 		
 		// Create publisher and subscriber
-		Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
-				num_threads_per_broker, message_size, q_size, order, seq_type);
-		Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, false, order);
+		Publisher p(topic, GetHeadAddr(result), std::to_string(BROKER_PORT),
+					num_threads_per_broker, message_size, q_size, order, seq_type);
+		Subscriber s(GetHeadAddr(result), std::to_string(BROKER_PORT), topic, false, order);
 		
 		// Wait for subscriber connections (network setup - not measured)
 		s.WaitUntilAllConnected();
@@ -782,12 +794,12 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 
 		try {
 			// Create publisher and subscriber
-			Publisher p(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
+			Publisher p(topic, GetHeadAddr(result), std::to_string(BROKER_PORT),
 					num_threads_per_broker, message_size, q_size, order, seq_type);
 #ifdef COLLECT_LATENCY_STATS
 			p.SetRecordResults(result.count("record_results") > 0);
 #endif
-			Subscriber s("127.0.0.1", std::to_string(BROKER_PORT), topic, true, order);
+			Subscriber s(GetHeadAddr(result), std::to_string(BROKER_PORT), topic, true, order);
 			s.WaitUntilAllConnected();
 
 			// Initialize publisher

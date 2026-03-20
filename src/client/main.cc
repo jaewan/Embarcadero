@@ -19,6 +19,8 @@ int main(int argc, char* argv[]) {
         ("l,log_level", "Log level", cxxopts::value<int>()->default_value("1"))
         ("a,ack_level", "Acknowledgement level", cxxopts::value<int>()->default_value("0"))
         ("o,order_level", "Order Level", cxxopts::value<int>()->default_value("0"))
+        ("head_addr", "Head broker address for client control/data connections",
+            cxxopts::value<std::string>()->default_value("127.0.0.1"))
         ("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", 
             cxxopts::value<std::string>()->default_value("EMBARCADERO"))
         ("s,total_message_size", "Total size of messages to publish", 
@@ -130,8 +132,9 @@ int main(int argc, char* argv[]) {
     }
     
     // Create gRPC stub
+    std::string head_addr = result["head_addr"].as<std::string>();
     std::unique_ptr<HeartBeat::Stub> stub = HeartBeat::NewStub(
-        grpc::CreateChannel("127.0.0.1:" + std::to_string(BROKER_PORT), 
+        grpc::CreateChannel(head_addr + ":" + std::to_string(BROKER_PORT),
                            grpc::InsecureChannelCredentials()));
     
     // Prepare topic
