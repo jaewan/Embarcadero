@@ -274,6 +274,12 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 					tinode->offsets[broker_id_].validated_written_byte_offset =
 						tinode->offsets[broker_id_].log_offset;
 					disk_manager_.StartScalogCXLReplication(tinode);
+					// For RF>1, start replica polling for each primary we replicate
+					int num_brokers = NUM_MAX_BROKERS_CONFIG;
+					for (int i = 1; i < replication_factor; i++) {
+						int primary_id = (broker_id_ - i + num_brokers) % num_brokers;
+						disk_manager_.StartScalogCXLReplicaPolling(tinode, primary_id, i - 1);
+					}
 				} else {
 					disk_manager_.StartScalogReplicaLocalSequencer();
 				}
@@ -448,6 +454,12 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 				tinode->offsets[broker_id_].validated_written_byte_offset =
 					tinode->offsets[broker_id_].log_offset;
 				disk_manager_.StartScalogCXLReplication(tinode);
+				// For RF>1, start replica polling for each primary we replicate
+				int num_brokers = NUM_MAX_BROKERS_CONFIG;
+				for (int i = 1; i < replication_factor; i++) {
+					int primary_id = (broker_id_ - i + num_brokers) % num_brokers;
+					disk_manager_.StartScalogCXLReplicaPolling(tinode, primary_id, i - 1);
+				}
 			} else {
 				disk_manager_.StartScalogReplicaLocalSequencer();
 			}

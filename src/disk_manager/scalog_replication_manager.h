@@ -42,11 +42,14 @@ namespace Scalog
 
         // [[CXL_SCALOG]] Set up CXL-based replication: replica polls CXL directly.
         void StartCXLReplication(void *cxl_addr, TInode *tinode);
+        // Start a polling thread that replicates primary_broker_id's log to local disk (RF > 1).
+        void StartReplicaPollingThread(void *cxl_addr, TInode *tinode, int primary_broker_id, int replica_index);
 
     private:
         std::unique_ptr<ScalogReplicationServiceImpl> service_;
         std::unique_ptr<grpc::Server> server_;
         std::thread server_thread_;
+        std::string base_dir_;
     };
 
 } // End of namespace Scalog

@@ -257,11 +257,6 @@ void Topic::Start() {
 				}
 				break;
 			case SCALOG:
-				if (order_ == 1){
-					sequencerThread_ = std::thread(&Topic::StartScalogLocalSequencer, this);
-					// Already started when creating topic instance from topic manager
-				}else if (order_ == 2)
-					LOG(ERROR) << "Order is set 2 at scalog";
 				break;
 			case CORFU:
 				if (order_ == Embarcadero::kOrderTotal) {
@@ -275,6 +270,11 @@ void Topic::Start() {
 				LOG(ERROR) << "Unknown sequencer:" << seq_type_;
 				break;
 		}
+	}
+
+	// SCALOG: all brokers run ScalogLocalSequencer (Register + SendLocalCut + ordering)
+	if (seq_type_ == heartbeat_system::SCALOG && order_ == 1) {
+		sequencerThread_ = std::thread(&Topic::StartScalogLocalSequencer, this);
 	}
 }
 

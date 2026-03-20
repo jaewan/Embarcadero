@@ -1150,4 +1150,12 @@ namespace Embarcadero{
 		scalog_replication_manager_->StartCXLReplication(cxl_addr_, tinode);
 	}
 
+	void DiskManager::StartScalogCXLReplicaPolling(TInode* tinode, int primary_id, int replica_index) {
+		if (!scalog_replication_manager_) {
+			LOG(ERROR) << "StartScalogCXLReplicaPolling: replication manager not initialized";
+			return;
+		}
+		scalog_replication_manager_->StartReplicaPollingThread(cxl_addr_, tinode, primary_id, replica_index);
+	}
+
 } // End of namespace Embarcadero
