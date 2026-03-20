@@ -25,7 +25,7 @@ LOG_FILE="/tmp/order5_validate_$$.log"
 
 ORDER="$ORDER" ACK="$ACK" NUM_BROKERS="$NUM_BROKERS" TOTAL_MESSAGE_SIZE="$TOTAL_MESSAGE_SIZE" \
 MESSAGE_SIZE="$MESSAGE_SIZE" TEST_TYPE="$TEST_TYPE" NUM_TRIALS="$NUM_TRIALS" QUIET=1 \
-  bash ../../scripts/run_throughput.sh > "$LOG_FILE" 2>&1
+  bash ../../scripts/singlenode_run_throughput.sh > "$LOG_FILE" 2>&1
 
 mapfile -t vals < <(sed -n 's/.*Bandwidth: \([0-9][0-9.]*\) MB\/s.*/\1/p' "$LOG_FILE")
 if [[ "${#vals[@]}" -eq 0 ]]; then

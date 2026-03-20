@@ -45,7 +45,7 @@ for order in $ORDERS; do
       SEQUENCER="$SEQUENCER"
       EMBARCADERO_ACK_TIMEOUT_SEC="$ACK_TIMEOUT_SEC"
       TRIAL_MAX_ATTEMPTS="$TRIAL_MAX_ATTEMPTS"
-      "$SCRIPT_DIR/run_throughput.sh"
+      "$SCRIPT_DIR/singlenode_run_throughput.sh"
     )
 
     LOG_FILE="$OUTDIR/o${order}_a${ack}.log"

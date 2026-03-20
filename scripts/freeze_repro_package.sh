@@ -41,9 +41,9 @@ cmake --build build -j
 scripts/run_order5_anomaly_checks.sh
 
 # Step 7 (Scalog deferred in current scope; direct runner commands on current tree)
-NUM_BROKERS=4 TEST_TYPE=5 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/run_throughput.sh
-NUM_BROKERS=4 TEST_TYPE=5 ORDER=5 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/run_throughput.sh
-NUM_BROKERS=4 TEST_TYPE=5 ORDER=2 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=CORFU scripts/run_throughput.sh
+NUM_BROKERS=4 TEST_TYPE=5 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/singlenode_run_throughput.sh
+NUM_BROKERS=4 TEST_TYPE=5 ORDER=5 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/singlenode_run_throughput.sh
+NUM_BROKERS=4 TEST_TYPE=5 ORDER=2 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=CORFU scripts/singlenode_run_throughput.sh
 
 # Step 8 (validated stable frontier points in this environment; current tree uses direct sweep runner)
 for trial in 1 2 3 4 5; do
@@ -76,6 +76,7 @@ hash_if_exists() {
 {
   hash_if_exists scripts/run_order5_anomaly_checks.sh
   hash_if_exists scripts/run_throughput.sh
+  hash_if_exists scripts/singlenode_run_throughput.sh
   hash_if_exists scripts/run_throughput_latency_sweep.sh
   hash_if_exists scripts/run_ordering_durability_ladder.sh
   hash_if_exists scripts/run_slow_replica_heterogeneity.sh
@@ -97,6 +98,7 @@ copy_if_exists() {
 
 copy_if_exists scripts/run_order5_anomaly_checks.sh "$SNAPSHOT_DIR/scripts/"
 copy_if_exists scripts/run_throughput.sh "$SNAPSHOT_DIR/scripts/"
+copy_if_exists scripts/singlenode_run_throughput.sh "$SNAPSHOT_DIR/scripts/"
 copy_if_exists scripts/run_throughput_latency_sweep.sh "$SNAPSHOT_DIR/scripts/"
 copy_if_exists scripts/run_ordering_durability_ladder.sh "$SNAPSHOT_DIR/scripts/"
 copy_if_exists scripts/run_slow_replica_heterogeneity.sh "$SNAPSHOT_DIR/scripts/"
@@ -137,8 +139,8 @@ bash data/latency/repro_manifest/commands.sh
 
 ## Guardrail Sanity
 ```bash
-NUM_BROKERS=4 TEST_TYPE=5 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/run_throughput.sh
-NUM_BROKERS=4 TEST_TYPE=5 ORDER=5 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/run_throughput.sh
+NUM_BROKERS=4 TEST_TYPE=5 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/singlenode_run_throughput.sh
+NUM_BROKERS=4 TEST_TYPE=5 ORDER=5 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/singlenode_run_throughput.sh
 ```
 EOF
 

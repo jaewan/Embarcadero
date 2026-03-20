@@ -7,7 +7,7 @@ This directory contains the experiment launchers for throughput, latency, and re
 Run any script as an environment-driven command:
 
 ```bash
-VAR1=value VAR2=value scripts/run_throughput.sh
+VAR1=value VAR2=value scripts/singlenode_run_throughput.sh
 ```
 
 Most scripts read their options from environment variables instead of flags. That keeps them easy to compose in shell loops and CI jobs.
@@ -37,9 +37,9 @@ Remote mode reuses healthy brokers when possible. Use `FORCE_RESTART_BROKERS=1` 
 
 ## Throughput Script
 
-### `scripts/run_throughput.sh`
+### `scripts/singlenode_run_throughput.sh`
 
-Optimized for large-message throughput tests.
+Single-node throughput launcher. This is the original local workflow where the script starts local brokers and the client runs on the same machine.
 
 Common options:
 
@@ -56,8 +56,17 @@ Common options:
 Examples:
 
 ```bash
-NUM_BROKERS=4 TEST_TYPE=5 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/run_throughput.sh
+NUM_BROKERS=4 TEST_TYPE=5 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/singlenode_run_throughput.sh
 ```
+
+### `scripts/run_throughput.sh`
+
+Remote-client throughput launcher. This is the multi-node workflow where the client runs here and brokers are managed on a remote broker node over SSH.
+
+Remote-only requirements:
+
+- `REMOTE_BROKER_HOST`
+- `EMBARCADERO_HEAD_ADDR`
 
 ```bash
 REMOTE_BROKER_HOST=broker \
@@ -109,7 +118,7 @@ Common options:
 
 ### `scripts/run_ordering_durability_ladder.sh`
 
-Sweeps `ORDER` and `ACK` combinations by calling `run_throughput.sh`.
+Sweeps `ORDER` and `ACK` combinations by calling `singlenode_run_throughput.sh`.
 
 Common options:
 
@@ -149,3 +158,4 @@ Common options:
 - Keep local mode and remote mode separate in your shell history so it is obvious when a broker node is being managed over SSH.
 - If a remote cluster is left in a bad state, rerun with `FORCE_RESTART_BROKERS=1`.
 - For remote runs, use the broker node IP in `EMBARCADERO_HEAD_ADDR`, not `127.0.0.1`.
+- On the current host, `192.168.50.12` and `192.168.60.8` are on `1GbE` NICs. The `100GbE` interface currently has no usable IPv4 address assigned, so the scripts cannot target it until that interface is addressed and routed.
