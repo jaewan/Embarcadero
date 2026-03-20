@@ -132,33 +132,26 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 		msg_to_order = ((MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id_].log_offset));
 	}
 
-	static auto last_log_time = std::chrono::steady_clock::now();
-	static size_t written=0;
-			auto now = std::chrono::steady_clock::now();
-				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 3000) {
-					LOG(INFO) << "[DEBUG] [SCALOG] written:" << written;
-					last_log_time = std::chrono::steady_clock::now();
-				}
-
-	size_t total_size = 0;
-	void* start_addr = (void*)msg_to_order;
+	static size_t total_size = 0;
+	static void* start_addr = nullptr;
+	if (start_addr == nullptr) start_addr = (void*)msg_to_order;
 	for(auto &cut : global_cut){
 		if(cut.first == broker_id_){
 			for(int i = 0; i<cut.second; i++){
 				total_size += msg_to_order->paddedSize;
 				msg_to_order->total_order = seq;
 				std::atomic_thread_fence(std::memory_order_release);
-				tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset;
+				tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset + 1;
 				tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
 				//cxl_manager_->UpdateTinodeOrder(topic_char, tinode, broker_id_, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
-				written = msg_to_order->logical_offset;
 				msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
 				seq++;
 				if(total_size >= BATCH_SIZE){
+					size_t export_log_idx = static_cast<size_t>(
+							static_cast<uint8_t*>(start_addr) - static_cast<uint8_t*>(cxl_addr_));
 					batch_header_[batch_header_idx].batch_off_to_export = 0;
 					batch_header_[batch_header_idx].total_size = total_size;
-					batch_header_[batch_header_idx].log_idx = static_cast<size_t>(
-							static_cast<uint8_t*>(start_addr) - static_cast<uint8_t*>(cxl_addr_));
+					batch_header_[batch_header_idx].log_idx = export_log_idx;
 					batch_header_[batch_header_idx].ordered = 1;
 					batch_header_idx++;
 					start_addr = (void*)msg_to_order;

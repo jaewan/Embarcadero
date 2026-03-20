@@ -58,6 +58,13 @@ class DiskManager{
 		// Change this to get real-time num brokers
 		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
 		void StartScalogReplicaLocalSequencer();
+		// [[CXL_SCALOG]] Primary path: copies this broker's own CXL data to local disk
+		// and reports disk-persisted count to global sequencer as replica_id=1.
+		void StartScalogCXLReplication(TInode* tinode);
+		// [[CXL_SCALOG]] Replica path: copies another broker's (primary_id) CXL data
+		// to this broker's local disk and reports disk-persisted count to global
+		// sequencer as replica_id=2+replica_index.
+		void StartScalogCXLReplicaPolling(TInode* tinode, int primary_id, int replica_index);
 
 	private:
 		void ReplicateThread();

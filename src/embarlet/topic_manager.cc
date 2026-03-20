@@ -265,7 +265,24 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		// Run sequencer if needed
 		if (tinode->seq_type == SCALOG) {
 			if (replication_factor > 0) {
-				disk_manager_.StartScalogReplicaLocalSequencer();
+				static const bool kCxlScalogMode =
+					(getenv("SCALOG_CXL_MODE") != nullptr &&
+					 std::string(getenv("SCALOG_CXL_MODE")) == "1");
+				if (kCxlScalogMode) {
+					// [[CXL_SCALOG]] Initialize the completeness watermark to the start of
+					// the log region so the replica polling thread doesn't spin on 0 vs ~18GB.
+					tinode->offsets[broker_id_].validated_written_byte_offset =
+						tinode->offsets[broker_id_].log_offset;
+					disk_manager_.StartScalogCXLReplication(tinode);
+					// For RF>1, start replica polling for each primary we replicate
+					int num_brokers = NUM_MAX_BROKERS_CONFIG;
+					for (int i = 1; i < replication_factor; i++) {
+						int primary_id = (broker_id_ - i + num_brokers) % num_brokers;
+						disk_manager_.StartScalogCXLReplicaPolling(tinode, primary_id, i - 1);
+					}
+				} else {
+					disk_manager_.StartScalogReplicaLocalSequencer();
+				}
 			}
 		}
 	}
@@ -430,7 +447,22 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 	// Run sequencer if needed
 	if (tinode->seq_type == SCALOG) {
 		if (replication_factor > 0) {
-			disk_manager_.StartScalogReplicaLocalSequencer();
+			static const bool kCxlScalogMode =
+				(getenv("SCALOG_CXL_MODE") != nullptr &&
+				 std::string(getenv("SCALOG_CXL_MODE")) == "1");
+			if (kCxlScalogMode) {
+				tinode->offsets[broker_id_].validated_written_byte_offset =
+					tinode->offsets[broker_id_].log_offset;
+				disk_manager_.StartScalogCXLReplication(tinode);
+				// For RF>1, start replica polling for each primary we replicate
+				int num_brokers = NUM_MAX_BROKERS_CONFIG;
+				for (int i = 1; i < replication_factor; i++) {
+					int primary_id = (broker_id_ - i + num_brokers) % num_brokers;
+					disk_manager_.StartScalogCXLReplicaPolling(tinode, primary_id, i - 1);
+				}
+			} else {
+				disk_manager_.StartScalogReplicaLocalSequencer();
+			}
 		}
 	}
 

@@ -257,11 +257,6 @@ void Topic::Start() {
 				}
 				break;
 			case SCALOG:
-				if (order_ == 1){
-					sequencerThread_ = std::thread(&Topic::StartScalogLocalSequencer, this);
-					// Already started when creating topic instance from topic manager
-				}else if (order_ == 2)
-					LOG(ERROR) << "Order is set 2 at scalog";
 				break;
 			case CORFU:
 				if (order_ == Embarcadero::kOrderTotal) {
@@ -275,6 +270,11 @@ void Topic::Start() {
 				LOG(ERROR) << "Unknown sequencer:" << seq_type_;
 				break;
 		}
+	}
+
+	// SCALOG: all brokers run ScalogLocalSequencer (Register + SendLocalCut + ordering)
+	if (seq_type_ == heartbeat_system::SCALOG && order_ == 1) {
+		sequencerThread_ = std::thread(&Topic::StartScalogLocalSequencer, this);
 	}
 }
 
@@ -374,10 +374,19 @@ void Topic::DelegationThread() {
 					}
 
 					if (order_ != 0) {
+						// For SCALOG: written must be a COUNT (not 0-indexed offset) so the
+						// local sequencer's local_cut and global_cut arithmetic is correct.
+						// For other sequencers: written is still 0-indexed (legacy).
+						size_t written_val = (seq_type_ == SCALOG) ? logical_offset_ : logical_offset_ - 1;
 						UpdateTInodeWritten(
-							logical_offset_ - 1,
+							written_val,
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
+						// [[CXL_SCALOG]] Advance completeness watermark: end of this batch is safe to read.
+						if (seq_type_ == SCALOG) {
+							tinode_->offsets[broker_id_].validated_written_byte_offset =
+								current_batch->log_idx + current_batch->total_size;
+						}
 					}
 				} else {
 					BlogMessageHeader* batch_first_msg = reinterpret_cast<BlogMessageHeader*>(
@@ -1150,10 +1159,19 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
         BatchHeader* &batch_header_location,
         bool /*epoch_already_checked*/) {
 
-    // Set batch header location to nullptr (not used by Scalog sequencer)
-    batch_header_location = nullptr;
+	// Allocate a PBR slot so DelegationThread can process this batch and advance
+	// tinode->offsets[broker_id_].written, which the Scalog local sequencer reads
+	// as its local cut to send to the global sequencer.
+	uint64_t pbr_idx = broker_pbr_counters_[broker_id_].fetch_add(1, std::memory_order_relaxed);
+	batch_header.pbr_absolute_index = pbr_idx;
+	batch_header.batch_id = (static_cast<uint64_t>(broker_id_) << 48) | pbr_idx;
 
-    batch_header.log_idx = scalog_batch_offset_.fetch_add(batch_header.total_size);
+	BatchHeader* batch_header_ring = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
+	size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
+	batch_header_location = &batch_header_ring[slot_idx];
+	__atomic_store_n(&batch_header_location->batch_complete, 0, __ATOMIC_RELEASE);
 
 	// Calculate addresses
 	const unsigned long long int segment_metadata =
@@ -1163,15 +1181,32 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 	// Allocate space in log
 	log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
 
+	// log_idx must be offset from cxl_addr_ so DelegationThread can find the data
+	batch_header.log_idx = reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_);
+
 	// Check for segment boundary
 	CheckSegmentBoundary(log, msg_size, segment_metadata);
 
+	// [[CXL_SCALOG]] In CXL mode the replica reads directly from CXL — no data push needed.
+	// In original-Scalog mode we use a 0-based replication offset so the replica's
+	// LocalCutTracker can handle contiguous-from-zero range tracking.
+	static const bool kCxlScalogMode =
+		(getenv("SCALOG_CXL_MODE") != nullptr &&
+		 std::string(getenv("SCALOG_CXL_MODE")) == "1");
+
+	size_t rep_offset = 0;
+	if (!kCxlScalogMode) {
+		rep_offset = scalog_batch_offset_.fetch_add(batch_header.total_size, std::memory_order_relaxed);
+	}
+
 	// Return replication callback
-	return [this, batch_header, log](void* log_ptr, size_t /*placeholder*/) {
+	return [this, batch_header, log, rep_offset](void* log_ptr, size_t /*placeholder*/) {
+		// [[CXL_SCALOG]] Skip data push — replica polls validated_written_byte_offset directly.
+		if (kCxlScalogMode) return;
 		// Handle replication if needed
 		if (replication_factor_ > 0 && scalog_replication_client_) {
 				scalog_replication_client_->ReplicateData(
-						batch_header.log_idx,
+						rep_offset,
 						batch_header.total_size,
 						batch_header.num_msg,
 						log
