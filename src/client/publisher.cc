@@ -30,6 +30,19 @@ constexpr int kAckPortMin = 10000;
 constexpr int kAckPortMax = 65535;
 constexpr int kAckPortRange = kAckPortMax - kAckPortMin + 1;
 
+int GetFailureMeasureIntervalMs() {
+	if (const char* env = std::getenv("EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS")) {
+		char* end = nullptr;
+		long parsed = std::strtol(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0) {
+			return static_cast<int>(parsed);
+		}
+		LOG(WARNING) << "Ignoring invalid EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS='" << env
+		             << "'; using default 100 ms";
+	}
+	return 100;
+}
+
 }  // namespace
 
 Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, 
@@ -843,6 +856,7 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 
 		if (!shutdown_.load(std::memory_order_relaxed)) {
 			size_t sent_at_trigger = total_sent_bytes_.load(std::memory_order_acquire);
+			RecordFailureEvent("Failure threshold reached (sent frontier)");
 			LOG(INFO) << "Triggering broker kill at " << sent_at_trigger << " bytes sent";
 			RecordFailureEvent("Broker kill requested (gRPC)");
 			killbrokers();
@@ -878,11 +892,13 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 		}
 		throughputFile << ",Total_GBps\n";
 
-		constexpr int kTargetIntervalMs = 100;
+		const int kTargetIntervalMs = GetFailureMeasureIntervalMs();
 		constexpr double kGBDivisor = 1024.0 * 1024.0 * 1024.0;
 		constexpr int kDrainIntervalsAfterFinish = 30;  // 3s of trailing measurements after publish finishes
+		const size_t ack_bytes_to_kill_brokers = total_message_size * failure_percentage;
 		auto prev_time = std::chrono::steady_clock::now();
 		int drain_remaining = -1;  // -1 = not draining yet
+		bool ack_frontier_recorded = false;
 
 		while (!shutdown_.load(std::memory_order_relaxed)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(kTargetIntervalMs));
@@ -906,6 +922,14 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 
 			double total_gbps = (static_cast<double>(sum) / elapsed_sec) / kGBDivisor;
 			throughputFile << "," << total_gbps << "\n";
+
+			if (!ack_frontier_recorded) {
+				const size_t acked_bytes = ack_received_.load(std::memory_order_relaxed) * message_size;
+				if (acked_bytes >= ack_bytes_to_kill_brokers) {
+					RecordFailureEvent("Failure threshold reached (ACK frontier)");
+					ack_frontier_recorded = true;
+				}
+			}
 
 			if (publish_finished_.load(std::memory_order_relaxed)) {
 				if (drain_remaining < 0) drain_remaining = kDrainIntervalsAfterFinish;
@@ -1650,6 +1674,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			RecordFailureEvent(reconn_msg);
 
 			broker_id = new_broker_id;
+			pubQue_.MarkQueueActive(pubQuesIdx);
 			try {
 				send_batch_header();
 			} catch (const std::exception& e) {
@@ -1794,6 +1819,7 @@ handle_send_failure:
 				RecordFailureEvent(reconn_msg);
 				// Reset and try again with new broker
 				broker_id = new_broker_id;
+				pubQue_.MarkQueueActive(pubQuesIdx);
 				try {
 					send_batch_header();
 				} catch (const std::exception& e) {

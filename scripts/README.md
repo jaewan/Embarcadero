@@ -116,6 +116,47 @@ Common options:
 
 ## Experiment Wrappers
 
+### `scripts/run_failures.sh`
+
+Runs the broker-failure benchmark locally: starts a 4-broker cluster, kills one broker mid-run, records real-time throughput, writes failure events, and generates a plot.
+
+Common options:
+
+- `NUM_BROKERS`
+- `NUM_BROKERS_TO_KILL`
+- `FAILURE_PERCENTAGE`
+- `NUM_TRIALS`
+- `TOTAL_MESSAGE_SIZE`
+- `MESSAGE_SIZE`
+- `ORDER`
+- `ACK`
+- `SEQUENCER`
+- `THREADS_PER_BROKER`
+- `CLIENT_TIMEOUT`
+- `EMBARCADERO_RUNTIME_MODE`
+- `EMBARCADERO_ACK_TIMEOUT_SEC`
+- `EMBARCADERO_FAILURE_QUEUE_SIZE_MB` or `EMBARCADERO_FAILURE_QUEUE_SIZE_BYTES`
+
+Outputs:
+
+- `data/failure/real_time_acked_throughput.csv`
+- `data/failure/failure_events.csv`
+- `data/failure/failure.png`
+- `data/failure/failure.pdf`
+- per-trial archives such as `data/failure/real_time_acked_throughput_trial1.csv`
+
+The script now prints both the benchmark's reported end-to-end `Bandwidth` and a trimmed active-window throughput summary, which is usually the more representative metric for the failure/re-route phase.
+
+`plot_failure.py` also supports `--keep-full-tail` when you want to inspect the full post-failure drain/tail instead of the trimmed active window.
+
+Example:
+
+```bash
+ORDER=5 ACK=1 NUM_BROKERS=4 NUM_BROKERS_TO_KILL=1 FAILURE_PERCENTAGE=0.5 \
+TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 NUM_TRIALS=3 \
+scripts/run_failures.sh
+```
+
 ### `scripts/run_ordering_durability_ladder.sh`
 
 Sweeps `ORDER` and `ACK` combinations by calling `singlenode_run_throughput.sh`.

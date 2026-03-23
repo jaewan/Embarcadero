@@ -8,7 +8,11 @@
 #include <thread>
 #include <fstream>
 #include <numeric>
+#include <optional>
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <map>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -56,12 +60,218 @@ struct StageMetricSummary {
 	bool valid = false;
 };
 
+struct FailureRealtimeSummary {
+	double active_mean_gbps = 0.0;
+	double active_std_gbps = 0.0;
+	double active_peak_gbps = 0.0;
+	double pre_failure_mean_gbps = 0.0;
+	double post_reroute_mean_gbps = 0.0;
+	double post_reroute_active_mean_gbps = 0.0;
+	double post_reroute_active_peak_gbps = 0.0;
+	size_t active_samples = 0;
+	size_t pre_failure_samples = 0;
+	size_t post_reroute_samples = 0;
+	size_t post_reroute_active_samples = 0;
+	int failed_broker_id = -1;
+	bool valid = false;
+};
+
 std::vector<std::string> SplitCsv(const std::string& line) {
 	std::vector<std::string> out;
 	std::stringstream ss(line);
 	std::string cell;
 	while (std::getline(ss, cell, ',')) out.push_back(cell);
 	return out;
+}
+
+std::optional<int> ParseIntEnv(const char* name) {
+	const char* env = std::getenv(name);
+	if (env == nullptr || env[0] == '\0') return std::nullopt;
+	try {
+		return std::stoi(env);
+	} catch (...) {
+		LOG(WARNING) << "Ignoring invalid integer env " << name << "=" << env;
+		return std::nullopt;
+	}
+}
+
+size_t GetFailureQueueSizeBytes() {
+	if (auto bytes = ParseIntEnv("EMBARCADERO_FAILURE_QUEUE_SIZE_BYTES"); bytes.has_value()) {
+		return std::max<size_t>(1024, static_cast<size_t>(bytes.value()));
+	}
+	if (auto mb = ParseIntEnv("EMBARCADERO_FAILURE_QUEUE_SIZE_MB"); mb.has_value()) {
+		return std::max<size_t>(1024, static_cast<size_t>(mb.value()) * 1024ULL * 1024ULL);
+	}
+	// Preserve current benchmark default unless overridden.
+	return 8ULL * 1024ULL * 1024ULL;
+}
+
+std::string GetFailureDataDir() {
+	const char* failure_dir = std::getenv("EMBARCADERO_FAILURE_DATA_DIR");
+	if (failure_dir && failure_dir[0]) {
+		return failure_dir;
+	}
+	const char* home = std::getenv("HOME");
+	std::string dir = (home && home[0]) ? home : ".";
+	dir += "/Embarcadero/data/failure";
+	return dir;
+}
+
+double ComputeMean(const std::vector<double>& vals) {
+	if (vals.empty()) return 0.0;
+	return std::accumulate(vals.begin(), vals.end(), 0.0) / static_cast<double>(vals.size());
+}
+
+double ComputeStdDev(const std::vector<double>& vals, double mean) {
+	if (vals.empty()) return 0.0;
+	double accum = 0.0;
+	for (double v : vals) {
+		double d = v - mean;
+		accum += d * d;
+	}
+	return std::sqrt(accum / static_cast<double>(vals.size()));
+}
+
+std::vector<double> TrimFailureTail(const std::vector<double>& vals) {
+	if (vals.empty()) return {};
+	std::vector<double> trimmed = vals;
+	if (trimmed.size() <= 5) return trimmed;
+
+	const double peak = *std::max_element(trimmed.begin(), trimmed.end());
+	const double cutoff = peak * 0.70;
+	size_t last_above = 0;
+	for (size_t i = 0; i < trimmed.size(); ++i) {
+		size_t begin = (i >= 2) ? (i - 2) : 0;
+		double rolling = 0.0;
+		for (size_t j = begin; j <= i; ++j) rolling += trimmed[j];
+		rolling /= static_cast<double>(i - begin + 1);
+		if (rolling >= cutoff) last_above = i;
+	}
+	trimmed.resize(last_above + 1);
+	return trimmed;
+}
+
+bool TryLoadFailureRealtimeSummary(const std::string& throughput_csv,
+		const std::string& events_csv,
+		FailureRealtimeSummary* out) {
+	if (out == nullptr) return false;
+	std::ifstream tf(throughput_csv);
+	if (!tf.is_open()) return false;
+	std::string header_line;
+	if (!std::getline(tf, header_line)) return false;
+	const auto headers = SplitCsv(header_line);
+	std::unordered_map<std::string, size_t> col;
+	for (size_t i = 0; i < headers.size(); ++i) col[headers[i]] = i;
+	if (!col.count("Timestamp(ms)") || !col.count("Total_GBps")) return false;
+
+	struct Sample {
+		long long ts_ms = 0;
+		double total_gbps = 0.0;
+	};
+	std::vector<Sample> samples;
+	std::string line;
+	while (std::getline(tf, line)) {
+		if (line.empty()) continue;
+		const auto row = SplitCsv(line);
+		try {
+			Sample s;
+			s.ts_ms = std::stoll(row.at(col.at("Timestamp(ms)")));
+			s.total_gbps = std::stod(row.at(col.at("Total_GBps")));
+			samples.push_back(s);
+		} catch (...) {
+			continue;
+		}
+	}
+	if (samples.empty()) return false;
+
+	std::optional<long long> kill_ts_ms;
+	std::optional<long long> reroute_ts_ms;
+	std::optional<int> failed_broker_id;
+	std::ifstream ef(events_csv);
+	if (ef.is_open()) {
+		std::string event_header;
+		if (std::getline(ef, event_header)) {
+			const auto event_headers = SplitCsv(event_header);
+			std::unordered_map<std::string, size_t> event_col;
+			for (size_t i = 0; i < event_headers.size(); ++i) event_col[event_headers[i]] = i;
+			while (std::getline(ef, line)) {
+				if (line.empty()) continue;
+				const auto row = SplitCsv(line);
+				auto ts_it = event_col.find("Timestamp(ms)");
+				auto desc_it = event_col.find("EventDescription");
+				if (ts_it == event_col.end() || desc_it == event_col.end()) continue;
+				if (ts_it->second >= row.size() || desc_it->second >= row.size()) continue;
+				long long ts = 0;
+				try {
+					ts = std::stoll(row[ts_it->second]);
+				} catch (...) {
+					continue;
+				}
+				const std::string& desc = row[desc_it->second];
+				if (!kill_ts_ms.has_value() && desc.find("Broker kill requested") != std::string::npos) {
+					kill_ts_ms = ts;
+				}
+				if (!reroute_ts_ms.has_value() && desc.find("Reconnect Success Broker ") != std::string::npos) {
+					reroute_ts_ms = ts;
+				}
+				if (!failed_broker_id.has_value()) {
+					const std::string needle = "Broker ";
+					size_t pos = desc.find(needle);
+					if (pos != std::string::npos) {
+						pos += needle.size();
+						size_t end = pos;
+						while (end < desc.size() && std::isdigit(static_cast<unsigned char>(desc[end]))) ++end;
+						if (end > pos) {
+							try {
+								failed_broker_id = std::stoi(desc.substr(pos, end - pos));
+							} catch (...) {
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	std::vector<double> active_vals;
+	active_vals.reserve(samples.size());
+	for (const auto& sample : samples) {
+		if (sample.total_gbps > 0.01) active_vals.push_back(sample.total_gbps);
+	}
+	if (active_vals.empty()) return false;
+
+	std::vector<double> trimmed = TrimFailureTail(active_vals);
+	if (trimmed.empty()) return false;
+
+	std::vector<double> pre_failure_vals;
+	std::vector<double> post_reroute_vals;
+	for (const auto& sample : samples) {
+		if (sample.total_gbps <= 0.01) continue;
+		if (kill_ts_ms.has_value() && sample.ts_ms < kill_ts_ms.value()) {
+			pre_failure_vals.push_back(sample.total_gbps);
+		}
+		if (reroute_ts_ms.has_value() && sample.ts_ms >= reroute_ts_ms.value()) {
+			post_reroute_vals.push_back(sample.total_gbps);
+		}
+	}
+	const std::vector<double> post_reroute_active_vals = TrimFailureTail(post_reroute_vals);
+
+	out->active_mean_gbps = ComputeMean(trimmed);
+	out->active_std_gbps = ComputeStdDev(trimmed, out->active_mean_gbps);
+	out->active_peak_gbps = *std::max_element(trimmed.begin(), trimmed.end());
+	out->active_samples = trimmed.size();
+	out->pre_failure_mean_gbps = ComputeMean(pre_failure_vals);
+	out->pre_failure_samples = pre_failure_vals.size();
+	out->post_reroute_mean_gbps = ComputeMean(post_reroute_vals);
+	out->post_reroute_samples = post_reroute_vals.size();
+	out->post_reroute_active_mean_gbps = ComputeMean(post_reroute_active_vals);
+	out->post_reroute_active_peak_gbps = post_reroute_active_vals.empty()
+		? 0.0
+		: *std::max_element(post_reroute_active_vals.begin(), post_reroute_active_vals.end());
+	out->post_reroute_active_samples = post_reroute_active_vals.size();
+	out->failed_broker_id = failed_broker_id.value_or(-1);
+	out->valid = true;
+	return true;
 }
 
 bool TryLoadMetricSummary(const std::string& path, const std::string& metric, StageMetricSummary* out) {
@@ -278,11 +488,10 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 		return 0.0;
 	}
 
-	// Calculate optimal queue size based on configuration
-	// Use fixed small queue size to throttle producer so it stays alive throughout test
-	// We use 8MB total queue size to force the producer to keep running alongside the network sends.
-	size_t q_size = 1024 * 1024 * 8; // Very small queue to force producer to block
-	q_size = std::max(q_size, static_cast<size_t>(1024));
+	// Failure-mode queue sizing is intentionally configurable because a tiny queue materially
+	// changes publisher-side backpressure behavior and therefore the observed failure dynamics.
+	size_t q_size = GetFailureQueueSizeBytes();
+	LOG(INFO) << "Failure test queue size: " << q_size << " bytes";
 
 	// Initialize subscriber BEFORE publisher to make sure they're ready to receive
 	LOG(INFO) << "Setting up dummy subscriber to keep connections open if needed";
@@ -360,23 +569,61 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 			exit(1);
 		}
 
-		const char* failure_dir = getenv("EMBARCADERO_FAILURE_DATA_DIR");
-		std::string events_dir = (failure_dir && failure_dir[0]) ? failure_dir : std::string(getenv("HOME") ? getenv("HOME") : ".") + "/Embarcadero/data/failure";
+		std::string events_dir = GetFailureDataDir();
 		std::string events_file = events_dir + "/failure_events.csv";
+		std::string throughput_file = events_dir + "/real_time_acked_throughput.csv";
 		p.WriteFailureEventsToFile(events_file);
 		// Calculate elapsed time and bandwidth
 		auto end = std::chrono::high_resolution_clock::now();
 		std::chrono::duration<double> elapsed = end - start;
 		double seconds = elapsed.count();
-		double bandwidthMbps = ((message_size * n) / seconds) / (1024 * 1024);
+		double end_to_end_bandwidth_mbps = ((message_size * n) / seconds) / (1024 * 1024);
+		double reported_bandwidth_mbps = end_to_end_bandwidth_mbps;
+
+		FailureRealtimeSummary realtime_summary;
+		if (TryLoadFailureRealtimeSummary(throughput_file, events_file, &realtime_summary) &&
+		    realtime_summary.valid) {
+			reported_bandwidth_mbps = realtime_summary.active_mean_gbps * 1024.0;
+			LOG(INFO) << "Failure real-time throughput summary:";
+			LOG(INFO) << "  Active window mean: " << std::fixed << std::setprecision(3)
+			          << realtime_summary.active_mean_gbps << " GB/s";
+			LOG(INFO) << "  Active window stddev: " << realtime_summary.active_std_gbps << " GB/s";
+			LOG(INFO) << "  Active window peak: " << realtime_summary.active_peak_gbps << " GB/s";
+			if (realtime_summary.pre_failure_samples > 0) {
+				LOG(INFO) << "  Pre-failure mean: " << realtime_summary.pre_failure_mean_gbps
+				          << " GB/s";
+			}
+			if (realtime_summary.post_reroute_samples > 0) {
+				LOG(INFO) << "  Post-reroute mean: " << realtime_summary.post_reroute_mean_gbps
+				          << " GB/s";
+			}
+			if (realtime_summary.post_reroute_active_samples > 0) {
+				LOG(INFO) << "  Post-reroute active mean: "
+				          << realtime_summary.post_reroute_active_mean_gbps
+				          << " GB/s";
+				LOG(INFO) << "  Post-reroute active peak: "
+				          << realtime_summary.post_reroute_active_peak_gbps
+				          << " GB/s";
+			}
+			if (realtime_summary.failed_broker_id >= 0) {
+				LOG(INFO) << "  Failed broker (from events): " << realtime_summary.failed_broker_id;
+			}
+		} else {
+			LOG(WARNING) << "Failed to compute active-window failure throughput summary from "
+			             << throughput_file << " and " << events_file
+			             << "; falling back to end-to-end bandwidth.";
+		}
 
 		LOG(INFO) << "Failure publish test completed in " << std::fixed << std::setprecision(2) 
 			<< seconds << " seconds";
-		LOG(INFO) << "Bandwidth: " << std::fixed << std::setprecision(2) << bandwidthMbps << " MB/s";
+		LOG(INFO) << "Bandwidth (active-window headline): " << std::fixed << std::setprecision(2)
+		          << reported_bandwidth_mbps << " MB/s";
+		LOG(INFO) << "Bandwidth (end-to-end incl. tail drain): " << std::fixed << std::setprecision(2)
+		          << end_to_end_bandwidth_mbps << " MB/s";
 
 		// Clean up
 		delete[] message;
-		return bandwidthMbps;
+		return reported_bandwidth_mbps;
 
 	} catch (const std::exception& e) {
 		LOG(ERROR) << "Exception during failure publish test: " << e.what();

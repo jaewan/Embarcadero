@@ -100,6 +100,13 @@ public:
 	void MarkQueueInactive(size_t queue_idx);
 
 	/**
+	 * Mark a queue as active again after a transient failure/reconnect.
+	 * This lets the producer resume feeding a publish thread that has
+	 * successfully rerouted to another broker.
+	 */
+	void MarkQueueActive(size_t queue_idx);
+
+	/**
 	 * Pre-touch pool memory (hugepage regions) to fault pages in and reduce measurement variance.
 	 * Call explicitly after AddBuffers() and before the hot path. Not done inside AddBuffers()
 	 * so callers control when/how (e.g. after thread binding, or skip in tests that don't care).

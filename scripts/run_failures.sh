@@ -69,6 +69,8 @@ FAILURE_DATA_DIR="$(cd "$PROJECT_ROOT" && pwd)/data/failure"
 mkdir -p "$FAILURE_DATA_DIR"
 # Client writes to this dir when env is set (see publisher.cc, test_utils.cc)
 export EMBARCADERO_FAILURE_DATA_DIR="$FAILURE_DATA_DIR"
+SUMMARY_TSV="/tmp/run_failures_summary_$$.tsv"
+printf 'trial\treported_mb_s\tactive_mean_gbps\tactive_std_gbps\tactive_peak_gbps\n' > "$SUMMARY_TSV"
 
 echo "===== Failure Benchmark Configuration ====="
 echo "  Brokers:          $NUM_BROKERS"
@@ -166,6 +168,94 @@ wait_for_all_brokers_ready() {
   return 1
 }
 
+summarize_trial_results() {
+  local trial=$1
+  local client_log=$2
+  local trial_csv="$FAILURE_DATA_DIR/real_time_acked_throughput_trial${trial}.csv"
+  local trial_events="$FAILURE_DATA_DIR/failure_events_trial${trial}.csv"
+  local source_csv="$FAILURE_DATA_DIR/real_time_acked_throughput.csv"
+  local source_events="$FAILURE_DATA_DIR/failure_events.csv"
+
+  if [ -f "$source_csv" ]; then
+    cp "$source_csv" "$trial_csv"
+  fi
+  if [ -f "$source_events" ]; then
+    cp "$source_events" "$trial_events"
+  fi
+
+  local reported_mb_s
+  reported_mb_s=$(sed -n 's/.*Bandwidth (active-window headline): \([0-9][0-9.]*\) MB\/s.*/\1/p' "$client_log" | tail -n 1)
+  if [ -z "$reported_mb_s" ]; then
+    reported_mb_s=$(sed -n 's/.*Bandwidth: \([0-9][0-9.]*\) MB\/s.*/\1/p' "$client_log" | tail -n 1)
+  fi
+  if [ -z "$reported_mb_s" ]; then
+    reported_mb_s="nan"
+  fi
+
+  local csv_to_analyze="$trial_csv"
+  if [ ! -f "$csv_to_analyze" ] && [ -f "$source_csv" ]; then
+    csv_to_analyze="$source_csv"
+  fi
+
+  local active_stats="nan nan nan"
+  if [ -f "$csv_to_analyze" ]; then
+    active_stats=$(python3 - <<'PY' "$csv_to_analyze"
+import csv
+import math
+import sys
+
+path = sys.argv[1]
+rows = []
+with open(path, newline='') as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        try:
+            rows.append(float(row["Total_GBps"]))
+        except (KeyError, ValueError):
+            pass
+
+if not rows:
+    print("nan nan nan")
+    raise SystemExit
+
+threshold = 0.01
+active = [i for i, v in enumerate(rows) if v > threshold]
+trimmed = rows[:active[-1] + 2] if active else rows[:]
+
+if len(trimmed) > 5:
+    peak = max(trimmed)
+    cutoff = peak * 0.70
+    rolling = []
+    for i in range(len(trimmed)):
+        window = trimmed[max(0, i - 2):i + 1]
+        rolling.append(sum(window) / len(window))
+    above = [i for i, v in enumerate(rolling) if v >= cutoff]
+    if above:
+        trimmed = trimmed[:above[-1] + 1]
+
+if not trimmed:
+    print("nan nan nan")
+    raise SystemExit
+
+mean = sum(trimmed) / len(trimmed)
+var = sum((v - mean) ** 2 for v in trimmed) / len(trimmed)
+std = math.sqrt(var)
+peak = max(trimmed)
+print(f"{mean:.3f} {std:.3f} {peak:.3f}")
+PY
+)
+  fi
+
+  local active_mean active_std active_peak
+  read -r active_mean active_std active_peak <<< "$active_stats"
+
+  echo "Trial $trial summary:"
+  echo "  Reported bandwidth: ${reported_mb_s} MB/s"
+  echo "  Active-window throughput: mean=${active_mean} GB/s std=${active_std} GB/s peak=${active_peak} GB/s"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$trial" "$reported_mb_s" "$active_mean" "$active_std" "$active_peak" >> "$SUMMARY_TSV"
+}
+
 # --- Run failure trials ---
 for test_case in "${test_cases[@]}"; do
   for ((trial=1; trial<=NUM_TRIALS; trial++)); do
@@ -222,13 +312,17 @@ for test_case in "${test_cases[@]}"; do
     echo "  Throughput/events will be written to: $FAILURE_DATA_DIR"
 
     # Run failure test with timeout to prevent infinite hang (Bug: publish loop can stall on ACK backpressure)
-    CLIENT_LOG="client_failure_trial${trial}.log"
-    CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-300}  # 5 minutes max
+CLIENT_LOG="client_failure_trial${trial}.log"
+CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-300}  # 5 minutes max
+    RECORD_RESULTS_ARG=()
+    if [ -n "${EMBARCADERO_RECORD_RESULTS:-}" ]; then
+      RECORD_RESULTS_ARG+=(--record_results)
+    fi
     set +e
     timeout --signal=TERM --kill-after=10 "$CLIENT_TIMEOUT" \
       stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml \
       -n $THREADS_PER_BROKER -m $MESSAGE_SIZE \
-      -s $TOTAL_MESSAGE_SIZE --record_results -t $test_case \
+      -s $TOTAL_MESSAGE_SIZE "${RECORD_RESULTS_ARG[@]}" -t $test_case \
       --num_brokers_to_kill $NUM_BROKERS_TO_KILL --failure_percentage $FAILURE_PERCENTAGE \
       -o $ORDER -a $ack --sequencer $sequencer -l 0 2>&1 | tee "$CLIENT_LOG"
     test_exit_code=${PIPESTATUS[0]}
@@ -240,6 +334,8 @@ for test_case in "${test_cases[@]}"; do
     else
       echo "Failure throughput test completed successfully."
     fi
+
+    summarize_trial_results "$trial" "$CLIENT_LOG"
 
     # Clean up broker processes
     echo "Cleaning up broker processes..."
@@ -284,6 +380,49 @@ else
     echo "No throughput data found. Skipping plot."
   fi
 fi
+
+echo ""
+echo "===== Trial Summary ====="
+python3 - <<'PY' "$SUMMARY_TSV"
+import csv
+import math
+import sys
+
+path = sys.argv[1]
+rows = []
+with open(path, newline='') as f:
+    reader = csv.DictReader(f, delimiter='\t')
+    for row in reader:
+        rows.append(row)
+
+def parse_metric(name):
+    vals = []
+    for row in rows:
+        try:
+            v = float(row[name])
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(v):
+            continue
+        vals.append(v)
+    return vals
+
+def summarize(name, unit):
+    vals = parse_metric(name)
+    if not vals:
+        print(f"{name}: no successful samples")
+        return
+    mean = sum(vals) / len(vals)
+    var = sum((v - mean) ** 2 for v in vals) / len(vals)
+    std = math.sqrt(var)
+    joined = ", ".join(f"{v:.3f}" for v in vals)
+    print(f"{name}: [{joined}] {unit}")
+    print(f"  avg={mean:.3f} {unit} stddev={std:.3f} {unit} n={len(vals)}")
+
+summarize("reported_mb_s", "MB/s")
+summarize("active_mean_gbps", "GB/s")
+summarize("active_peak_gbps", "GB/s")
+PY
 
 echo ""
 echo "All failure experiments have finished."

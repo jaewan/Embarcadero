@@ -514,6 +514,13 @@ void QueueBuffer::MarkQueueInactive(size_t queue_idx) {
 	}
 }
 
+void QueueBuffer::MarkQueueActive(size_t queue_idx) {
+	if (queue_active_ && queue_idx < num_queues_) {
+		queue_active_[queue_idx].store(true, std::memory_order_relaxed);
+		NotifyQueueDataReady(queue_idx);
+	}
+}
+
 void QueueBuffer::WarmupBuffers() {
 	for (auto& region : batch_buffers_region_) {
 		if (!region.first || region.second == 0) continue;
