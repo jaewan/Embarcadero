@@ -59,6 +59,7 @@ QUIET=${QUIET:-0}
 TRIAL_MAX_ATTEMPTS=${TRIAL_MAX_ATTEMPTS:-3}
 BROKER_READY_TIMEOUT_SEC=${BROKER_READY_TIMEOUT_SEC:-60}
 BROKER_POLL_INTERVAL_SEC=${BROKER_POLL_INTERVAL_SEC:-0.1}
+PRESERVE_REMOTE_BROKERS=${PRESERVE_REMOTE_BROKERS:-0}
 
 # --- Environment Setup ---
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
@@ -70,6 +71,21 @@ if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
   shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
   rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
 fi
+
+throughput_test_supports_head_addr() {
+  strings ./throughput_test 2>/dev/null | grep -q 'head_addr'
+}
+
+resolve_client_head_addr() {
+  local head_addr="${EMBARCADERO_HEAD_ADDR:-${REMOTE_HEAD_ADDR:-127.0.0.1}}"
+  if broker_is_remote_mode && broker_remote_host_is_local; then
+    if [ "$head_addr" != "127.0.0.1" ]; then
+      echo "Remote broker host resolves to the local machine; using 127.0.0.1 for client/broker connections to match single-node behavior."
+    fi
+    head_addr="127.0.0.1"
+  fi
+  printf '%s\n' "$head_addr"
+}
 
 EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
 CLIENT_NUMA_BIND="numactl --cpunodebind=0 --membind=0"
@@ -83,14 +99,18 @@ broker_init_paths
 
 cleanup() {
   [ "$QUIET" != "1" ] && echo "Cleaning up..."
-  if broker_is_remote_mode; then
-    pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
-    pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
-  else
+  pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
+  pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
+  if ! broker_is_remote_mode || [ "$PRESERVE_REMOTE_BROKERS" != "1" ]; then
     broker_cleanup
   fi
   shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
   rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
+}
+
+fresh_start_cluster() {
+  [ "$QUIET" != "1" ] && echo "Resetting brokers for a fresh trial start..."
+  cleanup
 }
 
 wait_for_brokers() {
@@ -177,14 +197,21 @@ start_cluster() {
 }
 
 overall_status=0
-cleanup
+fresh_start_cluster
 inspect_replication_layout
+
+CLIENT_HEAD_ADDR="$(resolve_client_head_addr)"
+if broker_is_remote_mode && broker_remote_host_is_local; then
+  REMOTE_HEAD_ADDR="$CLIENT_HEAD_ADDR"
+fi
+export EMBARCADERO_HEAD_ADDR="$CLIENT_HEAD_ADDR"
 
 for ((trial=1; trial<=NUM_TRIALS; trial++)); do
   echo "=== Trial $trial ($SEQUENCER Order $ORDER, $NUM_BROKERS brokers, msg=$MESSAGE_SIZE) ==="
   trial_success=0
   for ((attempt=1; attempt<=TRIAL_MAX_ATTEMPTS; attempt++)); do
     [ "$QUIET" != "1" ] && echo "Trial $trial attempt $attempt/$TRIAL_MAX_ATTEMPTS"
+    fresh_start_cluster
     if ! start_cluster; then
       overall_status=1
       cleanup
@@ -193,13 +220,30 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
 
     echo "Running throughput test (type $TEST_TYPE)..."
     TRIAL_LOG="$(mktemp /tmp/throughput_trial_${trial}_${attempt}_XXXX.log)"
+    client_cmd=(
+      ./throughput_test
+      --config "$CLIENT_CONFIG_ABS"
+      -n "$THREADS_PER_BROKER"
+      -m "$MESSAGE_SIZE"
+      -s "$TOTAL_MESSAGE_SIZE"
+      -t "$TEST_TYPE"
+      -o "$ORDER"
+      -a "$ACK"
+      --sequencer "$SEQUENCER"
+      -l 0
+      -r "$REPLICATION_FACTOR"
+    )
+    if throughput_test_supports_head_addr; then
+      client_cmd+=(--head_addr "$CLIENT_HEAD_ADDR")
+    else
+      echo "WARNING: throughput_test binary does not advertise --head_addr; relying on EMBARCADERO_HEAD_ADDR environment fallback."
+    fi
     if broker_is_remote_mode; then
-      export EMBARCADERO_HEAD_ADDR="${EMBARCADERO_HEAD_ADDR:-$REMOTE_HEAD_ADDR}"
       echo "Benchmark start timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      $CLIENT_NUMA_BIND ./throughput_test --config "$CLIENT_CONFIG_ABS" --head_addr "$EMBARCADERO_HEAD_ADDR" -n "$THREADS_PER_BROKER" -m "$MESSAGE_SIZE" -s "$TOTAL_MESSAGE_SIZE" -t "$TEST_TYPE" -o "$ORDER" -a "$ACK" --sequencer "$SEQUENCER" -l 0 -r "$REPLICATION_FACTOR" 2>&1 | tee "$TRIAL_LOG"
+      $CLIENT_NUMA_BIND "${client_cmd[@]}" 2>&1 | tee "$TRIAL_LOG"
     else
       echo "Benchmark start timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      $CLIENT_NUMA_BIND ./throughput_test --config "$CLIENT_CONFIG_ABS" -n "$THREADS_PER_BROKER" -m "$MESSAGE_SIZE" -s "$TOTAL_MESSAGE_SIZE" -t "$TEST_TYPE" -o "$ORDER" -a "$ACK" --sequencer "$SEQUENCER" -l 0 -r "$REPLICATION_FACTOR" 2>&1 | tee "$TRIAL_LOG"
+      $CLIENT_NUMA_BIND "${client_cmd[@]}" 2>&1 | tee "$TRIAL_LOG"
     fi
     cmd_status=${PIPESTATUS[0]}
 

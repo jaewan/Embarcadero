@@ -15,6 +15,13 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
                                   std::function<bool()> killbrokers);
 
 /**
+ * Resolves the broker head address for client-side benchmark code.
+ * Falls back to EMBARCADERO_HEAD_ADDR and then localhost when the CLI option
+ * is absent or empty.
+ */
+std::string GetHeadAddr(const cxxopts::ParseResult& result);
+
+/**
  * Runs a publish throughput test
  * @param result Parse result from command line
  * @param topic Topic name

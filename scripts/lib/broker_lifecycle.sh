@@ -47,6 +47,36 @@ broker_remote_ssh() {
   ssh "$REMOTE_BROKER_HOST" "$@"
 }
 
+broker_remote_host_tokens() {
+  broker_remote_ssh bash -s <<'EOF'
+{
+  hostname -f 2>/dev/null || true
+  hostname -s 2>/dev/null || true
+  hostname -I 2>/dev/null || true
+} | tr ' ' '\n' | awk 'NF' | sort -u
+EOF
+}
+
+broker_local_host_tokens() {
+  {
+    hostname -f 2>/dev/null || true
+    hostname -s 2>/dev/null || true
+    hostname -I 2>/dev/null || true
+  } | tr ' ' '\n' | awk 'NF' | sort -u
+}
+
+broker_remote_host_is_local() {
+  local local_tokens remote_tokens token
+  local_tokens="$(broker_local_host_tokens)" || return 1
+  remote_tokens="$(broker_remote_host_tokens)" || return 1
+  for token in $remote_tokens; do
+    case " $local_tokens " in
+      *" $token "*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 broker_ready_file_count_local() {
   local ready_files=(/tmp/embarlet_*_ready)
   if [ -e "${ready_files[0]}" ]; then
@@ -111,7 +141,7 @@ EOF
 }
 
 broker_remote_cleanup() {
-  broker_remote_ssh bash -s -- "$REMOTE_BROKER_STATE_DIR" "$REMOTE_BUILD_BIN" "$BROKER_CONFIG_ABS" "$BROKER_DATA_PORT_BASE" "$BROKER_HEARTBEAT_PORT" "$NUM_BROKERS" <<'EOF'
+  broker_remote_ssh bash -s -- "$REMOTE_BROKER_STATE_DIR" "$REMOTE_BUILD_BIN" "$BROKER_CONFIG_ABS" "$BROKER_DATA_PORT_BASE" "$BROKER_HEARTBEAT_PORT" "$NUM_BROKERS" "${EMBARCADERO_CXL_SHM_NAME:-}" <<'EOF'
 set -euo pipefail
 state_dir=$1
 build_bin=$2
@@ -119,6 +149,7 @@ config=$3
 data_base=$4
 heartbeat_port=$5
 num_brokers=$6
+shm_name=$7
 if [ -d "$state_dir" ]; then
   for pid_file in "$state_dir"/broker_*.pid; do
     [ -e "$pid_file" ] || continue
@@ -155,6 +186,12 @@ for pid in $(pgrep -f "$build_bin/corfu_global_sequencer" 2>/dev/null || true); 
   sleep 0.05
   kill -9 "$pid" 2>/dev/null || true
 done
+
+rm -f /tmp/embarlet_*_ready 2>/dev/null || true
+if [ -n "$shm_name" ]; then
+  shm_unlink "$shm_name" 2>/dev/null || true
+  rm -f "/dev/shm${shm_name}" 2>/dev/null || true
+fi
 EOF
 }
 
@@ -210,14 +247,23 @@ idx=$5
 role=$6
 sequence=$7
 poll_interval=$8
+export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
+export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
+export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
+export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-0}
+export EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}
 log_file="$state_dir/broker_${idx}.log"
 cd "$build_bin"
 export EMBARCADERO_HEAD_ADDR="$head_addr"
+cmd=(./embarlet --config "$config")
 if [ "$role" = "head" ]; then
-  ./embarlet --config "$config" --head --"$sequence" >"$log_file" 2>&1 &
-else
-  ./embarlet --config "$config" --"$sequence" >"$log_file" 2>&1 &
+  cmd+=(--head)
 fi
+cmd+=(--"$sequence")
+if command -v numactl >/dev/null 2>&1; then
+  cmd=(numactl --cpunodebind=1 --membind=1,2 "${cmd[@]}")
+fi
+"${cmd[@]}" >"$log_file" 2>&1 &
 pid=$!
 printf '%s\n' "$pid" > "$state_dir/broker_${idx}.pid"
 for _ in $(seq 1 1200); do

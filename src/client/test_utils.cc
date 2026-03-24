@@ -35,7 +35,7 @@ static bool ShouldValidateOrder() {
 	return std::strcmp(env, "0") != 0;
 }
 
-static std::string GetHeadAddr(const cxxopts::ParseResult& result) {
+std::string GetHeadAddr(const cxxopts::ParseResult& result) {
 	if (result.count("head_addr") > 0) {
 		const std::string addr = result["head_addr"].as<std::string>();
 		if (!addr.empty()) return addr;
