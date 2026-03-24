@@ -85,6 +85,19 @@ static bool ShouldUseUnifiedReplicationPath() {
 	return enabled;
 }
 
+static int ReadEnvIntNonNegative(const char* name, int default_value) {
+	const char* env = std::getenv(name);
+	if (!env || !env[0]) return default_value;
+	char* end = nullptr;
+	long parsed = std::strtol(env, &end, 10);
+	if (end == env || *end != '\0' || parsed < 0) {
+		LOG(WARNING) << "Ignoring invalid " << name << "=" << env
+		             << "; using default " << default_value;
+		return default_value;
+	}
+	return static_cast<int>(parsed);
+}
+
 /**
  * Closes socket and epoll file descriptors safely
  */
@@ -1893,9 +1906,13 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	size_t last_known_ack = 0;  // Cache for fast-path optimization
 	const bool ack_jitter_trace = ShouldEnableAckJitterTrace();
 	auto ack_trace_last_send = std::chrono::steady_clock::now();
+	auto ack_last_send_time = std::chrono::steady_clock::now();
 	size_t last_trace_sent_ack = static_cast<size_t>(-1);
+	size_t last_sent_ack = static_cast<size_t>(-1);
 	TInode* trace_tinode = nullptr;
 	bool trace_order5_ack = false;
+	const int ack_send_min_interval_us =
+		ReadEnvIntNonNegative("EMBARCADERO_ACK_SEND_MIN_INTERVAL_US", 0);
 	if (ShouldEnableOrder5Trace()) {
 		trace_tinode = (TInode*)cxl_manager_->GetTInode(topic.c_str());
 		if (trace_tinode && trace_tinode->order == 5 &&
@@ -1969,6 +1986,17 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 
 		// ACK is ready, use the verified value
 		size_t ack = current_ack;
+		if (ack_send_min_interval_us > 0 && ack == last_sent_ack) {
+			continue;
+		}
+		if (ack_send_min_interval_us > 0 && last_sent_ack != static_cast<size_t>(-1)) {
+			auto now = std::chrono::steady_clock::now();
+			auto since_last_send = std::chrono::duration_cast<std::chrono::microseconds>(
+				now - ack_last_send_time).count();
+			if (since_last_send < ack_send_min_interval_us) {
+				continue;
+			}
+		}
 
 				if(ack != (size_t)-1 && next_to_ack_offset <= ack){
 					if (ack_jitter_trace) {
@@ -2088,6 +2116,10 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 					}
 					}
 				} // end of send loop
+				if (acked_size >= sizeof(ack)) {
+					last_sent_ack = ack;
+					ack_last_send_time = std::chrono::steady_clock::now();
+				}
 			}else{
 			// Check if connection is still alive
 			if (!IsConnectionAlive(ack_fd, buf)) {

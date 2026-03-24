@@ -84,6 +84,7 @@ class HeartBeatServiceImpl final : public HeartBeat::Service {
 				CreateTopicResponse* reply) override;
 
 		void SetServer(std::shared_ptr<Server> server);
+		void SetAcceptsPublishes(int broker_id, bool accepts);
 		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback);
 		int GetRegisteredBrokers(absl::btree_set<int> &registered_brokers,
 				struct Embarcadero::MessageHeader** msg_to_order,
@@ -130,6 +131,7 @@ class FollowerNodeClient {
 		int GetNumBrokers();
 		bool IsHeadAlive() const { return head_alive_; }
 		void SetHeadAlive(bool alive) { head_alive_ = alive; }
+		void SetAcceptsPublishes(bool accepts) { accepts_publishes_.store(accepts, std::memory_order_release); }
 		int GetBrokerId() { return broker_id_; }
 		std::string GetNodeId() const { return node_id_; }
 		std::string GetAddress() const { return address_; }
@@ -169,6 +171,7 @@ class FollowerNodeClient {
 		std::string address_;
 		grpc::CompletionQueue cq_;
 		std::atomic<bool> head_alive_{true};
+		std::atomic<bool> accepts_publishes_{false};
 		std::atomic<bool> wait_called_{false};
 		int broker_id_{-1};
 		std::thread heartbeat_thread_;
@@ -189,6 +192,7 @@ class HeartBeatManager {
 				struct Embarcadero::TInode *tinode);
 		std::string GetNextBrokerAddr(int broker_id);
 		int GetNumBrokers();
+		void SetAcceptsPublishes(bool accepts);
 		void RegisterCreateTopicEntryCallback(Embarcadero::CreateTopicEntryCallback callback);
 
 	private:

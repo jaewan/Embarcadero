@@ -330,6 +330,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	// Signal initialization completion
+	heartbeat_manager.SetAcceptsPublishes(true);
 	LOG(INFO) << "[CORFU_DEBUG] Data port listening, signaling ready";
 	SignalScriptReady();
 	LOG(INFO) << "Embarcadero initialized. Ready to go";

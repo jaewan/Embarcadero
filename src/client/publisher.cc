@@ -2004,9 +2004,9 @@ void Publisher::SubscribeToClusterStatus() {
 						connected_.store(true, std::memory_order_release);
 						VLOG(1) << "SubscribeToCluster: Connection established successfully. connected_=true";
 					}
-				} else if (!connected_.load(std::memory_order_acquire) && brokers_.empty()) {
-					// Fallback: no publishable brokers discovered, use head broker (0)
-					LOG(WARNING) << "SubscribeToCluster: No publishable brokers discovered, using head broker (0) as fallback";
+				} else if (!connected_.load(std::memory_order_acquire) && brokers_.empty() && !use_broker_info) {
+					// Legacy-only fallback for old brokers that do not publish broker_info.
+					LOG(WARNING) << "SubscribeToCluster: No broker_info available; using legacy fallback broker 0";
 					if (!AddPublisherThreads(num_threads_per_broker_, 0, qsize)) {
 						LOG(ERROR) << "Failed to add publisher threads for head broker";
 					} else {

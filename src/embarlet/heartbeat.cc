@@ -1,6 +1,8 @@
 #include <chrono>
 #include <algorithm>
 #include <cstring>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include "heartbeat.h"
 
 namespace heartbeat_system {
@@ -35,7 +37,7 @@ HeartBeatServiceImpl::HeartBeatServiceImpl(std::string head_addr) {
 		head_network_addr,
 		now,  // registration_time
 		now,  // last_heartbeat
-		true  // head always accepts publishes
+		false  // Only advertise publishable after the data listener is live.
 	};
 
 	// Start a thread to check follower node heartbeats
@@ -84,7 +86,7 @@ Status HeartBeatServiceImpl::RegisterNode(
 				network_mgr_addr,
 				now,  // registration_time
 				now,  // last_heartbeat
-				true  // accepts_publishes = true for all data brokers
+				false  // Publishability is flipped on only after the data listener is live.
 			};
 
 			reply->set_success(true);
@@ -112,6 +114,7 @@ grpc::Status HeartBeatServiceImpl::Heartbeat(
 
 	bool node_exists = false;
 	bool force_full_update = false;
+	bool need_version_increment = false;
 
 	{
 		absl::MutexLock lock(&mutex_);
@@ -120,6 +123,10 @@ grpc::Status HeartBeatServiceImpl::Heartbeat(
 
 		if (it != nodes_.end()) {
 			it->second.last_heartbeat = std::chrono::steady_clock::now();
+			if (it->second.accepts_publishes != request->accepts_publishes()) {
+				it->second.accepts_publishes = request->accepts_publishes();
+				need_version_increment = true;
+			}
 			node_exists = true;
 
 			if (shutdown_) {
@@ -130,6 +137,12 @@ grpc::Status HeartBeatServiceImpl::Heartbeat(
 
 		// Check if client needs a full update
 		force_full_update = (request->cluster_version() < cluster_version_);
+	}
+
+	if (need_version_increment) {
+		absl::MutexLock lock(&cluster_mutex_);
+		cluster_version_++;
+		force_full_update = true;
 	}
 
 	reply->set_alive(node_exists);
@@ -251,6 +264,27 @@ grpc::Status HeartBeatServiceImpl::GetClusterStatus(
 	}
 
 	return grpc::Status::OK;
+}
+
+void HeartBeatServiceImpl::SetAcceptsPublishes(int broker_id, bool accepts) {
+	bool changed = false;
+	{
+		absl::MutexLock lock(&mutex_);
+		for (auto& entry : nodes_) {
+			if (entry.second.broker_id == broker_id) {
+				if (entry.second.accepts_publishes != accepts) {
+					entry.second.accepts_publishes = accepts;
+					changed = true;
+				}
+				break;
+			}
+		}
+	}
+
+	if (changed) {
+		absl::MutexLock lock(&cluster_mutex_);
+		cluster_version_++;
+	}
 }
 
 grpc::Status HeartBeatServiceImpl::TerminateCluster(
@@ -593,6 +627,7 @@ void FollowerNodeClient::Register() {
 void FollowerNodeClient::SendHeartbeat() {
 	HeartbeatRequest request;
 	request.set_node_id(node_id_);
+	request.set_accepts_publishes(accepts_publishes_.load(std::memory_order_acquire));
 
 	{
 		absl::MutexLock lock(&cluster_mutex_);
@@ -815,6 +850,16 @@ int HeartBeatManager::GetNumBrokers () {
 	}
 }
 
+void HeartBeatManager::SetAcceptsPublishes(bool accepts) {
+	if (is_head_node_) {
+		service_->SetAcceptsPublishes(0, accepts);
+		return;
+	}
+	if (follower_) {
+		follower_->SetAcceptsPublishes(accepts);
+	}
+}
+
 void HeartBeatManager::RegisterCreateTopicEntryCallback(
 		Embarcadero::CreateTopicEntryCallback callback) {
 
@@ -850,6 +895,32 @@ std::string HeartBeatManager::GenerateUniqueId() {
 }
 
 std::string HeartBeatManager::GetAddress() {
+	if (const char* advertised = std::getenv("EMBARCADERO_HEAD_ADDR")) {
+		if (advertised[0] != '\0') {
+			return std::string(advertised);
+		}
+	}
+
+	struct ifaddrs* ifaddr = nullptr;
+	if (getifaddrs(&ifaddr) == 0) {
+		for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+			if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET) {
+				continue;
+			}
+			if ((ifa->ifa_flags & IFF_LOOPBACK) != 0) {
+				continue;
+			}
+
+			char addrbuf[INET_ADDRSTRLEN];
+			auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+			if (inet_ntop(AF_INET, &sin->sin_addr, addrbuf, sizeof(addrbuf)) != nullptr) {
+				freeifaddrs(ifaddr);
+				return std::string(addrbuf);
+			}
+		}
+		freeifaddrs(ifaddr);
+	}
+
 	char hostbuffer[256];
 	char *IPbuffer;
 	struct hostent *host_entry;

@@ -76,6 +76,67 @@ throughput_test_supports_head_addr() {
   strings ./throughput_test 2>/dev/null | grep -q 'head_addr'
 }
 
+have_numactl() {
+  command -v numactl >/dev/null 2>&1
+}
+
+local_numa_node_count() {
+  if ! have_numactl; then
+    printf '0\n'
+    return
+  fi
+  numactl --hardware 2>/dev/null | awk '/^available:/ {print $2; exit}'
+}
+
+detect_numa_node_for_head_addr() {
+  local head_addr="$1"
+  local route_line iface numa_node
+
+  if [ -z "$head_addr" ] || [ "$head_addr" = "127.0.0.1" ] || [ "$head_addr" = "localhost" ]; then
+    return 1
+  fi
+
+  route_line=$(ip -o route get "$head_addr" 2>/dev/null | head -1) || return 1
+  iface=$(awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}' <<<"$route_line")
+  if [ -z "$iface" ] || [ ! -r "/sys/class/net/$iface/device/numa_node" ]; then
+    return 1
+  fi
+
+  numa_node=$(cat "/sys/class/net/$iface/device/numa_node" 2>/dev/null || true)
+  if [[ ! "$numa_node" =~ ^-?[0-9]+$ ]] || [ "$numa_node" -lt 0 ]; then
+    return 1
+  fi
+
+  printf '%s %s\n' "$numa_node" "$iface"
+}
+
+default_client_numa_bind() {
+  local head_addr="$1"
+  local numa_nodes detection detected_node detected_iface
+
+  if ! have_numactl; then
+    printf '%s\n' ""
+    return
+  fi
+
+  numa_nodes=$(local_numa_node_count)
+  if [[ ! "$numa_nodes" =~ ^[0-9]+$ ]] || [ "$numa_nodes" -le 1 ]; then
+    printf '%s\n' ""
+    return
+  fi
+
+  if detection=$(detect_numa_node_for_head_addr "$head_addr"); then
+    read -r detected_node detected_iface <<<"$detection"
+    if [ -n "$detected_node" ] && [ -n "$detected_iface" ]; then
+      echo "Client NUMA auto-bind: head_addr=$head_addr routes via $detected_iface on NUMA node $detected_node" >&2
+      printf 'numactl --cpunodebind=%s --membind=%s\n' "$detected_node" "$detected_node"
+      return
+    fi
+  fi
+
+  printf '%s\n' "numactl --cpunodebind=0 --membind=0"
+}
+
 resolve_client_head_addr() {
   local head_addr="${EMBARCADERO_HEAD_ADDR:-${REMOTE_HEAD_ADDR:-127.0.0.1}}"
   if broker_is_remote_mode && broker_remote_host_is_local; then
@@ -86,13 +147,6 @@ resolve_client_head_addr() {
   fi
   printf '%s\n' "$head_addr"
 }
-
-EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
-CLIENT_NUMA_BIND="numactl --cpunodebind=0 --membind=0"
-if [[ "$SEQUENCER" == "CORFU" ]]; then
-  EMBARLET_NUMA_BIND=""
-  CLIENT_NUMA_BIND=""
-fi
 
 cd build/bin || { echo "Error: build/bin not found"; exit 1; }
 broker_init_paths
@@ -205,6 +259,13 @@ if broker_is_remote_mode && broker_remote_host_is_local; then
   REMOTE_HEAD_ADDR="$CLIENT_HEAD_ADDR"
 fi
 export EMBARCADERO_HEAD_ADDR="$CLIENT_HEAD_ADDR"
+
+EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
+CLIENT_NUMA_BIND="${CLIENT_NUMA_BIND:-$(default_client_numa_bind "$CLIENT_HEAD_ADDR")}"
+if [[ "$SEQUENCER" == "CORFU" ]]; then
+  EMBARLET_NUMA_BIND=""
+  CLIENT_NUMA_BIND=""
+fi
 
 for ((trial=1; trial<=NUM_TRIALS; trial++)); do
   echo "=== Trial $trial ($SEQUENCER Order $ORDER, $NUM_BROKERS brokers, msg=$MESSAGE_SIZE) ==="

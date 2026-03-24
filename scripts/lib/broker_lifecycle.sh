@@ -163,6 +163,14 @@ if [ -d "$state_dir" ]; then
   rm -f "$state_dir"/broker_*.pid "$state_dir"/broker_*.ready "$state_dir"/broker_*.log
 fi
 
+# Kill any orphaned broker processes from earlier failed starts, even if they never
+# reached the point of binding a data port or writing a current pid file.
+for pid in $(pgrep -x embarlet 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+  sleep 0.05
+  kill -9 "$pid" 2>/dev/null || true
+done
+
 # Catch any orphaned listeners on the broker data/heartbeat ports.
 for idx in $(seq 0 $((num_brokers - 1))); do
   port=$((data_base + idx))
@@ -225,7 +233,8 @@ broker_remote_launch() {
     "$idx" \
     "$role" \
     "$sequence" \
-    "$poll_interval" <<'EOF'
+    "$poll_interval" \
+    "${EMBARCADERO_ACK_SEND_MIN_INTERVAL_US:-}" <<'EOF'
 set -euo pipefail
 state_dir=$1
 build_bin=$2
@@ -235,9 +244,10 @@ idx=$5
 role=$6
 sequence=$7
 poll_interval=$8
+ack_send_min_interval_us=$9
 mkdir -p "$state_dir"
 rm -f "$state_dir/broker_${idx}.pid" "$state_dir/broker_${idx}.ready" "$state_dir/broker_${idx}.log"
-nohup bash -s -- "$state_dir" "$build_bin" "$config" "$head_addr" "$idx" "$role" "$sequence" "$poll_interval" <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
+nohup bash -s -- "$state_dir" "$build_bin" "$config" "$head_addr" "$idx" "$role" "$sequence" "$poll_interval" "$ack_send_min_interval_us" <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
 set -euo pipefail
 state_dir=$1
 build_bin=$2
@@ -247,11 +257,15 @@ idx=$5
 role=$6
 sequence=$7
 poll_interval=$8
+ack_send_min_interval_us=$9
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
 export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-0}
 export EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}
+if [ -n "$ack_send_min_interval_us" ]; then
+  export EMBARCADERO_ACK_SEND_MIN_INTERVAL_US="$ack_send_min_interval_us"
+fi
 log_file="$state_dir/broker_${idx}.log"
 cd "$build_bin"
 export EMBARCADERO_HEAD_ADDR="$head_addr"
@@ -284,9 +298,11 @@ EOF
 broker_remote_wait_for_cluster() {
   local timeout_s="$1"
   local expected="$2"
+  local stability_s="${BROKER_READY_STABILITY_SEC:-1}"
   local start_ts
   start_ts=$(date +%s)
   local last_report=0
+  local stable_since=0
   while true; do
     local healthy=0
     local missing=()
@@ -298,7 +314,16 @@ broker_remote_wait_for_cluster() {
       fi
     done
     if [ "$healthy" -ge "$expected" ]; then
-      return 0
+      local now
+      now=$(date +%s)
+      if [ "$stable_since" -eq 0 ]; then
+        stable_since="$now"
+      fi
+      if [ $((now - stable_since)) -ge "$stability_s" ]; then
+        return 0
+      fi
+    else
+      stable_since=0
     fi
     local now
     now=$(date +%s)
@@ -318,14 +343,25 @@ broker_remote_wait_for_cluster() {
 broker_local_wait_for_cluster() {
   local timeout_s="$1"
   local expected="$2"
+  local stability_s="${BROKER_READY_STABILITY_SEC:-1}"
   local start_ts
   start_ts=$(date +%s)
+  local stable_since=0
   echo "Waiting for $expected brokers to signal readiness..."
   while true; do
     local ready
     ready="$(broker_ready_file_count_local)"
     if [ "$ready" -ge "$expected" ]; then
-      return 0
+      local now
+      now=$(date +%s)
+      if [ "$stable_since" -eq 0 ]; then
+        stable_since="$now"
+      fi
+      if [ $((now - stable_since)) -ge "$stability_s" ]; then
+        return 0
+      fi
+    else
+      stable_since=0
     fi
     if [ $(( $(date +%s) - start_ts )) -ge "$timeout_s" ]; then
       echo "ERROR: local brokers did not become ready within ${timeout_s}s" >&2
