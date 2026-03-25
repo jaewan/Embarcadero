@@ -351,6 +351,26 @@ class Topic {
 				size_t& messages_size);
 
 		/**
+		 * Push a batch record for ORDER=0 subscriber export.
+		 * Called from the ingest fast path after UpdateWrittenForOrder0.
+		 * Lock-free multi-producer, multi-reader ring (DRAM only, no CXL writes).
+		 */
+		void PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg);
+
+		/**
+		 * Read the next ORDER=0 batch record for a subscriber.
+		 * @param read_cursor Per-subscriber cursor (monotonic, 0-based). Advanced on success.
+		 * @param out_log_idx CXL offset of batch payload start.
+		 * @param out_total_size Payload byte count.
+		 * @param out_num_msg Message count in batch.
+		 * @return true if a batch was available and read_cursor advanced.
+		 */
+		bool ReadOrder0Batch(uint64_t& read_cursor,
+				uint64_t& out_log_idx,
+				uint32_t& out_total_size,
+				uint32_t& out_num_msg) const;
+
+		/**
 		 * Get a buffer in CXL memory for a new batch of messages
 		 *
 		 * @param batch_header Reference to the batch header
@@ -633,6 +653,22 @@ class Topic {
 
 		// [[ORDER_0_SKIP_PBR]] Monotonic logical offset for order 0; no PBR slot written, only written count updated
 		std::atomic<size_t> order0_next_logical_offset_{0};
+
+		// [[ORDER0_SUBSCRIBE]] DRAM batch ring for ORDER=0 subscriber export.
+		// Lock-free multi-producer (one ingest thread per publisher connection) +
+		// multi-reader (one subscribe thread per subscriber, independent cursors).
+		// Seqlock-style: slot.sequence encodes which cursor's batch is stored.
+		struct alignas(32) Order0BatchSlot {
+			std::atomic<uint64_t> sequence{0};  // 0=empty; N = batch for cursor N-1 is ready
+			uint64_t log_idx = 0;
+			uint32_t total_size = 0;
+			uint32_t num_msg = 0;
+			uint32_t _pad = 0;
+		};
+		static_assert(sizeof(Order0BatchSlot) == 32, "Order0BatchSlot must be 32 bytes");
+		static constexpr size_t kOrder0BatchRingSize = 8192;  // 8K slots × 32B = 256KB DRAM
+		alignas(64) std::array<Order0BatchSlot, kOrder0BatchRingSize> order0_batch_ring_{};
+		alignas(64) std::atomic<uint64_t> order0_batch_write_cursor_{0};
 
 		// TInode cache
 		int replication_factor_;

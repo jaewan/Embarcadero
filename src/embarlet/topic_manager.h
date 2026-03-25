@@ -158,6 +158,12 @@ class TopicManager {
 				void*& messages,
 				size_t& messages_size);
 
+		bool ReadOrder0Batch(const char* topic, uint64_t& read_cursor,
+				uint64_t& out_log_idx, uint32_t& out_total_size,
+				uint32_t& out_num_msg) const;
+		void PushOrder0Batch(const char* topic, uint64_t log_idx,
+				uint32_t total_size, uint32_t num_msg);
+
 		int GetTopicOrder(const char* topic);
 
 		void RegisterGetNumBrokersCallback(GetNumBrokersCallback callback){

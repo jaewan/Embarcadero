@@ -2144,6 +2144,42 @@ void Topic::CommittedSeqUpdaterThread() {
  *
  * @return true if more messages are available
  */
+void Topic::PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg) {
+	uint64_t cursor = order0_batch_write_cursor_.fetch_add(1, std::memory_order_relaxed);
+	auto& slot = order0_batch_ring_[cursor & (kOrder0BatchRingSize - 1)];
+	slot.log_idx = log_idx;
+	slot.total_size = total_size;
+	slot.num_msg = num_msg;
+	// Release store: makes log_idx/total_size/num_msg visible to readers after sequence.
+	slot.sequence.store(cursor + 1, std::memory_order_release);
+}
+
+bool Topic::ReadOrder0Batch(uint64_t& read_cursor,
+		uint64_t& out_log_idx,
+		uint32_t& out_total_size,
+		uint32_t& out_num_msg) const {
+	const auto& slot = order0_batch_ring_[read_cursor & (kOrder0BatchRingSize - 1)];
+	uint64_t seq = slot.sequence.load(std::memory_order_acquire);
+	if (seq != read_cursor + 1) {
+		if (seq > read_cursor + 1) {
+			// Subscriber fell behind; ring slot has been overwritten. Skip ahead.
+			static std::atomic<uint64_t> overrun_log_count{0};
+			if (overrun_log_count.fetch_add(1, std::memory_order_relaxed) % 100 == 0) {
+				LOG(WARNING) << "ORDER=0 subscribe ring overrun: read_cursor=" << read_cursor
+				             << " seq=" << seq << " (subscriber too slow, skipping "
+				             << (seq - 1 - read_cursor) << " batches)";
+			}
+			read_cursor = seq - 1;
+		}
+		return false;
+	}
+	out_log_idx = slot.log_idx;
+	out_total_size = slot.total_size;
+	out_num_msg = slot.num_msg;
+	read_cursor++;
+	return true;
+}
+
 bool Topic::GetMessageAddr(
 		size_t &last_offset,
 		void* &last_addr,
