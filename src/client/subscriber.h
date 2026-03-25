@@ -236,6 +236,12 @@ class Subscriber {
 		 */
 		void Poll(size_t total_msg_size, size_t msg_size);
 
+		// Returns the wall-clock nanoseconds (system_clock epoch) when the first byte was received.
+		// Returns 0 if no data has been received yet.
+		int64_t GetFirstByteWallNs() const {
+			return first_byte_wall_ns_.load(std::memory_order_relaxed);
+		}
+
 
 		// Initiate shutdown
 		void Shutdown();
@@ -334,6 +340,9 @@ class Subscriber {
 		size_t sub_connections_per_broker_;
 		int order_level_; // Store the order level for batch-aware processing
 		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
+		// Wall-clock nanoseconds (system_clock epoch) when the first byte was received.
+		// Set once via CAS on first non-zero recv; 0 means no data yet.
+		std::atomic<int64_t> first_byte_wall_ns_{0};
 		std::atomic<size_t> latency_unique_message_count_{0}; // Unique message keys seen during receive
 		std::atomic<size_t> latency_parsed_message_count_{0}; // Parsed latency messages seen during receive
 		absl::Mutex latency_seen_mutex_;

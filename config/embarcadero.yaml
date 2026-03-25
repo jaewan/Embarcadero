@@ -46,7 +46,7 @@ embarcadero:
     io_threads: 6               # ReqReceive threads: tuned for optimal throughput (too many threads causes contention)
     disk_io_threads: 2           # REDUCED: Testing if fewer disk threads help. Was 4, now 2.
     sub_connections: 3           # Set to 3 connections per broker as requested
-    zero_copy_send_limit: 65536     # PERF TUNED: 64KB threshold - optimal for MSG_ZEROCOPY (Linux kernel sweet spot, works with 2MB batches)
+    zero_copy_send_limit: 2097152   # 2MB: MSG_ZEROCOPY is disabled; match batch size to minimize send() syscalls (was 64KB = 32 syscalls/batch)
 
     # Publish path: blocking recv() directly to BLog (CXL). No staging; single code path.
     # PBR backpressure: stop reading TCP when ring above high %, resume when below low %.

@@ -79,6 +79,13 @@ class Publisher {
 		 */
 		bool Poll(size_t n, bool include_tail_drain = true);
 
+		// Returns wall-clock ns (system_clock epoch) when the last batch's send() returned.
+		// 0 if no batch has been sent yet. Use this to compute true send-done bandwidth,
+		// excluding the thread-join + queue-drain overhead inside Poll().
+		int64_t GetLastSendWallNs() const {
+			return last_send_wall_ns_.load(std::memory_order_relaxed);
+		}
+
 		/**
 		 * Debug method to check if sending is finished
 		 */
@@ -194,6 +201,10 @@ class Publisher {
 		std::atomic<size_t> total_batches_attempted_{0};
 		std::atomic<size_t> total_batches_failed_{0};
 		std::atomic<size_t> zero_batch_publish_threads_{0};
+		// Wall-clock ns (system_clock epoch) when the last batch's send() returned.
+		// Updated via atomic max after every successful send in PublishThread.
+		// Exposed via GetLastSendWallNs() so callers can compute true send-done bandwidth.
+		std::atomic<int64_t> last_send_wall_ns_{0};
 		// Used to measure real-time throughput during failure benchmark
 		std::atomic<size_t> total_sent_bytes_{0};
 		// [[CACHE_LINE_FIX]] Cache-line aligned per-broker statistics to prevent false sharing

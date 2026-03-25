@@ -1198,8 +1198,8 @@ void NetworkManager::HandleSubscribeRequest(
 		return;
 	}
 
-	// Set larger send buffer
-	int send_buffer_size = 16 * 1024 * 1024;  // 16MB
+	// Set send buffer: 64MB is ~50× the 100G/100µs BDP, avoids OOM from 268MB × 12 connections
+	int send_buffer_size = 64 * 1024 * 1024;
 	if (setsockopt(client_socket, SOL_SOCKET, SO_SNDBUF, &send_buffer_size, sizeof(send_buffer_size)) == -1) {
 		LOG(ERROR) << "Subscriber setsockopt SO_SNDBUF failed";
 		close(client_socket);
@@ -1508,7 +1508,7 @@ bool NetworkManager::SendMessageData(
 			// [[PERF_FIX]] Remove MSG_ZEROCOPY to avoid ENOBUFS caused by undrained error queue
 			// MSG_ZEROCOPY requires draining MSG_ERRQUEUE which wasn't implemented,
 			// causing non-deterministic throughput collapse when queue fills up.
-			int send_flags = 0;
+			int send_flags = MSG_NOSIGNAL; // prevents SIGPIPE when subscriber closes mid-send (would kill broker process)
 			int ret = send(sock_fd, (uint8_t*)buffer + sent_bytes, to_send, send_flags);
 
 			if (ret > 0) {

@@ -152,6 +152,11 @@ int main(int argc, char* argv[]) {
 	// [[GRACEFUL_SHUTDOWN]] Handle SIGTERM/SIGINT so brokers can drain and exit cleanly
 	std::signal(SIGTERM, ShutdownSignalHandler);
 	std::signal(SIGINT, ShutdownSignalHandler);
+	// Ignore SIGPIPE: prevents broker death when a subscriber closes the TCP connection
+	// while SubscribeNetworkThread is mid-send(). Without this, send() to a closed socket
+	// raises SIGPIPE (default: process termination). MSG_NOSIGNAL in SendMessageData is the
+	// primary guard; this is defense-in-depth for any other socket writes in the broker.
+	std::signal(SIGPIPE, SIG_IGN);
 
 	// Parse command line arguments
 	std::string head_addr = "127.0.0.1:" + std::to_string(BROKER_PORT);

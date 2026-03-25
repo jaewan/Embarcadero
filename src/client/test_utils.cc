@@ -1,6 +1,8 @@
 #include "test_utils.h"
 #include "../common/configuration.h"
 #include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -716,6 +718,15 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 
 			// Start timing
 			auto start = std::chrono::high_resolution_clock::now();
+			const int64_t pub_start_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::system_clock::now().time_since_epoch()).count();
+			if (const char* time_file = std::getenv("EMBARCADERO_PUB_START_TIME_FILE")) {
+				if (FILE* f = std::fopen(time_file, "w")) {
+					std::fprintf(f, "%" PRId64 "\n", pub_start_wall_ns);
+					std::fclose(f);
+				}
+			}
+			LOG(INFO) << "Publisher push start (wall ns): " << pub_start_wall_ns;
 
 			// Publish messages
 				for (size_t i = 0; i < n; i++) {
@@ -736,9 +747,20 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 		double seconds = elapsed.count();
 		double bandwidthMbps = ((message_size * n) / seconds) / (1024 * 1024);
 
-		LOG(INFO) << "Publish test completed in " << std::fixed << std::setprecision(2) 
-			<< seconds << " seconds";
-		LOG(INFO) << "Bandwidth: " << std::fixed << std::setprecision(2) << bandwidthMbps << " MB/s";
+		// True send-done bandwidth: excludes thread-join + queue-drain overhead in Poll().
+		// last_send_wall_ns is set right after the final send() returns in PublishThread.
+		const int64_t last_send_ns = p.GetLastSendWallNs();
+		double send_done_bandwidthMbps = 0.0;
+		if (last_send_ns > 0 && last_send_ns > pub_start_wall_ns) {
+			double send_done_sec = (last_send_ns - pub_start_wall_ns) * 1e-9;
+			send_done_bandwidthMbps = ((message_size * n) / send_done_sec) / (1024 * 1024);
+		}
+		LOG(INFO) << "Publish test completed in " << std::fixed << std::setprecision(2)
+			<< seconds << " seconds (Poll overhead: "
+			<< std::setprecision(0) << (seconds - (last_send_ns > 0 ? (last_send_ns - pub_start_wall_ns) * 1e-9 : seconds)) * 1000
+			<< " ms)";
+		LOG(INFO) << "Bandwidth: " << std::fixed << std::setprecision(2) << bandwidthMbps << " MB/s"
+			<< " | Send-done: " << send_done_bandwidthMbps << " MB/s";
 
 		// Clean up
 		delete[] message;
@@ -780,6 +802,8 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
 
 		// Calculate elapsed time and bandwidth
 		auto end = std::chrono::high_resolution_clock::now();
+		const int64_t end_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::system_clock::now().time_since_epoch()).count();
 		std::chrono::duration<double> elapsed = end - start;
 		std::chrono::duration<double> receive_elapsed = end - receive_start;
 
@@ -788,12 +812,50 @@ double SubscribeThroughputTest(const cxxopts::ParseResult& result, char topic[TO
 		double bandwidthMbps = (total_message_size / (1024 * 1024)) / seconds;
 		double receive_bandwidthMbps = (total_message_size / (1024 * 1024)) / receive_seconds;
 
-		LOG(INFO) << "Subscribe test completed in " << std::fixed << std::setprecision(2) 
-			<< seconds << " seconds (connection: " 
-			<< std::setprecision(2) << (seconds - receive_seconds) 
+		// Wire bandwidth: first-byte to last-byte (excludes publisher init + connection overhead).
+		// Accurate without clock sync; on a fast LAN, first-byte ≈ publisher push start.
+		const int64_t first_byte_ns = s.GetFirstByteWallNs();
+		double wire_bandwidthMbps = 0.0;
+		double wire_seconds = 0.0;
+		if (first_byte_ns > 0 && end_wall_ns > first_byte_ns) {
+			wire_seconds = (end_wall_ns - first_byte_ns) * 1e-9;
+			wire_bandwidthMbps = (total_message_size / (1024.0 * 1024.0)) / wire_seconds;
+		}
+
+		// Cross-machine E2E bandwidth using synced clocks:
+		// Set EMBARCADERO_PUB_START_EPOCH_NS to the publisher's push-start time (nanoseconds
+		// since system_clock epoch). The publisher writes this to EMBARCADERO_PUB_START_TIME_FILE.
+		double cross_machine_e2e_mbps = 0.0;
+		if (const char* pub_start_env = std::getenv("EMBARCADERO_PUB_START_EPOCH_NS")) {
+			try {
+				int64_t pub_start_ns = std::stoll(pub_start_env);
+				if (pub_start_ns > 0 && end_wall_ns > pub_start_ns) {
+					double e2e_sec = (end_wall_ns - pub_start_ns) * 1e-9;
+					cross_machine_e2e_mbps = (total_message_size / (1024.0 * 1024.0)) / e2e_sec;
+					LOG(INFO) << "Cross-machine E2E (synced clocks): " << std::fixed
+					          << std::setprecision(2) << cross_machine_e2e_mbps
+					          << " MB/s over " << e2e_sec << "s"
+					          << " (pub_start→sub_done, from pub start=" << pub_start_ns
+					          << " to sub end=" << end_wall_ns << ")";
+				}
+			} catch (...) {}
+		}
+
+		LOG(INFO) << "Subscribe test completed in " << std::fixed << std::setprecision(2)
+			<< seconds << " seconds (connection: "
+			<< std::setprecision(2) << (seconds - receive_seconds)
 			<< "s, receiving: " << std::setprecision(2) << receive_seconds << "s)";
-		LOG(INFO) << "Bandwidth: " << std::fixed << std::setprecision(2) << bandwidthMbps 
+		LOG(INFO) << "Bandwidth: " << std::fixed << std::setprecision(2) << bandwidthMbps
 			<< " MB/s (receiving only: " << receive_bandwidthMbps << " MB/s)";
+		if (wire_bandwidthMbps > 0.0) {
+			LOG(INFO) << "Wire bandwidth (first-byte to last-byte): " << std::fixed
+			          << std::setprecision(2) << wire_bandwidthMbps
+			          << " MB/s over " << std::setprecision(3) << wire_seconds << "s";
+		}
+		// Always log end_wall_ns so cross-machine E2E can be computed offline:
+		// cross_e2e_mbps = total_bytes_MB / ((end_wall_ns - pub_start_ns) / 1e9)
+		LOG(INFO) << "Subscribe end wall ns: " << end_wall_ns
+		          << " (first_byte_ns=" << first_byte_ns << ")";
 
 		// Check message ordering if requested
 		if (ShouldValidateOrder() && !s.DEBUG_check_order(order)) {
@@ -939,6 +1001,17 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		// NOW start timing for pure critical path performance
 		LOG(INFO) << "Starting critical path measurement...";
 		auto start = std::chrono::high_resolution_clock::now();
+		const int64_t pub_start_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::system_clock::now().time_since_epoch()).count();
+		// Export start time for cross-machine E2E measurement (synced clocks).
+		// Set EMBARCADERO_PUB_START_TIME_FILE to a path; subscriber reads via EMBARCADERO_PUB_START_EPOCH_NS.
+		if (const char* time_file = std::getenv("EMBARCADERO_PUB_START_TIME_FILE")) {
+			if (FILE* f = std::fopen(time_file, "w")) {
+				std::fprintf(f, "%" PRId64 "\n", pub_start_wall_ns);
+				std::fclose(f);
+			}
+		}
+		LOG(INFO) << "Publisher push start (wall ns): " << pub_start_wall_ns;
 
 		// Publish messages
 		for (size_t i = 0; i < n; i++) {

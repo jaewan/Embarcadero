@@ -1204,6 +1204,15 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		ssize_t bytes_received = recv(conn_buffers->fd, write_ptr, recv_chunk_size, 0);
 
 		if (bytes_received > 0) {
+			// Record wall-clock time of first byte received (once, via CAS).
+			// Used by test_utils to compute true wire bandwidth excluding publisher init.
+			int64_t expected_zero = 0;
+			if (first_byte_wall_ns_.load(std::memory_order_relaxed) == 0) {
+				const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::system_clock::now().time_since_epoch()).count();
+				first_byte_wall_ns_.compare_exchange_strong(expected_zero, now_ns,
+					std::memory_order_relaxed, std::memory_order_relaxed);
+			}
 			// [[BLOG_HEADER: Process ORDER=2/5 batch metadata in receiver thread]]
 			// Only enable in-place header rewrite when explicit order validation is requested.
 			// Latency/throughput tests do not require this rewrite on the hot receive path.
