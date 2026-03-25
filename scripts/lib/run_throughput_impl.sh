@@ -162,6 +162,7 @@ cleanup() {
   rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
 }
 
+
 fresh_start_cluster() {
   [ "$QUIET" != "1" ] && echo "Resetting brokers for a fresh trial start..."
   cleanup
@@ -319,7 +320,7 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
         break
       fi
     else
-      if grep -q "Bandwidth:" "$TRIAL_LOG"; then
+      if grep -qi "bandwidth:" "$TRIAL_LOG"; then
         trial_success=1
         rm -f "$TRIAL_LOG"
         cleanup

@@ -1,4 +1,5 @@
 #include <atomic>
+#include <array>
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
@@ -27,8 +28,8 @@
 #include "../cxl_manager/cxl_datastructure.h"
 #include "../embarlet/topic_manager.h"
 #include "../common/config.h"
-#include "../common/order_level.h"
 #include "../common/env_flags.h"
+#include "../common/order_level.h"
 #include "../common/performance_utils.h"
 #include "../common/wire_formats.h"
 
@@ -40,6 +41,24 @@ namespace Embarcadero {
 
 static bool ShouldEnableSoBusyPoll() {
 	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ENABLE_SO_BUSY_POLL", true);
+	return enabled;
+}
+
+static bool ShouldEnablePayloadQuickAck() {
+	static const bool enabled =
+		ReadEnvBoolStrict("EMBARCADERO_ENABLE_PAYLOAD_TCP_QUICKACK", true);
+	return enabled;
+}
+
+// [[PERF: ORDER=0 fast path]] Skip PBR allocation, publication, validation, and
+// DelegationThread processing for ORDER=0. The network ingest thread directly updates
+// tinode->written via UpdateWrittenForOrder0, which is sufficient for ACK completion.
+// This eliminates ~2× CXL bandwidth from DelegationThread per-message metadata walks
+// and removes PBR-related CXL writes from the critical recv→publish path.
+// Default: enabled. Set EMBARCADERO_ORDER0_FAST_PATH=0 to disable.
+static bool ShouldUseOrder0FastPath() {
+	static const bool enabled =
+		ReadEnvBoolStrict("EMBARCADERO_ORDER0_FAST_PATH", true);
 	return enabled;
 }
 
@@ -135,9 +154,12 @@ static void SetAcceptedSocketBuffers(int fd) {
 	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
 		LOG(WARNING) << "setsockopt(TCP_NODELAY) on accepted socket failed: " << strerror(errno);
 	}
-	// Enable TCP_QUICKACK so kernel sends ACKs immediately (reduces client RTT / backoff on blocking recv path)
-	if (setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) < 0) {
-		LOG(WARNING) << "setsockopt(TCP_QUICKACK) on accepted socket failed: " << strerror(errno);
+	if (ShouldEnablePayloadQuickAck()) {
+		// Enable TCP_QUICKACK so kernel sends ACKs immediately when we explicitly want
+		// low-latency ACKing on the broker payload socket.
+		if (setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag)) < 0) {
+			LOG(WARNING) << "setsockopt(TCP_QUICKACK) on accepted socket failed: " << strerror(errno);
+		}
 	}
 	if (ShouldEnableSoBusyPoll()) {
 		// Enable SO_BUSY_POLL for ultra-low latency (kernel polls socket queue directly)
@@ -584,7 +606,7 @@ void NetworkManager::MainThread() {
 		for (int i = 0; i < n; i++) {
 			if (events[i].data.fd == server_socket) {
 				// Accept new connection
-				struct NetworkRequest req;
+				struct NetworkRequest req{};
 				struct sockaddr_in client_addr;
 				socklen_t client_addr_len = sizeof(client_addr);
 
@@ -597,12 +619,12 @@ void NetworkManager::MainThread() {
 				continue;
 			}
 
-			// Apply large socket buffers so rcv_space is not ~43KB (kernel default).
+				// Apply large socket buffers so rcv_space is not ~43KB (kernel default).
 			// Without this, throughput is TCP-window limited (~884 MB/s).
 			SetAcceptedSocketBuffers(req.client_socket);
 
-			// Enqueue the request for processing
-			request_queue_.blockingWrite(req);
+			// Keep each publish connection owned by a stable receive worker.
+			EnqueueRequest(req);
 			}
 		}
 	}
@@ -715,7 +737,6 @@ void NetworkManager::HandlePublishRequest(
 	// so timeout is not needed for shutdown detection. For microsecond-scale batch processing,
 	// 200ms timeout introduces significant latency variability.
 	// setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-
 	if (handshake.ack >= 1) {
 		absl::MutexLock lock(&ack_mu_);
 		auto it = ack_connections_.find(handshake.client_id);
@@ -756,13 +777,22 @@ void NetworkManager::HandlePublishRequest(
 	bool running = true;
 	bool publisher_disconnected = false;
 
+	// [[PERF: ORDER=0 fast path]] Cache tinode + CXL base outside loop to avoid per-batch lookup.
+	TInode* order0_tinode = nullptr;
+	uint8_t* cxl_base = nullptr;
+	if (ShouldUseOrder0FastPath()) {
+		order0_tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
+		cxl_base = reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr());
+	}
+
 	while (running && !stop_threads_) {
+		constexpr int recv_flags = MSG_NOSIGNAL;
 		// Read batch header
 		BatchHeader batch_header;
 		batch_header.client_id = handshake.client_id;
 		batch_header.ordered = 0;
 
-		ssize_t bytes_read = recv(client_socket, &batch_header, sizeof(BatchHeader), MSG_NOSIGNAL);
+		ssize_t bytes_read = recv(client_socket, &batch_header, sizeof(BatchHeader), recv_flags);
 		if (bytes_read <= 0) {
 			if (bytes_read < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
@@ -787,7 +817,7 @@ void NetworkManager::HandlePublishRequest(
 			ssize_t recv_ret = recv(client_socket,
 					((uint8_t*)&batch_header) + bytes_read,
 					sizeof(BatchHeader) - bytes_read,
-					MSG_NOSIGNAL);
+					recv_flags);
 			if (recv_ret < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
 				    !stop_threads_) {
@@ -829,10 +859,10 @@ void NetworkManager::HandlePublishRequest(
 		Topic* topic_ptr = cxl_manager_->GetTopicPtr(handshake.topic);
 		bool epoch_checked_this_batch = false;
 
+
 		// Use GetCXLBuffer for batch-level allocation and zero-copy receive
 		// BLOCKING MODE: Wait indefinitely for ring space - NEVER close connection
 			size_t wait_iterations = 0;
-			auto ring_wait_start = std::chrono::steady_clock::time_point{};
 
 			while (!buf && !stop_threads_) {
 			if (stop_threads_) {
@@ -859,15 +889,12 @@ void NetworkManager::HandlePublishRequest(
 			}
 
 				// Ring full - wait for consumer to make space
-				if (wait_iterations == 0) {
-					ring_wait_start = std::chrono::steady_clock::now();
-				}
 				wait_iterations++;
 				// [[FIX_RING_FULL_YIELD]] Use yield() immediately for ring full - consumer needs CPU time.
 				// Ring full means consumer is slow, so yield to allow consumer threads to catch up.
 				std::this_thread::yield();
 				}
-				if (wait_iterations > 0 && ring_wait_start != std::chrono::steady_clock::time_point{}) {
+				if (wait_iterations > 0) {
 					VLOG(2) << "NetworkManager: waited for ring space, iterations=" << wait_iterations;
 				}
 
@@ -879,6 +906,10 @@ void NetworkManager::HandlePublishRequest(
 		}
 
 		// [[PERF_REGRESSION_FIX]] Removed ORDER_0_LOG_IDX - not needed now that ORDER=0 uses PBR.
+
+		// [[PERF: ORDER=0 fast path]] Detect whether to skip PBR entirely.
+		const bool order0_fast = ShouldUseOrder0FastPath() &&
+			seq_type == EMBARCADERO && topic_ptr && topic_ptr->GetOrder() == 0;
 
 		// [[DESIGN: PBR reserve after receive]] For EMBARCADERO, GetCXLBuffer only allocates BLog (buf);
 		// batch_header_location is intentionally null here and is set later by ReservePBRSlotAfterRecv.
@@ -894,11 +925,12 @@ void NetworkManager::HandlePublishRequest(
 			// batch_header_location is set
 		}
 
-		// Receive message data (byte-accurate accounting only)
+		// Receive message data directly into CXL BLog
+
 		size_t read = 0;
 		bool batch_data_complete = false;
 		while (running && !stop_threads_) {
-			bytes_read = recv(client_socket, (uint8_t*)buf + read, to_read, MSG_NOSIGNAL);
+			bytes_read = recv(client_socket, static_cast<uint8_t*>(buf) + read, to_read, recv_flags);
 			if (bytes_read < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
 				    !stop_threads_) {
@@ -929,18 +961,36 @@ void NetworkManager::HandlePublishRequest(
 
 		// Only process batch if all data was received
 			if (!batch_data_complete) {
-			LOG(WARNING) << "NetworkManager: Batch incomplete (received " << read << " of " 
+			LOG(WARNING) << "NetworkManager: Batch incomplete (received " << read << " of "
 			            << batch_header.total_size << " bytes) for batch_seq=" << batch_header.batch_seq
 			            << ". Closing connection to avoid stream desync.";
 			// Connection is now out-of-sync; close to avoid interpreting payload as next header.
 			running = false;
 				break;
 			}
+
+		// [[PERF: ORDER=0 fast path]] Skip PBR entirely — go straight from recv to ACK update.
+		// Eliminates: PBR allocation, PBR publish, validation walk, and DelegationThread
+		// per-message metadata writes. Reduces CXL bandwidth by ~2× the data volume.
+		if (order0_fast) {
+			if (!order0_tinode) {
+				order0_tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
+				cxl_base = reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr());
+			}
+			if (order0_tinode) {
+				const uint64_t log_idx = static_cast<uint64_t>(
+					reinterpret_cast<uint8_t*>(buf) - cxl_base);
+				const uint64_t batch_end_addr = log_idx + batch_header.total_size;
+				UpdateWrittenForOrder0(order0_tinode, batch_end_addr, batch_header.num_msg);
+			}
+			continue;  // Next batch — no PBR, no validation, no DelegationThread dependency
+		}
+
 			// [[DESIGN: PBR reserve after receive]] Reserve PBR slot only after payload is fully received.
 	// [[PERF_REGRESSION_FIX]] Reverted ORDER_0_SKIP_PBR: ORDER=0 now uses PBR like all other orders.
 	// This allows DelegationThread to process ORDER=0 batches, restoring 10-12 GB/s performance.
 	TInode* tinode = nullptr;
-		if (seq_type == EMBARCADERO) {
+	if (seq_type == EMBARCADERO) {
 		size_t post_recv_attempts = 0;
 		// Retry post-recv PBR reservation with exponential backoff (max 10 seconds)
 		int sleep_ms = 1;  // Start at 1 ms
@@ -1044,7 +1094,12 @@ void NetworkManager::HandlePublishRequest(
 		}
 		// For Sequencer 5 with BlogHeader: messages already valid from publisher
 		// For other orders: Ensure message validation
-		if (seq_type != EMBARCADERO || (tinode && tinode->order != 5) || !is_blog_header_enabled) {
+		// [[PERF]] Skip redundant validation for Order 0 — DelegationThread does the same
+		// per-message walk and will catch any issues. Avoids 512 KiB CXL read per batch.
+		bool skip_validation = (seq_type == EMBARCADERO && tinode && tinode->order == 0);
+		// Read-only comparisons above (tinode->order); CXL writes here are flushed via flush_cacheline below.
+		if (!skip_validation &&
+		    (seq_type != EMBARCADERO || (tinode && tinode->order != 5) || !is_blog_header_enabled)) {
 			// For Sequencer 4 and other modes: Validate v1 headers without blocking
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
@@ -1913,6 +1968,10 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	bool trace_order5_ack = false;
 	const int ack_send_min_interval_us =
 		ReadEnvIntNonNegative("EMBARCADERO_ACK_SEND_MIN_INTERVAL_US", 0);
+	// [[PERF: ACK_STALL_TUNE]] Stall sleep after kMaxStalls fast-polls with no new ACK.
+	// Lower values reduce ACK latency at cost of higher CPU (0 = busy-spin).
+	const int ack_stall_sleep_us =
+		ReadEnvIntNonNegative("EMBARCADERO_ACK_STALL_SLEEP_US", 100);
 	if (ShouldEnableOrder5Trace()) {
 		trace_tinode = (TInode*)cxl_manager_->GetTInode(topic.c_str());
 		if (trace_tinode && trace_tinode->order == 5 &&
@@ -1976,8 +2035,13 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 					CXL::cpu_pause();
 				}
 					} else {
-						// Cap at 100us to avoid drifting into millisecond-scale ACK stalls.
-						std::this_thread::sleep_for(std::chrono::microseconds(100));
+						// Cap sleep to avoid drifting into millisecond-scale ACK stalls.
+						// Configurable via EMBARCADERO_ACK_STALL_SLEEP_US (default 100us).
+						if (ack_stall_sleep_us > 0) {
+							std::this_thread::sleep_for(std::chrono::microseconds(ack_stall_sleep_us));
+						} else {
+							CXL::cpu_pause();
+						}
 						stall_sleep_since_last_send++;
 						consecutive_ack_stalls = 50;  // Cap to prevent overflow
 					}

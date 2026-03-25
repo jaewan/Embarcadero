@@ -190,8 +190,12 @@ bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* co
 		}
 	}
 	current_batch_ = next;
-	// Defensive clear for recycled buffers so stale headers/payload are never observed.
-	memset(current_batch_, 0, slot_size_);
+	// [[PERF]] Clear only the BatchHeader (128B), not the full 2MB slot.
+	// All payload bytes are overwritten by Write() calls before sending.
+	// All BatchHeader fields used by ORDER=0 fast path are set explicitly in
+	// SealCurrentAndAdvance() and send_batch_header(). Safe for all orders because
+	// the broker reads only total_size bytes of payload (never beyond the batch boundary).
+	memset(current_batch_, 0, sizeof(Embarcadero::BatchHeader));
 	current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
 	current_batch_num_msg_ = 0;
 #ifdef COLLECT_LATENCY_STATS

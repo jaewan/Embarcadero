@@ -1,6 +1,60 @@
 #include "common.h"
 
+#include <cstdio>
+#include <sstream>
+
 namespace {
+std::string HugeTlbErrnoString(int err) {
+    std::ostringstream oss;
+    oss << strerror(err) << " (errno=" << err << ")";
+    return oss.str();
+}
+
+void* mmap_large_buffer_hugetlbfs(size_t aligned_size, size_t& allocated, std::string* error_out) {
+    const char* hugetlbfs_dir = "/dev/hugepages";
+    if (access(hugetlbfs_dir, W_OK) != 0) {
+        if (error_out) {
+            *error_out = std::string("hugetlbfs dir not writable: ") + hugetlbfs_dir + " - " +
+                         HugeTlbErrnoString(errno);
+        }
+        return MAP_FAILED;
+    }
+
+    char path_template[256];
+    std::snprintf(path_template, sizeof(path_template),
+                  "%s/embarcadero-hugetlb-%d-XXXXXX", hugetlbfs_dir, static_cast<int>(getpid()));
+    int fd = mkstemp(path_template);
+    if (fd < 0) {
+        if (error_out) {
+            *error_out = std::string("mkstemp failed for hugetlbfs path ") + path_template + ": " +
+                         HugeTlbErrnoString(errno);
+        }
+        return MAP_FAILED;
+    }
+
+    unlink(path_template);
+
+    if (ftruncate(fd, static_cast<off_t>(aligned_size)) != 0) {
+        const int err = errno;
+        close(fd);
+        if (error_out) {
+            *error_out = std::string("ftruncate failed on hugetlbfs file: ") + HugeTlbErrnoString(err);
+        }
+        return MAP_FAILED;
+    }
+
+    void* buffer = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    const int map_errno = errno;
+    close(fd);
+    if (buffer == MAP_FAILED && error_out) {
+        *error_out = std::string("mmap on hugetlbfs file failed: ") + HugeTlbErrnoString(map_errno);
+    }
+    if (buffer != MAP_FAILED) {
+        allocated = aligned_size;
+    }
+    return buffer;
+}
+
 const Embarcadero::EmbarcaderoConfig::Client::Runtime& RuntimeConfig() {
     return Embarcadero::GetConfig().config().client.runtime;
 }
@@ -371,12 +425,26 @@ void* mmap_large_buffer(size_t need, size_t& allocated) {
             
             // If this is not the last retry, wait a bit and try again
             if (retry < max_retries - 1) {
-                VLOG(3) << "MAP_HUGETLB failed (retry " << retry << "), retrying: " << strerror(errno);
+                const int err = errno;
+                VLOG(3) << "MAP_HUGETLB failed (retry " << retry << "), retrying: "
+                        << HugeTlbErrnoString(err);
                 std::this_thread::sleep_for(std::chrono::milliseconds(10 + retry * 5));
             } else {
-                VLOG(1) << "MAP_HUGETLB failed after " << max_retries << " retries for " << aligned_size 
-                        << " bytes. Error: " << strerror(errno) << ". Falling back to THP (madvise). "
-                        << "Provision sufficient hugepages or set EMBAR_USE_HUGETLB=0 to prefer THP.";
+                const int err = errno;
+                LOG(WARNING) << "MAP_HUGETLB anonymous mmap failed after " << max_retries
+                             << " retries for " << aligned_size << " bytes. Error: "
+                             << HugeTlbErrnoString(err);
+            }
+        }
+        if (buffer == MAP_FAILED) {
+            std::string hugetlbfs_error;
+            buffer = mmap_large_buffer_hugetlbfs(aligned_size, allocated, &hugetlbfs_error);
+            if (buffer != MAP_FAILED) {
+                LOG(INFO) << "mmap_large_buffer: hugetlbfs-backed HugeTLB success for "
+                          << aligned_size << " bytes";
+            } else {
+                LOG(WARNING) << "mmap_large_buffer: hugetlbfs HugeTLB fallback failed for "
+                             << aligned_size << " bytes: " << hugetlbfs_error;
             }
         }
     }

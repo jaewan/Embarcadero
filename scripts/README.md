@@ -157,6 +157,83 @@ TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 NUM_TRIALS=3 \
 scripts/run_failures.sh
 ```
 
+### `scripts/run_multiclient.sh`
+
+Multi-client throughput orchestration script. Starts brokers locally, then launches up to five physical client machines in parallel using a NTP-synchronized future-timestamp barrier so all clients begin sending simultaneously.
+
+**Client roster** (cumulative; each level adds one machine):
+
+| `NUM_CLIENTS` | Active clients | NUMA binding |
+|:---:|---|---|
+| 1 | c4 | node 1 |
+| 2 | c4, local (broker node) | node 1, node 0 |
+| 3 | c4, local, c3 | node 1, node 0, node 1 |
+| 4 | c4, local, c3, c2 | node 1, node 0, node 1, node 1 |
+| 5 | c4, local, c3, c2, c1 | node 1, node 0, node 1, node 1, node 1 |
+
+`TOTAL_MESSAGE_SIZE` is divided equally across all active clients; each client sends `TOTAL_MESSAGE_SIZE / NUM_CLIENTS` bytes.
+
+Configuration options:
+
+| Variable | Default | Description |
+|---|---|---|
+| `NUM_CLIENTS` | `1` | Number of clients to activate (1–5) |
+| `NUM_BROKERS` | `4` | Brokers to start locally |
+| `NUM_TRIALS` | `3` | Number of benchmark trials |
+| `TRIAL_MAX_ATTEMPTS` | `3` | Retry attempts per trial on failure |
+| `TOTAL_MESSAGE_SIZE` | `8589934592` | Combined bytes across all clients (8 GiB) |
+| `MESSAGE_SIZE` | `1024` | Per-message size in bytes |
+| `THREADS_PER_BROKER` | `4` | Publisher threads per broker connection |
+| `TEST_TYPE` | `5` | Throughput-test mode (5 = publish-only) |
+| `ORDER` | `0` | Ordering mode |
+| `ACK` | `1` | Ack level |
+| `REPLICATION_FACTOR` | `0` | Replication factor |
+| `SEQUENCER` | `EMBARCADERO` | Sequencer type |
+| `EMBARCADERO_HEAD_ADDR` | `10.10.10.10` | Broker node IP |
+| `START_DELAY_SEC` | `8` | Lead time (seconds) for SSH launch + clock settling |
+| `EMBARCADERO_ORDER0_FAST_PATH` | `1` | Enable Order-0 fast path |
+| `EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES` | `524288` | Client send chunk size (bytes) |
+| `EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE` | `1` | Enable `MSG_MORE` on payload sends |
+| `EMBARCADERO_BATCH_SIZE` | `524288` | Client batch size (bytes) |
+| `EMBARCADERO_CLIENT_PUB_BATCH_KB` | `512` | Client publish batch (KiB) |
+| `EMBARCADERO_NETWORK_IO_THREADS` | `4` | Client network I/O threads |
+
+Logs for each trial are written to `multiclient_logs/trial<N>_<host>.log`.
+
+Examples:
+
+```bash
+# 1 client — c4 alone
+NUM_CLIENTS=1 scripts/run_multiclient.sh
+
+# 2 clients — c4 + local, larger messages
+NUM_CLIENTS=2 MESSAGE_SIZE=8192 scripts/run_multiclient.sh
+
+# Full 5-client sweep, 5 trials, 16 GiB total load
+NUM_CLIENTS=5 NUM_TRIALS=5 TOTAL_MESSAGE_SIZE=17179869184 \
+    scripts/run_multiclient.sh
+
+# Compare without MSG_MORE
+NUM_CLIENTS=3 EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE=0 \
+    scripts/run_multiclient.sh
+```
+
+**Prerequisite:** all cluster machines must have NTP-synchronized clocks before running.
+Use `scripts/setup/sync_clocks.sh` if they are not already synced.
+
+**Aggregation note:** the per-trial totals printed at the end are the naive sum of
+each client's self-reported average bandwidth. For peer-reviewable results, collect
+the per-client time-series CSVs and calculate throughput within the overlapping
+steady-state send window instead.
+
+**TODO (pending test runs):**
+- [ ] Test with 1 client (c4 alone)
+- [ ] Test with 2 clients (c4 + local)
+- [ ] Test with 3 clients (c4 + local + c3)
+- [ ] Test with 4 clients (c4 + local + c3 + c2)
+- [ ] Test with 5 clients (c4 + local + c3 + c2 + c1)
+- [ ] Verify aggregate throughput using time-series overlapping window analysis
+
 ### `scripts/run_ordering_durability_ladder.sh`
 
 Sweeps `ORDER` and `ACK` combinations by calling `singlenode_run_throughput.sh`.

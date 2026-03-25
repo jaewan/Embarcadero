@@ -222,6 +222,14 @@ void Topic::Start() {
 		LOG(INFO) << "Topic " << topic_name_ << ": DelegationThread disabled for Order 2 "
 		          << "(subscribers use GetBatchToExportWithMetadata)";
 	}
+	// [[PERF: ORDER=0 fast path]] When the fast path is enabled, PBR is never written,
+	// so DelegationThread would spin-wait on CXL forever, wasting a CPU core and CXL bandwidth.
+	if (order_ == 0 && seq_type_ == EMBARCADERO &&
+	    ReadEnvBoolStrict("EMBARCADERO_ORDER0_FAST_PATH", true)) {
+		skip_delegation = true;
+		LOG(INFO) << "Topic " << topic_name_ << ": DelegationThread disabled for Order 0 "
+		          << "(fast path: network thread handles ACK cursor directly, no PBR)";
+	}
 			if (!skip_delegation && seq_type_ != KAFKA) {
 				delegationThreads_.emplace_back(&Topic::DelegationThread, this);
 		}

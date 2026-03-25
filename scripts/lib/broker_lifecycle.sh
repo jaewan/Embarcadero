@@ -234,7 +234,9 @@ broker_remote_launch() {
     "$role" \
     "$sequence" \
     "$poll_interval" \
-    "${EMBARCADERO_ACK_SEND_MIN_INTERVAL_US:-}" <<'EOF'
+    "${EMBARCADERO_ACK_SEND_MIN_INTERVAL_US:-}" \
+    "${EMBARCADERO_ORDER0_FAST_PATH:-}" \
+    "${EMBARCADERO_ACK_STALL_SLEEP_US:-}" <<'EOF'
 set -euo pipefail
 state_dir=$1
 build_bin=$2
@@ -244,10 +246,12 @@ idx=$5
 role=$6
 sequence=$7
 poll_interval=$8
-ack_send_min_interval_us=$9
+ack_send_min_interval_us=${9-}
+order0_fast_path=${10-}
+ack_stall_sleep_us=${11-}
 mkdir -p "$state_dir"
 rm -f "$state_dir/broker_${idx}.pid" "$state_dir/broker_${idx}.ready" "$state_dir/broker_${idx}.log"
-nohup bash -s -- "$state_dir" "$build_bin" "$config" "$head_addr" "$idx" "$role" "$sequence" "$poll_interval" "$ack_send_min_interval_us" <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
+nohup bash -s -- "$state_dir" "$build_bin" "$config" "$head_addr" "$idx" "$role" "$sequence" "$poll_interval" "$ack_send_min_interval_us" "$order0_fast_path" "$ack_stall_sleep_us" <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
 set -euo pipefail
 state_dir=$1
 build_bin=$2
@@ -257,7 +261,9 @@ idx=$5
 role=$6
 sequence=$7
 poll_interval=$8
-ack_send_min_interval_us=$9
+ack_send_min_interval_us=${9-}
+order0_fast_path=${10-}
+ack_stall_sleep_us=${11-}
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
@@ -266,6 +272,8 @@ export EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIME
 if [ -n "$ack_send_min_interval_us" ]; then
   export EMBARCADERO_ACK_SEND_MIN_INTERVAL_US="$ack_send_min_interval_us"
 fi
+if [ -n "$order0_fast_path" ]; then export EMBARCADERO_ORDER0_FAST_PATH="$order0_fast_path"; fi
+if [ -n "$ack_stall_sleep_us" ]; then export EMBARCADERO_ACK_STALL_SLEEP_US="$ack_stall_sleep_us"; fi
 log_file="$state_dir/broker_${idx}.log"
 cd "$build_bin"
 export EMBARCADERO_HEAD_ADDR="$head_addr"
