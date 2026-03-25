@@ -1072,12 +1072,17 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-	// Whether we're using BlogMessageHeader (Order 5 + env): used only to skip v1 validation when publisher sent v2.
+	// ORDER=0 and ORDER=5 both use BlogMessageHeader when the feature flag is on.
+	// For the ORDER=0 fast path, this code is only reached when fast-path is disabled
+	// (EMBARCADERO_ORDER0_FAST_PATH=0); in the common case order0_fast already continued.
+	// Read-only field access (tinode->order); CXL writes below are flushed via flush_cacheline.
 	bool is_blog_header_enabled = false;
-	if (seq_type == EMBARCADERO && !tinode) {
-		tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
-		if (tinode && tinode->order == 5 && HeaderUtils::ShouldUseBlogHeader())
-			is_blog_header_enabled = true;
+	if (seq_type == EMBARCADERO) {
+		if (!tinode)
+			tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
+		// Read-only comparisons (tinode->order); CXL writes flushed via flush_cacheline later.
+		if (tinode && (tinode->order == 0 || tinode->order == 5) && HeaderUtils::ShouldUseBlogHeader())
+			is_blog_header_enabled = true;  // flush_cacheline not needed: no CXL write here
 	}
 
 	// Signal batch completion for ALL order levels
@@ -1092,15 +1097,9 @@ void NetworkManager::HandlePublishRequest(
 			running = false;
 			break;
 		}
-		// For Sequencer 5 with BlogHeader: messages already valid from publisher
-		// For other orders: Ensure message validation
-		// [[PERF]] Skip redundant validation for Order 0 — DelegationThread does the same
-		// per-message walk and will catch any issues. Avoids 512 KiB CXL read per batch.
-		bool skip_validation = (seq_type == EMBARCADERO && tinode && tinode->order == 0);
-		// Read-only comparisons above (tinode->order); CXL writes here are flushed via flush_cacheline below.
-		if (!skip_validation &&
-		    (seq_type != EMBARCADERO || (tinode && tinode->order != 5) || !is_blog_header_enabled)) {
-			// For Sequencer 4 and other modes: Validate v1 headers without blocking
+		// [[BLOG_HEADER]] Skip v1 per-message validation when publisher sent BlogMessageHeader (v2).
+		// Applies to ORDER=0 and ORDER=5 with BlogHeader enabled; all other orders use MessageHeader.
+		if (!is_blog_header_enabled) {
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
 			for (size_t i = 0; i < batch_header.num_msg; ++i) {
@@ -1376,11 +1375,10 @@ void NetworkManager::SubscribeNetworkThread(
 				batch_meta.batch_total_order = batch_total_order;
 				batch_meta.num_messages = num_messages;
 				uint16_t header_version = wire::HEADER_VERSION_V1;
-				// Canonical header semantics:
-				// - ORDER=2 (Corfu): always MessageHeader (v1)
-				// - ORDER=5 (Embarcadero): header format is mode-driven, not payload-sniffed.
-				//   Payload sniffing here can transiently misclassify a batch and cause subscriber
-				//   decode to drop an entire batch with a wrong header version.
+				// Header format is order-driven, not payload-sniffed: ORDER=0 and ORDER=5 both
+				// use BlogMessageHeader when the feature flag is on; ORDER=2 (Corfu) always uses
+				// MessageHeader (v1). Note: ORDER=0 uses GetMessageAddr (separate path below)
+				// and does not currently send batch_meta — TODO: unify ORDER=0 subscribe path.
 				if (order == 5 && HeaderUtils::ShouldUseBlogHeader()) {
 					header_version = wire::HEADER_VERSION_V2;
 				}

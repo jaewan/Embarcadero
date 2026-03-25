@@ -47,7 +47,10 @@ QueueBuffer::QueueBuffer(size_t num_buf, size_t num_threads_per_broker, int clie
 	header_.logical_offset = static_cast<size_t>(-1);
 	header_.next_msg_diff = 0;
 
-	use_blog_header_ = (Embarcadero::HeaderUtils::ShouldUseBlogHeader() && order_ == 5);
+	// ORDER=0 and ORDER=5 both use BlogMessageHeader when the feature flag is on.
+	// ORDER=0's fast path skips PBR and DelegationThread; blog format is purely a
+	// publisher-side wire layout change (stride via ComputeStrideV2 instead of paddedSize).
+	use_blog_header_ = (Embarcadero::HeaderUtils::ShouldUseBlogHeader() && (order_ == 0 || order_ == 5));
 	if (use_blog_header_) {
 		memset(&blog_header_, 0, sizeof(blog_header_));
 		blog_header_.client_id = client_id;

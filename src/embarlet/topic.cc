@@ -343,8 +343,10 @@ void Topic::DelegationThread() {
 	while (!stop_threads_) {
 		if (current_batch && __atomic_load_n(&current_batch->batch_complete, __ATOMIC_ACQUIRE)) {
 			if (current_batch->num_msg > 0) {
-				// [[BLOG_HEADER: Gate ORDER=5 per-message writes when BlogHeader is enabled]]
-				bool skip_per_message_writes = (order_ == 5 && HeaderUtils::ShouldUseBlogHeader());
+				// [[BLOG_HEADER]] ORDER=0 and ORDER=5 both skip per-message field writes when BlogHeader
+				// is enabled. For ORDER=0, DelegationThread is disabled so this is a dead path, but
+				// keeping the condition symmetric avoids surprise if the fast-path flag is toggled.
+				bool skip_per_message_writes = ((order_ == 0 || order_ == 5) && HeaderUtils::ShouldUseBlogHeader());
 
 				if (!skip_per_message_writes) {
 					MessageHeader* batch_first_msg = reinterpret_cast<MessageHeader*>(
@@ -2383,6 +2385,10 @@ bool Topic::GetMessageAddr(
 
 	// Order 0: cap export at 2MB per call to reduce mutex/send overhead (batch message export)
 	constexpr size_t kMaxExportBatchBytes = 2UL << 20;
+	// [[BLOG_HEADER]] ORDER=0 uses BlogMessageHeader when enabled; stride = ComputeStrideV2(size)
+	// instead of paddedSize. The readiness check (size == 0) works for both formats because
+	// BlogMessageHeader::size and MessageHeader::paddedSize both occupy bytes 0-3 (little-endian).
+	const bool blog_order0 = (order_ == 0 && HeaderUtils::ShouldUseBlogHeader());
 	if (order_ == 0 && full_size > kMaxExportBatchBytes) {
 		MessageHeader* cur = start_msg_header;
 		size_t accumulated = 0;
@@ -2390,10 +2396,14 @@ bool Topic::GetMessageAddr(
 		while (cur != combined_addr) {
 			CXL::flush_cacheline(CXL::ToFlushable(cur));
 			CXL::load_fence();
-			size_t step = cur->paddedSize;
-			if (step == 0) {
-				// Message header not visible yet; do not advance cursor based on stale metadata.
-				break;
+			size_t step;
+			if (blog_order0) {
+				uint32_t payload_size = reinterpret_cast<BlogMessageHeader*>(cur)->size;
+				if (payload_size == 0) break;  // message not yet visible
+				step = wire::ComputeStrideV2(payload_size);
+			} else {
+				step = cur->paddedSize;
+				if (step == 0) break;  // message not yet visible
 			}
 			if (accumulated + step > kMaxExportBatchBytes) break;
 			accumulated += step;
@@ -2401,27 +2411,27 @@ bool Topic::GetMessageAddr(
 			cur = reinterpret_cast<MessageHeader*>(reinterpret_cast<uint8_t*>(cur) + step);
 		}
 		if (stop_at != nullptr) {
-			// [[CXL_VISIBILITY]] Ensure we see writer's logical_offset (completion runs on receive path).
 			CXL::flush_cacheline(CXL::ToFlushable(stop_at));
 			CXL::load_fence();
 			if (order_ == 0) {
-				// ORDER=0 uses last_offset as the next unread logical offset/cumulative
-				// count, not the last exported message's logical offset. If we leave this
-				// one behind, the next call treats the end pointer as unread data instead
-				// of reporting "caught up" until newer writes appear.
-				last_offset = stop_at->logical_offset + 1;
-				// ORDER=0 batches are allocated in aligned BLog chunks. Advancing only to
-				// payload end strands the cursor in the post-payload alignment gap.
+				size_t stop_stride;
+				if (blog_order0) {
+					stop_stride = wire::ComputeStrideV2(reinterpret_cast<BlogMessageHeader*>(stop_at)->size);
+				} else {
+					stop_stride = stop_at->paddedSize;
+				}
+				// Use the total written count as last_offset so the "caught up" check works
+				// correctly regardless of header format (logical_offset is unused in ORDER=0).
+				last_offset = combined_offset;
 				last_addr = advance_order0_cursor(
-					reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(stop_at) + stop_at->paddedSize));
+					reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(stop_at) + stop_stride));
 			} else {
 				last_offset = stop_at->logical_offset;
 				if (last_offset == static_cast<size_t>(-1))
 					last_offset = (combined_offset > 0) ? (combined_offset - 1) : 0;
 				last_addr = stop_at;
 			}
-			messages_size = reinterpret_cast<uint8_t*>(stop_at) -
-				reinterpret_cast<uint8_t*>(start_msg_header) + stop_at->paddedSize;
+			messages_size = accumulated;
 		} else {
 			// No fully visible message was available for export yet. Keep the cursor unchanged
 			// and retry instead of speculatively consuming the whole written frontier.
