@@ -149,7 +149,7 @@ config=$3
 data_base=$4
 heartbeat_port=$5
 num_brokers=$6
-shm_name=$7
+shm_name=${7:-}
 if [ -d "$state_dir" ]; then
   for pid_file in "$state_dir"/broker_*.pid; do
     [ -e "$pid_file" ] || continue
@@ -282,8 +282,12 @@ if [ "$role" = "head" ]; then
   cmd+=(--head)
 fi
 cmd+=(--"$sequence")
-if command -v numactl >/dev/null 2>&1; then
-  cmd=(numactl --cpunodebind=1 --membind=1,2 "${cmd[@]}")
+if command -v numactl >/dev/null 2>&1 && numactl --hardware 2>/dev/null | grep -q 'node 1'; then
+  if numactl --hardware 2>/dev/null | grep -q 'node 2'; then
+    cmd=(numactl --cpunodebind=1 --membind=1,2 "${cmd[@]}")
+  else
+    cmd=(numactl --cpunodebind=1 --membind=1 "${cmd[@]}")
+  fi
 fi
 "${cmd[@]}" >"$log_file" 2>&1 &
 pid=$!
