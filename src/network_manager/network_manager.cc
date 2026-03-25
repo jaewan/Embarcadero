@@ -977,11 +977,16 @@ void NetworkManager::HandlePublishRequest(
 				order0_tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
 				cxl_base = reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr());
 			}
+			const uint64_t log_idx = static_cast<uint64_t>(
+				reinterpret_cast<uint8_t*>(buf) - cxl_base);
 			if (order0_tinode) {
-				const uint64_t log_idx = static_cast<uint64_t>(
-					reinterpret_cast<uint8_t*>(buf) - cxl_base);
 				const uint64_t batch_end_addr = log_idx + batch_header.total_size;
 				UpdateWrittenForOrder0(order0_tinode, batch_end_addr, batch_header.num_msg);
+			}
+			// [[ORDER0_SUBSCRIBE]] Record batch in DRAM ring so subscribers can export
+			// with batch_meta (same protocol as ORDER=5). No CXL writes; minimal overhead.
+			if (topic_ptr) {
+				topic_ptr->PushOrder0Batch(log_idx, batch_header.total_size, batch_header.num_msg);
 			}
 			continue;  // Next batch — no PBR, no validation, no DelegationThread dependency
 		}
@@ -1072,12 +1077,17 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-	// Whether we're using BlogMessageHeader (Order 5 + env): used only to skip v1 validation when publisher sent v2.
+	// ORDER=0 and ORDER=5 both use BlogMessageHeader when the feature flag is on.
+	// For the ORDER=0 fast path, this code is only reached when fast-path is disabled
+	// (EMBARCADERO_ORDER0_FAST_PATH=0); in the common case order0_fast already continued.
+	// Read-only field access (tinode->order); CXL writes below are flushed via flush_cacheline.
 	bool is_blog_header_enabled = false;
-	if (seq_type == EMBARCADERO && !tinode) {
-		tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
-		if (tinode && tinode->order == 5 && HeaderUtils::ShouldUseBlogHeader())
-			is_blog_header_enabled = true;
+	if (seq_type == EMBARCADERO) {
+		if (!tinode)
+			tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
+		// Read-only comparisons (tinode->order); CXL writes flushed via flush_cacheline later.
+		if (tinode && (tinode->order == 0 || tinode->order == 5) && HeaderUtils::ShouldUseBlogHeader())
+			is_blog_header_enabled = true;  // flush_cacheline not needed: no CXL write here
 	}
 
 	// Signal batch completion for ALL order levels
@@ -1092,15 +1102,9 @@ void NetworkManager::HandlePublishRequest(
 			running = false;
 			break;
 		}
-		// For Sequencer 5 with BlogHeader: messages already valid from publisher
-		// For other orders: Ensure message validation
-		// [[PERF]] Skip redundant validation for Order 0 — DelegationThread does the same
-		// per-message walk and will catch any issues. Avoids 512 KiB CXL read per batch.
-		bool skip_validation = (seq_type == EMBARCADERO && tinode && tinode->order == 0);
-		// Read-only comparisons above (tinode->order); CXL writes here are flushed via flush_cacheline below.
-		if (!skip_validation &&
-		    (seq_type != EMBARCADERO || (tinode && tinode->order != 5) || !is_blog_header_enabled)) {
-			// For Sequencer 4 and other modes: Validate v1 headers without blocking
+		// [[BLOG_HEADER]] Skip v1 per-message validation when publisher sent BlogMessageHeader (v2).
+		// Applies to ORDER=0 and ORDER=5 with BlogHeader enabled; all other orders use MessageHeader.
+		if (!is_blog_header_enabled) {
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
 			for (size_t i = 0; i < batch_header.num_msg; ++i) {
@@ -1339,9 +1343,6 @@ void NetworkManager::SubscribeNetworkThread(
 		void* msg = nullptr;
 		size_t messages_size = 0;
 		struct LargeMsgRequest req;
-		// [[BUG_FIX: STATE_AFTER_SEND]] Only for order 0: pending state to apply after successful send
-		size_t order0_pending_offset = static_cast<size_t>(-1);
-		void* order0_pending_addr = nullptr;
 
 		if (large_msg_queue_.read(req)) {
 			// Process from large message queue
@@ -1376,11 +1377,10 @@ void NetworkManager::SubscribeNetworkThread(
 				batch_meta.batch_total_order = batch_total_order;
 				batch_meta.num_messages = num_messages;
 				uint16_t header_version = wire::HEADER_VERSION_V1;
-				// Canonical header semantics:
-				// - ORDER=2 (Corfu): always MessageHeader (v1)
-				// - ORDER=5 (Embarcadero): header format is mode-driven, not payload-sniffed.
-				//   Payload sniffing here can transiently misclassify a batch and cause subscriber
-				//   decode to drop an entire batch with a wrong header version.
+				// Header format is order-driven, not payload-sniffed: ORDER=0 and ORDER=5 both
+				// use BlogMessageHeader when the feature flag is on; ORDER=2 (Corfu) always uses
+				// MessageHeader (v1). Note: ORDER=0 uses GetMessageAddr (separate path below)
+				// and does not currently send batch_meta — TODO: unify ORDER=0 subscribe path.
 				if (order == 5 && HeaderUtils::ShouldUseBlogHeader()) {
 					header_version = wire::HEADER_VERSION_V2;
 				}
@@ -1404,23 +1404,36 @@ void NetworkManager::SubscribeNetworkThread(
 					cached_state->last_offset = local_offset;
 				}
 			} else {
-			// Order 0: copy-out, call GetMessageAddr without holding mutex (it may spin on next_msg_diff), then copy-in
-			size_t local_offset;
-			void* local_addr = nullptr;
-			{
-				absl::MutexLock lock(&cached_state->mu);
-				local_offset = cached_state->last_offset;
-				local_addr = cached_state->last_addr;
+				// ORDER=0: use DRAM batch ring (same batch_meta protocol as ORDER=5/2).
+				// last_offset serves as the per-subscriber ring read cursor.
+				uint64_t ring_cursor;
+				{
+					absl::MutexLock lock(&cached_state->mu);
+					ring_cursor = static_cast<uint64_t>(cached_state->last_offset);
+				}
+				uint64_t o0_log_idx = 0;
+				uint32_t o0_total_size = 0, o0_num_msg = 0;
+				if (!topic_manager_->ReadOrder0Batch(topic, ring_cursor,
+				                                      o0_log_idx, o0_total_size, o0_num_msg)) {
+					export_no_data_loops++;
+					std::this_thread::yield();
+					continue;
+				}
+				{
+					absl::MutexLock lock(&cached_state->mu);
+					cached_state->last_offset = static_cast<size_t>(ring_cursor);
+				}
+				msg = reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) + o0_log_idx;
+				messages_size = o0_total_size;
+				batch_meta.batch_total_order = 0;  // ORDER=0: no global ordering
+				batch_meta.num_messages = o0_num_msg;
+				batch_meta.header_version = HeaderUtils::ShouldUseBlogHeader()
+					? wire::HEADER_VERSION_V2 : wire::HEADER_VERSION_V1;
+				batch_meta.flags = 0;
+				export_batches++;
+				export_bytes += messages_size;
+				export_messages += o0_num_msg;
 			}
-			if (!topic_manager_->GetMessageAddr(topic, local_offset, local_addr, msg, messages_size)) {
-				std::this_thread::yield();
-				continue;
-			}
-			// [[BUG_FIX: STATE_AFTER_SEND]] Do NOT update state here; defer until after SendMessageData succeeds.
-			order0_pending_offset = local_offset;
-			order0_pending_addr = local_addr;
-			// [[BUG_FIX: NO_SHARED_QUEUE]] For Order 0, do not use shared large_msg_queue_ (avoids cross-connection fragment mix-up). Send full range; TCP chunks internally.
-		}
 		}
 
 		// Validate message size
@@ -1429,8 +1442,8 @@ void NetworkManager::SubscribeNetworkThread(
 			continue;
 		}
 
-		// Order 2 and Order 5: send batch metadata first (total_order, num_messages) for order-aware consume.
-		if (order == 5 || order == 2) {
+		// ORDER=0, 2, 5: send batch metadata first (header_version, num_messages) for format-aware consume.
+		if (order == 0 || order == 5 || order == 2) {
 			// batch_meta is already populated by GetBatchToExportWithMetadata
 			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL);
 			if (meta_sent != sizeof(batch_meta)) {
@@ -1452,13 +1465,6 @@ void NetworkManager::SubscribeNetworkThread(
 			             << ". Breaking loop (connection will close).";
 			payload_send_failures++;
 			break;  // Connection error - state not advanced, so reconnect can retry from same position
-		}
-
-		// [[BUG_FIX: STATE_AFTER_SEND]] Advance state only after successful send (Order 0).
-		if (order == 0 && order0_pending_offset != static_cast<size_t>(-1)) {
-			absl::MutexLock lock(&cached_state->mu);
-			cached_state->last_offset = order0_pending_offset;
-			cached_state->last_addr = order0_pending_addr;
 		}
 
 		if (corfu_latency_diag && order == 2 &&
