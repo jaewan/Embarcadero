@@ -154,10 +154,10 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 	auto& pending = conn->latency_parse_pending;
 	pending.insert(pending.end(), data, data + len);
 
-	const bool parse_batch_metadata = (order_level == 5 || order_level == 2);
+	const bool parse_batch_metadata = (order_level == 0 || order_level == 5 || order_level == 2);
 	const bool uid_batch_diag_enabled = (std::getenv("EMBAR_UID_BATCH_DIAG") != nullptr);
 	const uint16_t expected_header_version =
-		(order_level == 5 && Embarcadero::HeaderUtils::ShouldUseBlogHeader())
+		((order_level == 0 || order_level == 5) && Embarcadero::HeaderUtils::ShouldUseBlogHeader())
 			? Embarcadero::wire::HEADER_VERSION_V2
 			: Embarcadero::wire::HEADER_VERSION_V1;
 	size_t parse_offset = 0;
