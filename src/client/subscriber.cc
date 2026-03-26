@@ -1202,6 +1202,13 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		// Use 1MB receive chunks for optimal performance
 		size_t recv_chunk_size = std::min(available_space, static_cast<size_t>(1UL << 20));
 		ssize_t bytes_received = recv(conn_buffers->fd, write_ptr, recv_chunk_size, 0);
+		// Re-arm TCP_QUICKACK after every recv: Linux resets it to delayed-ACK mode
+		// after each ACK sent.  Without this, the broker hits EAGAIN and blocks in
+		// epoll_wait for ~40–200 ms per event waiting for ACKs to slide the window.
+		if (bytes_received > 0) {
+			const int one = 1;
+			setsockopt(conn_buffers->fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+		}
 
 		if (bytes_received > 0) {
 			// Record wall-clock time of first byte received (once, via CAS).

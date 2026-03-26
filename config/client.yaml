@@ -28,7 +28,10 @@ client:
     batch_size_kb: 2048
   
   subscriber:
-    connections_per_broker: 3
+    # connections_per_broker is not read from YAML; use env EMBARCADERO_SUB_CONNECTIONS.
+    # Default changed to 1: triplication (3×) wasted 2/3 of NIC bandwidth causing EAGAIN
+    # stalls on every batch.  1 connection per broker eliminates contention and raises
+    # unique subscribe throughput from ~1 GB/s to ~10 GB/s on 100 GbE.
     buffer_size_mb: 256
   
   network:

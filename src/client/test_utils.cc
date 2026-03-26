@@ -716,6 +716,51 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 
 				VLOG(5) << "All clients ready, starting publish test";
 
+				// PUSH-READY BARRIER
+				// Two-phase file protocol that lets an external orchestrator align
+				// multiple publisher processes (possibly on different machines) to
+				// start their push loops within a few microseconds of each other:
+				//
+				//   Phase 1 — ready signal:
+				//     Publisher writes "1\n" to EMBARCADERO_PUSH_READY_FILE
+				//     (one file per publisher, path supplied by orchestrator).
+				//     This marks the end of all connection setup / warmup.
+				//
+				//   Phase 2 — go timestamp:
+				//     Orchestrator polls all ready-files, then writes a future
+				//     CLOCK_REALTIME nanosecond timestamp (go_ns) to
+				//     EMBARCADERO_PUSH_GO_FILE (shared by all publishers).
+				//     Publisher spin-waits until system_clock >= go_ns.
+				//
+				// If either env var is absent the barrier is a no-op so the binary
+				// remains fully backwards-compatible.
+				if (const char* ready_file = std::getenv("EMBARCADERO_PUSH_READY_FILE")) {
+					if (FILE* f = std::fopen(ready_file, "w")) {
+						std::fprintf(f, "1\n");
+						std::fclose(f);
+					}
+					LOG(INFO) << "Push-ready barrier: wrote ready file " << ready_file;
+
+					if (const char* go_file = std::getenv("EMBARCADERO_PUSH_GO_FILE")) {
+						int64_t go_ns = 0;
+						while (go_ns <= 0) {
+							if (FILE* gf = std::fopen(go_file, "r")) {
+								if (std::fscanf(gf, "%" SCNd64, &go_ns) != 1) go_ns = 0;
+								std::fclose(gf);
+							}
+							if (go_ns <= 0)
+								std::this_thread::sleep_for(std::chrono::microseconds(200));
+						}
+						LOG(INFO) << "Push-ready barrier: go_ns=" << go_ns
+						          << "  spinning until system clock reaches go time...";
+						while (std::chrono::duration_cast<std::chrono::nanoseconds>(
+						           std::chrono::system_clock::now().time_since_epoch()).count() < go_ns) {
+							std::this_thread::yield();
+						}
+						LOG(INFO) << "Push-ready barrier: go time reached, starting push";
+					}
+				}
+
 			// Start timing
 			auto start = std::chrono::high_resolution_clock::now();
 			const int64_t pub_start_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(

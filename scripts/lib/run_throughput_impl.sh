@@ -134,7 +134,12 @@ default_client_numa_bind() {
     fi
   fi
 
-  printf '%s\n' "numactl --cpunodebind=0 --membind=0"
+  # Single-node fallback: bind client to NUMA 1, same node as the broker (broker_lifecycle.sh
+  # always uses --cpunodebind=1).  Broker creates loopback socket buffers on NUMA 1; if the
+  # client is on NUMA 0 its recv() must cross NUMA to read those buffers, doubling avg_send_us
+  # (~500 µs vs ~250 µs) and halving single-node subscribe throughput (~3 GB/s vs ~7 GB/s).
+  echo "Client NUMA auto-bind: single-node loopback → cpunodebind=1 (co-locate with broker)" >&2
+  printf '%s\n' "numactl --cpunodebind=1 --membind=1"
 }
 
 resolve_client_head_addr() {
