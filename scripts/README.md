@@ -95,6 +95,15 @@ scripts/run_throughput.sh
 
 Runs the latency benchmark matrix across the configured modes and sequencers.
 
+Supports two scenarios:
+
+- `SCENARIO=local` (default): brokers and client on the same machine (loopback).
+- `SCENARIO=remote`: brokers on this machine, client runs on a remote node via SSH.
+  Requires `REMOTE_CLIENT_HOST` (e.g. `c4`) and `BROKER_LISTEN_ADDR` (e.g. `10.10.10.10`).
+  The script automatically sets `EMBARCADERO_HEAD_ADDR` so brokers bind to the external
+  NIC, cleans stale CSV files on the remote node before each trial, and `scp`s result
+  CSVs back after each trial.
+
 Common options:
 
 - `NUM_BROKERS`
@@ -107,6 +116,36 @@ Common options:
 - `PLOT_RESULTS=1` to generate plots after the run
 - `TARGET_MBPS`
 - `MODES`: whitespace-separated list such as `steady burst`
+- `ORDERS`: space-separated order levels, e.g. `"0 5"`
+- `SCENARIO`: `local` or `remote`
+- `REMOTE_CLIENT_HOST`: SSH destination for remote client (default: `c4`)
+- `BROKER_LISTEN_ADDR`: IP the remote client uses to reach the broker (default: `10.10.10.10`)
+
+#### Batch size and latency
+
+The default batch size (512 KB in `EMBARCADERO_BATCH_SIZE`) is tuned for throughput:
+many messages are coalesced into a single batch before sending, which amortizes syscall
+and CXL-write overhead but adds **batching delay** — each message waits until the batch
+fills before it is sent.  This dominates measured latency at low offered loads.
+
+For per-record latency measurement, override `EMBARCADERO_BATCH_SIZE` to reduce the
+number of messages per batch.  This does **not** require recompilation — the value is
+read from the environment at runtime via `storage.batch_size`.
+
+| `EMBARCADERO_BATCH_SIZE` | Msgs/batch (1 KB msgs) | Typical p50 (ORDER=0, local) | Use case |
+|:---:|:---:|:---:|---|
+| 524288 (512 KB, default) | ~480 | ~1,940 µs | Throughput benchmarks |
+| 4096 (4 KB) | ~2–3 | ~137 µs | Low-latency benchmarks |
+| 1024 (1 KB) | 1 | ~149 µs | Per-record latency baseline |
+
+The 4 KB and 1 KB settings produce nearly identical p50 because once batching delay is
+removed, the remaining ~136–150 µs is the true single-message pipeline latency (publisher
+buffer write → TCP send → broker CXL write → subscriber TCP recv).
+
+**Important:** smaller batch sizes increase per-batch overhead and reduce maximum
+throughput.  Always use the default (or larger) batch size for throughput experiments.
+The `EMBARCADERO_BATCH_SIZE` override only affects the current process — other scripts
+and experiments are unaffected unless they explicitly set the same variable.
 
 ### `scripts/run_throughput_latency_sweep.sh`
 
