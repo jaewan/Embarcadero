@@ -60,3 +60,22 @@ Or set `corfu.sequencer_ip: "10.10.10.181"` in the shared YAML all processes loa
 ## Remote helper scripts
 
 `scripts/run_pub.sh` and related helpers accept `corfu_global_sequencer` as the sequencer binary name for `start_remote_sequencer` patterns; align the remote path and env with the variables above.
+
+## Split layout: sequencer on c2, brokers on c3, publisher on c1
+
+Off-internet nodes: build on a dev machine, then push binaries:
+
+```bash
+./scripts/cluster_rsync_bins.sh c2 c3
+CLUSTER_PUBLISHER_HOST=c1 ./scripts/cluster_rsync_bins.sh c2 c3   # if c1 resolves over SSH
+```
+
+On the **publisher** host (c1 or dev), from the repo root:
+
+```bash
+./scripts/run_corfu_remote_throughput.sh
+```
+
+Override addresses if your 10.10.10.* assignments differ. Environment variables are documented at the top of `scripts/run_corfu_remote_throughput.sh`.
+
+`scripts/lib/broker_lifecycle.sh` starts `corfu_global_sequencer` over SSH on `REMOTE_CORFU_SEQUENCER_HOST` before brokers when `SEQUENCER=CORFU`, and exports `EMBARCADERO_CORFU_SEQ_IP` to remote `embarlet` processes.
