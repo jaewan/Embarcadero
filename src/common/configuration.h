@@ -97,6 +97,7 @@ struct EmbarcaderoConfig {
     struct Corfu {
         ConfigValue<int> sequencer_port{50052, "EMBARCADERO_CORFU_SEQ_PORT"};
         ConfigValue<int> replication_port{50053, "EMBARCADERO_CORFU_REP_PORT"};
+        ConfigValue<std::string> sequencer_ip{"127.0.0.1", "EMBARCADERO_CORFU_SEQ_IP"};
     } corfu;
 
     // Scalog configuration

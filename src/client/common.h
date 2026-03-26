@@ -37,7 +37,9 @@
 #define MSG_ZEROCOPY    0x4000000
 #endif
 
-#define CORFU_SEQUENCER_ADDR "127.0.0.1:"
+// CORFU sequencer address: override with EMBARCADERO_CORFU_SEQ_IP env var for multi-node.
+// e.g. EMBARCADERO_CORFU_SEQ_IP=10.10.10.30 when sequencer runs on c3.
+#define CORFU_SEQUENCER_ADDR (Embarcadero::GetConfig().config().corfu.sequencer_ip.get() + ":")
 // Define if batch optimization is enabled
 #define BATCH_OPTIMIZATION 1
 

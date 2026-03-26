@@ -145,6 +145,7 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 auto corfu = root["corfu"];
                 if (corfu["sequencer_port"]) config_.corfu.sequencer_port.set(corfu["sequencer_port"].as<int>());
                 if (corfu["replication_port"]) config_.corfu.replication_port.set(corfu["replication_port"].as<int>());
+                if (corfu["sequencer_ip"]) config_.corfu.sequencer_ip.set(corfu["sequencer_ip"].as<std::string>());
             }
             
             // Scalog
