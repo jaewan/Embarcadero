@@ -402,6 +402,10 @@ class Topic {
 
 		int GetOrder(){ return order_; }
 
+		// Returns the number of messages ordered for the given client_id at this broker.
+		// Used by AckThread for correct per-publisher ACK (all sequencer modes).
+		uint64_t GetClientOrdered(uint32_t client_id) const;
+
 		/** [[ORDER_0_SKIP_PBR]] For order 0 we do not write to PBR. Returns start logical offset for this batch and advances by num_msg. */
 		size_t GetAndAdvanceOrder0LogicalOffset(uint32_t num_msg);
 
@@ -544,7 +548,7 @@ class Topic {
 				size_t& logical_offset,
 				BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
-		void RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_msg);
+		void RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_msg, uint32_t client_id);
 
 		std::function<void(void*, size_t)> ScalogGetCXLBuffer(
 				BatchHeader& batch_header,
@@ -622,9 +626,17 @@ class Topic {
 		absl::flat_hash_map<size_t, size_t> order3_client_batch_ ABSL_GUARDED_BY(mutex_);
 		// Corfu ORDER=2 completion tracking: recv completion can be out-of-order across network threads.
 		// We only advance ordered/ACK frontier when contiguous batch_seq is complete.
+		// corfu_order2_completed_: batch_seq -> {num_msg, client_id}
 		absl::Mutex corfu_order2_mu_;
 		uint64_t corfu_order2_next_seq_ ABSL_GUARDED_BY(corfu_order2_mu_) = 0;
-		absl::btree_map<uint64_t, uint32_t> corfu_order2_completed_ ABSL_GUARDED_BY(corfu_order2_mu_);
+		absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>> corfu_order2_completed_ ABSL_GUARDED_BY(corfu_order2_mu_);
+
+		// Per-client ordered counters for correct publisher ACK (all sequencer modes).
+		// Avoids false-positive ACK from global tinode ordered counter aggregating all clients.
+		mutable absl::Mutex per_client_mu_;
+		absl::flat_hash_map<uint32_t, uint64_t> per_client_ordered_ ABSL_GUARDED_BY(per_client_mu_);
+		// Called by all ordering paths (CORFU, ORDER=4, ORDER=5) to advance per-client counter.
+		void UpdatePerClientOrdered(uint32_t client_id, uint64_t count);
 
 		// Synchronization
 		absl::Mutex mutex_;

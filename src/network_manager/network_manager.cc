@@ -768,7 +768,7 @@ void NetworkManager::HandlePublishRequest(
 			LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
 			          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id;
 			// Pass local_ack_efd to thread so it uses the correct epoll instance
-			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd);
+			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd, handshake.client_id);
 		}
 		}
 	}
@@ -1890,7 +1890,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	}
 }
 
-void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd) {
+void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd, uint32_t client_id) {
 	struct epoll_event events[10];
 	char buf[1];
 
@@ -1898,7 +1898,8 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	std::string topic(topic_cstr ? topic_cstr : "");
 
 	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic='" << topic
-	          << "' (len=" << topic.size() << "), ack_level=" << ack_level;
+	          << "' (len=" << topic.size() << "), ack_level=" << ack_level
+	          << ", client_id=" << client_id;
 
 	// [[CRITICAL: Validate topic is not empty]]
 	// If topic is empty, GetOffsetToAck will use wrong TInode → wrong ACKs → client timeout
@@ -2039,6 +2040,14 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		}
 	}
 
+	// Use per-client ordered counter for ALL sequencer modes so each publisher only ACKs
+	// its own messages. Without this, a fast client can push the global broker-wide
+	// tinode->offsets[].ordered counter past a slow client's target, causing the slow
+	// client to exit WaitForAcks prematurely (false-positive ACK bug).
+	// Per-client counters are populated by: RecordCorfuOrder2BatchCompletion (CORFU),
+	// AssignOrder (EMBARCADERO ORDER=4), CommitEpoch (EMBARCADERO ORDER=5).
+	Topic* ack_topic = topic_manager_ ? topic_manager_->GetTopic(topic) : nullptr;
+
 	consecutive_timeouts = 0;
 	consecutive_errors = 0;
 	size_t consecutive_ack_stalls = 0;
@@ -2060,6 +2069,12 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 
 			// Fast-path: Read without flush/fence to detect potential changes.
 			// Safe for ACK2 because durability frontiers are monotonic; stale reads can only delay ACKs.
+			// Per-client path: use DRAM counter (no CXL flush/fence needed, works for all modes).
+			if (ack_topic) {
+				current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
+				expensive_checks_since_last_ack++;
+				fast_polls_without_full_check = 0;
+			} else {
 			auto [fast_read_value, needs_expensive_check] = GetOffsetToAckFast(topic.c_str(), ack_level, last_known_ack);
 			const bool force_full_check = (fast_polls_without_full_check >= kMaxFastPollsBeforeFullCheck);
 			if (needs_expensive_check || force_full_check) {
@@ -2075,6 +2090,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 				current_ack = fast_read_value;
 				fast_checks_since_last_send++;
 				fast_polls_without_full_check++;
+			}
 			}
 
 		if (current_ack != (size_t)-1 && next_to_ack_offset <= current_ack) {

@@ -222,6 +222,15 @@ void Topic::Start() {
 		LOG(INFO) << "Topic " << topic_name_ << ": DelegationThread disabled for Order 2 "
 		          << "(subscribers use GetBatchToExportWithMetadata)";
 	}
+	// Corfu ORDER=2: CorfuGetCXLBuffer returns batch_header_location=nullptr, so
+	// ReservePBRSlotAfterRecv is never called and batch_complete is never set.
+	// DelegationThread would spin-wait forever on batch_complete, wasting a full core
+	// and generating spurious CXL cache-line traffic.
+	if (order_ == 2 && seq_type_ == CORFU) {
+		skip_delegation = true;
+		LOG(INFO) << "Topic " << topic_name_ << ": DelegationThread disabled for Corfu Order 2 "
+		          << "(PBR ring never written; delegation would busy-spin indefinitely)";
+	}
 	// [[PERF: ORDER=0 fast path]] When the fast path is enabled, PBR is never written,
 	// so DelegationThread would spin-wait on CXL forever, wasting a CPU core and CXL bandwidth.
 	if (order_ == 0 && seq_type_ == EMBARCADERO &&
@@ -735,6 +744,10 @@ void Topic::AssignOrder(BatchHeader *batch_to_order, size_t start_total_order, B
 				reinterpret_cast<uint8_t*>(msg_header) + current_padded_size
 				);
 	} // End message loop
+
+	// Per-client ACK tracking: batch-level update (outside message loop to avoid per-message lock overhead)
+	UpdatePerClientOrdered(static_cast<uint32_t>(batch_to_order->client_id), num_messages);
+
 	header_for_sub->batch_off_to_export = (reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(header_for_sub));
 	header_for_sub->ordered = 1;
 	header_for_sub = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(header_for_sub) + sizeof(BatchHeader));
@@ -913,8 +926,12 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(slot_header) + 64);
 	CXL::store_fence();
 
-	// Return replication callback
-	return [this, batch_header, log](void* log_ptr, size_t /*placeholder*/) {
+	// Return replication/completion callback.
+	// NOTE: log_ptr (the first parameter) is always nullptr for Corfu — the network
+	// manager passes `(void*)header` where `header` is only set in the KAFKA parse
+	// block, which is skipped for CORFU.  All data access uses the captured `log`
+	// pointer (set above from log_addr_ + batch_header.log_idx).
+	return [this, batch_header, log](void* /*log_ptr*/, size_t /*placeholder*/) {
 		// Handle replication if needed
 		if (replication_factor_ > 0 && corfu_replication_client_) {
 			MessageHeader *header = (MessageHeader*)log;
@@ -929,32 +946,46 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 					log
 					);
 
-			// Marking replication done
-			size_t last_offset = header->logical_offset + batch_header.num_msg - 1;
+		// Marking replication done.
+		// Use GetReplicationSetBroker (forward: broker_id+i) — must match the formula
+		// used by GetBatchToExportWithMetadata and GetOffsetToAck.  The old backward
+		// formula (broker_id - i) wrote to the wrong offsets[] slots, so subscribers
+		// reading via GetReplicationSetBroker would see stale zeros and stall.
+		size_t last_offset = header->logical_offset + batch_header.num_msg - 1;
+		{
+			int num_brokers = get_num_brokers_callback_();
 			for (int i = 0; i < replication_factor_; i++) {
-				int num_brokers = get_num_brokers_callback_();
-				int b = (broker_id_ + num_brokers - i) % num_brokers;
+				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor_, num_brokers, i);
 				if (tinode_->replicate_tinode) {
-				replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
-			}
-				tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+					replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+					CXL::flush_cacheline(const_cast<const void*>(
+						reinterpret_cast<const volatile void*>(&replica_tinode_->offsets[b].replication_done[broker_id_])));
 				}
+				tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+				CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(&tinode_->offsets[b].replication_done[broker_id_])));
 			}
+			CXL::store_fence();
+		}
+		} // end: if (replication_factor_ > 0 && corfu_replication_client_)
 
-		RecordCorfuOrder2BatchCompletion(batch_header.batch_seq, batch_header.num_msg);
+		RecordCorfuOrder2BatchCompletion(batch_header.batch_seq, batch_header.num_msg, batch_header.client_id);
 	};
 }
 
-void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_msg) {
+void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_msg, uint32_t client_id) {
 	if (seq_type_ != CORFU || order_ != Embarcadero::kOrderTotal || num_slots_ == 0) {
 		return;
 	}
 
 	uint64_t contiguous_advanced = 0;
 	uint64_t messages_to_ack = 0;
+	// Per-client deltas collected while holding order2_mu_; applied to per-client map separately
+	// to keep the two locks independent (no nested lock acquisition).
+	absl::flat_hash_map<uint32_t, uint64_t> per_client_delta;
 	{
 		absl::MutexLock lock(&corfu_order2_mu_);
-		auto [it, inserted] = corfu_order2_completed_.emplace(batch_seq, num_msg);
+		auto [it, inserted] = corfu_order2_completed_.emplace(batch_seq, std::make_pair(num_msg, client_id));
 		if (!inserted) {
 			LOG(WARNING) << "Corfu ORDER=2: duplicate completion for batch_seq=" << batch_seq;
 			return;
@@ -965,6 +996,8 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 			if (next_it == corfu_order2_completed_.end()) {
 				break;
 			}
+			const uint32_t slot_num_msg = next_it->second.first;
+			const uint32_t slot_client_id = next_it->second.second;
 			const size_t slot = static_cast<size_t>(corfu_order2_next_seq_ % num_slots_);
 			BatchHeader* batch_header_log = reinterpret_cast<BatchHeader*>(batch_headers_);
 			BatchHeader* slot_header = &batch_header_log[slot];
@@ -972,14 +1005,30 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(slot_header) + 64);
 			CXL::full_fence();
 			if (slot_header->pbr_absolute_index != corfu_order2_next_seq_) {
-				LOG(ERROR) << "Corfu ORDER=2 slot freshness mismatch: slot=" << slot
+				// The CXL metadata slot was overwritten by a newer batch that mapped to the same
+				// ring slot (num_slots_ too small for outstanding window).  We still know num_msg
+				// from corfu_order2_completed_, so we can advance the ordered cursor to keep the
+				// ACK path moving — the message data itself is intact in BLog.
+				// Do NOT set slot_header->ordered here; that slot now belongs to a different batch.
+				static std::atomic<uint64_t> freshness_errors{0};
+				uint64_t err_n = freshness_errors.fetch_add(1, std::memory_order_relaxed) + 1;
+				LOG(ERROR) << "Corfu ORDER=2 slot freshness mismatch #" << err_n
+				           << ": slot=" << slot
 				           << " expected_seq=" << corfu_order2_next_seq_
 				           << " observed_seq=" << slot_header->pbr_absolute_index
-				           << " (metadata overwritten before export)";
-				break;
+				           << " — num_slots_=" << num_slots_ << " is too small; increase ring size."
+				           << " Advancing ordered cursor using map num_msg to avoid ACK deadlock.";
+				// Advance anyway using the num_msg we registered — avoids permanent ACK freeze.
+				messages_to_ack += slot_num_msg;
+				per_client_delta[slot_client_id] += slot_num_msg;
+				corfu_order2_completed_.erase(next_it);
+				corfu_order2_next_seq_++;
+				contiguous_advanced++;
+				continue;
 			}
 
-			messages_to_ack += next_it->second;
+			messages_to_ack += slot_num_msg;
+			per_client_delta[slot_client_id] += slot_num_msg;
 			slot_header->ordered = 1;
 			CXL::flush_cacheline(slot_header);
 			CXL::store_fence();
@@ -991,10 +1040,17 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 	}
 
 	if (messages_to_ack > 0) {
+		// Update global ordered counter (used by subscribers to track broker-wide progress).
 		tinode_->offsets[broker_id_].ordered += messages_to_ack;
 		CXL::flush_cacheline(const_cast<const void*>(
 			reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered)));
 		CXL::store_fence();
+
+		// Update per-client ordered counters (used by per-publisher AckThread for correct ACK).
+		// Held separately from corfu_order2_mu_ to avoid nested locking.
+		for (auto& [cid, cnt] : per_client_delta) {
+			UpdatePerClientOrdered(cid, cnt);
+		}
 	}
 
 	if (contiguous_advanced > 0 && VLOG_IS_ON(4)) {
@@ -1002,6 +1058,17 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 		        << " batches, acked_messages+=" << messages_to_ack
 		        << " next_seq=" << corfu_order2_next_seq_;
 	}
+}
+
+void Topic::UpdatePerClientOrdered(uint32_t client_id, uint64_t count) {
+	absl::MutexLock lock(&per_client_mu_);
+	per_client_ordered_[client_id] += count;
+}
+
+uint64_t Topic::GetClientOrdered(uint32_t client_id) const {
+	absl::MutexLock lock(&per_client_mu_);
+	auto it = per_client_ordered_.find(client_id);
+	return (it != per_client_ordered_.end()) ? it->second : 0;
 }
 
 std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(
@@ -3089,6 +3156,8 @@ void Topic::CommitEpoch(
 	std::array<size_t, NUM_MAX_BROKERS> ordered_increment{};
 	std::array<size_t, NUM_MAX_BROKERS> last_ordered_offset{};
 	std::array<bool, NUM_MAX_BROKERS> ordered_broker_seen{};
+	// Per-client delta accumulated here; flushed to per_client_ordered_ after [PHASE-4].
+	absl::flat_hash_map<uint32_t, uint64_t> per_client_delta_epoch;
 
 	for (PendingBatch5& p : ready) {
 		if (p.skipped || p.is_held_marker) continue;
@@ -3107,12 +3176,13 @@ void Topic::CommitEpoch(
 					goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
 					goi_timestamps_[ring_pos].timestamp_ns.store(SteadyNowNs(), std::memory_order_release);
 				}
-			int b = m.broker_id;
-			ordered_increment[b] += m.num_msg;
-			last_ordered_offset[b] = m.log_idx;
-			ordered_broker_seen[b] = true;
-			{
-				OrderedHoldExportEntry ex;
+		int b = m.broker_id;
+		ordered_increment[b] += m.num_msg;
+		last_ordered_offset[b] = m.log_idx;
+		ordered_broker_seen[b] = true;
+		per_client_delta_epoch[static_cast<uint32_t>(p.client_id)] += m.num_msg;
+		{
+			OrderedHoldExportEntry ex;
 				ex.log_idx = m.log_idx;
 				ex.batch_size = m.total_size;
 				ex.total_order = next_order;
@@ -3138,13 +3208,14 @@ void Topic::CommitEpoch(
 					goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
 					goi_timestamps_[ring_pos].timestamp_ns.store(SteadyNowNs(), std::memory_order_release);
 				}
-			next_order += p.num_msg;
-			int b = p.broker_id;
-			ordered_increment[b] += p.num_msg;
-			last_ordered_offset[b] = static_cast<size_t>(reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
-			ordered_broker_seen[b] = true;
+		next_order += p.num_msg;
+		int b = p.broker_id;
+		ordered_increment[b] += p.num_msg;
+		last_ordered_offset[b] = static_cast<size_t>(reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
+		ordered_broker_seen[b] = true;
+		per_client_delta_epoch[static_cast<uint32_t>(p.client_id)] += p.num_msg;
 
-			size_t& next_expected = contiguous_consumed_per_broker[b];
+		size_t& next_expected = contiguous_consumed_per_broker[b];
 			if (p.slot_offset == next_expected || (next_expected == BATCHHEADERS_SIZE && p.slot_offset == 0)) {
 				next_expected = p.slot_offset + sizeof(BatchHeader);
 				if (next_expected >= BATCHHEADERS_SIZE) next_expected = BATCHHEADERS_SIZE;
@@ -3165,6 +3236,13 @@ void Topic::CommitEpoch(
 		CXL::flush_cacheline(const_cast<const void*>(
 			reinterpret_cast<const volatile void*>(&tinode_->offsets[b].ordered)));
 		CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].ordered_offset));
+	}
+	// Per-client ordered update (one lock acquisition per epoch, not per batch).
+	if (!per_client_delta_epoch.empty()) {
+		absl::MutexLock lock(&per_client_mu_);
+		for (auto& [cid, cnt] : per_client_delta_epoch) {
+			per_client_ordered_[cid] += cnt;
+		}
 	}
 	if (ShouldEnableFrontierTrace() && order_ == 5) {
 		static thread_local uint64_t last_frontier_log_ns = 0;
