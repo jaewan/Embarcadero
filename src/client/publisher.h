@@ -176,7 +176,8 @@ class Publisher {
 		QueueBuffer pubQue_;
 		SequencerType seq_type_;
 		std::unique_ptr<CorfuSequencerClient> corfu_client_;
-		// [[CORFU]] Per-broker batch sequence for GetTotalOrder; sequencer expects 0,1,2,... per (client,broker)
+		// [[CORFU]] Per-broker batch sequence for GetTotalOrder; sequencer expects 0,1,2,... per (client,broker).
+		// Global total_order is serialized server-side per client_id (see corfu_sequencer_service.cc).
 		static constexpr int kMaxCorfuBrokers = 32;
 		std::array<std::atomic<size_t>, kMaxCorfuBrokers> corfu_batch_seq_per_broker_{};
 		std::array<std::atomic<size_t>, kMaxCorfuBrokers> order5_batch_seq_per_broker_{};

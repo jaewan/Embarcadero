@@ -223,6 +223,7 @@ set_target_properties(scalog_global_sequencer PROPERTIES
 
 add_executable(corfu_global_sequencer
     cxl_manager/corfu_global_sequencer.cc
+    cxl_manager/corfu_sequencer_service.cc
     common/configuration.cc
     common/configuration.h
 )
@@ -230,6 +231,7 @@ add_executable(corfu_global_sequencer
 target_include_directories(corfu_global_sequencer PUBLIC
 	"${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_BINARY_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(corfu_global_sequencer
@@ -245,6 +247,29 @@ target_link_libraries(corfu_global_sequencer
 set_target_properties(corfu_global_sequencer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+# Deterministic ordering checks for CorfuSequencerImpl (per-client FIFO vs global total_order).
+add_executable(corfu_sequencer_fifo_smoke
+    cxl_manager/corfu_sequencer_fifo_smoke.cc
+    cxl_manager/corfu_sequencer_service.cc
+)
+target_include_directories(corfu_sequencer_fifo_smoke PUBLIC
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_link_libraries(corfu_sequencer_fifo_smoke
+    absl::flat_hash_map
+    corfu_sequencer_grpc_proto
+    grpc++
+    protobuf::libprotobuf
+    Threads::Threads
+)
+set_target_properties(corfu_sequencer_fifo_smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+add_test(NAME corfu_sequencer_fifo_smoke COMMAND corfu_sequencer_fifo_smoke
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 
 # Configuration test executable
