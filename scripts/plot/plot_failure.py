@@ -22,6 +22,7 @@ DPI = 300
 THROUGHPUT_THRESHOLD = 0.01
 EARLY_FAILURE_FACTOR = 0.8
 TAIL_CUTOFF_FACTOR = 0.70
+ACK_FRONTIER_PLOT_MARGIN_SEC = 1.0
 STEP_STYLE = 'post'
 
 SAFE_COLORS = [
@@ -85,7 +86,7 @@ def plot_real_time_throughput(csv_filename, output_prefix, event_filename=None, 
                 event_data = None
 
         # Event timestamps
-        kill_time = detect_time = reroute_time = None
+        kill_time = detect_time = reroute_time = ack_frontier_time = None
         failed_idx = -1
         if event_data is not None:
             for _, ev in event_data.iterrows():
@@ -97,10 +98,27 @@ def plot_real_time_throughput(csv_filename, output_prefix, event_filename=None, 
                     detect_time = ts
                 if "reconnect success" in desc and reroute_time is None:
                     reroute_time = ts
+                if "ack frontier" in desc and ack_frontier_time is None:
+                    ack_frontier_time = ts
                 if failed_idx < 0:
                     match = re.search(r'broker (\d+)', desc)
                     if match:
                         failed_idx = int(match.group(1))
+
+        # Clip charted window near ACK-frontier to avoid plotting ACK-drain tail spikes
+        # as if they were sustained steady-state throughput.
+        if (not keep_full_tail and ack_frontier_time is not None and
+                ack_frontier_time >= 0.0 and len(data) > 5):
+            cutoff_sec = ack_frontier_time + ACK_FRONTIER_PLOT_MARGIN_SEC
+            keep_mask = x_sec <= cutoff_sec
+            if keep_mask.any() and keep_mask.sum() >= 3:
+                kept = int(keep_mask.sum())
+                data = data.iloc[:kept].copy()
+                x_sec = x_sec.iloc[:kept]
+                print(
+                    f"Clipped tail after ACK frontier at {ack_frontier_time:.3f}s "
+                    f"(kept {kept} samples, +{ACK_FRONTIER_PLOT_MARGIN_SEC:.1f}s margin)"
+                )
 
         if failed_idx >= 0:
             print(f"Failed broker from events: Broker index {failed_idx}")
@@ -178,10 +196,14 @@ def plot_real_time_throughput(csv_filename, output_prefix, event_filename=None, 
         ax.grid(True, which='major', linewidth=0.3, alpha=GRID_ALPHA)
         x_max = x_sec.max() * 1.02 if not x_sec.empty else 1
         ax.set_xlim(0, x_max)
-        y_max = data['Total_GBps'].max() if 'Total_GBps' in data.columns else data[broker_cols].max().max()
+        y_max = float(data['Total_GBps'].max()) if 'Total_GBps' in data.columns else float(data[broker_cols].max().max())
+        if not np.isfinite(y_max) or y_max <= 0:
+            y_max = 0.1
         ax.set_ylim(0, y_max * 1.12)
-        ax.yaxis.set_major_locator(ticker.MultipleLocator(2))
-        ax.yaxis.set_minor_locator(ticker.MultipleLocator(1))
+        # Use adaptive ticks: fixed step=2 hides all labels when peak < 2 GB/s (common on 10G or failure runs).
+        ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=8, min_n_ticks=5))
+        ax.yaxis.set_minor_locator(ticker.AutoMinorLocator())
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, pos: f"{v:.2f}"))
         ax.text(
             0.01, 0.98,
             f"Step plot; each sample covers ~{sample_period_sec*1000:.0f} ms",

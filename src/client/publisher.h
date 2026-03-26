@@ -240,6 +240,10 @@ class Publisher {
 		absl::flat_hash_map<int, std::string> nodes_;
 		absl::Mutex mutex_;
 		std::vector<int> brokers_;
+		// Publish threads connected to each broker_id; used to pick least-loaded survivor on reroute.
+		std::array<std::atomic<int>, kMaxBrokerIds> publish_thread_load_{};
+		// When several survivors tie for minimum load, spread reconnects (avoid always picking brokers_[0]).
+		size_t failure_reroute_tiebreak_rr_{0} ABSL_GUARDED_BY(mutex_);
 		// [[FIX: B2=0 ACKs]] Track which brokers have publisher threads to handle late registration
 		absl::flat_hash_set<int> brokers_with_threads_ ABSL_GUARDED_BY(mutex_);
 		char topic_[TOPIC_NAME_SIZE];

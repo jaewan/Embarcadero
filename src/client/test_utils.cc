@@ -490,8 +490,18 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 
 	// Failure-mode queue sizing is intentionally configurable because a tiny queue materially
 	// changes publisher-side backpressure behavior and therefore the observed failure dynamics.
-	size_t q_size = GetFailureQueueSizeBytes();
-	LOG(INFO) << "Failure test queue size: " << q_size << " bytes";
+	// When EMBARCADERO_FAILURE_MATCH_THROUGHPUT is set (non-empty, not "0"), use the same queue
+	// sizing as PublishThroughputTest and skip the artificial in-flight publish throttle so
+	// offered load matches the standard throughput benchmark (still failure instrumentation).
+	const bool failure_match_throughput = []() {
+		const char* e = std::getenv("EMBARCADERO_FAILURE_MATCH_THROUGHPUT");
+		return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+	}();
+	size_t q_size = failure_match_throughput
+		? CalculateOptimalQueueSize(num_threads_per_broker, total_message_size, message_size)
+		: GetFailureQueueSizeBytes();
+	LOG(INFO) << "Failure test queue size: " << q_size << " bytes"
+	          << (failure_match_throughput ? " (throughput-matched via EMBARCADERO_FAILURE_MATCH_THROUGHPUT)" : "");
 
 	// Initialize subscriber BEFORE publisher to make sure they're ready to receive
 	LOG(INFO) << "Setting up dummy subscriber to keep connections open if needed";
@@ -506,7 +516,6 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 #endif
 
 	try {
-		p.RecordStartTime();
 		p.Init(ack_level);
 
 		auto warmup_start = std::chrono::high_resolution_clock::now();
@@ -515,6 +524,9 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 			std::chrono::high_resolution_clock::now() - warmup_start).count();
 		LOG(INFO) << "Failure test buffer warmup completed in " << warmup_ms << " ms";
 
+		// Anchor failure-event timestamps and EMBARCADERO_FAILURE_AFTER_MS to publish phase
+		// (exclude Init/Warmup), so "failure after X ms" means after traffic starts.
+		p.RecordStartTime();
 		p.FailBrokers(total_message_size, message_size, failure_percentage, killbrokers);
 
 		// Create progress tracker
@@ -536,7 +548,8 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 					break;
 				}
 
-				if (!p.IsThrottleRelaxed() && i > p.GetAckReceived() + max_in_flight_msgs) {
+				if (!failure_match_throughput && !p.IsThrottleRelaxed() &&
+				    i > p.GetAckReceived() + max_in_flight_msgs) {
 					auto throttle_start = std::chrono::steady_clock::now();
 					int spin_count = 0;
 					while (!p.GetShutdown() && !p.IsThrottleRelaxed() &&

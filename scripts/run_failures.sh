@@ -4,22 +4,34 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/lib/broker_lifecycle.sh"
 cd "$PROJECT_ROOT"
 
 if [ ! -d "build/bin" ]; then
     echo "Error: Cannot find build/bin directory (expected $PROJECT_ROOT/build/bin)"
     exit 1
 fi
+broker_init_paths
 cd build/bin
 
 # Config for brokers
 HEAD_CONFIG_ARG="--config ../../config/embarcadero.yaml"
 CONFIG_ARG="--config ../../config/embarcadero.yaml"
+PRESERVE_REMOTE_BROKERS=${PRESERVE_REMOTE_BROKERS:-0}
+BROKER_READY_TIMEOUT_SEC=${BROKER_READY_TIMEOUT_SEC:-90}
+FORCE_RESTART_BROKERS=${FORCE_RESTART_BROKERS:-1}
+CLIENT_HEAD_ADDR="${EMBARCADERO_HEAD_ADDR:-${REMOTE_HEAD_ADDR:-127.0.0.1}}"
+
+# Needed before first cleanup: remote broker_cleanup iterates ports by broker count (set -u).
+NUM_BROKERS=${NUM_BROKERS:-4}
 
 # Cleanup any stale processes/ports from previous runs
 cleanup() {
   echo "Cleaning up stale brokers and ports..."
-  pkill -f "./embarlet" >/dev/null 2>&1 || true
+  pkill -f "./throughput_test" >/dev/null 2>&1 || true
+  if ! broker_is_remote_mode || [ "$PRESERVE_REMOTE_BROKERS" != "1" ]; then
+    broker_cleanup
+  fi
   rm -f /tmp/embarlet_*_ready 2>/dev/null || true
   sleep 1
 }
@@ -53,8 +65,14 @@ if [ -z "${EMBARLET_NUMA_BIND+x}" ]; then
 fi
 
 # --- Failure test parameters ---
-NUM_BROKERS=${NUM_BROKERS:-4}
 FAILURE_PERCENTAGE=${FAILURE_PERCENTAGE:-0.5}
+# Wall-clock kill when >0 (client uses EMBARCADERO_FAILURE_AFTER_MS; byte fraction ignored). Use 0 for legacy %-of-data trigger.
+FAILURE_AFTER_MS=${FAILURE_AFTER_MS:-1500}
+export EMBARCADERO_FAILURE_AFTER_MS="$FAILURE_AFTER_MS"
+# Use the same queue sizing / no artificial in-flight cap as the normal throughput benchmark
+# so pre/post-failure behavior is apples-to-apples by default.
+FAILURE_MATCH_THROUGHPUT=${FAILURE_MATCH_THROUGHPUT:-1}
+export EMBARCADERO_FAILURE_MATCH_THROUGHPUT="$FAILURE_MATCH_THROUGHPUT"
 NUM_BROKERS_TO_KILL=${NUM_BROKERS_TO_KILL:-1}
 NUM_TRIALS=${NUM_TRIALS:-1}
 test_cases=(4)
@@ -74,13 +92,24 @@ printf 'trial\treported_mb_s\tactive_mean_gbps\tactive_std_gbps\tactive_peak_gbp
 
 echo "===== Failure Benchmark Configuration ====="
 echo "  Brokers:          $NUM_BROKERS"
-echo "  Kill:             $NUM_BROKERS_TO_KILL broker(s) at ${FAILURE_PERCENTAGE} of data"
+if [ "${FAILURE_AFTER_MS}" -gt 0 ] 2>/dev/null; then
+  echo "  Kill:             $NUM_BROKERS_TO_KILL broker(s) after ${FAILURE_AFTER_MS} ms (EMBARCADERO_FAILURE_AFTER_MS)"
+else
+  echo "  Kill:             $NUM_BROKERS_TO_KILL broker(s) at ${FAILURE_PERCENTAGE} of data (no time trigger)"
+fi
 echo "  Total data:       $TOTAL_MESSAGE_SIZE bytes"
 echo "  Message size:     $MESSAGE_SIZE bytes"
 echo "  Order:            $ORDER"
 echo "  ACK level:        $ack"
 echo "  Sequencer:        $sequencer"
 echo "  Trials:           $NUM_TRIALS"
+echo "  Match throughput: $FAILURE_MATCH_THROUGHPUT"
+if broker_is_remote_mode; then
+  echo "  Broker mode:      remote ($REMOTE_BROKER_HOST)"
+else
+  echo "  Broker mode:      local"
+fi
+echo "  Client head addr: $CLIENT_HEAD_ADDR"
 echo "  Output dir:       $FAILURE_DATA_DIR"
 echo "============================================"
 
@@ -265,41 +294,53 @@ for test_case in "${test_cases[@]}"; do
     echo "================================================================="
 
     pids=()
-    # Start head broker; $! is the PID of the background embarlet process
-    $EMBARLET_NUMA_BIND ./embarlet $HEAD_CONFIG_ARG --head --$sequencer > broker_0_trial${trial}.log 2>&1 &
-    head_pid=$!
-    pids+=($head_pid)
-    echo "Started head broker with PID $head_pid (log: broker_0_trial${trial}.log)"
+    if broker_is_remote_mode; then
+      echo "Ensuring remote broker cluster on $REMOTE_BROKER_HOST..."
+      if ! broker_ensure_cluster "$NUM_BROKERS" "$BROKER_READY_TIMEOUT_SEC" "$sequencer"; then
+        echo "Remote broker startup failed, aborting trial"
+        cleanup
+        continue
+      fi
+      echo "Remote brokers ready on $REMOTE_BROKER_HOST."
+    else
+      # Avoid binding local brokers to a remote head address.
+      unset EMBARCADERO_HEAD_ADDR
+      # Start head broker; $! is the PID of the background embarlet process
+      $EMBARLET_NUMA_BIND ./embarlet $HEAD_CONFIG_ARG --head --$sequencer > broker_0_trial${trial}.log 2>&1 &
+      head_pid=$!
+      pids+=($head_pid)
+      echo "Started head broker with PID $head_pid (log: broker_0_trial${trial}.log)"
 
-    if ! wait_for_broker_ready "$head_pid" 60; then
-      echo "Head broker failed to initialize, aborting trial"
-      for pid in "${pids[@]}"; do kill $pid 2>/dev/null || true; done
-      pids=()
-      cleanup
-      continue
+      if ! wait_for_broker_ready "$head_pid" 60; then
+        echo "Head broker failed to initialize, aborting trial"
+        for pid in "${pids[@]}"; do kill $pid 2>/dev/null || true; done
+        pids=()
+        cleanup
+        continue
+      fi
+
+      echo "Starting follower brokers..."
+      # Start follower brokers in parallel
+      broker_shell_pids=()
+      for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
+        $EMBARLET_NUMA_BIND ./embarlet $CONFIG_ARG > broker_${i}_trial${trial}.log 2>&1 &
+        broker_shell_pids+=($!)
+      done
+      sleep 0.5
+      # $! from each "cmd &" is the PID of that process; use them directly as follower PIDs
+      follower_pids=("${broker_shell_pids[@]}")
+      for pid in "${follower_pids[@]}"; do pids+=($pid); done
+      echo "Started follower brokers with PIDs: ${follower_pids[*]} (waiting up to 90s for ready)"
+
+      if ! wait_for_all_brokers_ready 90 "${follower_pids[@]}"; then
+        echo "One or more followers failed to initialize (timeout 90s), aborting trial"
+        for pid in "${pids[@]}"; do kill $pid 2>/dev/null || true; done
+        pids=()
+        cleanup
+        continue
+      fi
+      echo "All $NUM_BROKERS brokers ready, cluster formed."
     fi
-
-    echo "Starting follower brokers..."
-    # Start follower brokers in parallel
-    broker_shell_pids=()
-    for ((i = 1; i <= NUM_BROKERS - 1; i++)); do
-      $EMBARLET_NUMA_BIND ./embarlet $CONFIG_ARG > broker_${i}_trial${trial}.log 2>&1 &
-      broker_shell_pids+=($!)
-    done
-    sleep 0.5
-    # $! from each "cmd &" is the PID of that process; use them directly as follower PIDs
-    follower_pids=("${broker_shell_pids[@]}")
-    for pid in "${follower_pids[@]}"; do pids+=($pid); done
-    echo "Started follower brokers with PIDs: ${follower_pids[*]} (waiting up to 90s for ready)"
-
-    if ! wait_for_all_brokers_ready 90 "${follower_pids[@]}"; then
-      echo "One or more followers failed to initialize (timeout 90s), aborting trial"
-      for pid in "${pids[@]}"; do kill $pid 2>/dev/null || true; done
-      pids=()
-      cleanup
-      continue
-    fi
-    echo "All $NUM_BROKERS brokers ready, cluster formed."
 
     # Longer ACK timeout when ack>=1 (failure + redirect can delay ACKs)
     if [ "$ack" != "0" ]; then
@@ -323,6 +364,7 @@ CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-300}  # 5 minutes max
       stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml \
       -n $THREADS_PER_BROKER -m $MESSAGE_SIZE \
       -s $TOTAL_MESSAGE_SIZE "${RECORD_RESULTS_ARG[@]}" -t $test_case \
+      --head_addr "$CLIENT_HEAD_ADDR" \
       --num_brokers_to_kill $NUM_BROKERS_TO_KILL --failure_percentage $FAILURE_PERCENTAGE \
       -o $ORDER -a $ack --sequencer $sequencer -l 0 2>&1 | tee "$CLIENT_LOG"
     test_exit_code=${PIPESTATUS[0]}
