@@ -24,6 +24,18 @@ Most scripts read their options from environment variables instead of flags. Tha
 - `BROKER_READY_TIMEOUT_SEC`: remote/local startup timeout for broker readiness.
 - `BROKER_POLL_INTERVAL_SEC`: polling interval while waiting for broker readiness.
 
+### ACK levels (`ACK` / `ack_level`)
+
+The `ACK` variable controls what the publisher waits for before considering a message "sent":
+
+| Level | Semantics | What the broker does |
+|:---:|---|---|
+| `0` | **Fire and forget** — publisher does NOT wait for any broker confirmation. `Poll()` returns as soon as all publish threads have exited (data handed to kernel socket buffer). No guarantee the broker has received or written the data. | Broker sends no ACK; AckThread not started on publisher. |
+| `1` | **Written/ordered confirmation** — publisher waits until the broker confirms the message is written to shared memory (CXL). For ORDER=0 this means `tinode->offsets[broker_id].written` is advanced; for ORDER>0 it means `ordered` is advanced. | Broker's AckThread polls `GetOffsetToAck()` and sends cumulative count back to publisher via a TCP connection. |
+| `2` | **Replication confirmation** — publisher waits until all designated replica brokers have replicated the data. Requires `REPLICATION_FACTOR > 0`; with RF=0 this falls through to ack=1 semantics. | Same as ack=1 but broker waits for `replication_done` frontier across the full replication set. |
+
+**Use ack=1 for all meaningful throughput benchmarks.** Ack=0 only measures how fast the publisher fills the kernel socket buffer, not how fast the broker processes data. Ack=2 measures replication overhead on top of ack=1.
+
 ### Remote mode
 
 Set these to run scripts from a client node while brokers live on a broker node:
@@ -166,10 +178,10 @@ Multi-client throughput orchestration script. Starts brokers locally, then launc
 | `NUM_CLIENTS` | Active clients | NUMA binding |
 |:---:|---|---|
 | 1 | c4 | node 1 |
-| 2 | c4, local (broker node) | node 1, node 0 |
-| 3 | c4, local, c3 | node 1, node 0, node 1 |
-| 4 | c4, local, c3, c2 | node 1, node 0, node 1, node 1 |
-| 5 | c4, local, c3, c2, c1 | node 1, node 0, node 1, node 1, node 1 |
+| 2 | c4, c3 | node 1, node 1 |
+| 3 | c4, c3, local (broker node) | node 1, node 1, node 0 |
+| 4 | c4, c3, local, c2 | node 1, node 1, node 0, node 1 |
+| 5 | c4, c3, local, c2, c1 | node 1, node 1, node 0, node 1, node 1 |
 
 `TOTAL_MESSAGE_SIZE` is divided equally across all active clients; each client sends `TOTAL_MESSAGE_SIZE / NUM_CLIENTS` bytes.
 
@@ -206,33 +218,71 @@ Examples:
 # 1 client — c4 alone
 NUM_CLIENTS=1 scripts/run_multiclient.sh
 
-# 2 clients — c4 + local, larger messages
-NUM_CLIENTS=2 MESSAGE_SIZE=8192 scripts/run_multiclient.sh
+# 2 clients — c4 + c3, 10 GiB total, ORDER=0
+NUM_CLIENTS=2 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 \
+    SEQUENCER=EMBARCADERO EMBARCADERO_HEAD_ADDR=10.10.10.10 \
+    scripts/run_multiclient.sh
+
+# 2 clients — c4 + c3, ORDER=5
+NUM_CLIENTS=2 ORDER=5 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 \
+    SEQUENCER=EMBARCADERO EMBARCADERO_HEAD_ADDR=10.10.10.10 \
+    scripts/run_multiclient.sh
 
 # Full 5-client sweep, 5 trials, 16 GiB total load
 NUM_CLIENTS=5 NUM_TRIALS=5 TOTAL_MESSAGE_SIZE=17179869184 \
-    scripts/run_multiclient.sh
-
-# Compare without MSG_MORE
-NUM_CLIENTS=3 EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE=0 \
     scripts/run_multiclient.sh
 ```
 
 **Prerequisite:** all cluster machines must have NTP-synchronized clocks before running.
 Use `scripts/setup/sync_clocks.sh` if they are not already synced.
 
+**c3 setup prerequisites** (run once on c3 as root):
+```bash
+# Hugepages: ensure ≥ 8200 on NUMA node 1 (client runs --membind=1)
+echo 8200 | sudo tee /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+sudo chmod 1777 /dev/hugepages
+# Socket buffers
+sudo sysctl -w net.core.rmem_max=268435456
+sudo sysctl -w net.core.wmem_max=268435456
+sudo sysctl -w net.ipv4.tcp_rmem='4096 65536 268435456'
+sudo sysctl -w net.ipv4.tcp_wmem='4096 65536 268435456'
+# NIC ring buffer (100G data NIC: ens801f0np0)
+sudo ethtool -G ens801f0np0 rx 8192 tx 8192
+```
+
 **Aggregation note:** the per-trial totals printed at the end are the naive sum of
 each client's self-reported average bandwidth. For peer-reviewable results, collect
 the per-client time-series CSVs and calculate throughput within the overlapping
 steady-state send window instead.
 
+**Benchmark results** (2026-03-26, 4 brokers on moscxl, 1 KB messages, ACK=1, no replication):
+
+Multi-client publish throughput (c4 + c3 → moscxl, `NUM_CLIENTS=2`):
+
+| ORDER | Trial 1 | Trial 2 | Trial 3 | Notes |
+|:---:|---:|---:|---:|---|
+| 0 | 11.4 GB/s | 12.2 GB/s | 12.5 GB/s | ORDER=0 fast path, c4≈6.9 GB/s + c3≈5.9 GB/s |
+| 5 | 11.5 GB/s | 12.2 GB/s | 12.1 GB/s | Sequencer overhead negligible at this scale |
+
+E2E throughput (c4 publisher → moscxl brokers → c3 subscriber, 10 GiB, single client):
+
+| ORDER | Publish (c4→broker) | Subscribe (broker→c3) | Notes |
+|:---:|---:|---:|---|
+| 0 | 6,631 MB/s | 1,266 MB/s | Subscriber bound by CXL read + broker→wire |
+| 5 | 7,074 MB/s | 1,231 MB/s | ORDER=5 slightly faster publish (epoch batching) |
+
+Subscribe bandwidth reflects the broker reading from CXL (NUMA node 2, distance=255) and
+re-transmitting to the subscriber over the same 100 GbE fabric. The publish path is
+write-only (producer→CXL); the subscribe path adds a CXL read plus a second TCP send
+per byte, which limits it to ~1.2 GB/s with the current single-subscriber configuration.
+
 **TODO (pending test runs):**
-- [ ] Test with 1 client (c4 alone)
-- [ ] Test with 2 clients (c4 + local)
-- [ ] Test with 3 clients (c4 + local + c3)
-- [ ] Test with 4 clients (c4 + local + c3 + c2)
-- [ ] Test with 5 clients (c4 + local + c3 + c2 + c1)
+- [x] Test with 2 clients (c4 + c3) — ORDER=0 and ORDER=5 ✓
+- [ ] Test with 3 clients (c4 + c3 + local)
+- [ ] Test with 4 clients (c4 + c3 + local + c2)
+- [ ] Test with 5 clients (c4 + c3 + local + c2 + c1)
 - [ ] Verify aggregate throughput using time-series overlapping window analysis
+- [ ] Multi-subscriber e2e (c4 pub + c3 sub + c2 sub) to test fanout bandwidth
 
 ### `scripts/run_ordering_durability_ladder.sh`
 

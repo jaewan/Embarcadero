@@ -1198,8 +1198,8 @@ void NetworkManager::HandleSubscribeRequest(
 		return;
 	}
 
-	// Set larger send buffer
-	int send_buffer_size = 16 * 1024 * 1024;  // 16MB
+	// Set send buffer: 64MB is ~50× the 100G/100µs BDP, avoids OOM from 268MB × 12 connections
+	int send_buffer_size = 64 * 1024 * 1024;
 	if (setsockopt(client_socket, SOL_SOCKET, SO_SNDBUF, &send_buffer_size, sizeof(send_buffer_size)) == -1) {
 		LOG(ERROR) << "Subscriber setsockopt SO_SNDBUF failed";
 		close(client_socket);
@@ -1269,6 +1269,11 @@ void NetworkManager::HandleSubscribeRequest(
 	close(epoll_fd);
 }
 
+// Thread-local send-path diagnostics — shared between SubscribeNetworkThread and SendMessageData.
+// SubscribeNetworkThread reads these after each SendMessageData call to build per-connection stats.
+static thread_local uint64_t tl_send_eagain_count = 0;
+static thread_local uint64_t tl_send_epoll_ns = 0;
+
 void NetworkManager::SubscribeNetworkThread(
 		int sock,
 		int efd,
@@ -1337,6 +1342,11 @@ void NetworkManager::SubscribeNetworkThread(
 	uint64_t metadata_send_failures = 0;
 	uint64_t payload_send_failures = 0;
 	uint64_t meta_sent_bytes = 0;
+	// Subscribe send-path diagnostics (always collected, logged at thread exit)
+	uint64_t send_total_ns = 0;     // total ns inside SendMessageData
+	uint64_t send_eagain_count = 0; // EAGAIN events inside SendMessageData
+	uint64_t send_epoll_ns = 0;     // ns spent blocked in epoll_wait
+	static constexpr bool kSubSendDiag = true;
 
 	while (!stop_threads_) {
 		// Get message data to send
@@ -1458,13 +1468,24 @@ void NetworkManager::SubscribeNetworkThread(
 			// Send message data
 		}
 
-		// Send message data
+		// Send message data — time it to diagnose cross-machine slowness
+		const int64_t send_t0 = kSubSendDiag
+			? std::chrono::duration_cast<std::chrono::nanoseconds>(
+				  std::chrono::steady_clock::now().time_since_epoch()).count()
+			: 0;
 		if (!SendMessageData(sock, efd, msg, messages_size, zero_copy_send_limit, zero_copy_send_limit_cached)) {
 			LOG(WARNING) << "SubscribeNetworkThread [B" << broker_id_ << "]: SendMessageData failed, "
 			             << "messages_size=" << messages_size << ", connection_id=" << connection_id
 			             << ". Breaking loop (connection will close).";
 			payload_send_failures++;
 			break;  // Connection error - state not advanced, so reconnect can retry from same position
+		}
+		if (kSubSendDiag) {
+			const int64_t send_t1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+			send_total_ns  += static_cast<uint64_t>(send_t1 - send_t0);
+			send_eagain_count = tl_send_eagain_count;
+			send_epoll_ns     = tl_send_epoll_ns;
 		}
 
 		if (corfu_latency_diag && order == 2 &&
@@ -1478,6 +1499,26 @@ void NetworkManager::SubscribeNetworkThread(
 		}
 	}
 
+	// Always log send-path diagnostics so we can diagnose cross-machine slowness without
+	// recompiling. Single-node baseline vs cross-machine can be compared directly.
+	if (export_batches > 0) {
+		const double avg_send_us = (send_total_ns / export_batches) / 1e3;
+		const double throughput_mbs = export_bytes > 0 && send_total_ns > 0
+			? static_cast<double>(export_bytes) / (send_total_ns * 1e-9) / (1024.0 * 1024.0)
+			: 0.0;
+		const double epoll_pct = send_total_ns > 0
+			? 100.0 * send_epoll_ns / send_total_ns : 0.0;
+		LOG(INFO) << "SubscribeNetworkThread send-diag [B" << broker_id_ << " conn=" << connection_id
+		          << " order=" << order << "]: batches=" << export_batches
+		          << " bytes=" << export_bytes
+		          << " avg_send_us=" << std::fixed << std::setprecision(1) << avg_send_us
+		          << " send_eagain=" << send_eagain_count
+		          << " epoll_pct=" << std::setprecision(1) << epoll_pct
+		          << " throughput_mbs=" << std::setprecision(0) << throughput_mbs
+		          << " no_data_loops=" << export_no_data_loops
+		          << " meta_failures=" << metadata_send_failures
+		          << " payload_failures=" << payload_send_failures;
+	}
 	if (corfu_latency_diag) {
 		LOG(INFO) << "SubscribeNetworkThread summary [B" << broker_id_ << " conn=" << connection_id
 		          << " order=" << order << "]: batches=" << export_batches
@@ -1508,7 +1549,7 @@ bool NetworkManager::SendMessageData(
 			// [[PERF_FIX]] Remove MSG_ZEROCOPY to avoid ENOBUFS caused by undrained error queue
 			// MSG_ZEROCOPY requires draining MSG_ERRQUEUE which wasn't implemented,
 			// causing non-deterministic throughput collapse when queue fills up.
-			int send_flags = 0;
+			int send_flags = MSG_NOSIGNAL; // prevents SIGPIPE when subscriber closes mid-send (would kill broker process)
 			int ret = send(sock_fd, (uint8_t*)buffer + sent_bytes, to_send, send_flags);
 
 			if (ret > 0) {
@@ -1516,6 +1557,7 @@ bool NetworkManager::SendMessageData(
 				send_limit = zero_copy_send_limit_cached;
 			} else if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
 				send_limit = std::max(send_limit / 2, 1UL << 16);
+				++tl_send_eagain_count;
 				break;  // Wait for epoll
 			} else if (ret < 0) {
 				LOG(ERROR) << "SendMessageData: send() failed: " << strerror(errno)
@@ -1528,7 +1570,12 @@ bool NetworkManager::SendMessageData(
 			break;
 		}
 		struct epoll_event events[10];
+		const int64_t epoll_t0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
 		int n = epoll_wait(epoll_fd, events, 10, -1);
+		tl_send_epoll_ns += static_cast<uint64_t>(
+			std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count() - epoll_t0);
 		if (n == -1) {
 			LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
 			return false;

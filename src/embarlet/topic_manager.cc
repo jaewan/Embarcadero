@@ -464,7 +464,14 @@ bool TopicManager::CreateNewTopic(
 	if (tinode) {
 		return true;
 	} else {
-		LOG(ERROR) << "Topic already exists!";
+		// If topic is already in the map a second client is connecting to an existing topic;
+		// treat as success (idempotent create) so multi-client benchmarks work.
+		absl::ReaderMutexLock lock(&topics_mutex_);
+		if (topics_.find(topic) != topics_.end()) {
+			LOG(INFO) << "Topic already exists, returning success for concurrent client: " << topic;
+			return true;
+		}
+		LOG(ERROR) << "Topic creation failed for: " << topic;
 		return false;
 	}
 }

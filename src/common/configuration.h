@@ -83,7 +83,7 @@ struct EmbarcaderoConfig {
     struct Network {
         ConfigValue<int> io_threads{8, "EMBARCADERO_NETWORK_IO_THREADS"};
         ConfigValue<int> disk_io_threads{4, "EMBARCADERO_DISK_IO_THREADS"};
-        ConfigValue<int> sub_connections{3, "EMBARCADERO_SUB_CONNECTIONS"};
+        ConfigValue<int> sub_connections{1, "EMBARCADERO_SUB_CONNECTIONS"};
         ConfigValue<size_t> zero_copy_send_limit{1UL << 23, "EMBARCADERO_ZERO_COPY_LIMIT"};
 
         // PBR (batch header ring) backpressure: stop reading from TCP when utilization above high, resume when below low.
