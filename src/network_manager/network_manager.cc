@@ -913,13 +913,16 @@ void NetworkManager::HandlePublishRequest(
 
 		// [[DESIGN: PBR reserve after receive]] For EMBARCADERO, GetCXLBuffer only allocates BLog (buf);
 		// batch_header_location is intentionally null here and is set later by ReservePBRSlotAfterRecv.
+		// EMBARCADERO: nullptr here is normal (PBR slot filled after recv via ReservePBRSlotAfterRecv).
+		// CORFU ORDER=2 / Order3-style paths: nullptr by design; completion runs via non_emb_seq_callback below.
 		if (batch_header_location == nullptr) {
-			if (seq_type != EMBARCADERO) {
+			if (seq_type != EMBARCADERO && seq_type != CORFU) {
 				static std::atomic<size_t> batch_header_location_null_count{0};
 				size_t cnt = batch_header_location_null_count.fetch_add(1, std::memory_order_relaxed) + 1;
 				LOG(ERROR) << "NetworkManager: GetCXLBuffer returned null batch_header_location (count=" << cnt
 				           << ") topic=" << handshake.topic << " seq_type=" << static_cast<int>(seq_type)
-				           << " batch_seq=" << batch_header.batch_seq << " — batch will not be sequenced or acked";
+				           << " batch_seq=" << batch_header.batch_seq
+				           << " — unexpected for this sequencer; batch may not be sequenced or acked";
 			}
 		} else {
 			// batch_header_location is set
@@ -1166,10 +1169,9 @@ void NetworkManager::HandlePublishRequest(
 #endif
 			}
 			
+				// CORFU: Topic::CorfuGetCXLBuffer callback runs replication (if any) then
+				// RecordCorfuOrder2BatchCompletion, which advances tinode->offsets[broker].ordered for ACK1.
 				non_emb_seq_callback((void*)header, logical_offset - 1);
-				if (seq_type == CORFU) {
-					// Replication ack not implemented
-				}
 			}
 		}
 
@@ -1798,6 +1800,10 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 			// [[ACK_LEVEL_2_COUNT_SEMANTICS]] - Client expects cumulative message COUNT.
 			return completed_logical_offset;
 		}
+
+		// CORFU + ACK2: falls through here — frontier is min(replication_done)+1 (last logical offset
+		// across the replication set). ACK1 uses tinode->offsets[].ordered (cumulative message count after
+		// contiguous export). Ensure client/server agree on units if both ACK levels are used with RF>0.
 
 		// Legacy non-ORDER5 replication frontier path.
 		for (int i = 0; i < replication_factor; i++) {
