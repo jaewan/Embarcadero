@@ -179,7 +179,20 @@ from 3 to 1 in `src/common/configuration.h`.
 ## Next Steps
 
 1. **Multi-client run** (c4 + c3, NUM_CLIENTS=2): verify aggregate ~12 GB/s hypothesis. ✓ Done: 11.4–12.5 GB/s.
-2. **Multi-subscriber e2e**: c4 pub + c3 sub + c2 sub to test fanout bandwidth.
-3. **NIC RSS / interrupt affinity** on moscxl: investigate if RSS spreading helps broker receive.
-4. **Producer optimization** (lower priority): multi-threaded producer in `PublishThroughputTest`
+2. **2-pub + 1-sub** (c4 + moscxl NUMA 0 → c3): saturate the broker NIC from two concurrent publishers.
+   Script: `scripts/run_2pub_1sub.sh` (ORDER=0 and ORDER=5).
+   ✓ Done (2026-03-26): push-ready file barrier aligns publishers to within ~2 ms (NTP skew).
+   Results (ORDER=0, 3 trials):
+   | Trial | C4 (MB/s) | Local (MB/s) | Overlap | Concurrent Agg | c3 Wire BW |
+   |-------|-----------|--------------|---------|----------------|------------|
+   | 1     | 6,326     | 11,134       | 460 ms  | 17,460 MB/s    | 6.49 GB/s  |
+   | 2     | 7,045     | 11,924       | 430 ms  | 18,969 MB/s    | 6.51 GB/s  |
+   | 3     | 7,163     | 12,031       | 430 ms  | 19,194 MB/s    | 6.11 GB/s  |
+   Note: local publisher (moscxl NUMA 0 → 10.10.10.10) achieves ~11–12 GB/s single-core
+   because AMD EPYC 9754 single-core streaming BW is ~2× Intel SPR (c4 achieves ~6.3–7.2 GB/s).
+   Broker CXL ingestion: ~17–19 GB/s aggregate (well above single-client 12–13 GB/s loopback).
+   c3 wire BW (~6.1–6.5 GB/s) reflects one publisher's topic stream on a single 100GbE link.
+3. **Multi-subscriber e2e**: c4 pub + c3 sub + c2 sub to test fanout bandwidth.
+4. **NIC RSS / interrupt affinity** on moscxl: investigate if RSS spreading helps broker receive.
+5. **Producer optimization** (lower priority): multi-threaded producer in `PublishThroughputTest`
    or batched `Publish()` to increase per-client rate.
