@@ -66,9 +66,14 @@ fi
 
 # --- Failure test parameters ---
 FAILURE_PERCENTAGE=${FAILURE_PERCENTAGE:-0.5}
-# Wall-clock kill when >0 (client uses EMBARCADERO_FAILURE_AFTER_MS; byte fraction ignored). Use 0 for legacy %-of-data trigger.
-FAILURE_AFTER_MS=${FAILURE_AFTER_MS:-1500}
-export EMBARCADERO_FAILURE_AFTER_MS="$FAILURE_AFTER_MS"
+# Wall-clock kill when >0 (publisher uses EMBARCADERO_FAILURE_AFTER_MS; sent-byte threshold ignored for kill timing).
+# Set FAILURE_AFTER_MS=0 to use FAILURE_PERCENTAGE only (legacy).
+FAILURE_AFTER_MS=${FAILURE_AFTER_MS:-1000}
+if [ "${FAILURE_AFTER_MS}" -gt 0 ] 2>/dev/null; then
+  export EMBARCADERO_FAILURE_AFTER_MS="$FAILURE_AFTER_MS"
+else
+  unset EMBARCADERO_FAILURE_AFTER_MS
+fi
 # Use the same queue sizing / no artificial in-flight cap as the normal throughput benchmark
 # so pre/post-failure behavior is apples-to-apples by default.
 FAILURE_MATCH_THROUGHPUT=${FAILURE_MATCH_THROUGHPUT:-1}
@@ -290,7 +295,11 @@ for test_case in "${test_cases[@]}"; do
   for ((trial=1; trial<=NUM_TRIALS; trial++)); do
     echo ""
     echo "================================================================="
-    echo "=== Failure trial $trial / $NUM_TRIALS (test_case=$test_case, kill $NUM_BROKERS_TO_KILL broker(s) at ${FAILURE_PERCENTAGE} of data) ==="
+    if [ "${FAILURE_AFTER_MS}" -gt 0 ] 2>/dev/null; then
+      echo "=== Failure trial $trial / $NUM_TRIALS (test_case=$test_case, kill $NUM_BROKERS_TO_KILL after ${FAILURE_AFTER_MS} ms) ==="
+    else
+      echo "=== Failure trial $trial / $NUM_TRIALS (test_case=$test_case, kill $NUM_BROKERS_TO_KILL at ${FAILURE_PERCENTAGE} of data) ==="
+    fi
     echo "================================================================="
 
     pids=()
