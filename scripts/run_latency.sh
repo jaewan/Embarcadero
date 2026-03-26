@@ -127,8 +127,15 @@ start_local_brokers() {
 
   cleanup
 
+  # For remote scenario the broker must bind to the external NIC so the remote client
+  # can reach it.  EMBARCADERO_HEAD_ADDR overrides the default 127.0.0.1 listen address.
+  local broker_env=""
+  if [[ "$SCENARIO" == "remote" ]]; then
+    broker_env="EMBARCADERO_HEAD_ADDR=$BROKER_LISTEN_ADDR"
+  fi
+
   echo "Starting head broker (order=$order sequencer=$seq)..."
-  $EMBARLET_NUMA_BIND "$BIN_DIR/embarlet" \
+  env $broker_env $EMBARLET_NUMA_BIND "$BIN_DIR/embarlet" \
     --config "$BROKER_CONFIG_ABS" \
     --head \
     --"$seq" \
@@ -136,7 +143,7 @@ start_local_brokers() {
 
   for ((i=1; i<NUM_BROKERS; i++)); do
     echo "Starting broker $i..."
-    $EMBARLET_NUMA_BIND "$BIN_DIR/embarlet" \
+    env $broker_env $EMBARLET_NUMA_BIND "$BIN_DIR/embarlet" \
       --config "$BROKER_CONFIG_ABS" \
       > "$BIN_DIR/broker_${i}.log" 2>&1 &
   done
@@ -192,6 +199,10 @@ run_trial() {
 
   # Clean up any leftover CSV files from a previous run
   (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv)
+  if [[ "$SCENARIO" == "remote" ]]; then
+    ssh -o StrictHostKeyChecking=no "$REMOTE_CLIENT_HOST" \
+      "cd ${REMOTE_CLIENT_BIN_DIR} && rm -f cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv" 2>/dev/null || true
+  fi
 
   # Start brokers (local; for remote-client scenario the broker still lives here)
   if ! start_local_brokers "$order" "$seq"; then
@@ -244,12 +255,21 @@ run_trial() {
   TRIAL_DIR="$DATA_DIR/$mode/$RUN_ID/${seq}_order${order}_ack${ACK_LEVEL}_msg${MSG_SIZE}_bytes${TOTAL_MESSAGE_SIZE}_trial${trial}"
   mkdir -p "$TRIAL_DIR"
 
-  for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv; do
-    local src="$BIN_DIR/$f"
-    if [[ -f "$src" ]]; then
-      mv "$src" "$TRIAL_DIR/$f"
-    fi
-  done
+  if [[ "$SCENARIO" == "remote" ]]; then
+    # CSV files were written on the remote client; scp them back.
+    for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv; do
+      scp -o StrictHostKeyChecking=no \
+          "${REMOTE_CLIENT_HOST}:${REMOTE_CLIENT_BIN_DIR}/$f" \
+          "$TRIAL_DIR/$f" 2>/dev/null || true
+    done
+  else
+    for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv; do
+      local src="$BIN_DIR/$f"
+      if [[ -f "$src" ]]; then
+        mv "$src" "$TRIAL_DIR/$f"
+      fi
+    done
+  fi
 
   cat > "$TRIAL_DIR/run_metadata.txt" <<EOF
 run_id=$RUN_ID

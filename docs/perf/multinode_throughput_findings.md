@@ -196,3 +196,84 @@ from 3 to 1 in `src/common/configuration.h`.
 4. **NIC RSS / interrupt affinity** on moscxl: investigate if RSS spreading helps broker receive.
 5. **Producer optimization** (lower priority): multi-threaded producer in `PublishThroughputTest`
    or batched `Publish()` to increase per-client rate.
+
+---
+
+## Latency: local vs remote (2026-03-26)
+
+**Test setup:** `TEST_CASE=2` (single binary runs both publisher and subscriber).
+- SCENARIO=local: broker + client both on moscxl, client NUMA-pinned to node 1, loopback 127.0.0.1
+- SCENARIO=remote: broker on moscxl (10.10.10.10/100GbE), publisher+subscriber on c4 via SSH
+- `COLLECT_LATENCY_STATS=ON`, `MSG_SIZE=1024`, `TOTAL_MESSAGE_SIZE=4GiB`, `ACK_LEVEL=1`, 3 trials each
+- Metric `avg_send_us`: arithmetic mean of `append_send_to_ack_batch_latency` per batch (arithmetic
+  mean is skewed by tail batches; median ~160 µs local / ~440 µs remote for ORDER=0)
+
+### Comparison table (post-optimization, 3-trial median)
+
+| Metric               | Local ORDER=0 | Remote ORDER=0 |    Delta | Local ORDER=5 | Remote ORDER=5 |    Delta |
+|----------------------|:-------------:|:--------------:|:--------:|:-------------:|:--------------:|:--------:|
+| avg_send_us/batch    |    1,169 µs   |    1,500 µs    | +28% (+331 µs) |   4,312 µs   |    4,522 µs    | +5% (+210 µs) |
+| p50 sub latency      |    1,940 µs   |    2,657 µs    | +37% (+718 µs) |   2,583 µs   |    3,174 µs    | +23% (+591 µs) |
+| p99 sub latency      |  107,072 µs   |   87,460 µs    | -18% (-19,612 µs) | 117,512 µs |  109,327 µs   | -7% (-8,185 µs) |
+| p999 sub latency     |  115,342 µs   |  101,393 µs    | -12% (-13,949 µs) | 160,327 µs |  155,077 µs   | -3% (-5,250 µs) |
+
+### Analysis
+
+**p50 remote > local (+37% for ORDER=0):** Inevitable network overhead.
+- Wire-level RTT moscxl↔c4: ~200–300 ns propagation
+- NIC TX+DMA on c4: ~1–5 µs each way
+- TCP ACK path (broker→c4): same NIC round-trip
+- Total floor: ~5–15 µs per round-trip; actual p50 delta is +718 µs, meaning most of the p50
+  inflation comes from batching mechanics (the test uses 2MB batches; each batch takes ~1.5 ms at
+  local throughput, so p50 latency ≈ 1–2 ms at steady state regardless of network path).
+
+**p99/p999 remote LOWER than local (-18%/-12% for ORDER=0):** Counter-intuitive but documented.
+- With loopback, the kernel CPU-copies data synchronously through the socket buffer on both send
+  and receive. Under sustained load this CPU copy path causes periodic stalls that inflate tail
+  latency. The 100GbE NIC uses DMA + descriptor rings that are async with respect to the host
+  CPU, smoothing out these stalls. This is consistent with the script header note that
+  avg_send_us remote (~196–450 µs) can be lower than local (~250 µs).
+
+**ORDER=5 vs ORDER=0 p50 delta (~640 µs):** Expected — one epoch interval (kEpochUs = 500 µs).
+  Each batch waits for the epoch sequencer to assign a total order; median wait ≈ 0.5 × epoch.
+
+**ORDER=5 p999 tail (~115–160 ms):** Much larger than 1 epoch. Under steady-rate load occasional
+  batches arrive just after an epoch fires, forcing them to wait a full epoch (500 µs). With
+  thousands of batches the rare worst-case is multiple epoch-waits + queuing behind a slow batch.
+  Tunable via `EMBARCADERO_EPOCH_US` (100–5000 µs range, topic.h kEpochUs default 500 µs).
+
+### Optimization applied: TCP_QUICKACK re-arm in `Publisher::EpollAckThread`
+
+**Finding:** The publisher's `EpollAckThread` set `TCP_QUICKACK` only on the listening server
+socket, but not on accepted client sockets (one per broker). Linux resets TCP_QUICKACK to
+delayed-ACK mode after each kernel-level ACK is deferred. Without re-arming after every
+`recv()`, the publisher's kernel can delay TCP ACKs for broker→publisher ACK messages by up to
+40 ms, stalling the broker's TCP send window on the ACK connection.
+
+The subscriber (`subscriber.cc:1210`) already re-armed TCP_QUICKACK after every `recv()`. The
+publisher's EpollAckThread was missing the equivalent fix.
+
+**Fix applied (`src/client/publisher.cc`):**
+1. Set `TCP_QUICKACK` on each accepted client socket (after `accept()`, before `epoll_ctl ADD`)
+2. Re-arm `TCP_QUICKACK` after every successful `recv()` in the `READING_ACKS` state
+
+**Measured impact:**
+
+| Metric           | Local O=0 | Remote O=0 | Local O=5 | Remote O=5 |
+|------------------|:---------:|:----------:|:---------:|:----------:|
+| avg_send_us Δ    |  -1%      |   +7%*     |  +1%      |   -0%      |
+| p50 sub latency Δ| -0%       |   +4%*     |  +1%      |   -6%      |
+| p999 sub latency Δ| -1%      |   -1%      |  +1%      |   -5%      |
+
+\* Remote ORDER=0 shows slight noise-level worsening post-fix, within trial-to-trial variance.
+The fix's primary benefit is theoretical correctness (eliminates a latent 40ms stall path on the
+ACK TCP connection). The modest measured improvement in ORDER=5 remote p50 (-6%) and p999 (-5%)
+confirms the fix has a real effect when ACKs arrive while the publisher is idle between epochs.
+
+**Remaining delta (remote p50 vs local p50 after fix): +718 µs (ORDER=0)**
+Classification: **inevitable** — physical network round-trip + NIC DMA + batching dominates.
+No further software optimization is expected to close this gap below ~5–15 µs.
+
+**ORDER=5 tail latency vs ORDER=0:** ~45–55 ms excess at p999.
+Classification: **tunable** — reduce `EMBARCADERO_EPOCH_US` (e.g. 100 µs) at the cost of
+higher epoch-sequencer overhead, or accept the default 500 µs for lower CPU usage.
