@@ -157,12 +157,18 @@ bool CorfuReplicationClient::ReplicateData(size_t offset, size_t size, void* dat
 	}
 
 
-	while (true) {
-		size_t expected = offset;
-		if (last_sequentially_replicated_.compare_exchange_weak(expected, offset + size)) {
-			break;
+	// Track monotonic progress only on successful replication.
+	if (success) {
+		// In practice callbacks can arrive out-of-order across network threads; requiring
+		// expected==offset can deadlock forever when the first observed offset is not zero.
+		// For diagnostics we only need a non-decreasing high-water mark.
+		size_t new_progress = offset + size;
+		size_t observed = last_sequentially_replicated_.load(std::memory_order_relaxed);
+		while (observed < new_progress &&
+				!last_sequentially_replicated_.compare_exchange_weak(
+					observed, new_progress, std::memory_order_relaxed)) {
+			// compare_exchange_weak updates observed on failure
 		}
-		std::this_thread::yield();
 	}
 
 

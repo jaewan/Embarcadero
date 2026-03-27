@@ -90,7 +90,7 @@ private:
     void MainThread();
     void ReqReceiveThread();
     /** @param topic_cstr Topic name (converted to std::string internally for thread safety). */
-    void AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd);
+    void AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd, uint32_t client_id);
     size_t GetOffsetToAck(const char* topic, uint32_t ack_level);
     std::pair<size_t, bool> GetOffsetToAckFast(const char* topic, uint32_t ack_level, size_t last_known_ack);
 	void SubscribeNetworkThread(int sock, int efd, const char* topic, int connection_id);

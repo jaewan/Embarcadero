@@ -768,7 +768,7 @@ void NetworkManager::HandlePublishRequest(
 			LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
 			          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id;
 			// Pass local_ack_efd to thread so it uses the correct epoll instance
-			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd);
+			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd, handshake.client_id);
 		}
 		}
 	}
@@ -913,13 +913,16 @@ void NetworkManager::HandlePublishRequest(
 
 		// [[DESIGN: PBR reserve after receive]] For EMBARCADERO, GetCXLBuffer only allocates BLog (buf);
 		// batch_header_location is intentionally null here and is set later by ReservePBRSlotAfterRecv.
+		// EMBARCADERO: nullptr here is normal (PBR slot filled after recv via ReservePBRSlotAfterRecv).
+		// CORFU ORDER=2 / Order3-style paths: nullptr by design; completion runs via non_emb_seq_callback below.
 		if (batch_header_location == nullptr) {
-			if (seq_type != EMBARCADERO) {
+			if (seq_type != EMBARCADERO && seq_type != CORFU) {
 				static std::atomic<size_t> batch_header_location_null_count{0};
 				size_t cnt = batch_header_location_null_count.fetch_add(1, std::memory_order_relaxed) + 1;
 				LOG(ERROR) << "NetworkManager: GetCXLBuffer returned null batch_header_location (count=" << cnt
 				           << ") topic=" << handshake.topic << " seq_type=" << static_cast<int>(seq_type)
-				           << " batch_seq=" << batch_header.batch_seq << " — batch will not be sequenced or acked";
+				           << " batch_seq=" << batch_header.batch_seq
+				           << " — unexpected for this sequencer; batch may not be sequenced or acked";
 			}
 		} else {
 			// batch_header_location is set
@@ -1166,10 +1169,9 @@ void NetworkManager::HandlePublishRequest(
 #endif
 			}
 			
+				// CORFU: Topic::CorfuGetCXLBuffer callback runs replication (if any) then
+				// RecordCorfuOrder2BatchCompletion, which advances tinode->offsets[broker].ordered for ACK1.
 				non_emb_seq_callback((void*)header, logical_offset - 1);
-				if (seq_type == CORFU) {
-					// Replication ack not implemented
-				}
 			}
 		}
 
@@ -1799,6 +1801,10 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 			return completed_logical_offset;
 		}
 
+		// CORFU + ACK2: falls through here — frontier is min(replication_done)+1 (last logical offset
+		// across the replication set). ACK1 uses tinode->offsets[].ordered (cumulative message count after
+		// contiguous export). Ensure client/server agree on units if both ACK levels are used with RF>0.
+
 		// Legacy non-ORDER5 replication frontier path.
 		for (int i = 0; i < replication_factor; i++) {
 			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
@@ -1884,7 +1890,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	}
 }
 
-void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd) {
+void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd, uint32_t client_id) {
 	struct epoll_event events[10];
 	char buf[1];
 
@@ -1892,7 +1898,8 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	std::string topic(topic_cstr ? topic_cstr : "");
 
 	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic='" << topic
-	          << "' (len=" << topic.size() << "), ack_level=" << ack_level;
+	          << "' (len=" << topic.size() << "), ack_level=" << ack_level
+	          << ", client_id=" << client_id;
 
 	// [[CRITICAL: Validate topic is not empty]]
 	// If topic is empty, GetOffsetToAck will use wrong TInode → wrong ACKs → client timeout
@@ -2043,6 +2050,11 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		trace_topic = cxl_manager_->GetTopicPtr(topic.c_str());
 	}
 
+	// ACK frontier source architecture:
+	// - ACK1: per-client ordered frontier when topic supports it.
+	// - ACK2: per-client durable frontier when topic supports explicit durability attribution;
+	//         otherwise legacy durability frontier (GetOffsetToAck*).
+	// This prevents semantic drift between "ordered" and "durable" ACK meanings.
 	consecutive_timeouts = 0;
 	consecutive_errors = 0;
 	size_t consecutive_ack_stalls = 0;
@@ -2061,9 +2073,23 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		// Phase 2: Expensive check only if fast read suggests a change
 		bool found_ack = false;
 		size_t current_ack = (size_t)-1;
+		Topic* ack_topic = topic_manager_ ? topic_manager_->GetTopic(topic) : nullptr;
+		const bool use_per_client_ack_level1 =
+			(ack_level == 1 && ack_topic != nullptr && ack_topic->SupportsPerClientAckLevel1());
+		const bool use_per_client_ack_level2_durable =
+			(ack_level == 2 && ack_topic != nullptr && ack_topic->SupportsPerClientAckLevel2Durable());
 
 			// Fast-path: Read without flush/fence to detect potential changes.
 			// Safe for ACK2 because durability frontiers are monotonic; stale reads can only delay ACKs.
+			if (use_per_client_ack_level1) {
+				current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
+				expensive_checks_since_last_ack++;
+				fast_polls_without_full_check = 0;
+			} else if (use_per_client_ack_level2_durable) {
+				current_ack = static_cast<size_t>(ack_topic->GetClientDurable(client_id));
+				expensive_checks_since_last_ack++;
+				fast_polls_without_full_check = 0;
+			} else {
 			auto [fast_read_value, needs_expensive_check] = GetOffsetToAckFast(topic.c_str(), ack_level, last_known_ack);
 			const bool force_full_check = (fast_polls_without_full_check >= kMaxFastPollsBeforeFullCheck);
 			if (needs_expensive_check || force_full_check) {
@@ -2079,6 +2105,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 				current_ack = fast_read_value;
 				fast_checks_since_last_send++;
 				fast_polls_without_full_check++;
+			}
 			}
 
 		if (current_ack != (size_t)-1 && next_to_ack_offset <= current_ack) {

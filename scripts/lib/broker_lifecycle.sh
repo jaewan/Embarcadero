@@ -77,6 +77,56 @@ broker_remote_host_is_local() {
   return 1
 }
 
+# Corfu gRPC sequencer on a cluster node (may differ from REMOTE_BROKER_HOST, e.g. c2 vs c3).
+broker_remote_corfu_sequencer_host() {
+  if [ -n "${REMOTE_CORFU_SEQUENCER_HOST:-}" ]; then
+    printf '%s\n' "${REMOTE_CORFU_SEQUENCER_HOST}"
+  elif broker_is_remote_mode; then
+    printf '%s\n' "${REMOTE_BROKER_HOST}"
+  else
+    printf '%s\n' ""
+  fi
+}
+
+broker_remote_corfu_start() {
+  local host
+  host="$(broker_remote_corfu_sequencer_host)"
+  [ -n "$host" ] || return 0
+  local bin="${REMOTE_CORFU_BUILD_BIN:-$REMOTE_BUILD_BIN}"
+  [ -n "$bin" ] || return 1
+  echo "Remote Corfu sequencer: starting on $host (cd $bin)"
+  ssh -o BatchMode=yes "$host" bash -s -- "$bin" <<'EOF'
+set -euo pipefail
+build_bin=$1
+cd "$build_bin"
+for pid in $(pgrep -f "corfu_global_sequencer" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+sleep 0.3
+for pid in $(pgrep -f "corfu_global_sequencer" 2>/dev/null || true); do
+  kill -9 "$pid" 2>/dev/null || true
+done
+nohup ./corfu_global_sequencer >>/tmp/corfu_sequencer.log 2>&1 &
+printf '%s\n' "$!" >/tmp/corfu_global_sequencer.pid
+EOF
+}
+
+broker_remote_corfu_stop() {
+  local host
+  host="$(broker_remote_corfu_sequencer_host)"
+  [ -n "$host" ] || return 0
+  ssh -o BatchMode=yes "$host" bash -s -- <<'EOF'
+for pid in $(pgrep -f "corfu_global_sequencer" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+sleep 0.2
+for pid in $(pgrep -f "corfu_global_sequencer" 2>/dev/null || true); do
+  kill -9 "$pid" 2>/dev/null || true
+done
+rm -f /tmp/corfu_global_sequencer.pid
+EOF
+}
+
 broker_ready_file_count_local() {
   local ready_files=(/tmp/embarlet_*_ready)
   if [ -e "${ready_files[0]}" ]; then
@@ -213,6 +263,11 @@ broker_local_cleanup() {
 broker_cleanup() {
   if broker_is_remote_mode; then
     broker_remote_cleanup
+    # If Corfu runs on a dedicated host (REMOTE_CORFU_SEQUENCER_HOST), kill it there; if
+    # collocated with brokers, broker_remote_cleanup already killed it on REMOTE_BROKER_HOST.
+    if [ -n "${REMOTE_CORFU_SEQUENCER_HOST:-}" ]; then
+      broker_remote_corfu_stop || true
+    fi
   else
     broker_local_cleanup
   fi
@@ -236,7 +291,8 @@ broker_remote_launch() {
     "$poll_interval" \
     "${EMBARCADERO_ACK_SEND_MIN_INTERVAL_US:-}" \
     "${EMBARCADERO_ORDER0_FAST_PATH:-}" \
-    "${EMBARCADERO_ACK_STALL_SLEEP_US:-}" <<'EOF'
+    "${EMBARCADERO_ACK_STALL_SLEEP_US:-}" \
+    "${EMBARCADERO_CORFU_SEQ_IP:-}" <<'EOF'
 set -euo pipefail
 state_dir=$1
 build_bin=$2
@@ -249,9 +305,10 @@ poll_interval=$8
 ack_send_min_interval_us=${9-}
 order0_fast_path=${10-}
 ack_stall_sleep_us=${11-}
+corfu_seq_ip=${12-}
 mkdir -p "$state_dir"
 rm -f "$state_dir/broker_${idx}.pid" "$state_dir/broker_${idx}.ready" "$state_dir/broker_${idx}.log"
-nohup bash -s -- "$state_dir" "$build_bin" "$config" "$head_addr" "$idx" "$role" "$sequence" "$poll_interval" "$ack_send_min_interval_us" "$order0_fast_path" "$ack_stall_sleep_us" <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
+nohup bash -s -- "$state_dir" "$build_bin" "$config" "$head_addr" "$idx" "$role" "$sequence" "$poll_interval" "$ack_send_min_interval_us" "$order0_fast_path" "$ack_stall_sleep_us" "$corfu_seq_ip" <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
 set -euo pipefail
 state_dir=$1
 build_bin=$2
@@ -264,6 +321,7 @@ poll_interval=$8
 ack_send_min_interval_us=${9-}
 order0_fast_path=${10-}
 ack_stall_sleep_us=${11-}
+corfu_seq_ip=${12-}
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
@@ -274,6 +332,7 @@ if [ -n "$ack_send_min_interval_us" ]; then
 fi
 if [ -n "$order0_fast_path" ]; then export EMBARCADERO_ORDER0_FAST_PATH="$order0_fast_path"; fi
 if [ -n "$ack_stall_sleep_us" ]; then export EMBARCADERO_ACK_STALL_SLEEP_US="$ack_stall_sleep_us"; fi
+if [ -n "$corfu_seq_ip" ]; then export EMBARCADERO_CORFU_SEQ_IP="$corfu_seq_ip"; fi
 log_file="$state_dir/broker_${idx}.log"
 cd "$build_bin"
 export EMBARCADERO_HEAD_ADDR="$head_addr"
@@ -282,7 +341,7 @@ if [ "$role" = "head" ]; then
   cmd+=(--head)
 fi
 cmd+=(--"$sequence")
-if command -v numactl >/dev/null 2>&1 && numactl --hardware 2>/dev/null | grep -q 'node 1'; then
+if [ "$sequence" != "CORFU" ] && command -v numactl >/dev/null 2>&1 && numactl --hardware 2>/dev/null | grep -q 'node 1'; then
   if numactl --hardware 2>/dev/null | grep -q 'node 2'; then
     cmd=(numactl --cpunodebind=1 --membind=1,2 "${cmd[@]}")
   else
@@ -404,6 +463,14 @@ broker_ensure_cluster() {
     if [ "$force_restart" = "1" ]; then
       echo "Force-restarting remote brokers on $REMOTE_BROKER_HOST"
   broker_remote_cleanup
+    fi
+
+    if [[ "$sequence" == "CORFU" ]]; then
+      if ! broker_remote_corfu_start; then
+        echo "ERROR: failed to start Corfu sequencer on $(broker_remote_corfu_sequencer_host)" >&2
+        return 1
+      fi
+      sleep 1
     fi
 
     local healthy=0
