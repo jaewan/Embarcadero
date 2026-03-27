@@ -388,6 +388,7 @@ struct ValidationEntry {
     uint64_t batch_id = 0;
     uint64_t client_id = 0;
     uint64_t client_seq = 0;
+    uint16_t broker_id = 0;
     bool is_level5 = false;
 };
 
@@ -397,6 +398,7 @@ struct ValidationSlot {
     uint64_t batch_id = 0;
     uint64_t client_id = 0;
     uint64_t client_seq = 0;
+    uint16_t broker_id = 0;
     bool is_level5 = false;
     std::atomic<bool> ready{false};
 };
@@ -418,7 +420,8 @@ public:
     /** Lock-free: multiple producers. Call only before drain() (i.e. while writers run).
      * Step 2: Removed spin loop - just check for overwrite and proceed.
      * Ensures sequencer never stalls on validation. */
-    void record(uint64_t global_seq, uint64_t batch_id, uint64_t client_id, uint64_t client_seq, bool is_level5) noexcept {
+    void record(uint64_t global_seq, uint64_t batch_id, uint64_t client_id, uint64_t client_seq,
+                uint16_t broker_id, bool is_level5) noexcept {
         uint64_t idx = write_pos_.fetch_add(1, std::memory_order_relaxed);
         ValidationSlot& e = slots_[idx & mask()];
         
@@ -432,6 +435,7 @@ public:
         e.batch_id = batch_id;
         e.client_id = client_id;
         e.client_seq = client_seq;
+        e.broker_id = broker_id;
         e.is_level5 = is_level5;
         e.ready.store(true, std::memory_order_release);
     }
@@ -454,6 +458,7 @@ public:
             copy.batch_id = e.batch_id;
             copy.client_id = e.client_id;
             copy.client_seq = e.client_seq;
+            copy.broker_id = e.broker_id;
             copy.is_level5 = e.is_level5;
             result.push_back(copy);
             e.ready.store(false, std::memory_order_release);
@@ -1363,6 +1368,11 @@ enum class SequencerMode {
     SCATTER_GATHER      // Parallel: one atomic per shard per epoch
 };
 
+enum class OrderingContract {
+    CLIENT_CHAIN,
+    CLIENT_BROKER_STREAM,
+};
+
 // ============================================================================
 // Statistics
 // ============================================================================
@@ -1501,6 +1511,11 @@ struct SequencerConfig {
 
     /// When true, allow lossy behavior under overload (stress tests only).
     bool allow_drops = false;
+
+    /// Validation contract for ORDER=5 traces.
+    /// CLIENT_CHAIN: one client-global chain across all brokers.
+    /// CLIENT_BROKER_STREAM: independent FIFO per (client, broker) stream.
+    OrderingContract ordering_contract = OrderingContract::CLIENT_CHAIN;
 
     /// Validation ring size. 0 = use config::VALIDATION_RING_SIZE. For full-trace validation set to expected_batches (e.g. throughput * duration).
     size_t validation_ring_size = 0;
@@ -3034,7 +3049,8 @@ void Sequencer::writer_loop() {
             uint64_t count = validation_batch_count_.fetch_add(1, std::memory_order_relaxed);
             bool record = config_.validate_ordering || (count & config::VALIDATION_SAMPLE_MASK) == 0;
             if (record)
-                validation_ring_.record(b.global_seq, b.batch_id, b.client_id, b.client_seq, b.is_level5());
+                validation_ring_.record(b.global_seq, b.batch_id, b.client_id, b.client_seq,
+                                        b.broker_id, b.is_level5());
         }
         if (!buf.sequenced.empty()) {
             stats_.batches_sequenced.fetch_add(buf.sequenced.size(), std::memory_order_relaxed);
@@ -3357,6 +3373,7 @@ void Sequencer::write_ready_to_goi_shard(ShardState& shard, uint64_t cycle_ns) {
             shard.validation_ring_[idx].batch_id = b.batch_id;
             shard.validation_ring_[idx].client_id = b.client_id;
             shard.validation_ring_[idx].client_seq = b.client_seq;
+            shard.validation_ring_[idx].broker_id = b.broker_id;
             shard.validation_ring_[idx].is_level5 = b.is_level5();
             ++shard.validation_write_pos_;
         }
@@ -3760,6 +3777,44 @@ bool Sequencer::validate_ordering() {
     return validate_ordering_reason().empty();
 }
 
+static std::string validate_entries_for_contract(const std::vector<ValidationEntry>& sorted,
+                                                 OrderingContract contract) {
+    std::map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> by_client;
+    std::map<std::pair<uint64_t, uint16_t>, std::vector<std::pair<uint64_t, uint64_t>>> by_stream;
+    for (const auto& e : sorted) {
+        if (!(e.is_level5 || e.batch_id == SKIP_MARKER_BATCH_ID)) {
+            continue;
+        }
+        by_client[e.client_id].emplace_back(e.global_seq, e.client_seq);
+        by_stream[{e.client_id, e.broker_id}].emplace_back(e.global_seq, e.client_seq);
+    }
+    if (contract == OrderingContract::CLIENT_CHAIN) {
+        for (auto& [cid, vec] : by_client) {
+            std::sort(vec.begin(), vec.end());
+            for (size_t i = 1; i < vec.size(); ++i) {
+                if (vec[i].second <= vec[i - 1].second) {
+                    return "per-client order violation client_id=" + std::to_string(cid)
+                        + " global_seq " + std::to_string(vec[i - 1].first) + " client_seq " + std::to_string(vec[i - 1].second)
+                        + " then global_seq " + std::to_string(vec[i].first) + " client_seq " + std::to_string(vec[i].second);
+                }
+            }
+        }
+        return "";
+    }
+    for (auto& [key, vec] : by_stream) {
+        std::sort(vec.begin(), vec.end());
+        for (size_t i = 1; i < vec.size(); ++i) {
+            if (vec[i].second <= vec[i - 1].second) {
+                return "per-stream order violation client_id=" + std::to_string(key.first)
+                    + " broker_id=" + std::to_string(key.second)
+                    + " global_seq " + std::to_string(vec[i - 1].first) + " client_seq " + std::to_string(vec[i - 1].second)
+                    + " then global_seq " + std::to_string(vec[i].first) + " client_seq " + std::to_string(vec[i].second);
+            }
+        }
+    }
+    return "";
+}
+
 /** Query: Is broker_id's PBR below low watermark? For adaptive backoff in producer. */
 bool Sequencer::below_low_watermark(uint16_t broker_id) const {
     if (broker_id >= config_.num_brokers) return true;
@@ -3813,21 +3868,9 @@ std::string Sequencer::validate_ordering_reason() {
         }
         prev_seq = e.global_seq;
     }
-    // Per-client order (Order 5): include both Order 5 batches and SKIP markers so client_seq (including SKIPs) is strictly increasing (review §significant.6).
-    std::map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> by_client;
-    for (const auto& e : sorted) {
-        if (e.is_level5 || e.batch_id == SKIP_MARKER_BATCH_ID)
-            by_client[e.client_id].emplace_back(e.global_seq, e.client_seq);
-    }
-    for (auto& [cid, vec] : by_client) {
-        std::sort(vec.begin(), vec.end());  // by global_seq
-        for (size_t i = 1; i < vec.size(); ++i) {
-            if (vec[i].second <= vec[i - 1].second) {
-                return "per-client order violation client_id=" + std::to_string(cid)
-                    + " global_seq " + std::to_string(vec[i - 1].first) + " client_seq " + std::to_string(vec[i - 1].second)
-                    + " then global_seq " + std::to_string(vec[i].first) + " client_seq " + std::to_string(vec[i].second);
-            }
-        }
+    const std::string ordering_reason = validate_entries_for_contract(sorted, config_.ordering_contract);
+    if (!ordering_reason.empty()) {
+        return ordering_reason;
     }
     // Review §critical.2: committed_seq must not exceed the max global_seq assigned (valid GOI prefix).
     uint64_t cs = control_->committed_seq.load(std::memory_order_acquire);
@@ -3950,6 +3993,7 @@ Sequencer::GapResolutionReport Sequencer::get_gap_resolution_report() const {
 
 // Forward declaration for CSV mode string (defined later in file).
 static const char* sequencer_mode_name(embarcadero::SequencerMode mode);
+static const char* ordering_contract_name(embarcadero::OrderingContract contract);
 
 namespace bench {
 
@@ -3997,6 +4041,7 @@ struct Config {
     uint64_t duration_sec = 10;
     SequencerMode mode = SequencerMode::PER_EPOCH_ATOMIC;
     bool validate = true;
+    OrderingContract ordering_contract = OrderingContract::CLIENT_CHAIN;
     bool use_radix_sort = false;  // A/B: false = std::sort (safe default)
     int num_runs = 5;             // Runs per test; if >= 2, report median [min, max]. Use 5+ for publication.
     bool stress_test = true;      // Include 100% L5 stress test
@@ -4022,6 +4067,7 @@ struct Config {
     bool run_epoch_test = true;
     bool run_broker_test = true;
     bool run_scatter_gather = true;
+    uint32_t order5_broker_home_size = 0;  // 0 = all brokers; >0 caps strong-order clients to a K-broker home set
     bool skip_dedup = false;  // If true, disable dedup for ablation (benchmark has no retries)
     bool use_fast_dedup = true;  // If false, use legacy Deduplicator (--legacy-dedup)
     bool phase_timing = false;   // If true, enable per-phase timing (Order 5 cost breakdown) without rebuild
@@ -4112,6 +4158,7 @@ public:
         sc.num_collectors = cfg_.collectors;
         sc.epoch_us = cfg_.epoch_us;
         sc.level5_enabled = cfg_.level5;
+        sc.ordering_contract = cfg_.ordering_contract;
         // C2/B1: Preserve mode (PER_BATCH vs PER_EPOCH) for atomic strategy in both single-threaded and scatter-gather.
         sc.mode = cfg_.mode;
         sc.use_radix_sort = cfg_.use_radix_sort;
@@ -4372,6 +4419,20 @@ private:
         uint64_t backlog_max = 0;
     };
 
+    uint16_t select_broker_for_batch(uint64_t batch_index, uint32_t extra_flags,
+                                     uint64_t client_id, uint64_t client_seq) const {
+        if (!(extra_flags & flags::STRONG_ORDER) || cfg_.brokers == 0) {
+            return static_cast<uint16_t>(batch_index % cfg_.brokers);
+        }
+
+        const uint32_t home_size = (cfg_.order5_broker_home_size == 0)
+            ? cfg_.brokers
+            : std::min(cfg_.brokers, cfg_.order5_broker_home_size);
+        const uint32_t home_base = static_cast<uint32_t>(hash64(client_id) % cfg_.brokers);
+        const uint32_t offset = static_cast<uint32_t>(client_seq % home_size);
+        return static_cast<uint16_t>((home_base + offset) % cfg_.brokers);
+    }
+
     struct ProducerGroup {
         std::atomic<bool> go{true};
         std::vector<std::thread> threads;
@@ -4419,7 +4480,7 @@ private:
                         cseq_val = cseqs[local_c]++;  // Design §5.3: start from 0
                     }
                     uint64_t my_batch = global_batch_counter_.fetch_add(1, std::memory_order_relaxed);
-                    uint16_t broker_id = static_cast<uint16_t>(my_batch % cfg_.brokers);
+                    uint16_t broker_id = select_broker_for_batch(my_batch, ef, cid, cseq_val);
                     uint64_t batch_id = (uint64_t(tid) << 48) | my_batch;
                     
                     // Step 1: Adaptive backpressure with exponential backoff
@@ -5577,6 +5638,8 @@ static void print_usage(const char* prog) {
               << "  --ss-backlog=N      steady-state max backlog epochs\n"
               << "  --pbr-threshold=PCT PBR_full validity threshold (percent, e.g. 0.1)\n"
               << "  --validity=MODE     validity mode: algo|max|stress (default max)\n"
+              << "  --ordering-contract=MODE  validation contract: client_chain|client_broker_stream (default client_chain)\n"
+              << "  --order5-home-brokers=N   cap strong-order clients to an N-broker home set (0 = all brokers)\n"
               << "  --target-rate=N     closed-loop: target total batches/sec (0 = open-loop)\n"
               << "  --skip-dedup        disable deduplication (valid for algorithm ablation; see config comment)\n"
               << "  --legacy-dedup      use legacy Deduplicator instead of FastDeduplicator\n"
@@ -5611,6 +5674,15 @@ static const char* sequencer_mode_name(embarcadero::SequencerMode mode) {
         case SequencerMode::SCATTER_GATHER: return "scatter_gather";
     }
     return "per_epoch";
+}
+
+static const char* ordering_contract_name(embarcadero::OrderingContract contract) {
+    using embarcadero::OrderingContract;
+    switch (contract) {
+        case OrderingContract::CLIENT_CHAIN: return "client_chain";
+        case OrderingContract::CLIENT_BROKER_STREAM: return "client_broker_stream";
+    }
+    return "client_chain";
 }
 
 /** Minimal correctness test: inject batches, run briefly, assert validate_ordering() (includes per-client). */
@@ -5706,6 +5778,27 @@ static bool run_deterministic_correctness_tests() {
     const uint32_t batch_size = 256;
     const uint32_t msgs = 4;
 
+    // (0) Contract split: same trace is invalid under true client-chain but valid under per-(client, broker) stream order.
+    {
+        std::vector<ValidationEntry> synthetic = {
+            ValidationEntry{1, 101, 7, 1, 0, true},
+            ValidationEntry{2, 102, 7, 0, 1, true},
+        };
+        std::string client_chain_reason =
+            validate_entries_for_contract(synthetic, OrderingContract::CLIENT_CHAIN);
+        if (client_chain_reason.empty()) {
+            std::cerr << "  Deterministic contract split: expected client-chain violation was not detected\n";
+            return false;
+        }
+        std::string stream_reason =
+            validate_entries_for_contract(synthetic, OrderingContract::CLIENT_BROKER_STREAM);
+        if (!stream_reason.empty()) {
+            std::cerr << "  Deterministic contract split: stream validator unexpectedly failed: "
+                      << stream_reason << "\n";
+            return false;
+        }
+    }
+
     // (1) Sort resolution: inject (client=1, seq=5) then (client=1, seq=4); must emit in client_seq order 4, 5.
     {
         SequencerConfig sc;
@@ -5757,6 +5850,110 @@ static bool run_deterministic_correctness_tests() {
         seq.stop();
         if (!seq.validate_ordering_reason().empty()) {
             std::cerr << "  Deterministic hold cascade: " << seq.validate_ordering_reason() << "\n";
+            return false;
+        }
+    }
+
+    // (3) Cross-broker client chain: inject same client across two brokers out of arrival order.
+    // True client-chain must still validate because committed order must merge one client-global sequence.
+    {
+        SequencerConfig sc;
+        sc.num_brokers = 2;
+        sc.num_collectors = 2;
+        sc.num_shards = 1;
+        sc.scatter_gather_enabled = false;
+        sc.level5_enabled = true;
+        sc.mode = SequencerMode::PER_EPOCH_ATOMIC;
+        sc.ordering_contract = OrderingContract::CLIENT_CHAIN;
+        sc.validate_ordering = true;
+        sc.validate();
+        Sequencer seq(sc);
+        if (!seq.initialize()) return false;
+        seq.start();
+        uint64_t bid = 0;
+        InjectResult r;
+        r = seq.inject_batch(1, bid++, batch_size, msgs, flags::STRONG_ORDER, 42, 1);
+        if (r != InjectResult::SUCCESS) { seq.stop(); return false; }
+        r = seq.inject_batch(0, bid++, batch_size, msgs, flags::STRONG_ORDER, 42, 0);
+        if (r != InjectResult::SUCCESS) { seq.stop(); return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        seq.stop();
+        std::string reason = seq.validate_ordering_reason();
+        if (!reason.empty()) {
+            std::cerr << "  Deterministic cross-broker client-chain: " << reason << "\n";
+            return false;
+        }
+    }
+
+    // (4) Timeout then late arrival: inject seq=1, wait past hold timeout so gap is skipped, then inject late seq=0.
+    // Validation should still pass because SKIP markers keep the client chain monotonic and late arrivals are rejected.
+    {
+        SequencerConfig sc;
+        sc.num_brokers = 1;
+        sc.num_collectors = 1;
+        sc.num_shards = 1;
+        sc.scatter_gather_enabled = false;
+        sc.level5_enabled = true;
+        sc.mode = SequencerMode::PER_EPOCH_ATOMIC;
+        sc.ordering_contract = OrderingContract::CLIENT_CHAIN;
+        sc.validate_ordering = true;
+        sc.validate();
+        Sequencer seq(sc);
+        if (!seq.initialize()) return false;
+        seq.start();
+        uint64_t bid = 0;
+        InjectResult r = seq.inject_batch(0, bid++, batch_size, msgs, flags::STRONG_ORDER, 9, 1);
+        if (r != InjectResult::SUCCESS) { seq.stop(); return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        r = seq.inject_batch(0, bid++, batch_size, msgs, flags::STRONG_ORDER, 9, 0);
+        if (r != InjectResult::SUCCESS) { seq.stop(); return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        seq.stop();
+        std::string reason = seq.validate_ordering_reason();
+        if (!reason.empty()) {
+            std::cerr << "  Deterministic timeout-late-arrival: " << reason << "\n";
+            return false;
+        }
+        if (seq.stats().gaps_skipped.load(std::memory_order_relaxed) == 0) {
+            std::cerr << "  Deterministic timeout-late-arrival: expected at least one skipped gap\n";
+            return false;
+        }
+    }
+
+    // (5) First visible fragment is far ahead: inject seq=7 first on one broker, then backfill
+    // seq=0..6 across both brokers. This guards the production bug where an unseen client could
+    // incorrectly seed next_expected from the first observed fragment instead of from seq 0.
+    {
+        SequencerConfig sc;
+        sc.num_brokers = 2;
+        sc.num_collectors = 2;
+        sc.num_shards = 1;
+        sc.scatter_gather_enabled = false;
+        sc.level5_enabled = true;
+        sc.mode = SequencerMode::PER_EPOCH_ATOMIC;
+        sc.ordering_contract = OrderingContract::CLIENT_CHAIN;
+        sc.validate_ordering = true;
+        sc.validate();
+        Sequencer seq(sc);
+        if (!seq.initialize()) return false;
+        seq.start();
+        uint64_t bid = 0;
+        InjectResult r = seq.inject_batch(1, bid++, batch_size, msgs, flags::STRONG_ORDER, 77, 7);
+        if (r != InjectResult::SUCCESS) { seq.stop(); return false; }
+        for (uint64_t cseq = 0; cseq < 7; ++cseq) {
+            const uint16_t broker = static_cast<uint16_t>(cseq % 2);
+            r = seq.inject_batch(broker, bid++, batch_size, msgs, flags::STRONG_ORDER, 77, cseq);
+            if (r != InjectResult::SUCCESS) { seq.stop(); return false; }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        seq.stop();
+        std::string reason = seq.validate_ordering_reason();
+        if (!reason.empty()) {
+            std::cerr << "  Deterministic first-visible-fragment-far-ahead: " << reason << "\n";
+            return false;
+        }
+        if (seq.stats().gaps_skipped.load(std::memory_order_relaxed) != 0) {
+            std::cerr << "  Deterministic first-visible-fragment-far-ahead: unexpected skipped gap\n";
             return false;
         }
     }
@@ -5865,6 +6062,8 @@ int main(int argc, char* argv[]) {
     bool trace_drain_only_cli = false;
     uint64_t epoch_us_cli = 0;  // 0 = use default
     uint64_t target_batches_per_sec = 0;  // B2: 0 = open-loop
+    uint32_t order5_home_brokers_cli = 0;
+    embarcadero::OrderingContract ordering_contract_cli = embarcadero::OrderingContract::CLIENT_CHAIN;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
@@ -5954,6 +6153,22 @@ int main(int argc, char* argv[]) {
         }
         if (arg.rfind("--target-rate=", 0) == 0) {
             target_batches_per_sec = static_cast<uint64_t>(std::stoull(arg.substr(std::string("--target-rate=").size())));
+        }
+        if (arg.rfind("--ordering-contract=", 0) == 0) {
+            std::string mode = arg.substr(std::string("--ordering-contract=").size());
+            if (mode == "client_chain") {
+                ordering_contract_cli = embarcadero::OrderingContract::CLIENT_CHAIN;
+            } else if (mode == "client_broker_stream") {
+                ordering_contract_cli = embarcadero::OrderingContract::CLIENT_BROKER_STREAM;
+            } else {
+                std::cerr << "Unknown ordering contract: " << mode << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        if (arg.rfind("--order5-home-brokers=", 0) == 0) {
+            order5_home_brokers_cli = static_cast<uint32_t>(
+                std::stoul(arg.substr(std::string("--order5-home-brokers=").size())));
         }
         if (arg == "--skip-dedup") {
             skip_dedup_cli = true;
@@ -6056,8 +6271,10 @@ int main(int argc, char* argv[]) {
     cfg.steady_state_max_backlog_epochs = ss_backlog;
     cfg.pbr_full_valid_threshold_pct = pbr_threshold_pct;
     cfg.validity_mode = validity_mode;
+    cfg.ordering_contract = ordering_contract_cli;
     cfg.validity_mode_explicit = validity_specified;
     cfg.target_batches_per_sec = target_batches_per_sec;
+    cfg.order5_broker_home_size = order5_home_brokers_cli;
 
     bench::set_output_csv(output_csv);
 
@@ -6103,6 +6320,8 @@ int main(int argc, char* argv[]) {
               << cfg.num_runs << " runs, "
               << (cfg.use_radix_sort ? "radix" : "std::sort")
               << ", validate=" << (cfg.validate ? "yes" : "no")
+              << ", contract=" << ordering_contract_name(cfg.ordering_contract)
+              << ", order5_home_brokers=" << cfg.order5_broker_home_size
               << ", steady_state=" << (cfg.steady_state ? "yes" : "no")
               << ", pbr_threshold=" << cfg.pbr_full_valid_threshold_pct << "%"
               << ", validity=" << validity_mode_name(cfg.validity_mode);

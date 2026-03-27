@@ -140,6 +140,8 @@ target_link_libraries(throughput_test
     cxxopts::cxxopts
     heartbeat_grpc_proto
     corfu_sequencer_grpc_proto
+    corfu_replication_grpc_proto
+    scalog_replication_grpc_proto
     grpc++_reflection
     grpc++
     protobuf::libprotobuf
@@ -293,4 +295,3 @@ target_link_libraries(config_test
 set_target_properties(config_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
-

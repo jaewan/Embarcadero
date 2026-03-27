@@ -75,10 +75,6 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "Using threads_per_broker from command line: " << num_threads_per_broker;
     }
     int order = result["order_level"].as<int>();
-    if (order == Embarcadero::kOrderLegacyStrong) {
-        LOG(ERROR) << "Order 4 is no longer supported; use Order 5 for strong ordering.";
-        return -1;
-    }
     int replication_factor = result["replication_factor"].as<int>();
     bool replicate_tinode = result.count("replicate_tinode");
     int num_clients = result["parallel_client"].as<int>();

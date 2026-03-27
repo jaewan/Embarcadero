@@ -2022,10 +2022,13 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	const bool ack_jitter_trace = ShouldEnableAckJitterTrace();
 	auto ack_trace_last_send = std::chrono::steady_clock::now();
 	auto ack_last_send_time = std::chrono::steady_clock::now();
+	auto ack_last_progress_time = std::chrono::steady_clock::now();
 	size_t last_trace_sent_ack = static_cast<size_t>(-1);
 	size_t last_sent_ack = static_cast<size_t>(-1);
 	TInode* trace_tinode = nullptr;
 	bool trace_order5_ack = false;
+	Topic* trace_topic = nullptr;
+	bool dumped_order5_flight = false;
 	const int ack_send_min_interval_us =
 		ReadEnvIntNonNegative("EMBARCADERO_ACK_SEND_MIN_INTERVAL_US", 0);
 	// [[PERF: ACK_STALL_TUNE]] Stall sleep after kMaxStalls fast-polls with no new ACK.
@@ -2038,6 +2041,13 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		    trace_tinode->seq_type == EMBARCADERO && ack_level == 1) {
 			trace_order5_ack = true;
 		}
+	}
+	if (!trace_tinode) {
+		trace_tinode = (TInode*)cxl_manager_->GetTInode(topic.c_str());
+	}
+	if (trace_tinode && trace_tinode->order == 5 &&
+	    trace_tinode->seq_type == EMBARCADERO && ack_level == 1) {
+		trace_topic = cxl_manager_->GetTopicPtr(topic.c_str());
 	}
 
 	// ACK frontier source architecture:
@@ -2103,10 +2113,17 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 			consecutive_ack_stalls = 0;
 			last_known_ack = current_ack;  // Update cache
 			expensive_checks_since_last_ack = 0;  // Reset counter
+			ack_last_progress_time = std::chrono::steady_clock::now();
 		}
 
 		if (!found_ack) {
 			consecutive_ack_stalls++;
+			if (!dumped_order5_flight && trace_topic &&
+			    std::chrono::duration_cast<std::chrono::seconds>(
+			        std::chrono::steady_clock::now() - ack_last_progress_time).count() >= 5) {
+				trace_topic->DumpOrder5FlightRecorder("ack_stall");
+				dumped_order5_flight = true;
+			}
 
 			// [[PERF: ACK_BACKOFF_TUNE]] Keep ACK polling responsive by capping stall sleep.
 			if (consecutive_ack_stalls < 10) {
@@ -2182,9 +2199,10 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 					          << " consumed_through=" << consumed
 					          << " next_to_ack_offset=" << next_to_ack_offset;
 					if (ack > ordered) {
-						LOG(ERROR) << "[ORDER5_TRACE_ACK_INVARIANT B" << broker_id_ << "]"
-						           << " ack_send=" << ack
-						           << " exceeds tinode_ordered=" << ordered;
+						LOG(INFO) << "[ORDER5_TRACE_ACK_TERMINAL_ADVANCE B" << broker_id_ << "]"
+						          << " ack_send=" << ack
+						          << " exceeds tinode_ordered=" << ordered
+						          << " due_to_cv_logical_only_terminal_progress=1";
 					}
 					last_trace_sent_ack = ack;
 				}

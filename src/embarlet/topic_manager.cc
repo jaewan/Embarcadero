@@ -284,11 +284,6 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 
 	LOG(INFO) << "CreateNewTopicInternal: topic=" << topic << " order=" << order 
 	          << " replication_factor=" << replication_factor << " ack_level=" << ack_level;
-	if (order == kOrderLegacyStrong) {
-		LOG(ERROR) << "CreateNewTopicInternal: rejecting deprecated Order 4 for topic '" << topic
-		           << "'; use Order 5 for strong ordering.";
-		return nullptr;
-	}
 	if (seq_type == CORFU && order != kOrderTotal) {
 		LOG(ERROR) << "CreateNewTopicInternal: Corfu supports only ORDER=2 (topic='"
 		           << topic << "', order=" << order << ")";
@@ -445,11 +440,6 @@ bool TopicManager::CreateNewTopic(
         int ack_level,
         heartbeat_system::SequencerType seq_type) {
 	if (shutting_down_.load(std::memory_order_acquire)) return false;
-	if (order == kOrderLegacyStrong) {
-		LOG(ERROR) << "CreateNewTopic: rejecting deprecated Order 4 for topic '" << topic
-		           << "'; use Order 5 for strong ordering.";
-		return false;
-	}
 	if (seq_type == CORFU && order != kOrderTotal) {
 		LOG(ERROR) << "CreateNewTopic: Corfu supports only ORDER=2 (topic='"
 		           << topic << "', order=" << order << ")";

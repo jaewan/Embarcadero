@@ -105,6 +105,8 @@ public:
 	 * successfully rerouted to another broker.
 	 */
 	void MarkQueueActive(size_t queue_idx);
+	void SetPreferredQueues(const std::vector<size_t>& preferred_indices);
+	void ClearPreferredQueues();
 
 	/**
 	 * Pre-touch pool memory (hugepage regions) to fault pages in and reduce measurement variance.
@@ -146,6 +148,8 @@ private:
 	std::unique_ptr<std::condition_variable[]> queue_wait_cvs_;
 	std::unique_ptr<std::atomic<uint64_t>[]> queue_epochs_;
 	std::unique_ptr<std::atomic<bool>[]> queue_active_;
+	std::unique_ptr<std::atomic<bool>[]> queue_preferred_;
+	std::atomic<size_t> preferred_queue_count_{0};
 	// Per-queue capacity; pool sized so 1 + num_queues_*kQueueCapacity slots exist.
 	// [[ROOT_CAUSE_FIX]] 256 was too small for 10GB test. 512 helped; 1024 gives more headroom when broker recv is slow (docs/NEW_BUFFER_BANDWIDTH_INVESTIGATION.md).
 	static constexpr size_t kQueueCapacity = 1024;

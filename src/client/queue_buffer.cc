@@ -65,9 +65,11 @@ QueueBuffer::QueueBuffer(size_t num_buf, size_t num_threads_per_broker, int clie
 	queue_wait_cvs_ = std::make_unique<std::condition_variable[]>(num_queues_);
 	queue_epochs_ = std::make_unique<std::atomic<uint64_t>[]>(num_queues_);
 	queue_active_ = std::make_unique<std::atomic<bool>[]>(num_queues_);
+	queue_preferred_ = std::make_unique<std::atomic<bool>[]>(num_queues_);
 	for (size_t i = 0; i < num_queues_; ++i) {
 		queue_epochs_[i].store(0, std::memory_order_relaxed);
 		queue_active_[i].store(true, std::memory_order_relaxed);
+		queue_preferred_[i].store(false, std::memory_order_relaxed);
 	}
 }
 
@@ -238,6 +240,7 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 	// Avoids blocking entire producer on one slow consumer. If all queues full, block on original queue.
 	const size_t n = active_queues_;
 	if (n == 0) return 0;
+	const bool use_preferred = preferred_queue_count_.load(std::memory_order_relaxed) > 0;
 
 	auto queue_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kQueueFullTimeoutMs);
 	bool logged = false;
@@ -249,6 +252,9 @@ retry_push:
 	for (size_t i = 0; i < n; i++) {
 		size_t idx = (start_id + i) % n;
 		if (!queue_active_[idx].load(std::memory_order_relaxed)) {
+			continue;
+		}
+		if (use_preferred && !queue_preferred_[idx].load(std::memory_order_relaxed)) {
 			continue;
 		}
 		folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>* q = queues_[idx].get();
@@ -263,11 +269,15 @@ retry_push:
 		// All active queues full: keep polling all active queues instead of blocking on just one.
 		// This prevents head-of-line blocking if one queue's consumer is dead but hasn't timed out yet.
 		bool found_active = false;
-		for(size_t i=0; i<n; i++) {
-			if (queue_active_[i].load(std::memory_order_relaxed)) {
-				found_active = true;
-				break;
+		for (size_t i = 0; i < n; i++) {
+			if (!queue_active_[i].load(std::memory_order_relaxed)) {
+				continue;
 			}
+			if (use_preferred && !queue_preferred_[i].load(std::memory_order_relaxed)) {
+				continue;
+			}
+			found_active = true;
+			break;
 		}
 		if (!found_active) {
 			LOG(ERROR) << "QueueBuffer: all queues inactive. Cannot push batch.";
@@ -526,6 +536,28 @@ void QueueBuffer::MarkQueueActive(size_t queue_idx) {
 		queue_active_[queue_idx].store(true, std::memory_order_relaxed);
 		NotifyQueueDataReady(queue_idx);
 	}
+}
+
+void QueueBuffer::SetPreferredQueues(const std::vector<size_t>& preferred_indices) {
+	if (!queue_preferred_) return;
+	size_t count = 0;
+	for (size_t i = 0; i < num_queues_; ++i) {
+		queue_preferred_[i].store(false, std::memory_order_relaxed);
+	}
+	for (size_t idx : preferred_indices) {
+		if (idx >= num_queues_) continue;
+		queue_preferred_[idx].store(true, std::memory_order_relaxed);
+		++count;
+	}
+	preferred_queue_count_.store(count, std::memory_order_release);
+}
+
+void QueueBuffer::ClearPreferredQueues() {
+	if (!queue_preferred_) return;
+	for (size_t i = 0; i < num_queues_; ++i) {
+		queue_preferred_[i].store(false, std::memory_order_relaxed);
+	}
+	preferred_queue_count_.store(0, std::memory_order_release);
 }
 
 void QueueBuffer::WarmupBuffers() {
