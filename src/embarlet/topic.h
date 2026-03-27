@@ -472,14 +472,16 @@ class Topic {
 		void AdvanceCVForSequencer(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count);
 		// [PHASE-3] Per-broker CV accumulation for single-fence commit
 		void AccumulateCVUpdate(
-				uint16_t broker_id,
-				uint64_t pbr_index,
-				uint64_t cumulative_msg_count,
-				std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
-				std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
+			uint16_t broker_id,
+			uint64_t pbr_index,
+			uint64_t cumulative_msg_count,
+			std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
+			std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
+		void FlushAccumulatedCVLogicalOnly(
+			const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative);
 		void FlushAccumulatedCV(
-				const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
-				const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
+			const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
+			const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
 		void EnqueueCompletedRange(uint64_t start, uint64_t end);
 		void CommittedSeqUpdaterThread();
 		void ResetCompletedRangeQueue();
@@ -820,6 +822,7 @@ class Topic {
 			// [PHASE-3] Per-shard CV accumulation for late/expired batches
 			absl::flat_hash_map<int, uint64_t> cv_max_cumulative;
 			absl::flat_hash_map<int, uint64_t> cv_max_pbr_index;
+			absl::flat_hash_map<int, uint64_t> cv_logical_only_cumulative;
 		};
 		size_t level5_num_shards_{1};
 		std::vector<std::unique_ptr<Level5ShardState>> level5_shards_;

@@ -67,7 +67,7 @@ EMBARCADERO_BATCH_SIZE=${EMBARCADERO_BATCH_SIZE:-524288}
 EMBARCADERO_CLIENT_PUB_BATCH_KB=${EMBARCADERO_CLIENT_PUB_BATCH_KB:-512}
 EMBARCADERO_NETWORK_IO_THREADS=${EMBARCADERO_NETWORK_IO_THREADS:-4}
 EMBARCADERO_ORDER5_HOME_BROKERS=${EMBARCADERO_ORDER5_HOME_BROKERS:-}
-CLIENT_LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
+CLIENT_LD_LIBRARY_PATH=${CLIENT_LD_LIBRARY_PATH:-${LD_LIBRARY_PATH:-}}
 
 # ---------------------------------------------------------------------------
 # Derived paths
@@ -114,6 +114,39 @@ EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
 # Helpers
 # ---------------------------------------------------------------------------
 log() { [ "$QUIET" != "1" ] && echo "$*"; }
+
+verify_client_binary() {
+    local host="$1"
+    local remote_cmd="
+set -e
+cd '$BUILD_BIN'
+if [ ! -x ./throughput_test ]; then
+    echo 'missing throughput_test in $BUILD_BIN'
+    exit 10
+fi
+if command -v ldd >/dev/null 2>&1; then
+    ldd ./throughput_test 2>/dev/null | grep -E 'not found|GLIBC_|GLIBCXX_' && exit 11 || true
+fi
+"
+    if [[ "$host" == "local" ]]; then
+        bash -lc "$remote_cmd"
+    else
+        ssh "$host" "$remote_cmd"
+    fi
+}
+
+preflight_clients() {
+    local failed=0
+    for (( i=0; i<NUM_CLIENTS; i++ )); do
+        local host="${CLIENT_HOSTS[$i]}"
+        if ! verify_client_binary "$host"; then
+            echo "ERROR: client preflight failed on host '$host'." >&2
+            echo "       Ensure /home/domin/Embarcadero/build/bin/throughput_test exists and is runnable on that host." >&2
+            failed=1
+        fi
+    done
+    return "$failed"
+}
 
 shm_cleanup() {
     shm_unlink "${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
@@ -205,6 +238,10 @@ echo "================================================================"
 mkdir -p "$LOG_DIR"
 overall_status=0
 
+if ! preflight_clients; then
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Trial loop
 # ---------------------------------------------------------------------------
@@ -258,7 +295,7 @@ export EMBARCADERO_BATCH_SIZE=$EMBARCADERO_BATCH_SIZE
 export EMBARCADERO_CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB
 export EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS
 export EMBARCADERO_ORDER5_HOME_BROKERS=$EMBARCADERO_ORDER5_HOME_BROKERS
-export LD_LIBRARY_PATH=$CLIENT_LD_LIBRARY_PATH
+if [ -n "$CLIENT_LD_LIBRARY_PATH" ]; then export LD_LIBRARY_PATH=$CLIENT_LD_LIBRARY_PATH; fi
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 cd $BUILD_BIN
 # Spin-wait until the synchronized barrier millisecond (requires NTP-synced clocks)

@@ -2067,6 +2067,40 @@ void Topic::AccumulateCVUpdate(
 	}
 }
 
+void Topic::FlushAccumulatedCVLogicalOnly(
+		const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative) {
+	CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
+
+	for (int broker_id = 0; broker_id < NUM_MAX_BROKERS; ++broker_id) {
+		const uint64_t cumulative = max_cumulative[broker_id];
+		if (cumulative == 0) continue;
+
+		CompletionVectorEntry* entry = &cv[broker_id];
+		CXL::flush_cacheline(entry);
+		CXL::load_fence();
+
+		const uint64_t prev_cur = entry->sequencer_logical_offset.load(std::memory_order_acquire);
+		if (cumulative <= prev_cur) continue;
+
+		entry->sequencer_logical_offset.store(cumulative, std::memory_order_release);
+		RecordOrder5FlightEvent(
+			kOrder5FlightCV,
+			static_cast<uint32_t>(broker_id),
+			prev_cur,
+			cumulative,
+			entry->completed_pbr_head.load(std::memory_order_acquire),
+			entry->completed_pbr_head.load(std::memory_order_relaxed));
+		if (ShouldEnableOrder5Trace() && order_ == 5) {
+			LOG(INFO) << "[ORDER5_TRACE_CV_LOGICAL_ONLY B" << broker_id << "]"
+			          << " cv_logical:" << prev_cur << "->" << cumulative;
+		}
+
+		CXL::flush_cacheline(entry);
+	}
+	CXL::store_fence();
+}
+
 void Topic::FlushAccumulatedCV(
 		const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
 		const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index) {
@@ -3505,11 +3539,32 @@ void Topic::EpochSequencerThread() {
 			std::array<bool, NUM_MAX_BROKERS> idle_broker_seen{};
 			std::array<uint64_t, NUM_MAX_BROKERS> idle_cv_max_cumulative{};
 			std::array<uint64_t, NUM_MAX_BROKERS> idle_cv_max_pbr_index{};
+			std::array<uint64_t, NUM_MAX_BROKERS> idle_cv_logical_only_cumulative{};
+			for (auto& shard_ptr : level5_shards_) {
+				if (!shard_ptr) continue;
+				for (const auto& [bid, cum] : shard_ptr->cv_logical_only_cumulative) {
+					if (bid >= 0 && bid < NUM_MAX_BROKERS && cum > idle_cv_logical_only_cumulative[bid]) {
+						idle_cv_logical_only_cumulative[bid] = cum;
+					}
+				}
+			}
 			std::vector<const PendingBatch5*> idle_by_slot;
 			std::vector<PendingBatch5> idle_batch_list;
 			CommitEpoch(idle_ready_level5, idle_by_slot, idle_contiguous_consumed, idle_broker_seen,
 			           idle_cv_max_cumulative, idle_cv_max_pbr_index, idle_batch_list,
 			           /*is_drain_mode=*/false);
+			FlushAccumulatedCVLogicalOnly(idle_cv_logical_only_cumulative);
+		} else {
+			std::array<uint64_t, NUM_MAX_BROKERS> idle_cv_logical_only_cumulative{};
+			for (auto& shard_ptr : level5_shards_) {
+				if (!shard_ptr) continue;
+				for (const auto& [bid, cum] : shard_ptr->cv_logical_only_cumulative) {
+					if (bid >= 0 && bid < NUM_MAX_BROKERS && cum > idle_cv_logical_only_cumulative[bid]) {
+						idle_cv_logical_only_cumulative[bid] = cum;
+					}
+				}
+			}
+			FlushAccumulatedCVLogicalOnly(idle_cv_logical_only_cumulative);
 		}
 		last_idle_hold_tick_ns = now_ns;
 	};
@@ -3661,6 +3716,7 @@ void Topic::EpochSequencerThread() {
 		// [PHASE-3] Accumulate CV updates locally; merge Level 5 shard CV updates
 		std::array<uint64_t, NUM_MAX_BROKERS> cv_max_cumulative{};
 		std::array<uint64_t, NUM_MAX_BROKERS> cv_max_pbr_index{};
+		std::array<uint64_t, NUM_MAX_BROKERS> cv_logical_only_cumulative{};
 
 		for (auto& shard_ptr : level5_shards_) {
 			if (!shard_ptr) continue;
@@ -3674,18 +3730,25 @@ void Topic::EpochSequencerThread() {
 					if (pbr > cv_max_pbr_index[bid]) cv_max_pbr_index[bid] = pbr;
 				}
 			}
+			for (const auto& [bid, cum] : shard_ptr->cv_logical_only_cumulative) {
+				if (bid >= 0 && bid < NUM_MAX_BROKERS) {
+					if (cum > cv_logical_only_cumulative[bid]) cv_logical_only_cumulative[bid] = cum;
+				}
+			}
 		}
 
 		if (ready.empty()) {
 			// No ready batches, but we still need to advance consumed_through for all processed slots
 			// to prevent ring deadlock. Advance consumed_through for all slots in batch_list.
 			AdvanceConsumedThroughForProcessedSlots(batch_list, contiguous_consumed_per_broker, broker_seen_in_epoch, &cv_max_cumulative, &cv_max_pbr_index);
+			FlushAccumulatedCVLogicalOnly(cv_logical_only_cumulative);
 			continue;
 		}
 
 		// Call unified commit logic
 		CommitEpoch(ready, by_slot, contiguous_consumed_per_broker, broker_seen_in_epoch,
 		           cv_max_cumulative, cv_max_pbr_index, batch_list, /*is_drain_mode=*/false);
+		FlushAccumulatedCVLogicalOnly(cv_logical_only_cumulative);
 		}
 
 	// [[TAIL_STALL_FIX]] Drain remaining sealed epochs before exit.
@@ -3752,11 +3815,35 @@ void Topic::EpochSequencerThread() {
 							}
 							std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_cumulative{};
 							std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_pbr_index{};
+							std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_logical_only_cumulative{};
+							for (auto& shard_ptr : level5_shards_) {
+								if (!shard_ptr) continue;
+								for (const auto& [bid, cum] : shard_ptr->cv_logical_only_cumulative) {
+									if (bid >= 0 && bid < NUM_MAX_BROKERS &&
+									    cum > drain_cv_logical_only_cumulative[bid]) {
+										drain_cv_logical_only_cumulative[bid] = cum;
+									}
+								}
+							}
 							std::vector<const PendingBatch5*> drain_by_slot;
 							std::vector<PendingBatch5> empty_batch_list;
 							CommitEpoch(ready_level5, drain_by_slot, drain_contiguous_consumed, drain_broker_seen,
 							           drain_cv_max_cumulative, drain_cv_max_pbr_index,
 							           empty_batch_list, /*is_drain_mode=*/true);
+							FlushAccumulatedCVLogicalOnly(drain_cv_logical_only_cumulative);
+						}
+						else {
+							std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_logical_only_cumulative{};
+							for (auto& shard_ptr : level5_shards_) {
+								if (!shard_ptr) continue;
+								for (const auto& [bid, cum] : shard_ptr->cv_logical_only_cumulative) {
+									if (bid >= 0 && bid < NUM_MAX_BROKERS &&
+									    cum > drain_cv_logical_only_cumulative[bid]) {
+										drain_cv_logical_only_cumulative[bid] = cum;
+									}
+								}
+							}
+							FlushAccumulatedCVLogicalOnly(drain_cv_logical_only_cumulative);
 						}
 						}
 				LOG(INFO) << "EpochSequencerThread: Caught up (last=" << last << " current=" << current
@@ -3852,6 +3939,17 @@ void Topic::EpochSequencerThread() {
 			// No ready batches, but we still need to advance consumed_through for all processed slots
 			// to prevent ring deadlock. Advance consumed_through for all slots in batch_list.
 			AdvanceConsumedThroughForProcessedSlots(batch_list, contiguous_consumed_per_broker, broker_seen_in_epoch, nullptr, nullptr);
+			std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_logical_only_cumulative{};
+			for (auto& shard_ptr : level5_shards_) {
+				if (!shard_ptr) continue;
+				for (const auto& [bid, cum] : shard_ptr->cv_logical_only_cumulative) {
+					if (bid >= 0 && bid < NUM_MAX_BROKERS &&
+					    cum > drain_cv_logical_only_cumulative[bid]) {
+						drain_cv_logical_only_cumulative[bid] = cum;
+					}
+				}
+			}
+			FlushAccumulatedCVLogicalOnly(drain_cv_logical_only_cumulative);
 			continue;
 		}
 
@@ -3859,6 +3957,7 @@ void Topic::EpochSequencerThread() {
 		// [[DRAIN_MODE_COMMIT]] Use drain-specific CV accumulator arrays
 		std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_cumulative{};
 		std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_max_pbr_index{};
+		std::array<uint64_t, NUM_MAX_BROKERS> drain_cv_logical_only_cumulative{};
 		for (auto& shard_ptr : level5_shards_) {
 			if (!shard_ptr) continue;
 			for (const auto& [bid, cum] : shard_ptr->cv_max_cumulative) {
@@ -3871,9 +3970,17 @@ void Topic::EpochSequencerThread() {
 					if (pbr > drain_cv_max_pbr_index[bid]) drain_cv_max_pbr_index[bid] = pbr;
 				}
 			}
+			for (const auto& [bid, cum] : shard_ptr->cv_logical_only_cumulative) {
+				if (bid >= 0 && bid < NUM_MAX_BROKERS) {
+					if (cum > drain_cv_logical_only_cumulative[bid]) {
+						drain_cv_logical_only_cumulative[bid] = cum;
+					}
+				}
+			}
 		}
 		CommitEpoch(ready, by_slot, contiguous_consumed_per_broker, broker_seen_in_epoch,
 		           drain_cv_max_cumulative, drain_cv_max_pbr_index, batch_list, /*is_drain_mode=*/true);
+		FlushAccumulatedCVLogicalOnly(drain_cv_logical_only_cumulative);
 	}
 
 	// [[SHARD_SHUTDOWN]] Signal Level 5 workers to exit
@@ -3989,6 +4096,26 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		if (!true_client_chain) return;
 		shard.client_pressure_stats[client_id].late_drops++;
 	};
+	auto accumulate_logical_only = [&](int broker_id, uint64_t start_logical_offset, uint32_t num_msg) {
+		if (!true_client_chain) return;
+		if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS) return;
+		const uint64_t cumulative = start_logical_offset + static_cast<uint64_t>(num_msg);
+		auto& slot = shard.cv_logical_only_cumulative[broker_id];
+		if (cumulative > slot) slot = cumulative;
+	};
+	auto terminalize_already_emitted = [&](size_t client_id, int broker_id, uint64_t start_logical_offset,
+	                                      uint32_t num_msg, uint64_t batch_id, uint64_t seq) {
+		if (!true_client_chain) return;
+		accumulate_logical_only(broker_id, start_logical_offset, num_msg);
+		record_late_drop(client_id);
+		CheckAndInsertBatchId(shard, batch_id);
+		if (ShouldEnableOrder5Trace()) {
+			LOG(INFO) << "[ORDER5_TRACE_TERMINAL_ALREADY_EMITTED B" << broker_id << "]"
+			          << " client=" << client_id
+			          << " seq=" << seq
+			          << " cumulative=" << (start_logical_offset + static_cast<uint64_t>(num_msg));
+		}
+	};
 	if (!shard.deferred_level5.empty()) {
 		level5.insert(level5.end(),
 			std::make_move_iterator(shard.deferred_level5.begin()),
@@ -3998,6 +4125,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	// [PHASE-3] Clear shard CV accumulation for this invocation
 	shard.cv_max_cumulative.clear();
 	shard.cv_max_pbr_index.clear();
+	shard.cv_logical_only_cumulative.clear();
 	std::array<uint64_t, NUM_MAX_BROKERS> shard_cv_max_cumulative{};
 	std::array<uint64_t, NUM_MAX_BROKERS> shard_cv_max_pbr_index{};
 
@@ -4058,12 +4186,17 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					size_t seq = p->batch_seq;
 					if (state.is_duplicate(seq) &&
 					    emitted.IsEmitted(static_cast<uint64_t>(seq))) {
+						terminalize_already_emitted(
+							first_client, p->broker_id, p->cached_start_logical_offset,
+							p->num_msg, p->cached_batch_id, seq);
 						continue;
 					}
 					if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
 						state.mark_sequenced(seq);
 						if (seq >= state.next_expected) state.next_expected = seq + 1;
-						CheckAndInsertBatchId(shard, p->cached_batch_id);
+						terminalize_already_emitted(
+							first_client, p->broker_id, p->cached_start_logical_offset,
+							p->num_msg, p->cached_batch_id, seq);
 						continue;
 					}
 					if (seq == state.next_expected) {
@@ -4075,6 +4208,8 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						}
 					} else if (seq < state.next_expected) {
 						state.mark_sequenced(seq);
+						accumulate_logical_only(p->broker_id, p->cached_start_logical_offset, p->num_msg);
+						record_late_drop(first_client);
 						CheckAndInsertBatchId(shard, p->cached_batch_id);
 					} else {
 						if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
@@ -4264,6 +4399,9 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				size_t seq = jt->batch_seq;
 				if (state.is_duplicate(seq) &&
 				    emitted.IsEmitted(static_cast<uint64_t>(seq))) {
+					terminalize_already_emitted(
+						client_id, jt->broker_id, jt->cached_start_logical_offset,
+						jt->num_msg, jt->cached_batch_id, seq);
 					continue;
 				}
 				if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
@@ -4271,7 +4409,9 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					if (seq >= state.next_expected) {
 						state.next_expected = seq + 1;
 					}
-					CheckAndInsertBatchId(shard, jt->cached_batch_id);
+					terminalize_already_emitted(
+						client_id, jt->broker_id, jt->cached_start_logical_offset,
+						jt->num_msg, jt->cached_batch_id, seq);
 					continue;
 				}
 				if (seq == state.next_expected) {
@@ -4283,6 +4423,8 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					}
 				} else if (seq < state.next_expected) {
 					state.mark_sequenced(seq);
+					accumulate_logical_only(jt->broker_id, jt->cached_start_logical_offset, jt->num_msg);
+					record_late_drop(client_id);
 					CheckAndInsertBatchId(shard, jt->cached_batch_id);
 				} else {
 					if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
@@ -4476,7 +4618,9 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					state.mark_sequenced(he.batch.batch_seq);
 					state.advance_next_expected();
 					if (true_client_chain) {
-						CheckAndInsertBatchId(shard, he.meta.batch_id);
+						terminalize_already_emitted(
+							cid, he.meta.broker_id, he.meta.start_logical_offset,
+							he.meta.num_msg, he.meta.batch_id, he.batch.batch_seq);
 					} else {
 						PendingBatch5 late = std::move(he.batch);
 						late.from_hold = true;
@@ -4575,13 +4719,17 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		ClientState5& state = shard.client_state[ent.client_id];
 		state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
 		ClientEmitTracker& emitted = shard.client_emitted_tracker[ent.client_id];
-		if (ent.seq < state.next_expected || emitted.IsEmitted(static_cast<uint64_t>(ent.seq))) {
+			if (ent.seq < state.next_expected || emitted.IsEmitted(static_cast<uint64_t>(ent.seq))) {
 			state.mark_sequenced(ent.seq);
 			// Advance next_expected so later batches (e.g. seq+1) can drain; otherwise
 			// we'd leave next_expected behind and hold valid in-order batches forever.
 			if (ent.seq >= state.next_expected)
 				state.next_expected = ent.seq + 1;
 			if (true_client_chain) {
+				accumulate_logical_only(
+					ent.batch.broker_id,
+					ent.meta.start_logical_offset,
+					ent.meta.num_msg);
 				CheckAndInsertBatchId(shard, ent.meta.batch_id);
 				record_late_drop(ent.client_id);
 				VLOG(1) << "[L5_EXPIRED_LATE_DROP] B" << ent.batch.broker_id
@@ -4640,7 +4788,9 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				if (emitted.IsEmitted(static_cast<uint64_t>(he.batch.batch_seq))) {
 					state.mark_sequenced(he.batch.batch_seq);
 					state.advance_next_expected();
-					CheckAndInsertBatchId(shard, he.meta.batch_id);
+					terminalize_already_emitted(
+						cid, he.meta.broker_id, he.meta.start_logical_offset,
+						he.meta.num_msg, he.meta.batch_id, he.batch.batch_seq);
 					cmap.erase(seq_it);
 					shard.hold_buffer_size--;
 				continue;
