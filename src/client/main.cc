@@ -271,9 +271,9 @@ int main(int argc, char* argv[]) {
             // Publish and Subscribe test
             if (!ensure_topic_ready()) return EXIT_FAILURE;
             LOG(INFO) << "Running Publish and Consume: " << total_message_size;
-            double pub_bandwidthMb = PublishThroughputTest(result, topic, synchronizer);
+            PublishThroughputTest(result, topic, synchronizer);
             sleep(3);
-            double sub_bandwidthMb = ConsumeThroughputTest(result, topic);
+            ConsumeThroughputTest(result, topic);
             break;
         }
         default:
