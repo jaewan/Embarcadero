@@ -179,6 +179,7 @@ class Publisher {
 		// [[CORFU]] Per-broker batch sequence for GetTotalOrder; sequencer expects 0,1,2,... per (client,broker)
 		static constexpr int kMaxCorfuBrokers = 32;
 		std::array<std::atomic<size_t>, kMaxCorfuBrokers> corfu_batch_seq_per_broker_{};
+		std::atomic<size_t> order5_batch_seq_{0};
 		std::array<std::atomic<size_t>, kMaxCorfuBrokers> order5_batch_seq_per_broker_{};
 		// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker to eliminate out-of-order retries (Phase 2C).
 		std::array<std::mutex, kMaxCorfuBrokers> corfu_seq_per_broker_lock_{};
@@ -251,6 +252,8 @@ class Publisher {
 		absl::flat_hash_map<int, std::string> nodes_;
 		absl::Mutex mutex_;
 		std::vector<int> brokers_;
+		absl::flat_hash_map<int, std::vector<size_t>> broker_queue_indices_ ABSL_GUARDED_BY(mutex_);
+		size_t order5_home_brokers_{0};
 		// Publish threads connected to each broker_id; used to pick least-loaded survivor on reroute.
 		std::array<std::atomic<int>, kMaxBrokerIds> publish_thread_load_{};
 		// When several survivors tie for minimum load, spread reconnects (avoid always picking brokers_[0]).
@@ -339,6 +342,9 @@ class Publisher {
 		 * @return true if successful, false otherwise
 		 */
 		bool AddPublisherThreads(size_t num_threads, int broker_id, size_t queue_size);
+		void RefreshOrder5PreferredQueuesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+		void ReassignQueueBrokerLocked(size_t queue_idx, int old_broker_id, int new_broker_id) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+		void LogOrder5RoutingSummary() const;
 
 		// Instance vars for SubscribeToClusterStatus error handling (was static)
 		std::chrono::steady_clock::time_point last_read_warning_;
