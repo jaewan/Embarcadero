@@ -1830,6 +1830,16 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                                 << " (header_version=" << (is_v2_header ? 2 : 1) << ")";
                         return msg_ptr;
                     }
+
+                    if (current_total_order < next_expected_order) {
+                        static thread_local uint64_t stale_order_count = 0;
+                        if ((stale_order_count++ % 1000) == 0) {
+                            LOG(WARNING) << "ConsumeBatchAware: Non-monotonic message order detected"
+                                         << " current_total_order=" << current_total_order
+                                         << " next_expected_order=" << next_expected_order
+                                         << " fd=" << fd;
+                        }
+                    }
                     
                     // If it's a future message within reasonable range, buffer it
                     if (current_total_order > next_expected_order && 

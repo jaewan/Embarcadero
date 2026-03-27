@@ -8,7 +8,7 @@
 # Client roster (order defines who is added at each NUM_CLIENTS level):
 #   NUM_CLIENTS=1  → c4              (NUMA 1)
 #   NUM_CLIENTS=2  → c4, c3          (NUMA 1, 1)
-#   NUM_CLIENTS=3  → c4, c3, local   (NUMA 1, 1, 0)
+#   NUM_CLIENTS=3  → c4, c3, local   (NUMA 1, 1, broker-local auto)
 #   NUM_CLIENTS=4  → c4, local, c3, c2
 #   NUM_CLIENTS=5  → c4, local, c3, c2, c1
 #
@@ -20,7 +20,7 @@
 #   EMBARCADERO_ORDER0_FAST_PATH, EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES,
 #   EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE, EMBARCADERO_BATCH_SIZE,
 #   EMBARCADERO_CLIENT_PUB_BATCH_KB, EMBARCADERO_NETWORK_IO_THREADS,
-#   EMBARCADERO_ORDER5_HOME_BROKERS
+#   EMBARCADERO_ORDER5_HOME_BROKERS, LOCAL_CLIENT_NUMA
 #
 # Example:
 #   NUM_CLIENTS=3 NUM_BROKERS=4 MESSAGE_SIZE=8192 scripts/run_multiclient.sh
@@ -32,7 +32,7 @@ set -euo pipefail
 # "local" means this broker machine (where brokers run); everything else is SSH
 # ---------------------------------------------------------------------------
 declare -a CLIENT_HOSTS=( "c4"  "c3"  "local" "c2"  "c1"  )
-declare -a CLIENT_NUMAS=( "1"   "1"   "0"     "1"   "1"   )
+declare -a CLIENT_NUMAS=( "1"   "1"   ""      "1"   "1"   )
 MAX_CLIENTS=${#CLIENT_HOSTS[@]}
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,6 @@ EMBARCADERO_CLIENT_PUB_BATCH_KB=${EMBARCADERO_CLIENT_PUB_BATCH_KB:-512}
 EMBARCADERO_NETWORK_IO_THREADS=${EMBARCADERO_NETWORK_IO_THREADS:-4}
 EMBARCADERO_ORDER5_HOME_BROKERS=${EMBARCADERO_ORDER5_HOME_BROKERS:-}
 CLIENT_LD_LIBRARY_PATH=${CLIENT_LD_LIBRARY_PATH:-${LD_LIBRARY_PATH:-}}
-
 # ---------------------------------------------------------------------------
 # Derived paths
 # ---------------------------------------------------------------------------
@@ -114,6 +113,32 @@ EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
 # Helpers
 # ---------------------------------------------------------------------------
 log() { [ "$QUIET" != "1" ] && echo "$*"; }
+
+infer_broker_cpu_numa() {
+    if [[ "$EMBARLET_NUMA_BIND" =~ --cpunodebind=([0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return
+    fi
+    printf '%s\n' "1"
+}
+
+resolve_local_client_numa() {
+    if [[ -n "${LOCAL_CLIENT_NUMA:-}" ]]; then
+        printf '%s\n' "$LOCAL_CLIENT_NUMA"
+        return
+    fi
+    infer_broker_cpu_numa
+}
+
+resolve_client_numa() {
+    local host="$1"
+    local default_numa="$2"
+    if [[ "$host" == "local" ]]; then
+        resolve_local_client_numa
+        return
+    fi
+    printf '%s\n' "$default_numa"
+}
 
 verify_client_binary() {
     local host="$1"
@@ -233,6 +258,7 @@ printf "  %-32s %s\n" "ENABLE_PAYLOAD_MSG_MORE:"       "$EMBARCADERO_ENABLE_PAYL
 printf "  %-32s %s\n" "BATCH_SIZE:"                    "$EMBARCADERO_BATCH_SIZE"
 printf "  %-32s %s\n" "CLIENT_PUB_BATCH_KB:"           "$EMBARCADERO_CLIENT_PUB_BATCH_KB"
 printf "  %-32s %s\n" "ORDER5_HOME_BROKERS:"           "${EMBARCADERO_ORDER5_HOME_BROKERS:-"(unset)"}"
+printf "  %-32s %s\n" "LOCAL_CLIENT_NUMA:"             "$(resolve_local_client_numa)"
 echo "================================================================"
 
 mkdir -p "$LOG_DIR"
@@ -274,7 +300,7 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
 
         for (( i=0; i<NUM_CLIENTS; i++ )); do
             host="${CLIENT_HOSTS[$i]}"
-            numa="${CLIENT_NUMAS[$i]}"
+            numa="$(resolve_client_numa "$host" "${CLIENT_NUMAS[$i]}")"
             log_file="$LOG_DIR/trial${trial}_${host}.log"
             CLIENT_LOGS+=( "$log_file" )
 

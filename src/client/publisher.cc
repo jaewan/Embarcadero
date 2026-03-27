@@ -238,19 +238,19 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 	message_size_(message_size),
 	queueSize_((num_threads_per_broker > 0) ? (queueSize / static_cast<size_t>(num_threads_per_broker)) : queueSize),
 	order_level_(order),
-		// [[NEW_BUFFER_FIX]] Start with reasonable initial queue count, dynamically grow as brokers are added.
-		// Avoid massive 128-queue allocation when only 4-8 threads are needed initially.
-		// See docs/NEW_BUFFER_BANDWIDTH_INVESTIGATION.md.
-		pubQue_(num_threads_per_broker_ * 4, num_threads_per_broker_, client_id_, message_size, order),
+	// [[NEW_BUFFER_FIX]] Start with reasonable initial queue count, dynamically grow as brokers are added.
+	// Avoid massive 128-queue allocation when only 4-8 threads are needed initially.
+	// See docs/NEW_BUFFER_BANDWIDTH_INVESTIGATION.md.
+	pubQue_(num_threads_per_broker_ * 4, num_threads_per_broker_, client_id_, message_size, order),
 	seq_type_(seq_type),
-	order5_home_brokers_(GetOrder5HomeBrokers()),
 	broker_stats_(NUM_MAX_BROKERS),
 	start_time_(std::chrono::steady_clock::now())  // Initialize immediately
+	,order5_home_brokers_(GetOrder5HomeBrokers())
 #ifdef COLLECT_LATENCY_STATS
 	,send_records_per_broker_(NUM_MAX_BROKERS),
 	send_records_mutexes_(NUM_MAX_BROKERS)
 #endif
-	{
+		{
 		// Copy topic name
 		memcpy(topic_, topic, TOPIC_NAME_SIZE);
 
@@ -1942,8 +1942,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		};
 
 		// Try to send batch header, handle failures
-		auto* net_profile = ShouldEnableNetworkPathProfile() ? &GetClientNetworkPathProfile() : nullptr;
-		auto payload_loop_start = std::chrono::steady_clock::now();
 		try {
 			send_batch_header();
 			if (batch_count % 100 == 0 || batch_count == 1) {
