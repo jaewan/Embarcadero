@@ -1198,13 +1198,18 @@ bool Topic::SupportsPerClientAckLevel1() const {
 	// ACK level 1 is "ordered frontier" semantics.
 	// We currently maintain per-client ordered frontier in:
 	// - CORFU ORDER=2 via RecordCorfuOrder2BatchCompletion
-	// - EMBARCADERO order>0 via AssignOrder / CommitEpoch
+	// - EMBARCADERO ORDER=4 via AssignOrder
+	//
+	// ORDER=5 is different: ordered frontiers are advanced from shared CXL state across broker
+	// processes, but per_client_ordered_ lives only in the local broker process. Non-owner
+	// brokers can therefore observe tinode/CV progress without having a populated local
+	// per-client map, which would pin ACK1 at zero. Until per-client ORDER=5 frontiers are
+	// published in shared memory, fall back to the legacy shared frontier path for ACK1.
 	if (seq_type_ == CORFU) {
 		return order_ == Embarcadero::kOrderTotal;
 	}
 	if (seq_type_ == EMBARCADERO) {
-		return order_ == Embarcadero::kOrderPerBroker ||
-		       order_ == Embarcadero::kOrderStrong;
+		return order_ == Embarcadero::kOrderPerBroker;
 	}
 	return false;
 }
