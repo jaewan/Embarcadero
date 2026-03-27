@@ -403,8 +403,15 @@ class Topic {
 		int GetOrder(){ return order_; }
 
 		// Returns the number of messages ordered for the given client_id at this broker.
-		// Used by AckThread for correct per-publisher ACK (all sequencer modes).
+		// Used by AckThread for ACK1 in modes that support per-client ordered frontier.
 		uint64_t GetClientOrdered(uint32_t client_id) const;
+		// Returns the number of messages durably replicated for the given client_id at this broker.
+		// Used by AckThread for ACK2 in modes that support per-client durability attribution.
+		uint64_t GetClientDurable(uint32_t client_id) const;
+		// True when this topic/mode maintains per-client ordered frontier for ACK level 1.
+		bool SupportsPerClientAckLevel1() const;
+		// True when this topic/mode maintains per-client durable frontier for ACK level 2.
+		bool SupportsPerClientAckLevel2Durable() const;
 
 		/** [[ORDER_0_SKIP_PBR]] For order 0 we do not write to PBR. Returns start logical offset for this batch and advances by num_msg. */
 		size_t GetAndAdvanceOrder0LogicalOffset(uint32_t num_msg);
@@ -549,6 +556,7 @@ class Topic {
 				BatchHeader*& batch_header_location,
 				bool epoch_already_checked = false);
 		void RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_msg, uint32_t client_id);
+		void RecordCorfuOrder2DurableCompletion(uint64_t batch_seq, uint32_t num_msg, uint32_t client_id);
 
 		std::function<void(void*, size_t)> ScalogGetCXLBuffer(
 				BatchHeader& batch_header,
@@ -630,13 +638,23 @@ class Topic {
 		absl::Mutex corfu_order2_mu_;
 		uint64_t corfu_order2_next_seq_ ABSL_GUARDED_BY(corfu_order2_mu_) = 0;
 		absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>> corfu_order2_completed_ ABSL_GUARDED_BY(corfu_order2_mu_);
+		// Corfu ACK2 durable cumulative count (message count - 1 = last durable offset).
+		std::atomic<uint64_t> corfu_ack2_durable_count_{0};
+		absl::Mutex corfu_order2_durable_mu_;
+		uint64_t corfu_order2_durable_next_seq_ ABSL_GUARDED_BY(corfu_order2_durable_mu_) = 0;
+		absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>> corfu_order2_durable_completed_
+				ABSL_GUARDED_BY(corfu_order2_durable_mu_);
 
-		// Per-client ordered counters for correct publisher ACK (all sequencer modes).
+		// Per-client ordered counters for ACK1 in supported modes.
 		// Avoids false-positive ACK from global tinode ordered counter aggregating all clients.
 		mutable absl::Mutex per_client_mu_;
 		absl::flat_hash_map<uint32_t, uint64_t> per_client_ordered_ ABSL_GUARDED_BY(per_client_mu_);
 		// Called by all ordering paths (CORFU, ORDER=4, ORDER=5) to advance per-client counter.
 		void UpdatePerClientOrdered(uint32_t client_id, uint64_t count);
+		// Per-client durable counters for ACK2 (only in modes with explicit durability attribution).
+		mutable absl::Mutex per_client_durable_mu_;
+		absl::flat_hash_map<uint32_t, uint64_t> per_client_durable_ ABSL_GUARDED_BY(per_client_durable_mu_);
+		void UpdatePerClientDurable(uint32_t client_id, uint64_t count);
 
 		// Synchronization
 		absl::Mutex mutex_;

@@ -934,39 +934,21 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 	return [this, batch_header, log](void* /*log_ptr*/, size_t /*placeholder*/) {
 		// Handle replication if needed
 		if (replication_factor_ > 0 && corfu_replication_client_) {
-			MessageHeader *header = (MessageHeader*)log;
-			// Wait until the message is combined
-			while(header->next_msg_diff == 0){
-				std::this_thread::yield();
-			}
-
-			corfu_replication_client_->ReplicateData(
+			const bool replicated = corfu_replication_client_->ReplicateData(
 					batch_header.log_idx,
 					batch_header.total_size,
 					log
 					);
-
-		// Marking replication done.
-		// Use GetReplicationSetBroker (forward: broker_id+i) — must match the formula
-		// used by GetBatchToExportWithMetadata and GetOffsetToAck.  The old backward
-		// formula (broker_id - i) wrote to the wrong offsets[] slots, so subscribers
-		// reading via GetReplicationSetBroker would see stale zeros and stall.
-		size_t last_offset = header->logical_offset + batch_header.num_msg - 1;
-		{
-			int num_brokers = get_num_brokers_callback_();
-			for (int i = 0; i < replication_factor_; i++) {
-				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor_, num_brokers, i);
-				if (tinode_->replicate_tinode) {
-					replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
-					CXL::flush_cacheline(const_cast<const void*>(
-						reinterpret_cast<const volatile void*>(&replica_tinode_->offsets[b].replication_done[broker_id_])));
-				}
-				tinode_->offsets[b].replication_done[broker_id_] = last_offset;
-				CXL::flush_cacheline(const_cast<const void*>(
-					reinterpret_cast<const volatile void*>(&tinode_->offsets[b].replication_done[broker_id_])));
+			if (!replicated) {
+				LOG(ERROR) << "CORFU replication failed for batch_seq=" << batch_header.batch_seq
+				           << " log_idx=" << batch_header.log_idx
+				           << " size=" << batch_header.total_size
+				           << " client_id=" << batch_header.client_id
+				           << "; not advancing replication_done / durable frontier.";
+				return;
 			}
-			CXL::store_fence();
-		}
+			RecordCorfuOrder2DurableCompletion(
+					batch_header.batch_seq, batch_header.num_msg, batch_header.client_id);
 		} // end: if (replication_factor_ > 0 && corfu_replication_client_)
 
 		RecordCorfuOrder2BatchCompletion(batch_header.batch_seq, batch_header.num_msg, batch_header.client_id);
@@ -1060,6 +1042,67 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 	}
 }
 
+void Topic::RecordCorfuOrder2DurableCompletion(uint64_t batch_seq, uint32_t num_msg, uint32_t client_id) {
+	if (seq_type_ != CORFU || order_ != Embarcadero::kOrderTotal || replication_factor_ <= 0) {
+		return;
+	}
+
+	uint64_t messages_to_ack = 0;
+	absl::flat_hash_map<uint32_t, uint64_t> per_client_delta;
+	{
+		absl::MutexLock lock(&corfu_order2_durable_mu_);
+		auto [it, inserted] =
+				corfu_order2_durable_completed_.emplace(batch_seq, std::make_pair(num_msg, client_id));
+		if (!inserted) {
+			LOG(WARNING) << "Corfu ORDER=2 durable: duplicate completion for batch_seq=" << batch_seq;
+			return;
+		}
+
+		while (true) {
+			auto next_it = corfu_order2_durable_completed_.find(corfu_order2_durable_next_seq_);
+			if (next_it == corfu_order2_durable_completed_.end()) {
+				break;
+			}
+			const uint32_t slot_num_msg = next_it->second.first;
+			const uint32_t slot_client_id = next_it->second.second;
+			messages_to_ack += slot_num_msg;
+			per_client_delta[slot_client_id] += slot_num_msg;
+			corfu_order2_durable_completed_.erase(next_it);
+			corfu_order2_durable_next_seq_++;
+		}
+	}
+
+	if (messages_to_ack == 0) {
+		return;
+	}
+
+	// Advance durable frontier only for contiguous durable completions.
+	const uint64_t start =
+			corfu_ack2_durable_count_.fetch_add(messages_to_ack, std::memory_order_relaxed);
+	const uint64_t last_offset = start + messages_to_ack - 1;
+
+	// Mark replication_done using canonical replication set indices.
+	int num_brokers = get_num_brokers_callback_();
+	for (int i = 0; i < replication_factor_; i++) {
+		int b = Embarcadero::GetReplicationSetBroker(
+				broker_id_, replication_factor_, num_brokers, i);
+		if (tinode_->replicate_tinode) {
+			replica_tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+			CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(
+							&replica_tinode_->offsets[b].replication_done[broker_id_])));
+		}
+		tinode_->offsets[b].replication_done[broker_id_] = last_offset;
+		CXL::flush_cacheline(const_cast<const void*>(reinterpret_cast<const volatile void*>(
+				&tinode_->offsets[b].replication_done[broker_id_])));
+	}
+	CXL::store_fence();
+
+	for (auto& [cid, cnt] : per_client_delta) {
+		UpdatePerClientDurable(cid, cnt);
+	}
+}
+
 void Topic::UpdatePerClientOrdered(uint32_t client_id, uint64_t count) {
 	absl::MutexLock lock(&per_client_mu_);
 	per_client_ordered_[client_id] += count;
@@ -1069,6 +1112,41 @@ uint64_t Topic::GetClientOrdered(uint32_t client_id) const {
 	absl::MutexLock lock(&per_client_mu_);
 	auto it = per_client_ordered_.find(client_id);
 	return (it != per_client_ordered_.end()) ? it->second : 0;
+}
+
+uint64_t Topic::GetClientDurable(uint32_t client_id) const {
+	absl::MutexLock lock(&per_client_durable_mu_);
+	auto it = per_client_durable_.find(client_id);
+	return (it != per_client_durable_.end()) ? it->second : 0;
+}
+
+bool Topic::SupportsPerClientAckLevel1() const {
+	// ACK level 1 is "ordered frontier" semantics.
+	// We currently maintain per-client ordered frontier in:
+	// - CORFU ORDER=2 via RecordCorfuOrder2BatchCompletion
+	// - EMBARCADERO order>0 via AssignOrder / CommitEpoch
+	if (seq_type_ == CORFU) {
+		return order_ == Embarcadero::kOrderTotal;
+	}
+	if (seq_type_ == EMBARCADERO) {
+		return order_ == Embarcadero::kOrderPerBroker ||
+		       order_ == Embarcadero::kOrderStrong;
+	}
+	return false;
+}
+
+bool Topic::SupportsPerClientAckLevel2Durable() const {
+	// Durability attribution is currently explicit in CORFU path where replication callback
+	// advances per-client durable frontier only after replication_done writes are committed.
+	return seq_type_ == CORFU &&
+	       order_ == Embarcadero::kOrderTotal &&
+	       replication_factor_ > 0 &&
+	       corfu_replication_client_ != nullptr;
+}
+
+void Topic::UpdatePerClientDurable(uint32_t client_id, uint64_t count) {
+	absl::MutexLock lock(&per_client_durable_mu_);
+	per_client_durable_[client_id] += count;
 }
 
 std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(

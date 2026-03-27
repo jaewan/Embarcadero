@@ -2040,14 +2040,11 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		}
 	}
 
-	// Use per-client ordered counter for ALL sequencer modes so each publisher only ACKs
-	// its own messages. Without this, a fast client can push the global broker-wide
-	// tinode->offsets[].ordered counter past a slow client's target, causing the slow
-	// client to exit WaitForAcks prematurely (false-positive ACK bug).
-	// Per-client counters are populated by: RecordCorfuOrder2BatchCompletion (CORFU),
-	// AssignOrder (EMBARCADERO ORDER=4), CommitEpoch (EMBARCADERO ORDER=5).
-	Topic* ack_topic = topic_manager_ ? topic_manager_->GetTopic(topic) : nullptr;
-
+	// ACK frontier source architecture:
+	// - ACK1: per-client ordered frontier when topic supports it.
+	// - ACK2: per-client durable frontier when topic supports explicit durability attribution;
+	//         otherwise legacy durability frontier (GetOffsetToAck*).
+	// This prevents semantic drift between "ordered" and "durable" ACK meanings.
 	consecutive_timeouts = 0;
 	consecutive_errors = 0;
 	size_t consecutive_ack_stalls = 0;
@@ -2066,12 +2063,20 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		// Phase 2: Expensive check only if fast read suggests a change
 		bool found_ack = false;
 		size_t current_ack = (size_t)-1;
+		Topic* ack_topic = topic_manager_ ? topic_manager_->GetTopic(topic) : nullptr;
+		const bool use_per_client_ack_level1 =
+			(ack_level == 1 && ack_topic != nullptr && ack_topic->SupportsPerClientAckLevel1());
+		const bool use_per_client_ack_level2_durable =
+			(ack_level == 2 && ack_topic != nullptr && ack_topic->SupportsPerClientAckLevel2Durable());
 
 			// Fast-path: Read without flush/fence to detect potential changes.
 			// Safe for ACK2 because durability frontiers are monotonic; stale reads can only delay ACKs.
-			// Per-client path: use DRAM counter (no CXL flush/fence needed, works for all modes).
-			if (ack_topic) {
+			if (use_per_client_ack_level1) {
 				current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
+				expensive_checks_since_last_ack++;
+				fast_polls_without_full_check = 0;
+			} else if (use_per_client_ack_level2_durable) {
+				current_ack = static_cast<size_t>(ack_topic->GetClientDurable(client_id));
 				expensive_checks_since_last_ack++;
 				fast_polls_without_full_check = 0;
 			} else {
