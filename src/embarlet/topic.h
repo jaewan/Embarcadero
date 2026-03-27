@@ -104,6 +104,14 @@ struct ExpiredHoldEntry {
 	HoldBatchMetadata meta;
 };
 
+struct ClientPressureStats {
+	uint64_t hold_inserts{0};
+	uint64_t expiries{0};
+	uint64_t forced_skips{0};
+	uint64_t late_drops{0};
+	uint64_t max_held_depth{0};
+};
+
 // Tracks what has been emitted per client without assuming dense, monotonic commits.
 // This avoids false "already committed" drops when gaps/timeouts reorder releases.
 struct ClientEmitTracker {
@@ -178,11 +186,8 @@ struct alignas(64) EpochBuffer5 {
 		if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS) return;
 		broker_active[broker_id].store(false, std::memory_order_release);
 
-		// Only notify sealer if we're in SEALED state (optimization to avoid unnecessary lock contention)
-		if (state.load(std::memory_order_acquire) == State::SEALED) {
-			std::lock_guard<std::mutex> lk(seal_mutex);
-			seal_cv.notify_all();
-		}
+		std::lock_guard<std::mutex> lk(seal_mutex);
+		seal_cv.notify_all();
 	}
 
 	bool seal() {
@@ -191,7 +196,7 @@ struct alignas(64) EpochBuffer5 {
 			return false;
 		}
 		std::unique_lock<std::mutex> lk(seal_mutex);
-		constexpr auto kSealWaitBudget = std::chrono::milliseconds(2);
+		constexpr auto kSealWaitBudget = std::chrono::milliseconds(10);
 		bool quiesced = seal_cv.wait_for(lk, kSealWaitBudget, [this] {
 			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
 				if (broker_active[i].load(std::memory_order_acquire)) return false;
@@ -277,6 +282,7 @@ class Topic {
 		 * This method creates and starts all necessary threads for the topic.
 		 */
 		void Start();
+		void DumpOrder5FlightRecorder(const char* reason);
 
 		/**
 		 * Destructor - ensures all threads are stopped and joined
@@ -318,6 +324,7 @@ class Topic {
 				}
 			}
 			WriteOrder5AnomalyCountersCsv();
+			WriteOrder5ClientPressureSummary();
 
 			VLOG(3) << "[Topic]: \tDestructed";
 		}
@@ -566,8 +573,8 @@ class Topic {
 
 		// [[ORDER5_PERF_GUARD]]
 		// Legacy Order4 helpers are intentionally kept in this translation unit because
-		// removing them changed code layout and regressed ORDER=5 throughput materially.
-		// Runtime still rejects Order4 topics (see TopicManager/client checks).
+		// removing them changed code layout and regressed epoch-sequencer throughput materially.
+		// Runtime now maps ORDER=4 onto the epoch path, so these helpers remain cold legacy code.
 		std::function<void(void*, size_t)> Order4GetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
@@ -688,7 +695,9 @@ class Topic {
 		absl::flat_hash_set<int> brokers_with_scanners_ ABSL_GUARDED_BY(scanner_management_mu_);
 		std::vector<std::thread> scanner_threads_ ABSL_GUARDED_BY(scanner_management_mu_);
 		absl::Mutex scanner_management_mu_;
+		std::array<std::atomic<bool>, NUM_MAX_BROKERS> scanner_shutdown_drained_{};
 		void CheckAndSpawnNewScanners();  // Called periodically to add scanners for new brokers
+		bool HaveAllScannerDrainsCompleted();
 		
 		uint32_t local_counter_ = 0; // threading: single thread (DelegationThread)
 
@@ -723,6 +732,7 @@ class Topic {
 	void InitLevel5Shards();
 	size_t GetTotalHoldBufferSize();
 	void WriteOrder5AnomalyCountersCsv() const;
+	void WriteOrder5ClientPressureSummary() const;
 	// [[ORDER5_PERF_GUARD]] See note above: retained for code-layout stability.
 	bool ProcessSkipped(
 		absl::flat_hash_map<size_t, absl::btree_map<size_t, BatchHeader*>>& skipped_batches,
@@ -769,6 +779,20 @@ class Topic {
 		// Disconnect/shutdown tail drain: keep force-expiring hold frontiers for a short bounded window
 		// so late-visible batches are not stranded behind a one-shot expiry pulse.
 		std::atomic<uint64_t> force_expire_hold_until_ns_{0};
+		struct Order5FlightEvent {
+			uint64_t ts_ns{0};
+			uint64_t a{0};
+			uint64_t b{0};
+			uint64_t c{0};
+			uint64_t d{0};
+			uint32_t kind{0};
+			uint32_t broker{0};
+		};
+		static constexpr size_t kOrder5FlightRingSize = 256;
+		std::array<Order5FlightEvent, kOrder5FlightRingSize> order5_flight_ring_{};
+		std::atomic<uint64_t> order5_flight_write_pos_{0};
+		std::atomic_flag order5_flight_dumped_ = ATOMIC_FLAG_INIT;
+		void RecordOrder5FlightEvent(uint32_t kind, uint32_t broker, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 	// Epoch buffers for safe collection/sequencing (no concurrent merge/write).
 	EpochBuffer5 epoch_buffers_[3];
 		std::thread epoch_driver_thread_;
@@ -786,6 +810,7 @@ class Topic {
 			absl::flat_hash_map<size_t, std::map<size_t, HoldEntry5>> hold_buffer;  // client_id -> ordered(client_seq -> entry)
 			size_t hold_buffer_size{0};
 			absl::flat_hash_set<size_t> clients_with_held_batches;
+			absl::flat_hash_map<size_t, ClientPressureStats> client_pressure_stats;
 			std::vector<ExpiredHoldEntry> expired_hold_buffer;
 			std::vector<std::pair<size_t, size_t>> expired_hold_keys_buffer;
 			std::vector<PendingBatch5> deferred_level5;
