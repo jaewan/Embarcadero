@@ -22,8 +22,7 @@ namespace {
 	constexpr size_t kQueueFullSleepMs = 1;
 	constexpr size_t kMaxRegions = 4;  // allow multiple AddBuffers(); pool capacity = pool_slots_ * kMaxRegions
 	constexpr size_t kAlign = 64;
-	/** Default target batch pool size (hugepage-backed, same as buffer.cc via mmap_large_buffer). */
-	constexpr size_t kDefaultPoolSizeBytes = 16ULL * 1024 * 1024 * 1024;  // 16 GB
+	constexpr size_t kDefaultPoolSizeBytes = 256ULL * 1024 * 1024;  // 256 MB; caller hint or min_slots dominates for throughput
 	inline size_t AlignUp(size_t size, size_t align) {
 		return (size + align - 1) & ~(align - 1);
 	}
@@ -130,8 +129,7 @@ bool QueueBuffer::AddBuffers(size_t buf_size) {
 	for (size_t i = 0; i < slots_this_region; i++) {
 		Embarcadero::BatchHeader* slot = reinterpret_cast<Embarcadero::BatchHeader*>(
 			reinterpret_cast<uint8_t*>(region) + i * slot_size_);
-		// Zero-initialize to prevent stale data (paddedSize=0) from recycled batches
-		memset(slot, 0, slot_size_);
+		memset(slot, 0, sizeof(Embarcadero::BatchHeader));
 		pool_->write(slot);
 	}
 

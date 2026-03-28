@@ -125,6 +125,28 @@ if(PkgConfig_FOUND)
             TIMEOUT 180
             LABELS "unit;phase3;recovery;integration;production"
         )
+
+        add_executable(replication_topology_test
+            replication_topology_test.cc
+        )
+        target_include_directories(replication_topology_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(replication_topology_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(replication_topology_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_replication_topology COMMAND replication_topology_test)
+        set_tests_properties(unit_replication_topology PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;replication;topology;smoke"
+        )
     else()
         message(WARNING "GTest not found via pkg-config, unit tests disabled")
     endif()

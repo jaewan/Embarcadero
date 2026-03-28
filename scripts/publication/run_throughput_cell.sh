@@ -21,6 +21,7 @@ THREADS_PER_BROKER="${THREADS_PER_BROKER:-4}"
 BROKER_IP="${BROKER_IP:-10.10.10.10}"
 START_DELAY_SEC="${START_DELAY_SEC:-8}"
 LOCAL_CLIENT_NUMA="${LOCAL_CLIENT_NUMA:-0}"
+CORFU_SEQUENCER_LOG_HOST="${CORFU_SEQUENCER_LOG_HOST:-c2}"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${RUN_TS}}"
 
@@ -54,7 +55,7 @@ TAG='$TAG' SYSTEM='$SYSTEM' ORDER='$ORDER' SEQUENCER='$SEQUENCER' NUM_CLIENTS='$
 REPLICATION_FACTOR='$REPLICATION_FACTOR' ACK_LEVEL='$ACK_LEVEL' NUM_TRIALS='$NUM_TRIALS' NUM_BROKERS='$NUM_BROKERS' \\
 TOTAL_MESSAGE_SIZE='$TOTAL_MESSAGE_SIZE' MESSAGE_SIZE='$MESSAGE_SIZE' TEST_TYPE='$TEST_TYPE' \\
 THREADS_PER_BROKER='$THREADS_PER_BROKER' BROKER_IP='$BROKER_IP' START_DELAY_SEC='$START_DELAY_SEC' \\
-LOCAL_CLIENT_NUMA='$LOCAL_CLIENT_NUMA' bash scripts/publication/run_throughput_cell.sh
+LOCAL_CLIENT_NUMA='$LOCAL_CLIENT_NUMA' CORFU_SEQUENCER_LOG_HOST='$CORFU_SEQUENCER_LOG_HOST' bash scripts/publication/run_throughput_cell.sh
 EOF
 chmod +x "$RUN_DIR/command.sh"
 
@@ -79,6 +80,7 @@ broker_numa=node1
 broker_ip=$BROKER_IP
 local_client_numa=$LOCAL_CLIENT_NUMA
 start_delay_sec=$START_DELAY_SEC
+corfu_sequencer_log_host=$CORFU_SEQUENCER_LOG_HOST
 commit=$COMMIT
 start_time_utc=$RUN_TS
 EOF
@@ -116,7 +118,8 @@ set -e
 cp -a "$PROJECT_ROOT/multiclient_logs/." "$RAW_DIR/" 2>/dev/null || true
 cp -a build/bin/broker_*.log "$RAW_DIR/" 2>/dev/null || true
 cp -a /tmp/broker_*.log "$RAW_DIR/" 2>/dev/null || true
-scp -o StrictHostKeyChecking=no c1:/tmp/corfu_sequencer.log "$RAW_DIR/c1_corfu_sequencer.log" >/dev/null 2>&1 || true
+scp -o StrictHostKeyChecking=no "${CORFU_SEQUENCER_LOG_HOST}:/tmp/corfu_sequencer.log" \
+  "$RAW_DIR/${CORFU_SEQUENCER_LOG_HOST}_corfu_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
 echo "system,order,sequencer,num_clients,client_layout,replication_factor,run_idx,status,throughput_gbps,artifact_dir,commit" > "$SUMMARY_CSV"

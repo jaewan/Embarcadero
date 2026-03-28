@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <chrono>
+#include <thread>
 #include <cstring>
 #include <array>
 #include <deque>
@@ -33,13 +34,18 @@ struct PendingTokenUpdate {
 inline void RefreshGOIEntry(GOIEntry* entry) {
     CXL::flush_cacheline(entry);
     CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);
-    CXL::load_fence();
+    // GOI lives in non-coherent CXL memory. CLFLUSHOPT visibility must be ordered with a
+    // full fence before subsequent metadata loads, otherwise readers can observe stale
+    // publication/token state even after the producer flushed it.
+    CXL::full_fence();
 }
 
 inline void RefreshGOIToken(GOIEntry* entry) {
     // num_replicated is in the first cache line of GOIEntry; avoid touching line 2 in token hot path.
     CXL::flush_cacheline(entry);
-    CXL::load_fence();
+    // Token handoff correctness relies on seeing the producer's flushed num_replicated update.
+    // A load fence is insufficient for CLFLUSHOPT ordering on non-coherent CXL.
+    CXL::full_fence();
 }
 
 std::vector<std::string> SplitCsv(const std::string& csv) {
@@ -76,6 +82,11 @@ inline size_t InMemorySinkBytesPerSource() {
 
 inline bool ShouldCopyInMemorySinkPayload() {
     static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY", false);
+    return enabled;
+}
+
+inline bool ShouldEnableOrder5Trace() {
+    static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_TRACE", false);
     return enabled;
 }
 
@@ -269,6 +280,7 @@ void ChainReplicationManager::ReplicationThread() {
     std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> pending_by_source;
     std::array<uint64_t, NUM_MAX_BROKERS> token_poll_not_before_ns{};
     std::array<uint64_t, NUM_MAX_BROKERS> token_wait_backoff_ns{};
+    std::array<uint64_t, NUM_MAX_BROKERS> token_stall_log_deadline_ns{};
     int token_scan_start_src = 0;
     std::vector<int8_t> source_role_map;
     std::array<std::deque<PendingTokenUpdate>, NUM_MAX_BROKERS> write_queues;
@@ -278,6 +290,7 @@ void ChainReplicationManager::ReplicationThread() {
     std::deque<PendingTokenUpdate> completed_writes;
     std::atomic<size_t> queued_writes{0};
     std::atomic<bool> write_error{false};
+    std::atomic<bool> shutdown_workers{false};
     std::vector<std::thread> write_workers;
     const bool in_memory_sink = ShouldUseInMemorySink();
     const bool in_memory_copy = in_memory_sink && ShouldCopyInMemorySinkPayload();
@@ -318,20 +331,19 @@ void ChainReplicationManager::ReplicationThread() {
     token_wait_backoff_ns.fill(kMinWaitPollBackoffNs);
     source_role_map.assign(static_cast<size_t>(std::max(0, num_brokers_)), static_cast<int8_t>(-1));
     for (int src = 0; src < num_brokers_; ++src) {
-        int8_t role = -1;
-        for (int i = 0; i < replication_factor_; ++i) {
-            const int replica_broker = Embarcadero::GetReplicationSetBroker(
-                src, replication_factor_, num_brokers_, i);
-            if (replica_broker == local_broker_id_) {
-                role = static_cast<int8_t>(i);
-                break;
-            }
-        }
-        source_role_map[static_cast<size_t>(src)] = role;
+        const int role = Embarcadero::GetReplicationChainRole(
+            local_broker_id_, src, replication_factor_, num_brokers_);
+        const int8_t role8 = (role < 0) ? static_cast<int8_t>(-1) : static_cast<int8_t>(role);
+        source_role_map[static_cast<size_t>(src)] = role8;
+        LOG(INFO) << "ChainReplicationManager: local_broker_id=" << local_broker_id_
+                  << " source=" << src << " role=" << static_cast<int>(role8);
     }
     auto refresh_control_state = [&](uint64_t goi_index) {
         CXL::flush_cacheline(control_block);
-        CXL::load_fence();
+        // ControlBlock lives in non-coherent CXL just like GOI metadata. A load fence does not
+        // order CLFLUSHOPT, so replicas can strand on a stale committed_seq/epoch snapshot and
+        // stop ingesting the final committed GOI tail.
+        CXL::full_fence();
         cached_committed_seq = control_block->committed_seq.load(std::memory_order_acquire);
         cached_epoch = static_cast<uint16_t>(
             control_block->epoch.load(std::memory_order_acquire) & 0xFFFFu);
@@ -346,10 +358,11 @@ void ChainReplicationManager::ReplicationThread() {
                 {
                     std::unique_lock<std::mutex> lk(write_mu[src]);
                     write_cv[src].wait(lk, [&] {
-                        return stop_.load(std::memory_order_acquire) || !write_queues[src].empty();
+                        return shutdown_workers.load(std::memory_order_acquire) ||
+                               !write_queues[src].empty();
                     });
                     if (write_queues[src].empty()) {
-                        if (stop_.load(std::memory_order_acquire)) {
+                        if (shutdown_workers.load(std::memory_order_acquire)) {
                             break;
                         }
                         continue;
@@ -402,10 +415,30 @@ void ChainReplicationManager::ReplicationThread() {
         });
     }
 
-    while (!stop_.load(std::memory_order_acquire)) {
+    auto completed_writes_pending = [&]() -> bool {
+        std::lock_guard<std::mutex> lk(completed_mu);
+        return !completed_writes.empty();
+    };
+
+    while (true) {
+        const bool stop_requested = stop_.load(std::memory_order_acquire);
+        if (stop_requested) {
+            const uint64_t goi_index = next_goi_index_.load(std::memory_order_relaxed);
+            refresh_control_state(goi_index);
+            const bool more_committed_goi =
+                (cached_committed_seq != UINT64_MAX && goi_index <= cached_committed_seq);
+            if (!more_committed_goi &&
+                pending_total() == 0 &&
+                queued_writes.load(std::memory_order_acquire) == 0 &&
+                !completed_writes_pending()) {
+                break;
+            }
+        }
+
         bool made_progress = false;
 
         // Stage 1: ingest GOI entries and copy payloads without waiting on token progression.
+        bool stage1_blocked_on_chain_token = false;
         while (pending_and_inflight() < kMaxPendingTokenUpdates) {
             const uint64_t goi_index = next_goi_index_.load(std::memory_order_relaxed);
 
@@ -480,6 +513,20 @@ void ChainReplicationManager::ReplicationThread() {
                 continue;
             }
 
+            // Role r>0 runs on a different process than role 0. Without this gate, the tail can finish
+            // pwrite and enter token/CV stages while the head has not yet published num_replicated >= r
+            // in CXL, yielding token=0 stalls and stuck ACK2 frontiers (ORDER=5 RF=2 latency runs).
+            if (my_role > 0) {
+                RefreshGOIToken(entry);
+                const uint32_t tok = entry->num_replicated.load(std::memory_order_acquire);
+                if (tok < static_cast<uint32_t>(my_role)) {
+                    stage1_blocked_on_chain_token = true;
+                    break;
+                }
+            }
+
+            stage1_blocked_on_chain_token = false;
+
             const size_t src_idx = static_cast<size_t>(source_broker);
             if (!in_memory_sink &&
                 (src_idx >= source_disk_fds_.size() || source_disk_fds_[src_idx] < 0)) {
@@ -505,6 +552,9 @@ void ChainReplicationManager::ReplicationThread() {
             next_goi_index_.fetch_add(1, std::memory_order_relaxed);
             made_progress = true;
         }
+        if (stage1_blocked_on_chain_token) {
+            std::this_thread::yield();
+        }
 
         // Stage 2a: move completed writes into token-serialization stage.
         while (true) {
@@ -517,17 +567,44 @@ void ChainReplicationManager::ReplicationThread() {
             }
             batches_replicated++;
             made_progress = true;
+            if (ShouldEnableOrder5Trace() && completed.cumulative_msg_count >= 1'040'000) {
+                LOG(INFO) << "[ORDER5_TRACE_CR_COMPLETED]"
+                          << " local_broker=" << local_broker_id_
+                          << " source=" << completed.source_broker
+                          << " owner=" << completed.owner_broker
+                          << " goi=" << completed.goi_index
+                          << " role=" << completed.role
+                          << " pbr=" << completed.pbr_index
+                          << " cumulative=" << completed.cumulative_msg_count;
+            }
 
             GOIEntry* entry = &goi_[completed.goi_index];
             if (completed.role == 0) {
-                // Role-0 owns first token step.
+                // Role-0 owns first token step (CAS: single winner publishes 0→1 for CXL visibility).
                 RefreshGOIToken(entry);
-                uint16_t token = static_cast<uint16_t>(entry->num_replicated.load(std::memory_order_acquire));
+                uint32_t token = entry->num_replicated.load(std::memory_order_acquire);
                 if (token == 0) {
-                    entry->num_replicated.store(static_cast<uint16_t>(1), std::memory_order_release);
-                    CXL::flush_cacheline(entry);
-                    CXL::store_fence();
-                    token = 1;
+                    uint32_t expected = 0;
+                    constexpr uint32_t kAfterHead = 1;
+                    if (entry->num_replicated.compare_exchange_strong(
+                            expected, kAfterHead, std::memory_order_release, std::memory_order_acquire)) {
+                        CXL::flush_cacheline(entry);
+                        CXL::store_fence();
+                        token = 1;
+                        if (ShouldEnableOrder5Trace() && completed.cumulative_msg_count >= 1'040'000) {
+                            LOG(INFO) << "[ORDER5_TRACE_CR_TOKEN_SET]"
+                                      << " local_broker=" << local_broker_id_
+                                      << " source=" << completed.source_broker
+                                      << " owner=" << completed.owner_broker
+                                      << " goi=" << completed.goi_index
+                                      << " role=" << completed.role
+                                      << " token=" << token
+                                      << " pbr=" << completed.pbr_index
+                                      << " cumulative=" << completed.cumulative_msg_count;
+                        }
+                    } else {
+                        token = expected;
+                    }
                 }
                 if (replication_factor_ == 1 &&
                     token >= static_cast<uint16_t>(replication_factor_)) {
@@ -562,8 +639,25 @@ void ChainReplicationManager::ReplicationThread() {
                 GOIEntry* entry = &goi_[h.goi_index];
                 RefreshGOIToken(entry);
 
-                uint16_t token = static_cast<uint16_t>(entry->num_replicated.load(std::memory_order_acquire));
+                uint32_t token = entry->num_replicated.load(std::memory_order_acquire);
                 if (token < h.role) {
+                    if (ShouldEnableOrder5Trace()) {
+                        const uint64_t now_trace_ns = SteadyNowNs();
+                        if (now_trace_ns >= token_stall_log_deadline_ns[src]) {
+                            LOG(INFO) << "[ORDER5_TRACE_CR_TOKEN_WAIT]"
+                                      << " local_broker=" << local_broker_id_
+                                      << " source=" << src
+                                      << " owner=" << h.owner_broker
+                                      << " goi=" << h.goi_index
+                                      << " role=" << h.role
+                                      << " token=" << token
+                                      << " pbr=" << h.pbr_index
+                                      << " cumulative=" << h.cumulative_msg_count
+                                      << " pending_src=" << q.size()
+                                      << " pending_total=" << pending_total();
+                            token_stall_log_deadline_ns[src] = now_trace_ns + 250'000'000ULL;
+                        }
+                    }
                     const uint64_t backoff = token_wait_backoff_ns[src];
                     token_poll_not_before_ns[src] = now_ns + backoff;
                     token_wait_backoff_ns[src] = std::min(backoff << 1, kMaxWaitPollBackoffNs);
@@ -572,11 +666,28 @@ void ChainReplicationManager::ReplicationThread() {
                 token_poll_not_before_ns[src] = 0;
                 token_wait_backoff_ns[src] = kMinWaitPollBackoffNs;
                 if (token == h.role) {
-                    entry->num_replicated.store(static_cast<uint16_t>(h.role + 1), std::memory_order_release);
-                    CXL::flush_cacheline(entry);
-                    CXL::store_fence();
-                    token = static_cast<uint16_t>(h.role + 1);
-                    made_progress = true;
+                    uint32_t expected = static_cast<uint32_t>(h.role);
+                    const uint32_t desired = static_cast<uint32_t>(h.role) + 1u;
+                    if (entry->num_replicated.compare_exchange_strong(
+                            expected, desired, std::memory_order_release, std::memory_order_acquire)) {
+                        CXL::flush_cacheline(entry);
+                        CXL::store_fence();
+                        token = desired;
+                        made_progress = true;
+                        if (ShouldEnableOrder5Trace() && h.cumulative_msg_count >= 1'040'000) {
+                            LOG(INFO) << "[ORDER5_TRACE_CR_TOKEN_ADVANCE]"
+                                      << " local_broker=" << local_broker_id_
+                                      << " source=" << src
+                                      << " owner=" << h.owner_broker
+                                      << " goi=" << h.goi_index
+                                      << " role=" << h.role
+                                      << " token=" << token
+                                      << " pbr=" << h.pbr_index
+                                      << " cumulative=" << h.cumulative_msg_count;
+                        }
+                    } else {
+                        token = expected;
+                    }
                 }
 
                 if (h.role == static_cast<uint16_t>(replication_factor_ - 1) &&
@@ -628,7 +739,7 @@ void ChainReplicationManager::ReplicationThread() {
         }
     }
 
-    stop_.store(true, std::memory_order_release);
+    shutdown_workers.store(true, std::memory_order_release);
     for (int src = 0; src < num_brokers_; ++src) {
         write_cv[src].notify_all();
     }
@@ -642,10 +753,23 @@ void ChainReplicationManager::ReplicationThread() {
 }
 
 void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count) {
+    static std::atomic<uint64_t> cv_update_logs{0};
+    const uint64_t log_idx = cv_update_logs.fetch_add(1, std::memory_order_relaxed);
+    if (log_idx < 16 || (log_idx % 512) == 0 ||
+        (ShouldEnableOrder5Trace() && cumulative_msg_count >= 1000000)) {
+        LOG(INFO) << "ChainReplicationManager: UpdateCompletionVector local_broker_id="
+                  << local_broker_id_
+                  << " broker_id=" << broker_id
+                  << " pbr_index=" << pbr_index
+                  << " cumulative_msg_count=" << cumulative_msg_count
+                  << " replica_id=" << replica_id_;
+    }
+
     // Tail replica owns ACK2 durability frontier.
-    // Use max semantics directly on both fields:
-    // - completed_pbr_head: export/recovery visibility
-    // - completed_logical_offset: durable ACK2 frontier (message count)
+    // All three data fields (completed_pbr_head, sequencer_logical_offset, completed_logical_offset)
+    // reside in the first 24 bytes of the 128B-aligned entry — a single 64B cache line.
+    CXL::flush_cacheline(&cv_[broker_id]);
+    CXL::full_fence();
     uint64_t cur = cv_[broker_id].completed_pbr_head.load(std::memory_order_acquire);
     while (cur == kNoProgress || pbr_index > cur) {
         if (cv_[broker_id].completed_pbr_head.compare_exchange_strong(

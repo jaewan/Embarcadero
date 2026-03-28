@@ -19,6 +19,8 @@ MODES="${MODES:-steady}"
 PUBLISHER_HOST="${PUBLISHER_HOST:-c4}"
 BROKER_HOST="${BROKER_HOST:-moscxl}"
 BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
+# Corfu gRPC sequencer log fetch (publication default: c2; override if your layout host differs).
+CORFU_SEQUENCER_LOG_HOST="${CORFU_SEQUENCER_LOG_HOST:-c2}"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${RUN_TS}}"
 
@@ -44,7 +46,8 @@ cd "$PROJECT_ROOT"
 TAG='$TAG' SYSTEM='$SYSTEM' ORDER='$ORDER' SEQUENCER='$SEQUENCER' REPLICATION_FACTOR='$REPLICATION_FACTOR' \\
 NUM_TRIALS='$NUM_TRIALS' NUM_BROKERS='$NUM_BROKERS' MSG_SIZE='$MSG_SIZE' TOTAL_MESSAGE_SIZE='$TOTAL_MESSAGE_SIZE' \\
 ACK_LEVEL='$ACK_LEVEL' MODES='$MODES' PUBLISHER_HOST='$PUBLISHER_HOST' BROKER_HOST='$BROKER_HOST' \\
-BROKER_LISTEN_ADDR='$BROKER_LISTEN_ADDR' bash scripts/publication/run_latency_cell.sh
+BROKER_LISTEN_ADDR='$BROKER_LISTEN_ADDR' CORFU_SEQUENCER_LOG_HOST='$CORFU_SEQUENCER_LOG_HOST' \\
+bash scripts/publication/run_latency_cell.sh
 EOF
 chmod +x "$RUN_DIR/command.sh"
 
@@ -64,6 +67,7 @@ modes=$MODES
 publisher_host=$PUBLISHER_HOST
 broker_host=$BROKER_HOST
 broker_listen_addr=$BROKER_LISTEN_ADDR
+corfu_sequencer_log_host=$CORFU_SEQUENCER_LOG_HOST
 commit=$COMMIT
 start_time_utc=$RUN_TS
 EOF
@@ -95,7 +99,8 @@ RUN_STATUS=${PIPESTATUS[0]}
 set -e
 
 cp -a build/bin/broker_*.log "$RUN_DIR/" 2>/dev/null || true
-scp -o StrictHostKeyChecking=no c1:/tmp/corfu_sequencer.log "$RUN_DIR/c1_corfu_sequencer.log" >/dev/null 2>&1 || true
+scp -o StrictHostKeyChecking=no "${CORFU_SEQUENCER_LOG_HOST}:/tmp/corfu_sequencer.log" \
+  "$RUN_DIR/${CORFU_SEQUENCER_LOG_HOST}_corfu_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
 echo "system,order,sequencer,replication_factor,publisher_host,broker_host,run_idx,status,p50_us,p95_us,p99_us,max_us,artifact_dir,commit" > "$SUMMARY_CSV"

@@ -86,8 +86,12 @@ BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
 REMOTE_CORFU_SEQUENCER_HOST="${REMOTE_CORFU_SEQUENCER_HOST:-}"
 REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}"
 
-# NUMA binding for broker processes (always NUMA 1 for CXL locality)
+# NUMA: CPUs on compute node 1; membind includes node 2 when CXL is a **zero-core** NUMA node (see cxl_manager.cc mbind).
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
+# CORFU: same default as run_multiclient — do not wrap embarlet in numactl unless you set EMBARLET_NUMA_BIND_CORFU.
+if [[ "$SEQUENCER" == "CORFU" ]]; then
+  EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND_CORFU-}"
+fi
 
 # ---------------------------------------------------------------------------
 # Initialise paths (sets BROKER_CONFIG_ABS, CLIENT_CONFIG_ABS, etc.)
@@ -103,10 +107,9 @@ if [ -z "${CLIENT_NUMA_BIND+x}" ]; then
   if [[ "$SCENARIO" == "remote" ]]; then
     CLIENT_NUMA_BIND=""
   else
-    # Single-node loopback: bind to NUMA 1 to match broker socket buffer locality.
-    # Binding to NUMA 0 doubles avg_send_us (~500 µs vs ~250 µs) and halves subscribe
-    # throughput because the kernel loopback copy crosses NUMA.
-    CLIENT_NUMA_BIND="numactl --cpunodebind=1 --membind=1"
+    # Single-node: CPUs on node 1 (match brokers). membind=1,2 so policy allows the CXL NUMA node
+    # (often node 2, no CPUs) used by head mbind; keeps heap preferring DRAM while shared CXL maps correctly.
+    CLIENT_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
   fi
 fi
 
@@ -262,8 +265,12 @@ run_trial() {
     local quoted_cmd
     quoted_cmd="cd ${REMOTE_CLIENT_BIN_DIR} && "
     quoted_cmd+="export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE} && "
-    quoted_cmd+="export EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP:-} && "
-    quoted_cmd+="export EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT:-} && "
+    if [[ -n "${EMBARCADERO_CORFU_SEQ_IP:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP} && "
+    fi
+    if [[ -n "${EMBARCADERO_CORFU_SEQ_PORT:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT} && "
+    fi
     if [[ -n "$CLIENT_NUMA_BIND" ]]; then
       quoted_cmd+="$CLIENT_NUMA_BIND "
     fi

@@ -127,7 +127,7 @@ struct EmbarcaderoConfig {
             // Default ACK drain after successful publish completion in each mode.
             ConfigValue<int> ack_drain_ms_throughput{50, "EMBARCADERO_ACK_DRAIN_MS_THROUGHPUT"};
             ConfigValue<int> ack_drain_ms_failure{3000, "EMBARCADERO_ACK_DRAIN_MS_FAILURE"};
-            ConfigValue<int> ack_drain_ms_latency{50, "EMBARCADERO_ACK_DRAIN_MS_LATENCY"};
+            ConfigValue<int> ack_drain_ms_latency{0, "EMBARCADERO_ACK_DRAIN_MS_LATENCY"};
             // Socket buffer policy by mode. Throughput mode uses larger buffers.
             ConfigValue<size_t> socket_send_buffer_bytes_throughput{256UL * 1024 * 1024, "EMBARCADERO_SOCKET_SNDBUF_BYTES_THROUGHPUT"};
             ConfigValue<size_t> socket_send_buffer_bytes_failure{16UL * 1024 * 1024, "EMBARCADERO_SOCKET_SNDBUF_BYTES_FAILURE"};

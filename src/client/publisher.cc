@@ -15,20 +15,15 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
-#include <cstdlib>  // For getenv, atoi
+#include <cstdlib>
 #include <fstream>
-#include <iomanip>
 #include <thread>
 #include <limits>
 #include <mutex>
 #include <netdb.h>
 #include <numeric>
-#include <optional>
 #include <set>
-#include <shared_mutex>
 #include <stdexcept>
-
-// [[CODE_CLEANUP]] Removed no-op profiling stubs - if profiling is needed, implement properly
 
 
 bool ShouldEnableNetworkPathProfile() {
@@ -1768,11 +1763,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				// CRITICAL: Don't exit immediately if we haven't sent any batches yet
 				// This ensures the connection stays alive even if this thread got no batches
 				// NetworkManager expects to receive at least one batch header per connection
-					if (!has_sent_batch) {
-						zero_batch_publish_threads_.fetch_add(1, std::memory_order_relaxed);
-						// Wait a bit to see if batches arrive, then exit gracefully
-						std::this_thread::sleep_for(std::chrono::milliseconds(100));
-					}
+				if (!has_sent_batch) {
+					zero_batch_publish_threads_.fetch_add(1, std::memory_order_relaxed);
+					std::this_thread::yield();
+				}
 				// Drain remaining batches before exit.
 				while ((batch_header = static_cast<Embarcadero::BatchHeader*>(pubQue_.Read(pubQuesIdx))) != nullptr
 				       && batch_header->total_size != 0) {
@@ -1800,8 +1794,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 	process_batch:
 			consecutive_empty_reads = 0;
-			static thread_local size_t batch_count = 0;
-			++batch_count;
 #ifdef COLLECT_LATENCY_STATS
 			auto submit_time = std::chrono::steady_clock::now();
 			bool has_submit_time = pubQue_.GetBatchSubmitTime(batch_header, &submit_time);
@@ -1963,9 +1955,9 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		// Try to send batch header, handle failures
 		try {
 			send_batch_header();
-			if (batch_count % 100 == 0 || batch_count == 1) {
+			if (sent_batches % 100 == 0 || sent_batches == 0) {
 				VLOG(2) << "PublishThread[" << pubQuesIdx << "]: Sent batch header for batch " 
-				        << batch_count << " to broker " << broker_id;
+				        << sent_batches << " to broker " << broker_id;
 			}
 		} catch (const std::exception& e) {
 			total_batches_failed_.fetch_add(1, std::memory_order_relaxed);

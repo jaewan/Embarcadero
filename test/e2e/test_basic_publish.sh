@@ -17,7 +17,8 @@ TEST_NAME="basic_publish"
 NUM_BROKERS=4
 MESSAGE_SIZE=128
 TOTAL_MESSAGES=1000  # Small for quick test
-NUMA_BIND="numactl --cpunodebind=1 --membind=1"
+# Include CXL NUMA node in membind when cxl.numa_node is a zero-core expander (e.g. node 2); CPUs stay on node 1.
+NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
 
 # Colors for output
 RED='\033[0;31m'
@@ -258,8 +259,8 @@ run_client_test() {
     local total_size=$((MESSAGE_SIZE * TOTAL_MESSAGES))
     log_info "Total data size: $total_size bytes"
 
-    # Run throughput test
-    "$BIN_DIR/throughput_test" \
+    # Run throughput test (same NUMA policy as brokers: CPU node 1, membind includes CXL node)
+    $NUMA_BIND "$BIN_DIR/throughput_test" \
         --config "$CONFIG_DIR/client.yaml" \
         -m "$MESSAGE_SIZE" \
         -s "$total_size" \
@@ -278,9 +279,9 @@ run_client_test() {
         return 1
     fi
 
-    # Verify client didn't report errors
-    if grep -i "error\|failed\|timeout" client.log 2>/dev/null; then
-        log_error "Client reported errors in log"
+    # glog WARNING lines often contain "failed" (e.g. MAP_HUGETLB retry) while the run succeeds; require real errors.
+    if grep -E '^E[0-9]{8}|FATAL|Segmentation fault|Assertion .* failed' client.log 2>/dev/null; then
+        log_error "Client reported fatal/error-level issues in log"
         cat client.log
         return 1
     fi

@@ -3,7 +3,7 @@ client:
     mode: throughput
     ack_drain_ms_throughput: 50
     ack_drain_ms_failure: 3000
-    ack_drain_ms_latency: 50
+    ack_drain_ms_latency: 0
     socket_send_buffer_bytes_throughput: 268435456
     socket_send_buffer_bytes_failure: 16777216
     socket_send_buffer_bytes_latency: 16777216
