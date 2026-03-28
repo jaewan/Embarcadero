@@ -51,6 +51,12 @@ double BytesToMiB(uint64_t bytes) {
 	return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
+int64_t SteadyNowNs() {
+	return static_cast<int64_t>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 size_t RuntimePayloadSendChunkBytes() {
 	static const size_t value = []() {
 		const char* env = std::getenv("EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES");
@@ -787,18 +793,29 @@ void Publisher::Init(int ack_level) {
 	// This prevents the race where publishing completes before all ACK connections are up
 	if (ack_level_ >= 1) {
 		constexpr auto ACK_CONNECTION_TIMEOUT = std::chrono::seconds(30);
+		// Small debounce so staged cluster-status updates do not race ACK readiness,
+		// without imposing a fixed quarter-second startup penalty on every run.
+		constexpr auto ACK_EXPECTED_STABLE_WINDOW = std::chrono::milliseconds(25);
 		auto ack_wait_start = std::chrono::steady_clock::now();
 		auto last_log_time = ack_wait_start;
-		int expected = expected_ack_brokers_.load(std::memory_order_acquire);
 
-		while (expected > 0) {
+		while (true) {
+			const int expected = expected_ack_brokers_.load(std::memory_order_acquire);
+			const int64_t last_expected_update_ns =
+				expected_ack_brokers_last_update_ns_.load(std::memory_order_acquire);
 			int connected_count;
 			{
 				absl::MutexLock lock(&mutex_);
 				connected_count = static_cast<int>(brokers_with_ack_connection_.size());
 			}
 
-			if (connected_count >= expected) {
+			const bool expected_is_stable =
+				last_expected_update_ns > 0 &&
+				(SteadyNowNs() - last_expected_update_ns) >=
+					std::chrono::duration_cast<std::chrono::nanoseconds>(
+						ACK_EXPECTED_STABLE_WINDOW).count();
+
+			if (expected > 0 && connected_count >= expected && expected_is_stable) {
 				VLOG(1) << "Publisher::Init() All " << expected << " broker ACK connections established";
 				break;
 			}
@@ -809,7 +826,9 @@ void Publisher::Init(int ack_level) {
 			// Log progress every 2 seconds
 			if (now - last_log_time >= std::chrono::seconds(2)) {
 				VLOG(1) << "Publisher::Init() Waiting for broker ACK connections: "
-				         << connected_count << " / " << expected << " (elapsed: " << elapsed.count() << "s)";
+				         << connected_count << " / " << expected
+				         << " (elapsed: " << elapsed.count() << "s, expected_stable="
+				         << (expected_is_stable ? "yes" : "no") << ")";
 				last_log_time = now;
 			}
 
@@ -2172,8 +2191,6 @@ void Publisher::SubscribeToClusterStatus() {
 				if (!brokers_needing_threads.empty()) {
 					VLOG(1) << "SubscribeToCluster: Adding publisher threads for "
 					         << brokers_needing_threads.size() << " broker(s)";
-					// [[FIX: B3=0 ACKs]] Set expected ACK brokers count for tracking
-					expected_ack_brokers_.store(static_cast<int>(brokers_needing_threads.size()), std::memory_order_release);
 					bool all_connected = true;
 					for (int broker_id : brokers_needing_threads) {
 						VLOG(1) << "SubscribeToCluster: Adding publisher threads for broker " << broker_id;
@@ -2186,6 +2203,12 @@ void Publisher::SubscribeToClusterStatus() {
 						{
 							absl::MutexLock lock(&mutex_);
 							brokers_with_threads_.insert(broker_id);
+							expected_ack_brokers_.store(
+								static_cast<int>(brokers_with_threads_.size()),
+								std::memory_order_release);
+							expected_ack_brokers_last_update_ns_.store(
+								SteadyNowNs(),
+								std::memory_order_release);
 						}
 					}
 

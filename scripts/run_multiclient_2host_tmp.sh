@@ -7,8 +7,8 @@
 #
 # Client roster (order defines who is added at each NUM_CLIENTS level):
 #   NUM_CLIENTS=1  → c4              (NUMA 1)
-#   NUM_CLIENTS=2  → c4, local       (NUMA 1, 0)
-#   NUM_CLIENTS=3  → c4, local, c3   (NUMA 1, 0, 1)
+#   NUM_CLIENTS=2  → c4, c3          (NUMA 1, 1)
+#   NUM_CLIENTS=3  → c4, c3, local   (NUMA 1, 1, 0)
 #   NUM_CLIENTS=4  → c4, local, c3, c2
 #   NUM_CLIENTS=5  → c4, local, c3, c2, c1
 #
@@ -19,10 +19,7 @@
 #   EMBARCADERO_HEAD_ADDR (broker IP, default 10.10.10.10)
 #   EMBARCADERO_ORDER0_FAST_PATH, EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES,
 #   EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE, EMBARCADERO_BATCH_SIZE,
-#   EMBARCADERO_CLIENT_PUB_BATCH_KB, EMBARCADERO_NETWORK_IO_THREADS,
-#   EMBARCADERO_ORDER5_HOME_BROKERS, LOCAL_CLIENT_NUMA,
-#   REMOTE_CORFU_SEQUENCER_HOST, REMOTE_CORFU_BUILD_BIN
-#   EMBARCADERO_CORFU_SEQ_IP / EMBARCADERO_CORFU_SEQ_PORT for CORFU + SSH clients
+#   EMBARCADERO_CLIENT_PUB_BATCH_KB, EMBARCADERO_NETWORK_IO_THREADS
 #
 # Example:
 #   NUM_CLIENTS=3 NUM_BROKERS=4 MESSAGE_SIZE=8192 scripts/run_multiclient.sh
@@ -33,8 +30,8 @@ set -euo pipefail
 # Cluster topology — order determines activation sequence
 # "local" means this broker machine (where brokers run); everything else is SSH
 # ---------------------------------------------------------------------------
-declare -a CLIENT_HOSTS=( "c4"  "local" "c3"  "c2"  "c1"  )
-declare -a CLIENT_NUMAS=( "1"   ""      "1"   "1"   "1"   )
+declare -a CLIENT_HOSTS=( "c4"  "local" )
+declare -a CLIENT_NUMAS=( "1"   "1" )
 MAX_CLIENTS=${#CLIENT_HOSTS[@]}
 
 # ---------------------------------------------------------------------------
@@ -68,12 +65,7 @@ EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE=${EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE:-1}
 EMBARCADERO_BATCH_SIZE=${EMBARCADERO_BATCH_SIZE:-524288}
 EMBARCADERO_CLIENT_PUB_BATCH_KB=${EMBARCADERO_CLIENT_PUB_BATCH_KB:-512}
 EMBARCADERO_NETWORK_IO_THREADS=${EMBARCADERO_NETWORK_IO_THREADS:-4}
-EMBARCADERO_ORDER5_HOME_BROKERS=${EMBARCADERO_ORDER5_HOME_BROKERS:-}
-EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP:-}
-EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT:-}
-CLIENT_LD_LIBRARY_PATH=${CLIENT_LD_LIBRARY_PATH:-${LD_LIBRARY_PATH:-}}
-REMOTE_CORFU_SEQUENCER_HOST=${REMOTE_CORFU_SEQUENCER_HOST:-}
-REMOTE_CORFU_BUILD_BIN=${REMOTE_CORFU_BUILD_BIN:-}
+
 # ---------------------------------------------------------------------------
 # Derived paths
 # ---------------------------------------------------------------------------
@@ -103,40 +95,6 @@ if [[ "$SEQUENCER" == "CORFU" ]] && [[ "$ORDER" != "2" ]]; then
     exit 1
 fi
 
-corfu_seq_ip_is_loopback() {
-    case "${EMBARCADERO_CORFU_SEQ_IP:-}" in
-        ""|127.0.0.1|localhost)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-corfu_uses_remote_clients() {
-    local i host
-    for (( i=0; i<NUM_CLIENTS; i++ )); do
-        host="${CLIENT_HOSTS[$i]}"
-        if [[ "$host" != "local" ]]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-if [[ "$SEQUENCER" == "CORFU" ]] && corfu_uses_remote_clients && corfu_seq_ip_is_loopback; then
-    echo "ERROR: CORFU with SSH clients requires EMBARCADERO_CORFU_SEQ_IP to be a routable non-loopback address." >&2
-    if [[ -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
-        echo "       Sequencer host: $REMOTE_CORFU_SEQUENCER_HOST" >&2
-        echo "       Hint: ssh $REMOTE_CORFU_SEQUENCER_HOST 'hostname -I'" >&2
-    else
-        echo "       Hint: set EMBARCADERO_CORFU_SEQ_IP to the sequencer host dataplane IP." >&2
-        echo "       Local interfaces: $(hostname -I 2>/dev/null || true)" >&2
-    fi
-    exit 1
-fi
-
 # ---------------------------------------------------------------------------
 # Source lifecycle helpers (provides broker_local_wait_for_cluster, etc.)
 # broker_is_remote_mode() tests for REMOTE_BROKER_HOST; unset it so we stay local
@@ -154,67 +112,6 @@ EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
 # ---------------------------------------------------------------------------
 log() { [ "$QUIET" != "1" ] && echo "$*"; }
 
-infer_broker_cpu_numa() {
-    if [[ "$EMBARLET_NUMA_BIND" =~ --cpunodebind=([0-9]+) ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-        return
-    fi
-    printf '%s\n' "1"
-}
-
-resolve_local_client_numa() {
-    if [[ -n "${LOCAL_CLIENT_NUMA:-}" ]]; then
-        printf '%s\n' "$LOCAL_CLIENT_NUMA"
-        return
-    fi
-    # Publication throughput uses the broker-node local client on NUMA 0 to match
-    # the requested study topology and avoid cross-NUMA loopback penalties.
-    printf '%s\n' "0"
-}
-
-resolve_client_numa() {
-    local host="$1"
-    local default_numa="$2"
-    if [[ "$host" == "local" ]]; then
-        resolve_local_client_numa
-        return
-    fi
-    printf '%s\n' "$default_numa"
-}
-
-verify_client_binary() {
-    local host="$1"
-    local remote_cmd="
-set -e
-cd '$BUILD_BIN'
-if [ ! -x ./throughput_test ]; then
-    echo 'missing throughput_test in $BUILD_BIN'
-    exit 10
-fi
-if command -v ldd >/dev/null 2>&1; then
-    LD_LIBRARY_PATH=\"$CLIENT_LD_LIBRARY_PATH\" ldd ./throughput_test 2>/dev/null | grep -E 'not found|GLIBC_|GLIBCXX_' && exit 11 || true
-fi
-"
-    if [[ "$host" == "local" ]]; then
-        bash -lc "$remote_cmd"
-    else
-        ssh "$host" "$remote_cmd"
-    fi
-}
-
-preflight_clients() {
-    local failed=0
-    for (( i=0; i<NUM_CLIENTS; i++ )); do
-        local host="${CLIENT_HOSTS[$i]}"
-        if ! verify_client_binary "$host"; then
-            echo "ERROR: client preflight failed on host '$host'." >&2
-            echo "       Ensure /home/domin/Embarcadero/build/bin/throughput_test exists and is runnable on that host." >&2
-            failed=1
-        fi
-    done
-    return "$failed"
-}
-
 shm_cleanup() {
     shm_unlink "${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
     rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
@@ -223,9 +120,6 @@ shm_cleanup() {
 cleanup() {
     log "Cleaning up..."
     broker_local_cleanup
-    if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
-        broker_remote_corfu_stop || true
-    fi
     shm_cleanup
     # Kill remote client processes (ignore failures)
     for (( _i=0; _i<${NUM_CLIENTS:-0}; _i++ )); do
@@ -243,16 +137,6 @@ start_brokers() {
     rm -f /tmp/embarlet_*_ready 2>/dev/null || true
     shm_cleanup
 
-    if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
-        export REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-$BUILD_BIN}"
-        log "Starting remote Corfu sequencer on $REMOTE_CORFU_SEQUENCER_HOST..."
-        if ! broker_remote_corfu_start; then
-            echo "ERROR: failed to start remote Corfu sequencer on $REMOTE_CORFU_SEQUENCER_HOST" >&2
-            return 1
-        fi
-        sleep 1
-    fi
-
     cd "$BUILD_BIN"
 
     export EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-1}"
@@ -264,7 +148,7 @@ start_brokers() {
     export EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES
 
     log "Starting $NUM_BROKERS broker(s) with NUMA bind: '${EMBARLET_NUMA_BIND}'"
-    if [[ "$SEQUENCER" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+    if [[ "$SEQUENCER" == "CORFU" ]]; then
         ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
     fi
 
@@ -312,20 +196,10 @@ printf "  %-32s %s\n" "PAYLOAD_SEND_CHUNK_BYTES:"      "$EMBARCADERO_PAYLOAD_SEN
 printf "  %-32s %s\n" "ENABLE_PAYLOAD_MSG_MORE:"       "$EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE"
 printf "  %-32s %s\n" "BATCH_SIZE:"                    "$EMBARCADERO_BATCH_SIZE"
 printf "  %-32s %s\n" "CLIENT_PUB_BATCH_KB:"           "$EMBARCADERO_CLIENT_PUB_BATCH_KB"
-printf "  %-32s %s\n" "ORDER5_HOME_BROKERS:"           "${EMBARCADERO_ORDER5_HOME_BROKERS:-"(unset)"}"
-printf "  %-32s %s\n" "LOCAL_CLIENT_NUMA:"             "$(resolve_local_client_numa)"
-if [[ "$SEQUENCER" == "CORFU" ]]; then
-    printf "  %-32s %s\n" "CORFU_SEQ_IP:"               "${EMBARCADERO_CORFU_SEQ_IP:-"(unset)"}"
-    printf "  %-32s %s\n" "CORFU_SEQ_PORT:"             "${EMBARCADERO_CORFU_SEQ_PORT:-"(default)"}"
-fi
 echo "================================================================"
 
 mkdir -p "$LOG_DIR"
 overall_status=0
-
-if ! preflight_clients; then
-    exit 1
-fi
 
 # ---------------------------------------------------------------------------
 # Trial loop
@@ -359,7 +233,7 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
 
         for (( i=0; i<NUM_CLIENTS; i++ )); do
             host="${CLIENT_HOSTS[$i]}"
-            numa="$(resolve_client_numa "$host" "${CLIENT_NUMAS[$i]}")"
+            numa="${CLIENT_NUMAS[$i]}"
             log_file="$LOG_DIR/trial${trial}_${host}.log"
             CLIENT_LOGS+=( "$log_file" )
 
@@ -379,10 +253,6 @@ export EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE=$EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE
 export EMBARCADERO_BATCH_SIZE=$EMBARCADERO_BATCH_SIZE
 export EMBARCADERO_CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB
 export EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS
-export EMBARCADERO_ORDER5_HOME_BROKERS=$EMBARCADERO_ORDER5_HOME_BROKERS
-if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_IP" ]; then export EMBARCADERO_CORFU_SEQ_IP=$EMBARCADERO_CORFU_SEQ_IP; fi
-if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_PORT" ]; then export EMBARCADERO_CORFU_SEQ_PORT=$EMBARCADERO_CORFU_SEQ_PORT; fi
-if [ -n "$CLIENT_LD_LIBRARY_PATH" ]; then export LD_LIBRARY_PATH=$CLIENT_LD_LIBRARY_PATH; fi
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 cd $BUILD_BIN
 # Spin-wait until the synchronized barrier millisecond (requires NTP-synced clocks)

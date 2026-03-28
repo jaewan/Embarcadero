@@ -489,7 +489,8 @@ class Topic {
 			std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
 			std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
 		void FlushAccumulatedCVLogicalOnly(
-			const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative);
+			const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
+			const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
 		void FlushAccumulatedCV(
 			const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
 			const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
@@ -853,6 +854,9 @@ class Topic {
 			absl::flat_hash_map<int, uint64_t> cv_max_cumulative;
 			absl::flat_hash_map<int, uint64_t> cv_max_pbr_index;
 			absl::flat_hash_map<int, uint64_t> cv_logical_only_cumulative;
+			// Stores (pbr_index + 1) so zero can remain the "unset" sentinel while preserving
+			// the real zero-based first batch index.
+			absl::flat_hash_map<int, uint64_t> cv_logical_only_pbr_index;
 		};
 		size_t level5_num_shards_{1};
 		std::vector<std::unique_ptr<Level5ShardState>> level5_shards_;

@@ -82,6 +82,9 @@ REMOTE_CLIENT_HOST="${REMOTE_CLIENT_HOST:-c4}"
 REMOTE_CLIENT_BIN_DIR="${REMOTE_CLIENT_BIN_DIR:-~/Embarcadero/build/bin}"
 # IP address the remote client uses to reach the broker on this machine
 BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
+# Optional separate Corfu sequencer host for Corfu latency runs.
+REMOTE_CORFU_SEQUENCER_HOST="${REMOTE_CORFU_SEQUENCER_HOST:-}"
+REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}"
 
 # NUMA binding for broker processes (always NUMA 1 for CXL locality)
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
@@ -113,6 +116,9 @@ fi
 cleanup() {
   pkill -9 -f "./embarlet"      >/dev/null 2>&1 || true
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
+  if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+    broker_remote_corfu_stop || true
+  fi
   rm -f /tmp/embarlet_*_ready   >/dev/null 2>&1 || true
 }
 
@@ -127,11 +133,24 @@ start_local_brokers() {
 
   cleanup
 
+  if [[ "$seq" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+    export REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-$BIN_DIR}"
+    echo "Starting remote Corfu sequencer on $REMOTE_CORFU_SEQUENCER_HOST..."
+    if ! broker_remote_corfu_start; then
+      echo "ERROR: failed to start remote Corfu sequencer on $REMOTE_CORFU_SEQUENCER_HOST" >&2
+      return 1
+    fi
+    sleep 1
+  fi
+
   # For remote scenario the broker must bind to the external NIC so the remote client
   # can reach it.  EMBARCADERO_HEAD_ADDR overrides the default 127.0.0.1 listen address.
   local broker_env=""
+  broker_env+="REPLICATION_FACTOR=$REPLICATION_FACTOR "
+  broker_env+="EMBARCADERO_REPLICATION_FACTOR=$REPLICATION_FACTOR "
+  broker_env+="NUM_BROKERS=$NUM_BROKERS "
   if [[ "$SCENARIO" == "remote" ]]; then
-    broker_env="EMBARCADERO_HEAD_ADDR=$BROKER_LISTEN_ADDR"
+    broker_env+="EMBARCADERO_HEAD_ADDR=$BROKER_LISTEN_ADDR "
   fi
 
   echo "Starting head broker (order=$order sequencer=$seq)..."
@@ -194,6 +213,17 @@ run_trial() {
   local order="$2"
   local seq="$3"
   local trial="$4"
+  local TRIAL_DIR
+  TRIAL_DIR="$DATA_DIR/$mode/$RUN_ID/${seq}_order${order}_ack${ACK_LEVEL}_msg${MSG_SIZE}_bytes${TOTAL_MESSAGE_SIZE}_trial${trial}"
+  mkdir -p "$TRIAL_DIR/brokers"
+
+  local RUN_LOG="$TRIAL_DIR/run.log"
+  local CLIENT_CMD_FILE="$TRIAL_DIR/client_command.txt"
+  local RUN_METADATA="$TRIAL_DIR/run_metadata.txt"
+
+  exec 3>&1 4>&2
+  trap 'exec 1>&3 2>&4; exec 3>&- 4>&-; trap - RETURN' RETURN
+  exec > >(tee "$RUN_LOG") 2>&1
 
   echo "[Trial $trial/$NUM_TRIALS] scenario=$SCENARIO mode=$mode sequencer=$seq order=$order"
 
@@ -221,6 +251,8 @@ run_trial() {
   # Build client command array (one arg per line for easy SSH quoting)
   local -a raw_cmd
   mapfile -t raw_cmd < <(build_client_cmd "$head_addr" "$order" "$seq" "$mode")
+  printf '%q ' "${raw_cmd[@]}" > "$CLIENT_CMD_FILE"
+  printf '\n' >> "$CLIENT_CMD_FILE"
 
   if [[ "$SCENARIO" == "remote" ]]; then
     # Run the publisher on the remote client machine (c4).
@@ -229,6 +261,9 @@ run_trial() {
     # Reconstruct the command as a single shell-quoted string for SSH.
     local quoted_cmd
     quoted_cmd="cd ${REMOTE_CLIENT_BIN_DIR} && "
+    quoted_cmd+="export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE} && "
+    quoted_cmd+="export EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP:-} && "
+    quoted_cmd+="export EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT:-} && "
     if [[ -n "$CLIENT_NUMA_BIND" ]]; then
       quoted_cmd+="$CLIENT_NUMA_BIND "
     fi
@@ -250,11 +285,6 @@ run_trial() {
     echo "WARNING: throughput_test exited with status $client_status" >&2
   fi
 
-  # Collect artefacts
-  local TRIAL_DIR
-  TRIAL_DIR="$DATA_DIR/$mode/$RUN_ID/${seq}_order${order}_ack${ACK_LEVEL}_msg${MSG_SIZE}_bytes${TOTAL_MESSAGE_SIZE}_trial${trial}"
-  mkdir -p "$TRIAL_DIR"
-
   if [[ "$SCENARIO" == "remote" ]]; then
     # CSV files were written on the remote client; scp them back.
     for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv; do
@@ -271,7 +301,13 @@ run_trial() {
     done
   fi
 
-  cat > "$TRIAL_DIR/run_metadata.txt" <<EOF
+  for broker_log in "$BIN_DIR"/broker_*.log; do
+    if [[ -f "$broker_log" ]]; then
+      cp "$broker_log" "$TRIAL_DIR/brokers/"
+    fi
+  done
+
+  cat > "$RUN_METADATA" <<EOF
 run_id=$RUN_ID
 scenario=$SCENARIO
 mode=$mode
@@ -287,6 +323,8 @@ replication_factor=$REPLICATION_FACTOR
 runtime_mode=$EMBARCADERO_RUNTIME_MODE
 target_mbps=$TARGET_MBPS
 broker_head_addr=$head_addr
+run_log=$RUN_LOG
+client_command_file=$CLIENT_CMD_FILE
 EOF
 
   echo "Saved trial artefacts to: $TRIAL_DIR"

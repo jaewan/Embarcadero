@@ -277,6 +277,7 @@ class Publisher {
 		// This allows us to detect when a broker's ACK connection is missing
 		absl::flat_hash_set<int> brokers_with_ack_connection_ ABSL_GUARDED_BY(mutex_);
 		std::atomic<int> expected_ack_brokers_{0};
+		std::atomic<int64_t> expected_ack_brokers_last_update_ns_{0};
 
 		// When true, PublishThread updates total_batches_attempted_ (for ACK timeout log). Set from EMBARCADERO_ACK_TIMEOUT_DEBUG in Init().
 		bool enable_batch_attempted_for_timeout_log_{false};
