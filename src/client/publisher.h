@@ -331,6 +331,7 @@ class Publisher {
 		 * Subscribes to cluster status updates
 		 */
 		void SubscribeToClusterStatus();
+		void StartThroughputTimeseriesIfEnabled();
 
 		/**
 		 * Adds publisher threads

@@ -65,6 +65,10 @@ PLOT_RESULTS="${PLOT_RESULTS:-0}"
 TARGET_MBPS="${TARGET_MBPS:-0}"
 REPLICATION_FACTOR="${REPLICATION_FACTOR:-0}"
 BROKER_READY_TIMEOUT_SEC="${BROKER_READY_TIMEOUT_SEC:-60}"
+BROKER_REACHABILITY_TIMEOUT_SEC="${BROKER_REACHABILITY_TIMEOUT_SEC:-20}"
+BROKER_REACHABILITY_POLL_SEC="${BROKER_REACHABILITY_POLL_SEC:-1}"
+# Give broker heartbeat/control-plane state time to converge after sockets are listening.
+BROKER_READY_PROPAGATION_SEC="${BROKER_READY_PROPAGATION_SEC:-4}"
 SEQUENCER="${SEQUENCER:-EMBARCADERO}"
 
 # Orders to benchmark: space-separated list, e.g. "0 5"
@@ -128,6 +132,54 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
+# Readiness hardening: verify broker data ports are reachable from client host(s)
+# ---------------------------------------------------------------------------
+probe_tcp_from_host() {
+  local host="$1"
+  local ip="$2"
+  local port="$3"
+  local probe_cmd="timeout 1 bash -lc '</dev/tcp/$ip/$port' >/dev/null 2>&1"
+  if [[ "$host" == "local" ]]; then
+    eval "$probe_cmd"
+  else
+    ssh -o StrictHostKeyChecking=no "$host" "$probe_cmd" >/dev/null 2>&1
+  fi
+}
+
+wait_for_broker_reachability() {
+  local target_ip="$1"
+  shift
+  local -a hosts=("$@")
+  local deadline=$(( $(date +%s) + BROKER_REACHABILITY_TIMEOUT_SEC ))
+
+  while (( $(date +%s) < deadline )); do
+    local all_ok=1
+    local missing=""
+    local host
+    local i
+
+    for host in "${hosts[@]}"; do
+      for ((i=0; i<NUM_BROKERS; i++)); do
+        local port=$((1214 + i))
+        if ! probe_tcp_from_host "$host" "$target_ip" "$port"; then
+          all_ok=0
+          missing+=" ${host}:${target_ip}:${port}"
+        fi
+      done
+    done
+
+    if [[ "$all_ok" -eq 1 ]]; then
+      return 0
+    fi
+
+    echo "Waiting for client-side broker reachability:${missing}" >&2
+    sleep "$BROKER_REACHABILITY_POLL_SEC"
+  done
+
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Broker startup (local only — uses ready-file mechanism)
 # ---------------------------------------------------------------------------
 start_local_brokers() {
@@ -175,7 +227,27 @@ start_local_brokers() {
     return 1
   fi
   rm -f /tmp/embarlet_*_ready
-  echo "All $NUM_BROKERS brokers ready."
+
+  local reachability_ip
+  local -a reachability_hosts
+  if [[ "$SCENARIO" == "remote" ]]; then
+    reachability_ip="$BROKER_LISTEN_ADDR"
+    reachability_hosts=("$REMOTE_CLIENT_HOST")
+  else
+    reachability_ip="${EMBARCADERO_HEAD_ADDR:-127.0.0.1}"
+    reachability_hosts=("local")
+  fi
+
+  if ! wait_for_broker_reachability "$reachability_ip" "${reachability_hosts[@]}"; then
+    echo "ERROR: Brokers are not reachable from client host(s) within ${BROKER_REACHABILITY_TIMEOUT_SEC}s" >&2
+    return 1
+  fi
+
+  if [[ "$BROKER_READY_PROPAGATION_SEC" -gt 0 ]]; then
+    echo "Waiting ${BROKER_READY_PROPAGATION_SEC}s for cluster state propagation..."
+    sleep "$BROKER_READY_PROPAGATION_SEC"
+  fi
+  echo "All $NUM_BROKERS brokers ready and reachable."
 }
 
 # ---------------------------------------------------------------------------

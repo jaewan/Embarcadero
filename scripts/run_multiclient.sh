@@ -57,8 +57,14 @@ REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
 
 BROKER_READY_TIMEOUT_SEC=${BROKER_READY_TIMEOUT_SEC:-60}
+BROKER_REACHABILITY_TIMEOUT_SEC=${BROKER_REACHABILITY_TIMEOUT_SEC:-20}
+BROKER_REACHABILITY_POLL_SEC=${BROKER_REACHABILITY_POLL_SEC:-1}
+# Extra settle time for broker heartbeat/control-plane convergence after sockets listen.
+BROKER_READY_PROPAGATION_SEC=${BROKER_READY_PROPAGATION_SEC:-4}
 # Extra lead time given to SSH connections and clock-sync settling
 START_DELAY_SEC=${START_DELAY_SEC:-8}
+# Enforce a safer minimum barrier delay when any client runs over SSH.
+MIN_REMOTE_START_DELAY_SEC=${MIN_REMOTE_START_DELAY_SEC:-8}
 QUIET=${QUIET:-0}
 
 # Performance knobs (set to empty string to disable)
@@ -115,6 +121,17 @@ corfu_seq_ip_is_loopback() {
 }
 
 corfu_uses_remote_clients() {
+    local i host
+    for (( i=0; i<NUM_CLIENTS; i++ )); do
+        host="${CLIENT_HOSTS[$i]}"
+        if [[ "$host" != "local" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+has_remote_clients() {
     local i host
     for (( i=0; i<NUM_CLIENTS; i++ )); do
         host="${CLIENT_HOSTS[$i]}"
@@ -215,6 +232,134 @@ preflight_clients() {
     return "$failed"
 }
 
+probe_tcp_from_host() {
+    local host="$1"
+    local ip="$2"
+    local port="$3"
+    local probe_cmd="timeout 1 bash -lc '</dev/tcp/$ip/$port' >/dev/null 2>&1"
+    if [[ "$host" == "local" ]]; then
+        eval "$probe_cmd"
+    else
+        ssh "$host" "$probe_cmd" >/dev/null 2>&1
+    fi
+}
+
+wait_for_broker_reachability() {
+    local deadline=$(( $(date +%s) + BROKER_REACHABILITY_TIMEOUT_SEC ))
+    local i j host port
+
+    while (( $(date +%s) < deadline )); do
+        local all_ok=1
+        local missing=""
+
+        for (( i=0; i<NUM_CLIENTS; i++ )); do
+            host="${CLIENT_HOSTS[$i]}"
+            for (( j=0; j<NUM_BROKERS; j++ )); do
+                port=$((1214 + j))
+                if ! probe_tcp_from_host "$host" "$BROKER_IP" "$port"; then
+                    all_ok=0
+                    missing+=" ${host}:${BROKER_IP}:${port}"
+                fi
+            done
+        done
+
+        if [[ "$all_ok" -eq 1 ]]; then
+            return 0
+        fi
+
+        log "Waiting for client-side broker reachability:${missing}"
+        sleep "$BROKER_REACHABILITY_POLL_SEC"
+    done
+
+    return 1
+}
+
+compute_overlap_throughput_gbps() {
+    local trial="$1"
+    shift
+    local -a files=("$@")
+    local tmp_bounds
+    tmp_bounds="$(mktemp)"
+    local file
+
+    for file in "${files[@]}"; do
+        [[ -s "$file" ]] || continue
+        awk -F',' '
+            NR==1 {
+                for (i = 1; i <= NF; ++i) if ($i == "Total_GBps") col = i
+                next
+            }
+            col > 0 {
+                ts = $1 + 0
+                g = $col + 0
+                if (g > 0.000001) {
+                    if (!seen) { first = ts; seen = 1 }
+                    last = ts
+                }
+            }
+            END {
+                if (seen) printf "%s,%s,%s\n", FILENAME, first, last
+            }
+        ' "$file" >> "$tmp_bounds"
+    done
+
+    if [[ ! -s "$tmp_bounds" ]]; then
+        rm -f "$tmp_bounds"
+        return 1
+    fi
+
+    # Phase-align each client's active window to its first positive sample so that
+    # host clock skew / SSH launch jitter does not eliminate overlap coverage.
+    local overlap_start overlap_end
+    overlap_start=0
+    overlap_end="$(awk -F',' '
+        NR==1 { m = ($3 - $2) }
+        {
+            d = ($3 - $2)
+            if (d < m) m = d
+        }
+        END { printf "%.0f", m }
+    ' "$tmp_bounds")"
+    if [[ -z "$overlap_end" ]]; then
+        rm -f "$tmp_bounds"
+        return 1
+    fi
+    if [[ "$overlap_end" -le "$overlap_start" ]]; then
+        overlap_end=$((overlap_start + 1))
+    fi
+
+    local overlap_window_ms=$((overlap_end - overlap_start))
+    local sum_mean_gbps="0"
+    local client_count=0
+    local ts_file first_ts mean
+    while IFS=',' read -r ts_file first_ts _; do
+        [[ -f "$ts_file" ]] || continue
+        mean="$(awk -F',' -v b="$first_ts" -v s="$overlap_start" -v e="$overlap_end" '
+            NR==1 {
+                for (i = 1; i <= NF; ++i) if ($i == "Total_GBps") col = i
+                next
+            }
+            col > 0 {
+                ts = ($1 + 0) - b
+                g = $col + 0
+                if (ts >= s && ts <= e) { sum += g; n += 1 }
+            }
+            END { if (n > 0) printf "%.9f", sum / n }
+        ' "$ts_file")"
+        if [[ -n "$mean" ]]; then
+            sum_mean_gbps="$(awk -v a="$sum_mean_gbps" -v b="$mean" 'BEGIN {printf "%.9f", a + b}')"
+            client_count=$((client_count + 1))
+        fi
+    done < "$tmp_bounds"
+    rm -f "$tmp_bounds"
+
+    if [[ "$client_count" -le 0 ]]; then
+        return 1
+    fi
+
+    printf "%s,%s,%s,%s\n" "$trial" "$sum_mean_gbps" "$overlap_window_ms" "$client_count"
+}
+
 shm_cleanup() {
     shm_unlink "${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
     rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
@@ -285,7 +430,15 @@ start_brokers() {
     fi
     # Clear ready sentinels so the next trial's wait starts from a clean state
     rm -f /tmp/embarlet_*_ready 2>/dev/null || true
-    log "All $NUM_BROKERS brokers ready."
+    if ! wait_for_broker_reachability; then
+        echo "ERROR: Brokers are not reachable from client host(s) within ${BROKER_REACHABILITY_TIMEOUT_SEC}s" >&2
+        return 1
+    fi
+    if [[ "$BROKER_READY_PROPAGATION_SEC" -gt 0 ]]; then
+        log "Waiting ${BROKER_READY_PROPAGATION_SEC}s for cluster state propagation..."
+        sleep "$BROKER_READY_PROPAGATION_SEC"
+    fi
+    log "All $NUM_BROKERS brokers ready and reachable."
 }
 
 # ---------------------------------------------------------------------------
@@ -322,6 +475,10 @@ echo "================================================================"
 
 mkdir -p "$LOG_DIR"
 overall_status=0
+ATTEMPT_SUMMARY_CSV="$LOG_DIR/attempt_summary.csv"
+echo "trial,attempt,result,reason" > "$ATTEMPT_SUMMARY_CSV"
+OVERLAP_SUMMARY_CSV="$LOG_DIR/overlap_summary.csv"
+echo "trial,overlap_total_gbps,overlap_window_ms,timeseries_clients" > "$OVERLAP_SUMMARY_CSV"
 
 if ! preflight_clients; then
     exit 1
@@ -340,6 +497,7 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
 
         if ! start_brokers; then
             echo "ERROR: broker startup failed on trial $trial attempt $attempt" >&2
+            echo "$trial,$attempt,failed,broker_startup" >> "$ATTEMPT_SUMMARY_CSV"
             cleanup
             continue
         fi
@@ -348,20 +506,28 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
         # Compute synchronized barrier timestamp (NTP-synced wall clock)
         # All clients spin-wait until this exact millisecond.
         # ------------------------------------------------------------------
-        START_TIME_MS=$(( $(date +%s%3N) + START_DELAY_SEC * 1000 ))
-        log "  Barrier start time: ${START_TIME_MS} ms  (T+${START_DELAY_SEC}s)"
+        effective_start_delay_sec="$START_DELAY_SEC"
+        if has_remote_clients && [[ "$effective_start_delay_sec" -lt "$MIN_REMOTE_START_DELAY_SEC" ]]; then
+            log "  START_DELAY_SEC=${START_DELAY_SEC}s too small for SSH clients; using ${MIN_REMOTE_START_DELAY_SEC}s"
+            effective_start_delay_sec="$MIN_REMOTE_START_DELAY_SEC"
+        fi
+        START_TIME_MS=$(( $(date +%s%3N) + effective_start_delay_sec * 1000 ))
+        log "  Barrier start time: ${START_TIME_MS} ms  (T+${effective_start_delay_sec}s)"
 
         # ------------------------------------------------------------------
         # Launch all clients in parallel
         # ------------------------------------------------------------------
         declare -a CLIENT_PIDS=()
         declare -a CLIENT_LOGS=()
+        declare -a CLIENT_TS_LOCAL_FILES=()
 
         for (( i=0; i<NUM_CLIENTS; i++ )); do
             host="${CLIENT_HOSTS[$i]}"
             numa="$(resolve_client_numa "$host" "${CLIENT_NUMAS[$i]}")"
             log_file="$LOG_DIR/trial${trial}_${host}.log"
+            ts_file="$BUILD_BIN/throughput_timeseries_trial${trial}_${host}.csv"
             CLIENT_LOGS+=( "$log_file" )
+            CLIENT_TS_LOCAL_FILES+=( "$LOG_DIR/trial${trial}_${host}_timeseries.csv" )
 
             # Build the command that will execute on the remote (or local) shell.
             # We use export statements so every env var is properly set regardless
@@ -380,6 +546,9 @@ export EMBARCADERO_BATCH_SIZE=$EMBARCADERO_BATCH_SIZE
 export EMBARCADERO_CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB
 export EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS
 export EMBARCADERO_ORDER5_HOME_BROKERS=$EMBARCADERO_ORDER5_HOME_BROKERS
+export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$ts_file
+export EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS=$START_TIME_MS
+rm -f $ts_file
 if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_IP" ]; then export EMBARCADERO_CORFU_SEQ_IP=$EMBARCADERO_CORFU_SEQ_IP; fi
 if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_PORT" ]; then export EMBARCADERO_CORFU_SEQ_PORT=$EMBARCADERO_CORFU_SEQ_PORT; fi
 if [ -n "$CLIENT_LD_LIBRARY_PATH" ]; then export LD_LIBRARY_PATH=$CLIENT_LD_LIBRARY_PATH; fi
@@ -421,6 +590,18 @@ ENDINNERSCRIPT
             wait "$pid" || all_ok=0
         done
 
+        # Collect per-client throughput timeseries from client hosts.
+        for (( i=0; i<NUM_CLIENTS; i++ )); do
+            host="${CLIENT_HOSTS[$i]}"
+            local_ts="$LOG_DIR/trial${trial}_${host}_timeseries.csv"
+            remote_ts="$BUILD_BIN/throughput_timeseries_trial${trial}_${host}.csv"
+            if [[ "$host" == "local" ]]; then
+                cp "$remote_ts" "$local_ts" 2>/dev/null || true
+            else
+                scp -o StrictHostKeyChecking=no "$host:$remote_ts" "$local_ts" >/dev/null 2>&1 || true
+            fi
+        done
+
         # ------------------------------------------------------------------
         # Validate: every log must contain a "Bandwidth:" line
         # ------------------------------------------------------------------
@@ -434,11 +615,17 @@ ENDINNERSCRIPT
         done
 
         if [[ "$all_ok" -eq 1 && "$logs_ok" -eq 1 ]]; then
+            overlap_row="$(compute_overlap_throughput_gbps "$trial" "${CLIENT_TS_LOCAL_FILES[@]}" || true)"
+            if [[ -n "$overlap_row" ]]; then
+                echo "$overlap_row" >> "$OVERLAP_SUMMARY_CSV"
+            fi
             trial_success=1
+            echo "$trial,$attempt,success,ok" >> "$ATTEMPT_SUMMARY_CSV"
             break
         fi
 
         echo "WARNING: trial $trial attempt $attempt incomplete — retrying..." >&2
+        echo "$trial,$attempt,failed,incomplete_or_missing_bandwidth" >> "$ATTEMPT_SUMMARY_CSV"
         # Kill any surviving clients before re-attempting
         for pid in "${CLIENT_PIDS[@]}"; do
             kill "$pid" 2>/dev/null || true
@@ -470,10 +657,20 @@ ENDINNERSCRIPT
     total_gbs=$(awk "BEGIN {printf \"%.3f\", $total_bw_mbs / 1024}")
     echo "  ────────────────────────────────────────"
     printf "  %-8s → %s MB/s  (%s GB/s)\n" "TOTAL" "$total_bw_mbs" "$total_gbs"
+    overlap_line="$(awk -F',' -v t="$trial" 'NR>1 && $1==t {print $0; exit}' "$OVERLAP_SUMMARY_CSV" || true)"
+    if [[ -n "$overlap_line" ]]; then
+        overlap_gbps="$(echo "$overlap_line" | awk -F',' '{print $2}')"
+        overlap_window_ms="$(echo "$overlap_line" | awk -F',' '{print $3}')"
+        overlap_clients="$(echo "$overlap_line" | awk -F',' '{print $4}')"
+        printf "  %-8s → %s GB/s  (window=%sms clients=%s)\n" "OVERLAP" "$overlap_gbps" "$overlap_window_ms" "$overlap_clients"
+    fi
     echo "  (naive sum of per-client averages; see OSDI/SOSP note below)"
 
     if [[ "$trial_success" -ne 1 ]]; then
         echo "ERROR: Trial $trial failed after $TRIAL_MAX_ATTEMPTS attempts." >&2
+        if ! awk -F',' -v t="$trial" '$1==t && $3=="success"{found=1} END{exit !found}' "$ATTEMPT_SUMMARY_CSV"; then
+            echo "$trial,$TRIAL_MAX_ATTEMPTS,failed,max_attempts_exhausted" >> "$ATTEMPT_SUMMARY_CSV"
+        fi
         overall_status=1
     fi
 

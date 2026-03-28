@@ -70,6 +70,34 @@ size_t RuntimePayloadSendChunkBytes() {
 	return value;
 }
 
+std::string GetThroughputTimeseriesFilePath() {
+	const char* explicit_file = std::getenv("EMBARCADERO_THROUGHPUT_TIMESERIES_FILE");
+	if (explicit_file && explicit_file[0] != '\0') {
+		return std::string(explicit_file);
+	}
+	return "";
+}
+
+int GetThroughputTimeseriesIntervalMs() {
+	const char* env = std::getenv("EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS");
+	if (!env || env[0] == '\0') return 100;
+	char* end = nullptr;
+	long parsed = std::strtol(env, &end, 10);
+	if (end == env || (end && *end != '\0') || parsed <= 0) return 100;
+	if (parsed > 5000) parsed = 5000;
+	return static_cast<int>(parsed);
+}
+
+bool GetThroughputTimeseriesOriginMs(int64_t& origin_ms_out) {
+	const char* env = std::getenv("EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS");
+	if (!env || env[0] == '\0') return false;
+	char* end = nullptr;
+	long long parsed = std::strtoll(env, &end, 10);
+	if (end == env || (end && *end != '\0')) return false;
+	origin_ms_out = static_cast<int64_t>(parsed);
+	return true;
+}
+
 bool ShouldEnablePayloadMsgMore() {
 	static const bool enabled =
 		Embarcadero::ReadEnvBoolLenient("EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE", false);
@@ -869,6 +897,92 @@ void Publisher::Init(int ack_level) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 		}
 	}
+
+	if (runtime_mode_ == "throughput") {
+		StartThroughputTimeseriesIfEnabled();
+	}
+}
+
+void Publisher::StartThroughputTimeseriesIfEnabled() {
+	if (real_time_throughput_measure_thread_.joinable()) {
+		return;
+	}
+	const std::string out_file = GetThroughputTimeseriesFilePath();
+	if (out_file.empty()) {
+		return;
+	}
+
+	const int interval_ms = GetThroughputTimeseriesIntervalMs();
+	const size_t num_brokers = static_cast<size_t>(
+		(expected_num_brokers_ > 0) ? expected_num_brokers_ : NUM_MAX_BROKERS);
+	measure_real_time_throughput_ = true;
+
+	real_time_throughput_measure_thread_ = std::thread([this, out_file, interval_ms, num_brokers]() {
+		std::ofstream throughput_file(out_file);
+		if (!throughput_file.is_open()) {
+			LOG(ERROR) << "Failed to open throughput timeseries file: " << out_file;
+			return;
+		}
+
+		throughput_file << "Timestamp(ms)";
+		for (size_t i = 0; i < num_brokers; ++i) {
+			throughput_file << ",Broker_" << i << "_GBps";
+		}
+		throughput_file << ",Total_GBps\n";
+
+		std::vector<size_t> prev_acked_bytes(num_brokers, 0);
+		constexpr double kGBDivisor = 1024.0 * 1024.0 * 1024.0;
+		constexpr int kDrainIntervalsAfterFinish = 20;
+		int drain_remaining = -1;
+		auto prev_time = std::chrono::steady_clock::now();
+		int64_t shared_origin_ms = 0;
+		const bool has_shared_origin = GetThroughputTimeseriesOriginMs(shared_origin_ms);
+
+		while (!shutdown_.load(std::memory_order_relaxed)) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+			auto now = std::chrono::steady_clock::now();
+			double elapsed_sec = std::chrono::duration<double>(now - prev_time).count();
+			if (elapsed_sec <= 0.0) elapsed_sec = interval_ms / 1000.0;
+			prev_time = now;
+
+			int64_t timestamp_ms = 0;
+			if (has_shared_origin) {
+				const int64_t now_epoch_ms = static_cast<int64_t>(
+					std::chrono::duration_cast<std::chrono::milliseconds>(
+						std::chrono::system_clock::now().time_since_epoch()).count());
+				timestamp_ms = now_epoch_ms - shared_origin_ms;
+				if (timestamp_ms < 0) timestamp_ms = 0;
+			} else {
+				timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					now - start_time_).count();
+			}
+			throughput_file << timestamp_ms;
+
+			size_t total_delta_bytes = 0;
+			for (size_t i = 0; i < num_brokers; ++i) {
+				const size_t acked_bytes =
+					broker_stats_[i].acked_messages.load(std::memory_order_relaxed) * message_size_;
+				const size_t delta_bytes = acked_bytes - prev_acked_bytes[i];
+				const double gbps = (static_cast<double>(delta_bytes) / elapsed_sec) / kGBDivisor;
+				throughput_file << "," << gbps;
+				total_delta_bytes += delta_bytes;
+				prev_acked_bytes[i] = acked_bytes;
+			}
+
+			const double total_gbps =
+				(static_cast<double>(total_delta_bytes) / elapsed_sec) / kGBDivisor;
+			throughput_file << "," << total_gbps << "\n";
+
+			if (publish_finished_.load(std::memory_order_relaxed)) {
+				if (drain_remaining < 0) drain_remaining = kDrainIntervalsAfterFinish;
+				if (--drain_remaining <= 0) break;
+			}
+		}
+
+		throughput_file.flush();
+		throughput_file.close();
+		LOG(INFO) << "Wrote throughput timeseries to " << out_file;
+	});
 }
 
 void Publisher::WarmupBuffers() {

@@ -23,6 +23,7 @@ BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
 CORFU_SEQUENCER_LOG_HOST="${CORFU_SEQUENCER_LOG_HOST:-c2}"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${RUN_TS}}"
+REQUIRE_FIRST_ATTEMPT_PASS="${REQUIRE_FIRST_ATTEMPT_PASS:-0}"
 
 if [[ -z "$ACK_LEVEL" ]]; then
   if [[ "$REPLICATION_FACTOR" == "2" ]]; then
@@ -68,6 +69,7 @@ publisher_host=$PUBLISHER_HOST
 broker_host=$BROKER_HOST
 broker_listen_addr=$BROKER_LISTEN_ADDR
 corfu_sequencer_log_host=$CORFU_SEQUENCER_LOG_HOST
+require_first_attempt_pass=$REQUIRE_FIRST_ATTEMPT_PASS
 commit=$COMMIT
 start_time_utc=$RUN_TS
 EOF
@@ -103,7 +105,7 @@ scp -o StrictHostKeyChecking=no "${CORFU_SEQUENCER_LOG_HOST}:/tmp/corfu_sequence
   "$RUN_DIR/${CORFU_SEQUENCER_LOG_HOST}_corfu_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
-echo "system,order,sequencer,replication_factor,publisher_host,broker_host,run_idx,status,p50_us,p95_us,p99_us,max_us,artifact_dir,commit" > "$SUMMARY_CSV"
+echo "system,order,sequencer,replication_factor,publisher_host,broker_host,run_idx,status,p50_us,p95_us,p99_us,max_us,attempts_used,first_attempt_pass,artifact_dir,commit" > "$SUMMARY_CSV"
 
 find "$RAW_DATA_DIR" -type f -name latency_stats.csv | sort | while read -r stats; do
   trial_dir="$(dirname "$stats")"
@@ -122,8 +124,15 @@ find "$RAW_DATA_DIR" -type f -name latency_stats.csv | sort | while read -r stat
     maxv=""
     status="failed"
   fi
-  echo "$SYSTEM,$ORDER,$SEQUENCER,$REPLICATION_FACTOR,$PUBLISHER_HOST,$BROKER_HOST,$trial_num,$status,$p50,$p95,$p99,$maxv,$trial_dir,$COMMIT" >> "$SUMMARY_CSV"
+  echo "$SYSTEM,$ORDER,$SEQUENCER,$REPLICATION_FACTOR,$PUBLISHER_HOST,$BROKER_HOST,$trial_num,$status,$p50,$p95,$p99,$maxv,1,1,$trial_dir,$COMMIT" >> "$SUMMARY_CSV"
 done
+
+if [[ "$REQUIRE_FIRST_ATTEMPT_PASS" == "1" ]]; then
+  if awk -F',' 'NR>1 && $14 != "1" {found=1} END{exit !found}' "$SUMMARY_CSV"; then
+    echo "ERROR: first-attempt reliability gate failed (REQUIRE_FIRST_ATTEMPT_PASS=1)." >&2
+    RUN_STATUS=1
+  fi
+fi
 
 printf 'run_status=%s\nend_time_utc=%s\n' "$RUN_STATUS" "$(date -u +%Y%m%dT%H%M%SZ)" >> "$RUN_DIR/metadata.env"
 exit "$RUN_STATUS"

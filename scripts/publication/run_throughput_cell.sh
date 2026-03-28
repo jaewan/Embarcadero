@@ -24,6 +24,7 @@ LOCAL_CLIENT_NUMA="${LOCAL_CLIENT_NUMA:-0}"
 CORFU_SEQUENCER_LOG_HOST="${CORFU_SEQUENCER_LOG_HOST:-c2}"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${RUN_TS}}"
+REQUIRE_FIRST_ATTEMPT_PASS="${REQUIRE_FIRST_ATTEMPT_PASS:-0}"
 
 if [[ -z "$ACK_LEVEL" ]]; then
   if [[ "$REPLICATION_FACTOR" == "2" ]]; then
@@ -81,6 +82,7 @@ broker_ip=$BROKER_IP
 local_client_numa=$LOCAL_CLIENT_NUMA
 start_delay_sec=$START_DELAY_SEC
 corfu_sequencer_log_host=$CORFU_SEQUENCER_LOG_HOST
+require_first_attempt_pass=$REQUIRE_FIRST_ATTEMPT_PASS
 commit=$COMMIT
 start_time_utc=$RUN_TS
 EOF
@@ -122,7 +124,9 @@ scp -o StrictHostKeyChecking=no "${CORFU_SEQUENCER_LOG_HOST}:/tmp/corfu_sequence
   "$RAW_DIR/${CORFU_SEQUENCER_LOG_HOST}_corfu_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
-echo "system,order,sequencer,num_clients,client_layout,replication_factor,run_idx,status,throughput_gbps,artifact_dir,commit" > "$SUMMARY_CSV"
+echo "system,order,sequencer,num_clients,client_layout,replication_factor,run_idx,status,throughput_gbps,throughput_overlap_gbps,overlap_window_ms,timeseries_clients,attempts_used,first_attempt_pass,artifact_dir,commit" > "$SUMMARY_CSV"
+ATTEMPT_SUMMARY_FILE="$RAW_DIR/attempt_summary.csv"
+OVERLAP_SUMMARY_FILE="$RAW_DIR/overlap_summary.csv"
 
 for trial in $(seq 1 "$NUM_TRIALS"); do
   trial_dir="$RUN_DIR/trial_$trial"
@@ -148,8 +152,38 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
     trial_status="missing_logs"
   fi
   throughput_gbps="$(awk "BEGIN {printf \"%.6f\", $total_mbs * 8 / 1024}")"
-  echo "$SYSTEM,$ORDER,$SEQUENCER,$NUM_CLIENTS,\"$CLIENT_LAYOUT\",$REPLICATION_FACTOR,$trial,$trial_status,$throughput_gbps,$trial_dir,$COMMIT" >> "$SUMMARY_CSV"
+  overlap_gbps=""
+  overlap_window_ms=""
+  timeseries_clients=""
+  if [[ -f "$OVERLAP_SUMMARY_FILE" ]]; then
+    overlap_gbps="$(awk -F',' -v t="$trial" 'NR>1 && $1==t {print $2; exit}' "$OVERLAP_SUMMARY_FILE")"
+    overlap_window_ms="$(awk -F',' -v t="$trial" 'NR>1 && $1==t {print $3; exit}' "$OVERLAP_SUMMARY_FILE")"
+    timeseries_clients="$(awk -F',' -v t="$trial" 'NR>1 && $1==t {print $4; exit}' "$OVERLAP_SUMMARY_FILE")"
+  fi
+  attempts_used=""
+  first_attempt_pass=""
+  if [[ -f "$ATTEMPT_SUMMARY_FILE" ]]; then
+    attempts_used="$(awk -F',' -v t="$trial" '$1==t && $3=="success"{print $2; exit}' "$ATTEMPT_SUMMARY_FILE")"
+    if [[ -z "$attempts_used" ]]; then
+      attempts_used="$(awk -F',' -v t="$trial" '$1==t && $2+0>max{max=$2+0} END{if(max>0) print max}' "$ATTEMPT_SUMMARY_FILE")"
+    fi
+    if [[ -n "$attempts_used" ]]; then
+      if [[ "$attempts_used" == "1" ]]; then
+        first_attempt_pass="1"
+      else
+        first_attempt_pass="0"
+      fi
+    fi
+  fi
+  echo "$SYSTEM,$ORDER,$SEQUENCER,$NUM_CLIENTS,\"$CLIENT_LAYOUT\",$REPLICATION_FACTOR,$trial,$trial_status,$throughput_gbps,$overlap_gbps,$overlap_window_ms,$timeseries_clients,$attempts_used,$first_attempt_pass,$trial_dir,$COMMIT" >> "$SUMMARY_CSV"
 done
+
+if [[ "$REQUIRE_FIRST_ATTEMPT_PASS" == "1" ]]; then
+  if awk -F',' 'NR>1 && $14 != "1" {found=1} END{exit !found}' "$SUMMARY_CSV"; then
+    echo "ERROR: first-attempt reliability gate failed (REQUIRE_FIRST_ATTEMPT_PASS=1)." >&2
+    RUN_STATUS=1
+  fi
+fi
 
 printf 'run_status=%s\nend_time_utc=%s\n' "$RUN_STATUS" "$(date -u +%Y%m%dT%H%M%SZ)" >> "$RUN_DIR/metadata.env"
 exit "$RUN_STATUS"
