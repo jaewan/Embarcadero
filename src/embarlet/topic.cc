@@ -268,13 +268,25 @@ Topic::Topic(
 			}
 
 
+		// Seed broker_epoch_ from the CXL ControlBlock so the first
+		// CheckEpochOnce() does not falsely detect a stale epoch.
+		// Without this, broker_epoch_ starts at 0 while CXL epoch is 1
+		// (set by broker 0 at init), causing a guaranteed 100ms sleep on
+		// every first batch across all brokers.
+		if (cxl_addr_) {
+			ControlBlock* cb = reinterpret_cast<ControlBlock*>(cxl_addr_);
+			CXL::flush_cacheline(cb);
+			CXL::load_fence();
+			uint64_t initial_epoch = cb->epoch.load(std::memory_order_acquire);
+			broker_epoch_.store(initial_epoch, std::memory_order_release);
+		}
+
 		// Constructor completes initialization without starting threads
 		// Call Start() method separately to begin thread execution
 }
 
 void Topic::Start() {
-	// Ensure all initialization is complete before starting threads
-	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	std::atomic_thread_fence(std::memory_order_seq_cst);
 	// Start delegation thread if needed (Stage 2: Local Ordering)
 	// [PHASE-1] Skip DelegationThread for the epoch-ordered modes and Order 2 with EMBARCADERO sequencer.
 	// Reason 1: Order 4/5/2 subscribers use GetBatchToExportWithMetadata (GOI/CV-based),
@@ -5076,13 +5088,13 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	shard.expired_hold_keys_buffer.reserve(shard.clients_with_held_batches.size());
 	const bool force_expire_all_frontiers =
 		now_ns < force_expire_hold_until_ns_.load(std::memory_order_acquire);
+	constexpr uint64_t kForceExpireMinAgeNs = 50ULL * 1000 * 1000;
 	for (size_t cid : shard.clients_with_held_batches) {
 		auto map_it = shard.hold_buffer.find(cid);
 		if (map_it == shard.hold_buffer.end() || map_it->second.empty()) continue;
 		if (force_expire_all_frontiers) {
-			// Disconnect/drain should skip only the current missing frontier for a client.
-			// Expiring the entire held chain at once creates large expiry storms and defeats
-			// the normal "skip one gap, then drain newly-ready contiguous batches" flow.
+			const auto& front = map_it->second.begin()->second;
+			if (now_ns - front.hold_start_ns < kForceExpireMinAgeNs) continue;
 			const size_t min_seq = map_it->second.begin()->first;
 			shard.expired_hold_keys_buffer.emplace_back(cid, min_seq);
 			continue;

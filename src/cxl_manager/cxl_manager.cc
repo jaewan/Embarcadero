@@ -202,6 +202,13 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 
 	if (will_mbind) {
 		// Bind the shm-backed region to the configured CXL NUMA node before first-touch.
+		//
+		// Deployment note (e.g. lab hosts with CXL expanders): NUMA node N may expose **CXL memory
+		// with zero CPUs** on that node. That is normal. You still mbind the mapping to node N so
+		// pages populate on the CXL NUMA domain. **Run broker/client processes with CPUs on a
+		// compute node** (e.g. --cpunodebind=1) and **membind that includes both DRAM and the CXL
+		// node** (e.g. --membind=1,2) so default allocations stay on DRAM while this mbound region
+		// lives on node N. Override: env EMBARCADERO_CXL_NUMA_NODE or embarcadero.cxl.numa_node in YAML.
 		int cxl_numa_node = Configuration::getInstance().config().cxl.numa_node.get();
 		struct bitmask* bitmask = numa_allocate_nodemask();
 		numa_bitmask_setbit(bitmask, cxl_numa_node);
@@ -342,8 +349,19 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		goi_ = reinterpret_cast<GOIEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + kGOIOffset);
 
-		// Head broker initializes CompletionVector (GOI can be lazy-initialized - zeros are valid)
+		// Head broker initializes Phase 2 control structures.
 		if (broker_id_ == 0) {
+			// committed_seq must be UINT64_MAX ("no committed entries") before any
+			// chain replication thread can run.  After memset, committed_seq=0 looks
+			// like "GOI[0] is committed", causing chain replication to read the zeroed
+			// GOI[0], skip it as stale, and advance next_goi_index_ past it.  When the
+			// sequencer later writes real data at GOI[0], chain replication has already
+			// moved to index 1 and never processes it — deadlocking ACK2.
+			ControlBlock* cb = reinterpret_cast<ControlBlock*>(cxl_addr_);
+			cb->committed_seq.store(UINT64_MAX, std::memory_order_release);
+			CXL::flush_cacheline(cb);
+			CXL::store_fence();
+
 			// Sentinel (uint64_t)-1 = no progress; 0 = first batch completed (so GetOffsetToAck can distinguish)
 			constexpr uint64_t kCVNoProgress = static_cast<uint64_t>(-1);
 			for (int i = 0; i < NUM_MAX_BROKERS; i++) {
