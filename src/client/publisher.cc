@@ -245,28 +245,43 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 	pubQue_(num_threads_per_broker_ * 4, num_threads_per_broker_, client_id_, message_size, order),
 	seq_type_(seq_type),
 	broker_stats_(NUM_MAX_BROKERS),
-	start_time_(std::chrono::steady_clock::now())  // Initialize immediately
-	,order5_home_brokers_(GetOrder5HomeBrokers())
+	start_time_(std::chrono::steady_clock::now()),  // Initialize immediately
+	order5_home_brokers_(GetOrder5HomeBrokers()),
+	expected_num_brokers_(0)
 #ifdef COLLECT_LATENCY_STATS
 	,send_records_per_broker_(NUM_MAX_BROKERS),
 	send_records_mutexes_(NUM_MAX_BROKERS)
 #endif
-		{
-		// Copy topic name
-		memcpy(topic_, topic, TOPIC_NAME_SIZE);
-
-		// Create gRPC stub for head broker
-		std::string addr = head_addr + ":" + port;
-		stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
-
-		// Initialize first broker
-		nodes_[0] = head_addr + ":" + std::to_string(PORT);
-		brokers_.emplace_back(0);
-
-		VLOG(3) << "Publisher constructed with client_id: " << client_id_ 
-			<< ", topic: " << topic 
-			<< ", num_threads_per_broker: " << num_threads_per_broker_;
+{
+	// Initialize expected_num_brokers_ from environment variable if provided
+	if (const char* env_num_brokers = std::getenv("NUM_BROKERS")) {
+		try {
+			expected_num_brokers_ = std::stoi(env_num_brokers);
+			LOG(INFO) << "Publisher: Expecting " << expected_num_brokers_ << " brokers (from NUM_BROKERS env)";
+		} catch (...) {
+			LOG(WARNING) << "Publisher: Invalid NUM_BROKERS environment variable: " << env_num_brokers;
+		}
+	} else {
+		// Fallback to config if env not set
+		expected_num_brokers_ = Embarcadero::GetConfig().config().broker.max_brokers.get();
+		LOG(INFO) << "Publisher: Expecting " << expected_num_brokers_ << " brokers (from config max_brokers)";
 	}
+
+	// Copy topic name
+	memcpy(topic_, topic, TOPIC_NAME_SIZE);
+
+	// Create gRPC stub for head broker
+	std::string addr = head_addr + ":" + port;
+	stub_ = HeartBeat::NewStub(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials()));
+
+	// Initialize first broker
+	nodes_[0] = head_addr + ":" + std::to_string(PORT);
+	brokers_.emplace_back(0);
+
+	VLOG(3) << "Publisher constructed with client_id: " << client_id_ 
+		<< ", topic: " << topic 
+		<< ", num_threads_per_broker: " << num_threads_per_broker_;
+}
 
 void Publisher::RefreshOrder5PreferredQueuesLocked() {
 	if (seq_type_ != heartbeat_system::SequencerType::EMBARCADERO ||
@@ -2206,8 +2221,15 @@ void Publisher::SubscribeToClusterStatus() {
 
 					// Signal that we're connected (only on first successful connection)
 					if (all_connected && !connected_.load(std::memory_order_acquire)) {
-						connected_.store(true, std::memory_order_release);
-						VLOG(1) << "SubscribeToCluster: Connection established successfully. connected_=true";
+						int expected = expected_num_brokers_;
+						if (static_cast<int>(brokers_with_threads_.size()) >= expected) {
+							connected_.store(true, std::memory_order_release);
+							VLOG(1) << "SubscribeToCluster: Connection established successfully. connected_=true ("
+							         << brokers_with_threads_.size() << "/" << expected << " brokers)";
+						} else {
+							VLOG(1) << "SubscribeToCluster: " << brokers_with_threads_.size()
+							         << "/" << expected << " brokers ready, waiting for full cluster...";
+						}
 					}
 				} else if (!connected_.load(std::memory_order_acquire) && brokers_.empty() && !use_broker_info) {
 					// Legacy-only fallback for old brokers that do not publish broker_info.

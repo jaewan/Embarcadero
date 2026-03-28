@@ -762,6 +762,10 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 		}
 	}
 	constexpr int PROGRESS_LOG_INTERVAL_SEC = 5;  // Progress log interval during Poll
+
+	// [[FIX: Subscriber Readiness]] Wait for all expected brokers to connect before starting timeout
+	WaitUntilAllConnected();
+
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(POLL_TIMEOUT_SEC);
 	auto last_progress_log = std::chrono::steady_clock::now();
 

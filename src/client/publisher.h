@@ -344,7 +344,9 @@ class Publisher {
 		void ReassignQueueBrokerLocked(size_t queue_idx, int old_broker_id, int new_broker_id) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 		void LogOrder5RoutingSummary() const;
 
-		// Instance vars for SubscribeToClusterStatus error handling (was static)
+		// SubscribeToClusterStatus error handling
 		std::chrono::steady_clock::time_point last_read_warning_;
 		size_t read_fail_count_{0};
+
+		int expected_num_brokers_{0};
 };

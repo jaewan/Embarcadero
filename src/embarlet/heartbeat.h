@@ -25,6 +25,8 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/btree_set.h"
 #include "absl/synchronization/mutex.h"
+#include <condition_variable>
+#include <mutex>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/alarm.h>
 
@@ -131,7 +133,7 @@ class FollowerNodeClient {
 		int GetNumBrokers();
 		bool IsHeadAlive() const { return head_alive_; }
 		void SetHeadAlive(bool alive) { head_alive_ = alive; }
-		void SetAcceptsPublishes(bool accepts) { accepts_publishes_.store(accepts, std::memory_order_release); }
+		void SetAcceptsPublishes(bool accepts);
 		int GetBrokerId() { return broker_id_; }
 		std::string GetNodeId() const { return node_id_; }
 		std::string GetAddress() const { return address_; }
@@ -179,6 +181,9 @@ class FollowerNodeClient {
 		uint64_t cluster_version_{0};
 		absl::Mutex cluster_mutex_;
 		absl::flat_hash_map<int, NodeEntry> cluster_nodes_;
+
+		std::mutex hb_mutex_;
+		std::condition_variable hb_cv_;
 };
 
 class HeartBeatManager {

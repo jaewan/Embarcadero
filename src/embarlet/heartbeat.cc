@@ -701,12 +701,16 @@ bool FollowerNodeClient::CheckHeartBeatReply() {
 	return true;
 }
 
+void FollowerNodeClient::SetAcceptsPublishes(bool accepts) {
+	accepts_publishes_.store(accepts, std::memory_order_release);
+	hb_cv_.notify_one();
+}
+
 void FollowerNodeClient::HeartBeatLoop() {
 	const auto half_interval = std::chrono::seconds(HEARTBEAT_INTERVAL / 2);
 
 	while (!shutdown_) {
 		SendHeartbeat();
-		std::this_thread::sleep_for(half_interval);
 
 		if (!CheckHeartBeatReply()) {
 			wait_called_ = false;
@@ -718,7 +722,10 @@ void FollowerNodeClient::HeartBeatLoop() {
 			// Head election logic could be implemented here
 		}
 
-		std::this_thread::sleep_for(half_interval);
+		{
+			std::unique_lock<std::mutex> lock(hb_mutex_);
+			hb_cv_.wait_for(lock, half_interval, [this] { return shutdown_.load(); });
+		}
 	}
 
 	// Drain the completion queue after shutdown
