@@ -487,6 +487,14 @@ start_brokers() {
         sleep "$BROKER_READY_PROPAGATION_SEC"
     fi
     if [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+        # Let the sequencer and broker control plane settle before the zero-load
+        # topic warm-up probe. The probe itself only needs the steady-state cluster
+        # view, and running it earlier just reintroduces startup flakiness.
+        log "Waiting for remote Scalog sequencer readiness..."
+        if ! broker_wait_for_remote_scalog_ready "${SCALOG_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
+            echo "ERROR: remote Scalog sequencer did not reach full readiness" >&2
+            return 1
+        fi
         log "Precreating Scalog topic metadata..."
         (
             cd "$BUILD_BIN"
@@ -512,11 +520,6 @@ start_brokers() {
             cat /tmp/scalog_topic_precreate.log >&2 || true
             return 1
         }
-        log "Waiting for remote Scalog sequencer readiness..."
-        if ! broker_wait_for_remote_scalog_ready "${SCALOG_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
-            echo "ERROR: remote Scalog sequencer did not reach full readiness" >&2
-            return 1
-        fi
     fi
     log "All $NUM_BROKERS brokers ready and reachable."
 }
