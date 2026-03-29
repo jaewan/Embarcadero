@@ -217,6 +217,7 @@ Topic::Topic(
 		replication_factor_ = tinode_->replication_factor;
 		ordered_offset_addr_ = nullptr;
 		ordered_offset_ = 0;
+		validated_written_byte_offset_ = tinode_->offsets[broker_id_].log_offset;
 		for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
 			scanner_pushed_batches_[i].store(0, std::memory_order_relaxed);
 			scanner_pushed_msgs_[i].store(0, std::memory_order_relaxed);
@@ -440,6 +441,54 @@ inline void Topic::UpdateTInodeWritten(size_t written, size_t written_addr) {
 	tinode_->offsets[broker_id_].written_addr = written_addr;
 }
 
+inline void Topic::PublishValidatedWrittenRange(size_t start_offset, size_t total_size) {
+	if (total_size == 0) {
+		return;
+	}
+
+	size_t range_start = start_offset;
+	size_t range_end = start_offset + total_size;
+	auto next_it = validated_written_ranges_.lower_bound(range_start);
+	if (next_it != validated_written_ranges_.begin()) {
+		auto prev_it = std::prev(next_it);
+		if (prev_it->second >= range_start) {
+			range_start = prev_it->first;
+			range_end = std::max(range_end, prev_it->second);
+			validated_written_ranges_.erase(prev_it);
+		}
+	}
+	while (next_it != validated_written_ranges_.end() && next_it->first <= range_end) {
+		range_end = std::max(range_end, next_it->second);
+		auto erase_it = next_it++;
+		validated_written_ranges_.erase(erase_it);
+	}
+	validated_written_ranges_[range_start] = range_end;
+
+	bool advanced = false;
+	while (!validated_written_ranges_.empty()) {
+		auto it = validated_written_ranges_.begin();
+		if (it->first > validated_written_byte_offset_) {
+			break;
+		}
+		if (it->second <= validated_written_byte_offset_) {
+			validated_written_ranges_.erase(it);
+			continue;
+		}
+		validated_written_byte_offset_ = it->second;
+		validated_written_ranges_.erase(it);
+		advanced = true;
+	}
+
+	if (!advanced) {
+		return;
+	}
+
+	tinode_->offsets[broker_id_].validated_written_byte_offset = validated_written_byte_offset_;
+	CXL::flush_cacheline(CXL::ToFlushable(
+		&tinode_->offsets[broker_id_].validated_written_byte_offset));
+	CXL::store_fence();
+}
+
 /**
  * DelegationThread: Stage 2 (Local Ordering)
  *
@@ -474,6 +523,11 @@ void Topic::DelegationThread() {
 	size_t bytes_since_flush = 0;
 
 	while (!stop_threads_) {
+		if (current_batch) {
+			CXL::flush_cacheline(current_batch);
+			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(current_batch) + 64);
+			CXL::load_fence();
+		}
 		if (current_batch && __atomic_load_n(&current_batch->batch_complete, __ATOMIC_ACQUIRE)) {
 			if (current_batch->num_msg > 0) {
 				// [[BLOG_HEADER]] ORDER=0 and epoch-sequenced orders both skip per-message field writes when BlogHeader
@@ -486,6 +540,7 @@ void Topic::DelegationThread() {
 					MessageHeader* batch_first_msg = reinterpret_cast<MessageHeader*>(
 						reinterpret_cast<uint8_t*>(cxl_addr_) + current_batch->log_idx);
 					MessageHeader* msg_ptr = batch_first_msg;
+					bool touched_message_headers = false;
 					for (size_t i = 0; i < current_batch->num_msg; ++i) {
 						msg_ptr->logical_offset = logical_offset_;
 						msg_ptr->segment_header = reinterpret_cast<uint8_t*>(msg_ptr) - CACHELINE_SIZE;
@@ -508,6 +563,8 @@ void Topic::DelegationThread() {
 						*reinterpret_cast<unsigned long long int*>(msg_ptr->segment_header) =
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(msg_ptr->segment_header));
+						CXL::flush_cacheline(msg_ptr);
+						touched_message_headers = true;
 
 						if (i < current_batch->num_msg - 1) {
 							msg_ptr = reinterpret_cast<MessageHeader*>(
@@ -515,6 +572,12 @@ void Topic::DelegationThread() {
 						}
 
 						logical_offset_++;
+					}
+					if (touched_message_headers) {
+						// Scalog replication pollers parse next_msg_diff from CXL-shared MessageHeaders.
+						// Publish those cachelines before advancing validated_written_byte_offset so
+						// readers never observe "bytes visible" while an interior header still looks zero.
+						CXL::store_fence();
 					}
 
 					if (order_ != 0) {
@@ -525,7 +588,9 @@ void Topic::DelegationThread() {
 							written_val,
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
-						if (seq_type_ == SCALOG || seq_type_ == LAZYLOG) {
+						if (seq_type_ == SCALOG) {
+							PublishValidatedWrittenRange(current_batch->log_idx, current_batch->total_size);
+						} else if (seq_type_ == LAZYLOG) {
 							tinode_->offsets[broker_id_].validated_written_byte_offset =
 								current_batch->log_idx + current_batch->total_size;
 						}
@@ -580,7 +645,9 @@ void Topic::DelegationThread() {
 							written_val,
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
-						if (seq_type_ == SCALOG || seq_type_ == LAZYLOG) {
+						if (seq_type_ == SCALOG) {
+							PublishValidatedWrittenRange(current_batch->log_idx, current_batch->total_size);
+						} else if (seq_type_ == LAZYLOG) {
 							tinode_->offsets[broker_id_].validated_written_byte_offset =
 								current_batch->log_idx + current_batch->total_size;
 						}

@@ -102,6 +102,8 @@ REMOTE_LAZYLOG_SEQUENCER_HOST="${REMOTE_LAZYLOG_SEQUENCER_HOST:-}"
 REMOTE_LAZYLOG_BUILD_BIN="${REMOTE_LAZYLOG_BUILD_BIN:-}"
 EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-}"
 EMBARCADERO_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}"
+REMOTE_SCALOG_SEQUENCER_HOST="${REMOTE_SCALOG_SEQUENCER_HOST:-}"
+REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-}"
 
 # NUMA: CPUs on compute node 1; membind includes node 2 when CXL is a **zero-core** NUMA node (see cxl_manager.cc mbind).
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
@@ -134,12 +136,15 @@ fi
 # Cleanup helpers
 # ---------------------------------------------------------------------------
 cleanup() {
-  pkill -9 -f "./embarlet"      >/dev/null 2>&1 || true
+  broker_cleanup
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
   if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     broker_remote_corfu_stop || true
   elif [[ "$SEQUENCER" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
     broker_remote_lazylog_stop || true
+  fi
+  if [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    broker_remote_scalog_stop || true
   fi
   rm -f /tmp/embarlet_*_ready   >/dev/null 2>&1 || true
 }
@@ -175,12 +180,18 @@ wait_for_broker_reachability() {
 
     for host in "${hosts[@]}"; do
       for ((i=0; i<NUM_BROKERS; i++)); do
-        local port=$((1214 + i))
+        local port=$((BROKER_DATA_PORT_BASE + i))
         if ! probe_tcp_from_host "$host" "$target_ip" "$port"; then
           all_ok=0
           missing+=" ${host}:${target_ip}:${port}"
         fi
       done
+      if [[ -n "${BROKER_HEARTBEAT_PORT:-}" ]]; then
+        if ! probe_tcp_from_host "$host" "$target_ip" "$BROKER_HEARTBEAT_PORT"; then
+          all_ok=0
+          missing+=" ${host}:${target_ip}:${BROKER_HEARTBEAT_PORT}"
+        fi
+      fi
     done
 
     if [[ "$all_ok" -eq 1 ]]; then
@@ -220,6 +231,14 @@ start_local_brokers() {
       return 1
     fi
     sleep 1
+  elif [[ "$seq" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    export REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-$BIN_DIR}"
+    echo "Starting remote Scalog sequencer on $REMOTE_SCALOG_SEQUENCER_HOST..."
+    if ! broker_remote_scalog_start; then
+      echo "ERROR: failed to start remote Scalog sequencer on $REMOTE_SCALOG_SEQUENCER_HOST" >&2
+      return 1
+    fi
+    sleep 1
   fi
 
   # For remote scenario the broker must bind to the external NIC so the remote client
@@ -229,6 +248,9 @@ start_local_brokers() {
   broker_env+="EMBARCADERO_REPLICATION_FACTOR=$REPLICATION_FACTOR "
   broker_env+="NUM_BROKERS=$NUM_BROKERS "
   broker_env+="EMBARCADERO_NUM_BROKERS=$NUM_BROKERS "
+  if [[ "$seq" == "SCALOG" ]]; then
+    broker_env+="SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1} "
+  fi
   if [[ "$seq" == "LAZYLOG" ]]; then
     broker_env+="LAZYLOG_CXL_MODE=1 "
   fi
@@ -241,22 +263,31 @@ start_local_brokers() {
   if [[ "$seq" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]]; then
     broker_env+="EMBARCADERO_LAZYLOG_SEQ_PORT=$EMBARCADERO_LAZYLOG_SEQ_PORT "
   fi
+  local -a launched_broker_pids=()
 
   echo "Starting head broker (order=$order sequencer=$seq)..."
+  if [[ "$seq" == "SCALOG" && -z "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    "$BIN_DIR/scalog_global_sequencer" > /tmp/scalog_sequencer.log 2>&1 &
+  elif [[ "$seq" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+    "$BIN_DIR/corfu_global_sequencer" > /tmp/corfu_sequencer.log 2>&1 &
+  fi
   env $broker_env $EMBARLET_NUMA_BIND "$BIN_DIR/embarlet" \
     --config "$BROKER_CONFIG_ABS" \
     --head \
     --"$seq" \
     > "$BIN_DIR/broker_0.log" 2>&1 &
+  launched_broker_pids+=("$!")
 
   for ((i=1; i<NUM_BROKERS; i++)); do
     echo "Starting broker $i..."
     env $broker_env $EMBARLET_NUMA_BIND "$BIN_DIR/embarlet" \
       --config "$BROKER_CONFIG_ABS" \
+      --"$seq" \
       > "$BIN_DIR/broker_${i}.log" 2>&1 &
+    launched_broker_pids+=("$!")
   done
 
-  if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS"; then
+  if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS" "${launched_broker_pids[@]}"; then
     echo "ERROR: Brokers failed to reach ready state within ${BROKER_READY_TIMEOUT_SEC}s" >&2
     return 1
   fi
@@ -276,10 +307,64 @@ start_local_brokers() {
     echo "ERROR: Brokers are not reachable from client host(s) within ${BROKER_REACHABILITY_TIMEOUT_SEC}s" >&2
     return 1
   fi
-
   if [[ "$BROKER_READY_PROPAGATION_SEC" -gt 0 ]]; then
     echo "Waiting ${BROKER_READY_PROPAGATION_SEC}s for cluster state propagation..."
     sleep "$BROKER_READY_PROPAGATION_SEC"
+  fi
+  if [[ "$seq" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    local precreate_settle_sec="${SCALOG_PRECREATE_SETTLE_SEC:-15}"
+    if [[ "$precreate_settle_sec" -gt 0 ]]; then
+      echo "Waiting ${precreate_settle_sec}s for Scalog precreate settle..."
+      sleep "$precreate_settle_sec"
+    fi
+    local precreate_attempt precreate_max_attempts precreate_retry_sleep_sec
+    precreate_max_attempts="${SCALOG_PRECREATE_ATTEMPTS:-3}"
+    precreate_retry_sleep_sec="${SCALOG_PRECREATE_RETRY_SLEEP_SEC:-3}"
+    for (( precreate_attempt=1; precreate_attempt<=precreate_max_attempts; precreate_attempt++ )); do
+      echo "Precreating Scalog topic metadata (attempt ${precreate_attempt}/${precreate_max_attempts})..."
+      (
+        cd "$BIN_DIR"
+        EMBARCADERO_RUNTIME_MODE=throughput \
+        EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-}" \
+        EMBARCADERO_SCALOG_SEQ_PORT="${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
+        SCALOG_CXL_MODE="${SCALOG_CXL_MODE:-1}" \
+        ./throughput_test \
+          --config "$CLIENT_CONFIG_ABS" \
+          --head_addr "$reachability_ip" \
+          -n "$NUM_BROKERS" \
+          -m "$MSG_SIZE" \
+          -s 0 \
+          -t 5 \
+          -o "$order" \
+          -a "$ACK_LEVEL" \
+          -r "$REPLICATION_FACTOR" \
+          --sequencer "$seq" \
+          -l 0 \
+          >/tmp/scalog_topic_precreate.log 2>&1
+      ) && break
+
+      if [[ "$precreate_attempt" -lt "$precreate_max_attempts" ]]; then
+        echo "Scalog topic precreation attempt ${precreate_attempt} failed; retrying after ${precreate_retry_sleep_sec}s..." >&2
+        sleep "$precreate_retry_sleep_sec"
+        continue
+      fi
+
+      echo "ERROR: Scalog topic precreation failed" >&2
+      cat /tmp/scalog_topic_precreate.log >&2 || true
+      return 1
+    done
+    echo "Waiting for remote Scalog sequencer readiness..."
+    if ! broker_wait_for_remote_scalog_ready "${SCALOG_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
+      echo "ERROR: remote Scalog sequencer did not reach full readiness" >&2
+      return 1
+    fi
+    if [[ "$REPLICATION_FACTOR" -gt 1 ]]; then
+      echo "Waiting for local Scalog replication pollers to initialize..."
+      if ! broker_wait_for_local_scalog_replication_ready "${SCALOG_REPLICATION_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
+        echo "ERROR: local Scalog replication did not reach full readiness" >&2
+        return 1
+      fi
+    fi
   fi
   echo "All $NUM_BROKERS brokers ready and reachable."
 }
@@ -383,6 +468,15 @@ run_trial() {
     fi
     if [[ -n "${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" ]]; then
       quoted_cmd+="export EMBARCADERO_LAZYLOG_SEQ_PORT=${EMBARCADERO_LAZYLOG_SEQ_PORT} && "
+  fi
+    if [[ -n "${EMBARCADERO_SCALOG_SEQ_IP:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_SCALOG_SEQ_IP=${EMBARCADERO_SCALOG_SEQ_IP} && "
+    fi
+    if [[ -n "${EMBARCADERO_SCALOG_SEQ_PORT:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_SCALOG_SEQ_PORT=${EMBARCADERO_SCALOG_SEQ_PORT} && "
+    fi
+    if [[ "$seq" == "SCALOG" ]]; then
+      quoted_cmd+="export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1} && "
     fi
     if [[ -n "$CLIENT_NUMA_BIND" ]]; then
       quoted_cmd+="$CLIENT_NUMA_BIND "
@@ -401,8 +495,10 @@ run_trial() {
     local client_status=$?
   fi
 
+  local trial_failed=0
   if [[ "$client_status" -ne 0 ]]; then
-    echo "WARNING: throughput_test exited with status $client_status" >&2
+    echo "ERROR: latency client exited with status $client_status" >&2
+    trial_failed=1
   fi
 
   if [[ "$SCENARIO" == "remote" ]]; then
@@ -427,6 +523,15 @@ run_trial() {
     fi
   done
 
+  local trial_stats="$TRIAL_DIR/latency_stats.csv"
+  if [[ ! -f "$trial_stats" ]]; then
+    echo "ERROR: latency_stats.csv missing for trial $trial" >&2
+    trial_failed=1
+  elif ! awk -F',' '$13=="publish_to_deliver_latency"{found=1} END{exit !found}' "$trial_stats"; then
+    echo "ERROR: publish_to_deliver_latency row missing in latency_stats.csv for trial $trial" >&2
+    trial_failed=1
+  fi
+
   cat > "$RUN_METADATA" <<EOF
 run_id=$RUN_ID
 scenario=$SCENARIO
@@ -448,6 +553,9 @@ client_command_file=$CLIENT_CMD_FILE
 EOF
 
   echo "Saved trial artefacts to: $TRIAL_DIR"
+  if [[ "$trial_failed" -ne 0 ]]; then
+    return 1
+  fi
   return 0
 }
 

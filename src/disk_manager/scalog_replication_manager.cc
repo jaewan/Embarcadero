@@ -32,6 +32,50 @@ namespace Scalog {
 	using scalogreplication::ScalogReplicationRequest;
 	using scalogreplication::ScalogReplicationResponse;
 
+	namespace {
+		inline size_t LoadSharedSizeT(volatile size_t* ptr) {
+			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(ptr)));
+			Embarcadero::CXL::load_fence();
+			return *ptr;
+		}
+
+		inline void RefreshMessageHeader(const Embarcadero::MessageHeader* hdr) {
+			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(hdr)));
+			Embarcadero::CXL::load_fence();
+		}
+
+		bool WriteFullyAtOffset(int fd, const uint8_t* src, size_t total_bytes, off_t offset,
+		                        const char* context) {
+			size_t written_total = 0;
+			while (written_total < total_bytes) {
+				ssize_t rc = pwrite(fd,
+				                   src + written_total,
+				                   total_bytes - written_total,
+				                   offset + static_cast<off_t>(written_total));
+				if (rc < 0) {
+					if (errno == EINTR) {
+						continue;
+					}
+					LOG(ERROR) << context << ": pwrite failed after " << written_total
+					           << "/" << total_bytes << " bytes at offset "
+					           << (offset + static_cast<off_t>(written_total))
+					           << ": " << strerror(errno);
+					return false;
+				}
+				if (rc == 0) {
+					LOG(ERROR) << context << ": pwrite returned 0 after " << written_total
+					           << "/" << total_bytes << " bytes at offset "
+					           << (offset + static_cast<off_t>(written_total));
+					return false;
+				}
+				written_total += static_cast<size_t>(rc);
+			}
+			return true;
+		}
+	}  // namespace
+
 	class ScalogReplicationServiceImpl final : public ScalogReplicationService::Service {
 		// --- LocalCutTracker (Assumed Correct - Uses its own absl::Mutex) ---
 		class LocalCutTracker {
@@ -718,9 +762,13 @@ namespace Scalog {
 			size_t last_cxl_offset = tinode_->offsets[broker_id_].log_offset;
 			size_t rep_offset = 0;
 			int64_t persisted_count = 0;
+			LOG(INFO) << "CXLPollingLoop: broker=" << broker_id_
+			          << " starting primary CXL replication"
+			          << " log_offset=" << last_cxl_offset
+			          << " validated=" << LoadSharedSizeT(&tinode_->offsets[broker_id_].validated_written_byte_offset);
 
 			while (running_.load()) {
-				size_t validated = tinode_->offsets[broker_id_].validated_written_byte_offset;
+				size_t validated = LoadSharedSizeT(&tinode_->offsets[broker_id_].validated_written_byte_offset);
 				if (validated <= last_cxl_offset) {
 					Embarcadero::CXL::cpu_pause();
 					continue;
@@ -736,6 +784,7 @@ namespace Scalog {
 				uint8_t* ptr = src;
 				for (; ptr < src + chunk_size; ) {
 					auto* hdr = reinterpret_cast<Embarcadero::MessageHeader*>(ptr);
+					RefreshMessageHeader(hdr);
 					if (hdr->paddedSize == 0 || hdr->next_msg_diff == 0) {
 						break;
 					}
@@ -756,9 +805,9 @@ namespace Scalog {
 				{
 					std::shared_lock<std::shared_mutex> lock(file_state_mutex_);
 					if (fd_ != -1) {
-						ssize_t written = pwrite(fd_, src, complete_bytes, static_cast<off_t>(rep_offset));
-						if (written < 0 || static_cast<size_t>(written) != complete_bytes) {
-							LOG(ERROR) << "CXLPollingLoop: pwrite failed: " << strerror(errno);
+						if (!WriteFullyAtOffset(fd_, src, complete_bytes,
+						                        static_cast<off_t>(rep_offset),
+						                        "CXLPollingLoop")) {
 							break;
 						}
 					}
@@ -796,7 +845,7 @@ namespace Scalog {
 			// "not yet initialized" (real offsets are always > 0 due to CXL layout).
 			size_t primary_log_offset = 0;
 			while (running_.load()) {
-				primary_log_offset = tinode_->offsets[primary_broker_id].log_offset;
+				primary_log_offset = LoadSharedSizeT(&tinode_->offsets[primary_broker_id].log_offset);
 				if (primary_log_offset != 0) break;
 				Embarcadero::CXL::cpu_pause();
 			}
@@ -809,7 +858,7 @@ namespace Scalog {
 			int64_t local_count = 0;
 
 			while (running_.load()) {
-				size_t validated = tinode_->offsets[primary_broker_id].validated_written_byte_offset;
+				size_t validated = LoadSharedSizeT(&tinode_->offsets[primary_broker_id].validated_written_byte_offset);
 				if (validated <= last_cxl_offset) {
 					Embarcadero::CXL::cpu_pause();
 					continue;
@@ -823,6 +872,7 @@ namespace Scalog {
 				uint8_t* ptr = src;
 				for (; ptr < src + chunk_size; ) {
 					auto* hdr = reinterpret_cast<Embarcadero::MessageHeader*>(ptr);
+					RefreshMessageHeader(hdr);
 					if (hdr->paddedSize == 0 || hdr->next_msg_diff == 0) {
 						break;
 					}
@@ -838,10 +888,9 @@ namespace Scalog {
 					continue;
 				}
 
-				ssize_t written = pwrite(fd, src, complete_bytes, static_cast<off_t>(rep_offset));
-				if (written < 0 || static_cast<size_t>(written) != complete_bytes) {
-					LOG(ERROR) << "ReplicaPollingLoop[" << primary_broker_id << "]: pwrite failed: "
-					           << strerror(errno);
+				if (!WriteFullyAtOffset(fd, src, complete_bytes,
+				                        static_cast<off_t>(rep_offset),
+				                        ("ReplicaPollingLoop[" + std::to_string(primary_broker_id) + "]").c_str())) {
 					break;
 				}
 

@@ -5,6 +5,7 @@
 #include "cxl_datastructure.h"
 #include <scalog_sequencer.grpc.pb.h>
 #include <atomic>
+#include <cstdint>
 
 namespace Embarcadero{
 	class CXLManager;
@@ -33,9 +34,9 @@ class ScalogLocalSequencer {
 		/// Receives the global cut from the global sequencer
 		void ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWriter<LocalCut, GlobalCut>>& stream, std::string topic_str);
 
-		/// Receives the global cut from the head node
-		/// This function is called in the callback of the send local cut grpc call
-		void ScalogSequencer(const char* topic, absl::btree_map<int, int> &global_cut);
+		/// Receives the global cut from the head node.
+		/// The input map is a per-broker delta (not cumulative).
+		void ScalogSequencer(const char* topic, absl::btree_map<int, int64_t> &global_cut_delta);
 
 	private:
 		TInode* tinode_;
@@ -45,8 +46,12 @@ class ScalogLocalSequencer {
 		BatchHeader* batch_header_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
 
-		/// Map of broker_id to local cut
-		absl::btree_map<int, int> global_cut_;
+		/// Last cumulative global cut received from global sequencer (broker_id -> cumulative count).
+		absl::btree_map<int, int64_t> global_cut_;
+
+		/// Last cumulative global cut already applied by this local sequencer.
+		/// Used to convert cumulative wire format into exactly-once per-broker deltas.
+		absl::btree_map<int, int64_t> last_applied_global_cut_;
 
 		/// Local epoch
 		int local_epoch_ = 0;

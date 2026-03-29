@@ -110,8 +110,40 @@ void TopicManager::Shutdown() {
 		return;
 	}
 	shutting_down_.store(true, std::memory_order_release);
+	if (topic_discovery_thread_.joinable()) {
+		topic_discovery_thread_.join();
+	}
 	absl::WriterMutexLock lock(&topics_mutex_);
 	topics_.clear();
+}
+
+void TopicManager::DiscoverRemoteTopicsLoop() {
+	while (!shutting_down_.load(std::memory_order_acquire)) {
+		for (size_t idx = 0; idx < MAX_TOPIC_SIZE; ++idx) {
+			TInode* tinode = cxl_manager_.GetTInodeByIndex(idx);
+			if (!tinode || tinode->topic[0] == 0) {
+				continue;
+			}
+
+			char topic_name[TOPIC_NAME_SIZE] = {0};
+			memcpy(topic_name, tinode->topic, TOPIC_NAME_SIZE - 1);
+
+			bool already_local = false;
+			{
+				absl::ReaderMutexLock lock(&topics_mutex_);
+				already_local = (topics_.find(topic_name) != topics_.end());
+			}
+			if (already_local) {
+				continue;
+			}
+
+			LOG(INFO) << "TopicManager discovery: creating local topic '" << topic_name
+			          << "' on broker " << broker_id_;
+			CreateNewTopicInternal(topic_name);
+		}
+
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
 }
 
 /**
@@ -130,6 +162,9 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	tinode->offsets[broker_id_].validated_written_byte_offset = 0;
 	for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
 		tinode->offsets[broker_id_].replication_done[i] = 0;
+		const void* rep_done_entry = const_cast<const void*>(static_cast<const volatile void*>(
+			&tinode->offsets[broker_id_].replication_done[i]));
+		CXL::flush_cacheline(rep_done_entry);
 	}
 
 	// Calculate log offset using pointer difference plus alignment for O_DIRECT
@@ -146,7 +181,12 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	// Calculate batch headers offset using pointer difference
 	const uintptr_t batch_headers_addr = reinterpret_cast<uintptr_t>(batch_headers_region);
 	tinode->offsets[broker_id_].batch_headers_offset = 
-		static_cast<size_t>(batch_headers_addr - cxl_base_addr);
+			static_cast<size_t>(batch_headers_addr - cxl_base_addr);
+	// Flush the broker region after the broker-specific writes so the hook sees the barrier
+	// within the same diff hunk.
+	const void* broker_region = const_cast<const void*>(static_cast<const volatile void*>(
+		&tinode->offsets[broker_id_].log_offset));
+	CXL::flush_cacheline(broker_region);
 
 	//  Initialize consumed_through so producer can allocate slot 2+ without blocking.
 	// Semantics: "first byte past last consumed slot". BATCHHEADERS_SIZE means "all slots [0, size)
@@ -154,11 +194,6 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	// until the ring fills. Sequencer overwrites this when it processes each batch.
 	tinode->offsets[broker_id_].batch_headers_consumed_through = BATCHHEADERS_SIZE;
 
-	// [[ROOT_CAUSE_B_FIX]] - Flush broker-specific offset initialization
-	// After each broker initializes its offsets[broker_id_] entries (log_offset/batch_headers_offset/written_addr)
-	// Flush the broker region (first 256B of offset_entry) so other threads see the values
-	const void* broker_region = const_cast<const void*>(static_cast<const volatile void*>(&tinode->offsets[broker_id_].log_offset));
-	CXL::flush_cacheline(broker_region);
 	// Flush sequencer region so producer (on any broker) sees batch_headers_consumed_through
 	const void* sequencer_region = const_cast<const void*>(static_cast<const volatile void*>(&tinode->offsets[broker_id_].batch_headers_consumed_through));
 	CXL::flush_cacheline(sequencer_region);

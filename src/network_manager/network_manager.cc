@@ -1122,6 +1122,15 @@ void NetworkManager::HandlePublishRequest(
 					             << " remaining=" << remaining;
 					break;
 				}
+				// [[CXL_VISIBILITY_FIX]] Flush each MessageHeader cacheline to CXL before
+				// PublishPBRSlotDirect signals batch_complete=1. recv() writes paddedSize only
+				// to this CPU's L1/L2; without an explicit flush the CXL device still holds the
+				// zero-initialized value. DelegationThread's cache miss would then fetch 0 from
+				// CXL, trigger the invalid-paddedSize error path, skip writing next_msg_diff,
+				// and stall CXLPollingLoop/ReplicaPollingLoop forever. The SFENCE inside
+				// PublishPBRSlotDirect orders all these CLFLUSHOPTs before batch_complete is
+				// visible, so the happens-before guarantee is maintained.
+				CXL::flush_cacheline(first_msg);
 				remaining -= first_msg->paddedSize;
 				first_msg = reinterpret_cast<MessageHeader*>(
 					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
@@ -1650,6 +1659,10 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 			int ready_replicas = 0;
 			for (int i = 0; i < replication_factor; i++) {
 				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
+				volatile uint64_t* rep_done_ptr = &tinode->offsets[b].replication_done[broker_id_];
+				CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(rep_done_ptr)));
+				CXL::load_fence();
 				size_t val = tinode->offsets[b].replication_done[broker_id_];
 				if (val == kReplicationNotStarted) {
 					continue;
@@ -1676,6 +1689,8 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 		}
 	} else if (replication_factor > 0) {
 		if (ack_level == 1) {
+			// ACK1 is the ordered-visibility frontier.
+			// Keep ORDER=0 on written; all ordered modes (including SCALOG ORDER=1) use ordered.
 			if (order == 0) {
 				fast_read_value = tinode->offsets[broker_id_].written;
 			} else {
@@ -1840,7 +1855,8 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		return min + 1;  // Convert last offset to message count
 	}
 
-	// ACK Level 1: Acknowledge after written to shared memory and ordered (order 0/1/2 or non-EMBARCADERO)
+		// ACK Level 1: acknowledge after ordered visibility frontier advances.
+		// Keep ORDER=0 on written; ordered modes (including SCALOG ORDER=1) use ordered.
 	if(replication_factor > 0){
 		if(ack_level == 1){
 			if(order == 0){
@@ -1881,6 +1897,10 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		// [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
 		for (int i = 0; i < replication_factor; i++) {
 			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
+			volatile uint64_t* rep_done_ptr = &tinode->offsets[b].replication_done[broker_id_];
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(rep_done_ptr)));
+			CXL::load_fence();
 			const size_t val = tinode->offsets[b].replication_done[broker_id_];
 			if (val == kReplicationNotStarted) {
 				return static_cast<size_t>(-1);
@@ -1889,9 +1909,9 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 				min = val;
 			}
 		}
-		return min;
+		return min + 1;
 	}else{
-		// No replication: Acknowledge after written (order=0) or ordered (order>0)
+		// No replication: acknowledge after written for ORDER=0, ordered otherwise.
 		if(order == 0){
 			// [[CRITICAL_FIX: Invalidate cache before reading written for ORDER=0]]
 			// UpdateWrittenForOrder0 flushes from writer; AckThread must invalidate to see it

@@ -173,6 +173,7 @@ class FollowerNodeClient {
 		std::string address_;
 		grpc::CompletionQueue cq_;
 		std::atomic<bool> head_alive_{true};
+		std::atomic<int> consecutive_missed_heartbeats_{0};
 		std::atomic<bool> accepts_publishes_{false};
 		std::atomic<bool> wait_called_{false};
 		int broker_id_{-1};

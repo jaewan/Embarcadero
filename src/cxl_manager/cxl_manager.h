@@ -35,6 +35,7 @@ class CXLManager{
 		void* GetNewBatchHeaderLog();
 		TInode* GetTInode(const char* topic);
 		TInode* GetReplicaTInode(const char* topic);
+		TInode* GetTInodeByIndex(size_t idx);
 		void* GetCXLAddr(){return cxl_addr_;}
 
 		// [[PHASE_2]] Accessors for GOI and CompletionVector

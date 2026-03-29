@@ -19,7 +19,7 @@ const Configuration& GetConfig() {
 template<>
 std::optional<int> ConfigValue<int>::getEnvValue() const {
     const char* env_val = std::getenv(env_var_.c_str());
-    if (env_val) {
+    if (env_val && *env_val != '\0') {
         try {
             return std::stoi(env_val);
         } catch (const std::exception& e) {
@@ -32,7 +32,7 @@ std::optional<int> ConfigValue<int>::getEnvValue() const {
 template<>
 std::optional<size_t> ConfigValue<size_t>::getEnvValue() const {
     const char* env_val = std::getenv(env_var_.c_str());
-    if (env_val) {
+    if (env_val && *env_val != '\0') {
         try {
             return std::stoull(env_val);
         } catch (const std::exception& e) {

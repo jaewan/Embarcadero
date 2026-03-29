@@ -1,8 +1,17 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <chrono>
+#include <cstring>
+#include <functional>
+#include <mutex>
+#include <shared_mutex>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <glog/logging.h>
 
 // Architecture-specific intrinsics
@@ -17,6 +26,120 @@ struct BlogMessageHeader;
 }
 
 namespace Embarcadero {
+
+// Lightweight compatibility utilities used by benchmark/performance_test.cc.
+// These were historically provided from this header and are still cheap enough
+// to keep here for local tooling/benchmark builds.
+
+class StringInternPool {
+public:
+    static constexpr size_t kNumShards = 16;
+
+    static StringInternPool& Instance() {
+        static StringInternPool instance;
+        return instance;
+    }
+
+    const char* Intern(std::string_view str) {
+        const size_t shard_idx = std::hash<std::string_view>{}(str) % kNumShards;
+        auto& shard = shards_[shard_idx];
+        {
+            std::shared_lock lock(shard.mutex);
+            auto it = shard.pool.find(std::string(str));
+            if (it != shard.pool.end()) {
+                return it->first.c_str();
+            }
+        }
+
+        std::unique_lock lock(shard.mutex);
+        auto [it, inserted] = shard.pool.emplace(std::string(str), true);
+        (void)inserted;
+        return it->first.c_str();
+    }
+
+    const char* GetInterned(std::string_view str) const {
+        const size_t shard_idx = std::hash<std::string_view>{}(str) % kNumShards;
+        const auto& shard = shards_[shard_idx];
+        std::shared_lock lock(shard.mutex);
+        auto it = shard.pool.find(std::string(str));
+        return (it != shard.pool.end()) ? it->first.c_str() : nullptr;
+    }
+
+private:
+    struct alignas(64) Shard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<std::string, bool> pool;
+    };
+
+    std::array<Shard, kNumShards> shards_{};
+
+    StringInternPool() = default;
+    StringInternPool(const StringInternPool&) = delete;
+    StringInternPool& operator=(const StringInternPool&) = delete;
+};
+
+class ZeroCopyBuffer {
+public:
+    ZeroCopyBuffer(void* data, size_t size) : data_(data), size_(size) {}
+
+    std::string_view AsStringView() const {
+        return std::string_view(static_cast<const char*>(data_), size_);
+    }
+
+    const void* Data() const { return data_; }
+    size_t Size() const { return size_; }
+
+    ZeroCopyBuffer Slice(size_t offset, size_t length) const {
+        if (offset + length > size_) {
+            throw std::out_of_range("Slice out of bounds");
+        }
+        return ZeroCopyBuffer(static_cast<char*>(data_) + offset, length);
+    }
+
+private:
+    void* data_;
+    size_t size_;
+};
+
+inline void OptimizedMemcpy(void* dest, const void* src, size_t size) {
+    std::memcpy(dest, src, size);
+}
+
+template <typename T, size_t Size>
+class SPSCQueue {
+public:
+    SPSCQueue() : head_(0), tail_(0) {}
+
+    bool TryPush(const T& item) {
+        const size_t head = head_.load(std::memory_order_relaxed);
+        const size_t next_head = (head + 1) % Size;
+        if (next_head == tail_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        buffer_[head] = item;
+        head_.store(next_head, std::memory_order_release);
+        return true;
+    }
+
+    bool TryPop(T& item) {
+        const size_t tail = tail_.load(std::memory_order_relaxed);
+        if (tail == head_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        item = buffer_[tail];
+        tail_.store((tail + 1) % Size, std::memory_order_release);
+        return true;
+    }
+
+    bool Empty() const {
+        return tail_.load(std::memory_order_acquire) == head_.load(std::memory_order_acquire);
+    }
+
+private:
+    alignas(64) std::atomic<size_t> head_;
+    alignas(64) std::atomic<size_t> tail_;
+    alignas(64) T buffer_[Size]{};
+};
 
 // Cache coherence primitives for non-coherent CXL memory
 // Note: DEV-002 (batched flushes) is planned but not yet implemented

@@ -513,6 +513,14 @@ TInode* CXLManager::GetReplicaTInode(const char* topic){
 	return (TInode*)((uint8_t*)base_for_regions_ + (TInode_idx * sizeof(struct TInode)));
 }
 
+TInode* CXLManager::GetTInodeByIndex(size_t idx) {
+	if (idx >= MAX_TOPIC_SIZE) {
+		return nullptr;
+	}
+	return reinterpret_cast<TInode*>(
+		reinterpret_cast<uint8_t*>(base_for_regions_) + (idx * sizeof(struct TInode)));
+}
+
 /**
  * [[DEVIATION_005: Atomic Bitmap-Based Segment Allocation]]
  * 

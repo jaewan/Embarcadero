@@ -21,10 +21,13 @@
 #   EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE, EMBARCADERO_BATCH_SIZE,
 #   EMBARCADERO_CLIENT_PUB_BATCH_KB, EMBARCADERO_NETWORK_IO_THREADS,
 #   EMBARCADERO_ORDER5_HOME_BROKERS, LOCAL_CLIENT_NUMA,
-#   REMOTE_CORFU_SEQUENCER_HOST, REMOTE_CORFU_BUILD_BIN
+#   REMOTE_CORFU_SEQUENCER_HOST, REMOTE_CORFU_BUILD_BIN,
+#   REMOTE_SCALOG_SEQUENCER_HOST, REMOTE_SCALOG_BUILD_BIN
 #   EMBARCADERO_CORFU_SEQ_IP / EMBARCADERO_CORFU_SEQ_PORT for CORFU + SSH clients
 #   REMOTE_LAZYLOG_SEQUENCER_HOST, REMOTE_LAZYLOG_BUILD_BIN
 #   EMBARCADERO_LAZYLOG_SEQ_IP / EMBARCADERO_LAZYLOG_SEQ_PORT for LAZYLOG + SSH clients
+#   EMBARCADERO_SCALOG_SEQ_IP / EMBARCADERO_SCALOG_SEQ_PORT for SCALOG
+#   REMOTE_CLIENT_BIN_DIR to override the SSH client executable directory
 #
 # Example:
 #   NUM_CLIENTS=3 NUM_BROKERS=4 MESSAGE_SIZE=8192 scripts/run_multiclient.sh
@@ -92,12 +95,17 @@ REMOTE_CORFU_SEQUENCER_HOST=${REMOTE_CORFU_SEQUENCER_HOST:-}
 REMOTE_CORFU_BUILD_BIN=${REMOTE_CORFU_BUILD_BIN:-}
 REMOTE_LAZYLOG_SEQUENCER_HOST=${REMOTE_LAZYLOG_SEQUENCER_HOST:-}
 REMOTE_LAZYLOG_BUILD_BIN=${REMOTE_LAZYLOG_BUILD_BIN:-}
+EMBARCADERO_SCALOG_SEQ_IP=${EMBARCADERO_SCALOG_SEQ_IP:-}
+EMBARCADERO_SCALOG_SEQ_PORT=${EMBARCADERO_SCALOG_SEQ_PORT:-}
+REMOTE_SCALOG_SEQUENCER_HOST=${REMOTE_SCALOG_SEQUENCER_HOST:-}
+REMOTE_SCALOG_BUILD_BIN=${REMOTE_SCALOG_BUILD_BIN:-}
 # ---------------------------------------------------------------------------
 # Derived paths
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_BIN="$PROJECT_ROOT/build/bin"
+REMOTE_CLIENT_BIN_DIR=${REMOTE_CLIENT_BIN_DIR:-$BUILD_BIN}
 BROKER_CONFIG="${BROKER_CONFIG:-config/embarcadero.yaml}"
 CLIENT_CONFIG="${CLIENT_CONFIG:-config/client.yaml}"
 BROKER_CONFIG_ABS="$PROJECT_ROOT/$BROKER_CONFIG"
@@ -217,11 +225,15 @@ resolve_client_numa() {
 
 verify_client_binary() {
     local host="$1"
+    local client_bin="$BUILD_BIN"
+    if [[ "$host" != "local" ]]; then
+        client_bin="$REMOTE_CLIENT_BIN_DIR"
+    fi
     local remote_cmd="
 set -e
-cd '$BUILD_BIN'
+cd '$client_bin'
 if [ ! -x ./throughput_test ]; then
-    echo 'missing throughput_test in $BUILD_BIN'
+    echo 'missing throughput_test in $client_bin'
     exit 10
 fi
 if command -v ldd >/dev/null 2>&1; then
@@ -271,12 +283,18 @@ wait_for_broker_reachability() {
         for (( i=0; i<NUM_CLIENTS; i++ )); do
             host="${CLIENT_HOSTS[$i]}"
             for (( j=0; j<NUM_BROKERS; j++ )); do
-                port=$((1214 + j))
+                port=$((BROKER_DATA_PORT_BASE + j))
                 if ! probe_tcp_from_host "$host" "$BROKER_IP" "$port"; then
                     all_ok=0
                     missing+=" ${host}:${BROKER_IP}:${port}"
                 fi
             done
+            if [[ -n "${BROKER_HEARTBEAT_PORT:-}" ]]; then
+                if ! probe_tcp_from_host "$host" "$BROKER_IP" "$BROKER_HEARTBEAT_PORT"; then
+                    all_ok=0
+                    missing+=" ${host}:${BROKER_IP}:${BROKER_HEARTBEAT_PORT}"
+                fi
+            fi
         done
 
         if [[ "$all_ok" -eq 1 ]]; then
@@ -381,6 +399,25 @@ shm_cleanup() {
     rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
 }
 
+wait_for_broker_ports_free() {
+    local timeout_sec="${BROKER_PORT_DRAIN_TIMEOUT_SEC:-20}"
+    local deadline=$(( $(date +%s) + timeout_sec ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        local listeners=""
+        if [ -n "${BROKER_HEARTBEAT_PORT:-}" ]; then
+            listeners="$(ss -H -ltn "( sport = :${BROKER_DATA_PORT_BASE} or sport = :${BROKER_HEARTBEAT_PORT} )" 2>/dev/null || true)"
+        else
+            listeners="$(ss -H -ltn "sport = :${BROKER_DATA_PORT_BASE}" 2>/dev/null || true)"
+        fi
+        if [ -z "$listeners" ]; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "WARNING: broker port drain timed out after ${timeout_sec}s; continuing with restart" >&2
+    return 0
+}
+
 cleanup() {
     log "Cleaning up..."
     broker_local_cleanup
@@ -389,7 +426,11 @@ cleanup() {
   elif [[ "$SEQUENCER" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
         broker_remote_lazylog_stop || true
     fi
+    if [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+        broker_remote_scalog_stop || true
+    fi
     shm_cleanup
+    wait_for_broker_ports_free
     # Kill remote client processes (ignore failures)
     for (( _i=0; _i<${NUM_CLIENTS:-0}; _i++ )); do
         _h="${CLIENT_HOSTS[$_i]}"
@@ -402,10 +443,9 @@ trap cleanup EXIT
 
 start_brokers() {
     log "Resetting previous broker state..."
-    export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
-    pkill -9 -f "./embarlet" >/dev/null 2>&1 || true
-    rm -f /tmp/embarlet_*_ready 2>/dev/null || true
+    broker_local_cleanup
     shm_cleanup
+    wait_for_broker_ports_free
 
     if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         export REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-$BUILD_BIN}"
@@ -420,6 +460,14 @@ start_brokers() {
         log "Starting remote LazyLog sequencer on $REMOTE_LAZYLOG_SEQUENCER_HOST..."
         if ! broker_remote_lazylog_start; then
             echo "ERROR: failed to start remote LazyLog sequencer on $REMOTE_LAZYLOG_SEQUENCER_HOST" >&2
+            return 1
+        fi
+        sleep 1
+    elif [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+        export REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-$BUILD_BIN}"
+        log "Starting remote Scalog sequencer on $REMOTE_SCALOG_SEQUENCER_HOST..."
+        if ! broker_remote_scalog_start; then
+            echo "ERROR: failed to start remote Scalog sequencer on $REMOTE_SCALOG_SEQUENCER_HOST" >&2
             return 1
         fi
         sleep 1
@@ -444,25 +492,33 @@ start_brokers() {
     if [[ "$SEQUENCER" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]]; then
         export EMBARCADERO_LAZYLOG_SEQ_PORT
     fi
+    if [[ "$SEQUENCER" == "SCALOG" ]]; then
+        export SCALOG_CXL_MODE="${SCALOG_CXL_MODE:-1}"
+    fi
 
     log "Starting $NUM_BROKERS broker(s) with NUMA bind: '${EMBARLET_NUMA_BIND}'"
+    local -a launched_broker_pids=()
     if [[ "$SEQUENCER" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
     elif [[ "$SEQUENCER" == "LAZYLOG" && -z "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
         ./lazylog_global_sequencer > /tmp/lazylog_sequencer.log 2>&1 &
+    elif [[ "$SEQUENCER" == "SCALOG" ]]; then
+        ./scalog_global_sequencer > /tmp/scalog_sequencer.log 2>&1 &
     fi
 
     # shellcheck disable=SC2086
     $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" \
         > /tmp/broker_0.log 2>&1 &
+    launched_broker_pids+=("$!")
     for (( i=1; i<NUM_BROKERS; i++ )); do
         # shellcheck disable=SC2086
-        $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" \
+        $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" \
             > /tmp/broker_"$i".log 2>&1 &
+        launched_broker_pids+=("$!")
     done
 
     log "Waiting for $NUM_BROKERS broker(s) to become ready (timeout: ${BROKER_READY_TIMEOUT_SEC}s)..."
-    if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS"; then
+    if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS" "${launched_broker_pids[@]}"; then
         echo "ERROR: Brokers did not become ready within ${BROKER_READY_TIMEOUT_SEC}s" >&2
         cat /tmp/broker_0.log >&2
         return 1
@@ -476,6 +532,61 @@ start_brokers() {
     if [[ "$BROKER_READY_PROPAGATION_SEC" -gt 0 ]]; then
         log "Waiting ${BROKER_READY_PROPAGATION_SEC}s for cluster state propagation..."
         sleep "$BROKER_READY_PROPAGATION_SEC"
+    fi
+    if [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+        local precreate_settle_sec="${SCALOG_PRECREATE_SETTLE_SEC:-15}"
+        if [[ "$precreate_settle_sec" -gt 0 ]]; then
+            log "Waiting ${precreate_settle_sec}s for Scalog precreate settle..."
+            sleep "$precreate_settle_sec"
+        fi
+        local precreate_attempt precreate_max_attempts precreate_retry_sleep_sec
+        precreate_max_attempts="${SCALOG_PRECREATE_ATTEMPTS:-3}"
+        precreate_retry_sleep_sec="${SCALOG_PRECREATE_RETRY_SLEEP_SEC:-3}"
+        for (( precreate_attempt=1; precreate_attempt<=precreate_max_attempts; precreate_attempt++ )); do
+            log "Precreating Scalog topic metadata (attempt ${precreate_attempt}/${precreate_max_attempts})..."
+            (
+                cd "$BUILD_BIN"
+                EMBARCADERO_RUNTIME_MODE=throughput \
+                EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-}" \
+                EMBARCADERO_SCALOG_SEQ_PORT="${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
+                SCALOG_CXL_MODE="${SCALOG_CXL_MODE:-1}" \
+                ./throughput_test \
+                    --config "$CLIENT_CONFIG_ABS" \
+                    --head_addr "$BROKER_IP" \
+                    -n "$NUM_BROKERS" \
+                    -m "$MESSAGE_SIZE" \
+                    -s 0 \
+                    -t 5 \
+                    -o "$ORDER" \
+                    -a "$ACK" \
+                    -r "$REPLICATION_FACTOR" \
+                    --sequencer "$SEQUENCER" \
+                    -l 0 \
+                    >/tmp/scalog_topic_precreate.log 2>&1
+            ) && break
+
+            if [[ "$precreate_attempt" -lt "$precreate_max_attempts" ]]; then
+                log "Scalog topic precreation attempt ${precreate_attempt} failed; retrying after ${precreate_retry_sleep_sec}s..."
+                sleep "$precreate_retry_sleep_sec"
+                continue
+            fi
+
+            echo "ERROR: Scalog topic precreation failed" >&2
+            cat /tmp/scalog_topic_precreate.log >&2 || true
+            return 1
+        done
+        log "Waiting for remote Scalog sequencer readiness..."
+        if ! broker_wait_for_remote_scalog_ready "${SCALOG_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
+            echo "ERROR: remote Scalog sequencer did not reach full readiness" >&2
+            return 1
+        fi
+        if [[ "$REPLICATION_FACTOR" -gt 1 ]]; then
+            log "Waiting for local Scalog replication pollers to initialize..."
+            if ! broker_wait_for_local_scalog_replication_ready "${SCALOG_REPLICATION_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
+                echo "ERROR: local Scalog replication did not reach full readiness" >&2
+                return 1
+            fi
+        fi
     fi
     log "All $NUM_BROKERS brokers ready and reachable."
 }
@@ -512,6 +623,10 @@ if [[ "$SEQUENCER" == "CORFU" ]]; then
 elif [[ "$SEQUENCER" == "LAZYLOG" ]]; then
     printf "  %-32s %s\n" "LAZYLOG_SEQ_IP:"             "${EMBARCADERO_LAZYLOG_SEQ_IP:-"(unset)"}"
     printf "  %-32s %s\n" "LAZYLOG_SEQ_PORT:"           "${EMBARCADERO_LAZYLOG_SEQ_PORT:-"(default)"}"
+elif [[ "$SEQUENCER" == "SCALOG" ]]; then
+    printf "  %-32s %s\n" "SCALOG_SEQ_IP:"              "${EMBARCADERO_SCALOG_SEQ_IP:-"(unset)"}"
+    printf "  %-32s %s\n" "SCALOG_SEQ_PORT:"            "${EMBARCADERO_SCALOG_SEQ_PORT:-"(default)"}"
+    printf "  %-32s %s\n" "SCALOG_CXL_MODE:"            "${SCALOG_CXL_MODE:-1}"
 fi
 echo "================================================================"
 
@@ -567,7 +682,11 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
             host="${CLIENT_HOSTS[$i]}"
             numa="$(resolve_client_numa "$host" "${CLIENT_NUMAS[$i]}")"
             log_file="$LOG_DIR/trial${trial}_${host}.log"
-            ts_file="$BUILD_BIN/throughput_timeseries_trial${trial}_${host}.csv"
+            remote_build_bin="$BUILD_BIN"
+            if [[ "$host" != "local" ]]; then
+                remote_build_bin="$REMOTE_CLIENT_BIN_DIR"
+            fi
+            ts_file="$remote_build_bin/throughput_timeseries_trial${trial}_${host}.csv"
             CLIENT_LOGS+=( "$log_file" )
             CLIENT_TS_LOCAL_FILES+=( "$LOG_DIR/trial${trial}_${host}_timeseries.csv" )
 
@@ -596,9 +715,12 @@ if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_IP" ]; then export
 if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_PORT" ]; then export EMBARCADERO_CORFU_SEQ_PORT=$EMBARCADERO_CORFU_SEQ_PORT; fi
 if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "$EMBARCADERO_LAZYLOG_SEQ_IP" ]; then export EMBARCADERO_LAZYLOG_SEQ_IP=$EMBARCADERO_LAZYLOG_SEQ_IP; fi
 if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]; then export EMBARCADERO_LAZYLOG_SEQ_PORT=$EMBARCADERO_LAZYLOG_SEQ_PORT; fi
+if [ "$SEQUENCER" = "SCALOG" ] && [ -n "$EMBARCADERO_SCALOG_SEQ_IP" ]; then export EMBARCADERO_SCALOG_SEQ_IP=$EMBARCADERO_SCALOG_SEQ_IP; fi
+if [ "$SEQUENCER" = "SCALOG" ] && [ -n "$EMBARCADERO_SCALOG_SEQ_PORT" ]; then export EMBARCADERO_SCALOG_SEQ_PORT=$EMBARCADERO_SCALOG_SEQ_PORT; fi
+if [ "$SEQUENCER" = "SCALOG" ]; then export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1}; fi
 if [ -n "$CLIENT_LD_LIBRARY_PATH" ]; then export LD_LIBRARY_PATH=$CLIENT_LD_LIBRARY_PATH; fi
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
-cd $BUILD_BIN
+cd $remote_build_bin
 # Spin-wait until the synchronized barrier millisecond (requires NTP-synced clocks)
 while [ \$(date +%s%3N) -lt $START_TIME_MS ]; do sleep 0.0005; done
 numactl --cpunodebind=$numa --membind=$numa ./throughput_test --config $CLIENT_CONFIG_ABS -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $LOAD_PER_CLIENT -t $TEST_TYPE -o $ORDER -a $ACK -r $REPLICATION_FACTOR --sequencer $SEQUENCER --head_addr $BROKER_IP -l 0
@@ -628,6 +750,9 @@ ENDINNERSCRIPT
             host="${CLIENT_HOSTS[$i]}"
             local_ts="$LOG_DIR/trial${trial}_${host}_timeseries.csv"
             remote_ts="$BUILD_BIN/throughput_timeseries_trial${trial}_${host}.csv"
+            if [[ "$host" != "local" ]]; then
+                remote_ts="$REMOTE_CLIENT_BIN_DIR/throughput_timeseries_trial${trial}_${host}.csv"
+            fi
             if [[ "$host" == "local" ]]; then
                 cp "$remote_ts" "$local_ts" 2>/dev/null || true
             else
