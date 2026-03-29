@@ -32,6 +32,21 @@ namespace Scalog {
 	using scalogreplication::ScalogReplicationRequest;
 	using scalogreplication::ScalogReplicationResponse;
 
+	namespace {
+		inline size_t LoadSharedSizeT(volatile size_t* ptr) {
+			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(ptr)));
+			Embarcadero::CXL::load_fence();
+			return *ptr;
+		}
+
+		inline void RefreshMessageHeader(const Embarcadero::MessageHeader* hdr) {
+			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(hdr)));
+			Embarcadero::CXL::load_fence();
+		}
+	}  // namespace
+
 	class ScalogReplicationServiceImpl final : public ScalogReplicationService::Service {
 		// --- LocalCutTracker (Assumed Correct - Uses its own absl::Mutex) ---
 		class LocalCutTracker {
@@ -716,7 +731,7 @@ namespace Scalog {
 			int64_t persisted_count = 0;
 
 			while (running_.load()) {
-				size_t validated = tinode_->offsets[broker_id_].validated_written_byte_offset;
+				size_t validated = LoadSharedSizeT(&tinode_->offsets[broker_id_].validated_written_byte_offset);
 				if (validated <= last_cxl_offset) {
 					Embarcadero::CXL::cpu_pause();
 					continue;
@@ -732,6 +747,7 @@ namespace Scalog {
 				uint8_t* ptr = src;
 				for (; ptr < src + chunk_size; ) {
 					auto* hdr = reinterpret_cast<Embarcadero::MessageHeader*>(ptr);
+					RefreshMessageHeader(hdr);
 					if (hdr->paddedSize == 0 || hdr->next_msg_diff == 0) {
 						break;
 					}
@@ -792,7 +808,7 @@ namespace Scalog {
 			// "not yet initialized" (real offsets are always > 0 due to CXL layout).
 			size_t primary_log_offset = 0;
 			while (running_.load()) {
-				primary_log_offset = tinode_->offsets[primary_broker_id].log_offset;
+				primary_log_offset = LoadSharedSizeT(&tinode_->offsets[primary_broker_id].log_offset);
 				if (primary_log_offset != 0) break;
 				Embarcadero::CXL::cpu_pause();
 			}
@@ -805,7 +821,7 @@ namespace Scalog {
 			int64_t local_count = 0;
 
 			while (running_.load()) {
-				size_t validated = tinode_->offsets[primary_broker_id].validated_written_byte_offset;
+				size_t validated = LoadSharedSizeT(&tinode_->offsets[primary_broker_id].validated_written_byte_offset);
 				if (validated <= last_cxl_offset) {
 					Embarcadero::CXL::cpu_pause();
 					continue;
@@ -819,6 +835,7 @@ namespace Scalog {
 				uint8_t* ptr = src;
 				for (; ptr < src + chunk_size; ) {
 					auto* hdr = reinterpret_cast<Embarcadero::MessageHeader*>(ptr);
+					RefreshMessageHeader(hdr);
 					if (hdr->paddedSize == 0 || hdr->next_msg_diff == 0) {
 						break;
 					}

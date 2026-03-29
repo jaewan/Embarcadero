@@ -50,6 +50,9 @@ class TopicManager {
 			disk_manager_(disk_manager),
 			broker_id_(broker_id),
 			num_topics_(0) {
+				if (!IsHeadNode()) {
+					topic_discovery_thread_ = std::thread(&TopicManager::DiscoverRemoteTopicsLoop, this);
+				}
 				VLOG(3) << "\t[TopicManager]\t\tConstructed";
 			}
 
@@ -213,6 +216,8 @@ class TopicManager {
 				void* batch_headers_region,
 				void* cxl_addr);
 
+		void DiscoverRemoteTopicsLoop();
+
 		/**
 		 * Get topic index from name
 		 *
@@ -248,6 +253,7 @@ class TopicManager {
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 		std::atomic<bool> shutting_down_{false};
 		std::atomic<bool> shutdown_done_{false};
+		std::thread topic_discovery_thread_;
 }; // TopicManager
 
 } // End of namespace Embarcadero

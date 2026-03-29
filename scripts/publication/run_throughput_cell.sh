@@ -22,9 +22,15 @@ BROKER_IP="${BROKER_IP:-10.10.10.10}"
 START_DELAY_SEC="${START_DELAY_SEC:-8}"
 LOCAL_CLIENT_NUMA="${LOCAL_CLIENT_NUMA:-0}"
 CORFU_SEQUENCER_LOG_HOST="${CORFU_SEQUENCER_LOG_HOST:-c2}"
+SCALOG_SEQUENCER_LOG_HOST="${SCALOG_SEQUENCER_LOG_HOST:-c2}"
+REMOTE_CORFU_SEQUENCER_HOST="${REMOTE_CORFU_SEQUENCER_HOST:-}"
+REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}"
+REMOTE_SCALOG_SEQUENCER_HOST="${REMOTE_SCALOG_SEQUENCER_HOST:-}"
+REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-}"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${RUN_TS}}"
 REQUIRE_FIRST_ATTEMPT_PASS="${REQUIRE_FIRST_ATTEMPT_PASS:-0}"
+EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-}"
 
 if [[ -z "$ACK_LEVEL" ]]; then
   if [[ "$REPLICATION_FACTOR" == "2" ]]; then
@@ -56,7 +62,12 @@ TAG='$TAG' SYSTEM='$SYSTEM' ORDER='$ORDER' SEQUENCER='$SEQUENCER' NUM_CLIENTS='$
 REPLICATION_FACTOR='$REPLICATION_FACTOR' ACK_LEVEL='$ACK_LEVEL' NUM_TRIALS='$NUM_TRIALS' NUM_BROKERS='$NUM_BROKERS' \\
 TOTAL_MESSAGE_SIZE='$TOTAL_MESSAGE_SIZE' MESSAGE_SIZE='$MESSAGE_SIZE' TEST_TYPE='$TEST_TYPE' \\
 THREADS_PER_BROKER='$THREADS_PER_BROKER' BROKER_IP='$BROKER_IP' START_DELAY_SEC='$START_DELAY_SEC' \\
-LOCAL_CLIENT_NUMA='$LOCAL_CLIENT_NUMA' CORFU_SEQUENCER_LOG_HOST='$CORFU_SEQUENCER_LOG_HOST' bash scripts/publication/run_throughput_cell.sh
+LOCAL_CLIENT_NUMA='$LOCAL_CLIENT_NUMA' CORFU_SEQUENCER_LOG_HOST='$CORFU_SEQUENCER_LOG_HOST' \\
+SCALOG_SEQUENCER_LOG_HOST='$SCALOG_SEQUENCER_LOG_HOST' \\
+REMOTE_CORFU_SEQUENCER_HOST='$REMOTE_CORFU_SEQUENCER_HOST' REMOTE_CORFU_BUILD_BIN='$REMOTE_CORFU_BUILD_BIN' \\
+REMOTE_SCALOG_SEQUENCER_HOST='$REMOTE_SCALOG_SEQUENCER_HOST' REMOTE_SCALOG_BUILD_BIN='$REMOTE_SCALOG_BUILD_BIN' \\
+EMBARCADERO_ACK_TIMEOUT_SEC='$EMBARCADERO_ACK_TIMEOUT_SEC' \\
+bash scripts/publication/run_throughput_cell.sh
 EOF
 chmod +x "$RUN_DIR/command.sh"
 
@@ -82,12 +93,42 @@ broker_ip=$BROKER_IP
 local_client_numa=$LOCAL_CLIENT_NUMA
 start_delay_sec=$START_DELAY_SEC
 corfu_sequencer_log_host=$CORFU_SEQUENCER_LOG_HOST
+scalog_sequencer_log_host=$SCALOG_SEQUENCER_LOG_HOST
+remote_corfu_sequencer_host=$REMOTE_CORFU_SEQUENCER_HOST
+remote_corfu_build_bin=$REMOTE_CORFU_BUILD_BIN
+remote_scalog_sequencer_host=$REMOTE_SCALOG_SEQUENCER_HOST
+remote_scalog_build_bin=$REMOTE_SCALOG_BUILD_BIN
 require_first_attempt_pass=$REQUIRE_FIRST_ATTEMPT_PASS
+ack_timeout_sec=${EMBARCADERO_ACK_TIMEOUT_SEC:-}
 commit=$COMMIT
 start_time_utc=$RUN_TS
 EOF
 
 git status --short > "$RUN_DIR/git_status.txt"
+
+if [[ -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+  ssh -o BatchMode=yes "$REMOTE_CORFU_SEQUENCER_HOST" \
+    'cd /home/domin/Embarcadero && git rev-parse HEAD' \
+    > "$RUN_DIR/remote_corfu_git_commit.txt" 2>&1 || true
+  ssh -o BatchMode=yes "$REMOTE_CORFU_SEQUENCER_HOST" \
+    'cd /home/domin/Embarcadero && git status --short' \
+    > "$RUN_DIR/remote_corfu_git_status.txt" 2>&1 || true
+  ssh -o BatchMode=yes "$REMOTE_CORFU_SEQUENCER_HOST" \
+    'cd /home/domin/Embarcadero && git diff --stat && printf "\n---\n" && git diff' \
+    > "$RUN_DIR/remote_corfu_git_diff.txt" 2>&1 || true
+fi
+
+if [[ -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+  ssh -o BatchMode=yes "$REMOTE_SCALOG_SEQUENCER_HOST" \
+    'cd /home/domin/Embarcadero && git rev-parse HEAD' \
+    > "$RUN_DIR/remote_scalog_git_commit.txt" 2>&1 || true
+  ssh -o BatchMode=yes "$REMOTE_SCALOG_SEQUENCER_HOST" \
+    'cd /home/domin/Embarcadero && git status --short' \
+    > "$RUN_DIR/remote_scalog_git_status.txt" 2>&1 || true
+  ssh -o BatchMode=yes "$REMOTE_SCALOG_SEQUENCER_HOST" \
+    'cd /home/domin/Embarcadero && git diff --stat && printf "\n---\n" && git diff' \
+    > "$RUN_DIR/remote_scalog_git_diff.txt" 2>&1 || true
+fi
 
 rm -rf "$PROJECT_ROOT/multiclient_logs"
 mkdir -p "$PROJECT_ROOT/multiclient_logs"
@@ -110,8 +151,13 @@ env \
   EMBARCADERO_HEAD_ADDR="$BROKER_IP" \
   START_DELAY_SEC="$START_DELAY_SEC" \
   LOCAL_CLIENT_NUMA="$LOCAL_CLIENT_NUMA" \
-  REMOTE_CORFU_SEQUENCER_HOST="${REMOTE_CORFU_SEQUENCER_HOST:-}" \
-  REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}" \
+  REMOTE_CORFU_SEQUENCER_HOST="$REMOTE_CORFU_SEQUENCER_HOST" \
+  REMOTE_CORFU_BUILD_BIN="$REMOTE_CORFU_BUILD_BIN" \
+  REMOTE_SCALOG_SEQUENCER_HOST="$REMOTE_SCALOG_SEQUENCER_HOST" \
+  REMOTE_SCALOG_BUILD_BIN="$REMOTE_SCALOG_BUILD_BIN" \
+  EMBARCADERO_ACK_TIMEOUT_SEC="$EMBARCADERO_ACK_TIMEOUT_SEC" \
+  EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-}" \
+  EMBARCADERO_SCALOG_SEQ_PORT="${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
   bash scripts/run_multiclient.sh \
   2>&1 | tee "$RUN_LOG"
 RUN_STATUS=${PIPESTATUS[0]}
@@ -122,6 +168,8 @@ cp -a build/bin/broker_*.log "$RAW_DIR/" 2>/dev/null || true
 cp -a /tmp/broker_*.log "$RAW_DIR/" 2>/dev/null || true
 scp -o StrictHostKeyChecking=no "${CORFU_SEQUENCER_LOG_HOST}:/tmp/corfu_sequencer.log" \
   "$RAW_DIR/${CORFU_SEQUENCER_LOG_HOST}_corfu_sequencer.log" >/dev/null 2>&1 || true
+scp -o StrictHostKeyChecking=no "${SCALOG_SEQUENCER_LOG_HOST}:/tmp/scalog_sequencer.log" \
+  "$RAW_DIR/${SCALOG_SEQUENCER_LOG_HOST}_scalog_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
 echo "system,order,sequencer,num_clients,client_layout,replication_factor,run_idx,status,throughput_gbps,throughput_overlap_gbps,overlap_window_ms,timeseries_clients,attempts_used,first_attempt_pass,artifact_dir,commit" > "$SUMMARY_CSV"
@@ -179,7 +227,17 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
 done
 
 if [[ "$REQUIRE_FIRST_ATTEMPT_PASS" == "1" ]]; then
-  if awk -F',' 'NR>1 && $14 != "1" {found=1} END{exit !found}' "$SUMMARY_CSV"; then
+  gate_failed=0
+  if [[ ! -f "$ATTEMPT_SUMMARY_FILE" ]]; then
+    gate_failed=1
+  elif awk -F',' '
+    NR == 1 { next }
+    $3 != "success" || $2 != "1" { bad = 1 }
+    END { exit bad ? 0 : 1 }
+  ' "$ATTEMPT_SUMMARY_FILE"; then
+    gate_failed=1
+  fi
+  if [[ "$gate_failed" == "1" ]]; then
     echo "ERROR: first-attempt reliability gate failed (REQUIRE_FIRST_ATTEMPT_PASS=1)." >&2
     RUN_STATUS=1
   fi

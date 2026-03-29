@@ -265,6 +265,12 @@ if broker_is_remote_mode && broker_remote_host_is_local; then
   REMOTE_HEAD_ADDR="$CLIENT_HEAD_ADDR"
 fi
 export EMBARCADERO_HEAD_ADDR="$CLIENT_HEAD_ADDR"
+# Remote brokers are started over SSH; REMOTE_BROKER_HOST is often an SSH alias, not the dataplane IP.
+# broker_remote_launch passes REMOTE_HEAD_ADDR to embarlet as EMBARCADERO_HEAD_ADDR; default it to the
+# same address clients use so publish and ACK paths match publication / multiclient runs.
+if broker_is_remote_mode && [ -z "${REMOTE_HEAD_ADDR:-}" ]; then
+  export REMOTE_HEAD_ADDR="$CLIENT_HEAD_ADDR"
+fi
 
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
 CLIENT_NUMA_BIND="${CLIENT_NUMA_BIND:-$(default_client_numa_bind "$CLIENT_HEAD_ADDR")}"

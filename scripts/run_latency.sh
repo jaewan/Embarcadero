@@ -89,6 +89,8 @@ BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
 # Optional separate Corfu sequencer host for Corfu latency runs.
 REMOTE_CORFU_SEQUENCER_HOST="${REMOTE_CORFU_SEQUENCER_HOST:-}"
 REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}"
+REMOTE_SCALOG_SEQUENCER_HOST="${REMOTE_SCALOG_SEQUENCER_HOST:-}"
+REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-}"
 
 # NUMA: CPUs on compute node 1; membind includes node 2 when CXL is a **zero-core** NUMA node (see cxl_manager.cc mbind).
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
@@ -125,6 +127,9 @@ cleanup() {
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
   if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     broker_remote_corfu_stop || true
+  fi
+  if [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    broker_remote_scalog_stop || true
   fi
   rm -f /tmp/embarlet_*_ready   >/dev/null 2>&1 || true
 }
@@ -196,6 +201,14 @@ start_local_brokers() {
       return 1
     fi
     sleep 1
+  elif [[ "$seq" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    export REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-$BIN_DIR}"
+    echo "Starting remote Scalog sequencer on $REMOTE_SCALOG_SEQUENCER_HOST..."
+    if ! broker_remote_scalog_start; then
+      echo "ERROR: failed to start remote Scalog sequencer on $REMOTE_SCALOG_SEQUENCER_HOST" >&2
+      return 1
+    fi
+    sleep 1
   fi
 
   # For remote scenario the broker must bind to the external NIC so the remote client
@@ -204,11 +217,19 @@ start_local_brokers() {
   broker_env+="REPLICATION_FACTOR=$REPLICATION_FACTOR "
   broker_env+="EMBARCADERO_REPLICATION_FACTOR=$REPLICATION_FACTOR "
   broker_env+="NUM_BROKERS=$NUM_BROKERS "
+  if [[ "$seq" == "SCALOG" ]]; then
+    broker_env+="SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1} "
+  fi
   if [[ "$SCENARIO" == "remote" ]]; then
     broker_env+="EMBARCADERO_HEAD_ADDR=$BROKER_LISTEN_ADDR "
   fi
 
   echo "Starting head broker (order=$order sequencer=$seq)..."
+  if [[ "$seq" == "SCALOG" && -z "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    "$BIN_DIR/scalog_global_sequencer" > /tmp/scalog_sequencer.log 2>&1 &
+  elif [[ "$seq" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+    "$BIN_DIR/corfu_global_sequencer" > /tmp/corfu_sequencer.log 2>&1 &
+  fi
   env $broker_env $EMBARLET_NUMA_BIND "$BIN_DIR/embarlet" \
     --config "$BROKER_CONFIG_ABS" \
     --head \
@@ -219,6 +240,7 @@ start_local_brokers() {
     echo "Starting broker $i..."
     env $broker_env $EMBARLET_NUMA_BIND "$BIN_DIR/embarlet" \
       --config "$BROKER_CONFIG_ABS" \
+      --"$seq" \
       > "$BIN_DIR/broker_${i}.log" 2>&1 &
   done
 
@@ -242,10 +264,44 @@ start_local_brokers() {
     echo "ERROR: Brokers are not reachable from client host(s) within ${BROKER_REACHABILITY_TIMEOUT_SEC}s" >&2
     return 1
   fi
+  if [[ "$seq" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    echo "Precreating Scalog topic metadata..."
+    (
+      cd "$BIN_DIR"
+      EMBARCADERO_RUNTIME_MODE=throughput \
+      EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-}" \
+      EMBARCADERO_SCALOG_SEQ_PORT="${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
+      SCALOG_CXL_MODE="${SCALOG_CXL_MODE:-1}" \
+      ./throughput_test \
+        --config "$CLIENT_CONFIG_ABS" \
+        --head_addr "$reachability_ip" \
+        -n "$NUM_BROKERS" \
+        -m "$MSG_SIZE" \
+        -s 0 \
+        -t 5 \
+        -o "$order" \
+        -a "$ACK_LEVEL" \
+        -r "$REPLICATION_FACTOR" \
+        --sequencer "$seq" \
+        -l 0 \
+        >/tmp/scalog_topic_precreate.log 2>&1
+    ) || {
+      echo "ERROR: Scalog topic precreation failed" >&2
+      cat /tmp/scalog_topic_precreate.log >&2 || true
+      return 1
+    }
+  fi
 
   if [[ "$BROKER_READY_PROPAGATION_SEC" -gt 0 ]]; then
     echo "Waiting ${BROKER_READY_PROPAGATION_SEC}s for cluster state propagation..."
     sleep "$BROKER_READY_PROPAGATION_SEC"
+  fi
+  if [[ "$seq" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    echo "Waiting for remote Scalog sequencer readiness..."
+    if ! broker_wait_for_remote_scalog_ready "${SCALOG_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
+      echo "ERROR: remote Scalog sequencer did not reach full readiness" >&2
+      return 1
+    fi
   fi
   echo "All $NUM_BROKERS brokers ready and reachable."
 }
@@ -342,6 +398,15 @@ run_trial() {
     fi
     if [[ -n "${EMBARCADERO_CORFU_SEQ_PORT:-}" ]]; then
       quoted_cmd+="export EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT} && "
+    fi
+    if [[ -n "${EMBARCADERO_SCALOG_SEQ_IP:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_SCALOG_SEQ_IP=${EMBARCADERO_SCALOG_SEQ_IP} && "
+    fi
+    if [[ -n "${EMBARCADERO_SCALOG_SEQ_PORT:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_SCALOG_SEQ_PORT=${EMBARCADERO_SCALOG_SEQ_PORT} && "
+    fi
+    if [[ "$seq" == "SCALOG" ]]; then
+      quoted_cmd+="export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1} && "
     fi
     if [[ -n "$CLIENT_NUMA_BIND" ]]; then
       quoted_cmd+="$CLIENT_NUMA_BIND "

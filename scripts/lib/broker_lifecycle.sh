@@ -127,6 +127,134 @@ rm -f /tmp/corfu_global_sequencer.pid
 EOF
 }
 
+broker_remote_scalog_sequencer_host() {
+  if [ -n "${REMOTE_SCALOG_SEQUENCER_HOST:-}" ]; then
+    printf '%s\n' "${REMOTE_SCALOG_SEQUENCER_HOST}"
+  elif broker_is_remote_mode; then
+    printf '%s\n' "${REMOTE_BROKER_HOST}"
+  else
+    printf '%s\n' ""
+  fi
+}
+
+broker_remote_scalog_start() {
+  if [ "${SKIP_REMOTE_SCALOG_SEQUENCER:-0}" = "1" ]; then
+    echo "Remote Scalog sequencer: skipped (SKIP_REMOTE_SCALOG_SEQUENCER=1; sequencer must already be running)"
+    return 0
+  fi
+  local host
+  host="$(broker_remote_scalog_sequencer_host)"
+  [ -n "$host" ] || return 0
+  local bin="${REMOTE_SCALOG_BUILD_BIN:-$REMOTE_BUILD_BIN}"
+  [ -n "$bin" ] || return 1
+  echo "Remote Scalog sequencer: starting on $host (cd $bin)"
+  ssh -o BatchMode=yes "$host" bash -s -- "$bin" "${EMBARCADERO_SCALOG_SEQ_IP:-}" "${EMBARCADERO_SCALOG_SEQ_PORT:-}" <<'EOF'
+set -euo pipefail
+build_bin=$1
+scalog_seq_ip=${2-}
+scalog_seq_port=${3-}
+if [ -z "$scalog_seq_port" ]; then
+  scalog_seq_port=50051
+fi
+cd "$build_bin"
+for pid in $(pgrep -f "scalog_global_sequencer" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+sleep 0.3
+for pid in $(pgrep -f "scalog_global_sequencer" 2>/dev/null || true); do
+  kill -9 "$pid" 2>/dev/null || true
+done
+if [ -n "$scalog_seq_ip" ]; then export EMBARCADERO_SCALOG_SEQ_IP="$scalog_seq_ip"; fi
+if [ -n "$scalog_seq_port" ]; then export EMBARCADERO_SCALOG_SEQ_PORT="$scalog_seq_port"; fi
+: >/tmp/scalog_sequencer.log
+printf '=== scalog start %s ===\n' "$(date -u +%Y%m%dT%H%M%SZ)" >>/tmp/scalog_sequencer.log
+nohup ./scalog_global_sequencer >>/tmp/scalog_sequencer.log 2>&1 &
+printf '%s\n' "$!" >/tmp/scalog_global_sequencer.pid
+for _ in $(seq 1 100); do
+  if ss -H -ltn "sport = :$scalog_seq_port" 2>/dev/null | grep -q .; then
+    exit 0
+  fi
+  sleep 0.1
+done
+echo "Remote Scalog sequencer failed to bind port $scalog_seq_port" >&2
+tail -n 80 /tmp/scalog_sequencer.log >&2 || true
+exit 1
+EOF
+}
+
+broker_remote_scalog_stop() {
+  if [ "${SKIP_REMOTE_SCALOG_SEQUENCER:-0}" = "1" ]; then
+    return 0
+  fi
+  local host
+  host="$(broker_remote_scalog_sequencer_host)"
+  [ -n "$host" ] || return 0
+  ssh -o BatchMode=yes "$host" bash -s -- <<'EOF'
+for pid in $(pgrep -f "scalog_global_sequencer" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+sleep 0.2
+for pid in $(pgrep -f "scalog_global_sequencer" 2>/dev/null || true); do
+  kill -9 "$pid" 2>/dev/null || true
+done
+rm -f /tmp/scalog_global_sequencer.pid
+EOF
+}
+
+broker_wait_for_remote_scalog_ready() {
+  local timeout_sec="${1:?timeout_sec}"
+  local expected_brokers="${2:?expected_brokers}"
+  local replication_factor="${3:?replication_factor}"
+  local host
+  host="$(broker_remote_scalog_sequencer_host)"
+  [ -n "$host" ] || return 0
+  ssh -o BatchMode=yes "$host" bash -s -- "$timeout_sec" "$expected_brokers" "$replication_factor" <<'EOF'
+set -euo pipefail
+timeout_sec=$1
+expected_brokers=$2
+replication_factor=$3
+expected_streams=$((expected_brokers * replication_factor))
+deadline=$(( $(date +%s) + timeout_sec ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  regs=$(grep -c 'registered broker=' /tmp/scalog_sequencer.log 2>/dev/null || true)
+  started=$(grep -c 'starting cut distribution thread' /tmp/scalog_sequencer.log 2>/dev/null || true)
+  streams=$(awk '
+    /received local cut broker=/ {
+      broker="";
+      replica="";
+      for (i = 1; i <= NF; ++i) {
+        if ($i ~ /^broker=/) {
+          split($i, a, "=");
+          broker=a[2];
+        }
+        if ($i ~ /^replica=/) {
+          split($i, a, "=");
+          replica=a[2];
+        }
+      }
+      if (broker != "" && replica != "") {
+        seen[broker ":" replica] = 1;
+      }
+    }
+    END {
+      count = 0;
+      for (k in seen) {
+        count++;
+      }
+      print count + 0;
+    }
+  ' /tmp/scalog_sequencer.log 2>/dev/null || true)
+  if [ "$regs" -ge "$expected_brokers" ] && [ "$started" -ge 1 ] && [ "$streams" -ge "$expected_streams" ]; then
+    exit 0
+  fi
+  sleep 0.2
+done
+echo "Scalog readiness timeout: regs=$regs/$expected_brokers streams=$streams/$expected_streams started=$started" >&2
+tail -n 80 /tmp/scalog_sequencer.log >&2 || true
+exit 1
+EOF
+}
+
 broker_ready_file_count_local() {
   local ready_files=(/tmp/embarlet_*_ready)
   if [ -e "${ready_files[0]}" ]; then
@@ -244,6 +372,11 @@ for pid in $(pgrep -f "$build_bin/corfu_global_sequencer" 2>/dev/null || true); 
   sleep 0.05
   kill -9 "$pid" 2>/dev/null || true
 done
+for pid in $(pgrep -f "$build_bin/scalog_global_sequencer" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+  sleep 0.05
+  kill -9 "$pid" 2>/dev/null || true
+done
 
 rm -f /tmp/embarlet_*_ready 2>/dev/null || true
 if [ -n "$shm_name" ]; then
@@ -257,6 +390,7 @@ broker_local_cleanup() {
   pkill -9 -f "./embarlet" >/dev/null 2>&1 || true
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
   pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
+  pkill -9 -f "scalog_global_sequencer" >/dev/null 2>&1 || true
   rm -f /tmp/embarlet_*_ready 2>/dev/null || true
 }
 
@@ -267,6 +401,9 @@ broker_cleanup() {
     # collocated with brokers, broker_remote_cleanup already killed it on REMOTE_BROKER_HOST.
     if [ -n "${REMOTE_CORFU_SEQUENCER_HOST:-}" ]; then
       broker_remote_corfu_stop || true
+    fi
+    if [ -n "${REMOTE_SCALOG_SEQUENCER_HOST:-}" ]; then
+      broker_remote_scalog_stop || true
     fi
   else
     broker_local_cleanup
@@ -280,6 +417,11 @@ broker_remote_launch() {
   local head_addr="${REMOTE_HEAD_ADDR:-${REMOTE_BROKER_HOST}}"
   local poll_interval="${BROKER_POLL_INTERVAL_SEC:-0.1}"
 
+  # SSH does not forward the orchestrator shell's environment; pass replication and cluster
+  # size explicitly so remote embarlet matches local runs (Scalog CXL / ACK paths depend on this).
+  local _remote_rep="${REPLICATION_FACTOR:-${EMBARCADERO_REPLICATION_FACTOR:-0}}"
+  local _remote_nb="${NUM_BROKERS:-4}"
+
   broker_remote_ssh bash -s -- \
     "$REMOTE_BROKER_STATE_DIR" \
     "$REMOTE_BUILD_BIN" \
@@ -292,7 +434,11 @@ broker_remote_launch() {
     "${EMBARCADERO_ACK_SEND_MIN_INTERVAL_US:-}" \
     "${EMBARCADERO_ORDER0_FAST_PATH:-}" \
     "${EMBARCADERO_ACK_STALL_SLEEP_US:-}" \
-    "${EMBARCADERO_CORFU_SEQ_IP:-}" <<'EOF'
+    "${EMBARCADERO_CORFU_SEQ_IP:-}" \
+    "${EMBARCADERO_SCALOG_SEQ_IP:-}" \
+    "${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
+    "$_remote_rep" \
+    "$_remote_nb" <<'EOF'
 set -euo pipefail
 state_dir=$1
 build_bin=$2
@@ -306,9 +452,13 @@ ack_send_min_interval_us=${9-}
 order0_fast_path=${10-}
 ack_stall_sleep_us=${11-}
 corfu_seq_ip=${12-}
+scalog_seq_ip=${13-}
+scalog_seq_port=${14-}
+replication_factor_cfg=${15:-0}
+num_brokers_cfg=${16:-4}
 mkdir -p "$state_dir"
 rm -f "$state_dir/broker_${idx}.pid" "$state_dir/broker_${idx}.ready" "$state_dir/broker_${idx}.log"
-nohup bash -s -- "$state_dir" "$build_bin" "$config" "$head_addr" "$idx" "$role" "$sequence" "$poll_interval" "$ack_send_min_interval_us" "$order0_fast_path" "$ack_stall_sleep_us" "$corfu_seq_ip" <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
+nohup bash -s -- "$state_dir" "$build_bin" "$config" "$head_addr" "$idx" "$role" "$sequence" "$poll_interval" "$ack_send_min_interval_us" "$order0_fast_path" "$ack_stall_sleep_us" "$corfu_seq_ip" "$scalog_seq_ip" "$scalog_seq_port" "$replication_factor_cfg" "$num_brokers_cfg" <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
 set -euo pipefail
 state_dir=$1
 build_bin=$2
@@ -322,17 +472,27 @@ ack_send_min_interval_us=${9-}
 order0_fast_path=${10-}
 ack_stall_sleep_us=${11-}
 corfu_seq_ip=${12-}
+scalog_seq_ip=${13-}
+scalog_seq_port=${14-}
+replication_factor_cfg=${15:-0}
+num_brokers_cfg=${16:-4}
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
-export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-0}
+export EMBARCADERO_REPLICATION_FACTOR="${replication_factor_cfg:-0}"
+export NUM_BROKERS="${num_brokers_cfg:-4}"
 export EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}
+if [ "$sequence" = "SCALOG" ]; then
+  export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1}
+fi
 if [ -n "$ack_send_min_interval_us" ]; then
   export EMBARCADERO_ACK_SEND_MIN_INTERVAL_US="$ack_send_min_interval_us"
 fi
 if [ -n "$order0_fast_path" ]; then export EMBARCADERO_ORDER0_FAST_PATH="$order0_fast_path"; fi
 if [ -n "$ack_stall_sleep_us" ]; then export EMBARCADERO_ACK_STALL_SLEEP_US="$ack_stall_sleep_us"; fi
 if [ -n "$corfu_seq_ip" ]; then export EMBARCADERO_CORFU_SEQ_IP="$corfu_seq_ip"; fi
+if [ -n "$scalog_seq_ip" ]; then export EMBARCADERO_SCALOG_SEQ_IP="$scalog_seq_ip"; fi
+if [ -n "$scalog_seq_port" ]; then export EMBARCADERO_SCALOG_SEQ_PORT="$scalog_seq_port"; fi
 log_file="$state_dir/broker_${idx}.log"
 cd "$build_bin"
 export EMBARCADERO_HEAD_ADDR="$head_addr"
@@ -468,6 +628,12 @@ broker_ensure_cluster() {
     if [[ "$sequence" == "CORFU" ]]; then
       if ! broker_remote_corfu_start; then
         echo "ERROR: failed to start Corfu sequencer on $(broker_remote_corfu_sequencer_host)" >&2
+        return 1
+      fi
+      sleep 1
+    elif [[ "$sequence" == "SCALOG" ]]; then
+      if ! broker_remote_scalog_start; then
+        echo "ERROR: failed to start Scalog sequencer on $(broker_remote_scalog_sequencer_host)" >&2
         return 1
       fi
       sleep 1

@@ -473,6 +473,8 @@ class Topic {
 		 * Update the TInode's written offset and address
 		 */
 		inline void UpdateTInodeWritten(size_t written, size_t written_addr);
+		/** Publish a contiguous validated-written byte frontier for Scalog CXL replication. */
+		inline void PublishValidatedWrittenRange(size_t start_offset, size_t total_size);
 		/**
 		 * [[PHASE_2_CV_EXPORT]] Advance CompletionVector for this broker so ack_level=1 export can proceed without waiting for replication.
 		 * Sequencer calls after writing GOI entry; uses atomic max so tail replica (ack_level=2) can also advance CV.
@@ -630,6 +632,7 @@ class Topic {
 		// Offset tracking
 		size_t logical_offset_;
 		size_t written_logical_offset_ = static_cast<size_t>(-1);  // Sentinel: "not set"
+		size_t validated_written_byte_offset_ = 0;
 		void* written_physical_addr_ = nullptr;
 		void* order0_first_physical_addr_ = nullptr;  // [[ORDER_0]] Start of message chain (set on first SetOrder0Written); first_message_addr_ may be wrong for Order 0
 		std::atomic<unsigned long long int> log_addr_;
@@ -673,6 +676,7 @@ class Topic {
 		// Kafka specific
 		std::atomic<size_t> kafka_logical_offset_{0};
 		absl::flat_hash_map<size_t, size_t> written_messages_range_;
+		std::map<size_t, size_t> validated_written_ranges_;
 
 		// Ring buffer metrics
 		std::atomic<uint64_t> ring_full_count_{0};

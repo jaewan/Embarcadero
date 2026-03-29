@@ -3,6 +3,28 @@
 #include <chrono>
 #include <sstream>
 
+namespace {
+
+int ExpectedScalogBrokerCount() {
+	const auto& config = Embarcadero::GetConfig().config();
+	if (!config.cluster.data_broker_ids.empty()) {
+		return static_cast<int>(config.cluster.data_broker_ids.size());
+	}
+	return NUM_MAX_BROKERS_CONFIG;
+}
+
+#ifdef SCALOG_SEQUENCER_IP
+const char* ScalogSequencerIp() {
+	return SCALOG_SEQUENCER_IP;
+}
+#else
+const char* ScalogSequencerIp() {
+	return SCLAOG_SEQUENCER_IP;
+}
+#endif
+
+}  // namespace
+
 // NOTE: The global sequencer will only begin sending global cuts after NUM_MAX_BROKERS have sent HandleRegisterBroker requests.
 ScalogGlobalSequencer::ScalogGlobalSequencer(std::string scalog_seq_address) {
 	LOG(INFO) << "Starting Scalog global sequencer with interval: " << SCALOG_SEQ_LOCAL_CUT_INTERVAL;
@@ -53,15 +75,16 @@ grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* co
 		num_replicas_per_broker_ = request->replication_factor();
 	}
 
-    {
+	{
         absl::WriterMutexLock lock(&registered_brokers_mu_);
 		registered_brokers_.insert(broker_id);
+		const int expected_brokers = ExpectedScalogBrokerCount();
 		LOG(INFO) << "Scalog global sequencer registered broker=" << broker_id
 		          << " registered=" << registered_brokers_.size()
-		          << "/" << NUM_MAX_BROKERS_CONFIG
+		          << "/" << expected_brokers
 		          << " replicas_per_broker=" << num_replicas_per_broker_;
 
-		if ((int)registered_brokers_.size() == NUM_MAX_BROKERS_CONFIG && !global_cut_thread_.joinable()) {
+		if ((int)registered_brokers_.size() == expected_brokers && !global_cut_thread_.joinable()) {
 			global_cut_thread_ = std::thread(&ScalogGlobalSequencer::SendGlobalCut, this);
 			LOG(INFO) << "Scalog global sequencer starting cut distribution thread";
 		}
@@ -85,8 +108,10 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 				for (const auto& [broker_id, replica_map] : global_cut_) {
 					total_num_replicas += replica_map.size();
 				}
+				const size_t expected_replicas =
+					static_cast<size_t>(ExpectedScalogBrokerCount()) * num_replicas_per_broker_;
 
-				if (total_num_replicas != ((size_t)NUM_MAX_BROKERS_CONFIG * num_replicas_per_broker_)) {
+				if (total_num_replicas != expected_replicas) {
 					continue;
 				}
 				
@@ -209,7 +234,7 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 
 int main(int argc, char* argv[]){
     // Initialize scalog global sequencer
-    std::string scalog_seq_address = std::string(SCALOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
+    std::string scalog_seq_address = std::string(ScalogSequencerIp()) + ":" + std::to_string(SCALOG_SEQ_PORT);
     ScalogGlobalSequencer scalog_global_sequencer(scalog_seq_address);
 
 	scalog_global_sequencer.Run();
