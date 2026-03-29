@@ -511,6 +511,7 @@ void Topic::DelegationThread() {
 					MessageHeader* batch_first_msg = reinterpret_cast<MessageHeader*>(
 						reinterpret_cast<uint8_t*>(cxl_addr_) + current_batch->log_idx);
 					MessageHeader* msg_ptr = batch_first_msg;
+					bool touched_message_headers = false;
 					for (size_t i = 0; i < current_batch->num_msg; ++i) {
 						msg_ptr->logical_offset = logical_offset_;
 						msg_ptr->segment_header = reinterpret_cast<uint8_t*>(msg_ptr) - CACHELINE_SIZE;
@@ -533,6 +534,8 @@ void Topic::DelegationThread() {
 						*reinterpret_cast<unsigned long long int*>(msg_ptr->segment_header) =
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(msg_ptr->segment_header));
+						CXL::flush_cacheline(msg_ptr);
+						touched_message_headers = true;
 
 						if (i < current_batch->num_msg - 1) {
 							msg_ptr = reinterpret_cast<MessageHeader*>(
@@ -540,6 +543,12 @@ void Topic::DelegationThread() {
 						}
 
 						logical_offset_++;
+					}
+					if (touched_message_headers) {
+						// Scalog replication pollers parse next_msg_diff from CXL-shared MessageHeaders.
+						// Publish those cachelines before advancing validated_written_byte_offset so
+						// readers never observe "bytes visible" while an interior header still looks zero.
+						CXL::store_fence();
 					}
 
 					if (order_ != 0) {
