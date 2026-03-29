@@ -272,6 +272,11 @@ start_local_brokers() {
     sleep "$BROKER_READY_PROPAGATION_SEC"
   fi
   if [[ "$seq" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    local precreate_settle_sec="${SCALOG_PRECREATE_SETTLE_SEC:-15}"
+    if [[ "$precreate_settle_sec" -gt 0 ]]; then
+      echo "Waiting ${precreate_settle_sec}s for Scalog precreate settle..."
+      sleep "$precreate_settle_sec"
+    fi
     local precreate_attempt precreate_max_attempts precreate_retry_sleep_sec
     precreate_max_attempts="${SCALOG_PRECREATE_ATTEMPTS:-3}"
     precreate_retry_sleep_sec="${SCALOG_PRECREATE_RETRY_SLEEP_SEC:-3}"
