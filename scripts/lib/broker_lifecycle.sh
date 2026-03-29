@@ -386,11 +386,72 @@ fi
 EOF
 }
 
+broker_local_listener_pids() {
+  local ports=()
+  local exprs=()
+  local idx
+  local num_brokers="${NUM_BROKERS:-4}"
+
+  if ! [[ "$num_brokers" =~ ^[0-9]+$ ]] || [ "$num_brokers" -lt 1 ]; then
+    num_brokers=4
+  fi
+
+  for ((idx = 0; idx < num_brokers; ++idx)); do
+    ports+=("$((BROKER_DATA_PORT_BASE + idx))")
+  done
+  if [ -n "${BROKER_HEARTBEAT_PORT:-}" ]; then
+    ports+=("$BROKER_HEARTBEAT_PORT")
+  fi
+
+  for port in "${ports[@]}"; do
+    exprs+=("sport = :${port}")
+  done
+
+  if [ "${#exprs[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  # Join expressions as: ( sport = :1214 or sport = :1215 ... )
+  local ss_expr=""
+  local sep=""
+  for expr in "${exprs[@]}"; do
+    ss_expr+="${sep}${expr}"
+    sep=" or "
+  done
+
+  ss -H -ltnp "(${ss_expr})" 2>/dev/null \
+    | grep -oP 'pid=\K[0-9]+' \
+    | sort -u
+}
+
+broker_local_drain_ports() {
+  local timeout_sec="${BROKER_PORT_DRAIN_TIMEOUT_SEC:-20}"
+  local deadline=$(( $(date +%s) + timeout_sec ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local pids
+    pids="$(broker_local_listener_pids || true)"
+    if [ -z "$pids" ]; then
+      return 0
+    fi
+    for pid in $pids; do
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    done
+    sleep 0.2
+  done
+  echo "WARNING: broker port drain timed out after ${timeout_sec}s; continuing with restart" >&2
+  return 0
+}
+
 broker_local_cleanup() {
+  pkill -9 -x embarlet >/dev/null 2>&1 || true
   pkill -9 -f "./embarlet" >/dev/null 2>&1 || true
-  pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
-  pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
-  pkill -9 -f "scalog_global_sequencer" >/dev/null 2>&1 || true
+  pkill -9 -x throughput_test >/dev/null 2>&1 || true
+  pkill -9 -f "./throughput_test" >/dev/null 2>&1 || true
+  pkill -9 -x corfu_global_sequencer >/dev/null 2>&1 || true
+  pkill -9 -f "./corfu_global_sequencer" >/dev/null 2>&1 || true
+  pkill -9 -x scalog_global_sequencer >/dev/null 2>&1 || true
+  pkill -9 -f "./scalog_global_sequencer" >/dev/null 2>&1 || true
+  broker_local_drain_ports
   rm -f /tmp/embarlet_*_ready 2>/dev/null || true
 }
 

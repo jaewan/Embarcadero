@@ -419,9 +419,9 @@ trap cleanup EXIT
 
 start_brokers() {
     log "Resetting previous broker state..."
-    pkill -9 -f "./embarlet" >/dev/null 2>&1 || true
-    rm -f /tmp/embarlet_*_ready 2>/dev/null || true
+    broker_local_cleanup
     shm_cleanup
+    wait_for_broker_ports_free
 
     if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         export REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-$BUILD_BIN}"

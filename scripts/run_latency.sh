@@ -123,7 +123,7 @@ fi
 # Cleanup helpers
 # ---------------------------------------------------------------------------
 cleanup() {
-  pkill -9 -f "./embarlet"      >/dev/null 2>&1 || true
+  broker_cleanup
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
   if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     broker_remote_corfu_stop || true
