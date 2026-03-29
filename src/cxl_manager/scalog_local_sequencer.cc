@@ -137,27 +137,51 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 	while (!stop_reading_from_stream_.load(std::memory_order_relaxed)) {
 		GlobalCut global_cut;
 		if (stream->Read(&global_cut)) {
-			// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
+			// Wire format is cumulative per broker. Convert to monotonic per-broker deltas
+			// so each cut segment is applied exactly once locally.
+			absl::btree_map<int, int64_t> global_cut_delta;
 			for (const auto& entry : global_cut.global_cut()) {
-				global_cut_[static_cast<int>(entry.first)] = static_cast<int>(entry.second);
+				const int broker = static_cast<int>(entry.first);
+				const int64_t cumulative_cut = static_cast<int64_t>(entry.second);
+				global_cut_[broker] = cumulative_cut;
+
+				const int64_t prev_applied = last_applied_global_cut_[broker];
+				if (cumulative_cut < prev_applied) {
+					LOG(WARNING) << "Scalog local sequencer ignoring regressing cumulative global cut broker="
+					             << broker
+					             << " previous_applied=" << prev_applied
+					             << " current=" << cumulative_cut;
+					continue;
+				}
+
+				const int64_t delta = cumulative_cut - prev_applied;
+				if (delta > 0) {
+					global_cut_delta[broker] = delta;
+					last_applied_global_cut_[broker] = cumulative_cut;
+				}
 			}
 
-			ScalogSequencer(topic, global_cut_);
+			if (!global_cut_delta.empty()) {
+				ScalogSequencer(topic, global_cut_delta);
+			}
 
 			num_global_cuts++;
 			if ((num_global_cuts % 1000) == 1) {
 				auto it = global_cut_.find(broker_id_);
-				const int local_delta = (it == global_cut_.end()) ? -1 : it->second;
+				const int64_t local_cumulative = (it == global_cut_.end()) ? -1 : it->second;
+				const auto applied_it = last_applied_global_cut_.find(broker_id_);
+				const int64_t local_applied = (applied_it == last_applied_global_cut_.end()) ? 0 : applied_it->second;
 				LOG(INFO) << "Scalog global cut received broker=" << broker_id_
 				          << " num_global_cuts=" << num_global_cuts
-				          << " local_delta=" << local_delta
+				          << " local_cumulative=" << local_cumulative
+				          << " local_applied=" << local_applied
 				          << " map_size=" << global_cut_.size();
 			}
 		}
 	}
 }
 
-void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<int, int> &global_cut) {
+void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<int, int64_t> &global_cut_delta) {
 	static char topic_char[TOPIC_NAME_SIZE];
 	static size_t seq = 0;
 	static TInode *tinode = nullptr;
@@ -189,9 +213,9 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 		Embarcadero::CXL::store_fence();
 		batch_header_idx++;
 	};
-	for(auto &cut : global_cut){
+	for(auto &cut : global_cut_delta){
 		if(cut.first == broker_id_){
-			for(int i = 0; i<cut.second; i++){
+			for(int64_t i = 0; i < cut.second; i++){
 				local_progress = true;
 				total_size += msg_to_order->paddedSize;
 				msg_to_order->total_order = seq;
@@ -212,19 +236,19 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 				}
 			}
 		}else{
-			seq += cut.second;
+			seq += static_cast<size_t>(cut.second);
 		}
 	}
 	if (local_progress && total_size > 0) {
 		publish_batch(start_addr, total_size);
 	}
 
-	if (!global_cut.empty()) {
+	if (!global_cut_delta.empty()) {
 		static thread_local auto last_order_log = std::chrono::steady_clock::now();
 		const auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_order_log).count() >= 2000) {
-			auto local_it = global_cut.find(broker_id_);
-			const int local_delta = (local_it == global_cut.end()) ? 0 : local_it->second;
+			auto local_it = global_cut_delta.find(broker_id_);
+			const int64_t local_delta = (local_it == global_cut_delta.end()) ? 0 : local_it->second;
 			LOG(INFO) << "Scalog sequencer advanced broker=" << broker_id_
 			          << " local_delta=" << local_delta
 			          << " ordered=" << tinode_->offsets[broker_id_].ordered

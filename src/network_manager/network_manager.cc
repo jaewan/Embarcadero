@@ -1122,6 +1122,15 @@ void NetworkManager::HandlePublishRequest(
 					             << " remaining=" << remaining;
 					break;
 				}
+				// [[CXL_VISIBILITY_FIX]] Flush each MessageHeader cacheline to CXL before
+				// PublishPBRSlotDirect signals batch_complete=1. recv() writes paddedSize only
+				// to this CPU's L1/L2; without an explicit flush the CXL device still holds the
+				// zero-initialized value. DelegationThread's cache miss would then fetch 0 from
+				// CXL, trigger the invalid-paddedSize error path, skip writing next_msg_diff,
+				// and stall CXLPollingLoop/ReplicaPollingLoop forever. The SFENCE inside
+				// PublishPBRSlotDirect orders all these CLFLUSHOPTs before batch_complete is
+				// visible, so the happens-before guarantee is maintained.
+				CXL::flush_cacheline(first_msg);
 				remaining -= first_msg->paddedSize;
 				first_msg = reinterpret_cast<MessageHeader*>(
 					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
@@ -1680,12 +1689,9 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 		}
 	} else if (replication_factor > 0) {
 		if (ack_level == 1) {
-			// SCALOG ORDER=1 is per-broker local visibility semantics.
-			// Its local/global cut path can lag far behind the broker-local written frontier on
-			// cold start, but ACK=1 for ORDER=1 only requires broker-local ordered visibility.
-			// written is advanced after DelegationThread assigns logical offsets, so it is the
-			// correct cumulative frontier for this contract.
-			if (order == 0 || (seq_type == SCALOG && order == kOrderPerBroker)) {
+			// ACK1 is the ordered-visibility frontier.
+			// Keep ORDER=0 on written; all ordered modes (including SCALOG ORDER=1) use ordered.
+			if (order == 0) {
 				fast_read_value = tinode->offsets[broker_id_].written;
 			} else {
 				fast_read_value = tinode->offsets[broker_id_].ordered;
@@ -1711,7 +1717,7 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 		}
 	} else {
 		// No replication
-		if (order == 0 || (seq_type == SCALOG && order == kOrderPerBroker)) {
+		if (order == 0) {
 			fast_read_value = tinode->offsets[broker_id_].written;
 		} else {
 			fast_read_value = tinode->offsets[broker_id_].ordered;
@@ -1849,12 +1855,11 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		return min + 1;  // Convert last offset to message count
 	}
 
-		// ACK Level 1: acknowledge after the order-specific visibility frontier advances.
-		// For SCALOG ORDER=1, the documented contract is per-broker local visibility, so ACK
-		// must follow broker-local written rather than the slower global-cut-driven ordered cursor.
+		// ACK Level 1: acknowledge after ordered visibility frontier advances.
+		// Keep ORDER=0 on written; ordered modes (including SCALOG ORDER=1) use ordered.
 	if(replication_factor > 0){
 		if(ack_level == 1){
-			if(order == 0 || (seq_type == SCALOG && order == kOrderPerBroker)){
+			if(order == 0){
 				// [[CRITICAL_FIX: Invalidate cache before reading written for ORDER=0]]
 				// UpdateWrittenForOrder0 flushes from writer; AckThread must invalidate to see it
 				volatile uint64_t* written_ptr = &tinode->offsets[broker_id_].written;
@@ -1906,8 +1911,8 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		}
 		return min + 1;
 	}else{
-		// No replication: acknowledge after written (ORDER=0 / SCALOG ORDER=1) or ordered otherwise.
-		if(order == 0 || (seq_type == SCALOG && order == kOrderPerBroker)){
+		// No replication: acknowledge after written for ORDER=0, ordered otherwise.
+		if(order == 0){
 			// [[CRITICAL_FIX: Invalidate cache before reading written for ORDER=0]]
 			// UpdateWrittenForOrder0 flushes from writer; AckThread must invalidate to see it
 			volatile uint64_t* written_ptr = &tinode->offsets[broker_id_].written;

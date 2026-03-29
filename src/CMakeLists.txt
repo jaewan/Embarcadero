@@ -124,6 +124,9 @@ add_executable(throughput_test
     client/main.cc
     common/configuration.cc
     common/configuration.h
+    # [[GLIBC_COMPAT]] Provide __isoc23_strtoul etc. locally so binaries
+    # compiled on GLIBC 2.39 (Ubuntu 24.04) run on GLIBC 2.35 (Ubuntu 22.04).
+    common/compat_isoc23.cpp
 )
 
 target_include_directories(throughput_test PUBLIC
@@ -152,10 +155,11 @@ target_link_libraries(throughput_test
 
 set_target_properties(throughput_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-)
-
-set_target_properties(throughput_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    # [[GLIBC_COMPAT]] Allow binary to find shared libs (e.g. libglog.so.1)
+    # from the same directory as itself on remote machines without /usr/local/lib.
+    BUILD_RPATH_USE_ORIGIN TRUE
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
 )
 
 # Buffer-only throughput benchmark (no network). Isolates pubQue_/Buffer for serialization investigation.
@@ -203,6 +207,8 @@ add_executable(scalog_global_sequencer
     cxl_manager/scalog_global_sequencer.h
     common/configuration.cc
     common/configuration.h
+    # [[GLIBC_COMPAT]] Provide __isoc23_* locally for GLIBC 2.35 compatibility.
+    common/compat_isoc23.cpp
 )
 
 target_include_directories(scalog_global_sequencer PUBLIC
@@ -221,6 +227,9 @@ target_link_libraries(scalog_global_sequencer
 
 set_target_properties(scalog_global_sequencer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    BUILD_RPATH_USE_ORIGIN TRUE
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
 )
 
 add_executable(corfu_global_sequencer
