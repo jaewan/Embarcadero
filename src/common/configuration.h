@@ -104,7 +104,7 @@ struct EmbarcaderoConfig {
     struct Scalog {
         ConfigValue<int> sequencer_port{50051, "EMBARCADERO_SCALOG_SEQ_PORT"};
         ConfigValue<int> replication_port{50052, "EMBARCADERO_SCALOG_REP_PORT"};
-        ConfigValue<std::string> sequencer_ip{"192.168.60.173", "EMBARCADERO_SCALOG_SEQ_IP"};
+        ConfigValue<std::string> sequencer_ip{"127.0.0.1", "EMBARCADERO_SCALOG_SEQ_IP"};
         ConfigValue<int> local_cut_interval{100, "EMBARCADERO_SCALOG_CUT_INTERVAL"};
     } scalog;
 

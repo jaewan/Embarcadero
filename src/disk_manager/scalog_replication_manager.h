@@ -1,8 +1,11 @@
 #pragma once
 
 #include "common/config.h"
+#include "../cxl_manager/cxl_datastructure.h"
 #include <thread>
 #include <scalog_sequencer.grpc.pb.h>
+
+using Embarcadero::TInode;
 
 // Forward declarations
 namespace grpc {
@@ -33,11 +36,14 @@ public:
     void Shutdown();
 
     void StartSendLocalCut();
+    void StartCXLReplication(void* cxl_addr, TInode* tinode);
+    void StartReplicaPollingThread(void* cxl_addr, TInode* tinode, int primary_broker_id, int replica_index);
 
 private:
     std::unique_ptr<ScalogReplicationServiceImpl> service_;
     std::unique_ptr<grpc::Server> server_;
     std::thread server_thread_;
+    std::string base_dir_;
 };
 
 } // End of namespace Scalog

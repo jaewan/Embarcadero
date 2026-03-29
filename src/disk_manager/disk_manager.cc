@@ -212,7 +212,8 @@ namespace Embarcadero{
 				replication_metrics_[i].last_advance_time = std::chrono::steady_clock::now();
 			}
 			if(sequencerType == heartbeat_system::SequencerType::SCALOG){
-				scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(broker_id_, log_to_memory, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
+				scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(
+					broker_id_, log_to_memory, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
 				return;
 			}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 				LOG(INFO) << "[CORFU_DEBUG] DiskManager: creating CorfuReplicationManager (broker_id=" << broker_id << ", cxl_addr=" << cxl_addr_ << ")";
@@ -1140,6 +1141,22 @@ namespace Embarcadero{
 
 	void DiskManager::StartScalogReplicaLocalSequencer() {
 		scalog_replication_manager_->StartSendLocalCut();
+	}
+
+	void DiskManager::StartScalogCXLReplication(TInode* tinode) {
+		if (!scalog_replication_manager_) {
+			LOG(ERROR) << "StartScalogCXLReplication: replication manager not initialized";
+			return;
+		}
+		scalog_replication_manager_->StartCXLReplication(cxl_addr_, tinode);
+	}
+
+	void DiskManager::StartScalogCXLReplicaPolling(TInode* tinode, int primary_id, int replica_index) {
+		if (!scalog_replication_manager_) {
+			LOG(ERROR) << "StartScalogCXLReplicaPolling: replication manager not initialized";
+			return;
+		}
+		scalog_replication_manager_->StartReplicaPollingThread(cxl_addr_, tinode, primary_id, replica_index);
 	}
 
 } // End of namespace Embarcadero

@@ -294,7 +294,8 @@ struct alignas(64) offset_entry {
 	volatile size_t batch_headers_offset;    // +8 (8B)
 	volatile size_t written;                 // +16 (8B)
 	volatile unsigned long long int written_addr; // +24 (8B)
-	uint8_t _pad_broker[256 - 32];           // +32 (224B) - pad first region to 256B
+	volatile size_t validated_written_byte_offset; // +32 (8B)
+	uint8_t _pad_broker[256 - 40];           // +40 (216B) - pad first region to 256B
 	
 	// ============================================================================
 	// REPLICATION_DONE REGION: Cache lines 2-3 (bytes 256-511)

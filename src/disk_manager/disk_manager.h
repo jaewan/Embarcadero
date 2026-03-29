@@ -58,6 +58,8 @@ class DiskManager{
 		// Change this to get real-time num brokers
 		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
 		void StartScalogReplicaLocalSequencer();
+		void StartScalogCXLReplication(TInode* tinode);
+		void StartScalogCXLReplicaPolling(TInode* tinode, int primary_id, int replica_index);
 
 	private:
 		void ReplicateThread();

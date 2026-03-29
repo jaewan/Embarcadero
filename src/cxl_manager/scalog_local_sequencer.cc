@@ -1,5 +1,6 @@
 #include "scalog_local_sequencer.h"
 #include "cxl_manager.h"
+#include <limits>
 
 namespace Scalog {
 
@@ -13,14 +14,10 @@ ScalogLocalSequencer::ScalogLocalSequencer(TInode* tinode, int broker_id, void* 
 	cxl_addr_(cxl_addr),
 	batch_header_(batch_header){
 
-	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
 	int unique_port = SCALOG_SEQ_PORT;
 	std::string scalog_seq_address = scalog_global_sequencer_ip_ + ":" + std::to_string(unique_port);
 	std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 	stub_ = ScalogSequencer::NewStub(channel);
-
-	static char topic[TOPIC_NAME_SIZE];
-	memcpy(topic, topic_str.data(), topic_str.size());
 
 	// Send register request to the global sequencer
 	Register(tinode_->replication_factor);
@@ -48,12 +45,19 @@ void ScalogLocalSequencer::Register(int replication_factor) {
 	grpc::Status status = stub_->HandleRegisterBroker(&context, request, &response);
 	if (!status.ok()) {
 		LOG(ERROR) << "Error registering local sequencer: " << status.error_message();
+	} else {
+		LOG(INFO) << "Scalog local sequencer registered broker=" << broker_id_
+		          << " replication_factor=" << replication_factor;
 	}
 }
 
 void ScalogLocalSequencer::SendLocalCut(std::string topic_str, volatile bool& stop_thread){
 	static char topic[TOPIC_NAME_SIZE];
 	memcpy(topic, topic_str.data(), topic_str.size());
+	const bool cxl_scalog_mode = []() {
+		const char* env = std::getenv("SCALOG_CXL_MODE");
+		return env && std::string(env) == "1";
+	}();
 
 	grpc::ClientContext context;
     std::unique_ptr<grpc::ClientReaderWriter<LocalCut, GlobalCut>> stream(
@@ -63,8 +67,24 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str, volatile bool& st
 	std::thread receive_global_cut(&ScalogLocalSequencer::ReceiveGlobalCut, this, std::ref(stream), topic_str);
 
 	while (!stop_thread) {
-		/// Send epoch and tinode_->offsets[broker_id_].written to global sequencer
-		int local_cut = tinode_->offsets[broker_id_].written;
+		int64_t local_cut = 0;
+		if (cxl_scalog_mode) {
+			volatile uint64_t* rep_done_ptr = &tinode_->offsets[broker_id_].replication_done[broker_id_];
+			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(rep_done_ptr)));
+			Embarcadero::CXL::full_fence();
+			const uint64_t rep_done = *rep_done_ptr;
+			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].validated_written_byte_offset)));
+			Embarcadero::CXL::full_fence();
+			const size_t validated = tinode_->offsets[broker_id_].validated_written_byte_offset;
+			const size_t log_start = tinode_->offsets[broker_id_].log_offset;
+			local_cut = (validated <= log_start || rep_done == std::numeric_limits<uint64_t>::max())
+				? 0
+				: static_cast<int64_t>(rep_done + 1);
+		} else {
+			local_cut = static_cast<int64_t>(tinode_->offsets[broker_id_].written);
+		}
 
 		LocalCut request;
 		request.set_local_cut(local_cut);
@@ -79,6 +99,18 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str, volatile bool& st
 			break;
 		}
 
+		static thread_local auto last_log_time = std::chrono::steady_clock::now();
+		const auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 2000) {
+			LOG(INFO) << "Scalog local cut broker=" << broker_id_
+			          << " replica=" << replica_id_
+			          << " epoch=" << local_epoch_
+			          << " local_cut=" << local_cut
+			          << " ordered=" << tinode_->offsets[broker_id_].ordered
+			          << " written=" << tinode_->offsets[broker_id_].written;
+			last_log_time = now;
+		}
+
 		// Increment the epoch
 		local_epoch_++;
 
@@ -87,7 +119,7 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str, volatile bool& st
 	}
 
 	stream->WritesDone();
-	stop_reading_from_stream_ = true;
+	stop_reading_from_stream_.store(true, std::memory_order_release);
 	receive_global_cut.join();
 
 	// If this is the head node, terminate the global sequencer
@@ -102,7 +134,7 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 	memcpy(topic, topic_str.data(), topic_str.size());
 
 	int num_global_cuts = 0;
-	while (!stop_reading_from_stream_) {
+	while (!stop_reading_from_stream_.load(std::memory_order_relaxed)) {
 		GlobalCut global_cut;
 		if (stream->Read(&global_cut)) {
 			// Convert google::protobuf::Map<int64_t, int64_t> to absl::flat_hash_map<int, int>
@@ -113,10 +145,16 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 			ScalogSequencer(topic, global_cut_);
 
 			num_global_cuts++;
+			if ((num_global_cuts % 1000) == 1) {
+				auto it = global_cut_.find(broker_id_);
+				const int local_delta = (it == global_cut_.end()) ? -1 : it->second;
+				LOG(INFO) << "Scalog global cut received broker=" << broker_id_
+				          << " num_global_cuts=" << num_global_cuts
+				          << " local_delta=" << local_delta
+				          << " map_size=" << global_cut_.size();
+			}
 		}
 	}
-
-    // grpc::Status status = stream->Finish();
 }
 
 void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<int, int> &global_cut) {
@@ -125,6 +163,7 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 	static TInode *tinode = nullptr;
 	static MessageHeader* msg_to_order = nullptr;
 	static size_t batch_header_idx = 0;
+	const size_t kNumBatchSlots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
 
 	memcpy(topic_char, topic, TOPIC_NAME_SIZE);
 	if(tinode == nullptr){
@@ -132,41 +171,65 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 		msg_to_order = ((MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id_].log_offset));
 	}
 
-	static auto last_log_time = std::chrono::steady_clock::now();
-	static size_t written=0;
-			auto now = std::chrono::steady_clock::now();
-				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 3000) {
-					LOG(INFO) << "[DEBUG] [SCALOG] written:" << written;
-					last_log_time = std::chrono::steady_clock::now();
-				}
-
 	size_t total_size = 0;
 	void* start_addr = (void*)msg_to_order;
+	bool local_progress = false;
+	auto publish_batch = [&](void* batch_start_addr, size_t publish_size) {
+		if (publish_size == 0 || batch_start_addr == nullptr) {
+			return;
+		}
+		const size_t slot = batch_header_idx % kNumBatchSlots;
+		batch_header_[slot].batch_off_to_export = 0;
+		batch_header_[slot].total_size = publish_size;
+		batch_header_[slot].log_idx = static_cast<size_t>(
+				static_cast<uint8_t*>(batch_start_addr) - static_cast<uint8_t*>(cxl_addr_));
+		batch_header_[slot].ordered = 1;
+		Embarcadero::CXL::flush_cacheline(&batch_header_[slot]);
+		Embarcadero::CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(&batch_header_[slot]) + 64);
+		Embarcadero::CXL::store_fence();
+		batch_header_idx++;
+	};
 	for(auto &cut : global_cut){
 		if(cut.first == broker_id_){
 			for(int i = 0; i<cut.second; i++){
+				local_progress = true;
 				total_size += msg_to_order->paddedSize;
 				msg_to_order->total_order = seq;
 				std::atomic_thread_fence(std::memory_order_release);
-				tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset;
+				tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset + 1;
 				tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
-				//cxl_manager_->UpdateTinodeOrder(topic_char, tinode, broker_id_, msg_to_order->logical_offset, (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_);
-				written = msg_to_order->logical_offset;
+				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(&tinode->offsets[broker_id_].ordered)));
+				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(&tinode->offsets[broker_id_].ordered_offset)));
+				Embarcadero::CXL::store_fence();
 				msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
 				seq++;
 				if(total_size >= BATCH_SIZE){
-					batch_header_[batch_header_idx].batch_off_to_export = 0;
-					batch_header_[batch_header_idx].total_size = total_size;
-					batch_header_[batch_header_idx].log_idx = static_cast<size_t>(
-							static_cast<uint8_t*>(start_addr) - static_cast<uint8_t*>(cxl_addr_));
-					batch_header_[batch_header_idx].ordered = 1;
-					batch_header_idx++;
+					publish_batch(start_addr, total_size);
 					start_addr = (void*)msg_to_order;
 					total_size = 0;
 				}
 			}
 		}else{
 			seq += cut.second;
+		}
+	}
+	if (local_progress && total_size > 0) {
+		publish_batch(start_addr, total_size);
+	}
+
+	if (!global_cut.empty()) {
+		static thread_local auto last_order_log = std::chrono::steady_clock::now();
+		const auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_order_log).count() >= 2000) {
+			auto local_it = global_cut.find(broker_id_);
+			const int local_delta = (local_it == global_cut.end()) ? 0 : local_it->second;
+			LOG(INFO) << "Scalog sequencer advanced broker=" << broker_id_
+			          << " local_delta=" << local_delta
+			          << " ordered=" << tinode_->offsets[broker_id_].ordered
+			          << " seq=" << seq;
+			last_order_log = now;
 		}
 	}
 }
