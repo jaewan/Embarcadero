@@ -223,6 +223,7 @@ start_local_brokers() {
   if [[ "$SCENARIO" == "remote" ]]; then
     broker_env+="EMBARCADERO_HEAD_ADDR=$BROKER_LISTEN_ADDR "
   fi
+  local -a launched_broker_pids=()
 
   echo "Starting head broker (order=$order sequencer=$seq)..."
   if [[ "$seq" == "SCALOG" && -z "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
@@ -235,6 +236,7 @@ start_local_brokers() {
     --head \
     --"$seq" \
     > "$BIN_DIR/broker_0.log" 2>&1 &
+  launched_broker_pids+=("$!")
 
   for ((i=1; i<NUM_BROKERS; i++)); do
     echo "Starting broker $i..."
@@ -242,9 +244,10 @@ start_local_brokers() {
       --config "$BROKER_CONFIG_ABS" \
       --"$seq" \
       > "$BIN_DIR/broker_${i}.log" 2>&1 &
+    launched_broker_pids+=("$!")
   done
 
-  if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS"; then
+  if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS" "${launched_broker_pids[@]}"; then
     echo "ERROR: Brokers failed to reach ready state within ${BROKER_READY_TIMEOUT_SEC}s" >&2
     return 1
   fi

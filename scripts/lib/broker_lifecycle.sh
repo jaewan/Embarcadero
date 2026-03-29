@@ -574,14 +574,27 @@ broker_remote_wait_for_cluster() {
 broker_local_wait_for_cluster() {
   local timeout_s="$1"
   local expected="$2"
+  shift 2 || true
+  local expected_pids=("$@")
   local stability_s="${BROKER_READY_STABILITY_SEC:-1}"
   local start_ts
   start_ts=$(date +%s)
   local stable_since=0
   echo "Waiting for $expected brokers to signal readiness..."
   while true; do
-    local ready
-    ready="$(broker_ready_file_count_local)"
+    local ready=0
+    if [ "${#expected_pids[@]}" -gt 0 ]; then
+      local pid missing_pid
+      for pid in "${expected_pids[@]}"; do
+        if [ -f "/tmp/embarlet_${pid}_ready" ]; then
+          ready=$((ready + 1))
+        else
+          missing_pid="${missing_pid:-} ${pid}"
+        fi
+      done
+    else
+      ready="$(broker_ready_file_count_local)"
+    fi
     if [ "$ready" -ge "$expected" ]; then
       local now
       now=$(date +%s)

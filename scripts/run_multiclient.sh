@@ -447,6 +447,7 @@ start_brokers() {
     fi
 
     log "Starting $NUM_BROKERS broker(s) with NUMA bind: '${EMBARLET_NUMA_BIND}'"
+    local -a launched_broker_pids=()
     if [[ "$SEQUENCER" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
     elif [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
@@ -464,14 +465,16 @@ start_brokers() {
     # shellcheck disable=SC2086
     $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" \
         > /tmp/broker_0.log 2>&1 &
+    launched_broker_pids+=("$!")
     for (( i=1; i<NUM_BROKERS; i++ )); do
         # shellcheck disable=SC2086
         $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" \
             > /tmp/broker_"$i".log 2>&1 &
+        launched_broker_pids+=("$!")
     done
 
     log "Waiting for $NUM_BROKERS broker(s) to become ready (timeout: ${BROKER_READY_TIMEOUT_SEC}s)..."
-    if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS"; then
+    if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS" "${launched_broker_pids[@]}"; then
         echo "ERROR: Brokers did not become ready within ${BROKER_READY_TIMEOUT_SEC}s" >&2
         cat /tmp/broker_0.log >&2
         return 1
