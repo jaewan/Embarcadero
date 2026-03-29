@@ -255,6 +255,51 @@ exit 1
 EOF
 }
 
+broker_wait_for_local_scalog_replication_ready() {
+  local timeout_sec="${1:?timeout_sec}"
+  local expected_brokers="${2:?expected_brokers}"
+  local replication_factor="${3:?replication_factor}"
+  local expected_replicas_per_broker=$(( replication_factor - 1 ))
+
+  if [ "$expected_replicas_per_broker" -le 0 ]; then
+    return 0
+  fi
+
+  local deadline=$(( $(date +%s) + timeout_sec ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local ready_brokers=0
+    local broker_idx
+    for (( broker_idx = 0; broker_idx < expected_brokers; ++broker_idx )); do
+      local log_file="/tmp/broker_${broker_idx}.log"
+      if [ ! -f "$log_file" ]; then
+        continue
+      fi
+
+      local primary_started replica_started
+      primary_started=$(grep -F -c "CXLPollingLoop: broker=" "$log_file" 2>/dev/null || true)
+      replica_started=$(grep -F -c 'ReplicaPollingLoop[' "$log_file" 2>/dev/null || true)
+      if [ "$primary_started" -ge 1 ] && [ "$replica_started" -ge "$expected_replicas_per_broker" ]; then
+        ready_brokers=$((ready_brokers + 1))
+      fi
+    done
+
+    if [ "$ready_brokers" -ge "$expected_brokers" ]; then
+      return 0
+    fi
+
+    sleep 0.2
+  done
+
+  echo "Scalog replication readiness timeout after ${timeout_sec}s" >&2
+  local broker_idx
+  for (( broker_idx = 0; broker_idx < expected_brokers; ++broker_idx )); do
+    local log_file="/tmp/broker_${broker_idx}.log"
+    echo "--- /tmp/broker_${broker_idx}.log ---" >&2
+    tail -n 80 "$log_file" >&2 || true
+  done
+  return 1
+}
+
 broker_ready_file_count_local() {
   local ready_files=(/tmp/embarlet_*_ready)
   if [ -e "${ready_files[0]}" ]; then

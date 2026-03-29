@@ -45,6 +45,35 @@ namespace Scalog {
 				reinterpret_cast<const volatile void*>(hdr)));
 			Embarcadero::CXL::load_fence();
 		}
+
+		bool WriteFullyAtOffset(int fd, const uint8_t* src, size_t total_bytes, off_t offset,
+		                        const char* context) {
+			size_t written_total = 0;
+			while (written_total < total_bytes) {
+				ssize_t rc = pwrite(fd,
+				                   src + written_total,
+				                   total_bytes - written_total,
+				                   offset + static_cast<off_t>(written_total));
+				if (rc < 0) {
+					if (errno == EINTR) {
+						continue;
+					}
+					LOG(ERROR) << context << ": pwrite failed after " << written_total
+					           << "/" << total_bytes << " bytes at offset "
+					           << (offset + static_cast<off_t>(written_total))
+					           << ": " << strerror(errno);
+					return false;
+				}
+				if (rc == 0) {
+					LOG(ERROR) << context << ": pwrite returned 0 after " << written_total
+					           << "/" << total_bytes << " bytes at offset "
+					           << (offset + static_cast<off_t>(written_total));
+					return false;
+				}
+				written_total += static_cast<size_t>(rc);
+			}
+			return true;
+		}
 	}  // namespace
 
 	class ScalogReplicationServiceImpl final : public ScalogReplicationService::Service {
@@ -729,6 +758,10 @@ namespace Scalog {
 			size_t last_cxl_offset = tinode_->offsets[broker_id_].log_offset;
 			size_t rep_offset = 0;
 			int64_t persisted_count = 0;
+			LOG(INFO) << "CXLPollingLoop: broker=" << broker_id_
+			          << " starting primary CXL replication"
+			          << " log_offset=" << last_cxl_offset
+			          << " validated=" << LoadSharedSizeT(&tinode_->offsets[broker_id_].validated_written_byte_offset);
 
 			while (running_.load()) {
 				size_t validated = LoadSharedSizeT(&tinode_->offsets[broker_id_].validated_written_byte_offset);
@@ -768,9 +801,9 @@ namespace Scalog {
 				{
 					std::shared_lock<std::shared_mutex> lock(file_state_mutex_);
 					if (fd_ != -1) {
-						ssize_t written = pwrite(fd_, src, complete_bytes, static_cast<off_t>(rep_offset));
-						if (written < 0 || static_cast<size_t>(written) != complete_bytes) {
-							LOG(ERROR) << "CXLPollingLoop: pwrite failed: " << strerror(errno);
+						if (!WriteFullyAtOffset(fd_, src, complete_bytes,
+						                        static_cast<off_t>(rep_offset),
+						                        "CXLPollingLoop")) {
 							break;
 						}
 					}
@@ -851,10 +884,9 @@ namespace Scalog {
 					continue;
 				}
 
-				ssize_t written = pwrite(fd, src, complete_bytes, static_cast<off_t>(rep_offset));
-				if (written < 0 || static_cast<size_t>(written) != complete_bytes) {
-					LOG(ERROR) << "ReplicaPollingLoop[" << primary_broker_id << "]: pwrite failed: "
-					           << strerror(errno);
+				if (!WriteFullyAtOffset(fd, src, complete_bytes,
+				                        static_cast<off_t>(rep_offset),
+				                        ("ReplicaPollingLoop[" + std::to_string(primary_broker_id) + "]").c_str())) {
 					break;
 				}
 

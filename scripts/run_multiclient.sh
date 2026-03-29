@@ -267,12 +267,18 @@ wait_for_broker_reachability() {
         for (( i=0; i<NUM_CLIENTS; i++ )); do
             host="${CLIENT_HOSTS[$i]}"
             for (( j=0; j<NUM_BROKERS; j++ )); do
-                port=$((1214 + j))
+                port=$((BROKER_DATA_PORT_BASE + j))
                 if ! probe_tcp_from_host "$host" "$BROKER_IP" "$port"; then
                     all_ok=0
                     missing+=" ${host}:${BROKER_IP}:${port}"
                 fi
             done
+            if [[ -n "${BROKER_HEARTBEAT_PORT:-}" ]]; then
+                if ! probe_tcp_from_host "$host" "$BROKER_IP" "$BROKER_HEARTBEAT_PORT"; then
+                    all_ok=0
+                    missing+=" ${host}:${BROKER_IP}:${BROKER_HEARTBEAT_PORT}"
+                fi
+            fi
         done
 
         if [[ "$all_ok" -eq 1 ]]; then
@@ -535,6 +541,13 @@ start_brokers() {
         if ! broker_wait_for_remote_scalog_ready "${SCALOG_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
             echo "ERROR: remote Scalog sequencer did not reach full readiness" >&2
             return 1
+        fi
+        if [[ "$REPLICATION_FACTOR" -gt 1 ]]; then
+            log "Waiting for local Scalog replication pollers to initialize..."
+            if ! broker_wait_for_local_scalog_replication_ready "${SCALOG_REPLICATION_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
+                echo "ERROR: local Scalog replication did not reach full readiness" >&2
+                return 1
+            fi
         fi
     fi
     log "All $NUM_BROKERS brokers ready and reachable."

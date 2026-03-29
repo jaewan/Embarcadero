@@ -657,8 +657,9 @@ bool FollowerNodeClient::CheckHeartBeatReply() {
 	// Use a timeout when checking for replies
 	gpr_timespec deadline = gpr_time_add(
 			gpr_now(GPR_CLOCK_REALTIME),
-			gpr_time_from_seconds(1, GPR_TIMESPAN) // 1 second timeout
+			gpr_time_from_seconds(HEARTBEAT_INTERVAL, GPR_TIMESPAN)
 			);
+	static constexpr int kHeartbeatMissThreshold = 3;
 
 	while (!shutdown_) {
 		grpc::CompletionQueue::NextStatus status = cq_.AsyncNext(&got_tag, &ok, deadline);
@@ -669,6 +670,12 @@ bool FollowerNodeClient::CheckHeartBeatReply() {
 		}
 
 		if (status == grpc::CompletionQueue::TIMEOUT) {
+			const int missed = consecutive_missed_heartbeats_.fetch_add(1, std::memory_order_acq_rel) + 1;
+			if (missed >= kHeartbeatMissThreshold) {
+				head_alive_ = false;
+				LOG(WARNING) << "[CheckHeartBeatReply] heartbeat timeout threshold reached"
+				             << " misses=" << missed;
+			}
 			break;
 		}
 
@@ -686,13 +693,18 @@ bool FollowerNodeClient::CheckHeartBeatReply() {
 				delete call;
 				return false;
 			}
+			consecutive_missed_heartbeats_.store(0, std::memory_order_release);
 			head_alive_ = true;
 
 			// Process cluster info in the response
 			ProcessClusterInfo(call->reply);
 		} else {
-			head_alive_ = false;
-			LOG(INFO) << "[CheckHeartBeatReply] head node is dead";
+			const int missed = consecutive_missed_heartbeats_.fetch_add(1, std::memory_order_acq_rel) + 1;
+			if (missed >= kHeartbeatMissThreshold) {
+				head_alive_ = false;
+				LOG(WARNING) << "[CheckHeartBeatReply] head node is dead"
+				             << " misses=" << missed;
+			}
 		}
 
 		delete call;
