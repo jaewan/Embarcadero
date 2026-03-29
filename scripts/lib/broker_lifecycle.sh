@@ -244,12 +244,32 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
       print count + 0;
     }
   ' /tmp/scalog_sequencer.log 2>/dev/null || true)
-  if [ "$regs" -ge "$expected_brokers" ] && [ "$started" -ge 1 ] && [ "$streams" -ge "$expected_streams" ]; then
+  nonzero_cuts=$(awk -v expected="$expected_brokers" '
+    BEGIN { seen = 0 }
+    /Scalog global cut send/ {
+      count = 0;
+      nonzero = 0;
+      for (i = 1; i <= NF; ++i) {
+        if ($i ~ /^b[0-9]+=/) {
+          split($i, a, "=");
+          count++;
+          if ((a[2] + 0) > 0) {
+            nonzero++;
+          }
+        }
+      }
+      if (count >= expected && nonzero >= expected) {
+        seen = 1;
+      }
+    }
+    END { print seen + 0 }
+  ' /tmp/scalog_sequencer.log 2>/dev/null || true)
+  if [ "$regs" -ge "$expected_brokers" ] && [ "$started" -ge 1 ] && [ "$streams" -ge "$expected_streams" ] && [ "$nonzero_cuts" -ge 1 ]; then
     exit 0
   fi
   sleep 0.2
 done
-echo "Scalog readiness timeout: regs=$regs/$expected_brokers streams=$streams/$expected_streams started=$started" >&2
+echo "Scalog readiness timeout: regs=$regs/$expected_brokers streams=$streams/$expected_streams started=$started nonzero_cuts=$nonzero_cuts" >&2
 tail -n 80 /tmp/scalog_sequencer.log >&2 || true
 exit 1
 EOF
