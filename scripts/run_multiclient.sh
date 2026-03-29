@@ -377,6 +377,25 @@ shm_cleanup() {
     rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
 }
 
+wait_for_broker_ports_free() {
+    local timeout_sec="${BROKER_PORT_DRAIN_TIMEOUT_SEC:-20}"
+    local deadline=$(( $(date +%s) + timeout_sec ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        local listeners=""
+        if [ -n "${BROKER_HEARTBEAT_PORT:-}" ]; then
+            listeners="$(ss -H -ltn "( sport = :${BROKER_DATA_PORT_BASE} or sport = :${BROKER_HEARTBEAT_PORT} )" 2>/dev/null || true)"
+        else
+            listeners="$(ss -H -ltn "sport = :${BROKER_DATA_PORT_BASE}" 2>/dev/null || true)"
+        fi
+        if [ -z "$listeners" ]; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "WARNING: broker port drain timed out after ${timeout_sec}s; continuing with restart" >&2
+    return 0
+}
+
 cleanup() {
     log "Cleaning up..."
     broker_local_cleanup
@@ -387,6 +406,7 @@ cleanup() {
         broker_remote_scalog_stop || true
     fi
     shm_cleanup
+    wait_for_broker_ports_free
     # Kill remote client processes (ignore failures)
     for (( _i=0; _i<${NUM_CLIENTS:-0}; _i++ )); do
         _h="${CLIENT_HOSTS[$_i]}"
@@ -462,7 +482,16 @@ start_brokers() {
         echo "ERROR: Brokers are not reachable from client host(s) within ${BROKER_REACHABILITY_TIMEOUT_SEC}s" >&2
         return 1
     fi
+    if [[ "$BROKER_READY_PROPAGATION_SEC" -gt 0 ]]; then
+        log "Waiting ${BROKER_READY_PROPAGATION_SEC}s for cluster state propagation..."
+        sleep "$BROKER_READY_PROPAGATION_SEC"
+    fi
     if [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+        log "Waiting for remote Scalog sequencer readiness..."
+        if ! broker_wait_for_remote_scalog_ready "${SCALOG_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
+            echo "ERROR: remote Scalog sequencer did not reach full readiness" >&2
+            return 1
+        fi
         log "Precreating Scalog topic metadata..."
         (
             cd "$BUILD_BIN"
@@ -488,17 +517,6 @@ start_brokers() {
             cat /tmp/scalog_topic_precreate.log >&2 || true
             return 1
         }
-    fi
-    if [[ "$BROKER_READY_PROPAGATION_SEC" -gt 0 ]]; then
-        log "Waiting ${BROKER_READY_PROPAGATION_SEC}s for cluster state propagation..."
-        sleep "$BROKER_READY_PROPAGATION_SEC"
-    fi
-    if [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
-        log "Waiting for remote Scalog sequencer readiness..."
-        if ! broker_wait_for_remote_scalog_ready "${SCALOG_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
-            echo "ERROR: remote Scalog sequencer did not reach full readiness" >&2
-            return 1
-        fi
     fi
     log "All $NUM_BROKERS brokers ready and reachable."
 }
