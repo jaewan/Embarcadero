@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package lazylogsequencer;
+
+service LazyLogSequencer {
+  // Local broker reports append progress (message count written at broker).
+  rpc HandleSendLocalProgress(stream LocalProgress) returns (stream GlobalBinding);
+
+  // Local broker registers with the coordinator before sequencing begins.
+  rpc HandleRegisterBroker(RegisterBrokerRequest) returns (RegisterBrokerResponse);
+
+  // Terminate coordinator when benchmark run finishes.
+  rpc HandleTerminateGlobalSequencer(TerminateGlobalSequencerRequest) returns (TerminateGlobalSequencerResponse);
+}
+
+message LocalProgress {
+  int64 local_progress = 1;
+  string topic = 2;
+  int64 broker_id = 3;
+  int64 epoch = 4;
+}
+
+// Per-broker delta of newly bound messages for this interval.
+message GlobalBinding {
+  map<int64, int64> global_binding = 1;
+}
+
+message RegisterBrokerRequest {
+  int64 broker_id = 1;
+}
+
+message RegisterBrokerResponse {}
+
+message TerminateGlobalSequencerRequest {}
+
+message TerminateGlobalSequencerResponse {}

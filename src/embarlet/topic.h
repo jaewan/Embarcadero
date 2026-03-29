@@ -533,6 +533,7 @@ class Topic {
 		std::pair<uint64_t, bool> RefreshBrokerEpochFromCXL(bool force_full_read);
 
 		void StartScalogLocalSequencer();
+		void StartLazyLogLocalSequencer();
 
 		// Function pointer type for GetCXLBuffer implementations
 		using GetCXLBufferFuncPtr = std::function<void(void*, size_t)> (Topic::*)(
@@ -569,6 +570,15 @@ class Topic {
 		void RecordCorfuOrder2DurableCompletion(uint64_t batch_seq, uint32_t num_msg, uint32_t client_id);
 
 		std::function<void(void*, size_t)> ScalogGetCXLBuffer(
+				BatchHeader& batch_header,
+				const char topic[TOPIC_NAME_SIZE],
+				void*& log,
+				void*& segment_header,
+				size_t& logical_offset,
+				BatchHeader*& batch_header_location,
+				bool epoch_already_checked = false);
+
+		std::function<void(void*, size_t)> LazyLogGetCXLBuffer(
 				BatchHeader& batch_header,
 				const char topic[TOPIC_NAME_SIZE],
 				void*& log,

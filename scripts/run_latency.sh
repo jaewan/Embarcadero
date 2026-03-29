@@ -80,6 +80,15 @@ read -r -a modes <<< "${MODES:-steady}"
 # Scenario: local or remote
 SCENARIO="${SCENARIO:-local}"
 
+if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+  for __order in "${ORDERS_ARR[@]}"; do
+    if [[ "$__order" != "1" ]]; then
+      echo "ERROR: LAZYLOG sequencer currently requires ORDER=1 (got ORDER=${__order})" >&2
+      exit 1
+    fi
+  done
+fi
+
 # Remote client settings (SCENARIO=remote only)
 # REMOTE_CLIENT_HOST: SSH destination for the publisher (e.g. "c4" or "user@10.10.10.20")
 REMOTE_CLIENT_HOST="${REMOTE_CLIENT_HOST:-c4}"
@@ -89,6 +98,10 @@ BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
 # Optional separate Corfu sequencer host for Corfu latency runs.
 REMOTE_CORFU_SEQUENCER_HOST="${REMOTE_CORFU_SEQUENCER_HOST:-}"
 REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}"
+REMOTE_LAZYLOG_SEQUENCER_HOST="${REMOTE_LAZYLOG_SEQUENCER_HOST:-}"
+REMOTE_LAZYLOG_BUILD_BIN="${REMOTE_LAZYLOG_BUILD_BIN:-}"
+EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-}"
+EMBARCADERO_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}"
 
 # NUMA: CPUs on compute node 1; membind includes node 2 when CXL is a **zero-core** NUMA node (see cxl_manager.cc mbind).
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
@@ -125,6 +138,8 @@ cleanup() {
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
   if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     broker_remote_corfu_stop || true
+  elif [[ "$SEQUENCER" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+    broker_remote_lazylog_stop || true
   fi
   rm -f /tmp/embarlet_*_ready   >/dev/null 2>&1 || true
 }
@@ -187,12 +202,21 @@ start_local_brokers() {
   local seq="$2"
 
   cleanup
+  export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
 
   if [[ "$seq" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     export REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-$BIN_DIR}"
     echo "Starting remote Corfu sequencer on $REMOTE_CORFU_SEQUENCER_HOST..."
     if ! broker_remote_corfu_start; then
       echo "ERROR: failed to start remote Corfu sequencer on $REMOTE_CORFU_SEQUENCER_HOST" >&2
+      return 1
+    fi
+    sleep 1
+  elif [[ "$seq" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+    export REMOTE_LAZYLOG_BUILD_BIN="${REMOTE_LAZYLOG_BUILD_BIN:-$BIN_DIR}"
+    echo "Starting remote LazyLog sequencer on $REMOTE_LAZYLOG_SEQUENCER_HOST..."
+    if ! broker_remote_lazylog_start; then
+      echo "ERROR: failed to start remote LazyLog sequencer on $REMOTE_LAZYLOG_SEQUENCER_HOST" >&2
       return 1
     fi
     sleep 1
@@ -204,8 +228,18 @@ start_local_brokers() {
   broker_env+="REPLICATION_FACTOR=$REPLICATION_FACTOR "
   broker_env+="EMBARCADERO_REPLICATION_FACTOR=$REPLICATION_FACTOR "
   broker_env+="NUM_BROKERS=$NUM_BROKERS "
+  broker_env+="EMBARCADERO_NUM_BROKERS=$NUM_BROKERS "
+  if [[ "$seq" == "LAZYLOG" ]]; then
+    broker_env+="LAZYLOG_CXL_MODE=1 "
+  fi
   if [[ "$SCENARIO" == "remote" ]]; then
     broker_env+="EMBARCADERO_HEAD_ADDR=$BROKER_LISTEN_ADDR "
+  fi
+  if [[ "$seq" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_IP" ]]; then
+    broker_env+="EMBARCADERO_LAZYLOG_SEQ_IP=$EMBARCADERO_LAZYLOG_SEQ_IP "
+  fi
+  if [[ "$seq" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]]; then
+    broker_env+="EMBARCADERO_LAZYLOG_SEQ_PORT=$EMBARCADERO_LAZYLOG_SEQ_PORT "
   fi
 
   echo "Starting head broker (order=$order sequencer=$seq)..."
@@ -265,7 +299,6 @@ build_client_cmd() {
     --head_addr "$head_addr"
     -m "$MSG_SIZE"
     -s "$TOTAL_MESSAGE_SIZE"
-    --record_results
     -t "$TEST_CASE"
     -o "$order"
     -a "$ACK_LEVEL"
@@ -342,6 +375,12 @@ run_trial() {
     fi
     if [[ -n "${EMBARCADERO_CORFU_SEQ_PORT:-}" ]]; then
       quoted_cmd+="export EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT} && "
+    fi
+    if [[ -n "${EMBARCADERO_LAZYLOG_SEQ_IP:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_LAZYLOG_SEQ_IP=${EMBARCADERO_LAZYLOG_SEQ_IP} && "
+    fi
+    if [[ -n "${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_LAZYLOG_SEQ_PORT=${EMBARCADERO_LAZYLOG_SEQ_PORT} && "
     fi
     if [[ -n "$CLIENT_NUMA_BIND" ]]; then
       quoted_cmd+="$CLIENT_NUMA_BIND "

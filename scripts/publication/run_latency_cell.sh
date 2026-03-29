@@ -21,6 +21,7 @@ BROKER_HOST="${BROKER_HOST:-moscxl}"
 BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
 # Corfu gRPC sequencer log fetch (publication default: c2; override if your layout host differs).
 CORFU_SEQUENCER_LOG_HOST="${CORFU_SEQUENCER_LOG_HOST:-c2}"
+LAZYLOG_SEQUENCER_LOG_HOST="${LAZYLOG_SEQUENCER_LOG_HOST:-c3}"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${RUN_TS}}"
 REQUIRE_FIRST_ATTEMPT_PASS="${REQUIRE_FIRST_ATTEMPT_PASS:-0}"
@@ -48,6 +49,7 @@ TAG='$TAG' SYSTEM='$SYSTEM' ORDER='$ORDER' SEQUENCER='$SEQUENCER' REPLICATION_FA
 NUM_TRIALS='$NUM_TRIALS' NUM_BROKERS='$NUM_BROKERS' MSG_SIZE='$MSG_SIZE' TOTAL_MESSAGE_SIZE='$TOTAL_MESSAGE_SIZE' \\
 ACK_LEVEL='$ACK_LEVEL' MODES='$MODES' PUBLISHER_HOST='$PUBLISHER_HOST' BROKER_HOST='$BROKER_HOST' \\
 BROKER_LISTEN_ADDR='$BROKER_LISTEN_ADDR' CORFU_SEQUENCER_LOG_HOST='$CORFU_SEQUENCER_LOG_HOST' \\
+LAZYLOG_SEQUENCER_LOG_HOST='$LAZYLOG_SEQUENCER_LOG_HOST' \\
 bash scripts/publication/run_latency_cell.sh
 EOF
 chmod +x "$RUN_DIR/command.sh"
@@ -69,6 +71,7 @@ publisher_host=$PUBLISHER_HOST
 broker_host=$BROKER_HOST
 broker_listen_addr=$BROKER_LISTEN_ADDR
 corfu_sequencer_log_host=$CORFU_SEQUENCER_LOG_HOST
+lazylog_sequencer_log_host=$LAZYLOG_SEQUENCER_LOG_HOST
 require_first_attempt_pass=$REQUIRE_FIRST_ATTEMPT_PASS
 commit=$COMMIT
 start_time_utc=$RUN_TS
@@ -95,6 +98,10 @@ env \
   BROKER_LISTEN_ADDR="$BROKER_LISTEN_ADDR" \
   REMOTE_CORFU_SEQUENCER_HOST="${REMOTE_CORFU_SEQUENCER_HOST:-}" \
   REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}" \
+  REMOTE_LAZYLOG_SEQUENCER_HOST="${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" \
+  REMOTE_LAZYLOG_BUILD_BIN="${REMOTE_LAZYLOG_BUILD_BIN:-}" \
+  EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-}" \
+  EMBARCADERO_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" \
   bash scripts/run_latency.sh \
   2>&1 | tee "$RUN_LOG"
 RUN_STATUS=${PIPESTATUS[0]}
@@ -103,6 +110,8 @@ set -e
 cp -a build/bin/broker_*.log "$RUN_DIR/" 2>/dev/null || true
 scp -o StrictHostKeyChecking=no "${CORFU_SEQUENCER_LOG_HOST}:/tmp/corfu_sequencer.log" \
   "$RUN_DIR/${CORFU_SEQUENCER_LOG_HOST}_corfu_sequencer.log" >/dev/null 2>&1 || true
+scp -o StrictHostKeyChecking=no "${LAZYLOG_SEQUENCER_LOG_HOST}:/tmp/lazylog_sequencer.log" \
+  "$RUN_DIR/${LAZYLOG_SEQUENCER_LOG_HOST}_lazylog_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
 echo "system,order,sequencer,replication_factor,publisher_host,broker_host,run_idx,status,p50_us,p95_us,p99_us,max_us,attempts_used,first_attempt_pass,artifact_dir,commit" > "$SUMMARY_CSV"

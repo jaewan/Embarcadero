@@ -54,6 +54,20 @@ bool ReplicationManager::Initialize() {
             }
             break;
 
+        case LAZYLOG:
+            scalog_client_ = std::make_unique<Scalog::ScalogReplicationClient>(
+                topic_name_,
+                replication_factor_,
+                "localhost",
+                broker_id_,
+                LAZYLOG_REP_PORT
+            );
+            if (!scalog_client_->Connect()) {
+                LOG(ERROR) << "LazyLog replication client failed to connect to replica";
+                return false;
+            }
+            break;
+
         default:
             // Other sequencer types don't use replication clients
             break;

@@ -23,6 +23,8 @@
 #   EMBARCADERO_ORDER5_HOME_BROKERS, LOCAL_CLIENT_NUMA,
 #   REMOTE_CORFU_SEQUENCER_HOST, REMOTE_CORFU_BUILD_BIN
 #   EMBARCADERO_CORFU_SEQ_IP / EMBARCADERO_CORFU_SEQ_PORT for CORFU + SSH clients
+#   REMOTE_LAZYLOG_SEQUENCER_HOST, REMOTE_LAZYLOG_BUILD_BIN
+#   EMBARCADERO_LAZYLOG_SEQ_IP / EMBARCADERO_LAZYLOG_SEQ_PORT for LAZYLOG + SSH clients
 #
 # Example:
 #   NUM_CLIENTS=3 NUM_BROKERS=4 MESSAGE_SIZE=8192 scripts/run_multiclient.sh
@@ -35,6 +37,12 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 declare -a CLIENT_HOSTS=( "c4"  "local" "c3"  "c2"  "c1"  )
 declare -a CLIENT_NUMAS=( "1"   ""      "1"   "1"   "1"   )
+if [[ -n "${CLIENT_HOSTS_CSV:-}" ]]; then
+    IFS=',' read -r -a CLIENT_HOSTS <<< "$CLIENT_HOSTS_CSV"
+fi
+if [[ -n "${CLIENT_NUMAS_CSV:-}" ]]; then
+    IFS=',' read -r -a CLIENT_NUMAS <<< "$CLIENT_NUMAS_CSV"
+fi
 MAX_CLIENTS=${#CLIENT_HOSTS[@]}
 
 # ---------------------------------------------------------------------------
@@ -77,9 +85,13 @@ EMBARCADERO_NETWORK_IO_THREADS=${EMBARCADERO_NETWORK_IO_THREADS:-4}
 EMBARCADERO_ORDER5_HOME_BROKERS=${EMBARCADERO_ORDER5_HOME_BROKERS:-}
 EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP:-}
 EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT:-}
+EMBARCADERO_LAZYLOG_SEQ_IP=${EMBARCADERO_LAZYLOG_SEQ_IP:-}
+EMBARCADERO_LAZYLOG_SEQ_PORT=${EMBARCADERO_LAZYLOG_SEQ_PORT:-}
 CLIENT_LD_LIBRARY_PATH=${CLIENT_LD_LIBRARY_PATH:-${LD_LIBRARY_PATH:-}}
 REMOTE_CORFU_SEQUENCER_HOST=${REMOTE_CORFU_SEQUENCER_HOST:-}
 REMOTE_CORFU_BUILD_BIN=${REMOTE_CORFU_BUILD_BIN:-}
+REMOTE_LAZYLOG_SEQUENCER_HOST=${REMOTE_LAZYLOG_SEQUENCER_HOST:-}
+REMOTE_LAZYLOG_BUILD_BIN=${REMOTE_LAZYLOG_BUILD_BIN:-}
 # ---------------------------------------------------------------------------
 # Derived paths
 # ---------------------------------------------------------------------------
@@ -106,6 +118,10 @@ fi
 
 if [[ "$SEQUENCER" == "CORFU" ]] && [[ "$ORDER" != "2" ]]; then
     echo "ERROR: CORFU sequencer requires ORDER=2 (got ORDER=$ORDER)" >&2
+    exit 1
+fi
+if [[ "$SEQUENCER" == "LAZYLOG" ]] && [[ "$ORDER" != "1" ]]; then
+    echo "ERROR: LAZYLOG sequencer currently requires ORDER=1 (got ORDER=$ORDER)" >&2
     exit 1
 fi
 
@@ -163,7 +179,7 @@ export PROJECT_ROOT
 source "$SCRIPT_DIR/lib/broker_lifecycle.sh"
 broker_init_paths
 
-EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
+EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
 [[ "$SEQUENCER" == "CORFU" ]] && EMBARLET_NUMA_BIND=""
 
 # ---------------------------------------------------------------------------
@@ -370,6 +386,8 @@ cleanup() {
     broker_local_cleanup
     if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         broker_remote_corfu_stop || true
+  elif [[ "$SEQUENCER" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+        broker_remote_lazylog_stop || true
     fi
     shm_cleanup
     # Kill remote client processes (ignore failures)
@@ -384,6 +402,7 @@ trap cleanup EXIT
 
 start_brokers() {
     log "Resetting previous broker state..."
+    export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
     pkill -9 -f "./embarlet" >/dev/null 2>&1 || true
     rm -f /tmp/embarlet_*_ready 2>/dev/null || true
     shm_cleanup
@@ -396,6 +415,14 @@ start_brokers() {
             return 1
         fi
         sleep 1
+    elif [[ "$SEQUENCER" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+        export REMOTE_LAZYLOG_BUILD_BIN="${REMOTE_LAZYLOG_BUILD_BIN:-$BUILD_BIN}"
+        log "Starting remote LazyLog sequencer on $REMOTE_LAZYLOG_SEQUENCER_HOST..."
+        if ! broker_remote_lazylog_start; then
+            echo "ERROR: failed to start remote LazyLog sequencer on $REMOTE_LAZYLOG_SEQUENCER_HOST" >&2
+            return 1
+        fi
+        sleep 1
     fi
 
     cd "$BUILD_BIN"
@@ -405,12 +432,24 @@ start_brokers() {
     export EMBARCADERO_RUNTIME_MODE="throughput"
     export EMBARCADERO_REPLICATION_FACTOR="$REPLICATION_FACTOR"
     export EMBARCADERO_HEAD_ADDR="$BROKER_IP"
+    export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
     export EMBARCADERO_ORDER0_FAST_PATH
     export EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES
+    if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+        export LAZYLOG_CXL_MODE=1
+    fi
+    if [[ "$SEQUENCER" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_IP" ]]; then
+        export EMBARCADERO_LAZYLOG_SEQ_IP
+    fi
+    if [[ "$SEQUENCER" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]]; then
+        export EMBARCADERO_LAZYLOG_SEQ_PORT
+    fi
 
     log "Starting $NUM_BROKERS broker(s) with NUMA bind: '${EMBARLET_NUMA_BIND}'"
     if [[ "$SEQUENCER" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
+    elif [[ "$SEQUENCER" == "LAZYLOG" && -z "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+        ./lazylog_global_sequencer > /tmp/lazylog_sequencer.log 2>&1 &
     fi
 
     # shellcheck disable=SC2086
@@ -470,6 +509,9 @@ printf "  %-32s %s\n" "LOCAL_CLIENT_NUMA:"             "$(resolve_local_client_n
 if [[ "$SEQUENCER" == "CORFU" ]]; then
     printf "  %-32s %s\n" "CORFU_SEQ_IP:"               "${EMBARCADERO_CORFU_SEQ_IP:-"(unset)"}"
     printf "  %-32s %s\n" "CORFU_SEQ_PORT:"             "${EMBARCADERO_CORFU_SEQ_PORT:-"(default)"}"
+elif [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+    printf "  %-32s %s\n" "LAZYLOG_SEQ_IP:"             "${EMBARCADERO_LAZYLOG_SEQ_IP:-"(unset)"}"
+    printf "  %-32s %s\n" "LAZYLOG_SEQ_PORT:"           "${EMBARCADERO_LAZYLOG_SEQ_PORT:-"(default)"}"
 fi
 echo "================================================================"
 
@@ -551,24 +593,14 @@ export EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS=$START_TIME_MS
 rm -f $ts_file
 if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_IP" ]; then export EMBARCADERO_CORFU_SEQ_IP=$EMBARCADERO_CORFU_SEQ_IP; fi
 if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_PORT" ]; then export EMBARCADERO_CORFU_SEQ_PORT=$EMBARCADERO_CORFU_SEQ_PORT; fi
+if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "$EMBARCADERO_LAZYLOG_SEQ_IP" ]; then export EMBARCADERO_LAZYLOG_SEQ_IP=$EMBARCADERO_LAZYLOG_SEQ_IP; fi
+if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]; then export EMBARCADERO_LAZYLOG_SEQ_PORT=$EMBARCADERO_LAZYLOG_SEQ_PORT; fi
 if [ -n "$CLIENT_LD_LIBRARY_PATH" ]; then export LD_LIBRARY_PATH=$CLIENT_LD_LIBRARY_PATH; fi
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 cd $BUILD_BIN
 # Spin-wait until the synchronized barrier millisecond (requires NTP-synced clocks)
 while [ \$(date +%s%3N) -lt $START_TIME_MS ]; do sleep 0.0005; done
-numactl --cpunodebind=$numa --membind=$numa \\
-    ./throughput_test \\
-    --config $CLIENT_CONFIG_ABS \\
-    -n $THREADS_PER_BROKER \\
-    -m $MESSAGE_SIZE \\
-    -s $LOAD_PER_CLIENT \\
-    -t $TEST_TYPE \\
-    -o $ORDER \\
-    -a $ACK \\
-    -r $REPLICATION_FACTOR \\
-    --sequencer $SEQUENCER \\
-    --head_addr $BROKER_IP \\
-    -l 0
+numactl --cpunodebind=$numa --membind=$numa ./throughput_test --config $CLIENT_CONFIG_ABS -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $LOAD_PER_CLIENT -t $TEST_TYPE -o $ORDER -a $ACK -r $REPLICATION_FACTOR --sequencer $SEQUENCER --head_addr $BROKER_IP -l 0
 ENDINNERSCRIPT
 )"
 

@@ -9,11 +9,16 @@
 
 namespace Scalog {
 
-ScalogReplicationClient::ScalogReplicationClient(const char* topic, size_t replication_factor, const std::string& address, int broker_id)
+ScalogReplicationClient::ScalogReplicationClient(
+		const char* topic,
+		size_t replication_factor,
+		const std::string& address,
+		int broker_id,
+		int replication_port_base)
 	: topic_(topic), replication_factor_(replication_factor), broker_id_(broker_id) {
 
 		// Set the server address
-		server_address_ = address + ":" + std::to_string(SCALOG_REP_PORT + broker_id);
+		server_address_ = address + ":" + std::to_string(replication_port_base + broker_id);
 
 		// Initialize random generator for exponential backoff
 		{

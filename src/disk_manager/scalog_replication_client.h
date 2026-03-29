@@ -31,7 +31,12 @@ public:
      *
      * @param server_address The address of the server in format "hostname:port"
      */
-    explicit ScalogReplicationClient(const char* topic, size_t replication_factor, const std::string& address, int broker_id);
+    explicit ScalogReplicationClient(
+        const char* topic,
+        size_t replication_factor,
+        const std::string& address,
+        int broker_id,
+        int replication_port_base = SCALOG_REP_PORT);
 
     /**
      * @brief Destroy the client and release resources

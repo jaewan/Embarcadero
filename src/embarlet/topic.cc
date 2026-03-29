@@ -1,5 +1,6 @@
 #include "topic.h"
 #include "../cxl_manager/scalog_local_sequencer.h"
+#include "../cxl_manager/lazylog_local_sequencer.h"
 #include "common/performance_utils.h"
 #include "../common/wire_formats.h"
 #include "../common/order_level.h"
@@ -261,6 +262,20 @@ Topic::Topic(
 				}
 			}
 			GetCXLBufferFunc = &Topic::ScalogGetCXLBuffer;
+		} else if (seq_type == LAZYLOG) {
+			if (replication_factor_ > 0) {
+				scalog_replication_client_ = std::make_unique<Scalog::ScalogReplicationClient>(
+					topic_name,
+					replication_factor_,
+					"localhost",
+					broker_id_,
+					LAZYLOG_REP_PORT
+				);
+				if (!scalog_replication_client_->Connect()) {
+					LOG(ERROR) << "LazyLog replication client failed to connect to replica";
+				}
+			}
+			GetCXLBufferFunc = &Topic::LazyLogGetCXLBuffer;
 			} else {
 				// Set buffer function based on order
 				if (order_ == 3) {
@@ -338,8 +353,8 @@ void Topic::Start() {
 				delegationThreads_.emplace_back(&Topic::DelegationThread, this);
 		}
 
-	// Head node runs centralized sequencers; Scalog local sequencers run on every broker.
-	if (broker_id_ == 0 || seq_type_ == SCALOG) {
+	// Head node runs centralized sequencers; Scalog/LazyLog local sequencers run on every broker.
+	if (broker_id_ == 0 || seq_type_ == SCALOG || seq_type_ == LAZYLOG) {
 		LOG(INFO) << "Topic Start: broker_id=" << broker_id_ << ", order=" << order_ << ", seq_type=" << seq_type_;
 		switch(seq_type_){
 			case KAFKA: // Kafka is just a way to not run DelegationThread, not actual sequencer
@@ -375,6 +390,13 @@ void Topic::Start() {
 				}else if (order_ == 2)
 					LOG(ERROR) << "Order is set 2 at scalog";
 				break;
+			case LAZYLOG:
+				if (order_ == 1){
+					sequencerThread_ = std::thread(&Topic::StartLazyLogLocalSequencer, this);
+				} else {
+					LOG(ERROR) << "LazyLog currently supports ORDER=1 (got ORDER=" << order_ << ")";
+				}
+				break;
 			case CORFU:
 				if (order_ == Embarcadero::kOrderTotal) {
 					VLOG(3) << "Corfu running in canonical ORDER=2 mode.";
@@ -396,6 +418,13 @@ void Topic::StartScalogLocalSequencer() {
 			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 	Scalog::ScalogLocalSequencer scalog_local_sequencer(tinode_, broker_id_, cxl_addr_, topic_name_, batch_header);
 	scalog_local_sequencer.SendLocalCut(topic_name_, stop_threads_volatile_);
+}
+
+void Topic::StartLazyLogLocalSequencer() {
+	BatchHeader* batch_header = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	LazyLog::LazyLogLocalSequencer lazylog_local_sequencer(tinode_, broker_id_, cxl_addr_, topic_name_, batch_header);
+	lazylog_local_sequencer.SendLocalProgress(topic_name_, stop_threads_volatile_);
 }
 
 
@@ -489,7 +518,9 @@ void Topic::DelegationThread() {
 					}
 
 					if (order_ != 0) {
-						size_t written_val = (seq_type_ == SCALOG) ? logical_offset_ : logical_offset_ - 1;
+						const bool count_based_written =
+							(seq_type_ == SCALOG || seq_type_ == LAZYLOG);
+						size_t written_val = count_based_written ? logical_offset_ : logical_offset_ - 1;
 						UpdateTInodeWritten(
 							written_val,
 							static_cast<unsigned long long int>(
@@ -542,7 +573,9 @@ void Topic::DelegationThread() {
 					}
 
 					if (order_ != 0) {
-						size_t written_val = (seq_type_ == SCALOG) ? logical_offset_ : logical_offset_ - 1;
+						const bool count_based_written =
+							(seq_type_ == SCALOG || seq_type_ == LAZYLOG);
+						size_t written_val = count_based_written ? logical_offset_ : logical_offset_ - 1;
 						UpdateTInodeWritten(
 							written_val,
 							static_cast<unsigned long long int>(
@@ -1462,6 +1495,57 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 						batch_header.num_msg,
 						log
 				);
+		}
+	};
+}
+
+std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
+		BatchHeader &batch_header,
+		const char topic[TOPIC_NAME_SIZE],
+		void* &log,
+		void* &segment_header,
+		size_t &logical_offset,
+		BatchHeader* &batch_header_location,
+		bool /*epoch_already_checked*/) {
+
+	static const bool kCxlLazyLogMode =
+		(getenv("LAZYLOG_CXL_MODE") != nullptr &&
+		 std::string(getenv("LAZYLOG_CXL_MODE")) == "1");
+
+	uint64_t pbr_idx = broker_pbr_counters_[broker_id_].fetch_add(1, std::memory_order_relaxed);
+	batch_header.pbr_absolute_index = pbr_idx;
+	batch_header.batch_id = (static_cast<uint64_t>(broker_id_) << 48) | pbr_idx;
+
+	BatchHeader* batch_header_ring = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
+	size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
+	batch_header_location = &batch_header_ring[slot_idx];
+	__atomic_store_n(&batch_header_location->batch_complete, 0, __ATOMIC_RELEASE);
+
+	const unsigned long long int segment_metadata =
+		reinterpret_cast<unsigned long long int>(current_segment_);
+	const size_t msg_size = batch_header.total_size;
+
+	log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
+	batch_header.log_idx = reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_);
+	CheckSegmentBoundary(log, msg_size, segment_metadata);
+
+	size_t rep_offset = 0;
+	if (!kCxlLazyLogMode) {
+		rep_offset = scalog_batch_offset_.fetch_add(batch_header.total_size, std::memory_order_relaxed);
+	}
+
+	return [this, batch_header, log, rep_offset, kCxlLazyLogMode](void* /*log_ptr*/, size_t /*placeholder*/) {
+		if (kCxlLazyLogMode) {
+			return;
+		}
+		if (replication_factor_ > 0 && scalog_replication_client_) {
+			scalog_replication_client_->ReplicateData(
+					rep_offset,
+					batch_header.total_size,
+					batch_header.num_msg,
+					log);
 		}
 	};
 }

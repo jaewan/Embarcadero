@@ -89,7 +89,8 @@ heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
         {"EMBARCADERO", heartbeat_system::SequencerType::EMBARCADERO},
         {"KAFKA", heartbeat_system::SequencerType::KAFKA},
         {"SCALOG", heartbeat_system::SequencerType::SCALOG},
-        {"CORFU", heartbeat_system::SequencerType::CORFU}
+        {"CORFU", heartbeat_system::SequencerType::CORFU},
+        {"LAZYLOG", heartbeat_system::SequencerType::LAZYLOG}
     };
     
     auto it = sequencerMap.find(value);

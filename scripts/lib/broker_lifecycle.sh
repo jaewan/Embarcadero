@@ -88,6 +88,16 @@ broker_remote_corfu_sequencer_host() {
   fi
 }
 
+broker_remote_lazylog_sequencer_host() {
+  if [ -n "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]; then
+    printf '%s\n' "${REMOTE_LAZYLOG_SEQUENCER_HOST}"
+  elif broker_is_remote_mode; then
+    printf '%s\n' "${REMOTE_BROKER_HOST}"
+  else
+    printf '%s\n' ""
+  fi
+}
+
 broker_remote_corfu_start() {
   local host
   host="$(broker_remote_corfu_sequencer_host)"
@@ -124,6 +134,60 @@ for pid in $(pgrep -f "corfu_global_sequencer" 2>/dev/null || true); do
   kill -9 "$pid" 2>/dev/null || true
 done
 rm -f /tmp/corfu_global_sequencer.pid
+EOF
+}
+
+broker_remote_lazylog_start() {
+  local host
+  host="$(broker_remote_lazylog_sequencer_host)"
+  [ -n "$host" ] || return 0
+  local bin="${REMOTE_LAZYLOG_BUILD_BIN:-$REMOTE_BUILD_BIN}"
+  local seq_ip="${EMBARCADERO_LAZYLOG_SEQ_IP:-}"
+  local seq_port="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}"
+  local num_brokers="${EMBARCADERO_NUM_BROKERS:-}"
+  [ -n "$bin" ] || return 1
+  echo "Remote LazyLog sequencer: starting on $host (cd $bin)"
+  ssh -o BatchMode=yes "$host" bash -s -- "$bin" "$seq_ip" "$seq_port" "$num_brokers" <<'EOF'
+set -euo pipefail
+build_bin=$1
+seq_ip=${2:-}
+seq_port=${3:-}
+num_brokers=${4:-}
+cd "$build_bin"
+for pid in $(pgrep -f "lazylog_global_sequencer" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+sleep 0.3
+for pid in $(pgrep -f "lazylog_global_sequencer" 2>/dev/null || true); do
+  kill -9 "$pid" 2>/dev/null || true
+done
+if [ -n "$seq_ip" ]; then
+  export EMBARCADERO_LAZYLOG_SEQ_IP="$seq_ip"
+fi
+if [ -n "$seq_port" ]; then
+  export EMBARCADERO_LAZYLOG_SEQ_PORT="$seq_port"
+fi
+if [ -n "$num_brokers" ]; then
+  export EMBARCADERO_NUM_BROKERS="$num_brokers"
+fi
+nohup ./lazylog_global_sequencer >>/tmp/lazylog_sequencer.log 2>&1 &
+printf '%s\n' "$!" >/tmp/lazylog_global_sequencer.pid
+EOF
+}
+
+broker_remote_lazylog_stop() {
+  local host
+  host="$(broker_remote_lazylog_sequencer_host)"
+  [ -n "$host" ] || return 0
+  ssh -o BatchMode=yes "$host" bash -s -- <<'EOF'
+for pid in $(pgrep -f "lazylog_global_sequencer" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+sleep 0.2
+for pid in $(pgrep -f "lazylog_global_sequencer" 2>/dev/null || true); do
+  kill -9 "$pid" 2>/dev/null || true
+done
+rm -f /tmp/lazylog_global_sequencer.pid
 EOF
 }
 
@@ -244,6 +308,11 @@ for pid in $(pgrep -f "$build_bin/corfu_global_sequencer" 2>/dev/null || true); 
   sleep 0.05
   kill -9 "$pid" 2>/dev/null || true
 done
+for pid in $(pgrep -f "$build_bin/lazylog_global_sequencer" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+  sleep 0.05
+  kill -9 "$pid" 2>/dev/null || true
+done
 
 rm -f /tmp/embarlet_*_ready 2>/dev/null || true
 if [ -n "$shm_name" ]; then
@@ -257,6 +326,7 @@ broker_local_cleanup() {
   pkill -9 -f "./embarlet" >/dev/null 2>&1 || true
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
   pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
+  pkill -9 -f "lazylog_global_sequencer" >/dev/null 2>&1 || true
   rm -f /tmp/embarlet_*_ready 2>/dev/null || true
 }
 
@@ -267,6 +337,9 @@ broker_cleanup() {
     # collocated with brokers, broker_remote_cleanup already killed it on REMOTE_BROKER_HOST.
     if [ -n "${REMOTE_CORFU_SEQUENCER_HOST:-}" ]; then
       broker_remote_corfu_stop || true
+    fi
+    if [ -n "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]; then
+      broker_remote_lazylog_stop || true
     fi
   else
     broker_local_cleanup
@@ -468,6 +541,12 @@ broker_ensure_cluster() {
     if [[ "$sequence" == "CORFU" ]]; then
       if ! broker_remote_corfu_start; then
         echo "ERROR: failed to start Corfu sequencer on $(broker_remote_corfu_sequencer_host)" >&2
+        return 1
+      fi
+      sleep 1
+    elif [[ "$sequence" == "LAZYLOG" ]]; then
+      if ! broker_remote_lazylog_start; then
+        echo "ERROR: failed to start LazyLog sequencer on $(broker_remote_lazylog_sequencer_host)" >&2
         return 1
       fi
       sleep 1

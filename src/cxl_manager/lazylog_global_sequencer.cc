@@ -1,0 +1,171 @@
+#include "lazylog_global_sequencer.h"
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <glog/logging.h>
+
+namespace {
+size_t ResolveExpectedBrokers() {
+  const char* brokers_env = std::getenv("EMBARCADERO_NUM_BROKERS");
+  if (brokers_env && std::strlen(brokers_env) > 0) {
+    try {
+      const int parsed = std::stoi(brokers_env);
+      if (parsed > 0) {
+        return static_cast<size_t>(parsed);
+      }
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Invalid EMBARCADERO_NUM_BROKERS='" << brokers_env
+                   << "', falling back to " << NUM_MAX_BROKERS_CONFIG;
+    }
+  }
+  return static_cast<size_t>(NUM_MAX_BROKERS_CONFIG);
+}
+}  // namespace
+
+LazyLogGlobalSequencer::LazyLogGlobalSequencer(const std::string& sequencer_address)
+    : expected_brokers_(ResolveExpectedBrokers()) {
+  grpc::ServerBuilder builder;
+  int selected_port = 0;
+  builder.AddListeningPort(sequencer_address, grpc::InsecureServerCredentials(), &selected_port);
+  builder.RegisterService(this);
+  server_ = builder.BuildAndStart();
+  if (!server_) {
+    LOG(ERROR) << "LazyLog global sequencer failed to bind " << sequencer_address;
+    return;
+  }
+  LOG(INFO) << "LazyLog global sequencer listening on " << sequencer_address
+            << " selected_port=" << selected_port
+            << " expected_brokers=" << expected_brokers_;
+}
+
+void LazyLogGlobalSequencer::Run() {
+  if (!server_) {
+    LOG(ERROR) << "LazyLog global sequencer failed to start";
+    return;
+  }
+  server_->Wait();
+}
+
+grpc::Status LazyLogGlobalSequencer::HandleRegisterBroker(
+    grpc::ServerContext* /*context*/,
+    const lazylogsequencer::RegisterBrokerRequest* request,
+    lazylogsequencer::RegisterBrokerResponse* /*response*/) {
+  const int broker_id = static_cast<int>(request->broker_id());
+  if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS_CONFIG) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "broker_id out of range");
+  }
+  absl::WriterMutexLock lock(&registered_brokers_mu_);
+  registered_brokers_.insert(broker_id);
+  LOG(INFO) << "LazyLog sequencer registered broker=" << broker_id
+            << " total_registered=" << registered_brokers_.size()
+            << "/" << expected_brokers_;
+  if (registered_brokers_.size() >= expected_brokers_ && !binding_thread_.joinable()) {
+    binding_thread_ = std::thread(&LazyLogGlobalSequencer::SendGlobalBinding, this);
+  }
+  return grpc::Status::OK;
+}
+
+grpc::Status LazyLogGlobalSequencer::HandleTerminateGlobalSequencer(
+    grpc::ServerContext* /*context*/,
+    const lazylogsequencer::TerminateGlobalSequencerRequest* /*request*/,
+    lazylogsequencer::TerminateGlobalSequencerResponse* /*response*/) {
+  LOG(INFO) << "LazyLog global sequencer terminating";
+  stop_reading_streams_.store(true, std::memory_order_release);
+  shutdown_requested_.store(true, std::memory_order_release);
+  if (binding_thread_.joinable()) {
+    binding_thread_.join();
+  }
+  std::thread([this]() {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    server_->Shutdown();
+  }).detach();
+  return grpc::Status::OK;
+}
+
+grpc::Status LazyLogGlobalSequencer::HandleSendLocalProgress(
+    grpc::ServerContext* /*context*/,
+    grpc::ServerReaderWriter<lazylogsequencer::GlobalBinding, lazylogsequencer::LocalProgress>* stream) {
+  {
+    absl::MutexLock lock(&stream_mu_);
+    local_streams_.push_back(stream);
+  }
+  ReceiveLocalProgress(stream);
+  {
+    // Remove closed stream to avoid writing into stale/dangling pointers.
+    absl::MutexLock lock(&stream_mu_);
+    local_streams_.erase(
+        std::remove(local_streams_.begin(), local_streams_.end(), stream),
+        local_streams_.end());
+  }
+  return grpc::Status::OK;
+}
+
+void LazyLogGlobalSequencer::ReceiveLocalProgress(
+    grpc::ServerReaderWriter<lazylogsequencer::GlobalBinding, lazylogsequencer::LocalProgress>* stream) {
+  while (!stop_reading_streams_.load(std::memory_order_acquire)) {
+    lazylogsequencer::LocalProgress progress;
+    if (!stream->Read(&progress)) {
+      break;
+    }
+    const int broker_id = static_cast<int>(progress.broker_id());
+    if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS_CONFIG) {
+      LOG(WARNING) << "Ignoring local progress with invalid broker_id=" << broker_id;
+      continue;
+    }
+    const int64_t current = progress.local_progress();
+    absl::WriterMutexLock lock(&progress_mu_);
+    const int64_t previous = last_progress_[broker_id];
+    if (current < previous) {
+      continue;
+    }
+    pending_binding_[broker_id] += (current - previous);
+    last_progress_[broker_id] = current;
+  }
+}
+
+void LazyLogGlobalSequencer::SendGlobalBinding() {
+  while (!shutdown_requested_.load(std::memory_order_acquire)) {
+    lazylogsequencer::GlobalBinding binding;
+    {
+      absl::WriterMutexLock lock(&progress_mu_);
+      for (const auto& entry : pending_binding_) {
+        if (entry.second > 0) {
+          binding.mutable_global_binding()->insert({entry.first, entry.second});
+        }
+      }
+      pending_binding_.clear();
+    }
+
+    if (!binding.global_binding().empty()) {
+      absl::MutexLock lock(&stream_mu_);
+      for (auto* stream : local_streams_) {
+        if (stream) {
+          stream->Write(binding);
+        }
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(LAZYLOG_SEQ_LOCAL_CUT_INTERVAL));
+  }
+}
+
+int main(int argc, char* argv[]) {
+  google::InitGoogleLogging(argv[0]);
+  const char* sequencer_ip_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_IP");
+  const char* sequencer_port_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_PORT");
+  const std::string sequencer_ip =
+      (sequencer_ip_env && std::strlen(sequencer_ip_env) > 0) ? sequencer_ip_env : LAZYLOG_SEQUENCER_IP;
+  int sequencer_port = LAZYLOG_SEQ_PORT;
+  if (sequencer_port_env && std::strlen(sequencer_port_env) > 0) {
+    try {
+      sequencer_port = std::stoi(sequencer_port_env);
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Invalid EMBARCADERO_LAZYLOG_SEQ_PORT='" << sequencer_port_env
+                   << "', falling back to " << LAZYLOG_SEQ_PORT;
+    }
+  }
+  std::string sequencer_addr = sequencer_ip + ":" + std::to_string(sequencer_port);
+  LazyLogGlobalSequencer sequencer(sequencer_addr);
+  sequencer.Run();
+  return 0;
+}

@@ -140,7 +140,11 @@ namespace Scalog {
 		// --- End Write Task ---
 
 		public:
-		explicit ScalogReplicationServiceImpl(std::string base_filename, int broker_id)
+		explicit ScalogReplicationServiceImpl(
+				std::string base_filename,
+				int broker_id,
+				std::string sequencer_ip,
+				int sequencer_port)
 			: base_filename_(std::move(base_filename)),
 			broker_id_(broker_id),
 			running_(true),
@@ -159,7 +163,7 @@ namespace Scalog {
 			local_cut_tracker_ = std::make_unique<LocalCutTracker>();
 
 			// Setup gRPC channel to sequencer (error handling recommended)
-			std::string scalog_seq_address = std::string(SCALOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
+			std::string scalog_seq_address = sequencer_ip + ":" + std::to_string(sequencer_port);
 			std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 			stub_ = ScalogSequencer::NewStub(channel); // Assuming this is the correct Stub type
 
@@ -964,7 +968,9 @@ namespace Scalog {
 			bool log_to_memory,
 			const std::string& address,
 			const std::string& port,
-			const std::string& log_file) {
+			const std::string& log_file,
+			const std::string& sequencer_ip,
+			int sequencer_port) {
 		try {
 			int disk_to_write = broker_id % NUM_DISKS ;
 			std::string base_dir = "../../.Replication/disk" + std::to_string(disk_to_write) + "/";
@@ -973,7 +979,12 @@ namespace Scalog {
 			}
 			std::string base_filename = log_file.empty() ? base_dir+"scalog_replication_log"+std::to_string(broker_id) +".dat" : log_file;
 			base_dir_ = base_dir;
-			service_ = std::make_unique<ScalogReplicationServiceImpl>(base_filename, broker_id);
+			const std::string effective_sequencer_ip =
+				sequencer_ip.empty() ? std::string(SCALOG_SEQUENCER_IP) : sequencer_ip;
+			const int effective_sequencer_port =
+				(sequencer_port == 0) ? SCALOG_SEQ_PORT : sequencer_port;
+			service_ = std::make_unique<ScalogReplicationServiceImpl>(
+				base_filename, broker_id, effective_sequencer_ip, effective_sequencer_port);
 
 			std::string server_address = address + ":" + (port.empty() ? std::to_string(SCALOG_REP_PORT) : port);
 
