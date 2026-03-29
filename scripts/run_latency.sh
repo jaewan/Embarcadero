@@ -269,36 +269,47 @@ start_local_brokers() {
     sleep "$BROKER_READY_PROPAGATION_SEC"
   fi
   if [[ "$seq" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+    local precreate_attempt precreate_max_attempts precreate_retry_sleep_sec
+    precreate_max_attempts="${SCALOG_PRECREATE_ATTEMPTS:-3}"
+    precreate_retry_sleep_sec="${SCALOG_PRECREATE_RETRY_SLEEP_SEC:-3}"
+    for (( precreate_attempt=1; precreate_attempt<=precreate_max_attempts; precreate_attempt++ )); do
+      echo "Precreating Scalog topic metadata (attempt ${precreate_attempt}/${precreate_max_attempts})..."
+      (
+        cd "$BIN_DIR"
+        EMBARCADERO_RUNTIME_MODE=throughput \
+        EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-}" \
+        EMBARCADERO_SCALOG_SEQ_PORT="${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
+        SCALOG_CXL_MODE="${SCALOG_CXL_MODE:-1}" \
+        ./throughput_test \
+          --config "$CLIENT_CONFIG_ABS" \
+          --head_addr "$reachability_ip" \
+          -n "$NUM_BROKERS" \
+          -m "$MSG_SIZE" \
+          -s 0 \
+          -t 5 \
+          -o "$order" \
+          -a "$ACK_LEVEL" \
+          -r "$REPLICATION_FACTOR" \
+          --sequencer "$seq" \
+          -l 0 \
+          >/tmp/scalog_topic_precreate.log 2>&1
+      ) && break
+
+      if [[ "$precreate_attempt" -lt "$precreate_max_attempts" ]]; then
+        echo "Scalog topic precreation attempt ${precreate_attempt} failed; retrying after ${precreate_retry_sleep_sec}s..." >&2
+        sleep "$precreate_retry_sleep_sec"
+        continue
+      fi
+
+      echo "ERROR: Scalog topic precreation failed" >&2
+      cat /tmp/scalog_topic_precreate.log >&2 || true
+      return 1
+    done
     echo "Waiting for remote Scalog sequencer readiness..."
     if ! broker_wait_for_remote_scalog_ready "${SCALOG_READY_TIMEOUT_SEC:-30}" "$NUM_BROKERS" "$REPLICATION_FACTOR"; then
       echo "ERROR: remote Scalog sequencer did not reach full readiness" >&2
       return 1
     fi
-    echo "Precreating Scalog topic metadata..."
-    (
-      cd "$BIN_DIR"
-      EMBARCADERO_RUNTIME_MODE=throughput \
-      EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-}" \
-      EMBARCADERO_SCALOG_SEQ_PORT="${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
-      SCALOG_CXL_MODE="${SCALOG_CXL_MODE:-1}" \
-      ./throughput_test \
-        --config "$CLIENT_CONFIG_ABS" \
-        --head_addr "$reachability_ip" \
-        -n "$NUM_BROKERS" \
-        -m "$MSG_SIZE" \
-        -s 0 \
-        -t 5 \
-        -o "$order" \
-        -a "$ACK_LEVEL" \
-        -r "$REPLICATION_FACTOR" \
-        --sequencer "$seq" \
-        -l 0 \
-        >/tmp/scalog_topic_precreate.log 2>&1
-    ) || {
-      echo "ERROR: Scalog topic precreation failed" >&2
-      cat /tmp/scalog_topic_precreate.log >&2 || true
-      return 1
-    }
   fi
   echo "All $NUM_BROKERS brokers ready and reachable."
 }
