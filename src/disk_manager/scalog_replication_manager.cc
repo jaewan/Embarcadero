@@ -1,5 +1,6 @@
 #include "scalog_replication_manager.h"
 #include "../cxl_manager/cxl_datastructure.h"
+#include "../common/performance_utils.h"
 #include "scalog_replication.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>
@@ -126,6 +127,8 @@ namespace Scalog {
 			int64_t num_msg;
 			std::string data; // Store data by value
 
+			WriteTask() : offset(0), size(0), num_msg(0) {}
+
 			// Constructor to copy from request
 			explicit WriteTask(const ScalogReplicationRequest& req) :
 				offset(req.offset()),
@@ -145,7 +148,7 @@ namespace Scalog {
 			fd_(-1), // Initialize fd_
 			write_queue_(10240), // Queue size
 			local_epoch_(0),
-			replica_id_(1) // Example replica ID
+			replica_id_(1)
 		{
 			local_cut_interval_ = std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL);
 
@@ -156,7 +159,7 @@ namespace Scalog {
 			local_cut_tracker_ = std::make_unique<LocalCutTracker>();
 
 			// Setup gRPC channel to sequencer (error handling recommended)
-			std::string scalog_seq_address = std::string(SCLAOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
+			std::string scalog_seq_address = std::string(SCALOG_SEQUENCER_IP) + ":" + std::to_string(SCALOG_SEQ_PORT);
 			std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 			stub_ = ScalogSequencer::NewStub(channel); // Assuming this is the correct Stub type
 
@@ -236,6 +239,23 @@ namespace Scalog {
 				}
 				VLOG(1) << "SendLocalCut thread joined.";
 
+				if (cxl_polling_thread_.joinable()) {
+					cxl_polling_thread_.join();
+				}
+
+				for (auto& task : replica_polling_tasks_) {
+					if (task->polling_thread.joinable()) {
+						task->polling_thread.join();
+					}
+					if (task->cut_thread.joinable()) {
+						task->cut_thread.join();
+					}
+					if (task->fd != -1) {
+						close(task->fd);
+						task->fd = -1;
+					}
+				}
+
 			} else {
 				VLOG(1) << "Shutdown already initiated.";
 			}
@@ -270,6 +290,41 @@ namespace Scalog {
 			// 5. Return success immediately
 			response->set_success(true);
 			return Status::OK;
+		}
+
+		public:
+		void SetCXLInfo(void* cxl_addr, TInode* tinode) {
+			cxl_addr_ = cxl_addr;
+			tinode_ = tinode;
+		}
+
+		void StartCXLPollingThread() {
+			if (!cxl_polling_thread_.joinable()) {
+				cxl_polling_thread_ = std::thread(&ScalogReplicationServiceImpl::CXLPollingLoop, this);
+			}
+		}
+
+		void StartReplicaPollingForPrimary(int primary_broker_id, int replica_index, const std::string& file_path) {
+			if (!cxl_addr_ || !tinode_) {
+				LOG(ERROR) << "StartReplicaPollingForPrimary: CXL info not set";
+				return;
+			}
+			int fd = open(file_path.c_str(), O_WRONLY | O_CREAT, 0644);
+			if (fd == -1) {
+				LOG(ERROR) << "StartReplicaPollingForPrimary: failed to open " << file_path
+				           << ": " << strerror(errno);
+				return;
+			}
+			auto task = std::make_unique<ReplicaPollingTask>();
+			task->primary_broker_id = primary_broker_id;
+			task->fd = fd;
+			task->polling_thread = std::thread(
+				&ScalogReplicationServiceImpl::ReplicaPollingLoop, this,
+				primary_broker_id, fd, std::ref(task->persisted_count));
+			task->cut_thread = std::thread(
+				&ScalogReplicationServiceImpl::SendReplicaCut, this,
+				primary_broker_id, replica_index, std::ref(task->persisted_count));
+			replica_polling_tasks_.push_back(std::move(task));
 		}
 
 		private:
@@ -638,6 +693,214 @@ namespace Scalog {
 			// Release unique lock automatically at scope end
 		}
 
+		void UpdateReplicationDone(int target_broker_id, int source_broker_id, int64_t persisted_count) {
+			if (!tinode_ || persisted_count <= 0) {
+				return;
+			}
+			const uint64_t last_offset = static_cast<uint64_t>(persisted_count - 1);
+			tinode_->offsets[target_broker_id].replication_done[source_broker_id] = last_offset;
+			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(
+					&tinode_->offsets[target_broker_id].replication_done[source_broker_id])));
+			Embarcadero::CXL::store_fence();
+		}
+
+		void CXLPollingLoop() {
+			if (!cxl_addr_ || !tinode_) {
+				LOG(ERROR) << "CXLPollingLoop: cxl_addr or tinode not set";
+				return;
+			}
+
+			size_t last_cxl_offset = tinode_->offsets[broker_id_].log_offset;
+			size_t rep_offset = 0;
+			int64_t persisted_count = 0;
+
+			while (running_.load()) {
+				size_t validated = tinode_->offsets[broker_id_].validated_written_byte_offset;
+				if (validated <= last_cxl_offset) {
+					Embarcadero::CXL::cpu_pause();
+					continue;
+				}
+
+				uint8_t* src = reinterpret_cast<uint8_t*>(cxl_addr_) + last_cxl_offset;
+				size_t chunk_size = validated - last_cxl_offset;
+				// Help this core see delegation-thread writes before parsing headers (CXL / weak ordering).
+				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(src)));
+				Embarcadero::CXL::load_fence();
+
+				int64_t msg_count = 0;
+				uint8_t* ptr = src;
+				for (; ptr < src + chunk_size; ) {
+					auto* hdr = reinterpret_cast<Embarcadero::MessageHeader*>(ptr);
+					if (hdr->paddedSize == 0 || hdr->next_msg_diff == 0) {
+						break;
+					}
+					if (hdr->next_msg_diff > chunk_size - static_cast<size_t>(ptr - src)) {
+						break;
+					}
+					++msg_count;
+					ptr += hdr->next_msg_diff;
+				}
+				const size_t complete_bytes = static_cast<size_t>(ptr - src);
+				// Do not advance past a partially visible tail: jumping to `validated` without counting
+				// messages stalls replication_done / local cuts and leaves ACK=1 ordered short of published.
+				if (complete_bytes == 0) {
+					Embarcadero::CXL::cpu_pause();
+					continue;
+				}
+
+				{
+					std::shared_lock<std::shared_mutex> lock(file_state_mutex_);
+					if (fd_ != -1) {
+						ssize_t written = pwrite(fd_, src, complete_bytes, static_cast<off_t>(rep_offset));
+						if (written < 0 || static_cast<size_t>(written) != complete_bytes) {
+							LOG(ERROR) << "CXLPollingLoop: pwrite failed: " << strerror(errno);
+							break;
+						}
+					}
+				}
+				local_cut_tracker_->recordWrite(rep_offset, complete_bytes, msg_count);
+				persisted_count += msg_count;
+				UpdateReplicationDone(broker_id_, broker_id_, persisted_count);
+				static auto last_log_time = std::chrono::steady_clock::now();
+				const auto now = std::chrono::steady_clock::now();
+				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 2000) {
+					LOG(INFO) << "Scalog CXL primary poll broker=" << broker_id_
+					          << " validated=" << validated
+					          << " rep_offset=" << rep_offset
+					          << " chunk_size=" << chunk_size
+					          << " complete_bytes=" << complete_bytes
+					          << " msg_count=" << msg_count
+					          << " persisted_count=" << persisted_count;
+					last_log_time = now;
+				}
+
+				last_cxl_offset += complete_bytes;
+				rep_offset += complete_bytes;
+			}
+		}
+
+		void ReplicaPollingLoop(int primary_broker_id, int fd, std::atomic<int64_t>& persisted_count) {
+			if (!cxl_addr_ || !tinode_) {
+				LOG(ERROR) << "ReplicaPollingLoop: cxl_addr or tinode not set";
+				return;
+			}
+
+			// Wait for the primary broker to initialize its log_offset.
+			// On startup, the replica loop may be launched before the primary broker has
+			// joined the cluster and written its TInode offsets. log_offset == 0 means
+			// "not yet initialized" (real offsets are always > 0 due to CXL layout).
+			size_t primary_log_offset = 0;
+			while (running_.load()) {
+				primary_log_offset = tinode_->offsets[primary_broker_id].log_offset;
+				if (primary_log_offset != 0) break;
+				Embarcadero::CXL::cpu_pause();
+			}
+			if (!running_.load()) return;
+			LOG(INFO) << "ReplicaPollingLoop[" << primary_broker_id << "]: primary log_offset="
+			          << primary_log_offset << ", starting replica polling";
+
+			size_t last_cxl_offset = primary_log_offset;
+			size_t rep_offset = 0;
+			int64_t local_count = 0;
+
+			while (running_.load()) {
+				size_t validated = tinode_->offsets[primary_broker_id].validated_written_byte_offset;
+				if (validated <= last_cxl_offset) {
+					Embarcadero::CXL::cpu_pause();
+					continue;
+				}
+				uint8_t* src = reinterpret_cast<uint8_t*>(cxl_addr_) + last_cxl_offset;
+				size_t chunk_size = validated - last_cxl_offset;
+				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(src)));
+				Embarcadero::CXL::load_fence();
+
+				int64_t msg_count = 0;
+				uint8_t* ptr = src;
+				for (; ptr < src + chunk_size; ) {
+					auto* hdr = reinterpret_cast<Embarcadero::MessageHeader*>(ptr);
+					if (hdr->paddedSize == 0 || hdr->next_msg_diff == 0) {
+						break;
+					}
+					if (hdr->next_msg_diff > chunk_size - static_cast<size_t>(ptr - src)) {
+						break;
+					}
+					++msg_count;
+					ptr += hdr->next_msg_diff;
+				}
+				const size_t complete_bytes = static_cast<size_t>(ptr - src);
+				if (complete_bytes == 0) {
+					Embarcadero::CXL::cpu_pause();
+					continue;
+				}
+
+				ssize_t written = pwrite(fd, src, complete_bytes, static_cast<off_t>(rep_offset));
+				if (written < 0 || static_cast<size_t>(written) != complete_bytes) {
+					LOG(ERROR) << "ReplicaPollingLoop[" << primary_broker_id << "]: pwrite failed: "
+					           << strerror(errno);
+					break;
+				}
+
+				rep_offset += complete_bytes;
+				local_count += msg_count;
+				persisted_count.store(local_count, std::memory_order_release);
+				UpdateReplicationDone(broker_id_, primary_broker_id, local_count);
+				static thread_local auto last_log_time = std::chrono::steady_clock::now();
+				const auto now = std::chrono::steady_clock::now();
+				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 2000) {
+					LOG(INFO) << "Scalog CXL replica poll local_broker=" << broker_id_
+					          << " primary_broker=" << primary_broker_id
+					          << " validated=" << validated
+					          << " rep_offset=" << rep_offset
+					          << " chunk_size=" << chunk_size
+					          << " complete_bytes=" << complete_bytes
+					          << " msg_count=" << msg_count
+					          << " persisted_count=" << local_count;
+					last_log_time = now;
+				}
+				last_cxl_offset += complete_bytes;
+			}
+		}
+
+		void SendReplicaCut(int primary_broker_id, int replica_index, std::atomic<int64_t>& persisted_count) {
+			int replica_id = 1 + replica_index;
+			grpc::ClientContext context;
+			auto stream = stub_->HandleSendLocalCut(&context);
+			if (!stream) {
+				LOG(ERROR) << "SendReplicaCut[" << primary_broker_id << "]: failed to create stream";
+				return;
+			}
+
+			std::thread drainer([&stream]() {
+				GlobalCut gc;
+				while (stream->Read(&gc)) {}
+			});
+
+			int64_t local_epoch = 0;
+			while (running_.load()) {
+				LocalCut request;
+				request.set_broker_id(primary_broker_id);
+				request.set_replica_id(replica_id);
+				request.set_local_cut(persisted_count.load(std::memory_order_acquire));
+				request.set_epoch(local_epoch++);
+				request.set_topic("");
+				if (!stream->Write(request)) {
+					break;
+				}
+				if ((local_epoch % 1000) == 0) {
+					LOG(INFO) << "Scalog replica cut primary_broker=" << primary_broker_id
+					          << " replica_id=" << replica_id
+					          << " local_cut=" << request.local_cut()
+					          << " epoch=" << local_epoch;
+				}
+				std::this_thread::sleep_for(local_cut_interval_);
+			}
+			stream->WritesDone();
+			if (drainer.joinable()) {
+				drainer.join();
+			}
+		}
+
 
 		// --- Helper to create error response (Use simplified version) ---
 		Status CreateErrorResponse(ScalogReplicationResponse* response,
@@ -682,8 +945,17 @@ namespace Scalog {
 		// State for ScalogSequencer
 		std::atomic<size_t> next_global_sequence_number_{0}; // Start at 0
 		std::atomic<off_t> next_sequencing_disk_offset_{0}; // Start at 0
-																												// TODO: These atomics might need stronger ordering or locking if accessed/updated
-																												// from multiple places concurrently, but likely okay if only updated by ReceiveGlobalCut thread.
+		void* cxl_addr_ = nullptr;
+		TInode* tinode_ = nullptr;
+		std::thread cxl_polling_thread_;
+		struct ReplicaPollingTask {
+			int primary_broker_id = -1;
+			int fd = -1;
+			std::atomic<int64_t> persisted_count{0};
+			std::thread polling_thread;
+			std::thread cut_thread;
+		};
+		std::vector<std::unique_ptr<ReplicaPollingTask>> replica_polling_tasks_;
 
 	}; // End class ScalogReplicationServiceImpl
 
@@ -700,6 +972,7 @@ namespace Scalog {
 				base_dir = "/tmp/";
 			}
 			std::string base_filename = log_file.empty() ? base_dir+"scalog_replication_log"+std::to_string(broker_id) +".dat" : log_file;
+			base_dir_ = base_dir;
 			service_ = std::make_unique<ScalogReplicationServiceImpl>(base_filename, broker_id);
 
 			std::string server_address = address + ":" + (port.empty() ? std::to_string(SCALOG_REP_PORT) : port);
@@ -743,6 +1016,19 @@ namespace Scalog {
 
 	void ScalogReplicationManager::StartSendLocalCut() {
 		service_->StartSendLocalCutThread();
+	}
+
+	void ScalogReplicationManager::StartCXLReplication(void* cxl_addr, TInode* tinode) {
+		service_->SetCXLInfo(cxl_addr, tinode);
+		service_->StartCXLPollingThread();
+	}
+
+	void ScalogReplicationManager::StartReplicaPollingThread(
+			void* cxl_addr, TInode* tinode, int primary_broker_id, int replica_index) {
+		service_->SetCXLInfo(cxl_addr, tinode);
+		std::string file_path = base_dir_ + "scalog_replication_log" + std::to_string(primary_broker_id)
+			+ "_replica" + std::to_string(replica_index) + ".dat";
+		service_->StartReplicaPollingForPrimary(primary_broker_id, replica_index, file_path);
 	}
 
 	void ScalogReplicationManager::Wait() {

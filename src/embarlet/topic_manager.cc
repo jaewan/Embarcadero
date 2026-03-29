@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 #include "common/performance_utils.h"
 #include "common/order_level.h"
 #include <immintrin.h>
@@ -14,6 +15,7 @@
 namespace Embarcadero {
 
 constexpr size_t NT_THRESHOLD = 256; // [[P5_FIX]] Lower threshold for CXL - non-temporal stores bypass cache, better for write-once log data
+constexpr uint64_t kReplicationNotStarted = std::numeric_limits<uint64_t>::max();
 
 /** 32 bytes = one AVX2 vector; two per 64-byte cache line. */
 static constexpr size_t AVX2_VECTOR_SIZE = 32;
@@ -125,6 +127,7 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	// Start from 0 instead of -1 to allow initial acknowledgments
 	tinode->offsets[broker_id_].ordered = 0;
 	tinode->offsets[broker_id_].written = 0;
+	tinode->offsets[broker_id_].validated_written_byte_offset = 0;
 	for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
 		tinode->offsets[broker_id_].replication_done[i] = 0;
 	}
@@ -265,7 +268,34 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		// Run sequencer if needed
 		if (tinode->seq_type == SCALOG) {
 			if (replication_factor > 0) {
-				disk_manager_.StartScalogReplicaLocalSequencer();
+				static const bool kCxlScalogMode =
+					(getenv("SCALOG_CXL_MODE") != nullptr &&
+					 std::string(getenv("SCALOG_CXL_MODE")) == "1");
+				if (kCxlScalogMode) {
+					for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+						// "Replica not started yet" must be distinct from durable progress.
+						// ACK/quorum paths treat this sentinel as not-ready (not ACK-visible).
+						tinode->offsets[broker_id_].replication_done[i] = kReplicationNotStarted;
+					}
+					tinode->offsets[broker_id_].validated_written_byte_offset =
+						tinode->offsets[broker_id_].log_offset;
+					CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(
+						&tinode->offsets[broker_id_].replication_done[0])));
+					CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(
+						&tinode->offsets[broker_id_].validated_written_byte_offset)));
+					CXL::store_fence();
+					disk_manager_.StartScalogCXLReplication(tinode);
+					int num_brokers = get_num_brokers_callback_ ? get_num_brokers_callback_() : NUM_MAX_BROKERS_CONFIG;
+					if (num_brokers <= 0) {
+						num_brokers = NUM_MAX_BROKERS_CONFIG;
+					}
+					for (int i = 1; i < replication_factor; i++) {
+						int primary_id = (broker_id_ - i + num_brokers) % num_brokers;
+						disk_manager_.StartScalogCXLReplicaPolling(tinode, primary_id, i - 1);
+					}
+				} else {
+					disk_manager_.StartScalogReplicaLocalSequencer();
+				}
 			}
 		}
 	}
@@ -425,7 +455,34 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 	// Run sequencer if needed
 	if (tinode->seq_type == SCALOG) {
 		if (replication_factor > 0) {
-			disk_manager_.StartScalogReplicaLocalSequencer();
+			static const bool kCxlScalogMode =
+				(getenv("SCALOG_CXL_MODE") != nullptr &&
+				 std::string(getenv("SCALOG_CXL_MODE")) == "1");
+			if (kCxlScalogMode) {
+				for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+					// "Replica not started yet" must be distinct from durable progress.
+					// ACK/quorum paths treat this sentinel as not-ready (not ACK-visible).
+					tinode->offsets[broker_id_].replication_done[i] = kReplicationNotStarted;
+				}
+				tinode->offsets[broker_id_].validated_written_byte_offset =
+					tinode->offsets[broker_id_].log_offset;
+				CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(
+					&tinode->offsets[broker_id_].replication_done[0])));
+				CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(
+					&tinode->offsets[broker_id_].validated_written_byte_offset)));
+				CXL::store_fence();
+				disk_manager_.StartScalogCXLReplication(tinode);
+				int num_brokers = get_num_brokers_callback_ ? get_num_brokers_callback_() : NUM_MAX_BROKERS_CONFIG;
+				if (num_brokers <= 0) {
+					num_brokers = NUM_MAX_BROKERS_CONFIG;
+				}
+				for (int i = 1; i < replication_factor; i++) {
+					int primary_id = (broker_id_ - i + num_brokers) % num_brokers;
+					disk_manager_.StartScalogCXLReplicaPolling(tinode, primary_id, i - 1);
+				}
+			} else {
+				disk_manager_.StartScalogReplicaLocalSequencer();
+			}
 		}
 	}
 

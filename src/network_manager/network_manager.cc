@@ -35,6 +35,8 @@
 
 namespace Embarcadero {
 
+constexpr size_t kReplicationNotStarted = std::numeric_limits<size_t>::max();
+
 //----------------------------------------------------------------------------
 // Utility Functions
 //----------------------------------------------------------------------------
@@ -1645,12 +1647,17 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 			}
 		} else {
 			size_t min_val = std::numeric_limits<size_t>::max();
+			int ready_replicas = 0;
 			for (int i = 0; i < replication_factor; i++) {
 				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
 				size_t val = tinode->offsets[b].replication_done[broker_id_];
+				if (val == kReplicationNotStarted) {
+					continue;
+				}
+				ready_replicas++;
 				if (min_val > val) min_val = val;
 			}
-			if (min_val != std::numeric_limits<size_t>::max()) {
+			if (ready_replicas == replication_factor && min_val != kReplicationNotStarted) {
 				fast_read_value = min_val + 1;  // replication_done is last offset; ACK expects count
 			}
 		}
@@ -1679,12 +1686,19 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 		} else {
 			// Fallback: replication_done
 			size_t min_val = std::numeric_limits<size_t>::max();
+			int ready_replicas = 0;
 			for (int i = 0; i < replication_factor; i++) {
 				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
 				size_t val = tinode->offsets[b].replication_done[broker_id_];
+				if (val == kReplicationNotStarted) {
+					continue;
+				}
+				ready_replicas++;
 				if (min_val > val) min_val = val;
 			}
-			fast_read_value = min_val;
+			if (ready_replicas == replication_factor && min_val != kReplicationNotStarted) {
+				fast_read_value = min_val;
+			}
 		}
 	} else {
 		// No replication
@@ -1806,6 +1820,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		// contiguous export). Ensure client/server agree on units if both ACK levels are used with RF>0.
 
 		// Legacy non-ORDER5 replication frontier path.
+		int ready_replicas = 0;
 		for (int i = 0; i < replication_factor; i++) {
 			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
 			volatile uint64_t* rep_done_ptr = &tinode->offsets[b].replication_done[broker_id_];
@@ -1813,9 +1828,13 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 				reinterpret_cast<const volatile void*>(rep_done_ptr)));
 			CXL::full_fence();
 			const size_t val = *rep_done_ptr;
+			if (val == kReplicationNotStarted) {
+				continue;
+			}
+			ready_replicas++;
 			if (min > val) min = val;
 		}
-		if (min == std::numeric_limits<size_t>::max()) {
+		if (ready_replicas < replication_factor || min == kReplicationNotStarted) {
 			return (size_t)-1;
 		}
 		return min + 1;  // Convert last offset to message count
@@ -1863,6 +1882,9 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		for (int i = 0; i < replication_factor; i++) {
 			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
 			const size_t val = tinode->offsets[b].replication_done[broker_id_];
+			if (val == kReplicationNotStarted) {
+				return static_cast<size_t>(-1);
+			}
 			if (min > val) {
 				min = val;
 			}

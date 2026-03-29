@@ -1,9 +1,12 @@
 #include "message_export.h"
 #include <glog/logging.h>
+#include <limits>
 #include <thread>
 #include "../common/performance_utils.h"
 
 namespace Embarcadero {
+
+constexpr size_t kReplicationNotStarted = std::numeric_limits<size_t>::max();
 
 MessageExport::MessageExport(void* cxl_addr,
                            void* first_message_addr,
@@ -58,19 +61,24 @@ bool MessageExport::GetMessageAddr(size_t& last_offset,
                 int num_brokers = NUM_MAX_BROKERS;
                 size_t r[replication_factor_];
                 size_t min = static_cast<size_t>(-1);
+                int ready_replicas = 0;
                 for (int i = 0; i < replication_factor_; i++) {
                     int b = GetReplicationSetBroker(broker_id_, replication_factor_, num_brokers, i);
                     volatile uint64_t* rep_done_ptr = &tinode_->offsets[b].replication_done[broker_id_];
                     CXL::flush_cacheline(const_cast<const void*>(
                         reinterpret_cast<const volatile void*>(rep_done_ptr)));
                     r[i] = *rep_done_ptr;
+                    if (r[i] == kReplicationNotStarted) {
+                        continue;
+                    }
+                    ready_replicas++;
                     if (min > r[i]) {
                         min = r[i];
                     }
                 }
                 CXL::load_fence();
 
-                if (min == static_cast<size_t>(-1)) {
+                if (ready_replicas < replication_factor_ || min == kReplicationNotStarted) {
                     return false;
                 }
                 if (combined_offset != min) {

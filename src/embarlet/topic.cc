@@ -11,12 +11,15 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <unordered_map>
 
 
 namespace Embarcadero {
+
+constexpr size_t kReplicationNotStarted = std::numeric_limits<size_t>::max();
 
 static inline uint64_t SteadyNowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -335,8 +338,8 @@ void Topic::Start() {
 				delegationThreads_.emplace_back(&Topic::DelegationThread, this);
 		}
 
-	// Head node runs sequencer
-	if(broker_id_ == 0){
+	// Head node runs centralized sequencers; Scalog local sequencers run on every broker.
+	if (broker_id_ == 0 || seq_type_ == SCALOG) {
 		LOG(INFO) << "Topic Start: broker_id=" << broker_id_ << ", order=" << order_ << ", seq_type=" << seq_type_;
 		switch(seq_type_){
 			case KAFKA: // Kafka is just a way to not run DelegationThread, not actual sequencer
@@ -486,10 +489,15 @@ void Topic::DelegationThread() {
 					}
 
 					if (order_ != 0) {
+						size_t written_val = (seq_type_ == SCALOG) ? logical_offset_ : logical_offset_ - 1;
 						UpdateTInodeWritten(
-							logical_offset_ - 1,
+							written_val,
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
+						if (seq_type_ == SCALOG) {
+							tinode_->offsets[broker_id_].validated_written_byte_offset =
+								current_batch->log_idx + current_batch->total_size;
+						}
 					}
 				} else {
 					BlogMessageHeader* batch_first_msg = reinterpret_cast<BlogMessageHeader*>(
@@ -534,10 +542,15 @@ void Topic::DelegationThread() {
 					}
 
 					if (order_ != 0) {
+						size_t written_val = (seq_type_ == SCALOG) ? logical_offset_ : logical_offset_ - 1;
 						UpdateTInodeWritten(
-							logical_offset_ - 1,
+							written_val,
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
+						if (seq_type_ == SCALOG) {
+							tinode_->offsets[broker_id_].validated_written_byte_offset =
+								current_batch->log_idx + current_batch->total_size;
+						}
 					}
 				}
 			}
@@ -1404,10 +1417,20 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
         BatchHeader* &batch_header_location,
         bool /*epoch_already_checked*/) {
 
-    // Set batch header location to nullptr (not used by Scalog sequencer)
-    batch_header_location = nullptr;
+    static const bool kCxlScalogMode =
+        (getenv("SCALOG_CXL_MODE") != nullptr &&
+         std::string(getenv("SCALOG_CXL_MODE")) == "1");
 
-    batch_header.log_idx = scalog_batch_offset_.fetch_add(batch_header.total_size);
+    uint64_t pbr_idx = broker_pbr_counters_[broker_id_].fetch_add(1, std::memory_order_relaxed);
+    batch_header.pbr_absolute_index = pbr_idx;
+    batch_header.batch_id = (static_cast<uint64_t>(broker_id_) << 48) | pbr_idx;
+
+    BatchHeader* batch_header_ring = reinterpret_cast<BatchHeader*>(
+        reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+    size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
+    size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
+    batch_header_location = &batch_header_ring[slot_idx];
+    __atomic_store_n(&batch_header_location->batch_complete, 0, __ATOMIC_RELEASE);
 
 	// Calculate addresses
 	const unsigned long long int segment_metadata =
@@ -1416,16 +1439,25 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 
 	// Allocate space in log
 	log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
+    batch_header.log_idx = reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_);
 
 	// Check for segment boundary
 	CheckSegmentBoundary(log, msg_size, segment_metadata);
 
+    size_t rep_offset = 0;
+    if (!kCxlScalogMode) {
+        rep_offset = scalog_batch_offset_.fetch_add(batch_header.total_size, std::memory_order_relaxed);
+    }
+
 	// Return replication callback
-	return [this, batch_header, log](void* log_ptr, size_t /*placeholder*/) {
+	return [this, batch_header, log, rep_offset, kCxlScalogMode](void* log_ptr, size_t /*placeholder*/) {
+		if (kCxlScalogMode) {
+			return;
+		}
 		// Handle replication if needed
 		if (replication_factor_ > 0 && scalog_replication_client_) {
 				scalog_replication_client_->ReplicateData(
-						batch_header.log_idx,
+						rep_offset,
 						batch_header.total_size,
 						batch_header.num_msg,
 						log
@@ -2745,19 +2777,24 @@ bool Topic::GetMessageAddr(
 				int num_brokers = get_num_brokers_callback_();
 				size_t r[replication_factor_];
 				size_t min = (size_t)-1;
+				int ready_replicas = 0;
 				for (int i = 0; i < replication_factor_; i++) {
 					int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor_, num_brokers, i);
 					volatile uint64_t* rep_done_ptr = &tinode_->offsets[b].replication_done[broker_id_];
 					CXL::flush_cacheline(const_cast<const void*>(
 						reinterpret_cast<const volatile void*>(rep_done_ptr)));
 					r[i] = *rep_done_ptr;
+					if (r[i] == kReplicationNotStarted) {
+						continue;
+					}
+					ready_replicas++;
 					if (min > r[i]) {
 						min = r[i];
 					}
 				}
 				CXL::load_fence();
 
-				if(min == (size_t)-1){
+				if (ready_replicas < replication_factor_ || min == kReplicationNotStarted) {
 					return false;
 				}
 				if(combined_offset != min){
