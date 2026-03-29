@@ -1676,7 +1676,12 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 		}
 	} else if (replication_factor > 0) {
 		if (ack_level == 1) {
-			if (order == 0) {
+			// SCALOG ORDER=1 is per-broker local visibility semantics.
+			// Its local/global cut path can lag far behind the broker-local written frontier on
+			// cold start, but ACK=1 for ORDER=1 only requires broker-local ordered visibility.
+			// written is advanced after DelegationThread assigns logical offsets, so it is the
+			// correct cumulative frontier for this contract.
+			if (order == 0 || (seq_type == SCALOG && order == kOrderPerBroker)) {
 				fast_read_value = tinode->offsets[broker_id_].written;
 			} else {
 				fast_read_value = tinode->offsets[broker_id_].ordered;
@@ -1702,7 +1707,7 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 		}
 	} else {
 		// No replication
-		if (order == 0) {
+		if (order == 0 || (seq_type == SCALOG && order == kOrderPerBroker)) {
 			fast_read_value = tinode->offsets[broker_id_].written;
 		} else {
 			fast_read_value = tinode->offsets[broker_id_].ordered;
@@ -1840,10 +1845,12 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		return min + 1;  // Convert last offset to message count
 	}
 
-	// ACK Level 1: Acknowledge after written to shared memory and ordered (order 0/1/2 or non-EMBARCADERO)
+		// ACK Level 1: acknowledge after the order-specific visibility frontier advances.
+		// For SCALOG ORDER=1, the documented contract is per-broker local visibility, so ACK
+		// must follow broker-local written rather than the slower global-cut-driven ordered cursor.
 	if(replication_factor > 0){
 		if(ack_level == 1){
-			if(order == 0){
+			if(order == 0 || (seq_type == SCALOG && order == kOrderPerBroker)){
 				// [[CRITICAL_FIX: Invalidate cache before reading written for ORDER=0]]
 				// UpdateWrittenForOrder0 flushes from writer; AckThread must invalidate to see it
 				volatile uint64_t* written_ptr = &tinode->offsets[broker_id_].written;
@@ -1891,8 +1898,8 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		}
 		return min;
 	}else{
-		// No replication: Acknowledge after written (order=0) or ordered (order>0)
-		if(order == 0){
+		// No replication: acknowledge after written (ORDER=0 / SCALOG ORDER=1) or ordered otherwise.
+		if(order == 0 || (seq_type == SCALOG && order == kOrderPerBroker)){
 			// [[CRITICAL_FIX: Invalidate cache before reading written for ORDER=0]]
 			// UpdateWrittenForOrder0 flushes from writer; AckThread must invalidate to see it
 			volatile uint64_t* written_ptr = &tinode->offsets[broker_id_].written;
