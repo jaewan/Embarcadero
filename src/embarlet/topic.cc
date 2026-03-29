@@ -391,10 +391,10 @@ void Topic::Start() {
 					LOG(ERROR) << "Order is set 2 at scalog";
 				break;
 			case LAZYLOG:
-				if (order_ == 1){
+				if (order_ == Embarcadero::kOrderTotal){
 					sequencerThread_ = std::thread(&Topic::StartLazyLogLocalSequencer, this);
 				} else {
-					LOG(ERROR) << "LazyLog currently supports ORDER=1 (got ORDER=" << order_ << ")";
+					LOG(ERROR) << "LazyLog baseline requires ORDER=2 (got ORDER=" << order_ << ")";
 				}
 				break;
 			case CORFU:
@@ -525,7 +525,7 @@ void Topic::DelegationThread() {
 							written_val,
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
-						if (seq_type_ == SCALOG) {
+						if (seq_type_ == SCALOG || seq_type_ == LAZYLOG) {
 							tinode_->offsets[broker_id_].validated_written_byte_offset =
 								current_batch->log_idx + current_batch->total_size;
 						}
@@ -580,7 +580,7 @@ void Topic::DelegationThread() {
 							written_val,
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
-						if (seq_type_ == SCALOG) {
+						if (seq_type_ == SCALOG || seq_type_ == LAZYLOG) {
 							tinode_->offsets[broker_id_].validated_written_byte_offset =
 								current_batch->log_idx + current_batch->total_size;
 						}
@@ -2175,6 +2175,36 @@ bool Topic::GetBatchToExportWithMetadata(
 		batch_total_order = header->total_order;
 		num_messages = header->num_msg;
 		expected_batch_offset++;
+		return true;
+	}
+	// LazyLog ORDER=2 currently exports from the ordered slot ring and does not
+	// drive CompletionVector progress. Reuse legacy slot export and derive
+	// metadata directly from the batch payload.
+	if (seq_type_ == LAZYLOG && order_ == Embarcadero::kOrderTotal) {
+		if (!GetBatchToExport(expected_batch_offset, batch_addr, batch_size)) {
+			return false;
+		}
+		if (batch_addr == nullptr || batch_size < sizeof(MessageHeader)) {
+			return false;
+		}
+
+		auto* first = reinterpret_cast<MessageHeader*>(batch_addr);
+		batch_total_order = first->total_order;
+
+		uint32_t counted = 0;
+		size_t remaining = batch_size;
+		uint8_t* cursor = reinterpret_cast<uint8_t*>(batch_addr);
+		while (remaining >= sizeof(MessageHeader)) {
+			auto* hdr = reinterpret_cast<MessageHeader*>(cursor);
+			const size_t stride = static_cast<size_t>(hdr->next_msg_diff);
+			if (stride == 0 || stride > remaining) {
+				break;
+			}
+			++counted;
+			cursor += stride;
+			remaining -= stride;
+		}
+		num_messages = (counted > 0) ? counted : 1;
 		return true;
 	}
 

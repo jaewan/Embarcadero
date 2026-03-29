@@ -50,7 +50,8 @@ class LazyLogGlobalSequencer : public lazylogsequencer::LazyLogSequencer::Servic
 
   absl::Mutex progress_mu_;
   absl::btree_map<int, int64_t> last_progress_ ABSL_GUARDED_BY(progress_mu_);
-  absl::btree_map<int, int64_t> pending_binding_ ABSL_GUARDED_BY(progress_mu_);
+  absl::btree_map<int, int64_t> bound_progress_ ABSL_GUARDED_BY(progress_mu_);
+  absl::btree_set<int> reported_brokers_ ABSL_GUARDED_BY(progress_mu_);
 };
 
 #endif

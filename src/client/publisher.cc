@@ -2254,6 +2254,11 @@ void Publisher::SubscribeToClusterStatus() {
 				brokers_.clear();
 				for (const auto& bi : cluster_status.broker_info()) {
 					int broker_id = bi.broker_id();
+					if (expected_num_brokers_ > 0 && broker_id >= expected_num_brokers_) {
+						VLOG(1) << "SubscribeToCluster: ignoring broker " << broker_id
+						        << " beyond expected NUM_BROKERS=" << expected_num_brokers_;
+						continue;
+					}
 					if (bi.accepts_publishes()) {
 						nodes_[broker_id] = bi.network_mgr_addr();
 						brokers_.emplace_back(broker_id);
@@ -2285,6 +2290,11 @@ void Publisher::SubscribeToClusterStatus() {
 				// Add new brokers
 				for (const auto& addr : new_nodes) {
 					int broker_id = GetBrokerId(addr);
+					if (expected_num_brokers_ > 0 && broker_id >= expected_num_brokers_) {
+						VLOG(1) << "SubscribeToCluster: ignoring legacy broker " << broker_id
+						        << " beyond expected NUM_BROKERS=" << expected_num_brokers_;
+						continue;
+					}
 					nodes_[broker_id] = addr;
 					brokers_.emplace_back(broker_id);
 				}

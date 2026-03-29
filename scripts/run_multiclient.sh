@@ -6,11 +6,11 @@
 # synchronized (future-timestamp) barrier start.
 #
 # Client roster (order defines who is added at each NUM_CLIENTS level):
-#   NUM_CLIENTS=1  → c4              (NUMA 1)
-#   NUM_CLIENTS=2  → c4, local       (NUMA 1, 0)
-#   NUM_CLIENTS=3  → c4, local, c3   (NUMA 1, 0, 1)
-#   NUM_CLIENTS=4  → c4, local, c3, c2
-#   NUM_CLIENTS=5  → c4, local, c3, c2, c1
+#   NUM_CLIENTS=1  → c2              (NUMA 1)
+#   NUM_CLIENTS=2  → c2, local       (NUMA 1, 0)
+#   NUM_CLIENTS=3  → c2, local, c4   (NUMA 1, 0, 1)
+#   NUM_CLIENTS=4  → c2, local, c4, c3
+#   NUM_CLIENTS=5  → c2, local, c4, c3, c1
 #
 # All configuration via environment variables:
 #   NUM_CLIENTS, NUM_BROKERS, NUM_TRIALS, TRIAL_MAX_ATTEMPTS
@@ -35,7 +35,7 @@ set -euo pipefail
 # Cluster topology — order determines activation sequence
 # "local" means this broker machine (where brokers run); everything else is SSH
 # ---------------------------------------------------------------------------
-declare -a CLIENT_HOSTS=( "c4"  "local" "c3"  "c2"  "c1"  )
+declare -a CLIENT_HOSTS=( "c2"  "local" "c4"  "c3"  "c1"  )
 declare -a CLIENT_NUMAS=( "1"   ""      "1"   "1"   "1"   )
 if [[ -n "${CLIENT_HOSTS_CSV:-}" ]]; then
     IFS=',' read -r -a CLIENT_HOSTS <<< "$CLIENT_HOSTS_CSV"
@@ -120,8 +120,8 @@ if [[ "$SEQUENCER" == "CORFU" ]] && [[ "$ORDER" != "2" ]]; then
     echo "ERROR: CORFU sequencer requires ORDER=2 (got ORDER=$ORDER)" >&2
     exit 1
 fi
-if [[ "$SEQUENCER" == "LAZYLOG" ]] && [[ "$ORDER" != "1" ]]; then
-    echo "ERROR: LAZYLOG sequencer currently requires ORDER=1 (got ORDER=$ORDER)" >&2
+if [[ "$SEQUENCER" == "LAZYLOG" ]] && [[ "$ORDER" != "2" ]]; then
+    echo "ERROR: LAZYLOG baseline requires ORDER=2 (got ORDER=$ORDER)" >&2
     exit 1
 fi
 
@@ -577,6 +577,7 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
             EXEC_CMD="$(cat <<ENDINNERSCRIPT
 set -e
 export EMBARCADERO_HEAD_ADDR=$BROKER_IP
+export NUM_BROKERS=$NUM_BROKERS
 export EMBARCADERO_CXL_SHM_NAME=$EMBARCADERO_CXL_SHM_NAME
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=throughput

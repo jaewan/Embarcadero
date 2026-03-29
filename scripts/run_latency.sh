@@ -3,29 +3,29 @@
 #
 # Supported scenarios:
 #   SCENARIO=local  — brokers and client both run on this machine (default)
-#   SCENARIO=remote — brokers on this machine; client (publisher) runs on c4 via SSH
+#   SCENARIO=remote — brokers on this machine; client (publisher) runs on c2 via SSH
 #
 # Quick examples:
 #   ORDERS="0 5" SCENARIO=local  bash scripts/run_latency.sh
-#   ORDERS="0 5" SCENARIO=remote REMOTE_CLIENT_HOST=c4 bash scripts/run_latency.sh
+#   ORDERS="0 5" SCENARIO=remote REMOTE_CLIENT_HOST=c2 bash scripts/run_latency.sh
 #
 # NOTE: This script requires recompilation with COLLECT_LATENCY_STATS macro defined.
 # Build with:
 #   cmake -S . -B build -DCOLLECT_LATENCY_STATS=ON
 #   cmake --build build -j
 #
-# === Latency breakdown: local vs remote (c4→moscxl) ===
+# === Latency breakdown: local vs remote (c2→moscxl) ===
 #
 # Local (single-node, loopback):
 #   - avg_send_us ~250 µs/batch (NUMA 1 client, NUMA-local socket buffers)
 #   - No NIC serialization latency
 #   - Synchronous loopback copy on both send and receive
 #
-# Remote (c4→moscxl, 100GbE):
+# Remote (c2→moscxl, 100GbE):
 #   - Network RTT: ~200–300 ns at wire level
-#   - NIC TX + DMA on c4: ~1–5 µs
+#   - NIC TX + DMA on c2: ~1–5 µs
 #   - NIC RX + DMA on moscxl: ~1–5 µs
-#   - TCP ACK path (broker → c4): same NIC round-trip
+#   - TCP ACK path (broker → c2): same NIC round-trip
 #   - Expected publish latency delta vs local: ~10–50 µs per batch (network overhead)
 #     dominated by NIC DMA + PCIe transfer, NOT propagation delay
 #   - avg_send_us for remote: ~196 µs/batch (measured) — LOWER than local ~250 µs
@@ -82,8 +82,8 @@ SCENARIO="${SCENARIO:-local}"
 
 if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
   for __order in "${ORDERS_ARR[@]}"; do
-    if [[ "$__order" != "1" ]]; then
-      echo "ERROR: LAZYLOG sequencer currently requires ORDER=1 (got ORDER=${__order})" >&2
+    if [[ "$__order" != "2" ]]; then
+      echo "ERROR: LAZYLOG baseline requires ORDER=2 (got ORDER=${__order})" >&2
       exit 1
     fi
   done
@@ -91,7 +91,7 @@ fi
 
 # Remote client settings (SCENARIO=remote only)
 # REMOTE_CLIENT_HOST: SSH destination for the publisher (e.g. "c4" or "user@10.10.10.20")
-REMOTE_CLIENT_HOST="${REMOTE_CLIENT_HOST:-c4}"
+REMOTE_CLIENT_HOST="${REMOTE_CLIENT_HOST:-c2}"
 REMOTE_CLIENT_BIN_DIR="${REMOTE_CLIENT_BIN_DIR:-~/Embarcadero/build/bin}"
 # IP address the remote client uses to reach the broker on this machine
 BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
@@ -370,6 +370,8 @@ run_trial() {
     local quoted_cmd
     quoted_cmd="cd ${REMOTE_CLIENT_BIN_DIR} && "
     quoted_cmd+="export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE} && "
+    quoted_cmd+="export NUM_BROKERS=${NUM_BROKERS} && "
+    quoted_cmd+="export EMBARCADERO_NUM_BROKERS=${NUM_BROKERS} && "
     if [[ -n "${EMBARCADERO_CORFU_SEQ_IP:-}" ]]; then
       quoted_cmd+="export EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP} && "
     fi

@@ -16,7 +16,7 @@ MSG_SIZE="${MSG_SIZE:-1024}"
 TOTAL_MESSAGE_SIZE="${TOTAL_MESSAGE_SIZE:-4294967296}"
 ACK_LEVEL="${ACK_LEVEL:-}"
 MODES="${MODES:-steady}"
-PUBLISHER_HOST="${PUBLISHER_HOST:-c4}"
+PUBLISHER_HOST="${PUBLISHER_HOST:-c2}"
 BROKER_HOST="${BROKER_HOST:-moscxl}"
 BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
 # Corfu gRPC sequencer log fetch (publication default: c2; override if your layout host differs).

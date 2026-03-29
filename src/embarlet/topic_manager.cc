@@ -304,6 +304,16 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 					(getenv("LAZYLOG_CXL_MODE") != nullptr &&
 					 std::string(getenv("LAZYLOG_CXL_MODE")) == "1");
 				if (kCxlLazyLogMode) {
+					for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+						tinode->offsets[broker_id_].replication_done[i] = kReplicationNotStarted;
+					}
+					tinode->offsets[broker_id_].validated_written_byte_offset =
+						tinode->offsets[broker_id_].log_offset;
+					CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(
+						&tinode->offsets[broker_id_].replication_done[0])));
+					CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(
+						&tinode->offsets[broker_id_].validated_written_byte_offset)));
+					CXL::store_fence();
 					disk_manager_.StartScalogCXLReplication(tinode);
 					int num_brokers = get_num_brokers_callback_ ? get_num_brokers_callback_() : NUM_MAX_BROKERS_CONFIG;
 					if (num_brokers <= 0) {
@@ -339,8 +349,8 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		           << topic << "', order=" << order << ")";
 		return nullptr;
 	}
-	if (seq_type == LAZYLOG && order != kOrderPerBroker) {
-		LOG(ERROR) << "CreateNewTopicInternal: LazyLog currently supports only ORDER=1 (topic='"
+	if (seq_type == LAZYLOG && order != kOrderTotal) {
+		LOG(ERROR) << "CreateNewTopicInternal: LazyLog baseline requires ORDER=2 (topic='"
 		           << topic << "', order=" << order << ")";
 		return nullptr;
 	}
@@ -516,6 +526,16 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 				(getenv("LAZYLOG_CXL_MODE") != nullptr &&
 				 std::string(getenv("LAZYLOG_CXL_MODE")) == "1");
 			if (kCxlLazyLogMode) {
+				for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+					tinode->offsets[broker_id_].replication_done[i] = kReplicationNotStarted;
+				}
+				tinode->offsets[broker_id_].validated_written_byte_offset =
+					tinode->offsets[broker_id_].log_offset;
+				CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(
+					&tinode->offsets[broker_id_].replication_done[0])));
+				CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(
+					&tinode->offsets[broker_id_].validated_written_byte_offset)));
+				CXL::store_fence();
 				disk_manager_.StartScalogCXLReplication(tinode);
 				int num_brokers = get_num_brokers_callback_ ? get_num_brokers_callback_() : NUM_MAX_BROKERS_CONFIG;
 				if (num_brokers <= 0) {
@@ -547,8 +567,8 @@ bool TopicManager::CreateNewTopic(
 		           << topic << "', order=" << order << ")";
 		return false;
 	}
-	if (seq_type == LAZYLOG && order != kOrderPerBroker) {
-		LOG(ERROR) << "CreateNewTopic: LazyLog currently supports only ORDER=1 (topic='"
+	if (seq_type == LAZYLOG && order != kOrderTotal) {
+		LOG(ERROR) << "CreateNewTopic: LazyLog baseline requires ORDER=2 (topic='"
 		           << topic << "', order=" << order << ")";
 		return false;
 	}

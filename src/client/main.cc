@@ -89,8 +89,8 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "Corfu supports only ORDER=2 in this implementation (got ORDER=" << order << ").";
         return -1;
     }
-    if (seq_type == heartbeat_system::SequencerType::LAZYLOG && order != Embarcadero::kOrderPerBroker) {
-        LOG(ERROR) << "LazyLog currently supports only ORDER=1 in this implementation (got ORDER=" << order << ").";
+    if (seq_type == heartbeat_system::SequencerType::LAZYLOG && order != Embarcadero::kOrderTotal) {
+        LOG(ERROR) << "LazyLog baseline requires ORDER=2 (weak total order) in this implementation (got ORDER=" << order << ").";
         return -1;
     }
 

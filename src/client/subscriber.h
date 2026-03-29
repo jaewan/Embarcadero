@@ -255,13 +255,13 @@ class Subscriber {
 
 			void WaitUntilAllConnected(){
 				size_t num_connections = 0;
-				size_t final_expected = static_cast<size_t>(NUM_MAX_BROKERS_CONFIG) * sub_connections_per_broker_;
+				size_t final_expected = configured_broker_count_ * sub_connections_per_broker_;
 				// Dynamically recalculate expected connections as cluster info arrives
 				// Recalculate expected connections as cluster info arrives
 				size_t last_expected = 0;
 				const int connect_timeout_sec = 90;
 				int last_progress_log_sec = -1;
-				LOG(INFO) << "Waiting for connections (brokers=" << NUM_MAX_BROKERS_CONFIG
+				LOG(INFO) << "Waiting for connections (brokers=" << configured_broker_count_
 					<< ", sub_connections=" << sub_connections_per_broker_ << ", data_brokers=pending)";
 
 			auto start_time = std::chrono::steady_clock::now();
@@ -281,8 +281,8 @@ class Subscriber {
 				// Keep expected connections monotonic and never below configured broker count.
 				// Cluster status updates can arrive as partial snapshots during startup.
 				size_t broker_count = data_broker_count_.load();
-				if (broker_count < static_cast<size_t>(NUM_MAX_BROKERS_CONFIG)) {
-					broker_count = NUM_MAX_BROKERS_CONFIG;
+				if (broker_count < configured_broker_count_) {
+					broker_count = configured_broker_count_;
 				}
 				size_t expected = broker_count * sub_connections_per_broker_;
 				final_expected = expected;
@@ -334,6 +334,7 @@ class Subscriber {
 		std::atomic<bool> connected_{false}; // Maybe more granular connection state needed
 		// Track actual data broker count
 		std::atomic<size_t> data_broker_count_{0};
+		size_t configured_broker_count_{1};
 
 		// --- Latency / Debug ---
 		bool measure_latency_;

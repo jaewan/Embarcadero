@@ -21,6 +21,8 @@ size_t ResolveExpectedBrokers() {
   }
   return static_cast<size_t>(NUM_MAX_BROKERS_CONFIG);
 }
+
+constexpr int64_t kMaxBindingsPerBrokerPerTick = 4096;
 }  // namespace
 
 LazyLogGlobalSequencer::LazyLogGlobalSequencer(const std::string& sequencer_address)
@@ -119,25 +121,45 @@ void LazyLogGlobalSequencer::ReceiveLocalProgress(
     if (current < previous) {
       continue;
     }
-    pending_binding_[broker_id] += (current - previous);
     last_progress_[broker_id] = current;
+    reported_brokers_.insert(broker_id);
   }
 }
 
 void LazyLogGlobalSequencer::SendGlobalBinding() {
   while (!shutdown_requested_.load(std::memory_order_acquire)) {
     lazylogsequencer::GlobalBinding binding;
+    absl::btree_set<int> registered_snapshot;
+    {
+      absl::ReaderMutexLock lock(&registered_brokers_mu_);
+      registered_snapshot = registered_brokers_;
+    }
+    bool ready_to_bind = false;
     {
       absl::WriterMutexLock lock(&progress_mu_);
-      for (const auto& entry : pending_binding_) {
-        if (entry.second > 0) {
-          binding.mutable_global_binding()->insert({entry.first, entry.second});
+      // LazyLog binding starts only after all brokers have registered and reported progress at least once.
+      if (registered_snapshot.size() >= expected_brokers_ &&
+          reported_brokers_.size() >= expected_brokers_) {
+        ready_to_bind = true;
+        for (int broker_id : registered_snapshot) {
+          const int64_t reported = last_progress_[broker_id];
+          const int64_t already_bound = bound_progress_[broker_id];
+          if (reported <= already_bound) {
+            continue;
+          }
+
+          const int64_t available = reported - already_bound;
+          const int64_t bind_now = std::min<int64_t>(available, kMaxBindingsPerBrokerPerTick);
+          if (bind_now <= 0) {
+            continue;
+          }
+          binding.mutable_global_binding()->insert({broker_id, bind_now});
+          bound_progress_[broker_id] = already_bound + bind_now;
         }
       }
-      pending_binding_.clear();
     }
 
-    if (!binding.global_binding().empty()) {
+    if (ready_to_bind && !binding.global_binding().empty()) {
       absl::MutexLock lock(&stream_mu_);
       for (auto* stream : local_streams_) {
         if (stream) {

@@ -36,9 +36,9 @@ if [[ -z "$ACK_LEVEL" ]]; then
 fi
 
 case "$NUM_CLIENTS" in
-  1) CLIENT_LAYOUT="c4" ;;
-  2) CLIENT_LAYOUT="c4,moscxl-local(numa0)" ;;
-  3) CLIENT_LAYOUT="c4,moscxl-local(numa0),c3" ;;
+  1) CLIENT_LAYOUT="c2" ;;
+  2) CLIENT_LAYOUT="c2,moscxl-local(numa0)" ;;
+  3) CLIENT_LAYOUT="c2,moscxl-local(numa0),c4" ;;
   *) CLIENT_LAYOUT="unsupported" ;;
 esac
 
@@ -143,7 +143,7 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
   trial_status="ok"
   total_mbs="0"
   copied_any=0
-  for host in c4 local c3; do
+  for host in c2 local c4; do
     log_file="$RAW_DIR/trial${trial}_${host}.log"
     if [[ ! -f "$log_file" ]]; then
       continue
