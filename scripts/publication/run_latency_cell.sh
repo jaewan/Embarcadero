@@ -171,28 +171,43 @@ scp -o StrictHostKeyChecking=no "${SCALOG_SEQUENCER_LOG_HOST}:/tmp/scalog_sequen
 SUMMARY_CSV="$RUN_DIR/summary.csv"
 echo "system,order,sequencer,replication_factor,publisher_host,broker_host,run_idx,status,p50_us,p95_us,p99_us,max_us,attempts_used,first_attempt_pass,artifact_dir,commit" > "$SUMMARY_CSV"
 
-find "$RAW_DATA_DIR" -type f -name latency_stats.csv | sort | while read -r stats; do
-  trial_dir="$(dirname "$stats")"
-  trial_num="$(basename "$trial_dir" | sed -n 's/.*_trial\([0-9][0-9]*\)$/\1/p')"
-  if [[ -z "$trial_num" ]]; then
-    continue
+for trial_num in $(seq 1 "$NUM_TRIALS"); do
+  trial_dir="$(find "$RAW_DATA_DIR" -type d -name "*_trial${trial_num}" | sort | head -n 1)"
+  status="failed"
+  p50=""
+  p95=""
+  p99=""
+  maxv=""
+  first_attempt_pass="0"
+
+  if [[ -n "$trial_dir" ]]; then
+    stats="$trial_dir/latency_stats.csv"
+    if [[ -f "$stats" ]]; then
+      row="$(awk -F',' '$13=="publish_to_deliver_latency"{print $3","$5","$6","$8; exit}' "$stats")"
+      if [[ -n "$row" ]]; then
+        IFS=',' read -r p50 p95 p99 maxv <<< "$row"
+        status="ok"
+        first_attempt_pass="1"
+      fi
+    fi
   fi
-  row="$(awk -F',' '$13=="publish_to_deliver_latency"{print $3","$5","$6","$8; exit}' "$stats")"
-  if [[ -n "$row" ]]; then
-    IFS=',' read -r p50 p95 p99 maxv <<< "$row"
-    status="ok"
-  else
-    p50=""
-    p95=""
-    p99=""
-    maxv=""
-    status="failed"
-  fi
-  echo "$SYSTEM,$ORDER,$SEQUENCER,$REPLICATION_FACTOR,$PUBLISHER_HOST,$BROKER_HOST,$trial_num,$status,$p50,$p95,$p99,$maxv,1,1,$trial_dir,$COMMIT" >> "$SUMMARY_CSV"
+
+  echo "$SYSTEM,$ORDER,$SEQUENCER,$REPLICATION_FACTOR,$PUBLISHER_HOST,$BROKER_HOST,$trial_num,$status,$p50,$p95,$p99,$maxv,1,$first_attempt_pass,$trial_dir,$COMMIT" >> "$SUMMARY_CSV"
 done
 
+summary_rows="$(tail -n +2 "$SUMMARY_CSV" | wc -l | awk '{print $1}')"
+if [[ "$summary_rows" != "$NUM_TRIALS" ]]; then
+  echo "ERROR: latency summary row count mismatch (expected $NUM_TRIALS, got $summary_rows)." >&2
+  RUN_STATUS=1
+fi
+
+if awk -F',' 'NR>1 && $8 != "ok" {exit 0} END{exit 1}' "$SUMMARY_CSV"; then
+  echo "ERROR: one or more latency trials failed." >&2
+  RUN_STATUS=1
+fi
+
 if [[ "$REQUIRE_FIRST_ATTEMPT_PASS" == "1" ]]; then
-  if awk -F',' 'NR>1 && $14 != "1" {found=1} END{exit !found}' "$SUMMARY_CSV"; then
+  if awk -F',' 'NR>1 && $14 != "1" {exit 0} END{exit 1}' "$SUMMARY_CSV"; then
     echo "ERROR: first-attempt reliability gate failed (REQUIRE_FIRST_ATTEMPT_PASS=1)." >&2
     RUN_STATUS=1
   fi

@@ -454,8 +454,10 @@ run_trial() {
     local client_status=$?
   fi
 
+  local trial_failed=0
   if [[ "$client_status" -ne 0 ]]; then
-    echo "WARNING: throughput_test exited with status $client_status" >&2
+    echo "ERROR: latency client exited with status $client_status" >&2
+    trial_failed=1
   fi
 
   if [[ "$SCENARIO" == "remote" ]]; then
@@ -480,6 +482,15 @@ run_trial() {
     fi
   done
 
+  local trial_stats="$TRIAL_DIR/latency_stats.csv"
+  if [[ ! -f "$trial_stats" ]]; then
+    echo "ERROR: latency_stats.csv missing for trial $trial" >&2
+    trial_failed=1
+  elif ! awk -F',' '$13=="publish_to_deliver_latency"{found=1} END{exit !found}' "$trial_stats"; then
+    echo "ERROR: publish_to_deliver_latency row missing in latency_stats.csv for trial $trial" >&2
+    trial_failed=1
+  fi
+
   cat > "$RUN_METADATA" <<EOF
 run_id=$RUN_ID
 scenario=$SCENARIO
@@ -501,6 +512,9 @@ client_command_file=$CLIENT_CMD_FILE
 EOF
 
   echo "Saved trial artefacts to: $TRIAL_DIR"
+  if [[ "$trial_failed" -ne 0 ]]; then
+    return 1
+  fi
   return 0
 }
 
