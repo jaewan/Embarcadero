@@ -1650,6 +1650,10 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 			int ready_replicas = 0;
 			for (int i = 0; i < replication_factor; i++) {
 				int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
+				volatile uint64_t* rep_done_ptr = &tinode->offsets[b].replication_done[broker_id_];
+				CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(rep_done_ptr)));
+				CXL::load_fence();
 				size_t val = tinode->offsets[b].replication_done[broker_id_];
 				if (val == kReplicationNotStarted) {
 					continue;
@@ -1888,6 +1892,10 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		// [[PHASE_3_ALIGN_REPLICATION_SET]] - Use canonical replication set computation
 		for (int i = 0; i < replication_factor; i++) {
 			int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor, num_brokers, i);
+			volatile uint64_t* rep_done_ptr = &tinode->offsets[b].replication_done[broker_id_];
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(rep_done_ptr)));
+			CXL::load_fence();
 			const size_t val = tinode->offsets[b].replication_done[broker_id_];
 			if (val == kReplicationNotStarted) {
 				return static_cast<size_t>(-1);
@@ -1896,7 +1904,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 				min = val;
 			}
 		}
-		return min;
+		return min + 1;
 	}else{
 		// No replication: acknowledge after written (ORDER=0 / SCALOG ORDER=1) or ordered otherwise.
 		if(order == 0 || (seq_type == SCALOG && order == kOrderPerBroker)){
