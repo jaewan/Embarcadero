@@ -160,19 +160,46 @@ cd "$build_bin"
 for pid in $(pgrep -f "scalog_global_sequencer" 2>/dev/null || true); do
   kill "$pid" 2>/dev/null || true
 done
-sleep 0.3
+for _ in $(seq 1 50); do
+  if ! pgrep -f "scalog_global_sequencer" >/dev/null 2>&1 && \
+     ! ss -H -ltn "sport = :$scalog_seq_port" 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 0.1
+done
 for pid in $(pgrep -f "scalog_global_sequencer" 2>/dev/null || true); do
   kill -9 "$pid" 2>/dev/null || true
+done
+for _ in $(seq 1 50); do
+  if ! pgrep -f "scalog_global_sequencer" >/dev/null 2>&1 && \
+     ! ss -H -ltn "sport = :$scalog_seq_port" 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 0.1
 done
 if [ -n "$scalog_seq_ip" ]; then export EMBARCADERO_SCALOG_SEQ_IP="$scalog_seq_ip"; fi
 if [ -n "$scalog_seq_port" ]; then export EMBARCADERO_SCALOG_SEQ_PORT="$scalog_seq_port"; fi
 : >/tmp/scalog_sequencer.log
 printf '=== scalog start %s ===\n' "$(date -u +%Y%m%dT%H%M%SZ)" >>/tmp/scalog_sequencer.log
 nohup ./scalog_global_sequencer >>/tmp/scalog_sequencer.log 2>&1 &
-printf '%s\n' "$!" >/tmp/scalog_global_sequencer.pid
+pid=$!
+printf '%s\n' "$pid" >/tmp/scalog_global_sequencer.pid
 for _ in $(seq 1 100); do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "Remote Scalog sequencer exited before bind" >&2
+    tail -n 80 /tmp/scalog_sequencer.log >&2 || true
+    exit 1
+  fi
   if ss -H -ltn "sport = :$scalog_seq_port" 2>/dev/null | grep -q .; then
-    exit 0
+    for _ in $(seq 1 20); do
+      if kill -0 "$pid" 2>/dev/null; then
+        exit 0
+      fi
+      sleep 0.1
+    done
+    echo "Remote Scalog sequencer bound port but did not stay alive" >&2
+    tail -n 80 /tmp/scalog_sequencer.log >&2 || true
+    exit 1
   fi
   sleep 0.1
 done
@@ -189,13 +216,27 @@ broker_remote_scalog_stop() {
   local host
   host="$(broker_remote_scalog_sequencer_host)"
   [ -n "$host" ] || return 0
-  ssh -o BatchMode=yes "$host" bash -s -- <<'EOF'
+  ssh -o BatchMode=yes "$host" bash -s -- "${EMBARCADERO_SCALOG_SEQ_PORT:-50051}" <<'EOF'
+scalog_seq_port=$1
 for pid in $(pgrep -f "scalog_global_sequencer" 2>/dev/null || true); do
   kill "$pid" 2>/dev/null || true
 done
-sleep 0.2
+for _ in $(seq 1 50); do
+  if ! pgrep -f "scalog_global_sequencer" >/dev/null 2>&1 && \
+     ! ss -H -ltn "sport = :$scalog_seq_port" 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 0.1
+done
 for pid in $(pgrep -f "scalog_global_sequencer" 2>/dev/null || true); do
   kill -9 "$pid" 2>/dev/null || true
+done
+for _ in $(seq 1 50); do
+  if ! pgrep -f "scalog_global_sequencer" >/dev/null 2>&1 && \
+     ! ss -H -ltn "sport = :$scalog_seq_port" 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 0.1
 done
 rm -f /tmp/scalog_global_sequencer.pid
 EOF
