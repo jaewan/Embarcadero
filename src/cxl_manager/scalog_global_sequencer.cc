@@ -135,10 +135,6 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 
 					global_cut.mutable_global_cut()->insert({entry.first, min_entry->second});
 
-					// Update all entries in last_sent_global_cut_[entry.first]
-					for (const auto& replica_entry : entry.second) {
-						global_cut_[entry.first][replica_entry.first] = global_cut_[entry.first][replica_entry.first] - min_entry->second;
-					}
 				}
 			}
 
