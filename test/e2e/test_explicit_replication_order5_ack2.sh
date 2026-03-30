@@ -189,6 +189,14 @@ setup() {
     # [[PHASE_4_BOUNDED_TIMEOUTS]] - Set ACK timeout for publisher
     # This ensures tests fail fast instead of hanging indefinitely
     export EMBARCADERO_ACK_TIMEOUT_SEC=120  # 2 minutes for ACK wait (should be plenty for 5k messages)
+    # Ensure broker-side replication managers are initialized for ACK2 durability frontier.
+    # throughput_test's -r flag configures topic metadata, but DiskManager reads env at process startup.
+    export EMBARCADERO_REPLICATION_FACTOR=1
+
+    # Keep this e2e test hermetic to local single-node runs.
+    # Without this, a stale shell env can point the client to a remote head addr.
+    export EMBARCADERO_HEAD_ADDR=127.0.0.1
+    unset REMOTE_HEAD_ADDR || true
 
     log_info "Test output directory: $PWD"
     log_info "Test configuration: ORDER=5, ack_level=2, replication_factor=1"
@@ -228,6 +236,7 @@ start_brokers() {
         log_info "Starting broker $i..."
         $NUMA_BIND "$BIN_DIR/embarlet" \
             --config "$CONFIG_DIR/embarcadero.yaml" \
+            --EMBARCADERO \
             > "broker_$i.log" 2>&1 &
 
         local broker_pid=$!
@@ -305,9 +314,11 @@ run_client_test() {
         return 1
     fi
 
-    # Verify client didn't report errors
-    if grep -i "error\|failed\|timeout" client.log 2>/dev/null; then
-        log_error "Client reported errors in log"
+    # Verify client didn't report hard errors.
+    # Avoid broad "failed/timeout" substring checks because benign fields like
+    # "ack_drain_ms_failure" would produce false positives.
+    if grep -Eq "^(E[0-9]{8}|F[0-9]{8})|\[ERROR\]|\[Publisher ACK Timeout\]|TEST FAILED" client.log 2>/dev/null; then
+        log_error "Client reported hard errors in log"
         cat client.log
         return 1
     fi
@@ -395,7 +406,9 @@ verify_replication() {
     # Look for "Replicated batch" messages
     local replication_messages=0
     for i in $(seq 0 $((NUM_BROKERS-1))); do
-        local count=$(grep -c "Replicated batch\|replication_done" "broker_$i.log" 2>/dev/null || echo "0")
+        local count
+        count=$(grep -c "Replicated batch\|replication_done" "broker_$i.log" 2>/dev/null || true)
+        count=${count:-0}
         replication_messages=$((replication_messages + count))
     done
 

@@ -1942,12 +1942,23 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic='" << topic
 	          << "' (len=" << topic.size() << "), ack_level=" << ack_level
 	          << ", client_id=" << client_id;
+	auto remove_ack_registration = [&]() {
+		absl::MutexLock lock(&ack_mu_);
+		auto it = ack_connections_.find(client_id);
+		if (it != ack_connections_.end() && it->second == ack_fd) {
+			ack_connections_.erase(it);
+		}
+		if (ack_fd_ == ack_fd) {
+			ack_fd_ = -1;
+		}
+	};
 
 	// [[CRITICAL: Validate topic is not empty]]
 	// If topic is empty, GetOffsetToAck will use wrong TInode → wrong ACKs → client timeout
 	if (topic.empty()) {
 		LOG(ERROR) << "AckThread: Empty topic for broker " << broker_id_
 		           << ". Cannot send ACKs correctly. Exiting AckThread.";
+		remove_ack_registration();
 		close(ack_fd);
 		if (ack_efd >= 0) close(ack_efd);
 		return;
@@ -1997,6 +2008,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 			if (consecutive_timeouts >= kMaxConsecutiveTimeouts) {
 				if (stop_threads_) break;
 				if (!reset_ack_epoll("broker_id_timeout")) {
+					remove_ack_registration();
 					close(ack_fd);
 					return;
 				}
@@ -2011,6 +2023,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 			if (consecutive_errors >= kMaxConsecutiveErrors) {
 				if (stop_threads_) break;
 				if (!reset_ack_epoll("broker_id_error")) {
+					remove_ack_registration();
 					close(ack_fd);
 					return;
 				}
@@ -2042,6 +2055,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 							continue;
 						} else {
 							LOG(ERROR) << "Offset acknowledgment failed: " << strerror(errno);
+							remove_ack_registration();
 							return;
 						}
 					} else {
@@ -2262,6 +2276,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 						LOG(WARNING) << "AckThread: repeated ACK send timeouts for broker " << broker_id_
 						             << ", resetting epoll";
 						if (!reset_ack_epoll("ack_timeout")) {
+							remove_ack_registration();
 							close(ack_fd);
 							return;
 						}
@@ -2276,6 +2291,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 					if (consecutive_errors >= kMaxConsecutiveErrors) {
 						if (stop_threads_) break;
 						if (!reset_ack_epoll("ack_error")) {
+							remove_ack_registration();
 							close(ack_fd);
 							return;
 						}
@@ -2307,6 +2323,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 									continue;
 								} else {
 									LOG(ERROR) << "Offset acknowledgment failed: " << strerror(errno);
+									remove_ack_registration();
 									return;
 								}
 							} else {
@@ -2335,6 +2352,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 				}
 			}
 		}// end of while loop
+	remove_ack_registration();
 	close(ack_fd);
 	if (ack_efd >= 0) {
 		close(ack_efd);

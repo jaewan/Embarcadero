@@ -529,6 +529,35 @@ broker_local_drain_ports() {
 }
 
 broker_local_cleanup() {
+  # First terminate shell-owned background jobs and reap them quietly.
+  # This avoids noisy async job-status lines during teardown.
+  local _job_pids=()
+  while IFS= read -r _pid; do
+    [ -n "$_pid" ] && _job_pids+=("$_pid")
+  done < <(jobs -pr 2>/dev/null || true)
+  if [ "${#_job_pids[@]}" -gt 0 ]; then
+    for _pid in "${_job_pids[@]}"; do
+      kill "$_pid" >/dev/null 2>&1 || true
+    done
+    sleep 0.2
+    for _pid in "${_job_pids[@]}"; do
+      kill -9 "$_pid" >/dev/null 2>&1 || true
+    done
+    for _pid in "${_job_pids[@]}"; do
+      wait "$_pid" >/dev/null 2>&1 || true
+    done
+  fi
+
+  # Then clean up any remaining local processes by name.
+  pkill -x embarlet >/dev/null 2>&1 || true
+  pkill -f "./embarlet" >/dev/null 2>&1 || true
+  pkill -x throughput_test >/dev/null 2>&1 || true
+  pkill -f "./throughput_test" >/dev/null 2>&1 || true
+  pkill -x corfu_global_sequencer >/dev/null 2>&1 || true
+  pkill -f "./corfu_global_sequencer" >/dev/null 2>&1 || true
+  pkill -x scalog_global_sequencer >/dev/null 2>&1 || true
+  pkill -f "./scalog_global_sequencer" >/dev/null 2>&1 || true
+  sleep 0.1
   pkill -9 -x embarlet >/dev/null 2>&1 || true
   pkill -9 -f "./embarlet" >/dev/null 2>&1 || true
   pkill -9 -x throughput_test >/dev/null 2>&1 || true

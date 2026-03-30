@@ -1,5 +1,6 @@
 #include "topic_manager.h"
 #include <glog/logging.h>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <limits>
@@ -358,6 +359,23 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		LOG(ERROR) << "CreateNewTopicInternal: ACK level 2 requires replication_factor>0 "
 		           << "(topic='" << topic << "', replication_factor=" << replication_factor << ")";
 		return nullptr;
+	}
+	if (seq_type == SCALOG && ack_level == 2) {
+		if (replication_factor <= 0) {
+			LOG(ERROR) << "CreateNewTopicInternal: Scalog ACK level 2 requires replication_factor>0 "
+			           << "(topic='" << topic << "', replication_factor=" << replication_factor << ")";
+			return nullptr;
+		}
+		// Scalog ACK2 tracks durability via the CXL replication path.
+		// Running ACK2 without SCALOG_CXL_MODE causes non-progressing ACK frontiers.
+		const char* scalog_cxl_mode = std::getenv("SCALOG_CXL_MODE");
+		const bool scalog_cxl_enabled =
+			(scalog_cxl_mode != nullptr && scalog_cxl_mode[0] == '1' && scalog_cxl_mode[1] == '\0');
+		if (!scalog_cxl_enabled) {
+			LOG(ERROR) << "CreateNewTopicInternal: Scalog ACK2 requires SCALOG_CXL_MODE=1 "
+			           << "(topic='" << topic << "').";
+			return nullptr;
+		}
 	}
 
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);

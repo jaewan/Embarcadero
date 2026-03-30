@@ -2110,6 +2110,28 @@ bool Topic::GetBatchToExport(
 	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(actual) + 64);
 	CXL::full_fence();  // MFENCE required for CLFLUSHOPT ordering
 	header = actual;
+
+	// Scalog ORDER=1 export must never expose a batch beyond the ordered frontier used by ACK1.
+	// Keep export/ACK visibility contracts identical by refusing batches that violate this invariant.
+	if (seq_type_ == SCALOG && order_ == kOrderPerBroker) {
+		volatile uint64_t* ordered_ptr = &tinode_->offsets[broker_id_].ordered;
+		CXL::flush_cacheline(const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(ordered_ptr)));
+		CXL::load_fence();
+		const uint64_t ordered_frontier = *ordered_ptr;
+		const uint64_t batch_end_logical =
+			static_cast<uint64_t>(header->start_logical_offset) + static_cast<uint64_t>(header->num_msg);
+		if (batch_end_logical > ordered_frontier) {
+			LOG(WARNING) << "[Scalog Export Guard B" << broker_id_
+			             << "] blocking batch beyond ordered frontier"
+			             << " start=" << header->start_logical_offset
+			             << " num_msg=" << header->num_msg
+			             << " batch_end=" << batch_end_logical
+			             << " ordered=" << ordered_frontier;
+			return false;
+		}
+	}
+
 	batch_size = header->total_size;
 	batch_addr = header->log_idx + reinterpret_cast<uint8_t*>(cxl_addr_);
 	expected_batch_offset++;
