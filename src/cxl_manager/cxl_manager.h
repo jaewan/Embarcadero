@@ -90,6 +90,7 @@ class CXLManager{
 			// Flush cache line after TInode metadata update for CXL visibility
 			// Paper §4.2 - Flush & Poll principle: Writers must flush after writes to non-coherent CXL
 			// Note: DEV-002 (batched flushes) planned - could batch if multiple fields in same cache line
+			CXL::store_fence();
 			CXL::flush_cacheline(const_cast<const void*>(static_cast<volatile void*>(&tinode->offsets[broker])));
 			CXL::store_fence();
 		}

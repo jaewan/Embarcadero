@@ -329,6 +329,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		// [[PHASE_1A_EPOCH_FENCING]] Head broker initializes ControlBlock (epoch-based fencing)
 		if (broker_id_ == 0) {
 			control_block_->epoch.store(1, std::memory_order_release);
+			CXL::store_fence();
 			CXL::flush_cacheline(control_block_);
 			CXL::store_fence();
 			LOG(INFO) << "CXLManager: ControlBlock initialized (epoch=1) for zombie fencing";
@@ -359,6 +360,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 			// moved to index 1 and never processes it — deadlocking ACK2.
 			ControlBlock* cb = reinterpret_cast<ControlBlock*>(cxl_addr_);
 			cb->committed_seq.store(UINT64_MAX, std::memory_order_release);
+			CXL::store_fence();
 			CXL::flush_cacheline(cb);
 			CXL::store_fence();
 
@@ -371,6 +373,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 			}
 
 			// Flush CV to CXL (4 KB = 32 cache lines, flush in batches)
+			CXL::store_fence();
 			for (int i = 0; i < NUM_MAX_BROKERS; i++) {  // 1 entry per 128-byte cacheline (was 2)
 				CXL::flush_cacheline(&completion_vector_[i]);
 			}
@@ -401,6 +404,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 			
 			// Zero-initialize bitmap (all segments free)
 			memset(bitmap_, 0, std::min(Bitmap_Region_size, bitmap_bytes));
+			CXL::store_fence();
 			CXL::flush_cacheline(bitmap_);
 			CXL::store_fence();
 			
@@ -639,11 +643,13 @@ void* CXLManager::GetNewSegment(){
 			
 			// CRITICAL: Flush bitmap cache line for CXL visibility
 			// Even on cache-coherent systems, this ensures visibility to CXL device
+			CXL::store_fence();
 			CXL::flush_cacheline(&bitmap64[i]);
 			CXL::store_fence();
 			
 			// Initialize segment header (first 64 bytes)
 			memset(segment_addr, 0, 64);
+			CXL::store_fence();
 			CXL::flush_cacheline(segment_addr);
 			CXL::store_fence();
 			
@@ -834,6 +840,7 @@ void CXLManager::Sequencer1(std::array<char, TOPIC_NAME_SIZE> topic) {
 				msg_to_order[broker_id]->total_order = seq; // Assign sequence number
 
 								// Note: DEV-002 (batched flushes) planned - could batch if multiple fields in same cache line
+				CXL::store_fence();
 				CXL::flush_cacheline(msg_to_order[broker_id]);
 				CXL::store_fence();
 
@@ -905,6 +912,7 @@ void CXLManager::Sequencer2(std::array<char, TOPIC_NAME_SIZE> topic){
 						(last_ordered_itr != last_ordered.end() && last_ordered_itr->second == client_order - 1)){
 					msg_to_order[broker]->total_order = seq;
 					// Flush & Poll principle: Sequencer must flush after writing total_order
+					CXL::store_fence();
 					CXL::flush_cacheline(msg_to_order[broker]);
 					CXL::store_fence();
 					seq++;
@@ -1010,6 +1018,7 @@ void CXLManager::Sequencer3(std::array<char, TOPIC_NAME_SIZE> topic){
 						&& msg_to_order[broker]->logical_offset != (size_t)-1){
 					msg_to_order[broker]->total_order = seq;
 					// Flush & Poll principle: Sequencer must flush after writing total_order
+					CXL::store_fence();
 					CXL::flush_cacheline(msg_to_order[broker]);
 					CXL::store_fence();
 					seq++;

@@ -1634,13 +1634,6 @@ process_client_fd:;
 						connection_error_or_closed = true; break;
 					}
 					partial.second += static_cast<size_t>(recv_ret);
-					// Re-arm TCP_QUICKACK: Linux resets to delayed-ACK after each recv().
-					// Ensures broker's next ACK send gets an immediate TCP ACK from us,
-					// keeping the broker's send window open. Mirrors subscriber.cc:1210.
-					{
-						int one = 1;
-						setsockopt(client_sock, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
-					}
 					if (partial.second != sizeof(size_t)) {
 						// EPOLLET requires draining socket data until EAGAIN.
 						// If we break here, remaining bytes may never trigger a new edge,
@@ -1649,6 +1642,13 @@ process_client_fd:;
 					}
 
 					// --- Process Full ACK Value ---
+					// Re-arm TCP_QUICKACK once per complete ACK (not per recv fragment).
+					// Linux resets to delayed-ACK after each recv(); re-arming keeps the
+					// broker's send window open without a syscall on every partial read.
+					{
+						int one = 1;
+						setsockopt(client_sock, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+					}
 					size_t acked_msg = partial.first;
 					if (ShouldEnableNetworkPathProfile()) {
 						GetClientNetworkPathProfile().ack_values_processed.fetch_add(1, std::memory_order_relaxed);

@@ -605,35 +605,32 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		return nullptr;
 	}
 	
-	// Fast path: try to find topic without locking first
-	auto topic_itr = topics_.end();
+	// Single lock scope: find + call in one critical section to avoid double lookup.
 	{
 		absl::ReaderMutexLock lock(&topics_mutex_);
-		topic_itr = topics_.find(topic);
-	}
-
-	if (topic_itr == topics_.end()) {
-		// Topic not found locally, but should exist in CXL if head broker created it
-		// Create local reference to the existing CXL topic
-		tinode = CreateNewTopicInternal(topic);
-		if (tinode) {
-			absl::ReaderMutexLock lock(&topics_mutex_);
-			topic_itr = topics_.find(topic);
-		} else {
-			LOG(ERROR) << "Failed to create local topic reference for: " << topic;
-			return nullptr;
+		auto topic_itr = topics_.find(topic);
+		if (topic_itr != topics_.end()) {
+			auto& topic_obj = topic_itr->second;
+			seq_type = topic_obj->GetSeqtype();
+			return topic_obj->GetCXLBuffer(
+					batch_header, topic, log, segment_header, logical_offset, batch_header_location, epoch_already_checked);
 		}
 	}
 
-	// Final lookup with proper locking
+	// Topic not found locally — create local reference to the existing CXL topic
+	tinode = CreateNewTopicInternal(topic);
+	if (!tinode) {
+		LOG(ERROR) << "Failed to create local topic reference for: " << topic;
+		return nullptr;
+	}
+
 	{
 		absl::ReaderMutexLock lock(&topics_mutex_);
-		topic_itr = topics_.find(topic);
+		auto topic_itr = topics_.find(topic);
 		if (topic_itr == topics_.end()) {
-			LOG(ERROR) << "Topic disappeared: " << topic;
+			LOG(ERROR) << "Topic disappeared after creation: " << topic;
 			return nullptr;
 		}
-		
 		auto& topic_obj = topic_itr->second;
 		seq_type = topic_obj->GetSeqtype();
 		return topic_obj->GetCXLBuffer(

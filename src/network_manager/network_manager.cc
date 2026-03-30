@@ -206,6 +206,7 @@ void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, uint64_t written_add
 	volatile size_t* written_ptr = &tinode->offsets[broker_id_].written;
 	__atomic_fetch_add(reinterpret_cast<size_t*>(const_cast<size_t*>(written_ptr)), num_msg, __ATOMIC_RELEASE);
 
+	CXL::store_fence();
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written_addr));
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
 	CXL::store_fence();  // Required for CXL visibility; reader (AckThread) must see updated written
@@ -787,6 +788,11 @@ void NetworkManager::HandlePublishRequest(
 		cxl_base = reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr());
 	}
 
+	// Hoist std::function outside the loop to avoid per-batch construction/destruction overhead.
+	// For EMBARCADERO paths non_emb_seq_callback is always nullptr; for CORFU/KAFKA the lambda
+	// is assigned by GetCXLBuffer and reset here each iteration.
+	std::function<void(void*, size_t)> non_emb_seq_callback = nullptr;
+
 	while (running && !stop_threads_) {
 		constexpr int recv_flags = MSG_NOSIGNAL;
 		// Read batch header
@@ -803,8 +809,6 @@ void NetworkManager::HandlePublishRequest(
 				}
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
 			} else {
-				// bytes_read == 0 indicates connection closed by peer
-				// In failure test, publishers close the connection intentionally when their broker fails and they switch.
 				VLOG(1) << "NetworkManager: Connection closed by publisher (client_id=" 
 				            << handshake.client_id << ", topic=" << handshake.topic 
 				            << "). Normal termination if publisher is re-routing or shutting down.";
@@ -851,13 +855,12 @@ void NetworkManager::HandlePublishRequest(
 		size_t to_read = batch_header.total_size;
 		void* segment_header = nullptr;
 		void* buf = nullptr;
-		size_t logical_offset = 0;  // Initialize to prevent garbage values in UpdateWrittenForOrder0
+		size_t logical_offset = 0;
 		SequencerType seq_type;
 		BatchHeader* batch_header_location = nullptr;
 
-		std::function<void(void*, size_t)> non_emb_seq_callback = nullptr;
+		non_emb_seq_callback = nullptr;
 
-		// [[Issue #3]] Get Topic* once per batch for single epoch check and ReservePBRSlotAfterRecv(Topic*, ..., epoch_checked).
 		Topic* topic_ptr = cxl_manager_->GetTopicPtr(handshake.topic);
 		bool epoch_checked_this_batch = false;
 
@@ -1122,6 +1125,9 @@ void NetworkManager::HandlePublishRequest(
 		if (!is_blog_header_enabled) {
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
+			// recv() populated these MessageHeader cache lines before returning to user space.
+			// Drain those stores before CLFLUSHOPT so CXL observes the freshly received headers.
+			CXL::store_fence();
 			for (size_t i = 0; i < batch_header.num_msg; ++i) {
 				if (remaining < sizeof(MessageHeader)) {
 					LOG(WARNING) << "NetworkManager: v1 batch too small for header, remaining=" << remaining;
@@ -1476,9 +1482,10 @@ void NetworkManager::SubscribeNetworkThread(
 		}
 
 		// ORDER=0, 2, 5: send batch metadata first (header_version, num_messages) for format-aware consume.
+		// MSG_MORE hints the kernel to coalesce this small send with the upcoming payload,
+		// avoiding a separate TCP segment for the 16-byte metadata header.
 		if (order == 0 || order == 5 || order == 2) {
-			// batch_meta is already populated by GetBatchToExportWithMetadata
-			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL);
+			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL | MSG_MORE);
 			if (meta_sent != sizeof(batch_meta)) {
 				LOG(ERROR) << "Failed to send batch metadata: " << strerror(errno);
 				metadata_send_failures++;
@@ -2104,7 +2111,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	// [[PERF: ACK_STALL_TUNE]] Stall sleep after kMaxStalls fast-polls with no new ACK.
 	// Lower values reduce ACK latency at cost of higher CPU (0 = busy-spin).
 	const int ack_stall_sleep_us =
-		ReadEnvIntNonNegative("EMBARCADERO_ACK_STALL_SLEEP_US", 100);
+		ReadEnvIntNonNegative("EMBARCADERO_ACK_STALL_SLEEP_US", 20);
 	if (ShouldEnableOrder5Trace()) {
 		trace_tinode = (TInode*)cxl_manager_->GetTInode(topic.c_str());
 		if (trace_tinode && trace_tinode->order == 5 &&

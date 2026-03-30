@@ -614,6 +614,9 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
         if ! start_brokers; then
             echo "ERROR: broker startup failed on trial $trial attempt $attempt" >&2
             echo "$trial,$attempt,failed,broker_startup" >> "$ATTEMPT_SUMMARY_CSV"
+            for b in $(seq 0 $((NUM_BROKERS - 1))); do
+                cp -f "/tmp/broker_${b}.log" "$LOG_DIR/trial${trial}_attempt${attempt}_broker${b}.log" 2>/dev/null || true
+            done
             cleanup
             continue
         fi
@@ -752,6 +755,9 @@ ENDINNERSCRIPT
 
         echo "WARNING: trial $trial attempt $attempt incomplete — retrying..." >&2
         echo "$trial,$attempt,failed,incomplete_or_missing_bandwidth" >> "$ATTEMPT_SUMMARY_CSV"
+        for b in $(seq 0 $((NUM_BROKERS - 1))); do
+            cp -f "/tmp/broker_${b}.log" "$LOG_DIR/trial${trial}_attempt${attempt}_broker${b}.log" 2>/dev/null || true
+        done
         # Kill any surviving clients before re-attempting
         for pid in "${CLIENT_PIDS[@]}"; do
             kill "$pid" 2>/dev/null || true
