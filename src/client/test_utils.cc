@@ -1288,7 +1288,7 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 
 	} catch (const std::exception& e) {
 		LOG(ERROR) << "Exception during latency test: " << e.what();
-		return std::make_pair(0.0, 0.0);
+		exit(EXIT_FAILURE);
 	}
 }
 

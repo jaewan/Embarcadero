@@ -48,6 +48,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/broker_lifecycle.sh"
 
+# NUMA membind: only use "1,2" when node 2 exists (avoids libnuma errors on 2-node machines).
+embar_default_numa_membind() {
+  if command -v numactl >/dev/null 2>&1 && numactl -H 2>/dev/null | grep -qE '^node 2 cpus:'; then
+    echo "1,2"
+  else
+    echo "1"
+  fi
+}
+
 BIN_DIR="$PROJECT_ROOT/build/bin"
 DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/latency}"
 
@@ -59,6 +68,14 @@ TEST_CASE="${TEST_CASE:-2}"
 MSG_SIZE="${MSG_SIZE:-1024}"
 ACK_LEVEL="${ACK_LEVEL:-1}"
 TOTAL_MESSAGE_SIZE="${TOTAL_MESSAGE_SIZE:-4294967296}"   # 4 GiB
+# Subscriber::Poll defaults to 15s; scale when unset so large runs do not false-timeout.
+if [[ -z "${EMBARCADERO_E2E_TIMEOUT_SEC+x}" ]]; then
+  _e2e=$(( 120 + TOTAL_MESSAGE_SIZE / 52428800 ))
+  (( _e2e < 180 )) && _e2e=180
+  (( _e2e > 7200 )) && _e2e=7200
+  export EMBARCADERO_E2E_TIMEOUT_SEC="$_e2e"
+  unset _e2e
+fi
 NUM_TRIALS="${NUM_TRIALS:-1}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 PLOT_RESULTS="${PLOT_RESULTS:-0}"
@@ -79,6 +96,13 @@ read -r -a modes <<< "${MODES:-steady}"
 
 # Scenario: local or remote
 SCENARIO="${SCENARIO:-local}"
+
+# Local runs: inherited EMBARCADERO_LAZYLOG_SEQ_* from another machine sends brokers to the wrong
+# coordinator. Clear unless using a remote LazyLog sequencer host or EMBARCADERO_KEEP_LAZYLOG_SEQ_ENV=1.
+if [[ "$SCENARIO" == "local" && "${EMBARCADERO_KEEP_LAZYLOG_SEQ_ENV:-0}" != "1" ]] &&
+   [[ -z "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]]; then
+  unset EMBARCADERO_LAZYLOG_SEQ_IP EMBARCADERO_LAZYLOG_SEQ_PORT
+fi
 
 if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
   for __order in "${ORDERS_ARR[@]}"; do
@@ -105,8 +129,10 @@ EMBARCADERO_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}"
 REMOTE_SCALOG_SEQUENCER_HOST="${REMOTE_SCALOG_SEQUENCER_HOST:-}"
 REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-}"
 
-# NUMA: CPUs on compute node 1; membind includes node 2 when CXL is a **zero-core** NUMA node (see cxl_manager.cc mbind).
-EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
+# NUMA: CPUs on compute node 1; membind includes node 2 only when that node exists.
+_default_membind="$(embar_default_numa_membind)"
+EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=${_default_membind}}"
+unset _default_membind
 # CORFU: same default as run_multiclient — do not wrap embarlet in numactl unless you set EMBARLET_NUMA_BIND_CORFU.
 if [[ "$SEQUENCER" == "CORFU" ]]; then
   EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND_CORFU-}"
@@ -126,9 +152,9 @@ if [ -z "${CLIENT_NUMA_BIND+x}" ]; then
   if [[ "$SCENARIO" == "remote" ]]; then
     CLIENT_NUMA_BIND=""
   else
-    # Single-node: CPUs on node 1 (match brokers). membind=1,2 so policy allows the CXL NUMA node
-    # (often node 2, no CPUs) used by head mbind; keeps heap preferring DRAM while shared CXL maps correctly.
-    CLIENT_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
+    _mb="$(embar_default_numa_membind)"
+    CLIENT_NUMA_BIND="numactl --cpunodebind=1 --membind=${_mb}"
+    unset _mb
   fi
 fi
 

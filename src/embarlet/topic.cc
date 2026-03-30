@@ -2274,6 +2274,36 @@ bool Topic::GetBatchToExportWithMetadata(
 		num_messages = (counted > 0) ? counted : 1;
 		return true;
 	}
+	// Scalog ORDER=2: local sequencers commit ordered batches into the slot ring; export
+	// uses the same slot walk as LazyLog (CompletionVector / ORDER=5-style path does not
+	// match how Scalog publishes).
+	if (seq_type_ == SCALOG && order_ == Embarcadero::kOrderTotal) {
+		if (!GetBatchToExport(expected_batch_offset, batch_addr, batch_size)) {
+			return false;
+		}
+		if (batch_addr == nullptr || batch_size < sizeof(MessageHeader)) {
+			return false;
+		}
+
+		auto* first = reinterpret_cast<MessageHeader*>(batch_addr);
+		batch_total_order = first->total_order;
+
+		uint32_t counted = 0;
+		size_t remaining = batch_size;
+		uint8_t* cursor = reinterpret_cast<uint8_t*>(batch_addr);
+		while (remaining >= sizeof(MessageHeader)) {
+			auto* hdr = reinterpret_cast<MessageHeader*>(cursor);
+			const size_t stride = static_cast<size_t>(hdr->next_msg_diff);
+			if (stride == 0 || stride > remaining) {
+				break;
+			}
+			++counted;
+			cursor += stride;
+			remaining -= stride;
+		}
+		num_messages = (counted > 0) ? counted : 1;
+		return true;
+	}
 
 	const bool trace_order5 = ShouldEnableOrder5Trace() && (order_ == 5);
 	constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
@@ -2629,10 +2659,14 @@ void Topic::FlushAccumulatedCV(
 		const uint64_t prev_pbr = cur_pbr;
 		const uint64_t pbr_val = max_pbr_index[broker_id];
 		const uint64_t cumulative = max_cumulative[broker_id];
+		const uint64_t prev_durable =
+			entry->completed_logical_offset.load(std::memory_order_acquire);
 		bool advanced_logical = false;
 		bool advanced_pbr = false;
+		bool advanced_durable = false;
 		uint64_t post_cumulative = prev_cur;
 		uint64_t post_pbr = prev_pbr;
+		uint64_t post_durable = prev_durable;
 		if (cumulative > cur) {
 			while (cumulative > cur) {
 				if (entry->sequencer_logical_offset.compare_exchange_strong(
@@ -2644,6 +2678,23 @@ void Topic::FlushAccumulatedCV(
 			}
 			if (!advanced_logical) {
 				post_cumulative = cur;
+			}
+		}
+		// [[ACK_LEVEL_2_RF1]] ORDER=5 ack_level=2 reads completed_logical_offset (NetworkManager).
+		// Happy-path commits only fed FlushAccumulatedCV, not FlushAccumulatedCVLogicalOnly's
+		// cv_logical_only_* maps (those are for late/terminalized batches), so durable lagged at 0.
+		if (sequencer_owns_durable_cv && cumulative > prev_durable) {
+			uint64_t cur_d = prev_durable;
+			while (cumulative > cur_d) {
+				if (entry->completed_logical_offset.compare_exchange_strong(
+				        cur_d, cumulative, std::memory_order_release, std::memory_order_acquire)) {
+					advanced_durable = true;
+					post_durable = cumulative;
+					break;
+				}
+			}
+			if (!advanced_durable) {
+				post_durable = cur_d;
 			}
 		}
 		if (sequencer_owns_durable_cv &&
@@ -2663,7 +2714,7 @@ void Topic::FlushAccumulatedCV(
 		if (order_ == 5 && post_pbr > prev_pbr && post_cumulative <= prev_cur) {
 			order5_ack_order_violations_.fetch_add(1, std::memory_order_relaxed);
 		}
-		if (advanced_logical || advanced_pbr) {
+		if (advanced_logical || advanced_pbr || advanced_durable) {
 			RecordOrder5FlightEvent(
 				kOrder5FlightCV,
 				static_cast<uint32_t>(broker_id),
@@ -2673,10 +2724,13 @@ void Topic::FlushAccumulatedCV(
 				post_pbr);
 		}
 		if (ShouldEnableOrder5Trace() && order_ == 5 &&
-		    (advanced_logical || (prev_pbr == kNoProgress || post_pbr > prev_pbr))) {
+		    (advanced_logical || advanced_durable ||
+		     (prev_pbr == kNoProgress || post_pbr > prev_pbr))) {
 			LOG(INFO) << "[ORDER5_TRACE_CV B" << broker_id << "]"
 			          << " cv_logical:" << prev_cur << "->"
 			          << post_cumulative
+			          << " cv_durable:" << prev_durable << "->"
+			          << post_durable
 			          << " cv_pbr_head:" << prev_pbr << "->"
 			          << post_pbr;
 		}
@@ -3330,6 +3384,10 @@ void Topic::Sequencer2() {
 	}
 	committed_seq_updater_stop_.store(false, std::memory_order_release);
 	committed_seq_updater_thread_ = std::thread(&Topic::CommittedSeqUpdaterThread, this);
+	// Same Level-5 shard state as Sequencer5: EpochSequencerThread always calls
+	// ProcessLevel5Batches (hold-buffer tick + per-epoch partition). Without this,
+	// level5_shards_ is empty and ProcessLevel5Batches dereferences level5_shards_[0].
+	InitLevel5Shards();
 	absl::btree_set<int> registered_brokers;
 	GetRegisteredBrokerSet(registered_brokers);
 
@@ -4667,7 +4725,10 @@ void Topic::ClientGc(Level5ShardState& shard) {
 }
 
 void Topic::ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector<PendingBatch5>& ready) {
-	if (level5_shards_.empty() || level5_num_shards_ <= 1) {
+	if (level5_shards_.empty()) {
+		LOG(FATAL) << "ProcessLevel5Batches: level5_shards_ empty (InitLevel5Shards was not run)";
+	}
+	if (level5_num_shards_ <= 1) {
 		ProcessLevel5BatchesShard(*level5_shards_[0], level5, ready);
 		return;
 	}

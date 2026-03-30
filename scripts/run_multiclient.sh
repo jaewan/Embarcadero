@@ -187,7 +187,22 @@ export PROJECT_ROOT
 source "$SCRIPT_DIR/lib/broker_lifecycle.sh"
 broker_init_paths
 
-EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
+embar_default_numa_membind() {
+  if command -v numactl >/dev/null 2>&1 && numactl -H 2>/dev/null | grep -qE '^node 2 cpus:'; then
+    echo "1,2"
+  else
+    echo "1"
+  fi
+}
+
+# Inherited LazyLog sequencer IP breaks all-local broker clusters unless a remote sequencer is in use.
+if [[ "${EMBARCADERO_KEEP_LAZYLOG_SEQ_ENV:-0}" != "1" ]] && [[ -z "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]]; then
+  unset EMBARCADERO_LAZYLOG_SEQ_IP EMBARCADERO_LAZYLOG_SEQ_PORT
+fi
+
+_default_mb="$(embar_default_numa_membind)"
+EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=${_default_mb}}"
+unset _default_mb
 [[ "$SEQUENCER" == "CORFU" ]] && EMBARLET_NUMA_BIND=""
 
 # ---------------------------------------------------------------------------
