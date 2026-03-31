@@ -97,11 +97,13 @@ read -r -a modes <<< "${MODES:-steady}"
 # Scenario: local or remote
 SCENARIO="${SCENARIO:-local}"
 
-# Local runs: inherited EMBARCADERO_LAZYLOG_SEQ_* from another machine sends brokers to the wrong
-# coordinator. Clear unless using a remote LazyLog sequencer host or EMBARCADERO_KEEP_LAZYLOG_SEQ_ENV=1.
-if [[ "$SCENARIO" == "local" && "${EMBARCADERO_KEEP_LAZYLOG_SEQ_ENV:-0}" != "1" ]] &&
-   [[ -z "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]]; then
-  unset EMBARCADERO_LAZYLOG_SEQ_IP EMBARCADERO_LAZYLOG_SEQ_PORT
+# Local runs should use localhost sequencer endpoints by default.
+# Respect explicit overrides from the caller.
+if [[ "$SCENARIO" == "local" && -z "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]]; then
+  export EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-127.0.0.1}"
+fi
+if [[ "$SCENARIO" == "local" && -z "${REMOTE_SCALOG_SEQUENCER_HOST:-}" ]]; then
+  export EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-127.0.0.1}"
 fi
 
 if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
@@ -294,6 +296,11 @@ start_local_brokers() {
   echo "Starting head broker (order=$order sequencer=$seq)..."
   if [[ "$seq" == "SCALOG" && -z "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
     "$BIN_DIR/scalog_global_sequencer" > /tmp/scalog_sequencer.log 2>&1 &
+  elif [[ "$seq" == "LAZYLOG" && -z "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+    # Local LazyLog coordinator (mirrors local SCALOG / CORFU startup).
+    export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
+    "$BIN_DIR/lazylog_global_sequencer" > /tmp/lazylog_sequencer.log 2>&1 &
+    sleep 0.5
   elif [[ "$seq" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     "$BIN_DIR/corfu_global_sequencer" > /tmp/corfu_sequencer.log 2>&1 &
   fi
