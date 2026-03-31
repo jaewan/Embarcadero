@@ -106,6 +106,21 @@ void nt_memcpy(void* __restrict dst, const void* __restrict src, size_t size) {
 	}
 }
 
+static void InitializeBatchHeaderRing(void* batch_headers_region) {
+	if (!batch_headers_region) return;
+	memset(batch_headers_region, 0, BATCHHEADERS_SIZE);
+	BatchHeader* slots = reinterpret_cast<BatchHeader*>(batch_headers_region);
+	const size_t slot_count = BATCHHEADERS_SIZE / sizeof(BatchHeader);
+	for (size_t i = 0; i < slot_count; ++i) {
+		slots[i].publish_commit = kBatchHeaderPublishUncommitted;
+	}
+	CXL::store_fence();
+	for (size_t i = 0; i < BATCHHEADERS_SIZE; i += 64) {
+		CXL::flush_cacheline(reinterpret_cast<uint8_t*>(batch_headers_region) + i);
+	}
+	CXL::store_fence();
+}
+
 void TopicManager::Shutdown() {
 	if (shutdown_done_.exchange(true, std::memory_order_acq_rel)) {
 		return;
@@ -163,6 +178,9 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	tinode->offsets[broker_id_].validated_written_byte_offset = 0;
 	for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
 		tinode->offsets[broker_id_].replication_done[i] = 0;
+	}
+	CXL::store_fence();
+	for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
 		const void* rep_done_entry = const_cast<const void*>(static_cast<const volatile void*>(
 			&tinode->offsets[broker_id_].replication_done[i]));
 		CXL::flush_cacheline(rep_done_entry);
@@ -242,13 +260,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		// [[CRITICAL FIX: STALE_RING_DATA]] Zero out batch header ring to prevent false in-flight slots
 		// CXL memory may contain garbage data that looks like batches (num_msg>0, batch_complete=0).
 		// Without zeroing, the scanner will think these are in-flight batches and stall.
-		memset(batch_headers_region, 0, BATCHHEADERS_SIZE);
-		// Flush the zeroed memory to CXL (non-coherent)
-		for (size_t i = 0; i < BATCHHEADERS_SIZE; i += 64) {
-			CXL::flush_cacheline(reinterpret_cast<uint8_t*>(batch_headers_region) + i);
-		}
-		CXL::store_fence();
-		LOG(INFO) << "Zeroed batch header ring at " << batch_headers_region << " (" << BATCHHEADERS_SIZE << " bytes)";
+		InitializeBatchHeaderRing(batch_headers_region);
+		LOG(INFO) << "Initialized batch header ring at " << batch_headers_region
+		          << " (" << BATCHHEADERS_SIZE << " bytes, publish_commit=UNCOMMITTED)";
 
 		// Handle replica if needed
 		if (tinode->replicate_tinode) {
@@ -415,12 +429,19 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		}
 
 		// [[CRITICAL FIX: STALE_RING_DATA]] Zero out batch header ring to prevent false in-flight slots
-		memset(batch_headers_region, 0, BATCHHEADERS_SIZE);
-		for (size_t i = 0; i < BATCHHEADERS_SIZE; i += 64) {
-			CXL::flush_cacheline(reinterpret_cast<uint8_t*>(batch_headers_region) + i);
+		InitializeBatchHeaderRing(batch_headers_region);
+		LOG(INFO) << "Initialized batch header ring at " << batch_headers_region
+		          << " (" << BATCHHEADERS_SIZE << " bytes, publish_commit=UNCOMMITTED)";
+
+		// Topic metadata lives across trials in shared CXL memory. Reset every broker offset entry
+		// before publishing the new topic so the head never scans a stale follower ring from a
+		// previous run before that follower has recreated and published its fresh offsets.
+		memset(const_cast<offset_entry*>(tinode->offsets), 0, sizeof(tinode->offsets));
+		CXL::store_fence();
+		for (size_t i = 0; i < sizeof(tinode->offsets); i += 64) {
+			CXL::flush_cacheline(reinterpret_cast<uint8_t*>(const_cast<offset_entry*>(tinode->offsets)) + i);
 		}
 		CXL::store_fence();
-		LOG(INFO) << "Zeroed batch header ring at " << batch_headers_region << " (" << BATCHHEADERS_SIZE << " bytes)";
 
 		// Initialize tinode metadata
 		tinode->order = order;
@@ -432,6 +453,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		memcpy(tinode->topic, topic, std::min<size_t>(TOPIC_NAME_SIZE - 1, strlen(topic)));
 
 		// [[ROOT_CAUSE_B_FIX]] - Flush TInode metadata after head broker initialization
+		CXL::store_fence();
 		CXL::flush_cacheline(tinode);
 		CXL::store_fence();
 

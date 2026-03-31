@@ -1202,11 +1202,14 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-	if (publisher_disconnected && cxl_manager_ && handshake.topic[0] != '\0') {
-		if (Topic* topic = cxl_manager_->GetTopicPtr(handshake.topic)) {
-			topic->RequestOrder5HoldExpiryOnce();
-		}
-	}
+	// Do not arm ORDER=5 force-expiry on an arbitrary publisher disconnect.
+	// In multi-client runs one publisher can finish earlier than the others; treating
+	// that single disconnect as "cluster tail drain" causes the sequencer to expire
+	// perfectly healthy cross-broker gaps while other publishers are still active.
+	//
+	// Tail drain is now stall-driven inside the sequencer itself, so disconnect here
+	// is only a local socket lifecycle event.
+	(void)publisher_disconnected;
 
 	close(client_socket);
 }

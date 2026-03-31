@@ -528,6 +528,26 @@ broker_local_drain_ports() {
   return 0
 }
 
+broker_local_signal_named_processes() {
+  local signal="$1"
+  shift
+  local self_pids=" $$ ${BASHPID:-} ${PPID:-} "
+  local name pid
+  for name in "$@"; do
+    while IFS= read -r pid; do
+      [ -n "$pid" ] || continue
+      case " $self_pids " in
+        *" $pid "*) continue ;;
+      esac
+      if [ -n "$signal" ]; then
+        kill "$signal" "$pid" >/dev/null 2>&1 || true
+      else
+        kill "$pid" >/dev/null 2>&1 || true
+      fi
+    done < <(pgrep -x "$name" 2>/dev/null || true)
+  done
+}
+
 broker_local_cleanup() {
   # First terminate shell-owned background jobs and reap them quietly.
   # This avoids noisy async job-status lines during teardown.
@@ -548,24 +568,12 @@ broker_local_cleanup() {
     done
   fi
 
-  # Then clean up any remaining local processes by name.
-  pkill -x embarlet >/dev/null 2>&1 || true
-  pkill -f "./embarlet" >/dev/null 2>&1 || true
-  pkill -x throughput_test >/dev/null 2>&1 || true
-  pkill -f "./throughput_test" >/dev/null 2>&1 || true
-  pkill -x corfu_global_sequencer >/dev/null 2>&1 || true
-  pkill -f "./corfu_global_sequencer" >/dev/null 2>&1 || true
-  pkill -x scalog_global_sequencer >/dev/null 2>&1 || true
-  pkill -f "./scalog_global_sequencer" >/dev/null 2>&1 || true
+  # Then clean up any remaining local broker/test processes by exact executable name.
+  # Avoid `pkill -f ./foo`: in orchestration shells it can match the shell command line
+  # and kill the harness itself while cleanup is running.
+  broker_local_signal_named_processes "" embarlet throughput_test corfu_global_sequencer scalog_global_sequencer
   sleep 0.1
-  pkill -9 -x embarlet >/dev/null 2>&1 || true
-  pkill -9 -f "./embarlet" >/dev/null 2>&1 || true
-  pkill -9 -x throughput_test >/dev/null 2>&1 || true
-  pkill -9 -f "./throughput_test" >/dev/null 2>&1 || true
-  pkill -9 -x corfu_global_sequencer >/dev/null 2>&1 || true
-  pkill -9 -f "./corfu_global_sequencer" >/dev/null 2>&1 || true
-  pkill -9 -x scalog_global_sequencer >/dev/null 2>&1 || true
-  pkill -9 -f "./scalog_global_sequencer" >/dev/null 2>&1 || true
+  broker_local_signal_named_processes "-9" embarlet throughput_test corfu_global_sequencer scalog_global_sequencer
   broker_local_drain_ports
   rm -f /tmp/embarlet_*_ready 2>/dev/null || true
 }

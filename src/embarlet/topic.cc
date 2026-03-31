@@ -77,16 +77,46 @@ static uint64_t GetOrder5HoldTimeoutNs(bool replicated_ack2_mode) {
 	if (const char* env = std::getenv("EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS")) {
 		char* end = nullptr;
 		unsigned long parsed = std::strtoul(env, &end, 10);
-		if (end != env && *end == '\0' && parsed > 0) {
+		if (end != env && *end == '\0') {
 			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
 		}
 		LOG(WARNING) << "Ignoring invalid EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS='" << env
 		             << "'; using runtime default";
 	}
-	// Keep the default hold timeout tight enough that replicated ORDER=5 runs do not
-	// accumulate a large disconnect-time expiry wave. The force-expire window still
-	// handles final tail drain explicitly.
-	const uint64_t default_ms = 100ULL;
+	(void)replicated_ack2_mode;
+	// ORDER=5 gaps are normal while multiple publishers stripe across brokers. Treating
+	// "held for N ms" as loss in steady state causes false expiry waves and ACK stalls.
+	// We therefore disable steady-state age expiry by default and rely on explicit
+	// force-expire windows during verified stalls/tail drain. Operators can still opt
+	// back into a fixed timeout for experiments via EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS.
+	return 0;
+}
+
+static uint64_t GetOrder5IdleForceExpireTriggerNs(bool replicated_ack2_mode) {
+	if (const char* env = std::getenv("EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS")) {
+		char* end = nullptr;
+		unsigned long parsed = std::strtoul(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0) {
+			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
+		}
+		LOG(WARNING) << "Ignoring invalid EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS='" << env
+		             << "'; using runtime default";
+	}
+	const uint64_t default_ms = replicated_ack2_mode ? 2000ULL : 750ULL;
+	return default_ms * 1000ULL * 1000ULL;
+}
+
+static uint64_t GetOrder5IdleForceExpireWindowNs(bool replicated_ack2_mode) {
+	if (const char* env = std::getenv("EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_WINDOW_MS")) {
+		char* end = nullptr;
+		unsigned long parsed = std::strtoul(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0) {
+			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
+		}
+		LOG(WARNING) << "Ignoring invalid EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_WINDOW_MS='" << env
+		             << "'; using runtime default";
+	}
+	const uint64_t default_ms = replicated_ack2_mode ? 1000ULL : 250ULL;
 	return default_ms * 1000ULL * 1000ULL;
 }
 
@@ -1924,15 +1954,17 @@ bool Topic::ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
 		batch_header_location = nullptr;
 		return false;
 	}
-	batch_header.batch_complete = 0;
-	batch_header.flags = kBatchHeaderFlagValid;
-
-	// [[P0.1]] Minimal slot init: scanner gates on VALID && num_msg>0. Set CLAIMED only; no full memset.
 	BatchHeader* slot = reinterpret_cast<BatchHeader*>(batch_headers_log);
-	slot->publish_commit = kBatchHeaderPublishUncommitted;
-	__atomic_store_n(&slot->flags, kBatchHeaderFlagClaimed, __ATOMIC_RELEASE);
-	__atomic_store_n(&slot->batch_complete, 0, __ATOMIC_RELEASE);
-	__atomic_store_n(&slot->num_msg, 0, __ATOMIC_RELEASE);
+	BatchHeader claimed = batch_header;
+	claimed.flags = kBatchHeaderFlagClaimed;
+	claimed.batch_complete = 0;
+	claimed.publish_commit = kBatchHeaderPublishUncommitted;
+
+	// Persist a full immutable claim descriptor before publication.
+	// ORDER=5 scanners gate readiness on publish_commit + batch_complete, so exposing the
+	// descriptor early is safe and gives timeout recovery enough identity to retire a specific
+	// client sequence gap instead of an anonymous ring slot.
+	memcpy(slot, &claimed, sizeof(BatchHeader));
 	CXL::store_fence();
 	CXL::flush_cacheline(batch_headers_log);
 	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(batch_headers_log) + 64);
@@ -1984,16 +2016,22 @@ bool Topic::PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader
 	return PublishPBRSlotDirect(batch_header, batch_header_location);
 }
 
+void Topic::ArmOrder5ForceExpiryWindow(uint64_t duration_ns) {
+	if (duration_ns == 0) return;
+	const uint64_t new_deadline = SteadyNowNs() + duration_ns;
+	uint64_t cur_deadline = force_expire_hold_until_ns_.load(std::memory_order_acquire);
+	while (cur_deadline < new_deadline &&
+	       !force_expire_hold_until_ns_.compare_exchange_weak(
+	           cur_deadline, new_deadline, std::memory_order_release, std::memory_order_acquire)) {
+	}
+}
+
 void Topic::RequestOrder5HoldExpiryOnce() {
 	if (seq_type_ == EMBARCADERO && Embarcadero::UsesEpochSequencerPath(order_)) {
 		const uint64_t kDisconnectForceExpireWindowNs =
 			(replication_factor_ > 0) ? 90'000'000'000ULL : 2'500'000'000ULL;
-		const uint64_t new_deadline = SteadyNowNs() + kDisconnectForceExpireWindowNs;
-		uint64_t cur_deadline = force_expire_hold_until_ns_.load(std::memory_order_acquire);
-		while (cur_deadline < new_deadline &&
-		       !force_expire_hold_until_ns_.compare_exchange_weak(
-		           cur_deadline, new_deadline, std::memory_order_release, std::memory_order_acquire)) {
-		}
+		ArmOrder5ForceExpiryWindow(kDisconnectForceExpireWindowNs);
+		const uint64_t new_deadline = force_expire_hold_until_ns_.load(std::memory_order_acquire);
 
 		// A disconnect often means publishers have finished sending and the last useful work
 		// is sitting in the current COLLECTING epoch. Nudge the epoch state machine forward so
@@ -4029,6 +4067,16 @@ void Topic::EpochSequencerThread() {
 		          << ",ordered=" << tinode_->offsets[3].ordered << ")";
 	};
 	uint64_t last_idle_diag_ns = 0;
+	uint64_t idle_stall_start_ns = 0;
+	uint64_t last_idle_progress_epoch = last_sequenced_epoch_.load(std::memory_order_acquire);
+	std::array<uint64_t, NUM_MAX_BROKERS> last_idle_scanner_pushed_batches{};
+	std::array<uint64_t, NUM_MAX_BROKERS> last_idle_sequencer_committed_batches{};
+	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
+		last_idle_scanner_pushed_batches[b] =
+			scanner_pushed_batches_[b].load(std::memory_order_relaxed);
+		last_idle_sequencer_committed_batches[b] =
+			sequencer_committed_batches_[b].load(std::memory_order_relaxed);
+	}
 	auto run_idle_hold_tick = [&]() {
 		if (!Embarcadero::UsesEpochSequencerPath(order_) || seq_type_ != EMBARCADERO) return;
 		const uint64_t now_ns = SteadyNowNs();
@@ -4042,7 +4090,39 @@ void Topic::EpochSequencerThread() {
 			std::lock_guard<std::mutex> lock(shard_ptr->mu);
 			deferred_before += shard_ptr->deferred_level5.size();
 		}
-		if ((hold_before > 0 || deferred_before > 0) &&
+		const bool has_held_work = (hold_before > 0 || deferred_before > 0);
+		bool observed_progress = false;
+		const uint64_t current_last_sequenced_epoch =
+			last_sequenced_epoch_.load(std::memory_order_acquire);
+		if (current_last_sequenced_epoch != last_idle_progress_epoch) {
+			observed_progress = true;
+			last_idle_progress_epoch = current_last_sequenced_epoch;
+		}
+		for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
+			const uint64_t pushed = scanner_pushed_batches_[b].load(std::memory_order_relaxed);
+			const uint64_t committed =
+				sequencer_committed_batches_[b].load(std::memory_order_relaxed);
+			if (pushed != last_idle_scanner_pushed_batches[b] ||
+			    committed != last_idle_sequencer_committed_batches[b]) {
+				observed_progress = true;
+			}
+			last_idle_scanner_pushed_batches[b] = pushed;
+			last_idle_sequencer_committed_batches[b] = committed;
+		}
+		if (has_held_work) {
+			if (observed_progress || idle_stall_start_ns == 0) {
+				idle_stall_start_ns = now_ns;
+			}
+			const uint64_t idle_stall_age_ns = now_ns - idle_stall_start_ns;
+			if (!force_expire_active &&
+			    idle_stall_age_ns >= GetOrder5IdleForceExpireTriggerNs(replication_factor_ > 0)) {
+				ArmOrder5ForceExpiryWindow(
+					GetOrder5IdleForceExpireWindowNs(replication_factor_ > 0));
+			}
+		} else {
+			idle_stall_start_ns = 0;
+		}
+		if (has_held_work &&
 		    (now_ns - last_idle_diag_ns) > 5'000'000'000ULL) {
 			last_idle_diag_ns = now_ns;
 			CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
@@ -4050,6 +4130,7 @@ void Topic::EpochSequencerThread() {
 			LOG(ERROR) << "[SEQ5_IDLE_DIAG] hold=" << hold_before
 			           << " deferred=" << deferred_before
 			           << " force_expire=" << (force_expire_active ? 1 : 0)
+			           << " progress=" << (observed_progress ? 1 : 0)
 			           << " epoch_idx=" << epoch_index_.load(std::memory_order_relaxed)
 			           << " last_seq=" << last_sequenced_epoch_.load(std::memory_order_relaxed);
 			for (int b = 0; b < 4; ++b) {
@@ -4066,7 +4147,7 @@ void Topic::EpochSequencerThread() {
 				           << " seq_commit_m=" << sequencer_committed_msgs_[b].load(std::memory_order_relaxed);
 			}
 		}
-		if (hold_before == 0 && deferred_before == 0 && !force_expire_active) return;
+		if (!has_held_work && !force_expire_active) return;
 		std::vector<PendingBatch5> idle_level5_empty;
 		std::vector<PendingBatch5> idle_ready_level5;
 		ProcessLevel5Batches(idle_level5_empty, idle_ready_level5);
@@ -4736,16 +4817,35 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	std::array<uint64_t, NUM_MAX_BROKERS> shard_cv_max_cumulative{};
 	std::array<uint64_t, NUM_MAX_BROKERS> shard_cv_max_pbr_index{};
 
-	// [[SKIP_MARKER_FILTER]] Extract skip markers before sorting/grouping.
-	// Skip markers (from BrokerScannerWorker5 hole-skip) have client_id=SIZE_MAX.
-	// They don't need per-client FIFO tracking - just push directly to ready
-	// so EpochSequencerThread can advance consumed_through for their slots.
-	auto skip_partition = std::partition(level5.begin(), level5.end(),
-		[](const PendingBatch5& p) { return !p.skipped; });
-	for (auto it = skip_partition; it != level5.end(); ++it) {
-		ready.push_back(std::move(*it));
+	// [[SKIP_MARKER_FILTER]] Extract scanner timeout markers before sorting/grouping.
+	// Anonymous skips advance only consumed_through. Targeted skips (client_id/batch_seq known
+	// from the claim descriptor) must also advance the affected client frontier so later held
+	// batches can drain.
+	uint64_t hold_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+	auto skip_it = level5.begin();
+	while (skip_it != level5.end()) {
+		if (!skip_it->skipped) {
+			++skip_it;
+			continue;
+		}
+		if (skip_it->client_id != SIZE_MAX) {
+			ClientState5& state = shard.client_state[skip_it->client_id];
+			state.last_epoch = hold_epoch;
+			LOG(INFO) << "[ORDER5_TARGETED_SKIP]"
+			          << " client=" << skip_it->client_id
+			          << " seq=" << skip_it->batch_seq
+			          << " broker=" << skip_it->broker_id
+			          << " next_expected_before=" << state.next_expected
+			          << " hold_size=" << shard.hold_buffer_size;
+			state.mark_sequenced(skip_it->batch_seq);
+			if (skip_it->batch_seq >= state.next_expected) {
+				state.next_expected = skip_it->batch_seq + 1;
+				record_forced_skip(skip_it->client_id);
+			}
+		}
+		ready.push_back(std::move(*skip_it));
+		skip_it = level5.erase(skip_it);
 	}
-	level5.erase(skip_partition, level5.end());
 
 	// [PHASE-6] Fast path: single client, no held batches, no deferred.
 	// Skip radix sort, dedup check, and hold buffer management when possible.
@@ -5288,7 +5388,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			bool should_expire = false;
 			if (force_expire_all_frontiers) {
 				should_expire = (age_ns >= kForceExpireMinAgeNs);
-			} else {
+			} else if (normal_timeout_ns > 0) {
 				should_expire = (age_ns >= normal_timeout_ns);
 			}
 			if (should_expire) {
@@ -5878,6 +5978,19 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 
 				LOG(ERROR) << "[Scanner B" << broker_id << "] CLAIMED slot timeout ("
 					<< (kMaxClaimedWaitUs / 1000000) << "s), forcing skip. DATA MAY BE LOST for this batch.";
+				LOG(ERROR) << "[ORDER5_CLAIMED_TIMEOUT]"
+				           << " broker=" << broker_id
+				           << " slot_seq=" << scanner_slot_seq
+				           << " slot_off=" << (reinterpret_cast<uint8_t*>(current_batch_header) -
+				                               reinterpret_cast<uint8_t*>(ring_start_default))
+				           << " client=" << current_batch_header->client_id
+				           << " seq=" << current_batch_header->batch_seq
+				           << " flags=0x" << std::hex << __atomic_load_n(&current_batch_header->flags, __ATOMIC_ACQUIRE)
+				           << std::dec
+				           << " publish_commit=" << current_batch_header->publish_commit
+				           << " pbr_abs=" << current_batch_header->pbr_absolute_index
+				           << " num_msg=" << current_batch_header->num_msg
+				           << " batch_complete=" << current_batch_header->batch_complete;
 
 				// Push SKIP marker with the same robust retry as normal batch push.
 				// Timer reset and counter increment are deferred until the push succeeds;
@@ -5891,10 +6004,15 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 					skip_marker.hdr = current_batch_header;
 					skip_marker.broker_id = broker_id;
 					skip_marker.num_msg = 0;
-					skip_marker.client_id = SIZE_MAX;
-					skip_marker.batch_seq = SIZE_MAX;
+					skip_marker.client_id = current_batch_header->client_id;
+					skip_marker.batch_seq = current_batch_header->batch_seq;
 					skip_marker.slot_offset = slot_offset;
-					skip_marker.epoch_created = 0;
+					skip_marker.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
+					skip_marker.cached_batch_id = current_batch_header->batch_id;
+					skip_marker.cached_pbr_absolute_index = current_batch_header->pbr_absolute_index;
+					skip_marker.cached_log_idx = current_batch_header->log_idx;
+					skip_marker.cached_total_size = current_batch_header->total_size;
+					skip_marker.cached_start_logical_offset = current_batch_header->start_logical_offset;
 					skip_marker.skipped = true;
 
 					bool pushed = false;
