@@ -2151,6 +2151,8 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	size_t fast_checks_since_last_send = 0;
 	size_t stall_sleep_since_last_send = 0;
 	constexpr size_t kMaxFastPollsBeforeFullCheck = 256;
+	// For CORFU ordered-frontier hole-filling: call DrainStaleCorfuFrontier() every 5s on stall.
+	auto last_corfu_drain_time = std::chrono::steady_clock::now();
 
 		while (!stop_threads_) {
 		loops_since_last_send++;
@@ -2209,6 +2211,17 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 			        std::chrono::steady_clock::now() - ack_last_progress_time).count() >= 5) {
 				trace_topic->DumpOrder5FlightRecorder("ack_stall");
 				dumped_order5_flight = true;
+			}
+
+			// CORFU hole-filling: if the ordered frontier is stuck (a batch_seq committed by
+			// the global sequencer was never delivered as a header), DrainStaleCorfuFrontier
+			// skips it after a 10s timeout so all subsequent batches can drain.
+			if (use_per_client_ack_level1 && ack_topic != nullptr) {
+				auto now = std::chrono::steady_clock::now();
+				if (std::chrono::duration_cast<std::chrono::seconds>(now - last_corfu_drain_time).count() >= 5) {
+					ack_topic->DrainStaleCorfuFrontier();
+					last_corfu_drain_time = now;
+				}
 			}
 
 			// [[PERF: ACK_BACKOFF_TUNE]] Keep ACK polling responsive by capping stall sleep.

@@ -1263,10 +1263,63 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 		}
 	}
 
-	if (contiguous_advanced > 0 && VLOG_IS_ON(4)) {
-		VLOG(4) << "Corfu ORDER=2 advanced contiguous frontier by " << contiguous_advanced
-		        << " batches, acked_messages+=" << messages_to_ack
-		        << " next_seq=" << corfu_order2_next_seq_;
+	if (contiguous_advanced > 0) {
+		// Record the time at which the frontier last moved, so DrainStaleCorfuFrontier can detect
+		// holes that have been stuck for longer than the drain threshold.
+		corfu_order2_frontier_advanced_ns_.store(
+			std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count(),
+			std::memory_order_relaxed);
+		if (VLOG_IS_ON(4)) {
+			VLOG(4) << "Corfu ORDER=2 advanced contiguous frontier by " << contiguous_advanced
+			        << " batches, acked_messages+=" << messages_to_ack
+			        << " next_seq=" << corfu_order2_next_seq_;
+		}
+	}
+}
+
+void Topic::DrainStaleCorfuFrontier() {
+	if (seq_type_ != CORFU || order_ != Embarcadero::kOrderTotal) return;
+
+	uint64_t stuck_seq = 0;
+	bool should_skip = false;
+	{
+		absl::MutexLock lock(&corfu_order2_mu_);
+		if (corfu_order2_completed_.empty()) return;
+
+		// Check whether the minimum pending entry is above the frontier (i.e., there is a hole).
+		const uint64_t min_pending = corfu_order2_completed_.begin()->first;
+		if (min_pending <= corfu_order2_next_seq_) {
+			// The next-in-line batch is already pending; RecordCorfuOrder2BatchCompletion will
+			// drain it when this lock is released.  No skip needed.
+			return;
+		}
+
+		// There is a hole: min_pending > next_seq_.
+		// Decide whether the hole has been stuck long enough to warrant a skip.
+		constexpr int64_t kStuckThresholdNs = 10LL * 1000000000LL;  // 10 seconds
+		int64_t last_adv = corfu_order2_frontier_advanced_ns_.load(std::memory_order_relaxed);
+		const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+
+		if (last_adv == 0) {
+			// First time we observe a hole; initialise the timer and return.
+			corfu_order2_frontier_advanced_ns_.store(now_ns, std::memory_order_relaxed);
+			return;
+		}
+
+		if (now_ns - last_adv >= kStuckThresholdNs) {
+			stuck_seq = corfu_order2_next_seq_;
+			should_skip = true;
+		}
+	}
+
+	if (should_skip) {
+		LOG(WARNING) << "CORFU DrainStaleFrontier: frontier stuck at batch_seq=" << stuck_seq
+		             << " for >" << 10 << "s; publisher likely disconnected before delivering"
+		             << " the batch header. Inserting 0-msg skip to unblock.";
+		// SkipCorfuOrder2Batch acquires corfu_order2_mu_ (and optionally durable_mu_) internally.
+		SkipCorfuOrder2Batch(stuck_seq, 0 /*client_id unknown — safe because num_msg=0*/);
 	}
 }
 

@@ -422,6 +422,10 @@ class Topic {
 		// Advance ordered (and, if replicated, durable) frontiers with 0-message credit for a
 		// batch whose payload never arrived (publisher disconnected after GetTotalOrder committed).
 		void SkipCorfuOrder2Batch(uint64_t batch_seq, uint32_t client_id);
+		// Detect a hole in the CORFU ORDER=2 ordered frontier (a batch_seq committed by the global
+		// sequencer whose header was never delivered to this broker) and skip it after a timeout.
+		// Safe to call from AckThread periodically — idempotent and lock-safe.
+		void DrainStaleCorfuFrontier();
 
 		/** [[ORDER_0_SKIP_PBR]] For order 0 we do not write to PBR. Returns start logical offset for this batch and advances by num_msg. */
 		size_t GetAndAdvanceOrder0LogicalOffset(uint32_t num_msg);
@@ -655,6 +659,9 @@ class Topic {
 		absl::Mutex corfu_order2_mu_;
 		uint64_t corfu_order2_next_seq_ ABSL_GUARDED_BY(corfu_order2_mu_) = 0;
 		absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>> corfu_order2_completed_ ABSL_GUARDED_BY(corfu_order2_mu_);
+		// Nanoseconds since epoch when corfu_order2_next_seq_ last advanced (0 = never/unset).
+		// Updated inside corfu_order2_mu_; read by DrainStaleCorfuFrontier to detect stuck frontiers.
+		std::atomic<int64_t> corfu_order2_frontier_advanced_ns_{0};
 		// Corfu ACK2 durable cumulative count (message count - 1 = last durable offset).
 		std::atomic<uint64_t> corfu_ack2_durable_count_{0};
 		absl::Mutex corfu_order2_durable_mu_;
