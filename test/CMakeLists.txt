@@ -147,6 +147,29 @@ if(PkgConfig_FOUND)
             TIMEOUT 60
             LABELS "unit;replication;topology;smoke"
         )
+
+        # SCALOG ACK invariant test
+        add_executable(scalog_ack_invariant_test
+            scalog_ack_invariant_test.cc
+        )
+        target_include_directories(scalog_ack_invariant_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(scalog_ack_invariant_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(scalog_ack_invariant_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_scalog_ack_invariant COMMAND scalog_ack_invariant_test)
+        set_tests_properties(unit_scalog_ack_invariant PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;scalog;ack;invariant;correctness"
+        )
     else()
         message(WARNING "GTest not found via pkg-config, unit tests disabled")
     endif()
