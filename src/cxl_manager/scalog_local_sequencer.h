@@ -45,6 +45,9 @@ class ScalogLocalSequencer {
 		void* cxl_addr_;
 		BatchHeader* batch_header_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
+		size_t seq_ = 0;
+		MessageHeader* msg_to_order_ = nullptr;
+		size_t batch_header_idx_ = 0;
 
 		/// Last cumulative global cut received from global sequencer (broker_id -> cumulative count).
 		absl::btree_map<int, int64_t> global_cut_;

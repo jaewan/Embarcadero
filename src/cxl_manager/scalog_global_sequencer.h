@@ -78,7 +78,7 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
 		absl::Mutex stream_mu_;
 
 		// Replication factor
-		int num_replicas_per_broker_;
+		int num_replicas_per_broker_ = 1;
 
 		std::thread global_cut_thread_;
 };

@@ -206,6 +206,7 @@ void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, uint64_t written_add
 	volatile size_t* written_ptr = &tinode->offsets[broker_id_].written;
 	__atomic_fetch_add(reinterpret_cast<size_t*>(const_cast<size_t*>(written_ptr)), num_msg, __ATOMIC_RELEASE);
 
+	CXL::store_fence();
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written_addr));
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
 	CXL::store_fence();  // Required for CXL visibility; reader (AckThread) must see updated written
@@ -787,6 +788,11 @@ void NetworkManager::HandlePublishRequest(
 		cxl_base = reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr());
 	}
 
+	// Hoist std::function outside the loop to avoid per-batch construction/destruction overhead.
+	// For EMBARCADERO paths non_emb_seq_callback is always nullptr; for CORFU/KAFKA the lambda
+	// is assigned by GetCXLBuffer and reset here each iteration.
+	std::function<void(void*, size_t)> non_emb_seq_callback = nullptr;
+
 	while (running && !stop_threads_) {
 		constexpr int recv_flags = MSG_NOSIGNAL;
 		// Read batch header
@@ -803,8 +809,6 @@ void NetworkManager::HandlePublishRequest(
 				}
 				LOG(ERROR) << "Error receiving batch header: " << strerror(errno);
 			} else {
-				// bytes_read == 0 indicates connection closed by peer
-				// In failure test, publishers close the connection intentionally when their broker fails and they switch.
 				VLOG(1) << "NetworkManager: Connection closed by publisher (client_id=" 
 				            << handshake.client_id << ", topic=" << handshake.topic 
 				            << "). Normal termination if publisher is re-routing or shutting down.";
@@ -851,13 +855,12 @@ void NetworkManager::HandlePublishRequest(
 		size_t to_read = batch_header.total_size;
 		void* segment_header = nullptr;
 		void* buf = nullptr;
-		size_t logical_offset = 0;  // Initialize to prevent garbage values in UpdateWrittenForOrder0
+		size_t logical_offset = 0;
 		SequencerType seq_type;
 		BatchHeader* batch_header_location = nullptr;
 
-		std::function<void(void*, size_t)> non_emb_seq_callback = nullptr;
+		non_emb_seq_callback = nullptr;
 
-		// [[Issue #3]] Get Topic* once per batch for single epoch check and ReservePBRSlotAfterRecv(Topic*, ..., epoch_checked).
 		Topic* topic_ptr = cxl_manager_->GetTopicPtr(handshake.topic);
 		bool epoch_checked_this_batch = false;
 
@@ -875,7 +878,9 @@ void NetworkManager::HandlePublishRequest(
 			if (topic_ptr && topic_ptr->GetSeqtype() == EMBARCADERO) {
 				if (!epoch_checked_this_batch) {
 					if (topic_ptr->CheckEpochOnce()) {
-						std::this_thread::sleep_for(std::chrono::milliseconds(100));
+						// Epoch stale: yield and retry; do NOT sleep — this is called on every
+						// batch receive and a long sleep here would throttle the entire publish pipe.
+						std::this_thread::yield();
 						continue;
 					}
 					epoch_checked_this_batch = true;
@@ -910,8 +915,16 @@ void NetworkManager::HandlePublishRequest(
 		// [[PERF_REGRESSION_FIX]] Removed ORDER_0_LOG_IDX - not needed now that ORDER=0 uses PBR.
 
 		// [[PERF: ORDER=0 fast path]] Detect whether to skip PBR entirely.
-		const bool order0_fast = ShouldUseOrder0FastPath() &&
-			seq_type == EMBARCADERO && topic_ptr && topic_ptr->GetOrder() == 0;
+		// ACK=2 with RF>0 requires the replication-done frontier even for ORDER=0;
+		// the fast path bypasses that check, so exclude it for correctness.
+		const bool order0_fast =
+			ShouldUseOrder0FastPath() &&
+			seq_type == EMBARCADERO &&
+			topic_ptr &&
+			topic_ptr->GetOrder() == 0 &&
+			!(handshake.ack == 2 &&
+			  order0_tinode != nullptr &&
+			  order0_tinode->replication_factor > 0);
 
 		// [[DESIGN: PBR reserve after receive]] For EMBARCADERO, GetCXLBuffer only allocates BLog (buf);
 		// batch_header_location is intentionally null here and is set later by ReservePBRSlotAfterRecv.
@@ -1112,6 +1125,9 @@ void NetworkManager::HandlePublishRequest(
 		if (!is_blog_header_enabled) {
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
+			// recv() populated these MessageHeader cache lines before returning to user space.
+			// Drain those stores before CLFLUSHOPT so CXL observes the freshly received headers.
+			CXL::store_fence();
 			for (size_t i = 0; i < batch_header.num_msg; ++i) {
 				if (remaining < sizeof(MessageHeader)) {
 					LOG(WARNING) << "NetworkManager: v1 batch too small for header, remaining=" << remaining;
@@ -1186,11 +1202,14 @@ void NetworkManager::HandlePublishRequest(
 			}
 		}
 
-	if (publisher_disconnected && cxl_manager_ && handshake.topic[0] != '\0') {
-		if (Topic* topic = cxl_manager_->GetTopicPtr(handshake.topic)) {
-			topic->RequestOrder5HoldExpiryOnce();
-		}
-	}
+	// Do not arm ORDER=5 force-expiry on an arbitrary publisher disconnect.
+	// In multi-client runs one publisher can finish earlier than the others; treating
+	// that single disconnect as "cluster tail drain" causes the sequencer to expire
+	// perfectly healthy cross-broker gaps while other publishers are still active.
+	//
+	// Tail drain is now stall-driven inside the sequencer itself, so disconnect here
+	// is only a local socket lifecycle event.
+	(void)publisher_disconnected;
 
 	close(client_socket);
 }
@@ -1466,9 +1485,10 @@ void NetworkManager::SubscribeNetworkThread(
 		}
 
 		// ORDER=0, 2, 5: send batch metadata first (header_version, num_messages) for format-aware consume.
+		// MSG_MORE hints the kernel to coalesce this small send with the upcoming payload,
+		// avoiding a separate TCP segment for the 16-byte metadata header.
 		if (order == 0 || order == 5 || order == 2) {
-			// batch_meta is already populated by GetBatchToExportWithMetadata
-			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL);
+			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL | MSG_MORE);
 			if (meta_sent != sizeof(batch_meta)) {
 				LOG(ERROR) << "Failed to send batch metadata: " << strerror(errno);
 				metadata_send_failures++;
@@ -1771,14 +1791,18 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		CXL::full_fence();
 
 		uint64_t completed_logical_offset = my_cv_entry->sequencer_logical_offset.load(std::memory_order_acquire);
-		volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
-		CXL::flush_cacheline(const_cast<const void*>(
-			reinterpret_cast<const volatile void*>(ordered_ptr)));
-		CXL::load_fence();
-		const uint64_t ordered_count = tinode->offsets[broker_id_].ordered;
 
+		// Only read ordered_count when the CV is still at zero (cold-start sentinel path).
+		// In steady-state completed_logical_offset advances normally, so the extra CXL flush
+		// and load_fence on tinode->ordered would be unnecessary overhead on every ACK iteration.
+		uint64_t ordered_count = 0;
 		if (completed_logical_offset == 0) {
 			uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
+			volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(ordered_ptr)));
+			CXL::load_fence();
+			ordered_count = tinode->offsets[broker_id_].ordered;
 			if (completed_pbr_index == static_cast<uint64_t>(-1) && ordered_count == 0) {
 				return static_cast<size_t>(-1);
 			}
@@ -1979,19 +2003,30 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic='" << topic
 	          << "' (len=" << topic.size() << "), ack_level=" << ack_level
 	          << ", client_id=" << client_id;
+	auto remove_ack_registration = [&]() {
+		absl::MutexLock lock(&ack_mu_);
+		auto it = ack_connections_.find(client_id);
+		if (it != ack_connections_.end() && it->second == ack_fd) {
+			ack_connections_.erase(it);
+		}
+		if (ack_fd_ == ack_fd) {
+			ack_fd_ = -1;
+		}
+	};
 
 	// [[CRITICAL: Validate topic is not empty]]
 	// If topic is empty, GetOffsetToAck will use wrong TInode → wrong ACKs → client timeout
 	if (topic.empty()) {
 		LOG(ERROR) << "AckThread: Empty topic for broker " << broker_id_
 		           << ". Cannot send ACKs correctly. Exiting AckThread.";
+		remove_ack_registration();
 		close(ack_fd);
 		if (ack_efd >= 0) close(ack_efd);
 		return;
 	}
 
-	constexpr int kBrokerIdEpollTimeoutMs = 100;
-	constexpr int kAckEpollTimeoutMs = 100;
+	constexpr int kBrokerIdEpollTimeoutMs = 1;
+	constexpr int kAckEpollTimeoutMs = 1;
 	constexpr int kMaxConsecutiveTimeouts = 20;
 	constexpr int kMaxConsecutiveErrors = 5;
 
@@ -2034,6 +2069,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 			if (consecutive_timeouts >= kMaxConsecutiveTimeouts) {
 				if (stop_threads_) break;
 				if (!reset_ack_epoll("broker_id_timeout")) {
+					remove_ack_registration();
 					close(ack_fd);
 					return;
 				}
@@ -2048,6 +2084,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 			if (consecutive_errors >= kMaxConsecutiveErrors) {
 				if (stop_threads_) break;
 				if (!reset_ack_epoll("broker_id_error")) {
+					remove_ack_registration();
 					close(ack_fd);
 					return;
 				}
@@ -2079,6 +2116,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 							continue;
 						} else {
 							LOG(ERROR) << "Offset acknowledgment failed: " << strerror(errno);
+							remove_ack_registration();
 							return;
 						}
 					} else {
@@ -2113,7 +2151,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	// [[PERF: ACK_STALL_TUNE]] Stall sleep after kMaxStalls fast-polls with no new ACK.
 	// Lower values reduce ACK latency at cost of higher CPU (0 = busy-spin).
 	const int ack_stall_sleep_us =
-		ReadEnvIntNonNegative("EMBARCADERO_ACK_STALL_SLEEP_US", 100);
+		ReadEnvIntNonNegative("EMBARCADERO_ACK_STALL_SLEEP_US", 20);
 	if (ShouldEnableOrder5Trace()) {
 		trace_tinode = (TInode*)cxl_manager_->GetTInode(topic.c_str());
 		if (trace_tinode && trace_tinode->order == 5 &&
@@ -2299,6 +2337,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 						LOG(WARNING) << "AckThread: repeated ACK send timeouts for broker " << broker_id_
 						             << ", resetting epoll";
 						if (!reset_ack_epoll("ack_timeout")) {
+							remove_ack_registration();
 							close(ack_fd);
 							return;
 						}
@@ -2313,6 +2352,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 					if (consecutive_errors >= kMaxConsecutiveErrors) {
 						if (stop_threads_) break;
 						if (!reset_ack_epoll("ack_error")) {
+							remove_ack_registration();
 							close(ack_fd);
 							return;
 						}
@@ -2344,6 +2384,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 									continue;
 								} else {
 									LOG(ERROR) << "Offset acknowledgment failed: " << strerror(errno);
+									remove_ack_registration();
 									return;
 								}
 							} else {
@@ -2372,6 +2413,7 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 				}
 			}
 		}// end of while loop
+	remove_ack_registration();
 	close(ack_fd);
 	if (ack_efd >= 0) {
 		close(ack_efd);

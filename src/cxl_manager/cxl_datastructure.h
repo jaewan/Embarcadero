@@ -356,18 +356,20 @@ struct alignas(64) TInode{
  * 
  * Stage 1 (Receiver/NetworkManager):
  *   - Reserve BLog, recv payload into CXL, then reserve PBR slot (post-recv).
- *   - Slot receives minimal init on reserve (CLAIMED, batch_complete=0, num_msg=0) so scanner
- *     does not see it as ready until full header is published (no full zero required).
+ *   - Slot receives minimal init on reserve (CLAIMED, batch_complete=0, num_msg=0,
+ *     publish_commit=UNCOMMITTED) so scanner does not see it as ready until the writer
+ *     publishes an explicit commit token after the full header is durable in CXL.
  *   - Writes full BatchHeader once after recv: batch_seq, client_id, num_msg, broker_id, total_size,
  *     start_logical_offset, log_idx, epoch_created, batch_id, pbr_absolute_index.
- *   - Readiness = flags has VALID (num_msg>0 is still validated for sanity).
- *   - MUST flush: both cachelines of BatchHeader
- *   - MUST fence: CXL::store_fence() after flush
+ *   - Readiness = publish_commit == pbr_absolute_index && batch_complete == 1.
+ *     VALID/CLAIMED remain lifecycle hints, not the authoritative publication barrier.
+ *   - MUST flush: both cachelines of BatchHeader, then publish_commit cacheline again.
+ *   - MUST fence: CXL::store_fence() before every writer flush and after the flush batch.
  * 
  * Stage 3 (Sequencer):
- *   - Reads: flags VALID as readiness (blocking path); batch_complete still used by async paths.
+ *   - Reads: publish_commit as readiness barrier; flags/num_msg remain sanity/liveness signals.
  *   - Writes: total_order, ordered=1, batch_off_to_export
- *   - Clears: batch_complete=0, num_msg=0 (prevents duplicate processing / ABA reuse)
+ *   - Clears: publish_commit=UNCOMMITTED, batch_complete=0, flags=0 (prevents duplicate processing / ABA reuse)
  *   - MUST flush: cacheline containing ordered/batch_off_to_export (Stage-4 polls this)
  *   - MUST fence: CXL::store_fence() after flush
  * 
@@ -386,12 +388,16 @@ struct alignas(64) TInode{
  */
 constexpr uint32_t kBatchHeaderFlagClaimed = 1u << 0;
 constexpr uint32_t kBatchHeaderFlagValid = 1u << 1;
+constexpr uint64_t kBatchHeaderPublishUncommitted = std::numeric_limits<uint64_t>::max();
 
 struct alignas(64) BatchHeader{
 	// [[LIFECYCLE]]
-	// 1) NetworkManager reserves PBR after recv, minimal-init slot (CLAIMED, batch_complete=0, num_msg=0),
-	//    then writes full header once, flush+fence.
-	// 2) Sequencer processes batch and clears batch_complete=0 and num_msg=0 (with flush+fence).
+	// 1) NetworkManager reserves PBR after recv, minimal-init slot
+	//    (CLAIMED, batch_complete=0, num_msg=0, publish_commit=UNCOMMITTED),
+	//    then writes full header, flushes it, and finally commits publication by writing
+	//    publish_commit=pbr_absolute_index and flushing the second cache line again.
+	// 2) Sequencer processes batch and clears publish_commit, batch_complete, and flags
+	//    (with flush+fence) before the slot can be safely reused.
 	// This prevents duplicate processing of ring slots under ABA reuse.
 	// Keep readiness-critical fields in the first cache line for CXL visibility
 	size_t batch_seq; // [[WRITER: NetworkManager]] Monotonically increasing from each client. Corfu sets in log's seq
@@ -415,6 +421,7 @@ struct alignas(64) BatchHeader{
 	size_t log_idx;	// [[WRITER: NetworkManager]] Sequencer4: relative log offset to the payload of the batch and relative offset to last message
 	size_t total_order; // [[WRITER: Sequencer]] Global sequence number assigned by sequencer
 	size_t batch_off_to_export; // [[WRITER: Sequencer]] Export chain offset (0=in-place, !=0=points to actual batch)
+	uint64_t publish_commit; // [[WRITER: NetworkManager/Sequencer]] Uncommitted sentinel or committed pbr_absolute_index, written last
 #ifdef BUILDING_ORDER_BENCH
 	uint32_t gen;
 #endif
@@ -422,12 +429,17 @@ struct alignas(64) BatchHeader{
     uint64_t publish_ts_ns;
 #endif
 };
+inline bool BatchHeaderPublishCommitted(const BatchHeader& hdr) {
+	return hdr.publish_commit != kBatchHeaderPublishUncommitted &&
+	       hdr.publish_commit == hdr.pbr_absolute_index;
+}
 static_assert(sizeof(BatchHeader) % 64 == 0, "BatchHeader must be cache-line sized");
 static_assert(sizeof(BatchHeader) == 128, "BatchHeader must be exactly 128 bytes (two cache lines); CompleteBatchInCXL flushes both");
 static_assert(offsetof(BatchHeader, client_id) < 64, "client_id must be in first cache line");
 static_assert(offsetof(BatchHeader, num_msg) < 64, "num_msg must be in first cache line");
 static_assert(offsetof(BatchHeader, batch_complete) < 64, "batch_complete must be in first cache line");
 static_assert(offsetof(BatchHeader, flags) < 64, "flags must be in first cache line");
+static_assert(offsetof(BatchHeader, publish_commit) >= 64, "publish_commit must be in second cache line");
 // Note: BATCHHEADERS_SIZE is runtime config, alignment verified at runtime in BrokerScannerWorker5
 
 

@@ -653,11 +653,13 @@ namespace Embarcadero{
 				if (rep_done_advanced) {
 					const void* rep_done_addr = reinterpret_cast<const void*>(
 						const_cast<const uint64_t*>(&req.tinode->offsets[broker_id_].replication_done[req.broker_id]));
+					CXL::store_fence();
 					CXL::flush_cacheline(rep_done_addr);
 				}
 				if (replica_rep_done_advanced) {
 					const void* replica_rep_done_addr = reinterpret_cast<const void*>(
 						const_cast<const uint64_t*>(&replica_tinode->offsets[broker_id_].replication_done[req.broker_id]));
+					CXL::store_fence();
 					CXL::flush_cacheline(replica_rep_done_addr);
 				}
 				if (rep_done_advanced || replica_rep_done_advanced) {

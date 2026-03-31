@@ -1,5 +1,6 @@
 #include "scalog_local_sequencer.h"
 #include "cxl_manager.h"
+#include <cstdlib>
 #include <limits>
 
 namespace Scalog {
@@ -13,11 +14,17 @@ ScalogLocalSequencer::ScalogLocalSequencer(TInode* tinode, int broker_id, void* 
 	broker_id_(broker_id),
 	cxl_addr_(cxl_addr),
 	batch_header_(batch_header){
+	if (const char* override_ip = std::getenv("SCALOG_SEQUENCER_IP_OVERRIDE");
+	    override_ip && override_ip[0] != '\0') {
+		scalog_global_sequencer_ip_ = override_ip;
+	}
 
 	int unique_port = SCALOG_SEQ_PORT;
 	std::string scalog_seq_address = scalog_global_sequencer_ip_ + ":" + std::to_string(unique_port);
 	std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 	stub_ = ScalogSequencer::NewStub(channel);
+	msg_to_order_ = reinterpret_cast<MessageHeader*>(
+		static_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].log_offset);
 
 	// Send register request to the global sequencer
 	Register(tinode_->replication_factor);
@@ -183,35 +190,35 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 }
 
 void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<int, int64_t> &global_cut_delta) {
-	static char topic_char[TOPIC_NAME_SIZE];
-	static size_t seq = 0;
-	static TInode *tinode = nullptr;
-	static MessageHeader* msg_to_order = nullptr;
-	static size_t batch_header_idx = 0;
+	(void)topic;
 	const size_t kNumBatchSlots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
 
-	memcpy(topic_char, topic, TOPIC_NAME_SIZE);
-	if(tinode == nullptr){
-		tinode = tinode_;
-		msg_to_order = ((MessageHeader*)((uint8_t*)cxl_addr_ + tinode->offsets[broker_id_].log_offset));
+	if (msg_to_order_ == nullptr) {
+		msg_to_order_ = reinterpret_cast<MessageHeader*>(
+			static_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].log_offset);
 	}
 
 	size_t total_size = 0;
-	void* start_addr = (void*)msg_to_order;
+	uint32_t batch_num_msg = 0;
+	size_t batch_start_logical_offset = 0;
+	void* start_addr = static_cast<void*>(msg_to_order_);
 	bool local_progress = false;
 
 	// [[CORRECTNESS_FIX]] Track the last ordered values locally. We only publish
-	// tinode->offsets[].ordered AFTER the batch header export slot is written, so
+	// tinode_->offsets[].ordered AFTER the batch header export slot is written, so
 	// ACK1 (which reads ordered) never exceeds export visibility.
 	uint64_t last_ordered_count = 0;
 	size_t last_ordered_offset = 0;
 
-	auto publish_batch = [&](void* batch_start_addr, size_t publish_size) {
+	auto publish_batch = [&](void* batch_start_addr, size_t publish_size,
+	                         uint32_t num_msg, size_t start_logical_offset) {
 		if (publish_size == 0 || batch_start_addr == nullptr) {
 			return;
 		}
-		const size_t slot = batch_header_idx % kNumBatchSlots;
+		const size_t slot = batch_header_idx_ % kNumBatchSlots;
 		batch_header_[slot].batch_off_to_export = 0;
+		batch_header_[slot].num_msg = num_msg;
+		batch_header_[slot].start_logical_offset = start_logical_offset;
 		batch_header_[slot].total_size = publish_size;
 		batch_header_[slot].log_idx = static_cast<size_t>(
 				static_cast<uint8_t*>(batch_start_addr) - static_cast<uint8_t*>(cxl_addr_));
@@ -219,44 +226,51 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 		Embarcadero::CXL::flush_cacheline(&batch_header_[slot]);
 		Embarcadero::CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(&batch_header_[slot]) + 64);
 		Embarcadero::CXL::store_fence();
-		batch_header_idx++;
+		batch_header_idx_++;
 
 		// [[CORRECTNESS_FIX]] Publish tinode ordered frontier AFTER the export batch
 		// header is visible. This ensures ACK1 <= export visibility.
-		tinode->offsets[broker_id_].ordered = last_ordered_count;
-		tinode->offsets[broker_id_].ordered_offset = last_ordered_offset;
+		tinode_->offsets[broker_id_].ordered = last_ordered_count;
+		tinode_->offsets[broker_id_].ordered_offset = last_ordered_offset;
 		Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
-			reinterpret_cast<const volatile void*>(&tinode->offsets[broker_id_].ordered)));
+			reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered)));
 		Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
-			reinterpret_cast<const volatile void*>(&tinode->offsets[broker_id_].ordered_offset)));
+			reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered_offset)));
 		Embarcadero::CXL::store_fence();
 	};
 	for(auto &cut : global_cut_delta){
 		if(cut.first == broker_id_){
 			for(int64_t i = 0; i < cut.second; i++){
 				local_progress = true;
-				total_size += msg_to_order->paddedSize;
-				msg_to_order->total_order = seq;
+				if (batch_num_msg == 0) {
+					batch_start_logical_offset = msg_to_order_->logical_offset;
+				}
+				total_size += msg_to_order_->paddedSize;
+				batch_num_msg++;
+				msg_to_order_->total_order = seq_;
 				std::atomic_thread_fence(std::memory_order_release);
 
 				// Track locally; tinode update deferred to publish_batch
-				last_ordered_count = msg_to_order->logical_offset + 1;
-				last_ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
+				last_ordered_count = static_cast<uint64_t>(msg_to_order_->logical_offset) + 1;
+				last_ordered_offset = static_cast<size_t>(
+					static_cast<uint8_t*>(static_cast<void*>(msg_to_order_)) - static_cast<uint8_t*>(cxl_addr_));
 
-				msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
-				seq++;
+				msg_to_order_ = reinterpret_cast<MessageHeader*>(
+					static_cast<uint8_t*>(static_cast<void*>(msg_to_order_)) + msg_to_order_->next_msg_diff);
+				seq_++;
 				if(total_size >= BATCH_SIZE){
-					publish_batch(start_addr, total_size);
-					start_addr = (void*)msg_to_order;
+					publish_batch(start_addr, total_size, batch_num_msg, batch_start_logical_offset);
+					start_addr = static_cast<void*>(msg_to_order_);
 					total_size = 0;
+					batch_num_msg = 0;
 				}
 			}
 		}else{
-			seq += static_cast<size_t>(cut.second);
+			seq_ += static_cast<size_t>(cut.second);
 		}
 	}
 	if (local_progress && total_size > 0) {
-		publish_batch(start_addr, total_size);
+		publish_batch(start_addr, total_size, batch_num_msg, batch_start_logical_offset);
 	}
 
 	if (!global_cut_delta.empty()) {
@@ -268,7 +282,7 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 			LOG(INFO) << "Scalog sequencer advanced broker=" << broker_id_
 			          << " local_delta=" << local_delta
 			          << " ordered=" << tinode_->offsets[broker_id_].ordered
-			          << " seq=" << seq;
+			          << " seq=" << seq_;
 			last_order_log = now;
 		}
 	}
