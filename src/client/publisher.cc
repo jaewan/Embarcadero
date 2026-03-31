@@ -2001,7 +2001,15 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			size_t total_sent = 0;
 			const size_t header_size = sizeof(Embarcadero::BatchHeader) + len;
 			size_t consecutive_timeouts = 0;
-			const size_t max_consecutive_timeouts = 500; // 500ms fallback (TCP_USER_TIMEOUT handles fast path)
+			// For CORFU, GetTotalOrder has already committed log_idx to this specific broker;
+			// cannot reroute to a different broker. The stall is TCP backpressure caused by the
+			// per-broker inbound rate doubling when sibling broker threads finish (8 threads competing
+			// for the sequencer vs 16 → each remaining broker gets 2× more batches/s → TCP recv buffer
+			// overflows transiently). TCP flow control will resolve the stall naturally — must wait,
+			// not abort. Dead brokers are still detected quickly (EPOLLERR within 1ms via epoll_wait).
+			// Non-CORFU paths can reroute to a different broker, so 500ms is sufficient for them.
+			const size_t max_consecutive_timeouts =
+				(seq_type_ == heartbeat_system::SequencerType::CORFU) ? 30000 : 500;
 
 			while (total_sent < header_size) {
 				auto send_start = std::chrono::steady_clock::now();
