@@ -1184,6 +1184,7 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 
 	uint64_t contiguous_advanced = 0;
 	uint64_t messages_to_ack = 0;
+	uint64_t new_frontier = 0;  // captured inside lock for export frontier publish
 	// Per-client deltas collected while holding order2_mu_; applied to per-client map separately
 	// to keep the two locks independent (no nested lock acquisition).
 	absl::flat_hash_map<uint32_t, uint64_t> per_client_delta;
@@ -1209,24 +1210,15 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(slot_header) + 64);
 			CXL::full_fence();
 			if (slot_header->pbr_absolute_index != corfu_order2_next_seq_) {
-				// Ring slot was overwritten by a later batch that hashed to the same slot
-				// (num_slots_ too small for the outstanding batch window).  With the current
-				// config (BATCHHEADERS_SIZE=10MB, sizeof(BatchHeader)~128B → ~81920 slots) and
-				// at most ~4 concurrent in-flight batches per broker this should NEVER fire.
-				// If it does, the subscriber export path will miss the ordered flag for this batch
-				// (slot_header->ordered is not set), but ACK=1 still advances correctly because
-				// num_msg is preserved in corfu_order2_completed_.  Increase batch_headers_size
-				// in the broker config to eliminate the ring-overwrite path entirely.
-				// Do NOT set slot_header->ordered here; that slot now belongs to a different batch.
+				// Ring slot was overwritten by a later batch that hashed to the same slot.
+				// The export path will detect this via corfu_export_frontier_ and skip it.
 				static std::atomic<uint64_t> freshness_errors{0};
 				uint64_t err_n = freshness_errors.fetch_add(1, std::memory_order_relaxed) + 1;
 				LOG(ERROR) << "Corfu ORDER=2 slot freshness mismatch #" << err_n
 				           << ": slot=" << slot
 				           << " expected_seq=" << corfu_order2_next_seq_
 				           << " observed_seq=" << slot_header->pbr_absolute_index
-				           << " — num_slots_=" << num_slots_ << " is too small; increase ring size."
-				           << " Advancing ordered cursor using map num_msg to avoid ACK deadlock.";
-				// Advance anyway using the num_msg we registered — avoids permanent ACK freeze.
+				           << " — num_slots_=" << num_slots_ << " is too small; increase ring size.";
 				messages_to_ack += slot_num_msg;
 				per_client_delta[slot_client_id] += slot_num_msg;
 				corfu_order2_completed_.erase(next_it);
@@ -1235,17 +1227,32 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 				continue;
 			}
 
+			if (slot_num_msg == 0) {
+				// Hole: batch was skipped (publisher disconnect or drain-timeout).
+				// Zero the slot metadata so the export path recognises it as a hole
+				// (ordered=1 + num_msg=0 → skip). This also prevents exposing partial
+				// payload data that may remain in BLog from an incomplete recv.
+				slot_header->num_msg = 0;
+				slot_header->total_size = 0;
+				slot_header->ordered = 1;
+				CXL::store_fence();
+				CXL::flush_cacheline(slot_header);
+				CXL::store_fence();
+			} else {
+				slot_header->ordered = 1;
+				CXL::store_fence();
+				CXL::flush_cacheline(slot_header);
+				CXL::store_fence();
+			}
+
 			messages_to_ack += slot_num_msg;
 			per_client_delta[slot_client_id] += slot_num_msg;
-			slot_header->ordered = 1;
-			CXL::store_fence();
-			CXL::flush_cacheline(slot_header);
-			CXL::store_fence();
 
 			corfu_order2_completed_.erase(next_it);
 			corfu_order2_next_seq_++;
 			contiguous_advanced++;
 		}
+		new_frontier = corfu_order2_next_seq_;
 	}
 
 	if (messages_to_ack > 0) {
@@ -1264,8 +1271,18 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 	}
 
 	if (contiguous_advanced > 0) {
-		// Record the time at which the frontier last moved, so DrainStaleCorfuFrontier can detect
-		// holes that have been stuck for longer than the drain threshold.
+		// Publish export frontier (captured inside the lock above) so
+		// GetBatchToExportWithMetadata can skip holes lock-free.
+		// Use atomic max: two threads may race outside the lock and the one with
+		// the lower new_frontier must not overwrite a higher value.
+		uint64_t cur = corfu_export_frontier_.load(std::memory_order_relaxed);
+		while (new_frontier > cur) {
+			if (corfu_export_frontier_.compare_exchange_weak(
+					cur, new_frontier,
+					std::memory_order_release, std::memory_order_relaxed))
+				break;
+		}
+
 		corfu_order2_frontier_advanced_ns_.store(
 			std::chrono::duration_cast<std::chrono::nanoseconds>(
 				std::chrono::steady_clock::now().time_since_epoch()).count(),
@@ -1415,11 +1432,28 @@ void Topic::SkipCorfuOrder2Batch(uint64_t batch_seq, uint32_t client_id) {
 	// full payload was received.  Without intervention the ordered (and durable) frontiers
 	// stall forever at this hole.  Advance both frontiers with 0-message credit so that
 	// subsequently arriving batches can still complete and ACK normally.
-	// RecordCorfuOrder2DurableCompletion with num_msg=0 is safe: the early-return guard
-	// in that function skips the tinode/durable-count update when messages_to_ack==0.
 	LOG(WARNING) << "CORFU: skipping abandoned batch_seq=" << batch_seq
 	             << " client_id=" << client_id
 	             << " (publisher disconnected mid-batch); advancing ordered frontier.";
+
+	// Pre-clear the ring slot metadata so that even if CorfuGetCXLBuffer populated it
+	// with the original (pre-disconnect) num_msg/total_size, the export path will not
+	// serve partial or corrupt payload data.  RecordCorfuOrder2BatchCompletion with
+	// num_msg=0 will set ordered=1 and keep num_msg/total_size at 0, making the slot
+	// a recognisable hole for the subscriber export path.
+	if (num_slots_ > 0) {
+		const size_t slot = static_cast<size_t>(batch_seq % num_slots_);
+		BatchHeader* batch_header_log = reinterpret_cast<BatchHeader*>(batch_headers_);
+		BatchHeader* slot_header = &batch_header_log[slot];
+		if (slot_header->pbr_absolute_index == batch_seq) {
+			slot_header->num_msg = 0;
+			slot_header->total_size = 0;
+			CXL::store_fence();
+			CXL::flush_cacheline(slot_header);
+			CXL::store_fence();
+		}
+	}
+
 	RecordCorfuOrder2BatchCompletion(batch_seq, 0, client_id);
 	if (replication_factor_ > 0 && corfu_replication_client_ != nullptr) {
 		RecordCorfuOrder2DurableCompletion(batch_seq, 0, client_id);
@@ -2315,36 +2349,67 @@ bool Topic::GetBatchToExportWithMetadata(
 		size_t &batch_size,
 		size_t &batch_total_order,
 		uint32_t &num_messages) {
-	// Corfu ORDER=2 does not advance CompletionVector like ORDER=5/3 paths.
-	// Fall back to legacy ordered-slot export using monotonic expected_batch_offset.
+	// Corfu ORDER=2: ordered-slot export with hole-skip using corfu_export_frontier_.
+	//
+	// Contract (post-fix): the export frontier is the exclusive upper bound of the
+	// contiguous ordered batch_seq prefix.  For any batch_seq < frontier where the
+	// ring slot is stale, overwritten, or marked as a hole (ordered=1, num_msg=0),
+	// the subscriber advances past it without emitting data.  Only fully-received,
+	// non-hole batches are served to subscribers.
 	if (seq_type_ == CORFU && order_ == 2 && num_slots_ > 0 && cxl_addr_) {
+		const uint64_t frontier = corfu_export_frontier_.load(std::memory_order_acquire);
 		BatchHeader* start_batch_header = reinterpret_cast<BatchHeader*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
-		size_t slot = expected_batch_offset % num_slots_;
-		BatchHeader* header = reinterpret_cast<BatchHeader*>(
-			reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * slot);
-		CXL::flush_cacheline(header);
-		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(header) + 64);
-		CXL::full_fence();
-		if (header->pbr_absolute_index != expected_batch_offset) {
-			if (header->pbr_absolute_index > expected_batch_offset) {
-				// Gap: later batch arrived, wait for missing sequence.
+
+		// Bounded loop: skip at most num_slots_ holes in one call to prevent livelock.
+		for (size_t skipped = 0; skipped < num_slots_; ++skipped) {
+			const size_t slot = expected_batch_offset % num_slots_;
+			BatchHeader* header = reinterpret_cast<BatchHeader*>(
+				reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * slot);
+			CXL::flush_cacheline(header);
+			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(header) + 64);
+			CXL::full_fence();
+
+			const bool slot_fresh = (header->pbr_absolute_index == expected_batch_offset);
+			const bool past_frontier = (expected_batch_offset < frontier);
+
+			if (!slot_fresh) {
+				if (past_frontier) {
+					// Slot overwritten or never populated, but frontier has advanced past it.
+					// This batch was either a hole (DrainStaleCorfuFrontier) or its ring slot
+					// was reused.  Skip it — the data is irrecoverable.
+					expected_batch_offset++;
+					continue;
+				}
 				return false;
 			}
-			LOG(ERROR) << "Corfu ORDER=2 export freshness violation: slot=" << slot
-			           << " expected_seq=" << expected_batch_offset
-			           << " observed_seq=" << header->pbr_absolute_index;
-			return false;
+
+			// Slot is fresh.  Check if it's a hole (ordered=1, num_msg/total_size zeroed).
+			if (header->ordered == 1 && (header->num_msg == 0 || header->total_size == 0)) {
+				expected_batch_offset++;
+				continue;
+			}
+
+			if (header->ordered == 0) {
+				return false;
+			}
+
+			if (header->num_msg == 0 || header->total_size == 0) {
+				if (past_frontier) {
+					expected_batch_offset++;
+					continue;
+				}
+				return false;
+			}
+
+			batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + header->log_idx;
+			batch_size = header->total_size;
+			batch_total_order = header->total_order;
+			num_messages = header->num_msg;
+			expected_batch_offset++;
+			return true;
 		}
-		if (header->ordered == 0 || header->num_msg == 0 || header->total_size == 0) {
-			return false;
-		}
-		batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + header->log_idx;
-		batch_size = header->total_size;
-		batch_total_order = header->total_order;
-		num_messages = header->num_msg;
-		expected_batch_offset++;
-		return true;
+		return false;
 	}
 
 	const bool trace_order5 = ShouldEnableOrder5Trace() && (order_ == 5);

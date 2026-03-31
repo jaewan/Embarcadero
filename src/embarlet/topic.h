@@ -662,6 +662,10 @@ class Topic {
 		// Nanoseconds since epoch when corfu_order2_next_seq_ last advanced (0 = never/unset).
 		// Updated inside corfu_order2_mu_; read by DrainStaleCorfuFrontier to detect stuck frontiers.
 		std::atomic<int64_t> corfu_order2_frontier_advanced_ns_{0};
+		// Lock-free export frontier: next batch_seq not yet in the contiguous ordered prefix.
+		// Updated at the end of RecordCorfuOrder2BatchCompletion drain loop.
+		// Read by GetBatchToExportWithMetadata to skip holes (stale/overwritten slots).
+		std::atomic<uint64_t> corfu_export_frontier_{0};
 		// Corfu ACK2 durable cumulative count (message count - 1 = last durable offset).
 		std::atomic<uint64_t> corfu_ack2_durable_count_{0};
 		absl::Mutex corfu_order2_durable_mu_;
