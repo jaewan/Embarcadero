@@ -1712,7 +1712,14 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 				if (min_val > val) min_val = val;
 			}
 			if (ready_replicas == replication_factor && min_val != kReplicationNotStarted) {
-				fast_read_value = min_val;
+				fast_read_value = min_val + 1;  // Convert last offset to message count
+				// [[SCALOG_CORRECTNESS_FIX]] Clamp by ordered to prevent ACK2 > ordered
+				if (seq_type == SCALOG) {
+					const size_t ordered_val = tinode->offsets[broker_id_].ordered;
+					if (fast_read_value > ordered_val) {
+						fast_read_value = ordered_val;
+					}
+				}
 			}
 		}
 	} else {
@@ -1852,7 +1859,23 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		if (ready_replicas < replication_factor || min == kReplicationNotStarted) {
 			return (size_t)-1;
 		}
-		return min + 1;  // Convert last offset to message count
+		size_t durable_frontier = min + 1;  // Convert last offset to message count
+
+		// [[SCALOG_CORRECTNESS_FIX]] ACK2 must not exceed the ordered frontier.
+		// replication_done advances as data hits disk, independent of global ordering.
+		// Without this clamp, ACK2 can acknowledge messages that have no total order yet.
+		if (seq_type == SCALOG) {
+			volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
+			CXL::flush_cacheline(const_cast<const void*>(
+				reinterpret_cast<const volatile void*>(ordered_ptr)));
+			CXL::load_fence();
+			const size_t ordered_frontier = static_cast<size_t>(tinode->offsets[broker_id_].ordered);
+			if (durable_frontier > ordered_frontier) {
+				durable_frontier = ordered_frontier;
+			}
+		}
+
+		return durable_frontier;
 	}
 
 		// ACK Level 1: acknowledge after ordered visibility frontier advances.
@@ -1909,7 +1932,21 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 				min = val;
 			}
 		}
-		return min + 1;
+		{
+			size_t ack_val = min + 1;
+			// [[SCALOG_CORRECTNESS_FIX]] Clamp by ordered for SCALOG
+			if (seq_type == SCALOG) {
+				volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
+				CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(ordered_ptr)));
+				CXL::load_fence();
+				const size_t ordered_frontier = static_cast<size_t>(tinode->offsets[broker_id_].ordered);
+				if (ack_val > ordered_frontier) {
+					ack_val = ordered_frontier;
+				}
+			}
+			return ack_val;
+		}
 	}else{
 		// No replication: acknowledge after written for ORDER=0, ordered otherwise.
 		if(order == 0){

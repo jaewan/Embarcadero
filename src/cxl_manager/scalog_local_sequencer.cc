@@ -198,6 +198,13 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 	size_t total_size = 0;
 	void* start_addr = (void*)msg_to_order;
 	bool local_progress = false;
+
+	// [[CORRECTNESS_FIX]] Track the last ordered values locally. We only publish
+	// tinode->offsets[].ordered AFTER the batch header export slot is written, so
+	// ACK1 (which reads ordered) never exceeds export visibility.
+	uint64_t last_ordered_count = 0;
+	size_t last_ordered_offset = 0;
+
 	auto publish_batch = [&](void* batch_start_addr, size_t publish_size) {
 		if (publish_size == 0 || batch_start_addr == nullptr) {
 			return;
@@ -212,6 +219,16 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 		Embarcadero::CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(&batch_header_[slot]) + 64);
 		Embarcadero::CXL::store_fence();
 		batch_header_idx++;
+
+		// [[CORRECTNESS_FIX]] Publish tinode ordered frontier AFTER the export batch
+		// header is visible. This ensures ACK1 <= export visibility.
+		tinode->offsets[broker_id_].ordered = last_ordered_count;
+		tinode->offsets[broker_id_].ordered_offset = last_ordered_offset;
+		Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(&tinode->offsets[broker_id_].ordered)));
+		Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(&tinode->offsets[broker_id_].ordered_offset)));
+		Embarcadero::CXL::store_fence();
 	};
 	for(auto &cut : global_cut_delta){
 		if(cut.first == broker_id_){
@@ -220,13 +237,11 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 				total_size += msg_to_order->paddedSize;
 				msg_to_order->total_order = seq;
 				std::atomic_thread_fence(std::memory_order_release);
-				tinode->offsets[broker_id_].ordered = msg_to_order->logical_offset + 1;
-				tinode->offsets[broker_id_].ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
-				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
-					reinterpret_cast<const volatile void*>(&tinode->offsets[broker_id_].ordered)));
-				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
-					reinterpret_cast<const volatile void*>(&tinode->offsets[broker_id_].ordered_offset)));
-				Embarcadero::CXL::store_fence();
+
+				// Track locally; tinode update deferred to publish_batch
+				last_ordered_count = msg_to_order->logical_offset + 1;
+				last_ordered_offset = (uint8_t*)msg_to_order - (uint8_t*)cxl_addr_;
+
 				msg_to_order = (MessageHeader*)((uint8_t*)msg_to_order + msg_to_order->next_msg_diff);
 				seq++;
 				if(total_size >= BATCH_SIZE){
