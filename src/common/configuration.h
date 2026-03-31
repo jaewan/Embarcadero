@@ -108,6 +108,14 @@ struct EmbarcaderoConfig {
         ConfigValue<int> local_cut_interval{100, "EMBARCADERO_SCALOG_CUT_INTERVAL"};
     } scalog;
 
+    // LazyLog configuration
+    struct Lazylog {
+        ConfigValue<int> sequencer_port{50061, "EMBARCADERO_LAZYLOG_SEQ_PORT"};
+        ConfigValue<int> replication_port{50062, "EMBARCADERO_LAZYLOG_REP_PORT"};
+        ConfigValue<std::string> sequencer_ip{"127.0.0.1", "EMBARCADERO_LAZYLOG_SEQ_IP"};
+        ConfigValue<int> local_cut_interval{100, "EMBARCADERO_LAZYLOG_CUT_INTERVAL"};
+    } lazylog;
+
     // Platform detection
     struct Platform {
         ConfigValue<bool> is_intel{false, "EMBARCADERO_PLATFORM_INTEL"};

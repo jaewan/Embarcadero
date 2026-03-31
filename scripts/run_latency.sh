@@ -3,29 +3,29 @@
 #
 # Supported scenarios:
 #   SCENARIO=local  — brokers and client both run on this machine (default)
-#   SCENARIO=remote — brokers on this machine; client (publisher) runs on c4 via SSH
+#   SCENARIO=remote — brokers on this machine; client (publisher) runs on c2 via SSH
 #
 # Quick examples:
 #   ORDERS="0 5" SCENARIO=local  bash scripts/run_latency.sh
-#   ORDERS="0 5" SCENARIO=remote REMOTE_CLIENT_HOST=c4 bash scripts/run_latency.sh
+#   ORDERS="0 5" SCENARIO=remote REMOTE_CLIENT_HOST=c2 bash scripts/run_latency.sh
 #
 # NOTE: This script requires recompilation with COLLECT_LATENCY_STATS macro defined.
 # Build with:
 #   cmake -S . -B build -DCOLLECT_LATENCY_STATS=ON
 #   cmake --build build -j
 #
-# === Latency breakdown: local vs remote (c4→moscxl) ===
+# === Latency breakdown: local vs remote (c2→moscxl) ===
 #
 # Local (single-node, loopback):
 #   - avg_send_us ~250 µs/batch (NUMA 1 client, NUMA-local socket buffers)
 #   - No NIC serialization latency
 #   - Synchronous loopback copy on both send and receive
 #
-# Remote (c4→moscxl, 100GbE):
+# Remote (c2→moscxl, 100GbE):
 #   - Network RTT: ~200–300 ns at wire level
-#   - NIC TX + DMA on c4: ~1–5 µs
+#   - NIC TX + DMA on c2: ~1–5 µs
 #   - NIC RX + DMA on moscxl: ~1–5 µs
-#   - TCP ACK path (broker → c4): same NIC round-trip
+#   - TCP ACK path (broker → c2): same NIC round-trip
 #   - Expected publish latency delta vs local: ~10–50 µs per batch (network overhead)
 #     dominated by NIC DMA + PCIe transfer, NOT propagation delay
 #   - avg_send_us for remote: ~196 µs/batch (measured) — LOWER than local ~250 µs
@@ -48,6 +48,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/broker_lifecycle.sh"
 
+# NUMA membind: only use "1,2" when node 2 exists (avoids libnuma errors on 2-node machines).
+embar_default_numa_membind() {
+  if command -v numactl >/dev/null 2>&1 && numactl -H 2>/dev/null | grep -qE '^node 2 cpus:'; then
+    echo "1,2"
+  else
+    echo "1"
+  fi
+}
+
 BIN_DIR="$PROJECT_ROOT/build/bin"
 DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/latency}"
 
@@ -59,6 +68,14 @@ TEST_CASE="${TEST_CASE:-2}"
 MSG_SIZE="${MSG_SIZE:-1024}"
 ACK_LEVEL="${ACK_LEVEL:-1}"
 TOTAL_MESSAGE_SIZE="${TOTAL_MESSAGE_SIZE:-4294967296}"   # 4 GiB
+# Subscriber::Poll defaults to 15s; scale when unset so large runs do not false-timeout.
+if [[ -z "${EMBARCADERO_E2E_TIMEOUT_SEC+x}" ]]; then
+  _e2e=$(( 120 + TOTAL_MESSAGE_SIZE / 52428800 ))
+  (( _e2e < 180 )) && _e2e=180
+  (( _e2e > 7200 )) && _e2e=7200
+  export EMBARCADERO_E2E_TIMEOUT_SEC="$_e2e"
+  unset _e2e
+fi
 NUM_TRIALS="${NUM_TRIALS:-1}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 PLOT_RESULTS="${PLOT_RESULTS:-0}"
@@ -80,20 +97,44 @@ read -r -a modes <<< "${MODES:-steady}"
 # Scenario: local or remote
 SCENARIO="${SCENARIO:-local}"
 
+# Local runs should use localhost sequencer endpoints by default.
+# Respect explicit overrides from the caller.
+if [[ "$SCENARIO" == "local" && -z "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]]; then
+  export EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-127.0.0.1}"
+fi
+if [[ "$SCENARIO" == "local" && -z "${REMOTE_SCALOG_SEQUENCER_HOST:-}" ]]; then
+  export EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-127.0.0.1}"
+fi
+
+if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+  for __order in "${ORDERS_ARR[@]}"; do
+    if [[ "$__order" != "2" ]]; then
+      echo "ERROR: LAZYLOG baseline requires ORDER=2 (got ORDER=${__order})" >&2
+      exit 1
+    fi
+  done
+fi
+
 # Remote client settings (SCENARIO=remote only)
 # REMOTE_CLIENT_HOST: SSH destination for the publisher (e.g. "c4" or "user@10.10.10.20")
-REMOTE_CLIENT_HOST="${REMOTE_CLIENT_HOST:-c4}"
+REMOTE_CLIENT_HOST="${REMOTE_CLIENT_HOST:-c2}"
 REMOTE_CLIENT_BIN_DIR="${REMOTE_CLIENT_BIN_DIR:-~/Embarcadero/build/bin}"
 # IP address the remote client uses to reach the broker on this machine
 BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.10}"
 # Optional separate Corfu sequencer host for Corfu latency runs.
 REMOTE_CORFU_SEQUENCER_HOST="${REMOTE_CORFU_SEQUENCER_HOST:-}"
 REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}"
+REMOTE_LAZYLOG_SEQUENCER_HOST="${REMOTE_LAZYLOG_SEQUENCER_HOST:-}"
+REMOTE_LAZYLOG_BUILD_BIN="${REMOTE_LAZYLOG_BUILD_BIN:-}"
+EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-}"
+EMBARCADERO_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}"
 REMOTE_SCALOG_SEQUENCER_HOST="${REMOTE_SCALOG_SEQUENCER_HOST:-}"
 REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-}"
 
-# NUMA: CPUs on compute node 1; membind includes node 2 when CXL is a **zero-core** NUMA node (see cxl_manager.cc mbind).
-EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
+# NUMA: CPUs on compute node 1; membind includes node 2 only when that node exists.
+_default_membind="$(embar_default_numa_membind)"
+EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=${_default_membind}}"
+unset _default_membind
 # CORFU: same default as run_multiclient — do not wrap embarlet in numactl unless you set EMBARLET_NUMA_BIND_CORFU.
 if [[ "$SEQUENCER" == "CORFU" ]]; then
   EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND_CORFU-}"
@@ -113,9 +154,9 @@ if [ -z "${CLIENT_NUMA_BIND+x}" ]; then
   if [[ "$SCENARIO" == "remote" ]]; then
     CLIENT_NUMA_BIND=""
   else
-    # Single-node: CPUs on node 1 (match brokers). membind=1,2 so policy allows the CXL NUMA node
-    # (often node 2, no CPUs) used by head mbind; keeps heap preferring DRAM while shared CXL maps correctly.
-    CLIENT_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
+    _mb="$(embar_default_numa_membind)"
+    CLIENT_NUMA_BIND="numactl --cpunodebind=1 --membind=${_mb}"
+    unset _mb
   fi
 fi
 
@@ -127,6 +168,8 @@ cleanup() {
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
   if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     broker_remote_corfu_stop || true
+  elif [[ "$SEQUENCER" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+    broker_remote_lazylog_stop || true
   fi
   if [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
     broker_remote_scalog_stop || true
@@ -198,12 +241,21 @@ start_local_brokers() {
   local seq="$2"
 
   cleanup
+  export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
 
   if [[ "$seq" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     export REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-$BIN_DIR}"
     echo "Starting remote Corfu sequencer on $REMOTE_CORFU_SEQUENCER_HOST..."
     if ! broker_remote_corfu_start; then
       echo "ERROR: failed to start remote Corfu sequencer on $REMOTE_CORFU_SEQUENCER_HOST" >&2
+      return 1
+    fi
+    sleep 1
+  elif [[ "$seq" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+    export REMOTE_LAZYLOG_BUILD_BIN="${REMOTE_LAZYLOG_BUILD_BIN:-$BIN_DIR}"
+    echo "Starting remote LazyLog sequencer on $REMOTE_LAZYLOG_SEQUENCER_HOST..."
+    if ! broker_remote_lazylog_start; then
+      echo "ERROR: failed to start remote LazyLog sequencer on $REMOTE_LAZYLOG_SEQUENCER_HOST" >&2
       return 1
     fi
     sleep 1
@@ -223,17 +275,32 @@ start_local_brokers() {
   broker_env+="REPLICATION_FACTOR=$REPLICATION_FACTOR "
   broker_env+="EMBARCADERO_REPLICATION_FACTOR=$REPLICATION_FACTOR "
   broker_env+="NUM_BROKERS=$NUM_BROKERS "
+  broker_env+="EMBARCADERO_NUM_BROKERS=$NUM_BROKERS "
   if [[ "$seq" == "SCALOG" ]]; then
     broker_env+="SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1} "
   fi
+  if [[ "$seq" == "LAZYLOG" ]]; then
+    broker_env+="LAZYLOG_CXL_MODE=1 "
+  fi
   if [[ "$SCENARIO" == "remote" ]]; then
     broker_env+="EMBARCADERO_HEAD_ADDR=$BROKER_LISTEN_ADDR "
+  fi
+  if [[ "$seq" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_IP" ]]; then
+    broker_env+="EMBARCADERO_LAZYLOG_SEQ_IP=$EMBARCADERO_LAZYLOG_SEQ_IP "
+  fi
+  if [[ "$seq" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]]; then
+    broker_env+="EMBARCADERO_LAZYLOG_SEQ_PORT=$EMBARCADERO_LAZYLOG_SEQ_PORT "
   fi
   local -a launched_broker_pids=()
 
   echo "Starting head broker (order=$order sequencer=$seq)..."
   if [[ "$seq" == "SCALOG" && -z "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
     "$BIN_DIR/scalog_global_sequencer" > /tmp/scalog_sequencer.log 2>&1 &
+  elif [[ "$seq" == "LAZYLOG" && -z "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+    # Local LazyLog coordinator (mirrors local SCALOG / CORFU startup).
+    export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
+    "$BIN_DIR/lazylog_global_sequencer" > /tmp/lazylog_sequencer.log 2>&1 &
+    sleep 0.5
   elif [[ "$seq" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     "$BIN_DIR/corfu_global_sequencer" > /tmp/corfu_sequencer.log 2>&1 &
   fi
@@ -350,7 +417,6 @@ build_client_cmd() {
     --head_addr "$head_addr"
     -m "$MSG_SIZE"
     -s "$TOTAL_MESSAGE_SIZE"
-    --record_results
     -t "$TEST_CASE"
     -o "$order"
     -a "$ACK_LEVEL"
@@ -422,12 +488,20 @@ run_trial() {
     local quoted_cmd
     quoted_cmd="cd ${REMOTE_CLIENT_BIN_DIR} && "
     quoted_cmd+="export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE} && "
+    quoted_cmd+="export NUM_BROKERS=${NUM_BROKERS} && "
+    quoted_cmd+="export EMBARCADERO_NUM_BROKERS=${NUM_BROKERS} && "
     if [[ -n "${EMBARCADERO_CORFU_SEQ_IP:-}" ]]; then
       quoted_cmd+="export EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP} && "
     fi
     if [[ -n "${EMBARCADERO_CORFU_SEQ_PORT:-}" ]]; then
       quoted_cmd+="export EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT} && "
     fi
+    if [[ -n "${EMBARCADERO_LAZYLOG_SEQ_IP:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_LAZYLOG_SEQ_IP=${EMBARCADERO_LAZYLOG_SEQ_IP} && "
+    fi
+    if [[ -n "${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_LAZYLOG_SEQ_PORT=${EMBARCADERO_LAZYLOG_SEQ_PORT} && "
+  fi
     if [[ -n "${EMBARCADERO_SCALOG_SEQ_IP:-}" ]]; then
       quoted_cmd+="export EMBARCADERO_SCALOG_SEQ_IP=${EMBARCADERO_SCALOG_SEQ_IP} && "
     fi

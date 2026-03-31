@@ -71,6 +71,13 @@ embarcadero:
     sequencer_ip: "192.168.60.173"  # Scalog sequencer IP address
     local_cut_interval: 100      # Scalog local cut interval
 
+  # LazyLog sequencer configuration
+  lazylog:
+    sequencer_port: 50061        # LazyLog sequencer port
+    replication_port: 50062      # LazyLog replication port
+    sequencer_ip: "192.168.60.175"  # LazyLog sequencer IP address
+    local_cut_interval: 100      # LazyLog local progress interval
+
   # Platform detection
   platform:
     is_intel: false              # Intel platform flag

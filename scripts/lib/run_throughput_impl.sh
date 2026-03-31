@@ -66,6 +66,7 @@ export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
 export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-$REPLICATION_FACTOR}
+export EMBARCADERO_NUM_BROKERS=${EMBARCADERO_NUM_BROKERS:-$NUM_BROKERS}
 # Scalog ACK2/durability experiments require the CXL-backed Scalog path.
 # Keep user override possible, but default to enabled for Scalog runs.
 if [[ "$SEQUENCER" == "SCALOG" && -z "${SCALOG_CXL_MODE:-}" ]]; then
@@ -75,6 +76,16 @@ if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
   export EMBARCADERO_CXL_SHM_NAME="/CXL_SHARED_EXPERIMENT_${UID}"
   shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
   rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
+fi
+
+# Local sequencer defaults: on single-node runs, prefer localhost unless explicitly remote.
+if ! broker_is_remote_mode; then
+  if [[ "$SEQUENCER" == "SCALOG" && -z "${EMBARCADERO_SCALOG_SEQ_IP:-}" ]]; then
+    export EMBARCADERO_SCALOG_SEQ_IP="127.0.0.1"
+  fi
+  if [[ "$SEQUENCER" == "LAZYLOG" && -z "${EMBARCADERO_LAZYLOG_SEQ_IP:-}" ]]; then
+    export EMBARCADERO_LAZYLOG_SEQ_IP="127.0.0.1"
+  fi
 fi
 
 throughput_test_supports_head_addr() {
@@ -253,6 +264,13 @@ start_cluster() {
       export SCALOG_SEQUENCER_IP_OVERRIDE="${EMBARCADERO_SCALOG_SEQ_IP:-127.0.0.1}"
     fi
     ./scalog_global_sequencer > /tmp/scalog_sequencer.log 2>&1 &
+    sleep 0.5
+    export SCALOG_CXL_MODE="${SCALOG_CXL_MODE:-1}"
+  elif [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+    export EMBARCADERO_NUM_BROKERS="${EMBARCADERO_NUM_BROKERS:-$NUM_BROKERS}"
+    export LAZYLOG_CXL_MODE="${LAZYLOG_CXL_MODE:-1}"
+    ./lazylog_global_sequencer > /tmp/lazylog_sequencer.log 2>&1 &
+    sleep 0.5
   fi
 
   $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head --$SEQUENCER > broker_0.log 2>&1 &
@@ -286,7 +304,18 @@ if broker_is_remote_mode && [ -z "${REMOTE_HEAD_ADDR:-}" ]; then
   export REMOTE_HEAD_ADDR="$CLIENT_HEAD_ADDR"
 fi
 
-EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
+# Safe default NUMA policy:
+# - prefer node 1,2 only when node 2 exists
+# - fallback to node 1 on 2-node machines
+if [ -z "${EMBARLET_NUMA_BIND:-}" ]; then
+  if have_numactl && numactl --hardware 2>/dev/null | awk '/^node 2 cpus:/ {found=1} END{exit found?0:1}'; then
+    EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
+  elif have_numactl && numactl --hardware 2>/dev/null | awk '/^node 1 cpus:/ {found=1} END{exit found?0:1}'; then
+    EMBARLET_NUMA_BIND="numactl --cpunodebind=1 --membind=1"
+  else
+    EMBARLET_NUMA_BIND=""
+  fi
+fi
 CLIENT_NUMA_BIND="${CLIENT_NUMA_BIND:-$(default_client_numa_bind "$CLIENT_HEAD_ADDR")}"
 if [[ "$SEQUENCER" == "CORFU" ]]; then
   EMBARLET_NUMA_BIND=""

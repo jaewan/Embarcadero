@@ -12,16 +12,14 @@ BIN_DIR="$BUILD_DIR/bin"
 CONFIG_DIR="$PROJECT_ROOT/config"
 TEST_OUTPUT_DIR="$BUILD_DIR/test_output"
 
+# Portable NUMA (override with NUMA_BIND=... in the environment if needed)
+source "$SCRIPT_DIR/numa_bind.sh"
+
 # Test configuration
 TEST_NAME="explicit_replication_order5_ack2"
 NUM_BROKERS=4
 MESSAGE_SIZE=128
 TOTAL_MESSAGES=5000  # Small enough for quick test, large enough to see replication progress
-# [[PHASE_5_E2E_HARDENING]] - NUMA binding for memory-only nodes
-# Config shows numa_node: 2 (CXL memory node, has no CPUs)
-# Bind CPUs to node 0/1, but memory to node 2 (CXL)
-# If your CXL is on a different node, adjust --membind accordingly
-NUMA_BIND="numactl --cpunodebind=0 --membind=2"
 
 # [[PHASE_4_BOUNDED_TIMEOUTS]] - Global test timeout (5 minutes)
 # Prevents infinite hangs if replication/ACK never progresses
@@ -289,7 +287,8 @@ run_client_test() {
     # -a 2: ack_level=2 (ack after replication)
     # -r 1: replication_factor=1 (one replica)
     # -t 5: publish-only test (simpler, deterministic)
-    timeout $((GLOBAL_TIMEOUT - 60)) "$BIN_DIR/throughput_test" \
+    # Match basic_publish.sh: same NUMA policy as brokers (client defaults to numa_bind in YAML).
+    timeout $((GLOBAL_TIMEOUT - 60)) $NUMA_BIND "$BIN_DIR/throughput_test" \
         --config "$CONFIG_DIR/client.yaml" \
         -m "$MESSAGE_SIZE" \
         -s "$total_size" \

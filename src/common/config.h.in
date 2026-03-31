@@ -73,6 +73,12 @@ const Configuration& GetConfig();
 #define SCLAOG_SEQUENCER_IP SCALOG_SEQUENCER_IP
 
 #define SCALOG_SEQ_LOCAL_CUT_INTERVAL (Embarcadero::GetConfig().config().scalog.local_cut_interval.get())
+
+//********* LazyLog configs *********
+#define LAZYLOG_SEQ_PORT (Embarcadero::GetConfig().config().lazylog.sequencer_port.get())
+#define LAZYLOG_REP_PORT (Embarcadero::GetConfig().config().lazylog.replication_port.get())
+#define LAZYLOG_SEQUENCER_IP (Embarcadero::GetConfig().config().lazylog.sequencer_ip.get().c_str())
+#define LAZYLOG_SEQ_LOCAL_CUT_INTERVAL (Embarcadero::GetConfig().config().lazylog.local_cut_interval.get())
 	
 using GetNumBrokersCallback = std::function<int()>;
 using GetRegisteredBrokersCallback = std::function<int(absl::btree_set<int> &registered_brokers, 

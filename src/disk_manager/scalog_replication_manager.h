@@ -22,7 +22,9 @@ public:
 														bool log_to_memory,
                             const std::string& address = "localhost",
                             const std::string& port = "",
-                            const std::string& log_file = "");
+                            const std::string& log_file = "",
+                            const std::string& sequencer_ip = "",
+                            int sequencer_port = 0);
     ~ScalogReplicationManager();
 
     // Prevent copying

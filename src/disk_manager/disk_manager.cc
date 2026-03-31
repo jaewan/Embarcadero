@@ -215,6 +215,16 @@ namespace Embarcadero{
 				scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(
 					broker_id_, log_to_memory, "localhost", std::to_string(SCALOG_REP_PORT + broker_id_));
 				return;
+			}else if(sequencerType == heartbeat_system::SequencerType::LAZYLOG){
+				scalog_replication_manager_ = std::make_unique<Scalog::ScalogReplicationManager>(
+					broker_id_,
+					log_to_memory,
+					"localhost",
+					std::to_string(LAZYLOG_REP_PORT + broker_id_),
+					"",
+					std::string(LAZYLOG_SEQUENCER_IP),
+					LAZYLOG_SEQ_PORT);
+				return;
 			}else if(sequencerType == heartbeat_system::SequencerType::CORFU){
 				LOG(INFO) << "[CORFU_DEBUG] DiskManager: creating CorfuReplicationManager (broker_id=" << broker_id << ", cxl_addr=" << cxl_addr_ << ")";
 				corfu_replication_manager_ = std::make_unique<Corfu::CorfuReplicationManager>(broker_id, log_to_memory, cxl_addr_);
@@ -325,7 +335,9 @@ namespace Embarcadero{
 	// No producers write to copyQueue_ except sentinel values for shutdown
 	// Kept for potential future use or compatibility with older replication paths
 	void DiskManager::CopyThread(){
-		if(sequencerType_ == heartbeat_system::SequencerType::SCALOG && scalog_replication_manager_){
+		if((sequencerType_ == heartbeat_system::SequencerType::SCALOG ||
+		    sequencerType_ == heartbeat_system::SequencerType::LAZYLOG) &&
+		   scalog_replication_manager_){
 			scalog_replication_manager_->Shutdown();
 			return;
 		}else if(sequencerType_ == heartbeat_system::SequencerType::CORFU){

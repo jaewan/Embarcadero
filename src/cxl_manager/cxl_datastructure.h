@@ -277,6 +277,7 @@ using heartbeat_system::SequencerType::EMBARCADERO;
 using heartbeat_system::SequencerType::KAFKA;
 using heartbeat_system::SequencerType::SCALOG;
 using heartbeat_system::SequencerType::CORFU;
+using heartbeat_system::SequencerType::LAZYLOG;
 
 // Separate broker-owned, replication-owned, and sequencer-owned fields to prevent false sharing
 // Total: 768 bytes - three independent 256-byte cache-line regions

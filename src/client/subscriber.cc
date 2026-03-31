@@ -4,6 +4,7 @@
 #include "../common/wire_formats.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <set>
 #include <sstream>
@@ -14,11 +15,38 @@
 // Sequencer 5: Logical reconstruction of message ordering from batch metadata
 // Messages arrive with total_order=0, batch metadata provides base total_order
 
+namespace {
+
+size_t ResolveConfiguredBrokerCount() {
+	constexpr size_t kMinBrokers = 1;
+	const size_t kMaxBrokers = static_cast<size_t>(NUM_MAX_BROKERS_CONFIG);
+	const char* env = std::getenv("NUM_BROKERS");
+	if (env != nullptr) {
+		try {
+			const size_t parsed = static_cast<size_t>(std::stoul(env));
+			if (parsed < kMinBrokers) return kMinBrokers;
+			if (parsed > kMaxBrokers) return kMaxBrokers;
+			return parsed;
+		} catch (...) {
+			LOG(WARNING) << "Subscriber: invalid NUM_BROKERS='" << env
+			             << "', falling back to configured max_brokers";
+		}
+	}
+	const size_t configured = static_cast<size_t>(
+		Embarcadero::GetConfig().config().broker.max_brokers.get());
+	if (configured < kMinBrokers) return kMinBrokers;
+	if (configured > kMaxBrokers) return kMaxBrokers;
+	return configured;
+}
+
+}  // namespace
+
 Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency, int order_level)
 	: head_addr_(head_addr),
 	port_(port),
 	shutdown_(false),
 	connected_(false),
+	configured_broker_count_(ResolveConfiguredBrokerCount()),
 	measure_latency_(measure_latency),
 	sub_connections_per_broker_(measure_latency ? 1 : static_cast<size_t>(NUM_SUB_CONNECTIONS)),
 	order_level_(order_level),
@@ -40,6 +68,9 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 		absl::MutexLock lock(&node_mutex_);
 		nodes_[0] = head_addr + ":" + std::to_string(PORT); // Assuming PORT is defined
 	}
+	data_broker_count_.store(configured_broker_count_, std::memory_order_release);
+	LOG(INFO) << "Subscriber: configured broker count=" << configured_broker_count_
+	          << " sub_connections_per_broker=" << sub_connections_per_broker_;
 
 	// Start cluster probe thread (will call ManageBrokerConnections)
 	cluster_probe_thread_ = std::thread([this]() { this->SubscribeToClusterStatus(); });
@@ -949,7 +980,7 @@ void Subscriber::StartMissingConfiguredBrokerConnections() {
 	std::vector<std::pair<int, std::string>> brokers_to_add;
 	{
 		absl::MutexLock lock(&node_mutex_);
-		for (int broker_id = 0; broker_id < NUM_MAX_BROKERS_CONFIG; ++broker_id) {
+		for (int broker_id = 0; broker_id < static_cast<int>(configured_broker_count_); ++broker_id) {
 			const std::string fallback_addr =
 				head_addr_ + ":" + std::to_string(PORT + broker_id);
 			nodes_[broker_id] = fallback_addr;
@@ -1356,6 +1387,11 @@ void Subscriber::SubscribeToClusterStatus() {
 					absl::MutexLock lock(&node_mutex_);
 					for (const auto& bi : cluster_status.broker_info()) {
 						int broker_id = bi.broker_id();
+						if (broker_id < 0 || broker_id >= static_cast<int>(configured_broker_count_)) {
+							VLOG(2) << "SubscribeToCluster: skipping broker " << broker_id
+							        << " outside configured broker count=" << configured_broker_count_;
+							continue;
+						}
 						std::string addr = bi.network_mgr_addr();
 						if (!bi.accepts_publishes()) {
 							LOG(INFO) << "SubscribeToCluster: Skipping broker " << broker_id
@@ -1397,6 +1433,11 @@ void Subscriber::SubscribeToClusterStatus() {
 						absl::MutexLock lock(&node_mutex_);
 						for (const auto& addr : new_nodes_proto) {
 							int broker_id = GetBrokerId(addr);
+							if (broker_id < 0 || broker_id >= static_cast<int>(configured_broker_count_)) {
+								VLOG(2) << "SubscribeToCluster: ignoring legacy broker_id=" << broker_id
+								        << " outside configured broker count=" << configured_broker_count_;
+								continue;
+							}
 							if (nodes_.find(broker_id) == nodes_.end()) {
 								nodes_[broker_id] = addr;
 								brokers_to_add.push_back({broker_id, addr});

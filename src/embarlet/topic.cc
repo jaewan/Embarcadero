@@ -1,5 +1,6 @@
 #include "topic.h"
 #include "../cxl_manager/scalog_local_sequencer.h"
+#include "../cxl_manager/lazylog_local_sequencer.h"
 #include "common/performance_utils.h"
 #include "../common/wire_formats.h"
 #include "../common/order_level.h"
@@ -299,6 +300,20 @@ Topic::Topic(
 				}
 			}
 			GetCXLBufferFunc = &Topic::ScalogGetCXLBuffer;
+		} else if (seq_type == LAZYLOG) {
+			if (replication_factor_ > 0) {
+				scalog_replication_client_ = std::make_unique<Scalog::ScalogReplicationClient>(
+					topic_name,
+					replication_factor_,
+					"localhost",
+					broker_id_,
+					LAZYLOG_REP_PORT
+				);
+				if (!scalog_replication_client_->Connect()) {
+					LOG(ERROR) << "LazyLog replication client failed to connect to replica";
+				}
+			}
+			GetCXLBufferFunc = &Topic::LazyLogGetCXLBuffer;
 			} else {
 				// Set buffer function based on order
 				if (order_ == 3) {
@@ -376,8 +391,8 @@ void Topic::Start() {
 				delegationThreads_.emplace_back(&Topic::DelegationThread, this);
 		}
 
-	// Head node runs centralized sequencers; Scalog local sequencers run on every broker.
-	if (broker_id_ == 0 || seq_type_ == SCALOG) {
+	// Head node runs centralized sequencers; Scalog/LazyLog local sequencers run on every broker.
+	if (broker_id_ == 0 || seq_type_ == SCALOG || seq_type_ == LAZYLOG) {
 		LOG(INFO) << "Topic Start: broker_id=" << broker_id_ << ", order=" << order_ << ", seq_type=" << seq_type_;
 		switch(seq_type_){
 			case KAFKA: // Kafka is just a way to not run DelegationThread, not actual sequencer
@@ -413,6 +428,13 @@ void Topic::Start() {
 				}else if (order_ == 2)
 					LOG(ERROR) << "Order is set 2 at scalog";
 				break;
+			case LAZYLOG:
+				if (order_ == Embarcadero::kOrderTotal){
+					sequencerThread_ = std::thread(&Topic::StartLazyLogLocalSequencer, this);
+				} else {
+					LOG(ERROR) << "LazyLog baseline requires ORDER=2 (got ORDER=" << order_ << ")";
+				}
+				break;
 			case CORFU:
 				if (order_ == Embarcadero::kOrderTotal) {
 					VLOG(3) << "Corfu running in canonical ORDER=2 mode.";
@@ -434,6 +456,13 @@ void Topic::StartScalogLocalSequencer() {
 			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
 	Scalog::ScalogLocalSequencer scalog_local_sequencer(tinode_, broker_id_, cxl_addr_, topic_name_, batch_header);
 	scalog_local_sequencer.SendLocalCut(topic_name_, stop_threads_volatile_);
+}
+
+void Topic::StartLazyLogLocalSequencer() {
+	BatchHeader* batch_header = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	LazyLog::LazyLogLocalSequencer lazylog_local_sequencer(tinode_, broker_id_, cxl_addr_, topic_name_, batch_header);
+	lazylog_local_sequencer.SendLocalProgress(topic_name_, stop_threads_volatile_);
 }
 
 
@@ -598,13 +627,18 @@ void Topic::DelegationThread() {
 					}
 
 					if (order_ != 0) {
-						size_t written_val = (seq_type_ == SCALOG) ? logical_offset_ : logical_offset_ - 1;
+						const bool count_based_written =
+							(seq_type_ == SCALOG || seq_type_ == LAZYLOG);
+						size_t written_val = count_based_written ? logical_offset_ : logical_offset_ - 1;
 						UpdateTInodeWritten(
 							written_val,
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
 						if (seq_type_ == SCALOG) {
 							PublishValidatedWrittenRange(current_batch->log_idx, current_batch->total_size);
+						} else if (seq_type_ == LAZYLOG) {
+							tinode_->offsets[broker_id_].validated_written_byte_offset =
+								current_batch->log_idx + current_batch->total_size;
 						}
 					}
 				} else {
@@ -650,13 +684,18 @@ void Topic::DelegationThread() {
 					}
 
 					if (order_ != 0) {
-						size_t written_val = (seq_type_ == SCALOG) ? logical_offset_ : logical_offset_ - 1;
+						const bool count_based_written =
+							(seq_type_ == SCALOG || seq_type_ == LAZYLOG);
+						size_t written_val = count_based_written ? logical_offset_ : logical_offset_ - 1;
 						UpdateTInodeWritten(
 							written_val,
 							static_cast<unsigned long long int>(
 								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(cxl_addr_)));
 						if (seq_type_ == SCALOG) {
 							PublishValidatedWrittenRange(current_batch->log_idx, current_batch->total_size);
+						} else if (seq_type_ == LAZYLOG) {
+							tinode_->offsets[broker_id_].validated_written_byte_offset =
+								current_batch->log_idx + current_batch->total_size;
 						}
 					}
 				}
@@ -1716,6 +1755,57 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 	};
 }
 
+std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
+		BatchHeader &batch_header,
+		const char topic[TOPIC_NAME_SIZE],
+		void* &log,
+		void* &segment_header,
+		size_t &logical_offset,
+		BatchHeader* &batch_header_location,
+		bool /*epoch_already_checked*/) {
+
+	static const bool kCxlLazyLogMode =
+		(getenv("LAZYLOG_CXL_MODE") != nullptr &&
+		 std::string(getenv("LAZYLOG_CXL_MODE")) == "1");
+
+	uint64_t pbr_idx = broker_pbr_counters_[broker_id_].fetch_add(1, std::memory_order_relaxed);
+	batch_header.pbr_absolute_index = pbr_idx;
+	batch_header.batch_id = (static_cast<uint64_t>(broker_id_) << 48) | pbr_idx;
+
+	BatchHeader* batch_header_ring = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
+	size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
+	batch_header_location = &batch_header_ring[slot_idx];
+	__atomic_store_n(&batch_header_location->batch_complete, 0, __ATOMIC_RELEASE);
+
+	const unsigned long long int segment_metadata =
+		reinterpret_cast<unsigned long long int>(current_segment_);
+	const size_t msg_size = batch_header.total_size;
+
+	log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
+	batch_header.log_idx = reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_);
+	CheckSegmentBoundary(log, msg_size, segment_metadata);
+
+	size_t rep_offset = 0;
+	if (!kCxlLazyLogMode) {
+		rep_offset = scalog_batch_offset_.fetch_add(batch_header.total_size, std::memory_order_relaxed);
+	}
+
+	return [this, batch_header, log, rep_offset, kCxlLazyLogMode](void* /*log_ptr*/, size_t /*placeholder*/) {
+		if (kCxlLazyLogMode) {
+			return;
+		}
+		if (replication_factor_ > 0 && scalog_replication_client_) {
+			scalog_replication_client_->ReplicateData(
+					rep_offset,
+					batch_header.total_size,
+					batch_header.num_msg,
+					log);
+		}
+	};
+}
+
 std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		BatchHeader &batch_header,
 		const char topic[TOPIC_NAME_SIZE],
@@ -2411,6 +2501,66 @@ bool Topic::GetBatchToExportWithMetadata(
 		}
 		return false;
 	}
+	// LazyLog ORDER=2 currently exports from the ordered slot ring and does not
+	// drive CompletionVector progress. Reuse legacy slot export and derive
+	// metadata directly from the batch payload.
+	if (seq_type_ == LAZYLOG && order_ == Embarcadero::kOrderTotal) {
+		if (!GetBatchToExport(expected_batch_offset, batch_addr, batch_size)) {
+			return false;
+		}
+		if (batch_addr == nullptr || batch_size < sizeof(MessageHeader)) {
+			return false;
+		}
+
+		auto* first = reinterpret_cast<MessageHeader*>(batch_addr);
+		batch_total_order = first->total_order;
+
+		uint32_t counted = 0;
+		size_t remaining = batch_size;
+		uint8_t* cursor = reinterpret_cast<uint8_t*>(batch_addr);
+		while (remaining >= sizeof(MessageHeader)) {
+			auto* hdr = reinterpret_cast<MessageHeader*>(cursor);
+			const size_t stride = static_cast<size_t>(hdr->next_msg_diff);
+			if (stride == 0 || stride > remaining) {
+				break;
+			}
+			++counted;
+			cursor += stride;
+			remaining -= stride;
+		}
+		num_messages = (counted > 0) ? counted : 1;
+		return true;
+	}
+	// Scalog ORDER=2: local sequencers commit ordered batches into the slot ring; export
+	// uses the same slot walk as LazyLog (CompletionVector / ORDER=5-style path does not
+	// match how Scalog publishes).
+	if (seq_type_ == SCALOG && order_ == Embarcadero::kOrderTotal) {
+		if (!GetBatchToExport(expected_batch_offset, batch_addr, batch_size)) {
+			return false;
+		}
+		if (batch_addr == nullptr || batch_size < sizeof(MessageHeader)) {
+			return false;
+		}
+
+		auto* first = reinterpret_cast<MessageHeader*>(batch_addr);
+		batch_total_order = first->total_order;
+
+		uint32_t counted = 0;
+		size_t remaining = batch_size;
+		uint8_t* cursor = reinterpret_cast<uint8_t*>(batch_addr);
+		while (remaining >= sizeof(MessageHeader)) {
+			auto* hdr = reinterpret_cast<MessageHeader*>(cursor);
+			const size_t stride = static_cast<size_t>(hdr->next_msg_diff);
+			if (stride == 0 || stride > remaining) {
+				break;
+			}
+			++counted;
+			cursor += stride;
+			remaining -= stride;
+		}
+		num_messages = (counted > 0) ? counted : 1;
+		return true;
+	}
 
 	const bool trace_order5 = ShouldEnableOrder5Trace() && (order_ == 5);
 	constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
@@ -2768,10 +2918,14 @@ void Topic::FlushAccumulatedCV(
 		const uint64_t prev_pbr = cur_pbr;
 		const uint64_t pbr_val = max_pbr_index[broker_id];
 		const uint64_t cumulative = max_cumulative[broker_id];
+		const uint64_t prev_durable =
+			entry->completed_logical_offset.load(std::memory_order_acquire);
 		bool advanced_logical = false;
 		bool advanced_pbr = false;
+		bool advanced_durable = false;
 		uint64_t post_cumulative = prev_cur;
 		uint64_t post_pbr = prev_pbr;
+		uint64_t post_durable = prev_durable;
 		if (cumulative > cur) {
 			while (cumulative > cur) {
 				if (entry->sequencer_logical_offset.compare_exchange_strong(
@@ -2783,6 +2937,23 @@ void Topic::FlushAccumulatedCV(
 			}
 			if (!advanced_logical) {
 				post_cumulative = cur;
+			}
+		}
+		// [[ACK_LEVEL_2_RF1]] ORDER=5 ack_level=2 reads completed_logical_offset (NetworkManager).
+		// Happy-path commits only fed FlushAccumulatedCV, not FlushAccumulatedCVLogicalOnly's
+		// cv_logical_only_* maps (those are for late/terminalized batches), so durable lagged at 0.
+		if (sequencer_owns_durable_cv && cumulative > prev_durable) {
+			uint64_t cur_d = prev_durable;
+			while (cumulative > cur_d) {
+				if (entry->completed_logical_offset.compare_exchange_strong(
+				        cur_d, cumulative, std::memory_order_release, std::memory_order_acquire)) {
+					advanced_durable = true;
+					post_durable = cumulative;
+					break;
+				}
+			}
+			if (!advanced_durable) {
+				post_durable = cur_d;
 			}
 		}
 		if (sequencer_owns_durable_cv &&
@@ -2802,7 +2973,7 @@ void Topic::FlushAccumulatedCV(
 		if (order_ == 5 && post_pbr > prev_pbr && post_cumulative <= prev_cur) {
 			order5_ack_order_violations_.fetch_add(1, std::memory_order_relaxed);
 		}
-		if (advanced_logical || advanced_pbr) {
+		if (advanced_logical || advanced_pbr || advanced_durable) {
 			RecordOrder5FlightEvent(
 				kOrder5FlightCV,
 				static_cast<uint32_t>(broker_id),
@@ -2812,10 +2983,13 @@ void Topic::FlushAccumulatedCV(
 				post_pbr);
 		}
 		if (ShouldEnableOrder5Trace() && order_ == 5 &&
-		    (advanced_logical || (prev_pbr == kNoProgress || post_pbr > prev_pbr))) {
+		    (advanced_logical || advanced_durable ||
+		     (prev_pbr == kNoProgress || post_pbr > prev_pbr))) {
 			LOG(INFO) << "[ORDER5_TRACE_CV B" << broker_id << "]"
 			          << " cv_logical:" << prev_cur << "->"
 			          << post_cumulative
+			          << " cv_durable:" << prev_durable << "->"
+			          << post_durable
 			          << " cv_pbr_head:" << prev_pbr << "->"
 			          << post_pbr;
 		}
@@ -3474,6 +3648,10 @@ void Topic::Sequencer2() {
 	}
 	committed_seq_updater_stop_.store(false, std::memory_order_release);
 	committed_seq_updater_thread_ = std::thread(&Topic::CommittedSeqUpdaterThread, this);
+	// Same Level-5 shard state as Sequencer5: EpochSequencerThread always calls
+	// ProcessLevel5Batches (hold-buffer tick + per-epoch partition). Without this,
+	// level5_shards_ is empty and ProcessLevel5Batches dereferences level5_shards_[0].
+	InitLevel5Shards();
 	absl::btree_set<int> registered_brokers;
 	GetRegisteredBrokerSet(registered_brokers);
 
@@ -4884,7 +5062,10 @@ void Topic::ClientGc(Level5ShardState& shard) {
 }
 
 void Topic::ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector<PendingBatch5>& ready) {
-	if (level5_shards_.empty() || level5_num_shards_ <= 1) {
+	if (level5_shards_.empty()) {
+		LOG(FATAL) << "ProcessLevel5Batches: level5_shards_ empty (InitLevel5Shards was not run)";
+	}
+	if (level5_num_shards_ <= 1) {
 		ProcessLevel5BatchesShard(*level5_shards_[0], level5, ready);
 		return;
 	}
@@ -5888,6 +6069,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id].batch_headers_offset);
 	BatchHeader* current_batch_header = ring_start_default;
 	uint64_t scanner_slot_seq = 0;
+	uint64_t scanner_abs_hw = 0;  // ABA guard: highest pbr_absolute_index processed/skipped
 
 	// [[CRITICAL FIX: Ring Buffer Boundary]] - Calculate ring end to prevent out-of-bounds access
 	// Each broker gets BATCHHEADERS_SIZE bytes per topic for batch headers
@@ -6002,6 +6184,19 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			(batch_complete_check == 1) &&
 			(num_msg_check > 0 && num_msg_check <= MAX_REASONABLE_NUM_MSG);
 
+		// [[ABA_GUARD]] Reject stale writes from previous ring traversals.
+		// A stalled thread that wakes after the ring has wrapped will flush a slot
+		// with pbr_absolute_index from a previous generation (at least N behind).
+		// Reject any slot whose absolute index lags scanner_abs_hw by more than N/2.
+		if (batch_ready && scanner_abs_hw > slot_count / 2 &&
+		    pbr_absolute_index + slot_count / 2 <= scanner_abs_hw) {
+			LOG(WARNING) << "[Scanner B" << broker_id << "] ABA_GUARD: rejecting stale slot"
+				<< " pbr_abs=" << pbr_absolute_index
+				<< " scanner_abs_hw=" << scanner_abs_hw
+				<< " slot_count=" << slot_count;
+			batch_ready = false;
+		}
+
 		// [[PERF_OPTIMIZATION]] Lazy timestamp collection - only when needed for hole timing or heartbeat
 		// Removed: std::chrono::steady_clock::now() call from every iteration (~25ns overhead)
 
@@ -6112,6 +6307,11 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 						    re_complete == 1 &&
 						    re_num > 0 &&
 						    re_num <= MAX_REASONABLE_NUM_MSG) {
+							uint64_t re_abs = current_batch_header->pbr_absolute_index;
+							if (scanner_abs_hw > slot_count / 2 &&
+							    re_abs + slot_count / 2 <= scanner_abs_hw) {
+								break;  // ABA stale write, do not treat as ready
+							}
 							recheck_ready = true;
 						}
 					}
@@ -6138,8 +6338,13 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 					    BatchHeaderPublishCommitted(*current_batch_header) &&
 					    re_complete == 1 &&
 					    re_num > 0 && re_num <= MAX_REASONABLE_NUM_MSG) {
-						hole_wait_start_ns = 0;
-						continue;
+						uint64_t re_abs = current_batch_header->pbr_absolute_index;
+						if (scanner_abs_hw <= slot_count / 2 ||
+						    re_abs + slot_count / 2 > scanner_abs_hw) {
+							hole_wait_start_ns = 0;
+							continue;  // Legitimate late completion, not ABA
+						}
+						// ABA stale write — fall through to skip
 					}
 				}
 
@@ -6225,6 +6430,8 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 					if (pushed) {
 						hole_wait_start_ns = 0;
 						++holes_skipped;
+						if (skip_marker.cached_pbr_absolute_index > scanner_abs_hw)
+							scanner_abs_hw = skip_marker.cached_pbr_absolute_index;
 						order5_skipped_batches_.fetch_add(1, std::memory_order_relaxed);
 						order5_scanner_timeout_skips_.fetch_add(1, std::memory_order_relaxed);
 						BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
@@ -6399,6 +6606,8 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	total_batches_processed++;
 	scanner_pushed_batches_[broker_id].fetch_add(1, std::memory_order_relaxed);
 	scanner_pushed_msgs_[broker_id].fetch_add(static_cast<uint64_t>(pending.num_msg), std::memory_order_relaxed);
+	if (pending.cached_pbr_absolute_index > scanner_abs_hw)
+		scanner_abs_hw = pending.cached_pbr_absolute_index;
 	if (slot_index < last_pushed_pbr_index_per_slot.size()) {
 		last_pushed_pbr_index_per_slot[slot_index] = pending.cached_pbr_absolute_index;
 	}

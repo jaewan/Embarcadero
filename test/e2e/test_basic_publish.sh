@@ -12,13 +12,14 @@ BIN_DIR="$BUILD_DIR/bin"
 CONFIG_DIR="$PROJECT_ROOT/config"
 TEST_OUTPUT_DIR="$BUILD_DIR/test_output"
 
+# Portable NUMA (override with NUMA_BIND=... in the environment if needed)
+source "$SCRIPT_DIR/numa_bind.sh"
+
 # Test configuration
 TEST_NAME="basic_publish"
 NUM_BROKERS=4
 MESSAGE_SIZE=128
 TOTAL_MESSAGES=1000  # Small for quick test
-# Include CXL NUMA node in membind when cxl.numa_node is a zero-core expander (e.g. node 2); CPUs stay on node 1.
-NUMA_BIND="numactl --cpunodebind=1 --membind=1,2"
 
 # Colors for output
 RED='\033[0;31m'

@@ -167,6 +167,8 @@ int main(int argc, char* argv[]) {
 		("follower", "Follower Address and Port", cxxopts::value<std::string>())
 		("scalog", "Run also as a Scalog Replica")
 		("SCALOG", "Run also as a Scalog Replica")
+		("lazylog", "Run also as a LazyLog Replica")
+		("LAZYLOG", "Run also as a LazyLog Replica")
 		("corfu", "Run also as a Corfu Replica")
 		("CORFU", "Run also as a Corfu Replica")
 		("embarcadero", "Run as a Embarcadero Replica")
@@ -213,12 +215,17 @@ int main(int argc, char* argv[]) {
 
 	if (arguments.count("scalog") || arguments.count("SCALOG")) {
 		sequencerType = heartbeat_system::SequencerType::SCALOG;
+	} else if (arguments.count("lazylog") || arguments.count("LAZYLOG")) {
+		sequencerType = heartbeat_system::SequencerType::LAZYLOG;
 	} else if (arguments.count("corfu") || arguments.count("CORFU")) {
 		sequencerType = heartbeat_system::SequencerType::CORFU;
 	}
 	// [[CORFU_DEBUG]] Trace startup to pinpoint broker death
-	LOG(INFO) << "[CORFU_DEBUG] sequencerType=" << (sequencerType == heartbeat_system::SequencerType::CORFU ? "CORFU" :
-	      sequencerType == heartbeat_system::SequencerType::SCALOG ? "SCALOG" : "EMBARCADERO");
+	LOG(INFO) << "[CORFU_DEBUG] sequencerType="
+	          << (sequencerType == heartbeat_system::SequencerType::CORFU ? "CORFU" :
+	              sequencerType == heartbeat_system::SequencerType::SCALOG ? "SCALOG" :
+	              sequencerType == heartbeat_system::SequencerType::LAZYLOG ? "LAZYLOG" :
+	              "EMBARCADERO");
 
 	if (arguments.count("head")) {
 		is_head_node = true;

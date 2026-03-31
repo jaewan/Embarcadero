@@ -21,6 +21,7 @@ enum SequencerType{
 	KAFKA = 1;
 	SCALOG = 2;
 	CORFU = 3;
+	LAZYLOG = 4;
 }
 
 message ClientInfo{

@@ -156,6 +156,15 @@ bool Configuration::loadFromFile(const std::string& filename) {
                 if (scalog["sequencer_ip"]) config_.scalog.sequencer_ip.set(scalog["sequencer_ip"].as<std::string>());
                 if (scalog["local_cut_interval"]) config_.scalog.local_cut_interval.set(scalog["local_cut_interval"].as<int>());
             }
+
+            // LazyLog
+            if (root["lazylog"]) {
+                auto lazylog = root["lazylog"];
+                if (lazylog["sequencer_port"]) config_.lazylog.sequencer_port.set(lazylog["sequencer_port"].as<int>());
+                if (lazylog["replication_port"]) config_.lazylog.replication_port.set(lazylog["replication_port"].as<int>());
+                if (lazylog["sequencer_ip"]) config_.lazylog.sequencer_ip.set(lazylog["sequencer_ip"].as<std::string>());
+                if (lazylog["local_cut_interval"]) config_.lazylog.local_cut_interval.set(lazylog["local_cut_interval"].as<int>());
+            }
             
             // Platform
             if (root["platform"]) {

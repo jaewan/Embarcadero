@@ -21,7 +21,7 @@ int main(int argc, char* argv[]) {
         ("o,order_level", "Order Level", cxxopts::value<int>()->default_value("0"))
         ("head_addr", "Head broker address for client control/data connections",
             cxxopts::value<std::string>()->default_value("127.0.0.1"))
-        ("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3)", 
+        ("sequencer", "Sequencer Type: Embarcadero(0), Kafka(1), Scalog(2), Corfu(3), LazyLog(4)",
             cxxopts::value<std::string>()->default_value("EMBARCADERO"))
         ("s,total_message_size", "Total size of messages to publish", 
             cxxopts::value<size_t>()->default_value("10737418240"))
@@ -87,6 +87,10 @@ int main(int argc, char* argv[]) {
 
     if (seq_type == heartbeat_system::SequencerType::CORFU && order != Embarcadero::kOrderTotal) {
         LOG(ERROR) << "Corfu supports only ORDER=2 in this implementation (got ORDER=" << order << ").";
+        return -1;
+    }
+    if (seq_type == heartbeat_system::SequencerType::LAZYLOG && order != Embarcadero::kOrderTotal) {
+        LOG(ERROR) << "LazyLog baseline requires ORDER=2 (weak total order) in this implementation (got ORDER=" << order << ").";
         return -1;
     }
 

@@ -1,5 +1,6 @@
 include(cmake/heartbeat_grpc.cmake)
 include(cmake/scalog_sequencer_grpc.cmake)
+include(cmake/lazylog_sequencer_grpc.cmake)
 include(cmake/corfu_sequencer_grpc.cmake)
 include(cmake/scalog_replication_grpc.cmake)
 include(cmake/corfu_replication_grpc.cmake)
@@ -62,6 +63,8 @@ add_executable(embarlet
     cxl_manager/cxl_manager.h
     cxl_manager/scalog_local_sequencer.cc
     cxl_manager/scalog_local_sequencer.h
+    cxl_manager/lazylog_local_sequencer.cc
+    cxl_manager/lazylog_local_sequencer.h
     network_manager/network_manager.cc
     network_manager/network_manager.h
     embarlet/heartbeat.cc
@@ -87,6 +90,7 @@ target_link_libraries(embarlet
     mimalloc
     absl::flat_hash_map
 	scalog_sequencer_grpc_proto
+    lazylog_sequencer_grpc_proto
 	corfu_replication_grpc_proto
     scalog_replication_grpc_proto
 	heartbeat_grpc_proto
@@ -230,6 +234,31 @@ set_target_properties(scalog_global_sequencer PROPERTIES
     BUILD_RPATH_USE_ORIGIN TRUE
     INSTALL_RPATH "$ORIGIN"
     BUILD_WITH_INSTALL_RPATH TRUE
+)
+
+add_executable(lazylog_global_sequencer
+    cxl_manager/lazylog_global_sequencer.cc
+    cxl_manager/lazylog_global_sequencer.h
+    common/configuration.cc
+    common/configuration.h
+)
+
+target_include_directories(lazylog_global_sequencer PUBLIC
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+)
+
+target_link_libraries(lazylog_global_sequencer
+    glog::glog
+    absl::flat_hash_map
+    lazylog_sequencer_grpc_proto
+    protobuf::libprotobuf
+    Threads::Threads
+    yaml-cpp
+)
+
+set_target_properties(lazylog_global_sequencer PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
 add_executable(corfu_global_sequencer
