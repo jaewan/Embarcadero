@@ -22,7 +22,10 @@ size_t ResolveExpectedBrokers() {
   return static_cast<size_t>(NUM_MAX_BROKERS_CONFIG);
 }
 
-constexpr int64_t kMaxBindingsPerBrokerPerTick = 4096;
+// No artificial per-tick cap. The original value of 4096 could throttle throughput
+// at lower binding intervals. Scalog's global cut has no per-tick cap either.
+// Bind everything available each tick for a fair comparison.
+constexpr int64_t kMaxBindingsPerBrokerPerTick = std::numeric_limits<int64_t>::max();
 }  // namespace
 
 LazyLogGlobalSequencer::LazyLogGlobalSequencer(const std::string& sequencer_address)
@@ -115,6 +118,21 @@ void LazyLogGlobalSequencer::ReceiveLocalProgress(
       LOG(WARNING) << "Ignoring local progress with invalid broker_id=" << broker_id;
       continue;
     }
+
+    // Guard: this sequencer instance does not multiplex topics. Log a warning
+    // if a second topic appears so the operator notices the misconfiguration.
+    const std::string& topic = progress.topic();
+    if (!topic.empty()) {
+      static std::string first_topic;
+      static std::once_flag once;
+      std::call_once(once, [&]() { first_topic = topic; });
+      if (topic != first_topic) {
+        LOG_EVERY_N(WARNING, 10000) << "LazyLog global sequencer received progress for topic '"
+            << topic << "' but is already tracking topic '" << first_topic
+            << "'. Multi-topic multiplexing is not supported; results may be incorrect.";
+      }
+    }
+
     const int64_t current = progress.local_progress();
     absl::WriterMutexLock lock(&progress_mu_);
     const int64_t previous = last_progress_[broker_id];
@@ -161,9 +179,11 @@ void LazyLogGlobalSequencer::SendGlobalBinding() {
 
     if (ready_to_bind && !binding.global_binding().empty()) {
       absl::MutexLock lock(&stream_mu_);
-      for (auto* stream : local_streams_) {
-        if (stream) {
-          stream->Write(binding);
+      for (auto it = local_streams_.begin(); it != local_streams_.end(); ) {
+        if (*it && (*it)->Write(binding)) {
+          ++it;
+        } else {
+          it = local_streams_.erase(it);
         }
       }
     }

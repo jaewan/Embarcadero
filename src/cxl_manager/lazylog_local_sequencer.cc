@@ -76,31 +76,60 @@ void LazyLogLocalSequencer::SendLocalProgress(std::string topic_str, volatile bo
     return env && std::string(env) == "1";
   }();
 
+  const int num_brokers = []() {
+    const char* env = std::getenv("EMBARCADERO_NUM_BROKERS");
+    if (env && std::strlen(env) > 0) {
+      const int parsed = std::atoi(env);
+      if (parsed > 0) return parsed;
+    }
+    return NUM_MAX_BROKERS_CONFIG;
+  }();
+
   grpc::ClientContext context;
   auto stream = stub_->HandleSendLocalProgress(&context);
   std::thread recv_thread(&LazyLogLocalSequencer::ReceiveGlobalBinding, this, std::ref(stream));
 
   while (!stop_thread) {
     int64_t local_progress = 0;
-    const bool track_replication_progress =
-        (kCxlLazyLogMode && tinode_->replication_factor > 0);
+    const int rf = tinode_->replication_factor;
+    const bool track_replication_progress = (kCxlLazyLogMode && rf > 0);
     if (track_replication_progress) {
+      // [[CORRECTNESS_FIX]] Read min(replication_done[broker_id_]) across ALL replicas
+      // in the replication set, not just self. Without this, ordering is gated only by
+      // the primary's persistence, giving LazyLog an unfair advantage over Scalog (which
+      // takes min across all replicas for its global cut).
+      uint64_t min_rep = std::numeric_limits<uint64_t>::max();
+      int ready_replicas = 0;
+      for (int i = 0; i < rf; i++) {
+        const int b = Embarcadero::GetReplicationSetBroker(broker_id_, rf, num_brokers, i);
+        volatile uint64_t* rep_done_ptr = &tinode_->offsets[b].replication_done[broker_id_];
+        Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+            reinterpret_cast<const volatile void*>(rep_done_ptr)));
+        Embarcadero::CXL::full_fence();
+        const uint64_t val = *rep_done_ptr;
+        if (val == std::numeric_limits<uint64_t>::max()) {
+          continue;
+        }
+        ready_replicas++;
+        if (val < min_rep) min_rep = val;
+      }
+      if (ready_replicas < rf || min_rep == std::numeric_limits<uint64_t>::max()) {
+        local_progress = 0;
+      } else {
+        local_progress = static_cast<int64_t>(min_rep + 1);
+      }
+    } else if (rf > 0) {
+      // Non-CXL replication mode with RF > 0: track replication_done from self-replica
+      // (remote replicas update replication_done via gRPC callbacks to disk manager).
       volatile uint64_t* rep_done_ptr = &tinode_->offsets[broker_id_].replication_done[broker_id_];
       Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
           reinterpret_cast<const volatile void*>(rep_done_ptr)));
       Embarcadero::CXL::full_fence();
       const uint64_t rep_done = *rep_done_ptr;
-      Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
-          reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].validated_written_byte_offset)));
-      Embarcadero::CXL::full_fence();
-      const size_t validated = tinode_->offsets[broker_id_].validated_written_byte_offset;
-      const size_t log_start = tinode_->offsets[broker_id_].log_offset;
-      local_progress = (validated <= log_start || rep_done == std::numeric_limits<uint64_t>::max())
+      local_progress = (rep_done == std::numeric_limits<uint64_t>::max())
           ? 0
           : static_cast<int64_t>(rep_done + 1);
     } else {
-      // No replication durability frontier is available (e.g., replication_factor=0),
-      // so progress must follow locally delegated message count.
       local_progress = static_cast<int64_t>(tinode_->offsets[broker_id_].written);
     }
 
@@ -157,6 +186,12 @@ void LazyLogLocalSequencer::ApplyGlobalBinding(const absl::btree_map<int, int>& 
   uint32_t current_batch_num_messages = 0;
   uint64_t current_batch_first_total_order = next_global_sequence_;
 
+  // [[CORRECTNESS_FIX]] Track the last ordered values locally. We only publish
+  // tinode->offsets[].ordered AFTER the batch header export slot is written, so
+  // ACK1 (which reads ordered) never exceeds export visibility.
+  uint64_t last_ordered_count = 0;
+  size_t last_ordered_offset = 0;
+
   auto publish_batch = [&](void* batch_start_addr,
                            size_t publish_size,
                            uint32_t publish_num_messages,
@@ -174,6 +209,16 @@ void LazyLogLocalSequencer::ApplyGlobalBinding(const absl::btree_map<int, int>& 
     Embarcadero::CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(&batch_header_[slot]) + 64);
     Embarcadero::CXL::store_fence();
     batch_header_idx_++;
+
+    // [[CORRECTNESS_FIX]] Publish tinode ordered frontier AFTER the export batch
+    // header is visible. This ensures ACK1 <= export visibility.
+    tinode_->offsets[broker_id_].ordered = last_ordered_count;
+    tinode_->offsets[broker_id_].ordered_offset = last_ordered_offset;
+    Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+        static_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered)));
+    Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+        static_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered_offset)));
+    Embarcadero::CXL::store_fence();
   };
 
   for (const auto& cut : global_binding) {
@@ -187,14 +232,12 @@ void LazyLogLocalSequencer::ApplyGlobalBinding(const absl::btree_map<int, int>& 
         total_size += msg_to_order_->paddedSize;
         msg_to_order_->total_order = next_global_sequence_;
         std::atomic_thread_fence(std::memory_order_release);
-        tinode_->offsets[broker_id_].ordered = msg_to_order_->logical_offset + 1;
-        tinode_->offsets[broker_id_].ordered_offset =
-            reinterpret_cast<uint8_t*>(msg_to_order_) - reinterpret_cast<uint8_t*>(cxl_addr_);
-        Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
-            static_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered)));
-        Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
-            static_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered_offset)));
-        Embarcadero::CXL::store_fence();
+
+        // Track locally; tinode update deferred to publish_batch
+        last_ordered_count = msg_to_order_->logical_offset + 1;
+        last_ordered_offset = reinterpret_cast<uint8_t*>(msg_to_order_) -
+            reinterpret_cast<uint8_t*>(cxl_addr_);
+
         msg_to_order_ = reinterpret_cast<MessageHeader*>(
             reinterpret_cast<uint8_t*>(msg_to_order_) + msg_to_order_->next_msg_diff);
         ++next_global_sequence_;

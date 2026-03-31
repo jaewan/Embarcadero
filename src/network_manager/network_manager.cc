@@ -1714,7 +1714,7 @@ std::pair<size_t, bool> NetworkManager::GetOffsetToAckFast(const char* topic, ui
 			if (ready_replicas == replication_factor && min_val != kReplicationNotStarted) {
 				fast_read_value = min_val + 1;  // Convert last offset to message count
 				// [[SCALOG_CORRECTNESS_FIX]] Clamp by ordered to prevent ACK2 > ordered
-				if (seq_type == SCALOG) {
+				if (seq_type == SCALOG || seq_type == LAZYLOG) {
 					const size_t ordered_val = tinode->offsets[broker_id_].ordered;
 					if (fast_read_value > ordered_val) {
 						fast_read_value = ordered_val;
@@ -1864,7 +1864,7 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		// [[SCALOG_CORRECTNESS_FIX]] ACK2 must not exceed the ordered frontier.
 		// replication_done advances as data hits disk, independent of global ordering.
 		// Without this clamp, ACK2 can acknowledge messages that have no total order yet.
-		if (seq_type == SCALOG) {
+		if (seq_type == SCALOG || seq_type == LAZYLOG) {
 			volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
 			CXL::flush_cacheline(const_cast<const void*>(
 				reinterpret_cast<const volatile void*>(ordered_ptr)));
@@ -1934,8 +1934,8 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 		}
 		{
 			size_t ack_val = min + 1;
-			// [[SCALOG_CORRECTNESS_FIX]] Clamp by ordered for SCALOG
-			if (seq_type == SCALOG) {
+			// [[SCALOG_CORRECTNESS_FIX]] Clamp by ordered for SCALOG/LAZYLOG
+			if (seq_type == SCALOG || seq_type == LAZYLOG) {
 				volatile uint64_t* ordered_ptr = &tinode->offsets[broker_id_].ordered;
 				CXL::flush_cacheline(const_cast<const void*>(
 					reinterpret_cast<const volatile void*>(ordered_ptr)));

@@ -108,8 +108,12 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 				for (const auto& [broker_id, replica_map] : global_cut_) {
 					total_num_replicas += replica_map.size();
 				}
+				// RF=0 still needs one local-cut stream per broker (the broker-local writer frontier).
+				// Treat RF=0 as one effective replica stream per broker for cut readiness.
+				const size_t replicas_per_broker =
+					static_cast<size_t>(std::max(1, num_replicas_per_broker_));
 				const size_t expected_replicas =
-					static_cast<size_t>(ExpectedScalogBrokerCount()) * num_replicas_per_broker_;
+					static_cast<size_t>(ExpectedScalogBrokerCount()) * replicas_per_broker;
 
 				if (total_num_replicas != expected_replicas) {
 					continue;

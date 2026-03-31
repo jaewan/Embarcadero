@@ -68,7 +68,8 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str, volatile bool& st
 
 	while (!stop_thread) {
 		int64_t local_cut = 0;
-		if (cxl_scalog_mode) {
+		const bool track_replication_progress = (cxl_scalog_mode && tinode_->replication_factor > 0);
+		if (track_replication_progress) {
 			volatile uint64_t* rep_done_ptr = &tinode_->offsets[broker_id_].replication_done[broker_id_];
 			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
 				reinterpret_cast<const volatile void*>(rep_done_ptr)));
