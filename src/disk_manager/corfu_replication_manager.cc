@@ -129,7 +129,13 @@ namespace Corfu {
 					throw std::runtime_error("CXL address not initialized in ReplicationService");
 				}
 
-				// Phase 4 fix: Read directly from CXL memory instead of protobuf bytes
+				// Read directly from CXL memory into the replica file.
+				// DURABILITY SEMANTICS: pwrite() lands in the replica OS page cache, not on disk.
+				// A successful pwrite triggers RecordCorfuOrder2DurableCompletion → ACK=2 to the
+				// publisher, meaning ACK=2 guarantees "written to replica page cache on N replicas."
+				// Persistence to disk happens via FsyncLoop (every ~5 s). This matches Kafka's
+				// default replication semantics (log.flush.interval.ms=-1 / OS-driven flush).
+				// For crash-safe durability, reduce FsyncLoop interval or enable O_SYNC on the fd.
 				void* source_addr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(cxl_addr_) + log_idx);
 
 				// Use the passed file descriptor

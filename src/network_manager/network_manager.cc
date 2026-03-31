@@ -982,6 +982,12 @@ void NetworkManager::HandlePublishRequest(
 			LOG(WARNING) << "NetworkManager: Batch incomplete (received " << read << " of "
 			            << batch_header.total_size << " bytes) for batch_seq=" << batch_header.batch_seq
 			            << ". Closing connection to avoid stream desync.";
+			// CORFU: the sequencer committed batch_seq before the publisher started sending.
+			// Without a skip the ordered (and durable) frontier stalls at this hole forever.
+			// non_emb_seq_callback non-null confirms CorfuGetCXLBuffer already ran (slot claimed).
+			if (seq_type == CORFU && topic_ptr != nullptr && non_emb_seq_callback != nullptr) {
+				topic_ptr->SkipCorfuOrder2Batch(batch_header.batch_seq, batch_header.client_id);
+			}
 			// Connection is now out-of-sync; close to avoid interpreting payload as next header.
 			running = false;
 				break;

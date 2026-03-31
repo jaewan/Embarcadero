@@ -1149,9 +1149,10 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 	// block, which is skipped for CORFU.  All data access uses the captured `log`
 	// pointer (set above from log_addr_ + batch_header.log_idx).
 	return [this, batch_header, log](void* /*log_ptr*/, size_t /*placeholder*/) {
-		// Handle replication if needed
+		// Attempt replication first (synchronous RPC); track success for durable gating.
+		bool replicated = false;
 		if (replication_factor_ > 0 && corfu_replication_client_) {
-			const bool replicated = corfu_replication_client_->ReplicateData(
+			replicated = corfu_replication_client_->ReplicateData(
 					batch_header.log_idx,
 					batch_header.total_size,
 					log
@@ -1161,14 +1162,18 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 				           << " log_idx=" << batch_header.log_idx
 				           << " size=" << batch_header.total_size
 				           << " client_id=" << batch_header.client_id
-				           << "; not advancing replication_done / durable frontier.";
-				return;
+				           << "; ordered frontier will advance but durable frontier will not.";
 			}
+		}
+		// Ordered MUST fire before durable so that ACK=2 can never precede ACK=1.
+		// Data is locally intact in CXL regardless of replication outcome, so ordered
+		// always advances — even if replication fails.
+		RecordCorfuOrder2BatchCompletion(batch_header.batch_seq, batch_header.num_msg, batch_header.client_id);
+		// Durable fires only on replication success, and always after ordered.
+		if (replicated) {
 			RecordCorfuOrder2DurableCompletion(
 					batch_header.batch_seq, batch_header.num_msg, batch_header.client_id);
-		} // end: if (replication_factor_ > 0 && corfu_replication_client_)
-
-		RecordCorfuOrder2BatchCompletion(batch_header.batch_seq, batch_header.num_msg, batch_header.client_id);
+		}
 	};
 }
 
@@ -1204,10 +1209,14 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(slot_header) + 64);
 			CXL::full_fence();
 			if (slot_header->pbr_absolute_index != corfu_order2_next_seq_) {
-				// The CXL metadata slot was overwritten by a newer batch that mapped to the same
-				// ring slot (num_slots_ too small for outstanding window).  We still know num_msg
-				// from corfu_order2_completed_, so we can advance the ordered cursor to keep the
-				// ACK path moving — the message data itself is intact in BLog.
+				// Ring slot was overwritten by a later batch that hashed to the same slot
+				// (num_slots_ too small for the outstanding batch window).  With the current
+				// config (BATCHHEADERS_SIZE=10MB, sizeof(BatchHeader)~128B → ~81920 slots) and
+				// at most ~4 concurrent in-flight batches per broker this should NEVER fire.
+				// If it does, the subscriber export path will miss the ordered flag for this batch
+				// (slot_header->ordered is not set), but ACK=1 still advances correctly because
+				// num_msg is preserved in corfu_order2_completed_.  Increase batch_headers_size
+				// in the broker config to eliminate the ring-overwrite path entirely.
 				// Do NOT set slot_header->ordered here; that slot now belongs to a different batch.
 				static std::atomic<uint64_t> freshness_errors{0};
 				uint64_t err_n = freshness_errors.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1321,6 +1330,22 @@ void Topic::RecordCorfuOrder2DurableCompletion(uint64_t batch_seq, uint32_t num_
 
 	for (auto& [cid, cnt] : per_client_delta) {
 		UpdatePerClientDurable(cid, cnt);
+	}
+}
+
+void Topic::SkipCorfuOrder2Batch(uint64_t batch_seq, uint32_t client_id) {
+	// Publisher disconnected after the CORFU sequencer committed batch_seq but before the
+	// full payload was received.  Without intervention the ordered (and durable) frontiers
+	// stall forever at this hole.  Advance both frontiers with 0-message credit so that
+	// subsequently arriving batches can still complete and ACK normally.
+	// RecordCorfuOrder2DurableCompletion with num_msg=0 is safe: the early-return guard
+	// in that function skips the tinode/durable-count update when messages_to_ack==0.
+	LOG(WARNING) << "CORFU: skipping abandoned batch_seq=" << batch_seq
+	             << " client_id=" << client_id
+	             << " (publisher disconnected mid-batch); advancing ordered frontier.";
+	RecordCorfuOrder2BatchCompletion(batch_seq, 0, client_id);
+	if (replication_factor_ > 0 && corfu_replication_client_ != nullptr) {
+		RecordCorfuOrder2DurableCompletion(batch_seq, 0, client_id);
 	}
 }
 

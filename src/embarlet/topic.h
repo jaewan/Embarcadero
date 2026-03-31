@@ -419,6 +419,9 @@ class Topic {
 		bool SupportsPerClientAckLevel1() const;
 		// True when this topic/mode maintains per-client durable frontier for ACK level 2.
 		bool SupportsPerClientAckLevel2Durable() const;
+		// Advance ordered (and, if replicated, durable) frontiers with 0-message credit for a
+		// batch whose payload never arrived (publisher disconnected after GetTotalOrder committed).
+		void SkipCorfuOrder2Batch(uint64_t batch_seq, uint32_t client_id);
 
 		/** [[ORDER_0_SKIP_PBR]] For order 0 we do not write to PBR. Returns start logical offset for this batch and advances by num_msg. */
 		size_t GetAndAdvanceOrder0LogicalOffset(uint32_t num_msg);
