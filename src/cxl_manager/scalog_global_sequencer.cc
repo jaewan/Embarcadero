@@ -1,6 +1,8 @@
 #include "scalog_global_sequencer.h"
 #include <glog/logging.h>
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <sstream>
 
 namespace {
@@ -15,10 +17,18 @@ int ExpectedScalogBrokerCount() {
 
 #ifdef SCALOG_SEQUENCER_IP
 const char* ScalogSequencerIp() {
+	const char* override_ip = std::getenv("SCALOG_SEQUENCER_IP_OVERRIDE");
+	if (override_ip && override_ip[0] != '\0') {
+		return override_ip;
+	}
 	return SCALOG_SEQUENCER_IP;
 }
 #else
 const char* ScalogSequencerIp() {
+	const char* override_ip = std::getenv("SCALOG_SEQUENCER_IP_OVERRIDE");
+	if (override_ip && override_ip[0] != '\0') {
+		return override_ip;
+	}
 	return SCLAOG_SEQUENCER_IP;
 }
 #endif
@@ -108,8 +118,12 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 				for (const auto& [broker_id, replica_map] : global_cut_) {
 					total_num_replicas += replica_map.size();
 				}
+				// Each broker always contributes at least one local-cut stream (replica_id=0)
+				// even when replication_factor=0. Waiting for exactly rf streams would block
+				// global-cut emission forever in RF=0 runs.
+				const int streams_per_broker = std::max(1, num_replicas_per_broker_);
 				const size_t expected_replicas =
-					static_cast<size_t>(ExpectedScalogBrokerCount()) * num_replicas_per_broker_;
+					static_cast<size_t>(ExpectedScalogBrokerCount()) * static_cast<size_t>(streams_per_broker);
 
 				if (total_num_replicas != expected_replicas) {
 					continue;

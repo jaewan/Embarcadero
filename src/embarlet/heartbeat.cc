@@ -7,6 +7,23 @@
 
 namespace heartbeat_system {
 
+static int GetStartupHeartbeatGracePeriodSeconds() {
+	const char* env = std::getenv("EMBARCADERO_STARTUP_HEARTBEAT_GRACE_SEC");
+	if (env && env[0] != '\0') {
+		char* end = nullptr;
+		long parsed = std::strtol(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0) {
+			return static_cast<int>(parsed);
+		}
+		LOG(WARNING) << "Ignoring invalid EMBARCADERO_STARTUP_HEARTBEAT_GRACE_SEC='"
+		             << env << "'; using default";
+	}
+	// Followers can spend well over a minute in CXL MAP_POPULATE before their first real
+	// heartbeat is scheduled. Treating those brokers as dead during normal cold start poisons
+	// cluster convergence and ORDER=5 topic creation.
+	return 180;
+}
+
 static std::string MaybeForceGrpcIPv4Address(const std::string& address) {
 	const char* env = std::getenv("EMBAR_FORCE_GRPC_IPV4");
 	// Default on: avoids IPv6 socket creation path that can fail with EPERM in restricted envs.
@@ -458,7 +475,7 @@ int HeartBeatServiceImpl::GetNumBrokers () {
 
 void HeartBeatServiceImpl::CheckHeartbeats() {
 	static const int timeout_seconds = HEARTBEAT_INTERVAL * 3;
-	static const int startup_grace_period_seconds = 60;  // Don't check heartbeats for first 60 seconds after registration
+	static const int startup_grace_period_seconds = GetStartupHeartbeatGracePeriodSeconds();
 	bool cluster_changed = false;
 
 	while (!shutdown_) {

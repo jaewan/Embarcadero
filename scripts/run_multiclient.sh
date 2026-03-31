@@ -34,6 +34,14 @@
 
 set -euo pipefail
 
+RUN_LOCK_FILE="${RUN_LOCK_FILE:-/tmp/embarcadero_run_multiclient.lock}"
+exec {RUN_LOCK_FD}>"$RUN_LOCK_FILE"
+if ! flock -n "$RUN_LOCK_FD"; then
+    echo "ERROR: another benchmark orchestrator is already running (lock: $RUN_LOCK_FILE)." >&2
+    echo "       Clear the existing run or override RUN_LOCK_FILE if you intentionally need a separate harness lock." >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Cluster topology — order determines activation sequence
 # "local" means this broker machine (where brokers run); everything else is SSH
@@ -67,11 +75,13 @@ ACK=${ACK:-1}
 REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
 
-BROKER_READY_TIMEOUT_SEC=${BROKER_READY_TIMEOUT_SEC:-60}
+BROKER_READY_TIMEOUT_SEC=${BROKER_READY_TIMEOUT_SEC:-120}
 BROKER_REACHABILITY_TIMEOUT_SEC=${BROKER_REACHABILITY_TIMEOUT_SEC:-20}
 BROKER_REACHABILITY_POLL_SEC=${BROKER_REACHABILITY_POLL_SEC:-1}
+BROKER_START_STAGGER_SEC=${BROKER_START_STAGGER_SEC:-1}
 # Extra settle time for broker heartbeat/control-plane convergence after sockets listen.
 BROKER_READY_PROPAGATION_SEC=${BROKER_READY_PROPAGATION_SEC:-4}
+ORDER5_CLUSTER_READY_TIMEOUT_SEC=${ORDER5_CLUSTER_READY_TIMEOUT_SEC:-30}
 # Extra lead time given to SSH connections and clock-sync settling
 START_DELAY_SEC=${START_DELAY_SEC:-8}
 # Enforce a safer minimum barrier delay when any client runs over SSH.
@@ -112,8 +122,23 @@ BROKER_CONFIG_ABS="$PROJECT_ROOT/$BROKER_CONFIG"
 CLIENT_CONFIG_ABS="$PROJECT_ROOT/$CLIENT_CONFIG"
 LOG_DIR="$PROJECT_ROOT/multiclient_logs"
 
-BROKER_IP="${EMBARCADERO_HEAD_ADDR:-10.10.10.10}"
+default_broker_ip() {
+    if [[ -n "${EMBARCADERO_HEAD_ADDR:-}" ]]; then
+        printf '%s\n' "$EMBARCADERO_HEAD_ADDR"
+        return 0
+    fi
+    local host_ip
+    host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    if [[ -n "$host_ip" ]]; then
+        printf '%s\n' "$host_ip"
+    else
+        printf '%s\n' "127.0.0.1"
+    fi
+}
+
+BROKER_IP="$(default_broker_ip)"
 export EMBARCADERO_CXL_SHM_NAME="${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}"
+export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -199,6 +224,9 @@ embar_default_numa_membind() {
 if [[ "${EMBARCADERO_KEEP_LAZYLOG_SEQ_ENV:-0}" != "1" ]] && [[ -z "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]]; then
   unset EMBARCADERO_LAZYLOG_SEQ_IP EMBARCADERO_LAZYLOG_SEQ_PORT
 fi
+if [[ "$SEQUENCER" == "LAZYLOG" && -z "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]]; then
+  EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-$BROKER_IP}"
+fi
 
 _default_mb="$(embar_default_numa_membind)"
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=${_default_mb}}"
@@ -209,6 +237,52 @@ unset _default_mb
 # Helpers
 # ---------------------------------------------------------------------------
 log() { [ "$QUIET" != "1" ] && echo "$*"; }
+
+START_BROKERS_FAILURE_REASON=""
+
+print_local_resource_snapshot() {
+    local mem_available_kb huge_free page_kb huge_free_mb shm_avail_kb
+    mem_available_kb="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    huge_free="$(awk '/HugePages_Free:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    page_kb="$(awk '/Hugepagesize:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    shm_avail_kb="$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
+    huge_free_mb=$(( huge_free * page_kb / 1024 ))
+    log "Resource snapshot: MemAvailable=$(( mem_available_kb / 1024 ))MB HugePagesFree=${huge_free} (${huge_free_mb}MB) /dev/shm_avail=$(( shm_avail_kb / 1024 ))MB"
+}
+
+preflight_local_broker_resources() {
+    local mem_available_kb huge_free page_kb huge_free_mb
+    mem_available_kb="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    huge_free="$(awk '/HugePages_Free:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    page_kb="$(awk '/Hugepagesize:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    huge_free_mb=$(( huge_free * page_kb / 1024 ))
+    print_local_resource_snapshot
+    if [[ "$mem_available_kb" -lt $(( 8 * 1024 * 1024 )) ]]; then
+        echo "WARNING: low MemAvailable before broker start: $(( mem_available_kb / 1024 ))MB" >&2
+    fi
+    if [[ "${EMBAR_USE_HUGETLB:-1}" == "1" && "$huge_free_mb" -lt 8192 ]]; then
+        echo "WARNING: low free hugepages before broker start: ${huge_free_mb}MB" >&2
+    fi
+    return 0
+}
+
+classify_broker_startup_failure() {
+    local -a pids=( "$@" )
+    local idx pid log_file
+    for idx in "${!pids[@]}"; do
+        pid="${pids[$idx]}"
+        log_file="/tmp/broker_${idx}.log"
+        if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+            if grep -Eqi 'Killed|Out of memory|oom-kill|oom_reaper|std::bad_alloc' "$log_file" 2>/dev/null; then
+                printf '%s\n' "infra_broker_killed"
+                return
+            fi
+            printf '%s\n' "infra_broker_exited"
+            return
+        fi
+    done
+    printf '%s\n' "infra_broker_startup_timeout"
+}
 
 infer_broker_cpu_numa() {
     if [[ "$EMBARLET_NUMA_BIND" =~ --cpunodebind=([0-9]+) ]]; then
@@ -321,6 +395,98 @@ wait_for_broker_reachability() {
     done
 
     return 1
+}
+
+wait_for_order5_cluster_convergence() {
+    if [[ "$SEQUENCER" != "EMBARCADERO" || "$ORDER" != "5" ]]; then
+        return 0
+    fi
+
+    local timeout_sec="${ORDER5_CLUSTER_READY_TIMEOUT_SEC}"
+    local deadline=$(( $(date +%s) + timeout_sec ))
+    local broker_id expected_scanners scanner_lines
+    expected_scanners="$NUM_BROKERS"
+
+    log "Waiting for ORDER=5 head convergence (${expected_scanners} scanner(s), timeout: ${timeout_sec}s)..."
+    while (( $(date +%s) < deadline )); do
+        if [[ ! -f /tmp/broker_0.log ]]; then
+            sleep 0.2
+            continue
+        fi
+
+        if ! kill -0 "${HEAD_BROKER_PID:-0}" 2>/dev/null; then
+            echo "ERROR: head broker exited while waiting for ORDER=5 convergence" >&2
+            START_BROKERS_FAILURE_REASON="infra_broker_exited"
+            return 1
+        fi
+
+        scanner_lines="$(grep -Ec 'Started (initial )?BrokerScannerWorker5 for broker|Started BrokerScannerWorker5 for broker' /tmp/broker_0.log 2>/dev/null || true)"
+        if [[ "$scanner_lines" -ge "$expected_scanners" ]]; then
+            for (( broker_id=0; broker_id<NUM_BROKERS; broker_id++ )); do
+                if ! grep -Eq "Started (initial )?BrokerScannerWorker5 for broker ${broker_id}|Started BrokerScannerWorker5 for broker ${broker_id}" /tmp/broker_0.log 2>/dev/null; then
+                    scanner_lines=0
+                    break
+                fi
+            done
+            if [[ "$scanner_lines" -ne 0 ]]; then
+                log "ORDER=5 head convergence complete: scanner workers active for brokers 0..$((NUM_BROKERS - 1))."
+                return 0
+            fi
+        fi
+
+        sleep 0.2
+    done
+
+    echo "ERROR: ORDER=5 head convergence did not complete within ${timeout_sec}s" >&2
+    tail -n 120 /tmp/broker_0.log >&2 || true
+    START_BROKERS_FAILURE_REASON="infra_order5_cluster_convergence_timeout"
+    return 1
+}
+
+precreate_embarcadero_order5_topic() {
+    if [[ "$SEQUENCER" != "EMBARCADERO" || "$ORDER" != "5" ]]; then
+        return 0
+    fi
+
+    local precreate_log="/tmp/embarcadero_order5_precreate.log"
+    log "Precreating ORDER=5 topic metadata and scanner state..."
+    (
+        cd "$BUILD_BIN"
+        EMBARCADERO_RUNTIME_MODE=throughput \
+        EMBARCADERO_HEAD_ADDR="$BROKER_IP" \
+        EMBARCADERO_CXL_SHM_NAME="$EMBARCADERO_CXL_SHM_NAME" \
+        EMBARCADERO_CXL_ZERO_MODE="$EMBARCADERO_CXL_ZERO_MODE" \
+        EMBARCADERO_REPLICATION_FACTOR="$REPLICATION_FACTOR" \
+        EMBARCADERO_ORDER0_FAST_PATH="$EMBARCADERO_ORDER0_FAST_PATH" \
+        EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES="$EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES" \
+        EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE="$EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE" \
+        EMBARCADERO_BATCH_SIZE="$EMBARCADERO_BATCH_SIZE" \
+        EMBARCADERO_CLIENT_PUB_BATCH_KB="$EMBARCADERO_CLIENT_PUB_BATCH_KB" \
+        EMBARCADERO_NETWORK_IO_THREADS="$EMBARCADERO_NETWORK_IO_THREADS" \
+        EMBARCADERO_ORDER5_HOME_BROKERS="$EMBARCADERO_ORDER5_HOME_BROKERS" \
+        EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-}" \
+        LD_LIBRARY_PATH="$CLIENT_LD_LIBRARY_PATH" \
+        EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-1}" \
+        numactl --cpunodebind="$(resolve_local_client_numa)" --membind="$(resolve_local_client_numa)" \
+            ./throughput_test \
+            --config "$CLIENT_CONFIG_ABS" \
+            -n "$THREADS_PER_BROKER" \
+            -m "$MESSAGE_SIZE" \
+            -s 0 \
+            -t "$TEST_TYPE" \
+            -o "$ORDER" \
+            -a "$ACK" \
+            -r "$REPLICATION_FACTOR" \
+            --sequencer "$SEQUENCER" \
+            -l 0
+    ) >"$precreate_log" 2>&1
+    local status=$?
+    if [[ "$status" -ne 0 ]]; then
+        echo "ERROR: ORDER=5 topic precreate failed" >&2
+        cat "$precreate_log" >&2 || true
+        return 1
+    fi
+    return 0
 }
 
 compute_overlap_throughput_gbps() {
@@ -457,10 +623,12 @@ cleanup() {
 trap cleanup EXIT
 
 start_brokers() {
+    START_BROKERS_FAILURE_REASON=""
     log "Resetting previous broker state..."
     broker_local_cleanup
     shm_cleanup
     wait_for_broker_ports_free
+    preflight_local_broker_resources
 
     if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         export REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-$BUILD_BIN}"
@@ -501,10 +669,10 @@ start_brokers() {
     if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
         export LAZYLOG_CXL_MODE=1
     fi
-    if [[ "$SEQUENCER" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_IP" ]]; then
+    if [[ "$SEQUENCER" == "LAZYLOG" && -n "${EMBARCADERO_LAZYLOG_SEQ_IP:-}" ]]; then
         export EMBARCADERO_LAZYLOG_SEQ_IP
     fi
-    if [[ "$SEQUENCER" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]]; then
+    if [[ "$SEQUENCER" == "LAZYLOG" && -n "${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" ]]; then
         export EMBARCADERO_LAZYLOG_SEQ_PORT
     fi
     if [[ "$SEQUENCER" == "SCALOG" ]]; then
@@ -521,32 +689,58 @@ start_brokers() {
         ./scalog_global_sequencer > /tmp/scalog_sequencer.log 2>&1 &
     fi
 
+    # Start the head broker first. Cold CXL initialization and full-region zeroing are the
+    # heaviest part of startup; launching followers concurrently increases memory pressure and
+    # can OOM-kill broker 0 before the cluster even forms.
     # shellcheck disable=SC2086
     $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" \
         > /tmp/broker_0.log 2>&1 &
     launched_broker_pids+=("$!")
+    HEAD_BROKER_PID="${launched_broker_pids[0]}"
+    if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" 1 "${launched_broker_pids[0]}"; then
+        echo "ERROR: head broker did not become ready within ${BROKER_READY_TIMEOUT_SEC}s" >&2
+        cat /tmp/broker_0.log >&2
+        START_BROKERS_FAILURE_REASON="$(classify_broker_startup_failure "${launched_broker_pids[@]}")"
+        return 1
+    fi
+    if [[ "$BROKER_START_STAGGER_SEC" -gt 0 ]]; then
+        sleep "$BROKER_START_STAGGER_SEC"
+    fi
     for (( i=1; i<NUM_BROKERS; i++ )); do
         # shellcheck disable=SC2086
         $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" \
             > /tmp/broker_"$i".log 2>&1 &
         launched_broker_pids+=("$!")
+        if [[ "$BROKER_START_STAGGER_SEC" -gt 0 ]]; then
+            sleep "$BROKER_START_STAGGER_SEC"
+        fi
     done
 
     log "Waiting for $NUM_BROKERS broker(s) to become ready (timeout: ${BROKER_READY_TIMEOUT_SEC}s)..."
     if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS" "${launched_broker_pids[@]}"; then
         echo "ERROR: Brokers did not become ready within ${BROKER_READY_TIMEOUT_SEC}s" >&2
         cat /tmp/broker_0.log >&2
+        START_BROKERS_FAILURE_REASON="$(classify_broker_startup_failure "${launched_broker_pids[@]}")"
+        log "Broker startup failure classification: ${START_BROKERS_FAILURE_REASON}"
         return 1
     fi
     # Clear ready sentinels so the next trial's wait starts from a clean state
     rm -f /tmp/embarlet_*_ready 2>/dev/null || true
     if ! wait_for_broker_reachability; then
         echo "ERROR: Brokers are not reachable from client host(s) within ${BROKER_REACHABILITY_TIMEOUT_SEC}s" >&2
+        START_BROKERS_FAILURE_REASON="infra_broker_unreachable"
         return 1
     fi
     if [[ "$BROKER_READY_PROPAGATION_SEC" -gt 0 ]]; then
         log "Waiting ${BROKER_READY_PROPAGATION_SEC}s for cluster state propagation..."
         sleep "$BROKER_READY_PROPAGATION_SEC"
+    fi
+    if ! precreate_embarcadero_order5_topic; then
+        START_BROKERS_FAILURE_REASON="infra_order5_topic_precreate_failed"
+        return 1
+    fi
+    if ! wait_for_order5_cluster_convergence; then
+        return 1
     fi
     if [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
         local precreate_settle_sec="${SCALOG_PRECREATE_SETTLE_SEC:-15}"
@@ -669,7 +863,10 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
 
         if ! start_brokers; then
             echo "ERROR: broker startup failed on trial $trial attempt $attempt" >&2
-            echo "$trial,$attempt,failed,broker_startup" >> "$ATTEMPT_SUMMARY_CSV"
+            echo "$trial,$attempt,failed,${START_BROKERS_FAILURE_REASON:-infra_broker_startup}" >> "$ATTEMPT_SUMMARY_CSV"
+            for b in $(seq 0 $((NUM_BROKERS - 1))); do
+                cp -f "/tmp/broker_${b}.log" "$LOG_DIR/trial${trial}_attempt${attempt}_broker${b}.log" 2>/dev/null || true
+            done
             cleanup
             continue
         fi
@@ -723,15 +920,16 @@ export EMBARCADERO_BATCH_SIZE=$EMBARCADERO_BATCH_SIZE
 export EMBARCADERO_CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB
 export EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS
 export EMBARCADERO_ORDER5_HOME_BROKERS=$EMBARCADERO_ORDER5_HOME_BROKERS
+if [ -n "${EMBARCADERO_ACK_TIMEOUT_SEC:-}" ]; then export EMBARCADERO_ACK_TIMEOUT_SEC=${EMBARCADERO_ACK_TIMEOUT_SEC:-}; fi
 export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$ts_file
 export EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS=$START_TIME_MS
 rm -f $ts_file
-if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_IP" ]; then export EMBARCADERO_CORFU_SEQ_IP=$EMBARCADERO_CORFU_SEQ_IP; fi
-if [ "$SEQUENCER" = "CORFU" ] && [ -n "$EMBARCADERO_CORFU_SEQ_PORT" ]; then export EMBARCADERO_CORFU_SEQ_PORT=$EMBARCADERO_CORFU_SEQ_PORT; fi
-if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "$EMBARCADERO_LAZYLOG_SEQ_IP" ]; then export EMBARCADERO_LAZYLOG_SEQ_IP=$EMBARCADERO_LAZYLOG_SEQ_IP; fi
-if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]; then export EMBARCADERO_LAZYLOG_SEQ_PORT=$EMBARCADERO_LAZYLOG_SEQ_PORT; fi
-if [ "$SEQUENCER" = "SCALOG" ] && [ -n "$EMBARCADERO_SCALOG_SEQ_IP" ]; then export EMBARCADERO_SCALOG_SEQ_IP=$EMBARCADERO_SCALOG_SEQ_IP; fi
-if [ "$SEQUENCER" = "SCALOG" ] && [ -n "$EMBARCADERO_SCALOG_SEQ_PORT" ]; then export EMBARCADERO_SCALOG_SEQ_PORT=$EMBARCADERO_SCALOG_SEQ_PORT; fi
+if [ "$SEQUENCER" = "CORFU" ] && [ -n "${EMBARCADERO_CORFU_SEQ_IP:-}" ]; then export EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP:-}; fi
+if [ "$SEQUENCER" = "CORFU" ] && [ -n "${EMBARCADERO_CORFU_SEQ_PORT:-}" ]; then export EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT:-}; fi
+if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "${EMBARCADERO_LAZYLOG_SEQ_IP:-}" ]; then export EMBARCADERO_LAZYLOG_SEQ_IP=${EMBARCADERO_LAZYLOG_SEQ_IP:-}; fi
+if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" ]; then export EMBARCADERO_LAZYLOG_SEQ_PORT=${EMBARCADERO_LAZYLOG_SEQ_PORT:-}; fi
+if [ "$SEQUENCER" = "SCALOG" ] && [ -n "${EMBARCADERO_SCALOG_SEQ_IP:-}" ]; then export EMBARCADERO_SCALOG_SEQ_IP=${EMBARCADERO_SCALOG_SEQ_IP:-}; fi
+if [ "$SEQUENCER" = "SCALOG" ] && [ -n "${EMBARCADERO_SCALOG_SEQ_PORT:-}" ]; then export EMBARCADERO_SCALOG_SEQ_PORT=${EMBARCADERO_SCALOG_SEQ_PORT:-}; fi
 if [ "$SEQUENCER" = "SCALOG" ]; then export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1}; fi
 if [ -n "$CLIENT_LD_LIBRARY_PATH" ]; then export LD_LIBRARY_PATH=$CLIENT_LD_LIBRARY_PATH; fi
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
@@ -799,6 +997,9 @@ ENDINNERSCRIPT
 
         echo "WARNING: trial $trial attempt $attempt incomplete — retrying..." >&2
         echo "$trial,$attempt,failed,incomplete_or_missing_bandwidth" >> "$ATTEMPT_SUMMARY_CSV"
+        for b in $(seq 0 $((NUM_BROKERS - 1))); do
+            cp -f "/tmp/broker_${b}.log" "$LOG_DIR/trial${trial}_attempt${attempt}_broker${b}.log" 2>/dev/null || true
+        done
         # Kill any surviving clients before re-attempting
         for pid in "${CLIENT_PIDS[@]}"; do
             kill "$pid" 2>/dev/null || true

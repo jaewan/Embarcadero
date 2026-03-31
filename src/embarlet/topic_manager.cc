@@ -1,5 +1,6 @@
 #include "topic_manager.h"
 #include <glog/logging.h>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <limits>
@@ -105,6 +106,21 @@ void nt_memcpy(void* __restrict dst, const void* __restrict src, size_t size) {
 	}
 }
 
+static void InitializeBatchHeaderRing(void* batch_headers_region) {
+	if (!batch_headers_region) return;
+	memset(batch_headers_region, 0, BATCHHEADERS_SIZE);
+	BatchHeader* slots = reinterpret_cast<BatchHeader*>(batch_headers_region);
+	const size_t slot_count = BATCHHEADERS_SIZE / sizeof(BatchHeader);
+	for (size_t i = 0; i < slot_count; ++i) {
+		slots[i].publish_commit = kBatchHeaderPublishUncommitted;
+	}
+	CXL::store_fence();
+	for (size_t i = 0; i < BATCHHEADERS_SIZE; i += 64) {
+		CXL::flush_cacheline(reinterpret_cast<uint8_t*>(batch_headers_region) + i);
+	}
+	CXL::store_fence();
+}
+
 void TopicManager::Shutdown() {
 	if (shutdown_done_.exchange(true, std::memory_order_acq_rel)) {
 		return;
@@ -162,6 +178,9 @@ void TopicManager::InitializeTInodeOffsets(TInode* tinode,
 	tinode->offsets[broker_id_].validated_written_byte_offset = 0;
 	for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
 		tinode->offsets[broker_id_].replication_done[i] = 0;
+	}
+	CXL::store_fence();
+	for ( int i = 0; i < NUM_MAX_BROKERS; i++ ) {
 		const void* rep_done_entry = const_cast<const void*>(static_cast<const volatile void*>(
 			&tinode->offsets[broker_id_].replication_done[i]));
 		CXL::flush_cacheline(rep_done_entry);
@@ -241,13 +260,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		// [[CRITICAL FIX: STALE_RING_DATA]] Zero out batch header ring to prevent false in-flight slots
 		// CXL memory may contain garbage data that looks like batches (num_msg>0, batch_complete=0).
 		// Without zeroing, the scanner will think these are in-flight batches and stall.
-		memset(batch_headers_region, 0, BATCHHEADERS_SIZE);
-		// Flush the zeroed memory to CXL (non-coherent)
-		for (size_t i = 0; i < BATCHHEADERS_SIZE; i += 64) {
-			CXL::flush_cacheline(reinterpret_cast<uint8_t*>(batch_headers_region) + i);
-		}
-		CXL::store_fence();
-		LOG(INFO) << "Zeroed batch header ring at " << batch_headers_region << " (" << BATCHHEADERS_SIZE << " bytes)";
+		InitializeBatchHeaderRing(batch_headers_region);
+		LOG(INFO) << "Initialized batch header ring at " << batch_headers_region
+		          << " (" << BATCHHEADERS_SIZE << " bytes, publish_commit=UNCOMMITTED)";
 
 		// Handle replica if needed
 		if (tinode->replicate_tinode) {
@@ -394,6 +409,23 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		           << "(topic='" << topic << "', replication_factor=" << replication_factor << ")";
 		return nullptr;
 	}
+	if (seq_type == SCALOG && ack_level == 2) {
+		if (replication_factor <= 0) {
+			LOG(ERROR) << "CreateNewTopicInternal: Scalog ACK level 2 requires replication_factor>0 "
+			           << "(topic='" << topic << "', replication_factor=" << replication_factor << ")";
+			return nullptr;
+		}
+		// Scalog ACK2 tracks durability via the CXL replication path.
+		// Running ACK2 without SCALOG_CXL_MODE causes non-progressing ACK frontiers.
+		const char* scalog_cxl_mode = std::getenv("SCALOG_CXL_MODE");
+		const bool scalog_cxl_enabled =
+			(scalog_cxl_mode != nullptr && scalog_cxl_mode[0] == '1' && scalog_cxl_mode[1] == '\0');
+		if (!scalog_cxl_enabled) {
+			LOG(ERROR) << "CreateNewTopicInternal: Scalog ACK2 requires SCALOG_CXL_MODE=1 "
+			           << "(topic='" << topic << "').";
+			return nullptr;
+		}
+	}
 
 	struct TInode* tinode = cxl_manager_.GetTInode(topic);
 	struct TInode* replica_tinode = nullptr;
@@ -432,12 +464,19 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		}
 
 		// [[CRITICAL FIX: STALE_RING_DATA]] Zero out batch header ring to prevent false in-flight slots
-		memset(batch_headers_region, 0, BATCHHEADERS_SIZE);
-		for (size_t i = 0; i < BATCHHEADERS_SIZE; i += 64) {
-			CXL::flush_cacheline(reinterpret_cast<uint8_t*>(batch_headers_region) + i);
+		InitializeBatchHeaderRing(batch_headers_region);
+		LOG(INFO) << "Initialized batch header ring at " << batch_headers_region
+		          << " (" << BATCHHEADERS_SIZE << " bytes, publish_commit=UNCOMMITTED)";
+
+		// Topic metadata lives across trials in shared CXL memory. Reset every broker offset entry
+		// before publishing the new topic so the head never scans a stale follower ring from a
+		// previous run before that follower has recreated and published its fresh offsets.
+		memset(const_cast<offset_entry*>(tinode->offsets), 0, sizeof(tinode->offsets));
+		CXL::store_fence();
+		for (size_t i = 0; i < sizeof(tinode->offsets); i += 64) {
+			CXL::flush_cacheline(reinterpret_cast<uint8_t*>(const_cast<offset_entry*>(tinode->offsets)) + i);
 		}
 		CXL::store_fence();
-		LOG(INFO) << "Zeroed batch header ring at " << batch_headers_region << " (" << BATCHHEADERS_SIZE << " bytes)";
 
 		// Initialize tinode metadata
 		tinode->order = order;
@@ -449,6 +488,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		memcpy(tinode->topic, topic, std::min<size_t>(TOPIC_NAME_SIZE - 1, strlen(topic)));
 
 		// [[ROOT_CAUSE_B_FIX]] - Flush TInode metadata after head broker initialization
+		CXL::store_fence();
 		CXL::flush_cacheline(tinode);
 		CXL::store_fence();
 
@@ -657,35 +697,32 @@ std::function<void(void*, size_t)> TopicManager::GetCXLBuffer(
 		return nullptr;
 	}
 	
-	// Fast path: try to find topic without locking first
-	auto topic_itr = topics_.end();
+	// Single lock scope: find + call in one critical section to avoid double lookup.
 	{
 		absl::ReaderMutexLock lock(&topics_mutex_);
-		topic_itr = topics_.find(topic);
-	}
-
-	if (topic_itr == topics_.end()) {
-		// Topic not found locally, but should exist in CXL if head broker created it
-		// Create local reference to the existing CXL topic
-		tinode = CreateNewTopicInternal(topic);
-		if (tinode) {
-			absl::ReaderMutexLock lock(&topics_mutex_);
-			topic_itr = topics_.find(topic);
-		} else {
-			LOG(ERROR) << "Failed to create local topic reference for: " << topic;
-			return nullptr;
+		auto topic_itr = topics_.find(topic);
+		if (topic_itr != topics_.end()) {
+			auto& topic_obj = topic_itr->second;
+			seq_type = topic_obj->GetSeqtype();
+			return topic_obj->GetCXLBuffer(
+					batch_header, topic, log, segment_header, logical_offset, batch_header_location, epoch_already_checked);
 		}
 	}
 
-	// Final lookup with proper locking
+	// Topic not found locally — create local reference to the existing CXL topic
+	tinode = CreateNewTopicInternal(topic);
+	if (!tinode) {
+		LOG(ERROR) << "Failed to create local topic reference for: " << topic;
+		return nullptr;
+	}
+
 	{
 		absl::ReaderMutexLock lock(&topics_mutex_);
-		topic_itr = topics_.find(topic);
+		auto topic_itr = topics_.find(topic);
 		if (topic_itr == topics_.end()) {
-			LOG(ERROR) << "Topic disappeared: " << topic;
+			LOG(ERROR) << "Topic disappeared after creation: " << topic;
 			return nullptr;
 		}
-		
 		auto& topic_obj = topic_itr->second;
 		seq_type = topic_obj->GetSeqtype();
 		return topic_obj->GetCXLBuffer(

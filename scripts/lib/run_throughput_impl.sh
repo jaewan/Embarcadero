@@ -66,6 +66,11 @@ export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
 export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-$REPLICATION_FACTOR}
+# Scalog ACK2/durability experiments require the CXL-backed Scalog path.
+# Keep user override possible, but default to enabled for Scalog runs.
+if [[ "$SEQUENCER" == "SCALOG" && -z "${SCALOG_CXL_MODE:-}" ]]; then
+  export SCALOG_CXL_MODE=1
+fi
 if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
   export EMBARCADERO_CXL_SHM_NAME="/CXL_SHARED_EXPERIMENT_${UID}"
   shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
@@ -241,11 +246,20 @@ start_cluster() {
 
   if [[ "$SEQUENCER" == "CORFU" ]]; then
     ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
+  elif [[ "$SEQUENCER" == "SCALOG" ]]; then
+    # Local Scalog runs need the global sequencer sidecar just like Corfu runs do.
+    # Default to localhost for single-node experiments unless caller overrides it.
+    if [ -z "${SCALOG_SEQUENCER_IP_OVERRIDE:-}" ]; then
+      export SCALOG_SEQUENCER_IP_OVERRIDE="${EMBARCADERO_SCALOG_SEQ_IP:-127.0.0.1}"
+    fi
+    ./scalog_global_sequencer > /tmp/scalog_sequencer.log 2>&1 &
   fi
 
   $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head --$SEQUENCER > broker_0.log 2>&1 &
   for ((i=1; i<NUM_BROKERS; i++)); do
-    $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" > broker_"$i".log 2>&1 &
+    # Followers must run the same sequencer mode as head so DiskManager/topic wiring
+    # initializes the correct replication/ordering path (critical for Scalog ACK2).
+    $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --$SEQUENCER > broker_"$i".log 2>&1 &
   done
 
   if ! wait_for_brokers "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS"; then

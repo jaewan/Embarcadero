@@ -588,6 +588,7 @@ void ChainReplicationManager::ReplicationThread() {
                     constexpr uint32_t kAfterHead = 1;
                     if (entry->num_replicated.compare_exchange_strong(
                             expected, kAfterHead, std::memory_order_release, std::memory_order_acquire)) {
+                        CXL::store_fence();
                         CXL::flush_cacheline(entry);
                         CXL::store_fence();
                         token = 1;
@@ -670,6 +671,7 @@ void ChainReplicationManager::ReplicationThread() {
                     const uint32_t desired = static_cast<uint32_t>(h.role) + 1u;
                     if (entry->num_replicated.compare_exchange_strong(
                             expected, desired, std::memory_order_release, std::memory_order_acquire)) {
+                        CXL::store_fence();
                         CXL::flush_cacheline(entry);
                         CXL::store_fence();
                         token = desired;
@@ -786,6 +788,7 @@ void ChainReplicationManager::UpdateCompletionVector(uint16_t broker_id, uint64_
         }
     }
 
+    CXL::store_fence();
     CXL::flush_cacheline(&cv_[broker_id]);
     CXL::store_fence();
 }

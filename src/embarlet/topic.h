@@ -463,6 +463,7 @@ class Topic {
 		void RequestOrder5HoldExpiryOnce();
 
 		private:
+			void ArmOrder5ForceExpiryWindow(uint64_t duration_ns);
 			bool PublishPBRSlotDirect(const BatchHeader& batch_header, BatchHeader* batch_header_location);
 			/** Lock-free PBR slot reservation (128-bit CAS). Returns false if ring full. @threading Concurrent. */
 			bool ReservePBRSlotLockFree(uint32_t num_msg, size_t& out_byte_offset, size_t& out_logical_offset);

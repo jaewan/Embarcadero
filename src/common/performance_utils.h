@@ -166,8 +166,9 @@ namespace CXL {
  *
  * Usage pattern (Paper spec):
  *   msg_header->field = value;
- *   CXL::flush_cacheline(msg_header);
- *   CXL::store_fence();
+ *   CXL::store_fence();                 // drain stores to cache
+ *   CXL::flush_cacheline(msg_header);   // flush cache line to CXL
+ *   CXL::store_fence();                 // ensure flush completes
  *
  * Future optimization (DEV-002):
  *   Multiple field writes to same cache line → single flush
