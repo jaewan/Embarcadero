@@ -429,4 +429,156 @@ TEST_F(ScalogAckInvariantTest, LazyLogProgressNeverExceedsOrdered) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Semantic contract tests: SCALOG RF=2 ACK1 may exceed ACK2 (ordering before
+// full replication); LazyLog RF=2 ACK1 == ACK2 (ordering after full replication).
+//
+// These tests exist to document INTENTIONAL semantic differences between the
+// two systems and to catch regressions if the invariants are ever broken.
+// ---------------------------------------------------------------------------
+
+// Mirrors ScalogLocalSequencer::SendLocalCut for CXL mode RF>0.
+// Returns rep_done+1 when rep_done != max AND validated > log_start.
+// Reads only self-replica: offsets[broker_id].replication_done[broker_id].
+int64_t ComputeScalogLocalCut(
+    volatile offset_entry* offsets,
+    int broker_id,
+    size_t validated_written_byte_offset,
+    size_t log_offset) {
+    const uint64_t rep_done = offsets[broker_id].replication_done[broker_id];
+    const bool validated_ok = (validated_written_byte_offset > log_offset);
+    if (!validated_ok || rep_done == std::numeric_limits<uint64_t>::max()) {
+        return 0;
+    }
+    return static_cast<int64_t>(rep_done + 1);
+}
+
+// Mirrors LazyLogLocalSequencer::SendLocalProgress for CXL mode RF>0.
+// Returns min(replication_done[broker_id]) across all replicas in the set.
+int64_t ComputeLazyLogProgressCXL(
+    volatile offset_entry* offsets,
+    int broker_id,
+    int replication_factor,
+    int num_brokers) {
+    uint64_t min_rep = std::numeric_limits<uint64_t>::max();
+    int ready_replicas = 0;
+    for (int i = 0; i < replication_factor; i++) {
+        const int b = GetReplicationSetBroker(broker_id, replication_factor, num_brokers, i);
+        const uint64_t val = offsets[b].replication_done[broker_id];
+        if (val == kReplicationNotStarted) {
+            continue;
+        }
+        ready_replicas++;
+        if (val < min_rep) min_rep = val;
+    }
+    if (ready_replicas < replication_factor || min_rep == std::numeric_limits<uint64_t>::max()) {
+        return 0;
+    }
+    return static_cast<int64_t>(min_rep + 1);
+}
+
+// SCALOG RF=2: ACK1 (ordered) CAN exceed ACK2 (durable) because ordering is
+// based on local persistence only, while replication to the remote replica may lag.
+// This is INTENTIONAL: the global cut is computed from local persistence; the
+// remote replica is tracked separately and exposed only through ACK2.
+TEST_F(ScalogAckInvariantTest, ScalogRF2_Ack1CanExceedAck2_IntentionalSemantics) {
+    const int broker = 0;
+    const int rf = 2;
+
+    // Broker 0 has locally persisted 100 messages (rep_done[0][0] = 99).
+    offsets_[0].replication_done[0] = 99;
+    // Remote replica (broker 1) has only replicated 50 messages so far.
+    offsets_[1].replication_done[0] = 49;
+    // Ordered = 100 (global sequencer used broker 0's local cut of 100).
+    offsets_[0].ordered = 100;
+
+    size_t ack1 = ComputeScalogAck1(offsets_, broker);
+    size_t ack2 = ComputeScalogAck2(offsets_, broker, rf, kNumBrokers, SCALOG);
+
+    EXPECT_EQ(ack1, 100u) << "SCALOG ACK1 == ordered (global cut based on local persistence)";
+    EXPECT_EQ(ack2, 50u)  << "SCALOG ACK2 limited by lagging remote replica";
+    EXPECT_LT(ack2, ack1) << "SCALOG RF=2: ACK1 > ACK2 is INTENDED (ordering before full replication)";
+}
+
+// SCALOG RF=2: once remote replication catches up, ACK2 equals ACK1.
+TEST_F(ScalogAckInvariantTest, ScalogRF2_Ack2EqualsAck1_WhenReplicationCaughtUp) {
+    const int broker = 0;
+    const int rf = 2;
+
+    offsets_[0].replication_done[0] = 99;   // local: 100 messages
+    offsets_[1].replication_done[0] = 99;   // remote: also 100 messages (caught up)
+    offsets_[0].ordered = 100;
+
+    size_t ack1 = ComputeScalogAck1(offsets_, broker);
+    size_t ack2 = ComputeScalogAck2(offsets_, broker, rf, kNumBrokers, SCALOG);
+
+    EXPECT_EQ(ack1, 100u);
+    EXPECT_EQ(ack2, 100u) << "SCALOG ACK2 == ACK1 when remote replication is caught up";
+}
+
+// LazyLog RF=2: ACK1 == ACK2 because ordering is gated on full replication.
+// Since progress = min(local, remote) gates ordering, by the time ordered advances,
+// both replicas have confirmed. So durable_frontier >= ordered, and the clamp gives
+// ACK2 = ordered = ACK1.
+TEST_F(ScalogAckInvariantTest, LazyLogRF2_Ack2EqualsAck1_OrderingGatedOnFullReplication) {
+    const int broker = 0;
+    const int rf = 2;
+
+    // Both replicas confirmed 100 messages. LazyLog progress = min(100, 100) = 100.
+    // Global sequencer assigned order up to 100 messages.
+    offsets_[0].replication_done[0] = 99;   // local: 100 messages
+    offsets_[1].replication_done[0] = 99;   // remote: 100 messages
+    offsets_[0].ordered = 100;              // ordered: 100 (≤ progress=100)
+
+    size_t ack1 = ComputeScalogAck1(offsets_, broker);
+    size_t ack2 = ComputeScalogAck2(offsets_, broker, rf, kNumBrokers, LAZYLOG);
+
+    EXPECT_EQ(ack1, 100u);
+    EXPECT_EQ(ack2, 100u) << "LazyLog RF=2: ACK2 == ACK1 because ordering waited for full replication";
+}
+
+// SCALOG local cut for CXL RF=2 uses self-replication only (not min across set).
+// This documents the intentional difference from LazyLog's progress computation.
+TEST_F(ScalogAckInvariantTest, ScalogLocalCut_SelfOnlyNotMin_IntentionalDifference) {
+    const int broker = 0;
+    const int rf = 2;
+
+    // Local: 100 messages. Remote: 50 messages.
+    offsets_[0].replication_done[0] = 99;
+    offsets_[1].replication_done[0] = 49;
+
+    // SCALOG local cut = local persistence only = 100.
+    // validated_written_byte_offset=5000 > log_offset=4096 (simulating data received).
+    int64_t scalog_cut = ComputeScalogLocalCut(offsets_, broker, /*validated=*/5000, /*log_start=*/4096);
+    EXPECT_EQ(scalog_cut, 100)
+        << "SCALOG local cut reads self-replication only (not min across replication set)";
+
+    // LazyLog CXL progress = min(local, remote) = 50.
+    int64_t lazylog_progress = ComputeLazyLogProgressCXL(offsets_, broker, rf, kNumBrokers);
+    EXPECT_EQ(lazylog_progress, 50)
+        << "LazyLog CXL progress reads min across full replication set";
+
+    // The semantic difference: SCALOG orders 100 messages; LazyLog orders only 50.
+    // For SCALOG, the remaining 50 messages are ordered but not yet durably replicated.
+    EXPECT_GT(scalog_cut, lazylog_progress)
+        << "SCALOG reports more ready messages than LazyLog when replica lags";
+}
+
+// SCALOG local cut returns 0 when replication has not started (rep_done == max).
+TEST_F(ScalogAckInvariantTest, ScalogLocalCut_NotStarted_ReturnsZero) {
+    const int broker = 0;
+    // replication_done[0][0] = kReplicationNotStarted (initialized by SetUp)
+    int64_t cut = ComputeScalogLocalCut(offsets_, broker, /*validated=*/5000, /*log_start=*/4096);
+    EXPECT_EQ(cut, 0) << "SCALOG local cut must be 0 when replication has not started";
+}
+
+// SCALOG local cut returns 0 when no data has been validated yet (validated == log_start).
+TEST_F(ScalogAckInvariantTest, ScalogLocalCut_NoDataValidated_ReturnsZero) {
+    const int broker = 0;
+    offsets_[0].replication_done[0] = 99;  // rep_done indicates 100 messages persisted
+    // But validated == log_start means DelegationThread hasn't processed any data yet.
+    int64_t cut = ComputeScalogLocalCut(offsets_, broker, /*validated=*/4096, /*log_start=*/4096);
+    EXPECT_EQ(cut, 0) << "SCALOG local cut must be 0 when no data is validated";
+}
+
 }  // namespace
