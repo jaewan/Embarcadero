@@ -282,6 +282,23 @@ set_target_properties(corfu_sequencer_fifo_smoke PROPERTIES
 add_test(NAME corfu_sequencer_fifo_smoke COMMAND corfu_sequencer_fifo_smoke
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# Corfu ORDER=2 frontier invariant test (standalone, no CXL/gRPC dependency).
+add_executable(corfu_order2_invariant_test
+    cxl_manager/corfu_order2_invariant_test.cc
+)
+target_include_directories(corfu_order2_invariant_test PUBLIC
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_link_libraries(corfu_order2_invariant_test
+    Threads::Threads
+)
+set_target_properties(corfu_order2_invariant_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+add_test(NAME corfu_order2_invariant_test COMMAND corfu_order2_invariant_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Configuration test executable
 add_executable(config_test
