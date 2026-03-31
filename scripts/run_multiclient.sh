@@ -607,6 +607,7 @@ start_brokers() {
     local -a launched_broker_pids=()
     if [[ "$SEQUENCER" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
+        sleep 1  # Give local sequencer time to bind its port before brokers connect
     elif [[ "$SEQUENCER" == "SCALOG" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
         export REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-$BUILD_BIN}"
         log "Starting remote Scalog sequencer on $REMOTE_SCALOG_SEQUENCER_HOST..."

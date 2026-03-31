@@ -2215,8 +2215,11 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 
 			// CORFU hole-filling: if the ordered frontier is stuck (a batch_seq committed by
 			// the global sequencer was never delivered as a header), DrainStaleCorfuFrontier
-			// skips it after a 10s timeout so all subsequent batches can drain.
-			if (use_per_client_ack_level1 && ack_topic != nullptr) {
+			// skips it after a 5s timeout so all subsequent batches can drain.
+			// Fires for both ACK=1 and ACK=2: SkipCorfuOrder2Batch advances both frontiers.
+			const bool can_drain_corfu = ack_topic != nullptr &&
+				(use_per_client_ack_level1 || use_per_client_ack_level2_durable);
+			if (can_drain_corfu) {
 				auto now = std::chrono::steady_clock::now();
 				if (std::chrono::duration_cast<std::chrono::seconds>(now - last_corfu_drain_time).count() >= 5) {
 					ack_topic->DrainStaleCorfuFrontier();

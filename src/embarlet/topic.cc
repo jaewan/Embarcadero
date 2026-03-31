@@ -1297,7 +1297,7 @@ void Topic::DrainStaleCorfuFrontier() {
 
 		// There is a hole: min_pending > next_seq_.
 		// Decide whether the hole has been stuck long enough to warrant a skip.
-		constexpr int64_t kStuckThresholdNs = 10LL * 1000000000LL;  // 10 seconds
+		constexpr int64_t kStuckThresholdNs = 5LL * 1000000000LL;  // 5 seconds
 		int64_t last_adv = corfu_order2_frontier_advanced_ns_.load(std::memory_order_relaxed);
 		const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1315,11 +1315,35 @@ void Topic::DrainStaleCorfuFrontier() {
 	}
 
 	if (should_skip) {
-		LOG(WARNING) << "CORFU DrainStaleFrontier: frontier stuck at batch_seq=" << stuck_seq
-		             << " for >" << 10 << "s; publisher likely disconnected before delivering"
-		             << " the batch header. Inserting 0-msg skip to unblock.";
-		// SkipCorfuOrder2Batch acquires corfu_order2_mu_ (and optionally durable_mu_) internally.
-		SkipCorfuOrder2Batch(stuck_seq, 0 /*client_id unknown — safe because num_msg=0*/);
+		// Drain all consecutive holes in one pass so a mass publisher-disconnect (many batch_seqs
+		// committed in the sequencer but no headers delivered) resolves in a single call rather
+		// than one hole every 10+ seconds.  kMaxBatchDrain caps the loop to bound latency.
+		constexpr int kMaxBatchDrain = 10000;
+		int drained = 0;
+		while (drained < kMaxBatchDrain) {
+			uint64_t current_stuck;
+			{
+				absl::MutexLock lock(&corfu_order2_mu_);
+				if (corfu_order2_completed_.empty()) break;
+				const uint64_t min_pending = corfu_order2_completed_.begin()->first;
+				if (min_pending <= corfu_order2_next_seq_) {
+					// The next batch is already queued — normal drain will handle it.
+					break;
+				}
+				current_stuck = corfu_order2_next_seq_;
+			}
+			// SkipCorfuOrder2Batch acquires the lock internally; release outer lock first.
+			if (drained == 0) {
+				LOG(WARNING) << "CORFU DrainStaleFrontier: frontier stuck at batch_seq=" << current_stuck
+				             << " for >10s; bulk-draining undelivered holes.";
+			}
+			SkipCorfuOrder2Batch(current_stuck, 0 /*client_id unknown — safe: num_msg=0*/);
+			drained++;
+		}
+		if (drained > 0) {
+			LOG(WARNING) << "CORFU DrainStaleFrontier: skipped " << drained
+			             << " undelivered batch holes.";
+		}
 	}
 }
 
