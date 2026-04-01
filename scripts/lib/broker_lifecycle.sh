@@ -103,7 +103,7 @@ broker_remote_corfu_start() {
   host="$(broker_remote_corfu_sequencer_host)"
   [ -n "$host" ] || return 0
   local bin="${REMOTE_CORFU_BUILD_BIN:-$REMOTE_BUILD_BIN}"
-  local seq_port="${EMBARCADERO_CORFU_SEQ_PORT:-50055}"
+  local seq_port="${EMBARCADERO_CORFU_SEQ_PORT:-50052}"
   [ -n "$bin" ] || return 1
   echo "Remote Corfu sequencer: starting on $host (cd $bin)"
   ssh -o BatchMode=yes "$host" bash -s -- "$bin" "$seq_port" <<'EOF'
