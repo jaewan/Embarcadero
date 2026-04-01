@@ -170,6 +170,28 @@ if(PkgConfig_FOUND)
             TIMEOUT 60
             LABELS "unit;scalog;ack;invariant;correctness"
         )
+
+        add_executable(lazylog_latency_invariant_test
+            lazylog_latency_invariant_test.cc
+        )
+        target_include_directories(lazylog_latency_invariant_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(lazylog_latency_invariant_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(lazylog_latency_invariant_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_lazylog_latency_invariant COMMAND lazylog_latency_invariant_test)
+        set_tests_properties(unit_lazylog_latency_invariant PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;lazylog;latency;correctness"
+        )
     else()
         message(WARNING "GTest not found via pkg-config, unit tests disabled")
     endif()

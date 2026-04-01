@@ -77,6 +77,20 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str, volatile bool& st
 		int64_t local_cut = 0;
 		const bool track_replication_progress = (cxl_scalog_mode && tinode_->replication_factor > 0);
 		if (track_replication_progress) {
+			// [[SEMANTIC CONTRACT]] CXL mode RF>0: local cut = self-replication progress only.
+			// We intentionally read offsets[broker_id_].replication_done[broker_id_] (the self
+			// slot) rather than taking the min across the full replication set.
+			//
+			// Rationale: in Scalog, the local cut reports how many messages THIS broker has
+			// ready for global ordering. Remote replication is a separate durability concern,
+			// tracked at ACK2 time via GetOffsetToAck (which does take min across all replicas).
+			//
+			// Consequence for RF=2: ACK1 (ordered) can advance ahead of ACK2 (durable) when
+			// the remote replica lags. This is intentional — the global sequencer assigns total
+			// order based on local persistence, and ACK2 separately enforces the durable frontier.
+			//
+			// LazyLog differs: it reads min(replication_done) across all replicas so ordering
+			// only proceeds after full replication. For LazyLog RF=2, ACK1 == ACK2.
 			volatile uint64_t* rep_done_ptr = &tinode_->offsets[broker_id_].replication_done[broker_id_];
 			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
 				reinterpret_cast<const volatile void*>(rep_done_ptr)));

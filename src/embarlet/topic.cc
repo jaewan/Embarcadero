@@ -584,9 +584,11 @@ void Topic::DelegationThread() {
 					MessageHeader* msg_ptr = batch_first_msg;
 					// Scalog replication pollers parse next_msg_diff directly from CXL-shared
 					// MessageHeaders, so those cachelines must be flushed before advancing
-					// validated_written_byte_offset. Embarcadero subscribers use the network
-					// export path and don't require per-message CXL flushes here.
-					const bool need_per_msg_flush = (seq_type_ == SCALOG);
+					// validated_written_byte_offset. LazyLog's ApplyGlobalBinding also walks
+					// next_msg_diff directly from CXL, so it needs the same per-message flush.
+					// Embarcadero subscribers use the network export path and don't require
+					// per-message CXL flushes here.
+					const bool need_per_msg_flush = (seq_type_ == SCALOG || seq_type_ == LAZYLOG);
 					bool touched_message_headers = false;
 					for (size_t i = 0; i < current_batch->num_msg; ++i) {
 						msg_ptr->logical_offset = logical_offset_;

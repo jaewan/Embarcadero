@@ -6,6 +6,25 @@
 
 namespace LazyLog {
 
+namespace {
+
+std::string ResolveLazyLogSequencerIp() {
+  const char* sequencer_ip_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_IP");
+  if (sequencer_ip_env && std::strlen(sequencer_ip_env) > 0) {
+    return std::string(sequencer_ip_env);
+  }
+
+  const char* configured_ip = LAZYLOG_SEQUENCER_IP;
+  if (configured_ip && std::strlen(configured_ip) > 0) {
+    return std::string(configured_ip);
+  }
+
+  LOG(WARNING) << "LazyLog sequencer IP resolved empty; falling back to 127.0.0.1";
+  return "127.0.0.1";
+}
+
+}  // namespace
+
 LazyLogLocalSequencer::LazyLogLocalSequencer(
     TInode* tinode,
     int broker_id,
@@ -16,10 +35,8 @@ LazyLogLocalSequencer::LazyLogLocalSequencer(
       broker_id_(broker_id),
       cxl_addr_(cxl_addr),
       batch_header_(batch_header) {
-  const char* sequencer_ip_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_IP");
   const char* sequencer_port_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_PORT");
-  const std::string sequencer_ip =
-      (sequencer_ip_env && std::strlen(sequencer_ip_env) > 0) ? sequencer_ip_env : LAZYLOG_SEQUENCER_IP;
+  const std::string sequencer_ip = ResolveLazyLogSequencerIp();
   int sequencer_port = LAZYLOG_SEQ_PORT;
   if (sequencer_port_env && std::strlen(sequencer_port_env) > 0) {
     try {
