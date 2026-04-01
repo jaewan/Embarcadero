@@ -884,19 +884,20 @@ bool TopicManager::GetMessageAddr(
 
 bool TopicManager::ReadOrder0Batch(const char* topic, uint64_t& read_cursor,
 		uint64_t& out_log_idx, uint32_t& out_total_size,
-		uint32_t& out_num_msg) const {
+		uint32_t& out_num_msg, uint16_t& out_header_version) const {
 	absl::ReaderMutexLock lock(const_cast<absl::Mutex*>(&topics_mutex_));
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr == topics_.end()) return false;
-	return topic_itr->second->ReadOrder0Batch(read_cursor, out_log_idx, out_total_size, out_num_msg);
+	return topic_itr->second->ReadOrder0Batch(
+		read_cursor, out_log_idx, out_total_size, out_num_msg, out_header_version);
 }
 
 void TopicManager::PushOrder0Batch(const char* topic, uint64_t log_idx,
-		uint32_t total_size, uint32_t num_msg) {
+		uint32_t total_size, uint32_t num_msg, uint16_t header_version) {
 	absl::ReaderMutexLock lock(&topics_mutex_);
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr != topics_.end()) {
-		topic_itr->second->PushOrder0Batch(log_idx, total_size, num_msg);
+		topic_itr->second->PushOrder0Batch(log_idx, total_size, num_msg, header_version);
 	}
 }
 

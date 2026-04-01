@@ -119,6 +119,61 @@ static int ReadEnvIntNonNegative(const char* name, int default_value) {
 	return static_cast<int>(parsed);
 }
 
+static bool Order0BatchMatchesV1(const uint8_t* data, size_t total_size, uint32_t num_msg) {
+	if (data == nullptr || total_size < sizeof(MessageHeader) || num_msg == 0) return false;
+	size_t pos = 0;
+	for (uint32_t i = 0; i < num_msg; ++i) {
+		if (total_size - pos < sizeof(MessageHeader)) return false;
+		const auto* hdr = reinterpret_cast<const MessageHeader*>(data + pos);
+		const size_t stride = hdr->paddedSize;
+		if (stride < wire::V1_HEADER_SIZE ||
+		    stride > wire::MaxV1PaddedSize() ||
+		    (stride % 64) != 0 ||
+		    stride > (total_size - pos)) {
+			return false;
+		}
+		pos += stride;
+	}
+	return pos == total_size;
+}
+
+static bool Order0BatchMatchesV2(const uint8_t* data, size_t total_size, uint32_t num_msg) {
+	if (data == nullptr || total_size < sizeof(BlogMessageHeader) || num_msg == 0) return false;
+	size_t pos = 0;
+	for (uint32_t i = 0; i < num_msg; ++i) {
+		if (total_size - pos < sizeof(BlogMessageHeader)) return false;
+		const auto* hdr = reinterpret_cast<const BlogMessageHeader*>(data + pos);
+		if (hdr->size == 0 || hdr->size > wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+			return false;
+		}
+		const size_t stride = wire::ComputeStrideV2(hdr->size);
+		if (stride > (total_size - pos)) {
+			return false;
+		}
+		pos += stride;
+	}
+	return pos == total_size;
+}
+
+static uint16_t InferOrder0HeaderVersion(const void* batch_data,
+                                         size_t total_size,
+                                         uint32_t num_msg) {
+	const auto* data = static_cast<const uint8_t*>(batch_data);
+	const bool matches_v2 = Order0BatchMatchesV2(data, total_size, num_msg);
+	const bool matches_v1 = Order0BatchMatchesV1(data, total_size, num_msg);
+	if (matches_v2 && !matches_v1) return wire::HEADER_VERSION_V2;
+	if (matches_v1 && !matches_v2) return wire::HEADER_VERSION_V1;
+	const uint16_t fallback = HeaderUtils::ShouldUseBlogHeader()
+		? wire::HEADER_VERSION_V2
+		: wire::HEADER_VERSION_V1;
+	LOG(WARNING) << "InferOrder0HeaderVersion ambiguous: total_size=" << total_size
+	             << " num_msg=" << num_msg
+	             << " matches_v1=" << matches_v1
+	             << " matches_v2=" << matches_v2
+	             << " fallback=" << fallback;
+	return fallback;
+}
+
 /**
  * Closes socket and epoll file descriptors safely
  */
@@ -1004,7 +1059,12 @@ void NetworkManager::HandlePublishRequest(
 			// [[ORDER0_SUBSCRIBE]] Record batch in DRAM ring so subscribers can export
 			// with batch_meta (same protocol as ORDER=5). No CXL writes; minimal overhead.
 			if (topic_ptr) {
-				topic_ptr->PushOrder0Batch(log_idx, batch_header.total_size, batch_header.num_msg);
+				const uint16_t order0_header_version =
+					InferOrder0HeaderVersion(buf, batch_header.total_size, batch_header.num_msg);
+				topic_ptr->PushOrder0Batch(log_idx,
+				                           batch_header.total_size,
+				                           batch_header.num_msg,
+				                           order0_header_version);
 			}
 			continue;  // Next batch — no PBR, no validation, no DelegationThread dependency
 		}
@@ -1185,9 +1245,12 @@ void NetworkManager::HandlePublishRequest(
 			// is lock-free, and the subscriber export loop has no replication gate
 			// (matching the fast-path semantic where delivery precedes ACK).
 			if (topic_ptr) {
+				const uint16_t order0_header_version =
+					InferOrder0HeaderVersion(buf, batch_header.total_size, batch_header.num_msg);
 				topic_ptr->PushOrder0Batch(batch_header.log_idx,
 				                           batch_header.total_size,
-				                           batch_header.num_msg);
+				                           batch_header.num_msg,
+				                           order0_header_version);
 			}
 		}
 		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for other orders
@@ -1409,8 +1472,9 @@ void NetworkManager::SubscribeNetworkThread(
 				absl::MutexLock lock(&cached_state->mu);
 				local_offset = cached_state->last_offset;
 			}
-			// Order 2 (Corfu total order) and Order 5 (Embarcadero strong order): include batch metadata for subscriber ordering.
-			if (order == 5 || order == 2) {
+			// Order 2 (Corfu total), 5 (Embarcadero strong), and 1 (SCALOG per-broker): batch
+			// metadata prefix so Subscriber::ConsumeOrdered can parse the stream.
+			if (order == 5 || order == 2 || order == 1) {
 				size_t batch_total_order = 0;
 				uint32_t num_messages = 0;
 				if (!topic_manager_->GetBatchToExportWithMetadata(
@@ -1467,8 +1531,10 @@ void NetworkManager::SubscribeNetworkThread(
 				}
 				uint64_t o0_log_idx = 0;
 				uint32_t o0_total_size = 0, o0_num_msg = 0;
+				uint16_t o0_header_version = wire::HEADER_VERSION_V1;
 				if (!topic_manager_->ReadOrder0Batch(topic, ring_cursor,
-				                                      o0_log_idx, o0_total_size, o0_num_msg)) {
+				                                      o0_log_idx, o0_total_size, o0_num_msg,
+				                                      o0_header_version)) {
 					export_no_data_loops++;
 					std::this_thread::yield();
 					continue;
@@ -1481,8 +1547,7 @@ void NetworkManager::SubscribeNetworkThread(
 				messages_size = o0_total_size;
 				batch_meta.batch_total_order = 0;  // ORDER=0: no global ordering
 				batch_meta.num_messages = o0_num_msg;
-				batch_meta.header_version = HeaderUtils::ShouldUseBlogHeader()
-					? wire::HEADER_VERSION_V2 : wire::HEADER_VERSION_V1;
+				batch_meta.header_version = o0_header_version;
 				batch_meta.flags = 0;
 				export_batches++;
 				export_bytes += messages_size;
@@ -1496,10 +1561,10 @@ void NetworkManager::SubscribeNetworkThread(
 			continue;
 		}
 
-		// ORDER=0, 2, 5: send batch metadata first (header_version, num_messages) for format-aware consume.
+		// ORDER=0, 1, 2, 5: send batch metadata first (header_version, num_messages) for format-aware consume.
 		// MSG_MORE hints the kernel to coalesce this small send with the upcoming payload,
 		// avoiding a separate TCP segment for the 16-byte metadata header.
-		if (order == 0 || order == 5 || order == 2) {
+		if (order == 0 || order == 5 || order == 2 || order == 1) {
 			ssize_t meta_sent = send(sock, &batch_meta, sizeof(batch_meta), MSG_NOSIGNAL | MSG_MORE);
 			if (meta_sent != sizeof(batch_meta)) {
 				LOG(ERROR) << "Failed to send batch metadata: " << strerror(errno);

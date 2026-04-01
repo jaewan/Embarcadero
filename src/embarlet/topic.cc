@@ -2366,34 +2366,57 @@ bool Topic::GetBatchToExportWithMetadata(
 		num_messages = (counted > 0) ? counted : 1;
 		return true;
 	}
-	// Scalog ORDER=2: local sequencers commit ordered batches into the slot ring; export
-	// uses the same slot walk as LazyLog (CompletionVector / ORDER=5-style path does not
-	// match how Scalog publishes).
-	if (seq_type_ == SCALOG && order_ == Embarcadero::kOrderTotal) {
-		if (!GetBatchToExport(expected_batch_offset, batch_addr, batch_size)) {
+	// Scalog ORDER=1 (per-broker) and ORDER=2 (total): export from the ordered slot ring.
+	// Use BatchHeader::num_msg as the authoritative batch count; re-walking the payload via
+	// next_msg_diff can undercount a partially visible batch and desync the ordered subscriber
+	// stream mid-payload.
+	if (seq_type_ == SCALOG && (order_ == Embarcadero::kOrderTotal ||
+	                          order_ == Embarcadero::kOrderPerBroker)) {
+		if (num_slots_ == 0) {
 			return false;
 		}
-		if (batch_addr == nullptr || batch_size < sizeof(MessageHeader)) {
+		BatchHeader* start_batch_header = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+		BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(start_batch_header) + BATCHHEADERS_SIZE);
+		size_t slot_index = expected_batch_offset % num_slots_;
+		BatchHeader* header = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * slot_index);
+		CXL::flush_cacheline(header);
+		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(header) + 64);
+		CXL::full_fence();
+		if (header->ordered == 0) {
+			return false;
+		}
+		size_t off = header->batch_off_to_export;
+		if (off >= BATCHHEADERS_SIZE || off % sizeof(BatchHeader) != 0) {
+			LOG(WARNING) << "[Scalog GetBatchToExportWithMetadata B" << broker_id_
+			             << "] Invalid batch_off_to_export=" << off;
+			expected_batch_offset++;
+			return false;
+		}
+		BatchHeader* actual = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(header) + off);
+		if (actual < start_batch_header || actual >= ring_end) {
+			LOG(WARNING) << "[Scalog GetBatchToExportWithMetadata B" << broker_id_
+			             << "] Export chain outside ring (off=" << off << ")";
+			expected_batch_offset++;
+			return false;
+		}
+		CXL::flush_cacheline(actual);
+		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(actual) + 64);
+		CXL::full_fence();
+
+		batch_addr = actual->log_idx + reinterpret_cast<uint8_t*>(cxl_addr_);
+		batch_size = actual->total_size;
+		num_messages = actual->num_msg;
+		expected_batch_offset++;
+		if (batch_addr == nullptr || batch_size < sizeof(MessageHeader) || num_messages == 0) {
 			return false;
 		}
 
 		auto* first = reinterpret_cast<MessageHeader*>(batch_addr);
 		batch_total_order = first->total_order;
-
-		uint32_t counted = 0;
-		size_t remaining = batch_size;
-		uint8_t* cursor = reinterpret_cast<uint8_t*>(batch_addr);
-		while (remaining >= sizeof(MessageHeader)) {
-			auto* hdr = reinterpret_cast<MessageHeader*>(cursor);
-			const size_t stride = static_cast<size_t>(hdr->next_msg_diff);
-			if (stride == 0 || stride > remaining) {
-				break;
-			}
-			++counted;
-			cursor += stride;
-			remaining -= stride;
-		}
-		num_messages = (counted > 0) ? counted : 1;
 		return true;
 	}
 
@@ -2401,7 +2424,6 @@ bool Topic::GetBatchToExportWithMetadata(
 	constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
 	// [[EXPORT_BY_TOTAL_ORDER]] [PHASE-8] Hold queue is peeked/popped atomically later.
 	bool have_hold = false;
-	size_t hold_total_order = 0;
 	OrderedHoldExportEntry hold_front;
 
 	// [[PHASE_2_CV_EXPORT]] O(1) export: use CompletionVector instead of linear scan (design §3.4).
@@ -2467,11 +2489,25 @@ bool Topic::GetBatchToExportWithMetadata(
 					}
 				}
 				ring_total_order = actual->total_order;
-
+				// ORDER=5 can observe the producer slot before commit has published a stable
+				// export descriptor, in which case the ring metadata still reports
+				// total_order=0 for a later batch. The only safe zero-order exception is the
+				// true global-leading batch: broker-local PBR 0 whose committed logical
+				// frontier matches the entire global committed frontier. Later brokers can
+				// also start at local PBR 0, but their first committed batch must not be
+				// exported with total_order=0.
+				const bool allow_global_zero_order_ring =
+					(next_pbr == 0) &&
+					(cv_completed_logical > 0) &&
+					(global_seq_.load(std::memory_order_acquire) == cv_completed_logical);
+				if (order_ == 5 && ring_total_order == 0 && !allow_global_zero_order_ring) {
+					have_ring = false;
+				} else {
 					ring_batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + actual->log_idx;
 					ring_batch_size = actual->total_size;
 					ring_num_messages = actual->num_msg;
-				have_ring = true;
+					have_ring = true;
+				}
 			}
 		}
 	}
@@ -2505,6 +2541,8 @@ bool Topic::GetBatchToExportWithMetadata(
 		          << " cv_logical=" << cv_completed_logical
 		          << " have_hold=" << (have_hold ? 1 : 0)
 		          << " have_ring=" << (have_ring ? 1 : 0)
+		          << " ring_total_order=" << ring_total_order
+		          << " ring_batch_size=" << ring_batch_size
 		          << " slot_ordered=" << ring_slot_ordered
 		          << " slot_pbr_idx=" << ring_slot_pbr_idx
 		          << " slot_flags=" << ring_slot_flags
@@ -2532,7 +2570,6 @@ bool Topic::GetBatchToExportWithMetadata(
 			have_hold = false;
 			if (!hold_export_queues_[broker_id_].q.empty()) {
 				hold_front = hold_export_queues_[broker_id_].q.front();
-				hold_total_order = hold_front.total_order;
 				have_hold = true;
 				if (hold_front.pbr_absolute_index < next_pbr) {
 					// This held batch may still be the only exportable copy. Serve it as a
@@ -2540,8 +2577,7 @@ bool Topic::GetBatchToExportWithMetadata(
 					hold_export_queues_[broker_id_].q.pop_front();
 					return_hold = true;
 					return_late_hold = true;
-				} else if (hold_front.pbr_absolute_index == next_pbr &&
-				           (!have_ring || hold_total_order <= ring_total_order)) {
+				} else if (hold_front.pbr_absolute_index == next_pbr) {
 					hold_export_queues_[broker_id_].q.pop_front();
 					return_hold = true;
 				}
@@ -3029,12 +3065,16 @@ void Topic::CommittedSeqUpdaterThread() {
  *
  * @return true if more messages are available
  */
-void Topic::PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg) {
+void Topic::PushOrder0Batch(uint64_t log_idx,
+                            uint32_t total_size,
+                            uint32_t num_msg,
+                            uint16_t header_version) {
 	uint64_t cursor = order0_batch_write_cursor_.fetch_add(1, std::memory_order_relaxed);
 	auto& slot = order0_batch_ring_[cursor & (kOrder0BatchRingSize - 1)];
 	slot.log_idx = log_idx;
 	slot.total_size = total_size;
 	slot.num_msg = num_msg;
+	slot.header_version = header_version;
 	// Release store: makes log_idx/total_size/num_msg visible to readers after sequence.
 	slot.sequence.store(cursor + 1, std::memory_order_release);
 }
@@ -3042,7 +3082,8 @@ void Topic::PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_
 bool Topic::ReadOrder0Batch(uint64_t& read_cursor,
 		uint64_t& out_log_idx,
 		uint32_t& out_total_size,
-		uint32_t& out_num_msg) const {
+		uint32_t& out_num_msg,
+		uint16_t& out_header_version) const {
 	const auto& slot = order0_batch_ring_[read_cursor & (kOrder0BatchRingSize - 1)];
 	uint64_t seq = slot.sequence.load(std::memory_order_acquire);
 	if (seq != read_cursor + 1) {
@@ -3061,6 +3102,7 @@ bool Topic::ReadOrder0Batch(uint64_t& read_cursor,
 	out_log_idx = slot.log_idx;
 	out_total_size = slot.total_size;
 	out_num_msg = slot.num_msg;
+	out_header_version = slot.header_version;
 	read_cursor++;
 	return true;
 }
@@ -3996,8 +4038,15 @@ void Topic::CommitEpoch(
 	}
 
 	// 2. Flush export chain and BatchHeaders
-		for (PendingBatch5& p : ready) {
+	// Snapshot export metadata from the epoch's sequenced order directly. For
+	// non-head broker batches the producer slot can still hold total_order=0 while
+	// this epoch is being committed, so reading p.hdr->total_order here can export a
+	// stale zero even though the batch is committed at a non-zero global order.
+	size_t export_total_order = base_order;
+	for (PendingBatch5& p : ready) {
 			if (p.skipped || p.is_held_marker || p.from_hold || p.hdr == nullptr) continue;
+		const size_t batch_total_order = export_total_order;
+		export_total_order += p.num_msg;
 			int b = p.broker_id;
 			if (b >= 0 && b < NUM_MAX_BROKERS) {
 				const size_t batch_headers_offset = tinode_->offsets[b].batch_headers_offset;
@@ -4015,8 +4064,24 @@ void Topic::CommitEpoch(
 						export_cursor_by_broker_[b] = cur;
 					}
 
-					cur->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cur);
+					// Publish a self-contained export descriptor instead of redirecting through
+					// p.hdr, which is a live producer slot and can be reinitialized before the
+					// subscriber export thread consumes it.
+					cur->total_order = batch_total_order;
+					cur->num_msg = static_cast<uint32_t>(p.num_msg);
+					cur->total_size = static_cast<uint32_t>(p.cached_total_size);
+					cur->log_idx = p.cached_log_idx;
+					cur->pbr_absolute_index = p.cached_pbr_absolute_index;
+					cur->batch_id = p.cached_batch_id;
+					cur->client_id = p.client_id;
+					cur->batch_seq = p.batch_seq;
+					cur->broker_id = static_cast<uint16_t>(p.broker_id);
+					cur->epoch_created = p.epoch_created;
+					cur->batch_off_to_export = 0;
 					cur->ordered = 1;
+					cur->batch_complete = 1;
+					cur->publish_commit = p.cached_pbr_absolute_index;
+					cur->flags = kBatchHeaderFlagClaimed | kBatchHeaderFlagValid;
 					CXL::store_fence();
 					CXL::flush_cacheline(cur);
 					CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(cur) + 64);
@@ -4093,6 +4158,16 @@ void Topic::CommitEpoch(
 					goi_timestamps_[ring_pos].goi_index.store(batch_index, std::memory_order_relaxed);
 					goi_timestamps_[ring_pos].timestamp_ns.store(SteadyNowNs(), std::memory_order_release);
 				}
+		{
+			OrderedHoldExportEntry ex;
+			ex.log_idx = p.cached_log_idx;
+			ex.batch_size = p.cached_total_size;
+			ex.total_order = next_order;
+			ex.num_messages = p.num_msg;
+			ex.pbr_absolute_index = p.cached_pbr_absolute_index;
+			absl::MutexLock lock(&hold_export_queues_[owner_broker].mu);
+			hold_export_queues_[owner_broker].q.push_back(ex);
+		}
 		next_order += p.num_msg;
 		int b = p.broker_id;
 		ordered_increment[b] += p.num_msg;
@@ -6670,9 +6745,28 @@ void Topic::AssignOrder5(BatchHeader* batch_to_order, size_t start_total_order, 
 	// Single fence for all flushes - reduces fence overhead
 	CXL::store_fence();
 
-	// Set up export chain (GOI equivalent)
-	header_for_sub->batch_off_to_export = (reinterpret_cast<uint8_t*>(batch_to_order) - reinterpret_cast<uint8_t*>(header_for_sub));
+	// Self-contained export descriptor (same contract as CommitEpoch fast path).
+	// Do not set batch_off_to_export -> batch_to_order: that slot is live producer
+	// memory and can be reinitialized before the export thread reads it.
+	header_for_sub->total_order = start_total_order;
+	header_for_sub->num_msg = static_cast<uint32_t>(num_messages);
+	header_for_sub->total_size = static_cast<uint32_t>(batch_to_order->total_size);
+	header_for_sub->log_idx = batch_to_order->log_idx;
+	header_for_sub->pbr_absolute_index = batch_to_order->pbr_absolute_index;
+	header_for_sub->batch_id = batch_to_order->batch_id;
+	header_for_sub->client_id = batch_to_order->client_id;
+	header_for_sub->batch_seq = batch_to_order->batch_seq;
+	header_for_sub->broker_id = batch_to_order->broker_id;
+	header_for_sub->epoch_created = batch_to_order->epoch_created;
+	header_for_sub->batch_off_to_export = 0;
 	header_for_sub->ordered = 1;
+	header_for_sub->batch_complete = 1;
+	header_for_sub->publish_commit = batch_to_order->pbr_absolute_index;
+	header_for_sub->flags = kBatchHeaderFlagClaimed | kBatchHeaderFlagValid;
+	CXL::store_fence();
+	CXL::flush_cacheline(header_for_sub);
+	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(header_for_sub) + 64);
+	CXL::store_fence();
 
 	header_for_sub = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(header_for_sub) + sizeof(BatchHeader));
 

@@ -77,6 +77,7 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	absl::CondVar receiver_can_write_cv; // Notifies receiver the *other* buffer is free
 
 	std::vector<RecvLogEntry> recv_log ABSL_GUARDED_BY(state_mutex);
+	std::vector<uint8_t> ordered_stream_pending ABSL_GUARDED_BY(state_mutex);
 	// Incremental latency parsing state so StoreLatency() does not depend on
 	// retention of full connection buffers across swaps.
 	std::vector<uint8_t> latency_parse_pending ABSL_GUARDED_BY(state_mutex);
@@ -86,18 +87,6 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	uint32_t latency_messages_processed ABSL_GUARDED_BY(state_mutex) = 0;
 	uint64_t latency_batch_total_order ABSL_GUARDED_BY(state_mutex) = 0;
 	std::vector<LatencySample> latency_samples ABSL_GUARDED_BY(state_mutex);
-	struct BatchUidDiagEntry {
-		int broker_id = -1;
-		uint64_t batch_total_order = 0;
-		uint32_t num_messages = 0;
-		uint64_t first_uid = 0;
-		uint64_t last_uid = 0;
-		uint32_t uid_seen = 0;
-	};
-	std::vector<BatchUidDiagEntry> latency_batch_uid_diag ABSL_GUARDED_BY(state_mutex);
-	uint64_t latency_batch_first_uid ABSL_GUARDED_BY(state_mutex) = 0;
-	uint64_t latency_batch_last_uid ABSL_GUARDED_BY(state_mutex) = 0;
-	uint32_t latency_batch_uid_seen ABSL_GUARDED_BY(state_mutex) = 0;
 	struct LatencyParseDiag {
 		uint64_t parse_calls = 0;
 		uint64_t parse_input_bytes = 0;
@@ -109,6 +98,9 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 		uint64_t parse_break_no_progress = 0;
 		uint64_t samples_added = 0;
 		uint64_t samples_rejected_implausible_ts = 0;
+		uint64_t metadata_resync_count = 0;
+		uint64_t header_version_switch_count = 0;
+		uint64_t partial_timeout_accept_count = 0;
 	} latency_diag ABSL_GUARDED_BY(state_mutex);
 	// Increments when a buffer is reset for reuse; needed to disambiguate offsets
 	// across buffer swaps when correlating per-message receive timestamps.

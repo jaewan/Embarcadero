@@ -362,7 +362,10 @@ class Topic {
 		 * Called from the ingest fast path after UpdateWrittenForOrder0.
 		 * Lock-free multi-producer, multi-reader ring (DRAM only, no CXL writes).
 		 */
-		void PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg);
+		void PushOrder0Batch(uint64_t log_idx,
+		                    uint32_t total_size,
+		                    uint32_t num_msg,
+		                    uint16_t header_version);
 
 		/**
 		 * Read the next ORDER=0 batch record for a subscriber.
@@ -373,9 +376,10 @@ class Topic {
 		 * @return true if a batch was available and read_cursor advanced.
 		 */
 		bool ReadOrder0Batch(uint64_t& read_cursor,
-				uint64_t& out_log_idx,
-				uint32_t& out_total_size,
-				uint32_t& out_num_msg) const;
+			uint64_t& out_log_idx,
+			uint32_t& out_total_size,
+			uint32_t& out_num_msg,
+			uint16_t& out_header_version) const;
 
 		/**
 		 * Get a buffer in CXL memory for a new batch of messages
@@ -718,6 +722,8 @@ class Topic {
 			uint64_t log_idx = 0;
 			uint32_t total_size = 0;
 			uint32_t num_msg = 0;
+			uint16_t header_version = 1;
+			uint16_t _reserved = 0;
 			uint32_t _pad = 0;
 		};
 		static_assert(sizeof(Order0BatchSlot) == 32, "Order0BatchSlot must be 32 bytes");

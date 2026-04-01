@@ -185,12 +185,8 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 	auto& pending = conn->latency_parse_pending;
 	pending.insert(pending.end(), data, data + len);
 
-	const bool parse_batch_metadata = (order_level == 0 || order_level == 5 || order_level == 2);
-	const bool uid_batch_diag_enabled = (std::getenv("EMBAR_UID_BATCH_DIAG") != nullptr);
-	const uint16_t expected_header_version =
-		((order_level == 0 || order_level == 5) && Embarcadero::HeaderUtils::ShouldUseBlogHeader())
-			? Embarcadero::wire::HEADER_VERSION_V2
-			: Embarcadero::wire::HEADER_VERSION_V1;
+	// BatchMetadata framing is present on ordered paths and some ORDER=0 runs.
+	const bool parse_batch_metadata = (order_level == 0 || order_level == 1 || order_level == 5 || order_level == 2);
 	size_t parse_offset = 0;
 
 	while (parse_offset < pending.size()) {
@@ -201,7 +197,9 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		    !conn->latency_has_batch_metadata &&
 		    remaining >= sizeof(Embarcadero::wire::BatchMetadata)) {
 			auto* metadata = reinterpret_cast<Embarcadero::wire::BatchMetadata*>(current_parse_ptr);
-			const bool header_ok = (metadata->header_version == expected_header_version);
+			const bool header_ok =
+				metadata->header_version == Embarcadero::wire::HEADER_VERSION_V1 ||
+				metadata->header_version == Embarcadero::wire::HEADER_VERSION_V2;
 			const bool batch_shape_ok =
 				metadata->num_messages > 0 &&
 				metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
@@ -209,16 +207,13 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 				metadata->flags == 0;
 			if (header_ok && batch_shape_ok) {
 				conn->latency_has_batch_metadata = true;
-					conn->latency_diag.metadata_detected++;
-					conn->latency_header_version = metadata->header_version;
-					conn->latency_messages_in_batch = metadata->num_messages;
-					conn->latency_messages_processed = 0;
-					conn->latency_batch_total_order = metadata->batch_total_order;
-					conn->latency_batch_first_uid = 0;
-					conn->latency_batch_last_uid = 0;
-					conn->latency_batch_uid_seen = 0;
-					parse_offset += sizeof(Embarcadero::wire::BatchMetadata);
-					continue;
+				conn->latency_diag.metadata_detected++;
+				conn->latency_header_version = metadata->header_version;
+				conn->latency_messages_in_batch = metadata->num_messages;
+				conn->latency_messages_processed = 0;
+				conn->latency_batch_total_order = metadata->batch_total_order;
+				parse_offset += sizeof(Embarcadero::wire::BatchMetadata);
+				continue;
 			}
 			// Resync: metadata-sized chunk present but invalid at this offset.
 			// Advance by 8B to find the next plausible metadata boundary.
@@ -234,26 +229,80 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		size_t total_message_size = 0;
 		size_t header_size = sizeof(Embarcadero::MessageHeader);
 		bool valid_message = false;
+		bool switched_header_version = false;
+		bool incomplete_message = false;
+
+		auto try_parse_v2 = [&](bool allow_incomplete) {
+			auto* v2_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(current_parse_ptr);
+			if (v2_hdr->size == 0 || v2_hdr->size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+				return false;
+			}
+			const size_t stride = Embarcadero::wire::ComputeStrideV2(v2_hdr->size);
+			header_size = sizeof(Embarcadero::BlogMessageHeader);
+			if (stride > remaining) {
+				if (allow_incomplete) incomplete_message = true;
+				return false;
+			}
+			total_message_size = stride;
+			valid_message = true;
+			return true;
+		};
+
+		auto try_parse_v1 = [&](bool allow_incomplete) {
+			auto* v1_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(current_parse_ptr);
+			const size_t padded_size = v1_hdr->paddedSize;
+			if (padded_size < Embarcadero::wire::V1_HEADER_SIZE ||
+			    padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
+			    (padded_size % 64) != 0) {
+				return false;
+			}
+			header_size = sizeof(Embarcadero::MessageHeader);
+			if (padded_size > remaining) {
+				if (allow_incomplete) incomplete_message = true;
+				return false;
+			}
+			total_message_size = padded_size;
+			valid_message = true;
+			return true;
+		};
 
 		if (conn->latency_header_version == Embarcadero::wire::HEADER_VERSION_V2) {
-			auto* v2_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(current_parse_ptr);
-			if (Embarcadero::wire::ValidateV2Payload(v2_hdr->size, remaining)) {
-				total_message_size = Embarcadero::wire::ComputeStrideV2(v2_hdr->size);
-				header_size = sizeof(Embarcadero::BlogMessageHeader);
-				valid_message = (remaining >= total_message_size);
+			if (!try_parse_v2(/*allow_incomplete=*/true) && !incomplete_message) {
+				// Fallback: tolerate mixed/legacy streams by probing V1 framing.
+				switched_header_version = try_parse_v1(/*allow_incomplete=*/false);
 			}
 		} else {
-			auto* v1_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(current_parse_ptr);
-			if (Embarcadero::wire::ValidateV1PaddedSize(v1_hdr->paddedSize, remaining)) {
-				total_message_size = v1_hdr->paddedSize;
-				header_size = sizeof(Embarcadero::MessageHeader);
-				valid_message = (remaining >= total_message_size);
+			if (!try_parse_v1(/*allow_incomplete=*/true) && !incomplete_message) {
+				// Fallback: tolerate streams that switched to Blog header format.
+				switched_header_version = try_parse_v2(/*allow_incomplete=*/false);
 			}
+		}
+		if (switched_header_version && valid_message) {
+			conn->latency_header_version =
+				(header_size == sizeof(Embarcadero::BlogMessageHeader))
+					? Embarcadero::wire::HEADER_VERSION_V2
+					: Embarcadero::wire::HEADER_VERSION_V1;
+			conn->latency_diag.header_version_switch_count++;
+		}
+
+		if (incomplete_message) {
+			conn->latency_diag.parse_break_incomplete_message++;
+			break;
 		}
 
 		if (!valid_message || total_message_size == 0) {
 			if (total_message_size == 0) {
 				conn->latency_diag.parse_break_invalid_size++;
+				if (parse_batch_metadata) {
+					// Recover from bad/partial batch framing by resetting metadata state
+					// and probing the next aligned boundary.
+					conn->latency_has_batch_metadata = false;
+					conn->latency_messages_in_batch = 0;
+					conn->latency_messages_processed = 0;
+					conn->latency_diag.metadata_resync_count++;
+					parse_offset += 8;
+					continue;
+				}
 			} else {
 				conn->latency_diag.parse_break_incomplete_message++;
 			}
@@ -261,76 +310,59 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		}
 		conn->latency_diag.parsed_messages++;
 
-			if (total_message_size >= header_size + sizeof(long long)) {
-				long long send_nanos_since_epoch = 0;
-				memcpy(&send_nanos_since_epoch, current_parse_ptr + header_size, sizeof(long long));
-				uint64_t msg_uid = 0;
-				if (total_message_size >= header_size + sizeof(long long) + sizeof(uint64_t)) {
-					memcpy(&msg_uid,
-					       current_parse_ptr + header_size + sizeof(long long),
-					       sizeof(uint64_t));
-				}
-				const long long recv_nanos_since_epoch =
-					std::chrono::duration_cast<std::chrono::nanoseconds>(recv_time.time_since_epoch()).count();
-				constexpr long long kMaxPastWindowNs = 60LL * 60LL * 1000LL * 1000LL * 1000LL; // 1 hour
+		if (total_message_size >= header_size + sizeof(long long)) {
+			long long send_nanos_since_epoch = 0;
+			memcpy(&send_nanos_since_epoch, current_parse_ptr + header_size, sizeof(long long));
+			uint64_t msg_uid = 0;
+			if (total_message_size >= header_size + sizeof(long long) + sizeof(uint64_t)) {
+				memcpy(&msg_uid,
+				       current_parse_ptr + header_size + sizeof(long long),
+				       sizeof(uint64_t));
+			}
+			const long long recv_nanos_since_epoch =
+				std::chrono::duration_cast<std::chrono::nanoseconds>(recv_time.time_since_epoch()).count();
+			constexpr long long kMaxPastWindowNs = 60LL * 60LL * 1000LL * 1000LL * 1000LL; // 1 hour
 			constexpr long long kMaxFutureSkewNs = 1LL * 1000LL * 1000LL * 1000LL; // 1 second
 			const bool plausible_timestamp =
 				send_nanos_since_epoch >= (recv_nanos_since_epoch - kMaxPastWindowNs) &&
 				send_nanos_since_epoch <= (recv_nanos_since_epoch + kMaxFutureSkewNs);
-				if (plausible_timestamp) {
-					std::chrono::steady_clock::time_point send_time{std::chrono::nanoseconds(send_nanos_since_epoch)};
-					long long latency_micros =
-						std::chrono::duration_cast<std::chrono::microseconds>(recv_time - send_time).count();
-					uint64_t dedupe_key = static_cast<uint64_t>(send_nanos_since_epoch);
-					if (msg_uid != 0) {
-						if (uid_batch_diag_enabled && parse_batch_metadata && conn->latency_has_batch_metadata) {
-							if (conn->latency_batch_uid_seen == 0) {
-								conn->latency_batch_first_uid = msg_uid;
-							}
-							conn->latency_batch_last_uid = msg_uid;
-							conn->latency_batch_uid_seen++;
-						}
-						// Use raw UID as dedupe identity when available.
-						// Combining UID/timestamp via XOR hashing is not injective for correlated
-						// sequences and can produce false collisions at scale.
-						dedupe_key = msg_uid;
-					} else if (parse_batch_metadata && conn->latency_has_batch_metadata) {
-						// Combine metadata identity with send timestamp to avoid key collisions.
-						const uint64_t batch_local_index =
-							(conn->latency_batch_total_order << 16) |
-							static_cast<uint64_t>(conn->latency_messages_processed & 0xFFFFu);
-						dedupe_key = Mix64(batch_local_index) ^ Mix64(static_cast<uint64_t>(send_nanos_since_epoch));
-					}
-					conn->latency_samples.push_back(
-						LatencySample{dedupe_key, send_nanos_since_epoch, latency_micros});
-					conn->latency_diag.samples_added++;
-				} else {
-					conn->latency_diag.samples_rejected_implausible_ts++;
+			if (plausible_timestamp) {
+				std::chrono::steady_clock::time_point send_time{std::chrono::nanoseconds(send_nanos_since_epoch)};
+				long long latency_micros =
+					std::chrono::duration_cast<std::chrono::microseconds>(recv_time - send_time).count();
+				uint64_t dedupe_key = static_cast<uint64_t>(send_nanos_since_epoch);
+				if (msg_uid != 0) {
+					// Use raw UID as dedupe identity when available.
+					// Combining UID/timestamp via XOR hashing is not injective for correlated
+					// sequences and can produce false collisions at scale.
+					dedupe_key = msg_uid;
+				} else if (parse_batch_metadata && conn->latency_has_batch_metadata) {
+					// Combine metadata identity with send timestamp to avoid key collisions.
+					const uint64_t batch_local_index =
+						(conn->latency_batch_total_order << 16) |
+						static_cast<uint64_t>(conn->latency_messages_processed & 0xFFFFu);
+					dedupe_key = Mix64(batch_local_index) ^ Mix64(static_cast<uint64_t>(send_nanos_since_epoch));
+				}
+				conn->latency_samples.push_back(
+					LatencySample{dedupe_key, send_nanos_since_epoch, latency_micros});
+				conn->latency_diag.samples_added++;
+			} else {
+				conn->latency_diag.samples_rejected_implausible_ts++;
 			}
 		}
 
 		parse_offset += total_message_size;
 		if (parse_batch_metadata && conn->latency_has_batch_metadata) {
 			conn->latency_messages_processed++;
-				if (conn->latency_messages_processed >= conn->latency_messages_in_batch) {
-					if (uid_batch_diag_enabled) {
-						ConnectionBuffers::BatchUidDiagEntry e;
-						e.broker_id = conn->broker_id;
-						e.batch_total_order = conn->latency_batch_total_order;
-						e.num_messages = conn->latency_messages_in_batch;
-						e.first_uid = conn->latency_batch_first_uid;
-						e.last_uid = conn->latency_batch_last_uid;
-						e.uid_seen = conn->latency_batch_uid_seen;
-						conn->latency_batch_uid_diag.push_back(e);
-					}
-					conn->latency_has_batch_metadata = false;
-					conn->latency_header_version = Embarcadero::wire::HEADER_VERSION_V1;
-					conn->latency_messages_in_batch = 0;
-					conn->latency_messages_processed = 0;
-					conn->latency_batch_total_order = 0;
-				}
+			if (conn->latency_messages_processed >= conn->latency_messages_in_batch) {
+				conn->latency_has_batch_metadata = false;
+				conn->latency_header_version = Embarcadero::wire::HEADER_VERSION_V1;
+				conn->latency_messages_in_batch = 0;
+				conn->latency_messages_processed = 0;
+				conn->latency_batch_total_order = 0;
 			}
 		}
+	}
 
 	if (parse_offset == 0) {
 		conn->latency_diag.parse_break_no_progress++;
@@ -653,6 +685,15 @@ void Subscriber::StoreLatency() {
 	size_t total_messages_parsed = 0;
 	const bool dedupe_latency_samples = (std::getenv("EMBARCADERO_DEDUPE_LATENCY") != nullptr);
 	std::unordered_map<uint64_t, long long> best_latency_by_message_key;
+	uint64_t diag_metadata_detected = 0;
+	uint64_t diag_break_short = 0;
+	uint64_t diag_break_incomplete = 0;
+	uint64_t diag_break_invalid = 0;
+	uint64_t diag_break_no_progress = 0;
+	uint64_t diag_samples_rejected_ts = 0;
+	uint64_t diag_metadata_resync = 0;
+	uint64_t diag_header_switch = 0;
+	uint64_t diag_partial_timeout_accept = 0;
 
 	std::vector<std::pair<int, std::shared_ptr<ConnectionBuffers>>> connections_to_parse;
 	{
@@ -673,6 +714,15 @@ void Subscriber::StoreLatency() {
 	for (auto const& [fd, conn_ptr] : connections_to_parse) {
 		if (!conn_ptr) continue;
 		absl::MutexLock state_lock(&conn_ptr->state_mutex);
+		diag_metadata_detected += conn_ptr->latency_diag.metadata_detected;
+		diag_break_short += conn_ptr->latency_diag.parse_break_short_header;
+		diag_break_incomplete += conn_ptr->latency_diag.parse_break_incomplete_message;
+		diag_break_invalid += conn_ptr->latency_diag.parse_break_invalid_size;
+		diag_break_no_progress += conn_ptr->latency_diag.parse_break_no_progress;
+		diag_samples_rejected_ts += conn_ptr->latency_diag.samples_rejected_implausible_ts;
+		diag_metadata_resync += conn_ptr->latency_diag.metadata_resync_count;
+		diag_header_switch += conn_ptr->latency_diag.header_version_switch_count;
+		diag_partial_timeout_accept += conn_ptr->latency_diag.partial_timeout_accept_count;
 		for (const auto& sample : conn_ptr->latency_samples) {
 			total_messages_parsed++;
 			if (!dedupe_latency_samples) {
@@ -748,6 +798,31 @@ void Subscriber::StoreLatency() {
 		latency_file.close();
 	}
 
+	std::string diag_filename = "latency_diag.csv";
+	std::ofstream diag_file(diag_filename);
+	if (!diag_file.is_open()) {
+		LOG(ERROR) << "Failed to open file for writing: " << diag_filename;
+	} else {
+		diag_file << "Parsed,Recorded,Dropped,MetadataDetected,BreakShortHeader,"
+		          << "BreakIncompleteMessage,BreakInvalidSize,BreakNoProgress,"
+		          << "SamplesRejectedImplausibleTs,MetadataResyncCount,"
+		          << "HeaderVersionSwitchCount,PartialTimeoutAcceptCount\n";
+		diag_file << total_messages_parsed
+		          << "," << recorded_samples
+		          << "," << dropped_samples
+		          << "," << diag_metadata_detected
+		          << "," << diag_break_short
+		          << "," << diag_break_incomplete
+		          << "," << diag_break_invalid
+		          << "," << diag_break_no_progress
+		          << "," << diag_samples_rejected_ts
+		          << "," << diag_metadata_resync
+		          << "," << diag_header_switch
+		          << "," << diag_partial_timeout_accept
+		          << "\n";
+		diag_file.close();
+	}
+
 	// --- Generate and Write CDF Data Points ---
 	std::string cdf_filename = "cdf_latency_us.csv"; // Use .csv for easy import
 	VLOG(3) << "Writing CDF data points to " << cdf_filename;
@@ -814,6 +889,34 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 
 		auto now = std::chrono::steady_clock::now();
 		if (now >= deadline) {
+			if (wait_on_latency_messages &&
+			    current_parsed > 0 &&
+			    std::getenv("EMBAR_ALLOW_PARTIAL_LATENCY") != nullptr) {
+				std::vector<std::shared_ptr<ConnectionBuffers>> snapshot;
+				{
+					absl::ReaderMutexLock map_lock(&connection_map_mutex_);
+					snapshot.reserve(connections_.size() + closed_connections_.size());
+					for (const auto& [fd, conn] : connections_) {
+						(void)fd;
+						if (conn) snapshot.push_back(conn);
+					}
+					for (const auto& conn : closed_connections_) {
+						if (conn) snapshot.push_back(conn);
+					}
+				}
+				for (const auto& conn : snapshot) {
+					if (!conn) continue;
+					absl::MutexLock lock(&conn->state_mutex);
+					conn->latency_diag.partial_timeout_accept_count++;
+				}
+				double parsed_pct = target_latency_messages > 0
+					? (100.0 * static_cast<double>(current_parsed)) / static_cast<double>(target_latency_messages)
+					: 0;
+				LOG(WARNING) << "Subscriber::Poll timeout reached; accepting partial latency samples parsed="
+				             << current_parsed << "/" << target_latency_messages
+				             << " (" << std::fixed << std::setprecision(1) << parsed_pct << "%)";
+				break;
+			}
 			double byte_pct = total_data_size > 0
 				? (100.0 * static_cast<double>(current_count)) / static_cast<double>(total_data_size)
 				: 0;
@@ -884,48 +987,6 @@ void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
 				           << " break_incomplete_msg=" << diag_break_incomplete
 				           << " break_invalid_size=" << diag_break_invalid
 				           << " break_no_progress=" << diag_break_no_progress;
-				if (std::getenv("EMBAR_UID_BATCH_DIAG") != nullptr) {
-					std::unordered_map<std::string, size_t> signature_counts;
-					size_t total_batch_diag = 0;
-					size_t uid_count_mismatch = 0;
-					for (const auto& [fd, conn] : snapshot) {
-						(void)fd;
-						absl::MutexLock lock(&conn->state_mutex);
-						for (const auto& e : conn->latency_batch_uid_diag) {
-							total_batch_diag++;
-							if (e.uid_seen != e.num_messages) {
-								uid_count_mismatch++;
-							}
-							std::ostringstream key;
-							key << "B" << e.broker_id
-							    << ":to=" << e.batch_total_order
-							    << ":n=" << e.num_messages
-							    << ":u0=" << e.first_uid
-							    << ":u1=" << e.last_uid;
-							signature_counts[key.str()]++;
-						}
-					}
-					size_t duplicate_signature_entries = 0;
-					std::vector<std::pair<std::string, size_t>> dup_entries;
-					dup_entries.reserve(signature_counts.size());
-					for (const auto& [k, c] : signature_counts) {
-						if (c > 1) {
-							duplicate_signature_entries += (c - 1);
-							dup_entries.emplace_back(k, c);
-						}
-					}
-					std::sort(dup_entries.begin(), dup_entries.end(),
-					          [](const auto& a, const auto& b) { return a.second > b.second; });
-					LOG(ERROR) << "UID batch diag: total_batches=" << total_batch_diag
-					           << " unique_signatures=" << signature_counts.size()
-					           << " duplicate_signature_entries=" << duplicate_signature_entries
-					           << " uid_count_mismatch_batches=" << uid_count_mismatch;
-					const size_t kMaxReport = 12;
-					for (size_t i = 0; i < dup_entries.size() && i < kMaxReport; ++i) {
-						LOG(ERROR) << "UID batch diag duplicate[" << i << "]: count="
-						           << dup_entries[i].second << " sig=" << dup_entries[i].first;
-					}
-				}
 			}
 			throw std::runtime_error("Subscriber poll timeout");
 		}
@@ -1261,11 +1322,22 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 			const char* validate_order_env = std::getenv("EMBAR_VALIDATE_ORDER");
 			const bool should_rewrite_batch_headers =
 				validate_order_env && std::strcmp(validate_order_env, "0") != 0;
-			if ((order_level_ == 5 || order_level_ == 2) && should_rewrite_batch_headers) {
+			// SCALOG (ORDER=1) uses the same batch-metadata + MessageHeader wire stream as ORDER=2/5.
+			if ((order_level_ == 5 || order_level_ == 2 || order_level_ == 1) &&
+			    should_rewrite_batch_headers) {
 				ProcessSequencer5Data(static_cast<uint8_t*>(write_ptr), bytes_received, conn_buffers);
 			}
-			
+
 			auto recv_complete_time = std::chrono::steady_clock::now();
+			// Feed ConsumeOrdered stream for any globally ordered topic (includes SCALOG order=1).
+			if (order_level_ >= 1) {
+				absl::MutexLock lock(&conn_buffers->state_mutex);
+				const auto* chunk_begin = static_cast<uint8_t*>(write_ptr);
+				conn_buffers->ordered_stream_pending.insert(
+					conn_buffers->ordered_stream_pending.end(),
+					chunk_begin,
+					chunk_begin + static_cast<size_t>(bytes_received));
+			}
 			// 4. Advance write offset (BEFORE getting timestamp)
 			conn_buffers->advance_write_offset(bytes_received);
 			// 5. Record Timestamp and NEW Offset
@@ -1300,6 +1372,25 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 							latency_unique_message_count_.fetch_add(1, std::memory_order_relaxed);
 						}
 					}
+				}
+			}
+
+			// DKVS uses Consume()/ConsumeOrdered() as a streaming interface, so we
+			// must publish partial receive buffers before the 16MB socket buffer
+			// fills or the connection closes. Only swap when there is no pending
+			// ready buffer and the alternate buffer is idle.
+			{
+				absl::MutexLock lock(&conn_buffers->state_mutex);
+				const int write_idx = conn_buffers->current_write_idx.load(std::memory_order_acquire);
+				if (conn_buffers->buffers[write_idx].write_offset.load(std::memory_order_relaxed) > 0 &&
+				    !conn_buffers->write_buffer_ready_for_consumer.load(std::memory_order_acquire) &&
+				    !conn_buffers->read_buffer_in_use_by_consumer.load(std::memory_order_acquire)) {
+					const int next_write_idx = 1 - write_idx;
+					conn_buffers->write_buffer_ready_for_consumer.store(true, std::memory_order_release);
+					conn_buffers->current_write_idx.store(next_write_idx, std::memory_order_release);
+					conn_buffers->buffer_generation[next_write_idx] += 1;
+					conn_buffers->buffers[next_write_idx].write_offset.store(0, std::memory_order_relaxed);
+					consume_cv_.SignalAll();
 				}
 			}
 
@@ -1564,6 +1655,15 @@ void ConnectionBuffers::release_read_buffer(BufferState* acquired_buffer) {
 
 	absl::MutexLock lock(&state_mutex);
 	read_buffer_in_use_by_consumer.store(false, std::memory_order_release);
+	const int write_idx = current_write_idx.load(std::memory_order_acquire);
+	if (write_idx != released_idx &&
+	    !write_buffer_ready_for_consumer.load(std::memory_order_acquire) &&
+	    buffers[write_idx].write_offset.load(std::memory_order_relaxed) > 0) {
+		write_buffer_ready_for_consumer.store(true, std::memory_order_release);
+		current_write_idx.store(released_idx, std::memory_order_release);
+		buffer_generation[released_idx] += 1;
+		buffers[released_idx].write_offset.store(0, std::memory_order_relaxed);
+	}
 	VLOG(3) << "FD=" << fd << ": Consumer released read buffer " << released_idx;
 	// Notify the receiver thread *for this connection* that might be waiting to swap
 	receiver_can_write_cv.Signal();
@@ -1937,7 +2037,8 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
 // [[FIX: Multi-subscriber]] Uses per-instance state (next_expected_order_weak_, consume_acquired_*)
 // so multiple Subscriber instances or threads don't share one ordering state or buffer.
 void* Subscriber::Consume(int timeout_ms) {
-    if (order_level_ >= 2) {
+    // ORDER=0 stays on the legacy dual-buffer parser; SCALOG (1) shares ORDER>=2 batch stream.
+    if (order_level_ >= 1) {
         return ConsumeOrdered(timeout_ms);
     }
 
@@ -2107,13 +2208,15 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 				const auto* hdr = reinterpret_cast<const Embarcadero::BlogMessageHeader*>(
 					state.buffer.data() + pos);
 				const size_t payload_size = hdr->size;
-				if (!Embarcadero::wire::ValidateV2Payload(payload_size, buf_size - pos)) {
-					// Resync on invalid header
+				if (payload_size == 0 ||
+				    payload_size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+					// Clearly invalid header: attempt resync.
 					pos += 8;
 					continue;
 				}
 				const size_t stride = Embarcadero::wire::ComputeStrideV2(payload_size);
 				if (buf_size - pos < stride) {
+					// Valid header but incomplete frame: wait for more bytes.
 					break;
 				}
 
@@ -2127,7 +2230,13 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 				size_t total_order = msg_hdr->total_order;
 				state.next_message_order_in_batch = total_order + 1;
 				state.current_batch_messages_processed++;
-				pending_messages_.try_emplace(total_order, std::move(msg));
+				{
+					auto ins = pending_messages_.try_emplace(total_order, std::move(msg));
+					if (!ins.second) {
+						VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
+						        << " (keeping first)";
+					}
+				}
 
 				if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
 					state.has_pending_metadata = false;
@@ -2143,11 +2252,16 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 			const auto* hdr = reinterpret_cast<const Embarcadero::MessageHeader*>(
 				state.buffer.data() + pos);
 			const size_t padded_size = hdr->paddedSize;
-			if (!Embarcadero::wire::ValidateV1PaddedSize(padded_size, buf_size - pos)) {
+			const bool invalid_v1_header =
+				padded_size < Embarcadero::wire::V1_HEADER_SIZE ||
+				padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
+				(padded_size % 64 != 0);
+			if (invalid_v1_header) {
 				pos += 8;
 				continue;
 			}
 			if (buf_size - pos < padded_size) {
+				// Valid header but incomplete frame: wait for more bytes.
 				break;
 			}
 
@@ -2161,7 +2275,13 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 			size_t total_order = msg_hdr->total_order;
 			state.next_message_order_in_batch = total_order + 1;
 			state.current_batch_messages_processed++;
-			pending_messages_.try_emplace(total_order, std::move(msg));
+			{
+				auto ins = pending_messages_.try_emplace(total_order, std::move(msg));
+				if (!ins.second) {
+					VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
+					        << " (keeping first)";
+				}
+			}
 
 			if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
 				state.has_pending_metadata = false;
@@ -2175,20 +2295,22 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 	};
 
 	while (std::chrono::steady_clock::now() - start_time < timeout) {
-		// Pull any available buffers into per-connection stream buffers
+		// Pull any newly received bytes into per-connection stream buffers.
+		// ORDER>=2 consumers read from this stream path directly rather than
+		// depending on dual-buffer readiness heuristics.
 		{
 			absl::ReaderMutexLock map_lock(&connection_map_mutex_);
 			for (auto const& [fd, conn_ptr] : connections_) {
 				if (!conn_ptr) continue;
-				BufferState* buffer = conn_ptr->acquire_read_buffer();
-				if (!buffer) continue;
-				size_t buffer_write_offset = buffer->write_offset.load(std::memory_order_acquire);
-				if (buffer_write_offset > 0) {
-					auto& state = parse_states_[fd];
-					uint8_t* data = static_cast<uint8_t*>(buffer->buffer);
-					state.buffer.insert(state.buffer.end(), data, data + buffer_write_offset);
+				auto& state = parse_states_[fd];
+				absl::MutexLock lock(&conn_ptr->state_mutex);
+				if (!conn_ptr->ordered_stream_pending.empty()) {
+					state.buffer.insert(
+						state.buffer.end(),
+						conn_ptr->ordered_stream_pending.begin(),
+						conn_ptr->ordered_stream_pending.end());
+					conn_ptr->ordered_stream_pending.clear();
 				}
-				conn_ptr->release_read_buffer(buffer);
 			}
 		}
 
