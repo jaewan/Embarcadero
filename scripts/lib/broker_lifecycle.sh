@@ -414,6 +414,18 @@ broker_ready_file_count_local() {
   fi
 }
 
+
+broker_local_pid_is_listening() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  local listener_pids
+  listener_pids="$(broker_local_listener_pids || true)"
+  case " $listener_pids " in
+    *" $pid "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 broker_ready_file_count_remote() {
   local expected="$1"
   broker_remote_ssh bash -s -- "$BROKER_DATA_PORT_BASE" "$BROKER_HEARTBEAT_PORT" "$expected" <<'EOF'
@@ -842,7 +854,7 @@ broker_local_wait_for_cluster() {
     if [ "${#expected_pids[@]}" -gt 0 ]; then
       local pid missing_pid
       for pid in "${expected_pids[@]}"; do
-        if [ -f "/tmp/embarlet_${pid}_ready" ]; then
+        if [ -f "/tmp/embarlet_${pid}_ready" ] || broker_local_pid_is_listening "$pid"; then
           ready=$((ready + 1))
         else
           missing_pid="${missing_pid:-} ${pid}"

@@ -1177,6 +1177,18 @@ void NetworkManager::HandlePublishRequest(
 		if (seq_type == EMBARCADERO && tinode && tinode->order == 0) {
 			const uint64_t batch_end_addr = static_cast<uint64_t>(batch_header.log_idx + batch_header.total_size);
 			UpdateWrittenForOrder0(tinode, batch_end_addr, batch_header.num_msg);
+			// [[ORDER0_SUBSCRIBE_SLOW_PATH]] Populate the subscriber DRAM ring.
+			// PushOrder0Batch is only called in the fast path (order0_fast=true).
+			// The PBR slow path — used when ACK=2 && RF>0 — was missing this call,
+			// causing ReadOrder0Batch() to always return false and subscribers to
+			// receive 0 bytes for ORDER=0 RF=2.  Call unconditionally here: the ring
+			// is lock-free, and the subscriber export loop has no replication gate
+			// (matching the fast-path semantic where delivery precedes ACK).
+			if (topic_ptr) {
+				topic_ptr->PushOrder0Batch(batch_header.log_idx,
+				                           batch_header.total_size,
+				                           batch_header.num_msg);
+			}
 		}
 		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for other orders
 		} else if (batch_header_location == nullptr && seq_type == EMBARCADERO) {
