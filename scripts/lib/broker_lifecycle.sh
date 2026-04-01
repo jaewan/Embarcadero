@@ -103,21 +103,65 @@ broker_remote_corfu_start() {
   host="$(broker_remote_corfu_sequencer_host)"
   [ -n "$host" ] || return 0
   local bin="${REMOTE_CORFU_BUILD_BIN:-$REMOTE_BUILD_BIN}"
+  local seq_port="${EMBARCADERO_CORFU_SEQ_PORT:-50055}"
   [ -n "$bin" ] || return 1
   echo "Remote Corfu sequencer: starting on $host (cd $bin)"
-  ssh -o BatchMode=yes "$host" bash -s -- "$bin" <<'EOF'
+  ssh -o BatchMode=yes "$host" bash -s -- "$bin" "$seq_port" <<'EOF'
 set -euo pipefail
 build_bin=$1
+seq_port=$2
 cd "$build_bin"
+if [ ! -x ./corfu_global_sequencer ]; then
+  echo "Missing corfu_global_sequencer in $build_bin" >&2
+  exit 1
+fi
 for pid in $(pgrep -f "corfu_global_sequencer" 2>/dev/null || true); do
   kill "$pid" 2>/dev/null || true
 done
-sleep 0.3
+for _ in $(seq 1 50); do
+  if ! pgrep -f "corfu_global_sequencer" >/dev/null 2>&1 && \
+     ! ss -H -ltn "sport = :$seq_port" 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 0.1
+done
 for pid in $(pgrep -f "corfu_global_sequencer" 2>/dev/null || true); do
   kill -9 "$pid" 2>/dev/null || true
 done
+for _ in $(seq 1 50); do
+  if ! pgrep -f "corfu_global_sequencer" >/dev/null 2>&1 && \
+     ! ss -H -ltn "sport = :$seq_port" 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 0.1
+done
+: >/tmp/corfu_sequencer.log
+printf '=== corfu start %s ===\n' "$(date -u +%Y%m%dT%H%M%SZ)" >>/tmp/corfu_sequencer.log
 nohup ./corfu_global_sequencer >>/tmp/corfu_sequencer.log 2>&1 &
-printf '%s\n' "$!" >/tmp/corfu_global_sequencer.pid
+pid=$!
+printf '%s\n' "$pid" >/tmp/corfu_global_sequencer.pid
+for _ in $(seq 1 100); do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "Remote Corfu sequencer exited before bind" >&2
+    tail -n 80 /tmp/corfu_sequencer.log >&2 || true
+    exit 1
+  fi
+  if ss -H -ltn "sport = :$seq_port" 2>/dev/null | grep -q .; then
+    for _ in $(seq 1 20); do
+      if kill -0 "$pid" 2>/dev/null; then
+        exit 0
+      fi
+      sleep 0.1
+    done
+    echo "Remote Corfu sequencer bound port but did not stay alive" >&2
+    tail -n 80 /tmp/corfu_sequencer.log >&2 || true
+    exit 1
+  fi
+  sleep 0.1
+done
+echo "Remote Corfu sequencer failed to bind port $seq_port" >&2
+tail -n 80 /tmp/corfu_sequencer.log >&2 || true
+exit 1
 EOF
 }
 
@@ -143,7 +187,7 @@ broker_remote_lazylog_start() {
   [ -n "$host" ] || return 0
   local bin="${REMOTE_LAZYLOG_BUILD_BIN:-$REMOTE_BUILD_BIN}"
   local seq_ip="${EMBARCADERO_LAZYLOG_SEQ_IP:-}"
-  local seq_port="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}"
+  local seq_port="${EMBARCADERO_LAZYLOG_SEQ_PORT:-50061}"
   local num_brokers="${EMBARCADERO_NUM_BROKERS:-}"
   [ -n "$bin" ] || return 1
   echo "Remote LazyLog sequencer: starting on $host (cd $bin)"
@@ -151,27 +195,67 @@ broker_remote_lazylog_start() {
 set -euo pipefail
 build_bin=$1
 seq_ip=${2:-}
-seq_port=${3:-}
+seq_port=${3:-50061}
 num_brokers=${4:-}
 cd "$build_bin"
+if [ ! -x ./lazylog_global_sequencer ]; then
+  echo "Missing lazylog_global_sequencer in $build_bin" >&2
+  exit 1
+fi
 for pid in $(pgrep -f "lazylog_global_sequencer" 2>/dev/null || true); do
   kill "$pid" 2>/dev/null || true
 done
-sleep 0.3
+for _ in $(seq 1 50); do
+  if ! pgrep -f "lazylog_global_sequencer" >/dev/null 2>&1 && \
+     ! ss -H -ltn "sport = :$seq_port" 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 0.1
+done
 for pid in $(pgrep -f "lazylog_global_sequencer" 2>/dev/null || true); do
   kill -9 "$pid" 2>/dev/null || true
+done
+for _ in $(seq 1 50); do
+  if ! pgrep -f "lazylog_global_sequencer" >/dev/null 2>&1 && \
+     ! ss -H -ltn "sport = :$seq_port" 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 0.1
 done
 if [ -n "$seq_ip" ]; then
   export EMBARCADERO_LAZYLOG_SEQ_IP="$seq_ip"
 fi
-if [ -n "$seq_port" ]; then
-  export EMBARCADERO_LAZYLOG_SEQ_PORT="$seq_port"
-fi
+export EMBARCADERO_LAZYLOG_SEQ_PORT="${seq_port:-50061}"
 if [ -n "$num_brokers" ]; then
   export EMBARCADERO_NUM_BROKERS="$num_brokers"
 fi
+: >/tmp/lazylog_sequencer.log
+printf '=== lazylog start %s ===\n' "$(date -u +%Y%m%dT%H%M%SZ)" >>/tmp/lazylog_sequencer.log
 nohup ./lazylog_global_sequencer >>/tmp/lazylog_sequencer.log 2>&1 &
-printf '%s\n' "$!" >/tmp/lazylog_global_sequencer.pid
+pid=$!
+printf '%s\n' "$pid" >/tmp/lazylog_global_sequencer.pid
+for _ in $(seq 1 100); do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "Remote LazyLog sequencer exited before bind" >&2
+    tail -n 80 /tmp/lazylog_sequencer.log >&2 || true
+    exit 1
+  fi
+  if ss -H -ltn "sport = :$seq_port" 2>/dev/null | grep -q .; then
+    for _ in $(seq 1 20); do
+      if kill -0 "$pid" 2>/dev/null; then
+        exit 0
+      fi
+      sleep 0.1
+    done
+    echo "Remote LazyLog sequencer bound port but did not stay alive" >&2
+    tail -n 80 /tmp/lazylog_sequencer.log >&2 || true
+    exit 1
+  fi
+  sleep 0.1
+done
+echo "Remote LazyLog sequencer failed to bind port $seq_port" >&2
+tail -n 80 /tmp/lazylog_sequencer.log >&2 || true
+exit 1
 EOF
 }
 
