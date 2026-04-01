@@ -69,6 +69,39 @@ For publication throughput reruns, keep the contract explicit:
 
 The appendable matrix wrapper [run_throughput_matrix.sh](/home/domin/Embarcadero/scripts/publication/run_throughput_matrix.sh) now derives that default automatically unless `ACK_LEVEL` is set explicitly. If you want an RF=2 run with `ACK_LEVEL=1`, set `ACK_LEVEL=1` yourself; do not rely on the default.
 
+### Publication matrix runner
+
+Use [run_throughput_matrix.sh](/home/domin/Embarcadero/scripts/publication/run_throughput_matrix.sh) to reproduce the current publication throughput package.
+
+The wrapper now encodes the intended publication contracts:
+
+- `embarcadero0`: mixed local+remote client layout, `THREADS_PER_BROKER=4`, `RF=1`
+- `embarcadero5`: publication-safe remote-only layout, `THREADS_PER_BROKER=1`, `RF=1`
+- `corfu`, `lazylog`, `scalog`: mixed local+remote client layout, `THREADS_PER_BROKER=4`, `RF=1 2`
+- `NUM_CLIENTS=1 2 3` by default for every enabled system group
+- sequencer host defaults:
+  - `REMOTE_SEQ_HOST=c2`
+  - `REMOTE_SEQ_IP=10.10.10.144`
+  - `REMOTE_CORFU_SEQ_PORT=50052`
+  - `REMOTE_LAZYLOG_SEQ_PORT=50061`
+  - `REMOTE_SCALOG_SEQ_PORT=50051`
+
+Default invocation:
+
+```bash
+NUM_TRIALS=3 \
+TAG=publication_matrix_current \
+bash scripts/publication/run_throughput_matrix.sh
+```
+
+Useful overrides:
+
+- `MATRIX_SYSTEMS="corfu lazylog scalog"` to run only the baseline systems
+- `BASELINE_RF_VALUES="2"` to run only `rf2` baseline rows
+- `EMBARCADERO_RF_VALUES="1"` and `EMBARCADERO_ORDER5_RF_VALUES="1"` to keep the current Embarcadero publication contracts explicit
+- `SKIP_EXISTING_CELLS=1` to resume an appendable tag without rerunning completed cells
+- `NUM_TRIALS=1` to do a fast first-pass sweep before backfilling to `3` trials
+
 ## Throughput Script
 
 ### `scripts/singlenode_run_throughput.sh`
