@@ -437,7 +437,12 @@ void Topic::Start() {
 				break;
 			case CORFU:
 				if (order_ == Embarcadero::kOrderTotal) {
-					VLOG(3) << "Corfu running in canonical ORDER=2 mode.";
+					LOG(INFO) << "Creating Sequencer2 thread for Corfu ORDER=2";
+					if (replication_factor_ > 0) {
+						goi_recovery_thread_ = std::thread(&Topic::GOIRecoveryThread, this);
+						LOG(INFO) << "Started GOIRecoveryThread for topic " << topic_name_;
+					}
+					sequencerThread_ = std::thread(&Topic::Sequencer2, this);
 				} else {
 					LOG(ERROR) << "Corfu supports only ORDER=2 in this implementation (got ORDER="
 					           << order_ << ")";
@@ -454,14 +459,16 @@ void Topic::StartScalogLocalSequencer() {
 	// int unique_port = SCALOG_SEQ_PORT + scalog_local_sequencer_port_offset_.fetch_add(1);
 	BatchHeader* batch_header = reinterpret_cast<BatchHeader*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
-	Scalog::ScalogLocalSequencer scalog_local_sequencer(tinode_, broker_id_, cxl_addr_, topic_name_, batch_header);
+	Scalog::ScalogLocalSequencer scalog_local_sequencer(
+		tinode_, broker_id_, cxl_addr_, topic_name_, batch_header, this);
 	scalog_local_sequencer.SendLocalCut(topic_name_, stop_threads_volatile_);
 }
 
 void Topic::StartLazyLogLocalSequencer() {
 	BatchHeader* batch_header = reinterpret_cast<BatchHeader*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
-	LazyLog::LazyLogLocalSequencer lazylog_local_sequencer(tinode_, broker_id_, cxl_addr_, topic_name_, batch_header);
+	LazyLog::LazyLogLocalSequencer lazylog_local_sequencer(
+		tinode_, broker_id_, cxl_addr_, topic_name_, batch_header, this);
 	lazylog_local_sequencer.SendLocalProgress(topic_name_, stop_threads_volatile_);
 }
 
@@ -1365,9 +1372,28 @@ void Topic::RecordCorfuOrder2DurableCompletion(uint64_t batch_seq, uint32_t num_
 	}
 }
 
+void Topic::UpdatePerClientWritten(uint32_t client_id, uint64_t count) {
+	absl::MutexLock lock(&per_client_mu_);
+	per_client_written_[client_id] += count;
+}
+
+void Topic::RecordPerClientOrderedVisibility(uint32_t client_id, uint64_t count) {
+	UpdatePerClientOrdered(client_id, count);
+}
+
+void Topic::RecordPerClientDurableVisibility(uint32_t client_id, uint64_t count) {
+	UpdatePerClientDurable(client_id, count);
+}
+
 void Topic::UpdatePerClientOrdered(uint32_t client_id, uint64_t count) {
 	absl::MutexLock lock(&per_client_mu_);
 	per_client_ordered_[client_id] += count;
+}
+
+uint64_t Topic::GetClientWritten(uint32_t client_id) const {
+	absl::MutexLock lock(&per_client_mu_);
+	auto it = per_client_written_.find(client_id);
+	return (it != per_client_written_.end()) ? it->second : 0;
 }
 
 uint64_t Topic::GetClientOrdered(uint32_t client_id) const {
@@ -1386,6 +1412,7 @@ bool Topic::SupportsPerClientAckLevel1() const {
 	// ACK level 1 is "ordered frontier" semantics.
 	// We currently maintain per-client ordered frontier in:
 	// - CORFU ORDER=2 via RecordCorfuOrder2BatchCompletion
+	// - LAZYLOG ORDER=2 and SCALOG ORDER=1 via local sequencer export publication
 	// - EMBARCADERO ORDER=4 via AssignOrder
 	//
 	// ORDER=5 is different: ordered frontiers are advanced from shared CXL state across broker
@@ -1396,19 +1423,38 @@ bool Topic::SupportsPerClientAckLevel1() const {
 	if (seq_type_ == CORFU) {
 		return order_ == Embarcadero::kOrderTotal;
 	}
+	if (seq_type_ == LAZYLOG) {
+		return order_ == Embarcadero::kOrderTotal;
+	}
+	if (seq_type_ == SCALOG) {
+		return order_ == Embarcadero::kOrderPerBroker;
+	}
 	if (seq_type_ == EMBARCADERO) {
 		return order_ == Embarcadero::kOrderPerBroker;
 	}
 	return false;
 }
 
+bool Topic::SupportsPerClientWrittenAckLevel1() const {
+	return seq_type_ == EMBARCADERO &&
+	       order_ == 0;
+}
+
 bool Topic::SupportsPerClientAckLevel2Durable() const {
-	// Durability attribution is currently explicit in CORFU path where replication callback
-	// advances per-client durable frontier only after replication_done writes are committed.
-	return seq_type_ == CORFU &&
-	       order_ == Embarcadero::kOrderTotal &&
-	       replication_factor_ > 0 &&
-	       corfu_replication_client_ != nullptr;
+	if (seq_type_ == CORFU) {
+		return order_ == Embarcadero::kOrderTotal &&
+		       replication_factor_ > 0 &&
+		       corfu_replication_client_ != nullptr;
+	}
+	if (seq_type_ == LAZYLOG) {
+		return order_ == Embarcadero::kOrderTotal &&
+		       replication_factor_ > 0;
+	}
+	if (seq_type_ == SCALOG) {
+		return order_ == Embarcadero::kOrderPerBroker &&
+		       replication_factor_ > 0;
+	}
+	return false;
 }
 
 void Topic::UpdatePerClientDurable(uint32_t client_id, uint64_t count) {
@@ -4064,7 +4110,7 @@ void Topic::CommitEpoch(
 		ordered_increment[b] += m.num_msg;
 		last_ordered_offset[b] = m.log_idx;
 		ordered_broker_seen[b] = true;
-		per_client_delta_epoch[static_cast<uint32_t>(p.client_id)] += m.num_msg;
+		per_client_delta_epoch[static_cast<uint32_t>(m.client_id)] += m.num_msg;
 		{
 			OrderedHoldExportEntry ex;
 				ex.log_idx = m.log_idx;
@@ -4247,15 +4293,19 @@ void Topic::EpochSequencerThread() {
 		          << ",ordered=" << tinode_->offsets[3].ordered << ")";
 	};
 	uint64_t last_idle_diag_ns = 0;
-	uint64_t idle_stall_start_ns = 0;
-	uint64_t last_idle_progress_epoch = last_sequenced_epoch_.load(std::memory_order_acquire);
+	// last_idle_progress_epoch removed: epoch advancement is not real progress
 	std::array<uint64_t, NUM_MAX_BROKERS> last_idle_scanner_pushed_batches{};
 	std::array<uint64_t, NUM_MAX_BROKERS> last_idle_sequencer_committed_batches{};
+	std::array<uint64_t, NUM_MAX_BROKERS> last_idle_progress_ns{};
 	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
 		last_idle_scanner_pushed_batches[b] =
 			scanner_pushed_batches_[b].load(std::memory_order_relaxed);
 		last_idle_sequencer_committed_batches[b] =
 			sequencer_committed_batches_[b].load(std::memory_order_relaxed);
+		if (last_idle_scanner_pushed_batches[b] != 0 ||
+		    last_idle_sequencer_committed_batches[b] != 0) {
+			last_idle_progress_ns[b] = SteadyNowNs();
+		}
 	}
 	auto run_idle_hold_tick = [&]() {
 		if (!Embarcadero::UsesEpochSequencerPath(order_) || seq_type_ != EMBARCADERO) return;
@@ -4272,12 +4322,12 @@ void Topic::EpochSequencerThread() {
 		}
 		const bool has_held_work = (hold_before > 0 || deferred_before > 0);
 		bool observed_progress = false;
-		const uint64_t current_last_sequenced_epoch =
-			last_sequenced_epoch_.load(std::memory_order_acquire);
-		if (current_last_sequenced_epoch != last_idle_progress_epoch) {
-			observed_progress = true;
-			last_idle_progress_epoch = current_last_sequenced_epoch;
-		}
+		bool has_active_stalled_broker = false;
+		uint64_t longest_stall_ns = 0;
+		// NOTE: Do NOT count last_sequenced_epoch_ advancement as progress.
+		// The epoch driver seals empty epochs every 500µs, so epoch advancement
+		// is not evidence of data flow. Only scanner pushes and sequencer commits
+		// indicate real progress; otherwise the idle stall timer never fires.
 		for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
 			const uint64_t pushed = scanner_pushed_batches_[b].load(std::memory_order_relaxed);
 			const uint64_t committed =
@@ -4285,22 +4335,27 @@ void Topic::EpochSequencerThread() {
 			if (pushed != last_idle_scanner_pushed_batches[b] ||
 			    committed != last_idle_sequencer_committed_batches[b]) {
 				observed_progress = true;
+				last_idle_progress_ns[b] = now_ns;
+			}
+			const bool broker_active = (pushed != 0 || committed != 0);
+			if (broker_active && last_idle_progress_ns[b] == 0) {
+				last_idle_progress_ns[b] = now_ns;
+			}
+			if (has_held_work && broker_active && last_idle_progress_ns[b] != 0) {
+				const uint64_t stalled_ns = now_ns - last_idle_progress_ns[b];
+				if (stalled_ns > longest_stall_ns) {
+					longest_stall_ns = stalled_ns;
+				}
+				if (stalled_ns >= GetOrder5IdleForceExpireTriggerNs(replication_factor_ > 0)) {
+					has_active_stalled_broker = true;
+				}
 			}
 			last_idle_scanner_pushed_batches[b] = pushed;
 			last_idle_sequencer_committed_batches[b] = committed;
 		}
-		if (has_held_work) {
-			if (observed_progress || idle_stall_start_ns == 0) {
-				idle_stall_start_ns = now_ns;
-			}
-			const uint64_t idle_stall_age_ns = now_ns - idle_stall_start_ns;
-			if (!force_expire_active &&
-			    idle_stall_age_ns >= GetOrder5IdleForceExpireTriggerNs(replication_factor_ > 0)) {
-				ArmOrder5ForceExpiryWindow(
-					GetOrder5IdleForceExpireWindowNs(replication_factor_ > 0));
-			}
-		} else {
-			idle_stall_start_ns = 0;
+		if (has_held_work && !force_expire_active && has_active_stalled_broker) {
+			ArmOrder5ForceExpiryWindow(
+				GetOrder5IdleForceExpireWindowNs(replication_factor_ > 0));
 		}
 		if (has_held_work &&
 		    (now_ns - last_idle_diag_ns) > 5'000'000'000ULL) {
@@ -4311,6 +4366,8 @@ void Topic::EpochSequencerThread() {
 			           << " deferred=" << deferred_before
 			           << " force_expire=" << (force_expire_active ? 1 : 0)
 			           << " progress=" << (observed_progress ? 1 : 0)
+			           << " stalled_broker=" << (has_active_stalled_broker ? 1 : 0)
+			           << " longest_stall_ms=" << (longest_stall_ns / 1'000'000.0)
 			           << " epoch_idx=" << epoch_index_.load(std::memory_order_relaxed)
 			           << " last_seq=" << last_sequenced_epoch_.load(std::memory_order_relaxed);
 			for (int b = 0; b < 4; ++b) {
@@ -4999,6 +5056,10 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	shard.cv_logical_only_pbr_index.clear();
 	std::array<uint64_t, NUM_MAX_BROKERS> shard_cv_max_cumulative{};
 	std::array<uint64_t, NUM_MAX_BROKERS> shard_cv_max_pbr_index{};
+	// ORDER=5 ACK1 on the head broker is per-client. Some true-client-chain recovery paths
+	// terminalize a late batch without re-emitting it; those batches still need to count
+	// toward the per-client ACK frontier or broker 0 can remain permanently short.
+	absl::flat_hash_map<uint32_t, uint64_t> per_client_terminalized_delta_epoch;
 
 	// [[SKIP_MARKER_FILTER]] Extract scanner timeout markers before sorting/grouping.
 	// Anonymous skips advance only consumed_through. Targeted skips (client_id/batch_seq known
@@ -5098,11 +5159,15 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						}
 					} else if (seq < state.next_expected) {
 						state.mark_sequenced(seq);
-						accumulate_logical_only(
-							p->broker_id, p->cached_start_logical_offset, p->num_msg,
-							p->cached_pbr_absolute_index);
-						record_late_drop(first_client);
-						CheckAndInsertBatchId(shard, p->cached_batch_id);
+						const bool duplicate = CheckAndInsertBatchId(shard, p->cached_batch_id);
+						if (!duplicate) {
+							accumulate_logical_only(
+								p->broker_id, p->cached_start_logical_offset, p->num_msg,
+								p->cached_pbr_absolute_index);
+							record_late_drop(first_client);
+							per_client_terminalized_delta_epoch[static_cast<uint32_t>(first_client)] +=
+								p->num_msg;
+						}
 					} else {
 						if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
 							std::this_thread::sleep_for(std::chrono::microseconds(10));
@@ -5315,11 +5380,15 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					}
 				} else if (seq < state.next_expected) {
 					state.mark_sequenced(seq);
-					accumulate_logical_only(
-						jt->broker_id, jt->cached_start_logical_offset, jt->num_msg,
-						jt->cached_pbr_absolute_index);
-					record_late_drop(client_id);
-					CheckAndInsertBatchId(shard, jt->cached_batch_id);
+					const bool duplicate = CheckAndInsertBatchId(shard, jt->cached_batch_id);
+					if (!duplicate) {
+						accumulate_logical_only(
+							jt->broker_id, jt->cached_start_logical_offset, jt->num_msg,
+							jt->cached_pbr_absolute_index);
+						record_late_drop(client_id);
+						per_client_terminalized_delta_epoch[static_cast<uint32_t>(client_id)] +=
+							jt->num_msg;
+					}
 				} else {
 					if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
 						std::this_thread::sleep_for(std::chrono::microseconds(10));
@@ -5624,15 +5693,22 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			if (ent.seq >= state.next_expected)
 				state.next_expected = ent.seq + 1;
 			if (true_client_chain) {
-				accumulate_logical_only(
-					ent.batch.broker_id,
-					ent.meta.start_logical_offset,
-					ent.meta.num_msg,
-					ent.meta.pbr_absolute_index);
-				CheckAndInsertBatchId(shard, ent.meta.batch_id);
-				record_late_drop(ent.client_id);
-				VLOG(1) << "[L5_EXPIRED_LATE_DROP] B" << ent.batch.broker_id
-				        << " seq=" << ent.seq;
+				const bool duplicate = CheckAndInsertBatchId(shard, ent.meta.batch_id);
+				if (!duplicate) {
+					accumulate_logical_only(
+						ent.batch.broker_id,
+						ent.meta.start_logical_offset,
+						ent.meta.num_msg,
+						ent.meta.pbr_absolute_index);
+					record_late_drop(ent.client_id);
+					per_client_terminalized_delta_epoch[static_cast<uint32_t>(ent.client_id)] +=
+						ent.meta.num_msg;
+					VLOG(1) << "[L5_EXPIRED_LATE_DROP] B" << ent.batch.broker_id
+					        << " seq=" << ent.seq;
+				} else {
+					VLOG(1) << "[L5_EXPIRED_SKIP_DUP] B" << ent.batch.broker_id
+					        << " seq=" << ent.seq;
+				}
 			} else if (!CheckAndInsertBatchId(shard, ent.meta.batch_id)) {
 				PendingBatch5 b = std::move(ent.batch);
 				b.from_hold = true;
@@ -5713,6 +5789,13 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			shard.clients_with_held_batches.erase(*to_erase);
 		} else {
 			++sit;
+		}
+	}
+
+	if (!per_client_terminalized_delta_epoch.empty()) {
+		absl::MutexLock lock(&per_client_mu_);
+		for (auto& [cid, cnt] : per_client_terminalized_delta_epoch) {
+			per_client_ordered_[cid] += cnt;
 		}
 	}
 

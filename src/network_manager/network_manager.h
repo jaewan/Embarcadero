@@ -21,6 +21,7 @@ namespace Embarcadero {
 
 class CXLManager;
 class DiskManager;
+class Topic;
 class TopicManager;
 
 enum ClientRequestType {Publish, Subscribe};
@@ -104,7 +105,7 @@ private:
     bool IsConnectionAlive(int fd, char* buffer);
 
     // [[PERF]] Order 0 ACK cursor owner: network ingest path updates cumulative message count.
-    void UpdateWrittenForOrder0(TInode* tinode, uint64_t written_addr, uint32_t num_msg);
+    void UpdateWrittenForOrder0(TInode* tinode, Topic* topic, uint32_t client_id, uint64_t written_addr, uint32_t num_msg);
 
     // Thread-safe queues
     folly::MPMCQueue<std::optional<struct NetworkRequest>> request_queue_;

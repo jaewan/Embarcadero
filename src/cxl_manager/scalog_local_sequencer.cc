@@ -1,19 +1,36 @@
 #include "scalog_local_sequencer.h"
 #include "cxl_manager.h"
+#include "../embarlet/topic.h"
 #include <cstdlib>
 #include <limits>
 
 namespace Scalog {
 
+namespace {
+
+constexpr uint64_t kReplicationNotStarted = std::numeric_limits<uint64_t>::max();
+
+int ResolveNumBrokers() {
+	const char* env = std::getenv("EMBARCADERO_NUM_BROKERS");
+	if (env && env[0] != '\0') {
+		const int parsed = std::atoi(env);
+		if (parsed > 0) return parsed;
+	}
+	return NUM_MAX_BROKERS_CONFIG;
+}
+
+}  // namespace
+
 //TODO (tony) priority 2 (failure test)  make the scalog code failure prone.
 //Current logic proceeds epoch with all brokers at the same pace.
 //If a broker fails, the entire cluster is stuck. If a failure is detected from the heartbeat, GetRegisteredBroker will return the alive brokers
 //after heartbeat_interval (failure is detected), if there is a change in the cluster, only proceed with the brokers
-ScalogLocalSequencer::ScalogLocalSequencer(TInode* tinode, int broker_id, void* cxl_addr, std::string topic_str, BatchHeader *batch_header) :
+ScalogLocalSequencer::ScalogLocalSequencer(TInode* tinode, int broker_id, void* cxl_addr, std::string topic_str, BatchHeader *batch_header, Embarcadero::Topic* topic) :
 	tinode_(tinode),
 	broker_id_(broker_id),
 	cxl_addr_(cxl_addr),
-	batch_header_(batch_header){
+	batch_header_(batch_header),
+	topic_(topic){
 	if (const char* override_ip = std::getenv("SCALOG_SEQUENCER_IP_OVERRIDE");
 	    override_ip && override_ip[0] != '\0') {
 		scalog_global_sequencer_ip_ = override_ip;
@@ -138,6 +155,7 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str, volatile bool& st
 
 		// Sleep until interval passes to send next local cut
 		std::this_thread::sleep_for(std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL));
+		DrainDurableBatches();
 	}
 
 	stream->WritesDone();
@@ -148,6 +166,60 @@ void ScalogLocalSequencer::SendLocalCut(std::string topic_str, volatile bool& st
 	if (broker_id_ == 0) {
 		LOG(INFO) << "Scalog Terminating global sequencer";
 		TerminateGlobalSequencer();
+	}
+}
+
+void ScalogLocalSequencer::EnqueueDurableBatch(
+		uint64_t end_logical_count,
+		const absl::flat_hash_map<uint32_t, uint64_t>& per_client_delta) {
+	if (topic_ == nullptr || tinode_->replication_factor <= 0 || per_client_delta.empty()) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(durable_mu_);
+	durable_pending_.push_back(DurableBatch{end_logical_count, per_client_delta});
+}
+
+void ScalogLocalSequencer::DrainDurableBatches() {
+	if (topic_ == nullptr || tinode_->replication_factor <= 0) {
+		return;
+	}
+
+	const int num_brokers = ResolveNumBrokers();
+	const int rf = tinode_->replication_factor;
+	uint64_t min_rep = std::numeric_limits<uint64_t>::max();
+	int ready_replicas = 0;
+	for (int i = 0; i < rf; ++i) {
+		const int b = Embarcadero::GetReplicationSetBroker(broker_id_, rf, num_brokers, i);
+		volatile uint64_t* rep_done_ptr = &tinode_->offsets[b].replication_done[broker_id_];
+		Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(rep_done_ptr)));
+		Embarcadero::CXL::load_fence();
+		const uint64_t val = *rep_done_ptr;
+		if (val == kReplicationNotStarted) {
+			continue;
+		}
+		ready_replicas++;
+		if (val < min_rep) min_rep = val;
+	}
+	if (ready_replicas < rf || min_rep == kReplicationNotStarted) {
+		return;
+	}
+
+	const uint64_t durable_frontier = min_rep + 1;
+	std::vector<DurableBatch> ready;
+	{
+		std::lock_guard<std::mutex> lock(durable_mu_);
+		while (!durable_pending_.empty() &&
+		       durable_pending_.front().end_logical_count <= durable_frontier) {
+			ready.push_back(std::move(durable_pending_.front()));
+			durable_pending_.pop_front();
+		}
+	}
+
+	for (const auto& batch : ready) {
+		for (const auto& [client_id, count] : batch.per_client_delta) {
+			topic_->RecordPerClientDurableVisibility(client_id, count);
+		}
 	}
 }
 
@@ -217,6 +289,7 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 	size_t batch_start_logical_offset = 0;
 	void* start_addr = static_cast<void*>(msg_to_order_);
 	bool local_progress = false;
+	absl::flat_hash_map<uint32_t, uint64_t> batch_per_client_delta;
 
 	// [[CORRECTNESS_FIX]] Track the last ordered values locally. We only publish
 	// tinode_->offsets[].ordered AFTER the batch header export slot is written, so
@@ -225,7 +298,8 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 	size_t last_ordered_offset = 0;
 
 	auto publish_batch = [&](void* batch_start_addr, size_t publish_size,
-	                         uint32_t num_msg, size_t start_logical_offset) {
+	                         uint32_t num_msg, size_t start_logical_offset,
+	                         const absl::flat_hash_map<uint32_t, uint64_t>& per_client_delta) {
 		if (publish_size == 0 || batch_start_addr == nullptr) {
 			return;
 		}
@@ -251,6 +325,13 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 		Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
 			reinterpret_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered_offset)));
 		Embarcadero::CXL::store_fence();
+		if (topic_ != nullptr) {
+			for (const auto& [client_id, count] : per_client_delta) {
+				topic_->RecordPerClientOrderedVisibility(client_id, count);
+			}
+		}
+		EnqueueDurableBatch(last_ordered_count, per_client_delta);
+		DrainDurableBatches();
 	};
 	for(auto &cut : global_cut_delta){
 		if(cut.first == broker_id_){
@@ -261,6 +342,7 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 				}
 				total_size += msg_to_order_->paddedSize;
 				batch_num_msg++;
+				batch_per_client_delta[static_cast<uint32_t>(msg_to_order_->client_id)]++;
 				msg_to_order_->total_order = seq_;
 				std::atomic_thread_fence(std::memory_order_release);
 
@@ -273,10 +355,12 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 					static_cast<uint8_t*>(static_cast<void*>(msg_to_order_)) + msg_to_order_->next_msg_diff);
 				seq_++;
 				if(total_size >= BATCH_SIZE){
-					publish_batch(start_addr, total_size, batch_num_msg, batch_start_logical_offset);
+					publish_batch(start_addr, total_size, batch_num_msg, batch_start_logical_offset,
+					             batch_per_client_delta);
 					start_addr = static_cast<void*>(msg_to_order_);
 					total_size = 0;
 					batch_num_msg = 0;
+					batch_per_client_delta.clear();
 				}
 			}
 		}else{
@@ -284,7 +368,8 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 		}
 	}
 	if (local_progress && total_size > 0) {
-		publish_batch(start_addr, total_size, batch_num_msg, batch_start_logical_offset);
+		publish_batch(start_addr, total_size, batch_num_msg, batch_start_logical_offset,
+		             batch_per_client_delta);
 	}
 
 	if (!global_cut_delta.empty()) {

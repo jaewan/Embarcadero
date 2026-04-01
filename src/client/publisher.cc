@@ -1024,8 +1024,32 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	const auto queue_spin_duration = low_payload_poll_mode
 		? std::chrono::microseconds(100)
 		: std::chrono::milliseconds(1);
+	const auto queue_wait_start = std::chrono::steady_clock::now();
+	auto last_queue_log_time = queue_wait_start;
 	uint32_t queue_wait_loops = 0;
 	while (client_order_.load(std::memory_order_acquire) < n) {
+		auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_queue_log_time).count() >= 1) {
+			std::string per_broker;
+			for (size_t i = 0; i < broker_stats_.size(); i++) {
+				if (i) per_broker += " ";
+				per_broker += "B" + std::to_string(i)
+					+ "(sent=" + std::to_string(broker_stats_[i].sent_messages.load(std::memory_order_relaxed))
+					+ ",acked=" + std::to_string(broker_stats_[i].acked_messages.load(std::memory_order_relaxed))
+					+ ")";
+			}
+			LOG(WARNING) << "[Publisher Queue Drain Wait] client_order="
+			             << client_order_.load(std::memory_order_relaxed)
+			             << " target=" << n
+			             << " total_batches_sent=" << total_batches_sent_.load(std::memory_order_relaxed)
+			             << " total_messages_sent=" << total_messages_sent_.load(std::memory_order_relaxed)
+			             << " total_batches_attempted=" << total_batches_attempted_.load(std::memory_order_relaxed)
+			             << " total_batches_failed=" << total_batches_failed_.load(std::memory_order_relaxed)
+			             << " elapsed_s="
+			             << std::chrono::duration_cast<std::chrono::seconds>(now - queue_wait_start).count()
+			             << " [" << per_broker << "]";
+			last_queue_log_time = now;
+		}
 		auto spin_start = std::chrono::steady_clock::now();
 		const auto spin_end = spin_start + queue_spin_duration;
 		while (std::chrono::steady_clock::now() < spin_end && client_order_.load(std::memory_order_acquire) < n) {
@@ -1161,6 +1185,27 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	}
 		// Only treat as success if we actually received ACKs for all messages
 		const size_t received = ack_received_.load(std::memory_order_relaxed);
+			if (received > target_acks) {
+				LOG(ERROR) << "[Publisher ACK Failure]: Received ACKs beyond target. received="
+				           << received << " target=" << target_acks
+				           << " excess=" << (received - target_acks)
+				           << " (ACK attribution is not per-client correct)";
+				std::string per_broker;
+				for (size_t i = 0; i < broker_stats_.size(); i++) {
+					size_t sent = broker_stats_[i].sent_messages.load(std::memory_order_relaxed);
+					size_t acked = broker_stats_[i].acked_messages.load(std::memory_order_relaxed);
+					if (i) per_broker += " ";
+					per_broker += "B" + std::to_string(i) + "=" + std::to_string(acked);
+					if (sent != 0 || acked != 0) {
+						per_broker += "(sent=" + std::to_string(sent);
+						if (acked > sent) per_broker += ",excess=" + std::to_string(acked - sent);
+						else if (sent > acked) per_broker += ",short=" + std::to_string(sent - acked);
+						per_broker += ")";
+					}
+				}
+				LOG(ERROR) << "[Publisher ACK Per-Broker]: " << per_broker;
+				return false;
+			}
 			if (received < target_acks) {
 				if (kill_brokers_) {
 					LOG(INFO) << "[Publisher ACK]: Allowed shortfall due to killed brokers. received=" << received << " target=" << target_acks;
@@ -1954,8 +1999,9 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			// Handle sequencer-specific batch header processing
 				if (seq_type_ == heartbeat_system::SequencerType::EMBARCADERO &&
 				    order_level_ == Embarcadero::kOrderStrong) {
-					// True client-chain ordering uses one sequence per client across brokers.
-					batch_header->batch_seq = order5_batch_seq_.fetch_add(1, std::memory_order_relaxed);
+					// ORDER=5 batch_seq is assigned when the producer seals the batch in QueueBuffer.
+					// Reassigning it here from parallel send threads makes ordering depend on
+					// scheduler/send timing instead of deterministic client submit order.
 				} else if (seq_type_ == heartbeat_system::SequencerType::EMBARCADERO &&
 				           order_level_ == Embarcadero::kOrderClientBrokerStream) {
 					// Weaker ORDER=4 preserves FIFO per (client, broker) stream.

@@ -55,6 +55,8 @@ struct StageMetricSummary {
 	double average = 0.0;
 	double min = 0.0;
 	double p50 = 0.0;
+	double p90 = 0.0;
+	double p95 = 0.0;
 	double p99 = 0.0;
 	double p999 = 0.0;
 	double max = 0.0;
@@ -306,6 +308,8 @@ bool TryLoadMetricSummary(const std::string& path, const std::string& metric, St
 		if (!parse_double(row, "Average", &s.average)) return false;
 		if (!parse_double(row, "Min", &s.min)) return false;
 		if (!parse_double(row, "Median", &s.p50)) return false;
+		if (!parse_double(row, "p90", &s.p90)) return false;
+		if (!parse_double(row, "p95", &s.p95)) return false;
 		if (!parse_double(row, "p99", &s.p99)) return false;
 		if (!parse_double(row, "p999", &s.p999)) return false;
 		if (!parse_double(row, "Max", &s.max)) return false;
@@ -377,6 +381,117 @@ void CheckStageLatencyMonotonicity(int ack_level) {
 		             << "(ordered=" << have_ordered << ", ack=" << have_ack << ", deliver=" << have_deliver << ")";
 	}
 	WriteStageLatencySummary(ordered, ack, deliver, monotonic_ok);
+}
+
+void WriteLatencyBenchmarkSummary(const cxxopts::ParseResult& result,
+		bool steady_rate,
+		double target_mbps,
+		double achieved_offered_mbps,
+		double pub_bandwidth_mbps,
+		double e2e_bandwidth_mbps,
+		uint64_t offered_wire_bytes) {
+	StageMetricSummary submit{};
+	StageMetricSummary ack{};
+	StageMetricSummary ordered{};
+	StageMetricSummary deliver{};
+	const bool have_submit =
+		TryLoadMetricSummary("pub_latency_stats.csv", "append_submit_to_ack_batch_latency", &submit);
+	const bool have_ack =
+		TryLoadMetricSummary("pub_latency_stats.csv", "append_send_to_ack_batch_latency", &ack);
+	bool have_ordered =
+		TryLoadMetricSummary("pub_latency_stats.csv", "append_send_to_ordered_batch_latency", &ordered);
+	const bool have_deliver =
+		TryLoadMetricSummary("latency_stats.csv", "publish_to_deliver_latency", &deliver) ||
+		TryLoadMetricSummary("latency_stats.csv", "append_send_to_deliver_message_latency", &deliver);
+	const int ack_level = result["ack_level"].as<int>();
+	if (!have_ordered && have_ack && ack_level == 1) {
+		ordered = ack;
+		ordered.valid = true;
+		have_ordered = true;
+	}
+
+	const size_t message_size = result["size"].as<size_t>();
+	const size_t total_message_size = result["total_message_size"].as<size_t>();
+	const size_t message_count = message_size > 0 ? (total_message_size / message_size) : 0;
+
+	std::ofstream out("latency_benchmark_summary.csv");
+	if (!out.is_open()) {
+		LOG(ERROR) << "Failed to open latency_benchmark_summary.csv";
+		return;
+	}
+
+	out << "message_size_bytes,total_message_size_bytes,message_count,steady_rate,target_offered_load_mbps,"
+	    << "achieved_offered_load_mbps,achieved_publish_goodput_mbps,achieved_e2e_goodput_mbps,"
+	    << "offered_wire_bytes,offered_payload_bytes,"
+	    << "pub_submit_p50_us,pub_submit_p95_us,pub_submit_p99_us,pub_submit_count,"
+	    << "pub_ack_p50_us,pub_ack_p95_us,pub_ack_p99_us,pub_ack_count,"
+	    << "pub_ordered_p50_us,pub_ordered_p95_us,pub_ordered_p99_us,pub_ordered_count,"
+	    << "publish_to_deliver_p50_us,publish_to_deliver_p95_us,publish_to_deliver_p99_us,publish_to_deliver_count\n";
+
+	auto emit_metric = [&](const StageMetricSummary& metric, bool valid) {
+		if (!valid) {
+			out << ",,,";
+			return;
+		}
+		out << std::fixed << std::setprecision(3)
+		    << metric.p50 << ","
+		    << metric.p95 << ","
+		    << metric.p99 << ","
+		    << metric.count;
+	};
+
+	out << message_size
+	    << "," << total_message_size
+	    << "," << message_count
+	    << "," << (steady_rate ? "true" : "false")
+	    << "," << std::fixed << std::setprecision(3) << target_mbps
+	    << "," << achieved_offered_mbps
+	    << "," << pub_bandwidth_mbps
+	    << "," << e2e_bandwidth_mbps
+	    << "," << offered_wire_bytes
+	    << "," << total_message_size;
+	out << ",";
+	emit_metric(submit, have_submit);
+	out << ",";
+	emit_metric(ack, have_ack);
+	out << ",";
+	emit_metric(ordered, have_ordered);
+	out << ",";
+	emit_metric(deliver, have_deliver);
+	out << "\n";
+}
+
+void WriteThroughputBenchmarkSummary(const cxxopts::ParseResult& result,
+		double publish_goodput_mbps,
+		double e2e_goodput_mbps) {
+	const size_t message_size = result["size"].as<size_t>();
+	const size_t total_message_size = result["total_message_size"].as<size_t>();
+	const size_t num_threads_per_broker = result["num_threads_per_broker"].as<size_t>();
+	const int ack_level = result["ack_level"].as<int>();
+	const int order = result["order_level"].as<int>();
+	const int replication_factor = result["replication_factor"].as<int>();
+	const std::string sequencer = result["sequencer"].as<std::string>();
+	const size_t message_count = message_size > 0 ? (total_message_size / message_size) : 0;
+
+	std::ofstream out("throughput_benchmark_summary.csv");
+	if (!out.is_open()) {
+		LOG(ERROR) << "Failed to open throughput_benchmark_summary.csv";
+		return;
+	}
+
+	out << "message_size_bytes,total_message_size_bytes,message_count,num_threads_per_broker,ack_level,order,"
+	    << "replication_factor,sequencer,publish_goodput_mbps,e2e_goodput_mbps\n";
+	out << message_size
+	    << "," << total_message_size
+	    << "," << message_count
+	    << "," << num_threads_per_broker
+	    << "," << ack_level
+	    << "," << order
+	    << "," << replication_factor
+	    << "," << sequencer
+	    << "," << std::fixed << std::setprecision(3) << publish_goodput_mbps
+	    << "," << e2e_goodput_mbps
+	    << "\n";
 }
 
 }  // namespace
@@ -1115,6 +1230,7 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 			<< pub_seconds << " seconds, " << pubBandwidthMbps << " MB/s";
 		LOG(INFO) << "End-to-end completed in " << std::fixed << std::setprecision(2) 
 			<< e2e_seconds << " seconds, " << e2eBandwidthMbps << " MB/s";
+		WriteThroughputBenchmarkSummary(result, pubBandwidthMbps, e2eBandwidthMbps);
 
 		// Clean up
 		delete[] message;
@@ -1283,6 +1399,13 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		}
 		s.StoreLatency();
 		CheckStageLatencyMonotonicity(ack_level);
+		WriteLatencyBenchmarkSummary(result,
+				steady_rate,
+				target_mbps,
+				achieved_offered_mbps,
+				pubBandwidthMbps,
+				e2eBandwidthMbps,
+				offered_bytes);
 
 		return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);
 

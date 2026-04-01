@@ -3,12 +3,16 @@
 
 #include "common/config.h"
 #include "cxl_datastructure.h"
+#include "absl/container/flat_hash_map.h"
 #include <scalog_sequencer.grpc.pb.h>
 #include <atomic>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 
 namespace Embarcadero{
 	class CXLManager;
+	class Topic;
 }
 
 namespace Scalog {
@@ -20,7 +24,7 @@ using Embarcadero::BatchHeader;
 class ScalogLocalSequencer {
 	public:
 		ScalogLocalSequencer(TInode* tinode, int broker_id, 
-				void* cxl_addr, std::string topic_str, BatchHeader *batch_header);
+				void* cxl_addr, std::string topic_str, BatchHeader *batch_header, Embarcadero::Topic* topic);
 
 		/// Sends a register request to the global sequencer
 		void Register(int replication_factor);
@@ -39,11 +43,21 @@ class ScalogLocalSequencer {
 		void ScalogSequencer(const char* topic, absl::btree_map<int, int64_t> &global_cut_delta);
 
 	private:
+		struct DurableBatch {
+			uint64_t end_logical_count = 0;
+			absl::flat_hash_map<uint32_t, uint64_t> per_client_delta;
+		};
+
+		void EnqueueDurableBatch(uint64_t end_logical_count,
+		                         const absl::flat_hash_map<uint32_t, uint64_t>& per_client_delta);
+		void DrainDurableBatches();
+
 		TInode* tinode_;
 		int broker_id_;
 		int replica_id_ = 0;
 		void* cxl_addr_;
 		BatchHeader* batch_header_;
+		Embarcadero::Topic* topic_;
 		std::unique_ptr<ScalogSequencer::Stub> stub_;
 		size_t seq_ = 0;
 		MessageHeader* msg_to_order_ = nullptr;
@@ -64,6 +78,8 @@ class ScalogLocalSequencer {
 
 		/// Flag to indicate if we should stop reading from the stream
 		std::atomic<bool> stop_reading_from_stream_{false};
+		std::mutex durable_mu_;
+		std::deque<DurableBatch> durable_pending_;
 };
 
 } // End of namespace Scalog

@@ -412,11 +412,16 @@ class Topic {
 		// Returns the number of messages ordered for the given client_id at this broker.
 		// Used by AckThread for ACK1 in modes that support per-client ordered frontier.
 		uint64_t GetClientOrdered(uint32_t client_id) const;
+		// Returns the number of messages written/visible for the given client_id at this broker.
+		// Used by AckThread for ORDER=0 ACK1 so one publisher cannot consume another's progress.
+		uint64_t GetClientWritten(uint32_t client_id) const;
 		// Returns the number of messages durably replicated for the given client_id at this broker.
 		// Used by AckThread for ACK2 in modes that support per-client durability attribution.
 		uint64_t GetClientDurable(uint32_t client_id) const;
 		// True when this topic/mode maintains per-client ordered frontier for ACK level 1.
 		bool SupportsPerClientAckLevel1() const;
+		// True when this topic/mode maintains per-client written frontier for ORDER=0 ACK level 1.
+		bool SupportsPerClientWrittenAckLevel1() const;
 		// True when this topic/mode maintains per-client durable frontier for ACK level 2.
 		bool SupportsPerClientAckLevel2Durable() const;
 
@@ -425,6 +430,12 @@ class Topic {
 
 		/** [[ORDER_0_SUBSCRIBE]] Update written_logical_offset_ and written_physical_addr_ so GetMessageAddr can serve subscribers. Call after next_msg_diff is set for the batch. */
 		void SetOrder0Written(size_t cumulative_logical_offset, size_t blog_offset, uint32_t num_msg);
+		// Advance per-client written frontier for ORDER=0 ACK1 attribution.
+		void UpdatePerClientWritten(uint32_t client_id, uint64_t count);
+		// Advance per-client ordered frontier after a sequencer-owned export batch becomes visible.
+		void RecordPerClientOrderedVisibility(uint32_t client_id, uint64_t count);
+		// Advance per-client durable frontier after a sequencer-owned export batch becomes durably replicated.
+		void RecordPerClientDurableVisibility(uint32_t client_id, uint64_t count);
 
 		/** [[ORDER_0_TAIL]] When publish connection closes, advance written_* to order0_next_logical_offset_ so subscribers see full tail (fixes out-of-order batch completion leaving written behind). */
 		void FinalizeOrder0WrittenIfNeeded();
@@ -672,6 +683,7 @@ class Topic {
 		// Per-client ordered counters for ACK1 in supported modes.
 		// Avoids false-positive ACK from global tinode ordered counter aggregating all clients.
 		mutable absl::Mutex per_client_mu_;
+		absl::flat_hash_map<uint32_t, uint64_t> per_client_written_ ABSL_GUARDED_BY(per_client_mu_);
 		absl::flat_hash_map<uint32_t, uint64_t> per_client_ordered_ ABSL_GUARDED_BY(per_client_mu_);
 		// Called by all ordering paths (CORFU, ORDER=4, ORDER=5) to advance per-client counter.
 		void UpdatePerClientOrdered(uint32_t client_id, uint64_t count);

@@ -47,6 +47,28 @@ Set these to run scripts from a client node while brokers live on a broker node:
 
 Remote mode reuses healthy brokers when possible. Use `FORCE_RESTART_BROKERS=1` when you want a clean cluster start.
 
+### Publication client layout
+
+The publication matrix uses a fixed mixed local+remote client expansion order:
+
+- `NUM_CLIENTS=1` -> `c4`
+- `NUM_CLIENTS=2` -> `c4,c3`
+- `NUM_CLIENTS=3` -> `c4,c3,moscxl(local)`
+
+The corresponding default host roster in the launcher continues with `c2` and `c1` for larger ad hoc runs, but publication results should treat the three-client mixed layout above as canonical.
+
+### Publication matrix contract
+
+For publication throughput reruns, keep the contract explicit:
+
+- `NUM_CLIENTS=1` -> `c4`
+- `NUM_CLIENTS=2` -> `c4,c3`
+- `NUM_CLIENTS=3` -> `c4,c3,moscxl(local)`
+- `REPLICATION_FACTOR=1` -> default `ACK_LEVEL=1`
+- `REPLICATION_FACTOR=2` -> default `ACK_LEVEL=2`
+
+The appendable matrix wrapper [run_throughput_matrix.sh](/home/domin/Embarcadero/scripts/publication/run_throughput_matrix.sh) now derives that default automatically unless `ACK_LEVEL` is set explicitly. If you want an RF=2 run with `ACK_LEVEL=1`, set `ACK_LEVEL=1` yourself; do not rely on the default.
+
 ## Throughput Script
 
 ### `scripts/singlenode_run_throughput.sh`
@@ -164,6 +186,56 @@ Common options:
 - `SWEEP_TARGETS`: whitespace-separated MB/s targets
 - `POINT_MAX_ATTEMPTS`
 - `STRICT_BROKER_COUNT=1` to reject runs that do not use all brokers
+
+### `scripts/run_latency_vs_load.sh`
+
+Runs the publication-oriented latency-vs-load workflow.
+
+Common options:
+
+- `LOAD_POINTS_MBPS`: whitespace-separated offered-load targets for the x-axis
+- `PACING_MODE`: `open_loop` or `steady`
+- `SEQUENCER`
+- `ORDER`
+- `ACK_LEVEL`
+- `REPLICATION_FACTOR`
+- `MSG_SIZE`
+- `TOTAL_MESSAGE_SIZE`
+- `NUM_TRIALS`
+- `NUM_BROKERS`
+- `SCENARIO`
+- `BENCHMARK_TAG`
+- `RUN_ID`
+
+Outputs:
+
+- Raw artifacts per target/trial under `data/latency_vs_load/...`
+- `latency_benchmark_summary.csv` per trial
+- `trial_results.csv` and `summary.csv` aggregated for plotting
+
+### `scripts/run_e2e_throughput_benchmark.sh`
+
+Runs the publication-oriented end-to-end throughput harness for `throughput_test -t 1`.
+
+Common options:
+
+- `SCENARIO`: `local` or `remote`
+- `SEQUENCER`
+- `ORDER`
+- `ACK`
+- `REPLICATION_FACTOR`
+- `NUM_BROKERS`
+- `NUM_TRIALS`
+- `TOTAL_MESSAGE_SIZE`
+- `MESSAGE_SIZE`
+- `THREADS_PER_BROKER`
+- `BENCHMARK_TAG`
+- `RUN_ID`
+
+Outputs:
+
+- Raw per-trial logs and `throughput_benchmark_summary.csv` under `data/e2e_throughput/...`
+- `trial_results.csv` and `summary.csv` aggregated for the run
 
 ## Experiment Wrappers
 
