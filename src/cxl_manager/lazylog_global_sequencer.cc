@@ -26,6 +26,21 @@ size_t ResolveExpectedBrokers() {
 // at lower binding intervals. Scalog's global cut has no per-tick cap either.
 // Bind everything available each tick for a fair comparison.
 constexpr int64_t kMaxBindingsPerBrokerPerTick = std::numeric_limits<int64_t>::max();
+
+std::string ResolveLazyLogSequencerIp() {
+  const char* sequencer_ip_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_IP");
+  if (sequencer_ip_env && std::strlen(sequencer_ip_env) > 0) {
+    return std::string(sequencer_ip_env);
+  }
+
+  const char* configured_ip = LAZYLOG_SEQUENCER_IP;
+  if (configured_ip && std::strlen(configured_ip) > 0) {
+    return std::string(configured_ip);
+  }
+
+  LOG(WARNING) << "LazyLog sequencer IP resolved empty; falling back to 127.0.0.1";
+  return "127.0.0.1";
+}
 }  // namespace
 
 LazyLogGlobalSequencer::LazyLogGlobalSequencer(const std::string& sequencer_address)
@@ -193,10 +208,8 @@ void LazyLogGlobalSequencer::SendGlobalBinding() {
 
 int main(int argc, char* argv[]) {
   google::InitGoogleLogging(argv[0]);
-  const char* sequencer_ip_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_IP");
   const char* sequencer_port_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_PORT");
-  const std::string sequencer_ip =
-      (sequencer_ip_env && std::strlen(sequencer_ip_env) > 0) ? sequencer_ip_env : LAZYLOG_SEQUENCER_IP;
+  const std::string sequencer_ip = ResolveLazyLogSequencerIp();
   int sequencer_port = LAZYLOG_SEQ_PORT;
   if (sequencer_port_env && std::strlen(sequencer_port_env) > 0) {
     try {

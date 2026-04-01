@@ -105,6 +105,9 @@ fi
 if [[ "$SCENARIO" == "local" && -z "${REMOTE_SCALOG_SEQUENCER_HOST:-}" ]]; then
   export EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-127.0.0.1}"
 fi
+if [[ "$SCENARIO" == "remote" && "$SEQUENCER" == "LAZYLOG" && -z "${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" ]]; then
+  export EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-$BROKER_LISTEN_ADDR}"
+fi
 
 if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
   for __order in "${ORDERS_ARR[@]}"; do
