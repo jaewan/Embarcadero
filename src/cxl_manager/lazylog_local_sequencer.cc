@@ -119,6 +119,22 @@ void LazyLogLocalSequencer::SendLocalProgress(std::string topic_str, volatile bo
   grpc::ClientContext context;
   auto stream = stub_->HandleSendLocalProgress(&context);
   std::thread recv_thread(&LazyLogLocalSequencer::ReceiveGlobalBinding, this, std::ref(stream));
+  auto final_drain_until_quiescent = [&]() {
+    if (topic_ == nullptr || tinode_->replication_factor <= 0) {
+      return;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+      DrainDurableBatches();
+      {
+        std::lock_guard<std::mutex> lock(durable_mu_);
+        if (durable_pending_.empty()) {
+          return;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  };
 
   while (!stop_thread) {
     int64_t local_progress = 0;
@@ -169,7 +185,10 @@ void LazyLogLocalSequencer::SendLocalProgress(std::string topic_str, volatile bo
     request.set_topic(topic_str);
     request.set_broker_id(broker_id_);
     request.set_epoch(local_epoch_++);
+    // Durable ACK visibility must keep advancing even if the progress stream stalls.
+    DrainDurableBatches();
     if (!stream->Write(request)) {
+      final_drain_until_quiescent();
       LOG(ERROR) << "LazyLog local progress stream closed broker=" << broker_id_;
       break;
     }
@@ -177,6 +196,7 @@ void LazyLogLocalSequencer::SendLocalProgress(std::string topic_str, volatile bo
     std::this_thread::sleep_for(std::chrono::microseconds(LAZYLOG_SEQ_LOCAL_CUT_INTERVAL));
   }
 
+  final_drain_until_quiescent();
   stream->WritesDone();
   grpc::Status finish_status = stream->Finish();
   if (!finish_status.ok()) {
