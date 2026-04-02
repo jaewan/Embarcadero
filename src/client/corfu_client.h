@@ -32,7 +32,11 @@ class CorfuSequencerClient {
 			request.set_total_size(batch_header->total_size);
 			request.set_broker_id(batch_header->broker_id);
 
-			int retry_count = 0;
+			int transient_retry_count = 0;
+			int unavailable_retry_count = 0;
+			const auto start = std::chrono::steady_clock::now();
+			constexpr auto kUnavailableRetryBudget = std::chrono::seconds(15);
+			constexpr int kUnavailableLogInterval = 1000;
 			while (true) {
 				TotalOrderResponse response;
 				ClientContext context;
@@ -49,9 +53,40 @@ class CorfuSequencerClient {
 				}
 
 				if (status.error_code() == grpc::StatusCode::UNAVAILABLE) {
-					// Out-of-order batch at sequencer; retry immediately.
-					// yield() instead of 100μs sleep to avoid retry-storm cascade
-					// that serializes all publishers through the sleep penalty.
+					unavailable_retry_count++;
+					if (unavailable_retry_count == 1) {
+						LOG(WARNING) << "GetTotalOrder UNAVAILABLE on first attempt"
+						             << " client_id=" << client_id_
+						             << " broker_id=" << batch_header->broker_id
+						             << " request_batch_seq=" << request.batchseq()
+						             << " msg_count=" << batch_header->num_msg
+						             << " total_size=" << batch_header->total_size
+						             << " error=\"" << status.error_message() << "\"";
+					}
+					if ((unavailable_retry_count % kUnavailableLogInterval) == 0) {
+						const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+								std::chrono::steady_clock::now() - start).count();
+						LOG(WARNING) << "GetTotalOrder still retrying after UNAVAILABLE"
+						             << " client_id=" << client_id_
+						             << " broker_id=" << batch_header->broker_id
+						             << " request_batch_seq=" << request.batchseq()
+						             << " retries=" << unavailable_retry_count
+						             << " waited_ms=" << waited_ms
+						             << " msg_count=" << batch_header->num_msg
+						             << " total_size=" << batch_header->total_size
+						             << " error=\"" << status.error_message() << "\"";
+					}
+					if (std::chrono::steady_clock::now() - start >= kUnavailableRetryBudget) {
+						LOG(ERROR) << "GetTotalOrder giving up after repeated UNAVAILABLE"
+						           << " client_id=" << client_id_
+						           << " broker_id=" << batch_header->broker_id
+						           << " request_batch_seq=" << request.batchseq()
+						           << " retries=" << unavailable_retry_count
+						           << " waited_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+						                   std::chrono::steady_clock::now() - start).count()
+						           << " error=\"" << status.error_message() << "\"";
+						return false;
+					}
 					std::this_thread::yield();
 					continue;
 				}
@@ -59,14 +94,18 @@ class CorfuSequencerClient {
 				// [[PHASE_8]] Retry on other transient errors (e.g. DEADLINE_EXCEEDED)
 				if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
 				    status.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED) {
-					if (++retry_count < 3) {
+					if (++transient_retry_count < 3) {
 						LOG(WARNING) << "GetTotalOrder transient error: " << status.error_message() << ". Retrying...";
 						std::this_thread::sleep_for(std::chrono::milliseconds(10));
 						continue;
 					}
 				}
 
-				LOG(ERROR) << "GetTotalOrder failed: " << status.error_message() << " (code=" << status.error_code() << ")";
+				LOG(ERROR) << "GetTotalOrder failed: " << status.error_message()
+				           << " (code=" << status.error_code() << ")"
+				           << " client_id=" << client_id_
+				           << " broker_id=" << batch_header->broker_id
+				           << " request_batch_seq=" << request.batchseq();
 				return false;
 			}
 		}

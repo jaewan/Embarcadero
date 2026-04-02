@@ -32,6 +32,8 @@ REMOTE_SCALOG_SEQUENCER_HOST="${REMOTE_SCALOG_SEQUENCER_HOST:-}"
 REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-}"
 EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-}"
 EMBARCADERO_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}"
+CLIENT_HOSTS_CSV="${CLIENT_HOSTS_CSV:-}"
+CLIENT_NUMAS_CSV="${CLIENT_NUMAS_CSV:-}"
 PUBLICATION_BROKER_CONFIG="${PUBLICATION_BROKER_CONFIG:-config/embarcadero.yaml}"
 PUBLICATION_CLIENT_CONFIG="${PUBLICATION_CLIENT_CONFIG:-config/client.yaml}"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -47,12 +49,48 @@ if [[ -z "$ACK_LEVEL" ]]; then
   fi
 fi
 
-case "$NUM_CLIENTS" in
-  1) CLIENT_LAYOUT="c2" ;;
-  2) CLIENT_LAYOUT="c2,moscxl-local(numa0)" ;;
-  3) CLIENT_LAYOUT="c2,moscxl-local(numa0),c4" ;;
-  *) CLIENT_LAYOUT="unsupported" ;;
-esac
+declare -a DEFAULT_CLIENT_HOSTS=( "c4" "c3" "local" "c2" "c1" )
+declare -a DEFAULT_CLIENT_NUMAS=( "1" "1" "0" "1" "1" )
+declare -a ACTIVE_CLIENT_HOSTS=()
+declare -a ACTIVE_CLIENT_NUMAS=()
+
+if [[ -n "$CLIENT_HOSTS_CSV" ]]; then
+  IFS=',' read -r -a ACTIVE_CLIENT_HOSTS <<< "$CLIENT_HOSTS_CSV"
+else
+  ACTIVE_CLIENT_HOSTS=( "${DEFAULT_CLIENT_HOSTS[@]:0:$NUM_CLIENTS}" )
+fi
+
+if [[ -n "$CLIENT_NUMAS_CSV" ]]; then
+  IFS=',' read -r -a ACTIVE_CLIENT_NUMAS <<< "$CLIENT_NUMAS_CSV"
+else
+  ACTIVE_CLIENT_NUMAS=( "${DEFAULT_CLIENT_NUMAS[@]:0:$NUM_CLIENTS}" )
+fi
+
+if [[ "${#ACTIVE_CLIENT_HOSTS[@]}" -lt "$NUM_CLIENTS" ]]; then
+  echo "ERROR: CLIENT_HOSTS_CSV provides fewer than NUM_CLIENTS hosts" >&2
+  exit 1
+fi
+
+CLIENT_LAYOUT=""
+for ((i=0; i<NUM_CLIENTS; i++)); do
+  host="${ACTIVE_CLIENT_HOSTS[$i]}"
+  numa="${ACTIVE_CLIENT_NUMAS[$i]:-}"
+  if [[ "$host" == "local" ]]; then
+    host_label="moscxl-local"
+    if [[ -n "$numa" ]]; then
+      host_label="${host_label}(numa${numa})"
+    fi
+  else
+    host_label="$host"
+    if [[ -n "$numa" ]]; then
+      host_label="${host_label}(numa${numa})"
+    fi
+  fi
+  if [[ -n "$CLIENT_LAYOUT" ]]; then
+    CLIENT_LAYOUT+=","
+  fi
+  CLIENT_LAYOUT+="$host_label"
+done
 
 CELL_ID="${SYSTEM}_order${ORDER}_rf${REPLICATION_FACTOR}_n${NUM_CLIENTS}"
 RUN_DIR="$PROJECT_ROOT/data/publication/throughput/$TAG/$CELL_ID/run_$RUN_ID"
@@ -76,6 +114,7 @@ THREADS_PER_BROKER='$THREADS_PER_BROKER' BROKER_IP='$BROKER_IP' START_DELAY_SEC=
 LOCAL_CLIENT_NUMA='$LOCAL_CLIENT_NUMA' CORFU_SEQUENCER_LOG_HOST='$CORFU_SEQUENCER_LOG_HOST' \\
 LAZYLOG_SEQUENCER_LOG_HOST='$LAZYLOG_SEQUENCER_LOG_HOST' \\
 SCALOG_SEQUENCER_LOG_HOST='$SCALOG_SEQUENCER_LOG_HOST' \\
+CLIENT_HOSTS_CSV='$CLIENT_HOSTS_CSV' CLIENT_NUMAS_CSV='$CLIENT_NUMAS_CSV' \\
 REMOTE_CORFU_SEQUENCER_HOST='$REMOTE_CORFU_SEQUENCER_HOST' REMOTE_CORFU_BUILD_BIN='$REMOTE_CORFU_BUILD_BIN' \\
 REMOTE_LAZYLOG_SEQUENCER_HOST='$REMOTE_LAZYLOG_SEQUENCER_HOST' REMOTE_LAZYLOG_BUILD_BIN='$REMOTE_LAZYLOG_BUILD_BIN' \\
 REMOTE_SCALOG_SEQUENCER_HOST='$REMOTE_SCALOG_SEQUENCER_HOST' REMOTE_SCALOG_BUILD_BIN='$REMOTE_SCALOG_BUILD_BIN' \\
@@ -107,6 +146,8 @@ broker_numa=node1
 broker_ip=$BROKER_IP
 local_client_numa=$LOCAL_CLIENT_NUMA
 start_delay_sec=$START_DELAY_SEC
+client_hosts_csv=$CLIENT_HOSTS_CSV
+client_numas_csv=$CLIENT_NUMAS_CSV
 corfu_sequencer_log_host=$CORFU_SEQUENCER_LOG_HOST
 lazylog_sequencer_log_host=$LAZYLOG_SEQUENCER_LOG_HOST
 scalog_sequencer_log_host=$SCALOG_SEQUENCER_LOG_HOST
@@ -179,6 +220,8 @@ env \
   EMBARCADERO_HEAD_ADDR="$BROKER_IP" \
   START_DELAY_SEC="$START_DELAY_SEC" \
   LOCAL_CLIENT_NUMA="$LOCAL_CLIENT_NUMA" \
+  CLIENT_HOSTS_CSV="$CLIENT_HOSTS_CSV" \
+  CLIENT_NUMAS_CSV="$CLIENT_NUMAS_CSV" \
   REMOTE_CORFU_SEQUENCER_HOST="${REMOTE_CORFU_SEQUENCER_HOST:-}" \
   REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}" \
   REMOTE_LAZYLOG_SEQUENCER_HOST="${REMOTE_LAZYLOG_SEQUENCER_HOST:-}" \
@@ -216,8 +259,8 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
   trial_status="ok"
   total_mbs="0"
   copied_any=0
-  for host in c2 local c4; do
-    log_file="$RAW_DIR/trial${trial}_${host}.log"
+  shopt -s nullglob
+  for log_file in "$RAW_DIR"/trial${trial}_*.log; do
     if [[ ! -f "$log_file" ]]; then
       continue
     fi
@@ -230,6 +273,7 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
       trial_status="failed"
     fi
   done
+  shopt -u nullglob
   if [[ "$copied_any" -eq 0 ]]; then
     trial_status="missing_logs"
   fi

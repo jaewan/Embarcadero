@@ -6,11 +6,11 @@
 # synchronized (future-timestamp) barrier start.
 #
 # Client roster (order defines who is added at each NUM_CLIENTS level):
-#   NUM_CLIENTS=1  → c2              (NUMA 1)
-#   NUM_CLIENTS=2  → c2, local       (NUMA 1, 0)
-#   NUM_CLIENTS=3  → c2, local, c4   (NUMA 1, 0, 1)
-#   NUM_CLIENTS=4  → c2, local, c4, c3
-#   NUM_CLIENTS=5  → c2, local, c4, c3, c1
+#   NUM_CLIENTS=1  → c4              (NUMA 1)
+#   NUM_CLIENTS=2  → c4, c3          (NUMA 1, 1)
+#   NUM_CLIENTS=3  → c4, c3, local   (NUMA 1, 1, 0)
+#   NUM_CLIENTS=4  → c4, c3, local, c2
+#   NUM_CLIENTS=5  → c4, c3, local, c2, c1
 #
 # All configuration via environment variables:
 #   NUM_CLIENTS, NUM_BROKERS, NUM_TRIALS, TRIAL_MAX_ATTEMPTS
@@ -46,8 +46,8 @@ fi
 # Cluster topology — order determines activation sequence
 # "local" means this broker machine (where brokers run); everything else is SSH
 # ---------------------------------------------------------------------------
-declare -a CLIENT_HOSTS=( "c2"  "local" "c4"  "c3"  "c1"  )
-declare -a CLIENT_NUMAS=( "1"   ""      "1"   "1"   "1"   )
+declare -a CLIENT_HOSTS=( "c4"  "c3"    "local" "c2"  "c1"  )
+declare -a CLIENT_NUMAS=( "1"   "1"     ""      "1"   "1"   )
 if [[ -n "${CLIENT_HOSTS_CSV:-}" ]]; then
     IFS=',' read -r -a CLIENT_HOSTS <<< "$CLIENT_HOSTS_CSV"
 fi
@@ -193,6 +193,30 @@ has_remote_clients() {
     done
     return 1
 }
+
+all_active_clients_are_remote() {
+    local i host
+    for (( i=0; i<NUM_CLIENTS; i++ )); do
+        host="${CLIENT_HOSTS[$i]}"
+        if [[ "$host" == "local" ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+if [[ -z "${EMBARCADERO_ORDER5_HOME_BROKERS:-}" ]] &&
+   [[ "$SEQUENCER" == "EMBARCADERO" ]] &&
+   [[ "$ORDER" == "5" ]] &&
+   [[ "$TEST_TYPE" == "5" ]] &&
+   [[ "$THREADS_PER_BROKER" -ge 4 ]] &&
+   [[ "$NUM_CLIENTS" -ge 3 ]] &&
+   all_active_clients_are_remote; then
+    # Fully striped remote ORDER=5 publish-only runs can create large head-broker hold/expiry
+    # waves during disconnect tail drain. Bias each client to a small broker home set to keep
+    # cross-broker sequence skew bounded without changing ORDER=5 semantics.
+    EMBARCADERO_ORDER5_HOME_BROKERS=2
+fi
 
 if [[ "$SEQUENCER" == "CORFU" ]] && corfu_uses_remote_clients && corfu_seq_ip_is_loopback; then
     echo "ERROR: CORFU with SSH clients requires EMBARCADERO_CORFU_SEQ_IP to be a routable non-loopback address." >&2
@@ -478,7 +502,7 @@ precreate_embarcadero_order5_topic() {
             -s 0 \
             -t "$TEST_TYPE" \
             -o "$ORDER" \
-            -a "$ACK" \
+            -a 0 \
             -r "$REPLICATION_FACTOR" \
             --sequencer "$SEQUENCER" \
             -l 0
@@ -892,18 +916,30 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
         declare -a CLIENT_PIDS=()
         declare -a CLIENT_LOGS=()
         declare -a CLIENT_TS_LOCAL_FILES=()
+        declare -a CLIENT_TAGS=()
 
         for (( i=0; i<NUM_CLIENTS; i++ )); do
             host="${CLIENT_HOSTS[$i]}"
             numa="$(resolve_client_numa "$host" "${CLIENT_NUMAS[$i]}")"
-            log_file="$LOG_DIR/trial${trial}_${host}.log"
+            host_occurrences=0
+            for (( j=0; j<NUM_CLIENTS; j++ )); do
+                if [[ "${CLIENT_HOSTS[$j]}" == "$host" ]]; then
+                    host_occurrences=$((host_occurrences + 1))
+                fi
+            done
+            client_tag="$host"
+            if [[ "$host_occurrences" -gt 1 ]]; then
+                client_tag="${host}${i}"
+            fi
+            log_file="$LOG_DIR/trial${trial}_${client_tag}.log"
             remote_build_bin="$BUILD_BIN"
             if [[ "$host" != "local" ]]; then
                 remote_build_bin="$REMOTE_CLIENT_BIN_DIR"
             fi
-            ts_file="$remote_build_bin/throughput_timeseries_trial${trial}_${host}.csv"
+            ts_file="$remote_build_bin/throughput_timeseries_trial${trial}_${client_tag}.csv"
+            CLIENT_TAGS+=( "$client_tag" )
             CLIENT_LOGS+=( "$log_file" )
-            CLIENT_TS_LOCAL_FILES+=( "$LOG_DIR/trial${trial}_${host}_timeseries.csv" )
+            CLIENT_TS_LOCAL_FILES+=( "$LOG_DIR/trial${trial}_${client_tag}_timeseries.csv" )
 
             # Build the command that will execute on the remote (or local) shell.
             # We use export statements so every env var is properly set regardless
@@ -964,10 +1000,11 @@ ENDINNERSCRIPT
         # Collect per-client throughput timeseries from client hosts.
         for (( i=0; i<NUM_CLIENTS; i++ )); do
             host="${CLIENT_HOSTS[$i]}"
-            local_ts="$LOG_DIR/trial${trial}_${host}_timeseries.csv"
-            remote_ts="$BUILD_BIN/throughput_timeseries_trial${trial}_${host}.csv"
+            client_tag="${CLIENT_TAGS[$i]}"
+            local_ts="$LOG_DIR/trial${trial}_${client_tag}_timeseries.csv"
+            remote_ts="$BUILD_BIN/throughput_timeseries_trial${trial}_${client_tag}.csv"
             if [[ "$host" != "local" ]]; then
-                remote_ts="$REMOTE_CLIENT_BIN_DIR/throughput_timeseries_trial${trial}_${host}.csv"
+                remote_ts="$REMOTE_CLIENT_BIN_DIR/throughput_timeseries_trial${trial}_${client_tag}.csv"
             fi
             if [[ "$host" == "local" ]]; then
                 cp "$remote_ts" "$local_ts" 2>/dev/null || true
@@ -1020,13 +1057,14 @@ ENDINNERSCRIPT
     total_bw_mbs=0
     for (( i=0; i<NUM_CLIENTS; i++ )); do
         host="${CLIENT_HOSTS[$i]}"
-        log_file="$LOG_DIR/trial${trial}_${host}.log"
+        client_tag="${CLIENT_TAGS[$i]:-$host}"
+        log_file="$LOG_DIR/trial${trial}_${client_tag}.log"
         bw_line=$(grep -i "bandwidth:" "$log_file" 2>/dev/null | tail -1 || echo "")
         # glog prefix: "I0326 HH:MM:SS PID file:line] Bandwidth: VALUE UNIT"
         # extract the number that follows "Bandwidth:" regardless of prefix fields
         bw_val=$(echo "$bw_line" | grep -oiP 'bandwidth:\s*\K[0-9]+(\.[0-9]+)?' || true)
         bw_unit=$(echo "$bw_line" | awk '{for(i=1;i<NF;i++) if($i=="Bandwidth:") {print $(i+2); exit}}' || true)
-        printf "  %-8s → %s %s\n" "$host" "${bw_val:-N/A}" "${bw_unit:-}"
+        printf "  %-8s → %s %s\n" "$client_tag" "${bw_val:-N/A}" "${bw_unit:-}"
         if [[ "$bw_val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             total_bw_mbs=$(awk "BEGIN {printf \"%.2f\", $total_bw_mbs + $bw_val}")
         fi
@@ -1065,7 +1103,17 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
     total=0
     for (( i=0; i<NUM_CLIENTS; i++ )); do
         host="${CLIENT_HOSTS[$i]}"
-        log_file="$LOG_DIR/trial${trial}_${host}.log"
+        client_tag="$host"
+        host_occurrences=0
+        for (( j=0; j<NUM_CLIENTS; j++ )); do
+            if [[ "${CLIENT_HOSTS[$j]}" == "$host" ]]; then
+                host_occurrences=$((host_occurrences + 1))
+            fi
+        done
+        if [[ "$host_occurrences" -gt 1 ]]; then
+            client_tag="${host}${i}"
+        fi
+        log_file="$LOG_DIR/trial${trial}_${client_tag}.log"
         bw=$(grep -i "bandwidth:" "$log_file" 2>/dev/null | tail -1 | grep -oiP 'bandwidth:\s*\K[0-9]+(\.[0-9]+)?' || true)
         if [[ "$bw" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             total=$(awk "BEGIN {printf \"%.2f\", $total + $bw}")

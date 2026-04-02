@@ -893,11 +893,13 @@ bool TopicManager::ReadOrder0Batch(const char* topic, uint64_t& read_cursor,
 }
 
 void TopicManager::PushOrder0Batch(const char* topic, uint64_t log_idx,
-		uint32_t total_size, uint32_t num_msg, uint16_t header_version) {
+		uint32_t total_size, uint32_t num_msg,
+		uint64_t start_logical_offset, uint32_t client_id) {
 	absl::ReaderMutexLock lock(&topics_mutex_);
 	auto topic_itr = topics_.find(topic);
 	if (topic_itr != topics_.end()) {
-		topic_itr->second->PushOrder0Batch(log_idx, total_size, num_msg, header_version);
+		topic_itr->second->PushOrder0Batch(log_idx, total_size, num_msg,
+		                                 start_logical_offset, client_id);
 	}
 }
 

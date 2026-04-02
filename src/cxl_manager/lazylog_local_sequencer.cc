@@ -1,5 +1,6 @@
 #include "lazylog_local_sequencer.h"
 #include "cxl_manager.h"
+#include "../embarlet/topic.h"
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -7,6 +8,8 @@
 namespace LazyLog {
 
 namespace {
+
+constexpr uint64_t kReplicationNotStarted = std::numeric_limits<uint64_t>::max();
 
 std::string ResolveLazyLogSequencerIp() {
   const char* sequencer_ip_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_IP");
@@ -23,6 +26,15 @@ std::string ResolveLazyLogSequencerIp() {
   return "127.0.0.1";
 }
 
+int ResolveNumBrokers() {
+  const char* env = std::getenv("EMBARCADERO_NUM_BROKERS");
+  if (env && std::strlen(env) > 0) {
+    const int parsed = std::atoi(env);
+    if (parsed > 0) return parsed;
+  }
+  return NUM_MAX_BROKERS_CONFIG;
+}
+
 }  // namespace
 
 LazyLogLocalSequencer::LazyLogLocalSequencer(
@@ -30,11 +42,13 @@ LazyLogLocalSequencer::LazyLogLocalSequencer(
     int broker_id,
     void* cxl_addr,
     std::string /*topic_str*/,
-    BatchHeader* batch_header)
+    BatchHeader* batch_header,
+    Embarcadero::Topic* topic)
     : tinode_(tinode),
       broker_id_(broker_id),
       cxl_addr_(cxl_addr),
-      batch_header_(batch_header) {
+      batch_header_(batch_header),
+      topic_(topic) {
   const char* sequencer_port_env = std::getenv("EMBARCADERO_LAZYLOG_SEQ_PORT");
   const std::string sequencer_ip = ResolveLazyLogSequencerIp();
   int sequencer_port = LAZYLOG_SEQ_PORT;
@@ -159,6 +173,7 @@ void LazyLogLocalSequencer::SendLocalProgress(std::string topic_str, volatile bo
       LOG(ERROR) << "LazyLog local progress stream closed broker=" << broker_id_;
       break;
     }
+    DrainDurableBatches();
     std::this_thread::sleep_for(std::chrono::microseconds(LAZYLOG_SEQ_LOCAL_CUT_INTERVAL));
   }
 
@@ -172,6 +187,60 @@ void LazyLogLocalSequencer::SendLocalProgress(std::string topic_str, volatile bo
   if (recv_thread.joinable()) recv_thread.join();
   if (broker_id_ == 0) {
     TerminateGlobalSequencer();
+  }
+}
+
+void LazyLogLocalSequencer::EnqueueDurableBatch(
+    uint64_t end_logical_count,
+    const absl::flat_hash_map<uint32_t, uint64_t>& per_client_delta) {
+  if (topic_ == nullptr || tinode_->replication_factor <= 0 || per_client_delta.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(durable_mu_);
+  durable_pending_.push_back(DurableBatch{end_logical_count, per_client_delta});
+}
+
+void LazyLogLocalSequencer::DrainDurableBatches() {
+  if (topic_ == nullptr || tinode_->replication_factor <= 0) {
+    return;
+  }
+
+  const int num_brokers = ResolveNumBrokers();
+  const int rf = tinode_->replication_factor;
+  uint64_t min_rep = std::numeric_limits<uint64_t>::max();
+  int ready_replicas = 0;
+  for (int i = 0; i < rf; ++i) {
+    const int b = Embarcadero::GetReplicationSetBroker(broker_id_, rf, num_brokers, i);
+    volatile uint64_t* rep_done_ptr = &tinode_->offsets[b].replication_done[broker_id_];
+    Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+        reinterpret_cast<const volatile void*>(rep_done_ptr)));
+    Embarcadero::CXL::load_fence();
+    const uint64_t val = *rep_done_ptr;
+    if (val == kReplicationNotStarted) {
+      continue;
+    }
+    ready_replicas++;
+    if (val < min_rep) min_rep = val;
+  }
+  if (ready_replicas < rf || min_rep == kReplicationNotStarted) {
+    return;
+  }
+
+  const uint64_t durable_frontier = min_rep + 1;
+  std::vector<DurableBatch> ready;
+  {
+    std::lock_guard<std::mutex> lock(durable_mu_);
+    while (!durable_pending_.empty() &&
+           durable_pending_.front().end_logical_count <= durable_frontier) {
+      ready.push_back(std::move(durable_pending_.front()));
+      durable_pending_.pop_front();
+    }
+  }
+
+  for (const auto& batch : ready) {
+    for (const auto& [client_id, count] : batch.per_client_delta) {
+      topic_->RecordPerClientDurableVisibility(client_id, count);
+    }
   }
 }
 
@@ -202,6 +271,7 @@ void LazyLogLocalSequencer::ApplyGlobalBinding(const absl::btree_map<int, int>& 
   bool local_progress = false;
   uint32_t current_batch_num_messages = 0;
   uint64_t current_batch_first_total_order = next_global_sequence_;
+  absl::flat_hash_map<uint32_t, uint64_t> current_batch_per_client_delta;
 
   // [[CORRECTNESS_FIX]] Track the last ordered values locally. We only publish
   // tinode->offsets[].ordered AFTER the batch header export slot is written, so
@@ -212,7 +282,8 @@ void LazyLogLocalSequencer::ApplyGlobalBinding(const absl::btree_map<int, int>& 
   auto publish_batch = [&](void* batch_start_addr,
                            size_t publish_size,
                            uint32_t publish_num_messages,
-                           uint64_t publish_first_total_order) {
+                           uint64_t publish_first_total_order,
+                           const absl::flat_hash_map<uint32_t, uint64_t>& per_client_delta) {
     if (publish_size == 0 || batch_start_addr == nullptr) return;
     const size_t slot = batch_header_idx_ % kNumBatchSlots;
     batch_header_[slot].batch_off_to_export = 0;
@@ -236,6 +307,14 @@ void LazyLogLocalSequencer::ApplyGlobalBinding(const absl::btree_map<int, int>& 
     Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
         static_cast<const volatile void*>(&tinode_->offsets[broker_id_].ordered_offset)));
     Embarcadero::CXL::store_fence();
+
+    if (topic_ != nullptr) {
+      for (const auto& [client_id, count] : per_client_delta) {
+        topic_->RecordPerClientOrderedVisibility(client_id, count);
+      }
+    }
+    EnqueueDurableBatch(last_ordered_count, per_client_delta);
+    DrainDurableBatches();
   };
 
   for (const auto& cut : global_binding) {
@@ -246,6 +325,7 @@ void LazyLogLocalSequencer::ApplyGlobalBinding(const absl::btree_map<int, int>& 
           current_batch_first_total_order = next_global_sequence_;
         }
         current_batch_num_messages++;
+        current_batch_per_client_delta[static_cast<uint32_t>(msg_to_order_->client_id)]++;
         total_size += msg_to_order_->paddedSize;
         msg_to_order_->total_order = next_global_sequence_;
         std::atomic_thread_fence(std::memory_order_release);
@@ -259,11 +339,13 @@ void LazyLogLocalSequencer::ApplyGlobalBinding(const absl::btree_map<int, int>& 
             reinterpret_cast<uint8_t*>(msg_to_order_) + msg_to_order_->next_msg_diff);
         ++next_global_sequence_;
         if (total_size >= BATCH_SIZE) {
-          publish_batch(start_addr, total_size, current_batch_num_messages, current_batch_first_total_order);
+          publish_batch(start_addr, total_size, current_batch_num_messages, current_batch_first_total_order,
+                        current_batch_per_client_delta);
           start_addr = reinterpret_cast<void*>(msg_to_order_);
           total_size = 0;
           current_batch_num_messages = 0;
           current_batch_first_total_order = next_global_sequence_;
+          current_batch_per_client_delta.clear();
         }
       }
     } else {
@@ -275,7 +357,8 @@ void LazyLogLocalSequencer::ApplyGlobalBinding(const absl::btree_map<int, int>& 
     publish_batch(start_addr,
                   total_size,
                   std::max<uint32_t>(current_batch_num_messages, 1),
-                  current_batch_first_total_order);
+                  current_batch_first_total_order,
+                  current_batch_per_client_delta);
   }
 }
 

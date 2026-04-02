@@ -362,10 +362,8 @@ class Topic {
 		 * Called from the ingest fast path after UpdateWrittenForOrder0.
 		 * Lock-free multi-producer, multi-reader ring (DRAM only, no CXL writes).
 		 */
-		void PushOrder0Batch(uint64_t log_idx,
-		                    uint32_t total_size,
-		                    uint32_t num_msg,
-		                    uint16_t header_version);
+		void PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg,
+		                   uint64_t start_logical_offset, uint32_t client_id);
 
 		/**
 		 * Read the next ORDER=0 batch record for a subscriber.
@@ -416,11 +414,16 @@ class Topic {
 		// Returns the number of messages ordered for the given client_id at this broker.
 		// Used by AckThread for ACK1 in modes that support per-client ordered frontier.
 		uint64_t GetClientOrdered(uint32_t client_id) const;
+		// Returns the number of messages written/visible for the given client_id at this broker.
+		// Used by AckThread for ORDER=0 ACK1 so one publisher cannot consume another's progress.
+		uint64_t GetClientWritten(uint32_t client_id) const;
 		// Returns the number of messages durably replicated for the given client_id at this broker.
 		// Used by AckThread for ACK2 in modes that support per-client durability attribution.
 		uint64_t GetClientDurable(uint32_t client_id) const;
 		// True when this topic/mode maintains per-client ordered frontier for ACK level 1.
 		bool SupportsPerClientAckLevel1() const;
+		// True when this topic/mode maintains per-client written frontier for ORDER=0 ACK level 1.
+		bool SupportsPerClientWrittenAckLevel1() const;
 		// True when this topic/mode maintains per-client durable frontier for ACK level 2.
 		bool SupportsPerClientAckLevel2Durable() const;
 
@@ -429,6 +432,14 @@ class Topic {
 
 		/** [[ORDER_0_SUBSCRIBE]] Update written_logical_offset_ and written_physical_addr_ so GetMessageAddr can serve subscribers. Call after next_msg_diff is set for the batch. */
 		void SetOrder0Written(size_t cumulative_logical_offset, size_t blog_offset, uint32_t num_msg);
+		// Advance per-client written frontier for ORDER=0 ACK1 attribution.
+		void UpdatePerClientWritten(uint32_t client_id, uint64_t count);
+		// Advance per-client ordered frontier after a sequencer-owned export batch becomes visible.
+		void RecordPerClientOrderedVisibility(uint32_t client_id, uint64_t count);
+		// Advance per-client durable frontier after a sequencer-owned export batch becomes durably replicated.
+		void RecordPerClientDurableVisibility(uint32_t client_id, uint64_t count);
+		void RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num_msg, uint32_t client_id);
+		void MaybeAdvanceOrder0DurableVisibility() const;
 
 		/** [[ORDER_0_TAIL]] When publish connection closes, advance written_* to order0_next_logical_offset_ so subscribers see full tail (fixes out-of-order batch completion leaving written behind). */
 		void FinalizeOrder0WrittenIfNeeded();
@@ -676,12 +687,16 @@ class Topic {
 		// Per-client ordered counters for ACK1 in supported modes.
 		// Avoids false-positive ACK from global tinode ordered counter aggregating all clients.
 		mutable absl::Mutex per_client_mu_;
+		absl::flat_hash_map<uint32_t, uint64_t> per_client_written_ ABSL_GUARDED_BY(per_client_mu_);
 		absl::flat_hash_map<uint32_t, uint64_t> per_client_ordered_ ABSL_GUARDED_BY(per_client_mu_);
 		// Called by all ordering paths (CORFU, ORDER=4, ORDER=5) to advance per-client counter.
 		void UpdatePerClientOrdered(uint32_t client_id, uint64_t count);
 		// Per-client durable counters for ACK2 (only in modes with explicit durability attribution).
 		mutable absl::Mutex per_client_durable_mu_;
-		absl::flat_hash_map<uint32_t, uint64_t> per_client_durable_ ABSL_GUARDED_BY(per_client_durable_mu_);
+		mutable absl::flat_hash_map<uint32_t, uint64_t> per_client_durable_ ABSL_GUARDED_BY(per_client_durable_mu_);
+		mutable uint64_t order0_durable_logical_count_ ABSL_GUARDED_BY(per_client_durable_mu_) = 0;
+		mutable absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>> order0_durable_pending_
+			ABSL_GUARDED_BY(per_client_durable_mu_);
 		void UpdatePerClientDurable(uint32_t client_id, uint64_t count);
 
 		// Synchronization
@@ -720,13 +735,13 @@ class Topic {
 		struct alignas(32) Order0BatchSlot {
 			std::atomic<uint64_t> sequence{0};  // 0=empty; N = batch for cursor N-1 is ready
 			uint64_t log_idx = 0;
+			uint64_t start_logical_offset = 0;
 			uint32_t total_size = 0;
 			uint32_t num_msg = 0;
-			uint16_t header_version = 1;
-			uint16_t _reserved = 0;
+			uint32_t client_id = 0;
 			uint32_t _pad = 0;
 		};
-		static_assert(sizeof(Order0BatchSlot) == 32, "Order0BatchSlot must be 32 bytes");
+		static_assert(sizeof(Order0BatchSlot) == 64, "Order0BatchSlot must be 64 bytes");
 		static constexpr size_t kOrder0BatchRingSize = 8192;  // 8K slots × 32B = 256KB DRAM
 		alignas(64) std::array<Order0BatchSlot, kOrder0BatchRingSize> order0_batch_ring_{};
 		alignas(64) std::atomic<uint64_t> order0_batch_write_cursor_{0};

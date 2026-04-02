@@ -171,6 +171,7 @@ resolve_client_head_addr() {
 
 cd build/bin || { echo "Error: build/bin not found"; exit 1; }
 broker_init_paths
+THROUGHPUT_ARTIFACT_BASE_DIR="${THROUGHPUT_ARTIFACT_BASE_DIR:-}"
 
 cleanup() {
   [ "$QUIET" != "1" ] && echo "Cleaning up..."
@@ -324,6 +325,11 @@ fi
 
 for ((trial=1; trial<=NUM_TRIALS; trial++)); do
   echo "=== Trial $trial ($SEQUENCER Order $ORDER, $NUM_BROKERS brokers, msg=$MESSAGE_SIZE) ==="
+  trial_artifact_dir=""
+  if [[ -n "$THROUGHPUT_ARTIFACT_BASE_DIR" ]]; then
+    trial_artifact_dir="$THROUGHPUT_ARTIFACT_BASE_DIR/trial_${trial}"
+    mkdir -p "$trial_artifact_dir"
+  fi
   trial_success=0
   for ((attempt=1; attempt<=TRIAL_MAX_ATTEMPTS; attempt++)); do
     [ "$QUIET" != "1" ] && echo "Trial $trial attempt $attempt/$TRIAL_MAX_ATTEMPTS"
@@ -336,6 +342,7 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
 
     echo "Running throughput test (type $TEST_TYPE)..."
     TRIAL_LOG="$(mktemp /tmp/throughput_trial_${trial}_${attempt}_XXXX.log)"
+    rm -f throughput_benchmark_summary.csv
     client_cmd=(
       ./throughput_test
       --config "$CLIENT_CONFIG_ABS"
@@ -362,6 +369,15 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
       $CLIENT_NUMA_BIND "${client_cmd[@]}" 2>&1 | tee "$TRIAL_LOG"
     fi
     cmd_status=${PIPESTATUS[0]}
+    if [[ -n "$trial_artifact_dir" ]]; then
+      cp "$TRIAL_LOG" "$trial_artifact_dir/attempt_${attempt}.log" 2>/dev/null || true
+      if [[ -f throughput_benchmark_summary.csv ]]; then
+        cp throughput_benchmark_summary.csv "$trial_artifact_dir/attempt_${attempt}_throughput_benchmark_summary.csv" 2>/dev/null || true
+      fi
+      for ((b=0; b<NUM_BROKERS; b++)); do
+        cp "/tmp/broker_${b}.log" "$trial_artifact_dir/attempt_${attempt}_broker${b}.log" 2>/dev/null || true
+      done
+    fi
 
     if [[ "$TEST_TYPE" == "2" ]]; then
       if [[ "$cmd_status" -eq 0 ]] &&
@@ -369,6 +385,15 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
          grep -q "Latency accounting:" "$TRIAL_LOG" &&
          ! grep -q -E "Exception during latency test|Subscriber::Poll timeout|Subscriber poll timeout" "$TRIAL_LOG"; then
         trial_success=1
+        if [[ -n "$trial_artifact_dir" ]]; then
+          cp "$TRIAL_LOG" "$trial_artifact_dir/run.log" 2>/dev/null || true
+          if [[ -f throughput_benchmark_summary.csv ]]; then
+            cp throughput_benchmark_summary.csv "$trial_artifact_dir/throughput_benchmark_summary.csv" 2>/dev/null || true
+          fi
+          for ((b=0; b<NUM_BROKERS; b++)); do
+            cp "/tmp/broker_${b}.log" "$trial_artifact_dir/broker${b}.log" 2>/dev/null || true
+          done
+        fi
         rm -f "$TRIAL_LOG"
         cleanup
         break
@@ -376,6 +401,15 @@ for ((trial=1; trial<=NUM_TRIALS; trial++)); do
     else
       if grep -qi "bandwidth:" "$TRIAL_LOG"; then
         trial_success=1
+        if [[ -n "$trial_artifact_dir" ]]; then
+          cp "$TRIAL_LOG" "$trial_artifact_dir/run.log" 2>/dev/null || true
+          if [[ -f throughput_benchmark_summary.csv ]]; then
+            cp throughput_benchmark_summary.csv "$trial_artifact_dir/throughput_benchmark_summary.csv" 2>/dev/null || true
+          fi
+          for ((b=0; b<NUM_BROKERS; b++)); do
+            cp "/tmp/broker_${b}.log" "$trial_artifact_dir/broker${b}.log" 2>/dev/null || true
+          done
+        fi
         rm -f "$TRIAL_LOG"
         cleanup
         break

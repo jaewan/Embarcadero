@@ -240,7 +240,7 @@ static constexpr int kMaxPBRRetries = 20;           // WAIT_PBR_SLOT: recovery a
 
 // [[Phase 3.2]] written is cumulative (monotonic); fetch_add is sufficient. CXL layout uses
 // volatile size_t; __atomic_fetch_add is the correct way to get atomic RMW (GCC/clang extension).
-void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, uint64_t written_addr, uint32_t num_msg) {
+void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, Topic* topic, uint32_t client_id, uint64_t written_addr, uint32_t num_msg) {
 	if (!tinode) return;
 
 	// [[RACE_CONDITION_FIX]] Update written_addr BEFORE written!
@@ -265,6 +265,10 @@ void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, uint64_t written_add
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written_addr));
 	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
 	CXL::store_fence();  // Required for CXL visibility; reader (AckThread) must see updated written
+
+	if (topic) {
+		topic->UpdatePerClientWritten(client_id, num_msg);
+	}
 }
 
 /**
@@ -1054,17 +1058,14 @@ void NetworkManager::HandlePublishRequest(
 				reinterpret_cast<uint8_t*>(buf) - cxl_base);
 			if (order0_tinode) {
 				const uint64_t batch_end_addr = log_idx + batch_header.total_size;
-				UpdateWrittenForOrder0(order0_tinode, batch_end_addr, batch_header.num_msg);
+				UpdateWrittenForOrder0(order0_tinode, topic_ptr, handshake.client_id,
+				                      batch_end_addr, batch_header.num_msg);
 			}
 			// [[ORDER0_SUBSCRIBE]] Record batch in DRAM ring so subscribers can export
 			// with batch_meta (same protocol as ORDER=5). No CXL writes; minimal overhead.
 			if (topic_ptr) {
-				const uint16_t order0_header_version =
-					InferOrder0HeaderVersion(buf, batch_header.total_size, batch_header.num_msg);
-				topic_ptr->PushOrder0Batch(log_idx,
-				                           batch_header.total_size,
-				                           batch_header.num_msg,
-				                           order0_header_version);
+				topic_ptr->PushOrder0Batch(log_idx, batch_header.total_size, batch_header.num_msg,
+				                         batch_header.start_logical_offset, handshake.client_id);
 			}
 			continue;  // Next batch — no PBR, no validation, no DelegationThread dependency
 		}
@@ -1236,7 +1237,8 @@ void NetworkManager::HandlePublishRequest(
 		// ORDER=0 ACK cursor owner: network ingest path is the single source of truth for written.
 		if (seq_type == EMBARCADERO && tinode && tinode->order == 0) {
 			const uint64_t batch_end_addr = static_cast<uint64_t>(batch_header.log_idx + batch_header.total_size);
-			UpdateWrittenForOrder0(tinode, batch_end_addr, batch_header.num_msg);
+			UpdateWrittenForOrder0(tinode, topic_ptr, handshake.client_id,
+			                      batch_end_addr, batch_header.num_msg);
 			// [[ORDER0_SUBSCRIBE_SLOW_PATH]] Populate the subscriber DRAM ring.
 			// PushOrder0Batch is only called in the fast path (order0_fast=true).
 			// The PBR slow path — used when ACK=2 && RF>0 — was missing this call,
@@ -1244,13 +1246,15 @@ void NetworkManager::HandlePublishRequest(
 			// receive 0 bytes for ORDER=0 RF=2.  Call unconditionally here: the ring
 			// is lock-free, and the subscriber export loop has no replication gate
 			// (matching the fast-path semantic where delivery precedes ACK).
-			if (topic_ptr) {
-				const uint16_t order0_header_version =
-					InferOrder0HeaderVersion(buf, batch_header.total_size, batch_header.num_msg);
-				topic_ptr->PushOrder0Batch(batch_header.log_idx,
-				                           batch_header.total_size,
-				                           batch_header.num_msg,
-				                           order0_header_version);
+				if (topic_ptr) {
+					topic_ptr->RecordOrder0DurableBatch(batch_header.start_logical_offset,
+					                                  batch_header.num_msg,
+					                                  handshake.client_id);
+					topic_ptr->PushOrder0Batch(batch_header.log_idx,
+					                           batch_header.total_size,
+					                           batch_header.num_msg,
+				                           batch_header.start_logical_offset,
+				                           handshake.client_id);
 			}
 		}
 		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for other orders
@@ -2268,6 +2272,14 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		bool found_ack = false;
 		size_t current_ack = (size_t)-1;
 		Topic* ack_topic = topic_manager_ ? topic_manager_->GetTopic(topic) : nullptr;
+		const bool is_order5_head_owned_ack_level1 =
+			(ack_level == 1 &&
+			 ack_topic != nullptr &&
+			 ack_topic->GetSeqtype() == EMBARCADERO &&
+			 ack_topic->GetOrder() == Embarcadero::kOrderStrong);
+		const bool use_per_client_written_ack_level1 =
+			(ack_level == 1 && ack_topic != nullptr &&
+			 ack_topic->SupportsPerClientWrittenAckLevel1());
 		const bool use_per_client_ack_level1 =
 			(ack_level == 1 && ack_topic != nullptr && ack_topic->SupportsPerClientAckLevel1());
 		const bool use_per_client_ack_level2_durable =
@@ -2275,9 +2287,23 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 
 			// Fast-path: Read without flush/fence to detect potential changes.
 			// Safe for ACK2 because durability frontiers are monotonic; stale reads can only delay ACKs.
-			if (use_per_client_ack_level1) {
+			if (use_per_client_written_ack_level1) {
+				current_ack = static_cast<size_t>(ack_topic->GetClientWritten(client_id));
+				expensive_checks_since_last_ack++;
+				fast_polls_without_full_check = 0;
+			} else if (use_per_client_ack_level1) {
 				current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
 				expensive_checks_since_last_ack++;
+				fast_polls_without_full_check = 0;
+			} else if (is_order5_head_owned_ack_level1) {
+				// ORDER=5 ACK1 must be attributed per client from the head sequencer's ordered frontier.
+				// Falling back to the shared per-broker frontier causes multiclient over-ack.
+				if (broker_id_ == 0) {
+					current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
+					expensive_checks_since_last_ack++;
+				} else {
+					current_ack = static_cast<size_t>(-1);
+				}
 				fast_polls_without_full_check = 0;
 			} else if (use_per_client_ack_level2_durable) {
 				current_ack = static_cast<size_t>(ack_topic->GetClientDurable(client_id));

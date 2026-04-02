@@ -47,6 +47,61 @@ Set these to run scripts from a client node while brokers live on a broker node:
 
 Remote mode reuses healthy brokers when possible. Use `FORCE_RESTART_BROKERS=1` when you want a clean cluster start.
 
+### Publication client layout
+
+The publication matrix uses a fixed mixed local+remote client expansion order:
+
+- `NUM_CLIENTS=1` -> `c4`
+- `NUM_CLIENTS=2` -> `c4,c3`
+- `NUM_CLIENTS=3` -> `c4,c3,moscxl(local)`
+
+The corresponding default host roster in the launcher continues with `c2` and `c1` for larger ad hoc runs, but publication results should treat the three-client mixed layout above as canonical.
+
+### Publication matrix contract
+
+For publication throughput reruns, keep the contract explicit:
+
+- `NUM_CLIENTS=1` -> `c4`
+- `NUM_CLIENTS=2` -> `c4,c3`
+- `NUM_CLIENTS=3` -> `c4,c3,moscxl(local)`
+- `REPLICATION_FACTOR=1` -> default `ACK_LEVEL=1`
+- `REPLICATION_FACTOR=2` -> default `ACK_LEVEL=2`
+
+The appendable matrix wrapper [run_throughput_matrix.sh](/home/domin/Embarcadero/scripts/publication/run_throughput_matrix.sh) now derives that default automatically unless `ACK_LEVEL` is set explicitly. If you want an RF=2 run with `ACK_LEVEL=1`, set `ACK_LEVEL=1` yourself; do not rely on the default.
+
+### Publication matrix runner
+
+Use [run_throughput_matrix.sh](/home/domin/Embarcadero/scripts/publication/run_throughput_matrix.sh) to reproduce the current publication throughput package.
+
+The wrapper now encodes the intended publication contracts:
+
+- `embarcadero0`: mixed local+remote client layout, `THREADS_PER_BROKER=4`, `RF=1`
+- `embarcadero5`: publication-safe remote-only layout, `THREADS_PER_BROKER=1`, `RF=1`
+- `corfu`, `lazylog`, `scalog`: mixed local+remote client layout, `THREADS_PER_BROKER=4`, `RF=1 2`
+- `NUM_CLIENTS=1 2 3` by default for every enabled system group
+- sequencer host defaults:
+  - `REMOTE_SEQ_HOST=c2`
+  - `REMOTE_SEQ_IP=10.10.10.144`
+  - `REMOTE_CORFU_SEQ_PORT=50052`
+  - `REMOTE_LAZYLOG_SEQ_PORT=50061`
+  - `REMOTE_SCALOG_SEQ_PORT=50051`
+
+Default invocation:
+
+```bash
+NUM_TRIALS=3 \
+TAG=publication_matrix_current \
+bash scripts/publication/run_throughput_matrix.sh
+```
+
+Useful overrides:
+
+- `MATRIX_SYSTEMS="corfu lazylog scalog"` to run only the baseline systems
+- `BASELINE_RF_VALUES="2"` to run only `rf2` baseline rows
+- `EMBARCADERO_RF_VALUES="1"` and `EMBARCADERO_ORDER5_RF_VALUES="1"` to keep the current Embarcadero publication contracts explicit
+- `SKIP_EXISTING_CELLS=1` to resume an appendable tag without rerunning completed cells
+- `NUM_TRIALS=1` to do a fast first-pass sweep before backfilling to `3` trials
+
 ## Throughput Script
 
 ### `scripts/singlenode_run_throughput.sh`
@@ -164,6 +219,56 @@ Common options:
 - `SWEEP_TARGETS`: whitespace-separated MB/s targets
 - `POINT_MAX_ATTEMPTS`
 - `STRICT_BROKER_COUNT=1` to reject runs that do not use all brokers
+
+### `scripts/run_latency_vs_load.sh`
+
+Runs the publication-oriented latency-vs-load workflow.
+
+Common options:
+
+- `LOAD_POINTS_MBPS`: whitespace-separated offered-load targets for the x-axis
+- `PACING_MODE`: `open_loop` or `steady`
+- `SEQUENCER`
+- `ORDER`
+- `ACK_LEVEL`
+- `REPLICATION_FACTOR`
+- `MSG_SIZE`
+- `TOTAL_MESSAGE_SIZE`
+- `NUM_TRIALS`
+- `NUM_BROKERS`
+- `SCENARIO`
+- `BENCHMARK_TAG`
+- `RUN_ID`
+
+Outputs:
+
+- Raw artifacts per target/trial under `data/latency_vs_load/...`
+- `latency_benchmark_summary.csv` per trial
+- `trial_results.csv` and `summary.csv` aggregated for plotting
+
+### `scripts/run_e2e_throughput_benchmark.sh`
+
+Runs the publication-oriented end-to-end throughput harness for `throughput_test -t 1`.
+
+Common options:
+
+- `SCENARIO`: `local` or `remote`
+- `SEQUENCER`
+- `ORDER`
+- `ACK`
+- `REPLICATION_FACTOR`
+- `NUM_BROKERS`
+- `NUM_TRIALS`
+- `TOTAL_MESSAGE_SIZE`
+- `MESSAGE_SIZE`
+- `THREADS_PER_BROKER`
+- `BENCHMARK_TAG`
+- `RUN_ID`
+
+Outputs:
+
+- Raw per-trial logs and `throughput_benchmark_summary.csv` under `data/e2e_throughput/...`
+- `trial_results.csv` and `summary.csv` aggregated for the run
 
 ## Experiment Wrappers
 
