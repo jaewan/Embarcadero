@@ -449,6 +449,7 @@ broker_wait_for_local_scalog_replication_ready() {
   local expected_brokers="${2:?expected_brokers}"
   local replication_factor="${3:?replication_factor}"
   local expected_replicas_per_broker=$(( replication_factor - 1 ))
+  local log_dir="${BROKER_LOG_DIR:-/tmp}"
 
   if [ "$expected_replicas_per_broker" -le 0 ]; then
     return 0
@@ -459,7 +460,7 @@ broker_wait_for_local_scalog_replication_ready() {
     local ready_brokers=0
     local broker_idx
     for (( broker_idx = 0; broker_idx < expected_brokers; ++broker_idx )); do
-      local log_file="/tmp/broker_${broker_idx}.log"
+      local log_file="${log_dir}/broker_${broker_idx}.log"
       if [ ! -f "$log_file" ]; then
         continue
       fi
@@ -482,8 +483,8 @@ broker_wait_for_local_scalog_replication_ready() {
   echo "Scalog replication readiness timeout after ${timeout_sec}s" >&2
   local broker_idx
   for (( broker_idx = 0; broker_idx < expected_brokers; ++broker_idx )); do
-    local log_file="/tmp/broker_${broker_idx}.log"
-    echo "--- /tmp/broker_${broker_idx}.log ---" >&2
+    local log_file="${log_dir}/broker_${broker_idx}.log"
+    echo "--- ${log_file} ---" >&2
     tail -n 80 "$log_file" >&2 || true
   done
   return 1

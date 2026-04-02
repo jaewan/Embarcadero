@@ -1094,6 +1094,16 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 		auto last_log_time = wait_start_time;
 		auto last_ack_change_time = wait_start_time;
 		auto normalized_acks = [&]() -> size_t {
+			// ORDER=5 ACK1/ACK2 are head-owned on broker 0. The broker emits a single
+			// per-client frontier for the whole client stream, not one frontier per
+			// routed broker. Summing min(sent_i, acked_i) therefore collapses a
+			// correct global ACK stream down to one broker's quota.
+			if (seq_type_ == heartbeat_system::SequencerType::EMBARCADERO &&
+			    order_level_ == Embarcadero::kOrderStrong &&
+			    (ack_level_ == 1 || ack_level_ == 2) &&
+			    !broker_stats_.empty()) {
+				return broker_stats_[0].acked_messages.load(std::memory_order_relaxed);
+			}
 			size_t total = 0;
 			for (size_t i = 0; i < broker_stats_.size(); i++) {
 				const size_t sent = broker_stats_[i].sent_messages.load(std::memory_order_relaxed);

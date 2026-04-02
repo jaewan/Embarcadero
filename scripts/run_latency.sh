@@ -276,6 +276,8 @@ start_local_brokers() {
   local order="$1"
   local seq="$2"
 
+  export BROKER_LOG_DIR="$BIN_DIR"
+
   cleanup
   export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
 
@@ -508,6 +510,32 @@ start_local_brokers() {
   echo "All $NUM_BROKERS brokers ready and reachable."
 }
 
+check_remote_latency_client_ready() {
+  if [[ "$SCENARIO" != "remote" ]]; then
+    return 0
+  fi
+
+  local check_cmd='
+set -euo pipefail
+cd '"$REMOTE_CLIENT_BIN_DIR"'
+test -x ./throughput_test
+if ! grep -q "^COLLECT_LATENCY_STATS:BOOL=ON$" ../CMakeCache.txt 2>/dev/null; then
+  echo "remote throughput_test was built without COLLECT_LATENCY_STATS=ON" >&2
+  exit 1
+fi
+if ! strings ./throughput_test > /tmp/throughput_test_strings.txt 2>/dev/null; then
+  echo "failed to inspect remote throughput_test strings" >&2
+  exit 1
+fi
+if ! grep -q "record_results" /tmp/throughput_test_strings.txt; then
+  echo "remote throughput_test does not contain record_results support" >&2
+  exit 1
+fi
+'
+
+  ssh -o StrictHostKeyChecking=no "$REMOTE_CLIENT_HOST" "bash -lc '$check_cmd'"
+}
+
 # ---------------------------------------------------------------------------
 # Client command builder
 # ---------------------------------------------------------------------------
@@ -560,6 +588,11 @@ run_trial() {
   exec > >(tee "$RUN_LOG") 2>&1
 
   echo "[Trial $trial/$NUM_TRIALS] scenario=$SCENARIO mode=$mode sequencer=$seq order=$order"
+
+  if ! check_remote_latency_client_ready; then
+    echo "ERROR: remote latency client on $REMOTE_CLIENT_HOST is not built with result-recording support" >&2
+    return 1
+  fi
 
   # Clean up any leftover CSV files from a previous run
   (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv)

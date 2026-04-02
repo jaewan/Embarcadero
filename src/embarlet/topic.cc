@@ -121,6 +121,38 @@ static uint64_t GetOrder5IdleForceExpireWindowNs(bool replicated_ack2_mode) {
 	return default_ms * 1000ULL * 1000ULL;
 }
 
+static size_t RecomputeOrder5BatchSizeFromPayload(
+		void* cxl_addr,
+		size_t log_idx,
+		uint32_t expected_num_messages,
+		size_t fallback_size) {
+	if (cxl_addr == nullptr || log_idx == 0 || expected_num_messages == 0) {
+		return fallback_size;
+	}
+
+	uint8_t* cursor = reinterpret_cast<uint8_t*>(cxl_addr) + log_idx;
+	size_t computed_size = 0;
+	for (uint32_t i = 0; i < expected_num_messages; ++i) {
+		if (HeaderUtils::ShouldUseBlogHeader()) {
+			auto* hdr = reinterpret_cast<BlogMessageHeader*>(cursor + computed_size);
+			const size_t payload_size = static_cast<size_t>(hdr->size);
+			if (!wire::ValidateV2Payload(payload_size, wire::ComputeStrideV2(payload_size))) {
+				return fallback_size;
+			}
+			computed_size += wire::ComputeStrideV2(payload_size);
+		} else {
+			auto* hdr = reinterpret_cast<MessageHeader*>(cursor + computed_size);
+			const size_t padded_size = static_cast<size_t>(hdr->paddedSize);
+			if (!wire::ValidateV1PaddedSize(padded_size, padded_size)) {
+				return fallback_size;
+			}
+			computed_size += padded_size;
+		}
+	}
+
+	return computed_size == 0 ? fallback_size : computed_size;
+}
+
 static inline void ClearOrder5PublishState(BatchHeader* hdr) {
 	if (!hdr) return;
 	hdr->publish_commit = kBatchHeaderPublishUncommitted;
@@ -2587,10 +2619,17 @@ bool Topic::GetBatchToExportWithMetadata(
 					}
 				}
 				ring_total_order = actual->total_order;
-
-					ring_batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + actual->log_idx;
-					ring_batch_size = actual->total_size;
-					ring_num_messages = actual->num_msg;
+				ring_batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + actual->log_idx;
+				ring_batch_size = RecomputeOrder5BatchSizeFromPayload(
+					cxl_addr_, actual->log_idx, actual->num_msg, actual->total_size);
+				if (ring_batch_size != actual->total_size) {
+					LOG(WARNING) << "[ORDER5_RING_EXPORT_SIZE_FIX B" << broker_id_ << "]"
+					             << " pbr=" << actual->pbr_absolute_index
+					             << " num_msg=" << actual->num_msg
+					             << " cached_total_size=" << actual->total_size
+					             << " recomputed_total_size=" << ring_batch_size;
+				}
+				ring_num_messages = actual->num_msg;
 				have_ring = true;
 			}
 		}
@@ -2660,8 +2699,7 @@ bool Topic::GetBatchToExportWithMetadata(
 					hold_export_queues_[broker_id_].q.pop_front();
 					return_hold = true;
 					return_late_hold = true;
-				} else if (hold_front.pbr_absolute_index == next_pbr &&
-				           (!have_ring || hold_total_order <= ring_total_order)) {
+				} else if (hold_front.pbr_absolute_index == next_pbr) {
 					hold_export_queues_[broker_id_].q.pop_front();
 					return_hold = true;
 				}
@@ -2674,6 +2712,15 @@ bool Topic::GetBatchToExportWithMetadata(
 		batch_size = hold_front.batch_size;
 		batch_total_order = hold_front.total_order;
 		num_messages = hold_front.num_messages;
+		if (trace_order5) {
+			LOG(INFO) << "[ORDER5_TRACE_EXPORT_BATCH B" << broker_id_ << "]"
+			          << " source=" << (return_late_hold ? "hold_late" : "hold")
+			          << " pbr=" << hold_front.pbr_absolute_index
+			          << " total_order=" << hold_front.total_order
+			          << " log_idx=" << hold_front.log_idx
+			          << " batch_size=" << hold_front.batch_size
+			          << " num_messages=" << hold_front.num_messages;
+		}
 		expected_batch_offset = std::max(next_pbr, hold_front.pbr_absolute_index + 1);
 		trace_export("hit", return_late_hold ? "hold_late" : "hold");
 		return true;
@@ -2683,6 +2730,17 @@ bool Topic::GetBatchToExportWithMetadata(
 		batch_size = ring_batch_size;
 		batch_total_order = ring_total_order;
 		num_messages = ring_num_messages;
+		if (trace_order5) {
+			LOG(INFO) << "[ORDER5_TRACE_EXPORT_BATCH B" << broker_id_ << "]"
+			          << " source=ring"
+			          << " pbr=" << ring_slot_pbr_idx
+			          << " total_order=" << ring_total_order
+			          << " batch_addr="
+			          << (reinterpret_cast<uint8_t*>(ring_batch_addr) -
+			              reinterpret_cast<uint8_t*>(cxl_addr_))
+			          << " batch_size=" << ring_batch_size
+			          << " num_messages=" << ring_num_messages;
+		}
 		expected_batch_offset = next_pbr + 1;
 		trace_export("hit", "ring");
 		return true;
@@ -4191,7 +4249,15 @@ void Topic::CommitEpoch(
 		{
 			OrderedHoldExportEntry ex;
 				ex.log_idx = m.log_idx;
-				ex.batch_size = m.total_size;
+				ex.batch_size = RecomputeOrder5BatchSizeFromPayload(
+					cxl_addr_, m.log_idx, m.num_msg, m.total_size);
+				if (ex.batch_size != m.total_size) {
+					LOG(WARNING) << "[ORDER5_HOLD_EXPORT_SIZE_FIX B" << b << "]"
+					             << " pbr=" << m.pbr_absolute_index
+					             << " num_msg=" << m.num_msg
+					             << " cached_total_size=" << m.total_size
+					             << " recomputed_total_size=" << ex.batch_size;
+				}
 				ex.total_order = next_order;
 				ex.num_messages = m.num_msg;
 				ex.pbr_absolute_index = m.pbr_absolute_index;
@@ -4222,6 +4288,24 @@ void Topic::CommitEpoch(
 		last_ordered_offset[b] = static_cast<size_t>(reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
 		ordered_broker_seen[b] = true;
 		per_client_delta_epoch[static_cast<uint32_t>(p.client_id)] += p.num_msg;
+		{
+			OrderedHoldExportEntry ex;
+			ex.log_idx = p.cached_log_idx;
+			ex.batch_size = RecomputeOrder5BatchSizeFromPayload(
+				cxl_addr_, p.cached_log_idx, p.num_msg, p.cached_total_size);
+			if (ex.batch_size != p.cached_total_size) {
+				LOG(WARNING) << "[ORDER5_EXPORT_SIZE_FIX B" << b << "]"
+				             << " pbr=" << p.cached_pbr_absolute_index
+				             << " num_msg=" << p.num_msg
+				             << " cached_total_size=" << p.cached_total_size
+				             << " recomputed_total_size=" << ex.batch_size;
+			}
+			ex.total_order = next_order - p.num_msg;
+			ex.num_messages = p.num_msg;
+			ex.pbr_absolute_index = p.cached_pbr_absolute_index;
+			absl::MutexLock lock(&hold_export_queues_[b].mu);
+			hold_export_queues_[b].q.push_back(ex);
+		}
 
 		size_t& next_expected = contiguous_consumed_per_broker[b];
 			if (p.slot_offset == next_expected || (next_expected == BATCHHEADERS_SIZE && p.slot_offset == 0)) {
