@@ -920,7 +920,7 @@ class Topic {
 		// Uses per-broker mutex to minimize contention (vs global mutex).
 		struct PerBrokerHoldQueue {
 			absl::Mutex mu;
-			std::deque<OrderedHoldExportEntry> q;
+			absl::btree_map<uint64_t, OrderedHoldExportEntry> q;
 		};
 		std::array<PerBrokerHoldQueue, NUM_MAX_BROKERS> hold_export_queues_{};
 

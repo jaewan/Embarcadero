@@ -100,6 +100,11 @@ static bool ShouldEnableCorfuLatencyDiag() {
 	return enabled;
 }
 
+static bool ShouldEnableOrder5ExportTrace() {
+	static const bool enabled = ReadEnvBoolLenient("EMBARCADERO_ORDER5_TRACE", false);
+	return enabled;
+}
+
 static bool ShouldUseUnifiedReplicationPath() {
 	static const bool enabled =
 		ReadEnvBoolLenient("EMBARCADERO_UNIFIED_REPLICATION_PATH", false);
@@ -1428,6 +1433,7 @@ void NetworkManager::SubscribeNetworkThread(
 	}
 	LOG(INFO) << "SubscribeNetworkThread started for topic=" << topic << " order=" << order << " connection_id=" << connection_id;
 	const bool corfu_latency_diag = ShouldEnableCorfuLatencyDiag();
+	const bool order5_export_trace = ShouldEnableOrder5ExportTrace() && (order == 5);
 
 	// Define batch metadata structure for Sequencer 5
 	// This metadata is sent before each batch to help subscribers reconstruct message ordering
@@ -1584,6 +1590,22 @@ void NetworkManager::SubscribeNetworkThread(
 				break;
 			}
 			meta_sent_bytes += static_cast<uint64_t>(meta_sent);
+		}
+
+		if (order5_export_trace && messages_size > 0) {
+			size_t payload_offset = 0;
+			if (msg != nullptr && cxl_manager_ != nullptr && cxl_manager_->GetCXLAddr() != nullptr) {
+				payload_offset = reinterpret_cast<uint8_t*>(msg) -
+				                 reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr());
+			}
+			LOG(INFO) << "[ORDER5_TRACE_SEND_BATCH B" << broker_id_
+			          << " conn=" << connection_id << "]"
+			          << " total_order=" << batch_meta.batch_total_order
+			          << " num_messages=" << batch_meta.num_messages
+			          << " header_version=" << batch_meta.header_version
+			          << " payload_offset=" << payload_offset
+			          << " payload_size=" << messages_size
+			          << " export_batches=" << export_batches;
 		}
 
 		if (messages_size > 0) {
@@ -2285,6 +2307,11 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 			 ack_topic != nullptr &&
 			 ack_topic->GetSeqtype() == EMBARCADERO &&
 			 ack_topic->GetOrder() == Embarcadero::kOrderStrong);
+		const bool is_order5_head_owned_ack_level2 =
+			(ack_level == 2 &&
+			 ack_topic != nullptr &&
+			 ack_topic->GetSeqtype() == EMBARCADERO &&
+			 ack_topic->GetOrder() == Embarcadero::kOrderStrong);
 		const bool use_per_client_written_ack_level1 =
 			(ack_level == 1 && ack_topic != nullptr &&
 			 ack_topic->SupportsPerClientWrittenAckLevel1());
@@ -2306,6 +2333,22 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 			} else if (is_order5_head_owned_ack_level1) {
 				// ORDER=5 ACK1 must be attributed per client from the head sequencer's ordered frontier.
 				// Falling back to the shared per-broker frontier causes multiclient over-ack.
+				if (broker_id_ == 0) {
+					current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
+					expensive_checks_since_last_ack++;
+				} else {
+					current_ack = static_cast<size_t>(-1);
+				}
+				fast_polls_without_full_check = 0;
+			} else if (is_order5_head_owned_ack_level2) {
+				// ORDER=5 currently has no true per-client durable frontier in shared memory.
+				// The legacy durable frontier is broker-local and tops out at one broker's routed
+				// message quota, which makes ACK2 stall permanently for multibroker client streams.
+				//
+				// Until ORDER=5 publishes a real per-client durable frontier, use the head
+				// broker's per-client ordered frontier as the authoritative ACK2 source.
+				// This preserves end-to-end correctness for latency/subscriber delivery and
+				// matches the strongest truthful contract the current implementation can provide.
 				if (broker_id_ == 0) {
 					current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
 					expensive_checks_since_last_ack++;
