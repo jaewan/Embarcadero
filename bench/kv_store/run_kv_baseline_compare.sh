@@ -32,7 +32,10 @@ KV_BENCH_BROKER_IP="${KV_BENCH_BROKER_IP:-127.0.0.1}"
 KV_BENCH_RECORD_COUNT="${KV_BENCH_RECORD_COUNT:-100000}"
 KV_BENCH_OPERATION_COUNT="${KV_BENCH_OPERATION_COUNT:-500000}"
 KV_BENCH_WARMUP_OPS="${KV_BENCH_WARMUP_OPS:-10000}"
-KV_BENCH_PUB_THREADS="${KV_BENCH_PUB_THREADS:-3}"
+# Default 1: Embarcadero ORDER=5 can stall final apply with multi-thread publisher
+# (pipelined KV bench); CORFU/LazyLog/Scalog remain stable with higher values.
+# Override KV_BENCH_PUB_THREADS for sensitivity; use the same value for all sequencers in a run.
+KV_BENCH_PUB_THREADS="${KV_BENCH_PUB_THREADS:-1}"
 KV_BENCH_LOG_LEVEL="${KV_BENCH_LOG_LEVEL:-0}"
 KV_BENCH_ENABLE_LATENCY="${KV_BENCH_ENABLE_LATENCY:-1}"
 KV_BENCH_NUM_TRIALS="${KV_BENCH_NUM_TRIALS:-3}"
