@@ -2,6 +2,8 @@
 // TODO(Jae) modify this later
 #include "distributed_kv_store.h"
 
+#include "common/wire_formats.h"
+
 #include <sstream>
 #include <chrono>
 
@@ -108,45 +110,62 @@ LogEntry LogEntry::deserialize(const void* data, size_t client_id, size_t client
 	return entry;
 }
 
-// DistributedKVStore implementation
-DistributedKVStore::DistributedKVStore(SequencerType seq_type,
-							 int publisher_threads,
-							 size_t publisher_message_size,
-							 int ack_level)
+// Config-based constructor
+DistributedKVStore::DistributedKVStore(const Config& cfg)
 	: last_request_id_(0),
 		last_applied_total_order_(0),
 		last_transaction_id_(0),
-		running_(true) {
+		running_(true),
+		manage_cluster_(cfg.manage_cluster),
+		track_latency_(cfg.track_latency) {
 
 		char topic[TOPIC_NAME_SIZE];
 		memset(topic, 0, TOPIC_NAME_SIZE);
 		memcpy(topic, "KVStoreTopic", 12);
 
-		// Setup Embarcadero
 		stub_ = HeartBeat::NewStub(
-				grpc::CreateChannel("127.0.0.1:" + std::to_string(BROKER_PORT), 
+				grpc::CreateChannel(cfg.broker_ip + ":" + std::to_string(BROKER_PORT),
 					grpc::InsecureChannelCredentials()));
-		int num_threads = publisher_threads;
-		int order = 0;
-		if(SequencerType::EMBARCADERO == seq_type){
-			order = 4;
-		} else if(SequencerType::SCALOG == seq_type){
-			order = 1;
-		} else if(SequencerType::CORFU == seq_type){
-			order = 4;
-		}
 
-		CreateNewTopic(stub_, topic, order, seq_type, 1/*replication_factor*/, false, ack_level);
+		int order = cfg.order;
+		order_level_ = order;
 
-		subscriber_ = std::unique_ptr<Subscriber>(new Subscriber("127.0.0.1", std::to_string(BROKER_PORT), topic));
-		publisher_ = std::unique_ptr<Publisher>(new Publisher(topic, "127.0.0.1", std::to_string(BROKER_PORT), 
-				num_threads, publisher_message_size, (1UL<<33), order, seq_type));
-		publisher_->Init(ack_level);
+		CreateNewTopic(stub_, topic, order, cfg.seq_type,
+		               cfg.replication_factor, false, cfg.ack_level);
+
+		subscriber_ = std::make_unique<Subscriber>(
+			cfg.broker_ip,
+			std::to_string(BROKER_PORT),
+			topic,
+			/*measure_latency=*/false,
+			order);
+		publisher_ = std::make_unique<Publisher>(
+			topic, cfg.broker_ip, std::to_string(BROKER_PORT),
+			cfg.publisher_threads, cfg.publisher_message_size,
+			(1UL << 33), order, cfg.seq_type);
+		publisher_->Init(cfg.ack_level);
 		server_id_ = publisher_->GetClientId();
 
-		// Wait until all brokers (as per runtime config) have established subscriber connections
 		subscriber_->WaitUntilAllConnected();
 		log_consumer_threads_.emplace_back(&DistributedKVStore::logConsumer, this);
+}
+
+// Legacy constructor delegates to Config-based
+DistributedKVStore::DistributedKVStore(SequencerType seq_type,
+							 int publisher_threads,
+							 size_t publisher_message_size,
+							 int ack_level)
+	: DistributedKVStore(Config{
+		seq_type,
+		/*order=*/ (seq_type == SequencerType::SCALOG ? 1 :
+		            seq_type == SequencerType::EMBARCADERO ? 5 : 2),
+		ack_level,
+		/*replication_factor=*/ 1,
+		publisher_threads,
+		publisher_message_size,
+		"127.0.0.1",
+		true
+	}) {
 }
 
 DistributedKVStore::~DistributedKVStore() {
@@ -163,11 +182,12 @@ DistributedKVStore::~DistributedKVStore() {
 	}
 	log_consumer_threads_.clear();
 
-	// Terminate Embarcadero Cluster
-	google::protobuf::Empty request, response;
-	grpc::ClientContext context;
-	if (stub_) {
-		stub_->TerminateCluster(&context, request, &response);
+	if (manage_cluster_) {
+		google::protobuf::Empty request, response;
+		grpc::ClientContext context;
+		if (stub_) {
+			stub_->TerminateCluster(&context, request, &response);
+		}
 	}
 
 	// Release resources
@@ -180,7 +200,8 @@ DistributedKVStore::~DistributedKVStore() {
 
 void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t size,
 		uint32_t client_id, size_t client_order,
-		size_t total_order) {
+		size_t total_order,
+		bool use_apply_ordinal_for_pending_completion) {
 	if (!data || size == 0) {
 		LOG(ERROR) << "Invalid raw buffer data for processing";
 		return;
@@ -188,9 +209,6 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 
 	const char* buffer = static_cast<const char*>(data);
 	size_t offset = 0;
-
-	// Create an OperationId from the message header information
-	OperationId opId{client_id, client_order};
 
 	// Read operation type
 	uint8_t opTypeValue;
@@ -241,21 +259,14 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				std::string value(buffer + offset, valueLength);
 				offset += valueLength;
 
-				// Apply the operation directly to the ShardedKVStore (no mutex needed!)
 				kv_store_.put(key, value);
 
-				// If this is our own request, complete the pending operation
 				if (client_id == server_id_) {
-					{
-						absl::MutexLock l(&lat_mutex_);
-						auto it = op_start_ts_.find(opId.requestId);
-						if (it != op_start_ts_.end()) {
-							double dur_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it->second).count();
-							apply_latencies_ms_.push_back(dur_ms);
-							op_start_ts_.erase(it);
-						}
-					}
-					completeOperation(client_order);
+					const OPID applied_op =
+						applied_local_ops_.fetch_add(1, std::memory_order_acq_rel);
+					completePendingLocalOp(use_apply_ordinal_for_pending_completion
+					                               ? applied_op
+					                               : client_order);
 				}
 				break;
 			}
@@ -284,34 +295,25 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				memcpy(&valueLength, buffer + offset, sizeof(valueLength));
 				offset += sizeof(valueLength) + valueLength; // Skip value content
 
-				// Apply the operation directly to the ShardedKVStore (no mutex needed!)
 				kv_store_.remove(key);
 
-				// If this is our own request, complete the pending operation
 				if (client_id == server_id_) {
-					{
-						absl::MutexLock l(&lat_mutex_);
-						auto it = op_start_ts_.find(opId.requestId);
-						if (it != op_start_ts_.end()) {
-							double dur_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it->second).count();
-							apply_latencies_ms_.push_back(dur_ms);
-							op_start_ts_.erase(it);
-						}
-					}
-					completeOperation(client_order);
+					const OPID applied_op =
+						applied_local_ops_.fetch_add(1, std::memory_order_acq_rel);
+					completePendingLocalOp(use_apply_ordinal_for_pending_completion
+					                               ? applied_op
+					                               : client_order);
 				}
 				break;
 			}
 
 		case OpType::MULTI_PUT: 
 			{
-				// Process multiple PUT operations with thread-local scratch to reduce allocs
 				thread_local std::vector<std::pair<std::string, std::string>> kvPairs;
 				kvPairs.clear();
 				kvPairs.reserve(pairCount);
 
 				for (uint32_t i = 0; i < pairCount; ++i) {
-					// Read key
 					uint32_t keyLength;
 					if (offset + sizeof(keyLength) > size) return;
 					memcpy(&keyLength, buffer + offset, sizeof(keyLength));
@@ -321,7 +323,6 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 					std::string key(buffer + offset, keyLength);
 					offset += keyLength;
 
-					// Read value
 					uint32_t valueLength;
 					if (offset + sizeof(valueLength) > size) return;
 					memcpy(&valueLength, buffer + offset, sizeof(valueLength));
@@ -331,25 +332,17 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 					std::string value(buffer + offset, valueLength);
 					offset += valueLength;
 
-					// Collect key-value pairs
 					kvPairs.emplace_back(key, value);
 				}
 
-				// Apply all key-value pairs in one call (efficient batching)
 				kv_store_.multiPut(kvPairs);
 
-				// If this is our own request, complete the pending operation
 				if (client_id == server_id_) {
-					{
-						absl::MutexLock l(&lat_mutex_);
-						auto it = op_start_ts_.find(opId.requestId);
-						if (it != op_start_ts_.end()) {
-							double dur_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it->second).count();
-							apply_latencies_ms_.push_back(dur_ms);
-							op_start_ts_.erase(it);
-						}
-					}
-					completeOperation(client_order);
+					const OPID applied_op =
+						applied_local_ops_.fetch_add(1, std::memory_order_acq_rel);
+					completePendingLocalOp(use_apply_ordinal_for_pending_completion
+					                               ? applied_op
+					                               : client_order);
 				}
 				break;
 			}
@@ -462,26 +455,62 @@ void DistributedKVStore::completeOperation(OPID opId){
 	 */
 }
 
-// Process messages in without caring total_order
+void DistributedKVStore::completePendingLocalOp(OPID op) {
+	if (track_latency_) {
+		absl::MutexLock l(&lat_mutex_);
+		auto it = op_start_ts_.find(op);
+		if (it != op_start_ts_.end()) {
+			double dur_ms = std::chrono::duration<double, std::milli>(
+					std::chrono::steady_clock::now() - it->second).count();
+			apply_latencies_ms_.push_back(dur_ms);
+			op_start_ts_.erase(it);
+		}
+	}
+	absl::MutexLock lock(&pending_ops_mutex_);
+	if (pending_ops_.erase(op) == 0) {
+		LOG_EVERY_N(WARNING, 100) << "Applied local operation with no pending op id=" << op;
+	}
+}
+
+// ORDER>=2: Subscriber::Consume() dispatches to ConsumeOrdered (private); do not
+// bypass it unless a public ordered API is added.
 void DistributedKVStore::logConsumer() {
 	while (running_) {
-		Embarcadero::MessageHeader *header =	(Embarcadero::MessageHeader*)subscriber_->Consume();
-		if(header == nullptr){
+		void* raw = subscriber_->Consume();
+		if (raw == nullptr) {
 			if (!running_) break;
 			std::this_thread::yield();
 			continue;
 		}
 
-		// Extract the message payload (skip the header)
-		void* payload = (void*)((uint8_t*)header + sizeof(Embarcadero::MessageHeader));
-		size_t payload_size = header->size;
-		processLogEntryFromRawBuffer(
+		// Decode using the format the subscriber parsed (from BatchMetadata.header_version on
+		// the wire), not ShouldUseBlogHeader() here: broker vs client env mismatch would
+		// mis-read client_id/size and stall applied_local_ops_.
+		const uint16_t wire_ver = subscriber_->LastConsumedWireHeaderVersion();
+		const bool is_blog_wire =
+			(wire_ver == Embarcadero::wire::HEADER_VERSION_V2);
+		if (is_blog_wire) {
+			auto* header = reinterpret_cast<Embarcadero::BlogMessageHeader*>(raw);
+			void* payload = reinterpret_cast<uint8_t*>(header) + sizeof(Embarcadero::BlogMessageHeader);
+			processLogEntryFromRawBuffer(
 				payload,
-				payload_size,
-				header->client_id,
-				header->client_order,
-				header->total_order
-		);
+				header->size,
+				static_cast<uint32_t>(header->client_id),
+				header->batch_seq,
+				header->total_order,
+				/*use_apply_ordinal_for_pending_completion=*/true);
+			continue;
+		}
+
+		auto* header = reinterpret_cast<Embarcadero::MessageHeader*>(raw);
+		void* payload = reinterpret_cast<uint8_t*>(header) + sizeof(Embarcadero::MessageHeader);
+		processLogEntryFromRawBuffer(
+			payload,
+			header->size,
+			header->client_id,
+			header->client_order,
+			header->total_order,
+			/*use_apply_ordinal_for_pending_completion=*/false);
 		/*
 		// Deserialize the message into a LogEntry
 		LogEntry entry = LogEntry::deserialize(payload, header->client_id, header->client_order);
@@ -500,27 +529,23 @@ void DistributedKVStore::logConsumer() {
 }
 
 size_t DistributedKVStore::put(const std::string& key, const std::string& value) {
-	// Create operation ID
-	size_t client_order = last_request_id_++;
+	size_t client_order = publisher_->GetNextPublishOrder();
 	OperationId opId{server_id_, client_order};
 
-	// Create log entry
 	LogEntry entry;
 	entry.opId = opId;
 	entry.type = OpType::PUT;
 	entry.kvPairs.push_back({key, value});
-	entry.transactionId = 0;  // Not part of a transaction
+	entry.transactionId = 0;
 
-	OPID opid = client_order; // This must be same as MesageHeader's client_order
+	OPID opid = client_order;
 
-	// Register pending operation
 	{
 		absl::MutexLock lock(&pending_ops_mutex_);
 		pending_ops_.insert(opid);
 	}
-	// Publish to log
 	auto serialized = entry.serialize();
-	{
+	if (track_latency_) {
 		absl::MutexLock l(&lat_mutex_);
 		op_start_ts_[opid] = std::chrono::steady_clock::now();
 	}
@@ -530,27 +555,23 @@ size_t DistributedKVStore::put(const std::string& key, const std::string& value)
 }
 
 size_t DistributedKVStore::multiPut(const std::vector<KeyValue>& kvPairs) {
-	// Create operation ID
-	size_t client_order = last_request_id_++;
+	size_t client_order = publisher_->GetNextPublishOrder();
 	OperationId opId{server_id_, client_order};
 
-	// Create log entry
 	LogEntry entry;
 	entry.opId = opId;
 	entry.type = OpType::MULTI_PUT;
 	entry.kvPairs = kvPairs;
-	entry.transactionId = 0;  // Not part of a transaction
+	entry.transactionId = 0;
 
-	OPID opid = client_order; // This must be same as MesageHeader's client_order
+	OPID opid = client_order;
 
-	// Register pending operation
 	{
 		absl::MutexLock lock(&pending_ops_mutex_);
 		pending_ops_.insert(opid);
 	}
-	// Publish to log
 	auto serialized = entry.serialize();
-	{
+	if (track_latency_) {
 		absl::MutexLock l(&lat_mutex_);
 		op_start_ts_[opid] = std::chrono::steady_clock::now();
 	}
@@ -560,12 +581,25 @@ size_t DistributedKVStore::multiPut(const std::vector<KeyValue>& kvPairs) {
 }
 
 void DistributedKVStore::waitForSyncWithLog(){
-	// Get last total_order from the shared log and wait until local KV store is up-to-date
-	return;
+	// Read-your-writes barrier for callers that do not track a specific client op id.
+	// Flush the publisher first so partially filled client batches are visible to the
+	// subscriber/consumer thread, then wait until every pending local write is applied.
+	if (publisher_) {
+		publisher_->WriteFinishedOrPaused();
+	}
+	const uint64_t target = publisher_ ? publisher_->GetNextPublishOrder() : 0;
+	while (applied_local_ops_.load(std::memory_order_acquire) < target) {
+		std::this_thread::yield();
+	}
 }
 
 void DistributedKVStore::waitForSyncWithLog(OPID min_client_opid){
-	while (!opFinished(min_client_opid)){
+	// Flush any partially filled client batch before waiting; otherwise the last
+	// few ops may never be sealed/published, and this barrier can spin forever.
+	if (publisher_) {
+		publisher_->WriteFinishedOrPaused();
+	}
+	while (applied_local_ops_.load(std::memory_order_acquire) <= min_client_opid) {
 		std::this_thread::yield();
 	}
 }
@@ -609,4 +643,12 @@ std::vector<double> DistributedKVStore::collectApplyLatenciesAndReset(){
 	std::vector<double> out;
 	out.swap(apply_latencies_ms_);
 	return out;
+}
+
+size_t DistributedKVStore::publishBatch(const std::vector<KeyValue>& kvPairs, OpType type) {
+	if (kvPairs.empty()) return 0;
+	if (kvPairs.size() == 1 && type == OpType::MULTI_PUT) {
+		return put(kvPairs[0].key, kvPairs[0].value);
+	}
+	return multiPut(kvPairs);
 }

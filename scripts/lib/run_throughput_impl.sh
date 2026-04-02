@@ -78,13 +78,19 @@ if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
   rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
 fi
 
-# Local sequencer defaults: on single-node runs, prefer localhost unless explicitly remote.
+# Sequencer reachability: loopback when the global sequencer is colocated with brokers.
+# Remote throughput runs SSH to REMOTE_BROKER_HOST; broker→sequencer RPCs must not use the
+# client's dataplane IP unless the sequencer actually listens there.
 if ! broker_is_remote_mode; then
   if [[ "$SEQUENCER" == "SCALOG" && -z "${EMBARCADERO_SCALOG_SEQ_IP:-}" ]]; then
     export EMBARCADERO_SCALOG_SEQ_IP="127.0.0.1"
   fi
   if [[ "$SEQUENCER" == "LAZYLOG" && -z "${EMBARCADERO_LAZYLOG_SEQ_IP:-}" ]]; then
     export EMBARCADERO_LAZYLOG_SEQ_IP="127.0.0.1"
+  fi
+else
+  if [[ "$SEQUENCER" == "SCALOG" && -z "${REMOTE_SCALOG_SEQUENCER_HOST:-}" ]]; then
+    export EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-127.0.0.1}"
   fi
 fi
 

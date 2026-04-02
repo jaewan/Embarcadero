@@ -214,6 +214,12 @@ class Subscriber {
 		void* Consume(int timeout_ms = 1000);
 		void* ConsumeBatchAware(int timeout_ms = 1000);
 
+		// Wire format of the last successful Consume() return (HEADER_VERSION_V1/V2).
+		// Undefined if the last Consume() returned nullptr; call only after a non-null pointer.
+		uint16_t LastConsumedWireHeaderVersion() const {
+			return last_consumed_wire_version_;
+		}
+
 	// For Sequencer 5: Process batch metadata and reconstruct message ordering
 	void ProcessSequencer5Data(uint8_t* data, size_t data_size, std::shared_ptr<ConnectionBuffers> conn_buffers);
 
@@ -404,6 +410,7 @@ class Subscriber {
 		size_t next_expected_order_{0};
 		std::map<size_t, std::unique_ptr<OwnedMessage>> pending_messages_;
 		std::unique_ptr<OwnedMessage> last_returned_;
+		uint16_t last_consumed_wire_version_{Embarcadero::wire::HEADER_VERSION_V1};
 		absl::flat_hash_map<int, StreamParseState> parse_states_;
 
 		// --- Order < 2 consume state (per-Subscriber, not static) ---

@@ -18,6 +18,7 @@
 #include "../disk_manager/scalog_replication_client.h"
 #include "../cxl_manager/cxl_datastructure.h"
 #include "common/config.h"
+#include "common/wire_formats.h"
 #include "sequencer_utils.h"
 
 #include "absl/container/flat_hash_set.h"
@@ -363,7 +364,8 @@ class Topic {
 		 * Lock-free multi-producer, multi-reader ring (DRAM only, no CXL writes).
 		 */
 		void PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg,
-		                   uint64_t start_logical_offset, uint32_t client_id);
+		                   uint64_t start_logical_offset, uint32_t client_id,
+		                   uint16_t header_version);
 
 		/**
 		 * Read the next ORDER=0 batch record for a subscriber.
@@ -739,7 +741,8 @@ class Topic {
 			uint32_t total_size = 0;
 			uint32_t num_msg = 0;
 			uint32_t client_id = 0;
-			uint32_t _pad = 0;
+			uint16_t header_version = wire::HEADER_VERSION_V1;
+			uint16_t _pad = 0;
 		};
 		static_assert(sizeof(Order0BatchSlot) == 64, "Order0BatchSlot must be 64 bytes");
 		static constexpr size_t kOrder0BatchRingSize = 8192;  // 8K slots × 32B = 256KB DRAM

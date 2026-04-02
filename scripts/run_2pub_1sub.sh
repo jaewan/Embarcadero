@@ -42,7 +42,7 @@
 #   TOTAL_MESSAGE_SIZE   total bytes across both publishers (default 10 GiB)
 #   MESSAGE_SIZE, THREADS_PER_BROKER
 #   ORDER, ACK, REPLICATION_FACTOR, SEQUENCER
-#   EMBARCADERO_HEAD_ADDR   broker NIC IP (default 10.10.10.10)
+#   EMBARCADERO_HEAD_ADDR   broker NIC IP (default 10.10.10.143)
 #   PUB_C4_NUMA             NUMA node for c4 publisher (default 1)
 #   LOCAL_PUB_NUMA          NUMA node for local publisher on broker machine (default 0)
 #   SUB_NUMA                NUMA node for c3 subscriber (default 1)
@@ -90,7 +90,7 @@ ACK=${ACK:-1}
 REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
 
-BROKER_IP="${EMBARCADERO_HEAD_ADDR:-10.10.10.10}"
+BROKER_IP="${EMBARCADERO_HEAD_ADDR:-10.10.10.143}"
 export EMBARCADERO_HEAD_ADDR="$BROKER_IP"
 
 BROKER_READY_TIMEOUT_SEC=${BROKER_READY_TIMEOUT_SEC:-60}

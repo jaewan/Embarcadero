@@ -376,6 +376,13 @@ void Publisher::LogOrder5RoutingSummary() const {
 Publisher::~Publisher() {
 	VLOG(3) << "Publisher destructor called, cleaning up resources";
 
+	// Benchmark paths that rely on explicit sync barriers can destroy Publisher
+	// without ever calling Poll(). Flush any partial batch and wake queue readers so
+	// PublishThread instances can drain/exit before we join them here.
+	WriteFinishedOrPaused();
+	pubQue_.WriteFinished();
+	pubQue_.ReturnReads();
+
 	// Signal all threads to terminate [[RELAXED: Simple flags don't need ordering]]
 	publish_finished_.store(true, std::memory_order_relaxed);
 	shutdown_.store(true, std::memory_order_relaxed);

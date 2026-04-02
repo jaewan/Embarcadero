@@ -2,6 +2,8 @@
 
 _Last updated: 2026-03-26_
 
+**Lab addressing (2026-04):** scripts and clients default to broker head **`10.10.10.143`** on the 10.10.10.x LAN. Text below still cites **`10.10.10.10`** where it describes historical loopback / published measurements; treat that as the same host’s alternate address in those runs, not a conflicting requirement.
+
 ---
 
 ## TL;DR

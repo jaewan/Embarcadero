@@ -313,7 +313,7 @@ for test_case in "${test_cases[@]}"; do
       echo "Remote brokers ready on $REMOTE_BROKER_HOST."
     else
       # Bind local brokers to the external head address so remote clients can connect.
-      export EMBARCADERO_HEAD_ADDR="${EMBARCADERO_HEAD_ADDR:-10.10.10.10}"
+      export EMBARCADERO_HEAD_ADDR="${EMBARCADERO_HEAD_ADDR:-10.10.10.143}"
       # Start head broker; $! is the PID of the background embarlet process
       $EMBARLET_NUMA_BIND ./embarlet $HEAD_CONFIG_ARG --head --$sequencer > broker_0_trial${trial}.log 2>&1 &
       head_pid=$!

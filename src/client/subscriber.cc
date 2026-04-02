@@ -2142,6 +2142,7 @@ void* Subscriber::Consume(int timeout_ms) {
             if (message_to_return != nullptr) {
                 consume_acquired_buffer_ = buffer;
                 consume_acquired_connection_ = conn_ptr;
+                last_consumed_wire_version_ = Embarcadero::wire::HEADER_VERSION_V1;
                 return message_to_return;
             }
             // No message found in this buffer, release it (single release only)
@@ -2326,6 +2327,7 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 			pending_messages_.erase(it);
 			void* ret = last_returned_ ? static_cast<void*>(last_returned_->data.data()) : nullptr;
 			if (ret) {
+				last_consumed_wire_version_ = last_returned_->header_version;
 				next_expected_order_++;
 				return ret;
 			}

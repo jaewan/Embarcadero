@@ -210,6 +210,8 @@ class DistributedKVStore {
 
 		// Index tracking - where in the log we've processed up to
 		std::atomic<uint64_t> last_applied_total_order_;
+		// Count of this client's published log entries that have been applied locally.
+		std::atomic<uint64_t> applied_local_ops_{0};
 		absl::Mutex apply_mutex_;
 
 		// Thread pool for handling read operations
@@ -238,8 +240,12 @@ class DistributedKVStore {
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::unique_ptr<Publisher> publisher_;
 		std::unique_ptr<Subscriber> subscriber_;
+		int order_level_ = 0;
 
-		// Latency instrumentation
+		bool manage_cluster_ = true;
+		bool track_latency_ = false;
+
+		// Latency instrumentation (only active when track_latency_ == true)
 		absl::Mutex lat_mutex_;
 		absl::flat_hash_map<OPID, std::chrono::steady_clock::time_point> op_start_ts_ ABSL_GUARDED_BY(lat_mutex_);
 		std::vector<double> apply_latencies_ms_ ABSL_GUARDED_BY(lat_mutex_);
@@ -248,18 +254,33 @@ class DistributedKVStore {
 		void processLogEntry(const LogEntry& entry, uint64_t logPosition);
 		void processLogEntryFromRawBuffer(const void* data, size_t size,
 				uint32_t client_id, size_t client_order,
-				size_t total_order);
+				size_t total_order,
+				bool use_apply_ordinal_for_pending_completion);
 
 		// Complete a pending operation
 		void completeOperation(OPID opId);
+		// Clear pending state for our client_id using log message order (not FIFO publish order).
+		void completePendingLocalOp(OPID op);
 
 		// Consumer thread function to process log entries
 		void logConsumer();
 
-		void waitForSyncWithLog();
-
 	public:
-		// Constructor - now initializes the thread pool with a configurable number of threads
+		struct Config {
+			SequencerType seq_type = heartbeat_system::SequencerType::EMBARCADERO;
+			int order = 5;
+			int ack_level = 0;
+			int replication_factor = 1;
+			int publisher_threads = 3;
+			size_t publisher_message_size = (64 * 1024);
+			std::string broker_ip = "127.0.0.1";
+			bool manage_cluster = true;
+			bool track_latency = false;  // enable per-op latency tracking (adds mutex contention)
+		};
+
+		explicit DistributedKVStore(const Config& config);
+
+		// Legacy constructor for backward compatibility
 		explicit DistributedKVStore(SequencerType seq_type,
 								 int publisher_threads = 3,
 								 size_t publisher_message_size = (64 * 1024),
@@ -284,18 +305,27 @@ class DistributedKVStore {
 
 		std::vector<std::pair<std::string, std::string>> multiGet(const std::vector<std::string>& keys);
 
+		// Batch publish: serialize multiple KV ops into a single log append
+		size_t publishBatch(const std::vector<KeyValue>& kvPairs, OpType type = OpType::MULTI_PUT);
+
 		// Get the current state of the key-value store (for debugging)
 		std::unordered_map<std::string, std::string> getState();
 
 		// Get the last applied index
 		uint64_t getLastAppliedIndex() const;
 
+		uint64_t getServerID() const { return server_id_; }
+
+		size_t storeSize() const { return kv_store_.size(); }
+
 		bool opFinished(OPID opId){
 			absl::MutexLock lock(&pending_ops_mutex_);
 			return pending_ops_.find(opId) == pending_ops_.end();
 		}
 
-		// Read-your-writes barrier
+		// Flush publisher, then wait until all sealed publishes are applied locally.
+		void waitForSyncWithLog();
+		// Wait until an op with client order strictly greater than min_client_opid is applied.
 		void waitForSyncWithLog(OPID min_client_opid);
 
 		// Collect and reset apply latencies

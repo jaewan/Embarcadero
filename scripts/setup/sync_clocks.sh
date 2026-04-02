@@ -1,11 +1,11 @@
 #!/bin/bash
 # Synchronize clocks across the cluster using chrony
-# Local node (10.10.10.10) acts as the NTP master
+# Local node (10.10.10.143) acts as the NTP master
 # c1, c2, c3, c4 act as NTP clients
 
 set -e
 
-MASTER_IP="10.10.10.10"
+MASTER_IP="10.10.10.143"
 NETWORK="10.10.10.0/24"
 CLIENTS=("c1" "c2" "c3" "c4")
 

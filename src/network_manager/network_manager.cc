@@ -1064,8 +1064,11 @@ void NetworkManager::HandlePublishRequest(
 			// [[ORDER0_SUBSCRIBE]] Record batch in DRAM ring so subscribers can export
 			// with batch_meta (same protocol as ORDER=5). No CXL writes; minimal overhead.
 			if (topic_ptr) {
+				const uint16_t o0_wire_ver = InferOrder0HeaderVersion(
+					buf, batch_header.total_size, batch_header.num_msg);
 				topic_ptr->PushOrder0Batch(log_idx, batch_header.total_size, batch_header.num_msg,
-				                         batch_header.start_logical_offset, handshake.client_id);
+				                         batch_header.start_logical_offset, handshake.client_id,
+				                         o0_wire_ver);
 			}
 			continue;  // Next batch — no PBR, no validation, no DelegationThread dependency
 		}
@@ -1250,11 +1253,16 @@ void NetworkManager::HandlePublishRequest(
 					topic_ptr->RecordOrder0DurableBatch(batch_header.start_logical_offset,
 					                                  batch_header.num_msg,
 					                                  handshake.client_id);
+					uint8_t* payload_base = reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr()) +
+					                        batch_header.log_idx;
+					const uint16_t o0_wire_ver = InferOrder0HeaderVersion(
+						payload_base, batch_header.total_size, batch_header.num_msg);
 					topic_ptr->PushOrder0Batch(batch_header.log_idx,
 					                           batch_header.total_size,
 					                           batch_header.num_msg,
 				                           batch_header.start_logical_offset,
-				                           handshake.client_id);
+				                           handshake.client_id,
+				                           o0_wire_ver);
 			}
 		}
 		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for other orders

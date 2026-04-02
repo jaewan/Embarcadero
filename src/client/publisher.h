@@ -143,6 +143,12 @@ class Publisher {
 			return client_id_;
 		}
 
+		// Returns the client_order that the next Publish() call will stamp into the
+		// message header. Safe for the single-producer benchmark path.
+		size_t GetNextPublishOrder() const {
+			return next_publish_order_;
+		}
+
 		size_t GetAckReceived() const {
 			return ack_received_.load(std::memory_order_relaxed);
 		}

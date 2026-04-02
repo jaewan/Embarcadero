@@ -166,7 +166,8 @@ class TopicManager {
 				uint32_t& out_num_msg, uint16_t& out_header_version) const;
 		void PushOrder0Batch(const char* topic, uint64_t log_idx,
 				uint32_t total_size, uint32_t num_msg,
-				uint64_t start_logical_offset, uint32_t client_id);
+				uint64_t start_logical_offset, uint32_t client_id,
+				uint16_t header_version);
 
 		int GetTopicOrder(const char* topic);
 

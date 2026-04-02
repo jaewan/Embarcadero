@@ -2,8 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 find_package(cxxopts REQUIRED)
 
-add_executable(kv_store_bench
-    main.cc
+set(KV_CLIENT_SOURCES
     distributed_kv_store.cc
     distributed_kv_store.h
     ../../src/client/publisher.cc
@@ -20,7 +19,7 @@ add_executable(kv_store_bench
     ../../src/common/configuration.h
 )
 
-target_include_directories(kv_store_bench PUBLIC
+set(KV_INCLUDE_DIRS
     "${CMAKE_CURRENT_BINARY_DIR}/../../src"
     "${PROJECT_BINARY_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/client"
@@ -28,7 +27,7 @@ target_include_directories(kv_store_bench PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
-target_link_libraries(kv_store_bench
+set(KV_LINK_LIBS
     glog::glog
     gflags
     mimalloc
@@ -45,6 +44,24 @@ target_link_libraries(kv_store_bench
     yaml-cpp
 )
 
+# Legacy batch benchmark
+add_executable(kv_store_bench
+    main.cc
+    ${KV_CLIENT_SOURCES}
+)
+target_include_directories(kv_store_bench PUBLIC ${KV_INCLUDE_DIRS})
+target_link_libraries(kv_store_bench ${KV_LINK_LIBS})
 set_target_properties(kv_store_bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Shared-log KV benchmark (throughput + latency)
+add_executable(kv_ycsb_bench
+    kv_bench_main.cc
+    ${KV_CLIENT_SOURCES}
+)
+target_include_directories(kv_ycsb_bench PUBLIC ${KV_INCLUDE_DIRS})
+target_link_libraries(kv_ycsb_bench ${KV_LINK_LIBS})
+set_target_properties(kv_ycsb_bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )

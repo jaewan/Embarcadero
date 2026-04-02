@@ -3186,7 +3186,8 @@ void Topic::CommittedSeqUpdaterThread() {
  * @return true if more messages are available
  */
 void Topic::PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg,
-		uint64_t start_logical_offset, uint32_t client_id) {
+		uint64_t start_logical_offset, uint32_t client_id,
+		uint16_t header_version) {
 	uint64_t cursor = order0_batch_write_cursor_.fetch_add(1, std::memory_order_relaxed);
 	auto& slot = order0_batch_ring_[cursor & (kOrder0BatchRingSize - 1)];
 	slot.log_idx = log_idx;
@@ -3194,6 +3195,7 @@ void Topic::PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_
 	slot.total_size = total_size;
 	slot.num_msg = num_msg;
 	slot.client_id = client_id;
+	slot.header_version = header_version;
 	// Release store: makes slot metadata visible to readers after sequence.
 	slot.sequence.store(cursor + 1, std::memory_order_release);
 }
