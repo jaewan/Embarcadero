@@ -1385,6 +1385,76 @@ void Topic::RecordPerClientDurableVisibility(uint32_t client_id, uint64_t count)
 	UpdatePerClientDurable(client_id, count);
 }
 
+void Topic::RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num_msg, uint32_t client_id) {
+	if (!(seq_type_ == EMBARCADERO && order_ == 0 && replication_factor_ > 0) || num_msg == 0) {
+		return;
+	}
+	absl::MutexLock lock(&per_client_durable_mu_);
+	auto [it, inserted] = order0_durable_pending_.emplace(start_logical_offset,
+	                                                      std::make_pair(num_msg, client_id));
+	if (!inserted) {
+		if (it->second != std::make_pair(num_msg, client_id)) {
+			LOG(WARNING) << "ORDER0 durable pending duplicate/conflict start=" << start_logical_offset
+			             << " old_num_msg=" << it->second.first
+			             << " old_client=" << it->second.second
+			             << " new_num_msg=" << num_msg
+			             << " new_client=" << client_id;
+		}
+	}
+}
+
+void Topic::MaybeAdvanceOrder0DurableVisibility() const {
+	if (!(seq_type_ == EMBARCADERO && order_ == 0 && replication_factor_ > 0)) {
+		return;
+	}
+
+	int num_brokers = get_num_brokers_callback_ ? get_num_brokers_callback_() : NUM_MAX_BROKERS_CONFIG;
+	if (num_brokers <= 0) {
+		num_brokers = NUM_MAX_BROKERS_CONFIG;
+	}
+
+	size_t min_replication_done = std::numeric_limits<size_t>::max();
+	int ready_replicas = 0;
+	for (int i = 0; i < replication_factor_; ++i) {
+		int b = Embarcadero::GetReplicationSetBroker(broker_id_, replication_factor_, num_brokers, i);
+		volatile uint64_t* rep_done_ptr = &tinode_->offsets[b].replication_done[broker_id_];
+		CXL::flush_cacheline(const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(rep_done_ptr)));
+		CXL::load_fence();
+		const size_t val = *rep_done_ptr;
+		if (val == kReplicationNotStarted) {
+			continue;
+		}
+		ready_replicas++;
+		if (val < min_replication_done) {
+			min_replication_done = val;
+		}
+	}
+
+	if (ready_replicas < replication_factor_ || min_replication_done == kReplicationNotStarted) {
+		return;
+	}
+
+	const uint64_t durable_frontier = min_replication_done + 1;
+	absl::MutexLock lock(&per_client_durable_mu_);
+	while (order0_durable_logical_count_ < durable_frontier) {
+		auto it = order0_durable_pending_.find(order0_durable_logical_count_);
+		if (it == order0_durable_pending_.end()) {
+			break;
+		}
+		const uint32_t num_msg = it->second.first;
+		const uint32_t client_id = it->second.second;
+		const uint64_t batch_end = order0_durable_logical_count_ + num_msg;
+		if (batch_end > durable_frontier) {
+			break;
+		}
+
+		per_client_durable_[client_id] += num_msg;
+		order0_durable_logical_count_ = batch_end;
+		order0_durable_pending_.erase(it);
+	}
+}
+
 void Topic::UpdatePerClientOrdered(uint32_t client_id, uint64_t count) {
 	absl::MutexLock lock(&per_client_mu_);
 	per_client_ordered_[client_id] += count;
@@ -1403,6 +1473,7 @@ uint64_t Topic::GetClientOrdered(uint32_t client_id) const {
 }
 
 uint64_t Topic::GetClientDurable(uint32_t client_id) const {
+	MaybeAdvanceOrder0DurableVisibility();
 	absl::MutexLock lock(&per_client_durable_mu_);
 	auto it = per_client_durable_.find(client_id);
 	return (it != per_client_durable_.end()) ? it->second : 0;
@@ -1441,6 +1512,9 @@ bool Topic::SupportsPerClientWrittenAckLevel1() const {
 }
 
 bool Topic::SupportsPerClientAckLevel2Durable() const {
+	if (seq_type_ == EMBARCADERO) {
+		return order_ == 0 && replication_factor_ > 0;
+	}
 	if (seq_type_ == CORFU) {
 		return order_ == Embarcadero::kOrderTotal &&
 		       replication_factor_ > 0 &&
@@ -3075,13 +3149,16 @@ void Topic::CommittedSeqUpdaterThread() {
  *
  * @return true if more messages are available
  */
-void Topic::PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg) {
+void Topic::PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg,
+		uint64_t start_logical_offset, uint32_t client_id) {
 	uint64_t cursor = order0_batch_write_cursor_.fetch_add(1, std::memory_order_relaxed);
 	auto& slot = order0_batch_ring_[cursor & (kOrder0BatchRingSize - 1)];
 	slot.log_idx = log_idx;
+	slot.start_logical_offset = start_logical_offset;
 	slot.total_size = total_size;
 	slot.num_msg = num_msg;
-	// Release store: makes log_idx/total_size/num_msg visible to readers after sequence.
+	slot.client_id = client_id;
+	// Release store: makes slot metadata visible to readers after sequence.
 	slot.sequence.store(cursor + 1, std::memory_order_release);
 }
 

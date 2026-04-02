@@ -80,6 +80,7 @@ NUM_TRIALS="${NUM_TRIALS:-1}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 PLOT_RESULTS="${PLOT_RESULTS:-0}"
 TARGET_MBPS="${TARGET_MBPS:-0}"
+THREADS_PER_BROKER="${THREADS_PER_BROKER:-1}"
 REPLICATION_FACTOR="${REPLICATION_FACTOR:-0}"
 BROKER_READY_TIMEOUT_SEC="${BROKER_READY_TIMEOUT_SEC:-60}"
 BROKER_REACHABILITY_TIMEOUT_SEC="${BROKER_REACHABILITY_TIMEOUT_SEC:-20}"
@@ -130,7 +131,7 @@ REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-}"
 REMOTE_LAZYLOG_SEQUENCER_HOST="${REMOTE_LAZYLOG_SEQUENCER_HOST:-}"
 REMOTE_LAZYLOG_BUILD_BIN="${REMOTE_LAZYLOG_BUILD_BIN:-}"
 EMBARCADERO_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-}"
-EMBARCADERO_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}"
+EMBARCADERO_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-50061}"
 REMOTE_SCALOG_SEQUENCER_HOST="${REMOTE_SCALOG_SEQUENCER_HOST:-}"
 REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-}"
 
@@ -197,6 +198,38 @@ probe_tcp_from_host() {
   fi
 }
 
+is_ipv4_literal() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+resolve_host_ipv4() {
+  local host="$1"
+  if [[ -z "$host" ]]; then
+    return 1
+  fi
+  if is_ipv4_literal "$host"; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+  if command -v getent >/dev/null 2>&1; then
+    getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1 {print $1; exit}'
+    return $?
+  fi
+  if command -v host >/dev/null 2>&1; then
+    host "$host" 2>/dev/null | awk '/has address/ {print $4; exit}'
+    return $?
+  fi
+  return 1
+}
+
+resolve_host_ipv4_via_ssh() {
+  local host="$1"
+  if [[ -z "$host" ]]; then
+    return 1
+  fi
+  ssh -o BatchMode=yes "$host" "hostname -I 2>/dev/null | awk 'NF {print \$1; exit}'" 2>/dev/null
+}
+
 wait_for_broker_reachability() {
   local target_ip="$1"
   shift
@@ -245,6 +278,76 @@ start_local_brokers() {
 
   cleanup
   export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
+
+  if [[ "$seq" == "CORFU" ]]; then
+    if [[ -n "${EMBARCADERO_CORFU_SEQ_IP:-}" ]]; then
+      local resolved_corfu_ip
+      resolved_corfu_ip="$(resolve_host_ipv4 "$EMBARCADERO_CORFU_SEQ_IP" || true)"
+      if [[ -z "$resolved_corfu_ip" && -n "$REMOTE_CORFU_SEQUENCER_HOST" && "$EMBARCADERO_CORFU_SEQ_IP" == "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+        resolved_corfu_ip="$(resolve_host_ipv4_via_ssh "$REMOTE_CORFU_SEQUENCER_HOST" || true)"
+      fi
+      if [[ -n "$resolved_corfu_ip" && "$resolved_corfu_ip" != "$EMBARCADERO_CORFU_SEQ_IP" ]]; then
+        echo "Resolved Corfu sequencer host $EMBARCADERO_CORFU_SEQ_IP -> $resolved_corfu_ip"
+        export EMBARCADERO_CORFU_SEQ_IP="$resolved_corfu_ip"
+      fi
+    elif [[ -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+      local resolved_remote_corfu_ip
+      resolved_remote_corfu_ip="$(resolve_host_ipv4 "$REMOTE_CORFU_SEQUENCER_HOST" || true)"
+      if [[ -z "$resolved_remote_corfu_ip" ]]; then
+        resolved_remote_corfu_ip="$(resolve_host_ipv4_via_ssh "$REMOTE_CORFU_SEQUENCER_HOST" || true)"
+      fi
+      if [[ -n "$resolved_remote_corfu_ip" ]]; then
+        echo "Resolved remote Corfu sequencer host $REMOTE_CORFU_SEQUENCER_HOST -> $resolved_remote_corfu_ip"
+        export EMBARCADERO_CORFU_SEQ_IP="$resolved_remote_corfu_ip"
+      fi
+    fi
+  fi
+  if [[ "$seq" == "SCALOG" ]]; then
+    if [[ -n "${EMBARCADERO_SCALOG_SEQ_IP:-}" ]]; then
+      local resolved_scalog_ip
+      resolved_scalog_ip="$(resolve_host_ipv4 "$EMBARCADERO_SCALOG_SEQ_IP" || true)"
+      if [[ -z "$resolved_scalog_ip" && -n "$REMOTE_SCALOG_SEQUENCER_HOST" && "$EMBARCADERO_SCALOG_SEQ_IP" == "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+        resolved_scalog_ip="$(resolve_host_ipv4_via_ssh "$REMOTE_SCALOG_SEQUENCER_HOST" || true)"
+      fi
+      if [[ -n "$resolved_scalog_ip" && "$resolved_scalog_ip" != "$EMBARCADERO_SCALOG_SEQ_IP" ]]; then
+        echo "Resolved Scalog sequencer host $EMBARCADERO_SCALOG_SEQ_IP -> $resolved_scalog_ip"
+        export EMBARCADERO_SCALOG_SEQ_IP="$resolved_scalog_ip"
+      fi
+    elif [[ -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]]; then
+      local resolved_remote_scalog_ip
+      resolved_remote_scalog_ip="$(resolve_host_ipv4 "$REMOTE_SCALOG_SEQUENCER_HOST" || true)"
+      if [[ -z "$resolved_remote_scalog_ip" ]]; then
+        resolved_remote_scalog_ip="$(resolve_host_ipv4_via_ssh "$REMOTE_SCALOG_SEQUENCER_HOST" || true)"
+      fi
+      if [[ -n "$resolved_remote_scalog_ip" ]]; then
+        echo "Resolved remote Scalog sequencer host $REMOTE_SCALOG_SEQUENCER_HOST -> $resolved_remote_scalog_ip"
+        export EMBARCADERO_SCALOG_SEQ_IP="$resolved_remote_scalog_ip"
+      fi
+    fi
+  fi
+  if [[ "$seq" == "LAZYLOG" ]]; then
+    if [[ -n "${EMBARCADERO_LAZYLOG_SEQ_IP:-}" ]]; then
+      local resolved_lazylog_ip
+      resolved_lazylog_ip="$(resolve_host_ipv4 "$EMBARCADERO_LAZYLOG_SEQ_IP" || true)"
+      if [[ -z "$resolved_lazylog_ip" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" && "$EMBARCADERO_LAZYLOG_SEQ_IP" == "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+        resolved_lazylog_ip="$(resolve_host_ipv4_via_ssh "$REMOTE_LAZYLOG_SEQUENCER_HOST" || true)"
+      fi
+      if [[ -n "$resolved_lazylog_ip" && "$resolved_lazylog_ip" != "$EMBARCADERO_LAZYLOG_SEQ_IP" ]]; then
+        echo "Resolved LazyLog sequencer host $EMBARCADERO_LAZYLOG_SEQ_IP -> $resolved_lazylog_ip"
+        export EMBARCADERO_LAZYLOG_SEQ_IP="$resolved_lazylog_ip"
+      fi
+    elif [[ -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+      local resolved_remote_lazylog_ip
+      resolved_remote_lazylog_ip="$(resolve_host_ipv4 "$REMOTE_LAZYLOG_SEQUENCER_HOST" || true)"
+      if [[ -z "$resolved_remote_lazylog_ip" ]]; then
+        resolved_remote_lazylog_ip="$(resolve_host_ipv4_via_ssh "$REMOTE_LAZYLOG_SEQUENCER_HOST" || true)"
+      fi
+      if [[ -n "$resolved_remote_lazylog_ip" ]]; then
+        echo "Resolved remote LazyLog sequencer host $REMOTE_LAZYLOG_SEQUENCER_HOST -> $resolved_remote_lazylog_ip"
+        export EMBARCADERO_LAZYLOG_SEQ_IP="$resolved_remote_lazylog_ip"
+      fi
+    fi
+  fi
 
   if [[ "$seq" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     export REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-$BIN_DIR}"
@@ -418,6 +521,7 @@ build_client_cmd() {
     ./throughput_test
     --config "$CLIENT_CONFIG_ABS"
     --head_addr "$head_addr"
+    -n "$THREADS_PER_BROKER"
     -m "$MSG_SIZE"
     -s "$TOTAL_MESSAGE_SIZE"
     -t "$TEST_CASE"
@@ -426,6 +530,7 @@ build_client_cmd() {
     --sequencer "$seq"
     -r "$REPLICATION_FACTOR"
     --target_mbps "$TARGET_MBPS"
+    --record_results
   )
   if [[ "$mode" == "steady" ]]; then
     cmd+=(--steady_rate)
@@ -457,10 +562,10 @@ run_trial() {
   echo "[Trial $trial/$NUM_TRIALS] scenario=$SCENARIO mode=$mode sequencer=$seq order=$order"
 
   # Clean up any leftover CSV files from a previous run
-  (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv)
+  (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv)
   if [[ "$SCENARIO" == "remote" ]]; then
     ssh -o StrictHostKeyChecking=no "$REMOTE_CLIENT_HOST" \
-      "cd ${REMOTE_CLIENT_BIN_DIR} && rm -f cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv" 2>/dev/null || true
+      "cd ${REMOTE_CLIENT_BIN_DIR} && rm -f cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv" 2>/dev/null || true
   fi
 
   # Start brokers (local; for remote-client scenario the broker still lives here)
@@ -539,13 +644,13 @@ run_trial() {
 
   if [[ "$SCENARIO" == "remote" ]]; then
     # CSV files were written on the remote client; scp them back.
-    for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv; do
+    for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
       scp -o StrictHostKeyChecking=no \
           "${REMOTE_CLIENT_HOST}:${REMOTE_CLIENT_BIN_DIR}/$f" \
           "$TRIAL_DIR/$f" 2>/dev/null || true
     done
   else
-    for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv; do
+    for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
       local src="$BIN_DIR/$f"
       if [[ -f "$src" ]]; then
         mv "$src" "$TRIAL_DIR/$f"

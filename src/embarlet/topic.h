@@ -362,7 +362,8 @@ class Topic {
 		 * Called from the ingest fast path after UpdateWrittenForOrder0.
 		 * Lock-free multi-producer, multi-reader ring (DRAM only, no CXL writes).
 		 */
-		void PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg);
+		void PushOrder0Batch(uint64_t log_idx, uint32_t total_size, uint32_t num_msg,
+		                   uint64_t start_logical_offset, uint32_t client_id);
 
 		/**
 		 * Read the next ORDER=0 batch record for a subscriber.
@@ -436,6 +437,8 @@ class Topic {
 		void RecordPerClientOrderedVisibility(uint32_t client_id, uint64_t count);
 		// Advance per-client durable frontier after a sequencer-owned export batch becomes durably replicated.
 		void RecordPerClientDurableVisibility(uint32_t client_id, uint64_t count);
+		void RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num_msg, uint32_t client_id);
+		void MaybeAdvanceOrder0DurableVisibility() const;
 
 		/** [[ORDER_0_TAIL]] When publish connection closes, advance written_* to order0_next_logical_offset_ so subscribers see full tail (fixes out-of-order batch completion leaving written behind). */
 		void FinalizeOrder0WrittenIfNeeded();
@@ -689,7 +692,10 @@ class Topic {
 		void UpdatePerClientOrdered(uint32_t client_id, uint64_t count);
 		// Per-client durable counters for ACK2 (only in modes with explicit durability attribution).
 		mutable absl::Mutex per_client_durable_mu_;
-		absl::flat_hash_map<uint32_t, uint64_t> per_client_durable_ ABSL_GUARDED_BY(per_client_durable_mu_);
+		mutable absl::flat_hash_map<uint32_t, uint64_t> per_client_durable_ ABSL_GUARDED_BY(per_client_durable_mu_);
+		mutable uint64_t order0_durable_logical_count_ ABSL_GUARDED_BY(per_client_durable_mu_) = 0;
+		mutable absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>> order0_durable_pending_
+			ABSL_GUARDED_BY(per_client_durable_mu_);
 		void UpdatePerClientDurable(uint32_t client_id, uint64_t count);
 
 		// Synchronization
@@ -728,11 +734,13 @@ class Topic {
 		struct alignas(32) Order0BatchSlot {
 			std::atomic<uint64_t> sequence{0};  // 0=empty; N = batch for cursor N-1 is ready
 			uint64_t log_idx = 0;
+			uint64_t start_logical_offset = 0;
 			uint32_t total_size = 0;
 			uint32_t num_msg = 0;
+			uint32_t client_id = 0;
 			uint32_t _pad = 0;
 		};
-		static_assert(sizeof(Order0BatchSlot) == 32, "Order0BatchSlot must be 32 bytes");
+		static_assert(sizeof(Order0BatchSlot) == 64, "Order0BatchSlot must be 64 bytes");
 		static constexpr size_t kOrder0BatchRingSize = 8192;  // 8K slots × 32B = 256KB DRAM
 		alignas(64) std::array<Order0BatchSlot, kOrder0BatchRingSize> order0_batch_ring_{};
 		alignas(64) std::atomic<uint64_t> order0_batch_write_cursor_{0};

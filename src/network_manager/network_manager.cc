@@ -1009,7 +1009,8 @@ void NetworkManager::HandlePublishRequest(
 			// [[ORDER0_SUBSCRIBE]] Record batch in DRAM ring so subscribers can export
 			// with batch_meta (same protocol as ORDER=5). No CXL writes; minimal overhead.
 			if (topic_ptr) {
-				topic_ptr->PushOrder0Batch(log_idx, batch_header.total_size, batch_header.num_msg);
+				topic_ptr->PushOrder0Batch(log_idx, batch_header.total_size, batch_header.num_msg,
+				                         batch_header.start_logical_offset, handshake.client_id);
 			}
 			continue;  // Next batch — no PBR, no validation, no DelegationThread dependency
 		}
@@ -1190,10 +1191,15 @@ void NetworkManager::HandlePublishRequest(
 			// receive 0 bytes for ORDER=0 RF=2.  Call unconditionally here: the ring
 			// is lock-free, and the subscriber export loop has no replication gate
 			// (matching the fast-path semantic where delivery precedes ACK).
-			if (topic_ptr) {
-				topic_ptr->PushOrder0Batch(batch_header.log_idx,
-				                           batch_header.total_size,
-				                           batch_header.num_msg);
+				if (topic_ptr) {
+					topic_ptr->RecordOrder0DurableBatch(batch_header.start_logical_offset,
+					                                  batch_header.num_msg,
+					                                  handshake.client_id);
+					topic_ptr->PushOrder0Batch(batch_header.log_idx,
+					                           batch_header.total_size,
+					                           batch_header.num_msg,
+				                           batch_header.start_logical_offset,
+				                           handshake.client_id);
 			}
 		}
 		// [[ARCHITECTURE]] DelegationThread handles per-message metadata + written updates for other orders
