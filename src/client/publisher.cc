@@ -1290,6 +1290,89 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	return true;
 }
 
+bool Publisher::WaitUntilAcked(size_t n) {
+	if (ack_level_ < 1) {
+		return true;
+	}
+
+	const bool low_payload_poll_mode = (n <= 1000000);
+	auto wait_start_time = std::chrono::steady_clock::now();
+	auto last_log_time = wait_start_time;
+	auto last_ack_change_time = wait_start_time;
+	auto normalized_acks = [&]() -> size_t {
+		size_t total = 0;
+		for (size_t i = 0; i < broker_stats_.size(); i++) {
+			const size_t sent = broker_stats_[i].sent_messages.load(std::memory_order_relaxed);
+			const size_t acked = broker_stats_[i].acked_messages.load(std::memory_order_relaxed);
+			total += std::min(sent, acked);
+		}
+		return total;
+	};
+	size_t last_ack_val = normalized_acks();
+	const auto ack_spin_duration = low_payload_poll_mode
+		? std::chrono::microseconds(100)
+		: std::chrono::microseconds(500);
+	uint32_t ack_wait_loops = 0;
+	int timeout_seconds = ack_timeout_seconds_;
+	const auto timeout_duration = std::chrono::seconds(timeout_seconds);
+
+	while (normalized_acks() < n && !shutdown_.load(std::memory_order_relaxed)) {
+		auto now = std::chrono::steady_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - wait_start_time);
+		const size_t current_raw_acks = ack_received_.load(std::memory_order_acquire);
+		const size_t current_normalized_acks = normalized_acks();
+
+		if (timeout_seconds > 0 && elapsed >= timeout_duration) {
+			LOG(ERROR) << "[Publisher ACK Timeout]: Waited " << elapsed.count()
+			           << " seconds for ACKs, normalized_received=" << current_normalized_acks
+			           << " raw_received=" << current_raw_acks
+			           << " out of " << n
+			           << " (timeout=" << timeout_seconds << "s)";
+			LOG(ERROR) << "[Publisher ACK Diagnostics]: ack_level=" << ack_level_
+			           << ", last_normalized_ack_received=" << current_normalized_acks
+			           << ", last_raw_ack_received=" << current_raw_acks
+			           << ", target=" << n;
+			return false;
+		}
+
+		if (current_normalized_acks > last_ack_val) {
+			last_ack_val = current_normalized_acks;
+			last_ack_change_time = now;
+		}
+
+		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
+			std::string per_broker;
+			for (size_t i = 0; i < broker_stats_.size(); i++) {
+				if (i) per_broker += " ";
+				per_broker += "B" + std::to_string(i)
+					+ "(sent=" + std::to_string(broker_stats_[i].sent_messages.load(std::memory_order_relaxed))
+					+ ",acked=" + std::to_string(broker_stats_[i].acked_messages.load(std::memory_order_relaxed))
+					+ ")";
+			}
+			VLOG(1) << "Waiting for acknowledgments, normalized_received "
+			        << current_normalized_acks << " raw_received " << current_raw_acks
+			        << " out of " << n << " (elapsed: " << elapsed.count()
+			        << "s, idle_s="
+			        << std::chrono::duration_cast<std::chrono::seconds>(now - last_ack_change_time).count()
+			        << ") [" << per_broker << "]";
+			last_log_time = now;
+		}
+
+		auto spin_start = std::chrono::steady_clock::now();
+		const auto spin_end = spin_start + ack_spin_duration;
+		while (std::chrono::steady_clock::now() < spin_end && normalized_acks() < n) {
+			Embarcadero::CXL::cpu_pause();
+		}
+		if (normalized_acks() < n) {
+			if (!low_payload_poll_mode || ((++ack_wait_loops & 0x3F) == 0)) {
+				std::this_thread::yield();
+			}
+		}
+	}
+
+	return normalized_acks() >= n;
+}
+
 void Publisher::DEBUG_check_send_finish() {
 	WriteFinishedOrPaused();
 	pubQue_.ReturnReads();

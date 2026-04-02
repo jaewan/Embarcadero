@@ -317,6 +317,9 @@ class DistributedKVStore {
 		uint64_t getServerID() const { return server_id_; }
 
 		size_t storeSize() const { return kv_store_.size(); }
+		uint64_t getAppliedLocalOpCount() const {
+			return applied_local_ops_.load(std::memory_order_acquire);
+		}
 
 		bool opFinished(OPID opId){
 			absl::MutexLock lock(&pending_ops_mutex_);
@@ -327,6 +330,10 @@ class DistributedKVStore {
 		void waitForSyncWithLog();
 		// Wait until an op with client order strictly greater than min_client_opid is applied.
 		void waitForSyncWithLog(OPID min_client_opid);
+		// Flush publisher, then wait until all sealed publishes are ACKed.
+		bool waitForAckedWrites();
+		// Wait until an op with client order <= min_client_opid has been ACKed.
+		bool waitForAckedWrites(OPID min_client_opid);
 
 		// Collect and reset apply latencies
 		std::vector<double> collectApplyLatenciesAndReset();

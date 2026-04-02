@@ -152,6 +152,10 @@ class Publisher {
 		size_t GetAckReceived() const {
 			return ack_received_.load(std::memory_order_relaxed);
 		}
+
+		// Wait until at least n messages have been ACKed without shutting down
+		// publisher threads. Used by stop-and-wait benchmark modes.
+		bool WaitUntilAcked(size_t n);
 		
 		bool GetShutdown() const {
 			return shutdown_.load(std::memory_order_relaxed);

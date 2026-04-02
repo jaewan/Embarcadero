@@ -580,28 +580,90 @@ size_t DistributedKVStore::multiPut(const std::vector<KeyValue>& kvPairs) {
 	return client_order;
 }
 
+static constexpr int kSyncTimeoutSec = 30;
+
 void DistributedKVStore::waitForSyncWithLog(){
-	// Read-your-writes barrier for callers that do not track a specific client op id.
-	// Flush the publisher first so partially filled client batches are visible to the
-	// subscriber/consumer thread, then wait until every pending local write is applied.
 	if (publisher_) {
 		publisher_->WriteFinishedOrPaused();
 	}
 	const uint64_t target = publisher_ ? publisher_->GetNextPublishOrder() : 0;
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kSyncTimeoutSec);
+	uint64_t last_progress = applied_local_ops_.load(std::memory_order_acquire);
+	auto last_log_time = std::chrono::steady_clock::now();
+
 	while (applied_local_ops_.load(std::memory_order_acquire) < target) {
 		std::this_thread::yield();
+		auto now = std::chrono::steady_clock::now();
+		if (now - last_log_time >= std::chrono::seconds(5)) {
+			uint64_t current = applied_local_ops_.load(std::memory_order_acquire);
+			LOG(WARNING) << "waitForSyncWithLog: applied=" << current
+			             << " target=" << target
+			             << " (stalled=" << (current == last_progress) << ")";
+			if (current > last_progress) {
+				deadline = now + std::chrono::seconds(kSyncTimeoutSec);
+				last_progress = current;
+			}
+			last_log_time = now;
+		}
+		if (std::chrono::steady_clock::now() > deadline) {
+			uint64_t current = applied_local_ops_.load(std::memory_order_acquire);
+			LOG(ERROR) << "waitForSyncWithLog TIMEOUT: applied=" << current
+			           << " target=" << target
+			           << " (missing " << (target - current) << " ops after "
+			           << kSyncTimeoutSec << "s with no progress)";
+			break;
+		}
 	}
 }
 
 void DistributedKVStore::waitForSyncWithLog(OPID min_client_opid){
-	// Flush any partially filled client batch before waiting; otherwise the last
-	// few ops may never be sealed/published, and this barrier can spin forever.
 	if (publisher_) {
 		publisher_->WriteFinishedOrPaused();
 	}
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kSyncTimeoutSec);
+	uint64_t last_progress = applied_local_ops_.load(std::memory_order_acquire);
+	auto last_log_time = std::chrono::steady_clock::now();
+
 	while (applied_local_ops_.load(std::memory_order_acquire) <= min_client_opid) {
 		std::this_thread::yield();
+		auto now = std::chrono::steady_clock::now();
+		if (now - last_log_time >= std::chrono::seconds(5)) {
+			uint64_t current = applied_local_ops_.load(std::memory_order_acquire);
+			LOG(WARNING) << "waitForSyncWithLog(opid=" << min_client_opid
+			             << "): applied=" << current
+			             << " (stalled=" << (current == last_progress) << ")";
+			if (current > last_progress) {
+				deadline = now + std::chrono::seconds(kSyncTimeoutSec);
+				last_progress = current;
+			}
+			last_log_time = now;
+		}
+		if (std::chrono::steady_clock::now() > deadline) {
+			uint64_t current = applied_local_ops_.load(std::memory_order_acquire);
+			LOG(ERROR) << "waitForSyncWithLog TIMEOUT: applied=" << current
+			           << " target>=" << (min_client_opid + 1)
+			           << " (missing " << (min_client_opid + 1 - current) << " ops after "
+			           << kSyncTimeoutSec << "s with no progress)";
+			break;
+		}
 	}
+}
+
+bool DistributedKVStore::waitForAckedWrites() {
+	if (!publisher_) {
+		return true;
+	}
+	publisher_->WriteFinishedOrPaused();
+	const uint64_t target = publisher_->GetNextPublishOrder();
+	return publisher_->WaitUntilAcked(target);
+}
+
+bool DistributedKVStore::waitForAckedWrites(OPID min_client_opid) {
+	if (!publisher_) {
+		return true;
+	}
+	publisher_->WriteFinishedOrPaused();
+	return publisher_->WaitUntilAcked(static_cast<size_t>(min_client_opid) + 1);
 }
 
 void DistributedKVStore::waitUntilApplied(size_t total_order){
