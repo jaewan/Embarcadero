@@ -2551,9 +2551,10 @@ bool Topic::GetBatchToExportWithMetadata(
 
 	const bool trace_order5 = ShouldEnableOrder5Trace() && (order_ == 5);
 	constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
-	// [[EXPORT_BY_TOTAL_ORDER]] [PHASE-8] Hold queue is peeked/popped atomically later.
+	// [[EXPORT_BY_TOTAL_ORDER]] ORDER=5 export is driven by immutable committed descriptors
+	// keyed by absolute PBR. Subscriber export must not fall back to mutable ring state after
+	// commit, because cleared/reused slots can retain stale num_msg/total_size/log_idx fields.
 	bool have_hold = false;
-	size_t hold_total_order = 0;
 	OrderedHoldExportEntry hold_front;
 
 	// [[PHASE_2_CV_EXPORT]] O(1) export: use CompletionVector instead of linear scan (design §3.4).
@@ -2593,43 +2594,24 @@ bool Topic::GetBatchToExportWithMetadata(
 			ring_slot_pbr_idx = header->pbr_absolute_index;
 			ring_slot_flags = header->flags;
 			ring_slot_num_msg = header->num_msg;
-			// ORDER=5 export readiness is driven by CompletionVector (sequencer completion),
-			// not by local per-slot ordered bit on non-head brokers.
-			// Non-head brokers can have ordered==0 while CV has already advanced.
-			if (header->pbr_absolute_index == next_pbr &&
+			// ORDER=5 export readiness is driven by CompletionVector plus the immutable export
+			// descriptor written into the shared batch-header ring during commit.
+			if (header->ordered == 1 &&
+			    header->pbr_absolute_index == next_pbr &&
 			    header->num_msg > 0 &&
 			    header->total_size > 0) {
-				// Resolve export chain (batch_off_to_export 0 = in-place)
-				BatchHeader* actual = header;
-				if (header->batch_off_to_export != 0) {
-					size_t off = header->batch_off_to_export;
-					if (off >= BATCHHEADERS_SIZE || off % sizeof(BatchHeader) != 0) {
-						VLOG(1) << "[GetBatchToExportWithMetadata B" << broker_id_ << "] Invalid batch_off_to_export=" << off;
-					} else {
-						BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
-							reinterpret_cast<uint8_t*>(start_batch_header) + BATCHHEADERS_SIZE);
-						actual = reinterpret_cast<BatchHeader*>(reinterpret_cast<uint8_t*>(header) + off);
-						if (actual >= start_batch_header && actual < ring_end) {
-							CXL::flush_cacheline(actual);
-							CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(actual) + 64);
-							CXL::full_fence();  // MFENCE required for CLFLUSHOPT ordering
-						} else {
-							actual = header;
-						}
-					}
-				}
-				ring_total_order = actual->total_order;
-				ring_batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + actual->log_idx;
+				ring_total_order = header->total_order;
+				ring_batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + header->log_idx;
 				ring_batch_size = RecomputeOrder5BatchSizeFromPayload(
-					cxl_addr_, actual->log_idx, actual->num_msg, actual->total_size);
-				if (ring_batch_size != actual->total_size) {
+					cxl_addr_, header->log_idx, header->num_msg, header->total_size);
+				if (ring_batch_size != header->total_size) {
 					LOG(WARNING) << "[ORDER5_RING_EXPORT_SIZE_FIX B" << broker_id_ << "]"
-					             << " pbr=" << actual->pbr_absolute_index
-					             << " num_msg=" << actual->num_msg
-					             << " cached_total_size=" << actual->total_size
+					             << " pbr=" << header->pbr_absolute_index
+					             << " num_msg=" << header->num_msg
+					             << " cached_total_size=" << header->total_size
 					             << " recomputed_total_size=" << ring_batch_size;
 				}
-				ring_num_messages = actual->num_msg;
+				ring_num_messages = header->num_msg;
 				have_ring = true;
 			}
 		}
@@ -2679,33 +2661,29 @@ bool Topic::GetBatchToExportWithMetadata(
 		last_log_ns = now_ns;
 	};
 
-	// Choose hold-vs-ring with hold entries tied to expected PBR frontier.
-	// Held batches are the export source for slots that were drained from hold after the
-	// ring cursor had already moved on, so we must never discard them just because the
-	// subscriber cursor/CV has advanced past their PBR index.
 	bool return_hold = false;
 	bool return_late_hold = false;
-	while (true) {
-		{
-			absl::MutexLock lock(&hold_export_queues_[broker_id_].mu);
-			have_hold = false;
-			if (!hold_export_queues_[broker_id_].q.empty()) {
-				hold_front = hold_export_queues_[broker_id_].q.front();
-				hold_total_order = hold_front.total_order;
+	{
+		absl::MutexLock lock(&hold_export_queues_[broker_id_].mu);
+		auto& q = hold_export_queues_[broker_id_].q;
+		while (!q.empty()) {
+			auto it = q.begin();
+			if (it->first < next_pbr) {
+				hold_front = it->second;
+				q.erase(it);
 				have_hold = true;
-				if (hold_front.pbr_absolute_index < next_pbr) {
-					// This held batch may still be the only exportable copy. Serve it as a
-					// late hold instead of dropping it; keep the cursor monotonic below.
-					hold_export_queues_[broker_id_].q.pop_front();
-					return_hold = true;
-					return_late_hold = true;
-				} else if (hold_front.pbr_absolute_index == next_pbr) {
-					hold_export_queues_[broker_id_].q.pop_front();
-					return_hold = true;
-				}
+				return_hold = true;
+				return_late_hold = true;
+				break;
 			}
+			if (it->first == next_pbr) {
+				hold_front = it->second;
+				q.erase(it);
+				have_hold = true;
+				return_hold = true;
+			}
+			break;
 		}
-		break;
 	}
 	if (return_hold) {
 		batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + hold_front.log_idx;
@@ -4176,10 +4154,22 @@ void Topic::CommitEpoch(
 		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);
 	}
 
-	// 2. Flush export chain and BatchHeaders
+	// 2. Flush shared immutable export descriptors into the per-broker export ring.
+	// Non-head brokers must be able to export committed ORDER=5 batches without access to
+	// the head sequencer's process-local hold/export map, so every committed batch gets a
+	// descriptor written into shared memory keyed by PBR order.
+		size_t export_next_order = base_order;
 		for (PendingBatch5& p : ready) {
-			if (p.skipped || p.is_held_marker || p.from_hold || p.hdr == nullptr) continue;
-			int b = p.broker_id;
+			if (p.skipped || p.is_held_marker) continue;
+			const bool from_hold = p.from_hold;
+			const HoldBatchMetadata* hold = from_hold ? &p.hold_meta : nullptr;
+			int b = from_hold ? hold->broker_id : p.broker_id;
+			const size_t log_idx = from_hold ? hold->log_idx : p.cached_log_idx;
+			const uint32_t num_msg = from_hold ? hold->num_msg : p.num_msg;
+			const uint64_t pbr_abs = from_hold ? hold->pbr_absolute_index : p.cached_pbr_absolute_index;
+			const size_t batch_total_size = from_hold
+				? RecomputeOrder5BatchSizeFromPayload(cxl_addr_, hold->log_idx, hold->num_msg, hold->total_size)
+				: RecomputeOrder5BatchSizeFromPayload(cxl_addr_, p.cached_log_idx, p.num_msg, p.cached_total_size);
 			if (b >= 0 && b < NUM_MAX_BROKERS) {
 				const size_t batch_headers_offset = tinode_->offsets[b].batch_headers_offset;
 				if (batch_headers_offset != 0) {
@@ -4196,7 +4186,12 @@ void Topic::CommitEpoch(
 						export_cursor_by_broker_[b] = cur;
 					}
 
-					cur->batch_off_to_export = reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cur);
+					cur->batch_off_to_export = 0;
+					cur->log_idx = log_idx;
+					cur->total_size = static_cast<uint32_t>(batch_total_size);
+					cur->num_msg = num_msg;
+					cur->total_order = export_next_order;
+					cur->pbr_absolute_index = pbr_abs;
 					cur->ordered = 1;
 					CXL::store_fence();
 					CXL::flush_cacheline(cur);
@@ -4208,10 +4203,13 @@ void Topic::CommitEpoch(
 					export_cursor_by_broker_[b] = next_cursor;
 				}
 			}
-			ClearOrder5PublishState(p.hdr);
-			CXL::store_fence();
-			CXL::flush_cacheline(p.hdr);
-			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(p.hdr) + 64);
+			if (p.hdr != nullptr) {
+				ClearOrder5PublishState(p.hdr);
+				CXL::store_fence();
+				CXL::flush_cacheline(p.hdr);
+				CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(p.hdr) + 64);
+			}
+			export_next_order += num_msg;
 	}
 
 	// 3. Metadata updates (local accumulation)
@@ -4263,7 +4261,7 @@ void Topic::CommitEpoch(
 				ex.pbr_absolute_index = m.pbr_absolute_index;
 				{
 					absl::MutexLock lock(&hold_export_queues_[b].mu);
-					hold_export_queues_[b].q.push_back(ex);
+					hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
 				}
 			}
 			next_order += m.num_msg;
@@ -4304,7 +4302,7 @@ void Topic::CommitEpoch(
 			ex.num_messages = p.num_msg;
 			ex.pbr_absolute_index = p.cached_pbr_absolute_index;
 			absl::MutexLock lock(&hold_export_queues_[b].mu);
-			hold_export_queues_[b].q.push_back(ex);
+			hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
 		}
 
 		size_t& next_expected = contiguous_consumed_per_broker[b];
