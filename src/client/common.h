@@ -29,7 +29,7 @@
 #include "folly/ProducerConsumerQueue.h"
 
 #include "common/config.h"
-#include "../cxl_manager/cxl_manager.h"
+#include "cxl_manager/cxl_manager.h"
 #include "corfu_client.h"
 #include <heartbeat.grpc.pb.h>
 

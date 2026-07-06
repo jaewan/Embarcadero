@@ -336,7 +336,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		}
 
 		// [[PHASE_2_GOI_CV_ALLOCATION]] Allocate GOI and CompletionVector in CXL memory
-		// Memory layout per docs/CXL_MEMORY_LAYOUT_v2.md:
+		// Memory layout per docs/design/CXL_MEMORY_LAYOUT_v2.md:
 		//   0x0000_0000: ControlBlock (128 B)
 		//   0x0000_1000: CompletionVector (4 KB)
 		//   0x0000_2000: GOI (32 GB) - [[SIZE_UPDATE]] 128 bytes per entry

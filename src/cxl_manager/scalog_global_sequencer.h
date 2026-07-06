@@ -8,6 +8,7 @@
 
 #include <scalog_sequencer.grpc.pb.h>
 #include "common/config.h"
+#include "cxl_manager/scalog_global_ordering_core.h"
 
 class ScalogGlobalSequencer : public ScalogSequencer::Service {
 	public:
@@ -47,13 +48,16 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
 		std::condition_variable cv_;
 		std::condition_variable reset_cv_;
 
-		/// Map of broker_id to replica_id to local cut
+		/// Guards the shared global-ordering core (which holds the per-broker/per-replica
+		/// cuts + registration state). Held across every core_ call, exactly where the
+		/// inline min-across-replicas logic used to run — the core has no internal locks.
 		absl::Mutex global_cut_mu_;
-		absl::btree_map<int, absl::btree_map<int, int64_t>> global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
 
-		/// Used to keep track of # messages of each epoch so we can calculate the global cut
-		/// Map of broker_id to replica_id to logical offset
-		absl::btree_map<int, absl::btree_map<int, int64_t>> logical_offsets_ ABSL_GUARDED_BY(global_cut_mu_);
+		/// Transport-independent Scalog global-cut state machine (min across replicas per
+		/// shard = the durable prefix). Shared verbatim with the CXL mailbox port
+		/// (ScalogMailboxSequencer). Mirrors the Corfu AssignToken extraction: the gRPC
+		/// baseline and the mailbox path call literally the same ordering code.
+		Embarcadero::cxl_manager::ScalogGlobalOrderingCore core_ ABSL_GUARDED_BY(global_cut_mu_);
 
 		/// Map of broker_id to replica_id last sent global cut
 		absl::btree_map<int, absl::btree_map<int, int64_t>> last_sent_global_cut_ ABSL_GUARDED_BY(global_cut_mu_);
@@ -76,9 +80,6 @@ class ScalogGlobalSequencer : public ScalogSequencer::Service {
 
 		/// Mutex to protect local_sequencers_
 		absl::Mutex stream_mu_;
-
-		// Replication factor
-		int num_replicas_per_broker_ = 1;
 
 		std::thread global_cut_thread_;
 };

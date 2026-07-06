@@ -12,9 +12,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <glog/logging.h>
-#include "../common/performance_utils.h"
-#include "../common/env_flags.h"
-#include "../cxl_manager/cxl_datastructure.h"  // CXL namespace
+#include "common/performance_utils.h"
+#include "common/env_flags.h"
+#include "cxl_manager/cxl_datastructure.h"  // CXL namespace
 
 namespace Embarcadero {
 namespace {

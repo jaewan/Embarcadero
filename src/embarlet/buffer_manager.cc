@@ -1,6 +1,6 @@
 #include "buffer_manager.h"
-#include "../client/corfu_client.h"
-#include "../client/scalog_client.h"
+#include "client/corfu_client.h"
+#include "client/scalog_client.h"
 #include <glog/logging.h>
 #include <cstring>
 

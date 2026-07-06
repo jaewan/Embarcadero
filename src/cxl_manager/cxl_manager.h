@@ -11,11 +11,11 @@
 #include <grpcpp/grpcpp.h>
 
 #include <heartbeat.grpc.pb.h>
-#include "../embarlet/heartbeat.h"
+#include "embarlet/heartbeat.h"
 #include "cxl_datastructure.h"
-#include "../embarlet/topic_manager.h"
-#include "../network_manager/network_manager.h"
-#include "../common/performance_utils.h"
+#include "embarlet/topic_manager.h"
+#include "network_manager/network_manager.h"
+#include "common/performance_utils.h"
 
 namespace Embarcadero{
 

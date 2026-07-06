@@ -1,7 +1,7 @@
 #pragma once
 
 #include <functional>
-#include "../common/common.h"
+#include "common/common.h"
 
 namespace Embarcadero {
 

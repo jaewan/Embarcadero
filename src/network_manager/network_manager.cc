@@ -23,15 +23,15 @@
 #include "mimalloc.h"
 
 #include "network_manager.h"
-#include "../disk_manager/disk_manager.h"
-#include "../cxl_manager/cxl_manager.h"
-#include "../cxl_manager/cxl_datastructure.h"
-#include "../embarlet/topic_manager.h"
-#include "../common/config.h"
-#include "../common/env_flags.h"
-#include "../common/order_level.h"
-#include "../common/performance_utils.h"
-#include "../common/wire_formats.h"
+#include "disk_manager/disk_manager.h"
+#include "cxl_manager/cxl_manager.h"
+#include "cxl_manager/cxl_datastructure.h"
+#include "embarlet/topic_manager.h"
+#include "common/config.h"
+#include "common/env_flags.h"
+#include "common/order_level.h"
+#include "common/performance_utils.h"
+#include "common/wire_formats.h"
 
 namespace Embarcadero {
 

@@ -75,6 +75,14 @@ grpc::Status LazyLogGlobalSequencer::HandleRegisterBroker(
   if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS_CONFIG) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "broker_id out of range");
   }
+  // Register in the shared ordering core (drives readiness + binding iteration), under
+  // progress_mu_ where all core access is serialized.
+  {
+    absl::WriterMutexLock cut_lock(&progress_mu_);
+    core_.RegisterBroker(broker_id);
+  }
+  // Keep the sequencer's own registered set (separate lock) purely for the binding-thread
+  // start gate — not ordering logic.
   absl::WriterMutexLock lock(&registered_brokers_mu_);
   registered_brokers_.insert(broker_id);
   LOG(INFO) << "LazyLog sequencer registered broker=" << broker_id
@@ -149,45 +157,31 @@ void LazyLogGlobalSequencer::ReceiveLocalProgress(
     }
 
     const int64_t current = progress.local_progress();
+    const int64_t epoch = progress.epoch();
     absl::WriterMutexLock lock(&progress_mu_);
-    const int64_t previous = last_progress_[broker_id];
-    if (current < previous) {
-      continue;
-    }
-    last_progress_[broker_id] = current;
-    reported_brokers_.insert(broker_id);
+    // Shared core: same latest-progress tracking + regressing-progress rejection the inline
+    // code did (and the CXL mailbox path uses). epoch feeds only the opt-in barrier (off here).
+    core_.AddLocalProgress(broker_id, epoch, current);
   }
 }
 
 void LazyLogGlobalSequencer::SendGlobalBinding() {
   while (!shutdown_requested_.load(std::memory_order_acquire)) {
     lazylogsequencer::GlobalBinding binding;
-    absl::btree_set<int> registered_snapshot;
-    {
-      absl::ReaderMutexLock lock(&registered_brokers_mu_);
-      registered_snapshot = registered_brokers_;
-    }
     bool ready_to_bind = false;
     {
       absl::WriterMutexLock lock(&progress_mu_);
-      // LazyLog binding starts only after all brokers have registered and reported progress at least once.
-      if (registered_snapshot.size() >= expected_brokers_ &&
-          reported_brokers_.size() >= expected_brokers_) {
-        ready_to_bind = true;
-        for (int broker_id : registered_snapshot) {
-          const int64_t reported = last_progress_[broker_id];
-          const int64_t already_bound = bound_progress_[broker_id];
-          if (reported <= already_bound) {
-            continue;
-          }
-
-          const int64_t available = reported - already_bound;
-          const int64_t bind_now = std::min<int64_t>(available, kMaxBindingsPerBrokerPerTick);
-          if (bind_now <= 0) {
-            continue;
-          }
+      // Shared core: the SAME count-only readiness gate (all brokers registered AND reported)
+      // and the SAME per-broker binding-delta decision the CXL mailbox port uses. The gRPC
+      // baseline passes use_epoch_barrier=false, so its cadence is unchanged bit-for-bit — the
+      // core advances bound_progress_ and returns the per-broker deltas exactly as the inline
+      // logic did.
+      absl::btree_map<int, int64_t> binding_map;
+      ready_to_bind = core_.ComputeGlobalBinding(static_cast<int>(expected_brokers_), binding_map,
+          /*out_epoch=*/nullptr, /*use_epoch_barrier=*/false);
+      if (ready_to_bind) {
+        for (const auto& [broker_id, bind_now] : binding_map) {
           binding.mutable_global_binding()->insert({broker_id, bind_now});
-          bound_progress_[broker_id] = already_bound + bind_now;
         }
       }
     }

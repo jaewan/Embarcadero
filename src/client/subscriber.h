@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common.h"
-#include "../common/wire_formats.h"
+#include "common/wire_formats.h"
 #include <array>
 #include <cstdint>
 #include <map>

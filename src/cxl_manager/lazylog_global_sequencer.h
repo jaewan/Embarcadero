@@ -10,6 +10,7 @@
 #include "absl/synchronization/mutex.h"
 #include <lazylog_sequencer.grpc.pb.h>
 #include "common/config.h"
+#include "cxl_manager/lazylog_binding_core.h"
 
 class LazyLogGlobalSequencer : public lazylogsequencer::LazyLogSequencer::Service {
  public:
@@ -48,10 +49,14 @@ class LazyLogGlobalSequencer : public lazylogsequencer::LazyLogSequencer::Servic
   std::vector<grpc::ServerReaderWriter<lazylogsequencer::GlobalBinding, lazylogsequencer::LocalProgress>*> local_streams_
       ABSL_GUARDED_BY(stream_mu_);
 
+  // Shared ordering state machine — the SAME binding-delta core the CXL mailbox port uses, so
+  // the gRPC baseline (E1 leg 1) and the mailbox port (leg 2) call literally the same code. The
+  // core has no internal locks; all access is under progress_mu_ (exactly where the inline
+  // last_progress_/bound_progress_/reported_brokers_ logic used to run). The gRPC path always
+  // calls ComputeGlobalBinding with use_epoch_barrier=false, preserving its original count-only
+  // cadence; only the mailbox path opts into the epoch barrier.
   absl::Mutex progress_mu_;
-  absl::btree_map<int, int64_t> last_progress_ ABSL_GUARDED_BY(progress_mu_);
-  absl::btree_map<int, int64_t> bound_progress_ ABSL_GUARDED_BY(progress_mu_);
-  absl::btree_set<int> reported_brokers_ ABSL_GUARDED_BY(progress_mu_);
+  Embarcadero::cxl_manager::LazyLogBindingCore core_ ABSL_GUARDED_BY(progress_mu_);
 };
 
 #endif

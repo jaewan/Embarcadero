@@ -2,7 +2,7 @@
 
 #include <atomic>
 #include <functional>
-#include "../common/common.h"
+#include "common/common.h"
 #include "interfaces.h"
 
 namespace Embarcadero {

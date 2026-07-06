@@ -75,10 +75,10 @@
  */
 
 #include "buffer.h"
-#include "../common/configuration.h"
-#include "../common/wire_formats.h"
-#include "../common/performance_utils.h"
-#include "../cxl_manager/cxl_datastructure.h"
+#include "common/configuration.h"
+#include "common/wire_formats.h"
+#include "common/performance_utils.h"
+#include "cxl_manager/cxl_datastructure.h"
 #include <thread>
 #include <chrono>
 #include <iomanip>

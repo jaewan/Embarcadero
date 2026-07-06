@@ -1,0 +1,28 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 69 and seed -8383053931955873474 with 24 workers on 512 cores with 14564MB heap and 64MB offheap memory [pid: 1511851] (Linux 6.17.0-23-generic amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/spec/MCEmbarcadero.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/spec/Embarcadero.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/exactly_once_fence/tmp/TLC.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/exactly_once_fence/tmp/Naturals.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/exactly_once_fence/tmp/Sequences.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/exactly_once_fence/tmp/FiniteSets.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Embarcadero
+Semantic processing of module TLC
+Semantic processing of module MCEmbarcadero
+Starting... (2026-07-06 09:39:04)
+Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
+(Use the -nowarning option to disable this warning.)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-06 09:39:04.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 5.3E-10
+  based on the actual fingerprints:  val = 2.6E-10
+234319 states generated, 53820 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 31.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 2).
+Finished in 01s at (2026-07-06 09:39:05)

@@ -1,7 +1,7 @@
 #include "replication_manager.h"
-#include "../client/corfu_client.h"
-#include "../client/scalog_client.h"
-#include "../common/performance_utils.h"
+#include "client/corfu_client.h"
+#include "client/scalog_client.h"
+#include "common/performance_utils.h"
 #include <glog/logging.h>
 
 namespace Embarcadero {

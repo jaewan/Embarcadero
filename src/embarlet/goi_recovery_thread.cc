@@ -2,8 +2,8 @@
 // Scan-based approach - no hot-path overhead, no queue limits.
 
 #include "topic.h"
-#include "../common/performance_utils.h"
-#include "../common/env_flags.h"
+#include "common/performance_utils.h"
+#include "common/env_flags.h"
 #include <chrono>
 #include <unordered_map>
 #include <glog/logging.h>

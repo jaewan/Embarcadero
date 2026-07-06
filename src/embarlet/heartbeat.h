@@ -33,7 +33,7 @@
 // Project includes
 #include <heartbeat.grpc.pb.h>
 #include "common/config.h"
-#include "../cxl_manager/cxl_manager.h"
+#include "cxl_manager/cxl_manager.h"
 
 // Forward declarations
 namespace Embarcadero {

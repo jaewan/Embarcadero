@@ -775,60 +775,87 @@ broker_remote_launch() {
   local _remote_rep="${REPLICATION_FACTOR:-${EMBARCADERO_REPLICATION_FACTOR:-0}}"
   local _remote_nb="${NUM_BROKERS:-4}"
 
-  broker_remote_ssh bash -s -- \
-    "$REMOTE_BROKER_STATE_DIR" \
-    "$REMOTE_BUILD_BIN" \
-    "$BROKER_CONFIG_ABS" \
-    "$head_addr" \
-    "$idx" \
-    "$role" \
-    "$sequence" \
-    "$poll_interval" \
-    "${EMBARCADERO_ACK_SEND_MIN_INTERVAL_US:-}" \
-    "${EMBARCADERO_ORDER0_FAST_PATH:-}" \
-    "${EMBARCADERO_ACK_STALL_SLEEP_US:-}" \
-    "${EMBARCADERO_CORFU_SEQ_IP:-}" \
-    "${EMBARCADERO_SCALOG_SEQ_IP:-}" \
-    "${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
-    "$_remote_rep" \
-    "$_remote_nb" <<'EOF'
+  broker_remote_ssh env \
+    REMOTE_STATE_DIR="$REMOTE_BROKER_STATE_DIR" \
+    REMOTE_BUILD_BIN_PATH="$REMOTE_BUILD_BIN" \
+    REMOTE_BROKER_CONFIG="$BROKER_CONFIG_ABS" \
+    REMOTE_HEAD_ADDR_VALUE="$head_addr" \
+    REMOTE_BROKER_IDX="$idx" \
+    REMOTE_BROKER_ROLE="$role" \
+    REMOTE_BROKER_SEQUENCE="$sequence" \
+    REMOTE_BROKER_POLL_INTERVAL="$poll_interval" \
+    REMOTE_ACK_SEND_MIN_INTERVAL_US="${EMBARCADERO_ACK_SEND_MIN_INTERVAL_US:-}" \
+    REMOTE_ORDER0_FAST_PATH="${EMBARCADERO_ORDER0_FAST_PATH:-}" \
+    REMOTE_ACK_STALL_SLEEP_US="${EMBARCADERO_ACK_STALL_SLEEP_US:-}" \
+    REMOTE_CORFU_SEQ_IP="${EMBARCADERO_CORFU_SEQ_IP:-}" \
+    REMOTE_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-}" \
+    REMOTE_SCALOG_SEQ_PORT="${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
+    REMOTE_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-}" \
+    REMOTE_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" \
+    REMOTE_REPLICATION_FACTOR="$_remote_rep" \
+    REMOTE_NUM_BROKERS="$_remote_nb" \
+    bash -s <<'EOF'
 set -euo pipefail
-state_dir=$1
-build_bin=$2
-config=$3
-head_addr=$4
-idx=$5
-role=$6
-sequence=$7
-poll_interval=$8
-ack_send_min_interval_us=${9-}
-order0_fast_path=${10-}
-ack_stall_sleep_us=${11-}
-corfu_seq_ip=${12-}
-scalog_seq_ip=${13-}
-scalog_seq_port=${14-}
-replication_factor_cfg=${15:-0}
-num_brokers_cfg=${16:-4}
+state_dir=${REMOTE_STATE_DIR:?}
+build_bin=${REMOTE_BUILD_BIN_PATH:?}
+config=${REMOTE_BROKER_CONFIG:?}
+head_addr=${REMOTE_HEAD_ADDR_VALUE:?}
+idx=${REMOTE_BROKER_IDX:?}
+role=${REMOTE_BROKER_ROLE:?}
+sequence=${REMOTE_BROKER_SEQUENCE:?}
+poll_interval=${REMOTE_BROKER_POLL_INTERVAL:?}
+ack_send_min_interval_us=${REMOTE_ACK_SEND_MIN_INTERVAL_US:-}
+order0_fast_path=${REMOTE_ORDER0_FAST_PATH:-}
+ack_stall_sleep_us=${REMOTE_ACK_STALL_SLEEP_US:-}
+corfu_seq_ip=${REMOTE_CORFU_SEQ_IP:-}
+scalog_seq_ip=${REMOTE_SCALOG_SEQ_IP:-}
+scalog_seq_port=${REMOTE_SCALOG_SEQ_PORT:-}
+lazylog_seq_ip=${REMOTE_LAZYLOG_SEQ_IP:-}
+lazylog_seq_port=${REMOTE_LAZYLOG_SEQ_PORT:-}
+replication_factor_cfg=${REMOTE_REPLICATION_FACTOR:-0}
+num_brokers_cfg=${REMOTE_NUM_BROKERS:-4}
 mkdir -p "$state_dir"
 rm -f "$state_dir/broker_${idx}.pid" "$state_dir/broker_${idx}.ready" "$state_dir/broker_${idx}.log"
-nohup bash -s -- "$state_dir" "$build_bin" "$config" "$head_addr" "$idx" "$role" "$sequence" "$poll_interval" "$ack_send_min_interval_us" "$order0_fast_path" "$ack_stall_sleep_us" "$corfu_seq_ip" "$scalog_seq_ip" "$scalog_seq_port" "$replication_factor_cfg" "$num_brokers_cfg" <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
+nohup env \
+  STATE_DIR="$state_dir" \
+  BUILD_BIN="$build_bin" \
+  BROKER_CONFIG="$config" \
+  HEAD_ADDR="$head_addr" \
+  BROKER_IDX="$idx" \
+  BROKER_ROLE="$role" \
+  BROKER_SEQUENCE="$sequence" \
+  BROKER_POLL_INTERVAL="$poll_interval" \
+  EMBARCADERO_ACK_SEND_MIN_INTERVAL_US="$ack_send_min_interval_us" \
+  EMBARCADERO_ORDER0_FAST_PATH="$order0_fast_path" \
+  EMBARCADERO_ACK_STALL_SLEEP_US="$ack_stall_sleep_us" \
+  EMBARCADERO_CORFU_SEQ_IP="$corfu_seq_ip" \
+  EMBARCADERO_SCALOG_SEQ_IP="$scalog_seq_ip" \
+  EMBARCADERO_SCALOG_SEQ_PORT="$scalog_seq_port" \
+  SCALOG_SEQUENCER_IP_OVERRIDE="$scalog_seq_ip" \
+  EMBARCADERO_LAZYLOG_SEQ_IP="$lazylog_seq_ip" \
+  EMBARCADERO_LAZYLOG_SEQ_PORT="$lazylog_seq_port" \
+  EMBARCADERO_REPLICATION_FACTOR="$replication_factor_cfg" \
+  NUM_BROKERS="$num_brokers_cfg" \
+  bash -s <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
 set -euo pipefail
-state_dir=$1
-build_bin=$2
-config=$3
-head_addr=$4
-idx=$5
-role=$6
-sequence=$7
-poll_interval=$8
-ack_send_min_interval_us=${9-}
-order0_fast_path=${10-}
-ack_stall_sleep_us=${11-}
-corfu_seq_ip=${12-}
-scalog_seq_ip=${13-}
-scalog_seq_port=${14-}
-replication_factor_cfg=${15:-0}
-num_brokers_cfg=${16:-4}
+state_dir=${STATE_DIR:?}
+build_bin=${BUILD_BIN:?}
+config=${BROKER_CONFIG:?}
+head_addr=${HEAD_ADDR:?}
+idx=${BROKER_IDX:?}
+role=${BROKER_ROLE:?}
+sequence=${BROKER_SEQUENCE:?}
+poll_interval=${BROKER_POLL_INTERVAL:?}
+ack_send_min_interval_us=${EMBARCADERO_ACK_SEND_MIN_INTERVAL_US:-}
+order0_fast_path=${EMBARCADERO_ORDER0_FAST_PATH:-}
+ack_stall_sleep_us=${EMBARCADERO_ACK_STALL_SLEEP_US:-}
+corfu_seq_ip=${EMBARCADERO_CORFU_SEQ_IP:-}
+scalog_seq_ip=${EMBARCADERO_SCALOG_SEQ_IP:-}
+scalog_seq_port=${EMBARCADERO_SCALOG_SEQ_PORT:-}
+lazylog_seq_ip=${EMBARCADERO_LAZYLOG_SEQ_IP:-}
+lazylog_seq_port=${EMBARCADERO_LAZYLOG_SEQ_PORT:-}
+replication_factor_cfg=${EMBARCADERO_REPLICATION_FACTOR:-0}
+num_brokers_cfg=${NUM_BROKERS:-4}
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
@@ -837,6 +864,8 @@ export NUM_BROKERS="${num_brokers_cfg:-4}"
 export EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}
 if [ "$sequence" = "SCALOG" ]; then
   export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1}
+elif [ "$sequence" = "LAZYLOG" ]; then
+  export LAZYLOG_CXL_MODE=${LAZYLOG_CXL_MODE:-1}
 fi
 if [ -n "$ack_send_min_interval_us" ]; then
   export EMBARCADERO_ACK_SEND_MIN_INTERVAL_US="$ack_send_min_interval_us"
@@ -844,8 +873,13 @@ fi
 if [ -n "$order0_fast_path" ]; then export EMBARCADERO_ORDER0_FAST_PATH="$order0_fast_path"; fi
 if [ -n "$ack_stall_sleep_us" ]; then export EMBARCADERO_ACK_STALL_SLEEP_US="$ack_stall_sleep_us"; fi
 if [ -n "$corfu_seq_ip" ]; then export EMBARCADERO_CORFU_SEQ_IP="$corfu_seq_ip"; fi
-if [ -n "$scalog_seq_ip" ]; then export EMBARCADERO_SCALOG_SEQ_IP="$scalog_seq_ip"; fi
+if [ -n "$scalog_seq_ip" ]; then
+  export EMBARCADERO_SCALOG_SEQ_IP="$scalog_seq_ip"
+  export SCALOG_SEQUENCER_IP_OVERRIDE="$scalog_seq_ip"
+fi
 if [ -n "$scalog_seq_port" ]; then export EMBARCADERO_SCALOG_SEQ_PORT="$scalog_seq_port"; fi
+if [ -n "$lazylog_seq_ip" ]; then export EMBARCADERO_LAZYLOG_SEQ_IP="$lazylog_seq_ip"; fi
+if [ -n "$lazylog_seq_port" ]; then export EMBARCADERO_LAZYLOG_SEQ_PORT="$lazylog_seq_port"; fi
 log_file="$state_dir/broker_${idx}.log"
 cd "$build_bin"
 export EMBARCADERO_HEAD_ADDR="$head_addr"

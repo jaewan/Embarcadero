@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/config.h"
-#include "../cxl_manager/cxl_datastructure.h"
+#include "cxl_manager/cxl_datastructure.h"
 #include <thread>
 #include <scalog_sequencer.grpc.pb.h>
 

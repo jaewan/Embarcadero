@@ -1,6 +1,6 @@
 #include "scalog_replication_manager.h"
-#include "../cxl_manager/cxl_datastructure.h"
-#include "../common/performance_utils.h"
+#include "cxl_manager/cxl_datastructure.h"
+#include "common/performance_utils.h"
 #include "scalog_replication.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>

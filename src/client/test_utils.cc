@@ -1,5 +1,5 @@
 #include "test_utils.h"
-#include "../common/configuration.h"
+#include "common/configuration.h"
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>

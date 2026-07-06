@@ -3,8 +3,8 @@
 #include "subscriber.h"
 #include "test_utils.h"
 #include "result_writer.h"
-#include "../common/configuration.h"
-#include "../common/order_level.h"
+#include "common/configuration.h"
+#include "common/order_level.h"
 
 int main(int argc, char* argv[]) {
     // Initialize logging

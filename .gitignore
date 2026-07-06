@@ -1,66 +1,75 @@
+# ─────────────────────────────────────────────────────────────
+# Embarcadero .gitignore
+# ─────────────────────────────────────────────────────────────
+
+# ── Build output ──────────────────────────────────────────────
+build/
+*/build/
+.Replication/
+_deps/
+
+# ── Generated experiment results & data (NEVER commit) ────────
+# All benchmark/experiment output belongs in results/ (git-ignored).
+# See CONTRIBUTING.md.
+results/*
+!results/README.md
+data/
+data_backup/
+datathroughput/
+**/result*.csv
+**/baseline_*.csv
+**/*_latency.csv
+**/summary_*.txt
+*.log
+
+# ── Paper (kept locally, managed separately) ──────────────────
 Paper/
 
-# Ignore build directory
-build/
-.Replication/
-
-# Ignore large data files
-data_backup/
+# ── Editor / tooling ──────────────────────────────────────────
+.vscode/
+.idea/
 tags
+compile_commands.json
 
-# Ignore external dependencies
+# ── External dependencies ─────────────────────────────────────
 !third_party/
 third_party/*
 !third_party/CMakeLists.txt
 
-# Ignore vscode
-.vscode
-
-# Gitignore for C++ projects
+# ── C/C++ build artifacts ─────────────────────────────────────
 # https://github.com/github/gitignore/blob/main/C%2B%2B.gitignore
-# Prerequisites
 *.d
-
-# Compiled Object files
 *.slo
 *.lo
 *.o
 *.obj
-
-# Precompiled Headers
 *.gch
 *.pch
-
-# Compiled Dynamic libraries
 *.so
 *.dylib
 *.dll
-
-# Fortran module files
 *.mod
 *.smod
-
-# Compiled Static libraries
 *.lai
 *.la
 *.a
 *.lib
-
-# Executables
 *.exe
 *.out
 *.app
 
-# Gitignore for cmake projects
-# From: https://github.com/github/gitignore/blob/main/CMake.gitignore
+# ── CMake artifacts ───────────────────────────────────────────
+# https://github.com/github/gitignore/blob/main/CMake.gitignore
 CMakeLists.txt.user
 CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-Makefile
+CMakeFiles/
+CMakeScripts/
+Testing/
 cmake_install.cmake
 install_manifest.txt
-compile_commands.json
 CTestTestfile.cmake
-_deps
+
+# Generated Makefiles (CMake), but keep hand-written ones that are tracked.
+Makefile
+!benchmarks/sequencer/Makefile
+!scripts/network-emulation/Makefile

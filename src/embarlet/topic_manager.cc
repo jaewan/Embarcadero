@@ -10,8 +10,8 @@
 #include <xmmintrin.h>  // For _mm_pause()
 
 // Project includes
-#include "../cxl_manager/cxl_manager.h"
-#include "../disk_manager/disk_manager.h"
+#include "cxl_manager/cxl_manager.h"
+#include "disk_manager/disk_manager.h"
 
 namespace Embarcadero {
 

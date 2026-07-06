@@ -2,6 +2,26 @@
 
 This directory contains the experiment launchers for throughput, latency, and related broker lifecycle workflows.
 
+## Directory layout
+
+| Path | Purpose |
+|------|---------|
+| `scripts/*.sh` | Top-level experiment launchers (throughput, latency, failures, multiclient). |
+| `scripts/setup/` | One-time cluster provisioning (deps, disks, CXL mount, cgroups, `sync_clocks.sh`). |
+| `scripts/lib/` | Reusable shell libraries sourced by launchers (`broker_lifecycle.sh`, `run_throughput_impl.sh`). |
+| `scripts/publication/` | Publication-grade experiment runners + result export/plotting. |
+| `scripts/plot/` | Plotting helpers for experimental data. |
+| `scripts/network/` | Cluster network/clock helpers (`run_clients.sh`, `run_servers.sh` iperf; `sync_clocks.sh`). |
+| `scripts/network-emulation/` | Standalone WAN/latency emulation harness. |
+
+> **Output convention:** generated data belongs in the git-ignored `results/` tree (see
+> `/results/README.md`). Some older scripts still write under `data/…`; migrate those to
+> `results/…` when you touch them.
+>
+> **Note:** two `sync_clocks.sh` variants exist — `scripts/setup/` (chrony) and
+> `scripts/network/` (systemd-timesyncd, moved from the repo root). They target different
+> cluster configs; reconcile to one when convenient.
+
 ## Quick Start
 
 Run any script as an environment-driven command:

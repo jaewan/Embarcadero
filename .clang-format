@@ -1,0 +1,20 @@
+# Go-forward formatting convention for new/changed C++ code (C++17).
+# The existing tree has mixed styling; do NOT reformat wholesale — format only
+# what you touch (`git clang-format`). See CONTRIBUTING.md.
+---
+Language: Cpp
+BasedOnStyle: Google
+Standard: c++17
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -2
+DerivePointerAlignment: false
+PointerAlignment: Left
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+IncludeBlocks: Preserve
+SortIncludes: false
+...

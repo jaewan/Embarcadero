@@ -21,10 +21,10 @@
 #include "scalog_replication_manager.h"
 #include "corfu_replication_manager.h"
 #include "chain_replication.h"
-#include "../cxl_manager/cxl_datastructure.h"
-#include "../common/order_level.h"
-#include "../common/env_flags.h"
-#include "../common/performance_utils.h"
+#include "cxl_manager/cxl_datastructure.h"
+#include "common/order_level.h"
+#include "common/env_flags.h"
+#include "common/performance_utils.h"
 
 namespace Embarcadero{
 

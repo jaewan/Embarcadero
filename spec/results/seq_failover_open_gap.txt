@@ -1,0 +1,29 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 115 and seed -763575459799210547 with 20 workers on 512 cores with 29127MB heap and 64MB offheap memory [pid: 1504832] (Linux 6.17.0-23-generic amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/spec/MCEmbarcadero.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/spec/Embarcadero.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/seq_failover_open_gap/tmp/TLC.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/seq_failover_open_gap/tmp/Naturals.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/seq_failover_open_gap/tmp/Sequences.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/seq_failover_open_gap/tmp/FiniteSets.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Embarcadero
+Semantic processing of module TLC
+Semantic processing of module MCEmbarcadero
+Starting... (2026-07-06 09:11:01)
+Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
+(Use the -nowarning option to disable this warning.)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-06 09:11:01.
+Progress(22) at 2026-07-06 09:11:05: 1,024,743 states generated (1,024,743 s/min), 269,869 distinct states found (269,869 ds/min), 46,768 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 2.6E-8
+  based on the actual fingerprints:  val = 3.5E-9
+1624573 states generated, 388282 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 32.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 3).
+Finished in 04s at (2026-07-06 09:11:06)

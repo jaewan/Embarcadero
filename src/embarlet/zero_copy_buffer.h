@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <functional>
-#include "../common/performance_utils.h"
+#include "common/performance_utils.h"
 
 namespace Embarcadero {
 

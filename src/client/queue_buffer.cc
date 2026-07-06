@@ -7,9 +7,9 @@
  */
 
 #include "queue_buffer.h"
-#include "../common/configuration.h"
-#include "../common/wire_formats.h"
-#include "../cxl_manager/cxl_datastructure.h"
+#include "common/configuration.h"
+#include "common/wire_formats.h"
+#include "cxl_manager/cxl_datastructure.h"
 #include <glog/logging.h>
 #include <chrono>
 #include <thread>

@@ -13,7 +13,7 @@
  */
 
 #include "common.h"
-#include "../cxl_manager/cxl_datastructure.h"
+#include "cxl_manager/cxl_datastructure.h"
 #include "folly/ProducerConsumerQueue.h"
 #include "folly/MPMCQueue.h"
 #include <atomic>

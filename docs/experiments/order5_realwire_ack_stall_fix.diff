@@ -1,0 +1,154 @@
+--- /tmp/claude-1002/-home-domin-Embarcadero/e62ea11f-43af-463f-8ead-6b9ae9823775/scratchpad/topic_clean.cc	2026-07-07 04:58:59.486415810 +0900
++++ /home/domin/Embarcadero-sessions/01-core-protocol/src/embarlet/topic.cc	2026-07-07 04:10:36.459061614 +0900
+@@ -4548,6 +4548,30 @@
+ 		          << " B3(push_b=" << scanner_pushed_batches_[3].load(std::memory_order_relaxed)
+ 		          << ",commit_b=" << sequencer_committed_batches_[3].load(std::memory_order_relaxed)
+ 		          << ",ordered=" << tinode_->offsets[3].ordered << ")";
++		// [[TMP_O5_STALL_DIAG]] Per-client hold state so a frozen stream's stuck point is visible:
++		// next_expected vs min held seq tells whether the gap batch vanished (min > expected) or
++		// the drain is broken (min == expected). Remove before final diff review if too chatty.
++		for (const auto& shard_ptr : level5_shards_) {
++			if (!shard_ptr) continue;
++			std::lock_guard<std::mutex> shard_lock(shard_ptr->mu);
++			for (const auto& [cid, cmap] : shard_ptr->hold_buffer) {
++				if (cmap.empty()) continue;
++				const auto st_it = shard_ptr->client_state.find(cid);
++				const auto em_it = shard_ptr->client_emitted_tracker.find(cid);
++				LOG(INFO) << "[ORDER5_HOLD_DIAG] client=" << cid
++				          << " held=" << cmap.size()
++				          << " min_held_seq=" << cmap.begin()->first
++				          << " max_held_seq=" << cmap.rbegin()->first
++				          << " next_expected="
++				          << (st_it != shard_ptr->client_state.end() ? st_it->second.next_expected : 0)
++				          << " highest_sequenced="
++				          << (st_it != shard_ptr->client_state.end() ? st_it->second.highest_sequenced : 0)
++				          << " emitted_contig_max="
++				          << (em_it != shard_ptr->client_emitted_tracker.end()
++				                  ? em_it->second.contiguous_max : UINT64_MAX)
++				          << " deferred=" << shard_ptr->deferred_level5.size();
++			}
++		}
+ 	};
+ 	uint64_t last_idle_diag_ns = 0;
+ 	// last_idle_progress_epoch removed: epoch advancement is not real progress
+@@ -4564,7 +4588,13 @@
+ 			last_idle_progress_ns[b] = SteadyNowNs();
+ 		}
+ 	}
+-	auto run_idle_hold_tick = [&]() {
++	// [[EXPIRY_ARMING_LIVENESS_FIX]] allow_inline_drain=false runs only the progress/stall
++	// tracking, force-expiry arming, and diagnostics — callable from the BUSY loop. The
++	// inline empty-epoch drain stays idle-only. Previously this tick ran exclusively in the
++	// idle branches; a sequencer kept permanently busy (e.g., a large hold buffer makes each
++	// epoch pass as slow as the 500 µs seal cadence) could never arm force-expiry, so a
++	// gapped stream's hold never drained and the client stalled to ACK timeout.
++	auto run_idle_hold_tick = [&](bool allow_inline_drain) {
+ 		if (!Embarcadero::UsesEpochSequencerPath(order_) || seq_type_ != EMBARCADERO) return;
+ 		const uint64_t now_ns = SteadyNowNs();
+ 		if (now_ns - last_idle_hold_tick_ns < 1'000'000ULL) return;
+@@ -4641,7 +4671,15 @@
+ 				           << " seq_commit_m=" << sequencer_committed_msgs_[b].load(std::memory_order_relaxed);
+ 			}
+ 		}
+-		if (!has_held_work && !force_expire_active) return;
++		if (!has_held_work && !force_expire_active) {
++			// Update the gate so the busy-loop caller pays this scan at most once per ms.
++			last_idle_hold_tick_ns = now_ns;
++			return;
++		}
++		if (!allow_inline_drain) {
++			last_idle_hold_tick_ns = now_ns;
++			return;
++		}
+ 		std::vector<PendingBatch5> idle_level5_empty;
+ 		std::vector<PendingBatch5> idle_ready_level5;
+ 		ProcessLevel5Batches(idle_level5_empty, idle_ready_level5);
+@@ -4694,10 +4732,12 @@
+ 
+ 	while (!stop_threads_) {
+ 		emit_phase_diag("loop");
++		// [[EXPIRY_ARMING_LIVENESS_FIX]] Arm/track even while busy (internally 1 ms-gated).
++		run_idle_hold_tick(/*allow_inline_drain=*/false);
+ 		uint64_t last = last_sequenced_epoch_.load(std::memory_order_acquire);
+ 		uint64_t current = epoch_index_.load(std::memory_order_acquire);
+ 		if (last >= current) {
+-			run_idle_hold_tick();
++			run_idle_hold_tick(/*allow_inline_drain=*/true);
+ 			// [[FIX_SEQUENCER_WAIT_PAUSE]] Replace sleep_for with cpu_pause for epoch waiting.
+ 			CXL::cpu_pause();
+ 			CXL::cpu_pause();
+@@ -4708,12 +4748,31 @@
+ 		if (buf.state.load(std::memory_order_acquire) != EpochBuffer5::State::SEALED) {
+ 			// Tail-progress tick: when no epoch is sealed, still age/expire hold-buffer entries
+ 			// so final batches do not wait indefinitely for new input traffic.
+-			run_idle_hold_tick();
++			run_idle_hold_tick(/*allow_inline_drain=*/true);
+ 			// [[FIX_BUFFER_STATE_PAUSE]] Replace sleep_for with cpu_pause for buffer state waiting.
+ 			CXL::cpu_pause();
+ 			CXL::cpu_pause();
+ 			continue;
+ 		}
++		// [[EPOCH_BUFFER_LOSS_FIX]] seal() publishes SEALED *before* its collector quiesce
++		// wait completes, so a scanner that already passed enter_collection() may still be
++		// about to push. Draining before those collectors exit loses their batches (the
++		// buffer is drained, the late push lands in it, and the next reset_and_start()
++		// wipes it). Consume only once no collector is active; new collectors cannot enter
++		// a SEALED buffer, and stragglers hold broker_active until after their push.
++		{
++			bool collectors_active = false;
++			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
++				if (buf.broker_active[i].load(std::memory_order_acquire)) {
++					collectors_active = true;
++					break;
++				}
++			}
++			if (collectors_active) {
++				CXL::cpu_pause();
++				continue;
++			}
++		}
+ 		// Clear only when we have work; avoids redundant clear() in idle loop.
+ 		batch_list.clear();
+ 		level0.clear(); level5.clear(); ready_level5.clear(); ready.clear();
+@@ -5018,6 +5077,22 @@
+ 			std::this_thread::sleep_for(std::chrono::microseconds(100));
+ 			continue;
+ 		}
++		// [[EPOCH_BUFFER_LOSS_FIX]] Same quiesce requirement as the main consume loop:
++		// do not drain a SEALED buffer while a collector is still active (its push would
++		// land in a drained buffer and be wiped by the next reset_and_start()).
++		{
++			bool collectors_active = false;
++			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
++				if (buf.broker_active[i].load(std::memory_order_acquire)) {
++					collectors_active = true;
++					break;
++				}
++			}
++			if (collectors_active) {
++				std::this_thread::sleep_for(std::chrono::microseconds(10));
++				continue;
++			}
++		}
+ 		{
+ 			size_t total = 0;
+ 			std::lock_guard<std::mutex> data_lock(buf.data_mu);
+@@ -6734,9 +6809,15 @@
+ 							continue;
+ 						}
+ 						uint64_t expected = cur_epoch;
+-						if (!epoch_index_.compare_exchange_strong(expected, cand_epoch, std::memory_order_release)) {
+-							cand.state.store(EpochBuffer5::State::IDLE, std::memory_order_release);
+-						}
++						// [[EPOCH_BUFFER_LOSS_FIX]] On CAS failure do NOT roll the candidate back to
++						// IDLE. Between reset_and_start() (state=COLLECTING) and a rollback store,
++						// another scanner can enter_collection() and push batches; marking the buffer
++						// IDLE strands them, and the next reset_and_start() silently wipes them
++						// (observed as a client stream freezing at the wiped batch's seq with the
++						// entire tail piling into the hold buffer). Leaving it COLLECTING is safe:
++						// buffers are not epoch-tagged, and the driver's rotation seals and the
++						// sequencer consumes it within <=2 epochs.
++						epoch_index_.compare_exchange_strong(expected, cand_epoch, std::memory_order_release);
+ 						break;
+ 					}
+ 				}

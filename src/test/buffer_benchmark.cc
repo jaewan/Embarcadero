@@ -23,13 +23,13 @@
  *   GetCXLBuffer, CXL writes, ACK path, and EAGAIN backoff. The slowest of those limits end-to-end throughput,
  *   so full-stack is lower (~7 GB/s) than buffer-only (~10 GB/s).
  */
-#include "../client/buffer.h"
-#include "../client/queue_buffer.h"
-#include "../client/publisher_profile.h"
-#include "../common/configuration.h"
-#include "../cxl_manager/cxl_datastructure.h"
-#include "../cxl_manager/cxl_datastructure.h"
-#include "../common/performance_utils.h"
+#include "client/buffer.h"
+#include "client/queue_buffer.h"
+#include "client/publisher_profile.h"
+#include "common/configuration.h"
+#include "cxl_manager/cxl_datastructure.h"
+#include "cxl_manager/cxl_datastructure.h"
+#include "common/performance_utils.h"
 #include <glog/logging.h>
 #include <cxxopts.hpp>
 #include <chrono>

@@ -26,9 +26,9 @@
 #include "common/configuration.h"
 #include "heartbeat.h"
 #include "topic_manager.h"
-#include "../disk_manager/disk_manager.h"
-#include "../network_manager/network_manager.h"
-#include "../cxl_manager/cxl_manager.h"
+#include "disk_manager/disk_manager.h"
+#include "network_manager/network_manager.h"
+#include "cxl_manager/cxl_manager.h"
 
 namespace {
 

@@ -19,6 +19,8 @@ MODES="${MODES:-steady}"
 PUBLISHER_HOST="${PUBLISHER_HOST:-c2}"
 BROKER_HOST="${BROKER_HOST:-moscxl}"
 BROKER_LISTEN_ADDR="${BROKER_LISTEN_ADDR:-10.10.10.143}"
+LATENCY_METRIC_SOURCE="${LATENCY_METRIC_SOURCE:-e2e}"
+LATENCY_METRIC_NAME="${LATENCY_METRIC_NAME:-}"
 # Corfu gRPC sequencer log fetch (publication default: c2; override if your layout host differs).
 CORFU_SEQUENCER_LOG_HOST="${CORFU_SEQUENCER_LOG_HOST:-c2}"
 LAZYLOG_SEQUENCER_LOG_HOST="${LAZYLOG_SEQUENCER_LOG_HOST:-c3}"
@@ -48,6 +50,25 @@ if [[ -z "$ACK_LEVEL" ]]; then
   fi
 fi
 
+if [[ -z "$LATENCY_METRIC_NAME" ]]; then
+  case "$LATENCY_METRIC_SOURCE" in
+    e2e)
+      LATENCY_METRIC_NAME="publish_to_deliver_latency"
+      ;;
+    publish)
+      if [[ "$ACK_LEVEL" == "1" ]]; then
+        LATENCY_METRIC_NAME="append_send_to_ordered_batch_latency"
+      else
+        LATENCY_METRIC_NAME="append_send_to_ack_batch_latency"
+      fi
+      ;;
+    *)
+      echo "ERROR: unsupported LATENCY_METRIC_SOURCE='$LATENCY_METRIC_SOURCE' (expected e2e or publish)" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 CELL_ID="${SYSTEM}_order${ORDER}_rf${REPLICATION_FACTOR}"
 RUN_DIR="$PROJECT_ROOT/data/publication/latency/$TAG/$CELL_ID/run_$RUN_ID"
 RAW_DATA_DIR="$RUN_DIR/rawdata"
@@ -67,6 +88,7 @@ TAG='$TAG' SYSTEM='$SYSTEM' ORDER='$ORDER' SEQUENCER='$SEQUENCER' REPLICATION_FA
 NUM_TRIALS='$NUM_TRIALS' NUM_BROKERS='$NUM_BROKERS' MSG_SIZE='$MSG_SIZE' TOTAL_MESSAGE_SIZE='$TOTAL_MESSAGE_SIZE' \\
 ACK_LEVEL='$ACK_LEVEL' MODES='$MODES' PUBLISHER_HOST='$PUBLISHER_HOST' BROKER_HOST='$BROKER_HOST' \\
 BROKER_LISTEN_ADDR='$BROKER_LISTEN_ADDR' CORFU_SEQUENCER_LOG_HOST='$CORFU_SEQUENCER_LOG_HOST' \\
+LATENCY_METRIC_SOURCE='$LATENCY_METRIC_SOURCE' LATENCY_METRIC_NAME='$LATENCY_METRIC_NAME' \\
 LAZYLOG_SEQUENCER_LOG_HOST='$LAZYLOG_SEQUENCER_LOG_HOST' \\
 SCALOG_SEQUENCER_LOG_HOST='$SCALOG_SEQUENCER_LOG_HOST' \\
 REMOTE_CORFU_SEQUENCER_HOST='$REMOTE_CORFU_SEQUENCER_HOST' REMOTE_CORFU_BUILD_BIN='$REMOTE_CORFU_BUILD_BIN' \\
@@ -96,6 +118,8 @@ modes=$MODES
 publisher_host=$PUBLISHER_HOST
 broker_host=$BROKER_HOST
 broker_listen_addr=$BROKER_LISTEN_ADDR
+latency_metric_source=$LATENCY_METRIC_SOURCE
+latency_metric_name=$LATENCY_METRIC_NAME
 corfu_sequencer_log_host=$CORFU_SEQUENCER_LOG_HOST
 lazylog_sequencer_log_host=$LAZYLOG_SEQUENCER_LOG_HOST
 scalog_sequencer_log_host=$SCALOG_SEQUENCER_LOG_HOST
@@ -193,7 +217,7 @@ scp -o StrictHostKeyChecking=no "${SCALOG_SEQUENCER_LOG_HOST}:/tmp/scalog_sequen
   "$RUN_DIR/${SCALOG_SEQUENCER_LOG_HOST}_scalog_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
-echo "system,order,sequencer,replication_factor,publisher_host,broker_host,run_idx,status,p50_us,p95_us,p99_us,max_us,attempts_used,first_attempt_pass,artifact_dir,commit" > "$SUMMARY_CSV"
+echo "system,order,sequencer,replication_factor,publisher_host,broker_host,run_idx,status,p50_us,p95_us,p99_us,max_us,attempts_used,first_attempt_pass,artifact_dir,commit,metric_source,metric_name" > "$SUMMARY_CSV"
 
 for trial_num in $(seq 1 "$NUM_TRIALS"); do
   trial_dir="$(find "$RAW_DATA_DIR" -type d -name "*_trial${trial_num}" | sort | head -n 1)"
@@ -205,18 +229,32 @@ for trial_num in $(seq 1 "$NUM_TRIALS"); do
   first_attempt_pass="0"
 
   if [[ -n "$trial_dir" ]]; then
-    stats="$trial_dir/latency_stats.csv"
-    if [[ -f "$stats" ]]; then
-      row="$(awk -F',' '$13=="publish_to_deliver_latency"{print $3","$5","$6","$8; exit}' "$stats")"
-      if [[ -n "$row" ]]; then
-        IFS=',' read -r p50 p95 p99 maxv <<< "$row"
-        status="ok"
-        first_attempt_pass="1"
-      fi
+    case "$LATENCY_METRIC_SOURCE" in
+      e2e)
+        stats="$trial_dir/latency_stats.csv"
+        if [[ -f "$stats" ]]; then
+          row="$(awk -F',' -v metric="$LATENCY_METRIC_NAME" '$13==metric{print $3","$5","$6","$8; exit}' "$stats")"
+        else
+          row=""
+        fi
+        ;;
+      publish)
+        stats="$trial_dir/pub_latency_stats.csv"
+        if [[ -f "$stats" ]]; then
+          row="$(awk -F',' -v metric="$LATENCY_METRIC_NAME" '$10==metric{print $3","$5","$6","$8; exit}' "$stats")"
+        else
+          row=""
+        fi
+        ;;
+    esac
+    if [[ -n "${row:-}" ]]; then
+      IFS=',' read -r p50 p95 p99 maxv <<< "$row"
+      status="ok"
+      first_attempt_pass="1"
     fi
   fi
 
-  echo "$SYSTEM,$ORDER,$SEQUENCER,$REPLICATION_FACTOR,$PUBLISHER_HOST,$BROKER_HOST,$trial_num,$status,$p50,$p95,$p99,$maxv,1,$first_attempt_pass,$trial_dir,$COMMIT" >> "$SUMMARY_CSV"
+  echo "$SYSTEM,$ORDER,$SEQUENCER,$REPLICATION_FACTOR,$PUBLISHER_HOST,$BROKER_HOST,$trial_num,$status,$p50,$p95,$p99,$maxv,1,$first_attempt_pass,$trial_dir,$COMMIT,$LATENCY_METRIC_SOURCE,$LATENCY_METRIC_NAME" >> "$SUMMARY_CSV"
 done
 
 summary_rows="$(tail -n +2 "$SUMMARY_CSV" | wc -l | awk '{print $1}')"

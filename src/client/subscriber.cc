@@ -1,7 +1,7 @@
 #include "subscriber.h"
 #include "latency_stats.h"
-#include "../cxl_manager/cxl_datastructure.h"
-#include "../common/wire_formats.h"
+#include "cxl_manager/cxl_datastructure.h"
+#include "common/wire_formats.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>

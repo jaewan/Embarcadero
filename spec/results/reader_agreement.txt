@@ -1,0 +1,29 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 50 and seed 7092281829583358926 with 20 workers on 512 cores with 29127MB heap and 64MB offheap memory [pid: 1504841] (Linux 6.17.0-23-generic amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/spec/MCEmbarcadero.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/spec/Embarcadero.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/reader_agreement/tmp/TLC.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/reader_agreement/tmp/Naturals.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/reader_agreement/tmp/Sequences.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/reader_agreement/tmp/FiniteSets.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Embarcadero
+Semantic processing of module TLC
+Semantic processing of module MCEmbarcadero
+Starting... (2026-07-06 09:11:01)
+Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
+(Use the -nowarning option to disable this warning.)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-06 09:11:02.
+Progress(23) at 2026-07-06 09:11:05: 1,551,053 states generated (1,551,053 s/min), 427,905 distinct states found (427,905 ds/min), 70,852 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 5.1E-8
+  based on the actual fingerprints:  val = 2.5E-8
+2217647 states generated, 565954 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 32.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 7 and the 95th percentile is 3).
+Finished in 05s at (2026-07-06 09:11:06)

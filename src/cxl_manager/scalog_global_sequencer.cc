@@ -81,18 +81,27 @@ grpc::Status ScalogGlobalSequencer::HandleRegisterBroker(grpc::ServerContext* co
 
     int broker_id = request->broker_id();
 
-	if (broker_id == 0) {
-		num_replicas_per_broker_ = request->replication_factor();
+	// Route registration (and the broker-0 replication factor) into the shared ordering
+	// core, which owns num_replicas_per_broker_ now. Held under global_cut_mu_ because the
+	// core has no internal locks.
+	{
+		absl::WriterMutexLock cut_lock(&global_cut_mu_);
+		core_.RegisterBroker(broker_id, request->replication_factor());
 	}
 
 	{
         absl::WriterMutexLock lock(&registered_brokers_mu_);
 		registered_brokers_.insert(broker_id);
 		const int expected_brokers = ExpectedScalogBrokerCount();
+		int replicas_per_broker;
+		{
+			absl::WriterMutexLock cut_lock(&global_cut_mu_);
+			replicas_per_broker = core_.num_replicas_per_broker();
+		}
 		LOG(INFO) << "Scalog global sequencer registered broker=" << broker_id
 		          << " registered=" << registered_brokers_.size()
 		          << "/" << expected_brokers
-		          << " replicas_per_broker=" << num_replicas_per_broker_;
+		          << " replicas_per_broker=" << replicas_per_broker;
 
 		if ((int)registered_brokers_.size() == expected_brokers && !global_cut_thread_.joinable()) {
 			global_cut_thread_ = std::thread(&ScalogGlobalSequencer::SendGlobalCut, this);
@@ -110,45 +119,20 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 		// TODO(Tony) Might not need this lock or might be able to move it to right before we begin iterating through local_sequencers_ vector.
 		{
 			absl::MutexLock lock(&stream_mu_);
-			/// Convert global_cut_ to google::protobuf::Map<int64_t, int64_t>
+			/// Compute the per-broker global cut (MIN across replicas per shard = the durable
+			/// prefix) via the shared transport-independent core. Same readiness gate and
+			/// same min-across-replicas decision as before — extracted verbatim, so the gRPC
+			/// baseline and the CXL mailbox port call literally the same ordering code.
 			{
 				absl::WriterMutexLock lock(&global_cut_mu_);
-				// TODO(Tony) For now, ensure all local sequencers make connections to the global seq before we start distributing the global cut.
-				size_t total_num_replicas = 0;
-				for (const auto& [broker_id, replica_map] : global_cut_) {
-					total_num_replicas += replica_map.size();
-				}
-				// Each broker always contributes at least one local-cut stream (replica_id=0)
-				// even when replication_factor=0. Waiting for exactly rf streams would block
-				// global-cut emission forever in RF=0 runs.
-				const int streams_per_broker = std::max(1, num_replicas_per_broker_);
-				const size_t expected_replicas =
-					static_cast<size_t>(ExpectedScalogBrokerCount()) * static_cast<size_t>(streams_per_broker);
-
-				if (total_num_replicas != expected_replicas) {
+				absl::btree_map<int, int64_t> cut_by_broker;
+				// Readiness: every expected broker must have reported every expected stream
+				// (durability coupling — no cut until the whole replica set is present).
+				if (!core_.ComputeGlobalCut(ExpectedScalogBrokerCount(), cut_by_broker)) {
 					continue;
 				}
-				
-				auto global_cut_copy = global_cut_;
-				for (const auto& entry : global_cut_copy) {
-					if (entry.second.empty()) {
-						global_cut.mutable_global_cut()->insert({entry.first, 0});
-						continue;
-					}
-
-					size_t num_replicas = entry.second.size();
-					if (num_replicas < num_replicas_per_broker_) {
-						global_cut.mutable_global_cut()->insert({entry.first, 0});
-						continue;
-					}
-
-					auto min_entry = std::min_element(entry.second.begin(), entry.second.end(),
-													[](const auto& a, const auto& b) {
-														return a.second < b.second;
-													});
-
-					global_cut.mutable_global_cut()->insert({entry.first, min_entry->second});
-
+				for (const auto& [broker_id, cut_value] : cut_by_broker) {
+					global_cut.mutable_global_cut()->insert({broker_id, cut_value});
 				}
 			}
 
@@ -164,7 +148,12 @@ void ScalogGlobalSequencer::SendGlobalCut() {
 					first = false;
 					oss << "b" << entry.first << "=" << entry.second;
 				}
-				LOG(INFO) << "Scalog global cut send replicas_seen=" << global_cut_.size()
+				int replicas_seen;
+				{
+					absl::WriterMutexLock cut_lock(&global_cut_mu_);
+					replicas_seen = core_.num_registered_brokers();
+				}
+				LOG(INFO) << "Scalog global cut send replicas_seen=" << replicas_seen
 				          << " streams=" << local_sequencers_.size()
 				          << " cuts={" << oss.str() << "}";
 				last_log_time = now;
@@ -210,30 +199,10 @@ void ScalogGlobalSequencer::ReceiveLocalCut(grpc::ServerReaderWriter<GlobalCut, 
 				int replica_id = request.replica_id();
 
 				{
+					// Delegate the cut accumulation (delta-since-last + regression rejection)
+					// to the shared core — same behavior as the inline logic it replaces.
 					absl::WriterMutexLock lock(&global_cut_mu_);
-					int64_t previous_cut = 0;
-					auto broker_it = logical_offsets_.find(broker_id);
-					if (broker_it != logical_offsets_.end()) {
-						auto replica_it = broker_it->second.find(replica_id);
-						if (replica_it != broker_it->second.end()) {
-							previous_cut = replica_it->second;
-						}
-					}
-					if (local_cut < previous_cut) {
-						LOG(WARNING) << "Scalog global sequencer ignoring regressing local cut broker="
-						             << broker_id << " replica=" << replica_id
-						             << " previous=" << previous_cut << " current=" << local_cut;
-					} else {
-						global_cut_[broker_id][replica_id] += (local_cut - previous_cut);
-						logical_offsets_[broker_id][replica_id] = local_cut;
-						if ((epoch % 1000) == 0) {
-							LOG(INFO) << "Scalog global sequencer received local cut broker=" << broker_id
-							          << " replica=" << replica_id
-							          << " epoch=" << epoch
-							          << " local_cut=" << local_cut
-							          << " delta=" << (local_cut - previous_cut);
-						}
-					}
+					core_.AddLocalCut(broker_id, replica_id, epoch, local_cut);
 				}
 			}
 		}

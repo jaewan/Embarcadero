@@ -1,0 +1,375 @@
+diff --git a/src/embarlet/topic.cc b/src/embarlet/topic.cc
+index 2893bab..e048c10 100644
+--- a/src/embarlet/topic.cc
++++ b/src/embarlet/topic.cc
+@@ -1,10 +1,10 @@
+ #include "topic.h"
+-#include "../cxl_manager/scalog_local_sequencer.h"
+-#include "../cxl_manager/lazylog_local_sequencer.h"
++#include "cxl_manager/scalog_local_sequencer.h"
++#include "cxl_manager/lazylog_local_sequencer.h"
+ #include "common/performance_utils.h"
+-#include "../common/wire_formats.h"
+-#include "../common/order_level.h"
+-#include "../common/env_flags.h"
++#include "common/wire_formats.h"
++#include "common/order_level.h"
++#include "common/env_flags.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -74,6 +74,16 @@ static inline bool UsesTrueClientChainOrdering(int order) {
+ 	return order == kOrderStrong;
+ }
+ 
++// [[W1.2]] EMBAR_ASSERT_COMMIT_ORDER=1 makes the per-session commit-order check a hard CHECK
++// (abort) for tests; default off (count + LOG only) so it is safe to leave on under load runs.
++static inline bool ShouldAssertCommitOrder() {
++	static const bool v = []() {
++		const char* e = std::getenv("EMBAR_ASSERT_COMMIT_ORDER");
++		return e != nullptr && std::atoi(e) > 0;
++	}();
++	return v;
++}
++
+ static uint64_t GetOrder5HoldTimeoutNs(bool replicated_ack2_mode) {
+ 	if (const char* env = std::getenv("EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS")) {
+ 		char* end = nullptr;
+@@ -3578,6 +3588,8 @@ void Topic::InitExportCursorForBroker(int broker_id) {
+ 
+ void Topic::Sequencer5() {
+ 	LOG(INFO) << "Starting Sequencer5 (Phase 1b epoch pipeline) for topic: " << topic_name_;
++	commit_order_last_seq_.clear();  // [[W1.2]] fresh per-session commit-order tracking each run
++	order5_commit_order_violations_.store(0, std::memory_order_relaxed);
+ 	ResetCompletedRangeQueue();
+ 	global_batch_seq_.store(0, std::memory_order_release);
+ 	{
+@@ -4122,7 +4134,7 @@ void Topic::CommitEpoch(
+ 	};
+ 
+ 	// [COMMIT_DIAG] Count batches committed per broker this epoch
+-	std::array<size_t, 8> committed_this_epoch{};
++	std::array<size_t, NUM_MAX_BROKERS> committed_this_epoch{};
+ 
+ 	// [PHASE-3D] Regroup flushes for better pipeline utilization
+ 	// 1. Flush all GOI entries
+@@ -4178,6 +4190,27 @@ void Topic::CommitEpoch(
+ 				entry->global_seq = batch_index;
+ 				next_order += p.num_msg;
+ 			}
++		// [[W1.2]] Empirical per-session in-order commit invariant (W1 item #2): across epoch
++		// seals the collector must commit a client's batches in strictly increasing client_seq.
++		// Deliberate gap-skips still advance (increasing, non-contiguous); a LOWER client_seq
++		// committed after a higher one for the same client is a genuine collector reorder -> bug.
++		if (order_ == kOrderStrong && (p.from_hold || p.hdr != nullptr)) {
++			const uint64_t w12_cid = entry->client_id;
++			const uint64_t w12_seq = entry->client_seq;
++			auto w12_it = commit_order_last_seq_.find(w12_cid);
++			if (w12_it != commit_order_last_seq_.end() && w12_seq <= w12_it->second) {
++				order5_commit_order_violations_.fetch_add(1, std::memory_order_relaxed);
++				LOG(ERROR) << "[W1.2_COMMIT_ORDER_VIOLATION] client=" << w12_cid
++				           << " committed client_seq=" << w12_seq << " <= last=" << w12_it->second
++				           << " broker=" << entry->broker_id << " goi_index=" << batch_index;
++				if (ShouldAssertCommitOrder()) {
++					CHECK_GT(w12_seq, w12_it->second) << "[W1.2] per-session commit-order invariant violated";
++				}
++				commit_order_last_seq_[w12_cid] = std::max<uint64_t>(w12_seq, w12_it->second);
++			} else {
++				commit_order_last_seq_[w12_cid] = w12_seq;
++			}
++		}
+ 		CXL::store_fence();
+ 		CXL::flush_cacheline(entry);
+ 		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);
+@@ -4188,6 +4221,12 @@ void Topic::CommitEpoch(
+ 	// the head sequencer's process-local hold/export map, so every committed batch gets a
+ 	// descriptor written into shared memory keyed by PBR order.
+ 		size_t export_next_order = base_order;
++		// [E2] Compute the ORDER=5 recomputed batch size ONCE per batch here (step 2) and reuse it
++		// in the step-3 metadata loop, eliminating the second identical CXL payload walk. Indexed by
++		// position in `ready`; both loops bind references to the same vector, so &p - ready.data()
++		// yields the same index. Values are byte-identical to a second recompute (the BlogMessageHeader
++		// payload at log_idx is not mutated between the two loops), so this is behavior-preserving.
++		std::vector<size_t> order5_recomputed_size(ready.size(), 0);
+ 		for (PendingBatch5& p : ready) {
+ 			if (p.skipped || p.is_held_marker) continue;
+ 			const bool from_hold = p.from_hold;
+@@ -4199,6 +4238,7 @@ void Topic::CommitEpoch(
+ 			const size_t batch_total_size = from_hold
+ 				? RecomputeOrder5BatchSizeFromPayload(cxl_addr_, hold->log_idx, hold->num_msg, hold->total_size)
+ 				: RecomputeOrder5BatchSizeFromPayload(cxl_addr_, p.cached_log_idx, p.num_msg, p.cached_total_size);
++			order5_recomputed_size[static_cast<size_t>(&p - ready.data())] = batch_total_size;
+ 			if (b >= 0 && b < NUM_MAX_BROKERS) {
+ 				const size_t batch_headers_offset = tinode_->offsets[b].batch_headers_offset;
+ 				if (batch_headers_offset != 0) {
+@@ -4223,7 +4263,7 @@ void Topic::CommitEpoch(
+ 					cur->pbr_absolute_index = pbr_abs;
+ 					cur->ordered = 1;
+ 					cur->batch_complete = 1;
+-					cur->publish_commit = p.cached_pbr_absolute_index;
++					cur->publish_commit = pbr_abs;
+ 					cur->flags = kBatchHeaderFlagClaimed | kBatchHeaderFlagValid;
+ 					CXL::store_fence();
+ 					CXL::flush_cacheline(cur);
+@@ -4279,8 +4319,7 @@ void Topic::CommitEpoch(
+ 		{
+ 			OrderedHoldExportEntry ex;
+ 				ex.log_idx = m.log_idx;
+-				ex.batch_size = RecomputeOrder5BatchSizeFromPayload(
+-					cxl_addr_, m.log_idx, m.num_msg, m.total_size);
++				ex.batch_size = order5_recomputed_size[static_cast<size_t>(&p - ready.data())];
+ 				if (ex.batch_size != m.total_size) {
+ 					LOG(WARNING) << "[ORDER5_HOLD_EXPORT_SIZE_FIX B" << b << "]"
+ 					             << " pbr=" << m.pbr_absolute_index
+@@ -4292,8 +4331,13 @@ void Topic::CommitEpoch(
+ 				ex.num_messages = m.num_msg;
+ 				ex.pbr_absolute_index = m.pbr_absolute_index;
+ 				{
+-					absl::MutexLock lock(&hold_export_queues_[b].mu);
+-					hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
++					// [E1] hold_export_queues_ is process-local DRAM; only the sequencer's own
++					// broker (broker_id_) drains it. Others export via the shared CXL ring, so
++					// inserts for non-owned brokers were dead writes (unbounded DRAM growth).
++					if (b == broker_id_) {
++						absl::MutexLock lock(&hold_export_queues_[b].mu);
++						hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
++					}
+ 				}
+ 			}
+ 			next_order += m.num_msg;
+@@ -4319,8 +4363,13 @@ void Topic::CommitEpoch(
+ 			ex.total_order = next_order;
+ 			ex.num_messages = p.num_msg;
+ 			ex.pbr_absolute_index = p.cached_pbr_absolute_index;
+-			absl::MutexLock lock(&hold_export_queues_[owner_broker].mu);
+-			hold_export_queues_[owner_broker].q.push_back(ex);
++			// [E1] hold_export_queues_ is process-local DRAM; only the sequencer's own
++			// broker (broker_id_) drains it. Others export via the shared CXL ring, so
++			// inserts for non-owned brokers were dead writes (unbounded DRAM growth).
++			if (owner_broker == broker_id_) {
++				absl::MutexLock lock(&hold_export_queues_[owner_broker].mu);
++				hold_export_queues_[owner_broker].q[ex.pbr_absolute_index] = ex;
++			}
+ 		}
+ 		next_order += p.num_msg;
+ 		int b = p.broker_id;
+@@ -4331,8 +4380,7 @@ void Topic::CommitEpoch(
+ 		{
+ 			OrderedHoldExportEntry ex;
+ 			ex.log_idx = p.cached_log_idx;
+-			ex.batch_size = RecomputeOrder5BatchSizeFromPayload(
+-				cxl_addr_, p.cached_log_idx, p.num_msg, p.cached_total_size);
++			ex.batch_size = order5_recomputed_size[static_cast<size_t>(&p - ready.data())];
+ 			if (ex.batch_size != p.cached_total_size) {
+ 				LOG(WARNING) << "[ORDER5_EXPORT_SIZE_FIX B" << b << "]"
+ 				             << " pbr=" << p.cached_pbr_absolute_index
+@@ -4343,8 +4391,13 @@ void Topic::CommitEpoch(
+ 			ex.total_order = next_order - p.num_msg;
+ 			ex.num_messages = p.num_msg;
+ 			ex.pbr_absolute_index = p.cached_pbr_absolute_index;
+-			absl::MutexLock lock(&hold_export_queues_[b].mu);
+-			hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
++			// [E1] hold_export_queues_ is process-local DRAM; only the sequencer's own
++			// broker (broker_id_) drains it. Others export via the shared CXL ring, so
++			// inserts for non-owned brokers were dead writes (unbounded DRAM growth).
++			if (b == broker_id_) {
++				absl::MutexLock lock(&hold_export_queues_[b].mu);
++				hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
++			}
+ 		}
+ 
+ 		size_t& next_expected = contiguous_consumed_per_broker[b];
+@@ -5390,7 +5443,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
+ 						if (stream_map.find(seq) != stream_map.end()) continue;
+ 
+ 						HoldEntry5 he;
+-						he.batch = std::move(*p);
+ 						he.meta.log_idx = p->cached_log_idx;
+ 						he.meta.total_size = p->cached_total_size;
+ 						he.meta.batch_id = p->cached_batch_id;
+@@ -5402,15 +5454,16 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
+ 						he.meta.num_msg = p->num_msg;
+ 						he.meta.start_logical_offset = p->cached_start_logical_offset;
+ 						he.hold_start_ns = SteadyNowNs();
++						he.batch = std::move(*p);
+ 						stream_map.emplace(seq, he);
+ 						record_hold_insert(first_client, stream_map);
+ 						shard.hold_buffer_size++;
+ 						shard.clients_with_held_batches.insert(first_client);
+-						InvalidateOrder5HeldSlot(p->hdr);
++						InvalidateOrder5HeldSlot(he.batch.hdr);
+ 
+ 						PendingBatch5 marker;
+-						marker.broker_id = p->broker_id;
+-						marker.slot_offset = p->slot_offset;
++						marker.broker_id = he.batch.broker_id;
++						marker.slot_offset = he.batch.slot_offset;
+ 						marker.is_held_marker = true;
+ 						marker.hdr = nullptr;
+ 						marker.num_msg = 0;
+@@ -5492,7 +5545,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
+ 							if (stream_map.find(seq) != stream_map.end()) continue;
+ 
+ 							HoldEntry5 he;
+-							he.batch = std::move(*p);
+ 							he.meta.log_idx = p->cached_log_idx;
+ 							he.meta.total_size = p->cached_total_size;
+ 							he.meta.batch_id = p->cached_batch_id;
+@@ -5504,14 +5556,15 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
+ 							he.meta.num_msg = p->num_msg;
+ 							he.meta.start_logical_offset = p->cached_start_logical_offset;
+ 							he.hold_start_ns = SteadyNowNs();
++							he.batch = std::move(*p);
+ 							stream_map.emplace(seq, he);
+ 							shard.hold_buffer_size++;
+ 							shard.clients_with_held_batches.insert(stream_key);
+-							InvalidateOrder5HeldSlot(p->hdr);
++							InvalidateOrder5HeldSlot(he.batch.hdr);
+ 
+ 							PendingBatch5 marker;
+-							marker.broker_id = p->broker_id;
+-							marker.slot_offset = p->slot_offset;
++							marker.broker_id = he.batch.broker_id;
++							marker.slot_offset = he.batch.slot_offset;
+ 							marker.is_held_marker = true;
+ 							marker.hdr = nullptr;
+ 							marker.num_msg = 0;
+@@ -5613,7 +5666,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
+ 					}
+ 
+ 					HoldEntry5 he;
+-					he.batch = std::move(*jt);
+ 					he.meta.log_idx = jt->cached_log_idx;
+ 					he.meta.total_size = jt->cached_total_size;
+ 					he.meta.batch_id = jt->cached_batch_id;
+@@ -5625,15 +5677,16 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
+ 					he.meta.num_msg = jt->num_msg;
+ 					he.meta.start_logical_offset = jt->cached_start_logical_offset;
+ 					he.hold_start_ns = SteadyNowNs();
++					he.batch = std::move(*jt);
+ 					stream_map.emplace(seq, he);
+ 					record_hold_insert(client_id, stream_map);
+ 					shard.hold_buffer_size++;
+ 					shard.clients_with_held_batches.insert(client_id);
+-					InvalidateOrder5HeldSlot(jt->hdr);
++					InvalidateOrder5HeldSlot(he.batch.hdr);
+ 
+ 					PendingBatch5 marker;
+-					marker.broker_id = jt->broker_id;
+-					marker.slot_offset = jt->slot_offset;
++					marker.broker_id = he.batch.broker_id;
++					marker.slot_offset = he.batch.slot_offset;
+ 					marker.is_held_marker = true;
+ 					marker.hdr = nullptr;
+ 					marker.num_msg = 0;
+@@ -5728,7 +5781,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
+ 						}
+ 
+ 						HoldEntry5 he;
+-						he.batch = std::move(*jt);
+ 						he.meta.log_idx = jt->cached_log_idx;
+ 						he.meta.total_size = jt->cached_total_size;
+ 						he.meta.batch_id = jt->cached_batch_id;
+@@ -5740,14 +5792,15 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
+ 						he.meta.num_msg = jt->num_msg;
+ 						he.meta.start_logical_offset = jt->cached_start_logical_offset;
+ 						he.hold_start_ns = SteadyNowNs();
++						he.batch = std::move(*jt);
+ 						stream_map.emplace(seq, he);
+ 						shard.hold_buffer_size++;
+ 						shard.clients_with_held_batches.insert(stream_key);
+-						InvalidateOrder5HeldSlot(jt->hdr);
++						InvalidateOrder5HeldSlot(he.batch.hdr);
+ 
+ 						PendingBatch5 marker;
+-						marker.broker_id = jt->broker_id;
+-						marker.slot_offset = jt->slot_offset;
++						marker.broker_id = he.batch.broker_id;
++						marker.slot_offset = he.batch.slot_offset;
+ 						marker.is_held_marker = true;
+ 						marker.hdr = nullptr;
+ 						marker.num_msg = 0;
+@@ -6023,6 +6076,9 @@ size_t Topic::GetTotalHoldBufferSize() {
+ 
+ void Topic::WriteOrder5AnomalyCountersCsv() const {
+ 	if (order_ != 5 || seq_type_ != heartbeat_system::EMBARCADERO) return;
++	LOG(INFO) << "[W1.2_SUMMARY] topic=" << topic_name_ << " broker=" << broker_id_
++	          << " order5_commit_order_violations="
++	          << order5_commit_order_violations_.load(std::memory_order_relaxed);
+ 
+ 	const std::string path = "order5_anomaly_counters_broker" + std::to_string(broker_id_) + ".csv";
+ 	const bool write_header = !std::ifstream(path).good();
+@@ -6854,10 +6910,18 @@ void Topic::AdvanceConsumedThroughForProcessedSlots(
+ 
+ 	const size_t slot_size = sizeof(BatchHeader);
+ 	const size_t slot_count = BATCHHEADERS_SIZE / slot_size;
+-	std::array<std::vector<uint8_t>, NUM_MAX_BROKERS> processed_slots;
++	// [E3] Reuse the member scratch instead of allocating a fresh array each call.
++	// Safe without a lock: this function runs only on the single EpochSequencerThread
++	// (see processed_slots_scratch_ declaration in topic.h). resize() grows only on the
++	// first call (slot_count is constant per run); std::fill re-zeroes the seen brokers'
++	// regions so the marking loop below sees zeroed slots for every seen broker.
++	std::array<std::vector<uint8_t>, NUM_MAX_BROKERS>& processed_slots = processed_slots_scratch_;
+ 	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
+ 		if (broker_seen_in_epoch[b]) {
+-			processed_slots[b].assign(slot_count, 0);
++			if (processed_slots[b].size() != slot_count) {
++				processed_slots[b].resize(slot_count);
++			}
++			std::fill(processed_slots[b].begin(), processed_slots[b].end(), static_cast<uint8_t>(0));
+ 		}
+ 	}
+ 	for (const PendingBatch5& p : batch_list) {
+diff --git a/src/embarlet/topic.h b/src/embarlet/topic.h
+index fbb5332..8d0529f 100644
+--- a/src/embarlet/topic.h
++++ b/src/embarlet/topic.h
+@@ -14,9 +14,9 @@
+ #include <chrono>
+ #include <cstdlib>
+ 
+-#include "../disk_manager/corfu_replication_client.h"
+-#include "../disk_manager/scalog_replication_client.h"
+-#include "../cxl_manager/cxl_datastructure.h"
++#include "disk_manager/corfu_replication_client.h"
++#include "disk_manager/scalog_replication_client.h"
++#include "cxl_manager/cxl_datastructure.h"
+ #include "common/config.h"
+ #include "common/wire_formats.h"
+ #include "sequencer_utils.h"
+@@ -465,7 +465,7 @@ class Topic {
+ 		 * @brief Reserves one PBR slot after payload recv; caller writes BatchHeader once after.
+ 		 * @threading Thread-safe: lock-free (128-bit CAS) when pbr_state_.is_lock_free(), else mutex-protected.
+ 		 * @ownership batch_header_location points into CXL; caller must write header + flush.
+-		 * @paper_ref docs/EMBARCADERO_DEFINITIVE_DESIGN.md §3.1 (receive then PBR commit).
++		 * @paper_ref docs/design/EMBARCADERO_DEFINITIVE_DESIGN.md §3.1 (receive then PBR commit).
+ 		 */
+ 		bool ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
+ 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
+@@ -848,6 +848,12 @@ class Topic {
+ 		std::atomic<uint64_t> order5_hold_timeout_skips_{0};
+ 		std::atomic<uint64_t> order5_hold_buffer_forced_skips_{0};
+ 		std::atomic<uint64_t> order5_stale_epoch_skips_{0};
++		// [[W1.2]] Per-session commit-order invariant instrumentation (W1 item #2). Detects the
++		// collector committing a client's batch out of order across epoch seals.
++		std::atomic<uint64_t> order5_commit_order_violations_{0};
++		// [[W1.2]] Last committed client_seq per client_id. Single-writer: touched ONLY in
++		// CommitEpoch on the EpochSequencerThread, so no lock is required.
++		absl::flat_hash_map<uint64_t, uint64_t> commit_order_last_seq_;
+ 		// Disconnect/shutdown tail drain: keep force-expiring hold frontiers for a short bounded window
+ 		// so late-visible batches are not stranded behind a one-shot expiry pulse.
+ 		std::atomic<uint64_t> force_expire_hold_until_ns_{0};
+@@ -955,6 +961,13 @@ class Topic {
+ 		const std::array<bool, NUM_MAX_BROKERS>& broker_seen_in_epoch,
+ 		const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_cumulative,
+ 		const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_pbr_index);
++	// [E3] Reusable scratch for AdvanceConsumedThroughForProcessedSlots to avoid
++	// per-epoch heap churn. Single-writer: accessed ONLY on EpochSequencerThread
++	// (all callers reach it via CommitEpoch/direct calls inside EpochSequencerThread,
++	// which is spawned exactly once per Topic in Sequencer5/Sequencer2). No lock needed.
++	// Sized to slot_count (constant per run) on first use; each call zeroes only the
++	// seen brokers' [0, slot_count) region.
++	std::array<std::vector<uint8_t>, NUM_MAX_BROKERS> processed_slots_scratch_;
+ 
+ 	// [[PHASE_3]] Recovery parameters (§4.2.2)
+ 		// Recovery timeout for declaring a chain replica stalled.

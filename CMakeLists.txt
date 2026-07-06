@@ -68,28 +68,5 @@ endif()
 
 # Add subdirectories
 add_subdirectory(src)
-add_subdirectory(bench)
+add_subdirectory(benchmarks)   # KV benchmark + component micro-benchmarks
 add_subdirectory(test)
-
-# Benchmarks
-option(BUILD_BENCHMARKS "Build performance benchmarks" ON)
-if(BUILD_BENCHMARKS)
-    find_package(benchmark QUIET)
-    if(benchmark_FOUND)
-        add_executable(performance_test benchmark/performance_test.cc)
-        target_link_libraries(performance_test
-            PRIVATE
-            benchmark::benchmark
-            absl::hash
-            absl::synchronization
-            pthread
-        )
-        target_include_directories(performance_test PRIVATE ${CMAKE_SOURCE_DIR})
-        
-        # Install performance_test to bin directory
-        set_target_properties(performance_test PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-    else()
-        message(WARNING "Google Benchmark not found, skipping performance tests")
-    endif()
-endif()

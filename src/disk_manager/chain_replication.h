@@ -5,7 +5,7 @@
 #include <thread>
 #include <vector>
 #include <array>
-#include "../cxl_manager/cxl_datastructure.h"
+#include "cxl_manager/cxl_datastructure.h"
 
 namespace Embarcadero {
 
