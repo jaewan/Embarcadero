@@ -5603,7 +5603,10 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						state.highest_sequenced = emitted.contiguous_max;
 					}
 					if (state.next_expected == 0 && !vec.empty()) {
-						state.next_expected = vec.front()->batch_seq;
+						// [[C5_SEED_UNIFY]] Same rule as the true-client-chain sites: a new
+						// session starts at seq 0. Seeding from the first *observed* batch_seq
+						// silently treated earlier striped batches as "late" and dropped them.
+						state.next_expected = 0;
 					}
 					for (PendingBatch5* p : vec) {
 						classify_one(state, emitted, stream_key, *p, true_client_chain);
@@ -5667,7 +5670,8 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					state.highest_sequenced = emitted.contiguous_max;
 				}
 				if (state.next_expected == 0 && state.highest_sequenced == 0 && emitted.contiguous_max == UINT64_MAX) {
-					state.next_expected = bit->batch_seq;
+					// [[C5_SEED_UNIFY]] New sessions start at seq 0 (see the fast-path note).
+					state.next_expected = 0;
 				}
 
 				for (auto jt = bit; jt != broker_end; ++jt) {
