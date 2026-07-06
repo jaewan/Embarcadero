@@ -82,3 +82,93 @@ bash scripts/singlenode_run_throughput.sh` — **×8 trials**.
 The two-commit change staged in the clean tree, verification numbers (ORDER=5 pass rate + W1.2 = 0 +
 throughput) for each commit, and confirmation that ORDER=5 behavior is byte-identical after commit 1.
 Report back; I fold it into the Track-01 deliverable and proceed to the next D1 §7 step (CXL session table).
+
+---
+
+## UPDATE (Track 01): base + verified reference classifier
+
+**Base changed:** land S2 on the **integrated base** `chore/repo-reorg` @ `35a314d` (reorg + tracks
+01/02/03/04, build-verified) — NOT the old `01-core-protocol-clean`. `topic.cc` there == the W1+fix
+version, so all anchors below hold. Broker tree: `~/Embarcadero-sessions/integration-build`.
+
+**Verified reference for commit 1** (Track 01 read all 4 loops and derived this; it is byte-identical
+for ORDER=5=`true_client_chain`). Define this lambda once, right after the
+`per_client_terminalized_delta_epoch` declaration (~topic.cc:5394, before the skip-marker loop), then
+replace each of the 4 inner per-record loop **bodies** with a single call
+`classify_one(state, emitted, KEY, *ITER, true_client_chain);` (KEY = `first_client`/`stream_key`/
+`client_id`/`stream_key` per site; ITER = `p`/`p`/`jt`/`jt`). Keep each site's grouping/sort/seed
+prologue unchanged (seed unification is commit 2).
+
+```cpp
+auto classify_one = [&](ClientState5& state, ClientEmitTracker& emitted, size_t key,
+                        PendingBatch5& p, bool tcc) {
+  size_t seq = p.batch_seq;
+  if (state.is_duplicate(seq) && emitted.IsEmitted((uint64_t)seq)) {
+    terminalize_already_emitted(key, p.broker_id, p.cached_start_logical_offset,
+      p.num_msg, p.cached_batch_id, seq, p.cached_pbr_absolute_index); return; }
+  if (emitted.IsEmitted((uint64_t)seq)) {
+    state.mark_sequenced(seq);
+    if (seq >= state.next_expected) state.next_expected = seq + 1;
+    if (tcc) terminalize_already_emitted(key, p.broker_id, p.cached_start_logical_offset,
+      p.num_msg, p.cached_batch_id, seq, p.cached_pbr_absolute_index);
+    else if (!CheckAndInsertBatchId(shard, p.cached_batch_id)) {
+      ready.push_back(std::move(p)); emitted.MarkEmitted((uint64_t)seq);
+      order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed); }
+    return; }
+  if (seq == state.next_expected) {
+    state.mark_sequenced(seq); state.advance_next_expected();
+    if (!CheckAndInsertBatchId(shard, p.cached_batch_id)) {
+      emitted.MarkEmitted((uint64_t)seq); ready.push_back(std::move(p)); }
+  } else if (seq < state.next_expected) {
+    state.mark_sequenced(seq);
+    if (!CheckAndInsertBatchId(shard, p.cached_batch_id)) {
+      if (tcc) { accumulate_logical_only(p.broker_id, p.cached_start_logical_offset,
+                   p.num_msg, p.cached_pbr_absolute_index);
+                 record_late_drop(key);
+                 per_client_terminalized_delta_epoch[(uint32_t)key] += p.num_msg; }
+      else { order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+             ready.push_back(std::move(p)); emitted.MarkEmitted((uint64_t)seq); } }
+  } else {
+    if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
+      std::this_thread::sleep_for(std::chrono::microseconds(10));
+      if (shard.deferred_level5.size() < kDeferredL5MaxEntries) {
+        shard.deferred_level5.push_back(std::move(p)); return; }
+      state.mark_sequenced(seq); state.next_expected = seq + 1;
+      if (!tcc) order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+      order5_skipped_batches_.fetch_add(1, std::memory_order_relaxed);
+      order5_hold_buffer_forced_skips_.fetch_add(1, std::memory_order_relaxed);
+      if (tcc) record_forced_skip(key);
+      emitted.MarkEmitted((uint64_t)seq); ready.push_back(std::move(p)); return; }
+    auto& stream_map = shard.hold_buffer[key];
+    if (stream_map.find(seq) != stream_map.end()) return;
+    HoldEntry5 he;
+    he.meta.log_idx = p.cached_log_idx; he.meta.total_size = p.cached_total_size;
+    he.meta.batch_id = p.cached_batch_id; he.meta.batch_seq = p.batch_seq;
+    he.meta.pbr_absolute_index = p.cached_pbr_absolute_index; he.meta.client_id = p.client_id;
+    he.meta.epoch_created = p.epoch_created; he.meta.broker_id = p.broker_id;
+    he.meta.num_msg = p.num_msg; he.meta.start_logical_offset = p.cached_start_logical_offset;
+    he.hold_start_ns = SteadyNowNs(); he.batch = std::move(p);
+    stream_map.emplace(seq, he);
+    if (tcc) record_hold_insert(key, stream_map);
+    shard.hold_buffer_size++; shard.clients_with_held_batches.insert(key);
+    InvalidateOrder5HeldSlot(he.batch.hdr);
+    PendingBatch5 marker; marker.broker_id = he.batch.broker_id;
+    marker.slot_offset = he.batch.slot_offset; marker.is_held_marker = true;
+    marker.hdr = nullptr; marker.num_msg = 0; ready.push_back(marker);
+  }
+};
+```
+
+**Divergences captured (verify against loops 5468/5575/5687/5798):** DUP→terminalize(self-gates)/
+continue; IsEmitted-only→tcc terminalize vs legacy emit+fifo_violation; EQ identical; LT→tcc
+drop-late(+terminalized_delta) vs legacy emit-late(+fifo_violation); GT-full→tcc record_forced_skip
+vs legacy fifo_violation; GT-hold→record_hold_insert tcc-only. VLOGs in the legacy general loop are
+logging-only (droppable; not behavior). `he.batch = std::move` placed AFTER `he.meta` capture (C3).
+
+**Commit 2 (C5 seed unify):** replace the legacy first-observed seeds (`state.next_expected =
+vec.front()->batch_seq` ~5573, `state.next_expected = bit->batch_seq` ~5795) with the true-chain rule
+(`= 0` for new sessions). No-op for ORDER=5; behavior change for ORDER=4 only.
+
+**Validate:** `~/Embarcadero-sessions/integration-build` (rebuild), ORDER=5 repro ×8 with
+`EMBAR_ASSERT_COMMIT_ORDER=1` — expect ≥7/8 pass, W1.2=0, throughput ~11.5–12.3 GB/s (byte-identical
+⇒ matches pre-refactor). Then commit 2, re-validate.
