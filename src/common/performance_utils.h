@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <glog/logging.h>
 
@@ -20,6 +21,20 @@
 #include <xmmintrin.h>  // For _mm_pause
 #endif
 
+// [[TRACK04_W6]] CXL non-coherence fault-injection seam (INTERIM — see note).
+// When the CMake option CXL_FAULT_INJECTION is OFF this header is not included and
+// every hook below compiles away: the accessor functions are byte-for-byte
+// identical to before, so production builds are unchanged.
+//
+// NOTE (per sessions/00-BACKGROUND.md "One shared accessor seam"): Tracks 04 and
+// 05 must ultimately interpose through a SINGLE RegionAccessor interface that
+// Track 01 exposes at design-freeze — not two separate seams. These guarded hooks
+// are an interim so the harness has something to exercise; migrate them onto
+// RegionAccessor once it lands (coordinate the one interpose point via the human).
+#ifdef CXL_FAULT_INJECTION
+#include "faultinj/cxl_fault_inject.h"   // resolved via -I <repo>/test (cxl_faultinj PUBLIC include dir)
+#endif
+
 // Forward declaration for BlogMessageHeader (defined in cxl_datastructure.h)
 namespace Embarcadero {
 struct BlogMessageHeader;
@@ -27,7 +42,7 @@ struct BlogMessageHeader;
 
 namespace Embarcadero {
 
-// Lightweight compatibility utilities used by benchmark/performance_test.cc.
+// Lightweight compatibility utilities used by benchmarks/micro/performance_test.cc.
 // These were historically provided from this header and are still cheap enough
 // to keep here for local tooling/benchmark builds.
 
@@ -174,6 +189,13 @@ namespace CXL {
  *   Multiple field writes to same cache line → single flush
  */
 inline void flush_cacheline(const void* addr) {
+#ifdef CXL_FAULT_INJECTION
+    // torn-window: optionally widen the gap so a concurrent reader can observe a
+    // partially-flushed multi-cacheline record. delayed-flush: optionally defer
+    // the physical flush to the next fence (drained by store_fence/full_fence).
+    ::Embarcadero::faultinj::MaybeTornGap(addr);
+    if (::Embarcadero::faultinj::InterceptFlush(addr)) return;
+#endif
 #ifdef __x86_64__
     // Safe cast: _mm_clflushopt doesn't modify memory, only flushes cache line
     _mm_clflushopt(const_cast<void*>(addr));
@@ -199,6 +221,11 @@ inline void flush_cacheline(const void* addr) {
  * Use for B0 scanner on the head node (same process as NetworkManager writer).
  */
 inline void invalidate_cacheline_for_read(const void* addr) {
+#ifdef CXL_FAULT_INJECTION
+    // stale-read: optionally suppress the invalidation so the reader keeps its
+    // (stale) cache line — models cross-host non-coherence.
+    if (::Embarcadero::faultinj::InterceptInvalidateForRead(addr)) return;
+#endif
 #ifdef __x86_64__
     _mm_clflush(const_cast<void*>(addr));
 #elif defined(__aarch64__)
@@ -232,6 +259,12 @@ inline void invalidate_cacheline_for_read(const void* addr) {
  * Critical: Must be called after flush_cacheline() for correctness
  */
 inline void store_fence() {
+#ifdef CXL_FAULT_INJECTION
+    // delayed-flush: drain deferred physical flushes here. Honouring the fence
+    // keeps a correct design correct (sfence orders prior clflushopt); a *missing*
+    // fence is what leaves stale lines visible, which is what this catches.
+    ::Embarcadero::faultinj::DrainDeferredFlushes();
+#endif
 #ifdef __x86_64__
     _mm_sfence();
 #elif defined(__aarch64__)
@@ -385,12 +418,58 @@ inline void load_fence() {
  * Performance: POLLING PATH - More expensive than load_fence, use only when needed
  */
 inline void full_fence() {
+#ifdef CXL_FAULT_INJECTION
+    ::Embarcadero::faultinj::DrainDeferredFlushes();
+#endif
 #ifdef __x86_64__
     _mm_mfence();
 #elif defined(__aarch64__)
     __asm__ __volatile__("dmb sy" ::: "memory");
 #else
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+/**
+ * @brief Acquire-load from (possibly non-coherent) CXL memory — the READ SEAM.
+ *
+ * @paper_ref Track 04 (W6) fault-injection read seam.
+ *
+ * Production build (CXL_FAULT_INJECTION OFF): this is *exactly*
+ *   __atomic_load_n(ptr, __ATOMIC_ACQUIRE)
+ * i.e. adopting it at a call site is a semantic no-op.
+ *
+ * Fault-injection build: the value is routed through the stale-read adversary,
+ * which may return a previously-observed value within a bounded window. This is
+ * the only way to exercise stale reads on a single *coherent* host, where the
+ * hardware cache cannot itself produce a stale value.
+ *
+ * COVERAGE: the stale-read schedule reaches ONLY loads that a call site has been
+ * converted from a raw __atomic_load_n to this. Adopting it at the sequencer's
+ * readiness polls (batch_complete / ordered / validated_written_byte_offset) is a
+ * Track-01 change (see sessions/handoff-04.md); until then, in-vivo stale-read
+ * only suppresses invalidations and does not serve a stale value to the pipeline.
+ * Restricted to integer/pointer T (the readiness fields); enforced below.
+ */
+template <typename T>
+inline T acquire_load(const volatile T* ptr) {
+    static_assert(std::is_integral<T>::value || std::is_pointer<T>::value,
+                  "CXL::acquire_load requires an integer or pointer type "
+                  "(matches __atomic_load_n's constraint)");
+#ifdef CXL_FAULT_INJECTION
+    T live = __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+    if (::Embarcadero::faultinj::Enabled(::Embarcadero::faultinj::kStaleRead)) {
+        uint64_t packed = 0;
+        __builtin_memcpy(&packed, &live, sizeof(T));
+        uint64_t out = ::Embarcadero::faultinj::MaybeStale(
+            const_cast<const void*>(reinterpret_cast<const volatile void*>(ptr)), packed);
+        T result;
+        __builtin_memcpy(&result, &out, sizeof(T));
+        return result;
+    }
+    return live;
+#else
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
 #endif
 }
 
