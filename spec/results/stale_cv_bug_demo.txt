@@ -1,0 +1,201 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 74 and seed -285960022098789264 with 20 workers on 512 cores with 29127MB heap and 64MB offheap memory [pid: 1504823] (Linux 6.17.0-23-generic amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/spec/MCEmbarcadero.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/spec/Embarcadero.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/stale_cv_bug_demo/tmp/TLC.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/stale_cv_bug_demo/tmp/Naturals.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/stale_cv_bug_demo/tmp/Sequences.tla
+Parsing file /home/domin/Embarcadero-sessions/02-tla-spec/states/stale_cv_bug_demo/tmp/FiniteSets.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Embarcadero
+Semantic processing of module TLC
+Semantic processing of module MCEmbarcadero
+Starting... (2026-07-06 09:11:01)
+Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
+(Use the -nowarning option to disable this warning.)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-06 09:11:01.
+Error: Invariant Safety is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ specSnap = <<>>
+/\ orphaned = {}
+/\ sessEpoch = (c1 :> 0)
+/\ paused = {}
+/\ replicationFloor = 0
+/\ fenceHWM = (c1 :> 0)
+/\ pbr = (b1 :> <<>> @@ b2 :> <<>>)
+/\ expectedSeq = (c1 :> 1)
+/\ cvSig = {}
+/\ retxUsed = (c1 :> {})
+/\ net = {}
+/\ collectCursor = (b1 :> 0 @@ b2 :> 0)
+/\ clientNext = (c1 :> 1)
+/\ crashed = {}
+/\ goi = <<>>
+/\ pbrReserved = (b1 :> {} @@ b2 :> {})
+/\ acked = (c1 :> {})
+/\ sessionFenced = (c1 :> FALSE)
+/\ hold = (c1 :> {})
+/\ cbEpoch = 0
+
+State 2: <ClientSubmit line 153, col 5 to line 160, col 80 of module Embarcadero>
+/\ specSnap = <<>>
+/\ orphaned = {}
+/\ sessEpoch = (c1 :> 0)
+/\ paused = {}
+/\ replicationFloor = 0
+/\ fenceHWM = (c1 :> 0)
+/\ pbr = (b1 :> <<>> @@ b2 :> <<>>)
+/\ expectedSeq = (c1 :> 1)
+/\ cvSig = {}
+/\ retxUsed = (c1 :> {})
+/\ net = {[cseq |-> 1, client |-> c1, broker |-> b1]}
+/\ collectCursor = (b1 :> 0 @@ b2 :> 0)
+/\ clientNext = (c1 :> 2)
+/\ crashed = {}
+/\ goi = <<>>
+/\ pbrReserved = (b1 :> {} @@ b2 :> {})
+/\ acked = (c1 :> {})
+/\ sessionFenced = (c1 :> FALSE)
+/\ hold = (c1 :> {})
+/\ cbEpoch = 0
+
+State 3: <BrokerReserve line 178, col 5 to line 188, col 80 of module Embarcadero>
+/\ specSnap = <<>>
+/\ orphaned = {}
+/\ sessEpoch = (c1 :> 0)
+/\ paused = {}
+/\ replicationFloor = 0
+/\ fenceHWM = (c1 :> 0)
+/\ pbr = (b1 :> <<>> @@ b2 :> <<>>)
+/\ expectedSeq = (c1 :> 1)
+/\ cvSig = {}
+/\ retxUsed = (c1 :> {})
+/\ net = {}
+/\ collectCursor = (b1 :> 0 @@ b2 :> 0)
+/\ clientNext = (c1 :> 2)
+/\ crashed = {}
+/\ goi = <<>>
+/\ pbrReserved = (b1 :> {[cseq |-> 1, client |-> c1, epoch |-> 0]} @@ b2 :> {})
+/\ acked = (c1 :> {})
+/\ sessionFenced = (c1 :> FALSE)
+/\ hold = (c1 :> {})
+/\ cbEpoch = 0
+
+State 4: <BrokerWrite line 191, col 5 to line 198, col 80 of module Embarcadero>
+/\ specSnap = <<>>
+/\ orphaned = {}
+/\ sessEpoch = (c1 :> 0)
+/\ paused = {}
+/\ replicationFloor = 0
+/\ fenceHWM = (c1 :> 0)
+/\ pbr = (b1 :> <<[cseq |-> 1, client |-> c1, epoch |-> 0]>> @@ b2 :> <<>>)
+/\ expectedSeq = (c1 :> 1)
+/\ cvSig = {}
+/\ retxUsed = (c1 :> {})
+/\ net = {}
+/\ collectCursor = (b1 :> 0 @@ b2 :> 0)
+/\ clientNext = (c1 :> 2)
+/\ crashed = {}
+/\ goi = <<>>
+/\ pbrReserved = (b1 :> {} @@ b2 :> {})
+/\ acked = (c1 :> {})
+/\ sessionFenced = (c1 :> FALSE)
+/\ hold = (c1 :> {})
+/\ cbEpoch = 0
+
+State 5: <SeqCollectCommit line 242, col 5 to line 254, col 63 of module Embarcadero>
+/\ specSnap = <<>>
+/\ orphaned = {}
+/\ sessEpoch = (c1 :> 0)
+/\ paused = {}
+/\ replicationFloor = 0
+/\ fenceHWM = (c1 :> 0)
+/\ pbr = (b1 :> <<[cseq |-> 1, client |-> c1, epoch |-> 0]>> @@ b2 :> <<>>)
+/\ expectedSeq = (c1 :> 2)
+/\ cvSig = {}
+/\ retxUsed = (c1 :> {})
+/\ net = {}
+/\ collectCursor = (b1 :> 1 @@ b2 :> 0)
+/\ clientNext = (c1 :> 2)
+/\ crashed = {}
+/\ goi = <<[cseq |-> 1, client |-> c1, lost |-> FALSE, epoch |-> 0]>>
+/\ pbrReserved = (b1 :> {} @@ b2 :> {})
+/\ acked = (c1 :> {})
+/\ sessionFenced = (c1 :> FALSE)
+/\ hold = (c1 :> {})
+/\ cbEpoch = 0
+
+State 6: <SequencerFailover line 400, col 5 to line 414, col 89 of module Embarcadero>
+/\ specSnap = <<>>
+/\ orphaned = {[cseq |-> 1, client |-> c1]}
+/\ sessEpoch = (c1 :> 0)
+/\ paused = {}
+/\ replicationFloor = 0
+/\ fenceHWM = (c1 :> 0)
+/\ pbr = (b1 :> <<[cseq |-> 1, client |-> c1, epoch |-> 0]>> @@ b2 :> <<>>)
+/\ expectedSeq = (c1 :> 1)
+/\ cvSig = {}
+/\ retxUsed = (c1 :> {})
+/\ net = {}
+/\ collectCursor = (b1 :> 0 @@ b2 :> 0)
+/\ clientNext = (c1 :> 2)
+/\ crashed = {}
+/\ goi = <<>>
+/\ pbrReserved = (b1 :> {} @@ b2 :> {})
+/\ acked = (c1 :> {})
+/\ sessionFenced = (c1 :> FALSE)
+/\ hold = (c1 :> {})
+/\ cbEpoch = 1
+
+State 7: <StaleCVAdvance line 339, col 5 to line 346, col 82 of module Embarcadero>
+/\ specSnap = <<>>
+/\ orphaned = {[cseq |-> 1, client |-> c1]}
+/\ sessEpoch = (c1 :> 0)
+/\ paused = {}
+/\ replicationFloor = 0
+/\ fenceHWM = (c1 :> 0)
+/\ pbr = (b1 :> <<[cseq |-> 1, client |-> c1, epoch |-> 0]>> @@ b2 :> <<>>)
+/\ expectedSeq = (c1 :> 1)
+/\ cvSig = {[cseq |-> 1, client |-> c1, epoch |-> 0]}
+/\ retxUsed = (c1 :> {})
+/\ net = {}
+/\ collectCursor = (b1 :> 0 @@ b2 :> 0)
+/\ clientNext = (c1 :> 2)
+/\ crashed = {}
+/\ goi = <<>>
+/\ pbrReserved = (b1 :> {} @@ b2 :> {})
+/\ acked = (c1 :> {})
+/\ sessionFenced = (c1 :> FALSE)
+/\ hold = (c1 :> {})
+/\ cbEpoch = 1
+
+State 8: <AckRelay line 354, col 5 to line 361, col 82 of module Embarcadero>
+/\ specSnap = <<>>
+/\ orphaned = {[cseq |-> 1, client |-> c1]}
+/\ sessEpoch = (c1 :> 0)
+/\ paused = {}
+/\ replicationFloor = 0
+/\ fenceHWM = (c1 :> 0)
+/\ pbr = (b1 :> <<[cseq |-> 1, client |-> c1, epoch |-> 0]>> @@ b2 :> <<>>)
+/\ expectedSeq = (c1 :> 1)
+/\ cvSig = {[cseq |-> 1, client |-> c1, epoch |-> 0]}
+/\ retxUsed = (c1 :> {})
+/\ net = {}
+/\ collectCursor = (b1 :> 0 @@ b2 :> 0)
+/\ clientNext = (c1 :> 2)
+/\ crashed = {}
+/\ goi = <<>>
+/\ pbrReserved = (b1 :> {} @@ b2 :> {})
+/\ acked = (c1 :> {1})
+/\ sessionFenced = (c1 :> FALSE)
+/\ hold = (c1 :> {})
+/\ cbEpoch = 1
+
+3441 states generated, 1524 distinct states found, 754 states left on queue.
+The depth of the complete state graph search is 11.
+The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 5 and the 95th percentile is 4).
+Finished in 01s at (2026-07-06 09:11:02)
