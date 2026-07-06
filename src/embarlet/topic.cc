@@ -5393,6 +5393,119 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	// toward the per-client ACK frontier or broker 0 can remain permanently short.
 	absl::flat_hash_map<uint32_t, uint64_t> per_client_terminalized_delta_epoch;
 
+	// [[S2_CLASSIFIER]] Single seq classifier shared by all 4 per-record loops (fast/general ×
+	// true-chain/legacy). One decision tree: DUP-already-emitted / IsEmitted-only / EQ / LT / GT.
+	// Divergences between the true-chain (tcc) and legacy stream flavors are expressed inline:
+	//  - key: client_id (tcc) vs MakeClientBrokerStreamKey (legacy) — chosen by the caller.
+	//  - LT: tcc drops-late (terminalize, per-client ACK credit); legacy emits-late
+	//    (fifo_violation + ready).
+	//  - IsEmitted-only: tcc terminalizes; legacy re-emits with fifo_violation.
+	//  - GT force-skip: legacy counts fifo_violation; tcc records forced_skip pressure.
+	//  - GT hold-insert: record_hold_insert is tcc-only.
+	// terminalize_already_emitted / record_* / accumulate_logical_only self-gate on
+	// true_client_chain, so tcc-gated calls are no-ops for legacy streams and vice versa.
+	// D1's session fencing will replace the LT/GT recovery policy here, in exactly one place.
+	auto classify_one = [&](ClientState5& state, ClientEmitTracker& emitted, size_t key,
+	                        PendingBatch5& p, bool tcc) {
+		size_t seq = p.batch_seq;
+		if (state.is_duplicate(seq) && emitted.IsEmitted(static_cast<uint64_t>(seq))) {
+			terminalize_already_emitted(
+				key, p.broker_id, p.cached_start_logical_offset,
+				p.num_msg, p.cached_batch_id, seq, p.cached_pbr_absolute_index);
+			return;
+		}
+		if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
+			state.mark_sequenced(seq);
+			if (seq >= state.next_expected) state.next_expected = seq + 1;
+			if (tcc) {
+				terminalize_already_emitted(
+					key, p.broker_id, p.cached_start_logical_offset,
+					p.num_msg, p.cached_batch_id, seq, p.cached_pbr_absolute_index);
+			} else if (!CheckAndInsertBatchId(shard, p.cached_batch_id)) {
+				ready.push_back(std::move(p));
+				emitted.MarkEmitted(static_cast<uint64_t>(seq));
+				order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+			}
+			return;
+		}
+		if (seq == state.next_expected) {
+			state.mark_sequenced(seq);
+			state.advance_next_expected();
+			if (!CheckAndInsertBatchId(shard, p.cached_batch_id)) {
+				emitted.MarkEmitted(static_cast<uint64_t>(seq));
+				ready.push_back(std::move(p));
+			}
+		} else if (seq < state.next_expected) {
+			state.mark_sequenced(seq);
+			if (!CheckAndInsertBatchId(shard, p.cached_batch_id)) {
+				if (tcc) {
+					accumulate_logical_only(
+						p.broker_id, p.cached_start_logical_offset, p.num_msg,
+						p.cached_pbr_absolute_index);
+					record_late_drop(key);
+					per_client_terminalized_delta_epoch[static_cast<uint32_t>(key)] += p.num_msg;
+				} else {
+					order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+					ready.push_back(std::move(p));
+					emitted.MarkEmitted(static_cast<uint64_t>(seq));
+				}
+			}
+		} else {
+			if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
+				std::this_thread::sleep_for(std::chrono::microseconds(10));
+				if (shard.deferred_level5.size() < kDeferredL5MaxEntries) {
+					shard.deferred_level5.push_back(std::move(p));
+					return;
+				}
+				state.mark_sequenced(seq);
+				state.next_expected = seq + 1;
+				if (!tcc) {
+					order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+				}
+				order5_skipped_batches_.fetch_add(1, std::memory_order_relaxed);
+				order5_hold_buffer_forced_skips_.fetch_add(1, std::memory_order_relaxed);
+				if (tcc) {
+					record_forced_skip(key);
+				}
+				emitted.MarkEmitted(static_cast<uint64_t>(seq));
+				ready.push_back(std::move(p));
+				return;
+			}
+
+			auto& stream_map = shard.hold_buffer[key];
+			if (stream_map.find(seq) != stream_map.end()) return;
+
+			HoldEntry5 he;
+			he.meta.log_idx = p.cached_log_idx;
+			he.meta.total_size = p.cached_total_size;
+			he.meta.batch_id = p.cached_batch_id;
+			he.meta.batch_seq = p.batch_seq;
+			he.meta.pbr_absolute_index = p.cached_pbr_absolute_index;
+			he.meta.client_id = p.client_id;
+			he.meta.epoch_created = p.epoch_created;
+			he.meta.broker_id = p.broker_id;
+			he.meta.num_msg = p.num_msg;
+			he.meta.start_logical_offset = p.cached_start_logical_offset;
+			he.hold_start_ns = SteadyNowNs();
+			he.batch = std::move(p);
+			stream_map.emplace(seq, he);
+			if (tcc) {
+				record_hold_insert(key, stream_map);
+			}
+			shard.hold_buffer_size++;
+			shard.clients_with_held_batches.insert(key);
+			InvalidateOrder5HeldSlot(he.batch.hdr);
+
+			PendingBatch5 marker;
+			marker.broker_id = he.batch.broker_id;
+			marker.slot_offset = he.batch.slot_offset;
+			marker.is_held_marker = true;
+			marker.hdr = nullptr;
+			marker.num_msg = 0;
+			ready.push_back(marker);
+		}
+	};
+
 	// [[SKIP_MARKER_FILTER]] Extract scanner timeout markers before sorting/grouping.
 	// Anonymous skips advance only consumed_through. Targeted skips (client_id/batch_seq known
 	// from the claim descriptor) must also advance the affected client frontier so later held
@@ -5466,87 +5579,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					state.next_expected = 0;
 				}
 				for (PendingBatch5* p : ordered) {
-					size_t seq = p->batch_seq;
-						if (state.is_duplicate(seq) &&
-						    emitted.IsEmitted(static_cast<uint64_t>(seq))) {
-							terminalize_already_emitted(
-								first_client, p->broker_id, p->cached_start_logical_offset,
-								p->num_msg, p->cached_batch_id, seq, p->cached_pbr_absolute_index);
-							continue;
-						}
-						if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
-						state.mark_sequenced(seq);
-						if (seq >= state.next_expected) state.next_expected = seq + 1;
-							terminalize_already_emitted(
-								first_client, p->broker_id, p->cached_start_logical_offset,
-								p->num_msg, p->cached_batch_id, seq, p->cached_pbr_absolute_index);
-							continue;
-						}
-					if (seq == state.next_expected) {
-						state.mark_sequenced(seq);
-						state.advance_next_expected();
-						if (!CheckAndInsertBatchId(shard, p->cached_batch_id)) {
-							emitted.MarkEmitted(static_cast<uint64_t>(seq));
-							ready.push_back(std::move(*p));
-						}
-					} else if (seq < state.next_expected) {
-						state.mark_sequenced(seq);
-						const bool duplicate = CheckAndInsertBatchId(shard, p->cached_batch_id);
-						if (!duplicate) {
-							accumulate_logical_only(
-								p->broker_id, p->cached_start_logical_offset, p->num_msg,
-								p->cached_pbr_absolute_index);
-							record_late_drop(first_client);
-							per_client_terminalized_delta_epoch[static_cast<uint32_t>(first_client)] +=
-								p->num_msg;
-						}
-					} else {
-						if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
-							std::this_thread::sleep_for(std::chrono::microseconds(10));
-							if (shard.deferred_level5.size() < kDeferredL5MaxEntries) {
-								shard.deferred_level5.push_back(std::move(*p));
-								continue;
-							}
-							state.mark_sequenced(seq);
-							state.next_expected = seq + 1;
-							order5_skipped_batches_.fetch_add(1, std::memory_order_relaxed);
-							order5_hold_buffer_forced_skips_.fetch_add(1, std::memory_order_relaxed);
-							record_forced_skip(first_client);
-							emitted.MarkEmitted(static_cast<uint64_t>(seq));
-							ready.push_back(std::move(*p));
-							continue;
-						}
-
-						auto& stream_map = shard.hold_buffer[first_client];
-						if (stream_map.find(seq) != stream_map.end()) continue;
-
-						HoldEntry5 he;
-						he.meta.log_idx = p->cached_log_idx;
-						he.meta.total_size = p->cached_total_size;
-						he.meta.batch_id = p->cached_batch_id;
-						he.meta.batch_seq = p->batch_seq;
-						he.meta.pbr_absolute_index = p->cached_pbr_absolute_index;
-						he.meta.client_id = p->client_id;
-						he.meta.epoch_created = p->epoch_created;
-						he.meta.broker_id = p->broker_id;
-						he.meta.num_msg = p->num_msg;
-						he.meta.start_logical_offset = p->cached_start_logical_offset;
-						he.hold_start_ns = SteadyNowNs();
-						he.batch = std::move(*p);
-						stream_map.emplace(seq, he);
-						record_hold_insert(first_client, stream_map);
-						shard.hold_buffer_size++;
-						shard.clients_with_held_batches.insert(first_client);
-						InvalidateOrder5HeldSlot(he.batch.hdr);
-
-						PendingBatch5 marker;
-						marker.broker_id = he.batch.broker_id;
-						marker.slot_offset = he.batch.slot_offset;
-						marker.is_held_marker = true;
-						marker.hdr = nullptr;
-						marker.num_msg = 0;
-						ready.push_back(marker);
-					}
+					classify_one(state, emitted, first_client, *p, true_client_chain);
 				}
 			} else {
 				absl::flat_hash_map<int, std::vector<PendingBatch5*>> by_broker;
@@ -5573,81 +5606,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						state.next_expected = vec.front()->batch_seq;
 					}
 					for (PendingBatch5* p : vec) {
-						size_t seq = p->batch_seq;
-						if (state.is_duplicate(seq) &&
-						    emitted.IsEmitted(static_cast<uint64_t>(seq))) {
-							continue;
-						}
-						if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
-							state.mark_sequenced(seq);
-							if (seq >= state.next_expected) state.next_expected = seq + 1;
-							if (!CheckAndInsertBatchId(shard, p->cached_batch_id)) {
-								ready.push_back(std::move(*p));
-								emitted.MarkEmitted(static_cast<uint64_t>(seq));
-								order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
-							}
-							continue;
-						}
-						if (seq == state.next_expected) {
-							state.mark_sequenced(seq);
-							state.advance_next_expected();
-							if (!CheckAndInsertBatchId(shard, p->cached_batch_id)) {
-								emitted.MarkEmitted(static_cast<uint64_t>(seq));
-								ready.push_back(std::move(*p));
-							}
-						} else if (seq < state.next_expected) {
-							state.mark_sequenced(seq);
-							if (!CheckAndInsertBatchId(shard, p->cached_batch_id)) {
-								order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
-								ready.push_back(std::move(*p));
-								emitted.MarkEmitted(static_cast<uint64_t>(seq));
-							}
-						} else {
-							if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
-								std::this_thread::sleep_for(std::chrono::microseconds(10));
-								if (shard.deferred_level5.size() < kDeferredL5MaxEntries) {
-									shard.deferred_level5.push_back(std::move(*p));
-									continue;
-								}
-								state.mark_sequenced(seq);
-								state.next_expected = seq + 1;
-								order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
-								order5_skipped_batches_.fetch_add(1, std::memory_order_relaxed);
-								order5_hold_buffer_forced_skips_.fetch_add(1, std::memory_order_relaxed);
-								emitted.MarkEmitted(static_cast<uint64_t>(seq));
-								ready.push_back(std::move(*p));
-								continue;
-							}
-
-							auto& stream_map = shard.hold_buffer[stream_key];
-							if (stream_map.find(seq) != stream_map.end()) continue;
-
-							HoldEntry5 he;
-							he.meta.log_idx = p->cached_log_idx;
-							he.meta.total_size = p->cached_total_size;
-							he.meta.batch_id = p->cached_batch_id;
-							he.meta.batch_seq = p->batch_seq;
-							he.meta.pbr_absolute_index = p->cached_pbr_absolute_index;
-							he.meta.client_id = p->client_id;
-							he.meta.epoch_created = p->epoch_created;
-							he.meta.broker_id = p->broker_id;
-							he.meta.num_msg = p->num_msg;
-							he.meta.start_logical_offset = p->cached_start_logical_offset;
-							he.hold_start_ns = SteadyNowNs();
-							he.batch = std::move(*p);
-							stream_map.emplace(seq, he);
-							shard.hold_buffer_size++;
-							shard.clients_with_held_batches.insert(stream_key);
-							InvalidateOrder5HeldSlot(he.batch.hdr);
-
-							PendingBatch5 marker;
-							marker.broker_id = he.batch.broker_id;
-							marker.slot_offset = he.batch.slot_offset;
-							marker.is_held_marker = true;
-							marker.hdr = nullptr;
-							marker.num_msg = 0;
-							ready.push_back(marker);
-						}
+						classify_one(state, emitted, stream_key, *p, true_client_chain);
 					}
 				}
 			}
@@ -5685,91 +5644,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				}
 
 			for (auto jt = it; jt != group_end; ++jt) {
-				size_t seq = jt->batch_seq;
-				if (state.is_duplicate(seq) &&
-				    emitted.IsEmitted(static_cast<uint64_t>(seq))) {
-						terminalize_already_emitted(
-							client_id, jt->broker_id, jt->cached_start_logical_offset,
-							jt->num_msg, jt->cached_batch_id, seq, jt->cached_pbr_absolute_index);
-					continue;
-				}
-				if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
-					state.mark_sequenced(seq);
-					if (seq >= state.next_expected) {
-						state.next_expected = seq + 1;
-					}
-					terminalize_already_emitted(
-						client_id, jt->broker_id, jt->cached_start_logical_offset,
-						jt->num_msg, jt->cached_batch_id, seq, jt->cached_pbr_absolute_index);
-					continue;
-				}
-				if (seq == state.next_expected) {
-					state.mark_sequenced(seq);
-					state.advance_next_expected();
-					if (!CheckAndInsertBatchId(shard, jt->cached_batch_id)) {
-						emitted.MarkEmitted(static_cast<uint64_t>(seq));
-						ready.push_back(std::move(*jt));
-					}
-				} else if (seq < state.next_expected) {
-					state.mark_sequenced(seq);
-					const bool duplicate = CheckAndInsertBatchId(shard, jt->cached_batch_id);
-					if (!duplicate) {
-						accumulate_logical_only(
-							jt->broker_id, jt->cached_start_logical_offset, jt->num_msg,
-							jt->cached_pbr_absolute_index);
-						record_late_drop(client_id);
-						per_client_terminalized_delta_epoch[static_cast<uint32_t>(client_id)] +=
-							jt->num_msg;
-					}
-				} else {
-					if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
-						std::this_thread::sleep_for(std::chrono::microseconds(10));
-						if (shard.deferred_level5.size() < kDeferredL5MaxEntries) {
-							shard.deferred_level5.push_back(std::move(*jt));
-							continue;
-						}
-						state.mark_sequenced(seq);
-						state.next_expected = seq + 1;
-						order5_skipped_batches_.fetch_add(1, std::memory_order_relaxed);
-						order5_hold_buffer_forced_skips_.fetch_add(1, std::memory_order_relaxed);
-						record_forced_skip(client_id);
-						emitted.MarkEmitted(static_cast<uint64_t>(seq));
-						ready.push_back(std::move(*jt));
-						continue;
-					}
-
-					auto& stream_map = shard.hold_buffer[client_id];
-					if (stream_map.find(seq) != stream_map.end()) {
-						continue;
-					}
-
-					HoldEntry5 he;
-					he.meta.log_idx = jt->cached_log_idx;
-					he.meta.total_size = jt->cached_total_size;
-					he.meta.batch_id = jt->cached_batch_id;
-					he.meta.batch_seq = jt->batch_seq;
-					he.meta.pbr_absolute_index = jt->cached_pbr_absolute_index;
-					he.meta.client_id = jt->client_id;
-					he.meta.epoch_created = jt->epoch_created;
-					he.meta.broker_id = jt->broker_id;
-					he.meta.num_msg = jt->num_msg;
-					he.meta.start_logical_offset = jt->cached_start_logical_offset;
-					he.hold_start_ns = SteadyNowNs();
-					he.batch = std::move(*jt);
-					stream_map.emplace(seq, he);
-					record_hold_insert(client_id, stream_map);
-					shard.hold_buffer_size++;
-					shard.clients_with_held_batches.insert(client_id);
-					InvalidateOrder5HeldSlot(he.batch.hdr);
-
-					PendingBatch5 marker;
-					marker.broker_id = he.batch.broker_id;
-					marker.slot_offset = he.batch.slot_offset;
-					marker.is_held_marker = true;
-					marker.hdr = nullptr;
-					marker.num_msg = 0;
-					ready.push_back(marker);
-				}
+				classify_one(state, emitted, client_id, *jt, true_client_chain);
 			}
 		} else {
 			std::sort(it, group_end,
@@ -5796,94 +5671,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				}
 
 				for (auto jt = bit; jt != broker_end; ++jt) {
-					size_t seq = jt->batch_seq;
-					if (state.is_duplicate(seq) &&
-					    emitted.IsEmitted(static_cast<uint64_t>(seq))) {
-						continue;
-					}
-					if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
-						state.mark_sequenced(seq);
-						if (seq >= state.next_expected) {
-							state.next_expected = seq + 1;
-						}
-						if (!CheckAndInsertBatchId(shard, jt->cached_batch_id)) {
-							ready.push_back(std::move(*jt));
-							emitted.MarkEmitted(static_cast<uint64_t>(seq));
-							order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
-							VLOG(1) << "[L5_REPLAY_EMIT] B" << ready.back().broker_id
-							        << " seq=" << seq;
-						}
-						continue;
-					}
-					if (seq == state.next_expected) {
-						state.mark_sequenced(seq);
-						state.advance_next_expected();
-						if (!CheckAndInsertBatchId(shard, jt->cached_batch_id)) {
-							emitted.MarkEmitted(static_cast<uint64_t>(seq));
-							ready.push_back(std::move(*jt));
-						}
-					} else if (seq < state.next_expected) {
-						state.mark_sequenced(seq);
-						if (!CheckAndInsertBatchId(shard, jt->cached_batch_id)) {
-							order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
-							ready.push_back(std::move(*jt));
-							emitted.MarkEmitted(static_cast<uint64_t>(seq));
-							VLOG(1) << "[L5_LATE_RESEQ] B" << ready.back().broker_id
-							        << " seq=" << seq
-							        << " next_expected=" << state.next_expected
-							        << " (emit-late for ACK progress)";
-						} else {
-							VLOG(1) << "[L5_LATE_SKIP_DUP] B" << jt->broker_id
-							        << " seq=" << seq;
-						}
-					} else {
-						if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
-							std::this_thread::sleep_for(std::chrono::microseconds(10));
-							if (shard.deferred_level5.size() < kDeferredL5MaxEntries) {
-								shard.deferred_level5.push_back(std::move(*jt));
-								continue;
-							}
-							state.mark_sequenced(seq);
-							state.next_expected = seq + 1;
-							order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
-							order5_skipped_batches_.fetch_add(1, std::memory_order_relaxed);
-							order5_hold_buffer_forced_skips_.fetch_add(1, std::memory_order_relaxed);
-							emitted.MarkEmitted(static_cast<uint64_t>(seq));
-							ready.push_back(std::move(*jt));
-							continue;
-						}
-
-						auto& stream_map = shard.hold_buffer[stream_key];
-						if (stream_map.find(seq) != stream_map.end()) {
-							continue;
-						}
-
-						HoldEntry5 he;
-						he.meta.log_idx = jt->cached_log_idx;
-						he.meta.total_size = jt->cached_total_size;
-						he.meta.batch_id = jt->cached_batch_id;
-						he.meta.batch_seq = jt->batch_seq;
-						he.meta.pbr_absolute_index = jt->cached_pbr_absolute_index;
-						he.meta.client_id = jt->client_id;
-						he.meta.epoch_created = jt->epoch_created;
-						he.meta.broker_id = jt->broker_id;
-						he.meta.num_msg = jt->num_msg;
-						he.meta.start_logical_offset = jt->cached_start_logical_offset;
-						he.hold_start_ns = SteadyNowNs();
-						he.batch = std::move(*jt);
-						stream_map.emplace(seq, he);
-						shard.hold_buffer_size++;
-						shard.clients_with_held_batches.insert(stream_key);
-						InvalidateOrder5HeldSlot(he.batch.hdr);
-
-						PendingBatch5 marker;
-						marker.broker_id = he.batch.broker_id;
-						marker.slot_offset = he.batch.slot_offset;
-						marker.is_held_marker = true;
-						marker.hdr = nullptr;
-						marker.num_msg = 0;
-						ready.push_back(marker);
-					}
+					classify_one(state, emitted, stream_key, *jt, true_client_chain);
 				}
 
 				bit = broker_end;
