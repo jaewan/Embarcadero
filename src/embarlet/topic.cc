@@ -1,10 +1,10 @@
 #include "topic.h"
-#include "../cxl_manager/scalog_local_sequencer.h"
-#include "../cxl_manager/lazylog_local_sequencer.h"
+#include "cxl_manager/scalog_local_sequencer.h"
+#include "cxl_manager/lazylog_local_sequencer.h"
 #include "common/performance_utils.h"
-#include "../common/wire_formats.h"
-#include "../common/order_level.h"
-#include "../common/env_flags.h"
+#include "common/wire_formats.h"
+#include "common/order_level.h"
+#include "common/env_flags.h"
 
 #include <algorithm>
 #include <array>
@@ -72,6 +72,16 @@ static inline uint64_t MakeClientBrokerStreamKey(size_t client_id, int broker_id
 
 static inline bool UsesTrueClientChainOrdering(int order) {
 	return order == kOrderStrong;
+}
+
+// [[W1.2]] EMBAR_ASSERT_COMMIT_ORDER=1 makes the per-session commit-order check a hard CHECK
+// (abort) for tests; default off (count + LOG only) so it is safe to leave on under load runs.
+static inline bool ShouldAssertCommitOrder() {
+	static const bool v = []() {
+		const char* e = std::getenv("EMBAR_ASSERT_COMMIT_ORDER");
+		return e != nullptr && std::atoi(e) > 0;
+	}();
+	return v;
 }
 
 static uint64_t GetOrder5HoldTimeoutNs(bool replicated_ack2_mode) {
@@ -157,7 +167,10 @@ static inline void ClearOrder5PublishState(BatchHeader* hdr) {
 	if (!hdr) return;
 	hdr->publish_commit = kBatchHeaderPublishUncommitted;
 	hdr->batch_complete = 0;
-	__atomic_store_n(&hdr->flags, 0u, __ATOMIC_RELEASE);
+	// RETIRED (not 0): a cleared slot must stay distinguishable from a never-written tail
+	// slot. If it reads as empty, a scanner resynced onto it parks forever waiting for a
+	// publication that will never come, stranding every later published slot in the ring.
+	__atomic_store_n(&hdr->flags, kBatchHeaderFlagRetired, __ATOMIC_RELEASE);
 }
 
 // Once an ORDER=5 batch is copied into the hold buffer, its original ring slot must stop
@@ -3578,6 +3591,8 @@ void Topic::InitExportCursorForBroker(int broker_id) {
 
 void Topic::Sequencer5() {
 	LOG(INFO) << "Starting Sequencer5 (Phase 1b epoch pipeline) for topic: " << topic_name_;
+	commit_order_last_seq_.clear();  // [[W1.2]] fresh per-session commit-order tracking each run
+	order5_commit_order_violations_.store(0, std::memory_order_relaxed);
 	ResetCompletedRangeQueue();
 	global_batch_seq_.store(0, std::memory_order_release);
 	{
@@ -4122,7 +4137,7 @@ void Topic::CommitEpoch(
 	};
 
 	// [COMMIT_DIAG] Count batches committed per broker this epoch
-	std::array<size_t, 8> committed_this_epoch{};
+	std::array<size_t, NUM_MAX_BROKERS> committed_this_epoch{};
 
 	// [PHASE-3D] Regroup flushes for better pipeline utilization
 	// 1. Flush all GOI entries
@@ -4178,6 +4193,27 @@ void Topic::CommitEpoch(
 				entry->global_seq = batch_index;
 				next_order += p.num_msg;
 			}
+		// [[W1.2]] Empirical per-session in-order commit invariant (W1 item #2): across epoch
+		// seals the collector must commit a client's batches in strictly increasing client_seq.
+		// Deliberate gap-skips still advance (increasing, non-contiguous); a LOWER client_seq
+		// committed after a higher one for the same client is a genuine collector reorder -> bug.
+		if (order_ == kOrderStrong && (p.from_hold || p.hdr != nullptr)) {
+			const uint64_t w12_cid = entry->client_id;
+			const uint64_t w12_seq = entry->client_seq;
+			auto w12_it = commit_order_last_seq_.find(w12_cid);
+			if (w12_it != commit_order_last_seq_.end() && w12_seq <= w12_it->second) {
+				order5_commit_order_violations_.fetch_add(1, std::memory_order_relaxed);
+				LOG(ERROR) << "[W1.2_COMMIT_ORDER_VIOLATION] client=" << w12_cid
+				           << " committed client_seq=" << w12_seq << " <= last=" << w12_it->second
+				           << " broker=" << entry->broker_id << " goi_index=" << batch_index;
+				if (ShouldAssertCommitOrder()) {
+					CHECK_GT(w12_seq, w12_it->second) << "[W1.2] per-session commit-order invariant violated";
+				}
+				commit_order_last_seq_[w12_cid] = std::max<uint64_t>(w12_seq, w12_it->second);
+			} else {
+				commit_order_last_seq_[w12_cid] = w12_seq;
+			}
+		}
 		CXL::store_fence();
 		CXL::flush_cacheline(entry);
 		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);
@@ -4188,6 +4224,12 @@ void Topic::CommitEpoch(
 	// the head sequencer's process-local hold/export map, so every committed batch gets a
 	// descriptor written into shared memory keyed by PBR order.
 		size_t export_next_order = base_order;
+		// [E2] Compute the ORDER=5 recomputed batch size ONCE per batch here (step 2) and reuse it
+		// in the step-3 metadata loop, eliminating the second identical CXL payload walk. Indexed by
+		// position in `ready`; both loops bind references to the same vector, so &p - ready.data()
+		// yields the same index. Values are byte-identical to a second recompute (the BlogMessageHeader
+		// payload at log_idx is not mutated between the two loops), so this is behavior-preserving.
+		std::vector<size_t> order5_recomputed_size(ready.size(), 0);
 		for (PendingBatch5& p : ready) {
 			if (p.skipped || p.is_held_marker) continue;
 			const bool from_hold = p.from_hold;
@@ -4199,6 +4241,7 @@ void Topic::CommitEpoch(
 			const size_t batch_total_size = from_hold
 				? RecomputeOrder5BatchSizeFromPayload(cxl_addr_, hold->log_idx, hold->num_msg, hold->total_size)
 				: RecomputeOrder5BatchSizeFromPayload(cxl_addr_, p.cached_log_idx, p.num_msg, p.cached_total_size);
+			order5_recomputed_size[static_cast<size_t>(&p - ready.data())] = batch_total_size;
 			if (b >= 0 && b < NUM_MAX_BROKERS) {
 				const size_t batch_headers_offset = tinode_->offsets[b].batch_headers_offset;
 				if (batch_headers_offset != 0) {
@@ -4223,7 +4266,7 @@ void Topic::CommitEpoch(
 					cur->pbr_absolute_index = pbr_abs;
 					cur->ordered = 1;
 					cur->batch_complete = 1;
-					cur->publish_commit = p.cached_pbr_absolute_index;
+					cur->publish_commit = pbr_abs;
 					cur->flags = kBatchHeaderFlagClaimed | kBatchHeaderFlagValid;
 					CXL::store_fence();
 					CXL::flush_cacheline(cur);
@@ -4279,8 +4322,7 @@ void Topic::CommitEpoch(
 		{
 			OrderedHoldExportEntry ex;
 				ex.log_idx = m.log_idx;
-				ex.batch_size = RecomputeOrder5BatchSizeFromPayload(
-					cxl_addr_, m.log_idx, m.num_msg, m.total_size);
+				ex.batch_size = order5_recomputed_size[static_cast<size_t>(&p - ready.data())];
 				if (ex.batch_size != m.total_size) {
 					LOG(WARNING) << "[ORDER5_HOLD_EXPORT_SIZE_FIX B" << b << "]"
 					             << " pbr=" << m.pbr_absolute_index
@@ -4292,8 +4334,13 @@ void Topic::CommitEpoch(
 				ex.num_messages = m.num_msg;
 				ex.pbr_absolute_index = m.pbr_absolute_index;
 				{
-					absl::MutexLock lock(&hold_export_queues_[b].mu);
-					hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
+					// [E1] hold_export_queues_ is process-local DRAM; only the sequencer's own
+					// broker (broker_id_) drains it. Others export via the shared CXL ring, so
+					// inserts for non-owned brokers were dead writes (unbounded DRAM growth).
+					if (b == broker_id_) {
+						absl::MutexLock lock(&hold_export_queues_[b].mu);
+						hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
+					}
 				}
 			}
 			next_order += m.num_msg;
@@ -4319,8 +4366,13 @@ void Topic::CommitEpoch(
 			ex.total_order = next_order;
 			ex.num_messages = p.num_msg;
 			ex.pbr_absolute_index = p.cached_pbr_absolute_index;
-			absl::MutexLock lock(&hold_export_queues_[owner_broker].mu);
-			hold_export_queues_[owner_broker].q.push_back(ex);
+			// [E1] hold_export_queues_ is process-local DRAM; only the sequencer's own
+			// broker (broker_id_) drains it. Others export via the shared CXL ring, so
+			// inserts for non-owned brokers were dead writes (unbounded DRAM growth).
+			if (owner_broker == broker_id_) {
+				absl::MutexLock lock(&hold_export_queues_[owner_broker].mu);
+				hold_export_queues_[owner_broker].q[ex.pbr_absolute_index] = ex;
+			}
 		}
 		next_order += p.num_msg;
 		int b = p.broker_id;
@@ -4331,8 +4383,7 @@ void Topic::CommitEpoch(
 		{
 			OrderedHoldExportEntry ex;
 			ex.log_idx = p.cached_log_idx;
-			ex.batch_size = RecomputeOrder5BatchSizeFromPayload(
-				cxl_addr_, p.cached_log_idx, p.num_msg, p.cached_total_size);
+			ex.batch_size = order5_recomputed_size[static_cast<size_t>(&p - ready.data())];
 			if (ex.batch_size != p.cached_total_size) {
 				LOG(WARNING) << "[ORDER5_EXPORT_SIZE_FIX B" << b << "]"
 				             << " pbr=" << p.cached_pbr_absolute_index
@@ -4343,8 +4394,13 @@ void Topic::CommitEpoch(
 			ex.total_order = next_order - p.num_msg;
 			ex.num_messages = p.num_msg;
 			ex.pbr_absolute_index = p.cached_pbr_absolute_index;
-			absl::MutexLock lock(&hold_export_queues_[b].mu);
-			hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
+			// [E1] hold_export_queues_ is process-local DRAM; only the sequencer's own
+			// broker (broker_id_) drains it. Others export via the shared CXL ring, so
+			// inserts for non-owned brokers were dead writes (unbounded DRAM growth).
+			if (b == broker_id_) {
+				absl::MutexLock lock(&hold_export_queues_[b].mu);
+				hold_export_queues_[b].q[ex.pbr_absolute_index] = ex;
+			}
 		}
 
 		size_t& next_expected = contiguous_consumed_per_broker[b];
@@ -4492,6 +4548,30 @@ void Topic::EpochSequencerThread() {
 		          << " B3(push_b=" << scanner_pushed_batches_[3].load(std::memory_order_relaxed)
 		          << ",commit_b=" << sequencer_committed_batches_[3].load(std::memory_order_relaxed)
 		          << ",ordered=" << tinode_->offsets[3].ordered << ")";
+		// [[TMP_O5_STALL_DIAG]] Per-client hold state so a frozen stream's stuck point is visible:
+		// next_expected vs min held seq tells whether the gap batch vanished (min > expected) or
+		// the drain is broken (min == expected). Remove before final diff review if too chatty.
+		for (const auto& shard_ptr : level5_shards_) {
+			if (!shard_ptr) continue;
+			std::lock_guard<std::mutex> shard_lock(shard_ptr->mu);
+			for (const auto& [cid, cmap] : shard_ptr->hold_buffer) {
+				if (cmap.empty()) continue;
+				const auto st_it = shard_ptr->client_state.find(cid);
+				const auto em_it = shard_ptr->client_emitted_tracker.find(cid);
+				LOG(INFO) << "[ORDER5_HOLD_DIAG] client=" << cid
+				          << " held=" << cmap.size()
+				          << " min_held_seq=" << cmap.begin()->first
+				          << " max_held_seq=" << cmap.rbegin()->first
+				          << " next_expected="
+				          << (st_it != shard_ptr->client_state.end() ? st_it->second.next_expected : 0)
+				          << " highest_sequenced="
+				          << (st_it != shard_ptr->client_state.end() ? st_it->second.highest_sequenced : 0)
+				          << " emitted_contig_max="
+				          << (em_it != shard_ptr->client_emitted_tracker.end()
+				                  ? em_it->second.contiguous_max : UINT64_MAX)
+				          << " deferred=" << shard_ptr->deferred_level5.size();
+			}
+		}
 	};
 	uint64_t last_idle_diag_ns = 0;
 	// last_idle_progress_epoch removed: epoch advancement is not real progress
@@ -4508,7 +4588,13 @@ void Topic::EpochSequencerThread() {
 			last_idle_progress_ns[b] = SteadyNowNs();
 		}
 	}
-	auto run_idle_hold_tick = [&]() {
+	// [[EXPIRY_ARMING_LIVENESS_FIX]] allow_inline_drain=false runs only the progress/stall
+	// tracking, force-expiry arming, and diagnostics — callable from the BUSY loop. The
+	// inline empty-epoch drain stays idle-only. Previously this tick ran exclusively in the
+	// idle branches; a sequencer kept permanently busy (e.g., a large hold buffer makes each
+	// epoch pass as slow as the 500 µs seal cadence) could never arm force-expiry, so a
+	// gapped stream's hold never drained and the client stalled to ACK timeout.
+	auto run_idle_hold_tick = [&](bool allow_inline_drain) {
 		if (!Embarcadero::UsesEpochSequencerPath(order_) || seq_type_ != EMBARCADERO) return;
 		const uint64_t now_ns = SteadyNowNs();
 		if (now_ns - last_idle_hold_tick_ns < 1'000'000ULL) return;
@@ -4585,7 +4671,15 @@ void Topic::EpochSequencerThread() {
 				           << " seq_commit_m=" << sequencer_committed_msgs_[b].load(std::memory_order_relaxed);
 			}
 		}
-		if (!has_held_work && !force_expire_active) return;
+		if (!has_held_work && !force_expire_active) {
+			// Update the gate so the busy-loop caller pays this scan at most once per ms.
+			last_idle_hold_tick_ns = now_ns;
+			return;
+		}
+		if (!allow_inline_drain) {
+			last_idle_hold_tick_ns = now_ns;
+			return;
+		}
 		std::vector<PendingBatch5> idle_level5_empty;
 		std::vector<PendingBatch5> idle_ready_level5;
 		ProcessLevel5Batches(idle_level5_empty, idle_ready_level5);
@@ -4638,10 +4732,12 @@ void Topic::EpochSequencerThread() {
 
 	while (!stop_threads_) {
 		emit_phase_diag("loop");
+		// [[EXPIRY_ARMING_LIVENESS_FIX]] Arm/track even while busy (internally 1 ms-gated).
+		run_idle_hold_tick(/*allow_inline_drain=*/false);
 		uint64_t last = last_sequenced_epoch_.load(std::memory_order_acquire);
 		uint64_t current = epoch_index_.load(std::memory_order_acquire);
 		if (last >= current) {
-			run_idle_hold_tick();
+			run_idle_hold_tick(/*allow_inline_drain=*/true);
 			// [[FIX_SEQUENCER_WAIT_PAUSE]] Replace sleep_for with cpu_pause for epoch waiting.
 			CXL::cpu_pause();
 			CXL::cpu_pause();
@@ -4652,11 +4748,30 @@ void Topic::EpochSequencerThread() {
 		if (buf.state.load(std::memory_order_acquire) != EpochBuffer5::State::SEALED) {
 			// Tail-progress tick: when no epoch is sealed, still age/expire hold-buffer entries
 			// so final batches do not wait indefinitely for new input traffic.
-			run_idle_hold_tick();
+			run_idle_hold_tick(/*allow_inline_drain=*/true);
 			// [[FIX_BUFFER_STATE_PAUSE]] Replace sleep_for with cpu_pause for buffer state waiting.
 			CXL::cpu_pause();
 			CXL::cpu_pause();
 			continue;
+		}
+		// [[EPOCH_BUFFER_LOSS_FIX]] seal() publishes SEALED *before* its collector quiesce
+		// wait completes, so a scanner that already passed enter_collection() may still be
+		// about to push. Draining before those collectors exit loses their batches (the
+		// buffer is drained, the late push lands in it, and the next reset_and_start()
+		// wipes it). Consume only once no collector is active; new collectors cannot enter
+		// a SEALED buffer, and stragglers hold broker_active until after their push.
+		{
+			bool collectors_active = false;
+			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+				if (buf.broker_active[i].load(std::memory_order_acquire)) {
+					collectors_active = true;
+					break;
+				}
+			}
+			if (collectors_active) {
+				CXL::cpu_pause();
+				continue;
+			}
 		}
 		// Clear only when we have work; avoids redundant clear() in idle loop.
 		batch_list.clear();
@@ -4961,6 +5076,22 @@ void Topic::EpochSequencerThread() {
 		if (buf.state.load(std::memory_order_acquire) != EpochBuffer5::State::SEALED) {
 			std::this_thread::sleep_for(std::chrono::microseconds(100));
 			continue;
+		}
+		// [[EPOCH_BUFFER_LOSS_FIX]] Same quiesce requirement as the main consume loop:
+		// do not drain a SEALED buffer while a collector is still active (its push would
+		// land in a drained buffer and be wiped by the next reset_and_start()).
+		{
+			bool collectors_active = false;
+			for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
+				if (buf.broker_active[i].load(std::memory_order_acquire)) {
+					collectors_active = true;
+					break;
+				}
+			}
+			if (collectors_active) {
+				std::this_thread::sleep_for(std::chrono::microseconds(10));
+				continue;
+			}
 		}
 		{
 			size_t total = 0;
@@ -5390,7 +5521,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						if (stream_map.find(seq) != stream_map.end()) continue;
 
 						HoldEntry5 he;
-						he.batch = std::move(*p);
 						he.meta.log_idx = p->cached_log_idx;
 						he.meta.total_size = p->cached_total_size;
 						he.meta.batch_id = p->cached_batch_id;
@@ -5402,15 +5532,16 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						he.meta.num_msg = p->num_msg;
 						he.meta.start_logical_offset = p->cached_start_logical_offset;
 						he.hold_start_ns = SteadyNowNs();
+						he.batch = std::move(*p);
 						stream_map.emplace(seq, he);
 						record_hold_insert(first_client, stream_map);
 						shard.hold_buffer_size++;
 						shard.clients_with_held_batches.insert(first_client);
-						InvalidateOrder5HeldSlot(p->hdr);
+						InvalidateOrder5HeldSlot(he.batch.hdr);
 
 						PendingBatch5 marker;
-						marker.broker_id = p->broker_id;
-						marker.slot_offset = p->slot_offset;
+						marker.broker_id = he.batch.broker_id;
+						marker.slot_offset = he.batch.slot_offset;
 						marker.is_held_marker = true;
 						marker.hdr = nullptr;
 						marker.num_msg = 0;
@@ -5492,7 +5623,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 							if (stream_map.find(seq) != stream_map.end()) continue;
 
 							HoldEntry5 he;
-							he.batch = std::move(*p);
 							he.meta.log_idx = p->cached_log_idx;
 							he.meta.total_size = p->cached_total_size;
 							he.meta.batch_id = p->cached_batch_id;
@@ -5504,14 +5634,15 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 							he.meta.num_msg = p->num_msg;
 							he.meta.start_logical_offset = p->cached_start_logical_offset;
 							he.hold_start_ns = SteadyNowNs();
+							he.batch = std::move(*p);
 							stream_map.emplace(seq, he);
 							shard.hold_buffer_size++;
 							shard.clients_with_held_batches.insert(stream_key);
-							InvalidateOrder5HeldSlot(p->hdr);
+							InvalidateOrder5HeldSlot(he.batch.hdr);
 
 							PendingBatch5 marker;
-							marker.broker_id = p->broker_id;
-							marker.slot_offset = p->slot_offset;
+							marker.broker_id = he.batch.broker_id;
+							marker.slot_offset = he.batch.slot_offset;
 							marker.is_held_marker = true;
 							marker.hdr = nullptr;
 							marker.num_msg = 0;
@@ -5613,7 +5744,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					}
 
 					HoldEntry5 he;
-					he.batch = std::move(*jt);
 					he.meta.log_idx = jt->cached_log_idx;
 					he.meta.total_size = jt->cached_total_size;
 					he.meta.batch_id = jt->cached_batch_id;
@@ -5625,15 +5755,16 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					he.meta.num_msg = jt->num_msg;
 					he.meta.start_logical_offset = jt->cached_start_logical_offset;
 					he.hold_start_ns = SteadyNowNs();
+					he.batch = std::move(*jt);
 					stream_map.emplace(seq, he);
 					record_hold_insert(client_id, stream_map);
 					shard.hold_buffer_size++;
 					shard.clients_with_held_batches.insert(client_id);
-					InvalidateOrder5HeldSlot(jt->hdr);
+					InvalidateOrder5HeldSlot(he.batch.hdr);
 
 					PendingBatch5 marker;
-					marker.broker_id = jt->broker_id;
-					marker.slot_offset = jt->slot_offset;
+					marker.broker_id = he.batch.broker_id;
+					marker.slot_offset = he.batch.slot_offset;
 					marker.is_held_marker = true;
 					marker.hdr = nullptr;
 					marker.num_msg = 0;
@@ -5728,7 +5859,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						}
 
 						HoldEntry5 he;
-						he.batch = std::move(*jt);
 						he.meta.log_idx = jt->cached_log_idx;
 						he.meta.total_size = jt->cached_total_size;
 						he.meta.batch_id = jt->cached_batch_id;
@@ -5740,14 +5870,15 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						he.meta.num_msg = jt->num_msg;
 						he.meta.start_logical_offset = jt->cached_start_logical_offset;
 						he.hold_start_ns = SteadyNowNs();
+						he.batch = std::move(*jt);
 						stream_map.emplace(seq, he);
 						shard.hold_buffer_size++;
 						shard.clients_with_held_batches.insert(stream_key);
-						InvalidateOrder5HeldSlot(jt->hdr);
+						InvalidateOrder5HeldSlot(he.batch.hdr);
 
 						PendingBatch5 marker;
-						marker.broker_id = jt->broker_id;
-						marker.slot_offset = jt->slot_offset;
+						marker.broker_id = he.batch.broker_id;
+						marker.slot_offset = he.batch.slot_offset;
 						marker.is_held_marker = true;
 						marker.hdr = nullptr;
 						marker.num_msg = 0;
@@ -6023,6 +6154,9 @@ size_t Topic::GetTotalHoldBufferSize() {
 
 void Topic::WriteOrder5AnomalyCountersCsv() const {
 	if (order_ != 5 || seq_type_ != heartbeat_system::EMBARCADERO) return;
+	LOG(INFO) << "[W1.2_SUMMARY] topic=" << topic_name_ << " broker=" << broker_id_
+	          << " order5_commit_order_violations="
+	          << order5_commit_order_violations_.load(std::memory_order_relaxed);
 
 	const std::string path = "order5_anomaly_counters_broker" + std::to_string(broker_id_) + ".csv";
 	const bool write_header = !std::ifstream(path).good();
@@ -6231,6 +6365,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	const size_t slot_count = BATCHHEADERS_SIZE / sizeof(BatchHeader);
 	constexpr size_t kMaxScannerLeadSlots = 256;
 	std::vector<uint64_t> last_pushed_pbr_index_per_slot(slot_count, std::numeric_limits<uint64_t>::max());
+	// [[SCANNER_RETIRED_SKIP]] Bound CPU/CXL cost if the ring ever reads fully retired
+	// (possible only after a complete wrap): after a full lap of retired skips, yield.
+	size_t retired_skip_streak = 0;
 
 
 	while (!stop_threads_) {
@@ -6322,11 +6459,34 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 		}
 
 		if (!batch_ready) {
+			// [[SCANNER_RETIRED_SKIP]] A retired slot (sequencer cleared it after commit or
+			// hold-insert) never becomes publishable again until ring wrap. Waiting on it
+			// deadlocks the scanner while published batches sit unscanned in later slots;
+			// its batch is already owned by the sequencer, so passing it is always safe.
+			if (!publish_ready && (flags & kBatchHeaderFlagRetired) != 0) {
+				BatchHeader* next_batch_header = reinterpret_cast<BatchHeader*>(
+					reinterpret_cast<uint8_t*>(current_batch_header) + sizeof(BatchHeader));
+				if (next_batch_header >= ring_end) next_batch_header = ring_start_default;
+				current_batch_header = next_batch_header;
+				++scanner_slot_seq;
+				hole_wait_start_ns = 0;
+				idle_cycles = 0;
+				if (++retired_skip_streak >= slot_count) {
+					retired_skip_streak = 0;
+					std::this_thread::yield();
+				}
+				continue;
+			}
+			retired_skip_streak = 0;
 			// Only truly empty slots (!CLAIMED && not publish-committed) are tail.
 			// Anything else is treated as an in-flight or partially retired slot and follows bounded wait.
 			if (!is_claimed && !publish_ready) {
 				// Re-sync to the authoritative consumed frontier when the scanner lands on an
 				// already-processed empty slot after wrap/skip/drain progress elsewhere.
+				// [[SCANNER_FORWARD_ONLY_RESYNC]] Jump forward only (same window rule as the
+				// top-of-loop jump). consumed_through can point at a slot the sequencer has
+				// invalidated but not yet consumed (hold-insert); jumping backward onto it
+				// parked the scanner forever and stranded the rest of the ring.
 				const void* consumed_addr = const_cast<const void*>(
 					reinterpret_cast<const volatile void*>(
 						&tinode_->offsets[broker_id].batch_headers_consumed_through));
@@ -6335,11 +6495,13 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				size_t consumed = tinode_->offsets[broker_id].batch_headers_consumed_through;
 				if (consumed == BATCHHEADERS_SIZE) consumed = 0;
 				if (consumed < BATCHHEADERS_SIZE && (consumed % sizeof(BatchHeader)) == 0) {
-					BatchHeader* consumed_header = reinterpret_cast<BatchHeader*>(
-						reinterpret_cast<uint8_t*>(ring_start_default) + consumed);
-					if (consumed_header != current_batch_header) {
-						current_batch_header = consumed_header;
-						scanner_slot_seq = static_cast<uint64_t>(consumed / sizeof(BatchHeader));
+					const size_t consumed_slot = consumed / sizeof(BatchHeader);
+					const size_t current_slot = static_cast<size_t>(scanner_slot_seq % slot_count);
+					const size_t forward = (consumed_slot + slot_count - current_slot) % slot_count;
+					if (forward > 0 && forward < (slot_count / 2)) {
+						current_batch_header = reinterpret_cast<BatchHeader*>(
+							reinterpret_cast<uint8_t*>(ring_start_default) + consumed);
+						scanner_slot_seq += forward;
 						hole_wait_start_ns = 0;
 						idle_cycles = 0;
 						continue;
@@ -6647,9 +6809,15 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 							continue;
 						}
 						uint64_t expected = cur_epoch;
-						if (!epoch_index_.compare_exchange_strong(expected, cand_epoch, std::memory_order_release)) {
-							cand.state.store(EpochBuffer5::State::IDLE, std::memory_order_release);
-						}
+						// [[EPOCH_BUFFER_LOSS_FIX]] On CAS failure do NOT roll the candidate back to
+						// IDLE. Between reset_and_start() (state=COLLECTING) and a rollback store,
+						// another scanner can enter_collection() and push batches; marking the buffer
+						// IDLE strands them, and the next reset_and_start() silently wipes them
+						// (observed as a client stream freezing at the wiped batch's seq with the
+						// entire tail piling into the hold buffer). Leaving it COLLECTING is safe:
+						// buffers are not epoch-tagged, and the driver's rotation seals and the
+						// sequencer consumes it within <=2 epochs.
+						epoch_index_.compare_exchange_strong(expected, cand_epoch, std::memory_order_release);
 						break;
 					}
 				}
@@ -6854,10 +7022,18 @@ void Topic::AdvanceConsumedThroughForProcessedSlots(
 
 	const size_t slot_size = sizeof(BatchHeader);
 	const size_t slot_count = BATCHHEADERS_SIZE / slot_size;
-	std::array<std::vector<uint8_t>, NUM_MAX_BROKERS> processed_slots;
+	// [E3] Reuse the member scratch instead of allocating a fresh array each call.
+	// Safe without a lock: this function runs only on the single EpochSequencerThread
+	// (see processed_slots_scratch_ declaration in topic.h). resize() grows only on the
+	// first call (slot_count is constant per run); std::fill re-zeroes the seen brokers'
+	// regions so the marking loop below sees zeroed slots for every seen broker.
+	std::array<std::vector<uint8_t>, NUM_MAX_BROKERS>& processed_slots = processed_slots_scratch_;
 	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
 		if (broker_seen_in_epoch[b]) {
-			processed_slots[b].assign(slot_count, 0);
+			if (processed_slots[b].size() != slot_count) {
+				processed_slots[b].resize(slot_count);
+			}
+			std::fill(processed_slots[b].begin(), processed_slots[b].end(), static_cast<uint8_t>(0));
 		}
 	}
 	for (const PendingBatch5& p : batch_list) {

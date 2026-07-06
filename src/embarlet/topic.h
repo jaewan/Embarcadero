@@ -14,9 +14,9 @@
 #include <chrono>
 #include <cstdlib>
 
-#include "../disk_manager/corfu_replication_client.h"
-#include "../disk_manager/scalog_replication_client.h"
-#include "../cxl_manager/cxl_datastructure.h"
+#include "disk_manager/corfu_replication_client.h"
+#include "disk_manager/scalog_replication_client.h"
+#include "cxl_manager/cxl_datastructure.h"
 #include "common/config.h"
 #include "common/wire_formats.h"
 #include "sequencer_utils.h"
@@ -465,7 +465,7 @@ class Topic {
 		 * @brief Reserves one PBR slot after payload recv; caller writes BatchHeader once after.
 		 * @threading Thread-safe: lock-free (128-bit CAS) when pbr_state_.is_lock_free(), else mutex-protected.
 		 * @ownership batch_header_location points into CXL; caller must write header + flush.
-		 * @paper_ref docs/EMBARCADERO_DEFINITIVE_DESIGN.md §3.1 (receive then PBR commit).
+		 * @paper_ref docs/design/EMBARCADERO_DEFINITIVE_DESIGN.md §3.1 (receive then PBR commit).
 		 */
 		bool ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
 				void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
@@ -848,6 +848,12 @@ class Topic {
 		std::atomic<uint64_t> order5_hold_timeout_skips_{0};
 		std::atomic<uint64_t> order5_hold_buffer_forced_skips_{0};
 		std::atomic<uint64_t> order5_stale_epoch_skips_{0};
+		// [[W1.2]] Per-session commit-order invariant instrumentation (W1 item #2). Detects the
+		// collector committing a client's batch out of order across epoch seals.
+		std::atomic<uint64_t> order5_commit_order_violations_{0};
+		// [[W1.2]] Last committed client_seq per client_id. Single-writer: touched ONLY in
+		// CommitEpoch on the EpochSequencerThread, so no lock is required.
+		absl::flat_hash_map<uint64_t, uint64_t> commit_order_last_seq_;
 		// Disconnect/shutdown tail drain: keep force-expiring hold frontiers for a short bounded window
 		// so late-visible batches are not stranded behind a one-shot expiry pulse.
 		std::atomic<uint64_t> force_expire_hold_until_ns_{0};
@@ -955,6 +961,13 @@ class Topic {
 		const std::array<bool, NUM_MAX_BROKERS>& broker_seen_in_epoch,
 		const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_cumulative,
 		const std::array<uint64_t, NUM_MAX_BROKERS>* cv_max_pbr_index);
+	// [E3] Reusable scratch for AdvanceConsumedThroughForProcessedSlots to avoid
+	// per-epoch heap churn. Single-writer: accessed ONLY on EpochSequencerThread
+	// (all callers reach it via CommitEpoch/direct calls inside EpochSequencerThread,
+	// which is spawned exactly once per Topic in Sequencer5/Sequencer2). No lock needed.
+	// Sized to slot_count (constant per run) on first use; each call zeroes only the
+	// seen brokers' [0, slot_count) region.
+	std::array<std::vector<uint8_t>, NUM_MAX_BROKERS> processed_slots_scratch_;
 
 	// [[PHASE_3]] Recovery parameters (§4.2.2)
 		// Recovery timeout for declaring a chain replica stalled.

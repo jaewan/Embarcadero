@@ -10,7 +10,7 @@
 
 /* CXL memory layout (v2.0 - Phase 1a + Phase 2)
  *
- * Reference: docs/CXL_MEMORY_LAYOUT_v2.md
+ * Reference: docs/design/CXL_MEMORY_LAYOUT_v2.md
  *
  * [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0x0 (128 bytes)
  * [[PHASE_2_GOI_CV]]         CompletionVector at 0x1000 (4 KB), GOI at 0x2000 (16 GB)
@@ -388,6 +388,10 @@ struct alignas(64) TInode{
  */
 constexpr uint32_t kBatchHeaderFlagClaimed = 1u << 0;
 constexpr uint32_t kBatchHeaderFlagValid = 1u << 1;
+// Set (exclusively) when the sequencer invalidates a slot after the batch was committed or
+// moved into the hold buffer. A retired slot never becomes publishable again until the ring
+// wraps and a new claim overwrites it; scanners must skip it rather than treat it as tail.
+constexpr uint32_t kBatchHeaderFlagRetired = 1u << 2;
 constexpr uint64_t kBatchHeaderPublishUncommitted = std::numeric_limits<uint64_t>::max();
 
 struct alignas(64) BatchHeader{
