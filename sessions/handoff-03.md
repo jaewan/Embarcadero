@@ -232,39 +232,6 @@ leg 1.
 ALL CHECKS PASSED (min-across-replicas, monotonic, broadcast-fidelity, wedged-broker); ~47K cuts/s,
 ~378K ordered-msg/s (perf not calibrated — small run; calibration floor ≥18.7K writes/s/shard @4KB).
 
-## Unit 5 — LazyLog coordinator port — DONE (workflow + hand-hardening)
-
-Built via workflow (lessons from Scalog baked into the spec: opt-in barrier, don't touch leg-1/local-seq).
-The apply agent over-corrected: it left `lazylog_global_sequencer.cc` pristine (good for leg-1) but that
-left the mailbox core as a SEPARATE copy of the binding logic while the docs claimed "shared code" —
-a drift risk + inconsistent with Corfu/Scalog. Adversarial verify flagged it (critical).
-
-**What shipped:** `lazylog_binding_core.{h,cc}` (per-broker binding-delta core, opt-in epoch barrier),
-`lazylog_mailbox_messages.h` (POD LocalProgress/GlobalBinding; map→fixed by-broker array),
-`lazylog_mailbox_sequencer.{h,cc}` (poll → bind → `BroadcastDown`), `lazylog_mailbox_bench.cc`
-(independent binding-delta recompute + monotonic + broadcast-fidelity + wedged-broker regression).
-
-**My hand-fixes:**
-1. **Verified the core is byte-equivalent to the inline gRPC binding logic** (same count-only readiness,
-   same `registered_brokers_` iteration, same `reported - already_bound` delta, same regression
-   rejection) — so the verifier's "they differ" was a false positive, but the two-copies risk was real.
-2. **Refactored the gRPC path to call the shared core** (`use_epoch_barrier=false`) — now leg 1 and
-   leg 2 run literally the same `LazyLogBindingCore`, matching Corfu/Scalog; behavior-preserving
-   (readiness/delta identical), and the bench now guards leg 1 too.
-3. **Reverted the gratuitous `lazylog_local_sequencer.cc` include tweak.**
-4. **Corrected the appendix** (removed now-stale "gRPC untouched / future refactor" claims → shared code).
-
-**Verified on broker (all green):** configure+build clean; `lazylog_latency_invariant` guard passes;
-`lazylog_mailbox_bench` ALL CHECKS PASSED (binding-delta, monotonic, broadcast-fidelity, wedged-broker);
-~69K bindings/s, ~278K ordered-msg/s (perf not calibrated).
-
-**Same pre-existing caveat as Scalog (flagged, not fixed):** whether the untouched local sequencer
-reports true min-across-replicas progress vs self-only under RF>1 is a pre-existing baseline-fidelity
-question (§5c) — the port claims the binding-core decision (bench-verified), not end-to-end.
-
-**All three baselines now ported** (Corfu/Scalog/LazyLog), each sharing its ordering core between the
-gRPC baseline and the CXL mailbox path, each with a wedged-broker regression, each documented honestly.
-
 ## For other tracks
 - **Track 01:** mailbox lib lives entirely in new `src/cxl_transport/`; does not touch
   `src/embarlet/topic.{cc,h}` or the epoch collector. Only shared dependency is the existing
