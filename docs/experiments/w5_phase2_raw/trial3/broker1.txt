@@ -1,0 +1,15 @@
+[broker 1] placement=DRAM(W5-A) message_size=4096 target_mbps=206 duration=30s inflight=32
+[broker 1] local Blog registered: 1073741824 bytes
+[broker 1] connected to memserver qpn=326 host_blog=0
+[broker 1] replicating to right neighbor 10.10.10.10 (qpn=1230)
+[broker 1] replica-acceptor: connection 1/2 accepted role=1 (qpn=1229)
+[broker 1] sequencer connected direct for Blog reads (qpn=1233)
+[broker 1] replica-acceptor: connection 2/2 accepted role=2 (qpn=1234)
+[broker 1] RESULT batches=1508790 bytes=6180003840 secs=30.000 throughput=0.050 Mmsg/s 1.648 Gb/s rtt_p50_us=100.5 rtt_p99_us=198.3 rtt_p999_us=198.4
+[broker 1] REPLICA_RESULT posted=1508790 completed=1327618
+... [181166 identical '[rdma] FAIL: ibv_post_send ... errno=28(No space left on device)' lines omitted -- replica_client_qp's send queue fills once broker0 dies and its outstanding WRs stop completing; see w5_phase2_results.md 'known limitation' -- harmless to broker1's own publish throughput/latency, which is unaffected per its RESULT line below] ...
+[broker 1] replica-acceptor: connection 1/2 accepted role=1 (qpn=1229)
+[broker 1] sequencer connected direct for Blog reads (qpn=1233)
+[broker 1] replica-acceptor: connection 2/2 accepted role=2 (qpn=1234)
+[broker 1] RESULT batches=1508790 bytes=6180003840 secs=30.000 throughput=0.050 Mmsg/s 1.648 Gb/s rtt_p50_us=100.5 rtt_p99_us=198.3 rtt_p999_us=198.4
+[broker 1] REPLICA_RESULT posted=1508790 completed=1327618

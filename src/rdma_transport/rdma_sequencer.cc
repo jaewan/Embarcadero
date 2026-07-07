@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "rdma_transport/rdma_common.h"
@@ -73,6 +74,14 @@ int main(int argc, char** argv) {
   int duration_secs = atoi(GetArg(argc, argv, "--duration", "10"));
   std::string broker_ips_csv = GetArg(argc, argv, "--broker-ips", "");  // W5-A only; CSV, index = broker_id
   int blog_port = atoi(GetArg(argc, argv, "--blog-port", "18700"));
+  std::string blog_ports_csv = GetArg(argc, argv, "--blog-ports", "");  // optional per-broker override
+                                                                          // (CSV, index = broker_id) —
+                                                                          // needed when >1 broker is
+                                                                          // co-located on one host and
+                                                                          // a single shared port would
+                                                                          // conflict; falls back to
+                                                                          // --blog-port for every
+                                                                          // broker if not given.
   std::string dev = GetArg(argc, argv, "--dev", "mlx5_0");
   int gid = atoi(GetArg(argc, argv, "--gid", "-1"));
 
@@ -80,9 +89,9 @@ int main(int argc, char** argv) {
           BLOG_PLACEMENT_DRAM ? "DRAM(W5-A)" : "MEMSERVER(W5-B)", num_brokers, duration_secs);
 
   std::vector<std::string> broker_ips;
+  std::vector<int> blog_ports;
 #if BLOG_PLACEMENT_DRAM
   {
-    size_t pos = 0;
     std::string s = broker_ips_csv;
     while (!s.empty()) {
       size_t comma = s.find(',');
@@ -95,11 +104,33 @@ int main(int argc, char** argv) {
                       "(got %zu) for W5-A broker-direct Blog reads\n", num_brokers, broker_ips.size());
       return 1;
     }
+    if (blog_ports_csv.empty()) {
+      blog_ports.assign(num_brokers, blog_port);
+    } else {
+      std::string p = blog_ports_csv;
+      while (!p.empty()) {
+        size_t comma = p.find(',');
+        blog_ports.push_back(atoi((comma == std::string::npos ? p : p.substr(0, comma)).c_str()));
+        if (comma == std::string::npos) break;
+        p = p.substr(comma + 1);
+      }
+      if (static_cast<int>(blog_ports.size()) != num_brokers) {
+        fprintf(stderr, "[sequencer] FATAL: --blog-ports must list exactly num_brokers=%d ports "
+                        "(got %zu)\n", num_brokers, blog_ports.size());
+        return 1;
+      }
+    }
   }
 #endif
 
   DeviceCtx d{};
   if (!OpenDevice(dev, gid, 1, &d)) return 1;
+
+  // [[PIPELINE]] Windowed pipeline depth, shared by every pipelined_ops() call below (header
+  // reads, Blog reads, GOI writes) AND by the per-broker Blog QPs' send-queue sizing in W5-A —
+  // declared here (not at its point of use further down) so the QP creation below can size
+  // against it.
+  constexpr int kWindow = 64;
 
   // ---- Connect to the memserver (metadata always; Blog too in W5-B) ----
   RcQp meta_qp{};
@@ -126,10 +157,14 @@ int main(int argc, char** argv) {
   std::vector<RcQp> blog_qps(num_brokers);
   std::vector<RegionDesc> blog_regions(num_brokers);
   for (int b = 0; b < num_brokers; ++b) {
-    if (!CreateRcQpOnSharedCq(&d, blog_shared_cq, 64, /*psn_seed=*/0x7000 + b, &blog_qps[b])) return 1;
+    // [[BUG FOUND]] max_send_wr==kWindow left ZERO margin: the pipeline can post up to kWindow
+    // outstanding reads to ONE broker's QP if a poll cycle's work happens to concentrate on that
+    // broker (e.g. a burst from one broker while others are quiet). Sized with headroom so a
+    // full-window burst never hits ibv_post_send's ENOMEM/queue-full path.
+    if (!CreateRcQpOnSharedCq(&d, blog_shared_cq, 2 * kWindow, /*psn_seed=*/0x7000 + b, &blog_qps[b])) return 1;
     BlogHandoffBlob hlocal{}, hremote{};
     hlocal.ep = LocalEndpoint(blog_qps[b]);
-    if (!OobClientExchange(broker_ips[b], blog_port, &hlocal, &hremote, sizeof(BlogHandoffBlob))) {
+    if (!OobClientExchange(broker_ips[b], blog_ports[b], &hlocal, &hremote, sizeof(BlogHandoffBlob))) {
       fprintf(stderr, "[sequencer] Blog handoff with broker %d (%s) failed\n", b, broker_ips[b].c_str());
       return 1;
     }
@@ -138,6 +173,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[sequencer] broker-direct Blog connection to broker %d (%s) qpn=%u\n",
             b, broker_ips[b].c_str(), hremote.ep.qpn);
   }
+  // Maps a completion's LOCAL qp_num (blog_qps[b].qp->qp_num — the number ibv_poll_cq reports for
+  // a WC on that QP) back to the broker it belongs to, so the fast-path error handler in Step 4
+  // knows WHICH broker just errored out.
+  std::unordered_map<uint32_t, int> qpnum_to_broker;
+  for (int b = 0; b < num_brokers; ++b) qpnum_to_broker[blog_qps[b].qp->qp_num] = b;
 #endif
 
   // ---- Local staging buffers, registered once ----
@@ -154,7 +194,6 @@ int main(int argc, char** argv) {
   // land), and batch CV/ControlBlock updates to once per broker per poll cycle instead of once
   // per batch (matching the real system's per-epoch-not-per-message commit cadence) — GOI still
   // gets one WRITE per batch (it is inherently a per-record log) but pipelined, not blocked on.
-  constexpr int kWindow = 64;
   std::vector<BatchHeaderMirror> header_buf(kWindow);
   Mr header_buf_mr{};
   if (!RegisterMr(d.pd, header_buf.data(), header_buf.size() * sizeof(BatchHeaderMirror),
@@ -185,41 +224,97 @@ int main(int argc, char** argv) {
   int bad = 0;
 
   // Windowed pipeline: keep up to kWindow ops outstanding on `q`, posting item i's op via
-  // `post_one(i)` (wr_id MUST equal i) and invoking `on_complete(i)` as each lands — standard
-  // sliding-window pattern, the fix for the fully-serial post/block/repeat bottleneck above.
-  auto pipelined_ops = [&](RcQp* q, size_t count, auto&& post_one, auto&& on_complete) -> bool {
+  // `post_one(i)` (wr_id MUST equal i, MUST return bool) and invoking `on_complete(i)` as each
+  // lands — standard sliding-window pattern, the fix for the fully-serial post/block/repeat
+  // bottleneck above.
+  //
+  // [[BUG FOUND]] `post_one`'s return value used to be discarded and `posted` incremented
+  // unconditionally. If ibv_post_send ever fails (queue full, or — the case that matters for
+  // Phase 2 — the peer is dead and the QP has entered an error state), that op is silently never
+  // sent, yet `posted` advances as if it had been; `completed` then can never reach `count` for
+  // that phantom op, so `while (completed < count)` spins forever. Fixed: check the return value
+  // and abort the whole pipelined_ops call immediately on a post failure instead of pretending it
+  // succeeded. A post/poll failure on a per-broker Blog QP (W5-A) is exactly the fast-path
+  // `kPeerDown` signal Phase 2's failure-detection race depends on — silently hanging on it would
+  // have made that measurement impossible, not just slow.
+  // [[BUG FOUND]] The original fast-path plan was "a failed ibv_post_send on a dead peer's QP is
+  // kPeerDown" — WRONG. post_send() only enqueues a WR on the LOCAL send queue; it does not touch
+  // the network and succeeds regardless of whether the peer is alive. A dead peer only surfaces as
+  // a BAD COMPLETION STATUS later (RC retry/timeout exhaustion -> IBV_WC_RETRY_EXC_ERR, or
+  // IBV_WC_WR_FLUSH_ERR for anything queued after the QP already entered the error state) —
+  // discovered via POLLING, not posting. Verified by a kill sanity test: broker0 was killed, but
+  // `!post_one(...)` never fired even once; detection only happened via the 500ms lease backstop.
+  // Fixed: pipelined_ops now polls inline (instead of delegating to the opaque PollCq helper) so it
+  // can extract the erroring completion's qp_num and hand it to an optional `on_error` hook —
+  // that's the real fast path. Good completions retrieved in the SAME poll batch as a bad one are
+  // still delivered to on_complete before reporting the error (ibv_poll_cq can return a mixed
+  // batch; only the bad entry and anything after it in that batch is lost, to be picked up by the
+  // caller's retry logic).
+  auto pipelined_ops = [&](RcQp* q, size_t count, auto&& post_one, auto&& on_complete,
+                           auto&& on_error) -> bool {
     size_t posted = 0, completed = 0;
     while (completed < count) {
       while (posted < count && (posted - completed) < static_cast<size_t>(kWindow)) {
-        post_one(posted);
+        if (!post_one(posted)) {
+          fprintf(stderr, "[sequencer] pipelined op post failed at index %zu\n", posted);
+          return false;
+        }
         ++posted;
       }
-      int n = PollCq(q->cq, wc, 16, &bad);
-      if (n < 0) { fprintf(stderr, "[sequencer] pipelined op WC error status=%d\n", bad); return false; }
-      for (int i = 0; i < n; ++i) on_complete(static_cast<size_t>(wc[i].wr_id));
-      completed += static_cast<size_t>(n);
+      int n = ibv_poll_cq(q->cq, 16, wc);
+      if (n < 0) { fprintf(stderr, "[sequencer] pipelined op poll_cq error\n"); return false; }
+      if (n == 0) continue;
+      bool had_error = false;
+      for (int i = 0; i < n; ++i) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          fprintf(stderr,
+                  "[sequencer] pipelined op WC error status=%d(%s) qp_num=%u wr_id=%llu\n",
+                  wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].qp_num,
+                  static_cast<unsigned long long>(wc[i].wr_id));
+          on_error(wc[i].qp_num);
+          had_error = true;
+          break;  // stop processing this batch; anything after (incl. this entry) is lost, the
+                  // caller's retry logic picks up whatever didn't complete
+        }
+        on_complete(static_cast<size_t>(wc[i].wr_id));
+        ++completed;
+      }
+      if (had_error) return false;
     }
     return true;
   };
 
   std::vector<uint64_t> last_seen(num_brokers, kPublishUncommitted);
-  std::vector<uint64_t> detect_ts(num_brokers, 0);
   uint64_t committed_seq = 0;
   uint64_t batches = 0, blog_bytes_read = 0, sentinel_polls = 0, stale_misses = 0;
+  uint64_t unrecoverable_bytes = 0;
   LatencyStats detect_to_commit;
 
   const auto t_start = std::chrono::steady_clock::now();
   const auto deadline = t_start + std::chrono::seconds(duration_secs);
 
+  // ---- W5-A leg-1 failure detection: FAST path (RDMA op to a dead broker errors, kPeerDown)
+  // vs BACKSTOP path (lease timeout) — Phase 2 measures which fires first. `last_alive_ts[b]` is
+  // the "lease": renewed implicitly by every successful Blog read from broker b (there is no
+  // separate heartbeat message in this harness — the Blog read traffic itself IS the liveness
+  // signal, matching the spec's "single-writer ownership... lease only for cold-path membership").
+  // Per the spec's M2 guidance, the RDMA lease timeout must NOT reuse CXL's tight constants —
+  // inflated here to cover RDMA RTT tail + polling-cycle granularity, not CXL's sub-microsecond
+  // coherence latency.
+  constexpr uint64_t kLeaseTimeoutNs = 500'000'000ull;  // 500ms backstop; RDMA RTT here is ~us-scale
+  std::vector<bool> broker_dead(num_brokers, false);
+  std::vector<uint64_t> broker_dead_detect_ts(num_brokers, 0);
+  std::vector<std::string> broker_dead_via(num_brokers, "");
+  std::vector<uint64_t> last_alive_ts(num_brokers, NowNsLocal());
+
   auto blocking_read = [&](RcQp* q, void* laddr, uint32_t lkey, uint64_t raddr, uint32_t rkey,
                            uint32_t len) -> bool {
-    PostRead(q, laddr, lkey, raddr, rkey, len, /*wr_id=*/0);
+    if (!PostRead(q, laddr, lkey, raddr, rkey, len, /*wr_id=*/0)) return false;
     int n = PollCq(q->cq, wc, 16, &bad);
     return n > 0;
   };
 
   std::vector<uint64_t> cv_dirty_since_flush(num_brokers, kPublishUncommitted);  // latest ack_offset pending a WRITE, per broker
-  std::vector<uint64_t> item_detect_ts;  // parallel to worklist, for detect_to_commit sampling
 
   while (std::chrono::steady_clock::now() < deadline) {
     // Step 1: ONE contiguous READ of the whole sentinel array.
@@ -229,6 +324,24 @@ int main(int argc, char** argv) {
     }
     ++sentinel_polls;
     const uint64_t poll_ts = NowNsLocal();
+
+#if BLOG_PLACEMENT_DRAM
+    // Lease-timeout BACKSTOP check (Phase 2 §7 "failure detection via BOTH paths"): if a broker
+    // hasn't produced a successful Blog read in kLeaseTimeoutNs and the FAST path (RDMA op error,
+    // checked in Step 4 below) hasn't already caught it, declare it dead here. Checked every poll
+    // cycle so the backstop's own detection latency is bounded by the poll rate, not the run
+    // duration.
+    for (int b = 0; b < num_brokers; ++b) {
+      if (broker_dead[b]) continue;
+      if (poll_ts - last_alive_ts[b] > kLeaseTimeoutNs) {
+        broker_dead[b] = true;
+        broker_dead_detect_ts[b] = poll_ts;
+        broker_dead_via[b] = "lease_timeout";
+        fprintf(stderr, "[sequencer] broker %d declared dead via LEASE_TIMEOUT at t=%.3fs\n", b,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
+      }
+    }
+#endif
 
     // Step 2: flatten every newly-visible (broker,seq) across ALL brokers into one worklist for
     // this poll cycle — the sentinel array holds a single overwriting FRONTIER per broker (spec
@@ -262,8 +375,8 @@ int main(int argc, char** argv) {
           const uint64_t slot_addr = remote.pbr.addr +
               static_cast<uint64_t>(w.broker) * remote.pbr_ring_bytes_per_broker +
               slot * sizeof(BatchHeaderMirror);
-          PostRead(&meta_qp, &header_buf[i % kWindow], header_buf_mr.lkey(), slot_addr,
-                   remote.pbr.rkey, sizeof(BatchHeaderMirror), /*wr_id=*/i);
+          return PostRead(&meta_qp, &header_buf[i % kWindow], header_buf_mr.lkey(), slot_addr,
+                          remote.pbr.rkey, sizeof(BatchHeaderMirror), /*wr_id=*/i);
         },
         [&](size_t i) {
           WorkItem& w = work[i];
@@ -280,7 +393,8 @@ int main(int argc, char** argv) {
           w.total_size = h.total_size;
           w.client_id = h.client_id;
           w.batch_seq = h.batch_seq;
-        });
+        },
+        [](uint32_t) {});  // no per-broker QP here — meta_qp targets c3, never killed in Phase 2
 
     std::vector<size_t> valid_idx;
     for (size_t i = 0; i < work.size(); ++i) if (work[i].header_valid) valid_idx.push_back(i);
@@ -294,40 +408,127 @@ int main(int argc, char** argv) {
     // completions would let a GOI-write completion's wr_id (a different index space) show up in
     // the same poll batch and be misread as a blog-read work-item index (an out-of-bounds bug
     // caught before any real run). The GOI writes get their OWN pipelined pass below instead.
+    //
+    // W5-A dead-broker handling: pipelined_ops aborts the WHOLE call on the first post failure
+    // (see the fix above — no more silent-hang-on-failed-post), which would otherwise starve
+    // OTHER, still-alive brokers' items queued in the SAME window behind a dead broker's item.
+    // Retry loop: after an abort, drop items whose broker just got marked dead (their payload is
+    // now permanently unrecoverable — counted below) and re-run the pipeline on whatever's left,
+    // bounded at num_brokers+1 attempts (at most one NEW broker can die per attempt).
     std::vector<size_t> committed;  // indices into `work` that read their Blog payload successfully
     committed.reserve(valid_idx.size());
-    pipelined_ops(
+    std::vector<size_t> pending = valid_idx;
+    for (int attempt = 0; attempt <= num_brokers && !pending.empty(); ++attempt) {
+      const size_t committed_before = committed.size();
+      bool ok = pipelined_ops(
 #if BLOG_PLACEMENT_DRAM
-        &blog_qps[0],  // all blog_qps share one CQ (blog_shared_cq) — any element's .cq works
+          &blog_qps[0],  // all blog_qps share one CQ (blog_shared_cq) — any element's .cq works
 #else
-        &meta_qp,
+          &meta_qp,
 #endif
-        valid_idx.size(),
-        [&](size_t j) {
-          const WorkItem& w = work[valid_idx[j]];
-          const uint32_t len = static_cast<uint32_t>(std::min<uint64_t>(w.total_size, kMaxPayload));
-          uint8_t* laddr = payload_buf.data() + (j % kWindow) * kMaxPayload;
+          pending.size(),
+          [&](size_t j) -> bool {
+            const WorkItem& w = work[pending[j]];
+            const uint32_t len = static_cast<uint32_t>(std::min<uint64_t>(w.total_size, kMaxPayload));
+            uint8_t* laddr = payload_buf.data() + (j % kWindow) * kMaxPayload;
 #if BLOG_PLACEMENT_DRAM
-          PostRead(&blog_qps[w.broker], laddr, payload_buf_mr.lkey(),
-                   blog_regions[w.broker].addr + w.log_idx, blog_regions[w.broker].rkey, len,
-                   /*wr_id=*/j);
+            if (broker_dead[w.broker]) return false;
+            bool posted = PostRead(&blog_qps[w.broker], laddr, payload_buf_mr.lkey(),
+                                   blog_regions[w.broker].addr + w.log_idx, blog_regions[w.broker].rkey,
+                                   len, /*wr_id=*/j);
+            if (!posted && !broker_dead[w.broker]) {
+              // Defensive fallback only — a LOCAL post_send() failure (e.g. this QP already in
+              // the error state from an earlier bad completion THIS window, so ibv_post_send
+              // itself rejects it) can still land here. The REAL fast path for a dead PEER is the
+              // on_error(qp_num) hook below, fired from a bad completion status, not from post
+              // failing (post_send succeeds locally regardless of whether the peer is alive).
+              broker_dead[w.broker] = true;
+              broker_dead_detect_ts[w.broker] = NowNsLocal();
+              broker_dead_via[w.broker] = "rdma_error";
+              fprintf(stderr, "[sequencer] broker %d declared dead via RDMA_ERROR (kPeerDown) at t=%.3fs\n",
+                      w.broker, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
+            }
+            return posted;
 #else
-          const uint64_t blog_base = remote.blog.addr +
-              static_cast<uint64_t>(w.broker) * remote.blog_bytes_per_broker;
-          PostRead(&meta_qp, laddr, payload_buf_mr.lkey(),
-                   blog_base + (w.log_idx % remote.blog_bytes_per_broker), remote.blog.rkey, len,
-                   /*wr_id=*/j);
+            const uint64_t blog_base = remote.blog.addr +
+                static_cast<uint64_t>(w.broker) * remote.blog_bytes_per_broker;
+            return PostRead(&meta_qp, laddr, payload_buf_mr.lkey(),
+                            blog_base + (w.log_idx % remote.blog_bytes_per_broker), remote.blog.rkey, len,
+                            /*wr_id=*/j);
 #endif
-        },
-        [&](size_t j) {
-          const WorkItem& w = work[valid_idx[j]];
-          blog_bytes_read += w.total_size;
-          ++batches;
-          cv_dirty_since_flush[w.broker] = w.seq + 1;
-          detect_to_commit.Add(NowNsLocal() - poll_ts);
-          committed.push_back(valid_idx[j]);
-        });
+          },
+          [&](size_t j) {
+            const WorkItem& w = work[pending[j]];
+            blog_bytes_read += w.total_size;
+            ++batches;
+#if BLOG_PLACEMENT_DRAM
+            last_alive_ts[w.broker] = NowNsLocal();  // renew the lease — this read IS the heartbeat
+#endif
+            // [[BUG FOUND]] was `cv_dirty_since_flush[w.broker] = w.seq + 1;` (last-writer wins).
+            // Harmless under normal single-QP-per-broker completion ordering, but not defensively
+            // correct once a retry pass (above) can re-attempt items out of their original window
+            // order — take the max so a late-arriving lower seq can never regress a broker's
+            // already-recorded ack_offset.
+            if (cv_dirty_since_flush[w.broker] == kPublishUncommitted ||
+                w.seq + 1 > cv_dirty_since_flush[w.broker]) {
+              cv_dirty_since_flush[w.broker] = w.seq + 1;
+            }
+            committed.push_back(pending[j]);
+          }
+#if BLOG_PLACEMENT_DRAM
+          ,
+          [&](uint32_t qp_num) {
+            // THE actual fast path: a completion for this QP came back with a bad status (RC
+            // retry/timeout exhaustion against a dead peer, or a flush error for anything queued
+            // after the QP already entered the error state). Map qp_num back to broker_id and
+            // declare it dead here — this is what kPeerDown detection really looks like, not a
+            // failed post_send (see the bug note on pipelined_ops above).
+            auto it = qpnum_to_broker.find(qp_num);
+            if (it == qpnum_to_broker.end()) return;
+            int b = it->second;
+            if (broker_dead[b]) return;
+            broker_dead[b] = true;
+            broker_dead_detect_ts[b] = NowNsLocal();
+            broker_dead_via[b] = "rdma_error";
+            fprintf(stderr, "[sequencer] broker %d declared dead via RDMA_ERROR (kPeerDown) at t=%.3fs\n",
+                    b, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
+          }
+#else
+          ,
+          [](uint32_t) {}  // meta_qp targets c3, never killed in Phase 2
+#endif
+          );
+      if (ok) { pending.clear(); break; }
+      std::vector<size_t> committed_this_attempt(committed.begin() + committed_before, committed.end());
+      std::vector<size_t> next_pending;
+      next_pending.reserve(pending.size());
+      for (size_t idx : pending) {
+        if (std::find(committed_this_attempt.begin(), committed_this_attempt.end(), idx) !=
+            committed_this_attempt.end()) {
+          continue;  // completed this attempt
+        }
+        const WorkItem& w = work[idx];
+        if (broker_dead[w.broker]) {
+          unrecoverable_bytes += w.total_size;  // that broker's DRAM Blog is gone; this batch's
+                                                 // payload is lost forever (header was committed,
+                                                 // sentinel proves it, but the bytes are unreachable)
+          continue;
+        }
+        next_pending.push_back(idx);  // still-alive broker, just not reached yet this attempt
+      }
+      pending = std::move(next_pending);
+    }
+    for (size_t idx : pending) unrecoverable_bytes += work[idx].total_size;  // exhausted retries
     if (committed.empty()) continue;
+
+    // [[BUG FOUND]] `committed` is populated in on_complete's ARRIVAL order, which is completion
+    // order, not post order — for W5-A those are the SAME per-broker (RC preserves per-QP
+    // completion order) but can DIFFER ACROSS brokers sharing one CQ (a fast/local broker's read
+    // can complete before a slower/farther broker's read that was posted earlier), and the retry
+    // loop above appends recovered items even later. GOI's total_order must reflect a canonical,
+    // reproducible order, not real-time network arrival — sort back into `work`-index order
+    // (== valid_idx's original broker-then-seq order) before assigning committed_seq below.
+    std::sort(committed.begin(), committed.end());
 
     // Step 4b: SEPARATE pipelined pass for the GOI writes (one per committed batch — GOI is
     // inherently a per-record log, unlike CV/ControlBlock below). Runs after Step 4 fully drains,
@@ -346,10 +547,11 @@ int main(int argc, char** argv) {
           g.total_size = w.total_size;
           const uint64_t goi_addr = remote.goi.addr +
               (committed_seq % static_cast<uint64_t>(remote.goi_entries)) * sizeof(GoiEntryMirror);
-          PostWrite(&meta_qp, &g, goi_buf_mr.lkey(), goi_addr, remote.goi.rkey,
-                    sizeof(GoiEntryMirror), /*wr_id=*/k);
+          return PostWrite(&meta_qp, &g, goi_buf_mr.lkey(), goi_addr, remote.goi.rkey,
+                           sizeof(GoiEntryMirror), /*wr_id=*/k);
         },
-        [&](size_t /*k*/) {});
+        [&](size_t /*k*/) {},
+        [](uint32_t) {});  // meta_qp targets c3, never killed in Phase 2
 
     // Step 5: CV + ControlBlock — ONCE per broker (CV) / once total (ControlBlock) per poll
     // cycle with the LATEST value, not once per batch. This matches the real system's per-epoch
@@ -387,18 +589,40 @@ int main(int argc, char** argv) {
         drained += n;
       }
     }
+
+    // [[BUG FOUND]] `detect_to_commit` used to be sampled at Step 4's blog-read completion, before
+    // the GOI write (Step 4b) and the CV/ControlBlock write (Step 5) even happen — understating
+    // true detect-to-COMMIT latency by excluding the two writes that actually make a batch visible
+    // to a real consumer. Sample here, after the CV/CB write is confirmed landed, for every item
+    // this poll cycle actually committed (all share this poll's poll_ts and this now-confirmed
+    // commit instant — coarser than per-item, but no longer systematically too fast).
+    {
+      const uint64_t commit_ts = NowNsLocal();
+      for (size_t i = 0; i < committed.size(); ++i) detect_to_commit.Add(commit_ts - poll_ts);
+    }
   }
 
   double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
   fprintf(stderr,
           "[sequencer] RESULT batches=%lu blog_bytes=%lu secs=%.3f throughput=%.3f Mmsg/s "
-          "%.3f Gb/s sentinel_polls=%lu poll_rate=%.1f/s stale_misses=%lu "
+          "%.3f Gb/s sentinel_polls=%lu poll_rate=%.1f/s stale_misses=%lu unrecoverable_bytes=%lu "
           "detect_to_commit_p50_us=%.1f p99_us=%.1f p999_us=%.1f\n",
           (unsigned long)batches, (unsigned long)blog_bytes_read, secs, batches / secs / 1e6,
           (blog_bytes_read * 8.0) / secs / 1e9, (unsigned long)sentinel_polls,
-          sentinel_polls / secs, (unsigned long)stale_misses,
+          sentinel_polls / secs, (unsigned long)stale_misses, (unsigned long)unrecoverable_bytes,
           detect_to_commit.Pct(0.50) / 1e3, detect_to_commit.Pct(0.99) / 1e3,
           detect_to_commit.Pct(0.999) / 1e3);
+#if BLOG_PLACEMENT_DRAM
+  for (int b = 0; b < num_brokers; ++b) {
+    if (!broker_dead[b]) continue;
+    fprintf(stderr,
+            "[sequencer] BROKER_DEAD broker=%d via=%s detect_t=%.3fs\n", b,
+            broker_dead_via[b].c_str(),
+            (broker_dead_detect_ts[b] - static_cast<uint64_t>(
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     t_start.time_since_epoch()).count())) / 1e9);
+  }
+#endif
 
   DeregisterMr(&sentinel_local_mr); DeregisterMr(&header_buf_mr); DeregisterMr(&payload_buf_mr);
   DeregisterMr(&cb_local_mr); DeregisterMr(&cv_buf_mr); DeregisterMr(&goi_buf_mr);

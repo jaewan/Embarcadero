@@ -1,0 +1,5 @@
+[2026-07-07T22:29:52Z] trial 2: launched, memserver(c3)=2454178 broker0(moscxl)=2454180 seq(moscxl)=2454185
+[2026-07-07T22:30:02Z] trial 2: KILLED broker0 pid=2454180 (host kill via kill -9; anonymous private DRAM Blog -- process death makes those bytes genuinely unrecoverable, no shared/file-backed substrate to recover from; kernel atomically tears down its QPs/MRs too, so the sequencer's next op gets a real completion-level failure, not a soft timeout)
+[sequencer] broker 0 declared dead via LEASE_TIMEOUT at t=10.479s
+recovery_rc=0
+[2026-07-07T22:30:48Z] trial 2: all processes exited

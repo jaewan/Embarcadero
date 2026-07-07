@@ -1,0 +1,2 @@
+[token-client] mode=latency num_qps=1 num_threads=1 inflight=16 num_counters=1 duration=5s
+[token-client] RESULT mode=latency ops=1529873 secs=5.044 rate=303306.1/s rtt_p50_us=3.21 p99_us=3.43 p999_us=3.85

@@ -1,0 +1,3 @@
+[sequencer] placement=MEMSERVER(W5-B) num_brokers=8 duration=10s
+[sequencer] connected to memserver qpn=186 host_blog=1
+[sequencer] RESULT batches=5085201 blog_bytes=20828983296 secs=10.000 throughput=0.509 Mmsg/s 16.663 Gb/s sentinel_polls=806800 poll_rate=80680.0/s stale_misses=2216070 detect_to_commit_p50_us=73596.5 p99_us=104427.3 p999_us=118674.2

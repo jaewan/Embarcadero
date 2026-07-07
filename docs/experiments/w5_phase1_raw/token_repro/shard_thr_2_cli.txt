@@ -1,0 +1,2 @@
+[token-client] mode=throughput num_qps=16 num_threads=8 inflight=16 num_counters=16 duration=5s
+[token-client] RESULT mode=throughput num_qps=16 num_threads=8 inflight=16 ops=146504237 secs=5.000 rate=29.299 Mtok/s

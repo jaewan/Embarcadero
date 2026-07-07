@@ -66,7 +66,15 @@ memserver duration=10s. 7 offered-load points (10/20/40/60/80/100/120% of the ~9
 `ib_write_bw -q N` reference measured in Phase 0), 3 trials each, `flock`-serialized against the
 shared testbed.
 
-Two **independent** signals were recorded per run, per the seven-facts protocol:
+Two **independent** signals were recorded per run. All seven per-run facts (host↔host QP count,
+CQ depth, MR sizes, NIC port count, RoCEv2 CC config, hugepage/NUMA placement, exact
+`activity.log` line) are defined and populated for this sweep in
+[`w5_phase1_raw/README.md`](w5_phase1_raw/README.md) — including two disclosed gaps (CC config
+has no RoCE priority isolation yet; NUMA placement was not controlled and the NIC's own NUMA node
+has zero hugepages reserved on this host) that the Phase 3 prerequisites below exist to close.
+The full raw per-trial logs (231 files, ~1 MB) and a parsed `summary.csv` are in
+[`w5_phase1_raw/funnel_sweep/`](w5_phase1_raw/funnel_sweep/); the reviewer-D token measurement's
+raw logs are in [`w5_phase1_raw/token_repro/`](w5_phase1_raw/token_repro/).
 
 ### Signal A — broker-side aggregate write bandwidth (NIC-bound funnel metric)
 
