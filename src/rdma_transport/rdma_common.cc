@@ -141,6 +141,7 @@ QpEndpoint LocalEndpoint(const RcQp& q) {
   e.psn = q.local_psn;
   e.gid = q.dev->gid;
   e.lid = q.dev->port_attr.lid;  // 0 on RoCE
+  e.mtu = static_cast<uint8_t>(q.dev->port_attr.active_mtu);
   return e;
 }
 
@@ -148,7 +149,17 @@ bool ConnectRcQp(RcQp* q, const QpEndpoint& remote) {
   // INIT -> RTR
   ibv_qp_attr a{};
   a.qp_state = IBV_QPS_RTR;
+  // Negotiate path MTU to min(local active, remote active) — see QpEndpoint::mtu. Setting the
+  // local active MTU unilaterally (the previous behavior) is only correct while both ports
+  // happen to agree; on divergence the responder NAKs multi-packet WRITEs with REM_INV_REQ.
   a.path_mtu = q->dev->port_attr.active_mtu;
+  if (remote.mtu != 0 && static_cast<ibv_mtu>(remote.mtu) < a.path_mtu) {
+    a.path_mtu = static_cast<ibv_mtu>(remote.mtu);
+  }
+  if (remote.mtu != 0 && static_cast<ibv_mtu>(remote.mtu) != q->dev->port_attr.active_mtu) {
+    fprintf(stderr, "[rdma] path_mtu negotiated to %d (local active=%d, remote active=%d)\n",
+            a.path_mtu, q->dev->port_attr.active_mtu, remote.mtu);
+  }
   a.dest_qp_num = remote.qpn;
   a.rq_psn = remote.psn;
   a.max_dest_rd_atomic = 16;
@@ -239,7 +250,16 @@ int PollCq(ibv_cq* cq, ibv_wc* wc, int max, int* bad_status) {
     if (n < 0) { if (bad_status) *bad_status = -1; return -1; }
     if (n == 0) continue;
     for (int i = 0; i < n; ++i)
-      if (wc[i].status != IBV_WC_SUCCESS) { if (bad_status) *bad_status = wc[i].status; return -1; }
+      if (wc[i].status != IBV_WC_SUCCESS) {
+        // Self-documenting failure: WC9 (REM_INV_REQ) here has been environment-sensitive
+        // (path-MTU divergence class); capture everything needed to diagnose a one-off.
+        fprintf(stderr,
+                "[rdma] WC error: status=%d(%s) opcode=%d wr_id=%llu vendor_err=0x%x qp_num=%u\n",
+                wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].opcode,
+                static_cast<unsigned long long>(wc[i].wr_id), wc[i].vendor_err, wc[i].qp_num);
+        if (bad_status) *bad_status = wc[i].status;
+        return -1;
+      }
     return n;
   }
 }

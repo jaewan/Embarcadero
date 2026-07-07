@@ -50,3 +50,44 @@ Since stock write works but ours fails with the WR construction verified, the de
   atomic paths — the reviewer-D naive-token repro — already work); blocks the WRITE-based W5 path.
 - **Lesson:** static root-cause over-concluded "not a code bug"; a 2-minute `ib_write_bw` control
   flipped it. For hardware/verbs bugs, run the stock-tool control early.
+
+## Fix (2026-07-07, branch `rdma-write-fix`)
+
+**Reproduction status first (honesty):** with byte-identical binaries/params/GIDs to the failing
+run, `--op=write` now PASSES at both 4 KiB (46.0 Gb/s) and 64 KiB (53.7 Gb/s ≈ the 54 Gb/s
+`ib_write_bw` fabric reference). The original WC9 is **environment-sensitive and was not
+reproducible today**. The debug therefore pivoted to the brief's lead #3 (delta vs stock) and
+closed the mechanisms that fit the evidence.
+
+**Root cause (latent defect, closed):** `ConnectRcQp` set `path_mtu =` **each side's own**
+`active_mtu` with **no negotiation** (`rdma_common.cc`, RTR block). Stock perftest negotiates
+`min(local, remote)` — the one setup-path delta vs `ib_write_bw`. Under an active-MTU divergence
+between the two ports (the fabric MTU config is runtime/non-persistent, and the GID-index drift
+5→3 on c1 proves link events occurred in the failure window), the requester segments WRITEs at a
+PMTU the responder's strict inbound FIRST/MIDDLE length check rejects → `IBV_WC_REM_INV_REQ_ERR`
+on the first write — while READ (requester-side response check is laxer) and single-packet
+atomics keep passing. That asymmetric pass/fail pattern is exactly the observed symptom.
+
+**Changes:**
+1. `rdma_common.h/.cc` — `QpEndpoint` now carries `mtu` (active MTU enum, exchanged OOB);
+   `ConnectRcQp` sets `path_mtu = min(local active, remote active)` and logs when it clamps.
+   `mtu==0` (legacy peer) falls back to the old behavior. NOTE: `QpEndpoint` is a raw OOB wire
+   struct — rebuild both ends together.
+2. `rdma_bench_main.cc` — H1 defensive bounds guard: `--size` of 0 or > the peer's advertised
+   `region.len` fails fast with the actual numbers instead of a cryptic WC9.
+3. `rdma_common.cc PollCq` — WC errors now print status string, opcode, wr_id, vendor_err, and
+   qp_num, so any future one-off self-documents.
+
+**Verification (moscxl server ↔ c1 client, RoCEv2 gid auto-scan, both ends rebuilt):**
+| Case | Result |
+|---|---|
+| write 4 KiB | PASS — 1.40 Mops/s, **46.01 Gb/s** |
+| write 64 KiB | PASS — **53.65 Gb/s** (fabric ceiling ~54 Gb/s per ib_write_bw) |
+| read 64 KiB (regression) | PASS — 56.18 Gb/s |
+| fetchadd (regression) | PASS — 1.99 Mops/s |
+| guard: size 64 KiB > server region 4 KiB | clean error, rc=1 (no WC9) |
+
+**Residual:** the exact environmental trigger of 2026-07-06 was not captured live (it predates
+the enriched WC logging). If WC9 recurs, the new diagnostics + negotiated PMTU log line will
+pin it in one run. Recommend also making the fabric MTU/GID config persistent per
+`sessions/rdma_fabric_setup.md` "Make it durable".

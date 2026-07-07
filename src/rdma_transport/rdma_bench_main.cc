@@ -85,6 +85,13 @@ int main(int argc, char** argv) {
 
   // ---- client: pipeline `inflight` one-sided ops for `secs`, measure rate/bandwidth ----
   if (op == "fetchadd" && inflight > 16) inflight = 16;  // RC atomic outstanding cap
+  // H1 bounds guard: an op larger than the peer's advertised region is a guaranteed
+  // REM_INV_REQ with a cryptic WC — fail fast with the actual numbers instead.
+  if (op != "fetchadd" && (size == 0 || size > remote.region.len)) {
+    fprintf(stderr, "[client] --size=%u out of bounds for remote region len=%u (server --bytes)\n",
+            size, remote.region.len);
+    return 1;
+  }
   uint64_t raddr = remote.region.addr;
   uint32_t rkey = remote.region.rkey;
   auto post = [&](uint64_t wr_id) -> bool {

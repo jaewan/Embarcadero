@@ -74,10 +74,17 @@ struct QpEndpoint {
   uint32_t psn = 0;
   ibv_gid  gid{};
   uint16_t lid = 0;   // 0 for RoCE
+  // Port active MTU (ibv_mtu enum) at endpoint creation. Exchanged so BOTH sides can set
+  // path_mtu = min(local, remote), like stock perftest. Without negotiation, an active-MTU
+  // divergence between the two ports (the fabric MTU config is runtime/non-persistent) makes
+  // the requester segment WRITEs at a PMTU the responder rejects -> IBV_WC_REM_INV_REQ_ERR on
+  // the first write, while READ (requester-side response check is laxer) and single-packet
+  // atomics keep passing. 0 = legacy peer (field absent): fall back to the local active MTU.
+  uint8_t  mtu = 0;
 };
 QpEndpoint LocalEndpoint(const RcQp& q);
 
-// Drive INIT->RTR->RTS against a remote endpoint. `mtu` defaults to the port's active MTU.
+// Drive INIT->RTR->RTS against a remote endpoint. path_mtu = min(local active, remote.mtu).
 bool ConnectRcQp(RcQp* q, const QpEndpoint& remote);
 
 // ---- one-sided ops (post + poll a single completion) ---------------------------------------------
