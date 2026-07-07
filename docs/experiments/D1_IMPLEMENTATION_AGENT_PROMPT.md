@@ -130,6 +130,8 @@ static_assert(sizeof(SessionEntry) == 64, "one TLP-atomic cache line");
 
 > **DO NOT start F code/e2e until Track-02's TLA+ Scenarios A & B are finalized AND passing (see §5). "TLA+ first, code second."** Verify the spec passes first (`bash spec/run_all.sh`), then land the code.
 
+> **F/G BOUNDARY (clarified 2026-07-07):** F implements the proto *definitions* + the *server-side* consumers (reconnect HWM, ACK-relay epoch guard, D4 spatial guard, R1 recovery). The **client-side `SessionOpen`→`SessionOpenAck` handshake** (client opens a session, receives its assigned epoch, sets `session_epoch_`) is **Commit G** (client library), where it pairs with G's `SessionFenced`→resubmit logic. For F, drive nonzero epochs through the pipeline via **`EMBARCADERO_SESSION_EPOCH`** as the test vehicle — this is sufficient and correct for F; G wires the real handshake. **The live end-to-end fence-fire test IS required in F** and is enabled by this env epoch (do not defer it again).
+
 **Files:** new `src/protobuf/session.proto`; `network_manager.cc`; `topic.cc`.
 **Changes (spec §4.3, §6.3, §6.4, §11 R-C/R-D/R-F/R-G):**
 - (a) `session.proto` (additive+versioned): `SessionOpen`, `SessionOpenAck{committed_hwm,status,assigned_session_epoch}`, `SessionFenced{client_id,session_epoch,committed_batch_seq(field 3, AUTHORITATIVE resubmit key),committed_msg_hwm(field 4, DIAGNOSTIC ONLY),control_epoch,reason}`; `reason {HOLD_EXPIRY=1, EPOCH_STALE=2, LEASE_LOST=3, DUP_PAST_EXPECTED=4}`. **`committed_msg_hwm` is NEVER a batch_seq / release axis.**
