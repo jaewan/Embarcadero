@@ -61,11 +61,17 @@ struct RcQp {
   ibv_qp* qp = nullptr;
   uint32_t local_psn = 0;
   DeviceCtx* dev = nullptr;
+  bool owns_cq = true;  // false for CreateRcQpOnSharedCq — DestroyRcQp then leaves `cq` alone
   bool ok() const { return cq && qp; }
 };
 // Create a CQ (depth `cqe`) and an RC QP (send/recv depth `max_wr`). PSN is derived from `psn_seed`
 // (workflows/tests pass an index; no RNG so runs are reproducible).
 bool CreateRcQp(DeviceCtx* dev, int cqe, int max_wr, uint32_t psn_seed, RcQp* out);
+// Like CreateRcQp, but binds the new QP to an EXISTING CQ instead of creating one. Lets a single
+// poll loop watch completions from many QPs at once (e.g. one per remote broker) — needed
+// whenever a pipelined poller must treat several one-sided-target QPs as one completion stream.
+// DestroyRcQp will NOT destroy a shared CQ; the caller owns its lifetime.
+bool CreateRcQpOnSharedCq(DeviceCtx* dev, ibv_cq* shared_cq, int max_wr, uint32_t psn_seed, RcQp* out);
 void DestroyRcQp(RcQp* q);
 
 // Endpoint info exchanged out-of-band to connect two QPs.

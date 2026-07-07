@@ -99,10 +99,9 @@ bool RegisterMr(ibv_pd* pd, void* buf, size_t len, Mr* out) {
 void DeregisterMr(Mr* m) { if (m && m->mr) { ibv_dereg_mr(m->mr); *m = Mr{}; } }
 
 // ---- QP ------------------------------------------------------------------------------------------
-bool CreateRcQp(DeviceCtx* dev, int cqe, int max_wr, uint32_t psn_seed, RcQp* out) {
+static bool CreateRcQpCommon(DeviceCtx* dev, ibv_cq* cq, int max_wr, uint32_t psn_seed, RcQp* out) {
   out->dev = dev;
-  out->cq = ibv_create_cq(dev->ctx, cqe, nullptr, nullptr, 0);
-  if (!out->cq) { LogFail("ibv_create_cq", __FILE__, __LINE__); return false; }
+  out->cq = cq;
   ibv_qp_init_attr ia{};
   ia.send_cq = out->cq;
   ia.recv_cq = out->cq;
@@ -128,10 +127,24 @@ bool CreateRcQp(DeviceCtx* dev, int cqe, int max_wr, uint32_t psn_seed, RcQp* ou
   }
   return true;
 }
+
+bool CreateRcQp(DeviceCtx* dev, int cqe, int max_wr, uint32_t psn_seed, RcQp* out) {
+  ibv_cq* cq = ibv_create_cq(dev->ctx, cqe, nullptr, nullptr, 0);
+  if (!cq) { LogFail("ibv_create_cq", __FILE__, __LINE__); return false; }
+  out->owns_cq = true;
+  if (!CreateRcQpCommon(dev, cq, max_wr, psn_seed, out)) { ibv_destroy_cq(cq); return false; }
+  return true;
+}
+
+bool CreateRcQpOnSharedCq(DeviceCtx* dev, ibv_cq* shared_cq, int max_wr, uint32_t psn_seed, RcQp* out) {
+  out->owns_cq = false;
+  return CreateRcQpCommon(dev, shared_cq, max_wr, psn_seed, out);
+}
+
 void DestroyRcQp(RcQp* q) {
   if (!q) return;
   if (q->qp) ibv_destroy_qp(q->qp);
-  if (q->cq) ibv_destroy_cq(q->cq);
+  if (q->cq && q->owns_cq) ibv_destroy_cq(q->cq);
   *q = RcQp{};
 }
 
