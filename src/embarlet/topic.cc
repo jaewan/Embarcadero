@@ -93,6 +93,9 @@ static inline uint64_t MakeClientBrokerStreamKey(size_t client_id, int broker_id
 	       static_cast<uint16_t>(broker_id & 0xFFFF);
 }
 
+static constexpr uint64_t kSessionEntryFlagFenced = 1ULL << 0;
+static constexpr uint64_t kSessionEntryFlagActive = 1ULL << 1;
+
 static inline bool UsesTrueClientChainOrdering(int order) {
 	return order == kOrderStrong;
 }
@@ -222,6 +225,50 @@ void Topic::RecordOrder5FlightEvent(
 	slot.d = d;
 }
 
+SessionEntry* Topic::FindOrCreateSessionEntry(uint64_t session_key) {
+	if (session_key == 0 || session_table_ == nullptr) return nullptr;
+	const size_t start = static_cast<size_t>(Mix64(session_key) % kMaxSessions);
+	for (size_t probe = 0; probe < kMaxSessions; ++probe) {
+		SessionEntry* entry = &session_table_[(start + probe) % kMaxSessions];
+		uint64_t observed = entry->session_key.load(std::memory_order_acquire);
+		if (observed == session_key) {
+			return entry;
+		}
+		if (observed == 0) {
+			uint64_t expected = 0;
+			if (entry->session_key.compare_exchange_strong(
+					expected, session_key, std::memory_order_acq_rel, std::memory_order_acquire) ||
+					expected == session_key) {
+				return entry;
+			}
+		}
+	}
+	LOG(ERROR) << "SessionEntry table full for topic=" << topic_name_
+	           << " session_key=" << session_key;
+	return nullptr;
+}
+
+void Topic::PublishSessionEntry(uint64_t session_key, const SessionPublishSnapshot& snapshot) {
+	if (snapshot.session_epoch == 0) return;
+	SessionEntry* entry = FindOrCreateSessionEntry(session_key);
+	if (entry == nullptr) return;
+
+	entry->expected_seq.store(snapshot.expected_seq, std::memory_order_relaxed);
+	entry->committed_hwm.store(snapshot.committed_hwm, std::memory_order_relaxed);
+	entry->highest_sequenced.store(snapshot.highest_sequenced, std::memory_order_relaxed);
+	CXL::store_fence();
+	CXL::flush_cacheline(entry);
+	CXL::store_fence();
+
+	const uint64_t flags = kSessionEntryFlagActive |
+		(snapshot.fenced ? kSessionEntryFlagFenced : 0);
+	const uint64_t state_word = (static_cast<uint64_t>(snapshot.session_epoch) << 32) | flags;
+	entry->state_word.store(state_word, std::memory_order_release);
+	CXL::store_fence();
+	CXL::flush_cacheline(&entry->state_word);
+	CXL::store_fence();
+}
+
 void Topic::DumpOrder5FlightRecorder(const char* reason) {
 	if (!ShouldCaptureOrder5Flight(order_, broker_id_)) return;
 	if (order5_flight_dumped_.test_and_set(std::memory_order_acq_rel)) return;
@@ -264,6 +311,7 @@ Topic::Topic(
 		int order,
 		SequencerType seq_type,
 		void* cxl_addr,
+		SessionEntry* session_table,
 		void* segment_metadata):
 	get_new_segment_callback_(get_new_segment),
 	get_num_brokers_callback_(get_num_brokers_callback),
@@ -275,6 +323,7 @@ Topic::Topic(
 	order_(order),
 	seq_type_(seq_type),
 	cxl_addr_(cxl_addr),
+	session_table_(session_table),
 	logical_offset_(0),
 	written_logical_offset_((size_t)-1),
 	num_slots_(BATCHHEADERS_SIZE / sizeof(BatchHeader)),
@@ -4189,6 +4238,7 @@ void Topic::CommitEpoch(
 				entry->client_seq = m.batch_seq;
 				entry->pbr_index = m.pbr_absolute_index;
 				entry->cumulative_message_count = cumulative_msg_count;
+				entry->session_epoch = m.session_epoch;
 				// Publish GOI index last so readers never treat a partially-written entry as valid.
 				entry->global_seq = batch_index;
 				next_order += m.num_msg;
@@ -4212,6 +4262,7 @@ void Topic::CommitEpoch(
 				entry->client_seq = p.hdr->batch_seq;
 				entry->pbr_index = p.cached_pbr_absolute_index;
 				entry->cumulative_message_count = cumulative_msg_count;
+				entry->session_epoch = p.session_epoch;
 				// Publish GOI index last so readers never treat a partially-written entry as valid.
 				entry->global_seq = batch_index;
 				next_order += p.num_msg;
@@ -4321,6 +4372,16 @@ void Topic::CommitEpoch(
 	std::array<bool, NUM_MAX_BROKERS> ordered_broker_seen{};
 	// Per-client delta accumulated here; flushed to per_client_ordered_ after [PHASE-4].
 	absl::flat_hash_map<uint32_t, uint64_t> per_client_delta_epoch;
+	absl::flat_hash_map<uint64_t, SessionPublishSnapshot> session_publish_epoch;
+	auto record_session_publish = [&](size_t client_id, uint32_t session_epoch, uint64_t batch_seq) {
+		if (session_epoch == 0) return;
+		const uint64_t session_key = MakeSessionKey(client_id, session_epoch);
+		SessionPublishSnapshot& snapshot = session_publish_epoch[session_key];
+		snapshot.session_epoch = session_epoch;
+		snapshot.expected_seq = std::max(snapshot.expected_seq, batch_seq + 1);
+		snapshot.committed_hwm = std::max(snapshot.committed_hwm, batch_seq);
+		snapshot.highest_sequenced = std::max(snapshot.highest_sequenced, batch_seq);
+	};
 
 	for (PendingBatch5& p : ready) {
 		if (p.skipped || p.is_held_marker) continue;
@@ -4345,6 +4406,7 @@ void Topic::CommitEpoch(
 		last_ordered_offset[b] = m.log_idx;
 		ordered_broker_seen[b] = true;
 		per_client_delta_epoch[static_cast<uint32_t>(m.client_id)] += m.num_msg;
+		record_session_publish(m.client_id, m.session_epoch, m.batch_seq);
 		{
 			OrderedHoldExportEntry ex;
 				ex.log_idx = m.log_idx;
@@ -4406,6 +4468,7 @@ void Topic::CommitEpoch(
 		last_ordered_offset[b] = static_cast<size_t>(reinterpret_cast<uint8_t*>(p.hdr) - reinterpret_cast<uint8_t*>(cxl_addr_));
 		ordered_broker_seen[b] = true;
 		per_client_delta_epoch[static_cast<uint32_t>(p.client_id)] += p.num_msg;
+		record_session_publish(p.client_id, p.session_epoch, p.batch_seq);
 		{
 			OrderedHoldExportEntry ex;
 			ex.log_idx = p.cached_log_idx;
@@ -4458,6 +4521,9 @@ void Topic::CommitEpoch(
 		for (auto& [cid, cnt] : per_client_delta_epoch) {
 			per_client_ordered_[cid] += cnt;
 		}
+	}
+	for (const auto& [session_key, snapshot] : session_publish_epoch) {
+		PublishSessionEntry(session_key, snapshot);
 	}
 	if (ShouldEnableFrontierTrace() && order_ == 5) {
 		static thread_local uint64_t last_frontier_log_ns = 0;
@@ -6479,6 +6545,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 					skip_marker.num_msg = 0;
 					skip_marker.client_id = current_batch_header->client_id;
 					skip_marker.batch_seq = current_batch_header->batch_seq;
+					skip_marker.session_epoch = static_cast<uint32_t>(current_batch_header->session_epoch);
 					skip_marker.slot_offset = slot_offset;
 					skip_marker.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
 					skip_marker.cached_batch_id = current_batch_header->batch_id;
@@ -6562,6 +6629,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	pending.num_msg = num_msg_check;
 	pending.client_id = current_batch_header->client_id;
 	pending.batch_seq = current_batch_header->batch_seq;
+	pending.session_epoch = static_cast<uint32_t>(current_batch_header->session_epoch);
 	pending.slot_offset = slot_offset;
 	pending.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
 	// [PHASE-5] Cache metadata while in L1 (just invalidated both cache lines above)
@@ -6794,6 +6862,7 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			pending.num_msg = num_msg_check;
 			pending.client_id = current_batch_header->client_id;
 			pending.batch_seq = current_batch_header->batch_seq;
+			pending.session_epoch = static_cast<uint32_t>(current_batch_header->session_epoch);
 			pending.slot_offset = slot_offset;
 			pending.epoch_created = static_cast<uint16_t>(current_batch_header->epoch_created);
 			pending.cached_log_idx = current_batch_header->log_idx;

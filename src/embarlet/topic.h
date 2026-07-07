@@ -279,7 +279,7 @@ class Topic {
 				void* TInode_addr, TInode* replica_tinode,
 				const char* topic_name, int broker_id, int order,
 				heartbeat_system::SequencerType seq_type,
-				void* cxl_addr, void* segment_metadata);
+				void* cxl_addr, SessionEntry* session_table, void* segment_metadata);
 
 		/**
 		 * Start the topic's threads after construction is complete.
@@ -517,6 +517,15 @@ class Topic {
 		void FlushAccumulatedCV(
 			const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
 			const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
+		struct SessionPublishSnapshot {
+			uint32_t session_epoch{0};
+			uint64_t expected_seq{0};
+			uint64_t committed_hwm{0};
+			uint64_t highest_sequenced{0};
+			bool fenced{false};
+		};
+		SessionEntry* FindOrCreateSessionEntry(uint64_t session_key);
+		void PublishSessionEntry(uint64_t session_key, const SessionPublishSnapshot& snapshot);
 		void EnqueueCompletedRange(uint64_t start, uint64_t end);
 		void CommittedSeqUpdaterThread();
 		void ResetCompletedRangeQueue();
@@ -655,6 +664,7 @@ class Topic {
 		heartbeat_system::SequencerType seq_type_;
 		/** Raw CXL base (ControlBlock at offset 0). Same as CXLManager::GetCXLAddr(); Topic receives this from TopicManager. */
 		void* cxl_addr_;
+		SessionEntry* session_table_;
 
 		// Replication
 		std::unique_ptr<Corfu::CorfuReplicationClient> corfu_replication_client_;

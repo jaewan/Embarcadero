@@ -243,6 +243,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		void* cxl_addr = cxl_manager_.GetCXLAddr();
 		void* segment_metadata = nullptr;
 		void* batch_headers_region = nullptr;
+		SessionEntry* session_table = cxl_manager_.GetSessionTable(topic);
 
 		segment_metadata = cxl_manager_.GetNewSegment();
 		batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
@@ -254,6 +255,10 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 		}
 		if (!batch_headers_region) {
 			LOG(ERROR) << "Failed to allocate batch headers for topic: " << topic;
+			return nullptr;
+		}
+		if (!session_table) {
+			LOG(ERROR) << "Failed to resolve session table for topic: " << topic;
 			return nullptr;
 		}
 
@@ -295,6 +300,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 				tinode->order,
 				tinode->seq_type,
 				cxl_addr,
+				session_table,
 				segment_metadata
 				);
 
@@ -449,6 +455,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		void* cxl_addr = cxl_manager_.GetCXLAddr();
 		void* segment_metadata = nullptr;
 		void* batch_headers_region = nullptr;
+		SessionEntry* session_table = cxl_manager_.GetSessionTable(topic);
 
 		segment_metadata = cxl_manager_.GetNewSegment();
 		batch_headers_region = cxl_manager_.GetNewBatchHeaderLog();
@@ -460,6 +467,10 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		}
 		if (!batch_headers_region) {
 			LOG(ERROR) << "Failed to allocate batch headers for topic: " << topic;
+			return nullptr;
+		}
+		if (!session_table) {
+			LOG(ERROR) << "Failed to resolve session table for topic: " << topic;
 			return nullptr;
 		}
 
@@ -545,6 +556,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 				order,
 				seq_type,
 				cxl_addr,
+				session_table,
 				segment_metadata
 				);
 
