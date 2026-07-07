@@ -24,6 +24,7 @@ struct OptimizedClientState {
 	uint64_t committed_hwm{0};
 	uint32_t fence_epoch{0};
 	uint32_t session_epoch{0};
+	uint64_t gap_since_ns{0};
 
 	static constexpr size_t kWindowSize = Sequencer5Config::kClientWindowSize;
 	uint64_t window_base{0};
@@ -31,8 +32,8 @@ struct OptimizedClientState {
 
 	bool is_duplicate(uint64_t seq) const {
 		// Late ORDER=5 batches can legitimately arrive after next_expected/window_base have
-		// advanced due to gap-skip or forced expiry. Those batches still need to flow through
-		// emitted-tracker logic so the sequencer can emit them once for ACK/export progress.
+		// advanced due to prior committed progress. Those batches still need to flow through
+		// emitted-tracker logic so the sequencer can handle them once for ACK/export progress.
 		// Treat only the active window bitmap as authoritative duplicate state here.
 		if (seq < window_base) return false;
 		if (seq >= window_base + kWindowSize) return false;
@@ -51,9 +52,24 @@ struct OptimizedClientState {
 		}
 	}
 
-	/// Advance next_expected by one (after emitting or discarding the batch at next_expected).
-	/// For gap-skip use direct assignment next_expected = seq + 1.
-	void advance_next_expected() { next_expected++; }
+	/// Advance next_expected by one after emitting the batch at next_expected.
+	void advance_next_expected() {
+		next_expected++;
+		gap_since_ns = 0;
+	}
+
+	void set_next_expected(uint64_t next) {
+		if (next != next_expected) {
+			gap_since_ns = 0;
+		}
+		next_expected = next;
+	}
+
+	void note_gap(uint64_t now_ns) {
+		if (!fenced && gap_since_ns == 0) {
+			gap_since_ns = now_ns;
+		}
+	}
 
 	/// Idempotent, monotone fence cache; durable SessionEntry wiring lands in D.
 	void fence() {
