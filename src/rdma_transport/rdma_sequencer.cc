@@ -250,21 +250,47 @@ int main(int argc, char** argv) {
   // still delivered to on_complete before reporting the error (ibv_poll_cq can return a mixed
   // batch; only the bad entry and anything after it in that batch is lost, to be picked up by the
   // caller's retry logic).
+  // [[BUG FOUND: G1]] The original error path `return false` the INSTANT a bad WC was seen,
+  // leaving this attempt's remaining outstanding WRs (posted-completed, up to kWindow=64) sitting
+  // UNDRAINED in the CQ. Step 4's retry loop then calls pipelined_ops AGAIN with a NEW, smaller
+  // `pending` list, reusing wr_id 0..new_count-1 from scratch. blog_shared_cq is SHARED across
+  // every broker's QP, so the retry's very first ibv_poll_cq call can return one of THOSE stale
+  // leftover completions — its wr_id gets reinterpreted as an index into the RETRY's `pending`
+  // array (a completely different item), silently corrupting `committed`/`on_complete` with the
+  // wrong work item. Never surfaced at Phase 2's 60% load because pipelined_ops essentially never
+  // hit its error path there; WILL fire under Phase 3's higher/backlogged load where multi-attempt
+  // retries against a dead broker's QP are the norm, not a rare edge case.
+  // Fix: once an error is seen, stop posting new work but keep polling — and keep delivering GOOD
+  // completions to on_complete as they arrive — until every WR this call ever posted has been
+  // accounted for (completed == posted), so the CQ is fully drained before returning. A retry's
+  // fresh wr_id space can then never collide with anything left over from this attempt.
   auto pipelined_ops = [&](RcQp* q, size_t count, auto&& post_one, auto&& on_complete,
                            auto&& on_error) -> bool {
     size_t posted = 0, completed = 0;
-    while (completed < count) {
-      while (posted < count && (posted - completed) < static_cast<size_t>(kWindow)) {
-        if (!post_one(posted)) {
-          fprintf(stderr, "[sequencer] pipelined op post failed at index %zu\n", posted);
-          return false;
+    bool had_error = false;
+    while (completed < posted || (!had_error && posted < count)) {
+      if (!had_error) {
+        while (posted < count && (posted - completed) < static_cast<size_t>(kWindow)) {
+          if (!post_one(posted)) {
+            fprintf(stderr, "[sequencer] pipelined op post failed at index %zu\n", posted);
+            had_error = true;
+            break;
+          }
+          ++posted;
         }
-        ++posted;
+      }
+      if (completed == posted) {
+        if (had_error) break;  // fully drained after an error -> done
+        continue;              // posted<count but nothing outstanding yet -> post more
       }
       int n = ibv_poll_cq(q->cq, 16, wc);
-      if (n < 0) { fprintf(stderr, "[sequencer] pipelined op poll_cq error\n"); return false; }
+      if (n < 0) {
+        fprintf(stderr, "[sequencer] pipelined op poll_cq FATAL error, forcing drain\n");
+        had_error = true;
+        completed = posted;  // a broken CQ won't yield any more completions; stop waiting for one
+        break;
+      }
       if (n == 0) continue;
-      bool had_error = false;
       for (int i = 0; i < n; ++i) {
         if (wc[i].status != IBV_WC_SUCCESS) {
           fprintf(stderr,
@@ -273,15 +299,14 @@ int main(int argc, char** argv) {
                   static_cast<unsigned long long>(wc[i].wr_id));
           on_error(wc[i].qp_num);
           had_error = true;
-          break;  // stop processing this batch; anything after (incl. this entry) is lost, the
-                  // caller's retry logic picks up whatever didn't complete
+          ++completed;  // this WR slot is accounted for (drained); do NOT deliver it
+          continue;
         }
         on_complete(static_cast<size_t>(wc[i].wr_id));
         ++completed;
       }
-      if (had_error) return false;
     }
-    return true;
+    return !had_error;
   };
 
   std::vector<uint64_t> last_seen(num_brokers, kPublishUncommitted);
@@ -458,6 +483,17 @@ int main(int argc, char** argv) {
 #endif
           },
           [&](size_t j) {
+            // [[G1 defense-in-depth]] pipelined_ops now fully drains an aborted attempt before
+            // returning (see the fix there), which should make this unreachable — but this
+            // callback is exactly the one a stale cross-attempt wr_id would corrupt if that
+            // invariant were ever violated by a future change, so guard it explicitly rather than
+            // trust the drain alone.
+            if (j >= pending.size()) {
+              fprintf(stderr, "[sequencer] BUG-GUARD: blog-read on_complete got out-of-range "
+                              "wr_id=%zu (pending.size()=%zu this attempt) -- dropping\n",
+                      j, pending.size());
+              return;
+            }
             const WorkItem& w = work[pending[j]];
             blog_bytes_read += w.total_size;
             ++batches;

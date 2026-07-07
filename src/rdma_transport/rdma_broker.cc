@@ -54,6 +54,10 @@ const char* GetArg(int argc, char** argv, const char* key, const char* def) {
     if (!strncmp(argv[i], key, klen) && argv[i][klen] == '=') return argv[i] + klen + 1;
   return def;
 }
+bool HasFlag(int argc, char** argv, const char* key) {
+  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], key)) return true;
+  return false;
+}
 
 void* AllocHugeOrFallback(size_t bytes) {
   size_t aligned = (bytes + (1ull << 21) - 1) & ~((1ull << 21) - 1);
@@ -104,6 +108,13 @@ int main(int argc, char** argv) {
   // post-kill recovery SOURCE for a given trial needs 2: the left-neighbor feed plus the recovery
   // tool's later read-only connection.
   int replica_max_accepts = atoi(GetArg(argc, argv, "--replica-max-accepts", "1"));
+  // [[G2]] Off by default (matches Phase 2's already-reported fire-and-forget replication).
+  // When set, the sentinel WRITE for a batch is gated on that batch's replication write actually
+  // completing — a REAL durability claim ("sentinel published => data survives on RF>=2 hosts"),
+  // at the cost of adding replication RTT to the producer's own critical path once RF>=2 is
+  // active. Phase 2's survivor-stall=0 finding does NOT generalize to this mode by construction;
+  // that is the whole point of turning it on for Sub-phase 3B's backlogged-kill trial.
+  bool durable_replicate = HasFlag(argc, argv, "--durable-replicate");
 
   fprintf(stderr, "[broker %d] placement=%s message_size=%u target_mbps=%d duration=%ds inflight=%d\n",
           broker_id, BLOG_PLACEMENT_DRAM ? "DRAM(W5-A)" : "MEMSERVER(W5-B)", message_size,
@@ -278,6 +289,7 @@ int main(int argc, char** argv) {
   uint64_t wr_id_ctr = 0;
 #if BLOG_PLACEMENT_DRAM
   uint64_t replica_wr_id_ctr = 0, replica_completed = 0;
+  bool right_neighbor_dead = false;  // [[G2]] circuit breaker, tripped by any bad completion
 #endif
 
   auto now_ns = [] {
@@ -318,17 +330,69 @@ int main(int argc, char** argv) {
     memset(static_cast<uint8_t*>(local_blog_mem) + log_idx, static_cast<uint8_t>(global_seq & 0xFF),
            per_slot_blog_bytes);  // local CPU store, no network (leg-2 held)
     // Step 1b (Phase 2 RF>=2): replicate the SAME bytes to our right neighbor at the SAME log_idx
-    // offset (1:1 mirrored layout) — best-effort, fire-and-mostly-forget: opportunistically drain
-    // completions (non-blocking) rather than adding this QP to the main backpressure loop, since
-    // its only job is keeping a redundant copy current, not gating the producer's own throughput.
-    if (has_right_neighbor) {
+    // offset (1:1 mirrored layout).
+    //
+    // [[BUG FOUND: G2]] The original version posted here unconditionally and only opportunistically
+    // drained completions with a bare `rn>0` check — once the peer died, every subsequent post
+    // queued behind never-completing WRs until the send queue filled, then every single
+    // ibv_post_send failed locally with ENOSPC for the rest of the run (~180K repeated log lines
+    // per Phase 2 trial). No circuit breaker, and no fence tying sentinel publication to
+    // replication completion — so "survivor throughput/RTT unaffected" was real, but "the
+    // replicated copy is actually there when the sentinel says the batch is committed" was NEVER
+    // actually verified; it was always fire-and-forget. Fixed:
+    //   1. Circuit breaker: a bad completion (not just an empty poll) trips right_neighbor_dead;
+    //      once tripped, stop posting to this QP entirely (no more ENOSPC storm, no more wasted
+    //      cycles racing a peer that's gone).
+    //   2. Optional fence (--durable-replicate, off by default = Phase 2's already-reported
+    //      behavior unchanged): when enabled and the neighbor is still alive, BLOCK here until
+    //      THIS batch's replication write actually completes before falling through to the
+    //      header/sentinel writes below — only then is "sentinel published implies replicated"
+    //      a claim this code actually backs. Skipped once the peer is known dead (nothing to
+    //      fence on; the batch proceeds RF=1, exactly as Sub-phase 3B's backlogged-kill trial
+    //      wants to observe).
+    if (has_right_neighbor && !right_neighbor_dead) {
       PostWrite(&replica_client_qp, static_cast<uint8_t*>(local_blog_mem) + log_idx,
                 local_blog_mr.lkey(), right_replica_region.addr + log_idx, right_replica_region.rkey,
                 static_cast<uint32_t>(per_slot_blog_bytes), /*wr_id=*/replica_wr_id_ctr++);
       ibv_wc replica_wc[16];
-      int rn = ibv_poll_cq(replica_client_qp.cq, 16, replica_wc);
-      if (rn > 0) replica_completed += rn;
-      else if (rn < 0) fprintf(stderr, "[broker %d] replica QP poll error\n", broker_id);
+      if (durable_replicate) {
+        // Synchronous fence: drain until THIS write's own completion (or an error) lands.
+        for (;;) {
+          int rn = ibv_poll_cq(replica_client_qp.cq, 16, replica_wc);
+          if (rn < 0) { fprintf(stderr, "[broker %d] replica QP poll error\n", broker_id); break; }
+          if (rn == 0) continue;
+          bool tripped = false;
+          for (int i = 0; i < rn; ++i) {
+            if (replica_wc[i].status != IBV_WC_SUCCESS) {
+              fprintf(stderr, "[broker %d] replica QP WC error status=%d(%s) -- right neighbor "
+                              "declared dead, replicating RF=1 from here on\n",
+                      broker_id, replica_wc[i].status, ibv_wc_status_str(replica_wc[i].status));
+              right_neighbor_dead = true;
+              tripped = true;
+            }
+          }
+          replica_completed += rn;
+          if (tripped) break;
+          break;  // rn>0 and no error: our fenced WR (the only one outstanding on this QP in
+                  // durable mode, since we fence every batch) has landed
+        }
+      } else {
+        // Best-effort, non-blocking: opportunistically drain without gating this batch.
+        int rn = ibv_poll_cq(replica_client_qp.cq, 16, replica_wc);
+        if (rn > 0) {
+          for (int i = 0; i < rn; ++i) {
+            if (replica_wc[i].status != IBV_WC_SUCCESS) {
+              fprintf(stderr, "[broker %d] replica QP WC error status=%d(%s) -- right neighbor "
+                              "declared dead, stopping replication\n",
+                      broker_id, replica_wc[i].status, ibv_wc_status_str(replica_wc[i].status));
+              right_neighbor_dead = true;
+            }
+          }
+          replica_completed += rn;
+        } else if (rn < 0) {
+          fprintf(stderr, "[broker %d] replica QP poll error\n", broker_id);
+        }
+      }
     }
 #else
     PostWrite(&meta_qp, stage.data(), stage_mr.lkey(), remote_blog_base + (log_idx % remote_blog_bytes),
