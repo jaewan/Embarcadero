@@ -38,8 +38,12 @@ hold-buffer loose end, ~500× smaller; subsumed by D1).
 ### D1 design (frozen-ready) — `docs/design/D1_SESSION_FIFO_DESIGN_v2.md`
 Two-round adversarial design (workflow-driven). v1 (14 must-fixes) → v2 (all closed) → §11 resolves
 the 2nd-round holes (R-A head-gap lease clock; R-B recovery park bound; R-C durable-truth before
-EPOCH_STALE; …). **Decision: per-session-global `batch_seq`.** No open design forks. Two gates:
-human freeze + one open-load `append_send_to_ack` p99.9 measurement (for δ_cap).
+EPOCH_STALE; …). **Decision: per-session-global `batch_seq`.** No open design forks. **δ measurement
+gate CLOSED (2026-07-07):** open-load `append_send_to_ack` p99.9 = 1.1 ms typical / 4.95 ms worst;
+`kDeltaFloorMs=1.7`, `kDeltaCapMs=12` frozen in §5.2 (3-lens adversarial review raised cap 10→12 for
+honest ≥2× incl. wire RTT; the ≥166 ms fear was refuted — e2e tail is subscriber-side). Results +
+raw audit CSVs: `docs/experiments/delta_measurement_results.md` + `delta_measurement_raw/`. **Only the
+human design-freeze gate remains** before C→G implementation (Track-02 TLA A/B still gates commit F).
 - **Track 02 handoff:** `docs/design/D1_TLA_SCENARIOS_FOR_TRACK02.md` (Scenarios A & B) — ready now.
 - **Implementation order (§7):** S2 classifier refactor → CXL `SessionEntry` table → sequencer
   fencing → protobuf → client. **S2 brief:** `docs/experiments/S2_REFACTOR_BRIEF.md`.
