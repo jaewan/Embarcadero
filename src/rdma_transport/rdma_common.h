@@ -113,6 +113,16 @@ int PollCq(ibv_cq* cq, ibv_wc* wc, int max, int* bad_status);
 bool OobServerExchange(int port, const void* send, void* recv, size_t n);
 bool OobClientExchange(const std::string& ip, int port, const void* send, void* recv, size_t n);
 
+// Multi-accept variant: open ONE listening socket up front (backlog sized for `max_pending`
+// concurrent connect attempts) and reuse it across several sequential accepts. Use this instead of
+// repeated OobServerExchange calls when accepting a known-size batch of clients (e.g. N brokers +
+// sequencer) whose connect order/timing isn't controlled — closing and reopening the listener
+// between accepts (what repeated OobServerExchange calls do) leaves a gap where a client's connect
+// gets refused if it arrives between one accept and the next listen.
+int OobServerListen(int port, int max_pending);
+bool OobServerAccept(int listen_fd, const void* send, void* recv, size_t n, int timeout_sec = 30);
+void OobServerClose(int listen_fd);
+
 // A convenience bundle a target (server) advertises for each region it exposes.
 struct RegionDesc {
   uint64_t addr = 0;

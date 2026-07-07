@@ -289,31 +289,48 @@ static bool ReadAll(int fd, void* p, size_t n) {
   return true;
 }
 
-bool OobServerExchange(int port, const void* send, void* recv, size_t n) {
+int OobServerListen(int port, int max_pending) {
   int ls = socket(AF_INET, SOCK_STREAM, 0);
-  if (ls < 0) { LogFail("socket", __FILE__, __LINE__); return false; }
+  if (ls < 0) { LogFail("socket", __FILE__, __LINE__); return -1; }
   int one = 1;
   setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
   sockaddr_in a{};
   a.sin_family = AF_INET;
   a.sin_addr.s_addr = INADDR_ANY;
   a.sin_port = htons(port);
-  if (bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) || listen(ls, 1)) {
-    LogFail("bind/listen", __FILE__, __LINE__); close(ls); return false;
+  if (bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) || listen(ls, max_pending)) {
+    LogFail("bind/listen", __FILE__, __LINE__); close(ls); return -1;
   }
+  return ls;
+}
+
+bool OobServerAccept(int listen_fd, const void* send, void* recv, size_t n, int timeout_sec) {
   // Bounded accept: if no client connects within the timeout, fail instead of blocking forever
   // (a hung server would hold the exclusive testbed flock — see handoff post-mortem).
   fd_set rfds;
   FD_ZERO(&rfds);
-  FD_SET(ls, &rfds);
-  timeval tv{30, 0};  // 30 s
-  int sel = select(ls + 1, &rfds, nullptr, nullptr, &tv);
-  if (sel <= 0) { LogFail("accept timeout/select", __FILE__, __LINE__); close(ls); return false; }
-  int fd = accept(ls, nullptr, nullptr);
-  close(ls);
+  FD_SET(listen_fd, &rfds);
+  timeval tv{timeout_sec, 0};
+  errno = 0;
+  int sel = select(listen_fd + 1, &rfds, nullptr, nullptr, &tv);
+  if (sel < 0) { LogFail("accept select", __FILE__, __LINE__); return false; }
+  if (sel == 0) { fprintf(stderr, "[rdma] FAIL: accept timeout (%ds, no error)\n", timeout_sec); return false; }
+  int fd = accept(listen_fd, nullptr, nullptr);
   if (fd < 0) { LogFail("accept", __FILE__, __LINE__); return false; }
   bool ok = WriteAll(fd, send, n) && ReadAll(fd, recv, n);
   close(fd);
+  return ok;
+}
+
+void OobServerClose(int listen_fd) {
+  if (listen_fd >= 0) close(listen_fd);
+}
+
+bool OobServerExchange(int port, const void* send, void* recv, size_t n) {
+  int ls = OobServerListen(port, /*max_pending=*/1);
+  if (ls < 0) return false;
+  bool ok = OobServerAccept(ls, send, recv, n);
+  OobServerClose(ls);
   return ok;
 }
 

@@ -46,6 +46,11 @@ int main(int argc, char** argv) {
   Mr counter_mr{};
   if (!RegisterMr(d.pd, &counter, sizeof(counter), &counter_mr)) return 1;
 
+  // ONE listening socket for the whole batch (see rdma_memserver.cc for why: a fresh
+  // listen+accept+close per client races a concurrent multi-QP client that may connect all its
+  // QPs back-to-back faster than the server can cycle its listener).
+  int listen_fd = OobServerListen(port, num_clients);
+  if (listen_fd < 0) return 1;
   std::vector<RcQp> qps(num_clients);
   for (int i = 0; i < num_clients; ++i) {
     if (!CreateRcQp(&d, 64, 64, /*psn_seed=*/0x8000 + i, &qps[i])) return 1;
@@ -53,12 +58,15 @@ int main(int argc, char** argv) {
     local.server_ep = LocalEndpoint(qps[i]);
     local.counter = {reinterpret_cast<uint64_t>(counter_mr.addr), counter_mr.rkey(),
                      static_cast<uint32_t>(counter_mr.len)};
-    if (!OobServerExchange(port, &local, &remote, sizeof(TokenHandshake))) {
-      fprintf(stderr, "[token-server] handshake failed for client %d\n", i); return 1;
+    if (!OobServerAccept(listen_fd, &local, &remote, sizeof(TokenHandshake))) {
+      fprintf(stderr, "[token-server] handshake failed for client %d\n", i);
+      OobServerClose(listen_fd);
+      return 1;
     }
     if (!ConnectRcQp(&qps[i], remote.client_ep)) return 1;
     fprintf(stderr, "[token-server] client %d connected qpn=%u\n", i, remote.client_ep.qpn);
   }
+  OobServerClose(listen_fd);
 
   fprintf(stderr, "[token-server] all %d clients connected; passive for %ds\n", num_clients,
           duration_secs);
