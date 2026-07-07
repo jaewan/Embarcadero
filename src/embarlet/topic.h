@@ -52,6 +52,7 @@ struct HoldBatchMetadata {
 	size_t total_size{0};
 	uint64_t batch_id{0};
 	size_t batch_seq{0};
+	uint32_t session_epoch{0};
 	uint64_t pbr_absolute_index{0};
 	size_t client_id{0};
 	uint16_t epoch_created{0};
@@ -65,6 +66,7 @@ struct PendingBatch5 {
 	uint32_t num_msg{0};
 	size_t client_id{0};
 	size_t batch_seq{0};
+	uint32_t session_epoch{0};
 	size_t slot_offset{0};  // For commit order (consumed_through per broker)
 	uint16_t epoch_created{0};  // [[PHASE_1A]] For sequencer-side epoch validation (§4.2)
 	// [[CONSUMED_THROUGH_SKIP]] When true, scanner skipped this slot (in-flight); sequencer only advances consumed_through
@@ -99,6 +101,7 @@ struct HoldEntry5 {
 	uint64_t hold_start_ns{0};
 };
 struct ExpiredHoldEntry {
+	size_t session_key{0};
 	size_t client_id{0};
 	size_t seq{0};
 	PendingBatch5 batch;
@@ -883,11 +886,11 @@ class Topic {
 			bool stop{false};
 			std::vector<PendingBatch5> input;
 			std::vector<PendingBatch5> ready;
-			absl::flat_hash_map<size_t, ClientState5> client_state;
-			absl::flat_hash_map<size_t, ClientEmitTracker> client_emitted_tracker;
-			absl::flat_hash_map<size_t, std::map<size_t, HoldEntry5>> hold_buffer;  // client_id -> ordered(client_seq -> entry)
+			absl::flat_hash_map<size_t, ClientState5> client_state;  // session_key -> state
+			absl::flat_hash_map<size_t, ClientEmitTracker> client_emitted_tracker;  // session_key -> emitted seqs
+			absl::flat_hash_map<size_t, std::map<size_t, HoldEntry5>> hold_buffer;  // session_key -> ordered(client_seq -> entry)
 			size_t hold_buffer_size{0};
-			absl::flat_hash_set<size_t> clients_with_held_batches;
+			absl::flat_hash_set<size_t> clients_with_held_batches;  // session_key set
 			absl::flat_hash_map<size_t, ClientPressureStats> client_pressure_stats;
 			std::vector<ExpiredHoldEntry> expired_hold_buffer;
 			std::vector<std::pair<size_t, size_t>> expired_hold_keys_buffer;

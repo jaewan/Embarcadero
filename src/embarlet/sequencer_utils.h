@@ -20,6 +20,10 @@ struct OptimizedClientState {
 	uint64_t next_expected{0};
 	uint64_t highest_sequenced{0};
 	uint64_t last_epoch{0};
+	bool fenced{false};
+	uint64_t committed_hwm{0};
+	uint32_t fence_epoch{0};
+	uint32_t session_epoch{0};
 
 	static constexpr size_t kWindowSize = Sequencer5Config::kClientWindowSize;
 	uint64_t window_base{0};
@@ -50,6 +54,14 @@ struct OptimizedClientState {
 	/// Advance next_expected by one (after emitting or discarding the batch at next_expected).
 	/// For gap-skip use direct assignment next_expected = seq + 1.
 	void advance_next_expected() { next_expected++; }
+
+	/// Idempotent, monotone fence cache; durable SessionEntry wiring lands in D.
+	void fence() {
+		if (!fenced) {
+			fenced = true;
+			committed_hwm = next_expected;
+		}
+	}
 };
 
 template <typename T>
