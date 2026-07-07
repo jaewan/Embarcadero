@@ -107,6 +107,8 @@ public:
 	void MarkQueueActive(size_t queue_idx);
 	void SetPreferredQueues(const std::vector<size_t>& preferred_indices);
 	void ClearPreferredQueues();
+	// D1 session rollover hook. Call only after producers are quiesced and unacked suffix is handled.
+	void ResetBatchSeqForNewSession();
 
 	/**
 	 * Pre-touch pool memory (hugepage regions) to fault pages in and reduce measurement variance.

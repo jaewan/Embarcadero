@@ -558,6 +558,10 @@ void QueueBuffer::ClearPreferredQueues() {
 	preferred_queue_count_.store(0, std::memory_order_release);
 }
 
+void QueueBuffer::ResetBatchSeqForNewSession() {
+	batch_seq_.store(0, std::memory_order_relaxed);
+}
+
 void QueueBuffer::WarmupBuffers() {
 	for (auto& region : batch_buffers_region_) {
 		if (!region.first || region.second == 0) continue;
