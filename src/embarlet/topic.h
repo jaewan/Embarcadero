@@ -920,6 +920,7 @@ class Topic {
 			// Stores (pbr_index + 1) so zero can remain the "unset" sentinel while preserving
 			// the real zero-based first batch index.
 			absl::flat_hash_map<int, uint64_t> cv_logical_only_pbr_index;
+			std::vector<Order5SlotIdentity> backpressured_level5_slots;
 		};
 		size_t level5_num_shards_{1};
 		std::vector<std::unique_ptr<Level5ShardState>> level5_shards_;

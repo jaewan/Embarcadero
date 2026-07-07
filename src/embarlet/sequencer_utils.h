@@ -80,6 +80,40 @@ struct OptimizedClientState {
 	}
 };
 
+struct Order5SlotIdentity {
+	int broker_id{0};
+	size_t slot_offset{0};
+	uint64_t pbr_index{0};
+};
+
+inline bool CanFenceSessionEpoch(uint32_t session_epoch) {
+	return session_epoch != 0;
+}
+
+inline bool ShouldFenceSessionGap(
+		const OptimizedClientState& state,
+		uint64_t now_ns,
+		uint64_t session_lease_ns) {
+	return CanFenceSessionEpoch(state.session_epoch) &&
+	       !state.fenced &&
+	       state.gap_since_ns != 0 &&
+	       now_ns - state.gap_since_ns >= session_lease_ns;
+}
+
+inline bool ShouldClearSessionGapFromHeldMax(uint64_t next_expected, uint64_t max_held_seq) {
+	return max_held_seq <= next_expected;
+}
+
+inline bool Order5SlotMatches(
+		const Order5SlotIdentity& slot,
+		int broker_id,
+		size_t slot_offset,
+		uint64_t pbr_index) {
+	return slot.broker_id == broker_id &&
+	       slot.slot_offset == slot_offset &&
+	       slot.pbr_index == pbr_index;
+}
+
 template <typename T>
 class RadixSorter {
 public:

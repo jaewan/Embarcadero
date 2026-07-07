@@ -216,6 +216,28 @@ if(PkgConfig_FOUND)
             TIMEOUT 60
             LABELS "unit;session_entry;torn_read;correctness"
         )
+
+        add_executable(order5_session_fencing_test
+            order5_session_fencing_test.cc
+        )
+        target_include_directories(order5_session_fencing_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(order5_session_fencing_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(order5_session_fencing_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_order5_session_fencing COMMAND order5_session_fencing_test)
+        set_tests_properties(unit_order5_session_fencing PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;order5;session;fencing;correctness"
+        )
     else()
         message(WARNING "GTest not found via pkg-config, unit tests disabled")
     endif()

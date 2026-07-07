@@ -5444,14 +5444,24 @@ bool Topic::IsOrder5HeldSlot(int broker_id, size_t slot_offset, uint64_t pbr_ind
 	for (const auto& shard_ptr : level5_shards_) {
 		if (!shard_ptr) continue;
 		std::lock_guard<std::mutex> lock(shard_ptr->mu);
+		for (const PendingBatch5& p : shard_ptr->deferred_level5) {
+			Order5SlotIdentity slot{p.broker_id, p.slot_offset, p.cached_pbr_absolute_index};
+			if (Order5SlotMatches(slot, broker_id, slot_offset, pbr_index)) {
+				return true;
+			}
+		}
+		for (const Order5SlotIdentity& slot : shard_ptr->backpressured_level5_slots) {
+			if (Order5SlotMatches(slot, broker_id, slot_offset, pbr_index)) {
+				return true;
+			}
+		}
 		for (const auto& [session_key, held] : shard_ptr->hold_buffer) {
 			(void)session_key;
 			for (const auto& [seq, entry] : held) {
 				(void)seq;
 				const HoldBatchMetadata& meta = entry.meta;
-				if (meta.broker_id == broker_id &&
-				    meta.slot_offset == slot_offset &&
-				    meta.pbr_absolute_index == pbr_index) {
+				Order5SlotIdentity slot{meta.broker_id, meta.slot_offset, meta.pbr_absolute_index};
+				if (Order5SlotMatches(slot, broker_id, slot_offset, pbr_index)) {
 					return true;
 				}
 			}
@@ -5597,11 +5607,10 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	};
 	auto record_fence = [&](size_t shard_session_key, ClientState5& state) {
 		if (!true_client_chain) return;
+		if (!CanFenceSessionEpoch(state.session_epoch)) return;
 		state.fence();
 		SessionPublishSnapshot snapshot;
-		snapshot.session_epoch = state.session_epoch != 0
-			? state.session_epoch
-			: static_cast<uint32_t>(shard_session_key & 0xFFFFFFFFULL);
+		snapshot.session_epoch = state.session_epoch;
 		snapshot.expected_seq = state.next_expected;
 		snapshot.committed_hwm = state.committed_hwm;
 		snapshot.highest_sequenced = state.highest_sequenced;
@@ -5640,6 +5649,16 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			std::make_move_iterator(shard.deferred_level5.begin()),
 			std::make_move_iterator(shard.deferred_level5.end()));
 		shard.deferred_level5.clear();
+	}
+	for (const PendingBatch5& p : level5) {
+		shard.backpressured_level5_slots.erase(
+			std::remove_if(shard.backpressured_level5_slots.begin(),
+				shard.backpressured_level5_slots.end(),
+				[&](const Order5SlotIdentity& slot) {
+					return Order5SlotMatches(
+						slot, p.broker_id, p.slot_offset, p.cached_pbr_absolute_index);
+				}),
+			shard.backpressured_level5_slots.end());
 	}
 	// [PHASE-3] Clear shard CV accumulation for this invocation
 	shard.cv_max_cumulative.clear();
@@ -5727,10 +5746,19 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					shard.deferred_level5.push_back(std::move(p));
 					return;
 				}
-				if (tcc) {
-					record_forced_skip(p.client_id);
+				Order5SlotIdentity blocked_slot{
+					p.broker_id, p.slot_offset, p.cached_pbr_absolute_index};
+				const bool already_blocked = std::any_of(
+					shard.backpressured_level5_slots.begin(),
+					shard.backpressured_level5_slots.end(),
+					[&](const Order5SlotIdentity& slot) {
+						return Order5SlotMatches(
+							slot, blocked_slot.broker_id, blocked_slot.slot_offset,
+							blocked_slot.pbr_index);
+					});
+				if (!already_blocked) {
+					shard.backpressured_level5_slots.push_back(blocked_slot);
 				}
-				order5_hold_buffer_forced_skips_.fetch_add(1, std::memory_order_relaxed);
 				LOG_EVERY_N(WARNING, 100)
 					<< "[ORDER5_HOLD_BACKPRESSURE] deferred full; leaving session frontier unchanged"
 					<< " client=" << p.client_id
@@ -5801,8 +5829,16 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			          << " next_expected_before=" << state.next_expected
 			          << " hold_size=" << shard.hold_buffer_size;
 			if (true_client_chain) {
-				record_fence(session_key, state);
-				record_forced_skip(skip_it->client_id);
+				if (CanFenceSessionEpoch(state.session_epoch)) {
+					record_fence(session_key, state);
+					record_forced_skip(skip_it->client_id);
+				} else {
+					state.mark_sequenced(skip_it->batch_seq);
+					if (skip_it->batch_seq >= state.next_expected) {
+						state.set_next_expected(skip_it->batch_seq + 1);
+						record_forced_skip(skip_it->client_id);
+					}
+				}
 			} else {
 				state.mark_sequenced(skip_it->batch_seq);
 				if (skip_it->batch_seq >= state.next_expected) {
@@ -6067,6 +6103,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		auto map_it = shard.hold_buffer.find(session_key);
 		if (map_it == shard.hold_buffer.end() || map_it->second.empty()) continue;
 		ClientState5& state = shard.client_state[session_key];
+		if (!CanFenceSessionEpoch(state.session_epoch)) continue;
 		if (state.fenced) {
 			shard.expired_hold_keys_buffer.emplace_back(session_key, state.next_expected);
 			continue;
@@ -6076,12 +6113,12 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			state.gap_since_ns = 0;
 			continue;
 		}
-		if (cmap.begin()->first <= state.next_expected) {
+		if (ShouldClearSessionGapFromHeldMax(state.next_expected, cmap.rbegin()->first)) {
 			state.gap_since_ns = 0;
 			continue;
 		}
 		state.note_gap(now_ns);
-		if (state.gap_since_ns != 0 && now_ns - state.gap_since_ns >= session_lease_ns) {
+		if (ShouldFenceSessionGap(state, now_ns, session_lease_ns)) {
 			shard.expired_hold_keys_buffer.emplace_back(session_key, state.next_expected);
 		}
 	}
