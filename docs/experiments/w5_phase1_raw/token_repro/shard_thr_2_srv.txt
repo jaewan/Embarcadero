@@ -1,0 +1,19 @@
+[token-server] dev=mlx5_0 gid_index=3 num_clients=16 num_counters=16 duration=6s
+[token-server] client 0 connected qpn=818
+[token-server] client 1 connected qpn=819
+[token-server] client 2 connected qpn=820
+[token-server] client 3 connected qpn=821
+[token-server] client 4 connected qpn=822
+[token-server] client 5 connected qpn=823
+[token-server] client 6 connected qpn=824
+[token-server] client 7 connected qpn=825
+[token-server] client 8 connected qpn=826
+[token-server] client 9 connected qpn=827
+[token-server] client 10 connected qpn=828
+[token-server] client 11 connected qpn=829
+[token-server] client 12 connected qpn=830
+[token-server] client 13 connected qpn=831
+[token-server] client 14 connected qpn=832
+[token-server] client 15 connected qpn=833
+[token-server] all 16 clients connected; passive for 6s
+[token-server] final counter total=146504493 (across 16 shard(s))
