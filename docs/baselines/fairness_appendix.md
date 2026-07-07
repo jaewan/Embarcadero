@@ -92,3 +92,75 @@ LazyLog's binding-round coordination is **pod-internal** and is bottlenecked on 
 - Single-writer discipline (one thread per `up(b)`; the sequencer poll thread sole writer of every `down(b)`) enforces SPSC at the transport layer — a transport property, not a change to the ordering algorithm.
 - Readiness gates cadence: no binding is emitted until every expected broker has registered and reported for the round (`ComputeGlobalBinding` returns false otherwise), preserving the durability coupling and the count-only readiness of the gRPC baseline.
 - **Behavior guard (honest scope):** `lazylog_latency_invariant_test` is a standalone gtest of utility functions and does **not** exercise `LazyLogBindingCore` — so it is *not* the guard for the L1 extraction. The actual correctness guard for the binding-delta core is **`lazylog_mailbox_bench`'s independent per-round binding-delta recomputation** (it recomputes the expected delta in the harness and compares). The gRPC path's behavior-preservation is that its readiness is count-only (`use_epoch_barrier=false`) — identical to the original `registered_brokers_.size() >= expected_brokers && reported_brokers_.size() >= expected_brokers` gate — and `lazylog_global_sequencer` still builds (untouched).
+
+---
+
+## Calibration results (2026-07-07, moscxl, branch `track03-calib`)
+
+**Method** (per `calibration_plan.md`): CXL-mailbox benches scaled to seconds-long steady-state
+plateaus via new env-overridable shape knobs (`CORFU_BENCH_REQUESTS_PER_BROKER`,
+`CORFU_BENCH_MSGS_PER_REQ`, `SCALOG_BENCH_EPOCHS`, `LAZYLOG_BENCH_EPOCHS`; smoke defaults
+unchanged). 3 trials/config under the testbed lock; median (range). All correctness checks
+passed in every trial. Timing window is first-post→last-recv, so a ~10 s run amortizes warmup
+(plateau-grade). Latency percentiles: not sampled by these benches — best-effort item deferred
+(Scalog publishes no p99 anyway; its ~1.3 ms envelope remains unmeasured here).
+
+| Baseline | Config / scale | Target (floor) | Measured, median (range) | Verdict |
+|---|---|---|---|---|
+| Corfu | no-batch, 4×1M reqs (~10 s) | ≥570K tokens/s | **0.370 M tokens/s** (0.370–0.404) | **below-floor — honest finding** |
+| Corfu | batch=4, 4×1M reqs (~10.7 s) | >2M tokens/s | **1.490 M tokens/s** (1.487–1.505); 0.372 M req/s | **below-floor — honest finding** |
+| Scalog | 100K epochs (~2.1 s) | ≥18.7K writes/s/shard | **47.9K global-cut rounds/s** (47.8–48.0K); 383K local-cut inputs/s | **meets-floor (structural)** |
+| LazyLog | 100K epochs (~1.4 s) | ≥1.34M metadata-appends/s | **73.7K binding-rounds/s** (73.2–73.8K); 294K progress-reports/s | **meets-floor (structural)**; unit differs — see below |
+| LazyLog | 1-RTT append (exact, structural) | binary match | appends never wait on a binding round (lazy background binding preserved by the mailbox port) | **exact match** |
+
+**Corfu — the honest finding (E10-relevant).** The request rate is FLAT across batch factors
+(0.370 M/s at batch=1 vs 0.372 M/s at batch=4, 10-second plateaus): the bound is the
+**per-request mailbox round-trip** (~2.7 µs: up-ring produce + sequencer poll + down-ring
+grant + consume, each with clflushopt/sfence non-coherent-CXL discipline), NOT the counter
+work and NOT warmup (the calibration_plan's ⚠ scenario (c) confirmed — scaling N from 16K to
+4M left the rate unchanged). Tango's RIO/TCP sequencer exceeds 570K req/s by amortizing many
+requests per NIC interrupt/syscall; a non-coherent shared-memory mailbox cannot amortize below
+its per-record flush/fence floor. Consequence for E10: Corfu-on-CXL's token path is
+mailbox-RTT-bound, so its knee is set by token latency, not counter throughput — report as a
+finding, not tuned away.
+
+**Why this is the faithful-port ceiling, not an untuned number** (verified against the port
+code, to preempt the "did you optimize?" objection): the three ways to beat a per-request
+round-trip floor are already exhausted or forbidden. (1) *Warmup* — excluded: scaling N 16K→4M
+left the rate unchanged. (2) *Client pipelining* — already deep: the bench driver produces to
+ring-full (up to 1024 outstanding) before draining grants, so up-flushes overlap sequencer
+work. (3) *Sequencer poll batching* — already high: the poll thread drains `K_=64`
+requests/broker/pass (`corfu_mailbox_sequencer` default), so idle-spin is amortized and each
+request still costs its own consume(invalidate+fence) + `AssignToken` + produce(flush). The
+only remaining lever is **multiple sequencer threads**, which would shard Corfu's single
+monotonic `next_order_` counter — a **protocol-rule violation** (`porting_rule.md`: the
+centralized single-counter sequencer IS Corfu's architecture; sharding it is a redesign, not a
+port). So 370K req/s is the honest ceiling for a *faithful* single-counter Corfu sequencer over
+a non-coherent mailbox that must durably cross-link-write each grant — Tango's 570K is beaten
+only because its RIO counter needs no per-request durable cross-link write. Message-level
+throughput still scales with batch factor (1.49M msgs/s at batch=4), so Corfu-on-CXL remains
+usable for the E1/E10 comparisons at realistic batch sizes.
+
+**Scalog — unit honesty.** The port is the cut/report path (the transport swap under test);
+the 18.7K writes/s/shard floor is data-plane (4 KB records to storage — out of the port's
+scope). The comparable structural statement: the mailbox cut path sustains **47.9K global-cut
+rounds/s**, 4.8× the paper's 0.1 ms-interleave design point (10K cuts/s), so ordering capacity
+cannot be the binder for an 18.7K writes/s shard (writes-per-cut ≥ 1). Verdict: the ordering
+path meets the floor structurally; data-plane write throughput was not (and cannot be)
+measured by this bench.
+
+**LazyLog — unit honesty.** Erwin's 1.34M metadata-appends/s is a per-append single-leader
+ceiling; in this port the coordinator aggregates per-broker progress counters, so it is
+structurally not per-append-bound. At the measured **73.7K binding-rounds/s**, covering
+1.34M appends/s requires only ~4.6 appends per broker per round — satisfied at any real load;
+the coordinator ceiling exceeds the floor for every workload with ≥5-append rounds. The
+exact-match calibration item is the structural invariant: **1-RTT append with lazy background
+binding** (appends return on durability, never wait for a binding round), which the mailbox
+port preserves (no gRPC coordinator round-trip on the append path). The ~4× latency-ratio
+anchor (vs a same-stack eager baseline) remains follow-up.
+
+**TCP-vs-CXL delta (E1 leg-1→leg-2):** follow-up — no TCP-transport twin of these
+microbenches exists yet; the gRPC sequencer paths are not shape-comparable without work.
+
+**Scaled-N provenance:** raw output preserved at `/tmp/t03_calib_out.log` on moscxl
+(12/12 trials `ALL CHECKS PASSED`).

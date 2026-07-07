@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -43,13 +44,26 @@ using Embarcadero::cxl_transport::MailboxSegment;
 
 using Clock = std::chrono::high_resolution_clock;
 
+// [[CALIBRATION]] Env override for benchmark-shape knobs (positive integers only). The smoke
+// defaults keep CTest fast; calibration runs (docs/baselines/calibration_plan.md) scale the
+// request count to a seconds-long plateau and sweep the batch size without a recompile.
+uint64_t EnvShapeU64(const char* name, uint64_t def) {
+	const char* e = std::getenv(name);
+	if (!e || !*e) return def;
+	char* end = nullptr;
+	unsigned long long v = std::strtoull(e, &end, 10);
+	return (end != e && *end == '\0' && v > 0) ? static_cast<uint64_t>(v) : def;
+}
+
 // Benchmark shape.
 constexpr uint32_t kNumBrokers = 4;
 constexpr uint32_t kNumClients = 8;
 constexpr uint32_t kRecordSize = 128;      // >= sizeof(CorfuTokenGrant) == 48
 constexpr uint32_t kRingCapacity = 1024;   // power of two
-constexpr uint32_t kRequestsPerBroker = 4096;
-constexpr uint64_t kMessagesPerRequest = 4;   // batch size (num_msg per token request)
+const uint32_t kRequestsPerBroker = static_cast<uint32_t>(
+		EnvShapeU64("CORFU_BENCH_REQUESTS_PER_BROKER", 4096));
+const uint64_t kMessagesPerRequest =
+		EnvShapeU64("CORFU_BENCH_MSGS_PER_REQ", 4);   // batch size (num_msg per token request)
 constexpr uint64_t kBytesPerRequest = 512;    // total_size per request
 
 // One request submitted and (later) its grant, kept in submission order per driver.

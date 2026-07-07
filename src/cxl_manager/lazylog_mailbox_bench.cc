@@ -35,6 +35,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <limits>
 #include <thread>
@@ -60,9 +61,20 @@ using Embarcadero::cxl_transport::MailboxSegment;
 
 using Clock = std::chrono::high_resolution_clock;
 
+// [[CALIBRATION]] Env override for the epoch count (positive integers only). The smoke default
+// keeps CTest fast; calibration runs (docs/baselines/calibration_plan.md) scale it 10-50x so the
+// measured window is a seconds-long steady-state plateau, not a warmup-dominated burst.
+inline uint32_t BenchEpochs(const char* name, uint32_t def) {
+	const char* e = std::getenv(name);
+	if (!e || !*e) return def;
+	char* end = nullptr;
+	unsigned long long v = std::strtoull(e, &end, 10);
+	return (end != e && *end == '\0' && v > 0) ? static_cast<uint32_t>(v) : def;
+}
+
 // Benchmark shape.
 constexpr uint32_t kNumBrokers = 4;
-constexpr uint32_t kEpochs = 2000;
+const uint32_t kEpochs = BenchEpochs("LAZYLOG_BENCH_EPOCHS", 2000);
 constexpr uint32_t kRecordSize = 512;       // >= sizeof(LazyLogGlobalBindingMsg) == 272
 constexpr uint32_t kRingCapacity = 1024;    // power of two
 
