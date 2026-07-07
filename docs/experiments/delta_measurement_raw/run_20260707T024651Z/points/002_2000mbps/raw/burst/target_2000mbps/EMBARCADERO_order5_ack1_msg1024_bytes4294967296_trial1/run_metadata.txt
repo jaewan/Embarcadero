@@ -1,0 +1,17 @@
+run_id=target_2000mbps
+scenario=local
+mode=burst
+trial=1
+sequencer=EMBARCADERO
+order=5
+ack_level=1
+message_size=1024
+total_message_size=4294967296
+num_brokers=4
+test_case=2
+replication_factor=0
+runtime_mode=latency
+target_mbps=2000
+broker_head_addr=127.0.0.1
+run_log=/home/domin/Embarcadero-sessions/s2-work/data/latency_vs_load/delta_measure/EMBARCADERO_order5_ack1_rf0/run_20260707T024651Z/points/002_2000mbps/raw/burst/target_2000mbps/EMBARCADERO_order5_ack1_msg1024_bytes4294967296_trial1/run.log
+client_command_file=/home/domin/Embarcadero-sessions/s2-work/data/latency_vs_load/delta_measure/EMBARCADERO_order5_ack1_rf0/run_20260707T024651Z/points/002_2000mbps/raw/burst/target_2000mbps/EMBARCADERO_order5_ack1_msg1024_bytes4294967296_trial1/client_command.txt

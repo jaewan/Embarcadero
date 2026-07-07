@@ -5,7 +5,11 @@
 **Method:** `docs/experiments/DELTA_MEASUREMENT_BRIEF.md` — loopback open-loop offered-load sweep,
 ORDER=5 ACK=1 RF=0, 4 brokers, 1 KiB msgs, 4 GiB/trial, 3 trials/point,
 `scripts/run_latency_vs_load.sh` (PACING_MODE=open_loop → harness `burst` mode).
-**Run dir:** `data/latency_vs_load/delta_measure/EMBARCADERO_order5_ack1_rf0/run_20260707T024651Z`.
+**Run dir:** `data/latency_vs_load/delta_measure/EMBARCADERO_order5_ack1_rf0/run_20260707T024651Z`
+(moscxl; full ~2.7 GB with logs). **Committed audit subset (~200 KB):**
+`delta_measurement_raw/` — per-trial `pub_latency_stats.csv` / `pub_cdf_latency_us.csv` /
+`stage_latency_summary.csv` / `run_metadata.txt`. The 4.951 ms anchor is verifiable there
+(`points/003_4000mbps/.../trial1`: p99.9 = max = 4951 µs, a single sample; trials 2/3 = 755/1143 µs).
 **Note (provenance):** the wrapper `run_latency_vs_load.sh` defaults `ORDER=0` (singular) and
 forwards it as `ORDERS="$ORDER"` to `run_latency.sh` (which itself defaults `ORDERS="0 5"`); so
 setting only `ORDERS` at the wrapper level is silently overridden to ORDER=0. This run set `ORDER=5`

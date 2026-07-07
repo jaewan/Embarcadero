@@ -1,0 +1,4 @@
+Average,Min,Median,p90,p95,p99,p999,Max,Count,Metric,Unit,PercentileMethod,Granularity,SampleCountMeaning,AckedMessages,TotalBatchesSent,OutOfOrderInserts,MissingSubmitTimestamps
+3005.479,1847.000,3017.000,3236.000,3299.000,3365.000,3486.000,3486.000,545,append_submit_to_ack_batch_latency,us,0,batch,samples=count_of_fully_acked_batches_with_submit_timestamp,4194304,2177,0,0
+359.020,99.000,354.000,566.000,589.000,626.000,653.000,653.000,545,append_send_to_ack_batch_latency,us,0,batch,samples=count_of_fully_acked_batches,4194304,2177,0,0
+359.020,99.000,354.000,566.000,589.000,626.000,653.000,653.000,545,append_send_to_ordered_batch_latency,us,0,batch,samples=count_of_fully_ordered_batches_derived_from_ack_level_1,4194304,2177,0,0

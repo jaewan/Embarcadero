@@ -1,0 +1,1 @@
+./throughput_test --config /home/domin/Embarcadero-sessions/s2-work/config/client.yaml --head_addr 127.0.0.1 -n 1 -m 1024 -s 4294967296 -t 2 -o 5 -a 1 --sequencer EMBARCADERO -r 0 --target_mbps 1000 --record_results 
