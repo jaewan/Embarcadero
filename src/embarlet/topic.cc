@@ -15,6 +15,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 
 
@@ -110,7 +111,7 @@ static inline bool ShouldAssertCommitOrder() {
 	return v;
 }
 
-static uint64_t GetOrder5HoldTimeoutNs(bool replicated_ack2_mode) {
+[[maybe_unused]] static uint64_t GetOrder5HoldTimeoutNs(bool replicated_ack2_mode) {
 	if (const char* env = std::getenv("EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS")) {
 		char* end = nullptr;
 		unsigned long parsed = std::strtoul(env, &end, 10);
@@ -127,6 +128,20 @@ static uint64_t GetOrder5HoldTimeoutNs(bool replicated_ack2_mode) {
 	// force-expire windows during verified stalls/tail drain. Operators can still opt
 	// back into a fixed timeout for experiments via EMBARCADERO_ORDER5_HOLD_TIMEOUT_MS.
 	return 0;
+}
+
+static uint64_t GetSessionLeaseNs(bool replicated_ack2_mode) {
+	if (const char* env = std::getenv("EMBARCADERO_SESSION_LEASE_MS")) {
+		char* end = nullptr;
+		unsigned long parsed = std::strtoul(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0) {
+			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
+		}
+		LOG(WARNING) << "Ignoring invalid EMBARCADERO_SESSION_LEASE_MS='" << env
+		             << "'; using placeholder default";
+	}
+	const uint64_t default_ms = replicated_ack2_mode ? 2000ULL : 1000ULL;
+	return default_ms * 1000ULL * 1000ULL;
 }
 
 static uint64_t GetOrder5IdleForceExpireTriggerNs(bool replicated_ack2_mode) {
@@ -225,6 +240,20 @@ void Topic::RecordOrder5FlightEvent(
 	slot.d = d;
 }
 
+SessionEntry* Topic::FindSessionEntry(uint64_t session_key) {
+	if (session_key == 0 || session_table_ == nullptr) return nullptr;
+	const size_t start = static_cast<size_t>(Mix64(session_key) % kMaxSessions);
+	for (size_t probe = 0; probe < kMaxSessions; ++probe) {
+		SessionEntry* entry = &session_table_[(start + probe) % kMaxSessions];
+		CXL::invalidate_cacheline_for_read(entry);
+		CXL::load_fence();
+		const uint64_t observed = entry->session_key.load(std::memory_order_acquire);
+		if (observed == session_key) return entry;
+		if (observed == 0) return nullptr;
+	}
+	return nullptr;
+}
+
 SessionEntry* Topic::FindOrCreateSessionEntry(uint64_t session_key) {
 	if (session_key == 0 || session_table_ == nullptr) return nullptr;
 	const size_t start = static_cast<size_t>(Mix64(session_key) % kMaxSessions);
@@ -246,6 +275,32 @@ SessionEntry* Topic::FindOrCreateSessionEntry(uint64_t session_key) {
 	LOG(ERROR) << "SessionEntry table full for topic=" << topic_name_
 	           << " session_key=" << session_key;
 	return nullptr;
+}
+
+void Topic::ReconstructClientStateFromSessionEntry(uint64_t session_key, ClientState5& state) {
+	SessionEntry* entry = FindSessionEntry(session_key);
+	if (entry == nullptr) return;
+
+	CXL::invalidate_cacheline_for_read(entry);
+	CXL::load_fence();
+	const uint64_t state_word = entry->state_word.load(std::memory_order_acquire);
+	const uint64_t flags = state_word & 0xFFFFFFFFULL;
+	if ((flags & kSessionEntryFlagActive) == 0) return;
+
+	const uint32_t durable_epoch = static_cast<uint32_t>(state_word >> 32);
+	const uint64_t durable_expected = entry->expected_seq.load(std::memory_order_acquire);
+	const uint64_t durable_committed = entry->committed_hwm.load(std::memory_order_acquire);
+	const uint64_t durable_highest = entry->highest_sequenced.load(std::memory_order_acquire);
+
+	state.session_epoch = std::max(state.session_epoch, durable_epoch);
+	if (durable_expected > state.next_expected) {
+		state.set_next_expected(durable_expected);
+	}
+	state.committed_hwm = std::max(state.committed_hwm, durable_committed);
+	state.highest_sequenced = std::max(state.highest_sequenced, durable_highest);
+	if ((flags & kSessionEntryFlagFenced) != 0) {
+		state.fenced = true;
+	}
 }
 
 void Topic::PublishSessionEntry(uint64_t session_key, const SessionPublishSnapshot& snapshot) {
@@ -4269,8 +4324,8 @@ void Topic::CommitEpoch(
 			}
 		// [[W1.2]] Empirical per-session in-order commit invariant (W1 item #2): across epoch
 		// seals the collector must commit a client's batches in strictly increasing client_seq.
-		// Deliberate gap-skips still advance (increasing, non-contiguous); a LOWER client_seq
-		// committed after a higher one for the same client is a genuine collector reorder -> bug.
+		// A LOWER client_seq committed after a higher one for the same session is a genuine
+		// collector reorder and must be surfaced immediately under EMBAR_ASSERT_COMMIT_ORDER.
 		if (order_ == kOrderStrong && (p.from_hold || p.hdr != nullptr)) {
 			const uint64_t w12_cid = entry->client_id;
 			const uint64_t w12_seq = entry->client_seq;
@@ -4402,9 +4457,17 @@ void Topic::CommitEpoch(
 					goi_timestamps_[ring_pos].timestamp_ns.store(SteadyNowNs(), std::memory_order_release);
 				}
 		int b = m.broker_id;
-		ordered_increment[b] += m.num_msg;
-		last_ordered_offset[b] = m.log_idx;
-		ordered_broker_seen[b] = true;
+		if (b >= 0 && b < NUM_MAX_BROKERS) {
+			ordered_increment[b] += m.num_msg;
+			last_ordered_offset[b] = m.log_idx;
+			ordered_broker_seen[b] = true;
+			size_t& next_expected = contiguous_consumed_per_broker[b];
+			if (m.slot_offset == next_expected ||
+			    (next_expected == BATCHHEADERS_SIZE && m.slot_offset == 0)) {
+				next_expected = m.slot_offset + sizeof(BatchHeader);
+				if (next_expected >= BATCHHEADERS_SIZE) next_expected = BATCHHEADERS_SIZE;
+			}
+		}
 		per_client_delta_epoch[static_cast<uint32_t>(m.client_id)] += m.num_msg;
 		record_session_publish(m.client_id, m.session_epoch, m.batch_seq);
 		{
@@ -5377,6 +5440,57 @@ void Topic::ClientGc(Level5ShardState& shard) {
 	}
 }
 
+bool Topic::IsOrder5HeldSlot(int broker_id, size_t slot_offset, uint64_t pbr_index) {
+	for (const auto& shard_ptr : level5_shards_) {
+		if (!shard_ptr) continue;
+		std::lock_guard<std::mutex> lock(shard_ptr->mu);
+		for (const PendingBatch5& p : shard_ptr->deferred_level5) {
+			Order5SlotIdentity slot{p.broker_id, p.slot_offset, p.cached_pbr_absolute_index};
+			if (Order5SlotMatches(slot, broker_id, slot_offset, pbr_index)) {
+				return true;
+			}
+		}
+		for (const Order5SlotIdentity& slot : shard_ptr->backpressured_level5_slots) {
+			if (Order5SlotMatches(slot, broker_id, slot_offset, pbr_index)) {
+				return true;
+			}
+		}
+		for (const auto& [session_key, held] : shard_ptr->hold_buffer) {
+			(void)session_key;
+			for (const auto& [seq, entry] : held) {
+				(void)seq;
+				const HoldBatchMetadata& meta = entry.meta;
+				Order5SlotIdentity slot{meta.broker_id, meta.slot_offset, meta.pbr_absolute_index};
+				if (Order5SlotMatches(slot, broker_id, slot_offset, pbr_index)) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+void Topic::RetireOrder5HeldSlotAndAdvance(BatchHeader* hdr, int broker_id, size_t slot_offset) {
+	InvalidateOrder5HeldSlot(hdr);
+	if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS) return;
+	if (slot_offset >= BATCHHEADERS_SIZE || (slot_offset % sizeof(BatchHeader)) != 0) return;
+
+	const volatile void* addr = reinterpret_cast<const volatile void*>(
+		&tinode_->offsets[broker_id].batch_headers_consumed_through);
+	CXL::flush_cacheline(const_cast<const void*>(addr));
+	CXL::load_fence();
+	size_t consumed = tinode_->offsets[broker_id].batch_headers_consumed_through;
+	if (consumed == BATCHHEADERS_SIZE) consumed = 0;
+	if (consumed == slot_offset) {
+		size_t next = slot_offset + sizeof(BatchHeader);
+		if (next >= BATCHHEADERS_SIZE) next = BATCHHEADERS_SIZE;
+		tinode_->offsets[broker_id].batch_headers_consumed_through = next;
+		CXL::store_fence();
+		CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[broker_id].batch_headers_consumed_through));
+		CXL::store_fence();
+	}
+}
+
 void Topic::ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector<PendingBatch5>& ready) {
 	if (level5_shards_.empty()) {
 		LOG(FATAL) << "ProcessLevel5Batches: level5_shards_ empty (InitLevel5Shards was not run)";
@@ -5441,6 +5555,69 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		if (!true_client_chain) return;
 		shard.client_pressure_stats[client_id].late_drops++;
 	};
+	auto purge_fenced_session = [&](size_t shard_session_key) {
+		auto hold_it = shard.hold_buffer.find(shard_session_key);
+		if (hold_it != shard.hold_buffer.end()) {
+			std::vector<std::tuple<int, size_t, BatchHeader*>> retire;
+			retire.reserve(hold_it->second.size());
+			for (auto& [seq, held] : hold_it->second) {
+				(void)seq;
+				retire.emplace_back(
+					held.meta.broker_id, held.meta.slot_offset, held.batch.hdr);
+			}
+			std::array<size_t, NUM_MAX_BROKERS> consume_start{};
+			for (int broker_id = 0; broker_id < NUM_MAX_BROKERS; ++broker_id) {
+				const volatile void* addr = reinterpret_cast<const volatile void*>(
+					&tinode_->offsets[broker_id].batch_headers_consumed_through);
+				CXL::flush_cacheline(const_cast<const void*>(addr));
+				CXL::load_fence();
+				consume_start[broker_id] =
+					tinode_->offsets[broker_id].batch_headers_consumed_through;
+				if (consume_start[broker_id] == BATCHHEADERS_SIZE) consume_start[broker_id] = 0;
+			}
+			std::sort(retire.begin(), retire.end(),
+				[&](const auto& a, const auto& b) {
+					const int broker_a = std::get<0>(a);
+					const int broker_b = std::get<0>(b);
+					if (broker_a != broker_b) return broker_a < broker_b;
+					if (broker_a < 0 || broker_a >= NUM_MAX_BROKERS) {
+						return std::get<1>(a) < std::get<1>(b);
+					}
+					const size_t start = consume_start[broker_a];
+					const size_t distance_a =
+						(std::get<1>(a) + BATCHHEADERS_SIZE - start) % BATCHHEADERS_SIZE;
+					const size_t distance_b =
+						(std::get<1>(b) + BATCHHEADERS_SIZE - start) % BATCHHEADERS_SIZE;
+					return distance_a < distance_b;
+				});
+			for (const auto& [broker_id, slot_offset, hdr] : retire) {
+				RetireOrder5HeldSlotAndAdvance(hdr, broker_id, slot_offset);
+			}
+			shard.hold_buffer_size -= hold_it->second.size();
+			shard.hold_buffer.erase(hold_it);
+		}
+		shard.clients_with_held_batches.erase(shard_session_key);
+		shard.client_emitted_tracker.erase(shard_session_key);
+		shard.deferred_level5.erase(
+			std::remove_if(shard.deferred_level5.begin(), shard.deferred_level5.end(),
+				[&](const PendingBatch5& p) {
+					return MakeSessionKey(p.client_id, p.session_epoch) == shard_session_key;
+				}),
+			shard.deferred_level5.end());
+	};
+	auto record_fence = [&](size_t shard_session_key, ClientState5& state) {
+		if (!true_client_chain) return;
+		if (!CanFenceSessionEpoch(state.session_epoch)) return;
+		state.fence();
+		SessionPublishSnapshot snapshot;
+		snapshot.session_epoch = state.session_epoch;
+		snapshot.expected_seq = state.next_expected;
+		snapshot.committed_hwm = state.committed_hwm;
+		snapshot.highest_sequenced = state.highest_sequenced;
+		snapshot.fenced = true;
+		PublishSessionEntry(shard_session_key, snapshot);
+		purge_fenced_session(shard_session_key);
+	};
 	auto accumulate_logical_only = [&](int broker_id, uint64_t start_logical_offset,
 	                                  uint32_t num_msg, uint64_t pbr_index) {
 		if (!true_client_chain) return;
@@ -5473,6 +5650,16 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			std::make_move_iterator(shard.deferred_level5.end()));
 		shard.deferred_level5.clear();
 	}
+	for (const PendingBatch5& p : level5) {
+		shard.backpressured_level5_slots.erase(
+			std::remove_if(shard.backpressured_level5_slots.begin(),
+				shard.backpressured_level5_slots.end(),
+				[&](const Order5SlotIdentity& slot) {
+					return Order5SlotMatches(
+						slot, p.broker_id, p.slot_offset, p.cached_pbr_absolute_index);
+				}),
+			shard.backpressured_level5_slots.end());
+	}
 	// [PHASE-3] Clear shard CV accumulation for this invocation
 	shard.cv_max_cumulative.clear();
 	shard.cv_max_pbr_index.clear();
@@ -5492,14 +5679,21 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	//  - LT: tcc drops-late (terminalize, per-client ACK credit); legacy emits-late
 	//    (fifo_violation + ready).
 	//  - IsEmitted-only: tcc terminalizes; legacy re-emits with fifo_violation.
-	//  - GT force-skip: legacy counts fifo_violation; tcc records forced_skip pressure.
+	//  - GT hold-full: legacy counts fifo pressure; tcc records backpressure pressure.
 	//  - GT hold-insert: record_hold_insert is tcc-only.
 	// terminalize_already_emitted / record_* / accumulate_logical_only self-gate on
 	// true_client_chain, so tcc-gated calls are no-ops for legacy streams and vice versa.
-	// D1's session fencing will replace the LT/GT recovery policy here, in exactly one place.
+	// D1 session fencing lives here so late/fenced/drop decisions stay centralized.
 	auto classify_one = [&](ClientState5& state, ClientEmitTracker& emitted, size_t key,
 	                        PendingBatch5& p, bool tcc) {
 		size_t seq = p.batch_seq;
+		if (tcc && state.fenced) {
+			accumulate_logical_only(
+				p.broker_id, p.cached_start_logical_offset, p.num_msg,
+				p.cached_pbr_absolute_index);
+			record_late_drop(p.client_id);
+			return;
+		}
 		if (state.is_duplicate(seq) && emitted.IsEmitted(static_cast<uint64_t>(seq))) {
 			terminalize_already_emitted(
 				p.client_id, p.broker_id, p.cached_start_logical_offset,
@@ -5508,7 +5702,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		}
 		if (emitted.IsEmitted(static_cast<uint64_t>(seq))) {
 			state.mark_sequenced(seq);
-			if (seq >= state.next_expected) state.next_expected = seq + 1;
+			if (seq >= state.next_expected) state.set_next_expected(seq + 1);
 			if (tcc) {
 				terminalize_already_emitted(
 					p.client_id, p.broker_id, p.cached_start_logical_offset,
@@ -5543,24 +5737,34 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				}
 			}
 		} else {
+			if (tcc) {
+				state.note_gap(SteadyNowNs());
+			}
 			if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
 				std::this_thread::sleep_for(std::chrono::microseconds(10));
 				if (shard.deferred_level5.size() < kDeferredL5MaxEntries) {
 					shard.deferred_level5.push_back(std::move(p));
 					return;
 				}
-				state.mark_sequenced(seq);
-				state.next_expected = seq + 1;
-				if (!tcc) {
-					order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+				Order5SlotIdentity blocked_slot{
+					p.broker_id, p.slot_offset, p.cached_pbr_absolute_index};
+				const bool already_blocked = std::any_of(
+					shard.backpressured_level5_slots.begin(),
+					shard.backpressured_level5_slots.end(),
+					[&](const Order5SlotIdentity& slot) {
+						return Order5SlotMatches(
+							slot, blocked_slot.broker_id, blocked_slot.slot_offset,
+							blocked_slot.pbr_index);
+					});
+				if (!already_blocked) {
+					shard.backpressured_level5_slots.push_back(blocked_slot);
 				}
-				order5_skipped_batches_.fetch_add(1, std::memory_order_relaxed);
-				order5_hold_buffer_forced_skips_.fetch_add(1, std::memory_order_relaxed);
-				if (tcc) {
-					record_forced_skip(p.client_id);
-				}
-				emitted.MarkEmitted(static_cast<uint64_t>(seq));
-				ready.push_back(std::move(p));
+				LOG_EVERY_N(WARNING, 100)
+					<< "[ORDER5_HOLD_BACKPRESSURE] deferred full; leaving session frontier unchanged"
+					<< " client=" << p.client_id
+					<< " session_epoch=" << p.session_epoch
+					<< " seq=" << seq
+					<< " next_expected=" << state.next_expected;
 				return;
 			}
 
@@ -5579,6 +5783,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			he.meta.broker_id = p.broker_id;
 			he.meta.num_msg = p.num_msg;
 			he.meta.start_logical_offset = p.cached_start_logical_offset;
+			he.meta.slot_offset = p.slot_offset;
 			he.hold_start_ns = SteadyNowNs();
 			he.batch = std::move(p);
 			stream_map.emplace(seq, he);
@@ -5587,7 +5792,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			}
 			shard.hold_buffer_size++;
 			shard.clients_with_held_batches.insert(key);
-			InvalidateOrder5HeldSlot(he.batch.hdr);
 
 			PendingBatch5 marker;
 			marker.broker_id = he.batch.broker_id;
@@ -5595,6 +5799,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			marker.is_held_marker = true;
 			marker.hdr = nullptr;
 			marker.num_msg = 0;
+			marker.cached_pbr_absolute_index = he.meta.pbr_absolute_index;
 			ready.push_back(marker);
 		}
 	};
@@ -5615,6 +5820,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			ClientState5& state = shard.client_state[session_key];
 			state.session_epoch = skip_it->session_epoch;
 			state.last_epoch = hold_epoch;
+			ReconstructClientStateFromSessionEntry(session_key, state);
 			LOG(INFO) << "[ORDER5_TARGETED_SKIP]"
 			          << " client=" << skip_it->client_id
 			          << " session_epoch=" << skip_it->session_epoch
@@ -5622,10 +5828,23 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			          << " broker=" << skip_it->broker_id
 			          << " next_expected_before=" << state.next_expected
 			          << " hold_size=" << shard.hold_buffer_size;
-			state.mark_sequenced(skip_it->batch_seq);
-			if (skip_it->batch_seq >= state.next_expected) {
-				state.next_expected = skip_it->batch_seq + 1;
-				record_forced_skip(skip_it->client_id);
+			if (true_client_chain) {
+				if (CanFenceSessionEpoch(state.session_epoch)) {
+					record_fence(session_key, state);
+					record_forced_skip(skip_it->client_id);
+				} else {
+					state.mark_sequenced(skip_it->batch_seq);
+					if (skip_it->batch_seq >= state.next_expected) {
+						state.set_next_expected(skip_it->batch_seq + 1);
+						record_forced_skip(skip_it->client_id);
+					}
+				}
+			} else {
+				state.mark_sequenced(skip_it->batch_seq);
+				if (skip_it->batch_seq >= state.next_expected) {
+					state.set_next_expected(skip_it->batch_seq + 1);
+					record_forced_skip(skip_it->client_id);
+				}
 			}
 		}
 		ready.push_back(std::move(*skip_it));
@@ -5665,8 +5884,9 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				ClientEmitTracker& emitted = shard.client_emitted_tracker[session_key];
 				state.session_epoch = first_session_epoch;
 				state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+				ReconstructClientStateFromSessionEntry(session_key, state);
 				if (state.next_expected == 0 && emitted.contiguous_max != UINT64_MAX) {
-					state.next_expected = emitted.contiguous_max + 1;
+					state.set_next_expected(emitted.contiguous_max + 1);
 					state.highest_sequenced = emitted.contiguous_max;
 				}
 				if (state.next_expected == 0 &&
@@ -5676,7 +5896,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					// first fragment we happened to observe in this epoch. Starting at the first
 					// observed batch_seq can silently treat earlier striped batches as "late" and
 					// drop them behind the frontier. New clients always start from seq 0.
-					state.next_expected = 0;
+					state.set_next_expected(0);
 				}
 				for (PendingBatch5* p : ordered) {
 					classify_one(state, emitted, session_key, *p, true_client_chain);
@@ -5700,15 +5920,19 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					ClientEmitTracker& emitted = shard.client_emitted_tracker[stream_key];
 					state.session_epoch = vec.empty() ? 0 : vec.front()->session_epoch;
 					state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+					if (!vec.empty()) {
+						ReconstructClientStateFromSessionEntry(
+							MakeSessionKey(first_client, vec.front()->session_epoch), state);
+					}
 					if (state.next_expected == 0 && emitted.contiguous_max != UINT64_MAX) {
-						state.next_expected = emitted.contiguous_max + 1;
+						state.set_next_expected(emitted.contiguous_max + 1);
 						state.highest_sequenced = emitted.contiguous_max;
 					}
 					if (state.next_expected == 0 && !vec.empty()) {
 						// [[C5_SEED_UNIFY]] Same rule as the true-client-chain sites: a new
 						// session starts at seq 0. Seeding from the first *observed* batch_seq
 						// silently treated earlier striped batches as "late" and dropped them.
-						state.next_expected = 0;
+						state.set_next_expected(0);
 					}
 					for (PendingBatch5* p : vec) {
 						classify_one(state, emitted, stream_key, *p, true_client_chain);
@@ -5745,15 +5969,16 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			ClientState5& state = shard.client_state[session_key];
 			state.session_epoch = session_epoch;
 			state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+			ReconstructClientStateFromSessionEntry(session_key, state);
 			ClientEmitTracker& emitted = shard.client_emitted_tracker[session_key];
 			if (state.next_expected == 0 && emitted.contiguous_max != UINT64_MAX) {
-				state.next_expected = emitted.contiguous_max + 1;
+				state.set_next_expected(emitted.contiguous_max + 1);
 				state.highest_sequenced = emitted.contiguous_max;
 			}
 				if (state.next_expected == 0 &&
 				    state.highest_sequenced == 0 &&
 				    emitted.contiguous_max == UINT64_MAX) {
-					state.next_expected = 0;
+					state.set_next_expected(0);
 				}
 
 			for (auto jt = it; jt != group_end; ++jt) {
@@ -5781,14 +6006,16 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				ClientState5& state = shard.client_state[stream_key];
 				state.session_epoch = stream_epoch;
 				state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+				ReconstructClientStateFromSessionEntry(
+					MakeSessionKey(client_id, stream_epoch), state);
 				ClientEmitTracker& emitted = shard.client_emitted_tracker[stream_key];
 				if (state.next_expected == 0 && emitted.contiguous_max != UINT64_MAX) {
-					state.next_expected = emitted.contiguous_max + 1;
+					state.set_next_expected(emitted.contiguous_max + 1);
 					state.highest_sequenced = emitted.contiguous_max;
 				}
 				if (state.next_expected == 0 && state.highest_sequenced == 0 && emitted.contiguous_max == UINT64_MAX) {
 					// [[C5_SEED_UNIFY]] New sessions start at seq 0 (see the fast-path note).
-					state.next_expected = 0;
+					state.set_next_expected(0);
 				}
 
 				for (auto jt = bit; jt != broker_end; ++jt) {
@@ -5821,6 +6048,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				if (emitted.IsEmitted(static_cast<uint64_t>(he.batch.batch_seq))) {
 					state.mark_sequenced(he.batch.batch_seq);
 					state.advance_next_expected();
+					bool handed_to_commit = false;
 					if (true_client_chain) {
 						terminalize_already_emitted(
 							he.meta.client_id, he.meta.broker_id, he.meta.start_logical_offset,
@@ -5834,7 +6062,12 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 							ready.push_back(std::move(late));
 							emitted.MarkEmitted(static_cast<uint64_t>(ready.back().batch_seq));
 							order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+							handed_to_commit = true;
 						}
+					}
+					if (!handed_to_commit) {
+						RetireOrder5HeldSlotAndAdvance(
+							he.batch.hdr, he.meta.broker_id, he.meta.slot_offset);
 					}
 					cmap.erase(seq_it);
 					shard.hold_buffer_size--;
@@ -5861,131 +6094,50 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		}
 	}
 
-	// Age hold buffer: expire ALL entries older than the timeout, not just the front.
-	// With true_client_chain ordering and multi-broker publisher threads, batch sequences
-	// arrive non-contiguously per broker (global seq interleaved across brokers). Single-entry
-	// expiry creates an O(N) drain where N = held entries, since the "second drain" sweep
-	// finds no contiguous followers. Batch expiry reduces this to O(1) ticks.
+	// E/R-A: fence only when a per-session head gap outlives the session lease.
+	// Detector-driven force-expire windows are retained as tail-drain nudges, not as fence clocks.
 	const uint64_t now_ns = SteadyNowNs();
-	shard.expired_hold_buffer.clear();
 	shard.expired_hold_keys_buffer.clear();
-	const bool force_expire_all_frontiers =
-		now_ns < force_expire_hold_until_ns_.load(std::memory_order_acquire);
-	constexpr uint64_t kForceExpireMinAgeNs = 50ULL * 1000 * 1000;
-	const uint64_t normal_timeout_ns = GetOrder5HoldTimeoutNs(replication_factor_ > 0);
+	const uint64_t session_lease_ns = GetSessionLeaseNs(replication_factor_ > 0);
 	for (size_t session_key : shard.clients_with_held_batches) {
 		auto map_it = shard.hold_buffer.find(session_key);
 		if (map_it == shard.hold_buffer.end() || map_it->second.empty()) continue;
-		for (auto it = map_it->second.begin(); it != map_it->second.end(); ++it) {
-			const uint64_t age_ns = now_ns - it->second.hold_start_ns;
-			bool should_expire = false;
-			if (force_expire_all_frontiers) {
-				should_expire = (age_ns >= kForceExpireMinAgeNs);
-			} else if (normal_timeout_ns > 0) {
-				should_expire = (age_ns >= normal_timeout_ns);
-			}
-			if (should_expire) {
-				shard.expired_hold_keys_buffer.emplace_back(session_key, it->first);
-			}
-		}
-	}
-	for (const auto& [session_key, seq] : shard.expired_hold_keys_buffer) {
-		auto map_it = shard.hold_buffer.find(session_key);
-		if (map_it == shard.hold_buffer.end()) continue;
-		auto& cmap = map_it->second;
-		auto entry_it = cmap.find(seq);
-		if (entry_it == cmap.end()) continue;
-		ExpiredHoldEntry ent;
-		ent.session_key = session_key;
-		ent.client_id = entry_it->second.meta.client_id;
-		ent.seq = seq;
-		ent.batch = entry_it->second.batch;
-		ent.meta = entry_it->second.meta;
-		record_expiry(ent.client_id);
-		RecordOrder5FlightEvent(
-			kOrder5FlightExpiry,
-			static_cast<uint32_t>(ent.batch.broker_id),
-			ent.client_id,
-			ent.seq,
-			shard.hold_buffer_size,
-			force_expire_all_frontiers ? 1 : 0);
-		cmap.erase(entry_it);
-		shard.hold_buffer_size--;
-		if (cmap.empty()) {
-			shard.hold_buffer.erase(map_it);
-			shard.clients_with_held_batches.erase(session_key);
-		}
-		shard.expired_hold_buffer.push_back(ent);
-	}
-	std::sort(shard.expired_hold_buffer.begin(), shard.expired_hold_buffer.end(),
-		[](const ExpiredHoldEntry& a, const ExpiredHoldEntry& b) {
-			if (a.session_key != b.session_key) return a.session_key < b.session_key;
-			return a.seq < b.seq;
-		});
-	for (ExpiredHoldEntry& ent : shard.expired_hold_buffer) {
-		VLOG(1) << "[L5_EXPIRY_ENTRY] B" << ent.batch.broker_id << " client=" << ent.client_id
-		        << " seq=" << ent.seq;
-		ClientState5& state = shard.client_state[ent.session_key];
-		state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
-		ClientEmitTracker& emitted = shard.client_emitted_tracker[ent.session_key];
-			if (ent.seq < state.next_expected || emitted.IsEmitted(static_cast<uint64_t>(ent.seq))) {
-			state.mark_sequenced(ent.seq);
-			// Advance next_expected so later batches (e.g. seq+1) can drain; otherwise
-			// we'd leave next_expected behind and hold valid in-order batches forever.
-			if (ent.seq >= state.next_expected)
-				state.next_expected = ent.seq + 1;
-			if (true_client_chain) {
-				const bool duplicate = CheckAndInsertBatchId(shard, ent.meta.batch_id);
-				if (!duplicate) {
-					accumulate_logical_only(
-						ent.batch.broker_id,
-						ent.meta.start_logical_offset,
-						ent.meta.num_msg,
-						ent.meta.pbr_absolute_index);
-					record_late_drop(ent.client_id);
-					per_client_terminalized_delta_epoch[static_cast<uint32_t>(ent.client_id)] +=
-						ent.meta.num_msg;
-					VLOG(1) << "[L5_EXPIRED_LATE_DROP] B" << ent.batch.broker_id
-					        << " seq=" << ent.seq;
-				} else {
-					VLOG(1) << "[L5_EXPIRED_SKIP_DUP] B" << ent.batch.broker_id
-					        << " seq=" << ent.seq;
-				}
-			} else if (!CheckAndInsertBatchId(shard, ent.meta.batch_id)) {
-				PendingBatch5 b = std::move(ent.batch);
-				b.from_hold = true;
-				b.hold_meta = ent.meta;
-				emitted.MarkEmitted(static_cast<uint64_t>(b.batch_seq));
-				ready.push_back(std::move(b));
-				order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
-				VLOG(1) << "[L5_EXPIRED_LATE_EMIT] B" << ready.back().broker_id
-				        << " seq=" << ent.seq;
-			} else {
-				VLOG(1) << "[L5_EXPIRED_SKIP_DUP] B" << ent.batch.broker_id
-				        << " seq=" << ent.seq;
-			}
+		ClientState5& state = shard.client_state[session_key];
+		if (!CanFenceSessionEpoch(state.session_epoch)) continue;
+		if (state.fenced) {
+			shard.expired_hold_keys_buffer.emplace_back(session_key, state.next_expected);
 			continue;
 		}
-		// Sequence is beyond next_expected - skip the gap
-		state.next_expected = ent.seq + 1;
-		state.mark_sequenced(ent.seq);
-		if (!true_client_chain) {
-			order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+		auto& cmap = map_it->second;
+		if (cmap.find(state.next_expected) != cmap.end()) {
+			state.gap_since_ns = 0;
+			continue;
 		}
-		order5_skipped_batches_.fetch_add(1, std::memory_order_relaxed);
-		order5_hold_timeout_skips_.fetch_add(1, std::memory_order_relaxed);
-		record_forced_skip(ent.client_id);
-		if (!CheckAndInsertBatchId(shard, ent.meta.batch_id)) {
-			PendingBatch5 b = std::move(ent.batch);
-			b.from_hold = true;
-			b.hold_meta = ent.meta;
-			emitted.MarkEmitted(static_cast<uint64_t>(b.batch_seq));
-			ready.push_back(std::move(b));
+		if (ShouldClearSessionGapFromHeldMax(state.next_expected, cmap.rbegin()->first)) {
+			state.gap_since_ns = 0;
+			continue;
+		}
+		state.note_gap(now_ns);
+		if (ShouldFenceSessionGap(state, now_ns, session_lease_ns)) {
+			shard.expired_hold_keys_buffer.emplace_back(session_key, state.next_expected);
 		}
 	}
+	for (const auto& [session_key, missing_seq] : shard.expired_hold_keys_buffer) {
+		ClientState5& state = shard.client_state[session_key];
+		state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+		order5_hold_timeout_skips_.fetch_add(1, std::memory_order_relaxed);
+		record_expiry(static_cast<size_t>(session_key >> 32));
+		RecordOrder5FlightEvent(
+			kOrder5FlightExpiry,
+			static_cast<uint32_t>(broker_id_),
+			static_cast<uint64_t>(session_key),
+			missing_seq,
+			shard.hold_buffer_size,
+			session_lease_ns);
+		record_fence(session_key, state);
+	}
 
-	// Second drain: emit batches that became ready after age_hold advanced next_expected (gap-skip).
-	// Ablation pattern: drain_hold → age_hold → drain_hold so unblocked batches are emitted this epoch.
+	// Second drain: emit batches that became ready after the first drain.
 	for (auto sit = shard.clients_with_held_batches.begin(); sit != shard.clients_with_held_batches.end(); ) {
 		size_t session_key = *sit;
 		auto map_it = shard.hold_buffer.find(session_key);
@@ -6009,6 +6161,8 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						he.meta.client_id, he.meta.broker_id, he.meta.start_logical_offset,
 						he.meta.num_msg, he.meta.batch_id, he.batch.batch_seq,
 						he.meta.pbr_absolute_index);
+					RetireOrder5HeldSlotAndAdvance(
+						he.batch.hdr, he.meta.broker_id, he.meta.slot_offset);
 					cmap.erase(seq_it);
 					shard.hold_buffer_size--;
 				continue;
@@ -6954,6 +7108,7 @@ void Topic::AdvanceConsumedThroughForProcessedSlots(
 		if (b < 0 || b >= NUM_MAX_BROKERS || !broker_seen_in_epoch[b]) continue;
 		if (p.slot_offset >= BATCHHEADERS_SIZE) continue;
 		if ((p.slot_offset % slot_size) != 0) continue;
+		if (IsOrder5HeldSlot(b, p.slot_offset, p.cached_pbr_absolute_index)) continue;
 		processed_slots[b][p.slot_offset / slot_size] = 1;
 	}
 	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {

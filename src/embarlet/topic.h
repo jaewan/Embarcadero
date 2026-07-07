@@ -59,6 +59,7 @@ struct HoldBatchMetadata {
 	int broker_id{0};
 	uint32_t num_msg{0};
 	size_t start_logical_offset{0};
+	size_t slot_offset{0};
 };
 struct PendingBatch5 {
 	struct BatchHeader* hdr{nullptr};
@@ -524,7 +525,9 @@ class Topic {
 			uint64_t highest_sequenced{0};
 			bool fenced{false};
 		};
+		SessionEntry* FindSessionEntry(uint64_t session_key);
 		SessionEntry* FindOrCreateSessionEntry(uint64_t session_key);
+		void ReconstructClientStateFromSessionEntry(uint64_t session_key, ClientState5& state);
 		void PublishSessionEntry(uint64_t session_key, const SessionPublishSnapshot& snapshot);
 		void EnqueueCompletedRange(uint64_t start, uint64_t end);
 		void CommittedSeqUpdaterThread();
@@ -813,6 +816,8 @@ class Topic {
 		std::vector<PendingBatch5>& ready);
 	void ClientGc(Level5ShardState& shard);
 	bool CheckAndInsertBatchId(Level5ShardState& shard, uint64_t batch_id);
+	bool IsOrder5HeldSlot(int broker_id, size_t slot_offset, uint64_t pbr_index);
+	void RetireOrder5HeldSlotAndAdvance(BatchHeader* hdr, int broker_id, size_t slot_offset);
 	void Level5ShardWorker(size_t shard_id);
 	void InitLevel5Shards();
 	size_t GetTotalHoldBufferSize();
@@ -915,6 +920,7 @@ class Topic {
 			// Stores (pbr_index + 1) so zero can remain the "unset" sentinel while preserving
 			// the real zero-based first batch index.
 			absl::flat_hash_map<int, uint64_t> cv_logical_only_pbr_index;
+			std::vector<Order5SlotIdentity> backpressured_level5_slots;
 		};
 		size_t level5_num_shards_{1};
 		std::vector<std::unique_ptr<Level5ShardState>> level5_shards_;
