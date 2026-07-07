@@ -230,6 +230,84 @@ static bool SendSessionFencedControl(
 		static_cast<ssize_t>(payload.size());
 }
 
+static bool RecvExactNetwork(int fd, void* data, size_t len) {
+	uint8_t* p = static_cast<uint8_t*>(data);
+	size_t got = 0;
+	while (got < len) {
+		ssize_t n = recv(fd, p + got, len - got, 0);
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			return false;
+		}
+		if (n == 0) return false;
+		got += static_cast<size_t>(n);
+	}
+	return true;
+}
+
+static bool SendExactNetwork(int fd, const void* data, size_t len) {
+	const uint8_t* p = static_cast<const uint8_t*>(data);
+	size_t sent = 0;
+	while (sent < len) {
+		ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			return false;
+		}
+		if (n == 0) return false;
+		sent += static_cast<size_t>(n);
+	}
+	return true;
+}
+
+static bool SendSessionOpenAckControl(
+		int fd,
+		uint64_t committed_hwm,
+		embarcadero::session::SessionOpenAck::Status status,
+		uint32_t assigned_session_epoch) {
+	embarcadero::session::SessionOpenAck ack;
+	ack.set_committed_hwm(committed_hwm);
+	ack.set_status(status);
+	ack.set_assigned_session_epoch(assigned_session_epoch);
+	std::string payload;
+	if (!ack.SerializeToString(&payload)) return false;
+	struct Header {
+		uint32_t magic;
+		uint32_t length;
+	} header{kSessionControlMagic, static_cast<uint32_t>(payload.size())};
+	return SendExactNetwork(fd, &header, sizeof(header)) &&
+	       SendExactNetwork(fd, payload.data(), payload.size());
+}
+
+static bool TryReceiveSessionOpen(
+		int fd,
+		const EmbarcaderoReq& handshake,
+		embarcadero::session::SessionOpen* out) {
+	if (out == nullptr) return false;
+	struct Header {
+		uint32_t magic;
+		uint32_t length;
+	} header{};
+	struct timeval tv;
+	tv.tv_sec = 0;
+	tv.tv_usec = 200000;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	ssize_t peek = recv(fd, &header, sizeof(header), MSG_PEEK);
+	if (peek != static_cast<ssize_t>(sizeof(header)) || header.magic != kSessionControlMagic) {
+		return false;
+	}
+	if (header.length == 0 || header.length > 64 * 1024) {
+		return false;
+	}
+	if (!RecvExactNetwork(fd, &header, sizeof(header))) return false;
+	std::string payload(header.length, '\0');
+	if (!RecvExactNetwork(fd, payload.data(), payload.size())) return false;
+	if (!out->ParseFromString(payload)) return false;
+	if (out->client_id() != handshake.client_id) return false;
+	if (out->topic() != std::string(handshake.topic)) return false;
+	return true;
+}
+
 static bool ShouldEnableOrder5Trace() {
 	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_TRACE", false);
 	return enabled;
@@ -994,8 +1072,36 @@ void NetworkManager::HandlePublishRequest(
 
 	// Setup acknowledgment channel if needed
 	int ack_fd = client_socket;
-	const uint32_t connection_session_epoch =
+	uint32_t connection_session_epoch =
 		static_cast<uint32_t>(ReadEnvIntNonNegative("EMBARCADERO_SESSION_EPOCH", 0));
+	embarcadero::session::SessionOpen open;
+	const bool has_session_open = TryReceiveSessionOpen(client_socket, handshake, &open);
+	if (has_session_open) {
+		connection_session_epoch = open.requested_session_epoch() != 0
+			? open.requested_session_epoch()
+			: 1U;
+		DurableSessionSnapshot snapshot = ReadDurableSessionSnapshot(
+			cxl_manager_, handshake.topic, handshake.client_id, connection_session_epoch);
+		const auto status = snapshot.fenced
+			? embarcadero::session::SessionOpenAck::FENCED
+			: embarcadero::session::SessionOpenAck::OK;
+		if (!SendSessionOpenAckControl(
+				client_socket,
+				snapshot.reconnect_committed_hwm,
+				status,
+				connection_session_epoch)) {
+			LOG(ERROR) << "HandlePublishRequest: failed to send SessionOpenAck client_id="
+			           << handshake.client_id << " session_epoch=" << connection_session_epoch;
+			close(client_socket);
+			return;
+		}
+		LOG(INFO) << "[SESSION_OPEN]"
+		          << " client_id=" << handshake.client_id
+		          << " requested_session_epoch=" << open.requested_session_epoch()
+		          << " assigned_session_epoch=" << connection_session_epoch
+		          << " committed_hwm=" << snapshot.reconnect_committed_hwm
+		          << " status=" << status;
+	}
 	if (connection_session_epoch != 0) {
 		DurableSessionSnapshot snapshot = ReadDurableSessionSnapshot(
 			cxl_manager_, handshake.topic, handshake.client_id, connection_session_epoch);
@@ -1013,43 +1119,54 @@ void NetworkManager::HandlePublishRequest(
 	// so timeout is not needed for shutdown detection. For microsecond-scale batch processing,
 	// 200ms timeout introduces significant latency variability.
 	// setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-	if (handshake.ack >= 1) {
-		absl::MutexLock lock(&ack_mu_);
-		auto it = ack_connections_.find(handshake.client_id);
-
-		if (it != ack_connections_.end()) {
-			ack_fd = it->second;
-		} else {
-			// Create new acknowledgment connection
-			// Capture ack_efd_ locally before starting thread to prevent race condition
+		if (handshake.ack >= 1) {
+			bool need_ack_thread = false;
 			int local_ack_efd = -1;
-			if (!SetupAcknowledgmentSocket(ack_fd, client_address, handshake.port)) {
-				close(client_socket);
-				return;
+			{
+				absl::MutexLock lock(&ack_mu_);
+				auto it = ack_connections_.find(handshake.client_id);
+				auto epoch_it = ack_connection_epochs_.find(handshake.client_id);
+				const bool same_session =
+					it != ack_connections_.end() &&
+					epoch_it != ack_connection_epochs_.end() &&
+					epoch_it->second == connection_session_epoch;
+				if (same_session) {
+					ack_fd = it->second;
+				} else {
+					need_ack_thread = true;
+				}
 			}
 
-			// Capture the ack_efd_ value immediately after setup, before it can be overwritten
-			local_ack_efd = ack_efd_;
+			if (need_ack_thread) {
+				if (!SetupAcknowledgmentSocket(ack_fd, client_address, handshake.port)) {
+					close(client_socket);
+					return;
+				}
+				local_ack_efd = ack_efd_;
+				{
+					absl::MutexLock lock(&ack_mu_);
+					ack_fd_ = ack_fd;
+					ack_connections_[handshake.client_id] = ack_fd;
+					ack_connection_epochs_[handshake.client_id] = connection_session_epoch;
+				}
 
-			ack_fd_ = ack_fd;
-			ack_connections_[handshake.client_id] = ack_fd;
-
-			// [[CRITICAL: Validate topic before starting AckThread]]
-			// Empty topic -> GetOffsetToAck returns wrong TInode -> client ACK timeout
-			if (strlen(handshake.topic) == 0) {
-				LOG(ERROR) << "HandlePublishRequest: Empty topic in handshake for broker " << broker_id_
-				           << ", client_id=" << handshake.client_id << ". NOT starting AckThread!";
-				// Still keep connection open for publish, but ACKs will not work correctly
-			} else {
-				LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
-				          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id;
-				// Pass local_ack_efd to thread so it uses the correct epoll instance.
-				threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic,
-					handshake.ack, ack_fd, local_ack_efd, handshake.client_id,
-					connection_session_epoch);
+				// [[CRITICAL: Validate topic before starting AckThread]]
+				// Empty topic -> GetOffsetToAck returns wrong TInode -> client ACK timeout
+				if (strlen(handshake.topic) == 0) {
+					LOG(ERROR) << "HandlePublishRequest: Empty topic in handshake for broker " << broker_id_
+					           << ", client_id=" << handshake.client_id << ". NOT starting AckThread!";
+					// Still keep connection open for publish, but ACKs will not work correctly
+				} else {
+					LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
+					          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id
+					          << ", session_epoch=" << connection_session_epoch;
+					// Pass local_ack_efd to thread so it uses the correct epoll instance.
+					threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic,
+						handshake.ack, ack_fd, local_ack_efd, handshake.client_id,
+						connection_session_epoch);
+				}
 			}
 		}
-	}
 
 	// Process message batches
 	bool running = true;
@@ -2363,6 +2480,7 @@ void NetworkManager::AckThread(
 		auto it = ack_connections_.find(client_id);
 		if (it != ack_connections_.end() && it->second == ack_fd) {
 			ack_connections_.erase(it);
+			ack_connection_epochs_.erase(client_id);
 		}
 		if (ack_fd_ == ack_fd) {
 			ack_fd_ = -1;

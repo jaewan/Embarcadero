@@ -170,6 +170,38 @@ void QueueBuffer::NotifyAllWaiters() {
 	}
 }
 
+bool QueueBuffer::BeginProducerOp() {
+	for (;;) {
+		if (session_rollover_paused_fast_.load(std::memory_order_acquire)) {
+			std::unique_lock<std::mutex> lock(session_rollover_mu_);
+			session_rollover_cv_.wait(lock, [&]() {
+				return !session_rollover_paused_ || shutdown_.load(std::memory_order_acquire);
+			});
+			if (shutdown_.load(std::memory_order_acquire)) return false;
+			continue;
+		}
+		if (shutdown_.load(std::memory_order_acquire)) return false;
+		active_producer_ops_.fetch_add(1, std::memory_order_acq_rel);
+		if (!session_rollover_paused_fast_.load(std::memory_order_acquire)) {
+			return true;
+		}
+		EndProducerOp();
+	}
+}
+
+void QueueBuffer::EndProducerOp() {
+	const size_t previous = active_producer_ops_.fetch_sub(1, std::memory_order_acq_rel);
+	if (previous == 0) {
+		active_producer_ops_.fetch_add(1, std::memory_order_relaxed);
+		LOG(ERROR) << "QueueBuffer::EndProducerOp called with no active producer op";
+		return;
+	}
+	if (previous == 1 && session_rollover_paused_fast_.load(std::memory_order_acquire)) {
+		std::lock_guard<std::mutex> lock(session_rollover_mu_);
+		session_rollover_cv_.notify_all();
+	}
+}
+
 bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* context) {
 	if (!pool_) {
 		LOG(ERROR) << "QueueBuffer::" << (context ? context : "AcquireNextBatchFromPool")
@@ -330,6 +362,12 @@ retry_push:
 }
 
 bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t paddedSize, size_t& sealed_out) {
+	if (!BeginProducerOp()) return false;
+	struct EndGuard {
+		QueueBuffer* self;
+		~EndGuard() { self->EndProducerOp(); }
+	} guard{this};
+
 	size_t sealed_count = 0;
 	sealed_out = 0;
 	const size_t v1_header_size = sizeof(Embarcadero::MessageHeader);
@@ -392,10 +430,20 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 }
 
 void QueueBuffer::Seal() {
+	if (!BeginProducerOp()) return;
+	struct EndGuard {
+		QueueBuffer* self;
+		~EndGuard() { self->EndProducerOp(); }
+	} guard{this};
 	SealCurrentAndAdvance();
 }
 
 size_t QueueBuffer::SealAll() {
+	if (!BeginProducerOp()) return 0;
+	struct EndGuard {
+		QueueBuffer* self;
+		~EndGuard() { self->EndProducerOp(); }
+	} guard{this};
 	return SealCurrentAndAdvance();
 }
 
@@ -531,6 +579,7 @@ void QueueBuffer::WriteFinished() {
 void QueueBuffer::ReturnReads() {
 	shutdown_.store(true, std::memory_order_release);
 	NotifyAllWaiters();
+	session_rollover_cv_.notify_all();
 }
 
 void QueueBuffer::SetActiveQueues(size_t active_count) {
@@ -572,8 +621,45 @@ void QueueBuffer::ClearPreferredQueues() {
 	preferred_queue_count_.store(0, std::memory_order_release);
 }
 
+void QueueBuffer::PauseSessionRollover() {
+	std::unique_lock<std::mutex> lock(session_rollover_mu_);
+	session_rollover_paused_ = true;
+	session_rollover_paused_fast_.store(true, std::memory_order_release);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	session_rollover_cv_.wait(lock, [&]() {
+		return active_producer_ops_.load(std::memory_order_acquire) == 0 ||
+		       shutdown_.load(std::memory_order_acquire);
+	});
+}
+
+size_t QueueBuffer::SealAllForSessionRollover() {
+	std::lock_guard<std::mutex> lock(session_rollover_mu_);
+	if (!session_rollover_paused_ || active_producer_ops_.load(std::memory_order_acquire) != 0) {
+		LOG(ERROR) << "QueueBuffer::SealAllForSessionRollover called without quiescing producers";
+		return 0;
+	}
+	return SealCurrentAndAdvance();
+}
+
+void QueueBuffer::SetNextBatchSeqForNewSession(size_t next_batch_seq) {
+	std::lock_guard<std::mutex> lock(session_rollover_mu_);
+	if (!session_rollover_paused_ || active_producer_ops_.load(std::memory_order_acquire) != 0) {
+		LOG(ERROR) << "QueueBuffer::SetNextBatchSeqForNewSession called without quiescing producers";
+	}
+	batch_seq_.store(next_batch_seq, std::memory_order_relaxed);
+}
+
+void QueueBuffer::ResumeSessionRollover() {
+	{
+		std::lock_guard<std::mutex> lock(session_rollover_mu_);
+		session_rollover_paused_ = false;
+		session_rollover_paused_fast_.store(false, std::memory_order_release);
+	}
+	session_rollover_cv_.notify_all();
+}
+
 void QueueBuffer::ResetBatchSeqForNewSession() {
-	batch_seq_.store(0, std::memory_order_relaxed);
+	SetNextBatchSeqForNewSession(0);
 }
 
 void QueueBuffer::WarmupBuffers() {

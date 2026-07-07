@@ -29,6 +29,58 @@
 namespace {
 constexpr uint32_t kSessionControlMagic = 0x53455346U;  // "SESF"
 constexpr uint32_t kMaxSessionControlPayload = 64 * 1024;
+
+struct SessionControlHeader {
+	uint32_t magic;
+	uint32_t length;
+};
+
+uint32_t ReadSessionEpochOverride() {
+	const char* env = std::getenv("EMBARCADERO_SESSION_EPOCH");
+	if (!env || env[0] == '\0') return 0;
+	char* end = nullptr;
+	unsigned long parsed = std::strtoul(env, &end, 10);
+	if (end == env || (end && *end != '\0')) return 0;
+	return static_cast<uint32_t>(parsed);
+}
+
+bool SendAllBlocking(int fd, const void* data, size_t len) {
+	const uint8_t* p = static_cast<const uint8_t*>(data);
+	size_t sent = 0;
+	while (sent < len) {
+		ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			return false;
+		}
+		if (n == 0) return false;
+		sent += static_cast<size_t>(n);
+	}
+	return true;
+}
+
+bool RecvAllBlocking(int fd, void* data, size_t len) {
+	uint8_t* p = static_cast<uint8_t*>(data);
+	size_t got = 0;
+	while (got < len) {
+		ssize_t n = recv(fd, p + got, len - got, 0);
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			return false;
+		}
+		if (n == 0) return false;
+		got += static_cast<size_t>(n);
+	}
+	return true;
+}
+
+void SetSocketBlockingTemporarily(int fd, bool blocking, int* old_flags) {
+	if (old_flags == nullptr) return;
+	if (*old_flags < 0) *old_flags = fcntl(fd, F_GETFL, 0);
+	if (*old_flags < 0) return;
+	int flags = blocking ? (*old_flags & ~O_NONBLOCK) : *old_flags;
+	fcntl(fd, F_SETFL, flags);
+}
 }
 
 
@@ -311,6 +363,9 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 	// Initialize first broker
 	nodes_[0] = head_addr + ":" + std::to_string(PORT);
 	brokers_.emplace_back(0);
+	const uint32_t initial_epoch = InitialSessionEpochRequest();
+	requested_session_epoch_.store(initial_epoch, std::memory_order_release);
+	session_epoch_.store(ReadSessionEpochOverride(), std::memory_order_release);
 
 	VLOG(3) << "Publisher constructed with client_id: " << client_id_ 
 		<< ", topic: " << topic 
@@ -379,6 +434,433 @@ void Publisher::LogOrder5RoutingSummary() const {
 	LOG(INFO) << oss.str();
 }
 
+bool Publisher::IsOrder5SessionMode() const {
+	return seq_type_ == heartbeat_system::SequencerType::EMBARCADERO &&
+	       order_level_ == Embarcadero::kOrderStrong;
+}
+
+uint32_t Publisher::InitialSessionEpochRequest() const {
+	const uint32_t override_epoch = ReadSessionEpochOverride();
+	return override_epoch != 0 ? override_epoch : 1U;
+}
+
+uint64_t Publisher::SessionLeaseNs() const {
+	if (const char* env = std::getenv("EMBARCADERO_SESSION_LEASE_MS")) {
+		char* end = nullptr;
+		unsigned long parsed = std::strtoul(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0) {
+			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
+		}
+	}
+	const bool replicated = ack_level_ == 2;
+	return (replicated ? 2000ULL : 1000ULL) * 1000ULL * 1000ULL;
+}
+
+size_t Publisher::ComputeUnackedByteCap() const {
+	const uint64_t lease_ns = SessionLeaseNs();
+	uint64_t offered_rate = 12ULL * 1024ULL * 1024ULL * 1024ULL;
+	if (const char* env = std::getenv("EMBARCADERO_OFFERED_RATE_BYTES_PER_SEC")) {
+		char* end = nullptr;
+		unsigned long long parsed = std::strtoull(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0) {
+			offered_rate = parsed;
+		}
+	}
+	const long double cap = static_cast<long double>(offered_rate) *
+	                        static_cast<long double>(lease_ns) / 1.0e9L;
+	const long double max_size = static_cast<long double>(std::numeric_limits<size_t>::max());
+	return static_cast<size_t>(std::max<long double>(BATCH_SIZE, std::min(cap, max_size)));
+}
+
+bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
+	if (!IsOrder5SessionMode()) return true;
+	uint32_t requested = requested_session_epoch_.load(std::memory_order_acquire);
+	if (requested == 0) {
+		requested = InitialSessionEpochRequest();
+		uint32_t expected = 0;
+		requested_session_epoch_.compare_exchange_strong(expected, requested);
+	}
+
+	embarcadero::session::SessionOpen open;
+	open.set_client_id(static_cast<uint32_t>(client_id_));
+	open.set_requested_session_epoch(requested);
+	open.set_topic(std::string(topic_, strnlen(topic_, TOPIC_NAME_SIZE)));
+	std::string payload;
+	if (!open.SerializeToString(&payload)) return false;
+	if (payload.size() > kMaxSessionControlPayload) return false;
+	const SessionControlHeader header{kSessionControlMagic, static_cast<uint32_t>(payload.size())};
+
+	int old_flags = -1;
+	SetSocketBlockingTemporarily(sock_fd, true, &old_flags);
+	struct timeval tv;
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	const bool sent = SendAllBlocking(sock_fd, &header, sizeof(header)) &&
+	                  SendAllBlocking(sock_fd, payload.data(), payload.size());
+	if (!sent) {
+		if (old_flags >= 0) fcntl(sock_fd, F_SETFL, old_flags);
+		return false;
+	}
+
+	SessionControlHeader ack_header{};
+	if (!RecvAllBlocking(sock_fd, &ack_header, sizeof(ack_header)) ||
+	    ack_header.magic != kSessionControlMagic ||
+	    ack_header.length == 0 ||
+	    ack_header.length > kMaxSessionControlPayload) {
+		if (old_flags >= 0) fcntl(sock_fd, F_SETFL, old_flags);
+		return false;
+	}
+	std::string ack_payload(ack_header.length, '\0');
+	if (!RecvAllBlocking(sock_fd, ack_payload.data(), ack_payload.size())) {
+		if (old_flags >= 0) fcntl(sock_fd, F_SETFL, old_flags);
+		return false;
+	}
+	if (old_flags >= 0) fcntl(sock_fd, F_SETFL, old_flags);
+
+	embarcadero::session::SessionOpenAck ack;
+	if (!ack.ParseFromString(ack_payload) || ack.assigned_session_epoch() == 0) {
+		return false;
+	}
+	session_epoch_.store(ack.assigned_session_epoch(), std::memory_order_release);
+	requested_session_epoch_.store(ack.assigned_session_epoch(), std::memory_order_release);
+	LOG(INFO) << "[SESSION_OPEN_ACK]"
+	          << " broker_id=" << broker_id
+	          << " client_id=" << client_id_
+	          << " assigned_session_epoch=" << ack.assigned_session_epoch()
+	          << " committed_hwm=" << ack.committed_hwm()
+	          << " status=" << ack.status();
+	return true;
+}
+
+void Publisher::WaitForUnackedCapacity(size_t bytes) {
+	if (!IsOrder5SessionMode() || ack_level_ < 1 || unacked_byte_cap_ == 0) return;
+	std::unique_lock<std::mutex> lock(unacked_mu_);
+	unacked_cv_.wait(lock, [&]() {
+		return shutdown_.load(std::memory_order_relaxed) ||
+		       unacked_bytes_ + bytes <= unacked_byte_cap_;
+	});
+}
+
+bool Publisher::RecordUnackedBatch(const Embarcadero::BatchHeader& header,
+                                   const void* batch_bytes,
+                                   size_t wire_bytes,
+                                   int broker_id,
+                                   size_t) {
+	if (!IsOrder5SessionMode() || ack_level_ < 1 || header.session_epoch32 == 0) return false;
+	UnackedBatch rec;
+	rec.original_batch_seq = header.batch_seq;
+	rec.current_batch_seq = header.batch_seq;
+	rec.num_msg = header.num_msg;
+	rec.session_epoch = header.session_epoch32;
+	rec.broker_id = broker_id;
+	rec.last_send_ns = SteadyNowNs();
+	last_unacked_send_ns_.store(rec.last_send_ns, std::memory_order_release);
+	rec.batch = const_cast<Embarcadero::BatchHeader*>(
+		static_cast<const Embarcadero::BatchHeader*>(batch_bytes));
+	rec.wire_bytes = wire_bytes;
+	std::lock_guard<std::mutex> lock(unacked_mu_);
+	session_sent_hwm_ += rec.num_msg;
+	rec.broker_ack_end = std::numeric_limits<size_t>::max();
+	unacked_bytes_ += rec.wire_bytes;
+	unacked_batches_.push_back(std::move(rec));
+	std::sort(unacked_batches_.begin(), unacked_batches_.end(), [](const UnackedBatch& a, const UnackedBatch& b) {
+		return a.current_batch_seq < b.current_batch_seq;
+	});
+	return true;
+}
+
+void Publisher::CompleteUnackedThrough(int, size_t broker_ack_hwm) {
+	if (!IsOrder5SessionMode() || ack_level_ < 1) return;
+	const int64_t now_ns = SteadyNowNs();
+	std::vector<Embarcadero::BatchHeader*> release_after_unlock;
+	{
+		std::lock_guard<std::mutex> lock(unacked_mu_);
+		for (auto it = unacked_batches_.begin(); it != unacked_batches_.end();) {
+			size_t candidate_hwm = 0;
+			if (!SessionPrefixAckEnd(it->current_batch_seq,
+			                         session_next_retire_batch_seq_,
+			                         session_retire_prefix_hwm_,
+			                         it->num_msg,
+			                         &candidate_hwm)) {
+				break;
+			}
+			it->broker_ack_end = candidate_hwm;
+			if (!SessionGlobalUnackedRetired(candidate_hwm, broker_ack_hwm)) {
+				break;
+			}
+			{
+				std::lock_guard<std::mutex> delta_lock(delta_mu_);
+				delta_estimator_.sample(static_cast<uint64_t>(std::max<int64_t>(0, now_ns - it->last_send_ns)),
+				                        it->attempt);
+			}
+			session_retire_prefix_hwm_ = candidate_hwm;
+			session_next_retire_batch_seq_++;
+			unacked_bytes_ -= it->wire_bytes;
+			if (it->batch != nullptr) {
+				release_after_unlock.push_back(it->batch);
+			}
+			it = unacked_batches_.erase(it);
+			unacked_cv_.notify_all();
+		}
+	}
+	for (auto* batch : release_after_unlock) {
+		pubQue_.ReleaseBatch(batch);
+	}
+}
+
+bool Publisher::SendRawBatchToBroker(const void* bytes, size_t wire_bytes, int broker_id) {
+	if (bytes == nullptr || wire_bytes < sizeof(Embarcadero::BatchHeader)) return false;
+	std::string addr;
+	size_t num_brokers = 0;
+	{
+		absl::MutexLock lock(&mutex_);
+		auto it = nodes_.find(broker_id);
+		if (it == nodes_.end()) return false;
+		try {
+			auto parsed = ParseAddressPort(it->second);
+			addr = parsed.first;
+		} catch (const std::exception& e) {
+			LOG(ERROR) << "SendRawBatchToBroker: invalid broker address " << it->second << ": " << e.what();
+			return false;
+		}
+		num_brokers = nodes_.size();
+	}
+	ScopedFd sock(GetNonblockingSock(const_cast<char*>(addr.c_str()), PORT + broker_id));
+	if (sock.get() < 0) return false;
+	ScopedFd efd(epoll_create1(0));
+	if (efd.get() < 0) return false;
+	epoll_event event;
+	event.data.fd = sock.get();
+	event.events = EPOLLOUT | EPOLLRDHUP;
+	if (epoll_ctl(efd.get(), EPOLL_CTL_ADD, sock.get(), &event) != 0) return false;
+	epoll_event events[4];
+	int ready = epoll_wait(efd.get(), events, 4, 1000);
+	if (ready <= 0) return false;
+	int sock_err = 0;
+	socklen_t sock_err_len = sizeof(sock_err);
+	if (getsockopt(sock.get(), SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len) != 0 ||
+	    sock_err != 0) {
+		return false;
+	}
+	int old_flags = -1;
+	SetSocketBlockingTemporarily(sock.get(), true, &old_flags);
+
+	Embarcadero::EmbarcaderoReq shake;
+	std::memset(&shake, 0, sizeof(shake));
+	shake.client_req = Embarcadero::Publish;
+	shake.client_id = client_id_;
+	std::memcpy(shake.topic, topic_, std::min<size_t>(TOPIC_NAME_SIZE - 1, sizeof(shake.topic) - 1));
+	shake.ack = ack_level_;
+	shake.port = ack_port_;
+	shake.num_msg = num_brokers;
+	if (!SendAllBlocking(sock.get(), &shake, sizeof(shake))) return false;
+	if (!SendSessionOpenOnSocket(sock.get(), efd.get(), static_cast<size_t>(broker_id))) return false;
+	const bool ok = SendAllBlocking(sock.get(), bytes, wire_bytes);
+	if (old_flags >= 0) fcntl(sock.get(), F_SETFL, old_flags);
+	return ok;
+}
+
+void Publisher::WaitForSessionSendDrain(size_t target_messages) {
+	const int64_t deadline_ns = SteadyNowNs() + static_cast<int64_t>(SessionLeaseNs());
+	while (SteadyNowNs() < deadline_ns) {
+		size_t sent_hwm = 0;
+		{
+			std::lock_guard<std::mutex> lock(unacked_mu_);
+			sent_hwm = ack_message_base_.load(std::memory_order_acquire) + session_sent_hwm_;
+		}
+		if (sent_hwm >= target_messages) return;
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	LOG(WARNING) << "[SESSION_ROLLOVER_DRAIN_TIMEOUT]"
+	             << " target_messages=" << target_messages;
+}
+
+void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& fenced, int broker_id) {
+	if (!IsOrder5SessionMode()) return;
+	const uint32_t old_epoch = session_epoch_.load(std::memory_order_acquire);
+	const uint32_t new_epoch = NextSessionEpochAfterFence(old_epoch);
+	session_fenced_observed_.fetch_add(1, std::memory_order_relaxed);
+	session_fenced_committed_batch_seq_.store(fenced.committed_batch_seq(), std::memory_order_release);
+	session_fenced_reopen_pending_.store(true, std::memory_order_release);
+	pubQue_.PauseSessionRollover();
+	struct RolloverResumeGuard {
+		Publisher* self;
+		bool active{true};
+		~RolloverResumeGuard() {
+			if (!active) return;
+			self->session_fenced_reopen_pending_.store(false, std::memory_order_release);
+			self->pubQue_.ResumeSessionRollover();
+		}
+		void dismiss() { active = false; }
+	} rollover_guard{this};
+	const size_t sealed = pubQue_.SealAllForSessionRollover();
+	if (sealed > 0) {
+		client_order_.fetch_add(sealed, std::memory_order_release);
+	}
+	WaitForSessionSendDrain(client_order_.load(std::memory_order_acquire));
+	requested_session_epoch_.store(new_epoch, std::memory_order_release);
+	session_epoch_.store(new_epoch, std::memory_order_release);
+	last_ack_progress_ns_.store(SteadyNowNs(), std::memory_order_release);
+
+	std::vector<UnackedBatch> suffix;
+	std::vector<Embarcadero::BatchHeader*> release_after_unlock;
+	size_t locally_committed_msgs = 0;
+	const size_t ack_base_before_local_credit = ack_received_.load(std::memory_order_acquire);
+	{
+		std::lock_guard<std::mutex> lock(unacked_mu_);
+		for (const auto& rec : unacked_batches_) {
+			if (rec.session_epoch != old_epoch) continue;
+			if (rec.original_batch_seq <= fenced.committed_batch_seq()) {
+				locally_committed_msgs += rec.num_msg;
+				if (rec.batch != nullptr) {
+					release_after_unlock.push_back(rec.batch);
+				}
+			} else {
+				suffix.push_back(rec);
+			}
+		}
+		std::sort(suffix.begin(), suffix.end(), [](const UnackedBatch& a, const UnackedBatch& b) {
+			return a.original_batch_seq < b.original_batch_seq;
+		});
+		unacked_batches_.clear();
+		unacked_bytes_ = 0;
+		session_sent_hwm_ = 0;
+		session_retire_prefix_hwm_ = 0;
+		session_next_retire_batch_seq_ = 0;
+		unacked_cv_.notify_all();
+	}
+	for (auto* batch : release_after_unlock) {
+		pubQue_.ReleaseBatch(batch);
+	}
+	if (locally_committed_msgs > 0) {
+		broker_stats_[0].acked_messages.fetch_add(locally_committed_msgs, std::memory_order_relaxed);
+		ack_received_.fetch_add(locally_committed_msgs, std::memory_order_release);
+		LOG(WARNING) << "[SESSION_FENCE_LOCAL_COMMIT]"
+		             << " old_epoch=" << old_epoch
+		             << " committed_batch_seq=" << fenced.committed_batch_seq()
+		             << " credited_msgs=" << locally_committed_msgs;
+	}
+	const size_t ack_after_local_credit = ack_received_.load(std::memory_order_acquire);
+	const size_t rebased_ack_base =
+		RebasedAckBaseAfterFenceCredit(ack_base_before_local_credit, locally_committed_msgs);
+	CHECK_EQ(rebased_ack_base, ack_after_local_credit);
+	ack_message_base_.store(rebased_ack_base, std::memory_order_release);
+	order5_last_ack_hwm_.store(rebased_ack_base, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> lock(unacked_mu_);
+		session_retire_prefix_hwm_ = rebased_ack_base;
+	}
+
+	uint64_t new_seq = 0;
+	for (auto& rec : suffix) {
+		auto* header = rec.batch;
+		if (header == nullptr) continue;
+		header->batch_seq = new_seq++;
+		header->session_epoch = static_cast<uint16_t>(new_epoch & 0xFFFFU);
+		header->session_epoch32 = new_epoch;
+		header->client_id = client_id_;
+		std::vector<int> survivors;
+		{
+			absl::MutexLock lock(&mutex_);
+			survivors = brokers_;
+		}
+		const int target = RendezvousBroker(static_cast<uint32_t>(client_id_),
+		                                    header->batch_seq,
+		                                    survivors,
+		                                    -1);
+		if (target < 0) continue;
+		header->broker_id = static_cast<uint32_t>(target);
+		SendRawBatchToBroker(rec.batch, rec.wire_bytes, target);
+		rec.current_batch_seq = header->batch_seq;
+		rec.session_epoch = new_epoch;
+		rec.broker_id = target;
+		rec.attempt = 1;
+		rec.last_send_ns = SteadyNowNs();
+		last_unacked_send_ns_.store(rec.last_send_ns, std::memory_order_release);
+		std::lock_guard<std::mutex> lock(unacked_mu_);
+		session_sent_hwm_ += rec.num_msg;
+		rec.broker_ack_end = std::numeric_limits<size_t>::max();
+		unacked_bytes_ += rec.wire_bytes;
+		unacked_batches_.push_back(std::move(rec));
+	}
+	pubQue_.SetNextBatchSeqForNewSession(NextBatchSeqAfterSuffixResubmit(static_cast<size_t>(new_seq)));
+	session_fenced_reopen_pending_.store(false, std::memory_order_release);
+	pubQue_.ResumeSessionRollover();
+	rollover_guard.dismiss();
+	LOG(WARNING) << "[SESSION_REOPEN_RESUBMIT]"
+	             << " old_epoch=" << old_epoch
+	             << " new_epoch=" << new_epoch
+	             << " committed_batch_seq=" << fenced.committed_batch_seq()
+	             << " suffix_batches=" << suffix.size();
+}
+
+void Publisher::RetransmitThread() {
+	while (!shutdown_.load(std::memory_order_relaxed)) {
+		double delta_ms = DeltaEstimator::kDeltaFloorMs;
+		{
+			std::lock_guard<std::mutex> lock(delta_mu_);
+			delta_ms = delta_estimator_.delta_ms();
+		}
+		const double sleep_ms = std::min(delta_ms / 2.0, 2.0);
+		std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int>(sleep_ms * 1000.0)));
+		const int64_t now_ns = SteadyNowNs();
+		struct DueRetransmit {
+			std::vector<uint8_t> bytes;
+			int broker_id{-1};
+			uint64_t current_batch_seq{0};
+		};
+		std::vector<DueRetransmit> due;
+		{
+			std::lock_guard<std::mutex> lock(unacked_mu_);
+			for (auto& rec : unacked_batches_) {
+				const double backoff_ms = delta_ms * static_cast<double>(1ULL << std::min<uint32_t>(rec.attempt, 10));
+				const double backstop_ms = std::max(backoff_ms, DeltaEstimator::kDeltaCapMs);
+				const int64_t due_ns = static_cast<int64_t>(backstop_ms * 1.0e6);
+				const int64_t last_progress_ns = std::max(
+					last_unacked_send_ns_.load(std::memory_order_acquire),
+					last_ack_progress_ns_.load(std::memory_order_acquire));
+				if (last_progress_ns > 0 && now_ns - last_progress_ns < due_ns) {
+					continue;
+				}
+				if (now_ns - rec.last_send_ns >= due_ns) {
+					DueRetransmit item;
+					item.broker_id = rec.broker_id;
+					item.current_batch_seq = rec.current_batch_seq;
+					item.bytes.resize(rec.wire_bytes);
+					if (rec.batch != nullptr) {
+						std::memcpy(item.bytes.data(), rec.batch, rec.wire_bytes);
+						due.push_back(std::move(item));
+					}
+					rec.attempt++;
+					rec.last_send_ns = now_ns;
+				}
+			}
+		}
+		for (auto& rec : due) {
+			std::vector<int> survivors;
+			{
+				absl::MutexLock lock(&mutex_);
+				survivors = brokers_;
+			}
+			const int target = RendezvousBroker(static_cast<uint32_t>(client_id_),
+			                                    rec.current_batch_seq,
+			                                    survivors,
+			                                    rec.broker_id);
+			if (target < 0) continue;
+			auto* header = reinterpret_cast<Embarcadero::BatchHeader*>(rec.bytes.data());
+			header->broker_id = static_cast<uint32_t>(target);
+			header->session_epoch = static_cast<uint16_t>(session_epoch_.load(std::memory_order_acquire) & 0xFFFFU);
+			header->session_epoch32 = session_epoch_.load(std::memory_order_acquire);
+			if (SendRawBatchToBroker(rec.bytes.data(), rec.bytes.size(), target)) {
+				retransmit_attempts_.fetch_add(1, std::memory_order_relaxed);
+				last_unacked_send_ns_.store(SteadyNowNs(), std::memory_order_release);
+			}
+		}
+	}
+}
+
 Publisher::~Publisher() {
 	VLOG(3) << "Publisher destructor called, cleaning up resources";
 
@@ -393,6 +875,7 @@ Publisher::~Publisher() {
 	publish_finished_.store(true, std::memory_order_relaxed);
 	shutdown_.store(true, std::memory_order_relaxed);
 	consumer_should_exit_.store(true, std::memory_order_relaxed);
+	unacked_cv_.notify_all();
 	// Cancel current gRPC SubscribeToCluster call so cluster_probe_thread_ can exit (reader->Read() unblocks).
 	if (grpc::ClientContext* ctx = subscribe_context_.exchange(nullptr)) {
 		ctx->TryCancel();
@@ -415,6 +898,10 @@ Publisher::~Publisher() {
 
 	if (ack_thread_.joinable()) {
 		ack_thread_.join();
+	}
+
+	if (retransmit_thread_.joinable()) {
+		retransmit_thread_.join();
 	}
 
 	if (real_time_throughput_measure_thread_.joinable()) {
@@ -750,6 +1237,9 @@ void Publisher::Init(int ack_level) {
 	          << " ack_drain_ms_failure=" << ack_drain_ms_failure_
 	          << " ack_timeout_sec=" << ack_timeout_seconds_
 	          << " epoll_wait_writable_ms=" << epoll_wait_writable_ms_;
+	unacked_byte_cap_ = ComputeUnackedByteCap();
+	LOG(INFO) << "Publisher session lease_ns=" << SessionLeaseNs()
+	          << " unacked_byte_cap=" << unacked_byte_cap_;
 
 	// When set, PublishThread updates total_batches_attempted_ so ACK timeout log shows attempted count.
 	const char* ack_debug = std::getenv("EMBARCADERO_ACK_TIMEOUT_DEBUG");
@@ -765,6 +1255,11 @@ void Publisher::Init(int ack_level) {
 		ack_thread_ = std::thread([this]() {
 				this->EpollAckThread();
 				});
+		if (IsOrder5SessionMode()) {
+			retransmit_thread_ = std::thread([this]() {
+					this->RetransmitThread();
+					});
+		}
 
 		// Wait for acknowledgment thread to initialize (with timeout  EpollAckThread may fail to start)
 		constexpr auto ACK_THREAD_INIT_TIMEOUT = std::chrono::seconds(30);
@@ -1004,6 +1499,10 @@ void Publisher::WarmupBuffers() {
 }
 
 void Publisher::Publish(char* message, size_t len) {
+	while (session_fenced_reopen_pending_.load(std::memory_order_acquire) &&
+	       !shutdown_.load(std::memory_order_relaxed)) {
+		Embarcadero::CXL::cpu_pause();
+	}
 	constexpr size_t kHeaderSize = sizeof(Embarcadero::MessageHeader);
 	// Branchless 64-byte payload alignment for the hot path.
 	const size_t padded_total = ((len + 63) & ~static_cast<size_t>(63)) + kHeaderSize;
@@ -1275,6 +1774,22 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			LOG(INFO) << "[ACK_VERIFY] normalized_received=" << normalized_received
 			          << " raw_received=" << received
 			          << " target=" << target_acks << " 100%";
+			if (IsOrder5SessionMode() && ack_level_ >= 1) {
+				size_t unacked_bytes = 0;
+				size_t unacked_batches = 0;
+				size_t session_sent_hwm = 0;
+				{
+					std::lock_guard<std::mutex> lock(unacked_mu_);
+					unacked_bytes = unacked_bytes_;
+					unacked_batches = unacked_batches_.size();
+					session_sent_hwm = session_sent_hwm_;
+				}
+				LOG(INFO) << "[UNACKED_DRAIN]"
+				          << " bytes=" << unacked_bytes
+				          << " batches=" << unacked_batches
+				          << " session_sent_hwm=" << session_sent_hwm
+				          << " ack_base=" << ack_message_base_.load(std::memory_order_acquire);
+			}
 			if (ack_jitter_trace) {
 				const auto ack_wait_ms = std::chrono::duration_cast<std::chrono::microseconds>(
 					std::chrono::steady_clock::now() - wait_start_time).count() / 1000.0;
@@ -1778,11 +2293,15 @@ process_client_fd:;
 							        << "Total ACK connections: " << brokers_with_ack_connection_.size()
 							        << " / expected: " << expected_ack_brokers_.load(std::memory_order_relaxed);
 						}
-						// Clear partial read state for this FD
-						partial_id_reads.erase(client_sock);
-						partial_ack_reads[client_sock] = {0, 0}; // Init ACK read buffer for this connection
-						// Continue reading potential ACK data in the same loop iteration
-					}
+							// Clear partial read state for this FD
+							partial_id_reads.erase(client_sock);
+							partial_ack_reads[client_sock] = {0, 0}; // Init ACK read buffer for this connection
+							if (IsOrder5SessionMode()) {
+								prev_ack_per_sock[client_sock] =
+									ack_message_base_.load(std::memory_order_acquire);
+							}
+							// Continue reading potential ACK data in the same loop iteration
+						}
 					// If ID still not complete, loop will try recv() again if more data indicated by epoll
 				}else if(current_state == ConnState::READING_ACKS){
 					// [[CRITICAL_FIX: Buffer partial ACK reads]] - Don't discard bytes when recv returns < sizeof(size_t).
@@ -1861,16 +2380,16 @@ process_client_fd:;
 							connection_error_or_closed = true;
 							break;
 						}
-						LOG(WARNING) << "[SESSION_FENCED_OBSERVED]"
-						             << " broker_id=" << client_sockets[client_sock]
-						             << " committed_batch_seq=" << fenced.committed_batch_seq()
-						             << " committed_msg_hwm=" << fenced.committed_msg_hwm()
-						             << " control_epoch=" << fenced.control_epoch()
-						             << " reason=" << fenced.reason();
-						shutdown_.store(true, std::memory_order_release);
-						connection_error_or_closed = true;
-						break;
-					}
+							LOG(WARNING) << "[SESSION_FENCED_OBSERVED]"
+							             << " broker_id=" << client_sockets[client_sock]
+							             << " committed_batch_seq=" << fenced.committed_batch_seq()
+							             << " committed_msg_hwm=" << fenced.committed_msg_hwm()
+							             << " control_epoch=" << fenced.control_epoch()
+							             << " reason=" << fenced.reason();
+							HandleSessionFenced(fenced, client_sockets[client_sock]);
+							connection_error_or_closed = true;
+							break;
+						}
 					if (ShouldEnableNetworkPathProfile()) {
 						GetClientNetworkPathProfile().ack_values_processed.fetch_add(1, std::memory_order_relaxed);
 					}
@@ -1884,36 +2403,52 @@ process_client_fd:;
 						connection_error_or_closed = true; break;
 					}
 
+					const size_t session_global_acked =
+						IsOrder5SessionMode()
+							? SessionGlobalAckFromGeneration(
+								ack_message_base_.load(std::memory_order_acquire),
+								acked_msg)
+							: acked_msg;
 					size_t prev_acked = prev_ack_per_sock[client_sock]; // Assumes key exists
 
-					if (acked_msg >= prev_acked || prev_acked == (size_t)-1) { // Check for valid cumulative value
+					if (session_global_acked >= prev_acked || prev_acked == (size_t)-1) { // Check for valid cumulative value
 						// [[CRITICAL_FIX: Handle first ACK correctly to avoid unsigned underflow]]
 						// If prev_acked == (size_t)-1, this is the first ACK from this broker
 						// Direct subtraction would underflow: acked_msg - (size_t)-1 = huge number
 						// We must handle first ACK specially: new_acked_msgs = acked_msg (not acked_msg - (-1))
 						size_t new_acked_msgs;
-						if (prev_acked == (size_t)-1) {
+						if (IsOrder5SessionMode()) {
+							size_t global_prev = order5_last_ack_hwm_.load(std::memory_order_acquire);
+							while (session_global_acked > global_prev &&
+							       !order5_last_ack_hwm_.compare_exchange_weak(
+								       global_prev, session_global_acked,
+								       std::memory_order_acq_rel,
+								       std::memory_order_acquire)) {}
+							new_acked_msgs = session_global_acked > global_prev ? session_global_acked - global_prev : 0;
+						} else if (prev_acked == (size_t)-1) {
 							// First ACK from this broker - use value directly (no previous to subtract)
 							new_acked_msgs = acked_msg;
 						} else {
 							// Subsequent ACK - calculate increment from previous
-							new_acked_msgs = acked_msg - prev_acked;
+							new_acked_msgs = session_global_acked - prev_acked;
 						}
 						if (new_acked_msgs > 0) {
 #ifdef COLLECT_LATENCY_STATS
-								ProcessPublishAckLatency(broker_id, acked_msg);
+								ProcessPublishAckLatency(broker_id, session_global_acked);
 #endif
-							broker_stats_[broker_id].acked_messages.fetch_add(new_acked_msgs, std::memory_order_relaxed);
-							ack_received_.fetch_add(new_acked_msgs, std::memory_order_release);
-							prev_ack_per_sock[client_sock] = acked_msg; // Update last value for this socket
-						} else {
+								broker_stats_[broker_id].acked_messages.fetch_add(new_acked_msgs, std::memory_order_relaxed);
+								last_ack_progress_ns_.store(SteadyNowNs(), std::memory_order_release);
+								prev_ack_per_sock[client_sock] = session_global_acked; // Update last value for this socket
+								CompleteUnackedThrough(broker_id, session_global_acked);
+								ack_received_.fetch_add(new_acked_msgs, std::memory_order_release);
+							} else {
 							// Duplicate cumulative value, ignore.
 							VLOG(5) << "AckThread: fd=" << client_sock << " (Broker " << broker_id << 
-								") Duplicate ACK messages received: " << acked_msg;
+								") Duplicate ACK messages received: " << session_global_acked;
 						}
 					} else {
 						LOG(WARNING) << "AckThread: Received non-monotonic ACK bytes on fd " << client_sock
-							<< " (Broker " << broker_id << "). Received: " << acked_msg << ", Previous: " << prev_acked;
+							<< " (Broker " << broker_id << "). Received: " << session_global_acked << ", Previous: " << prev_acked;
 					}
 					// Continue loop to read potentially more data from this socket event
 				}else{
@@ -2071,14 +2606,18 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 		}
 
-		if (sent_bytes != sizeof(shake)) {
-			LOG(ERROR) << "PublishThread: Handshake incomplete - sent " << sent_bytes 
-			          << " of " << sizeof(shake) << " bytes to broker " << brokerId;
-			return false;
-		}
+			if (sent_bytes != sizeof(shake)) {
+				LOG(ERROR) << "PublishThread: Handshake incomplete - sent " << sent_bytes
+				          << " of " << sizeof(shake) << " bytes to broker " << brokerId;
+				return false;
+			}
+			if (!SendSessionOpenOnSocket(sock.get(), efd.get(), brokerId)) {
+				LOG(ERROR) << "PublishThread: SessionOpen failed for broker " << brokerId;
+				return false;
+			}
 
-		return true;
-	};
+			return true;
+		};
 
 	// Connect to initial broker
 	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Starting connection to broker " << broker_id;
@@ -2157,12 +2696,22 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			total_batches_attempted_.fetch_add(1, std::memory_order_relaxed);
 		}
 
-		batch_header->client_id = client_id_;
-		batch_header->broker_id = broker_id;
+			batch_header->client_id = client_id_;
+			batch_header->broker_id = broker_id;
+			if (IsOrder5SessionMode()) {
+				uint32_t epoch = session_epoch_.load(std::memory_order_acquire);
+				if (epoch == 0) {
+					epoch = requested_session_epoch_.load(std::memory_order_acquire);
+				}
+				batch_header->session_epoch = static_cast<uint16_t>(epoch & 0xFFFFU);
+				batch_header->session_epoch32 = epoch;
+			}
 
-		// Get pointer to message data
-		void* msg = reinterpret_cast<uint8_t*>(batch_header) + sizeof(Embarcadero::BatchHeader);
-		len = batch_header->total_size;
+			// Get pointer to message data
+			void* msg = reinterpret_cast<uint8_t*>(batch_header) + sizeof(Embarcadero::BatchHeader);
+			len = batch_header->total_size;
+			const size_t wire_bytes = sizeof(Embarcadero::BatchHeader) + len;
+			WaitForUnackedCapacity(wire_bytes);
 
 		// Function to send batch header
 		auto send_batch_header = [&]() -> void {
@@ -2319,10 +2868,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			// DYNAMIC MASK UPDATE: stop upstream from feeding this queue
 			pubQue_.MarkQueueInactive(pubQuesIdx);
 
-			// Handle broker failure by finding another broker
-			int new_broker_id;
-			{
-				absl::MutexLock lock(&mutex_);
+				// Handle broker failure by finding another broker
+				int new_broker_id;
+				{
+					absl::MutexLock lock(&mutex_);
 
 				// Remove the failed broker
 				auto it = std::find(brokers_.begin(), brokers_.end(), broker_id);
@@ -2338,9 +2887,15 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					return;
 				}
 
-				// Select replacement broker
-				new_broker_id = brokers_[(pubQuesIdx % num_threads_per_broker_) % brokers_.size()];
-			}
+					const std::vector<int> survivors = brokers_;
+					new_broker_id = RendezvousBroker(static_cast<uint32_t>(client_id_),
+					                                batch_header->batch_seq,
+					                                survivors,
+					                                broker_id);
+					if (new_broker_id < 0) {
+						new_broker_id = brokers_[(pubQuesIdx % num_threads_per_broker_) % brokers_.size()];
+					}
+				}
 
 			// CORFU: GetTotalOrder pre-assigns log_idx and broker_batch_seq for the
 			// original broker. Re-routing after that would write data to the wrong
@@ -2396,19 +2951,25 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			       !last_send_wall_ns_.compare_exchange_weak(prev, now_ns,
 			           std::memory_order_relaxed, std::memory_order_relaxed)) {}
 		}
-		size_t prev_sent = broker_stats_[broker_id].sent_messages.fetch_add(
-			batch_header->num_msg, std::memory_order_relaxed);
-		size_t end_count = prev_sent + batch_header->num_msg;
-#ifdef COLLECT_LATENCY_STATS
-		RecordPublishSend(broker_id, end_count, submit_time, has_submit_time);
+			size_t prev_sent = broker_stats_[broker_id].sent_messages.fetch_add(
+				batch_header->num_msg, std::memory_order_relaxed);
+			size_t end_count = prev_sent + batch_header->num_msg;
+				const bool unacked_owns_batch = RecordUnackedBatch(
+					*batch_header, batch_header,
+					sizeof(Embarcadero::BatchHeader) + batch_header->total_size,
+					broker_id, end_count);
+	#ifdef COLLECT_LATENCY_STATS
+			RecordPublishSend(broker_id, end_count, submit_time, has_submit_time);
 #else
 		(void)end_count;
 #endif
 		sent_batches += 1;
 		sent_msgs += batch_header->num_msg;
 
-		// Return batch to pool (QueueBuffer).
-		pubQue_.ReleaseBatch(batch_header);
+			// Return immediately unless UnackedBuffer retained the slot for ACK/fence handling.
+			if (!unacked_owns_batch) {
+				pubQue_.ReleaseBatch(batch_header);
+			}
 
 	}
 

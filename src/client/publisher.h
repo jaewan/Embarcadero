@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -11,6 +12,9 @@
 #include "absl/container/flat_hash_set.h"
 #include "common.h"
 #include "queue_buffer.h"
+#include "session.pb.h"
+
+struct PublisherTestPeer;
 
 /**
  * Publisher class for publishing messages to the messaging system
@@ -175,6 +179,7 @@ class Publisher {
 		void WriteFinishedOrPaused();
 
 	private:
+		friend struct PublisherTestPeer;
 		std::string head_addr_;
 		std::string port_;
 		int client_id_;
@@ -280,9 +285,10 @@ class Publisher {
 		// [[threading: EpollAckThread writes, Poll() reads]] — must be atomic for correctness
 		std::atomic<size_t> ack_received_{0};
 		std::vector<std::thread> threads_;
-		std::thread ack_thread_;
-		std::atomic<int> thread_count_{0};
-		std::atomic<bool> threads_joined_{false};
+			std::thread ack_thread_;
+			std::thread retransmit_thread_;
+			std::atomic<int> thread_count_{0};
+			std::atomic<bool> threads_joined_{false};
 		// [[FIX: B3=0 ACKs]] Track which brokers have established ACK connections
 		// This allows us to detect when a broker's ACK connection is missing
 		absl::flat_hash_set<int> brokers_with_ack_connection_ ABSL_GUARDED_BY(mutex_);
@@ -290,7 +296,58 @@ class Publisher {
 		std::atomic<int64_t> expected_ack_brokers_last_update_ns_{0};
 
 		// When true, PublishThread updates total_batches_attempted_ (for ACK timeout log). Set from EMBARCADERO_ACK_TIMEOUT_DEBUG in Init().
-		bool enable_batch_attempted_for_timeout_log_{false};
+			bool enable_batch_attempted_for_timeout_log_{false};
+
+			struct UnackedBatch {
+				uint64_t original_batch_seq{0};
+				uint64_t current_batch_seq{0};
+				uint32_t num_msg{0};
+				uint32_t session_epoch{0};
+				int broker_id{-1};
+				size_t broker_ack_end{0};
+				uint32_t attempt{0};
+				int64_t last_send_ns{0};
+				Embarcadero::BatchHeader* batch{nullptr};
+				size_t wire_bytes{0};
+			};
+
+			std::atomic<uint32_t> session_epoch_{0};
+			std::atomic<uint32_t> requested_session_epoch_{0};
+			std::atomic<size_t> ack_message_base_{0};
+			std::atomic<size_t> order5_last_ack_hwm_{0};
+			std::atomic<bool> session_fenced_reopen_pending_{false};
+			std::atomic<uint64_t> session_fenced_committed_batch_seq_{0};
+			std::atomic<uint64_t> retransmit_attempts_{0};
+			std::atomic<uint64_t> session_fenced_observed_{0};
+			std::atomic<int64_t> last_unacked_send_ns_{0};
+			std::atomic<int64_t> last_ack_progress_ns_{0};
+			std::mutex unacked_mu_;
+			std::condition_variable unacked_cv_;
+			std::deque<UnackedBatch> unacked_batches_;
+			size_t unacked_bytes_{0};
+			size_t unacked_byte_cap_{0};
+			size_t session_sent_hwm_{0};
+			size_t session_retire_prefix_hwm_{0};
+			uint64_t session_next_retire_batch_seq_{0};
+			DeltaEstimator delta_estimator_;
+			std::mutex delta_mu_;
+
+			bool IsOrder5SessionMode() const;
+			uint32_t InitialSessionEpochRequest() const;
+			uint64_t SessionLeaseNs() const;
+			size_t ComputeUnackedByteCap() const;
+			bool SendSessionOpenOnSocket(int sock_fd, int epoll_fd, size_t broker_id);
+			bool SendRawBatchToBroker(const void* bytes, size_t wire_bytes, int broker_id);
+			void WaitForUnackedCapacity(size_t bytes);
+			bool RecordUnackedBatch(const Embarcadero::BatchHeader& header,
+			                        const void* batch_bytes,
+			                        size_t wire_bytes,
+			                        int broker_id,
+			                        size_t broker_ack_end);
+			void CompleteUnackedThrough(int broker_id, size_t broker_ack_hwm);
+			void HandleSessionFenced(const embarcadero::session::SessionFenced& fenced, int broker_id);
+			void WaitForSessionSendDrain(size_t target_messages);
+			void RetransmitThread();
 
 	#ifdef COLLECT_LATENCY_STATS
 		struct BatchSendRecord {
