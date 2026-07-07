@@ -420,6 +420,12 @@ class Topic {
 		// Returns the number of messages ordered for the given client_id at this broker.
 		// Used by AckThread for ACK1 in modes that support per-client ordered frontier.
 		uint64_t GetClientOrdered(uint32_t client_id) const;
+		uint64_t GetClientOrderedEpoch(uint32_t client_id) const;
+		void RestampRecoveredOrderedEpochs(uint64_t producing_epoch);
+		bool AckRelayEpochValid(
+			uint32_t client_id,
+			uint64_t* producing_epoch_out = nullptr,
+			uint64_t* control_epoch_out = nullptr) const;
 		// Returns the number of messages written/visible for the given client_id at this broker.
 		// Used by AckThread for ORDER=0 ACK1 so one publisher cannot consume another's progress.
 		uint64_t GetClientWritten(uint32_t client_id) const;
@@ -446,6 +452,7 @@ class Topic {
 		void RecordPerClientDurableVisibility(uint32_t client_id, uint64_t count);
 		void RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num_msg, uint32_t client_id);
 		void MaybeAdvanceOrder0DurableVisibility() const;
+		uint64_t CurrentControlEpoch() const;
 
 		/** [[ORDER_0_TAIL]] When publish connection closes, advance written_* to order0_next_logical_offset_ so subscribers see full tail (fixes out-of-order batch completion leaving written behind). */
 		void FinalizeOrder0WrittenIfNeeded();
@@ -707,6 +714,7 @@ class Topic {
 		mutable absl::Mutex per_client_mu_;
 		absl::flat_hash_map<uint32_t, uint64_t> per_client_written_ ABSL_GUARDED_BY(per_client_mu_);
 		absl::flat_hash_map<uint32_t, uint64_t> per_client_ordered_ ABSL_GUARDED_BY(per_client_mu_);
+		absl::flat_hash_map<uint32_t, uint64_t> per_client_ordered_epoch_ ABSL_GUARDED_BY(per_client_mu_);
 		// Called by all ordering paths (CORFU, ORDER=4, ORDER=5) to advance per-client counter.
 		void UpdatePerClientOrdered(uint32_t client_id, uint64_t count);
 		// Per-client durable counters for ACK2 (only in modes with explicit durability attribution).
@@ -811,6 +819,8 @@ class Topic {
 		bool is_drain_mode);
 	struct Level5ShardState;  // forward declaration; defined below
 	void ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector<PendingBatch5>& ready);
+	uint64_t RecoverSequencer5State();
+	void ApplyRecoveredSequencer5State(uint64_t session_key, ClientState5& state);
 	void ProcessLevel5BatchesShard(Level5ShardState& shard,
 		std::vector<PendingBatch5>& level5,
 		std::vector<PendingBatch5>& ready);
@@ -844,7 +854,8 @@ class Topic {
 		// [[Issue #3]] Epoch from last CheckEpochOnce() for use when epoch_already_checked=true in ReservePBRSlotAndWriteEntry
 		alignas(64) std::atomic<uint64_t> last_checked_epoch_{0};
 		// [PHASE-2B] Shared atomic for sequencer to avoid cold CXL read of ControlBlock.epoch
-		alignas(64) std::atomic<uint64_t> cached_epoch_{0};
+		alignas(64) mutable std::atomic<uint64_t> cached_epoch_{0};
+		alignas(64) mutable std::atomic<uint64_t> last_control_epoch_refresh_ns_{0};
 		// [[PHASE_1A_EPOCH_FENCING]] Counter for periodic epoch check (every kEpochCheckInterval batches; design §4.2.1 "e.g. every 100 batches")
 		alignas(64) std::atomic<uint64_t> epoch_check_counter_{0};
 		static constexpr uint64_t kEpochCheckInterval = 100;
@@ -866,12 +877,15 @@ class Topic {
 		std::atomic<uint64_t> order5_hold_timeout_skips_{0};
 		std::atomic<uint64_t> order5_hold_buffer_forced_skips_{0};
 		std::atomic<uint64_t> order5_stale_epoch_skips_{0};
+		std::atomic<uint64_t> order5_spatial_guard_rejects_{0};
 		// [[W1.2]] Per-session commit-order invariant instrumentation (W1 item #2). Detects the
 		// collector committing a client's batch out of order across epoch seals.
 		std::atomic<uint64_t> order5_commit_order_violations_{0};
 		// [[W1.2]] Last committed client_seq per client_id. Single-writer: touched ONLY in
 		// CommitEpoch on the EpochSequencerThread, so no lock is required.
 		absl::flat_hash_map<uint64_t, uint64_t> commit_order_last_seq_;
+		absl::flat_hash_map<uint64_t, uint64_t> recovered_order5_next_expected_;
+		std::atomic<bool> order5_recovery_complete_{false};
 		// Disconnect/shutdown tail drain: keep force-expiring hold frontiers for a short bounded window
 		// so late-visible batches are not stranded behind a one-shot expiry pulse.
 		std::atomic<uint64_t> force_expire_hold_until_ns_{0};

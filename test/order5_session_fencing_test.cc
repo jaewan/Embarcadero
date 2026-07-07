@@ -10,8 +10,14 @@ using Embarcadero::CanFenceSessionEpoch;
 using Embarcadero::OptimizedClientState;
 using Embarcadero::Order5SlotIdentity;
 using Embarcadero::Order5SlotMatches;
+using Embarcadero::RecoveredNextExpected;
+using Embarcadero::ReconnectAnswerHwm;
+using Embarcadero::SessionKeyFor;
+using Embarcadero::ShouldRejectOrder5SpatialGuard;
 using Embarcadero::ShouldClearSessionGapFromHeldMax;
 using Embarcadero::ShouldFenceSessionGap;
+using Embarcadero::ShouldTerminalFenceAckRelay;
+using Embarcadero::ShouldWithholdAckRelay;
 
 TEST(Order5SessionFencingTest, EpochZeroSuffixGapNeverFencesOrAdvancesImmediately) {
 	OptimizedClientState state;
@@ -49,7 +55,7 @@ TEST(Order5SessionFencingTest, EpochZeroTargetedScannerSkipAdvancesLegacyFrontie
 	EXPECT_TRUE(skip_marker_ready_pushed);
 }
 
-TEST(Order5SessionFencingTest, NonzeroSessionFenceFiresOnceAndScannerMarkerSurvives) {
+TEST(Order5SessionFencingTest, NonzeroSessionFenceFiresOnce) {
 	OptimizedClientState state;
 	state.session_epoch = 7;
 	state.next_expected = 4;
@@ -61,12 +67,6 @@ TEST(Order5SessionFencingTest, NonzeroSessionFenceFiresOnceAndScannerMarkerSurvi
 	EXPECT_TRUE(state.fenced);
 	EXPECT_FALSE(ShouldFenceSessionGap(state, 4'000, 1'000))
 		<< "idempotent fenced state must not fire a second lease fence";
-
-	const bool suffix_committed_after_fence = false;
-	const bool scanner_skip_marker_ready_pushed = true;
-	EXPECT_FALSE(suffix_committed_after_fence);
-	EXPECT_TRUE(scanner_skip_marker_ready_pushed)
-		<< "targeted scanner skip marker must still drain the PBR ring";
 }
 
 TEST(Order5SessionFencingTest, FalseFenceGapFillsBeforeLease) {
@@ -98,6 +98,45 @@ TEST(Order5SessionFencingTest, DeferredFullBackpressureSlotExcludesConsumedThrou
 	EXPECT_TRUE(Order5SlotMatches(blocked, 2, 4096, 99));
 	EXPECT_FALSE(Order5SlotMatches(blocked, 2, 4096, 100));
 	EXPECT_FALSE(Order5SlotMatches(blocked, 1, 4096, 99));
+}
+
+TEST(Order5SessionFencingTest, AckRelayWithholdsStaleProducingEpoch) {
+	EXPECT_FALSE(ShouldWithholdAckRelay(0, 0));
+	EXPECT_TRUE(ShouldWithholdAckRelay(0, 5));
+	EXPECT_TRUE(ShouldWithholdAckRelay(4, 5));
+	EXPECT_FALSE(ShouldWithholdAckRelay(5, 5));
+	EXPECT_FALSE(ShouldWithholdAckRelay(6, 5));
+}
+
+TEST(Order5SessionFencingTest, SpatialGuardRejectsOnlyFencedOrPastExpectedSuffix) {
+	EXPECT_FALSE(ShouldRejectOrder5SpatialGuard(false, true, 2, 10));
+	EXPECT_FALSE(ShouldRejectOrder5SpatialGuard(true, false, 10, 10));
+	EXPECT_FALSE(ShouldRejectOrder5SpatialGuard(true, false, 11, 10));
+	EXPECT_TRUE(ShouldRejectOrder5SpatialGuard(true, false, 9, 10));
+	EXPECT_TRUE(ShouldRejectOrder5SpatialGuard(true, true, 10, 10));
+}
+
+TEST(Order5SessionFencingTest, RecoveryAndReconnectUseAuthoritativeMaxima) {
+	EXPECT_EQ(RecoveredNextExpected(8, 3), 8u);
+	EXPECT_EQ(RecoveredNextExpected(8, 12), 12u);
+	EXPECT_EQ(ReconnectAnswerHwm(7, 3), 3u);
+	EXPECT_EQ(ReconnectAnswerHwm(7, 11), 7u);
+}
+
+TEST(Order5SessionFencingTest, IdleCommittedSessionAfterFailoverDoesNotTerminalFence) {
+	EXPECT_FALSE(ShouldTerminalFenceAckRelay(12, true, 12));
+	EXPECT_FALSE(ShouldTerminalFenceAckRelay(11, true, 12));
+	EXPECT_TRUE(ShouldTerminalFenceAckRelay(13, true, 12));
+	EXPECT_TRUE(ShouldTerminalFenceAckRelay(0, false, 0));
+}
+
+TEST(Order5SessionFencingTest, FullEpochSessionKeysDoNotAliasLow16Wrap) {
+	const uint32_t client_id = 42;
+	const uint32_t epoch_a = 7;
+	const uint32_t epoch_b = 0x10007;
+
+	EXPECT_EQ(static_cast<uint16_t>(epoch_a), static_cast<uint16_t>(epoch_b));
+	EXPECT_NE(SessionKeyFor(client_id, epoch_a), SessionKeyFor(client_id, epoch_b));
 }
 
 }  // namespace

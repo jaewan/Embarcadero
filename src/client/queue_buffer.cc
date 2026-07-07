@@ -14,6 +14,7 @@
 #include <chrono>
 #include <thread>
 #include <cstring>
+#include <cstdlib>
 #include <sys/mman.h>
 
 namespace {
@@ -25,6 +26,17 @@ namespace {
 	constexpr size_t kDefaultPoolSizeBytes = 256ULL * 1024 * 1024;  // 256 MB; caller hint or min_slots dominates for throughput
 	inline size_t AlignUp(size_t size, size_t align) {
 		return (size + align - 1) & ~(align - 1);
+	}
+	inline uint16_t RuntimeSessionEpochHint() {
+		static const uint16_t value = []() {
+			const char* env = std::getenv("EMBARCADERO_SESSION_EPOCH");
+			if (!env || env[0] == '\0') return static_cast<uint16_t>(0);
+			char* end = nullptr;
+			unsigned long parsed = std::strtoul(env, &end, 10);
+			if (end == env || *end != '\0') return static_cast<uint16_t>(0);
+			return static_cast<uint16_t>(parsed & 0xFFFFUL);
+		}();
+		return value;
 	}
 }
 
@@ -221,6 +233,8 @@ size_t QueueBuffer::SealCurrentAndAdvance() {
 	// Start of payload in this slot (broker may overwrite with BLog logical offset)
 	h->start_logical_offset = sizeof(Embarcadero::BatchHeader);
 	h->batch_seq = batch_seq_.fetch_add(1, std::memory_order_relaxed);
+	h->session_epoch = RuntimeSessionEpochHint();
+	h->session_epoch32 = 0;
 	h->total_size = data_size;
 	h->num_msg = static_cast<uint32_t>(current_batch_num_msg_);
 	h->batch_complete = 0;

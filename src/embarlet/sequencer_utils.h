@@ -114,6 +114,34 @@ inline bool Order5SlotMatches(
 	       slot.pbr_index == pbr_index;
 }
 
+inline uint64_t RecoveredNextExpected(uint64_t goi_scan_next, uint64_t session_entry_expected) {
+	return std::max(goi_scan_next, session_entry_expected);
+}
+
+inline uint64_t ReconnectAnswerHwm(uint64_t session_entry_hwm, uint64_t goi_committed_hwm) {
+	return std::min(session_entry_hwm, goi_committed_hwm);
+}
+
+inline bool ShouldTerminalFenceAckRelay(uint64_t next_to_ack_offset, bool goi_hwm_found, uint64_t goi_committed_hwm) {
+	return !goi_hwm_found || next_to_ack_offset > goi_committed_hwm;
+}
+
+inline uint64_t SessionKeyFor(uint32_t client_id, uint32_t session_epoch) {
+	return (static_cast<uint64_t>(client_id) << 32) | static_cast<uint64_t>(session_epoch);
+}
+
+inline bool ShouldWithholdAckRelay(uint64_t producing_epoch, uint64_t control_epoch) {
+	return control_epoch != 0 && producing_epoch < control_epoch;
+}
+
+inline bool ShouldRejectOrder5SpatialGuard(
+		bool session_active,
+		bool session_fenced,
+		uint64_t batch_seq,
+		uint64_t durable_expected) {
+	return session_active && (session_fenced || batch_seq < durable_expected);
+}
+
 template <typename T>
 class RadixSorter {
 public:
