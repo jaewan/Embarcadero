@@ -24,7 +24,7 @@ Every one of the 14 must-fixes from the v1 gate (§"⚠ CRITICAL") is resolved i
 | **9** | `batch_seq` is minted PER-BROKER, undefined for multi-home client | **RESOLVED (FIXED DECISION).** The per-session-global batch_seq is the EXISTING seal-time counter `QueueBuffer::batch_seq_` (single per-process `pubQue_`, `publisher.h:186`). For `kOrderStrong` the send path already does NOT reassign (`publisher.cc:2121-2125` is a deliberate no-op). The per-broker `order5_batch_seq_per_broker_` (`publisher.h:194`) is the ORDER=4 (`kOrderClientBrokerStream`) counter, left INTACT. Reset per session via `ResetBatchSeqForNewSession()` (quiesced-only). | §2.1, §2.2, §5.4 |
 | **10** | Cumulative-ACK → batch_seq resolution missing (ACK wire is per-socket message count) | **RESOLVED.** Client maintains a local monotone prefix-sum map `batch_seq → cumulative_num_msg`; on each head-broker ACK `M` (message count), advance `released_through_seq` to the last batch fully covered by `M` via O(k) prefix-pop over `UnackedBuffer` ordered by batch_seq. This is the OPTIMISTIC frontier; AUTHORITATIVE axis stays `committed_hwm`. RTT sampled only when `attempt==0` (Karn). No wire change. | §4.1, §5.1, §5.5 |
 | **11** | Rendezvous hash must mix batch_seq and provably exclude the dead broker | **RESOLVED.** `RendezvousBroker` computes HRW score `score_b = splitmix64_finalize(mix(client_id, batch_seq, b))` per candidate `b ∈ survivors, b ≠ exclude_broker`, argmax over the filtered set. Does NOT reuse the client_id-only home finalizer (`publisher.cc:323-327`). Dead broker structurally excluded; 1-survivor case deterministic; survivor set snapshotted once under `mutex_` for racing-duplicate determinism. | §5.3 |
-| **12** | Re-derive δ from open-load append/ack p99.9, not steady 1.68 ms | **RESOLVED.** `kDeltaFloorMs`/`kDeltaCapMs` derived from OPEN-LOAD `append_send_to_ack` p99.9 (offered-load sweep), NOT steady pacing (steady 1.68 ms only seeds the estimator). Because open-load e2e p99 ≈ 82.9 ms > v1's 50 ms cap, cap raised strictly above the measured open-load ack tail (≥2× ⇒ ≥~166 ms). δ is a BACKSTOP (D2 NACK primary) so a larger cap is safe. **Pre-freeze measurement gate** flagged. | §5.2 |
+| **12** | Re-derive δ from open-load append/ack p99.9, not steady 1.68 ms | **RESOLVED + MEASURED (2026-07-07).** `kDeltaFloorMs=1.7`/`kDeltaCapMs=12` derived from the OPEN-LOAD `append_send_to_ack` p99.9 offered-load sweep, NOT steady pacing (steady 1.68 ms only seeds the estimator at t=0). Measured worst-trial ack p99.9 = 4.95 ms; the ~83 ms open-load e2e tail is subscriber-side and does NOT track the ack path, so the earlier "≥166 ms" hypothesis is **RETIRED**. cap = 2×(worst ack p99.9 + wire) ≈ 12 ms. δ is a BACKSTOP (D2 NACK primary) so a larger cap errs safe. Measurement gate CLOSED — `delta_measurement_results.md`. | §5.2 |
 | **13** | Bound unACKed buffer against failure stall (`offered_rate × session_lease`), specify producer backpressure + client lock order | **RESOLVED.** Buffer capped by BYTES = `offered_rate_bytes_per_sec × session_lease_seconds` (failure-stall envelope). On cap, `PublishThread` stops dequeuing from `pubQue_` (producer backpressure). Strict lock order `UnackedBuffer.mu → mutex_ → pubQue_`, never a send under `UnackedBuffer.mu`; absl thread-safety annotations at the 3 sites. | §5.1, §5.5 |
 | **14** | ACK-relay epoch guard with a terminal bound to avoid infinite δ-retransmit | **RESOLVED.** `AckThread` epoch guard: each `per_client_ordered_` advance stamped with producing `ControlBlock.epoch`; before any ACK advance, withhold if `producing_epoch < ControlBlock.epoch`. Terminal bound: after a bounded withhold window (≥ session_lease) with `ControlBlock.epoch` advanced, emit terminal `SessionFenced{reason=EPOCH_STALE}` instead of withholding forever. | §6.4 |
 
@@ -421,11 +421,19 @@ struct UnackedBuffer {
 ```cpp
 struct DeltaEstimator { double srtt_ms{0}, rttvar_ms{0}; bool seeded{false};
                         std::atomic<double> delta_ms{kDeltaFloorMs}; };
-// kDeltaFloorMs / kDeltaCapMs derived from OPEN-LOAD append_send_to_ack p99.9 (offered-load sweep), α=1/8, β=1/4 (RFC6298)
+// MEASURED (2026-07-07, docs/experiments/delta_measurement_results.md; open-load offered-load sweep,
+// ORDER=5/ACK=1, append_send_to_ack p99.9 — NOT steady pacing, per must-fix #12):
+//   kDeltaFloorMs = 1.7   (>= open-load TYPICAL p99.9 ~1.1 ms with margin; the steady 1.68 ms only
+//                          seeds srtt/rttvar at t=0 — it is NOT the floor's justification, must-fix #12)
+//   kDeltaCapMs   = 12.0  (>= 2x worst open-load append_send_to_ack p99.9 incl. real-wire +0.2 ms:
+//                          2x(4.951+0.2)=10.30 ms; 12.0 clears it with honest slack)
+// delta_ms = clamp(srtt + 4*rttvar, kDeltaFloorMs, kDeltaCapMs), α=1/8, β=1/4 (RFC6298), Karn sampling.
+// NOTE: in the measured regime srtt+4*rttvar ≈ 0.3 ms clamps UP to the floor, so δ == floor == 1.7 ms
+// in normal operation and the cap is essentially never the operative timer (see §5.2 floor-safety note).
 ```
 
 **δ constants MUST be derived from OPEN-LOAD `append_send_to_ack` p99.9, not steady pacing (must-fix #12).** `w1_findings.md:222-223` states append/ack p99.9 = 1.68 ms, but line 224 explicitly annotates "(Note: this run used steady pacing; not comparable to the paper open-loop 83ms e2e figure)"; lines 158-160 give the OPEN-LOAD sweep e2e p99 = 82888.8µs (~82.9 ms) at 1000 MB/s. Since the v1 `kDeltaCapMs=50` is BELOW the open-load ack tail (~82.9 ms), a spurious backstop would fire on every open-load tail batch. Resolution:
-- **(B, then A) Recommended:** measure open-load `append_send_to_ack` p99.9 first (the `stage_latency_summary.csv` `append_send_to_ack` stage under the offered-load sweep, NOT steady pacing), set `floor ≈ that p99.9`, `cap ≈ 2–3× it`. Alternatively **(A)** raise `kDeltaCapMs` strictly above the measured open-load append/ack p99.9 with headroom (≥2× ⇒ ≥~166 ms if the ack tail tracks e2e).
+- **(B, then A) Recommended:** measure open-load `append_send_to_ack` p99.9 first (the `stage_latency_summary.csv` `append_send_to_ack` stage under the offered-load sweep, NOT steady pacing), set `floor ≈ that p99.9`, `cap ≈ 2–3× it`. Alternatively **(A)** raise `kDeltaCapMs` strictly above the measured open-load append/ack p99.9 with headroom (≥2×). **Now measured (2026-07-07): ack p99.9 = 4.95 ms worst-trial and does NOT track e2e → `cap = 12 ms`; the earlier "≥166 ms if the ack tail tracks e2e" conditional is RETIRED.** See the gate-CLOSED note below.
 - The steady 1.68 ms may only SEED the estimator, never bound the cap.
 
 **δ is a BACKSTOP, not the primary trigger.** D2 lease-driven NACK is PRIMARY (~lease time, ms); δ is only the silent-loss backstop. An over-large cap costs only backstop latency on genuinely-lost batches, not correctness (safety lives on the sequencer). So erring toward a LARGER cap is safe; erring small causes the spurious-retransmit storm (`w1_findings.md:200-202`).
@@ -434,7 +442,29 @@ struct DeltaEstimator { double srtt_ms{0}, rttvar_ms{0}; bool seeded{false};
 - `delta_ms = clamp(srtt + 4·rttvar, floor, cap)`.
 - **New `RetransmitThread`** (started in `Init()` near `publisher.cc:758`): every `min(δ/2, 2ms)` scans `UnackedBuffer`; for any entry past `last_send_ts + backoff(δ, attempt)` (exponential `δ·2^attempt`) not superseded by a D2 NACK, triggers retransmit. Silent-loss backstop only; the D2 NACK path calls the same routine immediately.
 
-**Pre-freeze measurement gate:** the offered-load `append_send_to_ack` p99.9 has NOT been measured (`w1_findings.md:224` explicitly used steady pacing). Run the offered-load sweep and read `stage_latency_summary.csv append_send_to_ack` p99.9 under open load (per `w1_findings.md:191-202`) BEFORE fixing δ constants. Until then `kDeltaCapMs` is a placeholder gated on that measurement.
+**Pre-freeze measurement gate: CLOSED (2026-07-07).** The offered-load sweep was run on the S2
+tree (loopback open-loop, ORDER=5/ACK=1, 1000–8000 MB/s, 3 trials/point —
+`docs/experiments/delta_measurement_results.md`). Measured open-load `append_send_to_ack`
+p99.9 ≈ 1.0–1.1 ms typical, **4.95 ms worst single trial** at operating load (knee onset ~8000 MB/s;
+achieved tracks target through 6000). The feared "ack tail tracks the ~83 ms e2e tail ⇒ cap
+≥166 ms" scenario is **REFUTED** — the e2e tail is subscriber-side (`w1_findings.md` §W1.1), not on
+the publisher ACK path. Constants frozen: `kDeltaFloorMs = 1.7`, `kDeltaCapMs = 12` (≥2× the worst
+measured tail including the +0.2 ms real-wire adder — 2×(4.951+0.2)=10.30 ms — so 12 clears it with
+honest slack, unlike a bare 10 which is only 1.01× its own basis). `kDeltaCapMs < session_lease_ms`
+holds against the current 1000–2000 ms placeholder — see §9 residual #1 for the D2-owned lease
+constraint. Revisit only if E-matrix real-wire runs show a larger send→ack p99.9 (cap then = 2× that;
+a larger cap errs safe — δ is a NACK-backed, idempotent backstop).
+
+**Floor-safety — the operative timer is the FLOOR, not the cap.** With the measured stream
+(p50 ≈ 0.3 ms), `srtt + 4·rttvar` sits well below the floor, so in normal operation **δ = floor =
+1.7 ms** and the cap is reached only transiently; the cap value is therefore not on the correctness
+path. The floor (1.7 ms) sits *below* the worst-trial p99.9 (4.95 ms), so in a bad trial ≲0.1 % of
+batches see one *spurious* first retransmit — exactly the idempotent, deduped (`per-session
+batch_seq` at the sequencer), exponentially-backed-off case the design tolerates (≈5 duplicate 1 KiB
+sends per stalled batch, all deduped; bounded bandwidth, never a correctness event). Because a
+retransmitted (slow) batch ACKs with `attempt>0`, Karn suppresses its RTT sample, so srtt/rttvar
+stay biased low and **δ effectively equals the floor by design** — the floor, not the estimator, is
+the operative timer. Accepted for a backstop sitting behind the D2 NACK primary.
 
 ### 5.3 Rendezvous survivor selection (must-fix #11)
 
@@ -653,8 +683,8 @@ void ApplyLevel5Record(Level5ShardState& shard, ClientState5& st, ClientEmitTrac
 
 The 14 must-fixes are resolved inline. These residuals remain (from the cluster resolutions) and need human/cross-track sign-off before code merges:
 
-1. **`session_lease_ns` value (D2-owned).** The 1s/2s default (§3.4) is a PLACEHOLDER; the authoritative value is a D2 deliverable. Config-load inequality `kDeltaCapMs < session_lease_ms < PBR_fill_time_ms` and `session_lease_ns ≥ open-load append/ack p99.9` must hold. Too low re-introduces false-fence of slow sessions; too high slows recovery and risks D3 ring-coupling.
-2. **Open-load δ measurement gate (must-fix #12, unmeasured).** The offered-load `append_send_to_ack` p99.9 has NOT been measured (`w1_findings.md:224` used steady pacing). δ constants CANNOT be frozen until that offered-load stage-decomposition run exists (§5.2).
+1. **`session_lease_ns` value (D2-owned).** The 1s/2s default (§3.4) is a PLACEHOLDER; the authoritative value is a D2 deliverable. Config-load inequality `kDeltaCapMs < session_lease_ms < PBR_fill_time_ms` and `session_lease_ns ≥ open-load append/ack p99.9` must hold. **D2 MUST set `session_lease_ms > kDeltaCapMs` (i.e. > 12 ms)** — the inequality currently holds only against the 1000–2000 ms placeholder; an aggressive sub-12 ms lease would violate it. Too low re-introduces false-fence of slow sessions; too high slows recovery and risks D3 ring-coupling.
+2. **Open-load δ measurement gate — CLOSED (2026-07-07).** Offered-load sweep run on the S2 tree; open-load `append_send_to_ack` p99.9 = 1.0–1.1 ms typical / 4.95 ms worst trial at operating load (knee onset ~8000 MB/s). Constants frozen in §5.2: `kDeltaFloorMs=1.7`, `kDeltaCapMs=12`. Full table + knee + caveats: `docs/experiments/delta_measurement_results.md`. **Follow-up validation (D2 phase, non-blocking for D1 freeze):** the 4.95 ms anchor is a single nearest-rank p99.9 sample at the anti-monotone 4000 MB/s point on loopback — re-run the 4000-point in isolation, add a real-wire (`SCENARIO=remote`) point and a multi-client point, and commit the raw per-point CDF CSVs so the anchor is auditable. Raising the cap to 12 already absorbs this single-sample fragility for the backstop.
 3. **`GOIEntry.session_epoch` field (cross-cluster).** Recovery (§6.2) requires `session_epoch` persisted in the GOI to disambiguate generations of the same `client_id`. Confirm Track-04 accepts the additive `uint32_t session_epoch` in `GOIEntry._pad` (`:270`).
 4. **R1 MAX vs. reconnect-answer min reconciliation (Cluster C ↔ E).** §6.2.1 uses `MAX` for accept-time `next_expected`; §4.1 uses `min` for the reconnect answer. Confirm both signs (both conservative for their property). Cross-cluster sign-off required.
 5. **`SessionEntry` slot reclamation (ties to D6).** Open-addressed, never-freed-within-epoch (fence terminality) fills 4096/topic under many-generation long runs. When is a FENCED entry's slot freed (GC frontier, co-design with D6 so no in-flight old-epoch client can still present the key)?
@@ -730,7 +760,7 @@ per-client-id ACK relay design.)
 
 **R-H (additive fields + measurement gates — not design forks).**
 - Add `GOIEntry.session_epoch` (16 b) using the existing `_pad[40]` (`cxl_datastructure.h:270`) — required so failover GOI-scan separates generations of the same `client_id`. Keeps GOIEntry at 128 B.
-- **δ cap** stays a pre-freeze **measurement gate**: measure open-load `append_send_to_ack` p99.9 (not e2e, not steady 1.68 ms) and set `δ_cap ≥ 2×` that; do not freeze the placeholder number.
+- **δ cap** measurement gate **CLOSED (2026-07-07)**: measured open-load `append_send_to_ack` p99.9 = 4.95 ms worst-trial (not e2e — the ~83 ms tail is subscriber-side; not steady 1.68 ms). Frozen: `δ_cap = 12 ms` (≥2× incl. +0.2 ms wire), `δ_floor = 1.7 ms` — §5.2. `delta_measurement_results.md`.
 - **Lock order** `UnackedBuffer.mu → mutex_ → pubQue_` requires a manual audit (QueueBuffer uses `std::mutex`, not absl-annotated) — an implementation-review checklist item, not a design change.
 - **Anchor drift** (`publisher.h:194↔195`, a few ±1-line cites): re-verify line numbers at implementation; non-load-bearing.
 
