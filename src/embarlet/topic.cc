@@ -15,6 +15,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 
 
@@ -239,6 +240,20 @@ void Topic::RecordOrder5FlightEvent(
 	slot.d = d;
 }
 
+SessionEntry* Topic::FindSessionEntry(uint64_t session_key) {
+	if (session_key == 0 || session_table_ == nullptr) return nullptr;
+	const size_t start = static_cast<size_t>(Mix64(session_key) % kMaxSessions);
+	for (size_t probe = 0; probe < kMaxSessions; ++probe) {
+		SessionEntry* entry = &session_table_[(start + probe) % kMaxSessions];
+		CXL::invalidate_cacheline_for_read(entry);
+		CXL::load_fence();
+		const uint64_t observed = entry->session_key.load(std::memory_order_acquire);
+		if (observed == session_key) return entry;
+		if (observed == 0) return nullptr;
+	}
+	return nullptr;
+}
+
 SessionEntry* Topic::FindOrCreateSessionEntry(uint64_t session_key) {
 	if (session_key == 0 || session_table_ == nullptr) return nullptr;
 	const size_t start = static_cast<size_t>(Mix64(session_key) % kMaxSessions);
@@ -260,6 +275,32 @@ SessionEntry* Topic::FindOrCreateSessionEntry(uint64_t session_key) {
 	LOG(ERROR) << "SessionEntry table full for topic=" << topic_name_
 	           << " session_key=" << session_key;
 	return nullptr;
+}
+
+void Topic::ReconstructClientStateFromSessionEntry(uint64_t session_key, ClientState5& state) {
+	SessionEntry* entry = FindSessionEntry(session_key);
+	if (entry == nullptr) return;
+
+	CXL::invalidate_cacheline_for_read(entry);
+	CXL::load_fence();
+	const uint64_t state_word = entry->state_word.load(std::memory_order_acquire);
+	const uint64_t flags = state_word & 0xFFFFFFFFULL;
+	if ((flags & kSessionEntryFlagActive) == 0) return;
+
+	const uint32_t durable_epoch = static_cast<uint32_t>(state_word >> 32);
+	const uint64_t durable_expected = entry->expected_seq.load(std::memory_order_acquire);
+	const uint64_t durable_committed = entry->committed_hwm.load(std::memory_order_acquire);
+	const uint64_t durable_highest = entry->highest_sequenced.load(std::memory_order_acquire);
+
+	state.session_epoch = std::max(state.session_epoch, durable_epoch);
+	if (durable_expected > state.next_expected) {
+		state.set_next_expected(durable_expected);
+	}
+	state.committed_hwm = std::max(state.committed_hwm, durable_committed);
+	state.highest_sequenced = std::max(state.highest_sequenced, durable_highest);
+	if ((flags & kSessionEntryFlagFenced) != 0) {
+		state.fenced = true;
+	}
 }
 
 void Topic::PublishSessionEntry(uint64_t session_key, const SessionPublishSnapshot& snapshot) {
@@ -4416,9 +4457,17 @@ void Topic::CommitEpoch(
 					goi_timestamps_[ring_pos].timestamp_ns.store(SteadyNowNs(), std::memory_order_release);
 				}
 		int b = m.broker_id;
-		ordered_increment[b] += m.num_msg;
-		last_ordered_offset[b] = m.log_idx;
-		ordered_broker_seen[b] = true;
+		if (b >= 0 && b < NUM_MAX_BROKERS) {
+			ordered_increment[b] += m.num_msg;
+			last_ordered_offset[b] = m.log_idx;
+			ordered_broker_seen[b] = true;
+			size_t& next_expected = contiguous_consumed_per_broker[b];
+			if (m.slot_offset == next_expected ||
+			    (next_expected == BATCHHEADERS_SIZE && m.slot_offset == 0)) {
+				next_expected = m.slot_offset + sizeof(BatchHeader);
+				if (next_expected >= BATCHHEADERS_SIZE) next_expected = BATCHHEADERS_SIZE;
+			}
+		}
 		per_client_delta_epoch[static_cast<uint32_t>(m.client_id)] += m.num_msg;
 		record_session_publish(m.client_id, m.session_epoch, m.batch_seq);
 		{
@@ -5391,6 +5440,47 @@ void Topic::ClientGc(Level5ShardState& shard) {
 	}
 }
 
+bool Topic::IsOrder5HeldSlot(int broker_id, size_t slot_offset, uint64_t pbr_index) {
+	for (const auto& shard_ptr : level5_shards_) {
+		if (!shard_ptr) continue;
+		std::lock_guard<std::mutex> lock(shard_ptr->mu);
+		for (const auto& [session_key, held] : shard_ptr->hold_buffer) {
+			(void)session_key;
+			for (const auto& [seq, entry] : held) {
+				(void)seq;
+				const HoldBatchMetadata& meta = entry.meta;
+				if (meta.broker_id == broker_id &&
+				    meta.slot_offset == slot_offset &&
+				    meta.pbr_absolute_index == pbr_index) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+void Topic::RetireOrder5HeldSlotAndAdvance(BatchHeader* hdr, int broker_id, size_t slot_offset) {
+	InvalidateOrder5HeldSlot(hdr);
+	if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS) return;
+	if (slot_offset >= BATCHHEADERS_SIZE || (slot_offset % sizeof(BatchHeader)) != 0) return;
+
+	const volatile void* addr = reinterpret_cast<const volatile void*>(
+		&tinode_->offsets[broker_id].batch_headers_consumed_through);
+	CXL::flush_cacheline(const_cast<const void*>(addr));
+	CXL::load_fence();
+	size_t consumed = tinode_->offsets[broker_id].batch_headers_consumed_through;
+	if (consumed == BATCHHEADERS_SIZE) consumed = 0;
+	if (consumed == slot_offset) {
+		size_t next = slot_offset + sizeof(BatchHeader);
+		if (next >= BATCHHEADERS_SIZE) next = BATCHHEADERS_SIZE;
+		tinode_->offsets[broker_id].batch_headers_consumed_through = next;
+		CXL::store_fence();
+		CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[broker_id].batch_headers_consumed_through));
+		CXL::store_fence();
+	}
+}
+
 void Topic::ProcessLevel5Batches(std::vector<PendingBatch5>& level5, std::vector<PendingBatch5>& ready) {
 	if (level5_shards_.empty()) {
 		LOG(FATAL) << "ProcessLevel5Batches: level5_shards_ empty (InitLevel5Shards was not run)";
@@ -5458,6 +5548,41 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 	auto purge_fenced_session = [&](size_t shard_session_key) {
 		auto hold_it = shard.hold_buffer.find(shard_session_key);
 		if (hold_it != shard.hold_buffer.end()) {
+			std::vector<std::tuple<int, size_t, BatchHeader*>> retire;
+			retire.reserve(hold_it->second.size());
+			for (auto& [seq, held] : hold_it->second) {
+				(void)seq;
+				retire.emplace_back(
+					held.meta.broker_id, held.meta.slot_offset, held.batch.hdr);
+			}
+			std::array<size_t, NUM_MAX_BROKERS> consume_start{};
+			for (int broker_id = 0; broker_id < NUM_MAX_BROKERS; ++broker_id) {
+				const volatile void* addr = reinterpret_cast<const volatile void*>(
+					&tinode_->offsets[broker_id].batch_headers_consumed_through);
+				CXL::flush_cacheline(const_cast<const void*>(addr));
+				CXL::load_fence();
+				consume_start[broker_id] =
+					tinode_->offsets[broker_id].batch_headers_consumed_through;
+				if (consume_start[broker_id] == BATCHHEADERS_SIZE) consume_start[broker_id] = 0;
+			}
+			std::sort(retire.begin(), retire.end(),
+				[&](const auto& a, const auto& b) {
+					const int broker_a = std::get<0>(a);
+					const int broker_b = std::get<0>(b);
+					if (broker_a != broker_b) return broker_a < broker_b;
+					if (broker_a < 0 || broker_a >= NUM_MAX_BROKERS) {
+						return std::get<1>(a) < std::get<1>(b);
+					}
+					const size_t start = consume_start[broker_a];
+					const size_t distance_a =
+						(std::get<1>(a) + BATCHHEADERS_SIZE - start) % BATCHHEADERS_SIZE;
+					const size_t distance_b =
+						(std::get<1>(b) + BATCHHEADERS_SIZE - start) % BATCHHEADERS_SIZE;
+					return distance_a < distance_b;
+				});
+			for (const auto& [broker_id, slot_offset, hdr] : retire) {
+				RetireOrder5HeldSlotAndAdvance(hdr, broker_id, slot_offset);
+			}
 			shard.hold_buffer_size -= hold_it->second.size();
 			shard.hold_buffer.erase(hold_it);
 		}
@@ -5630,6 +5755,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			he.meta.broker_id = p.broker_id;
 			he.meta.num_msg = p.num_msg;
 			he.meta.start_logical_offset = p.cached_start_logical_offset;
+			he.meta.slot_offset = p.slot_offset;
 			he.hold_start_ns = SteadyNowNs();
 			he.batch = std::move(p);
 			stream_map.emplace(seq, he);
@@ -5638,7 +5764,6 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			}
 			shard.hold_buffer_size++;
 			shard.clients_with_held_batches.insert(key);
-			InvalidateOrder5HeldSlot(he.batch.hdr);
 
 			PendingBatch5 marker;
 			marker.broker_id = he.batch.broker_id;
@@ -5646,6 +5771,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			marker.is_held_marker = true;
 			marker.hdr = nullptr;
 			marker.num_msg = 0;
+			marker.cached_pbr_absolute_index = he.meta.pbr_absolute_index;
 			ready.push_back(marker);
 		}
 	};
@@ -5666,6 +5792,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			ClientState5& state = shard.client_state[session_key];
 			state.session_epoch = skip_it->session_epoch;
 			state.last_epoch = hold_epoch;
+			ReconstructClientStateFromSessionEntry(session_key, state);
 			LOG(INFO) << "[ORDER5_TARGETED_SKIP]"
 			          << " client=" << skip_it->client_id
 			          << " session_epoch=" << skip_it->session_epoch
@@ -5721,6 +5848,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				ClientEmitTracker& emitted = shard.client_emitted_tracker[session_key];
 				state.session_epoch = first_session_epoch;
 				state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+				ReconstructClientStateFromSessionEntry(session_key, state);
 				if (state.next_expected == 0 && emitted.contiguous_max != UINT64_MAX) {
 					state.set_next_expected(emitted.contiguous_max + 1);
 					state.highest_sequenced = emitted.contiguous_max;
@@ -5756,6 +5884,10 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					ClientEmitTracker& emitted = shard.client_emitted_tracker[stream_key];
 					state.session_epoch = vec.empty() ? 0 : vec.front()->session_epoch;
 					state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+					if (!vec.empty()) {
+						ReconstructClientStateFromSessionEntry(
+							MakeSessionKey(first_client, vec.front()->session_epoch), state);
+					}
 					if (state.next_expected == 0 && emitted.contiguous_max != UINT64_MAX) {
 						state.set_next_expected(emitted.contiguous_max + 1);
 						state.highest_sequenced = emitted.contiguous_max;
@@ -5801,6 +5933,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			ClientState5& state = shard.client_state[session_key];
 			state.session_epoch = session_epoch;
 			state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+			ReconstructClientStateFromSessionEntry(session_key, state);
 			ClientEmitTracker& emitted = shard.client_emitted_tracker[session_key];
 			if (state.next_expected == 0 && emitted.contiguous_max != UINT64_MAX) {
 				state.set_next_expected(emitted.contiguous_max + 1);
@@ -5837,6 +5970,8 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				ClientState5& state = shard.client_state[stream_key];
 				state.session_epoch = stream_epoch;
 				state.last_epoch = current_epoch_for_hold_.load(std::memory_order_acquire);
+				ReconstructClientStateFromSessionEntry(
+					MakeSessionKey(client_id, stream_epoch), state);
 				ClientEmitTracker& emitted = shard.client_emitted_tracker[stream_key];
 				if (state.next_expected == 0 && emitted.contiguous_max != UINT64_MAX) {
 					state.set_next_expected(emitted.contiguous_max + 1);
@@ -5877,6 +6012,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				if (emitted.IsEmitted(static_cast<uint64_t>(he.batch.batch_seq))) {
 					state.mark_sequenced(he.batch.batch_seq);
 					state.advance_next_expected();
+					bool handed_to_commit = false;
 					if (true_client_chain) {
 						terminalize_already_emitted(
 							he.meta.client_id, he.meta.broker_id, he.meta.start_logical_offset,
@@ -5890,7 +6026,12 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 							ready.push_back(std::move(late));
 							emitted.MarkEmitted(static_cast<uint64_t>(ready.back().batch_seq));
 							order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+							handed_to_commit = true;
 						}
+					}
+					if (!handed_to_commit) {
+						RetireOrder5HeldSlotAndAdvance(
+							he.batch.hdr, he.meta.broker_id, he.meta.slot_offset);
 					}
 					cmap.erase(seq_it);
 					shard.hold_buffer_size--;
@@ -5983,6 +6124,8 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						he.meta.client_id, he.meta.broker_id, he.meta.start_logical_offset,
 						he.meta.num_msg, he.meta.batch_id, he.batch.batch_seq,
 						he.meta.pbr_absolute_index);
+					RetireOrder5HeldSlotAndAdvance(
+						he.batch.hdr, he.meta.broker_id, he.meta.slot_offset);
 					cmap.erase(seq_it);
 					shard.hold_buffer_size--;
 				continue;
@@ -6928,6 +7071,7 @@ void Topic::AdvanceConsumedThroughForProcessedSlots(
 		if (b < 0 || b >= NUM_MAX_BROKERS || !broker_seen_in_epoch[b]) continue;
 		if (p.slot_offset >= BATCHHEADERS_SIZE) continue;
 		if ((p.slot_offset % slot_size) != 0) continue;
+		if (IsOrder5HeldSlot(b, p.slot_offset, p.cached_pbr_absolute_index)) continue;
 		processed_slots[b][p.slot_offset / slot_size] = 1;
 	}
 	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
