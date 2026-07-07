@@ -59,6 +59,12 @@ target_link_libraries(w5_sequencer_memserver PRIVATE rdma_transport)
 target_compile_definitions(w5_sequencer_memserver PRIVATE BLOG_PLACEMENT_DRAM=0)
 set_target_properties(w5_sequencer_memserver PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# Phase 2 (W5-A leg-1) re-replication tool: reads a surviving replica, writes it to the
+# memserver's spare region, timing bytes+wall-clock for the "re-replication volume+time" metric.
+add_executable(rdma_recovery rdma_recovery.cc)
+target_link_libraries(rdma_recovery PRIVATE rdma_transport)
+set_target_properties(rdma_recovery PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # ---- Reviewer-D naive RDMA token server repro (spec §5, E10 tie-in) ------------------------------
 add_executable(rdma_token_server rdma_token_server.cc)
 target_link_libraries(rdma_token_server PRIVATE rdma_transport)

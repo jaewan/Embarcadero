@@ -151,6 +151,11 @@ struct HandshakeBlob {
   embarcadero::rdma::RegionDesc goi;
   embarcadero::rdma::RegionDesc pbr;       // whole combined region; client slices by broker_id * pbr_ring_bytes_per_broker
   embarcadero::rdma::RegionDesc blog;      // valid only if host_blog; same per-broker slicing
+  embarcadero::rdma::RegionDesc spare;     // Phase 2 (W5-A) recovery target: always allocated on the
+                                           // always-alive memserver, regardless of host_blog, so a
+                                           // post-kill re-replication step has a cross-host,
+                                           // guaranteed-reachable destination that isn't itself one
+                                           // of the (possibly also-dead) brokers.
   uint32_t pbr_ring_bytes_per_broker;
   uint32_t blog_bytes_per_broker;
   uint32_t host_blog;      // 1 if this memserver hosts Blog (W5-B), 0 otherwise (W5-A metadata-only)
@@ -164,6 +169,24 @@ struct HandshakeBlob {
 struct BlogHandoffBlob {
   embarcadero::rdma::QpEndpoint ep;
   embarcadero::rdma::RegionDesc blog;
+};
+
+// ---- Phase 2 (W5-A leg-1) peer replication + recovery handoff --------------------------------
+// One shape, three uses, all structurally identical (a QP endpoint + a region the ACCEPTOR is
+// exposing) — the `role` field is for human-readable logging only, RDMA access rights are already
+// granted broadly (read+write+atomic) on every QP this harness creates, so there's no enforcement
+// difference between the roles:
+//   role=1 (ring replication): broker i (client) connects to broker (i+1 mod N)'s acceptor to WRITE
+//     a live copy of every batch broker i commits, giving RF=2 for as long as broker i is alive.
+//   role=2 (recovery source read): after a kill, the recovery tool connects to the surviving
+//     replica-holder (broker i+1) to READ the dead broker's replicated data.
+//   role=1 again (recovery target write): the SAME recovery tool then connects to the memserver's
+//     spare-region acceptor (always alive — c3 is never killed in Phase 2, Decision 1) to WRITE
+//     that data there, restoring RF onto a guaranteed-reachable, cross-host destination.
+struct ReplicaHandoffBlob {
+  int32_t role;
+  embarcadero::rdma::QpEndpoint ep;
+  embarcadero::rdma::RegionDesc region;
 };
 
 }  // namespace embarcadero::rdma_variant

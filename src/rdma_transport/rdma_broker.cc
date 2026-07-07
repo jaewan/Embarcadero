@@ -93,6 +93,17 @@ int main(int argc, char** argv) {
   int blog_port = atoi(GetArg(argc, argv, "--blog-port", "18700"));  // DRAM mode only
   std::string dev = GetArg(argc, argv, "--dev", "mlx5_0");
   int gid = atoi(GetArg(argc, argv, "--gid", "-1"));
+  // Phase 2 (W5-A leg-1) RF>=2 ring replication: this broker's OWN replica-of-left-neighbor
+  // acceptor port, and (if set) the right neighbor to replicate TO. Ring topology (broker i ->
+  // broker (i+1 mod N)) is wired up by the orchestration script passing explicit IPs/ports, not
+  // computed from broker_id here, so the binary doesn't need to know the full topology.
+  int replica_port = atoi(GetArg(argc, argv, "--replica-port", "18710"));
+  std::string right_neighbor_ip = GetArg(argc, argv, "--right-neighbor-ip", "");
+  int right_neighbor_replica_port = atoi(GetArg(argc, argv, "--right-neighbor-replica-port", "18710"));
+  // Normally 1 (just our left neighbor's ongoing replication feed). The broker designated as the
+  // post-kill recovery SOURCE for a given trial needs 2: the left-neighbor feed plus the recovery
+  // tool's later read-only connection.
+  int replica_max_accepts = atoi(GetArg(argc, argv, "--replica-max-accepts", "1"));
 
   fprintf(stderr, "[broker %d] placement=%s message_size=%u target_mbps=%d duration=%ds inflight=%d\n",
           broker_id, BLOG_PLACEMENT_DRAM ? "DRAM(W5-A)" : "MEMSERVER(W5-B)", message_size,
@@ -110,6 +121,13 @@ int main(int argc, char** argv) {
   memset(local_blog_mem, 0, 1 << 20);  // touch first page; payload content doesn't need full zero
   if (!RegisterMr(d.pd, local_blog_mem, kBlogBytesPerBroker, &local_blog_mr)) return 1;
   fprintf(stderr, "[broker %d] local Blog registered: %zu bytes\n", broker_id, kBlogBytesPerBroker);
+
+  // ---- Phase 2 RF>=2: replica-of-left-neighbor region (same size as our own Blog, so it can
+  // hold a full 1:1 mirror of whichever broker replicates into us) ----
+  void* replica_mem = AllocHugeOrFallback(kBlogBytesPerBroker);
+  memset(replica_mem, 0, 1 << 20);
+  Mr replica_mr{};
+  if (!RegisterMr(d.pd, replica_mem, kBlogBytesPerBroker, &replica_mr)) return 1;
 #endif
 
   // ---- Connect to the memserver (control plane; also the Blog target in W5-B) ----
@@ -170,6 +188,68 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::seconds(duration_secs + 5));
     DestroyRcQp(&blog_qp);
   });
+
+  // ---- Phase 2 RF>=2: accept our LEFT neighbor's replication connection (they WRITE into our
+  // replica_mem) — one accept, separate port/listener from the sequencer's blog handoff above so
+  // the two concerns (payload reads, peer replication) don't share failure modes. ----
+  std::thread replica_acceptor_thread([&, replica_max_accepts]() {
+    // Accepts UP TO replica_max_accepts connections over the run's lifetime, not just one: the
+    // FIRST is normally our left neighbor's ongoing replication feed (role=1); on whichever broker
+    // the orchestration script designates as the post-kill recovery SOURCE, a SECOND, later
+    // connection from the recovery tool (role=2, read-only) needs to land too — both get the SAME
+    // replica region descriptor (concurrent RDMA READs of one region are safe; only the recovery
+    // tool ever reads it, the left neighbor only ever writes it).
+    int rfd = OobServerListen(replica_port, replica_max_accepts);
+    if (rfd < 0) { fprintf(stderr, "[broker %d] replica-acceptor listen failed\n", broker_id); return; }
+    std::vector<RcQp> rqps;
+    for (int i = 0; i < replica_max_accepts; ++i) {
+      RcQp rqp{};
+      if (!CreateRcQp(&d, 4096, 2048, /*psn_seed=*/0x5500 + broker_id * 8 + i, &rqp)) {
+        fprintf(stderr, "[broker %d] replica-acceptor CreateRcQp failed\n", broker_id); break;
+      }
+      ReplicaHandoffBlob hlocal{}, hremote{};
+      hlocal.role = 1;
+      hlocal.ep = LocalEndpoint(rqp);
+      hlocal.region = {reinterpret_cast<uint64_t>(replica_mr.addr), replica_mr.rkey(),
+                       static_cast<uint32_t>(replica_mr.len)};
+      if (!OobServerAccept(rfd, &hlocal, &hremote, sizeof(ReplicaHandoffBlob))) {
+        fprintf(stderr, "[broker %d] replica-acceptor: accept %d/%d timed out (RF=1 or no "
+                        "recovery this run)\n", broker_id, i + 1, replica_max_accepts);
+        break;
+      }
+      if (!ConnectRcQp(&rqp, hremote.ep)) {
+        fprintf(stderr, "[broker %d] replica-acceptor ConnectRcQp failed\n", broker_id); break;
+      }
+      fprintf(stderr, "[broker %d] replica-acceptor: connection %d/%d accepted role=%d (qpn=%u)\n",
+              broker_id, i + 1, replica_max_accepts, hremote.role, hremote.ep.qpn);
+      rqps.push_back(rqp);
+    }
+    OobServerClose(rfd);
+    std::this_thread::sleep_for(std::chrono::seconds(duration_secs + 15));  // outlive recovery window
+    for (auto& q : rqps) DestroyRcQp(&q);
+  });
+
+  // ---- Phase 2 RF>=2: connect to our RIGHT neighbor as a replication CLIENT (we WRITE into
+  // their replica region after every local store) ----
+  RcQp replica_client_qp{};
+  RegionDesc right_replica_region{};
+  bool has_right_neighbor = !right_neighbor_ip.empty();
+  if (has_right_neighbor) {
+    if (!CreateRcQp(&d, 4096, 2048, /*psn_seed=*/0x5600 + broker_id, &replica_client_qp)) return 1;
+    ReplicaHandoffBlob hlocal{}, hremote{};
+    hlocal.role = 1;
+    hlocal.ep = LocalEndpoint(replica_client_qp);
+    if (!OobClientExchange(right_neighbor_ip, right_neighbor_replica_port, &hlocal, &hremote,
+                           sizeof(ReplicaHandoffBlob))) {
+      fprintf(stderr, "[broker %d] replication handoff with right neighbor (%s) failed\n",
+              broker_id, right_neighbor_ip.c_str());
+      return 1;
+    }
+    if (!ConnectRcQp(&replica_client_qp, hremote.ep)) return 1;
+    right_replica_region = hremote.region;
+    fprintf(stderr, "[broker %d] replicating to right neighbor %s (qpn=%u)\n", broker_id,
+            right_neighbor_ip.c_str(), hremote.ep.qpn);
+  }
 #endif
 
   // ---- Producer loop: fixed-size "batches" of message_size bytes, PBR ring of pbr_slots ----
@@ -196,6 +276,9 @@ int main(int argc, char** argv) {
   const auto t_start = std::chrono::steady_clock::now();
   const auto deadline = t_start + std::chrono::seconds(duration_secs);
   uint64_t wr_id_ctr = 0;
+#if BLOG_PLACEMENT_DRAM
+  uint64_t replica_wr_id_ctr = 0, replica_completed = 0;
+#endif
 
   auto now_ns = [] {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -234,6 +317,19 @@ int main(int argc, char** argv) {
 #if BLOG_PLACEMENT_DRAM
     memset(static_cast<uint8_t*>(local_blog_mem) + log_idx, static_cast<uint8_t>(global_seq & 0xFF),
            per_slot_blog_bytes);  // local CPU store, no network (leg-2 held)
+    // Step 1b (Phase 2 RF>=2): replicate the SAME bytes to our right neighbor at the SAME log_idx
+    // offset (1:1 mirrored layout) — best-effort, fire-and-mostly-forget: opportunistically drain
+    // completions (non-blocking) rather than adding this QP to the main backpressure loop, since
+    // its only job is keeping a redundant copy current, not gating the producer's own throughput.
+    if (has_right_neighbor) {
+      PostWrite(&replica_client_qp, static_cast<uint8_t*>(local_blog_mem) + log_idx,
+                local_blog_mr.lkey(), right_replica_region.addr + log_idx, right_replica_region.rkey,
+                static_cast<uint32_t>(per_slot_blog_bytes), /*wr_id=*/replica_wr_id_ctr++);
+      ibv_wc replica_wc[16];
+      int rn = ibv_poll_cq(replica_client_qp.cq, 16, replica_wc);
+      if (rn > 0) replica_completed += rn;
+      else if (rn < 0) fprintf(stderr, "[broker %d] replica QP poll error\n", broker_id);
+    }
 #else
     PostWrite(&meta_qp, stage.data(), stage_mr.lkey(), remote_blog_base + (log_idx % remote_blog_bytes),
               remote_blog_rkey, static_cast<uint32_t>(per_slot_blog_bytes), wr_id_ctr++);
@@ -304,10 +400,19 @@ int main(int argc, char** argv) {
           broker_id, (unsigned long)batches, (unsigned long)bytes_posted, secs,
           batches / secs / 1e6, (bytes_posted * 8.0) / secs / 1e9,
           lat.Pct(0.50) / 1e3, lat.Pct(0.99) / 1e3, lat.Pct(0.999) / 1e3);
+#if BLOG_PLACEMENT_DRAM
+  if (has_right_neighbor) {
+    fprintf(stderr, "[broker %d] REPLICA_RESULT posted=%lu completed=%lu\n", broker_id,
+            (unsigned long)replica_wr_id_ctr, (unsigned long)replica_completed);
+  }
+#endif
 
 #if BLOG_PLACEMENT_DRAM
   blog_server_thread.join();
+  replica_acceptor_thread.join();
+  if (has_right_neighbor) DestroyRcQp(&replica_client_qp);
   DeregisterMr(&local_blog_mr);
+  DeregisterMr(&replica_mr);
 #else
   DeregisterMr(&stage_mr);
 #endif

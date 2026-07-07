@@ -73,6 +73,9 @@ int main(int argc, char** argv) {
   bool host_blog = HasFlag(argc, argv, "--host-blog");
   size_t blog_bytes_per_broker = atoll(GetArg(argc, argv, "--blog-bytes", "1073741824"));  // 1 GiB
   int duration_secs = atoi(GetArg(argc, argv, "--duration", "10"));
+  size_t spare_bytes = atoll(GetArg(argc, argv, "--spare-bytes", "0"));  // Phase 2 recovery target; 0 = none
+  int recovery_port = atoi(GetArg(argc, argv, "--recovery-port", "18690"));
+  int max_recoveries = atoi(GetArg(argc, argv, "--max-recoveries", "4"));
   std::string dev = GetArg(argc, argv, "--dev", "mlx5_0");
   int gid = atoi(GetArg(argc, argv, "--gid", "-1"));
 
@@ -114,20 +117,26 @@ int main(int argc, char** argv) {
     blog_mem = AllocHugeOrFallback(blog_total);
     memset(blog_mem, 0, blog_total < (1u << 20) ? blog_total : (1u << 20));  // touch first page only; full zero is unnecessary for a payload buffer
   }
+  void* spare_mem = nullptr;
+  if (spare_bytes > 0) {
+    spare_mem = AllocHugeOrFallback(spare_bytes);
+    memset(spare_mem, 0, spare_bytes < (1u << 20) ? spare_bytes : (1u << 20));
+  }
 
-  Mr control_mr{}, cv_mr{}, sentinel_mr{}, goi_mr{}, pbr_mr{}, blog_mr{};
+  Mr control_mr{}, cv_mr{}, sentinel_mr{}, goi_mr{}, pbr_mr{}, blog_mr{}, spare_mr{};
   if (!RegisterMr(d.pd, control_mem, layout.control_block_bytes(), &control_mr)) return 1;
   if (!RegisterMr(d.pd, cv_mem, layout.completion_vector_bytes(), &cv_mr)) return 1;
   if (!RegisterMr(d.pd, sentinel_mem, layout.sentinel_array_bytes(), &sentinel_mr)) return 1;
   if (!RegisterMr(d.pd, goi_mem, layout.goi_bytes(), &goi_mr)) return 1;
   if (!RegisterMr(d.pd, pbr_mem, layout.pbr_ring_bytes_total(), &pbr_mr)) return 1;
   if (host_blog && !RegisterMr(d.pd, blog_mem, blog_total, &blog_mr)) return 1;
+  if (spare_bytes > 0 && !RegisterMr(d.pd, spare_mem, spare_bytes, &spare_mr)) return 1;
 
   fprintf(stderr, "[memserver] regions registered: control=%zuB cv=%zuB sentinel=%zuB goi=%zuB "
-                  "pbr=%zuB blog=%zuB\n",
+                  "pbr=%zuB blog=%zuB spare=%zuB\n",
           layout.control_block_bytes(), layout.completion_vector_bytes(),
           layout.sentinel_array_bytes(), layout.goi_bytes(), layout.pbr_ring_bytes_total(),
-          host_blog ? blog_total : 0);
+          host_blog ? blog_total : 0, spare_bytes);
 
   // ---- Accept num_brokers + 1 (sequencer) QP connections ----
   // Passive server: ONE listening socket stays open for the whole batch (backlog sized for all
@@ -154,6 +163,10 @@ int main(int argc, char** argv) {
       local.blog = {reinterpret_cast<uint64_t>(blog_mr.addr), blog_mr.rkey(),
                     static_cast<uint32_t>(blog_mr.len)};
     }
+    if (spare_bytes > 0) {
+      local.spare = {reinterpret_cast<uint64_t>(spare_mr.addr), spare_mr.rkey(),
+                     static_cast<uint32_t>(spare_mr.len)};
+    }
     local.pbr_ring_bytes_per_broker = static_cast<uint32_t>(layout.pbr_ring_bytes_per_broker());
     local.blog_bytes_per_broker = static_cast<uint32_t>(blog_bytes_per_broker);
     local.host_blog = host_blog ? 1 : 0;
@@ -174,7 +187,38 @@ int main(int argc, char** argv) {
 
   fprintf(stderr, "[memserver] all %d clients connected; passive for %ds (CPU not in data path)\n",
           total_clients, duration_secs);
+
+  // ---- Phase 2 recovery-target acceptor (spare_bytes>0 only) ----
+  // Separate, independent listener from the fixed-count client loop above: the recovery tool
+  // connects LATE (only after a kill has actually happened, at an unpredictable point mid-run),
+  // not as part of the initial bring-up, so it needs its own persistent listener that stays armed
+  // for the whole run rather than closing after a fixed handshake count.
+  std::vector<RcQp> recovery_qps;
+  std::thread recovery_acceptor;
+  if (spare_bytes > 0) {
+    recovery_acceptor = std::thread([&]() {
+      int rfd = OobServerListen(recovery_port, max_recoveries);
+      if (rfd < 0) { fprintf(stderr, "[memserver] recovery-acceptor listen failed\n"); return; }
+      for (int i = 0; i < max_recoveries; ++i) {
+        RcQp rqp{};
+        if (!CreateRcQp(&d, 64, 64, /*psn_seed=*/0x9500 + i, &rqp)) break;
+        ReplicaHandoffBlob hlocal{}, hremote{};
+        hlocal.role = 1;  // recovery target: someone is about to WRITE a recovered replica here
+        hlocal.ep = LocalEndpoint(rqp);
+        hlocal.region = {reinterpret_cast<uint64_t>(spare_mr.addr), spare_mr.rkey(),
+                         static_cast<uint32_t>(spare_mr.len)};
+        if (!OobServerAccept(rfd, &hlocal, &hremote, sizeof(ReplicaHandoffBlob))) break;  // no more
+                                                                                            // recoveries this run
+        if (!ConnectRcQp(&rqp, hremote.ep)) break;
+        fprintf(stderr, "[memserver] recovery connection %d accepted qpn=%u\n", i, hremote.ep.qpn);
+        recovery_qps.push_back(rqp);
+      }
+      OobServerClose(rfd);
+    });
+  }
+
   std::this_thread::sleep_for(std::chrono::seconds(duration_secs));
+  if (recovery_acceptor.joinable()) recovery_acceptor.join();
 
   // ---- Post-run independent state dump (correctness cross-check, same spirit as Track 03's
   // mailbox benches' independent recompute) ----
@@ -189,9 +233,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[memserver] sentinel[broker=%d]=%lu\n", b, (unsigned long)sentinels[b].value);
 
   for (auto& q : qps) DestroyRcQp(&q);
+  for (auto& q : recovery_qps) DestroyRcQp(&q);
   DeregisterMr(&control_mr); DeregisterMr(&cv_mr); DeregisterMr(&sentinel_mr);
   DeregisterMr(&goi_mr); DeregisterMr(&pbr_mr);
   if (host_blog) DeregisterMr(&blog_mr);
+  if (spare_bytes > 0) DeregisterMr(&spare_mr);
   CloseDevice(&d);
   fprintf(stderr, "[memserver] clean exit\n");
   return 0;

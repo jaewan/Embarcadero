@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "rdma_transport/rdma_common.h"
@@ -73,6 +74,14 @@ int main(int argc, char** argv) {
   int duration_secs = atoi(GetArg(argc, argv, "--duration", "10"));
   std::string broker_ips_csv = GetArg(argc, argv, "--broker-ips", "");  // W5-A only; CSV, index = broker_id
   int blog_port = atoi(GetArg(argc, argv, "--blog-port", "18700"));
+  std::string blog_ports_csv = GetArg(argc, argv, "--blog-ports", "");  // optional per-broker override
+                                                                          // (CSV, index = broker_id) —
+                                                                          // needed when >1 broker is
+                                                                          // co-located on one host and
+                                                                          // a single shared port would
+                                                                          // conflict; falls back to
+                                                                          // --blog-port for every
+                                                                          // broker if not given.
   std::string dev = GetArg(argc, argv, "--dev", "mlx5_0");
   int gid = atoi(GetArg(argc, argv, "--gid", "-1"));
 
@@ -80,9 +89,9 @@ int main(int argc, char** argv) {
           BLOG_PLACEMENT_DRAM ? "DRAM(W5-A)" : "MEMSERVER(W5-B)", num_brokers, duration_secs);
 
   std::vector<std::string> broker_ips;
+  std::vector<int> blog_ports;
 #if BLOG_PLACEMENT_DRAM
   {
-    size_t pos = 0;
     std::string s = broker_ips_csv;
     while (!s.empty()) {
       size_t comma = s.find(',');
@@ -94,6 +103,22 @@ int main(int argc, char** argv) {
       fprintf(stderr, "[sequencer] FATAL: --broker-ips must list exactly num_brokers=%d IPs "
                       "(got %zu) for W5-A broker-direct Blog reads\n", num_brokers, broker_ips.size());
       return 1;
+    }
+    if (blog_ports_csv.empty()) {
+      blog_ports.assign(num_brokers, blog_port);
+    } else {
+      std::string p = blog_ports_csv;
+      while (!p.empty()) {
+        size_t comma = p.find(',');
+        blog_ports.push_back(atoi((comma == std::string::npos ? p : p.substr(0, comma)).c_str()));
+        if (comma == std::string::npos) break;
+        p = p.substr(comma + 1);
+      }
+      if (static_cast<int>(blog_ports.size()) != num_brokers) {
+        fprintf(stderr, "[sequencer] FATAL: --blog-ports must list exactly num_brokers=%d ports "
+                        "(got %zu)\n", num_brokers, blog_ports.size());
+        return 1;
+      }
     }
   }
 #endif
@@ -139,7 +164,7 @@ int main(int argc, char** argv) {
     if (!CreateRcQpOnSharedCq(&d, blog_shared_cq, 2 * kWindow, /*psn_seed=*/0x7000 + b, &blog_qps[b])) return 1;
     BlogHandoffBlob hlocal{}, hremote{};
     hlocal.ep = LocalEndpoint(blog_qps[b]);
-    if (!OobClientExchange(broker_ips[b], blog_port, &hlocal, &hremote, sizeof(BlogHandoffBlob))) {
+    if (!OobClientExchange(broker_ips[b], blog_ports[b], &hlocal, &hremote, sizeof(BlogHandoffBlob))) {
       fprintf(stderr, "[sequencer] Blog handoff with broker %d (%s) failed\n", b, broker_ips[b].c_str());
       return 1;
     }
@@ -148,6 +173,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[sequencer] broker-direct Blog connection to broker %d (%s) qpn=%u\n",
             b, broker_ips[b].c_str(), hremote.ep.qpn);
   }
+  // Maps a completion's LOCAL qp_num (blog_qps[b].qp->qp_num — the number ibv_poll_cq reports for
+  // a WC on that QP) back to the broker it belongs to, so the fast-path error handler in Step 4
+  // knows WHICH broker just errored out.
+  std::unordered_map<uint32_t, int> qpnum_to_broker;
+  for (int b = 0; b < num_brokers; ++b) qpnum_to_broker[blog_qps[b].qp->qp_num] = b;
 #endif
 
   // ---- Local staging buffers, registered once ----
@@ -207,7 +237,21 @@ int main(int argc, char** argv) {
   // succeeded. A post/poll failure on a per-broker Blog QP (W5-A) is exactly the fast-path
   // `kPeerDown` signal Phase 2's failure-detection race depends on — silently hanging on it would
   // have made that measurement impossible, not just slow.
-  auto pipelined_ops = [&](RcQp* q, size_t count, auto&& post_one, auto&& on_complete) -> bool {
+  // [[BUG FOUND]] The original fast-path plan was "a failed ibv_post_send on a dead peer's QP is
+  // kPeerDown" — WRONG. post_send() only enqueues a WR on the LOCAL send queue; it does not touch
+  // the network and succeeds regardless of whether the peer is alive. A dead peer only surfaces as
+  // a BAD COMPLETION STATUS later (RC retry/timeout exhaustion -> IBV_WC_RETRY_EXC_ERR, or
+  // IBV_WC_WR_FLUSH_ERR for anything queued after the QP already entered the error state) —
+  // discovered via POLLING, not posting. Verified by a kill sanity test: broker0 was killed, but
+  // `!post_one(...)` never fired even once; detection only happened via the 500ms lease backstop.
+  // Fixed: pipelined_ops now polls inline (instead of delegating to the opaque PollCq helper) so it
+  // can extract the erroring completion's qp_num and hand it to an optional `on_error` hook —
+  // that's the real fast path. Good completions retrieved in the SAME poll batch as a bad one are
+  // still delivered to on_complete before reporting the error (ibv_poll_cq can return a mixed
+  // batch; only the bad entry and anything after it in that batch is lost, to be picked up by the
+  // caller's retry logic).
+  auto pipelined_ops = [&](RcQp* q, size_t count, auto&& post_one, auto&& on_complete,
+                           auto&& on_error) -> bool {
     size_t posted = 0, completed = 0;
     while (completed < count) {
       while (posted < count && (posted - completed) < static_cast<size_t>(kWindow)) {
@@ -217,10 +261,25 @@ int main(int argc, char** argv) {
         }
         ++posted;
       }
-      int n = PollCq(q->cq, wc, 16, &bad);
-      if (n < 0) { fprintf(stderr, "[sequencer] pipelined op WC error status=%d\n", bad); return false; }
-      for (int i = 0; i < n; ++i) on_complete(static_cast<size_t>(wc[i].wr_id));
-      completed += static_cast<size_t>(n);
+      int n = ibv_poll_cq(q->cq, 16, wc);
+      if (n < 0) { fprintf(stderr, "[sequencer] pipelined op poll_cq error\n"); return false; }
+      if (n == 0) continue;
+      bool had_error = false;
+      for (int i = 0; i < n; ++i) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          fprintf(stderr,
+                  "[sequencer] pipelined op WC error status=%d(%s) qp_num=%u wr_id=%llu\n",
+                  wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].qp_num,
+                  static_cast<unsigned long long>(wc[i].wr_id));
+          on_error(wc[i].qp_num);
+          had_error = true;
+          break;  // stop processing this batch; anything after (incl. this entry) is lost, the
+                  // caller's retry logic picks up whatever didn't complete
+        }
+        on_complete(static_cast<size_t>(wc[i].wr_id));
+        ++completed;
+      }
+      if (had_error) return false;
     }
     return true;
   };
@@ -334,7 +393,8 @@ int main(int argc, char** argv) {
           w.total_size = h.total_size;
           w.client_id = h.client_id;
           w.batch_seq = h.batch_seq;
-        });
+        },
+        [](uint32_t) {});  // no per-broker QP here — meta_qp targets c3, never killed in Phase 2
 
     std::vector<size_t> valid_idx;
     for (size_t i = 0; i < work.size(); ++i) if (work[i].header_valid) valid_idx.push_back(i);
@@ -377,10 +437,11 @@ int main(int argc, char** argv) {
                                    blog_regions[w.broker].addr + w.log_idx, blog_regions[w.broker].rkey,
                                    len, /*wr_id=*/j);
             if (!posted && !broker_dead[w.broker]) {
-              // FAST path: RC RETRY_EXC -> QP ERROR on a dead peer, caught at post_send() time
-              // (the QP already transitioned to error from an earlier failed op this window) or
-              // via the completion-poll WC-error branch inside pipelined_ops itself — either way
-              // this is `kPeerDown`, the fast half of Phase 2's failure-detection race.
+              // Defensive fallback only — a LOCAL post_send() failure (e.g. this QP already in
+              // the error state from an earlier bad completion THIS window, so ibv_post_send
+              // itself rejects it) can still land here. The REAL fast path for a dead PEER is the
+              // on_error(qp_num) hook below, fired from a bad completion status, not from post
+              // failing (post_send succeeds locally regardless of whether the peer is alive).
               broker_dead[w.broker] = true;
               broker_dead_detect_ts[w.broker] = NowNsLocal();
               broker_dead_via[w.broker] = "rdma_error";
@@ -413,7 +474,30 @@ int main(int argc, char** argv) {
               cv_dirty_since_flush[w.broker] = w.seq + 1;
             }
             committed.push_back(pending[j]);
-          });
+          }
+#if BLOG_PLACEMENT_DRAM
+          ,
+          [&](uint32_t qp_num) {
+            // THE actual fast path: a completion for this QP came back with a bad status (RC
+            // retry/timeout exhaustion against a dead peer, or a flush error for anything queued
+            // after the QP already entered the error state). Map qp_num back to broker_id and
+            // declare it dead here — this is what kPeerDown detection really looks like, not a
+            // failed post_send (see the bug note on pipelined_ops above).
+            auto it = qpnum_to_broker.find(qp_num);
+            if (it == qpnum_to_broker.end()) return;
+            int b = it->second;
+            if (broker_dead[b]) return;
+            broker_dead[b] = true;
+            broker_dead_detect_ts[b] = NowNsLocal();
+            broker_dead_via[b] = "rdma_error";
+            fprintf(stderr, "[sequencer] broker %d declared dead via RDMA_ERROR (kPeerDown) at t=%.3fs\n",
+                    b, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
+          }
+#else
+          ,
+          [](uint32_t) {}  // meta_qp targets c3, never killed in Phase 2
+#endif
+          );
       if (ok) { pending.clear(); break; }
       std::vector<size_t> committed_this_attempt(committed.begin() + committed_before, committed.end());
       std::vector<size_t> next_pending;
@@ -466,7 +550,8 @@ int main(int argc, char** argv) {
           return PostWrite(&meta_qp, &g, goi_buf_mr.lkey(), goi_addr, remote.goi.rkey,
                            sizeof(GoiEntryMirror), /*wr_id=*/k);
         },
-        [&](size_t /*k*/) {});
+        [&](size_t /*k*/) {},
+        [](uint32_t) {});  // meta_qp targets c3, never killed in Phase 2
 
     // Step 5: CV + ControlBlock — ONCE per broker (CV) / once total (ControlBlock) per poll
     // cycle with the LATEST value, not once per batch. This matches the real system's per-epoch
