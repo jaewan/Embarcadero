@@ -29,3 +29,32 @@ target_link_libraries(rdma_transport PUBLIC ${IBVERBS_LIB})
 add_executable(rdma_bench rdma_bench_main.cc)
 target_link_libraries(rdma_bench PRIVATE rdma_transport)
 set_target_properties(rdma_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# ---- W5-A / W5-B variant harness (docs/design/W5_RDMA_VARIANTS_SPEC.md) --------------------------
+# Passive memory server: always hosts metadata (Decision 1); --host-blog additionally hosts the
+# payload Blog (W5-B). One binary serves both variants at runtime.
+add_executable(rdma_memserver rdma_memserver.cc)
+target_link_libraries(rdma_memserver PRIVATE rdma_transport)
+set_target_properties(rdma_memserver PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Broker/producer + sequencer: ONE TU each, TWO targets differing only by -DBLOG_PLACEMENT_DRAM
+# (spec §4 CI check: "both targets build from the same TU set differing only by the macro").
+add_executable(w5_broker_dram rdma_broker.cc)
+target_link_libraries(w5_broker_dram PRIVATE rdma_transport)
+target_compile_definitions(w5_broker_dram PRIVATE BLOG_PLACEMENT_DRAM=1)
+set_target_properties(w5_broker_dram PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(w5_broker_memserver rdma_broker.cc)
+target_link_libraries(w5_broker_memserver PRIVATE rdma_transport)
+target_compile_definitions(w5_broker_memserver PRIVATE BLOG_PLACEMENT_DRAM=0)
+set_target_properties(w5_broker_memserver PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(w5_sequencer_dram rdma_sequencer.cc)
+target_link_libraries(w5_sequencer_dram PRIVATE rdma_transport)
+target_compile_definitions(w5_sequencer_dram PRIVATE BLOG_PLACEMENT_DRAM=1)
+set_target_properties(w5_sequencer_dram PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(w5_sequencer_memserver rdma_sequencer.cc)
+target_link_libraries(w5_sequencer_memserver PRIVATE rdma_transport)
+target_compile_definitions(w5_sequencer_memserver PRIVATE BLOG_PLACEMENT_DRAM=0)
+set_target_properties(w5_sequencer_memserver PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
