@@ -128,11 +128,15 @@ batch_header->session_epoch = static_cast<uint16_t>(session_epoch_.load(std::mem
 
 ### 2.3 CXL session table (new durable region, single-writer) — the DURABLE TRUTH
 
-**Do not grow `ControlBlock`** (128B is the exact 2-cache-line prefetch contract, `cxl_datastructure.h:83`). Place the session table in the **~495 GB BLog/PBR tail** at a dedicated per-topic stride, mirroring TInode. One 256 KB block/topic:
+**Do not grow `ControlBlock`** (128B is the exact 2-cache-line prefetch contract, `cxl_datastructure.h:83`). The fixed low metadata plane (`ControlBlock@0x0 → CV@0x1000 → GOI@0x2000..16 GiB`, ending at `kPhase2MetadataEnd=0x4'0000'2000`) is packed — there is **NO** free slot for a 256 KB region there. **RESOLVED — Track-04 sign-off 2026-07-07:** place the session table as a **COMPUTED region in the dynamic plane, between `batchHeaders_` and `segments_`** in `cxl_manager.cc`, mirroring exactly how `batchHeaders_` is placed (deterministic from config ⇒ every broker computes the identical base ⇒ no cross-broker mismatch — the corruption risk). NOT a fixed hex `kSessionTableBase` (the low plane has no room). One 256 KB block/topic:
 
 ```cpp
-// cxl_datastructure.h
-constexpr size_t kSessionTableBase = /* dedicated base in BLog tail, per-topic stride */;
+// cxl_manager.cc, in the region-setup block (:290-327), inserted AFTER batchHeaders_ / BEFORE segments_:
+//   session_table_ = base_for_regions_ + TInode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size
+//   SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE   // 256KB*MAX_TOPIC_SIZE = 8 MB @ 32
+//   segments_ = session_table_ + SessionTable_Region_size                             // rebased (was = batchHeaders_end)
+//   Segment_Region_size -= SessionTable_Region_size                                   // + update the :310 "too small" check
+//   GetSessionTable(topic_idx) = session_table_ + topic_idx * (kMaxSessions * sizeof(SessionEntry))  // 256 KB stride
 constexpr size_t kMaxSessions      = 4096;   // per topic; 4096 × 64B = 256 KB/topic
 
 struct alignas(64) SessionEntry {              // exactly 64B → one TLP-atomic cache line
@@ -150,7 +154,7 @@ static_assert(sizeof(SessionEntry) == 64);
 **Role change from v1 (must-fix #6): DURABLE TRUTH, not a mirror.** The CXL `SessionEntry` table is the **DURABLE TRUTH** for per-session `{expected_seq, committed_hwm, fenced, session_epoch, highest_sequenced}`. The DRAM `ClientState5` (`OptimizedClientState`, `sequencer_utils.h:18`; via `topic.h:886 shard.client_state`) becomes a **write-through CACHE**. Every field is monotone; the FENCED bit only sets. Each entry is exactly 64B ⇒ one TLP-atomic line ⇒ a poll reader sees whole-old or whole-new, never torn.
 
 - **Ownership:** the **sequencer is the single writer** for every field. Open-addressed by `hash(session_key) % kMaxSessions` with linear probe. `session_key` uses the **FULL 32-bit** `session_epoch`; `epoch=0` maps to a distinct legacy code path (no SessionEntry, no fence).
-- **Chain-replicated** in the same metadata plane as `ControlBlock`/CV so D7 replicates it (Track-04 CXL layout).
+- **Replicated via the existing per-replica-topic pattern (D7), not per-offset mirroring** (Track-04 sign-off 2026-07-07): a replica topic already gets its own TInode hash slot (`GetReplicaTInode`, `cxl_manager.cc:512-517`), so its SessionTable lands in its own slot via the same computed formula (replica `topic_idx`). No special mirror needed.
 
 **Writer publish protocol (must-fix #6, #7 — TOCTOU-safe).** Single-writer, at commit/fence time, batched **per-epoch-per-session inside `CommitEpoch`** (`topic.cc:4429-4435` per-client flush block), NOT per-batch (preserves the fast path):
 
@@ -685,7 +689,7 @@ The 14 must-fixes are resolved inline. These residuals remain (from the cluster 
 
 1. **`session_lease_ns` value (D2-owned).** The 1s/2s default (§3.4) is a PLACEHOLDER; the authoritative value is a D2 deliverable. Config-load inequality `kDeltaCapMs < session_lease_ms < PBR_fill_time_ms` and `session_lease_ns ≥ open-load append/ack p99.9` must hold. **D2 MUST set `session_lease_ms > kDeltaCapMs` (i.e. > 12 ms)** — the inequality currently holds only against the 1000–2000 ms placeholder; an aggressive sub-12 ms lease would violate it. Too low re-introduces false-fence of slow sessions; too high slows recovery and risks D3 ring-coupling.
 2. **Open-load δ measurement gate — CLOSED (2026-07-07).** Offered-load sweep run on the S2 tree; open-load `append_send_to_ack` p99.9 = 1.0–1.1 ms typical / 4.95 ms worst trial at operating load (knee onset ~8000 MB/s). Constants frozen in §5.2: `kDeltaFloorMs=1.7`, `kDeltaCapMs=12`. Full table + knee + caveats: `docs/experiments/delta_measurement_results.md`. **Follow-up validation (D2 phase, non-blocking for D1 freeze):** the 4.95 ms anchor is a single nearest-rank p99.9 sample at the anti-monotone 4000 MB/s point on loopback — re-run the 4000-point in isolation, add a real-wire (`SCENARIO=remote`) point and a multi-client point, and commit the raw per-point CDF CSVs so the anchor is auditable. Raising the cap to 12 already absorbs this single-sample fragility for the backstop.
-3. **`GOIEntry.session_epoch` field (cross-cluster).** Recovery (§6.2) requires `session_epoch` persisted in the GOI to disambiguate generations of the same `client_id`. Confirm Track-04 accepts the additive `uint32_t session_epoch` in `GOIEntry._pad` (`:270`).
+3. **`GOIEntry.session_epoch` field + SessionEntry region — CLOSED (Track-04 sign-off 2026-07-07).** Recovery (§6.2) requires `session_epoch` persisted in the GOI to disambiguate generations of the same `client_id`: the additive `uint32_t session_epoch` in `GOIEntry._pad` (`:270`, keeps 128B) is **accepted**. The SessionEntry table is placed as a **computed region between `batchHeaders_` and `segments_`** (§2.3), 8 MB total (256 KB × MAX_TOPIC_SIZE) out of the ~26 GB segment pool, replicated via the per-replica-topic slot pattern. Implemented in D1 Commit D.
 4. **R1 MAX vs. reconnect-answer min reconciliation (Cluster C ↔ E).** §6.2.1 uses `MAX` for accept-time `next_expected`; §4.1 uses `min` for the reconnect answer. Confirm both signs (both conservative for their property). Cross-cluster sign-off required.
 5. **`SessionEntry` slot reclamation (ties to D6).** Open-addressed, never-freed-within-epoch (fence terminality) fills 4096/topic under many-generation long runs. When is a FENCED entry's slot freed (GC frontier, co-design with D6 so no in-flight old-epoch client can still present the key)?
 6. **`ResetBatchSeqForNewSession` quiescence (Cluster A residual).** `batch_seq_` is single-producer; resetting to 0 while any `PublishThread` is mid-seal corrupts the monotone invariant. The reset (§5.4) must provably follow SealAll drain + producer pause. If quiescence cannot be guaranteed, fall back to NOT resetting (let `session_epoch` alone namespace the seq) — but that changes reconnect-at-0 accept on the sequencer. Client-library cluster decision.

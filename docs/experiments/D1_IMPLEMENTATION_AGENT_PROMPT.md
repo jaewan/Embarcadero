@@ -71,9 +71,10 @@ Until G stamps `BatchHeader.session_epoch`, **`session_epoch=0` (legacy) everywh
 - Add **verbatim** to `cxl_datastructure.h` (~lines 53–68):
 ```cpp
 constexpr size_t kMaxSessions = 4096;              // per topic; 4096 × 64B = 256 KB/topic
-// kSessionTableBase: NEW dedicated region — Track-04 CXL-layout decision. Proposed: a metadata-plane
-// region after CV/GOI, per-topic stride 256KB, chain-replicated with ControlBlock/CV (D7).
-// DO NOT grow ControlBlock (128B contract, :83). Confirm offset with Track 04 before coding.
+// PLACEMENT — RESOLVED (Track-04 sign-off 2026-07-07): the fixed low plane (CB@0x0/CV@0x1000/
+// GOI@0x2000..16GiB, ending at kPhase2MetadataEnd=0x4'0000'2000) is PACKED — no room there.
+// Place the table as a COMPUTED region in cxl_manager.cc between batchHeaders_ and segments_,
+// mirroring how batchHeaders_ is placed (NOT a fixed hex kSessionTableBase). DO NOT grow ControlBlock.
 
 struct alignas(64) SessionEntry {                 // exactly 64B → one TLP-atomic line
     std::atomic<uint64_t> session_key{0};         // (client_id<<32)|full_32bit_session_epoch; 0=free
@@ -86,7 +87,16 @@ struct alignas(64) SessionEntry {                 // exactly 64B → one TLP-ato
 };
 static_assert(sizeof(SessionEntry) == 64, "one TLP-atomic cache line");
 ```
-- **`kSessionTableBase` is a NEW dedicated region** (Track-04 decision). **DO NOT grow `ControlBlock`** (128B contract, `cxl_datastructure.h:83`). **STOP and confirm the region offset with Track-04 before coding it — do NOT hard-code blind.**
+- **Region placement — RESOLVED (Track-04 sign-off 2026-07-07); implement it, do NOT stop.** In `cxl_manager.cc` region-setup (`:290-327`), insert a computed SessionTable region AFTER `batchHeaders_` / BEFORE `segments_`, exactly mirroring `batchHeaders_`:
+  ```cpp
+  // after: batchHeaders_ = base_for_regions + TInode_Region_size + Bitmap_Region_size; (all-broker base)
+  session_table_ = reinterpret_cast<uint8_t*>(batchHeaders_) + BatchHeaders_Region_size;   // BEFORE the per-broker rebase at :327
+  size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;   // 256KB*MAX_TOPIC_SIZE (8 MB @ 32)
+  segments_ = reinterpret_cast<uint8_t*>(session_table_) + SessionTable_Region_size;        // rebased (was batchHeaders_+BHsize)
+  // subtract SessionTable_Region_size from Segment_Region_size (:316) AND add it to the too-small check (:310-312)
+  // accessor: GetSessionTable(topic_idx) = session_table_ + topic_idx * (kMaxSessions * sizeof(SessionEntry));  // 256KB stride
+  ```
+  Deterministic from config ⇒ every broker computes the identical base (no cross-broker mismatch). **DO NOT grow `ControlBlock`** (128B contract, `cxl_datastructure.h:83`). Replication follows the per-replica-topic slot pattern (`GetReplicaTInode`, `:512-517`) — the replica topic's SessionTable lands in its own slot via the same formula; no per-offset mirror.
 - `GOIEntry`: consume `uint32_t session_epoch` from the 40B `_pad(:270)`, keep 128B (`static_assert`), populate at commit (`topic.cc:4166` / `:4189` alongside `client_seq`).
 - `BatchHeader._pad0(:415)` → `uint16_t session_epoch` (**16-bit TRANSPORT HINT only**) + `static_assert(offsetof(BatchHeader, session_epoch) < 64)`. SessionEntry/GOIEntry carry the **full 32-bit** epoch; BatchHeader is a hint only.
 - **Writer protocol (spec §2.3):** single-writer sequencer in `CommitEpoch` per-epoch-per-session flush (`topic.cc:4429–4435`): **data words first** (store relaxed) → `store_fence`+`flush_cacheline`+`store_fence` → **`state_word` LAST** (`store(release)`) → `store_fence`+`flush`+`store_fence`.
@@ -190,7 +200,7 @@ java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -deadlock -workers 16 \
 - `GOIEntry` (128B @ 0x2000) `:240-273`; `client_seq` `:261`; `_pad` `:270` → add `uint32_t session_epoch`.
 - `BatchHeader` (128B) `:397-441`; `batch_seq` `:407`; `pbr_absolute_index` `:421`; `_pad0` `:415` → `uint16_t session_epoch`.
 - `kCompletionVectorOffset=0x1000`, `kGOIOffset=0x2000` `:712-713`.
-- **New:** `SessionEntry` + `kMaxSessions=4096` (verbatim in Commit D); `kSessionTableBase` (Track-04 offset).
+- **New:** `SessionEntry` + `kMaxSessions=4096` (verbatim in Commit D); SessionTable = computed region in `cxl_manager.cc` between `batchHeaders_` and `segments_` (Track-04 signed off — see Commit D).
 
 **Sequencer — `src/embarlet/topic.{h,cc}`:**
 - `HoldBatchMetadata`/`PendingBatch5` `topic.h:50-84` (`batch_seq` @ `:52`/`:67`, `client_id` @ `:66`).
@@ -247,7 +257,7 @@ git bundle create /tmp/d1_impl.bundle origin/main..d1-impl
 
 ## 9. STOP and Report (do NOT proceed / do NOT guess) if:
 
-- **Track-04 has NOT signed off the `kSessionTableBase` region offset** (or `GOIEntry.session_epoch` layout) — Commit D. Do NOT hard-code the offset blind.
+- ~~Track-04 sign-off for the SessionEntry region / `GOIEntry.session_epoch`~~ — **RESOLVED (2026-07-07)**: computed region between `batchHeaders_` and `segments_`; `GOIEntry.session_epoch` in `_pad` accepted (Commit D spec above). Commit D is UNBLOCKED.
 - **D2 has NOT supplied `session_lease_ns`** — Commit E is blocked (placeholder is 1000/2000ms; D2 must set `session_lease_ms > kDeltaCapMs` i.e. `> 12ms`, and satisfy `kDeltaCapMs < session_lease_ms < PBR_fill_time_ms` AND `session_lease_ns >= open-load append/ack p99.9`).
 - **Track-02 TLA+ Scenarios A & B are NOT finalized/passing** (`bash spec/run_all.sh`) — Commit F is hard-blocked. "TLA+ first, code second."
 - **The open-load δ measurement gate is NOT closed** — Commit G's δ tuning is blocked (constants stay `kDeltaFloorMs=1.7`, `kDeltaCapMs=12`).
