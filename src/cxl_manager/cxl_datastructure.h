@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cctype>
 #include <atomic>
+#include <cstddef>
+#include <limits>
 
 /* CXL memory layout (v2.0 - Phase 1a + Phase 2)
  *
@@ -220,6 +222,21 @@ struct alignas(128) CompletionVectorEntry {
 static_assert(sizeof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be exactly 128 bytes");
 static_assert(alignof(CompletionVectorEntry) == 128, "CompletionVectorEntry must be 128-byte aligned");
 
+constexpr size_t kMaxSessions = 4096;
+
+struct alignas(64) SessionEntry {
+	std::atomic<uint64_t> session_key{0};      // (client_id << 32) | session_epoch; 0 = empty
+	std::atomic<uint64_t> expected_seq{0};     // next client batch_seq expected for this live session
+	std::atomic<uint64_t> committed_hwm{0};    // highest committed client batch_seq
+	std::atomic<uint64_t> highest_sequenced{0};
+	std::atomic<uint64_t> state_word{0};       // bit0=FENCED, bit1=ACTIVE; written last
+	std::atomic<uint64_t> reserved0{0};
+	uint8_t _pad[16];
+};
+static_assert(sizeof(SessionEntry) == 64, "one TLP-atomic cache line");
+static_assert(alignof(SessionEntry) == 64, "SessionEntry must be 64-byte aligned");
+static_assert(offsetof(SessionEntry, state_word) < 64, "state_word must stay in the single cache line");
+
 /**
  * GOIEntry (128 bytes) — Phase 2: Global Order Index
  *
@@ -266,8 +283,9 @@ struct alignas(128) GOIEntry {
 	// [[ACK_OPTIMIZATION]] Cumulative message count for this broker (start_logical_offset + num_msg).
 	// Allows Tail Replica to update CV with message count without reading BatchHeader from ring.
 	uint64_t cumulative_message_count;
+	uint32_t session_epoch;                    // Per-client session generation for Level-5 recovery/fencing
 	
-	uint8_t _pad[40];                          // Pad to 128 bytes (128 - 88 = 40)
+	uint8_t _pad[36];                          // Pad to 128 bytes (128 - 92 = 36)
 };
 static_assert(sizeof(GOIEntry) == 128, "GOIEntry must be exactly 128 bytes");
 static_assert(alignof(GOIEntry) == 128, "GOIEntry must be 128-byte aligned");
@@ -412,7 +430,7 @@ struct alignas(64) BatchHeader{
 	uint32_t ordered; // [[WRITER: Sequencer]] Set to 1 when batch is globally ordered (Stage-4 polls this)
 	uint32_t flags; // [[WRITER: NetworkManager]] CLAIMED/VALID flags for scanner readiness
 	uint16_t epoch_created; // [[WRITER: NetworkManager]] Epoch when batch was accepted (Phase 1a zombie fencing; sequencer can reject if stale)
-	uint16_t _pad0;
+	uint16_t session_epoch; // [[WRITER: NetworkManager]] Session epoch hint; authoritative table added in D
 
 	// [[PHASE_2]] Globally unique batch identifier for GOI deduplication and tracking
 	uint64_t batch_id; // [[WRITER: NetworkManager]] Format: (broker_id << 48) | pbr_absolute_index (P2.1)
@@ -443,6 +461,7 @@ static_assert(offsetof(BatchHeader, client_id) < 64, "client_id must be in first
 static_assert(offsetof(BatchHeader, num_msg) < 64, "num_msg must be in first cache line");
 static_assert(offsetof(BatchHeader, batch_complete) < 64, "batch_complete must be in first cache line");
 static_assert(offsetof(BatchHeader, flags) < 64, "flags must be in first cache line");
+static_assert(offsetof(BatchHeader, session_epoch) < 64, "session_epoch must be in first cache line");
 static_assert(offsetof(BatchHeader, publish_commit) >= 64, "publish_commit must be in second cache line");
 // Note: BATCHHEADERS_SIZE is runtime config, alignment verified at runtime in BrokerScannerWorker5
 

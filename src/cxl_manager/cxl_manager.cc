@@ -235,7 +235,9 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 			}
 			size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
 			size_t BatchHeaders_Region_size = NUM_MAX_BROKERS_CONFIG * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
-			size_t metadata_bytes = kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size;
+			size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
+			size_t metadata_bytes = kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+				BatchHeaders_Region_size + SessionTable_Region_size;
 			clear_bytes = std::min(cxl_size, metadata_bytes);
 			LOG(INFO) << "Head broker clearing CXL metadata only: " << clear_bytes
 			          << " bytes (set EMBARCADERO_CXL_ZERO_MODE=full to clear full region)";
@@ -298,6 +300,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		// Use configured max brokers consistently with GetNewSegment()
 		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
 		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+		size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
 		
 		// [[DEVIATION_005: Atomic Bitmap-Based Segment Allocation]]
 		// Phase 1: Single-Node Optimized (cache-coherent)
@@ -307,13 +310,16 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		
 		// Calculate total segment region size (shared pool for all brokers)
 		// Usable size = after Phase 2 metadata (ControlBlock + CV + GOI)
-		if (cxl_size_ < kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size) {
+		if (cxl_size_ < kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+				BatchHeaders_Region_size + SessionTable_Region_size) {
 			LOG(ERROR) << "CXL size " << cxl_size_ << " too small for layout v2: need at least "
-			           << (kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size)
-			           << " (Phase2 metadata + TInode + Bitmap + BatchHeaders)";
+			           << (kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+			               BatchHeaders_Region_size + SessionTable_Region_size)
+			           << " (Phase2 metadata + TInode + Bitmap + BatchHeaders + SessionTable)";
 			return;
 		}
-		size_t Segment_Region_size = (cxl_size_ - kPhase2MetadataEnd - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size);
+		size_t Segment_Region_size = (cxl_size_ - kPhase2MetadataEnd - TINode_Region_size -
+			Bitmap_Region_size - BatchHeaders_Region_size - SessionTable_Region_size);
 		padding = Segment_Region_size % cacheline_size;
 		Segment_Region_size -= padding;
 
@@ -323,7 +329,9 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		// [[DEVIATION_004]] - Bmeta region removed, segments start after BatchHeaders
 		// Shared segment pool: All brokers allocate from the same region
 		// Bitmap coordinates allocation to prevent fragmentation
-		segments_ = reinterpret_cast<uint8_t*>(batchHeaders_) + BatchHeaders_Region_size;
+		session_table_ = reinterpret_cast<SessionEntry*>(
+			reinterpret_cast<uint8_t*>(batchHeaders_) + BatchHeaders_Region_size);
+		segments_ = reinterpret_cast<uint8_t*>(session_table_) + SessionTable_Region_size;
 		batchHeaders_ = reinterpret_cast<uint8_t*>(batchHeaders_) + (broker_id_ * (BATCHHEADERS_SIZE * MAX_TOPIC_SIZE));
 
 		// [[PHASE_1A_EPOCH_FENCING]] Head broker initializes ControlBlock (epoch-based fencing)
@@ -525,6 +533,19 @@ TInode* CXLManager::GetTInodeByIndex(size_t idx) {
 		reinterpret_cast<uint8_t*>(base_for_regions_) + (idx * sizeof(struct TInode)));
 }
 
+SessionEntry* CXLManager::GetSessionTable(const char* topic) {
+	int TInode_idx = hashTopic(topic);
+	return GetSessionTableByIndex(static_cast<size_t>(TInode_idx));
+}
+
+SessionEntry* CXLManager::GetSessionTableByIndex(size_t idx) {
+	if (idx >= MAX_TOPIC_SIZE || session_table_ == nullptr) {
+		return nullptr;
+	}
+	return reinterpret_cast<SessionEntry*>(
+		reinterpret_cast<uint8_t*>(session_table_) + idx * (kMaxSessions * sizeof(SessionEntry)));
+}
+
 /**
  * [[DEVIATION_005: Atomic Bitmap-Based Segment Allocation]]
  * 
@@ -563,9 +584,11 @@ void* CXLManager::GetNewSegment(){
 		size_t cxl_size = Embarcadero::Configuration::getInstance().config().cxl.size.get();
 		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
 		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+		size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
 		
-		// [[DEVIATION_004]] - Bmeta region removed; [[PHASE_1A]] subtract ControlBlock
-		size_t Segment_Region_size = (cxl_size - sizeof(ControlBlock) - TINode_Region_size - Bitmap_Region_size - BatchHeaders_Region_size);
+		// [[DEVIATION_004]] - Bmeta region removed; regions start after Phase 2 metadata.
+		size_t Segment_Region_size = (cxl_size - kPhase2MetadataEnd - TINode_Region_size -
+			Bitmap_Region_size - BatchHeaders_Region_size - SessionTable_Region_size);
 		padding = Segment_Region_size % cacheline_size;
 		Segment_Region_size -= padding;
 		
@@ -686,9 +709,11 @@ size_t CXLManager::CalculatePBROffset(int broker_id, int max_brokers) {
 	
 	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
 	size_t BatchHeaders_Region_size = max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+	size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
 	
-	// PBR region starts after BatchHeaders
-	size_t PBR_Region_start = TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size;
+	// PBR/segment region starts after BatchHeaders and the computed SessionEntry table.
+	size_t PBR_Region_start = kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+		BatchHeaders_Region_size + SessionTable_Region_size;
 	
 	// Each broker gets its own PBR
 	return PBR_Region_start + broker_id * PBR_SIZE_PER_BROKER;
@@ -722,12 +747,14 @@ size_t CXLManager::GetTotalMemoryRequirement(int max_brokers) {
 	
 	size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
 	size_t BatchHeaders_Region_size = max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+	size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
 	size_t PBR_Region_size = max_brokers * PBR_SIZE_PER_BROKER;
 	size_t GOI_Region_size = GOI_SIZE;
 	
 	// Minimum memory requirement (before BrokerLogs)
-	return TINode_Region_size + Bitmap_Region_size + BatchHeaders_Region_size + 
-	       PBR_Region_size + GOI_Region_size;
+	return kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+	       BatchHeaders_Region_size + SessionTable_Region_size + PBR_Region_size +
+	       GOI_Region_size;
 }
 
 void CXLManager::GetRegisteredBrokerSet(absl::btree_set<int>& registered_brokers,

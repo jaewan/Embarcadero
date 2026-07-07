@@ -192,6 +192,30 @@ if(PkgConfig_FOUND)
             TIMEOUT 60
             LABELS "unit;lazylog;latency;correctness"
         )
+
+        add_executable(session_entry_torn_read_test
+            session_entry_torn_read_test.cc
+        )
+        target_include_directories(session_entry_torn_read_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(session_entry_torn_read_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(session_entry_torn_read_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            heartbeat_grpc_proto
+            protobuf::libprotobuf
+            pthread
+        )
+        add_test(NAME unit_session_entry_torn_read COMMAND session_entry_torn_read_test)
+        set_tests_properties(unit_session_entry_torn_read PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;session_entry;torn_read;correctness"
+        )
     else()
         message(WARNING "GTest not found via pkg-config, unit tests disabled")
     endif()

@@ -36,6 +36,8 @@ class CXLManager{
 		TInode* GetTInode(const char* topic);
 		TInode* GetReplicaTInode(const char* topic);
 		TInode* GetTInodeByIndex(size_t idx);
+		SessionEntry* GetSessionTable(const char* topic);
+		SessionEntry* GetSessionTableByIndex(size_t idx);
 		void* GetCXLAddr(){return cxl_addr_;}
 
 		// [[PHASE_2]] Accessors for GOI and CompletionVector
@@ -111,6 +113,7 @@ class CXLManager{
 		void* base_for_regions_;                      // [[PHASE_1A]] cxl_addr_ + sizeof(ControlBlock); TInode/bitmap/batchHeaders/segments base
 		void* bitmap_;
 		void* batchHeaders_;
+		SessionEntry* session_table_;
 		void* segments_;
 		void* current_log_addr_;
 		volatile bool stop_threads_ = false;
