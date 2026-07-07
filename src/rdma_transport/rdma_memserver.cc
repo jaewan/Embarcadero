@@ -75,6 +75,11 @@ int main(int argc, char** argv) {
   int duration_secs = atoi(GetArg(argc, argv, "--duration", "10"));
   size_t spare_bytes = atoll(GetArg(argc, argv, "--spare-bytes", "0"));  // Phase 2 recovery target; 0 = none
   int recovery_port = atoi(GetArg(argc, argv, "--recovery-port", "18690"));
+  // Sub-phase 3A item 2: a multi-threaded W5-B sequencer opens ONE QP per worker thread instead
+  // of one QP for the whole sequencer process -- the memserver's fixed accept loop needs to know
+  // how many sequencer-role connections to expect (all use role=1; the memserver doesn't need to
+  // tell them apart individually).
+  int num_sequencer_conns = atoi(GetArg(argc, argv, "--num-sequencer-conns", "1"));
   int max_recoveries = atoi(GetArg(argc, argv, "--max-recoveries", "4"));
   std::string dev = GetArg(argc, argv, "--dev", "mlx5_0");
   int gid = atoi(GetArg(argc, argv, "--gid", "-1"));
@@ -144,7 +149,7 @@ int main(int argc, char** argv) {
   // only during the narrow window a single-shot listen+accept+close is up — that race caused a
   // hang under concurrent multi-host launch (see w5_phase1_progress.md). Connect order among
   // brokers/sequencer is still unconstrained (role+broker_id in the hello disambiguates).
-  int total_clients = num_brokers + 1;
+  int total_clients = num_brokers + num_sequencer_conns;
   int listen_fd = OobServerListen(port, total_clients);
   if (listen_fd < 0) return 1;
   std::vector<RcQp> qps(total_clients);
