@@ -4,6 +4,7 @@ include(cmake/lazylog_sequencer_grpc.cmake)
 include(cmake/corfu_sequencer_grpc.cmake)
 include(cmake/scalog_replication_grpc.cmake)
 include(cmake/corfu_replication_grpc.cmake)
+include(cmake/session_proto.cmake)
 
 find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
@@ -94,6 +95,7 @@ target_link_libraries(embarlet
 	corfu_replication_grpc_proto
     scalog_replication_grpc_proto
 	heartbeat_grpc_proto
+	session_proto
     cxxopts::cxxopts
     grpc++_reflection
     grpc++
@@ -146,6 +148,7 @@ target_link_libraries(throughput_test
     mimalloc
     cxxopts::cxxopts
     heartbeat_grpc_proto
+    session_proto
     corfu_sequencer_grpc_proto
     corfu_replication_grpc_proto
     scalog_replication_grpc_proto

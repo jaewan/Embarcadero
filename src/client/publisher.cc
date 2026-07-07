@@ -8,6 +8,7 @@
 #include "common/config.h"
 #include "common/order_level.h"
 #include "common/scoped_fd.h"
+#include "session.pb.h"
 #include "absl/container/flat_hash_map.h"
 #include <cstring>
 #include <random>
@@ -24,6 +25,11 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+
+namespace {
+constexpr uint32_t kSessionControlMagic = 0x53455346U;  // "SESF"
+constexpr uint32_t kMaxSessionControlPayload = 64 * 1024;
+}
 
 
 bool ShouldEnableNetworkPathProfile() {
@@ -1816,6 +1822,55 @@ process_client_fd:;
 						setsockopt(client_sock, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 					}
 					size_t acked_msg = partial.first;
+					const uint32_t maybe_magic = static_cast<uint32_t>(acked_msg & 0xFFFFFFFFULL);
+					const uint32_t control_len = static_cast<uint32_t>((acked_msg >> 32) & 0xFFFFFFFFULL);
+					if (maybe_magic == kSessionControlMagic) {
+						partial_ack_reads[client_sock] = {0, 0};
+						if (control_len == 0 || control_len > kMaxSessionControlPayload) {
+							LOG(ERROR) << "AckThread: invalid SessionFenced control length " << control_len;
+							connection_error_or_closed = true;
+							break;
+						}
+						std::string payload(control_len, '\0');
+						const int old_flags = fcntl(client_sock, F_GETFL, 0);
+						if (old_flags >= 0) {
+							fcntl(client_sock, F_SETFL, old_flags & ~O_NONBLOCK);
+						}
+						struct timeval tv;
+						tv.tv_sec = 1;
+						tv.tv_usec = 0;
+						setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+						size_t got = 0;
+						while (got < control_len) {
+							ssize_t n = recv(client_sock, payload.data() + got, control_len - got, 0);
+							if (n <= 0) break;
+							got += static_cast<size_t>(n);
+						}
+						if (old_flags >= 0) {
+							fcntl(client_sock, F_SETFL, old_flags);
+						}
+						if (got != control_len) {
+							LOG(ERROR) << "AckThread: short SessionFenced control payload got="
+							           << got << " expected=" << control_len;
+							connection_error_or_closed = true;
+							break;
+						}
+						embarcadero::session::SessionFenced fenced;
+						if (!fenced.ParseFromString(payload)) {
+							LOG(ERROR) << "AckThread: failed to parse SessionFenced control payload";
+							connection_error_or_closed = true;
+							break;
+						}
+						LOG(WARNING) << "[SESSION_FENCED_OBSERVED]"
+						             << " broker_id=" << client_sockets[client_sock]
+						             << " committed_batch_seq=" << fenced.committed_batch_seq()
+						             << " committed_msg_hwm=" << fenced.committed_msg_hwm()
+						             << " control_epoch=" << fenced.control_epoch()
+						             << " reason=" << fenced.reason();
+						shutdown_.store(true, std::memory_order_release);
+						connection_error_or_closed = true;
+						break;
+					}
 					if (ShouldEnableNetworkPathProfile()) {
 						GetClientNetworkPathProfile().ack_values_processed.fetch_add(1, std::memory_order_relaxed);
 					}

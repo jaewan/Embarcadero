@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package embarcadero.session;
+
+message SessionOpen {
+	uint32 client_id = 1;
+	uint32 requested_session_epoch = 2;
+	string topic = 3;
+}
+
+message SessionOpenAck {
+	enum Status {
+		OK = 0;
+		FENCED = 1;
+		EPOCH_STALE = 2;
+	}
+
+	uint64 committed_hwm = 1;
+	Status status = 2;
+	uint32 assigned_session_epoch = 3;
+}
+
+message SessionFenced {
+	enum Reason {
+		HOLD_EXPIRY = 0;
+		EPOCH_STALE = 1;
+		LEASE_LOST = 2;
+		DUP_PAST_EXPECTED = 3;
+	}
+
+	uint64 committed_batch_seq = 3;
+	uint64 committed_msg_hwm = 4;
+	uint64 control_epoch = 5;
+	Reason reason = 6;
+}

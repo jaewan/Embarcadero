@@ -32,10 +32,15 @@
 #include "common/order_level.h"
 #include "common/performance_utils.h"
 #include "common/wire_formats.h"
+#include "embarlet/sequencer_utils.h"
+#include "session.pb.h"
 
 namespace Embarcadero {
 
 constexpr size_t kReplicationNotStarted = std::numeric_limits<size_t>::max();
+constexpr uint64_t kSessionEntryFlagFenced = 1ULL << 0;
+constexpr uint64_t kSessionEntryFlagActive = 1ULL << 1;
+constexpr uint32_t kSessionControlMagic = 0x53455346U;  // "SESF"
 
 //----------------------------------------------------------------------------
 // Utility Functions
@@ -80,6 +85,151 @@ static int RuntimeSocketRcvBufBytes() {
 	return static_cast<int>(runtime.socket_recv_buffer_bytes_throughput.get());
 }
 
+static uint64_t SteadyNowNsNetwork() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+static uint64_t GetNetworkSessionLeaseNs(bool replicated_ack2_mode) {
+	if (const char* env = std::getenv("EMBARCADERO_SESSION_LEASE_MS")) {
+		char* end = nullptr;
+		unsigned long parsed = std::strtoul(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0) {
+			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
+		}
+	}
+	const uint64_t default_ms = replicated_ack2_mode ? 2000ULL : 1000ULL;
+	return default_ms * 1000ULL * 1000ULL;
+}
+
+static uint64_t Mix64Network(uint64_t x) {
+	x ^= x >> 33;
+	x *= 0xff51afd7ed558ccdULL;
+	x ^= x >> 33;
+	x *= 0xc4ceb9fe1a85ec53ULL;
+	x ^= x >> 33;
+	return x;
+}
+
+static uint64_t MakeSessionKeyNetwork(uint32_t client_id, uint32_t session_epoch) {
+	return SessionKeyFor(client_id, session_epoch);
+}
+
+struct DurableSessionSnapshot {
+	bool active{false};
+	bool fenced{false};
+	uint32_t session_epoch{0};
+	uint64_t expected_seq{0};
+	uint64_t committed_hwm{0};
+	uint64_t highest_sequenced{0};
+	uint64_t goi_committed_hwm{0};
+	bool goi_committed_hwm_found{false};
+	uint64_t reconnect_committed_hwm{0};
+};
+
+static bool ReadSessionEntrySnapshot(
+		SessionEntry* table,
+		uint32_t client_id,
+		uint32_t session_epoch,
+		DurableSessionSnapshot* out) {
+	if (table == nullptr || session_epoch == 0 || out == nullptr) return false;
+	const uint64_t session_key = MakeSessionKeyNetwork(client_id, session_epoch);
+	const size_t start = static_cast<size_t>(Mix64Network(session_key) % kMaxSessions);
+	for (size_t probe = 0; probe < kMaxSessions; ++probe) {
+		SessionEntry* entry = &table[(start + probe) % kMaxSessions];
+		CXL::invalidate_cacheline_for_read(entry);
+		CXL::load_fence();
+		const uint64_t observed = entry->session_key.load(std::memory_order_acquire);
+		if (observed == 0) return false;
+		if (observed != session_key) continue;
+
+		const uint64_t state_word = entry->state_word.load(std::memory_order_acquire);
+		const uint64_t flags = state_word & 0xFFFFFFFFULL;
+		out->active = (flags & kSessionEntryFlagActive) != 0;
+		out->fenced = (flags & kSessionEntryFlagFenced) != 0;
+		out->session_epoch = static_cast<uint32_t>(state_word >> 32);
+		out->expected_seq = entry->expected_seq.load(std::memory_order_acquire);
+		out->committed_hwm = entry->committed_hwm.load(std::memory_order_acquire);
+		out->highest_sequenced = entry->highest_sequenced.load(std::memory_order_acquire);
+		out->reconnect_committed_hwm = out->committed_hwm;
+		return out->active;
+	}
+	return false;
+}
+
+static bool ScanGOICommittedHwm(
+		GOIEntry* goi,
+		ControlBlock* control_block,
+		uint32_t client_id,
+		uint32_t session_epoch,
+		uint64_t* out_hwm) {
+	if (out_hwm != nullptr) *out_hwm = 0;
+	if (goi == nullptr || control_block == nullptr || session_epoch == 0 || out_hwm == nullptr) return false;
+	CXL::invalidate_cacheline_for_read(control_block);
+	CXL::load_fence();
+	const uint64_t committed_seq = control_block->committed_seq.load(std::memory_order_acquire);
+	if (committed_seq == UINT64_MAX) return false;
+	static constexpr uint64_t kMaxGOIEntries = 256ULL * 1024ULL * 1024ULL;
+	CHECK_LT(committed_seq, kMaxGOIEntries) << "ControlBlock.committed_seq exceeds GOI capacity";
+	const uint64_t limit = committed_seq + 1;
+	uint64_t hwm = 0;
+	bool found = false;
+	for (uint64_t i = 0; i < limit; ++i) {
+		GOIEntry* entry = &goi[i];
+		CXL::invalidate_cacheline_for_read(entry);
+		CXL::load_fence();
+		if (entry->global_seq != i) continue;
+		if (entry->client_id == client_id && entry->session_epoch == session_epoch) {
+			hwm = found ? std::max<uint64_t>(hwm, entry->client_seq) : entry->client_seq;
+			found = true;
+		}
+	}
+	if (found) *out_hwm = hwm;
+	return found;
+}
+
+static DurableSessionSnapshot ReadDurableSessionSnapshot(
+		CXLManager* cxl_manager,
+		const char* topic,
+		uint32_t client_id,
+		uint32_t session_epoch) {
+	DurableSessionSnapshot snapshot;
+	if (cxl_manager == nullptr || topic == nullptr || session_epoch == 0) return snapshot;
+	ReadSessionEntrySnapshot(
+		cxl_manager->GetSessionTable(topic), client_id, session_epoch, &snapshot);
+	snapshot.goi_committed_hwm_found = ScanGOICommittedHwm(
+		cxl_manager->GetGOI(), cxl_manager->GetControlBlock(), client_id, session_epoch,
+		&snapshot.goi_committed_hwm);
+	snapshot.reconnect_committed_hwm =
+		ReconnectAnswerHwm(snapshot.committed_hwm, snapshot.goi_committed_hwm);
+	return snapshot;
+}
+
+static bool SendSessionFencedControl(
+		int fd,
+		uint64_t committed_batch_seq,
+		uint64_t committed_msg_hwm,
+		uint64_t control_epoch,
+		embarcadero::session::SessionFenced::Reason reason) {
+	embarcadero::session::SessionFenced fenced;
+	fenced.set_committed_batch_seq(committed_batch_seq);
+	fenced.set_committed_msg_hwm(committed_msg_hwm);
+	fenced.set_control_epoch(control_epoch);
+	fenced.set_reason(reason);
+	std::string payload;
+	if (!fenced.SerializeToString(&payload)) return false;
+	const uint32_t len = static_cast<uint32_t>(payload.size());
+	struct Header {
+		uint32_t magic;
+		uint32_t length;
+	} header{kSessionControlMagic, len};
+	if (send(fd, &header, sizeof(header), MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(header))) {
+		return false;
+	}
+	return send(fd, payload.data(), payload.size(), MSG_NOSIGNAL) ==
+		static_cast<ssize_t>(payload.size());
+}
+
 static bool ShouldEnableOrder5Trace() {
 	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_TRACE", false);
 	return enabled;
@@ -122,6 +272,52 @@ static int ReadEnvIntNonNegative(const char* name, int default_value) {
 		return default_value;
 	}
 	return static_cast<int>(parsed);
+}
+
+static bool ReadEnvUint64Strict(const char* name, uint64_t* out) {
+	if (out == nullptr) return false;
+	const char* env = std::getenv(name);
+	if (env == nullptr || env[0] == '\0') return false;
+	char* end = nullptr;
+	unsigned long long parsed = std::strtoull(env, &end, 10);
+	if (end == env || *end != '\0') return false;
+	*out = static_cast<uint64_t>(parsed);
+	return true;
+}
+
+static bool ShouldLeaveOrder5ClaimedForTest(const BatchHeader& batch_header) {
+	struct Config {
+		bool enabled{false};
+		uint64_t target_seq{0};
+		bool has_epoch{false};
+		uint32_t target_epoch{0};
+		bool has_client{false};
+		uint32_t target_client{0};
+	};
+	static const Config config = []() {
+		Config cfg;
+		cfg.enabled = ReadEnvUint64Strict(
+			"EMBARCADERO_TEST_ORDER5_STUCK_CLAIMED_BATCH_SEQ", &cfg.target_seq);
+		uint64_t target_epoch = 0;
+		cfg.has_epoch = ReadEnvUint64Strict(
+			"EMBARCADERO_TEST_ORDER5_STUCK_CLAIMED_SESSION_EPOCH", &target_epoch);
+		cfg.target_epoch = static_cast<uint32_t>(target_epoch);
+		uint64_t target_client = 0;
+		cfg.has_client = ReadEnvUint64Strict(
+			"EMBARCADERO_TEST_ORDER5_STUCK_CLAIMED_CLIENT_ID", &target_client);
+		cfg.target_client = static_cast<uint32_t>(target_client);
+		return cfg;
+	}();
+	if (!config.enabled) return false;
+	const uint32_t header_epoch =
+		batch_header.session_epoch32 != 0 ? batch_header.session_epoch32
+		                                  : static_cast<uint32_t>(batch_header.session_epoch);
+	if (config.has_epoch && config.target_epoch != header_epoch) return false;
+	if (config.has_client && config.target_client != batch_header.client_id) return false;
+	static std::atomic<bool> fired{false};
+	bool expected = false;
+	return batch_header.batch_seq == config.target_seq &&
+	       fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
 }
 
 static bool Order0BatchMatchesV1(const uint8_t* data, size_t total_size, uint32_t num_msg) {
@@ -798,6 +994,19 @@ void NetworkManager::HandlePublishRequest(
 
 	// Setup acknowledgment channel if needed
 	int ack_fd = client_socket;
+	const uint32_t connection_session_epoch =
+		static_cast<uint32_t>(ReadEnvIntNonNegative("EMBARCADERO_SESSION_EPOCH", 0));
+	if (connection_session_epoch != 0) {
+		DurableSessionSnapshot snapshot = ReadDurableSessionSnapshot(
+			cxl_manager_, handshake.topic, handshake.client_id, connection_session_epoch);
+		LOG(INFO) << "HandlePublishRequest: session reconnect client_id=" << handshake.client_id
+		          << " session_epoch=" << connection_session_epoch
+		          << " active=" << snapshot.active
+		          << " fenced=" << snapshot.fenced
+		          << " committed_hwm=" << snapshot.reconnect_committed_hwm
+		          << " session_entry_hwm=" << snapshot.committed_hwm
+		          << " goi_hwm=" << snapshot.goi_committed_hwm;
+	}
 
 	// [[PERF_FIX]] Remove 200ms SO_RCVTIMEO from batch recv loop - causes unnecessary EAGAIN stalls
 	// during high-throughput publishing. The loop checks stop_threads_ at top of while loop,
@@ -811,32 +1020,34 @@ void NetworkManager::HandlePublishRequest(
 		if (it != ack_connections_.end()) {
 			ack_fd = it->second;
 		} else {
-		// Create new acknowledgment connection
-		// Capture ack_efd_ locally before starting thread to prevent race condition
-		int local_ack_efd = -1;
-		if (!SetupAcknowledgmentSocket(ack_fd, client_address, handshake.port)) {
-			close(client_socket);
-			return;
-		}
+			// Create new acknowledgment connection
+			// Capture ack_efd_ locally before starting thread to prevent race condition
+			int local_ack_efd = -1;
+			if (!SetupAcknowledgmentSocket(ack_fd, client_address, handshake.port)) {
+				close(client_socket);
+				return;
+			}
 
-		// Capture the ack_efd_ value immediately after setup, before it can be overwritten
-		local_ack_efd = ack_efd_;
-		
-		ack_fd_ = ack_fd;
-		ack_connections_[handshake.client_id] = ack_fd;
+			// Capture the ack_efd_ value immediately after setup, before it can be overwritten
+			local_ack_efd = ack_efd_;
 
-		// [[CRITICAL: Validate topic before starting AckThread]]
-		// Empty topic → GetOffsetToAck returns wrong TInode → client ACK timeout
-		if (strlen(handshake.topic) == 0) {
-			LOG(ERROR) << "HandlePublishRequest: Empty topic in handshake for broker " << broker_id_
-			           << ", client_id=" << handshake.client_id << ". NOT starting AckThread!";
-			// Still keep connection open for publish, but ACKs will not work correctly
-		} else {
-			LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
-			          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id;
-			// Pass local_ack_efd to thread so it uses the correct epoll instance
-			threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic, handshake.ack, ack_fd, local_ack_efd, handshake.client_id);
-		}
+			ack_fd_ = ack_fd;
+			ack_connections_[handshake.client_id] = ack_fd;
+
+			// [[CRITICAL: Validate topic before starting AckThread]]
+			// Empty topic -> GetOffsetToAck returns wrong TInode -> client ACK timeout
+			if (strlen(handshake.topic) == 0) {
+				LOG(ERROR) << "HandlePublishRequest: Empty topic in handshake for broker " << broker_id_
+				           << ", client_id=" << handshake.client_id << ". NOT starting AckThread!";
+				// Still keep connection open for publish, but ACKs will not work correctly
+			} else {
+				LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
+				          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id;
+				// Pass local_ack_efd to thread so it uses the correct epoll instance.
+				threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic,
+					handshake.ack, ack_fd, local_ack_efd, handshake.client_id,
+					connection_session_epoch);
+			}
 		}
 	}
 
@@ -908,6 +1119,17 @@ void NetworkManager::HandlePublishRequest(
 		if (!running || stop_threads_) {
 			break;
 		}
+		if (connection_session_epoch != 0 &&
+		    batch_header.session_epoch !=
+		        static_cast<uint16_t>(connection_session_epoch & 0xFFFFU)) {
+			LOG(WARNING) << "NetworkManager: rejecting stale session epoch hint client_id="
+			             << handshake.client_id
+			             << " full_epoch=" << connection_session_epoch
+			             << " header_low16=" << batch_header.session_epoch;
+			running = false;
+			break;
+		}
+		batch_header.session_epoch32 = connection_session_epoch;
 
 		if (batch_header.total_size == 0) {
 			LOG(WARNING) << "NetworkManager: Received batch with total_size=0, closing connection.";
@@ -1118,7 +1340,7 @@ void NetworkManager::HandlePublishRequest(
 			}
 			sleep_ms = std::min(100, sleep_ms * 2);
 		}
-		
+
 		if (!batch_header_location) {
 			// Either deadline exceeded or stop_threads_ set
 			if (stop_threads_) {
@@ -1131,11 +1353,26 @@ void NetworkManager::HandlePublishRequest(
 			}
 			running = false;
 			break;
+			}
 		}
-	}
+		if (seq_type == EMBARCADERO && topic_ptr &&
+		    topic_ptr->GetOrder() == Embarcadero::kOrderStrong &&
+		    ShouldLeaveOrder5ClaimedForTest(batch_header)) {
+			LOG(WARNING) << "[ORDER5_TEST_STUCK_CLAIMED_INJECT]"
+			             << " client=" << batch_header.client_id
+			             << " session_epoch="
+			             << (batch_header.session_epoch32 != 0
+			                 ? batch_header.session_epoch32
+			                 : static_cast<uint32_t>(batch_header.session_epoch))
+			             << " batch_seq=" << batch_header.batch_seq
+			             << " broker=" << batch_header.broker_id
+			             << " pbr=" << batch_header.pbr_absolute_index
+			             << " num_msg=" << batch_header.num_msg;
+			continue;
+		}
 
-		// Post-receive parsing only where required
-		MessageHeader* header = nullptr;  // Last message header for callback
+			// Post-receive parsing only where required
+			MessageHeader* header = nullptr;  // Last message header for callback
 		if (seq_type == KAFKA && batch_header.num_msg > 0) {
 			MessageHeader* current_header = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
@@ -2104,7 +2341,13 @@ size_t NetworkManager::GetOffsetToAck(const char* topic, uint32_t ack_level){
 	}
 }
 
-void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd, uint32_t client_id) {
+void NetworkManager::AckThread(
+		const char* topic_cstr,
+		uint32_t ack_level,
+		int ack_fd,
+		int ack_efd,
+		uint32_t client_id,
+		uint32_t session_epoch) {
 	struct epoll_event events[10];
 	char buf[1];
 
@@ -2113,7 +2356,8 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 
 	LOG(INFO) << "AckThread: Starting for broker " << broker_id_ << ", topic='" << topic
 	          << "' (len=" << topic.size() << "), ack_level=" << ack_level
-	          << ", client_id=" << client_id;
+	          << ", client_id=" << client_id
+	          << ", session_epoch=" << session_epoch;
 	auto remove_ack_registration = [&]() {
 		absl::MutexLock lock(&ack_mu_);
 		auto it = ack_connections_.find(client_id);
@@ -2293,8 +2537,10 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 	size_t fast_checks_since_last_send = 0;
 	size_t stall_sleep_since_last_send = 0;
 	constexpr size_t kMaxFastPollsBeforeFullCheck = 256;
+	uint64_t ack_withhold_started_ns = 0;
+	bool terminal_session_fenced = false;
 
-		while (!stop_threads_) {
+	while (!stop_threads_ && !terminal_session_fenced) {
 		loops_since_last_send++;
 		// [[PERF_OPTIMIZATION]] Two-phase ACK checking to avoid CXL bus storm:
 		// Phase 1: Fast read without expensive flush/fence operations
@@ -2320,47 +2566,47 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 		const bool use_per_client_ack_level2_durable =
 			(ack_level == 2 && ack_topic != nullptr && ack_topic->SupportsPerClientAckLevel2Durable());
 
-			// Fast-path: Read without flush/fence to detect potential changes.
-			// Safe for ACK2 because durability frontiers are monotonic; stale reads can only delay ACKs.
-			if (use_per_client_written_ack_level1) {
-				current_ack = static_cast<size_t>(ack_topic->GetClientWritten(client_id));
-				expensive_checks_since_last_ack++;
-				fast_polls_without_full_check = 0;
-			} else if (use_per_client_ack_level1) {
+		// Fast-path: Read without flush/fence to detect potential changes.
+		// Safe for ACK2 because durability frontiers are monotonic; stale reads can only delay ACKs.
+		if (use_per_client_written_ack_level1) {
+			current_ack = static_cast<size_t>(ack_topic->GetClientWritten(client_id));
+			expensive_checks_since_last_ack++;
+			fast_polls_without_full_check = 0;
+		} else if (use_per_client_ack_level1) {
+			current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
+			expensive_checks_since_last_ack++;
+			fast_polls_without_full_check = 0;
+		} else if (is_order5_head_owned_ack_level1) {
+			// ORDER=5 ACK1 must be attributed per client from the head sequencer's ordered frontier.
+			// Falling back to the shared per-broker frontier causes multiclient over-ack.
+			if (broker_id_ == 0) {
 				current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
 				expensive_checks_since_last_ack++;
-				fast_polls_without_full_check = 0;
-			} else if (is_order5_head_owned_ack_level1) {
-				// ORDER=5 ACK1 must be attributed per client from the head sequencer's ordered frontier.
-				// Falling back to the shared per-broker frontier causes multiclient over-ack.
-				if (broker_id_ == 0) {
-					current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
-					expensive_checks_since_last_ack++;
-				} else {
-					current_ack = static_cast<size_t>(-1);
-				}
-				fast_polls_without_full_check = 0;
-			} else if (is_order5_head_owned_ack_level2) {
-				// ORDER=5 currently has no true per-client durable frontier in shared memory.
-				// The legacy durable frontier is broker-local and tops out at one broker's routed
-				// message quota, which makes ACK2 stall permanently for multibroker client streams.
-				//
-				// Until ORDER=5 publishes a real per-client durable frontier, use the head
-				// broker's per-client ordered frontier as the authoritative ACK2 source.
-				// This preserves end-to-end correctness for latency/subscriber delivery and
-				// matches the strongest truthful contract the current implementation can provide.
-				if (broker_id_ == 0) {
-					current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
-					expensive_checks_since_last_ack++;
-				} else {
-					current_ack = static_cast<size_t>(-1);
-				}
-				fast_polls_without_full_check = 0;
-			} else if (use_per_client_ack_level2_durable) {
-				current_ack = static_cast<size_t>(ack_topic->GetClientDurable(client_id));
-				expensive_checks_since_last_ack++;
-				fast_polls_without_full_check = 0;
 			} else {
+				current_ack = static_cast<size_t>(-1);
+			}
+			fast_polls_without_full_check = 0;
+		} else if (is_order5_head_owned_ack_level2) {
+			// ORDER=5 currently has no true per-client durable frontier in shared memory.
+			// The legacy durable frontier is broker-local and tops out at one broker's routed
+			// message quota, which makes ACK2 stall permanently for multibroker client streams.
+			//
+			// Until ORDER=5 publishes a real per-client durable frontier, use the head
+			// broker's per-client ordered frontier as the authoritative ACK2 source.
+			// This preserves end-to-end correctness for latency/subscriber delivery and
+			// matches the strongest truthful contract the current implementation can provide.
+			if (broker_id_ == 0) {
+				current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
+				expensive_checks_since_last_ack++;
+			} else {
+				current_ack = static_cast<size_t>(-1);
+			}
+			fast_polls_without_full_check = 0;
+		} else if (use_per_client_ack_level2_durable) {
+			current_ack = static_cast<size_t>(ack_topic->GetClientDurable(client_id));
+			expensive_checks_since_last_ack++;
+			fast_polls_without_full_check = 0;
+		} else {
 			auto [fast_read_value, needs_expensive_check] = GetOffsetToAckFast(topic.c_str(), ack_level, last_known_ack);
 			const bool force_full_check = (fast_polls_without_full_check >= kMaxFastPollsBeforeFullCheck);
 			if (needs_expensive_check || force_full_check) {
@@ -2377,7 +2623,59 @@ void NetworkManager::AckThread(const char* topic_cstr, uint32_t ack_level, int a
 				fast_checks_since_last_send++;
 				fast_polls_without_full_check++;
 			}
+		}
+
+		if (session_epoch != 0 && current_ack != static_cast<size_t>(-1) &&
+		    ack_topic != nullptr &&
+		    ack_topic->GetSeqtype() == EMBARCADERO &&
+		    ack_topic->GetOrder() == Embarcadero::kOrderStrong) {
+			uint64_t producing_epoch = 0;
+			uint64_t control_epoch = 0;
+			if (!ack_topic->AckRelayEpochValid(client_id, &producing_epoch, &control_epoch)) {
+				const uint64_t now_ns = SteadyNowNsNetwork();
+				if (ack_withhold_started_ns == 0) {
+					ack_withhold_started_ns = now_ns;
+				}
+				const uint64_t lease_ns = GetNetworkSessionLeaseNs(ack_level == 2);
+				if (now_ns - ack_withhold_started_ns >= lease_ns) {
+					DurableSessionSnapshot snapshot = ReadDurableSessionSnapshot(
+						cxl_manager_, topic.c_str(), client_id, session_epoch);
+					if (!ShouldTerminalFenceAckRelay(
+							next_to_ack_offset,
+							snapshot.goi_committed_hwm_found,
+							snapshot.goi_committed_hwm)) {
+						ack_withhold_started_ns = 0;
+						current_ack = std::max<uint64_t>(current_ack, next_to_ack_offset);
+						LOG(INFO) << "AckThread: stale epoch suppressed by durable GOI truth"
+						          << " client_id=" << client_id
+						          << " session_epoch=" << session_epoch
+						          << " next_to_ack=" << next_to_ack_offset
+						          << " goi_hwm=" << snapshot.goi_committed_hwm
+						          << " producing_epoch=" << producing_epoch
+						          << " control_epoch=" << control_epoch;
+						} else {
+							SendSessionFencedControl(
+								ack_fd,
+								snapshot.reconnect_committed_hwm,
+								current_ack,
+								control_epoch,
+								embarcadero::session::SessionFenced::EPOCH_STALE);
+							LOG(WARNING) << "AckThread: terminal SessionFenced{EPOCH_STALE}"
+							             << " client_id=" << client_id
+							             << " session_epoch=" << session_epoch
+							             << " producing_epoch=" << producing_epoch
+							             << " control_epoch=" << control_epoch
+							             << " committed_batch_seq=" << snapshot.reconnect_committed_hwm
+							             << " committed_msg_hwm=" << current_ack;
+							terminal_session_fenced = true;
+							break;
+						}
+				}
+				current_ack = static_cast<size_t>(-1);
+			} else {
+				ack_withhold_started_ns = 0;
 			}
+		}
 
 		if (current_ack != (size_t)-1 && next_to_ack_offset <= current_ack) {
 			found_ack = true;

@@ -431,6 +431,7 @@ struct alignas(64) BatchHeader{
 	uint32_t flags; // [[WRITER: NetworkManager]] CLAIMED/VALID flags for scanner readiness
 	uint16_t epoch_created; // [[WRITER: NetworkManager]] Epoch when batch was accepted (Phase 1a zombie fencing; sequencer can reject if stale)
 	uint16_t session_epoch; // [[WRITER: NetworkManager]] Session epoch hint; authoritative table added in D
+	uint32_t session_epoch32; // [[WRITER: NetworkManager]] Authoritative full session epoch; session_epoch is low16 hint
 
 	// [[PHASE_2]] Globally unique batch identifier for GOI deduplication and tracking
 	uint64_t batch_id; // [[WRITER: NetworkManager]] Format: (broker_id << 48) | pbr_absolute_index (P2.1)
@@ -462,6 +463,7 @@ static_assert(offsetof(BatchHeader, num_msg) < 64, "num_msg must be in first cac
 static_assert(offsetof(BatchHeader, batch_complete) < 64, "batch_complete must be in first cache line");
 static_assert(offsetof(BatchHeader, flags) < 64, "flags must be in first cache line");
 static_assert(offsetof(BatchHeader, session_epoch) < 64, "session_epoch must be in first cache line");
+static_assert(offsetof(BatchHeader, session_epoch32) < 64, "session_epoch32 must be in first cache line");
 static_assert(offsetof(BatchHeader, publish_commit) >= 64, "publish_commit must be in second cache line");
 // Note: BATCHHEADERS_SIZE is runtime config, alignment verified at runtime in BrokerScannerWorker5
 

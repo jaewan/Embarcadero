@@ -24,6 +24,12 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
+add_test(
+    NAME e2e_order5_live_session_fence_fire
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_order5_live_session_fence_fire.sh
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
 # Set test properties
 set_tests_properties(e2e_basic_publish PROPERTIES
     TIMEOUT 300  # 5 minutes max
@@ -33,6 +39,11 @@ set_tests_properties(e2e_basic_publish PROPERTIES
 set_tests_properties(e2e_explicit_replication_order5_ack2 PROPERTIES
     TIMEOUT 600  # 10 minutes max (replication may take longer)
     LABELS "e2e;replication;order5;ack2"
+)
+
+set_tests_properties(e2e_order5_live_session_fence_fire PROPERTIES
+    TIMEOUT 180
+    LABELS "e2e;order5;session;fencing;correctness"
 )
 
 # Unit tests
@@ -215,6 +226,30 @@ if(PkgConfig_FOUND)
         set_tests_properties(unit_session_entry_torn_read PROPERTIES
             TIMEOUT 60
             LABELS "unit;session_entry;torn_read;correctness"
+        )
+
+        add_executable(session_proto_roundtrip_test
+            session_proto_roundtrip_test.cc
+        )
+        target_include_directories(session_proto_roundtrip_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(session_proto_roundtrip_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(session_proto_roundtrip_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            session_proto
+            protobuf::libprotobuf
+            pthread
+        )
+        add_test(NAME unit_session_proto_roundtrip COMMAND session_proto_roundtrip_test)
+        set_tests_properties(unit_session_proto_roundtrip PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;session;protobuf;correctness"
         )
 
         add_executable(order5_session_fencing_test
