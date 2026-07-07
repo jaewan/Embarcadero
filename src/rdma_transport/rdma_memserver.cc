@@ -129,12 +129,15 @@ int main(int argc, char** argv) {
           layout.sentinel_array_bytes(), layout.goi_bytes(), layout.pbr_ring_bytes_total(),
           host_blog ? blog_total : 0);
 
-  // ---- Accept num_brokers + 1 (sequencer) QP connections, sequentially ----
-  // Passive server: each accept is a fresh listen+accept on the same port (rebinding a closed
-  // listening socket is safe — no TIME_WAIT on the listener itself). Order is agreed with the run
-  // script: all producer/broker roles connect first (any order among themselves — role+broker_id
-  // in the hello disambiguates), sequencer connects last.
+  // ---- Accept num_brokers + 1 (sequencer) QP connections ----
+  // Passive server: ONE listening socket stays open for the whole batch (backlog sized for all
+  // total_clients), so a client's connect can land at any point during the accept loop instead of
+  // only during the narrow window a single-shot listen+accept+close is up — that race caused a
+  // hang under concurrent multi-host launch (see w5_phase1_progress.md). Connect order among
+  // brokers/sequencer is still unconstrained (role+broker_id in the hello disambiguates).
   int total_clients = num_brokers + 1;
+  int listen_fd = OobServerListen(port, total_clients);
+  if (listen_fd < 0) return 1;
   std::vector<RcQp> qps(total_clients);
   for (int i = 0; i < total_clients; ++i) {
     if (!CreateRcQp(&d, 4096, 512, /*psn_seed=*/0x3000 + i, &qps[i])) return 1;
@@ -158,13 +161,16 @@ int main(int argc, char** argv) {
 
     // ONE exchange: client's half (role/broker_id/client_ep) arrives in `remote`; our half (above)
     // goes out in `local`. Single TCP connect/accept for the whole handshake.
-    if (!OobServerExchange(port, &local, &remote, sizeof(HandshakeBlob))) {
-      fprintf(stderr, "[memserver] handshake exchange failed for client %d\n", i); return 1;
+    if (!OobServerAccept(listen_fd, &local, &remote, sizeof(HandshakeBlob))) {
+      fprintf(stderr, "[memserver] handshake exchange failed for client %d\n", i);
+      OobServerClose(listen_fd);
+      return 1;
     }
     fprintf(stderr, "[memserver] client %d hello: role=%d broker_id=%d\n", i, remote.role, remote.broker_id);
     if (!ConnectRcQp(&qps[i], remote.client_ep)) return 1;
     fprintf(stderr, "[memserver] client %d connected qpn=%u\n", i, remote.client_ep.qpn);
   }
+  OobServerClose(listen_fd);
 
   fprintf(stderr, "[memserver] all %d clients connected; passive for %ds (CPU not in data path)\n",
           total_clients, duration_secs);

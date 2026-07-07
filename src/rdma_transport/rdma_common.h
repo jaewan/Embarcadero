@@ -61,11 +61,17 @@ struct RcQp {
   ibv_qp* qp = nullptr;
   uint32_t local_psn = 0;
   DeviceCtx* dev = nullptr;
+  bool owns_cq = true;  // false for CreateRcQpOnSharedCq — DestroyRcQp then leaves `cq` alone
   bool ok() const { return cq && qp; }
 };
 // Create a CQ (depth `cqe`) and an RC QP (send/recv depth `max_wr`). PSN is derived from `psn_seed`
 // (workflows/tests pass an index; no RNG so runs are reproducible).
 bool CreateRcQp(DeviceCtx* dev, int cqe, int max_wr, uint32_t psn_seed, RcQp* out);
+// Like CreateRcQp, but binds the new QP to an EXISTING CQ instead of creating one. Lets a single
+// poll loop watch completions from many QPs at once (e.g. one per remote broker) — needed
+// whenever a pipelined poller must treat several one-sided-target QPs as one completion stream.
+// DestroyRcQp will NOT destroy a shared CQ; the caller owns its lifetime.
+bool CreateRcQpOnSharedCq(DeviceCtx* dev, ibv_cq* shared_cq, int max_wr, uint32_t psn_seed, RcQp* out);
 void DestroyRcQp(RcQp* q);
 
 // Endpoint info exchanged out-of-band to connect two QPs.
@@ -106,6 +112,16 @@ int PollCq(ibv_cq* cq, ibv_wc* wc, int max, int* bad_status);
 // blob and receive the peer's (same fixed size). Used to swap QpEndpoint + MR descriptors at setup.
 bool OobServerExchange(int port, const void* send, void* recv, size_t n);
 bool OobClientExchange(const std::string& ip, int port, const void* send, void* recv, size_t n);
+
+// Multi-accept variant: open ONE listening socket up front (backlog sized for `max_pending`
+// concurrent connect attempts) and reuse it across several sequential accepts. Use this instead of
+// repeated OobServerExchange calls when accepting a known-size batch of clients (e.g. N brokers +
+// sequencer) whose connect order/timing isn't controlled — closing and reopening the listener
+// between accepts (what repeated OobServerExchange calls do) leaves a gap where a client's connect
+// gets refused if it arrives between one accept and the next listen.
+int OobServerListen(int port, int max_pending);
+bool OobServerAccept(int listen_fd, const void* send, void* recv, size_t n, int timeout_sec = 30);
+void OobServerClose(int listen_fd);
 
 // A convenience bundle a target (server) advertises for each region it exposes.
 struct RegionDesc {

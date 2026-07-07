@@ -99,10 +99,9 @@ bool RegisterMr(ibv_pd* pd, void* buf, size_t len, Mr* out) {
 void DeregisterMr(Mr* m) { if (m && m->mr) { ibv_dereg_mr(m->mr); *m = Mr{}; } }
 
 // ---- QP ------------------------------------------------------------------------------------------
-bool CreateRcQp(DeviceCtx* dev, int cqe, int max_wr, uint32_t psn_seed, RcQp* out) {
+static bool CreateRcQpCommon(DeviceCtx* dev, ibv_cq* cq, int max_wr, uint32_t psn_seed, RcQp* out) {
   out->dev = dev;
-  out->cq = ibv_create_cq(dev->ctx, cqe, nullptr, nullptr, 0);
-  if (!out->cq) { LogFail("ibv_create_cq", __FILE__, __LINE__); return false; }
+  out->cq = cq;
   ibv_qp_init_attr ia{};
   ia.send_cq = out->cq;
   ia.recv_cq = out->cq;
@@ -128,10 +127,24 @@ bool CreateRcQp(DeviceCtx* dev, int cqe, int max_wr, uint32_t psn_seed, RcQp* ou
   }
   return true;
 }
+
+bool CreateRcQp(DeviceCtx* dev, int cqe, int max_wr, uint32_t psn_seed, RcQp* out) {
+  ibv_cq* cq = ibv_create_cq(dev->ctx, cqe, nullptr, nullptr, 0);
+  if (!cq) { LogFail("ibv_create_cq", __FILE__, __LINE__); return false; }
+  out->owns_cq = true;
+  if (!CreateRcQpCommon(dev, cq, max_wr, psn_seed, out)) { ibv_destroy_cq(cq); return false; }
+  return true;
+}
+
+bool CreateRcQpOnSharedCq(DeviceCtx* dev, ibv_cq* shared_cq, int max_wr, uint32_t psn_seed, RcQp* out) {
+  out->owns_cq = false;
+  return CreateRcQpCommon(dev, shared_cq, max_wr, psn_seed, out);
+}
+
 void DestroyRcQp(RcQp* q) {
   if (!q) return;
   if (q->qp) ibv_destroy_qp(q->qp);
-  if (q->cq) ibv_destroy_cq(q->cq);
+  if (q->cq && q->owns_cq) ibv_destroy_cq(q->cq);
   *q = RcQp{};
 }
 
@@ -276,31 +289,48 @@ static bool ReadAll(int fd, void* p, size_t n) {
   return true;
 }
 
-bool OobServerExchange(int port, const void* send, void* recv, size_t n) {
+int OobServerListen(int port, int max_pending) {
   int ls = socket(AF_INET, SOCK_STREAM, 0);
-  if (ls < 0) { LogFail("socket", __FILE__, __LINE__); return false; }
+  if (ls < 0) { LogFail("socket", __FILE__, __LINE__); return -1; }
   int one = 1;
   setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
   sockaddr_in a{};
   a.sin_family = AF_INET;
   a.sin_addr.s_addr = INADDR_ANY;
   a.sin_port = htons(port);
-  if (bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) || listen(ls, 1)) {
-    LogFail("bind/listen", __FILE__, __LINE__); close(ls); return false;
+  if (bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) || listen(ls, max_pending)) {
+    LogFail("bind/listen", __FILE__, __LINE__); close(ls); return -1;
   }
+  return ls;
+}
+
+bool OobServerAccept(int listen_fd, const void* send, void* recv, size_t n, int timeout_sec) {
   // Bounded accept: if no client connects within the timeout, fail instead of blocking forever
   // (a hung server would hold the exclusive testbed flock — see handoff post-mortem).
   fd_set rfds;
   FD_ZERO(&rfds);
-  FD_SET(ls, &rfds);
-  timeval tv{30, 0};  // 30 s
-  int sel = select(ls + 1, &rfds, nullptr, nullptr, &tv);
-  if (sel <= 0) { LogFail("accept timeout/select", __FILE__, __LINE__); close(ls); return false; }
-  int fd = accept(ls, nullptr, nullptr);
-  close(ls);
+  FD_SET(listen_fd, &rfds);
+  timeval tv{timeout_sec, 0};
+  errno = 0;
+  int sel = select(listen_fd + 1, &rfds, nullptr, nullptr, &tv);
+  if (sel < 0) { LogFail("accept select", __FILE__, __LINE__); return false; }
+  if (sel == 0) { fprintf(stderr, "[rdma] FAIL: accept timeout (%ds, no error)\n", timeout_sec); return false; }
+  int fd = accept(listen_fd, nullptr, nullptr);
   if (fd < 0) { LogFail("accept", __FILE__, __LINE__); return false; }
   bool ok = WriteAll(fd, send, n) && ReadAll(fd, recv, n);
   close(fd);
+  return ok;
+}
+
+void OobServerClose(int listen_fd) {
+  if (listen_fd >= 0) close(listen_fd);
+}
+
+bool OobServerExchange(int port, const void* send, void* recv, size_t n) {
+  int ls = OobServerListen(port, /*max_pending=*/1);
+  if (ls < 0) return false;
+  bool ok = OobServerAccept(ls, send, recv, n);
+  OobServerClose(ls);
   return ok;
 }
 

@@ -58,3 +58,12 @@ add_executable(w5_sequencer_memserver rdma_sequencer.cc)
 target_link_libraries(w5_sequencer_memserver PRIVATE rdma_transport)
 target_compile_definitions(w5_sequencer_memserver PRIVATE BLOG_PLACEMENT_DRAM=0)
 set_target_properties(w5_sequencer_memserver PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# ---- Reviewer-D naive RDMA token server repro (spec §5, E10 tie-in) ------------------------------
+add_executable(rdma_token_server rdma_token_server.cc)
+target_link_libraries(rdma_token_server PRIVATE rdma_transport)
+set_target_properties(rdma_token_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(rdma_token_client rdma_token_client.cc)
+target_link_libraries(rdma_token_client PRIVATE rdma_transport)
+set_target_properties(rdma_token_client PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
