@@ -33,6 +33,7 @@ set(KV_LINK_LIBS
     mimalloc
     cxxopts::cxxopts
     heartbeat_grpc_proto
+    session_proto
     corfu_sequencer_grpc_proto
     corfu_replication_grpc_proto
     scalog_replication_grpc_proto

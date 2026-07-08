@@ -18,7 +18,6 @@
 #include <map>
 #include <sstream>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 // Helper function to generate random message content
@@ -434,14 +433,17 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 	DeliveryDrainResult result;
 	result.target = target_messages;
 	result.samples.reserve(target_messages);
-	std::unordered_set<uint64_t> seen_total_orders;
-	std::unordered_set<uint64_t> seen_uids;
-	seen_total_orders.reserve(target_messages);
-	seen_uids.reserve(target_messages);
+	std::vector<uint8_t> seen_uids;
+	if (target_messages > 0 &&
+	    message_size >= sizeof(long long) + sizeof(uint64_t)) {
+		seen_uids.assign(target_messages + 1, 0);
+	}
 
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
 	bool have_expected_total_order = false;
 	uint64_t expected_total_order = 0;
+	size_t unique_uids = 0;
+	bool saw_uid = false;
 
 	while (result.delivered < target_messages &&
 	       std::chrono::steady_clock::now() < deadline) {
@@ -462,6 +464,10 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 		}
 		sample.delivery_latency_us = (deliver_ns - sample.send_time_ns) / 1000;
 
+		if (have_expected_total_order &&
+		    sample.total_order == result.last_total_order) {
+			result.duplicate_total_order++;
+		}
 		if (!have_expected_total_order) {
 			have_expected_total_order = true;
 			expected_total_order = sample.total_order;
@@ -473,13 +479,18 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 		}
 		expected_total_order++;
 		result.last_total_order = sample.total_order;
-		if (!seen_total_orders.insert(sample.total_order).second) {
-			result.duplicate_total_order++;
-		}
 
 		if (sample.has_uid) {
-			if (!seen_uids.insert(sample.msg_uid).second) {
-				result.duplicate_uid++;
+			saw_uid = true;
+			if (!seen_uids.empty() &&
+			    sample.msg_uid > 0 &&
+			    sample.msg_uid <= target_messages) {
+				if (seen_uids[sample.msg_uid] != 0) {
+					result.duplicate_uid++;
+				} else {
+					seen_uids[sample.msg_uid] = 1;
+					unique_uids++;
+				}
 			}
 			result.min_uid = std::min(result.min_uid, sample.msg_uid);
 			result.max_uid = std::max(result.max_uid, sample.msg_uid);
@@ -489,14 +500,14 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 	}
 
 	result.timed_out = (result.delivered < target_messages);
-	if (!seen_uids.empty()) {
+	if (saw_uid) {
 		const uint64_t expected_uid_min = 1;
 		const uint64_t expected_uid_max = static_cast<uint64_t>(target_messages);
 		const bool uid_range_ok =
 			result.min_uid == expected_uid_min && result.max_uid == expected_uid_max;
-		if (!uid_range_ok || seen_uids.size() != target_messages) {
+		if (!uid_range_ok || unique_uids != target_messages) {
 			result.missing_uid =
-				target_messages > seen_uids.size() ? target_messages - seen_uids.size() : 0;
+				target_messages > unique_uids ? target_messages - unique_uids : 0;
 			if (!uid_range_ok && result.missing_uid == 0) {
 				result.missing_uid = 1;
 			}
@@ -1713,36 +1724,21 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		// Publish messages with timestamps
 		size_t sent_bytes = 0;
 		for (size_t i = 0; i < n; i++) {
+			if (steady_rate && sent_bytes >= (BATCH_SIZE * 4)) {
+				p.WriteFinishedOrPaused();
+				std::this_thread::sleep_for(std::chrono::microseconds(1500));
+				sent_bytes = 0;
+			}
 
-			// If using steady rate, pause periodically
-				if (steady_rate && (sent_bytes >= (BATCH_SIZE*4))) {
-					p.WriteFinishedOrPaused();
-					std::this_thread::sleep_for(std::chrono::microseconds(1500));
-					sent_bytes = 0;
-					// Capture current timestamp and embed it in the message
-				auto timestamp = std::chrono::steady_clock::now();
-				long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
-						timestamp.time_since_epoch()).count();
-
-					// First part of message contains the timestamp
-					memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
-					if (message_size >= sizeof(long long) + sizeof(uint64_t)) {
-						const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
-						memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
-					}
-				}else{
-				// Capture current timestamp and embed it in the message
-				auto timestamp = std::chrono::steady_clock::now();
-				long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
-						timestamp.time_since_epoch()).count();
-
-					// First part of message contains the timestamp
-					memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
-					if (message_size >= sizeof(long long) + sizeof(uint64_t)) {
-						const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
-						memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
-					}
-				}
+			const auto timestamp = std::chrono::steady_clock::now();
+			const long long nanoseconds_since_epoch =
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					timestamp.time_since_epoch()).count();
+			memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
+			if (message_size >= sizeof(long long) + sizeof(uint64_t)) {
+				const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
+				memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
+			}
 
 			// Send the message
 			if (target_bytes_per_sec > 0.0) {

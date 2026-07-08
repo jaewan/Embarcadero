@@ -3,6 +3,7 @@
 #include "common.h"
 #include "common/wire_formats.h"
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstdint>
 #include <map>
@@ -402,7 +403,7 @@ class Subscriber {
 		std::string port_;
 		std::unique_ptr<heartbeat_system::HeartBeat::Stub> stub_;
 		char topic_[TOPIC_NAME_SIZE];
-		volatile bool shutdown_{false};  // Non-atomic for performance - shutdown coordination
+		std::atomic<bool> shutdown_{false};
 		std::atomic<bool> connected_{false}; // Maybe more granular connection state needed
 		// Track actual data broker count
 		std::atomic<size_t> data_broker_count_{0};

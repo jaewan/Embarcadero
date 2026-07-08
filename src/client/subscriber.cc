@@ -19,6 +19,8 @@
 
 namespace {
 
+constexpr size_t kMinStreamReserveGrowth = 1UL << 20;
+
 size_t ResolveConfiguredBrokerCount() {
 	constexpr size_t kMinBrokers = 1;
 	const size_t kMaxBrokers = static_cast<size_t>(NUM_MAX_BROKERS_CONFIG);
@@ -39,6 +41,17 @@ size_t ResolveConfiguredBrokerCount() {
 	if (configured < kMinBrokers) return kMinBrokers;
 	if (configured > kMaxBrokers) return kMaxBrokers;
 	return configured;
+}
+
+void ReserveForAppend(std::vector<uint8_t>& buffer, size_t bytes_to_append) {
+	if (bytes_to_append == 0) {
+		return;
+	}
+	const size_t required = buffer.size() + bytes_to_append;
+	if (required <= buffer.capacity()) {
+		return;
+	}
+	buffer.reserve(buffer.size() + std::max(bytes_to_append, kMinStreamReserveGrowth));
 }
 
 }  // namespace
@@ -103,10 +116,9 @@ Subscriber::~Subscriber() {
 }
 
 void Subscriber::Shutdown() {
-	if (shutdown_) { // Prevent double shutdown
+	if (shutdown_.exchange(true, std::memory_order_acq_rel)) { // Prevent double shutdown
 		return;
 	}
-	shutdown_ = true;
 
 	// Wake up any waiting consumer
 	consume_cv_.SignalAll();
@@ -1490,7 +1502,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 	const bool partial_flush_enabled = (order_level_ >= 1);
 
 	// --- Main receive loop (Simplified - Blocking recv) ---
-	while (!shutdown_) {
+	while (!shutdown_.load(std::memory_order_acquire)) {
 		// 1. Get current write buffer location & space (same as before)
 		ConnectionBuffers::WriteLocation write_loc = conn_buffers->get_write_location();
 		void* write_ptr = write_loc.ptr;
@@ -1509,9 +1521,9 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 				// Wait logic (manual loop using receiver_can_write_cv) remains the same
 				{
 					absl::MutexLock lock(&conn_buffers->state_mutex);
-					if (shutdown_) break;
-					while (! (shutdown_ ||
-								!conn_buffers->read_buffer_in_use_by_consumer.load(std::memory_order_acquire)) )
+					if (shutdown_.load(std::memory_order_acquire)) break;
+					while (!(shutdown_.load(std::memory_order_acquire) ||
+							 !conn_buffers->read_buffer_in_use_by_consumer.load(std::memory_order_acquire)))
 					{
 						const auto wait_start = std::chrono::steady_clock::now();
 						conn_buffers->receiver_can_write_cv.WaitWithTimeout(
@@ -1527,7 +1539,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 					}
 				}
 				VLOG(4) << "Worker (fd=" << conn_buffers->fd << "): Wait loop finished.";
-				if (shutdown_) break;
+				if (shutdown_.load(std::memory_order_acquire)) break;
 				VLOG(4) << "Worker (fd=" << conn_buffers->fd << "): Consumer released buffer, continuing loop.";
 				continue;
 			}
@@ -1594,13 +1606,14 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 				}
 				if (feed_ordered_consume_stream) {
 					const auto* chunk_begin = static_cast<uint8_t*>(write_ptr);
+					const size_t chunk_len = static_cast<size_t>(bytes_received);
+					ReserveForAppend(conn_buffers->ordered_stream_pending, chunk_len);
 					conn_buffers->ordered_stream_pending.insert(
 						conn_buffers->ordered_stream_pending.end(),
 						chunk_begin,
-						chunk_begin + static_cast<size_t>(bytes_received));
+						chunk_begin + chunk_len);
 					conn_buffers->delivery_diag.ordered_stream_feed_calls++;
-					conn_buffers->delivery_diag.ordered_stream_feed_bytes +=
-						static_cast<uint64_t>(bytes_received);
+					conn_buffers->delivery_diag.ordered_stream_feed_bytes += chunk_len;
 					MaxAssign(conn_buffers->delivery_diag.ordered_stream_max_pending_bytes,
 					          static_cast<uint64_t>(conn_buffers->ordered_stream_pending.size()));
 					consume_cv_.SignalAll();
@@ -1671,7 +1684,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 				}
 				continue;
 			}
-			if (shutdown_) { /* log shutdown */ }
+			if (shutdown_.load(std::memory_order_acquire)) { /* log shutdown */ }
 			else { LOG(ERROR) << "Worker (fd=" << conn_buffers->fd << "): recv failed: " << strerror(errno); }
 			size_t final_write_offset_err = conn_buffers->buffers[conn_buffers->current_write_idx.load()].write_offset.load();
 			if (final_write_offset_err > 0) { /* signal final buffer */ }
@@ -1694,7 +1707,7 @@ void Subscriber::SubscribeToClusterStatus() {
 	// Wait for cluster info before connecting to brokers
 	// to determine which brokers accept subscriptions (same as publishers)
 
-	while (!shutdown_) {
+	while (!shutdown_.load(std::memory_order_acquire)) {
 		heartbeat_system::ClientInfo client_info;
 		heartbeat_system::ClusterStatus cluster_status;
 		grpc::ClientContext stream_context; // New context per attempt
@@ -1703,7 +1716,7 @@ void Subscriber::SubscribeToClusterStatus() {
 		stream_context.set_deadline(deadline);
 
 
-		if (shutdown_) break;
+		if (shutdown_.load(std::memory_order_acquire)) break;
 
 		std::unique_ptr<grpc::ClientReader<heartbeat_system::ClusterStatus>> reader(
 				stub_->SubscribeToCluster(&stream_context, client_info));
@@ -1715,7 +1728,7 @@ void Subscriber::SubscribeToClusterStatus() {
 		}
 
 		while (true) { // Loop until Read fails or shutdown is detected
-			if (shutdown_) {
+			if (shutdown_.load(std::memory_order_acquire)) {
 				// Need to explicitly cancel the context *before* Finish if shutting down mid-stream
 				stream_context.TryCancel();
 				break; // Exit inner loop
@@ -1809,7 +1822,7 @@ void Subscriber::SubscribeToClusterStatus() {
 
 
 		// Check status and shutdown flag AFTER Finish()
-		if (shutdown_) {
+		if (shutdown_.load(std::memory_order_acquire)) {
 			VLOG(5) << "Cluster status loop exiting due to shutdown request.";
 			break; // Exit outer loop
 		}
@@ -2622,14 +2635,15 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 		// depending on dual-buffer readiness heuristics.
 		{
 			absl::ReaderMutexLock map_lock(&connection_map_mutex_);
-				for (auto const& [fd, conn_ptr] : connections_) {
-					if (!conn_ptr) continue;
-					auto& state = parse_states_[fd];
-					absl::MutexLock lock(&conn_ptr->state_mutex);
-					if (!conn_ptr->ordered_stream_pending.empty()) {
-						const size_t drained_bytes = conn_ptr->ordered_stream_pending.size();
-						state.buffer.insert(
-							state.buffer.end(),
+			for (auto const& [fd, conn_ptr] : connections_) {
+				if (!conn_ptr) continue;
+				auto& state = parse_states_[fd];
+				absl::MutexLock lock(&conn_ptr->state_mutex);
+				if (!conn_ptr->ordered_stream_pending.empty()) {
+					const size_t drained_bytes = conn_ptr->ordered_stream_pending.size();
+					ReserveForAppend(state.buffer, drained_bytes);
+					state.buffer.insert(
+						state.buffer.end(),
 						conn_ptr->ordered_stream_pending.begin(),
 						conn_ptr->ordered_stream_pending.end());
 					conn_ptr->ordered_stream_pending.clear();
