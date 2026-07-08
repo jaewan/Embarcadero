@@ -181,8 +181,10 @@ THROUGHPUT_ARTIFACT_BASE_DIR="${THROUGHPUT_ARTIFACT_BASE_DIR:-}"
 
 cleanup() {
   [ "$QUIET" != "1" ] && echo "Cleaning up..."
-  pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
-  pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
+  if [[ "${EMBARCADERO_DISABLE_PATTERN_KILL:-0}" != "1" ]]; then
+    pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
+    pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
+  fi
   if ! broker_is_remote_mode || [ "$PRESERVE_REMOTE_BROKERS" != "1" ]; then
     broker_cleanup
   fi

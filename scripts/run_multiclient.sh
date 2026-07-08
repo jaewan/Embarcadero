@@ -640,12 +640,14 @@ cleanup() {
     shm_cleanup
     wait_for_broker_ports_free
     # Kill remote client processes (ignore failures)
-    for (( _i=0; _i<${NUM_CLIENTS:-0}; _i++ )); do
-        _h="${CLIENT_HOSTS[$_i]}"
-        if [[ "$_h" != "local" ]]; then
-            ssh "$_h" "pkill -9 -f throughput_test 2>/dev/null; true" 2>/dev/null || true
-        fi
-    done
+    if [[ "${EMBARCADERO_DISABLE_PATTERN_KILL:-0}" != "1" ]]; then
+        for (( _i=0; _i<${NUM_CLIENTS:-0}; _i++ )); do
+            _h="${CLIENT_HOSTS[$_i]}"
+            if [[ "$_h" != "local" ]]; then
+                ssh "$_h" "pkill -9 -f throughput_test 2>/dev/null; true" 2>/dev/null || true
+            fi
+        done
+    fi
 }
 trap cleanup EXIT
 

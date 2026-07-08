@@ -169,7 +169,9 @@ fi
 # ---------------------------------------------------------------------------
 cleanup() {
   broker_cleanup
-  pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
+  if [[ "${EMBARCADERO_DISABLE_PATTERN_KILL:-0}" != "1" ]]; then
+    pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
+  fi
   if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     broker_remote_corfu_stop || true
   elif [[ "$SEQUENCER" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
