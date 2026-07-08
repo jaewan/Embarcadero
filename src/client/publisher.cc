@@ -100,6 +100,12 @@ double NsToMs(uint64_t ns) {
 	return static_cast<double>(ns) / 1e6;
 }
 
+double DurationMs(const std::chrono::steady_clock::time_point& start,
+                  const std::chrono::steady_clock::time_point& end) {
+	return static_cast<double>(
+		std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000.0;
+}
+
 double BytesToMiB(uint64_t bytes) {
 	return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
@@ -1520,6 +1526,14 @@ void Publisher::Publish(char* message, size_t len) {
 
 bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	const bool ack_jitter_trace = (std::getenv("EMBARCADERO_ACK_JITTER_TRACE") != nullptr);
+	const auto poll_start_time = std::chrono::steady_clock::now();
+	auto queue_drain_done_time = poll_start_time;
+	auto publisher_join_done_time = poll_start_time;
+	auto ack_wait_start_time = poll_start_time;
+	auto ack_wait_done_time = poll_start_time;
+	bool ack_wait_measured = false;
+	size_t poll_target_acks = 0;
+	size_t poll_normalized_received = 0;
 	// [[LAST_PERCENT_ACK_FIX]] Seal and return reads before signaling finished.
 	// If we set publish_finished_ first, threads that get nullptr from Read() may exit
 	// before we've called SealAll(), dropping the last batches.
@@ -1573,6 +1587,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			}
 		}
 	}
+	queue_drain_done_time = std::chrono::steady_clock::now();
 
 	// All messages queued, waiting for transmission to complete
 
@@ -1593,6 +1608,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 		}
 			// All publisher threads completed transmission
 		}
+		publisher_join_done_time = std::chrono::steady_clock::now();
 		const size_t zero_batch_threads = zero_batch_publish_threads_.load(std::memory_order_relaxed);
 		if (zero_batch_threads > 0) {
 			LOG(WARNING) << "[Publisher Thread Distribution] " << zero_batch_threads
@@ -1603,6 +1619,9 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 		// If acknowledgments are enabled, wait for all acks
 		if (ack_level_ >= 1) {
 		auto wait_start_time = std::chrono::steady_clock::now();
+		ack_wait_start_time = wait_start_time;
+		ack_wait_done_time = wait_start_time;
+		ack_wait_measured = true;
 		auto last_log_time = wait_start_time;
 		auto last_ack_change_time = wait_start_time;
 		auto normalized_acks = [&]() -> size_t {
@@ -1637,6 +1656,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 		// [[FIX: ACK Race Condition]] Capture target ONCE - never reload inside loop
 		// Reloading allowed concurrent Publish() calls to move the target, causing potential infinite wait
 		const size_t target_acks = client_order_.load(std::memory_order_acquire);
+		poll_target_acks = target_acks;
 
 		// Need to check for test completion/shutdown condition inside this loop to avoid hanging if things fail
 	while (normalized_acks() < target_acks && !shutdown_.load(std::memory_order_relaxed)) {
@@ -1724,6 +1744,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 		// Only treat as success if we actually received ACKs for all messages
 		const size_t received = ack_received_.load(std::memory_order_relaxed);
 		const size_t normalized_received = normalized_acks();
+			poll_normalized_received = normalized_received;
 			if (received > target_acks) {
 				LOG(WARNING) << "[Publisher ACK Normalize]: raw_received="
 				             << received << " target=" << target_acks
@@ -1771,6 +1792,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			LOG(ERROR) << "[Publisher ACK Per-Broker]: " << per_broker;
 			return false;
 		}
+			ack_wait_done_time = std::chrono::steady_clock::now();
 			LOG(INFO) << "[ACK_VERIFY] normalized_received=" << normalized_received
 			          << " raw_received=" << received
 			          << " target=" << target_acks << " 100%";
@@ -1818,6 +1840,17 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	// This allows the subscriber to continue using the cluster management infrastructure
 	// The context will be cleaned up when the Publisher object is destroyed
 	LogOrder5RoutingSummary();
+	const auto poll_done_time = std::chrono::steady_clock::now();
+	LOG(INFO) << "[POLL_BREAKDOWN] target_messages=" << n
+	          << " ack_enabled=" << (ack_level_ >= 1 ? 1 : 0)
+	          << " queue_drain_ms=" << std::fixed << std::setprecision(3)
+	          << DurationMs(poll_start_time, queue_drain_done_time)
+	          << " publisher_join_ms=" << DurationMs(queue_drain_done_time, publisher_join_done_time)
+	          << " ack_wait_ms=" << (ack_wait_measured ? DurationMs(ack_wait_start_time, ack_wait_done_time) : 0.0)
+	          << " post_ack_ms=" << (ack_wait_measured ? DurationMs(ack_wait_done_time, poll_done_time) : 0.0)
+	          << " total_poll_ms=" << DurationMs(poll_start_time, poll_done_time)
+	          << " target_acks=" << poll_target_acks
+	          << " normalized_acks=" << poll_normalized_received;
 	return true;
 }
 

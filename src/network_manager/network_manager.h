@@ -93,6 +93,19 @@ private:
     /** @param topic_cstr Topic name (converted to std::string internally for thread safety). */
     void AckThread(const char* topic_cstr, uint32_t ack_level, int ack_fd, int ack_efd,
                    uint32_t client_id, uint32_t session_epoch);
+    template <typename Callable, typename... Args>
+    bool StartManagedThread(Callable&& callable, Args&&... args) {
+        if (stop_threads_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        std::thread thread(std::forward<Callable>(callable), std::forward<Args>(args)...);
+        {
+            absl::MutexLock lock(&threads_mu_);
+            threads_.emplace_back(std::move(thread));
+        }
+        return true;
+    }
     size_t GetOffsetToAck(const char* topic, uint32_t ack_level);
     std::pair<size_t, bool> GetOffsetToAckFast(const char* topic, uint32_t ack_level, size_t last_known_ack);
 	void SubscribeNetworkThread(int sock, int efd, const char* topic, int connection_id);
@@ -115,7 +128,8 @@ private:
 
     // Thread management
     int broker_id_;
-    std::vector<std::thread> threads_;
+    absl::Mutex threads_mu_;
+    std::vector<std::thread> threads_ ABSL_GUARDED_BY(threads_mu_);
     int num_reqReceive_threads_;
     std::atomic<int> thread_count_{0};
     std::atomic<bool> stop_threads_{false};  // Atomic for correctness - volatile was dangerous

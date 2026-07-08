@@ -798,11 +798,11 @@ NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads)
 		LOG(INFO) << "NetworkManager: Blocking recv direct to BLog (single code path)";
 
 		// Create main listener thread
-		threads_.emplace_back(&NetworkManager::MainThread, this);
+		StartManagedThread(&NetworkManager::MainThread, this);
 
 		// Create request handler threads (each handles publish via HandlePublishRequest)
 		for (int i = 0; i < num_reqReceive_threads; i++) {
-			threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
+			StartManagedThread(&NetworkManager::ReqReceiveThread, this);
 		}
 
 		// Wait for all threads to start
@@ -843,13 +843,22 @@ void NetworkManager::Shutdown() {
 		request_queue_.blockingWrite(sentinel);
 	}
 
-	// Join all threads
-	for (std::thread& thread : threads_) {
-		if (thread.joinable()) {
-			thread.join();
+	while (true) {
+		std::vector<std::thread> threads_to_join;
+		{
+			absl::MutexLock lock(&threads_mu_);
+			if (threads_.empty()) {
+				break;
+			}
+			threads_to_join.swap(threads_);
+		}
+
+		for (std::thread& thread : threads_to_join) {
+			if (thread.joinable()) {
+				thread.join();
+			}
 		}
 	}
-
 }
 
 void NetworkManager::SetCXLManager(CXLManager* cxl_manager) {
@@ -1133,37 +1142,86 @@ void NetworkManager::HandlePublishRequest(
 				if (same_session) {
 					ack_fd = it->second;
 				} else {
+					// Reserve the ACK channel while this request thread performs the socket
+					// connect. Without the in-progress sentinel, parallel publish sockets from
+					// one client all observe "missing" and spawn duplicate AckThreads.
+					ack_connections_[handshake.client_id] = -1;
+					ack_connection_epochs_[handshake.client_id] = connection_session_epoch;
 					need_ack_thread = true;
 				}
 			}
 
 			if (need_ack_thread) {
 				if (!SetupAcknowledgmentSocket(ack_fd, client_address, handshake.port)) {
+					{
+						absl::MutexLock lock(&ack_mu_);
+						auto it = ack_connections_.find(handshake.client_id);
+						auto epoch_it = ack_connection_epochs_.find(handshake.client_id);
+						if (it != ack_connections_.end() && it->second == -1 &&
+						    epoch_it != ack_connection_epochs_.end() &&
+						    epoch_it->second == connection_session_epoch) {
+							ack_connections_.erase(it);
+							ack_connection_epochs_.erase(handshake.client_id);
+						}
+					}
 					close(client_socket);
 					return;
 				}
 				local_ack_efd = ack_efd_;
+				bool registration_current = false;
 				{
 					absl::MutexLock lock(&ack_mu_);
-					ack_fd_ = ack_fd;
-					ack_connections_[handshake.client_id] = ack_fd;
-					ack_connection_epochs_[handshake.client_id] = connection_session_epoch;
+					auto it = ack_connections_.find(handshake.client_id);
+					auto epoch_it = ack_connection_epochs_.find(handshake.client_id);
+					registration_current =
+						it != ack_connections_.end() &&
+						it->second == -1 &&
+						epoch_it != ack_connection_epochs_.end() &&
+						epoch_it->second == connection_session_epoch;
+					if (registration_current) {
+						ack_fd_ = ack_fd;
+						it->second = ack_fd;
+					}
+				}
+				if (!registration_current) {
+					LOG(INFO) << "HandlePublishRequest: ACK setup superseded for broker "
+					          << broker_id_ << ", client_id=" << handshake.client_id
+					          << ", session_epoch=" << connection_session_epoch;
+					CleanupSocketAndEpoll(ack_fd, local_ack_efd);
+					ack_fd = -1;
+					local_ack_efd = -1;
+					need_ack_thread = false;
 				}
 
 				// [[CRITICAL: Validate topic before starting AckThread]]
 				// Empty topic -> GetOffsetToAck returns wrong TInode -> client ACK timeout
-				if (strlen(handshake.topic) == 0) {
+				if (need_ack_thread && strlen(handshake.topic) == 0) {
 					LOG(ERROR) << "HandlePublishRequest: Empty topic in handshake for broker " << broker_id_
 					           << ", client_id=" << handshake.client_id << ". NOT starting AckThread!";
 					// Still keep connection open for publish, but ACKs will not work correctly
-				} else {
+				} else if (need_ack_thread) {
 					LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
 					          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id
 					          << ", session_epoch=" << connection_session_epoch;
 					// Pass local_ack_efd to thread so it uses the correct epoll instance.
-					threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic,
-						handshake.ack, ack_fd, local_ack_efd, handshake.client_id,
-						connection_session_epoch);
+					if (!StartManagedThread(&NetworkManager::AckThread, this, handshake.topic,
+							handshake.ack, ack_fd, local_ack_efd, handshake.client_id,
+							connection_session_epoch)) {
+						LOG(INFO) << "HandlePublishRequest: Shutdown in progress; not starting AckThread for broker "
+						          << broker_id_ << ", client_id=" << handshake.client_id;
+						{
+							absl::MutexLock lock(&ack_mu_);
+							auto it = ack_connections_.find(handshake.client_id);
+							if (it != ack_connections_.end() && it->second == ack_fd) {
+								ack_connections_.erase(it);
+								ack_connection_epochs_.erase(handshake.client_id);
+							}
+							if (ack_fd_ == ack_fd) {
+								ack_fd_ = -1;
+							}
+						}
+						CleanupSocketAndEpoll(ack_fd, local_ack_efd);
+					}
 				}
 			}
 		}
