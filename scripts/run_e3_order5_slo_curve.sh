@@ -62,37 +62,38 @@ cp "$RUN_DIR/benchmark_contract.md" "$RAW_DOC_ROOT/benchmark_contract.md"
 cp "$RUN_DIR/trial_results.csv" "$RAW_DOC_ROOT/trial_results.csv"
 cp "$RUN_DIR/summary.csv" "$RAW_DOC_ROOT/summary.csv"
 
-python3 - "$RUN_DIR/trial_results.csv" "$RAW_DOC_ROOT/e3_slo_threshold_curve.csv" <<'PY'
+python3 - "$RUN_DIR/summary.csv" "$RAW_DOC_ROOT/e3_slo_threshold_curve.csv" <<'PY'
 import csv
 import sys
 
 inp, outp = sys.argv[1], sys.argv[2]
 rows = list(csv.DictReader(open(inp, newline="")))
 thresholds_ms = [1, 2, 5, 10, 20, 50, 100]
-
-lat_cols = [c for c in rows[0].keys() if c.lower() in {"p99_us", "p999_us", "p99_9_us", "publish_to_deliver_p99_us"}] if rows else []
-lat_col = lat_cols[0] if lat_cols else None
-throughput_cols = [c for c in rows[0].keys() if c.lower() in {"achieved_mbps", "e2e_goodput_mbps", "publish_goodput_mbps", "target_mbps"}] if rows else []
-tp_col = throughput_cols[0] if throughput_cols else None
+metrics = [
+    ("append_ack_p99", "pub_ack_p99_us_mean", "achieved_publish_goodput_mbps_mean"),
+    ("publish_to_deliver_p99", "publish_to_deliver_p99_us_mean", "achieved_e2e_goodput_mbps_mean"),
+]
 
 with open(outp, "w", newline="") as f:
     w = csv.writer(f)
-    w.writerow(["threshold_ms", "throughput_mbps", "latency_column", "throughput_column"])
-    if not lat_col or not tp_col:
+    w.writerow(["metric", "threshold_ms", "throughput_mbps", "latency_column", "throughput_column"])
+    if not rows:
         for t in thresholds_ms:
-            w.writerow([t, "", lat_col or "", tp_col or ""])
+            for metric, lat_col, tp_col in metrics:
+                w.writerow([metric, t, "", lat_col, tp_col])
     else:
-        for threshold in thresholds_ms:
-            eligible = []
-            for row in rows:
-                try:
-                    lat_ms = float(row[lat_col]) / 1000.0
-                    tp = float(row[tp_col])
-                except (TypeError, ValueError):
-                    continue
-                if lat_ms <= threshold:
-                    eligible.append(tp)
-            w.writerow([threshold, f"{max(eligible):.6f}" if eligible else "", lat_col, tp_col])
+        for metric, lat_col, tp_col in metrics:
+            for threshold in thresholds_ms:
+                eligible = []
+                for row in rows:
+                    try:
+                        lat_ms = float(row[lat_col]) / 1000.0
+                        tp = float(row[tp_col])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if lat_ms <= threshold:
+                        eligible.append(tp)
+                w.writerow([metric, threshold, f"{max(eligible):.6f}" if eligible else "", lat_col, tp_col])
 PY
 
 echo "E3 raw tree: $RAW_DOC_ROOT"
