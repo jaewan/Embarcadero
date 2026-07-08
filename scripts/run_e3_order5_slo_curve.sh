@@ -34,7 +34,7 @@ flock "$LOCK_FD"
 
 printf '%s START e3_order5_slo_curve tag=%s peak_mbps=%s loads="%s" commit=%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TAG" "$PEAK_MBPS" "$LOAD_POINTS_MBPS" "$(git rev-parse HEAD)" >> "$ACTIVITY_LOG"
-trap 'printf "%s END e3_order5_slo_curve tag=%s status=%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TAG" "$?" >> "$ACTIVITY_LOG"' EXIT
+trap 'status=$?; printf "%s END e3_order5_slo_curve tag=%s status=%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TAG" "$status" >> "$ACTIVITY_LOG"' EXIT
 
 env \
   EMBARCADERO_DISABLE_PATTERN_KILL=1 \

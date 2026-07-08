@@ -26,7 +26,7 @@ flock "$LOCK_FD"
 
 printf '%s START e1_leg4_order5_cxl tag=%s commit=%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TAG" "$(git rev-parse HEAD)" >> "$ACTIVITY_LOG"
-trap 'printf "%s END e1_leg4_order5_cxl tag=%s status=%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TAG" "$?" >> "$ACTIVITY_LOG"' EXIT
+trap 'status=$?; printf "%s END e1_leg4_order5_cxl tag=%s status=%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TAG" "$status" >> "$ACTIVITY_LOG"' EXIT
 
 for msg_size in $MSG_SIZES; do
   run_id="${RUN_TS}_msg${msg_size}"
