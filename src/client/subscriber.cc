@@ -215,6 +215,16 @@ int64_t ConsumeOrderedWaitUs() {
 	return ResolveInt64Env("EMBARCADERO_CONSUME_ORDERED_WAIT_US", 50, 1, 1000000);
 }
 
+size_t SubscriberRecvChunkBytes(bool measure_latency, size_t broker_count) {
+	constexpr int64_t kThroughputDefault = 1LL << 20;
+	constexpr int64_t kLatencyDefault = 256LL << 10;
+	return static_cast<size_t>(ResolveInt64Env(
+		"EMBARCADERO_SUBSCRIBER_RECV_CHUNK_BYTES",
+		(measure_latency && broker_count > 1) ? kLatencyDefault : kThroughputDefault,
+		16LL << 10,
+		kThroughputDefault));
+}
+
 bool BuildLatencySampleFromFrame(const uint8_t* frame,
                                  size_t frame_size,
                                  size_t header_size,
@@ -1561,6 +1571,8 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		  (!measure_latency_ && !BenchmarkPollOnlyRuntime())));
 	const bool partial_flush_enabled = (order_level_ >= 1);
 	StreamParseState ordered_consume_parse_state;
+	const size_t recv_chunk_cap =
+		SubscriberRecvChunkBytes(measure_latency_, configured_broker_count_);
 
 	// --- Main receive loop (Simplified - Blocking recv) ---
 	while (!shutdown_.load(std::memory_order_acquire)) {
@@ -1606,8 +1618,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 			}
 		}
 
-		// Use 1MB receive chunks for optimal performance
-		size_t recv_chunk_size = std::min(available_space, static_cast<size_t>(1UL << 20));
+		size_t recv_chunk_size = std::min(available_space, recv_chunk_cap);
 		ssize_t bytes_received = recv(conn_buffers->fd, write_ptr, recv_chunk_size, 0);
 		if (bytes_received <= 0 && recv_write_idx >= 0) {
 			conn_buffers->clear_write_inflight(recv_write_idx);
