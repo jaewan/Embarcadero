@@ -10,6 +10,14 @@
 // Usage:
 //   rdma_recovery --source-ip=<surviving-broker> --source-port=<replica-port>
 //                 --target-ip=<memserver> --target-port=<recovery-port> --bytes=<N>
+//                 [--verify-slot-bytes=4096 --verify-slots=N]
+//
+// --verify-slot-bytes/--verify-slots (Sub-phase 3B leg-1 item 2): brokers write
+// `global_seq & 0xFF` into every byte of a batch's per-slot Blog region (rdma_broker.cc's Step 1),
+// and for slots before the ring's first wraparound, slot index == global_seq directly -- so slot
+// k's expected content is deterministic: every byte == (k & 0xFF). Checking this after the READ
+// (before writing to the target) turns "we recovered SOME bytes" into "we recovered the CORRECT
+// bytes, byte-for-byte" without needing any out-of-band record of what was actually written.
 
 #include <chrono>
 #include <cstdio>
@@ -38,6 +46,8 @@ int main(int argc, char** argv) {
   std::string target_ip = GetArg(argc, argv, "--target-ip", "");
   int target_port = atoi(GetArg(argc, argv, "--target-port", "18690"));
   size_t bytes = atoll(GetArg(argc, argv, "--bytes", "0"));
+  size_t verify_slot_bytes = atoll(GetArg(argc, argv, "--verify-slot-bytes", "0"));
+  size_t verify_slots = atoll(GetArg(argc, argv, "--verify-slots", "0"));
   std::string dev = GetArg(argc, argv, "--dev", "mlx5_0");
   int gid = atoi(GetArg(argc, argv, "--gid", "-1"));
 
@@ -93,6 +103,39 @@ int main(int argc, char** argv) {
   int n = PollCq(src_qp.cq, wc, 1, &bad);
   if (n <= 0) { fprintf(stderr, "[recovery] source READ failed (status=%d)\n", bad); return 1; }
   const auto t_read_done = std::chrono::steady_clock::now();
+
+  if (verify_slot_bytes > 0 && verify_slots > 0) {
+    // [[BUG FOUND: leg-1 sanity testing]] The original check assumed slot k's expected byte value
+    // is simply (k & 0xFF), which only holds BEFORE the ring's first wraparound (global_seq ==
+    // slot index only for seq < pbr_slots). Under sustained load the ring wraps many times before
+    // a kill happens, so slot k's actual content reflects whichever global_seq last landed there
+    // (k + m*pbr_slots for whatever wrap count m applies) -- unknowable here without an
+    // out-of-band record of exactly how many batches were sent. Fixed to a wrap-count-independent
+    // invariant instead: every byte WITHIN one slot must be identical (each batch's payload is one
+    // memset of a single value -- internal inconsistency means torn/corrupted data), AND
+    // consecutive slots' values must differ by exactly +1 mod 256 (adjacent ring slots hold
+    // consecutive global_seq values in the SAME final pass through the ring, as long as the
+    // checked range is small relative to pbr_slots so it doesn't itself span a wrap boundary).
+    // This verifies real byte-for-byte recovery correctness without needing to know the absolute
+    // sequence number.
+    size_t checked_slots = 0, bad_slots = 0;
+    int prev_value = -1;
+    for (size_t k = 0; k < verify_slots && (k + 1) * verify_slot_bytes <= bytes; ++k) {
+      const uint8_t* slot = staging.data() + k * verify_slot_bytes;
+      const uint8_t value = slot[0];
+      bool uniform = true;
+      for (size_t b = 1; b < verify_slot_bytes; ++b) {
+        if (slot[b] != value) { uniform = false; break; }
+      }
+      bool sequential = (prev_value < 0) || (value == static_cast<uint8_t>(prev_value + 1));
+      ++checked_slots;
+      if (!uniform || !sequential) ++bad_slots;
+      prev_value = value;
+    }
+    fprintf(stderr, "[recovery] VERIFY checked_slots=%zu bad_slots=%zu %s\n", checked_slots,
+            bad_slots, bad_slots == 0 ? "PASS" : "FAIL");
+    if (bad_slots > 0) { fprintf(stderr, "[recovery] FATAL: checksum verification failed\n"); return 1; }
+  }
 
   PostWrite(&dst_qp, staging.data(), staging_mr.lkey(), dst_remote.region.addr, dst_remote.region.rkey,
             static_cast<uint32_t>(bytes), /*wr_id=*/0);

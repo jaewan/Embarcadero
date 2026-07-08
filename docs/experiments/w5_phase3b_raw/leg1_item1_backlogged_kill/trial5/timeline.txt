@@ -1,0 +1,5 @@
+[2026-07-08T02:39:06Z] trial 5: launched, memserver(c3)=2527980 broker0(moscxl)=2527982 seq(moscxl)=2527987 durable=[]
+[2026-07-08T02:39:10Z] trial 5: KILLED broker0 pid=2527982 at kill_t_mono=1783478350.093934686
+[sequencer] broker 0 declared dead via LEASE_TIMEOUT at t=6.979s
+recovery_rc=0
+[2026-07-08T02:39:48Z] trial 5: all processes exited

@@ -691,7 +691,18 @@ int main(int argc, char** argv) {
   // Per the spec's M2 guidance, the RDMA lease timeout must NOT reuse CXL's tight constants —
   // inflated here to cover RDMA RTT tail + polling-cycle granularity, not CXL's sub-microsecond
   // coherence latency.
-  constexpr uint64_t kLeaseTimeoutNs = 500'000'000ull;  // 500ms backstop; RDMA RTT here is ~us-scale
+  //
+  // [[BUG FOUND: Sub-phase 3B leg-1]] 500ms was NOT a real backstop -- it turned out to be almost
+  // exactly the same duration as the RC QP's own retry-exhaustion time (timeout=14, retry_cnt=7 in
+  // rdma_common.cc -> ~470-500ms to IBV_WC_RETRY_EXC_ERR), and the lease check runs unconditionally
+  // at the TOP of every poll cycle, before Step 4 even gets a chance to post a new read and let its
+  // OWN retry-exhaustion clock start. That structurally favors the lease every time a kill happens,
+  // regardless of whether there was a genuine in-flight read to fail -- confirmed empirically: the
+  // lease fired at ~4.479-4.484s after a kill at t=4.0s in every trial tried, independent of offered
+  // load (0/300/1200/1800 MB/s all showed the identical ~479-484ms timing). Widened to a genuine
+  // backstop -- long enough that the fast path has real, uncontested room to fire first whenever
+  // there IS a live operation to fail.
+  constexpr uint64_t kLeaseTimeoutNs = 3'000'000'000ull;  // 3s backstop; RDMA RTT here is ~us-scale
   std::vector<bool> broker_dead(num_brokers, false);
   std::vector<uint64_t> broker_dead_detect_ts(num_brokers, 0);
   std::vector<std::string> broker_dead_via(num_brokers, "");

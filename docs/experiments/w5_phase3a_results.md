@@ -77,14 +77,23 @@ Same config as Phase 1 (8 brokers, 4096B messages, inflight=64, `pbr_slots=16384
 | 36.0 Gb/s | 35.968 Gb/s | 17.98 | 17.98 | 23.486 Gb/s | 12.9 µs |
 | 54.0 Gb/s | 53.952 Gb/s | 26.98 | 26.98 | 33.446 Gb/s | 15.8 µs |
 | 72.0 Gb/s | 72.0 Gb/s | 36.0 | 36.0 | 42.715 Gb/s | 21.7 µs |
-| 90.0 Gb/s | **~84.6 Gb/s** | ~42.3 | ~42.3 | **~21.2 Gb/s** | **~61.1 ms** |
-| 108.0 Gb/s | **~86.2 Gb/s** | ~43.1 | ~43.1 | **~21.1 Gb/s** | **~61.2 ms** |
+| 90.0 Gb/s | **~84.6 Gb/s** | ~41.3 (median) | ~43.3 (median) | **~21.2 Gb/s** | **~61.1 ms** |
+| 108.0 Gb/s | **~86.2 Gb/s** | ~42.8 (median) | ~43.3 (median) | **~21.1 Gb/s** | **~61.2 ms** |
 
-(Per-host split is symmetric — 4 identically-configured brokers per host in this topology — so
-each host's egress is exactly half the aggregate; neither host approaches its own ~98 Gb/s
-NUMA-local device ceiling even at the highest points, which is the honest answer item 5's
-constraint permits: **sender-host egress does not appear to be the binding constraint** in this
-2-host topology, though a >2-host topology was not available to confirm this more rigorously.)
+(**Correction, 2026-07-08:** the per-host split is symmetric only in OFFERED load — 4
+identically-configured brokers per host, same target rate — not in ACHIEVED egress. Re-checked
+directly against the raw per-broker RESULT lines (`w5_phase3a_raw/funnel_sweep/`, summed per host,
+3 trials each): at the 90 Gb/s point c1's 4 brokers deliver **~43.3 Gb/s vs. moscxl's ~41.3 Gb/s —
+c1 ~5.4% hotter**; at 108 Gb/s the gap narrows to **~1.1%** (c1 ~43.3 vs. moscxl ~42.8). Below the
+knee (offered ≤72 Gb/s) both hosts land within rounding of the identical target rate — the pacer
+successfully rate-limits both sides equally, so no asymmetry is visible until the system is
+actually saturated. The most likely explanation is not symmetric hardware but that **moscxl also
+hosts the 8-thread sequencer**, whose 8 QPs continuously read Blog data from c3 over the SAME
+`enp193s0f0np0` NIC moscxl's 4 brokers use to write to c3 — extra RX+TX duplex load on moscxl's
+link that c1's brokers-only role doesn't carry. Neither host approaches its own ~98 Gb/s NUMA-local
+device ceiling even at the highest points, so **sender-host egress does not appear to be the
+binding constraint** overall, but the asymmetry itself is real and attributable to moscxl's
+co-hosted sequencer, not claimed away as "exactly half.")
 
 ### Signal A (broker-side, NIC-bound funnel) — confirms and sharpens Phase 1's finding
 

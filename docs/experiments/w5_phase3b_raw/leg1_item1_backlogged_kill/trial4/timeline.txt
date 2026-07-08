@@ -1,0 +1,5 @@
+[2026-07-08T02:38:17Z] trial 4: launched, memserver(c3)=2527917 broker0(moscxl)=2527919 seq(moscxl)=2527924 durable=[]
+[2026-07-08T02:38:21Z] trial 4: KILLED broker0 pid=2527919 at kill_t_mono=1783478301.483773096
+[sequencer] broker 0 declared dead via RDMA_ERROR (kPeerDown) at t=8.155s
+recovery_rc=1
+[2026-07-08T02:39:00Z] trial 4: all processes exited

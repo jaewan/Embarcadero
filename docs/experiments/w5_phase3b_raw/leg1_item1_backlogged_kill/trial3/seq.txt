@@ -1,0 +1,7 @@
+[sequencer] placement=DRAM(W5-A) num_brokers=2 duration=20s
+[sequencer] connected to memserver qpn=1047 host_blog=0
+[sequencer] broker-direct Blog connection to broker 0 (10.10.10.10) qpn=1902
+[sequencer] broker-direct Blog connection to broker 1 (10.10.10.11) qpn=1071
+[sequencer] broker 0 declared dead via LEASE_TIMEOUT at t=6.980s
+[sequencer] RESULT batches=7818571 blog_bytes=32024866816 secs=20.000 throughput=0.391 Mmsg/s 12.810 Gb/s sentinel_polls=642048 poll_rate=32102.4/s stale_misses=5899316 unrecoverable_bytes=0 detect_to_commit_p50_us=62.3 p99_us=6832.1 p999_us=26305.8
+[sequencer] BROKER_DEAD broker=0 via=lease_timeout detect_t=6.980s

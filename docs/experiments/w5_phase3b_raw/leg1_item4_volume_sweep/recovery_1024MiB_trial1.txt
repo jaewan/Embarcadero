@@ -1,0 +1,3 @@
+[recovery] connected to source 10.10.10.11 (qpn=1155)
+[recovery] connected to target 10.10.10.181 (qpn=1114)
+[recovery] RESULT bytes=1073741824 read_secs=0.223658 write_secs=0.122274 total_secs=0.354689 read_gbps=38.407 write_gbps=70.251

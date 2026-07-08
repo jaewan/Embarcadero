@@ -1,0 +1,22 @@
+[memserver] num_brokers=2 pbr_slots=16384 goi_entries=2000000 host_blog=0 blog_bytes/broker=1073741824 duration=30s
+[memserver] dev=mlx5_0 gid_index=3 active_mtu=5
+[memserver] hugepage alloc ok: 64 bytes (2MB-aligned 2097152)
+[memserver] hugepage alloc ok: 128 bytes (2MB-aligned 2097152)
+[memserver] hugepage alloc ok: 16 bytes (2MB-aligned 2097152)
+[memserver] hugepage alloc ok: 128000000 bytes (2MB-aligned 130023424)
+[memserver] hugepage alloc ok: 4194304 bytes (2MB-aligned 4194304)
+[memserver] regions registered: control=64B cv=128B sentinel=16B goi=128000000B pbr=4194304B blog=0B spare=0B
+[memserver] client 0 hello: role=0 broker_id=0
+[memserver] client 0 connected qpn=1942
+[memserver] client 1 hello: role=0 broker_id=1
+[memserver] client 1 connected qpn=1093
+[memserver] client 2 hello: role=1 broker_id=-1
+[memserver] client 2 connected qpn=1946
+[memserver] all 3 clients connected; passive for 30s (CPU not in data path)
+[memserver] --- final state dump ---
+[memserver] ControlBlock: epoch=0 committed_seq=1881837 sequencer_id=0
+[memserver] CV[broker=0] ack_offset=1005860
+[memserver] CV[broker=1] ack_offset=1005860
+[memserver] sentinel[broker=0]=1005859
+[memserver] sentinel[broker=1]=1005859
+[memserver] clean exit

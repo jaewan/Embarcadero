@@ -1,0 +1,4 @@
+[sequencer] placement=DRAM(W5-A) num_brokers=2 duration=25s
+[sequencer] connected to memserver qpn=1095 host_blog=0
+[sequencer] broker-direct Blog connection to broker 0 (10.10.10.10) qpn=2013
+[sequencer] broker-direct Blog connection to broker 1 (10.10.10.11) qpn=1134

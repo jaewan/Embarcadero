@@ -1,0 +1,44 @@
+[memserver] num_brokers=2 pbr_slots=262144 goi_entries=2000000 host_blog=0 blog_bytes/broker=1073741824 duration=85s
+[memserver] dev=mlx5_0 gid_index=3 active_mtu=5
+[memserver] hugepage alloc ok: 64 bytes (2MB-aligned 2097152)
+[memserver] hugepage alloc ok: 128 bytes (2MB-aligned 2097152)
+[memserver] hugepage alloc ok: 16 bytes (2MB-aligned 2097152)
+[memserver] hugepage alloc ok: 128000000 bytes (2MB-aligned 130023424)
+[memserver] hugepage alloc ok: 67108864 bytes (2MB-aligned 67108864)
+[memserver] hugepage alloc ok: 1073741824 bytes (2MB-aligned 1073741824)
+[memserver] regions registered: control=64B cv=128B sentinel=16B goi=128000000B pbr=67108864B blog=0B spare=1073741824B
+[memserver] client 0 hello: role=0 broker_id=0
+[memserver] client 0 connected qpn=2012
+[memserver] client 1 hello: role=0 broker_id=1
+[memserver] client 1 connected qpn=1133
+[memserver] client 2 hello: role=1 broker_id=-1
+[memserver] client 2 connected qpn=2016
+[memserver] all 3 clients connected; passive for 85s (CPU not in data path)
+[memserver] recovery connection 0 accepted qpn=2020
+[memserver] recovery connection 1 accepted qpn=2022
+[memserver] recovery connection 2 accepted qpn=2024
+[memserver] recovery connection 3 accepted qpn=2026
+[memserver] recovery connection 4 accepted qpn=2028
+[memserver] recovery connection 5 accepted qpn=2030
+[memserver] recovery connection 6 accepted qpn=2032
+[memserver] recovery connection 7 accepted qpn=2034
+[memserver] recovery connection 8 accepted qpn=2036
+[memserver] recovery connection 9 accepted qpn=2038
+[memserver] recovery connection 10 accepted qpn=2040
+[memserver] recovery connection 11 accepted qpn=2042
+[memserver] recovery connection 12 accepted qpn=2044
+[memserver] recovery connection 13 accepted qpn=2046
+[memserver] recovery connection 14 accepted qpn=2048
+[memserver] recovery connection 15 accepted qpn=2050
+[memserver] recovery connection 16 accepted qpn=2052
+[memserver] recovery connection 17 accepted qpn=2054
+[memserver] recovery connection 18 accepted qpn=2056
+[memserver] recovery connection 19 accepted qpn=2058
+[memserver] recovery connection 20 accepted qpn=2060
+[memserver] --- final state dump ---
+[memserver] ControlBlock: epoch=0 committed_seq=4913134 sequencer_id=0
+[memserver] CV[broker=0] ack_offset=10800307
+[memserver] CV[broker=1] ack_offset=7828155
+[memserver] sentinel[broker=0]=10800381
+[memserver] sentinel[broker=1]=7837528
+[memserver] clean exit

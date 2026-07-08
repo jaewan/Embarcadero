@@ -1,0 +1,6 @@
+[broker 0] placement=DRAM(W5-A) message_size=4096 target_mbps=0 duration=25s inflight=32
+[broker 0] local Blog registered: 1073741824 bytes
+[broker 0] connected to memserver qpn=1093 host_blog=0
+[broker 0] replica-acceptor: connection 1/1 accepted role=1 (qpn=1135)
+[broker 0] replicating to right neighbor 10.10.10.11 (qpn=1136)
+[broker 0] sequencer connected direct for Blog reads (qpn=2017)
