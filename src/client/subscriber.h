@@ -58,6 +58,8 @@ struct LatencySample {
 	uint64_t dedupe_key;
 	long long send_time_nanos;
 	long long latency_us;
+	long long recv_buffer_age_us;
+	size_t recv_chunk_bytes;
 };
 
 // Manages the dual buffers and state for a single connection (FD)
@@ -105,6 +107,21 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	// Increments when a buffer is reset for reuse; needed to disambiguate offsets
 	// across buffer swaps when correlating per-message receive timestamps.
 	std::array<uint64_t, 2> buffer_generation ABSL_GUARDED_BY(state_mutex) = {0, 0};
+	std::array<int64_t, 2> buffer_first_write_ns ABSL_GUARDED_BY(state_mutex) = {0, 0};
+	struct DeliveryDiag {
+		uint64_t recv_calls = 0;
+		uint64_t recv_bytes = 0;
+		uint64_t max_recv_bytes = 0;
+		uint64_t full_swap_attempts = 0;
+		uint64_t full_swap_success = 0;
+		uint64_t full_swap_blocked = 0;
+		uint64_t partial_ready_swaps = 0;
+		uint64_t consumer_release_swaps = 0;
+		uint64_t cv_wait_calls = 0;
+		uint64_t cv_wait_ns = 0;
+		uint64_t cv_wait_max_ns = 0;
+		uint64_t max_buffer_age_us = 0;
+	} delivery_diag ABSL_GUARDED_BY(state_mutex);
 
 	// [[BLOG_HEADER: Per-connection batch state for ORDER=5 (no global mutex)]]
 	// Replaces the global g_batch_states map, eliminating mutex contention
@@ -160,6 +177,10 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	// Called by Receiver: Signal that the current write buffer is ready and try to swap
 	// Returns true if swap was successful, false otherwise (consumer still busy)
 	bool signal_and_attempt_swap(Subscriber* subscriber_instance); // Implementation in .cc
+	bool flush_partial_if_due(Subscriber* subscriber_instance,
+	                          int64_t now_ns,
+	                          int64_t deadline_us,
+	                          bool force_flush); // Implementation in .cc
 
 	// Called by Consumer: Try to acquire the buffer ready for reading
 	// Returns pointer to buffer state if acquired, nullptr otherwise.
@@ -344,8 +365,6 @@ class Subscriber {
 		std::atomic<int64_t> first_byte_wall_ns_{0};
 		std::atomic<size_t> latency_unique_message_count_{0}; // Unique message keys seen during receive
 		std::atomic<size_t> latency_parsed_message_count_{0}; // Parsed latency messages seen during receive
-		absl::Mutex latency_seen_mutex_;
-		absl::flat_hash_set<uint64_t> latency_seen_send_ns_ ABSL_GUARDED_BY(latency_seen_mutex_);
 		// Per-broker byte counters for debugging subscribe stall (which broker underperforms)
 		std::array<std::atomic<size_t>, NUM_MAX_BROKERS> per_broker_bytes_{};
 
