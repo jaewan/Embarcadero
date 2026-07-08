@@ -1,0 +1,10 @@
+[sequencer] placement=MEMSERVER(W5-B) MULTI-THREADED num_brokers=8 seq_threads=8 duration=10s
+[seq-worker 2] connected to memserver qpn=713, owns brokers [2,3)
+[seq-worker 1] connected to memserver qpn=714, owns brokers [1,2)
+[seq-worker 0] connected to memserver qpn=715, owns brokers [0,1)
+[seq-worker 4] connected to memserver qpn=716, owns brokers [4,5)
+[seq-worker 7] connected to memserver qpn=717, owns brokers [7,8)
+[seq-worker 5] connected to memserver qpn=718, owns brokers [5,6)
+[seq-worker 6] connected to memserver qpn=719, owns brokers [6,7)
+[seq-worker 3] connected to memserver qpn=720, owns brokers [3,4)
+[sequencer] RESULT batches=7167221 blog_bytes=29356937216 secs=10 throughput=0.717 Mmsg/s 23.486 Gb/s sentinel_polls=9287553 poll_rate=928755.3/s stale_misses=120138 unrecoverable_bytes=0 detect_to_commit_p50_us=12.6 p99_us=17.2 p999_us=54.9 seq_threads=8

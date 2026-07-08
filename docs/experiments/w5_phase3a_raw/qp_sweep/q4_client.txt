@@ -1,0 +1,37 @@
+ WARNING: BW peak won't be measured in this run.
+---------------------------------------------------------------------------------------
+                    RDMA_Write BW Test
+ Dual-port       : OFF		Device         : mlx5_0
+ Number of qps   : 4		Transport type : IB
+ Connection type : RC		Using SRQ      : OFF
+ PCIe relax order: ON
+ ibv_wr* API     : ON
+ TX depth        : 128
+ CQ Moderation   : 1
+ Mtu             : 4096[B]
+ Link type       : Ethernet
+ GID index       : 3
+ Max inline data : 0[B]
+ rdma_cm QPs	 : OFF
+ Data ex. method : Ethernet
+---------------------------------------------------------------------------------------
+ local address: LID 0000 QPN 0x050c PSN 0xa7d9dc RKey 0x183eee VAddr 0x007d03ceeee000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:10:10
+ local address: LID 0000 QPN 0x050d PSN 0xcad496 RKey 0x183eee VAddr 0x007d03ceefe000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:10:10
+ local address: LID 0000 QPN 0x050e PSN 0x14c928 RKey 0x183eee VAddr 0x007d03cef0e000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:10:10
+ local address: LID 0000 QPN 0x050f PSN 0x9a3557 RKey 0x183eee VAddr 0x007d03cef1e000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:10:10
+ remote address: LID 0000 QPN 0x0155 PSN 0xf436fc RKey 0x1830ef VAddr 0x0078e279d36000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:10:181
+ remote address: LID 0000 QPN 0x0156 PSN 0x793b36 RKey 0x1830ef VAddr 0x0078e279d46000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:10:181
+ remote address: LID 0000 QPN 0x0157 PSN 0xa3b48 RKey 0x1830ef VAddr 0x0078e279d56000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:10:181
+ remote address: LID 0000 QPN 0x0158 PSN 0x248cf7 RKey 0x1830ef VAddr 0x0078e279d66000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:10:181
+---------------------------------------------------------------------------------------
+ #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
+ 65536      561040           0.00               98.05  		   0.187016
+---------------------------------------------------------------------------------------
