@@ -21,11 +21,13 @@
 // bandwidth/latency/failure-detection numbers it produces are transport-real, not simulated.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -66,7 +68,323 @@ struct LatencyStats {
 
 }  // namespace
 
+#if !BLOG_PLACEMENT_DRAM
+// ---- Sub-phase 3A item 2: multi-threaded W5-B sequencer -----------------------------------------
+// The single-threaded main() loop below tops out around 16-21 Gb/s (Phase 1 Signal B) because ONE
+// CPU thread doing ONE QP's worth of post/poll work is a real, separate ceiling from the NIC's
+// ~90-98 Gb/s device ceiling — conflating the two would make Phase 1's funnel "knee" partly a
+// software artifact, not a clean leg-2 (shared-NIC) result. This path is W5-B only (metadata AND
+// Blog on the memserver — no per-broker QPs to juggle, which is what makes clean broker-range
+// partitioning across worker threads straightforward here) and only spun up when --seq-threads>1;
+// W5-A (Phase 2's already-validated dead-broker/lease-timeout logic) is untouched, always taking
+// the original single-threaded path below regardless of --seq-threads.
+//
+// Each worker thread: owns ONE dedicated QP + CQ to the memserver (real N-QP/N-CQ parallelism,
+// not N threads timesharing one QP) and a disjoint, contiguous range of brokers. GOI's global
+// `total_order` is minted via one shared atomic counter (fetch_add is cheap relative to an RDMA
+// RTT, so this is not a new bottleneck); ControlBlock is written by thread 0 only, periodically,
+// reading the atomic's CURRENT value — every other thread only ever touches CV entries for
+// brokers it exclusively owns, so there is no cross-thread write race on any single field.
+struct SeqThreadStats {
+  uint64_t batches = 0, blog_bytes_read = 0, sentinel_polls = 0, stale_misses = 0;
+  LatencyStats detect_to_commit;
+};
+
+void SeqWorkerW5B(int thread_id, DeviceCtx* d, const std::string& memserver_ip, int memserver_port,
+                  int pbr_slots, int duration_secs, int broker_lo, int broker_hi,
+                  std::atomic<uint64_t>* g_committed_seq, bool is_aggregator,
+                  SeqThreadStats* out) {
+  RcQp meta_qp{};
+  if (!CreateRcQp(d, 4096, 512, /*psn_seed=*/0x6000 + thread_id, &meta_qp)) {
+    fprintf(stderr, "[seq-worker %d] CreateRcQp failed\n", thread_id); return;
+  }
+  HandshakeBlob local{}, remote{};
+  local.role = 1;
+  local.broker_id = -1;
+  local.client_ep = LocalEndpoint(meta_qp);
+  if (!OobClientExchange(memserver_ip, memserver_port, &local, &remote, sizeof(HandshakeBlob))) {
+    fprintf(stderr, "[seq-worker %d] OOB exchange with memserver failed\n", thread_id); return;
+  }
+  if (!ConnectRcQp(&meta_qp, remote.server_ep)) {
+    fprintf(stderr, "[seq-worker %d] ConnectRcQp failed\n", thread_id); return;
+  }
+  fprintf(stderr, "[seq-worker %d] connected to memserver qpn=%u, owns brokers [%d,%d)\n",
+          thread_id, remote.server_ep.qpn, broker_lo, broker_hi);
+
+  const int my_num_brokers = broker_hi - broker_lo;
+  constexpr int kWindow = 64;
+  constexpr size_t kMaxPayload = 1 << 16;
+
+  std::vector<uint64_t> sentinel_local(my_num_brokers, kPublishUncommitted);
+  Mr sentinel_local_mr{};
+  RegisterMr(d->pd, sentinel_local.data(), sentinel_local.size() * sizeof(uint64_t), &sentinel_local_mr);
+  std::vector<BatchHeaderMirror> header_buf(kWindow);
+  Mr header_buf_mr{};
+  RegisterMr(d->pd, header_buf.data(), header_buf.size() * sizeof(BatchHeaderMirror), &header_buf_mr);
+  std::vector<uint8_t> payload_buf(static_cast<size_t>(kWindow) * kMaxPayload);
+  Mr payload_buf_mr{};
+  RegisterMr(d->pd, payload_buf.data(), payload_buf.size(), &payload_buf_mr);
+  std::vector<GoiEntryMirror> goi_buf(kWindow);
+  Mr goi_buf_mr{};
+  RegisterMr(d->pd, goi_buf.data(), goi_buf.size() * sizeof(GoiEntryMirror), &goi_buf_mr);
+  std::vector<CompletionVectorEntryMirror> cv_buf(my_num_brokers);
+  Mr cv_buf_mr{};
+  RegisterMr(d->pd, cv_buf.data(), cv_buf.size() * sizeof(CompletionVectorEntryMirror), &cv_buf_mr);
+  ControlBlockMirror cb_local{};
+  Mr cb_local_mr{};
+  if (is_aggregator) RegisterMr(d->pd, &cb_local, sizeof(cb_local), &cb_local_mr);
+
+  struct WorkItem { int broker; uint64_t seq; bool header_valid = false; uint64_t log_idx = 0;
+                     uint64_t total_size = 0; uint32_t client_id = 0; uint64_t batch_seq = 0; };
+
+  ibv_wc wc[16];
+  int bad = 0;
+
+  // Same G1-fixed drain-to-completion pipeline as the single-threaded path, LOCAL to this thread
+  // (its own wc[]/bad, its own QP) — no sharing, so no cross-thread CQ-misattribution risk at all.
+  auto pipelined_ops = [&](RcQp* q, size_t count, auto&& post_one, auto&& on_complete) -> bool {
+    size_t posted = 0, completed = 0;
+    bool had_error = false;
+    while (completed < posted || (!had_error && posted < count)) {
+      if (!had_error) {
+        while (posted < count && (posted - completed) < static_cast<size_t>(kWindow)) {
+          if (!post_one(posted)) { had_error = true; break; }
+          ++posted;
+        }
+      }
+      if (completed == posted) { if (had_error) break; continue; }
+      int n = ibv_poll_cq(q->cq, 16, wc);
+      if (n < 0) { had_error = true; completed = posted; break; }
+      if (n == 0) continue;
+      for (int i = 0; i < n; ++i) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          fprintf(stderr, "[seq-worker %d] WC error status=%d(%s)\n", thread_id, wc[i].status,
+                  ibv_wc_status_str(wc[i].status));
+          had_error = true;
+          ++completed;
+          continue;
+        }
+        on_complete(static_cast<size_t>(wc[i].wr_id));
+        ++completed;
+      }
+    }
+    return !had_error;
+  };
+  auto blocking_read = [&](RcQp* q, void* laddr, uint32_t lkey, uint64_t raddr, uint32_t rkey,
+                           uint32_t len) -> bool {
+    if (!PostRead(q, laddr, lkey, raddr, rkey, len, /*wr_id=*/0)) return false;
+    int n = PollCq(q->cq, wc, 16, &bad);
+    return n > 0;
+  };
+
+  std::vector<uint64_t> last_seen(my_num_brokers, kPublishUncommitted);
+  std::vector<uint64_t> cv_dirty_since_flush(my_num_brokers, kPublishUncommitted);
+
+  const auto t_start = std::chrono::steady_clock::now();
+  const auto deadline = t_start + std::chrono::seconds(duration_secs);
+  auto last_cb_flush = t_start;
+
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!blocking_read(&meta_qp, sentinel_local.data(), sentinel_local_mr.lkey(),
+                       remote.sentinel.addr + static_cast<uint64_t>(broker_lo) * sizeof(SentinelSlot),
+                       remote.sentinel.rkey, static_cast<uint32_t>(my_num_brokers * sizeof(uint64_t)))) {
+      fprintf(stderr, "[seq-worker %d] sentinel-array READ failed\n", thread_id); break;
+    }
+    ++out->sentinel_polls;
+    const uint64_t poll_ts = NowNsLocal();
+
+    std::vector<WorkItem> work;
+    for (int lb = 0; lb < my_num_brokers; ++lb) {
+      const int b = broker_lo + lb;
+      const uint64_t sv = sentinel_local[lb];
+      if (sv == kPublishUncommitted || sv == last_seen[lb]) continue;
+      uint64_t range_start = (last_seen[lb] == kPublishUncommitted) ? sv : last_seen[lb] + 1;
+      if (sv - range_start >= static_cast<uint64_t>(pbr_slots)) {
+        out->stale_misses += (sv - range_start) - static_cast<uint64_t>(pbr_slots) + 1;
+        range_start = sv - static_cast<uint64_t>(pbr_slots) + 1;
+      }
+      last_seen[lb] = sv;
+      for (uint64_t seq = range_start; seq <= sv; ++seq) work.push_back({b, seq});
+    }
+    if (work.empty()) continue;
+
+    pipelined_ops(
+        &meta_qp, work.size(),
+        [&](size_t i) {
+          const WorkItem& w = work[i];
+          const uint64_t slot = w.seq % static_cast<uint64_t>(pbr_slots);
+          const uint64_t slot_addr = remote.pbr.addr +
+              static_cast<uint64_t>(w.broker) * remote.pbr_ring_bytes_per_broker +
+              slot * sizeof(BatchHeaderMirror);
+          return PostRead(&meta_qp, &header_buf[i % kWindow], header_buf_mr.lkey(), slot_addr,
+                          remote.pbr.rkey, sizeof(BatchHeaderMirror), /*wr_id=*/i);
+        },
+        [&](size_t i) {
+          WorkItem& w = work[i];
+          const BatchHeaderMirror& h = header_buf[i % kWindow];
+          if (!HeaderPublishCommitted(h) || h.pbr_absolute_index != w.seq) {
+            ++out->stale_misses;
+            return;
+          }
+          w.header_valid = true;
+          w.log_idx = h.log_idx;
+          w.total_size = h.total_size;
+          w.client_id = h.client_id;
+          w.batch_seq = h.batch_seq;
+        });
+
+    std::vector<size_t> valid_idx;
+    for (size_t i = 0; i < work.size(); ++i) if (work[i].header_valid) valid_idx.push_back(i);
+    if (valid_idx.empty()) continue;
+
+    std::vector<size_t> committed;
+    committed.reserve(valid_idx.size());
+    pipelined_ops(
+        &meta_qp, valid_idx.size(),
+        [&](size_t j) {
+          const WorkItem& w = work[valid_idx[j]];
+          const uint32_t len = static_cast<uint32_t>(std::min<uint64_t>(w.total_size, kMaxPayload));
+          uint8_t* laddr = payload_buf.data() + (j % kWindow) * kMaxPayload;
+          const uint64_t blog_base = remote.blog.addr +
+              static_cast<uint64_t>(w.broker) * remote.blog_bytes_per_broker;
+          return PostRead(&meta_qp, laddr, payload_buf_mr.lkey(),
+                          blog_base + (w.log_idx % remote.blog_bytes_per_broker), remote.blog.rkey, len,
+                          /*wr_id=*/j);
+        },
+        [&](size_t j) {
+          const WorkItem& w = work[valid_idx[j]];
+          out->blog_bytes_read += w.total_size;
+          ++out->batches;
+          const int lb = w.broker - broker_lo;
+          if (cv_dirty_since_flush[lb] == kPublishUncommitted || w.seq + 1 > cv_dirty_since_flush[lb]) {
+            cv_dirty_since_flush[lb] = w.seq + 1;
+          }
+          out->detect_to_commit.Add(NowNsLocal() - poll_ts);
+          committed.push_back(valid_idx[j]);
+        });
+    if (committed.empty()) continue;
+    std::sort(committed.begin(), committed.end());
+
+    pipelined_ops(
+        &meta_qp, committed.size(),
+        [&](size_t k) {
+          const WorkItem& w = work[committed[k]];
+          uint64_t order = g_committed_seq->fetch_add(1) + 1;
+          GoiEntryMirror& g = goi_buf[k % kWindow];
+          g.total_order = order;
+          g.batch_seq = w.batch_seq;
+          g.client_id = w.client_id;
+          g.broker_id = static_cast<uint32_t>(w.broker);
+          g.log_idx = w.log_idx;
+          g.total_size = w.total_size;
+          const uint64_t goi_addr = remote.goi.addr +
+              (order % static_cast<uint64_t>(remote.goi_entries)) * sizeof(GoiEntryMirror);
+          return PostWrite(&meta_qp, &g, goi_buf_mr.lkey(), goi_addr, remote.goi.rkey,
+                           sizeof(GoiEntryMirror), /*wr_id=*/k);
+        },
+        [&](size_t /*k*/) {});
+
+    int cv_posted = 0;
+    for (int lb = 0; lb < my_num_brokers; ++lb) {
+      if (cv_dirty_since_flush[lb] == kPublishUncommitted) continue;
+      cv_buf[lb].ack_offset = cv_dirty_since_flush[lb];
+      cv_dirty_since_flush[lb] = kPublishUncommitted;
+      const uint64_t cv_addr = remote.cv.addr +
+          static_cast<uint64_t>(broker_lo + lb) * sizeof(CompletionVectorEntryMirror);
+      PostWrite(&meta_qp, &cv_buf[lb], cv_buf_mr.lkey(), cv_addr, remote.cv.rkey,
+                sizeof(CompletionVectorEntryMirror), /*wr_id=*/1);
+      ++cv_posted;
+    }
+    // Only thread 0 (the aggregator) periodically writes ControlBlock, reading the shared
+    // atomic's CURRENT value -- avoids every worker racing to write the SAME single field from
+    // DIFFERENT, unordered QPs (RDMA WRITE ordering is only guaranteed same-QP).
+    bool cb_posted = false;
+    if (is_aggregator &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - last_cb_flush).count() > 0.005) {
+      cb_local.committed_seq = g_committed_seq->load();
+      PostWrite(&meta_qp, &cb_local, cb_local_mr.lkey(), remote.control.addr, remote.control.rkey,
+                sizeof(ControlBlockMirror), /*wr_id=*/2);
+      cb_posted = true;
+      last_cb_flush = std::chrono::steady_clock::now();
+    }
+    int drained = 0;
+    const int expected = cv_posted + (cb_posted ? 1 : 0);
+    while (drained < expected) {
+      int n = PollCq(meta_qp.cq, wc, 16, &bad);
+      if (n < 0) break;
+      drained += n;
+    }
+  }
+
+  DeregisterMr(&sentinel_local_mr); DeregisterMr(&header_buf_mr); DeregisterMr(&payload_buf_mr);
+  DeregisterMr(&goi_buf_mr); DeregisterMr(&cv_buf_mr);
+  if (is_aggregator) DeregisterMr(&cb_local_mr);
+  DestroyRcQp(&meta_qp);
+}
+
+int RunMultithreadedW5B(int argc, char** argv) {
+  std::string memserver_ip = GetArg(argc, argv, "--memserver-ip", "");
+  int memserver_port = atoi(GetArg(argc, argv, "--memserver-port", "18600"));
+  int num_brokers = atoi(GetArg(argc, argv, "--num-brokers", "2"));
+  int pbr_slots = atoi(GetArg(argc, argv, "--pbr-slots", "4096"));
+  int duration_secs = atoi(GetArg(argc, argv, "--duration", "10"));
+  int seq_threads = atoi(GetArg(argc, argv, "--seq-threads", "1"));
+  std::string dev = GetArg(argc, argv, "--dev", "mlx5_0");
+  int gid = atoi(GetArg(argc, argv, "--gid", "-1"));
+  if (seq_threads > num_brokers) seq_threads = num_brokers;  // no point in an idle thread
+
+  fprintf(stderr, "[sequencer] placement=MEMSERVER(W5-B) MULTI-THREADED num_brokers=%d "
+                  "seq_threads=%d duration=%ds\n", num_brokers, seq_threads, duration_secs);
+
+  DeviceCtx d{};
+  if (!OpenDevice(dev, gid, 1, &d)) return 1;
+
+  std::atomic<uint64_t> g_committed_seq{0};
+  std::vector<SeqThreadStats> stats(seq_threads);
+  std::vector<std::thread> workers;
+  const int base = num_brokers / seq_threads, rem = num_brokers % seq_threads;
+  int lo = 0;
+  for (int t = 0; t < seq_threads; ++t) {
+    int count = base + (t < rem ? 1 : 0);
+    int hi = lo + count;
+    workers.emplace_back(SeqWorkerW5B, t, &d, memserver_ip, memserver_port, pbr_slots,
+                         duration_secs, lo, hi, &g_committed_seq, /*is_aggregator=*/t == 0,
+                         &stats[t]);
+    lo = hi;
+  }
+  for (auto& th : workers) th.join();
+
+  uint64_t total_batches = 0, total_bytes = 0, total_polls = 0, total_stale = 0;
+  LatencyStats combined;
+  for (auto& s : stats) {
+    total_batches += s.batches;
+    total_bytes += s.blog_bytes_read;
+    total_polls += s.sentinel_polls;
+    total_stale += s.stale_misses;
+    for (uint64_t v : s.detect_to_commit.s) combined.Add(v);
+  }
+  fprintf(stderr,
+          "[sequencer] RESULT batches=%lu blog_bytes=%lu secs=%d throughput=%.3f Mmsg/s "
+          "%.3f Gb/s sentinel_polls=%lu poll_rate=%.1f/s stale_misses=%lu unrecoverable_bytes=0 "
+          "detect_to_commit_p50_us=%.1f p99_us=%.1f p999_us=%.1f seq_threads=%d\n",
+          (unsigned long)total_batches, (unsigned long)total_bytes, duration_secs,
+          total_batches / static_cast<double>(duration_secs) / 1e6,
+          (total_bytes * 8.0) / duration_secs / 1e9, (unsigned long)total_polls,
+          total_polls / static_cast<double>(duration_secs), (unsigned long)total_stale,
+          combined.Pct(0.50) / 1e3, combined.Pct(0.99) / 1e3, combined.Pct(0.999) / 1e3, seq_threads);
+
+  CloseDevice(&d);
+  return 0;
+}
+#endif  // !BLOG_PLACEMENT_DRAM
+
 int main(int argc, char** argv) {
+#if !BLOG_PLACEMENT_DRAM
+  // Sub-phase 3A item 2: --seq-threads>1 dispatches to the multi-threaded W5-B path entirely,
+  // bypassing everything below. W5-A always takes the original single-threaded path (Phase 2's
+  // dead-broker/lease-timeout logic is untouched regardless of this flag).
+  if (atoi(GetArg(argc, argv, "--seq-threads", "1")) > 1) return RunMultithreadedW5B(argc, argv);
+#endif
   std::string memserver_ip = GetArg(argc, argv, "--memserver-ip", "");
   int memserver_port = atoi(GetArg(argc, argv, "--memserver-port", "18600"));
   int num_brokers = atoi(GetArg(argc, argv, "--num-brokers", "2"));
@@ -250,21 +568,47 @@ int main(int argc, char** argv) {
   // still delivered to on_complete before reporting the error (ibv_poll_cq can return a mixed
   // batch; only the bad entry and anything after it in that batch is lost, to be picked up by the
   // caller's retry logic).
+  // [[BUG FOUND: G1]] The original error path `return false` the INSTANT a bad WC was seen,
+  // leaving this attempt's remaining outstanding WRs (posted-completed, up to kWindow=64) sitting
+  // UNDRAINED in the CQ. Step 4's retry loop then calls pipelined_ops AGAIN with a NEW, smaller
+  // `pending` list, reusing wr_id 0..new_count-1 from scratch. blog_shared_cq is SHARED across
+  // every broker's QP, so the retry's very first ibv_poll_cq call can return one of THOSE stale
+  // leftover completions — its wr_id gets reinterpreted as an index into the RETRY's `pending`
+  // array (a completely different item), silently corrupting `committed`/`on_complete` with the
+  // wrong work item. Never surfaced at Phase 2's 60% load because pipelined_ops essentially never
+  // hit its error path there; WILL fire under Phase 3's higher/backlogged load where multi-attempt
+  // retries against a dead broker's QP are the norm, not a rare edge case.
+  // Fix: once an error is seen, stop posting new work but keep polling — and keep delivering GOOD
+  // completions to on_complete as they arrive — until every WR this call ever posted has been
+  // accounted for (completed == posted), so the CQ is fully drained before returning. A retry's
+  // fresh wr_id space can then never collide with anything left over from this attempt.
   auto pipelined_ops = [&](RcQp* q, size_t count, auto&& post_one, auto&& on_complete,
                            auto&& on_error) -> bool {
     size_t posted = 0, completed = 0;
-    while (completed < count) {
-      while (posted < count && (posted - completed) < static_cast<size_t>(kWindow)) {
-        if (!post_one(posted)) {
-          fprintf(stderr, "[sequencer] pipelined op post failed at index %zu\n", posted);
-          return false;
+    bool had_error = false;
+    while (completed < posted || (!had_error && posted < count)) {
+      if (!had_error) {
+        while (posted < count && (posted - completed) < static_cast<size_t>(kWindow)) {
+          if (!post_one(posted)) {
+            fprintf(stderr, "[sequencer] pipelined op post failed at index %zu\n", posted);
+            had_error = true;
+            break;
+          }
+          ++posted;
         }
-        ++posted;
+      }
+      if (completed == posted) {
+        if (had_error) break;  // fully drained after an error -> done
+        continue;              // posted<count but nothing outstanding yet -> post more
       }
       int n = ibv_poll_cq(q->cq, 16, wc);
-      if (n < 0) { fprintf(stderr, "[sequencer] pipelined op poll_cq error\n"); return false; }
+      if (n < 0) {
+        fprintf(stderr, "[sequencer] pipelined op poll_cq FATAL error, forcing drain\n");
+        had_error = true;
+        completed = posted;  // a broken CQ won't yield any more completions; stop waiting for one
+        break;
+      }
       if (n == 0) continue;
-      bool had_error = false;
       for (int i = 0; i < n; ++i) {
         if (wc[i].status != IBV_WC_SUCCESS) {
           fprintf(stderr,
@@ -273,15 +617,14 @@ int main(int argc, char** argv) {
                   static_cast<unsigned long long>(wc[i].wr_id));
           on_error(wc[i].qp_num);
           had_error = true;
-          break;  // stop processing this batch; anything after (incl. this entry) is lost, the
-                  // caller's retry logic picks up whatever didn't complete
+          ++completed;  // this WR slot is accounted for (drained); do NOT deliver it
+          continue;
         }
         on_complete(static_cast<size_t>(wc[i].wr_id));
         ++completed;
       }
-      if (had_error) return false;
     }
-    return true;
+    return !had_error;
   };
 
   std::vector<uint64_t> last_seen(num_brokers, kPublishUncommitted);
@@ -458,6 +801,17 @@ int main(int argc, char** argv) {
 #endif
           },
           [&](size_t j) {
+            // [[G1 defense-in-depth]] pipelined_ops now fully drains an aborted attempt before
+            // returning (see the fix there), which should make this unreachable — but this
+            // callback is exactly the one a stale cross-attempt wr_id would corrupt if that
+            // invariant were ever violated by a future change, so guard it explicitly rather than
+            // trust the drain alone.
+            if (j >= pending.size()) {
+              fprintf(stderr, "[sequencer] BUG-GUARD: blog-read on_complete got out-of-range "
+                              "wr_id=%zu (pending.size()=%zu this attempt) -- dropping\n",
+                      j, pending.size());
+              return;
+            }
             const WorkItem& w = work[pending[j]];
             blog_bytes_read += w.total_size;
             ++batches;
