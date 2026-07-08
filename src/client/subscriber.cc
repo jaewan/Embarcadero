@@ -4,6 +4,7 @@
 #include "common/wire_formats.h"
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <iomanip>
 #include <set>
@@ -1500,6 +1501,7 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		 (force_ordered_consume_stream ||
 		  (!measure_latency_ && !BenchmarkPollOnlyRuntime())));
 	const bool partial_flush_enabled = (order_level_ >= 1);
+	StreamParseState ordered_consume_parse_state;
 
 	// --- Main receive loop (Simplified - Blocking recv) ---
 	while (!shutdown_.load(std::memory_order_acquire)) {
@@ -1604,20 +1606,19 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 					MaxAssign(conn_buffers->delivery_diag.max_buffer_age_us,
 					          static_cast<uint64_t>(std::max<long long>(0, recv_buffer_age_us)));
 				}
-				if (feed_ordered_consume_stream) {
-					const auto* chunk_begin = static_cast<uint8_t*>(write_ptr);
+				if (feed_ordered_consume_stream && delivery_diag_enabled) {
 					const size_t chunk_len = static_cast<size_t>(bytes_received);
-					ReserveForAppend(conn_buffers->ordered_stream_pending, chunk_len);
-					conn_buffers->ordered_stream_pending.insert(
-						conn_buffers->ordered_stream_pending.end(),
-						chunk_begin,
-						chunk_begin + chunk_len);
 					conn_buffers->delivery_diag.ordered_stream_feed_calls++;
 					conn_buffers->delivery_diag.ordered_stream_feed_bytes += chunk_len;
 					MaxAssign(conn_buffers->delivery_diag.ordered_stream_max_pending_bytes,
-					          static_cast<uint64_t>(conn_buffers->ordered_stream_pending.size()));
-					consume_cv_.SignalAll();
+					          static_cast<uint64_t>(chunk_len));
 				}
+			}
+			if (feed_ordered_consume_stream) {
+				ParseAndStageOrderedBytes(
+					ordered_consume_parse_state,
+					static_cast<const uint8_t*>(write_ptr),
+					static_cast<size_t>(bytes_received));
 			}
 			// Record Timestamp and NEW Offset
 			if (measure_latency_) {
@@ -2470,203 +2471,237 @@ void* Subscriber::Consume(int timeout_ms) {
     return nullptr;
 }
 
-void* Subscriber::ConsumeOrdered(int timeout_ms) {
-	auto start_time = std::chrono::steady_clock::now();
-	auto timeout = std::chrono::milliseconds(timeout_ms);
-	const int64_t wait_us = ConsumeOrderedWaitUs();
+void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state, const uint8_t* data, size_t len) {
+	if (data == nullptr || len == 0) {
+		return;
+	}
 
-	// Release previously returned owned message (valid until next Consume call)
-	last_returned_.reset();
+	constexpr size_t kMaxStreamBufferBytes = 64UL << 20; // 64 MB safety cap
+	ReserveForAppend(state.buffer, len);
+	state.buffer.insert(state.buffer.end(), data, data + len);
+	if (state.buffer.size() > kMaxStreamBufferBytes) {
+		LOG(WARNING) << "ConsumeOrdered: stream buffer exceeded cap, dropping "
+		             << state.buffer.size() << " bytes";
+		state.buffer.clear();
+		state.has_pending_metadata = false;
+		state.current_batch_messages_processed = 0;
+		state.next_message_order_in_batch = 0;
+		return;
+	}
 
-	auto return_ready_message = [&]() -> void* {
-		auto it = pending_messages_.find(next_expected_order_);
-		if (it == pending_messages_.end()) {
-			return nullptr;
-		}
-		last_returned_ = std::move(it->second);
-		pending_messages_.erase(it);
-		void* ret = last_returned_ ? static_cast<void*>(last_returned_->data.data()) : nullptr;
-		if (ret) {
-			last_consumed_wire_version_ = last_returned_->header_version;
-			next_expected_order_++;
-			return ret;
-		}
-		return nullptr;
-	};
+	std::vector<std::pair<size_t, std::unique_ptr<OwnedMessage>>> parsed_messages;
+	parsed_messages.reserve(std::min<size_t>((len / 1024) + 1, 4096));
 
-	auto parse_stream = [&](StreamParseState& state) {
-		constexpr size_t kMaxStreamBufferBytes = 64UL << 20; // 64 MB safety cap
-		if (state.buffer.size() > kMaxStreamBufferBytes) {
-			LOG(WARNING) << "ConsumeOrdered: stream buffer exceeded cap, dropping "
-			             << state.buffer.size() << " bytes";
-			state.buffer.clear();
-			state.has_pending_metadata = false;
-			state.current_batch_messages_processed = 0;
-			state.next_message_order_in_batch = 0;
-			return;
-		}
-
-		size_t pos = 0;
-		const size_t buf_size = state.buffer.size();
-		while (pos < buf_size) {
-			if (!state.has_pending_metadata) {
-				if (buf_size - pos < sizeof(Embarcadero::wire::BatchMetadata)) {
-					break;
-				}
-				const auto* meta = reinterpret_cast<const Embarcadero::wire::BatchMetadata*>(
-					state.buffer.data() + pos);
-				if (Embarcadero::wire::IsValidHeaderVersion(meta->header_version) &&
-				    meta->num_messages > 0 &&
-				    meta->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
-				    meta->batch_total_order < Embarcadero::wire::MAX_BATCH_TOTAL_ORDER) {
-					state.pending_metadata = *meta;
-					state.has_pending_metadata = true;
-					state.current_batch_messages_processed = 0;
-					state.next_message_order_in_batch = meta->batch_total_order;
-					pos += sizeof(Embarcadero::wire::BatchMetadata);
-					continue;
-				}
-				// Resync: advance by 8 bytes to find next metadata boundary
-				pos += 8;
-				continue;
-			}
-
-			const uint16_t header_version = state.pending_metadata.header_version;
-			if (header_version == Embarcadero::wire::HEADER_VERSION_V2) {
-				if (buf_size - pos < sizeof(Embarcadero::BlogMessageHeader)) {
-					break;
-				}
-				const auto* hdr = reinterpret_cast<const Embarcadero::BlogMessageHeader*>(
-					state.buffer.data() + pos);
-				const size_t payload_size = hdr->size;
-				if (payload_size == 0 ||
-				    payload_size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
-					// Clearly invalid header: attempt resync.
-					pos += 8;
-					continue;
-				}
-				const size_t stride = Embarcadero::wire::ComputeStrideV2(payload_size);
-				if (buf_size - pos < stride) {
-					// Valid header but incomplete frame: wait for more bytes.
-					break;
-				}
-
-				auto msg = std::make_unique<OwnedMessage>();
-				msg->header_version = header_version;
-				msg->data.assign(state.buffer.begin() + pos, state.buffer.begin() + pos + stride);
-				auto* msg_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg->data.data());
-				if (msg_hdr->total_order == 0) {
-					msg_hdr->total_order = state.next_message_order_in_batch;
-				}
-					size_t total_order = msg_hdr->total_order;
-					state.next_message_order_in_batch = total_order + 1;
-					state.current_batch_messages_processed++;
-					{
-						auto ins = pending_messages_.try_emplace(total_order, std::move(msg));
-						if (!ins.second) {
-							VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
-							        << " (keeping first)";
-						}
-					}
-
-					if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
-						state.has_pending_metadata = false;
-					}
-					pos += stride;
-					continue;
-				}
-
-			// Header version v1 (MessageHeader)
-			if (buf_size - pos < sizeof(Embarcadero::MessageHeader)) {
+	size_t pos = 0;
+	const size_t buf_size = state.buffer.size();
+	while (pos < buf_size) {
+		if (!state.has_pending_metadata) {
+			if (buf_size - pos < sizeof(Embarcadero::wire::BatchMetadata)) {
 				break;
 			}
-			const auto* hdr = reinterpret_cast<const Embarcadero::MessageHeader*>(
+			const auto* meta = reinterpret_cast<const Embarcadero::wire::BatchMetadata*>(
 				state.buffer.data() + pos);
-			const size_t padded_size = hdr->paddedSize;
-			const bool invalid_v1_header =
-				padded_size < Embarcadero::wire::V1_HEADER_SIZE ||
-				padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
-				(padded_size % 64 != 0);
-			if (invalid_v1_header) {
+			if (Embarcadero::wire::IsValidHeaderVersion(meta->header_version) &&
+			    meta->num_messages > 0 &&
+			    meta->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
+			    meta->batch_total_order < Embarcadero::wire::MAX_BATCH_TOTAL_ORDER) {
+				state.pending_metadata = *meta;
+				state.has_pending_metadata = true;
+				state.current_batch_messages_processed = 0;
+				state.next_message_order_in_batch = meta->batch_total_order;
+				pos += sizeof(Embarcadero::wire::BatchMetadata);
+				continue;
+			}
+			pos += 8;
+			continue;
+		}
+
+		const uint16_t header_version = state.pending_metadata.header_version;
+		if (header_version == Embarcadero::wire::HEADER_VERSION_V2) {
+			if (buf_size - pos < sizeof(Embarcadero::BlogMessageHeader)) {
+				break;
+			}
+			const auto* hdr = reinterpret_cast<const Embarcadero::BlogMessageHeader*>(
+				state.buffer.data() + pos);
+			const size_t payload_size = hdr->size;
+			if (payload_size == 0 ||
+			    payload_size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
 				pos += 8;
 				continue;
 			}
-			if (buf_size - pos < padded_size) {
-				// Valid header but incomplete frame: wait for more bytes.
+			const size_t stride = Embarcadero::wire::ComputeStrideV2(payload_size);
+			if (buf_size - pos < stride) {
 				break;
 			}
 
 			auto msg = std::make_unique<OwnedMessage>();
 			msg->header_version = header_version;
-			msg->data.assign(state.buffer.begin() + pos, state.buffer.begin() + pos + padded_size);
-			auto* msg_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(msg->data.data());
+			msg->data.assign(state.buffer.begin() + pos, state.buffer.begin() + pos + stride);
+			auto* msg_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg->data.data());
 			if (msg_hdr->total_order == 0) {
 				msg_hdr->total_order = state.next_message_order_in_batch;
 			}
-				size_t total_order = msg_hdr->total_order;
-				state.next_message_order_in_batch = total_order + 1;
-				state.current_batch_messages_processed++;
-				{
-					auto ins = pending_messages_.try_emplace(total_order, std::move(msg));
-					if (!ins.second) {
-						VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
-						        << " (keeping first)";
-					}
-				}
-
-				if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
-					state.has_pending_metadata = false;
-				}
-				pos += padded_size;
+			const size_t total_order = msg_hdr->total_order;
+			state.next_message_order_in_batch = total_order + 1;
+			state.current_batch_messages_processed++;
+			if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
+				state.has_pending_metadata = false;
 			}
-
-		if (pos > 0) {
-			state.buffer.erase(state.buffer.begin(), state.buffer.begin() + pos);
+			pos += stride;
+			parsed_messages.emplace_back(total_order, std::move(msg));
+			continue;
 		}
-	};
+
+		if (buf_size - pos < sizeof(Embarcadero::MessageHeader)) {
+			break;
+		}
+		const auto* hdr = reinterpret_cast<const Embarcadero::MessageHeader*>(
+			state.buffer.data() + pos);
+		const size_t padded_size = hdr->paddedSize;
+		const bool invalid_v1_header =
+			padded_size < Embarcadero::wire::V1_HEADER_SIZE ||
+			padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
+			(padded_size % 64 != 0);
+		if (invalid_v1_header) {
+			pos += 8;
+			continue;
+		}
+		if (buf_size - pos < padded_size) {
+			break;
+		}
+
+		auto msg = std::make_unique<OwnedMessage>();
+		msg->header_version = header_version;
+		msg->data.assign(state.buffer.begin() + pos, state.buffer.begin() + pos + padded_size);
+		auto* msg_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(msg->data.data());
+		if (msg_hdr->total_order == 0) {
+			msg_hdr->total_order = state.next_message_order_in_batch;
+		}
+		const size_t total_order = msg_hdr->total_order;
+		state.next_message_order_in_batch = total_order + 1;
+		state.current_batch_messages_processed++;
+		if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
+			state.has_pending_metadata = false;
+		}
+		pos += padded_size;
+		parsed_messages.emplace_back(total_order, std::move(msg));
+	}
+
+	if (pos > 0) {
+		state.buffer.erase(
+			state.buffer.begin(),
+			state.buffer.begin() + static_cast<std::vector<uint8_t>::difference_type>(pos));
+	}
+
+	if (!parsed_messages.empty()) {
+		StageOrderedMessages(std::move(parsed_messages));
+	}
+}
+
+void Subscriber::StageOrderedMessages(
+		std::vector<std::pair<size_t, std::unique_ptr<OwnedMessage>>> messages) {
+	if (messages.empty()) {
+		return;
+	}
+
+	bool ready_to_consume = false;
+	{
+		absl::MutexLock lock(&consume_mutex_);
+		for (auto& [total_order, msg] : messages) {
+			if (!msg || total_order < next_expected_order_) {
+				continue;
+			}
+			if (pending_messages_.empty()) {
+				pending_messages_base_order_ = next_expected_order_;
+			}
+			if (pending_messages_base_order_ < next_expected_order_) {
+				const size_t stale_count = std::min(
+					next_expected_order_ - pending_messages_base_order_,
+					pending_messages_.size());
+				for (size_t i = 0; i < stale_count; ++i) {
+					pending_messages_.pop_front();
+				}
+				pending_messages_base_order_ += stale_count;
+				if (pending_messages_.empty()) {
+					pending_messages_base_order_ = next_expected_order_;
+				}
+			}
+			if (total_order < pending_messages_base_order_) {
+				continue;
+			}
+			const size_t index = total_order - pending_messages_base_order_;
+			if (index >= pending_messages_.size()) {
+				pending_messages_.resize(index + 1);
+			}
+			if (pending_messages_[index]) {
+				VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
+				        << " (keeping first)";
+				continue;
+			}
+			pending_messages_[index] = std::move(msg);
+		}
+		ready_to_consume =
+			!pending_messages_.empty() &&
+			pending_messages_base_order_ == next_expected_order_ &&
+			pending_messages_.front() != nullptr;
+		if (ready_to_consume) {
+			consume_cv_.SignalAll();
+		}
+	}
+}
+
+void* Subscriber::TryPopOrderedMessageLocked() {
+	if (pending_messages_.empty()) {
+		pending_messages_base_order_ = next_expected_order_;
+		return nullptr;
+	}
+	if (pending_messages_base_order_ < next_expected_order_) {
+		const size_t stale_count = std::min(
+			next_expected_order_ - pending_messages_base_order_,
+			pending_messages_.size());
+		for (size_t i = 0; i < stale_count; ++i) {
+			pending_messages_.pop_front();
+		}
+		pending_messages_base_order_ += stale_count;
+		if (pending_messages_.empty()) {
+			pending_messages_base_order_ = next_expected_order_;
+			return nullptr;
+		}
+	}
+	if (pending_messages_base_order_ != next_expected_order_ ||
+	    !pending_messages_.front()) {
+		return nullptr;
+	}
+	last_returned_ = std::move(pending_messages_.front());
+	pending_messages_.pop_front();
+	pending_messages_base_order_++;
+	void* ret = last_returned_ ? static_cast<void*>(last_returned_->data.data()) : nullptr;
+	if (ret) {
+		last_consumed_wire_version_ = last_returned_->header_version;
+		next_expected_order_++;
+		return ret;
+	}
+	return nullptr;
+}
+
+void* Subscriber::ConsumeOrdered(int timeout_ms) {
+	auto start_time = std::chrono::steady_clock::now();
+	auto timeout = std::chrono::milliseconds(timeout_ms);
+	const int64_t wait_us = ConsumeOrderedWaitUs();
+
+	{
+		absl::MutexLock lock(&consume_mutex_);
+		last_returned_.reset();
+	}
 
 	while (std::chrono::steady_clock::now() - start_time < timeout) {
-		if (void* ret = return_ready_message()) {
+		absl::MutexLock lock(&consume_mutex_);
+		if (void* ret = TryPopOrderedMessageLocked()) {
 			return ret;
 		}
-
-		// Pull any newly received bytes into per-connection stream buffers.
-		// ORDER>=2 consumers read from this stream path directly rather than
-		// depending on dual-buffer readiness heuristics.
-		{
-			absl::ReaderMutexLock map_lock(&connection_map_mutex_);
-			for (auto const& [fd, conn_ptr] : connections_) {
-				if (!conn_ptr) continue;
-				auto& state = parse_states_[fd];
-				absl::MutexLock lock(&conn_ptr->state_mutex);
-				if (!conn_ptr->ordered_stream_pending.empty()) {
-					const size_t drained_bytes = conn_ptr->ordered_stream_pending.size();
-					ReserveForAppend(state.buffer, drained_bytes);
-					state.buffer.insert(
-						state.buffer.end(),
-						conn_ptr->ordered_stream_pending.begin(),
-						conn_ptr->ordered_stream_pending.end());
-					conn_ptr->ordered_stream_pending.clear();
-					conn_ptr->delivery_diag.ordered_stream_drain_calls++;
-					conn_ptr->delivery_diag.ordered_stream_drain_bytes +=
-						static_cast<uint64_t>(drained_bytes);
-				}
-			}
-		}
-
-		// Parse available data
-		for (auto& kv : parse_states_) {
-			parse_stream(kv.second);
-		}
-
-		// Return next expected message if ready
-		if (void* ret = return_ready_message()) {
+		consume_cv_.WaitWithTimeout(&consume_mutex_, absl::Microseconds(wait_us));
+		if (void* ret = TryPopOrderedMessageLocked()) {
 			return ret;
-		}
-
-		{
-			absl::MutexLock wait_lock(&consume_mutex_);
-			consume_cv_.WaitWithTimeout(&consume_mutex_, absl::Microseconds(wait_us));
 		}
 	}
 

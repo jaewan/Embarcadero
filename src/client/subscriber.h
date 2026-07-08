@@ -6,8 +6,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdint>
-#include <map>
+#include <deque>
 #include <memory>
+#include <utility>
 #include <vector>
 
 class Subscriber;
@@ -81,7 +82,6 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	absl::CondVar receiver_can_write_cv; // Notifies receiver the *other* buffer is free
 
 	std::vector<RecvLogEntry> recv_log ABSL_GUARDED_BY(state_mutex);
-	std::vector<uint8_t> ordered_stream_pending ABSL_GUARDED_BY(state_mutex);
 	// Incremental latency parsing state so StoreLatency() does not depend on
 	// retention of full connection buffers across swaps.
 	std::vector<uint8_t> latency_parse_pending ABSL_GUARDED_BY(state_mutex);
@@ -473,19 +473,19 @@ class Subscriber {
 			uint16_t header_version = Embarcadero::wire::HEADER_VERSION_V1;
 		};
 
-			struct StreamParseState {
-				std::vector<uint8_t> buffer;
-				bool has_pending_metadata = false;
-				Embarcadero::wire::BatchMetadata pending_metadata{};
+		struct StreamParseState {
+			std::vector<uint8_t> buffer;
+			bool has_pending_metadata = false;
+			Embarcadero::wire::BatchMetadata pending_metadata{};
 			size_t current_batch_messages_processed = 0;
 			size_t next_message_order_in_batch = 0;
 		};
 
-		size_t next_expected_order_{0};
-		std::map<size_t, std::unique_ptr<OwnedMessage>> pending_messages_;
+		size_t next_expected_order_ ABSL_GUARDED_BY(consume_mutex_){0};
+		std::deque<std::unique_ptr<OwnedMessage>> pending_messages_ ABSL_GUARDED_BY(consume_mutex_);
+		size_t pending_messages_base_order_ ABSL_GUARDED_BY(consume_mutex_){0};
 		std::unique_ptr<OwnedMessage> last_returned_;
 		uint16_t last_consumed_wire_version_{Embarcadero::wire::HEADER_VERSION_V1};
-		absl::flat_hash_map<int, StreamParseState> parse_states_;
 
 		// --- Order < 2 consume state (per-Subscriber, not static) ---
 		size_t next_expected_order_weak_{0};
@@ -498,8 +498,11 @@ class Subscriber {
 		// --- Private Methods ---
 		void SubscribeToClusterStatus(); // Runs in cluster_probe_thread_
 		void ManageBrokerConnections(int broker_id, const std::string& address); // Launches workers
-																																						 // Worker thread function (needs access to Subscriber instance)
+		// Worker thread function (needs access to Subscriber instance)
 		void ReceiveWorkerThread(int broker_id, int fd_to_handle);
+		void ParseAndStageOrderedBytes(StreamParseState& state, const uint8_t* data, size_t len);
+		void StageOrderedMessages(std::vector<std::pair<size_t, std::unique_ptr<OwnedMessage>>> messages);
+		void* TryPopOrderedMessageLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
 		void* ConsumeOrdered(int timeout_ms);
 
 		// Helper to remove connection resources
