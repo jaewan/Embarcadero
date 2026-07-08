@@ -43,6 +43,15 @@ static bool ShouldEnableFrontierTrace() {
 	return enabled;
 }
 
+// [[ORDER5_COMMIT_PROFILE]] Opt-in wall-clock breakdown of CommitEpoch's internal phases
+// (GOI write, export-descriptor + size-recompute, per-client/CV metadata), to find where the
+// single-threaded EpochSequencerThread's commit path spends time relative to raw publish
+// throughput. Zero overhead when disabled beyond one relaxed atomic load per epoch.
+static bool ShouldEnableOrder5CommitProfile() {
+	static const bool enabled = ReadEnvBoolLenient("EMBAR_ORDER5_COMMIT_PROFILE", false);
+	return enabled;
+}
+
 static bool ShouldEnableOrder5SessionTestTrace() {
 	static const bool enabled =
 		ReadEnvBoolLenient("EMBARCADERO_TEST_ORDER5_SESSION_TRACE", false);
@@ -4377,6 +4386,10 @@ void Topic::CommitEpoch(
 		std::vector<PendingBatch5>& batch_list,
 		bool is_drain_mode) {
 
+	const bool commit_profile = ShouldEnableOrder5CommitProfile();
+	const auto commit_t_start = commit_profile ? std::chrono::steady_clock::now()
+	                                            : std::chrono::steady_clock::time_point{};
+
 	auto spatial_guard_reject = [&](PendingBatch5& p) {
 		if (p.skipped || p.is_held_marker) return false;
 		const uint32_t session_epoch = p.from_hold ? p.hold_meta.session_epoch : p.session_epoch;
@@ -4479,6 +4492,8 @@ void Topic::CommitEpoch(
 	// [COMMIT_DIAG] Count batches committed per broker this epoch
 	std::array<size_t, NUM_MAX_BROKERS> committed_this_epoch{};
 
+	const auto goi_loop_t_start = commit_profile ? std::chrono::steady_clock::now()
+	                                              : std::chrono::steady_clock::time_point{};
 	// [PHASE-3D] Regroup flushes for better pipeline utilization
 	// 1. Flush all GOI entries
 	for (PendingBatch5& p : ready) {
@@ -4581,18 +4596,29 @@ void Topic::CommitEpoch(
 		CXL::flush_cacheline(entry);
 		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);
 	}
-
+	if (commit_profile) {
+		order5_commit_goi_ns_.fetch_add(
+			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - goi_loop_t_start).count()),
+			std::memory_order_relaxed);
+	}
+	const auto export_loop_t_start = commit_profile ? std::chrono::steady_clock::now()
+	                                                 : std::chrono::steady_clock::time_point{};
 	// 2. Flush shared immutable export descriptors into the per-broker export ring.
 	// Non-head brokers must be able to export committed ORDER=5 batches without access to
 	// the head sequencer's process-local hold/export map, so every committed batch gets a
 	// descriptor written into shared memory keyed by PBR order.
 		size_t export_next_order = base_order;
-		// [E2] Compute the ORDER=5 recomputed batch size ONCE per batch here (step 2) and reuse it
-		// in the step-3 metadata loop, eliminating the second identical CXL payload walk. Indexed by
-		// position in `ready`; both loops bind references to the same vector, so &p - ready.data()
-		// yields the same index. Values are byte-identical to a second recompute (the BlogMessageHeader
-		// payload at log_idx is not mutated between the two loops), so this is behavior-preserving.
-		std::vector<size_t> order5_recomputed_size(ready.size(), 0);
+		// [[REMOVED: per-batch payload recompute]] This used to re-walk every message's header
+		// (RecomputeOrder5BatchSizeFromPayload) to defend against a stale/zero-initialized read of
+		// the cached total_size — that walk was ~94% of CommitEpoch's wall-clock time on the
+		// single-threaded EpochSequencerThread (measured via EMBAR_ORDER5_COMMIT_PROFILE), the
+		// actual ACKed-throughput ceiling. The real gap it defended against was a missing CXL
+		// flush for BlogMessageHeader (v2) payload bytes on ingest (network_manager.cc's
+		// [[CXL_VISIBILITY_FIX]] loop was v1-only); now that ingest flushes v2 message headers the
+		// same way, the cached total_size (m.total_size / p.cached_total_size — sourced from the
+		// client's own stride computation and flushed as part of the sentinel-gated BatchHeader) is
+		// trustworthy without re-deriving it here.
 		for (PendingBatch5& p : ready) {
 			if (p.skipped || p.is_held_marker) continue;
 			const bool from_hold = p.from_hold;
@@ -4601,10 +4627,7 @@ void Topic::CommitEpoch(
 			const size_t log_idx = from_hold ? hold->log_idx : p.cached_log_idx;
 			const uint32_t num_msg = from_hold ? hold->num_msg : p.num_msg;
 			const uint64_t pbr_abs = from_hold ? hold->pbr_absolute_index : p.cached_pbr_absolute_index;
-			const size_t batch_total_size = from_hold
-				? RecomputeOrder5BatchSizeFromPayload(cxl_addr_, hold->log_idx, hold->num_msg, hold->total_size)
-				: RecomputeOrder5BatchSizeFromPayload(cxl_addr_, p.cached_log_idx, p.num_msg, p.cached_total_size);
-			order5_recomputed_size[static_cast<size_t>(&p - ready.data())] = batch_total_size;
+			const size_t batch_total_size = from_hold ? hold->total_size : p.cached_total_size;
 			if (b >= 0 && b < NUM_MAX_BROKERS) {
 				const size_t batch_headers_offset = tinode_->offsets[b].batch_headers_offset;
 				if (batch_headers_offset != 0) {
@@ -4649,6 +4672,14 @@ void Topic::CommitEpoch(
 			}
 			export_next_order += num_msg;
 	}
+	if (commit_profile) {
+		order5_commit_export_ns_.fetch_add(
+			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - export_loop_t_start).count()),
+			std::memory_order_relaxed);
+	}
+	const auto metadata_loop_t_start = commit_profile ? std::chrono::steady_clock::now()
+	                                                   : std::chrono::steady_clock::time_point{};
 
 	// 3. Metadata updates (local accumulation)
 	goi_idx_order5 = 0;
@@ -4704,14 +4735,7 @@ void Topic::CommitEpoch(
 		{
 			OrderedHoldExportEntry ex;
 				ex.log_idx = m.log_idx;
-				ex.batch_size = order5_recomputed_size[static_cast<size_t>(&p - ready.data())];
-				if (ex.batch_size != m.total_size) {
-					LOG(WARNING) << "[ORDER5_HOLD_EXPORT_SIZE_FIX B" << b << "]"
-					             << " pbr=" << m.pbr_absolute_index
-					             << " num_msg=" << m.num_msg
-					             << " cached_total_size=" << m.total_size
-					             << " recomputed_total_size=" << ex.batch_size;
-				}
+				ex.batch_size = m.total_size;
 				ex.total_order = next_order;
 				ex.num_messages = m.num_msg;
 				ex.pbr_absolute_index = m.pbr_absolute_index;
@@ -4766,14 +4790,7 @@ void Topic::CommitEpoch(
 		{
 			OrderedHoldExportEntry ex;
 			ex.log_idx = p.cached_log_idx;
-			ex.batch_size = order5_recomputed_size[static_cast<size_t>(&p - ready.data())];
-			if (ex.batch_size != p.cached_total_size) {
-				LOG(WARNING) << "[ORDER5_EXPORT_SIZE_FIX B" << b << "]"
-				             << " pbr=" << p.cached_pbr_absolute_index
-				             << " num_msg=" << p.num_msg
-				             << " cached_total_size=" << p.cached_total_size
-				             << " recomputed_total_size=" << ex.batch_size;
-			}
+			ex.batch_size = p.cached_total_size;
 			ex.total_order = next_order - p.num_msg;
 			ex.num_messages = p.num_msg;
 			ex.pbr_absolute_index = p.cached_pbr_absolute_index;
@@ -4821,6 +4838,12 @@ void Topic::CommitEpoch(
 	for (const auto& [session_key, snapshot] : session_publish_epoch) {
 		PublishSessionEntry(session_key, snapshot);
 	}
+	if (commit_profile) {
+		order5_commit_metadata_ns_.fetch_add(
+			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - metadata_loop_t_start).count()),
+			std::memory_order_relaxed);
+	}
 	if (ShouldEnableFrontierTrace() && order_ == 5) {
 		static thread_local uint64_t last_frontier_log_ns = 0;
 		const uint64_t now_ns = SteadyNowNs();
@@ -4860,8 +4883,16 @@ void Topic::CommitEpoch(
 			base_batch_index_order5,
 			num_goi_order5);
 	}
+	const auto cv_flush_t_start = commit_profile ? std::chrono::steady_clock::now()
+	                                              : std::chrono::steady_clock::time_point{};
 	// [PHASE-3] Single fence for all CV updates
 	FlushAccumulatedCV(cv_max_cumulative, cv_max_pbr_index);
+	if (commit_profile) {
+		order5_commit_cv_flush_ns_.fetch_add(
+			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - cv_flush_t_start).count()),
+			std::memory_order_relaxed);
+	}
 
 	// Advance consumed_through for all remaining slots that were processed but not ready
 	AdvanceConsumedThroughForProcessedSlots(batch_list, contiguous_consumed_per_broker, broker_seen_in_epoch, nullptr, nullptr);
@@ -4878,6 +4909,16 @@ void Topic::CommitEpoch(
 		CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].batch_headers_consumed_through));
 	}
 	CXL::store_fence();
+
+	if (commit_profile) {
+		order5_commit_calls_.fetch_add(1, std::memory_order_relaxed);
+		order5_commit_batches_.fetch_add(ready.size(), std::memory_order_relaxed);
+		order5_commit_msgs_.fetch_add(total_msg, std::memory_order_relaxed);
+		order5_commit_total_ns_.fetch_add(
+			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - commit_t_start).count()),
+			std::memory_order_relaxed);
+	}
 }
 
 void Topic::EpochSequencerThread() {
@@ -4960,6 +5001,51 @@ void Topic::EpochSequencerThread() {
 				          << " deferred=" << shard_ptr->deferred_level5.size();
 			}
 		}
+	};
+	// [[ORDER5_COMMIT_PROFILE]] Periodic (1s) breakdown of CommitEpoch's internal wall-clock
+	// cost, to find why ACKed throughput can trail raw publish throughput on the ORDER=5
+	// EpochSequencerThread's single-threaded commit path. Deltas since the last print, so the
+	// numbers reflect recent load rather than a lifetime average that hides transients.
+	const bool commit_profile_enabled = (order_ == 5) && ShouldEnableOrder5CommitProfile();
+	auto last_commit_profile = std::chrono::steady_clock::now();
+	uint64_t last_cp_calls = 0, last_cp_batches = 0, last_cp_msgs = 0;
+	uint64_t last_cp_total_ns = 0, last_cp_goi_ns = 0, last_cp_export_ns = 0;
+	uint64_t last_cp_metadata_ns = 0, last_cp_cv_ns = 0;
+	auto emit_commit_profile = [&]() {
+		if (!commit_profile_enabled) return;
+		auto now = std::chrono::steady_clock::now();
+		if (now - last_commit_profile < std::chrono::seconds(1)) return;
+		last_commit_profile = now;
+		const uint64_t calls = order5_commit_calls_.load(std::memory_order_relaxed);
+		const uint64_t batches = order5_commit_batches_.load(std::memory_order_relaxed);
+		const uint64_t msgs = order5_commit_msgs_.load(std::memory_order_relaxed);
+		const uint64_t total_ns = order5_commit_total_ns_.load(std::memory_order_relaxed);
+		const uint64_t goi_ns = order5_commit_goi_ns_.load(std::memory_order_relaxed);
+		const uint64_t export_ns = order5_commit_export_ns_.load(std::memory_order_relaxed);
+		const uint64_t metadata_ns = order5_commit_metadata_ns_.load(std::memory_order_relaxed);
+		const uint64_t cv_ns = order5_commit_cv_flush_ns_.load(std::memory_order_relaxed);
+		const uint64_t d_calls = calls - last_cp_calls;
+		const uint64_t d_batches = batches - last_cp_batches;
+		const uint64_t d_msgs = msgs - last_cp_msgs;
+		const uint64_t d_total_ns = total_ns - last_cp_total_ns;
+		const uint64_t d_goi_ns = goi_ns - last_cp_goi_ns;
+		const uint64_t d_export_ns = export_ns - last_cp_export_ns;
+		const uint64_t d_metadata_ns = metadata_ns - last_cp_metadata_ns;
+		const uint64_t d_cv_ns = cv_ns - last_cp_cv_ns;
+		last_cp_calls = calls; last_cp_batches = batches; last_cp_msgs = msgs;
+		last_cp_total_ns = total_ns; last_cp_goi_ns = goi_ns; last_cp_export_ns = export_ns;
+		last_cp_metadata_ns = metadata_ns; last_cp_cv_ns = cv_ns;
+		if (d_calls == 0) return;
+		LOG(INFO) << "[ORDER5_COMMIT_PROFILE]"
+		          << " calls=" << d_calls
+		          << " batches=" << d_batches
+		          << " msgs=" << d_msgs
+		          << " avg_batch_sz=" << (d_batches ? (d_msgs / d_batches) : 0)
+		          << " total_ms=" << (d_total_ns / 1e6)
+		          << " goi_ms=" << (d_goi_ns / 1e6)
+		          << " export_ms=" << (d_export_ns / 1e6)
+		          << " metadata_ms=" << (d_metadata_ns / 1e6)
+		          << " cv_flush_ms=" << (d_cv_ns / 1e6);
 	};
 	uint64_t last_idle_diag_ns = 0;
 	// last_idle_progress_epoch removed: epoch advancement is not real progress
@@ -5120,6 +5206,7 @@ void Topic::EpochSequencerThread() {
 
 	while (!stop_threads_) {
 		emit_phase_diag("loop");
+		emit_commit_profile();
 		// [[EXPIRY_ARMING_LIVENESS_FIX]] Arm/track even while busy (internally 1 ms-gated).
 		run_idle_hold_tick(/*allow_inline_drain=*/false);
 		uint64_t last = last_sequenced_epoch_.load(std::memory_order_acquire);

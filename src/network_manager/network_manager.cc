@@ -1601,8 +1601,16 @@ void NetworkManager::HandlePublishRequest(
 			running = false;
 			break;
 		}
-		// [[BLOG_HEADER]] Skip v1 per-message validation when publisher sent BlogMessageHeader (v2).
-		// Applies to ORDER=0 and ORDER=5 with BlogHeader enabled; all other orders use MessageHeader.
+		// [[BLOG_HEADER]] v1 (MessageHeader) and v2 (BlogMessageHeader) both need every per-message
+		// header cacheline explicitly flushed to CXL before PublishPBRSlotDirect signals
+		// batch_complete=1 — recv() only lands these stores in this CPU's L1/L2 (see
+		// [[CXL_VISIBILITY_FIX]] below). v2 was previously skipped here on the assumption that
+		// "v1 per-message validation" was the only thing being skipped; in fact the flush itself
+		// was v1-only, leaving BlogMessageHeader payload bytes potentially stale/zero-initialized
+		// from CXL's perspective when read by a different thread later (the sequencer's per-batch
+		// size recompute, CommitEpoch's RecomputeOrder5BatchSizeFromPayload, silently falling back
+		// to BatchHeader::total_size whenever this manifested — the real root cause that fallback
+		// was papering over, not a producer/consumer stride-formula mismatch).
 		if (!is_blog_header_enabled) {
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
@@ -1631,6 +1639,35 @@ void NetworkManager::HandlePublishRequest(
 				remaining -= first_msg->paddedSize;
 				first_msg = reinterpret_cast<MessageHeader*>(
 					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
+				);
+			}
+		} else {
+			BlogMessageHeader* first_msg = reinterpret_cast<BlogMessageHeader*>(buf);
+			size_t remaining = batch_header.total_size;
+			// Same happens-before requirement as the v1 loop above: drain recv()'s stores before
+			// CLFLUSHOPT so CXL observes the freshly received per-message headers.
+			CXL::store_fence();
+			for (size_t i = 0; i < batch_header.num_msg; ++i) {
+				if (remaining < sizeof(BlogMessageHeader)) {
+					LOG(WARNING) << "NetworkManager: v2 batch too small for header, remaining=" << remaining;
+					break;
+				}
+				const size_t payload_size = static_cast<size_t>(first_msg->size);
+				if (!wire::ValidateV2Payload(payload_size, remaining)) {
+					LOG(WARNING) << "NetworkManager: v2 invalid payload_size=" << payload_size
+					             << " remaining=" << remaining;
+					break;
+				}
+				// [[CXL_VISIBILITY_FIX]] v2 counterpart of the v1 loop above: flush each
+				// BlogMessageHeader cacheline (bytes 0-15 written by this receiver thread) to CXL
+				// before batch_complete=1 is signaled, so any later reader on a different thread
+				// (e.g. CommitEpoch's per-batch size recompute) reliably sees ->size rather than a
+				// stale/zero-initialized cacheline.
+				CXL::flush_cacheline(first_msg);
+				const size_t stride = wire::ComputeStrideV2(payload_size);
+				remaining -= stride;
+				first_msg = reinterpret_cast<BlogMessageHeader*>(
+					reinterpret_cast<uint8_t*>(first_msg) + stride
 				);
 			}
 		}

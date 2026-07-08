@@ -878,6 +878,17 @@ class Topic {
 		std::atomic<uint64_t> order5_hold_buffer_forced_skips_{0};
 		std::atomic<uint64_t> order5_stale_epoch_skips_{0};
 		std::atomic<uint64_t> order5_spatial_guard_rejects_{0};
+		// [[ORDER5_COMMIT_PROFILE]] Cumulative wall-clock ns spent in each CommitEpoch phase,
+		// single-writer (EpochSequencerThread only) so relaxed ops suffice. Enabled via
+		// EMBAR_ORDER5_COMMIT_PROFILE; see topic.cc's periodic reporter in EpochSequencerThread.
+		std::atomic<uint64_t> order5_commit_calls_{0};
+		std::atomic<uint64_t> order5_commit_batches_{0};
+		std::atomic<uint64_t> order5_commit_msgs_{0};
+		std::atomic<uint64_t> order5_commit_total_ns_{0};
+		std::atomic<uint64_t> order5_commit_goi_ns_{0};
+		std::atomic<uint64_t> order5_commit_export_ns_{0};
+		std::atomic<uint64_t> order5_commit_metadata_ns_{0};
+		std::atomic<uint64_t> order5_commit_cv_flush_ns_{0};
 		// [[W1.2]] Per-session commit-order invariant instrumentation (W1 item #2). Detects the
 		// collector committing a client's batch out of order across epoch seals.
 		std::atomic<uint64_t> order5_commit_order_violations_{0};
