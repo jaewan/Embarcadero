@@ -1,0 +1,7 @@
+[2026-07-08T05:20:24Z] seamfix trial 3: launched, memserver(c3)=2631711 broker0(moscxl)=2631757 seq(moscxl)=2631762
+[2026-07-08T05:20:28Z] seamfix trial 3: KILLED broker0 pid=2631757 at kill_t_mono=1783488028.529120179
+[sequencer] broker 0 declared dead via RDMA_ERROR (kPeerDown) at t=8.264s
+recovery_move_rc=0
+[2026-07-08T05:21:07Z] seamfix trial 3: all processes exited
+final_global_seq_broker0=3016480
+recovery_verify_rc=0
