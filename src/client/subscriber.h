@@ -45,18 +45,6 @@ struct BufferState {
 	BufferState& operator=(BufferState&&) = delete;
 };
 
-struct TimestampPair {
-	long long send_time_nanos; // From message payload
-	std::chrono::steady_clock::time_point receive_time; // Captured on receive
-};
-
-struct RecvLogEntry {
-	std::chrono::steady_clock::time_point receive_time;
-	int buffer_idx;
-	uint64_t buffer_generation;
-	size_t end_offset;
-};
-
 struct LatencySample {
 	uint64_t dedupe_key;
 	long long send_time_nanos;
@@ -81,7 +69,6 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	absl::CondVar consumer_can_consume_cv; // Notifies consumer a buffer *might* be ready
 	absl::CondVar receiver_can_write_cv; // Notifies receiver the *other* buffer is free
 
-	std::vector<RecvLogEntry> recv_log ABSL_GUARDED_BY(state_mutex);
 	// Incremental latency parsing state so StoreLatency() does not depend on
 	// retention of full connection buffers across swaps.
 	std::vector<uint8_t> latency_parse_pending ABSL_GUARDED_BY(state_mutex);
@@ -500,7 +487,13 @@ class Subscriber {
 		void ManageBrokerConnections(int broker_id, const std::string& address); // Launches workers
 		// Worker thread function (needs access to Subscriber instance)
 		void ReceiveWorkerThread(int broker_id, int fd_to_handle);
-		void ParseAndStageOrderedBytes(StreamParseState& state, const uint8_t* data, size_t len);
+		void ParseAndStageOrderedBytes(StreamParseState& state,
+		                               const uint8_t* data,
+		                               size_t len,
+		                               ConnectionBuffers* latency_conn,
+		                               const std::chrono::steady_clock::time_point& recv_time,
+		                               long long recv_buffer_age_us,
+		                               size_t recv_chunk_bytes);
 		void StageOrderedMessages(std::vector<std::pair<size_t, std::unique_ptr<OwnedMessage>>> messages);
 		void* TryPopOrderedMessageLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
 		void* ConsumeOrdered(int timeout_ms);

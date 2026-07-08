@@ -215,6 +215,65 @@ int64_t ConsumeOrderedWaitUs() {
 	return ResolveInt64Env("EMBARCADERO_CONSUME_ORDERED_WAIT_US", 50, 1, 1000000);
 }
 
+bool BuildLatencySampleFromFrame(const uint8_t* frame,
+                                 size_t frame_size,
+                                 size_t header_size,
+                                 uint64_t batch_total_order,
+                                 size_t batch_message_index,
+                                 const std::chrono::steady_clock::time_point& recv_time,
+                                 long long recv_buffer_age_us,
+                                 size_t recv_chunk_bytes,
+                                 LatencySample* out,
+                                 bool* rejected_implausible_ts) {
+	if (out == nullptr || frame == nullptr || frame_size < header_size + sizeof(long long)) {
+		return false;
+	}
+	if (rejected_implausible_ts != nullptr) {
+		*rejected_implausible_ts = false;
+	}
+
+	long long send_nanos_since_epoch = 0;
+	memcpy(&send_nanos_since_epoch, frame + header_size, sizeof(long long));
+	uint64_t msg_uid = 0;
+	if (frame_size >= header_size + sizeof(long long) + sizeof(uint64_t)) {
+		memcpy(&msg_uid, frame + header_size + sizeof(long long), sizeof(uint64_t));
+	}
+	const long long recv_nanos_since_epoch =
+		std::chrono::duration_cast<std::chrono::nanoseconds>(
+			recv_time.time_since_epoch()).count();
+	constexpr long long kMaxPastWindowNs = 60LL * 60LL * 1000LL * 1000LL * 1000LL; // 1 hour
+	constexpr long long kMaxFutureSkewNs = 1LL * 1000LL * 1000LL * 1000LL; // 1 second
+	const bool plausible_timestamp =
+		send_nanos_since_epoch >= (recv_nanos_since_epoch - kMaxPastWindowNs) &&
+		send_nanos_since_epoch <= (recv_nanos_since_epoch + kMaxFutureSkewNs);
+	if (!plausible_timestamp) {
+		if (rejected_implausible_ts != nullptr) {
+			*rejected_implausible_ts = true;
+		}
+		return false;
+	}
+
+	std::chrono::steady_clock::time_point send_time{
+		std::chrono::nanoseconds(send_nanos_since_epoch)};
+	uint64_t dedupe_key = static_cast<uint64_t>(send_nanos_since_epoch);
+	if (msg_uid != 0) {
+		dedupe_key = msg_uid;
+	} else {
+		const uint64_t batch_local_index =
+			(batch_total_order << 16) |
+			static_cast<uint64_t>(batch_message_index & 0xFFFFu);
+		dedupe_key = Mix64(batch_local_index) ^ Mix64(static_cast<uint64_t>(send_nanos_since_epoch));
+	}
+
+	out->dedupe_key = dedupe_key;
+	out->send_time_nanos = send_nanos_since_epoch;
+	out->latency_us =
+		std::chrono::duration_cast<std::chrono::microseconds>(recv_time - send_time).count();
+	out->recv_buffer_age_us = recv_buffer_age_us;
+	out->recv_chunk_bytes = recv_chunk_bytes;
+	return true;
+}
+
 bool BenchmarkPollOnlyRuntime() {
 	const char* runtime = std::getenv("EMBARCADERO_RUNTIME_MODE");
 	return runtime != nullptr &&
@@ -1618,27 +1677,23 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 				ParseAndStageOrderedBytes(
 					ordered_consume_parse_state,
 					static_cast<const uint8_t*>(write_ptr),
+					static_cast<size_t>(bytes_received),
+					measure_latency_ ? conn_buffers.get() : nullptr,
+					recv_complete_time,
+					recv_buffer_age_us,
 					static_cast<size_t>(bytes_received));
 			}
 			// Record Timestamp and NEW Offset
-			if (measure_latency_) {
+			if (measure_latency_ && !feed_ordered_consume_stream) {
 				absl::MutexLock lock(&conn_buffers->state_mutex);
-				size_t current_end_offset = advance_result.end_offset;
-				const uint64_t generation = conn_buffers->buffer_generation[recv_write_idx];
 				const uint64_t parsed_before = conn_buffers->latency_diag.parsed_messages;
-				conn_buffers->recv_log.push_back(RecvLogEntry{
-					.receive_time = recv_complete_time,
-					.buffer_idx = recv_write_idx,
-					.buffer_generation = generation,
-					.end_offset = current_end_offset
-				});
 				ParseLatencySamplesLocked(conn_buffers.get(),
-				                        static_cast<uint8_t*>(write_ptr),
-				                        static_cast<size_t>(bytes_received),
-				                        order_level_,
-				                        recv_complete_time,
-				                        recv_buffer_age_us,
-				                        static_cast<size_t>(bytes_received));
+				                          static_cast<uint8_t*>(write_ptr),
+				                          static_cast<size_t>(bytes_received),
+				                          order_level_,
+				                          recv_complete_time,
+				                          recv_buffer_age_us,
+				                          static_cast<size_t>(bytes_received));
 				const uint64_t parsed_after = conn_buffers->latency_diag.parsed_messages;
 				if (parsed_after > parsed_before) {
 					const size_t parsed_delta = static_cast<size_t>(parsed_after - parsed_before);
@@ -2471,10 +2526,17 @@ void* Subscriber::Consume(int timeout_ms) {
     return nullptr;
 }
 
-void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state, const uint8_t* data, size_t len) {
+void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
+                                           const uint8_t* data,
+                                           size_t len,
+                                           ConnectionBuffers* latency_conn,
+                                           const std::chrono::steady_clock::time_point& recv_time,
+                                           long long recv_buffer_age_us,
+                                           size_t recv_chunk_bytes) {
 	if (data == nullptr || len == 0) {
 		return;
 	}
+	const bool record_latency = (latency_conn != nullptr);
 
 	constexpr size_t kMaxStreamBufferBytes = 64UL << 20; // 64 MB safety cap
 	ReserveForAppend(state.buffer, len);
@@ -2491,6 +2553,13 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state, const uint8_
 
 	std::vector<std::pair<size_t, std::unique_ptr<OwnedMessage>>> parsed_messages;
 	parsed_messages.reserve(std::min<size_t>((len / 1024) + 1, 4096));
+	std::vector<LatencySample> latency_samples;
+	if (record_latency) {
+		latency_samples.reserve(parsed_messages.capacity());
+	}
+	uint64_t latency_metadata_detected = 0;
+	uint64_t latency_parsed_messages = 0;
+	uint64_t latency_rejected_ts = 0;
 
 	size_t pos = 0;
 	const size_t buf_size = state.buffer.size();
@@ -2509,6 +2578,9 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state, const uint8_
 				state.has_pending_metadata = true;
 				state.current_batch_messages_processed = 0;
 				state.next_message_order_in_batch = meta->batch_total_order;
+				if (record_latency) {
+					latency_metadata_detected++;
+				}
 				pos += sizeof(Embarcadero::wire::BatchMetadata);
 				continue;
 			}
@@ -2542,6 +2614,27 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state, const uint8_
 				msg_hdr->total_order = state.next_message_order_in_batch;
 			}
 			const size_t total_order = msg_hdr->total_order;
+			const size_t batch_message_index = state.current_batch_messages_processed;
+			if (record_latency) {
+				latency_parsed_messages++;
+				LatencySample sample{};
+				bool rejected_ts = false;
+				if (BuildLatencySampleFromFrame(
+						msg->data.data(),
+						stride,
+						sizeof(Embarcadero::BlogMessageHeader),
+						state.pending_metadata.batch_total_order,
+						batch_message_index,
+						recv_time,
+						recv_buffer_age_us,
+						recv_chunk_bytes,
+						&sample,
+						&rejected_ts)) {
+					latency_samples.push_back(sample);
+				} else if (rejected_ts) {
+					latency_rejected_ts++;
+				}
+			}
 			state.next_message_order_in_batch = total_order + 1;
 			state.current_batch_messages_processed++;
 			if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
@@ -2578,6 +2671,27 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state, const uint8_
 			msg_hdr->total_order = state.next_message_order_in_batch;
 		}
 		const size_t total_order = msg_hdr->total_order;
+		const size_t batch_message_index = state.current_batch_messages_processed;
+		if (record_latency) {
+			latency_parsed_messages++;
+			LatencySample sample{};
+			bool rejected_ts = false;
+			if (BuildLatencySampleFromFrame(
+					msg->data.data(),
+					padded_size,
+					sizeof(Embarcadero::MessageHeader),
+					state.pending_metadata.batch_total_order,
+					batch_message_index,
+					recv_time,
+					recv_buffer_age_us,
+					recv_chunk_bytes,
+					&sample,
+					&rejected_ts)) {
+				latency_samples.push_back(sample);
+			} else if (rejected_ts) {
+				latency_rejected_ts++;
+			}
+		}
 		state.next_message_order_in_batch = total_order + 1;
 		state.current_batch_messages_processed++;
 		if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
@@ -2595,6 +2709,31 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state, const uint8_
 
 	if (!parsed_messages.empty()) {
 		StageOrderedMessages(std::move(parsed_messages));
+	}
+	if (record_latency) {
+		{
+			absl::MutexLock lock(&latency_conn->state_mutex);
+			latency_conn->latency_diag.parse_calls++;
+			latency_conn->latency_diag.parse_input_bytes += len;
+			latency_conn->latency_diag.metadata_detected += latency_metadata_detected;
+			latency_conn->latency_diag.parsed_messages += latency_parsed_messages;
+			latency_conn->latency_diag.samples_added += latency_samples.size();
+			latency_conn->latency_diag.samples_rejected_implausible_ts += latency_rejected_ts;
+			if (!latency_samples.empty()) {
+				latency_conn->latency_samples.reserve(
+					latency_conn->latency_samples.size() + latency_samples.size());
+				latency_conn->latency_samples.insert(
+					latency_conn->latency_samples.end(),
+					latency_samples.begin(),
+					latency_samples.end());
+			}
+		}
+		if (latency_parsed_messages > 0) {
+			latency_parsed_message_count_.fetch_add(
+				static_cast<size_t>(latency_parsed_messages), std::memory_order_relaxed);
+			latency_unique_message_count_.fetch_add(
+				static_cast<size_t>(latency_parsed_messages), std::memory_order_relaxed);
+		}
 	}
 }
 
