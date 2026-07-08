@@ -122,9 +122,10 @@ private:
     std::atomic<bool> listening_{false};
     std::atomic<bool> shutdown_started_{false};
 
-    // Acknowledgment management
-    absl::flat_hash_map<size_t, int> ack_connections_;  // <client_id, ack_sock>
-    absl::Mutex ack_mu_;
+	// Acknowledgment management
+	absl::flat_hash_map<size_t, int> ack_connections_;  // <client_id, ack_sock>
+	absl::flat_hash_map<size_t, uint32_t> ack_connection_epochs_;  // <client_id, session_epoch>
+	absl::Mutex ack_mu_;
     absl::Mutex sub_mu_;
     std::vector<std::unique_ptr<SubscriberState>> sub_state_;  // <connection_id, state> - dense IDs
     int ack_efd_; // Epoll file descriptor for acknowledgments

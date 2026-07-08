@@ -29,6 +29,8 @@
 #include <unordered_map>
 #endif
 
+struct QueueBufferTestPeer;
+
 class QueueBuffer {
 public:
 	/**
@@ -108,6 +110,10 @@ public:
 	void SetPreferredQueues(const std::vector<size_t>& preferred_indices);
 	void ClearPreferredQueues();
 	// D1 session rollover hook. Call only after producers are quiesced and unacked suffix is handled.
+	void PauseSessionRollover();
+	size_t SealAllForSessionRollover();
+	void SetNextBatchSeqForNewSession(size_t next_batch_seq);
+	void ResumeSessionRollover();
 	void ResetBatchSeqForNewSession();
 
 	/**
@@ -134,6 +140,7 @@ public:
 #endif
 
 private:
+	friend struct QueueBufferTestPeer;
 	size_t num_queues_;
 	// Number of queues actually used for round-robin (min(num_queues_, num_consumers)). Avoids pushing to ghost queues.
 	size_t active_queues_;
@@ -175,6 +182,11 @@ private:
 	char _pad_batch_seq_[kCacheLineBytes - sizeof(std::atomic<size_t>)]{};
 	std::atomic<bool> write_finished_{false};
 	std::atomic<bool> shutdown_{false};
+	std::mutex session_rollover_mu_;
+	std::condition_variable session_rollover_cv_;
+	bool session_rollover_paused_{false};
+	std::atomic<bool> session_rollover_paused_fast_{false};
+	std::atomic<size_t> active_producer_ops_{0};
 	// Current batch being filled (producer only)
 	Embarcadero::BatchHeader* current_batch_{nullptr};
 	size_t current_batch_tail_{0};  // bytes written in current slot (start at sizeof(BatchHeader))
@@ -190,6 +202,8 @@ private:
 	void AdvanceWriteBufId();
 	void NotifyQueueDataReady(size_t queue_idx);
 	void NotifyAllWaiters();
+	bool BeginProducerOp();
+	void EndProducerOp();
 	/** Acquire next writable batch from pool and reset local producer state. */
 	bool AcquireNextBatchFromPool(bool stop_on_shutdown, const char* context);
 	/** Seal current batch and push to queues_[write_buf_id_], then advance and get new buffer. Returns num_msg in batch sealed (0 if none). */

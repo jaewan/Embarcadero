@@ -30,6 +30,12 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
+add_test(
+    NAME e2e_order5_multibroker_unacked_release
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_order5_multibroker_unacked_release.sh
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
 # Set test properties
 set_tests_properties(e2e_basic_publish PROPERTIES
     TIMEOUT 300  # 5 minutes max
@@ -44,6 +50,11 @@ set_tests_properties(e2e_explicit_replication_order5_ack2 PROPERTIES
 set_tests_properties(e2e_order5_live_session_fence_fire PROPERTIES
     TIMEOUT 180
     LABELS "e2e;order5;session;fencing;correctness"
+)
+
+set_tests_properties(e2e_order5_multibroker_unacked_release PROPERTIES
+    TIMEOUT 180
+    LABELS "e2e;order5;session;multibroker;correctness"
 )
 
 # Unit tests
@@ -272,6 +283,50 @@ if(PkgConfig_FOUND)
         set_tests_properties(unit_order5_session_fencing PROPERTIES
             TIMEOUT 60
             LABELS "unit;order5;session;fencing;correctness"
+        )
+
+        add_executable(order5_publisher_rollover_test
+            order5_publisher_rollover_test.cc
+            ../src/client/common.cc
+            ../src/client/buffer.cc
+            ../src/client/queue_buffer.cc
+            ../src/client/publisher.cc
+            ../src/client/subscriber.cc
+            ../src/client/result_writer.cc
+            ../src/common/configuration.cc
+            ../src/common/compat_isoc23.cpp
+        )
+        target_include_directories(order5_publisher_rollover_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/client
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(order5_publisher_rollover_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(order5_publisher_rollover_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            glog::glog
+            gflags
+            mimalloc
+            heartbeat_grpc_proto
+            session_proto
+            corfu_sequencer_grpc_proto
+            corfu_replication_grpc_proto
+            scalog_replication_grpc_proto
+            grpc++_reflection
+            grpc++
+            protobuf::libprotobuf
+            ${FOLLY_LIBRARIES}
+            Threads::Threads
+            yaml-cpp
+        )
+        add_test(NAME unit_order5_publisher_rollover COMMAND order5_publisher_rollover_test)
+        set_tests_properties(unit_order5_publisher_rollover PROPERTIES
+            TIMEOUT 120
+            LABELS "unit;order5;publisher;rollover;correctness"
         )
     else()
         message(WARNING "GTest not found via pkg-config, unit tests disabled")

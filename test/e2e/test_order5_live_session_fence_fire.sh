@@ -9,7 +9,8 @@ CONFIG_DIR="$PROJECT_ROOT/config"
 OUT_DIR="$BUILD_DIR/test_output/order5_live_session_fence_fire"
 LOCK_FILE="${EMBARCADERO_TESTBED_LOCK:-$(cd "$PROJECT_ROOT/.." && pwd)/testbed.lock}"
 
-SESSION_EPOCH="${EMBARCADERO_TEST_LIVE_SESSION_EPOCH:-7}"
+SESSION_EPOCH="${EMBARCADERO_TEST_LIVE_SESSION_EPOCH:-1}"
+BROKER_ENV_SESSION_EPOCH="${EMBARCADERO_TEST_LIVE_BROKER_ENV_SESSION_EPOCH:-101}"
 LEASE_MS="${EMBARCADERO_TEST_LIVE_SESSION_LEASE_MS:-500}"
 CLAIMED_WAIT_MS="${EMBARCADERO_TEST_LIVE_CLAIMED_WAIT_MS:-650}"
 MESSAGE_SIZE=1024
@@ -44,7 +45,9 @@ cleanup() {
 	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
 		kill -9 "$pid" 2>/dev/null || true
 	fi
-	wait 2>/dev/null || true
+	if [ -n "$pid" ]; then
+		wait "$pid" 2>/dev/null || true
+	fi
 	rm -f /tmp/embarlet_*_ready 2>/dev/null || true
 }
 
@@ -98,7 +101,7 @@ run_test_body() {
 		EMBARCADERO_NUM_BROKERS=1 \
 		EMBAR_USE_HUGETLB=0 \
 		EMBARCADERO_CXL_ZERO_MODE=metadata \
-		EMBARCADERO_SESSION_EPOCH="$SESSION_EPOCH" \
+		EMBARCADERO_SESSION_EPOCH="$BROKER_ENV_SESSION_EPOCH" \
 		EMBARCADERO_SESSION_LEASE_MS="$LEASE_MS" \
 		EMBARCADERO_TEST_ORDER5_SESSION_TRACE=1 \
 		EMBARCADERO_TEST_ORDER5_CLAIMED_WAIT_MS="$CLAIMED_WAIT_MS" \
@@ -116,8 +119,7 @@ run_test_body() {
 	env NUM_BROKERS=1 \
 		EMBARCADERO_NUM_BROKERS=1 \
 		EMBAR_USE_HUGETLB=0 \
-		EMBARCADERO_SESSION_EPOCH="$SESSION_EPOCH" \
-		EMBARCADERO_ACK_TIMEOUT_SEC=5 \
+		EMBARCADERO_ACK_TIMEOUT_SEC=10 \
 		"$BIN_DIR/throughput_test" \
 			--config "$CONFIG_DIR/client.yaml" \
 			-n 1 -m "$MESSAGE_SIZE" -s "$FIRST_TOTAL_BYTES" -t 5 -o 5 -a 1 \
@@ -139,9 +141,24 @@ run_test_body() {
 	if ! grep -q "\\[SESSION_FENCED_OBSERVED\\]" client_fenced.log; then
 		fail "fenced client did not observe SessionFenced control"
 	fi
-	if [ "$fenced_client_rc" -eq 0 ]; then
-		fail "fenced client unexpectedly completed after SessionFenced"
+	if ! grep -q "\\[SESSION_OPEN_ACK\\].*assigned_session_epoch=$SESSION_EPOCH" client_fenced.log; then
+		fail "client did not complete SessionOpen/SessionOpenAck handshake"
 	fi
+	local next_epoch=$((SESSION_EPOCH + 1))
+	if ! grep -q "\\[SESSION_OPEN_ACK\\].*assigned_session_epoch=$next_epoch" client_fenced.log; then
+		fail "client did not reopen at incremented session epoch $next_epoch"
+	fi
+	if ! grep -q "\\[SESSION_OPEN\\].*requested_session_epoch=$SESSION_EPOCH.*assigned_session_epoch=$SESSION_EPOCH" broker_0.log; then
+		fail "broker env epoch overrode real SessionOpen request"
+	fi
+	if ! grep -q "\\[SESSION_REOPEN_RESUBMIT\\]" client_fenced.log; then
+		fail "client did not reopen session and resubmit suffix"
+	fi
+	if [ "$fenced_client_rc" -ne 0 ]; then
+		fail "fenced client did not recover and complete after SessionFenced"
+	fi
+	grep -q "\\[ACK_VERIFY\\].*100%" client_fenced.log ||
+		fail "fenced client did not receive complete ACK1 progress after reopen"
 
 	local fence_count
 	fence_count=$(grep -c "\\[ORDER5_SESSION_FENCE\\].*session_epoch=$SESSION_EPOCH" broker_0.log || true)
@@ -156,11 +173,32 @@ run_test_body() {
 	if grep -q "\\[ORDER5_TEST_GOI_COMMIT\\].*client=$drop_client.*session_epoch=$SESSION_EPOCH.*batch_seq=$drop_seq" broker_0.log; then
 		fail "dropped suffix client=$drop_client batch_seq=$drop_seq was committed to GOI"
 	fi
+	local duplicate_commits
+	duplicate_commits=$(awk -v client="$drop_client" '
+		/ORDER5_TEST_GOI_COMMIT/ && $0 ~ ("client=" client) {
+			epoch = ""; seq = "";
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /^session_epoch=/) { split($i, a, "="); epoch = a[2]; }
+				if ($i ~ /^batch_seq=/) { split($i, b, "="); seq = b[2]; }
+			}
+			if (epoch != "" && seq != "") {
+				key = epoch ":" seq;
+				count[key]++;
+			}
+		}
+		END {
+			dups = 0;
+			for (k in count) {
+				if (count[k] > 1) dups++;
+			}
+			print dups;
+		}' broker_0.log)
+	[ "$duplicate_commits" -eq 0 ] ||
+		fail "duplicate broker-side GOI commits detected for client=$drop_client"
 
 	env NUM_BROKERS=1 \
 		EMBARCADERO_NUM_BROKERS=1 \
 		EMBAR_USE_HUGETLB=0 \
-		EMBARCADERO_SESSION_EPOCH="$SESSION_EPOCH" \
 		"$BIN_DIR/throughput_test" \
 			--config "$CONFIG_DIR/client.yaml" \
 			-n 1 -m "$MESSAGE_SIZE" -s "$SECOND_TOTAL_BYTES" -t 5 -o 5 -a 1 \

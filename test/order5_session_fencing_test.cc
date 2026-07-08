@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <vector>
 
+#include "../src/client/session_client_utils.h"
 #include "../src/embarlet/sequencer_utils.h"
 
 namespace {
@@ -137,6 +139,81 @@ TEST(Order5SessionFencingTest, FullEpochSessionKeysDoNotAliasLow16Wrap) {
 
 	EXPECT_EQ(static_cast<uint16_t>(epoch_a), static_cast<uint16_t>(epoch_b));
 	EXPECT_NE(SessionKeyFor(client_id, epoch_a), SessionKeyFor(client_id, epoch_b));
+}
+
+TEST(Order5SessionFencingTest, RendezvousBrokerUsesBatchSeqAndExcludesFailedBroker) {
+	const std::vector<int> brokers{0, 1, 2, 3};
+	const int first = RendezvousBroker(42, 100, brokers, -1);
+	const int excluded = RendezvousBroker(42, 100, brokers, first);
+
+	EXPECT_NE(first, -1);
+	EXPECT_NE(excluded, -1);
+	EXPECT_NE(excluded, first);
+	EXPECT_NE(RendezvousBroker(42, 101, brokers, first), first);
+}
+
+TEST(Order5SessionFencingTest, DeltaEstimatorClampsAndUsesKarn) {
+	DeltaEstimator estimator;
+	EXPECT_DOUBLE_EQ(estimator.delta_ms(), DeltaEstimator::kDeltaFloorMs);
+
+	estimator.sample(20'000'000, 1);
+	EXPECT_DOUBLE_EQ(estimator.delta_ms(), DeltaEstimator::kDeltaFloorMs)
+		<< "retransmitted samples must be ignored by Karn filtering";
+
+	estimator.sample(500'000, 0);
+	EXPECT_DOUBLE_EQ(estimator.delta_ms(), DeltaEstimator::kDeltaFloorMs);
+
+	estimator.sample(100'000'000, 0);
+	EXPECT_DOUBLE_EQ(estimator.delta_ms(), DeltaEstimator::kDeltaCapMs);
+}
+
+TEST(Order5SessionFencingTest, FenceRebasesAckBaseAfterLocalCreditOnce) {
+	const size_t prior_ack_received = 100;
+	const size_t locally_committed = 40;
+	const size_t broker_frontier_after_fence = 140;
+	const size_t broker_frontier_excludes_local = 100;
+
+	const size_t rebased = RebasedAckBaseAfterFenceCredit(
+		prior_ack_received, locally_committed);
+	EXPECT_EQ(rebased, 140u);
+	EXPECT_EQ(broker_frontier_after_fence - rebased, 0u)
+		<< "already committed local-credit messages must not be credited twice";
+	EXPECT_EQ(broker_frontier_after_fence - prior_ack_received, locally_committed)
+		<< "the old base would double count the locally credited prefix";
+
+	EXPECT_EQ(RebasedAckBaseAfterFenceCredit(
+		          prior_ack_received, locally_committed),
+	          broker_frontier_after_fence)
+		<< "diagnostic committed_msg_hwm is not a release axis; the local credit path owns the prefix";
+	EXPECT_LT(broker_frontier_excludes_local, rebased);
+
+	const size_t suffix_ack_in_new_generation = 60;
+	EXPECT_EQ(SessionGlobalAckFromGeneration(rebased, suffix_ack_in_new_generation), 200u)
+		<< "R-G ACKs are generation-relative and must be rebased before ACK-delta accounting";
+}
+
+TEST(Order5SessionFencingTest, SessionGlobalLedgerRetiresNonHeadAndRehomedBatches) {
+	const size_t base = 10;
+	const size_t first_non_head_ack_end = base + 4;
+	const size_t second_rehomed_ack_end = base + 9;
+
+	EXPECT_TRUE(SessionGlobalUnackedRetired(first_non_head_ack_end, 14));
+	EXPECT_FALSE(SessionGlobalUnackedRetired(second_rehomed_ack_end, 14));
+	EXPECT_TRUE(SessionGlobalUnackedRetired(second_rehomed_ack_end, 19));
+
+	size_t ack_end = 0;
+	EXPECT_FALSE(SessionPrefixAckEnd(1, 0, base, 5, &ack_end))
+		<< "out-of-order send completion must not derive a releasable ACK key";
+	EXPECT_TRUE(SessionPrefixAckEnd(0, 0, base, 4, &ack_end));
+	EXPECT_EQ(ack_end, first_non_head_ack_end);
+}
+
+TEST(Order5SessionFencingTest, RolloverNextBatchSeqStartsAfterResubmittedSuffix) {
+	const size_t suffix_batches = 6;
+	EXPECT_EQ(NextBatchSeqAfterSuffixResubmit(suffix_batches), 6u);
+	EXPECT_LT(5u, NextBatchSeqAfterSuffixResubmit(suffix_batches));
+	EXPECT_EQ(NextSessionEpochAfterFence(7), 8u)
+		<< "env override may seed the initial epoch but must not pin reopens";
 }
 
 }  // namespace

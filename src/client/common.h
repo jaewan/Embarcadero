@@ -31,6 +31,7 @@
 #include "common/config.h"
 #include "cxl_manager/cxl_manager.h"
 #include "corfu_client.h"
+#include "session_client_utils.h"
 #include <heartbeat.grpc.pb.h>
 
 #ifndef MSG_ZEROCOPY
