@@ -234,13 +234,13 @@ for target in $SWEEP_TARGETS; do
 
       POINT_DIR="$PROJECT_ROOT/$OUTDIR/${target}mbps"
       mkdir -p "$POINT_DIR"
-      for f in pub_latency_stats.csv pub_cdf_latency_us.csv latency_stats.csv cdf_latency_us.csv; do
-        [ -f "$f" ] && mv "$f" "$POINT_DIR/"
-      done
+	      for f in pub_latency_stats.csv pub_cdf_latency_us.csv latency_stats.csv cdf_latency_us.csv delivery_latency_stats.csv cdf_delivery_latency_us.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv; do
+	        [ -f "$f" ] && mv "$f" "$POINT_DIR/"
+	      done
       cp "$TEST_LOG" "$POINT_DIR/test.log"
 
       PUB_STATS="$POINT_DIR/pub_latency_stats.csv"
-      E2E_STATS="$POINT_DIR/latency_stats.csv"
+	      E2E_STATS="$POINT_DIR/delivery_latency_stats.csv"
 
       # CSV columns: Average,Min,Median,p90,p95,p99,p999,Max,...
       pub_p50="" pub_p99="" pub_p999=""
@@ -254,8 +254,8 @@ for target in $SWEEP_TARGETS; do
       fi
 
       e2e_p50="" e2e_p99="" e2e_p999=""
-      if [ -f "$E2E_STATS" ]; then
-        row=$(grep -m1 "publish_to_deliver_latency" "$E2E_STATS" 2>/dev/null || tail -1 "$E2E_STATS" 2>/dev/null || true)
+	      if [ -f "$E2E_STATS" ]; then
+	        row=$(grep -m1 "publish_to_deliver_latency" "$E2E_STATS" 2>/dev/null || tail -1 "$E2E_STATS" 2>/dev/null || true)
         if [ -n "$row" ]; then
           e2e_p50=$(echo "$row" | awk -F',' '{print $3}')
           e2e_p99=$(echo "$row" | awk -F',' '{print $6}')

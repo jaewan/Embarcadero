@@ -198,6 +198,10 @@ int64_t ReceiverCvWaitUs() {
 	return ResolveInt64Env("EMBARCADERO_SUBSCRIBER_CV_WAIT_US", 1000, 100, 1000000);
 }
 
+int64_t ConsumeOrderedWaitUs() {
+	return ResolveInt64Env("EMBARCADERO_CONSUME_ORDERED_WAIT_US", 50, 1, 1000000);
+}
+
 bool BenchmarkPollOnlyRuntime() {
 	const char* runtime = std::getenv("EMBARCADERO_RUNTIME_MODE");
 	return runtime != nullptr &&
@@ -765,6 +769,11 @@ void Subscriber::StoreLatency() {
 	uint64_t diag_cv_wait_ns = 0;
 	uint64_t diag_cv_wait_max_ns = 0;
 	uint64_t diag_max_buffer_age_us = 0;
+	uint64_t diag_ordered_feed_calls = 0;
+	uint64_t diag_ordered_feed_bytes = 0;
+	uint64_t diag_ordered_drain_calls = 0;
+	uint64_t diag_ordered_drain_bytes = 0;
+	uint64_t diag_ordered_max_pending_bytes = 0;
 
 	std::vector<std::pair<int, std::shared_ptr<ConnectionBuffers>>> connections_to_parse;
 	{
@@ -806,6 +815,13 @@ void Subscriber::StoreLatency() {
 		diag_cv_wait_ns += conn_ptr->delivery_diag.cv_wait_ns;
 		diag_cv_wait_max_ns = std::max(diag_cv_wait_max_ns, conn_ptr->delivery_diag.cv_wait_max_ns);
 		diag_max_buffer_age_us = std::max(diag_max_buffer_age_us, conn_ptr->delivery_diag.max_buffer_age_us);
+		diag_ordered_feed_calls += conn_ptr->delivery_diag.ordered_stream_feed_calls;
+		diag_ordered_feed_bytes += conn_ptr->delivery_diag.ordered_stream_feed_bytes;
+		diag_ordered_drain_calls += conn_ptr->delivery_diag.ordered_stream_drain_calls;
+		diag_ordered_drain_bytes += conn_ptr->delivery_diag.ordered_stream_drain_bytes;
+		diag_ordered_max_pending_bytes =
+			std::max(diag_ordered_max_pending_bytes,
+			         conn_ptr->delivery_diag.ordered_stream_max_pending_bytes);
 		for (const auto& sample : conn_ptr->latency_samples) {
 			total_messages_parsed++;
 			if (delivery_diag_enabled) {
@@ -853,7 +869,7 @@ void Subscriber::StoreLatency() {
 	          << " dedupe=" << (dedupe_latency_samples ? "on" : "off");
 
 	// --- Log Results ---
-	LOG(INFO) << "Publish->Deliver Latency Statistics (us):";
+	LOG(INFO) << "Publish->Receive (wire arrival) Latency Statistics (us):";
 	LOG(INFO) << "  Count:   " << summary.count;
 	LOG(INFO) << "  Average: " << std::fixed << std::setprecision(3) << summary.average_us;
 	LOG(INFO) << "  Min:     " << summary.min_us;
@@ -881,7 +897,12 @@ void Subscriber::StoreLatency() {
 		          << " cv_wait_calls=" << diag_cv_wait_calls
 		          << " cv_wait_avg_us=" << avg_cv_wait_us
 		          << " cv_wait_max_us=" << (diag_cv_wait_max_ns / 1000.0)
-		          << " max_buffer_age_us=" << diag_max_buffer_age_us;
+		          << " max_buffer_age_us=" << diag_max_buffer_age_us
+		          << " ordered_stream_feed_calls=" << diag_ordered_feed_calls
+		          << " ordered_stream_feed_bytes=" << diag_ordered_feed_bytes
+		          << " ordered_stream_drain_calls=" << diag_ordered_drain_calls
+		          << " ordered_stream_drain_bytes=" << diag_ordered_drain_bytes
+		          << " ordered_stream_max_pending_bytes=" << diag_ordered_max_pending_bytes;
 
 		std::vector<long long> all_buffer_ages_us;
 		std::vector<long long> all_recv_chunks;
@@ -933,7 +954,7 @@ void Subscriber::StoreLatency() {
 			<< "," << total_messages_parsed
 			<< "," << recorded_samples
 			<< "," << dropped_samples
-			<< ",publish_to_deliver_latency"
+			<< ",publish_to_receive_latency"
 			<< ",us"
 			<< "," << Embarcadero::LatencyStats::kPercentileMethod
 			<< ",message\n";
@@ -982,10 +1003,33 @@ void Subscriber::StoreLatency() {
 			double cumulative_probability = static_cast<double>(i + 1) / summary.count;
 
 			cdf_file << current_latency << "," << std::fixed << std::setprecision(8) << cumulative_probability
-			         << ",publish_to_deliver_latency\n";
+			         << ",publish_to_receive_latency\n";
 		}
 		cdf_file.close();
 	}
+}
+
+std::vector<LatencySample> Subscriber::SnapshotLatencySamples() {
+	std::vector<LatencySample> out;
+	std::vector<std::shared_ptr<ConnectionBuffers>> connections_to_copy;
+	{
+		absl::ReaderMutexLock map_lock(&connection_map_mutex_);
+		connections_to_copy.reserve(connections_.size() + closed_connections_.size());
+		for (auto const& [fd, conn_ptr] : connections_) {
+			if (conn_ptr) connections_to_copy.push_back(conn_ptr);
+		}
+		for (const auto& conn_ptr : closed_connections_) {
+			if (conn_ptr) connections_to_copy.push_back(conn_ptr);
+		}
+	}
+	for (const auto& conn_ptr : connections_to_copy) {
+		if (!conn_ptr) continue;
+		absl::MutexLock state_lock(&conn_ptr->state_mutex);
+		out.insert(out.end(),
+		           conn_ptr->latency_samples.begin(),
+		           conn_ptr->latency_samples.end());
+	}
+	return out;
 }
 
 void Subscriber::Poll(size_t total_msg_size, size_t msg_size) {
@@ -1436,17 +1480,22 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 	const int64_t flush_deadline_us = DeliveryFlushDeadlineUs();
 	const int64_t receiver_cv_wait_us = ReceiverCvWaitUs();
 	const bool delivery_diag_enabled = (std::getenv("EMBARCADERO_SUBSCRIBER_DIAG") != nullptr);
+	const bool force_ordered_consume_stream =
+		(std::getenv("EMBARCADERO_ENABLE_ORDERED_CONSUME_STREAM") != nullptr ||
+		 std::getenv("EMBARCADERO_DELIVERY_MEASURE") != nullptr);
 	const bool feed_ordered_consume_stream =
-		(order_level_ >= 1 && !measure_latency_ &&
-		 (!BenchmarkPollOnlyRuntime() ||
-		  std::getenv("EMBARCADERO_ENABLE_ORDERED_CONSUME_STREAM") != nullptr));
+		(order_level_ >= 1 &&
+		 (force_ordered_consume_stream ||
+		  (!measure_latency_ && !BenchmarkPollOnlyRuntime())));
+	const bool partial_flush_enabled = (order_level_ >= 1);
 
 	// --- Main receive loop (Simplified - Blocking recv) ---
 	while (!shutdown_) {
 		// 1. Get current write buffer location & space (same as before)
-		std::pair<void*, size_t> write_loc = conn_buffers->get_write_location();
-		void* write_ptr = write_loc.first;
-		size_t available_space = write_loc.second;
+		ConnectionBuffers::WriteLocation write_loc = conn_buffers->get_write_location();
+		void* write_ptr = write_loc.ptr;
+		size_t available_space = write_loc.available;
+		const int recv_write_idx = write_loc.write_idx;
 
 		// 2. Check if current write buffer is full (same swap logic as before)
 		if (available_space == 0) {
@@ -1487,6 +1536,9 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		// Use 1MB receive chunks for optimal performance
 		size_t recv_chunk_size = std::min(available_space, static_cast<size_t>(1UL << 20));
 		ssize_t bytes_received = recv(conn_buffers->fd, write_ptr, recv_chunk_size, 0);
+		if (bytes_received <= 0 && recv_write_idx >= 0) {
+			conn_buffers->clear_write_inflight(recv_write_idx);
+		}
 		// Re-arm TCP_QUICKACK after every recv: Linux resets it to delayed-ACK mode
 		// after each ACK sent.  Without this, the broker hits EAGAIN and blocks in
 		// epoll_wait for ~40–200 ms per event waiting for ACKs to slide the window.
@@ -1520,16 +1572,18 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 			auto recv_complete_time = std::chrono::steady_clock::now();
 			const int64_t recv_complete_ns = SteadyNs(recv_complete_time);
 			long long recv_buffer_age_us = 0;
+			const ConnectionBuffers::AdvanceResult advance_result =
+				conn_buffers->advance_write_offset(recv_write_idx,
+					static_cast<size_t>(bytes_received));
 			// Feed ConsumeOrdered stream for any globally ordered topic (includes SCALOG order=1).
 			{
 				absl::MutexLock lock(&conn_buffers->state_mutex);
-				const int write_idx = conn_buffers->current_write_idx.load(std::memory_order_acquire);
-				const size_t offset_before = conn_buffers->buffers[write_idx].write_offset.load(std::memory_order_relaxed);
-				if (offset_before == 0 || conn_buffers->buffer_first_write_ns[write_idx] == 0) {
-					conn_buffers->buffer_first_write_ns[write_idx] = recv_complete_ns;
+				if (advance_result.offset_before == 0 ||
+				    conn_buffers->buffer_first_write_ns[recv_write_idx] == 0) {
+					conn_buffers->buffer_first_write_ns[recv_write_idx] = recv_complete_ns;
 				}
 				recv_buffer_age_us =
-					(recv_complete_ns - conn_buffers->buffer_first_write_ns[write_idx]) / 1000;
+					(recv_complete_ns - conn_buffers->buffer_first_write_ns[recv_write_idx]) / 1000;
 				if (delivery_diag_enabled) {
 					conn_buffers->delivery_diag.recv_calls++;
 					conn_buffers->delivery_diag.recv_bytes += static_cast<uint64_t>(bytes_received);
@@ -1544,20 +1598,23 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 						conn_buffers->ordered_stream_pending.end(),
 						chunk_begin,
 						chunk_begin + static_cast<size_t>(bytes_received));
+					conn_buffers->delivery_diag.ordered_stream_feed_calls++;
+					conn_buffers->delivery_diag.ordered_stream_feed_bytes +=
+						static_cast<uint64_t>(bytes_received);
+					MaxAssign(conn_buffers->delivery_diag.ordered_stream_max_pending_bytes,
+					          static_cast<uint64_t>(conn_buffers->ordered_stream_pending.size()));
+					consume_cv_.SignalAll();
 				}
 			}
-			// 4. Advance write offset (BEFORE getting timestamp)
-			conn_buffers->advance_write_offset(bytes_received);
-			// 5. Record Timestamp and NEW Offset
+			// Record Timestamp and NEW Offset
 			if (measure_latency_) {
 				absl::MutexLock lock(&conn_buffers->state_mutex);
-				const int write_idx = conn_buffers->current_write_idx.load(std::memory_order_relaxed);
-				size_t current_end_offset = conn_buffers->buffers[write_idx].write_offset.load(std::memory_order_relaxed);
-				const uint64_t generation = conn_buffers->buffer_generation[write_idx];
+				size_t current_end_offset = advance_result.end_offset;
+				const uint64_t generation = conn_buffers->buffer_generation[recv_write_idx];
 				const uint64_t parsed_before = conn_buffers->latency_diag.parsed_messages;
 				conn_buffers->recv_log.push_back(RecvLogEntry{
 					.receive_time = recv_complete_time,
-					.buffer_idx = write_idx,
+					.buffer_idx = recv_write_idx,
 					.buffer_generation = generation,
 					.end_offset = current_end_offset
 				});
@@ -1581,8 +1638,10 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 			// fills or the connection closes. Only swap when there is no pending
 			// ready buffer and the alternate buffer is idle.
 			{
-				conn_buffers->flush_partial_if_due(
-					this, recv_complete_ns, flush_deadline_us, false);
+				if (partial_flush_enabled) {
+					conn_buffers->flush_partial_if_due(
+						this, recv_complete_ns, flush_deadline_us, false);
+				}
 			}
 
 			DEBUG_count_.fetch_add(bytes_received, std::memory_order_relaxed);
@@ -1603,11 +1662,13 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		} else { // bytes_received < 0
 			if (errno == EINTR) continue;
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				conn_buffers->flush_partial_if_due(
-					this,
-					SteadyNs(std::chrono::steady_clock::now()),
-					flush_deadline_us,
-					true);
+				if (partial_flush_enabled) {
+					conn_buffers->flush_partial_if_due(
+						this,
+						SteadyNs(std::chrono::steady_clock::now()),
+						flush_deadline_us,
+						true);
+				}
 				continue;
 			}
 			if (shutdown_) { /* log shutdown */ }
@@ -1823,6 +1884,7 @@ bool ConnectionBuffers::flush_partial_if_due(Subscriber* subscriber_instance,
 	const int write_idx = current_write_idx.load(std::memory_order_acquire);
 	const size_t offset = buffers[write_idx].write_offset.load(std::memory_order_relaxed);
 	if (offset == 0 ||
+	    receiver_write_inflight_idx == write_idx ||
 	    write_buffer_ready_for_consumer.load(std::memory_order_acquire) ||
 	    read_buffer_in_use_by_consumer.load(std::memory_order_acquire)) {
 		return false;
@@ -1893,6 +1955,7 @@ void ConnectionBuffers::release_read_buffer(BufferState* acquired_buffer) {
 	const int write_idx = current_write_idx.load(std::memory_order_acquire);
 	if (write_idx != released_idx &&
 	    !write_buffer_ready_for_consumer.load(std::memory_order_acquire) &&
+	    receiver_write_inflight_idx != write_idx &&
 	    buffers[write_idx].write_offset.load(std::memory_order_relaxed) > 0) {
 		write_buffer_ready_for_consumer.store(true, std::memory_order_release);
 		current_write_idx.store(released_idx, std::memory_order_release);
@@ -2397,9 +2460,26 @@ void* Subscriber::Consume(int timeout_ms) {
 void* Subscriber::ConsumeOrdered(int timeout_ms) {
 	auto start_time = std::chrono::steady_clock::now();
 	auto timeout = std::chrono::milliseconds(timeout_ms);
+	const int64_t wait_us = ConsumeOrderedWaitUs();
 
 	// Release previously returned owned message (valid until next Consume call)
 	last_returned_.reset();
+
+	auto return_ready_message = [&]() -> void* {
+		auto it = pending_messages_.find(next_expected_order_);
+		if (it == pending_messages_.end()) {
+			return nullptr;
+		}
+		last_returned_ = std::move(it->second);
+		pending_messages_.erase(it);
+		void* ret = last_returned_ ? static_cast<void*>(last_returned_->data.data()) : nullptr;
+		if (ret) {
+			last_consumed_wire_version_ = last_returned_->header_version;
+			next_expected_order_++;
+			return ret;
+		}
+		return nullptr;
+	};
 
 	auto parse_stream = [&](StreamParseState& state) {
 		constexpr size_t kMaxStreamBufferBytes = 64UL << 20; // 64 MB safety cap
@@ -2465,23 +2545,23 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 				if (msg_hdr->total_order == 0) {
 					msg_hdr->total_order = state.next_message_order_in_batch;
 				}
-				size_t total_order = msg_hdr->total_order;
-				state.next_message_order_in_batch = total_order + 1;
-				state.current_batch_messages_processed++;
-				{
-					auto ins = pending_messages_.try_emplace(total_order, std::move(msg));
-					if (!ins.second) {
-						VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
-						        << " (keeping first)";
+					size_t total_order = msg_hdr->total_order;
+					state.next_message_order_in_batch = total_order + 1;
+					state.current_batch_messages_processed++;
+					{
+						auto ins = pending_messages_.try_emplace(total_order, std::move(msg));
+						if (!ins.second) {
+							VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
+							        << " (keeping first)";
+						}
 					}
-				}
 
-				if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
-					state.has_pending_metadata = false;
+					if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
+						state.has_pending_metadata = false;
+					}
+					pos += stride;
+					continue;
 				}
-				pos += stride;
-				continue;
-			}
 
 			// Header version v1 (MessageHeader)
 			if (buf_size - pos < sizeof(Embarcadero::MessageHeader)) {
@@ -2510,22 +2590,22 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 			if (msg_hdr->total_order == 0) {
 				msg_hdr->total_order = state.next_message_order_in_batch;
 			}
-			size_t total_order = msg_hdr->total_order;
-			state.next_message_order_in_batch = total_order + 1;
-			state.current_batch_messages_processed++;
-			{
-				auto ins = pending_messages_.try_emplace(total_order, std::move(msg));
-				if (!ins.second) {
-					VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
-					        << " (keeping first)";
+				size_t total_order = msg_hdr->total_order;
+				state.next_message_order_in_batch = total_order + 1;
+				state.current_batch_messages_processed++;
+				{
+					auto ins = pending_messages_.try_emplace(total_order, std::move(msg));
+					if (!ins.second) {
+						VLOG(2) << "ConsumeOrdered: duplicate total_order=" << total_order
+						        << " (keeping first)";
+					}
 				}
-			}
 
-			if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
-				state.has_pending_metadata = false;
+				if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
+					state.has_pending_metadata = false;
+				}
+				pos += padded_size;
 			}
-			pos += padded_size;
-		}
 
 		if (pos > 0) {
 			state.buffer.erase(state.buffer.begin(), state.buffer.begin() + pos);
@@ -2533,21 +2613,29 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 	};
 
 	while (std::chrono::steady_clock::now() - start_time < timeout) {
+		if (void* ret = return_ready_message()) {
+			return ret;
+		}
+
 		// Pull any newly received bytes into per-connection stream buffers.
 		// ORDER>=2 consumers read from this stream path directly rather than
 		// depending on dual-buffer readiness heuristics.
 		{
 			absl::ReaderMutexLock map_lock(&connection_map_mutex_);
-			for (auto const& [fd, conn_ptr] : connections_) {
-				if (!conn_ptr) continue;
-				auto& state = parse_states_[fd];
-				absl::MutexLock lock(&conn_ptr->state_mutex);
-				if (!conn_ptr->ordered_stream_pending.empty()) {
-					state.buffer.insert(
-						state.buffer.end(),
+				for (auto const& [fd, conn_ptr] : connections_) {
+					if (!conn_ptr) continue;
+					auto& state = parse_states_[fd];
+					absl::MutexLock lock(&conn_ptr->state_mutex);
+					if (!conn_ptr->ordered_stream_pending.empty()) {
+						const size_t drained_bytes = conn_ptr->ordered_stream_pending.size();
+						state.buffer.insert(
+							state.buffer.end(),
 						conn_ptr->ordered_stream_pending.begin(),
 						conn_ptr->ordered_stream_pending.end());
 					conn_ptr->ordered_stream_pending.clear();
+					conn_ptr->delivery_diag.ordered_stream_drain_calls++;
+					conn_ptr->delivery_diag.ordered_stream_drain_bytes +=
+						static_cast<uint64_t>(drained_bytes);
 				}
 			}
 		}
@@ -2558,19 +2646,14 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 		}
 
 		// Return next expected message if ready
-		auto it = pending_messages_.find(next_expected_order_);
-		if (it != pending_messages_.end()) {
-			last_returned_ = std::move(it->second);
-			pending_messages_.erase(it);
-			void* ret = last_returned_ ? static_cast<void*>(last_returned_->data.data()) : nullptr;
-			if (ret) {
-				last_consumed_wire_version_ = last_returned_->header_version;
-				next_expected_order_++;
-				return ret;
-			}
+		if (void* ret = return_ready_message()) {
+			return ret;
 		}
 
-		std::this_thread::sleep_for(std::chrono::microseconds(100));
+		{
+			absl::MutexLock wait_lock(&consume_mutex_);
+			consume_cv_.WaitWithTimeout(&consume_mutex_, absl::Microseconds(wait_us));
+		}
 	}
 
 	VLOG(3) << "ConsumeOrdered: Timeout reached after " << timeout_ms << "ms";

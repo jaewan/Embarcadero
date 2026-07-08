@@ -595,10 +595,10 @@ run_trial() {
   fi
 
   # Clean up any leftover CSV files from a previous run
-  (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv)
+  (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv)
   if [[ "$SCENARIO" == "remote" ]]; then
     ssh -o StrictHostKeyChecking=no "$REMOTE_CLIENT_HOST" \
-      "cd ${REMOTE_CLIENT_BIN_DIR} && rm -f cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv" 2>/dev/null || true
+      "cd ${REMOTE_CLIENT_BIN_DIR} && rm -f cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv" 2>/dev/null || true
   fi
 
   # Start brokers (local; for remote-client scenario the broker still lives here)
@@ -677,13 +677,13 @@ run_trial() {
 
   if [[ "$SCENARIO" == "remote" ]]; then
     # CSV files were written on the remote client; scp them back.
-    for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
+	    for f in cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
       scp -o StrictHostKeyChecking=no \
           "${REMOTE_CLIENT_HOST}:${REMOTE_CLIENT_BIN_DIR}/$f" \
           "$TRIAL_DIR/$f" 2>/dev/null || true
     done
   else
-    for f in cdf_latency_us.csv latency_stats.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
+	    for f in cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
       local src="$BIN_DIR/$f"
       if [[ -f "$src" ]]; then
         mv "$src" "$TRIAL_DIR/$f"
@@ -697,14 +697,14 @@ run_trial() {
     fi
   done
 
-  local trial_stats="$TRIAL_DIR/latency_stats.csv"
-  if [[ ! -f "$trial_stats" ]]; then
-    echo "ERROR: latency_stats.csv missing for trial $trial" >&2
-    trial_failed=1
-  elif ! awk -F',' '$13=="publish_to_deliver_latency"{found=1} END{exit !found}' "$trial_stats"; then
-    echo "ERROR: publish_to_deliver_latency row missing in latency_stats.csv for trial $trial" >&2
-    trial_failed=1
-  fi
+	  local trial_stats="$TRIAL_DIR/delivery_latency_stats.csv"
+	  if [[ ! -f "$trial_stats" ]]; then
+	    echo "ERROR: delivery_latency_stats.csv missing for trial $trial" >&2
+	    trial_failed=1
+	  elif ! awk -F',' '$13=="publish_to_deliver_latency"{found=1} END{exit !found}' "$trial_stats"; then
+	    echo "ERROR: publish_to_deliver_latency row missing in delivery_latency_stats.csv for trial $trial" >&2
+	    trial_failed=1
+	  fi
 
   cat > "$RUN_METADATA" <<EOF
 run_id=$RUN_ID
