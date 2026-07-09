@@ -169,7 +169,6 @@ fi
 # ---------------------------------------------------------------------------
 cleanup() {
   broker_cleanup
-  pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
   if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
     broker_remote_corfu_stop || true
   elif [[ "$SEQUENCER" == "LAZYLOG" && -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
@@ -720,6 +719,9 @@ num_brokers=$NUM_BROKERS
 test_case=$TEST_CASE
 replication_factor=$REPLICATION_FACTOR
 runtime_mode=$EMBARCADERO_RUNTIME_MODE
+cxl_zero_mode=${EMBARCADERO_CXL_ZERO_MODE:-full}
+cxl_map_populate=${EMBARCADERO_CXL_MAP_POPULATE:-1}
+hugetlb=${EMBAR_USE_HUGETLB:-1}
 target_mbps=$TARGET_MBPS
 broker_head_addr=$head_addr
 run_log=$RUN_LOG
