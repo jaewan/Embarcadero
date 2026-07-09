@@ -10,6 +10,38 @@ This branch wires a true delivery-stamped `publish_to_deliver_latency` metric th
 
 This is not a completed headline SLO package. The full 4 GiB, six-load, three-trial curve and the A/B copy-elimination study were not completed in this pass. The results below are smoke/diagnostic runs used to validate correctness and localize the remaining tail source.
 
+## 2026-07-09 Export/Flush Hardening Update
+
+The smoke rows below are superseded for any headline SLO claim. They remain diagnostic only. The hardening pass changed the correctness contract but did not complete the required 4 GiB, six-load, three-trial validation curve.
+
+Implemented in this pass:
+
+- Flush policy is intent-driven. `cxl_type==Real` now defaults to explicit payload flushes on every mapping path, including DAX, mbind-backed real CXL, and real-CXL fallbacks. `EMBARCADERO_CXL_COHERENT=1` is the explicit operator opt-in for the coherent single-domain optimization. `cxl_type==Emul` remains coherent by default.
+- The non-coherent writer path flushes the full received batch payload range before `batch_complete`/`publish_commit` publication, not just the first per-message header cacheline.
+- Chain replication invalidates the full payload range and fences before reading payload bytes unless `EMBARCADERO_CXL_COHERENT=1` is set.
+- ORDER=5 export ring lapping is no longer a silent permanent stall. The subscriber cursor resyncs to the oldest live descriptor, increments `ExportOverruns` and `ExportSkippedBatches` in `order5_anomaly_counters_broker*.csv`, and `scripts/run_latency.sh` fails the trial if either counter is nonzero. `EMBARCADERO_ORDER5_EXPORT_OVERRUN_FATAL=1` makes this path fatal for CI/diagnostic runs.
+- Sequencer restart recovery rebuilds compact ORDER=5 export descriptors from recovered GOI entries before live sequencing resumes, preserving per-broker compact export sequence numbers for the recovered committed prefix. If recovered history exceeds the compact ring window, the overrun counters above make the gap visible.
+- Latency-vs-load aggregation carries `order5_export_overruns` and `order5_export_skipped_batches` from per-trial metadata.
+
+Validation completed in this pass:
+
+```text
+cmake --build build -j --target embarlet throughput_test
+ctest --test-dir build -R 'unit_order5_publisher_rollover|unit_order5_session_fencing|unit_scalog_ack_invariant' --output-on-failure
+```
+
+The focused unit tests passed. The first attempted CTest filter used the historical names from the task brief and found no tests; the build registers them as `unit_*`.
+
+Validation not completed in this pass:
+
+- No flush-ON or flush-OFF 4 GiB headline delivery curve was run.
+- No six-load, three-trial delivery/order assertion gate was run.
+- No A/B attribution run was completed for export-rewrite versus flush policy.
+- No restart-mid-stream + reconnecting-subscriber end-to-end test was run.
+- No real-CXL NUMA-node flush-ON benchmark was run after the code changes.
+
+Current topology label for this update: code/build/unit validation only in `/home/domin/Embarcadero-sessions/subscriber-tail`; no new hardware benchmark number is claimed.
+
 ## Code Changes
 
 - Fixed the write-offset race by capturing the recv target buffer index with the write pointer and advancing that exact buffer. `EMBARCADERO_SUBSCRIBER_DIAG=1` asserts the advanced offset does not exceed capacity.

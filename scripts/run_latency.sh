@@ -594,7 +594,7 @@ run_trial() {
   fi
 
   # Clean up any leftover CSV files from a previous run
-  (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv)
+  (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv order5_anomaly_counters_broker*.csv)
   if [[ "$SCENARIO" == "remote" ]]; then
     ssh -o StrictHostKeyChecking=no "$REMOTE_CLIENT_HOST" \
       "cd ${REMOTE_CLIENT_BIN_DIR} && rm -f cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv" 2>/dev/null || true
@@ -695,6 +695,34 @@ run_trial() {
       cp "$broker_log" "$TRIAL_DIR/brokers/"
     fi
   done
+  for anomaly_csv in "$BIN_DIR"/order5_anomaly_counters_broker*.csv; do
+    if [[ -f "$anomaly_csv" ]]; then
+      cp "$anomaly_csv" "$TRIAL_DIR/"
+    fi
+  done
+
+  local export_overruns=0
+  local export_skipped=0
+  for anomaly_csv in "$TRIAL_DIR"/order5_anomaly_counters_broker*.csv; do
+    if [[ -f "$anomaly_csv" ]]; then
+      local sums
+      sums=$(awk -F',' 'NR == 1 {
+          for (i = 1; i <= NF; ++i) idx[$i] = i;
+          next
+        }
+        {
+          if ("ExportOverruns" in idx) over += $(idx["ExportOverruns"]) + 0;
+          if ("ExportSkippedBatches" in idx) skip += $(idx["ExportSkippedBatches"]) + 0;
+        }
+        END { printf "%d %d", over, skip }' "$anomaly_csv")
+      export_overruns=$((export_overruns + ${sums%% *}))
+      export_skipped=$((export_skipped + ${sums##* }))
+    fi
+  done
+  if [[ "$export_overruns" -ne 0 || "$export_skipped" -ne 0 ]]; then
+    echo "ERROR: ORDER=5 export ring overrun detected (overruns=$export_overruns skipped_batches=$export_skipped)" >&2
+    trial_failed=1
+  fi
 
 	  local trial_stats="$TRIAL_DIR/delivery_latency_stats.csv"
 	  if [[ ! -f "$trial_stats" ]]; then
@@ -722,6 +750,8 @@ runtime_mode=$EMBARCADERO_RUNTIME_MODE
 cxl_zero_mode=${EMBARCADERO_CXL_ZERO_MODE:-full}
 cxl_map_populate=${EMBARCADERO_CXL_MAP_POPULATE:-1}
 hugetlb=${EMBAR_USE_HUGETLB:-1}
+order5_export_overruns=$export_overruns
+order5_export_skipped_batches=$export_skipped
 target_mbps=$TARGET_MBPS
 broker_head_addr=$head_addr
 run_log=$RUN_LOG

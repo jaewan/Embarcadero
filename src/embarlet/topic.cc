@@ -33,6 +33,11 @@ static bool ShouldEnableOrder5Trace() {
 	return enabled;
 }
 
+static bool ShouldFatalOnOrder5ExportOverrun() {
+	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_EXPORT_OVERRUN_FATAL", false);
+	return enabled;
+}
+
 static bool ShouldEnableOrder5PhaseDiag() {
 	static const bool enabled = ReadEnvBoolLenient("EMBARCADERO_ORDER5_PHASE_DIAG", false);
 	return enabled;
@@ -2896,12 +2901,31 @@ bool Topic::GetBatchToExportWithMetadata(
 		           header->num_msg > 0 &&
 		           total_size > 0 &&
 		           header->batch_seq > next_export) {
+			const uint64_t observed = header->batch_seq;
+			const uint64_t oldest_live =
+				(observed >= static_cast<uint64_t>(num_slots_ - 1))
+					? observed - static_cast<uint64_t>(num_slots_ - 1)
+					: 0;
+			const uint64_t resync_to = std::max<uint64_t>(next_export + 1, oldest_live);
+			const uint64_t skipped = resync_to > next_export ? (resync_to - next_export) : 0;
+			order5_export_overruns_.fetch_add(1, std::memory_order_relaxed);
+			order5_export_skipped_batches_.fetch_add(skipped, std::memory_order_relaxed);
 			LOG(ERROR) << "[ORDER5_EXPORT_OVERRUN B" << broker_id_ << "]"
 			           << " expected_export_seq=" << next_export
-			           << " observed_export_seq=" << header->batch_seq
+			           << " observed_export_seq=" << observed
+			           << " resync_export_seq=" << resync_to
+			           << " skipped_export_batches=" << skipped
 			           << " slot=" << slot
 			           << " pbr=" << header->pbr_absolute_index
 			           << " total_order=" << header->total_order;
+			expected_batch_offset = resync_to;
+			if (ShouldFatalOnOrder5ExportOverrun()) {
+				LOG(FATAL) << "[ORDER5_EXPORT_OVERRUN_FATAL B" << broker_id_ << "]"
+				           << " expected_export_seq=" << next_export
+				           << " observed_export_seq=" << observed
+				           << " resync_export_seq=" << resync_to
+				           << " skipped_export_batches=" << skipped;
+			}
 		}
 	}
 
@@ -3796,6 +3820,73 @@ void Topic::InitExportCursorForBroker(int broker_id) {
 	export_sequence_by_broker_[broker_id] = 0;
 }
 
+void Topic::RebuildOrder5ExportDescriptorsFromGOI(uint64_t recovered_next_goi) {
+	if (recovered_next_goi == 0 || cxl_addr_ == nullptr || tinode_ == nullptr) return;
+
+	GOIEntry* goi = reinterpret_cast<GOIEntry*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + Embarcadero::kGOIOffset);
+	uint64_t replayed = 0;
+	for (uint64_t i = 0; i < recovered_next_goi; ++i) {
+		GOIEntry* entry = &goi[i];
+		CXL::invalidate_cacheline_for_read(entry);
+		CXL::invalidate_cacheline_for_read(reinterpret_cast<const uint8_t*>(entry) + 64);
+		CXL::load_fence();
+		if (entry->global_seq != i) continue;
+
+		const int b = static_cast<int>(entry->broker_id);
+		if (b < 0 || b >= NUM_MAX_BROKERS || entry->message_count == 0 || entry->payload_size == 0) {
+			continue;
+		}
+		const size_t batch_headers_offset = tinode_->offsets[b].batch_headers_offset;
+		if (batch_headers_offset == 0) continue;
+
+		BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(cxl_addr_) + batch_headers_offset);
+		BatchHeader* ring_end = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(ring_start) + BATCHHEADERS_SIZE);
+		BatchHeader* cur = export_cursor_by_broker_[b];
+		if (cur == nullptr || cur < ring_start || cur >= ring_end) {
+			cur = ring_start;
+			export_cursor_by_broker_[b] = cur;
+		}
+
+		const uint64_t export_seq = export_sequence_by_broker_[b]++;
+		cur->batch_seq = export_seq;
+		cur->client_id = static_cast<uint32_t>(entry->client_id);
+		cur->broker_id = static_cast<uint32_t>(b);
+		cur->epoch_created = entry->epoch_sequenced;
+		cur->session_epoch = static_cast<uint16_t>(entry->session_epoch & 0xFFFFu);
+		cur->session_epoch32 = entry->session_epoch;
+		cur->batch_id = entry->batch_id;
+		cur->pbr_absolute_index = entry->pbr_index;
+		cur->start_logical_offset =
+			(entry->cumulative_message_count >= entry->message_count)
+				? (entry->cumulative_message_count - entry->message_count)
+				: 0;
+		cur->batch_off_to_export = 0;
+		cur->log_idx = entry->blog_offset;
+		cur->total_size = entry->payload_size;
+		cur->num_msg = entry->message_count;
+		cur->total_order = entry->total_order;
+		cur->ordered = 1;
+		cur->batch_complete = 0;
+		cur->publish_commit = kBatchHeaderPublishUncommitted;
+		cur->flags = kBatchHeaderFlagRetired;
+		CXL::store_fence();
+		CXL::flush_cacheline(cur);
+		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(cur) + 64);
+		CXL::store_fence();
+
+		BatchHeader* next_cursor = reinterpret_cast<BatchHeader*>(
+			reinterpret_cast<uint8_t*>(cur) + sizeof(BatchHeader));
+		if (next_cursor >= ring_end) next_cursor = ring_start;
+		export_cursor_by_broker_[b] = next_cursor;
+		++replayed;
+	}
+	LOG(INFO) << "RebuildOrder5ExportDescriptorsFromGOI: recovered_next_goi="
+	          << recovered_next_goi << " replayed_descriptors=" << replayed;
+}
+
 void Topic::Sequencer5() {
 	LOG(INFO) << "Starting Sequencer5 (Phase 1b epoch pipeline) for topic: " << topic_name_;
 	commit_order_last_seq_.clear();  // [[W1.2]] fresh per-session commit-order tracking each run
@@ -3849,6 +3940,7 @@ void Topic::Sequencer5() {
 	for (int broker_id : registered_brokers) {
 		InitExportCursorForBroker(broker_id);
 	}
+	RebuildOrder5ExportDescriptorsFromGOI(recovered_next_goi);
 
 	epoch_driver_thread_ = std::thread(&Topic::EpochDriverThread, this);
 	std::thread epoch_sequencer_thread(&Topic::EpochSequencerThread, this);
@@ -6477,7 +6569,8 @@ void Topic::WriteOrder5AnomalyCountersCsv() const {
 	if (write_header) {
 		out << "TimestampNs,Topic,BrokerId,Order,FifoViolations,AckOrderViolations,"
 		    << "SkippedBatches,ScannerTimeoutSkips,HoldTimeoutSkips,"
-		    << "HoldBufferForcedSkips,StaleEpochSkips\n";
+		    << "HoldBufferForcedSkips,StaleEpochSkips,"
+		    << "ExportOverruns,ExportSkippedBatches\n";
 	}
 	out << SteadyNowNs() << ","
 	    << topic_name_ << ","
@@ -6489,7 +6582,9 @@ void Topic::WriteOrder5AnomalyCountersCsv() const {
 	    << order5_scanner_timeout_skips_.load(std::memory_order_relaxed) << ","
 	    << order5_hold_timeout_skips_.load(std::memory_order_relaxed) << ","
 	    << order5_hold_buffer_forced_skips_.load(std::memory_order_relaxed) << ","
-	    << order5_stale_epoch_skips_.load(std::memory_order_relaxed) << "\n";
+	    << order5_stale_epoch_skips_.load(std::memory_order_relaxed) << ","
+	    << order5_export_overruns_.load(std::memory_order_relaxed) << ","
+	    << order5_export_skipped_batches_.load(std::memory_order_relaxed) << "\n";
 }
 
 void Topic::WriteOrder5ClientPressureSummary() const {

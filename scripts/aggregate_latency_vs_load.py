@@ -91,6 +91,8 @@ def write_trial_rows(rows, output_path: pathlib.Path):
         "message_count",
         "offered_wire_bytes",
         "offered_payload_bytes",
+        "order5_export_overruns",
+        "order5_export_skipped_batches",
         "artifact_dir",
     ]
     with output_path.open("w", newline="") as handle:

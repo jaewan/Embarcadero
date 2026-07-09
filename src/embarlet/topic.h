@@ -867,6 +867,8 @@ class Topic {
 		std::atomic<uint64_t> order5_hold_timeout_skips_{0};
 		std::atomic<uint64_t> order5_hold_buffer_forced_skips_{0};
 		std::atomic<uint64_t> order5_stale_epoch_skips_{0};
+		std::atomic<uint64_t> order5_export_overruns_{0};
+		std::atomic<uint64_t> order5_export_skipped_batches_{0};
 		std::atomic<uint64_t> order5_spatial_guard_rejects_{0};
 		// [[ORDER5_COMMIT_PROFILE]] Cumulative wall-clock ns spent in each CommitEpoch phase,
 		// single-writer (EpochSequencerThread only) so relaxed ops suffice. Enabled via
@@ -956,6 +958,7 @@ class Topic {
 
 		/** Initializes the export chain cursor for a specific broker (ring_start). Idempotent. */
 		void InitExportCursorForBroker(int broker_id);
+		void RebuildOrder5ExportDescriptorsFromGOI(uint64_t recovered_next_goi);
 		std::vector<std::vector<PendingBatch5>> level5_per_shard_cache_;
 
 		// [[PHASE_2_FIX]] Per-broker absolute PBR counters (never wrap, for CV tracking)

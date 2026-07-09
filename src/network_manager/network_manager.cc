@@ -1601,13 +1601,9 @@ void NetworkManager::HandlePublishRequest(
 			running = false;
 			break;
 		}
-		// [[BLOG_HEADER]] v1 (MessageHeader) and v2 (BlogMessageHeader) need per-message
-		// header cacheline flushes before PublishPBRSlotDirect only on non-coherent CXL/DAX
-		// mappings. shm-backed benchmark mappings are CPU-cache coherent, so the flush walk is
-		// pure overhead there. v2 was previously skipped on the assumption that "v1 per-message
-		// validation" was the only thing being skipped; in fact the flush itself was v1-only,
-		// leaving BlogMessageHeader payload bytes potentially stale/zero-initialized from CXL's
-		// perspective when read by a different thread later.
+		// Non-coherent CXL requires the complete received batch body to be durable before
+		// PublishPBRSlotDirect advertises batch_complete/publish_commit. Flushing only the
+		// first header cacheline leaves the payload body stale for cross-domain readers.
 		const bool flush_payload_headers =
 			cxl_manager_ == nullptr || cxl_manager_->RequiresExplicitPayloadHeaderFlush();
 		if (!flush_payload_headers) {
@@ -1615,14 +1611,11 @@ void NetworkManager::HandlePublishRequest(
 			bool expected = false;
 			if (logged_payload_flush_skip.compare_exchange_strong(
 					expected, true, std::memory_order_relaxed)) {
-				LOG(INFO) << "NetworkManager: skipping per-message payload-header flush on cache-coherent CXL mapping";
+				LOG(INFO) << "NetworkManager: skipping full payload-range flush on cache-coherent CXL mapping";
 			}
 		} else if (!is_blog_header_enabled) {
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
-			// recv() populated these MessageHeader cache lines before returning to user space.
-			// Drain those stores before CLFLUSHOPT so CXL observes the freshly received headers.
-			CXL::store_fence();
 			for (size_t i = 0; i < batch_header.num_msg; ++i) {
 				if (remaining < sizeof(MessageHeader)) {
 					LOG(WARNING) << "NetworkManager: v1 batch too small for header, remaining=" << remaining;
@@ -1633,26 +1626,17 @@ void NetworkManager::HandlePublishRequest(
 					             << " remaining=" << remaining;
 					break;
 				}
-				// [[CXL_VISIBILITY_FIX]] Flush each MessageHeader cacheline to CXL before
-				// PublishPBRSlotDirect signals batch_complete=1. recv() writes paddedSize only
-				// to this CPU's L1/L2; without an explicit flush the CXL device still holds the
-				// zero-initialized value. DelegationThread's cache miss would then fetch 0 from
-				// CXL, trigger the invalid-paddedSize error path, skip writing next_msg_diff,
-				// and stall CXLPollingLoop/ReplicaPollingLoop forever. The SFENCE inside
-				// PublishPBRSlotDirect orders all these CLFLUSHOPTs before batch_complete is
-				// visible, so the happens-before guarantee is maintained.
-				CXL::flush_cacheline(first_msg);
 				remaining -= first_msg->paddedSize;
 				first_msg = reinterpret_cast<MessageHeader*>(
 					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
 				);
 			}
+			CXL::store_fence();
+			CXL::flush_cache_range(buf, batch_header.total_size);
+			CXL::store_fence();
 		} else {
 			BlogMessageHeader* first_msg = reinterpret_cast<BlogMessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
-			// Same happens-before requirement as the v1 loop above: drain recv()'s stores before
-			// CLFLUSHOPT so CXL observes the freshly received per-message headers.
-			CXL::store_fence();
 			for (size_t i = 0; i < batch_header.num_msg; ++i) {
 				if (remaining < sizeof(BlogMessageHeader)) {
 					LOG(WARNING) << "NetworkManager: v2 batch too small for header, remaining=" << remaining;
@@ -1664,18 +1648,15 @@ void NetworkManager::HandlePublishRequest(
 					             << " remaining=" << remaining;
 					break;
 				}
-				// [[CXL_VISIBILITY_FIX]] v2 counterpart of the v1 loop above: flush each
-				// BlogMessageHeader cacheline (bytes 0-15 written by this receiver thread) to CXL
-				// before batch_complete=1 is signaled, so any later reader on a different thread
-				// (e.g. CommitEpoch's per-batch size recompute) reliably sees ->size rather than a
-				// stale/zero-initialized cacheline.
-				CXL::flush_cacheline(first_msg);
 				const size_t stride = wire::ComputeStrideV2(payload_size);
 				remaining -= stride;
 				first_msg = reinterpret_cast<BlogMessageHeader*>(
 					reinterpret_cast<uint8_t*>(first_msg) + stride
 				);
 			}
+			CXL::store_fence();
+			CXL::flush_cache_range(buf, batch_header.total_size);
+			CXL::store_fence();
 		}
 		// [[DESIGN: Write PBR entry only after full receive]] Batch is fully in blog; write the
 		// complete BatchHeader to the PBR slot once. Slot was zeroed in GetCXLBuffer.
@@ -1957,6 +1938,12 @@ void NetworkManager::SubscribeNetworkThread(
 							messages_size,
 							batch_total_order,
 							num_messages)){
+					{
+						absl::MutexLock lock(&cached_state->mu);
+						if (local_offset != cached_state->last_offset) {
+							cached_state->last_offset = local_offset;
+						}
+					}
 					export_no_data_loops++;
 					std::this_thread::yield();
 					continue;

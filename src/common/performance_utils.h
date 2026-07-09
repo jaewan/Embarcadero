@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <chrono>
 #include <cstring>
@@ -236,6 +237,28 @@ inline void invalidate_cacheline_for_read(const void* addr) {
 #else
     (void)addr;
 #endif
+}
+
+inline void flush_cache_range(const void* addr, size_t len) {
+    if (addr == nullptr || len == 0) return;
+    constexpr uintptr_t kCacheLineSize = 64;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~(kCacheLineSize - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + len + kCacheLineSize - 1) &
+                          ~(kCacheLineSize - 1);
+    for (uintptr_t p = start; p < end; p += kCacheLineSize) {
+        flush_cacheline(reinterpret_cast<const void*>(p));
+    }
+}
+
+inline void invalidate_cache_range_for_read(const void* addr, size_t len) {
+    if (addr == nullptr || len == 0) return;
+    constexpr uintptr_t kCacheLineSize = 64;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~(kCacheLineSize - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + len + kCacheLineSize - 1) &
+                          ~(kCacheLineSize - 1);
+    for (uintptr_t p = start; p < end; p += kCacheLineSize) {
+        invalidate_cacheline_for_read(reinterpret_cast<const void*>(p));
+    }
 }
 
 /**

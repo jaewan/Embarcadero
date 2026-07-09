@@ -18,6 +18,7 @@
 #include "mimalloc.h"
 #include "common/configuration.h"
 #include "common/config.h"
+#include "common/env_flags.h"
 #include "common/performance_utils.h"
 
 namespace Embarcadero{
@@ -85,6 +86,10 @@ static bool MetadataOnlyZeroingEnabled() {
 		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 	}
 	return mode == "metadata" || mode == "meta" || mode == "metadata_only";
+}
+
+static bool CxlCoherentOptInEnabled() {
+	return ReadEnvBoolStrict("EMBARCADERO_CXL_COHERENT", false);
 }
 
 static inline void* allocate_shm(
@@ -289,10 +294,15 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	if(cxl_addr_ == nullptr){
 		return;
 	}
-	requires_explicit_payload_header_flush_ = dax_backed;
-	LOG(INFO) << "CXL payload header flush policy: "
+	const bool coherent_opt_in = CxlCoherentOptInEnabled();
+	requires_explicit_payload_header_flush_ = (cxl_type == Real) && !coherent_opt_in;
+	LOG(INFO) << "CXL payload flush policy: "
 	          << (requires_explicit_payload_header_flush_ ? "explicit_flush_required"
-	                                                      : "cache_coherent_mapping");
+	                                                      : "cache_coherent_mapping")
+	          << " cxl_type=" << (cxl_type == Real ? "Real" : "Emul")
+	          << " dax_backed=" << (dax_backed ? 1 : 0)
+	          << " EMBARCADERO_CXL_COHERENT="
+	          << (std::getenv("EMBARCADERO_CXL_COHERENT") ? std::getenv("EMBARCADERO_CXL_COHERENT") : "<unset>");
 
 	// [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0 (128 bytes)
 	// [[CXL_MEMORY_LAYOUT_v2]] PBR/BatchHeaders/TInode/Bitmap/Segments start AFTER Phase 2 metadata
