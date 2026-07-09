@@ -15,10 +15,6 @@
 #include <chrono>
 #include <errno.h>
 
-#ifndef MSG_ZEROCOPY
-#define MSG_ZEROCOPY 0x4000000
-#endif
-
 #include <glog/logging.h>
 #include "mimalloc.h"
 
@@ -1766,15 +1762,9 @@ void NetworkManager::HandleSubscribeRequest(
 		return;
 	}
 
-	// [[PERF_FIX]] Remove SO_ZEROCOPY to avoid ENOBUFS caused by undrained MSG_ERRQUEUE
-	// Without draining the error queue, kernel throttles socket when zerocopy notifications fill up,
-	// causing non-deterministic throughput collapse. SO_ZEROCOPY removed from subscriber path entirely.
-	// int flag = 1;
-	// if (setsockopt(client_socket, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
-	// 	LOG(ERROR) << "Subscriber setsockopt SO_ZEROCOPY failed";
-	// 	close(client_socket);
-	// 	return;
-	// }
+	// [[PERF_FIX]] SO_ZEROCOPY intentionally NOT set on the subscriber socket:
+	// without draining MSG_ERRQUEUE the kernel throttles the socket when zerocopy
+	// notifications fill up, causing non-deterministic throughput collapse.
 
 	// Create epoll for monitoring writability
 	int epoll_fd = epoll_create1(0);
@@ -2050,10 +2040,6 @@ void NetworkManager::SubscribeNetworkThread(
 			          << " export_batches=" << export_batches;
 		}
 
-		if (messages_size > 0) {
-			// Send message data
-		}
-
 		// Send message data — time it to diagnose cross-machine slowness
 		const int64_t send_t0 = kSubSendDiag
 			? std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2132,9 +2118,9 @@ bool NetworkManager::SendMessageData(
 		while (sent_bytes < buffer_size) {
 			size_t remaining_bytes = buffer_size - sent_bytes;
 			size_t to_send = std::min(remaining_bytes, send_limit);
-			// [[PERF_FIX]] Remove MSG_ZEROCOPY to avoid ENOBUFS caused by undrained error queue
-			// MSG_ZEROCOPY requires draining MSG_ERRQUEUE which wasn't implemented,
-			// causing non-deterministic throughput collapse when queue fills up.
+			// [[PERF_FIX]] MSG_ZEROCOPY intentionally NOT used: it requires draining
+			// MSG_ERRQUEUE (never implemented), which caused non-deterministic
+			// throughput collapse when the queue filled up.
 			int send_flags = MSG_NOSIGNAL; // prevents SIGPIPE when subscriber closes mid-send (would kill broker process)
 			int ret = send(sock_fd, (uint8_t*)buffer + sent_bytes, to_send, send_flags);
 

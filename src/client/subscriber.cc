@@ -270,8 +270,20 @@ int64_t ResolveInt64Env(const char* name, int64_t fallback, int64_t min_value, i
 	}
 }
 
-int64_t DeliveryFlushDeadlineUs() {
-	return ResolveInt64Env("EMBARCADERO_SUBSCRIBER_FLUSH_US", 2000, 100, 1000000);
+int64_t DeliveryFlushDeadlineUs(bool measurement_mode) {
+	// Partial-batch flush deadline (SO_RCVTIMEO on delivery sockets). This is the
+	// dominant CONSUME-side tail term: it bounds how long a partially-filled recv
+	// buffer waits before being released. It only affects WHEN a partial batch is
+	// released; total order / per-session FIFO / dedup are enforced by TryPop*
+	// regardless of flush timing, so lowering it cannot violate any guarantee.
+	//
+	// Throughput default is kept high (2ms) to amortize wakeups; latency/measurement
+	// runs default much lower (200us) to shave the partial-flush tail. An explicit
+	// EMBARCADERO_SUBSCRIBER_FLUSH_US override wins in either mode.
+	constexpr int64_t kThroughputDefaultUs = 2000;
+	constexpr int64_t kMeasurementDefaultUs = 200;
+	const int64_t default_us = measurement_mode ? kMeasurementDefaultUs : kThroughputDefaultUs;
+	return ResolveInt64Env("EMBARCADERO_SUBSCRIBER_FLUSH_US", default_us, 100, 1000000);
 }
 
 int64_t ReceiverCvWaitUs() {
@@ -1521,7 +1533,10 @@ void Subscriber::ManageBrokerConnections(int broker_id, const std::string& addre
 				mark_handled(sock);
 				continue;
 			}
-			const int64_t flush_deadline_us = DeliveryFlushDeadlineUs();
+			const bool flush_measurement_mode =
+				(measure_latency_ || BenchmarkPollOnlyRuntime() ||
+				 std::getenv("EMBARCADERO_DELIVERY_MEASURE") != nullptr);
+			const int64_t flush_deadline_us = DeliveryFlushDeadlineUs(flush_measurement_mode);
 			timeval recv_timeout = ToRecvTimeout(flush_deadline_us);
 			if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout)) != 0) {
 				LOG(WARNING) << "Failed to set subscriber receive timeout on socket " << sock
@@ -1626,7 +1641,10 @@ void Subscriber::ReceiveWorkerThread(int broker_id, int fd_to_handle) {
 		return;
 	}
 
-	const int64_t flush_deadline_us = DeliveryFlushDeadlineUs();
+	const bool flush_measurement_mode =
+		(measure_latency_ || BenchmarkPollOnlyRuntime() ||
+		 std::getenv("EMBARCADERO_DELIVERY_MEASURE") != nullptr);
+	const int64_t flush_deadline_us = DeliveryFlushDeadlineUs(flush_measurement_mode);
 	const int64_t receiver_cv_wait_us = ReceiverCvWaitUs();
 	const bool delivery_diag_enabled = (std::getenv("EMBARCADERO_SUBSCRIBER_DIAG") != nullptr);
 	const bool force_ordered_consume_stream =

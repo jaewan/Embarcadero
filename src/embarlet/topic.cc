@@ -98,8 +98,21 @@ static const char* Order5FlightKindToString(uint32_t kind) {
 	}
 }
 
+// [[O5-6]] The ORDER=5 flight recorder captures a clock_gettime + ring write per event
+// and dumps ~ring-size LOG(ERROR) lines on broker 0. That is live per-event overhead on the
+// hot path, so it is gated behind EMBARCADERO_ORDER5_FLIGHT_TRACE (default OFF). Set the env
+// var to a positive integer to enable it for debugging. The env lookup is memoized in a
+// function-local static so steady-state cost is a single relaxed bool load per event.
+static inline bool Order5FlightTraceEnabled() {
+	static const bool v = []() {
+		const char* e = std::getenv("EMBARCADERO_ORDER5_FLIGHT_TRACE");
+		return e != nullptr && std::atoi(e) > 0;
+	}();
+	return v;
+}
+
 static inline bool ShouldCaptureOrder5Flight(int order, int broker_id) {
-	return order == 5 && broker_id == 0;
+	return Order5FlightTraceEnabled() && order == 5 && broker_id == 0;
 }
 
 static inline uint64_t MakeSessionKey(size_t client_id, uint32_t session_epoch) {
@@ -3154,7 +3167,8 @@ void Topic::FlushAccumulatedCVLogicalOnly(
 
 void Topic::FlushAccumulatedCV(
 		const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
-		const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index) {
+		const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index,
+		const std::array<bool, NUM_MAX_BROKERS>* touched) {
 	// [PHASE-3] O(brokers) CXL writes + 1 fence (was O(batches) fences)
 	CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
 		reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
@@ -3162,6 +3176,12 @@ void Topic::FlushAccumulatedCV(
 	const bool sequencer_owns_durable_cv = (replication_factor_ <= 1);
 
 	for (int broker_id = 0; broker_id < NUM_MAX_BROKERS; ++broker_id) {
+		// [[O5-3]] Skip untouched brokers to avoid a flush_cacheline + MFENCE per broker
+		// every CommitEpoch. cv_max_* is populated only for touched brokers and only ever
+		// increases, so an untouched broker's entry could not have advanced here and the
+		// loop body would publish nothing for it anyway. Mirrors the both-zero early-continue
+		// in FlushAccumulatedCVLogicalOnly. Only active when the caller supplies `touched`.
+		if (touched != nullptr && !(*touched)[broker_id]) continue;
 		CompletionVectorEntry* entry = &cv[broker_id];
 
 		// [PANEL C3/R3] On non-coherent CXL, relaxed load can read from local cache (stale).
@@ -4881,7 +4901,11 @@ void Topic::CommitEpoch(
 	const auto cv_flush_t_start = commit_profile ? std::chrono::steady_clock::now()
 	                                              : std::chrono::steady_clock::time_point{};
 	// [PHASE-3] Single fence for all CV updates
-	FlushAccumulatedCV(cv_max_cumulative, cv_max_pbr_index);
+	// [[O5-3]] ordered_broker_seen[b] is set under the same broker-range guard that gates
+	// AccumulateCVUpdate into cv_max_*, so any broker with a non-zero cv_max_* here is also
+	// marked seen; passing it lets FlushAccumulatedCV skip the per-broker flush+fence for
+	// untouched brokers.
+	FlushAccumulatedCV(cv_max_cumulative, cv_max_pbr_index, &ordered_broker_seen);
 	if (commit_profile) {
 		order5_commit_cv_flush_ns_.fetch_add(
 			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

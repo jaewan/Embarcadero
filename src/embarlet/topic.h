@@ -512,9 +512,15 @@ class Topic {
 		void FlushAccumulatedCVLogicalOnly(
 			const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
 			const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
+		// [[O5-3]] Optional `touched`: when non-null, brokers with touched[b]==false are
+		// skipped (no flush_cacheline / fence for them). Only pass it when the caller can
+		// guarantee cv_max_* is non-zero ONLY for touched brokers (see CommitEpoch). Defaults
+		// to null (flush every broker) to preserve the behavior of callers that cannot prove
+		// that invariant.
 		void FlushAccumulatedCV(
 			const std::array<uint64_t, NUM_MAX_BROKERS>& max_cumulative,
-			const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index);
+			const std::array<uint64_t, NUM_MAX_BROKERS>& max_pbr_index,
+			const std::array<bool, NUM_MAX_BROKERS>* touched = nullptr);
 		struct SessionPublishSnapshot {
 			uint32_t session_epoch{0};
 			uint64_t expected_seq{0};

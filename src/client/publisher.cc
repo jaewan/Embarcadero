@@ -570,10 +570,24 @@ bool Publisher::RecordUnackedBatch(const Embarcadero::BatchHeader& header,
 	session_sent_hwm_ += rec.num_msg;
 	rec.broker_ack_end = std::numeric_limits<size_t>::max();
 	unacked_bytes_ += rec.wire_bytes;
-	unacked_batches_.push_back(std::move(rec));
-	std::sort(unacked_batches_.begin(), unacked_batches_.end(), [](const UnackedBatch& a, const UnackedBatch& b) {
-		return a.current_batch_seq < b.current_batch_seq;
-	});
+	// Keep unacked_batches_ sorted ascending by current_batch_seq so
+	// CompleteUnackedThrough can retire the in-order prefix from the front.
+	// Batches are recorded in send order, so the new key is >= the existing
+	// max in the common case (push_back); fall back to an ordered insert
+	// otherwise. This replaces an O(n log n) re-sort of the whole deque on
+	// every batch send with an O(n) ordered insert (O(1) in the common case),
+	// preserving the identical ordering invariant.
+	if (unacked_batches_.empty() ||
+	    rec.current_batch_seq >= unacked_batches_.back().current_batch_seq) {
+		unacked_batches_.push_back(std::move(rec));
+	} else {
+		auto it = std::upper_bound(unacked_batches_.begin(), unacked_batches_.end(),
+			rec.current_batch_seq,
+			[](uint64_t target_batch_seq, const UnackedBatch& candidate) {
+				return target_batch_seq < candidate.current_batch_seq;
+			});
+		unacked_batches_.insert(it, std::move(rec));
+	}
 	return true;
 }
 
