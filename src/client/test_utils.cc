@@ -84,6 +84,7 @@ struct DeliveryLatencySample {
 	uint64_t total_order = 0;
 	uint64_t msg_uid = 0;
 	long long send_time_ns = 0;
+	long long deliver_steady_ns = 0;
 	long long delivery_latency_us = 0;
 	long long receive_latency_us = -1;
 	long long receive_to_deliver_us = -1;
@@ -95,6 +96,7 @@ struct DeliveryLatencySample {
 
 struct DeliveryDrainResult {
 	size_t target = 0;
+	size_t message_size = 0;
 	size_t delivered = 0;
 	size_t invalid_messages = 0;
 	size_t duplicate_total_order = 0;
@@ -447,6 +449,7 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 		int timeout_sec) {
 	DeliveryDrainResult result;
 	result.target = target_messages;
+	result.message_size = message_size;
 	result.samples.reserve(target_messages);
 	std::vector<uint8_t> seen_uids;
 	if (target_messages > 0 &&
@@ -488,6 +491,7 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 				result.invalid_messages++;
 				continue;
 			}
+			sample.deliver_steady_ns = deliver_ns;
 			sample.delivery_latency_us = (deliver_ns - sample.send_time_ns) / 1000;
 
 			if (have_expected_total_order &&
@@ -732,10 +736,65 @@ void WriteDeliveryStageBreakdownCsv(const DeliveryDrainResult& result) {
 	    << "\n";
 }
 
+void WriteDeliverySteadyThroughputCsv(const DeliveryDrainResult& result) {
+	std::vector<long long> deliver_times;
+	deliver_times.reserve(result.samples.size());
+	for (const auto& sample : result.samples) {
+		if (sample.deliver_steady_ns > 0) {
+			deliver_times.push_back(sample.deliver_steady_ns);
+		}
+	}
+	std::sort(deliver_times.begin(), deliver_times.end());
+
+	std::ofstream out("delivery_steady_throughput.csv");
+	if (!out.is_open()) {
+		LOG(ERROR) << "Failed to open delivery_steady_throughput.csv";
+		return;
+	}
+	out << "Method,StartSample,EndSample,WindowMessages,WindowSeconds,PayloadBytes,PayloadMiBPerSec\n";
+	if (deliver_times.size() < 4 || result.message_size == 0) {
+		out << "delivery_timestamp_p25_p75,0,0,0,0,0,0\n";
+		return;
+	}
+
+	const size_t start_idx = deliver_times.size() / 4;
+	const size_t end_idx = (deliver_times.size() * 3) / 4;
+	if (end_idx <= start_idx || deliver_times[end_idx] <= deliver_times[start_idx]) {
+		out << "delivery_timestamp_p25_p75," << start_idx << "," << end_idx
+		    << ",0,0,0,0\n";
+		return;
+	}
+
+	const size_t window_messages = end_idx - start_idx;
+	const double window_seconds =
+		static_cast<double>(deliver_times[end_idx] - deliver_times[start_idx]) / 1e9;
+	const uint64_t payload_bytes =
+		static_cast<uint64_t>(window_messages) * static_cast<uint64_t>(result.message_size);
+	const double payload_mib_per_sec =
+		window_seconds > 0.0
+			? (static_cast<double>(payload_bytes) / (1024.0 * 1024.0)) / window_seconds
+			: 0.0;
+
+	out << "delivery_timestamp_p25_p75"
+	    << "," << start_idx
+	    << "," << end_idx
+	    << "," << window_messages
+	    << "," << std::fixed << std::setprecision(6) << window_seconds
+	    << "," << payload_bytes
+	    << "," << payload_mib_per_sec
+	    << "\n";
+
+	LOG(INFO) << "Delivery steady-state throughput: method=delivery_timestamp_p25_p75"
+	          << " window_messages=" << window_messages
+	          << " window_seconds=" << window_seconds
+	          << " payload_mib_per_sec=" << payload_mib_per_sec;
+}
+
 void WriteDeliveryResults(const DeliveryDrainResult& result) {
 	WriteDeliveryMetricCsv(result);
 	WriteDeliveryOrderingCsv(result);
 	WriteDeliveryStageBreakdownCsv(result);
+	WriteDeliverySteadyThroughputCsv(result);
 }
 
 void WriteStageLatencySummary(const StageMetricSummary& ordered,

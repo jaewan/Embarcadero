@@ -594,10 +594,10 @@ run_trial() {
   fi
 
   # Clean up any leftover CSV files from a previous run
-  (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv order5_anomaly_counters_broker*.csv)
+  (cd "$BIN_DIR" && rm -f cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv delivery_steady_throughput.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv order5_anomaly_counters_broker*.csv)
   if [[ "$SCENARIO" == "remote" ]]; then
     ssh -o StrictHostKeyChecking=no "$REMOTE_CLIENT_HOST" \
-      "cd ${REMOTE_CLIENT_BIN_DIR} && rm -f cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv" 2>/dev/null || true
+      "cd ${REMOTE_CLIENT_BIN_DIR} && rm -f cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv delivery_steady_throughput.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv" 2>/dev/null || true
   fi
 
   # Start brokers (local; for remote-client scenario the broker still lives here)
@@ -676,13 +676,13 @@ run_trial() {
 
   if [[ "$SCENARIO" == "remote" ]]; then
     # CSV files were written on the remote client; scp them back.
-	    for f in cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
+	    for f in cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv delivery_steady_throughput.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
       scp -o StrictHostKeyChecking=no \
           "${REMOTE_CLIENT_HOST}:${REMOTE_CLIENT_BIN_DIR}/$f" \
           "$TRIAL_DIR/$f" 2>/dev/null || true
     done
   else
-	    for f in cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
+	    for f in cdf_latency_us.csv latency_stats.csv cdf_delivery_latency_us.csv delivery_latency_stats.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv delivery_steady_throughput.csv pub_cdf_latency_us.csv pub_latency_stats.csv stage_latency_summary.csv latency_benchmark_summary.csv; do
       local src="$BIN_DIR/$f"
       if [[ -f "$src" ]]; then
         mv "$src" "$TRIAL_DIR/$f"
