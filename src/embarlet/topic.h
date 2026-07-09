@@ -85,16 +85,6 @@ struct PendingBatch5 {
 	uint64_t cached_pbr_absolute_index{0};
 	size_t cached_start_logical_offset{0};
 };
-/** Export metadata for batches ordered from hold (ring slot already advanced). */
-struct OrderedHoldExportEntry {
-	size_t log_idx{0};
-	size_t batch_size{0};
-	size_t total_order{0};
-	uint32_t num_messages{0};
-	uint64_t pbr_absolute_index{0};
-};
-
-
 using ClientState5 = OptimizedClientState;
 struct HoldEntry5 {
 	PendingBatch5 batch;
@@ -957,22 +947,16 @@ class Topic {
 		static constexpr uint64_t kClientGcEpochInterval = 1024;
 		static constexpr size_t kDeferredL5MaxEntries = kHoldBufferMaxEntries * 2;
 		alignas(64) std::atomic<uint64_t> current_epoch_for_hold_{0};  // Epoch for hold buffer expiry; atomic for shard workers
-		// Export chain: per-broker cursor into batch header ring (set by EpochSequencerThread on commit).
-		// Fixed array for O(1) indexed access; nullptr = no ring for that broker (e.g. sequencer-only B0).
+		// ORDER=5 compact export stream: descriptors are appended in commit/total-order
+		// order, not keyed by dense PBR. PBR can have holes from held or terminalized
+		// batches; the subscriber cursor follows export_sequence_by_broker_ instead.
 		std::array<BatchHeader*, NUM_MAX_BROKERS> export_cursor_by_broker_{};
+		std::array<uint64_t, NUM_MAX_BROKERS> export_sequence_by_broker_{};
 		absl::Mutex export_cursor_mu_;
 
 		/** Initializes the export chain cursor for a specific broker (ring_start). Idempotent. */
 		void InitExportCursorForBroker(int broker_id);
 		std::vector<std::vector<PendingBatch5>> level5_per_shard_cache_;
-		// [PHASE-8-REVISED] Per-broker unbounded queues for from-hold batch export.
-		// Replaces SPSC ring to avoid deadlock when no subscriber consumes (throughput test).
-		// Uses per-broker mutex to minimize contention (vs global mutex).
-		struct PerBrokerHoldQueue {
-			absl::Mutex mu;
-			absl::btree_map<uint64_t, OrderedHoldExportEntry> q;
-		};
-		std::array<PerBrokerHoldQueue, NUM_MAX_BROKERS> hold_export_queues_{};
 
 		// [[PHASE_2_FIX]] Per-broker absolute PBR counters (never wrap, for CV tracking)
 		std::array<std::atomic<uint64_t>, NUM_MAX_BROKERS> broker_pbr_counters_{};

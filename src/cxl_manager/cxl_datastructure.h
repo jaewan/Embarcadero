@@ -422,7 +422,7 @@ struct alignas(64) BatchHeader{
 	//    (with flush+fence) before the slot can be safely reused.
 	// This prevents duplicate processing of ring slots under ABA reuse.
 	// Keep readiness-critical fields in the first cache line for CXL visibility
-	size_t batch_seq; // [[WRITER: NetworkManager]] Monotonically increasing from each client. Corfu sets in log's seq
+	size_t batch_seq; // [[WRITER: NetworkManager]] Client seq in producer slots; ORDER=5 export seq in compact export descriptors
 	uint32_t client_id; // [[WRITER: NetworkManager]]
 	uint32_t num_msg; // [[WRITER: NetworkManager]] Set by receiver, cleared by sequencer
 	volatile uint32_t batch_complete;  // [[WRITER: NetworkManager (set=1), Sequencer (clear=0)]] Batch-level completion flag for Sequencer 5
