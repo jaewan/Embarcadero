@@ -158,3 +158,98 @@ Rejected classifications:
 Do not implement the broker export pipeline/sharding fix yet. The cheapest next fix is subscriber-side batch receive/parse/stage handoff: remove per-message receive-side allocation/copy/metadata work from the hot `ReceiveWorkerThread` path and hand ordered batches through in spans or pooled buffers. Expected gain: at least recover the prior roughly 0.45-0.5 GB/s single-connection ceiling, with a plausible 2-4x gain if the pinned receive-worker path stops doing per-message work.
 
 Revisit broker `writev`/`sendmmsg`, `MSG_ZEROCOPY`, or double-buffered export only after subscriber receive workers are no longer pegged and the loopback receive queues stay shallow.
+
+## Receive-path copy reduction pass
+
+Date: 2026-07-09
+Commit under test: working tree after the receive-path parser/pool change
+
+Scope implemented:
+
+* `ParseAndStageOrderedBytes` parses complete ordered frames directly from the recv buffer.
+* `state.buffer` is now a carry buffer for incomplete metadata/header/message tails. The common case no longer does `state.buffer.insert(end, whole_chunk)` followed by prefix `erase`.
+* `OwnedMessage` allocation now uses a bounded subscriber-owned recycle pool. This removes most `make_unique<OwnedMessage>()` churn and avoids returning the message object/vector storage to malloc on the drain thread.
+* The final `OwnedMessage::data` copy remains. This pass did not implement the larger zero-copy retained-buffer lifetime model.
+
+Smoke result:
+
+| run | size | windowed delivery goodput | ordering assertion |
+| --- | ---: | ---: | --- |
+| `smoke2_recvfix_20260709T071044Z` | 1 GiB | 936.593 MiB/s | pass |
+
+The smoke run is correctness/usefulness signal only. It is not the capacity number because it is too short to expose the sustained 8 GiB backlog behavior.
+
+Authoritative before/after 8 GiB result:
+
+| run | code state | windowed delivery goodput | e2e goodput | publish->receive p99 | publish->deliver p99 | ordering assertion |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `profile_8g_perf_20260709T063921Z` | before receive-path change | 287.078 MiB/s | 274.962 MB/s | 20.559 s | 20.627 s | pass |
+| `recvfix_8g2_20260709T071144Z` | after in-place/carry parser + message pool | 277.902 MiB/s | 273.287 MB/s | 20.592 s | 20.848 s | pass |
+
+After-run artifact directory:
+
+`data/latency/delivery_recvfix_profile/steady/recvfix_8g2_20260709T071144Z/EMBARCADERO_order5_ack1_msg1024_bytes8589934592_trial1`
+
+Profiler scratch directory:
+
+`/tmp/delivery_recvfix_profile2`
+
+After-run ordering assertion:
+
+```csv
+Target,Delivered,RecordedSamples,TimedOut,InvalidMessages,DuplicateTotalOrder,OutOfOrderTotalOrder,DuplicateUid,MissingUid,FirstTotalOrder,LastTotalOrder,MinUid,MaxUid,ReceiveMatched,Pass
+8388608,8388608,8388608,0,0,0,0,0,0,0,8388607,1,8388608,8388608,1
+```
+
+After-run `delivery_steady_throughput.csv`:
+
+```csv
+Method,StartSample,EndSample,WindowMessages,WindowSeconds,PayloadBytes,PayloadMiBPerSec
+delivery_timestamp_p25_p75,2097152,6291456,4194304,14.738993,4294967296,277.902301
+```
+
+After-run subscriber thread CPU:
+
+| tid | role | average CPU over sampled run | steady drain observation |
+| ---: | --- | ---: | --- |
+| `3006411` | `ReceiveWorkerThread` | 88.58% | pinned near 99-101% from 16:12:11 through 16:12:38 |
+| `3006412` | `ReceiveWorkerThread` | 90.91% | pinned near 99-101% from 16:12:11 through 16:12:38 |
+| `3006413` | `ReceiveWorkerThread` | 88.18% | pinned near 99-101% from 16:12:11 through 16:12:38 |
+| `3006414` | `ReceiveWorkerThread` | 89.24% | pinned near 99-101% from 16:12:11 through 16:12:38 |
+
+The receive worker TIDs were confirmed by the clean shutdown log:
+
+```text
+ReceiveWorkerThread fd=11 -> tid 3006411
+ReceiveWorkerThread fd=14 -> tid 3006412
+ReceiveWorkerThread fd=15 -> tid 3006413
+ReceiveWorkerThread fd=12 -> tid 3006414
+```
+
+After-run broker thread CPU:
+
+| broker pid | hot embarlet tid | observation |
+| ---: | ---: | --- |
+| `3005614` | `3006036` | about 100% during initial publish/export fill, mostly 1-3% during subscriber drain, then about 100% at final close/export work |
+| `3005615` | `3006204` | about 100% during initial publish/export fill, mostly 1-3% during subscriber drain, then about 100% at final close/export work |
+| `3005616` | `3006186` | about 100% during initial publish/export fill, mostly 1-3% during subscriber drain, then about 100% at final close/export work |
+| `3005617` | `3006222` | about 100% during initial publish/export fill, mostly 1-3% during subscriber drain, then about 100% at final close/export work |
+
+Broker export CPU is not the sustained delivery limiter in the after-run. The broker send queues remain blocked by the subscriber receive side once the drain falls behind.
+
+Socket snapshot during the after-run (`ss_mid_12s.txt`):
+
+| broker port | broker Send-Q | broker `notsent` | broker `rwnd_limited` | subscriber Recv-Q |
+| ---: | ---: | ---: | ---: | ---: |
+| 1214 | 120,750,652 B | 120,750,652 B | 94.1% | 31,899,994 B |
+| 1215 | 127,757,333 B | 127,757,333 B | 95.0% | 32,074,339 B |
+| 1216 | 116,035,876 B | 116,035,876 B | 94.4% | 32,738,805 B |
+| 1217 | 125,596,394 B | 125,596,394 B | 93.6% | 33,132,719 B |
+
+Classification after this pass:
+
+The safe receive-path copy reductions are correctness-clean but did not move the sustained 8 GiB ceiling. The new 8 GiB rate is statistically the same as before, and the same four subscriber receive workers are still pinned. The remaining limiter is still the subscriber receive path, specifically recv-thread parse/stage plus the still-present per-message copy into `OwnedMessage::data`.
+
+Next decision:
+
+Stop here before the large rewrite. The next real fix is structural: either implement the ordered-path zero-copy retained-buffer lifetime model, or decouple recv from parse/stage so a socket-drain thread can keep draining while parser/stager threads consume retained chunks. Broker export pipeline/sharding is still not the next gated fix.

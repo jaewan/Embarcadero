@@ -192,6 +192,48 @@ void Subscriber::RemoveConnection(int fd) {
 	}
 }
 
+void Subscriber::OwnedMessageRecycler::operator()(OwnedMessage* msg) const {
+	if (owner != nullptr) {
+		owner->RecycleOwnedMessage(msg);
+		return;
+	}
+	delete msg;
+}
+
+Subscriber::OwnedMessagePtr Subscriber::AcquireOwnedMessage() {
+	std::unique_ptr<OwnedMessage> storage;
+	{
+		absl::MutexLock lock(&owned_message_pool_mutex_);
+		if (!owned_message_pool_.empty()) {
+			storage = std::move(owned_message_pool_.back());
+			owned_message_pool_.pop_back();
+		}
+	}
+	if (!storage) {
+		storage = std::make_unique<OwnedMessage>();
+	}
+	storage->data.clear();
+	storage->header_version = Embarcadero::wire::HEADER_VERSION_V1;
+	return OwnedMessagePtr(storage.release(), OwnedMessageRecycler{this});
+}
+
+void Subscriber::RecycleOwnedMessage(OwnedMessage* msg) {
+	if (msg == nullptr) {
+		return;
+	}
+	msg->data.clear();
+	msg->header_version = Embarcadero::wire::HEADER_VERSION_V1;
+	constexpr size_t kMaxPooledMessages = 262144;
+	std::unique_ptr<OwnedMessage> storage(msg);
+	{
+		absl::MutexLock lock(&owned_message_pool_mutex_);
+		if (owned_message_pool_.size() < kMaxPooledMessages) {
+			owned_message_pool_.push_back(std::move(storage));
+			return;
+		}
+	}
+}
+
 // Helper struct to store header data for validation (supports both V1 and V2)
 struct HeaderValidationData {
 	size_t total_order;
@@ -2575,19 +2617,14 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 	const bool record_latency = (latency_conn != nullptr);
 
 	constexpr size_t kMaxStreamBufferBytes = 64UL << 20; // 64 MB safety cap
-	ReserveForAppend(state.buffer, len);
-	state.buffer.insert(state.buffer.end(), data, data + len);
-	if (state.buffer.size() > kMaxStreamBufferBytes) {
-		LOG(WARNING) << "ConsumeOrdered: stream buffer exceeded cap, dropping "
-		             << state.buffer.size() << " bytes";
+	auto reset_stream_state = [&]() {
 		state.buffer.clear();
 		state.has_pending_metadata = false;
 		state.current_batch_messages_processed = 0;
 		state.next_message_order_in_batch = 0;
-		return;
-	}
+	};
 
-	std::vector<std::pair<size_t, std::unique_ptr<OwnedMessage>>> parsed_messages;
+	std::vector<std::pair<size_t, OwnedMessagePtr>> parsed_messages;
 	parsed_messages.reserve(std::min<size_t>((len / 1024) + 1, 4096));
 	std::vector<LatencySample> latency_samples;
 	if (record_latency) {
@@ -2597,55 +2634,114 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 	uint64_t latency_parsed_messages = 0;
 	uint64_t latency_rejected_ts = 0;
 
-	size_t pos = 0;
-	const size_t buf_size = state.buffer.size();
-	while (pos < buf_size) {
-		if (!state.has_pending_metadata) {
-			if (buf_size - pos < sizeof(Embarcadero::wire::BatchMetadata)) {
-				break;
-			}
-			const auto* meta = reinterpret_cast<const Embarcadero::wire::BatchMetadata*>(
-				state.buffer.data() + pos);
-			if (Embarcadero::wire::IsValidHeaderVersion(meta->header_version) &&
-			    meta->num_messages > 0 &&
-			    meta->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
-			    meta->batch_total_order < Embarcadero::wire::MAX_BATCH_TOTAL_ORDER) {
-				state.pending_metadata = *meta;
-				state.has_pending_metadata = true;
-				state.current_batch_messages_processed = 0;
-				state.next_message_order_in_batch = meta->batch_total_order;
-				if (record_latency) {
-					latency_metadata_detected++;
+	auto parse_contiguous = [&](const uint8_t* bytes, size_t size) -> size_t {
+		size_t pos = 0;
+		while (pos < size) {
+			if (!state.has_pending_metadata) {
+				if (size - pos < sizeof(Embarcadero::wire::BatchMetadata)) {
+					break;
 				}
-				pos += sizeof(Embarcadero::wire::BatchMetadata);
-				continue;
-			}
-			pos += 8;
-			continue;
-		}
-
-		const uint16_t header_version = state.pending_metadata.header_version;
-		if (header_version == Embarcadero::wire::HEADER_VERSION_V2) {
-			if (buf_size - pos < sizeof(Embarcadero::BlogMessageHeader)) {
-				break;
-			}
-			const auto* hdr = reinterpret_cast<const Embarcadero::BlogMessageHeader*>(
-				state.buffer.data() + pos);
-			const size_t payload_size = hdr->size;
-			if (payload_size == 0 ||
-			    payload_size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+				const auto* meta = reinterpret_cast<const Embarcadero::wire::BatchMetadata*>(
+					bytes + pos);
+				if (Embarcadero::wire::IsValidHeaderVersion(meta->header_version) &&
+				    meta->num_messages > 0 &&
+				    meta->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
+				    meta->batch_total_order < Embarcadero::wire::MAX_BATCH_TOTAL_ORDER) {
+					state.pending_metadata = *meta;
+					state.has_pending_metadata = true;
+					state.current_batch_messages_processed = 0;
+					state.next_message_order_in_batch = meta->batch_total_order;
+					if (record_latency) {
+						latency_metadata_detected++;
+					}
+					pos += sizeof(Embarcadero::wire::BatchMetadata);
+					continue;
+				}
 				pos += 8;
 				continue;
 			}
-			const size_t stride = Embarcadero::wire::ComputeStrideV2(payload_size);
-			if (buf_size - pos < stride) {
+
+			const uint16_t header_version = state.pending_metadata.header_version;
+			if (header_version == Embarcadero::wire::HEADER_VERSION_V2) {
+				if (size - pos < sizeof(Embarcadero::BlogMessageHeader)) {
+					break;
+				}
+				const auto* hdr = reinterpret_cast<const Embarcadero::BlogMessageHeader*>(
+					bytes + pos);
+				const size_t payload_size = hdr->size;
+				if (payload_size == 0 ||
+				    payload_size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+					pos += 8;
+					continue;
+				}
+				const size_t stride = Embarcadero::wire::ComputeStrideV2(payload_size);
+				if (size - pos < stride) {
+					break;
+				}
+
+				auto msg = AcquireOwnedMessage();
+				msg->header_version = header_version;
+				msg->data.resize(stride);
+				std::memcpy(msg->data.data(), bytes + pos, stride);
+				auto* msg_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg->data.data());
+				if (msg_hdr->total_order == 0) {
+					msg_hdr->total_order = state.next_message_order_in_batch;
+				}
+				const size_t total_order = msg_hdr->total_order;
+				const size_t batch_message_index = state.current_batch_messages_processed;
+				if (record_latency) {
+					latency_parsed_messages++;
+					LatencySample sample{};
+					bool rejected_ts = false;
+					if (BuildLatencySampleFromFrame(
+							bytes + pos,
+							stride,
+							sizeof(Embarcadero::BlogMessageHeader),
+							state.pending_metadata.batch_total_order,
+							batch_message_index,
+							recv_time,
+							recv_buffer_age_us,
+							recv_chunk_bytes,
+							&sample,
+							&rejected_ts)) {
+						latency_samples.push_back(sample);
+					} else if (rejected_ts) {
+						latency_rejected_ts++;
+					}
+				}
+				state.next_message_order_in_batch = total_order + 1;
+				state.current_batch_messages_processed++;
+				if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
+					state.has_pending_metadata = false;
+				}
+				pos += stride;
+				parsed_messages.emplace_back(total_order, std::move(msg));
+				continue;
+			}
+
+			if (size - pos < sizeof(Embarcadero::MessageHeader)) {
+				break;
+			}
+			const auto* hdr = reinterpret_cast<const Embarcadero::MessageHeader*>(
+				bytes + pos);
+			const size_t padded_size = hdr->paddedSize;
+			const bool invalid_v1_header =
+				padded_size < Embarcadero::wire::V1_HEADER_SIZE ||
+				padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
+				(padded_size % 64 != 0);
+			if (invalid_v1_header) {
+				pos += 8;
+				continue;
+			}
+			if (size - pos < padded_size) {
 				break;
 			}
 
-			auto msg = std::make_unique<OwnedMessage>();
+			auto msg = AcquireOwnedMessage();
 			msg->header_version = header_version;
-			msg->data.assign(state.buffer.begin() + pos, state.buffer.begin() + pos + stride);
-			auto* msg_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg->data.data());
+			msg->data.resize(padded_size);
+			std::memcpy(msg->data.data(), bytes + pos, padded_size);
+			auto* msg_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(msg->data.data());
 			if (msg_hdr->total_order == 0) {
 				msg_hdr->total_order = state.next_message_order_in_batch;
 			}
@@ -2656,9 +2752,9 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 				LatencySample sample{};
 				bool rejected_ts = false;
 				if (BuildLatencySampleFromFrame(
-						msg->data.data(),
-						stride,
-						sizeof(Embarcadero::BlogMessageHeader),
+						bytes + pos,
+						padded_size,
+						sizeof(Embarcadero::MessageHeader),
 						state.pending_metadata.batch_total_order,
 						batch_message_index,
 						recv_time,
@@ -2676,71 +2772,107 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 			if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
 				state.has_pending_metadata = false;
 			}
-			pos += stride;
+			pos += padded_size;
 			parsed_messages.emplace_back(total_order, std::move(msg));
-			continue;
 		}
+		return pos;
+	};
 
-		if (buf_size - pos < sizeof(Embarcadero::MessageHeader)) {
-			break;
+	auto carry_bytes_needed = [&]() -> size_t {
+		const size_t carry_size = state.buffer.size();
+		if (!state.has_pending_metadata) {
+			return carry_size < sizeof(Embarcadero::wire::BatchMetadata)
+				? sizeof(Embarcadero::wire::BatchMetadata) - carry_size
+				: 0;
+		}
+		const uint16_t header_version = state.pending_metadata.header_version;
+		if (header_version == Embarcadero::wire::HEADER_VERSION_V2) {
+			if (carry_size < sizeof(Embarcadero::BlogMessageHeader)) {
+				return sizeof(Embarcadero::BlogMessageHeader) - carry_size;
+			}
+			const auto* hdr = reinterpret_cast<const Embarcadero::BlogMessageHeader*>(
+				state.buffer.data());
+			const size_t payload_size = hdr->size;
+			if (payload_size == 0 ||
+			    payload_size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
+				return 0;
+			}
+			const size_t stride = Embarcadero::wire::ComputeStrideV2(payload_size);
+			return carry_size < stride ? stride - carry_size : 0;
+		}
+		if (carry_size < sizeof(Embarcadero::MessageHeader)) {
+			return sizeof(Embarcadero::MessageHeader) - carry_size;
 		}
 		const auto* hdr = reinterpret_cast<const Embarcadero::MessageHeader*>(
-			state.buffer.data() + pos);
+			state.buffer.data());
 		const size_t padded_size = hdr->paddedSize;
 		const bool invalid_v1_header =
 			padded_size < Embarcadero::wire::V1_HEADER_SIZE ||
 			padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
 			(padded_size % 64 != 0);
 		if (invalid_v1_header) {
-			pos += 8;
-			continue;
+			return 0;
 		}
-		if (buf_size - pos < padded_size) {
-			break;
-		}
+		return state.buffer.size() < padded_size ? padded_size - state.buffer.size() : 0;
+	};
 
-		auto msg = std::make_unique<OwnedMessage>();
-		msg->header_version = header_version;
-		msg->data.assign(state.buffer.begin() + pos, state.buffer.begin() + pos + padded_size);
-		auto* msg_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(msg->data.data());
-		if (msg_hdr->total_order == 0) {
-			msg_hdr->total_order = state.next_message_order_in_batch;
-		}
-		const size_t total_order = msg_hdr->total_order;
-		const size_t batch_message_index = state.current_batch_messages_processed;
-		if (record_latency) {
-			latency_parsed_messages++;
-			LatencySample sample{};
-			bool rejected_ts = false;
-			if (BuildLatencySampleFromFrame(
-					msg->data.data(),
-					padded_size,
-					sizeof(Embarcadero::MessageHeader),
-					state.pending_metadata.batch_total_order,
-					batch_message_index,
-					recv_time,
-					recv_buffer_age_us,
-					recv_chunk_bytes,
-					&sample,
-					&rejected_ts)) {
-				latency_samples.push_back(sample);
-			} else if (rejected_ts) {
-				latency_rejected_ts++;
+	if (!state.buffer.empty()) {
+		size_t input_pos = 0;
+		while (!state.buffer.empty() && input_pos < len) {
+			const size_t consumed = parse_contiguous(state.buffer.data(), state.buffer.size());
+			if (consumed >= state.buffer.size()) {
+				state.buffer.clear();
+				break;
+			}
+			if (consumed > 0) {
+				state.buffer.erase(
+					state.buffer.begin(),
+					state.buffer.begin() + static_cast<std::vector<uint8_t>::difference_type>(consumed));
+				continue;
+			}
+			size_t needed = carry_bytes_needed();
+			if (needed == 0) {
+				needed = std::min<size_t>(8, len - input_pos);
+			}
+			const size_t take = std::min(needed, len - input_pos);
+			ReserveForAppend(state.buffer, take);
+			state.buffer.insert(state.buffer.end(), data + input_pos, data + input_pos + take);
+			input_pos += take;
+			if (state.buffer.size() > kMaxStreamBufferBytes) {
+				LOG(WARNING) << "ConsumeOrdered: stream carry buffer exceeded cap, dropping "
+				             << state.buffer.size() << " bytes";
+				reset_stream_state();
+				return;
 			}
 		}
-		state.next_message_order_in_batch = total_order + 1;
-		state.current_batch_messages_processed++;
-		if (state.current_batch_messages_processed >= state.pending_metadata.num_messages) {
-			state.has_pending_metadata = false;
+		if (!state.buffer.empty() && input_pos == len) {
+			const size_t consumed = parse_contiguous(state.buffer.data(), state.buffer.size());
+			if (consumed >= state.buffer.size()) {
+				state.buffer.clear();
+			} else if (consumed > 0) {
+				state.buffer.erase(
+					state.buffer.begin(),
+					state.buffer.begin() + static_cast<std::vector<uint8_t>::difference_type>(consumed));
+			}
 		}
-		pos += padded_size;
-		parsed_messages.emplace_back(total_order, std::move(msg));
-	}
-
-	if (pos > 0) {
-		state.buffer.erase(
-			state.buffer.begin(),
-			state.buffer.begin() + static_cast<std::vector<uint8_t>::difference_type>(pos));
+		if (state.buffer.empty() && input_pos < len) {
+			const size_t consumed = parse_contiguous(data + input_pos, len - input_pos);
+			if (input_pos + consumed < len) {
+				state.buffer.assign(data + input_pos + consumed, data + len);
+			}
+		}
+	} else {
+		const size_t consumed = parse_contiguous(data, len);
+		if (consumed < len) {
+			const size_t carry_bytes = len - consumed;
+			if (carry_bytes > kMaxStreamBufferBytes) {
+				LOG(WARNING) << "ConsumeOrdered: stream carry exceeded cap, dropping "
+				             << carry_bytes << " bytes";
+				reset_stream_state();
+				return;
+			}
+			state.buffer.assign(data + consumed, data + len);
+		}
 	}
 
 	if (!parsed_messages.empty()) {
@@ -2774,7 +2906,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 }
 
 void Subscriber::StageOrderedMessages(
-		std::vector<std::pair<size_t, std::unique_ptr<OwnedMessage>>> messages) {
+		std::vector<std::pair<size_t, OwnedMessagePtr>> messages) {
 	if (messages.empty()) {
 		return;
 	}
@@ -2861,7 +2993,7 @@ void* Subscriber::TryPopOrderedMessageLocked() {
 
 size_t Subscriber::TryPopOrderedMessagesLocked(
 		size_t max_messages,
-		std::vector<std::unique_ptr<OwnedMessage>>* out) {
+		std::vector<OwnedMessagePtr>* out) {
 	if (max_messages == 0 || out == nullptr) {
 		return 0;
 	}

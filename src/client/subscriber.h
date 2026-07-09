@@ -468,6 +468,13 @@ class Subscriber {
 			std::vector<uint8_t> data;
 			uint16_t header_version = Embarcadero::wire::HEADER_VERSION_V1;
 		};
+		struct OwnedMessageRecycler {
+			Subscriber* owner = nullptr;
+			OwnedMessageRecycler() noexcept = default;
+			explicit OwnedMessageRecycler(Subscriber* subscriber) noexcept : owner(subscriber) {}
+			void operator()(OwnedMessage* msg) const;
+		};
+		using OwnedMessagePtr = std::unique_ptr<OwnedMessage, OwnedMessageRecycler>;
 
 		struct StreamParseState {
 			std::vector<uint8_t> buffer;
@@ -477,11 +484,13 @@ class Subscriber {
 			size_t next_message_order_in_batch = 0;
 		};
 
+		absl::Mutex owned_message_pool_mutex_;
+		std::vector<std::unique_ptr<OwnedMessage>> owned_message_pool_ ABSL_GUARDED_BY(owned_message_pool_mutex_);
 		size_t next_expected_order_ ABSL_GUARDED_BY(consume_mutex_){0};
-		std::deque<std::unique_ptr<OwnedMessage>> pending_messages_ ABSL_GUARDED_BY(consume_mutex_);
+		std::deque<OwnedMessagePtr> pending_messages_ ABSL_GUARDED_BY(consume_mutex_);
 		size_t pending_messages_base_order_ ABSL_GUARDED_BY(consume_mutex_){0};
-		std::unique_ptr<OwnedMessage> last_returned_;
-		std::vector<std::unique_ptr<OwnedMessage>> last_returned_batch_;
+		OwnedMessagePtr last_returned_;
+		std::vector<OwnedMessagePtr> last_returned_batch_;
 		uint16_t last_consumed_wire_version_{Embarcadero::wire::HEADER_VERSION_V1};
 
 		// --- Order < 2 consume state (per-Subscriber, not static) ---
@@ -504,10 +513,12 @@ class Subscriber {
 		                               const std::chrono::steady_clock::time_point& recv_time,
 		                               long long recv_buffer_age_us,
 		                               size_t recv_chunk_bytes);
-		void StageOrderedMessages(std::vector<std::pair<size_t, std::unique_ptr<OwnedMessage>>> messages);
+		OwnedMessagePtr AcquireOwnedMessage();
+		void RecycleOwnedMessage(OwnedMessage* msg);
+		void StageOrderedMessages(std::vector<std::pair<size_t, OwnedMessagePtr>> messages);
 		void* TryPopOrderedMessageLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
 		size_t TryPopOrderedMessagesLocked(size_t max_messages,
-		                                   std::vector<std::unique_ptr<OwnedMessage>>* out)
+		                                   std::vector<OwnedMessagePtr>* out)
 			ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
 		void* ConsumeOrdered(int timeout_ms);
 
