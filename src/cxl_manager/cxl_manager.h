@@ -44,6 +44,7 @@ class CXLManager{
 		GOIEntry* GetGOI() { return goi_; }
 		CompletionVectorEntry* GetCompletionVector() { return completion_vector_; }
 		ControlBlock* GetControlBlock() { return control_block_; }
+		bool RequiresExplicitPayloadHeaderFlush() const { return requires_explicit_payload_header_flush_; }
 
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
 			get_registered_brokers_callback_ = callback;
@@ -107,6 +108,7 @@ class CXLManager{
 		NetworkManager *network_manager_;
 
 		void* cxl_addr_;
+		bool requires_explicit_payload_header_flush_{true};
 		ControlBlock* control_block_;                 // [[PHASE_1A]] At offset 0; epoch-based fencing
 		CompletionVectorEntry* completion_vector_;    // [[PHASE_2]] At offset 0x1000; ACK path (32 × 128B)
 		GOIEntry* goi_;                               // [[PHASE_2]] At offset 0x2000; 256M entries × 64B = 16GB

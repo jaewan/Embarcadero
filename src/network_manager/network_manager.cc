@@ -1601,17 +1601,23 @@ void NetworkManager::HandlePublishRequest(
 			running = false;
 			break;
 		}
-		// [[BLOG_HEADER]] v1 (MessageHeader) and v2 (BlogMessageHeader) both need every per-message
-		// header cacheline explicitly flushed to CXL before PublishPBRSlotDirect signals
-		// batch_complete=1 — recv() only lands these stores in this CPU's L1/L2 (see
-		// [[CXL_VISIBILITY_FIX]] below). v2 was previously skipped here on the assumption that
-		// "v1 per-message validation" was the only thing being skipped; in fact the flush itself
-		// was v1-only, leaving BlogMessageHeader payload bytes potentially stale/zero-initialized
-		// from CXL's perspective when read by a different thread later (the sequencer's per-batch
-		// size recompute, CommitEpoch's RecomputeOrder5BatchSizeFromPayload, silently falling back
-		// to BatchHeader::total_size whenever this manifested — the real root cause that fallback
-		// was papering over, not a producer/consumer stride-formula mismatch).
-		if (!is_blog_header_enabled) {
+		// [[BLOG_HEADER]] v1 (MessageHeader) and v2 (BlogMessageHeader) need per-message
+		// header cacheline flushes before PublishPBRSlotDirect only on non-coherent CXL/DAX
+		// mappings. shm-backed benchmark mappings are CPU-cache coherent, so the flush walk is
+		// pure overhead there. v2 was previously skipped on the assumption that "v1 per-message
+		// validation" was the only thing being skipped; in fact the flush itself was v1-only,
+		// leaving BlogMessageHeader payload bytes potentially stale/zero-initialized from CXL's
+		// perspective when read by a different thread later.
+		const bool flush_payload_headers =
+			cxl_manager_ == nullptr || cxl_manager_->RequiresExplicitPayloadHeaderFlush();
+		if (!flush_payload_headers) {
+			static std::atomic<bool> logged_payload_flush_skip{false};
+			bool expected = false;
+			if (logged_payload_flush_skip.compare_exchange_strong(
+					expected, true, std::memory_order_relaxed)) {
+				LOG(INFO) << "NetworkManager: skipping per-message payload-header flush on cache-coherent CXL mapping";
+			}
+		} else if (!is_blog_header_enabled) {
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
 			// recv() populated these MessageHeader cache lines before returning to user space.
