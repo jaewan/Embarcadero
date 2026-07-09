@@ -143,6 +143,8 @@ This exercises the RF/ACK2 path on the same host and with the default full-body 
 - Enabled the ordered delivery stream during latency measurement and added a concurrent drain loop that timestamps `Consume()` return.
 - Added `delivery_latency_stats.csv`, `cdf_delivery_latency_us.csv`, `delivery_ordering_assertion.csv`, and `delivery_stage_breakdown.csv`.
 - Added an ordered-consumer fast path: if `pending_messages_` already contains the next total order, `ConsumeOrdered()` returns it before relocking and reparsing connection streams.
+- Added `ConsumeOrderedBatch()` and switched the delivery benchmark drain to batch ordered-consume calls.
+- Added `EMBARCADERO_LATENCY_SUB_CONNECTIONS` for explicit multi-connection latency/capacity experiments; current broker export duplicates streams across those connections, so this is diagnostic only until export partitioning exists.
 
 ## Build
 
@@ -195,6 +197,38 @@ RecvChunkBytes p99:         ~1 MiB
 
 Interpretation: the true delivery path is now being measured and is lossless, but the single-message `ConsumeOrdered()` drain remains the limiting stage on the 4-broker 1 KiB-message load. The receive side is no longer the whole tail.
 
+## 2026-07-09 Delivery API Artifact Follow-Up
+
+Implemented a batched ordered-consume path for the benchmark drain:
+
+- `Subscriber::ConsumeOrderedBatch(max_messages)` pops contiguous ready ordered messages under one `consume_mutex_` acquisition.
+- `DrainDeliveredMessages()` now drains up to `EMBARCADERO_DELIVERY_DRAIN_BATCH` messages per call, defaulting to 1024.
+- `EMBARCADERO_LATENCY_SUB_CONNECTIONS` can opt latency measurement into more than one subscriber connection per broker for capacity experiments. The default remains 1 connection to preserve the existing SLO measurement shape.
+
+The 64 MiB smoke confirms the one-message-per-call drain was a real small-run artifact:
+
+| Run | Total | Target | Subscriber conns/broker | Drain batch | E2E goodput | Publish->Deliver p50 | p99 | p99.9 | max | Ordering |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Previous fast path | 64 MiB | 1000 MB/s | 1 | 1 | not retained | 67.380 ms | 89.184 ms | 89.568 ms | 89.619 ms | pass |
+| Batch drain | 64 MiB | 1000 MB/s | 1 | 1024 | 895.26 MB/s | 3.596 ms | 4.573 ms | 4.659 ms | 4.722 ms | pass, 65536/65536 |
+| Batch drain + 4 conns | 64 MiB | 1000 MB/s | 4 | 1024 | 900.35 MB/s | 3.285 ms | 4.247 ms | 4.347 ms | 4.413 ms | pass, 65536/65536 |
+
+However, the 4 GiB capacity point is not fixed by batching alone. With one subscriber connection per broker, the large run remains around the same end-to-end drain ceiling and the long tail has moved to publish-to-receive/receive parsing rather than the ordered-consume mutex:
+
+| Target MB/s | Subscriber conns/broker | Drain batch | Achieved offered MB/s | Publish goodput MB/s | E2E goodput MB/s | Publish->Deliver p50 | p99 | Publish->Receive p99 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1000 | 1 | 4096 | 999.99 | 940.58 | 476.92 | 547.057 ms | 4154.584 ms | 4003.050 ms |
+| 4000 | 1 | 4096 | 2194.94 | 2063.21 | 456.11 | 2654.761 ms | 6899.660 ms | 6577.710 ms |
+
+The opt-in four-connection run currently regresses because every subscriber connection receives the same export stream. The dedupe counters make this explicit:
+
+| Target MB/s | Subscriber conns/broker | Parsed latency messages | Recorded unique messages | E2E goodput MB/s | Publish->Deliver p50 | p99 | Publish->Receive p99 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1000 | 4 | 16,748,474 | 4,194,304 | 341.42 | 1223.492 ms | 7482.838 ms | 7446.310 ms |
+| 4000 | 4 | 16,736,649 | 4,194,304 | 355.20 | 1695.878 ms | 8765.772 ms | 8735.100 ms |
+
+Interpretation: the current ~0.5 GB/s 4 GiB delivery number should be reported as the ceiling of the current single-consumer/single-stream delivery measurement path, not as the system's fundamental ordered-merge capacity. Batch draining removes the small-run drain artifact; large-run capacity still needs partitioned subscriber export or an equivalent zero-copy/partitioned handoff before multi-connection capacity can be claimed.
+
 ## Throughput Guard
 
 4-broker ORDER=5 publish-only, 4 GiB, 1 KiB messages:
@@ -213,6 +247,7 @@ This meets the approximate 12 GB/s guard in the same fallback regime noted by pr
 - 100 MB/s point: under 100 ms average p99 in both flush policies.
 - 1000 MB/s and above: delivery p99 is seconds, not tens of milliseconds. The branch should not claim a sub-50 ms or sub-100 ms headline delivery SLO at 4 GiB.
 - 4000/6000/8000 MB/s targets did not achieve requested offered load; the publisher saturated around 2.2 GB/s and the end-to-end drain around 0.5 GB/s.
+- Batch ordered-consume lowers the 64 MiB smoke p99 to about 4.6 ms, but the 4 GiB capacity ceiling remains about 0.46-0.48 GB/s with one subscriber connection. Four subscriber connections currently duplicate export traffic and regress to about 0.34-0.36 GB/s.
 
 ## Hard-Gate Status
 

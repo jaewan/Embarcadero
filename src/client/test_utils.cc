@@ -38,6 +38,21 @@ static bool ShouldValidateOrder() {
 	return std::strcmp(env, "0") != 0;
 }
 
+size_t DeliveryDrainBatchSize() {
+	const char* env = std::getenv("EMBARCADERO_DELIVERY_DRAIN_BATCH");
+	if (env == nullptr || env[0] == '\0') {
+		return 1024;
+	}
+	try {
+		const size_t parsed = static_cast<size_t>(std::stoull(env));
+		return std::max<size_t>(1, parsed);
+	} catch (...) {
+		LOG(WARNING) << "Invalid EMBARCADERO_DELIVERY_DRAIN_BATCH='"
+		             << env << "', falling back to 1024";
+		return 1024;
+	}
+}
+
 std::string GetHeadAddr(const cxxopts::ParseResult& result) {
 	if (result.count("head_addr") > 0) {
 		const std::string addr = result["head_addr"].as<std::string>();
@@ -444,59 +459,71 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 	uint64_t expected_total_order = 0;
 	size_t unique_uids = 0;
 	bool saw_uid = false;
+	const size_t drain_batch_size = DeliveryDrainBatchSize();
+	std::vector<Subscriber::OrderedMessageView> delivered_batch;
+	delivered_batch.reserve(drain_batch_size);
 
 	while (result.delivered < target_messages &&
 	       std::chrono::steady_clock::now() < deadline) {
-		void* raw = subscriber.Consume(10);
-		if (raw == nullptr) {
+		const size_t max_to_drain = std::min(
+			drain_batch_size,
+			target_messages - result.delivered);
+		const size_t batch_count =
+			subscriber.ConsumeOrderedBatch(&delivered_batch, max_to_drain, 10);
+		if (batch_count == 0) {
 			continue;
 		}
-		const long long deliver_ns = SteadyNsNow();
-		result.delivered++;
-
-		DeliveryLatencySample sample;
-		if (!ExtractDeliveredMessage(raw,
-				subscriber.LastConsumedWireHeaderVersion(),
-				message_size,
-				&sample)) {
-			result.invalid_messages++;
-			continue;
-		}
-		sample.delivery_latency_us = (deliver_ns - sample.send_time_ns) / 1000;
-
-		if (have_expected_total_order &&
-		    sample.total_order == result.last_total_order) {
-			result.duplicate_total_order++;
-		}
-		if (!have_expected_total_order) {
-			have_expected_total_order = true;
-			expected_total_order = sample.total_order;
-			result.first_total_order = sample.total_order;
-		}
-		if (sample.total_order != expected_total_order) {
-			result.out_of_order_total_order++;
-			expected_total_order = sample.total_order;
-		}
-		expected_total_order++;
-		result.last_total_order = sample.total_order;
-
-		if (sample.has_uid) {
-			saw_uid = true;
-			if (!seen_uids.empty() &&
-			    sample.msg_uid > 0 &&
-			    sample.msg_uid <= target_messages) {
-				if (seen_uids[sample.msg_uid] != 0) {
-					result.duplicate_uid++;
-				} else {
-					seen_uids[sample.msg_uid] = 1;
-					unique_uids++;
-				}
+		for (const auto& delivered : delivered_batch) {
+			if (result.delivered >= target_messages) {
+				break;
 			}
-			result.min_uid = std::min(result.min_uid, sample.msg_uid);
-			result.max_uid = std::max(result.max_uid, sample.msg_uid);
-		}
+			const long long deliver_ns = SteadyNsNow();
+			result.delivered++;
 
-		result.samples.push_back(sample);
+			DeliveryLatencySample sample;
+			if (!ExtractDeliveredMessage(delivered.data,
+					delivered.wire_header_version,
+					message_size,
+					&sample)) {
+				result.invalid_messages++;
+				continue;
+			}
+			sample.delivery_latency_us = (deliver_ns - sample.send_time_ns) / 1000;
+
+			if (have_expected_total_order &&
+			    sample.total_order == result.last_total_order) {
+				result.duplicate_total_order++;
+			}
+			if (!have_expected_total_order) {
+				have_expected_total_order = true;
+				expected_total_order = sample.total_order;
+				result.first_total_order = sample.total_order;
+			}
+			if (sample.total_order != expected_total_order) {
+				result.out_of_order_total_order++;
+				expected_total_order = sample.total_order;
+			}
+			expected_total_order++;
+			result.last_total_order = sample.total_order;
+
+			if (sample.has_uid) {
+				saw_uid = true;
+				if (!seen_uids.empty() &&
+				    sample.msg_uid > 0 &&
+				    sample.msg_uid <= target_messages) {
+					if (seen_uids[sample.msg_uid] != 0) {
+						result.duplicate_uid++;
+					} else {
+						seen_uids[sample.msg_uid] = 1;
+						unique_uids++;
+					}
+				}
+				result.min_uid = std::min(result.min_uid, sample.msg_uid);
+				result.max_uid = std::max(result.max_uid, sample.msg_uid);
+			}
+
+			result.samples.push_back(sample);
+		}
 	}
 
 	result.timed_out = (result.delivered < target_messages);

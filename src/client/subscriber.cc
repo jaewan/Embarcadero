@@ -44,6 +44,26 @@ size_t ResolveConfiguredBrokerCount() {
 	return configured;
 }
 
+size_t ResolveLatencySubConnections() {
+	constexpr size_t kDefaultConnections = 1;
+	constexpr size_t kMinConnections = 1;
+	constexpr size_t kMaxConnections = 64;
+	const char* env = std::getenv("EMBARCADERO_LATENCY_SUB_CONNECTIONS");
+	if (env == nullptr) {
+		return kDefaultConnections;
+	}
+	try {
+		const size_t parsed = static_cast<size_t>(std::stoul(env));
+		if (parsed < kMinConnections) return kMinConnections;
+		if (parsed > kMaxConnections) return kMaxConnections;
+		return parsed;
+	} catch (...) {
+		LOG(WARNING) << "Subscriber: invalid EMBARCADERO_LATENCY_SUB_CONNECTIONS='"
+		             << env << "', falling back to " << kDefaultConnections;
+		return kDefaultConnections;
+	}
+}
+
 void ReserveForAppend(std::vector<uint8_t>& buffer, size_t bytes_to_append) {
 	if (bytes_to_append == 0) {
 		return;
@@ -64,17 +84,22 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 	connected_(false),
 	configured_broker_count_(ResolveConfiguredBrokerCount()),
 	measure_latency_(measure_latency),
-	sub_connections_per_broker_(measure_latency ? 1 : static_cast<size_t>(NUM_SUB_CONNECTIONS)),
+	sub_connections_per_broker_(measure_latency ? ResolveLatencySubConnections() : static_cast<size_t>(NUM_SUB_CONNECTIONS)),
 	order_level_(order_level),
 	// 16MB per-buffer size (32MB total per connection with dual buffers)
 	buffer_size_per_buffer_((16UL << 20)),
 	client_id_(GenerateRandomNum())
 {
 	memcpy(topic_, topic, TOPIC_NAME_SIZE);
-	if (measure_latency_ && NUM_SUB_CONNECTIONS > 1) {
+	if (measure_latency_ && sub_connections_per_broker_ == 1 && NUM_SUB_CONNECTIONS > 1) {
 		LOG(INFO) << "Latency mode: reducing subscriber connections per broker from "
 		          << NUM_SUB_CONNECTIONS << " to " << sub_connections_per_broker_
-		          << " to avoid duplicate export traffic.";
+		          << " to avoid duplicate export traffic; set EMBARCADERO_LATENCY_SUB_CONNECTIONS"
+		          << " for capacity runs.";
+	} else if (measure_latency_ && sub_connections_per_broker_ > 1) {
+		LOG(INFO) << "Latency mode: using " << sub_connections_per_broker_
+		          << " subscriber connections per broker from EMBARCADERO_LATENCY_SUB_CONNECTIONS"
+		          << " for delivery capacity measurement.";
 	}
 	std::string grpc_addr = head_addr + ":" + port;
 	// Consider managing stub_ lifecycle (e.g., unique_ptr) if Subscriber owns it
@@ -2834,6 +2859,47 @@ void* Subscriber::TryPopOrderedMessageLocked() {
 	return nullptr;
 }
 
+size_t Subscriber::TryPopOrderedMessagesLocked(
+		size_t max_messages,
+		std::vector<std::unique_ptr<OwnedMessage>>* out) {
+	if (max_messages == 0 || out == nullptr) {
+		return 0;
+	}
+	if (pending_messages_.empty()) {
+		pending_messages_base_order_ = next_expected_order_;
+		return 0;
+	}
+	if (pending_messages_base_order_ < next_expected_order_) {
+		const size_t stale_count = std::min(
+			next_expected_order_ - pending_messages_base_order_,
+			pending_messages_.size());
+		for (size_t i = 0; i < stale_count; ++i) {
+			pending_messages_.pop_front();
+		}
+		pending_messages_base_order_ += stale_count;
+		if (pending_messages_.empty()) {
+			pending_messages_base_order_ = next_expected_order_;
+			return 0;
+		}
+	}
+
+	size_t popped = 0;
+	while (popped < max_messages &&
+	       !pending_messages_.empty() &&
+	       pending_messages_base_order_ == next_expected_order_ &&
+	       pending_messages_.front()) {
+		out->push_back(std::move(pending_messages_.front()));
+		pending_messages_.pop_front();
+		pending_messages_base_order_++;
+		next_expected_order_++;
+		popped++;
+	}
+	if (pending_messages_.empty()) {
+		pending_messages_base_order_ = next_expected_order_;
+	}
+	return popped;
+}
+
 void* Subscriber::ConsumeOrdered(int timeout_ms) {
 	auto start_time = std::chrono::steady_clock::now();
 	auto timeout = std::chrono::milliseconds(timeout_ms);
@@ -2857,4 +2923,45 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 
 	VLOG(3) << "ConsumeOrdered: Timeout reached after " << timeout_ms << "ms";
 	return nullptr;
+}
+
+size_t Subscriber::ConsumeOrderedBatch(
+		std::vector<OrderedMessageView>* out,
+		size_t max_messages,
+		int timeout_ms) {
+	if (out == nullptr || max_messages == 0) {
+		return 0;
+	}
+	out->clear();
+	auto start_time = std::chrono::steady_clock::now();
+	auto timeout = std::chrono::milliseconds(timeout_ms);
+	const int64_t wait_us = ConsumeOrderedWaitUs();
+
+	last_returned_.reset();
+	last_returned_batch_.clear();
+	last_returned_batch_.reserve(max_messages);
+
+	while (std::chrono::steady_clock::now() - start_time < timeout) {
+		{
+			absl::MutexLock lock(&consume_mutex_);
+			if (TryPopOrderedMessagesLocked(max_messages, &last_returned_batch_) > 0) {
+				break;
+			}
+			consume_cv_.WaitWithTimeout(&consume_mutex_, absl::Microseconds(wait_us));
+			if (TryPopOrderedMessagesLocked(max_messages, &last_returned_batch_) > 0) {
+				break;
+			}
+		}
+	}
+
+	out->reserve(last_returned_batch_.size());
+	for (const auto& msg : last_returned_batch_) {
+		if (!msg) continue;
+		out->push_back(OrderedMessageView{
+			static_cast<void*>(msg->data.data()),
+			msg->header_version,
+		});
+		last_consumed_wire_version_ = msg->header_version;
+	}
+	return out->size();
 }

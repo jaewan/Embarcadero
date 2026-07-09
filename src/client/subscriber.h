@@ -275,6 +275,15 @@ class Subscriber {
 		void* Consume(int timeout_ms = 1000);
 		void* ConsumeBatchAware(int timeout_ms = 1000);
 
+		struct OrderedMessageView {
+			void* data = nullptr;
+			uint16_t wire_header_version = Embarcadero::wire::HEADER_VERSION_V1;
+		};
+
+		size_t ConsumeOrderedBatch(std::vector<OrderedMessageView>* out,
+		                           size_t max_messages,
+		                           int timeout_ms = 1000);
+
 		// Wire format of the last successful Consume() return (HEADER_VERSION_V1/V2).
 		// Undefined if the last Consume() returned nullptr; call only after a non-null pointer.
 		uint16_t LastConsumedWireHeaderVersion() const {
@@ -472,6 +481,7 @@ class Subscriber {
 		std::deque<std::unique_ptr<OwnedMessage>> pending_messages_ ABSL_GUARDED_BY(consume_mutex_);
 		size_t pending_messages_base_order_ ABSL_GUARDED_BY(consume_mutex_){0};
 		std::unique_ptr<OwnedMessage> last_returned_;
+		std::vector<std::unique_ptr<OwnedMessage>> last_returned_batch_;
 		uint16_t last_consumed_wire_version_{Embarcadero::wire::HEADER_VERSION_V1};
 
 		// --- Order < 2 consume state (per-Subscriber, not static) ---
@@ -496,6 +506,9 @@ class Subscriber {
 		                               size_t recv_chunk_bytes);
 		void StageOrderedMessages(std::vector<std::pair<size_t, std::unique_ptr<OwnedMessage>>> messages);
 		void* TryPopOrderedMessageLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
+		size_t TryPopOrderedMessagesLocked(size_t max_messages,
+		                                   std::vector<std::unique_ptr<OwnedMessage>>* out)
+			ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
 		void* ConsumeOrdered(int timeout_ms);
 
 		// Helper to remove connection resources
