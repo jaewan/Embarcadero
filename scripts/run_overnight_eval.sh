@@ -57,8 +57,12 @@ cd "$PROJECT_ROOT"
 CLIENT_HOSTS_REMOTE="${CLIENT_HOSTS_REMOTE:-c1}"   # single remote client (E3/E9/smoke)
 CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c1,c2,c3}"     # three remote clients for E2 scaling
 
-# Broker dataplane IP reachable from all client nodes
+# Broker IP for single-client runs (c1 only — uses 10G 10.10.10.x fabric)
 BROKER_IP="${BROKER_IP:-10.10.10.10}"
+
+# Broker IP for multi-client runs (c1+c2+c3) — must be reachable from ALL clients.
+# c2 is only on 192.168.60.x, not on 10.10.10.x. 192.168.60.8 is reachable by all three.
+BROKER_IP_MULTI="${BROKER_IP_MULTI:-192.168.60.8}"
 
 # ---------------------------------------------------------------------------
 # Mode / config
@@ -292,18 +296,23 @@ if [[ "${SMOKE:-0}" != "1" ]]; then
     for nc in 2 3; do
         # Use first $nc hosts from CLIENT_HOSTS_E2
         local_csv="$(echo "$CLIENT_HOSTS_E2" | tr ',' '\n' | head -"$nc" | tr '\n' ',' | sed 's/,$//')"
+        # N>=2 runs must use BROKER_IP_MULTI (192.168.60.8) — c2 is not on 10.10.10.x
         run_multi_cell "e2_embar5_rf0_n${nc}" "$nc" "$local_csv" \
             SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=0 \
-            TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency
+            TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency \
+            EMBARCADERO_HEAD_ADDR="$BROKER_IP_MULTI"
 
         if [[ "$SKIP_BASELINES" != "1" ]]; then
             run_multi_cell "e2_corfu_rf0_n${nc}" "$nc" "$local_csv" \
                 SEQUENCER=CORFU ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
-                TEST_TYPE=5 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
+                TEST_TYPE=5 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP_MULTI" \
+                EMBARCADERO_HEAD_ADDR="$BROKER_IP_MULTI"
 
             run_multi_cell "e2_lazylog_rf0_n${nc}" "$nc" "$local_csv" \
                 SEQUENCER=LAZYLOG ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
-                TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1
+                TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
+                EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP_MULTI" \
+                EMBARCADERO_HEAD_ADDR="$BROKER_IP_MULTI"
         fi
     done
 fi
