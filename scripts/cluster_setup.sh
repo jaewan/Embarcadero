@@ -203,12 +203,22 @@ if [[ -f /proc/meminfo ]]; then
     huge_free_mb=$(( huge_free * huge_size_kb / 1024 ))
     info "  HugePages: total=$huge_total free=$huge_free size=${huge_size_kb}kB → ${huge_free_mb}MB free"
 
-    if [[ "$huge_free_mb" -lt 8192 ]]; then
-        warn "  Low hugepages: ${huge_free_mb}MB free < 8192MB recommended"
-        warn "  To allocate: sudo sysctl -w vm.nr_hugepages=4096"
-        warn "  run_multiclient.sh will warn before each trial; set EMBAR_USE_HUGETLB=0 to disable"
+    # Minimum for overnight run with THREADS_THROUGHPUT=6:
+    #   precreate: 6 threads × 4 brokers × 1024 slots × 512KB = 12 GB = 6144 hugepages
+    #   safe minimum with headroom: 6500 hugepages (13 GB)
+    local MIN_HUGEPAGES_NEEDED=6500
+    local min_huge_mb=$(( MIN_HUGEPAGES_NEEDED * huge_size_kb / 1024 ))
+    if [[ "$huge_free_mb" -lt "$min_huge_mb" ]]; then
+        warn "  Low hugepages: ${huge_free_mb}MB free < ${min_huge_mb}MB needed for THREADS_THROUGHPUT=6"
+        info "  Auto-allocating ${MIN_HUGEPAGES_NEEDED} hugepages via sudo sysctl..."
+        if sudo sysctl -w vm.nr_hugepages="${MIN_HUGEPAGES_NEEDED}" 2>/dev/null; then
+            huge_free=$(grep HugePages_Free /proc/meminfo | awk '{print $2}')
+            info "  Hugepages after allocation: $huge_free × ${huge_size_kb}kB free"
+        else
+            warn "  sudo sysctl failed — manually run: sudo sysctl -w vm.nr_hugepages=${MIN_HUGEPAGES_NEEDED}"
+        fi
     else
-        info "  Hugepages: sufficient (${huge_free_mb}MB free)"
+        info "  Hugepages: sufficient (${huge_free_mb}MB free ≥ ${min_huge_mb}MB needed)"
     fi
 fi
 
