@@ -1,0 +1,8 @@
+[broker 1] placement=DRAM(W5-A) message_size=4096 target_mbps=0 duration=20s inflight=32
+[broker 1] local Blog registered: 1073741824 bytes
+[broker 1] connected to memserver qpn=1088 host_blog=0
+[broker 1] replicating to right neighbor 10.10.10.10 (qpn=2001)
+[broker 1] replica-acceptor: connection 1/1 accepted role=1 (qpn=2000)
+[broker 1] sequencer connected direct for Blog reads (qpn=2004)
+[broker 1] RESULT batches=3155773 bytes=12926046208 secs=20.000 throughput=0.158 Mmsg/s 5.170 Gb/s rtt_p50_us=37.9 rtt_p99_us=66.1 rtt_p999_us=69.3
+[broker 1] REPLICA_RESULT posted=3155773 completed=3155773

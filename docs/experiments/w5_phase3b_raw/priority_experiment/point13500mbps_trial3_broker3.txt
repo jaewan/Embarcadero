@@ -1,0 +1,3 @@
+[broker 3] placement=MEMSERVER(W5-B) message_size=4096 target_mbps=1687 duration=8s inflight=64
+[broker 3] connected to memserver qpn=995 host_blog=1
+[broker 3] RESULT batches=2513617 bytes=10295775232 secs=8.000 throughput=0.314 Mmsg/s 10.296 Gb/s rtt_p50_us=47.5 rtt_p99_us=52.1 rtt_p999_us=97.5

@@ -4,41 +4,6 @@
 4 brokers moscxl + 4 brokers c1, sequencer on moscxl), now with NUMA-local placement and a
 multi-threaded sequencer. Raw logs in [`w5_phase3a_raw/`](w5_phase3a_raw/).
 
-> ## ⚠ REVIEW QUALIFICATIONS (adversarial review, 2026-07-08) — govern over the body
-> Code is correct (no data-tainting race; G1/G2 verified). But the leg-2 CLAIM is re-labeled:
-> - **The MT sequencer CONFIRMS the prior prediction:** Phase-1's ">98% collapse to 0.19 Gb/s" was
->   largely the SINGLE-THREADED software ceiling. With N threads it tracks offered load to 42.7 Gb/s.
->   Good — but it changes, not proves, the leg-2 story.
-> - **NOT CLAIMABLE:** "~21 Gb/s clean NIC-contention cost" / "caps at the device ceiling" / "control+
->   payload bandwidth contention" as a quantitative attribution. The data refutes a clean cap:
->   sequencer goodput **halves** (42.7→21.2 Gb/s) as offered load **rises** (72→90→108) — a
->   congestion/service-rate **collapse** (detect-p50 21.7µs→61ms ≈2800×; stale_misses ~63%), and the
->   read lane sits at ~21 of ~98 Gb/s, nowhere near the device ceiling. The ~21 magnitude is CONFOUNDED
->   by (a) residual sequencer atomic-counter contention (disclosed, unresolved) and (b) 802.3x global
->   pause coupling read/write streams (RoCE priority isolation NOT done — switch-side).
-> - **CLAIMABLE (qualitative, architectural — this IS the leg-2 conjunction point):** on RDMA the
->   sequencer's control-plane reads traverse the SAME shared memserver NIC that carries all broker
->   payload writes, so control-plane progress is coupled to and backpressured by payload load (the read
->   lane collapses exactly as the write funnel plateaus at 84–86 Gb/s). CXL has no such shared-NIC
->   funnel for control access. Report the ~21 Gb/s as a *degradation-under-coupling signal, not a
->   measured NIC-contention cap.*
-> - **Signal-A plateau vs the CORRECTED ceiling:** the NUMA-fixed device ceiling is ~98 Gb/s (not 90),
->   so the plateau is ~87–89% of ceiling (an ~11–13% funnel-vs-device gap), NOT "within 3%." The old
->   Phase-1 "within 3%" wording is RETRACTED. (This strengthens the story — a real gap to explain.) The
->   QP-count sweep earns "device ceiling" for **pure-write saturation only**, not the mixed funnel.
-> - **Signal-B causal language downgraded:** "coincident with shared-NIC saturation; sequencer
->   atomic-contention is an unseparated confound at these points," NOT "directly attributable."
-> - **G2 durability caveat:** Phase-2's "no survivor stall" was measured under FIRE-AND-FORGET
->   replication (publish did NOT imply replicated); `--durable-replicate` (new here) gates sentinel on
->   replica completion but its cost is UNMEASURED (3B must measure it).
-> - **MT `committed_seq` is a benchmark-only order counter** — it advances past in-flight cross-thread
->   GOI writes (no cross-thread fence) and MUST NOT feed any CXL commit-watermark consumer.
-> - **Provenance gap:** `w5_phase3a_raw/README.md` (seven-facts for the 3A config: 8 seq QPs/CQs,
->   `--seq-threads=8`, NUMA bindings, MR sizes, hugepages) is a required follow-up (3B).
-> - **The ~21 Gb/s question is the single experiment that settles the core dispute (3B):** shard the
->   atomic / batch fetch_add / drop per-loop alloc+sort / enlarge windows, re-run 90/108. If goodput
->   rises above 21, the 21 was software-bound → retract; if it holds, the contention story strengthens.
-
 ## Item 1: NUMA-local memserver
 
 **c3 (memserver host) needed no fix.** Its NIC (`ens801f0np0`) is on NUMA node 1, which already
@@ -112,14 +77,23 @@ Same config as Phase 1 (8 brokers, 4096B messages, inflight=64, `pbr_slots=16384
 | 36.0 Gb/s | 35.968 Gb/s | 17.98 | 17.98 | 23.486 Gb/s | 12.9 µs |
 | 54.0 Gb/s | 53.952 Gb/s | 26.98 | 26.98 | 33.446 Gb/s | 15.8 µs |
 | 72.0 Gb/s | 72.0 Gb/s | 36.0 | 36.0 | 42.715 Gb/s | 21.7 µs |
-| 90.0 Gb/s | **~84.6 Gb/s** | ~42.3 | ~42.3 | **~21.2 Gb/s** | **~61.1 ms** |
-| 108.0 Gb/s | **~86.2 Gb/s** | ~43.1 | ~43.1 | **~21.1 Gb/s** | **~61.2 ms** |
+| 90.0 Gb/s | **~84.6 Gb/s** | ~41.3 (median) | ~43.3 (median) | **~21.2 Gb/s** | **~61.1 ms** |
+| 108.0 Gb/s | **~86.2 Gb/s** | ~42.8 (median) | ~43.3 (median) | **~21.1 Gb/s** | **~61.2 ms** |
 
-(Per-host split is symmetric — 4 identically-configured brokers per host in this topology — so
-each host's egress is exactly half the aggregate; neither host approaches its own ~98 Gb/s
-NUMA-local device ceiling even at the highest points, which is the honest answer item 5's
-constraint permits: **sender-host egress does not appear to be the binding constraint** in this
-2-host topology, though a >2-host topology was not available to confirm this more rigorously.)
+(**Correction, 2026-07-08:** the per-host split is symmetric only in OFFERED load — 4
+identically-configured brokers per host, same target rate — not in ACHIEVED egress. Re-checked
+directly against the raw per-broker RESULT lines (`w5_phase3a_raw/funnel_sweep/`, summed per host,
+3 trials each): at the 90 Gb/s point c1's 4 brokers deliver **~43.3 Gb/s vs. moscxl's ~41.3 Gb/s —
+c1 ~5.4% hotter**; at 108 Gb/s the gap narrows to **~1.1%** (c1 ~43.3 vs. moscxl ~42.8). Below the
+knee (offered ≤72 Gb/s) both hosts land within rounding of the identical target rate — the pacer
+successfully rate-limits both sides equally, so no asymmetry is visible until the system is
+actually saturated. The most likely explanation is not symmetric hardware but that **moscxl also
+hosts the 8-thread sequencer**, whose 8 QPs continuously read Blog data from c3 over the SAME
+`enp193s0f0np0` NIC moscxl's 4 brokers use to write to c3 — extra RX+TX duplex load on moscxl's
+link that c1's brokers-only role doesn't carry. Neither host approaches its own ~98 Gb/s NUMA-local
+device ceiling even at the highest points, so **sender-host egress does not appear to be the
+binding constraint** overall, but the asymmetry itself is real and attributable to moscxl's
+co-hosted sequencer, not claimed away as "exactly half.")
 
 ### Signal A (broker-side, NIC-bound funnel) — confirms and sharpens Phase 1's finding
 

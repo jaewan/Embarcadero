@@ -1,0 +1,5 @@
+[sequencer] placement=DRAM(W5-A) num_brokers=2 duration=20s
+[sequencer] connected to memserver qpn=1092 host_blog=0
+[sequencer] broker-direct Blog connection to broker 0 (10.10.10.10) qpn=2006
+[sequencer] broker-direct Blog connection to broker 1 (10.10.10.11) qpn=1130
+[sequencer] RESULT batches=6342435 blog_bytes=25978613760 secs=20.000 throughput=0.317 Mmsg/s 10.391 Gb/s sentinel_polls=871263 poll_rate=43563.1/s stale_misses=20 unrecoverable_bytes=0 detect_to_commit_p50_us=30.0 p99_us=37.5 p999_us=12057.3

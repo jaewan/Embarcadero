@@ -1,0 +1,8 @@
+     tx_bytes_phy: 2535595181787
+     rx_bytes_phy: 3734165518334
+     rx_pause_ctrl_phy: 0
+     tx_pause_ctrl_phy: 4
+     rx_discards_phy: 0
+     tx_discards_phy: 0
+     tx_pause_storm_warning_events: 0
+     tx_pause_storm_error_events: 0

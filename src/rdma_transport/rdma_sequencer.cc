@@ -80,22 +80,46 @@ struct LatencyStats {
 // the original single-threaded path below regardless of --seq-threads.
 //
 // Each worker thread: owns ONE dedicated QP + CQ to the memserver (real N-QP/N-CQ parallelism,
-// not N threads timesharing one QP) and a disjoint, contiguous range of brokers. GOI's global
-// `total_order` is minted via one shared atomic counter (fetch_add is cheap relative to an RDMA
-// RTT, so this is not a new bottleneck); ControlBlock is written by thread 0 only, periodically,
-// reading the atomic's CURRENT value — every other thread only ever touches CV entries for
-// brokers it exclusively owns, so there is no cross-thread write race on any single field.
+// not N threads timesharing one QP) and a disjoint, contiguous range of brokers.
+//
+// [[PRIORITY FIX: sharded total_order, no shared atomic]] The first version minted GOI's global
+// `total_order` via one shared atomic fetch_add, on the assumption that "fetch_add is cheap
+// relative to an RDMA RTT" -- WRONG at the commit rates this design reaches: 8 cores hammering
+// the SAME cache line with LOCK XADD causes real cache-line-bounce contention, and this was the
+// leading suspect for the ~21 Gb/s ceiling observed at 90-108 Gb/s offered load in the prior
+// sub-phase. Fixed: total_order is now `thread_id + local_seq * num_seq_threads` -- each thread
+// mints it from its OWN local counter, no shared state, no atomic, no contention. This is
+// globally UNIQUE (interleaved by thread) and monotonically increasing PER THREAD, but is NOT a
+// single chronological global order across threads -- it is explicitly a benchmark-only
+// throughput counter, not a claim this could feed a real commit-watermark consumer (see the
+// doc/provenance note in w5_phase3b_results.md). ControlBlock's `committed_seq` is derived
+// separately, from the MINIMUM of all threads' independently-advancing progress counters (see
+// RunMultithreadedW5B) -- a genuine, conservative, monotonic watermark, not the interleaved
+// per-thread total_order value itself.
 struct SeqThreadStats {
   uint64_t batches = 0, blog_bytes_read = 0, sentinel_polls = 0, stale_misses = 0;
   LatencyStats detect_to_commit;
 };
 
-void SeqWorkerW5B(int thread_id, DeviceCtx* d, const std::string& memserver_ip, int memserver_port,
-                  int pbr_slots, int duration_secs, int broker_lo, int broker_hi,
-                  std::atomic<uint64_t>* g_committed_seq, bool is_aggregator,
-                  SeqThreadStats* out) {
+// One per thread, cache-line-padded so 8 threads updating their OWN counter never false-share a
+// line with each other -- the exact class of contention the sharded total_order fix is meant to
+// eliminate; a plain std::vector<std::atomic<uint64_t>> would likely pack several threads' counters
+// into one or two cache lines and reintroduce the same problem in a different shape.
+struct alignas(64) PaddedProgress {
+  std::atomic<uint64_t> v{0};
+  char pad[64 - sizeof(std::atomic<uint64_t>)];
+};
+
+void SeqWorkerW5B(int thread_id, int num_seq_threads, DeviceCtx* d, const std::string& memserver_ip,
+                  int memserver_port, int pbr_slots, int duration_secs, int broker_lo, int broker_hi,
+                  PaddedProgress* my_progress, bool is_aggregator,
+                  std::vector<PaddedProgress>* all_progress, SeqThreadStats* out) {
+  // [[PRIORITY FIX: enlarged windows]] kWindow was 64 (matching the QP's own max_send_wr=512,
+  // headroom of 8x); raised both here so more ops can stay outstanding per QP, reducing how often
+  // a thread stalls waiting for room to post more at high offered load.
+  constexpr int kWindow = 256;
   RcQp meta_qp{};
-  if (!CreateRcQp(d, 4096, 512, /*psn_seed=*/0x6000 + thread_id, &meta_qp)) {
+  if (!CreateRcQp(d, 4096, 2048, /*psn_seed=*/0x6000 + thread_id, &meta_qp)) {
     fprintf(stderr, "[seq-worker %d] CreateRcQp failed\n", thread_id); return;
   }
   HandshakeBlob local{}, remote{};
@@ -112,7 +136,6 @@ void SeqWorkerW5B(int thread_id, DeviceCtx* d, const std::string& memserver_ip, 
           thread_id, remote.server_ep.qpn, broker_lo, broker_hi);
 
   const int my_num_brokers = broker_hi - broker_lo;
-  constexpr int kWindow = 64;
   constexpr size_t kMaxPayload = 1 << 16;
 
   std::vector<uint64_t> sentinel_local(my_num_brokers, kPublishUncommitted);
@@ -179,12 +202,24 @@ void SeqWorkerW5B(int thread_id, DeviceCtx* d, const std::string& memserver_ip, 
 
   std::vector<uint64_t> last_seen(my_num_brokers, kPublishUncommitted);
   std::vector<uint64_t> cv_dirty_since_flush(my_num_brokers, kPublishUncommitted);
+  uint64_t local_seq = 0;  // this thread's own commit counter -- see the sharded-total_order note above
+
+  // [[PRIORITY FIX: no per-loop heap alloc]] `work`/`valid_idx`/`committed` used to be declared
+  // FRESH inside the while loop every poll cycle -- real malloc/free churn at the hundreds-of-
+  // thousands-of-polls/sec rates this design reaches. Hoisted out, .clear()'d each iteration
+  // (keeps the underlying buffer, no repeated allocation).
+  std::vector<WorkItem> work;
+  std::vector<size_t> valid_idx;
+  std::vector<size_t> committed;
 
   const auto t_start = std::chrono::steady_clock::now();
   const auto deadline = t_start + std::chrono::seconds(duration_secs);
   auto last_cb_flush = t_start;
 
   while (std::chrono::steady_clock::now() < deadline) {
+    work.clear();
+    valid_idx.clear();
+    committed.clear();
     if (!blocking_read(&meta_qp, sentinel_local.data(), sentinel_local_mr.lkey(),
                        remote.sentinel.addr + static_cast<uint64_t>(broker_lo) * sizeof(SentinelSlot),
                        remote.sentinel.rkey, static_cast<uint32_t>(my_num_brokers * sizeof(uint64_t)))) {
@@ -193,7 +228,6 @@ void SeqWorkerW5B(int thread_id, DeviceCtx* d, const std::string& memserver_ip, 
     ++out->sentinel_polls;
     const uint64_t poll_ts = NowNsLocal();
 
-    std::vector<WorkItem> work;
     for (int lb = 0; lb < my_num_brokers; ++lb) {
       const int b = broker_lo + lb;
       const uint64_t sv = sentinel_local[lb];
@@ -233,12 +267,9 @@ void SeqWorkerW5B(int thread_id, DeviceCtx* d, const std::string& memserver_ip, 
           w.batch_seq = h.batch_seq;
         });
 
-    std::vector<size_t> valid_idx;
     for (size_t i = 0; i < work.size(); ++i) if (work[i].header_valid) valid_idx.push_back(i);
     if (valid_idx.empty()) continue;
 
-    std::vector<size_t> committed;
-    committed.reserve(valid_idx.size());
     pipelined_ops(
         &meta_qp, valid_idx.size(),
         [&](size_t j) {
@@ -263,13 +294,20 @@ void SeqWorkerW5B(int thread_id, DeviceCtx* d, const std::string& memserver_ip, 
           committed.push_back(valid_idx[j]);
         });
     if (committed.empty()) continue;
-    std::sort(committed.begin(), committed.end());
+    // [[PRIORITY FIX: no sort needed here]] Unlike the single-threaded W5-A path (which retries
+    // across per-broker QPs sharing one CQ, genuinely reordering completions relative to post
+    // order), this worker's blog reads all go through its OWN single QP with no retry loop --
+    // RC same-QP ordering already guarantees `committed` lands in ascending post order. The old
+    // sort was defensive copy-paste from that other path and cost a real allocation+sort every
+    // poll cycle for no correctness benefit here.
 
     pipelined_ops(
         &meta_qp, committed.size(),
         [&](size_t k) {
           const WorkItem& w = work[committed[k]];
-          uint64_t order = g_committed_seq->fetch_add(1) + 1;
+          // [[PRIORITY FIX: sharded, no shared atomic]] see the comment on SeqWorkerW5B.
+          uint64_t order = static_cast<uint64_t>(thread_id) + local_seq * static_cast<uint64_t>(num_seq_threads);
+          ++local_seq;
           GoiEntryMirror& g = goi_buf[k % kWindow];
           g.total_order = order;
           g.batch_seq = w.batch_seq;
@@ -284,6 +322,10 @@ void SeqWorkerW5B(int thread_id, DeviceCtx* d, const std::string& memserver_ip, 
         },
         [&](size_t /*k*/) {});
 
+    // Publish this thread's OWN progress (relaxed store to ITS OWN cache-line-padded counter --
+    // no contention with any other thread) so the aggregator can compute a safe watermark below.
+    my_progress->v.store(local_seq, std::memory_order_relaxed);
+
     int cv_posted = 0;
     for (int lb = 0; lb < my_num_brokers; ++lb) {
       if (cv_dirty_since_flush[lb] == kPublishUncommitted) continue;
@@ -295,13 +337,18 @@ void SeqWorkerW5B(int thread_id, DeviceCtx* d, const std::string& memserver_ip, 
                 sizeof(CompletionVectorEntryMirror), /*wr_id=*/1);
       ++cv_posted;
     }
-    // Only thread 0 (the aggregator) periodically writes ControlBlock, reading the shared
-    // atomic's CURRENT value -- avoids every worker racing to write the SAME single field from
-    // DIFFERENT, unordered QPs (RDMA WRITE ordering is only guaranteed same-QP).
+    // Only thread 0 (the aggregator) periodically writes ControlBlock. committed_seq is now the
+    // MINIMUM of every thread's local_seq (a conservative, genuinely monotonic watermark: "every
+    // thread has committed at least this many batches", scaled to a global slot count) -- NOT the
+    // interleaved per-thread total_order value itself, which is benchmark-only (see the top-level
+    // comment on SeqWorkerW5B). Still avoids any cross-thread write race: only thread 0 ever
+    // writes this field, and it only ever READS the other threads' independently-owned counters.
     bool cb_posted = false;
     if (is_aggregator &&
         std::chrono::duration<double>(std::chrono::steady_clock::now() - last_cb_flush).count() > 0.005) {
-      cb_local.committed_seq = g_committed_seq->load();
+      uint64_t min_progress = UINT64_MAX;
+      for (auto& p : *all_progress) min_progress = std::min(min_progress, p.v.load(std::memory_order_relaxed));
+      cb_local.committed_seq = min_progress * static_cast<uint64_t>(num_seq_threads);
       PostWrite(&meta_qp, &cb_local, cb_local_mr.lkey(), remote.control.addr, remote.control.rkey,
                 sizeof(ControlBlockMirror), /*wr_id=*/2);
       cb_posted = true;
@@ -339,7 +386,7 @@ int RunMultithreadedW5B(int argc, char** argv) {
   DeviceCtx d{};
   if (!OpenDevice(dev, gid, 1, &d)) return 1;
 
-  std::atomic<uint64_t> g_committed_seq{0};
+  std::vector<PaddedProgress> progress(seq_threads);  // cache-line-padded, one per thread
   std::vector<SeqThreadStats> stats(seq_threads);
   std::vector<std::thread> workers;
   const int base = num_brokers / seq_threads, rem = num_brokers % seq_threads;
@@ -347,9 +394,9 @@ int RunMultithreadedW5B(int argc, char** argv) {
   for (int t = 0; t < seq_threads; ++t) {
     int count = base + (t < rem ? 1 : 0);
     int hi = lo + count;
-    workers.emplace_back(SeqWorkerW5B, t, &d, memserver_ip, memserver_port, pbr_slots,
-                         duration_secs, lo, hi, &g_committed_seq, /*is_aggregator=*/t == 0,
-                         &stats[t]);
+    workers.emplace_back(SeqWorkerW5B, t, seq_threads, &d, memserver_ip, memserver_port, pbr_slots,
+                         duration_secs, lo, hi, &progress[t], /*is_aggregator=*/t == 0,
+                         &progress, &stats[t]);
     lo = hi;
   }
   for (auto& th : workers) th.join();
@@ -644,7 +691,18 @@ int main(int argc, char** argv) {
   // Per the spec's M2 guidance, the RDMA lease timeout must NOT reuse CXL's tight constants —
   // inflated here to cover RDMA RTT tail + polling-cycle granularity, not CXL's sub-microsecond
   // coherence latency.
-  constexpr uint64_t kLeaseTimeoutNs = 500'000'000ull;  // 500ms backstop; RDMA RTT here is ~us-scale
+  //
+  // [[BUG FOUND: Sub-phase 3B leg-1]] 500ms was NOT a real backstop -- it turned out to be almost
+  // exactly the same duration as the RC QP's own retry-exhaustion time (timeout=14, retry_cnt=7 in
+  // rdma_common.cc -> ~470-500ms to IBV_WC_RETRY_EXC_ERR), and the lease check runs unconditionally
+  // at the TOP of every poll cycle, before Step 4 even gets a chance to post a new read and let its
+  // OWN retry-exhaustion clock start. That structurally favors the lease every time a kill happens,
+  // regardless of whether there was a genuine in-flight read to fail -- confirmed empirically: the
+  // lease fired at ~4.479-4.484s after a kill at t=4.0s in every trial tried, independent of offered
+  // load (0/300/1200/1800 MB/s all showed the identical ~479-484ms timing). Widened to a genuine
+  // backstop -- long enough that the fast path has real, uncontested room to fire first whenever
+  // there IS a live operation to fail.
+  constexpr uint64_t kLeaseTimeoutNs = 3'000'000'000ull;  // 3s backstop; RDMA RTT here is ~us-scale
   std::vector<bool> broker_dead(num_brokers, false);
   std::vector<uint64_t> broker_dead_detect_ts(num_brokers, 0);
   std::vector<std::string> broker_dead_via(num_brokers, "");

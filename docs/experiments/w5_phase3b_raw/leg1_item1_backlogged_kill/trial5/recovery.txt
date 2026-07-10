@@ -1,0 +1,4 @@
+[recovery] connected to source 10.10.10.11 (qpn=1084)
+[recovery] connected to target 10.10.10.181 (qpn=1056)
+[recovery] VERIFY checked_slots=10000 bad_slots=0 PASS
+[recovery] RESULT bytes=40960000 read_secs=0.007009 write_secs=0.021967 total_secs=0.032230 read_gbps=46.753 write_gbps=14.917

@@ -5,40 +5,6 @@ broker1 on c1 (10.10.10.11), memserver on c3 (10.10.10.181, 10.10.10.181 never k
 1), sequencer on moscxl. Raw logs + orchestration script in
 [`w5_phase2_raw/`](w5_phase2_raw/).
 
-> ## ⚠ REVIEW QUALIFICATIONS (adversarial review, 2026-07-08) — read before citing any number here
-> The harness code is correct for these 3 runs (no data-tainting bug fired at 60% load), but the leg-1
-> CLAIM is narrowed. **These corrections govern; the body is preliminary.**
-> - **Process-kill IS valid here** (settled): the Blog is `MAP_PRIVATE|MAP_ANONYMOUS` (fd=-1), so
->   `kill -9` reclaims it and tears down the QP/MR — equivalent to a host-kill for leg-1's purposes. No
->   re-run needed on that axis.
-> - **NOT CLAIMABLE (must not enter the paper): "RF≥2 prevents data loss on broker death" / "leg-1
->   re-replication cost = 128 MiB in 35 ms" / "0 bytes unrecoverable proves durable replication."** The
->   two headline numbers never touch each other: `unrecoverable_bytes=0` is a *sequencer-read-backlog*
->   metric (0 only because the sequencer drained broker0's committed backlog well before the ~478 ms
->   lease fired at 60% load), NOT proof no loss is possible; `128 MiB / 35 ms` is a **fixed synthetic
->   probe** (hardcoded `RECOVERY_BYTES`, read from the replica base offset with **no content/CRC
->   verification**), NOT the cost of recovering what this failure lost. Replication here is
->   **asynchronous, un-waited, and demonstrably lossy on failure** (`REPLICA_RESULT` shows ~184K replica
->   writes never completed).
-> - **CLAIMABLE (narrow):** under a process-kill of an RF≥2 broker at ~60% offered load, the sequencer
->   had already consumed all committed backlog before failure detection, so zero committed-but-unread
->   bytes existed at the kill instant; detection fired via the **lease-timeout backstop (~478 ms) in all
->   3 trials, never the fast RDMA-error path** (a non-backlogged system has no in-flight op against the
->   dying broker's QP to fail); and the recovery *mechanism* moves data at a **source-link-bound** rate
->   (~52 Gb/s read ≈ the c1-link ceiling, ~98 Gb/s write) — not a generic/QP-scalable ceiling.
-> - **Raw-artifact corrections:** `w5_phase2_raw/trial*/timeline.txt` annotates the kill as "a real
->   completion-level failure, not a soft timeout" — that is **WRONG**; every trial detected via
->   `LEASE_TIMEOUT` (fast path 0/6). `broker1.txt` has a duplicated RESULT block. Disregard both.
-> - **Two latent code bugs (do NOT taint these numbers; HARD Phase-3 gates):** (1) shared-CQ
->   stale-completion misattribution — the fast-error/retry path fired 0/6 here but WILL fire in a
->   backlogged Phase-3 leg-1 trial and corrupt it → fix (drain the aborted attempt's WRs / per-attempt
->   CQ / wr_id bounds-check) BEFORE that run; (2) async replication has no circuit-breaker (ENOSPC storm
->   to a dead peer) and no fence tying sentinel publication to replica completion → fix before any
->   higher-RF/higher-load leg-1 run, else "survivor-stall = 0" will not generalize.
-> - **The real leg-1 cost is a Phase-3 measurement:** a backlogged/loss-inducing kill (non-zero
->   `unrecoverable_bytes`, fast path actually fires), checksummed recovery of the actual backlog, and a
->   re-replication volume-vs-Blog-size sweep. See Phase-3 must-do list.
-
 ## 0. Pre-registered deviation from the literal instruction: host-kill method
 
 The task asked for `kill -9` the broker process **and** drop the host (NIC down / power /

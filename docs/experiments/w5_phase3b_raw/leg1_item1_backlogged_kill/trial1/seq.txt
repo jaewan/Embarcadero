@@ -1,0 +1,71 @@
+[sequencer] placement=DRAM(W5-A) num_brokers=2 duration=20s
+[sequencer] connected to memserver qpn=1039 host_blog=0
+[sequencer] broker-direct Blog connection to broker 0 (10.10.10.10) qpn=1884
+[sequencer] broker-direct Blog connection to broker 1 (10.10.10.11) qpn=1061
+[sequencer] pipelined op WC error status=12(transport retry counter exceeded) qp_num=1888 wr_id=0
+[sequencer] broker 0 declared dead via RDMA_ERROR (kPeerDown) at t=8.286s
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=1
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=2
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=3
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=4
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=5
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=6
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=7
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=8
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=9
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=10
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=11
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=12
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=13
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=14
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=15
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=16
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=17
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=18
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=19
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=20
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=21
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=22
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=23
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=24
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=25
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=26
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=27
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=28
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=29
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=30
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=31
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=32
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=33
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=34
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=35
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=36
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=37
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=38
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=39
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=40
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=41
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=42
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=43
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=44
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=45
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=46
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=47
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=48
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=49
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=50
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=51
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=52
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=53
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=54
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=55
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=56
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=57
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=58
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=59
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=60
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=61
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=62
+[sequencer] pipelined op WC error status=5(Work Request Flushed Error) qp_num=1888 wr_id=63
+[sequencer] RESULT batches=7040343 blog_bytes=28837244928 secs=20.000 throughput=0.352 Mmsg/s 11.535 Gb/s sentinel_polls=506770 poll_rate=25338.5/s stale_misses=7548373 unrecoverable_bytes=284667904 detect_to_commit_p50_us=59.8 p99_us=4323903.5 p999_us=4323903.5
+[sequencer] BROKER_DEAD broker=0 via=rdma_error detect_t=8.286s

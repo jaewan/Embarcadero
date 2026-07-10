@@ -4,36 +4,6 @@
 (pipelining) on top of `1293525` (initial harness). Supersedes the blocker/setup narrative in
 `w5_phase1_progress.md`, which remains as historical record of Phase 0 + the memlock blocker.
 
-> ## ⚠ REVIEW QUALIFICATIONS (adversarial review, 2026-07-08) — read before citing any number here
-> The harness code is correct for the reported W5-B runs (no data-tainting bug), but the CLAIMS below
-> are qualified. **These corrections govern; the body text is preliminary.**
-> 1. **Signal B is NOT a clean E4e leg-2 (NIC-contention) demonstration.** The sequencer is a
->    single-threaded loop, software-bound at ~16–21 Gb/s *before* the NIC saturates, so the >98%
->    stage-2 collapse is entangled with that software ceiling and is refutable as "your sequencer is
->    just slow." Re-label it **"sequencer software ceiling + shared-NIC interaction,"** NOT leg-2
->    NIC contention. **E4e leg-2 requires a multi-threaded (N-thread/N-QP/N-CQ) sequencer** that tracks
->    offered load near the plateau before collapsing — Phase-3 prerequisite.
-> 2. **802.3x global-pause confound.** A >98% collapse with 260–343 ms p999 is the signature of
->    link-level PAUSE, not graceful per-QP sharing. The collapse *magnitude* is not attributable to
->    leg-2 until RoCE is isolated on its own priority/VLAN under DCQCN+PFC and the collapse is shown to
->    persist.
-> 3. **Signal A is "saturation vs offered load," not a proven "CC-agnostic device ceiling."** The
->    pre-registered falsifiability test (add QPs at fixed saturating load; goodput must not rise) was
->    not run. Earn "device ceiling" only after that QP-count sweep.
-> 4. **Reviewer-D claim narrowed:** "~30M tok/s requires abandoning single global order" is airtight
->    only against the *naive one-RDMA-atomic-per-token* design. A batched `FETCH_ADD(N)` reservation
->    (Corfu-style), a server-CPU sequencer, or a hardware counter can keep single global order above
->    2.0 Mtok/s. Scope the claim to the naive design; acknowledge batched/hierarchical alternatives.
-> 5. **Reproducibility gap:** raw per-trial lines, run_metadata (QP/CQ/MR/NIC-port/NUMA/CC), activity.log,
->    and the sweep script are not committed; the "seven-facts protocol" is undefined. Ship the raw tree
->    (mirror `delta_measurement_raw/`) before these numbers are treated as canonical evidence.
-> 6. **Tracked should-fix code bugs (land before any W5-A / Phase-3 run):** `post_one` return ignored →
->    latent hang on `ibv_post_send` failure; W5-A blog-QP `max_send_wr==kWindow` (zero margin); CV
->    dirty-value should be `max`, not last-writer; GOI committed order scrambled by completion order;
->    `detect_to_commit` sampled too early. None taint the reported W5-B numbers (off-path / unreached /
->    control-plane-only), but the two hang bugs are far likelier to fire under a saturating multi-QP
->    Phase-3 run.
-
 ## 0. A real bug found and fixed before any data was trusted
 
 The first full-scale sweep attempt hung indefinitely (`w5_broker_memserver --broker-id=3`, no

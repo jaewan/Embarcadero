@@ -1,0 +1,4 @@
+[recovery] connected to source 10.10.10.11 (qpn=1079)
+[recovery] connected to target 10.10.10.181 (qpn=1052)
+[recovery] VERIFY checked_slots=10000 bad_slots=1 FAIL
+[recovery] FATAL: checksum verification failed

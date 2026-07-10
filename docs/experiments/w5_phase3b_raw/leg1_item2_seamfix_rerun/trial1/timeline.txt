@@ -1,0 +1,7 @@
+[2026-07-08T05:18:50Z] seamfix trial 1: launched, memserver(c3)=2631334 broker0(moscxl)=2631352 seq(moscxl)=2631357
+[2026-07-08T05:18:54Z] seamfix trial 1: KILLED broker0 pid=2631352 at kill_t_mono=1783487934.045910629
+[sequencer] broker 0 declared dead via LEASE_TIMEOUT at t=6.978s
+recovery_move_rc=0
+[2026-07-08T05:19:32Z] seamfix trial 1: all processes exited
+final_global_seq_broker0=3847044
+recovery_verify_rc=0

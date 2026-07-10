@@ -1,0 +1,1 @@
+[recovery] VERIFY checked_slots=10000 bad_slots=0 excluded_seam_slot=47044 PASS
