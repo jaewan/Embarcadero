@@ -31,7 +31,7 @@
 #   TOTAL_BYTES=N         bytes per publisher per trial (default 4 GiB)
 #   MSG_SIZE=N            message size in bytes (default 1024)
 #   NUM_CLIENTS=N         remote publishers: 1|2|3 (default 1 for single-remote; 3 for E2)
-#   BROKER_IP=X.X.X.X    moscxl dataplane IP (default 10.10.10.143)
+#   BROKER_IP=X.X.X.X    moscxl dataplane IP (default 10.10.10.10 — 10G fabric, reachable from c1/c2/c3)
 #   SKIP_BASELINES=1      skip CORFU/SCALOG/LAZYLOG cells
 #   LOAD_POINTS_MBPS="…"  space-separated MB/s load points for E3
 #
@@ -58,7 +58,7 @@ CLIENT_HOSTS_REMOTE="${CLIENT_HOSTS_REMOTE:-c1}"   # single remote client (E3/E9
 CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c1,c2,c3}"     # three remote clients for E2 scaling
 
 # Broker dataplane IP reachable from all client nodes
-BROKER_IP="${BROKER_IP:-10.10.10.143}"
+BROKER_IP="${BROKER_IP:-10.10.10.10}"
 
 # ---------------------------------------------------------------------------
 # Mode / config
