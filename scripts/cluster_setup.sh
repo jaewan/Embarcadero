@@ -88,13 +88,23 @@ for host in "${CLIENT_NODES[@]}"; do
             [[ -f "$lib_path" ]] && cp -n "$lib_path" "$LOCAL_LIB/" 2>/dev/null || true
         done
 
-        # Sync the broker-compiled binary to client (works when client glibc >= broker glibc)
-        # For clients with older glibc: they need to build natively (done for c1 and c2).
-        # We always sync; the preflight will catch if it can't load.
+        # Sync the broker-compiled binary ONLY if the remote doesn't already have a working native build.
+        # The broker (AMD EPYC 9754) compiles with AVX-512 VBMI which some clients (Intel Cascade Lake)
+        # don't support. Always prefer a natively-built binary on the client.
+        # Check: if the remote binary is DIFFERENT from the broker binary, assume it's native → keep it.
+        local_hash=$(md5sum "$LOCAL_BIN/throughput_test" 2>/dev/null | cut -d' ' -f1)
+        remote_hash=$(ssh -o BatchMode=yes "$host" \
+            "md5sum $REMOTE_ROOT/build/bin/throughput_test 2>/dev/null | cut -d' ' -f1" 2>/dev/null || echo "")
         ssh -o BatchMode=yes "$host" "mkdir -p $REMOTE_ROOT/build/bin $REMOTE_ROOT/scripts/lib $REMOTE_ROOT/config $REMOTE_ROOT/lib" 2>/dev/null
-        rsync -az --checksum \
-            "$LOCAL_BIN/throughput_test" \
-            "$host:$REMOTE_ROOT/build/bin/"
+        if [[ "$remote_hash" == "$local_hash" ]] || [[ -z "$remote_hash" ]]; then
+            # Remote has broker binary or nothing — sync broker binary (ok for clients with newer/equal glibc)
+            rsync -az --checksum \
+                "$LOCAL_BIN/throughput_test" \
+                "$host:$REMOTE_ROOT/build/bin/"
+            info "  $host: synced broker binary (hash=$local_hash)"
+        else
+            info "  $host: keeping existing native binary (hash=$remote_hash ≠ broker $local_hash)"
+        fi
 
         # Sync shared libs needed by throughput_test
         if [[ -d "$LOCAL_LIB" && -n "$(ls -A "$LOCAL_LIB" 2>/dev/null)" ]]; then
