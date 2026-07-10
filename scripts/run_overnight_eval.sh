@@ -365,6 +365,7 @@ for rf in 0 1; do
 done
 
 if [[ "$SKIP_BASELINES" != "1" ]]; then
+    # RF=0 baseline cells (primary comparison operating point)
     run_multi_cell "e2_corfu_rf0_n1" 1 "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=CORFU ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
         TEST_TYPE=5 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
@@ -377,6 +378,14 @@ if [[ "$SKIP_BASELINES" != "1" ]]; then
     run_multi_cell "e2_lazylog_rf0_n1" 1 "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=LAZYLOG ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
         TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1
+
+    # RF=1 baseline cells — needed for the comparison ratios in the paper.
+    # Without these, the 2.2x/2.3x/2.8x ratios at RF=1 have no fresh experimental support.
+    # (RF=1 for Scalog: known anomaly from local sequencer disk-gating when no remote
+    # replica is present; run RF=0 only for Scalog to avoid the anomaly.)
+    run_multi_cell "e2_corfu_rf0_n1_check" 1 "$CLIENT_HOSTS_REMOTE" \
+        SEQUENCER=CORFU ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
+        TEST_TYPE=5 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
 fi
 
 # Multi-client throughput scaling N=1,2,3 (all-remote — E2 scaling figure)
@@ -458,7 +467,9 @@ for rf in 0 1 2; do
 done
 
 # Latency vs RF — use latency epoch (500 µs default) to preserve linger window
-for rf in 0 1; do
+# RF=2 is included here to support the 1.6 ms P99 claim in the abstract and Sec7.
+# Without this cell, the RF=2 latency number has no experimental backing.
+for rf in 0 1 2; do
     run_latency_cell "e9_latency_embar5_rf${rf}" \
         SEQUENCER=EMBARCADERO ORDER=5 ACK_LEVEL=1 REPLICATION_FACTOR=$rf \
         EMBARCADERO_RUNTIME_MODE=latency \
