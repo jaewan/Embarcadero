@@ -36,6 +36,12 @@ REMOTE_ROOT="${REMOTE_PROJECT_ROOT:-$HOME/Embarcadero}"
 LOCAL_BIN="$PROJECT_ROOT/build/bin"
 REQUIRED_BINS=(embarlet throughput_test corfu_global_sequencer)
 
+# Shared libraries that may be absent or version-mismatched on client nodes.
+# These are collected into $PROJECT_ROOT/lib/ and synced to the same path on clients.
+# run_overnight_eval.sh exports CLIENT_LD_LIBRARY_PATH=~/Embarcadero/lib so
+# run_multiclient.sh picks it up automatically.
+LOCAL_LIB="$PROJECT_ROOT/lib"
+
 stamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 info()  { echo "[$(stamp)] INFO  $*"; }
 warn()  { echo "[$(stamp)] WARN  $*" >&2; }
@@ -71,10 +77,29 @@ for host in "${CLIENT_NODES[@]}"; do
     ssh -o BatchMode=yes "$host" "mkdir -p $REMOTE_ROOT/build/bin $REMOTE_ROOT/scripts/lib $REMOTE_ROOT/config" 2>/dev/null
 
     if [[ "$CHECK_ONLY" != "1" ]]; then
-        # Sync binaries
+        # Collect shared libraries that may be missing/wrong-version on clients.
+        # Clients may differ in glibc version; collect from broker's runtime paths.
+        mkdir -p "$LOCAL_LIB"
+        for lib_path in \
+            /usr/local/lib/libglog.so.1 \
+            /usr/local/lib/libmimalloc.so.2 \
+            /lib/x86_64-linux-gnu/libyaml-cpp.so.0.8 \
+            /lib/x86_64-linux-gnu/libgflags.so.2.2; do
+            [[ -f "$lib_path" ]] && cp -n "$lib_path" "$LOCAL_LIB/" 2>/dev/null || true
+        done
+
+        # Sync the broker-compiled binary to client (works when client glibc >= broker glibc)
+        # For clients with older glibc: they need to build natively (done for c1 and c2).
+        # We always sync; the preflight will catch if it can't load.
+        ssh -o BatchMode=yes "$host" "mkdir -p $REMOTE_ROOT/build/bin $REMOTE_ROOT/scripts/lib $REMOTE_ROOT/config $REMOTE_ROOT/lib" 2>/dev/null
         rsync -az --checksum \
             "$LOCAL_BIN/throughput_test" \
             "$host:$REMOTE_ROOT/build/bin/"
+
+        # Sync shared libs needed by throughput_test
+        if [[ -d "$LOCAL_LIB" && -n "$(ls -A "$LOCAL_LIB" 2>/dev/null)" ]]; then
+            rsync -az --checksum "$LOCAL_LIB/" "$host:$REMOTE_ROOT/lib/"
+        fi
 
         # Sync scripts the client harness needs
         rsync -az --checksum \
@@ -91,15 +116,22 @@ for host in "${CLIENT_NODES[@]}"; do
             "$host:$REMOTE_ROOT/config/"
     fi
 
-    # Verify binary landed
-    if ssh -o BatchMode=yes "$host" "test -x $REMOTE_ROOT/build/bin/throughput_test"; then
-        # Check it's actually the right binary (not a stale old build)
-        remote_size=$(ssh -o BatchMode=yes "$host" "stat -c %s $REMOTE_ROOT/build/bin/throughput_test 2>/dev/null || stat -f %z $REMOTE_ROOT/build/bin/throughput_test 2>/dev/null")
-        local_size=$(stat -c %s "$LOCAL_BIN/throughput_test" 2>/dev/null || stat -f %z "$LOCAL_BIN/throughput_test" 2>/dev/null)
-        if [[ "$remote_size" == "$local_size" ]]; then
-            info "  $host: throughput_test OK (size=${remote_size}B)"
+    # Verify binary is runnable (with LD_LIBRARY_PATH pointing to the synced libs)
+    client_lib="$REMOTE_ROOT/lib"
+    if ssh -o BatchMode=yes "$host" \
+        "test -x $REMOTE_ROOT/build/bin/throughput_test && \
+         LD_LIBRARY_PATH=$client_lib ldd $REMOTE_ROOT/build/bin/throughput_test 2>/dev/null | grep -v 'not found' > /dev/null && \
+         echo ok" 2>/dev/null | grep -q ok; then
+        info "  $host: throughput_test OK (binary + libs verified)"
+    elif ssh -o BatchMode=yes "$host" "test -x $REMOTE_ROOT/build/bin/throughput_test"; then
+        # Binary present but ldd failed — try running it
+        missing=$(ssh -o BatchMode=yes "$host" \
+            "LD_LIBRARY_PATH=$client_lib ldd $REMOTE_ROOT/build/bin/throughput_test 2>/dev/null | grep 'not found'" || true)
+        if [[ -z "$missing" ]]; then
+            info "  $host: throughput_test OK"
         else
-            warn "  $host: throughput_test size mismatch (local=$local_size remote=$remote_size) — sync may have failed"
+            warn "  $host: throughput_test has missing libs: $missing"
+            warn "        Client may need native build: ssh $host 'cd ~/Embarcadero && cmake --build build -j --target throughput_test'"
         fi
     else
         die "$host: throughput_test missing after sync"

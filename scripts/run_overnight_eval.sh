@@ -85,6 +85,12 @@ MSG_SIZE="${MSG_SIZE:-1024}"
 NUM_BROKERS="${NUM_BROKERS:-4}"
 SKIP_BASELINES="${SKIP_BASELINES:-0}"
 
+# Shared libs that may be missing or wrong-version on client nodes.
+# cluster_setup.sh collects these into $PROJECT_ROOT/lib/; we point clients there.
+# run_multiclient.sh honours CLIENT_LD_LIBRARY_PATH and passes it to remote throughput_test.
+REMOTE_EMBAR_ROOT="${REMOTE_EMBAR_ROOT:-$HOME/Embarcadero}"
+export CLIENT_LD_LIBRARY_PATH="$REMOTE_EMBAR_ROOT/lib"
+
 RUN_TAG="${RUN_TAG:-$(date -u +%Y%m%dT%H%M%SZ)_overnight}"
 OUT_BASE="$PROJECT_ROOT/data/overnight_eval/$RUN_TAG"
 LOG_DIR="$OUT_BASE/logs"
