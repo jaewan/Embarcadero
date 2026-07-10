@@ -21,10 +21,22 @@ client:
     epoll_wait_writable_ms_latency: 1
 
   publisher:
-    threads_per_broker: 3   # Optimal config matching 981dd61 (10-12 GB/s)
+    threads_per_broker: 3   # Optimal for co-located config (10-12 GB/s, 4 brokers × 3 threads = 12 streams).
+    #
+    # SENTINEL NOTE: main.cc treats -n 4 as a sentinel that reads this yaml value instead.
+    # Passing -n 3 (or any value ≠ 4) uses that value directly.
+    # run_overnight_eval.sh passes THREADS_PER_BROKER=6 for throughput cells to bypass the
+    # sentinel and use 6 actual threads/broker → 24 streams → higher per-client ceiling.
+    #
     # 1024 MB per buffer so 12 buffers (3 threads/broker × 4 brokers) hold 10 GB total (12 × 1 GB = 12 GB ≥ 10 GB).
     # Min would be ceil(10/12) GB ≈ 854 MB; 1024 MB gives headroom so 10 GB test does not wrap.
     buffer_size_mb: 1024
+    #
+    # batch_size_kb: client publish-side batch target (2 MB = 2048 KB, matches theoretical ceiling
+    # of 4.0 GB/s at 500 µs/epoch = 2000 epochs/sec × 2 MB/epoch).
+    # To increase batch size for throughput mode WITHOUT editing this file, set:
+    #   EMBARCADERO_CLIENT_PUB_BATCH_KB=4096  (4 MB/batch → doubles throughput ceiling per epoch)
+    # Keep this yaml at 2048 to preserve latency-mode behaviour (linger accumulates < 2 MB).
     batch_size_kb: 2048
   
   subscriber:

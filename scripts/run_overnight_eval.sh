@@ -122,6 +122,14 @@ THREADS_THROUGHPUT="${THREADS_THROUGHPUT:-6}"
 # are initialized on first write. Matches the ablation sweep config.
 export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
 
+# FIX 5: Disable MAP_POPULATE for CXL mmap on follower brokers.
+# MAP_POPULATE=1 (default) causes follower brokers to page-fault all 64 GB of CXL
+# at startup via mmap(MAP_POPULATE), taking ~77 seconds — far beyond the 120s
+# BROKER_READY_TIMEOUT. The head broker uses lazy populate (mbind-only); followers
+# do the same with MAP_POPULATE=0. Payload correctness is unaffected: pages are
+# faulted on first write/read, which is the correct behavior for CXL.
+export EMBARCADERO_CXL_MAP_POPULATE="${EMBARCADERO_CXL_MAP_POPULATE:-0}"
+
 # FIX 4: Increase broker reachability timeout from 20s to 60s.
 # With epoch_us=100 and 4 brokers, all brokers bind ports within ~3s of signaling
 # ready; 20s is usually enough but the probe can fail transiently on first connection.
