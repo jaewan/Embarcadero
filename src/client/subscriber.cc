@@ -420,7 +420,9 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 				metadata->num_messages > 0 &&
 				metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
 				metadata->batch_total_order < Embarcadero::wire::MAX_BATCH_TOTAL_ORDER &&
-				metadata->flags == 0;
+				// [[O5-1 PR-2]] Accept the known EXPORT_GAP flag (a lagging subscriber's reported
+				// ring lap); only UNKNOWN flag bits invalidate the frame. Wire-compatible.
+				(metadata->flags & ~Embarcadero::wire::BATCH_META_FLAG_EXPORT_GAP) == 0;
 			if (header_ok && batch_shape_ok) {
 				conn->latency_has_batch_metadata = true;
 				conn->latency_diag.metadata_detected++;
@@ -2179,6 +2181,19 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::sha
 				batch_state.has_pending_metadata = true;
 				batch_state.current_batch_messages_processed = 0;
 				batch_state.next_message_order_in_batch = potential_metadata->batch_total_order;
+
+				// [[O5-1 PR-2]] If the broker reported an export-ring lap for this (lagging)
+				// connection, this batch is the first after committed batches it skipped. REPORT it
+				// (never silent) — delivery re-anchors to this batch's total_order above, so what IS
+				// delivered stays correctly ordered; the gap is a resubscribe-style discontinuity,
+				// not a total-order hole within the delivered stream.
+				if (potential_metadata->flags & Embarcadero::wire::BATCH_META_FLAG_EXPORT_GAP) {
+					ordered_export_gaps_reported_.fetch_add(1, std::memory_order_relaxed);
+					LOG(WARNING) << "Subscriber: ORDER=5 export gap reported by broker (lagging "
+					             << "subscriber lapped the export ring); re-anchoring at "
+					             << "batch_total_order=" << potential_metadata->batch_total_order
+					             << ", fd=" << fd;
+				}
 
 				VLOG(3) << "ProcessSequencer5Data: Found batch metadata, total_order="
 				        << potential_metadata->batch_total_order << ", num_messages="

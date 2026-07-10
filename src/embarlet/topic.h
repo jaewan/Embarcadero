@@ -337,7 +337,10 @@ class Topic {
 				void* &batch_addr,
 				size_t &batch_size,
 				size_t &batch_total_order,
-				uint32_t &num_messages);
+				uint32_t &num_messages,
+				// [[O5-1 EDIT B]] optional out: export batches skipped due to a ring lap on this
+				// call (0 normally). Non-null caller uses it to terminalize+flag the lagging conn.
+				uint64_t* export_gap = nullptr);
 		/**
 		 * Get the address and size of messages for a subscriber
 		 *

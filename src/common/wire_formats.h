@@ -55,6 +55,13 @@ static constexpr uint16_t HEADER_VERSION_V2 = 2;
 static constexpr size_t V1_HEADER_SIZE = 64;  // MessageHeader size (aligned)
 static constexpr size_t V2_HEADER_SIZE = 64;  // BlogMessageHeader size (aligned)
 
+// [[O5-1 PR-2]] BatchMetadata.flags bits. Wire-compatible: the field was reserved-and-zero, so a
+// peer that predates this ignores it. EXPORT_GAP marks the first batch a subscriber receives AFTER
+// the broker's export cursor skipped past committed batches it lapped in the export ring (a lagging
+// subscriber). The ORDER=5 client contiguity check treats this as a COUNTED, REPORTED gap and
+// re-anchors, instead of flagging a (sacred) total-order hole.
+static constexpr uint16_t BATCH_META_FLAG_EXPORT_GAP = 0x1;
+
 inline constexpr bool IsValidHeaderVersion(uint16_t version) {
     return version == HEADER_VERSION_V1 || version == HEADER_VERSION_V2;
 }

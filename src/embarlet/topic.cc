@@ -2774,7 +2774,13 @@ bool Topic::GetBatchToExportWithMetadata(
 		void* &batch_addr,
 		size_t &batch_size,
 		size_t &batch_total_order,
-		uint32_t &num_messages) {
+		uint32_t &num_messages,
+		uint64_t* export_gap) {
+	// [[O5-1 EDIT B]] export_gap (optional out): number of committed export batches SKIPPED because
+	// a lagging subscriber lapped the export ring on this call (0 on the common path). The caller
+	// (network layer) uses a non-zero value to terminalize+flag that connection so the gap is
+	// reported to the client, never silently dropped. Pointer-default keeps all other callers intact.
+	if (export_gap) *export_gap = 0;
 	// Corfu ORDER=2 does not advance CompletionVector like ORDER=5/3 paths.
 	// Fall back to legacy ordered-slot export using monotonic expected_batch_offset.
 	if (seq_type_ == CORFU && order_ == 2 && num_slots_ > 0 && cxl_addr_) {
@@ -2947,6 +2953,9 @@ bool Topic::GetBatchToExportWithMetadata(
 			const uint64_t skipped = resync_to > next_export ? (resync_to - next_export) : 0;
 			order5_export_overruns_.fetch_add(1, std::memory_order_relaxed);
 			order5_export_skipped_batches_.fetch_add(skipped, std::memory_order_relaxed);
+			// [[O5-1 EDIT B]] Surface the lap to the caller so it can terminalize+flag this
+			// connection (report the gap to the client) instead of silently advancing the cursor.
+			if (export_gap) *export_gap = skipped;
 			LOG(ERROR) << "[ORDER5_EXPORT_OVERRUN B" << broker_id_ << "]"
 			           << " expected_export_seq=" << next_export
 			           << " observed_export_seq=" << observed

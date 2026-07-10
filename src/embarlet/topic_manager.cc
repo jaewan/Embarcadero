@@ -863,7 +863,8 @@ bool TopicManager::GetBatchToExportWithMetadata(
 		void* &batch_addr,
 		size_t &batch_size,
 		size_t &batch_total_order,
-		uint32_t &num_messages) {
+		uint32_t &num_messages,
+		uint64_t* export_gap) {
 
 	absl::ReaderMutexLock lock(&topics_mutex_);
 
@@ -873,7 +874,7 @@ bool TopicManager::GetBatchToExportWithMetadata(
 		return false;
 	}
 
-	return topic_itr->second->GetBatchToExportWithMetadata(expected_batch_offset, batch_addr, batch_size, batch_total_order, num_messages);
+	return topic_itr->second->GetBatchToExportWithMetadata(expected_batch_offset, batch_addr, batch_size, batch_total_order, num_messages, export_gap);
 }
 
 bool TopicManager::GetMessageAddr(

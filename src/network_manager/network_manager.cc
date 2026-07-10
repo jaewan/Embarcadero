@@ -1892,6 +1892,12 @@ void NetworkManager::SubscribeNetworkThread(
 	uint64_t export_messages = 0;
 	uint64_t metadata_send_failures = 0;
 	uint64_t payload_send_failures = 0;
+	// [[O5-1 EDIT C]] Per-connection pending export-ring lap. If GetBatchToExportWithMetadata reports
+	// a lap (export_gap>0, cursor rebased to the live window), we flag the NEXT batch frame this
+	// connection sends with BATCH_META_FLAG_EXPORT_GAP so the ORDER=5 client records a counted,
+	// reported gap and re-anchors — never a silent total-order hole. Accumulates across the (rare)
+	// case where the lapping call returns no batch, so the flag rides the next successful frame.
+	uint64_t pending_export_gap = 0;
 	uint64_t meta_sent_bytes = 0;
 	// Subscribe send-path diagnostics (always collected, logged at thread exit)
 	uint64_t send_total_ns = 0;     // total ns inside SendMessageData
@@ -1921,13 +1927,19 @@ void NetworkManager::SubscribeNetworkThread(
 			if (order == 5 || order == 2 || order == 1) {
 				size_t batch_total_order = 0;
 				uint32_t num_messages = 0;
-				if (!topic_manager_->GetBatchToExportWithMetadata(
+				uint64_t export_gap = 0;  // [[O5-1 EDIT C]] set if this call lapped the export ring
+				const bool got_batch = topic_manager_->GetBatchToExportWithMetadata(
 							topic,
 							local_offset,
 							msg,
 							messages_size,
 							batch_total_order,
-							num_messages)){
+							num_messages,
+							&export_gap);
+				// [[O5-1 EDIT C]] Remember any ring lap; the flag rides the next batch frame (below),
+				// covering the rare case where the lapping call itself returned no batch.
+				if (export_gap > 0) pending_export_gap += export_gap;
+				if (!got_batch){
 					{
 						absl::MutexLock lock(&cached_state->mu);
 						if (local_offset != cached_state->last_offset) {
@@ -1954,6 +1966,13 @@ void NetworkManager::SubscribeNetworkThread(
 				}
 				batch_meta.header_version = header_version;
 				batch_meta.flags = 0;
+				// [[O5-1 EDIT C]] Flag the first frame after a ring lap so the ORDER=5 client records
+				// a counted, reported gap and re-anchors (never a silent total-order hole). Only the
+				// lagging connection is affected; keeping-up subscribers never set pending_export_gap.
+				if (pending_export_gap > 0) {
+					batch_meta.flags |= wire::BATCH_META_FLAG_EXPORT_GAP;
+					pending_export_gap = 0;
+				}
 				export_batches++;
 				export_bytes += messages_size;
 				export_messages += num_messages;

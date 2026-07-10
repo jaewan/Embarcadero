@@ -267,6 +267,12 @@ struct ConsumedData {
  */
 class Subscriber {
 	public:
+		// [[O5-1 PR-2]] Number of ORDER=5 export-ring laps reported to this subscriber (0 for a
+		// keeping-up subscriber). Non-zero means the broker skipped committed batches for this
+		// connection and flagged it; the gap is reported, not a silent total-order hole.
+		uint64_t GetOrderedExportGapsReported() const {
+			return ordered_export_gaps_reported_.load(std::memory_order_relaxed);
+		}
 		// ... Constructor, destructor, other methods ...
 		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency=false, int order_level=0);
 		~Subscriber(); // Important to manage shutdown and cleanup
@@ -410,6 +416,10 @@ class Subscriber {
 		size_t sub_connections_per_broker_;
 		int order_level_; // Store the order level for batch-aware processing
 		std::atomic<size_t> DEBUG_count_{0}; // Total bytes received across all connections
+		// [[O5-1 PR-2]] Count of ORDER=5 batches that arrived flagged BATCH_META_FLAG_EXPORT_GAP,
+		// i.e. the broker reported an export-ring lap for this (lagging) subscriber. Reported, not
+		// silent; exposed via GetOrderedExportGapsReported() for tests/telemetry.
+		std::atomic<uint64_t> ordered_export_gaps_reported_{0};
 		// Wall-clock nanoseconds (system_clock epoch) when the first byte was received.
 		// Set once via CAS on first non-zero recv; 0 means no data yet.
 		std::atomic<int64_t> first_byte_wall_ns_{0};

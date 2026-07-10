@@ -143,7 +143,8 @@ class TopicManager {
 				void* &batch_addr,
 				size_t &batch_size,
 				size_t &batch_total_order,
-				uint32_t &num_messages);
+				uint32_t &num_messages,
+				uint64_t* export_gap = nullptr);  // [[O5-1 EDIT B]] see Topic:: overload
 		/**
 		 * Get message address and size for a topic
 		 *
