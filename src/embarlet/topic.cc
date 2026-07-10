@@ -4048,6 +4048,11 @@ void Topic::Sequencer2() {
 	// ProcessLevel5Batches (hold-buffer tick + per-epoch partition). Without this,
 	// level5_shards_ is empty and ProcessLevel5Batches dereferences level5_shards_[0].
 	InitLevel5Shards();
+	// [[ORDER2_RECOVERY_GATE]] ORDER=2 has no per-session ORDER=5 state to recover; the
+	// EpochSequencerThread's ProcessLevel5Batches CHECK on order5_recovery_complete_ fires
+	// unless we set it here. For ORDER=2, level5 paths are no-ops (all batches have
+	// client_id==0 → level0), so setting the flag unconditionally is safe.
+	order5_recovery_complete_.store(true, std::memory_order_release);
 	absl::btree_set<int> registered_brokers;
 	GetRegisteredBrokerSet(registered_brokers);
 
