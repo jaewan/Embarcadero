@@ -116,6 +116,19 @@ EPOCH_US_LATENCY="${EPOCH_US_LATENCY:-500}"
 #   Latency cells are left at the config default (sentinel-4 → 3 threads) to avoid confounding.
 THREADS_THROUGHPUT="${THREADS_THROUGHPUT:-6}"
 
+# FIX 3: CXL zero mode — "full" zeros all 64 GB and takes ~5s per trial startup.
+# "metadata" zeros only the metadata region (~18 GB) and takes ~1s.
+# Use metadata for all eval runs; correctness is preserved since payload regions
+# are initialized on first write. Matches the ablation sweep config.
+export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
+
+# FIX 4: Increase broker reachability timeout from 20s to 60s.
+# With epoch_us=100 and 4 brokers, all brokers bind ports within ~3s of signaling
+# ready; 20s is usually enough but the probe can fail transiently on first connection.
+# 60s gives 3× headroom with no performance cost (the 120s broker-ready timeout
+# already gates the actual startup; this only adds guard time for the probe).
+export BROKER_REACHABILITY_TIMEOUT_SEC="${BROKER_REACHABILITY_TIMEOUT_SEC:-60}"
+
 # Shared libs that may be missing or wrong-version on client nodes.
 # cluster_setup.sh collects these into $PROJECT_ROOT/lib/; we point clients there.
 # run_multiclient.sh honours CLIENT_LD_LIBRARY_PATH and passes it to remote throughput_test.
