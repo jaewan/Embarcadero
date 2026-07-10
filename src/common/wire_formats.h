@@ -108,7 +108,8 @@ struct BatchMetadata {
     size_t batch_total_order;      // Starting total_order for this batch
     uint32_t num_messages;         // Number of messages in this batch
     uint16_t header_version;       // Message header format: 1=MessageHeader, 2=BlogMessageHeader
-    uint16_t flags;                // Reserved for future flags
+    uint16_t flags;                // Bitfield: bit0 = BATCH_META_FLAG_EXPORT_GAP (see above);
+                                   // remaining bits reserved (must be 0; unknown bits invalidate the frame).
 };
 
 // Verify size and alignment are consistent across platforms

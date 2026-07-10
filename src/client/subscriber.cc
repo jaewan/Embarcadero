@@ -2172,6 +2172,11 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::sha
 			Embarcadero::wire::BatchMetadata* potential_metadata =
 				reinterpret_cast<Embarcadero::wire::BatchMetadata*>(data + current_pos);
 
+			// [[O5-1 PR-2]] NOTE: unlike the latency parser (see the flags mask ~line 425), the
+			// ordered path does not validate `flags` here — the metadata boundary is disambiguated by
+			// header_version/num_messages/total_order, and the EXPORT_GAP bit is read (not gated) at
+			// the report site below. If a future flag bit needs to invalidate a frame on this path,
+			// mirror the `(flags & ~KNOWN_BITS) == 0` mask from the latency parser here.
 			if (Embarcadero::wire::IsValidHeaderVersion(potential_metadata->header_version) &&
 			    potential_metadata->num_messages > 0 &&
 			    potential_metadata->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&

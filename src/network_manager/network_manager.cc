@@ -1972,6 +1972,16 @@ void NetworkManager::SubscribeNetworkThread(
 				if (pending_export_gap > 0) {
 					batch_meta.flags |= wire::BATCH_META_FLAG_EXPORT_GAP;
 					pending_export_gap = 0;
+					// [[O5-1 KNOWN LIMITATION]] pending_export_gap is cleared here, before the
+					// metadata/payload send below. If that send then fails and this connection tears
+					// down, this single lap goes UNREPORTED: pending_export_gap is a per-connection-
+					// thread local, so it dies with the thread, and the client's reconnect starts a
+					// fresh SubscriberState at the live window (no flag). This does NOT violate any
+					// ordering guarantee (total order / per-session FIFO / single GOI are untouched) —
+					// it only drops the REPORT of one lap, and only when it coincides with a socket
+					// teardown, which is itself a client-observable resubscribe (not truly silent).
+					// A robust fix would need the gap persisted across the reconnect keyed on client
+					// identity; deferred as low-value since the teardown already signals the client.
 				}
 				export_batches++;
 				export_bytes += messages_size;
