@@ -707,6 +707,29 @@ std::vector<double> DistributedKVStore::collectApplyLatenciesAndReset(){
 	return out;
 }
 
+std::vector<std::pair<std::string, std::string>> DistributedKVStore::scan(
+		const std::string& start_key, int count) {
+	waitForSyncWithLog();
+	const uint64_t rc = scan_record_count_.load(std::memory_order_relaxed);
+	return kv_store_.scan(start_key, count, rc);
+}
+
+size_t DistributedKVStore::readModifyWrite(const std::string& key, size_t value_size) {
+	// Read through the public get() path so waitForSyncWithLog() runs first.
+	// Bypassing it (via kv_store_.get directly) risks reading a stale value when
+	// a prior write to the same key is in-flight in the log but not yet applied,
+	// which would silently drop the in-flight write on back-to-back RMWs.
+	std::string current = this->get(key);
+	// Append "|rmw" suffix, capped to value_size bytes.
+	static const std::string kSuffix = "|rmw";
+	std::string new_val = current + kSuffix;
+	if (value_size > 0 && new_val.size() > value_size) {
+		new_val.resize(value_size);
+	}
+	// Write back through the log.
+	return put(key, new_val);
+}
+
 size_t DistributedKVStore::publishBatch(const std::vector<KeyValue>& kvPairs, OpType type) {
 	if (kvPairs.empty()) return 0;
 	if (kvPairs.size() == 1 && type == OpType::MULTI_PUT) {

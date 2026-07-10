@@ -67,6 +67,9 @@ bool ScalogReplicationClient::Connect(int timeout_seconds) {
 		is_connected_.store(true, std::memory_order_release);
 	} else {
 		LOG(ERROR) << "Failed to connect to server at " << server_address_ << " within timeout";
+		LOG(WARNING) << "ScalogReplicationClient: no replica answered at " << server_address_
+		             << " — in a single-node eval pass --rf 0 (or RF=0) so the replication "
+		             << "client is never created and this 5-second stall is avoided entirely.";
 	}
 
 	return connected;

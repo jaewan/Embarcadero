@@ -184,6 +184,32 @@ class ShardedKVStore {
 			}
 		}
 
+		// Scan: retrieve up to `count` key-value pairs starting from the hash-
+		// position of `start_key`.  Because keys are hash-distributed across shards,
+		// this performs sequential get() calls for keys start_key, start_key+1, …
+		// (modulo record_count) using the numeric suffix encoded in the key.
+		std::vector<std::pair<std::string, std::string>> scan(
+				const std::string& start_key, int count, uint64_t record_count) const {
+			std::vector<std::pair<std::string, std::string>> results;
+			results.reserve(static_cast<size_t>(count));
+			// Parse the numeric id from the key (format "k%012lu")
+			uint64_t start_id = 0;
+			if (start_key.size() > 1) {
+				try { start_id = std::stoull(start_key.substr(1)); }
+				catch (...) { start_id = 0; }
+			}
+			if (record_count == 0) return results;
+			for (int i = 0; i < count; ++i) {
+				uint64_t id = (start_id + static_cast<uint64_t>(i)) % record_count;
+				char buf[32];
+				snprintf(buf, sizeof(buf), "k%012lu", static_cast<unsigned long>(id));
+				std::string k(buf);
+				std::string v = get(k);
+				results.emplace_back(std::move(k), std::move(v));
+			}
+			return results;
+		}
+
 		// Get total number of keys across all shards
 		size_t size() const {
 			size_t total = 0;
@@ -219,6 +245,10 @@ class DistributedKVStore {
 
 		// Server ID which should be the client_id from Embarcadero
 		uint64_t server_id_;
+
+		// Total number of loaded records — used by scan() for key wrapping.
+		// Updated by the bench driver via setScanRecordCount().
+		std::atomic<uint64_t> scan_record_count_{0};
 
 
 		// Local key-value store
@@ -316,6 +346,11 @@ class DistributedKVStore {
 
 		uint64_t getServerID() const { return server_id_; }
 
+		// Set the record count for scan() key wrapping.
+		void setScanRecordCount(uint64_t n) {
+			scan_record_count_.store(n, std::memory_order_relaxed);
+		}
+
 		size_t storeSize() const { return kv_store_.size(); }
 		uint64_t getAppliedLocalOpCount() const {
 			return applied_local_ops_.load(std::memory_order_acquire);
@@ -337,6 +372,17 @@ class DistributedKVStore {
 
 		// Collect and reset apply latencies
 		std::vector<double> collectApplyLatenciesAndReset();
+
+		// Scan up to `count` consecutive keys starting at start_key (hash-distributed
+		// across shards — sequential key lookup by numeric suffix).
+		// Calls waitForSyncWithLog() for read consistency.
+		std::vector<std::pair<std::string, std::string>> scan(
+				const std::string& start_key, int count);
+
+		// Read-Modify-Write: read current value locally, append "|rmw" (capped at
+		// value_size bytes), then write back through the log.
+		// Returns the client_order (opid) of the write.
+		size_t readModifyWrite(const std::string& key, size_t value_size);
 };
 
 #endif  // DISTRIBUTED_KV_STORE_H_
