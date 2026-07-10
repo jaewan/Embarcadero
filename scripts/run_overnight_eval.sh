@@ -103,11 +103,14 @@ SKIP_BASELINES="${SKIP_BASELINES:-0}"
 # ---------------------------------------------------------------------------
 # Throughput tuning knobs (FIX 1 + FIX 2)
 # ---------------------------------------------------------------------------
-# FIX 1: Epoch period for ORDER=5 EpochDriverThread.
-#   Throughput cells: 200 µs → 5000 epochs/sec → ~10 GB/s theoretical ceiling with 2 MB batches.
-#   Latency cells:   500 µs (default) preserves linger accumulation window.
-#   Override the respective var to revert to the original 500 µs default if needed.
-EPOCH_US_THROUGHPUT="${EPOCH_US_THROUGHPUT:-200}"
+# Epoch period for ORDER=5 EpochDriverThread.
+#   Default 500 µs matches the broker's kEpochUs and is optimal for remote publishing:
+#   a remote publisher over 100G produces ~1 batch per epoch at ~4-5 GB/s, so the
+#   epoch timer fires in sync with arrivals. Smaller epoch_us (100-200) helps only
+#   for LOCAL (loopback) publishing where the publisher can saturate the epoch faster.
+#   Latency cells use 500 µs (preserves linger accumulation window).
+#   Override with EPOCH_US_THROUGHPUT=200 for local/loopback ablation only.
+EPOCH_US_THROUGHPUT="${EPOCH_US_THROUGHPUT:-500}"
 EPOCH_US_LATENCY="${EPOCH_US_LATENCY:-500}"
 
 # FIX 2: Threads per broker for throughput cells.
