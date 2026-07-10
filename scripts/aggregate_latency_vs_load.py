@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import os
 import pathlib
 from collections import defaultdict
 
@@ -102,7 +103,14 @@ def write_trial_rows(rows, output_path: pathlib.Path):
             writer.writerow({field: row.get(field, "") for field in fields})
 
 
-def write_summary(rows, output_path: pathlib.Path):
+def _trial_index(row):
+    try:
+        return int(str(row.get("trial", "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def write_summary(rows, output_path: pathlib.Path, warmup_trials: int = 0):
     grouped = defaultdict(list)
     for row in rows:
         grouped[row.get("target_mbps", "")].append(row)
@@ -110,6 +118,7 @@ def write_summary(rows, output_path: pathlib.Path):
     fields = [
         "target_mbps",
         "trials",
+        "warmup_trials_excluded",
         "achieved_offered_load_mbps_mean",
         "achieved_publish_goodput_mbps_mean",
         "achieved_e2e_goodput_mbps_mean",
@@ -150,13 +159,21 @@ def write_summary(rows, output_path: pathlib.Path):
         writer.writeheader()
         for target in sorted(grouped.keys(), key=lambda v: maybe_float(v) if maybe_float(v) is not None else float("inf")):
             trial_rows = grouped[target]
+            # [[EVAL WARM-UP]] Per load point, drop the first N (cold) trials before averaging the
+            # percentiles/goodput — the first trial after a fresh cluster start is deterministically
+            # slow on this testbed (see docs/experiments/rf_throughput_warmup_artifact.md). Raw trials
+            # are still written to --trial-output. Fall back to all trials if a point has too few.
+            ordered = sorted(trial_rows, key=_trial_index)
+            wu = max(0, warmup_trials)
+            measured = ordered[wu:] if len(ordered) > wu else ordered
             out = {
                 "target_mbps": target,
                 "trials": len(trial_rows),
+                "warmup_trials_excluded": len(ordered) - len(measured),
             }
             for field in metric_fields:
                 out[f"{field}_mean"] = ""
-                value = mean([maybe_float(row.get(field)) for row in trial_rows])
+                value = mean([maybe_float(row.get(field)) for row in measured])
                 if value is not None:
                     out[f"{field}_mean"] = f"{value:.6f}"
             writer.writerow(out)
@@ -167,6 +184,11 @@ def main():
     parser.add_argument("--input-run-dir", required=True, help="Run directory produced by scripts/run_latency_vs_load.sh")
     parser.add_argument("--trial-output", required=True, help="Output CSV with one row per trial")
     parser.add_argument("--summary-output", required=True, help="Output CSV with one row per offered-load point")
+    # [[EVAL WARM-UP]] Exclude the first N cold trials PER LOAD POINT from the mean (raw preserved).
+    # Mirrors aggregate_e2e_throughput.py; see docs/baselines/fairness_appendix.md. Default 1;
+    # override via --warmup-trials or the WARMUP_TRIALS env var.
+    parser.add_argument("--warmup-trials", type=int,
+                        default=int(os.environ.get("WARMUP_TRIALS", "1")))
     args = parser.parse_args()
 
     run_dir = pathlib.Path(args.input_run_dir)
@@ -174,8 +196,8 @@ def main():
     if not rows:
         raise SystemExit(f"No latency_benchmark_summary.csv files found under {run_dir}")
 
-    write_trial_rows(rows, pathlib.Path(args.trial_output))
-    write_summary(rows, pathlib.Path(args.summary_output))
+    write_trial_rows(rows, pathlib.Path(args.trial_output))  # raw: ALL trials preserved
+    write_summary(rows, pathlib.Path(args.summary_output), warmup_trials=max(0, args.warmup_trials))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,10 @@ REPLICATION_FACTOR="${REPLICATION_FACTOR:-0}"
 MSG_SIZE="${MSG_SIZE:-1024}"
 TOTAL_MESSAGE_SIZE="${TOTAL_MESSAGE_SIZE:-134217728}"
 NUM_TRIALS="${NUM_TRIALS:-3}"
+# [[EVAL WARM-UP]] Leading (cold) trials excluded from the per-point mean (raw preserved). The first
+# trial after a fresh cluster start is deterministically slow on this testbed; see
+# docs/experiments/rf_throughput_warmup_artifact.md. Set 0 to disable; use NUM_TRIALS >= WARMUP_TRIALS+3.
+WARMUP_TRIALS="${WARMUP_TRIALS:-1}"
 NUM_BROKERS="${NUM_BROKERS:-4}"
 SCENARIO="${SCENARIO:-local}"
 SYSTEM_LABEL="${SYSTEM_LABEL:-${SEQUENCER}_order${ORDER}_ack${ACK_LEVEL}_rf${REPLICATION_FACTOR}}"
@@ -125,13 +129,15 @@ for target in $LOAD_POINTS_MBPS; do
   python3 scripts/aggregate_latency_vs_load.py \
     --input-run-dir "$POINT_DIR" \
     --trial-output "$POINT_DIR/trial_results.csv" \
-    --summary-output "$POINT_DIR/summary.csv"
+    --summary-output "$POINT_DIR/summary.csv" \
+    --warmup-trials "$WARMUP_TRIALS"
 done
 
 python3 scripts/aggregate_latency_vs_load.py \
   --input-run-dir "$RUN_DIR" \
   --trial-output "$RUN_DIR/trial_results.csv" \
-  --summary-output "$RUN_DIR/summary.csv"
+  --summary-output "$RUN_DIR/summary.csv" \
+  --warmup-trials "$WARMUP_TRIALS"
 
 printf 'end_time_utc=%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" >> "$RUN_DIR/metadata.env"
 
