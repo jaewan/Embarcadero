@@ -68,6 +68,39 @@ QueueBuffer::QueueBuffer(size_t num_buf, size_t num_threads_per_broker, int clie
 		blog_header_.received = 0;
 	}
 
+	// [[LINGER]] Time-based batch seal deadline. Bounds low-load publish->deliver latency by
+	// sealing a partially-full batch once it has been open >= linger_us_, instead of waiting for
+	// the size cap (~10 ms mean batch-fill at low offered load). Under load the size cap fires
+	// first, so throughput is unchanged. Precedence: explicit EMBARCADERO_CLIENT_LINGER_US wins;
+	// else in latency runtime mode a small default (300 us) is applied; else 0 (legacy size-only).
+	// Set once here and never mutated, so the producer hot path reads it lock-free. Guarantee-safe:
+	// seal *timing* does not affect total order / per-session FIFO / dedup (assigned downstream in
+	// CommitEpoch and enforced by the subscriber hold buffer + session lease/fence/dedup); batch_seq_
+	// still monotonically orders a session's batches regardless of when a batch seals.
+	{
+		linger_us_ = 0;
+		if (const char* e = std::getenv("EMBARCADERO_CLIENT_LINGER_US")) {
+			char* end = nullptr;
+			long long v = std::strtoll(e, &end, 10);
+			// Require a clean full parse (reject "300xyz"/"3.5") and clamp to [0, 60s]. The upper
+			// bound also guarantees the hot-path std::chrono::microseconds(linger_us_)->nanoseconds
+			// widening (x1000) below cannot overflow int64. strtoll returns LLONG_MAX on overflow,
+			// which fails the clamp and disables linger rather than triggering UB.
+			if (end != e && *end == '\0' && v >= 0 && v <= 60000000) {
+				linger_us_ = static_cast<int64_t>(v);
+			} else {
+				LOG(WARNING) << "QueueBuffer: ignoring invalid EMBARCADERO_CLIENT_LINGER_US='" << e
+				             << "' (want an integer 0..60000000 microseconds); linger disabled";
+			}
+		} else if (const char* mode = std::getenv("EMBARCADERO_RUNTIME_MODE")) {
+			if (std::strcmp(mode, "latency") == 0) linger_us_ = 300;
+		}
+		if (linger_us_ > 0) {
+			LOG(INFO) << "QueueBuffer: publisher batch linger enabled, linger_us=" << linger_us_
+			          << " (size cap still fires first under load; seal timing is order/FIFO-neutral)";
+		}
+	}
+
 	queues_.reserve(num_queues_);
 	for (size_t i = 0; i < num_queues_; i++) {
 		queues_.push_back(std::make_unique<folly::ProducerConsumerQueue<Embarcadero::BatchHeader*>>(kQueueCapacity));
@@ -245,9 +278,9 @@ bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* co
 	memset(current_batch_, 0, sizeof(Embarcadero::BatchHeader));
 	current_batch_tail_ = sizeof(Embarcadero::BatchHeader);
 	current_batch_num_msg_ = 0;
-#ifdef COLLECT_LATENCY_STATS
+	// [[LINGER]] Always reset the batch-open stamp (Write() re-stamps on the first message of the
+	// new batch; this keeps it well-defined for the linger check regardless of build flags).
 	current_batch_first_submit_time_ = {};
-#endif
 	return true;
 }
 
@@ -411,9 +444,10 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 		memcpy(base + current_batch_tail_ + header_size, msg, len);
 	}
 	if (current_batch_num_msg_ == 0) {
-#ifdef COLLECT_LATENCY_STATS
+		// [[LINGER]] Stamp the batch-open time unconditionally (was COLLECT_LATENCY_STATS-only).
+		// Cost is one steady_clock::now() per batch (~20 ns), and it is required by the linger
+		// seal below. Producer-exclusive field, no synchronization needed.
 		current_batch_first_submit_time_ = std::chrono::steady_clock::now();
-#endif
 	}
 	current_batch_tail_ += stride;
 	current_batch_num_msg_++;
@@ -422,7 +456,23 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 	// Use cached BATCH_SIZE when set (AddBuffers ran); else fall back to macro (avoids sealing every msg when cache==0).
 	const size_t cached = batch_size_cached_.load(std::memory_order_acquire);
 	const size_t threshold = (cached != 0) ? cached : BATCH_SIZE;
-	if (batch_payload >= threshold) {
+	bool should_seal = (batch_payload >= threshold);
+	// [[LINGER]] Time-based seal: bound how long the oldest message in this batch waits. Only
+	// checked when linger is enabled AND the size cap has not already fired (so under load this
+	// extra steady_clock::now() is never reached — the size path short-circuits it). Sealing here
+	// is race-free: current_batch_/tail/num_msg are producer-exclusive within Write(), and seal
+	// timing is neutral to total order / per-session FIFO / dedup (see linger_us_ decl). The
+	// message that trips the deadline is included in this batch, so its own latency stays low; the
+	// batch's OLDEST message has waited at most ~linger_us_ (mean ~linger_us_/2). NOTE: this bound
+	// holds only while a Write() stream keeps flowing — the check runs solely inside Write(), never
+	// from a background timer (a bg Seal() racing Write() would tear the batch header — forbidden).
+	// A partial batch left by a producer that goes idle waits for the next Write()/Poll()/SealAll/
+	// session-rollover/shutdown to seal, not for linger; no data is lost, only that tail's latency.
+	if (!should_seal && linger_us_ > 0) {
+		const auto age = std::chrono::steady_clock::now() - current_batch_first_submit_time_;
+		if (age >= std::chrono::microseconds(linger_us_)) should_seal = true;
+	}
+	if (should_seal) {
 		sealed_count += SealCurrentAndAdvance();
 	}
 	sealed_out = sealed_count;

@@ -191,9 +191,17 @@ private:
 	Embarcadero::BatchHeader* current_batch_{nullptr};
 	size_t current_batch_tail_{0};  // bytes written in current slot (start at sizeof(BatchHeader))
 	size_t current_batch_num_msg_{0};  // message count for current batch (for BatchHeader::num_msg)
-#ifdef COLLECT_LATENCY_STATS
+	// [[LINGER]] Always-on first-submit timestamp of the current open batch. Producer-exclusive
+	// (only ever read/written inside Write()/seal under the single-writer contract), so it needs
+	// no atomic. Drives the time-based linger seal below; also reused by COLLECT_LATENCY_STATS.
 	std::chrono::steady_clock::time_point current_batch_first_submit_time_{};
-#endif
+	// [[LINGER]] Time-based batch seal deadline in microseconds. 0 = size-only seal (legacy
+	// behavior, unchanged). When > 0, Write() seals the open batch once it has been open for
+	// >= linger_us_, bounding low-load batch-fill latency (mean ~linger_us_/2) WITHOUT affecting
+	// throughput — under load the size cap (batch_size_cached_) fires first. Set once in the
+	// constructor from EMBARCADERO_CLIENT_LINGER_US (or a latency-mode default); never mutated
+	// after, so it is safe to read on the producer hot path without synchronization.
+	int64_t linger_us_{0};
 
 	// Message header templates (same as Buffer)
 	Embarcadero::MessageHeader header_;
