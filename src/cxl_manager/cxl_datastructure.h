@@ -759,9 +759,13 @@ inline bool GetReplicatedLastOffsetFromCV(void* cxl_addr, TInode* tinode, int br
 		reinterpret_cast<uint8_t*>(cxl_addr) + kCompletionVectorOffset);
 	CompletionVectorEntry* my_cv_entry = &cv[broker_id];
 
-	// Read CV (tail replica updates this after replication completes)
+	// Read CV (tail replica updates this after replication completes).
+	// [[CXL-2]] completed_pbr_head is in line0 of the CV entry (all fields read here live in line0).
+	// clflushopt (flush_cacheline) is NOT ordered by LFENCE — it is ordered by MFENCE (Intel SDM
+	// 8.2.5; see performance_utils.h full_fence doc). Use full_fence so the invalidate retires
+	// before the load and we cannot read a spuriously-stale (below-true) frontier from local cache.
 	CXL::flush_cacheline(my_cv_entry);
-	CXL::load_fence();
+	CXL::full_fence();
 	uint64_t completed_pbr_index = my_cv_entry->completed_pbr_head.load(std::memory_order_acquire);
 
 	// Sentinel (uint64_t)-1 = no progress; 0 is valid (first batch completed)
@@ -779,9 +783,14 @@ inline bool GetReplicatedLastOffsetFromCV(void* cxl_addr, TInode* tinode, int br
 	size_t ring_position = completed_pbr_index % ring_size;
 	BatchHeader* completed_batch = ring_start + ring_position;
 
-	// Read batch header to get replicated logical offset range
-	CXL::flush_cacheline(completed_batch);
-	CXL::load_fence();
+	// Read batch header to get replicated logical offset range.
+	// [[CXL-2]] start_logical_offset is in the SECOND cache line (offset 64); num_msg is in line0.
+	// Flushing only line0 + LFENCE could pair a fresh num_msg with a stale start_logical_offset
+	// (torn read across the ring-slot ABA reuse) and OVER-report the durable frontier, letting the
+	// ack_level==2 export gate expose not-yet-replicated messages. Invalidate the full
+	// sizeof(BatchHeader) range (both lines) + MFENCE, matching the export-read discipline.
+	CXL::flush_cache_range(completed_batch, sizeof(BatchHeader));
+	CXL::full_fence();
 	size_t start_offset = completed_batch->start_logical_offset;
 	uint32_t num_msg = completed_batch->num_msg;
 

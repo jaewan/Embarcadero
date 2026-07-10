@@ -34,8 +34,30 @@ static bool ShouldEnableOrder5Trace() {
 }
 
 static bool ShouldFatalOnOrder5ExportOverrun() {
-	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_EXPORT_OVERRUN_FATAL", false);
+	// [[O5-1]] An ORDER=5 export lap drops committed total_order values from a lagging subscriber's
+	// stream — a total-order violation. Default to FATAL in debug/CI so it can never regress
+	// silently; in release default OFF (the lap is handled by terminalizing the lagging subscriber,
+	// not by aborting the broker). The env var still overrides either default.
+#ifdef NDEBUG
+	static const bool kDefault = false;
+#else
+	static const bool kDefault = true;
+#endif
+	static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_EXPORT_OVERRUN_FATAL", kDefault);
 	return enabled;
+}
+
+// [[CXL-1]] Fresh read of a 2-cache-line GOIEntry across the non-coherent link. The writer is
+// sentinel-last across both lines (line1 fields durable before the global_seq sentinel on line0),
+// so the reader must invalidate BOTH lines before reading ANY field — invalidating only line0 (the
+// sentinel line) can pair a fresh global_seq with a stale line1 (client_seq/session_epoch) from
+// local cache, poisoning the recovered dedup/FIFO frontier. invalidate_cacheline_for_read is
+// clflush (serializing), so a single load_fence after both invalidations is sufficient. All GOI
+// readers must go through this to prevent reader drift.
+static inline void ReadGOIEntryFresh(const Embarcadero::GOIEntry* entry) {
+	CXL::invalidate_cacheline_for_read(entry);                                        // LINE0 (global_seq)
+	CXL::invalidate_cacheline_for_read(reinterpret_cast<const uint8_t*>(entry) + 64); // LINE1 (client_seq, session_epoch, ...)
+	CXL::load_fence();
 }
 
 static bool ShouldEnableOrder5PhaseDiag() {
@@ -376,8 +398,10 @@ uint64_t Topic::RecoverSequencer5State() {
 			bool saw_valid_goi = false;
 			for (uint64_t i = 0; i < limit; ++i) {
 				GOIEntry* entry = &goi[i];
-				CXL::invalidate_cacheline_for_read(entry);
-				CXL::load_fence();
+				// [[CXL-1]] Invalidate BOTH cache lines before reading global_seq (line0) AND the
+				// session fields (line1) below — the old single-line invalidate could read a fresh
+				// global_seq with a stale line1, corrupting the recovered per-session frontier.
+				ReadGOIEntryFresh(entry);
 				if (entry->global_seq != i) continue;
 				saw_valid_goi = true;
 				next_goi_index = i + 1;
@@ -4616,9 +4640,16 @@ void Topic::CommitEpoch(
                 commit_order_last_seq_[w12_session_key] = w12_seq;
             }
         }
-        CXL::store_fence();
-        CXL::flush_cacheline(entry);
-        CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);
+        // [[CXL-1]] Sentinel-last ACROSS BOTH cache lines. LINE1 (client_seq@64, session_epoch@88,
+        // pbr_index, cumulative_message_count) must reach memory BEFORE LINE0, whose global_seq@0
+        // the recovery reader (RecoverSequencer5State) treats as the entry-valid sentinel. flush_cacheline
+        // is clflushopt (weakly ordered), so a store_fence between the two evictions is REQUIRED to keep
+        // line1's flush ahead of line0's; otherwise a crash/recovery reader could pair a fresh global_seq
+        // with stale line1 fields and poison the recovered dedup/FIFO frontier.
+        CXL::store_fence();                                                  // drain field stores
+        CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);  // LINE1 durable first
+        CXL::store_fence();                                                  // order line1 flush before sentinel flush
+        CXL::flush_cacheline(entry);                                         // LINE0 (global_seq sentinel) durable last
     }
     if (commit_profile) {
         order5_commit_goi_ns_.fetch_add(
