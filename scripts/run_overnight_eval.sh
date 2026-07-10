@@ -322,9 +322,9 @@ run_latency_cell "e3_embar5_linger_rf0" \
 run_latency_cell "e3_embar5_nolinger_rf0" \
     SEQUENCER=EMBARCADERO ORDER=5 ACK_LEVEL=1 REPLICATION_FACTOR=0
 
-# ORDER=0 — per-record ordering mode
-run_latency_cell "e3_embar0_rf0" \
-    SEQUENCER=EMBARCADERO ORDER=0 ACK_LEVEL=1 REPLICATION_FACTOR=0
+# NOTE: ORDER=0 (unordered) does not produce delivery_latency_stats.csv
+# because it uses Consume() not ConsumeOrdered(). Skip latency measurement for ORDER=0.
+# (ORDER=0 throughput is in Part A; it's the baseline for comparing ordering overhead.)
 
 if [[ "$SKIP_BASELINES" != "1" ]]; then
     run_latency_cell "e3_corfu_rf0" \
@@ -338,7 +338,9 @@ if [[ "$SKIP_BASELINES" != "1" ]]; then
 
     run_latency_cell "e3_lazylog_rf0" \
         SEQUENCER=LAZYLOG ORDER=2 ACK_LEVEL=1 REPLICATION_FACTOR=0 \
-        SKIP_REMOTE_LAZYLOG_SEQUENCER=1
+        SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
+        EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
+        BROKER_LISTEN_ADDR="$BROKER_IP"
 fi
 
 # ===========================================================================
