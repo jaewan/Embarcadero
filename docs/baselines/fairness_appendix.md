@@ -164,3 +164,29 @@ microbenches exists yet; the gRPC sequencer paths are not shape-comparable witho
 
 **Scaled-N provenance:** raw output preserved at `/tmp/t03_calib_out.log` on moscxl
 (12/12 trials `ALL CHECKS PASSED`).
+
+---
+
+## Measurement methodology: warm-up discard + RF-order interleaving (mandatory)
+
+This testbed exhibits a **deterministic first-run warm-up**: the first trial after a fresh cluster
+start is reproducibly the slowest, even on an idle host (verified — SCALOG RF=1 publish goodput
+`2979 → 3611 → 3588 …` MB/s with trial 1 at load 0.01; CORFU RF=1 `2902 → 11298 → 12633` monotonic).
+Run all-RF1-then-all-RF2, this made RF=2 spuriously appear *faster* than RF=1 (a physical
+impossibility for a replication cost). Full analysis: `docs/experiments/rf_throughput_warmup_artifact.md`.
+
+To keep every baseline-vs-Embarcadero comparison fair, all matrix runs MUST:
+
+1. **Discard the first (cold) trial** from the aggregate mean (raw trials preserved). Enforced by
+   `aggregate_e2e_throughput.py --warmup-trials` (default 1), wired via `WARMUP_TRIALS` in
+   `run_e2e_throughput_benchmark.sh`. Use `NUM_TRIALS ≥ WARMUP_TRIALS + 3`. The same rule applies to
+   latency runs (drop the cold trial before computing percentiles).
+2. **Interleave / randomize replication-factor and sequencer ordering** — never run all of one config
+   then all of another back-to-back; the warm-up otherwise biases whichever config runs later.
+3. For publication-grade confidence intervals, use an **exclusive host** (cgroups / exclusive
+   scheduling). This is only needed to suppress the *secondary* ambient-contention scatter of the
+   shared box (a concurrent session drove load 0.01 → 26 mid-probe); it is NOT required to obtain the
+   correct RF *ordering*, which the warm-up discard + interleaving already restore.
+
+RF-conditional throughput deltas measured WITHOUT (1) and (2) are not a reliable signal of replication
+cost and must not be cited as such.

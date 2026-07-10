@@ -14,6 +14,12 @@ ACK="${ACK:-1}"
 REPLICATION_FACTOR="${REPLICATION_FACTOR:-0}"
 NUM_BROKERS="${NUM_BROKERS:-1}"
 NUM_TRIALS="${NUM_TRIALS:-3}"
+# [[EVAL WARM-UP]] Number of leading (cold) trials excluded from the aggregate mean. The first trial
+# after a fresh cluster start is deterministically slow on this testbed (verified: slowest even on an
+# idle host), which — running all-RF1-then-all-RF2 — made RF=2 spuriously look faster than RF=1. The
+# raw trials are still recorded; only the mean drops the warm-up. Set 0 to disable. Run NUM_TRIALS >=
+# WARMUP_TRIALS+3 for a meaningful mean. See docs/experiments/rf_throughput_warmup_artifact.md.
+WARMUP_TRIALS="${WARMUP_TRIALS:-1}"
 TOTAL_MESSAGE_SIZE="${TOTAL_MESSAGE_SIZE:-134217728}"
 MESSAGE_SIZE="${MESSAGE_SIZE:-1024}"
 THREADS_PER_BROKER="${THREADS_PER_BROKER:-4}"
@@ -90,7 +96,8 @@ env \
 python3 scripts/aggregate_e2e_throughput.py \
   --input-run-dir "$RUN_DIR" \
   --trial-output "$RUN_DIR/trial_results.csv" \
-  --summary-output "$RUN_DIR/summary.csv"
+  --summary-output "$RUN_DIR/summary.csv" \
+  --warmup-trials "$WARMUP_TRIALS"
 
 printf 'end_time_utc=%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" >> "$RUN_DIR/metadata.env"
 
