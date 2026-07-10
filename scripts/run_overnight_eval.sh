@@ -42,7 +42,10 @@
 #   - /dev/shm cleaned after every trial (shm_unlink in cleanup trap)
 #   - Remote client nodes cleaned of stray throughput_test processes before each trial
 
-set -euo pipefail
+# Do NOT use set -e: the sweep must be fault-tolerant — a failing cell or helper command
+# must never kill the whole script. Each cell already uses an if/else wrapper; outside
+# code uses || true guards. We keep -u (catch undefined vars) and pipefail for real bugs.
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -109,6 +112,18 @@ log() { local msg="[$(stamp)] $*"; echo "$msg"; echo "$msg" >> "$SUMMARY_LOG"; }
 pass_cell() { log "PASS [$1]"; }
 fail_cell() { log "FAIL [$1] — see $LOG_DIR/${1}.log"; }
 
+# Fault-tolerant guard: wrap any command so a failure is logged but the script continues.
+# Usage: safe_run "description" command [args...]
+safe_run() {
+    local desc="$1"; shift
+    if "$@" 2>/dev/null; then
+        return 0
+    else
+        log "WARNING: '$desc' failed (exit $?) — continuing"
+        return 0
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Pre-flight: verify cluster reachability and binary presence on all nodes
 # ---------------------------------------------------------------------------
@@ -128,18 +143,20 @@ preflight_check() {
 
     if [[ "$all_ok" -eq 0 ]]; then
         log "Pre-flight FAILED. Running cluster_setup.sh to sync bins..."
-        bash "$SCRIPT_DIR/cluster_setup.sh" || {
+        if ! bash "$SCRIPT_DIR/cluster_setup.sh"; then
             log "cluster_setup.sh failed — aborting"
             exit 1
-        }
+        fi
         log "Sync done, re-checking..."
+        local still_bad=0
         for host in c1 c2 c3; do
-            ssh -o BatchMode=yes "$host" \
-                "test -x ~/Embarcadero/build/bin/throughput_test" || {
+            if ! ssh -o BatchMode=yes "$host" \
+                "test -x ~/Embarcadero/build/bin/throughput_test" 2>/dev/null; then
                 log "FATAL: $host still missing binary after sync"
-                exit 1
-            }
+                still_bad=1
+            fi
         done
+        if [[ "$still_bad" -eq 1 ]]; then exit 1; fi
     fi
 
     log "Pre-flight: all client nodes OK"
@@ -182,30 +199,41 @@ run_multi_cell() {
     local cell_log="$LOG_DIR/${label}.log"
     log "START [$label] clients=$nclients hosts=$client_csv"
 
-    # Clean up stray processes from any previous run before starting
-    cleanup_remote_stray_procs "$(echo "$client_csv" | tr ',' ' ')"
-    cleanup_shm_all
+    # Build NUMA CSV: "1" repeated nclients times, comma-joined
+    local numas_csv
+    numas_csv="$(printf '1,%.0s' $(seq 1 "$nclients") | sed 's/,$//')" || numas_csv="1"
 
-    if env "$@" \
-        NUM_CLIENTS="$nclients" \
-        CLIENT_HOSTS_CSV="$client_csv" \
-        CLIENT_NUMAS_CSV="$(printf '1,%.0s' $(seq 1 "$nclients") | sed 's/,$//')" \
-        NUM_BROKERS="$NUM_BROKERS" \
-        NUM_TRIALS="$NUM_TRIALS" \
-        WARMUP_TRIALS="$WARMUP_TRIALS" \
-        TOTAL_MESSAGE_SIZE="$TOTAL_BYTES" \
-        MESSAGE_SIZE="$MSG_SIZE" \
-        EMBARCADERO_HEAD_ADDR="$BROKER_IP" \
-        OUT_BASE="$OUT_BASE/multiclient" \
-        BENCHMARK_TAG="$RUN_TAG/$label" \
-        bash "$SCRIPT_DIR/run_multiclient.sh" >"$cell_log" 2>&1; then
+    # Pre-cell cleanup: always safe, never fatal
+    cleanup_remote_stray_procs "$(echo "$client_csv" | tr ',' ' ')" || true
+    cleanup_shm_all || true
+
+    local rc=0
+    {
+        env "$@" \
+            NUM_CLIENTS="$nclients" \
+            CLIENT_HOSTS_CSV="$client_csv" \
+            CLIENT_NUMAS_CSV="$numas_csv" \
+            NUM_BROKERS="$NUM_BROKERS" \
+            NUM_TRIALS="$NUM_TRIALS" \
+            WARMUP_TRIALS="$WARMUP_TRIALS" \
+            TOTAL_MESSAGE_SIZE="$TOTAL_BYTES" \
+            MESSAGE_SIZE="$MSG_SIZE" \
+            EMBARCADERO_HEAD_ADDR="$BROKER_IP" \
+            OUT_BASE="$OUT_BASE/multiclient" \
+            BENCHMARK_TAG="$RUN_TAG/$label" \
+            bash "$SCRIPT_DIR/run_multiclient.sh"
+    } >"$cell_log" 2>&1 || rc=$?
+
+    if [[ "$rc" -eq 0 ]]; then
         pass_cell "$label"
     else
         fail_cell "$label"
-        # Always clean up even on failure
-        cleanup_remote_stray_procs "$(echo "$client_csv" | tr ',' ' ')"
-        cleanup_shm_all
     fi
+
+    # Post-cell cleanup: always, never fatal
+    cleanup_remote_stray_procs "$(echo "$client_csv" | tr ',' ' ')" || true
+    cleanup_shm_all || true
+    return 0   # never propagate failure — script must continue
 }
 
 # ---------------------------------------------------------------------------
@@ -220,31 +248,38 @@ run_latency_cell() {
 
     # Use first remote client for latency runs
     local client_host
-    client_host="$(echo "$CLIENT_HOSTS_REMOTE" | cut -d',' -f1)"
+    client_host="$(echo "$CLIENT_HOSTS_REMOTE" | cut -d',' -f1)" || client_host="c1"
 
-    cleanup_remote_stray_procs "$client_host"
-    cleanup_shm_all
+    cleanup_remote_stray_procs "$client_host" || true
+    cleanup_shm_all || true
 
-    if env "$@" \
-        NUM_TRIALS="$NUM_TRIALS" \
-        WARMUP_TRIALS="$WARMUP_TRIALS" \
-        TOTAL_MESSAGE_SIZE="$TOTAL_BYTES" \
-        MSG_SIZE="$MSG_SIZE" \
-        LOAD_POINTS_MBPS="$LOAD_POINTS_MBPS" \
-        NUM_BROKERS="$NUM_BROKERS" \
-        SCENARIO=remote \
-        REMOTE_CLIENT_HOST="$client_host" \
-        EMBARCADERO_HEAD_ADDR="$BROKER_IP" \
-        PACING_MODE=steady \
-        BENCHMARK_TAG="$RUN_TAG" \
-        OUT_BASE="$OUT_BASE/latency" \
-        bash "$SCRIPT_DIR/run_latency_vs_load.sh" >"$cell_log" 2>&1; then
+    local rc=0
+    {
+        env "$@" \
+            NUM_TRIALS="$NUM_TRIALS" \
+            WARMUP_TRIALS="$WARMUP_TRIALS" \
+            TOTAL_MESSAGE_SIZE="$TOTAL_BYTES" \
+            MSG_SIZE="$MSG_SIZE" \
+            LOAD_POINTS_MBPS="$LOAD_POINTS_MBPS" \
+            NUM_BROKERS="$NUM_BROKERS" \
+            SCENARIO=remote \
+            REMOTE_CLIENT_HOST="$client_host" \
+            EMBARCADERO_HEAD_ADDR="$BROKER_IP" \
+            PACING_MODE=steady \
+            BENCHMARK_TAG="$RUN_TAG" \
+            OUT_BASE="$OUT_BASE/latency" \
+            bash "$SCRIPT_DIR/run_latency_vs_load.sh"
+    } >"$cell_log" 2>&1 || rc=$?
+
+    if [[ "$rc" -eq 0 ]]; then
         pass_cell "$label"
     else
         fail_cell "$label"
-        cleanup_remote_stray_procs "$client_host"
-        cleanup_shm_all
     fi
+
+    cleanup_remote_stray_procs "$client_host" || true
+    cleanup_shm_all || true
+    return 0   # never propagate failure
 }
 
 # ---------------------------------------------------------------------------
@@ -295,7 +330,8 @@ fi
 if [[ "${SMOKE:-0}" != "1" ]]; then
     for nc in 2 3; do
         # Use first $nc hosts from CLIENT_HOSTS_E2
-        local_csv="$(echo "$CLIENT_HOSTS_E2" | tr ',' '\n' | head -"$nc" | tr '\n' ',' | sed 's/,$//')"
+        # Compute safely outside env "$@" to avoid subshell-in-env-arg syntax issues
+        local_csv="$(echo "$CLIENT_HOSTS_E2" | tr ',' '\n' | head -"$nc" | tr '\n' ',' | sed 's/,$//')" || local_csv="c1,c2"
         # N>=2 runs must use BROKER_IP_MULTI (192.168.60.8) — c2 is not on 10.10.10.x
         run_multi_cell "e2_embar5_rf0_n${nc}" "$nc" "$local_csv" \
             SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=0 \
@@ -378,14 +414,13 @@ log "===== PART D: E8 overhead probe ====="
 OVERHEAD_LOG="$LOG_DIR/e8_overhead_probe.log"
 {
     echo "=== E8 overhead probe: $(stamp) ==="
-    echo "Commit: $(git rev-parse HEAD)"
+    echo "Commit: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
     if ! command -v pidstat &>/dev/null; then
         echo "WARNING: pidstat not available (install sysstat). Skipping CPU probe."
     else
-        # Run one throughput trial in the background, sample broker CPU for 20 s
-        cleanup_remote_stray_procs c1
-        cleanup_shm_all
+        cleanup_remote_stray_procs c1 || true
+        cleanup_shm_all || true
 
         NUM_CLIENTS=1 \
         CLIENT_HOSTS_CSV=c1 \
@@ -403,7 +438,7 @@ OVERHEAD_LOG="$LOG_DIR/e8_overhead_probe.log"
         BENCH_PID=$!
 
         sleep 6
-        EMBARLET_PID=$(pgrep -x embarlet 2>/dev/null | head -1 || true)
+        EMBARLET_PID=$(pgrep -x embarlet 2>/dev/null | head -1 || echo "")
         if [[ -n "$EMBARLET_PID" ]]; then
             echo "=== pidstat -t -p $EMBARLET_PID 1 20 ==="
             pidstat -t -p "$EMBARLET_PID" 1 20 || true
@@ -413,7 +448,7 @@ OVERHEAD_LOG="$LOG_DIR/e8_overhead_probe.log"
         wait "$BENCH_PID" || true
     fi
     echo "=== E8 probe complete: $(stamp) ==="
-} >"$OVERHEAD_LOG" 2>&1
+} >"$OVERHEAD_LOG" 2>&1 || true
 log "E8 overhead probe done"
 
 # ===========================================================================
