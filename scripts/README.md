@@ -226,6 +226,13 @@ and experiments are unaffected unless they explicitly set the same variable.
 
 Runs a throughput-vs-latency sweep over a list of offered-load targets.
 
+By default this launcher uses publication-grade CXL initialization:
+`EMBARCADERO_CXL_ZERO_MODE=full` and `EMBARCADERO_CXL_MAP_POPULATE=1`.
+That keeps BLog/CXL page allocation out of the measured ACK and delivery path.
+Use `EMBARCADERO_CXL_ZERO_MODE=metadata EMBARCADERO_CXL_MAP_POPULATE=0`
+only for explicit fast smoke tests; do not mix those runs into throughput or
+latency-vs-load claims.
+
 Common options:
 
 - `NUM_BROKERS`
@@ -243,6 +250,10 @@ Common options:
 ### `scripts/run_latency_vs_load.sh`
 
 Runs the publication-oriented latency-vs-load workflow.
+
+The run metadata records `EMBARCADERO_CXL_ZERO_MODE`,
+`EMBARCADERO_CXL_MAP_POPULATE`, and `EMBAR_USE_HUGETLB` so curves can be
+audited against the CXL initialization policy used for throughput runs.
 
 Common options:
 

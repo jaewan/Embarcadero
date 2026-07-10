@@ -3,9 +3,12 @@
 #include "common.h"
 #include "common/wire_formats.h"
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <cstdint>
-#include <map>
+#include <deque>
 #include <memory>
+#include <utility>
 #include <vector>
 
 class Subscriber;
@@ -42,22 +45,12 @@ struct BufferState {
 	BufferState& operator=(BufferState&&) = delete;
 };
 
-struct TimestampPair {
-	long long send_time_nanos; // From message payload
-	std::chrono::steady_clock::time_point receive_time; // Captured on receive
-};
-
-struct RecvLogEntry {
-	std::chrono::steady_clock::time_point receive_time;
-	int buffer_idx;
-	uint64_t buffer_generation;
-	size_t end_offset;
-};
-
 struct LatencySample {
 	uint64_t dedupe_key;
 	long long send_time_nanos;
 	long long latency_us;
+	long long recv_buffer_age_us;
+	size_t recv_chunk_bytes;
 };
 
 // Manages the dual buffers and state for a single connection (FD)
@@ -76,8 +69,6 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	absl::CondVar consumer_can_consume_cv; // Notifies consumer a buffer *might* be ready
 	absl::CondVar receiver_can_write_cv; // Notifies receiver the *other* buffer is free
 
-	std::vector<RecvLogEntry> recv_log ABSL_GUARDED_BY(state_mutex);
-	std::vector<uint8_t> ordered_stream_pending ABSL_GUARDED_BY(state_mutex);
 	// Incremental latency parsing state so StoreLatency() does not depend on
 	// retention of full connection buffers across swaps.
 	std::vector<uint8_t> latency_parse_pending ABSL_GUARDED_BY(state_mutex);
@@ -87,6 +78,7 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	uint32_t latency_messages_processed ABSL_GUARDED_BY(state_mutex) = 0;
 	uint64_t latency_batch_total_order ABSL_GUARDED_BY(state_mutex) = 0;
 	std::vector<LatencySample> latency_samples ABSL_GUARDED_BY(state_mutex);
+	int receiver_write_inflight_idx ABSL_GUARDED_BY(state_mutex) = -1;
 	struct LatencyParseDiag {
 		uint64_t parse_calls = 0;
 		uint64_t parse_input_bytes = 0;
@@ -105,6 +97,26 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 	// Increments when a buffer is reset for reuse; needed to disambiguate offsets
 	// across buffer swaps when correlating per-message receive timestamps.
 	std::array<uint64_t, 2> buffer_generation ABSL_GUARDED_BY(state_mutex) = {0, 0};
+	std::array<int64_t, 2> buffer_first_write_ns ABSL_GUARDED_BY(state_mutex) = {0, 0};
+	struct DeliveryDiag {
+		uint64_t recv_calls = 0;
+		uint64_t recv_bytes = 0;
+		uint64_t max_recv_bytes = 0;
+		uint64_t full_swap_attempts = 0;
+		uint64_t full_swap_success = 0;
+		uint64_t full_swap_blocked = 0;
+		uint64_t partial_ready_swaps = 0;
+		uint64_t consumer_release_swaps = 0;
+		uint64_t cv_wait_calls = 0;
+			uint64_t cv_wait_ns = 0;
+			uint64_t cv_wait_max_ns = 0;
+			uint64_t max_buffer_age_us = 0;
+			uint64_t ordered_stream_feed_calls = 0;
+			uint64_t ordered_stream_feed_bytes = 0;
+			uint64_t ordered_stream_drain_calls = 0;
+			uint64_t ordered_stream_drain_bytes = 0;
+			uint64_t ordered_stream_max_pending_bytes = 0;
+		} delivery_diag ABSL_GUARDED_BY(state_mutex);
 
 	// [[BLOG_HEADER: Per-connection batch state for ORDER=5 (no global mutex)]]
 	// Replaces the global g_batch_states map, eliminating mutex contention
@@ -139,27 +151,76 @@ struct ConnectionBuffers : public std::enable_shared_from_this<ConnectionBuffers
 
 	// --- Helper methods ---
 
-	// Called by Receiver: Get pointer and available space in the CURRENT write buffer
-	std::pair<void*, size_t> get_write_location() {
-		int write_idx = current_write_idx.load(std::memory_order_acquire);
-		size_t current_offset = buffers[write_idx].write_offset.load(std::memory_order_relaxed);
-		if (current_offset >= buffers[write_idx].capacity) {
-			return {nullptr, 0}; // Buffer is full
-		}
-		return {static_cast<uint8_t*>(buffers[write_idx].buffer) + current_offset,
-			buffers[write_idx].capacity - current_offset};
-	}
+		struct WriteLocation {
+			void* ptr = nullptr;
+			size_t available = 0;
+			int write_idx = -1;
+			size_t offset = 0;
+		};
 
-	// Called by Receiver: Update write offset after successful recv()
-	void advance_write_offset(size_t bytes_written) {
-		//int write_idx = current_write_idx.load(std::memory_order_relaxed);
-		int write_idx = current_write_idx;
-		buffers[write_idx].write_offset.fetch_add(bytes_written, std::memory_order_relaxed);
-	}
+		struct AdvanceResult {
+			size_t offset_before = 0;
+			size_t end_offset = 0;
+		};
+
+		// Called by Receiver: Get pointer and available space in the CURRENT write buffer.
+		// Pins the write role until the recv attempt is completed so consumer release
+		// cannot swap out a buffer while recv() is writing into it.
+		WriteLocation get_write_location() {
+			absl::MutexLock lock(&state_mutex);
+			int write_idx = current_write_idx.load(std::memory_order_acquire);
+			size_t current_offset = buffers[write_idx].write_offset.load(std::memory_order_relaxed);
+			if (current_offset >= buffers[write_idx].capacity) {
+				receiver_write_inflight_idx = -1;
+				return {nullptr, 0, write_idx, current_offset}; // Buffer is full
+			}
+			receiver_write_inflight_idx = write_idx;
+			return {static_cast<uint8_t*>(buffers[write_idx].buffer) + current_offset,
+				buffers[write_idx].capacity - current_offset,
+				write_idx,
+				current_offset};
+		}
+
+		// Called by Receiver: Update write offset after successful recv()
+		AdvanceResult advance_write_offset(int write_idx, size_t bytes_written) {
+			absl::MutexLock lock(&state_mutex);
+			if (write_idx < 0 || write_idx > 1) {
+				LOG(ERROR) << "FD=" << fd << ": invalid write_idx=" << write_idx
+				           << " for bytes_written=" << bytes_written;
+				return {};
+			}
+			if (receiver_write_inflight_idx == write_idx) {
+				receiver_write_inflight_idx = -1;
+			}
+			const size_t offset_before =
+				buffers[write_idx].write_offset.fetch_add(bytes_written, std::memory_order_relaxed);
+			const size_t end_offset = offset_before + bytes_written;
+			if (std::getenv("EMBARCADERO_SUBSCRIBER_DIAG") != nullptr &&
+			    end_offset > buffers[write_idx].capacity) {
+				LOG(ERROR) << "FD=" << fd << ": write_offset overflow buffer=" << write_idx
+				           << " before=" << offset_before
+				           << " bytes=" << bytes_written
+				           << " end=" << end_offset
+				           << " capacity=" << buffers[write_idx].capacity;
+				CHECK_LE(end_offset, buffers[write_idx].capacity);
+			}
+			return {offset_before, end_offset};
+		}
+
+		void clear_write_inflight(int write_idx) {
+			absl::MutexLock lock(&state_mutex);
+			if (receiver_write_inflight_idx == write_idx) {
+				receiver_write_inflight_idx = -1;
+			}
+		}
 
 	// Called by Receiver: Signal that the current write buffer is ready and try to swap
 	// Returns true if swap was successful, false otherwise (consumer still busy)
 	bool signal_and_attempt_swap(Subscriber* subscriber_instance); // Implementation in .cc
+	bool flush_partial_if_due(Subscriber* subscriber_instance,
+	                          int64_t now_ns,
+	                          int64_t deadline_us,
+	                          bool force_flush); // Implementation in .cc
 
 	// Called by Consumer: Try to acquire the buffer ready for reading
 	// Returns pointer to buffer state if acquired, nullptr otherwise.
@@ -214,6 +275,15 @@ class Subscriber {
 		void* Consume(int timeout_ms = 1000);
 		void* ConsumeBatchAware(int timeout_ms = 1000);
 
+		struct OrderedMessageView {
+			void* data = nullptr;
+			uint16_t wire_header_version = Embarcadero::wire::HEADER_VERSION_V1;
+		};
+
+		size_t ConsumeOrderedBatch(std::vector<OrderedMessageView>* out,
+		                           size_t max_messages,
+		                           int timeout_ms = 1000);
+
 		// Wire format of the last successful Consume() return (HEADER_VERSION_V1/V2).
 		// Undefined if the last Consume() returned nullptr; call only after a non-null pointer.
 		uint16_t LastConsumedWireHeaderVersion() const {
@@ -223,9 +293,10 @@ class Subscriber {
 	// For Sequencer 5: Process batch metadata and reconstruct message ordering
 	void ProcessSequencer5Data(uint8_t* data, size_t data_size, std::shared_ptr<ConnectionBuffers> conn_buffers);
 
-		// Called by client code after test is finished
-		void StoreLatency();
-		void DEBUG_wait(size_t total_msg_size, size_t msg_size);
+			// Called by client code after test is finished
+			void StoreLatency();
+			std::vector<LatencySample> SnapshotLatencySamples();
+			void DEBUG_wait(size_t total_msg_size, size_t msg_size);
 		bool DEBUG_check_order(int order);
 		/**
 		 * Debug method to wait for a certain amount of data
@@ -328,7 +399,7 @@ class Subscriber {
 		std::string port_;
 		std::unique_ptr<heartbeat_system::HeartBeat::Stub> stub_;
 		char topic_[TOPIC_NAME_SIZE];
-		volatile bool shutdown_{false};  // Non-atomic for performance - shutdown coordination
+		std::atomic<bool> shutdown_{false};
 		std::atomic<bool> connected_{false}; // Maybe more granular connection state needed
 		// Track actual data broker count
 		std::atomic<size_t> data_broker_count_{0};
@@ -344,14 +415,13 @@ class Subscriber {
 		std::atomic<int64_t> first_byte_wall_ns_{0};
 		std::atomic<size_t> latency_unique_message_count_{0}; // Unique message keys seen during receive
 		std::atomic<size_t> latency_parsed_message_count_{0}; // Parsed latency messages seen during receive
-		absl::Mutex latency_seen_mutex_;
-		absl::flat_hash_set<uint64_t> latency_seen_send_ns_ ABSL_GUARDED_BY(latency_seen_mutex_);
 		// Per-broker byte counters for debugging subscribe stall (which broker underperforms)
 		std::array<std::atomic<size_t>, NUM_MAX_BROKERS> per_broker_bytes_{};
 
 		// --- Buffer Management (part 2/2)---
-		const size_t buffer_size_per_buffer_; // Size for *each* of the two buffers per connection
-		absl::CondVar consume_cv_; // Global CV for consumer to wait on
+			const size_t buffer_size_per_buffer_; // Size for *each* of the two buffers per connection
+			absl::CondVar consume_cv_; // Global CV for consumer to wait on
+			absl::Mutex consume_mutex_;
 
 		int client_id_;
 
@@ -398,6 +468,13 @@ class Subscriber {
 			std::vector<uint8_t> data;
 			uint16_t header_version = Embarcadero::wire::HEADER_VERSION_V1;
 		};
+		struct OwnedMessageRecycler {
+			Subscriber* owner = nullptr;
+			OwnedMessageRecycler() noexcept = default;
+			explicit OwnedMessageRecycler(Subscriber* subscriber) noexcept : owner(subscriber) {}
+			void operator()(OwnedMessage* msg) const;
+		};
+		using OwnedMessagePtr = std::unique_ptr<OwnedMessage, OwnedMessageRecycler>;
 
 		struct StreamParseState {
 			std::vector<uint8_t> buffer;
@@ -407,11 +484,14 @@ class Subscriber {
 			size_t next_message_order_in_batch = 0;
 		};
 
-		size_t next_expected_order_{0};
-		std::map<size_t, std::unique_ptr<OwnedMessage>> pending_messages_;
-		std::unique_ptr<OwnedMessage> last_returned_;
+		absl::Mutex owned_message_pool_mutex_;
+		std::vector<std::unique_ptr<OwnedMessage>> owned_message_pool_ ABSL_GUARDED_BY(owned_message_pool_mutex_);
+		size_t next_expected_order_ ABSL_GUARDED_BY(consume_mutex_){0};
+		std::deque<OwnedMessagePtr> pending_messages_ ABSL_GUARDED_BY(consume_mutex_);
+		size_t pending_messages_base_order_ ABSL_GUARDED_BY(consume_mutex_){0};
+		OwnedMessagePtr last_returned_;
+		std::vector<OwnedMessagePtr> last_returned_batch_;
 		uint16_t last_consumed_wire_version_{Embarcadero::wire::HEADER_VERSION_V1};
-		absl::flat_hash_map<int, StreamParseState> parse_states_;
 
 		// --- Order < 2 consume state (per-Subscriber, not static) ---
 		size_t next_expected_order_weak_{0};
@@ -424,8 +504,22 @@ class Subscriber {
 		// --- Private Methods ---
 		void SubscribeToClusterStatus(); // Runs in cluster_probe_thread_
 		void ManageBrokerConnections(int broker_id, const std::string& address); // Launches workers
-																																						 // Worker thread function (needs access to Subscriber instance)
+		// Worker thread function (needs access to Subscriber instance)
 		void ReceiveWorkerThread(int broker_id, int fd_to_handle);
+		void ParseAndStageOrderedBytes(StreamParseState& state,
+		                               const uint8_t* data,
+		                               size_t len,
+		                               ConnectionBuffers* latency_conn,
+		                               const std::chrono::steady_clock::time_point& recv_time,
+		                               long long recv_buffer_age_us,
+		                               size_t recv_chunk_bytes);
+		OwnedMessagePtr AcquireOwnedMessage();
+		void RecycleOwnedMessage(OwnedMessage* msg);
+		void StageOrderedMessages(std::vector<std::pair<size_t, OwnedMessagePtr>> messages);
+		void* TryPopOrderedMessageLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
+		size_t TryPopOrderedMessagesLocked(size_t max_messages,
+		                                   std::vector<OwnedMessagePtr>* out)
+			ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
 		void* ConsumeOrdered(int timeout_ms);
 
 		// Helper to remove connection resources

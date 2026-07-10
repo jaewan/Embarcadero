@@ -15,10 +15,6 @@
 #include <chrono>
 #include <errno.h>
 
-#ifndef MSG_ZEROCOPY
-#define MSG_ZEROCOPY 0x4000000
-#endif
-
 #include <glog/logging.h>
 #include "mimalloc.h"
 
@@ -798,11 +794,11 @@ NetworkManager::NetworkManager(int broker_id, int num_reqReceive_threads)
 		LOG(INFO) << "NetworkManager: Blocking recv direct to BLog (single code path)";
 
 		// Create main listener thread
-		threads_.emplace_back(&NetworkManager::MainThread, this);
+		StartManagedThread(&NetworkManager::MainThread, this);
 
 		// Create request handler threads (each handles publish via HandlePublishRequest)
 		for (int i = 0; i < num_reqReceive_threads; i++) {
-			threads_.emplace_back(&NetworkManager::ReqReceiveThread, this);
+			StartManagedThread(&NetworkManager::ReqReceiveThread, this);
 		}
 
 		// Wait for all threads to start
@@ -843,13 +839,22 @@ void NetworkManager::Shutdown() {
 		request_queue_.blockingWrite(sentinel);
 	}
 
-	// Join all threads
-	for (std::thread& thread : threads_) {
-		if (thread.joinable()) {
-			thread.join();
+	while (true) {
+		std::vector<std::thread> threads_to_join;
+		{
+			absl::MutexLock lock(&threads_mu_);
+			if (threads_.empty()) {
+				break;
+			}
+			threads_to_join.swap(threads_);
+		}
+
+		for (std::thread& thread : threads_to_join) {
+			if (thread.joinable()) {
+				thread.join();
+			}
 		}
 	}
-
 }
 
 void NetworkManager::SetCXLManager(CXLManager* cxl_manager) {
@@ -1133,37 +1138,86 @@ void NetworkManager::HandlePublishRequest(
 				if (same_session) {
 					ack_fd = it->second;
 				} else {
+					// Reserve the ACK channel while this request thread performs the socket
+					// connect. Without the in-progress sentinel, parallel publish sockets from
+					// one client all observe "missing" and spawn duplicate AckThreads.
+					ack_connections_[handshake.client_id] = -1;
+					ack_connection_epochs_[handshake.client_id] = connection_session_epoch;
 					need_ack_thread = true;
 				}
 			}
 
 			if (need_ack_thread) {
 				if (!SetupAcknowledgmentSocket(ack_fd, client_address, handshake.port)) {
+					{
+						absl::MutexLock lock(&ack_mu_);
+						auto it = ack_connections_.find(handshake.client_id);
+						auto epoch_it = ack_connection_epochs_.find(handshake.client_id);
+						if (it != ack_connections_.end() && it->second == -1 &&
+						    epoch_it != ack_connection_epochs_.end() &&
+						    epoch_it->second == connection_session_epoch) {
+							ack_connections_.erase(it);
+							ack_connection_epochs_.erase(handshake.client_id);
+						}
+					}
 					close(client_socket);
 					return;
 				}
 				local_ack_efd = ack_efd_;
+				bool registration_current = false;
 				{
 					absl::MutexLock lock(&ack_mu_);
-					ack_fd_ = ack_fd;
-					ack_connections_[handshake.client_id] = ack_fd;
-					ack_connection_epochs_[handshake.client_id] = connection_session_epoch;
+					auto it = ack_connections_.find(handshake.client_id);
+					auto epoch_it = ack_connection_epochs_.find(handshake.client_id);
+					registration_current =
+						it != ack_connections_.end() &&
+						it->second == -1 &&
+						epoch_it != ack_connection_epochs_.end() &&
+						epoch_it->second == connection_session_epoch;
+					if (registration_current) {
+						ack_fd_ = ack_fd;
+						it->second = ack_fd;
+					}
+				}
+				if (!registration_current) {
+					LOG(INFO) << "HandlePublishRequest: ACK setup superseded for broker "
+					          << broker_id_ << ", client_id=" << handshake.client_id
+					          << ", session_epoch=" << connection_session_epoch;
+					CleanupSocketAndEpoll(ack_fd, local_ack_efd);
+					ack_fd = -1;
+					local_ack_efd = -1;
+					need_ack_thread = false;
 				}
 
 				// [[CRITICAL: Validate topic before starting AckThread]]
 				// Empty topic -> GetOffsetToAck returns wrong TInode -> client ACK timeout
-				if (strlen(handshake.topic) == 0) {
+				if (need_ack_thread && strlen(handshake.topic) == 0) {
 					LOG(ERROR) << "HandlePublishRequest: Empty topic in handshake for broker " << broker_id_
 					           << ", client_id=" << handshake.client_id << ". NOT starting AckThread!";
 					// Still keep connection open for publish, but ACKs will not work correctly
-				} else {
+				} else if (need_ack_thread) {
 					LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
 					          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id
 					          << ", session_epoch=" << connection_session_epoch;
 					// Pass local_ack_efd to thread so it uses the correct epoll instance.
-					threads_.emplace_back(&NetworkManager::AckThread, this, handshake.topic,
-						handshake.ack, ack_fd, local_ack_efd, handshake.client_id,
-						connection_session_epoch);
+					if (!StartManagedThread(&NetworkManager::AckThread, this, handshake.topic,
+							handshake.ack, ack_fd, local_ack_efd, handshake.client_id,
+							connection_session_epoch)) {
+						LOG(INFO) << "HandlePublishRequest: Shutdown in progress; not starting AckThread for broker "
+						          << broker_id_ << ", client_id=" << handshake.client_id;
+						{
+							absl::MutexLock lock(&ack_mu_);
+							auto it = ack_connections_.find(handshake.client_id);
+							if (it != ack_connections_.end() && it->second == ack_fd) {
+								ack_connections_.erase(it);
+								ack_connection_epochs_.erase(handshake.client_id);
+							}
+							if (ack_fd_ == ack_fd) {
+								ack_fd_ = -1;
+							}
+						}
+						CleanupSocketAndEpoll(ack_fd, local_ack_efd);
+					}
 				}
 			}
 		}
@@ -1543,14 +1597,21 @@ void NetworkManager::HandlePublishRequest(
 			running = false;
 			break;
 		}
-		// [[BLOG_HEADER]] Skip v1 per-message validation when publisher sent BlogMessageHeader (v2).
-		// Applies to ORDER=0 and ORDER=5 with BlogHeader enabled; all other orders use MessageHeader.
-		if (!is_blog_header_enabled) {
+		// Non-coherent CXL requires the complete received batch body to be durable before
+		// PublishPBRSlotDirect advertises batch_complete/publish_commit. Flushing only the
+		// first header cacheline leaves the payload body stale for cross-domain readers.
+		const bool flush_payload_headers =
+			cxl_manager_ == nullptr || cxl_manager_->RequiresExplicitPayloadHeaderFlush();
+		if (!flush_payload_headers) {
+			static std::atomic<bool> logged_payload_flush_skip{false};
+			bool expected = false;
+			if (logged_payload_flush_skip.compare_exchange_strong(
+					expected, true, std::memory_order_relaxed)) {
+				LOG(INFO) << "NetworkManager: skipping full payload-range flush on cache-coherent CXL mapping";
+			}
+		} else if (!is_blog_header_enabled) {
 			MessageHeader* first_msg = reinterpret_cast<MessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
-			// recv() populated these MessageHeader cache lines before returning to user space.
-			// Drain those stores before CLFLUSHOPT so CXL observes the freshly received headers.
-			CXL::store_fence();
 			for (size_t i = 0; i < batch_header.num_msg; ++i) {
 				if (remaining < sizeof(MessageHeader)) {
 					LOG(WARNING) << "NetworkManager: v1 batch too small for header, remaining=" << remaining;
@@ -1561,20 +1622,37 @@ void NetworkManager::HandlePublishRequest(
 					             << " remaining=" << remaining;
 					break;
 				}
-				// [[CXL_VISIBILITY_FIX]] Flush each MessageHeader cacheline to CXL before
-				// PublishPBRSlotDirect signals batch_complete=1. recv() writes paddedSize only
-				// to this CPU's L1/L2; without an explicit flush the CXL device still holds the
-				// zero-initialized value. DelegationThread's cache miss would then fetch 0 from
-				// CXL, trigger the invalid-paddedSize error path, skip writing next_msg_diff,
-				// and stall CXLPollingLoop/ReplicaPollingLoop forever. The SFENCE inside
-				// PublishPBRSlotDirect orders all these CLFLUSHOPTs before batch_complete is
-				// visible, so the happens-before guarantee is maintained.
-				CXL::flush_cacheline(first_msg);
 				remaining -= first_msg->paddedSize;
 				first_msg = reinterpret_cast<MessageHeader*>(
 					reinterpret_cast<uint8_t*>(first_msg) + first_msg->paddedSize
 				);
 			}
+			CXL::store_fence();
+			CXL::flush_cache_range(buf, batch_header.total_size);
+			CXL::store_fence();
+		} else {
+			BlogMessageHeader* first_msg = reinterpret_cast<BlogMessageHeader*>(buf);
+			size_t remaining = batch_header.total_size;
+			for (size_t i = 0; i < batch_header.num_msg; ++i) {
+				if (remaining < sizeof(BlogMessageHeader)) {
+					LOG(WARNING) << "NetworkManager: v2 batch too small for header, remaining=" << remaining;
+					break;
+				}
+				const size_t payload_size = static_cast<size_t>(first_msg->size);
+				if (!wire::ValidateV2Payload(payload_size, remaining)) {
+					LOG(WARNING) << "NetworkManager: v2 invalid payload_size=" << payload_size
+					             << " remaining=" << remaining;
+					break;
+				}
+				const size_t stride = wire::ComputeStrideV2(payload_size);
+				remaining -= stride;
+				first_msg = reinterpret_cast<BlogMessageHeader*>(
+					reinterpret_cast<uint8_t*>(first_msg) + stride
+				);
+			}
+			CXL::store_fence();
+			CXL::flush_cache_range(buf, batch_header.total_size);
+			CXL::store_fence();
 		}
 		// [[DESIGN: Write PBR entry only after full receive]] Batch is fully in blog; write the
 		// complete BatchHeader to the PBR slot once. Slot was zeroed in GetCXLBuffer.
@@ -1684,15 +1762,9 @@ void NetworkManager::HandleSubscribeRequest(
 		return;
 	}
 
-	// [[PERF_FIX]] Remove SO_ZEROCOPY to avoid ENOBUFS caused by undrained MSG_ERRQUEUE
-	// Without draining the error queue, kernel throttles socket when zerocopy notifications fill up,
-	// causing non-deterministic throughput collapse. SO_ZEROCOPY removed from subscriber path entirely.
-	// int flag = 1;
-	// if (setsockopt(client_socket, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag)) < 0) {
-	// 	LOG(ERROR) << "Subscriber setsockopt SO_ZEROCOPY failed";
-	// 	close(client_socket);
-	// 	return;
-	// }
+	// [[PERF_FIX]] SO_ZEROCOPY intentionally NOT set on the subscriber socket:
+	// without draining MSG_ERRQUEUE the kernel throttles the socket when zerocopy
+	// notifications fill up, causing non-deterministic throughput collapse.
 
 	// Create epoll for monitoring writability
 	int epoll_fd = epoll_create1(0);
@@ -1856,6 +1928,12 @@ void NetworkManager::SubscribeNetworkThread(
 							messages_size,
 							batch_total_order,
 							num_messages)){
+					{
+						absl::MutexLock lock(&cached_state->mu);
+						if (local_offset != cached_state->last_offset) {
+							cached_state->last_offset = local_offset;
+						}
+					}
 					export_no_data_loops++;
 					std::this_thread::yield();
 					continue;
@@ -1962,10 +2040,6 @@ void NetworkManager::SubscribeNetworkThread(
 			          << " export_batches=" << export_batches;
 		}
 
-		if (messages_size > 0) {
-			// Send message data
-		}
-
 		// Send message data — time it to diagnose cross-machine slowness
 		const int64_t send_t0 = kSubSendDiag
 			? std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2044,9 +2118,9 @@ bool NetworkManager::SendMessageData(
 		while (sent_bytes < buffer_size) {
 			size_t remaining_bytes = buffer_size - sent_bytes;
 			size_t to_send = std::min(remaining_bytes, send_limit);
-			// [[PERF_FIX]] Remove MSG_ZEROCOPY to avoid ENOBUFS caused by undrained error queue
-			// MSG_ZEROCOPY requires draining MSG_ERRQUEUE which wasn't implemented,
-			// causing non-deterministic throughput collapse when queue fills up.
+			// [[PERF_FIX]] MSG_ZEROCOPY intentionally NOT used: it requires draining
+			// MSG_ERRQUEUE (never implemented), which caused non-deterministic
+			// throughput collapse when the queue filled up.
 			int send_flags = MSG_NOSIGNAL; // prevents SIGPIPE when subscriber closes mid-send (would kill broker process)
 			int ret = send(sock_fd, (uint8_t*)buffer + sent_bytes, to_send, send_flags);
 

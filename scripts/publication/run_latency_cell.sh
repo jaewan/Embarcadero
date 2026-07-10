@@ -231,7 +231,7 @@ for trial_num in $(seq 1 "$NUM_TRIALS"); do
   if [[ -n "$trial_dir" ]]; then
     case "$LATENCY_METRIC_SOURCE" in
       e2e)
-        stats="$trial_dir/latency_stats.csv"
+        stats="$trial_dir/delivery_latency_stats.csv"
         if [[ -f "$stats" ]]; then
           row="$(awk -F',' -v metric="$LATENCY_METRIC_NAME" '$13==metric{print $3","$5","$6","$8; exit}' "$stats")"
         else

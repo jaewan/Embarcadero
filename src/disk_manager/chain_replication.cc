@@ -85,6 +85,11 @@ inline bool ShouldCopyInMemorySinkPayload() {
     return enabled;
 }
 
+inline bool ShouldInvalidatePayloadBeforeRead() {
+    static const bool enabled = !ReadEnvBoolStrict("EMBARCADERO_CXL_COHERENT", false);
+    return enabled;
+}
+
 inline bool ShouldEnableOrder5Trace() {
     static const bool enabled = ReadEnvBoolStrict("EMBARCADERO_ORDER5_TRACE", false);
     return enabled;
@@ -375,6 +380,10 @@ void ChainReplicationManager::ReplicationThread() {
                 const size_t payload_size = static_cast<size_t>(entry->payload_size);
                 const size_t src_idx = static_cast<size_t>(src);
                 void* payload = reinterpret_cast<uint8_t*>(cxl_addr_) + entry->blog_offset;
+                if (ShouldInvalidatePayloadBeforeRead()) {
+                    CXL::invalidate_cache_range_for_read(payload, payload_size);
+                    CXL::load_fence();
+                }
                 if (in_memory_sink) {
                     if (in_memory_copy) {
                         CopyIntoRing(in_memory_buffers[src_idx], in_memory_write_pos[src_idx], payload, payload_size);

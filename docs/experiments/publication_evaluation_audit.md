@@ -25,8 +25,10 @@
 - RF=2 → ACK=2 (write confirmed to both replicas)
 
 ### Latency metric
-- **Metric**: `publish_to_deliver_latency` — from when a publish call returns (post-ACK) until the
-  subscriber receives the message. This is end-to-end ordering+delivery latency, not publish-to-ACK.
+- **Metric**: `publish_to_deliver_latency` now means publish timestamp to subscriber delivery hand-off
+  through `ConsumeOrdered` and is read from `delivery_latency_stats.csv`. Older runs in this audit that
+  sourced this name from `latency_stats.csv` were receive-side wire-arrival measurements and must be
+  treated as `publish_to_receive_latency`, not headline delivery.
 - **Setup**: single publisher on a remote machine → broker on moscxl; 4 GiB total (4 M × 1 KiB).
   **Warning**: publisher machine differs across conditions; see §1B.
 
@@ -134,7 +136,7 @@ All `overlap_gbps` values as (trial1 / trial2 / trial3); **median in bold**.
 
 ---
 
-### 1B. Latency — Curated Table (publish_to_deliver_latency, µs)
+### 1B. Latency — Curated Historical Table (legacy receive-side label, µs)
 
 #### EMBARCADERO ORDER=0
 

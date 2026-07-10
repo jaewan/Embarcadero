@@ -18,6 +18,7 @@
 #include "mimalloc.h"
 #include "common/configuration.h"
 #include "common/config.h"
+#include "common/env_flags.h"
 #include "common/performance_utils.h"
 
 namespace Embarcadero{
@@ -87,7 +88,12 @@ static bool MetadataOnlyZeroingEnabled() {
 	return mode == "metadata" || mode == "meta" || mode == "metadata_only";
 }
 
-static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_size){
+static bool CxlCoherentOptInEnabled() {
+	return ReadEnvBoolStrict("EMBARCADERO_CXL_COHERENT", false);
+}
+
+static inline void* allocate_shm(
+		int broker_id, CXL_Type cxl_type, size_t cxl_size, bool* dax_backed = nullptr) {
 	void *addr = nullptr;
 	int cxl_fd = -1;
 	bool dev = false;
@@ -199,6 +205,9 @@ static inline void* allocate_shm(int broker_id, CXL_Type cxl_type, size_t cxl_si
 	}
 	close(cxl_fd);
 	LOG(INFO) << "CXL mapping successful at address: " << addr;
+	if (dax_backed) {
+		*dax_backed = dev;
+	}
 
 	if (will_mbind) {
 		// Bind the shm-backed region to the configured CXL NUMA node before first-touch.
@@ -279,14 +288,24 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	
 	LOG(INFO) << "CXLManager: broker_id=" << broker_id << " using CXL size=" << cxl_size_ << " bytes";
 
-		// Initialize CXL
-		cxl_addr_ = allocate_shm(broker_id, cxl_type, cxl_size_);
-		if(cxl_addr_ == nullptr){
-			return;
-		}
+	// Initialize CXL
+	bool dax_backed = false;
+	cxl_addr_ = allocate_shm(broker_id, cxl_type, cxl_size_, &dax_backed);
+	if(cxl_addr_ == nullptr){
+		return;
+	}
+	const bool coherent_opt_in = CxlCoherentOptInEnabled();
+	requires_explicit_payload_header_flush_ = (cxl_type == Real) && !coherent_opt_in;
+	LOG(INFO) << "CXL payload flush policy: "
+	          << (requires_explicit_payload_header_flush_ ? "explicit_flush_required"
+	                                                      : "cache_coherent_mapping")
+	          << " cxl_type=" << (cxl_type == Real ? "Real" : "Emul")
+	          << " dax_backed=" << (dax_backed ? 1 : 0)
+	          << " EMBARCADERO_CXL_COHERENT="
+	          << (std::getenv("EMBARCADERO_CXL_COHERENT") ? std::getenv("EMBARCADERO_CXL_COHERENT") : "<unset>");
 
-			// [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0 (128 bytes)
-		// [[CXL_MEMORY_LAYOUT_v2]] PBR/BatchHeaders/TInode/Bitmap/Segments start AFTER Phase 2 metadata
+	// [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0 (128 bytes)
+	// [[CXL_MEMORY_LAYOUT_v2]] PBR/BatchHeaders/TInode/Bitmap/Segments start AFTER Phase 2 metadata
 		// Layout: 0x0 ControlBlock | 0x1000 CompletionVector | 0x2000 GOI (16GB) | 0x4_0000_2000 PBR...
 		control_block_ = reinterpret_cast<ControlBlock*>(cxl_addr_);
 		base_for_regions_ = reinterpret_cast<uint8_t*>(cxl_addr_) + kPhase2MetadataEnd;

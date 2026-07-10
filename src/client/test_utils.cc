@@ -1,5 +1,6 @@
 #include "test_utils.h"
 #include "common/configuration.h"
+#include "latency_stats.h"
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -37,6 +38,21 @@ static bool ShouldValidateOrder() {
 	return std::strcmp(env, "0") != 0;
 }
 
+size_t DeliveryDrainBatchSize() {
+	const char* env = std::getenv("EMBARCADERO_DELIVERY_DRAIN_BATCH");
+	if (env == nullptr || env[0] == '\0') {
+		return 1024;
+	}
+	try {
+		const size_t parsed = static_cast<size_t>(std::stoull(env));
+		return std::max<size_t>(1, parsed);
+	} catch (...) {
+		LOG(WARNING) << "Invalid EMBARCADERO_DELIVERY_DRAIN_BATCH='"
+		             << env << "', falling back to 1024";
+		return 1024;
+	}
+}
+
 std::string GetHeadAddr(const cxxopts::ParseResult& result) {
 	if (result.count("head_addr") > 0) {
 		const std::string addr = result["head_addr"].as<std::string>();
@@ -62,6 +78,48 @@ struct StageMetricSummary {
 	double max = 0.0;
 	size_t count = 0;
 	bool valid = false;
+};
+
+struct DeliveryLatencySample {
+	uint64_t total_order = 0;
+	uint64_t msg_uid = 0;
+	long long send_time_ns = 0;
+	long long deliver_steady_ns = 0;
+	long long delivery_latency_us = 0;
+	long long receive_latency_us = -1;
+	long long receive_to_deliver_us = -1;
+	long long recv_buffer_age_us = -1;
+	size_t recv_chunk_bytes = 0;
+	bool has_uid = false;
+	bool receive_matched = false;
+};
+
+struct DeliveryDrainResult {
+	size_t target = 0;
+	size_t message_size = 0;
+	size_t delivered = 0;
+	size_t invalid_messages = 0;
+	size_t duplicate_total_order = 0;
+	size_t out_of_order_total_order = 0;
+	size_t duplicate_uid = 0;
+	size_t missing_uid = 0;
+	size_t receive_matched = 0;
+	bool timed_out = false;
+	uint64_t first_total_order = 0;
+	uint64_t last_total_order = 0;
+	uint64_t min_uid = std::numeric_limits<uint64_t>::max();
+	uint64_t max_uid = 0;
+	std::vector<DeliveryLatencySample> samples;
+
+	bool ordering_ok() const {
+		return delivered == target &&
+		       invalid_messages == 0 &&
+		       duplicate_total_order == 0 &&
+		       out_of_order_total_order == 0 &&
+		       duplicate_uid == 0 &&
+		       missing_uid == 0 &&
+		       !timed_out;
+	}
 };
 
 struct FailureRealtimeSummary {
@@ -321,6 +379,424 @@ bool TryLoadMetricSummary(const std::string& path, const std::string& metric, St
 	return false;
 }
 
+long long SteadyNsNow() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+uint64_t DeliveryDedupeKey(long long send_time_ns, uint64_t msg_uid) {
+	return msg_uid != 0 ? msg_uid : static_cast<uint64_t>(send_time_ns);
+}
+
+int ResolveDeliveryTimeoutSec(size_t total_message_size, double target_mbps) {
+	int timeout_sec = 120;
+	if (const char* env = std::getenv("EMBARCADERO_DELIVERY_TIMEOUT_SEC")) {
+		try {
+			timeout_sec = std::max(1, std::stoi(env));
+		} catch (...) {
+			LOG(WARNING) << "Ignoring invalid EMBARCADERO_DELIVERY_TIMEOUT_SEC=" << env;
+		}
+	} else if (const char* env = std::getenv("EMBARCADERO_E2E_TIMEOUT_SEC")) {
+		try {
+			timeout_sec = std::max(1, std::stoi(env));
+		} catch (...) {
+			LOG(WARNING) << "Ignoring invalid EMBARCADERO_E2E_TIMEOUT_SEC=" << env;
+		}
+	}
+	if (target_mbps > 0.0) {
+		const double expected_publish_sec =
+			static_cast<double>(total_message_size) / (target_mbps * 1024.0 * 1024.0);
+		timeout_sec = std::max(timeout_sec,
+			static_cast<int>(std::ceil(expected_publish_sec)) + 60);
+	}
+	return timeout_sec;
+}
+
+bool ExtractDeliveredMessage(void* raw,
+		uint16_t wire_version,
+		size_t configured_message_size,
+		DeliveryLatencySample* out) {
+	if (raw == nullptr || out == nullptr) return false;
+
+	const uint8_t* payload = nullptr;
+	size_t payload_size = configured_message_size;
+	if (wire_version == Embarcadero::wire::HEADER_VERSION_V2) {
+		auto* header = reinterpret_cast<Embarcadero::BlogMessageHeader*>(raw);
+		payload = reinterpret_cast<const uint8_t*>(raw) + sizeof(Embarcadero::BlogMessageHeader);
+		payload_size = header->size > 0 ? header->size : configured_message_size;
+		out->total_order = static_cast<uint64_t>(header->total_order);
+	} else {
+		auto* header = reinterpret_cast<Embarcadero::MessageHeader*>(raw);
+		payload = reinterpret_cast<const uint8_t*>(raw) + sizeof(Embarcadero::MessageHeader);
+		payload_size = header->size > 0 ? header->size : configured_message_size;
+		out->total_order = static_cast<uint64_t>(header->total_order);
+	}
+
+	if (payload_size < sizeof(long long)) {
+		return false;
+	}
+	std::memcpy(&out->send_time_ns, payload, sizeof(long long));
+	if (payload_size >= sizeof(long long) + sizeof(uint64_t)) {
+		std::memcpy(&out->msg_uid, payload + sizeof(long long), sizeof(uint64_t));
+		out->has_uid = (out->msg_uid != 0);
+	}
+	return out->send_time_ns > 0;
+}
+
+DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
+		size_t target_messages,
+		size_t message_size,
+		int timeout_sec) {
+	DeliveryDrainResult result;
+	result.target = target_messages;
+	result.message_size = message_size;
+	result.samples.reserve(target_messages);
+	std::vector<uint8_t> seen_uids;
+	if (target_messages > 0 &&
+	    message_size >= sizeof(long long) + sizeof(uint64_t)) {
+		seen_uids.assign(target_messages + 1, 0);
+	}
+
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
+	bool have_expected_total_order = false;
+	uint64_t expected_total_order = 0;
+	size_t unique_uids = 0;
+	bool saw_uid = false;
+	const size_t drain_batch_size = DeliveryDrainBatchSize();
+	std::vector<Subscriber::OrderedMessageView> delivered_batch;
+	delivered_batch.reserve(drain_batch_size);
+
+	while (result.delivered < target_messages &&
+	       std::chrono::steady_clock::now() < deadline) {
+		const size_t max_to_drain = std::min(
+			drain_batch_size,
+			target_messages - result.delivered);
+		const size_t batch_count =
+			subscriber.ConsumeOrderedBatch(&delivered_batch, max_to_drain, 10);
+		if (batch_count == 0) {
+			continue;
+		}
+		for (const auto& delivered : delivered_batch) {
+			if (result.delivered >= target_messages) {
+				break;
+			}
+			const long long deliver_ns = SteadyNsNow();
+			result.delivered++;
+
+			DeliveryLatencySample sample;
+			if (!ExtractDeliveredMessage(delivered.data,
+					delivered.wire_header_version,
+					message_size,
+					&sample)) {
+				result.invalid_messages++;
+				continue;
+			}
+			sample.deliver_steady_ns = deliver_ns;
+			sample.delivery_latency_us = (deliver_ns - sample.send_time_ns) / 1000;
+
+			if (have_expected_total_order &&
+			    sample.total_order == result.last_total_order) {
+				result.duplicate_total_order++;
+			}
+			if (!have_expected_total_order) {
+				have_expected_total_order = true;
+				expected_total_order = sample.total_order;
+				result.first_total_order = sample.total_order;
+			}
+			if (sample.total_order != expected_total_order) {
+				result.out_of_order_total_order++;
+				expected_total_order = sample.total_order;
+			}
+			expected_total_order++;
+			result.last_total_order = sample.total_order;
+
+			if (sample.has_uid) {
+				saw_uid = true;
+				if (!seen_uids.empty() &&
+				    sample.msg_uid > 0 &&
+				    sample.msg_uid <= target_messages) {
+					if (seen_uids[sample.msg_uid] != 0) {
+						result.duplicate_uid++;
+					} else {
+						seen_uids[sample.msg_uid] = 1;
+						unique_uids++;
+					}
+				}
+				result.min_uid = std::min(result.min_uid, sample.msg_uid);
+				result.max_uid = std::max(result.max_uid, sample.msg_uid);
+			}
+
+			result.samples.push_back(sample);
+		}
+	}
+
+	result.timed_out = (result.delivered < target_messages);
+	if (saw_uid) {
+		const uint64_t expected_uid_min = 1;
+		const uint64_t expected_uid_max = static_cast<uint64_t>(target_messages);
+		const bool uid_range_ok =
+			result.min_uid == expected_uid_min && result.max_uid == expected_uid_max;
+		if (!uid_range_ok || unique_uids != target_messages) {
+			result.missing_uid =
+				target_messages > unique_uids ? target_messages - unique_uids : 0;
+			if (!uid_range_ok && result.missing_uid == 0) {
+				result.missing_uid = 1;
+			}
+		}
+	}
+	return result;
+}
+
+void AnnotateDeliveryWithReceiveSamples(DeliveryDrainResult* result,
+		const std::vector<LatencySample>& receive_samples) {
+	if (result == nullptr) return;
+	std::unordered_map<uint64_t, LatencySample> best_receive;
+	best_receive.reserve(receive_samples.size());
+	for (const auto& sample : receive_samples) {
+		auto it = best_receive.find(sample.dedupe_key);
+		if (it == best_receive.end() || sample.latency_us < it->second.latency_us) {
+			best_receive[sample.dedupe_key] = sample;
+		}
+	}
+
+	result->receive_matched = 0;
+	for (auto& sample : result->samples) {
+		const uint64_t key = DeliveryDedupeKey(sample.send_time_ns, sample.msg_uid);
+		auto it = best_receive.find(key);
+		if (it == best_receive.end()) continue;
+		sample.receive_matched = true;
+		sample.receive_latency_us = it->second.latency_us;
+		sample.receive_to_deliver_us =
+			sample.delivery_latency_us - sample.receive_latency_us;
+		sample.recv_buffer_age_us = it->second.recv_buffer_age_us;
+		sample.recv_chunk_bytes = it->second.recv_chunk_bytes;
+		result->receive_matched++;
+	}
+}
+
+StageMetricSummary SummaryFromLatencies(std::vector<long long> values) {
+	StageMetricSummary out;
+	if (values.empty()) return out;
+	std::sort(values.begin(), values.end());
+	const auto summary = Embarcadero::LatencyStats::ComputeSummary(values);
+	out.average = summary.average_us;
+	out.min = summary.min_us;
+	out.p50 = summary.p50_us;
+	out.p90 = summary.p90_us;
+	out.p95 = summary.p95_us;
+	out.p99 = summary.p99_us;
+	out.p999 = summary.p999_us;
+	out.max = summary.max_us;
+	out.count = summary.count;
+	out.valid = true;
+	return out;
+}
+
+void WriteDeliveryMetricCsv(const DeliveryDrainResult& result) {
+	std::vector<long long> latencies;
+	latencies.reserve(result.samples.size());
+	for (const auto& sample : result.samples) {
+		latencies.push_back(sample.delivery_latency_us);
+	}
+	std::sort(latencies.begin(), latencies.end());
+	if (latencies.empty()) {
+		LOG(ERROR) << "No delivery latency samples recorded.";
+		return;
+	}
+	const auto summary = Embarcadero::LatencyStats::ComputeSummary(latencies);
+	LOG(INFO) << "Publish->Deliver Latency Statistics (us):"
+	          << " count=" << summary.count
+	          << " p50=" << summary.p50_us
+	          << " p99=" << summary.p99_us
+	          << " p999=" << summary.p999_us
+	          << " max=" << summary.max_us;
+
+	std::ofstream stats("delivery_latency_stats.csv");
+	if (!stats.is_open()) {
+		LOG(ERROR) << "Failed to open delivery_latency_stats.csv";
+		return;
+	}
+	stats << "Average,Min,Median,p90,p95,p99,p999,Max,Count,Parsed,Recorded,Dropped,Metric,Unit,PercentileMethod,Granularity\n";
+	stats << std::fixed << std::setprecision(3)
+	      << summary.average_us
+	      << "," << summary.min_us
+	      << "," << summary.p50_us
+	      << "," << summary.p90_us
+	      << "," << summary.p95_us
+	      << "," << summary.p99_us
+	      << "," << summary.p999_us
+	      << "," << summary.max_us
+	      << "," << summary.count
+	      << "," << result.delivered
+	      << "," << result.samples.size()
+	      << "," << (result.delivered >= result.samples.size()
+	              ? result.delivered - result.samples.size() : 0)
+	      << ",publish_to_deliver_latency,us,"
+	      << Embarcadero::LatencyStats::kPercentileMethod
+	      << ",message\n";
+	stats.close();
+
+	std::ofstream cdf("cdf_delivery_latency_us.csv");
+	if (!cdf.is_open()) {
+		LOG(ERROR) << "Failed to open cdf_delivery_latency_us.csv";
+		return;
+	}
+	cdf << "Latency_us,CumulativeProbability,Metric\n";
+	for (size_t i = 0; i < latencies.size(); ++i) {
+		const double cumulative_probability =
+			static_cast<double>(i + 1) / static_cast<double>(latencies.size());
+		cdf << latencies[i] << "," << std::fixed << std::setprecision(8)
+		    << cumulative_probability << ",publish_to_deliver_latency\n";
+	}
+}
+
+void WriteDeliveryOrderingCsv(const DeliveryDrainResult& result) {
+	std::ofstream out("delivery_ordering_assertion.csv");
+	if (!out.is_open()) {
+		LOG(ERROR) << "Failed to open delivery_ordering_assertion.csv";
+		return;
+	}
+	out << "Target,Delivered,RecordedSamples,TimedOut,InvalidMessages,"
+	    << "DuplicateTotalOrder,OutOfOrderTotalOrder,DuplicateUid,MissingUid,"
+	    << "FirstTotalOrder,LastTotalOrder,MinUid,MaxUid,ReceiveMatched,Pass\n";
+	out << result.target
+	    << "," << result.delivered
+	    << "," << result.samples.size()
+	    << "," << (result.timed_out ? 1 : 0)
+	    << "," << result.invalid_messages
+	    << "," << result.duplicate_total_order
+	    << "," << result.out_of_order_total_order
+	    << "," << result.duplicate_uid
+	    << "," << result.missing_uid
+	    << "," << result.first_total_order
+	    << "," << result.last_total_order
+	    << "," << (result.min_uid == std::numeric_limits<uint64_t>::max() ? 0 : result.min_uid)
+	    << "," << result.max_uid
+	    << "," << result.receive_matched
+	    << "," << (result.ordering_ok() ? 1 : 0)
+	    << "\n";
+}
+
+void WriteDeliveryStageBreakdownCsv(const DeliveryDrainResult& result) {
+	std::vector<long long> all_delivery;
+	all_delivery.reserve(result.samples.size());
+	for (const auto& sample : result.samples) {
+		all_delivery.push_back(sample.delivery_latency_us);
+	}
+	if (all_delivery.empty()) return;
+	std::sort(all_delivery.begin(), all_delivery.end());
+	const auto delivery_summary = Embarcadero::LatencyStats::ComputeSummary(all_delivery);
+	const long long tail_threshold_us = static_cast<long long>(delivery_summary.p99_us);
+
+	std::vector<long long> tail_buffer_age;
+	std::vector<long long> tail_receive_to_deliver;
+	std::vector<long long> tail_recv_chunk_bytes;
+	for (const auto& sample : result.samples) {
+		if (sample.delivery_latency_us < tail_threshold_us || !sample.receive_matched) continue;
+		if (sample.recv_buffer_age_us >= 0) {
+			tail_buffer_age.push_back(sample.recv_buffer_age_us);
+		}
+		if (sample.receive_to_deliver_us >= 0) {
+			tail_receive_to_deliver.push_back(sample.receive_to_deliver_us);
+		}
+		tail_recv_chunk_bytes.push_back(static_cast<long long>(sample.recv_chunk_bytes));
+	}
+
+	const StageMetricSummary buffer_age = SummaryFromLatencies(tail_buffer_age);
+	const StageMetricSummary receive_to_deliver = SummaryFromLatencies(tail_receive_to_deliver);
+	const StageMetricSummary chunk_bytes = SummaryFromLatencies(tail_recv_chunk_bytes);
+	std::string dominant = "unmatched";
+	if (buffer_age.valid && receive_to_deliver.valid) {
+		dominant = (buffer_age.p99 >= receive_to_deliver.p99)
+			? "buffer_fill_wait"
+			: "consumer_poll_or_backlog";
+	}
+
+	std::ofstream out("delivery_stage_breakdown.csv");
+	if (!out.is_open()) {
+		LOG(ERROR) << "Failed to open delivery_stage_breakdown.csv";
+		return;
+	}
+	out << "TailThresholdUs,TailMatchedSamples,DominantStage,"
+	    << "BufferAgeP50Us,BufferAgeP99Us,BufferAgeMaxUs,"
+	    << "ReceiveToDeliverP50Us,ReceiveToDeliverP99Us,ReceiveToDeliverMaxUs,"
+	    << "RecvChunkBytesP50,RecvChunkBytesP99,RecvChunkBytesMax\n";
+	out << tail_threshold_us
+	    << "," << tail_receive_to_deliver.size()
+	    << "," << dominant
+	    << "," << (buffer_age.valid ? buffer_age.p50 : -1)
+	    << "," << (buffer_age.valid ? buffer_age.p99 : -1)
+	    << "," << (buffer_age.valid ? buffer_age.max : -1)
+	    << "," << (receive_to_deliver.valid ? receive_to_deliver.p50 : -1)
+	    << "," << (receive_to_deliver.valid ? receive_to_deliver.p99 : -1)
+	    << "," << (receive_to_deliver.valid ? receive_to_deliver.max : -1)
+	    << "," << (chunk_bytes.valid ? chunk_bytes.p50 : -1)
+	    << "," << (chunk_bytes.valid ? chunk_bytes.p99 : -1)
+	    << "," << (chunk_bytes.valid ? chunk_bytes.max : -1)
+	    << "\n";
+}
+
+void WriteDeliverySteadyThroughputCsv(const DeliveryDrainResult& result) {
+	std::vector<long long> deliver_times;
+	deliver_times.reserve(result.samples.size());
+	for (const auto& sample : result.samples) {
+		if (sample.deliver_steady_ns > 0) {
+			deliver_times.push_back(sample.deliver_steady_ns);
+		}
+	}
+	std::sort(deliver_times.begin(), deliver_times.end());
+
+	std::ofstream out("delivery_steady_throughput.csv");
+	if (!out.is_open()) {
+		LOG(ERROR) << "Failed to open delivery_steady_throughput.csv";
+		return;
+	}
+	out << "Method,StartSample,EndSample,WindowMessages,WindowSeconds,PayloadBytes,PayloadMiBPerSec\n";
+	if (deliver_times.size() < 4 || result.message_size == 0) {
+		out << "delivery_timestamp_p25_p75,0,0,0,0,0,0\n";
+		return;
+	}
+
+	const size_t start_idx = deliver_times.size() / 4;
+	const size_t end_idx = (deliver_times.size() * 3) / 4;
+	if (end_idx <= start_idx || deliver_times[end_idx] <= deliver_times[start_idx]) {
+		out << "delivery_timestamp_p25_p75," << start_idx << "," << end_idx
+		    << ",0,0,0,0\n";
+		return;
+	}
+
+	const size_t window_messages = end_idx - start_idx;
+	const double window_seconds =
+		static_cast<double>(deliver_times[end_idx] - deliver_times[start_idx]) / 1e9;
+	const uint64_t payload_bytes =
+		static_cast<uint64_t>(window_messages) * static_cast<uint64_t>(result.message_size);
+	const double payload_mib_per_sec =
+		window_seconds > 0.0
+			? (static_cast<double>(payload_bytes) / (1024.0 * 1024.0)) / window_seconds
+			: 0.0;
+
+	out << "delivery_timestamp_p25_p75"
+	    << "," << start_idx
+	    << "," << end_idx
+	    << "," << window_messages
+	    << "," << std::fixed << std::setprecision(6) << window_seconds
+	    << "," << payload_bytes
+	    << "," << payload_mib_per_sec
+	    << "\n";
+
+	LOG(INFO) << "Delivery steady-state throughput: method=delivery_timestamp_p25_p75"
+	          << " window_messages=" << window_messages
+	          << " window_seconds=" << window_seconds
+	          << " payload_mib_per_sec=" << payload_mib_per_sec;
+}
+
+void WriteDeliveryResults(const DeliveryDrainResult& result) {
+	WriteDeliveryMetricCsv(result);
+	WriteDeliveryOrderingCsv(result);
+	WriteDeliveryStageBreakdownCsv(result);
+	WriteDeliverySteadyThroughputCsv(result);
+}
+
 void WriteStageLatencySummary(const StageMetricSummary& ordered,
 		const StageMetricSummary& ack,
 		const StageMetricSummary& deliver,
@@ -356,7 +832,7 @@ void CheckStageLatencyMonotonicity(int ack_level) {
 	const bool have_ack = TryLoadMetricSummary("pub_latency_stats.csv", "append_send_to_ack_batch_latency", &ack);
 	bool have_ordered = TryLoadMetricSummary("pub_latency_stats.csv", "append_send_to_ordered_batch_latency", &ordered);
 	const bool have_deliver =
-		TryLoadMetricSummary("latency_stats.csv", "publish_to_deliver_latency", &deliver) ||
+		TryLoadMetricSummary("delivery_latency_stats.csv", "publish_to_deliver_latency", &deliver) ||
 		TryLoadMetricSummary("latency_stats.csv", "append_send_to_deliver_message_latency", &deliver);
 	if (!have_ordered && have_ack && ack_level == 1) {
 		ordered = ack;
@@ -394,6 +870,7 @@ void WriteLatencyBenchmarkSummary(const cxxopts::ParseResult& result,
 	StageMetricSummary ack{};
 	StageMetricSummary ordered{};
 	StageMetricSummary deliver{};
+	StageMetricSummary receive{};
 	const bool have_submit =
 		TryLoadMetricSummary("pub_latency_stats.csv", "append_submit_to_ack_batch_latency", &submit);
 	const bool have_ack =
@@ -401,8 +878,10 @@ void WriteLatencyBenchmarkSummary(const cxxopts::ParseResult& result,
 	bool have_ordered =
 		TryLoadMetricSummary("pub_latency_stats.csv", "append_send_to_ordered_batch_latency", &ordered);
 	const bool have_deliver =
-		TryLoadMetricSummary("latency_stats.csv", "publish_to_deliver_latency", &deliver) ||
+		TryLoadMetricSummary("delivery_latency_stats.csv", "publish_to_deliver_latency", &deliver) ||
 		TryLoadMetricSummary("latency_stats.csv", "append_send_to_deliver_message_latency", &deliver);
+	const bool have_receive =
+		TryLoadMetricSummary("latency_stats.csv", "publish_to_receive_latency", &receive);
 	const int ack_level = result["ack_level"].as<int>();
 	if (!have_ordered && have_ack && ack_level == 1) {
 		ordered = ack;
@@ -426,6 +905,7 @@ void WriteLatencyBenchmarkSummary(const cxxopts::ParseResult& result,
 	    << "pub_submit_p50_us,pub_submit_p95_us,pub_submit_p99_us,pub_submit_count,"
 	    << "pub_ack_p50_us,pub_ack_p95_us,pub_ack_p99_us,pub_ack_count,"
 	    << "pub_ordered_p50_us,pub_ordered_p95_us,pub_ordered_p99_us,pub_ordered_count,"
+	    << "publish_to_receive_p50_us,publish_to_receive_p95_us,publish_to_receive_p99_us,publish_to_receive_count,"
 	    << "publish_to_deliver_p50_us,publish_to_deliver_p95_us,publish_to_deliver_p99_us,publish_to_deliver_count\n";
 
 	auto emit_metric = [&](const StageMetricSummary& metric, bool valid) {
@@ -456,6 +936,8 @@ void WriteLatencyBenchmarkSummary(const cxxopts::ParseResult& result,
 	emit_metric(ack, have_ack);
 	out << ",";
 	emit_metric(ordered, have_ordered);
+	out << ",";
+	emit_metric(receive, have_receive);
 	out << ",";
 	emit_metric(deliver, have_deliver);
 	out << "\n";
@@ -1286,18 +1768,35 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
-		try {
-			// Create publisher and subscriber
-			Publisher p(topic, GetHeadAddr(result), std::to_string(BROKER_PORT),
-					num_threads_per_broker, message_size, q_size, order, seq_type);
+			try {
+				const bool delivery_measurement_enabled = (order >= 1);
+				if (delivery_measurement_enabled) {
+					setenv("EMBARCADERO_DELIVERY_MEASURE", "1", 1);
+					setenv("EMBARCADERO_ENABLE_ORDERED_CONSUME_STREAM", "1", 0);
+				}
+
+				// Create publisher and subscriber
+				Publisher p(topic, GetHeadAddr(result), std::to_string(BROKER_PORT),
+						num_threads_per_broker, message_size, q_size, order, seq_type);
 #ifdef COLLECT_LATENCY_STATS
 			p.SetRecordResults(result.count("record_results") > 0);
 #endif
 			Subscriber s(GetHeadAddr(result), std::to_string(BROKER_PORT), topic, true, order);
 			s.WaitUntilAllConnected();
 
-			// Initialize publisher
-			p.Init(ack_level);
+				// Initialize publisher
+				p.Init(ack_level);
+
+				DeliveryDrainResult delivery_result;
+				std::thread delivery_thread;
+				const int delivery_timeout_sec = ResolveDeliveryTimeoutSec(total_message_size, target_mbps);
+				if (delivery_measurement_enabled) {
+					LOG(INFO) << "Starting delivery drain through ConsumeOrdered for " << n
+					          << " messages; timeout=" << delivery_timeout_sec << "s";
+					delivery_thread = std::thread([&]() {
+						delivery_result = DrainDeliveredMessages(s, n, message_size, delivery_timeout_sec);
+					});
+				}
 
 		// Set up progress tracking
 		//ProgressTracker progress(n, 1000);
@@ -1311,36 +1810,21 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		// Publish messages with timestamps
 		size_t sent_bytes = 0;
 		for (size_t i = 0; i < n; i++) {
+			if (steady_rate && sent_bytes >= (BATCH_SIZE * 4)) {
+				p.WriteFinishedOrPaused();
+				std::this_thread::sleep_for(std::chrono::microseconds(1500));
+				sent_bytes = 0;
+			}
 
-			// If using steady rate, pause periodically
-				if (steady_rate && (sent_bytes >= (BATCH_SIZE*4))) {
-					p.WriteFinishedOrPaused();
-					std::this_thread::sleep_for(std::chrono::microseconds(1500));
-					sent_bytes = 0;
-					// Capture current timestamp and embed it in the message
-				auto timestamp = std::chrono::steady_clock::now();
-				long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
-						timestamp.time_since_epoch()).count();
-
-					// First part of message contains the timestamp
-					memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
-					if (message_size >= sizeof(long long) + sizeof(uint64_t)) {
-						const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
-						memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
-					}
-				}else{
-				// Capture current timestamp and embed it in the message
-				auto timestamp = std::chrono::steady_clock::now();
-				long long nanoseconds_since_epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
-						timestamp.time_since_epoch()).count();
-
-					// First part of message contains the timestamp
-					memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
-					if (message_size >= sizeof(long long) + sizeof(uint64_t)) {
-						const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
-						memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
-					}
-				}
+			const auto timestamp = std::chrono::steady_clock::now();
+			const long long nanoseconds_since_epoch =
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					timestamp.time_since_epoch()).count();
+			memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
+			if (message_size >= sizeof(long long) + sizeof(uint64_t)) {
+				const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
+				memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
+			}
 
 			// Send the message
 			if (target_bytes_per_sec > 0.0) {
@@ -1367,12 +1851,26 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		// Record publish end time
 		auto pub_end = std::chrono::high_resolution_clock::now();
 
-		// Wait for all messages to be received
-		LOG(INFO) << "Publishing complete, waiting for subscriber to receive all data...";
-		s.Poll(total_message_size, message_size);
-
-		// Record end-to-end end time
-		auto end = std::chrono::high_resolution_clock::now();
+			// Wait for true delivery hand-off on ORDER>=1. ORDER=0 remains on
+			// the legacy receive-side poll path because partial flush is scoped
+			// out for that parser.
+			auto end = std::chrono::high_resolution_clock::now();
+			if (delivery_measurement_enabled) {
+				LOG(INFO) << "Publishing complete, waiting for delivery drain to finish...";
+				if (delivery_thread.joinable()) {
+					delivery_thread.join();
+				}
+				end = std::chrono::high_resolution_clock::now();
+				LOG(INFO) << "Delivery drain complete: delivered=" << delivery_result.delivered
+				          << "/" << delivery_result.target
+				          << " samples=" << delivery_result.samples.size()
+				          << " timeout=" << delivery_result.timed_out
+				          << " order_pass=" << delivery_result.ordering_ok();
+			} else {
+				LOG(INFO) << "Publishing complete, waiting for subscriber to receive all data...";
+				s.Poll(total_message_size, message_size);
+				end = std::chrono::high_resolution_clock::now();
+			}
 
 		// Calculate bandwidths
 		double pub_seconds = std::chrono::duration<double>(pub_end - start).count();
@@ -1396,9 +1894,25 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 		// Process latency data
 		if (ShouldValidateOrder()) {
 			s.DEBUG_check_order(order);
-		}
-		s.StoreLatency();
-		CheckStageLatencyMonotonicity(ack_level);
+			}
+			s.StoreLatency();
+			if (delivery_measurement_enabled) {
+				auto receive_samples = s.SnapshotLatencySamples();
+				AnnotateDeliveryWithReceiveSamples(&delivery_result, receive_samples);
+				WriteDeliveryResults(delivery_result);
+				if (!delivery_result.ordering_ok()) {
+					LOG(ERROR) << "Delivery ordering assertion failed: delivered="
+					           << delivery_result.delivered << "/" << delivery_result.target
+					           << " invalid=" << delivery_result.invalid_messages
+					           << " dup_total_order=" << delivery_result.duplicate_total_order
+					           << " out_of_order_total_order=" << delivery_result.out_of_order_total_order
+					           << " dup_uid=" << delivery_result.duplicate_uid
+					           << " missing_uid=" << delivery_result.missing_uid
+					           << " timed_out=" << delivery_result.timed_out;
+					exit(1);
+				}
+			}
+			CheckStageLatencyMonotonicity(ack_level);
 		WriteLatencyBenchmarkSummary(result,
 				steady_rate,
 				target_mbps,

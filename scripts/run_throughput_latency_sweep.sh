@@ -35,8 +35,11 @@ mkdir -p "$OUTDIR"
 
 # --- Environment ---
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
-export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-metadata}
-export EMBARCADERO_CXL_MAP_POPULATE=${EMBARCADERO_CXL_MAP_POPULATE:-0}
+# Publication-grade measurements must not first-touch BLog/CXL pages inside the
+# measured ACK/delivery path. Use metadata/no-populate only for explicit fast
+# smoke tests, never for throughput or latency-vs-load claims.
+export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
+export EMBARCADERO_CXL_MAP_POPULATE=${EMBARCADERO_CXL_MAP_POPULATE:-1}
 export EMBARCADERO_REPLICATION_FACTOR=${EMBARCADERO_REPLICATION_FACTOR:-$REPLICATION_FACTOR}
 if [ -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]; then
   export EMBARCADERO_CXL_SHM_NAME="/CXL_SHARED_EXPERIMENT_${UID}"
@@ -64,11 +67,25 @@ RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-$((TIMEOUT_SEC + 60))}
 cd build/bin || { echo "Error: build/bin not found. Run cmake/make first."; exit 1; }
 
 # --- Helpers ---
+BROKER_PIDS=()
+CORFU_SEQUENCER_PID=""
+
 cleanup() {
   local remove_cxl=${1:-false}
-  pkill -9 -f "embarlet" >/dev/null 2>&1 || true
-  pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
-  pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
+  for pid in "${BROKER_PIDS[@]:-}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  sleep 0.2
+  for pid in "${BROKER_PIDS[@]:-}"; do
+    kill -9 "$pid" >/dev/null 2>&1 || true
+  done
+  BROKER_PIDS=()
+  if [ -n "${CORFU_SEQUENCER_PID:-}" ]; then
+    kill "$CORFU_SEQUENCER_PID" >/dev/null 2>&1 || true
+    sleep 0.2
+    kill -9 "$CORFU_SEQUENCER_PID" >/dev/null 2>&1 || true
+    CORFU_SEQUENCER_PID=""
+  fi
   rm -f /tmp/embarlet_*_ready 2>/dev/null
   if [ "$remove_cxl" = "true" ]; then
     shm_unlink "$EMBARCADERO_CXL_SHM_NAME" 2>/dev/null || true
@@ -114,11 +131,13 @@ start_brokers() {
   rm -f /tmp/embarlet_*_ready 2>/dev/null || true
   if [[ "$SEQUENCER" == "CORFU" ]]; then
     ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
+    CORFU_SEQUENCER_PID=$!
     sleep 1
   fi
 
   # Start head broker first — it creates and populates the CXL shared memory file.
   $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --head --$SEQUENCER > /tmp/embarlet_head.log 2>&1 &
+  BROKER_PIDS+=($!)
 
   if [ "$NUM_BROKERS" -gt 1 ]; then
     # Wait for head to finish CXL init before launching followers.
@@ -134,6 +153,7 @@ start_brokers() {
     # on the 64 GiB shared-memory region.
     for ((i=1; i<NUM_BROKERS; i++)); do
       $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" > /tmp/embarlet_${i}.log 2>&1 &
+      BROKER_PIDS+=($!)
       if ! wait_for_brokers 180 1; then
         cleanup
         return 1
@@ -159,12 +179,28 @@ echo "========================================================"
 echo " Throughput-Latency Sweep"
 echo " Order=$ORDER  Sequencer=$SEQUENCER  Brokers=$NUM_BROKERS"
 echo " MsgSize=$MESSAGE_SIZE  TotalBytes=$TOTAL_BYTES"
+echo " CXL zero=$EMBARCADERO_CXL_ZERO_MODE  map_populate=$EMBARCADERO_CXL_MAP_POPULATE"
 echo " Timeouts: ACK=${EMBARCADERO_ACK_TIMEOUT_SEC}s E2E=${EMBARCADERO_E2E_TIMEOUT_SEC}s"
 echo " Targets: $SWEEP_TARGETS"
 echo " Output:  $OUTDIR/"
 echo "========================================================"
 
 cleanup true   # initial: remove stale CXL
+
+cat > "$PROJECT_ROOT/$OUTDIR/metadata.env" <<EOF
+sequencer=$SEQUENCER
+order=$ORDER
+ack=$ACK
+replication_factor=$REPLICATION_FACTOR
+message_size=$MESSAGE_SIZE
+total_bytes=$TOTAL_BYTES
+num_brokers=$NUM_BROKERS
+threads_per_broker=$THREADS_PER_BROKER
+cxl_zero_mode=$EMBARCADERO_CXL_ZERO_MODE
+cxl_map_populate=$EMBARCADERO_CXL_MAP_POPULATE
+hugetlb=$EMBAR_USE_HUGETLB
+commit=$(git rev-parse HEAD)
+EOF
 
 for target in $SWEEP_TARGETS; do
   echo ""
@@ -234,13 +270,13 @@ for target in $SWEEP_TARGETS; do
 
       POINT_DIR="$PROJECT_ROOT/$OUTDIR/${target}mbps"
       mkdir -p "$POINT_DIR"
-      for f in pub_latency_stats.csv pub_cdf_latency_us.csv latency_stats.csv cdf_latency_us.csv; do
-        [ -f "$f" ] && mv "$f" "$POINT_DIR/"
-      done
+	      for f in pub_latency_stats.csv pub_cdf_latency_us.csv latency_stats.csv cdf_latency_us.csv delivery_latency_stats.csv cdf_delivery_latency_us.csv delivery_ordering_assertion.csv delivery_stage_breakdown.csv; do
+	        [ -f "$f" ] && mv "$f" "$POINT_DIR/"
+	      done
       cp "$TEST_LOG" "$POINT_DIR/test.log"
 
       PUB_STATS="$POINT_DIR/pub_latency_stats.csv"
-      E2E_STATS="$POINT_DIR/latency_stats.csv"
+	      E2E_STATS="$POINT_DIR/delivery_latency_stats.csv"
 
       # CSV columns: Average,Min,Median,p90,p95,p99,p999,Max,...
       pub_p50="" pub_p99="" pub_p999=""
@@ -254,8 +290,8 @@ for target in $SWEEP_TARGETS; do
       fi
 
       e2e_p50="" e2e_p99="" e2e_p999=""
-      if [ -f "$E2E_STATS" ]; then
-        row=$(grep -m1 "publish_to_deliver_latency" "$E2E_STATS" 2>/dev/null || tail -1 "$E2E_STATS" 2>/dev/null || true)
+	      if [ -f "$E2E_STATS" ]; then
+	        row=$(grep -m1 "publish_to_deliver_latency" "$E2E_STATS" 2>/dev/null || tail -1 "$E2E_STATS" 2>/dev/null || true)
         if [ -n "$row" ]; then
           e2e_p50=$(echo "$row" | awk -F',' '{print $3}')
           e2e_p99=$(echo "$row" | awk -F',' '{print $6}')

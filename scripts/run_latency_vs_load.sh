@@ -20,6 +20,9 @@ NUM_BROKERS="${NUM_BROKERS:-4}"
 SCENARIO="${SCENARIO:-local}"
 SYSTEM_LABEL="${SYSTEM_LABEL:-${SEQUENCER}_order${ORDER}_ack${ACK_LEVEL}_rf${REPLICATION_FACTOR}}"
 OUT_BASE="${OUT_BASE:-$PROJECT_ROOT/data/latency_vs_load}"
+CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-full}"
+CXL_MAP_POPULATE="${EMBARCADERO_CXL_MAP_POPULATE:-1}"
+HUGETLB="${EMBAR_USE_HUGETLB:-1}"
 
 case "$PACING_MODE" in
   open_loop)
@@ -46,7 +49,7 @@ cat > "$RUN_DIR/benchmark_contract.md" <<EOF
 
 - Controlled variable: publisher offered load in MB/s via \`throughput_test --target_mbps\`.
 - Pacing semantics: \`PACING_MODE=open_loop\` maps to the existing latency harness \`burst\` mode, meaning no extra pause injection beyond the target-load scheduler. \`PACING_MODE=steady\` maps to \`--steady_rate\` and must not be mixed with open-loop results in one figure.
-- Measured latency: end-to-end \`publish_to_deliver_latency\` in \`latency_stats.csv\` and publisher batch latency metrics in \`pub_latency_stats.csv\`.
+- Measured latency: end-to-end \`publish_to_deliver_latency\` in \`delivery_latency_stats.csv\`; receive-side wire-arrival \`publish_to_receive_latency\` in \`latency_stats.csv\`; publisher batch latency metrics in \`pub_latency_stats.csv\`.
 - Measured throughput: achieved offered load, publish goodput, and end-to-end goodput from \`latency_benchmark_summary.csv\`.
 - Raw artifacts: every target/trial keeps its original CSV files and run log under a deterministic point directory.
 - Failure policy: the script stops on the first failed target to avoid silently publishing partial or incompatible sweeps.
@@ -67,6 +70,9 @@ num_brokers=$NUM_BROKERS
 scenario=$SCENARIO
 pacing_mode=$PACING_MODE
 load_points_mbps=$LOAD_POINTS_MBPS
+cxl_zero_mode=$CXL_ZERO_MODE
+cxl_map_populate=$CXL_MAP_POPULATE
+hugetlb=$HUGETLB
 start_time_utc=$(date -u +%Y%m%dT%H%M%SZ)
 commit=$(git rev-parse HEAD)
 EOF
@@ -79,6 +85,7 @@ LOAD_POINTS_MBPS='$LOAD_POINTS_MBPS' PACING_MODE='$PACING_MODE' BENCHMARK_TAG='$
 SEQUENCER='$SEQUENCER' ORDER='$ORDER' ACK_LEVEL='$ACK_LEVEL' REPLICATION_FACTOR='$REPLICATION_FACTOR' \\
 MSG_SIZE='$MSG_SIZE' TOTAL_MESSAGE_SIZE='$TOTAL_MESSAGE_SIZE' NUM_TRIALS='$NUM_TRIALS' NUM_BROKERS='$NUM_BROKERS' \\
 SCENARIO='$SCENARIO' SYSTEM_LABEL='$SYSTEM_LABEL' OUT_BASE='$OUT_BASE' \\
+EMBARCADERO_CXL_ZERO_MODE='$CXL_ZERO_MODE' EMBARCADERO_CXL_MAP_POPULATE='$CXL_MAP_POPULATE' EMBAR_USE_HUGETLB='$HUGETLB' \\
 bash scripts/run_latency_vs_load.sh
 EOF
 chmod +x "$RUN_DIR/command.sh"
@@ -110,6 +117,9 @@ for target in $LOAD_POINTS_MBPS; do
     NUM_TRIALS="$NUM_TRIALS" \
     NUM_BROKERS="$NUM_BROKERS" \
     SCENARIO="$SCENARIO" \
+    EMBARCADERO_CXL_ZERO_MODE="$CXL_ZERO_MODE" \
+    EMBARCADERO_CXL_MAP_POPULATE="$CXL_MAP_POPULATE" \
+    EMBAR_USE_HUGETLB="$HUGETLB" \
     bash scripts/run_latency.sh 2>&1 | tee -a "$POINT_DIR/driver.log"
 
   python3 scripts/aggregate_latency_vs_load.py \

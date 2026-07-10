@@ -64,9 +64,7 @@ class DiskManager{
 	private:
 		void ReplicateThread();
 		void CopyThread();
-		bool GetMessageAddr(TInode* tinode, int order, int broker_id, size_t &last_offset,
-			void* &last_addr, void* &messages, size_t &messages_size);
-		
+
 		// [[EXPLICIT_REPLICATION_STAGE4]] - Batch-based replication for EMBARCADERO sequencers
 		// Polls ordered batches from BatchHeader ring instead of message-based cursor
 		bool GetNextReplicationBatch(TInode* tinode, int broker_id, 
