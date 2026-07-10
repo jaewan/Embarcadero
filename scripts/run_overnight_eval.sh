@@ -275,11 +275,12 @@ done
 if [[ "$SKIP_BASELINES" != "1" ]]; then
     run_multi_cell "e2_corfu_rf0_n1" 1 "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=CORFU ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
-        TEST_TYPE=5
+        TEST_TYPE=5 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
 
     run_multi_cell "e2_scalog_rf0_n1" 1 "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=SCALOG ORDER=1 ACK=1 REPLICATION_FACTOR=0 \
-        TEST_TYPE=5 SKIP_REMOTE_SCALOG_SEQUENCER=1
+        TEST_TYPE=5 SKIP_REMOTE_SCALOG_SEQUENCER=1 \
+        EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP"
 
     run_multi_cell "e2_lazylog_rf0_n1" 1 "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=LAZYLOG ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
@@ -298,7 +299,7 @@ if [[ "${SMOKE:-0}" != "1" ]]; then
         if [[ "$SKIP_BASELINES" != "1" ]]; then
             run_multi_cell "e2_corfu_rf0_n${nc}" "$nc" "$local_csv" \
                 SEQUENCER=CORFU ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
-                TEST_TYPE=5
+                TEST_TYPE=5 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
 
             run_multi_cell "e2_lazylog_rf0_n${nc}" "$nc" "$local_csv" \
                 SEQUENCER=LAZYLOG ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
@@ -327,11 +328,13 @@ run_latency_cell "e3_embar0_rf0" \
 
 if [[ "$SKIP_BASELINES" != "1" ]]; then
     run_latency_cell "e3_corfu_rf0" \
-        SEQUENCER=CORFU ORDER=2 ACK_LEVEL=1 REPLICATION_FACTOR=0
+        SEQUENCER=CORFU ORDER=2 ACK_LEVEL=1 REPLICATION_FACTOR=0 \
+        EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
 
     run_latency_cell "e3_scalog_rf0" \
         SEQUENCER=SCALOG ORDER=1 ACK_LEVEL=1 REPLICATION_FACTOR=0 \
-        SKIP_REMOTE_SCALOG_SEQUENCER=1
+        SKIP_REMOTE_SCALOG_SEQUENCER=1 \
+        EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP"
 
     run_latency_cell "e3_lazylog_rf0" \
         SEQUENCER=LAZYLOG ORDER=2 ACK_LEVEL=1 REPLICATION_FACTOR=0 \
