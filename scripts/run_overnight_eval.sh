@@ -34,6 +34,11 @@
 #   BROKER_IP=X.X.X.X    moscxl dataplane IP (default 10.10.10.10 — 10G fabric, reachable from c1/c2/c3)
 #   SKIP_BASELINES=1      skip CORFU/SCALOG/LAZYLOG cells
 #   LOAD_POINTS_MBPS="…"  space-separated MB/s load points for E3
+#   EPOCH_US_THROUGHPUT=N ORDER=5 epoch period for throughput cells (default 200 µs → 5000 epochs/sec)
+#                         Use 500 to match the original kEpochUs default.  Broker clamps to [100,5000].
+#   EPOCH_US_LATENCY=N    ORDER=5 epoch period for latency cells (default 500 µs, preserves linger behaviour)
+#   THREADS_THROUGHPUT=N  threads/broker for E2/E9 throughput cells (default 6, bypasses sentinel-4)
+#                         Set to 3 to match co-located config; set higher (8,12) for ablation sweeps.
 #
 # Constraints honoured:
 #   - Never touches ~/Embarcadero
@@ -57,15 +62,18 @@ cd "$PROJECT_ROOT"
 # moscxl is always the broker node. Clients are activated in order by NUM_CLIENTS.
 # run_multiclient.sh's CLIENT_HOSTS roster: c4 c3 local c2 c1
 # We override with c1/c2/c3 only (no local publisher, avoids broker CPU contention):
-CLIENT_HOSTS_REMOTE="${CLIENT_HOSTS_REMOTE:-c1}"   # single remote client (E3/E9/smoke)
-CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c1,c2,c3}"     # three remote clients for E2 scaling
+# Network topology (verified with iperf3 2025-07-11):
+#   c1: 100G NIC (10.10.10.11), PCIe 3.0 x8 DOWNGRADED → ~5.6 GB/s TCP ceiling
+#   c3: 100G NIC (10.10.10.181), PCIe full            → ~12.4 GB/s TCP ceiling (near wire)
+#   c2: 1G NIC only (192.168.60.144)                   → ~0.16 GB/s  ← NOT for eval
+#   c4: 1G NIC only (192.168.60.182)                   → ~1G          ← NOT for eval
+# Both c1 and c3 are on the 10.10.10.x fabric → single BROKER_IP works for all multi-client.
+CLIENT_HOSTS_REMOTE="${CLIENT_HOSTS_REMOTE:-c1}"    # single remote client (E3/E9/smoke)
+CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c1,c3}"         # two 100G clients for E2 scaling (c2/c4 are 1G only)
 
-# Broker IP for single-client runs (c1 only — uses 10G 10.10.10.x fabric)
+# Single broker IP for all runs — c1 and c3 are both on 10.10.10.x.
 BROKER_IP="${BROKER_IP:-10.10.10.10}"
-
-# Broker IP for multi-client runs (c1+c2+c3) — must be reachable from ALL clients.
-# c2 is only on 192.168.60.x, not on 10.10.10.x. 192.168.60.8 is reachable by all three.
-BROKER_IP_MULTI="${BROKER_IP_MULTI:-192.168.60.8}"
+BROKER_IP_MULTI="${BROKER_IP_MULTI:-10.10.10.10}"  # same: c1+c3 both reach this
 
 # ---------------------------------------------------------------------------
 # Mode / config
@@ -91,6 +99,22 @@ fi
 MSG_SIZE="${MSG_SIZE:-1024}"
 NUM_BROKERS="${NUM_BROKERS:-4}"
 SKIP_BASELINES="${SKIP_BASELINES:-0}"
+
+# ---------------------------------------------------------------------------
+# Throughput tuning knobs (FIX 1 + FIX 2)
+# ---------------------------------------------------------------------------
+# FIX 1: Epoch period for ORDER=5 EpochDriverThread.
+#   Throughput cells: 200 µs → 5000 epochs/sec → ~10 GB/s theoretical ceiling with 2 MB batches.
+#   Latency cells:   500 µs (default) preserves linger accumulation window.
+#   Override the respective var to revert to the original 500 µs default if needed.
+EPOCH_US_THROUGHPUT="${EPOCH_US_THROUGHPUT:-200}"
+EPOCH_US_LATENCY="${EPOCH_US_LATENCY:-500}"
+
+# FIX 2: Threads per broker for throughput cells.
+#   main.cc line 68: -n 4 is a sentinel that reads threads_per_broker from config (currently 3).
+#   Passing 6 bypasses the sentinel and uses 6 actual threads/broker → more parallel batch streams.
+#   Latency cells are left at the config default (sentinel-4 → 3 threads) to avoid confounding.
+THREADS_THROUGHPUT="${THREADS_THROUGHPUT:-6}"
 
 # Shared libs that may be missing or wrong-version on client nodes.
 # cluster_setup.sh collects these into $PROJECT_ROOT/lib/; we point clients there.
@@ -299,16 +323,21 @@ preflight_check
 log "===== PART A: E2 throughput matrix ====="
 
 # Single-client throughput (N=1, all-remote — the clean comparison cell)
+# FIX 1: EMBAR_ORDER5_EPOCH_US=200 µs → 5000 epochs/sec.
+# FIX 2: THREADS_PER_BROKER=6 bypasses the sentinel-4 → uses 6 actual threads/broker.
 for rf in 0 1; do
     run_multi_cell "e2_embar5_rf${rf}_n1" 1 "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=$rf \
-        TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency
+        TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency \
+        EMBAR_ORDER5_EPOCH_US="$EPOCH_US_THROUGHPUT" \
+        THREADS_PER_BROKER="$THREADS_THROUGHPUT"
 done
 
 for rf in 0 1; do
     run_multi_cell "e2_embar0_rf${rf}_n1" 1 "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=EMBARCADERO ORDER=0 ACK=1 REPLICATION_FACTOR=$rf \
-        TEST_TYPE=5
+        TEST_TYPE=5 \
+        THREADS_PER_BROKER="$THREADS_THROUGHPUT"
 done
 
 if [[ "$SKIP_BASELINES" != "1" ]]; then
@@ -328,27 +357,30 @@ fi
 
 # Multi-client throughput scaling N=1,2,3 (all-remote — E2 scaling figure)
 if [[ "${SMOKE:-0}" != "1" ]]; then
-    for nc in 2 3; do
-        # Use first $nc hosts from CLIENT_HOSTS_E2
-        # Compute safely outside env "$@" to avoid subshell-in-env-arg syntax issues
-        local_csv="$(echo "$CLIENT_HOSTS_E2" | tr ',' '\n' | head -"$nc" | tr '\n' ',' | sed 's/,$//')" || local_csv="c1,c2"
-        # N>=2 runs must use BROKER_IP_MULTI (192.168.60.8) — c2 is not on 10.10.10.x
+    # Only c1 and c3 have 100G NICs on the 10.10.10.x fabric.
+    # c2 and c4 are 1G only — excluded. Max useful N=2 (c1+c3).
+    for nc in 2; do
+        # Use first $nc hosts from CLIENT_HOSTS_E2 (= "c1,c3")
+        local_csv="$(echo "$CLIENT_HOSTS_E2" | tr ',' '\n' | head -"$nc" | tr '\n' ',' | sed 's/,$//')" || local_csv="c1,c3"
+        # Both c1 and c3 are on 10.10.10.x — use single BROKER_IP
         run_multi_cell "e2_embar5_rf0_n${nc}" "$nc" "$local_csv" \
             SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=0 \
             TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency \
-            EMBARCADERO_HEAD_ADDR="$BROKER_IP_MULTI"
+            EMBAR_ORDER5_EPOCH_US="$EPOCH_US_THROUGHPUT" \
+            THREADS_PER_BROKER="$THREADS_THROUGHPUT" \
+            EMBARCADERO_HEAD_ADDR="$BROKER_IP"
 
         if [[ "$SKIP_BASELINES" != "1" ]]; then
             run_multi_cell "e2_corfu_rf0_n${nc}" "$nc" "$local_csv" \
                 SEQUENCER=CORFU ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
                 TEST_TYPE=5 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP_MULTI" \
-                EMBARCADERO_HEAD_ADDR="$BROKER_IP_MULTI"
+                EMBARCADERO_HEAD_ADDR="$BROKER_IP"
 
             run_multi_cell "e2_lazylog_rf0_n${nc}" "$nc" "$local_csv" \
                 SEQUENCER=LAZYLOG ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
                 TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
                 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP_MULTI" \
-                EMBARCADERO_HEAD_ADDR="$BROKER_IP_MULTI"
+                EMBARCADERO_HEAD_ADDR="$BROKER_IP"
         fi
     done
 fi
@@ -396,14 +428,17 @@ log "===== PART C: E9 RF sensitivity ====="
 for rf in 0 1 2; do
     run_multi_cell "e9_embar5_rf${rf}" "$NUM_CLIENTS_E3" "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=$rf \
-        TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency
+        TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency \
+        EMBAR_ORDER5_EPOCH_US="$EPOCH_US_THROUGHPUT" \
+        THREADS_PER_BROKER="$THREADS_THROUGHPUT"
 done
 
-# Latency vs RF
+# Latency vs RF — use latency epoch (500 µs default) to preserve linger window
 for rf in 0 1; do
     run_latency_cell "e9_latency_embar5_rf${rf}" \
         SEQUENCER=EMBARCADERO ORDER=5 ACK_LEVEL=1 REPLICATION_FACTOR=$rf \
-        EMBARCADERO_RUNTIME_MODE=latency
+        EMBARCADERO_RUNTIME_MODE=latency \
+        EMBAR_ORDER5_EPOCH_US="$EPOCH_US_LATENCY"
 done
 
 # ===========================================================================
