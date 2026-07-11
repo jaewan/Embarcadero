@@ -1135,7 +1135,17 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 		auto start = std::chrono::high_resolution_clock::now();
 
 		size_t batch_size = 10000;
+		// [[INFLIGHT_WINDOW 2026-07-12]] This client-side flow-control window is
+		// the binding throughput limiter in publish benchmarks: sustained rate
+		// = window / ACK-pipeline lag (measured ~100MB/29ms = 3.45 GB/s across
+		// ALL systems and every broker-side knob — the four-way "parity" in the
+		// E2 matrix was this constant, not architecture). Env-tunable so
+		// throughput cells can size it above the bandwidth-delay product.
 		size_t max_in_flight_bytes = 100 * 1024 * 1024;
+		if (const char* env = std::getenv("EMBARCADERO_MAX_INFLIGHT_MB")) {
+			int mb = std::atoi(env);
+			if (mb > 0) max_in_flight_bytes = static_cast<size_t>(mb) * 1024 * 1024;
+		}
 		size_t max_in_flight_msgs = max_in_flight_bytes / message_size;
 
 		for (size_t i = 0; i < n; i++) {
