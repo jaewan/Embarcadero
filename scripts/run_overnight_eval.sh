@@ -73,7 +73,7 @@ cd "$PROJECT_ROOT"
 #   c2: 1G only — excluded
 # Use c4 as primary single client (NUMA-local, NUMA 1, matches original publication topology)
 CLIENT_HOSTS_REMOTE="${CLIENT_HOSTS_REMOTE:-c4}"    # single remote client — c4 is NUMA-optimal
-CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c4,c1,c3}"     # scaling: c4+c1 for N=2, c4+c1+c3 for N=3
+CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c4,c3,c1}"     # scaling: c4+c3 (both x16 NUMA-local) for N=2, +c1 (x8) for N=3 NIC saturation
 
 # Single broker IP for all runs — c1 and c3 are both on 10.10.10.x.
 BROKER_IP="${BROKER_IP:-10.10.10.10}"
@@ -403,11 +403,13 @@ fi
 
 # Multi-client throughput scaling N=1,2,3 (all-remote — E2 scaling figure)
 if [[ "${SMOKE:-0}" != "1" ]]; then
-    # Only c1 and c3 have 100G NICs on the 10.10.10.x fabric.
-    # c2 and c4 are 1G only — excluded. Max useful N=2 (c1+c3).
-    for nc in 2; do
-        # Use first $nc hosts from CLIENT_HOSTS_E2 (= "c1,c3")
-        local_csv="$(echo "$CLIENT_HOSTS_E2" | tr ',' '\n' | head -"$nc" | tr '\n' ',' | sed 's/,$//')" || local_csv="c1,c3"
+    # c4, c3, c1 all have 100G NICs on the 10.10.10.x fabric (c4 added
+    # 2026-07-11; c1 is x8-downgraded ~3.3 GB/s). N=3 offered load
+    # (~13-14 GB/s) saturates the broker's single 100G port (~12.4 GB/s TCP)
+    # — that saturation point is the all-remote throughput headline.
+    for nc in 2 3; do
+        # Use first $nc hosts from CLIENT_HOSTS_E2 (= "c4,c3,c1")
+        local_csv="$(echo "$CLIENT_HOSTS_E2" | tr ',' '\n' | head -"$nc" | tr '\n' ',' | sed 's/,$//')" || local_csv="c4,c3"
         # Both c1 and c3 are on 10.10.10.x — use single BROKER_IP
         run_multi_cell "e2_embar5_rf0_n${nc}" "$nc" "$local_csv" \
             SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=0 \
@@ -427,6 +429,12 @@ if [[ "${SMOKE:-0}" != "1" ]]; then
                 TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
                 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP_MULTI" \
                 EMBARCADERO_HEAD_ADDR="$BROKER_IP"
+
+            run_multi_cell "e2_scalog_rf0_n${nc}" "$nc" "$local_csv" \
+                SEQUENCER=SCALOG ORDER=1 ACK=1 REPLICATION_FACTOR=0 \
+                TEST_TYPE=5 SKIP_REMOTE_SCALOG_SEQUENCER=1 \
+                EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP_MULTI" \
+                EMBARCADERO_HEAD_ADDR="$BROKER_IP"
         fi
     done
 fi
@@ -441,9 +449,13 @@ run_latency_cell "e3_embar5_linger_rf0" \
     SEQUENCER=EMBARCADERO ORDER=5 ACK_LEVEL=1 REPLICATION_FACTOR=0 \
     EMBARCADERO_RUNTIME_MODE=latency
 
-# ORDER=5 without linger — shows batch-fill cost (for comparison panel)
+# ORDER=5 without linger — shows batch-fill cost (for comparison panel).
+# RUNTIME_MODE must be forced to 'throughput' here: run_latency.sh defaults
+# to 'latency' (= linger ON), which silently made this cell a duplicate of
+# the linger cell in run 20260711T003924Z.
 run_latency_cell "e3_embar5_nolinger_rf0" \
-    SEQUENCER=EMBARCADERO ORDER=5 ACK_LEVEL=1 REPLICATION_FACTOR=0
+    SEQUENCER=EMBARCADERO ORDER=5 ACK_LEVEL=1 REPLICATION_FACTOR=0 \
+    EMBARCADERO_RUNTIME_MODE=throughput
 
 # NOTE: ORDER=0 (unordered) does not produce delivery_latency_stats.csv
 # because it uses Consume() not ConsumeOrdered(). Skip latency measurement for ORDER=0.
