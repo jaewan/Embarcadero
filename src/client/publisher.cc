@@ -1519,9 +1519,24 @@ void Publisher::WarmupBuffers() {
 }
 
 void Publisher::Publish(char* message, size_t len) {
-	while (session_fenced_reopen_pending_.load(std::memory_order_acquire) &&
-	       !shutdown_.load(std::memory_order_relaxed)) {
-		Embarcadero::CXL::cpu_pause();
+	// [[FENCE_REOPEN_SPIN_BOUND 2026-07-11]] This wait was unbounded: if the
+	// session reopen never completes (e.g. every publish thread died in a
+	// multi-client connect storm), the caller spun silently at 100% CPU with
+	// no log output — observed for 7 h in run 20260711T065047Z. Bound it and
+	// fail loudly instead. Cold path: only entered while a fence is pending.
+	if (session_fenced_reopen_pending_.load(std::memory_order_acquire)) {
+		const auto reopen_wait_start = std::chrono::steady_clock::now();
+		while (session_fenced_reopen_pending_.load(std::memory_order_acquire) &&
+		       !shutdown_.load(std::memory_order_relaxed)) {
+			Embarcadero::CXL::cpu_pause();
+			if (std::chrono::steady_clock::now() - reopen_wait_start >
+			    std::chrono::seconds(120)) {
+				LOG(ERROR) << "Publish(): session reopen pending for >120s — "
+				           << "session is dead; failing the run instead of spinning";
+				shutdown_.store(true, std::memory_order_relaxed);
+				return;
+			}
+		}
 	}
 	constexpr size_t kHeaderSize = sizeof(Embarcadero::MessageHeader);
 	// Branchless 64-byte payload alignment for the hot path.
@@ -2699,11 +2714,31 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			return true;
 		};
 
-	// Connect to initial broker
+	// Connect to initial broker.
+	// [[SESSION_OPEN_RETRY 2026-07-11]] The broker's ReqReceive pool binds one
+	// handler thread per publish connection for the connection's lifetime, so
+	// under a multi-client connect storm a connection can sit in the accept
+	// queue longer than one SessionOpen reply timeout (1 s). A one-shot
+	// failure here permanently killed the thread — and with it the whole
+	// client Init (run 20260711T065047Z, N=3). Retry with backoff; each
+	// attempt opens a fresh socket.
 	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Starting connection to broker " << broker_id;
-	if (!connect_to_server(broker_id)) {
-		LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Failed to connect to broker " << broker_id;
-		return;
+	{
+		constexpr int kInitialConnectAttempts = 5;
+		int connect_attempt = 1;
+		while (!connect_to_server(broker_id)) {
+			if (connect_attempt >= kInitialConnectAttempts ||
+			    shutdown_.load(std::memory_order_relaxed)) {
+				LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Failed to connect to broker "
+				           << broker_id << " after " << connect_attempt << " attempts";
+				return;
+			}
+			LOG(WARNING) << "PublishThread[" << pubQuesIdx << "]: connect/SessionOpen to broker "
+			             << broker_id << " failed (attempt " << connect_attempt << "/"
+			             << kInitialConnectAttempts << ") — retrying in 2s";
+			connect_attempt++;
+			std::this_thread::sleep_for(std::chrono::seconds(2));
+		}
 	}
 	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Successfully connected to broker " << broker_id;
 
