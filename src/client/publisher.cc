@@ -1564,11 +1564,44 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	const auto queue_spin_duration = low_payload_poll_mode
 		? std::chrono::microseconds(100)
 		: std::chrono::milliseconds(1);
+	// [[DRAIN_HANG_FIX 2026-07-11]] Bounded drain wait + periodic re-seal.
+	// Observed (e3 nolinger cell, run 20260711T003924Z): client_order_ wedged
+	// 26 messages short of target for 38+ min — a partial tail batch missed by
+	// the initial WriteFinishedOrPaused() seal pass never seals again, and this
+	// loop had no timeout. Re-run the seal pass periodically (idempotent; only
+	// newly sealed messages increment client_order_) and fail the Poll after a
+	// bounded wait instead of spinning forever.
+	const int drain_timeout_sec = [] {
+		if (const char* env = std::getenv("EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC")) {
+			int v = std::atoi(env);
+			if (v > 0) return v;
+		}
+		return 300;
+	}();
 	const auto queue_wait_start = std::chrono::steady_clock::now();
 	auto last_queue_log_time = queue_wait_start;
+	auto last_reseal_time = queue_wait_start;
 	uint32_t queue_wait_loops = 0;
 	while (client_order_.load(std::memory_order_acquire) < n) {
 		auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_reseal_time).count() >= 5) {
+			last_reseal_time = now;
+			const size_t before_reseal = client_order_.load(std::memory_order_acquire);
+			WriteFinishedOrPaused();
+			const size_t after_reseal = client_order_.load(std::memory_order_acquire);
+			if (after_reseal > before_reseal) {
+				LOG(WARNING) << "[Publisher Queue Drain Wait] late re-seal recovered "
+				             << (after_reseal - before_reseal)
+				             << " message(s) — tail-batch seal race hit; continuing";
+			}
+		}
+		if (std::chrono::duration_cast<std::chrono::seconds>(now - queue_wait_start).count() >= drain_timeout_sec) {
+			LOG(ERROR) << "[Publisher Queue Drain Wait] TIMEOUT after " << drain_timeout_sec
+			           << "s: client_order=" << client_order_.load(std::memory_order_acquire)
+			           << " target=" << n
+			           << " — failing Poll instead of hanging (EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC to tune)";
+			return false;
+		}
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_queue_log_time).count() >= 1) {
 			std::string per_broker;
 			for (size_t i = 0; i < broker_stats_.size(); i++) {
