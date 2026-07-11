@@ -517,14 +517,14 @@ check_remote_latency_client_ready() {
     return 0
   fi
 
+  # Capability is detected from the BINARY (strings probe below), not from the
+  # remote CMakeCache.txt: the deployed binary need not come from the remote
+  # host's own build tree (e.g. portable build synced from the broker node
+  # while the remote cache still says OFF — seen on c4, run 20260711T040441Z).
   local check_cmd='
 set -euo pipefail
 cd '"$REMOTE_CLIENT_BIN_DIR"'
 test -x ./throughput_test
-if ! grep -q "^COLLECT_LATENCY_STATS:BOOL=ON$" ../CMakeCache.txt 2>/dev/null; then
-  echo "remote throughput_test was built without COLLECT_LATENCY_STATS=ON" >&2
-  exit 1
-fi
 if ! strings ./throughput_test > /tmp/throughput_test_strings.txt 2>/dev/null; then
   echo "failed to inspect remote throughput_test strings" >&2
   exit 1

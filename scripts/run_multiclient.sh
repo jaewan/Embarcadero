@@ -604,6 +604,32 @@ compute_overlap_throughput_gbps() {
         return 1
     fi
 
+    # Guard against degenerate timeseries (e.g. a stale client binary writing
+    # Timestamp=0 on every row — seen on c3, run 20260711T040441Z: the overlap
+    # window collapsed to 1 ms and the result was garbage). A usable file must
+    # span >= 500 ms of active samples; if any expected client's file is
+    # unusable, the overlap no longer covers all clients — fail the overlap so
+    # the harness records nothing (the naive per-trial TOTAL remains in the
+    # cell log) instead of a silently wrong number.
+    local expected_clients=${#files[@]}
+    local valid_bounds
+    valid_bounds="$(mktemp)"
+    awk -F',' '
+        ($3 - $2) >= 500 { print; next }
+        {
+            printf "WARNING: degenerate timeseries window (%d ms) in %s — excluded from overlap\n",
+                   ($3 - $2), $1 > "/dev/stderr"
+        }
+    ' "$tmp_bounds" > "$valid_bounds"
+    mv -f "$valid_bounds" "$tmp_bounds"
+    local bounds_count
+    bounds_count="$(wc -l < "$tmp_bounds")"
+    if [[ "$bounds_count" -lt "$expected_clients" ]]; then
+        echo "WARNING: overlap aborted — only ${bounds_count}/${expected_clients} clients have usable timeseries; falling back to naive TOTAL (check client binary vintage / clock sync)" >&2
+        rm -f "$tmp_bounds"
+        return 1
+    fi
+
     # Phase-align each client's active window to its first positive sample so that
     # host clock skew / SSH launch jitter does not eliminate overlap coverage.
     local overlap_start overlap_end
@@ -650,6 +676,10 @@ compute_overlap_throughput_gbps() {
     rm -f "$tmp_bounds"
 
     if [[ "$client_count" -le 0 ]]; then
+        return 1
+    fi
+    if [[ "$overlap_window_ms" -lt 500 ]]; then
+        echo "WARNING: overlap window only ${overlap_window_ms} ms (< 500 ms) — result too quantized to report; use naive TOTAL" >&2
         return 1
     fi
 
