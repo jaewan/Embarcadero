@@ -1,6 +1,7 @@
 #ifndef EMBARCADERO_CONFIGURATION_H_
 #define EMBARCADERO_CONFIGURATION_H_
 
+#include <atomic>
 #include <string>
 #include <memory>
 #include <optional>
@@ -20,23 +21,50 @@ public:
     ConfigValue() = default;
     ConfigValue(T default_value, const std::string& env_var = "")
         : value_(default_value), env_var_(env_var) {}
-
-    T get() const {
-        if (!env_var_.empty()) {
-            auto env_value = getEnvValue();
-            if (env_value.has_value()) {
-                return env_value.value();
-            }
-        }
-        return value_;
+    // std::atomic member deletes implicit copies; restore them (fresh cache).
+    ConfigValue(const ConfigValue& other)
+        : value_(other.value_), env_var_(other.env_var_) {}
+    ConfigValue& operator=(const ConfigValue& other) {
+        value_ = other.value_;
+        env_var_ = other.env_var_;
+        resolved_.store(false, std::memory_order_release);
+        return *this;
     }
 
-    void set(T value) { value_ = value; }
+    // [[GETENV_MEMO 2026-07-12]] The env lookup is resolved ONCE and cached.
+    // Previously every get() called getenv() (a linear scan of environ with
+    // strncmp): the config macros in config.h.in hide these calls, and e.g.
+    // BATCHHEADERS_SIZE appears 14x inside BrokerScannerWorker5's poll loop —
+    // perf showed 35% of the head broker's cycles in getEnvValue()/getenv,
+    // pacing every client's ORDER=5 ordered frontier (~3.4 GB/s ACK ceiling).
+    // Env vars are process-start configuration; mid-run changes were never
+    // supported, so memoization preserves semantics.
+    T get() const {
+        if (!resolved_.load(std::memory_order_acquire)) {
+            std::optional<T> env_value;
+            if (!env_var_.empty()) {
+                env_value = getEnvValue();
+            }
+            // Benign race: concurrent first-callers compute identical results.
+            cached_ = env_value.has_value() ? env_value.value() : value_;
+            resolved_.store(true, std::memory_order_release);
+        }
+        return cached_;
+    }
+
+    void set(T value) {
+        value_ = value;
+        // Re-resolve on next get() so yaml loading (set()) still composes
+        // with env override precedence.
+        resolved_.store(false, std::memory_order_release);
+    }
     const std::string& env_var() const { return env_var_; }
 
 private:
     T value_;
     std::string env_var_;
+    mutable T cached_{};
+    mutable std::atomic<bool> resolved_{false};
 
     std::optional<T> getEnvValue() const;
 };
