@@ -21,9 +21,11 @@ KV_BENCH="$REPO_ROOT/build/bin/kv_ycsb_bench"
 # a hung trial would otherwise wedge the whole sweep.
 TRIAL_TIMEOUT_SEC="${TRIAL_TIMEOUT_SEC:-1200}"
 
-# kv_ycsb_bench spawns embarlet + sequencer processes itself. If a trial
-# crashes or times out they leak and poison the next cell (stale CXL shm →
-# SIGBUS-class startup failures). Clean between trials, never fatal.
+# kv_ycsb_bench does NOT manage a broker cluster (the old comment claiming
+# manage_cluster=true was wrong — every trial of run 20260711T172407Z died
+# with "Subscriber connection readiness timeout: got 0/4" against a broker
+# that was never started). This script starts a local 4-broker cluster per
+# cell and tears it down after.
 cleanup_kv_cluster() {
     pkill -x kv_ycsb_bench 2>/dev/null || true
     pkill -x embarlet 2>/dev/null || true
@@ -42,6 +44,55 @@ cleanup_kv_cluster() {
     done
 }
 trap cleanup_kv_cluster EXIT
+
+NUM_BROKERS="${NUM_BROKERS:-4}"
+BROKER_READY_TIMEOUT="${BROKER_READY_TIMEOUT:-120}"
+BIN_DIR="$REPO_ROOT/build/bin"
+
+# Start a local cluster for one system (EMBARCADERO | CORFU | LAZYLOG).
+# Head first (heaviest CXL init), then followers; readiness via the
+# /tmp/embarlet_<id>_ready sentinels embarlet writes.
+start_kv_cluster() {
+    local system="$1"
+    cleanup_kv_cluster
+    rm -f /tmp/embarlet_*_ready 2>/dev/null || true
+    (
+        cd "$BIN_DIR" || exit 1
+        export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
+        export EMBARCADERO_CXL_MAP_POPULATE="${EMBARCADERO_CXL_MAP_POPULATE:-0}"
+        export EMBARCADERO_HEAD_ADDR=127.0.0.1
+        export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
+        export EMBARCADERO_REPLICATION_FACTOR=0
+        export EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-1}"
+        case "$system" in
+            CORFU)   ./corfu_global_sequencer   > /tmp/kv_corfu_seq.log 2>&1 & ;;
+            LAZYLOG) ./lazylog_global_sequencer > /tmp/kv_lazylog_seq.log 2>&1 & ;;
+        esac
+        ./embarlet --config "$REPO_ROOT/config/embarcadero.yaml" --head "--$system" \
+            > /tmp/kv_broker_0.log 2>&1 &
+        sleep 2
+        local i
+        for (( i=1; i<NUM_BROKERS; i++ )); do
+            ./embarlet --config "$REPO_ROOT/config/embarcadero.yaml" "--$system" \
+                > /tmp/kv_broker_$i.log 2>&1 &
+            sleep 1
+        done
+    )
+    local deadline=$(( $(date +%s) + BROKER_READY_TIMEOUT )) ready
+    while :; do
+        ready="$(ls /tmp/embarlet_*_ready 2>/dev/null | wc -l)"
+        if [[ "$ready" -ge "$NUM_BROKERS" ]]; then
+            sleep 3   # control-plane propagation
+            return 0
+        fi
+        if [[ "$(date +%s)" -ge "$deadline" ]]; then
+            echo "ERROR: kv cluster not ready ($ready/$NUM_BROKERS) for $system" >&2
+            tail -5 /tmp/kv_broker_0.log >&2 || true
+            return 1
+        fi
+        sleep 1
+    done
+}
 
 # ---- Validate binary ----
 if [[ ! -x "$KV_BENCH" ]]; then
@@ -145,6 +196,17 @@ for system_entry in "${SYSTEMS[@]}"; do
 
             WL_FLAGS="$(workload_flags "$WL")"
 
+            # Fresh local cluster per cell (bounded topic accumulation; clean
+            # CXL state). A cell whose cluster fails to start is skipped, the
+            # sweep continues.
+            if ! start_kv_cluster "$SYSTEM_LABEL"; then
+                echo "  CLUSTER-FAIL $SYSTEM_LABEL workload=$WL dist=$KEY_DIST — skipping cell"
+                failed_cells=$((failed_cells + TRIALS))
+                total_cells=$((total_cells + TRIALS))
+                cleanup_kv_cluster
+                continue
+            fi
+
             for ((trial=1; trial<=TRIALS; trial++)); do
                 total_cells=$((total_cells + 1))
                 log_file="$LOG_DIR/${SYSTEM_LABEL}_${WL}_${KEY_DIST}_trial${trial}.log"
@@ -152,10 +214,8 @@ for system_entry in "${SYSTEMS[@]}"; do
 
                 echo "---- $SYSTEM_LABEL workload=$WL dist=$KEY_DIST trial=$trial/$TRIALS ----"
 
-                # kv_bench manages its own broker cluster (manage_cluster=true internally).
-                # Bound each trial and clean up leaked processes on failure so one
-                # crash cannot poison the rest of the sweep.
-                cleanup_kv_cluster
+                # Bound each trial; on failure restart the cell's cluster so one
+                # crash cannot poison the remaining trials.
                 # shellcheck disable=SC2086
                 if timeout --kill-after=30 "$TRIAL_TIMEOUT_SEC" "$KV_BENCH" \
                         $SYSTEM_FLAGS \
@@ -176,9 +236,15 @@ for system_entry in "${SYSTEMS[@]}"; do
                         echo "  FAIL (exit $rc) — see $log_file"
                     fi
                     failed_cells=$((failed_cells + 1))
-                    cleanup_kv_cluster
+                    # Restart the cluster for the remaining trials of this cell
+                    if ! start_kv_cluster "$SYSTEM_LABEL"; then
+                        echo "  CLUSTER-RESTART-FAIL — abandoning remaining trials of this cell"
+                        cleanup_kv_cluster
+                        break
+                    fi
                 fi
             done
+            cleanup_kv_cluster
         done
     done
 done
