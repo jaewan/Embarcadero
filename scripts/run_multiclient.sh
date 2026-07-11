@@ -1067,8 +1067,15 @@ if [ "$SEQUENCER" = "SCALOG" ]; then export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1
 if [ -n "$CLIENT_LD_LIBRARY_PATH" ]; then export LD_LIBRARY_PATH=$CLIENT_LD_LIBRARY_PATH; fi
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 cd $remote_build_bin
-# Spin-wait until the synchronized barrier millisecond (requires NTP-synced clocks)
-while [ \$(date +%s%3N) -lt $START_TIME_MS ]; do sleep 0.0005; done
+# Spin-wait until the synchronized barrier millisecond (requires NTP-synced clocks).
+# NOTE: use %s%N/1e6, NOT %s%3N — uutils date (c3) does not support %3N and
+# emits nanoseconds, making the comparison always true (client skips the
+# barrier entirely; root cause of months of degenerate N>=2 overlap windows).
+while [ \$(( \$(date +%s%N) / 1000000 )) -lt $START_TIME_MS ]; do sleep 0.0005; done
+__bar_now_ms=\$(( \$(date +%s%N) / 1000000 ))
+if [ \$(( __bar_now_ms - $START_TIME_MS )) -gt 2000 ]; then
+  echo "WARNING: BARRIER MISSED by \$(( __bar_now_ms - $START_TIME_MS )) ms — host clock skewed vs broker; concurrency of this trial is suspect" >&2
+fi
 numactl --cpunodebind=$numa --membind=$numa ./throughput_test --config $CLIENT_CONFIG_ABS -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $LOAD_PER_CLIENT -t $TEST_TYPE -o $ORDER -a $ACK -r $REPLICATION_FACTOR --sequencer $SEQUENCER --head_addr $BROKER_IP -l 0 $CLIENT_EXTRA_ARGS
 ENDINNERSCRIPT
 )"
