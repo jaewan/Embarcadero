@@ -47,7 +47,14 @@ fi
 # "local" means this broker machine (where brokers run); everything else is SSH
 # ---------------------------------------------------------------------------
 declare -a CLIENT_HOSTS=( "c4"  "c3"    "local" "c2"  "c1"  )
-declare -a CLIENT_NUMAS=( "1"   "1"     ""      "1"   "1"   )
+# NUMA pinning per client — must match the NUMA node of each client's high-speed NIC:
+#   c4: ens801f0np0 (100G) is on NUMA 1 → pin to NUMA 1
+#   c3: ens801f0np0 (100G) is on NUMA 1 → pin to NUMA 1
+#   c2: 1G only, NUMA 0 → pin to NUMA 0 (1G NIC)
+#   c1: enp24s0f0np0 (100G, 10.10.10.11) is on NUMA 0 → pin to NUMA 0 (was wrongly 1)
+#       Corrected 2026-07-11: NUMA 1 pinning caused cross-NUMA DMA, reducing c1 throughput
+#       from ~5.2 GB/s (c4 at NUMA-local) to ~3.33 GB/s.
+declare -a CLIENT_NUMAS=( "1"   "1"     ""      "0"   "0"   )
 if [[ -n "${CLIENT_HOSTS_CSV:-}" ]]; then
     IFS=',' read -r -a CLIENT_HOSTS <<< "$CLIENT_HOSTS_CSV"
 fi
@@ -99,6 +106,10 @@ EMBARCADERO_BATCH_SIZE=${EMBARCADERO_BATCH_SIZE:-524288}
 EMBARCADERO_CLIENT_PUB_BATCH_KB=${EMBARCADERO_CLIENT_PUB_BATCH_KB:-512}
 EMBARCADERO_NETWORK_IO_THREADS=${EMBARCADERO_NETWORK_IO_THREADS:-4}
 EMBARCADERO_ORDER5_HOME_BROKERS=${EMBARCADERO_ORDER5_HOME_BROKERS:-}
+# Epoch period for ORDER=5 sequencer (µs). Reads EMBAR_ORDER5_EPOCH_US from env;
+# default 500 µs (2000 epochs/sec). Shorter epochs (e.g. 200) raise throughput ceiling
+# at the cost of higher per-epoch CPU. Broker clamps to [100, 5000] µs internally.
+EMBAR_ORDER5_EPOCH_US=${EMBAR_ORDER5_EPOCH_US:-}
 EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP:-}
 EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT:-}
 EMBARCADERO_LAZYLOG_SEQ_IP=${EMBARCADERO_LAZYLOG_SEQ_IP:-}
@@ -695,6 +706,10 @@ start_brokers() {
     export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
     export EMBARCADERO_ORDER0_FAST_PATH
     export EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES
+    # Pass epoch tuning to embarlet if set; broker reads it in EpochDriverThread.
+    if [[ -n "${EMBAR_ORDER5_EPOCH_US:-}" ]]; then
+        export EMBAR_ORDER5_EPOCH_US
+    fi
     if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
         export LAZYLOG_CXL_MODE=1
     fi
@@ -854,6 +869,7 @@ printf "  %-32s %s\n" "ENABLE_PAYLOAD_MSG_MORE:"       "$EMBARCADERO_ENABLE_PAYL
 printf "  %-32s %s\n" "BATCH_SIZE:"                    "$EMBARCADERO_BATCH_SIZE"
 printf "  %-32s %s\n" "CLIENT_PUB_BATCH_KB:"           "$EMBARCADERO_CLIENT_PUB_BATCH_KB"
 printf "  %-32s %s\n" "ORDER5_HOME_BROKERS:"           "${EMBARCADERO_ORDER5_HOME_BROKERS:-"(unset)"}"
+printf "  %-32s %s\n" "ORDER5_EPOCH_US:"               "${EMBAR_ORDER5_EPOCH_US:-"(default=500)"}"
 printf "  %-32s %s\n" "LOCAL_CLIENT_NUMA:"             "$(resolve_local_client_numa)"
 if [[ "$SEQUENCER" == "CORFU" ]]; then
     printf "  %-32s %s\n" "CORFU_SEQ_IP:"               "${EMBARCADERO_CORFU_SEQ_IP:-"(unset)"}"

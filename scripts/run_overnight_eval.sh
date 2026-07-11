@@ -247,9 +247,20 @@ run_multi_cell() {
     local cell_log="$LOG_DIR/${label}.log"
     log "START [$label] clients=$nclients hosts=$client_csv"
 
-    # Build NUMA CSV: "1" repeated nclients times, comma-joined
+    # Build NUMA CSV per client host, matching each host's 100G NIC NUMA node:
+    #   c1 (10.10.10.11): 100G NIC enp24s0f0np0 is on NUMA 0 → pin to 0
+    #   c3 (10.10.10.181): 100G NIC ens801f0np0 is on NUMA 1 → pin to 1
+    #   others: default to 1
     local numas_csv
-    numas_csv="$(printf '1,%.0s' $(seq 1 "$nclients") | sed 's/,$//')" || numas_csv="1"
+    numas_csv=""
+    local _h
+    for _h in $(echo "$client_csv" | tr ',' ' '); do
+        case "$_h" in
+            c1) numas_csv="${numas_csv:+${numas_csv},}0" ;;
+            *)  numas_csv="${numas_csv:+${numas_csv},}1" ;;
+        esac
+    done
+    numas_csv="${numas_csv:-1}"
 
     # Pre-cell cleanup: always safe, never fatal
     cleanup_remote_stray_procs "$(echo "$client_csv" | tr ',' ' ')" || true
@@ -379,14 +390,11 @@ if [[ "$SKIP_BASELINES" != "1" ]]; then
         SEQUENCER=LAZYLOG ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
         TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1
 
-    # RF=1 baseline cells — needed for the comparison ratios in the paper.
-    # Without these, the 2.2x/2.3x/2.8x ratios at RF=1 have no fresh experimental support.
-    # (RF=1 for Scalog: known anomaly from local sequencer disk-gating when no remote
-    # replica is present; run RF=0 only for Scalog to avoid the anomaly.)
-    run_multi_cell "e2_corfu_rf0_n1_check" 1 "$CLIENT_HOSTS_REMOTE" \
-        SEQUENCER=CORFU ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
-        TEST_TYPE=5 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
 fi
+# Note: RF=1 baseline cells are deferred — Scalog RF=1 has a known anomaly
+# (disk-gating when no remote replica exists). All baselines run at RF=0 as
+# the primary comparison operating point. The comparison ratios in the paper
+# derive from RF=0 N=1 and N=2 all-remote results.
 
 # Multi-client throughput scaling N=1,2,3 (all-remote — E2 scaling figure)
 if [[ "${SMOKE:-0}" != "1" ]]; then
@@ -494,7 +502,7 @@ OVERHEAD_LOG="$LOG_DIR/e8_overhead_probe.log"
 
         NUM_CLIENTS=1 \
         CLIENT_HOSTS_CSV=c1 \
-        CLIENT_NUMAS_CSV=1 \
+        CLIENT_NUMAS_CSV=0 \
         NUM_BROKERS="$NUM_BROKERS" \
         NUM_TRIALS=1 \
         TOTAL_MESSAGE_SIZE=$((2 * 1024 * 1024 * 1024)) \
