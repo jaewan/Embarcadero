@@ -27,7 +27,10 @@ CHECK_ONLY=0
 for arg in "$@"; do [[ "$arg" == "--check" ]] && CHECK_ONLY=1; done
 
 # Client nodes (all must be reachable via passwordless SSH from moscxl)
-CLIENT_NODES=(c1 c2 c3)
+CLIENT_NODES=(c1 c2 c3 c4)
+# c4 now has 100G NIC (ens801f0np0) on NUMA 1 with IP 10.10.10.12 assigned.
+# c4's NIC is on NUMA 1 — same as benchmark pin → no NUMA penalty (ideal client).
+# c4 has its own native build at ~/Embarcadero/build/bin/throughput_test.
 
 # Remote Embarcadero root on client nodes
 REMOTE_ROOT="${REMOTE_PROJECT_ROOT:-$HOME/Embarcadero}"

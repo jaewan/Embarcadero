@@ -60,16 +60,20 @@ cd "$PROJECT_ROOT"
 # Cluster topology
 # ---------------------------------------------------------------------------
 # moscxl is always the broker node. Clients are activated in order by NUM_CLIENTS.
-# run_multiclient.sh's CLIENT_HOSTS roster: c4 c3 local c2 c1
-# We override with c1/c2/c3 only (no local publisher, avoids broker CPU contention):
-# Network topology (verified with iperf3 2025-07-11):
-#   c1: 100G NIC (10.10.10.11), PCIe 3.0 x8 DOWNGRADED → ~5.6 GB/s TCP ceiling
-#   c3: 100G NIC (10.10.10.181), PCIe full            → ~12.4 GB/s TCP ceiling (near wire)
-#   c2: 1G NIC only (192.168.60.144)                   → ~0.16 GB/s  ← NOT for eval
-#   c4: 1G NIC only (192.168.60.182)                   → ~1G          ← NOT for eval
-# Both c1 and c3 are on the 10.10.10.x fabric → single BROKER_IP works for all multi-client.
-CLIENT_HOSTS_REMOTE="${CLIENT_HOSTS_REMOTE:-c1}"    # single remote client (E3/E9/smoke)
-CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c1,c3}"         # two 100G clients for E2 scaling (c2/c4 are 1G only)
+# Network topology (verified 2026-07-11, all on 10.10.10.x fabric):
+#   c4 (10.10.10.12): 100G NIC ens801f0np0, NUMA 1, PCIe full → IDEAL (NUMA-local to NIC)
+#   c3 (10.10.10.181): 100G NIC ens801f0np0, NUMA 1, PCIe full → ~12.4 GB/s TCP
+#   c1 (10.10.10.11): 100G NIC enp24s0f0np0, NUMA 0, PCIe 3.0 x8 downgraded → ~5.6 GB/s TCP
+#   c2 (192.168.60.x): 1G only → excluded from eval
+# All three 100G clients reach broker at 10.10.10.10.
+# Client topology (verified 2026-07-11):
+#   c4 (10.10.10.12): 100G NIC ens801f0np0 on NUMA 1 — IDEAL primary client (no NUMA penalty)
+#   c1 (10.10.10.11): 100G NIC enp24s0f0np0 on NUMA 0 — pinned to NUMA 0 (fixed from NUMA 1)
+#   c3 (10.10.10.181): 100G NIC ens801f0np0 on NUMA 1 — ideal, PCIe full bandwidth ~12.4 GB/s
+#   c2: 1G only — excluded
+# Use c4 as primary single client (NUMA-local, NUMA 1, matches original publication topology)
+CLIENT_HOSTS_REMOTE="${CLIENT_HOSTS_REMOTE:-c4}"    # single remote client — c4 is NUMA-optimal
+CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c4,c1,c3}"     # scaling: c4+c1 for N=2, c4+c1+c3 for N=3
 
 # Single broker IP for all runs — c1 and c3 are both on 10.10.10.x.
 BROKER_IP="${BROKER_IP:-10.10.10.10}"
@@ -248,8 +252,9 @@ run_multi_cell() {
     log "START [$label] clients=$nclients hosts=$client_csv"
 
     # Build NUMA CSV per client host, matching each host's 100G NIC NUMA node:
-    #   c1 (10.10.10.11): 100G NIC enp24s0f0np0 is on NUMA 0 → pin to 0
-    #   c3 (10.10.10.181): 100G NIC ens801f0np0 is on NUMA 1 → pin to 1
+    #   c4 (10.10.10.12): 100G NIC ens801f0np0 on NUMA 1 → pin to 1
+    #   c3 (10.10.10.181): 100G NIC ens801f0np0 on NUMA 1 → pin to 1
+    #   c1 (10.10.10.11): 100G NIC enp24s0f0np0 on NUMA 0 → pin to 0 (corrected 2026-07-11)
     #   others: default to 1
     local numas_csv
     numas_csv=""
