@@ -98,6 +98,22 @@ START_DELAY_SEC=${START_DELAY_SEC:-8}
 MIN_REMOTE_START_DELAY_SEC=${MIN_REMOTE_START_DELAY_SEC:-8}
 QUIET=${QUIET:-0}
 
+# ---------------------------------------------------------------------------
+# Failure injection (E4 suite): timed kill of one broker mid-trial.
+# BROKER_KILL_AFTER_SEC > 0 arms a killer that sends BROKER_KILL_SIGNAL to
+# broker BROKER_KILL_ID at T = client barrier + BROKER_KILL_AFTER_SEC.
+# The kill wall-clock ms is recorded in $LOG_DIR/trial<N>_broker_kill.csv on
+# the same time axis as the client timeseries CSVs (ORIGIN_MS = barrier).
+# ---------------------------------------------------------------------------
+BROKER_KILL_AFTER_SEC=${BROKER_KILL_AFTER_SEC:-0}
+BROKER_KILL_ID=${BROKER_KILL_ID:-1}
+BROKER_KILL_SIGNAL=${BROKER_KILL_SIGNAL:-KILL}
+# Client timeseries sampling interval (ms); client default is 100 if unset.
+EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=${EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS:-}
+# Extra args appended verbatim to the throughput_test command line
+# (e.g. "--target_mbps 500 --steady_rate" for paced failure experiments).
+CLIENT_EXTRA_ARGS=${CLIENT_EXTRA_ARGS:-}
+
 # Performance knobs (set to empty string to disable)
 EMBARCADERO_ORDER0_FAST_PATH=${EMBARCADERO_ORDER0_FAST_PATH:-1}
 EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES=${EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES:-524288}
@@ -759,6 +775,8 @@ start_brokers() {
             sleep "$BROKER_START_STAGGER_SEC"
         fi
     done
+    # Global copy for failure injection (BROKER_KILL_AFTER_SEC) — indexed by broker id.
+    BROKER_PIDS=("${launched_broker_pids[@]}")
 
     log "Waiting for $NUM_BROKERS broker(s) to become ready (timeout: ${BROKER_READY_TIMEOUT_SEC}s)..."
     if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" "$NUM_BROKERS" "${launched_broker_pids[@]}"; then
@@ -978,6 +996,7 @@ export EMBARCADERO_CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB
 export EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS
 export EMBARCADERO_ORDER5_HOME_BROKERS=$EMBARCADERO_ORDER5_HOME_BROKERS
 if [ -n "${EMBARCADERO_ACK_TIMEOUT_SEC:-}" ]; then export EMBARCADERO_ACK_TIMEOUT_SEC=${EMBARCADERO_ACK_TIMEOUT_SEC:-}; fi
+if [ -n "${EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS:-}" ]; then export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=${EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS:-}; fi
 export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$ts_file
 export EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS=$START_TIME_MS
 rm -f $ts_file
@@ -993,7 +1012,7 @@ export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 cd $remote_build_bin
 # Spin-wait until the synchronized barrier millisecond (requires NTP-synced clocks)
 while [ \$(date +%s%3N) -lt $START_TIME_MS ]; do sleep 0.0005; done
-numactl --cpunodebind=$numa --membind=$numa ./throughput_test --config $CLIENT_CONFIG_ABS -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $LOAD_PER_CLIENT -t $TEST_TYPE -o $ORDER -a $ACK -r $REPLICATION_FACTOR --sequencer $SEQUENCER --head_addr $BROKER_IP -l 0
+numactl --cpunodebind=$numa --membind=$numa ./throughput_test --config $CLIENT_CONFIG_ABS -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $LOAD_PER_CLIENT -t $TEST_TYPE -o $ORDER -a $ACK -r $REPLICATION_FACTOR --sequencer $SEQUENCER --head_addr $BROKER_IP -l 0 $CLIENT_EXTRA_ARGS
 ENDINNERSCRIPT
 )"
 
@@ -1007,6 +1026,32 @@ ENDINNERSCRIPT
         done
 
         # ------------------------------------------------------------------
+        # E4 failure injection: arm timed broker kill (BROKER_KILL_AFTER_SEC)
+        # ------------------------------------------------------------------
+        BROKER_KILLER_PID=""
+        if [[ "$BROKER_KILL_AFTER_SEC" -gt 0 ]]; then
+            if [[ "$BROKER_KILL_ID" -lt 0 || "$BROKER_KILL_ID" -ge "$NUM_BROKERS" ]]; then
+                echo "ERROR: BROKER_KILL_ID=$BROKER_KILL_ID out of range for NUM_BROKERS=$NUM_BROKERS" >&2
+                exit 1
+            fi
+            kill_target_pid="${BROKER_PIDS[$BROKER_KILL_ID]}"
+            kill_record="$LOG_DIR/trial${trial}_broker_kill.csv"
+            kill_at_ms=$(( START_TIME_MS + BROKER_KILL_AFTER_SEC * 1000 ))
+            log "  Armed broker kill: broker $BROKER_KILL_ID (pid $kill_target_pid) SIG${BROKER_KILL_SIGNAL} at T+${BROKER_KILL_AFTER_SEC}s"
+            (
+                while [ "$(date +%s%3N)" -lt "$kill_at_ms" ]; do sleep 0.001; done
+                t_kill_ms="$(date +%s%3N)"
+                kill_rc=0
+                kill -"$BROKER_KILL_SIGNAL" "$kill_target_pid" 2>/dev/null || kill_rc=$?
+                {
+                    echo "trial,attempt,broker_id,pid,signal,kill_wall_ms,kill_rel_ms,kill_rc"
+                    echo "$trial,$attempt,$BROKER_KILL_ID,$kill_target_pid,$BROKER_KILL_SIGNAL,$t_kill_ms,$(( t_kill_ms - START_TIME_MS )),$kill_rc"
+                } > "$kill_record"
+            ) &
+            BROKER_KILLER_PID=$!
+        fi
+
+        # ------------------------------------------------------------------
         # Wait for all clients to finish
         # ------------------------------------------------------------------
         log "  Waiting for ${#CLIENT_PIDS[@]} client(s)..."
@@ -1014,6 +1059,13 @@ ENDINNERSCRIPT
         for pid in "${CLIENT_PIDS[@]}"; do
             wait "$pid" || all_ok=0
         done
+
+        # Reap the killer (kill first in case clients exited before T_kill)
+        if [[ -n "$BROKER_KILLER_PID" ]]; then
+            kill "$BROKER_KILLER_PID" 2>/dev/null || true
+            wait "$BROKER_KILLER_PID" 2>/dev/null || true
+            BROKER_KILLER_PID=""
+        fi
 
         # Collect per-client throughput timeseries from client hosts.
         for (( i=0; i<NUM_CLIENTS; i++ )); do

@@ -72,47 +72,78 @@ log "Broker IP: $BROKER_IP  Client: $CLIENT_HOST  Sessions: $NUM_SESSIONS"
 # E4a: broker kill with M concurrent sessions
 # ---------------------------------------------------------------------------
 run_e4a() {
-    log "E4a: broker kill — M=$NUM_SESSIONS concurrent sessions, 4 brokers"
+    log "E4a: broker kill — M=$NUM_SESSIONS concurrent sessions, $NUM_BROKERS brokers"
     local cell_log="$OUT_BASE/logs/e4a_broker_kill.log"
 
-    # Start M publishers on the client, each with their own session
-    # Kill broker 1 after 2s, measure per-session stall
-    # Implementation note: throughput_test supports multiple threads (THREADS_PER_BROKER
-    # controls publisher parallelism; each thread opens its own session).
-    # We launch with THREADS_PER_BROKER=NUM_SESSIONS to get M concurrent sessions.
+    # Sessions are per client PROCESS (one client_id + session_epoch per Publisher
+    # instance — publisher.cc IsOrder5SessionMode / SendSessionOpenOnSocket), NOT
+    # per publisher thread. M independent sessions therefore = NUM_CLIENTS=M
+    # processes, each with its own per-session timeseries CSV on the shared
+    # ORIGIN_MS axis. Load is paced (--target_mbps --steady_rate) so the send
+    # phase is still active at T_kill and the post-kill stall window is visible.
+    #
+    # Kill: broker BROKER_KILL_ID (default 1, non-head) gets SIGKILL at
+    # T = barrier + E4A_KILL_AFTER_SEC via run_multiclient.sh injection.
+    # Kill timestamp lands in multiclient_logs/trial<N>_broker_kill.csv.
+    local hosts="${E4A_CLIENT_HOSTS:-c4,c4,c3,c3}"
+    local numas="${E4A_CLIENT_NUMAS:-1,1,1,1}"
+    local per_session_mbps="${E4A_TARGET_MBPS_PER_SESSION:-500}"
+    local kill_after="${E4A_KILL_AFTER_SEC:-3}"
+    local kill_id="${E4A_KILL_BROKER_ID:-1}"
+    local ts_interval_ms="${E4A_TS_INTERVAL_MS:-10}"
+    # Paced run duration = total/(M*pace). Default 16 GiB → 4 GiB/session →
+    # ~8.6 s at 500 MB/s: kill at T+3 s leaves a >5 s post-kill window.
+    # SMOKE halves it (~4.3 s run, still past T_kill).
+    local total_bytes="${E4A_TOTAL_BYTES:-$(( 16 * 1024 * 1024 * 1024 ))}"
+    if [[ "${SMOKE:-0}" == "1" ]]; then
+        total_bytes="${E4A_TOTAL_BYTES:-$(( 8 * 1024 * 1024 * 1024 ))}"
+    fi
+
+    mkdir -p "$OUT_BASE/e4a"
+    local marker="$OUT_BASE/e4a/.start_marker"
+    touch "$marker"
+
     {
         echo "=== E4a: broker kill with M=$NUM_SESSIONS sessions ==="
-        echo "=== $(stamp): Starting publishers ==="
+        echo "hosts=$hosts numas=$numas pace=${per_session_mbps}MB/s/session kill=broker${kill_id}@T+${kill_after}s ts=${ts_interval_ms}ms"
+        echo "=== $(stamp): Starting cluster + $NUM_SESSIONS publisher sessions ==="
 
-        # Launch 4-broker cluster (reuse run_multiclient harness)
-        NUM_CLIENTS=1 \
-        CLIENT_HOSTS_CSV="$CLIENT_HOST" \
-        CLIENT_NUMAS_CSV=1 \
+        NUM_CLIENTS="$NUM_SESSIONS" \
+        CLIENT_HOSTS_CSV="$hosts" \
+        CLIENT_NUMAS_CSV="$numas" \
         NUM_BROKERS="$NUM_BROKERS" \
         NUM_TRIALS="$NUM_TRIALS" \
-        TOTAL_MESSAGE_SIZE="$TOTAL_BYTES" \
+        TRIAL_MAX_ATTEMPTS=1 \
+        TOTAL_MESSAGE_SIZE="$total_bytes" \
         MESSAGE_SIZE=1024 \
         EMBARCADERO_HEAD_ADDR="$BROKER_IP" \
-        THREADS_PER_BROKER="$NUM_SESSIONS" \
         SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=0 \
         TEST_TYPE=5 \
         EMBARCADERO_CXL_ZERO_MODE=metadata \
         EMBARCADERO_CXL_MAP_POPULATE=0 \
-        BROKER_KILL_AFTER_SEC=3 \
-        BROKER_KILL_ID=1 \
-        OUT_BASE="$OUT_BASE/e4a" \
-        BENCHMARK_TAG="$RUN_TAG/e4a" \
+        EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS="$ts_interval_ms" \
+        CLIENT_EXTRA_ARGS="--target_mbps $per_session_mbps --steady_rate" \
+        BROKER_KILL_AFTER_SEC="$kill_after" \
+        BROKER_KILL_ID="$kill_id" \
+        BROKER_KILL_SIGNAL=KILL \
         bash "$SCRIPT_DIR/run_multiclient.sh"
-        echo "=== $(stamp): E4a complete ==="
+        echo "=== $(stamp): E4a run complete ==="
     } > "$cell_log" 2>&1
-    log "E4a done — see $cell_log"
-    # Note: run_multiclient.sh does not currently support BROKER_KILL_AFTER_SEC.
-    # TODO: implement broker-kill injection inside run_multiclient.sh:
-    #   After START_DELAY_SEC barrier, sleep BROKER_KILL_AFTER_SEC then
-    #   kill launched_broker_pids[BROKER_KILL_ID]. Record kill timestamp.
-    #   The per-session ACK stall is recoverable from the publisher timeseries CSV.
-    log "E4a TODO: BROKER_KILL_AFTER_SEC injection not yet implemented in run_multiclient.sh"
-    log "E4a MANUAL: Kill broker PID manually during a run and record timeseries CSVs."
+    local rc=$?
+
+    # Preserve this run's per-session timeseries + kill records (only files
+    # written after the marker — multiclient_logs is shared across runs)
+    find "$PROJECT_ROOT/multiclient_logs" -maxdepth 1 -type f -newer "$marker" \
+        -exec cp -f {} "$OUT_BASE/e4a/" \; 2>/dev/null || true
+
+    # Per-session stall CDF
+    if python3 "$SCRIPT_DIR/analyze_e4a_stall.py" "$OUT_BASE/e4a" \
+        --output "$OUT_BASE/e4a/stall_summary.csv" >> "$cell_log" 2>&1; then
+        log "E4a stall analysis written to $OUT_BASE/e4a/stall_summary.csv"
+    else
+        log "E4a WARNING: stall analysis failed — inspect $cell_log"
+    fi
+    log "E4a done (rc=$rc) — see $cell_log"
 }
 
 # ---------------------------------------------------------------------------
@@ -210,6 +241,7 @@ log ""
 log "===== Failure suite COMPLETE — $RUN_TAG ====="
 log "Results: $OUT_BASE"
 log ""
-log "NOTE: E4a and E4b require manual broker-kill injection."
-log "The automated kill injection is not yet implemented in run_multiclient.sh."
-log "Run E4a/E4b manually following the procedures in the cell logs."
+log "NOTE: E4a is fully automated (BROKER_KILL_AFTER_SEC injection in"
+log "run_multiclient.sh + analyze_e4a_stall.py). E4b/E4f still document"
+log "manual procedures — automate them next (E4b = E4a with BROKER_KILL_ID=0"
+log "plus MTTR extraction from broker logs)."
