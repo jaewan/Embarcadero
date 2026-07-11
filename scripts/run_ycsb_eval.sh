@@ -10,12 +10,38 @@
 #   VALUE_SIZE       — bytes per value (default: 100)
 #   REPO_ROOT        — repo root (default: parent of scripts/)
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 # CMake target is kv_ycsb_bench; binary lands at build/bin/kv_ycsb_bench
 KV_BENCH="$REPO_ROOT/build/bin/kv_ycsb_bench"
+
+# Per-trial wall-clock bound. kv_ycsb_bench manages its own broker cluster;
+# a hung trial would otherwise wedge the whole sweep.
+TRIAL_TIMEOUT_SEC="${TRIAL_TIMEOUT_SEC:-1200}"
+
+# kv_ycsb_bench spawns embarlet + sequencer processes itself. If a trial
+# crashes or times out they leak and poison the next cell (stale CXL shm →
+# SIGBUS-class startup failures). Clean between trials, never fatal.
+cleanup_kv_cluster() {
+    pkill -x kv_ycsb_bench 2>/dev/null || true
+    pkill -x embarlet 2>/dev/null || true
+    pkill -x corfu_global_sequencer 2>/dev/null || true
+    pkill -x lazylog_global_sequencer 2>/dev/null || true
+    pkill -x scalog_global_sequencer 2>/dev/null || true
+    sleep 0.3
+    pkill -9 -x embarlet 2>/dev/null || true
+    rm -f /dev/shm/CXL_SHARED_FILE* /tmp/embarlet_*_ready 2>/dev/null || true
+    # Bounded wait for hugepage reservations of dying brokers to drain
+    local deadline=$(( $(date +%s) + 15 )) rsvd
+    while :; do
+        rsvd="$(awk '/HugePages_Rsvd:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+        [[ "$rsvd" -eq 0 || "$(date +%s)" -ge "$deadline" ]] && break
+        sleep 0.5
+    done
+}
+trap cleanup_kv_cluster EXIT
 
 # ---- Validate binary ----
 if [[ ! -x "$KV_BENCH" ]]; then
@@ -126,9 +152,12 @@ for system_entry in "${SYSTEMS[@]}"; do
 
                 echo "---- $SYSTEM_LABEL workload=$WL dist=$KEY_DIST trial=$trial/$TRIALS ----"
 
-                # kv_bench manages its own broker cluster (manage_cluster=true internally)
+                # kv_bench manages its own broker cluster (manage_cluster=true internally).
+                # Bound each trial and clean up leaked processes on failure so one
+                # crash cannot poison the rest of the sweep.
+                cleanup_kv_cluster
                 # shellcheck disable=SC2086
-                if "$KV_BENCH" \
+                if timeout --kill-after=30 "$TRIAL_TIMEOUT_SEC" "$KV_BENCH" \
                         $SYSTEM_FLAGS \
                         $WL_FLAGS \
                         --key_dist "$KEY_DIST" \
@@ -140,8 +169,14 @@ for system_entry in "${SYSTEMS[@]}"; do
                         >"$log_file" 2>&1; then
                     echo "  OK  -> $cell_dir/$run_id/summary.csv"
                 else
-                    echo "  FAIL (exit $?) — see $log_file"
+                    rc=$?
+                    if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+                        echo "  TIMEOUT after ${TRIAL_TIMEOUT_SEC}s — see $log_file"
+                    else
+                        echo "  FAIL (exit $rc) — see $log_file"
+                    fi
                     failed_cells=$((failed_cells + 1))
+                    cleanup_kv_cluster
                 fi
             done
         done

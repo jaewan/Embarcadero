@@ -65,9 +65,20 @@ fi
 
 NUM_BROKERS="${NUM_BROKERS:-4}"
 BROKER_IP="${BROKER_IP:-10.10.10.10}"
-CLIENT_HOST="${CLIENT_HOST:-c1}"
+# c4 is the NUMA-local x16 client (c1 is x8-downgraded and its NIC is on NUMA 0)
+CLIENT_HOST="${CLIENT_HOST:-c4}"
+case "$CLIENT_HOST" in
+    c1) CLIENT_NUMA="${CLIENT_NUMA:-0}" ;;
+    *)  CLIENT_NUMA="${CLIENT_NUMA:-1}" ;;
+esac
 MSG_SIZE="${MSG_SIZE:-1024}"
-PROBE_CPU="${PROBE_CPU:-0}"
+# Sequencer CPU is the point of E10 — probe by default.
+PROBE_CPU="${PROBE_CPU:-1}"
+# Wall-clock bound per cell so one wedge can't stall the sweep.
+CELL_TIMEOUT_SEC="${CELL_TIMEOUT_SEC:-1500}"
+# CORFU comparison cells (honest sequencer baseline): sweep THREADS_LIST at
+# the same load with the batched CXL-Corfu sequencer, probing its CPU.
+RUN_CORFU_BASELINE="${RUN_CORFU_BASELINE:-1}"
 
 REMOTE_EMBAR_ROOT="${REMOTE_EMBAR_ROOT:-$HOME/Embarcadero}"
 export CLIENT_LD_LIBRARY_PATH="$REMOTE_EMBAR_ROOT/lib"
@@ -78,7 +89,7 @@ LOG_DIR="$OUT_BASE/logs"
 mkdir -p "$LOG_DIR"
 
 SUMMARY_CSV="$OUT_BASE/ablation_summary.csv"
-echo "epoch_us,threads_per_broker,trial,overlap_gbps,overlap_window_ms,cell_label" > "$SUMMARY_CSV"
+echo "sequencer,epoch_us,threads_per_broker,trial,overlap_gbps,overlap_window_ms,cell_label" > "$SUMMARY_CSV"
 
 SUMMARY_LOG="$OUT_BASE/sweep_summary.log"
 touch "$SUMMARY_LOG"
@@ -94,11 +105,48 @@ cleanup_remote() {
         'pkill -x throughput_test 2>/dev/null; true' 2>/dev/null || true
 }
 
+cleanup_local() {
+    # run_multiclient.sh normally cleans up via its EXIT trap, but a timeout
+    # SIGKILL skips the trap — reap brokers/sequencers here so a crashed cell
+    # cannot poison the next one (stale CXL shm / held hugepage reservations).
+    pkill -x embarlet 2>/dev/null || true
+    pkill -x corfu_global_sequencer 2>/dev/null || true
+    pkill -x lazylog_global_sequencer 2>/dev/null || true
+    pkill -x scalog_global_sequencer 2>/dev/null || true
+    sleep 0.3
+    pkill -9 -x embarlet 2>/dev/null || true
+    rm -f /dev/shm/CXL_SHARED_FILE* /tmp/embarlet_*_ready 2>/dev/null || true
+}
+
 cleanup_shm() {
     local shm_name="${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}"
     rm -f "/dev/shm${shm_name}" 2>/dev/null || true
     ssh -o BatchMode=yes "$CLIENT_HOST" \
         "rm -f /dev/shm${shm_name} 2>/dev/null; true" 2>/dev/null || true
+}
+
+# Live CPU probe: the old post-hoc pidstat ran after run_multiclient returned,
+# when the brokers were already dead — it silently measured nothing. This
+# variant runs CONCURRENTLY with the cell: waits for the target processes to
+# appear, then samples embarlet (head = Sequencer5 thread) and, for CORFU,
+# corfu_global_sequencer, for up to 60 x 1 s.
+start_cpu_probe() {
+    local cpu_log="$1"
+    (
+        local waited=0 head_pid seq_pid
+        while [[ $waited -lt 90 ]]; do
+            head_pid="$(pgrep -x embarlet 2>/dev/null | head -1 || true)"
+            [[ -n "$head_pid" ]] && break
+            sleep 1; waited=$((waited + 1))
+        done
+        [[ -z "${head_pid:-}" ]] && exit 0
+        seq_pid="$(pgrep -x corfu_global_sequencer 2>/dev/null | head -1 || true)"
+        {
+            echo "# embarlet(head)=$head_pid corfu_seq=${seq_pid:-none}"
+            pidstat -t -p "$head_pid${seq_pid:+,$seq_pid}" 1 60 2>&1
+        } > "$cpu_log"
+    ) &
+    echo $!
 }
 
 # ---------------------------------------------------------------------------
@@ -123,32 +171,51 @@ fi
 # Cell runner
 # ---------------------------------------------------------------------------
 run_ablation_cell() {
-    local epoch_us="$1"
-    local threads="$2"
-    local label="e10_epoch${epoch_us}_t${threads}"
+    local sequencer="$1"    # EMBARCADERO | CORFU
+    local epoch_us="$2"     # "-" for CORFU (no epoch knob)
+    local threads="$3"
+    local label
+    if [[ "$sequencer" == "EMBARCADERO" ]]; then
+        label="e10_epoch${epoch_us}_t${threads}"
+    else
+        label="e10_corfu_t${threads}"
+    fi
     local cell_log="$LOG_DIR/${label}.log"
 
-    log "START cell [$label]: epoch_us=$epoch_us threads/broker=$threads"
+    log "START cell [$label]: sequencer=$sequencer epoch_us=$epoch_us threads/broker=$threads"
     cleanup_remote || true
+    cleanup_local || true
     cleanup_shm || true
 
     local cell_out="$OUT_BASE/cells/${label}"
     mkdir -p "$cell_out"
 
+    # Sequencer-specific env
+    local -a seq_env=()
+    if [[ "$sequencer" == "EMBARCADERO" ]]; then
+        seq_env=( SEQUENCER=EMBARCADERO ORDER=5 EMBAR_ORDER5_EPOCH_US="$epoch_us" )
+    else
+        seq_env=( SEQUENCER=CORFU ORDER=2 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP" )
+    fi
+
+    # Live sequencer/broker CPU probe, concurrent with the cell
+    local probe_pid=""
+    if [[ "$PROBE_CPU" == "1" ]] && command -v pidstat &>/dev/null; then
+        probe_pid="$(start_cpu_probe "$LOG_DIR/${label}_cpu.log")"
+    fi
+
     local rc=0
     {
-        EMBAR_ORDER5_EPOCH_US="$epoch_us" \
+        env "${seq_env[@]}" \
         THREADS_PER_BROKER="$threads" \
         NUM_CLIENTS=1 \
         CLIENT_HOSTS_CSV="$CLIENT_HOST" \
-        CLIENT_NUMAS_CSV=1 \
+        CLIENT_NUMAS_CSV="$CLIENT_NUMA" \
         NUM_BROKERS="$NUM_BROKERS" \
         NUM_TRIALS="$NUM_TRIALS" \
         WARMUP_TRIALS="$WARMUP_TRIALS" \
         TOTAL_MESSAGE_SIZE="$TOTAL_BYTES" \
         MESSAGE_SIZE="$MSG_SIZE" \
-        SEQUENCER=EMBARCADERO \
-        ORDER=5 \
         ACK=1 \
         REPLICATION_FACTOR=0 \
         TEST_TYPE=5 \
@@ -157,35 +224,38 @@ run_ablation_cell() {
         CLIENT_LD_LIBRARY_PATH="$CLIENT_LD_LIBRARY_PATH" \
         OUT_BASE="$cell_out" \
         BENCHMARK_TAG="$RUN_TAG/$label" \
+            timeout --kill-after=30 "$CELL_TIMEOUT_SEC" \
             bash "$SCRIPT_DIR/run_multiclient.sh"
     } >"$cell_log" 2>&1 || rc=$?
 
+    if [[ -n "$probe_pid" ]]; then
+        kill "$probe_pid" 2>/dev/null || true
+        wait "$probe_pid" 2>/dev/null || true
+    fi
+
     if [[ "$rc" -eq 0 ]]; then
         log "PASS [$label]"
+    elif [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+        log "TIMEOUT [$label] after ${CELL_TIMEOUT_SEC}s — see $cell_log"
     else
         log "FAIL [$label] — see $cell_log"
     fi
 
-    # Optional: sample CPU usage during the run (requires pidstat / sysstat)
-    if [[ "${PROBE_CPU:-0}" == "1" ]] && command -v pidstat &>/dev/null; then
-        local cpu_log="$LOG_DIR/${label}_cpu.log"
-        local embar_pid
-        embar_pid="$(pgrep -x embarlet 2>/dev/null | head -1 || true)"
-        if [[ -n "$embar_pid" ]]; then
-            pidstat -t -p "$embar_pid" 1 10 >"$cpu_log" 2>&1 || true
-        fi
-    fi
-
     # Extract overlap GB/s rows from the cell's overlap_summary.csv and append to master CSV
     local overlap_csv="$cell_out/multiclient/overlap_summary.csv"
+    if [[ ! -f "$overlap_csv" ]]; then
+        # run_multiclient.sh writes overlap_summary.csv into its LOG_DIR
+        overlap_csv="$PROJECT_ROOT/multiclient_logs/overlap_summary.csv"
+    fi
     if [[ -f "$overlap_csv" ]]; then
-        # Skip header row; emit: epoch_us, threads, trial, overlap_gbps, window_ms, label
-        awk -F',' -v eu="$epoch_us" -v th="$threads" -v lbl="$label" \
-            'NR>1 && NF>=3 { printf "%s,%s,%s,%s,%s,%s\n", eu, th, $1, $2, $3, lbl }' \
+        # Skip header row; emit: sequencer, epoch_us, threads, trial, overlap_gbps, window_ms, label
+        awk -F',' -v sq="$sequencer" -v eu="$epoch_us" -v th="$threads" -v lbl="$label" \
+            'NR>1 && NF>=3 { printf "%s,%s,%s,%s,%s,%s,%s\n", sq, eu, th, $1, $2, $3, lbl }' \
             "$overlap_csv" >> "$SUMMARY_CSV" || true
     fi
 
     cleanup_remote || true
+    cleanup_local || true
     cleanup_shm || true
     return 0   # never propagate failure — sweep must continue
 }
@@ -199,17 +269,33 @@ for epoch_us in $EPOCH_US_LIST; do
         total_cells=$(( total_cells + 1 ))
     done
 done
+if [[ "$RUN_CORFU_BASELINE" == "1" ]]; then
+    for threads in $THREADS_LIST; do
+        total_cells=$(( total_cells + 1 ))
+    done
+fi
 
 cell_num=0
 for epoch_us in $EPOCH_US_LIST; do
     for threads in $THREADS_LIST; do
         cell_num=$(( cell_num + 1 ))
-        log "--- Cell $cell_num / $total_cells: epoch_us=$epoch_us threads=$threads ---"
-        run_ablation_cell "$epoch_us" "$threads"
+        log "--- Cell $cell_num / $total_cells: EMBARCADERO epoch_us=$epoch_us threads=$threads ---"
+        run_ablation_cell EMBARCADERO "$epoch_us" "$threads"
         # Brief inter-cell pause for port drain + CXL region cleanup
         sleep 3
     done
 done
+
+# Honest sequencer baseline: batched CXL-Corfu at the same load points,
+# with sequencer-process CPU probed live (E10 v2 per improvement_plan IV).
+if [[ "$RUN_CORFU_BASELINE" == "1" ]]; then
+    for threads in $THREADS_LIST; do
+        cell_num=$(( cell_num + 1 ))
+        log "--- Cell $cell_num / $total_cells: CORFU threads=$threads ---"
+        run_ablation_cell CORFU "-" "$threads"
+        sleep 3
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # Summary table
@@ -228,22 +314,21 @@ if [[ -s "$SUMMARY_CSV" ]]; then
     # Print header + all data rows
     cat "$SUMMARY_CSV"
     echo ""
-    echo "Column order: epoch_us, threads_per_broker, trial, overlap_gbps, overlap_window_ms, cell_label"
+    echo "Column order: sequencer, epoch_us, threads_per_broker, trial, overlap_gbps, overlap_window_ms, cell_label"
     echo ""
-    # Quick matrix view: for each (epoch_us, threads), print max overlap_gbps
+    # Quick matrix view: for each (sequencer, epoch_us, threads), print max overlap_gbps
     echo "--- Peak OVERLAP GB/s per cell (max trial) ---"
     awk -F',' '
         NR==1 { next }
         {
-            key = $1 "," $2
-            val = $4 + 0
+            key = $1 " epoch=" $2 " threads=" $3
+            val = $5 + 0
             if (val > best[key]) best[key] = val
         }
         END {
-            for (k in best) printf "  epoch_us=%-5s threads=%-3s → %.3f GB/s\n", \
-                substr(k,1,index(k,",")-1), substr(k,index(k,",")+1), best[k]
+            for (k in best) printf "  %-40s → %.3f GB/s\n", k, best[k]
         }
-    ' "$SUMMARY_CSV" | sort -t= -k2 -n -k4 -n
+    ' "$SUMMARY_CSV" | sort
 fi
 echo "================================================================"
 echo ""
