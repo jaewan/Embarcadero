@@ -59,7 +59,10 @@ else
     THREADS_LIST="${THREADS_LIST:-3 6 8 12}"
     NUM_TRIALS="${NUM_TRIALS:-2}"
     WARMUP_TRIALS="${WARMUP_TRIALS:-0}"
-    TOTAL_BYTES="${TOTAL_BYTES:-$((1024 * 1024 * 1024))}"  # 1 GiB per cell
+    # 4 GiB: at the ~6 GB/s epoch=100 operating point a 1 GiB send lasts
+    # <300 ms — under the 500 ms overlap-window floor, so overlap extraction
+    # produced nothing (run 20260711T181503Z). 4 GiB keeps windows >600 ms.
+    TOTAL_BYTES="${TOTAL_BYTES:-$((4 * 1024 * 1024 * 1024))}"
     echo "[ablation] FULL sweep: epoch_us={$EPOCH_US_LIST} threads={$THREADS_LIST} ${NUM_TRIALS} trials/cell"
 fi
 
@@ -74,6 +77,12 @@ esac
 MSG_SIZE="${MSG_SIZE:-1024}"
 # Sequencer CPU is the point of E10 — probe by default.
 PROBE_CPU="${PROBE_CPU:-1}"
+# Broker ReqReceive pool must cover the largest THREADS_LIST value: each
+# handler thread binds to one publish connection for its lifetime, and the
+# yaml default (6) starves threads>=8 cells into SessionOpen timeouts
+# (e10_epoch100_t8 wedged then timed out, run 20260711T181503Z). Env wins
+# over yaml (configuration.h get() checks env first).
+export EMBARCADERO_NETWORK_IO_THREADS="${EMBARCADERO_NETWORK_IO_THREADS:-32}"
 # Wall-clock bound per cell so one wedge can't stall the sweep.
 CELL_TIMEOUT_SEC="${CELL_TIMEOUT_SEC:-1500}"
 # CORFU comparison cells (honest sequencer baseline): sweep THREADS_LIST at
