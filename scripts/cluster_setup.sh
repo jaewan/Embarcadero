@@ -130,24 +130,46 @@ for host in "${CLIENT_NODES[@]}"; do
     fi
 
     # Verify binary is runnable (with LD_LIBRARY_PATH pointing to the synced libs)
+    # Verify by actually EXECUTING the binary under the harness env
+    # (CLIENT_LD_LIBRARY_PATH=$REMOTE_ROOT/lib). ldd alone is insufficient:
+    # a synced broker lib can shadow a compatible system lib by soname and
+    # fail only at load with a GLIBC/GLIBCXX version error (seen on c4 with
+    # libgflags.so.2.2, run 20260711T040115Z). A bad-option invocation that
+    # reaches the cxxopts error proves loader + all libs + C++ runtime work.
     client_lib="$REMOTE_ROOT/lib"
-    if ssh -o BatchMode=yes "$host" \
-        "test -x $REMOTE_ROOT/build/bin/throughput_test && \
-         LD_LIBRARY_PATH=$client_lib ldd $REMOTE_ROOT/build/bin/throughput_test 2>/dev/null | grep -v 'not found' > /dev/null && \
-         echo ok" 2>/dev/null | grep -q ok; then
-        info "  $host: throughput_test OK (binary + libs verified)"
-    elif ssh -o BatchMode=yes "$host" "test -x $REMOTE_ROOT/build/bin/throughput_test"; then
-        # Binary present but ldd failed — try running it
-        missing=$(ssh -o BatchMode=yes "$host" \
-            "LD_LIBRARY_PATH=$client_lib ldd $REMOTE_ROOT/build/bin/throughput_test 2>/dev/null | grep 'not found'" || true)
-        if [[ -z "$missing" ]]; then
-            info "  $host: throughput_test OK"
-        else
-            warn "  $host: throughput_test has missing libs: $missing"
-            warn "        Client may need native build: ssh $host 'cd ~/Embarcadero && cmake --build build -j --target throughput_test'"
-        fi
-    else
+    verify_client_binary_runs() {
+        ssh -o BatchMode=yes "$1" \
+            "cd $REMOTE_ROOT/build/bin && LD_LIBRARY_PATH=$client_lib \
+             ./throughput_test --cluster_setup_verify_bad_option 2>&1 | head -3" 2>/dev/null \
+            | grep -q "no_such_option\|does not exist"
+    }
+    if ! ssh -o BatchMode=yes "$host" "test -x $REMOTE_ROOT/build/bin/throughput_test"; then
         die "$host: throughput_test missing after sync"
+    fi
+    if verify_client_binary_runs "$host"; then
+        info "  $host: throughput_test OK (executed under harness env)"
+    else
+        # Loader failure — usually a synced broker lib shadowing a compatible
+        # system lib. Remediate: for each synced lib that the host also has as
+        # a system lib, prefer the host's copy; keep synced libs with no
+        # system equivalent (e.g. libglog.so.1 on c3). Then re-verify.
+        warn "  $host: binary failed to run under harness env — trying system-lib fallback"
+        ssh -o BatchMode=yes "$host" '
+            for so in '"$client_lib"'/*.so*; do
+                [ -f "$so" ] || continue
+                name=$(basename "$so")
+                for sysdir in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/local/lib; do
+                    if [ -f "$sysdir/$name" ]; then
+                        cp -f "$sysdir/$name" "$so" && echo "  replaced $name with $sysdir copy"
+                        break
+                    fi
+                done
+            done' 2>/dev/null || true
+        if verify_client_binary_runs "$host"; then
+            info "  $host: throughput_test OK after system-lib fallback"
+        else
+            die "$host: throughput_test cannot run under harness env — fix before launching (try native build or check GLIBC versions)"
+        fi
     fi
 done
 info "Binary sync complete"
@@ -209,8 +231,8 @@ if [[ -f /proc/meminfo ]]; then
     # Minimum for overnight run with THREADS_THROUGHPUT=6:
     #   precreate: 6 threads × 4 brokers × 1024 slots × 512KB = 12 GB = 6144 hugepages
     #   safe minimum with headroom: 6500 hugepages (13 GB)
-    local MIN_HUGEPAGES_NEEDED=6500
-    local min_huge_mb=$(( MIN_HUGEPAGES_NEEDED * huge_size_kb / 1024 ))
+    MIN_HUGEPAGES_NEEDED=6500
+    min_huge_mb=$(( MIN_HUGEPAGES_NEEDED * huge_size_kb / 1024 ))
     if [[ "$huge_free_mb" -lt "$min_huge_mb" ]]; then
         warn "  Low hugepages: ${huge_free_mb}MB free < ${min_huge_mb}MB needed for THREADS_THROUGHPUT=6"
         info "  Auto-allocating ${MIN_HUGEPAGES_NEEDED} hugepages via sudo sysctl..."
