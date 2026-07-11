@@ -295,13 +295,39 @@ log() { [ "$QUIET" != "1" ] && echo "$*"; }
 START_BROKERS_FAILURE_REASON=""
 
 print_local_resource_snapshot() {
-    local mem_available_kb huge_free page_kb huge_free_mb shm_avail_kb
+    local mem_available_kb huge_free huge_rsvd huge_surp page_kb huge_free_mb shm_avail_kb
     mem_available_kb="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
     huge_free="$(awk '/HugePages_Free:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    huge_rsvd="$(awk '/HugePages_Rsvd:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    huge_surp="$(awk '/HugePages_Surp:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
     page_kb="$(awk '/Hugepagesize:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
     shm_avail_kb="$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
     huge_free_mb=$(( huge_free * page_kb / 1024 ))
-    log "Resource snapshot: MemAvailable=$(( mem_available_kb / 1024 ))MB HugePagesFree=${huge_free} (${huge_free_mb}MB) /dev/shm_avail=$(( shm_avail_kb / 1024 ))MB"
+    log "Resource snapshot: MemAvailable=$(( mem_available_kb / 1024 ))MB HugePagesFree=${huge_free} (${huge_free_mb}MB) HugePagesRsvd=${huge_rsvd} HugePagesSurp=${huge_surp} /dev/shm_avail=$(( shm_avail_kb / 1024 ))MB"
+}
+
+# Wait for hugepage reservations held by dying/crashed brokers to drain.
+# HugePages_Free stays high while a torn-down mapping still holds Rsvd pages;
+# launching a new broker in that window can SIGBUS at first touch (observed
+# in e2_embar5_rf0_n1 trial 2, run 20260711T003924Z: SIGBUS @CXL mmap offset
+# 0x2000 with a "full" pool). Bounded wait, warning on timeout, never fatal.
+wait_for_hugepage_reservations_released() {
+    [[ "${EMBAR_USE_HUGETLB:-1}" == "1" ]] || return 0
+    local timeout_sec="${HUGEPAGE_SETTLE_TIMEOUT_SEC:-15}"
+    local deadline=$(( $(date +%s) + timeout_sec ))
+    local rsvd
+    while :; do
+        rsvd="$(awk '/HugePages_Rsvd:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+        if [[ "$rsvd" -eq 0 ]]; then
+            return 0
+        fi
+        if [[ "$(date +%s)" -ge "$deadline" ]]; then
+            break
+        fi
+        sleep 0.5
+    done
+    echo "WARNING: HugePages_Rsvd=${rsvd} still held after ${timeout_sec}s settle — broker may SIGBUS at first touch" >&2
+    return 0
 }
 
 preflight_local_broker_resources() {
@@ -317,6 +343,7 @@ preflight_local_broker_resources() {
     if [[ "${EMBAR_USE_HUGETLB:-1}" == "1" && "$huge_free_mb" -lt 8192 ]]; then
         echo "WARNING: low free hugepages before broker start: ${huge_free_mb}MB" >&2
     fi
+    wait_for_hugepage_reservations_released
     return 0
 }
 
