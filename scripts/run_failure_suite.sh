@@ -25,14 +25,20 @@
 #   - Expected: Scalog stalls for cut cadence; Corfu stalls for reconfiguration MTTR
 #
 # Usage:
-#   bash scripts/run_failure_suite.sh            # full suite
+#   bash scripts/run_failure_suite.sh            # full suite (E4a, E4b, E4f)
 #   SUITE=E4a bash scripts/run_failure_suite.sh  # single experiment
-#   SMOKE=1 bash scripts/run_failure_suite.sh    # quick sanity (1 trial, 2 GiB)
+#   SMOKE=1 bash scripts/run_failure_suite.sh    # quick sanity (1 trial, 8 GiB)
+#
+# Each cell launches its own cluster via run_multiclient.sh with timed
+# broker-kill injection (BROKER_KILL_AFTER_SEC) and runs the per-session
+# stall analyzer. Knobs: E4_CLIENT_HOSTS, E4_CLIENT_NUMAS,
+# E4_TARGET_MBPS_PER_SESSION, E4_KILL_AFTER_SEC, E4_TS_INTERVAL_MS,
+# E4_TOTAL_BYTES, E4A_KILL_BROKER_ID, E4F_KILL_BROKER_ID.
 #
 # Prerequisites:
-#   - Brokers running on moscxl (broker node), publishers on remote clients
-#   - BROKER_IP=10.10.10.10 set to the CXL server dataplane IP
-#   - 4 brokers + sequencer started via run_multiclient.sh or manually
+#   - Run from moscxl (broker node); clients reachable over SSH (c4/c3/c1)
+#   - BROKER_IP=10.10.10.10 (CXL server dataplane IP)
+#   - No other run holding /tmp/embarcadero_run_multiclient.lock
 
 set -uo pipefail
 
@@ -47,14 +53,13 @@ NUM_SESSIONS="${NUM_SESSIONS:-4}"
 SUITE="${SUITE:-all}"
 
 if [[ "${SMOKE:-0}" == "1" ]]; then
-    TOTAL_BYTES=$((2 * 1024 * 1024 * 1024))
     NUM_TRIALS=1
     echo "[failure_suite] SMOKE mode"
 else
-    TOTAL_BYTES=$((8 * 1024 * 1024 * 1024))
     NUM_TRIALS=3
     echo "[failure_suite] FULL mode"
 fi
+# Per-cell data volume is set inside run_kill_cell (E4_TOTAL_BYTES; SMOKE-aware)
 
 RUN_TAG="${RUN_TAG:-$(date -u +%Y%m%dT%H%M%SZ)_failure}"
 OUT_BASE="$PROJECT_ROOT/data/failure_suite/$RUN_TAG"
@@ -69,45 +74,54 @@ log "===== Failure suite START — $RUN_TAG ====="
 log "Broker IP: $BROKER_IP  Client: $CLIENT_HOST  Sessions: $NUM_SESSIONS"
 
 # ---------------------------------------------------------------------------
-# E4a: broker kill with M concurrent sessions
+# Shared kill-cell runner
+#
+# Sessions are per client PROCESS (one client_id + session_epoch per Publisher
+# instance — publisher.cc IsOrder5SessionMode / SendSessionOpenOnSocket), NOT
+# per publisher thread. M independent sessions therefore = NUM_CLIENTS=M
+# processes, each with its own per-session timeseries CSV on the shared
+# ORIGIN_MS axis. Load is paced (--target_mbps --steady_rate) so the send
+# phase is still active at T_kill and the post-kill stall window is visible.
+#
+# Kill: broker $kill_id gets SIGKILL at T = barrier + E4_KILL_AFTER_SEC via
+# run_multiclient.sh injection; kill wall/rel timestamps land in
+# multiclient_logs/trial<N>_broker_kill.csv on the timeseries axis.
+#
+# Usage: run_kill_cell <label> <kill_broker_id> [extra ENV=VAL ...]
+# Extra env pairs are appended last, so they can override the defaults
+# (e.g. SEQUENCER=SCALOG ORDER=1 for baseline cells).
 # ---------------------------------------------------------------------------
-run_e4a() {
-    log "E4a: broker kill — M=$NUM_SESSIONS concurrent sessions, $NUM_BROKERS brokers"
-    local cell_log="$OUT_BASE/logs/e4a_broker_kill.log"
+run_kill_cell() {
+    local label="$1" kill_id="$2"
+    shift 2
+    local cell_log="$OUT_BASE/logs/${label}.log"
+    local cell_dir="$OUT_BASE/$label"
 
-    # Sessions are per client PROCESS (one client_id + session_epoch per Publisher
-    # instance — publisher.cc IsOrder5SessionMode / SendSessionOpenOnSocket), NOT
-    # per publisher thread. M independent sessions therefore = NUM_CLIENTS=M
-    # processes, each with its own per-session timeseries CSV on the shared
-    # ORIGIN_MS axis. Load is paced (--target_mbps --steady_rate) so the send
-    # phase is still active at T_kill and the post-kill stall window is visible.
-    #
-    # Kill: broker BROKER_KILL_ID (default 1, non-head) gets SIGKILL at
-    # T = barrier + E4A_KILL_AFTER_SEC via run_multiclient.sh injection.
-    # Kill timestamp lands in multiclient_logs/trial<N>_broker_kill.csv.
-    local hosts="${E4A_CLIENT_HOSTS:-c4,c4,c3,c3}"
-    local numas="${E4A_CLIENT_NUMAS:-1,1,1,1}"
-    local per_session_mbps="${E4A_TARGET_MBPS_PER_SESSION:-500}"
-    local kill_after="${E4A_KILL_AFTER_SEC:-3}"
-    local kill_id="${E4A_KILL_BROKER_ID:-1}"
-    local ts_interval_ms="${E4A_TS_INTERVAL_MS:-10}"
+    local hosts="${E4_CLIENT_HOSTS:-c4,c4,c3,c3}"
+    local numas="${E4_CLIENT_NUMAS:-1,1,1,1}"
+    local per_session_mbps="${E4_TARGET_MBPS_PER_SESSION:-500}"
+    local kill_after="${E4_KILL_AFTER_SEC:-3}"
+    local ts_interval_ms="${E4_TS_INTERVAL_MS:-10}"
     # Paced run duration = total/(M*pace). Default 16 GiB → 4 GiB/session →
     # ~8.6 s at 500 MB/s: kill at T+3 s leaves a >5 s post-kill window.
     # SMOKE halves it (~4.3 s run, still past T_kill).
-    local total_bytes="${E4A_TOTAL_BYTES:-$(( 16 * 1024 * 1024 * 1024 ))}"
+    local total_bytes="${E4_TOTAL_BYTES:-$(( 16 * 1024 * 1024 * 1024 ))}"
     if [[ "${SMOKE:-0}" == "1" ]]; then
-        total_bytes="${E4A_TOTAL_BYTES:-$(( 8 * 1024 * 1024 * 1024 ))}"
+        total_bytes="${E4_TOTAL_BYTES:-$(( 8 * 1024 * 1024 * 1024 ))}"
     fi
 
-    mkdir -p "$OUT_BASE/e4a"
-    local marker="$OUT_BASE/e4a/.start_marker"
+    log "[$label] M=$NUM_SESSIONS sessions on $hosts, kill broker $kill_id at T+${kill_after}s, pace ${per_session_mbps}MB/s/session"
+    mkdir -p "$cell_dir"
+    local marker="$cell_dir/.start_marker"
     touch "$marker"
 
+    local rc=0
     {
-        echo "=== E4a: broker kill with M=$NUM_SESSIONS sessions ==="
-        echo "hosts=$hosts numas=$numas pace=${per_session_mbps}MB/s/session kill=broker${kill_id}@T+${kill_after}s ts=${ts_interval_ms}ms"
+        echo "=== [$label] broker kill with M=$NUM_SESSIONS sessions ==="
+        echo "hosts=$hosts numas=$numas pace=${per_session_mbps}MB/s/session kill=broker${kill_id}@T+${kill_after}s ts=${ts_interval_ms}ms extra_env=$*"
         echo "=== $(stamp): Starting cluster + $NUM_SESSIONS publisher sessions ==="
 
+        env \
         NUM_CLIENTS="$NUM_SESSIONS" \
         CLIENT_HOSTS_CSV="$hosts" \
         CLIENT_NUMAS_CSV="$numas" \
@@ -126,100 +140,79 @@ run_e4a() {
         BROKER_KILL_AFTER_SEC="$kill_after" \
         BROKER_KILL_ID="$kill_id" \
         BROKER_KILL_SIGNAL=KILL \
+        "$@" \
         bash "$SCRIPT_DIR/run_multiclient.sh"
-        echo "=== $(stamp): E4a run complete ==="
-    } > "$cell_log" 2>&1
-    local rc=$?
+        echo "=== $(stamp): [$label] run complete ==="
+    } > "$cell_log" 2>&1 || rc=$?
 
     # Preserve this run's per-session timeseries + kill records (only files
-    # written after the marker — multiclient_logs is shared across runs)
+    # written after the marker — multiclient_logs is shared across runs),
+    # plus the LAST trial's broker logs (for broker-side recovery markers).
     find "$PROJECT_ROOT/multiclient_logs" -maxdepth 1 -type f -newer "$marker" \
-        -exec cp -f {} "$OUT_BASE/e4a/" \; 2>/dev/null || true
+        -exec cp -f {} "$cell_dir/" \; 2>/dev/null || true
+    local b
+    for (( b=0; b<NUM_BROKERS; b++ )); do
+        cp -f "/tmp/broker_${b}.log" "$cell_dir/last_trial_broker${b}.log" 2>/dev/null || true
+    done
 
     # Per-session stall CDF
-    if python3 "$SCRIPT_DIR/analyze_e4a_stall.py" "$OUT_BASE/e4a" \
-        --output "$OUT_BASE/e4a/stall_summary.csv" >> "$cell_log" 2>&1; then
-        log "E4a stall analysis written to $OUT_BASE/e4a/stall_summary.csv"
+    if python3 "$SCRIPT_DIR/analyze_e4a_stall.py" "$cell_dir" \
+        --output "$cell_dir/stall_summary.csv" >> "$cell_log" 2>&1; then
+        log "[$label] stall analysis written to $cell_dir/stall_summary.csv"
     else
-        log "E4a WARNING: stall analysis failed — inspect $cell_log"
+        log "[$label] WARNING: stall analysis failed — inspect $cell_log"
     fi
-    log "E4a done (rc=$rc) — see $cell_log"
+    log "[$label] done (rc=$rc) — see $cell_log"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
-# E4b: sequencer failover MTTR
+# E4a: kill a non-head broker with M concurrent sessions (Embarcadero ORDER=5)
+# Headline: per-session stall CDF — sessions homed on survivors should see
+# ~zero stall; only sessions rerouting off the dead broker pay the repair.
+# ---------------------------------------------------------------------------
+run_e4a() {
+    run_kill_cell "e4a_broker_kill" "${E4A_KILL_BROKER_ID:-1}"
+}
+
+# ---------------------------------------------------------------------------
+# E4b: sequencer failover MTTR — kill broker 0 (head). For ORDER=5 the
+# sequencer IS broker 0's Sequencer5 thread, so this forces re-election +
+# PBR rescan. Client-visible MTTR = stall_ms on surviving sessions (from the
+# shared analyzer); broker-side markers are extracted for corroboration.
 # ---------------------------------------------------------------------------
 run_e4b() {
-    log "E4b: sequencer failover MTTR"
-    local cell_log="$OUT_BASE/logs/e4b_sequencer_failover.log"
+    run_kill_cell "e4b_head_kill" 0
+
+    # Broker-side recovery markers from the surviving brokers' logs
+    # (last trial only — earlier trials' broker logs are overwritten).
+    local markers="$OUT_BASE/e4b_head_kill/recovery_markers.txt"
     {
-        echo "=== E4b: sequencer failover ==="
-        echo "=== $(stamp): Starting cluster ==="
-        # 1. Start 4-broker cluster normally
-        # 2. After 3s, kill the sequencer process (it's co-located with broker 0 in the embarlet)
-        #    For ORDER=5, the sequencer IS broker 0's Sequencer5 thread.
-        #    Killing broker 0 forces a new election.
-        # 3. Measure time from kill to first new ACK on surviving sessions.
-        #
-        # NOTE: In the current architecture the sequencer is a thread inside broker 0's
-        # embarlet process, not a separate binary. Killing broker 0 = killing the sequencer.
-        # Recovery: surviving brokers detect via heartbeat (~3s with gRPC heartbeat,
-        # or ~1ms with CXL lease if implemented). New sequencer elected by membership
-        # service, scans PBRs from committed frontier, resumes.
-        #
-        # Measure: time from kill signal to first successfully ACKed batch on a
-        # publisher that was mid-flight when broker 0 was killed.
-        #
-        # TODO: implement a scripted sequencer-kill + MTTR measurement harness.
-        # Until then, run manually and record timestamps from broker logs:
-        #   t_kill = kill -TERM <broker_0_pid>
-        #   t_resume = first "[SESSION_OPEN_ACK]" in broker_1.log after t_kill
-        #   MTTR = t_resume - t_kill
-        echo "=== E4b MANUAL PROCEDURE ==="
-        echo "1. Start 4-broker cluster: bash scripts/run_multiclient.sh ..."
-        echo "2. Wait for steady state (at least 5s of throughput)"
-        echo "3. Kill broker 0 (the sequencer): kill -TERM \$(pgrep -x embarlet | head -1)"
-        echo "4. Record kill timestamp from broker_0.log: grep 'Shutdown requested'"
-        echo "5. Record recovery from broker_1.log: grep 'Starting Sequencer5'"
-        echo "6. MTTR = time between kill and first new ACK on publisher"
-        echo "Expected: <200 ms for session-table read + PBR rescan"
-        echo "Caveat: gRPC heartbeat detection adds 3s timeout; CXL lease reduces to <1ms once implemented"
-    } > "$cell_log" 2>&1
-    log "E4b procedure documented — see $cell_log"
-    log "E4b TODO: implement automated MTTR measurement script"
+        echo "# Broker-side recovery markers (last trial). Compare against"
+        echo "# kill_wall_ms in trial<N>_broker_kill.csv (glog timestamps are local time)."
+        grep -Hn "Starting Sequencer5\|sequencer.*elect\|SESSION_OPEN_ACK\|SessionFenced\|head.*takeover\|becomes head\|new head" \
+            "$OUT_BASE/e4b_head_kill/"last_trial_broker*.log 2>/dev/null || echo "(no markers found)"
+    } > "$markers" 2>&1 || true
+    log "E4b broker-side markers: $markers"
 }
 
 # ---------------------------------------------------------------------------
-# E4f: baselines under failure
+# E4f: baselines under the SAME fault (kill broker 1) — Scalog and Corfu.
+# Expected: Scalog stalls globally at seal/cut cadence; Corfu publishers
+# stall at token/reconfiguration (the client deliberately does NOT reroute
+# for CORFU — publisher.cc RendezvousBroker refusal — so unrecovered
+# sessions in the analyzer output ARE the measurement).
+# Both cells use local sequencers on the broker node (matching the E2
+# baseline configuration in run_overnight_eval.sh).
 # ---------------------------------------------------------------------------
 run_e4f() {
-    log "E4f: baselines under failure — Scalog seal/cut stall, Corfu reconfig"
-    local cell_log="$OUT_BASE/logs/e4f_baselines_failure.log"
-    {
-        echo "=== E4f: baseline failure behavior ==="
-        # Scalog: kill the global sequencer (scalog_global_sequencer process)
-        #   Expected: local cuts stop delivering; per-broker ordering halts at cut cadence
-        #   Measure: throughput timeline from all publishers, hole duration
-        # Corfu: kill the corfu_global_sequencer
-        #   Expected: all publishers stall at token acquisition; no forward progress until
-        #   reconfiguration completes (Corfu uses epoch-based reconfiguration over gRPC)
-        #   Measure: throughput hole duration from kill to first ACK after reconfiguration
-        #
-        # TODO: implement automated kill + timeline collection for each baseline.
-        # The baseline sequencers run as separate processes (corfu_global_sequencer,
-        # scalog_global_sequencer from broker_lifecycle.sh), so killing them is safe.
-        echo "=== E4f MANUAL PROCEDURE ==="
-        echo "Scalog:"
-        echo "  1. Run: SEQUENCER=SCALOG bash scripts/run_multiclient.sh ..."
-        echo "  2. Kill: pkill -x scalog_global_sequencer"
-        echo "  3. Measure throughput hole in timeseries CSV"
-        echo "Corfu:"
-        echo "  1. Run: SEQUENCER=CORFU bash scripts/run_multiclient.sh ..."
-        echo "  2. Kill: pkill -x corfu_global_sequencer"
-        echo "  3. Measure throughput hole (expect full stall during reconfiguration)"
-    } > "$cell_log" 2>&1
-    log "E4f procedure documented — see $cell_log"
-    log "E4f TODO: automated sequencer-kill + timeline collection"
+    run_kill_cell "e4f_scalog_broker_kill" "${E4F_KILL_BROKER_ID:-1}" \
+        SEQUENCER=SCALOG ORDER=1 SKIP_REMOTE_SCALOG_SEQUENCER=1 \
+        EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP"
+
+    run_kill_cell "e4f_corfu_broker_kill" "${E4F_KILL_BROKER_ID:-1}" \
+        SEQUENCER=CORFU ORDER=2 \
+        EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
 }
 
 # ---------------------------------------------------------------------------
@@ -241,7 +234,6 @@ log ""
 log "===== Failure suite COMPLETE — $RUN_TAG ====="
 log "Results: $OUT_BASE"
 log ""
-log "NOTE: E4a is fully automated (BROKER_KILL_AFTER_SEC injection in"
-log "run_multiclient.sh + analyze_e4a_stall.py). E4b/E4f still document"
-log "manual procedures — automate them next (E4b = E4a with BROKER_KILL_ID=0"
-log "plus MTTR extraction from broker logs)."
+log "E4a/E4b/E4f are automated via BROKER_KILL_AFTER_SEC injection in"
+log "run_multiclient.sh + analyze_e4a_stall.py. E4c (SIGSTOP false positive)"
+log "remains future work. Per-cell results: $OUT_BASE/<cell>/stall_summary.csv"
