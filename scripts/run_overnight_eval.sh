@@ -3,11 +3,11 @@
 #
 # Overnight evaluation sweep — E2 (throughput), E3 (SLO latency), E9 (RF sensitivity),
 # E8 (overheads). Brokers run on moscxl with CXL NUMA node 2; publishers run on remote
-# SSH client machines (c1, c2, c3 — all passwordless-sudo).
+# SSH client machines (c4, c3, c1 — all passwordless-sudo).
 #
 # Architecture:
 #   - Brokers:   moscxl  (CXL NUMA node 2 for data, NIC on node 1)
-#   - Clients:   c1 / c2 / c3 (remote SSH, passwordless sudo)
+#   - Clients:   c4 / c3 / c1 (remote SSH, passwordless sudo)
 #   - All cells delegated to run_multiclient.sh, which handles:
 #       • shm creation + cleanup (EMBARCADERO_CXL_SHM_NAME)
 #       • numactl binding (--membind=1,2 when node 2 is CPU-less CXL)
@@ -15,14 +15,22 @@
 #       • barrier-start synchronization with SSH clients
 #       • post-trial shm_unlink + /dev/shm cleanup
 #
+# RF/ACK contract (paper Sec7 + ack_rf_policy.h):
+#   RF<=1 → ACK=1 (ordered-visible). RF>=2 → ACK=2 media-durable on dual NVMe dirs.
+#   Optional INCLUDE_MEMORY_COPY_RF2=1 adds RF=2 memory-copy companion cells
+#   labeled replicated_ack_emulated (never claim as media_durable).
+#
 # Prerequisites (run once on moscxl before starting):
-#   bash scripts/cluster_setup.sh   # syncs bins + config to c1/c2/c3, sets hugepages
+#   bash scripts/cluster_setup.sh   # syncs source + native-rebuilds c1/c3/c4, sets hugepages
 #
 # Usage:
 #   bash scripts/run_overnight_eval.sh              # full overnight (~6-8 h)
 #   SMOKE=1 bash scripts/run_overnight_eval.sh      # ~10-min sanity pass
 #   NUM_TRIALS=5 bash scripts/run_overnight_eval.sh # tighter CIs
 #   SKIP_BASELINES=1 bash scripts/run_overnight_eval.sh
+#
+# Detached launch (survives SSH/Cursor disconnect; keep moscxl powered):
+#   nohup bash scripts/run_overnight_eval.sh > /tmp/overnight_\$(date -u +%Y%m%dT%H%M%SZ).log 2>&1 &
 #
 # Key env overrides:
 #   SMOKE=1               fast sanity: 1 trial, 512 MiB, 2 load pts, 1 client
@@ -150,6 +158,39 @@ export BROKER_REACHABILITY_TIMEOUT_SEC="${BROKER_REACHABILITY_TIMEOUT_SEC:-60}"
 REMOTE_EMBAR_ROOT="${REMOTE_EMBAR_ROOT:-$HOME/Embarcadero}"
 export CLIENT_LD_LIBRARY_PATH="$REMOTE_EMBAR_ROOT/lib"
 
+# Paper RF/ACK contract (ack_rf_policy.h / Sec7):
+#   RF includes the CXL primary: RF<=1 → ACK1 (ordered-visible); RF>=2 → ACK2 (media-durable).
+# Dual NVMe replica dirs required for media-durable ACK2 (never /tmp fallback).
+export EMBARCADERO_REPLICA_DISK_DIRS="${EMBARCADERO_REPLICA_DISK_DIRS:-$PROJECT_ROOT/.Replication/disk0,/mnt/nvme0/replication/disk1}"
+# Optional companion cells: high-BW memory-copy sink (label: replicated_ack_emulated, NOT media_durable).
+INCLUDE_MEMORY_COPY_RF2="${INCLUDE_MEMORY_COPY_RF2:-1}"
+# Disk ACK2 can be slower; give publishers headroom.
+export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-300}"
+
+ack_for_rf() {
+    local rf="${1:-0}"
+    if [[ "$rf" -ge 2 ]]; then
+        echo 2
+    else
+        echo 1
+    fi
+}
+
+# Extra env for RF>=2 media-durable cells (disk sink is the default).
+rf2_disk_env() {
+    echo "EMBARCADERO_REPLICA_DISK_DIRS=$EMBARCADERO_REPLICA_DISK_DIRS"
+    echo "EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable"
+    # Clear memory-copy overrides if a parent shell exported them.
+    echo "EMBARCADERO_CHAIN_REPLICATION_INMEM=0"
+    echo "EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=0"
+}
+
+rf2_memcopy_env() {
+    echo "EMBARCADERO_CHAIN_REPLICATION_SINK=memory-copy"
+    echo "EMBARCADERO_CHAIN_REPLICATION_INMEM=1"
+    echo "EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=1"
+}
+
 RUN_TAG="${RUN_TAG:-$(date -u +%Y%m%dT%H%M%SZ)_overnight}"
 OUT_BASE="$PROJECT_ROOT/data/overnight_eval/$RUN_TAG"
 LOG_DIR="$OUT_BASE/logs"
@@ -180,45 +221,50 @@ safe_run() {
 # Pre-flight: verify cluster reachability and binary presence on all nodes
 # ---------------------------------------------------------------------------
 preflight_check() {
-    log "Pre-flight: checking cluster connectivity and binary sync"
-    local all_ok=1
+    log "Pre-flight: checking cluster connectivity and forcing source sync + native rebuild"
+    # Always refresh clients to the broker commit (native rebuild on each host).
+    if ! bash "$SCRIPT_DIR/cluster_setup.sh"; then
+        log "cluster_setup.sh failed — aborting"
+        exit 1
+    fi
 
-    for host in c1 c2 c3; do
+    local still_bad=0
+    for host in c4 c3 c1; do
         if ssh -o ConnectTimeout=5 -o BatchMode=yes "$host" \
                 "test -x ~/Embarcadero/build/bin/throughput_test" 2>/dev/null; then
-            log "  $host: throughput_test OK"
+            local remote_mtime
+            remote_mtime=$(ssh -o BatchMode=yes "$host" \
+                "stat -c %Y ~/Embarcadero/build/bin/throughput_test 2>/dev/null" 2>/dev/null || echo 0)
+            log "  $host: throughput_test OK (mtime=$remote_mtime)"
         else
-            log "  $host: throughput_test MISSING — run cluster_setup.sh first"
-            all_ok=0
+            log "FATAL: $host still missing throughput_test after cluster_setup"
+            still_bad=1
+        fi
+    done
+    if [[ "$still_bad" -eq 1 ]]; then exit 1; fi
+
+    # Replica dirs for media-durable ACK2
+    local d0 d1
+    d0="${EMBARCADERO_REPLICA_DISK_DIRS%%,*}"
+    d1="${EMBARCADERO_REPLICA_DISK_DIRS#*,}"
+    for d in "$d0" "$d1"; do
+        if [[ -z "$d" ]]; then continue; fi
+        if mkdir -p "$d" 2>/dev/null && [[ -w "$d" ]]; then
+            log "  replica dir OK: $d"
+        else
+            log "FATAL: replica dir missing/unwritable: $d"
+            exit 1
         fi
     done
 
-    if [[ "$all_ok" -eq 0 ]]; then
-        log "Pre-flight FAILED. Running cluster_setup.sh to sync bins..."
-        if ! bash "$SCRIPT_DIR/cluster_setup.sh"; then
-            log "cluster_setup.sh failed — aborting"
-            exit 1
-        fi
-        log "Sync done, re-checking..."
-        local still_bad=0
-        for host in c1 c2 c3; do
-            if ! ssh -o BatchMode=yes "$host" \
-                "test -x ~/Embarcadero/build/bin/throughput_test" 2>/dev/null; then
-                log "FATAL: $host still missing binary after sync"
-                still_bad=1
-            fi
-        done
-        if [[ "$still_bad" -eq 1 ]]; then exit 1; fi
-    fi
-
-    log "Pre-flight: all client nodes OK"
+    log "Pre-flight: all client nodes OK (commit=$(git rev-parse --short HEAD))"
 }
 
 # ---------------------------------------------------------------------------
 # Cleanup helper: remote clients + local shm
 # ---------------------------------------------------------------------------
 cleanup_remote_stray_procs() {
-    local hosts="${1:-c1 c2 c3}"
+    local hosts="${1:-c4 c3 c1}"
     for host in $hosts; do
         # Kill any stale throughput_test left from a prior aborted run.
         # Intentionally conservative: only kill by exact binary name, never pkill -f.
@@ -231,7 +277,7 @@ cleanup_shm_all() {
     # Clean /dev/shm on moscxl and all clients
     local shm_name="${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}"
     rm -f "/dev/shm${shm_name}" 2>/dev/null || true
-    for host in c1 c2 c3; do
+    for host in c4 c3 c1; do
         ssh -o BatchMode=yes "$host" \
             "rm -f /dev/shm${shm_name} 2>/dev/null; true" 2>/dev/null || true
     done
@@ -354,6 +400,8 @@ log "Output: $OUT_BASE"
 log "Trials: $NUM_TRIALS (warmup=$WARMUP_TRIALS discarded, $(( NUM_TRIALS - WARMUP_TRIALS )) measured)"
 log "Total bytes/client: $TOTAL_BYTES  MSG_SIZE: $MSG_SIZE  NUM_BROKERS: $NUM_BROKERS"
 log "Skip baselines: $SKIP_BASELINES"
+log "Replica dirs: $EMBARCADERO_REPLICA_DISK_DIRS"
+log "INCLUDE_MEMORY_COPY_RF2=$INCLUDE_MEMORY_COPY_RF2  ACK_TIMEOUT=${EMBARCADERO_ACK_TIMEOUT_SEC}s"
 
 preflight_check
 
@@ -363,19 +411,26 @@ preflight_check
 log "===== PART A: E2 throughput matrix ====="
 
 # Single-client throughput (N=1, all-remote — the clean comparison cell)
-# FIX 1: EMBAR_ORDER5_EPOCH_US=200 µs → 5000 epochs/sec.
-# FIX 2: THREADS_PER_BROKER=6 bypasses the sentinel-4 → uses 6 actual threads/broker.
-for rf in 0 1; do
-    run_multi_cell "e2_embar5_rf${rf}_n1" 1 "$CLIENT_HOSTS_REMOTE" \
-        SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=$rf \
+# Paper contract: RF<=1 → ACK1; RF>=2 → ACK2 media-durable.
+for rf in 0 1 2; do
+    ack="$(ack_for_rf "$rf")"
+    extra=()
+    if [[ "$rf" -ge 2 ]]; then
+        # shellcheck disable=SC2207
+        extra=( $(rf2_disk_env) )
+    fi
+    run_multi_cell "e2_embar5_rf${rf}_ack${ack}_n1" 1 "$CLIENT_HOSTS_REMOTE" \
+        SEQUENCER=EMBARCADERO ORDER=5 ACK="$ack" REPLICATION_FACTOR=$rf \
         TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency \
         EMBAR_ORDER5_EPOCH_US="$EPOCH_US_THROUGHPUT" \
-        THREADS_PER_BROKER="$THREADS_THROUGHPUT"
+        THREADS_PER_BROKER="$THREADS_THROUGHPUT" \
+        ${extra[@]+"${extra[@]}"}
 done
 
 for rf in 0 1; do
-    run_multi_cell "e2_embar0_rf${rf}_n1" 1 "$CLIENT_HOSTS_REMOTE" \
-        SEQUENCER=EMBARCADERO ORDER=0 ACK=1 REPLICATION_FACTOR=$rf \
+    ack="$(ack_for_rf "$rf")"
+    run_multi_cell "e2_embar0_rf${rf}_ack${ack}_n1" 1 "$CLIENT_HOSTS_REMOTE" \
+        SEQUENCER=EMBARCADERO ORDER=0 ACK="$ack" REPLICATION_FACTOR=$rf \
         TEST_TYPE=5 \
         THREADS_PER_BROKER="$THREADS_THROUGHPUT"
 done
@@ -411,7 +466,7 @@ if [[ "${SMOKE:-0}" != "1" ]]; then
         # Use first $nc hosts from CLIENT_HOSTS_E2 (= "c4,c3,c1")
         local_csv="$(echo "$CLIENT_HOSTS_E2" | tr ',' '\n' | head -"$nc" | tr '\n' ',' | sed 's/,$//')" || local_csv="c4,c3"
         # Both c1 and c3 are on 10.10.10.x — use single BROKER_IP
-        run_multi_cell "e2_embar5_rf0_n${nc}" "$nc" "$local_csv" \
+        run_multi_cell "e2_embar5_rf0_ack1_n${nc}" "$nc" "$local_csv" \
             SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=0 \
             TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency \
             EMBAR_ORDER5_EPOCH_US="$EPOCH_US_THROUGHPUT" \
@@ -479,27 +534,57 @@ if [[ "$SKIP_BASELINES" != "1" ]]; then
 fi
 
 # ===========================================================================
-# PART C — E9: RF SENSITIVITY (ORDER=5, RF={0,1,2})
+# PART C — E9: RF SENSITIVITY (ORDER=5, RF={0,1,2} with paper ACK contract)
 # ===========================================================================
-log "===== PART C: E9 RF sensitivity ====="
+log "===== PART C: E9 RF sensitivity (RF<=1 ACK1; RF=2 ACK2 media_durable) ====="
 
 for rf in 0 1 2; do
-    run_multi_cell "e9_embar5_rf${rf}" "$NUM_CLIENTS_E3" "$CLIENT_HOSTS_REMOTE" \
-        SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=$rf \
+    ack="$(ack_for_rf "$rf")"
+    extra=()
+    if [[ "$rf" -ge 2 ]]; then
+        # shellcheck disable=SC2207
+        extra=( $(rf2_disk_env) )
+    fi
+    run_multi_cell "e9_embar5_rf${rf}_ack${ack}" "$NUM_CLIENTS_E3" "$CLIENT_HOSTS_REMOTE" \
+        SEQUENCER=EMBARCADERO ORDER=5 ACK="$ack" REPLICATION_FACTOR=$rf \
         TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency \
         EMBAR_ORDER5_EPOCH_US="$EPOCH_US_THROUGHPUT" \
-        THREADS_PER_BROKER="$THREADS_THROUGHPUT"
+        THREADS_PER_BROKER="$THREADS_THROUGHPUT" \
+        ${extra[@]+"${extra[@]}"}
 done
 
-# Latency vs RF — use latency epoch (500 µs default) to preserve linger window
-# RF=2 is included here to support the 1.6 ms P99 claim in the abstract and Sec7.
-# Without this cell, the RF=2 latency number has no experimental backing.
+# Latency vs RF — paper tab:latency-sweep. RF=2 uses ACK2 media-durable.
 for rf in 0 1 2; do
-    run_latency_cell "e9_latency_embar5_rf${rf}" \
-        SEQUENCER=EMBARCADERO ORDER=5 ACK_LEVEL=1 REPLICATION_FACTOR=$rf \
+    ack="$(ack_for_rf "$rf")"
+    extra=()
+    if [[ "$rf" -ge 2 ]]; then
+        # shellcheck disable=SC2207
+        extra=( $(rf2_disk_env) )
+    fi
+    run_latency_cell "e9_latency_embar5_rf${rf}_ack${ack}" \
+        SEQUENCER=EMBARCADERO ORDER=5 ACK_LEVEL="$ack" REPLICATION_FACTOR=$rf \
         EMBARCADERO_RUNTIME_MODE=latency \
-        EMBAR_ORDER5_EPOCH_US="$EPOCH_US_LATENCY"
+        EMBAR_ORDER5_EPOCH_US="$EPOCH_US_LATENCY" \
+        ${extra[@]+"${extra[@]}"}
 done
+
+# Companion: RF=2 memory-copy (replicated_ack_emulated) — high-BW proxy, NOT media_durable.
+if [[ "$INCLUDE_MEMORY_COPY_RF2" == "1" ]]; then
+    log "===== PART C2: RF=2 memory-copy (replicated_ack_emulated) ====="
+    # shellcheck disable=SC2207
+    mem_extra=( $(rf2_memcopy_env) )
+    run_multi_cell "e9_embar5_rf2_ack2_memcopy" "$NUM_CLIENTS_E3" "$CLIENT_HOSTS_REMOTE" \
+        SEQUENCER=EMBARCADERO ORDER=5 ACK=2 REPLICATION_FACTOR=2 \
+        TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency \
+        EMBAR_ORDER5_EPOCH_US="$EPOCH_US_THROUGHPUT" \
+        THREADS_PER_BROKER="$THREADS_THROUGHPUT" \
+        ${mem_extra[@]+"${mem_extra[@]}"}
+    run_latency_cell "e9_latency_embar5_rf2_ack2_memcopy" \
+        SEQUENCER=EMBARCADERO ORDER=5 ACK_LEVEL=2 REPLICATION_FACTOR=2 \
+        EMBARCADERO_RUNTIME_MODE=latency \
+        EMBAR_ORDER5_EPOCH_US="$EPOCH_US_LATENCY" \
+        ${mem_extra[@]+"${mem_extra[@]}"}
+fi
 
 # ===========================================================================
 # PART D — E8: OVERHEAD PROBE (broker CPU during sustained load)
@@ -514,12 +599,12 @@ OVERHEAD_LOG="$LOG_DIR/e8_overhead_probe.log"
     if ! command -v pidstat &>/dev/null; then
         echo "WARNING: pidstat not available (install sysstat). Skipping CPU probe."
     else
-        cleanup_remote_stray_procs c1 || true
+        cleanup_remote_stray_procs c4 || true
         cleanup_shm_all || true
 
         NUM_CLIENTS=1 \
-        CLIENT_HOSTS_CSV=c1 \
-        CLIENT_NUMAS_CSV=0 \
+        CLIENT_HOSTS_CSV=c4 \
+        CLIENT_NUMAS_CSV=1 \
         NUM_BROKERS="$NUM_BROKERS" \
         NUM_TRIALS=1 \
         TOTAL_MESSAGE_SIZE=$((2 * 1024 * 1024 * 1024)) \
@@ -550,7 +635,7 @@ log "E8 overhead probe done"
 # FINAL CLEANUP + SUMMARY
 # ===========================================================================
 cleanup_shm_all
-cleanup_remote_stray_procs "c1 c2 c3"
+cleanup_remote_stray_procs "c4 c3 c1"
 
 log ""
 log "===== Overnight eval sweep COMPLETE — $RUN_TAG ====="

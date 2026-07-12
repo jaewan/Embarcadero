@@ -26,12 +26,13 @@ cd "$PROJECT_ROOT"
 CHECK_ONLY=0
 for arg in "$@"; do [[ "$arg" == "--check" ]] && CHECK_ONLY=1; done
 
-# Client nodes (all must be reachable via passwordless SSH from moscxl)
-CLIENT_NODES=(c1 c2 c3 c4)
-# c4 now has 100G NIC (ens801f0np0) on NUMA 1 with IP 10.10.10.12 assigned.
-# c4's NIC is on NUMA 1 — same as benchmark pin → no NUMA penalty (ideal client).
-# c4 has its own native build at ~/Embarcadero/build/bin/throughput_test.
-
+# Client nodes used by overnight/publication eval (100G fabric).
+# c2 is 1G-only and excluded from eval; do not hard-fail the setup on it.
+CLIENT_NODES=(c4 c3 c1)
+OPTIONAL_NODES=(c2)
+# c4: 100G NIC ens801f0np0 on NUMA 1 — primary overnight client.
+# c3: 100G NIC ens801f0np0 on NUMA 1.
+# c1: 100G NIC enp24s0f0np0 on NUMA 0.
 # Remote Embarcadero root on client nodes
 REMOTE_ROOT="${REMOTE_PROJECT_ROOT:-$HOME/Embarcadero}"
 
@@ -70,18 +71,55 @@ if [[ "$CHECK_ONLY" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Sync binaries to client nodes
+# 2. Sync source + native-rebuild client binaries
 # ---------------------------------------------------------------------------
-info "=== 2. Syncing binaries to client nodes ==="
-for host in "${CLIENT_NODES[@]}"; do
-    info "  Syncing to $host..."
+info "=== 2. Syncing source and rebuilding throughput_test on client nodes ==="
+# Clients need a native build (broker AVX-512 binaries can SIGILL on older CPUs).
+# Sync a clean git-archive of HEAD (plus overnight script overlays) so uncommitted
+# WIP on the broker (e.g. LazyLog metadata) cannot break remote client builds.
+SYNC_EXCLUDES=(
+    --exclude '.git/'
+    --exclude 'build/'
+    --exclude 'build-portable/'
+    --exclude 'data/'
+    --exclude 'Paper/'
+    --exclude 'Paper.zip'
+    --exclude 'multiclient_logs/'
+    --exclude 'lib/'
+    --exclude '*.o'
+    --exclude '*.a'
+    --exclude '__pycache__/'
+    --exclude '.Replication/'
+)
 
-    # Ensure remote directory structure exists
-    ssh -o BatchMode=yes "$host" "mkdir -p $REMOTE_ROOT/build/bin $REMOTE_ROOT/scripts/lib $REMOTE_ROOT/config" 2>/dev/null
+CLEAN_SYNC_ROOT="$(mktemp -d /tmp/embar_client_sync.XXXXXX)"
+info "  Exporting clean HEAD tree for client sync..."
+git -C "$PROJECT_ROOT" archive HEAD | tar -x -C "$CLEAN_SYNC_ROOT"
+# Overlay scripts that may be newer than HEAD but are required for this overnight.
+for rel in \
+    scripts/run_overnight_eval.sh \
+    scripts/cluster_setup.sh \
+    scripts/run_multiclient.sh \
+    scripts/run_latency.sh \
+    scripts/run_latency_vs_load.sh \
+    scripts/lib/broker_lifecycle.sh \
+    scripts/publication/run_throughput_cell.sh \
+    scripts/publication/run_latency_cell.sh \
+    test/CMakeLists.txt; do
+    if [[ -f "$PROJECT_ROOT/$rel" ]]; then
+        mkdir -p "$CLEAN_SYNC_ROOT/$(dirname "$rel")"
+        cp -a "$PROJECT_ROOT/$rel" "$CLEAN_SYNC_ROOT/$rel"
+    fi
+done
+
+for host in "${CLIENT_NODES[@]}"; do
+    info "  Syncing source to $host..."
+
+    ssh -o BatchMode=yes "$host" \
+        "mkdir -p $REMOTE_ROOT/build/bin $REMOTE_ROOT/scripts/lib $REMOTE_ROOT/config $REMOTE_ROOT/lib" \
+        2>/dev/null
 
     if [[ "$CHECK_ONLY" != "1" ]]; then
-        # Collect shared libraries that may be missing/wrong-version on clients.
-        # Clients may differ in glibc version; collect from broker's runtime paths.
         mkdir -p "$LOCAL_LIB"
         for lib_path in \
             /usr/local/lib/libglog.so.1 \
@@ -91,42 +129,32 @@ for host in "${CLIENT_NODES[@]}"; do
             [[ -f "$lib_path" ]] && cp -n "$lib_path" "$LOCAL_LIB/" 2>/dev/null || true
         done
 
-        # Sync the broker-compiled binary ONLY if the remote doesn't already have a working native build.
-        # The broker (AMD EPYC 9754) compiles with AVX-512 VBMI which some clients (Intel Cascade Lake)
-        # don't support. Always prefer a natively-built binary on the client.
-        # Check: if the remote binary is DIFFERENT from the broker binary, assume it's native → keep it.
-        local_hash=$(md5sum "$LOCAL_BIN/throughput_test" 2>/dev/null | cut -d' ' -f1)
-        remote_hash=$(ssh -o BatchMode=yes "$host" \
-            "md5sum $REMOTE_ROOT/build/bin/throughput_test 2>/dev/null | cut -d' ' -f1" 2>/dev/null || echo "")
-        ssh -o BatchMode=yes "$host" "mkdir -p $REMOTE_ROOT/build/bin $REMOTE_ROOT/scripts/lib $REMOTE_ROOT/config $REMOTE_ROOT/lib" 2>/dev/null
-        if [[ "$remote_hash" == "$local_hash" ]] || [[ -z "$remote_hash" ]]; then
-            # Remote has broker binary or nothing — sync broker binary (ok for clients with newer/equal glibc)
-            rsync -az --checksum \
-                "$LOCAL_BIN/throughput_test" \
-                "$host:$REMOTE_ROOT/build/bin/"
-            info "  $host: synced broker binary (hash=$local_hash)"
-        else
-            info "  $host: keeping existing native binary (hash=$remote_hash ≠ broker $local_hash)"
-        fi
+        rsync -az --checksum \
+            "${SYNC_EXCLUDES[@]}" \
+            "$CLEAN_SYNC_ROOT/" "$host:$REMOTE_ROOT/"
 
-        # Sync shared libs needed by throughput_test
         if [[ -d "$LOCAL_LIB" && -n "$(ls -A "$LOCAL_LIB" 2>/dev/null)" ]]; then
             rsync -az --checksum "$LOCAL_LIB/" "$host:$REMOTE_ROOT/lib/"
         fi
 
-        # Sync scripts the client harness needs
-        rsync -az --checksum \
-            "$SCRIPT_DIR/lib/broker_lifecycle.sh" \
-            "$SCRIPT_DIR/lib/run_throughput_impl.sh" \
-            "$host:$REMOTE_ROOT/scripts/lib/"
-        rsync -az --checksum \
-            "$SCRIPT_DIR/run_throughput.sh" \
-            "$host:$REMOTE_ROOT/scripts/"
-
-        # Sync config
-        rsync -az --checksum \
-            "$PROJECT_ROOT/config/client.yaml" \
-            "$host:$REMOTE_ROOT/config/"
+        info "  $host: native rebuild of throughput_test..."
+        if ! ssh -o BatchMode=yes "$host" "bash -s" <<REMOTE_BUILD
+set -euo pipefail
+cd "$REMOTE_ROOT"
+mkdir -p build
+# Reconfigure so newly synced sources/CMake match HEAD.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/embar_client_cmake.log 2>&1
+cmake --build build -j"\$(nproc)" --target throughput_test
+test -x build/bin/throughput_test
+REMOTE_BUILD
+        then
+            warn "  $host: native rebuild failed — falling back to broker binary sync"
+            rsync -az --checksum \
+                "$LOCAL_BIN/throughput_test" \
+                "$host:$REMOTE_ROOT/build/bin/"
+        else
+            info "  $host: native rebuild OK"
+        fi
     fi
 
     # Verify binary is runnable (with LD_LIBRARY_PATH pointing to the synced libs)
@@ -172,7 +200,8 @@ for host in "${CLIENT_NODES[@]}"; do
         fi
     fi
 done
-info "Binary sync complete"
+info "Source sync + client rebuild complete"
+rm -rf "$CLEAN_SYNC_ROOT"
 
 # ---------------------------------------------------------------------------
 # 3. Verify CXL NUMA node 2 on moscxl

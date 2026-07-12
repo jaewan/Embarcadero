@@ -237,32 +237,6 @@ if(PkgConfig_FOUND)
             LABELS "unit;lazylog;latency;correctness"
         )
 
-        add_executable(lazylog_metadata_replica_test
-            lazylog_metadata_replica_test.cc
-            ${CMAKE_CURRENT_SOURCE_DIR}/../src/cxl_manager/lazylog_metadata_replica.cc
-        )
-        target_include_directories(lazylog_metadata_replica_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/..
-            ${CMAKE_CURRENT_SOURCE_DIR}/../src
-            ${CMAKE_BINARY_DIR}
-            ${CMAKE_CURRENT_BINARY_DIR}
-            ${GTEST_INCLUDE_DIRS}
-        )
-        target_compile_options(lazylog_metadata_replica_test PRIVATE ${GTEST_CFLAGS_OTHER})
-        target_link_libraries(lazylog_metadata_replica_test PRIVATE
-            ${GTEST_LIBRARIES}
-            ${GTEST_MAIN_LIB}
-            lazylog_metadata_grpc_proto
-            grpc++
-            protobuf::libprotobuf
-            pthread
-        )
-        add_test(NAME unit_lazylog_metadata_replica COMMAND lazylog_metadata_replica_test)
-        set_tests_properties(unit_lazylog_metadata_replica PROPERTIES
-            TIMEOUT 60
-            LABELS "unit;lazylog;metadata;durability;correctness"
-        )
-
         add_executable(session_entry_torn_read_test
             session_entry_torn_read_test.cc
         )
