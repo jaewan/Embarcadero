@@ -83,9 +83,10 @@ log "Broker IP: $BROKER_IP  Client: $CLIENT_HOST  Sessions: $NUM_SESSIONS"
 # ORIGIN_MS axis. Load is paced (--target_mbps --steady_rate) so the send
 # phase is still active at T_kill and the post-kill stall window is visible.
 #
-# Kill: broker $kill_id gets SIGKILL at T = barrier + E4_KILL_AFTER_SEC via
-# run_multiclient.sh injection; kill wall/rel timestamps land in
-# multiclient_logs/trial<N>_broker_kill.csv on the timeseries axis.
+# Kill: broker $kill_id gets SIGKILL at push-start + E4_KILL_AFTER_SEC via
+# run_multiclient.sh injection (waits for Publisher::Init to finish first);
+# kill wall/rel timestamps land in multiclient_logs/trial<N>_broker_kill.csv
+# on the timeseries axis.
 #
 # Usage: run_kill_cell <label> <kill_broker_id> [extra ENV=VAL ...]
 # Extra env pairs are appended last, so they can override the defaults
@@ -103,11 +104,11 @@ run_kill_cell() {
     local kill_after="${E4_KILL_AFTER_SEC:-3}"
     local ts_interval_ms="${E4_TS_INTERVAL_MS:-10}"
     # Paced run duration = total/(M*pace). Default 16 GiB → 4 GiB/session →
-    # ~8.6 s at 500 MB/s: kill at T+3 s leaves a >5 s post-kill window.
-    # SMOKE halves it (~4.3 s run, still past T_kill).
+    # ~8.6 s at 500 MB/s: kill at push-go+3 s leaves a >5 s post-kill window.
+    # SMOKE uses 12 GiB (~6.4 s/session) so kill at +3 s still leaves ~3 s post.
     local total_bytes="${E4_TOTAL_BYTES:-$(( 16 * 1024 * 1024 * 1024 ))}"
     if [[ "${SMOKE:-0}" == "1" ]]; then
-        total_bytes="${E4_TOTAL_BYTES:-$(( 8 * 1024 * 1024 * 1024 ))}"
+        total_bytes="${E4_TOTAL_BYTES:-$(( 12 * 1024 * 1024 * 1024 ))}"
     fi
 
     log "[$label] M=$NUM_SESSIONS sessions on $hosts, kill broker $kill_id at T+${kill_after}s, pace ${per_session_mbps}MB/s/session"
@@ -136,10 +137,18 @@ run_kill_cell() {
         EMBARCADERO_CXL_ZERO_MODE=metadata \
         EMBARCADERO_CXL_MAP_POPULATE=0 \
         EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS="$ts_interval_ms" \
+        EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT=1 \
         CLIENT_EXTRA_ARGS="--target_mbps $per_session_mbps --steady_rate" \
         BROKER_KILL_AFTER_SEC="$kill_after" \
         BROKER_KILL_ID="$kill_id" \
         BROKER_KILL_SIGNAL=KILL \
+        START_DELAY_SEC="${START_DELAY_SEC:-8}" \
+        MIN_REMOTE_START_DELAY_SEC="${MIN_REMOTE_START_DELAY_SEC:-8}" \
+        EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC="${EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC:-30}" \
+        EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-30}" \
+        EMBARCADERO_SESSION_LEASE_MS="${EMBARCADERO_SESSION_LEASE_MS:-180000}" \
+        EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS="${EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS:-180000}" \
+        EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-0}" \
         "$@" \
         bash "$SCRIPT_DIR/run_multiclient.sh"
         echo "=== $(stamp): [$label] run complete ==="
@@ -155,15 +164,20 @@ run_kill_cell() {
         cp -f "/tmp/broker_${b}.log" "$cell_dir/last_trial_broker${b}.log" 2>/dev/null || true
     done
 
-    # Per-session stall CDF
+    # Per-session stall CDF (non-zero if any session lacks a usable baseline/recovery).
+    local analysis_rc=0
     if python3 "$SCRIPT_DIR/analyze_e4a_stall.py" "$cell_dir" \
         --output "$cell_dir/stall_summary.csv" >> "$cell_log" 2>&1; then
         log "[$label] stall analysis written to $cell_dir/stall_summary.csv"
     else
-        log "[$label] WARNING: stall analysis failed — inspect $cell_log"
+        analysis_rc=$?
+        log "[$label] WARNING: stall analysis failed (rc=$analysis_rc) — inspect $cell_log"
+    fi
+    if [[ "$rc" -eq 0 && "$analysis_rc" -ne 0 ]]; then
+        rc=$analysis_rc
     fi
     log "[$label] done (rc=$rc) — see $cell_log"
-    return 0
+    return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -218,14 +232,15 @@ run_e4f() {
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
+suite_rc=0
 case "$SUITE" in
-    E4a|e4a) run_e4a ;;
-    E4b|e4b) run_e4b ;;
-    E4f|e4f) run_e4f ;;
+    E4a|e4a) run_e4a || suite_rc=$? ;;
+    E4b|e4b) run_e4b || suite_rc=$? ;;
+    E4f|e4f) run_e4f || suite_rc=$? ;;
     all)
-        run_e4a
-        run_e4b
-        run_e4f
+        run_e4a || suite_rc=$?
+        run_e4b || suite_rc=$?
+        run_e4f || suite_rc=$?
         ;;
     *) echo "Unknown SUITE=$SUITE. Use E4a, E4b, E4f, or all." >&2; exit 1 ;;
 esac
@@ -237,3 +252,4 @@ log ""
 log "E4a/E4b/E4f are automated via BROKER_KILL_AFTER_SEC injection in"
 log "run_multiclient.sh + analyze_e4a_stall.py. E4c (SIGSTOP false positive)"
 log "remains future work. Per-cell results: $OUT_BASE/<cell>/stall_summary.csv"
+exit "$suite_rc"

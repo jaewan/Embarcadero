@@ -115,14 +115,16 @@ QUIET=${QUIET:-0}
 
 # ---------------------------------------------------------------------------
 # Failure injection (E4 suite): timed kill of one broker mid-trial.
-# BROKER_KILL_AFTER_SEC > 0 arms a killer that sends BROKER_KILL_SIGNAL to
-# broker BROKER_KILL_ID at T = client barrier + BROKER_KILL_AFTER_SEC.
-# The kill wall-clock ms is recorded in $LOG_DIR/trial<N>_broker_kill.csv on
-# the same time axis as the client timeseries CSVs (ORIGIN_MS = barrier).
+# BROKER_KILL_AFTER_SEC > 0 arms a killer that waits until every client log
+# shows "Publisher push start" (Init+warmup finished), then sends
+# BROKER_KILL_SIGNAL to broker BROKER_KILL_ID after BROKER_KILL_AFTER_SEC of
+# steady publish. Kill timestamps land in $LOG_DIR/trial<N>_broker_kill.csv on
+# the same axis as the client timeseries CSVs (ORIGIN_MS = launch barrier).
 # ---------------------------------------------------------------------------
 BROKER_KILL_AFTER_SEC=${BROKER_KILL_AFTER_SEC:-0}
 BROKER_KILL_ID=${BROKER_KILL_ID:-1}
 BROKER_KILL_SIGNAL=${BROKER_KILL_SIGNAL:-KILL}
+BROKER_KILL_PUSH_WAIT_SEC=${BROKER_KILL_PUSH_WAIT_SEC:-120}
 # Client timeseries sampling interval (ms); client default is 100 if unset.
 EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=${EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS:-}
 # Extra args appended verbatim to the throughput_test command line
@@ -808,6 +810,12 @@ start_brokers() {
     if [[ -n "${EMBAR_ORDER5_EPOCH_US:-}" ]]; then
         export EMBAR_ORDER5_EPOCH_US
     fi
+    if [[ -n "${EMBARCADERO_SESSION_LEASE_MS:-}" ]]; then
+        export EMBARCADERO_SESSION_LEASE_MS
+    fi
+    if [[ -n "${EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS:-}" ]]; then
+        export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS
+    fi
     if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
         export LAZYLOG_CXL_MODE=1
     fi
@@ -1051,6 +1059,13 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
         declare -a CLIENT_LOGS=()
         declare -a CLIENT_TS_LOCAL_FILES=()
         declare -a CLIENT_TAGS=()
+        declare -a CLIENT_PUSH_HOSTS=()
+        declare -a CLIENT_PUSH_READY=()
+        declare -a CLIENT_PUSH_GO=()
+        use_push_go=0
+        if [[ "$BROKER_KILL_AFTER_SEC" -gt 0 ]]; then
+            use_push_go=1
+        fi
 
         for (( i=0; i<NUM_CLIENTS; i++ )); do
             host="${CLIENT_HOSTS[$i]}"
@@ -1074,6 +1089,23 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
             CLIENT_TAGS+=( "$client_tag" )
             CLIENT_LOGS+=( "$log_file" )
             CLIENT_TS_LOCAL_FILES+=( "$LOG_DIR/trial${trial}_${client_tag}_timeseries.csv" )
+            CLIENT_PUSH_HOSTS+=( "$host" )
+
+            push_ready_export=""
+            push_go_export=""
+            if [[ "$use_push_go" -eq 1 ]]; then
+                ready_path="/tmp/embarcadero_e4_ready_t${trial}_${client_tag}_$$"
+                go_path="/tmp/embarcadero_e4_go_t${trial}_${client_tag}_$$"
+                CLIENT_PUSH_READY+=( "$ready_path" )
+                CLIENT_PUSH_GO+=( "$go_path" )
+                if [[ "$host" == "local" ]]; then
+                    rm -f "$ready_path" "$go_path"
+                else
+                    ssh "$host" "rm -f '$ready_path' '$go_path'" 2>/dev/null || true
+                fi
+                push_ready_export="export EMBARCADERO_PUSH_READY_FILE=$ready_path"
+                push_go_export="export EMBARCADERO_PUSH_GO_FILE=$go_path"
+            fi
 
             # Build the command that will execute on the remote (or local) shell.
             # We use export statements so every env var is properly set regardless
@@ -1095,8 +1127,13 @@ export EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS
 export EMBARCADERO_ORDER5_HOME_BROKERS=$EMBARCADERO_ORDER5_HOME_BROKERS
 if [ -n "${EMBARCADERO_ACK_TIMEOUT_SEC:-}" ]; then export EMBARCADERO_ACK_TIMEOUT_SEC=${EMBARCADERO_ACK_TIMEOUT_SEC:-}; fi
 if [ -n "${EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS:-}" ]; then export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=${EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS:-}; fi
+if [ -n "${EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT:-}" ]; then export EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT=${EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT:-}; fi
+if [ -n "${EMBARCADERO_SESSION_LEASE_MS:-}" ]; then export EMBARCADERO_SESSION_LEASE_MS=${EMBARCADERO_SESSION_LEASE_MS:-}; fi
+if [ -n "${EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS:-}" ]; then export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS=${EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS:-}; fi
 export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$ts_file
 export EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS=$START_TIME_MS
+$push_ready_export
+$push_go_export
 rm -f $ts_file
 if [ "$SEQUENCER" = "CORFU" ] && [ -n "${EMBARCADERO_CORFU_SEQ_IP:-}" ]; then export EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP:-}; fi
 if [ "$SEQUENCER" = "CORFU" ] && [ -n "${EMBARCADERO_CORFU_SEQ_PORT:-}" ]; then export EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT:-}; fi
@@ -1131,7 +1168,9 @@ ENDINNERSCRIPT
         done
 
         # ------------------------------------------------------------------
-        # E4 failure injection: arm timed broker kill (BROKER_KILL_AFTER_SEC)
+        # E4 failure injection: synchronize push-start (push-ready/go), then
+        # kill after BROKER_KILL_AFTER_SEC of steady publish. Kill must not
+        # arm against the launch barrier — Init still runs after that.
         # ------------------------------------------------------------------
         BROKER_KILLER_PID=""
         if [[ "$BROKER_KILL_AFTER_SEC" -gt 0 ]]; then
@@ -1141,9 +1180,54 @@ ENDINNERSCRIPT
             fi
             kill_target_pid="${BROKER_PIDS[$BROKER_KILL_ID]}"
             kill_record="$LOG_DIR/trial${trial}_broker_kill.csv"
-            kill_at_ms=$(( START_TIME_MS + BROKER_KILL_AFTER_SEC * 1000 ))
-            log "  Armed broker kill: broker $BROKER_KILL_ID (pid $kill_target_pid) SIG${BROKER_KILL_SIGNAL} at T+${BROKER_KILL_AFTER_SEC}s"
+            log "  Armed broker kill: broker $BROKER_KILL_ID (pid $kill_target_pid) SIG${BROKER_KILL_SIGNAL} at push-go+${BROKER_KILL_AFTER_SEC}s (wait up to ${BROKER_KILL_PUSH_WAIT_SEC}s for Init)"
             (
+                push_wait_deadline=$(( $(date +%s) + BROKER_KILL_PUSH_WAIT_SEC ))
+                while true; do
+                    ready=0
+                    for (( ci=0; ci<NUM_CLIENTS; ci++ )); do
+                        h="${CLIENT_PUSH_HOSTS[$ci]}"
+                        rf="${CLIENT_PUSH_READY[$ci]}"
+                        if [[ "$h" == "local" ]]; then
+                            [[ -f "$rf" ]] && ready=$((ready + 1))
+                        else
+                            ssh "$h" "test -f '$rf'" 2>/dev/null && ready=$((ready + 1))
+                        fi
+                    done
+                    if [[ "$ready" -ge "$NUM_CLIENTS" ]]; then
+                        break
+                    fi
+                    if [[ "$(date +%s)" -ge "$push_wait_deadline" ]]; then
+                        echo "ERROR: broker-kill push-ready wait timed out after ${BROKER_KILL_PUSH_WAIT_SEC}s (${ready}/${NUM_CLIENTS} ready)" >&2
+                        # Unblock any waiting clients so the trial can fail cleanly.
+                        for (( ci=0; ci<NUM_CLIENTS; ci++ )); do
+                            h="${CLIENT_PUSH_HOSTS[$ci]}"
+                            gf="${CLIENT_PUSH_GO[$ci]}"
+                            if [[ "$h" == "local" ]]; then
+                                echo 1 > "$gf"
+                            else
+                                ssh "$h" "echo 1 > '$gf'" 2>/dev/null || true
+                            fi
+                        done
+                        exit 1
+                    fi
+                    sleep 0.05
+                done
+                # All publishers past Init/warmup — fire a common go timestamp.
+                GO_NS=$(( $(date +%s%N) + 200000000 ))  # +200ms lead
+                for (( ci=0; ci<NUM_CLIENTS; ci++ )); do
+                    h="${CLIENT_PUSH_HOSTS[$ci]}"
+                    gf="${CLIENT_PUSH_GO[$ci]}"
+                    if [[ "$h" == "local" ]]; then
+                        echo "$GO_NS" > "$gf"
+                    else
+                        ssh "$h" "echo $GO_NS > '$gf'" &
+                    fi
+                done
+                wait || true
+                go_ms=$(( GO_NS / 1000000 ))
+                kill_at_ms=$(( go_ms + BROKER_KILL_AFTER_SEC * 1000 ))
+                echo "  Broker kill: push-go=${go_ms}; killing at ${kill_at_ms} (T+${BROKER_KILL_AFTER_SEC}s)" >&2
                 while [ "$(date +%s%3N)" -lt "$kill_at_ms" ]; do sleep 0.001; done
                 t_kill_ms="$(date +%s%3N)"
                 kill_rc=0

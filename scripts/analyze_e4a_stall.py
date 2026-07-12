@@ -29,6 +29,7 @@ import statistics
 import sys
 
 WARMUP_MS = 500          # ignore ramp-up when computing pre-kill baseline
+BASELINE_WINDOW_MS = 2000  # prefer the last 2s before kill (skips idle zeros before push-go)
 RECOVERY_FRAC = 0.5      # session considered recovered at >=50% of baseline
 SUSTAIN_SAMPLES = 2      # recovery must hold for this many consecutive samples
 
@@ -69,7 +70,11 @@ def analyze_session(ts_path, kill_rel_ms, killed_broker_id):
             kb_idx = i
             break
 
-    pre = [r[total_idx] for r in rows if WARMUP_MS <= r[0] < kill_rel_ms]
+    pre_lo = max(WARMUP_MS, kill_rel_ms - BASELINE_WINDOW_MS)
+    pre = [r[total_idx] for r in rows if pre_lo <= r[0] < kill_rel_ms]
+    # If the short window is empty (very early kill), fall back to all post-warmup pre-kill.
+    if not pre:
+        pre = [r[total_idx] for r in rows if WARMUP_MS <= r[0] < kill_rel_ms]
     post = [(r[0], r[total_idx]) for r in rows if r[0] >= kill_rel_ms]
     if not pre:
         return {"error": "no_pre_kill_samples"}
@@ -78,7 +83,12 @@ def analyze_session(ts_path, kill_rel_ms, killed_broker_id):
 
     baseline = statistics.median(pre)
     if baseline <= 0:
-        return {"error": "zero_baseline"}
+        # Push-go cells can still have sparse zeros in the window; use nonzero median.
+        nonzero = [v for v in pre if v > 0]
+        if nonzero:
+            baseline = statistics.median(nonzero)
+        else:
+            return {"error": "zero_baseline"}
 
     threshold = RECOVERY_FRAC * baseline
     stall_ms = None
@@ -177,6 +187,8 @@ def main():
     for r in errs:
         print(f"  ERROR: trial {r['trial']} session {r['session']}: {r['error']}")
     print(f"\nPer-session detail: {out}")
+    if errs or unrecovered or not stalls:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
