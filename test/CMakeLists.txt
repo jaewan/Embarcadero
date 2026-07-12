@@ -170,6 +170,28 @@ if(PkgConfig_FOUND)
             LABELS "unit;replication;topology;smoke"
         )
 
+        add_executable(chain_pipeline_test
+            chain_pipeline_test.cc
+        )
+        target_include_directories(chain_pipeline_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(chain_pipeline_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(chain_pipeline_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_chain_pipeline COMMAND chain_pipeline_test)
+        set_tests_properties(unit_chain_pipeline PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;replication;chain;pipeline;correctness"
+        )
+
         # SCALOG ACK invariant test
         add_executable(scalog_ack_invariant_test
             scalog_ack_invariant_test.cc
@@ -213,6 +235,32 @@ if(PkgConfig_FOUND)
         set_tests_properties(unit_lazylog_latency_invariant PROPERTIES
             TIMEOUT 60
             LABELS "unit;lazylog;latency;correctness"
+        )
+
+        add_executable(lazylog_metadata_replica_test
+            lazylog_metadata_replica_test.cc
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/cxl_manager/lazylog_metadata_replica.cc
+        )
+        target_include_directories(lazylog_metadata_replica_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(lazylog_metadata_replica_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(lazylog_metadata_replica_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            lazylog_metadata_grpc_proto
+            grpc++
+            protobuf::libprotobuf
+            pthread
+        )
+        add_test(NAME unit_lazylog_metadata_replica COMMAND lazylog_metadata_replica_test)
+        set_tests_properties(unit_lazylog_metadata_replica PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;lazylog;metadata;durability;correctness"
         )
 
         add_executable(session_entry_torn_read_test
@@ -261,6 +309,72 @@ if(PkgConfig_FOUND)
         set_tests_properties(unit_session_proto_roundtrip PROPERTIES
             TIMEOUT 60
             LABELS "unit;session;protobuf;correctness"
+        )
+
+        add_executable(durable_ack2_power_loss_model_test
+            durable_ack2_power_loss_model_test.cc
+        )
+        target_include_directories(durable_ack2_power_loss_model_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(durable_ack2_power_loss_model_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(durable_ack2_power_loss_model_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_durable_ack2_power_loss_model COMMAND durable_ack2_power_loss_model_test)
+        set_tests_properties(unit_durable_ack2_power_loss_model PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;ack2;durability;power_loss;correctness"
+        )
+
+        add_executable(order5_recovery_property_test
+            order5_recovery_property_test.cc
+        )
+        target_include_directories(order5_recovery_property_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(order5_recovery_property_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(order5_recovery_property_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_order5_recovery_property COMMAND order5_recovery_property_test)
+        set_tests_properties(unit_order5_recovery_property PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;order5;recovery;property;correctness"
+        )
+
+        add_executable(ack_rf_policy_test
+            ack_rf_policy_test.cc
+        )
+        target_include_directories(ack_rf_policy_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(ack_rf_policy_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(ack_rf_policy_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_ack_rf_policy COMMAND ack_rf_policy_test)
+        set_tests_properties(unit_ack_rf_policy PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;ack;rf;contract;correctness"
         )
 
         add_executable(order5_session_fencing_test

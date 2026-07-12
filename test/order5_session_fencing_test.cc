@@ -67,8 +67,21 @@ TEST(Order5SessionFencingTest, NonzeroSessionFenceFiresOnce) {
 	state.fence();
 
 	EXPECT_TRUE(state.fenced);
+	EXPECT_EQ(state.committed_hwm, 3u)
+		<< "fence() must publish inclusive last-committed batch_seq (next_expected-1)";
+	EXPECT_TRUE(state.HasCommittedPrefix());
 	EXPECT_FALSE(ShouldFenceSessionGap(state, 4'000, 1'000))
 		<< "idempotent fenced state must not fire a second lease fence";
+}
+
+TEST(Order5SessionFencingTest, EmptyPrefixFenceDoesNotClaimBatchZero) {
+	OptimizedClientState state;
+	state.session_epoch = 3;
+	state.next_expected = 0;
+	state.fence();
+	EXPECT_TRUE(state.fenced);
+	EXPECT_EQ(state.committed_hwm, 0u);
+	EXPECT_FALSE(state.HasCommittedPrefix());
 }
 
 TEST(Order5SessionFencingTest, FalseFenceGapFillsBeforeLease) {
@@ -123,6 +136,9 @@ TEST(Order5SessionFencingTest, RecoveryAndReconnectUseAuthoritativeMaxima) {
 	EXPECT_EQ(RecoveredNextExpected(8, 12), 12u);
 	EXPECT_EQ(ReconnectAnswerHwm(7, 3), 3u);
 	EXPECT_EQ(ReconnectAnswerHwm(7, 11), 7u);
+	EXPECT_EQ(ReconnectAnswerHwm(7, false, 0), 7u)
+		<< "missing GOI must not collapse reconnect HWM to 0";
+	EXPECT_EQ(ReconnectAnswerHwm(7, true, 3), 3u);
 }
 
 TEST(Order5SessionFencingTest, IdleCommittedSessionAfterFailoverDoesNotTerminalFence) {

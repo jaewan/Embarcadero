@@ -21,6 +21,7 @@ TEST(SessionProtoRoundTripTest, OpenAckCarriesAssignedEpochAndCommittedHwm) {
 
 	embarcadero::session::SessionOpenAck ack;
 	ack.set_committed_hwm(123);
+	ack.set_has_committed_prefix(true);
 	ack.set_status(embarcadero::session::SessionOpenAck::FENCED);
 	ack.set_assigned_session_epoch(decoded_open.requested_session_epoch());
 
@@ -29,13 +30,30 @@ TEST(SessionProtoRoundTripTest, OpenAckCarriesAssignedEpochAndCommittedHwm) {
 	embarcadero::session::SessionOpenAck decoded_ack;
 	ASSERT_TRUE(decoded_ack.ParseFromString(wire));
 	EXPECT_EQ(decoded_ack.committed_hwm(), 123u);
+	EXPECT_TRUE(decoded_ack.has_committed_prefix());
 	EXPECT_EQ(decoded_ack.status(), embarcadero::session::SessionOpenAck::FENCED);
 	EXPECT_EQ(decoded_ack.assigned_session_epoch(), 7u);
+}
+
+TEST(SessionProtoRoundTripTest, OpenAckEmptyPrefixIsExplicit) {
+	embarcadero::session::SessionOpenAck ack;
+	ack.set_committed_hwm(0);
+	ack.set_has_committed_prefix(false);
+	ack.set_status(embarcadero::session::SessionOpenAck::OK);
+	ack.set_assigned_session_epoch(1);
+
+	std::string wire;
+	ASSERT_TRUE(ack.SerializeToString(&wire));
+	embarcadero::session::SessionOpenAck decoded;
+	ASSERT_TRUE(decoded.ParseFromString(wire));
+	EXPECT_FALSE(decoded.has_committed_prefix());
+	EXPECT_EQ(decoded.committed_hwm(), 0u);
 }
 
 TEST(SessionProtoRoundTripTest, FencedPayloadKeepsBatchSeqAuthoritative) {
 	embarcadero::session::SessionFenced fenced;
 	fenced.set_committed_batch_seq(17);
+	fenced.set_has_committed_prefix(true);
 	fenced.set_committed_msg_hwm(4096);
 	fenced.set_control_epoch(11);
 	fenced.set_reason(embarcadero::session::SessionFenced::EPOCH_STALE);

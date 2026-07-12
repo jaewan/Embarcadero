@@ -274,6 +274,10 @@ class Publisher {
 		absl::flat_hash_set<int> brokers_with_threads_ ABSL_GUARDED_BY(mutex_);
 		char topic_[TOPIC_NAME_SIZE];
 
+		// Persistent publish channels for ORDER=5 fence/retransmit (avoid one-TCP-per-batch).
+		mutable std::mutex retransmit_channel_mu_;
+		absl::flat_hash_map<int, int> retransmit_channels_;  // broker_id -> connected fd
+
 		// Acknowledgement
 		int ack_level_;
 		int ack_port_;
@@ -338,6 +342,8 @@ class Publisher {
 			size_t ComputeUnackedByteCap() const;
 			bool SendSessionOpenOnSocket(int sock_fd, int epoll_fd, size_t broker_id);
 			bool SendRawBatchToBroker(const void* bytes, size_t wire_bytes, int broker_id);
+			bool EnsureRetransmitChannel(int broker_id, int* out_fd);
+			void CloseRetransmitChannel(int broker_id);
 			void WaitForUnackedCapacity(size_t bytes);
 			bool RecordUnackedBatch(const Embarcadero::BatchHeader& header,
 			                        const void* batch_bytes,

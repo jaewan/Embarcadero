@@ -246,6 +246,7 @@ static_assert(sizeof(PBRProducerState) == 16, "Must be 16 bytes for CMPXCHG16B")
  * Callback type for obtaining a new segment
  */
 using GetNewSegmentCallback = std::function<void*()>;
+using FreeSegmentCallback = std::function<bool(void*)>;
 
 /**
  * Class representing a message topic with storage and sequencing capabilities
@@ -279,6 +280,11 @@ class Topic {
 		 */
 		void Start();
 		void DumpOrder5FlightRecorder(const char* reason);
+
+		/** Wire CXL FreeSegment so retired segments can be returned after rollover. */
+		void SetFreeSegmentCallback(FreeSegmentCallback cb) {
+			free_segment_callback_ = std::move(cb);
+		}
 
 		/**
 		 * Destructor - ensures all threads are stopped and joined
@@ -420,6 +426,18 @@ class Topic {
 			uint32_t client_id,
 			uint64_t* producing_epoch_out = nullptr,
 			uint64_t* control_epoch_out = nullptr) const;
+
+		struct SessionFenceNotification {
+			uint32_t client_id{0};
+			uint32_t session_epoch{0};
+			uint64_t committed_batch_seq{0};
+			bool has_committed_prefix{false};
+			uint64_t committed_msg_hwm{0};
+			uint64_t control_epoch{0};
+			int reason{0};  // SessionFenced::Reason
+		};
+		void PublishSessionFenceNotification(const SessionFenceNotification& note);
+		bool TakeSessionFenceNotification(uint32_t client_id, SessionFenceNotification* out);
 		// Returns the number of messages written/visible for the given client_id at this broker.
 		// Used by AckThread for ORDER=0 ACK1 so one publisher cannot consume another's progress.
 		uint64_t GetClientWritten(uint32_t client_id) const;
@@ -432,6 +450,7 @@ class Topic {
 		bool SupportsPerClientWrittenAckLevel1() const;
 		// True when this topic/mode maintains per-client durable frontier for ACK level 2.
 		bool SupportsPerClientAckLevel2Durable() const;
+		void MaybeAdvanceOrder5DurableFromCV();
 
 		/** [[ORDER_0_SKIP_PBR]] For order 0 we do not write to PBR. Returns start logical offset for this batch and advances by num_msg. */
 		size_t GetAndAdvanceOrder0LogicalOffset(uint32_t num_msg);
@@ -662,6 +681,7 @@ class Topic {
 
 		// Core members
 		const GetNewSegmentCallback get_new_segment_callback_;
+		FreeSegmentCallback free_segment_callback_;
 		const GetNumBrokersCallback get_num_brokers_callback_;
 		const GetRegisteredBrokersCallback get_registered_brokers_callback_;
 		struct TInode* tinode_;
@@ -777,6 +797,11 @@ class Topic {
 		int replication_factor_;
 		void* ordered_offset_addr_;
 		void* current_segment_;
+		absl::Mutex segment_rollover_mu_;
+		uint64_t segment_id_counter_{0};
+		uint64_t segment_generation_{0};
+		std::deque<void*> retired_segments_ ABSL_GUARDED_BY(segment_rollover_mu_);
+		void MaybeGCRetiredSegments();
 		size_t ordered_offset_;
 
 		// Thread control
@@ -915,7 +940,13 @@ class Topic {
 		// CommitEpoch on the EpochSequencerThread, so no lock is required.
 		absl::flat_hash_map<uint64_t, uint64_t> commit_order_last_seq_;
 		absl::flat_hash_map<uint64_t, uint64_t> recovered_order5_next_expected_;
+		absl::flat_hash_map<uint32_t, uint64_t> recovered_order5_msg_counts_;
+		uint64_t recovered_global_seq_{0};
+		uint64_t order5_durable_next_goi_{0};
 		std::atomic<bool> order5_recovery_complete_{false};
+		mutable absl::Mutex session_fence_mu_;
+		absl::flat_hash_map<uint32_t, SessionFenceNotification> pending_session_fences_
+			ABSL_GUARDED_BY(session_fence_mu_);
 		// Disconnect/shutdown tail drain: keep force-expiring hold frontiers for a short bounded window
 		// so late-visible batches are not stranded behind a one-shot expiry pulse.
 		std::atomic<uint64_t> force_expire_hold_until_ns_{0};

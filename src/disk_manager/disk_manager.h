@@ -57,6 +57,12 @@ class DiskManager{
 		// Current Implementation strictly requires the active brokers to be MAX_BROKER_NUM
 		// Change this to get real-time num brokers
 		void Replicate(TInode* TInode_addr, TInode* replica_tinode, int replication_factor);
+		/**
+		 * Bind chain-replication RF to the authoritative per-topic value.
+		 * Fails closed if an already-started chain manager was configured with a
+		 * conflicting EMBARCADERO_REPLICATION_FACTOR.
+		 */
+		void EnsureTopicReplicationFactor(int topic_replication_factor);
 		void StartScalogReplicaLocalSequencer();
 		void StartScalogCXLReplication(TInode* tinode);
 		void StartScalogCXLReplicaPolling(TInode* tinode, int primary_id, int replica_index);
@@ -85,6 +91,7 @@ class DiskManager{
 		std::unique_ptr<Corfu::CorfuReplicationManager> corfu_replication_manager_;
 		std::unique_ptr<Scalog::ScalogReplicationManager> scalog_replication_manager_;
 		std::unique_ptr<Embarcadero::ChainReplicationManager> chain_replication_manager_;
+		int chain_replication_factor_{0};  // RF used when chain manager was started (0 = none)
 
 		std::atomic<int> offset_{0};
 		bool stop_threads_ = false;

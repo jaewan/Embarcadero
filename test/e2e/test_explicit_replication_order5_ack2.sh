@@ -189,7 +189,8 @@ setup() {
     export EMBARCADERO_ACK_TIMEOUT_SEC=120  # 2 minutes for ACK wait (should be plenty for 5k messages)
     # Ensure broker-side replication managers are initialized for ACK2 durability frontier.
     # throughput_test's -r flag configures topic metadata, but DiskManager reads env at process startup.
-    export EMBARCADERO_REPLICATION_FACTOR=1
+    # RF includes the CXL primary: RF=2 means primary + one media-durable disk replica.
+    export EMBARCADERO_REPLICATION_FACTOR=2
 
     # Keep this e2e test hermetic to local single-node runs.
     # Without this, a stale shell env can point the client to a remote head addr.
@@ -197,7 +198,7 @@ setup() {
     unset REMOTE_HEAD_ADDR || true
 
     log_info "Test output directory: $PWD"
-    log_info "Test configuration: ORDER=5, ack_level=2, replication_factor=1"
+    log_info "Test configuration: ORDER=5, ack_level=2, replication_factor=2"
     log_info "Global timeout: ${GLOBAL_TIMEOUT}s, ACK timeout: ${EMBARCADERO_ACK_TIMEOUT_SEC}s"
 }
 
@@ -268,10 +269,10 @@ start_brokers() {
     log_info "All $NUM_BROKERS brokers running successfully"
 }
 
-# Run client test with ORDER=5 + ack_level=2 + replication_factor=1
+# Run client test with ORDER=5 + ack_level=2 + replication_factor=2
 run_client_test() {
     log_info "Running client publish test with explicit replication..."
-    log_info "Config: ORDER=5, ack_level=2, replication_factor=1"
+    log_info "Config: ORDER=5, ack_level=2, replication_factor=2"
     log_info "Message config: ${MESSAGE_SIZE}B messages, ${TOTAL_MESSAGES} total messages"
 
     # Calculate total message size
@@ -284,8 +285,8 @@ run_client_test() {
     
     # Run throughput test with explicit replication parameters
     # -o 5: ORDER=5 (batch-based ordering)
-    # -a 2: ack_level=2 (ack after replication)
-    # -r 1: replication_factor=1 (one replica)
+    # -a 2: ack_level=2 (ack after media-durable RF-1 replicas)
+    # -r 2: replication_factor=2 (CXL primary + one durable disk replica)
     # -t 5: publish-only test (simpler, deterministic)
     # Match basic_publish.sh: same NUMA policy as brokers (client defaults to numa_bind in YAML).
     timeout $((GLOBAL_TIMEOUT - 60)) $NUMA_BIND "$BIN_DIR/throughput_test" \
@@ -295,7 +296,7 @@ run_client_test() {
         -t 5 \
         -o 5 \
         -a 2 \
-        -r 1 \
+        -r 2 \
         --sequencer EMBARCADERO \
         > client.log 2>&1
 
@@ -448,44 +449,133 @@ verify_broker_health() {
 }
 
 # Main test flow
-main() {
+# Profiles: disk (media_durable) and/or memory-copy (replicated_ack_emulated).
+# Override with CHAIN_SINK_PROFILES="disk memory-copy" (default: both).
+run_one_profile() {
+    local profile="$1"
+    echo ""
     echo "=========================================="
-    echo "E2E Test: Explicit Replication (ORDER=5 + ack_level=2)"
+    echo "E2E Profile: $profile (ORDER=5 + ack_level=2)"
     echo "=========================================="
-    
-    local test_start=$(date +%s)
-    
+
+    BROKER_PIDS=()
+    TEST_FAILED=0
+
+    case "$profile" in
+        disk|disk-durable)
+            unset EMBARCADERO_CHAIN_REPLICATION_INMEM || true
+            unset EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY || true
+            unset EMBARCADERO_CHAIN_REPLICATION_SINK || true
+            export EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable
+            # Disk ACK2 requires writable replica dirs (fail-closed; no /tmp fallback).
+            if [[ -z "${EMBARCADERO_REPLICA_DISK_DIRS:-}" ]]; then
+                local d0="$PROJECT_ROOT/.Replication/disk0"
+                local d1="$PROJECT_ROOT/.Replication/disk1"
+                mkdir -p "$d0" "$d1"
+                export EMBARCADERO_REPLICA_DISK_DIRS="$d0,$d1"
+            fi
+            ACK_CLAIM_EXPECTED="media_durable"
+            ;;
+        memory-copy|memory_copy)
+            export EMBARCADERO_CHAIN_REPLICATION_INMEM=1
+            export EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=1
+            export EMBARCADERO_CHAIN_REPLICATION_SINK=memory-copy
+            unset EMBARCADERO_REPLICA_DISK_DIRS || true
+            ACK_CLAIM_EXPECTED="replicated_ack_emulated"
+            ;;
+        *)
+            log_error "Unknown CHAIN_SINK profile: $profile"
+            return 1
+            ;;
+    esac
+
+    local test_start
+    test_start=$(date +%s)
+
     setup
+    log_info "Sink profile=$profile ack_claim=$ACK_CLAIM_EXPECTED"
     start_brokers || return 1
-    
-    # Give brokers a moment to fully initialize replication threads
+
+    # Confirm resolved sink mode from broker logs.
+    if ! grep -q "sink_mode=${EMBARCADERO_CHAIN_REPLICATION_SINK}" broker_0.log 2>/dev/null &&
+       ! grep -q "sink_mode=${profile}" broker_0.log 2>/dev/null; then
+        if grep -q "sink_mode=" broker_0.log 2>/dev/null; then
+            log_info "Broker reported: $(grep -m1 'sink_mode=' broker_0.log || true)"
+        else
+            log_warn "Could not find sink_mode log line yet (continuing)"
+        fi
+    fi
+    if [[ "$ACK_CLAIM_EXPECTED" == "replicated_ack_emulated" ]]; then
+        if grep -qi "media.durable while this mode is active\|ack_claim=replicated_ack_emulated" broker_0.log 2>/dev/null; then
+            log_info "Memory sink correctly labeled replicated_ack_emulated"
+        else
+            log_warn "Expected memory-sink ack_claim warning/label in broker logs"
+        fi
+        # Memory mode must never claim media_durable in DiskManager start line.
+        if grep -q "ack_claim=media_durable" broker_0.log 2>/dev/null; then
+            log_error "Memory-copy profile incorrectly claimed media_durable"
+            return 1
+        fi
+    fi
+
     sleep 2
-    
-    # [[PHASE_4_BOUNDED_TIMEOUTS]] - Check timeout before client test
+
     local elapsed=$(($(date +%s) - test_start))
     if [ $elapsed -ge $GLOBAL_TIMEOUT ]; then
         log_error "Test exceeded global timeout of ${GLOBAL_TIMEOUT}s before client test"
         return 1
     fi
-    
+
     run_client_test || return 1
-    
-    # Wait a bit for replication to catch up
+
     log_info "Waiting 5 seconds for replication to complete..."
     sleep 5
-    
-    # [[PHASE_4_BOUNDED_TIMEOUTS]] - Check timeout before verification
+
     elapsed=$(($(date +%s) - test_start))
     if [ $elapsed -ge $GLOBAL_TIMEOUT ]; then
         log_error "Test exceeded global timeout of ${GLOBAL_TIMEOUT}s during verification"
         return 1
     fi
-    
-    verify_replication || return 1
+
+    if [[ "$profile" == "disk" || "$profile" == "disk-durable" ]]; then
+        verify_replication || return 1
+    else
+        # Memory-copy: look for chain pipeline / in-memory sink evidence instead of disk files.
+        if grep -q "CHAIN_PIPELINE_STATS\|in-memory sink\|sink_mode=memory-copy" broker_*.log 2>/dev/null; then
+            log_info "✓ Memory-copy replication path observed in broker logs"
+        else
+            log_warn "Memory-copy path log markers not found (client ACK success is primary gate)"
+        fi
+    fi
     verify_broker_health || return 1
 
+    # Stop brokers between profiles so env flags take effect cleanly.
+    for pid in "${BROKER_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    sleep 1
+    pkill -9 -f "embarlet" 2>/dev/null || true
+    BROKER_PIDS=()
+    rm -f /tmp/embarlet_*_ready 2>/dev/null || true
+
+    log_info "Profile $profile passed"
+    return 0
+}
+
+main() {
+    echo "=========================================="
+    echo "E2E Test: Explicit Replication (ORDER=5 + ack_level=2)"
+    echo "=========================================="
+
+    local profiles="${CHAIN_SINK_PROFILES:-disk memory-copy}"
+    for profile in $profiles; do
+        run_one_profile "$profile" || return 1
+    done
+
     echo ""
-    log_info "All test assertions passed"
+    log_info "All test assertions passed for profiles: $profiles"
 }
 
 main "$@"

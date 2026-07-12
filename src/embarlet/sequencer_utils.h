@@ -71,12 +71,19 @@ struct OptimizedClientState {
 		}
 	}
 
-	/// Idempotent, monotone fence cache; durable SessionEntry wiring lands in D.
+	/// Idempotent, monotone fence cache.
+	/// committed_hwm is an inclusive last-committed batch_seq.
+	/// Empty prefix (next_expected == 0) keeps has_committed_prefix=false via
+	/// SessionOpenAck.has_committed_prefix on the wire; local state uses 0.
 	void fence() {
 		if (!fenced) {
 			fenced = true;
-			committed_hwm = next_expected;
+			committed_hwm = (next_expected == 0) ? 0 : (next_expected - 1);
 		}
+	}
+
+	bool HasCommittedPrefix() const {
+		return next_expected > 0;
 	}
 };
 
@@ -118,12 +125,29 @@ inline uint64_t RecoveredNextExpected(uint64_t goi_scan_next, uint64_t session_e
 	return std::max(goi_scan_next, session_entry_expected);
 }
 
+/// Reconnect HWM is the min of durable SessionEntry and GOI inclusive batch HWMs.
+/// When GOI is unreadable, fall back to the SessionEntry HWM rather than collapsing to 0.
 inline uint64_t ReconnectAnswerHwm(uint64_t session_entry_hwm, uint64_t goi_committed_hwm) {
 	return std::min(session_entry_hwm, goi_committed_hwm);
 }
 
-inline bool ShouldTerminalFenceAckRelay(uint64_t next_to_ack_offset, bool goi_hwm_found, uint64_t goi_committed_hwm) {
-	return !goi_hwm_found || next_to_ack_offset > goi_committed_hwm;
+inline uint64_t ReconnectAnswerHwm(
+		uint64_t session_entry_hwm,
+		bool goi_hwm_found,
+		uint64_t goi_committed_hwm) {
+	if (!goi_hwm_found) {
+		return session_entry_hwm;
+	}
+	return std::min(session_entry_hwm, goi_committed_hwm);
+}
+
+/// Both arguments must be inclusive batch-seq HWMs (same typed space).
+/// Terminal-fence when GOI is missing or the client-visible inclusive HWM exceeds GOI.
+inline bool ShouldTerminalFenceAckRelay(
+		uint64_t client_inclusive_batch_hwm,
+		bool goi_hwm_found,
+		uint64_t goi_committed_hwm) {
+	return !goi_hwm_found || client_inclusive_batch_hwm > goi_committed_hwm;
 }
 
 inline uint64_t SessionKeyFor(uint32_t client_id, uint32_t session_epoch) {

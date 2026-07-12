@@ -24,9 +24,11 @@
 // Project includes
 #include "common/config.h"
 #include "common/configuration.h"
+#include "common/failure_domain.h"
 #include "heartbeat.h"
 #include "topic_manager.h"
 #include "disk_manager/disk_manager.h"
+#include "disk_manager/chain_replication.h"
 #include "network_manager/network_manager.h"
 #include "cxl_manager/cxl_manager.h"
 
@@ -268,6 +270,34 @@ int main(int argc, char* argv[]) {
 	}
 
 	int num_network_io_threads = arguments["network_threads"].as<int>();
+	// Resolve effective runtime settings once after YAML/env/CLI merge and log them.
+	const auto failure_domain = Embarcadero::DefaultSingleHostDomain();
+	LOG(INFO) << "[EFFECTIVE_CONFIG]"
+	          << " broker_id=" << broker_id
+	          << " head=" << (is_head_node ? 1 : 0)
+	          << " network_threads=" << num_network_io_threads
+	          << " cxl_type=" << (cxl_type == Embarcadero::CXL_Type::Emul ? "emul" : "real")
+	          << " sequencer=" << static_cast<int>(sequencerType)
+	          << " failure_domain=" << Embarcadero::FailureDomainKindName(failure_domain.kind)
+	          << " domain_id=" << failure_domain.domain_id
+	          << " host_failure_tolerant="
+	          << (Embarcadero::ClaimHostFailureTolerance(failure_domain) ? 1 : 0)
+	          << " EMBARCADERO_REPLICATION_FACTOR="
+	          << (std::getenv("EMBARCADERO_REPLICATION_FACTOR")
+	                  ? std::getenv("EMBARCADERO_REPLICATION_FACTOR")
+	                  : "")
+	          << " EMBARCADERO_CXL_ZERO_MODE="
+	          << (std::getenv("EMBARCADERO_CXL_ZERO_MODE")
+	                  ? std::getenv("EMBARCADERO_CXL_ZERO_MODE")
+	                  : "")
+	          << " EMBARCADERO_CXL_COHERENT="
+	          << (std::getenv("EMBARCADERO_CXL_COHERENT")
+	                  ? std::getenv("EMBARCADERO_CXL_COHERENT")
+	                  : "")
+	          << " EMBARCADERO_STAGE_TRACE="
+	          << (std::getenv("EMBARCADERO_STAGE_TRACE")
+	                  ? std::getenv("EMBARCADERO_STAGE_TRACE")
+	                  : "0");
 
 	// Create and connect all manager components
 		Embarcadero::CXLManager cxl_manager(broker_id, cxl_type, head_ip);
@@ -276,6 +306,21 @@ int main(int argc, char* argv[]) {
 			return EXIT_FAILURE;
 		}
 		LOG(INFO) << "[CORFU_DEBUG] CXLManager OK, creating DiskManager (broker_id=" << broker_id << ")";
+		{
+			const Embarcadero::ChainReplicationConfig chain_cfg =
+				Embarcadero::ParseChainReplicationConfig();
+			LOG(INFO) << "embarlet: chain replication sink_mode="
+			          << Embarcadero::ChainReplicationSinkModeName(chain_cfg.sink_mode)
+			          << " ack_claim="
+			          << Embarcadero::ChainReplicationAckClaimLabel(chain_cfg.sink_mode)
+			          << " inmem_bytes_per_source=" << chain_cfg.inmem_bytes_per_source
+			          << " sync_bytes=" << chain_cfg.sync_bytes
+			          << " sync_interval_ms=" << (chain_cfg.sync_interval_ns / 1000000ULL)
+			          << " EMBARCADERO_REPLICATION_FACTOR="
+			          << (std::getenv("EMBARCADERO_REPLICATION_FACTOR")
+			                  ? std::getenv("EMBARCADERO_REPLICATION_FACTOR")
+			                  : "0");
+		}
 		Embarcadero::DiskManager disk_manager(broker_id, cxl_manager.GetCXLAddr(),
 				replicate_to_memory, sequencerType);
 		LOG(INFO) << "[CORFU_DEBUG] DiskManager constructed";

@@ -15,9 +15,12 @@ message SessionOpenAck {
 		EPOCH_STALE = 2;
 	}
 
+	// Inclusive last committed client batch_seq when has_committed_prefix is true.
+	// When has_committed_prefix is false, committed_hwm must be ignored (empty prefix).
 	uint64 committed_hwm = 1;
 	Status status = 2;
 	uint32 assigned_session_epoch = 3;
+	bool has_committed_prefix = 4;
 }
 
 message SessionFenced {
@@ -28,8 +31,11 @@ message SessionFenced {
 		DUP_PAST_EXPECTED = 3;
 	}
 
+	// Inclusive last committed client batch_seq when has_committed_prefix is true.
 	uint64 committed_batch_seq = 3;
+	// Diagnostic exclusive-next message-count frontier (not a release axis).
 	uint64 committed_msg_hwm = 4;
 	uint64 control_epoch = 5;
 	Reason reason = 6;
+	bool has_committed_prefix = 7;
 }

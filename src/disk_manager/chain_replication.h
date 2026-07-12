@@ -2,57 +2,93 @@
 #define EMBARCADERO_CHAIN_REPLICATION_H_
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <string>
 #include <thread>
 #include <vector>
-#include <array>
+
 #include "cxl_manager/cxl_datastructure.h"
 
 namespace Embarcadero {
 
 /**
+ * Sink backend for ORDER=5 chain replication.
+ * disk-durable: pwrite + fdatasync (media_durable ACK2 claim)
+ * memory-copy: CXL→DRAM memcpy into bounded ring (replicated_ack_emulated)
+ * memory-accounting: byte accounting only (replicated_ack_emulated)
+ */
+enum class ChainReplicationSinkMode {
+    DiskDurable = 0,
+    MemoryCopy = 1,
+    MemoryAccounting = 2,
+};
+
+struct ChainReplicationConfig {
+    ChainReplicationSinkMode sink_mode{ChainReplicationSinkMode::DiskDurable};
+    size_t inmem_bytes_per_source{256UL * 1024UL * 1024UL};
+    size_t sync_bytes{64UL * 1024UL * 1024UL};
+    uint64_t sync_interval_ns{250ULL * 1000ULL * 1000ULL};
+
+    bool IsMemorySink() const {
+        return sink_mode == ChainReplicationSinkMode::MemoryCopy ||
+               sink_mode == ChainReplicationSinkMode::MemoryAccounting;
+    }
+    bool IsMediaDurable() const {
+        return sink_mode == ChainReplicationSinkMode::DiskDurable;
+    }
+};
+
+// Parse env flags. Backward compatible with:
+//   EMBARCADERO_CHAIN_REPLICATION_INMEM / INMEM_COPY / INMEM_BYTES_PER_SOURCE
+// Optional override:
+//   EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable|memory-copy|memory-accounting
+// Sync thresholds:
+//   EMBARCADERO_CHAIN_SYNC_BYTES / EMBARCADERO_CHAIN_SYNC_INTERVAL_MS
+ChainReplicationConfig ParseChainReplicationConfig();
+
+const char* ChainReplicationSinkModeName(ChainReplicationSinkMode mode);
+
+// ACK2 claim label for publication metadata.
+// memory modes must never be labeled media_durable.
+const char* ChainReplicationAckClaimLabel(ChainReplicationSinkMode mode);
+
+/**
  * ChainReplicationManager - Phase 2 chain replication protocol
+ *
+ * Pipeline (per active source):
+ *   Dispatcher (GOI order) → SourcePipeline.sink → [sync] → token → CV (tail only)
  *
  * Protocol:
  *   1. Replicas poll GOI for new entries (written by sequencer)
- *   2. Replicas copy data from BLog to local disk IN PARALLEL
- *   3. Replicas serialize ACKs via num_replicated token:
- *      - Replica R_i waits for num_replicated == i
- *      - Replica R_i increments num_replicated = i + 1 (passes token to next)
- *   4. Tail replica (R_f) updates CompletionVector after replication (ack_level=2).
- *      Sequencer may also advance CV (ack_level=1); both use max semantics (design §3.4).
- *
- * Benefits:
- *   - Parallel data copy (low latency)
- *   - Serialized ACKs (ordered durability confirmation)
- *   - No per-replica counters (single num_replicated field)
+ *   2. Replicas copy data from BLog in parallel (copy-ahead; no Stage-1 token gate)
+ *   3. After local sink(+sync) completion, serialize ACKs via num_replicated token
+ *   4. Tail replica updates CompletionVector (ack_level=2)
  */
 class ChainReplicationManager {
 public:
     ChainReplicationManager(
-        int replica_id,             // My replica ID (0 = head, f = tail)
-        int replication_factor,     // Total replicas (f+1)
-        int local_broker_id,        // Local broker id
-        int num_brokers,            // Live broker count for replication-set mapping
-        void* cxl_addr,             // CXL base address
-        GOIEntry* goi,              // GOI pointer
-        CompletionVectorEntry* cv,  // CompletionVector pointer
-        const std::string& disk_path  // Local disk path
+        int replica_id,
+        int replication_factor,
+        int local_broker_id,
+        int num_brokers,
+        void* cxl_addr,
+        GOIEntry* goi,
+        CompletionVectorEntry* cv,
+        const std::string& disk_path
     );
 
     ~ChainReplicationManager();
 
-    // Start replication thread
     void Start();
-
-    // Stop replication thread
     void Stop();
 
-private:
-    // Main replication loop
-    void ReplicationThread();
+    const ChainReplicationConfig& config() const { return config_; }
 
-    // Tail replica updates CompletionVector
-    void UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count);
+private:
+    void ReplicationThread();
+    void UpdateCompletionVector(uint16_t broker_id, uint64_t pbr_index,
+                                uint64_t cumulative_msg_count);
 
     int replica_id_;
     int replication_factor_;
@@ -63,17 +99,14 @@ private:
     CompletionVectorEntry* cv_;
 
     std::string disk_path_;
-    std::vector<int> source_disk_fds_;
-    std::vector<std::string> source_disk_paths_;
-    std::vector<size_t> source_disk_offsets_;
+    ChainReplicationConfig config_;
     std::vector<std::string> disk_dirs_;
 
-    std::atomic<uint64_t> next_goi_index_{0};  // Next GOI entry to replicate
+    std::atomic<uint64_t> next_goi_index_{0};
     std::atomic<bool> stop_{false};
     std::thread replication_thread_;
-
 };
 
-} // namespace Embarcadero
+}  // namespace Embarcadero
 
 #endif  // EMBARCADERO_CHAIN_REPLICATION_H_

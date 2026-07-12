@@ -12,7 +12,7 @@ SEQUENCER="${SEQUENCER:?set SEQUENCER}"
 NUM_CLIENTS="${NUM_CLIENTS:?set NUM_CLIENTS}"
 REPLICATION_FACTOR="${REPLICATION_FACTOR:?set REPLICATION_FACTOR}"
 ACK_LEVEL="${ACK_LEVEL:-}"
-NUM_TRIALS="${NUM_TRIALS:-3}"
+NUM_TRIALS="${NUM_TRIALS:-5}"
 NUM_BROKERS="${NUM_BROKERS:-4}"
 TOTAL_MESSAGE_SIZE="${TOTAL_MESSAGE_SIZE:-16106127360}"
 MESSAGE_SIZE="${MESSAGE_SIZE:-1024}"
@@ -48,6 +48,29 @@ if [[ -z "$ACK_LEVEL" ]]; then
     ACK_LEVEL="1"
   fi
 fi
+
+CHAIN_SINK_MODE="disk-durable"
+if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_SINK:-}" ]]; then
+  CHAIN_SINK_MODE="${EMBARCADERO_CHAIN_REPLICATION_SINK}"
+elif [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM:-0}" == "1" ]]; then
+  if [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-0}" == "1" ]]; then
+    CHAIN_SINK_MODE="memory-copy"
+  else
+    CHAIN_SINK_MODE="memory-accounting"
+  fi
+fi
+case "$CHAIN_SINK_MODE" in
+  memory-copy|memory_copy|memory-accounting|memory_accounting|accounting|copy)
+    ACK_CLAIM_LABEL="replicated_ack_emulated"
+    ;;
+  *)
+    if [[ "$ACK_LEVEL" == "2" ]]; then
+      ACK_CLAIM_LABEL="media_durable"
+    else
+      ACK_CLAIM_LABEL="n/a"
+    fi
+    ;;
+esac
 
 declare -a DEFAULT_CLIENT_HOSTS=( "c4" "c3" "local" "c2" "c1" )
 declare -a DEFAULT_CLIENT_NUMAS=( "1" "1" "0" "1" "1" )
@@ -96,6 +119,19 @@ CELL_ID="${SYSTEM}_order${ORDER}_rf${REPLICATION_FACTOR}_n${NUM_CLIENTS}"
 RUN_DIR="$PROJECT_ROOT/data/publication/throughput/$TAG/$CELL_ID/run_$RUN_ID"
 RAW_DIR="$RUN_DIR/raw"
 mkdir -p "$RAW_DIR"
+
+cat > "$RUN_DIR/run_metadata.txt" <<EOF
+chain_replication_sink=$CHAIN_SINK_MODE
+chain_replication_inmem=${EMBARCADERO_CHAIN_REPLICATION_INMEM:-0}
+chain_replication_inmem_copy=${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-0}
+chain_replication_inmem_bytes_per_source=${EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}
+chain_sync_bytes=${EMBARCADERO_CHAIN_SYNC_BYTES:-}
+chain_sync_interval_ms=${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}
+replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}
+ack_claim_label=$ACK_CLAIM_LABEL
+ack_level=$ACK_LEVEL
+replication_factor=$REPLICATION_FACTOR
+EOF
 
 COMMIT="$(git rev-parse HEAD)"
 BROKER_CONFIG_ABS="$PROJECT_ROOT/$PUBLICATION_BROKER_CONFIG"
@@ -249,7 +285,7 @@ scp -o StrictHostKeyChecking=no "${SCALOG_SEQUENCER_LOG_HOST}:/tmp/scalog_sequen
   "$RAW_DIR/${SCALOG_SEQUENCER_LOG_HOST}_scalog_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
-echo "system,order,sequencer,num_clients,client_layout,replication_factor,run_idx,status,throughput_gbps,throughput_overlap_gbps,overlap_window_ms,timeseries_clients,attempts_used,first_attempt_pass,artifact_dir,commit" > "$SUMMARY_CSV"
+echo "system,order,sequencer,num_clients,client_layout,replication_factor,run_idx,status,throughput_gbps,throughput_overlap_gbps,overlap_window_ms,timeseries_clients,attempts_used,first_attempt_pass,artifact_dir,commit,chain_sink_mode,ack_claim_label" > "$SUMMARY_CSV"
 ATTEMPT_SUMMARY_FILE="$RAW_DIR/attempt_summary.csv"
 OVERLAP_SUMMARY_FILE="$RAW_DIR/overlap_summary.csv"
 
@@ -301,7 +337,7 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
       fi
     fi
   fi
-  echo "$SYSTEM,$ORDER,$SEQUENCER,$NUM_CLIENTS,\"$CLIENT_LAYOUT\",$REPLICATION_FACTOR,$trial,$trial_status,$throughput_gbps,$overlap_gbps,$overlap_window_ms,$timeseries_clients,$attempts_used,$first_attempt_pass,$trial_dir,$COMMIT" >> "$SUMMARY_CSV"
+  echo "$SYSTEM,$ORDER,$SEQUENCER,$NUM_CLIENTS,\"$CLIENT_LAYOUT\",$REPLICATION_FACTOR,$trial,$trial_status,$throughput_gbps,$overlap_gbps,$overlap_window_ms,$timeseries_clients,$attempts_used,$first_attempt_pass,$trial_dir,$COMMIT,$CHAIN_SINK_MODE,$ACK_CLAIM_LABEL" >> "$SUMMARY_CSV"
 done
 
 if [[ "$REQUIRE_FIRST_ATTEMPT_PASS" == "1" ]]; then

@@ -89,6 +89,30 @@ BROKER_REACHABILITY_POLL_SEC="${BROKER_REACHABILITY_POLL_SEC:-1}"
 BROKER_READY_PROPAGATION_SEC="${BROKER_READY_PROPAGATION_SEC:-4}"
 SEQUENCER="${SEQUENCER:-EMBARCADERO}"
 
+# Chain replication sink profile labeling (memory modes are never media_durable).
+CHAIN_SINK_MODE="disk-durable"
+if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_SINK:-}" ]]; then
+  CHAIN_SINK_MODE="${EMBARCADERO_CHAIN_REPLICATION_SINK}"
+elif [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM:-0}" == "1" ]]; then
+  if [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-0}" == "1" ]]; then
+    CHAIN_SINK_MODE="memory-copy"
+  else
+    CHAIN_SINK_MODE="memory-accounting"
+  fi
+fi
+case "$CHAIN_SINK_MODE" in
+  memory-copy|memory_copy|memory-accounting|memory_accounting|accounting|copy)
+    ACK_CLAIM_LABEL="replicated_ack_emulated"
+    ;;
+  *)
+    if [[ "$ACK_LEVEL" == "2" ]]; then
+      ACK_CLAIM_LABEL="media_durable"
+    else
+      ACK_CLAIM_LABEL="n/a"
+    fi
+    ;;
+esac
+
 # Orders to benchmark: space-separated list, e.g. "0 5"
 read -r -a ORDERS_ARR <<< "${ORDERS:-0 5}"
 
@@ -386,6 +410,24 @@ start_local_brokers() {
   broker_env+="EMBARCADERO_REPLICATION_FACTOR=$REPLICATION_FACTOR "
   broker_env+="NUM_BROKERS=$NUM_BROKERS "
   broker_env+="EMBARCADERO_NUM_BROKERS=$NUM_BROKERS "
+  if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_SINK:-}" ]]; then
+    broker_env+="EMBARCADERO_CHAIN_REPLICATION_SINK=$EMBARCADERO_CHAIN_REPLICATION_SINK "
+  fi
+  if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_INMEM:-}" ]]; then
+    broker_env+="EMBARCADERO_CHAIN_REPLICATION_INMEM=$EMBARCADERO_CHAIN_REPLICATION_INMEM "
+  fi
+  if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-}" ]]; then
+    broker_env+="EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=$EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY "
+  fi
+  if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}" ]]; then
+    broker_env+="EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE=$EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE "
+  fi
+  if [[ -n "${EMBARCADERO_CHAIN_SYNC_BYTES:-}" ]]; then
+    broker_env+="EMBARCADERO_CHAIN_SYNC_BYTES=$EMBARCADERO_CHAIN_SYNC_BYTES "
+  fi
+  if [[ -n "${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}" ]]; then
+    broker_env+="EMBARCADERO_CHAIN_SYNC_INTERVAL_MS=$EMBARCADERO_CHAIN_SYNC_INTERVAL_MS "
+  fi
   if [[ "$seq" == "SCALOG" ]]; then
     broker_env+="SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1} "
   fi
@@ -759,6 +801,14 @@ target_mbps=$TARGET_MBPS
 broker_head_addr=$head_addr
 run_log=$RUN_LOG
 client_command_file=$CLIENT_CMD_FILE
+chain_replication_sink=${EMBARCADERO_CHAIN_REPLICATION_SINK:-}
+chain_replication_inmem=${EMBARCADERO_CHAIN_REPLICATION_INMEM:-0}
+chain_replication_inmem_copy=${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-0}
+chain_replication_inmem_bytes_per_source=${EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}
+chain_sync_bytes=${EMBARCADERO_CHAIN_SYNC_BYTES:-}
+chain_sync_interval_ms=${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}
+replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}
+ack_claim_label=$ACK_CLAIM_LABEL
 EOF
 
   echo "Saved trial artefacts to: $TRIAL_DIR"

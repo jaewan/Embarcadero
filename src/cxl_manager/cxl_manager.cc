@@ -779,6 +779,53 @@ void* CXLManager::GetNewSegment(){
 	return nullptr;
 }
 
+bool CXLManager::FreeSegment(void* segment_addr) {
+	if (segment_addr == nullptr || segments_ == nullptr || bitmap_ == nullptr) {
+		return false;
+	}
+	const uintptr_t base = reinterpret_cast<uintptr_t>(segments_);
+	const uintptr_t addr = reinterpret_cast<uintptr_t>(segment_addr);
+	if (addr < base || (addr - base) % SEGMENT_SIZE != 0) {
+		LOG(ERROR) << "FreeSegment: address not a segment base " << segment_addr;
+		return false;
+	}
+	const size_t global_idx = (addr - base) / SEGMENT_SIZE;
+	size_t total_segments = 0;
+	{
+		size_t cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+		size_t TINode_Region_size = sizeof(TInode) * MAX_TOPIC_SIZE;
+		size_t padding = TINode_Region_size - ((TINode_Region_size/cacheline_size) * cacheline_size);
+		TINode_Region_size += padding;
+		size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
+		size_t cxl_size = Embarcadero::Configuration::getInstance().config().cxl.size.get();
+		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
+		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
+		size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
+		size_t Segment_Region_size = (cxl_size - kPhase2MetadataEnd - TINode_Region_size -
+			Bitmap_Region_size - BatchHeaders_Region_size - SessionTable_Region_size);
+		padding = Segment_Region_size % cacheline_size;
+		Segment_Region_size -= padding;
+		total_segments = Segment_Region_size / SEGMENT_SIZE;
+	}
+	if (global_idx >= total_segments) {
+		LOG(ERROR) << "FreeSegment: out of range index " << global_idx;
+		return false;
+	}
+	uint64_t* bitmap64 = static_cast<uint64_t*>(bitmap_);
+	const size_t word = global_idx / 64;
+	const uint64_t mask = 1ULL << (global_idx % 64);
+	const uint64_t old = __atomic_fetch_and(&bitmap64[word], ~mask, __ATOMIC_SEQ_CST);
+	if (!(old & mask)) {
+		LOG(WARNING) << "FreeSegment: segment " << global_idx << " was already free";
+		return false;
+	}
+	CXL::store_fence();
+	CXL::flush_cacheline(&bitmap64[word]);
+	CXL::store_fence();
+	LOG(INFO) << "Broker " << broker_id_ << " freed segment " << global_idx;
+	return true;
+}
+
 void* CXLManager::GetNewBatchHeaderLog(){
 	static std::atomic<size_t> batch_header_log_count{0};
 	CHECK_LT(batch_header_log_count, MAX_TOPIC_SIZE) << "You are creating too many topics";

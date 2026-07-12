@@ -1,4 +1,5 @@
 #include "common.h"
+#include "common/ack_rf_policy.h"
 
 #include <cstdio>
 #include <sstream>
@@ -104,6 +105,12 @@ heartbeat_system::SequencerType parseSequencerType(const std::string& value) {
 
 bool CreateNewTopic(std::unique_ptr<HeartBeat::Stub>& stub, char topic[TOPIC_NAME_SIZE],
 		int order, SequencerType seq_type, int replication_factor, bool replicate_tinode, int ack_level) {
+	const auto ack_rf = Embarcadero::ValidateAckReplicationPolicy(ack_level, replication_factor);
+	if (!ack_rf.ok) {
+		LOG(ERROR) << "CreateNewTopic rejected: " << ack_rf.error;
+		return false;
+	}
+
 	// Prepare request
 	grpc::ClientContext context;
 	heartbeat_system::CreateTopicRequest create_topic_req;

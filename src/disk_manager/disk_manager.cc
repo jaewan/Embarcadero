@@ -24,6 +24,7 @@
 #include "cxl_manager/cxl_datastructure.h"
 #include "common/order_level.h"
 #include "common/env_flags.h"
+#include "common/ack_rf_policy.h"
 #include "common/performance_utils.h"
 #include "common/replica_disk_dirs.h"
 
@@ -193,12 +194,24 @@ namespace Embarcadero{
 					}
 				}
 
-				// Default disk path: /tmp/embarcadero_replica_<broker_id>.dat
+				const Embarcadero::ChainReplicationConfig chain_cfg =
+					Embarcadero::ParseChainReplicationConfig();
+
+				// Default disk path must be under a configured replica directory for media-durable
+				// mode. Memory sinks do not require replica disk directories.
 				std::string disk_path;
 				if (disk_path_env) {
 					disk_path = disk_path_env;
+				} else if (chain_cfg.IsMemorySink()) {
+					disk_path = "[in-memory-sink]";
 				} else {
-					disk_path = "/tmp/embarcadero_replica_" + std::to_string(broker_id_) + ".dat";
+					auto dirs = Embarcadero::ResolveWritableReplicationDirs();
+					if (dirs.empty()) {
+						LOG(FATAL) << "DiskManager: no writable replication dirs and no "
+						           << "EMBARCADERO_DISK_PATH; refusing /tmp fallback";
+					}
+					disk_path = dirs.front() + "/embarcadero_replica_" +
+					            std::to_string(broker_id_) + ".dat";
 				}
 
 				// Calculate GOI and CV addresses from cxl_addr_
@@ -211,11 +224,14 @@ namespace Embarcadero{
 					chain_replication_manager_ = std::make_unique<Embarcadero::ChainReplicationManager>(
 						replica_id, replication_factor, broker_id_, num_brokers, cxl_addr_, goi, cv, disk_path);
 					chain_replication_manager_->Start();
+					chain_replication_factor_ = replication_factor;
 
 					LOG(INFO) << "DiskManager: Chain replication enabled (replica_id=" << replica_id
 					          << ", broker_id=" << broker_id_
 					          << ", num_brokers=" << num_brokers
 					          << ", replication_factor=" << replication_factor
+					          << ", sink_mode=" << Embarcadero::ChainReplicationSinkModeName(chain_cfg.sink_mode)
+					          << ", ack_claim=" << Embarcadero::ChainReplicationAckClaimLabel(chain_cfg.sink_mode)
 					          << ", disk=" << disk_path << ")";
 				} else {
 					LOG(INFO) << "DiskManager: Chain replication disabled (replication_factor="
@@ -303,6 +319,35 @@ namespace Embarcadero{
 		}
 	}
 
+	void DiskManager::EnsureTopicReplicationFactor(int topic_replication_factor) {
+		if (topic_replication_factor < 0) {
+			LOG(FATAL) << "DiskManager::EnsureTopicReplicationFactor: invalid topic RF="
+			           << topic_replication_factor;
+		}
+		if (topic_replication_factor == 0) {
+			return;
+		}
+		if (chain_replication_manager_ == nullptr) {
+			// Chain not started at broker boot (env RF=0). Topic RF is authoritative:
+			// require EMBARCADERO_REPLICATION_FACTOR to match before ACK2 can be claimed.
+			if (topic_replication_factor >= Embarcadero::kMinReplicationFactorForAck2) {
+				LOG(ERROR) << "DiskManager::EnsureTopicReplicationFactor: topic RF="
+				           << topic_replication_factor
+				           << " but chain replication is not running. Set "
+				           << "EMBARCADERO_REPLICATION_FACTOR=" << topic_replication_factor
+				           << " at broker start (per-topic RF must match durable replica path).";
+			}
+			return;
+		}
+		if (chain_replication_factor_ != topic_replication_factor) {
+			LOG(FATAL) << "DiskManager::EnsureTopicReplicationFactor: topic RF="
+			           << topic_replication_factor
+			           << " conflicts with chain replication RF="
+			           << chain_replication_factor_
+			           << " (from EMBARCADERO_REPLICATION_FACTOR). Fail closed.";
+		}
+	}
+
 	void DiskManager::Replicate(TInode* topic_inode, TInode* replica_tinode, int replication_factor){
 		// ORDER=5 (strong) on EMBARCADERO uses GOI + chain replication + CompletionVector.
 		// Do not start legacy batch-ring replication workers on this path.
@@ -386,7 +431,7 @@ namespace Embarcadero{
 					           << " error=" << ec.message();
 				}
 				std::string base_filename = base_dir+"/embarcadero_replication_log"+std::to_string(b) +".dat";
-				int fd = open(base_filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+				int fd = open(base_filename.c_str(), O_RDWR | O_CREAT, 0644);
 				if(fd == -1){
 					LOG(FATAL) << "DiskManager::Replicate: file open failed for " << base_filename
 					           << " error=" << strerror(errno);

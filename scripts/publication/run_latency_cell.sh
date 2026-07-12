@@ -50,6 +50,29 @@ if [[ -z "$ACK_LEVEL" ]]; then
   fi
 fi
 
+CHAIN_SINK_MODE="disk-durable"
+if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_SINK:-}" ]]; then
+  CHAIN_SINK_MODE="${EMBARCADERO_CHAIN_REPLICATION_SINK}"
+elif [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM:-0}" == "1" ]]; then
+  if [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-0}" == "1" ]]; then
+    CHAIN_SINK_MODE="memory-copy"
+  else
+    CHAIN_SINK_MODE="memory-accounting"
+  fi
+fi
+case "$CHAIN_SINK_MODE" in
+  memory-copy|memory_copy|memory-accounting|memory_accounting|accounting|copy)
+    ACK_CLAIM_LABEL="replicated_ack_emulated"
+    ;;
+  *)
+    if [[ "$ACK_LEVEL" == "2" ]]; then
+      ACK_CLAIM_LABEL="media_durable"
+    else
+      ACK_CLAIM_LABEL="n/a"
+    fi
+    ;;
+esac
+
 if [[ -z "$LATENCY_METRIC_NAME" ]]; then
   case "$LATENCY_METRIC_SOURCE" in
     e2e)
@@ -73,6 +96,19 @@ CELL_ID="${SYSTEM}_order${ORDER}_rf${REPLICATION_FACTOR}"
 RUN_DIR="$PROJECT_ROOT/data/publication/latency/$TAG/$CELL_ID/run_$RUN_ID"
 RAW_DATA_DIR="$RUN_DIR/rawdata"
 mkdir -p "$RAW_DATA_DIR"
+
+cat > "$RUN_DIR/run_metadata.txt" <<EOF
+chain_replication_sink=$CHAIN_SINK_MODE
+chain_replication_inmem=${EMBARCADERO_CHAIN_REPLICATION_INMEM:-0}
+chain_replication_inmem_copy=${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-0}
+chain_replication_inmem_bytes_per_source=${EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}
+chain_sync_bytes=${EMBARCADERO_CHAIN_SYNC_BYTES:-}
+chain_sync_interval_ms=${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}
+replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}
+ack_claim_label=$ACK_CLAIM_LABEL
+ack_level=$ACK_LEVEL
+replication_factor=$REPLICATION_FACTOR
+EOF
 
 COMMIT="$(git rev-parse HEAD)"
 BROKER_CONFIG_ABS="$PROJECT_ROOT/$PUBLICATION_BROKER_CONFIG"
@@ -217,7 +253,7 @@ scp -o StrictHostKeyChecking=no "${SCALOG_SEQUENCER_LOG_HOST}:/tmp/scalog_sequen
   "$RUN_DIR/${SCALOG_SEQUENCER_LOG_HOST}_scalog_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
-echo "system,order,sequencer,replication_factor,publisher_host,broker_host,run_idx,status,p50_us,p95_us,p99_us,max_us,attempts_used,first_attempt_pass,artifact_dir,commit,metric_source,metric_name" > "$SUMMARY_CSV"
+echo "system,order,sequencer,replication_factor,publisher_host,broker_host,run_idx,status,p50_us,p95_us,p99_us,max_us,attempts_used,first_attempt_pass,artifact_dir,commit,metric_source,metric_name,chain_sink_mode,ack_claim_label" > "$SUMMARY_CSV"
 
 for trial_num in $(seq 1 "$NUM_TRIALS"); do
   trial_dir="$(find "$RAW_DATA_DIR" -type d -name "*_trial${trial_num}" | sort | head -n 1)"
@@ -254,7 +290,7 @@ for trial_num in $(seq 1 "$NUM_TRIALS"); do
     fi
   fi
 
-  echo "$SYSTEM,$ORDER,$SEQUENCER,$REPLICATION_FACTOR,$PUBLISHER_HOST,$BROKER_HOST,$trial_num,$status,$p50,$p95,$p99,$maxv,1,$first_attempt_pass,$trial_dir,$COMMIT,$LATENCY_METRIC_SOURCE,$LATENCY_METRIC_NAME" >> "$SUMMARY_CSV"
+  echo "$SYSTEM,$ORDER,$SEQUENCER,$REPLICATION_FACTOR,$PUBLISHER_HOST,$BROKER_HOST,$trial_num,$status,$p50,$p95,$p99,$maxv,1,$first_attempt_pass,$trial_dir,$COMMIT,$LATENCY_METRIC_SOURCE,$LATENCY_METRIC_NAME,$CHAIN_SINK_MODE,$ACK_CLAIM_LABEL" >> "$SUMMARY_CSV"
 done
 
 summary_rows="$(tail -n +2 "$SUMMARY_CSV" | wc -l | awk '{print $1}')"

@@ -810,6 +810,12 @@ broker_remote_launch() {
   local _remote_rep="${REPLICATION_FACTOR:-${EMBARCADERO_REPLICATION_FACTOR:-0}}"
   local _remote_nb="${NUM_BROKERS:-4}"
   local _remote_disk_dirs="${EMBARCADERO_REPLICA_DISK_DIRS:-}"
+  local _remote_chain_inmem="${EMBARCADERO_CHAIN_REPLICATION_INMEM:-}"
+  local _remote_chain_inmem_copy="${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-}"
+  local _remote_chain_inmem_bytes="${EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}"
+  local _remote_chain_sink="${EMBARCADERO_CHAIN_REPLICATION_SINK:-}"
+  local _remote_chain_sync_bytes="${EMBARCADERO_CHAIN_SYNC_BYTES:-}"
+  local _remote_chain_sync_interval_ms="${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}"
 
   broker_remote_ssh env \
     REMOTE_STATE_DIR="$REMOTE_BROKER_STATE_DIR" \
@@ -831,6 +837,12 @@ broker_remote_launch() {
     REMOTE_REPLICATION_FACTOR="$_remote_rep" \
     REMOTE_NUM_BROKERS="$_remote_nb" \
     REMOTE_REPLICA_DISK_DIRS="$_remote_disk_dirs" \
+    REMOTE_CHAIN_REPLICATION_INMEM="$_remote_chain_inmem" \
+    REMOTE_CHAIN_REPLICATION_INMEM_COPY="$_remote_chain_inmem_copy" \
+    REMOTE_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE="$_remote_chain_inmem_bytes" \
+    REMOTE_CHAIN_REPLICATION_SINK="$_remote_chain_sink" \
+    REMOTE_CHAIN_SYNC_BYTES="$_remote_chain_sync_bytes" \
+    REMOTE_CHAIN_SYNC_INTERVAL_MS="$_remote_chain_sync_interval_ms" \
     bash -s <<'EOF'
 set -euo pipefail
 state_dir=${REMOTE_STATE_DIR:?}
@@ -852,6 +864,12 @@ lazylog_seq_port=${REMOTE_LAZYLOG_SEQ_PORT:-}
 replication_factor_cfg=${REMOTE_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${REMOTE_NUM_BROKERS:-4}
 replica_disk_dirs=${REMOTE_REPLICA_DISK_DIRS:-}
+chain_replication_inmem=${REMOTE_CHAIN_REPLICATION_INMEM:-}
+chain_replication_inmem_copy=${REMOTE_CHAIN_REPLICATION_INMEM_COPY:-}
+chain_replication_inmem_bytes=${REMOTE_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}
+chain_replication_sink=${REMOTE_CHAIN_REPLICATION_SINK:-}
+chain_sync_bytes=${REMOTE_CHAIN_SYNC_BYTES:-}
+chain_sync_interval_ms=${REMOTE_CHAIN_SYNC_INTERVAL_MS:-}
 mkdir -p "$state_dir"
 rm -f "$state_dir/broker_${idx}.pid" "$state_dir/broker_${idx}.ready" "$state_dir/broker_${idx}.log"
 nohup env \
@@ -875,6 +893,12 @@ nohup env \
   EMBARCADERO_REPLICATION_FACTOR="$replication_factor_cfg" \
   NUM_BROKERS="$num_brokers_cfg" \
   EMBARCADERO_REPLICA_DISK_DIRS="$replica_disk_dirs" \
+  EMBARCADERO_CHAIN_REPLICATION_INMEM="$chain_replication_inmem" \
+  EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY="$chain_replication_inmem_copy" \
+  EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE="$chain_replication_inmem_bytes" \
+  EMBARCADERO_CHAIN_REPLICATION_SINK="$chain_replication_sink" \
+  EMBARCADERO_CHAIN_SYNC_BYTES="$chain_sync_bytes" \
+  EMBARCADERO_CHAIN_SYNC_INTERVAL_MS="$chain_sync_interval_ms" \
   bash -s <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
 set -euo pipefail
 state_dir=${STATE_DIR:?}
@@ -896,6 +920,12 @@ lazylog_seq_port=${EMBARCADERO_LAZYLOG_SEQ_PORT:-}
 replication_factor_cfg=${EMBARCADERO_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${NUM_BROKERS:-4}
 replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}
+chain_replication_inmem=${EMBARCADERO_CHAIN_REPLICATION_INMEM:-}
+chain_replication_inmem_copy=${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-}
+chain_replication_inmem_bytes=${EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}
+chain_replication_sink=${EMBARCADERO_CHAIN_REPLICATION_SINK:-}
+chain_sync_bytes=${EMBARCADERO_CHAIN_SYNC_BYTES:-}
+chain_sync_interval_ms=${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_CXL_MAP_POPULATE=${EMBARCADERO_CXL_MAP_POPULATE:-1}
@@ -905,6 +935,24 @@ export NUM_BROKERS="${num_brokers_cfg:-4}"
 export EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}
 if [ -n "$replica_disk_dirs" ]; then
   export EMBARCADERO_REPLICA_DISK_DIRS="$replica_disk_dirs"
+fi
+if [ -n "$chain_replication_inmem" ]; then
+  export EMBARCADERO_CHAIN_REPLICATION_INMEM="$chain_replication_inmem"
+fi
+if [ -n "$chain_replication_inmem_copy" ]; then
+  export EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY="$chain_replication_inmem_copy"
+fi
+if [ -n "$chain_replication_inmem_bytes" ]; then
+  export EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE="$chain_replication_inmem_bytes"
+fi
+if [ -n "$chain_replication_sink" ]; then
+  export EMBARCADERO_CHAIN_REPLICATION_SINK="$chain_replication_sink"
+fi
+if [ -n "$chain_sync_bytes" ]; then
+  export EMBARCADERO_CHAIN_SYNC_BYTES="$chain_sync_bytes"
+fi
+if [ -n "$chain_sync_interval_ms" ]; then
+  export EMBARCADERO_CHAIN_SYNC_INTERVAL_MS="$chain_sync_interval_ms"
 fi
 if [ "$sequence" = "SCALOG" ]; then
   export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1}

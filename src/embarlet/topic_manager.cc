@@ -4,6 +4,7 @@
 #include <cstring>
 #include <algorithm>
 #include <limits>
+#include "common/ack_rf_policy.h"
 #include "common/performance_utils.h"
 #include "common/order_level.h"
 #include <immintrin.h>
@@ -303,6 +304,8 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 				session_table,
 				segment_metadata
 				);
+		topics_[topic]->SetFreeSegmentCallback(
+			[this](void* seg) { return cxl_manager_.FreeSegment(seg); });
 
 		// Start the topic's threads using factory pattern
 		try {
@@ -317,6 +320,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 	// Handle replication if needed
 	{
 		int replication_factor = tinode->replication_factor;
+		disk_manager_.EnsureTopicReplicationFactor(replication_factor);
 		if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
 			disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
 		}
@@ -410,17 +414,15 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 		           << topic << "', order=" << order << ")";
 		return nullptr;
 	}
-	if (seq_type == EMBARCADERO && ack_level == 2 && replication_factor <= 0) {
-		LOG(ERROR) << "CreateNewTopicInternal: ACK level 2 requires replication_factor>0 "
-		           << "(topic='" << topic << "', replication_factor=" << replication_factor << ")";
-		return nullptr;
-	}
-	if (seq_type == SCALOG && ack_level == 2) {
-		if (replication_factor <= 0) {
-			LOG(ERROR) << "CreateNewTopicInternal: Scalog ACK level 2 requires replication_factor>0 "
-			           << "(topic='" << topic << "', replication_factor=" << replication_factor << ")";
+	{
+		const auto ack_rf = ValidateAckReplicationPolicy(ack_level, replication_factor);
+		if (!ack_rf.ok) {
+			LOG(ERROR) << "CreateNewTopicInternal: " << ack_rf.error
+			           << " (topic='" << topic << "', sequencer=" << seq_type << ")";
 			return nullptr;
 		}
+	}
+	if (seq_type == SCALOG && ack_level == 2) {
 		// Scalog ACK2 tracks durability via the CXL replication path.
 		// Running ACK2 without SCALOG_CXL_MODE causes non-progressing ACK frontiers.
 		const char* scalog_cxl_mode = std::getenv("SCALOG_CXL_MODE");
@@ -559,6 +561,8 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 				session_table,
 				segment_metadata
 				);
+		topics_[topic]->SetFreeSegmentCallback(
+			[this](void* seg) { return cxl_manager_.FreeSegment(seg); });
 
 		// Start the topic's threads using factory pattern
 		try {
@@ -571,6 +575,7 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 	}
 
 	// Handle replication if needed
+	disk_manager_.EnsureTopicReplicationFactor(replication_factor);
 	if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
 		disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
 	}

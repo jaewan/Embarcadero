@@ -27,6 +27,7 @@
 #include "common/env_flags.h"
 #include "common/order_level.h"
 #include "common/performance_utils.h"
+#include "common/stage_trace.h"
 #include "common/wire_formats.h"
 #include "embarlet/sequencer_utils.h"
 #include "session.pb.h"
@@ -199,19 +200,23 @@ static DurableSessionSnapshot ReadDurableSessionSnapshot(
 	snapshot.goi_committed_hwm_found = ScanGOICommittedHwm(
 		cxl_manager->GetGOI(), cxl_manager->GetControlBlock(), client_id, session_epoch,
 		&snapshot.goi_committed_hwm);
-	snapshot.reconnect_committed_hwm =
-		ReconnectAnswerHwm(snapshot.committed_hwm, snapshot.goi_committed_hwm);
+	snapshot.reconnect_committed_hwm = ReconnectAnswerHwm(
+		snapshot.committed_hwm,
+		snapshot.goi_committed_hwm_found,
+		snapshot.goi_committed_hwm);
 	return snapshot;
 }
 
 static bool SendSessionFencedControl(
 		int fd,
 		uint64_t committed_batch_seq,
+		bool has_committed_prefix,
 		uint64_t committed_msg_hwm,
 		uint64_t control_epoch,
 		embarcadero::session::SessionFenced::Reason reason) {
 	embarcadero::session::SessionFenced fenced;
-	fenced.set_committed_batch_seq(committed_batch_seq);
+	fenced.set_committed_batch_seq(has_committed_prefix ? committed_batch_seq : 0);
+	fenced.set_has_committed_prefix(has_committed_prefix);
 	fenced.set_committed_msg_hwm(committed_msg_hwm);
 	fenced.set_control_epoch(control_epoch);
 	fenced.set_reason(reason);
@@ -262,10 +267,12 @@ static bool SendExactNetwork(int fd, const void* data, size_t len) {
 static bool SendSessionOpenAckControl(
 		int fd,
 		uint64_t committed_hwm,
+		bool has_committed_prefix,
 		embarcadero::session::SessionOpenAck::Status status,
 		uint32_t assigned_session_epoch) {
 	embarcadero::session::SessionOpenAck ack;
-	ack.set_committed_hwm(committed_hwm);
+	ack.set_committed_hwm(has_committed_prefix ? committed_hwm : 0);
+	ack.set_has_committed_prefix(has_committed_prefix);
 	ack.set_status(status);
 	ack.set_assigned_session_epoch(assigned_session_epoch);
 	std::string payload;
@@ -1016,6 +1023,7 @@ void NetworkManager::ReqReceiveThread() {
 		EmbarcaderoReq handshake{};
 		size_t read_total = 0;
 
+		bool handshake_failed = false;
 		while (read_total < sizeof(handshake)) {
 			int ret = recv(req.client_socket,
 					reinterpret_cast<char*>(&handshake) + read_total,
@@ -1027,19 +1035,29 @@ void NetworkManager::ReqReceiveThread() {
 					    !stop_threads_) {
 						continue;
 					}
+					// EBADF: socket already closed elsewhere. Do NOT close again —
+					// a tight continue here used to spin and close() a recycled fd
+					// (observed: gRPC epoll_ctl Bad file descriptor after TCP probes).
 					LOG(ERROR) << "Error receiving handshake: " << strerror(errno);
+					if (errno != EBADF) {
+						close(req.client_socket);
+					}
+				} else {
+					close(req.client_socket);
 				}
-				close(req.client_socket);
-				if (stop_threads_) {
-					break;
-				}
-				return;
+				handshake_failed = true;
+				break;  // leave recv loop; outer loop fetches next queued request
 			}
 			read_total += static_cast<size_t>(ret);
 		}
 		if (stop_threads_) {
-			close(req.client_socket);
+			if (!handshake_failed) {
+				close(req.client_socket);
+			}
 			break;
+		}
+		if (handshake_failed) {
+			continue;
 		}
 
 		// Ensure topic string is terminated to avoid strlen overrun
@@ -1093,9 +1111,13 @@ void NetworkManager::HandlePublishRequest(
 		const auto status = snapshot.fenced
 			? embarcadero::session::SessionOpenAck::FENCED
 			: embarcadero::session::SessionOpenAck::OK;
+		// Inclusive HWM with empty-prefix disambiguation:
+		// expected_seq is exclusive-next; prefix exists iff expected_seq > 0.
+		const bool has_committed_prefix = snapshot.expected_seq > 0;
 		if (!SendSessionOpenAckControl(
 				client_socket,
 				snapshot.reconnect_committed_hwm,
+				has_committed_prefix,
 				status,
 				connection_session_epoch)) {
 			LOG(ERROR) << "HandlePublishRequest: failed to send SessionOpenAck client_id="
@@ -1108,9 +1130,18 @@ void NetworkManager::HandlePublishRequest(
 		          << " requested_session_epoch=" << open.requested_session_epoch()
 		          << " assigned_session_epoch=" << connection_session_epoch
 		          << " committed_hwm=" << snapshot.reconnect_committed_hwm
+		          << " has_committed_prefix=" << (has_committed_prefix ? 1 : 0)
 		          << " status=" << status;
-	}
-	if (connection_session_epoch != 0) {
+		// Reuse the already-loaded snapshot for reconnect diagnostics (avoid a second GOI scan).
+		LOG(INFO) << "HandlePublishRequest: session reconnect client_id=" << handshake.client_id
+		          << " session_epoch=" << connection_session_epoch
+		          << " active=" << snapshot.active
+		          << " fenced=" << snapshot.fenced
+		          << " committed_hwm=" << snapshot.reconnect_committed_hwm
+		          << " session_entry_hwm=" << snapshot.committed_hwm
+		          << " goi_hwm=" << snapshot.goi_committed_hwm
+		          << " goi_found=" << (snapshot.goi_committed_hwm_found ? 1 : 0);
+	} else if (connection_session_epoch != 0) {
 		DurableSessionSnapshot snapshot = ReadDurableSessionSnapshot(
 			cxl_manager_, handshake.topic, handshake.client_id, connection_session_epoch);
 		LOG(INFO) << "HandlePublishRequest: session reconnect client_id=" << handshake.client_id
@@ -1484,6 +1515,18 @@ void NetworkManager::HandlePublishRequest(
 		int sleep_ms = 1;  // Start at 1 ms
 		auto post_recv_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 		while (!batch_header_location && !stop_threads_) {
+			if (topic_ptr != nullptr && topic_ptr->IsPBRAboveHighWatermark(80)) {
+				// Independent PBR capacity backpressure: pause ingest while the sequencer
+				// drains the shared BatchHeader ring (export uses the same ring today).
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				if (std::chrono::steady_clock::now() >= post_recv_deadline) {
+					LOG(ERROR) << "NetworkManager: PBR high-watermark timeout for batch_seq="
+					           << batch_header.batch_seq << " client_id=" << handshake.client_id;
+					running = false;
+					break;
+				}
+				continue;
+			}
 			// [[FIX: Force Epoch Refresh]] Pass false for epoch_already_checked to force ReservePBRSlotAfterRecv
 			// to refresh the epoch from CXL. This ensures that if recv() blocked for a long time,
 			// we don't stamp the batch with a stale epoch that gets dropped by the sequencer.
@@ -1493,6 +1536,11 @@ void NetworkManager::HandlePublishRequest(
 				: cxl_manager_->ReservePBRSlotAfterRecv(handshake.topic, batch_header, buf,
 						segment_header, logical_offset, batch_header_location);
 			if (ok) {
+				Embarcadero::StageTrace::Record(
+					Embarcadero::StageTrace::Stage::BrokerRecvDone,
+					handshake.client_id,
+					batch_header.batch_seq,
+					SteadyNowNsNetwork());
 				break;  // Success
 			}
 			post_recv_attempts++;
@@ -2772,6 +2820,29 @@ void NetworkManager::AckThread(
 		bool found_ack = false;
 		size_t current_ack = (size_t)-1;
 		Topic* ack_topic = topic_manager_ ? topic_manager_->GetTopic(topic) : nullptr;
+		if (ack_topic != nullptr && broker_id_ == 0) {
+			Topic::SessionFenceNotification fence_note;
+			if (ack_topic->TakeSessionFenceNotification(client_id, &fence_note)) {
+				const auto reason = static_cast<embarcadero::session::SessionFenced::Reason>(
+					fence_note.reason);
+				SendSessionFencedControl(
+					ack_fd,
+					fence_note.committed_batch_seq,
+					fence_note.has_committed_prefix,
+					fence_note.committed_msg_hwm,
+					fence_note.control_epoch,
+					reason);
+				LOG(WARNING) << "AckThread: delivered SessionFenced"
+				             << " reason=" << fence_note.reason
+				             << " client_id=" << client_id
+				             << " session_epoch=" << fence_note.session_epoch
+				             << " committed_batch_seq=" << fence_note.committed_batch_seq
+				             << " has_committed_prefix=" << (fence_note.has_committed_prefix ? 1 : 0)
+				             << " committed_msg_hwm=" << fence_note.committed_msg_hwm;
+				terminal_session_fenced = true;
+				break;
+			}
+		}
 		const bool is_order5_head_owned_ack_level1 =
 			(ack_level == 1 &&
 			 ack_topic != nullptr &&
@@ -2811,16 +2882,10 @@ void NetworkManager::AckThread(
 			}
 			fast_polls_without_full_check = 0;
 		} else if (is_order5_head_owned_ack_level2) {
-			// ORDER=5 currently has no true per-client durable frontier in shared memory.
-			// The legacy durable frontier is broker-local and tops out at one broker's routed
-			// message quota, which makes ACK2 stall permanently for multibroker client streams.
-			//
-			// Until ORDER=5 publishes a real per-client durable frontier, use the head
-			// broker's per-client ordered frontier as the authoritative ACK2 source.
-			// This preserves end-to-end correctness for latency/subscriber delivery and
-			// matches the strongest truthful contract the current implementation can provide.
+			// ORDER=5 ACK2: media-durable per-client frontier from CV/GOI attribution.
 			if (broker_id_ == 0) {
-				current_ack = static_cast<size_t>(ack_topic->GetClientOrdered(client_id));
+				ack_topic->MaybeAdvanceOrder5DurableFromCV();
+				current_ack = static_cast<size_t>(ack_topic->GetClientDurable(client_id));
 				expensive_checks_since_last_ack++;
 			} else {
 				current_ack = static_cast<size_t>(-1);
@@ -2865,7 +2930,7 @@ void NetworkManager::AckThread(
 					DurableSessionSnapshot snapshot = ReadDurableSessionSnapshot(
 						cxl_manager_, topic.c_str(), client_id, session_epoch);
 					if (!ShouldTerminalFenceAckRelay(
-							next_to_ack_offset,
+							snapshot.expected_seq > 0 ? snapshot.expected_seq - 1 : 0,
 							snapshot.goi_committed_hwm_found,
 							snapshot.goi_committed_hwm)) {
 						ack_withhold_started_ns = 0;
@@ -2874,13 +2939,17 @@ void NetworkManager::AckThread(
 						          << " client_id=" << client_id
 						          << " session_epoch=" << session_epoch
 						          << " next_to_ack=" << next_to_ack_offset
+						          << " client_batch_hwm="
+						          << (snapshot.expected_seq > 0 ? snapshot.expected_seq - 1 : 0)
 						          << " goi_hwm=" << snapshot.goi_committed_hwm
 						          << " producing_epoch=" << producing_epoch
 						          << " control_epoch=" << control_epoch;
 						} else {
+							const bool has_committed_prefix = snapshot.expected_seq > 0;
 							SendSessionFencedControl(
 								ack_fd,
 								snapshot.reconnect_committed_hwm,
+								has_committed_prefix,
 								current_ack,
 								control_epoch,
 								embarcadero::session::SessionFenced::EPOCH_STALE);
@@ -2890,6 +2959,7 @@ void NetworkManager::AckThread(
 							             << " producing_epoch=" << producing_epoch
 							             << " control_epoch=" << control_epoch
 							             << " committed_batch_seq=" << snapshot.reconnect_committed_hwm
+							             << " has_committed_prefix=" << (has_committed_prefix ? 1 : 0)
 							             << " committed_msg_hwm=" << current_ack;
 							terminal_session_fenced = true;
 							break;
@@ -2907,6 +2977,11 @@ void NetworkManager::AckThread(
 			last_known_ack = current_ack;  // Update cache
 			expensive_checks_since_last_ack = 0;  // Reset counter
 			ack_last_progress_time = std::chrono::steady_clock::now();
+			Embarcadero::StageTrace::Record(
+				Embarcadero::StageTrace::Stage::AckObserve,
+				client_id,
+				current_ack,
+				SteadyNowNsNetwork());
 		}
 
 		if (!found_ack) {

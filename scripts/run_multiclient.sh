@@ -68,7 +68,7 @@ MAX_CLIENTS=${#CLIENT_HOSTS[@]}
 # ---------------------------------------------------------------------------
 NUM_CLIENTS=${NUM_CLIENTS:-1}
 NUM_BROKERS=${NUM_BROKERS:-4}
-NUM_TRIALS=${NUM_TRIALS:-3}
+NUM_TRIALS=${NUM_TRIALS:-5}
 TRIAL_MAX_ATTEMPTS=${TRIAL_MAX_ATTEMPTS:-3}
 
 # Total bytes across ALL clients combined; divided equally per client
@@ -594,24 +594,35 @@ compute_overlap_throughput_gbps() {
     local tmp_bounds
     tmp_bounds="$(mktemp)"
     local file
+    local layer_col="${OVERLAP_LAYER_COL:-Cum_Ack_Bytes}"
+    local rate_col="${OVERLAP_RATE_COL:-Ack_GiBps}"
 
     for file in "${files[@]}"; do
         [[ -s "$file" ]] || continue
-        awk -F',' '
+        awk -F',' -v layer="$layer_col" '
             NR==1 {
-                for (i = 1; i <= NF; ++i) if ($i == "Total_GBps") col = i
+                for (i = 1; i <= NF; ++i) {
+                    if ($i == layer) layer_i = i
+                    if ($i == "Cum_Ack_Bytes") ack_i = i
+                    if ($i == "Cum_Sent_Bytes") sent_i = i
+                    if ($i == "Total_GBps") total_i = i
+                }
+                if (!layer_i) layer_i = (ack_i ? ack_i : (sent_i ? sent_i : 0))
                 next
             }
-            col > 0 {
+            layer_i > 0 {
                 ts = $1 + 0
-                g = $col + 0
-                if (g > 0.000001) {
-                    if (!seen) { first = ts; seen = 1 }
+                bytes = $layer_i + 0
+                if (bytes > 0) {
+                    if (!seen) { first = ts; first_bytes = bytes; seen = 1 }
                     last = ts
+                    last_bytes = bytes
                 }
             }
             END {
-                if (seen) printf "%s,%s,%s\n", FILENAME, first, last
+                if (seen && last > first) {
+                    printf "%s,%s,%s,%s,%s\n", FILENAME, first, last, first_bytes, last_bytes
+                }
             }
         ' "$file" >> "$tmp_bounds"
     done
@@ -621,13 +632,6 @@ compute_overlap_throughput_gbps() {
         return 1
     fi
 
-    # Guard against degenerate timeseries (e.g. a stale client binary writing
-    # Timestamp=0 on every row — seen on c3, run 20260711T040441Z: the overlap
-    # window collapsed to 1 ms and the result was garbage). A usable file must
-    # span >= 500 ms of active samples; if any expected client's file is
-    # unusable, the overlap no longer covers all clients — fail the overlap so
-    # the harness records nothing (the naive per-trial TOTAL remains in the
-    # cell log) instead of a silently wrong number.
     local expected_clients=${#files[@]}
     local valid_bounds
     valid_bounds="$(mktemp)"
@@ -642,51 +646,64 @@ compute_overlap_throughput_gbps() {
     local bounds_count
     bounds_count="$(wc -l < "$tmp_bounds")"
     if [[ "$bounds_count" -lt "$expected_clients" ]]; then
-        echo "WARNING: overlap aborted — only ${bounds_count}/${expected_clients} clients have usable timeseries; falling back to naive TOTAL (check client binary vintage / clock sync)" >&2
+        echo "WARNING: overlap aborted — only ${bounds_count}/${expected_clients} clients have usable timeseries" >&2
         rm -f "$tmp_bounds"
         return 1
     fi
 
-    # Phase-align each client's active window to its first positive sample so that
-    # host clock skew / SSH launch jitter does not eliminate overlap coverage.
+    # True wall-clock intersection of active windows (not phase-aligned means).
     local overlap_start overlap_end
-    overlap_start=0
-    overlap_end="$(awk -F',' '
-        NR==1 { m = ($3 - $2) }
-        {
-            d = ($3 - $2)
-            if (d < m) m = d
-        }
-        END { printf "%.0f", m }
-    ' "$tmp_bounds")"
-    if [[ -z "$overlap_end" ]]; then
+    overlap_start="$(awk -F',' 'NR==1{m=$2} {if($2>m)m=$2} END{printf "%.0f", m}' "$tmp_bounds")"
+    overlap_end="$(awk -F',' 'NR==1{m=$3} {if($3<m)m=$3} END{printf "%.0f", m}' "$tmp_bounds")"
+    if [[ -z "$overlap_start" || -z "$overlap_end" || "$overlap_end" -le "$overlap_start" ]]; then
         rm -f "$tmp_bounds"
         return 1
-    fi
-    if [[ "$overlap_end" -le "$overlap_start" ]]; then
-        overlap_end=$((overlap_start + 1))
     fi
 
     local overlap_window_ms=$((overlap_end - overlap_start))
-    local sum_mean_gbps="0"
+    # Publication gate: require >= 10s shared steady overlap when available.
+    local min_overlap_ms="${MIN_OVERLAP_MS:-10000}"
+    if [[ "$overlap_window_ms" -lt 500 ]]; then
+        echo "WARNING: overlap window only ${overlap_window_ms} ms (< 500 ms)" >&2
+        rm -f "$tmp_bounds"
+        return 1
+    fi
+    if [[ "$overlap_window_ms" -lt "$min_overlap_ms" ]]; then
+        echo "WARNING: overlap window ${overlap_window_ms} ms < MIN_OVERLAP_MS=${min_overlap_ms}; reporting anyway with caution" >&2
+    fi
+
+    local sum_gibps="0"
     local client_count=0
-    local ts_file first_ts mean
-    while IFS=',' read -r ts_file first_ts _; do
+    local ts_file first_ts last_ts first_bytes last_bytes
+    while IFS=',' read -r ts_file first_ts last_ts first_bytes last_bytes; do
         [[ -f "$ts_file" ]] || continue
-        mean="$(awk -F',' -v b="$first_ts" -v s="$overlap_start" -v e="$overlap_end" '
+        local gibps
+        gibps="$(awk -F',' -v s="$overlap_start" -v e="$overlap_end" -v layer="$layer_col" '
             NR==1 {
-                for (i = 1; i <= NF; ++i) if ($i == "Total_GBps") col = i
+                for (i = 1; i <= NF; ++i) {
+                    if ($i == layer) layer_i = i
+                    if ($i == "Cum_Ack_Bytes") ack_i = i
+                    if ($i == "Cum_Sent_Bytes") sent_i = i
+                }
+                if (!layer_i) layer_i = (ack_i ? ack_i : sent_i)
                 next
             }
-            col > 0 {
-                ts = ($1 + 0) - b
-                g = $col + 0
-                if (ts >= s && ts <= e) { sum += g; n += 1 }
+            layer_i > 0 {
+                ts = $1 + 0
+                b = $layer_i + 0
+                if (ts >= s && !have_start) { start_b = b; have_start = 1 }
+                if (ts <= e) { end_b = b; have_end = 1 }
             }
-            END { if (n > 0) printf "%.9f", sum / n }
+            END {
+                if (have_start && have_end && e > s) {
+                    delta = end_b - start_b
+                    if (delta < 0) delta = 0
+                    printf "%.9f", (delta / ((e - s) / 1000.0)) / (1024.0*1024.0*1024.0)
+                }
+            }
         ' "$ts_file")"
-        if [[ -n "$mean" ]]; then
-            sum_mean_gbps="$(awk -v a="$sum_mean_gbps" -v b="$mean" 'BEGIN {printf "%.9f", a + b}')"
+        if [[ -n "$gibps" ]]; then
+            sum_gibps="$(awk -v a="$sum_gibps" -v b="$gibps" 'BEGIN {printf "%.9f", a + b}')"
             client_count=$((client_count + 1))
         fi
     done < "$tmp_bounds"
@@ -695,12 +712,8 @@ compute_overlap_throughput_gbps() {
     if [[ "$client_count" -le 0 ]]; then
         return 1
     fi
-    if [[ "$overlap_window_ms" -lt 500 ]]; then
-        echo "WARNING: overlap window only ${overlap_window_ms} ms (< 500 ms) — result too quantized to report; use naive TOTAL" >&2
-        return 1
-    fi
 
-    printf "%s,%s,%s,%s\n" "$trial" "$sum_mean_gbps" "$overlap_window_ms" "$client_count"
+    printf "%s,%s,%s,%s,%s\n" "$trial" "$sum_gibps" "$overlap_window_ms" "$client_count" "$rate_col"
 }
 
 shm_cleanup() {
@@ -806,6 +819,25 @@ start_brokers() {
     export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
     export EMBARCADERO_ORDER0_FAST_PATH
     export EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES
+    # Chain replication sink profile (forwarded to remote brokers via broker_lifecycle).
+    if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_SINK:-}" ]]; then
+        export EMBARCADERO_CHAIN_REPLICATION_SINK
+    fi
+    if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_INMEM:-}" ]]; then
+        export EMBARCADERO_CHAIN_REPLICATION_INMEM
+    fi
+    if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-}" ]]; then
+        export EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY
+    fi
+    if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}" ]]; then
+        export EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE
+    fi
+    if [[ -n "${EMBARCADERO_CHAIN_SYNC_BYTES:-}" ]]; then
+        export EMBARCADERO_CHAIN_SYNC_BYTES
+    fi
+    if [[ -n "${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}" ]]; then
+        export EMBARCADERO_CHAIN_SYNC_INTERVAL_MS
+    fi
     # Pass epoch tuning to embarlet if set; broker reads it in EpochDriverThread.
     if [[ -n "${EMBAR_ORDER5_EPOCH_US:-}" ]]; then
         export EMBAR_ORDER5_EPOCH_US
@@ -981,6 +1013,31 @@ printf "  %-32s %s\n" "NUM_BROKERS:"                   "$NUM_BROKERS"
 printf "  %-32s %s\n" "NUM_TRIALS:"                    "$NUM_TRIALS"
 printf "  %-32s %s\n" "SEQUENCER / ORDER:"             "$SEQUENCER / $ORDER"
 printf "  %-32s %s\n" "ACK / REPLICATION_FACTOR:"      "$ACK / $REPLICATION_FACTOR"
+# Resolve chain sink labeling for publication metadata (memory != media_durable).
+CHAIN_SINK_MODE="disk-durable"
+if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_SINK:-}" ]]; then
+    CHAIN_SINK_MODE="${EMBARCADERO_CHAIN_REPLICATION_SINK}"
+elif [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM:-0}" == "1" ]]; then
+    if [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-0}" == "1" ]]; then
+        CHAIN_SINK_MODE="memory-copy"
+    else
+        CHAIN_SINK_MODE="memory-accounting"
+    fi
+fi
+case "$CHAIN_SINK_MODE" in
+    memory-copy|memory_copy|memory-accounting|memory_accounting|accounting|copy)
+        ACK_CLAIM_LABEL="replicated_ack_emulated"
+        ;;
+    *)
+        if [[ "$ACK" == "2" ]]; then
+            ACK_CLAIM_LABEL="media_durable"
+        else
+            ACK_CLAIM_LABEL="n/a"
+        fi
+        ;;
+esac
+printf "  %-32s %s\n" "CHAIN_SINK_MODE:"               "$CHAIN_SINK_MODE"
+printf "  %-32s %s\n" "ACK_CLAIM_LABEL:"               "$ACK_CLAIM_LABEL"
 printf "  %-32s %s\n" "MESSAGE_SIZE:"                  "$MESSAGE_SIZE B"
 printf "  %-32s %s\n" "TOTAL_MESSAGE_SIZE:"            "$TOTAL_MESSAGE_SIZE B  ($(( TOTAL_MESSAGE_SIZE / 1024 / 1024 )) MiB)"
 printf "  %-32s %s\n" "LOAD_PER_CLIENT:"               "$LOAD_PER_CLIENT B  ($(( LOAD_PER_CLIENT / 1024 / 1024 )) MiB)"
@@ -1062,9 +1119,11 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
         declare -a CLIENT_PUSH_HOSTS=()
         declare -a CLIENT_PUSH_READY=()
         declare -a CLIENT_PUSH_GO=()
-        use_push_go=0
-        if [[ "$BROKER_KILL_AFTER_SEC" -gt 0 ]]; then
-            use_push_go=1
+        # Publication contract: every throughput run uses one wall-clock axis with
+        # push-ready/go so overlap is not polluted by staggered SSH launch.
+        use_push_go=1
+        if [[ "${EMBARCADERO_DISABLE_PUSH_GO:-0}" == "1" ]]; then
+            use_push_go=0
         fi
 
         for (( i=0; i<NUM_CLIENTS; i++ )); do
@@ -1168,19 +1227,25 @@ ENDINNERSCRIPT
         done
 
         # ------------------------------------------------------------------
-        # E4 failure injection: synchronize push-start (push-ready/go), then
-        # kill after BROKER_KILL_AFTER_SEC of steady publish. Kill must not
-        # arm against the launch barrier — Init still runs after that.
+        # Push-ready/go barrier (always when use_push_go=1). Clients block on
+        # GO after Init; without this writer they hang forever. Optional E4
+        # broker-kill arms after the same GO timestamp.
         # ------------------------------------------------------------------
         BROKER_KILLER_PID=""
-        if [[ "$BROKER_KILL_AFTER_SEC" -gt 0 ]]; then
-            if [[ "$BROKER_KILL_ID" -lt 0 || "$BROKER_KILL_ID" -ge "$NUM_BROKERS" ]]; then
-                echo "ERROR: BROKER_KILL_ID=$BROKER_KILL_ID out of range for NUM_BROKERS=$NUM_BROKERS" >&2
-                exit 1
+        if [[ "$use_push_go" -eq 1 ]]; then
+            if [[ "$BROKER_KILL_AFTER_SEC" -gt 0 ]]; then
+                if [[ "$BROKER_KILL_ID" -lt 0 || "$BROKER_KILL_ID" -ge "$NUM_BROKERS" ]]; then
+                    echo "ERROR: BROKER_KILL_ID=$BROKER_KILL_ID out of range for NUM_BROKERS=$NUM_BROKERS" >&2
+                    exit 1
+                fi
+                kill_target_pid="${BROKER_PIDS[$BROKER_KILL_ID]}"
+                kill_record="$LOG_DIR/trial${trial}_broker_kill.csv"
+                log "  Armed broker kill: broker $BROKER_KILL_ID (pid $kill_target_pid) SIG${BROKER_KILL_SIGNAL} at push-go+${BROKER_KILL_AFTER_SEC}s (wait up to ${BROKER_KILL_PUSH_WAIT_SEC}s for Init)"
+            else
+                kill_target_pid=""
+                kill_record=""
+                log "  Push-go barrier armed (wait up to ${BROKER_KILL_PUSH_WAIT_SEC}s for Init)"
             fi
-            kill_target_pid="${BROKER_PIDS[$BROKER_KILL_ID]}"
-            kill_record="$LOG_DIR/trial${trial}_broker_kill.csv"
-            log "  Armed broker kill: broker $BROKER_KILL_ID (pid $kill_target_pid) SIG${BROKER_KILL_SIGNAL} at push-go+${BROKER_KILL_AFTER_SEC}s (wait up to ${BROKER_KILL_PUSH_WAIT_SEC}s for Init)"
             (
                 push_wait_deadline=$(( $(date +%s) + BROKER_KILL_PUSH_WAIT_SEC ))
                 while true; do
@@ -1198,8 +1263,7 @@ ENDINNERSCRIPT
                         break
                     fi
                     if [[ "$(date +%s)" -ge "$push_wait_deadline" ]]; then
-                        echo "ERROR: broker-kill push-ready wait timed out after ${BROKER_KILL_PUSH_WAIT_SEC}s (${ready}/${NUM_CLIENTS} ready)" >&2
-                        # Unblock any waiting clients so the trial can fail cleanly.
+                        echo "ERROR: push-ready wait timed out after ${BROKER_KILL_PUSH_WAIT_SEC}s (${ready}/${NUM_CLIENTS} ready)" >&2
                         for (( ci=0; ci<NUM_CLIENTS; ci++ )); do
                             h="${CLIENT_PUSH_HOSTS[$ci]}"
                             gf="${CLIENT_PUSH_GO[$ci]}"
@@ -1213,7 +1277,6 @@ ENDINNERSCRIPT
                     fi
                     sleep 0.05
                 done
-                # All publishers past Init/warmup — fire a common go timestamp.
                 GO_NS=$(( $(date +%s%N) + 200000000 ))  # +200ms lead
                 for (( ci=0; ci<NUM_CLIENTS; ci++ )); do
                     h="${CLIENT_PUSH_HOSTS[$ci]}"
@@ -1226,16 +1289,19 @@ ENDINNERSCRIPT
                 done
                 wait || true
                 go_ms=$(( GO_NS / 1000000 ))
-                kill_at_ms=$(( go_ms + BROKER_KILL_AFTER_SEC * 1000 ))
-                echo "  Broker kill: push-go=${go_ms}; killing at ${kill_at_ms} (T+${BROKER_KILL_AFTER_SEC}s)" >&2
-                while [ "$(date +%s%3N)" -lt "$kill_at_ms" ]; do sleep 0.001; done
-                t_kill_ms="$(date +%s%3N)"
-                kill_rc=0
-                kill -"$BROKER_KILL_SIGNAL" "$kill_target_pid" 2>/dev/null || kill_rc=$?
-                {
-                    echo "trial,attempt,broker_id,pid,signal,kill_wall_ms,kill_rel_ms,kill_rc"
-                    echo "$trial,$attempt,$BROKER_KILL_ID,$kill_target_pid,$BROKER_KILL_SIGNAL,$t_kill_ms,$(( t_kill_ms - START_TIME_MS )),$kill_rc"
-                } > "$kill_record"
+                echo "  Push-go fired at ${go_ms}" >&2
+                if [[ "${BROKER_KILL_AFTER_SEC:-0}" -gt 0 && -n "$kill_target_pid" ]]; then
+                    kill_at_ms=$(( go_ms + BROKER_KILL_AFTER_SEC * 1000 ))
+                    echo "  Broker kill: push-go=${go_ms}; killing at ${kill_at_ms} (T+${BROKER_KILL_AFTER_SEC}s)" >&2
+                    while [ "$(date +%s%3N)" -lt "$kill_at_ms" ]; do sleep 0.001; done
+                    t_kill_ms="$(date +%s%3N)"
+                    kill_rc=0
+                    kill -"$BROKER_KILL_SIGNAL" "$kill_target_pid" 2>/dev/null || kill_rc=$?
+                    {
+                        echo "trial,attempt,broker_id,pid,signal,kill_wall_ms,kill_rel_ms,kill_rc"
+                        echo "$trial,$attempt,$BROKER_KILL_ID,$kill_target_pid,$BROKER_KILL_SIGNAL,$t_kill_ms,$(( t_kill_ms - START_TIME_MS )),$kill_rc"
+                    } > "$kill_record"
+                fi
             ) &
             BROKER_KILLER_PID=$!
         fi

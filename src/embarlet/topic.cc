@@ -1,7 +1,9 @@
 #include "topic.h"
 #include "cxl_manager/scalog_local_sequencer.h"
 #include "cxl_manager/lazylog_local_sequencer.h"
+#include "common/ack_rf_policy.h"
 #include "common/performance_utils.h"
+#include "common/stage_trace.h"
 #include "common/wire_formats.h"
 #include "common/order_level.h"
 #include "common/env_flags.h"
@@ -380,6 +382,8 @@ void Topic::ApplyRecoveredSequencer5State(uint64_t session_key, ClientState5& st
 uint64_t Topic::RecoverSequencer5State() {
 	const uint64_t start_ns = SteadyNowNs();
 	recovered_order5_next_expected_.clear();
+	recovered_order5_msg_counts_.clear();
+	recovered_global_seq_ = 0;
 	uint64_t next_goi_index = 0;
 
 	ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
@@ -405,11 +409,17 @@ uint64_t Topic::RecoverSequencer5State() {
 				if (entry->global_seq != i) continue;
 				saw_valid_goi = true;
 				next_goi_index = i + 1;
+				const uint64_t batch_end_order =
+					entry->total_order + static_cast<uint64_t>(entry->message_count);
+				if (batch_end_order > recovered_global_seq_) {
+					recovered_global_seq_ = batch_end_order;
+				}
 				if (entry->session_epoch == 0) continue;
 				const uint64_t session_key =
 					MakeSessionKey(entry->client_id, entry->session_epoch);
 				uint64_t& next_expected = recovered_order5_next_expected_[session_key];
 				next_expected = RecoveredNextExpected(next_expected, entry->client_seq + 1);
+				recovered_order5_msg_counts_[entry->client_id] += entry->message_count;
 			}
 			if (!saw_valid_goi) {
 				next_goi_index = 0;
@@ -444,6 +454,7 @@ uint64_t Topic::RecoverSequencer5State() {
 	}
 	LOG(INFO) << "RecoverSequencer5State: sessions=" << recovered_order5_next_expected_.size()
 	          << " next_goi_index=" << next_goi_index
+	          << " recovered_global_seq=" << recovered_global_seq_
 	          << " elapsed_ns=" << elapsed
 	          << " lease_ns=" << lease;
 	return next_goi_index;
@@ -1335,7 +1346,10 @@ void Topic::AssignOrder(BatchHeader *batch_to_order, size_t start_total_order, B
 }
 
 /**
- * Check and handle segment boundary crossing
+ * Ensure the reserved [log, log+msgSize) lies entirely inside the current segment.
+ * If allocation already crossed the end, seal and roll to a new segment (fail-closed
+ * if no segment is available). Callers that can check first should prefer
+ * ReserveBLogSpace which reserves before crossing.
  */
 void Topic::CheckSegmentBoundary(
 		void* log,
@@ -1345,17 +1359,87 @@ void Topic::CheckSegmentBoundary(
 	const uintptr_t log_addr = reinterpret_cast<uintptr_t>(log);
 	const uintptr_t segment_end = segment_metadata + SEGMENT_SIZE;
 
-	// Check if message would cross segment boundary
-	if (segment_end <= log_addr + msgSize) {
-		LOG(ERROR) << "Segment size limit reached (" << SEGMENT_SIZE
-			<< "). Increase SEGMENT_SIZE";
+	if (segment_end > log_addr + msgSize) {
+		return;
+	}
 
-		// TODO(Jae) Implement segment boundary crossing
-		if (segment_end <= log_addr) {
-			// Allocate a new segment when log is entirely in next segment
-		} else {
-			// Wait for first thread that crossed segment to allocate new segment
+	absl::MutexLock lock(&segment_rollover_mu_);
+	// Re-read under lock; another thread may have already rolled.
+	const uintptr_t cur_seg = reinterpret_cast<uintptr_t>(current_segment_);
+	const uintptr_t cur_end = cur_seg + SEGMENT_SIZE;
+	const uintptr_t cur_log = log_addr_.load(std::memory_order_acquire);
+	if (cur_end > cur_log + msgSize && cur_seg != segment_metadata) {
+		return;  // Rollover already published a usable segment.
+	}
+
+	LOG(WARNING) << "Segment size limit reached (" << SEGMENT_SIZE
+	             << "); attempting rollover topic=" << topic_name_
+	             << " broker=" << broker_id_;
+
+	// Seal: persist written high-water relative to this segment.
+	if (current_segment_ != nullptr && cur_log >= cur_seg) {
+		*reinterpret_cast<unsigned long long int*>(current_segment_) =
+			cur_log - cur_seg;
+		CXL::store_fence();
+		CXL::flush_cacheline(current_segment_);
+		CXL::store_fence();
+	}
+
+	void* next = get_new_segment_callback_ ? get_new_segment_callback_() : nullptr;
+	if (next == nullptr) {
+		LOG(ERROR) << "Segment rollover failed: CXL segments exhausted "
+		           << "topic=" << topic_name_ << " broker=" << broker_id_;
+		return;
+	}
+
+	// Durable segment identity header (first 64 bytes):
+	// [0]=written_hwm, [8]=segment_id, [16]=generation, [24]=prev_cxl_offset
+	auto* header = reinterpret_cast<uint64_t*>(next);
+	header[0] = 0;
+	header[1] = ++segment_id_counter_;
+	header[2] = ++segment_generation_;
+	header[3] = (cxl_addr_ != nullptr)
+		? (reinterpret_cast<uintptr_t>(current_segment_) - reinterpret_cast<uintptr_t>(cxl_addr_))
+		: 0;
+	CXL::store_fence();
+	CXL::flush_cacheline(next);
+	CXL::store_fence();
+
+	retired_segments_.push_back(current_segment_);
+	current_segment_ = next;
+	// Skip 64B header like initial segment setup.
+	const uintptr_t new_base = reinterpret_cast<uintptr_t>(next) + 64;
+	log_addr_.store(new_base, std::memory_order_release);
+	LOG(INFO) << "Segment rolled topic=" << topic_name_
+	          << " broker=" << broker_id_
+	          << " segment_id=" << header[1]
+	          << " generation=" << header[2]
+	          << " new_base=" << reinterpret_cast<void*>(new_base);
+}
+
+void Topic::MaybeGCRetiredSegments() {
+	// Retention floor: keep a few retired segments for reconstruction/recovery windows.
+	// GC returns CXL capacity once FreeSegment is wired; otherwise bound the tracking deque.
+	static constexpr size_t kRetainRetired = 2;
+	static constexpr size_t kMaxTrackedRetired = 64;
+	absl::MutexLock lock(&segment_rollover_mu_);
+	while (retired_segments_.size() > kRetainRetired) {
+		void* seg = retired_segments_.front();
+		if (free_segment_callback_) {
+			if (!free_segment_callback_(seg)) {
+				LOG(WARNING) << "MaybeGCRetiredSegments: FreeSegment failed topic="
+				             << topic_name_ << " seg=" << seg;
+				break;
+			}
+			retired_segments_.pop_front();
+			continue;
 		}
+		if (retired_segments_.size() <= kMaxTrackedRetired) {
+			break;
+		}
+		LOG(WARNING) << "MaybeGCRetiredSegments: dropping oldest retired segment tracking entry "
+		             << "(FreeSegment callback unset); topic=" << topic_name_;
+		retired_segments_.pop_front();
 	}
 }
 
@@ -1756,6 +1840,12 @@ void Topic::UpdatePerClientOrdered(uint32_t client_id, uint64_t count) {
 	absl::MutexLock lock(&per_client_mu_);
 	per_client_ordered_[client_id] += count;
 	per_client_ordered_epoch_[client_id] = CurrentControlEpoch();
+	StageTrace::Record(
+		StageTrace::Stage::OrderedFrontier,
+		client_id,
+		per_client_ordered_[client_id],
+		SteadyNowNs(),
+		count);
 }
 
 uint64_t Topic::GetClientWritten(uint32_t client_id) const {
@@ -1774,6 +1864,21 @@ uint64_t Topic::GetClientOrderedEpoch(uint32_t client_id) const {
 	absl::MutexLock lock(&per_client_mu_);
 	auto it = per_client_ordered_epoch_.find(client_id);
 	return (it != per_client_ordered_epoch_.end()) ? it->second : 0;
+}
+
+void Topic::PublishSessionFenceNotification(const SessionFenceNotification& note) {
+	absl::MutexLock lock(&session_fence_mu_);
+	pending_session_fences_[note.client_id] = note;
+}
+
+bool Topic::TakeSessionFenceNotification(uint32_t client_id, SessionFenceNotification* out) {
+	if (out == nullptr) return false;
+	absl::MutexLock lock(&session_fence_mu_);
+	auto it = pending_session_fences_.find(client_id);
+	if (it == pending_session_fences_.end()) return false;
+	*out = it->second;
+	pending_session_fences_.erase(it);
+	return true;
 }
 
 uint64_t Topic::CurrentControlEpoch() const {
@@ -1863,7 +1968,11 @@ bool Topic::SupportsPerClientWrittenAckLevel1() const {
 
 bool Topic::SupportsPerClientAckLevel2Durable() const {
 	if (seq_type_ == EMBARCADERO) {
-		return order_ == 0 && replication_factor_ > 0;
+		// ACK2 requires RF>=2 (CXL primary + at least one media-durable replica).
+		if (replication_factor_ < Embarcadero::kMinReplicationFactorForAck2) {
+			return false;
+		}
+		return order_ == 0 || order_ == Embarcadero::kOrderStrong;
 	}
 	if (seq_type_ == CORFU) {
 		return order_ == Embarcadero::kOrderTotal &&
@@ -1884,6 +1993,56 @@ bool Topic::SupportsPerClientAckLevel2Durable() const {
 void Topic::UpdatePerClientDurable(uint32_t client_id, uint64_t count) {
 	absl::MutexLock lock(&per_client_durable_mu_);
 	per_client_durable_[client_id] += count;
+}
+
+void Topic::MaybeAdvanceOrder5DurableFromCV() {
+	if (order_ != Embarcadero::kOrderStrong || seq_type_ != EMBARCADERO) return;
+	if (replication_factor_ < Embarcadero::kMinReplicationFactorForAck2) return;
+	if (cxl_addr_ == nullptr) return;
+
+	ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
+	GOIEntry* goi = reinterpret_cast<GOIEntry*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + kGOIOffset);
+	CompletionVectorEntry* cv = reinterpret_cast<CompletionVectorEntry*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
+	CXL::invalidate_cacheline_for_read(control_block);
+	CXL::load_fence();
+	const uint64_t committed_seq = control_block->committed_seq.load(std::memory_order_acquire);
+	if (committed_seq == UINT64_MAX) return;
+
+	std::array<uint64_t, NUM_MAX_BROKERS> durable_logical{};
+	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
+		CXL::invalidate_cacheline_for_read(&cv[b]);
+		CXL::load_fence();
+		durable_logical[b] = cv[b].completed_logical_offset.load(std::memory_order_acquire);
+	}
+
+	absl::MutexLock lock(&per_client_durable_mu_);
+	while (order5_durable_next_goi_ <= committed_seq) {
+		GOIEntry* entry = &goi[order5_durable_next_goi_];
+		ReadGOIEntryFresh(entry);
+		if (entry->global_seq != order5_durable_next_goi_) {
+			break;
+		}
+		const int owner = static_cast<int>(entry->broker_id);
+		if (owner < 0 || owner >= NUM_MAX_BROKERS) {
+			++order5_durable_next_goi_;
+			continue;
+		}
+		if (durable_logical[owner] < entry->cumulative_message_count) {
+			break;
+		}
+		if (entry->client_id != 0 || entry->message_count > 0) {
+			per_client_durable_[static_cast<uint32_t>(entry->client_id)] += entry->message_count;
+			StageTrace::Record(
+				StageTrace::Stage::DurableFrontier,
+				entry->client_id,
+				order5_durable_next_goi_,
+				SteadyNowNs(),
+				per_client_durable_[static_cast<uint32_t>(entry->client_id)]);
+		}
+		++order5_durable_next_goi_;
+	}
 }
 
 std::function<void(void*, size_t)> Topic::Order3GetCXLBuffer(
@@ -2252,9 +2411,16 @@ void* Topic::ReserveBLogSpace(size_t size, bool epoch_already_checked) {
 		if (was_stale) return nullptr;
 	}
 
+	const uintptr_t seg = reinterpret_cast<uintptr_t>(current_segment_);
+	const uintptr_t cur = log_addr_.load(std::memory_order_acquire);
+	if (seg != 0 && cur + size > seg + SEGMENT_SIZE) {
+		// Reserve-before-cross: seal and roll before allocating past the end.
+		CheckSegmentBoundary(reinterpret_cast<void*>(cur), size, seg);
+	}
 	void* log = reinterpret_cast<void*>(log_addr_.fetch_add(size));
 	const unsigned long long int segment_metadata = reinterpret_cast<unsigned long long int>(current_segment_);
 	CheckSegmentBoundary(log, size, segment_metadata);
+	MaybeGCRetiredSegments();
 	return log;
 }
 
@@ -3950,7 +4116,11 @@ void Topic::Sequencer5() {
 	global_batch_seq_.store(recovered_next_goi, std::memory_order_release);
 	{
 		ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
-		control_block->committed_seq.store(UINT64_MAX, std::memory_order_release);
+		// Preserve the recovered committed prefix. Wiping to UINT64_MAX forced
+		// CommittedSeqUpdaterThread to restart at 0 with a permanent gap.
+		const uint64_t recovered_committed =
+			(recovered_next_goi == 0) ? UINT64_MAX : (recovered_next_goi - 1);
+		control_block->committed_seq.store(recovered_committed, std::memory_order_release);
 		CXL::store_fence();
 		CXL::flush_cacheline(control_block);
 		CXL::store_fence();
@@ -3958,6 +4128,12 @@ void Topic::Sequencer5() {
 	committed_seq_updater_stop_.store(false, std::memory_order_release);
 	committed_seq_updater_thread_ = std::thread(&Topic::CommittedSeqUpdaterThread, this);
 	InitLevel5Shards();
+	{
+		absl::MutexLock lock(&per_client_mu_);
+		for (const auto& [client_id, count] : recovered_order5_msg_counts_) {
+			per_client_ordered_[client_id] = std::max(per_client_ordered_[client_id], count);
+		}
+	}
 	absl::btree_set<int> registered_brokers;
 	GetRegisteredBrokerSet(registered_brokers);
 
@@ -3977,7 +4153,7 @@ void Topic::Sequencer5() {
 	RestampRecoveredOrderedEpochs(new_epoch);
 	LOG(INFO) << "Sequencer5: ControlBlock.epoch advanced " << prev_epoch << " -> " << new_epoch << " (zombie fencing)";
 
-	global_seq_.store(0, std::memory_order_relaxed);
+	global_seq_.store(recovered_global_seq_, std::memory_order_relaxed);
 	epoch_index_.store(0, std::memory_order_relaxed);
 	last_sequenced_epoch_.store(0, std::memory_order_relaxed);
 	epoch_driver_done_.store(false, std::memory_order_release);
@@ -4990,6 +5166,12 @@ void Topic::CommitEpoch(
 	if (num_goi_order5 > 0) {
 		const auto enqueue_t = phase_now();
 		EnqueueCompletedRange(base_batch_index_order5, base_batch_index_order5 + num_goi_order5);
+		StageTrace::Record(
+			StageTrace::Stage::GoiCommit,
+			0,
+			base_batch_index_order5 + num_goi_order5 - 1,
+			SteadyNowNs(),
+			num_goi_order5);
 		phase_ns(order5_commit_enqueue_ns_, enqueue_t);
 	}
 
@@ -6140,13 +6322,24 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			}
 			SessionPublishSnapshot snapshot;
 			snapshot.session_epoch = state.session_epoch;
-		snapshot.expected_seq = state.next_expected;
-		snapshot.committed_hwm = state.committed_hwm;
-		snapshot.highest_sequenced = state.highest_sequenced;
-		snapshot.fenced = true;
-		PublishSessionEntry(shard_session_key, snapshot);
-		purge_fenced_session(shard_session_key);
-	};
+			snapshot.expected_seq = state.next_expected;
+			snapshot.committed_hwm = state.committed_hwm;
+			snapshot.highest_sequenced = state.highest_sequenced;
+			snapshot.fenced = true;
+			PublishSessionEntry(shard_session_key, snapshot);
+			if (first_fence) {
+				SessionFenceNotification note;
+				note.client_id = static_cast<uint32_t>(shard_session_key >> 32);
+				note.session_epoch = state.session_epoch;
+				note.committed_batch_seq = state.committed_hwm;
+				note.has_committed_prefix = state.HasCommittedPrefix();
+				note.committed_msg_hwm = GetClientOrdered(note.client_id);
+				note.control_epoch = CurrentControlEpoch();
+				note.reason = 0;  // SessionFenced::HOLD_EXPIRY
+				PublishSessionFenceNotification(note);
+			}
+			purge_fenced_session(shard_session_key);
+		};
 	auto accumulate_logical_only = [&](int broker_id, uint64_t start_logical_offset,
 	                                  uint32_t num_msg, uint64_t pbr_index) {
 		if (!true_client_chain) return;

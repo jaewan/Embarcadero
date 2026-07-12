@@ -32,6 +32,8 @@ class CXLManager{
 		void SetTopicManager(TopicManager *topic_manager){topic_manager_ = topic_manager;}
 		void SetNetworkManager(NetworkManager* network_manager){network_manager_ = network_manager;}
 		void* GetNewSegment();
+		/// Release a previously allocated segment back to the bitmap (GC).
+		bool FreeSegment(void* segment_addr);
 		void* GetNewBatchHeaderLog();
 		TInode* GetTInode(const char* topic);
 		TInode* GetReplicaTInode(const char* topic);
