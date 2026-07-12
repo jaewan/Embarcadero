@@ -827,10 +827,15 @@ class Topic {
 	void ClientGc(Level5ShardState& shard);
 	bool CheckAndInsertBatchId(Level5ShardState& shard, uint64_t batch_id);
 	bool IsOrder5HeldSlot(int broker_id, size_t slot_offset, uint64_t pbr_index);
-	// [[HELD_SLOT_SET]] One-sweep snapshot of every held slot identity (deferred,
-	// backpressured, hold-buffer) for O(1) membership checks in consumed_through advance.
+	// [[HELD_SLOT_SET]] Full snapshot of every held slot identity (deferred, backpressured,
+	// hold-buffer); reference implementation for EMBARCADERO_ORDER5_HELDCHECK_VALIDATE.
 	void CollectOrder5HeldSlotIdentities(
 			absl::flat_hash_set<std::tuple<int, size_t, uint64_t>>& out);
+	// [[HELD_SLOT_KEYED]] Cheap variants used on the hot path: sweep only the small
+	// deferred/backpressured lists, and probe hold_buffer by session key per batch.
+	void CollectOrder5DeferredSlotIdentities(
+			absl::flat_hash_set<std::tuple<int, size_t, uint64_t>>& out);
+	bool IsOrder5SlotHeldInHoldBuffer(const PendingBatch5& p);
 	void RetireOrder5HeldSlotAndAdvance(BatchHeader* hdr, int broker_id, size_t slot_offset);
 	void Level5ShardWorker(size_t shard_id);
 	void InitLevel5Shards();
@@ -895,6 +900,14 @@ class Topic {
 		std::atomic<uint64_t> order5_commit_export_ns_{0};
 		std::atomic<uint64_t> order5_commit_metadata_ns_{0};
 		std::atomic<uint64_t> order5_commit_cv_flush_ns_{0};
+		// [[ORDER5_COMMIT_PROFILE_V2]] Phases that were previously unaccounted (together they
+		// held ~95% of CommitEpoch wall time in the 2-proc saturation runs of 2026-07-12).
+		std::atomic<uint64_t> order5_commit_guard_ns_{0};      // spatial_guard_reject sweep
+		std::atomic<uint64_t> order5_commit_lock_ns_{0};       // export_cursor_mu_ acquisition
+		std::atomic<uint64_t> order5_commit_advance_ns_{0};    // AdvanceConsumedThroughForProcessedSlots
+		std::atomic<uint64_t> order5_commit_heldsweep_ns_{0};  // CollectOrder5HeldSlotIdentities (inside advance)
+		std::atomic<uint64_t> order5_commit_enqueue_ns_{0};    // EnqueueCompletedRange
+		std::atomic<uint64_t> order5_commit_tailflush_ns_{0};  // final consumed_through flush loop
 		// [[W1.2]] Per-session commit-order invariant instrumentation (W1 item #2). Detects the
 		// collector committing a client's batch out of order across epoch seals.
 		std::atomic<uint64_t> order5_commit_order_violations_{0};

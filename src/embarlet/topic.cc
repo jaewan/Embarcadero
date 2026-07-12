@@ -4453,6 +4453,20 @@ void Topic::CommitEpoch(
 	const bool commit_profile = ShouldEnableOrder5CommitProfile();
 	const auto commit_t_start = commit_profile ? std::chrono::steady_clock::now()
 	                                            : std::chrono::steady_clock::time_point{};
+	// [[ORDER5_COMMIT_PROFILE_V2]] Scoped-phase helper; ~zero cost when profiling is off.
+	auto phase_ns = [commit_profile](std::atomic<uint64_t>& counter,
+	                                 std::chrono::steady_clock::time_point start) {
+		if (commit_profile) {
+			counter.fetch_add(
+				static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - start).count()),
+				std::memory_order_relaxed);
+		}
+	};
+	auto phase_now = [commit_profile]() {
+		return commit_profile ? std::chrono::steady_clock::now()
+		                      : std::chrono::steady_clock::time_point{};
+	};
 
 	auto spatial_guard_reject = [&](PendingBatch5& p) {
 		if (p.skipped || p.is_held_marker) return false;
@@ -4493,13 +4507,19 @@ void Topic::CommitEpoch(
 			<< " fenced=" << ((flags & kSessionEntryFlagFenced) != 0);
 		return true;
 	};
-	ready.erase(
-		std::remove_if(ready.begin(), ready.end(), spatial_guard_reject),
-		ready.end());
+	{
+		const auto guard_t = phase_now();
+		ready.erase(
+			std::remove_if(ready.begin(), ready.end(), spatial_guard_reject),
+			ready.end());
+		phase_ns(order5_commit_guard_ns_, guard_t);
+	}
 	if (ready.empty()) {
+		const auto advance_t = phase_now();
 		AdvanceConsumedThroughForProcessedSlots(
 			batch_list, contiguous_consumed_per_broker, broker_seen_in_epoch,
 			&cv_max_cumulative, &cv_max_pbr_index);
+		phase_ns(order5_commit_advance_ns_, advance_t);
 		return;
 	}
 
@@ -4514,7 +4534,9 @@ void Topic::CommitEpoch(
 	// [PHASE-4] Accumulate per-broker tinode updates
 	// Replace hash maps with arrays for better performance
 	// [PHASE-7] Single-pass commit: hold lock for entire epoch; export chain inline with GOI/CV/tinode.
+	const auto lock_t = phase_now();
 	absl::MutexLock header_lock(&export_cursor_mu_);
+	phase_ns(order5_commit_lock_ns_, lock_t);
 
 	size_t next_order = base_order;  // message order (total_order) for next batch
 	GOIEntry* goi = reinterpret_cast<GOIEntry*>(
@@ -4959,20 +4981,30 @@ void Topic::CommitEpoch(
 	}
 
 	// Advance consumed_through for all remaining slots that were processed but not ready
-	AdvanceConsumedThroughForProcessedSlots(batch_list, contiguous_consumed_per_broker, broker_seen_in_epoch, nullptr, nullptr);
+	{
+		const auto advance_t = phase_now();
+		AdvanceConsumedThroughForProcessedSlots(batch_list, contiguous_consumed_per_broker, broker_seen_in_epoch, nullptr, nullptr);
+		phase_ns(order5_commit_advance_ns_, advance_t);
+	}
 
 	if (num_goi_order5 > 0) {
+		const auto enqueue_t = phase_now();
 		EnqueueCompletedRange(base_batch_index_order5, base_batch_index_order5 + num_goi_order5);
+		phase_ns(order5_commit_enqueue_ns_, enqueue_t);
 	}
 
-	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
-		if (!broker_seen_in_epoch[b]) continue;
-		size_t val = contiguous_consumed_per_broker[b];
-		tinode_->offsets[b].batch_headers_consumed_through = val;
+	{
+		const auto tail_t = phase_now();
+		for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
+			if (!broker_seen_in_epoch[b]) continue;
+			size_t val = contiguous_consumed_per_broker[b];
+			tinode_->offsets[b].batch_headers_consumed_through = val;
+			CXL::store_fence();
+			CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].batch_headers_consumed_through));
+		}
 		CXL::store_fence();
-		CXL::flush_cacheline(CXL::ToFlushable(&tinode_->offsets[b].batch_headers_consumed_through));
+		phase_ns(order5_commit_tailflush_ns_, tail_t);
 	}
-	CXL::store_fence();
 
 	if (commit_profile) {
 		order5_commit_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -5075,6 +5107,8 @@ void Topic::EpochSequencerThread() {
 	uint64_t last_cp_calls = 0, last_cp_batches = 0, last_cp_msgs = 0;
 	uint64_t last_cp_total_ns = 0, last_cp_goi_ns = 0, last_cp_export_ns = 0;
 	uint64_t last_cp_metadata_ns = 0, last_cp_cv_ns = 0;
+	uint64_t last_cp_guard_ns = 0, last_cp_lock_ns = 0, last_cp_advance_ns = 0;
+	uint64_t last_cp_heldsweep_ns = 0, last_cp_enqueue_ns = 0, last_cp_tailflush_ns = 0;
 	auto emit_commit_profile = [&]() {
 		if (!commit_profile_enabled) return;
 		auto now = std::chrono::steady_clock::now();
@@ -5088,6 +5122,12 @@ void Topic::EpochSequencerThread() {
 		const uint64_t export_ns = order5_commit_export_ns_.load(std::memory_order_relaxed);
 		const uint64_t metadata_ns = order5_commit_metadata_ns_.load(std::memory_order_relaxed);
 		const uint64_t cv_ns = order5_commit_cv_flush_ns_.load(std::memory_order_relaxed);
+		const uint64_t guard_ns = order5_commit_guard_ns_.load(std::memory_order_relaxed);
+		const uint64_t lock_ns = order5_commit_lock_ns_.load(std::memory_order_relaxed);
+		const uint64_t advance_ns = order5_commit_advance_ns_.load(std::memory_order_relaxed);
+		const uint64_t heldsweep_ns = order5_commit_heldsweep_ns_.load(std::memory_order_relaxed);
+		const uint64_t enqueue_ns = order5_commit_enqueue_ns_.load(std::memory_order_relaxed);
+		const uint64_t tailflush_ns = order5_commit_tailflush_ns_.load(std::memory_order_relaxed);
 		const uint64_t d_calls = calls - last_cp_calls;
 		const uint64_t d_batches = batches - last_cp_batches;
 		const uint64_t d_msgs = msgs - last_cp_msgs;
@@ -5096,9 +5136,18 @@ void Topic::EpochSequencerThread() {
 		const uint64_t d_export_ns = export_ns - last_cp_export_ns;
 		const uint64_t d_metadata_ns = metadata_ns - last_cp_metadata_ns;
 		const uint64_t d_cv_ns = cv_ns - last_cp_cv_ns;
+		const uint64_t d_guard_ns = guard_ns - last_cp_guard_ns;
+		const uint64_t d_lock_ns = lock_ns - last_cp_lock_ns;
+		const uint64_t d_advance_ns = advance_ns - last_cp_advance_ns;
+		const uint64_t d_heldsweep_ns = heldsweep_ns - last_cp_heldsweep_ns;
+		const uint64_t d_enqueue_ns = enqueue_ns - last_cp_enqueue_ns;
+		const uint64_t d_tailflush_ns = tailflush_ns - last_cp_tailflush_ns;
 		last_cp_calls = calls; last_cp_batches = batches; last_cp_msgs = msgs;
 		last_cp_total_ns = total_ns; last_cp_goi_ns = goi_ns; last_cp_export_ns = export_ns;
 		last_cp_metadata_ns = metadata_ns; last_cp_cv_ns = cv_ns;
+		last_cp_guard_ns = guard_ns; last_cp_lock_ns = lock_ns; last_cp_advance_ns = advance_ns;
+		last_cp_heldsweep_ns = heldsweep_ns; last_cp_enqueue_ns = enqueue_ns;
+		last_cp_tailflush_ns = tailflush_ns;
 		if (d_calls == 0) return;
 		LOG(INFO) << "[ORDER5_COMMIT_PROFILE]"
 		          << " calls=" << d_calls
@@ -5109,7 +5158,14 @@ void Topic::EpochSequencerThread() {
 		          << " goi_ms=" << (d_goi_ns / 1e6)
 		          << " export_ms=" << (d_export_ns / 1e6)
 		          << " metadata_ms=" << (d_metadata_ns / 1e6)
-		          << " cv_flush_ms=" << (d_cv_ns / 1e6);
+		          << " cv_flush_ms=" << (d_cv_ns / 1e6)
+		          << " guard_ms=" << (d_guard_ns / 1e6)
+		          << " lock_ms=" << (d_lock_ns / 1e6)
+		          << " advance_ms=" << (d_advance_ns / 1e6)
+		          << " heldsweep_ms=" << (d_heldsweep_ns / 1e6)
+		          << " enqueue_ms=" << (d_enqueue_ns / 1e6)
+		          << " tailflush_ms=" << (d_tailflush_ns / 1e6)
+		          << " hold_depth=" << GetTotalHoldBufferSize();
 	};
 	uint64_t last_idle_diag_ns = 0;
 	// last_idle_progress_epoch removed: epoch advancement is not real progress
@@ -5826,13 +5882,13 @@ void Topic::ClientGc(Level5ShardState& shard) {
 
 void Topic::CollectOrder5HeldSlotIdentities(
 		absl::flat_hash_set<std::tuple<int, size_t, uint64_t>>& out) {
-	// Single sweep of all hold-side structures. AdvanceConsumedThroughForProcessedSlots
-	// previously called IsOrder5HeldSlot per batch-list entry, making each CommitEpoch
-	// O(batches × total_held). Under sustained 2-producer load the hold buffer grows while
-	// the sequencer slows, a quadratic feedback that collapsed ordered throughput to
-	// ~2 GB/s and stalled ACKs long enough to trigger client retransmit-reconnect storms
-	// (measured 2026-07-12, run 8). One sweep per epoch + O(1) membership keeps the same
-	// held-slot semantics.
+	// Full sweep of all hold-side structures. This replaced the per-batch IsOrder5HeldSlot
+	// scan (O(batches × total_held) per CommitEpoch), but at 2-proc saturation the hold
+	// buffer legitimately reaches ~27K entries and even one sweep per epoch dominated the
+	// sequencer (heldsweep ≈ 900 ms/s, run 14, 2026-07-12). The hot path now uses
+	// IsOrder5SlotHeldInHoldBuffer (keyed O(1) probe) + CollectOrder5DeferredSlotIdentities
+	// (small lists only); this full sweep remains as the reference for the env-gated
+	// validation mode (EMBARCADERO_ORDER5_HELDCHECK_VALIDATE=1).
 	for (const auto& shard_ptr : level5_shards_) {
 		if (!shard_ptr) continue;
 		std::lock_guard<std::mutex> lock(shard_ptr->mu);
@@ -5851,6 +5907,54 @@ void Topic::CollectOrder5HeldSlotIdentities(
 			}
 		}
 	}
+}
+
+void Topic::CollectOrder5DeferredSlotIdentities(
+		absl::flat_hash_set<std::tuple<int, size_t, uint64_t>>& out) {
+	// Deferred + backpressured lists only. Both are near-empty in steady state (deferred
+	// drains into the next epoch's input; backpressure only arises when the hold buffer is
+	// at capacity), so sweeping them per Advance call is cheap. The large structure —
+	// hold_buffer — is covered by the keyed probe instead.
+	for (const auto& shard_ptr : level5_shards_) {
+		if (!shard_ptr) continue;
+		std::lock_guard<std::mutex> lock(shard_ptr->mu);
+		for (const PendingBatch5& p : shard_ptr->deferred_level5) {
+			out.emplace(p.broker_id, p.slot_offset, p.cached_pbr_absolute_index);
+		}
+		for (const Order5SlotIdentity& slot : shard_ptr->backpressured_level5_slots) {
+			out.emplace(slot.broker_id, slot.slot_offset, slot.pbr_index);
+		}
+	}
+}
+
+bool Topic::IsOrder5SlotHeldInHoldBuffer(const PendingBatch5& p) {
+	// Keyed O(1) replacement for the full hold_buffer sweep: a batch-list entry's slot can
+	// only be held by ITS OWN batch (a (broker, slot_offset, pbr_index) triple is unique to
+	// one batch generation), and hold entries are keyed by exactly the identity fields the
+	// scanner stamped on the entry (client_id, session_epoch [, broker_id for legacy
+	// streams], batch_seq). So probing the owning session's stream map and comparing the
+	// triple is equivalent to scanning every held entry for a triple match.
+	// AdvanceConsumedThrough walks the epoch's batch_list AFTER those entries were
+	// std::move'd into level5/hold; PendingBatch5 is trivially movable so identity fields
+	// remain intact in the moved-from batch_list slots (do not clear them on move).
+	// client_id==0 (level0) batches are never held; SIZE_MAX marks anonymous skip markers,
+	// which reference CLAIMED-stuck producer slots, never held ones.
+	if (level5_shards_.empty() || level5_num_shards_ == 0) return false;
+	if (p.client_id == 0 || p.client_id == SIZE_MAX) return false;
+	Level5ShardState* shard_ptr = level5_shards_[p.client_id % level5_num_shards_].get();
+	if (shard_ptr == nullptr) return false;
+	const uint64_t key = UsesTrueClientChainOrdering(order_)
+		? MakeSessionKey(p.client_id, p.session_epoch)
+		: MakeClientBrokerStreamKey(p.client_id, p.session_epoch, p.broker_id);
+	std::lock_guard<std::mutex> lock(shard_ptr->mu);
+	auto it = shard_ptr->hold_buffer.find(key);
+	if (it == shard_ptr->hold_buffer.end()) return false;
+	auto jt = it->second.find(p.batch_seq);
+	if (jt == it->second.end()) return false;
+	const HoldBatchMetadata& meta = jt->second.meta;
+	return meta.broker_id == p.broker_id &&
+	       meta.slot_offset == p.slot_offset &&
+	       meta.pbr_absolute_index == p.cached_pbr_absolute_index;
 }
 
 bool Topic::IsOrder5HeldSlot(int broker_id, size_t slot_offset, uint64_t pbr_index) {
@@ -7556,15 +7660,55 @@ void Topic::AdvanceConsumedThroughForProcessedSlots(
 			std::fill(processed_slots[b].begin(), processed_slots[b].end(), static_cast<uint8_t>(0));
 		}
 	}
-	// [[HELD_SLOT_SET]] Snapshot held slots once per call; see CollectOrder5HeldSlotIdentities.
+	// [[HELD_SLOT_KEYED]] Held-slot detection: small deferred/backpressured lists are swept
+	// once per call; the (potentially large) hold_buffer is probed per batch by session key
+	// (see IsOrder5SlotHeldInHoldBuffer). The previous full sweep was O(hold_depth) per epoch
+	// and dominated the sequencer at 2-proc saturation (~900 ms/s at hold_depth ≈ 27K).
+	static const bool heldcheck_validate =
+		ReadEnvBoolLenient("EMBARCADERO_ORDER5_HELDCHECK_VALIDATE", false);
 	absl::flat_hash_set<std::tuple<int, size_t, uint64_t>> held_slots;
-	CollectOrder5HeldSlotIdentities(held_slots);
+	absl::flat_hash_set<std::tuple<int, size_t, uint64_t>> full_held_slots_for_validation;
+	{
+		const bool sweep_profile = ShouldEnableOrder5CommitProfile();
+		const auto sweep_t = sweep_profile ? std::chrono::steady_clock::now()
+		                                   : std::chrono::steady_clock::time_point{};
+		CollectOrder5DeferredSlotIdentities(held_slots);
+		if (sweep_profile) {
+			order5_commit_heldsweep_ns_.fetch_add(
+				static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - sweep_t).count()),
+				std::memory_order_relaxed);
+		}
+	}
+	if (heldcheck_validate) {
+		CollectOrder5HeldSlotIdentities(full_held_slots_for_validation);
+	}
 	for (const PendingBatch5& p : batch_list) {
 		int b = p.broker_id;
 		if (b < 0 || b >= NUM_MAX_BROKERS || !broker_seen_in_epoch[b]) continue;
 		if (p.slot_offset >= BATCHHEADERS_SIZE) continue;
 		if ((p.slot_offset % slot_size) != 0) continue;
-		if (held_slots.contains({b, p.slot_offset, p.cached_pbr_absolute_index})) continue;
+		const bool held =
+			held_slots.contains({b, p.slot_offset, p.cached_pbr_absolute_index}) ||
+			IsOrder5SlotHeldInHoldBuffer(p);
+		if (heldcheck_validate) {
+			const bool full_held = full_held_slots_for_validation.contains(
+				{b, p.slot_offset, p.cached_pbr_absolute_index});
+			if (held != full_held) {
+				LOG(ERROR) << "[ORDER5_HELDCHECK_MISMATCH]"
+				           << " keyed=" << held << " full=" << full_held
+				           << " client=" << p.client_id
+				           << " session_epoch=" << p.session_epoch
+				           << " batch_seq=" << p.batch_seq
+				           << " broker=" << b
+				           << " slot_offset=" << p.slot_offset
+				           << " pbr=" << p.cached_pbr_absolute_index
+				           << " skipped=" << p.skipped
+				           << " held_marker=" << p.is_held_marker
+				           << " from_hold=" << p.from_hold;
+			}
+		}
+		if (held) continue;
 		processed_slots[b][p.slot_offset / slot_size] = 1;
 	}
 	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
