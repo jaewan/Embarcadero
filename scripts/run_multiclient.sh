@@ -87,15 +87,30 @@ if [[ "$SEQUENCER" == "CORFU" && -z "${BROKER_READY_TIMEOUT_SEC_OVERRIDE_APPLIED
     BROKER_READY_TIMEOUT_SEC=300
 fi
 BROKER_REACHABILITY_TIMEOUT_SEC=${BROKER_REACHABILITY_TIMEOUT_SEC:-20}
-BROKER_REACHABILITY_POLL_SEC=${BROKER_REACHABILITY_POLL_SEC:-1}
-BROKER_START_STAGGER_SEC=${BROKER_START_STAGGER_SEC:-1}
-# Extra settle time for broker heartbeat/control-plane convergence after sockets listen.
-BROKER_READY_PROPAGATION_SEC=${BROKER_READY_PROPAGATION_SEC:-4}
+BROKER_REACHABILITY_POLL_SEC=${BROKER_REACHABILITY_POLL_SEC:-0.1}
+# Stagger between broker process launches. Full CXL zeroing is memory-heavy so default
+# 1s; metadata-mode (+ bg/sync prefault) is light enough to launch back-to-back.
+if [[ -z "${BROKER_START_STAGGER_SEC:-}" ]]; then
+    if [[ "${EMBARCADERO_CXL_ZERO_MODE:-full}" == "metadata" ]]; then
+        BROKER_START_STAGGER_SEC=0
+    else
+        BROKER_START_STAGGER_SEC=1
+    fi
+fi
+# Extra settle after sockets listen. ORDER=5 EMBARCADERO already waits on real
+# scanner/head convergence below, so a fixed sleep is pure waste there.
+if [[ -z "${BROKER_READY_PROPAGATION_SEC:-}" ]]; then
+    if [[ "${ORDER:-0}" == "5" && "${SEQUENCER:-EMBARCADERO}" == "EMBARCADERO" ]]; then
+        BROKER_READY_PROPAGATION_SEC=0
+    else
+        BROKER_READY_PROPAGATION_SEC=4
+    fi
+fi
 ORDER5_CLUSTER_READY_TIMEOUT_SEC=${ORDER5_CLUSTER_READY_TIMEOUT_SEC:-30}
-# Extra lead time given to SSH connections and clock-sync settling
-START_DELAY_SEC=${START_DELAY_SEC:-8}
-# Enforce a safer minimum barrier delay when any client runs over SSH.
-MIN_REMOTE_START_DELAY_SEC=${MIN_REMOTE_START_DELAY_SEC:-8}
+# Barrier lead time for SSH client launch + clock skew. Prior default of 8s was
+# overly conservative on this LAN (SSH spawn is typically <1s).
+START_DELAY_SEC=${START_DELAY_SEC:-3}
+MIN_REMOTE_START_DELAY_SEC=${MIN_REMOTE_START_DELAY_SEC:-3}
 QUIET=${QUIET:-0}
 
 # ---------------------------------------------------------------------------
@@ -710,7 +725,14 @@ wait_for_broker_ports_free() {
     return 0
 }
 
+CLEANUP_DONE=0
 cleanup() {
+    # Trap EXIT also fires after an explicit cleanup(); make teardown idempotent so we
+    # do not double-pay port drain / process kill / remote pkill on every trial.
+    if [[ "${CLEANUP_DONE}" -eq 1 ]]; then
+        return 0
+    fi
+    CLEANUP_DONE=1
     log "Cleaning up..."
     broker_local_cleanup
     if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
@@ -722,8 +744,8 @@ cleanup() {
         broker_remote_scalog_stop || true
     fi
     shm_cleanup
-    wait_for_broker_ports_free
-    # Kill remote client processes (ignore failures)
+    # broker_local_cleanup already drained listeners; a second wait_for_broker_ports_free
+    # here used to add up to another BROKER_PORT_DRAIN_TIMEOUT_SEC of polling.
     if [[ "${EMBARCADERO_DISABLE_PATTERN_KILL:-0}" != "1" ]]; then
         for (( _i=0; _i<${NUM_CLIENTS:-0}; _i++ )); do
             _h="${CLIENT_HOSTS[$_i]}"
@@ -737,10 +759,13 @@ trap cleanup EXIT
 
 start_brokers() {
     START_BROKERS_FAILURE_REASON=""
+    CLEANUP_DONE=0
     log "Resetting previous broker state..."
     broker_local_cleanup
     shm_cleanup
-    wait_for_broker_ports_free
+    # Ports should already be clear after broker_local_drain_ports; keep a short
+    # bound so a stuck TIME_WAIT listener cannot burn the full 20s budget every trial.
+    BROKER_PORT_DRAIN_TIMEOUT_SEC="${BROKER_PORT_DRAIN_TIMEOUT_SEC:-5}" wait_for_broker_ports_free
     preflight_local_broker_resources
 
     if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
@@ -806,22 +831,38 @@ start_brokers() {
         ./scalog_global_sequencer > /tmp/scalog_sequencer.log 2>&1 &
     fi
 
-    # Start the head broker first. Cold CXL initialization and full-region zeroing are the
-    # heaviest part of startup; launching followers concurrently increases memory pressure and
-    # can OOM-kill broker 0 before the cluster even forms.
+    # Start the head broker first. Cold CXL full-region zeroing is memory-heavy; launching
+    # followers concurrently in that mode can OOM-kill broker 0. Metadata-mode startup (used
+    # by throughput cells) only faults pages via a joined prefault on the head — followers
+    # just map the existing shm — so overlap their launch with the ~12s prefault instead of
+    # serializing follower startup after it.
+    local zero_mode="${EMBARCADERO_CXL_ZERO_MODE:-full}"
+    local wait_head_before_followers=1
+    if [[ "$zero_mode" == "metadata" ]]; then
+        wait_head_before_followers=0
+    fi
     # shellcheck disable=SC2086
     $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" \
         > /tmp/broker_0.log 2>&1 &
     launched_broker_pids+=("$!")
     HEAD_BROKER_PID="${launched_broker_pids[0]}"
-    if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" 1 "${launched_broker_pids[0]}"; then
-        echo "ERROR: head broker did not become ready within ${BROKER_READY_TIMEOUT_SEC}s" >&2
-        cat /tmp/broker_0.log >&2
-        START_BROKERS_FAILURE_REASON="$(classify_broker_startup_failure "${launched_broker_pids[@]}")"
-        return 1
-    fi
-    if [[ "$BROKER_START_STAGGER_SEC" -gt 0 ]]; then
-        sleep "$BROKER_START_STAGGER_SEC"
+    if [[ "$wait_head_before_followers" -eq 1 ]]; then
+        log "Waiting for head broker readiness before followers (zero_mode=$zero_mode)..."
+        if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" 1 "${launched_broker_pids[0]}"; then
+            echo "ERROR: head broker did not become ready within ${BROKER_READY_TIMEOUT_SEC}s" >&2
+            cat /tmp/broker_0.log >&2
+            START_BROKERS_FAILURE_REASON="$(classify_broker_startup_failure "${launched_broker_pids[@]}")"
+            return 1
+        fi
+        if [[ "$BROKER_START_STAGGER_SEC" -gt 0 ]]; then
+            sleep "$BROKER_START_STAGGER_SEC"
+        fi
+    else
+        log "Overlapping follower launch with head startup (zero_mode=$zero_mode)..."
+        # Head creates/sizes the CXL shm early in CXLManager, then spends ~12s in
+        # joined segment prefault before becoming ready. A short grace lets the shm
+        # exist so followers can attach, while still overlapping the prefault.
+        sleep "${BROKER_HEAD_SHM_GRACE_SEC:-2}"
     fi
     for (( i=1; i<NUM_BROKERS; i++ )); do
         # shellcheck disable=SC2086
