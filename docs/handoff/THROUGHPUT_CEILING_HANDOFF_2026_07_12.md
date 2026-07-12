@@ -1,5 +1,13 @@
 # Handoff: ORDER=5 ordered-ACK throughput ceiling investigation
 
+> **RESOLVED 2026-07-12 (same day, later session) — see §Resolution at the bottom.**
+> The "ACK coupling" framing below is wrong: the 3.4 GB/s cap was broker-side
+> ordered ingest present at ALL ack levels (ACK=0's 5.8/11 GB/s were client send
+> rates absorbed by kernel socket buffers). Three root causes fixed:
+> shmem first-touch fault serialization (zero_mode=metadata), quadratic
+> IsOrder5HeldSlot in CommitEpoch, and full-GOI reconnect scans. Post-fix:
+> 1-proc ACK=1 5.7 GB/s (client producer-bound), 2-proc same-host 8.2–9.3 GB/s.
+
 You are a systems engineering agent working on **Embarcadero** (distributed
 totally-ordered pub/sub log over CXL memory, OSDI/SOSP'27 resubmission) at
 `~/Embarcadero` (git, branch `main`). Your mission: **find and fix why a
@@ -107,3 +115,67 @@ retransmit — do not remove it; make it cheaper only if it proves hot.
 3. Check whether the memoization also lifted the subscriber delivery ceiling
    (~270 MB/s, receive-worker CPU-bound — same ConfigValue pattern may apply):
    rerun `scripts/run_delivery_scoping.sh`.
+
+---
+
+## Resolution (2026-07-12, follow-up session)
+
+### What the ceiling actually was
+Broker-side ordered ingest capped at ~3.4 GB/s in EVERY configuration; ACK=1
+merely made the client wait for it. The ACK=0 "5.8 / 11 GB/s" cells only measured
+client send rate into kernel socket buffers (~130 MB Recv-Q per connection at the
+rmem cap; ~2–3 GB total standing) — broker-side ordering was never verified and
+kept draining for >1 s after the client exited. Evidence: [ORDER5_COMMIT_PROFILE]
+msgs/s ≈ 3.5M in all runs; scanner push == sequencer commit (no internal backlog);
+`Send-done` ≫ `Bandwidth` in the client log under ACK=1.
+
+### Root causes (all fixed on main)
+1. **First-touch shmem page-fault serialization** (the 3.4 GB/s wall).
+   `EMBARCADERO_CXL_ZERO_MODE=metadata` (used by the eval cells for fast startup;
+   the script default is `full`) leaves the 46 GB segment/BLog region unfaulted.
+   Every 4 KB first-touch faults inside `recv()` into CXL shm and all 24 recv
+   threads across the 4 broker processes serialize on the shared shm file's
+   mapping spinlock (`shmem_add_to_page_cache`; perf: 68%
+   `native_queued_spin_lock_slowpath` under `_copy_to_iter`; /proc stacks +
+   per-TID jiffies: 6 recv threads pegged at 100% CPU at 145 MB/s each).
+   ~875K faults/s × 4 KB ≈ 3.4 GB/s — invariant to every application knob, which
+   is why the seven earlier hypothesis flips were all flat.
+   **Fix:** background 8-thread `MADV_POPULATE_WRITE` prefault of the segment
+   region in the `CXLManager` ctor (head broker, metadata mode only; 46 GB in
+   ~12 s, done before traffic; kill switch `EMBARCADERO_CXL_BG_PREFAULT=0`).
+   Note madvise requires page-aligned addresses; region offsets are only
+   cacheline-aligned.
+2. **Quadratic CommitEpoch under load.** `IsOrder5HeldSlot` walked every held
+   batch (all shards, under shard mutexes) once per batch-list entry —
+   O(batches × total_held) per epoch. Under 2-proc saturation the hold buffer
+   grows as the sequencer slows: 24 GiB 2-proc runs collapsed to 1.95 GB/s and
+   ACK stalls exceeded the client retransmit backstop.
+   **Fix:** `CollectOrder5HeldSlotIdentities` — one sweep into a flat_hash_set
+   per `AdvanceConsumedThroughForProcessedSlots` call, O(1) membership.
+3. **Full-GOI scan per reconnect.** ACK stalls → client `RetransmitThread`
+   resends each due batch via `SendRawBatchToBroker`, which opens a NEW
+   connection per batch; each connection's session-open path ran
+   `ScanGOICommittedHwm` FORWARD over the entire committed GOI with a
+   serializing clflush per 128 B entry (seconds per call; ~580 SESSION_OPENs per
+   broker in the collapsed run → recv-pool starvation feedback loop).
+   **Fix:** scan BACKWARD with early exit (sound because the W1.2 invariant
+   keeps per-session client_seq strictly increasing in GOI order).
+
+### Post-fix numbers (1 trial each, standard cell, zero_mode=metadata)
+| Cell | Before | After |
+|---|---|---|
+| 1-proc ACK=1 8 GiB | 3.48 | **5.68 GB/s** (Send-done ≈ Bandwidth → client producer-bound) |
+| 2-proc ACK=1 24 GiB | 1.95 (collapse) | **8.47 GB/s** |
+| 2-proc ACK=1 32 GiB | — | **9.32 GB/s** |
+
+### Remaining work
+- 2-proc residual: EpochSequencerThread ~95% busy; goi/export/metadata/cv timers
+  only account for ~45 ms/s of ~950 ms/s inside CommitEpoch. Suspects: the
+  held-slot sweep itself (hold buffer size × calls/s), spatial-guard
+  `FindSessionEntry` CXL reads per ready batch, `ensure_cv_tracker` flushes.
+  perf attribution kept failing (perf.data truncated when brokers restart);
+  capture with a longer run or record to a pipe.
+- The client single-threaded producer loop (~5.8 GB/s) is now the 1-proc bound.
+- E4a smoke gate result: see `order5_e4a_gate` note in the session log / commit.
+- Measurement hygiene for all future cells: enable `EMBAR_ORDER5_COMMIT_PROFILE=1`
+  and compare broker commit msgs/s with client Send-done vs Bandwidth.

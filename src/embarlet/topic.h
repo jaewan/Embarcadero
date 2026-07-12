@@ -21,6 +21,7 @@
 #include "common/wire_formats.h"
 #include "sequencer_utils.h"
 
+#include <tuple>
 #include "absl/container/flat_hash_set.h"
 
 #include "absl/container/flat_hash_map.h"
@@ -826,6 +827,10 @@ class Topic {
 	void ClientGc(Level5ShardState& shard);
 	bool CheckAndInsertBatchId(Level5ShardState& shard, uint64_t batch_id);
 	bool IsOrder5HeldSlot(int broker_id, size_t slot_offset, uint64_t pbr_index);
+	// [[HELD_SLOT_SET]] One-sweep snapshot of every held slot identity (deferred,
+	// backpressured, hold-buffer) for O(1) membership checks in consumed_through advance.
+	void CollectOrder5HeldSlotIdentities(
+			absl::flat_hash_set<std::tuple<int, size_t, uint64_t>>& out);
 	void RetireOrder5HeldSlotAndAdvance(BatchHeader* hdr, int broker_id, size_t slot_offset);
 	void Level5ShardWorker(size_t shard_id);
 	void InitLevel5Shards();

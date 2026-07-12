@@ -168,20 +168,23 @@ static bool ScanGOICommittedHwm(
 	static constexpr uint64_t kMaxGOIEntries = 256ULL * 1024ULL * 1024ULL;
 	CHECK_LT(committed_seq, kMaxGOIEntries) << "ControlBlock.committed_seq exceeds GOI capacity";
 	const uint64_t limit = committed_seq + 1;
-	uint64_t hwm = 0;
-	bool found = false;
-	for (uint64_t i = 0; i < limit; ++i) {
+	// Scan BACKWARD and stop at the first match: the W1.2 commit-order invariant keeps a
+	// session's client_seq strictly increasing in GOI index order, so the highest-index match
+	// is the hwm. The previous forward full scan was O(committed_seq) with a serializing
+	// clflush per 128B entry — multi-second per call mid-run, and every retransmit reconnect
+	// (one connection per resent batch) triggered two of them, starving the recv pool during
+	// exactly the ACK stalls that caused the retransmits (measured 2026-07-12, run 8).
+	for (uint64_t i = limit; i-- > 0;) {
 		GOIEntry* entry = &goi[i];
 		CXL::invalidate_cacheline_for_read(entry);
 		CXL::load_fence();
 		if (entry->global_seq != i) continue;
 		if (entry->client_id == client_id && entry->session_epoch == session_epoch) {
-			hwm = found ? std::max<uint64_t>(hwm, entry->client_seq) : entry->client_seq;
-			found = true;
+			*out_hwm = entry->client_seq;
+			return true;
 		}
 	}
-	if (found) *out_hwm = hwm;
-	return found;
+	return false;
 }
 
 static DurableSessionSnapshot ReadDurableSessionSnapshot(

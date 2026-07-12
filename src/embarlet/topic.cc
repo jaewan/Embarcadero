@@ -5824,6 +5824,35 @@ void Topic::ClientGc(Level5ShardState& shard) {
 	}
 }
 
+void Topic::CollectOrder5HeldSlotIdentities(
+		absl::flat_hash_set<std::tuple<int, size_t, uint64_t>>& out) {
+	// Single sweep of all hold-side structures. AdvanceConsumedThroughForProcessedSlots
+	// previously called IsOrder5HeldSlot per batch-list entry, making each CommitEpoch
+	// O(batches × total_held). Under sustained 2-producer load the hold buffer grows while
+	// the sequencer slows, a quadratic feedback that collapsed ordered throughput to
+	// ~2 GB/s and stalled ACKs long enough to trigger client retransmit-reconnect storms
+	// (measured 2026-07-12, run 8). One sweep per epoch + O(1) membership keeps the same
+	// held-slot semantics.
+	for (const auto& shard_ptr : level5_shards_) {
+		if (!shard_ptr) continue;
+		std::lock_guard<std::mutex> lock(shard_ptr->mu);
+		for (const PendingBatch5& p : shard_ptr->deferred_level5) {
+			out.emplace(p.broker_id, p.slot_offset, p.cached_pbr_absolute_index);
+		}
+		for (const Order5SlotIdentity& slot : shard_ptr->backpressured_level5_slots) {
+			out.emplace(slot.broker_id, slot.slot_offset, slot.pbr_index);
+		}
+		for (const auto& [session_key, held] : shard_ptr->hold_buffer) {
+			(void)session_key;
+			for (const auto& [seq, entry] : held) {
+				(void)seq;
+				const HoldBatchMetadata& meta = entry.meta;
+				out.emplace(meta.broker_id, meta.slot_offset, meta.pbr_absolute_index);
+			}
+		}
+	}
+}
+
 bool Topic::IsOrder5HeldSlot(int broker_id, size_t slot_offset, uint64_t pbr_index) {
 	for (const auto& shard_ptr : level5_shards_) {
 		if (!shard_ptr) continue;
@@ -7527,12 +7556,15 @@ void Topic::AdvanceConsumedThroughForProcessedSlots(
 			std::fill(processed_slots[b].begin(), processed_slots[b].end(), static_cast<uint8_t>(0));
 		}
 	}
+	// [[HELD_SLOT_SET]] Snapshot held slots once per call; see CollectOrder5HeldSlotIdentities.
+	absl::flat_hash_set<std::tuple<int, size_t, uint64_t>> held_slots;
+	CollectOrder5HeldSlotIdentities(held_slots);
 	for (const PendingBatch5& p : batch_list) {
 		int b = p.broker_id;
 		if (b < 0 || b >= NUM_MAX_BROKERS || !broker_seen_in_epoch[b]) continue;
 		if (p.slot_offset >= BATCHHEADERS_SIZE) continue;
 		if ((p.slot_offset % slot_size) != 0) continue;
-		if (IsOrder5HeldSlot(b, p.slot_offset, p.cached_pbr_absolute_index)) continue;
+		if (held_slots.contains({b, p.slot_offset, p.cached_pbr_absolute_index})) continue;
 		processed_slots[b][p.slot_offset / slot_size] = 1;
 	}
 	for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
