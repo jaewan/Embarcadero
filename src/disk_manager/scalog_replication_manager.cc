@@ -1,6 +1,7 @@
 #include "scalog_replication_manager.h"
 #include "cxl_manager/cxl_datastructure.h"
 #include "common/performance_utils.h"
+#include "common/replica_disk_dirs.h"
 #include "scalog_replication.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <chrono>
 #include <system_error>
+#include <filesystem>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cerrno>
@@ -1021,12 +1023,22 @@ namespace Scalog {
 			const std::string& sequencer_ip,
 			int sequencer_port) {
 		try {
-			int disk_to_write = broker_id % NUM_DISKS ;
-			std::string base_dir = "../../.Replication/disk" + std::to_string(disk_to_write) + "/";
-			if(log_to_memory){
-				base_dir = "/tmp/";
+			std::string base_dir = "/tmp/";
+			if (!log_to_memory) {
+				const auto dirs = Embarcadero::ResolveWritableReplicationDirs();
+				base_dir = Embarcadero::SelectReplicationDirForBroker(broker_id, dirs);
+				if (base_dir.empty()) {
+					base_dir = "../../.Replication/disk0";
+					LOG(WARNING) << "ScalogReplicationManager: no writable replication dirs; falling back to "
+					             << base_dir;
+				}
+				std::error_code ec;
+				std::filesystem::create_directories(base_dir, ec);
+				if (!base_dir.empty() && base_dir.back() != '/') base_dir.push_back('/');
 			}
-			std::string base_filename = log_file.empty() ? base_dir+"scalog_replication_log"+std::to_string(broker_id) +".dat" : log_file;
+			std::string base_filename = log_file.empty()
+				? base_dir + "scalog_replication_log" + std::to_string(broker_id) + ".dat"
+				: log_file;
 			base_dir_ = base_dir;
 			const std::string effective_sequencer_ip =
 				sequencer_ip.empty() ? std::string(SCALOG_SEQUENCER_IP) : sequencer_ip;

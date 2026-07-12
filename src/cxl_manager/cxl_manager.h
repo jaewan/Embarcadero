@@ -119,9 +119,6 @@ class CXLManager{
 		void* segments_;
 		void* current_log_addr_;
 		volatile bool stop_threads_ = false;
-		// [[SEGMENT_PREFAULT]] Background first-touch of the segment region when metadata-only
-		// zeroing leaves BLog pages unfaulted (see constructor comment); joined in destructor.
-		std::thread segment_prefault_thread_;
 		GetRegisteredBrokersCallback get_registered_brokers_callback_;
 		
 		// [[DEVIATION_005]] Future Multi-Node CXL Support: SegmentAllocator Abstraction

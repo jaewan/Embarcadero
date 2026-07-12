@@ -455,10 +455,10 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		// recv() on the ingest hot path. All recv threads across broker processes then serialize
 		// on the shared shm file's mapping lock (shmem_add_to_page_cache), capping total ordered
 		// ingest at the fault rate (~875K faults/s ≈ 3.4 GB/s, measured 2026-07-12) regardless of
-		// thread count, ACK level, or any other knob. Pre-fault the segment region in the
-		// background from the head broker (whose VMA carries the mbind to the CXL node, so pages
-		// land on the CXL NUMA domain exactly as the zeroing path would place them). Readiness is
-		// not delayed; traffic that arrives before the sweep completes just faults as before.
+		// thread count, ACK level, or any other knob. Pre-fault the segment region from the head
+		// broker (whose VMA carries the mbind to the CXL node) and JOIN before returning so
+		// broker-ready implies pages are populated — async prefault raced with early traffic and
+		// silently re-hit the fault ceiling. Disable with EMBARCADERO_CXL_BG_PREFAULT=0.
 		if (broker_id_ == 0 && MetadataOnlyZeroingEnabled()) {
 			bool prefault_enabled = true;
 			if (const char* env = std::getenv("EMBARCADERO_CXL_BG_PREFAULT")) {
@@ -473,42 +473,41 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 				uintptr_t aligned_addr = seg_addr & ~(page - 1);
 				uint8_t* pf_start = reinterpret_cast<uint8_t*>(aligned_addr);
 				const size_t pf_len = Segment_Region_size + (seg_addr - aligned_addr);
-				segment_prefault_thread_ = std::thread([this, pf_start, pf_len]() {
-					const auto t0 = std::chrono::steady_clock::now();
-					constexpr size_t kPrefaultWorkers = 8;
-					constexpr size_t kChunk = 1UL << 30;  // 1GB madvise granularity
-					const size_t worker_page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-					// Page-align the per-worker split so every madvise addr stays aligned.
-					const size_t per_worker =
-						(((pf_len + kPrefaultWorkers - 1) / kPrefaultWorkers) + worker_page - 1) &
-						~(worker_page - 1);
-					std::atomic<int> madvise_errno{0};
-					std::vector<std::thread> workers;
-					for (size_t w = 0; w < kPrefaultWorkers; ++w) {
-						workers.emplace_back([&, w]() {
-							size_t begin = w * per_worker;
-							size_t end = std::min(begin + per_worker, pf_len);
-							for (size_t off = begin; off < end && !stop_threads_; off += kChunk) {
-								size_t len = std::min(kChunk, end - off);
-								if (madvise(pf_start + off, len, MADV_POPULATE_WRITE) != 0) {
-									madvise_errno.store(errno, std::memory_order_relaxed);
-									return;
-								}
+				const auto t0 = std::chrono::steady_clock::now();
+				constexpr size_t kPrefaultWorkers = 8;
+				constexpr size_t kChunk = 1UL << 30;  // 1GB madvise granularity
+				const size_t worker_page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+				// Page-align the per-worker split so every madvise addr stays aligned.
+				const size_t per_worker =
+					(((pf_len + kPrefaultWorkers - 1) / kPrefaultWorkers) + worker_page - 1) &
+					~(worker_page - 1);
+				std::atomic<int> madvise_errno{0};
+				std::vector<std::thread> workers;
+				for (size_t w = 0; w < kPrefaultWorkers; ++w) {
+					workers.emplace_back([&, w]() {
+						size_t begin = w * per_worker;
+						size_t end = std::min(begin + per_worker, pf_len);
+						for (size_t off = begin; off < end && !stop_threads_; off += kChunk) {
+							size_t len = std::min(kChunk, end - off);
+							if (madvise(pf_start + off, len, MADV_POPULATE_WRITE) != 0) {
+								madvise_errno.store(errno, std::memory_order_relaxed);
+								return;
 							}
-						});
-					}
-					for (auto& t : workers) t.join();
-					const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-						std::chrono::steady_clock::now() - t0).count();
-					if (int err = madvise_errno.load(std::memory_order_relaxed)) {
-						LOG(WARNING) << "CXLManager: segment prefault madvise(MADV_POPULATE_WRITE) failed: "
-						             << strerror(err)
-						             << " — ingest will first-touch fault; use EMBARCADERO_CXL_ZERO_MODE=full";
-					} else if (!stop_threads_) {
-						LOG(INFO) << "CXLManager: segment region prefault complete ("
-						          << (pf_len >> 30) << " GB in " << ms << " ms)";
-					}
-				});
+						}
+					});
+				}
+				for (auto& t : workers) t.join();
+				const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - t0).count();
+				if (int err = madvise_errno.load(std::memory_order_relaxed)) {
+					LOG(ERROR) << "CXLManager: segment prefault madvise(MADV_POPULATE_WRITE) failed: "
+					           << strerror(err)
+					           << " — ingest will first-touch fault (~3.4 GB/s ceiling); "
+					           << "use EMBARCADERO_CXL_ZERO_MODE=full or fix madvise support";
+				} else {
+					LOG(INFO) << "CXLManager: segment region prefault complete ("
+					          << (pf_len >> 30) << " GB in " << ms << " ms)";
+				}
 			}
 		}
 
@@ -518,9 +517,6 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 
 CXLManager::~CXLManager(){
 	stop_threads_ = true;
-	if (segment_prefault_thread_.joinable()) {
-		segment_prefault_thread_.join();
-	}
 	for(std::thread& thread : sequencerThreads_){
 		if(thread.joinable()){
 			thread.join();

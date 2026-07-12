@@ -14,6 +14,7 @@
 #include <glog/logging.h>
 #include "common/performance_utils.h"
 #include "common/env_flags.h"
+#include "common/replica_disk_dirs.h"
 #include "cxl_manager/cxl_datastructure.h"  // CXL namespace
 
 namespace Embarcadero {
@@ -46,16 +47,6 @@ inline void RefreshGOIToken(GOIEntry* entry) {
     // Token handoff correctness relies on seeing the producer's flushed num_replicated update.
     // A load fence is insufficient for CLFLUSHOPT ordering on non-coherent CXL.
     CXL::full_fence();
-}
-
-std::vector<std::string> SplitCsv(const std::string& csv) {
-    std::vector<std::string> out;
-    std::stringstream ss(csv);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        if (!item.empty()) out.push_back(item);
-    }
-    return out;
 }
 
 inline uint64_t SteadyNowNs() {
@@ -137,61 +128,8 @@ ChainReplicationManager::ChainReplicationManager(
     source_disk_offsets_.assign(static_cast<size_t>(std::max(0, num_brokers_)), 0);
     const bool in_memory_sink = ShouldUseInMemorySink();
 
-    const char* dirs_env = std::getenv("EMBARCADERO_REPLICA_DISK_DIRS");
-    if (!in_memory_sink && dirs_env) {
-        disk_dirs_ = SplitCsv(dirs_env);
-    }
-    if (!in_memory_sink && disk_dirs_.empty()) {
-        if (const char* root_env = std::getenv("EMBARCADERO_REPLICA_DISK_ROOT")) {
-            std::error_code ec;
-            for (const auto& e : std::filesystem::directory_iterator(root_env, ec)) {
-                if (ec) break;
-                if (e.is_directory()) {
-                    const std::string n = e.path().filename().string();
-                    if (n.rfind("disk", 0) == 0) {
-                        disk_dirs_.push_back(e.path().string());
-                    }
-                }
-            }
-        }
-    }
-    if (!in_memory_sink && disk_dirs_.empty()) {
-        // Best-effort auto-discovery for local dev/bench scripts.
-        const std::array<std::string, 3> defaults = {
-            "../../.Replication",
-            "../.Replication",
-            ".Replication"
-        };
-        for (const auto& root : defaults) {
-            std::error_code ec;
-            if (!std::filesystem::exists(root, ec) || ec) continue;
-            for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
-                if (ec) break;
-                if (e.is_directory()) {
-                    const std::string n = e.path().filename().string();
-                    if (n.rfind("disk", 0) == 0) {
-                        disk_dirs_.push_back(e.path().string());
-                    }
-                }
-            }
-            if (!disk_dirs_.empty()) break;
-        }
-    }
     if (!in_memory_sink) {
-        std::sort(disk_dirs_.begin(), disk_dirs_.end());
-        disk_dirs_.erase(std::unique(disk_dirs_.begin(), disk_dirs_.end()), disk_dirs_.end());
-        // Keep only writable directories (some mounts may be root-owned in dev envs).
-        std::vector<std::string> writable_dirs;
-        writable_dirs.reserve(disk_dirs_.size());
-        for (const auto& d : disk_dirs_) {
-            if (d.empty()) continue;
-            if (::access(d.c_str(), W_OK | X_OK) == 0) {
-                writable_dirs.push_back(d);
-            } else {
-                LOG(WARNING) << "ChainReplicationManager: skipping non-writable replication dir: " << d;
-            }
-        }
-        disk_dirs_.swap(writable_dirs);
+        disk_dirs_ = ResolveWritableReplicationDirs();
         if (disk_dirs_.empty()) {
             // Fallback to directory of explicit disk_path.
             disk_dirs_.push_back(std::filesystem::path(disk_path_).parent_path().string());

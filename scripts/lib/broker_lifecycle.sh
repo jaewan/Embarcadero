@@ -18,6 +18,40 @@ broker_resolve_path() {
   fi
 }
 
+# Default dual-NVMe striping for replication. Prefers an explicit env, otherwise
+# discovers writable .Replication/disk* (and the common /mnt/nvme0 path).
+broker_ensure_replica_disk_dirs() {
+  if [ -n "${EMBARCADERO_REPLICA_DISK_DIRS:-}" ]; then
+    return 0
+  fi
+  local root="${PROJECT_ROOT:-.}/.Replication"
+  local -a dirs=()
+  local d
+  if [ -d "$root" ]; then
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      if [ -w "$d" ] && [ -x "$d" ]; then
+        dirs+=("$d")
+      fi
+    done < <(find "$root" -maxdepth 1 -type d -name 'disk*' 2>/dev/null | sort)
+  fi
+  # If auto-discovery only found one writable dir but the secondary NVMe path exists, add it.
+  if [ "${#dirs[@]}" -lt 2 ] && [ -d /mnt/nvme0/replication/disk1 ] && [ -w /mnt/nvme0/replication/disk1 ]; then
+    local have_nvme=0
+    for d in "${dirs[@]:-}"; do
+      if [ "$d" = "/mnt/nvme0/replication/disk1" ]; then have_nvme=1; break; fi
+    done
+    if [ "$have_nvme" -eq 0 ]; then
+      dirs+=("/mnt/nvme0/replication/disk1")
+    fi
+  fi
+  if [ "${#dirs[@]}" -ge 1 ]; then
+    local IFS=,
+    export EMBARCADERO_REPLICA_DISK_DIRS="${dirs[*]}"
+    echo "[replica-disks] EMBARCADERO_REPLICA_DISK_DIRS=$EMBARCADERO_REPLICA_DISK_DIRS"
+  fi
+}
+
 broker_init_paths() {
   BROKER_CONFIG="${BROKER_CONFIG:-config/embarcadero.yaml}"
   CLIENT_CONFIG="${CLIENT_CONFIG:-config/client.yaml}"
@@ -27,6 +61,7 @@ broker_init_paths() {
   BROKER_HEARTBEAT_PORT="$(grep -oP '^\s*broker_port:\s*\K[0-9]+' "$BROKER_CONFIG_ABS" 2>/dev/null | head -1)"
   BROKER_DATA_PORT_BASE="${BROKER_DATA_PORT_BASE:-1214}"
   BROKER_HEARTBEAT_PORT="${BROKER_HEARTBEAT_PORT:-12140}"
+  broker_ensure_replica_disk_dirs
 
   if broker_is_remote_mode; then
     REMOTE_PROJECT_ROOT="${REMOTE_PROJECT_ROOT:-$PROJECT_ROOT}"
@@ -774,6 +809,7 @@ broker_remote_launch() {
   # size explicitly so remote embarlet matches local runs (Scalog CXL / ACK paths depend on this).
   local _remote_rep="${REPLICATION_FACTOR:-${EMBARCADERO_REPLICATION_FACTOR:-0}}"
   local _remote_nb="${NUM_BROKERS:-4}"
+  local _remote_disk_dirs="${EMBARCADERO_REPLICA_DISK_DIRS:-}"
 
   broker_remote_ssh env \
     REMOTE_STATE_DIR="$REMOTE_BROKER_STATE_DIR" \
@@ -794,6 +830,7 @@ broker_remote_launch() {
     REMOTE_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" \
     REMOTE_REPLICATION_FACTOR="$_remote_rep" \
     REMOTE_NUM_BROKERS="$_remote_nb" \
+    REMOTE_REPLICA_DISK_DIRS="$_remote_disk_dirs" \
     bash -s <<'EOF'
 set -euo pipefail
 state_dir=${REMOTE_STATE_DIR:?}
@@ -814,6 +851,7 @@ lazylog_seq_ip=${REMOTE_LAZYLOG_SEQ_IP:-}
 lazylog_seq_port=${REMOTE_LAZYLOG_SEQ_PORT:-}
 replication_factor_cfg=${REMOTE_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${REMOTE_NUM_BROKERS:-4}
+replica_disk_dirs=${REMOTE_REPLICA_DISK_DIRS:-}
 mkdir -p "$state_dir"
 rm -f "$state_dir/broker_${idx}.pid" "$state_dir/broker_${idx}.ready" "$state_dir/broker_${idx}.log"
 nohup env \
@@ -836,6 +874,7 @@ nohup env \
   EMBARCADERO_LAZYLOG_SEQ_PORT="$lazylog_seq_port" \
   EMBARCADERO_REPLICATION_FACTOR="$replication_factor_cfg" \
   NUM_BROKERS="$num_brokers_cfg" \
+  EMBARCADERO_REPLICA_DISK_DIRS="$replica_disk_dirs" \
   bash -s <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
 set -euo pipefail
 state_dir=${STATE_DIR:?}
@@ -856,6 +895,7 @@ lazylog_seq_ip=${EMBARCADERO_LAZYLOG_SEQ_IP:-}
 lazylog_seq_port=${EMBARCADERO_LAZYLOG_SEQ_PORT:-}
 replication_factor_cfg=${EMBARCADERO_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${NUM_BROKERS:-4}
+replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_CXL_MAP_POPULATE=${EMBARCADERO_CXL_MAP_POPULATE:-1}
@@ -863,6 +903,9 @@ export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
 export EMBARCADERO_REPLICATION_FACTOR="${replication_factor_cfg:-0}"
 export NUM_BROKERS="${num_brokers_cfg:-4}"
 export EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}
+if [ -n "$replica_disk_dirs" ]; then
+  export EMBARCADERO_REPLICA_DISK_DIRS="$replica_disk_dirs"
+fi
 if [ "$sequence" = "SCALOG" ]; then
   export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1}
 elif [ "$sequence" = "LAZYLOG" ]; then

@@ -25,6 +25,7 @@
 #include "common/order_level.h"
 #include "common/env_flags.h"
 #include "common/performance_utils.h"
+#include "common/replica_disk_dirs.h"
 
 namespace Embarcadero{
 
@@ -34,76 +35,6 @@ namespace Embarcadero{
 		static const bool enabled =
 			ReadEnvBoolLenient("EMBARCADERO_UNIFIED_REPLICATION_PATH", false);
 		return enabled;
-	}
-
-	static std::vector<std::string> SplitCsvDirs(const char* csv) {
-		std::vector<std::string> dirs;
-		if (csv == nullptr) {
-			return dirs;
-		}
-		std::stringstream ss(csv);
-		std::string item;
-		while (std::getline(ss, item, ',')) {
-			if (!item.empty()) {
-				dirs.push_back(item);
-			}
-		}
-		return dirs;
-	}
-
-	static std::vector<std::string> ResolveWritableReplicationDirs() {
-		std::vector<std::string> dirs;
-		if (const char* dirs_env = std::getenv("EMBARCADERO_REPLICA_DISK_DIRS")) {
-			dirs = SplitCsvDirs(dirs_env);
-		}
-		if (dirs.empty()) {
-			if (const char* root_env = std::getenv("EMBARCADERO_REPLICA_DISK_ROOT")) {
-				std::error_code ec;
-				for (const auto& e : std::filesystem::directory_iterator(root_env, ec)) {
-					if (ec) break;
-					if (!e.is_directory()) continue;
-					const std::string n = e.path().filename().string();
-					if (n.rfind("disk", 0) == 0) {
-						dirs.push_back(e.path().string());
-					}
-				}
-			}
-		}
-		if (dirs.empty()) {
-			const std::array<std::string, 3> defaults = {
-				"../../.Replication",
-				"../.Replication",
-				".Replication"
-			};
-			for (const auto& root : defaults) {
-				std::error_code ec;
-				if (!std::filesystem::exists(root, ec) || ec) continue;
-				for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
-					if (ec) break;
-					if (!e.is_directory()) continue;
-					const std::string n = e.path().filename().string();
-					if (n.rfind("disk", 0) == 0) {
-						dirs.push_back(e.path().string());
-					}
-				}
-				if (!dirs.empty()) break;
-			}
-		}
-
-		std::sort(dirs.begin(), dirs.end());
-		dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
-
-		std::vector<std::string> writable_dirs;
-		writable_dirs.reserve(dirs.size());
-		for (const auto& d : dirs) {
-			if (d.empty()) continue;
-			if (::access(d.c_str(), W_OK | X_OK) == 0) {
-				writable_dirs.push_back(d);
-			} else {
-				LOG(WARNING) << "DiskManager: skipping non-writable replication dir: " << d;
-			}
-		}
-		return writable_dirs;
 	}
 
 	void memcpy_nt(void* dst, const void* src, size_t size) {
