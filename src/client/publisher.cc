@@ -1459,8 +1459,12 @@ void Publisher::StartThroughputTimeseriesIfEnabled() {
 		throughput_file << ",Total_GBps\n";
 
 		std::vector<size_t> prev_acked_bytes(num_brokers, 0);
+		std::vector<size_t> prev_sent_bytes(num_brokers, 0);
+		const bool use_sent = []() {
+			const char* env = std::getenv("EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT");
+			return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+		}();
 		constexpr double kGBDivisor = 1024.0 * 1024.0 * 1024.0;
-		constexpr int kDrainIntervalsAfterFinish = 20;
 		int drain_remaining = -1;
 		auto prev_time = std::chrono::steady_clock::now();
 		int64_t shared_origin_ms = 0;
@@ -1490,19 +1494,31 @@ void Publisher::StartThroughputTimeseriesIfEnabled() {
 			for (size_t i = 0; i < num_brokers; ++i) {
 				const size_t acked_bytes =
 					broker_stats_[i].acked_messages.load(std::memory_order_relaxed) * message_size_;
-				const size_t delta_bytes = acked_bytes - prev_acked_bytes[i];
+				const size_t sent_bytes =
+					broker_stats_[i].sent_messages.load(std::memory_order_relaxed) * message_size_;
+				const size_t cur_bytes = use_sent ? sent_bytes : acked_bytes;
+				size_t& prev_bytes = use_sent ? prev_sent_bytes[i] : prev_acked_bytes[i];
+				const size_t delta_bytes = cur_bytes - prev_bytes;
 				const double gbps = (static_cast<double>(delta_bytes) / elapsed_sec) / kGBDivisor;
 				throughput_file << "," << gbps;
 				total_delta_bytes += delta_bytes;
+				prev_bytes = cur_bytes;
 				prev_acked_bytes[i] = acked_bytes;
+				prev_sent_bytes[i] = sent_bytes;
 			}
 
 			const double total_gbps =
 				(static_cast<double>(total_delta_bytes) / elapsed_sec) / kGBDivisor;
 			throughput_file << "," << total_gbps << "\n";
 
+			// Keep sampling through Poll()/ACK drain so post-kill recovery is visible.
+			if (shutdown_.load(std::memory_order_relaxed)) {
+				break;
+			}
 			if (publish_finished_.load(std::memory_order_relaxed)) {
-				if (drain_remaining < 0) drain_remaining = kDrainIntervalsAfterFinish;
+				if (drain_remaining < 0) {
+					drain_remaining = use_sent ? 5 : 300;  // ~3s ACK-window when measuring ACKs
+				}
 				if (--drain_remaining <= 0) break;
 			}
 		}

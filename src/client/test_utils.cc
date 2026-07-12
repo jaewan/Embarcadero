@@ -1393,9 +1393,49 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 			}
 			LOG(INFO) << "Publisher push start (wall ns): " << pub_start_wall_ns;
 
+			// Optional offered-load pacing (same semantics as latency mode). Used by E4
+			// failure cells so the send phase stays active across BROKER_KILL_AFTER_SEC.
+			const bool steady_rate = result.count("steady_rate") > 0;
+			double target_mbps = 0.0;
+			if (result.count("target_mbps")) {
+				target_mbps = result["target_mbps"].as<double>();
+			}
+			size_t pad = message_size % 64;
+			if (pad) {
+				pad = 64 - pad;
+			}
+			const size_t paced_bytes_per_msg =
+				message_size + pad + sizeof(Embarcadero::MessageHeader);
+			const auto pace_start = std::chrono::steady_clock::now();
+			const double target_bytes_per_sec =
+				(target_mbps > 0.0) ? (target_mbps * 1024.0 * 1024.0) : 0.0;
+			uint64_t offered_bytes = 0;
+			size_t steady_window_bytes = 0;
+			if (target_mbps > 0.0 || steady_rate) {
+				LOG(INFO) << "PublishThroughput pacing: target_mbps=" << target_mbps
+					<< " steady_rate=" << (steady_rate ? "true" : "false");
+			}
+
 			// Publish messages
 				for (size_t i = 0; i < n; i++) {
+					if (steady_rate && steady_window_bytes >= (BATCH_SIZE * 4)) {
+						p.WriteFinishedOrPaused();
+						std::this_thread::sleep_for(std::chrono::microseconds(1500));
+						steady_window_bytes = 0;
+					}
+					if (target_bytes_per_sec > 0.0) {
+						const double expected_ns =
+							(static_cast<double>(offered_bytes) * 1e9) / target_bytes_per_sec;
+						const auto target_time =
+							pace_start + std::chrono::nanoseconds(static_cast<long long>(expected_ns));
+						const auto now = std::chrono::steady_clock::now();
+						if (target_time > now) {
+							std::this_thread::sleep_until(target_time);
+						}
+					}
 					p.Publish(message, message_size);
+					offered_bytes += paced_bytes_per_msg;
+					steady_window_bytes += paced_bytes_per_msg;
 				}
 
 			// Finalize publishing
