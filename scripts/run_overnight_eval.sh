@@ -205,6 +205,24 @@ log() { local msg="[$(stamp)] $*"; echo "$msg"; echo "$msg" >> "$SUMMARY_LOG"; }
 pass_cell() { log "PASS [$1]"; }
 fail_cell() { log "FAIL [$1] — see $LOG_DIR/${1}.log"; }
 
+# Optional cell filter for reruns: ONLY_CELLS=comma,separated,labels
+# Empty → run all cells. When set, run_multi_cell / run_latency_cell no-op if label absent.
+should_run_cell() {
+    local label="$1"
+    if [[ -z "${ONLY_CELLS:-}" ]]; then
+        return 0
+    fi
+    local IFS=','
+    local c
+    for c in $ONLY_CELLS; do
+        if [[ "$c" == "$label" ]]; then
+            return 0
+        fi
+    done
+    log "SKIP [$label] (not in ONLY_CELLS)"
+    return 1
+}
+
 # Fault-tolerant guard: wrap any command so a failure is logged but the script continues.
 # Usage: safe_run "description" command [args...]
 safe_run() {
@@ -223,7 +241,10 @@ safe_run() {
 preflight_check() {
     log "Pre-flight: checking cluster connectivity and forcing source sync + native rebuild"
     # Always refresh clients to the broker commit (native rebuild on each host).
-    if ! bash "$SCRIPT_DIR/cluster_setup.sh"; then
+    # SKIP_CLUSTER_SETUP=1 when re-running with uncommitted local fixes already deployed.
+    if [[ "${SKIP_CLUSTER_SETUP:-0}" == "1" ]]; then
+        log "SKIP_CLUSTER_SETUP=1 — leaving deployed binaries as-is"
+    elif ! bash "$SCRIPT_DIR/cluster_setup.sh"; then
         log "cluster_setup.sh failed — aborting"
         exit 1
     fi
@@ -294,6 +315,7 @@ run_multi_cell() {
     local nclients="$2"
     local client_csv="$3"
     shift 3
+    should_run_cell "$label" || return 0
     local cell_log="$LOG_DIR/${label}.log"
     log "START [$label] clients=$nclients hosts=$client_csv"
 
@@ -353,6 +375,7 @@ run_multi_cell() {
 run_latency_cell() {
     local label="$1"
     shift
+    should_run_cell "$label" || return 0
     local cell_log="$LOG_DIR/${label}.log"
     log "START latency [$label]"
 

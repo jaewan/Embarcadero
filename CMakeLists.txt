@@ -17,14 +17,17 @@ set(CMAKE_CXX_FLAGS "-Wall -O3")
 set(CMAKE_INSTALL_MESSAGE LAZY)
 set(CMAKE_PARALLEL_LEVEL 16)
 
-# Enable x86-64 CLFLUSHOPT for CXL flush (performance_utils.h) — required by src and bench
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+# performance_utils.h calls _mm_clflushopt on x86.  Check and enable the
+# precise compiler feature rather than assuming -march=native was accepted;
+# the latter can be absent from generated target flags and leaves every CXL
+# translation unit uncompilable.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
 	include(CheckCXXCompilerFlag)
-	check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
-	if(COMPILER_SUPPORTS_MARCH_NATIVE)
-		message(STATUS "Enabling -march=native for CXL intrinsics")
-		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+	check_cxx_compiler_flag("-mclflushopt" COMPILER_SUPPORTS_CLFLUSHOPT)
+	if(NOT COMPILER_SUPPORTS_CLFLUSHOPT)
+		message(FATAL_ERROR "This x86 build requires compiler support for -mclflushopt")
 	endif()
+	add_compile_options("-mclflushopt")
 endif()
 
 include(FetchContent)

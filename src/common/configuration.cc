@@ -329,6 +329,7 @@ void Configuration::overrideFromCommandLine(int argc, char* argv[]) {
         {"cxl-size", required_argument, 0, 'c'},
         {"batch-size", required_argument, 0, 'b'},
         {"network-threads", required_argument, 0, 'n'},
+        {"network_threads", required_argument, 0, 'n'},
         // Accept common flags used by the app so getopt_long doesn't error
         {"head", no_argument, 0, 0},
         {"follower", required_argument, 0, 0},

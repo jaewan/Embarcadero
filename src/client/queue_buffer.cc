@@ -23,9 +23,30 @@ namespace {
 	constexpr size_t kQueueFullSleepMs = 1;
 	constexpr size_t kMaxRegions = 4;  // allow multiple AddBuffers(); pool capacity = pool_slots_ * kMaxRegions
 	constexpr size_t kAlign = 64;
-	constexpr size_t kDefaultPoolSizeBytes = 256ULL * 1024 * 1024;  // 256 MB; caller hint or min_slots dominates for throughput
+	// Steady-state publish pipeline budget. Callers historically passed multi-GB
+	// hints (full dataset / threads×brokers×256MB); those must not inflate the
+	// hugepage mmap. Exhausted pool → Write() backpressures until ReleaseBatch.
+	constexpr size_t kDefaultPoolSizeBytes = 256ULL * 1024 * 1024;
+	// Cap must cover the session unacked window (default ~12 GiB/s × 1s lease)
+	// or Write() pool-acquires starve while PublishThreads hold slots waiting
+	// on WaitForUnackedCapacity. Still << the old 48 GiB (24×1024×2MiB) blow-up.
+	constexpr size_t kMaxPoolSizeBytes = 12ULL * 1024 * 1024 * 1024;
+	// Slots kept in flight per SPSC queue (not kQueueCapacity=1024). Full-queue
+	// sizing was 24×1024×2MiB ≈ 48GiB and blocked SubscribeToCluster past Init.
+	constexpr size_t kPipelineSlotsPerQueue = 32;
 	inline size_t AlignUp(size_t size, size_t align) {
 		return (size + align - 1) & ~(align - 1);
+	}
+	size_t ResolveMaxPoolBytes() {
+		if (const char* env = std::getenv("EMBARCADERO_QUEUE_POOL_MAX_BYTES")) {
+			char* end = nullptr;
+			unsigned long long parsed = std::strtoull(env, &end, 10);
+			if (end != env && *end == '\0' && parsed >= (1ULL << 20)) {
+				return static_cast<size_t>(parsed);
+			}
+			LOG(WARNING) << "Ignoring invalid EMBARCADERO_QUEUE_POOL_MAX_BYTES='" << env << "'";
+		}
+		return kMaxPoolSizeBytes;
 	}
 	inline uint16_t RuntimeSessionEpochHint() {
 		static const uint16_t value = []() {
@@ -127,9 +148,8 @@ QueueBuffer::~QueueBuffer() {
 }
 
 bool QueueBuffer::AddBuffers(size_t buf_size) {
-	// Publisher calls AddBuffers once per broker from the gRPC (SubscribeToCluster) thread.
-	// Each call used to allocate ~16 GB and block for many seconds, so 3 brokers = 60+ s block → Init() timeout.
-	// One region already provides enough slots (1 + num_queues_*kQueueCapacity); subsequent calls are no-ops.
+	// Prefer a single region allocated from Publisher::Init (main thread). Later
+	// calls from SubscribeToCluster / AddPublisherThreads are intentional no-ops.
 	if (!batch_buffers_region_.empty()) {
 		return true;
 	}
@@ -137,34 +157,38 @@ bool QueueBuffer::AddBuffers(size_t buf_size) {
 	const size_t batch_size = BATCH_SIZE;
 	batch_size_cached_.store(batch_size, std::memory_order_release);
 	slot_size_ = AlignUp(sizeof(Embarcadero::BatchHeader) + batch_size, kAlign);
-	// Pool size: at least the default target (16 GB), at least caller hint (buf_size),
-	// and at least 1 + num_queues_*kQueueCapacity slots for correctness.
-	// Same hugepage path as buffer.cc: mmap_large_buffer() uses MAP_HUGETLB (or THP fallback).
-	const size_t min_slots = std::max<size_t>(256, num_queues_ * kQueueCapacity + 1);
-	const size_t target_pool_bytes = std::max(kDefaultPoolSizeBytes, buf_size);
-	const size_t slots_for_target = static_cast<size_t>(target_pool_bytes / slot_size_);
-	const size_t slots_this_region = std::max(min_slots, slots_for_target);
 
-	// First call: set pool_slots_ and create pool with capacity for kMaxRegions
+	const size_t queues = std::max<size_t>(1, num_queues_);
+	const size_t min_slots =
+		std::max<size_t>(256, queues * kPipelineSlotsPerQueue + 1);
+	const size_t max_pool_bytes = ResolveMaxPoolBytes();
+	const size_t hint_bytes =
+		std::min(std::max(kDefaultPoolSizeBytes, buf_size), max_pool_bytes);
+	const size_t slots_for_hint = std::max<size_t>(1, hint_bytes / slot_size_);
+	const size_t max_slots = std::max<size_t>(min_slots, max_pool_bytes / slot_size_);
+	const size_t slots_this_region =
+		std::min(max_slots, std::max(min_slots, slots_for_hint));
+
 	if (!pool_) {
 		pool_slots_ = slots_this_region;
-		pool_ = std::make_unique<folly::MPMCQueue<Embarcadero::BatchHeader*>>(pool_slots_ * kMaxRegions);
+		pool_ = std::make_unique<folly::MPMCQueue<Embarcadero::BatchHeader*>>(
+			pool_slots_ * kMaxRegions);
 	}
 
 	size_t total_bytes = slots_this_region * slot_size_;
-	// Check hugepage availability before allocating (logs and warns if insufficient).
 	CheckHugePagesAvailable(total_bytes);
 
 	size_t allocated = 0;
 	void* region = nullptr;
 	try {
-		region = mmap_large_buffer(total_bytes, allocated);  // hugepage (MAP_HUGETLB) like buffer.cc
+		region = mmap_large_buffer(total_bytes, allocated);
 	} catch (const std::exception& e) {
 		LOG(ERROR) << "QueueBuffer: mmap_large_buffer failed: " << e.what();
 		return false;
 	}
 	if (!region || allocated < slots_this_region * slot_size_) {
-		LOG(ERROR) << "QueueBuffer: insufficient allocation " << allocated << " need " << (slots_this_region * slot_size_);
+		LOG(ERROR) << "QueueBuffer: insufficient allocation " << allocated
+		           << " need " << (slots_this_region * slot_size_);
 		if (region) munmap(region, allocated);
 		return false;
 	}
@@ -178,10 +202,13 @@ bool QueueBuffer::AddBuffers(size_t buf_size) {
 		pool_->write(slot);
 	}
 
-	VLOG(3) << "QueueBuffer::AddBuffers region_slots=" << slots_this_region
-	        << " slot_size=" << slot_size_
-	        << " pool_bytes=" << (slots_this_region * slot_size_)
-	        << " total_regions=" << batch_buffers_region_.size();
+	LOG(INFO) << "QueueBuffer::AddBuffers region_slots=" << slots_this_region
+	          << " slot_size=" << slot_size_
+	          << " pool_bytes=" << (slots_this_region * slot_size_)
+	          << " hint_bytes=" << buf_size
+	          << " max_pool_bytes=" << max_pool_bytes
+	          << " queues=" << queues
+	          << " (pipeline_slots_per_queue=" << kPipelineSlotsPerQueue << ")";
 	return true;
 }
 
@@ -428,7 +455,16 @@ bool QueueBuffer::Write(size_t client_order, char* msg, size_t len, size_t padde
 	// If this message would exceed the slot, seal first then write into new buffer.
 	if (current_batch_tail_ + stride > slot_size_) {
 		sealed_count += SealCurrentAndAdvance();
-		if (!current_batch_) return false;  // pool timeout
+		if (!current_batch_) {
+			// [[TAIL_SEAL_FIX 2026-07-12]] The batch we just sealed was pushed to a
+			// queue and will be sent+acked, but AcquireNextBatchFromPool timed out for
+			// THIS message. Surface the sealed count so the caller credits client_order_
+			// (otherwise those messages are sent+acked yet never counted, wedging Poll's
+			// drain a few hundred messages short of target — seen at N=3 full-stripe and
+			// in E4a broker-kill). The caller retries this message under backpressure.
+			sealed_out = sealed_count;
+			return false;  // pool timeout
+		}
 	}
 
 	uint8_t* base = reinterpret_cast<uint8_t*>(current_batch_);
@@ -647,6 +683,11 @@ void QueueBuffer::MarkQueueActive(size_t queue_idx) {
 		queue_active_[queue_idx].store(true, std::memory_order_relaxed);
 		NotifyQueueDataReady(queue_idx);
 	}
+}
+
+bool QueueBuffer::IsQueueActive(size_t queue_idx) const {
+	if (!queue_active_ || queue_idx >= num_queues_) return false;
+	return queue_active_[queue_idx].load(std::memory_order_relaxed);
 }
 
 void QueueBuffer::SetPreferredQueues(const std::vector<size_t>& preferred_indices) {

@@ -46,9 +46,11 @@ public:
 	~QueueBuffer();
 
 	/**
-	 * Allocate batch buffer pool (hugepage-backed, same as buffer.cc via mmap_large_buffer).
-	 * Pool size is at least the default target plus any caller-provided hint, and
-	 * enough slots for num_queues_*kQueueCapacity+1.
+	 * Allocate batch buffer pool (hugepage-backed via mmap_large_buffer).
+	 * Sized for steady-state pipeline depth (queues × ~32 slots), capped at the
+	 * session unacked window (~12GB default; EMBARCADERO_QUEUE_POOL_MAX_BYTES
+	 * overrides). Caller hints larger than the cap are clamped — pool exhaustion
+	 * backpressures Write(). Idempotent.
 	 * @param buf_size Size hint from caller (bytes)
 	 * @return true on success
 	 */
@@ -107,6 +109,9 @@ public:
 	 * successfully rerouted to another broker.
 	 */
 	void MarkQueueActive(size_t queue_idx);
+
+	/** True if the queue accepts producer seals (has a live PublishThread consumer). */
+	bool IsQueueActive(size_t queue_idx) const;
 	void SetPreferredQueues(const std::vector<size_t>& preferred_indices);
 	void ClearPreferredQueues();
 	// D1 session rollover hook. Call only after producers are quiesced and unacked suffix is handled.
@@ -159,8 +164,9 @@ private:
 	std::unique_ptr<std::atomic<bool>[]> queue_active_;
 	std::unique_ptr<std::atomic<bool>[]> queue_preferred_;
 	std::atomic<size_t> preferred_queue_count_{0};
-	// Per-queue capacity; pool sized so 1 + num_queues_*kQueueCapacity slots exist.
-	// [[ROOT_CAUSE_FIX]] 256 was too small for 10GB test. 512 helped; 1024 gives more headroom when broker recv is slow (docs/NEW_BUFFER_BANDWIDTH_INVESTIGATION.md).
+	// Per-queue SPSC ring depth (queue fullness backpressure). Batch *pool* depth is
+	// separate: AddBuffers sizes pools as queues×~32 slots, capped at the unacked
+	// window (~12 GiB / EMBARCADERO_QUEUE_POOL_MAX_BYTES) — not queues×kQueueCapacity.
 	static constexpr size_t kQueueCapacity = 1024;
 
 	// Batch buffer pool (MPMC: producer acquires, consumers release via ReleaseBatch)

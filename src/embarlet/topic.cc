@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -22,6 +23,24 @@
 
 
 namespace Embarcadero {
+
+namespace {
+
+std::vector<std::string> ResolveLazyLogMetadataEndpoints() {
+	const char* value = std::getenv("EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS");
+	if (value == nullptr || *value == '\0') return {};
+	std::vector<std::string> endpoints;
+	std::stringstream stream(value);
+	std::string endpoint;
+	while (std::getline(stream, endpoint, ',')) {
+		const auto first = endpoint.find_first_not_of(" \t");
+		const auto last = endpoint.find_last_not_of(" \t");
+		if (first != std::string::npos) endpoints.push_back(endpoint.substr(first, last - first + 1));
+	}
+	return endpoints;
+}
+
+}  // namespace
 
 constexpr size_t kReplicationNotStarted = std::numeric_limits<size_t>::max();
 
@@ -619,6 +638,21 @@ Topic::Topic(
 				);
 				if (!scalog_replication_client_->Connect()) {
 					LOG(ERROR) << "LazyLog replication client failed to connect to replica";
+				}
+			}
+			const auto metadata_endpoints = ResolveLazyLogMetadataEndpoints();
+			if (!metadata_endpoints.empty()) {
+				if (replication_factor_ <= 0 ||
+					static_cast<int>(metadata_endpoints.size()) != replication_factor_) {
+					LOG(ERROR) << "LazyLog metadata replication disabled: expected exactly "
+					           << replication_factor_ << " endpoints in "
+					           << "EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS, got "
+					           << metadata_endpoints.size();
+				} else {
+					lazylog_metadata_replica_client_ =
+						std::make_unique<LazyLog::LazyLogMetadataReplicaClient>(metadata_endpoints);
+					LOG(INFO) << "LazyLog metadata replication enabled with "
+					          << metadata_endpoints.size() << " replicas";
 				}
 			}
 			GetCXLBufferFunc = &Topic::LazyLogGetCXLBuffer;
@@ -1699,24 +1733,15 @@ void Topic::RecordCorfuOrder2DurableCompletion(uint64_t batch_seq, uint32_t num_
 	absl::flat_hash_map<uint32_t, uint64_t> per_client_delta;
 	{
 		absl::MutexLock lock(&corfu_order2_durable_mu_);
-		auto [it, inserted] =
-				corfu_order2_durable_completed_.emplace(batch_seq, std::make_pair(num_msg, client_id));
-		if (!inserted) {
+		std::vector<DurableBatch> newly_contiguous;
+		if (!corfu_order2_durable_frontier_.Record(
+				batch_seq, DurableBatch{num_msg, client_id}, &newly_contiguous)) {
 			LOG(WARNING) << "Corfu ORDER=2 durable: duplicate completion for batch_seq=" << batch_seq;
 			return;
 		}
-
-		while (true) {
-			auto next_it = corfu_order2_durable_completed_.find(corfu_order2_durable_next_seq_);
-			if (next_it == corfu_order2_durable_completed_.end()) {
-				break;
-			}
-			const uint32_t slot_num_msg = next_it->second.first;
-			const uint32_t slot_client_id = next_it->second.second;
-			messages_to_ack += slot_num_msg;
-			per_client_delta[slot_client_id] += slot_num_msg;
-			corfu_order2_durable_completed_.erase(next_it);
-			corfu_order2_durable_next_seq_++;
+		for (const DurableBatch& batch : newly_contiguous) {
+			messages_to_ack += batch.message_count;
+			per_client_delta[batch.client_id] += batch.message_count;
 		}
 	}
 
@@ -1766,8 +1791,55 @@ void Topic::RecordPerClientDurableVisibility(uint32_t client_id, uint64_t count)
 	UpdatePerClientDurable(client_id, count);
 }
 
+void Topic::RecordLazyLogMetadataReplicaAck(uint64_t start_logical_offset,
+		uint32_t num_msg, uint32_t client_id) {
+	if (!SupportsPerClientAppendAckLevel1() || num_msg == 0) return;
+	absl::MutexLock lock(&lazylog_append_mu_);
+	auto [it, inserted] = lazylog_metadata_ready_.emplace(
+		start_logical_offset, std::make_pair(num_msg, client_id));
+	if (!inserted && it->second != std::make_pair(num_msg, client_id)) {
+		LOG(ERROR) << "LazyLog metadata descriptor conflicts at logical offset "
+		           << start_logical_offset;
+	}
+}
+
+void Topic::MaybeAdvanceLazyLogAppendVisibility() const {
+	if (!SupportsPerClientAppendAckLevel1() || replication_factor_ <= 0) return;
+	const int num_brokers = get_num_brokers_callback_();
+	uint64_t data_frontier = std::numeric_limits<uint64_t>::max();
+	int ready_replicas = 0;
+	for (int i = 0; i < replication_factor_; ++i) {
+		const int replica = Embarcadero::GetReplicationSetBroker(
+			broker_id_, replication_factor_, num_brokers, i);
+		volatile uint64_t* done = &tinode_->offsets[replica].replication_done[broker_id_];
+		CXL::flush_cacheline(const_cast<const void*>(
+			reinterpret_cast<const volatile void*>(done)));
+		CXL::load_fence();
+		const uint64_t value = *done;
+		if (value == kReplicationNotStarted) continue;
+		++ready_replicas;
+		data_frontier = std::min(data_frontier, value + 1);
+	}
+	if (ready_replicas < replication_factor_) return;
+
+	absl::MutexLock lock(&lazylog_append_mu_);
+	while (true) {
+		auto it = lazylog_metadata_ready_.find(lazylog_append_next_logical_offset_);
+		if (it == lazylog_metadata_ready_.end()) break;
+		const uint64_t end = lazylog_append_next_logical_offset_ + it->second.first;
+		if (end > data_frontier) break;
+		per_client_lazylog_append_[it->second.second] += it->second.first;
+		lazylog_append_progress_.fetch_add(it->second.first, std::memory_order_release);
+		lazylog_append_next_logical_offset_ = end;
+		lazylog_metadata_ready_.erase(it);
+	}
+}
+
 void Topic::RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num_msg, uint32_t client_id) {
-	if (!(seq_type_ == EMBARCADERO && order_ == 0 && replication_factor_ > 0) || num_msg == 0) {
+	const bool uses_replication_done_durability =
+		(seq_type_ == EMBARCADERO && order_ == 0) ||
+		(seq_type_ == SCALOG && order_ == Embarcadero::kOrderPerBroker);
+	if (!uses_replication_done_durability || replication_factor_ <= 0 || num_msg == 0) {
 		return;
 	}
 	absl::MutexLock lock(&per_client_durable_mu_);
@@ -1785,7 +1857,10 @@ void Topic::RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num
 }
 
 void Topic::MaybeAdvanceOrder0DurableVisibility() const {
-	if (!(seq_type_ == EMBARCADERO && order_ == 0 && replication_factor_ > 0)) {
+	const bool uses_replication_done_durability =
+		(seq_type_ == EMBARCADERO && order_ == 0) ||
+		(seq_type_ == SCALOG && order_ == Embarcadero::kOrderPerBroker);
+	if (!uses_replication_done_durability || replication_factor_ <= 0) {
 		return;
 	}
 
@@ -1924,6 +1999,13 @@ bool Topic::AckRelayEpochValid(
 	}
 	if (producing_epoch_out) *producing_epoch_out = producing_epoch;
 	if (control_epoch_out) *control_epoch_out = control_epoch;
+	// producing_epoch==0 means this client has never been stamped by CommitEpoch.
+	// Withholding then blocks the zero frontier forever whenever ControlBlock.epoch
+	// was bumped at sequencer start (1→2). Only withhold once the client has a
+	// real producing stamp that lags the control epoch (zombie / stale session).
+	if (producing_epoch == 0) {
+		return true;
+	}
 	return !ShouldWithholdAckRelay(producing_epoch, control_epoch);
 }
 
@@ -1932,6 +2014,23 @@ uint64_t Topic::GetClientDurable(uint32_t client_id) const {
 	absl::MutexLock lock(&per_client_durable_mu_);
 	auto it = per_client_durable_.find(client_id);
 	return (it != per_client_durable_.end()) ? it->second : 0;
+}
+
+uint64_t Topic::GetClientAppend(uint32_t client_id) const {
+	MaybeAdvanceLazyLogAppendVisibility();
+	absl::MutexLock lock(&lazylog_append_mu_);
+	auto it = per_client_lazylog_append_.find(client_id);
+	return (it != per_client_lazylog_append_.end()) ? it->second : 0;
+}
+
+bool Topic::SupportsPerClientAppendAckLevel1() const {
+	return seq_type_ == LAZYLOG && order_ == Embarcadero::kOrderTotal &&
+	       lazylog_metadata_replica_client_ != nullptr;
+}
+
+uint64_t Topic::GetLazyLogAppendProgress() const {
+	MaybeAdvanceLazyLogAppendVisibility();
+	return lazylog_append_progress_.load(std::memory_order_acquire);
 }
 
 bool Topic::SupportsPerClientAckLevel1() const {
@@ -1975,8 +2074,11 @@ bool Topic::SupportsPerClientAckLevel2Durable() const {
 		return order_ == 0 || order_ == Embarcadero::kOrderStrong;
 	}
 	if (seq_type_ == CORFU) {
+		// The current Corfu transport has exactly one remote media-durable
+		// target.  RF is primary plus remote replicas, so accepting RF>2 would
+		// overclaim all-replica durability.  C2 generalizes this to a chain.
 		return order_ == Embarcadero::kOrderTotal &&
-		       replication_factor_ > 0 &&
+		       replication_factor_ == Embarcadero::kMinReplicationFactorForAck2 &&
 		       corfu_replication_client_ != nullptr;
 	}
 	if (seq_type_ == LAZYLOG) {
@@ -1985,7 +2087,7 @@ bool Topic::SupportsPerClientAckLevel2Durable() const {
 	}
 	if (seq_type_ == SCALOG) {
 		return order_ == Embarcadero::kOrderPerBroker &&
-		       replication_factor_ > 0;
+		       replication_factor_ >= Embarcadero::kMinReplicationFactorForAck2;
 	}
 	return false;
 }
@@ -2206,6 +2308,13 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
          std::string(getenv("SCALOG_CXL_MODE")) == "1");
 
     uint64_t pbr_idx = broker_pbr_counters_[broker_id_].fetch_add(1, std::memory_order_relaxed);
+	{
+		absl::MutexLock lock(&mutex_);
+		logical_offset = logical_offset_;
+		logical_offset_ += batch_header.num_msg;
+	}
+	batch_header.start_logical_offset = logical_offset;
+	batch_header.broker_id = broker_id_;
     batch_header.pbr_absolute_index = pbr_idx;
     batch_header.batch_id = (static_cast<uint64_t>(broker_id_) << 48) | pbr_idx;
 
@@ -2235,18 +2344,22 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 
 	// Return replication callback
 	return [this, batch_header, log, rep_offset, kCxlScalogMode](void* log_ptr, size_t /*placeholder*/) {
-		if (kCxlScalogMode) {
-			return;
-		}
+		bool data_replication_submitted = kCxlScalogMode;
 		// Handle replication if needed
-		if (replication_factor_ > 0 && scalog_replication_client_) {
-				scalog_replication_client_->ReplicateData(
+		if (!kCxlScalogMode && replication_factor_ > 0 && scalog_replication_client_) {
+			data_replication_submitted = scalog_replication_client_->ReplicateData(
 						rep_offset,
 						batch_header.total_size,
 						batch_header.num_msg,
 						log
 				);
 		}
+		if (!data_replication_submitted) {
+			LOG(ERROR) << "Scalog data replication failed; not recording durable batch";
+			return;
+		}
+		RecordOrder0DurableBatch(batch_header.start_logical_offset,
+			batch_header.num_msg, batch_header.client_id);
 	};
 }
 
@@ -2264,6 +2377,13 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 		 std::string(getenv("LAZYLOG_CXL_MODE")) == "1");
 
 	uint64_t pbr_idx = broker_pbr_counters_[broker_id_].fetch_add(1, std::memory_order_relaxed);
+	{
+		absl::MutexLock lock(&mutex_);
+		logical_offset = logical_offset_;
+		logical_offset_ += batch_header.num_msg;
+	}
+	batch_header.start_logical_offset = logical_offset;
+	batch_header.broker_id = broker_id_;
 	batch_header.pbr_absolute_index = pbr_idx;
 	batch_header.batch_id = (static_cast<uint64_t>(broker_id_) << 48) | pbr_idx;
 
@@ -2288,16 +2408,33 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 	}
 
 	return [this, batch_header, log, rep_offset, kCxlLazyLogMode](void* /*log_ptr*/, size_t /*placeholder*/) {
-		if (kCxlLazyLogMode) {
+		bool data_replication_submitted = kCxlLazyLogMode;
+		if (!kCxlLazyLogMode && replication_factor_ > 0 && scalog_replication_client_) {
+			data_replication_submitted = scalog_replication_client_->ReplicateData(
+				rep_offset, batch_header.total_size, batch_header.num_msg, log);
+		}
+		if (!lazylog_metadata_replica_client_) return;
+		if (!data_replication_submitted) {
+			LOG(ERROR) << "LazyLog data replication failed before metadata append";
 			return;
 		}
-		if (replication_factor_ > 0 && scalog_replication_client_) {
-			scalog_replication_client_->ReplicateData(
-					rep_offset,
-					batch_header.total_size,
-					batch_header.num_msg,
-					log);
+		lazylogmetadata::MetadataAppendRequest request;
+		request.set_topic(topic_name_);
+		request.set_source_broker_id(static_cast<uint32_t>(broker_id_));
+		request.set_source_batch_seq(batch_header.pbr_absolute_index);
+		request.set_client_id(batch_header.client_id);
+		request.set_client_batch_seq(batch_header.batch_seq);
+		request.set_payload_offset(batch_header.log_idx);
+		request.set_payload_size(batch_header.total_size);
+		request.set_num_messages(batch_header.num_msg);
+		std::string error;
+		if (!lazylog_metadata_replica_client_->AppendToAll(request, &error)) {
+			LOG(ERROR) << "LazyLog metadata replication failed for pbr="
+			           << batch_header.pbr_absolute_index << ": " << error;
+			return;
 		}
+		RecordLazyLogMetadataReplicaAck(batch_header.start_logical_offset,
+			batch_header.num_msg, batch_header.client_id);
 	};
 }
 
@@ -5391,12 +5528,20 @@ void Topic::EpochSequencerThread() {
 		// The epoch driver seals empty epochs every 500µs, so epoch advancement
 		// is not evidence of data flow. Only scanner pushes and sequencer commits
 		// indicate real progress; otherwise the idle stall timer never fires.
+		//
+		// [[HOLD_GAP_STALL_FIX 2026-07-13]] When the hold buffer is non-empty,
+		// scanner *pushes* alone must not reset the stall timer. Overnight N=2
+		// and the instrumented repro showed push_b climbing while commit_b=0 and
+		// HOLD_DIAG next_expected=0 with min_held_seq>0 — every late push into the
+		// gapped hold reset progress, force_expire stayed 0, and ACKs never moved.
+		// With held work, only commits count as progress for expiry arming.
 		for (int b = 0; b < NUM_MAX_BROKERS; ++b) {
 			const uint64_t pushed = scanner_pushed_batches_[b].load(std::memory_order_relaxed);
 			const uint64_t committed =
 				sequencer_committed_batches_[b].load(std::memory_order_relaxed);
-			if (pushed != last_idle_scanner_pushed_batches[b] ||
-			    committed != last_idle_sequencer_committed_batches[b]) {
+			const bool commit_moved = (committed != last_idle_sequencer_committed_batches[b]);
+			const bool push_moved = (pushed != last_idle_scanner_pushed_batches[b]);
+			if (commit_moved || (push_moved && !has_held_work)) {
 				observed_progress = true;
 				last_idle_progress_ns[b] = now_ns;
 			}

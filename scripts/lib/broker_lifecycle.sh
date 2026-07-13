@@ -816,6 +816,7 @@ broker_remote_launch() {
   local _remote_chain_sink="${EMBARCADERO_CHAIN_REPLICATION_SINK:-}"
   local _remote_chain_sync_bytes="${EMBARCADERO_CHAIN_SYNC_BYTES:-}"
   local _remote_chain_sync_interval_ms="${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}"
+  local _remote_lazylog_metadata_endpoints="${EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS:-}"
 
   broker_remote_ssh env \
     REMOTE_STATE_DIR="$REMOTE_BROKER_STATE_DIR" \
@@ -834,6 +835,7 @@ broker_remote_launch() {
     REMOTE_SCALOG_SEQ_PORT="${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
     REMOTE_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-}" \
     REMOTE_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" \
+    REMOTE_LAZYLOG_METADATA_ENDPOINTS="$_remote_lazylog_metadata_endpoints" \
     REMOTE_REPLICATION_FACTOR="$_remote_rep" \
     REMOTE_NUM_BROKERS="$_remote_nb" \
     REMOTE_REPLICA_DISK_DIRS="$_remote_disk_dirs" \
@@ -861,6 +863,7 @@ scalog_seq_ip=${REMOTE_SCALOG_SEQ_IP:-}
 scalog_seq_port=${REMOTE_SCALOG_SEQ_PORT:-}
 lazylog_seq_ip=${REMOTE_LAZYLOG_SEQ_IP:-}
 lazylog_seq_port=${REMOTE_LAZYLOG_SEQ_PORT:-}
+lazylog_metadata_endpoints=${REMOTE_LAZYLOG_METADATA_ENDPOINTS:-}
 replication_factor_cfg=${REMOTE_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${REMOTE_NUM_BROKERS:-4}
 replica_disk_dirs=${REMOTE_REPLICA_DISK_DIRS:-}
@@ -890,6 +893,7 @@ nohup env \
   SCALOG_SEQUENCER_IP_OVERRIDE="$scalog_seq_ip" \
   EMBARCADERO_LAZYLOG_SEQ_IP="$lazylog_seq_ip" \
   EMBARCADERO_LAZYLOG_SEQ_PORT="$lazylog_seq_port" \
+  EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS="$lazylog_metadata_endpoints" \
   EMBARCADERO_REPLICATION_FACTOR="$replication_factor_cfg" \
   NUM_BROKERS="$num_brokers_cfg" \
   EMBARCADERO_REPLICA_DISK_DIRS="$replica_disk_dirs" \
@@ -917,6 +921,7 @@ scalog_seq_ip=${EMBARCADERO_SCALOG_SEQ_IP:-}
 scalog_seq_port=${EMBARCADERO_SCALOG_SEQ_PORT:-}
 lazylog_seq_ip=${EMBARCADERO_LAZYLOG_SEQ_IP:-}
 lazylog_seq_port=${EMBARCADERO_LAZYLOG_SEQ_PORT:-}
+lazylog_metadata_endpoints=${EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS:-}
 replication_factor_cfg=${EMBARCADERO_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${NUM_BROKERS:-4}
 replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}
@@ -972,6 +977,9 @@ fi
 if [ -n "$scalog_seq_port" ]; then export EMBARCADERO_SCALOG_SEQ_PORT="$scalog_seq_port"; fi
 if [ -n "$lazylog_seq_ip" ]; then export EMBARCADERO_LAZYLOG_SEQ_IP="$lazylog_seq_ip"; fi
 if [ -n "$lazylog_seq_port" ]; then export EMBARCADERO_LAZYLOG_SEQ_PORT="$lazylog_seq_port"; fi
+if [ -n "$lazylog_metadata_endpoints" ]; then
+  export EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS="$lazylog_metadata_endpoints"
+fi
 log_file="$state_dir/broker_${idx}.log"
 cd "$build_bin"
 export EMBARCADERO_HEAD_ADDR="$head_addr"

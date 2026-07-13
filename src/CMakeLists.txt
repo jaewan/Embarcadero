@@ -1,7 +1,9 @@
 include(cmake/heartbeat_grpc.cmake)
 include(cmake/scalog_sequencer_grpc.cmake)
 include(cmake/lazylog_sequencer_grpc.cmake)
+include(cmake/lazylog_metadata_grpc.cmake)
 include(cmake/corfu_sequencer_grpc.cmake)
+include(cmake/corfu_token_proxy_grpc.cmake)
 include(cmake/scalog_replication_grpc.cmake)
 include(cmake/corfu_replication_grpc.cmake)
 include(cmake/session_proto.cmake)
@@ -66,6 +68,10 @@ add_executable(embarlet
     cxl_manager/scalog_local_sequencer.h
     cxl_manager/lazylog_local_sequencer.cc
     cxl_manager/lazylog_local_sequencer.h
+    cxl_manager/lazylog_metadata_replica.cc
+    cxl_manager/lazylog_metadata_replica.h
+    cxl_manager/corfu_token_proxy.cc
+    cxl_manager/corfu_token_proxy.h
     network_manager/network_manager.cc
     network_manager/network_manager.h
     embarlet/heartbeat.cc
@@ -92,7 +98,10 @@ target_link_libraries(embarlet
     absl::flat_hash_map
 	scalog_sequencer_grpc_proto
     lazylog_sequencer_grpc_proto
+    lazylog_metadata_grpc_proto
+	corfu_sequencer_grpc_proto
 	corfu_replication_grpc_proto
+	corfu_token_proxy_grpc_proto
     scalog_replication_grpc_proto
 	heartbeat_grpc_proto
 	session_proto
@@ -150,6 +159,7 @@ target_link_libraries(throughput_test
     heartbeat_grpc_proto
     session_proto
     corfu_sequencer_grpc_proto
+    corfu_token_proxy_grpc_proto
     corfu_replication_grpc_proto
     scalog_replication_grpc_proto
     grpc++_reflection
@@ -271,6 +281,26 @@ target_link_libraries(lazylog_global_sequencer
 
 set_target_properties(lazylog_global_sequencer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+add_executable(lazylog_metadata_replica
+    cxl_manager/lazylog_metadata_replica_main.cc
+    cxl_manager/lazylog_metadata_replica.cc
+    cxl_manager/lazylog_metadata_replica.h
+)
+
+target_include_directories(lazylog_metadata_replica PUBLIC
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+target_link_libraries(lazylog_metadata_replica
+    lazylog_metadata_grpc_proto
+    cxxopts::cxxopts
+    grpc++
+    protobuf::libprotobuf
+    Threads::Threads
 )
 
 add_executable(corfu_global_sequencer

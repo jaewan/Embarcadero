@@ -389,25 +389,28 @@ uint64_t DeliveryDedupeKey(long long send_time_ns, uint64_t msg_uid) {
 }
 
 int ResolveDeliveryTimeoutSec(size_t total_message_size, double target_mbps) {
-	int timeout_sec = 120;
+	// Parallel ConsumeOrdered drain runs after Init() and overlaps publish.
+	// Budget = post-publish slack + expected paced-publish duration so Init/mmap
+	// never share the deadline (those finish before the drain thread starts).
+	int drain_sec = 120;
 	if (const char* env = std::getenv("EMBARCADERO_DELIVERY_TIMEOUT_SEC")) {
 		try {
-			timeout_sec = std::max(1, std::stoi(env));
+			drain_sec = std::max(1, std::stoi(env));
 		} catch (...) {
 			LOG(WARNING) << "Ignoring invalid EMBARCADERO_DELIVERY_TIMEOUT_SEC=" << env;
 		}
 	} else if (const char* env = std::getenv("EMBARCADERO_E2E_TIMEOUT_SEC")) {
 		try {
-			timeout_sec = std::max(1, std::stoi(env));
+			drain_sec = std::max(1, std::stoi(env));
 		} catch (...) {
 			LOG(WARNING) << "Ignoring invalid EMBARCADERO_E2E_TIMEOUT_SEC=" << env;
 		}
 	}
+	int timeout_sec = drain_sec;
 	if (target_mbps > 0.0) {
 		const double expected_publish_sec =
 			static_cast<double>(total_message_size) / (target_mbps * 1024.0 * 1024.0);
-		timeout_sec = std::max(timeout_sec,
-			static_cast<int>(std::ceil(expected_publish_sec)) + 60);
+		timeout_sec = static_cast<int>(std::ceil(expected_publish_sec)) + drain_sec;
 	}
 	return timeout_sec;
 }
@@ -980,29 +983,26 @@ void WriteThroughputBenchmarkSummary(const cxxopts::ParseResult& result,
 
 // Helper function to calculate optimal queue size based on configuration
 size_t CalculateOptimalQueueSize(size_t num_threads_per_broker, size_t total_message_size, size_t message_size) {
+	(void)total_message_size;
+	(void)message_size;
 	const Embarcadero::Configuration& config = Embarcadero::Configuration::getInstance();
-	
-	// OPTIMIZED: Use 256MB constant per thread as determined from previous buffer optimization tests
-	// This eliminates buffer wrapping issues and provides optimal performance across all message sizes
-	const size_t OPTIMAL_BUFFER_SIZE_MB = 256;
-	size_t buffer_size_per_thread_bytes = OPTIMAL_BUFFER_SIZE_MB * 1024 * 1024; // 256MB per thread
-	
-	// Total buffer size = threads_per_broker * brokers * 256MB_per_thread
-	size_t num_brokers = config.config().broker.max_brokers.get();
-	size_t total_buffer_size = num_threads_per_broker * num_brokers * buffer_size_per_thread_bytes;
-	
-	// For small messages that require more total buffer space, ensure minimum capacity
-	size_t header_overhead = (total_message_size / message_size) * 64; // 64 bytes per message header
-	size_t required_size = total_message_size + header_overhead + (2 * 1024 * 1024); // 2MB safety margin
-	
-	// Always use the optimized 256MB per thread, but ensure it's sufficient for the dataset
-	size_t queue_size = std::max(total_buffer_size, required_size);
-	
-	VLOG(1) << "Using optimized 256MB per thread: " << (total_buffer_size / (1024 * 1024)) << " MB total "
-	          << "(required for dataset: " << (required_size / (1024 * 1024)) << " MB, "
-	          << "final queue: " << (queue_size / (1024 * 1024)) << " MB)";
-	
-	return std::max(queue_size, static_cast<size_t>(1024)); // Minimum 1KB
+
+	// Pipeline budget: 256MB × threads × brokers (historical buffer-optimization
+	// sweet spot). Do NOT inflate to dataset size — that forced multi-tens-of-GB
+	// hugepage mmaps and Init timeouts. QueueBuffer::AddBuffers also caps via
+	// EMBARCADERO_QUEUE_POOL_MAX_BYTES (~12 GiB / unacked window).
+	constexpr size_t kPerThreadBytes = 256ULL * 1024 * 1024;
+	constexpr size_t kMaxHintBytes = 12ULL * 1024 * 1024 * 1024;
+	const size_t num_brokers = config.config().broker.max_brokers.get();
+	const size_t total_buffer_size =
+		num_threads_per_broker * num_brokers * kPerThreadBytes;
+	const size_t queue_size = std::min(total_buffer_size, kMaxHintBytes);
+
+	VLOG(1) << "Pipeline queue hint: " << (queue_size / (1024 * 1024)) << " MB "
+	        << "(threads=" << num_threads_per_broker
+	        << " brokers=" << num_brokers << ")";
+
+	return std::max(queue_size, static_cast<size_t>(1024));
 }
 
 // Helper function to log test parameters
@@ -1115,7 +1115,10 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 #endif
 
 	try {
-		p.Init(ack_level);
+		if (!p.Init(ack_level)) {
+			LOG(ERROR) << "Publisher::Init failed; aborting failure test";
+			return 0.0;
+		}
 
 		auto warmup_start = std::chrono::high_resolution_clock::now();
 		p.WarmupBuffers();
@@ -1299,7 +1302,10 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 
 			try {
 				// Initialize publisher
-				p.Init(ack_level);
+				if (!p.Init(ack_level)) {
+					LOG(ERROR) << "Publisher::Init failed; aborting publish throughput test";
+					return 0.0;
+				}
 				// Warmup buffers to eliminate page-fault variance (same as other throughput tests).
 				auto warmup_start = std::chrono::steady_clock::now();
 				p.WarmupBuffers();
@@ -1693,7 +1699,10 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		s.WaitUntilAllConnected();
 
 		// Initialize publisher (buffer allocation + network threads - not measured)
-		p.Init(ack_level);
+		if (!p.Init(ack_level)) {
+			LOG(ERROR) << "Publisher::Init failed; aborting E2E test";
+			return {0.0, 0.0};
+		}
 		
 		// Warmup buffers to eliminate page fault variance (not measured)
 		p.WarmupBuffers();
@@ -1814,8 +1823,16 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 	// Allocate message buffer on heap-backed vector to avoid large stack allocations.
 	std::vector<char> message(message_size);
 
-	// Calculate queue size with buffer
-	size_t q_size = total_message_size + (total_message_size / message_size) * 64 + 2097152;
+	// Pipeline / unacked-window hint — never dataset-sized (that caused 4–48 GiB
+	// Init mmaps). AddBuffers floors at queues×32 and caps via
+	// EMBARCADERO_QUEUE_POOL_MAX_BYTES (~12 GiB). Size for ~1s at target load
+	// (overnight E3 peaks at 2000 MB/s) with a 2 GiB floor for unpaced runs.
+	size_t q_size = 2ULL * 1024 * 1024 * 1024;
+	if (target_mbps > 0.0) {
+		const size_t one_sec_bytes =
+			static_cast<size_t>(target_mbps * 1024.0 * 1024.0);
+		q_size = std::max(q_size, one_sec_bytes);
+	}
 	q_size = std::max(q_size, static_cast<size_t>(1024));
 
 			try {
@@ -1834,15 +1851,25 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 			Subscriber s(GetHeadAddr(result), std::to_string(BROKER_PORT), topic, true, order);
 			s.WaitUntilAllConnected();
 
-				// Initialize publisher
-				p.Init(ack_level);
+				// Pool alloc + hugepage warmup finish before the delivery drain
+				// thread so Init/mmap cannot burn the delivery timeout budget.
+				if (!p.Init(ack_level)) {
+					LOG(ERROR) << "Publisher::Init failed; aborting latency test";
+					return {0.0, 0.0};
+				}
+				p.WarmupBuffers();
 
 				DeliveryDrainResult delivery_result;
 				std::thread delivery_thread;
-				const int delivery_timeout_sec = ResolveDeliveryTimeoutSec(total_message_size, target_mbps);
+				// Parallel ConsumeOrdered during publish: stamps publish_to_deliver
+				// at true hand-off (not after Poll). Timeout includes paced-publish
+				// duration when target_mbps > 0.
+				const int delivery_timeout_sec =
+					ResolveDeliveryTimeoutSec(total_message_size, target_mbps);
 				if (delivery_measurement_enabled) {
 					LOG(INFO) << "Starting delivery drain through ConsumeOrdered for " << n
-					          << " messages; timeout=" << delivery_timeout_sec << "s";
+					          << " messages; timeout=" << delivery_timeout_sec << "s"
+					          << " (overlaps publish; Init already complete)";
 					delivery_thread = std::thread([&]() {
 						delivery_result = DrainDeliveredMessages(s, n, message_size, delivery_timeout_sec);
 					});

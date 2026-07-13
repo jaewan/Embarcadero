@@ -320,6 +320,56 @@ size_t GetOrder5HomeBrokers() {
 	return static_cast<size_t>(parsed);
 }
 
+// Multi-client SessionOpen storms can exceed the old 1s reply window (N=2×24
+// threads). Override with EMBARCADERO_SESSION_OPEN_TIMEOUT_SEC.
+int GetSessionOpenTimeoutSec() {
+	if (const char* env = std::getenv("EMBARCADERO_SESSION_OPEN_TIMEOUT_SEC")) {
+		char* end = nullptr;
+		long parsed = std::strtol(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0 && parsed <= 60) {
+			return static_cast<int>(parsed);
+		}
+		LOG(WARNING) << "Ignoring invalid EMBARCADERO_SESSION_OPEN_TIMEOUT_SEC='" << env
+		             << "'; using default 5s";
+	}
+	return 5;
+}
+
+// Override with EMBARCADERO_PUBLISH_CONNECT_ATTEMPTS (default 8).
+int GetInitialPublishConnectAttempts() {
+	if (const char* env = std::getenv("EMBARCADERO_PUBLISH_CONNECT_ATTEMPTS")) {
+		char* end = nullptr;
+		long parsed = std::strtol(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0 && parsed <= 30) {
+			return static_cast<int>(parsed);
+		}
+		LOG(WARNING) << "Ignoring invalid EMBARCADERO_PUBLISH_CONNECT_ATTEMPTS='" << env
+		             << "'; using default 8";
+	}
+	return 8;
+}
+
+// Negative-test hook (opt-in): require EMBARCADERO_ENABLE_CONNECT_FAIL_SIM=1
+// plus EMBARCADERO_SIMULATE_CONNECT_FAIL_MOD. Fails queues where (idx % mod) == rem.
+bool ShouldSimulateInitialConnectFail(size_t pubQuesIdx) {
+	const char* enable = std::getenv("EMBARCADERO_ENABLE_CONNECT_FAIL_SIM");
+	if (!enable || enable[0] != '1') return false;
+	const char* mod_env = std::getenv("EMBARCADERO_SIMULATE_CONNECT_FAIL_MOD");
+	if (!mod_env || !*mod_env) return false;
+	char* end = nullptr;
+	long mod = std::strtol(mod_env, &end, 10);
+	if (end == mod_env || *end != '\0' || mod <= 1) return false;
+	long rem = 1;
+	if (const char* rem_env = std::getenv("EMBARCADERO_SIMULATE_CONNECT_FAIL_REM")) {
+		char* rend = nullptr;
+		long parsed = std::strtol(rem_env, &rend, 10);
+		if (rend != rem_env && *rend == '\0' && parsed >= 0 && parsed < mod) {
+			rem = parsed;
+		}
+	}
+	return static_cast<long>(pubQuesIdx % static_cast<size_t>(mod)) == rem;
+}
+
 }  // namespace
 
 Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::string port, 
@@ -379,13 +429,9 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 		<< ", num_threads_per_broker: " << num_threads_per_broker_;
 }
 
-void Publisher::RefreshOrder5PreferredQueuesLocked() {
-	if (seq_type_ != heartbeat_system::SequencerType::EMBARCADERO ||
-	    order_level_ != Embarcadero::kOrderStrong ||
-	    order5_home_brokers_ == 0 ||
-	    brokers_.empty()) {
-		pubQue_.ClearPreferredQueues();
-		return;
+std::vector<int> Publisher::Order5HomeBrokerIdsLocked() const {
+	if (order5_home_brokers_ == 0 || brokers_.empty()) {
+		return brokers_;
 	}
 
 	auto mixed_client = static_cast<uint64_t>(client_id_);
@@ -396,15 +442,44 @@ void Publisher::RefreshOrder5PreferredQueuesLocked() {
 
 	const size_t home_size = std::min(order5_home_brokers_, brokers_.size());
 	const size_t home_base = static_cast<size_t>(mixed_client % brokers_.size());
-	std::vector<size_t> preferred_queue_indices;
-	preferred_queue_indices.reserve(home_size * num_threads_per_broker_);
-
+	std::vector<int> homes;
+	homes.reserve(home_size);
 	for (size_t offset = 0; offset < home_size; ++offset) {
-		const int broker_id = brokers_[(home_base + offset) % brokers_.size()];
+		homes.push_back(brokers_[(home_base + offset) % brokers_.size()]);
+	}
+	return homes;
+}
+
+bool Publisher::ShouldConnectPublishThreadsToBrokerLocked(int broker_id) const {
+	if (!IsOrder5SessionMode() || order5_home_brokers_ == 0) {
+		return true;
+	}
+	const std::vector<int> homes = Order5HomeBrokerIdsLocked();
+	return std::find(homes.begin(), homes.end(), broker_id) != homes.end();
+}
+
+void Publisher::RefreshOrder5PreferredQueuesLocked() {
+	if (seq_type_ != heartbeat_system::SequencerType::EMBARCADERO ||
+	    order_level_ != Embarcadero::kOrderStrong ||
+	    order5_home_brokers_ == 0 ||
+	    brokers_.empty()) {
+		pubQue_.ClearPreferredQueues();
+		return;
+	}
+
+	const std::vector<int> homes = Order5HomeBrokerIdsLocked();
+	std::vector<size_t> preferred_queue_indices;
+	preferred_queue_indices.reserve(homes.size() * num_threads_per_broker_);
+
+	for (int broker_id : homes) {
 		auto it = broker_queue_indices_.find(broker_id);
 		if (it == broker_queue_indices_.end()) continue;
-		preferred_queue_indices.insert(preferred_queue_indices.end(),
-			it->second.begin(), it->second.end());
+		for (size_t qidx : it->second) {
+			// Skip queues whose PublishThread never connected — sealing into them
+			// creates permanent ORDER=5 batch_seq holes (N=2 dead-queue failure).
+			if (!pubQue_.IsQueueActive(qidx)) continue;
+			preferred_queue_indices.push_back(qidx);
+		}
 	}
 
 	if (preferred_queue_indices.empty()) {
@@ -500,7 +575,7 @@ bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
 	int old_flags = -1;
 	SetSocketBlockingTemporarily(sock_fd, true, &old_flags);
 	struct timeval tv;
-	tv.tv_sec = 1;
+	tv.tv_sec = GetSessionOpenTimeoutSec();
 	tv.tv_usec = 0;
 	setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 	setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -1328,7 +1403,7 @@ void Publisher::WritePublishLatencyResults() {
 #endif
 
 
-void Publisher::Init(int ack_level) {
+bool Publisher::Init(int ack_level) {
 	ack_level_ = ack_level;
 
 	const auto& runtime_cfg = Embarcadero::GetConfig().config().client.runtime;
@@ -1408,6 +1483,22 @@ void Publisher::Init(int ack_level) {
 		thread_count_.store(0, std::memory_order_release);
 	}
 
+	// Allocate the publish batch pool on this thread before SubscribeToCluster.
+	// Historically AddBuffers ran inside the gRPC callback and a multi-tens-of-GB
+	// mmap blocked connected_=true past this 60s wait (false "gRPC failing" log).
+	{
+		size_t qsize = 0;
+		{
+			absl::MutexLock lock(&mutex_);
+			qsize = queueSize_;
+		}
+		if (!pubQue_.AddBuffers(qsize)) {
+			LOG(ERROR) << "Publisher::Init() failed to allocate publish queue buffers "
+			           << "(qsize_hint=" << qsize << ")";
+			return false;
+		}
+	}
+
 	// Start cluster status monitoring thread
 	cluster_probe_thread_ = std::thread([this]() {
 			this->SubscribeToClusterStatus();
@@ -1444,13 +1535,12 @@ void Publisher::Init(int ack_level) {
 	if (!connected_.load(std::memory_order_acquire)) {  // [[CRITICAL_FIX: Atomic load]]
 		LOG(ERROR) << "Publisher::Init() failed - cluster connection was not established. "
 		          << "Publisher will not be able to send messages.";
+		return false;
 	}
 
 	// Initialize Corfu sequencer if needed
 	if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
-		corfu_client_ = std::make_unique<CorfuSequencerClient>(
-				CORFU_SEQUENCER_ADDR + std::to_string(CORFU_SEQ_PORT),
-				static_cast<uint64_t>(client_id_));
+		corfu_client_ = std::make_unique<CorfuSequencerClient>(static_cast<uint64_t>(client_id_));
 	}
 
 	// [[Issue 6]] Wait for all publisher threads to initialize with timeout
@@ -1465,6 +1555,24 @@ void Publisher::Init(int ack_level) {
 			break;
 		}
 		std::this_thread::yield();
+	}
+
+	// ORDER=5 per-session FIFO + preferred striping: partial connect leaves dead
+	// preferred queues that swallow batch_seq and create permanent head gaps
+	// (N=2 pilot: 8/24 threads → fence storm). Refuse to publish in that state.
+	if (IsOrder5SessionMode()) {
+		const int ready = thread_count_.load(std::memory_order_acquire);
+		const int expected = num_threads_.load(std::memory_order_acquire);
+		if (ready < expected || expected <= 0) {
+			LOG(ERROR) << "Publisher::Init() ORDER=5 requires all publish threads connected; "
+			           << "got thread_count_=" << ready << " num_threads_=" << expected
+			           << ". Refusing to publish into dead preferred queues.";
+			return false;
+		}
+		{
+			absl::MutexLock lock(&mutex_);
+			RefreshOrder5PreferredQueuesLocked();
+		}
 	}
 
 	// [[FIX: B3=0 ACKs]] Wait for all expected broker ACK connections to be established
@@ -1541,6 +1649,7 @@ void Publisher::Init(int ack_level) {
 	if (runtime_mode_ == "throughput") {
 		StartThroughputTimeseriesIfEnabled();
 	}
+	return true;
 }
 
 void Publisher::StartThroughputTimeseriesIfEnabled() {
@@ -1680,12 +1789,41 @@ void Publisher::Publish(char* message, size_t len) {
 
 	// [[PERF]] Per-message order for header only (subscriber ordering). client_order_ updated per batch when sealed.
 	size_t my_order = next_publish_order_++;
-	size_t sealed = 0;
-	bool ok = pubQue_.Write(my_order, message, len, padded_total, sealed);
-	if (!ok) {
-		LOG(ERROR) << "Failed to write message to queue (client_order=" << my_order << ")";
-	} else if (sealed > 0) {
-		client_order_.fetch_add(sealed, std::memory_order_release);
+	// [[TAIL_SEAL_FIX 2026-07-12]] Never silently drop a message on transient buffer
+	// backpressure. A dropped message means client_order_ can never reach the Poll
+	// target n, so the drain wedges until the 300s timeout and the run fails even
+	// though everything sent was acked (observed at N=3 full-stripe and in E4a
+	// broker-kill: client_order_ stuck a few hundred short of target). Instead:
+	//   - always credit any batch that was sealed+pushed before the failure (Write now
+	//     surfaces its count via sealed even on the early-return path), and
+	//   - retry THIS message under backpressure until a buffer frees (an ack retires an
+	//     unacked batch -> ReleaseBatch -> pool refill). Bail on shutdown; fail loudly if
+	//     the unacked prefix never retires rather than hanging or dropping.
+	static const int kBackpressureTimeoutSec = [] {
+		if (const char* e = std::getenv("EMBARCADERO_PUBLISH_BACKPRESSURE_TIMEOUT_SEC")) {
+			int v = std::atoi(e);
+			if (v > 0) return v;
+		}
+		return 120;
+	}();
+	const auto publish_start = std::chrono::steady_clock::now();
+	for (;;) {
+		size_t sealed = 0;
+		const bool ok = pubQue_.Write(my_order, message, len, padded_total, sealed);
+		if (sealed > 0) {
+			client_order_.fetch_add(sealed, std::memory_order_release);
+		}
+		if (ok) return;
+		if (shutdown_.load(std::memory_order_relaxed)) return;
+		if (std::chrono::steady_clock::now() - publish_start >
+		    std::chrono::seconds(kBackpressureTimeoutSec)) {
+			LOG(ERROR) << "Publish(): buffer backpressure for >" << kBackpressureTimeoutSec
+			           << "s (client_order=" << my_order
+			           << ") — unacked prefix not retiring; failing run instead of dropping";
+			shutdown_.store(true, std::memory_order_relaxed);
+			return;
+		}
+		std::this_thread::yield();
 	}
 }
 
@@ -2854,19 +2992,40 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	// [[SESSION_OPEN_RETRY 2026-07-11]] The broker's ReqReceive pool binds one
 	// handler thread per publish connection for the connection's lifetime, so
 	// under a multi-client connect storm a connection can sit in the accept
-	// queue longer than one SessionOpen reply timeout (1 s). A one-shot
-	// failure here permanently killed the thread — and with it the whole
-	// client Init (run 20260711T065047Z, N=3). Retry with backoff; each
-	// attempt opens a fresh socket.
+	// queue longer than one SessionOpen reply timeout. A one-shot failure
+	// here permanently killed the thread — and with it the whole client Init
+	// (run 20260711T065047Z, N=3). Retry with backoff; each attempt opens a
+	// fresh socket.
+	// [[N2_DEAD_QUEUE 2026-07-12]] Stagger first connect so N clients ×
+	// THREADS_PER_BROKER do not stampede SessionOpen together. On give-up,
+	// MarkQueueInactive so preferred striping cannot seal into a dead queue.
 	VLOG(1) << "PublishThread[" << pubQuesIdx << "]: Starting connection to broker " << broker_id;
+	if (pubQuesIdx > 0) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(pubQuesIdx) * 40));
+	}
+	if (ShouldSimulateInitialConnectFail(pubQuesIdx)) {
+		LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Simulated initial connect failure "
+		           << "(EMBARCADERO_SIMULATE_CONNECT_FAIL_MOD)";
+		pubQue_.MarkQueueInactive(pubQuesIdx);
+		{
+			absl::MutexLock l(&mutex_);
+			RefreshOrder5PreferredQueuesLocked();
+		}
+		return;
+	}
 	{
-		constexpr int kInitialConnectAttempts = 5;
+		const int kInitialConnectAttempts = GetInitialPublishConnectAttempts();
 		int connect_attempt = 1;
 		while (!connect_to_server(broker_id)) {
 			if (connect_attempt >= kInitialConnectAttempts ||
 			    shutdown_.load(std::memory_order_relaxed)) {
 				LOG(ERROR) << "PublishThread[" << pubQuesIdx << "]: Failed to connect to broker "
 				           << broker_id << " after " << connect_attempt << " attempts";
+				pubQue_.MarkQueueInactive(pubQuesIdx);
+				{
+					absl::MutexLock l(&mutex_);
+					RefreshOrder5PreferredQueuesLocked();
+				}
 				return;
 			}
 			LOG(WARNING) << "PublishThread[" << pubQuesIdx << "]: connect/SessionOpen to broker "
@@ -2989,14 +3148,30 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					// [[CORFU_FIX]] Sequencer expects per-broker batch_seq (0,1,2,...), not global.
 					// Use per-broker counter so each broker's batches are sequenced correctly.
 					bool got_total_order = false;
+					std::string ingress_data_endpoint;
+					{
+						absl::MutexLock lock(&mutex_);
+						auto it = nodes_.find(broker_id);
+						if (it != nodes_.end()) ingress_data_endpoint = it->second;
+					}
+					if (ingress_data_endpoint.empty()) {
+						throw std::runtime_error("Corfu token proxy endpoint missing from broker membership");
+					}
+					auto [ingress_host, ignored_data_port] = ParseAddressPort(ingress_data_endpoint);
+					const int proxy_base = [] {
+						if (const char* value = std::getenv("EMBARCADERO_CORFU_PROXY_PORT_BASE")) return std::atoi(value);
+						return 50100;
+					}();
+					const std::string proxy_endpoint = ingress_host + ":" +
+						std::to_string(proxy_base + broker_id);
 					if (broker_id >= 0 && broker_id < kMaxCorfuBrokers) {
 						// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker (Phase 2C).
 						// This ensures in-order delivery to the sequencer, eliminating UNAVAILABLE retries.
 						std::lock_guard<std::mutex> lock(corfu_seq_per_broker_lock_[broker_id]);
 						batch_header->batch_seq = corfu_batch_seq_per_broker_[broker_id].fetch_add(1, std::memory_order_relaxed);
-						got_total_order = corfu_client_->GetTotalOrder(batch_header);
+						got_total_order = corfu_client_->GetTotalOrder(batch_header, proxy_endpoint);
 					} else {
-						got_total_order = corfu_client_->GetTotalOrder(batch_header);
+						got_total_order = corfu_client_->GetTotalOrder(batch_header, proxy_endpoint);
 					}
 					if (!got_total_order) {
 						throw std::runtime_error("corfu sequencer GetTotalOrder failed");
@@ -3164,6 +3339,12 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				pubQue_.ReleaseBatch(batch_header);
 				RecordFailureEvent("Reconnect Fail Broker " + std::to_string(new_broker_id));
 				LOG(ERROR) << "Failed to connect to replacement broker " << new_broker_id;
+				// Already MarkQueueInactive above; refresh preferred so routing
+				// diagnostics drop this dead queue (ORDER=5 striping).
+				{
+					absl::MutexLock l(&mutex_);
+					RefreshOrder5PreferredQueuesLocked();
+				}
 				return;
 			}
 
@@ -3358,6 +3539,23 @@ void Publisher::SubscribeToClusterStatus() {
 					         << brokers_needing_threads.size() << " broker(s)";
 					bool all_connected = true;
 					for (int broker_id : brokers_needing_threads) {
+						bool connect_broker = true;
+						{
+							absl::MutexLock lock(&mutex_);
+							connect_broker = ShouldConnectPublishThreadsToBrokerLocked(broker_id);
+							if (!connect_broker) {
+								// Mark decided without creating threads so connected_
+								// can reach full cluster size under HOME_BROKERS.
+								// Do not bump expected_ack_brokers_ — no ACK path here.
+								brokers_with_threads_.insert(broker_id);
+								VLOG(1) << "SubscribeToCluster: skipping PublishThreads for "
+								        << "non-home broker " << broker_id
+								        << " (ORDER5_HOME_BROKERS=" << order5_home_brokers_ << ")";
+							}
+						}
+						if (!connect_broker) {
+							continue;
+						}
 						VLOG(1) << "SubscribeToCluster: Adding publisher threads for broker " << broker_id;
 						if (!AddPublisherThreads(num_threads_per_broker_, broker_id, qsize)) {
 							LOG(ERROR) << "Failed to add publisher threads for broker " << broker_id;
@@ -3368,8 +3566,10 @@ void Publisher::SubscribeToClusterStatus() {
 						{
 							absl::MutexLock lock(&mutex_);
 							brokers_with_threads_.insert(broker_id);
+							// ACK expected = brokers with real PublishThreads (queue map),
+							// not non-home sentinels in brokers_with_threads_.
 							expected_ack_brokers_.store(
-								static_cast<int>(brokers_with_threads_.size()),
+								static_cast<int>(broker_queue_indices_.size()),
 								std::memory_order_release);
 							expected_ack_brokers_last_update_ns_.store(
 								SteadyNowNs(),

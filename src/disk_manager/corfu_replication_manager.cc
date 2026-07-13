@@ -74,9 +74,16 @@ namespace Corfu {
 						return CreateErrorResponse(response, "File descriptor invalid", StatusCode::UNAVAILABLE);
 					}
 					current_fd = fd_;
-					// --- Perform the write under shared lock ---
+					// ACK2 callers use this RPC reply as the replica's durable
+					// completion. Keep the descriptor and payload write plus media
+					// synchronization in the same request boundary; the periodic
+					// fsync loop remains only a background hygiene mechanism.
 					try {
 						WriteRequestInternal(*request, current_fd); // Pass fd explicitly
+						if (fdatasync(current_fd) != 0) {
+							throw std::system_error(errno, std::generic_category(),
+								"fdatasync failed for fd " + std::to_string(current_fd));
+						}
 						response->set_success(true);
 						return Status::OK;
 					} catch (const std::system_error& e) {

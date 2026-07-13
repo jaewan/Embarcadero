@@ -31,6 +31,7 @@
 #include "disk_manager/chain_replication.h"
 #include "network_manager/network_manager.h"
 #include "cxl_manager/cxl_manager.h"
+#include "cxl_manager/corfu_token_proxy.h"
 
 namespace {
 
@@ -260,6 +261,27 @@ int main(int argc, char* argv[]) {
 	int broker_id = heartbeat_manager.GetBrokerId();
 	size_t colon_pos = head_addr.find(':');
 	std::string head_ip = head_addr.substr(0, colon_pos);
+	std::unique_ptr<Corfu::CorfuTokenProxyServer> corfu_token_proxy;
+	if (sequencerType == heartbeat_system::SequencerType::CORFU) {
+		const int proxy_base = [] {
+			if (const char* value = std::getenv("EMBARCADERO_CORFU_PROXY_PORT_BASE")) return std::atoi(value);
+			return 50100;
+		}();
+		if (proxy_base <= 0 || proxy_base + broker_id > 65535) {
+			LOG(ERROR) << "invalid EMBARCADERO_CORFU_PROXY_PORT_BASE=" << proxy_base;
+			return EXIT_FAILURE;
+		}
+		const std::string sequencer_endpoint =
+			config.config().corfu.sequencer_ip.get() + ":" +
+			std::to_string(config.config().corfu.sequencer_port.get());
+		corfu_token_proxy = std::make_unique<Corfu::CorfuTokenProxyServer>(
+			"0.0.0.0:" + std::to_string(proxy_base + broker_id), sequencer_endpoint);
+		std::string proxy_error;
+		if (!corfu_token_proxy->Start(&proxy_error)) {
+			LOG(ERROR) << "Corfu token proxy startup failed: " << proxy_error;
+			return EXIT_FAILURE;
+		}
+	}
 
 	LOG(INFO) << "Starting Embarlet broker_id: " << broker_id;
 
@@ -269,7 +291,18 @@ int main(int argc, char* argv[]) {
 		LOG(WARNING) << "Using emulated CXL";
 	}
 
-	int num_network_io_threads = arguments["network_threads"].as<int>();
+	int num_network_io_threads = config.getNetworkIOThreads();
+	// cxxopts always materializes a default for --network_threads (compiled before
+	// YAML load), so only honor an explicit argv flag. Env
+	// EMBARCADERO_NETWORK_IO_THREADS and YAML io_threads flow through getNetworkIOThreads().
+	for (int i = 1; i < argc; ++i) {
+		const std::string arg = argv[i] ? argv[i] : "";
+		if (arg == "--network_threads" || arg.rfind("--network_threads=", 0) == 0 ||
+		    arg == "--network-threads" || arg.rfind("--network-threads=", 0) == 0) {
+			num_network_io_threads = arguments["network_threads"].as<int>();
+			break;
+		}
+	}
 	// Resolve effective runtime settings once after YAML/env/CLI merge and log them.
 	const auto failure_domain = Embarcadero::DefaultSingleHostDomain();
 	LOG(INFO) << "[EFFECTIVE_CONFIG]"
@@ -383,6 +416,7 @@ int main(int argc, char* argv[]) {
 		LOG(ERROR) << "Data port did not start listening within " << listen_wait_seconds << "s (broker " << broker_id << ")";
 		network_manager.Shutdown();
 		topic_manager.Shutdown();
+		if (corfu_token_proxy) corfu_token_proxy->Shutdown();
 		return EXIT_FAILURE;
 	}
 

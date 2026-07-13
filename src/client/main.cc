@@ -94,6 +94,23 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "LazyLog baseline requires ORDER=2 (weak total order) in this implementation (got ORDER=" << order << ").";
         return -1;
     }
+    if (seq_type == heartbeat_system::SequencerType::LAZYLOG && ack_level == 2) {
+        LOG(ERROR) << "LazyLog ACK=2 is not implemented: metadata replicas protect the "
+                   << "ACK=1 append contract but do not provide a media-durable payload path.";
+        return -1;
+    }
+    if (seq_type == heartbeat_system::SequencerType::CORFU && ack_level == 2 &&
+        replication_factor != Embarcadero::kMinReplicationFactorForAck2) {
+        LOG(ERROR) << "Corfu ACK=2 currently supports only RF=2 (primary plus one "
+                   << "media-durable replica); RF>2 chain replication is not implemented.";
+        return -1;
+    }
+    if (seq_type == heartbeat_system::SequencerType::SCALOG && ack_level == 2 &&
+        (!std::getenv("SCALOG_CXL_MODE") || std::string(std::getenv("SCALOG_CXL_MODE")) != "1")) {
+        LOG(ERROR) << "Scalog ACK=2 requires SCALOG_CXL_MODE=1: only the CXL polling "
+                   << "path currently publishes the per-replica media-durable frontier.";
+        return -1;
+    }
 
     {
         const auto ack_rf = Embarcadero::ValidateAckReplicationPolicy(ack_level, replication_factor);

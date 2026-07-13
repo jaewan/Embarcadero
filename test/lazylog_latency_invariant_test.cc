@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "../src/common/lazylog_append_contract.h"
+
 namespace {
 
 uint32_t ComputeLazyLogExportedMessageCount(size_t previous_offset,
@@ -39,6 +41,33 @@ TEST(LazyLogLatencyInvariantTest, EmptySequencerIpFallsBackToLoopback) {
 TEST(LazyLogLatencyInvariantTest, NonEmptySequencerIpWinsOverFallback) {
     EXPECT_STREQ(ResolveLazyLogSequencerIpForTest("10.10.10.10", "127.0.0.1"), "10.10.10.10");
     EXPECT_STREQ(ResolveLazyLogSequencerIpForTest("", "10.10.10.11"), "10.10.10.11");
+}
+
+TEST(LazyLogAppendContractTest, DurableAppendCompletesBeforeBinding) {
+    Embarcadero::LazyLogAppendReplicationState state;
+    state.data_replicas_durable = true;
+    state.metadata_replicas_durable = true;
+
+    EXPECT_TRUE(Embarcadero::CanCompleteLazyLogAppend(state));
+    EXPECT_FALSE(Embarcadero::CanExposeLazyLogOrderedRecord(state));
+}
+
+TEST(LazyLogAppendContractTest, BindingDoesNotSubstituteForDurability) {
+    Embarcadero::LazyLogAppendReplicationState state;
+    state.global_binding_received = true;
+
+    EXPECT_FALSE(Embarcadero::CanCompleteLazyLogAppend(state));
+    EXPECT_FALSE(Embarcadero::CanExposeLazyLogOrderedRecord(state));
+}
+
+TEST(LazyLogAppendContractTest, OrderedExposureRequiresCompletionAndBinding) {
+    Embarcadero::LazyLogAppendReplicationState state;
+    state.data_replicas_durable = true;
+    state.metadata_replicas_durable = true;
+    state.global_binding_received = true;
+
+    EXPECT_TRUE(Embarcadero::CanCompleteLazyLogAppend(state));
+    EXPECT_TRUE(Embarcadero::CanExposeLazyLogOrderedRecord(state));
 }
 
 }  // namespace

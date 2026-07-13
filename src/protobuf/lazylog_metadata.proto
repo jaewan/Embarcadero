@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package lazylogmetadata;
+
+// The sequencing-layer metadata write is deliberately separate from LazyLog's
+// background binding protocol.  Clients (via their ingress broker in this
+// harness) write one immutable descriptor to every sequencing replica and may
+// complete append once all replicas acknowledge durable persistence.
+service LazyLogMetadataReplica {
+  rpc AppendMetadata(MetadataAppendRequest) returns (MetadataAppendResponse) {}
+}
+
+message MetadataAppendRequest {
+  string topic = 1;
+  uint32 source_broker_id = 2;
+  uint64 source_batch_seq = 3;
+  uint32 client_id = 4;
+  uint64 client_batch_seq = 5;
+  uint64 payload_offset = 6;
+  uint64 payload_size = 7;
+  uint32 num_messages = 8;
+}
+
+message MetadataAppendResponse {
+  bool success = 1;
+  bool already_present = 2;
+  string error = 3;
+}

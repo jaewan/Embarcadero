@@ -81,11 +81,17 @@ ORDER=${ORDER:-0}
 ACK=${ACK:-1}
 REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
+REQUIRE_FAITHFUL_LAZYLOG=${REQUIRE_FAITHFUL_LAZYLOG:-0}
+LAZYLOG_METADATA_CONTRACT="not_applicable"
+LAZYLOG_METADATA_REPLICA_COUNT=0
+LAZYLOG_METADATA_READY_TIMEOUT_SEC=${LAZYLOG_METADATA_READY_TIMEOUT_SEC:-20}
+ACK_DURABILITY_CONTRACT="not_applicable"
 
 BROKER_READY_TIMEOUT_SEC=${BROKER_READY_TIMEOUT_SEC:-120}
 if [[ "$SEQUENCER" == "CORFU" && -z "${BROKER_READY_TIMEOUT_SEC_OVERRIDE_APPLIED:-}" && "${BROKER_READY_TIMEOUT_SEC:-120}" == "120" ]]; then
     BROKER_READY_TIMEOUT_SEC=300
 fi
+
 BROKER_REACHABILITY_TIMEOUT_SEC=${BROKER_REACHABILITY_TIMEOUT_SEC:-20}
 BROKER_REACHABILITY_POLL_SEC=${BROKER_REACHABILITY_POLL_SEC:-0.1}
 # Stagger between broker process launches. Full CXL zeroing is memory-heavy so default
@@ -137,6 +143,14 @@ EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES=${EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES:-524
 EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE=${EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE:-1}
 EMBARCADERO_BATCH_SIZE=${EMBARCADERO_BATCH_SIZE:-524288}
 EMBARCADERO_CLIENT_PUB_BATCH_KB=${EMBARCADERO_CLIENT_PUB_BATCH_KB:-512}
+# ReqReceive threads bind 1:1 to live publish connections. Undersizing this
+# (historical default 4/8) permanently starves N*THREADS_PER_BROKER connects
+# per broker — the N=2 SessionOpen "storm" was mostly pool exhaustion.
+# Auto-raise unless the caller already set a sufficient value.
+_EMB_NET_IO_USERSET=0
+if [[ -n "${EMBARCADERO_NETWORK_IO_THREADS:-}" ]]; then
+    _EMB_NET_IO_USERSET=1
+fi
 EMBARCADERO_NETWORK_IO_THREADS=${EMBARCADERO_NETWORK_IO_THREADS:-4}
 EMBARCADERO_ORDER5_HOME_BROKERS=${EMBARCADERO_ORDER5_HOME_BROKERS:-}
 # Epoch period for ORDER=5 sequencer (µs). Reads EMBAR_ORDER5_EPOCH_US from env;
@@ -204,6 +218,69 @@ if [[ "$SEQUENCER" == "LAZYLOG" ]] && [[ "$ORDER" != "2" ]]; then
     echo "ERROR: LAZYLOG baseline requires ORDER=2 (got ORDER=$ORDER)" >&2
     exit 1
 fi
+if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+    if [[ -n "${EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS:-}" ]]; then
+        IFS=',' read -r -a lazylog_metadata_endpoints <<< "$EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS"
+        for endpoint in "${lazylog_metadata_endpoints[@]}"; do
+            if [[ -z "${endpoint//[[:space:]]/}" ]]; then
+                echo "ERROR: EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS contains an empty endpoint" >&2
+                exit 1
+            fi
+        done
+        LAZYLOG_METADATA_REPLICA_COUNT=${#lazylog_metadata_endpoints[@]}
+        if [[ "$LAZYLOG_METADATA_REPLICA_COUNT" -ne "$REPLICATION_FACTOR" ]]; then
+            echo "ERROR: faithful LazyLog requires exactly RF metadata endpoints " \
+                 "(RF=$REPLICATION_FACTOR, endpoints=$LAZYLOG_METADATA_REPLICA_COUNT)" >&2
+            exit 1
+        fi
+        LAZYLOG_METADATA_CONTRACT="ack1_append_replicated"
+        export EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS
+    else
+        LAZYLOG_METADATA_CONTRACT="legacy_ack1_ordered_visible"
+        if [[ "$REQUIRE_FAITHFUL_LAZYLOG" == "1" ]]; then
+            echo "ERROR: REQUIRE_FAITHFUL_LAZYLOG=1 needs EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS" >&2
+            exit 1
+        fi
+    fi
+fi
+
+if [[ "$SEQUENCER" == "LAZYLOG" && "$ACK" == "1" ]]; then
+    ACK_DURABILITY_CONTRACT="$LAZYLOG_METADATA_CONTRACT"
+elif [[ "$SEQUENCER" == "CORFU" && "$ACK" == "2" && "$REPLICATION_FACTOR" == "2" ]]; then
+    ACK_DURABILITY_CONTRACT="ack2_primary_plus_one_media_durable_replica"
+fi
+
+# The metadata replicas are external services. Verify that every configured
+# endpoint is accepting TCP connections before starting brokers; otherwise a
+# run can appear healthy while every faithful ACK1 remains pinned at zero.
+lazylog_metadata_endpoints_ready() {
+    local endpoint host port deadline now
+    [[ "$SEQUENCER" == "LAZYLOG" ]] || return 0
+    [[ -n "${EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS:-}" ]] || return 0
+    deadline=$(( $(date +%s) + LAZYLOG_METADATA_READY_TIMEOUT_SEC ))
+    IFS=',' read -r -a lazylog_metadata_endpoints <<< "$EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS"
+    for endpoint in "${lazylog_metadata_endpoints[@]}"; do
+        endpoint="${endpoint//[[:space:]]/}"
+        host="${endpoint%:*}"
+        port="${endpoint##*:}"
+        if [[ -z "$host" || -z "$port" || "$host" == "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: LazyLog metadata endpoint must be host:port (got '$endpoint')" >&2
+            return 1
+        fi
+        while true; do
+            if timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null; then
+                break
+            fi
+            now=$(date +%s)
+            if (( now >= deadline )); then
+                echo "ERROR: LazyLog metadata endpoint did not become reachable within " \
+                     "${LAZYLOG_METADATA_READY_TIMEOUT_SEC}s: $endpoint" >&2
+                return 1
+            fi
+            sleep 0.2
+        done
+    done
+}
 
 corfu_seq_ip_is_loopback() {
     case "${EMBARCADERO_CORFU_SEQ_IP:-}" in
@@ -249,17 +326,22 @@ all_active_clients_are_remote() {
     return 0
 }
 
-if [[ -z "${EMBARCADERO_ORDER5_HOME_BROKERS:-}" ]] &&
-   [[ "$SEQUENCER" == "EMBARCADERO" ]] &&
-   [[ "$ORDER" == "5" ]] &&
-   [[ "$TEST_TYPE" == "5" ]] &&
-   [[ "$THREADS_PER_BROKER" -ge 4 ]] &&
-   [[ "$NUM_CLIENTS" -ge 3 ]] &&
-   all_active_clients_are_remote; then
-    # Fully striped remote ORDER=5 publish-only runs can create large head-broker hold/expiry
-    # waves during disconnect tail drain. Bias each client to a small broker home set to keep
-    # cross-broker sequence skew bounded without changing ORDER=5 semantics.
-    EMBARCADERO_ORDER5_HOME_BROKERS=2
+# ORDER=5 multi-client striping: do not auto-set EMBARCADERO_ORDER5_HOME_BROKERS.
+# Full stripe is the default once ReqReceive is sized for N×THREADS and dead
+# preferred queues are fail-closed (2026-07-12). Set HOME_BROKERS explicitly only
+# when intentionally biasing striping; PublishThreads then connect only to homes.
+
+# Ensure broker ReqReceive pool can hold every concurrent publish connection
+# (NUM_CLIENTS × THREADS_PER_BROKER per broker) plus ACK/precreate headroom.
+_min_network_io=$(( NUM_CLIENTS * THREADS_PER_BROKER + 8 ))
+if (( _min_network_io > 64 )); then
+    _min_network_io=64
+fi
+if (( EMBARCADERO_NETWORK_IO_THREADS < _min_network_io )); then
+    if (( _EMB_NET_IO_USERSET == 1 )); then
+        echo "WARNING: EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS < required floor $_min_network_io (NUM_CLIENTS*THREADS_PER_BROKER+8); raising to avoid SessionOpen starvation" >&2
+    fi
+    EMBARCADERO_NETWORK_IO_THREADS=$_min_network_io
 fi
 
 if [[ "$SEQUENCER" == "CORFU" ]] && corfu_uses_remote_clients && corfu_seq_ip_is_loopback; then
@@ -819,6 +901,7 @@ start_brokers() {
     export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
     export EMBARCADERO_ORDER0_FAST_PATH
     export EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES
+    export EMBARCADERO_NETWORK_IO_THREADS
     # Chain replication sink profile (forwarded to remote brokers via broker_lifecycle).
     if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_SINK:-}" ]]; then
         export EMBARCADERO_CHAIN_REPLICATION_SINK
@@ -842,11 +925,17 @@ start_brokers() {
     if [[ -n "${EMBAR_ORDER5_EPOCH_US:-}" ]]; then
         export EMBAR_ORDER5_EPOCH_US
     fi
+    if [[ -n "${EMBAR_ORDER5_COMMIT_PROFILE:-}" ]]; then
+        export EMBAR_ORDER5_COMMIT_PROFILE
+    fi
     if [[ -n "${EMBARCADERO_SESSION_LEASE_MS:-}" ]]; then
         export EMBARCADERO_SESSION_LEASE_MS
     fi
     if [[ -n "${EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS:-}" ]]; then
         export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS
+    fi
+    if [[ -n "${EMBARCADERO_ORDER5_PHASE_DIAG:-}" ]]; then
+        export EMBARCADERO_ORDER5_PHASE_DIAG
     fi
     if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
         export LAZYLOG_CXL_MODE=1
@@ -883,6 +972,7 @@ start_brokers() {
     fi
     # shellcheck disable=SC2086
     $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" \
+        --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
         > /tmp/broker_0.log 2>&1 &
     launched_broker_pids+=("$!")
     HEAD_BROKER_PID="${launched_broker_pids[0]}"
@@ -907,6 +997,7 @@ start_brokers() {
     for (( i=1; i<NUM_BROKERS; i++ )); do
         # shellcheck disable=SC2086
         $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" \
+            --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
             > /tmp/broker_"$i".log 2>&1 &
         launched_broker_pids+=("$!")
         if [[ "$BROKER_START_STAGGER_SEC" -gt 0 ]]; then
@@ -1049,6 +1140,7 @@ printf "  %-32s %s\n" "PAYLOAD_SEND_CHUNK_BYTES:"      "$EMBARCADERO_PAYLOAD_SEN
 printf "  %-32s %s\n" "ENABLE_PAYLOAD_MSG_MORE:"       "$EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE"
 printf "  %-32s %s\n" "BATCH_SIZE:"                    "$EMBARCADERO_BATCH_SIZE"
 printf "  %-32s %s\n" "CLIENT_PUB_BATCH_KB:"           "$EMBARCADERO_CLIENT_PUB_BATCH_KB"
+printf "  %-32s %s\n" "NETWORK_IO_THREADS:"            "$EMBARCADERO_NETWORK_IO_THREADS"
 printf "  %-32s %s\n" "ORDER5_HOME_BROKERS:"           "${EMBARCADERO_ORDER5_HOME_BROKERS:-"(unset)"}"
 printf "  %-32s %s\n" "ORDER5_EPOCH_US:"               "${EMBAR_ORDER5_EPOCH_US:-"(default=500)"}"
 printf "  %-32s %s\n" "LOCAL_CLIENT_NUMA:"             "$(resolve_local_client_numa)"
@@ -1058,11 +1150,14 @@ if [[ "$SEQUENCER" == "CORFU" ]]; then
 elif [[ "$SEQUENCER" == "LAZYLOG" ]]; then
     printf "  %-32s %s\n" "LAZYLOG_SEQ_IP:"             "${EMBARCADERO_LAZYLOG_SEQ_IP:-"(unset)"}"
     printf "  %-32s %s\n" "LAZYLOG_SEQ_PORT:"           "${EMBARCADERO_LAZYLOG_SEQ_PORT:-"(default)"}"
+    printf "  %-32s %s\n" "LAZYLOG_ACK1_CONTRACT:"      "$LAZYLOG_METADATA_CONTRACT"
+    printf "  %-32s %s\n" "LAZYLOG_METADATA_REPLICAS:"  "$LAZYLOG_METADATA_REPLICA_COUNT"
 elif [[ "$SEQUENCER" == "SCALOG" ]]; then
     printf "  %-32s %s\n" "SCALOG_SEQ_IP:"              "${EMBARCADERO_SCALOG_SEQ_IP:-"(unset)"}"
     printf "  %-32s %s\n" "SCALOG_SEQ_PORT:"            "${EMBARCADERO_SCALOG_SEQ_PORT:-"(default)"}"
     printf "  %-32s %s\n" "SCALOG_CXL_MODE:"            "${SCALOG_CXL_MODE:-1}"
 fi
+printf "  %-32s %s\n" "ACK_DURABILITY_CONTRACT:"     "$ACK_DURABILITY_CONTRACT"
 echo "================================================================"
 
 mkdir -p "$LOG_DIR"
@@ -1071,6 +1166,19 @@ ATTEMPT_SUMMARY_CSV="$LOG_DIR/attempt_summary.csv"
 echo "trial,attempt,result,reason" > "$ATTEMPT_SUMMARY_CSV"
 OVERLAP_SUMMARY_CSV="$LOG_DIR/overlap_summary.csv"
 echo "trial,overlap_total_gbps,overlap_window_ms,timeseries_clients" > "$OVERLAP_SUMMARY_CSV"
+RUN_CONTRACT_CSV="$LOG_DIR/run_contract.csv"
+GIT_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null)" ]]; then
+    GIT_DIRTY=true
+else
+    GIT_DIRTY=false
+fi
+echo "sequencer,order,ack_level,replication_factor,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
+echo "$SEQUENCER,$ORDER,$ACK,$REPLICATION_FACTOR,$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
+
+if ! lazylog_metadata_endpoints_ready; then
+    exit 1
+fi
 
 if ! preflight_clients; then
     exit 1
@@ -1189,6 +1297,15 @@ if [ -n "${EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS:-}" ]; then export EMBA
 if [ -n "${EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT:-}" ]; then export EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT=${EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT:-}; fi
 if [ -n "${EMBARCADERO_SESSION_LEASE_MS:-}" ]; then export EMBARCADERO_SESSION_LEASE_MS=${EMBARCADERO_SESSION_LEASE_MS:-}; fi
 if [ -n "${EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS:-}" ]; then export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS=${EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS:-}; fi
+if [ -n "${EMBARCADERO_ORDER5_PHASE_DIAG:-}" ]; then export EMBARCADERO_ORDER5_PHASE_DIAG=${EMBARCADERO_ORDER5_PHASE_DIAG:-}; fi
+if [ -n "${EMBAR_ORDER5_EPOCH_US:-}" ]; then export EMBAR_ORDER5_EPOCH_US=${EMBAR_ORDER5_EPOCH_US:-}; fi
+if [ -n "${EMBAR_ORDER5_COMMIT_PROFILE:-}" ]; then export EMBAR_ORDER5_COMMIT_PROFILE=${EMBAR_ORDER5_COMMIT_PROFILE:-}; fi
+if [ -n "${EMBAR_PROFILE_NETWORK_PATH:-}" ]; then export EMBAR_PROFILE_NETWORK_PATH=${EMBAR_PROFILE_NETWORK_PATH:-}; fi
+if [ -n "${EMBARCADERO_SESSION_OPEN_TIMEOUT_SEC:-}" ]; then export EMBARCADERO_SESSION_OPEN_TIMEOUT_SEC=${EMBARCADERO_SESSION_OPEN_TIMEOUT_SEC:-}; fi
+if [ -n "${EMBARCADERO_PUBLISH_CONNECT_ATTEMPTS:-}" ]; then export EMBARCADERO_PUBLISH_CONNECT_ATTEMPTS=${EMBARCADERO_PUBLISH_CONNECT_ATTEMPTS:-}; fi
+if [ -n "${EMBARCADERO_ENABLE_CONNECT_FAIL_SIM:-}" ]; then export EMBARCADERO_ENABLE_CONNECT_FAIL_SIM=${EMBARCADERO_ENABLE_CONNECT_FAIL_SIM:-}; fi
+if [ -n "${EMBARCADERO_SIMULATE_CONNECT_FAIL_MOD:-}" ]; then export EMBARCADERO_SIMULATE_CONNECT_FAIL_MOD=${EMBARCADERO_SIMULATE_CONNECT_FAIL_MOD:-}; fi
+if [ -n "${EMBARCADERO_SIMULATE_CONNECT_FAIL_REM:-}" ]; then export EMBARCADERO_SIMULATE_CONNECT_FAIL_REM=${EMBARCADERO_SIMULATE_CONNECT_FAIL_REM:-}; fi
 export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$ts_file
 export EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS=$START_TIME_MS
 $push_ready_export

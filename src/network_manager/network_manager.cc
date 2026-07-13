@@ -2856,6 +2856,9 @@ void NetworkManager::AckThread(
 		const bool use_per_client_written_ack_level1 =
 			(ack_level == 1 && ack_topic != nullptr &&
 			 ack_topic->SupportsPerClientWrittenAckLevel1());
+		const bool use_per_client_append_ack_level1 =
+			(ack_level == 1 && ack_topic != nullptr &&
+			 ack_topic->SupportsPerClientAppendAckLevel1());
 		const bool use_per_client_ack_level1 =
 			(ack_level == 1 && ack_topic != nullptr && ack_topic->SupportsPerClientAckLevel1());
 		const bool use_per_client_ack_level2_durable =
@@ -2865,6 +2868,10 @@ void NetworkManager::AckThread(
 		// Safe for ACK2 because durability frontiers are monotonic; stale reads can only delay ACKs.
 		if (use_per_client_written_ack_level1) {
 			current_ack = static_cast<size_t>(ack_topic->GetClientWritten(client_id));
+			expensive_checks_since_last_ack++;
+			fast_polls_without_full_check = 0;
+		} else if (use_per_client_append_ack_level1) {
+			current_ack = static_cast<size_t>(ack_topic->GetClientAppend(client_id));
 			expensive_checks_since_last_ack++;
 			fast_polls_without_full_check = 0;
 		} else if (use_per_client_ack_level1) {

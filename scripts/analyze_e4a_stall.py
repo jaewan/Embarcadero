@@ -3,17 +3,24 @@
 
 Inputs (a directory, e.g. data/failure_suite/<tag>/e4a):
   trial<N>_<session>_timeseries.csv  — per-session (per client process) throughput
-      timeseries written by throughput_test: Timestamp(ms), Broker_0_GBps, ...,
-      Total_GBps. Timestamps are relative to the synchronized barrier
+      timeseries written by throughput_test: Timestamp(ms), Broker_*_sent/ack,
+      Sent_GiBps, Ack_GiBps, Total_GBps, Cum_Sent_Bytes, Cum_Ack_Bytes.
+      Timestamps are relative to the synchronized barrier
       (EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS), the same axis as the kill record.
   trial<N>_broker_kill.csv — written by run_multiclient.sh kill injection:
       trial,attempt,broker_id,pid,signal,kill_wall_ms,kill_rel_ms,kill_rc
 
+Publication failure metrics (run separately when needed):
+  --layer sent  — client remux/send stall (Sent_GiBps)
+  --layer ack   — ACK stall for the configured ack_level (Ack_GiBps)
+      Use ACK_LEVEL=1 runs for ordered ACK1 stall and ACK_LEVEL=2 RF>=2 runs
+      for durable ACK2 stall; do not mix layers within one CDF.
+
 Per session we report:
-  baseline_gbps  — median Total_GBps in [WARMUP_MS, kill_rel) (pre-kill steady state)
+  baseline_gbps  — median rate in [WARMUP_MS, kill_rel) (pre-kill steady state)
   stall_ms       — time from kill to first post-kill sample with
-                   Total_GBps >= RECOVERY_FRAC * baseline (sustained for 2 samples)
-  dip_frac       — min post-kill Total_GBps / baseline (how deep the dip went)
+                   rate >= RECOVERY_FRAC * baseline (sustained for 2 samples)
+  dip_frac       — min post-kill rate / baseline (how deep the dip went)
   killed_broker_residual — post-recovery mean of the killed broker's column
                    (should be ~0: traffic re-routed, not resumed to the dead broker)
 
@@ -59,13 +66,34 @@ def read_kill_record(path):
     return None
 
 
-def analyze_session(ts_path, kill_rel_ms, killed_broker_id):
+def analyze_session(ts_path, kill_rel_ms, killed_broker_id, layer="ack"):
     header, rows = read_timeseries(ts_path)
     if not rows:
         return {"error": "empty_timeseries"}
-    total_idx = len(header) - 1  # Total_GBps is the last column
+
+    # Prefer multi-layer columns when present; fall back to Total_GBps.
+    rate_names = {
+        "ack": ("Ack_GiBps", "Total_GBps"),
+        "sent": ("Sent_GiBps", "Total_GBps"),
+        "total": ("Total_GBps",),
+    }
+    names = rate_names.get(layer, rate_names["ack"])
+    total_idx = None
+    for name in names:
+        for i, col in enumerate(header):
+            if col.strip() == name:
+                total_idx = i
+                break
+        if total_idx is not None:
+            break
+    if total_idx is None:
+        total_idx = len(header) - 1
+
     kb_idx = None
     for i, col in enumerate(header):
+        if re.fullmatch(rf"\s*Broker_{killed_broker_id}(_sent)?_Gi?Bps\s*", col):
+            kb_idx = i
+            break
         if re.fullmatch(rf"\s*Broker_{killed_broker_id}_GBps\s*", col):
             kb_idx = i
             break
@@ -129,12 +157,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("run_dir", help="directory with trial*_timeseries.csv + trial*_broker_kill.csv")
     ap.add_argument("--output", default=None, help="per-session summary CSV path")
+    ap.add_argument("--layer", default="both", choices=("ack", "sent", "total", "both"),
+                    help="which throughput layer to analyze (default: both ack+sent)")
     args = ap.parse_args()
 
     kill_files = sorted(glob.glob(os.path.join(args.run_dir, "trial*_broker_kill.csv")))
     if not kill_files:
         sys.exit(f"No trial*_broker_kill.csv in {args.run_dir} — was the kill armed?")
 
+    layers = ["ack", "sent"] if args.layer == "both" else [args.layer]
     results = []
     for kf in kill_files:
         m = re.search(r"trial(\d+)_broker_kill\.csv$", kf)
@@ -152,15 +183,16 @@ def main():
             continue
         for tsf in ts_files:
             tag = re.search(rf"trial{trial}_(.+)_timeseries\.csv$", tsf).group(1)
-            r = analyze_session(tsf, kill_rel_ms, killed_id)
-            r.update({"trial": trial, "session": tag,
-                      "kill_rel_ms": kill_rel_ms, "killed_broker": killed_id})
-            results.append(r)
+            for layer in layers:
+                r = analyze_session(tsf, kill_rel_ms, killed_id, layer=layer)
+                r.update({"trial": trial, "session": tag, "layer": layer,
+                          "kill_rel_ms": kill_rel_ms, "killed_broker": killed_id})
+                results.append(r)
 
     if not results:
         sys.exit("No sessions analyzed.")
 
-    fields = ["trial", "session", "killed_broker", "kill_rel_ms", "baseline_gbps",
+    fields = ["trial", "session", "layer", "killed_broker", "kill_rel_ms", "baseline_gbps",
               "stall_ms", "recovered", "dip_frac", "killed_broker_residual_gbps",
               "post_kill_mean_gbps", "error"]
     out = args.output or os.path.join(args.run_dir, "stall_summary.csv")
@@ -170,24 +202,30 @@ def main():
         for r in results:
             w.writerow({k: r.get(k, "") for k in fields})
 
-    ok = [r for r in results if "error" not in r]
-    errs = [r for r in results if "error" in r]
-    unrecovered = [r for r in ok if not r["recovered"]]
-    stalls = sorted(r["stall_ms"] for r in ok if r["recovered"])
+    for layer in layers:
+        ok = [r for r in results if r.get("layer") == layer and "error" not in r]
+        errs = [r for r in results if r.get("layer") == layer and "error" in r]
+        unrecovered = [r for r in ok if not r["recovered"]]
+        stalls = sorted(r["stall_ms"] for r in ok if r["recovered"])
 
-    print(f"\n=== E4a per-session stall CDF ({len(stalls)} recovered sessions, "
-          f"{len(unrecovered)} unrecovered, {len(errs)} errors) ===")
-    if stalls:
-        for label, p in [("min", 0), ("p25", .25), ("p50", .5), ("p75", .75),
-                         ("p90", .9), ("p99", .99), ("max", 1)]:
-            print(f"  {label:>4}: {percentile(stalls, p):8.1f} ms")
-    for r in unrecovered:
-        print(f"  UNRECOVERED: trial {r['trial']} session {r['session']} "
-              f"(dip_frac={r['dip_frac']})")
-    for r in errs:
-        print(f"  ERROR: trial {r['trial']} session {r['session']}: {r['error']}")
+        print(f"\n=== E4a {layer}-layer stall CDF ({len(stalls)} recovered sessions, "
+              f"{len(unrecovered)} unrecovered, {len(errs)} errors) ===")
+        if stalls:
+            for label, p in [("min", 0), ("p25", .25), ("p50", .5), ("p75", .75),
+                             ("p90", .9), ("p99", .99), ("max", 1)]:
+                print(f"  {label:>4}: {percentile(stalls, p):8.1f} ms")
+        for r in unrecovered:
+            print(f"  UNRECOVERED[{layer}]: trial {r['trial']} session {r['session']} "
+                  f"(dip_frac={r['dip_frac']})")
+        for r in errs:
+            print(f"  ERROR[{layer}]: trial {r['trial']} session {r['session']}: {r['error']}")
+
     print(f"\nPer-session detail: {out}")
-    if errs or unrecovered or not stalls:
+    ok_all = [r for r in results if "error" not in r]
+    errs_all = [r for r in results if "error" in r]
+    unrecovered_all = [r for r in ok_all if not r["recovered"]]
+    stalls_all = [r for r in ok_all if r["recovered"]]
+    if errs_all or unrecovered_all or not stalls_all:
         sys.exit(1)
 
 

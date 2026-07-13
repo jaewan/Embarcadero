@@ -56,8 +56,10 @@ class Publisher {
 		/**
 		 * Initializes the publisher
 		 * @param ack_level Acknowledgement level
+		 * @return true on success; false if ORDER=5 cannot establish a safe publish path
+		 *         (caller must not Publish/Poll)
 		 */
-		void Init(int ack_level);
+		bool Init(int ack_level);
 
 #ifdef COLLECT_LATENCY_STATS
 	/**
@@ -415,6 +417,10 @@ class Publisher {
 		 */
 		bool AddPublisherThreads(size_t num_threads, int broker_id, size_t queue_size);
 		void RefreshOrder5PreferredQueuesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+		/** Home-broker IDs for ORDER=5 preferred striping; empty means all brokers. */
+		std::vector<int> Order5HomeBrokerIdsLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+		bool ShouldConnectPublishThreadsToBrokerLocked(int broker_id) const
+			ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 		void ReassignQueueBrokerLocked(size_t queue_idx, int old_broker_id, int new_broker_id) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 		void LogOrder5RoutingSummary() const;
 

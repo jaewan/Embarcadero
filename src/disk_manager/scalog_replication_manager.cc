@@ -22,6 +22,7 @@
 #include <cstring>
 #include <shared_mutex>
 #include <condition_variable>
+#include <future>
 
 
 namespace Scalog {
@@ -172,6 +173,7 @@ namespace Scalog {
 			int64_t size;
 			int64_t num_msg;
 			std::string data; // Store data by value
+			std::shared_ptr<std::promise<bool>> durable_completion;
 
 			WriteTask() : offset(0), size(0), num_msg(0) {}
 
@@ -328,8 +330,11 @@ namespace Scalog {
 				return CreateErrorResponse(response, "Invalid request parameters", grpc::StatusCode::INVALID_ARGUMENT);
 			}
 
-			// 3. Create WriteTask (copies data)
+			// 3. Create WriteTask (copies data) and a completion that is fulfilled
+			// only after pwrite+fdatasync.
 			WriteTask task(*request);
+			task.durable_completion = std::make_shared<std::promise<bool>>();
+			auto durable_result = task.durable_completion->get_future();
 
 			// 4. Enqueue task
 			// Use blocking write for simplicity, assuming queue is large enough
@@ -337,7 +342,16 @@ namespace Scalog {
 			VLOG(5) << "Enqueueing write task for offset " << task.offset << " size " << task.size;
 			write_queue_.blockingWrite(std::move(task));
 
-			// 5. Return success immediately
+			// 5. Do not acknowledge queue admission as durability. Bound the wait by
+			// the RPC deadline so disk failure fails closed.
+			if (durable_result.wait_until(context->deadline()) != std::future_status::ready) {
+				return CreateErrorResponse(response, "replica durability timed out",
+				                           grpc::StatusCode::DEADLINE_EXCEEDED);
+			}
+			if (!durable_result.get()) {
+				return CreateErrorResponse(response, "replica write or fdatasync failed",
+				                           grpc::StatusCode::INTERNAL);
+			}
 			response->set_success(true);
 			return Status::OK;
 		}
@@ -443,40 +457,37 @@ namespace Scalog {
 				WriteTask& task = task_opt.value();
 				VLOG(5) << "Writer thread dequeued task for offset " << task.offset << " size " << task.size;
 
+				bool durable = false;
 				try {
 					int current_fd = -1;
 					bool write_successful = false;
 					{ // Scope for shared lock
 						std::shared_lock<std::shared_mutex> lock(file_state_mutex_);
 
-						if (!running_.load()) continue; // Check again under lock
-
-						if (fd_ == -1) {
+						if (!running_.load()) {
+							LOG(WARNING) << "Writer thread stopping before durable write";
+						} else if (fd_ == -1) {
 							LOG(ERROR) << "Writer thread: File descriptor invalid, skipping write for offset " << task.offset;
-							// Optional: Could trigger a reopen attempt here, but adds complexity.
-							continue; // Skip this task
+						} else {
+							current_fd = fd_;
+							ssize_t bytes_written = pwrite(current_fd, task.data.data(), task.size, task.offset);
+							if (bytes_written == -1) {
+								throw std::system_error(errno, std::generic_category(), "pwrite failed for fd " + std::to_string(current_fd) + " offset " + std::to_string(task.offset));
+							}
+							if (bytes_written != task.size) {
+								throw std::runtime_error("Incomplete pwrite for fd " + std::to_string(current_fd));
+							}
+							if (fdatasync(current_fd) == -1) {
+								throw std::system_error(errno, std::generic_category(), "fdatasync failed for fd " + std::to_string(current_fd));
+							}
+							write_successful = true;
+							durable = true;
 						}
-						current_fd = fd_; // Copy fd under lock
-
-						// Perform pwrite
-						ssize_t bytes_written = pwrite(current_fd, task.data.data(), task.size, task.offset);
-
-						if (bytes_written == -1) {
-							// Throw system_error to log errno
-							throw std::system_error(errno, std::generic_category(), "pwrite failed for fd " + std::to_string(current_fd) + " offset " + std::to_string(task.offset));
-						}
-						if (bytes_written != task.size) {
-							// Treat incomplete write as an error
-							throw std::runtime_error("Incomplete pwrite: expected " + std::to_string(task.size) +
-									", wrote " + std::to_string(bytes_written) + " for fd " + std::to_string(current_fd) + " offset " + std::to_string(task.offset));
-						}
-						write_successful = true; // Mark as successful if we reach here
-						VLOG(5) << "Writer thread successfully wrote " << bytes_written << " bytes at offset " << task.offset;
 
 					} // Shared lock released
 
 					// Update tracker *after* releasing lock, using data from the task
-					if (write_successful) {
+					if (write_successful && durable) {
 						local_cut_tracker_->recordWrite(task.offset, task.size, task.num_msg);
 					}
 
@@ -489,6 +500,9 @@ namespace Scalog {
 					}
 				} catch (const std::exception& e) {
 					LOG(ERROR) << "Writer thread exception: " << e.what();
+				}
+				if (task.durable_completion) {
+					task.durable_completion->set_value(durable);
 				}
 			} // End while loop
 			VLOG(1) << "Writer thread finished.";
@@ -804,6 +818,7 @@ namespace Scalog {
 					continue;
 				}
 
+				bool durable = false;
 				{
 					std::shared_lock<std::shared_mutex> lock(file_state_mutex_);
 					if (fd_ != -1) {
@@ -812,7 +827,16 @@ namespace Scalog {
 						                        "CXLPollingLoop")) {
 							break;
 						}
+						if (fdatasync(fd_) == -1) {
+							LOG(ERROR) << "CXLPollingLoop: fdatasync failed: " << strerror(errno);
+							break;
+						}
+						durable = true;
 					}
+				}
+				if (!durable) {
+					LOG(ERROR) << "CXLPollingLoop: no valid fd for durable write";
+					break;
 				}
 				local_cut_tracker_->recordWrite(rep_offset, complete_bytes, msg_count);
 				persisted_count += msg_count;
@@ -893,6 +917,11 @@ namespace Scalog {
 				if (!WriteFullyAtOffset(fd, src, complete_bytes,
 				                        static_cast<off_t>(rep_offset),
 				                        ("ReplicaPollingLoop[" + std::to_string(primary_broker_id) + "]").c_str())) {
+					break;
+				}
+				if (fdatasync(fd) == -1) {
+					LOG(ERROR) << "ReplicaPollingLoop[" << primary_broker_id
+					           << "]: fdatasync failed: " << strerror(errno);
 					break;
 				}
 

@@ -140,7 +140,12 @@ void LazyLogLocalSequencer::SendLocalProgress(std::string topic_str, volatile bo
     int64_t local_progress = 0;
     const int rf = tinode_->replication_factor;
     const bool track_replication_progress = (kCxlLazyLogMode && rf > 0);
-    if (track_replication_progress) {
+    if (topic_ != nullptr && topic_->SupportsPerClientAppendAckLevel1()) {
+      // Binding consumes completed appends. A completed append already requires
+      // both the data-replica frontier and the metadata-replica quorum, so it
+      // must never wait for a binding before becoming eligible for binding.
+      local_progress = static_cast<int64_t>(topic_->GetLazyLogAppendProgress());
+    } else if (track_replication_progress) {
       // [[CORRECTNESS_FIX]] Read min(replication_done[broker_id_]) across ALL replicas
       // in the replication set, not just self. Without this, ordering is gated only by
       // the primary's persistence, giving LazyLog an unfair advantage over Scalog (which

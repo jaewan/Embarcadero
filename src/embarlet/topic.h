@@ -16,8 +16,10 @@
 
 #include "disk_manager/corfu_replication_client.h"
 #include "disk_manager/scalog_replication_client.h"
+#include "cxl_manager/lazylog_metadata_replica.h"
 #include "cxl_manager/cxl_datastructure.h"
 #include "common/config.h"
+#include "common/durable_frontier.h"
 #include "common/wire_formats.h"
 #include "sequencer_utils.h"
 
@@ -444,6 +446,9 @@ class Topic {
 		// Returns the number of messages durably replicated for the given client_id at this broker.
 		// Used by AckThread for ACK2 in modes that support per-client durability attribution.
 		uint64_t GetClientDurable(uint32_t client_id) const;
+		uint64_t GetClientAppend(uint32_t client_id) const;
+		bool SupportsPerClientAppendAckLevel1() const;
+		uint64_t GetLazyLogAppendProgress() const;
 		// True when this topic/mode maintains per-client ordered frontier for ACK level 1.
 		bool SupportsPerClientAckLevel1() const;
 		// True when this topic/mode maintains per-client written frontier for ORDER=0 ACK level 1.
@@ -463,6 +468,9 @@ class Topic {
 		void RecordPerClientOrderedVisibility(uint32_t client_id, uint64_t count);
 		// Advance per-client durable frontier after a sequencer-owned export batch becomes durably replicated.
 		void RecordPerClientDurableVisibility(uint32_t client_id, uint64_t count);
+		void RecordLazyLogMetadataReplicaAck(uint64_t start_logical_offset,
+				uint32_t num_msg, uint32_t client_id);
+		void MaybeAdvanceLazyLogAppendVisibility() const;
 		void RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num_msg, uint32_t client_id);
 		void MaybeAdvanceOrder0DurableVisibility() const;
 		uint64_t CurrentControlEpoch() const;
@@ -699,6 +707,7 @@ class Topic {
 		// Replication
 		std::unique_ptr<Corfu::CorfuReplicationClient> corfu_replication_client_;
 		std::unique_ptr<Scalog::ScalogReplicationClient> scalog_replication_client_;
+		std::unique_ptr<LazyLog::LazyLogMetadataReplicaClient> lazylog_metadata_replica_client_;
 
 		// Offset tracking
 		size_t logical_offset_;
@@ -725,9 +734,7 @@ class Topic {
 		// Corfu ACK2 durable cumulative count (message count - 1 = last durable offset).
 		std::atomic<uint64_t> corfu_ack2_durable_count_{0};
 		absl::Mutex corfu_order2_durable_mu_;
-		uint64_t corfu_order2_durable_next_seq_ ABSL_GUARDED_BY(corfu_order2_durable_mu_) = 0;
-		absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>> corfu_order2_durable_completed_
-				ABSL_GUARDED_BY(corfu_order2_durable_mu_);
+		DurableFrontier corfu_order2_durable_frontier_ ABSL_GUARDED_BY(corfu_order2_durable_mu_);
 
 		// Per-client ordered counters for ACK1 in supported modes.
 		// Avoids false-positive ACK from global tinode ordered counter aggregating all clients.
@@ -744,6 +751,17 @@ class Topic {
 		mutable absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>> order0_durable_pending_
 			ABSL_GUARDED_BY(per_client_durable_mu_);
 		void UpdatePerClientDurable(uint32_t client_id, uint64_t count);
+
+		// Metadata acknowledgements may arrive out of receive order.  The append
+		// frontier advances only over a contiguous prefix also covered by the full
+		// data-replica frontier.
+		mutable absl::Mutex lazylog_append_mu_;
+		mutable uint64_t lazylog_append_next_logical_offset_ ABSL_GUARDED_BY(lazylog_append_mu_) = 0;
+		mutable absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>>
+			lazylog_metadata_ready_ ABSL_GUARDED_BY(lazylog_append_mu_);
+		mutable absl::flat_hash_map<uint32_t, uint64_t>
+			per_client_lazylog_append_ ABSL_GUARDED_BY(lazylog_append_mu_);
+		mutable std::atomic<uint64_t> lazylog_append_progress_{0};
 
 		// Synchronization
 		absl::Mutex mutex_;

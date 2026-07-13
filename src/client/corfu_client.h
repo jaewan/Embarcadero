@@ -1,4 +1,4 @@
-#include "corfu_sequencer.grpc.pb.h"
+#include "corfu_token_proxy.grpc.pb.h"
 #include "common/config.h"
 #include "../common/performance_utils.h"
 
@@ -12,20 +12,18 @@
 using grpc::Channel;
 using grpc::ClientContext;
 using grpc::Status;
-using corfusequencer::CorfuSequencer;
-using corfusequencer::TotalOrderRequest;
-using corfusequencer::TotalOrderResponse;
+using corfutokenproxy::CorfuTokenProxy;
+using corfutokenproxy::TokenRequest;
+using corfutokenproxy::TokenResponse;
 
 class CorfuSequencerClient {
 	public:
-		CorfuSequencerClient(const std::string& server_address, uint64_t client_id) 
-			: stub_(CorfuSequencer::NewStub(
-					grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials()))),
-			client_id_(client_id){}
+		explicit CorfuSequencerClient(uint64_t client_id) : client_id_(client_id) {}
 
 		// Get total order for a batch of messages
-		bool GetTotalOrder(Embarcadero::BatchHeader *batch_header){
-			TotalOrderRequest request;
+		bool GetTotalOrder(Embarcadero::BatchHeader *batch_header,
+				const std::string& proxy_endpoint){
+			TokenRequest request;
 			request.set_client_id(client_id_);
 			request.set_batchseq(batch_header->batch_seq);
 			request.set_num_msg(batch_header->num_msg);
@@ -38,12 +36,14 @@ class CorfuSequencerClient {
 			constexpr auto kUnavailableRetryBudget = std::chrono::seconds(15);
 			constexpr int kUnavailableLogInterval = 1000;
 			while (true) {
-				TotalOrderResponse response;
+				TokenResponse response;
 				ClientContext context;
 				// Set a reasonable timeout for the RPC
 				context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
 
-				Status status = stub_->GetTotalOrder(&context, request, &response);
+				auto channel = grpc::CreateChannel(proxy_endpoint, grpc::InsecureChannelCredentials());
+				auto stub = CorfuTokenProxy::NewStub(channel);
+				Status status = stub->GetTotalOrder(&context, request, &response);
 
 				if (status.ok()) {
 					batch_header->total_order = response.total_order();
@@ -111,6 +111,5 @@ class CorfuSequencerClient {
 		}
 
 	private:
-		std::unique_ptr<CorfuSequencer::Stub> stub_;
 		const uint64_t client_id_;
 };
