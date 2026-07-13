@@ -327,6 +327,10 @@ int main(int argc, char* argv[]) {
 	          << (std::getenv("EMBARCADERO_CXL_COHERENT")
 	                  ? std::getenv("EMBARCADERO_CXL_COHERENT")
 	                  : "")
+	          << " EMBARCADERO_CXL_NT_INGEST="
+	          << (std::getenv("EMBARCADERO_CXL_NT_INGEST")
+	                  ? std::getenv("EMBARCADERO_CXL_NT_INGEST")
+	                  : "")
 	          << " EMBARCADERO_STAGE_TRACE="
 	          << (std::getenv("EMBARCADERO_STAGE_TRACE")
 	                  ? std::getenv("EMBARCADERO_STAGE_TRACE")

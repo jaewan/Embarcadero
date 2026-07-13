@@ -304,6 +304,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	}
 	const bool coherent_opt_in = CxlCoherentOptInEnabled();
 	requires_explicit_payload_header_flush_ = (cxl_type == Real) && !coherent_opt_in;
+	CXL::SetExplicitFlushRequired(requires_explicit_payload_header_flush_);
 	LOG(INFO) << "CXL payload flush policy: "
 	          << (requires_explicit_payload_header_flush_ ? "explicit_flush_required"
 	                                                      : "cache_coherent_mapping")

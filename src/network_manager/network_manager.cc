@@ -444,19 +444,30 @@ static uint16_t InferOrder0HeaderVersion(const void* batch_data,
                                          size_t total_size,
                                          uint32_t num_msg) {
 	const auto* data = static_cast<const uint8_t*>(batch_data);
-	const bool matches_v2 = Order0BatchMatchesV2(data, total_size, num_msg);
-	const bool matches_v1 = Order0BatchMatchesV1(data, total_size, num_msg);
-	if (matches_v2 && !matches_v1) return wire::HEADER_VERSION_V2;
-	if (matches_v1 && !matches_v2) return wire::HEADER_VERSION_V1;
-	const uint16_t fallback = HeaderUtils::ShouldUseBlogHeader()
-		? wire::HEADER_VERSION_V2
-		: wire::HEADER_VERSION_V1;
+	// Prefer the configured header dialect first so the common path does one
+	// linear walk instead of always probing both V1 and V2.
+	if (HeaderUtils::ShouldUseBlogHeader()) {
+		if (Order0BatchMatchesV2(data, total_size, num_msg)) {
+			return wire::HEADER_VERSION_V2;
+		}
+		if (Order0BatchMatchesV1(data, total_size, num_msg)) {
+			return wire::HEADER_VERSION_V1;
+		}
+		LOG(WARNING) << "InferOrder0HeaderVersion ambiguous: total_size=" << total_size
+		             << " num_msg=" << num_msg
+		             << " matches_v1=0 matches_v2=0 fallback=" << wire::HEADER_VERSION_V2;
+		return wire::HEADER_VERSION_V2;
+	}
+	if (Order0BatchMatchesV1(data, total_size, num_msg)) {
+		return wire::HEADER_VERSION_V1;
+	}
+	if (Order0BatchMatchesV2(data, total_size, num_msg)) {
+		return wire::HEADER_VERSION_V2;
+	}
 	LOG(WARNING) << "InferOrder0HeaderVersion ambiguous: total_size=" << total_size
 	             << " num_msg=" << num_msg
-	             << " matches_v1=" << matches_v1
-	             << " matches_v2=" << matches_v2
-	             << " fallback=" << fallback;
-	return fallback;
+	             << " matches_v1=0 matches_v2=0 fallback=" << wire::HEADER_VERSION_V1;
+	return wire::HEADER_VERSION_V1;
 }
 
 /**
@@ -546,10 +557,14 @@ void NetworkManager::UpdateWrittenForOrder0(TInode* tinode, Topic* topic, uint32
 	volatile size_t* written_ptr = &tinode->offsets[broker_id_].written;
 	__atomic_fetch_add(reinterpret_cast<size_t*>(const_cast<size_t*>(written_ptr)), num_msg, __ATOMIC_RELEASE);
 
-	CXL::store_fence();
-	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written_addr));
-	CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
-	CXL::store_fence();  // Required for CXL visibility; reader (AckThread) must see updated written
+	// On Real non-coherent CXL, flush written_* so AckThread / remote observers see updates.
+	// Coherent mappings (Emul or EMBARCADERO_CXL_COHERENT=1) rely on MESI / release atomics.
+	if (cxl_manager_ == nullptr || cxl_manager_->RequiresExplicitPayloadHeaderFlush()) {
+		CXL::store_fence();
+		CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written_addr));
+		CXL::flush_cacheline(CXL::ToFlushable(&tinode->offsets[broker_id_].written));
+		CXL::store_fence();
+	}
 
 	if (topic) {
 		topic->UpdatePerClientWritten(client_id, num_msg);
@@ -1263,6 +1278,7 @@ void NetworkManager::HandlePublishRequest(
 	// [[PERF: ORDER=0 fast path]] Cache tinode + CXL base outside loop to avoid per-batch lookup.
 	TInode* order0_tinode = nullptr;
 	uint8_t* cxl_base = nullptr;
+	uint16_t cached_o0_wire_ver = 0;  // 0 = unset; sticky per connection (clients don't mix dialects)
 	if (ShouldUseOrder0FastPath()) {
 		order0_tinode = (TInode*)cxl_manager_->GetTInode(handshake.topic);
 		cxl_base = reinterpret_cast<uint8_t*>(cxl_manager_->GetCXLAddr());
@@ -1434,12 +1450,31 @@ void NetworkManager::HandlePublishRequest(
 			// batch_header_location is set
 		}
 
-		// Receive message data directly into CXL BLog
+		// Receive message data: default is zero-copy recv directly into CXL BLog.
+		// Optional EMBARCADERO_CXL_NT_INGEST=1: recv into DRAM then non-temporal copy
+		// into CXL. On this platform, kernel cacheable stores into CXL saturate at
+		// ~12–13 GB/s while streaming stores reach ~17–19 GB/s (NUMA1→CXL node2).
+		// Payload bytes and subsequent flush/PBR contracts are unchanged.
+		static const bool kNtIngest = []() {
+			const bool on = ReadEnvBoolStrict("EMBARCADERO_CXL_NT_INGEST", false);
+			if (on) {
+				LOG(INFO) << "EMBARCADERO_CXL_NT_INGEST=1: recv→DRAM then non-temporal copy into CXL BLog";
+			}
+			return on;
+		}();
+		thread_local std::vector<uint8_t> nt_staging;
 
 		size_t read = 0;
 		bool batch_data_complete = false;
+		uint8_t* recv_dst = static_cast<uint8_t*>(buf);
+		if (kNtIngest) {
+			if (nt_staging.size() < batch_header.total_size) {
+				nt_staging.resize(batch_header.total_size);
+			}
+			recv_dst = nt_staging.data();
+		}
 		while (running && !stop_threads_) {
-			bytes_read = recv(client_socket, static_cast<uint8_t*>(buf) + read, to_read, recv_flags);
+			bytes_read = recv(client_socket, recv_dst + read, to_read, recv_flags);
 			if (bytes_read < 0) {
 				if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
 				    !stop_threads_) {
@@ -1469,14 +1504,18 @@ void NetworkManager::HandlePublishRequest(
 		}
 
 		// Only process batch if all data was received
-			if (!batch_data_complete) {
+		if (!batch_data_complete) {
 			LOG(WARNING) << "NetworkManager: Batch incomplete (received " << read << " of "
 			            << batch_header.total_size << " bytes) for batch_seq=" << batch_header.batch_seq
 			            << ". Closing connection to avoid stream desync.";
 			// Connection is now out-of-sync; close to avoid interpreting payload as next header.
 			running = false;
-				break;
-			}
+			break;
+		}
+
+		if (kNtIngest) {
+			CXL::nt_copy(buf, nt_staging.data(), batch_header.total_size);
+		}
 
 		// [[PERF: ORDER=0 fast path]] Skip PBR entirely — go straight from recv to ACK update.
 		// Eliminates: PBR allocation, PBR publish, validation walk, and DelegationThread
@@ -1495,12 +1534,19 @@ void NetworkManager::HandlePublishRequest(
 			}
 			// [[ORDER0_SUBSCRIBE]] Record batch in DRAM ring so subscribers can export
 			// with batch_meta (same protocol as ORDER=5). No CXL writes; minimal overhead.
+			// Prefer DRAM staging for version inference when NT ingest is on — avoids
+			// walking every message header back from CXL after the streaming copy.
 			if (topic_ptr) {
-				const uint16_t o0_wire_ver = InferOrder0HeaderVersion(
-					buf, batch_header.total_size, batch_header.num_msg);
+				if (cached_o0_wire_ver == 0) {
+					const void* infer_src = (kNtIngest && !nt_staging.empty())
+						? static_cast<const void*>(nt_staging.data())
+						: buf;
+					cached_o0_wire_ver = InferOrder0HeaderVersion(
+						infer_src, batch_header.total_size, batch_header.num_msg);
+				}
 				topic_ptr->PushOrder0Batch(log_idx, batch_header.total_size, batch_header.num_msg,
 				                         batch_header.start_logical_offset, handshake.client_id,
-				                         o0_wire_ver);
+				                         cached_o0_wire_ver);
 			}
 			continue;  // Next batch — no PBR, no validation, no DelegationThread dependency
 		}
@@ -1679,8 +1725,12 @@ void NetworkManager::HandlePublishRequest(
 				);
 			}
 			CXL::store_fence();
-			CXL::flush_cache_range(buf, batch_header.total_size);
-			CXL::store_fence();
+			// NT ingest already drained streaming stores with sfence; a full-range
+			// clflushopt over write-through lines is redundant and saturates CXL.
+			if (!kNtIngest) {
+				CXL::flush_cache_range(buf, batch_header.total_size);
+				CXL::store_fence();
+			}
 		} else {
 			BlogMessageHeader* first_msg = reinterpret_cast<BlogMessageHeader*>(buf);
 			size_t remaining = batch_header.total_size;
@@ -1702,8 +1752,10 @@ void NetworkManager::HandlePublishRequest(
 				);
 			}
 			CXL::store_fence();
-			CXL::flush_cache_range(buf, batch_header.total_size);
-			CXL::store_fence();
+			if (!kNtIngest) {
+				CXL::flush_cache_range(buf, batch_header.total_size);
+				CXL::store_fence();
+			}
 		}
 		// [[DESIGN: Write PBR entry only after full receive]] Batch is fully in blog; write the
 		// complete BatchHeader to the PBR slot once. Slot was zeroed in GetCXLBuffer.

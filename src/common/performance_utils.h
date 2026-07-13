@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
@@ -248,6 +249,119 @@ inline void flush_cache_range(const void* addr, size_t len) {
     for (uintptr_t p = start; p < end; p += kCacheLineSize) {
         flush_cacheline(reinterpret_cast<const void*>(p));
     }
+}
+
+/**
+ * Process-wide CXL flush policy mirror of CXLManager::RequiresExplicitPayloadHeaderFlush.
+ * CXLManager sets this at init; hot paths (PBR publish, written updates) consult it without
+ * holding a CXLManager pointer.
+ */
+inline std::atomic<bool>& ExplicitFlushRequiredFlag() {
+	static std::atomic<bool> flag{true};
+	return flag;
+}
+
+inline void SetExplicitFlushRequired(bool required) {
+	ExplicitFlushRequiredFlag().store(required, std::memory_order_relaxed);
+}
+
+inline bool ExplicitFlushRequired() {
+	return ExplicitFlushRequiredFlag().load(std::memory_order_relaxed);
+}
+
+/** Below this size, ordinary memcpy beats setup cost of streaming stores. */
+inline constexpr size_t kNtMemcpyThreshold = 256;
+
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2")))
+inline void nt_memcpy_avx2_loop(uint8_t* __restrict dst, const uint8_t* __restrict src,
+                                size_t num_lines) {
+	constexpr size_t kCacheLine = 64;
+	constexpr size_t kVec = 32;
+	for (size_t i = 0; i < num_lines; ++i) {
+		__m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+		__m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + kVec));
+		_mm256_stream_si256(reinterpret_cast<__m256i*>(dst), a);
+		_mm256_stream_si256(reinterpret_cast<__m256i*>(dst + kVec), b);
+		src += kCacheLine;
+		dst += kCacheLine;
+	}
+}
+#endif
+
+/**
+ * Non-temporal memory copy for write-once CXL / far-memory fills.
+ * Peels to 64-byte alignment, uses AVX2 streaming stores when available (runtime detect),
+ * otherwise SSE2. Does not sfence — callers that need global visibility (ingest) use nt_copy.
+ */
+inline void nt_memcpy(void* __restrict dst, const void* __restrict src, size_t size) {
+	if (dst == nullptr || src == nullptr || size == 0) return;
+	if (size < kNtMemcpyThreshold) {
+		std::memcpy(dst, src, size);
+		return;
+	}
+
+	constexpr size_t kCacheLine = 64;
+	const uintptr_t dst_addr = reinterpret_cast<uintptr_t>(dst);
+	const size_t unaligned = (kCacheLine - (dst_addr % kCacheLine)) % kCacheLine;
+	const size_t initial = std::min(unaligned, size);
+	if (initial > 0) {
+		std::memcpy(dst, src, initial);
+	}
+
+	auto* aligned_dst = static_cast<uint8_t*>(dst) + initial;
+	auto* aligned_src = static_cast<const uint8_t*>(src) + initial;
+	size_t remaining = size - initial;
+	const size_t num_lines = remaining / kCacheLine;
+	remaining -= num_lines * kCacheLine;
+
+#if defined(__x86_64__) || defined(_M_X64)
+	static bool avx2_checked = false;
+	static bool use_avx2 = false;
+	if (!avx2_checked) {
+		__builtin_cpu_init();
+		use_avx2 = __builtin_cpu_supports("avx2");
+		avx2_checked = true;
+	}
+	if (use_avx2 && num_lines > 0) {
+		nt_memcpy_avx2_loop(aligned_dst, aligned_src, num_lines);
+		aligned_dst += num_lines * kCacheLine;
+		aligned_src += num_lines * kCacheLine;
+	} else {
+		const size_t vectors_per_line = kCacheLine / sizeof(__m128i);
+		for (size_t i = 0; i < num_lines; ++i) {
+			for (size_t j = 0; j < vectors_per_line; ++j) {
+				const __m128i data = _mm_loadu_si128(
+					reinterpret_cast<const __m128i*>(aligned_src + j * sizeof(__m128i)));
+				_mm_stream_si128(
+					reinterpret_cast<__m128i*>(aligned_dst + j * sizeof(__m128i)), data);
+			}
+			aligned_src += kCacheLine;
+			aligned_dst += kCacheLine;
+		}
+	}
+#else
+	std::memcpy(aligned_dst, aligned_src, num_lines * kCacheLine);
+	aligned_dst += num_lines * kCacheLine;
+	aligned_src += num_lines * kCacheLine;
+#endif
+
+	if (remaining > 0) {
+		std::memcpy(aligned_dst, aligned_src, remaining);
+	}
+}
+
+/**
+ * Ingest helper: streaming copy into CXL + sfence.
+ * Uses the shared AVX2 loop (target attribute) so non--march=native TUs still compile.
+ */
+inline void nt_copy(void* dst, const void* src, size_t len) {
+	nt_memcpy(dst, src, len);
+#if defined(__x86_64__) || defined(_M_X64)
+	_mm_sfence();
+#else
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
 }
 
 inline void invalidate_cache_range_for_read(const void* addr, size_t len) {

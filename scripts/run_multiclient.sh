@@ -902,6 +902,12 @@ start_brokers() {
     export EMBARCADERO_ORDER0_FAST_PATH
     export EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES
     export EMBARCADERO_NETWORK_IO_THREADS
+    if [[ -n "${EMBARCADERO_CXL_COHERENT:-}" ]]; then
+        export EMBARCADERO_CXL_COHERENT
+    fi
+    if [[ -n "${EMBARCADERO_CXL_NT_INGEST:-}" ]]; then
+        export EMBARCADERO_CXL_NT_INGEST
+    fi
     # Chain replication sink profile (forwarded to remote brokers via broker_lifecycle).
     if [[ -n "${EMBARCADERO_CHAIN_REPLICATION_SINK:-}" ]]; then
         export EMBARCADERO_CHAIN_REPLICATION_SINK

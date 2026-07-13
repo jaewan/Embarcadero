@@ -233,6 +233,15 @@ Use `EMBARCADERO_CXL_ZERO_MODE=metadata EMBARCADERO_CXL_MAP_POPULATE=0`
 only for explicit fast smoke tests; do not mix those runs into throughput or
 latency-vs-load claims.
 
+### CXL ingest / coherence flags
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `EMBARCADERO_CXL_COHERENT` | unset/false | When `1`/`true`/`yes`, skip explicit payload/PBR flushes (single-domain coherent mapping). Real CXL defaults to explicit flush. |
+| `EMBARCADERO_CXL_NT_INGEST` | unset/false | When `1`/`true`/`yes`, broker `recv`s into DRAM then non-temporal-copies into the CXL BLog. Raises same-host ingest toward the CXL NT write ceiling (~17–18 GB/s on this platform). Does not help remote 100GbE-limited runs. |
+
+Both flags are forwarded to local and remote brokers via `run_multiclient.sh` / `broker_lifecycle.sh`.
+
 Common options:
 
 - `NUM_BROKERS`

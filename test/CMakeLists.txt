@@ -397,6 +397,28 @@ if(PkgConfig_FOUND)
             LABELS "unit;ack;rf;contract;correctness"
         )
 
+        add_executable(nt_memcpy_test
+            nt_memcpy_test.cc
+        )
+        target_include_directories(nt_memcpy_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(nt_memcpy_test PRIVATE ${GTEST_CFLAGS_OTHER} -mclflushopt)
+        target_link_libraries(nt_memcpy_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_nt_memcpy COMMAND nt_memcpy_test)
+        set_tests_properties(unit_nt_memcpy PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;cxl;nt;perf;correctness"
+        )
+
         add_executable(order5_session_fencing_test
             order5_session_fencing_test.cc
         )

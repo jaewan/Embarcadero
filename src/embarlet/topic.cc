@@ -2831,9 +2831,11 @@ bool Topic::ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
 	// client sequence gap instead of an anonymous ring slot.
 	memcpy(slot, &claimed, sizeof(BatchHeader));
 	CXL::store_fence();
-	CXL::flush_cacheline(batch_headers_log);
-	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(batch_headers_log) + 64);
-	CXL::store_fence();
+	if (CXL::ExplicitFlushRequired()) {
+		CXL::flush_cacheline(batch_headers_log);
+		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(batch_headers_log) + 64);
+		CXL::store_fence();
+	}
 	batch_header_location = reinterpret_cast<BatchHeader*>(batch_headers_log);
 	return true;
 }
@@ -2853,17 +2855,23 @@ bool Topic::PublishPBRSlotDirect(const BatchHeader& batch_header, BatchHeader* b
 
 	// BatchHeader is 128B; flush both cachelines for non-coherent CXL visibility.
 	CXL::store_fence();
-	CXL::flush_cacheline(batch_header_location);
-	const void* batch_header_next_line = reinterpret_cast<const void*>(
-		reinterpret_cast<const uint8_t*>(batch_header_location) + 64);
-	CXL::flush_cacheline(batch_header_next_line);
-	CXL::store_fence();
+	if (CXL::ExplicitFlushRequired()) {
+		CXL::flush_cacheline(batch_header_location);
+		const void* batch_header_next_line = reinterpret_cast<const void*>(
+			reinterpret_cast<const uint8_t*>(batch_header_location) + 64);
+		CXL::flush_cacheline(batch_header_next_line);
+		CXL::store_fence();
 
-	// Publish the slot only after the full header is already durable in CXL.
-	batch_header_location->publish_commit = batch_header.pbr_absolute_index;
-	CXL::store_fence();
-	CXL::flush_cacheline(batch_header_next_line);
-	CXL::store_fence();
+		// Publish the slot only after the full header is already durable in CXL.
+		batch_header_location->publish_commit = batch_header.pbr_absolute_index;
+		CXL::store_fence();
+		CXL::flush_cacheline(batch_header_next_line);
+		CXL::store_fence();
+	} else {
+		// Coherent mapping: release store of publish_commit is sufficient.
+		batch_header_location->publish_commit = batch_header.pbr_absolute_index;
+		CXL::store_fence();
+	}
 	return true;
 }
 

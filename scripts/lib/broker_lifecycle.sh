@@ -829,6 +829,8 @@ broker_remote_launch() {
     REMOTE_BROKER_POLL_INTERVAL="$poll_interval" \
     REMOTE_ACK_SEND_MIN_INTERVAL_US="${EMBARCADERO_ACK_SEND_MIN_INTERVAL_US:-}" \
     REMOTE_ORDER0_FAST_PATH="${EMBARCADERO_ORDER0_FAST_PATH:-}" \
+    REMOTE_CXL_COHERENT="${EMBARCADERO_CXL_COHERENT:-}" \
+    REMOTE_CXL_NT_INGEST="${EMBARCADERO_CXL_NT_INGEST:-}" \
     REMOTE_ACK_STALL_SLEEP_US="${EMBARCADERO_ACK_STALL_SLEEP_US:-}" \
     REMOTE_CORFU_SEQ_IP="${EMBARCADERO_CORFU_SEQ_IP:-}" \
     REMOTE_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-}" \
@@ -857,6 +859,8 @@ sequence=${REMOTE_BROKER_SEQUENCE:?}
 poll_interval=${REMOTE_BROKER_POLL_INTERVAL:?}
 ack_send_min_interval_us=${REMOTE_ACK_SEND_MIN_INTERVAL_US:-}
 order0_fast_path=${REMOTE_ORDER0_FAST_PATH:-}
+cxl_coherent=${REMOTE_CXL_COHERENT:-}
+cxl_nt_ingest=${REMOTE_CXL_NT_INGEST:-}
 ack_stall_sleep_us=${REMOTE_ACK_STALL_SLEEP_US:-}
 corfu_seq_ip=${REMOTE_CORFU_SEQ_IP:-}
 scalog_seq_ip=${REMOTE_SCALOG_SEQ_IP:-}
@@ -886,6 +890,8 @@ nohup env \
   BROKER_POLL_INTERVAL="$poll_interval" \
   EMBARCADERO_ACK_SEND_MIN_INTERVAL_US="$ack_send_min_interval_us" \
   EMBARCADERO_ORDER0_FAST_PATH="$order0_fast_path" \
+  EMBARCADERO_CXL_COHERENT="$cxl_coherent" \
+  EMBARCADERO_CXL_NT_INGEST="$cxl_nt_ingest" \
   EMBARCADERO_ACK_STALL_SLEEP_US="$ack_stall_sleep_us" \
   EMBARCADERO_CORFU_SEQ_IP="$corfu_seq_ip" \
   EMBARCADERO_SCALOG_SEQ_IP="$scalog_seq_ip" \
@@ -934,6 +940,13 @@ chain_sync_interval_ms=${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}
 export EMBAR_USE_HUGETLB=${EMBAR_USE_HUGETLB:-1}
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_CXL_MAP_POPULATE=${EMBARCADERO_CXL_MAP_POPULATE:-1}
+# Optional ingest / coherence flags (inherited from harness when set).
+if [ -n "${EMBARCADERO_CXL_COHERENT:-}" ]; then
+  export EMBARCADERO_CXL_COHERENT
+fi
+if [ -n "${EMBARCADERO_CXL_NT_INGEST:-}" ]; then
+  export EMBARCADERO_CXL_NT_INGEST
+fi
 export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
 export EMBARCADERO_REPLICATION_FACTOR="${replication_factor_cfg:-0}"
 export NUM_BROKERS="${num_brokers_cfg:-4}"
@@ -968,6 +981,8 @@ if [ -n "$ack_send_min_interval_us" ]; then
   export EMBARCADERO_ACK_SEND_MIN_INTERVAL_US="$ack_send_min_interval_us"
 fi
 if [ -n "$order0_fast_path" ]; then export EMBARCADERO_ORDER0_FAST_PATH="$order0_fast_path"; fi
+if [ -n "${EMBARCADERO_CXL_COHERENT:-}" ]; then export EMBARCADERO_CXL_COHERENT; fi
+if [ -n "${EMBARCADERO_CXL_NT_INGEST:-}" ]; then export EMBARCADERO_CXL_NT_INGEST; fi
 if [ -n "$ack_stall_sleep_us" ]; then export EMBARCADERO_ACK_STALL_SLEEP_US="$ack_stall_sleep_us"; fi
 if [ -n "$corfu_seq_ip" ]; then export EMBARCADERO_CORFU_SEQ_IP="$corfu_seq_ip"; fi
 if [ -n "$scalog_seq_ip" ]; then
