@@ -810,6 +810,7 @@ broker_remote_launch() {
   local _remote_rep="${REPLICATION_FACTOR:-${EMBARCADERO_REPLICATION_FACTOR:-0}}"
   local _remote_nb="${NUM_BROKERS:-4}"
   local _remote_disk_dirs="${EMBARCADERO_REPLICA_DISK_DIRS:-}"
+  local _remote_disk_weights="${EMBARCADERO_REPLICA_DISK_WEIGHTS:-}"
   local _remote_chain_inmem="${EMBARCADERO_CHAIN_REPLICATION_INMEM:-}"
   local _remote_chain_inmem_copy="${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-}"
   local _remote_chain_inmem_bytes="${EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}"
@@ -841,6 +842,7 @@ broker_remote_launch() {
     REMOTE_REPLICATION_FACTOR="$_remote_rep" \
     REMOTE_NUM_BROKERS="$_remote_nb" \
     REMOTE_REPLICA_DISK_DIRS="$_remote_disk_dirs" \
+    REMOTE_REPLICA_DISK_WEIGHTS="$_remote_disk_weights" \
     REMOTE_CHAIN_REPLICATION_INMEM="$_remote_chain_inmem" \
     REMOTE_CHAIN_REPLICATION_INMEM_COPY="$_remote_chain_inmem_copy" \
     REMOTE_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE="$_remote_chain_inmem_bytes" \
@@ -871,6 +873,7 @@ lazylog_metadata_endpoints=${REMOTE_LAZYLOG_METADATA_ENDPOINTS:-}
 replication_factor_cfg=${REMOTE_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${REMOTE_NUM_BROKERS:-4}
 replica_disk_dirs=${REMOTE_REPLICA_DISK_DIRS:-}
+replica_disk_weights=${REMOTE_REPLICA_DISK_WEIGHTS:-}
 chain_replication_inmem=${REMOTE_CHAIN_REPLICATION_INMEM:-}
 chain_replication_inmem_copy=${REMOTE_CHAIN_REPLICATION_INMEM_COPY:-}
 chain_replication_inmem_bytes=${REMOTE_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}
@@ -903,6 +906,7 @@ nohup env \
   EMBARCADERO_REPLICATION_FACTOR="$replication_factor_cfg" \
   NUM_BROKERS="$num_brokers_cfg" \
   EMBARCADERO_REPLICA_DISK_DIRS="$replica_disk_dirs" \
+  EMBARCADERO_REPLICA_DISK_WEIGHTS="$replica_disk_weights" \
   EMBARCADERO_CHAIN_REPLICATION_INMEM="$chain_replication_inmem" \
   EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY="$chain_replication_inmem_copy" \
   EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE="$chain_replication_inmem_bytes" \
@@ -931,6 +935,7 @@ lazylog_metadata_endpoints=${EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS:-}
 replication_factor_cfg=${EMBARCADERO_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${NUM_BROKERS:-4}
 replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}
+replica_disk_weights=${EMBARCADERO_REPLICA_DISK_WEIGHTS:-}
 chain_replication_inmem=${EMBARCADERO_CHAIN_REPLICATION_INMEM:-}
 chain_replication_inmem_copy=${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-}
 chain_replication_inmem_bytes=${EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:-}
@@ -953,6 +958,9 @@ export NUM_BROKERS="${num_brokers_cfg:-4}"
 export EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}
 if [ -n "$replica_disk_dirs" ]; then
   export EMBARCADERO_REPLICA_DISK_DIRS="$replica_disk_dirs"
+fi
+if [ -n "$replica_disk_weights" ]; then
+  export EMBARCADERO_REPLICA_DISK_WEIGHTS="$replica_disk_weights"
 fi
 if [ -n "$chain_replication_inmem" ]; then
   export EMBARCADERO_CHAIN_REPLICATION_INMEM="$chain_replication_inmem"

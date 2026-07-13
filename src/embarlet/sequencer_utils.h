@@ -107,6 +107,15 @@ inline bool ShouldFenceSessionGap(
 	       now_ns - state.gap_since_ns >= session_lease_ns;
 }
 
+/// When the idle force-expire window is armed, gaps must fence immediately so
+/// held suffixes drain (via SESSION_FENCED + client resubmit) instead of waiting
+/// out the full session lease after the stall detector already fired.
+inline uint64_t EffectiveOrder5SessionFenceLeaseNs(
+		uint64_t session_lease_ns,
+		bool force_expire_active) {
+	return force_expire_active ? 0 : session_lease_ns;
+}
+
 inline bool ShouldClearSessionGapFromHeldMax(uint64_t next_expected, uint64_t max_held_seq) {
 	return max_held_seq <= next_expected;
 }

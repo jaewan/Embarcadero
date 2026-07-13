@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <errno.h>
+#include <vector>
 
 #include <glog/logging.h>
 #include "mimalloc.h"
@@ -1358,6 +1359,82 @@ void NetworkManager::HandlePublishRequest(
 			break;
 		}
 
+		Topic* topic_ptr = cxl_manager_->GetTopicPtr(handshake.topic);
+
+		// ORDER=5: drain retransmitted duplicates without allocating irreversible BLog.
+		// Sequencer dedup alone is too late — EmbarcaderoGetCXLBuffer already spent CXL.
+		if (topic_ptr &&
+		    topic_ptr->GetSeqtype() == EMBARCADERO &&
+		    topic_ptr->GetOrder() == Embarcadero::kOrderStrong &&
+		    topic_ptr->IsIngestBatchAlreadySeen(
+				handshake.client_id,
+				batch_header.batch_seq,
+				connection_session_epoch)) {
+			static thread_local std::vector<uint8_t> discard_buf;
+			if (discard_buf.size() < batch_header.total_size) {
+				discard_buf.resize(batch_header.total_size);
+			}
+			size_t drained = 0;
+			bool drain_ok = true;
+			while (drained < batch_header.total_size && !stop_threads_) {
+				ssize_t n = recv(client_socket,
+						discard_buf.data() + drained,
+						batch_header.total_size - drained,
+						recv_flags);
+				if (n < 0) {
+					if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
+					    !stop_threads_) {
+						continue;
+					}
+					drain_ok = false;
+					break;
+				}
+				if (n == 0) {
+					drain_ok = false;
+					publisher_disconnected = true;
+					break;
+				}
+				drained += static_cast<size_t>(n);
+			}
+			if (!drain_ok || stop_threads_) {
+				running = false;
+				break;
+			}
+			VLOG(1) << "NetworkManager: dropped duplicate ingest client_id="
+			        << handshake.client_id
+			        << " batch_seq=" << batch_header.batch_seq
+			        << " session_epoch=" << connection_session_epoch
+			        << " bytes=" << batch_header.total_size;
+			LOG_EVERY_N(WARNING, 256)
+				<< "NetworkManager: ingest dedup drain hits="
+				<< topic_ptr->GetIngestDedupHits()
+				<< " last client_id=" << handshake.client_id
+				<< " batch_seq=" << batch_header.batch_seq
+				<< " session_epoch=" << connection_session_epoch;
+			continue;
+		}
+
+		// Admit-before-allocate: wait for PBR capacity before burning BLog.
+		if (topic_ptr &&
+		    topic_ptr->GetSeqtype() == EMBARCADERO &&
+		    topic_ptr->GetOrder() == Embarcadero::kOrderStrong) {
+			const auto pbr_admit_deadline =
+				std::chrono::steady_clock::now() + std::chrono::minutes(5);
+			while (topic_ptr->IsPBRAboveHighWatermark(80) && !stop_threads_) {
+				if (std::chrono::steady_clock::now() >= pbr_admit_deadline) {
+					LOG(ERROR) << "NetworkManager: PBR admit wait exceeded 5m hard cap; "
+					           << "closing socket for batch_seq=" << batch_header.batch_seq;
+					running = false;
+					break;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			if (stop_threads_ || !running) {
+				running = false;
+				break;
+			}
+		}
+
 		// Allocate buffer for message batch
 		size_t to_read = batch_header.total_size;
 		void* segment_header = nullptr;
@@ -1368,13 +1445,13 @@ void NetworkManager::HandlePublishRequest(
 
 		non_emb_seq_callback = nullptr;
 
-		Topic* topic_ptr = cxl_manager_->GetTopicPtr(handshake.topic);
 		bool epoch_checked_this_batch = false;
 
 
 		// Use GetCXLBuffer for batch-level allocation and zero-copy receive
 		// BLOCKING MODE: Wait indefinitely for ring space - NEVER close connection
 			size_t wait_iterations = 0;
+			bool blog_exhausted_drain = false;
 
 			while (!buf && !stop_threads_) {
 			if (stop_threads_) {
@@ -1402,6 +1479,13 @@ void NetworkManager::HandlePublishRequest(
 				break;  // Success
 			}
 
+			// Fail closed on CXL exhaustion: drain payload and continue rather than
+			// SIGSEGV on a past-end pointer (old advisory rollover path).
+			if (topic_ptr && topic_ptr->IsBLogCapacityExhausted()) {
+				blog_exhausted_drain = true;
+				break;
+			}
+
 				// Ring full - wait for consumer to make space
 				wait_iterations++;
 				// [[FIX_RING_FULL_YIELD]] Use yield() immediately for ring full - consumer needs CPU time.
@@ -1411,6 +1495,27 @@ void NetworkManager::HandlePublishRequest(
 				if (wait_iterations > 0) {
 					VLOG(2) << "NetworkManager: waited for ring space, iterations=" << wait_iterations;
 				}
+
+			if (blog_exhausted_drain) {
+				static thread_local std::vector<uint8_t> exhaust_buf;
+				if (exhaust_buf.size() < batch_header.total_size) {
+					exhaust_buf.resize(batch_header.total_size);
+				}
+				size_t drained = 0;
+				while (drained < batch_header.total_size && !stop_threads_) {
+					ssize_t n = recv(client_socket,
+							exhaust_buf.data() + drained,
+							batch_header.total_size - drained,
+							recv_flags);
+					if (n <= 0) break;
+					drained += static_cast<size_t>(n);
+				}
+				LOG(ERROR) << "NetworkManager: BLog exhausted; drained batch_seq="
+				           << batch_header.batch_seq
+				           << " client_id=" << handshake.client_id
+				           << " without CXL alloc (client may RTO)";
+				continue;
+			}
 
 			if (!buf) {
 			// Only happens if stop_threads_ is set (shutdown)
@@ -1557,19 +1662,30 @@ void NetworkManager::HandlePublishRequest(
 	TInode* tinode = nullptr;
 	if (seq_type == EMBARCADERO) {
 		size_t post_recv_attempts = 0;
-		// Retry post-recv PBR reservation with exponential backoff (max 10 seconds)
+		// Soft per-slice deadline (10s) for logging; hard cap (5m) fails closed.
 		int sleep_ms = 1;  // Start at 1 ms
 		auto post_recv_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		const auto post_recv_hard_deadline =
+			std::chrono::steady_clock::now() + std::chrono::minutes(5);
 		while (!batch_header_location && !stop_threads_) {
+			if (std::chrono::steady_clock::now() >= post_recv_hard_deadline) {
+				LOG(ERROR) << "NetworkManager: PBR post-recv wait exceeded 5m hard cap for batch_seq="
+				           << batch_header.batch_seq << " client_id=" << handshake.client_id
+				           << " attempts=" << post_recv_attempts;
+				running = false;
+				break;
+			}
 			if (topic_ptr != nullptr && topic_ptr->IsPBRAboveHighWatermark(80)) {
 				// Independent PBR capacity backpressure: pause ingest while the sequencer
 				// drains the shared BatchHeader ring (export uses the same ring today).
+				// Do NOT close the connection — that forces client reconnect/RTO storms that
+				// burn irreversible BLog. Extend the deadline and keep waiting.
 				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 				if (std::chrono::steady_clock::now() >= post_recv_deadline) {
-					LOG(ERROR) << "NetworkManager: PBR high-watermark timeout for batch_seq="
-					           << batch_header.batch_seq << " client_id=" << handshake.client_id;
-					running = false;
-					break;
+					LOG(ERROR) << "NetworkManager: PBR high-watermark still elevated for batch_seq="
+					           << batch_header.batch_seq << " client_id=" << handshake.client_id
+					           << " — continuing to wait (closing would amplify CXL BLog waste)";
+					post_recv_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 				}
 				continue;
 			}
@@ -1590,13 +1706,14 @@ void NetworkManager::HandlePublishRequest(
 				break;  // Success
 			}
 			post_recv_attempts++;
-			// Check deadline; if exceeded, close connection (avoid blocking forever)
+			// Soft deadline: keep waiting rather than closing (same rationale as HWM path).
 			if (std::chrono::steady_clock::now() >= post_recv_deadline) {
-				LOG(ERROR) << "NetworkManager: PBR backpressure timeout (10s) for batch_seq="
+				LOG(ERROR) << "NetworkManager: PBR reservation still failing for batch_seq="
 				           << batch_header.batch_seq << " client_id=" << handshake.client_id
-				           << " — closing connection to prevent indefinite stall";
-				running = false;
-				break;
+				           << " attempts=" << post_recv_attempts
+				           << " — continuing to wait";
+				post_recv_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+				sleep_ms = 1;
 			}
 			
 			// [[FIX_BACKOFF_ADAPTIVE]] Use adaptive backoff: yield for small delays, sleep for large ones.
@@ -1610,12 +1727,12 @@ void NetworkManager::HandlePublishRequest(
 		}
 
 		if (!batch_header_location) {
-			// Either deadline exceeded or stop_threads_ set
+			// stop_threads_ set during wait
 			if (stop_threads_) {
 				VLOG(1) << "NetworkManager: Shutdown during post-recv PBR reservation for batch_seq="
 				        << batch_header.batch_seq;
 			} else {
-				LOG(ERROR) << "NetworkManager: PBR reservation failed for batch_seq="
+				LOG(ERROR) << "NetworkManager: PBR reservation aborted for batch_seq="
 				           << batch_header.batch_seq << " client_id=" << handshake.client_id
 				           << " after " << post_recv_attempts << " attempts";
 			}

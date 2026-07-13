@@ -485,6 +485,21 @@ class Topic {
 		bool IsPBRAboveHighWatermark(int high_pct);
 		bool IsPBRBelowLowWatermark(int low_pct);
 		/**
+		 * ORDER=5 ingest idempotency: true once this (client_id, batch_seq, session_epoch)
+		 * has been successfully published into PBR. Retransmits must not allocate more BLog.
+		 */
+		bool IsIngestBatchAlreadySeen(uint32_t client_id, uint64_t batch_seq,
+				uint32_t session_epoch) const;
+		void MarkIngestBatchSeen(uint32_t client_id, uint64_t batch_seq,
+				uint32_t session_epoch);
+		uint64_t GetIngestDedupHits() const {
+			return ingest_dedup_hits_.load(std::memory_order_relaxed);
+		}
+		/** True after a failed segment rollover until FreeSegment/GC restores capacity. */
+		bool IsBLogCapacityExhausted() const {
+			return blog_capacity_exhausted_.load(std::memory_order_acquire);
+		}
+		/**
 		 * @brief Reserves one PBR slot and writes BatchHeader to CXL; caller then writes payload and flushes.
 		 * @threading Thread-safe: lock-free (128-bit CAS) when pbr_state_.is_lock_free(), else mutex-protected.
 		 * @ownership batch_header_location points into CXL; caller must flush before signalling completion.
@@ -587,9 +602,16 @@ class Topic {
 		int GetPBRUtilizationPct();
 
 		/**
-		 * Check and handle segment boundary crossing
+		 * Check and handle segment boundary crossing.
+		 * @return true if [log, log+msgSize) fits in a live segment (possibly after rollover);
+		 *         false if CXL segments are exhausted — caller must fail closed (no past-end write).
 		 */
-		void CheckSegmentBoundary(void* log, size_t msgSize, unsigned long long int segment_metadata);
+		bool CheckSegmentBoundary(void* log, size_t msgSize, unsigned long long int segment_metadata);
+		/**
+		 * Reserve BLog space without ever returning a pointer past the mapped segment end.
+		 * Uses reserve-before-cross + CAS; returns nullptr if capacity is exhausted.
+		 */
+		void* TryReserveBLogSpaceFailClosed(size_t size, bool epoch_already_checked = false);
 
 		/**
 		 * [[PHASE_1A_EPOCH_FENCING]] Refresh broker's view of ControlBlock.epoch from CXL.
@@ -960,7 +982,32 @@ class Topic {
 		absl::flat_hash_map<uint64_t, uint64_t> recovered_order5_next_expected_;
 		absl::flat_hash_map<uint32_t, uint64_t> recovered_order5_msg_counts_;
 		uint64_t recovered_global_seq_{0};
-		uint64_t order5_durable_next_goi_{0};
+		// Per-owner GOI scan cursors for ACK2 durable attribution. Independent
+		// cursors prevent a slow remote owner's undurable entry from HOL-blocking
+		// durable credits for other clients/owners (critical for N>=3 mixed local/remote).
+		std::array<uint64_t, NUM_MAX_BROKERS> order5_durable_next_goi_by_owner_{};
+		std::array<uint64_t, NUM_MAX_BROKERS> order5_durable_pin_since_ns_{};
+		// Ingest-time exact dedup so RTO retransmits do not burn irreversible BLog.
+		struct IngestDedupKey {
+			uint32_t client_id{0};
+			uint32_t session_epoch{0};
+			uint64_t batch_seq{0};
+			bool operator==(const IngestDedupKey& o) const {
+				return client_id == o.client_id &&
+				       session_epoch == o.session_epoch &&
+				       batch_seq == o.batch_seq;
+			}
+			template <typename H>
+			friend H AbslHashValue(H h, const IngestDedupKey& k) {
+				return H::combine(std::move(h), k.client_id, k.session_epoch, k.batch_seq);
+			}
+		};
+		mutable absl::Mutex ingest_dedup_mu_;
+		absl::flat_hash_set<IngestDedupKey> ingest_seen_ ABSL_GUARDED_BY(ingest_dedup_mu_);
+		std::deque<IngestDedupKey> ingest_seen_ring_ ABSL_GUARDED_BY(ingest_dedup_mu_);
+		static constexpr size_t kIngestDedupCap = 1u << 20;  // ~1M recent batches
+		mutable std::atomic<uint64_t> ingest_dedup_hits_{0};
+		std::atomic<bool> blog_capacity_exhausted_{false};
 		std::atomic<bool> order5_recovery_complete_{false};
 		mutable absl::Mutex session_fence_mu_;
 		absl::flat_hash_map<uint32_t, SessionFenceNotification> pending_session_fences_

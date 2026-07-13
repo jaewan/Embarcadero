@@ -1124,10 +1124,28 @@ fi
 case "$CHAIN_SINK_MODE" in
     memory-copy|memory_copy|memory-accounting|memory_accounting|accounting|copy)
         ACK_CLAIM_LABEL="replicated_ack_emulated"
+        # Memory-emulated ACK2: CXL-class client credit + NT ingest headroom.
+        if [[ "$ACK" == "2" ]]; then
+            export EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC="${EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC:-12884901888}"
+            export EMBARCADERO_CXL_NT_INGEST="${EMBARCADERO_CXL_NT_INGEST:-1}"
+            export EMBARCADERO_ACK2_RETENTION="${EMBARCADERO_ACK2_RETENTION:-pool_pin}"
+            # Pool-pin depth needs multi-GiB hugepage arena (default pipeline ~0.7 GiB).
+            export EMBARCADERO_QUEUE_POOL_MAX_BYTES="${EMBARCADERO_QUEUE_POOL_MAX_BYTES:-8589934592}"
+        fi
         ;;
     *)
         if [[ "$ACK" == "2" ]]; then
             ACK_CLAIM_LABEL="media_durable"
+            # Disk ACK2: larger sync batches + optional capacity weights (fast disk first).
+            export EMBARCADERO_CHAIN_SYNC_BYTES="${EMBARCADERO_CHAIN_SYNC_BYTES:-268435456}"
+            export EMBARCADERO_ACK2_RETENTION="${EMBARCADERO_ACK2_RETENTION:-owned_rto_copy}"
+            if [[ -n "${EMBARCADERO_REPLICA_DISK_DIRS:-}" && -z "${EMBARCADERO_REPLICA_DISK_WEIGHTS:-}" ]]; then
+                # Prefer first listed disk (typically the faster NVMe) 4× vs second.
+                IFS=',' read -r -a _replica_dirs <<< "$EMBARCADERO_REPLICA_DISK_DIRS"
+                if [[ "${#_replica_dirs[@]}" -ge 2 ]]; then
+                    export EMBARCADERO_REPLICA_DISK_WEIGHTS="${EMBARCADERO_REPLICA_DISK_WEIGHTS:-4,1}"
+                fi
+            fi
         else
             ACK_CLAIM_LABEL="n/a"
         fi
@@ -1135,6 +1153,14 @@ case "$CHAIN_SINK_MODE" in
 esac
 printf "  %-32s %s\n" "CHAIN_SINK_MODE:"               "$CHAIN_SINK_MODE"
 printf "  %-32s %s\n" "ACK_CLAIM_LABEL:"               "$ACK_CLAIM_LABEL"
+if [[ "$ACK" == "2" ]]; then
+    printf "  %-32s %s\n" "ACK2_OFFERED_RATE:"             "${EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC:-default}"
+    printf "  %-32s %s\n" "ACK2_RETENTION:"                "${EMBARCADERO_ACK2_RETENTION:-default}"
+    printf "  %-32s %s\n" "QUEUE_POOL_MAX_BYTES:"           "${EMBARCADERO_QUEUE_POOL_MAX_BYTES:-default}"
+    printf "  %-32s %s\n" "CHAIN_SYNC_BYTES:"              "${EMBARCADERO_CHAIN_SYNC_BYTES:-default}"
+    printf "  %-32s %s\n" "REPLICA_DISK_WEIGHTS:"          "${EMBARCADERO_REPLICA_DISK_WEIGHTS:-}"
+    printf "  %-32s %s\n" "CXL_NT_INGEST:"                 "${EMBARCADERO_CXL_NT_INGEST:-}"
+fi
 printf "  %-32s %s\n" "MESSAGE_SIZE:"                  "$MESSAGE_SIZE B"
 printf "  %-32s %s\n" "TOTAL_MESSAGE_SIZE:"            "$TOTAL_MESSAGE_SIZE B  ($(( TOTAL_MESSAGE_SIZE / 1024 / 1024 )) MiB)"
 printf "  %-32s %s\n" "LOAD_PER_CLIENT:"               "$LOAD_PER_CLIENT B  ($(( LOAD_PER_CLIENT / 1024 / 1024 )) MiB)"
@@ -1299,6 +1325,13 @@ export EMBARCADERO_CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB
 export EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS
 export EMBARCADERO_ORDER5_HOME_BROKERS=$EMBARCADERO_ORDER5_HOME_BROKERS
 if [ -n "${EMBARCADERO_ACK_TIMEOUT_SEC:-}" ]; then export EMBARCADERO_ACK_TIMEOUT_SEC=${EMBARCADERO_ACK_TIMEOUT_SEC:-}; fi
+if [ -n "${EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC:-}" ]; then export EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC=${EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC:-}; fi
+if [ -n "${EMBARCADERO_OFFERED_RATE_BYTES_PER_SEC:-}" ]; then export EMBARCADERO_OFFERED_RATE_BYTES_PER_SEC=${EMBARCADERO_OFFERED_RATE_BYTES_PER_SEC:-}; fi
+if [ -n "${EMBARCADERO_ACK2_RETENTION:-}" ]; then export EMBARCADERO_ACK2_RETENTION=${EMBARCADERO_ACK2_RETENTION:-}; fi
+if [ -n "${EMBARCADERO_QUEUE_POOL_MAX_BYTES:-}" ]; then export EMBARCADERO_QUEUE_POOL_MAX_BYTES=${EMBARCADERO_QUEUE_POOL_MAX_BYTES:-}; fi
+if [ -n "${EMBARCADERO_CHAIN_REPLICATION_SINK:-}" ]; then export EMBARCADERO_CHAIN_REPLICATION_SINK=${EMBARCADERO_CHAIN_REPLICATION_SINK:-}; fi
+if [ -n "${EMBARCADERO_CHAIN_REPLICATION_INMEM:-}" ]; then export EMBARCADERO_CHAIN_REPLICATION_INMEM=${EMBARCADERO_CHAIN_REPLICATION_INMEM:-}; fi
+if [ -n "${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-}" ]; then export EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-}; fi
 if [ -n "${EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS:-}" ]; then export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=${EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS:-}; fi
 if [ -n "${EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT:-}" ]; then export EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT=${EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT:-}; fi
 if [ -n "${EMBARCADERO_SESSION_LEASE_MS:-}" ]; then export EMBARCADERO_SESSION_LEASE_MS=${EMBARCADERO_SESSION_LEASE_MS:-}; fi

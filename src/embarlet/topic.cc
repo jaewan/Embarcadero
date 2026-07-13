@@ -1383,9 +1383,10 @@ void Topic::AssignOrder(BatchHeader *batch_to_order, size_t start_total_order, B
  * Ensure the reserved [log, log+msgSize) lies entirely inside the current segment.
  * If allocation already crossed the end, seal and roll to a new segment (fail-closed
  * if no segment is available). Callers that can check first should prefer
- * ReserveBLogSpace which reserves before crossing.
+ * ReserveBLogSpace / TryReserveBLogSpaceFailClosed which reserve before crossing.
+ * @return false when CXL segments are exhausted — caller must not write past end.
  */
-void Topic::CheckSegmentBoundary(
+bool Topic::CheckSegmentBoundary(
 		void* log,
 		size_t msgSize,
 		unsigned long long int segment_metadata) {
@@ -1394,7 +1395,7 @@ void Topic::CheckSegmentBoundary(
 	const uintptr_t segment_end = segment_metadata + SEGMENT_SIZE;
 
 	if (segment_end > log_addr + msgSize) {
-		return;
+		return true;
 	}
 
 	absl::MutexLock lock(&segment_rollover_mu_);
@@ -1402,8 +1403,10 @@ void Topic::CheckSegmentBoundary(
 	const uintptr_t cur_seg = reinterpret_cast<uintptr_t>(current_segment_);
 	const uintptr_t cur_end = cur_seg + SEGMENT_SIZE;
 	const uintptr_t cur_log = log_addr_.load(std::memory_order_acquire);
-	if (cur_end > cur_log + msgSize && cur_seg != segment_metadata) {
-		return;  // Rollover already published a usable segment.
+	if (cur_seg != 0 && cur_end > cur_log + msgSize) {
+		// Fits in the live segment (possibly after a concurrent rollover that
+		// invalidated the caller's stale segment_metadata).
+		return true;
 	}
 
 	LOG(WARNING) << "Segment size limit reached (" << SEGMENT_SIZE
@@ -1423,7 +1426,8 @@ void Topic::CheckSegmentBoundary(
 	if (next == nullptr) {
 		LOG(ERROR) << "Segment rollover failed: CXL segments exhausted "
 		           << "topic=" << topic_name_ << " broker=" << broker_id_;
-		return;
+		blog_capacity_exhausted_.store(true, std::memory_order_release);
+		return false;
 	}
 
 	// Durable segment identity header (first 64 bytes):
@@ -1444,11 +1448,13 @@ void Topic::CheckSegmentBoundary(
 	// Skip 64B header like initial segment setup.
 	const uintptr_t new_base = reinterpret_cast<uintptr_t>(next) + 64;
 	log_addr_.store(new_base, std::memory_order_release);
+	blog_capacity_exhausted_.store(false, std::memory_order_release);
 	LOG(INFO) << "Segment rolled topic=" << topic_name_
 	          << " broker=" << broker_id_
 	          << " segment_id=" << header[1]
 	          << " generation=" << header[2]
 	          << " new_base=" << reinterpret_cast<void*>(new_base);
+	return true;
 }
 
 void Topic::MaybeGCRetiredSegments() {
@@ -1475,6 +1481,8 @@ void Topic::MaybeGCRetiredSegments() {
 		             << "(FreeSegment callback unset); topic=" << topic_name_;
 		retired_segments_.pop_front();
 	}
+	// blog_capacity_exhausted_ is cleared only in CheckSegmentBoundary after a
+	// successful rollover — freeing a retired segment does not prove a new one is available.
 }
 
 std::function<void(void*, size_t)> Topic::KafkaGetCXLBuffer(
@@ -2119,31 +2127,63 @@ void Topic::MaybeAdvanceOrder5DurableFromCV() {
 		durable_logical[b] = cv[b].completed_logical_offset.load(std::memory_order_acquire);
 	}
 
+	const uint64_t now_ns = SteadyNowNs();
+	// Bound/surface: warn when a disk-replica tail pins durable attribution.
+	static constexpr uint64_t kDurablePinWarnNs = 30ULL * 1000ULL * 1000ULL * 1000ULL;
 	absl::MutexLock lock(&per_client_durable_mu_);
-	while (order5_durable_next_goi_ <= committed_seq) {
-		GOIEntry* entry = &goi[order5_durable_next_goi_];
-		ReadGOIEntryFresh(entry);
-		if (entry->global_seq != order5_durable_next_goi_) {
-			break;
+	for (int owner = 0; owner < NUM_MAX_BROKERS; ++owner) {
+		uint64_t& cursor = order5_durable_next_goi_by_owner_[static_cast<size_t>(owner)];
+		bool pinned_this_pass = false;
+		uint64_t pin_needed_cumulative = 0;
+		while (cursor <= committed_seq) {
+			GOIEntry* entry = &goi[cursor];
+			ReadGOIEntryFresh(entry);
+			if (entry->global_seq != cursor) {
+				break;
+			}
+			const int entry_owner = static_cast<int>(entry->broker_id);
+			if (entry_owner != owner) {
+				++cursor;
+				continue;
+			}
+			// Empty/skip GOI entries have nothing to wait for on disk.
+			if (entry->message_count == 0) {
+				++cursor;
+				continue;
+			}
+			if (durable_logical[static_cast<size_t>(owner)] < entry->cumulative_message_count) {
+				pinned_this_pass = true;
+				pin_needed_cumulative = entry->cumulative_message_count;
+				break;
+			}
+			if (entry->client_id != 0 || entry->message_count > 0) {
+				per_client_durable_[static_cast<uint32_t>(entry->client_id)] += entry->message_count;
+				StageTrace::Record(
+					StageTrace::Stage::DurableFrontier,
+					entry->client_id,
+					cursor,
+					SteadyNowNs(),
+					per_client_durable_[static_cast<uint32_t>(entry->client_id)]);
+			}
+			++cursor;
 		}
-		const int owner = static_cast<int>(entry->broker_id);
-		if (owner < 0 || owner >= NUM_MAX_BROKERS) {
-			++order5_durable_next_goi_;
-			continue;
+		uint64_t& pin_since = order5_durable_pin_since_ns_[static_cast<size_t>(owner)];
+		if (pinned_this_pass) {
+			if (pin_since == 0) {
+				pin_since = now_ns;
+			} else if (now_ns - pin_since >= kDurablePinWarnNs) {
+				LOG_EVERY_N(ERROR, 64)
+					<< "[ORDER5_DURABLE_PIN] owner=" << owner
+					<< " pinned_ms=" << ((now_ns - pin_since) / 1'000'000ULL)
+					<< " goi_cursor=" << cursor
+					<< " durable_logical=" << durable_logical[static_cast<size_t>(owner)]
+					<< " need_cumulative=" << pin_needed_cumulative
+					<< " committed_seq=" << committed_seq
+					<< " (disk-replica tail stall; durable ACK waits on CV completed_logical)";
+			}
+		} else {
+			pin_since = 0;
 		}
-		if (durable_logical[owner] < entry->cumulative_message_count) {
-			break;
-		}
-		if (entry->client_id != 0 || entry->message_count > 0) {
-			per_client_durable_[static_cast<uint32_t>(entry->client_id)] += entry->message_count;
-			StageTrace::Record(
-				StageTrace::Stage::DurableFrontier,
-				entry->client_id,
-				order5_durable_next_goi_,
-				SteadyNowNs(),
-				per_client_durable_[static_cast<uint32_t>(entry->client_id)]);
-		}
-		++order5_durable_next_goi_;
 	}
 }
 
@@ -2459,9 +2499,8 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		}
 	}
 
-	// Calculate base addresses
-	const unsigned long long int segment_metadata =
-		reinterpret_cast<unsigned long long int>(current_segment_);
+	// Calculate message size for allocation. Segment base is re-read inside
+	// TryReserveBLogSpaceFailClosed to avoid stale segment_metadata races.
 	const size_t msg_size = batch_header.total_size;
 
 	// [[PERF FIX]] Ring gating check moved OUTSIDE mutex for ORDER=0.
@@ -2506,18 +2545,19 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 		}
 	}
 
-	// [[PERF Phase 1.1]] Lock-free BLog allocation: fetch_add is atomic; no mutex needed.
+	// [[PERF Phase 1.1]] Lock-free BLog allocation with fail-closed bounds.
+	// Never return a pointer past the mapped segment end (SIGSEGV under CXL exhaustion).
 	// PBR allocation is handled separately in ReservePBRSlotAfterRecv(); only log_addr_ is updated here.
-	// Design §3.1: wait-free broker; multi-threaded ingestion without mutex on hot path.
 	// [[P1.2]] When replication=0 no O_DIRECT pwrite; use cache-line alignment to reduce padding.
 	constexpr size_t kODirectAlign = 4096;
 	constexpr size_t kCacheLineAlign = 64;
 	size_t align = (replication_factor_ > 0) ? kODirectAlign : kCacheLineAlign;
 	size_t alloc_size = (msg_size + align - 1) & ~(align - 1);
-	log = reinterpret_cast<void*>(log_addr_.fetch_add(alloc_size));
-
-	// Check for segment boundary (advisory LOG(ERROR); does not need atomicity with allocation)
-	CheckSegmentBoundary(log, msg_size, segment_metadata);
+	log = TryReserveBLogSpaceFailClosed(alloc_size, /*epoch_already_checked=*/true);
+	if (log == nullptr) {
+		batch_header_location = nullptr;
+		return nullptr;
+	}
 
 	// [[DESIGN: PBR reserve after receive]] Do NOT generate metadata or write the BatchHeader here.
 	// NetworkManager reserves a PBR slot after recv(payload) and generates metadata once.
@@ -2526,6 +2566,31 @@ std::function<void(void*, size_t)> Topic::EmbarcaderoGetCXLBuffer(
 	batch_header_location = nullptr;
 
 	return nullptr;
+}
+
+bool Topic::IsIngestBatchAlreadySeen(uint32_t client_id, uint64_t batch_seq,
+		uint32_t session_epoch) const {
+	IngestDedupKey key{client_id, session_epoch, batch_seq};
+	absl::MutexLock lock(&ingest_dedup_mu_);
+	if (ingest_seen_.contains(key)) {
+		ingest_dedup_hits_.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	return false;
+}
+
+void Topic::MarkIngestBatchSeen(uint32_t client_id, uint64_t batch_seq,
+		uint32_t session_epoch) {
+	IngestDedupKey key{client_id, session_epoch, batch_seq};
+	absl::MutexLock lock(&ingest_dedup_mu_);
+	if (!ingest_seen_.insert(key).second) {
+		return;
+	}
+	ingest_seen_ring_.push_back(key);
+	while (ingest_seen_ring_.size() > kIngestDedupCap) {
+		ingest_seen_.erase(ingest_seen_ring_.front());
+		ingest_seen_ring_.pop_front();
+	}
 }
 
 // [[Issue #3]] Single epoch check per batch; call once at batch start, pass epoch_already_checked to ReserveBLogSpace/ReservePBRSlotAndWriteEntry.
@@ -2537,10 +2602,7 @@ bool Topic::CheckEpochOnce() {
 	return was_stale;
 }
 
-// [[RECV_DIRECT_TO_CXL]] Lock-free BLog allocation (~10ns).
-// [[PHASE_1A_EPOCH_FENCING]] Design §4.2.1: refuse writes if broker epoch is stale (zombie broker).
-// [[Issue #3]] When epoch_already_checked true, skip epoch check (caller did CheckEpochOnce at batch start).
-void* Topic::ReserveBLogSpace(size_t size, bool epoch_already_checked) {
+void* Topic::TryReserveBLogSpaceFailClosed(size_t size, bool epoch_already_checked) {
 	if (!epoch_already_checked) {
 		uint64_t n = epoch_check_counter_.fetch_add(1, std::memory_order_relaxed);
 		bool force_full_read = (n % kEpochCheckInterval == 0);
@@ -2548,17 +2610,41 @@ void* Topic::ReserveBLogSpace(size_t size, bool epoch_already_checked) {
 		if (was_stale) return nullptr;
 	}
 
-	const uintptr_t seg = reinterpret_cast<uintptr_t>(current_segment_);
-	const uintptr_t cur = log_addr_.load(std::memory_order_acquire);
-	if (seg != 0 && cur + size > seg + SEGMENT_SIZE) {
-		// Reserve-before-cross: seal and roll before allocating past the end.
-		CheckSegmentBoundary(reinterpret_cast<void*>(cur), size, seg);
+	for (int spin = 0; spin < 64; ++spin) {
+		void* seg_ptr = current_segment_;
+		const uintptr_t seg = reinterpret_cast<uintptr_t>(seg_ptr);
+		if (seg == 0) {
+			return nullptr;
+		}
+		unsigned long long cur = log_addr_.load(std::memory_order_acquire);
+		if (cur < seg) {
+			// Stale pairing of current_segment_ vs log_addr_; retry.
+			continue;
+		}
+		if (cur + size > seg + SEGMENT_SIZE) {
+			// Reserve-before-cross: roll before any past-end publish.
+			if (!CheckSegmentBoundary(reinterpret_cast<void*>(cur), size, seg)) {
+				return nullptr;
+			}
+			continue;
+		}
+		const unsigned long long next = cur + static_cast<unsigned long long>(size);
+		if (log_addr_.compare_exchange_weak(
+				cur, next,
+				std::memory_order_acq_rel,
+				std::memory_order_acquire)) {
+			MaybeGCRetiredSegments();
+			return reinterpret_cast<void*>(static_cast<uintptr_t>(cur));
+		}
 	}
-	void* log = reinterpret_cast<void*>(log_addr_.fetch_add(size));
-	const unsigned long long int segment_metadata = reinterpret_cast<unsigned long long int>(current_segment_);
-	CheckSegmentBoundary(log, size, segment_metadata);
-	MaybeGCRetiredSegments();
-	return log;
+	return nullptr;
+}
+
+// [[RECV_DIRECT_TO_CXL]] Lock-free BLog allocation (~10ns).
+// [[PHASE_1A_EPOCH_FENCING]] Design §4.2.1: refuse writes if broker epoch is stale (zombie broker).
+// [[Issue #3]] When epoch_already_checked true, skip epoch check (caller did CheckEpochOnce at batch start).
+void* Topic::ReserveBLogSpace(size_t size, bool epoch_already_checked) {
+	return TryReserveBLogSpaceFailClosed(size, epoch_already_checked);
 }
 
 void Topic::RefreshPBRConsumedThroughCache() {
@@ -2878,15 +2964,26 @@ bool Topic::PublishPBRSlotDirect(const BatchHeader& batch_header, BatchHeader* b
 bool Topic::PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader* batch_header_location) {
 	if (!batch_header_location) return false;
 
+	bool ok = false;
 	if (seq_type_ == EMBARCADERO && Embarcadero::UsesEpochSequencerPath(order_)) {
 		// ORDER=4/5 already tolerate out-of-arrival-order batches in the sequencer via hold/expiry
 		// hold/expiry logic. Delaying slot publication until pbr_absolute_index becomes contiguous
 		// can strand a large tail of fully received batches behind one missing index. Make each
 		// completed batch visible immediately and let the sequencer/CV path recover contiguity.
-		return PublishPBRSlotDirect(batch_header, batch_header_location);
+		ok = PublishPBRSlotDirect(batch_header, batch_header_location);
+	} else {
+		ok = PublishPBRSlotDirect(batch_header, batch_header_location);
 	}
-
-	return PublishPBRSlotDirect(batch_header, batch_header_location);
+	if (ok && seq_type_ == EMBARCADERO && order_ == Embarcadero::kOrderStrong) {
+		const uint32_t session_epoch =
+			batch_header.session_epoch32 != 0
+				? batch_header.session_epoch32
+				: static_cast<uint32_t>(batch_header.session_epoch);
+		MarkIngestBatchSeen(static_cast<uint32_t>(batch_header.client_id),
+		                    batch_header.batch_seq,
+		                    session_epoch);
+	}
+	return ok;
 }
 
 void Topic::ArmOrder5ForceExpiryWindow(uint64_t duration_ns) {
@@ -5569,7 +5666,10 @@ void Topic::EpochSequencerThread() {
 			last_idle_scanner_pushed_batches[b] = pushed;
 			last_idle_sequencer_committed_batches[b] = committed;
 		}
-		if (has_held_work && !force_expire_active && has_active_stalled_broker) {
+		if (has_held_work && has_active_stalled_broker) {
+			// Re-arm while any broker remains stalled so the force-expire fence
+			// clock stays live until held gaps resolve (B0/B1 progress must not
+			// let the window expire out from under B2/B3).
 			ArmOrder5ForceExpiryWindow(
 				GetOrder5IdleForceExpireWindowNs(replication_factor_ > 0));
 		}
@@ -6977,11 +7077,17 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 		}
 	}
 
-	// E/R-A: fence only when a per-session head gap outlives the session lease.
-	// Detector-driven force-expire windows are retained as tail-drain nudges, not as fence clocks.
+	// E/R-A: fence when a per-session head gap outlives the session lease.
+	// [[FORCE_EXPIRE_FENCE_CLOCK]] Detector-armed force-expire windows shorten the
+	// effective lease to 0 so stalled B2/B3 holds resolve via SESSION_FENCED rather
+	// than waiting the full lease after the idle stall detector already fired.
 	const uint64_t now_ns = SteadyNowNs();
 	shard.expired_hold_keys_buffer.clear();
 	const uint64_t session_lease_ns = GetSessionLeaseNs(replication_factor_ > 0);
+	const bool force_expire_active =
+		now_ns < force_expire_hold_until_ns_.load(std::memory_order_acquire);
+	const uint64_t effective_lease_ns =
+		EffectiveOrder5SessionFenceLeaseNs(session_lease_ns, force_expire_active);
 	for (size_t session_key : shard.clients_with_held_batches) {
 		auto map_it = shard.hold_buffer.find(session_key);
 		if (map_it == shard.hold_buffer.end() || map_it->second.empty()) continue;
@@ -7001,7 +7107,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			continue;
 		}
 		state.note_gap(now_ns);
-		if (ShouldFenceSessionGap(state, now_ns, session_lease_ns)) {
+		if (ShouldFenceSessionGap(state, now_ns, effective_lease_ns)) {
 			shard.expired_hold_keys_buffer.emplace_back(session_key, state.next_expected);
 		}
 	}
@@ -7016,7 +7122,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			static_cast<uint64_t>(session_key),
 			missing_seq,
 			shard.hold_buffer_size,
-			session_lease_ns);
+			effective_lease_ns);
 		record_fence(session_key, state);
 	}
 

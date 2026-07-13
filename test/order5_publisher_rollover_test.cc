@@ -22,6 +22,14 @@ struct PublisherTestPeer {
 		ASSERT_TRUE(publisher.pubQue_.AddBuffers(0));
 	}
 
+	static void SetAckLevel(Publisher& publisher, int ack_level) {
+		publisher.ack_level_ = ack_level;
+	}
+
+	static void ReleasePoolBatch(Publisher& publisher, Embarcadero::BatchHeader* batch) {
+		publisher.pubQue_.ReleaseBatch(batch);
+	}
+
 	static Embarcadero::BatchHeader* SealOneBatch(Publisher& publisher,
 	                                              uint32_t epoch,
 	                                              uint64_t batch_seq,
@@ -46,16 +54,36 @@ struct PublisherTestPeer {
 	}
 
 	static bool Record(Publisher& publisher, Embarcadero::BatchHeader* batch) {
-		return publisher.RecordUnackedBatch(*batch, batch, batch->total_size, 0, 0);
+		const size_t wire_bytes = sizeof(Embarcadero::BatchHeader) + batch->total_size;
+		return publisher.RecordUnackedBatch(*batch, batch, wire_bytes, 0, 0);
 	}
 
 	static void Fence(Publisher& publisher, uint64_t committed_batch_seq) {
 		embarcadero::session::SessionFenced fenced;
 		fenced.set_committed_batch_seq(committed_batch_seq);
+		fenced.set_has_committed_prefix(true);
 		fenced.set_committed_msg_hwm(0);
 		fenced.set_control_epoch(2);
 		fenced.set_reason(embarcadero::session::SessionFenced::HOLD_EXPIRY);
 		publisher.HandleSessionFenced(fenced, 0);
+	}
+
+	static size_t UnackedOwnedCopies(Publisher& publisher) {
+		std::lock_guard<std::mutex> lock(publisher.unacked_mu_);
+		size_t n = 0;
+		for (const auto& rec : publisher.unacked_batches_) {
+			if (!rec.wire.empty()) ++n;
+		}
+		return n;
+	}
+
+	static size_t UnackedPoolPins(Publisher& publisher) {
+		std::lock_guard<std::mutex> lock(publisher.unacked_mu_);
+		size_t n = 0;
+		for (const auto& rec : publisher.unacked_batches_) {
+			if (rec.pool_batch != nullptr) ++n;
+		}
+		return n;
 	}
 
 	static void Complete(Publisher& publisher, size_t session_global_ack) {
@@ -226,6 +254,73 @@ TEST(Order5PublisherRolloverTest, PublisherFenceAndRetireUseProductionState) {
 	PublisherTestPeer::Complete(publisher, committed_msgs + next->num_msg);
 	EXPECT_EQ(PublisherTestPeer::UnackedBatches(publisher), 0u);
 	publisher.WriteFinishedOrPaused();
+}
+
+TEST(Order5PublisherRolloverTest, Ack2RecordsOwnedCopyWithoutPoolPin) {
+	setenv("EMBAR_USE_HUGETLB", "0", 1);
+	setenv("NUM_BROKERS", "1", 1);
+	unsetenv("EMBARCADERO_CHAIN_REPLICATION_SINK");
+	unsetenv("EMBARCADERO_CHAIN_REPLICATION_INMEM");
+	setenv("EMBARCADERO_ACK2_RETENTION", "owned_rto_copy", 1);
+	char topic[TOPIC_NAME_SIZE] = {};
+	std::strncpy(topic, "TestTopicAck2", sizeof(topic) - 1);
+	Publisher publisher(topic,
+	                    "127.0.0.1",
+	                    "1212",
+	                    /*num_threads_per_broker=*/1,
+	                    /*message_size=*/64,
+	                    /*queueSize=*/1 << 20,
+	                    Embarcadero::kOrderStrong,
+	                    heartbeat_system::SequencerType::EMBARCADERO);
+	PublisherTestPeer::ConfigureOrder5Session(publisher, 1);
+	PublisherTestPeer::SetAckLevel(publisher, 2);
+
+	auto* batch = PublisherTestPeer::SealOneBatch(publisher, 1, 0, 4);
+	ASSERT_NE(batch, nullptr);
+	const size_t num_msg = batch->num_msg;
+	const bool owns_pool = PublisherTestPeer::Record(publisher, batch);
+	EXPECT_FALSE(owns_pool);
+	EXPECT_EQ(PublisherTestPeer::UnackedBatches(publisher), 1u);
+	EXPECT_EQ(PublisherTestPeer::UnackedOwnedCopies(publisher), 1u);
+	EXPECT_EQ(PublisherTestPeer::UnackedPoolPins(publisher), 0u);
+	// Caller releases the send slot immediately under disk ACK2.
+	PublisherTestPeer::ReleasePoolBatch(publisher, batch);
+	PublisherTestPeer::Complete(publisher, num_msg);
+	EXPECT_EQ(PublisherTestPeer::UnackedBatches(publisher), 0u);
+	publisher.WriteFinishedOrPaused();
+	unsetenv("EMBARCADERO_ACK2_RETENTION");
+}
+
+TEST(Order5PublisherRolloverTest, Ack2MemorySinkPinsPoolWithoutOwnedCopy) {
+	setenv("EMBAR_USE_HUGETLB", "0", 1);
+	setenv("NUM_BROKERS", "1", 1);
+	setenv("EMBARCADERO_CHAIN_REPLICATION_SINK", "memory-copy", 1);
+	unsetenv("EMBARCADERO_ACK2_RETENTION");
+	char topic[TOPIC_NAME_SIZE] = {};
+	std::strncpy(topic, "TestTopicAck2Mem", sizeof(topic) - 1);
+	Publisher publisher(topic,
+	                    "127.0.0.1",
+	                    "1212",
+	                    /*num_threads_per_broker=*/1,
+	                    /*message_size=*/64,
+	                    /*queueSize=*/1 << 20,
+	                    Embarcadero::kOrderStrong,
+	                    heartbeat_system::SequencerType::EMBARCADERO);
+	PublisherTestPeer::ConfigureOrder5Session(publisher, 1);
+	PublisherTestPeer::SetAckLevel(publisher, 2);
+
+	auto* batch = PublisherTestPeer::SealOneBatch(publisher, 1, 0, 4);
+	ASSERT_NE(batch, nullptr);
+	const size_t num_msg = batch->num_msg;
+	const bool owns_pool = PublisherTestPeer::Record(publisher, batch);
+	EXPECT_TRUE(owns_pool);
+	EXPECT_EQ(PublisherTestPeer::UnackedBatches(publisher), 1u);
+	EXPECT_EQ(PublisherTestPeer::UnackedOwnedCopies(publisher), 0u);
+	EXPECT_EQ(PublisherTestPeer::UnackedPoolPins(publisher), 1u);
+	PublisherTestPeer::Complete(publisher, num_msg);
+	EXPECT_EQ(PublisherTestPeer::UnackedBatches(publisher), 0u);
+	publisher.WriteFinishedOrPaused();
+	unsetenv("EMBARCADERO_CHAIN_REPLICATION_SINK");
 }
 
 }  // namespace

@@ -45,6 +45,9 @@ struct ChainReplicationConfig {
 //   EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable|memory-copy|memory-accounting
 // Sync thresholds:
 //   EMBARCADERO_CHAIN_SYNC_BYTES / EMBARCADERO_CHAIN_SYNC_INTERVAL_MS
+//   (defaults: 256 MiB / 250 ms)
+// Disk striping:
+//   EMBARCADERO_REPLICA_DISK_DIRS + optional EMBARCADERO_REPLICA_DISK_WEIGHTS
 ChainReplicationConfig ParseChainReplicationConfig();
 
 const char* ChainReplicationSinkModeName(ChainReplicationSinkMode mode);

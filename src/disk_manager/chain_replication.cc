@@ -28,11 +28,13 @@ namespace {
 
 constexpr uint64_t kNoProgress = static_cast<uint64_t>(-1);
 constexpr size_t kDefaultInMemSinkBytesPerSource = 256UL * 1024UL * 1024UL;
-constexpr size_t kDefaultChainSyncBytes = 64UL * 1024UL * 1024UL;
+// Prefer larger sync batches so fdatasync amortizes over more media bandwidth.
+constexpr size_t kDefaultChainSyncBytes = 256UL * 1024UL * 1024UL;
 constexpr uint64_t kDefaultChainSyncIntervalNs = 250ULL * 1000ULL * 1000ULL;
 constexpr size_t kMaxPendingTokenUpdates = 8192;
-constexpr uint64_t kMinWaitPollBackoffNs = 1'000;
-constexpr uint64_t kMaxWaitPollBackoffNs = 64'000;
+constexpr uint64_t kTokenSpinBeforeYield = 4096;
+constexpr uint64_t kTokenSpinBeforeSleep = 65536;
+constexpr uint64_t kTokenWaitSleepNs = 1'000;
 constexpr uint64_t kControlRefreshIntervalEntries = 256;
 constexpr uint64_t kStatsLogIntervalNs = 1'000'000'000ULL;  // 1s
 
@@ -302,12 +304,34 @@ void ChainReplicationManager::ReplicationThread() {
     std::array<std::unique_ptr<SourcePipeline>, NUM_MAX_BROKERS> pipelines{};
     std::vector<int> active_sources;
     active_sources.reserve(static_cast<size_t>(std::max(0, num_brokers_)));
-
     for (int src = 0; src < num_brokers_; ++src) {
         const int role =
             Embarcadero::GetReplicationChainRole(local_broker_id_, src, replication_factor_,
                                                  num_brokers_);
-        if (role < 0) continue;
+        if (role >= 0) active_sources.push_back(src);
+    }
+
+    std::vector<size_t> disk_assign;
+    std::vector<uint64_t> disk_weights;
+    if (!in_memory_sink && !disk_dirs_.empty()) {
+        disk_weights = ResolveReplicationDiskWeights(disk_dirs_.size());
+        disk_assign =
+            AssignSourcesToReplicationDisks(active_sources, disk_dirs_.size(), disk_weights);
+        std::ostringstream weight_ss;
+        for (size_t i = 0; i < disk_weights.size(); ++i) {
+            if (i) weight_ss << ',';
+            weight_ss << disk_weights[i];
+        }
+        LOG(INFO) << "ChainReplicationManager: capacity-aware disk striping dirs="
+                  << disk_dirs_.size() << " weights=" << weight_ss.str()
+                  << " active_sources=" << active_sources.size();
+    }
+
+    for (size_t ai = 0; ai < active_sources.size(); ++ai) {
+        const int src = active_sources[ai];
+        const int role =
+            Embarcadero::GetReplicationChainRole(local_broker_id_, src, replication_factor_,
+                                                 num_brokers_);
 
         auto pipe = std::make_unique<SourcePipeline>();
         pipe->source_broker = src;
@@ -322,7 +346,10 @@ void ChainReplicationManager::ReplicationThread() {
                 pipe->mem_ring.resize(config_.inmem_bytes_per_source);
             }
         } else {
-            const std::string& dir = disk_dirs_[static_cast<size_t>(src) % disk_dirs_.size()];
+            const size_t disk_i =
+                (ai < disk_assign.size()) ? disk_assign[ai]
+                                          : (static_cast<size_t>(src) % disk_dirs_.size());
+            const std::string& dir = disk_dirs_[disk_i];
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
             pipe->path = dir + "/replica_b" + std::to_string(local_broker_id_) + "_src" +
@@ -333,12 +360,17 @@ void ChainReplicationManager::ReplicationThread() {
                            << " error: " << strerror(errno)
                            << " (ACK2 fail-closed: no /tmp fallback)";
             }
+            LOG(INFO) << "ChainReplicationManager: source=" << src << " role=" << role
+                      << " disk_idx=" << disk_i << " weight="
+                      << ((disk_i < disk_weights.size()) ? disk_weights[disk_i] : 1) << " -> "
+                      << pipe->path;
         }
 
-        LOG(INFO) << "ChainReplicationManager: source=" << src << " role=" << role << " -> "
-                  << pipe->path;
+        if (in_memory_sink) {
+            LOG(INFO) << "ChainReplicationManager: source=" << src << " role=" << role << " -> "
+                      << pipe->path;
+        }
         pipelines[static_cast<size_t>(src)] = std::move(pipe);
-        active_sources.push_back(src);
     }
 
     auto enqueue_token = [](SourcePipeline* pipe, PendingTokenUpdate task) {
@@ -543,7 +575,6 @@ void ChainReplicationManager::ReplicationThread() {
     for (int src : active_sources) {
         SourcePipeline* pipe = pipelines[static_cast<size_t>(src)].get();
         pipe->token_thread = std::thread([&, pipe]() {
-            uint64_t wait_backoff_ns = kMinWaitPollBackoffNs;
             uint64_t stall_log_deadline_ns = 0;
             while (true) {
                 PendingTokenUpdate task;
@@ -565,6 +596,7 @@ void ChainReplicationManager::ReplicationThread() {
                 const uint64_t wait_start = SteadyNowNs();
                 bool completed = false;
                 bool wait_recorded = false;
+                uint64_t wait_spins = 0;
                 while (!completed) {
                     RefreshGOIToken(entry);
                     uint32_t token = entry->num_replicated.load(std::memory_order_acquire);
@@ -592,15 +624,24 @@ void ChainReplicationManager::ReplicationThread() {
                                 stall_log_deadline_ns = now + 250'000'000ULL;
                             }
                         }
-                        std::this_thread::sleep_for(std::chrono::nanoseconds(wait_backoff_ns));
-                        wait_backoff_ns = std::min(wait_backoff_ns << 1, kMaxWaitPollBackoffNs);
+                        // Spin/pause on the hot path; only sleep after a long stall so
+                        // predecessor token advances are not delayed by 64µs backoff.
+                        ++wait_spins;
+                        if (wait_spins < kTokenSpinBeforeYield) {
+                            CXL::cpu_pause();
+                        } else if (wait_spins < kTokenSpinBeforeSleep) {
+                            for (int i = 0; i < 32; ++i) CXL::cpu_pause();
+                            std::this_thread::yield();
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::nanoseconds(kTokenWaitSleepNs));
+                        }
                         continue;
                     }
                     if (!wait_recorded) {
                         pipe->stats.token_wait_ns.fetch_add(SteadyNowNs() - wait_start,
                                                            std::memory_order_relaxed);
                         wait_recorded = true;
-                        wait_backoff_ns = kMinWaitPollBackoffNs;
+                        wait_spins = 0;
                     }
 
                     if (token == task.role) {

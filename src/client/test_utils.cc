@@ -989,10 +989,10 @@ size_t CalculateOptimalQueueSize(size_t num_threads_per_broker, size_t total_mes
 
 	// Pipeline budget: 256MB × threads × brokers (historical buffer-optimization
 	// sweet spot). Do NOT inflate to dataset size — that forced multi-tens-of-GB
-	// hugepage mmaps and Init timeouts. QueueBuffer::AddBuffers also caps via
-	// EMBARCADERO_QUEUE_POOL_MAX_BYTES (~12 GiB / unacked window).
+	// hugepage mmaps and Init timeouts. QueueBuffer::AddBuffers caps via
+	// EMBARCADERO_QUEUE_POOL_MAX_BYTES (send-pipeline only; ACK credit is separate).
 	constexpr size_t kPerThreadBytes = 256ULL * 1024 * 1024;
-	constexpr size_t kMaxHintBytes = 12ULL * 1024 * 1024 * 1024;
+	constexpr size_t kMaxHintBytes = 4ULL * 1024 * 1024 * 1024;
 	const size_t num_brokers = config.config().broker.max_brokers.get();
 	const size_t total_buffer_size =
 		num_threads_per_broker * num_brokers * kPerThreadBytes;

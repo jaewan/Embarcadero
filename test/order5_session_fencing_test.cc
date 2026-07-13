@@ -18,6 +18,7 @@ using Embarcadero::SessionKeyFor;
 using Embarcadero::ShouldRejectOrder5SpatialGuard;
 using Embarcadero::ShouldClearSessionGapFromHeldMax;
 using Embarcadero::ShouldFenceSessionGap;
+using Embarcadero::EffectiveOrder5SessionFenceLeaseNs;
 using Embarcadero::ShouldTerminalFenceAckRelay;
 using Embarcadero::ShouldWithholdAckRelay;
 
@@ -55,6 +56,19 @@ TEST(Order5SessionFencingTest, EpochZeroTargetedScannerSkipAdvancesLegacyFrontie
 	EXPECT_FALSE(state.fenced);
 	EXPECT_EQ(state.next_expected, scanner_skip_seq + 1);
 	EXPECT_TRUE(skip_marker_ready_pushed);
+}
+
+TEST(Order5SessionFencingTest, ForceExpireShortensEffectiveFenceLease) {
+	EXPECT_EQ(EffectiveOrder5SessionFenceLeaseNs(2'000'000'000ULL, false), 2'000'000'000ULL);
+	EXPECT_EQ(EffectiveOrder5SessionFenceLeaseNs(2'000'000'000ULL, true), 0u);
+
+	OptimizedClientState state;
+	state.session_epoch = 3;
+	state.next_expected = 5;
+	state.note_gap(1'000);
+	EXPECT_FALSE(ShouldFenceSessionGap(state, 1'500, 2'000'000'000ULL));
+	EXPECT_TRUE(ShouldFenceSessionGap(
+		state, 1'500, EffectiveOrder5SessionFenceLeaseNs(2'000'000'000ULL, true)));
 }
 
 TEST(Order5SessionFencingTest, NonzeroSessionFenceFiresOnce) {

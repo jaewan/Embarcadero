@@ -47,14 +47,17 @@ public:
 
 	/**
 	 * Allocate batch buffer pool (hugepage-backed via mmap_large_buffer).
-	 * Sized for steady-state pipeline depth (queues × ~32 slots), capped at the
-	 * session unacked window (~12GB default; EMBARCADERO_QUEUE_POOL_MAX_BYTES
-	 * overrides). Caller hints larger than the cap are clamped — pool exhaustion
-	 * backpressures Write(). Idempotent.
+	 * Sized for steady-state send-pipeline depth (queues × ~32 slots), capped by
+	 * EMBARCADERO_QUEUE_POOL_MAX_BYTES. Disk ACK2 keeps owned RTO copies so the
+	 * pool tracks send depth only; memory-emulated ACK2 / ACK1 may pin slots
+	 * until ACK and must bound unacked credit by PoolBytes(). Idempotent.
 	 * @param buf_size Size hint from caller (bytes)
 	 * @return true on success
 	 */
 	bool AddBuffers(size_t buf_size);
+
+	/** Allocated hugepage pool size in bytes (0 before AddBuffers). */
+	size_t PoolBytes() const { return pool_slots_ * slot_size_; }
 
 	/**
 	 * Append one message to current batch; round-robins by write_buf_id_. Seals batch when >= BATCH_SIZE.
@@ -165,12 +168,14 @@ private:
 	std::unique_ptr<std::atomic<bool>[]> queue_preferred_;
 	std::atomic<size_t> preferred_queue_count_{0};
 	// Per-queue SPSC ring depth (queue fullness backpressure). Batch *pool* depth is
-	// separate: AddBuffers sizes pools as queues×~32 slots, capped at the unacked
-	// window (~12 GiB / EMBARCADERO_QUEUE_POOL_MAX_BYTES) — not queues×kQueueCapacity.
+	// send-pipeline only (queues×~32 slots); ACK/RTO credit is a separate Publisher
+	// bound and must not pin hugepage slots.
 	static constexpr size_t kQueueCapacity = 1024;
 
 	// Batch buffer pool (MPMC: producer acquires, consumers release via ReleaseBatch)
 	std::unique_ptr<folly::MPMCQueue<Embarcadero::BatchHeader*>> pool_;
+	std::mutex pool_mu_;
+	std::condition_variable pool_cv_;
 	std::vector<std::pair<void*, size_t>> batch_buffers_region_;  // (base, size) for munmap
 	size_t slot_size_{0};   // sizeof(BatchHeader) + batch_size_cached_, 64B aligned
 	size_t pool_slots_{0};

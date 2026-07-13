@@ -206,6 +206,14 @@ class Publisher {
 	// [[PERF]] Cache-line separate from producer-hot data so consumers don't bounce cache lines
 	alignas(64) std::atomic<bool> shutdown_{false};
 	std::atomic<bool> publish_finished_{false};
+	// True only while WaitUntilAllAcknowledged / Poll ACK drain is active.
+	// RetransmitThread must not RTO-storm during durable ACK2 wait.
+	// Also armed at publish_finished_ for ACK2 so fence/RTO windows during
+	// queue-drain/join are covered.
+	std::atomic<bool> ack_drain_active_{false};
+	// Last fence HWM credited during ACK2 drain; identical restates must not
+	// reopen/resubmit storms, but a newer HWM with remaining suffix may resubmit.
+	std::atomic<uint64_t> last_ack_drain_fence_hwm_{UINT64_MAX};
 	// Set true by Poll() and destructor; PublishThread checks only this (one load) when queue empty.
 	std::atomic<bool> consumer_should_exit_{false};
 	char pad_consumer_exit_[64 - 3 * sizeof(std::atomic<bool>)];  // pad to next cache line
@@ -313,8 +321,29 @@ class Publisher {
 				size_t broker_ack_end{0};
 				uint32_t attempt{0};
 				int64_t last_send_ns{0};
-				Embarcadero::BatchHeader* batch{nullptr};
+				// Disk ACK2: owned RTO/fence copy (wire non-empty). ACK1 and
+				// memory-emulated ACK2: pin pool_batch until ACK (credit capped
+				// to pool bytes so durable/emulated latency cannot hang the pool).
+				std::vector<uint8_t> wire;
+				Embarcadero::BatchHeader* pool_batch{nullptr};
 				size_t wire_bytes{0};
+
+				Embarcadero::BatchHeader* Header() {
+					if (!wire.empty()) {
+						return reinterpret_cast<Embarcadero::BatchHeader*>(wire.data());
+					}
+					return pool_batch;
+				}
+				const Embarcadero::BatchHeader* Header() const {
+					if (!wire.empty()) {
+						return reinterpret_cast<const Embarcadero::BatchHeader*>(wire.data());
+					}
+					return pool_batch;
+				}
+				const void* WireBytes() const {
+					if (!wire.empty()) return wire.data();
+					return pool_batch;
+				}
 			};
 
 			std::atomic<uint32_t> session_epoch_{0};
@@ -341,12 +370,18 @@ class Publisher {
 			bool IsOrder5SessionMode() const;
 			uint32_t InitialSessionEpochRequest() const;
 			uint64_t SessionLeaseNs() const;
+			bool IsMemoryEmulatedAck2() const;
+			bool Ack2UsesOwnedRtoCopy() const;
 			size_t ComputeUnackedByteCap() const;
+			void ApplyUnackedByteCapBounds();
 			bool SendSessionOpenOnSocket(int sock_fd, int epoll_fd, size_t broker_id);
 			bool SendRawBatchToBroker(const void* bytes, size_t wire_bytes, int broker_id);
 			bool EnsureRetransmitChannel(int broker_id, int* out_fd);
 			void CloseRetransmitChannel(int broker_id);
 			void WaitForUnackedCapacity(size_t bytes);
+			// Returns true iff the caller must NOT ReleaseBatch yet (pool pin).
+			// Disk ACK2 uses owned RTO copy (returns false); memory-emulated ACK2
+			// and ACK1 pin the pool slot until ACK (returns true).
 			bool RecordUnackedBatch(const Embarcadero::BatchHeader& header,
 			                        const void* batch_bytes,
 			                        size_t wire_bytes,

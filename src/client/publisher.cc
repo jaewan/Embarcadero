@@ -538,9 +538,63 @@ uint64_t Publisher::SessionLeaseNs() const {
 	return (replicated ? 2000ULL : 1000ULL) * 1000ULL * 1000ULL;
 }
 
+bool Publisher::IsMemoryEmulatedAck2() const {
+	if (ack_level_ < 2) return false;
+	if (const char* sink = std::getenv("EMBARCADERO_CHAIN_REPLICATION_SINK")) {
+		if (std::strcmp(sink, "memory-copy") == 0 ||
+		    std::strcmp(sink, "memory_copy") == 0 ||
+		    std::strcmp(sink, "memory-accounting") == 0 ||
+		    std::strcmp(sink, "memory_accounting") == 0 ||
+		    std::strcmp(sink, "accounting") == 0 ||
+		    std::strcmp(sink, "copy") == 0) {
+			return true;
+		}
+		if (std::strcmp(sink, "disk-durable") == 0 || std::strcmp(sink, "disk") == 0) {
+			return false;
+		}
+	}
+	if (const char* inmem = std::getenv("EMBARCADERO_CHAIN_REPLICATION_INMEM")) {
+		if (inmem[0] == '1' || inmem[0] == 'y' || inmem[0] == 'Y') {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool Publisher::Ack2UsesOwnedRtoCopy() const {
+	if (ack_level_ < 2) return false;
+	if (const char* retention = std::getenv("EMBARCADERO_ACK2_RETENTION")) {
+		if (std::strcmp(retention, "owned_rto_copy") == 0 ||
+		    std::strcmp(retention, "owned") == 0) {
+			return true;
+		}
+		if (std::strcmp(retention, "pool_pin") == 0 ||
+		    std::strcmp(retention, "pin") == 0) {
+			return false;
+		}
+	}
+	// Disk-durable ACK2 keeps an owned RTO copy so slow fdatasync cannot pin the
+	// hugepage send pool. Memory-emulated ACK2 pins like ACK1 (credit capped).
+	return !IsMemoryEmulatedAck2();
+}
+
 size_t Publisher::ComputeUnackedByteCap() const {
 	const uint64_t lease_ns = SessionLeaseNs();
-	uint64_t offered_rate = 12ULL * 1024ULL * 1024ULL * 1024ULL;
+	// ACK-class offered rates: ACK1 / memory-emulated ACK2 track CXL/GOI BDP;
+	// disk ACK2 tracks media-durable BDP so credit cannot outrun fdatasync.
+	const bool memory_ack2 = IsMemoryEmulatedAck2();
+	uint64_t offered_rate = (ack_level_ >= 2 && !memory_ack2)
+		? (1ULL * 1024ULL * 1024ULL * 1024ULL)   // 1 GiB/s durable default
+		: (12ULL * 1024ULL * 1024ULL * 1024ULL); // 12 GiB/s CXL / mem-ACK2 default
+	if (ack_level_ >= 2) {
+		if (const char* env = std::getenv("EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC")) {
+			char* end = nullptr;
+			unsigned long long parsed = std::strtoull(env, &end, 10);
+			if (end != env && *end == '\0' && parsed > 0) {
+				offered_rate = parsed;
+			}
+		}
+	}
 	if (const char* env = std::getenv("EMBARCADERO_OFFERED_RATE_BYTES_PER_SEC")) {
 		char* end = nullptr;
 		unsigned long long parsed = std::strtoull(env, &end, 10);
@@ -552,6 +606,22 @@ size_t Publisher::ComputeUnackedByteCap() const {
 	                        static_cast<long double>(lease_ns) / 1.0e9L;
 	const long double max_size = static_cast<long double>(std::numeric_limits<size_t>::max());
 	return static_cast<size_t>(std::max<long double>(BATCH_SIZE, std::min(cap, max_size)));
+}
+
+void Publisher::ApplyUnackedByteCapBounds() {
+	unacked_byte_cap_ = ComputeUnackedByteCap();
+	// Only memory-emulated ACK2 pool-pin needs credit ≤ pool (minus seal reserve).
+	// ACK1 also pool-pins, but must keep BDP-sized credit: blocking pool acquire
+	// already backpressures. Capping ACK1 to ~pool bytes caused N=3 session-fence
+	// stalls in AcquireNextBatchFromPool (seen 20260713T175917Z n3 trial3).
+	if (IsMemoryEmulatedAck2() && !Ack2UsesOwnedRtoCopy()) {
+		const size_t pool_bytes = pubQue_.PoolBytes();
+		if (pool_bytes > 0) {
+			const size_t reserve = std::min(pool_bytes / 8, 64UL * 1024UL * 1024UL);
+			const size_t pin_cap = std::max<size_t>(BATCH_SIZE, pool_bytes - reserve);
+			unacked_byte_cap_ = std::min(unacked_byte_cap_, pin_cap);
+		}
+	}
 }
 
 bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
@@ -643,8 +713,8 @@ bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
 			std::lock_guard<std::mutex> lock(unacked_mu_);
 			for (auto it = unacked_batches_.begin(); it != unacked_batches_.end();) {
 				if (it->original_batch_seq <= ack.committed_hwm()) {
-					if (it->batch != nullptr) {
-						release_after_unlock.push_back(it->batch);
+					if (it->pool_batch != nullptr) {
+						release_after_unlock.push_back(it->pool_batch);
 					}
 					unacked_bytes_ -= it->wire_bytes;
 					it = unacked_batches_.erase(it);
@@ -676,6 +746,7 @@ bool Publisher::RecordUnackedBatch(const Embarcadero::BatchHeader& header,
                                    int broker_id,
                                    size_t) {
 	if (!IsOrder5SessionMode() || ack_level_ < 1 || header.session_epoch32 == 0) return false;
+	if (batch_bytes == nullptr || wire_bytes < sizeof(Embarcadero::BatchHeader)) return false;
 	Embarcadero::StageTrace::Record(
 		Embarcadero::StageTrace::Stage::ClientSendDone,
 		client_id_,
@@ -690,20 +761,23 @@ bool Publisher::RecordUnackedBatch(const Embarcadero::BatchHeader& header,
 	rec.broker_id = broker_id;
 	rec.last_send_ns = SteadyNowNs();
 	last_unacked_send_ns_.store(rec.last_send_ns, std::memory_order_release);
-	rec.batch = const_cast<Embarcadero::BatchHeader*>(
-		static_cast<const Embarcadero::BatchHeader*>(batch_bytes));
 	rec.wire_bytes = wire_bytes;
+	// Disk ACK2: own an RTO copy and release the hugepage send slot immediately
+	// so durable latency cannot exhaust the send pool.
+	// ACK1 / memory-emulated ACK2: pin the pool slot until ACK (credit capped to
+	// pool/2) to avoid a line-rate DRAM memcpy on the fast path.
+	const bool owned_rto_copy = Ack2UsesOwnedRtoCopy();
+	if (owned_rto_copy) {
+		const auto* bytes = static_cast<const uint8_t*>(batch_bytes);
+		rec.wire.assign(bytes, bytes + wire_bytes);
+	} else {
+		rec.pool_batch = const_cast<Embarcadero::BatchHeader*>(
+			static_cast<const Embarcadero::BatchHeader*>(batch_bytes));
+	}
 	std::lock_guard<std::mutex> lock(unacked_mu_);
 	session_sent_hwm_ += rec.num_msg;
 	rec.broker_ack_end = std::numeric_limits<size_t>::max();
 	unacked_bytes_ += rec.wire_bytes;
-	// Keep unacked_batches_ sorted ascending by current_batch_seq so
-	// CompleteUnackedThrough can retire the in-order prefix from the front.
-	// Batches are recorded in send order, so the new key is >= the existing
-	// max in the common case (push_back); fall back to an ordered insert
-	// otherwise. This replaces an O(n log n) re-sort of the whole deque on
-	// every batch send with an O(n) ordered insert (O(1) in the common case),
-	// preserving the identical ordering invariant.
 	if (unacked_batches_.empty() ||
 	    rec.current_batch_seq >= unacked_batches_.back().current_batch_seq) {
 		unacked_batches_.push_back(std::move(rec));
@@ -715,7 +789,7 @@ bool Publisher::RecordUnackedBatch(const Embarcadero::BatchHeader& header,
 			});
 		unacked_batches_.insert(it, std::move(rec));
 	}
-	return true;
+	return !owned_rto_copy;
 }
 
 void Publisher::CompleteUnackedThrough(int, size_t broker_ack_hwm) {
@@ -745,8 +819,8 @@ void Publisher::CompleteUnackedThrough(int, size_t broker_ack_hwm) {
 			session_retire_prefix_hwm_ = candidate_hwm;
 			session_next_retire_batch_seq_++;
 			unacked_bytes_ -= it->wire_bytes;
-			if (it->batch != nullptr) {
-				release_after_unlock.push_back(it->batch);
+			if (it->pool_batch != nullptr) {
+				release_after_unlock.push_back(it->pool_batch);
 			}
 			it = unacked_batches_.erase(it);
 			unacked_cv_.notify_all();
@@ -874,6 +948,68 @@ void Publisher::WaitForSessionSendDrain(size_t target_messages) {
 
 void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& fenced, int broker_id) {
 	if (!IsOrder5SessionMode()) return;
+
+	// During ACK2 durable drain, identical lease restates of a frozen committed
+	// prefix must not reopen/resubmit (that re-burns BLog before ingest dedup).
+	// A newer HWM with remaining unacked suffix still falls through to reopen so
+	// held/purged batches can complete after force-expire fencing.
+	if (publish_finished_.load(std::memory_order_acquire) && ack_level_ >= 2 &&
+	    ack_drain_active_.load(std::memory_order_acquire) &&
+	    fenced.has_committed_prefix()) {
+		const uint64_t release_hwm = fenced.committed_batch_seq();
+		std::vector<Embarcadero::BatchHeader*> release_after_unlock;
+		size_t locally_committed_msgs = 0;
+		size_t remaining_suffix = 0;
+		{
+			std::lock_guard<std::mutex> lock(unacked_mu_);
+			for (auto it = unacked_batches_.begin(); it != unacked_batches_.end();) {
+				if (it->original_batch_seq <= release_hwm) {
+					locally_committed_msgs += it->num_msg;
+					unacked_bytes_ -= it->wire_bytes;
+					if (it->pool_batch != nullptr) {
+						release_after_unlock.push_back(it->pool_batch);
+					}
+					it = unacked_batches_.erase(it);
+				} else {
+					++remaining_suffix;
+					++it;
+				}
+			}
+			if (locally_committed_msgs > 0) {
+				unacked_cv_.notify_all();
+			}
+		}
+		for (auto* batch : release_after_unlock) {
+			pubQue_.ReleaseBatch(batch);
+		}
+		if (locally_committed_msgs > 0) {
+			broker_stats_[0].acked_messages.fetch_add(locally_committed_msgs, std::memory_order_relaxed);
+			ack_received_.fetch_add(locally_committed_msgs, std::memory_order_release);
+			last_ack_progress_ns_.store(SteadyNowNs(), std::memory_order_release);
+			LOG(WARNING) << "[SESSION_FENCE_ACK_DRAIN_CREDIT]"
+			             << " broker_id=" << broker_id
+			             << " committed_batch_seq=" << release_hwm
+			             << " credited_msgs=" << locally_committed_msgs
+			             << " remaining_suffix=" << remaining_suffix;
+		}
+		const uint64_t prev_hwm =
+			last_ack_drain_fence_hwm_.load(std::memory_order_acquire);
+		if (remaining_suffix == 0 || release_hwm == prev_hwm) {
+			VLOG(1) << "[SESSION_FENCE_SUPPRESSED_DURING_ACK_DRAIN]"
+			        << " broker_id=" << broker_id
+			        << " committed_batch_seq=" << release_hwm
+			        << " remaining_suffix=" << remaining_suffix
+			        << " same_hwm=" << (release_hwm == prev_hwm ? 1 : 0);
+			return;
+		}
+		last_ack_drain_fence_hwm_.store(release_hwm, std::memory_order_release);
+		LOG(WARNING) << "[SESSION_FENCE_ACK_DRAIN_RESUBMIT]"
+		             << " broker_id=" << broker_id
+		             << " committed_batch_seq=" << release_hwm
+		             << " remaining_suffix=" << remaining_suffix;
+		// Fall through to reopen + suffix resubmit.
+	}
+
 	const uint32_t old_epoch = session_epoch_.load(std::memory_order_acquire);
 	const uint32_t new_epoch = NextSessionEpochAfterFence(old_epoch);
 	session_fenced_observed_.fetch_add(1, std::memory_order_relaxed);
@@ -909,15 +1045,15 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 	const size_t ack_base_before_local_credit = ack_received_.load(std::memory_order_acquire);
 	{
 		std::lock_guard<std::mutex> lock(unacked_mu_);
-		for (const auto& rec : unacked_batches_) {
+		for (auto& rec : unacked_batches_) {
 			if (rec.session_epoch != old_epoch) continue;
 			if (fenced.has_committed_prefix() && rec.original_batch_seq <= release_hwm) {
 				locally_committed_msgs += rec.num_msg;
-				if (rec.batch != nullptr) {
-					release_after_unlock.push_back(rec.batch);
+				if (rec.pool_batch != nullptr) {
+					release_after_unlock.push_back(rec.pool_batch);
 				}
 			} else {
-				suffix.push_back(rec);
+				suffix.push_back(std::move(rec));
 			}
 		}
 		std::sort(suffix.begin(), suffix.end(), [](const UnackedBatch& a, const UnackedBatch& b) {
@@ -954,7 +1090,7 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 
 	uint64_t new_seq = 0;
 	for (auto& rec : suffix) {
-		auto* header = rec.batch;
+		auto* header = rec.Header();
 		if (header == nullptr) continue;
 		header->batch_seq = new_seq++;
 		header->session_epoch = static_cast<uint16_t>(new_epoch & 0xFFFFU);
@@ -971,7 +1107,7 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		                                    -1);
 		if (target < 0) continue;
 		header->broker_id = static_cast<uint32_t>(target);
-		SendRawBatchToBroker(rec.batch, rec.wire_bytes, target);
+		SendRawBatchToBroker(rec.WireBytes(), rec.wire_bytes, target);
 		rec.current_batch_seq = header->batch_seq;
 		rec.session_epoch = new_epoch;
 		rec.broker_id = target;
@@ -1004,6 +1140,32 @@ void Publisher::RetransmitThread() {
 		}
 		const double sleep_ms = std::min(delta_ms / 2.0, 2.0);
 		std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int>(sleep_ms * 1000.0)));
+
+		// During durable ACK2 drain, suppress RTO storms that re-burn BLog for
+		// already-ingested batches. Allow a slow backstop after prolonged stall so
+		// truly-lost in-flight batches can still recover before the ACK timeout.
+		{
+			static thread_local int64_t drain_stall_started_ns = 0;
+			const bool in_ack2_drain =
+				ack_drain_active_.load(std::memory_order_acquire) && ack_level_ >= 2;
+			if (!in_ack2_drain) {
+				drain_stall_started_ns = 0;
+			} else {
+				const int64_t now_ns = SteadyNowNs();
+				if (drain_stall_started_ns == 0) {
+					drain_stall_started_ns = now_ns;
+				}
+				constexpr int64_t kAckDrainRtoBackstopNs =
+					30LL * 1000LL * 1000LL * 1000LL;  // 30s
+				if (now_ns - drain_stall_started_ns < kAckDrainRtoBackstopNs) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(10));
+					continue;
+				}
+				// Fall through once for a backstop retransmit pass, then reset.
+				drain_stall_started_ns = now_ns;
+			}
+		}
+
 		const int64_t now_ns = SteadyNowNs();
 		struct DueRetransmit {
 			std::vector<uint8_t> bytes;
@@ -1027,9 +1189,10 @@ void Publisher::RetransmitThread() {
 					DueRetransmit item;
 					item.broker_id = rec.broker_id;
 					item.current_batch_seq = rec.current_batch_seq;
-					item.bytes.resize(rec.wire_bytes);
-					if (rec.batch != nullptr) {
-						std::memcpy(item.bytes.data(), rec.batch, rec.wire_bytes);
+					const void* src = rec.WireBytes();
+					if (src != nullptr && rec.wire_bytes > 0) {
+						item.bytes.resize(rec.wire_bytes);
+						std::memcpy(item.bytes.data(), src, rec.wire_bytes);
 						due.push_back(std::move(item));
 					}
 					rec.attempt++;
@@ -1446,7 +1609,11 @@ bool Publisher::Init(int ack_level) {
 	          << " epoll_wait_writable_ms=" << epoll_wait_writable_ms_;
 	unacked_byte_cap_ = ComputeUnackedByteCap();
 	LOG(INFO) << "Publisher session lease_ns=" << SessionLeaseNs()
-	          << " unacked_byte_cap=" << unacked_byte_cap_;
+	          << " unacked_byte_cap_pre_pool=" << unacked_byte_cap_
+	          << " ack_level=" << ack_level_
+	          << " memory_emulated_ack2=" << (IsMemoryEmulatedAck2() ? 1 : 0)
+	          << " unacked_retention="
+	          << (Ack2UsesOwnedRtoCopy() ? "owned_rto_copy" : "pool_pin");
 
 	// When set, PublishThread updates total_batches_attempted_ so ACK timeout log shows attempted count.
 	const char* ack_debug = std::getenv("EMBARCADERO_ACK_TIMEOUT_DEBUG");
@@ -1492,11 +1659,21 @@ bool Publisher::Init(int ack_level) {
 			absl::MutexLock lock(&mutex_);
 			qsize = queueSize_;
 		}
+		// Memory-emulated ACK2 pool-pin needs pool depth ≈ ACK BDP, not just
+		// send-pipeline slots; otherwise credit collapses to ~pipeline size.
+		if (IsMemoryEmulatedAck2() && !Ack2UsesOwnedRtoCopy()) {
+			qsize = std::max(qsize, ComputeUnackedByteCap());
+		}
 		if (!pubQue_.AddBuffers(qsize)) {
 			LOG(ERROR) << "Publisher::Init() failed to allocate publish queue buffers "
 			           << "(qsize_hint=" << qsize << ")";
 			return false;
 		}
+		ApplyUnackedByteCapBounds();
+		LOG(INFO) << "Publisher unacked_byte_cap=" << unacked_byte_cap_
+		          << " pool_bytes=" << pubQue_.PoolBytes()
+		          << " unacked_retention="
+		          << (Ack2UsesOwnedRtoCopy() ? "owned_rto_copy" : "pool_pin");
 	}
 
 	// Start cluster status monitoring thread
@@ -1797,7 +1974,8 @@ void Publisher::Publish(char* message, size_t len) {
 	//   - always credit any batch that was sealed+pushed before the failure (Write now
 	//     surfaces its count via sealed even on the early-return path), and
 	//   - retry THIS message under backpressure until a buffer frees (an ack retires an
-	//     unacked batch -> ReleaseBatch -> pool refill). Bail on shutdown; fail loudly if
+	//     unacked batch retires credit -> WaitForUnackedCapacity unblocks; pool
+	//     slots recycle on ReleaseBatch after send). Bail on shutdown; fail loudly if
 	//     the unacked prefix never retires rather than hanging or dropping.
 	static const int kBackpressureTimeoutSec = [] {
 		if (const char* e = std::getenv("EMBARCADERO_PUBLISH_BACKPRESSURE_TIMEOUT_SEC")) {
@@ -1844,6 +2022,24 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	// Enter queue-drain mode. Publish threads should keep consuming queued batches
 	// until empty, then exit; do not force shutdown here.
 	pubQue_.WriteFinished();
+
+	// ACK2: suppress RTO / futile identical-fence storms from publish_finished
+	// through ACK wait (covers queue-drain + publisher join). Cleared on all
+	// Poll exit paths via this guard.
+	struct AckDrainGuard {
+		Publisher* self;
+		bool armed{false};
+		AckDrainGuard(Publisher* p, bool arm) : self(p), armed(arm) {
+			if (armed) {
+				self->ack_drain_active_.store(true, std::memory_order_release);
+			}
+		}
+		~AckDrainGuard() {
+			if (armed) {
+				self->ack_drain_active_.store(false, std::memory_order_release);
+			}
+		}
+	} ack_drain_guard{this, ack_level_ >= 2};
 
 	// Signal threads before releasing queue resources [[RELAXED]]
 	publish_finished_.store(true, std::memory_order_relaxed);
@@ -3398,7 +3594,8 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 		sent_batches += 1;
 		sent_msgs += batch_header->num_msg;
 
-			// Return immediately unless UnackedBuffer retained the slot for ACK/fence handling.
+			// Owned RTO copy → release hugepage slot now. Pool-pin retention
+			// (ACK1 / memory ACK2) holds the slot until CompleteUnackedThrough.
 			if (!unacked_owns_batch) {
 				pubQue_.ReleaseBatch(batch_header);
 			}

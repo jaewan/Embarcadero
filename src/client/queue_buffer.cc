@@ -18,19 +18,17 @@
 #include <sys/mman.h>
 
 namespace {
-	constexpr size_t kPoolAcquireTimeoutMs = 100;
 	constexpr size_t kQueueFullTimeoutMs = 100;
 	constexpr size_t kQueueFullSleepMs = 1;
 	constexpr size_t kMaxRegions = 4;  // allow multiple AddBuffers(); pool capacity = pool_slots_ * kMaxRegions
 	constexpr size_t kAlign = 64;
-	// Steady-state publish pipeline budget. Callers historically passed multi-GB
-	// hints (full dataset / threads×brokers×256MB); those must not inflate the
-	// hugepage mmap. Exhausted pool → Write() backpressures until ReleaseBatch.
+	// Steady-state send-pipeline budget only. Unacked/ACK retention no longer
+	// pins pool slots (Publisher owns an RTO copy), so this must not track the
+	// ACK credit window. Exhausted pool → Write() blocks until ReleaseBatch.
 	constexpr size_t kDefaultPoolSizeBytes = 256ULL * 1024 * 1024;
-	// Cap must cover the session unacked window (default ~12 GiB/s × 1s lease)
-	// or Write() pool-acquires starve while PublishThreads hold slots waiting
-	// on WaitForUnackedCapacity. Still << the old 48 GiB (24×1024×2MiB) blow-up.
-	constexpr size_t kMaxPoolSizeBytes = 12ULL * 1024 * 1024 * 1024;
+	// Upper bound for hugepage mmap (pipeline depth under large thread counts).
+	// Still << the historical 48 GiB (queues×kQueueCapacity×slot) blow-up.
+	constexpr size_t kMaxPoolSizeBytes = 4ULL * 1024 * 1024 * 1024;
 	// Slots kept in flight per SPSC queue (not kQueueCapacity=1024). Full-queue
 	// sizing was 24×1024×2MiB ≈ 48GiB and blocked SubscribeToCluster past Init.
 	constexpr size_t kPipelineSlotsPerQueue = 32;
@@ -272,29 +270,28 @@ bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* co
 		return false;
 	}
 	Embarcadero::BatchHeader* next = nullptr;
-	constexpr int kPoolSpinBeforeYield = 128;
+	constexpr int kPoolSpinBeforeWait = 64;
 	int pool_spin = 0;
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPoolAcquireTimeoutMs);
+	// Blocking acquire: pool exhaustion is backpressure, not a soft error.
+	// Always honor shutdown so destructor/ReturnReads cannot deadlock writers.
+	// PublishThreads ReleaseBatch after send; ACK credit is a separate bound.
 	while (!pool_->read(next)) {
-		if (stop_on_shutdown && shutdown_.load(std::memory_order_relaxed)) {
+		if (shutdown_.load(std::memory_order_relaxed)) {
 			current_batch_ = nullptr;
 			current_batch_tail_ = 0;
 			current_batch_num_msg_ = 0;
+			(void)stop_on_shutdown;
+			(void)context;
 			return false;
 		}
-		if (++pool_spin % kPoolSpinBeforeYield == 0) {
-			if (std::chrono::steady_clock::now() > deadline) {
-				LOG(ERROR) << "QueueBuffer::" << (context ? context : "AcquireNextBatchFromPool")
-				           << " pool acquire timeout";
-				current_batch_ = nullptr;
-				current_batch_tail_ = 0;
-				current_batch_num_msg_ = 0;
-				return false;
-			}
-			std::this_thread::yield();
-		} else {
+		if (++pool_spin < kPoolSpinBeforeWait) {
 			Embarcadero::CXL::cpu_pause();
+			continue;
 		}
+		std::unique_lock<std::mutex> lock(pool_mu_);
+		pool_cv_.wait_for(lock, std::chrono::milliseconds(1), [&]() {
+			return shutdown_.load(std::memory_order_relaxed) || pool_->size() > 0;
+		});
 	}
 	current_batch_ = next;
 	// [[PERF]] Clear only the BatchHeader (128B), not the full 2MB slot.
@@ -640,6 +637,7 @@ void QueueBuffer::ReleaseBatch(void* batch) {
 	// [[DESIGN]] No memset: buffer is internal; we send to broker with batch total_size only.
 	// Only unoverwritten bytes are padding; nobody reads padding. memset would add cost with no benefit.
 	pool_->write(static_cast<Embarcadero::BatchHeader*>(batch));
+	pool_cv_.notify_one();
 }
 
 #ifdef COLLECT_LATENCY_STATS
@@ -666,6 +664,7 @@ void QueueBuffer::ReturnReads() {
 	shutdown_.store(true, std::memory_order_release);
 	NotifyAllWaiters();
 	session_rollover_cv_.notify_all();
+	pool_cv_.notify_all();
 }
 
 void QueueBuffer::SetActiveQueues(size_t active_count) {
