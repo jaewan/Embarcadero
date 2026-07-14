@@ -1314,10 +1314,21 @@ start_brokers() {
     if [[ "$zero_mode" == "metadata" ]]; then
         wait_head_before_followers=0
     fi
-    # shellcheck disable=SC2086
-    $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" \
-        --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
-        > /tmp/broker_0.log 2>&1 &
+    # A per-broker override lets a bounded RF2 integration smoke delay only the
+    # remote media replica.  The global variable remains the production/fault
+    # injection default when no indexed override is supplied.
+    local head_fdatasync_stall_ms="${EMBARCADERO_FDATASYNC_STALL_MS_BROKER_0:-${EMBARCADERO_FDATASYNC_STALL_MS:-}}"
+    if [[ -n "$head_fdatasync_stall_ms" ]]; then
+        # shellcheck disable=SC2086
+        EMBARCADERO_FDATASYNC_STALL_MS="$head_fdatasync_stall_ms" $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" \
+            --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
+            > /tmp/broker_0.log 2>&1 &
+    else
+        # shellcheck disable=SC2086
+        $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" \
+            --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
+            > /tmp/broker_0.log 2>&1 &
+    fi
     launched_broker_pids+=("$!")
     HEAD_BROKER_PID="${launched_broker_pids[0]}"
     if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
@@ -1373,10 +1384,22 @@ start_brokers() {
         sleep "${BROKER_HEAD_SHM_GRACE_SEC:-2}"
     fi
     for (( i=1; i<NUM_BROKERS; i++ )); do
-        # shellcheck disable=SC2086
-        $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" \
-            --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
-            > /tmp/broker_"$i".log 2>&1 &
+        local broker_stall_var="EMBARCADERO_FDATASYNC_STALL_MS_BROKER_${i}"
+        local broker_fdatasync_stall_ms="${EMBARCADERO_FDATASYNC_STALL_MS:-}"
+        if [[ -n "${!broker_stall_var+x}" ]]; then
+            broker_fdatasync_stall_ms="${!broker_stall_var}"
+        fi
+        if [[ -n "$broker_fdatasync_stall_ms" ]]; then
+            # shellcheck disable=SC2086
+            EMBARCADERO_FDATASYNC_STALL_MS="$broker_fdatasync_stall_ms" $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" \
+                --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
+                > /tmp/broker_"$i".log 2>&1 &
+        else
+            # shellcheck disable=SC2086
+            $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" \
+                --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
+                > /tmp/broker_"$i".log 2>&1 &
+        fi
         launched_broker_pids+=("$!")
         if [[ "$BROKER_START_STAGGER_SEC" -gt 0 ]]; then
             sleep "$BROKER_START_STAGGER_SEC"
