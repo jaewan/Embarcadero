@@ -71,12 +71,15 @@ Scalog labeling, and batching/RF instrumentation.
     token request/grant, one payload send, and zero payload-before-grant
     violations. The retained rerun used the tracked client config and records
     `CORFU,grpc,broker_proxy,RF=1,ACK=1,git_dirty=false` in `run_contract.csv`.
-- **C1b implementation and focused local validation are complete; its real
-  multi-process CXL deployment test remains open.** The broker proxy uses an
+- **C1b implementation and multi-process CXL deployment validation are complete.** The broker proxy uses an
   MPSC handoff, one sole up-ring dispatcher, one sole down-ring receiver, and
   a transport-only correlation ID. Its focused smoke verifies mailbox token
   assignment, retry idempotence, ingress ownership, status mapping, and
-  concurrent proxy callers. It has not yet passed a real multi-process CXL run.
+  concurrent proxy callers. A clean two-broker c4 run at commit `f79bf39f`
+  attached both brokers to `cxl_layout_v4`/`shm_numa_cxl`, exposed proxy
+  endpoints `50100/50101`, and completed 64/64 with zero payload-before-grant
+  violations. The run contract records `CORFU,cxl_mailbox,broker_proxy,RF=1,
+  ACK=1,git_dirty=false`.
 - **Corfu RF3 implementation status — 2026-07-15:** C2/C3 now implement the
   serialized RF-includes-primary chain, payload+CRC `WriteOnce`, durable
   sidecar recovery, and a broker-indexed replica membership map. RF>1 fails
