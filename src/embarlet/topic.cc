@@ -232,11 +232,11 @@ static uint64_t GetSessionLeaseNs(bool replicated_ack2_mode) {
 		LOG(WARNING) << "Ignoring invalid EMBARCADERO_SESSION_LEASE_MS='" << env
 		             << "'; using placeholder default";
 	}
-	// RF0 was 1000ms; multi-broker ORDER=5 head gaps at latency start (seq N held
-	// while seq N+1 is still in flight to another broker) routinely last >1s and
-	// false-fenced healthy linger runs. Keep well above that skew window.
+	// RF0 was 1000ms then 5000ms; multi-broker ORDER=5 head gaps at high offered
+	// load (linger@750 4GiB) still false-fenced after ~5s while later striped
+	// batches sat in hold. Keep well above that skew + pool-backpressure window.
 	(void)replicated_ack2_mode;
-	return 5000ULL * 1000ULL * 1000ULL;
+	return 30000ULL * 1000ULL * 1000ULL;
 }
 
 static uint64_t GetOrder5IdleForceExpireTriggerNs(bool replicated_ack2_mode) {
@@ -252,7 +252,7 @@ static uint64_t GetOrder5IdleForceExpireTriggerNs(bool replicated_ack2_mode) {
 	// Stay at/above the session lease so idle force-expire is a backstop, not the
 	// primary fence clock for transient multi-broker skew.
 	(void)replicated_ack2_mode;
-	const uint64_t default_ms = 5000ULL;
+	const uint64_t default_ms = 30000ULL;
 	return default_ms * 1000ULL * 1000ULL;
 }
 
@@ -2994,7 +2994,11 @@ bool Topic::PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader
 
 void Topic::ArmOrder5ForceExpiryWindow(uint64_t duration_ns) {
 	if (duration_ns == 0) return;
-	const uint64_t new_deadline = SteadyNowNs() + duration_ns;
+	const uint64_t now_ns = SteadyNowNs();
+	if (now_ns < force_expire_rearm_cooldown_until_ns_.load(std::memory_order_acquire)) {
+		return;
+	}
+	const uint64_t new_deadline = now_ns + duration_ns;
 	uint64_t cur_deadline = force_expire_hold_until_ns_.load(std::memory_order_acquire);
 	while (cur_deadline < new_deadline &&
 	       !force_expire_hold_until_ns_.compare_exchange_weak(
@@ -6596,9 +6600,14 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				note.control_epoch = CurrentControlEpoch();
 				note.reason = 0;  // SessionFenced::HOLD_EXPIRY
 				PublishSessionFenceNotification(note);
-				// Disarm idle force-expire so the client's reopen/resubmit epoch is
-				// not immediately re-fenced under a still-active shortened lease.
+				// Disarm idle force-expire and suppress re-arm for a full session
+				// lease. Otherwise run_idle_hold_tick re-arms within ~1ms while hold
+				// work remains, and the 250ms short lease instantly fences the
+				// reopen/resubmit epoch (fence storm → pool-pin hang).
 				force_expire_hold_until_ns_.store(0, std::memory_order_release);
+				force_expire_rearm_cooldown_until_ns_.store(
+					SteadyNowNs() + GetSessionLeaseNs(replication_factor_ > 0),
+					std::memory_order_release);
 			}
 			purge_fenced_session(shard_session_key);
 		};

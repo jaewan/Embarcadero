@@ -1015,6 +1015,10 @@ class Topic {
 		// Disconnect/shutdown tail drain: keep force-expiring hold frontiers for a short bounded window
 		// so late-visible batches are not stranded behind a one-shot expiry pulse.
 		std::atomic<uint64_t> force_expire_hold_until_ns_{0};
+		// After a SESSION_FENCE, suppress re-arming force-expire so the client's
+		// reopen/resubmit epoch is not immediately re-fenced under the 250ms short
+		// lease (seen as epoch 1→5 storm + pool-pin hang at linger@750 4GiB).
+		std::atomic<uint64_t> force_expire_rearm_cooldown_until_ns_{0};
 		struct Order5FlightEvent {
 			uint64_t ts_ns{0};
 			uint64_t a{0};

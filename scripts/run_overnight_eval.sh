@@ -450,6 +450,18 @@ for rf in 0 1 2; do
         ${extra[@]+"${extra[@]}"}
 done
 
+# E2 RF=2 memory-copy companion (same N=1 cell as disk ACK2, for sink comparison).
+if [[ "$INCLUDE_MEMORY_COPY_RF2" == "1" ]]; then
+    # shellcheck disable=SC2207
+    mem_extra=( $(rf2_memcopy_env) )
+    run_multi_cell "e2_embar5_rf2_ack2_n1_memcopy" 1 "$CLIENT_HOSTS_REMOTE" \
+        SEQUENCER=EMBARCADERO ORDER=5 ACK=2 REPLICATION_FACTOR=2 \
+        TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=latency \
+        EMBAR_ORDER5_EPOCH_US="$EPOCH_US_THROUGHPUT" \
+        THREADS_PER_BROKER="$THREADS_THROUGHPUT" \
+        ${mem_extra[@]+"${mem_extra[@]}"}
+fi
+
 for rf in 0 1; do
     ack="$(ack_for_rf "$rf")"
     run_multi_cell "e2_embar0_rf${rf}_ack${ack}_n1" 1 "$CLIENT_HOSTS_REMOTE" \

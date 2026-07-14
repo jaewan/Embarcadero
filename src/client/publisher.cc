@@ -534,10 +534,10 @@ uint64_t Publisher::SessionLeaseNs() const {
 			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
 		}
 	}
-	// Match broker GetSessionLeaseNs: RF0/RF2 defaults are both 5s so client
+	// Match broker GetSessionLeaseNs: RF0/RF2 defaults are both 30s so client
 	// rollover drain and broker hold-gap fencing agree.
 	(void)ack_level_;
-	return 5000ULL * 1000ULL * 1000ULL;
+	return 30000ULL * 1000ULL * 1000ULL;
 }
 
 bool Publisher::IsMemoryEmulatedAck2() const {
@@ -3074,8 +3074,12 @@ process_client_fd:;
 							             << " control_epoch=" << fenced.control_epoch()
 							             << " reason=" << fenced.reason();
 							HandleSessionFenced(fenced, client_sockets[client_sock]);
-							connection_error_or_closed = true;
-							break;
+							// Keep the ACK socket: SESSION_FENCED is recoverable via
+							// reopen/resubmit. Closing here dropped ACK credit while
+							// pool_pin still held every slot after a 1023-batch
+							// resubmit, so Publish wedged forever in AcquireNextBatchFromPool.
+							partial_ack_reads[client_sock] = {0, 0};
+							continue;
 						}
 					if (ShouldEnableNetworkPathProfile()) {
 						GetClientNetworkPathProfile().ack_values_processed.fetch_add(1, std::memory_order_relaxed);

@@ -225,8 +225,15 @@ private:
 	void EndProducerOp();
 	/** Acquire next writable batch from pool and reset local producer state. */
 	bool AcquireNextBatchFromPool(bool stop_on_shutdown, const char* context);
-	/** Seal current batch and push to queues_[write_buf_id_], then advance and get new buffer. Returns num_msg in batch sealed (0 if none). */
-	size_t SealCurrentAndAdvance();
+	/**
+	 * Seal current batch and push to queues_[write_buf_id_].
+	 * When acquire_next is true (Write path), pull the next pool slot afterward.
+	 * When false (session-rollover flush), leave current_batch_ null — callers hold
+	 * session_rollover_mu_ with pause armed, so AcquireNextBatchFromPool→BeginProducerOp
+	 * would self-deadlock waiting for Resume that cannot run until SealAll returns.
+	 * Returns num_msg in the sealed batch (0 if none).
+	 */
+	size_t SealCurrentAndAdvance(bool acquire_next = true);
 	/** Debug: true iff batch is a slot base in one of our regions (for ReleaseBatch validation). */
 	bool IsValidPoolPointer(void* batch) const;
 

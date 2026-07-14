@@ -321,7 +321,7 @@ bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* co
 	return true;
 }
 
-size_t QueueBuffer::SealCurrentAndAdvance() {
+size_t QueueBuffer::SealCurrentAndAdvance(bool acquire_next) {
 	if (!current_batch_) {
 		return 0;
 	}
@@ -425,6 +425,16 @@ retry_push:
 		goto retry_push;
 	}
 
+	// Detach the sealed slot before optionally acquiring the next one. Otherwise a
+	// concurrent SealAllForSessionRollover (or a failed pool wait) can observe the
+	// already-pushed pointer as still "current" and double-seal it.
+	current_batch_ = nullptr;
+	current_batch_tail_ = 0;
+	current_batch_num_msg_ = 0;
+	current_batch_first_submit_time_ = {};
+	if (!acquire_next) {
+		return num_sealed;
+	}
 	if (!AcquireNextBatchFromPool(/*stop_on_shutdown=*/true, "SealCurrentAndAdvance")) {
 		return num_sealed;
 	}
@@ -749,7 +759,11 @@ size_t QueueBuffer::SealAllForSessionRollover() {
 		LOG(ERROR) << "QueueBuffer::SealAllForSessionRollover called without quiescing producers";
 		return 0;
 	}
-	return SealCurrentAndAdvance();
+	// Must not acquire_next: we hold session_rollover_mu_ with pause armed, and
+	// AcquireNextBatchFromPool drops/reacquires the producer-op via BeginProducerOp,
+	// which waits on this same mutex for Resume — self-deadlock (seen hung AckThread
+	// + Write at linger@750 after SESSION_FENCED, tag 20260714T044800Z).
+	return SealCurrentAndAdvance(/*acquire_next=*/false);
 }
 
 void QueueBuffer::SetNextBatchSeqForNewSession(size_t next_batch_seq) {

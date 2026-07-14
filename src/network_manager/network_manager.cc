@@ -97,7 +97,7 @@ static uint64_t GetNetworkSessionLeaseNs(bool replicated_ack2_mode) {
 		}
 	}
 	(void)replicated_ack2_mode;
-	return 5000ULL * 1000ULL * 1000ULL;
+	return 30000ULL * 1000ULL * 1000ULL;
 }
 
 static uint64_t Mix64Network(uint64_t x) {
