@@ -39,8 +39,16 @@ PUBLICATION_CLIENT_CONFIG="${PUBLICATION_CLIENT_CONFIG:-config/client.yaml}"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${RUN_TS}}"
 REQUIRE_FIRST_ATTEMPT_PASS="${REQUIRE_FIRST_ATTEMPT_PASS:-0}"
+REQUIRE_CLEAN_WORKTREE="${REQUIRE_CLEAN_WORKTREE:-1}"
 EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-}"
 CONTROL_TRANSPORT="${EMBARCADERO_BASELINE_CONTROL_TRANSPORT:-grpc}"
+
+if [[ "$REQUIRE_CLEAN_WORKTREE" == "1" ]]; then
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "ERROR: publication cell requires a clean worktree; use a clean clone or set REQUIRE_CLEAN_WORKTREE=0 for a developer smoke." >&2
+    exit 2
+  fi
+fi
 
 if [[ -z "$ACK_LEVEL" ]]; then
   if [[ "$REPLICATION_FACTOR" == "2" ]]; then
@@ -204,6 +212,7 @@ client_config=$PUBLICATION_CLIENT_CONFIG
 client_config_abs=$CLIENT_CONFIG_ABS
 client_config_sha256=$CLIENT_CONFIG_SHA256
 require_first_attempt_pass=$REQUIRE_FIRST_ATTEMPT_PASS
+require_clean_worktree=$REQUIRE_CLEAN_WORKTREE
 ack_timeout_sec=${EMBARCADERO_ACK_TIMEOUT_SEC:-}
 commit=$COMMIT
 start_time_utc=$RUN_TS
