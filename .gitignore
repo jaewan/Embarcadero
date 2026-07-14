@@ -13,6 +13,9 @@ _deps/
 # See CONTRIBUTING.md.
 results/*
 !results/README.md
+# Legacy multiclient runner output; retained artifacts are exported under
+# results/, never from this scratch directory.
+multiclient_logs/
 data/
 data_backup/
 datathroughput/
