@@ -35,6 +35,17 @@ Scalog labeling, and batching/RF instrumentation.
   primary/replica durable frontiers, and metadata callback all advancing before
   the ACK verification. This validates the local process-emulation path only.
   It does not close the external multi-host/failure-restart gate above.
+- A clean remote-client mailbox RF2 smoke subsequently passed on the real-CXL
+  host with the standalone sequencer and two c2 metadata replicas: 64/64
+  acknowledgements, `cxl_layout_v4` mailbox attachment, and one durable record
+  in each sidecar.  A replica-restart follow-up exposed a real ledger bug:
+  idempotence was keyed only by the resettable sequencer source slot.  Commit
+  `5bfe3ca0` keys it by `(topic, source broker, client id, client batch seq)`
+  instead, and adds a regression test proving that a new publisher may reuse a
+  source slot.  The focused test suite passes 9/9.  The remote restart/redrive
+  smoke must be repeated with that committed service binary before F3 can be
+  closed; c2's temporary build is presently blocked from fetching its absent
+  gRPC source cache, so do not treat the pre-fix restart attempt as evidence.
 - The launcher now fails before broker startup if a selected local sequencer
   executable is absent, and `lazylog_metadata_replica` is emitted under
   `<build>/bin` with the other deployable roles. These artifact fixes do not
