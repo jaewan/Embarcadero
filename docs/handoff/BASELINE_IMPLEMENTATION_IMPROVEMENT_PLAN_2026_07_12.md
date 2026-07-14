@@ -99,6 +99,13 @@ Scalog labeling, and batching/RF instrumentation.
   identical canonical cut/binding values and emission order. This closes the
   deterministic core-equivalence artifact; it does not claim full Scalog Paxos
   or LazyLog pre-binding append fidelity.
+- **Clean-retained campaign status — 2026-07-15:** a clean-clone pilot at
+  commit `ba838e1c` passed the publication runner's clean-worktree gate and
+  produced a first-attempt-success RF1/ORDER0 artifact (`git_dirty=false`,
+  32 KiB bounded workload, 0.647344 Gb/s). This validates provenance and
+  manifest generation only; the multi-system, multi-RF publication campaign
+  remains open until synchronized clean remote sequencer/client binaries are
+  available.
 - **Current packet: M2.** Media-sync wiring is implemented and locally built;
   do not mark M2 complete until the remaining external-replica tests pass:
   - [x] Scalog CXL primary/remote-replica fault test (local four-process CXL
