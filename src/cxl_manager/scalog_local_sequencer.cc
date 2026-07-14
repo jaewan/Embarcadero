@@ -31,8 +31,16 @@ ScalogLocalSequencer::ScalogLocalSequencer(TInode* tinode, int broker_id, void* 
 	cxl_addr_(cxl_addr),
 	batch_header_(batch_header),
 	topic_(topic){
-	if (const char* override_ip = std::getenv("SCALOG_SEQUENCER_IP_OVERRIDE");
-	    override_ip && override_ip[0] != '\0') {
+	// The launcher exports EMBARCADERO_SCALOG_SEQ_IP for all baseline roles.
+	// Honor that canonical setting first; retain the legacy override as a
+	// compatibility fallback.  Previously local-cut streams could be sent to a
+	// stale compiled-in address while replica-cut streams reached localhost,
+	// leaving the global cut permanently short of its required replica-0 inputs.
+	const char* override_ip = std::getenv("EMBARCADERO_SCALOG_SEQ_IP");
+	if (override_ip == nullptr || override_ip[0] == '\0') {
+		override_ip = std::getenv("SCALOG_SEQUENCER_IP_OVERRIDE");
+	}
+	if (override_ip != nullptr && override_ip[0] != '\0') {
 		scalog_global_sequencer_ip_ = override_ip;
 	}
 

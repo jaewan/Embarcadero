@@ -8,6 +8,21 @@
 namespace {
 
 int ExpectedScalogBrokerCount() {
+	// The launcher deliberately runs reduced two-broker smoke cells while the
+	// checked-in topology describes the maximum four-broker deployment.  The
+	// sequencer must use the live membership cardinality supplied to every
+	// launched broker, just as LazyLog does; otherwise it waits forever for two
+	// nonexistent LocalCut streams and ACK2 can never advance.
+	if (const char* brokers_env = std::getenv("EMBARCADERO_NUM_BROKERS")) {
+		char* end = nullptr;
+		const long parsed = std::strtol(brokers_env, &end, 10);
+		if (end != brokers_env && *end == '\0' && parsed > 0 &&
+		    parsed <= NUM_MAX_BROKERS_CONFIG) {
+			return static_cast<int>(parsed);
+		}
+		LOG(WARNING) << "Invalid EMBARCADERO_NUM_BROKERS='" << brokers_env
+		             << "'; falling back to configured topology";
+	}
 	const auto& config = Embarcadero::GetConfig().config();
 	if (!config.cluster.data_broker_ids.empty()) {
 		return static_cast<int>(config.cluster.data_broker_ids.size());
