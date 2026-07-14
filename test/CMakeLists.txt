@@ -587,6 +587,30 @@ if(PkgConfig_FOUND)
             TIMEOUT 120
             LABELS "unit;order5;publisher;rollover;correctness"
         )
+
+        add_executable(baseline_transport_equivalence_test
+            baseline_transport_equivalence_test.cc
+            ../src/cxl_manager/scalog_global_ordering_core.cc
+            ../src/cxl_manager/lazylog_binding_core.cc
+        )
+        target_include_directories(baseline_transport_equivalence_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(baseline_transport_equivalence_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(baseline_transport_equivalence_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            glog::glog
+            absl::flat_hash_map
+            pthread
+        )
+        add_test(NAME unit_baseline_transport_equivalence COMMAND baseline_transport_equivalence_test)
+        set_tests_properties(unit_baseline_transport_equivalence PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;baseline;transport;equivalence;scalog;lazylog;correctness"
+        )
     else()
         message(WARNING "GTest not found via pkg-config, unit tests disabled")
     endif()
