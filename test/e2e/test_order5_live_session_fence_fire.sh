@@ -85,6 +85,7 @@ wait_log() {
 
 run_test_body() {
 	mkdir -p "$OUT_DIR"
+	mkdir -p "$OUT_DIR/disk"
 	cd "$OUT_DIR"
 	: > broker_0.log
 	: > client_fenced.log
@@ -101,6 +102,7 @@ run_test_body() {
 		EMBARCADERO_NUM_BROKERS=1 \
 		EMBAR_USE_HUGETLB=0 \
 		EMBARCADERO_CXL_ZERO_MODE=metadata \
+		EMBARCADERO_REPLICA_DISK_DIRS="$OUT_DIR/disk" \
 		EMBARCADERO_SESSION_EPOCH="$BROKER_ENV_SESSION_EPOCH" \
 		EMBARCADERO_SESSION_LEASE_MS="$LEASE_MS" \
 		EMBARCADERO_TEST_ORDER5_SESSION_TRACE=1 \

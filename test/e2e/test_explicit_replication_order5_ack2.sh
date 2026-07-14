@@ -18,6 +18,7 @@ source "$SCRIPT_DIR/numa_bind.sh"
 # Test configuration
 TEST_NAME="explicit_replication_order5_ack2"
 NUM_BROKERS=4
+EMBARCADERO_SEGMENT_SIZE=${EMBARCADERO_SEGMENT_SIZE:-4294967296}
 MESSAGE_SIZE=128
 TOTAL_MESSAGES=5000  # Small enough for quick test, large enough to see replication progress
 
@@ -467,6 +468,7 @@ run_one_profile() {
             unset EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY || true
             unset EMBARCADERO_CHAIN_REPLICATION_SINK || true
             export EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable
+            export EMBARCADERO_SEGMENT_SIZE
             # Disk ACK2 requires writable replica dirs (fail-closed; no /tmp fallback).
             if [[ -z "${EMBARCADERO_REPLICA_DISK_DIRS:-}" ]]; then
                 local d0="$PROJECT_ROOT/.Replication/disk0"

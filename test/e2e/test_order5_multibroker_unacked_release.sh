@@ -64,6 +64,7 @@ wait_ready() {
 
 run_test_body() {
 	mkdir -p "$OUT_DIR"
+	mkdir -p "$OUT_DIR/disk0" "$OUT_DIR/disk1"
 	cd "$OUT_DIR"
 	rm -f ./*.log /tmp/embarlet_*_ready 2>/dev/null || true
 
@@ -74,6 +75,8 @@ run_test_body() {
 		NUM_BROKERS="$NUM_BROKERS" \
 		EMBARCADERO_NUM_BROKERS="$NUM_BROKERS" \
 		EMBAR_USE_HUGETLB=0 \
+		EMBARCADERO_SEGMENT_SIZE=4294967296 \
+		EMBARCADERO_REPLICA_DISK_DIRS="$OUT_DIR/disk0,$OUT_DIR/disk1" \
 		EMBAR_ASSERT_COMMIT_ORDER=1 \
 		EMBARCADERO_TEST_ORDER5_SESSION_TRACE=1 \
 		"$BIN_DIR/embarlet" --config "$CONFIG_DIR/embarcadero.yaml" --head --EMBARCADERO \
@@ -85,6 +88,8 @@ run_test_body() {
 			NUM_BROKERS="$NUM_BROKERS" \
 			EMBARCADERO_NUM_BROKERS="$NUM_BROKERS" \
 			EMBAR_USE_HUGETLB=0 \
+			EMBARCADERO_SEGMENT_SIZE=4294967296 \
+			EMBARCADERO_REPLICA_DISK_DIRS="$OUT_DIR/disk0,$OUT_DIR/disk1" \
 			EMBAR_ASSERT_COMMIT_ORDER=1 \
 			EMBARCADERO_TEST_ORDER5_SESSION_TRACE=1 \
 			"$BIN_DIR/embarlet" --config "$CONFIG_DIR/embarcadero.yaml" --EMBARCADERO \
@@ -99,6 +104,7 @@ run_test_body() {
 		NUM_BROKERS="$NUM_BROKERS" \
 		EMBARCADERO_NUM_BROKERS="$NUM_BROKERS" \
 		EMBAR_USE_HUGETLB=0 \
+		EMBARCADERO_REPLICA_DISK_DIRS="$OUT_DIR/disk0,$OUT_DIR/disk1" \
 		EMBAR_ASSERT_COMMIT_ORDER=1 \
 		"$BIN_DIR/throughput_test" \
 			--config "$CONFIG_DIR/client.yaml" \

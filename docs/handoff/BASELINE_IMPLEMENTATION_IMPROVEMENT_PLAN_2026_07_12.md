@@ -85,12 +85,13 @@ Scalog labeling, and batching/RF instrumentation.
   sidecar recovery, and a broker-indexed replica membership map. RF>1 fails
   closed without an explicitly configured durable replica directory, and the
   launcher passes disk mode to each Corfu broker. Focused chain/proxy/mailbox
-  tests pass. A four-broker CXL process smoke reached all four durable replica
-  listeners, but the c4 publisher had only 3/4 ACK connections (B1 missing)
-  and therefore sent no complete batch. This is a multi-broker publisher
-  readiness failure, not RF3 success. C4 remains open; retain no RF3 result
-  until that ACK-connect defect is fixed and the remote/client process smoke
-  completes with chain-sidecar evidence.
+  tests pass. The retained four-broker CXL process smoke at clean commit
+  `f79bf39f` used a fresh durable replica directory and completed 64/64 with
+  `CORFU_TOKEN_PHASE requests=1 grants=1 payload_sends=1 payload_before_grant=0`.
+  Its immutable run contract records `RF=3`, `ACK=2`, two remote replicas,
+  `ack2_primary_plus_2_ordered_media_durable_replicas`, and `git_dirty=false`.
+  This closes the bounded developer RF3 process smoke; it remains a correctness
+  smoke rather than a publication throughput measurement.
 - **Current packet: M2.** Media-sync wiring is implemented and locally built;
   do not mark M2 complete until the remaining external-replica tests pass:
   - [x] Scalog CXL primary/remote-replica fault test (local four-process CXL
