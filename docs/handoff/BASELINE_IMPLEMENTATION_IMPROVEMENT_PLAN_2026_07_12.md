@@ -100,9 +100,12 @@ Scalog labeling, and batching/RF instrumentation.
   - [x] Model process-restart guard: the two-process CXL durability test kills
     a replica after `pwrite` and before `fdatasync`, observes its ACK frontier
     remain pinned, then verifies conservative truncation and redrive.
-  - [ ] Scalog replication-RPC test: a successful response is impossible before
-    the write worker has completed `fdatasync`; a forced write/sync failure
-    returns failure and advances neither local cut nor ACK frontier.
+  - [x] Scalog replication-RPC test: `integration_scalog_replication_rpc_durability`
+    passes. An injected 80 ms `fdatasync` stall delays the RPC reply, an
+    injected `EIO` returns failure, and a subsequent redrive succeeds. The
+    service waits on the write worker's durable completion promise, so queue
+    admission is not reported as replication success. This is a local RPC
+    integration test; the CXL frontier/ACK2 lag test remains separate.
   - [ ] Production-path crash/restart smoke: kill the Scalog/LazyLog replica
     immediately after an acknowledged batch, restart from its data file, then
     verify recovery/redrive and no ACK frontier passes an unsynced item.
