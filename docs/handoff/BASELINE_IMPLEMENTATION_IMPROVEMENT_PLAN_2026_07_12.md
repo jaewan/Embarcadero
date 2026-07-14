@@ -92,6 +92,13 @@ Scalog labeling, and batching/RF instrumentation.
   `ack2_primary_plus_2_ordered_media_durable_replicas`, and `git_dirty=false`.
   This closes the bounded developer RF3 process smoke; it remains a correctness
   smoke rather than a publication throughput measurement.
+- **Transport-equivalence status — 2026-07-15:** `unit_baseline_transport_equivalence`
+  drives identical deterministic registration/progress traces through the
+  shared Scalog and LazyLog ordering cores for RF1/RF2/RF3, including duplicate
+  and regressing reports. gRPC count cadence and mailbox epoch cadence produce
+  identical canonical cut/binding values and emission order. This closes the
+  deterministic core-equivalence artifact; it does not claim full Scalog Paxos
+  or LazyLog pre-binding append fidelity.
 - **Current packet: M2.** Media-sync wiring is implemented and locally built;
   do not mark M2 complete until the remaining external-replica tests pass:
   - [x] Scalog CXL primary/remote-replica fault test (local four-process CXL
