@@ -601,9 +601,10 @@ The chain rule is strict:
 - failure at position `i` leaves a valid written prefix and an unwritten
   suffix; later positions must not be marked complete;
 - RF1 ACK1 completes at position 0 under the ordered-visible contract;
-- ACK2 for RF>=2 advances only after the last configured remote target returns
-  its required media-durable success. Until the separate media-durability task
-  is merged, ACK2 publication measurements remain blocked.
+  - ACK2 for RF>=2 advances only after the last configured remote target returns
+  its required media-durable success. The media-durability implementation and
+  bounded RF2 lagging-replica evidence are now present; publication ACK2
+  measurements remain blocked only until the retained clean-cell campaign.
 
 Always emit a position-0 trace event so RF1/RF2/RF3 call order is unambiguous.
 
