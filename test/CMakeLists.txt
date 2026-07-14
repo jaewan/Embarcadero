@@ -12,11 +12,12 @@ add_custom_target(test_e2e
 )
 
 # Individual E2E tests
-add_test(
-    NAME e2e_basic_publish
-    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/test_basic_publish.sh
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-)
+#
+# `e2e/test_basic_publish.sh` is deliberately retired: it predates the
+# sequencer/readiness contract and used broad process killing during cleanup.
+# Publication-relevant end-to-end cells use scripts/run_multiclient.sh, which
+# owns exact child PIDs and records a run contract/manifest.  Do not add the
+# legacy script back to CTest.
 
 add_test(
     NAME e2e_explicit_replication_order5_ack2
@@ -37,11 +38,6 @@ add_test(
 )
 
 # Set test properties
-set_tests_properties(e2e_basic_publish PROPERTIES
-    TIMEOUT 300  # 5 minutes max
-    LABELS "e2e;basic;smoke"
-)
-
 set_tests_properties(e2e_explicit_replication_order5_ack2 PROPERTIES
     TIMEOUT 600  # 10 minutes max (replication may take longer)
     LABELS "e2e;replication;order5;ack2"
@@ -353,6 +349,30 @@ if(PkgConfig_FOUND)
             LABELS "unit;ack2;durability;power_loss;correctness"
         )
 
+        # Uses two real processes, a MAP_SHARED frontier (local CXL emulation),
+        # SIGKILL between pwrite and fdatasync, then restart/redrive.  This is
+        # intentionally separate from the pure model above.
+        add_executable(media_durability_process_restart_test
+            media_durability_process_restart_test.cc
+        )
+        target_include_directories(media_durability_process_restart_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(media_durability_process_restart_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(media_durability_process_restart_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME integration_media_durability_process_restart
+                 COMMAND media_durability_process_restart_test)
+        set_tests_properties(integration_media_durability_process_restart PROPERTIES
+            TIMEOUT 60
+            LABELS "integration;ack2;durability;process_restart;cxl_emulation"
+        )
+
         add_executable(order5_recovery_property_test
             order5_recovery_property_test.cc
         )
@@ -395,6 +415,53 @@ if(PkgConfig_FOUND)
         set_tests_properties(unit_ack_rf_policy PROPERTIES
             TIMEOUT 60
             LABELS "unit;ack;rf;contract;correctness"
+        )
+
+        add_executable(baseline_control_transport_test
+            baseline_control_transport_test.cc
+            ../src/common/baseline_control_transport.cc
+        )
+        target_include_directories(baseline_control_transport_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(baseline_control_transport_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(baseline_control_transport_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            pthread
+        )
+        add_test(NAME unit_baseline_control_transport COMMAND baseline_control_transport_test)
+        set_tests_properties(unit_baseline_control_transport PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;baseline;control_transport;configuration"
+        )
+
+        add_executable(baseline_cxl_layout_test
+            baseline_cxl_layout_test.cc
+            ../src/cxl_transport/cxl_mailbox.cc
+        )
+        target_include_directories(baseline_cxl_layout_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(baseline_cxl_layout_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(baseline_cxl_layout_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            glog::glog
+            absl::flat_hash_map
+            heartbeat_grpc_proto
+            protobuf::libprotobuf
+            pthread
+        )
+        add_test(NAME unit_baseline_cxl_layout COMMAND baseline_cxl_layout_test)
+        set_tests_properties(unit_baseline_cxl_layout PROPERTIES
+            TIMEOUT 60
+            LABELS "unit;baseline;cxl;layout"
         )
 
         add_executable(nt_memcpy_test

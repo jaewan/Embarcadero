@@ -19,8 +19,9 @@ make -j$(nproc)
 cd ../test/e2e
 ./run_all.sh
 
-# Or run individual test
-./test_basic_publish.sh
+# Publication-style end-to-end cells
+cd ../..
+bash scripts/run_multiclient.sh
 ```
 
 ## Test Organization
@@ -28,7 +29,6 @@ cd ../test/e2e
 ```
 test/
 ├── e2e/                    # End-to-end tests (working)
-│   ├── test_basic_publish.sh
 │   ├── run_all.sh
 │   └── README.md
 ├── archive/                # Archived unit tests (disabled)
@@ -56,10 +56,8 @@ They're **archived, not deleted** because:
 ## Test Coverage
 
 ### What's Tested (E2E)
-- ✅ Broker cluster startup (4 brokers)
-- ✅ Client connection and publish
-- ✅ Basic throughput measurement
-- ✅ Crash detection
+- ✅ Scenario-specific broker/client correctness tests listed in `e2e/run_all.sh`
+- ✅ Publication-style broker/client runs through `scripts/run_multiclient.sh`
 
 ### What's NOT Tested (High Priority Gaps)
 - ❌ FIFO ordering enforcement (Property 3d)
@@ -73,7 +71,8 @@ They're **archived, not deleted** because:
 ## Adding New Tests
 
 ### E2E Test (Recommended)
-1. Copy `e2e/test_basic_publish.sh` as template
+1. Copy a current scenario script from `e2e/` as a template; do not use the
+   retired `test_basic_publish.sh`, which is intentionally excluded from CTest.
 2. Modify test scenario
 3. Add to `e2e/run_all.sh`
 4. Add to `CMakeLists.txt`
