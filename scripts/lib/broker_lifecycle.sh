@@ -824,6 +824,10 @@ broker_remote_launch() {
   local _remote_chain_sync_interval_ms="${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}"
   local _remote_lazylog_metadata_endpoints="${EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS:-}"
   local _remote_corfu_replica_endpoints="${EMBARCADERO_CORFU_REPLICA_ENDPOINTS:-}"
+  # Explicitly forward the deterministic media-fault seam for bounded remote
+  # durability tests. It is unset for normal and publication runs.
+  local _remote_fdatasync_fail="${EMBARCADERO_FDATASYNC_FAIL:-}"
+  local _remote_fdatasync_stall_ms="${EMBARCADERO_FDATASYNC_STALL_MS:-}"
 
   broker_remote_ssh env \
     REMOTE_STATE_DIR="$REMOTE_BROKER_STATE_DIR" \
@@ -856,6 +860,8 @@ broker_remote_launch() {
     REMOTE_CHAIN_REPLICATION_SINK="$_remote_chain_sink" \
     REMOTE_CHAIN_SYNC_BYTES="$_remote_chain_sync_bytes" \
     REMOTE_CHAIN_SYNC_INTERVAL_MS="$_remote_chain_sync_interval_ms" \
+    REMOTE_FDATASYNC_FAIL="$_remote_fdatasync_fail" \
+    REMOTE_FDATASYNC_STALL_MS="$_remote_fdatasync_stall_ms" \
     bash -s <<'EOF'
 set -euo pipefail
 state_dir=${REMOTE_STATE_DIR:?}
@@ -888,6 +894,8 @@ chain_replication_inmem_bytes=${REMOTE_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE:
 chain_replication_sink=${REMOTE_CHAIN_REPLICATION_SINK:-}
 chain_sync_bytes=${REMOTE_CHAIN_SYNC_BYTES:-}
 chain_sync_interval_ms=${REMOTE_CHAIN_SYNC_INTERVAL_MS:-}
+fdatasync_fail=${REMOTE_FDATASYNC_FAIL:-}
+fdatasync_stall_ms=${REMOTE_FDATASYNC_STALL_MS:-}
 mkdir -p "$state_dir"
 rm -f "$state_dir/broker_${idx}.pid" "$state_dir/broker_${idx}.ready" "$state_dir/broker_${idx}.log"
 nohup env \
@@ -922,6 +930,8 @@ nohup env \
   EMBARCADERO_CHAIN_REPLICATION_SINK="$chain_replication_sink" \
   EMBARCADERO_CHAIN_SYNC_BYTES="$chain_sync_bytes" \
   EMBARCADERO_CHAIN_SYNC_INTERVAL_MS="$chain_sync_interval_ms" \
+  EMBARCADERO_FDATASYNC_FAIL="$fdatasync_fail" \
+  EMBARCADERO_FDATASYNC_STALL_MS="$fdatasync_stall_ms" \
   bash -s <<'INNER' >/tmp/embarcadero_broker_${idx}_manager.log 2>&1 &
 set -euo pipefail
 state_dir=${STATE_DIR:?}

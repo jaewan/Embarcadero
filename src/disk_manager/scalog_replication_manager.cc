@@ -1,6 +1,7 @@
 #include "scalog_replication_manager.h"
 #include "cxl_manager/cxl_datastructure.h"
 #include "common/performance_utils.h"
+#include "common/durable_sync.h"
 #include "common/replica_disk_dirs.h"
 #include "scalog_replication.grpc.pb.h"
 
@@ -477,7 +478,7 @@ namespace Scalog {
 							if (bytes_written != task.size) {
 								throw std::runtime_error("Incomplete pwrite for fd " + std::to_string(current_fd));
 							}
-							if (fdatasync(current_fd) == -1) {
+							if (Embarcadero::DurableFdatasync(current_fd) == -1) {
 								throw std::system_error(errno, std::generic_category(), "fdatasync failed for fd " + std::to_string(current_fd));
 							}
 							write_successful = true;
@@ -827,7 +828,7 @@ namespace Scalog {
 						                        "CXLPollingLoop")) {
 							break;
 						}
-						if (fdatasync(fd_) == -1) {
+						if (Embarcadero::DurableFdatasync(fd_) == -1) {
 							LOG(ERROR) << "CXLPollingLoop: fdatasync failed: " << strerror(errno);
 							break;
 						}
@@ -923,7 +924,7 @@ namespace Scalog {
 				                        ("ReplicaPollingLoop[" + std::to_string(primary_broker_id) + "]").c_str())) {
 					break;
 				}
-				if (fdatasync(fd) == -1) {
+				if (Embarcadero::DurableFdatasync(fd) == -1) {
 					LOG(ERROR) << "ReplicaPollingLoop[" << primary_broker_id
 					           << "]: fdatasync failed: " << strerror(errno);
 					break;

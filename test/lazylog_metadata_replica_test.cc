@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -96,6 +97,47 @@ TEST(LazyLogMetadataReplicaStoreTest, TruncatedFinalRecordIsIgnoredOnRecovery) {
     EXPECT_FALSE(already_present);
     EXPECT_EQ(store.size(), 2u);
   }
+  std::filesystem::remove(path);
+}
+
+TEST(LazyLogMetadataReplicaStoreTest, FailedSyncDoesNotAdvanceDurableMetadataFrontier) {
+  const std::string path = TempPath("sync-failure");
+  std::string error;
+  {
+    LazyLog::MetadataReplicaStore store(path);
+    ASSERT_TRUE(store.Open(&error)) << error;
+    setenv("EMBARCADERO_FDATASYNC_FAIL", "1", 1);
+    bool already_present = false;
+    EXPECT_FALSE(store.Append(Request(), &already_present, &error));
+    EXPECT_EQ(store.size(), 0u);
+  }
+  unsetenv("EMBARCADERO_FDATASYNC_FAIL");
+  {
+    // A redrive must recover the descriptor once, rather than admitting a
+    // second logical record after a failed acknowledgement.
+    LazyLog::MetadataReplicaStore store(path);
+    ASSERT_TRUE(store.Open(&error)) << error;
+    bool already_present = false;
+    ASSERT_TRUE(store.Append(Request(), &already_present, &error)) << error;
+    EXPECT_TRUE(already_present);
+    EXPECT_EQ(store.size(), 1u);
+  }
+  std::filesystem::remove(path);
+}
+
+TEST(LazyLogMetadataReplicaStoreTest, SyncStallDelaysDurabilityAcknowledgement) {
+  const std::string path = TempPath("sync-stall");
+  std::string error;
+  LazyLog::MetadataReplicaStore store(path);
+  ASSERT_TRUE(store.Open(&error)) << error;
+  setenv("EMBARCADERO_FDATASYNC_STALL_MS", "40", 1);
+  bool already_present = false;
+  const auto start = std::chrono::steady_clock::now();
+  ASSERT_TRUE(store.Append(Request(), &already_present, &error)) << error;
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  unsetenv("EMBARCADERO_FDATASYNC_STALL_MS");
+  EXPECT_FALSE(already_present);
+  EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 30);
   std::filesystem::remove(path);
 }
 

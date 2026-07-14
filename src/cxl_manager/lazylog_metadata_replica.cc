@@ -1,4 +1,5 @@
 #include "lazylog_metadata_replica.h"
+#include "common/durable_sync.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -172,7 +173,7 @@ bool MetadataReplicaStore::AppendRecord(const std::string& encoded, std::string*
       !WriteFully(fd_, reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size(), error)) {
     return false;
   }
-  if (fdatasync(fd_) != 0) {
+  if (Embarcadero::DurableFdatasync(fd_) != 0) {
     if (error) *error = "metadata sidecar fdatasync failed: " + std::string(strerror(errno));
     return false;
   }
