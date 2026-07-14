@@ -106,6 +106,11 @@ Scalog labeling, and batching/RF instrumentation.
   manifest generation only; the multi-system, multi-RF publication campaign
   remains open until synchronized clean remote sequencer/client binaries are
   available.
+- Publication cells now fail closed on either a dirty local worktree or a dirty
+  configured remote sequencer worktree (`REQUIRE_CLEAN_WORKTREE=1` and
+  `REQUIRE_CLEAN_REMOTE=1`). Existing c2/c4 trees are dirty colleague trees;
+  they must be synchronized into isolated clean revision/build directories
+  before any comparative remote cell is retained.
 - **Current packet: M2.** Media-sync wiring is implemented and locally built;
   do not mark M2 complete until the remaining external-replica tests pass:
   - [x] Scalog CXL primary/remote-replica fault test (local four-process CXL
