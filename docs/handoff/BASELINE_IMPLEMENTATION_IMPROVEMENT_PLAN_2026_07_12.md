@@ -65,8 +65,12 @@ Scalog labeling, and batching/RF instrumentation.
     issuing a second global token.
   - [x] Failed/expired token phase: the proxy deadline is bounded at 30 seconds
     (publisher payload suppression remains part of the live smoke).
-  - [ ] Two-broker local smoke: membership-derived proxy endpoint selection
-    reaches each selected ingress broker and bounded publish terminates.
+  - [x] Two-broker membership-derived proxy smoke: clean commit `f79bf39f`
+    launched brokers 0/1 with proxy endpoints `50100/50101`; the remote c4
+    publisher completed 64/64 through the selected ingress path, with one
+    token request/grant, one payload send, and zero payload-before-grant
+    violations. The retained rerun used the tracked client config and records
+    `CORFU,grpc,broker_proxy,RF=1,ACK=1,git_dirty=false` in `run_contract.csv`.
 - **C1b implementation and focused local validation are complete; its real
   multi-process CXL deployment test remains open.** The broker proxy uses an
   MPSC handoff, one sole up-ring dispatcher, one sole down-ring receiver, and
