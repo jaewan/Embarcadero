@@ -340,6 +340,12 @@ if [[ "$SEQUENCER" == "LAZYLOG" && "$ACK" == "1" ]]; then
     ACK_DURABILITY_CONTRACT="$LAZYLOG_METADATA_CONTRACT"
 elif [[ "$SEQUENCER" == "CORFU" && "$ACK" == "2" && "$REPLICATION_FACTOR" -ge 2 ]]; then
     ACK_DURABILITY_CONTRACT="ack2_primary_plus_$((REPLICATION_FACTOR - 1))_ordered_media_durable_replicas"
+elif [[ "$SEQUENCER" == "SCALOG" && "$ACK" == "2" && "$REPLICATION_FACTOR" -ge 1 ]]; then
+    # Scalog orders from local durable cuts, then ACK2 clamps that order to the
+    # minimum media-synced prefix across the configured replica set.
+    ACK_DURABILITY_CONTRACT="ack2_minimum_media_durable_replica_prefix"
+elif [[ "$SEQUENCER" == "LAZYLOG" && "$ACK" == "2" && "$REPLICATION_FACTOR" -ge 1 ]]; then
+    ACK_DURABILITY_CONTRACT="ack2_minimum_media_durable_replica_prefix"
 fi
 
 # The metadata replicas are external services. Verify that every configured
