@@ -373,6 +373,41 @@ if(PkgConfig_FOUND)
             LABELS "integration;ack2;durability;process_restart;cxl_emulation"
         )
 
+        add_executable(scalog_replication_rpc_durability_test
+            scalog_replication_rpc_durability_test.cc
+            ../src/disk_manager/scalog_replication_client.cc
+            ../src/disk_manager/scalog_replication_manager.cc
+            ../src/common/configuration.cc
+        )
+        target_include_directories(scalog_replication_rpc_durability_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(scalog_replication_rpc_durability_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(scalog_replication_rpc_durability_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            scalog_replication_grpc_proto
+            scalog_sequencer_grpc_proto
+            protobuf::libprotobuf
+            glog::glog
+            gflags
+            ${FOLLY_LIBRARIES}
+            grpc++
+            grpc++_reflection
+            yaml-cpp
+            pthread
+        )
+        add_test(NAME integration_scalog_replication_rpc_durability
+                 COMMAND scalog_replication_rpc_durability_test)
+        set_tests_properties(integration_scalog_replication_rpc_durability PROPERTIES
+            TIMEOUT 60
+            LABELS "integration;scalog;replication;durability;fdatasync"
+        )
+
         add_executable(order5_recovery_property_test
             order5_recovery_property_test.cc
         )

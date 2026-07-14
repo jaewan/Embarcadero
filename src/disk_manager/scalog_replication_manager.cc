@@ -1150,11 +1150,9 @@ namespace Scalog {
 	}
 
 	void ScalogReplicationManager::Shutdown() {
-		static std::atomic<bool> shutdown_in_progress(false);
-
 		// Ensure shutdown is only done once
 		bool expected = false;
-		if (!shutdown_in_progress.compare_exchange_strong(expected, true)) {
+		if (!shutdown_in_progress_.compare_exchange_strong(expected, true)) {
 			return;
 		}
 

@@ -3,6 +3,7 @@
 #include "common/config.h"
 #include "cxl_manager/cxl_datastructure.h"
 #include <thread>
+#include <atomic>
 #include <scalog_sequencer.grpc.pb.h>
 
 using Embarcadero::TInode;
@@ -46,6 +47,7 @@ private:
     std::unique_ptr<grpc::Server> server_;
     std::thread server_thread_;
     std::string base_dir_;
+    std::atomic<bool> shutdown_in_progress_{false};
 };
 
 } // End of namespace Scalog
