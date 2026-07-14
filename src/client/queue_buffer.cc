@@ -275,6 +275,12 @@ bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* co
 	// Blocking acquire: pool exhaustion is backpressure, not a soft error.
 	// Always honor shutdown so destructor/ReturnReads cannot deadlock writers.
 	// PublishThreads ReleaseBatch after send; ACK credit is a separate bound.
+	//
+	// [[FENCE_PAUSE_DEADLOCK_FIX]] Drop the producer-op while blocked on the pool.
+	// HandleSessionFenced (AckThread) calls PauseSessionRollover, which waits for
+	// active_producer_ops_==0 before it can trim/release unacked pool slots. If we
+	// keep the op held here, Pause waits forever and the pool never frees — hung
+	// overnight latency runs after SESSION_FENCED (futex forever, log frozen).
 	while (!pool_->read(next)) {
 		if (shutdown_.load(std::memory_order_relaxed)) {
 			current_batch_ = nullptr;
@@ -284,14 +290,21 @@ bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* co
 			(void)context;
 			return false;
 		}
+		EndProducerOp();
 		if (++pool_spin < kPoolSpinBeforeWait) {
 			Embarcadero::CXL::cpu_pause();
-			continue;
+		} else {
+			std::unique_lock<std::mutex> lock(pool_mu_);
+			pool_cv_.wait_for(lock, std::chrono::milliseconds(1), [&]() {
+				return shutdown_.load(std::memory_order_relaxed) || pool_->size() > 0;
+			});
 		}
-		std::unique_lock<std::mutex> lock(pool_mu_);
-		pool_cv_.wait_for(lock, std::chrono::milliseconds(1), [&]() {
-			return shutdown_.load(std::memory_order_relaxed) || pool_->size() > 0;
-		});
+		if (!BeginProducerOp()) {
+			current_batch_ = nullptr;
+			current_batch_tail_ = 0;
+			current_batch_num_msg_ = 0;
+			return false;
+		}
 	}
 	current_batch_ = next;
 	// [[PERF]] Clear only the BatchHeader (128B), not the full 2MB slot.
@@ -716,10 +729,18 @@ void QueueBuffer::PauseSessionRollover() {
 	session_rollover_paused_ = true;
 	session_rollover_paused_fast_.store(true, std::memory_order_release);
 	std::atomic_thread_fence(std::memory_order_seq_cst);
-	session_rollover_cv_.wait(lock, [&]() {
-		return active_producer_ops_.load(std::memory_order_acquire) == 0 ||
-		       shutdown_.load(std::memory_order_acquire);
-	});
+	// Bound the wait: a stuck producer-op used to hang AckThread forever inside
+	// HandleSessionFenced. Prefer a loud timeout over a silent futex deadlock.
+	const bool quiesced = session_rollover_cv_.wait_for(
+		lock, std::chrono::seconds(5), [&]() {
+			return active_producer_ops_.load(std::memory_order_acquire) == 0 ||
+			       shutdown_.load(std::memory_order_acquire);
+		});
+	if (!quiesced && !shutdown_.load(std::memory_order_acquire)) {
+		LOG(ERROR) << "QueueBuffer::PauseSessionRollover: producers still active after 5s "
+		           << "(ops=" << active_producer_ops_.load(std::memory_order_acquire)
+		           << ") — proceeding to avoid AckThread deadlock";
+	}
 }
 
 size_t QueueBuffer::SealAllForSessionRollover() {

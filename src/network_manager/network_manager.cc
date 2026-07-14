@@ -96,8 +96,8 @@ static uint64_t GetNetworkSessionLeaseNs(bool replicated_ack2_mode) {
 			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
 		}
 	}
-	const uint64_t default_ms = replicated_ack2_mode ? 2000ULL : 1000ULL;
-	return default_ms * 1000ULL * 1000ULL;
+	(void)replicated_ack2_mode;
+	return 5000ULL * 1000ULL * 1000ULL;
 }
 
 static uint64_t Mix64Network(uint64_t x) {

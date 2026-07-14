@@ -534,8 +534,10 @@ uint64_t Publisher::SessionLeaseNs() const {
 			return static_cast<uint64_t>(parsed) * 1000ULL * 1000ULL;
 		}
 	}
-	const bool replicated = ack_level_ == 2;
-	return (replicated ? 2000ULL : 1000ULL) * 1000ULL * 1000ULL;
+	// Match broker GetSessionLeaseNs: RF0/RF2 defaults are both 5s so client
+	// rollover drain and broker hold-gap fencing agree.
+	(void)ack_level_;
+	return 5000ULL * 1000ULL * 1000ULL;
 }
 
 bool Publisher::IsMemoryEmulatedAck2() const {
@@ -1021,6 +1023,9 @@ void Publisher::WaitForSessionSendDrain(size_t target_messages) {
 
 void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& fenced, int broker_id) {
 	if (!IsOrder5SessionMode()) return;
+	// Serialize concurrent fence notifications (multiple brokers / remapped ACK
+	// sockets) so Pause/Seal/resubmit cannot interleave.
+	std::lock_guard<std::mutex> fence_lock(session_fence_handle_mu_);
 
 	// During ACK2 durable drain, identical lease restates of a frozen committed
 	// prefix must not reopen/resubmit (that re-burns BLog before ingest dedup).

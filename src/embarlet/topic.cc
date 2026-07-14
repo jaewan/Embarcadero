@@ -232,8 +232,11 @@ static uint64_t GetSessionLeaseNs(bool replicated_ack2_mode) {
 		LOG(WARNING) << "Ignoring invalid EMBARCADERO_SESSION_LEASE_MS='" << env
 		             << "'; using placeholder default";
 	}
-	const uint64_t default_ms = replicated_ack2_mode ? 2000ULL : 1000ULL;
-	return default_ms * 1000ULL * 1000ULL;
+	// RF0 was 1000ms; multi-broker ORDER=5 head gaps at latency start (seq N held
+	// while seq N+1 is still in flight to another broker) routinely last >1s and
+	// false-fenced healthy linger runs. Keep well above that skew window.
+	(void)replicated_ack2_mode;
+	return 5000ULL * 1000ULL * 1000ULL;
 }
 
 static uint64_t GetOrder5IdleForceExpireTriggerNs(bool replicated_ack2_mode) {
@@ -246,12 +249,10 @@ static uint64_t GetOrder5IdleForceExpireTriggerNs(bool replicated_ack2_mode) {
 		LOG(WARNING) << "Ignoring invalid EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS='" << env
 		             << "'; using runtime default";
 	}
-	// RF0 default was 750ms; that false-triggered during healthy latency runs when
-	// batch_seq N+1 was briefly delayed while later batches sat in hold (linger /
-	// multi-broker skew). Prefer sitting at/above the session lease so the normal
-	// gap lease fences first; idle force-expire remains a backstop for long stalls.
+	// Stay at/above the session lease so idle force-expire is a backstop, not the
+	// primary fence clock for transient multi-broker skew.
 	(void)replicated_ack2_mode;
-	const uint64_t default_ms = 2000ULL;
+	const uint64_t default_ms = 5000ULL;
 	return default_ms * 1000ULL * 1000ULL;
 }
 

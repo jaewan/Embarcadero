@@ -356,6 +356,7 @@ class Publisher {
 			std::atomic<uint64_t> session_fenced_observed_{0};
 			std::atomic<int64_t> last_unacked_send_ns_{0};
 			std::atomic<int64_t> last_ack_progress_ns_{0};
+			std::mutex session_fence_handle_mu_;
 			std::mutex unacked_mu_;
 			std::condition_variable unacked_cv_;
 			std::deque<UnackedBatch> unacked_batches_;
