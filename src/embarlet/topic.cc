@@ -246,7 +246,12 @@ static uint64_t GetOrder5IdleForceExpireTriggerNs(bool replicated_ack2_mode) {
 		LOG(WARNING) << "Ignoring invalid EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS='" << env
 		             << "'; using runtime default";
 	}
-	const uint64_t default_ms = replicated_ack2_mode ? 2000ULL : 750ULL;
+	// RF0 default was 750ms; that false-triggered during healthy latency runs when
+	// batch_seq N+1 was briefly delayed while later batches sat in hold (linger /
+	// multi-broker skew). Prefer sitting at/above the session lease so the normal
+	// gap lease fences first; idle force-expire remains a backstop for long stalls.
+	(void)replicated_ack2_mode;
+	const uint64_t default_ms = 2000ULL;
 	return default_ms * 1000ULL * 1000ULL;
 }
 
@@ -260,7 +265,7 @@ static uint64_t GetOrder5IdleForceExpireWindowNs(bool replicated_ack2_mode) {
 		LOG(WARNING) << "Ignoring invalid EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_WINDOW_MS='" << env
 		             << "'; using runtime default";
 	}
-	const uint64_t default_ms = replicated_ack2_mode ? 1000ULL : 250ULL;
+	const uint64_t default_ms = replicated_ack2_mode ? 1000ULL : 500ULL;
 	return default_ms * 1000ULL * 1000ULL;
 }
 
@@ -6590,6 +6595,9 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				note.control_epoch = CurrentControlEpoch();
 				note.reason = 0;  // SessionFenced::HOLD_EXPIRY
 				PublishSessionFenceNotification(note);
+				// Disarm idle force-expire so the client's reopen/resubmit epoch is
+				// not immediately re-fenced under a still-active shortened lease.
+				force_expire_hold_until_ns_.store(0, std::memory_order_release);
 			}
 			purge_fenced_session(shard_session_key);
 		};

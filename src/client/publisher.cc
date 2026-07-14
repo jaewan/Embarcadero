@@ -1137,6 +1137,8 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		pubQue_.ReleaseBatch(batch);
 	}
 	if (locally_committed_msgs > 0) {
+		// Prefer the global ORDER=5 ledger; also keep B0 diagnostic counters in sync
+		// so per-broker ACK dumps do not look like a head stall after remap.
 		broker_stats_[0].acked_messages.fetch_add(locally_committed_msgs, std::memory_order_relaxed);
 		ack_received_.fetch_add(locally_committed_msgs, std::memory_order_release);
 		LOG(WARNING) << "[SESSION_FENCE_LOCAL_COMMIT]"
@@ -1150,6 +1152,11 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 	CHECK_EQ(rebased_ack_base, ack_after_local_credit);
 	ack_message_base_.store(rebased_ack_base, std::memory_order_release);
 	order5_last_ack_hwm_.store(rebased_ack_base, std::memory_order_release);
+	// Collapse post-fence attribution onto the global ledger so Poll/WaitUntilAcked
+	// and B0 diagnostics agree even if later ACK deltas arrive on remapped sockets.
+	if (!broker_stats_.empty()) {
+		broker_stats_[0].acked_messages.store(rebased_ack_base, std::memory_order_relaxed);
+	}
 	{
 		std::lock_guard<std::mutex> lock(unacked_mu_);
 		session_retire_prefix_hwm_ = rebased_ack_base;
@@ -2265,15 +2272,14 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 		auto last_log_time = wait_start_time;
 		auto last_ack_change_time = wait_start_time;
 		auto normalized_acks = [&]() -> size_t {
-			// ORDER=5 ACK1/ACK2 are head-owned on broker 0. The broker emits a single
-			// per-client frontier for the whole client stream, not one frontier per
-			// routed broker. Summing min(sent_i, acked_i) therefore collapses a
-			// correct global ACK stream down to one broker's quota.
-			if (seq_type_ == heartbeat_system::SequencerType::EMBARCADERO &&
-			    order_level_ == Embarcadero::kOrderStrong &&
-			    (ack_level_ == 1 || ack_level_ == 2) &&
-			    !broker_stats_.empty()) {
-				return broker_stats_[0].acked_messages.load(std::memory_order_relaxed);
+			// ORDER=5 ACK1/ACK2 are a single per-client frontier. EpollAckThread
+			// already folds every socket's deltas into order5_last_ack_hwm_ /
+			// ack_received_, while broker_stats_[i] only records which socket
+			// delivered the delta. After fence/reconnect the head ACK fd often
+			// remaps, so broker_stats_[0] can stall (e.g. B0=27, B1=118k) while
+			// the global ledger is correct — wait on that ledger, not B0 alone.
+			if (IsOrder5SessionMode() && (ack_level_ == 1 || ack_level_ == 2)) {
+				return order5_last_ack_hwm_.load(std::memory_order_acquire);
 			}
 			size_t total = 0;
 			for (size_t i = 0; i < broker_stats_.size(); i++) {
@@ -2504,6 +2510,9 @@ bool Publisher::WaitUntilAcked(size_t n) {
 	auto last_log_time = wait_start_time;
 	auto last_ack_change_time = wait_start_time;
 	auto normalized_acks = [&]() -> size_t {
+		if (IsOrder5SessionMode() && (ack_level_ == 1 || ack_level_ == 2)) {
+			return order5_last_ack_hwm_.load(std::memory_order_acquire);
+		}
 		size_t total = 0;
 		for (size_t i = 0; i < broker_stats_.size(); i++) {
 			const size_t sent = broker_stats_[i].sent_messages.load(std::memory_order_relaxed);

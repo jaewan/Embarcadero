@@ -107,13 +107,23 @@ inline bool ShouldFenceSessionGap(
 	       now_ns - state.gap_since_ns >= session_lease_ns;
 }
 
-/// When the idle force-expire window is armed, gaps must fence immediately so
-/// held suffixes drain (via SESSION_FENCED + client resubmit) instead of waiting
-/// out the full session lease after the stall detector already fired.
+/// When a force-expire window is armed (idle stall detector or disconnect),
+/// shorten the hold-gap fence lease so recovery starts sooner than the full
+/// session lease — but keep it non-zero.
+///
+/// Returning 0 previously instant-fenced any head gap, including brand-new
+/// epochs opened during client resubmit while the window was still armed.
+/// Latency runs then entered a fence→reopen→fence storm and stuck ACK waits
+/// (B0 ordered HWM frozen, B2/B3=0). A short positive lease still accelerates
+/// true stalls without killing in-flight recovery.
 inline uint64_t EffectiveOrder5SessionFenceLeaseNs(
 		uint64_t session_lease_ns,
 		bool force_expire_active) {
-	return force_expire_active ? 0 : session_lease_ns;
+	if (!force_expire_active) return session_lease_ns;
+	constexpr uint64_t kForceExpireShortLeaseNs = 250ULL * 1000ULL * 1000ULL;  // 250ms
+	return session_lease_ns < kForceExpireShortLeaseNs
+		? session_lease_ns
+		: kForceExpireShortLeaseNs;
 }
 
 inline bool ShouldClearSessionGapFromHeldMax(uint64_t next_expected, uint64_t max_held_seq) {

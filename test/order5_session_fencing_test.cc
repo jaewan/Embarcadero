@@ -60,15 +60,21 @@ TEST(Order5SessionFencingTest, EpochZeroTargetedScannerSkipAdvancesLegacyFrontie
 
 TEST(Order5SessionFencingTest, ForceExpireShortensEffectiveFenceLease) {
 	EXPECT_EQ(EffectiveOrder5SessionFenceLeaseNs(2'000'000'000ULL, false), 2'000'000'000ULL);
-	EXPECT_EQ(EffectiveOrder5SessionFenceLeaseNs(2'000'000'000ULL, true), 0u);
+	// Armed force-expire shortens to 250ms; must stay non-zero so reopen epochs
+	// are not instant-fenced during an still-armed recovery window.
+	EXPECT_EQ(EffectiveOrder5SessionFenceLeaseNs(2'000'000'000ULL, true), 250'000'000ULL);
+	EXPECT_EQ(EffectiveOrder5SessionFenceLeaseNs(100'000'000ULL, true), 100'000'000ULL);
 
 	OptimizedClientState state;
 	state.session_epoch = 3;
 	state.next_expected = 5;
 	state.note_gap(1'000);
 	EXPECT_FALSE(ShouldFenceSessionGap(state, 1'500, 2'000'000'000ULL));
-	EXPECT_TRUE(ShouldFenceSessionGap(
-		state, 1'500, EffectiveOrder5SessionFenceLeaseNs(2'000'000'000ULL, true)));
+	const uint64_t short_lease =
+		EffectiveOrder5SessionFenceLeaseNs(2'000'000'000ULL, true);
+	EXPECT_FALSE(ShouldFenceSessionGap(state, 1'500, short_lease))
+		<< "500ns after gap start must not fence under 250ms short lease";
+	EXPECT_TRUE(ShouldFenceSessionGap(state, 1'000 + short_lease, short_lease));
 }
 
 TEST(Order5SessionFencingTest, NonzeroSessionFenceFiresOnce) {
