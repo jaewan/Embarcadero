@@ -25,10 +25,14 @@ REMOTE_JOBS="${REMOTE_JOBS:-$(nproc 2>/dev/null || echo 8)}"
 # for more; each token becomes one --exclude.
 RSYNC_EXCLUDES=(
   'build/'
+  'build-*/'
   'data/'
+  'multiclient_logs/'
   '.Replication/'
   '.cursor/'
   '.git/'
+  '*.pdf'
+  '*.zip'
 )
 excludes=()
 for x in "${RSYNC_EXCLUDES[@]}"; do
@@ -41,7 +45,14 @@ if [[ -n "${RSYNC_EXTRA_EXCLUDES:-}" ]]; then
 fi
 
 echo "==> rsync $PROJECT_ROOT/ -> $REMOTE_SPEC"
-rsync -av --delete "${excludes[@]}" "$PROJECT_ROOT/" "$REMOTE_SPEC"
+# Remote client worktrees may be shared with other developers. Updating our
+# tracked source is sufficient for a native client rebuild; deletion is an
+# explicit maintenance action, never the default sync behavior.
+delete_args=()
+if [[ "${REMOTE_SYNC_DELETE:-0}" == "1" ]]; then
+  delete_args+=(--delete)
+fi
+rsync -av "${delete_args[@]}" "${excludes[@]}" "$PROJECT_ROOT/" "$REMOTE_SPEC"
 
 # Nodes without GitHub access cannot run FetchContent git clone. Seed grpc from this machine's
 # build tree (must already exist under build/_deps/grpc-src). Example:

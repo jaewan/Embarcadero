@@ -490,12 +490,6 @@ namespace Embarcadero{
 		size_t batch_last_logical_offset = 0;
 		uint64_t next_expected_pbr_index = 0;
 		
-		// Periodic durability sync state
-		size_t bytes_since_sync = 0;
-		auto last_sync_time = std::chrono::steady_clock::now();
-		constexpr size_t kSyncBytesThreshold = 64 * 1024 * 1024; // 64 MiB
-		constexpr auto kSyncTimeThreshold = std::chrono::milliseconds(250); // 250 ms
-		
 		// [[PERF_CLEANUPS]] - Scan backoff state (spin→sleep pattern for low-load efficiency)
 		constexpr auto kSpinDuration = std::chrono::microseconds(100);  // Spin for 100us
 		constexpr auto kSleepDuration = std::chrono::milliseconds(1);    // Then sleep for 1ms
@@ -514,8 +508,11 @@ namespace Embarcadero{
 					batch_payload, batch_payload_size,
 					batch_start_logical_offset, batch_last_logical_offset)) {
 				
-				// Flag to track if batch write succeeded
+				// A replication_done frontier is an ACK-visible durability claim.  In
+				// disk mode it may advance only after both the full pwrite and the
+				// corresponding fdatasync complete successfully.
 				bool batch_write_success = true;
+				bool batch_media_durable = log_to_memory_;
 				
 				// Write batch payload to disk (with proper short-write handling)
 				if (batch_payload_size > 0) {
@@ -567,9 +564,23 @@ namespace Embarcadero{
 							} else {
 								// Partial or full write succeeded
 								bytes_written_total += written;
-								bytes_since_sync += written;
 							}
 						}
+					}
+				}
+
+				// Do not amortize this sync across batches: doing so would expose a
+				// replication_done value for data that was merely in the page cache.
+				// On sync failure fail closed and leave both the local and mirrored
+				// frontiers unchanged.
+				if (batch_write_success && !log_to_memory_) {
+					if (fdatasync(fd) < 0) {
+						LOG(ERROR) << "fdatasync failed for broker " << req.broker_id
+						           << ": " << strerror(errno)
+						           << "; refusing to advance replication_done";
+						batch_write_success = false;
+					} else {
+						batch_media_durable = true;
 					}
 				}
 				
@@ -578,28 +589,10 @@ namespace Embarcadero{
 					disk_offset += batch_payload_size;
 				}
 				
-			// Only proceed with sync and replication_done update if write succeeded
-			if (batch_write_success) {
-				// [[PERIODIC_DURABILITY_SYNC]] - Periodic fdatasync policy for ack_level=2
-				// Syncs to disk when either:
-				// - 64 MiB written since last sync (kSyncBytesThreshold)
-				// - 250ms elapsed since last sync (kSyncTimeThreshold)
-				// This provides "eventual durability" semantics for ack_level=2
-				// Note: For stronger guarantees, consider configurable thresholds or explicit fsync() per batch
-				if (!log_to_memory_) {
-					auto now = std::chrono::steady_clock::now();
-					bool sync_needed = (bytes_since_sync >= kSyncBytesThreshold) ||
-					                   (now - last_sync_time >= kSyncTimeThreshold);
-					
-					if (sync_needed && bytes_since_sync > 0) {
-						if (fdatasync(fd) < 0) {
-							LOG(ERROR) << "fdatasync failed for broker " << req.broker_id << ": " << strerror(errno);
-						}
-						bytes_since_sync = 0;
-						last_sync_time = now;
-					}
-				}
-				
+			// Only proceed with replication_done update after the durable sink has
+			// completed.  This is the source for non-ORDER5 ACK2 and for CXL
+			// Scalog/LazyLog local-cut visibility.
+			if (batch_write_success && batch_media_durable) {
 				// Update replication_done to signal ACK level 2
 				// [[EXPLICIT_REPLICATION_STAGE4]] - Flush after replication_done update
 				// Only advance replication_done after full batch is successfully written to disk
@@ -708,13 +701,6 @@ namespace Embarcadero{
 			}
 		} // End while(!stop_threads_)
 		
-		// Final sync if needed
-		if (!log_to_memory_ && bytes_since_sync > 0) {
-			if (fdatasync(fd) < 0) {
-				LOG(WARNING) << "Final fdatasync failed for broker " << req.broker_id << ": " << strerror(errno);
-			}
-		}
-
 	// --- Cleanup ---
 	VLOG(1) << "[ReplicateThread " << req.broker_id << "]: Stopping replication loop.";
 

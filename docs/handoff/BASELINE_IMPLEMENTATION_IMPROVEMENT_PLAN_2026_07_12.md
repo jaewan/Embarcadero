@@ -16,19 +16,59 @@ Scalog labeling, and batching/RF instrumentation.
   append, a transient replica restart/redrive, and that no acknowledged batch
   is lost. Record the resulting `run_contract.csv`. This is an external-cluster
   gate and remains pending; do not infer it from local unit tests.
+
+### Validation note — 2026-07-15 (local four-process CXL emulation)
+
+- The direct Embarcadero four-broker smoke passed on this CXL-memory machine.
+  The mapping was POSIX shared memory (`dax_backed=0`), so this is process-level
+  CXL/control-path emulation only, not a multi-host failure-domain result.
+- The initial faithful LazyLog RF2 reproducer exposed an ACK shortfall
+  (1,924/2,048). Investigation showed that the metadata sidecars had accepted
+  every immutable descriptor, while the data-replica frontier had not been
+  published with the contiguous-range release protocol. LazyLog now uses
+  `PublishValidatedWrittenRange`, as Scalog does, rather than an unfenced raw
+  frontier store. This prevents an ACK from observing metadata durability ahead
+  of payload visibility/durability.
+- A fresh faithful RF2 smoke subsequently passed: four local broker processes,
+  two independent metadata-replica processes, and the standalone sequencer
+  acknowledged 2,048/2,048 messages. The trace showed the payload frontier,
+  primary/replica durable frontiers, and metadata callback all advancing before
+  the ACK verification. This validates the local process-emulation path only.
+  It does not close the external multi-host/failure-restart gate above.
+- The launcher now fails before broker startup if a selected local sequencer
+  executable is absent, and `lazylog_metadata_replica` is emitted under
+  `<build>/bin` with the other deployable roles. These artifact fixes do not
+  close the protocol-validation blocker above.
 - M1 is complete for Corfu RF2 only. Corfu ACK2 rejects RF>2 until C2 installs
   the required ordered replica chain.
-- **C1a implementation is present but unvalidated. Do not mark it complete
-  until these tests pass:**
-  - [ ] In-process direct-sequencer versus broker-proxy trace parity: identical
+- **C1a implementation is present and its focused proxy checks have passed;
+  the live publisher smoke remains required before it is complete:**
+  - [x] In-process direct-sequencer versus broker-proxy trace parity: identical
     requests produce identical grants and ordering.
-  - [ ] Retry/idempotence: repeat the same logical proxy request after a
+  - [x] Retry/idempotence: repeat the same logical proxy request after a
     successful grant and verify the cache returns the identical grant without
     issuing a second global token.
-  - [ ] Failed/expired token phase: the publisher records failure and sends no
-    payload bytes before a grant; proxy deadline is bounded at 30 seconds.
+  - [x] Failed/expired token phase: the proxy deadline is bounded at 30 seconds
+    (publisher payload suppression remains part of the live smoke).
   - [ ] Two-broker local smoke: membership-derived proxy endpoint selection
     reaches each selected ingress broker and bounded publish terminates.
+- **C1b implementation and focused local validation are complete; its real
+  multi-process CXL deployment test remains open.** The broker proxy uses an
+  MPSC handoff, one sole up-ring dispatcher, one sole down-ring receiver, and
+  a transport-only correlation ID. Its focused smoke verifies mailbox token
+  assignment, retry idempotence, ingress ownership, status mapping, and
+  concurrent proxy callers. It has not yet passed a real multi-process CXL run.
+- **Corfu RF3 implementation status — 2026-07-15:** C2/C3 now implement the
+  serialized RF-includes-primary chain, payload+CRC `WriteOnce`, durable
+  sidecar recovery, and a broker-indexed replica membership map. RF>1 fails
+  closed without an explicitly configured durable replica directory, and the
+  launcher passes disk mode to each Corfu broker. Focused chain/proxy/mailbox
+  tests pass. A four-broker CXL process smoke reached all four durable replica
+  listeners, but the c4 publisher had only 3/4 ACK connections (B1 missing)
+  and therefore sent no complete batch. This is a multi-broker publisher
+  readiness failure, not RF3 success. C4 remains open; retain no RF3 result
+  until that ACK-connect defect is fixed and the remote/client process smoke
+  completes with chain-sidecar evidence.
 - **Current packet: M2.** Media-sync wiring is implemented and locally built;
   do not mark M2 complete until these tests are added and pass:
   - [ ] Scalog replication-RPC test: a successful response is impossible before

@@ -35,7 +35,11 @@ namespace Embarcadero {
 namespace cxl_transport {
 
 inline constexpr uint32_t kMailboxSegmentMagic = 0x53424D45;  // 'EMBS'
-inline constexpr uint32_t kMailboxSegmentVersion = 1;
+// Version 2 adds Corfu mailbox session/key echoes.  Even though the fixed
+// 512-byte ring slot and CXL offsets did not change, a v1 coordinator would
+// not populate the new validation fields.  Attach must therefore reject mixed
+// role binaries rather than silently accepting stale/aliased grants.
+inline constexpr uint32_t kMailboxSegmentVersion = 2;
 
 struct MailboxParams {
 	uint32_t num_brokers = 0;
@@ -103,6 +107,8 @@ class MailboxSegment {
 	MailboxRing& down(uint32_t broker_id) { return down_[broker_id]; }
 	uint32_t num_brokers() const { return num_brokers_; }
 	uint32_t record_size() const { return record_size_; }
+	uint32_t up_capacity() const { return up_.empty() ? 0 : up_.front().capacity(); }
+	uint32_t down_capacity() const { return down_.empty() ? 0 : down_.front().capacity(); }
 
 	// Broadcast a record to every broker's down ring (Scalog GlobalCut / LazyLog
 	// GlobalBinding).

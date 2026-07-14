@@ -16,6 +16,7 @@
 #include "embarlet/topic_manager.h"
 #include "network_manager/network_manager.h"
 #include "common/performance_utils.h"
+#include "cxl_transport/cxl_mailbox.h"
 
 namespace Embarcadero{
 
@@ -46,6 +47,16 @@ class CXLManager{
 		GOIEntry* GetGOI() { return goi_; }
 		CompletionVectorEntry* GetCompletionVector() { return completion_vector_; }
 		ControlBlock* GetControlBlock() { return control_block_; }
+		// Reserved, fixed-offset control-plane mailbox region.  Ownership is
+		// intentionally separate from CXLManager: broker 0 creates it and peers
+		// attach, while standalone sequencers must attach non-destructively.
+		void* GetBaselineMailboxBase() { return baseline_mailbox_base_; }
+		size_t GetBaselineMailboxBytes() const { return baseline_mailbox_bytes_; }
+		// Non-owning handle to the fixed-layout control mailbox.  It is available
+		// only when EMBARCADERO_BASELINE_CONTROL_TRANSPORT=cxl_mailbox.
+		cxl_transport::MailboxSegment* GetBaselineMailboxSegment() {
+			return baseline_mailbox_segment_.get();
+		}
 		bool RequiresExplicitPayloadHeaderFlush() const { return requires_explicit_payload_header_flush_; }
 
 		void RegisterGetRegisteredBrokersCallback(GetRegisteredBrokersCallback callback){
@@ -114,6 +125,12 @@ class CXLManager{
 		ControlBlock* control_block_;                 // [[PHASE_1A]] At offset 0; epoch-based fencing
 		CompletionVectorEntry* completion_vector_;    // [[PHASE_2]] At offset 0x1000; ACK path (32 × 128B)
 		GOIEntry* goi_;                               // [[PHASE_2]] At offset 0x2000; 256M entries × 64B = 16GB
+		void* baseline_mailbox_base_{nullptr};
+		size_t baseline_mailbox_bytes_{0};
+		// Owns only the local handle; the segment storage is the fixed CXL extent.
+		// Broker 0 creates after zeroing and every non-head broker attaches without
+		// modifying it.  This makes mailbox initialization explicit and fail-closed.
+		std::unique_ptr<cxl_transport::MailboxSegment> baseline_mailbox_segment_;
 		void* base_for_regions_;                      // [[PHASE_1A]] cxl_addr_ + sizeof(ControlBlock); TInode/bitmap/batchHeaders/segments base
 		void* bitmap_;
 		void* batchHeaders_;

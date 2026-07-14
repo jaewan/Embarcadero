@@ -1722,7 +1722,10 @@ bool Publisher::Init(int ack_level) {
 			if (elapsed >= ACK_THREAD_INIT_TIMEOUT) {
 				LOG(ERROR) << "Publisher::Init() timed out after " << ACK_THREAD_INIT_TIMEOUT.count()
 				           << "s waiting for ACK thread. EpollAckThread may have failed (e.g. bind/listen).";
-				break;
+				// No broker may be allowed to publish to an ACK endpoint that never
+				// became a listener.  Continuing here makes a connection race look
+				// like partial broker failure and can admit an unacknowledgeable batch.
+				return false;
 			}
 			std::this_thread::yield();
 		}
@@ -1892,10 +1895,15 @@ bool Publisher::Init(int ack_level) {
 							missing_str += "B" + std::to_string(bid);
 						}
 					}
-					LOG(WARNING) << "  Connected brokers: " << (connected_str.empty() ? "(none)" : connected_str);
-					LOG(WARNING) << "  Missing brokers: " << (missing_str.empty() ? "(none)" : missing_str);
-				}
-				break;
+				LOG(WARNING) << "  Connected brokers: " << (connected_str.empty() ? "(none)" : connected_str);
+				LOG(WARNING) << "  Missing brokers: " << (missing_str.empty() ? "(none)" : missing_str);
+			}
+				// Token/payload correctness is not enough if an expected ACK path is
+				// absent: continuing here admitted work that can never satisfy ACK2
+				// (and previously left RF3 smokes hung).  Fail before any publisher
+				// thread can enqueue a payload; the orchestrator may retry a clean
+				// startup, but it must not turn partial connectivity into a result.
+				return false;
 			}
 
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -2491,6 +2499,18 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	// This allows the subscriber to continue using the cluster management infrastructure
 	// The context will be cleaned up when the Publisher object is destroyed
 	LogOrder5RoutingSummary();
+	if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
+		const uint64_t token_requests = corfu_token_requests_.load(std::memory_order_relaxed);
+		const uint64_t token_grants = corfu_token_grants_.load(std::memory_order_relaxed);
+		const uint64_t token_latency_ns = corfu_token_latency_ns_.load(std::memory_order_relaxed);
+		LOG(INFO) << "[CORFU_TOKEN_PHASE] requests=" << token_requests
+		          << " grants=" << token_grants
+		          << " payload_sends=" << corfu_payload_sends_.load(std::memory_order_relaxed)
+		          << " payload_before_grant="
+		          << corfu_payload_before_grant_.load(std::memory_order_relaxed)
+		          << " mean_token_latency_us="
+		          << (token_requests == 0 ? 0 : token_latency_ns / token_requests / 1000);
+	}
 	const auto poll_done_time = std::chrono::steady_clock::now();
 	LOG(INFO) << "[POLL_BREAKDOWN] target_messages=" << n
 	          << " ack_enabled=" << (ack_level_ >= 1 ? 1 : 0)
@@ -3452,6 +3472,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// Function to send batch header
 		auto send_batch_header = [&]() -> void {
+			bool corfu_token_granted = false;
 			auto* net_profile = ShouldEnableNetworkPathProfile() ? &GetClientNetworkPathProfile() : nullptr;
 			auto header_loop_start = std::chrono::steady_clock::now();
 			// Always refresh broker_id from the (potentially updated) local variable.
@@ -3496,13 +3517,27 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 						// This ensures in-order delivery to the sequencer, eliminating UNAVAILABLE retries.
 						std::lock_guard<std::mutex> lock(corfu_seq_per_broker_lock_[broker_id]);
 						batch_header->batch_seq = corfu_batch_seq_per_broker_[broker_id].fetch_add(1, std::memory_order_relaxed);
+						const auto token_start = std::chrono::steady_clock::now();
+						corfu_token_requests_.fetch_add(1, std::memory_order_relaxed);
 						got_total_order = corfu_client_->GetTotalOrder(batch_header, proxy_endpoint);
+						corfu_token_latency_ns_.fetch_add(
+							std::chrono::duration_cast<std::chrono::nanoseconds>(
+								std::chrono::steady_clock::now() - token_start).count(),
+							std::memory_order_relaxed);
 					} else {
+						const auto token_start = std::chrono::steady_clock::now();
+						corfu_token_requests_.fetch_add(1, std::memory_order_relaxed);
 						got_total_order = corfu_client_->GetTotalOrder(batch_header, proxy_endpoint);
+						corfu_token_latency_ns_.fetch_add(
+							std::chrono::duration_cast<std::chrono::nanoseconds>(
+								std::chrono::steady_clock::now() - token_start).count(),
+							std::memory_order_relaxed);
 					}
 					if (!got_total_order) {
 						throw std::runtime_error("corfu sequencer GetTotalOrder failed");
 					}
+					corfu_token_grants_.fetch_add(1, std::memory_order_relaxed);
+					corfu_token_granted = true;
 
 				VLOG(2) << "Publisher: Got total_order=" << batch_header->total_order
 				        << " for batch with " << batch_header->num_msg << " messages";
@@ -3522,6 +3557,13 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			// ORDER=5 EMBARCADERO now uses per-broker batch_seq to match broker-local stream sequencing.
 
 			// Send batch header with retry logic
+			if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
+				if (!corfu_token_granted) {
+					corfu_payload_before_grant_.fetch_add(1, std::memory_order_relaxed);
+					throw std::runtime_error("Corfu payload attempted without token grant");
+				}
+				corfu_payload_sends_.fetch_add(1, std::memory_order_relaxed);
+			}
 			size_t total_sent = 0;
 			const size_t header_size = sizeof(Embarcadero::BatchHeader) + len;
 			size_t consecutive_timeouts = 0;

@@ -100,9 +100,9 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     if (seq_type == heartbeat_system::SequencerType::CORFU && ack_level == 2 &&
-        replication_factor != Embarcadero::kMinReplicationFactorForAck2) {
-        LOG(ERROR) << "Corfu ACK=2 currently supports only RF=2 (primary plus one "
-                   << "media-durable replica); RF>2 chain replication is not implemented.";
+        replication_factor < Embarcadero::kMinReplicationFactorForAck2) {
+        LOG(ERROR) << "Corfu ACK=2 requires RF>=2 (the CXL primary plus at least one "
+                   << "ordered media-durable replica).";
         return -1;
     }
     if (seq_type == heartbeat_system::SequencerType::SCALOG && ack_level == 2 &&

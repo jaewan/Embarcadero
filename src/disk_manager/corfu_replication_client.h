@@ -7,6 +7,7 @@
 #include <random>
 #include <mutex>
 #include <atomic>
+#include "disk_manager/corfu_ordered_chain.h"
 
 // Include the generated gRPC headers
 #include "corfu_replication.grpc.pb.h"
@@ -32,6 +33,8 @@ public:
      * @param server_address The address of the server in format "hostname:port"
      */
     explicit CorfuReplicationClient(const char* topic, size_t replication_factor, const std::string& server_address);
+    CorfuReplicationClient(const char* topic, size_t replication_factor,
+                           std::vector<CorfuReplicaTarget> ordered_targets);
 
     /**
      * @brief Destroy the client and release resources
@@ -65,6 +68,11 @@ public:
      */
     bool ReplicateData(size_t start_idx, size_t size, void* data,
                       int max_retries = 3);
+    bool AppendOrdered(const CorfuAppendDescriptor& descriptor);
+    bool CompleteHole(const CorfuAppendDescriptor& descriptor);
+    // Complete an explicitly identified abandoned slot.  Callers must obtain
+    // the slot from durable recovery state; this API never guesses a hole.
+    bool CompleteJunkHole(const CorfuSlotKey& slot);
 
     /**
      * @brief Check if client is connected to server
@@ -113,7 +121,9 @@ private:
 
 		std::string topic_;
 		size_t replication_factor_;
-    std::string server_address_;
+		std::string server_address_;
+		std::vector<CorfuReplicaTarget> ordered_targets_;
+		std::vector<std::unique_ptr<CorfuChainEndpoint>> chain_endpoints_;
     std::shared_ptr<grpc::Channel> channel_;
     std::unique_ptr<corfureplication::CorfuReplicationService::Stub> stub_;
     std::atomic<bool> is_connected_{false};

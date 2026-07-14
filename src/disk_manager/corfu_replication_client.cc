@@ -8,6 +8,34 @@
 #include <random>
 
 namespace Corfu {
+namespace {
+uint32_t Crc32c(const uint8_t* p, size_t n) { uint32_t c=~0u; while(n--){c^=*p++;for(int i=0;i<8;++i)c=(c>>1)^(0x82f63b78u&-(c&1));}return ~c; }
+class GrpcChainEndpoint final : public CorfuChainEndpoint {
+ public:
+  explicit GrpcChainEndpoint(const std::string& endpoint)
+      : channel_(grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials())),
+        stub_(corfureplication::CorfuReplicationService::NewStub(channel_)) {}
+  CorfuProbeResult Probe(const CorfuSlotKey& key) override {
+    corfureplication::CorfuProbeRequest req; auto* s=req.mutable_slot(); s->set_topic(key.topic); s->set_broker_id(key.broker_id); s->set_broker_batch_seq(key.broker_batch_seq);
+    corfureplication::CorfuProbeResponse out; grpc::ClientContext ctx; ctx.set_deadline(std::chrono::system_clock::now()+std::chrono::seconds(10));
+    if (!stub_->ProbeSlot(&ctx,req,&out).ok()) return {};
+    CorfuProbeResult r; r.state=out.state()==corfureplication::CORFU_VALUE?CorfuSlotState::kValue:out.state()==corfureplication::CORFU_JUNK?CorfuSlotState::kJunk:CorfuSlotState::kUnwritten;
+    if (r.state == CorfuSlotState::kValue) {
+      r.value = {out.value().client_id(), out.value().original_client_batch_seq(),
+                 out.value().total_order(), out.value().num_msg(), out.value().total_size()};
+    }
+    return r;
+  }
+  CorfuWriteStatus WriteOnce(const CorfuAppendDescriptor& d) override {
+    if (!d.payload || d.size != d.value.total_size || d.size > 64U * 1024U * 1024U) return CorfuWriteStatus::kIoError;
+    corfureplication::CorfuWriteOnceRequest req; auto* s=req.mutable_slot();s->set_topic(d.slot.topic);s->set_broker_id(d.slot.broker_id);s->set_broker_batch_seq(d.slot.broker_batch_seq); auto* v=req.mutable_value();v->set_client_id(d.value.client_id);v->set_original_client_batch_seq(d.value.original_client_batch_seq);v->set_total_order(d.value.total_order);v->set_num_msg(d.value.num_msg);v->set_total_size(d.value.total_size);req.set_source_offset(d.source_offset);req.set_size(d.size);req.set_payload(d.payload, d.size);req.set_payload_crc32c(Crc32c(static_cast<const uint8_t*>(d.payload), d.size)); corfureplication::CorfuWriteResponse out;grpc::ClientContext ctx;ctx.set_deadline(std::chrono::system_clock::now()+std::chrono::seconds(10));if(!stub_->WriteOnce(&ctx,req,&out).ok())return CorfuWriteStatus::kIoError; return Decode(out.status());
+  }
+  CorfuWriteStatus WriteJunkOnce(const CorfuSlotKey& key) override { corfureplication::CorfuJunkRequest req;auto*s=req.mutable_slot();s->set_topic(key.topic);s->set_broker_id(key.broker_id);s->set_broker_batch_seq(key.broker_batch_seq);corfureplication::CorfuWriteResponse out;grpc::ClientContext ctx;ctx.set_deadline(std::chrono::system_clock::now()+std::chrono::seconds(10));if(!stub_->WriteJunkOnce(&ctx,req,&out).ok())return CorfuWriteStatus::kIoError;return Decode(out.status()); }
+ private:
+  static CorfuWriteStatus Decode(corfureplication::CorfuWriteStatus s) { switch(s) {case corfureplication::CORFU_WRITTEN:return CorfuWriteStatus::kWritten;case corfureplication::CORFU_ALREADY_SAME:return CorfuWriteStatus::kAlreadySame;case corfureplication::CORFU_ALREADY_JUNK:return CorfuWriteStatus::kAlreadyJunk;case corfureplication::CORFU_CONFLICT:return CorfuWriteStatus::kConflict;default:return CorfuWriteStatus::kIoError;} }
+  std::shared_ptr<grpc::Channel> channel_; std::unique_ptr<corfureplication::CorfuReplicationService::Stub> stub_;
+};
+}
 
 CorfuReplicationClient::CorfuReplicationClient(const char* topic, size_t replication_factor, const std::string& server_address)
 	: topic_(topic), replication_factor_(replication_factor), server_address_(server_address) {
@@ -31,6 +59,36 @@ CorfuReplicationClient::CorfuReplicationClient(const char* topic, size_t replica
 			CreateChannelLocked();
 		}
 	}
+
+CorfuReplicationClient::CorfuReplicationClient(const char* topic, size_t replication_factor,
+                                                 std::vector<CorfuReplicaTarget> ordered_targets)
+    : CorfuReplicationClient(topic, replication_factor,
+                             ordered_targets.empty() ? std::string() : ordered_targets.front().endpoint) {
+  ordered_targets_ = std::move(ordered_targets);
+  for (const auto& target : ordered_targets_) chain_endpoints_.push_back(std::make_unique<GrpcChainEndpoint>(target.endpoint));
+}
+
+bool CorfuReplicationClient::AppendOrdered(const CorfuAppendDescriptor& descriptor) {
+  if (replication_factor_ < 1 || ordered_targets_.size() != replication_factor_ - 1) return false;
+  std::vector<CorfuChainEndpoint*> endpoints; endpoints.reserve(chain_endpoints_.size());
+  for (auto& endpoint : chain_endpoints_) endpoints.push_back(endpoint.get());
+  CorfuOrderedChain chain; return chain.Append(descriptor, endpoints);
+}
+bool CorfuReplicationClient::CompleteHole(const CorfuAppendDescriptor& descriptor) {
+  if (ordered_targets_.size() != replication_factor_ - 1) return false;
+  std::vector<CorfuChainEndpoint*> endpoints; for (auto& endpoint : chain_endpoints_) endpoints.push_back(endpoint.get());
+  CorfuOrderedChain chain; return chain.CompleteHole(descriptor, endpoints);
+}
+
+bool CorfuReplicationClient::CompleteJunkHole(const CorfuSlotKey& slot) {
+  if (ordered_targets_.size() != replication_factor_ - 1) return false;
+  std::vector<CorfuChainEndpoint*> endpoints;
+  endpoints.reserve(chain_endpoints_.size());
+  for (auto& endpoint : chain_endpoints_) endpoints.push_back(endpoint.get());
+  CorfuOrderedChain chain;
+  return chain.CompleteJunkHole(slot, endpoints);
+}
+
 
 
 CorfuReplicationClient::~CorfuReplicationClient() {

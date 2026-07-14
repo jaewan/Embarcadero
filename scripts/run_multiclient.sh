@@ -81,6 +81,8 @@ ORDER=${ORDER:-0}
 ACK=${ACK:-1}
 REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
+CONTROL_TRANSPORT=${EMBARCADERO_BASELINE_CONTROL_TRANSPORT:-grpc}
+DRY_RUN=${DRY_RUN:-0}
 REQUIRE_FAITHFUL_LAZYLOG=${REQUIRE_FAITHFUL_LAZYLOG:-0}
 LAZYLOG_METADATA_CONTRACT="not_applicable"
 LAZYLOG_METADATA_REPLICA_COUNT=0
@@ -159,6 +161,14 @@ EMBARCADERO_ORDER5_HOME_BROKERS=${EMBARCADERO_ORDER5_HOME_BROKERS:-}
 EMBAR_ORDER5_EPOCH_US=${EMBAR_ORDER5_EPOCH_US:-}
 EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP:-}
 EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT:-}
+# Corfu clients derive each ingress host from membership and use this common
+# broker-id-indexed port base (proxy endpoint = host:(base + broker_id)).
+EMBARCADERO_CORFU_PROXY_PORT_BASE=${EMBARCADERO_CORFU_PROXY_PORT_BASE:-50100}
+# Corfu RF>1 has one ordered chain per source broker.  Give every broker the
+# same complete broker-id -> replica-service membership map; Topic derives its
+# RF-1 successors with GetReplicationSetBroker.  A caller can override this
+# for multi-host deployments with e.g. 0@c1:50053,1@c2:50054.
+EMBARCADERO_CORFU_REPLICA_ENDPOINTS=${EMBARCADERO_CORFU_REPLICA_ENDPOINTS:-}
 EMBARCADERO_LAZYLOG_SEQ_IP=${EMBARCADERO_LAZYLOG_SEQ_IP:-}
 EMBARCADERO_LAZYLOG_SEQ_PORT=${EMBARCADERO_LAZYLOG_SEQ_PORT:-}
 CLIENT_LD_LIBRARY_PATH=${CLIENT_LD_LIBRARY_PATH:-${LD_LIBRARY_PATH:-}}
@@ -175,13 +185,38 @@ REMOTE_SCALOG_BUILD_BIN=${REMOTE_SCALOG_BUILD_BIN:-}
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILD_BIN="$PROJECT_ROOT/build/bin"
+# Keep artifacts coupled to the actual compiled CXL layout.  The mailbox ring
+# protocol has its own header version, but this records the enclosing CXL
+# region layout and must not silently remain at an old hand-written constant.
+CXL_LAYOUT_VERSION="$(sed -nE 's/.*kCxlLayoutVersion = ([0-9]+).*/\1/p' \
+    "$PROJECT_ROOT/src/cxl_manager/baseline_cxl_layout.h" | head -1)"
+if ! [[ "$CXL_LAYOUT_VERSION" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: could not determine CXL layout version from baseline_cxl_layout.h" >&2
+    exit 1
+fi
+# Keep every locally launched role (brokers, sequencer, and local client) on one
+# explicitly selected build.  This is especially important for the baseline
+# services, whose protobuf ABI must match the broker binary.  A caller may point
+# this at a separately configured build tree, but must not mix role binaries.
+BUILD_BIN="${BUILD_BIN:-$PROJECT_ROOT/build/bin}"
 REMOTE_CLIENT_BIN_DIR=${REMOTE_CLIENT_BIN_DIR:-$BUILD_BIN}
 BROKER_CONFIG="${BROKER_CONFIG:-config/embarcadero.yaml}"
 CLIENT_CONFIG="${CLIENT_CONFIG:-config/client.yaml}"
 BROKER_CONFIG_ABS="$PROJECT_ROOT/$BROKER_CONFIG"
 CLIENT_CONFIG_ABS="$PROJECT_ROOT/$CLIENT_CONFIG"
 LOG_DIR="$PROJECT_ROOT/multiclient_logs"
+
+baseline_sequencer_binary() {
+    case "$SEQUENCER:$CONTROL_TRANSPORT" in
+        CORFU:grpc) echo "corfu_global_sequencer" ;;
+        CORFU:cxl_mailbox) echo "corfu_mailbox_global_sequencer" ;;
+        LAZYLOG:grpc) echo "lazylog_global_sequencer" ;;
+        LAZYLOG:cxl_mailbox) echo "lazylog_mailbox_global_sequencer" ;;
+        SCALOG:grpc) echo "scalog_global_sequencer" ;;
+        SCALOG:cxl_mailbox) echo "scalog_mailbox_global_sequencer" ;;
+        *) echo "" ;;
+    esac
+}
 
 default_broker_ip() {
     if [[ -n "${EMBARCADERO_HEAD_ADDR:-}" ]]; then
@@ -200,10 +235,57 @@ default_broker_ip() {
 BROKER_IP="$(default_broker_ip)"
 export EMBARCADERO_CXL_SHM_NAME="${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}"
 export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
+# A populated 64 GiB POSIX-shm object can take seconds of CPU time to reclaim.
+# Give every trial/attempt a unique object and reclaim it off the next cell's
+# critical path; the next broker 0 cannot accidentally attach stale bytes.
+BASE_CXL_SHM_NAME="$EMBARCADERO_CXL_SHM_NAME"
+DEFER_CXL_SHM_CLEANUP="${DEFER_CXL_SHM_CLEANUP:-1}"
 
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+if [[ "$CONTROL_TRANSPORT" != "grpc" && "$CONTROL_TRANSPORT" != "cxl_mailbox" ]]; then
+    echo "ERROR: EMBARCADERO_BASELINE_CONTROL_TRANSPORT must be exactly grpc or cxl_mailbox (got '$CONTROL_TRANSPORT')" >&2
+    exit 1
+fi
+if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
+    echo "ERROR: DRY_RUN must be 0 or 1 (got '$DRY_RUN')" >&2
+    exit 1
+fi
+if [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 &&
+      -z "${EMBARCADERO_REPLICA_DISK_DIRS:-}" &&
+      -z "${EMBARCADERO_REPLICA_DISK_ROOT:-}" ]]; then
+    echo "ERROR: Corfu RF>1 requires explicit EMBARCADERO_REPLICA_DISK_DIRS or EMBARCADERO_REPLICA_DISK_ROOT" >&2
+    exit 1
+fi
+if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
+    # Broker 0 owns CreateInPlace over its CXL mapping. Real CXL can be exposed
+    # through DAX *or* through the shared mapping whose pages are mbound to a
+    # zero-core CXL NUMA node. Do not reject the latter: this machine's default
+    # CXL deployment uses it. A dry run must remain hardware-independent.
+    if [[ "$DRY_RUN" != "1" && -n "${EMBARCADERO_CXL_DEVICE:-}" && ! -c "${EMBARCADERO_CXL_DEVICE}" ]]; then
+        echo "ERROR: EMBARCADERO_CXL_DEVICE must be a DAX character device when set: ${EMBARCADERO_CXL_DEVICE}" >&2
+        exit 1
+    fi
+    if [[ "$DRY_RUN" != "1" && -z "${EMBARCADERO_CXL_DEVICE:-}" && -z "${EMBARCADERO_CXL_SHM_NAME:-}" ]]; then
+        echo "ERROR: cxl_mailbox requires EMBARCADERO_CXL_DEVICE or EMBARCADERO_CXL_SHM_NAME" >&2
+        exit 1
+    fi
+    # These publication-layout constants are deliberately fixed.  Changing one
+    # role's values would make AttachInPlace interpret a different ring layout.
+    for _mailbox_setting in EMBARCADERO_BASELINE_MAILBOX_RECORD_SIZE=512 \
+                            EMBARCADERO_BASELINE_MAILBOX_UP_CAPACITY=1024 \
+                            EMBARCADERO_BASELINE_MAILBOX_DOWN_CAPACITY=1024; do
+        _name="${_mailbox_setting%%=*}"
+        _expected="${_mailbox_setting#*=}"
+        _actual="${!_name:-$_expected}"
+        if [[ "$_actual" != "$_expected" ]]; then
+            echo "ERROR: $_name must be $_expected for cxl_mailbox (got $_actual)" >&2
+            exit 1
+        fi
+        export "$_name=$_expected"
+    done
+fi
 if ! [[ "$NUM_CLIENTS" =~ ^[1-9][0-9]*$ ]] || [ "$NUM_CLIENTS" -gt "$MAX_CLIENTS" ]; then
     echo "ERROR: NUM_CLIENTS must be 1–${MAX_CLIENTS}, got '${NUM_CLIENTS}'" >&2
     echo "Usage: NUM_CLIENTS=<1-${MAX_CLIENTS}> $0" >&2
@@ -212,6 +294,16 @@ fi
 
 if [[ "$SEQUENCER" == "CORFU" ]] && [[ "$ORDER" != "2" ]]; then
     echo "ERROR: CORFU sequencer requires ORDER=2 (got ORDER=$ORDER)" >&2
+    exit 1
+fi
+if [[ "$SEQUENCER" == "SCALOG" ]] && [[ "$ORDER" != "1" ]]; then
+    echo "ERROR: SCALOG baseline requires ORDER=1; ORDER=$ORDER does not start its local-cut sequencer" >&2
+    exit 1
+fi
+if [[ "$SEQUENCER" == "CORFU" ]] && \
+   { ! [[ "$EMBARCADERO_CORFU_PROXY_PORT_BASE" =~ ^[1-9][0-9]*$ ]] ||
+     (( EMBARCADERO_CORFU_PROXY_PORT_BASE + NUM_BROKERS - 1 > 65535 )); }; then
+    echo "ERROR: EMBARCADERO_CORFU_PROXY_PORT_BASE must leave one valid port per broker (got '$EMBARCADERO_CORFU_PROXY_PORT_BASE')." >&2
     exit 1
 fi
 if [[ "$SEQUENCER" == "LAZYLOG" ]] && [[ "$ORDER" != "2" ]]; then
@@ -246,8 +338,8 @@ fi
 
 if [[ "$SEQUENCER" == "LAZYLOG" && "$ACK" == "1" ]]; then
     ACK_DURABILITY_CONTRACT="$LAZYLOG_METADATA_CONTRACT"
-elif [[ "$SEQUENCER" == "CORFU" && "$ACK" == "2" && "$REPLICATION_FACTOR" == "2" ]]; then
-    ACK_DURABILITY_CONTRACT="ack2_primary_plus_one_media_durable_replica"
+elif [[ "$SEQUENCER" == "CORFU" && "$ACK" == "2" && "$REPLICATION_FACTOR" -ge 2 ]]; then
+    ACK_DURABILITY_CONTRACT="ack2_primary_plus_$((REPLICATION_FACTOR - 1))_ordered_media_durable_replicas"
 fi
 
 # The metadata replicas are external services. Verify that every configured
@@ -275,6 +367,42 @@ lazylog_metadata_endpoints_ready() {
             if (( now >= deadline )); then
                 echo "ERROR: LazyLog metadata endpoint did not become reachable within " \
                      "${LAZYLOG_METADATA_READY_TIMEOUT_SEC}s: $endpoint" >&2
+                return 1
+            fi
+            sleep 0.2
+        done
+    done
+}
+
+# RF>1 Corfu ACK2 is meaningful only after every target service in the
+# broker-indexed membership map is listening.  Broker readiness alone covers
+# the data plane, not the distinct replica gRPC listeners.
+corfu_replica_endpoints_ready() {
+    local endpoint spec host port deadline now
+    declare -A _corfu_hosts=()
+    [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 ]] || return 0
+    [[ -n "${EMBARCADERO_CORFU_REPLICA_ENDPOINTS:-}" ]] || return 1
+    deadline=$(( $(date +%s) + ${CORFU_REPLICA_READY_TIMEOUT_SEC:-30} ))
+    IFS=',' read -r -a _corfu_replica_specs <<< "$EMBARCADERO_CORFU_REPLICA_ENDPOINTS"
+    for spec in "${_corfu_replica_specs[@]}"; do
+        spec="${spec//[[:space:]]/}"
+        endpoint="${spec#*@}"
+        host="${endpoint%:*}"; port="${endpoint##*:}"
+        if [[ "$spec" != *@* || -z "$host" || -z "$port" || "$host" == "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Corfu replica entry must be broker_id@host:port (got '$spec')" >&2
+            return 1
+        fi
+        if [[ "${EMBARCADERO_CORFU_REQUIRE_DISTINCT_FAILURE_DOMAINS:-0}" == "1" ]]; then
+            if [[ -n "${_corfu_hosts[$host]:-}" ]]; then
+                echo "ERROR: Corfu host-failure-tolerant mode requires distinct replica hosts; duplicate host '$host'" >&2
+                return 1
+            fi
+            _corfu_hosts[$host]=1
+        fi
+        while ! timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null; do
+            now=$(date +%s)
+            if (( now >= deadline )); then
+                echo "ERROR: Corfu replica endpoint did not become reachable: $spec" >&2
                 return 1
             fi
             sleep 0.2
@@ -344,7 +472,8 @@ if (( EMBARCADERO_NETWORK_IO_THREADS < _min_network_io )); then
     EMBARCADERO_NETWORK_IO_THREADS=$_min_network_io
 fi
 
-if [[ "$SEQUENCER" == "CORFU" ]] && corfu_uses_remote_clients && corfu_seq_ip_is_loopback; then
+if [[ "$SEQUENCER" == "CORFU" && "$CONTROL_TRANSPORT" == "grpc" ]] && \
+   corfu_uses_remote_clients && corfu_seq_ip_is_loopback; then
     echo "ERROR: CORFU with SSH clients requires EMBARCADERO_CORFU_SEQ_IP to be a routable non-loopback address." >&2
     if [[ -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         echo "       Sequencer host: $REMOTE_CORFU_SEQUENCER_HOST" >&2
@@ -529,6 +658,30 @@ preflight_clients() {
     return "$failed"
 }
 
+require_local_executable() {
+    local executable="$1"
+    if [[ ! -x "$BUILD_BIN/$executable" ]]; then
+        echo "ERROR: required local executable is missing or not executable: $BUILD_BIN/$executable" >&2
+        echo "       Build the selected configuration with: cmake --build <build-dir> --target $executable" >&2
+        return 1
+    fi
+}
+
+print_dry_run() {
+    local seq_bin
+    seq_bin="$(baseline_sequencer_binary)"
+    echo "DRY_RUN=1: no processes will be started."
+    echo "CONTROL_TRANSPORT=$CONTROL_TRANSPORT SEQUENCER=$SEQUENCER RF=$REPLICATION_FACTOR REMOTE_REPLICAS=$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )) ACK=$ACK BATCH_SIZE=$EMBARCADERO_BATCH_SIZE CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB"
+    echo "BUILD_BIN=$BUILD_BIN"
+    echo "BROKER_COMMAND=$BUILD_BIN/embarlet --broker_id <0..$((NUM_BROKERS - 1))>"
+    if [[ -n "$seq_bin" ]]; then
+        echo "SEQUENCER_COMMAND=$BUILD_BIN/$seq_bin"
+    else
+        echo "SEQUENCER_COMMAND=not_applicable"
+    fi
+    echo "CLIENT_COMMAND=$BUILD_BIN/throughput_test --sequencer $SEQUENCER"
+}
+
 probe_tcp_from_host() {
     local host="$1"
     local ip="$2"
@@ -575,6 +728,103 @@ wait_for_broker_reachability() {
     done
 
     return 1
+}
+
+# Corfu's publisher obtains a token through the selected broker's membership
+# ingress. Verify those endpoints before client launch, rather than letting a
+# missing proxy turn into a workload timeout after payload admission begins.
+wait_for_corfu_proxy_reachability() {
+    [[ "$SEQUENCER" == "CORFU" ]] || return 0
+    local deadline=$(( $(date +%s) + BROKER_REACHABILITY_TIMEOUT_SEC ))
+    local i j host port
+    while (( $(date +%s) < deadline )); do
+        local all_ok=1
+        for (( i=0; i<NUM_CLIENTS; i++ )); do
+            host="${CLIENT_HOSTS[$i]}"
+            for (( j=0; j<NUM_BROKERS; j++ )); do
+                port=$((EMBARCADERO_CORFU_PROXY_PORT_BASE + j))
+                if ! probe_tcp_from_host "$host" "$BROKER_IP" "$port"; then
+                    all_ok=0
+                fi
+            done
+        done
+        [[ "$all_ok" -eq 1 ]] && return 0
+        sleep "$BROKER_REACHABILITY_POLL_SEC"
+    done
+    echo "ERROR: Corfu membership ingress proxies are not reachable from every client host." >&2
+    return 1
+}
+
+# Resolve the mailbox backing from the processes that actually participated in
+# this attempt.  Intent/configuration is not sufficient evidence: a POSIX
+# fallback or a failed standalone sequencer attach would otherwise be recorded
+# as a CXL result.  This is deliberately called only after broker readiness,
+# when broker 0 has initialized the in-place layout and the mailbox sequencer
+# has attached to it.
+record_mailbox_runtime_backing() {
+    [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]] || return 0
+
+    local sequencer_log="/tmp/${SEQUENCER,,}_mailbox_sequencer.log"
+    local backing=""
+    if grep -q 'cxl_type=Real dax_backed=1' /tmp/broker_0.log 2>/dev/null && \
+       grep -q 'BASELINE_MAILBOX_SEQUENCER_ATTACHED backing=dax ' "$sequencer_log" 2>/dev/null; then
+        backing="dax"
+    elif grep -q 'cxl_type=Real dax_backed=0' /tmp/broker_0.log 2>/dev/null && \
+         grep -q 'CXL region bound to NUMA node ' /tmp/broker_0.log 2>/dev/null && \
+         grep -q 'BASELINE_MAILBOX_SEQUENCER_ATTACHED backing=shm_numa_cxl ' "$sequencer_log" 2>/dev/null; then
+        # A shared mapping explicitly mbound to the CXL NUMA node is this
+        # machine's production CXL configuration; it is not the private-SHM
+        # smoke fallback prohibited by the evaluation contract.
+        backing="shm_numa_cxl"
+    fi
+    if [[ -z "$backing" ]]; then
+        echo "ERROR: mailbox runtime backing could not be verified from broker/sequencer logs" >&2
+        return 1
+    fi
+
+    local broker
+    for (( broker=0; broker<NUM_BROKERS; broker++ )); do
+        local marker='BASELINE_MAILBOX_READY'
+        [[ "$broker" -eq 0 ]] || marker='BASELINE_MAILBOX_ATTACHED'
+        if ! grep -q "$marker" "/tmp/broker_${broker}.log" 2>/dev/null; then
+            echo "ERROR: broker $broker did not verify its in-place baseline mailbox attachment" >&2
+            return 1
+        fi
+    done
+
+    # There is one immutable contract per invocation, so replace only the
+    # placeholder field rather than trusting a caller-provided label.
+    local contract_tmp="${RUN_CONTRACT_CSV}.tmp"
+    awk -F',' -v OFS=',' -v backing="$backing" \
+        'NR == 1 { print; next } { $4 = backing; print }' \
+        "$RUN_CONTRACT_CSV" > "$contract_tmp"
+    mv "$contract_tmp" "$RUN_CONTRACT_CSV"
+    echo "$backing" > "$LOG_DIR/mailbox_runtime_backing.txt"
+    log "Verified mailbox runtime backing: $backing"
+}
+
+# The Corfu client records the two client-visible phases itself.  Treat a
+# missing/invalid record as a failed correctness cell: successful ACKs alone
+# cannot prove that payload admission waited for a token grant.
+validate_corfu_phase_evidence() {
+    local trial="$1"
+    [[ "$SEQUENCER" == "CORFU" ]] || return 0
+    local index log_file line requests grants payload violations
+    for (( index=0; index<${#CLIENT_LOGS[@]}; index++ )); do
+        log_file="${CLIENT_LOGS[$index]}"
+        line="$(grep '\[CORFU_TOKEN_PHASE\]' "$log_file" 2>/dev/null | tail -1 || true)"
+        if [[ ! "$line" =~ requests=([0-9]+)[[:space:]]+grants=([0-9]+)[[:space:]]+payload_sends=([0-9]+)[[:space:]]+payload_before_grant=([0-9]+) ]]; then
+            echo "ERROR: missing or malformed CORFU_TOKEN_PHASE evidence in $log_file" >&2
+            return 1
+        fi
+        requests="${BASH_REMATCH[1]}"; grants="${BASH_REMATCH[2]}"
+        payload="${BASH_REMATCH[3]}"; violations="${BASH_REMATCH[4]}"
+        if (( requests == 0 || grants != requests || payload != grants || violations != 0 )); then
+            echo "ERROR: Corfu phase invariant failed in $log_file: $line" >&2
+            return 1
+        fi
+        echo "$trial,${CLIENT_TAGS[$index]},$requests,$grants,$payload,$violations" >> "$CORFU_PHASE_CSV"
+    done
 }
 
 wait_for_order5_cluster_convergence() {
@@ -799,8 +1049,18 @@ compute_overlap_throughput_gbps() {
 }
 
 shm_cleanup() {
-    shm_unlink "${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
-    rm -f "/dev/shm${EMBARCADERO_CXL_SHM_NAME}" 2>/dev/null || true
+    local path="/dev/shm${EMBARCADERO_CXL_SHM_NAME}"
+    [[ -e "$path" ]] || return 0
+    if [[ "$DEFER_CXL_SHM_CLEANUP" == "1" ]]; then
+        # unlink(2) on a large tmpfs object may synchronously reclaim populated
+        # pages. It is safe to defer because every attempt has a distinct name.
+        ( nice -n 19 rm -f "$path" >/dev/null 2>&1 ) &
+        # broker_local_cleanup reaps shell jobs at the next attempt; detach
+        # this reaper so it can finish reclaiming the prior attempt's pages.
+        disown "$!" 2>/dev/null || true
+    else
+        rm -f "$path" 2>/dev/null || true
+    fi
 }
 
 wait_for_broker_ports_free() {
@@ -823,6 +1083,12 @@ wait_for_broker_ports_free() {
 }
 
 CLEANUP_DONE=0
+GLOBAL_SEQUENCER_PID=""
+# Exact remote client PID files are populated per attempt.  Never use a broad
+# remote `pkill -f throughput_test`: remote machines are shared by independent
+# experimenters.
+declare -a CLIENT_REMOTE_PID_HOSTS=()
+declare -a CLIENT_REMOTE_PID_FILES=()
 cleanup() {
     # Trap EXIT also fires after an explicit cleanup(); make teardown idempotent so we
     # do not double-pay port drain / process kill / remote pkill on every trial.
@@ -831,6 +1097,21 @@ cleanup() {
     fi
     CLEANUP_DONE=1
     log "Cleaning up..."
+    # The local baseline sequencer is not a broker and has no listener on a
+    # broker port, so terminate and reap its exact PID explicitly.  This keeps
+    # teardown bounded and avoids leaving a mailbox poller attached to a CXL
+    # mapping after the next cell starts.
+    if [[ -n "$GLOBAL_SEQUENCER_PID" ]]; then
+        kill "$GLOBAL_SEQUENCER_PID" >/dev/null 2>&1 || true
+        for _ in $(seq 1 20); do
+            kill -0 "$GLOBAL_SEQUENCER_PID" >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+        kill -9 "$GLOBAL_SEQUENCER_PID" >/dev/null 2>&1 || true
+        # Do not wait indefinitely after SIGKILL; bounded port/process checks
+        # below provide the next-cell safety condition.
+        GLOBAL_SEQUENCER_PID=""
+    fi
     broker_local_cleanup
     if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         broker_remote_corfu_stop || true
@@ -844,11 +1125,11 @@ cleanup() {
     # broker_local_cleanup already drained listeners; a second wait_for_broker_ports_free
     # here used to add up to another BROKER_PORT_DRAIN_TIMEOUT_SEC of polling.
     if [[ "${EMBARCADERO_DISABLE_PATTERN_KILL:-0}" != "1" ]]; then
-        for (( _i=0; _i<${NUM_CLIENTS:-0}; _i++ )); do
-            _h="${CLIENT_HOSTS[$_i]}"
-            if [[ "$_h" != "local" ]]; then
-                ssh "$_h" "pkill -9 -f throughput_test 2>/dev/null; true" 2>/dev/null || true
-            fi
+        for (( _i=0; _i<${#CLIENT_REMOTE_PID_FILES[@]}; _i++ )); do
+            _h="${CLIENT_REMOTE_PID_HOSTS[$_i]}"
+            _pid_file="${CLIENT_REMOTE_PID_FILES[$_i]}"
+            ssh "$_h" "if test -r '$_pid_file'; then read -r _pid < '$_pid_file'; kill -TERM \"\$_pid\" 2>/dev/null || true; sleep 0.1; kill -KILL \"\$_pid\" 2>/dev/null || true; rm -f '$_pid_file'; fi" \
+                2>/dev/null || true
         done
     fi
 }
@@ -864,6 +1145,30 @@ start_brokers() {
     # bound so a stuck TIME_WAIT listener cannot burn the full 20s budget every trial.
     BROKER_PORT_DRAIN_TIMEOUT_SEC="${BROKER_PORT_DRAIN_TIMEOUT_SEC:-5}" wait_for_broker_ports_free
     preflight_local_broker_resources
+
+    # Do this before any process is launched.  Previously a missing standalone
+    # baseline sequencer was started in the background, leaving brokers to retry
+    # a port that could never become live and obscuring the actual artifact error.
+    if ! require_local_executable embarlet; then
+        START_BROKERS_FAILURE_REASON="infra_missing_local_broker_binary"
+        return 1
+    fi
+    if [[ "$SEQUENCER" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+        if ! require_local_executable "$(baseline_sequencer_binary)"; then
+            START_BROKERS_FAILURE_REASON="infra_missing_local_corfu_sequencer"
+            return 1
+        fi
+    elif [[ "$SEQUENCER" == "LAZYLOG" && -z "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+        if ! require_local_executable "$(baseline_sequencer_binary)"; then
+            START_BROKERS_FAILURE_REASON="infra_missing_local_lazylog_sequencer"
+            return 1
+        fi
+    elif [[ "$SEQUENCER" == "SCALOG" ]]; then
+        if ! require_local_executable "$(baseline_sequencer_binary)"; then
+            START_BROKERS_FAILURE_REASON="infra_missing_local_scalog_sequencer"
+            return 1
+        fi
+    fi
 
     if [[ "$SEQUENCER" == "CORFU" && -n "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
         export REMOTE_CORFU_BUILD_BIN="${REMOTE_CORFU_BUILD_BIN:-$BUILD_BIN}"
@@ -896,9 +1201,33 @@ start_brokers() {
     export EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-1}"
     export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-full}"
     export EMBARCADERO_RUNTIME_MODE="throughput"
+    export EMBARCADERO_BASELINE_CONTROL_TRANSPORT="$CONTROL_TRANSPORT"
+    export EMBARCADERO_CORFU_PROXY_PORT_BASE
     export EMBARCADERO_REPLICATION_FACTOR="$REPLICATION_FACTOR"
     export EMBARCADERO_HEAD_ADDR="$BROKER_IP"
     export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
+	# One initial topic needs one CXL log segment per broker.  Ask the broker to
+	# reject an impossible real-CXL geometry during startup rather than retrying
+	# topic discovery until metadata allocation itself fails.
+	export EMBARCADERO_REQUIRED_CXL_SEGMENTS="$NUM_BROKERS"
+    local -a corfu_durability_args=()
+    if [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 ]]; then
+        if [[ -z "${EMBARCADERO_REPLICA_DISK_DIRS:-}" && -z "${EMBARCADERO_REPLICA_DISK_ROOT:-}" ]]; then
+            echo "ERROR: Corfu RF>1 requires explicit durable replica directories; refusing a memory-backed ACK2 chain" >&2
+            START_BROKERS_FAILURE_REASON="config_corfu_missing_durable_replica_dir"
+            return 1
+        fi
+        corfu_durability_args+=(--replicate_to_disk)
+        if [[ -z "$EMBARCADERO_CORFU_REPLICA_ENDPOINTS" ]]; then
+            local endpoints=""
+            for (( _corfu_broker=0; _corfu_broker<NUM_BROKERS; ++_corfu_broker )); do
+                endpoints+="${endpoints:+,}${_corfu_broker}@${BROKER_IP}:$((50053 + _corfu_broker))"
+            done
+            EMBARCADERO_CORFU_REPLICA_ENDPOINTS="$endpoints"
+        fi
+        export EMBARCADERO_CORFU_REPLICA_ENDPOINTS
+        log "Corfu RF membership: $EMBARCADERO_CORFU_REPLICA_ENDPOINTS"
+    fi
     export EMBARCADERO_ORDER0_FAST_PATH
     export EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES
     export EMBARCADERO_NETWORK_IO_THREADS
@@ -958,12 +1287,15 @@ start_brokers() {
 
     log "Starting $NUM_BROKERS broker(s) with NUMA bind: '${EMBARLET_NUMA_BIND}'"
     local -a launched_broker_pids=()
-    if [[ "$SEQUENCER" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
-        ./corfu_global_sequencer > /tmp/corfu_sequencer.log 2>&1 &
-    elif [[ "$SEQUENCER" == "LAZYLOG" && -z "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
-        ./lazylog_global_sequencer > /tmp/lazylog_sequencer.log 2>&1 &
-    elif [[ "$SEQUENCER" == "SCALOG" ]]; then
-        ./scalog_global_sequencer > /tmp/scalog_sequencer.log 2>&1 &
+    if [[ "$CONTROL_TRANSPORT" == "grpc" && "$SEQUENCER" == "CORFU" && -z "$REMOTE_CORFU_SEQUENCER_HOST" ]]; then
+        ./"$(baseline_sequencer_binary)" > /tmp/corfu_sequencer.log 2>&1 &
+        GLOBAL_SEQUENCER_PID=$!
+    elif [[ "$CONTROL_TRANSPORT" == "grpc" && "$SEQUENCER" == "LAZYLOG" && -z "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]]; then
+        ./"$(baseline_sequencer_binary)" > /tmp/lazylog_sequencer.log 2>&1 &
+        GLOBAL_SEQUENCER_PID=$!
+    elif [[ "$CONTROL_TRANSPORT" == "grpc" && "$SEQUENCER" == "SCALOG" ]]; then
+        ./"$(baseline_sequencer_binary)" > /tmp/scalog_sequencer.log 2>&1 &
+        GLOBAL_SEQUENCER_PID=$!
     fi
 
     # Start the head broker first. Cold CXL full-region zeroing is memory-heavy; launching
@@ -977,11 +1309,45 @@ start_brokers() {
         wait_head_before_followers=0
     fi
     # shellcheck disable=SC2086
-    $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" \
+    $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" \
         --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
         > /tmp/broker_0.log 2>&1 &
     launched_broker_pids+=("$!")
     HEAD_BROKER_PID="${launched_broker_pids[0]}"
+    if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
+        # A mailbox sequencer must never create or clear shared backing.  The
+        # head broker owns initialization; the precise marker is the handoff.
+        local mailbox_deadline=$(( $(date +%s) + BROKER_READY_TIMEOUT_SEC ))
+        until grep -q "BASELINE_MAILBOX_READY" /tmp/broker_0.log 2>/dev/null; do
+            if (( $(date +%s) >= mailbox_deadline )); then
+                echo "ERROR: broker 0 did not report BASELINE_MAILBOX_READY" >&2
+                START_BROKERS_FAILURE_REASON="infra_mailbox_not_initialized"
+                return 1
+            fi
+            sleep 0.1
+        done
+        ./"$(baseline_sequencer_binary)" > "/tmp/${SEQUENCER,,}_mailbox_sequencer.log" 2>&1 &
+        GLOBAL_SEQUENCER_PID=$!
+        # Do not let broker/client readiness race a mailbox sequencer that has
+        # merely been forked but has not attached to the published in-place
+        # extent (or has already died on an incompatible header).
+        local sequencer_log="/tmp/${SEQUENCER,,}_mailbox_sequencer.log"
+        local sequencer_deadline=$(( $(date +%s) + BROKER_READY_TIMEOUT_SEC ))
+        until grep -q 'BASELINE_MAILBOX_SEQUENCER_ATTACHED ' "$sequencer_log" 2>/dev/null; do
+            if ! kill -0 "$GLOBAL_SEQUENCER_PID" 2>/dev/null; then
+                echo "ERROR: mailbox sequencer exited before attaching" >&2
+                cat "$sequencer_log" >&2 || true
+                START_BROKERS_FAILURE_REASON="infra_mailbox_sequencer_attach_failed"
+                return 1
+            fi
+            if (( $(date +%s) >= sequencer_deadline )); then
+                echo "ERROR: mailbox sequencer did not attach before timeout" >&2
+                START_BROKERS_FAILURE_REASON="infra_mailbox_sequencer_attach_timeout"
+                return 1
+            fi
+            sleep 0.1
+        done
+    fi
     if [[ "$wait_head_before_followers" -eq 1 ]]; then
         log "Waiting for head broker readiness before followers (zero_mode=$zero_mode)..."
         if ! broker_local_wait_for_cluster "$BROKER_READY_TIMEOUT_SEC" 1 "${launched_broker_pids[0]}"; then
@@ -1002,7 +1368,7 @@ start_brokers() {
     fi
     for (( i=1; i<NUM_BROKERS; i++ )); do
         # shellcheck disable=SC2086
-        $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" \
+        $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" \
             --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" \
             > /tmp/broker_"$i".log 2>&1 &
         launched_broker_pids+=("$!")
@@ -1026,6 +1392,14 @@ start_brokers() {
     if ! wait_for_broker_reachability; then
         echo "ERROR: Brokers are not reachable from client host(s) within ${BROKER_REACHABILITY_TIMEOUT_SEC}s" >&2
         START_BROKERS_FAILURE_REASON="infra_broker_unreachable"
+        return 1
+    fi
+    if ! wait_for_corfu_proxy_reachability; then
+        START_BROKERS_FAILURE_REASON="infra_corfu_proxy_unreachable"
+        return 1
+    fi
+    if ! corfu_replica_endpoints_ready; then
+        START_BROKERS_FAILURE_REASON="infra_corfu_replica_unreachable"
         return 1
     fi
     if [[ "$BROKER_READY_PROPAGATION_SEC" -gt 0 ]]; then
@@ -1173,6 +1547,7 @@ printf "  %-32s %s\n" "ENABLE_PAYLOAD_MSG_MORE:"       "$EMBARCADERO_ENABLE_PAYL
 printf "  %-32s %s\n" "BATCH_SIZE:"                    "$EMBARCADERO_BATCH_SIZE"
 printf "  %-32s %s\n" "CLIENT_PUB_BATCH_KB:"           "$EMBARCADERO_CLIENT_PUB_BATCH_KB"
 printf "  %-32s %s\n" "NETWORK_IO_THREADS:"            "$EMBARCADERO_NETWORK_IO_THREADS"
+printf "  %-32s %s\n" "CONTROL_TRANSPORT:"            "$CONTROL_TRANSPORT"
 printf "  %-32s %s\n" "ORDER5_HOME_BROKERS:"           "${EMBARCADERO_ORDER5_HOME_BROKERS:-"(unset)"}"
 printf "  %-32s %s\n" "ORDER5_EPOCH_US:"               "${EMBAR_ORDER5_EPOCH_US:-"(default=500)"}"
 printf "  %-32s %s\n" "LOCAL_CLIENT_NUMA:"             "$(resolve_local_client_numa)"
@@ -1192,12 +1567,19 @@ fi
 printf "  %-32s %s\n" "ACK_DURABILITY_CONTRACT:"     "$ACK_DURABILITY_CONTRACT"
 echo "================================================================"
 
+if [[ "$DRY_RUN" == "1" ]]; then
+    print_dry_run
+    exit 0
+fi
+
 mkdir -p "$LOG_DIR"
 overall_status=0
 ATTEMPT_SUMMARY_CSV="$LOG_DIR/attempt_summary.csv"
 echo "trial,attempt,result,reason" > "$ATTEMPT_SUMMARY_CSV"
 OVERLAP_SUMMARY_CSV="$LOG_DIR/overlap_summary.csv"
 echo "trial,overlap_total_gbps,overlap_window_ms,timeseries_clients" > "$OVERLAP_SUMMARY_CSV"
+CORFU_PHASE_CSV="$LOG_DIR/corfu_token_phase.csv"
+echo "trial,client,requests,grants,payload_sends,payload_before_grant" > "$CORFU_PHASE_CSV"
 RUN_CONTRACT_CSV="$LOG_DIR/run_contract.csv"
 GIT_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null)" ]]; then
@@ -1205,8 +1587,23 @@ if [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null)" ]]; then
 else
     GIT_DIRTY=false
 fi
-echo "sequencer,order,ack_level,replication_factor,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
-echo "$SEQUENCER,$ORDER,$ACK,$REPLICATION_FACTOR,$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
+if [[ "$GIT_DIRTY" == "true" && "${ALLOW_DIRTY_ARTIFACT:-0}" != "1" ]]; then
+    echo "ERROR: refusing to create a publication artifact from a dirty revision. Set ALLOW_DIRTY_ARTIFACT=1 only for a developer smoke run." >&2
+    exit 1
+fi
+MAILBOX_BACKING="not_applicable"
+CONTROL_TOPOLOGY="direct_global"
+if [[ "$SEQUENCER" == "CORFU" ]]; then
+    CONTROL_TOPOLOGY="broker_proxy"
+fi
+if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
+    # This describes the intended production backing.  The CXL manager logs
+    # whether it actually obtained DAX; POSIX fallback results must be curated
+    # as smoke-only, never as CXL mailbox measurements.
+    MAILBOX_BACKING="pending_runtime_verification"
+fi
+echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
+echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
 
 if ! lazylog_metadata_endpoints_ready; then
     exit 1
@@ -1226,6 +1623,7 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
 
     for (( attempt=1; attempt<=TRIAL_MAX_ATTEMPTS; attempt++ )); do
         log "  Attempt $attempt / $TRIAL_MAX_ATTEMPTS"
+        export EMBARCADERO_CXL_SHM_NAME="${BASE_CXL_SHM_NAME}_t${trial}_a${attempt}"
 
         if ! start_brokers; then
             echo "ERROR: broker startup failed on trial $trial attempt $attempt" >&2
@@ -1233,6 +1631,11 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
             for b in $(seq 0 $((NUM_BROKERS - 1))); do
                 cp -f "/tmp/broker_${b}.log" "$LOG_DIR/trial${trial}_attempt${attempt}_broker${b}.log" 2>/dev/null || true
             done
+            cleanup
+            continue
+        fi
+        if ! record_mailbox_runtime_backing; then
+            echo "$trial,$attempt,failed,infra_mailbox_runtime_backing_unverified" >> "$ATTEMPT_SUMMARY_CSV"
             cleanup
             continue
         fi
@@ -1259,6 +1662,8 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
         declare -a CLIENT_PUSH_HOSTS=()
         declare -a CLIENT_PUSH_READY=()
         declare -a CLIENT_PUSH_GO=()
+        CLIENT_REMOTE_PID_HOSTS=()
+        CLIENT_REMOTE_PID_FILES=()
         # Publication contract: every throughput run uses one wall-clock axis with
         # push-ready/go so overlap is not polluted by staggered SSH launch.
         use_push_go=1
@@ -1289,6 +1694,11 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
             CLIENT_LOGS+=( "$log_file" )
             CLIENT_TS_LOCAL_FILES+=( "$LOG_DIR/trial${trial}_${client_tag}_timeseries.csv" )
             CLIENT_PUSH_HOSTS+=( "$host" )
+            remote_pid_file="/tmp/embarcadero_throughput_t${trial}_${client_tag}_$$_pid"
+            if [[ "$host" != "local" ]]; then
+                CLIENT_REMOTE_PID_HOSTS+=( "$host" )
+                CLIENT_REMOTE_PID_FILES+=( "$remote_pid_file" )
+            fi
 
             push_ready_export=""
             push_go_export=""
@@ -1352,6 +1762,7 @@ $push_go_export
 rm -f $ts_file
 if [ "$SEQUENCER" = "CORFU" ] && [ -n "${EMBARCADERO_CORFU_SEQ_IP:-}" ]; then export EMBARCADERO_CORFU_SEQ_IP=${EMBARCADERO_CORFU_SEQ_IP:-}; fi
 if [ "$SEQUENCER" = "CORFU" ] && [ -n "${EMBARCADERO_CORFU_SEQ_PORT:-}" ]; then export EMBARCADERO_CORFU_SEQ_PORT=${EMBARCADERO_CORFU_SEQ_PORT:-}; fi
+if [ "$SEQUENCER" = "CORFU" ]; then export EMBARCADERO_CORFU_PROXY_PORT_BASE=$EMBARCADERO_CORFU_PROXY_PORT_BASE; fi
 if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "${EMBARCADERO_LAZYLOG_SEQ_IP:-}" ]; then export EMBARCADERO_LAZYLOG_SEQ_IP=${EMBARCADERO_LAZYLOG_SEQ_IP:-}; fi
 if [ "$SEQUENCER" = "LAZYLOG" ] && [ -n "${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" ]; then export EMBARCADERO_LAZYLOG_SEQ_PORT=${EMBARCADERO_LAZYLOG_SEQ_PORT:-}; fi
 if [ "$SEQUENCER" = "SCALOG" ] && [ -n "${EMBARCADERO_SCALOG_SEQ_IP:-}" ]; then export EMBARCADERO_SCALOG_SEQ_IP=${EMBARCADERO_SCALOG_SEQ_IP:-}; fi
@@ -1369,7 +1780,8 @@ __bar_now_ms=\$(( \$(date +%s%N) / 1000000 ))
 if [ \$(( __bar_now_ms - $START_TIME_MS )) -gt 2000 ]; then
   echo "WARNING: BARRIER MISSED by \$(( __bar_now_ms - $START_TIME_MS )) ms — host clock skewed vs broker; concurrency of this trial is suspect" >&2
 fi
-numactl --cpunodebind=$numa --membind=$numa ./throughput_test --config $CLIENT_CONFIG_ABS -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $LOAD_PER_CLIENT -t $TEST_TYPE -o $ORDER -a $ACK -r $REPLICATION_FACTOR --sequencer $SEQUENCER --head_addr $BROKER_IP -l 0 $CLIENT_EXTRA_ARGS
+echo \$\$ > $remote_pid_file
+exec numactl --cpunodebind=$numa --membind=$numa ./throughput_test --config $CLIENT_CONFIG_ABS -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $LOAD_PER_CLIENT -t $TEST_TYPE -o $ORDER -a $ACK -r $REPLICATION_FACTOR --sequencer $SEQUENCER --head_addr $BROKER_IP -l 0 $CLIENT_EXTRA_ARGS
 ENDINNERSCRIPT
 )"
 
@@ -1505,6 +1917,9 @@ ENDINNERSCRIPT
                 logs_ok=0
             fi
         done
+        if [[ "$logs_ok" -eq 1 ]] && ! validate_corfu_phase_evidence "$trial"; then
+            logs_ok=0
+        fi
 
         if [[ "$all_ok" -eq 1 && "$logs_ok" -eq 1 ]]; then
             overlap_row="$(compute_overlap_throughput_gbps "$trial" "${CLIENT_TS_LOCAL_FILES[@]}" || true)"

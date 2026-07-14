@@ -201,6 +201,14 @@ class Publisher {
 		std::array<std::atomic<size_t>, kMaxCorfuBrokers> order5_batch_seq_per_broker_{};
 		// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker to eliminate out-of-order retries (Phase 2C).
 		std::array<std::mutex, kMaxCorfuBrokers> corfu_seq_per_broker_lock_{};
+		// C1 evidence: a Corfu payload must never begin before its ingress-proxy
+		// token grant. These counters are emitted by Poll for developer and
+		// evaluation artifacts, not used for control flow.
+		std::atomic<uint64_t> corfu_token_requests_{0};
+		std::atomic<uint64_t> corfu_token_grants_{0};
+		std::atomic<uint64_t> corfu_token_latency_ns_{0};
+		std::atomic<uint64_t> corfu_payload_sends_{0};
+		std::atomic<uint64_t> corfu_payload_before_grant_{0};
 
 	// [[THREAD_SAFETY_FIX]] Atomic variables with relaxed ordering for minimal overhead thread coordination
 	// [[PERF]] Cache-line separate from producer-hot data so consumers don't bounce cache lines

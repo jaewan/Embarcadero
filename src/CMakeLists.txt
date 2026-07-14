@@ -50,6 +50,8 @@ add_executable(embarlet
     embarlet/embarlet.cc
     common/configuration.cc
     common/configuration.h
+    common/baseline_control_transport.cc
+    common/baseline_control_transport.h
     disk_manager/disk_manager.cc
     disk_manager/disk_manager.h
     disk_manager/chain_replication.cc
@@ -58,12 +60,18 @@ add_executable(embarlet
     disk_manager/corfu_replication_manager.h
     disk_manager/corfu_replication_client.cc
     disk_manager/corfu_replication_client.h
+    disk_manager/corfu_ordered_chain.cc
+    disk_manager/corfu_ordered_chain.h
+    disk_manager/corfu_replica_store.cc
+    disk_manager/corfu_replica_store.h
     disk_manager/scalog_replication_manager.cc
     disk_manager/scalog_replication_manager.h
     disk_manager/scalog_replication_client.cc
     disk_manager/scalog_replication_client.h
     cxl_manager/cxl_manager.cc
     cxl_manager/cxl_manager.h
+    cxl_transport/cxl_mailbox.cc
+    cxl_transport/cxl_mailbox.h
     cxl_manager/scalog_local_sequencer.cc
     cxl_manager/scalog_local_sequencer.h
     cxl_manager/lazylog_local_sequencer.cc
@@ -303,6 +311,14 @@ target_link_libraries(lazylog_metadata_replica
     Threads::Threads
 )
 
+# Keep the durable metadata service alongside every other deployable baseline
+# role.  Launchers and artifact manifests operate on <build>/bin; leaving this
+# target under <build>/src made a successful build indistinguishable from a
+# missing service at experiment time.
+set_target_properties(lazylog_metadata_replica PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 add_executable(corfu_global_sequencer
     cxl_manager/corfu_global_sequencer.cc
     cxl_manager/corfu_sequencer_service.cc
@@ -351,6 +367,35 @@ set_target_properties(corfu_sequencer_fifo_smoke PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 add_test(NAME corfu_sequencer_fifo_smoke COMMAND corfu_sequencer_fifo_smoke
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# C1a: the ingress-broker proxy is a protocol-preserving hop, not a second
+# sequencer.  This suite compares it with the direct service and exercises its
+# retry/deadline and two-ingress behavior.
+add_executable(corfu_token_proxy_smoke
+    cxl_manager/corfu_token_proxy_smoke.cc
+    cxl_manager/corfu_token_proxy.cc
+    cxl_manager/corfu_mailbox_sequencer.cc
+    cxl_manager/corfu_sequencer_service.cc
+)
+target_include_directories(corfu_token_proxy_smoke PUBLIC
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${PROJECT_BINARY_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_link_libraries(corfu_token_proxy_smoke
+    absl::flat_hash_map
+    corfu_sequencer_grpc_proto
+    corfu_token_proxy_grpc_proto
+    cxl_transport
+    grpc++
+    protobuf::libprotobuf
+    Threads::Threads
+)
+set_target_properties(corfu_token_proxy_smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+add_test(NAME corfu_token_proxy_smoke COMMAND corfu_token_proxy_smoke
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # ---- Corfu CXL mailbox port (Track 03 / E10) ----
@@ -402,6 +447,20 @@ add_executable(scalog_mailbox_bench
     cxl_manager/scalog_mailbox_sequencer.cc
     cxl_manager/scalog_global_ordering_core.cc
 )
+
+# C2/C3/C4 deterministic chain and durable-sidecar correctness.  This target
+# intentionally has no gRPC/CXL dependency: it tests the state machine that
+# the RPC adapter exposes, including crash replay and prefix-only completion.
+add_executable(corfu_ordered_chain_smoke
+    disk_manager/corfu_ordered_chain_smoke.cc
+    disk_manager/corfu_ordered_chain.cc
+    disk_manager/corfu_replica_store.cc)
+target_include_directories(corfu_ordered_chain_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${PROJECT_BINARY_DIR}")
+target_link_libraries(corfu_ordered_chain_smoke PRIVATE Threads::Threads)
+set_target_properties(corfu_ordered_chain_smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME corfu_ordered_chain_smoke COMMAND corfu_ordered_chain_smoke)
 target_include_directories(scalog_mailbox_bench PUBLIC
     "${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_BINARY_DIR}"
@@ -460,6 +519,49 @@ set_target_properties(lazylog_mailbox_bench PROPERTIES
 )
 add_test(NAME lazylog_mailbox_bench COMMAND lazylog_mailbox_bench
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# ---- Production DAX mailbox sequencers (A3c) ----
+# These are attach-only processes.  They map the broker-created CXL/DAX mailbox
+# extent and refuse POSIX/file backing, keeping test-only SHM artifacts out of
+# publication runs.  The broker owns CreateInPlace; each binary below owns only
+# its ordering state machine and the mailbox poll loop.
+function(add_mailbox_global_sequencer target kind)
+    add_executable(${target}
+        cxl_manager/mailbox_global_sequencer.cc
+        ${ARGN}
+    )
+    target_compile_definitions(${target} PRIVATE MAILBOX_SEQUENCER_KIND=${kind})
+    target_include_directories(${target} PUBLIC
+        "${CMAKE_CURRENT_BINARY_DIR}"
+        "${PROJECT_BINARY_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    target_link_libraries(${target}
+        cxl_transport
+        corfu_sequencer_grpc_proto
+        scalog_sequencer_grpc_proto
+        lazylog_sequencer_grpc_proto
+        grpc++
+        protobuf::libprotobuf
+        glog::glog
+        absl::flat_hash_map
+        Threads::Threads
+        yaml-cpp
+    )
+    set_target_properties(${target} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+endfunction()
+
+add_mailbox_global_sequencer(corfu_mailbox_global_sequencer 1
+    cxl_manager/corfu_mailbox_sequencer.cc
+    cxl_manager/corfu_sequencer_service.cc)
+add_mailbox_global_sequencer(scalog_mailbox_global_sequencer 2
+    cxl_manager/scalog_mailbox_sequencer.cc
+    cxl_manager/scalog_global_ordering_core.cc)
+add_mailbox_global_sequencer(lazylog_mailbox_global_sequencer 3
+    cxl_manager/lazylog_mailbox_sequencer.cc
+    cxl_manager/lazylog_binding_core.cc)
 
 
 # ---- CXL mailbox transport (Track 03 / W4) ----

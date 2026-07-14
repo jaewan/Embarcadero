@@ -1,6 +1,7 @@
 #include "corfu_replication_manager.h"
 #include "corfu_replication.grpc.pb.h"
 #include "common/replica_disk_dirs.h"
+#include "disk_manager/corfu_replica_store.h"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/alarm.h>
@@ -30,28 +31,47 @@ namespace Corfu {
 	using corfureplication::CorfuReplicationService;
 	using corfureplication::CorfuReplicationRequest;
 	using corfureplication::CorfuReplicationResponse;
+	using corfureplication::CorfuProbeRequest;
+	using corfureplication::CorfuProbeResponse;
+	using corfureplication::CorfuWriteOnceRequest;
+	using corfureplication::CorfuJunkRequest;
+	using corfureplication::CorfuWriteResponse;
+
+	static CorfuSlotKey ToSlot(const corfureplication::CorfuSlotKey& s) {
+		return CorfuSlotKey{s.topic(), s.broker_id(), s.broker_batch_seq()};
+	}
+	static CorfuValueId ToValue(const corfureplication::CorfuValueId& v) {
+		return CorfuValueId{v.client_id(), v.original_client_batch_seq(), v.total_order(), v.num_msg(), v.total_size()};
+	}
+	static void SetValue(const CorfuValueId& v, corfureplication::CorfuValueId* out) {
+		out->set_client_id(v.client_id); out->set_original_client_batch_seq(v.original_client_batch_seq);
+		out->set_total_order(v.total_order); out->set_num_msg(v.num_msg); out->set_total_size(v.total_size);
+	}
+	static corfureplication::CorfuWriteStatus ToProto(CorfuWriteStatus s) {
+		using P=corfureplication::CorfuWriteStatus; switch(s) { case CorfuWriteStatus::kWritten:return P::CORFU_WRITTEN; case CorfuWriteStatus::kAlreadySame:return P::CORFU_ALREADY_SAME; case CorfuWriteStatus::kAlreadyJunk:return P::CORFU_ALREADY_JUNK; case CorfuWriteStatus::kConflict:return P::CORFU_CONFLICT; default:return P::CORFU_IO_ERROR; }
+	}
+	static uint32_t Crc32c(const uint8_t* p, size_t n) { uint32_t c=~0u; while(n--){c^=*p++;for(int i=0;i<8;++i)c=(c>>1)^(0x82f63b78u&-(c&1));}return ~c; }
 
 	class CorfuReplicationServiceImpl final : public CorfuReplicationService::Service {
 		public:
-			explicit CorfuReplicationServiceImpl(std::string base_filename, void* cxl_addr)
-				: base_filename_(std::move(base_filename)), cxl_addr_(cxl_addr), running_(true), fd_(-1) {
+			explicit CorfuReplicationServiceImpl(std::string base_filename, void* cxl_addr, bool media_durable)
+				: base_filename_(std::move(base_filename)), cxl_addr_(cxl_addr), media_durable_(media_durable), running_(true), fd_(-1) {
 					if (!OpenOutputFile()) {
 						throw std::runtime_error("Failed to open replication file: " + base_filename_);
 					}
-					fsync_thread_ = std::thread(&CorfuReplicationServiceImpl::FsyncLoop, this);
+					store_ = std::make_unique<CorfuReplicaStore>(base_filename_, base_filename_ + ".corfu_sidecar");
+					// WriteOnce owns the durability boundary (data fdatasync followed
+					// by sidecar fdatasync).  A periodic fsync worker is both redundant
+					// and unsafe here; it previously re-entered the file lock on error.
 				}
 
 			~CorfuReplicationServiceImpl() override {
 				Shutdown();
-				if (fsync_thread_.joinable()) {
-					fsync_thread_.join();
-				}
 			}
 
 			void Shutdown() {
 				bool expected = true;
 				if (running_.compare_exchange_strong(expected, false)) {
-					cv_fsync_.notify_one(); // Wake up fsync thread if sleeping
 					std::unique_lock<std::shared_mutex> lock(file_state_mutex_);
 					CloseOutputFile();
 				}
@@ -59,6 +79,14 @@ namespace Corfu {
 
 			Status Replicate(ServerContext* context, const CorfuReplicationRequest* request,
 					CorfuReplicationResponse* response) override {
+				// An anonymous byte-range write has no slot/value identity, cannot
+				// reject conflicts, and cannot participate in RF3 hole recovery.
+				// Keep the RPC name for wire compatibility but fail closed so no
+				// caller silently bypasses the ordered-chain protocol.
+				response->set_success(false);
+				return Status(StatusCode::FAILED_PRECONDITION,
+					"legacy Replicate is disabled; use WriteOnce with slot/value identity");
+				/*
 				if (!running_) {
 					return CreateErrorResponse(response, "Service is shutting down", StatusCode::CANCELLED);
 				}
@@ -101,6 +129,29 @@ namespace Corfu {
 						return CreateErrorResponse(response, std::string("Error: ") + e.what(), StatusCode::INTERNAL);
 					}
 				}
+				*/
+			}
+
+			Status ProbeSlot(ServerContext*, const CorfuProbeRequest* request, CorfuProbeResponse* response) override {
+				if (!running_.load(std::memory_order_acquire)) return Status(StatusCode::CANCELLED, "service is shutting down");
+				const auto r = store_->Probe(ToSlot(request->slot()));
+				response->set_state(r.state == CorfuSlotState::kValue ? corfureplication::CORFU_VALUE : r.state == CorfuSlotState::kJunk ? corfureplication::CORFU_JUNK : corfureplication::CORFU_UNWRITTEN);
+				if (r.state == CorfuSlotState::kValue) SetValue(r.value, response->mutable_value());
+				return Status::OK;
+			}
+			Status WriteOnce(ServerContext*, const CorfuWriteOnceRequest* request, CorfuWriteResponse* response) override {
+				constexpr uint64_t kMaxWriteBytes = 64ULL * 1024ULL * 1024ULL;
+				if (!media_durable_ || !running_.load(std::memory_order_acquire) || request->size() != request->value().total_size() ||
+					request->size() != static_cast<uint64_t>(request->payload().size()) || request->size() > kMaxWriteBytes ||
+					Crc32c(reinterpret_cast<const uint8_t*>(request->payload().data()), request->payload().size()) != request->payload_crc32c()) {
+					response->set_status(corfureplication::CORFU_IO_ERROR); return Status::OK;
+				}
+				response->set_status(ToProto(store_->WriteOnce(ToSlot(request->slot()), ToValue(request->value()), request->source_offset(), request->payload().data(), request->size())));
+				return Status::OK;
+			}
+			Status WriteJunkOnce(ServerContext*, const CorfuJunkRequest* request, CorfuWriteResponse* response) override {
+				if (!running_.load(std::memory_order_acquire)) return Status(StatusCode::CANCELLED, "service is shutting down");
+				response->set_status(ToProto(store_->WriteJunkOnce(ToSlot(request->slot())))); return Status::OK;
 			}
 
 		private:
@@ -229,14 +280,16 @@ namespace Corfu {
 
 			const std::string base_filename_;
 			void* const cxl_addr_;
+			const bool media_durable_;
 			std::atomic<bool> running_;
 			int fd_ = -1;
+			std::unique_ptr<CorfuReplicaStore> store_;
 			std::shared_mutex file_state_mutex_; // Use shared mutex
-
-			// For fsync thread
-			std::thread fsync_thread_;
+			// Retained only for the unused legacy helper below; no thread is
+			// started, because WriteOnce owns the synchronous durability boundary.
 			std::condition_variable cv_fsync_;
-			std::mutex fsync_cv_mutex_; // Mutex needed for condition variable wait
+			std::mutex fsync_cv_mutex_;
+
 	};
 
 	CorfuReplicationManager::CorfuReplicationManager(
@@ -248,27 +301,39 @@ namespace Corfu {
 			const std::string& log_file) {
 		LOG(INFO) << "[CORFU_DEBUG] CorfuReplicationManager ctor start (broker_id=" << broker_id << ")";
 		try {
-			std::string base_dir = "/tmp/";
-			if (!log_to_memory) {
-				const auto dirs = Embarcadero::ResolveWritableReplicationDirs();
+			std::string base_dir;
+			if (log_to_memory) {
+				// RF1/ACK1 does not use a remote chain. Keep the listener alive for
+				// normal broker startup, but WriteOnce rejects any ACK2 attempt.
+				base_dir = "/tmp/";
+		} else {
+			// ACK2 may not silently select a convenient working-directory or /tmp
+			// path.  The operator must name the replica medium explicitly so the
+			// manifest and failure model have a concrete sink to validate.
+			const char* configured_dirs = std::getenv("EMBARCADERO_REPLICA_DISK_DIRS");
+			const char* configured_root = std::getenv("EMBARCADERO_REPLICA_DISK_ROOT");
+			if ((configured_dirs == nullptr || *configured_dirs == '\0') &&
+				(configured_root == nullptr || *configured_root == '\0')) {
+				throw std::invalid_argument("Corfu RF>1 requires explicit EMBARCADERO_REPLICA_DISK_DIRS or EMBARCADERO_REPLICA_DISK_ROOT");
+			}
+			const auto dirs = Embarcadero::ResolveWritableReplicationDirs();
 				base_dir = Embarcadero::SelectReplicationDirForBroker(broker_id, dirs);
-				if (base_dir.empty()) {
-					base_dir = "../../.Replication/disk0";
-					LOG(WARNING) << "CorfuReplicationManager: no writable replication dirs; falling back to "
-					             << base_dir;
-				}
+				if (base_dir.empty()) throw std::invalid_argument("Corfu remote replica needs an explicit writable durable replication directory");
 				std::error_code ec;
 				std::filesystem::create_directories(base_dir, ec);
+				if (ec) throw std::runtime_error("cannot create Corfu replica directory: " + ec.message());
 				if (!base_dir.empty() && base_dir.back() != '/') base_dir.push_back('/');
 			}
 			std::string base_filename = log_file.empty()
 				? base_dir + "corfu_replication_log" + std::to_string(broker_id) + ".dat"
 				: log_file;
 			LOG(INFO) << "[CORFU_DEBUG] CorfuReplicationManager: creating CorfuReplicationServiceImpl (base_filename=" << base_filename << ")";
-			service_ = std::make_unique<CorfuReplicationServiceImpl>(base_filename, cxl_addr);
+			service_ = std::make_unique<CorfuReplicationServiceImpl>(base_filename, cxl_addr, !log_to_memory);
 			LOG(INFO) << "[CORFU_DEBUG] CorfuReplicationManager: service created";
 
-			std::string server_address = address + ":" + (port.empty() ? std::to_string(CORFU_REP_PORT) : port);
+			// Every broker owns a distinct replica listener.  A configured base
+			// port maps deterministically to membership/broker index.
+			std::string server_address = address + ":" + (port.empty() ? std::to_string(CORFU_REP_PORT + broker_id) : port);
 			ServerBuilder builder;
 
 			// Set server options
@@ -313,11 +378,9 @@ namespace Corfu {
 	}
 
 	void CorfuReplicationManager::Shutdown() {
-		static std::atomic<bool> shutdown_in_progress(false);
-
 		// Ensure shutdown is only done once
 		bool expected = false;
-		if (!shutdown_in_progress.compare_exchange_strong(expected, true)) {
+		if (!shutdown_.compare_exchange_strong(expected, true)) {
 			return;
 		}
 

@@ -2,6 +2,7 @@
 
 #include "common/config.h"
 #include <thread>
+#include <atomic>
 
 // Forward declarations
 namespace grpc {
@@ -17,7 +18,7 @@ public:
     CorfuReplicationManager(int broker_id,
 														bool log_to_memory,
 														void* cxl_addr = nullptr,
-														const std::string& address = "localhost",
+														const std::string& address = "0.0.0.0",
                             const std::string& port = "",
                             const std::string& log_file = "");
     ~CorfuReplicationManager();
@@ -36,6 +37,7 @@ private:
     std::unique_ptr<CorfuReplicationServiceImpl> service_;
     std::unique_ptr<grpc::Server> server_;
     std::thread server_thread_;
+    std::atomic<bool> shutdown_{false};
 };
 
 } // End of namespace Corfu

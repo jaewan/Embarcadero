@@ -29,6 +29,9 @@ size_t MailboxSegment::BytesNeeded(const MailboxParams& p) {
 void MailboxSegment::BindRings(void* base, bool create, const MailboxParams* cp) {
 	auto* h = reinterpret_cast<MailboxSegmentHeader*>(base);
 	if (create) {
+		CHECK_NOTNULL(cp);
+		CHECK_GT(cp->num_brokers, 0u);
+		CHECK_GT(cp->record_size, 0u);
 		CHECK((cp->up_capacity & (cp->up_capacity - 1)) == 0) << "up_capacity must be power of two";
 		CHECK((cp->down_capacity & (cp->down_capacity - 1)) == 0) << "down_capacity must be power of two";
 		std::memset(h, 0, sizeof(*h));
@@ -46,10 +49,36 @@ void MailboxSegment::BindRings(void* base, bool create, const MailboxParams* cp)
 		CXL::flush_cacheline(h);
 		CXL::store_fence();
 	} else {
+		// The header is untrusted shared state at attach time.  Validate every extent
+		// before deriving ring addresses: attaching a stale/different layout must fail
+		// closed rather than turn a configuration mismatch into out-of-bounds accesses.
+		CHECK_GE(bytes_, sizeof(MailboxSegmentHeader));
 		CXL::invalidate_cacheline_for_read(h);
 		CXL::full_fence();
 		CHECK_EQ(h->magic, kMailboxSegmentMagic) << "not a mailbox segment / uninitialized";
 		CHECK_EQ(h->version, kMailboxSegmentVersion) << "mailbox segment version mismatch";
+		CHECK_GT(h->num_brokers, 0u);
+		CHECK_GT(h->record_size, 0u);
+		CHECK_GT(h->up_capacity, 0u);
+		CHECK_GT(h->down_capacity, 0u);
+		CHECK_EQ(h->up_capacity & (h->up_capacity - 1), 0u)
+				<< "mailbox up_capacity is not a power of two";
+		CHECK_EQ(h->down_capacity & (h->down_capacity - 1), 0u)
+				<< "mailbox down_capacity is not a power of two";
+		CHECK_EQ(h->up_stride, MailboxRing::BytesNeeded(h->record_size, h->up_capacity))
+				<< "mailbox up-ring layout mismatch";
+		CHECK_EQ(h->down_stride, MailboxRing::BytesNeeded(h->record_size, h->down_capacity))
+				<< "mailbox down-ring layout mismatch";
+		CHECK_GE(h->up_base, sizeof(MailboxSegmentHeader));
+		CHECK_GE(h->down_base, h->up_base);
+		CHECK_LE(h->up_base, bytes_);
+		CHECK_LE(h->up_stride, (bytes_ - h->up_base) / h->num_brokers)
+				<< "mailbox upstream extent exceeds mapped region";
+		const size_t up_end = h->up_base + h->up_stride * h->num_brokers;
+		CHECK_GE(h->down_base, up_end) << "mailbox ring extents overlap";
+		CHECK_LE(h->down_base, bytes_);
+		CHECK_LE(h->down_stride, (bytes_ - h->down_base) / h->num_brokers)
+				<< "mailbox downstream extent exceeds mapped region";
 	}
 
 	num_brokers_ = h->num_brokers;

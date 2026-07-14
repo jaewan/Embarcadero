@@ -102,8 +102,10 @@ uint32_t CorfuMailboxSequencer::DrainBrokerRequests(uint32_t broker_id) {
 		CorfuTokenGrant grant{};
 		grant.client_id = req.client_id;    // echo for correlation
 		grant.batch_seq = req.batch_seq;    // echo for correlation
+		grant.session_id = req.session_id;
+		grant.correlation_id = req.correlation_id;
+		grant.broker_id = req.broker_id;
 		grant.status = StatusToGrantValue(status);
-		grant.pad = 0;
 		if (status == CorfuSequencerImpl::TokenStatus::OK) {
 			grant.total_order = total_order;
 			grant.log_idx = log_idx;

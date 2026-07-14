@@ -24,6 +24,7 @@
 // Project includes
 #include "common/config.h"
 #include "common/configuration.h"
+#include "common/baseline_control_transport.h"
 #include "common/failure_domain.h"
 #include "heartbeat.h"
 #include "topic_manager.h"
@@ -262,7 +263,8 @@ int main(int argc, char* argv[]) {
 	size_t colon_pos = head_addr.find(':');
 	std::string head_ip = head_addr.substr(0, colon_pos);
 	std::unique_ptr<Corfu::CorfuTokenProxyServer> corfu_token_proxy;
-	if (sequencerType == heartbeat_system::SequencerType::CORFU) {
+	if (sequencerType == heartbeat_system::SequencerType::CORFU &&
+		Embarcadero::ParseBaselineControlTransport() != Embarcadero::BaselineControlTransport::kCxlMailbox) {
 		const int proxy_base = [] {
 			if (const char* value = std::getenv("EMBARCADERO_CORFU_PROXY_PORT_BASE")) return std::atoi(value);
 			return 50100;
@@ -275,12 +277,18 @@ int main(int argc, char* argv[]) {
 			config.config().corfu.sequencer_ip.get() + ":" +
 			std::to_string(config.config().corfu.sequencer_port.get());
 		corfu_token_proxy = std::make_unique<Corfu::CorfuTokenProxyServer>(
-			"0.0.0.0:" + std::to_string(proxy_base + broker_id), sequencer_endpoint);
+			"0.0.0.0:" + std::to_string(proxy_base + broker_id), sequencer_endpoint,
+			broker_id);
 		std::string proxy_error;
 		if (!corfu_token_proxy->Start(&proxy_error)) {
 			LOG(ERROR) << "Corfu token proxy startup failed: " << proxy_error;
 			return EXIT_FAILURE;
 		}
+		// The proxy owns exactly this membership ingress; the request-side check
+		// rejects any token whose broker id does not match this endpoint.
+		LOG(INFO) << "Corfu token proxy ready: broker_id=" << broker_id
+		          << " endpoint=0.0.0.0:" << (proxy_base + broker_id)
+		          << " upstream=" << sequencer_endpoint;
 	}
 
 	LOG(INFO) << "Starting Embarlet broker_id: " << broker_id;
@@ -341,6 +349,30 @@ int main(int argc, char* argv[]) {
 		if (cxl_manager.GetCXLAddr() == nullptr) {
 			LOG(ERROR) << "CXL initialization failed for broker " << broker_id << ", aborting startup";
 			return EXIT_FAILURE;
+		}
+		if (sequencerType == heartbeat_system::SequencerType::CORFU &&
+			Embarcadero::ParseBaselineControlTransport() == Embarcadero::BaselineControlTransport::kCxlMailbox) {
+			const int proxy_base = [] {
+				if (const char* value = std::getenv("EMBARCADERO_CORFU_PROXY_PORT_BASE")) return std::atoi(value);
+				return 50100;
+			}();
+			if (proxy_base <= 0 || proxy_base + broker_id > 65535 ||
+				cxl_manager.GetBaselineMailboxSegment() == nullptr) {
+				LOG(ERROR) << "Corfu mailbox proxy startup has invalid port or missing mailbox segment";
+				return EXIT_FAILURE;
+			}
+			const std::string sequencer_endpoint = config.config().corfu.sequencer_ip.get() + ":" +
+				std::to_string(config.config().corfu.sequencer_port.get());
+			corfu_token_proxy = std::make_unique<Corfu::CorfuTokenProxyServer>(
+				"0.0.0.0:" + std::to_string(proxy_base + broker_id), sequencer_endpoint,
+				broker_id, cxl_manager.GetBaselineMailboxSegment());
+			std::string proxy_error;
+			if (!corfu_token_proxy->Start(&proxy_error)) {
+				LOG(ERROR) << "Corfu mailbox token proxy startup failed: " << proxy_error;
+				return EXIT_FAILURE;
+			}
+			LOG(INFO) << "Corfu token proxy ready: broker_id=" << broker_id
+				<< " transport=cxl_mailbox endpoint=0.0.0.0:" << (proxy_base + broker_id);
 		}
 		LOG(INFO) << "[CORFU_DEBUG] CXLManager OK, creating DiskManager (broker_id=" << broker_id << ")";
 		{

@@ -28,10 +28,14 @@
 #include "common/config.h"
 #include "common/env_flags.h"
 #include "common/performance_utils.h"
+#include "common/baseline_control_transport.h"
+#include "cxl_manager/baseline_cxl_layout.h"
 
 namespace Embarcadero{
 
-static constexpr size_t kPhase2MetadataEnd = 0x4'0000'2000ULL;  // 16 GB + 8 KB, end of GOI
+using cxl_manager::BaseRegionsOffset;
+using cxl_manager::BaselineMailboxBytes;
+using cxl_manager::BaselineMailboxOffset;
 
 static std::string GetCxlShmName() {
 	const char* env = std::getenv("EMBARCADERO_CXL_SHM_NAME");
@@ -107,13 +111,14 @@ static inline void* allocate_shm(
 	bool dev = false;
 	const std::string shm_name = GetCxlShmName();
 	if(cxl_type == Real){
-		if(std::filesystem::exists("/dev/dax0.0")){
-			int dax_fd = open("/dev/dax0.0", O_RDWR);
+		const std::string dax_path = Configuration::getInstance().config().cxl.device_path.get();
+		if(std::filesystem::exists(dax_path)){
+			int dax_fd = open(dax_path.c_str(), O_RDWR);
 			if (dax_fd >= 0) {
 				// Validate DAX device size to avoid SIGBUS when mapping more than device has
 				off_t device_size = lseek(dax_fd, 0, SEEK_END);
 				if (device_size < 0 || static_cast<size_t>(device_size) < cxl_size) {
-					LOG(ERROR) << "/dev/dax0.0 size " << (device_size >= 0 ? std::to_string(device_size) : "unknown")
+					LOG(ERROR) << dax_path << " size " << (device_size >= 0 ? std::to_string(device_size) : "unknown")
 					          << " < required CXL size " << cxl_size << "; use shm or increase device / reduce config cxl.size";
 					close(dax_fd);
 				} else {
@@ -121,7 +126,7 @@ static inline void* allocate_shm(
 					cxl_fd = dax_fd;
 				}
 			} else {
-				LOG(WARNING) << "Failed to open /dev/dax0.0: " << strerror(errno)
+				LOG(WARNING) << "Failed to open " << dax_path << ": " << strerror(errno)
 				             << ". Falling back to shm object " << shm_name;
 			}
 		}
@@ -253,7 +258,8 @@ static inline void* allocate_shm(
 			size_t Bitmap_Region_size = cacheline_size * MAX_TOPIC_SIZE;
 			size_t BatchHeaders_Region_size = NUM_MAX_BROKERS_CONFIG * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
 			size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
-			size_t metadata_bytes = kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+			const size_t layout_base = BaseRegionsOffset(NUM_MAX_BROKERS_CONFIG);
+			size_t metadata_bytes = layout_base + TINode_Region_size + Bitmap_Region_size +
 				BatchHeaders_Region_size + SessionTable_Region_size;
 			clear_bytes = std::min(cxl_size, metadata_bytes);
 			LOG(INFO) << "Head broker clearing CXL metadata only: " << clear_bytes
@@ -313,11 +319,15 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 	          << " EMBARCADERO_CXL_COHERENT="
 	          << (std::getenv("EMBARCADERO_CXL_COHERENT") ? std::getenv("EMBARCADERO_CXL_COHERENT") : "<unset>");
 
-	// [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0 (128 bytes)
-	// [[CXL_MEMORY_LAYOUT_v2]] PBR/BatchHeaders/TInode/Bitmap/Segments start AFTER Phase 2 metadata
-		// Layout: 0x0 ControlBlock | 0x1000 CompletionVector | 0x2000 GOI (16GB) | 0x4_0000_2000 PBR...
+		// [[PHASE_1A_EPOCH_FENCING]] ControlBlock at offset 0 (128 bytes).
+		// Layout v3: ControlBlock | CompletionVector | GOI | fixed mailbox | topic metadata.
+		// The mailbox follows the complete GOI extent, not a stale hand-written
+		// constant, so none of its control records can alias a GOI entry.
 		control_block_ = reinterpret_cast<ControlBlock*>(cxl_addr_);
-		base_for_regions_ = reinterpret_cast<uint8_t*>(cxl_addr_) + kPhase2MetadataEnd;
+		baseline_mailbox_base_ = reinterpret_cast<uint8_t*>(cxl_addr_) + BaselineMailboxOffset();
+		baseline_mailbox_bytes_ = BaselineMailboxBytes(NUM_MAX_BROKERS_CONFIG);
+		base_for_regions_ = reinterpret_cast<uint8_t*>(cxl_addr_) +
+			BaseRegionsOffset(NUM_MAX_BROKERS_CONFIG);
 		uint8_t* base_for_regions = reinterpret_cast<uint8_t*>(base_for_regions_);
 
 		// Initialize CXL memory regions (TInode, Bitmap, BatchHeaders, Segments after Phase 2 region)
@@ -338,18 +348,38 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		
 		// Calculate total segment region size (shared pool for all brokers)
 		// Usable size = after Phase 2 metadata (ControlBlock + CV + GOI)
-		if (cxl_size_ < kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+		const size_t layout_base = BaseRegionsOffset(configured_max_brokers);
+		if (cxl_size_ < layout_base + TINode_Region_size + Bitmap_Region_size +
 				BatchHeaders_Region_size + SessionTable_Region_size) {
 			LOG(ERROR) << "CXL size " << cxl_size_ << " too small for layout v2: need at least "
-			           << (kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+			           << (layout_base + TINode_Region_size + Bitmap_Region_size +
 			               BatchHeaders_Region_size + SessionTable_Region_size)
-			           << " (Phase2 metadata + TInode + Bitmap + BatchHeaders + SessionTable)";
+			           << " (GOI + fixed mailbox + TInode + Bitmap + BatchHeaders + SessionTable)";
 			return;
 		}
-		size_t Segment_Region_size = (cxl_size_ - kPhase2MetadataEnd - TINode_Region_size -
+		size_t Segment_Region_size = (cxl_size_ - layout_base - TINode_Region_size -
 			Bitmap_Region_size - BatchHeaders_Region_size - SessionTable_Region_size);
 		padding = Segment_Region_size % cacheline_size;
 		Segment_Region_size -= padding;
+		// Benchmark launchers know how many independent broker logs must fit in
+		// this shared CXL extent.  Refuse an impossible geometry before accepting
+		// clients: otherwise topic discovery repeatedly retries allocation and can
+		// exhaust unrelated metadata slots after a follower has already crashed.
+		// Keep this opt-in so a general deployment may still provision capacity for
+		// more topics through its own admission controller.
+		if (const char* required_env = std::getenv("EMBARCADERO_REQUIRED_CXL_SEGMENTS")) {
+			char* end = nullptr;
+			const unsigned long required = std::strtoul(required_env, &end, 10);
+			const size_t available = Segment_Region_size / SEGMENT_SIZE;
+			if (end == required_env || *end != '\0' || required == 0 || required > available) {
+				LOG(FATAL) << "CXL segment-capacity preflight failed: required=" << required_env
+				           << " available=" << available
+				           << " segment_size=" << SEGMENT_SIZE
+				           << " cxl_size=" << cxl_size_
+				           << ". Reduce EMBARCADERO_SEGMENT_SIZE, reduce broker/topic demand, "
+				              "or provision a larger CXL region.";
+			}
+		}
 
 		bitmap_ = base_for_regions + TINode_Region_size;
 		batchHeaders_ = reinterpret_cast<uint8_t*>(bitmap_) + Bitmap_Region_size;
@@ -376,10 +406,6 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 		//   0x0000_0000: ControlBlock (128 B)
 		//   0x0000_1000: CompletionVector (4 KB)
 		//   0x0000_2000: GOI (32 GB) - [[SIZE_UPDATE]] 128 bytes per entry
-		static constexpr size_t kCompletionVectorOffset = 0x1000;  // 4 KB from base
-		static constexpr size_t kGOIOffset = 0x2000;               // 8 KB from base
-		static constexpr size_t kMaxGOIEntries = 256ULL * 1024 * 1024;  // 256M entries
-
 		completion_vector_ = reinterpret_cast<CompletionVectorEntry*>(
 			reinterpret_cast<uint8_t*>(cxl_addr_) + kCompletionVectorOffset);
 
@@ -415,11 +441,15 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 			}
 			CXL::store_fence();
 
-			LOG(INFO) << "CXLManager: Phase 2 initialized - CompletionVector (4 KB) and GOI (32 GB) allocated";
+			LOG(INFO) << "CXLManager: layout v" << cxl_manager::kCxlLayoutVersion
+			          << " initialized - CompletionVector, GOI, and reserved mailbox";
 			LOG(INFO) << "  - CompletionVector at offset 0x" << std::hex << kCompletionVectorOffset
 			          << " (" << NUM_MAX_BROKERS << " brokers × 128 bytes)";
 			LOG(INFO) << "  - GOI at offset 0x" << std::hex << kGOIOffset
-			          << " (" << std::dec << kMaxGOIEntries << " entries × 128 bytes = 32 GB)";
+			          << " (" << std::dec << cxl_manager::kMaxGOIEntries << " entries × 128 bytes = 32 GB)";
+			LOG(INFO) << "  - baseline mailbox at offset 0x" << std::hex
+			          << BaselineMailboxOffset() << " (" << std::dec
+			          << baseline_mailbox_bytes_ << " bytes)";
 		}
 
 		// Initialize bitmap to zero (broker 0 only, to avoid race conditions)
@@ -448,6 +478,36 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 			          << " bytes, " << num_segments << " segments, " 
 			          << Segment_Region_size / (1024*1024*1024) << " GB pool)";
 			LOG(INFO) << "CXLManager: Bmeta region removed (using TInode.offset_entry instead)";
+		}
+
+		// The mailbox is a fixed CXL-layout object, never a side POSIX segment in
+		// production.  The head creates it only after its CXL zeroing/metadata setup;
+		// followers attach and validate the published header without clearing anything.
+		// An uninitialized or incompatible extent is fatal by design: falling back to
+		// private SHM would silently change the experiment's control transport.
+		if (ParseBaselineControlTransport() == BaselineControlTransport::kCxlMailbox) {
+			const auto mailbox_params = cxl_manager::BaselineMailboxParams(NUM_MAX_BROKERS_CONFIG);
+			if (broker_id_ == 0) {
+				baseline_mailbox_segment_ = cxl_transport::MailboxSegment::CreateInPlace(
+						baseline_mailbox_base_, baseline_mailbox_bytes_, mailbox_params);
+				LOG(INFO) << "BASELINE_MAILBOX_READY backing=cxl_layout_v"
+				          << cxl_manager::kCxlLayoutVersion
+				          << " brokers=" << mailbox_params.num_brokers
+				          << " bytes=" << baseline_mailbox_bytes_;
+			} else {
+				baseline_mailbox_segment_ = cxl_transport::MailboxSegment::AttachInPlace(
+						baseline_mailbox_base_, baseline_mailbox_bytes_);
+				CHECK_EQ(baseline_mailbox_segment_->num_brokers(), mailbox_params.num_brokers)
+						<< "baseline mailbox broker-count mismatch";
+				CHECK_EQ(baseline_mailbox_segment_->record_size(), mailbox_params.record_size)
+						<< "baseline mailbox record-size mismatch";
+				CHECK_EQ(baseline_mailbox_segment_->up_capacity(), mailbox_params.up_capacity)
+						<< "baseline mailbox upstream-capacity mismatch";
+				CHECK_EQ(baseline_mailbox_segment_->down_capacity(), mailbox_params.down_capacity)
+						<< "baseline mailbox downstream-capacity mismatch";
+				LOG(INFO) << "BASELINE_MAILBOX_ATTACHED backing=cxl_layout_v"
+				          << cxl_manager::kCxlLayoutVersion;
+			}
 		}
 
 
@@ -676,7 +736,8 @@ void* CXLManager::GetNewSegment(){
 		size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
 		
 		// [[DEVIATION_004]] - Bmeta region removed; regions start after Phase 2 metadata.
-		size_t Segment_Region_size = (cxl_size - kPhase2MetadataEnd - TINode_Region_size -
+		const size_t layout_base = BaseRegionsOffset(NUM_MAX_BROKERS_CONFIG);
+		size_t Segment_Region_size = (cxl_size - layout_base - TINode_Region_size -
 			Bitmap_Region_size - BatchHeaders_Region_size - SessionTable_Region_size);
 		padding = Segment_Region_size % cacheline_size;
 		Segment_Region_size -= padding;
@@ -802,7 +863,8 @@ bool CXLManager::FreeSegment(void* segment_addr) {
 		const size_t configured_max_brokers = NUM_MAX_BROKERS_CONFIG;
 		size_t BatchHeaders_Region_size = configured_max_brokers * BATCHHEADERS_SIZE * MAX_TOPIC_SIZE;
 		size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
-		size_t Segment_Region_size = (cxl_size - kPhase2MetadataEnd - TINode_Region_size -
+		const size_t layout_base = BaseRegionsOffset(configured_max_brokers);
+		size_t Segment_Region_size = (cxl_size - layout_base - TINode_Region_size -
 			Bitmap_Region_size - BatchHeaders_Region_size - SessionTable_Region_size);
 		padding = Segment_Region_size % cacheline_size;
 		Segment_Region_size -= padding;
@@ -848,7 +910,7 @@ size_t CXLManager::CalculatePBROffset(int broker_id, int max_brokers) {
 	size_t SessionTable_Region_size = kMaxSessions * sizeof(SessionEntry) * MAX_TOPIC_SIZE;
 	
 	// PBR/segment region starts after BatchHeaders and the computed SessionEntry table.
-	size_t PBR_Region_start = kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+	size_t PBR_Region_start = BaseRegionsOffset(NUM_MAX_BROKERS_CONFIG) + TINode_Region_size + Bitmap_Region_size +
 		BatchHeaders_Region_size + SessionTable_Region_size;
 	
 	// Each broker gets its own PBR
@@ -888,7 +950,7 @@ size_t CXLManager::GetTotalMemoryRequirement(int max_brokers) {
 	size_t GOI_Region_size = GOI_SIZE;
 	
 	// Minimum memory requirement (before BrokerLogs)
-	return kPhase2MetadataEnd + TINode_Region_size + Bitmap_Region_size +
+	return BaseRegionsOffset(max_brokers) + TINode_Region_size + Bitmap_Region_size +
 	       BatchHeaders_Region_size + SessionTable_Region_size + PBR_Region_size +
 	       GOI_Region_size;
 }

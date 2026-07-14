@@ -23,6 +23,9 @@ class CorfuSequencerClient {
 		// Get total order for a batch of messages
 		bool GetTotalOrder(Embarcadero::BatchHeader *batch_header,
 				const std::string& proxy_endpoint){
+			// The response rewrites batch_seq to the broker sequence.  Preserve the
+			// original client sequence before that mutation for Corfu ValueId.
+			batch_header->original_client_batch_seq = batch_header->batch_seq;
 			TokenRequest request;
 			request.set_client_id(client_id_);
 			request.set_batchseq(batch_header->batch_seq);

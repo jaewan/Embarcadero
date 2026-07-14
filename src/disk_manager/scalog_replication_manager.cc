@@ -841,6 +841,10 @@ namespace Scalog {
 				local_cut_tracker_->recordWrite(rep_offset, complete_bytes, msg_count);
 				persisted_count += msg_count;
 				UpdateReplicationDone(broker_id_, broker_id_, persisted_count);
+				VLOG(1) << "CXL primary durable frontier broker=" << broker_id_
+				        << " bytes=" << complete_bytes
+				        << " messages=" << msg_count
+				        << " persisted=" << persisted_count;
 				static auto last_log_time = std::chrono::steady_clock::now();
 				const auto now = std::chrono::steady_clock::now();
 				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 2000) {
@@ -929,6 +933,11 @@ namespace Scalog {
 				local_count += msg_count;
 				persisted_count.store(local_count, std::memory_order_release);
 				UpdateReplicationDone(broker_id_, primary_broker_id, local_count);
+				VLOG(1) << "CXL replica durable frontier local_broker=" << broker_id_
+				        << " primary_broker=" << primary_broker_id
+				        << " bytes=" << complete_bytes
+				        << " messages=" << msg_count
+				        << " persisted=" << local_count;
 				static thread_local auto last_log_time = std::chrono::steady_clock::now();
 				const auto now = std::chrono::steady_clock::now();
 				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 2000) {

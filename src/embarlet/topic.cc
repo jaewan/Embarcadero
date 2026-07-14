@@ -40,6 +40,62 @@ std::vector<std::string> ResolveLazyLogMetadataEndpoints() {
 	return endpoints;
 }
 
+std::vector<Corfu::CorfuReplicaTarget> ResolveCorfuChainTargets(
+		int source_broker_id, int replication_factor, int num_brokers) {
+	const int expected = std::max(0, replication_factor - 1);
+	if (expected == 0) return {};
+	if (num_brokers < replication_factor) {
+		LOG(ERROR) << "Corfu RF=" << replication_factor << " requires at least RF live brokers, got "
+		           << num_brokers;
+		return {};
+	}
+	// A complete membership map is deliberate: a single global RF-1 endpoint
+	// list is wrong because every source broker has a different ordered chain.
+	const char* value = std::getenv("EMBARCADERO_CORFU_REPLICA_ENDPOINTS");
+	if (value == nullptr || *value == '\0') {
+		LOG(ERROR) << "RF>1 Corfu requires EMBARCADERO_CORFU_REPLICA_ENDPOINTS as "
+		           << "broker_id@endpoint entries for every participating broker";
+		return {};
+	}
+	std::unordered_map<int, std::string> membership;
+	std::unordered_map<std::string, int> endpoint_owner;
+	std::stringstream stream(value); std::string item;
+	while (std::getline(stream, item, ',')) {
+		const auto first = item.find_first_not_of(" \t"), last = item.find_last_not_of(" \t");
+		if (first == std::string::npos) continue;
+		item = item.substr(first, last - first + 1);
+		const auto at = item.find('@');
+		if (at == std::string::npos || at == 0 || at + 1 == item.size()) {
+			LOG(ERROR) << "invalid Corfu replica endpoint entry '" << item << "' (expected broker_id@endpoint)";
+			return {};
+		}
+		char* end = nullptr;
+		const long id = std::strtol(item.substr(0, at).c_str(), &end, 10);
+		if (*end != '\0' || id < 0 || id >= num_brokers) {
+			LOG(ERROR) << "invalid Corfu replica broker id in '" << item << "'";
+			return {};
+		}
+		const std::string endpoint = item.substr(at + 1);
+		if (!membership.emplace(static_cast<int>(id), endpoint).second ||
+			!endpoint_owner.emplace(endpoint, static_cast<int>(id)).second) {
+			LOG(ERROR) << "duplicate Corfu replica broker id or endpoint in membership map";
+			return {};
+		}
+	}
+	std::vector<Corfu::CorfuReplicaTarget> targets;
+	for (int index = 1; index <= expected; ++index) {
+		const int target_id = Embarcadero::GetReplicationSetBroker(
+			source_broker_id, replication_factor, num_brokers, index);
+		auto it = membership.find(target_id);
+		if (it == membership.end() || target_id == source_broker_id) {
+			LOG(ERROR) << "Corfu chain membership lacks expected target broker " << target_id;
+			return {};
+		}
+		targets.push_back({index, target_id, it->second});
+	}
+	return targets;
+}
+
 }  // namespace
 
 constexpr size_t kReplicationNotStarted = std::numeric_limits<size_t>::max();
@@ -604,18 +660,13 @@ Topic::Topic(
 		if (seq_type == KAFKA) {
 			GetCXLBufferFunc = &Topic::KafkaGetCXLBuffer;
 		} else if (seq_type == CORFU) {
-			// Initialize Corfu replication client
-		// Read replica addresses from environment variable (comma-separated)
-		const char* env_addrs = std::getenv("CORFU_REPLICA_ADDRS");
-		std::string replica_addrs = env_addrs ? env_addrs : ("127.0.0.1:" + std::to_string(CORFU_REP_PORT));
-			corfu_replication_client_ = std::make_unique<Corfu::CorfuReplicationClient>(
-					topic_name,
-					replication_factor_,
-					replica_addrs
-					);
-
-			if (!corfu_replication_client_->Connect()) {
-				LOG(ERROR) << "Corfu replication client failed to connect to replica";
+			if (replication_factor_ > 1) {
+				const int num_brokers = get_num_brokers_callback_();
+				const auto targets = ResolveCorfuChainTargets(broker_id_, replication_factor_, num_brokers);
+				if (static_cast<int>(targets.size()) != replication_factor_ - 1) {
+					LOG(FATAL) << "invalid Corfu ordered chain configuration";
+				}
+				corfu_replication_client_ = std::make_unique<Corfu::CorfuReplicationClient>(topic_name, replication_factor_, targets);
 			}
 
 			GetCXLBufferFunc = &Topic::CorfuGetCXLBuffer;
@@ -880,6 +931,12 @@ inline void Topic::PublishValidatedWrittenRange(size_t start_offset, size_t tota
 	CXL::flush_cacheline(CXL::ToFlushable(
 		&tinode_->offsets[broker_id_].validated_written_byte_offset));
 	CXL::store_fence();
+	if (seq_type_ == LAZYLOG) {
+		VLOG(1) << "LazyLog validated payload frontier broker=" << broker_id_
+		        << " range_start=" << start_offset
+		        << " range_end=" << start_offset + total_size
+		        << " frontier=" << validated_written_byte_offset_;
+	}
 }
 
 /**
@@ -994,8 +1051,11 @@ void Topic::DelegationThread() {
 						if (seq_type_ == SCALOG) {
 							PublishValidatedWrittenRange(current_batch->log_idx, current_batch->total_size);
 						} else if (seq_type_ == LAZYLOG) {
-							tinode_->offsets[broker_id_].validated_written_byte_offset =
-								current_batch->log_idx + current_batch->total_size;
+							// LazyLog's CXL data-replica pollers consume this same
+							// byte frontier.  Publish it with the contiguous-range
+							// release protocol rather than an unfenced store: metadata
+							// ACKs must not overtake payload visibility at replicas.
+							PublishValidatedWrittenRange(current_batch->log_idx, current_batch->total_size);
 						}
 					}
 				} else {
@@ -1051,8 +1111,7 @@ void Topic::DelegationThread() {
 						if (seq_type_ == SCALOG) {
 							PublishValidatedWrittenRange(current_batch->log_idx, current_batch->total_size);
 						} else if (seq_type_ == LAZYLOG) {
-							tinode_->offsets[broker_id_].validated_written_byte_offset =
-								current_batch->log_idx + current_batch->total_size;
+							PublishValidatedWrittenRange(current_batch->log_idx, current_batch->total_size);
 						}
 					}
 				}
@@ -1627,12 +1686,13 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 	// pointer (set above from log_addr_ + batch_header.log_idx).
 	return [this, batch_header, log](void* /*log_ptr*/, size_t /*placeholder*/) {
 		// Handle replication if needed
-		if (replication_factor_ > 0 && corfu_replication_client_) {
-			const bool replicated = corfu_replication_client_->ReplicateData(
-					batch_header.log_idx,
-					batch_header.total_size,
-					log
-					);
+		if (replication_factor_ > 1 && corfu_replication_client_) {
+			const Corfu::CorfuAppendDescriptor descriptor{
+				Corfu::CorfuSlotKey{topic_name_, static_cast<uint32_t>(broker_id_), batch_header.batch_seq},
+				Corfu::CorfuValueId{batch_header.client_id, batch_header.original_client_batch_seq, batch_header.total_order,
+					batch_header.num_msg, batch_header.total_size},
+				batch_header.log_idx, log, batch_header.total_size};
+			const bool replicated = corfu_replication_client_->AppendOrdered(descriptor);
 			if (!replicated) {
 				LOG(ERROR) << "CORFU replication failed for batch_seq=" << batch_header.batch_seq
 				           << " log_idx=" << batch_header.log_idx
@@ -1643,7 +1703,7 @@ std::function<void(void*, size_t)> Topic::CorfuGetCXLBuffer(
 			}
 			RecordCorfuOrder2DurableCompletion(
 					batch_header.batch_seq, batch_header.num_msg, batch_header.client_id);
-		} // end: if (replication_factor_ > 0 && corfu_replication_client_)
+		} // end: remote chain RF>=2
 
 		RecordCorfuOrder2BatchCompletion(batch_header.batch_seq, batch_header.num_msg, batch_header.client_id);
 	};
@@ -1739,7 +1799,7 @@ void Topic::RecordCorfuOrder2BatchCompletion(uint64_t batch_seq, uint32_t num_ms
 }
 
 void Topic::RecordCorfuOrder2DurableCompletion(uint64_t batch_seq, uint32_t num_msg, uint32_t client_id) {
-	if (seq_type_ != CORFU || order_ != Embarcadero::kOrderTotal || replication_factor_ <= 0) {
+	if (seq_type_ != CORFU || order_ != Embarcadero::kOrderTotal || replication_factor_ <= 1) {
 		return;
 	}
 
@@ -2088,11 +2148,11 @@ bool Topic::SupportsPerClientAckLevel2Durable() const {
 		return order_ == 0 || order_ == Embarcadero::kOrderStrong;
 	}
 	if (seq_type_ == CORFU) {
-		// The current Corfu transport has exactly one remote media-durable
-		// target.  RF is primary plus remote replicas, so accepting RF>2 would
-		// overclaim all-replica durability.  C2 generalizes this to a chain.
+		// RF includes the already-published CXL primary.  The ordered driver
+		// returns only after every RF-1 remote sidecar has acknowledged its
+		// data+metadata sync, so RF2 and RF3 share this ACK2 contract.
 		return order_ == Embarcadero::kOrderTotal &&
-		       replication_factor_ == Embarcadero::kMinReplicationFactorForAck2 &&
+		       replication_factor_ >= Embarcadero::kMinReplicationFactorForAck2 &&
 		       corfu_replication_client_ != nullptr;
 	}
 	if (seq_type_ == LAZYLOG) {
@@ -2473,6 +2533,11 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 		request.set_payload_offset(batch_header.log_idx);
 		request.set_payload_size(batch_header.total_size);
 		request.set_num_messages(batch_header.num_msg);
+		VLOG(1) << "LazyLog metadata append descriptor source_broker="
+		        << request.source_broker_id()
+		        << " source_batch_seq=" << request.source_batch_seq()
+		        << " client=" << request.client_id()
+		        << " num_messages=" << request.num_messages();
 		std::string error;
 		if (!lazylog_metadata_replica_client_->AppendToAll(request, &error)) {
 			LOG(ERROR) << "LazyLog metadata replication failed for pbr="

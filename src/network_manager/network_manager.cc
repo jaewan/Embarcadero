@@ -657,16 +657,7 @@ bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
 bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 		const struct sockaddr_in& client_address,
 		uint32_t port) {
-	ack_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (ack_fd < 0) {
-		LOG(ERROR) << "Socket creation failed for acknowledgment connection";
-		return false;
-	}
-
-	if (!ConfigureNonBlockingSocket(ack_fd)) {
-		close(ack_fd);
-		return false;
-	}
+	ack_fd = -1;
 
 	// Setup server address for connection
 	// [[FIX: B1_ACK_ZERO]] Use inet_ntop (thread-safe) and explicit uint16_t port to avoid inet_ntoa/truncation issues
@@ -682,19 +673,29 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 	}
 	server_addr.sin_addr.s_addr = inet_addr(client_ip);
 
-	// Create epoll for connection monitoring
-	ack_efd_ = epoll_create1(0);
-	if (ack_efd_ == -1) {
-		LOG(ERROR) << "epoll_create1 failed for acknowledgment connection";
-		close(ack_fd);
-		return false;
-	}
-
-	// Try connecting with retries
+	// A failed non-blocking connect leaves a TCP socket in an unspecified/error
+	// state.  In particular, reusing it after ECONNREFUSED turns the next
+	// connect() into EALREADY/EISCONN on some kernels.  Recreate both the socket
+	// and its connect epoll for every attempt so a client ACK-listener startup
+	// race cannot permanently strand one broker without an ACK channel.
 	const int MAX_RETRIES = 5;
-	int retries = 0;
-
-	while (retries < MAX_RETRIES) {
+	bool connected = false;
+	for (int attempt = 1; attempt <= MAX_RETRIES && !connected; ++attempt) {
+		ack_fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (ack_fd < 0 || !ConfigureNonBlockingSocket(ack_fd)) {
+			LOG(ERROR) << "SetupAcknowledgmentSocket: cannot create non-blocking ACK socket for broker "
+			           << broker_id_ << ": " << strerror(errno);
+			if (ack_fd >= 0) close(ack_fd);
+			ack_fd = -1;
+			break;
+		}
+		ack_efd_ = epoll_create1(0);
+		if (ack_efd_ == -1) {
+			LOG(ERROR) << "epoll_create1 failed for acknowledgment connection";
+			close(ack_fd);
+			ack_fd = -1;
+			break;
+		}
 		int connect_result = connect(ack_fd,
 				reinterpret_cast<const sockaddr*>(&server_addr),
 				sizeof(server_addr));
@@ -703,6 +704,7 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 			// Connection succeeded immediately (sync)
 			LOG(INFO) << "SetupAcknowledgmentSocket: Broker " << broker_id_
 			          << " ACK connection established to " << client_ip << ":" << port << " (sync)";
+			connected = true;
 			break;
 		}
 
@@ -710,7 +712,10 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 			LOG(ERROR) << "SetupAcknowledgmentSocket: Broker " << broker_id_
 			           << " connect failed to " << client_ip << ":" << port << ": " << strerror(errno);
 			CleanupSocketAndEpoll(ack_fd, ack_efd_);
-			return false;
+			ack_fd = -1;
+			ack_efd_ = -1;
+			if (attempt < MAX_RETRIES) sleep(1);
+			continue;
 		}
 
 		// Connection is in progress, wait for completion with epoll
@@ -721,7 +726,9 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 		if (epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
 			LOG(ERROR) << "epoll_ctl failed: " << strerror(errno);
 			CleanupSocketAndEpoll(ack_fd, ack_efd_);
-			return false;
+			ack_fd = -1;
+			ack_efd_ = -1;
+			break;
 		}
 
 		// Wait for socket to become writable
@@ -735,13 +742,16 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 			if (getsockopt(ack_fd, SOL_SOCKET, SO_ERROR, &sock_error, &len) < 0) {
 				LOG(ERROR) << "getsockopt failed: " << strerror(errno);
 				CleanupSocketAndEpoll(ack_fd, ack_efd_);
-				return false;
+				ack_fd = -1;
+				ack_efd_ = -1;
+				break;
 			}
 
 			if (sock_error == 0) {
 				// Connection successful
 				LOG(INFO) << "SetupAcknowledgmentSocket: Broker " << broker_id_
 				          << " ACK connection established to " << client_ip << ":" << port << " (async)";
+				connected = true;
 				break;
 			} else {
 				LOG(ERROR) << "SetupAcknowledgmentSocket: Broker " << broker_id_
@@ -755,19 +765,22 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 			// epoll_wait error
 			LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
 			CleanupSocketAndEpoll(ack_fd, ack_efd_);
-			return false;
+			ack_fd = -1;
+			ack_efd_ = -1;
+			break;
 		}
 
-		// Remove fd from epoll before retrying
-		epoll_ctl(ack_efd_, EPOLL_CTL_DEL, ack_fd, NULL);
-		retries++;
-		sleep(1);  // Wait before retrying
+		if (!connected) {
+			CleanupSocketAndEpoll(ack_fd, ack_efd_);
+			ack_fd = -1;
+			ack_efd_ = -1;
+			if (attempt < MAX_RETRIES) sleep(1);
+		}
 	}
 
-	if (retries == MAX_RETRIES) {
+	if (!connected) {
 		LOG(ERROR) << "SetupAcknowledgmentSocket: Broker " << broker_id_
-		           << " max retries reached connecting to " << client_ip << ":" << port << ". ACK channel will not work.";
-		CleanupSocketAndEpoll(ack_fd, ack_efd_);
+			           << " max retries reached connecting to " << client_ip << ":" << port << ". ACK channel will not work.";
 		return false;
 	}
 
@@ -1617,6 +1630,13 @@ void NetworkManager::HandlePublishRequest(
 			running = false;
 			break;
 		}
+		if (seq_type == LAZYLOG) {
+			VLOG(1) << "LazyLog ingest payload complete broker=" << broker_id_
+			        << " client=" << handshake.client_id
+			        << " batch_seq=" << batch_header.batch_seq
+			        << " pbr=" << batch_header.pbr_absolute_index
+			        << " num_msg=" << batch_header.num_msg;
+		}
 
 		if (kNtIngest) {
 			CXL::nt_copy(buf, nt_staging.data(), batch_header.total_size);
@@ -1892,6 +1912,13 @@ void NetworkManager::HandlePublishRequest(
 				running = false;
 				break;
 			}
+			if (seq_type == LAZYLOG) {
+				VLOG(1) << "LazyLog ingest PBR published broker=" << broker_id_
+				        << " client=" << handshake.client_id
+				        << " batch_seq=" << batch_header.batch_seq
+				        << " pbr=" << batch_header.pbr_absolute_index
+				        << " num_msg=" << batch_header.num_msg;
+			}
 		}
 
 		// ORDER=0 ACK cursor owner: network ingest path is the single source of truth for written.
@@ -1943,6 +1970,13 @@ void NetworkManager::HandlePublishRequest(
 				// CORFU: Topic::CorfuGetCXLBuffer callback runs replication (if any) then
 				// RecordCorfuOrder2BatchCompletion, which advances tinode->offsets[broker].ordered for ACK1.
 				non_emb_seq_callback((void*)header, logical_offset - 1);
+				if (seq_type == LAZYLOG) {
+					VLOG(1) << "LazyLog metadata callback returned broker=" << broker_id_
+					        << " client=" << handshake.client_id
+					        << " batch_seq=" << batch_header.batch_seq
+					        << " pbr=" << batch_header.pbr_absolute_index
+					        << " num_msg=" << batch_header.num_msg;
+				}
 			}
 		}
 

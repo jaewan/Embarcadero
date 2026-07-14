@@ -229,7 +229,13 @@ struct TInode* TopicManager::CreateNewTopicInternal(const char topic[TOPIC_NAME_
 	// Handle replication if needed
 	{
 		int replication_factor = tinode->replication_factor;
-		disk_manager_.EnsureTopicReplicationFactor(replication_factor);
+		// Chain-replication configuration is an Embarcadero-only invariant.
+		// LazyLog/Scalog use their own replica managers, so applying this check
+		// there incorrectly reports a missing Embarcadero chain for valid RF>0
+		// baseline topics.
+		if (tinode->seq_type == EMBARCADERO) {
+			disk_manager_.EnsureTopicReplicationFactor(replication_factor);
+		}
 		if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
 			disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
 		}
@@ -484,7 +490,9 @@ struct TInode* TopicManager::CreateNewTopicInternal(
 	}
 
 	// Handle replication if needed
-	disk_manager_.EnsureTopicReplicationFactor(replication_factor);
+	if (tinode->seq_type == EMBARCADERO) {
+		disk_manager_.EnsureTopicReplicationFactor(replication_factor);
+	}
 	if (tinode->seq_type == EMBARCADERO && replication_factor > 0) {
 		disk_manager_.Replicate(tinode, replica_tinode, replication_factor);
 	}

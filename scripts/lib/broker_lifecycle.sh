@@ -764,17 +764,22 @@ broker_local_cleanup() {
     for _pid in "${_job_pids[@]}"; do
       kill -9 "$_pid" >/dev/null 2>&1 || true
     done
-    for _pid in "${_job_pids[@]}"; do
-      wait "$_pid" >/dev/null 2>&1 || true
-    done
+    # Do not wait indefinitely here. A killed process can remain in an
+    # uninterruptible kernel teardown (notably a large tmpfs/CXL unmap), and
+    # making the next experiment wait on it defeats bounded cleanup. Bash will
+    # reap the child naturally; port ownership is handled below explicitly.
   fi
 
   # Then clean up any remaining local broker/test processes by exact executable name.
   # Avoid `pkill -f ./foo`: in orchestration shells it can match the shell command line
   # and kill the harness itself while cleanup is running.
-  broker_local_signal_named_processes "" embarlet throughput_test corfu_global_sequencer lazylog_global_sequencer scalog_global_sequencer
+  broker_local_signal_named_processes "" embarlet throughput_test \
+    corfu_global_sequencer lazylog_global_sequencer scalog_global_sequencer \
+    corfu_mailbox_global_sequencer lazylog_mailbox_global_sequencer scalog_mailbox_global_sequencer
   sleep 0.1
-  broker_local_signal_named_processes "-9" embarlet throughput_test corfu_global_sequencer lazylog_global_sequencer scalog_global_sequencer
+  broker_local_signal_named_processes "-9" embarlet throughput_test \
+    corfu_global_sequencer lazylog_global_sequencer scalog_global_sequencer \
+    corfu_mailbox_global_sequencer lazylog_mailbox_global_sequencer scalog_mailbox_global_sequencer
   broker_local_drain_ports
   rm -f /tmp/embarlet_*_ready 2>/dev/null || true
 }
@@ -818,6 +823,7 @@ broker_remote_launch() {
   local _remote_chain_sync_bytes="${EMBARCADERO_CHAIN_SYNC_BYTES:-}"
   local _remote_chain_sync_interval_ms="${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}"
   local _remote_lazylog_metadata_endpoints="${EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS:-}"
+  local _remote_corfu_replica_endpoints="${EMBARCADERO_CORFU_REPLICA_ENDPOINTS:-}"
 
   broker_remote_ssh env \
     REMOTE_STATE_DIR="$REMOTE_BROKER_STATE_DIR" \
@@ -839,6 +845,7 @@ broker_remote_launch() {
     REMOTE_LAZYLOG_SEQ_IP="${EMBARCADERO_LAZYLOG_SEQ_IP:-}" \
     REMOTE_LAZYLOG_SEQ_PORT="${EMBARCADERO_LAZYLOG_SEQ_PORT:-}" \
     REMOTE_LAZYLOG_METADATA_ENDPOINTS="$_remote_lazylog_metadata_endpoints" \
+    REMOTE_CORFU_REPLICA_ENDPOINTS="$_remote_corfu_replica_endpoints" \
     REMOTE_REPLICATION_FACTOR="$_remote_rep" \
     REMOTE_NUM_BROKERS="$_remote_nb" \
     REMOTE_REPLICA_DISK_DIRS="$_remote_disk_dirs" \
@@ -870,6 +877,7 @@ scalog_seq_port=${REMOTE_SCALOG_SEQ_PORT:-}
 lazylog_seq_ip=${REMOTE_LAZYLOG_SEQ_IP:-}
 lazylog_seq_port=${REMOTE_LAZYLOG_SEQ_PORT:-}
 lazylog_metadata_endpoints=${REMOTE_LAZYLOG_METADATA_ENDPOINTS:-}
+corfu_replica_endpoints=${REMOTE_CORFU_REPLICA_ENDPOINTS:-}
 replication_factor_cfg=${REMOTE_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${REMOTE_NUM_BROKERS:-4}
 replica_disk_dirs=${REMOTE_REPLICA_DISK_DIRS:-}
@@ -903,6 +911,7 @@ nohup env \
   EMBARCADERO_LAZYLOG_SEQ_IP="$lazylog_seq_ip" \
   EMBARCADERO_LAZYLOG_SEQ_PORT="$lazylog_seq_port" \
   EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS="$lazylog_metadata_endpoints" \
+  EMBARCADERO_CORFU_REPLICA_ENDPOINTS="$corfu_replica_endpoints" \
   EMBARCADERO_REPLICATION_FACTOR="$replication_factor_cfg" \
   NUM_BROKERS="$num_brokers_cfg" \
   EMBARCADERO_REPLICA_DISK_DIRS="$replica_disk_dirs" \
@@ -932,6 +941,7 @@ scalog_seq_port=${EMBARCADERO_SCALOG_SEQ_PORT:-}
 lazylog_seq_ip=${EMBARCADERO_LAZYLOG_SEQ_IP:-}
 lazylog_seq_port=${EMBARCADERO_LAZYLOG_SEQ_PORT:-}
 lazylog_metadata_endpoints=${EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS:-}
+corfu_replica_endpoints=${EMBARCADERO_CORFU_REPLICA_ENDPOINTS:-}
 replication_factor_cfg=${EMBARCADERO_REPLICATION_FACTOR:-0}
 num_brokers_cfg=${NUM_BROKERS:-4}
 replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}
@@ -956,6 +966,9 @@ export EMBARCADERO_RUNTIME_MODE=${EMBARCADERO_RUNTIME_MODE:-throughput}
 export EMBARCADERO_REPLICATION_FACTOR="${replication_factor_cfg:-0}"
 export NUM_BROKERS="${num_brokers_cfg:-4}"
 export EMBARCADERO_CXL_SHM_NAME=${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}
+if [ -n "$corfu_replica_endpoints" ]; then
+  export EMBARCADERO_CORFU_REPLICA_ENDPOINTS="$corfu_replica_endpoints"
+fi
 if [ -n "$replica_disk_dirs" ]; then
   export EMBARCADERO_REPLICA_DISK_DIRS="$replica_disk_dirs"
 fi
@@ -1011,6 +1024,13 @@ if [ "$role" = "head" ]; then
   cmd+=(--head)
 fi
 cmd+=(--"$sequence")
+if [ "$sequence" = "CORFU" ] && [ "${replication_factor_cfg:-0}" -gt 1 ]; then
+  if [ -z "$replica_disk_dirs" ] && [ -z "${EMBARCADERO_REPLICA_DISK_ROOT:-}" ]; then
+    echo "Corfu RF>1 requires explicit replica disk directories" >&2
+    exit 2
+  fi
+  cmd+=(--replicate_to_disk)
+fi
 if [ "$sequence" != "CORFU" ] && command -v numactl >/dev/null 2>&1 && numactl --hardware 2>/dev/null | grep -q 'node 1'; then
   if numactl --hardware 2>/dev/null | grep -q 'node 2'; then
     cmd=(numactl --cpunodebind=1 --membind=1,2 "${cmd[@]}")

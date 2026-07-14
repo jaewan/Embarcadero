@@ -4,7 +4,12 @@ package corfureplication;
 
 // Service definition for Corfu replication
 service CorfuReplicationService {
+  // Legacy name retained only so old binaries fail at the response boundary rather
+  // than silently treating an anonymous byte range as a Corfu replica slot.
   rpc Replicate (CorfuReplicationRequest) returns (CorfuReplicationResponse) {}
+  rpc ProbeSlot (CorfuProbeRequest) returns (CorfuProbeResponse) {}
+  rpc WriteOnce (CorfuWriteOnceRequest) returns (CorfuWriteResponse) {}
+  rpc WriteJunkOnce (CorfuJunkRequest) returns (CorfuWriteResponse) {}
 }
 
 // Request message containing the data to be replicated
@@ -17,3 +22,49 @@ message CorfuReplicationRequest {
 message CorfuReplicationResponse {
   bool success = 1;
 }
+
+// Slot identity deliberately contains no virtual address.  A broker batch is
+// the durable unit in this harness.
+message CorfuSlotKey {
+  string topic = 1;
+  uint32 broker_id = 2;
+  uint64 broker_batch_seq = 3;
+}
+
+message CorfuValueId {
+  uint64 client_id = 1;
+  uint64 original_client_batch_seq = 2;
+  uint64 total_order = 3;
+  uint32 num_msg = 4;
+  uint64 total_size = 5;
+}
+
+enum CorfuSlotState {
+  CORFU_UNWRITTEN = 0;
+  CORFU_VALUE = 1;
+  CORFU_JUNK = 2;
+}
+
+enum CorfuWriteStatus {
+  CORFU_WRITTEN = 0;
+  CORFU_ALREADY_SAME = 1;
+  CORFU_ALREADY_JUNK = 2;
+  CORFU_CONFLICT = 3;
+  CORFU_IO_ERROR = 4;
+}
+
+message CorfuProbeRequest { CorfuSlotKey slot = 1; }
+message CorfuProbeResponse {
+  CorfuSlotState state = 1;
+  CorfuValueId value = 2;
+}
+message CorfuWriteOnceRequest {
+  CorfuSlotKey slot = 1;
+  CorfuValueId value = 2;
+  uint64 source_offset = 3;
+  uint64 size = 4;
+  bytes payload = 5;
+  uint32 payload_crc32c = 6;
+}
+message CorfuJunkRequest { CorfuSlotKey slot = 1; }
+message CorfuWriteResponse { CorfuWriteStatus status = 1; }

@@ -40,6 +40,7 @@ RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${RUN_TS}}"
 REQUIRE_FIRST_ATTEMPT_PASS="${REQUIRE_FIRST_ATTEMPT_PASS:-0}"
 EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-}"
+CONTROL_TRANSPORT="${EMBARCADERO_BASELINE_CONTROL_TRANSPORT:-grpc}"
 
 if [[ -z "$ACK_LEVEL" ]]; then
   if [[ "$REPLICATION_FACTOR" == "2" ]]; then
@@ -131,6 +132,7 @@ replica_disk_dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-}
 ack_claim_label=$ACK_CLAIM_LABEL
 ack_level=$ACK_LEVEL
 replication_factor=$REPLICATION_FACTOR
+control_transport=$CONTROL_TRANSPORT
 EOF
 
 COMMIT="$(git rev-parse HEAD)"
@@ -157,6 +159,7 @@ REMOTE_SCALOG_SEQUENCER_HOST='$REMOTE_SCALOG_SEQUENCER_HOST' REMOTE_SCALOG_BUILD
 PUBLICATION_BROKER_CONFIG='$PUBLICATION_BROKER_CONFIG' PUBLICATION_CLIENT_CONFIG='$PUBLICATION_CLIENT_CONFIG' \\
 EMBARCADERO_LAZYLOG_SEQ_IP='$EMBARCADERO_LAZYLOG_SEQ_IP' EMBARCADERO_LAZYLOG_SEQ_PORT='$EMBARCADERO_LAZYLOG_SEQ_PORT' \\
 EMBARCADERO_ACK_TIMEOUT_SEC='$EMBARCADERO_ACK_TIMEOUT_SEC' \\
+EMBARCADERO_BASELINE_CONTROL_TRANSPORT='$CONTROL_TRANSPORT' \\
 bash scripts/publication/run_throughput_cell.sh
 EOF
 chmod +x "$RUN_DIR/command.sh"
@@ -171,6 +174,7 @@ num_clients=$NUM_CLIENTS
 client_layout=$CLIENT_LAYOUT
 replication_factor=$REPLICATION_FACTOR
 ack_level=$ACK_LEVEL
+control_transport=$CONTROL_TRANSPORT
 num_trials=$NUM_TRIALS
 num_brokers=$NUM_BROKERS
 total_message_size=$TOTAL_MESSAGE_SIZE
@@ -267,6 +271,7 @@ env \
   REMOTE_SCALOG_SEQUENCER_HOST="${REMOTE_SCALOG_SEQUENCER_HOST:-}" \
   REMOTE_SCALOG_BUILD_BIN="${REMOTE_SCALOG_BUILD_BIN:-}" \
   EMBARCADERO_ACK_TIMEOUT_SEC="$EMBARCADERO_ACK_TIMEOUT_SEC" \
+  EMBARCADERO_BASELINE_CONTROL_TRANSPORT="$CONTROL_TRANSPORT" \
   EMBARCADERO_SCALOG_SEQ_IP="${EMBARCADERO_SCALOG_SEQ_IP:-}" \
   EMBARCADERO_SCALOG_SEQ_PORT="${EMBARCADERO_SCALOG_SEQ_PORT:-}" \
   bash scripts/run_multiclient.sh \
@@ -277,6 +282,7 @@ set -e
 cp -a "$PROJECT_ROOT/multiclient_logs/." "$RAW_DIR/" 2>/dev/null || true
 cp -a build/bin/broker_*.log "$RAW_DIR/" 2>/dev/null || true
 cp -a /tmp/broker_*.log "$RAW_DIR/" 2>/dev/null || true
+cp -a /tmp/*_mailbox_sequencer.log "$RAW_DIR/" 2>/dev/null || true
 scp -o StrictHostKeyChecking=no "${CORFU_SEQUENCER_LOG_HOST}:/tmp/corfu_sequencer.log" \
   "$RAW_DIR/${CORFU_SEQUENCER_LOG_HOST}_corfu_sequencer.log" >/dev/null 2>&1 || true
 scp -o StrictHostKeyChecking=no "${LAZYLOG_SEQUENCER_LOG_HOST}:/tmp/lazylog_sequencer.log" \
@@ -285,7 +291,20 @@ scp -o StrictHostKeyChecking=no "${SCALOG_SEQUENCER_LOG_HOST}:/tmp/scalog_sequen
   "$RAW_DIR/${SCALOG_SEQUENCER_LOG_HOST}_scalog_sequencer.log" >/dev/null 2>&1 || true
 
 SUMMARY_CSV="$RUN_DIR/summary.csv"
-echo "system,order,sequencer,num_clients,client_layout,replication_factor,run_idx,status,throughput_gbps,throughput_overlap_gbps,overlap_window_ms,timeseries_clients,attempts_used,first_attempt_pass,artifact_dir,commit,chain_sink_mode,ack_claim_label" > "$SUMMARY_CSV"
+MAILBOX_BACKING="not_applicable"
+if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
+  if grep -Rqs 'BASELINE_MAILBOX_SEQUENCER_ATTACHED backing=shm_numa_cxl' "$RAW_DIR"; then
+    MAILBOX_BACKING="cxl_numa_shm"
+  elif grep -Rqs 'BASELINE_MAILBOX_SEQUENCER_ATTACHED backing=dax' "$RAW_DIR"; then
+    MAILBOX_BACKING="dax"
+  else
+    echo "ERROR: mailbox cell lacks a verified production mailbox attachment marker" >&2
+    RUN_STATUS=1
+    MAILBOX_BACKING="unverified"
+  fi
+fi
+printf 'mailbox_backing=%s\ncontrol_transport=%s\n' "$MAILBOX_BACKING" "$CONTROL_TRANSPORT" >> "$RUN_DIR/metadata.env"
+echo "system,order,sequencer,control_transport,mailbox_backing,num_clients,client_layout,replication_factor,run_idx,status,throughput_gbps,throughput_overlap_gbps,overlap_window_ms,timeseries_clients,attempts_used,first_attempt_pass,artifact_dir,commit,chain_sink_mode,ack_claim_label" > "$SUMMARY_CSV"
 ATTEMPT_SUMMARY_FILE="$RAW_DIR/attempt_summary.csv"
 OVERLAP_SUMMARY_FILE="$RAW_DIR/overlap_summary.csv"
 
@@ -337,7 +356,7 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
       fi
     fi
   fi
-  echo "$SYSTEM,$ORDER,$SEQUENCER,$NUM_CLIENTS,\"$CLIENT_LAYOUT\",$REPLICATION_FACTOR,$trial,$trial_status,$throughput_gbps,$overlap_gbps,$overlap_window_ms,$timeseries_clients,$attempts_used,$first_attempt_pass,$trial_dir,$COMMIT,$CHAIN_SINK_MODE,$ACK_CLAIM_LABEL" >> "$SUMMARY_CSV"
+  echo "$SYSTEM,$ORDER,$SEQUENCER,$CONTROL_TRANSPORT,$MAILBOX_BACKING,$NUM_CLIENTS,\"$CLIENT_LAYOUT\",$REPLICATION_FACTOR,$trial,$trial_status,$throughput_gbps,$overlap_gbps,$overlap_window_ms,$timeseries_clients,$attempts_used,$first_attempt_pass,$trial_dir,$COMMIT,$CHAIN_SINK_MODE,$ACK_CLAIM_LABEL" >> "$SUMMARY_CSV"
 done
 
 if [[ "$REQUIRE_FIRST_ATTEMPT_PASS" == "1" ]]; then

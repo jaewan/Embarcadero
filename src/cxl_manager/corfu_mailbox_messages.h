@@ -18,10 +18,16 @@ struct alignas(8) CorfuTokenRequest {
 	uint64_t batch_seq;
 	uint64_t num_msg;
 	uint64_t total_size;
+	// Transport-only identity. `session_id` changes when an ingress proxy is
+	// recreated; `correlation_id` is unique only inside that session.  Both must
+	// be echoed so a late grant from a prior proxy instance cannot satisfy a new
+	// request whose local counter happened to restart at the same value.
+	uint64_t session_id;
+	uint64_t correlation_id;
 	uint32_t broker_id;
-	uint32_t pad;  // explicit padding: fixed 40-byte layout, no implicit tail padding
+	uint32_t pad;
 };
-static_assert(sizeof(CorfuTokenRequest) == 40, "CorfuTokenRequest must be 40 bytes (fixed CXL layout)");
+static_assert(sizeof(CorfuTokenRequest) == 56, "CorfuTokenRequest must be 56 bytes (fixed CXL layout)");
 
 // Sequencer -> broker, posted on down(broker_id). Mirrors TotalOrderResponse, plus an echo
 // of client_id + batch_seq for defensive request/response correlation, plus a status field
@@ -34,10 +40,12 @@ struct alignas(8) CorfuTokenGrant {
 	uint64_t broker_batch_seq;
 	uint64_t client_id;   // echo for correlation
 	uint64_t batch_seq;   // echo for correlation
+	uint64_t session_id;      // echo; prevents proxy-restart correlation aliasing
+	uint64_t correlation_id;  // echo; routes grant to the waiting proxy call
+	uint32_t broker_id;       // echo; validates ingress ownership at receipt
 	uint32_t status;      // TokenStatus as uint32_t
-	uint32_t pad;         // explicit padding: fixed 48-byte layout
 };
-static_assert(sizeof(CorfuTokenGrant) == 48, "CorfuTokenGrant must be 48 bytes (fixed CXL layout)");
+static_assert(sizeof(CorfuTokenGrant) == 64, "CorfuTokenGrant must be 64 bytes (fixed CXL layout)");
 
 }  // namespace cxl_manager
 }  // namespace Embarcadero
