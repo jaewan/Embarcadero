@@ -516,6 +516,23 @@ TEST_F(ScalogAckInvariantTest, ScalogRF2_Ack2EqualsAck1_WhenReplicationCaughtUp)
     EXPECT_EQ(ack2, 100u) << "SCALOG ACK2 == ACK1 when remote replication is caught up";
 }
 
+TEST_F(ScalogAckInvariantTest, ScalogRF3_Ack2RemainsPinnedByLaggingReplica) {
+    const int broker = 0;
+    const int rf = 3;
+
+    // Primary and first replica have persisted 100 messages, but the second
+    // remote replica has only persisted 41.  ACK2 must expose the common
+    // durable prefix, not the fastest replica's frontier.
+    offsets_[0].replication_done[0] = 99;
+    offsets_[1].replication_done[0] = 99;
+    offsets_[2].replication_done[0] = 40;
+    offsets_[0].ordered = 100;
+    EXPECT_EQ(ComputeScalogAck2(offsets_, broker, rf, kNumBrokers, SCALOG), 41u);
+
+    offsets_[2].replication_done[0] = 99;
+    EXPECT_EQ(ComputeScalogAck2(offsets_, broker, rf, kNumBrokers, SCALOG), 100u);
+}
+
 // LazyLog RF=2: ACK1 == ACK2 because ordering is gated on full replication.
 // Since progress = min(local, remote) gates ordering, by the time ordered advances,
 // both replicas have confirmed. So durable_frontier >= ordered, and the clamp gives
