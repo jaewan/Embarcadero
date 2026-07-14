@@ -42,14 +42,18 @@ Scalog labeling, and batching/RF instrumentation.
   idempotence was keyed only by the resettable sequencer source slot.  Commit
   `5bfe3ca0` keys it by `(topic, source broker, client id, client batch seq)`
   instead, and adds a regression test proving that a new publisher may reuse a
-  source slot.  The focused test suite passes 9/9.  The remote restart/redrive
-  smoke must be repeated with that committed service binary before F3 can be
-  closed; c2's temporary build is presently blocked from fetching its absent
-  gRPC source cache, so do not treat the pre-fix restart attempt as evidence.
+  source slot.  The focused test suite passes 9/9.  The committed source was
+  synchronized into c2's isolated validation worktree (source hashes match),
+  rebuilt against its existing dependency cache, and rerun: after killing and
+  restarting replica 1 with its sidecar retained, a new publisher session
+  completed 64/64 ACKs and both sidecars grew from 44 to 88 bytes.  This closes
+  the external metadata-replica restart/redrive gate for the bounded developer
+  smoke.  It remains process-emulation evidence, not a publication measurement.
 - The launcher now fails before broker startup if a selected local sequencer
   executable is absent, and `lazylog_metadata_replica` is emitted under
-  `<build>/bin` with the other deployable roles. These artifact fixes do not
-  close the protocol-validation blocker above.
+  `<build>/bin` with the other deployable roles. Remaining protocol gates are
+  tracked below (media crash timing, Scalog replication-RPC ordering, and the
+  publication-retained reruns).
 - M1 is complete for Corfu RF2 only. Corfu ACK2 rejects RF>2 until C2 installs
   the required ordered replica chain.
 - **C1a implementation is present and its focused proxy checks have passed;
