@@ -91,7 +91,8 @@ bool MetadataReplicaStore::Open(std::string* error) {
 std::string MetadataReplicaStore::SlotKey(
     const lazylogmetadata::MetadataAppendRequest& request) {
   return request.topic() + "\x1f" + std::to_string(request.source_broker_id()) + "\x1f" +
-         std::to_string(request.source_batch_seq());
+         std::to_string(request.client_id()) + "\x1f" +
+         std::to_string(request.client_batch_seq());
 }
 
 bool MetadataReplicaStore::Replay(std::string* error) {

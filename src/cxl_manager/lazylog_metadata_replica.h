@@ -16,8 +16,10 @@ class Server;
 namespace LazyLog {
 
 // Durable, immutable metadata ledger backing one sequencing replica.  The
-// ledger owns the idempotency boundary: a retry of the same logical descriptor
-// succeeds, while a different descriptor for the same source slot conflicts.
+// ledger owns the idempotency boundary: a retry of the same publisher batch
+// succeeds, while a different descriptor for that batch conflicts.  A
+// sequencer's source slot is deliberately not the identity: it is reused when
+// a fresh publisher session starts after a sequencer restart.
 class MetadataReplicaStore {
  public:
   explicit MetadataReplicaStore(std::string sidecar_path);

@@ -54,6 +54,27 @@ TEST(LazyLogMetadataReplicaStoreTest, DurableAppendIsIdempotentAndRejectsConflic
   std::filesystem::remove(path);
 }
 
+TEST(LazyLogMetadataReplicaStoreTest, NewPublisherMayReuseSequencerSourceSlot) {
+  const std::string path = TempPath("reused-source-slot");
+  LazyLog::MetadataReplicaStore store(path);
+  std::string error;
+  ASSERT_TRUE(store.Open(&error)) << error;
+
+  bool already_present = false;
+  ASSERT_TRUE(store.Append(Request(), &already_present, &error)) << error;
+  EXPECT_FALSE(already_present);
+
+  // A sequencer restart can reuse source_batch_seq=7.  This is a distinct
+  // publisher batch, not a conflict with the prior session's descriptor.
+  auto next_session = Request();
+  next_session.set_client_id(12);
+  next_session.set_payload_offset(8192);
+  ASSERT_TRUE(store.Append(next_session, &already_present, &error)) << error;
+  EXPECT_FALSE(already_present);
+  EXPECT_EQ(store.size(), 2u);
+  std::filesystem::remove(path);
+}
+
 TEST(LazyLogMetadataReplicaStoreTest, RestartReplaysDurableRecords) {
   const std::string path = TempPath("restart");
   std::string error;
@@ -93,7 +114,9 @@ TEST(LazyLogMetadataReplicaStoreTest, TruncatedFinalRecordIsIgnoredOnRecovery) {
     ASSERT_TRUE(store.Open(&error)) << error;
     EXPECT_EQ(store.size(), 1u);
     bool already_present = false;
-    ASSERT_TRUE(store.Append(Request(8), &already_present, &error)) << error;
+    auto next_batch = Request(8);
+    next_batch.set_client_batch_seq(14);
+    ASSERT_TRUE(store.Append(next_batch, &already_present, &error)) << error;
     EXPECT_FALSE(already_present);
     EXPECT_EQ(store.size(), 2u);
   }
