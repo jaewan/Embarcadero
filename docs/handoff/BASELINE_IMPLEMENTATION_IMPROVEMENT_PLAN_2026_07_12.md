@@ -109,8 +109,14 @@ Scalog labeling, and batching/RF instrumentation.
   - [ ] Production-path crash/restart smoke: kill the Scalog/LazyLog replica
     immediately after an acknowledged batch, restart from its data file, then
     verify recovery/redrive and no ACK frontier passes an unsynced item.
-  - [ ] RF2 integration smoke: a lagging media replica holds ACK2; it advances
-    only after that replica's durable frontier catches up.
+  - [x] RF2 integration smoke: a clean two-broker local-CXL Scalog cell at
+    commit `f79bf39f` set `EMBARCADERO_FDATASYNC_STALL_MS_BROKER_1=1500`.
+    Broker 0's primary durable frontier reached 64 messages at 07:54:54.822;
+    broker 1's lagging replica frontier reached 64 at 07:54:56.322; ACK2 then
+    verified 64/64 at 07:54:56.322 (`ack_wait_ms=1502.957`). The run contract
+    records `SCALOG,grpc,RF=2,ACK=2,ack2_minimum_media_durable_replica_prefix`.
+    This is a bounded developer CXL process smoke, not a publication
+    measurement.
 
 **Publication rule:** do not use an intermediate ablation result as a final
 baseline result. The control-transport work may be measured before the
