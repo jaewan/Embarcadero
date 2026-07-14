@@ -40,6 +40,7 @@ RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${RUN_TS}}"
 REQUIRE_FIRST_ATTEMPT_PASS="${REQUIRE_FIRST_ATTEMPT_PASS:-0}"
 REQUIRE_CLEAN_WORKTREE="${REQUIRE_CLEAN_WORKTREE:-1}"
+REQUIRE_CLEAN_REMOTE="${REQUIRE_CLEAN_REMOTE:-1}"
 EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-}"
 CONTROL_TRANSPORT="${EMBARCADERO_BASELINE_CONTROL_TRANSPORT:-grpc}"
 
@@ -48,6 +49,21 @@ if [[ "$REQUIRE_CLEAN_WORKTREE" == "1" ]]; then
     echo "ERROR: publication cell requires a clean worktree; use a clean clone or set REQUIRE_CLEAN_WORKTREE=0 for a developer smoke." >&2
     exit 2
   fi
+fi
+
+if [[ "$REQUIRE_CLEAN_REMOTE" == "1" ]]; then
+  declare -A _remote_hosts=()
+  [[ -n "$REMOTE_CORFU_SEQUENCER_HOST" ]] && _remote_hosts["$REMOTE_CORFU_SEQUENCER_HOST"]=1
+  [[ -n "$REMOTE_LAZYLOG_SEQUENCER_HOST" ]] && _remote_hosts["$REMOTE_LAZYLOG_SEQUENCER_HOST"]=1
+  [[ -n "$REMOTE_SCALOG_SEQUENCER_HOST" ]] && _remote_hosts["$REMOTE_SCALOG_SEQUENCER_HOST"]=1
+  for _host in "${!_remote_hosts[@]}"; do
+    _remote_status="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$_host" \
+      'cd /home/domin/Embarcadero && git status --porcelain' 2>/dev/null || echo '__REMOTE_CHECK_FAILED__')"
+    if [[ -n "$_remote_status" ]]; then
+      echo "ERROR: remote publication host $_host is not a clean Embarcadero worktree; synchronize an isolated clean revision first." >&2
+      exit 2
+    fi
+  done
 fi
 
 if [[ -z "$ACK_LEVEL" ]]; then
@@ -213,6 +229,7 @@ client_config_abs=$CLIENT_CONFIG_ABS
 client_config_sha256=$CLIENT_CONFIG_SHA256
 require_first_attempt_pass=$REQUIRE_FIRST_ATTEMPT_PASS
 require_clean_worktree=$REQUIRE_CLEAN_WORKTREE
+require_clean_remote=$REQUIRE_CLEAN_REMOTE
 ack_timeout_sec=${EMBARCADERO_ACK_TIMEOUT_SEC:-}
 commit=$COMMIT
 start_time_utc=$RUN_TS
