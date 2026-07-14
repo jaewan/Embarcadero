@@ -364,6 +364,12 @@ class Publisher {
 			size_t session_sent_hwm_{0};
 			size_t session_retire_prefix_hwm_{0};
 			uint64_t session_next_retire_batch_seq_{0};
+			// Inclusive max original_batch_seq known committed via SessionOpen /
+			// fence ACK-drain trim. Used to skip retire holes and drop late
+			// RecordUnackedBatch entries that race with reconnect trim
+			// (send completes before RecordUnackedBatch).
+			uint64_t session_trim_committed_hwm_{0};
+			bool session_trim_committed_valid_{false};
 			DeltaEstimator delta_estimator_;
 			std::mutex delta_mu_;
 
@@ -379,6 +385,18 @@ class Publisher {
 			bool EnsureRetransmitChannel(int broker_id, int* out_fd);
 			void CloseRetransmitChannel(int broker_id);
 			void WaitForUnackedCapacity(size_t bytes);
+			// Erase unacked batches with original_batch_seq <= committed_batch_hwm and
+			// advance session_next_retire_batch_seq_ / session_retire_prefix_hwm_ so
+			// CompleteUnackedThrough cannot wedge on a retire gap after reconnect trim.
+			// Caller must hold unacked_mu_. Returns newly credited message count.
+			size_t TrimUnackedThroughBatchSeqLocked(
+				uint64_t committed_batch_hwm,
+				std::vector<Embarcadero::BatchHeader*>* release_after_unlock);
+			// Advance next_retire through seqs <= session_trim_committed_hwm_ that
+			// are no longer present in unacked_batches_. Drops orphans with
+			// current_seq < next_retire. Caller must hold unacked_mu_.
+			void AdvanceRetireThroughTrimmedHolesLocked(
+				std::vector<Embarcadero::BatchHeader*>* release_after_unlock);
 			// Returns true iff the caller must NOT ReleaseBatch yet (pool pin).
 			// Disk ACK2 uses owned RTO copy (returns false); memory-emulated ACK2
 			// and ACK1 pin the pool slot until ACK (returns true).

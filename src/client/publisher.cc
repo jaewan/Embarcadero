@@ -702,33 +702,79 @@ bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
 		HandleSessionFenced(fenced, static_cast<int>(broker_id));
 	} else if (ack.has_committed_prefix() && IsOrder5SessionMode() && ack_level_ >= 1) {
 		// Trim optimistic unacked prefix through the inclusive reconnect HWM.
-		embarcadero::session::SessionFenced trim;
-		trim.set_committed_batch_seq(ack.committed_hwm());
-		trim.set_has_committed_prefix(true);
-		trim.set_committed_msg_hwm(0);
-		trim.set_control_epoch(0);
-		trim.set_reason(embarcadero::session::SessionFenced::HOLD_EXPIRY);
+		// Must advance the retire cursor with the erase — otherwise
+		// CompleteUnackedThrough wedges permanently on a retire gap.
 		std::vector<Embarcadero::BatchHeader*> release_after_unlock;
 		{
 			std::lock_guard<std::mutex> lock(unacked_mu_);
-			for (auto it = unacked_batches_.begin(); it != unacked_batches_.end();) {
-				if (it->original_batch_seq <= ack.committed_hwm()) {
-					if (it->pool_batch != nullptr) {
-						release_after_unlock.push_back(it->pool_batch);
-					}
-					unacked_bytes_ -= it->wire_bytes;
-					it = unacked_batches_.erase(it);
-				} else {
-					++it;
-				}
-			}
-			unacked_cv_.notify_all();
+			TrimUnackedThroughBatchSeqLocked(
+				ack.committed_hwm(), &release_after_unlock);
 		}
 		for (auto* batch : release_after_unlock) {
 			pubQue_.ReleaseBatch(batch);
 		}
 	}
 	return true;
+}
+
+size_t Publisher::TrimUnackedThroughBatchSeqLocked(
+		uint64_t committed_batch_hwm,
+		std::vector<Embarcadero::BatchHeader*>* release_after_unlock) {
+	size_t newly_credited_msgs = 0;
+	size_t erased = 0;
+	for (auto it = unacked_batches_.begin(); it != unacked_batches_.end();) {
+		if (it->original_batch_seq <= committed_batch_hwm) {
+			// Only batches still awaiting contiguous retirement contribute to
+			// retire_prefix_hwm_; earlier seqs were already folded in.
+			if (it->current_batch_seq >= session_next_retire_batch_seq_) {
+				newly_credited_msgs += it->num_msg;
+			}
+			if (it->pool_batch != nullptr && release_after_unlock != nullptr) {
+				release_after_unlock->push_back(it->pool_batch);
+			}
+			unacked_bytes_ -= it->wire_bytes;
+			it = unacked_batches_.erase(it);
+			++erased;
+		} else {
+			++it;
+		}
+	}
+	if (!session_trim_committed_valid_ ||
+	    committed_batch_hwm > session_trim_committed_hwm_) {
+		session_trim_committed_hwm_ = committed_batch_hwm;
+		session_trim_committed_valid_ = true;
+	}
+	session_retire_prefix_hwm_ += newly_credited_msgs;
+	AdvanceRetireThroughTrimmedHolesLocked(release_after_unlock);
+	if (erased > 0) {
+		unacked_cv_.notify_all();
+	}
+	return newly_credited_msgs;
+}
+
+void Publisher::AdvanceRetireThroughTrimmedHolesLocked(
+		std::vector<Embarcadero::BatchHeader*>* release_after_unlock) {
+	if (!session_trim_committed_valid_) return;
+	// Drop late-recorded orphans that landed behind the retire cursor after a
+	// reconnect trim (send completed before RecordUnackedBatch).
+	while (!unacked_batches_.empty() &&
+	       unacked_batches_.front().current_batch_seq < session_next_retire_batch_seq_) {
+		auto& head = unacked_batches_.front();
+		if (head.pool_batch != nullptr && release_after_unlock != nullptr) {
+			release_after_unlock->push_back(head.pool_batch);
+		}
+		unacked_bytes_ -= head.wire_bytes;
+		unacked_batches_.pop_front();
+	}
+	// Skip seq holes inside the trimmed committed prefix. Batches still present
+	// at next_retire wait for normal ACK-HWM retirement.
+	while (session_next_retire_batch_seq_ <= session_trim_committed_hwm_) {
+		if (!unacked_batches_.empty() &&
+		    unacked_batches_.front().current_batch_seq == session_next_retire_batch_seq_) {
+			break;
+		}
+		++session_next_retire_batch_seq_;
+	}
 }
 
 void Publisher::WaitForUnackedCapacity(size_t bytes) {
@@ -753,6 +799,18 @@ bool Publisher::RecordUnackedBatch(const Embarcadero::BatchHeader& header,
 		header.batch_seq,
 		static_cast<uint64_t>(SteadyNowNs()),
 		unacked_bytes_);
+	const bool owned_rto_copy = Ack2UsesOwnedRtoCopy();
+	{
+		std::lock_guard<std::mutex> lock(unacked_mu_);
+		// Send-before-Record race with SessionOpen trim: broker already reported
+		// this seq in committed_hwm, so pinning it would recreate a retire gap.
+		if (session_trim_committed_valid_ &&
+		    header.batch_seq <= session_trim_committed_hwm_) {
+			AdvanceRetireThroughTrimmedHolesLocked(nullptr);
+			unacked_cv_.notify_all();
+			return false;
+		}
+	}
 	UnackedBatch rec;
 	rec.original_batch_seq = header.batch_seq;
 	rec.current_batch_seq = header.batch_seq;
@@ -766,7 +824,6 @@ bool Publisher::RecordUnackedBatch(const Embarcadero::BatchHeader& header,
 	// so durable latency cannot exhaust the send pool.
 	// ACK1 / memory-emulated ACK2: pin the pool slot until ACK (credit capped to
 	// pool/2) to avoid a line-rate DRAM memcpy on the fast path.
-	const bool owned_rto_copy = Ack2UsesOwnedRtoCopy();
 	if (owned_rto_copy) {
 		const auto* bytes = static_cast<const uint8_t*>(batch_bytes);
 		rec.wire.assign(bytes, bytes + wire_bytes);
@@ -775,6 +832,13 @@ bool Publisher::RecordUnackedBatch(const Embarcadero::BatchHeader& header,
 			static_cast<const Embarcadero::BatchHeader*>(batch_bytes));
 	}
 	std::lock_guard<std::mutex> lock(unacked_mu_);
+	// Re-check after building the record — trim may have landed meanwhile.
+	if (session_trim_committed_valid_ &&
+	    header.batch_seq <= session_trim_committed_hwm_) {
+		AdvanceRetireThroughTrimmedHolesLocked(nullptr);
+		unacked_cv_.notify_all();
+		return false;
+	}
 	session_sent_hwm_ += rec.num_msg;
 	rec.broker_ack_end = std::numeric_limits<size_t>::max();
 	unacked_bytes_ += rec.wire_bytes;
@@ -799,6 +863,15 @@ void Publisher::CompleteUnackedThrough(int, size_t broker_ack_hwm) {
 	{
 		std::lock_guard<std::mutex> lock(unacked_mu_);
 		for (auto it = unacked_batches_.begin(); it != unacked_batches_.end();) {
+			// Heal trim/record races before testing contiguous retirement.
+			if (session_trim_committed_valid_ &&
+			    (it->current_batch_seq < session_next_retire_batch_seq_ ||
+			     (it->current_batch_seq > session_next_retire_batch_seq_ &&
+			      session_next_retire_batch_seq_ <= session_trim_committed_hwm_))) {
+				AdvanceRetireThroughTrimmedHolesLocked(&release_after_unlock);
+				it = unacked_batches_.begin();
+				if (it == unacked_batches_.end()) break;
+			}
 			size_t candidate_hwm = 0;
 			if (!SessionPrefixAckEnd(it->current_batch_seq,
 			                         session_next_retire_batch_seq_,
@@ -962,19 +1035,11 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		size_t remaining_suffix = 0;
 		{
 			std::lock_guard<std::mutex> lock(unacked_mu_);
-			for (auto it = unacked_batches_.begin(); it != unacked_batches_.end();) {
-				if (it->original_batch_seq <= release_hwm) {
-					locally_committed_msgs += it->num_msg;
-					unacked_bytes_ -= it->wire_bytes;
-					if (it->pool_batch != nullptr) {
-						release_after_unlock.push_back(it->pool_batch);
-					}
-					it = unacked_batches_.erase(it);
-				} else {
-					++remaining_suffix;
-					++it;
-				}
-			}
+			// Same retire-cursor advance as SessionOpen trim — erase alone left
+			// next_retire stuck and wedged CompleteUnackedThrough.
+			locally_committed_msgs =
+				TrimUnackedThroughBatchSeqLocked(release_hwm, &release_after_unlock);
+			remaining_suffix = unacked_batches_.size();
 			if (locally_committed_msgs > 0) {
 				unacked_cv_.notify_all();
 			}
@@ -1064,6 +1129,8 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		session_sent_hwm_ = 0;
 		session_retire_prefix_hwm_ = 0;
 		session_next_retire_batch_seq_ = 0;
+		session_trim_committed_hwm_ = 0;
+		session_trim_committed_valid_ = false;
 		unacked_cv_.notify_all();
 	}
 	for (auto* batch : release_after_unlock) {
@@ -1923,7 +1990,7 @@ void Publisher::StartThroughputTimeseriesIfEnabled() {
 			}
 			if (publish_finished_.load(std::memory_order_relaxed)) {
 				if (drain_remaining < 0) {
-					drain_remaining = 300;  // ~3s multi-layer drain window
+					drain_remaining = 300;  // ~30s at 100ms interval
 				}
 				if (--drain_remaining <= 0) break;
 			}
@@ -2125,7 +2192,38 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 
 	// CRITICAL FIX: Use atomic flag to prevent double-join race conditions
 		if (!threads_joined_.exchange(true)) {
-			// Only join threads once
+			// Bound PublishThread join: previously hung forever in WaitForUnackedCapacity
+			// and never reached ACK timeout. Fail closed so harness can retry.
+			const int join_timeout_sec = [] {
+				if (const char* env = std::getenv("EMBARCADERO_PUBLISH_JOIN_TIMEOUT_SEC")) {
+					const int v = std::atoi(env);
+					if (v > 0) return v;
+				}
+				return 120;
+			}();
+			std::atomic<bool> join_watchdog_stop{false};
+			std::atomic<bool> join_timed_out{false};
+			std::thread join_watchdog;
+			if (IsOrder5SessionMode() && ack_level_ >= 1) {
+				join_watchdog = std::thread([this, join_timeout_sec, &join_watchdog_stop, &join_timed_out]() {
+					const auto deadline =
+						std::chrono::steady_clock::now() + std::chrono::seconds(join_timeout_sec);
+					while (!join_watchdog_stop.load(std::memory_order_relaxed)) {
+						if (std::chrono::steady_clock::now() >= deadline) {
+							join_timed_out.store(true, std::memory_order_release);
+							LOG(ERROR) << "[PUBLISH_JOIN_TIMEOUT] after " << join_timeout_sec
+							           << "s — forcing shutdown so PublishThreads exit WaitForUnackedCapacity "
+							              "(EMBARCADERO_PUBLISH_JOIN_TIMEOUT_SEC to tune)";
+							shutdown_.store(true, std::memory_order_relaxed);
+							unacked_cv_.notify_all();
+							break;
+						}
+						for (int i = 0; i < 10 && !join_watchdog_stop.load(std::memory_order_relaxed); ++i) {
+							std::this_thread::sleep_for(std::chrono::milliseconds(100));
+						}
+					}
+				});
+			}
 			for (size_t i = 0; i < threads_.size(); ++i) {
 			if (threads_[i].joinable()) {
 				try {
@@ -2138,6 +2236,16 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			}
 			// Publisher thread not joinable (already joined or detached)
 		}
+			join_watchdog_stop.store(true, std::memory_order_relaxed);
+			unacked_cv_.notify_all();
+			if (join_watchdog.joinable()) {
+				join_watchdog.join();
+			}
+			if (join_timed_out.load(std::memory_order_acquire)) {
+				publisher_join_done_time = std::chrono::steady_clock::now();
+				LOG(ERROR) << "[PUBLISH_JOIN_TIMEOUT] Poll failing closed after PublishThread join timeout";
+				return false;
+			}
 			// All publisher threads completed transmission
 		}
 		publisher_join_done_time = std::chrono::steady_clock::now();
@@ -3318,6 +3426,11 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			len = batch_header->total_size;
 			const size_t wire_bytes = sizeof(Embarcadero::BatchHeader) + len;
 			WaitForUnackedCapacity(wire_bytes);
+			if (shutdown_.load(std::memory_order_relaxed)) {
+				// Join-timeout / fail-closed path: drop this batch and exit so Poll can finish.
+				pubQue_.ReleaseBatch(batch_header);
+				break;
+			}
 
 		// Function to send batch header
 		auto send_batch_header = [&]() -> void {
