@@ -70,13 +70,24 @@ Scalog labeling, and batching/RF instrumentation.
   until that ACK-connect defect is fixed and the remote/client process smoke
   completes with chain-sidecar evidence.
 - **Current packet: M2.** Media-sync wiring is implemented and locally built;
-  do not mark M2 complete until these tests are added and pass:
+  do not mark M2 complete until the remaining external-replica tests pass:
+  - [x] Scalog CXL primary/remote-replica fault test (local four-process CXL
+    emulation): `EMBARCADERO_FDATASYNC_FAIL=1` made both the primary and replica
+    loops report `EIO`; the bounded RF2/ACK2 publisher received 0/64 ACKs.
+    With `EMBARCADERO_FDATASYNC_STALL_MS=1500`, the publisher started at
+    06:33:06.761 and both durable frontiers advanced at 06:33:08.264-.265 before
+    the ACK completed. This is developer correctness evidence, not a retained
+    publication artifact (`ALLOW_DIRTY_ARTIFACT=1`).
+  - [x] LazyLog production metadata-sidecar unit coverage: forced sync failure
+    returns no append acknowledgement or in-memory frontier advance; a restart
+    redrive is idempotent, and a 40 ms forced stall delays append completion.
+    The `DurableFdatasync` seam is inert unless explicitly enabled.
+  - [x] Model process-restart guard: the two-process CXL durability test kills
+    a replica after `pwrite` and before `fdatasync`, observes its ACK frontier
+    remain pinned, then verifies conservative truncation and redrive.
   - [ ] Scalog replication-RPC test: a successful response is impossible before
     the write worker has completed `fdatasync`; a forced write/sync failure
     returns failure and advances neither local cut nor ACK frontier.
-  - [ ] Scalog CXL primary/remote-replica test: `replication_done` remains
-    unchanged until `fdatasync` completes, including a deliberately stalled or
-    failed replica.
   - [ ] Production-path crash/restart smoke: kill the Scalog/LazyLog replica
     immediately after an acknowledged batch, restart from its data file, then
     verify recovery/redrive and no ACK frontier passes an unsynced item.
