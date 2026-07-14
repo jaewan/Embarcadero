@@ -541,6 +541,10 @@ function(add_mailbox_global_sequencer target kind)
         corfu_sequencer_grpc_proto
         scalog_sequencer_grpc_proto
         lazylog_sequencer_grpc_proto
+        # baseline_cxl_layout.h reaches cxl_datastructure.h, which includes
+        # heartbeat.grpc.pb.h. Declare this direct build dependency so a clean
+        # mailbox-sequencer-only build generates the header.
+        heartbeat_grpc_proto
         grpc++
         protobuf::libprotobuf
         glog::glog
