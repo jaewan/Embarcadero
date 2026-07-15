@@ -80,6 +80,12 @@ TEST_TYPE=${TEST_TYPE:-5}          # 5 = publish-only
 ORDER=${ORDER:-0}
 ACK=${ACK:-1}
 REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
+# A benchmark's fixed TestTopic name starts broker slot sequences at zero.  A
+# durable Corfu sidecar must therefore not be reused for a distinct trial: its
+# conflict detection would (correctly) reject the new values.  Operators can
+# supply `%TRIAL%` in explicit replica directories to get isolated durable
+# media per trial, without deleting an earlier trial's evidence.
+REPLICA_DISK_DIRS_TEMPLATE=${EMBARCADERO_REPLICA_DISK_DIRS:-}
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
 CONTROL_TRANSPORT=${EMBARCADERO_BASELINE_CONTROL_TRANSPORT:-grpc}
 DRY_RUN=${DRY_RUN:-0}
@@ -204,7 +210,17 @@ BROKER_CONFIG="${BROKER_CONFIG:-config/embarcadero.yaml}"
 CLIENT_CONFIG="${CLIENT_CONFIG:-config/client.yaml}"
 BROKER_CONFIG_ABS="$PROJECT_ROOT/$BROKER_CONFIG"
 CLIENT_CONFIG_ABS="$PROJECT_ROOT/$CLIENT_CONFIG"
-LOG_DIR="$PROJECT_ROOT/multiclient_logs"
+# A direct invocation is frequently used for baseline diagnostics and durable
+# RF sweeps.  Keep the historical path as the default, but honour the same
+# OUT_BASE/BENCHMARK_TAG contract as the overnight harness so independent
+# cells never overwrite one another's evidence.
+if [[ -n "${LOG_DIR:-}" ]]; then
+    : # explicit caller choice wins
+elif [[ -n "${OUT_BASE:-}" && -n "${BENCHMARK_TAG:-}" ]]; then
+    LOG_DIR="$PROJECT_ROOT/$OUT_BASE/logs/$BENCHMARK_TAG"
+else
+    LOG_DIR="$PROJECT_ROOT/multiclient_logs"
+fi
 
 baseline_sequencer_binary() {
     case "$SEQUENCER:$CONTROL_TRANSPORT" in
@@ -239,7 +255,14 @@ export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
 # Give every trial/attempt a unique object and reclaim it off the next cell's
 # critical path; the next broker 0 cannot accidentally attach stale bytes.
 BASE_CXL_SHM_NAME="$EMBARCADERO_CXL_SHM_NAME"
-DEFER_CXL_SHM_CLEANUP="${DEFER_CXL_SHM_CLEANUP:-1}"
+# A real-CXL deployment commonly backs this mapping with a 64 GiB POSIX-shm
+# object.  Deferring unlinks while changing the name on every retry can retain
+# several such objects at once (until every mapping closes) and exhaust
+# /dev/shm.  Throughput runs therefore synchronously reclaim one stable name
+# by default.  Fault-injection users can explicitly opt back into per-attempt
+# names and deferred cleanup when isolation is more important than capacity.
+DEFER_CXL_SHM_CLEANUP="${DEFER_CXL_SHM_CLEANUP:-0}"
+CXL_SHM_PER_ATTEMPT="${CXL_SHM_PER_ATTEMPT:-0}"
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -1060,7 +1083,12 @@ shm_cleanup() {
     if [[ "$DEFER_CXL_SHM_CLEANUP" == "1" ]]; then
         # unlink(2) on a large tmpfs object may synchronously reclaim populated
         # pages. It is safe to defer because every attempt has a distinct name.
-        ( nice -n 19 rm -f "$path" >/dev/null 2>&1 ) &
+        # The background reaper inherits every open descriptor by default.
+        # In particular, it must close the harness flock descriptor: otherwise
+        # a large deferred unlink keeps RUN_LOCK_FILE locked after this
+        # run_multiclient process exits, and the next sweep cell is rejected as
+        # a concurrent orchestrator.
+        ( exec {RUN_LOCK_FD}>&-; nice -n 19 rm -f "$path" >/dev/null 2>&1 ) &
         # broker_local_cleanup reaps shell jobs at the next attempt; detach
         # this reaper so it can finish reclaiming the prior attempt's pages.
         disown "$!" 2>/dev/null || true
@@ -1435,6 +1463,17 @@ start_brokers() {
         log "Waiting ${BROKER_READY_PROPAGATION_SEC}s for cluster state propagation..."
         sleep "$BROKER_READY_PROPAGATION_SEC"
     fi
+    # LazyLog's global sequencer can publish broker membership before the
+    # broker-port service is fully stable.  A bounded settle phase avoids a
+    # transient CreateTopic connection refusal on the first client attempt;
+    # it applies only to the baseline and is recorded in the cell log.
+    if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+        local lazylog_settle_sec="${LAZYLOG_POST_READY_SETTLE_SEC:-3}"
+        if [[ "$lazylog_settle_sec" -gt 0 ]]; then
+            log "Waiting ${lazylog_settle_sec}s for LazyLog broker-port stabilization..."
+            sleep "$lazylog_settle_sec"
+        fi
+    fi
     if ! precreate_embarcadero_order5_topic; then
         START_BROKERS_FAILURE_REASON="infra_order5_topic_precreate_failed"
         return 1
@@ -1652,7 +1691,21 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
 
     for (( attempt=1; attempt<=TRIAL_MAX_ATTEMPTS; attempt++ )); do
         log "  Attempt $attempt / $TRIAL_MAX_ATTEMPTS"
-        export EMBARCADERO_CXL_SHM_NAME="${BASE_CXL_SHM_NAME}_t${trial}_a${attempt}"
+        if [[ -n "$REPLICA_DISK_DIRS_TEMPLATE" ]]; then
+            export EMBARCADERO_REPLICA_DISK_DIRS="${REPLICA_DISK_DIRS_TEMPLATE//%TRIAL%/$trial}"
+            if [[ "$EMBARCADERO_REPLICA_DISK_DIRS" != "$REPLICA_DISK_DIRS_TEMPLATE" ]]; then
+                IFS=',' read -r -a _trial_replica_dirs <<< "$EMBARCADERO_REPLICA_DISK_DIRS"
+                for _trial_replica_dir in "${_trial_replica_dirs[@]}"; do
+                    mkdir -p "$_trial_replica_dir"
+                done
+                unset _trial_replica_dirs _trial_replica_dir
+            fi
+        fi
+        if [[ "$CXL_SHM_PER_ATTEMPT" == "1" ]]; then
+            export EMBARCADERO_CXL_SHM_NAME="${BASE_CXL_SHM_NAME}_t${trial}_a${attempt}"
+        else
+            export EMBARCADERO_CXL_SHM_NAME="$BASE_CXL_SHM_NAME"
+        fi
 
         if ! start_brokers; then
             echo "ERROR: broker startup failed on trial $trial attempt $attempt" >&2

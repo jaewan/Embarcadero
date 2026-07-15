@@ -483,7 +483,8 @@ if [[ "$SKIP_BASELINES" != "1" ]]; then
 
     run_multi_cell "e2_lazylog_rf0_n1" 1 "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=LAZYLOG ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
-        TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1
+        TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
+        EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP"
 
 fi
 # Note: RF=1 baseline cells are deferred — Scalog RF=1 has a known anomaly
@@ -626,6 +627,7 @@ fi
 # ===========================================================================
 log "===== PART D: E8 overhead probe ====="
 
+if should_run_cell "e8_overhead_probe"; then
 OVERHEAD_LOG="$LOG_DIR/e8_overhead_probe.log"
 {
     echo "=== E8 overhead probe: $(stamp) ==="
@@ -665,6 +667,7 @@ OVERHEAD_LOG="$LOG_DIR/e8_overhead_probe.log"
     echo "=== E8 probe complete: $(stamp) ==="
 } >"$OVERHEAD_LOG" 2>&1 || true
 log "E8 overhead probe done"
+fi
 
 # ===========================================================================
 # FINAL CLEANUP + SUMMARY
