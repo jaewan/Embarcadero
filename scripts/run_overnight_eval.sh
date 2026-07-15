@@ -195,7 +195,9 @@ rf2_memcopy_env() {
 }
 
 RUN_TAG="${RUN_TAG:-$(date -u +%Y%m%dT%H%M%SZ)_overnight}"
-OUT_BASE="$PROJECT_ROOT/data/overnight_eval/$RUN_TAG"
+# A detached clean source snapshot can retain artifacts in the primary
+# workspace without inheriting that workspace's uncommitted files.
+OUT_BASE="${OUT_BASE:-$PROJECT_ROOT/data/overnight_eval/$RUN_TAG}"
 LOG_DIR="$OUT_BASE/logs"
 mkdir -p "$LOG_DIR"
 
