@@ -275,6 +275,18 @@ class DistributedKVStore {
 		bool manage_cluster_ = true;
 		bool track_latency_ = false;
 
+		// SMR-FIFO audit (Q3 eval): values written as "F|<key12>|<ver16>|..." carry a
+		// session-monotone version. The single log-consumer thread tracks the last
+		// version seen globally (session order) and per key; a regression means the
+		// log's total order permuted this client's submission order.
+		bool fifo_audit_ = false;
+		uint64_t fifo_last_seen_version_ = 0;
+		absl::flat_hash_map<uint64_t, uint64_t> fifo_last_key_version_;
+		std::atomic<uint64_t> fifo_session_reorders_{0};
+		std::atomic<uint64_t> fifo_key_reorders_{0};
+
+		void auditFifoValue(const std::string& value);
+
 		// Latency instrumentation (only active when track_latency_ == true)
 		absl::Mutex lat_mutex_;
 		absl::flat_hash_map<OPID, std::chrono::steady_clock::time_point> op_start_ts_ ABSL_GUARDED_BY(lat_mutex_);
@@ -306,6 +318,7 @@ class DistributedKVStore {
 			std::string broker_ip = "127.0.0.1";
 			bool manage_cluster = true;
 			bool track_latency = false;  // enable per-op latency tracking (adds mutex contention)
+			bool fifo_audit = false;     // track apply-order vs session-order divergence for "F|" values
 		};
 
 		explicit DistributedKVStore(const Config& config);
@@ -354,6 +367,23 @@ class DistributedKVStore {
 		size_t storeSize() const { return kv_store_.size(); }
 		uint64_t getAppliedLocalOpCount() const {
 			return applied_local_ops_.load(std::memory_order_acquire);
+		}
+
+		// Local read with no log-sync barrier. Only meaningful after
+		// waitForSyncWithLog() has confirmed all published ops are applied
+		// (e.g., post-run validation sweeps).
+		std::string getLocal(const std::string& key) const { return kv_store_.get(key); }
+
+		// SMR-FIFO audit counters (valid when Config::fifo_audit was set).
+		// session reorders: applied "F|" version lower than any previously applied
+		// version (total order permuted submission order somewhere).
+		// key reorders: applied version lower than the last applied version of the
+		// SAME key — the state-changing violation (final value would be stale).
+		uint64_t fifoSessionReorders() const {
+			return fifo_session_reorders_.load(std::memory_order_acquire);
+		}
+		uint64_t fifoKeyReorders() const {
+			return fifo_key_reorders_.load(std::memory_order_acquire);
 		}
 
 		bool opFinished(OPID opId){

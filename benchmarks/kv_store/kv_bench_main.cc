@@ -134,7 +134,37 @@ struct BenchConfig {
 	std::string key_dist = "uniform"; // uniform|zipf|latest
 	double zipf_theta = 0.99;
 	int scan_len = 100;               // number of keys per scan (workload E)
+
+	// SMR-FIFO eval (paper Q3, tab:kv-pipelined): pipelined same-session overwrites
+	// with session-monotone versioned values. Valid iff store size stays record_count,
+	// applied == published, and every key's final value is the LAST version this
+	// client submitted for it (session FIFO), verified byte-for-byte.
+	bool fifo_valid = false;
+	std::string fifo_mode = "auto";   // native|token_order|stop_and_wait|sticky|none|auto
 };
+
+// FIFO value layout (fixed 32-byte prefix, padded to value_size):
+//   F|<key_id:12 digits>|<version:16 digits>|xxxx...
+// The version is a single session-wide monotone counter, so apply-order
+// regressions are detectable both per key and across the whole session.
+std::string makeFifoValue(uint64_t key_id, uint64_t version, size_t len) {
+	char buf[40];
+	snprintf(buf, sizeof(buf), "F|%012lu|%016lu|",
+	         static_cast<unsigned long>(key_id), static_cast<unsigned long>(version));
+	std::string v(buf);
+	if (v.size() < len) v.append(len - v.size(), 'x');
+	return v;
+}
+
+// Label for the FIFO mechanism a run relies on (exported to the paper table).
+std::string fifoModeLabel(const BenchConfig& cfg) {
+	if (!cfg.fifo_valid) return "";
+	if (cfg.fifo_mode != "auto") return cfg.fifo_mode;
+	if (cfg.sync_interval == 1) return "stop_and_wait";
+	if (cfg.sequencer == "EMBARCADERO") return cfg.order == 5 ? "native" : "none";
+	if (cfg.sequencer == "CORFU") return "token_order";
+	return "none";  // SCALOG / LAZYLOG under striping: no per-session FIFO contract
+}
 
 // ---------------------------------------------------------------------------
 // Apply YCSB workload presets. Called after CLI options are parsed.
@@ -291,6 +321,20 @@ bool waitForBarrier(DistributedKVStore& store, const BenchConfig& cfg, size_t pe
 bool runBenchmark(BenchConfig& cfg) {
 	if (cfg.run_id == "auto") cfg.run_id = generateRunId();
 	if (cfg.order < 0) cfg.order = orderForSequencer(cfg.sequencer);
+	if (cfg.fifo_valid) {
+		// The overwrite phase is write-only, one PUT per log append, and needs the
+		// 32-byte versioned-value prefix to fit.
+		cfg.workload = "";
+		cfg.write_ratio = 1.0;
+		if (cfg.batch_size != 1) {
+			LOG(WARNING) << "fifo_valid forces batch_size=1 (was " << cfg.batch_size << ")";
+			cfg.batch_size = 1;
+		}
+		if (cfg.value_size < 32) {
+			LOG(WARNING) << "fifo_valid forces value_size=32 (was " << cfg.value_size << ")";
+			cfg.value_size = 32;
+		}
+	}
 
 	// Normalize workload label for run_dir naming
 	std::string wl_label = cfg.workload;
@@ -323,6 +367,10 @@ bool runBenchmark(BenchConfig& cfg) {
 		     << "\nsync_interval=" << cfg.sync_interval
 		     << "\nsync_barrier=" << cfg.sync_barrier
 		     << "\nlatency_tracking=" << cfg.latency
+		     << "\nfifo_valid=" << cfg.fifo_valid
+		     << "\nfifo_mode=" << fifoModeLabel(cfg)
+		     << "\npub_threads=" << cfg.pub_threads
+		     << "\nnum_brokers=" << (getenv("NUM_BROKERS") ? getenv("NUM_BROKERS") : "unset")
 		     << "\nbroker_ip=" << cfg.broker_ip
 		     << "\nwarmup_ops=" << cfg.warmup_ops
 		     << "\nhostname=" << getHostname()
@@ -342,6 +390,7 @@ bool runBenchmark(BenchConfig& cfg) {
 	kv_cfg.broker_ip = cfg.broker_ip;
 	kv_cfg.manage_cluster = true;
 	kv_cfg.track_latency = cfg.latency;
+	kv_cfg.fifo_audit = cfg.fifo_valid;
 
 	LOG(INFO) << "Creating KV store: " << cfg.sequencer
 	          << " order=" << cfg.order << " ack=" << cfg.ack
@@ -478,10 +527,52 @@ bool runBenchmark(BenchConfig& cfg) {
 	// The load phase covered [0, record_count-1]; new inserts go above that.
 	uint64_t latest_insert_idx = cfg.record_count - 1;
 
+	// SMR-FIFO overwrite phase: one client session, pipelined PUTs with a
+	// session-monotone version embedded in each value. The publisher stripes
+	// sealed batches round-robin across ALL brokers regardless of pub_threads
+	// (queue_buffer.cc SealCurrentAndAdvance), so this exercises per-session
+	// FIFO under full striping — the paper Q3 setting.
+	std::vector<uint64_t> fifo_last_version;
+	uint64_t fifo_version_counter = 0;
+	if (cfg.fifo_valid) {
+		fifo_last_version.assign(cfg.record_count, 0);
+	}
+
 	auto run_t0 = std::chrono::steady_clock::now();
 
 	uint64_t i = 0;
-	while (i < cfg.operation_count) {
+	if (cfg.fifo_valid) {
+		while (i < cfg.operation_count) {
+			uint64_t key_id = rng() % cfg.record_count;
+			++fifo_version_counter;
+			std::string value = makeFifoValue(key_id, fifo_version_counter, cfg.value_size);
+			if (cfg.latency) {
+				auto t0 = std::chrono::steady_clock::now();
+				pending_opid = store.put(makeKey(key_id), value);
+				auto t1 = std::chrono::steady_clock::now();
+				write_latencies_us.push_back(
+					std::chrono::duration<double, std::micro>(t1 - t0).count());
+			} else {
+				pending_opid = store.put(makeKey(key_id), value);
+			}
+			fifo_last_version[key_id] = fifo_version_counter;
+			run_write_entries++;
+			writes++;
+			ops_since_sync++;
+			i++;
+
+			if (cfg.sync_interval > 0 &&
+			    ops_since_sync >= static_cast<uint64_t>(cfg.sync_interval)) {
+				if (!waitForBarrier(store, cfg, pending_opid)) {
+					sync_failed = true;
+					run_aborted = true;
+					break;
+				}
+				ops_since_sync = 0;
+			}
+		}
+	}
+	while (!cfg.fifo_valid && i < cfg.operation_count) {
 		double dice = op_dist(rng);
 
 		// ---- Workload E: inserts (5%) vs scans (95%) ----
@@ -654,21 +745,81 @@ bool runBenchmark(BenchConfig& cfg) {
 	uint64_t applied_entries = store.getAppliedLocalOpCount();
 	uint64_t expected_applied_entries = load_entries + run_write_entries;
 	bool run_valid = true;
+	std::string failed_checks;
+	auto fail_check = [&run_valid, &failed_checks](const std::string& name) {
+		run_valid = false;
+		if (!failed_checks.empty()) failed_checks += "+";
+		failed_checks += name;
+	};
 	if (sync_failed) {
 		LOG(ERROR) << "VERIFICATION FAILED: intermediate " << cfg.sync_barrier
 		           << " barrier timed out";
-		run_valid = false;
+		fail_check("sync_barrier_timeout");
 	}
 	// Workload E inserts new keys beyond record_count, so store may be larger.
 	if (!is_workload_E && cfg.record_count > 0 && final_store_size != cfg.record_count) {
 		LOG(ERROR) << "VERIFICATION FAILED: store_size=" << final_store_size
 		           << " expected=" << cfg.record_count;
-		run_valid = false;
+		fail_check("store_size");
 	}
 	if (applied_entries != expected_applied_entries) {
 		LOG(ERROR) << "VERIFICATION FAILED: applied_entries=" << applied_entries
 		           << " expected=" << expected_applied_entries;
-		run_valid = false;
+		fail_check("applied_count");
+	}
+
+	// SMR-FIFO validation sweep (untimed): every key's final value must be the
+	// LAST version this session submitted for it, byte-for-byte; untouched keys
+	// must still hold the load-phase template value. This is session-FIFO ground
+	// truth — a system that applied a permutation of submission order leaves a
+	// stale version behind and fails here even though applied == published.
+	uint64_t fifo_overwritten_keys = 0, fifo_final_mismatch = 0, fifo_untouched_mismatch = 0;
+	uint64_t fifo_session_reorders = 0, fifo_key_reorders = 0;
+	if (cfg.fifo_valid && !run_aborted) {
+		for (uint64_t k = 0; k < cfg.record_count; ++k) {
+			std::string got = store.getLocal(makeKey(k));
+			if (fifo_last_version[k] != 0) {
+				fifo_overwritten_keys++;
+				if (got != makeFifoValue(k, fifo_last_version[k], cfg.value_size)) {
+					if (fifo_final_mismatch < 5) {
+						LOG(ERROR) << "FIFO MISMATCH key=" << makeKey(k)
+						           << " expected_version=" << fifo_last_version[k]
+						           << " got=" << got.substr(0, std::min<size_t>(got.size(), 32));
+					}
+					fifo_final_mismatch++;
+				}
+			} else if (got != template_value) {
+				if (fifo_untouched_mismatch < 3) {
+					size_t d = 0;
+					while (d < got.size() && d < template_value.size() &&
+					       got[d] == template_value[d]) d++;
+					std::string tail_hex;
+					char hx[4];
+					for (size_t j = d; j < std::min(got.size(), d + 24); ++j) {
+						snprintf(hx, sizeof(hx), "%02x ", static_cast<unsigned char>(got[j]));
+						tail_hex += hx;
+					}
+					LOG(ERROR) << "UNTOUCHED MISMATCH key=" << makeKey(k)
+					           << " got_size=" << got.size()
+					           << " first_diff_at=" << d
+					           << " got_tail_hex=[" << tail_hex << "]"
+					           << " expected_tail='"
+					           << template_value.substr(d, std::min<size_t>(24, template_value.size() - d)) << "'";
+				}
+				fifo_untouched_mismatch++;
+			}
+		}
+		fifo_session_reorders = store.fifoSessionReorders();
+		fifo_key_reorders = store.fifoKeyReorders();
+		if (fifo_final_mismatch > 0) fail_check("session_fifo_final_value");
+		if (fifo_untouched_mismatch > 0) fail_check("untouched_key_value");
+		LOG(INFO) << "FIFO validation: overwritten_keys=" << fifo_overwritten_keys
+		          << " final_mismatch=" << fifo_final_mismatch
+		          << " untouched_mismatch=" << fifo_untouched_mismatch
+		          << " session_reorders=" << fifo_session_reorders
+		          << " key_reorders=" << fifo_key_reorders;
+	} else if (cfg.fifo_valid) {
+		fail_check("run_aborted_before_validation");
 	}
 	if (run_sec < 0.01 && writes > 100) {
 		LOG(WARNING) << "Run duration suspiciously short (" << run_sec
@@ -722,7 +873,10 @@ bool runBenchmark(BenchConfig& cfg) {
 		    << "writes,reads,scans,rmws,store_size,published_entries,applied_entries,valid,"
 		    << "pub_p50_us,pub_p95_us,pub_p99_us,pub_p999_us,"
 		    << "apply_p50_us,apply_p95_us,apply_p99_us,apply_p999_us,"
-		    << "read_p50_us,read_p99_us\n";
+		    << "read_p50_us,read_p99_us,"
+		    << "pub_threads,num_brokers,fifo_valid,fifo_mode,overwritten_keys,"
+		    << "final_mismatch_keys,untouched_mismatch_keys,session_reorders,"
+		    << "key_reorders,failed_checks\n";
 		csv << cfg.sequencer << "," << cfg.order << "," << cfg.ack << "," << cfg.rf
 		    << "," << cfg.record_count << "," << cfg.operation_count
 		    << "," << cfg.value_size
@@ -748,6 +902,16 @@ bool runBenchmark(BenchConfig& cfg) {
 		    << "," << apply_stats.p50 << "," << apply_stats.p95
 		    << "," << apply_stats.p99 << "," << apply_stats.p999
 		    << "," << read_stats.p50 << "," << read_stats.p99
+		    << "," << cfg.pub_threads
+		    << "," << (getenv("NUM_BROKERS") ? getenv("NUM_BROKERS") : "")
+		    << "," << (cfg.fifo_valid ? 1 : 0)
+		    << "," << fifoModeLabel(cfg)
+		    << "," << fifo_overwritten_keys
+		    << "," << fifo_final_mismatch
+		    << "," << fifo_untouched_mismatch
+		    << "," << fifo_session_reorders
+		    << "," << fifo_key_reorders
+		    << "," << (failed_checks.empty() ? "none" : failed_checks)
 		    << "\n";
 	}
 
@@ -801,6 +965,10 @@ int main(int argc, char* argv[]) {
 		 cxxopts::value<int>()->default_value("0"))
 		("sync_barrier", "Intermediate sync barrier (apply|ack)",
 		 cxxopts::value<std::string>()->default_value("apply"))
+		("fifo_valid", "SMR-FIFO overwrite eval (paper Q3): pipelined single-session "
+		 "versioned overwrites + session-FIFO final-state validation")
+		("fifo_mode", "FIFO mechanism label for CSV (auto|native|token_order|stop_and_wait|sticky|none)",
+		 cxxopts::value<std::string>()->default_value("auto"))
 		("latency", "Enable per-op latency tracking (adds overhead; use for latency runs)")
 		("broker_ip", "Broker address",
 		 cxxopts::value<std::string>()->default_value("127.0.0.1"))
@@ -840,6 +1008,8 @@ int main(int argc, char* argv[]) {
 	cfg.scan_len = result["scan_len"].as<int>();
 	cfg.sync_interval = result["sync_interval"].as<int>();
 	cfg.sync_barrier = result["sync_barrier"].as<std::string>();
+	cfg.fifo_valid = result.count("fifo_valid") > 0;
+	cfg.fifo_mode = result["fifo_mode"].as<std::string>();
 	cfg.latency = result.count("latency") > 0;
 	cfg.broker_ip = result["broker_ip"].as<std::string>();
 	cfg.warmup_ops = result["warmup_ops"].as<uint64_t>();

@@ -35,6 +35,7 @@ set(KV_LINK_LIBS
     heartbeat_grpc_proto
     session_proto
     corfu_sequencer_grpc_proto
+    corfu_token_proxy_grpc_proto
     corfu_replication_grpc_proto
     scalog_replication_grpc_proto
     grpc++_reflection

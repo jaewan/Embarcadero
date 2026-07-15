@@ -117,7 +117,8 @@ DistributedKVStore::DistributedKVStore(const Config& cfg)
 		last_transaction_id_(0),
 		running_(true),
 		manage_cluster_(cfg.manage_cluster),
-		track_latency_(cfg.track_latency) {
+		track_latency_(cfg.track_latency),
+		fifo_audit_(cfg.fifo_audit) {
 
 		char topic[TOPIC_NAME_SIZE];
 		memset(topic, 0, TOPIC_NAME_SIZE);
@@ -133,6 +134,13 @@ DistributedKVStore::DistributedKVStore(const Config& cfg)
 		CreateNewTopic(stub_, topic, order, cfg.seq_type,
 		               cfg.replication_factor, false, cfg.ack_level);
 
+		// The SMR apply path consumes via Consume()/ConsumeOrdered(), which is fed
+		// only when the subscriber's ordered consume stream is enabled. Under
+		// EMBARCADERO_RUNTIME_MODE=latency|throughput with measure_latency=false the
+		// feed gate (subscriber.cc feed_ordered_consume_stream) turns the stream off
+		// and Consume() starves forever (applied stays 0). This store requires the
+		// stream; an explicit user env setting still wins (overwrite=0).
+		setenv("EMBARCADERO_ENABLE_ORDERED_CONSUME_STREAM", "1", /*overwrite=*/0);
 		subscriber_ = std::make_unique<Subscriber>(
 			cfg.broker_ip,
 			std::to_string(BROKER_PORT),
@@ -260,6 +268,9 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				offset += valueLength;
 
 				kv_store_.put(key, value);
+				if (fifo_audit_) {
+					auditFifoValue(value);
+				}
 
 				if (client_id == server_id_) {
 					const OPID applied_op =
@@ -440,6 +451,41 @@ void DistributedKVStore::processLogEntry(const LogEntry& entry, size_t total_ord
 		}
 	}
 
+}
+
+// Values from the SMR-FIFO overwrite workload are "F|<key:12 digits>|<version:16 digits>|pad".
+// Called only from the single logConsumer thread, in log total order, so plain
+// (non-atomic) tracking state is safe; counters are atomics for cross-thread reads.
+void DistributedKVStore::auditFifoValue(const std::string& value) {
+	// Layout: F(0) |(1) key[2..13] |(14) ver[15..30] |(31)
+	if (value.size() < 32 || value[0] != 'F' || value[1] != '|' ||
+	    value[14] != '|' || value[31] != '|') {
+		return;  // not a versioned FIFO value (e.g. load-phase template)
+	}
+	uint64_t key_id = 0, version = 0;
+	for (int i = 2; i < 14; ++i) {
+		char c = value[i];
+		if (c < '0' || c > '9') return;
+		key_id = key_id * 10 + static_cast<uint64_t>(c - '0');
+	}
+	for (int i = 15; i < 31; ++i) {
+		char c = value[i];
+		if (c < '0' || c > '9') return;
+		version = version * 10 + static_cast<uint64_t>(c - '0');
+	}
+	if (version < fifo_last_seen_version_) {
+		fifo_session_reorders_.fetch_add(1, std::memory_order_acq_rel);
+	} else {
+		fifo_last_seen_version_ = version;
+	}
+	auto [it, inserted] = fifo_last_key_version_.try_emplace(key_id, version);
+	if (!inserted) {
+		if (version < it->second) {
+			fifo_key_reorders_.fetch_add(1, std::memory_order_acq_rel);
+		} else {
+			it->second = version;
+		}
+	}
 }
 
 void DistributedKVStore::completeOperation(OPID opId){
