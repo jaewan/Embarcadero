@@ -59,6 +59,16 @@ setsid "$ROOT/build/bin/lazylog_metadata_replica" \
     >"$META_ROOT/replica_b.log" 2>&1 < /dev/null &
 META_PIDS+=("$!")
 
+# Do not silently reuse a sidecar that survived an earlier developer run: a
+# stale sidecar can carry conflicting metadata for the fixed benchmark topic.
+sleep 1
+for i in "${!META_PIDS[@]}"; do
+    if ! kill -0 "${META_PIDS[$i]}" 2>/dev/null; then
+        echo "ERROR: LazyLog metadata replica $((i + 1)) failed to start; see $META_ROOT/replica_$([[ "$i" == 0 ]] && echo a || echo b).log" >&2
+        exit 1
+    fi
+done
+
 ONLY_CELLS="e2_embar5_rf0_ack1_n1,e2_embar5_rf1_ack1_n1,e2_embar5_rf2_ack2_n1,e2_embar0_rf0_ack1_n1,e2_embar0_rf1_ack1_n1,e2_corfu_rf0_n1,e2_scalog_rf0_n1,e2_lazylog_rf0_n1,e2_corfu_rf2_ack2_n1,e2_scalog_rf2_ack2_n1,e2_lazylog_rf2_ack2_n1" \
 RUN_TAG="$RUN_TAG" \
 SKIP_BASELINES=0 \
@@ -81,4 +91,3 @@ EMBARCADERO_ACK_TIMEOUT_SEC=300 \
 EMBARCADERO_REPLICA_DISK_DIRS="$ROOT/.Replication/disk0,$ROOT/.Replication/disk1" \
 EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS="10.10.10.10:50081,10.10.10.10:50082" \
 bash "$SCRIPT_DIR/run_overnight_eval.sh"
-
