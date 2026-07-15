@@ -138,7 +138,11 @@ mkdir -p build
 # the cache and clean this target before each native client rebuild.
 rm -f build/CMakeCache.txt
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS= >/tmp/embar_client_cmake.log 2>&1
-cmake --build build --target clean >/tmp/embar_client_clean.log 2>&1 || true
+# Rebuild only this executable's objects.  A global `clean` also destroys the
+# cached gRPC dependency graph and turns a client refresh into a long cluster
+# outage.
+rm -rf build/src/CMakeFiles/throughput_test.dir
+rm -f build/bin/throughput_test
 cmake --build build -j"\$(nproc)" --target throughput_test
 test -x build/bin/throughput_test
 REMOTE_BUILD
