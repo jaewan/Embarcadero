@@ -111,6 +111,9 @@ fi
 MSG_SIZE="${MSG_SIZE:-1024}"
 NUM_BROKERS="${NUM_BROKERS:-4}"
 SKIP_BASELINES="${SKIP_BASELINES:-0}"
+# RF=2 baseline cells are intentionally opt-in: they require the durable
+# sidecars/services configured by the caller, unlike the primary RF=0 cells.
+INCLUDE_DURABLE_BASELINES_RF2="${INCLUDE_DURABLE_BASELINES_RF2:-0}"
 
 # ---------------------------------------------------------------------------
 # Throughput tuning knobs (FIX 1 + FIX 2)
@@ -485,6 +488,31 @@ if [[ "$SKIP_BASELINES" != "1" ]]; then
         SEQUENCER=LAZYLOG ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
         TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
         EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP"
+
+    if [[ "$INCLUDE_DURABLE_BASELINES_RF2" == "1" ]]; then
+        # These are ACK2 media-durable cells.  The caller supplies the
+        # metadata-replica endpoints for LazyLog; the other services are
+        # launched by run_multiclient with the same per-trial disk isolation.
+        # shellcheck disable=SC2207
+        durable_extra=( $(rf2_disk_env) )
+        run_multi_cell "e2_corfu_rf2_ack2_n1" 1 "$CLIENT_HOSTS_REMOTE" \
+            SEQUENCER=CORFU ORDER=2 ACK=2 REPLICATION_FACTOR=2 \
+            TEST_TYPE=5 EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP" \
+            ${durable_extra[@]+"${durable_extra[@]}"}
+
+        run_multi_cell "e2_scalog_rf2_ack2_n1" 1 "$CLIENT_HOSTS_REMOTE" \
+            SEQUENCER=SCALOG ORDER=1 ACK=2 REPLICATION_FACTOR=2 \
+            TEST_TYPE=5 SKIP_REMOTE_SCALOG_SEQUENCER=1 \
+            EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP" \
+            ${durable_extra[@]+"${durable_extra[@]}"}
+
+        run_multi_cell "e2_lazylog_rf2_ack2_n1" 1 "$CLIENT_HOSTS_REMOTE" \
+            SEQUENCER=LAZYLOG ORDER=2 ACK=2 REPLICATION_FACTOR=2 \
+            TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
+            EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
+            REQUIRE_FAITHFUL_LAZYLOG=1 \
+            ${durable_extra[@]+"${durable_extra[@]}"}
+    fi
 
 fi
 # Note: RF=1 baseline cells are deferred — Scalog RF=1 has a known anomaly

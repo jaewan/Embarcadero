@@ -6,7 +6,7 @@
 #
 # What it does:
 #   1. Verify local build is present and fresh
-#   2. Sync binaries + scripts to all client nodes (c1, c2, c3)
+#   2. Sync binaries + scripts to the selected client nodes (default: c4, c3, c1)
 #   3. Verify CXL NUMA node 2 is present and memory-accessible on moscxl
 #   4. Verify hugepages on moscxl (warn if low, don't abort)
 #   5. Verify RDMA NIC is up and has IB/RoCE link on moscxl
@@ -14,8 +14,9 @@
 #   7. Verify passwordless SSH + sudo to all client nodes
 #
 # Usage:
-#   bash scripts/cluster_setup.sh            # full setup + verify
-#   bash scripts/cluster_setup.sh --check    # verify only (no sync)
+#   bash scripts/cluster_setup.sh                         # full setup + verify
+#   CLIENT_NODES_CSV=c4,c3 bash scripts/cluster_setup.sh # selected clients only
+#   bash scripts/cluster_setup.sh --check                 # verify only (no sync)
 
 set -euo pipefail
 
@@ -35,6 +36,16 @@ OPTIONAL_NODES=(c2)
 # c1: 100G NIC enp24s0f0np0 on NUMA 0.
 # Remote Embarcadero root on client nodes
 REMOTE_ROOT="${REMOTE_PROJECT_ROOT:-$HOME/Embarcadero}"
+
+# A publication campaign must never refresh a colleague's unrelated remote
+# worktree merely because that host happens to be in the historical default
+# roster.  Callers select the exact client set used by their cells.
+if [[ -n "${CLIENT_NODES_CSV:-}" ]]; then
+    IFS=',' read -r -a CLIENT_NODES <<< "$CLIENT_NODES_CSV"
+    for host in "${CLIENT_NODES[@]}"; do
+        [[ -n "${host//[[:space:]]/}" ]] || die "CLIENT_NODES_CSV contains an empty host"
+    done
+fi
 
 # Binaries to sync to all client nodes
 LOCAL_BIN="$PROJECT_ROOT/build/bin"
