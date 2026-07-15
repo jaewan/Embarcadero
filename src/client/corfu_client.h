@@ -8,6 +8,9 @@
 #include <thread>
 #include <vector>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <string>
 
 using grpc::Channel;
 using grpc::ClientContext;
@@ -44,8 +47,10 @@ class CorfuSequencerClient {
 				// Set a reasonable timeout for the RPC
 				context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
 
-				auto channel = grpc::CreateChannel(proxy_endpoint, grpc::InsecureChannelCredentials());
-				auto stub = CorfuTokenProxy::NewStub(channel);
+				// Reuse a persistent channel/stub per proxy endpoint. Creating a
+				// channel on every token (~1 ms) was the dominant Corfu N=1 tax
+				// (batch_bytes / mean_token_latency ≈ measured GB/s).
+				CorfuTokenProxy::Stub* stub = StubFor(proxy_endpoint);
 				Status status = stub->GetTotalOrder(&context, request, &response);
 
 				if (status.ok()) {
@@ -56,6 +61,8 @@ class CorfuSequencerClient {
 				}
 
 				if (status.error_code() == grpc::StatusCode::UNAVAILABLE) {
+					// Drop the cached stub so the next attempt reconnects.
+					InvalidateStub(proxy_endpoint);
 					unavailable_retry_count++;
 					if (unavailable_retry_count == 1) {
 						LOG(WARNING) << "GetTotalOrder UNAVAILABLE on first attempt"
@@ -114,5 +121,25 @@ class CorfuSequencerClient {
 		}
 
 	private:
+		CorfuTokenProxy::Stub* StubFor(const std::string& proxy_endpoint) {
+			std::lock_guard<std::mutex> lock(stubs_mu_);
+			auto it = stubs_.find(proxy_endpoint);
+			if (it != stubs_.end()) {
+				return it->second.get();
+			}
+			auto channel = grpc::CreateChannel(proxy_endpoint, grpc::InsecureChannelCredentials());
+			auto stub = CorfuTokenProxy::NewStub(channel);
+			CorfuTokenProxy::Stub* raw = stub.get();
+			stubs_.emplace(proxy_endpoint, std::move(stub));
+			return raw;
+		}
+
+		void InvalidateStub(const std::string& proxy_endpoint) {
+			std::lock_guard<std::mutex> lock(stubs_mu_);
+			stubs_.erase(proxy_endpoint);
+		}
+
 		const uint64_t client_id_;
+		std::mutex stubs_mu_;
+		std::unordered_map<std::string, std::unique_ptr<CorfuTokenProxy::Stub>> stubs_;
 };

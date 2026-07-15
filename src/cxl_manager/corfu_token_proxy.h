@@ -44,11 +44,20 @@ class GrpcCorfuTokenProxy final : public corfutokenproxy::CorfuTokenProxy::Servi
     uint64_t total_size;
     std::chrono::steady_clock::time_point created;
   };
+  // Single-flight for cache misses: waiters share one upstream RPC instead of
+  // holding cache_mu_ across the sequencer hop (which serialized all proxies).
+  struct InflightGrant {
+    bool done{false};
+    grpc::Status status{grpc::Status::OK};
+    CachedGrant grant{};
+    std::condition_variable cv;
+  };
   std::string CacheKey(const corfutokenproxy::TokenRequest& request) const;
   const int expected_broker_id_;
   std::unique_ptr<corfusequencer::CorfuSequencer::Stub> stub_;
   std::mutex cache_mu_;
   std::unordered_map<std::string, CachedGrant> grants_;
+  std::unordered_map<std::string, std::shared_ptr<InflightGrant>> inflight_;
 };
 
 // C1b: keeps the publisher-to-ingress gRPC protocol unchanged, but replaces the

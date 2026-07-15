@@ -48,26 +48,47 @@ grpc::Status GrpcCorfuTokenProxy::GetTotalOrder(
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                         "token request routed to non-owner Corfu ingress");
   }
-  // Serialize cache miss handling. This keeps a retry from issuing a second
-  // token for the same logical (client_id, broker_id, original batchseq) key.
-  std::lock_guard<std::mutex> lock(cache_mu_);
-  const auto now = std::chrono::steady_clock::now();
-  for (auto it = grants_.begin(); it != grants_.end();) {
-    if (now - it->second.created > std::chrono::seconds(60)) it = grants_.erase(it);
-    else ++it;
-  }
+
   const std::string key = CacheKey(*request);
-  if (const auto found = grants_.find(key); found != grants_.end()) {
-    if (found->second.num_msg != request->num_msg() ||
-        found->second.total_size != request->total_size()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                          "conflicting retry for an already granted token");
+  std::shared_ptr<InflightGrant> inflight;
+  {
+    std::unique_lock<std::mutex> lock(cache_mu_);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = grants_.begin(); it != grants_.end();) {
+      if (now - it->second.created > std::chrono::seconds(60)) it = grants_.erase(it);
+      else ++it;
     }
-    response->set_total_order(found->second.total_order);
-    response->set_log_idx(found->second.log_idx);
-    response->set_broker_batch_seq(found->second.broker_batch_seq);
-    return grpc::Status::OK;
+    if (const auto found = grants_.find(key); found != grants_.end()) {
+      if (found->second.num_msg != request->num_msg() ||
+          found->second.total_size != request->total_size()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "conflicting retry for an already granted token");
+      }
+      response->set_total_order(found->second.total_order);
+      response->set_log_idx(found->second.log_idx);
+      response->set_broker_batch_seq(found->second.broker_batch_seq);
+      return grpc::Status::OK;
+    }
+    if (auto it = inflight_.find(key); it != inflight_.end()) {
+      inflight = it->second;
+      inflight->cv.wait(lock, [&] { return inflight->done; });
+      if (!inflight->status.ok()) return inflight->status;
+      if (inflight->grant.num_msg != request->num_msg() ||
+          inflight->grant.total_size != request->total_size()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "conflicting retry for an already granted token");
+      }
+      response->set_total_order(inflight->grant.total_order);
+      response->set_log_idx(inflight->grant.log_idx);
+      response->set_broker_batch_seq(inflight->grant.broker_batch_seq);
+      return grpc::Status::OK;
+    }
+    inflight = std::make_shared<InflightGrant>();
+    inflight_.emplace(key, inflight);
   }
+
+  // Upstream sequencer hop runs WITHOUT cache_mu_. Same-key retries
+  // single-flight on |inflight|; unrelated keys proceed concurrently.
   corfusequencer::TotalOrderRequest forwarded;
   forwarded.set_client_id(request->client_id());
   forwarded.set_batchseq(request->batchseq());
@@ -82,14 +103,26 @@ grpc::Status GrpcCorfuTokenProxy::GetTotalOrder(
   const auto deadline_cap = std::chrono::system_clock::now() + std::chrono::seconds(30);
   upstream.set_deadline(std::min(context->deadline(), deadline_cap));
   const grpc::Status status = stub_->GetTotalOrder(&upstream, forwarded, &grant);
-  if (!status.ok()) return status;
-  response->set_total_order(grant.total_order());
-  response->set_log_idx(grant.log_idx());
-  response->set_broker_batch_seq(grant.broker_batch_seq());
-  if (grants_.size() >= 65536) grants_.erase(grants_.begin());
-  grants_.emplace(key, CachedGrant{grant.total_order(), grant.log_idx(),
-      grant.broker_batch_seq(), request->num_msg(), request->total_size(), now});
-  return grpc::Status::OK;
+
+  {
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    if (status.ok()) {
+      const auto now = std::chrono::steady_clock::now();
+      CachedGrant cached{grant.total_order(), grant.log_idx(), grant.broker_batch_seq(),
+                         request->num_msg(), request->total_size(), now};
+      if (grants_.size() >= 65536) grants_.erase(grants_.begin());
+      grants_[key] = cached;
+      inflight->grant = cached;
+      response->set_total_order(cached.total_order);
+      response->set_log_idx(cached.log_idx);
+      response->set_broker_batch_seq(cached.broker_batch_seq);
+    }
+    inflight->status = status;
+    inflight->done = true;
+    inflight_.erase(key);
+    inflight->cv.notify_all();
+  }
+  return status;
 }
 
 std::string GrpcCorfuTokenProxy::CacheKey(
