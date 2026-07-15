@@ -92,3 +92,7 @@ env \
     EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS='10.10.10.10:50081,10.10.10.10:50082' \
     CLIENT_LD_LIBRARY_PATH="$CLIENT_LIB" \
     bash "$SCRIPT_DIR/run_overnight_eval.sh"
+status=$?
+# Keep a command after the sweep so Bash cannot optimize the final external
+# command into an exec; the EXIT trap above must own sidecar teardown.
+exit "$status"
