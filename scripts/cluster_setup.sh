@@ -51,11 +51,12 @@ fi
 LOCAL_BIN="$PROJECT_ROOT/build/bin"
 REQUIRED_BINS=(embarlet throughput_test corfu_global_sequencer)
 
-# Shared libraries that may be absent or version-mismatched on client nodes.
-# These are collected into $PROJECT_ROOT/lib/ and synced to the same path on clients.
-# run_overnight_eval.sh exports CLIENT_LD_LIBRARY_PATH=~/Embarcadero/lib so
-# run_multiclient.sh picks it up automatically.
+# Client binaries are built natively.  Do not normally inject broker-host
+# libraries here: c4's older glibc/libstdc++ cannot load the broker's glog or
+# yaml-cpp.  An operator may explicitly request a synced compatibility bundle
+# only for hosts with a verified compatible runtime.
 LOCAL_LIB="$PROJECT_ROOT/lib"
+SYNC_CLIENT_LIBS="${SYNC_CLIENT_LIBS:-0}"
 
 stamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 info()  { echo "[$(stamp)] INFO  $*"; }
@@ -106,22 +107,8 @@ SYNC_EXCLUDES=(
 CLEAN_SYNC_ROOT="$(mktemp -d /tmp/embar_client_sync.XXXXXX)"
 info "  Exporting clean HEAD tree for client sync..."
 git -C "$PROJECT_ROOT" archive HEAD | tar -x -C "$CLEAN_SYNC_ROOT"
-# Overlay scripts that may be newer than HEAD but are required for this overnight.
-for rel in \
-    scripts/run_overnight_eval.sh \
-    scripts/cluster_setup.sh \
-    scripts/run_multiclient.sh \
-    scripts/run_latency.sh \
-    scripts/run_latency_vs_load.sh \
-    scripts/lib/broker_lifecycle.sh \
-    scripts/publication/run_throughput_cell.sh \
-    scripts/publication/run_latency_cell.sh \
-    test/CMakeLists.txt; do
-    if [[ -f "$PROJECT_ROOT/$rel" ]]; then
-        mkdir -p "$CLEAN_SYNC_ROOT/$(dirname "$rel")"
-        cp -a "$PROJECT_ROOT/$rel" "$CLEAN_SYNC_ROOT/$rel"
-    fi
-done
+# Sync precisely the committed snapshot.  Copying uncommitted script overlays
+# made remote provenance ambiguous and can reintroduce a local WIP defect.
 
 for host in "${CLIENT_NODES[@]}"; do
     info "  Syncing source to $host..."
@@ -131,20 +118,12 @@ for host in "${CLIENT_NODES[@]}"; do
         2>/dev/null
 
     if [[ "$CHECK_ONLY" != "1" ]]; then
-        mkdir -p "$LOCAL_LIB"
-        for lib_path in \
-            /usr/local/lib/libglog.so.1 \
-            /usr/local/lib/libmimalloc.so.2 \
-            /lib/x86_64-linux-gnu/libyaml-cpp.so.0.8 \
-            /lib/x86_64-linux-gnu/libgflags.so.2.2; do
-            [[ -f "$lib_path" ]] && cp -n "$lib_path" "$LOCAL_LIB/" 2>/dev/null || true
-        done
-
         rsync -az --checksum \
             "${SYNC_EXCLUDES[@]}" \
             "$CLEAN_SYNC_ROOT/" "$host:$REMOTE_ROOT/"
 
-        if [[ -d "$LOCAL_LIB" && -n "$(ls -A "$LOCAL_LIB" 2>/dev/null)" ]]; then
+        if [[ "$SYNC_CLIENT_LIBS" == "1" && -d "$LOCAL_LIB" && -n "$(ls -A "$LOCAL_LIB" 2>/dev/null)" ]]; then
+            warn "  $host: syncing caller-requested compatibility libraries"
             rsync -az --checksum "$LOCAL_LIB/" "$host:$REMOTE_ROOT/lib/"
         fi
 
@@ -173,17 +152,11 @@ REMOTE_BUILD
         fi
     fi
 
-    # Verify binary is runnable (with LD_LIBRARY_PATH pointing to the synced libs)
-    # Verify by actually EXECUTING the binary under the harness env
-    # (CLIENT_LD_LIBRARY_PATH=$REMOTE_ROOT/lib). ldd alone is insufficient:
-    # a synced broker lib can shadow a compatible system lib by soname and
-    # fail only at load with a GLIBC/GLIBCXX version error (seen on c4 with
-    # libgflags.so.2.2, run 20260711T040115Z). A bad-option invocation that
-    # reaches the cxxopts error proves loader + all libs + C++ runtime work.
-    client_lib="$REMOTE_ROOT/lib"
+    # Verify the native binary with its host ABI. ldd alone is insufficient;
+    # this bad-option invocation proves loader + C++ runtime compatibility.
     verify_client_binary_runs() {
         ssh -o BatchMode=yes "$1" \
-            "cd $REMOTE_ROOT/build/bin && LD_LIBRARY_PATH=$client_lib \
+            "cd $REMOTE_ROOT/build/bin && env -u LD_LIBRARY_PATH \
              ./throughput_test --cluster_setup_verify_bad_option 2>&1 | head -3" 2>/dev/null \
             | grep -q "no_such_option\|does not exist"
     }
@@ -193,27 +166,7 @@ REMOTE_BUILD
     if verify_client_binary_runs "$host"; then
         info "  $host: throughput_test OK (executed under harness env)"
     else
-        # Loader failure — usually a synced broker lib shadowing a compatible
-        # system lib. Remediate: for each synced lib that the host also has as
-        # a system lib, prefer the host's copy; keep synced libs with no
-        # system equivalent (e.g. libglog.so.1 on c3). Then re-verify.
-        warn "  $host: binary failed to run under harness env — trying system-lib fallback"
-        ssh -o BatchMode=yes "$host" '
-            for so in '"$client_lib"'/*.so*; do
-                [ -f "$so" ] || continue
-                name=$(basename "$so")
-                for sysdir in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/local/lib; do
-                    if [ -f "$sysdir/$name" ]; then
-                        cp -f "$sysdir/$name" "$so" && echo "  replaced $name with $sysdir copy"
-                        break
-                    fi
-                done
-            done' 2>/dev/null || true
-        if verify_client_binary_runs "$host"; then
-            info "  $host: throughput_test OK after system-lib fallback"
-        else
-            die "$host: throughput_test cannot run under harness env — fix before launching (try native build or check GLIBC versions)"
-        fi
+        die "$host: native throughput_test cannot run — fix its host toolchain/runtime before launching"
     fi
 done
 info "Source sync + client rebuild complete"

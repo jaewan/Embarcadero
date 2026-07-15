@@ -155,11 +155,12 @@ export EMBARCADERO_CXL_MAP_POPULATE="${EMBARCADERO_CXL_MAP_POPULATE:-0}"
 # already gates the actual startup; this only adds guard time for the probe).
 export BROKER_REACHABILITY_TIMEOUT_SEC="${BROKER_REACHABILITY_TIMEOUT_SEC:-60}"
 
-# Shared libs that may be missing or wrong-version on client nodes.
-# cluster_setup.sh collects these into $PROJECT_ROOT/lib/; we point clients there.
-# run_multiclient.sh honours CLIENT_LD_LIBRARY_PATH and passes it to remote throughput_test.
+# Native client builds use their own host ABI by default.  A copied library
+# bundle must be opted in by the operator after a compatibility check; forcing
+# broker-host libraries onto c4 breaks its older GLIBC/GLIBCXX runtime.
 REMOTE_EMBAR_ROOT="${REMOTE_EMBAR_ROOT:-$HOME/Embarcadero}"
-export CLIENT_LD_LIBRARY_PATH="$REMOTE_EMBAR_ROOT/lib"
+CLIENT_LD_LIBRARY_PATH="${CLIENT_LD_LIBRARY_PATH:-}"
+export CLIENT_LD_LIBRARY_PATH
 
 # Paper RF/ACK contract (ack_rf_policy.h / Sec7):
 #   RF includes the CXL primary: RF<=1 → ACK1 (ordered-visible); RF>=2 → ACK2 (media-durable).
