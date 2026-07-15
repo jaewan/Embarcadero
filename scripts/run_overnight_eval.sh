@@ -114,6 +114,10 @@ SKIP_BASELINES="${SKIP_BASELINES:-0}"
 # RF=2 baseline cells are intentionally opt-in: they require the durable
 # sidecars/services configured by the caller, unlike the primary RF=0 cells.
 INCLUDE_DURABLE_BASELINES_RF2="${INCLUDE_DURABLE_BASELINES_RF2:-0}"
+# Metadata replica membership is a LazyLog RF>=2-only setting.  Preserve the
+# old spelling as an input alias, but never let a campaign-wide endpoint list
+# leak into an RF0 LazyLog cell (whose valid membership is empty).
+LAZYLOG_RF2_METADATA_ENDPOINTS="${LAZYLOG_RF2_METADATA_ENDPOINTS:-${EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS:-}}"
 
 # ---------------------------------------------------------------------------
 # Throughput tuning knobs (FIX 1 + FIX 2)
@@ -187,6 +191,12 @@ rf2_disk_env() {
     # Clear memory-copy overrides if a parent shell exported them.
     echo "EMBARCADERO_CHAIN_REPLICATION_INMEM=0"
     echo "EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=0"
+}
+
+lazylog_rf2_metadata_env() {
+    # Emit an explicit empty assignment too: this prevents an inherited global
+    # EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS from silently changing a cell.
+    echo "EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS=$LAZYLOG_RF2_METADATA_ENDPOINTS"
 }
 
 rf2_memcopy_env() {
@@ -490,7 +500,8 @@ if [[ "$SKIP_BASELINES" != "1" ]]; then
     run_multi_cell "e2_lazylog_rf0_n1" 1 "$CLIENT_HOSTS_REMOTE" \
         SEQUENCER=LAZYLOG ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
         TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
-        EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP"
+        EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
+        EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS=
 
     if [[ "$INCLUDE_DURABLE_BASELINES_RF2" == "1" ]]; then
         # These are ACK2 media-durable cells.  The caller supplies the
@@ -514,6 +525,7 @@ if [[ "$SKIP_BASELINES" != "1" ]]; then
             TEST_TYPE=5 SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
             EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
             REQUIRE_FAITHFUL_LAZYLOG=1 \
+            "$(lazylog_rf2_metadata_env)" \
             ${durable_extra[@]+"${durable_extra[@]}"}
     fi
 
