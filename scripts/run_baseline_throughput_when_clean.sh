@@ -57,13 +57,17 @@ while is_cluster_busy; do
 done
 
 mkdir -p "$META_ROOT/a" "$META_ROOT/b"
+# Do not let the detached sidecars inherit the campaign lock (fd 9).  More
+# importantly, retain this shell as their supervisor below: using `exec` for
+# the sweep would bypass cleanup_metadata and leave both ports and the lock
+# owned after an interrupted campaign.
 setsid "$ROOT/build/bin/lazylog_metadata_replica" \
     --listen 0.0.0.0:50081 --sidecar "$META_ROOT/a/metadata.sidecar" \
-    >"$META_ROOT/replica_a.log" 2>&1 < /dev/null &
+    >"$META_ROOT/replica_a.log" 2>&1 < /dev/null 9>&- &
 metadata_pids+=("$!")
 setsid "$ROOT/build/bin/lazylog_metadata_replica" \
     --listen 0.0.0.0:50082 --sidecar "$META_ROOT/b/metadata.sidecar" \
-    >"$META_ROOT/replica_b.log" 2>&1 < /dev/null &
+    >"$META_ROOT/replica_b.log" 2>&1 < /dev/null 9>&- &
 metadata_pids+=("$!")
 sleep 1
 for pid in "${metadata_pids[@]}"; do
@@ -73,7 +77,7 @@ done
 ONLY_CELLS='e2_embar5_rf0_ack1_n1,e2_embar5_rf1_ack1_n1,e2_embar5_rf2_ack2_n1,e2_embar0_rf0_ack1_n1,e2_embar0_rf1_ack1_n1,e2_corfu_rf0_n1,e2_scalog_rf0_n1,e2_lazylog_rf0_n1,e2_corfu_rf2_ack2_n1,e2_scalog_rf2_ack2_n1,e2_lazylog_rf2_ack2_n1'
 CLIENT_LIB='/home/domin/Embarcadero/third_party/glog-0.6/lib:/home/domin/Embarcadero/third_party/yaml-cpp-0.8/lib'
 
-exec env \
+env \
     RUN_TAG="$RUN_TAG" OUT_BASE="$OUT_BASE" \
     SKIP_CLUSTER_SETUP=1 ALLOW_DIRTY_ARTIFACT=1 \
     ONLY_CELLS="$ONLY_CELLS" SKIP_BASELINES=0 INCLUDE_DURABLE_BASELINES_RF2=1 \
