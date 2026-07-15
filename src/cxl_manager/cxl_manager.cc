@@ -526,6 +526,23 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 				prefault_enabled = !(env[0] == '0' && env[1] == '\0');
 			}
 			if (prefault_enabled) {
+				// A large CXL device can reserve far more segment capacity than a
+				// particular experiment will use.  Prefaulting the whole free pool
+				// delays broker readiness in proportion to *unused* capacity (e.g.,
+				// 222 GiB on a 256 GiB device for a four-broker run).  Launchers
+				// already declare the number of independent logs they require for
+				// the capacity preflight; use that same bounded working set here.
+				// General deployments that do not make the declaration retain the
+				// historical whole-pool prefault behavior.
+				size_t prefault_segment_bytes = Segment_Region_size;
+				if (const char* required_env = std::getenv("EMBARCADERO_REQUIRED_CXL_SEGMENTS")) {
+					char* end = nullptr;
+					const unsigned long required = std::strtoul(required_env, &end, 10);
+					if (end != required_env && *end == '\0' && required > 0) {
+						const size_t requested = static_cast<size_t>(required) * SEGMENT_SIZE;
+						prefault_segment_bytes = std::min(Segment_Region_size, requested);
+					}
+				}
 				// madvise requires page-aligned addr: segment region offsets are only
 				// cacheline-aligned, so align start down (the preceding bytes are metadata
 				// already faulted by the startup zeroing) and extend length to match.
@@ -533,7 +550,7 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 				uintptr_t seg_addr = reinterpret_cast<uintptr_t>(segments_);
 				uintptr_t aligned_addr = seg_addr & ~(page - 1);
 				uint8_t* pf_start = reinterpret_cast<uint8_t*>(aligned_addr);
-				const size_t pf_len = Segment_Region_size + (seg_addr - aligned_addr);
+				const size_t pf_len = prefault_segment_bytes + (seg_addr - aligned_addr);
 				const auto t0 = std::chrono::steady_clock::now();
 				constexpr size_t kPrefaultWorkers = 8;
 				constexpr size_t kChunk = 1UL << 30;  // 1GB madvise granularity
@@ -567,7 +584,8 @@ CXLManager::CXLManager(int broker_id, CXL_Type cxl_type, std::string head_ip):
 					           << "use EMBARCADERO_CXL_ZERO_MODE=full or fix madvise support";
 				} else {
 					LOG(INFO) << "CXLManager: segment region prefault complete ("
-					          << (pf_len >> 30) << " GB in " << ms << " ms)";
+					          << (pf_len >> 30) << " GB in " << ms << " ms; pool="
+					          << (Segment_Region_size >> 30) << " GB)";
 				}
 			}
 		}
