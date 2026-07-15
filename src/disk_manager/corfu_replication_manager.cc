@@ -50,16 +50,33 @@ namespace Corfu {
 	static corfureplication::CorfuWriteStatus ToProto(CorfuWriteStatus s) {
 		using P=corfureplication::CorfuWriteStatus; switch(s) { case CorfuWriteStatus::kWritten:return P::CORFU_WRITTEN; case CorfuWriteStatus::kAlreadySame:return P::CORFU_ALREADY_SAME; case CorfuWriteStatus::kAlreadyJunk:return P::CORFU_ALREADY_JUNK; case CorfuWriteStatus::kConflict:return P::CORFU_CONFLICT; default:return P::CORFU_IO_ERROR; }
 	}
+	static std::string SlotDebugString(const CorfuSlotKey& slot) {
+		return "(topic=" + slot.topic + ",broker=" + std::to_string(slot.broker_id) +
+			",batch=" + std::to_string(slot.broker_batch_seq) + ")";
+	}
+	static std::string ValueDebugString(const CorfuValueId& value) {
+		return "(client=" + std::to_string(value.client_id) +
+			",seq=" + std::to_string(value.original_client_batch_seq) +
+			",order=" + std::to_string(value.total_order) +
+			",messages=" + std::to_string(value.num_msg) +
+			",bytes=" + std::to_string(value.total_size) + ")";
+	}
 	static uint32_t Crc32c(const uint8_t* p, size_t n) { uint32_t c=~0u; while(n--){c^=*p++;for(int i=0;i<8;++i)c=(c>>1)^(0x82f63b78u&-(c&1));}return ~c; }
 
 	class CorfuReplicationServiceImpl final : public CorfuReplicationService::Service {
 		public:
 			explicit CorfuReplicationServiceImpl(std::string base_filename, void* cxl_addr, bool media_durable)
 				: base_filename_(std::move(base_filename)), cxl_addr_(cxl_addr), media_durable_(media_durable), running_(true), fd_(-1) {
-					if (!OpenOutputFile()) {
+					if (media_durable_ && !OpenOutputFile()) {
 						throw std::runtime_error("Failed to open replication file: " + base_filename_);
 					}
-					store_ = std::make_unique<CorfuReplicaStore>(base_filename_, base_filename_ + ".corfu_sidecar");
+					store_ = media_durable_
+						? std::make_unique<CorfuReplicaStore>(base_filename_, base_filename_ + ".corfu_sidecar", true)
+						: std::make_unique<CorfuReplicaStore>("", "", false);
+					if (!media_durable_) {
+						LOG(INFO) << "CORFU WriteOnce replica sink=memory-copy; "
+						          << "payloads are retained only in process memory";
+					}
 					// WriteOnce owns the durability boundary (data fdatasync followed
 					// by sidecar fdatasync).  A periodic fsync worker is both redundant
 					// and unsafe here; it previously re-entered the file lock on error.
@@ -141,12 +158,24 @@ namespace Corfu {
 			}
 			Status WriteOnce(ServerContext*, const CorfuWriteOnceRequest* request, CorfuWriteResponse* response) override {
 				constexpr uint64_t kMaxWriteBytes = 64ULL * 1024ULL * 1024ULL;
-				if (!media_durable_ || !running_.load(std::memory_order_acquire) || request->size() != request->value().total_size() ||
+				if (!running_.load(std::memory_order_acquire) || request->size() != request->value().total_size() ||
 					request->size() != static_cast<uint64_t>(request->payload().size()) || request->size() > kMaxWriteBytes ||
 					Crc32c(reinterpret_cast<const uint8_t*>(request->payload().data()), request->payload().size()) != request->payload_crc32c()) {
 					response->set_status(corfureplication::CORFU_IO_ERROR); return Status::OK;
 				}
-				response->set_status(ToProto(store_->WriteOnce(ToSlot(request->slot()), ToValue(request->value()), request->source_offset(), request->payload().data(), request->size())));
+				const auto slot = ToSlot(request->slot());
+				const auto value = ToValue(request->value());
+				const auto write_status = store_->WriteOnce(
+					slot, value, request->source_offset(), request->payload().data(), request->size());
+				if (write_status == CorfuWriteStatus::kConflict) {
+					const auto existing = store_->Probe(slot);
+					LOG(ERROR) << "CORFU WriteOnce conflict slot=" << SlotDebugString(slot)
+						<< " existing_state=" << static_cast<unsigned>(existing.state)
+						<< " existing_value=" << ValueDebugString(existing.value)
+						<< " incoming_value=" << ValueDebugString(value)
+						<< "; refusing to overwrite a durable slot";
+				}
+				response->set_status(ToProto(write_status));
 				return Status::OK;
 			}
 			Status WriteJunkOnce(ServerContext*, const CorfuJunkRequest* request, CorfuWriteResponse* response) override {

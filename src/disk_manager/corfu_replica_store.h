@@ -4,6 +4,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace Corfu {
 
@@ -26,11 +27,13 @@ enum class CorfuSlotState : uint8_t { kUnwritten = 0, kValue = 1, kJunk = 2 };
 enum class CorfuWriteStatus : uint8_t { kWritten, kAlreadySame, kAlreadyJunk, kConflict, kIoError };
 struct CorfuProbeResult { CorfuSlotState state{CorfuSlotState::kUnwritten}; CorfuValueId value{}; };
 
-// A sidecar is the source of truth for completed remote slots.  Data is synced
-// before VALUE is appended and synced; replay ignores only a torn final record.
+// A sidecar is the source of truth for completed remote slots in durable mode.
+// Memory-copy mode keeps an owned payload copy in the same slot/value state
+// machine, but deliberately has no replay or media-durability claim.
 class CorfuReplicaStore {
  public:
-  CorfuReplicaStore(std::string data_path, std::string sidecar_path);
+  CorfuReplicaStore(std::string data_path, std::string sidecar_path,
+                    bool media_durable = true);
   ~CorfuReplicaStore();
   CorfuReplicaStore(const CorfuReplicaStore&) = delete;
   CorfuProbeResult Probe(const CorfuSlotKey& key) const;
@@ -39,9 +42,17 @@ class CorfuReplicaStore {
   CorfuWriteStatus WriteJunkOnce(const CorfuSlotKey& key);
 
  private:
-  struct Entry { CorfuSlotState state; CorfuValueId value; uint64_t offset; uint64_t size; };
+  struct Entry {
+    CorfuSlotState state;
+    CorfuValueId value;
+    uint64_t offset;
+    uint64_t size;
+    // Retains the remote payload for the lifetime of a memory-copy replica.
+    std::vector<uint8_t> payload;
+  };
   void Replay();
   bool AppendRecord(const CorfuSlotKey& key, const Entry& entry);
+  bool media_durable_{true};
   int data_fd_{-1};
   int sidecar_fd_{-1};
   std::string sidecar_path_;

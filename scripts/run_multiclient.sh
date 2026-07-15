@@ -81,11 +81,17 @@ ORDER=${ORDER:-0}
 ACK=${ACK:-1}
 REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 # A benchmark's fixed TestTopic name starts broker slot sequences at zero.  A
-# durable Corfu sidecar must therefore not be reused for a distinct trial: its
-# conflict detection would (correctly) reject the new values.  Operators can
-# supply `%TRIAL%` in explicit replica directories to get isolated durable
-# media per trial, without deleting an earlier trial's evidence.
+# durable Corfu sidecar must therefore not be reused for a distinct invocation:
+# its conflict detection would (correctly) reject the new values.  The default
+# below isolates each logical trial *and retry attempt*.  Set this to 0 only
+# for an intentional restart/redrive test, where the same slot/value identities
+# are being replayed against the same durable medium.
 REPLICA_DISK_DIRS_TEMPLATE=${EMBARCADERO_REPLICA_DISK_DIRS:-}
+CORFU_REPLICA_ISOLATE_ATTEMPTS=${EMBARCADERO_CORFU_REPLICA_ISOLATE_ATTEMPTS:-1}
+if [[ "$CORFU_REPLICA_ISOLATE_ATTEMPTS" != "0" && "$CORFU_REPLICA_ISOLATE_ATTEMPTS" != "1" ]]; then
+    echo "ERROR: EMBARCADERO_CORFU_REPLICA_ISOLATE_ATTEMPTS must be 0 or 1" >&2
+    exit 1
+fi
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
 CONTROL_TRANSPORT=${EMBARCADERO_BASELINE_CONTROL_TRANSPORT:-grpc}
 DRY_RUN=${DRY_RUN:-0}
@@ -226,6 +232,40 @@ resolve_project_path() {
         echo "$PROJECT_ROOT/$p"
     fi
 }
+
+# Keep a durable Corfu sidecar scoped to one artifact/trial/attempt.  The
+# protocol deliberately treats a different value for an existing
+# (topic, broker, batch-seq) slot as a conflict, so merely using `%TRIAL%` is
+# insufficient: a retry starts a new client identity while broker batch
+# sequences restart at zero.  This helper changes only the directory selected
+# for an independent benchmark attempt; it never weakens WriteOnce conflict or
+# idempotence semantics.  Explicit restart/redrive tests can opt out with
+# EMBARCADERO_CORFU_REPLICA_ISOLATE_ATTEMPTS=0.
+corfu_replica_dirs_for_attempt() {
+    local trial="$1"
+    local attempt="$2"
+    local dirs="${REPLICA_DISK_DIRS_TEMPLATE//%TRIAL%/$trial}"
+    dirs="${dirs//%ATTEMPT%/$attempt}"
+
+    if [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 &&
+          "$CORFU_REPLICA_ISOLATE_ATTEMPTS" == "1" ]] &&
+          ! corfu_uses_memory_copy_sink; then
+        local artifact_key="${BENCHMARK_TAG:-$LOG_DIR}"
+        local artifact_hash
+        artifact_hash="$(printf '%s' "$artifact_key" | cksum | awk '{print $1}')"
+        local suffix="corfu_slots_${artifact_hash}_t${trial}_a${attempt}"
+        local -a base_dirs scoped_dirs
+        local base_dir
+        IFS=',' read -r -a base_dirs <<< "$dirs"
+        for base_dir in "${base_dirs[@]}"; do
+            [[ -n "$base_dir" ]] && scoped_dirs+=("${base_dir%/}/$suffix")
+        done
+        (IFS=','; printf '%s' "${scoped_dirs[*]}")
+    else
+        printf '%s' "$dirs"
+    fi
+}
+
 if [[ -n "${LOG_DIR:-}" ]]; then
     : # explicit caller choice wins
 elif [[ -n "${OUT_BASE:-}" && -n "${BENCHMARK_TAG:-}" ]]; then
@@ -260,6 +300,34 @@ default_broker_ip() {
     fi
 }
 
+# Corfu has its own ordered WriteOnce chain.  A generic memory-copy selection
+# must therefore select an actual in-memory Corfu replica service, not merely
+# change client-side ACK accounting while still launching --replicate_to_disk.
+corfu_replica_sink_mode() {
+    local sink="${EMBARCADERO_CHAIN_REPLICATION_SINK:-}"
+    sink="${sink,,}"
+    case "$sink" in
+        memory-copy|memory_copy|mem-copy|copy) printf '%s' "memory-copy" ;;
+        memory-accounting|memory_accounting|mem-accounting|accounting) printf '%s' "memory-accounting" ;;
+        disk-durable|disk_durable|disk|'')
+            if [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM:-0}" == "1" ]]; then
+                if [[ "${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-0}" == "1" ]]; then
+                    printf '%s' "memory-copy"
+                else
+                    printf '%s' "memory-accounting"
+                fi
+            else
+                printf '%s' "disk-durable"
+            fi
+            ;;
+        *) printf '%s' "invalid" ;;
+    esac
+}
+
+corfu_uses_memory_copy_sink() {
+    [[ "$(corfu_replica_sink_mode)" == "memory-copy" ]]
+}
+
 BROKER_IP="$(default_broker_ip)"
 export EMBARCADERO_CXL_SHM_NAME="${EMBARCADERO_CXL_SHM_NAME:-/CXL_SHARED_EXPERIMENT_${UID}}"
 export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
@@ -287,9 +355,10 @@ if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
     echo "ERROR: DRY_RUN must be 0 or 1 (got '$DRY_RUN')" >&2
     exit 1
 fi
-if [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 &&
-      -z "${EMBARCADERO_REPLICA_DISK_DIRS:-}" &&
-      -z "${EMBARCADERO_REPLICA_DISK_ROOT:-}" ]]; then
+if [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 ]] &&
+      ! corfu_uses_memory_copy_sink &&
+      [[ -z "${EMBARCADERO_REPLICA_DISK_DIRS:-}" &&
+         -z "${EMBARCADERO_REPLICA_DISK_ROOT:-}" ]]; then
     echo "ERROR: Corfu RF>1 requires explicit EMBARCADERO_REPLICA_DISK_DIRS or EMBARCADERO_REPLICA_DISK_ROOT" >&2
     exit 1
 fi
@@ -374,7 +443,11 @@ fi
 if [[ "$SEQUENCER" == "LAZYLOG" && "$ACK" == "1" ]]; then
     ACK_DURABILITY_CONTRACT="$LAZYLOG_METADATA_CONTRACT"
 elif [[ "$SEQUENCER" == "CORFU" && "$ACK" == "2" && "$REPLICATION_FACTOR" -ge 2 ]]; then
-    ACK_DURABILITY_CONTRACT="ack2_primary_plus_$((REPLICATION_FACTOR - 1))_ordered_media_durable_replicas"
+    if corfu_uses_memory_copy_sink; then
+        ACK_DURABILITY_CONTRACT="ack2_primary_plus_$((REPLICATION_FACTOR - 1))_ordered_memory_copy_replicas"
+    else
+        ACK_DURABILITY_CONTRACT="ack2_primary_plus_$((REPLICATION_FACTOR - 1))_ordered_media_durable_replicas"
+    fi
 elif [[ "$SEQUENCER" == "SCALOG" && "$ACK" == "2" && "$REPLICATION_FACTOR" -ge 1 ]]; then
     # Scalog orders from local durable cuts, then ACK2 clamps that order to the
     # minimum media-synced prefix across the configured replica set.
@@ -1255,15 +1328,29 @@ start_brokers() {
 	# One initial topic needs one CXL log segment per broker.  Ask the broker to
 	# reject an impossible real-CXL geometry during startup rather than retrying
 	# topic discovery until metadata allocation itself fails.
-	export EMBARCADERO_REQUIRED_CXL_SEGMENTS="$NUM_BROKERS"
+    export EMBARCADERO_REQUIRED_CXL_SEGMENTS="$NUM_BROKERS"
     local -a corfu_durability_args=()
     if [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 ]]; then
-        if [[ -z "${EMBARCADERO_REPLICA_DISK_DIRS:-}" && -z "${EMBARCADERO_REPLICA_DISK_ROOT:-}" ]]; then
-            echo "ERROR: Corfu RF>1 requires explicit durable replica directories; refusing a memory-backed ACK2 chain" >&2
-            START_BROKERS_FAILURE_REASON="config_corfu_missing_durable_replica_dir"
+        local corfu_sink
+        corfu_sink="$(corfu_replica_sink_mode)"
+        if [[ "$corfu_sink" == "memory-copy" ]]; then
+            # The Corfu service retains a private payload copy per WriteOnce.
+            # Do not pass --replicate_to_disk or let a configured disk path
+            # silently turn this labeled memory cell into a media-durable one.
+            unset EMBARCADERO_REPLICA_DISK_DIRS EMBARCADERO_REPLICA_DISK_ROOT
+            log "Corfu RF membership uses ordered memory-copy replicas"
+        elif [[ "$corfu_sink" == "disk-durable" ]]; then
+            if [[ -z "${EMBARCADERO_REPLICA_DISK_DIRS:-}" && -z "${EMBARCADERO_REPLICA_DISK_ROOT:-}" ]]; then
+                echo "ERROR: Corfu RF>1 disk-durable mode requires explicit replica directories" >&2
+                START_BROKERS_FAILURE_REASON="config_corfu_missing_durable_replica_dir"
+                return 1
+            fi
+            corfu_durability_args+=(--replicate_to_disk)
+        else
+            echo "ERROR: Corfu RF>1 requires disk-durable or memory-copy replication; refusing sink '$corfu_sink'" >&2
+            START_BROKERS_FAILURE_REASON="config_corfu_unsupported_replica_sink"
             return 1
         fi
-        corfu_durability_args+=(--replicate_to_disk)
         if [[ -z "$EMBARCADERO_CORFU_REPLICA_ENDPOINTS" ]]; then
             local endpoints=""
             for (( _corfu_broker=0; _corfu_broker<NUM_BROKERS; ++_corfu_broker )); do
@@ -1703,15 +1790,18 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
 
     for (( attempt=1; attempt<=TRIAL_MAX_ATTEMPTS; attempt++ )); do
         log "  Attempt $attempt / $TRIAL_MAX_ATTEMPTS"
-        if [[ -n "$REPLICA_DISK_DIRS_TEMPLATE" ]]; then
-            export EMBARCADERO_REPLICA_DISK_DIRS="${REPLICA_DISK_DIRS_TEMPLATE//%TRIAL%/$trial}"
-            if [[ "$EMBARCADERO_REPLICA_DISK_DIRS" != "$REPLICA_DISK_DIRS_TEMPLATE" ]]; then
-                IFS=',' read -r -a _trial_replica_dirs <<< "$EMBARCADERO_REPLICA_DISK_DIRS"
-                for _trial_replica_dir in "${_trial_replica_dirs[@]}"; do
-                    mkdir -p "$_trial_replica_dir"
-                done
-                unset _trial_replica_dirs _trial_replica_dir
-            fi
+        if [[ -n "$REPLICA_DISK_DIRS_TEMPLATE" ]] &&
+           ! ([[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 ]] && corfu_uses_memory_copy_sink); then
+            export EMBARCADERO_REPLICA_DISK_DIRS="$(corfu_replica_dirs_for_attempt "$trial" "$attempt")"
+            IFS=',' read -r -a _trial_replica_dirs <<< "$EMBARCADERO_REPLICA_DISK_DIRS"
+            for _trial_replica_dir in "${_trial_replica_dirs[@]}"; do
+                mkdir -p "$_trial_replica_dir"
+            done
+            unset _trial_replica_dirs _trial_replica_dir
+            log "  Corfu replica media: $EMBARCADERO_REPLICA_DISK_DIRS"
+        elif [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 ]] && corfu_uses_memory_copy_sink; then
+            unset EMBARCADERO_REPLICA_DISK_DIRS EMBARCADERO_REPLICA_DISK_ROOT
+            log "  Corfu replica sink: ordered memory-copy (no durable sidecar)"
         fi
         if [[ "$CXL_SHM_PER_ATTEMPT" == "1" ]]; then
             export EMBARCADERO_CXL_SHM_NAME="${BASE_CXL_SHM_NAME}_t${trial}_a${attempt}"
