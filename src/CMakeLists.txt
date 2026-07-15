@@ -166,6 +166,10 @@ target_link_libraries(throughput_test
     cxxopts::cxxopts
     heartbeat_grpc_proto
     session_proto
+    # topic.h includes the LazyLog metadata-replica client through the shared
+    # CXL manager headers.  Keep its generated headers available for a clean
+    # throughput_test build, not only for embarlet.
+    lazylog_metadata_grpc_proto
     corfu_sequencer_grpc_proto
     corfu_token_proxy_grpc_proto
     corfu_replication_grpc_proto
