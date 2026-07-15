@@ -137,12 +137,12 @@ mkdir -p build
 # rebuilding can incorrectly retain objects compiled against that ABI.  Drop
 # the cache and clean this target before each native client rebuild.
 rm -f build/CMakeCache.txt
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS= >/tmp/embar_client_cmake.log 2>&1
-# Rebuild only this executable's objects.  A global `clean` also destroys the
-# cached gRPC dependency graph and turns a client refresh into a long cluster
-# outage.
+# Rebuild only this executable's objects.  A global clean target also destroys
+# the cached gRPC dependency graph and turns a client refresh into a long
+# cluster outage.  Remove target state before CMake regenerates its rules.
 rm -rf build/src/CMakeFiles/throughput_test.dir
 rm -f build/bin/throughput_test
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS= >/tmp/embar_client_cmake.log 2>&1
 cmake --build build -j"\$(nproc)" --target throughput_test
 test -x build/bin/throughput_test
 REMOTE_BUILD
