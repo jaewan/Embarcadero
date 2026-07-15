@@ -201,6 +201,12 @@ class Publisher {
 		std::array<std::atomic<size_t>, kMaxCorfuBrokers> order5_batch_seq_per_broker_{};
 		// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker to eliminate out-of-order retries (Phase 2C).
 		std::array<std::mutex, kMaxCorfuBrokers> corfu_seq_per_broker_lock_{};
+		// [[CORFU_FIFO_FIX]] Next seal-order batch ticket allowed to issue a token
+		// request. Corfu's per-client FIFO comes from token ACQUISITION order; the
+		// per-broker send threads must issue GetTotalOrder in seal (submission)
+		// order or the sequencer grants total_order in RPC-arrival order, silently
+		// permuting one client's cross-broker submission order.
+		std::atomic<size_t> corfu_token_next_ticket_{0};
 		// C1 evidence: a Corfu payload must never begin before its ingress-proxy
 		// token grant. These counters are emitted by Poll for developer and
 		// evaluation artifacts, not used for control flow.

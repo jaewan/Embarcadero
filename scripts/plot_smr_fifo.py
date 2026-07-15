@@ -88,10 +88,10 @@ def make_markdown(agg):
         "(per-publisher FIFO violated under striping), not a harness failure."
     )
     lines.append(
-        "FIDELITY: harness CXL-Corfu Pipe races token requests across brokers "
-        "(per-(client,broker) batch_seq), so its Pipe row is NON-FAITHFUL to "
-        "Corfu's per-client token FIFO — label or withhold, as with LazyLog's "
-        "binding-gated Pipe row. See benchmarks/kv_store/README_SMR_FIFO.md."
+        "FIDELITY: harness CXL-LazyLog Pipe gates appends on binding (not "
+        "LazyLog's own append contract) — label or withhold that row. "
+        "CXL-Corfu token FIFO is faithful as of the [[CORFU_FIFO_FIX]] ordered "
+        "token stage (2026-07-16). See benchmarks/kv_store/README_SMR_FIFO.md."
     )
     return "\n".join(lines) + "\n"
 

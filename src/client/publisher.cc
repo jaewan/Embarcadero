@@ -3512,6 +3512,32 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					}();
 					const std::string proxy_endpoint = ingress_host + ":" +
 						std::to_string(proxy_base + broker_id);
+					// [[CORFU_FIFO_FIX]] batch_seq still holds the seal-time global
+					// sequence here (queue_buffer.cc Seal) — the client's submission
+					// order across ALL brokers. Corfu's per-client FIFO contract comes
+					// from token acquisition order, so hold this batch's token request
+					// until every earlier-sealed batch has completed its grant. Without
+					// this gate the per-broker threads race their RPCs and the sequencer
+					// (whose expected_batch_seq is per (client,broker) stream) grants
+					// total_order in arrival order, permuting cross-broker submission
+					// order. Re-sent batches (ticket already advanced) pass immediately.
+					const size_t corfu_token_ticket = batch_header->batch_seq;
+					{
+						auto ticket_wait_log = std::chrono::steady_clock::now();
+						while (corfu_token_next_ticket_.load(std::memory_order_acquire) <
+						       corfu_token_ticket) {
+							std::this_thread::yield();
+							if (std::chrono::steady_clock::now() - ticket_wait_log >
+							    std::chrono::seconds(5)) {
+								LOG(WARNING) << "Corfu token ticket wait: ticket="
+								             << corfu_token_ticket << " next="
+								             << corfu_token_next_ticket_.load(std::memory_order_acquire)
+								             << " broker=" << broker_id;
+								ticket_wait_log = std::chrono::steady_clock::now();
+							}
+							if (shutdown_.load(std::memory_order_relaxed)) break;
+						}
+					}
 					if (broker_id >= 0 && broker_id < kMaxCorfuBrokers) {
 						// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker (Phase 2C).
 						// This ensures in-order delivery to the sequencer, eliminating UNAVAILABLE retries.
@@ -3532,6 +3558,15 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 							std::chrono::duration_cast<std::chrono::nanoseconds>(
 								std::chrono::steady_clock::now() - token_start).count(),
 							std::memory_order_relaxed);
+					}
+					// Advance the ticket even on failure so successors are not wedged
+					// behind a batch that is about to abort the run.
+					{
+						size_t expected = corfu_token_next_ticket_.load(std::memory_order_relaxed);
+						while (expected <= corfu_token_ticket &&
+						       !corfu_token_next_ticket_.compare_exchange_weak(
+						           expected, corfu_token_ticket + 1, std::memory_order_acq_rel)) {
+						}
 					}
 					if (!got_total_order) {
 						throw std::runtime_error("corfu sequencer GetTotalOrder failed");

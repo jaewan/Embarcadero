@@ -122,21 +122,24 @@ append contract. Its rows are emitted by the harness but must be labeled
 non-faithful for Pipe claims (or withheld), matching `Sec7`'s current
 footnote. Do not present harness-LazyLog Pipe as LazyLog.
 
-**Corfu labeling (measured 2026-07-15):** the harness's Corfu Pipe row shows
-rare cross-broker inversions (600 session reorders / 11 same-key / 8 final
-mismatches per 20K ops) — but this is a **port-fidelity gap, not a Corfu
-property**. The shared-publisher token path assigns `batch_seq` per broker at
-send time from parallel per-broker threads
-(`src/client/publisher.cc` `corfu_batch_seq_per_broker_`), and the
-sequencer's `expected_batch_seq` gate is keyed per `(client_id, broker_id)`
-(`src/cxl_manager/corfu_sequencer_service.cc` `AssignToken`); the client's
-monotone submit order is never transmitted. Real Corfu derives per-client
-FIFO from token *acquisition* order, which requires the client to request
-tokens in submission order — the deferred Track-03 forked-client work
-(`docs/baselines/fairness_appendix.md`). Until that lands, label the Corfu
-Pipe row non-faithful (or withhold it) exactly as with LazyLog; do NOT
-report "Corfu violates FIFO." Its Serialize row (stop-and-wait) is faithful
-and Valid=YES.
+**Corfu token FIFO (found 2026-07-15, FIXED 2026-07-16):** the harness's
+Corfu Pipe row originally showed rare cross-broker inversions (600 session
+reorders / 8 wrong finals per 20K ops) — a **port-fidelity gap, not a Corfu
+property**. Token requests were issued by parallel per-broker send threads
+with per-broker `batch_seq`, and the sequencer's `expected_batch_seq` gate is
+per `(client_id, broker_id)`, so cross-broker token grants followed RPC
+*arrival* order, not the client's submission order. Real Corfu derives
+per-client FIFO from token *acquisition* order. Fix (`[[CORFU_FIFO_FIX]]`,
+`src/client/publisher.{h,cc}`): each batch's seal-time global `batch_seq`
+(assigned in `queue_buffer.cc` Seal, i.e. submission order) is used as a
+token-issuance ticket — a batch's `GetTotalOrder` is held until every
+earlier-sealed batch's grant returns. Client-behavior-only: no message,
+protocol, or sequencer change (porting-rule §3.1 forbids adding fields), and
+token-before-write is preserved. Validated: CORFU Pipe Valid=YES with 0
+session/key reorders at 483K ops/s (down from the unfaithful 819K — the
+honest cost of serialized token acquisition; Embar Pipe 731K Valid=YES on the
+same run). Note: `throughput_test` CORFU cells inherit the faithful token
+serialization and may shift vs pre-fix numbers.
 
 **Embar ORDER=0 negative control (optional):** same binary with
 `--sequencer=EMBARCADERO --order=0`; session-FIFO Valid should fail or be
@@ -255,8 +258,9 @@ as a broken run.
       2794×, Corfu 1149 ≈ 681×, Embar 2001 ≈ 391×)
 - [x] Striped-Scalog Pipe outcome explained against `app:scalog-fifo`
       (session reorders + same-key inversions measured by the apply audit)
-- [ ] Corfu client token-order fidelity (Track-03 forked client) before a
-      faithful Corfu Pipe row can be claimed
+- [x] Corfu client token-order fidelity: `[[CORFU_FIFO_FIX]]` ordered token
+      stage; CORFU Pipe now Valid=YES, 0 reorders, 483K ops/s
+      (`build/results/smr_fifo_corfufix1`)
 - [ ] Paper-scale run (500K/500K, 3 trials) → numbers into `tab:kv-pipelined`
-      (only after Valid/FIFO contracts are honest for every system: LazyLog
-      binding-gated Pipe + Corfu token-race Pipe both labeled/withheld)
+      (remaining fidelity caveat: LazyLog binding-gated Pipe row must stay
+      labeled/withheld per Sec7)
