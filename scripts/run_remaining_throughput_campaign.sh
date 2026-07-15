@@ -39,10 +39,17 @@ sleep "$START_DELAY_SEC"
 # Retained artifacts must be built from an exact source snapshot.  Do not
 # paper over a collaborator's in-progress files with ALLOW_DIRTY_ARTIFACT.
 if [[ -n "$(git status --porcelain)" ]]; then
-    echo "ERROR: refusing campaign from dirty worktree; commit/stash unrelated work and reschedule." >&2
-    exit 1
+    if [[ "${ALLOW_DIRTY_CAMPAIGN:-0}" != "1" ]]; then
+        echo "ERROR: refusing campaign from dirty worktree; commit/stash unrelated work or set ALLOW_DIRTY_CAMPAIGN=1 for a developer-only run." >&2
+        exit 1
+    fi
+    echo "WARNING: dirty worktree accepted by ALLOW_DIRTY_CAMPAIGN=1; artifacts are developer-only." >&2
+    export ALLOW_DIRTY_ARTIFACT=1
 fi
 
+if [[ ! -f build/CMakeCache.txt ]]; then
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+fi
 cmake --build build -j"$(nproc)" --target embarlet throughput_test lazylog_metadata_replica
 
 # c4 was explicitly selected: this avoids modifying c1's colleague worktree
