@@ -1021,9 +1021,13 @@ void Topic::DelegationThread() {
 						}
 
 						msg_ptr->next_msg_diff = current_padded_size;
-						*reinterpret_cast<unsigned long long int*>(msg_ptr->segment_header) =
-							static_cast<unsigned long long int>(
-								reinterpret_cast<uint8_t*>(msg_ptr) - reinterpret_cast<uint8_t*>(msg_ptr->segment_header));
+						// Do NOT dereference msg_ptr->segment_header here. For contiguously
+						// packed v1 batch messages, msg_ptr - CACHELINE_SIZE is the PREVIOUS
+						// message's payload tail; the old backlink store
+						//   *(unsigned long long*)(msg_ptr->segment_header) = 64
+						// corrupted 8 payload bytes of every non-last message in a batch.
+						// The only readers of that word are dead #ifdef MULTISEGMENT blocks;
+						// live consumers navigate via next_msg_diff / paddedSize.
 						if (need_per_msg_flush) {
 							CXL::flush_cacheline(msg_ptr);
 							touched_message_headers = true;
