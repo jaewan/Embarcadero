@@ -94,9 +94,9 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "LazyLog baseline requires ORDER=2 (weak total order) in this implementation (got ORDER=" << order << ").";
         return -1;
     }
-    if (seq_type == heartbeat_system::SequencerType::LAZYLOG && ack_level == 2) {
-        LOG(ERROR) << "LazyLog ACK=2 is not implemented: metadata replicas protect the "
-                   << "ACK=1 append contract but do not provide a media-durable payload path.";
+    if (seq_type == heartbeat_system::SequencerType::LAZYLOG && ack_level == 2 &&
+        replication_factor < Embarcadero::kMinReplicationFactorForAck2) {
+        LOG(ERROR) << "LazyLog ACK=2 requires RF>=2 (primary plus a media-durable payload replica).";
         return -1;
     }
     if (seq_type == heartbeat_system::SequencerType::CORFU && ack_level == 2 &&

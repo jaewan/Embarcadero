@@ -1912,7 +1912,8 @@ void Topic::MaybeAdvanceLazyLogAppendVisibility() const {
 void Topic::RecordOrder0DurableBatch(uint64_t durable_sequence_key, uint32_t num_msg, uint32_t client_id) {
 	const bool uses_replication_done_durability =
 		(seq_type_ == EMBARCADERO && order_ == 0) ||
-		(seq_type_ == SCALOG && order_ == Embarcadero::kOrderPerBroker);
+		(seq_type_ == SCALOG && order_ == Embarcadero::kOrderPerBroker) ||
+		(seq_type_ == LAZYLOG && order_ == Embarcadero::kOrderTotal);
 	if (!uses_replication_done_durability || replication_factor_ <= 0 || num_msg == 0) {
 		return;
 	}
@@ -1933,7 +1934,8 @@ void Topic::RecordOrder0DurableBatch(uint64_t durable_sequence_key, uint32_t num
 void Topic::MaybeAdvanceOrder0DurableVisibility() const {
 	const bool uses_replication_done_durability =
 		(seq_type_ == EMBARCADERO && order_ == 0) ||
-		(seq_type_ == SCALOG && order_ == Embarcadero::kOrderPerBroker);
+		(seq_type_ == SCALOG && order_ == Embarcadero::kOrderPerBroker) ||
+		(seq_type_ == LAZYLOG && order_ == Embarcadero::kOrderTotal);
 	if (!uses_replication_done_durability || replication_factor_ <= 0) {
 		return;
 	}
@@ -2158,7 +2160,8 @@ bool Topic::SupportsPerClientAckLevel2Durable() const {
 	}
 	if (seq_type_ == LAZYLOG) {
 		return order_ == Embarcadero::kOrderTotal &&
-		       replication_factor_ > 0;
+		       replication_factor_ >= Embarcadero::kMinReplicationFactorForAck2 &&
+		       lazylog_metadata_replica_client_ != nullptr;
 	}
 	if (seq_type_ == SCALOG) {
 		return order_ == Embarcadero::kOrderPerBroker &&
@@ -2518,8 +2521,12 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 	if (!kCxlLazyLogMode) {
 		rep_offset = scalog_batch_offset_.fetch_add(batch_header.total_size, std::memory_order_relaxed);
 	}
+	const uint64_t durable_sequence_key = kCxlLazyLogMode
+		? scalog_durable_local_message_offset_.fetch_add(batch_header.num_msg,
+		                                                std::memory_order_relaxed)
+		: batch_header.start_logical_offset;
 
-	return [this, batch_header, log, rep_offset, kCxlLazyLogMode](void* /*log_ptr*/, size_t /*placeholder*/) {
+	return [this, batch_header, log, rep_offset, durable_sequence_key, kCxlLazyLogMode](void* /*log_ptr*/, size_t /*placeholder*/) {
 		bool data_replication_submitted = kCxlLazyLogMode;
 		if (!kCxlLazyLogMode && replication_factor_ > 0 && scalog_replication_client_) {
 			data_replication_submitted = scalog_replication_client_->ReplicateData(
@@ -2551,6 +2558,10 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 			return;
 		}
 		RecordLazyLogMetadataReplicaAck(batch_header.start_logical_offset,
+			batch_header.num_msg, batch_header.client_id);
+		// ACK2 is attributed only after metadata replication succeeds; the
+		// shared Scalog-style media frontier then gates this local prefix.
+		RecordOrder0DurableBatch(durable_sequence_key,
 			batch_header.num_msg, batch_header.client_id);
 	};
 }
