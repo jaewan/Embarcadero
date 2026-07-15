@@ -1909,7 +1909,7 @@ void Topic::MaybeAdvanceLazyLogAppendVisibility() const {
 	}
 }
 
-void Topic::RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num_msg, uint32_t client_id) {
+void Topic::RecordOrder0DurableBatch(uint64_t durable_sequence_key, uint32_t num_msg, uint32_t client_id) {
 	const bool uses_replication_done_durability =
 		(seq_type_ == EMBARCADERO && order_ == 0) ||
 		(seq_type_ == SCALOG && order_ == Embarcadero::kOrderPerBroker);
@@ -1917,11 +1917,11 @@ void Topic::RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num
 		return;
 	}
 	absl::MutexLock lock(&per_client_durable_mu_);
-	auto [it, inserted] = order0_durable_pending_.emplace(start_logical_offset,
+	auto [it, inserted] = order0_durable_pending_.emplace(durable_sequence_key,
 	                                                      std::make_pair(num_msg, client_id));
 	if (!inserted) {
 		if (it->second != std::make_pair(num_msg, client_id)) {
-			LOG(WARNING) << "ORDER0 durable pending duplicate/conflict start=" << start_logical_offset
+			LOG(WARNING) << "ORDER0 durable pending duplicate/conflict key=" << durable_sequence_key
 			             << " old_num_msg=" << it->second.first
 			             << " old_client=" << it->second.second
 			             << " new_num_msg=" << num_msg
@@ -1968,7 +1968,7 @@ void Topic::MaybeAdvanceOrder0DurableVisibility() const {
 	const uint64_t durable_frontier = min_replication_done + 1;
 	absl::MutexLock lock(&per_client_durable_mu_);
 	while (order0_durable_logical_count_ < durable_frontier) {
-		auto it = order0_durable_pending_.find(order0_durable_logical_count_);
+		auto it = order0_durable_pending_.find(order0_durable_next_sequence_key_);
 		if (it == order0_durable_pending_.end()) {
 			break;
 		}
@@ -1981,6 +1981,7 @@ void Topic::MaybeAdvanceOrder0DurableVisibility() const {
 
 		per_client_durable_[client_id] += num_msg;
 		order0_durable_logical_count_ = batch_end;
+		order0_durable_next_sequence_key_ += num_msg;
 		order0_durable_pending_.erase(it);
 	}
 }
@@ -2448,8 +2449,13 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
         rep_offset = scalog_batch_offset_.fetch_add(batch_header.total_size, std::memory_order_relaxed);
     }
 
+	const uint64_t durable_sequence_key = kCxlScalogMode
+		? scalog_durable_local_message_offset_.fetch_add(batch_header.num_msg,
+		                                                std::memory_order_relaxed)
+		: batch_header.start_logical_offset;
+
 	// Return replication callback
-	return [this, batch_header, log, rep_offset, kCxlScalogMode](void* log_ptr, size_t /*placeholder*/) {
+	return [this, batch_header, log, rep_offset, durable_sequence_key, kCxlScalogMode](void* log_ptr, size_t /*placeholder*/) {
 		bool data_replication_submitted = kCxlScalogMode;
 		// Handle replication if needed
 		if (!kCxlScalogMode && replication_factor_ > 0 && scalog_replication_client_) {
@@ -2464,7 +2470,7 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 			LOG(ERROR) << "Scalog data replication failed; not recording durable batch";
 			return;
 		}
-		RecordOrder0DurableBatch(batch_header.start_logical_offset,
+		RecordOrder0DurableBatch(durable_sequence_key,
 			batch_header.num_msg, batch_header.client_id);
 	};
 }

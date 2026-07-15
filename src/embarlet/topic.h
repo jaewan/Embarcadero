@@ -471,7 +471,9 @@ class Topic {
 		void RecordLazyLogMetadataReplicaAck(uint64_t start_logical_offset,
 				uint32_t num_msg, uint32_t client_id);
 		void MaybeAdvanceLazyLogAppendVisibility() const;
-		void RecordOrder0DurableBatch(uint64_t start_logical_offset, uint32_t num_msg, uint32_t client_id);
+		// `durable_sequence_key` is a broker-local message offset in the media
+		// stream whose prefix is tracked by the replica durability frontier.
+		void RecordOrder0DurableBatch(uint64_t durable_sequence_key, uint32_t num_msg, uint32_t client_id);
 		void MaybeAdvanceOrder0DurableVisibility() const;
 		uint64_t CurrentControlEpoch() const;
 
@@ -770,8 +772,14 @@ class Topic {
 		mutable absl::Mutex per_client_durable_mu_;
 		mutable absl::flat_hash_map<uint32_t, uint64_t> per_client_durable_ ABSL_GUARDED_BY(per_client_durable_mu_);
 		mutable uint64_t order0_durable_logical_count_ ABSL_GUARDED_BY(per_client_durable_mu_) = 0;
+		mutable uint64_t order0_durable_next_sequence_key_ ABSL_GUARDED_BY(per_client_durable_mu_) = 0;
 		mutable absl::btree_map<uint64_t, std::pair<uint32_t, uint32_t>> order0_durable_pending_
 			ABSL_GUARDED_BY(per_client_durable_mu_);
+		// SCALOG ORDER=1 reserves a shared CXL byte stream per broker.  This
+		// message offset is assigned at reservation time, so its order matches
+		// the durable media poller's prefix even when a client's global stream is
+		// striped across brokers.
+		std::atomic<uint64_t> scalog_durable_local_message_offset_{0};
 		void UpdatePerClientDurable(uint32_t client_id, uint64_t count);
 
 		// Metadata acknowledgements may arrive out of receive order.  The append
