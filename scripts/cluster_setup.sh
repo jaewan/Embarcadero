@@ -153,8 +153,13 @@ for host in "${CLIENT_NODES[@]}"; do
 set -euo pipefail
 cd "$REMOTE_ROOT"
 mkdir -p build
-# Reconfigure so newly synced sources/CMake match HEAD.
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/embar_client_cmake.log 2>&1
+# A client may have been configured against a different distro glog (or with
+# a local static-link override).  rsync preserves source mtimes, so merely
+# rebuilding can incorrectly retain objects compiled against that ABI.  Drop
+# the cache and clean this target before each native client rebuild.
+rm -f build/CMakeCache.txt
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS= >/tmp/embar_client_cmake.log 2>&1
+cmake --build build --target clean >/tmp/embar_client_clean.log 2>&1 || true
 cmake --build build -j"\$(nproc)" --target throughput_test
 test -x build/bin/throughput_test
 REMOTE_BUILD
