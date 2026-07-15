@@ -22,6 +22,7 @@
 #include <thread>
 #include <limits>
 #include <mutex>
+#include <condition_variable>
 #include <netdb.h>
 #include <numeric>
 #include <set>
@@ -2221,13 +2222,23 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 				}
 				return 120;
 			}();
+			// Join watchdog must wake promptly when PublishThreads finish.
+			// A previous 100ms sleep_for loop added ~100ms of artificial Poll()
+			// wall time on every healthy ORDER=5 ACK=1 run (seen as
+			// publisher_join_ms≈100 with ack_wait_ms=0), which cut short-run
+			// Bandwidth by ~11% on 4 GiB cells while Send-done matched ORDER=0.
 			std::atomic<bool> join_watchdog_stop{false};
 			std::atomic<bool> join_timed_out{false};
+			std::mutex join_watchdog_mu;
+			std::condition_variable join_watchdog_cv;
 			std::thread join_watchdog;
 			if (IsOrder5SessionMode() && ack_level_ >= 1) {
-				join_watchdog = std::thread([this, join_timeout_sec, &join_watchdog_stop, &join_timed_out]() {
+				join_watchdog = std::thread([this, join_timeout_sec, &join_watchdog_stop,
+				                            &join_timed_out, &join_watchdog_mu,
+				                            &join_watchdog_cv]() {
 					const auto deadline =
 						std::chrono::steady_clock::now() + std::chrono::seconds(join_timeout_sec);
+					std::unique_lock<std::mutex> lock(join_watchdog_mu);
 					while (!join_watchdog_stop.load(std::memory_order_relaxed)) {
 						if (std::chrono::steady_clock::now() >= deadline) {
 							join_timed_out.store(true, std::memory_order_release);
@@ -2238,9 +2249,9 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 							unacked_cv_.notify_all();
 							break;
 						}
-						for (int i = 0; i < 10 && !join_watchdog_stop.load(std::memory_order_relaxed); ++i) {
-							std::this_thread::sleep_for(std::chrono::milliseconds(100));
-						}
+						join_watchdog_cv.wait_until(lock, deadline, [&join_watchdog_stop]() {
+							return join_watchdog_stop.load(std::memory_order_relaxed);
+						});
 					}
 				});
 			}
@@ -2256,7 +2267,11 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			}
 			// Publisher thread not joinable (already joined or detached)
 		}
-			join_watchdog_stop.store(true, std::memory_order_relaxed);
+			{
+				std::lock_guard<std::mutex> lock(join_watchdog_mu);
+				join_watchdog_stop.store(true, std::memory_order_relaxed);
+			}
+			join_watchdog_cv.notify_all();
 			unacked_cv_.notify_all();
 			if (join_watchdog.joinable()) {
 				join_watchdog.join();

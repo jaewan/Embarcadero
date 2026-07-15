@@ -214,10 +214,22 @@ CLIENT_CONFIG_ABS="$PROJECT_ROOT/$CLIENT_CONFIG"
 # RF sweeps.  Keep the historical path as the default, but honour the same
 # OUT_BASE/BENCHMARK_TAG contract as the overnight harness so independent
 # cells never overwrite one another's evidence.
+# Resolve OUT_BASE without double-prefixing when the caller already passed an
+# absolute path (overnight sets OUT_BASE=$PROJECT_ROOT/data/...).
+resolve_project_path() {
+    local p="$1"
+    if [[ -z "$p" ]]; then
+        echo ""
+    elif [[ "$p" == /* ]]; then
+        echo "$p"
+    else
+        echo "$PROJECT_ROOT/$p"
+    fi
+}
 if [[ -n "${LOG_DIR:-}" ]]; then
     : # explicit caller choice wins
 elif [[ -n "${OUT_BASE:-}" && -n "${BENCHMARK_TAG:-}" ]]; then
-    LOG_DIR="$PROJECT_ROOT/$OUT_BASE/logs/$BENCHMARK_TAG"
+    LOG_DIR="$(resolve_project_path "$OUT_BASE")/logs/$BENCHMARK_TAG"
 else
     LOG_DIR="$PROJECT_ROOT/multiclient_logs"
 fi
@@ -2033,23 +2045,48 @@ ENDINNERSCRIPT
     echo ""
     echo "--- Trial $trial Results ---"
     total_bw_mbs=0
+    total_send_done_mbs=0
     for (( i=0; i<NUM_CLIENTS; i++ )); do
         host="${CLIENT_HOSTS[$i]}"
         client_tag="${CLIENT_TAGS[$i]:-$host}"
         log_file="$LOG_DIR/trial${trial}_${client_tag}.log"
-        bw_line=$(grep -i "bandwidth:" "$log_file" 2>/dev/null | tail -1 || echo "")
-        # glog prefix: "I0326 HH:MM:SS PID file:line] Bandwidth: VALUE UNIT"
-        # extract the number that follows "Bandwidth:" regardless of prefix fields
+        # Prefer the test_utils headline that includes Send-done. A later
+        # result_writer line ("Publish bandwidth: ...") would otherwise win via
+        # tail -1 and hide Send-done / unit parsing.
+        bw_line=$(grep -E '\] Bandwidth:.*Send-done:' "$log_file" 2>/dev/null | tail -1 || true)
+        if [[ -z "$bw_line" ]]; then
+            bw_line=$(grep -E '\] Bandwidth:' "$log_file" 2>/dev/null | tail -1 || echo "")
+        fi
         bw_val=$(echo "$bw_line" | grep -oiP 'bandwidth:\s*\K[0-9]+(\.[0-9]+)?' || true)
-        bw_unit=$(echo "$bw_line" | awk '{for(i=1;i<NF;i++) if($i=="Bandwidth:") {print $(i+2); exit}}' || true)
-        printf "  %-8s → %s %s\n" "$client_tag" "${bw_val:-N/A}" "${bw_unit:-}"
+        bw_unit=$(echo "$bw_line" | awk '{for(i=1;i<=NF;i++) if(tolower($i)=="bandwidth:") {print $(i+2); exit}}' || true)
+        sd_val=$(echo "$bw_line" | grep -oiP 'send-done:\s*\K[0-9]+(\.[0-9]+)?' || true)
+        poll_line=$(grep -F "[POLL_BREAKDOWN]" "$log_file" 2>/dev/null | tail -1 || echo "")
+        poll_join=$(echo "$poll_line" | grep -oiP 'publisher_join_ms=\K[0-9]+(\.[0-9]+)?' || true)
+        poll_ack=$(echo "$poll_line" | grep -oiP 'ack_wait_ms=\K[0-9]+(\.[0-9]+)?' || true)
+        if [[ -n "$sd_val" ]]; then
+            printf "  %-8s → %s %s  (Send-done %s %s" "$client_tag" "${bw_val:-N/A}" "${bw_unit:-}" "$sd_val" "${bw_unit:-MB/s}"
+            if [[ -n "$poll_join" || -n "$poll_ack" ]]; then
+                printf "; join=%sms ack_wait=%sms" "${poll_join:-?}" "${poll_ack:-?}"
+            fi
+            printf ")\n"
+        else
+            printf "  %-8s → %s %s\n" "$client_tag" "${bw_val:-N/A}" "${bw_unit:-}"
+        fi
         if [[ "$bw_val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             total_bw_mbs=$(awk "BEGIN {printf \"%.2f\", $total_bw_mbs + $bw_val}")
+        fi
+        if [[ "$sd_val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            total_send_done_mbs=$(awk "BEGIN {printf \"%.2f\", $total_send_done_mbs + $sd_val}")
         fi
     done
     total_gbs=$(awk "BEGIN {printf \"%.3f\", $total_bw_mbs / 1024}")
     echo "  ────────────────────────────────────────"
-    printf "  %-8s → %s MB/s  (%s GB/s)\n" "TOTAL" "$total_bw_mbs" "$total_gbs"
+    printf "  %-8s → %s MB/s  (%s GB/s)  [end-to-end incl. Poll]\n" "TOTAL" "$total_bw_mbs" "$total_gbs"
+    if awk "BEGIN {exit !($total_send_done_mbs > 0)}"; then
+        total_sd_gbs=$(awk "BEGIN {printf \"%.3f\", $total_send_done_mbs / 1024}")
+        printf "  %-8s → %s MB/s  (%s GB/s)  [excludes Poll; prefer for short ORDER=5 runs]\n" \
+            "SENDDONE" "$total_send_done_mbs" "$total_sd_gbs"
+    fi
     overlap_line="$(awk -F',' -v t="$trial" 'NR>1 && $1==t {print $0; exit}' "$OVERLAP_SUMMARY_CSV" || true)"
     if [[ -n "$overlap_line" ]]; then
         overlap_gbps="$(echo "$overlap_line" | awk -F',' '{print $2}')"
@@ -2077,8 +2114,10 @@ echo ""
 echo "================================================================"
 echo "  Grand Summary  (naive aggregate MB/s per trial)"
 echo "================================================================"
+printf "  %-10s %12s %12s %10s\n" "Trial" "Bandwidth" "Send-done" "GB/s(BW)"
 for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
     total=0
+    total_sd=0
     for (( i=0; i<NUM_CLIENTS; i++ )); do
         host="${CLIENT_HOSTS[$i]}"
         client_tag="$host"
@@ -2092,14 +2131,26 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
             client_tag="${host}${i}"
         fi
         log_file="$LOG_DIR/trial${trial}_${client_tag}.log"
-        bw=$(grep -i "bandwidth:" "$log_file" 2>/dev/null | tail -1 | grep -oiP 'bandwidth:\s*\K[0-9]+(\.[0-9]+)?' || true)
+        bw_line=$(grep -E '\] Bandwidth:.*Send-done:' "$log_file" 2>/dev/null | tail -1 || true)
+        if [[ -z "$bw_line" ]]; then
+            bw_line=$(grep -E '\] Bandwidth:' "$log_file" 2>/dev/null | tail -1 || echo "")
+        fi
+        bw=$(echo "$bw_line" | grep -oiP 'bandwidth:\s*\K[0-9]+(\.[0-9]+)?' || true)
+        sd=$(echo "$bw_line" | grep -oiP 'send-done:\s*\K[0-9]+(\.[0-9]+)?' || true)
         if [[ "$bw" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             total=$(awk "BEGIN {printf \"%.2f\", $total + $bw}")
         fi
+        if [[ "$sd" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            total_sd=$(awk "BEGIN {printf \"%.2f\", $total_sd + $sd}")
+        fi
     done
     gbs=$(awk "BEGIN {printf \"%.3f\", $total / 1024}")
-    printf "  Trial %-3d:  %9s MB/s   (%s GB/s)\n" "$trial" "$total" "$gbs"
+    printf "  Trial %-3d:  %9s  %9s  %8s\n" "$trial" "$total" "${total_sd:-n/a}" "$gbs"
 done
+echo "================================================================"
+echo "  Note: Bandwidth includes Poll(); Send-done excludes it."
+echo "  After the ORDER=5 join-watchdog fix, short runs should agree;"
+echo "  if they diverge, inspect [POLL_BREAKDOWN] publisher_join_ms."
 echo "================================================================"
 echo ""
 echo "  Logs: $LOG_DIR/"
