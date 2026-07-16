@@ -84,16 +84,18 @@ HOSTS_N3="${HOSTS_N3:-c4,c3,c1}"
 HOSTS_N4="${HOSTS_N4:-c4,c3,c1,local}"
 N_VALUES="${N_VALUES:-1 2 3 4}"
 
-# Cross-host RF=2: replica A on broker (moscxl, 10.10.10.10:50081),
-# replica B on c4 (mos182, 10.10.10.12:50082) — distinct failure domains.
-# lazylog_metadata_replica_contract.md requires separate failure domains for RF=2.
-# Both sidecar paths must be on local NVMe of each host, not shared storage.
-LAZYLOG_METADATA_HOST_A="${LAZYLOG_METADATA_HOST_A:-local}"      # local = broker itself
+# Cross-host RF=2: replica A on broker (moscxl) — distinct failure domains.
+# Replica B runs on c4 (mos182) but c4 only exposes port 22.
+# SSH local-port-forward tunnels broker:50082 → c4:127.0.0.1:50082 so broker
+# RPCs reach c4's replica without requiring direct port access.
+# Endpoints seen by embarlet brokers: 127.0.0.1:50081 (local A), 127.0.0.1:50082 (tunnel→B).
+LAZYLOG_METADATA_HOST_A="${LAZYLOG_METADATA_HOST_A:-local}"  # local = broker itself
 LAZYLOG_METADATA_HOST_B="${LAZYLOG_METADATA_HOST_B:-c4}"
 LAZYLOG_METADATA_PORT_A="${LAZYLOG_METADATA_PORT_A:-50081}"
 LAZYLOG_METADATA_PORT_B="${LAZYLOG_METADATA_PORT_B:-50082}"
-LAZYLOG_METADATA_IP_A="${LAZYLOG_METADATA_IP_A:-10.10.10.10}"
-LAZYLOG_METADATA_IP_B="${LAZYLOG_METADATA_IP_B:-10.10.10.12}"
+# Both endpoints use 127.0.0.1: A is local; B reaches c4 via SSH tunnel on the same port.
+LAZYLOG_METADATA_IP_A="${LAZYLOG_METADATA_IP_A:-127.0.0.1}"
+LAZYLOG_METADATA_IP_B="${LAZYLOG_METADATA_IP_B:-127.0.0.1}"
 LAZYLOG_RF2_METADATA_ENDPOINTS="${LAZYLOG_RF2_METADATA_ENDPOINTS:-${LAZYLOG_METADATA_IP_A}:${LAZYLOG_METADATA_PORT_A},${LAZYLOG_METADATA_IP_B}:${LAZYLOG_METADATA_PORT_B}}"
 
 # Exclusive campaign lock (does NOT wrap run_multiclient's flock).
@@ -411,10 +413,12 @@ cleanup_metadata() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    # Kill remote replica B on c4
+    # Kill remote replica B on c4 and close its SSH tunnel
     if [[ "$LAZYLOG_METADATA_HOST_B" != "local" ]]; then
         ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
             "pkill -f 'lazylog_metadata_replica.*${LAZYLOG_METADATA_PORT_B}' 2>/dev/null; true" 2>/dev/null || true
+        # Close any lingering tunnel for this port
+        pkill -f "ssh.*-L.*${LAZYLOG_METADATA_PORT_B}:127.0.0.1:${LAZYLOG_METADATA_PORT_B}.*${LAZYLOG_METADATA_HOST_B}" 2>/dev/null || true
     fi
 }
 trap cleanup_metadata EXIT INT TERM
@@ -457,24 +461,40 @@ start_lazylog_metadata() {
         # Verify remote binary exists
         ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
             "[[ -x '$remote_bin' ]]" 2>/dev/null || {
-            log "FATAL: $remote_bin not found on $LAZYLOG_METADATA_HOST_B — run: scp $replica_bin $LAZYLOG_METADATA_HOST_B:$remote_bin"
+            log "FATAL: $remote_bin not found on $LAZYLOG_METADATA_HOST_B"
+            log "  Fix: scp $replica_bin ${LAZYLOG_METADATA_HOST_B}:${remote_bin}"
             exit 1
         }
 
         # Kill any stale replica B on the remote host
         ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
             "pkill -f 'lazylog_metadata_replica.*${LAZYLOG_METADATA_PORT_B}' 2>/dev/null; true" 2>/dev/null || true
-        sleep 0.3
 
+        # Start replica B on c4, listening on loopback only (port not exposed externally)
         ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
             "mkdir -p '$remote_sidecar_dir' && setsid '$remote_bin' \
-             --listen '0.0.0.0:${LAZYLOG_METADATA_PORT_B}' \
+             --listen '127.0.0.1:${LAZYLOG_METADATA_PORT_B}' \
              --sidecar '$remote_sidecar' \
              >'$remote_log' 2>&1 </dev/null &" 2>/dev/null || {
             log "FATAL: failed to start replica B on $LAZYLOG_METADATA_HOST_B"
             exit 1
         }
-        log "Replica B started on $LAZYLOG_METADATA_HOST_B:${LAZYLOG_METADATA_PORT_B}"
+
+        # SSH local-port-forward: broker:PORT_B → c4:127.0.0.1:PORT_B
+        # This makes the replica reachable by broker RPCs without requiring a
+        # direct open port on c4.  -N: no remote command; -f: background.
+        ssh -o BatchMode=yes -o ExitOnForwardFailure=yes \
+            -L "${LAZYLOG_METADATA_PORT_B}:127.0.0.1:${LAZYLOG_METADATA_PORT_B}" \
+            -N -f "$LAZYLOG_METADATA_HOST_B" 2>/dev/null || {
+            log "FATAL: SSH tunnel to $LAZYLOG_METADATA_HOST_B:$LAZYLOG_METADATA_PORT_B failed"
+            exit 1
+        }
+        # Track the tunnel PID for cleanup
+        local tunnel_pid
+        tunnel_pid=$(pgrep -n -f "ssh.*-L.*${LAZYLOG_METADATA_PORT_B}:127.0.0.1:${LAZYLOG_METADATA_PORT_B}.*${LAZYLOG_METADATA_HOST_B}" 2>/dev/null || true)
+        [[ -n "$tunnel_pid" ]] && metadata_pids+=("$tunnel_pid")
+
+        log "Replica B started on $LAZYLOG_METADATA_HOST_B via SSH tunnel (:${LAZYLOG_METADATA_PORT_B})"
     fi
 
     # Wait for both replicas to be ready via TCP port check (readiness, not just liveness)

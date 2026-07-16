@@ -115,14 +115,25 @@ The script already sets `REQUIRE_FAITHFUL_LAZYLOG=1` and
 for all LazyLog cells (run_fig1_throughput_scaling.sh:500-508).
 
 > **Cross-host RF=2 deployment (publication-grade):**
-> Replica A runs on moscxl (broker, `10.10.10.10:50081`); replica B runs on
-> c4 (`10.10.10.12:50082`) via SSH.  Distinct physical machines = distinct
-> failure domains per `lazylog_metadata_replica_contract.md`.  Each sidecar
-> resides on local NVMe of its host.  `start_lazylog_metadata` in
-> `run_fig1_throughput_scaling.sh` handles remote startup and TCP readiness
-> checking (20-second timeout).  Fallback single-host mode is still available
-> via `LAZYLOG_METADATA_HOST_B=local` but produces results labeled
-> "same-host RF=2" and cannot support cross-host durability claims.
+> Replica A runs on moscxl (broker, `127.0.0.1:50081`, local process).
+> Replica B runs on c4 (mos182) via SSH, listening on `127.0.0.1:50082`
+> (loopback-only — c4's firewall exposes only port 22).  An SSH local-port
+> forward tunnels broker's `127.0.0.1:50082` → c4's `127.0.0.1:50082`, making
+> the replica reachable as if local.  Both endpoints in
+> `LAZYLOG_RF2_METADATA_ENDPOINTS` are `127.0.0.1:5008{1,2}`.
+>
+> Distinct physical machines = distinct failure domains.  A moscxl crash kills
+> replica A and its sidecar; c4 and replica B survive.  A c4 crash kills
+> replica B; moscxl and replica A survive.  Neither host going down loses both
+> replicas — the RF=2 durability claim holds across single-host failures.
+>
+> `start_lazylog_metadata` handles: remote binary check, remote stale-process
+> kill, remote replica launch, SSH tunnel setup, and 20-second TCP readiness
+> polling on both ports before returning.  `cleanup_metadata` kills both the
+> remote process (via SSH pkill) and the local tunnel process on exit.
+>
+> Fallback `LAZYLOG_METADATA_HOST_B=local` still available for quick local
+> testing with an explicit WARN log ("same-host RF=2, not cross-host durable").
 
 ---
 
