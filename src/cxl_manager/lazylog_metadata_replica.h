@@ -94,10 +94,22 @@ class LazyLogMetadataReplicaClient {
   size_t replica_count() const { return endpoints_.size(); }
 
  private:
+  struct ReplicaStub {
+    std::string endpoint;
+    std::shared_ptr<grpc::Channel> channel;
+    std::unique_ptr<lazylogmetadata::LazyLogMetadataReplica::Stub> stub;
+  };
+
+  // Reuse channels/stubs across appends. Creating a channel per AppendToAll
+  // previously dominated faithful LazyLog ACK bandwidth (~tens of MB/s).
+  void EnsureStubs() const;
+
   std::vector<std::string> endpoints_;
   std::chrono::milliseconds rpc_timeout_;
   uint32_t max_attempts_;
   std::chrono::milliseconds retry_backoff_;
+  mutable std::mutex stub_mu_;
+  mutable std::vector<ReplicaStub> stubs_;
 };
 
 }  // namespace LazyLog

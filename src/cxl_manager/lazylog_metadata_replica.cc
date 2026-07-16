@@ -283,39 +283,64 @@ LazyLogMetadataReplicaClient::LazyLogMetadataReplicaClient(
       max_attempts_(std::max<uint32_t>(1, max_attempts)),
       retry_backoff_(std::max(std::chrono::milliseconds::zero(), retry_backoff)) {}
 
+void LazyLogMetadataReplicaClient::EnsureStubs() const {
+  std::lock_guard<std::mutex> lock(stub_mu_);
+  if (stubs_.size() == endpoints_.size()) return;
+  stubs_.clear();
+  stubs_.reserve(endpoints_.size());
+  for (const auto& endpoint : endpoints_) {
+    ReplicaStub rs;
+    rs.endpoint = endpoint;
+    rs.channel = grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials());
+    rs.stub = lazylogmetadata::LazyLogMetadataReplica::NewStub(rs.channel);
+    stubs_.push_back(std::move(rs));
+  }
+}
+
 bool LazyLogMetadataReplicaClient::AppendToAll(
     const lazylogmetadata::MetadataAppendRequest& request, std::string* error) const {
   if (endpoints_.empty()) {
     if (error) *error = "no LazyLog metadata replica endpoints configured";
     return false;
   }
+  EnsureStubs();
+
+  // Snapshot stub pointers under lock so Append RPCs can run without holding
+  // stub_mu_ (channels are thread-safe; Stub calls are safe concurrently).
+  std::vector<ReplicaStub*> stub_ptrs;
+  {
+    std::lock_guard<std::mutex> lock(stub_mu_);
+    stub_ptrs.reserve(stubs_.size());
+    for (auto& stub : stubs_) stub_ptrs.push_back(&stub);
+  }
+
   std::vector<std::future<std::string>> calls;
-  calls.reserve(endpoints_.size());
-  for (const auto& endpoint : endpoints_) {
+  calls.reserve(stub_ptrs.size());
+  for (ReplicaStub* stub : stub_ptrs) {
     calls.emplace_back(std::async(std::launch::async,
-        [endpoint, &request, timeout = rpc_timeout_, attempts = max_attempts_,
+        [stub, &request, timeout = rpc_timeout_, attempts = max_attempts_,
          retry_backoff = retry_backoff_] {
       std::string last_failure;
       for (uint32_t attempt = 1; attempt <= attempts; ++attempt) {
-        auto channel = grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials());
-        auto stub = lazylogmetadata::LazyLogMetadataReplica::NewStub(channel);
         grpc::ClientContext context;
         context.set_deadline(std::chrono::system_clock::now() + timeout);
         lazylogmetadata::MetadataAppendResponse response;
-        const grpc::Status status = stub->AppendMetadata(&context, request, &response);
+        const grpc::Status status =
+            stub->stub->AppendMetadata(&context, request, &response);
         if (status.ok() && response.success()) return std::string{};
 
         // A conflicting immutable descriptor is a safety failure, not a transient
         // transport failure. Retrying it cannot repair the disagreement.
         if (status.ok()) {
-          return endpoint + ": " + response.error();
+          return stub->endpoint + ": " + response.error();
         }
-        last_failure = endpoint + ": " + status.error_message();
+        last_failure = stub->endpoint + ": " + status.error_message();
         if (attempt < attempts && retry_backoff > std::chrono::milliseconds::zero()) {
           std::this_thread::sleep_for(retry_backoff * attempt);
         }
       }
-      return last_failure.empty() ? endpoint + ": metadata append failed" : last_failure;
+      return last_failure.empty() ? stub->endpoint + ": metadata append failed"
+                                  : last_failure;
     }));
   }
   for (auto& call : calls) {

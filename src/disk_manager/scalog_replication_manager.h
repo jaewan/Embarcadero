@@ -47,6 +47,7 @@ private:
     std::unique_ptr<grpc::Server> server_;
     std::thread server_thread_;
     std::string base_dir_;
+    bool log_to_memory_{false};
     std::atomic<bool> shutdown_in_progress_{false};
 };
 

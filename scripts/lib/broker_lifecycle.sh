@@ -1040,6 +1040,23 @@ if [ "$sequence" = "CORFU" ] && [ "${replication_factor_cfg:-0}" -gt 1 ]; then
     exit 2
   fi
   cmd+=(--replicate_to_disk)
+elif { [ "$sequence" = "SCALOG" ] || [ "$sequence" = "LAZYLOG" ]; } && \
+     [ "${replication_factor_cfg:-0}" -gt 1 ]; then
+  case "${chain_replication_sink:-}" in
+    disk-durable|disk_durable)
+      if [ -z "$replica_disk_dirs" ] && [ -z "${EMBARCADERO_REPLICA_DISK_ROOT:-}" ]; then
+        echo "$sequence RF>1 disk-durable requires explicit replica disk directories" >&2
+        exit 2
+      fi
+      cmd+=(--replicate_to_disk)
+      ;;
+    memory-copy|memory_copy|mem-copy|memory-accounting|memory_accounting)
+      ;; # default replicate_to_memory
+    *)
+      echo "$sequence RF>1 requires EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable|memory-copy (got '${chain_replication_sink:-}')" >&2
+      exit 2
+      ;;
+  esac
 fi
 if [ "$sequence" != "CORFU" ] && command -v numactl >/dev/null 2>&1 && numactl --hardware 2>/dev/null | grep -q 'node 1'; then
   if numactl --hardware 2>/dev/null | grep -q 'node 2'; then

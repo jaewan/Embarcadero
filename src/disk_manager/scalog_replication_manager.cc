@@ -11,6 +11,8 @@
 #include <folly/MPMCQueue.h>
 
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -21,6 +23,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <shared_mutex>
 #include <condition_variable>
 #include <future>
@@ -37,6 +40,16 @@ namespace Scalog {
 	using scalogreplication::ScalogReplicationResponse;
 
 	namespace {
+		inline bool ShouldInvalidatePayloadBeforeRead() {
+			static const bool enabled = [] {
+				const char* env = std::getenv("EMBARCADERO_CXL_COHERENT");
+				if (!env || !env[0]) return true;  // default: non-coherent → invalidate
+				return !(env[0] == '1' || env[0] == 't' || env[0] == 'T' ||
+				         env[0] == 'y' || env[0] == 'Y');
+			}();
+			return enabled;
+		}
+
 		inline size_t LoadSharedSizeT(volatile size_t* ptr) {
 			Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
 				reinterpret_cast<const volatile void*>(ptr)));
@@ -49,6 +62,101 @@ namespace Scalog {
 				reinterpret_cast<const volatile void*>(hdr)));
 			Embarcadero::CXL::load_fence();
 		}
+
+		// Match Embar ChainReplicationManager: full-range invalidate before CXL→DRAM/disk copy.
+		inline void InvalidatePayloadBeforeCopy(const void* src, size_t len) {
+			if (!ShouldInvalidatePayloadBeforeRead() || src == nullptr || len == 0) return;
+			Embarcadero::CXL::invalidate_cache_range_for_read(src, len);
+			Embarcadero::CXL::load_fence();
+		}
+
+		// Match Embar disk amortization (EMBARCADERO_CHAIN_SYNC_BYTES / INTERVAL_MS).
+		inline size_t ScalogDiskSyncBytes() {
+			static const size_t v = [] {
+				const char* env = std::getenv("EMBARCADERO_CHAIN_SYNC_BYTES");
+				if (!env || !env[0]) return size_t{256UL * 1024UL * 1024UL};
+				char* end = nullptr;
+				unsigned long long parsed = std::strtoull(env, &end, 10);
+				if (end == env || parsed < 4096ULL) return size_t{256UL * 1024UL * 1024UL};
+				return static_cast<size_t>(parsed);
+			}();
+			return v;
+		}
+
+		inline uint64_t ScalogDiskSyncIntervalNs() {
+			static const uint64_t v = [] {
+				const char* env = std::getenv("EMBARCADERO_CHAIN_SYNC_INTERVAL_MS");
+				if (!env || !env[0]) return 250ULL * 1000ULL * 1000ULL;
+				char* end = nullptr;
+				unsigned long long ms = std::strtoull(env, &end, 10);
+				if (end == env || ms == 0) return 250ULL * 1000ULL * 1000ULL;
+				return ms * 1000ULL * 1000ULL;
+			}();
+			return v;
+		}
+
+		inline uint64_t SteadyNowNs() {
+			return static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count());
+		}
+
+		struct MemRingSink {
+			std::vector<uint8_t> data;
+			size_t write_pos{0};
+			void Copy(const void* src, size_t len) {
+				if (data.empty() || len == 0) return;
+				const size_t cap = data.size();
+				const uint8_t* bytes = static_cast<const uint8_t*>(src);
+				size_t pos = write_pos % cap;
+				if (len >= cap) {
+					std::memcpy(data.data(), bytes + (len - cap), cap);
+					write_pos += len;
+					return;
+				}
+				const size_t first = std::min(len, cap - pos);
+				std::memcpy(data.data() + pos, bytes, first);
+				if (first < len) {
+					std::memcpy(data.data(), bytes + first, len - first);
+				}
+				write_pos += len;
+			}
+		};
+
+		struct DiskSyncCursor {
+			size_t bytes_since_sync{0};
+			int64_t pending_msgs{0};
+			size_t pending_bytes{0};
+			size_t pending_rep_offset{0};
+			uint64_t last_sync_ns{0};
+			bool has_pending{false};
+
+			bool ShouldSync(bool force) const {
+				if (!has_pending) return false;
+				if (force) return true;
+				if (bytes_since_sync >= ScalogDiskSyncBytes()) return true;
+				const uint64_t now = SteadyNowNs();
+				return last_sync_ns == 0 || (now - last_sync_ns) >= ScalogDiskSyncIntervalNs();
+			}
+
+			void NoteWrite(size_t rep_offset, size_t nbytes, int64_t msgs) {
+				if (!has_pending) {
+					pending_rep_offset = rep_offset;
+					has_pending = true;
+				}
+				bytes_since_sync += nbytes;
+				pending_bytes += nbytes;
+				pending_msgs += msgs;
+			}
+
+			void ClearAfterSync() {
+				bytes_since_sync = 0;
+				pending_msgs = 0;
+				pending_bytes = 0;
+				last_sync_ns = SteadyNowNs();
+				has_pending = false;
+			}
+		};
 
 		bool WriteFullyAtOffset(int fd, const uint8_t* src, size_t total_bytes, off_t offset,
 		                        const char* context) {
@@ -188,12 +296,23 @@ namespace Scalog {
 		};
 		// --- End Write Task ---
 
+		// Defined early: ReplicaPollingLoop takes ReplicaPollingTask*.
+		struct ReplicaPollingTask {
+			int primary_broker_id = -1;
+			int fd = -1;
+			MemRingSink mem_ring;
+			std::atomic<int64_t> persisted_count{0};
+			std::thread polling_thread;
+			std::thread cut_thread;
+		};
+
 		public:
 		explicit ScalogReplicationServiceImpl(
 				std::string base_filename,
 				int broker_id,
 				std::string sequencer_ip,
-				int sequencer_port)
+				int sequencer_port,
+				bool log_to_memory)
 			: base_filename_(std::move(base_filename)),
 			broker_id_(broker_id),
 			running_(true),
@@ -201,14 +320,10 @@ namespace Scalog {
 			fd_(-1), // Initialize fd_
 			write_queue_(10240), // Queue size
 			local_epoch_(0),
-			replica_id_(1)
+			replica_id_(1),
+			log_to_memory_(log_to_memory)
 		{
 			local_cut_interval_ = std::chrono::microseconds(SCALOG_SEQ_LOCAL_CUT_INTERVAL);
-
-			if (!OpenOutputFile()) { // Acquires unique lock
-				throw std::runtime_error("Failed to open replication file: " + base_filename_);
-			}
-
 			local_cut_tracker_ = std::make_unique<LocalCutTracker>();
 
 			// Setup gRPC channel to sequencer (error handling recommended)
@@ -216,12 +331,27 @@ namespace Scalog {
 			std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(scalog_seq_address, grpc::InsecureChannelCredentials());
 			stub_ = ScalogSequencer::NewStub(channel); // Assuming this is the correct Stub type
 
-			VLOG(1) << "Starting writer threads...";
-			for (int i = 0; i < NUM_DISK_IO_THREADS; ++i) {
-				writer_threads_.emplace_back(&ScalogReplicationServiceImpl::WriterLoop, this);
+			if (log_to_memory_) {
+				// Match Embar memory-copy claim: per-source DRAM ring, no media fdatasync.
+				constexpr size_t kMemRingBytes = 256UL * 1024UL * 1024UL;
+				primary_mem_ring_.data.assign(kMemRingBytes, 0);
+				primary_mem_ring_.write_pos = 0;
+				LOG(INFO) << "ScalogReplicationService: memory-copy sink "
+				          << "(replicated_ack_emulated; per-source rings; no --replicate_to_disk)";
+			} else {
+				if (!OpenOutputFile()) { // Acquires unique lock
+					throw std::runtime_error("Failed to open replication file: " + base_filename_);
+				}
+				LOG(INFO) << "ScalogReplicationService: disk-durable sink "
+				          << "amortized_fdatasync sync_bytes=" << ScalogDiskSyncBytes()
+				          << " sync_interval_ns=" << ScalogDiskSyncIntervalNs();
+				VLOG(1) << "Starting writer threads...";
+				for (int i = 0; i < NUM_DISK_IO_THREADS; ++i) {
+					writer_threads_.emplace_back(&ScalogReplicationServiceImpl::WriterLoop, this);
+				}
+				VLOG(1) << "Starting fsync thread...";
+				fsync_thread_ = std::thread(&ScalogReplicationServiceImpl::FsyncLoop, this);
 			}
-			VLOG(1) << "Starting fsync thread...";
-			fsync_thread_ = std::thread(&ScalogReplicationServiceImpl::FsyncLoop, this);
 			// Note: send_local_cut_thread_ is started externally via StartSendLocalCutThread
 		}
 
@@ -374,21 +504,27 @@ namespace Scalog {
 				LOG(ERROR) << "StartReplicaPollingForPrimary: CXL info not set";
 				return;
 			}
-			int fd = open(file_path.c_str(), O_WRONLY | O_CREAT, 0644);
-			if (fd == -1) {
-				LOG(ERROR) << "StartReplicaPollingForPrimary: failed to open " << file_path
-				           << ": " << strerror(errno);
-				return;
-			}
 			auto task = std::make_unique<ReplicaPollingTask>();
 			task->primary_broker_id = primary_broker_id;
-			task->fd = fd;
+			if (log_to_memory_) {
+				constexpr size_t kMemRingBytes = 256UL * 1024UL * 1024UL;
+				task->mem_ring.data.assign(kMemRingBytes, 0);
+				task->mem_ring.write_pos = 0;
+				task->fd = -1;
+			} else {
+				task->fd = open(file_path.c_str(), O_WRONLY | O_CREAT, 0644);
+				if (task->fd == -1) {
+					LOG(ERROR) << "StartReplicaPollingForPrimary: failed to open " << file_path
+					           << ": " << strerror(errno);
+					return;
+				}
+			}
+			ReplicaPollingTask* raw = task.get();
 			task->polling_thread = std::thread(
-				&ScalogReplicationServiceImpl::ReplicaPollingLoop, this,
-				primary_broker_id, fd, std::ref(task->persisted_count));
+				&ScalogReplicationServiceImpl::ReplicaPollingLoop, this, raw);
 			task->cut_thread = std::thread(
 				&ScalogReplicationServiceImpl::SendReplicaCut, this,
-				primary_broker_id, replica_index, std::ref(task->persisted_count));
+				primary_broker_id, replica_index, std::ref(raw->persisted_count));
 			replica_polling_tasks_.push_back(std::move(task));
 		}
 
@@ -770,6 +906,27 @@ namespace Scalog {
 			Embarcadero::CXL::store_fence();
 		}
 
+		bool FlushDiskSyncCursor(int fd, DiskSyncCursor& sync, int64_t& persisted_count,
+		                         int target_broker_id, int source_broker_id,
+		                         bool track_local_cut, const char* context) {
+			if (!sync.has_pending) return true;
+			if (Embarcadero::DurableFdatasync(fd) == -1) {
+				LOG(ERROR) << context << ": amortized fdatasync failed: " << strerror(errno);
+				return false;
+			}
+			if (track_local_cut && local_cut_tracker_) {
+				local_cut_tracker_->recordWrite(sync.pending_rep_offset, sync.pending_bytes,
+				                                sync.pending_msgs);
+			}
+			persisted_count += sync.pending_msgs;
+			UpdateReplicationDone(target_broker_id, source_broker_id, persisted_count);
+			VLOG(1) << context << " durable frontier bytes=" << sync.pending_bytes
+			        << " messages=" << sync.pending_msgs
+			        << " persisted=" << persisted_count;
+			sync.ClearAfterSync();
+			return true;
+		}
+
 		void CXLPollingLoop() {
 			if (!cxl_addr_ || !tinode_) {
 				LOG(ERROR) << "CXLPollingLoop: cxl_addr or tinode not set";
@@ -779,6 +936,7 @@ namespace Scalog {
 			size_t last_cxl_offset = tinode_->offsets[broker_id_].log_offset;
 			size_t rep_offset = 0;
 			int64_t persisted_count = 0;
+			DiskSyncCursor disk_sync;
 			LOG(INFO) << "CXLPollingLoop: broker=" << broker_id_
 			          << " starting primary CXL replication"
 			          << " log_offset=" << last_cxl_offset
@@ -787,13 +945,21 @@ namespace Scalog {
 			while (running_.load()) {
 				size_t validated = LoadSharedSizeT(&tinode_->offsets[broker_id_].validated_written_byte_offset);
 				if (validated <= last_cxl_offset) {
+					if (!log_to_memory_ && disk_sync.ShouldSync(false)) {
+						std::shared_lock<std::shared_mutex> lock(file_state_mutex_);
+						if (fd_ != -1) {
+							if (!FlushDiskSyncCursor(fd_, disk_sync, persisted_count,
+							                         broker_id_, broker_id_, true, "CXLPollingLoop")) {
+								break;
+							}
+						}
+					}
 					Embarcadero::CXL::cpu_pause();
 					continue;
 				}
 
 				uint8_t* src = reinterpret_cast<uint8_t*>(cxl_addr_) + last_cxl_offset;
 				size_t chunk_size = validated - last_cxl_offset;
-				// Help this core see delegation-thread writes before parsing headers (CXL / weak ordering).
 				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(static_cast<const volatile void*>(src)));
 				Embarcadero::CXL::load_fence();
 
@@ -812,40 +978,37 @@ namespace Scalog {
 					ptr += hdr->next_msg_diff;
 				}
 				const size_t complete_bytes = static_cast<size_t>(ptr - src);
-				// Do not advance past a partially visible tail: jumping to `validated` without counting
-				// messages stalls replication_done / local cuts and leaves ACK=1 ordered short of published.
 				if (complete_bytes == 0) {
 					Embarcadero::CXL::cpu_pause();
 					continue;
 				}
 
-				bool durable = false;
-				{
+				InvalidatePayloadBeforeCopy(src, complete_bytes);
+				if (log_to_memory_) {
+					primary_mem_ring_.Copy(src, complete_bytes);
+					local_cut_tracker_->recordWrite(rep_offset, complete_bytes, msg_count);
+					persisted_count += msg_count;
+					UpdateReplicationDone(broker_id_, broker_id_, persisted_count);
+				} else {
 					std::shared_lock<std::shared_mutex> lock(file_state_mutex_);
-					if (fd_ != -1) {
-						if (!WriteFullyAtOffset(fd_, src, complete_bytes,
-						                        static_cast<off_t>(rep_offset),
-						                        "CXLPollingLoop")) {
+					if (fd_ == -1) {
+						LOG(ERROR) << "CXLPollingLoop: no valid fd for durable write";
+						break;
+					}
+					if (!WriteFullyAtOffset(fd_, src, complete_bytes,
+					                        static_cast<off_t>(rep_offset),
+					                        "CXLPollingLoop")) {
+						break;
+					}
+					disk_sync.NoteWrite(rep_offset, complete_bytes, msg_count);
+					if (disk_sync.ShouldSync(false)) {
+						if (!FlushDiskSyncCursor(fd_, disk_sync, persisted_count,
+						                         broker_id_, broker_id_, true, "CXLPollingLoop")) {
 							break;
 						}
-						if (Embarcadero::DurableFdatasync(fd_) == -1) {
-							LOG(ERROR) << "CXLPollingLoop: fdatasync failed: " << strerror(errno);
-							break;
-						}
-						durable = true;
 					}
 				}
-				if (!durable) {
-					LOG(ERROR) << "CXLPollingLoop: no valid fd for durable write";
-					break;
-				}
-				local_cut_tracker_->recordWrite(rep_offset, complete_bytes, msg_count);
-				persisted_count += msg_count;
-				UpdateReplicationDone(broker_id_, broker_id_, persisted_count);
-				VLOG(1) << "CXL primary durable frontier broker=" << broker_id_
-				        << " bytes=" << complete_bytes
-				        << " messages=" << msg_count
-				        << " persisted=" << persisted_count;
+
 				static auto last_log_time = std::chrono::steady_clock::now();
 				const auto now = std::chrono::steady_clock::now();
 				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 2000) {
@@ -855,25 +1018,33 @@ namespace Scalog {
 					          << " chunk_size=" << chunk_size
 					          << " complete_bytes=" << complete_bytes
 					          << " msg_count=" << msg_count
-					          << " persisted_count=" << persisted_count;
+					          << " persisted_count=" << persisted_count
+					          << " unsynced_bytes=" << disk_sync.bytes_since_sync;
 					last_log_time = now;
 				}
 
 				last_cxl_offset += complete_bytes;
 				rep_offset += complete_bytes;
 			}
+
+			// Drain final durability before exit.
+			if (!log_to_memory_ && disk_sync.has_pending) {
+				std::shared_lock<std::shared_mutex> lock(file_state_mutex_);
+				if (fd_ != -1) {
+					(void)FlushDiskSyncCursor(fd_, disk_sync, persisted_count,
+					                          broker_id_, broker_id_, true, "CXLPollingLoop-final");
+				}
+			}
 		}
 
-		void ReplicaPollingLoop(int primary_broker_id, int fd, std::atomic<int64_t>& persisted_count) {
-			if (!cxl_addr_ || !tinode_) {
-				LOG(ERROR) << "ReplicaPollingLoop: cxl_addr or tinode not set";
+		void ReplicaPollingLoop(ReplicaPollingTask* task) {
+			if (!task || !cxl_addr_ || !tinode_) {
+				LOG(ERROR) << "ReplicaPollingLoop: missing task/cxl/tinode";
 				return;
 			}
+			const int primary_broker_id = task->primary_broker_id;
+			int fd = task->fd;
 
-			// Wait for the primary broker to initialize its log_offset.
-			// On startup, the replica loop may be launched before the primary broker has
-			// joined the cluster and written its TInode offsets. log_offset == 0 means
-			// "not yet initialized" (real offsets are always > 0 due to CXL layout).
 			size_t primary_log_offset = 0;
 			while (running_.load()) {
 				primary_log_offset = LoadSharedSizeT(&tinode_->offsets[primary_broker_id].log_offset);
@@ -887,10 +1058,19 @@ namespace Scalog {
 			size_t last_cxl_offset = primary_log_offset;
 			size_t rep_offset = 0;
 			int64_t local_count = 0;
+			DiskSyncCursor disk_sync;
 
 			while (running_.load()) {
 				size_t validated = LoadSharedSizeT(&tinode_->offsets[primary_broker_id].validated_written_byte_offset);
 				if (validated <= last_cxl_offset) {
+					if (!log_to_memory_ && disk_sync.ShouldSync(false)) {
+						if (!FlushDiskSyncCursor(fd, disk_sync, local_count,
+						                         broker_id_, primary_broker_id, false,
+						                         ("ReplicaPollingLoop[" + std::to_string(primary_broker_id) + "]").c_str())) {
+							break;
+						}
+						task->persisted_count.store(local_count, std::memory_order_release);
+					}
 					Embarcadero::CXL::cpu_pause();
 					continue;
 				}
@@ -919,26 +1099,29 @@ namespace Scalog {
 					continue;
 				}
 
-				if (!WriteFullyAtOffset(fd, src, complete_bytes,
-				                        static_cast<off_t>(rep_offset),
-				                        ("ReplicaPollingLoop[" + std::to_string(primary_broker_id) + "]").c_str())) {
-					break;
-				}
-				if (Embarcadero::DurableFdatasync(fd) == -1) {
-					LOG(ERROR) << "ReplicaPollingLoop[" << primary_broker_id
-					           << "]: fdatasync failed: " << strerror(errno);
-					break;
+				InvalidatePayloadBeforeCopy(src, complete_bytes);
+				if (log_to_memory_) {
+					task->mem_ring.Copy(src, complete_bytes);
+					local_count += msg_count;
+					task->persisted_count.store(local_count, std::memory_order_release);
+					UpdateReplicationDone(broker_id_, primary_broker_id, local_count);
+				} else {
+					if (!WriteFullyAtOffset(fd, src, complete_bytes,
+					                        static_cast<off_t>(rep_offset),
+					                        ("ReplicaPollingLoop[" + std::to_string(primary_broker_id) + "]").c_str())) {
+						break;
+					}
+					disk_sync.NoteWrite(rep_offset, complete_bytes, msg_count);
+					if (disk_sync.ShouldSync(false)) {
+						if (!FlushDiskSyncCursor(fd, disk_sync, local_count,
+						                         broker_id_, primary_broker_id, false,
+						                         ("ReplicaPollingLoop[" + std::to_string(primary_broker_id) + "]").c_str())) {
+							break;
+						}
+						task->persisted_count.store(local_count, std::memory_order_release);
+					}
 				}
 
-				rep_offset += complete_bytes;
-				local_count += msg_count;
-				persisted_count.store(local_count, std::memory_order_release);
-				UpdateReplicationDone(broker_id_, primary_broker_id, local_count);
-				VLOG(1) << "CXL replica durable frontier local_broker=" << broker_id_
-				        << " primary_broker=" << primary_broker_id
-				        << " bytes=" << complete_bytes
-				        << " messages=" << msg_count
-				        << " persisted=" << local_count;
 				static thread_local auto last_log_time = std::chrono::steady_clock::now();
 				const auto now = std::chrono::steady_clock::now();
 				if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() >= 2000) {
@@ -949,10 +1132,19 @@ namespace Scalog {
 					          << " chunk_size=" << chunk_size
 					          << " complete_bytes=" << complete_bytes
 					          << " msg_count=" << msg_count
-					          << " persisted_count=" << local_count;
+					          << " persisted_count=" << local_count
+					          << " unsynced_bytes=" << disk_sync.bytes_since_sync;
 					last_log_time = now;
 				}
 				last_cxl_offset += complete_bytes;
+				rep_offset += complete_bytes;
+			}
+
+			if (!log_to_memory_ && disk_sync.has_pending) {
+				(void)FlushDiskSyncCursor(fd, disk_sync, local_count,
+				                          broker_id_, primary_broker_id, false,
+				                          ("ReplicaPollingLoop[" + std::to_string(primary_broker_id) + "]-final").c_str());
+				task->persisted_count.store(local_count, std::memory_order_release);
 			}
 		}
 
@@ -1042,14 +1234,9 @@ namespace Scalog {
 		void* cxl_addr_ = nullptr;
 		TInode* tinode_ = nullptr;
 		std::thread cxl_polling_thread_;
-		struct ReplicaPollingTask {
-			int primary_broker_id = -1;
-			int fd = -1;
-			std::atomic<int64_t> persisted_count{0};
-			std::thread polling_thread;
-			std::thread cut_thread;
-		};
 		std::vector<std::unique_ptr<ReplicaPollingTask>> replica_polling_tasks_;
+		bool log_to_memory_{false};
+		MemRingSink primary_mem_ring_;
 
 	}; // End class ScalogReplicationServiceImpl
 
@@ -1083,8 +1270,10 @@ namespace Scalog {
 				sequencer_ip.empty() ? std::string(SCALOG_SEQUENCER_IP) : sequencer_ip;
 			const int effective_sequencer_port =
 				(sequencer_port == 0) ? SCALOG_SEQ_PORT : sequencer_port;
+			log_to_memory_ = log_to_memory;
 			service_ = std::make_unique<ScalogReplicationServiceImpl>(
-				base_filename, broker_id, effective_sequencer_ip, effective_sequencer_port);
+				base_filename, broker_id, effective_sequencer_ip, effective_sequencer_port,
+				log_to_memory);
 
 			std::string server_address = address + ":" + (port.empty() ? std::to_string(SCALOG_REP_PORT) : port);
 
@@ -1137,8 +1326,11 @@ namespace Scalog {
 	void ScalogReplicationManager::StartReplicaPollingThread(
 			void* cxl_addr, TInode* tinode, int primary_broker_id, int replica_index) {
 		service_->SetCXLInfo(cxl_addr, tinode);
-		std::string file_path = base_dir_ + "scalog_replication_log" + std::to_string(primary_broker_id)
-			+ "_replica" + std::to_string(replica_index) + ".dat";
+		std::string file_path;
+		if (!log_to_memory_) {
+			file_path = base_dir_ + "scalog_replication_log" + std::to_string(primary_broker_id)
+				+ "_replica" + std::to_string(replica_index) + ".dat";
+		}
 		service_->StartReplicaPollingForPrimary(primary_broker_id, replica_index, file_path);
 	}
 

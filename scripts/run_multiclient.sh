@@ -155,8 +155,25 @@ CLIENT_EXTRA_ARGS=${CLIENT_EXTRA_ARGS:-}
 EMBARCADERO_ORDER0_FAST_PATH=${EMBARCADERO_ORDER0_FAST_PATH:-1}
 EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES=${EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES:-524288}
 EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE=${EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE:-1}
-EMBARCADERO_BATCH_SIZE=${EMBARCADERO_BATCH_SIZE:-524288}
 EMBARCADERO_CLIENT_PUB_BATCH_KB=${EMBARCADERO_CLIENT_PUB_BATCH_KB:-512}
+# Corfu's ordered durable path is per broker batch.  Leaving its legacy 512 KiB
+# default in place while the client already publishes 2 MiB batches creates four
+# independent token/RPC/fsync boundaries per publication for no semantic gain.
+# For the RF2+ ACK2 path, align the broker unit with the caller's declared
+# publication unit unless an experiment explicitly pins a different size.  This
+# changes neither message ordering nor the ACK2 media-durability boundary.
+if [[ -n "${EMBARCADERO_BATCH_SIZE+x}" ]]; then
+    EMBARCADERO_BATCH_SIZE="${EMBARCADERO_BATCH_SIZE}"
+elif [[ "$SEQUENCER" == "CORFU" && "$ACK" -ge 2 && "$REPLICATION_FACTOR" -ge 2 ]]; then
+    EMBARCADERO_BATCH_SIZE=$(( EMBARCADERO_CLIENT_PUB_BATCH_KB * 1024 ))
+else
+    EMBARCADERO_BATCH_SIZE=524288
+fi
+# Disk-durable Corfu batches these completed WriteOnce requests before one data
+# and one sidecar media sync. Each member remains unacknowledged until that
+# group sync succeeds; record the knobs in every artifact.
+EMBARCADERO_CORFU_GROUP_COMMIT_BYTES=${EMBARCADERO_CORFU_GROUP_COMMIT_BYTES:-4194304}
+EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US=${EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US:-1000}
 # ReqReceive threads bind 1:1 to live publish connections. Undersizing this
 # (historical default 4/8) permanently starves N*THREADS_PER_BROKER connects
 # per broker — the N=2 SessionOpen "storm" was mostly pool exhaustion.
@@ -450,10 +467,20 @@ elif [[ "$SEQUENCER" == "CORFU" && "$ACK" == "2" && "$REPLICATION_FACTOR" -ge 2 
     fi
 elif [[ "$SEQUENCER" == "SCALOG" && "$ACK" == "2" && "$REPLICATION_FACTOR" -ge 1 ]]; then
     # Scalog orders from local durable cuts, then ACK2 clamps that order to the
-    # minimum media-synced prefix across the configured replica set.
-    ACK_DURABILITY_CONTRACT="ack2_minimum_media_durable_replica_prefix"
+    # minimum synced prefix across the configured replica set.
+    if corfu_uses_memory_copy_sink; then
+        ACK_DURABILITY_CONTRACT="ack2_minimum_memory_copy_replica_prefix"
+    else
+        ACK_DURABILITY_CONTRACT="ack2_minimum_media_durable_replica_prefix"
+    fi
 elif [[ "$SEQUENCER" == "LAZYLOG" && "$ACK" == "2" && "$REPLICATION_FACTOR" -ge 1 ]]; then
-    ACK_DURABILITY_CONTRACT="ack2_minimum_media_durable_replica_prefix"
+    # Faithful LazyLog ACK2 also requires metadata AppendToAll (sidecar durable)
+    # before the Scalog-style data-plane min(replication_done) clamp.
+    if corfu_uses_memory_copy_sink; then
+        ACK_DURABILITY_CONTRACT="ack2_metadata_append_plus_minimum_memory_copy_replica_prefix"
+    else
+        ACK_DURABILITY_CONTRACT="ack2_metadata_append_plus_minimum_media_durable_replica_prefix"
+    fi
 fi
 
 # The metadata replicas are external services. Verify that every configured
@@ -1323,6 +1350,8 @@ start_brokers() {
     export EMBARCADERO_BASELINE_CONTROL_TRANSPORT="$CONTROL_TRANSPORT"
     export EMBARCADERO_CORFU_PROXY_PORT_BASE
     export EMBARCADERO_REPLICATION_FACTOR="$REPLICATION_FACTOR"
+    export EMBARCADERO_CORFU_GROUP_COMMIT_BYTES
+    export EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US
     export EMBARCADERO_HEAD_ADDR="$BROKER_IP"
     export EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
 	# One initial topic needs one CXL log segment per broker.  Ask the broker to
@@ -1360,6 +1389,35 @@ start_brokers() {
         fi
         export EMBARCADERO_CORFU_REPLICA_ENDPOINTS
         log "Corfu RF membership: $EMBARCADERO_CORFU_REPLICA_ENDPOINTS"
+    elif [[ "$REPLICATION_FACTOR" -gt 1 ]]; then
+        # Scalog/LazyLog honor --replicate_to_disk (DiskManager log_to_memory).
+        # Embar RF>1 uses ChainReplicationManager + CHAIN_REPLICATION_SINK env
+        # (no --replicate_to_disk required). Without --replicate_to_disk, Scalog
+        # previously wrote under /tmp for both "disk" and "mem" labeled cells.
+        local chain_sink="${EMBARCADERO_CHAIN_REPLICATION_SINK:-}"
+        case "$chain_sink" in
+            disk-durable|disk_durable)
+                if [[ -z "${EMBARCADERO_REPLICA_DISK_DIRS:-}" && -z "${EMBARCADERO_REPLICA_DISK_ROOT:-}" ]]; then
+                    echo "ERROR: RF>1 disk-durable requires EMBARCADERO_REPLICA_DISK_DIRS or ROOT" >&2
+                    START_BROKERS_FAILURE_REASON="config_missing_durable_replica_dir"
+                    return 1
+                fi
+                if [[ "$SEQUENCER" == "SCALOG" || "$SEQUENCER" == "LAZYLOG" ]]; then
+                    corfu_durability_args+=(--replicate_to_disk)
+                    log "Scalog/LazyLog RF>1 disk-durable: --replicate_to_disk (dirs=${EMBARCADERO_REPLICA_DISK_DIRS:-$EMBARCADERO_REPLICA_DISK_ROOT})"
+                fi
+                ;;
+            memory-copy|memory_copy|mem-copy|memory-accounting|memory_accounting)
+                log "RF>1 sink=$chain_sink: replicate_to_memory (no --replicate_to_disk)"
+                ;;
+            "")
+                if [[ "$SEQUENCER" == "SCALOG" || "$SEQUENCER" == "LAZYLOG" ]]; then
+                    echo "ERROR: $SEQUENCER RF>1 requires EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable|memory-copy" >&2
+                    START_BROKERS_FAILURE_REASON="config_missing_chain_sink"
+                    return 1
+                fi
+                ;;
+        esac
     fi
     export EMBARCADERO_ORDER0_FAST_PATH
     export EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES
@@ -1713,6 +1771,10 @@ printf "  %-32s %s\n" "PAYLOAD_SEND_CHUNK_BYTES:"      "$EMBARCADERO_PAYLOAD_SEN
 printf "  %-32s %s\n" "ENABLE_PAYLOAD_MSG_MORE:"       "$EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE"
 printf "  %-32s %s\n" "BATCH_SIZE:"                    "$EMBARCADERO_BATCH_SIZE"
 printf "  %-32s %s\n" "CLIENT_PUB_BATCH_KB:"           "$EMBARCADERO_CLIENT_PUB_BATCH_KB"
+if [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 ]]; then
+    printf "  %-32s %s\n" "CORFU_GROUP_COMMIT_BYTES:" "$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES"
+    printf "  %-32s %s\n" "CORFU_GROUP_COMMIT_DELAY_US:" "$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US"
+fi
 printf "  %-32s %s\n" "NETWORK_IO_THREADS:"            "$EMBARCADERO_NETWORK_IO_THREADS"
 printf "  %-32s %s\n" "CONTROL_TRANSPORT:"            "$CONTROL_TRANSPORT"
 printf "  %-32s %s\n" "ORDER5_HOME_BROKERS:"           "${EMBARCADERO_ORDER5_HOME_BROKERS:-"(unset)"}"
@@ -1769,8 +1831,8 @@ if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
     # as smoke-only, never as CXL mailbox measurements.
     MAILBOX_BACKING="pending_runtime_verification"
 fi
-echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
-echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
+echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,corfu_group_commit_bytes,corfu_group_commit_delay_us,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
+echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES,$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US,${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
 
 if ! lazylog_metadata_endpoints_ready; then
     exit 1
@@ -2188,13 +2250,28 @@ ENDINNERSCRIPT
 
     if [[ "$trial_success" -ne 1 ]]; then
         echo "ERROR: Trial $trial failed after $TRIAL_MAX_ATTEMPTS attempts." >&2
-        if ! awk -F',' -v t="$trial" '$1==t && $3=="success"{found=1} END{exit !found}' "$ATTEMPT_SUMMARY_CSV"; then
+        if awk -F',' -v t="$trial" '$1==t && $3=="success"{found=1} END{exit !found}' "$ATTEMPT_SUMMARY_CSV"; then
+            :
+        else
             echo "$trial,$TRIAL_MAX_ATTEMPTS,failed,max_attempts_exhausted" >> "$ATTEMPT_SUMMARY_CSV"
         fi
         overall_status=1
     fi
 
-    cleanup
+    # Teardown must not turn an already verified workload into a failed result
+    # merely because a best-effort remote reap returns a non-zero status.  The
+    # next cell is safe only if no broker listener remains, so check that
+    # concrete invariant and fail only when it is violated.
+    cleanup_rc=0
+    cleanup || cleanup_rc=$?
+    if [[ "$cleanup_rc" -ne 0 ]]; then
+        echo "WARNING: cleanup returned rc=$cleanup_rc after trial $trial; verifying broker ports." >&2
+        lingering_broker_pids="$(broker_local_listener_pids || true)"
+        if [[ -n "$lingering_broker_pids" ]]; then
+            echo "ERROR: cleanup left broker listener PID(s): $lingering_broker_pids" >&2
+            overall_status=1
+        fi
+    fi
 done
 
 # ---------------------------------------------------------------------------
