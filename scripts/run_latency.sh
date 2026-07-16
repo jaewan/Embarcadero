@@ -403,6 +403,25 @@ start_local_brokers() {
     sleep 1
   fi
 
+  # Corfu RF>1: auto-build replica membership map when not explicitly provided,
+  # mirroring the run_multiclient.sh pattern (ports match CorfuReplicationManager
+  # bind: base 50053 + broker_id).  Must run AFTER sequencer IP resolution above
+  # so BROKER_LISTEN_ADDR is the correct external IP for remote scenarios.
+  if [[ "$seq" == "CORFU" && "${REPLICATION_FACTOR:-0}" -gt 1 ]]; then
+    if [[ -z "${EMBARCADERO_CORFU_REPLICA_ENDPOINTS:-}" ]]; then
+      local _corfu_ep_ip="${BROKER_LISTEN_ADDR:-127.0.0.1}"
+      local _corfu_endpoints=""
+      for (( _ci=0; _ci<NUM_BROKERS; ++_ci )); do
+        _corfu_endpoints+="${_corfu_endpoints:+,}${_ci}@${_corfu_ep_ip}:$((50053 + _ci))"
+      done
+      export EMBARCADERO_CORFU_REPLICA_ENDPOINTS="$_corfu_endpoints"
+      unset _ci _corfu_endpoints _corfu_ep_ip
+      echo "Corfu RF>1: auto-built replica endpoints: $EMBARCADERO_CORFU_REPLICA_ENDPOINTS"
+    else
+      echo "Corfu RF>1: using provided replica endpoints: $EMBARCADERO_CORFU_REPLICA_ENDPOINTS"
+    fi
+  fi
+
   # For remote scenario the broker must bind to the external NIC so the remote client
   # can reach it.  EMBARCADERO_HEAD_ADDR overrides the default 127.0.0.1 listen address.
   local broker_env=""
@@ -455,6 +474,10 @@ start_local_brokers() {
   fi
   if [[ "$seq" == "LAZYLOG" && -n "$EMBARCADERO_LAZYLOG_SEQ_PORT" ]]; then
     broker_env+="EMBARCADERO_LAZYLOG_SEQ_PORT=$EMBARCADERO_LAZYLOG_SEQ_PORT "
+  fi
+  # Forward Corfu replica membership to embarlet so topic.cc can resolve the chain.
+  if [[ "$seq" == "CORFU" && -n "${EMBARCADERO_CORFU_REPLICA_ENDPOINTS:-}" ]]; then
+    broker_env+="EMBARCADERO_CORFU_REPLICA_ENDPOINTS=$EMBARCADERO_CORFU_REPLICA_ENDPOINTS "
   fi
   local -a launched_broker_pids=()
 
