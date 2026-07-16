@@ -1065,7 +1065,11 @@ void Topic::DelegationThread() {
 						logical_offset_++;
 					}
 					if (touched_message_headers) {
-						CXL::store_fence();
+						// [[FIX: CXL replica visibility]] MFENCE instead of SFENCE: ensures
+						// CLFLUSHOPTs for next_msg_diff are globally visible before
+						// validated_written_byte_offset is updated and seen by the
+						// ReplicaPollingLoop on remote brokers (non-coherent CXL 2.0).
+						CXL::full_fence();
 					}
 
 					if (order_ != 0) {
