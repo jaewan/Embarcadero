@@ -220,6 +220,23 @@ class ShardedKVStore {
 			return total;
 		}
 
+		// Order-independent digest of the full store contents. Two replicas that
+		// applied the same log converge to the same digest regardless of shard
+		// iteration order (commutative sum of per-pair mixed hashes).
+		uint64_t digest() const {
+			uint64_t sum = 0;
+			std::hash<std::string> h;
+			for (const auto& shard : shards) {
+				std::shared_lock<std::shared_mutex> lock(shard.mutex);
+				for (const auto& [k, v] : shard.data) {
+					uint64_t hk = h(k) * 0x9E3779B97F4A7C15ULL;
+					uint64_t hv = h(v) + 0x517CC1B727220A95ULL;
+					sum += hk ^ (hv * 0xBF58476D1CE4E5B9ULL);
+				}
+			}
+			return sum;
+		}
+
 		// Clear all data
 		void clear() {
 			for (auto& shard : shards) {
@@ -238,6 +255,10 @@ class DistributedKVStore {
 		std::atomic<uint64_t> last_applied_total_order_;
 		// Count of this client's published log entries that have been applied locally.
 		std::atomic<uint64_t> applied_local_ops_{0};
+		// Count of ALL applied log entries regardless of publisher. A
+		// subscriber-only replica has no client_id, so this is the only counter
+		// it can use to know it has consumed the full run.
+		std::atomic<uint64_t> applied_any_entries_{0};
 		absl::Mutex apply_mutex_;
 
 		// Thread pool for handling read operations
@@ -319,6 +340,10 @@ class DistributedKVStore {
 			bool manage_cluster = true;
 			bool track_latency = false;  // enable per-op latency tracking (adds mutex contention)
 			bool fifo_audit = false;     // track apply-order vs session-order divergence for "F|" values
+			// Replica mode: consume + apply only. No publisher is created (put()
+			// and friends must not be called) and the topic is expected to exist.
+			bool subscriber_only = false;
+			bool create_topic = true;    // set false when joining an existing topic
 		};
 
 		explicit DistributedKVStore(const Config& config);
@@ -368,6 +393,11 @@ class DistributedKVStore {
 		uint64_t getAppliedLocalOpCount() const {
 			return applied_local_ops_.load(std::memory_order_acquire);
 		}
+		uint64_t getAppliedAnyEntryCount() const {
+			return applied_any_entries_.load(std::memory_order_acquire);
+		}
+		// Order-independent digest of the current KV state (replica convergence).
+		uint64_t stateDigest() const { return kv_store_.digest(); }
 
 		// Local read with no log-sync barrier. Only meaningful after
 		// waitForSyncWithLog() has confirmed all published ops are applied

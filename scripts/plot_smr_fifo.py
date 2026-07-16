@@ -69,7 +69,7 @@ def make_markdown(agg):
         "|--------|------|-------------:|------|---------:|-------|",
     ]
     for seq in SYSTEM_ORDER:
-        for mode in ("pipe", "serialize"):
+        for mode in ("pipe", "sticky", "serialize"):
             a = agg.get((seq, mode))
             if a is None:
                 continue

@@ -48,8 +48,9 @@ export EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-0}"
 KV_BENCH_REMOVE_STALE_KVBASE_SHM="${KV_BENCH_REMOVE_STALE_KVBASE_SHM:-1}"
 kv_bench_unlink_kvbase_shm() {
   [[ "${KV_BENCH_REMOVE_STALE_KVBASE_SHM}" == "1" ]] || return 0
+  # Only this driver's segments: a wildcard /dev/shm/CXL_* rm unlinks segments
+  # belonging to concurrently running harnesses (moscxl is a shared box).
   rm -f /dev/shm/CXL_KVBASE_"${UID}"_* 2>/dev/null || true
-  rm -f /dev/shm/CXL_* 2>/dev/null || true
 }
 
 BROKER_READY_TIMEOUT_SEC="${BROKER_READY_TIMEOUT_SEC:-120}"
@@ -159,7 +160,11 @@ start_cluster() {
   sleep "${BROKER_READY_PROPAGATION_SEC:-4}"
 }
 
-cleanup() { broker_local_cleanup; }
+# Only clean up on ABNORMAL exit: broker_local_cleanup kills embarlet/sequencer
+# processes host-wide by name, so a trap firing after a normal run (each config
+# already cleaned up) can kill a cluster a newer driver invocation just started.
+DRIVER_DONE=0
+cleanup() { [[ "$DRIVER_DONE" == 1 ]] || broker_local_cleanup; }
 trap cleanup EXIT
 
 BENCH_COMMON_BASE=(
@@ -267,6 +272,7 @@ if [[ "$KV_BENCH_RUN_FIFO_COMPARISON" == "1" ]]; then
   done
 fi
 
+DRIVER_DONE=1
 echo ""
 echo "Done. Results under $OUT_ROOT"
 ls -la "$OUT_ROOT"

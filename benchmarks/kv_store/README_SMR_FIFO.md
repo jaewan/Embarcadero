@@ -1,5 +1,9 @@
 # SMR-FIFO End-to-End Eval (Paper Q3 → `tab:kv-pipelined`)
 
+> Umbrella plan (full e2e suite E1–E8, claim ledger, expected results, paper
+> update map): `docs/experiments/E2E_KV_SMR_EVAL_PLAN.md`. This file is the
+> mechanics/runbook for E1 (the session-FIFO matrix).
+
 Design + runbook for the end-to-end replicated-state-machine eval over the
 shared log: Embarcadero (`ORDER=5`) vs the in-tree CXL baselines (Scalog,
 Corfu, LazyLog). This is **not** a bulk-append GB/s benchmark; it exists to
@@ -220,7 +224,25 @@ bash benchmarks/kv_store/run_smr_fifo_eval.sh
 SMR_FIFO_SEQUENCERS="EMBARCADERO SCALOG" SMR_FIFO_NUM_TRIALS=1 \
 SMR_FIFO_RECORD_COUNT=20000 SMR_FIFO_OPERATION_COUNT=20000 \
 SMR_FIFO_WARMUP_OPS=2000 bash benchmarks/kv_store/run_smr_fifo_eval.sh
+
+# Sticky control (E2): single broker = FIFO by forfeiting striping
+SMR_FIFO_MODES="pipe sticky" bash benchmarks/kv_store/run_smr_fifo_eval.sh
+
+# Replica convergence (E4): N subscriber-only replicas; digests must match
+SMR_FIFO_REPLICAS=2 bash benchmarks/kv_store/run_smr_fifo_eval.sh
+
+# Concurrent sessions (E6): disjoint keyspaces, per-session FIFO validation
+SMR_FIFO_SESSIONS=2 bash benchmarks/kv_store/run_smr_fifo_eval.sh
 ```
+
+Additional knobs: `KV_BENCH_LOAD_SYNC_EVERY` (load-phase barrier cadence;
+default 64 semi-serializes a 500K load on slow-apply systems — raise for
+paper-scale Scalog), `BENCH_TIMEOUT_SCALOG` (default 3600s). Multi-process
+runs set `--manage_cluster=0` on every bench process automatically (the
+driver tears the cluster down); the session-FIFO audit is session-scoped
+(`client_id == server_id_`), and per-session keyspaces come from
+`--key_offset` with the store-size check waived via `--shared_topic`
+(own-range completeness is still enforced by the validation sweep).
 
 Outputs land in `build/results/smr_fifo_<ts>/`: per-run dirs + logs,
 aggregated `summary.csv`, `paper_snippet.md`, and the two PDFs.

@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -141,6 +142,15 @@ struct BenchConfig {
 	// client submitted for it (session FIFO), verified byte-for-byte.
 	bool fifo_valid = false;
 	std::string fifo_mode = "auto";   // native|token_order|stop_and_wait|sticky|none|auto
+
+	// Multi-process experiments (E4 replicas / E6 sessions):
+	bool manage_cluster = true;       // exactly one process may terminate the cluster
+	bool shared_topic = false;        // other sessions also write this topic (skip store-size check)
+	uint64_t key_offset = 0;          // disjoint keyspace per concurrent session (fifo mode)
+	bool replica = false;             // subscriber-only convergence replica
+	uint64_t expected_entries = 0;    // replica: total log entries to wait for
+	int replica_timeout_sec = 300;    // replica: max wait for expected_entries
+	std::string digest_out = "";      // replica: write "digest=<hex> applied=<n>" here
 };
 
 // FIFO value layout (fixed 32-byte prefix, padded to value_size):
@@ -318,6 +328,71 @@ bool waitForBarrier(DistributedKVStore& store, const BenchConfig& cfg, size_t pe
 	return false;
 }
 
+// Subscriber-only convergence replica (plan E4): join an existing topic,
+// apply the log, wait for the expected entry count, emit a state digest.
+// Convergence = identical digests across the publisher process and every
+// replica once all have applied the same entry count.
+bool runReplica(BenchConfig& cfg) {
+	if (cfg.expected_entries == 0) {
+		// Otherwise the wait loop's condition (applied < 0) is never true and
+		// the replica reports complete=YES with the digest of an empty store —
+		// a vacuous pass that validates nothing (e.g. an unset/miscomputed
+		// driver-side expected_entries).
+		LOG(ERROR) << "--expected_entries=0 (or unset): refusing to report a "
+		              "vacuous convergence pass";
+		return false;
+	}
+	SequencerType seq_type = parseSequencerType(cfg.sequencer);
+	DistributedKVStore::Config kv_cfg;
+	kv_cfg.seq_type = seq_type;
+	kv_cfg.order = cfg.order;
+	kv_cfg.ack_level = cfg.ack;
+	kv_cfg.replication_factor = cfg.rf;
+	kv_cfg.broker_ip = cfg.broker_ip;
+	kv_cfg.manage_cluster = false;
+	kv_cfg.subscriber_only = true;
+	kv_cfg.create_topic = false;
+
+	LOG(INFO) << "Replica: " << cfg.sequencer << " order=" << cfg.order
+	          << " expecting " << cfg.expected_entries << " entries"
+	          << " (timeout " << cfg.replica_timeout_sec << "s)";
+	DistributedKVStore store(kv_cfg);
+
+	const auto deadline = std::chrono::steady_clock::now() +
+	                      std::chrono::seconds(cfg.replica_timeout_sec);
+	auto last_log = std::chrono::steady_clock::now();
+	uint64_t applied = 0;
+	while ((applied = store.getAppliedAnyEntryCount()) < cfg.expected_entries) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		auto now = std::chrono::steady_clock::now();
+		if (now - last_log >= std::chrono::seconds(5)) {
+			LOG(INFO) << "Replica progress: applied=" << applied << "/"
+			          << cfg.expected_entries;
+			last_log = now;
+		}
+		if (now > deadline) {
+			LOG(ERROR) << "Replica TIMEOUT: applied=" << applied << "/"
+			           << cfg.expected_entries;
+			break;
+		}
+	}
+	const uint64_t digest = store.stateDigest();
+	const size_t store_size = store.storeSize();
+	const bool complete = (applied >= cfg.expected_entries);
+	LOG(INFO) << "Replica done: applied=" << applied
+	          << " store_size=" << store_size
+	          << " digest=" << std::hex << digest << std::dec
+	          << " complete=" << (complete ? "YES" : "NO");
+	if (!cfg.digest_out.empty()) {
+		std::ofstream f(cfg.digest_out);
+		f << "digest=" << std::hex << digest << std::dec
+		  << " applied=" << applied
+		  << " store_size=" << store_size
+		  << " complete=" << (complete ? 1 : 0) << "\n";
+	}
+	return complete;
+}
+
 bool runBenchmark(BenchConfig& cfg) {
 	if (cfg.run_id == "auto") cfg.run_id = generateRunId();
 	if (cfg.order < 0) cfg.order = orderForSequencer(cfg.sequencer);
@@ -334,6 +409,12 @@ bool runBenchmark(BenchConfig& cfg) {
 			LOG(WARNING) << "fifo_valid forces value_size=32 (was " << cfg.value_size << ")";
 			cfg.value_size = 32;
 		}
+	}
+	if (cfg.key_offset > 0 && !cfg.fifo_valid) {
+		// scan()/sampleKey wrap keys modulo record_count from a zero base; an
+		// offset silently breaks those paths, so only the fifo workload supports it.
+		LOG(ERROR) << "--key_offset requires --fifo_valid";
+		return false;
 	}
 
 	// Normalize workload label for run_dir naming
@@ -388,7 +469,7 @@ bool runBenchmark(BenchConfig& cfg) {
 	kv_cfg.publisher_threads = cfg.pub_threads;
 	kv_cfg.publisher_message_size = cfg.pub_msg_size;
 	kv_cfg.broker_ip = cfg.broker_ip;
-	kv_cfg.manage_cluster = true;
+	kv_cfg.manage_cluster = cfg.manage_cluster;
 	kv_cfg.track_latency = cfg.latency;
 	kv_cfg.fifo_audit = cfg.fifo_valid;
 
@@ -406,8 +487,28 @@ bool runBenchmark(BenchConfig& cfg) {
 	// Pipeline inserts with periodic barriers. A single end-of-load sync can stall on ORDER=5
 	// when the publisher outruns the subscriber/log-apply path (bounded CXL / broker batching).
 	// Tighter sync helps SCALOG / slow-apply paths keep up with the publisher during load.
-	const uint64_t kLoadSyncEvery =
-	    (cfg.record_count > 256 && cfg.batch_size <= 4) ? 64u : UINT64_MAX;
+	// KV_BENCH_LOAD_SYNC_EVERY overrides: every barrier costs one apply round-trip, so 64
+	// semi-serializes a 500K-key load on slow-apply systems (~8K barriers).
+	const uint64_t kLoadSyncEvery = [&]() -> uint64_t {
+		if (const char* v = getenv("KV_BENCH_LOAD_SYNC_EVERY")) {
+			// atoll() silently maps any non-numeric garbage to 0, which this
+			// code maps to "disable barriers" — exactly the slow-apply load
+			// stall the default of 64 exists to prevent, with no signal that
+			// the override was misparsed rather than intentionally 0.
+			std::string s(v);
+			bool all_digits = !s.empty() &&
+				std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c); });
+			if (!all_digits) {
+				LOG(ERROR) << "KV_BENCH_LOAD_SYNC_EVERY='" << v
+				           << "' is not a non-negative integer; ignoring override";
+			} else {
+				const long long n = atoll(v);
+				if (n > 0) return static_cast<uint64_t>(n);
+				return UINT64_MAX;  // 0 = end-of-load sync only
+			}
+		}
+		return (cfg.record_count > 256 && cfg.batch_size <= 4) ? 64u : UINT64_MAX;
+	}();
 	LOG(INFO) << "Loading " << cfg.record_count << " records (pipelined, sync_every="
 	          << (kLoadSyncEvery == UINT64_MAX ? 0 : kLoadSyncEvery) << ")...";
 	auto load_t0 = std::chrono::steady_clock::now();
@@ -420,7 +521,7 @@ bool runBenchmark(BenchConfig& cfg) {
 		std::vector<KeyValue> batch;
 		batch.reserve(end - i);
 		for (uint64_t j = i; j < end; j++) {
-			batch.push_back({makeKey(j), template_value});
+			batch.push_back({makeKey(cfg.key_offset + j), template_value});
 		}
 		last_opid = store.multiPut(batch);
 		load_entries++;
@@ -448,7 +549,7 @@ bool runBenchmark(BenchConfig& cfg) {
 		std::uniform_int_distribution<uint64_t> wu_key_dist(0, cfg.record_count - 1);
 		uint64_t warmup_entries = 0;
 		for (uint64_t i = 0; i < cfg.warmup_ops; i++) {
-			last_opid = store.put(makeKey(wu_key_dist(rng)), template_value);
+			last_opid = store.put(makeKey(cfg.key_offset + wu_key_dist(rng)), template_value);
 			warmup_entries++;
 		}
 		store.waitForSyncWithLog(last_opid);
@@ -544,16 +645,17 @@ bool runBenchmark(BenchConfig& cfg) {
 	if (cfg.fifo_valid) {
 		while (i < cfg.operation_count) {
 			uint64_t key_id = rng() % cfg.record_count;
+			const uint64_t global_key = cfg.key_offset + key_id;
 			++fifo_version_counter;
-			std::string value = makeFifoValue(key_id, fifo_version_counter, cfg.value_size);
+			std::string value = makeFifoValue(global_key, fifo_version_counter, cfg.value_size);
 			if (cfg.latency) {
 				auto t0 = std::chrono::steady_clock::now();
-				pending_opid = store.put(makeKey(key_id), value);
+				pending_opid = store.put(makeKey(global_key), value);
 				auto t1 = std::chrono::steady_clock::now();
 				write_latencies_us.push_back(
 					std::chrono::duration<double, std::micro>(t1 - t0).count());
 			} else {
-				pending_opid = store.put(makeKey(key_id), value);
+				pending_opid = store.put(makeKey(global_key), value);
 			}
 			fifo_last_version[key_id] = fifo_version_counter;
 			run_write_entries++;
@@ -757,7 +859,12 @@ bool runBenchmark(BenchConfig& cfg) {
 		fail_check("sync_barrier_timeout");
 	}
 	// Workload E inserts new keys beyond record_count, so store may be larger.
-	if (!is_workload_E && cfg.record_count > 0 && final_store_size != cfg.record_count) {
+	// With concurrent sessions on a shared topic, every process applies every
+	// session's keys, so exact store size is not a per-session criterion; own-range
+	// completeness is still enforced by the fifo validation sweep (a missing key
+	// reads back "" and fails its value check).
+	if (!is_workload_E && !cfg.shared_topic &&
+	    cfg.record_count > 0 && final_store_size != cfg.record_count) {
 		LOG(ERROR) << "VERIFICATION FAILED: store_size=" << final_store_size
 		           << " expected=" << cfg.record_count;
 		fail_check("store_size");
@@ -777,12 +884,13 @@ bool runBenchmark(BenchConfig& cfg) {
 	uint64_t fifo_session_reorders = 0, fifo_key_reorders = 0;
 	if (cfg.fifo_valid && !run_aborted) {
 		for (uint64_t k = 0; k < cfg.record_count; ++k) {
-			std::string got = store.getLocal(makeKey(k));
+			const uint64_t gk = cfg.key_offset + k;
+			std::string got = store.getLocal(makeKey(gk));
 			if (fifo_last_version[k] != 0) {
 				fifo_overwritten_keys++;
-				if (got != makeFifoValue(k, fifo_last_version[k], cfg.value_size)) {
+				if (got != makeFifoValue(gk, fifo_last_version[k], cfg.value_size)) {
 					if (fifo_final_mismatch < 5) {
-						LOG(ERROR) << "FIFO MISMATCH key=" << makeKey(k)
+						LOG(ERROR) << "FIFO MISMATCH key=" << makeKey(gk)
 						           << " expected_version=" << fifo_last_version[k]
 						           << " got=" << got.substr(0, std::min<size_t>(got.size(), 32));
 					}
@@ -799,7 +907,7 @@ bool runBenchmark(BenchConfig& cfg) {
 						snprintf(hx, sizeof(hx), "%02x ", static_cast<unsigned char>(got[j]));
 						tail_hex += hx;
 					}
-					LOG(ERROR) << "UNTOUCHED MISMATCH key=" << makeKey(k)
+					LOG(ERROR) << "UNTOUCHED MISMATCH key=" << makeKey(gk)
 					           << " got_size=" << got.size()
 					           << " first_diff_at=" << d
 					           << " got_tail_hex=[" << tail_hex << "]"
@@ -820,6 +928,19 @@ bool runBenchmark(BenchConfig& cfg) {
 		          << " key_reorders=" << fifo_key_reorders;
 	} else if (cfg.fifo_valid) {
 		fail_check("run_aborted_before_validation");
+	}
+	// Convergence anchor for E4 replicas: replicas that applied the same entry
+	// count must report this same digest. With --shared_topic, this process's
+	// own final barrier only guarantees ITS OWN writes are applied — other
+	// concurrent sessions' entries may still be in flight, so a digest taken
+	// here would be a racy, non-reproducible snapshot. Leave it 0 (not
+	// meaningful) in that mode; cross-process convergence in shared-topic
+	// runs is checked via replicas, which wait for the combined total.
+	uint64_t state_digest = 0;
+	if (cfg.fifo_valid && !cfg.shared_topic) {
+		state_digest = store.stateDigest();
+		LOG(INFO) << "State digest: " << std::hex << state_digest << std::dec
+		          << " (applied_any=" << store.getAppliedAnyEntryCount() << ")";
 	}
 	if (run_sec < 0.01 && writes > 100) {
 		LOG(WARNING) << "Run duration suspiciously short (" << run_sec
@@ -876,7 +997,7 @@ bool runBenchmark(BenchConfig& cfg) {
 		    << "read_p50_us,read_p99_us,"
 		    << "pub_threads,num_brokers,fifo_valid,fifo_mode,overwritten_keys,"
 		    << "final_mismatch_keys,untouched_mismatch_keys,session_reorders,"
-		    << "key_reorders,failed_checks\n";
+		    << "key_reorders,failed_checks,key_offset,state_digest\n";
 		csv << cfg.sequencer << "," << cfg.order << "," << cfg.ack << "," << cfg.rf
 		    << "," << cfg.record_count << "," << cfg.operation_count
 		    << "," << cfg.value_size
@@ -912,6 +1033,8 @@ bool runBenchmark(BenchConfig& cfg) {
 		    << "," << fifo_session_reorders
 		    << "," << fifo_key_reorders
 		    << "," << (failed_checks.empty() ? "none" : failed_checks)
+		    << "," << cfg.key_offset
+		    << "," << std::hex << state_digest << std::dec
 		    << "\n";
 	}
 
@@ -969,6 +1092,19 @@ int main(int argc, char* argv[]) {
 		 "versioned overwrites + session-FIFO final-state validation")
 		("fifo_mode", "FIFO mechanism label for CSV (auto|native|token_order|stop_and_wait|sticky|none)",
 		 cxxopts::value<std::string>()->default_value("auto"))
+		("manage_cluster", "Create topic / terminate cluster on exit (0 for all but one process in multi-process runs)",
+		 cxxopts::value<int>()->default_value("1"))
+		("shared_topic", "Other sessions also write this topic; skip the exact store-size check")
+		("key_offset", "Base key id for this session's disjoint keyspace (fifo mode only)",
+		 cxxopts::value<uint64_t>()->default_value("0"))
+		("replica", "Subscriber-only convergence replica: apply the log, wait for "
+		 "--expected_entries, emit a state digest")
+		("expected_entries", "Replica: total log entries to wait for",
+		 cxxopts::value<uint64_t>()->default_value("0"))
+		("replica_timeout_sec", "Replica: max seconds to wait for expected_entries",
+		 cxxopts::value<int>()->default_value("300"))
+		("digest_out", "Replica: file to write 'digest=<hex> applied=<n> ...'",
+		 cxxopts::value<std::string>()->default_value(""))
 		("latency", "Enable per-op latency tracking (adds overhead; use for latency runs)")
 		("broker_ip", "Broker address",
 		 cxxopts::value<std::string>()->default_value("127.0.0.1"))
@@ -1010,6 +1146,13 @@ int main(int argc, char* argv[]) {
 	cfg.sync_barrier = result["sync_barrier"].as<std::string>();
 	cfg.fifo_valid = result.count("fifo_valid") > 0;
 	cfg.fifo_mode = result["fifo_mode"].as<std::string>();
+	cfg.manage_cluster = result["manage_cluster"].as<int>() != 0;
+	cfg.shared_topic = result.count("shared_topic") > 0;
+	cfg.key_offset = result["key_offset"].as<uint64_t>();
+	cfg.replica = result.count("replica") > 0;
+	cfg.expected_entries = result["expected_entries"].as<uint64_t>();
+	cfg.replica_timeout_sec = result["replica_timeout_sec"].as<int>();
+	cfg.digest_out = result["digest_out"].as<std::string>();
 	cfg.latency = result.count("latency") > 0;
 	cfg.broker_ip = result["broker_ip"].as<std::string>();
 	cfg.warmup_ops = result["warmup_ops"].as<uint64_t>();
@@ -1022,6 +1165,11 @@ int main(int argc, char* argv[]) {
 
 	// Apply YCSB preset overrides (must happen after all CLI parsing)
 	applyWorkloadPreset(cfg);
+
+	if (cfg.replica) {
+		if (cfg.order < 0) cfg.order = orderForSequencer(cfg.sequencer);
+		return runReplica(cfg) ? 0 : 1;
+	}
 
 	LOG(INFO) << "=== Shared-Log KV Benchmark ===";
 	LOG(INFO) << cfg.sequencer << " order=" << cfg.order << " ack=" << cfg.ack

@@ -29,6 +29,8 @@ broker_init_paths
 
 NUM_BROKERS="${NUM_BROKERS:-4}"
 export NUM_BROKERS EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
+# run_one overrides NUM_BROKERS per mode (sticky=1); remember the default.
+SMR_FIFO_NUM_BROKERS_DEFAULT="$NUM_BROKERS"
 REPLICATION_FACTOR="${REPLICATION_FACTOR:-1}"
 export REPLICATION_FACTOR EMBARCADERO_REPLICATION_FACTOR="$REPLICATION_FACTOR"
 export EMBARCADERO_RUNTIME_MODE="${EMBARCADERO_RUNTIME_MODE:-throughput}"
@@ -193,51 +195,200 @@ start_cluster() {
 # a normal run (where each trial already cleaned up) can murder a cluster some
 # NEWER driver invocation just started. Skip it once all trials completed.
 DRIVER_DONE=0
-cleanup() { [[ "$DRIVER_DONE" == 1 ]] || broker_local_cleanup; }
+# run_one populates these (not `local`) so an interrupt can reach them: a
+# multi-process trial's session/replica pids run in the background, so a
+# signal to this driver does not by itself guarantee they die too. An
+# orphaned bench process's destructor calls TerminateCluster on its
+# (fixed-port) cluster — if that fires after cleanup here has already let a
+# NEXT invocation start a new cluster, the orphan tears down someone else's
+# run. Kill them ourselves before touching the brokers.
+CURRENT_TRIAL_PIDS=()
+cleanup() {
+  [[ "$DRIVER_DONE" == 1 ]] && return 0
+  if [[ ${#CURRENT_TRIAL_PIDS[@]} -gt 0 ]]; then
+    kill "${CURRENT_TRIAL_PIDS[@]}" 2>/dev/null || true
+  fi
+  broker_local_cleanup
+}
 trap cleanup EXIT
 
 # run_one SEQ MODE TRIAL
+#
+# Modes: pipe (sync_interval=0, full striping), serialize (stop-and-wait on the
+# ACK barrier), sticky (single broker: FIFO by forfeiting striping — the
+# negative control and the "Kafka corner" row).
+#
+# Multi-process knobs:
+#   SMR_FIFO_SESSIONS=N   N concurrent publisher sessions, disjoint keyspaces
+#                         (per-session FIFO validation; store-size check waived)
+#   SMR_FIFO_REPLICAS=R   R subscriber-only replicas; each waits for the total
+#                         entry count and emits a state digest. Replica digests
+#                         must all match; with SESSIONS=1 they must also match
+#                         the publisher's digest (E4 convergence).
 run_one() {
   local seq="$1" mode="$2" trial="$3"
   local sync_iv=0 sync_barrier=apply ops="$SMR_FIFO_OPERATION_COUNT"
+  local nb="$SMR_FIFO_NUM_BROKERS_DEFAULT" fifo_mode_flag="auto"
   if [[ "$mode" == "serialize" ]]; then
     sync_iv=1
     sync_barrier="$SMR_FIFO_SERIALIZE_BARRIER"
     ops="$SMR_FIFO_SERIALIZE_OPS"
+  elif [[ "$mode" == "sticky" ]]; then
+    nb=1
+    fifo_mode_flag="sticky"
   fi
+  local effective_rf="$SMR_FIFO_RF"
+  if [[ "$mode" == "sticky" && "$SMR_FIFO_RF" -gt "$nb" ]]; then
+    echo "WARNING: sticky mode forces NUM_BROKERS=1 but SMR_FIFO_RF=$SMR_FIFO_RF" \
+         "cannot be satisfied by 1 broker (no replica host); the run would" \
+         "hang to timeout waiting for an unreachable ACK. Clamping RF=1 for" \
+         "this sticky trial only." >&2
+    effective_rf=1
+  fi
+  local sessions="${SMR_FIFO_SESSIONS:-1}"
+  local replicas="${SMR_FIFO_REPLICAS:-0}"
   local _bench_to="$BENCH_TIMEOUT_SEC"
-  [[ "$seq" == "SCALOG" ]] && _bench_to="${BENCH_TIMEOUT_SCALOG:-1800}"
+  [[ "$seq" == "SCALOG" ]] && _bench_to="${BENCH_TIMEOUT_SCALOG:-3600}"
 
-  echo "======== $seq  $mode  trial $trial  (sync_interval=$sync_iv barrier=$sync_barrier ops=$ops) ========"
+  # Broker count is per-mode (sticky=1); cluster and clients must agree.
+  NUM_BROKERS="$nb"
+  export NUM_BROKERS EMBARCADERO_NUM_BROKERS="$nb"
+
+  echo "======== $seq  $mode  trial $trial  (brokers=$nb sync_interval=$sync_iv barrier=$sync_barrier ops=$ops sessions=$sessions replicas=$replicas) ========"
   if ! start_cluster "$seq"; then
     echo "ERROR: skipping $seq $mode trial $trial (cluster did not start)" >&2
     broker_local_cleanup; sleep 2; return 1
   fi
-  local bench_status=0
+
+  # With any extra process, no bench process may TerminateCluster on exit;
+  # this driver tears the cluster down itself.
+  local manage=1
+  local -a multi_flags=()
+  if [[ "$sessions" -gt 1 || "$replicas" -gt 0 ]]; then
+    manage=0
+  fi
+  if [[ "$sessions" -gt 1 ]]; then
+    multi_flags+=(--shared_topic)
+  fi
+  local expected_entries=$(( sessions * (SMR_FIFO_RECORD_COUNT + SMR_FIFO_WARMUP_OPS + ops) ))
+
+  local -a bench_env=(
+    env "EMBAR_USE_HUGETLB=$EMBAR_USE_HUGETLB"
+    "EMBARCADERO_RUNTIME_MODE=${KV_BENCH_CLIENT_RUNTIME_MODE:-latency}"
+  )
+
+  local bench_status=0 s r
+  local -a session_pids=() replica_pids=()
+  CURRENT_TRIAL_PIDS=()  # global: lets an interrupt's EXIT trap kill these
   set +e
-  timeout "$_bench_to" env "EMBAR_USE_HUGETLB=$EMBAR_USE_HUGETLB" \
-    "EMBARCADERO_RUNTIME_MODE=${KV_BENCH_CLIENT_RUNTIME_MODE:-latency}" \
-    "${EMBARLET_NUMA_ARR[@]}" "$BIN_DIR/kv_ycsb_bench" \
-    --sequencer="$seq" \
-    --order=-1 \
-    --fifo_valid \
-    --record_count="$SMR_FIFO_RECORD_COUNT" \
-    --operation_count="$ops" \
-    --warmup_ops="$SMR_FIFO_WARMUP_OPS" \
-    --value_size="$SMR_FIFO_VALUE_SIZE" \
-    --batch_size=1 \
-    --ack="$SMR_FIFO_ACK" \
-    --rf="$SMR_FIFO_RF" \
-    --pub_threads="$SMR_FIFO_PUB_THREADS" \
-    --sync_interval="$sync_iv" \
-    --sync_barrier="$sync_barrier" \
-    --log_level="$SMR_FIFO_LOG_LEVEL" \
-    --broker_ip="$SMR_FIFO_BROKER_IP" \
-    --output_dir="$OUT_ROOT" \
-    --run_id="${mode}_trial${trial}" \
-    2>&1 | tee "$OUT_ROOT/${seq}_${mode}_trial${trial}.log"
-  bench_status=${PIPESTATUS[0]}
+  for ((s = 0; s < sessions; s++)); do
+    local -a session_flags=("${multi_flags[@]}")
+    session_flags+=(--manage_cluster="$manage")
+    [[ "$sessions" -gt 1 ]] && session_flags+=(--key_offset=$((s * SMR_FIFO_RECORD_COUNT)))
+    timeout "$_bench_to" "${bench_env[@]}" \
+      "${EMBARLET_NUMA_ARR[@]}" "$BIN_DIR/kv_ycsb_bench" \
+      --sequencer="$seq" \
+      --order=-1 \
+      --fifo_valid \
+      --fifo_mode="$fifo_mode_flag" \
+      --record_count="$SMR_FIFO_RECORD_COUNT" \
+      --operation_count="$ops" \
+      --warmup_ops="$SMR_FIFO_WARMUP_OPS" \
+      --value_size="$SMR_FIFO_VALUE_SIZE" \
+      --batch_size=1 \
+      --ack="$SMR_FIFO_ACK" \
+      --rf="$effective_rf" \
+      --pub_threads="$SMR_FIFO_PUB_THREADS" \
+      --sync_interval="$sync_iv" \
+      --sync_barrier="$sync_barrier" \
+      --log_level="$SMR_FIFO_LOG_LEVEL" \
+      --broker_ip="$SMR_FIFO_BROKER_IP" \
+      --output_dir="$OUT_ROOT" \
+      "${session_flags[@]}" \
+      --run_id="${mode}_trial${trial}_s${s}" \
+      >"$OUT_ROOT/${seq}_${mode}_trial${trial}_s${s}.log" 2>&1 &
+    session_pids+=("$!")
+    CURRENT_TRIAL_PIDS+=("$!")
+    # Session 0 creates the topic; give it a head start before others join.
+    [[ "$s" -eq 0 && ( "$sessions" -gt 1 || "$replicas" -gt 0 ) ]] && sleep 3
+  done
+
+  for ((r = 0; r < replicas; r++)); do
+    timeout "$_bench_to" "${bench_env[@]}" \
+      "$BIN_DIR/kv_ycsb_bench" \
+      --sequencer="$seq" \
+      --order=-1 \
+      --replica \
+      --expected_entries="$expected_entries" \
+      --replica_timeout_sec=$(( _bench_to - 30 > 60 ? _bench_to - 30 : 60 )) \
+      --digest_out="$OUT_ROOT/${seq}_${mode}_trial${trial}_replica${r}.txt" \
+      --ack="$SMR_FIFO_ACK" \
+      --rf="$effective_rf" \
+      --log_level="$SMR_FIFO_LOG_LEVEL" \
+      --broker_ip="$SMR_FIFO_BROKER_IP" \
+      --output_dir="$OUT_ROOT" \
+      >"$OUT_ROOT/${seq}_${mode}_trial${trial}_replica${r}.log" 2>&1 &
+    replica_pids+=("$!")
+    CURRENT_TRIAL_PIDS+=("$!")
+  done
+
+  local pid st
+  for pid in "${session_pids[@]}"; do
+    wait "$pid"; st=$?
+    [[ "$st" -ne 0 ]] && bench_status="$st"
+  done
+  # If a session already failed, replicas can never reach expected_entries
+  # (the combined total across all sessions) — kill them now instead of
+  # burning their full internal timeout (up to ~1h under SCALOG) waiting on
+  # a count that will never arrive.
+  if [[ "$bench_status" -ne 0 && ${#replica_pids[@]} -gt 0 ]]; then
+    echo "NOTE: session failure detected; terminating replicas early" \
+         "instead of waiting out their timeout" >&2
+    kill "${replica_pids[@]}" 2>/dev/null || true
+  fi
+  for pid in "${replica_pids[@]}"; do
+    wait "$pid"; st=$?
+    if [[ "$st" -ne 0 ]]; then
+      echo "ERROR: replica exited $st" >&2
+      bench_status="$st"
+    fi
+  done
+  CURRENT_TRIAL_PIDS=()  # all reaped; don't let a later interrupt kill stale/recycled pids
   set -e
+
+  # Convergence check (E4): all replica digests identical; with one session the
+  # publisher's state_digest (last CSV column) must match too.
+  #
+  # Every command substitution below is defensively `|| true`'d: grep/tail
+  # exit nonzero on "no match" (missing file, no digest line, glob left
+  # unexpanded), and under `set -euo pipefail` a bare `var="$(cmd)"` — NOT
+  # combined with `local` on the same line — propagates that exit status and
+  # aborts the WHOLE driver mid-matrix (a `local var` declared on its own
+  # line, as here, does not mask it the way `local var="$(cmd)"` would).
+  # Losing hours of an in-progress campaign to one missing replica file would
+  # be far worse than the trial this check is meant to fail.
+  if [[ "$replicas" -gt 0 ]]; then
+    local digests
+    digests="$(grep -ho 'digest=[0-9a-f]*' "$OUT_ROOT/${seq}_${mode}_trial${trial}"_replica*.txt 2>/dev/null | sort -u || true)"
+    local ndigests
+    ndigests="$(wc -l <<<"$digests")"
+    if [[ -z "$digests" || "$ndigests" -ne 1 ]]; then
+      echo "CONVERGENCE FAIL: replica digests differ or missing: $digests" >&2
+      bench_status=1
+    elif [[ "$sessions" -eq 1 ]]; then
+      local pub_digest
+      pub_digest="$(tail -1 "$OUT_ROOT/${seq}"_*_"${mode}_trial${trial}_s0/summary.csv" 2>/dev/null | awk -F, '{print $NF}' || true)"
+      if [[ "digest=$pub_digest" == "$digests" ]]; then
+        echo "CONVERGENCE OK: $replicas replica(s) + publisher agree ($digests)"
+      else
+        echo "CONVERGENCE FAIL: publisher digest=$pub_digest vs replicas $digests" >&2
+        bench_status=1
+      fi
+    else
+      echo "CONVERGENCE OK: $replicas replica(s) agree ($digests)"
+    fi
+  fi
+
   broker_local_cleanup
   kv_bench_unlink_kvbase_shm
   sleep "${BROKER_SEQ_GAP_SEC:-3}"
@@ -260,7 +411,7 @@ for SEQ in "${SEQ_ARR[@]}"; do
   for MODE in "${MODE_ARR[@]}"; do
     for TRIAL in $(seq 1 "$SMR_FIFO_NUM_TRIALS"); do
       if ! run_one "$SEQ" "$MODE" "$TRIAL"; then
-        if compgen -G "$OUT_ROOT/${SEQ}_*_${MODE}_trial${TRIAL}/summary.csv" >/dev/null; then
+        if compgen -G "$OUT_ROOT/${SEQ}_*_${MODE}_trial${TRIAL}_s*/summary.csv" >/dev/null; then
           invalid_runs+=("${SEQ}:${MODE}:trial${TRIAL}")
         else
           broken_runs+=("${SEQ}:${MODE}:trial${TRIAL}")
@@ -276,9 +427,12 @@ first=1
 for f in "$OUT_ROOT"/*/summary.csv; do
   [[ -e "$f" ]] || continue
   run_dir="$(basename "$(dirname "$f")")"
-  # run_id suffix is "<mode>_trial<N>"
-  mode="$(sed -E 's/.*_(pipe|serialize)_trial[0-9]+$/\1/' <<<"$run_dir")"
-  trial="$(sed -E 's/.*_trial([0-9]+)$/\1/' <<<"$run_dir")"
+  # run_id suffix is "<mode>_trial<N>_s<session>"; the "_s<N>" part is
+  # optional so an OUT_ROOT reused across a driver upgrade (pre-multi-process
+  # run dirs had no session suffix) still aggregates instead of silently
+  # dropping those trials from the report.
+  mode="$(sed -E 's/.*_(pipe|serialize|sticky)_trial[0-9]+(_s[0-9]+)?$/\1/' <<<"$run_dir")"
+  trial="$(sed -E 's/.*_trial([0-9]+)(_s[0-9]+)?$/\1/' <<<"$run_dir")"
   if [[ "$first" == 1 ]]; then
     echo "mode,trial,$(head -1 "$f")" > "$AGG"
     first=0

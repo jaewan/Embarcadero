@@ -1,11 +1,10 @@
-// NOTE: This only works when num of brokers == NUM_MAX_BROKERS. 
-// TODO(Jae) modify this later
 #include "distributed_kv_store.h"
 
 #include "common/wire_formats.h"
 
 #include <sstream>
 #include <chrono>
+#include <limits>
 
 // OperationId implementation
 bool OperationId::operator==(const OperationId& other) const {
@@ -131,8 +130,12 @@ DistributedKVStore::DistributedKVStore(const Config& cfg)
 		int order = cfg.order;
 		order_level_ = order;
 
-		CreateNewTopic(stub_, topic, order, cfg.seq_type,
-		               cfg.replication_factor, false, cfg.ack_level);
+		if (cfg.create_topic) {
+			if (!CreateNewTopic(stub_, topic, order, cfg.seq_type,
+			                    cfg.replication_factor, false, cfg.ack_level)) {
+				LOG(ERROR) << "CreateNewTopic failed (topic may already exist; continuing)";
+			}
+		}
 
 		// The SMR apply path consumes via Consume()/ConsumeOrdered(), which is fed
 		// only when the subscriber's ordered consume stream is enabled. Under
@@ -147,12 +150,19 @@ DistributedKVStore::DistributedKVStore(const Config& cfg)
 			topic,
 			/*measure_latency=*/false,
 			order);
-		publisher_ = std::make_unique<Publisher>(
-			topic, cfg.broker_ip, std::to_string(BROKER_PORT),
-			cfg.publisher_threads, cfg.publisher_message_size,
-			(1UL << 33), order, cfg.seq_type);
-		publisher_->Init(cfg.ack_level);
-		server_id_ = publisher_->GetClientId();
+		if (!cfg.subscriber_only) {
+			publisher_ = std::make_unique<Publisher>(
+				topic, cfg.broker_ip, std::to_string(BROKER_PORT),
+				cfg.publisher_threads, cfg.publisher_message_size,
+				(1UL << 33), order, cfg.seq_type);
+			publisher_->Init(cfg.ack_level);
+			server_id_ = publisher_->GetClientId();
+		} else {
+			// Replica: apply-only. No client_id, so per-session accounting
+			// (pending ops, FIFO audit, applied_local_ops_) stays inert; progress
+			// is observed via getAppliedAnyEntryCount()/getLastAppliedIndex().
+			server_id_ = std::numeric_limits<uint64_t>::max();
+		}
 
 		subscriber_->WaitUntilAllConnected();
 		log_consumer_threads_.emplace_back(&DistributedKVStore::logConsumer, this);
@@ -214,6 +224,14 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 		LOG(ERROR) << "Invalid raw buffer data for processing";
 		return;
 	}
+	// Count every raw entry the subscriber handed us, regardless of what the
+	// parse below does with it. A replica's completion check
+	// (getAppliedAnyEntryCount() >= expected_entries) must advance past a
+	// torn/malformed entry (a documented failure mode: stale CXL parse
+	// errors) or it hangs to its full timeout with no diagnostic — counting
+	// here at the top, instead of after the switch below, means an early
+	// parse-error return still advances progress.
+	applied_any_entries_.fetch_add(1, std::memory_order_acq_rel);
 
 	const char* buffer = static_cast<const char*>(data);
 	size_t offset = 0;
@@ -268,7 +286,10 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				offset += valueLength;
 
 				kv_store_.put(key, value);
-				if (fifo_audit_) {
+				// Session-scoped: the reorder audit tracks THIS client's submission
+				// order. Auditing other sessions' interleaved versions would count
+				// false "session reorders" the moment more than one client runs.
+				if (fifo_audit_ && client_id == server_id_) {
 					auditFifoValue(value);
 				}
 
