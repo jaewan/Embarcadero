@@ -38,7 +38,7 @@ via `start_lazylog_metadata`).
 | Disk vs mem data-sink delta for LazyLog | Expected ~flat — metadata `fdatasync` dominates both |
 | Per-client FIFO | Architectural claim; LazyLog has none; Embarcadero has it |
 | Failure recovery | Separate figure (Fig 3 / Sec 7.3) |
-| RF=1 faithful LazyLog | No metadata replicas at RF=1 with current harness wiring; follow-up |
+| RF=1 LazyLog without metadata endpoints | Silently binding-gated ACK — not faithful; see Section 10 |
 
 ---
 
@@ -238,18 +238,36 @@ Before running:
 
 ## 10. Follow-up: RF=1 faithful LazyLog (separate experiment)
 
-At RF=1 a single metadata endpoint covers the full replica set.  The faithful
-ACK reduces to:
+> ⚠️ **Critical: RF=1 without a metadata endpoint is NOT faithful LazyLog.**
+>
+> `SupportsPerClientAppendAckLevel1()` returns `false` when
+> `lazylog_metadata_replica_client_ == nullptr` (no metadata endpoints configured).
+> The ACK then falls through to `SupportsPerClientAckLevel1()` which is `true` for
+> `LAZYLOG && order==kOrderTotal` — this engages the **binding-gated** ordered path
+> (`ApplyGlobalBinding` → `tinode->ordered`), NOT the pre-binding faithful path.
+>
+> Any RF=1 LazyLog run without `EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS` set is
+> silently binding-gated and must not be labeled or compared as faithful LazyLog.
 
+To run a genuine RF=1 faithful ablation, you must set one metadata endpoint:
+
+```bash
+LAZYLOG_RF2_METADATA_ENDPOINTS=10.10.10.10:50081   # one endpoint for RF=1
+REPLICATION_FACTOR=1
+ACK=1
+```
+
+`Topic::Topic` validates `metadata_endpoints.size() == replication_factor` (both
+= 1 here), so one endpoint is correct.  `start_lazylog_metadata` starts two
+replicas by default; for RF=1 only the port-50081 replica is used.
+
+The faithful RF=1 ACK reduces to:
 - `AppendToAll` to 1 metadata replica (1 `fdatasync` per batch)
-- `replication_done[self]` satisfied trivially (primary wrote to CXL)
+- `min(replication_done)` across RF=1 = self only (trivially satisfied on CXL write)
 
-This isolates metadata coordinator cost from data replication cost and is a
-useful ablation.  Not part of the main paper result; defer unless a reviewer
-asks for the isolation.
-
-Set: `LAZYLOG_RF2_METADATA_ENDPOINTS=10.10.10.10:50081` (one endpoint only),
-`REPLICATION_FACTOR=1`, `ACK=1`.
+This isolates metadata coordinator cost from data replication cost — useful ablation
+for understanding whether throughput is limited by metadata `fdatasync` alone or by
+both metadata and data replication together.  Not part of the main paper result.
 
 ---
 
@@ -259,3 +277,4 @@ Set: `LAZYLOG_RF2_METADATA_ENDPOINTS=10.10.10.10:50081` (one endpoint only),
 |---|---|
 | 2026-07-15 | Faithful path implemented; channel/stub reuse fixed; experiment plan written |
 | 2026-07-15 | Double-credit fix for SCALOG/LAZYLOG DrainDurableBatches committed to broker |
+| 2026-07-16 | Post-review fixes: ACK2 canary scoped to ORDER=0 only; LazyLog batch_complete CXL flush added; LazyLog mem guard added to fig1 script; fdatasync estimate corrected; fault-domain caveat added; RF=1 silent fallback documented |
