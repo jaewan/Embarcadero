@@ -1049,7 +1049,10 @@ void Topic::DelegationThread() {
 							CXL::flush_cacheline(msg_ptr);
 							CXL::load_fence();
 						}
-						msg_ptr->logical_offset = logical_offset_;
+						// [[FIX: logical_offset race]] Use batch->start_logical_offset + i
+						// instead of logical_offset_ (which is racy with ScalogGetCXLBuffer
+						// concurrently incrementing it per-batch while we process per-message).
+						msg_ptr->logical_offset = current_batch->start_logical_offset + i;
 						msg_ptr->segment_header = reinterpret_cast<uint8_t*>(msg_ptr) - CACHELINE_SIZE;
 
 						size_t current_padded_size = msg_ptr->paddedSize;
@@ -1097,7 +1100,13 @@ void Topic::DelegationThread() {
 					if (order_ != 0) {
 						const bool count_based_written =
 							(seq_type_ == SCALOG || seq_type_ == LAZYLOG);
-						size_t written_val = count_based_written ? logical_offset_ : logical_offset_ - 1;
+						// [[FIX: written_val race]] For SCALOG/LAZYLOG use the batch-relative
+						// count (start + num_msg) instead of logical_offset_ (which is racy with
+						// ScalogGetCXLBuffer concurrently advancing it). For other sequencer types,
+						// logical_offset_ is the correct value since it is only incremented here.
+						size_t written_val = count_based_written
+							? (current_batch->start_logical_offset + current_batch->num_msg)
+							: logical_offset_ - 1;
 						UpdateTInodeWritten(
 							written_val,
 							static_cast<unsigned long long int>(
