@@ -26,6 +26,13 @@ struct CorfuValueId {
 enum class CorfuSlotState : uint8_t { kUnwritten = 0, kValue = 1, kJunk = 2 };
 enum class CorfuWriteStatus : uint8_t { kWritten, kAlreadySame, kAlreadyJunk, kConflict, kIoError };
 struct CorfuProbeResult { CorfuSlotState state{CorfuSlotState::kUnwritten}; CorfuValueId value{}; };
+struct CorfuWriteRequest {
+  CorfuSlotKey slot;
+  CorfuValueId value;
+  uint64_t data_offset{};
+  const void* payload{};
+  uint64_t size{};
+};
 
 // A sidecar is the source of truth for completed remote slots in durable mode.
 // Memory-copy mode keeps an owned payload copy in the same slot/value state
@@ -39,6 +46,10 @@ class CorfuReplicaStore {
   CorfuProbeResult Probe(const CorfuSlotKey& key) const;
   CorfuWriteStatus WriteOnce(const CorfuSlotKey& key, const CorfuValueId& value,
                              uint64_t data_offset, const void* payload, uint64_t size);
+  // A group has the same per-slot contract as WriteOnce. In durable mode no
+  // newly written member is reported complete until one data sync and one
+  // sidecar sync have covered the whole group.
+  std::vector<CorfuWriteStatus> WriteGroup(const std::vector<CorfuWriteRequest>& writes);
   CorfuWriteStatus WriteJunkOnce(const CorfuSlotKey& key);
 
  private:
@@ -51,7 +62,7 @@ class CorfuReplicaStore {
     std::vector<uint8_t> payload;
   };
   void Replay();
-  bool AppendRecord(const CorfuSlotKey& key, const Entry& entry);
+  bool AppendRecord(const CorfuSlotKey& key, const Entry& entry, bool sync);
   bool media_durable_{true};
   int data_fd_{-1};
   int sidecar_fd_{-1};

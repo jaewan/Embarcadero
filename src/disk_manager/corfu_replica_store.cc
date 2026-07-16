@@ -49,7 +49,7 @@ CorfuReplicaStore::CorfuReplicaStore(std::string data_path, std::string sidecar_
 CorfuReplicaStore::~CorfuReplicaStore() { if (data_fd_ >= 0) close(data_fd_); if (sidecar_fd_ >= 0) close(sidecar_fd_); }
 CorfuProbeResult CorfuReplicaStore::Probe(const CorfuSlotKey& key) const { std::lock_guard<std::mutex> l(mu_); auto it = slots_.find(key); return it == slots_.end() ? CorfuProbeResult{} : CorfuProbeResult{it->second.state, it->second.value}; }
 
-bool CorfuReplicaStore::AppendRecord(const CorfuSlotKey& key, const Entry& e) {
+bool CorfuReplicaStore::AppendRecord(const CorfuSlotKey& key, const Entry& e, bool sync) {
   if (key.topic.size() > kMaxTopic) return false;
   std::vector<uint8_t> body;
   Put<uint16_t>(&body, static_cast<uint16_t>(key.topic.size())); body.insert(body.end(), key.topic.begin(), key.topic.end());
@@ -66,32 +66,97 @@ bool CorfuReplicaStore::AppendRecord(const CorfuSlotKey& key, const Entry& e) {
     const long n = std::strtol(fail_after, nullptr, 10);
     if (n >= 0 && static_cast<size_t>(n) < bytes) bytes = static_cast<size_t>(n);
   }
-  const bool complete = WriteAll(sidecar_fd_, rec.data(), bytes) && bytes == rec.size() && fdatasync(sidecar_fd_) == 0;
+  const bool complete = WriteAll(sidecar_fd_, rec.data(), bytes) && bytes == rec.size() &&
+                        (!sync || fdatasync(sidecar_fd_) == 0);
   if (complete) return true;
   const bool rolled_back = ftruncate(sidecar_fd_, start) == 0 && fdatasync(sidecar_fd_) == 0;
   (void)rolled_back;  // caller receives IO_ERROR even if rollback itself also failed.
   return false;
 }
 CorfuWriteStatus CorfuReplicaStore::WriteOnce(const CorfuSlotKey& key, const CorfuValueId& value, uint64_t offset, const void* payload, uint64_t size) {
-  std::lock_guard<std::mutex> l(mu_); auto it = slots_.find(key); if (it != slots_.end()) return it->second.state == CorfuSlotState::kValue && it->second.value == value ? CorfuWriteStatus::kAlreadySame : CorfuWriteStatus::kConflict;
-  if (!payload || size != value.total_size) return CorfuWriteStatus::kIoError;
-  if (!media_durable_) {
-    // This is an actual remote memory-copy sink, not an accounting shortcut:
-    // retain a private payload copy before acknowledging the ordered slot.
-    Entry e{CorfuSlotState::kValue, value, offset, size};
-    try {
-      const auto* begin = static_cast<const uint8_t*>(payload);
-      e.payload.assign(begin, begin + size);
-    } catch (const std::exception&) {
-      return CorfuWriteStatus::kIoError;
-    }
-    slots_.emplace(key, std::move(e));
-    return CorfuWriteStatus::kWritten;
-  }
-  if (pwrite(data_fd_, payload, size, offset) != static_cast<ssize_t>(size) || fdatasync(data_fd_) != 0) return CorfuWriteStatus::kIoError;
-  Entry e{CorfuSlotState::kValue, value, offset, size}; if (!AppendRecord(key, e)) return CorfuWriteStatus::kIoError; slots_.emplace(key, e); return CorfuWriteStatus::kWritten;
+  return WriteGroup({CorfuWriteRequest{key, value, offset, payload, size}}).front();
 }
-CorfuWriteStatus CorfuReplicaStore::WriteJunkOnce(const CorfuSlotKey& key) { std::lock_guard<std::mutex> l(mu_); auto it = slots_.find(key); if (it != slots_.end()) return it->second.state == CorfuSlotState::kJunk ? CorfuWriteStatus::kAlreadyJunk : CorfuWriteStatus::kConflict; Entry e{CorfuSlotState::kJunk,{ },0,0}; if (media_durable_ && !AppendRecord(key,e)) return CorfuWriteStatus::kIoError; slots_.emplace(key,e); return CorfuWriteStatus::kWritten; }
+
+std::vector<CorfuWriteStatus> CorfuReplicaStore::WriteGroup(const std::vector<CorfuWriteRequest>& writes) {
+  std::vector<CorfuWriteStatus> result(writes.size(), CorfuWriteStatus::kIoError);
+  if (writes.empty()) return result;
+  std::lock_guard<std::mutex> lock(mu_);
+
+  struct Pending { size_t request_index; Entry entry; CorfuSlotKey slot; };
+  std::vector<Pending> pending;
+  std::map<CorfuSlotKey, size_t> pending_slots;
+  std::vector<size_t> duplicate_of(writes.size(), writes.size());
+  for (size_t i = 0; i < writes.size(); ++i) {
+    const auto& write = writes[i];
+    if (!write.payload || write.size != write.value.total_size) continue;
+    const auto existing = slots_.find(write.slot);
+    if (existing != slots_.end()) {
+      result[i] = existing->second.state == CorfuSlotState::kValue && existing->second.value == write.value
+                    ? CorfuWriteStatus::kAlreadySame : CorfuWriteStatus::kConflict;
+      continue;
+    }
+    const auto in_group = pending_slots.find(write.slot);
+    if (in_group != pending_slots.end()) {
+      const auto& first = pending[in_group->second];
+      if (first.entry.value == write.value) duplicate_of[i] = first.request_index;
+      else result[i] = CorfuWriteStatus::kConflict;
+      continue;
+    }
+    pending_slots.emplace(write.slot, pending.size());
+    pending.push_back(Pending{i, Entry{CorfuSlotState::kValue, write.value, write.data_offset, write.size}, write.slot});
+  }
+  if (pending.empty()) return result;
+
+  if (!media_durable_) {
+    for (auto& item : pending) {
+      const auto& write = writes[item.request_index];
+      try {
+        const auto* begin = static_cast<const uint8_t*>(write.payload);
+        item.entry.payload.assign(begin, begin + write.size);
+      } catch (const std::exception&) {
+        return result;
+      }
+    }
+    for (const auto& item : pending) {
+      slots_.emplace(item.slot, item.entry);
+      result[item.request_index] = CorfuWriteStatus::kWritten;
+    }
+    for (size_t i = 0; i < duplicate_of.size(); ++i) {
+      if (duplicate_of[i] != writes.size()) result[i] = CorfuWriteStatus::kWritten;
+    }
+    return result;
+  }
+
+  for (const auto& item : pending) {
+    const auto& write = writes[item.request_index];
+    if (pwrite(data_fd_, write.payload, write.size, item.entry.offset) != static_cast<ssize_t>(write.size)) return result;
+  }
+  if (fdatasync(data_fd_) != 0) return result;
+
+  const off_t sidecar_start = lseek(sidecar_fd_, 0, SEEK_END);
+  if (sidecar_start < 0) return result;
+  for (const auto& item : pending) {
+    if (!AppendRecord(item.slot, item.entry, false)) {
+      const bool rolled_back = ftruncate(sidecar_fd_, sidecar_start) == 0 && fdatasync(sidecar_fd_) == 0;
+      (void)rolled_back;
+      return result;
+    }
+  }
+  if (fdatasync(sidecar_fd_) != 0) {
+    const bool rolled_back = ftruncate(sidecar_fd_, sidecar_start) == 0 && fdatasync(sidecar_fd_) == 0;
+    (void)rolled_back;
+    return result;
+  }
+  for (const auto& item : pending) {
+    slots_.emplace(item.slot, item.entry);
+    result[item.request_index] = CorfuWriteStatus::kWritten;
+  }
+  for (size_t i = 0; i < duplicate_of.size(); ++i) {
+    if (duplicate_of[i] != writes.size()) result[i] = CorfuWriteStatus::kWritten;
+  }
+  return result;
+}
+CorfuWriteStatus CorfuReplicaStore::WriteJunkOnce(const CorfuSlotKey& key) { std::lock_guard<std::mutex> l(mu_); auto it = slots_.find(key); if (it != slots_.end()) return it->second.state == CorfuSlotState::kJunk ? CorfuWriteStatus::kAlreadyJunk : CorfuWriteStatus::kConflict; Entry e{CorfuSlotState::kJunk,{ },0,0}; if (media_durable_ && !AppendRecord(key,e,true)) return CorfuWriteStatus::kIoError; slots_.emplace(key,e); return CorfuWriteStatus::kWritten; }
 void CorfuReplicaStore::Replay() {
   const off_t end = lseek(sidecar_fd_, 0, SEEK_END); if (end < 0) throw std::runtime_error("cannot seek Corfu sidecar"); std::vector<uint8_t> bytes(static_cast<size_t>(end)); if (end && pread(sidecar_fd_, bytes.data(), bytes.size(), 0) != end) throw std::runtime_error("cannot read Corfu sidecar");
   size_t off = 0; while (off < bytes.size()) { const size_t start = off; if (bytes.size()-off < 12) break; const uint8_t* p=bytes.data()+off; const uint8_t* endp=bytes.data()+bytes.size(); uint32_t magic,len; uint16_t ver,res; if(!Get(p,endp,&magic)||!Get(p,endp,&ver)||!Get(p,endp,&res)||!Get(p,endp,&len)||magic!=kMagic||ver!=kVersion) throw std::runtime_error("corrupt Corfu sidecar header"); if (len > bytes.size() || static_cast<size_t>(endp-p) < len+4) break; const uint8_t* bodyend=p+len; uint16_t topic_len; CorfuSlotKey k; Entry e{}; uint8_t state; if(!Get(p,bodyend,&topic_len)||topic_len>kMaxTopic||static_cast<size_t>(bodyend-p)<topic_len) throw std::runtime_error("corrupt Corfu sidecar body"); k.topic.assign(reinterpret_cast<const char*>(p),topic_len);p+=topic_len; if(!Get(p,bodyend,&k.broker_id)||!Get(p,bodyend,&k.broker_batch_seq)||!Get(p,bodyend,&state)||!Get(p,bodyend,&e.value.client_id)||!Get(p,bodyend,&e.value.original_client_batch_seq)||!Get(p,bodyend,&e.value.total_order)||!Get(p,bodyend,&e.value.num_msg)||!Get(p,bodyend,&e.value.total_size)||!Get(p,bodyend,&e.offset)||!Get(p,bodyend,&e.size)||p!=bodyend) throw std::runtime_error("corrupt Corfu sidecar body"); uint32_t crc; const uint8_t* c=bodyend; if(!Get(c,endp,&crc)||crc!=Crc32c(bytes.data()+start, static_cast<size_t>(bodyend-(bytes.data()+start)))) { if (bodyend+4==endp) break; throw std::runtime_error("corrupt Corfu sidecar checksum"); } e.state=static_cast<CorfuSlotState>(state); if (e.state!=CorfuSlotState::kValue && e.state!=CorfuSlotState::kJunk) throw std::runtime_error("corrupt Corfu sidecar state"); if(!slots_.emplace(k,e).second) throw std::runtime_error("duplicate Corfu sidecar slot"); off=static_cast<size_t>(c-bytes.data()); }

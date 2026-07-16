@@ -18,8 +18,11 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <shared_mutex>
 #include <condition_variable>
+#include <deque>
+#include <vector>
 
 namespace Corfu {
 
@@ -77,6 +80,7 @@ namespace Corfu {
 						LOG(INFO) << "CORFU WriteOnce replica sink=memory-copy; "
 						          << "payloads are retained only in process memory";
 					}
+					if (media_durable_) StartDurableGroupCommitter();
 					// WriteOnce owns the durability boundary (data fdatasync followed
 					// by sidecar fdatasync).  A periodic fsync worker is both redundant
 					// and unsafe here; it previously re-entered the file lock on error.
@@ -89,6 +93,7 @@ namespace Corfu {
 			void Shutdown() {
 				bool expected = true;
 				if (running_.compare_exchange_strong(expected, false)) {
+					StopDurableGroupCommitter();
 					std::unique_lock<std::shared_mutex> lock(file_state_mutex_);
 					CloseOutputFile();
 				}
@@ -165,8 +170,9 @@ namespace Corfu {
 				}
 				const auto slot = ToSlot(request->slot());
 				const auto value = ToValue(request->value());
-				const auto write_status = store_->WriteOnce(
-					slot, value, request->source_offset(), request->payload().data(), request->size());
+				const auto write_status = media_durable_
+					? EnqueueDurableWrite(slot, value, request->source_offset(), request->payload().data(), request->size())
+					: store_->WriteOnce(slot, value, request->source_offset(), request->payload().data(), request->size());
 				if (write_status == CorfuWriteStatus::kConflict) {
 					const auto existing = store_->Probe(slot);
 					LOG(ERROR) << "CORFU WriteOnce conflict slot=" << SlotDebugString(slot)
@@ -184,6 +190,120 @@ namespace Corfu {
 			}
 
 		private:
+			struct PendingDurableWrite {
+				CorfuSlotKey slot;
+				CorfuValueId value;
+				uint64_t source_offset{};
+				std::vector<uint8_t> payload;
+				CorfuWriteStatus status{CorfuWriteStatus::kIoError};
+				bool done{false};
+				std::condition_variable completion;
+			};
+
+			static uint64_t GroupCommitBytes() {
+				const char* raw = std::getenv("EMBARCADERO_CORFU_GROUP_COMMIT_BYTES");
+				if (raw == nullptr || *raw == '\0') return 4ULL * 1024ULL * 1024ULL;
+				char* end = nullptr;
+				const auto bytes = std::strtoull(raw, &end, 10);
+				return end != raw && *end == '\0' && bytes > 0 ? bytes : 4ULL * 1024ULL * 1024ULL;
+			}
+			static uint64_t GroupCommitDelayUs() {
+				const char* raw = std::getenv("EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US");
+				if (raw == nullptr || *raw == '\0') return 1000;
+				char* end = nullptr;
+				const auto delay = std::strtoull(raw, &end, 10);
+				return end != raw && *end == '\0' ? delay : 1000;
+			}
+			void StartDurableGroupCommitter() {
+				group_commit_thread_ = std::thread([this] { DurableGroupCommitLoop(); });
+				LOG(INFO) << "CORFU durable group commit bytes=" << GroupCommitBytes()
+				          << " delay_us=" << GroupCommitDelayUs();
+			}
+			void StopDurableGroupCommitter() {
+				{
+					std::lock_guard<std::mutex> lock(group_commit_mu_);
+					group_commit_stopping_ = true;
+					for (const auto& pending : group_commit_queue_) {
+						pending->status = CorfuWriteStatus::kIoError;
+						pending->done = true;
+						pending->completion.notify_one();
+					}
+					group_commit_queue_.clear();
+				}
+				group_commit_cv_.notify_all();
+				if (group_commit_thread_.joinable()) group_commit_thread_.join();
+				const uint64_t groups = durable_group_count_.load(std::memory_order_relaxed);
+				const uint64_t writes = durable_group_write_count_.load(std::memory_order_relaxed);
+				const uint64_t bytes = durable_group_byte_count_.load(std::memory_order_relaxed);
+				if (groups != 0) {
+					LOG(INFO) << "CORFU durable group-commit summary groups=" << groups
+					          << " writes=" << writes
+					          << " bytes=" << bytes
+					          << " avg_writes=" << (static_cast<double>(writes) / groups)
+					          << " avg_bytes=" << (bytes / groups);
+				}
+			}
+			CorfuWriteStatus EnqueueDurableWrite(const CorfuSlotKey& slot, const CorfuValueId& value,
+					uint64_t source_offset, const void* payload, uint64_t size) {
+				auto pending = std::make_shared<PendingDurableWrite>();
+				pending->slot = slot;
+				pending->value = value;
+				pending->source_offset = source_offset;
+				try {
+					const auto* begin = static_cast<const uint8_t*>(payload);
+					pending->payload.assign(begin, begin + size);
+				} catch (const std::exception&) {
+					return CorfuWriteStatus::kIoError;
+				}
+				std::unique_lock<std::mutex> lock(group_commit_mu_);
+				if (group_commit_stopping_) return CorfuWriteStatus::kIoError;
+				group_commit_queue_.push_back(pending);
+				group_commit_cv_.notify_one();
+				pending->completion.wait(lock, [&] { return pending->done; });
+				return pending->status;
+			}
+			void DurableGroupCommitLoop() {
+				for (;;) {
+					std::vector<std::shared_ptr<PendingDurableWrite>> group;
+					{
+						std::unique_lock<std::mutex> lock(group_commit_mu_);
+						group_commit_cv_.wait(lock, [&] { return group_commit_stopping_ || !group_commit_queue_.empty(); });
+						if (group_commit_stopping_ && group_commit_queue_.empty()) return;
+						const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(GroupCommitDelayUs());
+						uint64_t bytes = 0;
+						do {
+							auto next = group_commit_queue_.front();
+							group_commit_queue_.pop_front();
+							bytes += next->payload.size();
+							group.push_back(std::move(next));
+							if (bytes >= GroupCommitBytes() || group_commit_queue_.empty()) {
+								if (bytes >= GroupCommitBytes() || group_commit_stopping_) break;
+								group_commit_cv_.wait_until(lock, deadline, [&] { return group_commit_stopping_ || !group_commit_queue_.empty(); });
+							}
+						} while (!group_commit_queue_.empty() && std::chrono::steady_clock::now() < deadline);
+					}
+					uint64_t group_bytes = 0;
+					std::vector<CorfuWriteRequest> writes;
+					writes.reserve(group.size());
+					for (const auto& pending : group) {
+						group_bytes += pending->payload.size();
+						writes.push_back({pending->slot, pending->value, pending->source_offset,
+						                  pending->payload.data(), pending->payload.size()});
+					}
+					const auto statuses = store_->WriteGroup(writes);
+					durable_group_count_.fetch_add(1, std::memory_order_relaxed);
+					durable_group_write_count_.fetch_add(group.size(), std::memory_order_relaxed);
+					durable_group_byte_count_.fetch_add(group_bytes, std::memory_order_relaxed);
+					{
+						std::lock_guard<std::mutex> lock(group_commit_mu_);
+						for (size_t i = 0; i < group.size(); ++i) {
+							group[i]->status = statuses[i];
+							group[i]->done = true;
+							group[i]->completion.notify_one();
+						}
+					}
+				}
+			}
 			bool OpenOutputFile() {
 				std::unique_lock<std::shared_mutex> lock(file_state_mutex_);
 				if (fd_ != -1) { // Already open
@@ -318,6 +438,17 @@ namespace Corfu {
 			// started, because WriteOnce owns the synchronous durability boundary.
 			std::condition_variable cv_fsync_;
 			std::mutex fsync_cv_mutex_;
+			std::mutex group_commit_mu_;
+			std::condition_variable group_commit_cv_;
+			std::deque<std::shared_ptr<PendingDurableWrite>> group_commit_queue_;
+			bool group_commit_stopping_{false};
+			std::thread group_commit_thread_;
+			// Publication diagnostics: aggregate only, emitted once at shutdown.  They
+			// make the configured durability policy auditable without perturbing the
+			// hot WriteOnce path with per-request logging.
+			std::atomic<uint64_t> durable_group_count_{0};
+			std::atomic<uint64_t> durable_group_write_count_{0};
+			std::atomic<uint64_t> durable_group_byte_count_{0};
 
 	};
 

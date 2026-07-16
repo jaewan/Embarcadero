@@ -92,6 +92,30 @@ Scalog labeling, and batching/RF instrumentation.
   `ack2_primary_plus_2_ordered_media_durable_replicas`, and `git_dirty=false`.
   This closes the bounded developer RF3 process smoke; it remains a correctness
   smoke rather than a publication throughput measurement.
+- **Corfu RF2/ACK2 stale-sidecar regression closure — 2026-07-16:** The
+  disk-durable Fig1-shaped smoke initially failed because independent runs
+  reused a fixed `TestTopic` sidecar and `WriteOnce` correctly returned
+  `CORFU_CONFLICT` for slot `(topic, broker, batch-seq)`. `run_multiclient.sh`
+  now namespaces Corfu replica media by artifact/trial/attempt (with an
+  explicit restart/redrive opt-out). On the real-CXL four-broker host, the
+  one-client, 10 GiB, ORDER=2/RF=2/ACK=2 disk smoke at local commit
+  `56e4037d` plus this uncommitted fix completed 2,621,440/2,621,440 ACKs;
+  the appended Fig1 row is `ok` at
+  `data/paper_eval/fig1/fig1_rf2_ack2_scaling/results.csv` (run
+  `20260715T232156Z`). No `WriteOnce` conflict, replication failure, or ACK
+  timeout was observed. This closes the stale-media regression and bounded
+  disk-durable RF2 process smoke, not a clean publication measurement.
+- **Corfu RF2/ACK2 memory-copy closure — 2026-07-16:** Corfu RF>1 now selects
+  a distinct in-process `WriteOnce` replica store for
+  `EMBARCADERO_CHAIN_REPLICATION_SINK=memory-copy`: it retains an owned remote
+  payload copy under the same ordered slot/value protocol, but does not create
+  a sidecar or claim media durability. `memory-accounting` is rejected for
+  Corfu RF>1 rather than mislabeled as replication. The real-CXL four-broker
+  smoke at local commit `56e4037d` plus this uncommitted fix completed
+  2,621,440/2,621,440 ACKs at ORDER=2/RF=2/ACK=2; its truthful run contract
+  records `ack2_primary_plus_1_ordered_memory_copy_replicas` and the appended
+  Fig1 row is `ok` at 0.636 GB/s overlap (run `20260715T233342Z`). This is a
+  bounded developer smoke, not a clean publication measurement.
 - **Transport-equivalence status — 2026-07-15:** `unit_baseline_transport_equivalence`
   drives identical deterministic registration/progress traces through the
   shared Scalog and LazyLog ordering cores for RF1/RF2/RF3, including duplicate

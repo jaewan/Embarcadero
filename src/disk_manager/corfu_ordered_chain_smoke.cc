@@ -51,6 +51,37 @@ int main() {
   unsetenv("EMBARCADERO_CORFU_SIDECAR_FAIL_AFTER_BYTES");
   { CorfuReplicaStore store(rollback_data,rollback_side); if(!Check(store.WriteOnce(d.slot,d.value,d.source_offset,d.payload,d.size)==CorfuWriteStatus::kWritten,"retry after rolled-back append")) return 1; }
   { CorfuReplicaStore store(rollback_data,rollback_side); if(!Check(store.Probe(d.slot).state==CorfuSlotState::kValue,"restart after retry")) return 1; }
+  // A durable group may share sync boundaries, but no member becomes visible
+  // before the data and sidecar group commit succeeds.
+  const std::string group_data=Temp(".group.data"), group_side=Temp(".group.side"); unlink(group_data.c_str()); unlink(group_side.c_str());
+  const CorfuSlotKey group_slot_a{"topic", 2, 20}, group_slot_b{"topic", 2, 21};
+  const CorfuValueId group_value_a{9, 20, 50, 3, 4}, group_value_b{9, 21, 51, 3, 4};
+  {
+    CorfuReplicaStore store(group_data, group_side);
+    const auto statuses = store.WriteGroup({{group_slot_a, group_value_a, 256, "data", 4}, {group_slot_b, group_value_b, 260, "data", 4}, {group_slot_a, group_value_a, 256, "data", 4}});
+    if (!Check(statuses.size()==3 && statuses[0]==CorfuWriteStatus::kWritten && statuses[1]==CorfuWriteStatus::kWritten && statuses[2]==CorfuWriteStatus::kWritten,"durable group write") ||
+        !Check(store.Probe(group_slot_a).state==CorfuSlotState::kValue && store.Probe(group_slot_b).state==CorfuSlotState::kValue,"durable group visible after commit")) return 1;
+  }
+  { CorfuReplicaStore store(group_data, group_side); if (!Check(store.Probe(group_slot_a).state==CorfuSlotState::kValue && store.Probe(group_slot_b).state==CorfuSlotState::kValue,"durable group replay")) return 1; }
+  unlink(group_data.c_str()); unlink(group_side.c_str());
+  const std::string failed_group_data=Temp(".failed-group.data"), failed_group_side=Temp(".failed-group.side"); unlink(failed_group_data.c_str()); unlink(failed_group_side.c_str());
+  setenv("EMBARCADERO_CORFU_SIDECAR_FAIL_AFTER_BYTES", "8", 1);
+  { CorfuReplicaStore store(failed_group_data, failed_group_side); const auto statuses=store.WriteGroup({{group_slot_a,group_value_a,256,"data",4},{group_slot_b,group_value_b,260,"data",4}}); if(!Check(statuses[0]==CorfuWriteStatus::kIoError && statuses[1]==CorfuWriteStatus::kIoError,"failed group has no durable acknowledgements") || !Check(store.Probe(group_slot_a).state==CorfuSlotState::kUnwritten && store.Probe(group_slot_b).state==CorfuSlotState::kUnwritten,"failed group remains invisible")) return 1; }
+  unsetenv("EMBARCADERO_CORFU_SIDECAR_FAIL_AFTER_BYTES");
+  { CorfuReplicaStore store(failed_group_data, failed_group_side); if(!Check(store.Probe(group_slot_a).state==CorfuSlotState::kUnwritten && store.Probe(group_slot_b).state==CorfuSlotState::kUnwritten,"failed group replay remains unwritten")) return 1; }
+  unlink(failed_group_data.c_str()); unlink(failed_group_side.c_str());
+  // Memory-copy mode must retain an owned payload and preserve the exact
+  // WriteOnce/idempotence/conflict contract, while making no restart claim.
+  {
+    CorfuReplicaStore memory_store("", "", false);
+    if (!Check(memory_store.WriteOnce(d.slot, d.value, d.source_offset, d.payload, d.size) == CorfuWriteStatus::kWritten,
+               "memory-copy value") ||
+        !Check(memory_store.Probe(d.slot).state == CorfuSlotState::kValue, "memory-copy probe") ||
+        !Check(memory_store.WriteOnce(d.slot, d.value, d.source_offset, d.payload, d.size) == CorfuWriteStatus::kAlreadySame,
+               "memory-copy idempotent same") ||
+        !Check(memory_store.WriteOnce(d.slot, {8,11,42,3,4}, d.source_offset, d.payload, d.size) == CorfuWriteStatus::kConflict,
+               "memory-copy conflict")) return 1;
+  }
   unlink(rollback_data.c_str()); unlink(rollback_side.c_str()); unlink(bad_data.c_str()); unlink(bad_side.c_str());
   unlink(data.c_str());unlink(side.c_str()); std::cout << "corfu ordered-chain/sidecar smoke passed\n"; return 0;
 }

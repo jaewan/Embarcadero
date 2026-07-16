@@ -428,6 +428,19 @@ start_local_brokers() {
   if [[ -n "${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-}" ]]; then
     broker_env+="EMBARCADERO_CHAIN_SYNC_INTERVAL_MS=$EMBARCADERO_CHAIN_SYNC_INTERVAL_MS "
   fi
+  # Explicitly forward CXL / ORDER=5 knobs (do not rely on ambient inheritance alone).
+  if [[ -n "${EMBARCADERO_CXL_SIZE:-}" ]]; then
+    broker_env+="EMBARCADERO_CXL_SIZE=$EMBARCADERO_CXL_SIZE "
+  fi
+  if [[ -n "${EMBARCADERO_CXL_ZERO_MODE:-}" ]]; then
+    broker_env+="EMBARCADERO_CXL_ZERO_MODE=$EMBARCADERO_CXL_ZERO_MODE "
+  fi
+  if [[ -n "${EMBARCADERO_CXL_MAP_POPULATE:-}" ]]; then
+    broker_env+="EMBARCADERO_CXL_MAP_POPULATE=$EMBARCADERO_CXL_MAP_POPULATE "
+  fi
+  if [[ -n "${EMBAR_ORDER5_EPOCH_US:-}" ]]; then
+    broker_env+="EMBAR_ORDER5_EPOCH_US=$EMBAR_ORDER5_EPOCH_US "
+  fi
   if [[ "$seq" == "SCALOG" ]]; then
     broker_env+="SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1} "
   fi
@@ -770,7 +783,21 @@ run_trial() {
   fi
 
 	  local trial_stats="$TRIAL_DIR/delivery_latency_stats.csv"
-	  if [[ ! -f "$trial_stats" ]]; then
+	  if [[ "$order" == "0" ]]; then
+	    # ORDER=0 uses Consume() (no ConsumeOrdered deliver stamp). Mechanism /
+	    # ablation cells still need publisher ACK latency for fair O0 vs O5 rows.
+	    local pub_stats="$TRIAL_DIR/pub_latency_stats.csv"
+	    if [[ ! -f "$pub_stats" ]]; then
+	      echo "ERROR: pub_latency_stats.csv missing for ORDER=0 trial $trial" >&2
+	      trial_failed=1
+	    elif ! grep -q 'append_send_to_ack_batch_latency\|append_send_to_ack' "$pub_stats" 2>/dev/null; then
+	      # Accept either exact metric name or any ack-row presence.
+	      if ! awk -F',' 'NR>1{found=1} END{exit !found}' "$pub_stats"; then
+	        echo "ERROR: pub_latency_stats.csv empty for ORDER=0 trial $trial" >&2
+	        trial_failed=1
+	      fi
+	    fi
+	  elif [[ ! -f "$trial_stats" ]]; then
 	    echo "ERROR: delivery_latency_stats.csv missing for trial $trial" >&2
 	    trial_failed=1
 	  elif ! awk -F',' '$13=="publish_to_deliver_latency"{found=1} END{exit !found}' "$trial_stats"; then

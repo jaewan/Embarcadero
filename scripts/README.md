@@ -10,6 +10,7 @@ This directory contains the experiment launchers for throughput, latency, and re
 | `scripts/setup/` | One-time cluster provisioning (deps, disks, CXL mount, cgroups, `sync_clocks.sh`). |
 | `scripts/lib/` | Reusable shell libraries sourced by launchers (`broker_lifecycle.sh`, `run_throughput_impl.sh`). |
 | `scripts/publication/` | Publication-grade experiment runners + result export/plotting. |
+| `PaperScripts/` | **Paper replication entry points** (forked overnight/E2 with honest TP defaults). Prefer this over editing `scripts/run_overnight_eval.sh` for paper runs. |
 | `scripts/plot/` | Plotting helpers for experimental data. |
 | `scripts/network/` | Cluster network/clock helpers (`run_clients.sh`, `run_servers.sh` iperf; `sync_clocks.sh`). |
 | `scripts/network-emulation/` | Standalone WAN/latency emulation harness. |

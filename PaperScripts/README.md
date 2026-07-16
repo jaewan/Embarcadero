@@ -31,6 +31,9 @@ Latency cells (E3 / E9 latency) still use `RUNTIME_MODE=latency` and do **not** 
 | `run_fig1_throughput_scaling.sh` | **Fig 1** RF2/ACK2 scaling N=1..4 (3R+1L); appendable CSV. Scalog RF2 sinks matched (`--replicate_to_disk` / mem-copy + amortized sync). LazyLog excluded by default (`SKIP_LAZYLOG=1`; metadata-bound). |
 | `plot_fig1_throughput_scaling.py` | Plot Fig 1 from campaign `results.csv` |
 | `FIG1.md` | Fig 1 draft + **caveats** (sink mismatch, metrics, CXL) |
+| `run_fig2_latency_vs_load.sh` | **Fig 2** latency vs load: primary Embar **O5 ACK2 RF2**; matched-load mechanism ablation (O0/O5/ACK2); optional 1–2 baseline points. |
+| `plot_fig2_latency_vs_load.py` | Plot Fig 2 load sweep + mechanism table/bar |
+| `FIG2.md` | Fig 2 draft + caveats (RF2 primary, mechanism table, pacing) |
 | `run_e2_throughput_matrix.sh` | Wait for idle cluster → E2 N=1 Embar+baselines matrix |
 | `run_overnight_eval.sh` | Full paper overnight (E2 + E3 + E9 + E8) |
 | `run_order5_latency_package.sh` | ORDER=5 latency package (wraps `scripts/publication/`) |
@@ -43,6 +46,13 @@ Latency cells (E3 / E9 latency) still use `RUNTIME_MODE=latency` and do **not** 
 NUM_TRIALS=1 bash PaperScripts/run_fig1_throughput_scaling.sh
 # Add trials later:
 NUM_TRIALS=1 bash PaperScripts/run_fig1_throughput_scaling.sh
+
+# Fig 2 latency vs load (primary Embar O5 ACK2 RF2 + mechanism ablation)
+NUM_TRIALS=3 WARMUP_TRIALS=1 bash PaperScripts/run_fig2_latency_vs_load.sh
+# Smoke:
+# FIG2_FAST_CXL=1 NUM_TRIALS=1 LOAD_POINTS_MBPS="100 500" MECHANISM_LOAD_MBPS=100 \
+#   TOTAL_BYTES=$((512<<20)) bash PaperScripts/run_fig2_latency_vs_load.sh
+# Requires: cmake -DCOLLECT_LATENCY_STATS=ON (local + remote throughput_test)
 
 # Smoke overnight (fast)
 SMOKE=1 bash PaperScripts/run_overnight_eval.sh
