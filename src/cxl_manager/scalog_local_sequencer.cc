@@ -316,7 +316,12 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 	// [[CORRECTNESS_FIX]] Track the last ordered values locally. We only publish
 	// tinode_->offsets[].ordered AFTER the batch header export slot is written, so
 	// ACK1 (which reads ordered) never exceeds export visibility.
-	uint64_t last_ordered_count = 0;
+	// [[FIX: analytical last_ordered_count]] Read the prior committed count
+	// from tinode->ordered instead of CXL message headers (which may have
+	// stale logical_offset values from prior experiments on non-coherent CXL).
+	// This makes ordering independent of DelegationThread-written logical_offset.
+	uint64_t last_ordered_count =
+		tinode_->offsets[broker_id_].ordered;  // prior committed count
 	size_t last_ordered_offset = 0;
 
 	auto publish_batch = [&](void* batch_start_addr, size_t publish_size,
@@ -404,7 +409,9 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 				}
 				local_progress = true;
 				if (batch_num_msg == 0) {
-					batch_start_logical_offset = msg_to_order_->logical_offset;
+					// start_logical_offset = count before this batch = last_ordered_count - 0
+					// (last_ordered_count has already been incremented above, so subtract 1)
+					batch_start_logical_offset = last_ordered_count - 1;
 				}
 				total_size += msg_to_order_->paddedSize;
 				batch_num_msg++;
@@ -412,8 +419,8 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 				msg_to_order_->total_order = seq_;
 				std::atomic_thread_fence(std::memory_order_release);
 
-				// Track locally; tinode update deferred to publish_batch
-				last_ordered_count = static_cast<uint64_t>(msg_to_order_->logical_offset) + 1;
+				// Compute last_ordered_count analytically (avoid stale CXL read)
+				last_ordered_count++;
 				last_ordered_offset = static_cast<size_t>(
 					static_cast<uint8_t*>(static_cast<void*>(msg_to_order_)) - static_cast<uint8_t*>(cxl_addr_));
 
