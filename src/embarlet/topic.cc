@@ -1027,6 +1027,14 @@ void Topic::DelegationThread() {
 					const bool need_per_msg_flush = (seq_type_ == SCALOG || seq_type_ == LAZYLOG);
 					bool touched_message_headers = false;
 					for (size_t i = 0; i < current_batch->num_msg; ++i) {
+						// [[FIX: NT ingest paddedSize visibility]] For SCALOG/LAZYLOG with
+						// NT ingest, message payload is written to CXL via non-temporal stores
+						// (bypassing CPU cache). Read paddedSize from CXL (not stale cache)
+						// by flushing the cacheline before the plain load.
+						if (need_per_msg_flush) {
+							CXL::flush_cacheline(msg_ptr);
+							CXL::load_fence();
+						}
 						msg_ptr->logical_offset = logical_offset_;
 						msg_ptr->segment_header = reinterpret_cast<uint8_t*>(msg_ptr) - CACHELINE_SIZE;
 
