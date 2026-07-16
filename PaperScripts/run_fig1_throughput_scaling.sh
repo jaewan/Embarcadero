@@ -458,11 +458,15 @@ start_lazylog_metadata() {
         local remote_bin="/home/domin/Embarcadero/build/bin/lazylog_metadata_replica"
         local remote_log="/tmp/lazylog_meta_b_${CAMPAIGN_ID}_${PASS_ID}.log"
 
-        # Verify remote binary exists
+        # Verify remote binary exists and is executable.
+        # NOTE: do NOT copy from broker — glibc version mismatch will prevent it
+        # from running on c4. Build natively: ssh c4 "cd ~/Embarcadero/build && \
+        #   cmake --build . --target lazylog_metadata_replica -j4"
         ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
             "[[ -x '$remote_bin' ]]" 2>/dev/null || {
             log "FATAL: $remote_bin not found on $LAZYLOG_METADATA_HOST_B"
-            log "  Fix: scp $replica_bin ${LAZYLOG_METADATA_HOST_B}:${remote_bin}"
+            log "  Build natively (do NOT scp from broker — glibc mismatch):"
+            log "  ssh $LAZYLOG_METADATA_HOST_B 'cd ~/Embarcadero/build && cmake --build . --target lazylog_metadata_replica -j4'"
             exit 1
         }
 
