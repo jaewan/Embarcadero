@@ -114,14 +114,15 @@ The script already sets `REQUIRE_FAITHFUL_LAZYLOG=1` and
 `EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS=$LAZYLOG_RF2_METADATA_ENDPOINTS`
 for all LazyLog cells (run_fig1_throughput_scaling.sh:500-508).
 
-> ⚠️ **Testbed fault-domain limitation:** both metadata replicas run on the same
-> machine (moscxl, ports 50081 and 50082).  The
-> `lazylog_metadata_replica_contract.md` requires distinct failure domains; this
-> deployment violates that requirement.  Consequence: a single broker-host crash
-> loses both replicas — the RF=2 durability claim does not hold across host
-> failures on this testbed.  Label all results as "co-located RF=2 (single
-> host)" and do not claim cross-host durability.  For publication, replicas must
-> be placed on separate machines (e.g., c4 and c3 via SSH forwarding).
+> **Cross-host RF=2 deployment (publication-grade):**
+> Replica A runs on moscxl (broker, `10.10.10.10:50081`); replica B runs on
+> c4 (`10.10.10.12:50082`) via SSH.  Distinct physical machines = distinct
+> failure domains per `lazylog_metadata_replica_contract.md`.  Each sidecar
+> resides on local NVMe of its host.  `start_lazylog_metadata` in
+> `run_fig1_throughput_scaling.sh` handles remote startup and TCP readiness
+> checking (20-second timeout).  Fallback single-host mode is still available
+> via `LAZYLOG_METADATA_HOST_B=local` but produces results labeled
+> "same-host RF=2" and cannot support cross-host durability claims.
 
 ---
 
@@ -226,9 +227,10 @@ gate on the binding frontier. Embarcadero ACK₂ is both ordered and durable."
 Before running:
 
 - [ ] Build `embarlet` and `lazylog_metadata_replica` after double-credit fix commit
-- [ ] Confirm `build/bin/lazylog_metadata_replica` exists on moscxl
-- [ ] Preflight: `nc -z 10.10.10.10 50081 && nc -z 10.10.10.10 50082`
-- [ ] Sidecar dirs exist and writable: `.Replication/lazylog_meta/a` and `b`
+- [ ] Confirm `build/bin/lazylog_metadata_replica` exists on moscxl AND on c4 (`ssh c4 ls ~/Embarcadero/build/bin/lazylog_metadata_replica`)
+- [ ] Preflight: `nc -z 10.10.10.10 50081 && nc -z 10.10.10.12 50082`
+- [ ] Sidecar dir writable on broker: `.Replication/lazylog_meta/a/`
+- [ ] Sidecar dir writable on c4: `ssh c4 mkdir -p ~/Embarcadero/.Replication/lazylog_meta_b/`
 - [ ] Run single N=1 preflight cell; verify `overlap_gbps > 0` and `status=ok`
 - [ ] Confirm broker logs show "LazyLog metadata replication enabled with 2 replicas"
 - [ ] Sync `throughput_test` binary to all client machines (c1–c4)
@@ -278,3 +280,4 @@ both metadata and data replication together.  Not part of the main paper result.
 | 2026-07-15 | Faithful path implemented; channel/stub reuse fixed; experiment plan written |
 | 2026-07-15 | Double-credit fix for SCALOG/LAZYLOG DrainDurableBatches committed to broker |
 | 2026-07-16 | Post-review fixes: ACK2 canary scoped to ORDER=0 only; LazyLog batch_complete CXL flush added; LazyLog mem guard added to fig1 script; fdatasync estimate corrected; fault-domain caveat added; RF=1 silent fallback documented |
+| 2026-07-16 | SCI-2 resolved: cross-host deployment implemented — replica A on moscxl, replica B on c4 (mos182, 10.10.10.12:50082). start_lazylog_metadata rewritten with SSH remote launch and TCP readiness polling (20s timeout). NT-ingest paddedSize flush fix committed. |

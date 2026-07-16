@@ -84,7 +84,17 @@ HOSTS_N3="${HOSTS_N3:-c4,c3,c1}"
 HOSTS_N4="${HOSTS_N4:-c4,c3,c1,local}"
 N_VALUES="${N_VALUES:-1 2 3 4}"
 
-LAZYLOG_RF2_METADATA_ENDPOINTS="${LAZYLOG_RF2_METADATA_ENDPOINTS:-10.10.10.10:50081,10.10.10.10:50082}"
+# Cross-host RF=2: replica A on broker (moscxl, 10.10.10.10:50081),
+# replica B on c4 (mos182, 10.10.10.12:50082) — distinct failure domains.
+# lazylog_metadata_replica_contract.md requires separate failure domains for RF=2.
+# Both sidecar paths must be on local NVMe of each host, not shared storage.
+LAZYLOG_METADATA_HOST_A="${LAZYLOG_METADATA_HOST_A:-local}"      # local = broker itself
+LAZYLOG_METADATA_HOST_B="${LAZYLOG_METADATA_HOST_B:-c4}"
+LAZYLOG_METADATA_PORT_A="${LAZYLOG_METADATA_PORT_A:-50081}"
+LAZYLOG_METADATA_PORT_B="${LAZYLOG_METADATA_PORT_B:-50082}"
+LAZYLOG_METADATA_IP_A="${LAZYLOG_METADATA_IP_A:-10.10.10.10}"
+LAZYLOG_METADATA_IP_B="${LAZYLOG_METADATA_IP_B:-10.10.10.12}"
+LAZYLOG_RF2_METADATA_ENDPOINTS="${LAZYLOG_RF2_METADATA_ENDPOINTS:-${LAZYLOG_METADATA_IP_A}:${LAZYLOG_METADATA_PORT_A},${LAZYLOG_METADATA_IP_B}:${LAZYLOG_METADATA_PORT_B}}"
 
 # Exclusive campaign lock (does NOT wrap run_multiclient's flock).
 exec 9>"$LOCK_FILE"
@@ -392,7 +402,7 @@ run_fig1_cell() {
 }
 
 # ---------------------------------------------------------------------------
-# Metadata replicas for LazyLog RF2
+# Metadata replicas for LazyLog RF2 (cross-host: broker + c4)
 # ---------------------------------------------------------------------------
 metadata_pids=()
 cleanup_metadata() {
@@ -401,6 +411,11 @@ cleanup_metadata() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
+    # Kill remote replica B on c4
+    if [[ "$LAZYLOG_METADATA_HOST_B" != "local" ]]; then
+        ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
+            "pkill -f 'lazylog_metadata_replica.*${LAZYLOG_METADATA_PORT_B}' 2>/dev/null; true" 2>/dev/null || true
+    fi
 }
 trap cleanup_metadata EXIT INT TERM
 
@@ -408,27 +423,83 @@ start_lazylog_metadata() {
     if [[ "$SKIP_BASELINES" == "1" ]]; then
         return 0
     fi
-    if [[ ! -x "$PROJECT_ROOT/build/bin/lazylog_metadata_replica" ]]; then
-        log "FATAL: missing build/bin/lazylog_metadata_replica"
+
+    local replica_bin="$PROJECT_ROOT/build/bin/lazylog_metadata_replica"
+    if [[ ! -x "$replica_bin" ]]; then
+        log "FATAL: missing $replica_bin"
         exit 1
     fi
-    setsid "$PROJECT_ROOT/build/bin/lazylog_metadata_replica" \
-        --listen 0.0.0.0:50081 --sidecar "$META_ROOT/a/metadata.sidecar" \
+
+    # --- Replica A: local (broker/moscxl) ---
+    mkdir -p "$META_ROOT/a"
+    setsid "$replica_bin" \
+        --listen "0.0.0.0:${LAZYLOG_METADATA_PORT_A}" \
+        --sidecar "$META_ROOT/a/metadata.sidecar" \
         >"$META_ROOT/replica_a.log" 2>&1 < /dev/null 9>&- &
     metadata_pids+=("$!")
-    setsid "$PROJECT_ROOT/build/bin/lazylog_metadata_replica" \
-        --listen 0.0.0.0:50082 --sidecar "$META_ROOT/b/metadata.sidecar" \
-        >"$META_ROOT/replica_b.log" 2>&1 < /dev/null 9>&- &
-    metadata_pids+=("$!")
-    sleep 1
-    local pid
-    for pid in "${metadata_pids[@]}"; do
-        kill -0 "$pid" 2>/dev/null || {
-            log "FATAL: lazylog metadata replica failed — $META_ROOT"
+
+    # --- Replica B: remote host (c4/mos182) — distinct failure domain ---
+    if [[ "$LAZYLOG_METADATA_HOST_B" == "local" ]]; then
+        # Fallback single-host mode (not publication-grade for cross-host durability)
+        log "WARN: replica B is local — same-host RF=2, not cross-host durable"
+        mkdir -p "$META_ROOT/b"
+        setsid "$replica_bin" \
+            --listen "0.0.0.0:${LAZYLOG_METADATA_PORT_B}" \
+            --sidecar "$META_ROOT/b/metadata.sidecar" \
+            >"$META_ROOT/replica_b.log" 2>&1 < /dev/null 9>&- &
+        metadata_pids+=("$!")
+    else
+        local remote_sidecar_dir="/home/domin/Embarcadero/.Replication/lazylog_meta_b/${CAMPAIGN_ID}_${PASS_ID}"
+        local remote_sidecar="${remote_sidecar_dir}/metadata.sidecar"
+        local remote_bin="/home/domin/Embarcadero/build/bin/lazylog_metadata_replica"
+        local remote_log="/tmp/lazylog_meta_b_${CAMPAIGN_ID}_${PASS_ID}.log"
+
+        # Verify remote binary exists
+        ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
+            "[[ -x '$remote_bin' ]]" 2>/dev/null || {
+            log "FATAL: $remote_bin not found on $LAZYLOG_METADATA_HOST_B — run: scp $replica_bin $LAZYLOG_METADATA_HOST_B:$remote_bin"
             exit 1
         }
+
+        # Kill any stale replica B on the remote host
+        ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
+            "pkill -f 'lazylog_metadata_replica.*${LAZYLOG_METADATA_PORT_B}' 2>/dev/null; true" 2>/dev/null || true
+        sleep 0.3
+
+        ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
+            "mkdir -p '$remote_sidecar_dir' && setsid '$remote_bin' \
+             --listen '0.0.0.0:${LAZYLOG_METADATA_PORT_B}' \
+             --sidecar '$remote_sidecar' \
+             >'$remote_log' 2>&1 </dev/null &" 2>/dev/null || {
+            log "FATAL: failed to start replica B on $LAZYLOG_METADATA_HOST_B"
+            exit 1
+        }
+        log "Replica B started on $LAZYLOG_METADATA_HOST_B:${LAZYLOG_METADATA_PORT_B}"
+    fi
+
+    # Wait for both replicas to be ready via TCP port check (readiness, not just liveness)
+    local deadline=$(( SECONDS + 20 ))
+    local all_ready=0
+    while [[ $SECONDS -lt $deadline ]]; do
+        local a_ok=0 b_ok=0
+        nc -z "${LAZYLOG_METADATA_IP_A}" "${LAZYLOG_METADATA_PORT_A}" 2>/dev/null && a_ok=1
+        nc -z "${LAZYLOG_METADATA_IP_B}" "${LAZYLOG_METADATA_PORT_B}" 2>/dev/null && b_ok=1
+        if [[ $a_ok -eq 1 && $b_ok -eq 1 ]]; then
+            all_ready=1
+            break
+        fi
+        sleep 0.5
     done
-    log "LazyLog metadata replicas up ($LAZYLOG_RF2_METADATA_ENDPOINTS)"
+
+    if [[ $all_ready -eq 0 ]]; then
+        log "FATAL: metadata replicas did not become ready within 20s"
+        log "  A ($LAZYLOG_METADATA_IP_A:$LAZYLOG_METADATA_PORT_A): $(nc -z ${LAZYLOG_METADATA_IP_A} ${LAZYLOG_METADATA_PORT_A} 2>/dev/null && echo OK || echo FAIL)"
+        log "  B ($LAZYLOG_METADATA_IP_B:$LAZYLOG_METADATA_PORT_B): $(nc -z ${LAZYLOG_METADATA_IP_B} ${LAZYLOG_METADATA_PORT_B} 2>/dev/null && echo OK || echo FAIL)"
+        exit 1
+    fi
+
+    log "LazyLog metadata replicas up — A(local):${LAZYLOG_METADATA_PORT_A} B(${LAZYLOG_METADATA_HOST_B}):${LAZYLOG_METADATA_PORT_B}"
+    log "Endpoints: $LAZYLOG_RF2_METADATA_ENDPOINTS"
 }
 
 # ---------------------------------------------------------------------------
