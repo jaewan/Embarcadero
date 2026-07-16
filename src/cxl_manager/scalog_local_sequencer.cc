@@ -372,10 +372,16 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 						reinterpret_cast<uintptr_t>(cxl_addr_);
 					const size_t valid_end =
 						tinode_->offsets[broker_id_].validated_written_byte_offset;
+					const size_t log_start =
+						tinode_->offsets[broker_id_].log_offset;
+					// If DelegationThread has not yet processed any bytes, skip ordering.
+					// Prevents stale CXL reads when global cut races ahead of delegation.
+					if (valid_end <= log_start) {
+						break;
+					}
 					if (msg_to_order_->next_msg_diff == 0 ||
 					    msg_to_order_->paddedSize == 0 ||
-					    (valid_end > tinode_->offsets[broker_id_].log_offset &&
-					     msg_byte_off >= valid_end)) {
+					    msg_byte_off >= valid_end) {
 						LOG_EVERY_N(WARNING, 100)
 							<< "[ScalogSequencer] stopping at stale/past-end msg broker=" << broker_id_
 							<< " i=" << i
