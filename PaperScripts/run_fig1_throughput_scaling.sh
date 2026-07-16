@@ -474,12 +474,13 @@ start_lazylog_metadata() {
         ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
             "pkill -f 'lazylog_metadata_replica.*${LAZYLOG_METADATA_PORT_B}' 2>/dev/null; true" 2>/dev/null || true
 
-        # Start replica B on c4, listening on loopback only (port not exposed externally)
-        ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
-            "mkdir -p '$remote_sidecar_dir' && setsid '$remote_bin' \
+        # Start replica B on c4, listening on loopback only (port not exposed externally).
+        # Use nohup + disown so remote bash exits immediately, allowing SSH to return.
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "$LAZYLOG_METADATA_HOST_B" \
+            "mkdir -p '$remote_sidecar_dir' && nohup '$remote_bin' \
              --listen '127.0.0.1:${LAZYLOG_METADATA_PORT_B}' \
              --sidecar '$remote_sidecar' \
-             >'$remote_log' 2>&1 </dev/null &" 2>/dev/null || {
+             </dev/null >'$remote_log' 2>&1 & disown" 2>/dev/null || {
             log "FATAL: failed to start replica B on $LAZYLOG_METADATA_HOST_B"
             exit 1
         }
