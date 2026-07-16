@@ -358,25 +358,32 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 	for(auto &cut : global_cut_delta){
 		if(cut.first == broker_id_){
 			for(int64_t i = 0; i < cut.second; i++){
-				// [[FIX: ScalogSequencer boundary guard]] The CXL log area is NOT
-				// zeroed by zero_mode=metadata, so messages past the current
-				// experiment's written range have stale paddedSize/next_msg_diff/
-				// logical_offset from prior runs. Flush before read to ensure the
-				// sequencer sees the freshest CXL values, then stop if we have gone
-				// past the valid log range (logical_offset >= written count).
-				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
-					reinterpret_cast<const volatile void*>(msg_to_order_)));
-				Embarcadero::CXL::load_fence();
-				if (msg_to_order_->next_msg_diff == 0 ||
-				    msg_to_order_->paddedSize == 0 ||
-				    msg_to_order_->logical_offset >= tinode_->offsets[broker_id_].written) {
-					LOG_EVERY_N(WARNING, 100)
-						<< "[ScalogSequencer] stopping at stale/past-end msg broker=" << broker_id_
-						<< " i=" << i
-						<< " logical_offset=" << msg_to_order_->logical_offset
-						<< " written=" << tinode_->offsets[broker_id_].written
-						<< " next_msg_diff=" << msg_to_order_->next_msg_diff;
-					break;
+				// [[FIX: ScalogSequencer validated boundary]] The CXL log area is NOT
+				// zeroed by zero_mode=metadata; messages past the DelegationThread's
+				// validated byte range have stale header values from prior experiments.
+				// Use validated_written_byte_offset (set by DelegationThread after
+				// flushing msg headers) as the byte-exact valid range boundary.
+				{
+					Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+						reinterpret_cast<const volatile void*>(msg_to_order_)));
+					Embarcadero::CXL::load_fence();
+					const uintptr_t msg_byte_off =
+						reinterpret_cast<uintptr_t>(msg_to_order_) -
+						reinterpret_cast<uintptr_t>(cxl_addr_);
+					const size_t valid_end =
+						tinode_->offsets[broker_id_].validated_written_byte_offset;
+					if (msg_to_order_->next_msg_diff == 0 ||
+					    msg_to_order_->paddedSize == 0 ||
+					    (valid_end > tinode_->offsets[broker_id_].log_offset &&
+					     msg_byte_off >= valid_end)) {
+						LOG_EVERY_N(WARNING, 100)
+							<< "[ScalogSequencer] stopping at stale/past-end msg broker=" << broker_id_
+							<< " i=" << i
+							<< " msg_byte_off=" << msg_byte_off
+							<< " valid_end=" << valid_end
+							<< " logical_offset=" << msg_to_order_->logical_offset;
+						break;
+					}
 				}
 				local_progress = true;
 				if (batch_num_msg == 0) {
