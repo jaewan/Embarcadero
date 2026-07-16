@@ -972,6 +972,10 @@ void Topic::DelegationThread() {
 	size_t batches_since_flush = 0;
 	size_t bytes_since_flush = 0;
 
+	// [[DELEGATION_STALL_DIAG]] Track when DelegationThread waits >5s for batch_complete=1.
+	// This catches the tail-drain stall where the last batch's PBR slot never gets published.
+	auto delegation_spin_start = std::chrono::steady_clock::now();
+	bool delegation_stall_logged = false;
 	while (!stop_threads_) {
 		if (current_batch) {
 			// batch_complete is in the first 64B of BatchHeader. Only flush the first
@@ -979,6 +983,26 @@ void Topic::DelegationThread() {
 			// batch_complete==1 (saves one CLFLUSHOPT per spin iteration).
 			CXL::flush_cacheline(current_batch);
 			CXL::load_fence();
+		}
+		if (current_batch && !__atomic_load_n(&current_batch->batch_complete, __ATOMIC_ACQUIRE)) {
+			const auto spin_now = std::chrono::steady_clock::now();
+			const auto spin_ms = std::chrono::duration_cast<std::chrono::milliseconds>(spin_now - delegation_spin_start).count();
+			if (spin_ms > 5000 && !delegation_stall_logged) {
+				delegation_stall_logged = true;
+				const size_t slot_offset = reinterpret_cast<uint8_t*>(current_batch) -
+					reinterpret_cast<uint8_t*>(delegation_ring_start);
+				LOG(WARNING) << "[DelegationThread stall] broker=" << broker_id_
+				             << " waiting >5s for batch_complete=1"
+				             << " slot_offset=" << slot_offset
+				             << " num_msg=" << current_batch->num_msg
+				             << " log_idx=" << current_batch->log_idx
+				             << " pbr=" << current_batch->pbr_absolute_index
+				             << " publish_commit=" << current_batch->publish_commit
+				             << " validated_written=" << validated_written_byte_offset_;
+			}
+		} else {
+			delegation_spin_start = std::chrono::steady_clock::now();
+			delegation_stall_logged = false;
 		}
 		if (current_batch && __atomic_load_n(&current_batch->batch_complete, __ATOMIC_ACQUIRE)) {
 			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(current_batch) + 64);
@@ -1914,10 +1938,13 @@ void Topic::MaybeAdvanceLazyLogAppendVisibility() const {
 }
 
 void Topic::RecordOrder0DurableBatch(uint64_t durable_sequence_key, uint32_t num_msg, uint32_t client_id) {
+	// Only EMBARCADERO ORDER=0 uses this path; SCALOG and LAZYLOG credit
+	// per_client_durable_ exclusively through their sequencer DrainDurableBatches
+	// (Path B), which gates on ordered AND min(replication_done). Including them
+	// here double-credits every message and allows clients to exit ACK-wait
+	// when only ~50% of bytes are actually durable.
 	const bool uses_replication_done_durability =
-		(seq_type_ == EMBARCADERO && order_ == 0) ||
-		(seq_type_ == SCALOG && order_ == Embarcadero::kOrderPerBroker) ||
-		(seq_type_ == LAZYLOG && order_ == Embarcadero::kOrderTotal);
+		(seq_type_ == EMBARCADERO && order_ == 0);
 	if (!uses_replication_done_durability || replication_factor_ <= 0 || num_msg == 0) {
 		return;
 	}
@@ -1937,9 +1964,7 @@ void Topic::RecordOrder0DurableBatch(uint64_t durable_sequence_key, uint32_t num
 
 void Topic::MaybeAdvanceOrder0DurableVisibility() const {
 	const bool uses_replication_done_durability =
-		(seq_type_ == EMBARCADERO && order_ == 0) ||
-		(seq_type_ == SCALOG && order_ == Embarcadero::kOrderPerBroker) ||
-		(seq_type_ == LAZYLOG && order_ == Embarcadero::kOrderTotal);
+		(seq_type_ == EMBARCADERO && order_ == 0);
 	if (!uses_replication_done_durability || replication_factor_ <= 0) {
 		return;
 	}
@@ -2177,6 +2202,21 @@ bool Topic::SupportsPerClientAckLevel2Durable() const {
 void Topic::UpdatePerClientDurable(uint32_t client_id, uint64_t count) {
 	absl::MutexLock lock(&per_client_durable_mu_);
 	per_client_durable_[client_id] += count;
+	// Canary: per-client durable total must never exceed messages written on this
+	// broker.  A violation means the durable counter is being double-credited
+	// (e.g. two independent paths both crediting the same messages).
+	if (tinode_ != nullptr) {
+		const uint64_t written = tinode_->offsets[broker_id_].written;
+		const uint64_t new_client_durable = per_client_durable_[client_id];
+		if (new_client_durable > written + 1) {
+			LOG(WARNING) << "[ACK2 canary] per_client_durable_ EXCEEDS broker written"
+			             << " broker=" << broker_id_
+			             << " client=" << client_id
+			             << " durable=" << new_client_durable
+			             << " written=" << written
+			             << " -- double-credit bug detected";
+		}
+	}
 }
 
 void Topic::MaybeAdvanceOrder5DurableFromCV() {
@@ -2437,7 +2477,16 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
     size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
     size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
     batch_header_location = &batch_header_ring[slot_idx];
+    // [[FIX: stale-batch_complete]] Flush batch_complete=0 to CXL immediately.
+    // The DelegationThread reads slots via flush+load from CXL. If batch_complete=1
+    // persists from a prior experiment run (zero_mode=metadata only clears metadata,
+    // not the batch headers ring), the DelegationThread spuriously processes this
+    // stale slot and skips the real last batch, causing a permanent tail-drain stall.
+    // Writing 0 and flushing to CXL ensures the DelegationThread sees the reset.
     __atomic_store_n(&batch_header_location->batch_complete, 0, __ATOMIC_RELEASE);
+    CXL::store_fence();
+    CXL::flush_cacheline(batch_header_location);
+    CXL::store_fence();
 
 	// Calculate addresses
 	const unsigned long long int segment_metadata =
@@ -2456,13 +2505,10 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
         rep_offset = scalog_batch_offset_.fetch_add(batch_header.total_size, std::memory_order_relaxed);
     }
 
-	const uint64_t durable_sequence_key = kCxlScalogMode
-		? scalog_durable_local_message_offset_.fetch_add(batch_header.num_msg,
-		                                                std::memory_order_relaxed)
-		: batch_header.start_logical_offset;
-
 	// Return replication callback
-	return [this, batch_header, log, rep_offset, durable_sequence_key, kCxlScalogMode](void* log_ptr, size_t /*placeholder*/) {
+	// ACK2 credit for SCALOG goes through ScalogLocalSequencer::DrainDurableBatches
+	// (Path B) gated on ordered AND min(replication_done). No direct call here.
+	return [this, batch_header, log, rep_offset, kCxlScalogMode](void* log_ptr, size_t /*placeholder*/) {
 		bool data_replication_submitted = kCxlScalogMode;
 		// Handle replication if needed
 		if (!kCxlScalogMode && replication_factor_ > 0 && scalog_replication_client_) {
@@ -2477,8 +2523,7 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 			LOG(ERROR) << "Scalog data replication failed; not recording durable batch";
 			return;
 		}
-		RecordOrder0DurableBatch(durable_sequence_key,
-			batch_header.num_msg, batch_header.client_id);
+		// ACK2 credit handled by ScalogLocalSequencer::DrainDurableBatches (Path B).
 	};
 }
 
@@ -2525,12 +2570,7 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 	if (!kCxlLazyLogMode) {
 		rep_offset = scalog_batch_offset_.fetch_add(batch_header.total_size, std::memory_order_relaxed);
 	}
-	const uint64_t durable_sequence_key = kCxlLazyLogMode
-		? scalog_durable_local_message_offset_.fetch_add(batch_header.num_msg,
-		                                                std::memory_order_relaxed)
-		: batch_header.start_logical_offset;
-
-	return [this, batch_header, log, rep_offset, durable_sequence_key, kCxlLazyLogMode](void* /*log_ptr*/, size_t /*placeholder*/) {
+	return [this, batch_header, log, rep_offset, kCxlLazyLogMode](void* /*log_ptr*/, size_t /*placeholder*/) {
 		bool data_replication_submitted = kCxlLazyLogMode;
 		if (!kCxlLazyLogMode && replication_factor_ > 0 && scalog_replication_client_) {
 			data_replication_submitted = scalog_replication_client_->ReplicateData(
@@ -2563,10 +2603,8 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 		}
 		RecordLazyLogMetadataReplicaAck(batch_header.start_logical_offset,
 			batch_header.num_msg, batch_header.client_id);
-		// ACK2 is attributed only after metadata replication succeeds; the
-		// shared Scalog-style media frontier then gates this local prefix.
-		RecordOrder0DurableBatch(durable_sequence_key,
-			batch_header.num_msg, batch_header.client_id);
+		// ACK2 credit for LAZYLOG goes through LazyLogLocalSequencer::
+		// DrainDurableBatches -> RecordPerClientDurableVisibility (Path B).
 	};
 }
 

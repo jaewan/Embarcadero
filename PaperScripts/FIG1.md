@@ -134,6 +134,17 @@ Fixes applied: channel/stub reuse; contract renamed to
 `SKIP_LAZYLOG=1`. Re-include only as a separate “faithful append” row, not as a
 disk/mem sink companion.
 
+**Full experiment plan: `PaperScripts/FIG2_LAZYLOG.md`.**
+
+Preflight cell (run this first to confirm the faithful path is live):
+```bash
+NUM_TRIALS=1 SKIP_LAZYLOG=0 SKIP_MEM=1 SKIP_BASELINES=0 SKIP_SCALOG_LAZYLOG=0 \
+  ONLY_CELLS=fig1_lazylog_o2_disk_n1 \
+  bash PaperScripts/run_fig1_throughput_scaling.sh
+```
+Check broker log for “LazyLog metadata replication enabled with 2 replicas”
+and the result CSV for `status=ok` and `overlap_gbps > 0`.
+
 ### B. Overlap vs Bandwidth vs Send-done
 
 | Metric | Meaning |
