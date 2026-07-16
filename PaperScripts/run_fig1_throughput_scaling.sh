@@ -476,7 +476,7 @@ start_lazylog_metadata() {
 
         # Start replica B on c4, listening on loopback only (port not exposed externally).
         # Use nohup + disown so remote bash exits immediately, allowing SSH to return.
-        ssh -o BatchMode=yes -o ConnectTimeout=10 "$LAZYLOG_METADATA_HOST_B" \
+        ssh -f -o BatchMode=yes -o ConnectTimeout=10 "$LAZYLOG_METADATA_HOST_B" \
             "mkdir -p '$remote_sidecar_dir' && nohup '$remote_bin' \
              --listen '127.0.0.1:${LAZYLOG_METADATA_PORT_B}' \
              --sidecar '$remote_sidecar' \
