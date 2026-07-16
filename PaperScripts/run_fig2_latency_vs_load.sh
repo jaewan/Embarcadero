@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # PaperScripts/run_fig2_latency_vs_load.sh
 #
-# Fig 2: latency vs offered load under the paper shared-log contract.
+# Fig 2: append→ACK latency vs offered load (paper coordination claim).
 #
-# Primary panel: Embar O5 ACK2 RF=2 disk-durable (matches Fig1 / shared-log claim)
-# Mechanism ablation (matched load): O0 ACK1 | O5 ACK1 RF0 | O5 ACK2 RF2
-# Optional: matched-load baseline points only (SKIP_BASELINES=0)
+# Primary panel: Embar O5 ACK2 RF=2 **memory-copy** (isolates ordering path;
+#   matches paper "RF2 nearly free / CXL poll" latency claim)
+# Disk ablation (matched load): Embar O5 ACK2 RF=2 disk-durable (media cost)
+# Mechanism: O0 ACK1 | O5 ACK1 RF0 | O5 ACK2 mem | O5 ACK2 disk
+# Baselines (default on): Corfu/Scalog RF2 ACK2 **matched mem sink**
+#
+# Primary metric: append→ack (pub_ack_*). Deliver is a scoped inset only.
 #
 # Results append to:
 #   data/paper_eval/fig2/<CAMPAIGN_ID>/results.csv
@@ -13,11 +17,9 @@
 #
 # Usage:
 #   NUM_TRIALS=1 bash PaperScripts/run_fig2_latency_vs_load.sh
-#   NUM_TRIALS=3 WARMUP_TRIALS=1 bash ...
-#   ONLY_CELLS=fig2_embar_o5_ack2_rf2 bash ...
-#   SKIP_MECHANISM=1 bash ...
-#   INCLUDE_BASELINES=1 BASELINE_LOAD_MBPS="500 1000" bash ...
-#   FIG2_PREFLIGHT_ONLY=1 bash ...   # validate binaries/media; start no cell
+#   SKIP_DISK_ABLATION=1 bash ...          # mem-only
+#   INCLUDE_BASELINES=0 bash ...
+#   FIG2_PREFLIGHT_ONLY=1 bash ...
 #
 set -uo pipefail
 
@@ -26,7 +28,7 @@ PROJECT_ROOT="$(cd "$PAPER_DIR/.." && pwd)"
 SCRIPTS_DIR="$PROJECT_ROOT/scripts"
 cd "$PROJECT_ROOT"
 
-CAMPAIGN_ID="${CAMPAIGN_ID:-fig2_latency_vs_load}"
+CAMPAIGN_ID="${CAMPAIGN_ID:-fig2_append_latency}"
 PASS_ID="${PASS_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$PROJECT_ROOT/data/paper_eval/fig2/$CAMPAIGN_ID}"
 LOG_DIR="$OUT_ROOT/logs/$PASS_ID"
@@ -35,9 +37,10 @@ RESULTS_CSV="${RESULTS_CSV:-$OUT_ROOT/results.csv}"
 MECH_CSV="${MECH_CSV:-$OUT_ROOT/mechanism_summary.csv}"
 SUMMARY_LOG="$OUT_ROOT/sweep_summary.log"
 CONTRACT_MD="$OUT_ROOT/campaign_contract.md"
-FIG_PDF="$OUT_ROOT/fig2_latency_vs_load.pdf"
-FIG_PNG="$OUT_ROOT/fig2_latency_vs_load.png"
+FIG_PDF="$OUT_ROOT/fig2_append_latency.pdf"
+FIG_PNG="$OUT_ROOT/fig2_append_latency.png"
 MECH_PDF="$OUT_ROOT/fig2_mechanism_ablation.pdf"
+DELIVER_PDF="$OUT_ROOT/fig2_deliver_inset.pdf"
 LOCK_FILE="${LOCK_FILE:-/tmp/embarcadero_paper_fig2.lock}"
 
 mkdir -p "$LOG_DIR" "$LATENCY_ROOT"
@@ -53,18 +56,22 @@ MSG_SIZE="${MSG_SIZE:-1024}"
 NUM_BROKERS="${NUM_BROKERS:-4}"
 EPOCH_US_LATENCY="${EPOCH_US_LATENCY:-500}"
 LOAD_POINTS_MBPS="${LOAD_POINTS_MBPS:-100 250 500 750 1000 1500 2000}"
-# Matched load for Embar mechanism table (O0A1 / O5A1 / O5A2RF2).
-MECHANISM_LOAD_MBPS="${MECHANISM_LOAD_MBPS:-500}"
-# Optional 1–2 baseline points only (not a full baseline load sweep).
-BASELINE_LOAD_MBPS="${BASELINE_LOAD_MBPS:-500 1000}"
-PACING_MODE="${PACING_MODE:-open_loop}"
+# Matched load for Embar mechanism table + disk ablation.
+# Prefer a point below the known ~270 MB/s deliver ceiling.
+MECHANISM_LOAD_MBPS="${MECHANISM_LOAD_MBPS:-250}"
+DISK_ABLATION_LOAD_MBPS="${DISK_ABLATION_LOAD_MBPS:-$MECHANISM_LOAD_MBPS}"
+# Matched RF2 mem baseline loads (same sink as primary).
+BASELINE_LOAD_MBPS="${BASELINE_LOAD_MBPS:-100 250 500 1000 2000}"
+# Paper tab:latency-sweep used paced steady-rate; do not mix with open_loop.
+PACING_MODE="${PACING_MODE:-steady}"
 CLIENT_HOST="${CLIENT_HOST:-c4}"
 BROKER_IP="${BROKER_IP:-10.10.10.10}"
 WAIT_FOR_IDLE="${WAIT_FOR_IDLE:-1}"
 RECHECK_DELAY_SEC="${RECHECK_DELAY_SEC:-300}"
-# Primary = Embar RF2 ACK2. Baselines / RF0 companion / nolinger are opt-in.
-INCLUDE_BASELINES="${INCLUDE_BASELINES:-0}"
+# Primary = Embar RF2 ACK2 mem. Disk ablation + RF2 mem baselines on by default.
+INCLUDE_BASELINES="${INCLUDE_BASELINES:-1}"
 SKIP_MECHANISM="${SKIP_MECHANISM:-0}"
+SKIP_DISK_ABLATION="${SKIP_DISK_ABLATION:-0}"
 SKIP_NOLINGER="${SKIP_NOLINGER:-1}"
 SKIP_RF0_COMPANION="${SKIP_RF0_COMPANION:-1}"
 SKIP_LAZYLOG="${SKIP_LAZYLOG:-1}"
@@ -78,19 +85,41 @@ export ALLOW_DIRTY_ARTIFACT
 REPLICA_DISK_DIRS_CONFIG="${EMBARCADERO_REPLICA_DISK_DIRS:-$PROJECT_ROOT/.Replication/disk0,/mnt/nvme0/replication/disk1}"
 export EMBARCADERO_REPLICA_DISK_DIRS="$REPLICA_DISK_DIRS_CONFIG"
 
-FIG2_FAST_CXL="${FIG2_FAST_CXL:-0}"
-if [[ "$FIG2_FAST_CXL" == "1" ]]; then
-  export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
-  export EMBARCADERO_CXL_MAP_POPULATE="${EMBARCADERO_CXL_MAP_POPULATE:-0}"
-else
-  export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-full}"
-  export EMBARCADERO_CXL_MAP_POPULATE="${EMBARCADERO_CXL_MAP_POPULATE:-0}"
+# CXL zero: default metadata.  Fig2 restarts brokers every load point; cold
+# metadata clear rewrites ~34 GiB GOI (often several minutes on this CXL node).
+# `none` skips memset (fast ready) but leaves dirty GOI and can stall ORDER=5
+# publish/ACK — only use via EMBARCADERO_CXL_ZERO_MODE=none for smoke.
+# Full-region zeroing is selected with FIG2_FULL_CXL=1.  Fig. 2 uses four
+# 8-GiB broker segments.  Its fixed GOI/control metadata occupies about
+# 34 GiB, so 64 GiB only admits three segments; 72 GiB is the smallest
+# practical CXL extent that admits all four without overcommitting node 2.
+FIG2_FULL_CXL="${FIG2_FULL_CXL:-0}"
+if [[ "${FIG2_FAST_CXL:-0}" == "1" ]]; then
+  FIG2_FULL_CXL=0
 fi
-export EMBARCADERO_CXL_SIZE="${EMBARCADERO_CXL_SIZE:-274877906944}"
+if [[ "$FIG2_FULL_CXL" == "1" ]]; then
+  export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-full}"
+else
+  export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
+fi
+export EMBARCADERO_CXL_MAP_POPULATE="${EMBARCADERO_CXL_MAP_POPULATE:-0}"
+export EMBARCADERO_CXL_SIZE="${EMBARCADERO_CXL_SIZE:-77309411328}"  # 72 GiB
 export EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-1}"
-export BROKER_REACHABILITY_TIMEOUT_SEC="${BROKER_REACHABILITY_TIMEOUT_SEC:-60}"
+# Ready timeout: cold metadata/full clears need many minutes; run_latency.sh
+# waits for head before followers so followers do not contend on the clear.
+if [[ -z "${BROKER_READY_TIMEOUT_SEC:-}" ]]; then
+  case "${EMBARCADERO_CXL_ZERO_MODE}" in
+    none|skip|off|0) BROKER_READY_TIMEOUT_SEC=120 ;;
+    *) BROKER_READY_TIMEOUT_SEC=900 ;;
+  esac
+fi
+export BROKER_READY_TIMEOUT_SEC
+export BROKER_REACHABILITY_TIMEOUT_SEC="${BROKER_REACHABILITY_TIMEOUT_SEC:-120}"
 export EMBARCADERO_ACK_TIMEOUT_SEC="${EMBARCADERO_ACK_TIMEOUT_SEC:-300}"
 export EMBAR_ORDER5_EPOCH_US="${EMBAR_ORDER5_EPOCH_US:-$EPOCH_US_LATENCY}"
+# Fig2 primary metric is append→ACK. Deliver-drain timeout alone must not fail
+# a cell when pub ACK percentiles exist (see EMBARCADERO_LATENCY_ACK_PRIMARY).
+export EMBARCADERO_LATENCY_ACK_PRIMARY="${EMBARCADERO_LATENCY_ACK_PRIMARY:-1}"
 
 CLIENT_LIB="${CLIENT_LD_LIBRARY_PATH:-/home/domin/Embarcadero/third_party/glog-0.6/lib:/home/domin/Embarcadero/third_party/yaml-cpp-0.8/lib}"
 export CLIENT_LD_LIBRARY_PATH="$CLIENT_LIB"
@@ -102,7 +131,7 @@ stamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { local msg="[$(stamp)] $*"; echo "$msg"; echo "$msg" >> "$SUMMARY_LOG"; }
 
 # ---------------------------------------------------------------------------
-# Env helpers: RF0 vs RF2 disk-durable
+# Env helpers: RF0 vs RF2 memory-copy vs RF2 disk-durable
 # ---------------------------------------------------------------------------
 clear_rf2_ambient() {
   unset EMBARCADERO_CHAIN_REPLICATION_SINK \
@@ -127,6 +156,17 @@ apply_rf0_env() {
   unset EMBARCADERO_REPLICA_DISK_DIRS 2>/dev/null || true
 }
 
+# Fig1 mem sink: DRAM replica completion (CXL + DRAM copy, no media fdatasync).
+apply_rf2_mem_env() {
+  clear_rf2_ambient
+  export EMBARCADERO_CHAIN_REPLICATION_SINK=memory-copy
+  export EMBARCADERO_CHAIN_REPLICATION_INMEM=1
+  export EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=1
+  unset EMBARCADERO_CHAIN_REPLICATION_INMEM_BYTES_PER_SOURCE
+  unset EMBARCADERO_REPLICA_DISK_DIRS 2>/dev/null || true
+  unset EMBARCADERO_CHAIN_SYNC_BYTES EMBARCADERO_CHAIN_SYNC_INTERVAL_MS
+}
+
 apply_rf2_disk_env() {
   clear_rf2_ambient
   export EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable
@@ -137,6 +177,26 @@ apply_rf2_disk_env() {
   # Match Fig1 Embar amortization.
   export EMBARCADERO_CHAIN_SYNC_BYTES="${EMBARCADERO_CHAIN_SYNC_BYTES:-268435456}"
   export EMBARCADERO_CHAIN_SYNC_INTERVAL_MS="${EMBARCADERO_CHAIN_SYNC_INTERVAL_MS:-250}"
+}
+
+apply_sink_env() {
+  local rf="$1" sink="$2"
+  if [[ "$rf" -lt 2 ]]; then
+    apply_rf0_env
+    return 0
+  fi
+  case "$sink" in
+    mem|memory|memory-copy|memory_copy)
+      apply_rf2_mem_env
+      ;;
+    disk|disk-durable)
+      apply_rf2_disk_env
+      ;;
+    *)
+      echo "ERROR: unknown sink='$sink' (use mem|disk)" >&2
+      return 1
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -199,7 +259,7 @@ preflight_fig2() {
     [[ -w "$d" ]] || { log "FATAL: unwritable $d"; exit 1; }
   done
 
-  log "Preflight OK (latency stats, pacing=$PACING_MODE, replica_dirs=$REPLICA_DISK_DIRS_CONFIG)"
+  log "Preflight OK (latency stats, pacing=$PACING_MODE, replica_dirs=$REPLICA_DISK_DIRS_CONFIG, cxl_zero=$EMBARCADERO_CXL_ZERO_MODE, broker_ready_timeout=${BROKER_READY_TIMEOUT_SEC}s)"
 }
 
 write_campaign_contract() {
@@ -211,29 +271,36 @@ write_campaign_contract() {
 - Commit: \`$(git rev-parse HEAD 2>/dev/null || echo unknown)\`
 - Dirty: $([[ -n $(git status --porcelain 2>/dev/null) ]] && echo yes || echo no)
 
-## Primary panel (shared-log SLO)
-- Embar **ORDER=5 ACK=2 RF=2 disk-durable** latency vs offered load
-- Pacing: \`$PACING_MODE\` (open_loop→burst; do not mix with steady in one plot)
+## Primary panel (append / coordination claim)
+- Embar **ORDER=5 ACK=2 RF=2 DRAM replica** append→ACK vs offered load
+- Sink claim: DRAM replica completion (CXL + DRAM copy; **no** media fdatasync)
+- Pacing: \`$PACING_MODE\` (paper table uses steady; do not mix open_loop in one plot)
 - Load points (MB/s): $LOAD_POINTS_MBPS
 - Publisher: 1× \`$CLIENT_HOST\` → \`$BROKER_IP\`
-- Metric: publish→deliver p50/p99 (µs)
+- **Primary metric:** append→ack p50/p99 (µs, batch) from \`pub_ack_*\`
+- Deliver inset scoped ≤~270 MB/s ordered-consume ceiling
+
+## Disk ablation (matched load = ${DISK_ABLATION_LOAD_MBPS} MB/s)
+- \`fig2_embar_o5_ack2_rf2_disk\` — media-durable RF2 cost (Fig1 disk contract)
+- SKIP_DISK_ABLATION=$SKIP_DISK_ABLATION
 
 ## Mechanism ablation (matched load = ${MECHANISM_LOAD_MBPS} MB/s)
-- \`fig2_mech_embar_o0_ack1_rf0\` — unordered floor (pub ACK; no ordered deliver)
+- \`fig2_mech_embar_o0_ack1_rf0\` — unordered floor
 - \`fig2_mech_embar_o5_ack1_rf0\` — + ordering
-- \`fig2_mech_embar_o5_ack2_rf2\` — + durable RF2 (same claim as primary)
-- Table metric: **append→ack** p50/p99 for all three rows
+- \`fig2_mech_embar_o5_ack2_rf2_mem\` — + DRAM RF2 (primary sink)
+- \`fig2_mech_embar_o5_ack2_rf2_disk\` — + media-durable RF2
+- Table metric: **append→ack** p50/p99
 
-## Optional
-- Baselines at \`$BASELINE_LOAD_MBPS\` only if \`INCLUDE_BASELINES=1\`
-- RF0 companion full sweep if \`SKIP_RF0_COMPANION=0\`
-- Nolinger companion if \`SKIP_NOLINGER=0\`
+## Baselines (matched RF2 ACK2 **DRAM** — same sink as primary)
+- Loads: \`$BASELINE_LOAD_MBPS\` (INCLUDE_BASELINES=$INCLUDE_BASELINES)
+- \`fig2_corfu_o2_ack2_rf2_mem\`, \`fig2_scalog_o1_ack2_rf2_mem\`
 
 ## Knobs
 - Msg / bytes: ${MSG_SIZE} B / ${TOTAL_BYTES} B
 - Epoch µs: $EMBAR_ORDER5_EPOCH_US
 - CXL: size=$EMBARCADERO_CXL_SIZE zero=$EMBARCADERO_CXL_ZERO_MODE populate=$EMBARCADERO_CXL_MAP_POPULATE
-- Replica dirs: $REPLICA_DISK_DIRS_CONFIG
+- Broker ready timeout: ${BROKER_READY_TIMEOUT_SEC}s
+- Replica dirs (disk ablation): $REPLICA_DISK_DIRS_CONFIG
 - Requires \`-DCOLLECT_LATENCY_STATS=ON\`
 EOF
 }
@@ -243,13 +310,14 @@ is_cluster_busy() {
     if pgrep -x embarlet >/dev/null || pgrep -x throughput_test >/dev/null; then
         return 0
     fi
-    if pgrep -f '[r]un_overnight_eval\.sh' >/dev/null ||
-       pgrep -f '[r]un_multiclient\.sh' >/dev/null ||
-       pgrep -f '[r]un_fig1_throughput' >/dev/null ||
-       pgrep -f '[r]un_latency_vs_load\.sh' >/dev/null; then
-        return 0
-    fi
-    if pgrep -af '[r]un_fig2_latency' 2>/dev/null | grep -v "$$" >/dev/null; then
+    # Require the script path as an argv token so incidental mentions inside
+    # `bash -c '…run_latency_vs_load…'` monitor commands do not false-positive.
+    # Concurrent Fig2 is gated by LOCK_FILE flock above — do not pgrep for
+    # run_fig2 here (parent shells that launched us also match and deadlock).
+    if pgrep -f '(^|/)run_overnight_eval\.sh([[:space:]]|$)' >/dev/null ||
+       pgrep -f '(^|/)run_multiclient\.sh([[:space:]]|$)' >/dev/null ||
+       pgrep -f '(^|/)run_fig1_throughput[^[:space:]]*\.sh([[:space:]]|$)' >/dev/null ||
+       pgrep -f '(^|/)run_latency_vs_load\.sh([[:space:]]|$)' >/dev/null; then
         return 0
     fi
     for host in c4 c3 c1; do
@@ -266,8 +334,10 @@ should_run_cell() {
     if [[ -z "${ONLY_CELLS:-}" ]]; then
         return 0
     fi
-    local IFS=',' c
-    for c in $ONLY_CELLS; do
+    # Accept space- and/or comma-separated cell lists (docs use spaces).
+    local normalized c
+    normalized="${ONLY_CELLS//,/ }"
+    for c in $normalized; do
         [[ "$c" == "$label" ]] && return 0
     done
     log "SKIP [$label] (not in ONLY_CELLS)"
@@ -293,7 +363,7 @@ PY
 }
 
 ensure_results_header() {
-    local expected="campaign_id,pass_id,run_ts_utc,git_commit,cell,panel,system,order,linger,n_clients,client_host,target_mbps,trial_in_pass,global_trial_seq,status,p50_us,p95_us,p99_us,achieved_offered_mbps,achieved_e2e_goodput_mbps,pub_ack_p50_us,pub_ack_p99_us,msg_size,total_bytes,num_brokers,rf,ack,pacing_mode,cxl_zero_mode,epoch_us,artifact_dir,notes"
+    local expected="campaign_id,pass_id,run_ts_utc,git_commit,cell,panel,system,order,linger,n_clients,client_host,target_mbps,trial_in_pass,global_trial_seq,status,p50_us,p95_us,p99_us,achieved_offered_mbps,achieved_e2e_goodput_mbps,pub_ack_p50_us,pub_ack_p99_us,msg_size,total_bytes,num_brokers,rf,ack,sink,pacing_mode,cxl_zero_mode,epoch_us,artifact_dir,notes"
     if [[ ! -f "$RESULTS_CSV" ]]; then
         echo "$expected" >"$RESULTS_CSV"
         return 0
@@ -329,15 +399,17 @@ refresh_plot() {
             --csv "$RESULTS_CSV" \
             --pdf "$FIG_PDF" \
             --png "$FIG_PNG" \
+            --deliver-pdf "$DELIVER_PDF" \
             --mech-csv "$MECH_CSV" \
             --mech-pdf "$MECH_PDF" \
+            --primary-metric ack \
             >>"$LOG_DIR/plot.log" 2>&1 || log "WARN: plot refresh failed (see $LOG_DIR/plot.log)"
     fi
 }
 
 append_point_results() {
     local label="$1" panel="$2" system="$3" order="$4" linger="$5"
-    local rf="$6" ack="$7" target="$8" cell_rc="$9" run_dir="${10}"
+    local rf="$6" ack="$7" sink="$8" target="$9" cell_rc="${10}" run_dir="${11}"
 
     local commit
     commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -345,13 +417,13 @@ append_point_results() {
     python3 - "$RESULTS_CSV" "$CAMPAIGN_ID" "$PASS_ID" "$(stamp)" "$commit" \
         "$label" "$panel" "$system" "$order" "$linger" "$CLIENT_HOST" "$target" \
         "$cell_rc" "$run_dir" "$MSG_SIZE" "$TOTAL_BYTES" "$NUM_BROKERS" \
-        "$rf" "$ack" "$PACING_MODE" "$EMBARCADERO_CXL_ZERO_MODE" "$EMBAR_ORDER5_EPOCH_US" <<'PY'
+        "$rf" "$ack" "$sink" "$PACING_MODE" "$EMBARCADERO_CXL_ZERO_MODE" "$EMBAR_ORDER5_EPOCH_US" <<'PY'
 import csv, sys
 from pathlib import Path
 
 (results_csv, campaign_id, pass_id, run_ts, commit, label, panel, system, order, linger,
  client_host, target, cell_rc, run_dir, msg_size, total_bytes, num_brokers,
- rf, ack, pacing_mode, cxl_zero_mode, epoch_us) = sys.argv[1:]
+ rf, ack, sink, pacing_mode, cxl_zero_mode, epoch_us) = sys.argv[1:]
 cell_rc = int(cell_rc)
 run_path = Path(run_dir)
 
@@ -388,22 +460,27 @@ for trial_csv in trial_csvs:
             p99 = (row.get("publish_to_deliver_p99_us") or "").strip()
             pub50 = (row.get("pub_ack_p50_us") or "").strip()
             pub99 = (row.get("pub_ack_p99_us") or "").strip()
-            # Mechanism / ORDER=0: allow missing deliver if pub ACK present.
+            # Primary claim is append→ack. Deliver is optional (scoped inset).
+            if not pub50 or not pub99:
+                status = "fail"
+                notes = (notes + ";" if notes else "") + "missing_pub_ack_percentiles"
             if panel == "mechanism" or str(order) == "0":
-                if not pub50 or not pub99:
-                    status = "fail"
-                    notes = (notes + ";" if notes else "") + "missing_pub_ack_percentiles"
                 if not p50:
                     notes = (notes + ";" if notes else "") + "no_deliver_metric"
-            else:
-                if not p50 or not p99:
-                    status = "fail"
-                    notes = (notes + ";" if notes else "") + "missing_latency_percentiles"
+            elif not p50 or not p99:
+                notes = (notes + ";" if notes else "") + "no_deliver_metric"
             try:
                 ach = float(row.get("achieved_offered_load_mbps") or "nan")
                 tgt_f = float(target)
                 if ach == ach and tgt_f > 0 and ach < 0.5 * tgt_f:
                     notes = (notes + ";" if notes else "") + "saturated_offered_lt_50pct_target"
+            except ValueError:
+                pass
+            try:
+                e2e = float(row.get("achieved_e2e_goodput_mbps") or "nan")
+                tgt_f = float(target)
+                if e2e == e2e and tgt_f > 0 and e2e < 0.5 * tgt_f:
+                    notes = (notes + ";" if notes else "") + "saturated_e2e_lt_50pct_target"
             except ValueError:
                 pass
             gseq = next_seq(label, target)
@@ -416,7 +493,7 @@ for trial_csv in trial_csvs:
                 row.get("achieved_offered_load_mbps") or "",
                 row.get("achieved_e2e_goodput_mbps") or "",
                 pub50, pub99,
-                msg_size, total_bytes, num_brokers, rf, ack,
+                msg_size, total_bytes, num_brokers, rf, ack, sink,
                 pacing_mode, cxl_zero_mode, epoch_us,
                 row.get("artifact_dir") or str(run_path), notes,
             ])
@@ -434,7 +511,7 @@ if appended == 0:
         label, panel, system, order, linger, "1", client_host,
         target, "1", str(gseq), "fail",
         "", "", "", "", "", "", "",
-        msg_size, total_bytes, num_brokers, rf, ack,
+        msg_size, total_bytes, num_brokers, rf, ack, sink,
         pacing_mode, cxl_zero_mode, epoch_us,
         str(run_path), notes,
     ])
@@ -445,8 +522,8 @@ PY
 
 run_fig2_point() {
     local label="$1" panel="$2" system="$3" order="$4" linger="$5"
-    local sequencer="$6" rf="$7" ack="$8" target="$9"
-    shift 9
+    local sequencer="$6" rf="$7" ack="$8" sink="$9" target="${10}"
+    shift 10
 
     should_run_cell "$label" || return 0
 
@@ -466,13 +543,9 @@ run_fig2_point() {
         run_id="l${target}_$(date -u +%H%M%S)"
     fi
 
-    log "START [$label] panel=$panel target=${target} MB/s order=$order ack=$ack rf=$rf linger=$linger"
+    log "START [$label] panel=$panel target=${target} MB/s order=$order ack=$ack rf=$rf sink=$sink linger=$linger"
 
-    if [[ "$rf" -ge 2 ]]; then
-        apply_rf2_disk_env
-    else
-        apply_rf0_env
-    fi
+    apply_sink_env "$rf" "$sink" || return 1
 
     cleanup_remote_stray_procs "$CLIENT_HOST" || true
     cleanup_shm_all || true
@@ -508,6 +581,8 @@ run_fig2_point() {
             EMBARCADERO_CXL_ZERO_MODE="$EMBARCADERO_CXL_ZERO_MODE" \
             EMBARCADERO_CXL_MAP_POPULATE="$EMBARCADERO_CXL_MAP_POPULATE" \
             EMBAR_USE_HUGETLB="$EMBAR_USE_HUGETLB" \
+            BROKER_READY_TIMEOUT_SEC="$BROKER_READY_TIMEOUT_SEC" \
+            BROKER_REACHABILITY_TIMEOUT_SEC="$BROKER_REACHABILITY_TIMEOUT_SEC" \
             SKIP_CLUSTER_SETUP="${SKIP_CLUSTER_SETUP:-1}" \
             CLIENT_LD_LIBRARY_PATH="$CLIENT_LD_LIBRARY_PATH" \
             bash "$SCRIPTS_DIR/run_latency_vs_load.sh"
@@ -520,7 +595,7 @@ run_fig2_point() {
     fi
 
     append_point_results "$label" "$panel" "$system" "$order" "$linger" \
-        "$rf" "$ack" "$target" "$cell_rc" "$actual_run_dir"
+        "$rf" "$ack" "$sink" "$target" "$cell_rc" "$actual_run_dir"
 
     if [[ "$cell_rc" -eq 0 ]]; then
         log "PASS [$label @ ${target}MB/s]"
@@ -535,13 +610,13 @@ run_fig2_point() {
 
 run_series_loads() {
     local label="$1" panel="$2" system="$3" order="$4" linger="$5"
-    local sequencer="$6" rf="$7" ack="$8"
-    shift 8
+    local sequencer="$6" rf="$7" ack="$8" sink="$9"
+    shift 9
     local loads="${SERIES_LOADS:-$LOAD_POINTS_MBPS}"
     local target
     for target in $loads; do
         run_fig2_point "$label" "$panel" "$system" "$order" "$linger" \
-            "$sequencer" "$rf" "$ack" "$target" "$@"
+            "$sequencer" "$rf" "$ack" "$sink" "$target" "$@"
     done
 }
 
@@ -555,8 +630,10 @@ write_campaign_contract
 log "===== Fig2 START campaign=$CAMPAIGN_ID pass=$PASS_ID ====="
 log "Commit: $(git rev-parse --short HEAD) dirty=$([[ -n $(git status --porcelain) ]] && echo yes || echo no)"
 log "OUT_ROOT=$OUT_ROOT RESULTS_CSV=$RESULTS_CSV"
-log "PRIMARY: Embar O5 ACK2 RF2 disk-durable | loads=$LOAD_POINTS_MBPS | pacing=$PACING_MODE"
-log "MECHANISM_LOAD_MBPS=$MECHANISM_LOAD_MBPS SKIP_MECHANISM=$SKIP_MECHANISM"
+log "PRIMARY: Embar O5 ACK2 RF2 memory-copy | loads=$LOAD_POINTS_MBPS | pacing=$PACING_MODE"
+log "CXL: size=$EMBARCADERO_CXL_SIZE zero=$EMBARCADERO_CXL_ZERO_MODE ready_timeout=${BROKER_READY_TIMEOUT_SEC}s reachability=${BROKER_REACHABILITY_TIMEOUT_SEC}s"
+log "MECHANISM_LOAD_MBPS=$MECHANISM_LOAD_MBPS DISK_ABLATION_LOAD_MBPS=$DISK_ABLATION_LOAD_MBPS"
+log "SKIP_MECHANISM=$SKIP_MECHANISM SKIP_DISK_ABLATION=$SKIP_DISK_ABLATION"
 log "INCLUDE_BASELINES=$INCLUDE_BASELINES BASELINE_LOADS=$BASELINE_LOAD_MBPS"
 log "SKIP_RF0_COMPANION=$SKIP_RF0_COMPANION SKIP_NOLINGER=$SKIP_NOLINGER SKIP_LAZYLOG=$SKIP_LAZYLOG"
 
@@ -579,45 +656,54 @@ if [[ "$WAIT_FOR_IDLE" == "1" ]]; then
     log "cluster idle — beginning Fig2 pass"
 fi
 
-# --- Primary: shared-log SLO curve ---
+# --- Primary: coordination claim (mem RF2) ---
 SERIES_LOADS="$LOAD_POINTS_MBPS" \
-  run_series_loads fig2_embar_o5_ack2_rf2 primary embar 5 on EMBARCADERO 2 2
+  run_series_loads fig2_embar_o5_ack2_rf2_mem primary embar 5 on EMBARCADERO 2 2 mem
 
 # Optional RF0 companion (ordering-only floor across loads)
 if [[ "$SKIP_RF0_COMPANION" != "1" ]]; then
     SERIES_LOADS="$LOAD_POINTS_MBPS" \
-      run_series_loads fig2_embar_o5_ack1_rf0 companion embar 5 on EMBARCADERO 0 1
+      run_series_loads fig2_embar_o5_ack1_rf0 companion embar 5 on EMBARCADERO 0 1 none
 fi
 
 if [[ "$SKIP_NOLINGER" != "1" ]]; then
     SERIES_LOADS="$LOAD_POINTS_MBPS" \
-      run_series_loads fig2_embar_o5_ack2_rf2_nolinger companion embar 5 off EMBARCADERO 2 2
+      run_series_loads fig2_embar_o5_ack2_rf2_mem_nolinger companion embar 5 off EMBARCADERO 2 2 mem
+fi
+
+# --- Disk ablation at one matched load (media-durable cost) ---
+if [[ "$SKIP_DISK_ABLATION" != "1" ]]; then
+    log "===== Disk ablation @ ${DISK_ABLATION_LOAD_MBPS} MB/s ====="
+    SERIES_LOADS="$DISK_ABLATION_LOAD_MBPS" \
+      run_series_loads fig2_embar_o5_ack2_rf2_disk disk_ablation embar 5 on EMBARCADERO 2 2 disk
 fi
 
 # --- Mechanism ablation at one matched load ---
 if [[ "$SKIP_MECHANISM" != "1" ]]; then
     log "===== Mechanism ablation @ ${MECHANISM_LOAD_MBPS} MB/s ====="
     SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
-      run_series_loads fig2_mech_embar_o0_ack1_rf0 mechanism embar 0 on EMBARCADERO 0 1
+      run_series_loads fig2_mech_embar_o0_ack1_rf0 mechanism embar 0 on EMBARCADERO 0 1 none
     SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
-      run_series_loads fig2_mech_embar_o5_ack1_rf0 mechanism embar 5 on EMBARCADERO 0 1
+      run_series_loads fig2_mech_embar_o5_ack1_rf0 mechanism embar 5 on EMBARCADERO 0 1 none
     SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
-      run_series_loads fig2_mech_embar_o5_ack2_rf2 mechanism embar 5 on EMBARCADERO 2 2
+      run_series_loads fig2_mech_embar_o5_ack2_rf2_mem mechanism embar 5 on EMBARCADERO 2 2 mem
+    SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
+      run_series_loads fig2_mech_embar_o5_ack2_rf2_disk mechanism embar 5 on EMBARCADERO 2 2 disk
 fi
 
-# --- Optional matched-load baselines (not a full sweep) ---
+# --- Matched RF2 ACK2 mem baselines (same sink as primary) ---
 if [[ "$INCLUDE_BASELINES" == "1" ]]; then
-    log "===== Matched-load baselines @ $BASELINE_LOAD_MBPS ====="
+    log "===== Matched-load RF2 ACK2 mem baselines @ $BASELINE_LOAD_MBPS ====="
     SERIES_LOADS="$BASELINE_LOAD_MBPS" \
-      run_series_loads fig2_corfu_o2_ack1_rf0 baseline corfu 2 na CORFU 0 1 \
+      run_series_loads fig2_corfu_o2_ack2_rf2_mem baseline corfu 2 na CORFU 2 2 mem \
         EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
     SERIES_LOADS="$BASELINE_LOAD_MBPS" \
-      run_series_loads fig2_scalog_o1_ack1_rf0 baseline scalog 1 na SCALOG 0 1 \
+      run_series_loads fig2_scalog_o1_ack2_rf2_mem baseline scalog 1 na SCALOG 2 2 mem \
         SKIP_REMOTE_SCALOG_SEQUENCER=1 \
         EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP"
     if [[ "$SKIP_LAZYLOG" != "1" ]]; then
         SERIES_LOADS="$BASELINE_LOAD_MBPS" \
-          run_series_loads fig2_lazylog_o2_ack1_rf0 baseline lazylog 2 na LAZYLOG 0 1 \
+          run_series_loads fig2_lazylog_o2_ack2_rf2_mem baseline lazylog 2 na LAZYLOG 2 2 mem \
             SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
             EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
             BROKER_LISTEN_ADDR="$BROKER_IP" \

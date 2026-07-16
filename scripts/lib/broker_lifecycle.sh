@@ -1143,6 +1143,10 @@ broker_local_wait_for_cluster() {
     if [ "${#expected_pids[@]}" -gt 0 ]; then
       local pid missing_pid
       for pid in "${expected_pids[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          echo "ERROR: broker pid $pid exited before ready" >&2
+          return 1
+        fi
         if [ -f "/tmp/embarlet_${pid}_ready" ] || broker_local_pid_is_listening "$pid"; then
           ready=$((ready + 1))
         else

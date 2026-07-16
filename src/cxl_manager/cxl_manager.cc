@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 
@@ -98,6 +99,21 @@ static bool MetadataOnlyZeroingEnabled() {
 		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 	}
 	return mode == "metadata" || mode == "meta" || mode == "metadata_only";
+}
+
+// Skip the head-broker memset entirely.  Use when the CXL shm is already
+// resident/clean (e.g. paper latency cells after a warm metadata clear) so
+// broker ready is not blocked on rewriting the ~34 GiB GOI region.
+static bool SkipCxlZeroingEnabled() {
+	const char* env = std::getenv("EMBARCADERO_CXL_ZERO_MODE");
+	if (!env || env[0] == '\0') {
+		return false;
+	}
+	std::string mode(env);
+	for (char& ch : mode) {
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	}
+	return mode == "none" || mode == "skip" || mode == "off" || mode == "0";
 }
 
 static bool CxlCoherentOptInEnabled() {
@@ -246,6 +262,10 @@ static inline void* allocate_shm(
 	}
 
 	if(broker_id == 0){
+		if (SkipCxlZeroingEnabled()) {
+			LOG(INFO) << "Head broker skipping CXL zero "
+			          << "(EMBARCADERO_CXL_ZERO_MODE=none|skip|off)";
+		} else {
 		size_t clear_bytes = cxl_size;
 		bool metadata_only = MetadataOnlyZeroingEnabled();
 		if (metadata_only) {
@@ -268,25 +288,51 @@ static inline void* allocate_shm(
 			LOG(INFO) << "Head broker clearing full CXL memory: " << cxl_size << " bytes";
 		}
 
-		// OPTIMIZATION: Use faster memory clearing with parallel chunks
+		// Parallel clear with a bounded worker pool.  One thread per 1 GiB chunk
+		// used to spawn ~256 threads for a 256 GiB region — that oversubscribed
+		// CXL bandwidth, delayed ready, and left hard-to-kill thread groups if
+		// the orchestrator timed out mid-clear.  Cap further for CXL: 32 writers
+		// collapse effective bandwidth on this expander (~80 MB/s); 8 is enough.
 		const size_t chunk_size = 1024 * 1024 * 1024;  // 1GB chunks
 		const size_t num_chunks = (clear_bytes + chunk_size - 1) / chunk_size;
-		
+		size_t hw = std::thread::hardware_concurrency();
+		if (hw == 0) {
+			hw = 8;
+		}
+		const size_t max_workers = (cxl_type == Real) ? size_t{8} : size_t{32};
+		const size_t num_workers = std::min(num_chunks, std::min(hw, max_workers));
+		std::atomic<size_t> next_chunk{0};
+		std::atomic<size_t> chunks_done{0};
+		const auto clear_t0 = std::chrono::steady_clock::now();
 		std::vector<std::thread> clear_threads;
-		for (size_t i = 0; i < num_chunks; ++i) {
-			clear_threads.emplace_back([addr, i, chunk_size, clear_bytes]() {
-				size_t start = i * chunk_size;
-				size_t size = std::min(chunk_size, clear_bytes - start);
-				memset((uint8_t*)addr + start, 0, size);
+		clear_threads.reserve(num_workers);
+		for (size_t t = 0; t < num_workers; ++t) {
+			clear_threads.emplace_back([addr, chunk_size, clear_bytes, num_chunks, &next_chunk, &chunks_done]() {
+				while (true) {
+					const size_t i = next_chunk.fetch_add(1, std::memory_order_relaxed);
+					if (i >= num_chunks) {
+						break;
+					}
+					const size_t start = i * chunk_size;
+					const size_t size = std::min(chunk_size, clear_bytes - start);
+					memset(static_cast<uint8_t*>(addr) + start, 0, size);
+					const size_t done = chunks_done.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (done == num_chunks || (done % 4) == 0) {
+						LOG(INFO) << "CXL clear progress: " << done << "/" << num_chunks
+						          << " GiB-chunks";
+					}
+				}
 			});
 		}
-		
-		// Wait for all threads to complete
 		for (auto& thread : clear_threads) {
 			thread.join();
 		}
+		const auto clear_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - clear_t0).count();
 		LOG(INFO) << "CXL memory clear complete (" << clear_bytes << " bytes) using "
-		          << num_chunks << " parallel threads";
+		          << num_workers << " workers over " << num_chunks << " chunks in "
+		          << clear_ms << " ms";
+		}  // !SkipCxlZeroingEnabled
 	}
 	return addr;
 }

@@ -212,8 +212,7 @@ Subscriber::OwnedMessagePtr Subscriber::AcquireOwnedMessage() {
 	if (!storage) {
 		storage = std::make_unique<OwnedMessage>();
 	}
-	storage->data.clear();
-	storage->header_version = Embarcadero::wire::HEADER_VERSION_V1;
+	storage->Reset();
 	return OwnedMessagePtr(storage.release(), OwnedMessageRecycler{this});
 }
 
@@ -221,8 +220,7 @@ void Subscriber::RecycleOwnedMessage(OwnedMessage* msg) {
 	if (msg == nullptr) {
 		return;
 	}
-	msg->data.clear();
-	msg->header_version = Embarcadero::wire::HEADER_VERSION_V1;
+	msg->Reset();
 	constexpr size_t kMaxPooledMessages = 262144;
 	std::unique_ptr<OwnedMessage> storage(msg);
 	{
@@ -2653,6 +2651,8 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 		return;
 	}
 	const bool record_latency = (latency_conn != nullptr);
+	// One retained copy per recv chunk replaces the hot per-message copies.
+	auto retained_input = std::make_shared<std::vector<uint8_t>>(data, data + len);
 
 	constexpr size_t kMaxStreamBufferBytes = 64UL << 20; // 64 MB safety cap
 	auto reset_stream_state = [&]() {
@@ -2672,7 +2672,9 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 	uint64_t latency_parsed_messages = 0;
 	uint64_t latency_rejected_ts = 0;
 
-	auto parse_contiguous = [&](const uint8_t* bytes, size_t size) -> size_t {
+	auto parse_contiguous = [&](const uint8_t* bytes, size_t size,
+	                            const std::shared_ptr<std::vector<uint8_t>>& retained_chunk,
+	                            size_t retained_base_offset) -> size_t {
 		size_t pos = 0;
 		while (pos < size) {
 			if (!state.has_pending_metadata) {
@@ -2719,9 +2721,14 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 
 				auto msg = AcquireOwnedMessage();
 				msg->header_version = header_version;
-				msg->data.resize(stride);
-				std::memcpy(msg->data.data(), bytes + pos, stride);
-				auto* msg_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg->data.data());
+				if (retained_chunk) {
+					msg->retained_chunk = retained_chunk;
+					msg->retained_offset = retained_base_offset + pos;
+				} else {
+					msg->data.resize(stride);
+					std::memcpy(msg->data.data(), bytes + pos, stride);
+				}
+				auto* msg_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg->bytes());
 				if (msg_hdr->total_order == 0) {
 					msg_hdr->total_order = state.next_message_order_in_batch;
 				}
@@ -2777,9 +2784,14 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 
 			auto msg = AcquireOwnedMessage();
 			msg->header_version = header_version;
-			msg->data.resize(padded_size);
-			std::memcpy(msg->data.data(), bytes + pos, padded_size);
-			auto* msg_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(msg->data.data());
+			if (retained_chunk) {
+				msg->retained_chunk = retained_chunk;
+				msg->retained_offset = retained_base_offset + pos;
+			} else {
+				msg->data.resize(padded_size);
+				std::memcpy(msg->data.data(), bytes + pos, padded_size);
+			}
+			auto* msg_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(msg->bytes());
 			if (msg_hdr->total_order == 0) {
 				msg_hdr->total_order = state.next_message_order_in_batch;
 			}
@@ -2857,7 +2869,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 	if (!state.buffer.empty()) {
 		size_t input_pos = 0;
 		while (!state.buffer.empty() && input_pos < len) {
-			const size_t consumed = parse_contiguous(state.buffer.data(), state.buffer.size());
+			const size_t consumed = parse_contiguous(state.buffer.data(), state.buffer.size(), nullptr, 0);
 			if (consumed >= state.buffer.size()) {
 				state.buffer.clear();
 				break;
@@ -2884,7 +2896,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 			}
 		}
 		if (!state.buffer.empty() && input_pos == len) {
-			const size_t consumed = parse_contiguous(state.buffer.data(), state.buffer.size());
+			const size_t consumed = parse_contiguous(state.buffer.data(), state.buffer.size(), nullptr, 0);
 			if (consumed >= state.buffer.size()) {
 				state.buffer.clear();
 			} else if (consumed > 0) {
@@ -2894,13 +2906,14 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 			}
 		}
 		if (state.buffer.empty() && input_pos < len) {
-			const size_t consumed = parse_contiguous(data + input_pos, len - input_pos);
+			const size_t consumed = parse_contiguous(retained_input->data() + input_pos, len - input_pos,
+			                                              retained_input, input_pos);
 			if (input_pos + consumed < len) {
-				state.buffer.assign(data + input_pos + consumed, data + len);
+				state.buffer.assign(retained_input->data() + input_pos + consumed, retained_input->data() + len);
 			}
 		}
 	} else {
-		const size_t consumed = parse_contiguous(data, len);
+		const size_t consumed = parse_contiguous(retained_input->data(), len, retained_input, 0);
 		if (consumed < len) {
 			const size_t carry_bytes = len - consumed;
 			if (carry_bytes > kMaxStreamBufferBytes) {
@@ -2909,7 +2922,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 				reset_stream_state();
 				return;
 			}
-			state.buffer.assign(data + consumed, data + len);
+			state.buffer.assign(retained_input->data() + consumed, retained_input->data() + len);
 		}
 	}
 
@@ -3020,7 +3033,7 @@ void* Subscriber::TryPopOrderedMessageLocked() {
 	last_returned_ = std::move(pending_messages_.front());
 	pending_messages_.pop_front();
 	pending_messages_base_order_++;
-	void* ret = last_returned_ ? static_cast<void*>(last_returned_->data.data()) : nullptr;
+	void* ret = last_returned_ ? static_cast<void*>(last_returned_->bytes()) : nullptr;
 	if (ret) {
 		last_consumed_wire_version_ = last_returned_->header_version;
 		next_expected_order_++;
@@ -3128,7 +3141,7 @@ size_t Subscriber::ConsumeOrderedBatch(
 	for (const auto& msg : last_returned_batch_) {
 		if (!msg) continue;
 		out->push_back(OrderedMessageView{
-			static_cast<void*>(msg->data.data()),
+			static_cast<void*>(msg->bytes()),
 			msg->header_version,
 		});
 		last_consumed_wire_version_ = msg->header_version;

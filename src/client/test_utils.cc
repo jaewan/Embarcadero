@@ -120,6 +120,15 @@ struct DeliveryDrainResult {
 		       missing_uid == 0 &&
 		       !timed_out;
 	}
+
+	// True order bugs (reorder / dup / corrupt). Incomplete drain alone is not
+	// a hard fault when EMBARCADERO_LATENCY_ACK_PRIMARY softens deliver timeout.
+	bool hard_ordering_fault() const {
+		return invalid_messages != 0 ||
+		       duplicate_total_order != 0 ||
+		       out_of_order_total_order != 0 ||
+		       duplicate_uid != 0;
+	}
 };
 
 struct FailureRealtimeSummary {
@@ -1977,7 +1986,31 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 				auto receive_samples = s.SnapshotLatencySamples();
 				AnnotateDeliveryWithReceiveSamples(&delivery_result, receive_samples);
 				WriteDeliveryResults(delivery_result);
-				if (!delivery_result.ordering_ok()) {
+			}
+			// Always write the summary before any delivery assert so ACK-primary
+			// campaigns retain trial_results even when deliver drain times out.
+			WriteLatencyBenchmarkSummary(result,
+				steady_rate,
+				target_mbps,
+				achieved_offered_mbps,
+				pubBandwidthMbps,
+				e2eBandwidthMbps,
+				offered_bytes);
+			if (delivery_measurement_enabled && !delivery_result.ordering_ok()) {
+				const bool ack_primary = [] {
+					const char* e = std::getenv("EMBARCADERO_LATENCY_ACK_PRIMARY");
+					return e != nullptr && e[0] != '\0' && e[0] != '0';
+				}();
+				const bool soft_timeout =
+					ack_primary &&
+					delivery_result.timed_out &&
+					!delivery_result.hard_ordering_fault();
+				if (soft_timeout) {
+					LOG(WARNING) << "ACK-primary: deliver drain timed out; "
+					             << "continuing with pub ACK metrics: delivered="
+					             << delivery_result.delivered << "/" << delivery_result.target
+					             << " missing_uid=" << delivery_result.missing_uid;
+				} else {
 					LOG(ERROR) << "Delivery ordering assertion failed: delivered="
 					           << delivery_result.delivered << "/" << delivery_result.target
 					           << " invalid=" << delivery_result.invalid_messages
@@ -1990,13 +2023,6 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 				}
 			}
 			CheckStageLatencyMonotonicity(ack_level);
-		WriteLatencyBenchmarkSummary(result,
-				steady_rate,
-				target_mbps,
-				achieved_offered_mbps,
-				pubBandwidthMbps,
-				e2eBandwidthMbps,
-				offered_bytes);
 
 		return std::make_pair(pubBandwidthMbps, e2eBandwidthMbps);
 

@@ -475,8 +475,25 @@ class Subscriber {
 
 		// --- Order-aware consume state (Order 2/5) ---
 		struct OwnedMessage {
+			// Complete frames borrow their retained receive chunk. Frames spanning
+			// receive calls keep using the owned-data fallback.
+			std::shared_ptr<std::vector<uint8_t>> retained_chunk;
+			size_t retained_offset = 0;
 			std::vector<uint8_t> data;
 			uint16_t header_version = Embarcadero::wire::HEADER_VERSION_V1;
+
+			uint8_t* bytes() {
+				return retained_chunk ? retained_chunk->data() + retained_offset : data.data();
+			}
+			const uint8_t* bytes() const {
+				return retained_chunk ? retained_chunk->data() + retained_offset : data.data();
+			}
+			void Reset() {
+				retained_chunk.reset();
+				retained_offset = 0;
+				data.clear();
+				header_version = Embarcadero::wire::HEADER_VERSION_V1;
+			}
 		};
 		struct OwnedMessageRecycler {
 			Subscriber* owner = nullptr;

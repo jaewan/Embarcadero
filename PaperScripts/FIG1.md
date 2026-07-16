@@ -45,7 +45,8 @@ a fair data-sink A/B.
 - **disk** — `disk-durable` + dual NVMe; Scalog gets `--replicate_to_disk` and
   **amortized** `fdatasync` (`EMBARCADERO_CHAIN_SYNC_BYTES`, default 256 MiB)
 - **mem** — per-source DRAM rings, full-range CXL invalidate, no media sync;
-  claim *replicated_ack_emulated* / `ack2_minimum_memory_copy_replica_prefix`
+  claim *DRAM replica completion* / `ack2_minimum_memory_copy_replica_prefix`
+  (isolates coordination from NVMe; not a media-durable ACK2 claim)
 - **Cross-system note:** Scalog ORDER=1 parallel RF vs Embar ORDER=5 serialized
   chain is a protocol difference, not a sink mismatch
 
@@ -160,12 +161,12 @@ use TOTAL Bandwidth (~8 GB/s).
 
 Scalog overlap that exceeds `10 GiB / window` is invalid (burst artifact).
 
-### C. RF2 mem “only ~6–8 GB/s” is not DRAM-bound
+### C. RF2 DRAM ACK “only ~6–8 GB/s” is not a fake path
 
-Mem-copy still does CXL write (ingest) + CXL read (replica) + DRAM ring.
-Measured CXL ~21 GB/s/dir; concurrent R+W ≈ ~10 GB/s/dir. Plus 100 G NIC and
-flushes. Embar mem ACK ~6–8 GB/s is near that envelope; label
-**replicated_ack_emulated**.
+DRAM-replica ACK2 still does CXL write (ingest) + CXL read (replica) + DRAM ring
+copy. Measured CXL ~21 GB/s/dir; concurrent R+W ≈ ~10 GB/s/dir. Plus 100 G NIC
+and flushes. Embar DRAM ACK ~6–8 GB/s is near that envelope; label it
+**DRAM replica completion**, not media-durable ACK2.
 
 ### D. Long `ack_wait` ≠ per-message latency
 
