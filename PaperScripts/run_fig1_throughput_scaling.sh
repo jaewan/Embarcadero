@@ -480,9 +480,25 @@ start_lazylog_metadata() {
             exit 1
         }
 
+        # Wait for replica B to bind its port on c4 before opening the tunnel.
+        # ExitOnForwardFailure connects to the remote side immediately; if the
+        # replica hasn't bound yet the tunnel fails. Poll via SSH until ready.
+        local b_ready_deadline=$(( SECONDS + 15 ))
+        local b_ready=0
+        while [[ $SECONDS -lt $b_ready_deadline ]]; do
+            if ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
+                "nc -z 127.0.0.1 ${LAZYLOG_METADATA_PORT_B}" 2>/dev/null; then
+                b_ready=1; break
+            fi
+            sleep 0.5
+        done
+        if [[ $b_ready -eq 0 ]]; then
+            log "FATAL: replica B on $LAZYLOG_METADATA_HOST_B:$LAZYLOG_METADATA_PORT_B did not start within 15s"
+            exit 1
+        fi
+
         # SSH local-port-forward: broker:PORT_B → c4:127.0.0.1:PORT_B
-        # This makes the replica reachable by broker RPCs without requiring a
-        # direct open port on c4.  -N: no remote command; -f: background.
+        # Replica is confirmed listening; tunnel will connect immediately.
         ssh -o BatchMode=yes -o ExitOnForwardFailure=yes \
             -L "${LAZYLOG_METADATA_PORT_B}:127.0.0.1:${LAZYLOG_METADATA_PORT_B}" \
             -N -f "$LAZYLOG_METADATA_HOST_B" 2>/dev/null || {
