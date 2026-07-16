@@ -114,20 +114,47 @@ The script already sets `REQUIRE_FAITHFUL_LAZYLOG=1` and
 `EMBARCADERO_LAZYLOG_METADATA_ENDPOINTS=$LAZYLOG_RF2_METADATA_ENDPOINTS`
 for all LazyLog cells (run_fig1_throughput_scaling.sh:500-508).
 
+> ⚠️ **Testbed fault-domain limitation:** both metadata replicas run on the same
+> machine (moscxl, ports 50081 and 50082).  The
+> `lazylog_metadata_replica_contract.md` requires distinct failure domains; this
+> deployment violates that requirement.  Consequence: a single broker-host crash
+> loses both replicas — the RF=2 durability claim does not hold across host
+> failures on this testbed.  Label all results as "co-located RF=2 (single
+> host)" and do not claim cross-host durability.  For publication, replicas must
+> be placed on separate machines (e.g., c4 and c3 via SSH forwarding).
+
 ---
 
 ## 6. Expected outcomes and interpretation
 
-### Expected: LazyLog faithful throughput 0.5–3 GB/s at N=1
+### Expected: LazyLog faithful throughput — measure, don't predict
 
-**Reasoning:** `AppendToAll` blocks the network-receive thread until each metadata
-replica returns success after `fdatasync`.  Even with stub reuse (fixed:
-`EnsureStubs` reuses gRPC channels across batches), the `fdatasync` serializes
-per batch.
+`AppendToAll` blocks the **network-receive thread** until every metadata replica
+returns success after `fdatasync`.  This is the structural bottleneck.
 
-At `CLIENT_PUB_BATCH_KB=2048` (2 MB batches) and ~1 ms NVMe `fdatasync`:
-ceiling ≈ 2 MB / 1 ms = ~2 GB/s.  With pipelined gRPC and NVMe queueing this
-may be 1–3 GB/s in practice.
+**Throughput ceiling formula** (per receive thread, single broker):
+
+```
+ceiling = CLIENT_PUB_BATCH_KB / (gRPC_RTT_to_replica + fdatasync_latency)
+```
+
+On this testbed (loopback gRPC, same-machine replicas):
+- gRPC loopback RTT ≈ 50–100 µs
+- NVMe `fdatasync` for a small sidecar append ≈ **50–200 µs** (not 1 ms — NVMe,
+  not spinning disk; `fdatasync` on a small append is a journal flush, not a data
+  flush of the full payload)
+- With 2 MB batches: ceiling ≈ 2 MB / (100 + 150) µs ≈ **8 GB/s per thread**
+
+However, 4 broker processes share the NVMe. Concurrent `fdatasync` calls serialize
+on the journal: effective `fdatasync` latency rises 4× → ceiling ≈ 2 GB/s per broker.
+
+**Important testbed caveat:** both metadata replicas are on the **same machine**
+(ports 50081, 50082 on 10.10.10.10). The `AppendToAll` fan-out is therefore not
+truly parallel — both `fdatasync` calls compete for the same NVMe journal.
+For a different-machine RF=2 deployment, the `fdatasync` calls would overlap fully.
+
+**Do not hard-code an expected range.** Measure and report empirically.
+Annotate the result with: "testbed: both metadata replicas co-located on broker host."
 
 ### Expected: Embar O5 disk >> LazyLog faithful
 

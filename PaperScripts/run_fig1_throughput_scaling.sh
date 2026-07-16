@@ -498,6 +498,15 @@ run_system_sink() {
                     ${extra_env[@]+"${extra_env[@]}"}
                 ;;
             LAZYLOG)
+                # LazyLog faithful ACK is metadata-fdatasync-bound regardless of data sink.
+                # Running LazyLog with a mem sink produces results indistinguishable from disk
+                # (both dominated by metadata fdatasync) but labelled "mem" — misleading.
+                # Guard: skip LazyLog mem cells silently. Use SKIP_MEM=0 for Embar/Corfu/Scalog;
+                # LazyLog disk is the only scientifically meaningful variant.
+                if [[ "$sink" != "disk" ]]; then
+                    log "SKIP [$label] (LazyLog mem sink — metadata fdatasync dominates; use FIG2_LAZYLOG.md)"
+                    return 0
+                fi
                 run_fig1_cell "$label" "$n" "$hosts" "$system" "$order" "$sequencer" "$sink" \
                     SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
                     EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \

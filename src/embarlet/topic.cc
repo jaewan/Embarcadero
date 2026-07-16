@@ -2202,10 +2202,11 @@ bool Topic::SupportsPerClientAckLevel2Durable() const {
 void Topic::UpdatePerClientDurable(uint32_t client_id, uint64_t count) {
 	absl::MutexLock lock(&per_client_durable_mu_);
 	per_client_durable_[client_id] += count;
-	// Canary: per-client durable total must never exceed messages written on this
-	// broker.  A violation means the durable counter is being double-credited
-	// (e.g. two independent paths both crediting the same messages).
-	if (tinode_ != nullptr) {
+	// Canary: for EMBARCADERO ORDER=0 only — the only path where tinode->written
+	// is actively maintained by UpdateWrittenForOrder0 on the network-receive thread.
+	// SCALOG and LAZYLOG do not update tinode->written, so comparing against it would
+	// always fire (false alarm): they use DrainDurableBatches (Path B) exclusively.
+	if (tinode_ != nullptr && seq_type_ == EMBARCADERO && order_ == 0) {
 		const uint64_t written = tinode_->offsets[broker_id_].written;
 		const uint64_t new_client_durable = per_client_durable_[client_id];
 		if (new_client_durable > written + 1) {
@@ -2556,7 +2557,14 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 	size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
 	size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
 	batch_header_location = &batch_header_ring[slot_idx];
+	// [[FIX: stale-batch_complete]] Mirror of ScalogGetCXLBuffer fix: flush batch_complete=0
+	// to CXL immediately. zero_mode=metadata clears metadata regions but not batch-header rings,
+	// so a stale batch_complete=1 from a prior run causes DelegationThread to skip the real last
+	// batch and stall permanently. Flushing ensures DelegationThread sees the cleared value.
 	__atomic_store_n(&batch_header_location->batch_complete, 0, __ATOMIC_RELEASE);
+	CXL::store_fence();
+	CXL::flush_cacheline(batch_header_location);
+	CXL::store_fence();
 
 	const unsigned long long int segment_metadata =
 		reinterpret_cast<unsigned long long int>(current_segment_);
