@@ -379,15 +379,26 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 					if (valid_end <= log_start) {
 						break;
 					}
-					if (msg_to_order_->next_msg_diff == 0 ||
-					    msg_to_order_->paddedSize == 0 ||
-					    msg_byte_off >= valid_end) {
+					// Compute max valid logical_offset from byte range.
+					// Stale messages at positions past valid range may appear
+					// inside the validated byte window but have logical_offset
+					// >= the byte-range-implied max, so catch both:
+					const size_t ps = msg_to_order_->paddedSize;
+					const uint64_t max_valid_idx =
+						(ps > 0 && valid_end > log_start)
+							? ((valid_end - log_start) / ps)
+							: 0;
+					if (ps == 0 ||
+					    msg_to_order_->next_msg_diff == 0 ||
+					    msg_byte_off >= valid_end ||
+					    msg_to_order_->logical_offset >= max_valid_idx) {
 						LOG_EVERY_N(WARNING, 100)
 							<< "[ScalogSequencer] stopping at stale/past-end msg broker=" << broker_id_
 							<< " i=" << i
+							<< " logical_offset=" << msg_to_order_->logical_offset
+							<< " max_valid_idx=" << max_valid_idx
 							<< " msg_byte_off=" << msg_byte_off
-							<< " valid_end=" << valid_end
-							<< " logical_offset=" << msg_to_order_->logical_offset;
+							<< " valid_end=" << valid_end;
 						break;
 					}
 				}
