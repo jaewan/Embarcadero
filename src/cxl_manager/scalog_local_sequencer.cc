@@ -365,10 +365,23 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
 					reinterpret_cast<const volatile void*>(msg_to_order_)));
 				Embarcadero::CXL::load_fence();
-				// Safety gate: stop if DelegationThread has not yet set next_msg_diff.
+				// Safety gate 1: stop if DelegationThread has not yet set next_msg_diff.
 				if (msg_to_order_->next_msg_diff == 0 || msg_to_order_->paddedSize == 0) {
-					LOG_EVERY_N(WARNING, 1000) << "[ScalogSequencer] stale/zero header at broker="
+					LOG_EVERY_N(WARNING, 1000) << "[ScalogSequencer] zero header at broker="
 						<< broker_id_ << " i=" << i << " next_msg_diff=" << msg_to_order_->next_msg_diff;
+					break;
+				}
+				// Safety gate 2: stop if logical_offset is not the next expected value.
+				// Stale messages from prior experiments have valid-looking paddedSize and
+				// next_msg_diff but incorrect logical_offset (not = last_ordered_count).
+				// After the first message, last_ordered_count == prev_msg.logical_offset + 1,
+				// so the current message should have logical_offset == last_ordered_count.
+				if (i > 0 && msg_to_order_->logical_offset != last_ordered_count) {
+					LOG_EVERY_N(WARNING, 100) << "[ScalogSequencer] non-sequential logical_offset at broker="
+						<< broker_id_ << " i=" << i
+						<< " expected=" << last_ordered_count
+						<< " got=" << msg_to_order_->logical_offset
+						<< " -- stale CXL data from prior experiment, stopping";
 					break;
 				}
 				local_progress = true;
