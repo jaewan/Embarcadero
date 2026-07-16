@@ -217,10 +217,24 @@ void ScalogLocalSequencer::DrainDurableBatches() {
 	std::vector<DurableBatch> ready;
 	{
 		std::lock_guard<std::mutex> lock(durable_mu_);
+		const size_t pending_before = durable_pending_.size();
 		while (!durable_pending_.empty() &&
 		       durable_pending_.front().end_logical_count <= durable_frontier) {
 			ready.push_back(std::move(durable_pending_.front()));
 			durable_pending_.pop_front();
+		}
+		static thread_local auto last_drain_log = std::chrono::steady_clock::now();
+		const auto now = std::chrono::steady_clock::now();
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_drain_log).count();
+		if (!durable_pending_.empty() && ms > 2000) {
+			last_drain_log = now;
+			LOG(INFO) << "[DrainDurableBatches] broker=" << broker_id_
+			          << " drained_this_call=" << ready.size()
+			          << " pending_before=" << pending_before
+			          << " pending_after=" << durable_pending_.size()
+			          << " frontier=" << durable_frontier
+			          << " min_rep=" << min_rep
+			          << " next_end=" << durable_pending_.front().end_logical_count;
 		}
 	}
 
@@ -344,6 +358,19 @@ void ScalogLocalSequencer::ScalogSequencer(const char* topic, absl::btree_map<in
 	for(auto &cut : global_cut_delta){
 		if(cut.first == broker_id_){
 			for(int64_t i = 0; i < cut.second; i++){
+				// [[FIX: ScalogSequencer CXL visibility]] Flush before read.
+				// Without a fresh CXL read, the sequencer may hit a stale L1/L2
+				// cache entry (prior experiment data) and produce garbage
+				// last_ordered_count values (>655,452) that block DrainDurableBatches.
+				Embarcadero::CXL::flush_cacheline(const_cast<const void*>(
+					reinterpret_cast<const volatile void*>(msg_to_order_)));
+				Embarcadero::CXL::load_fence();
+				// Safety gate: stop if DelegationThread has not yet set next_msg_diff.
+				if (msg_to_order_->next_msg_diff == 0 || msg_to_order_->paddedSize == 0) {
+					LOG_EVERY_N(WARNING, 1000) << "[ScalogSequencer] stale/zero header at broker="
+						<< broker_id_ << " i=" << i << " next_msg_diff=" << msg_to_order_->next_msg_diff;
+					break;
+				}
 				local_progress = true;
 				if (batch_num_msg == 0) {
 					batch_start_logical_offset = msg_to_order_->logical_offset;
