@@ -1087,7 +1087,11 @@ void Topic::DelegationThread() {
 								reinterpret_cast<uint8_t*>(msg_ptr) + current_padded_size);
 						}
 
-						logical_offset_++;
+						// For SCALOG/LAZYLOG, logical_offset_ is already advanced by
+						// ScalogGetCXLBuffer (by num_msg per batch). Do NOT double-count.
+						if (!need_per_msg_flush) {
+							logical_offset_++;
+						}
 					}
 					if (touched_message_headers) {
 						// [[FIX: CXL replica visibility]] MFENCE instead of SFENCE: ensures
