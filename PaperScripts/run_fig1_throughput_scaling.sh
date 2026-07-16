@@ -95,7 +95,7 @@ LAZYLOG_METADATA_PORT_A="${LAZYLOG_METADATA_PORT_A:-50081}"
 LAZYLOG_METADATA_PORT_B="${LAZYLOG_METADATA_PORT_B:-50082}"
 # Both endpoints use 127.0.0.1: A is local; B reaches c4 via SSH tunnel on the same port.
 LAZYLOG_METADATA_IP_A="${LAZYLOG_METADATA_IP_A:-127.0.0.1}"
-LAZYLOG_METADATA_IP_B="${LAZYLOG_METADATA_IP_B:-127.0.0.1}"
+LAZYLOG_METADATA_IP_B="${LAZYLOG_METADATA_IP_B:-10.10.10.12}"
 LAZYLOG_RF2_METADATA_ENDPOINTS="${LAZYLOG_RF2_METADATA_ENDPOINTS:-${LAZYLOG_METADATA_IP_A}:${LAZYLOG_METADATA_PORT_A},${LAZYLOG_METADATA_IP_B}:${LAZYLOG_METADATA_PORT_B}}"
 
 # Exclusive campaign lock (does NOT wrap run_multiclient's flock).
@@ -478,7 +478,7 @@ start_lazylog_metadata() {
         # Use nohup + disown so remote bash exits immediately, allowing SSH to return.
         ssh -f -o BatchMode=yes -o ConnectTimeout=10 "$LAZYLOG_METADATA_HOST_B" \
             "mkdir -p '$remote_sidecar_dir' && nohup '$remote_bin' \
-             --listen '127.0.0.1:${LAZYLOG_METADATA_PORT_B}' \
+             --listen '0.0.0.0:${LAZYLOG_METADATA_PORT_B}' \
              --sidecar '$remote_sidecar' \
              </dev/null >'$remote_log' 2>&1 & disown" 2>/dev/null || {
             log "FATAL: failed to start replica B on $LAZYLOG_METADATA_HOST_B"
@@ -492,7 +492,7 @@ start_lazylog_metadata() {
         local b_ready=0
         while [[ $SECONDS -lt $b_ready_deadline ]]; do
             if ssh -o BatchMode=yes "$LAZYLOG_METADATA_HOST_B" \
-                "nc -z 127.0.0.1 ${LAZYLOG_METADATA_PORT_B}" 2>/dev/null; then
+                "nc -z ${LAZYLOG_METADATA_IP_B} ${LAZYLOG_METADATA_PORT_B}" 2>/dev/null; then
                 b_ready=1; break
             fi
             sleep 0.5
@@ -502,20 +502,7 @@ start_lazylog_metadata() {
             exit 1
         fi
 
-        # SSH local-port-forward: broker:PORT_B → c4:127.0.0.1:PORT_B
-        # Replica is confirmed listening; tunnel will connect immediately.
-        ssh -o BatchMode=yes -o ExitOnForwardFailure=yes \
-            -L "${LAZYLOG_METADATA_PORT_B}:127.0.0.1:${LAZYLOG_METADATA_PORT_B}" \
-            -N -f "$LAZYLOG_METADATA_HOST_B" 2>/dev/null || {
-            log "FATAL: SSH tunnel to $LAZYLOG_METADATA_HOST_B:$LAZYLOG_METADATA_PORT_B failed"
-            exit 1
-        }
-        # Track the tunnel PID for cleanup
-        local tunnel_pid
-        tunnel_pid=$(pgrep -n -f "ssh.*-L.*${LAZYLOG_METADATA_PORT_B}:127.0.0.1:${LAZYLOG_METADATA_PORT_B}.*${LAZYLOG_METADATA_HOST_B}" 2>/dev/null || true)
-        [[ -n "$tunnel_pid" ]] && metadata_pids+=("$tunnel_pid")
-
-        log "Replica B started on $LAZYLOG_METADATA_HOST_B via SSH tunnel (:${LAZYLOG_METADATA_PORT_B})"
+        log "Replica B started on $LAZYLOG_METADATA_HOST_B direct (:${LAZYLOG_METADATA_PORT_B})"
     fi
 
     # Wait for both replicas to be ready via TCP port check (readiness, not just liveness)
