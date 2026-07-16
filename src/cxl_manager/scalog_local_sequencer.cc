@@ -278,7 +278,18 @@ void ScalogLocalSequencer::ReceiveGlobalCut(std::unique_ptr<grpc::ClientReaderWr
 			}
 
 			if (!global_cut_delta.empty()) {
+				const uint64_t ordered_before = tinode_->offsets[broker_id_].ordered;
 				ScalogSequencer(topic, global_cut_delta);
+				// [[FIX: deferred last_applied]] If ScalogSequencer ordered nothing
+				// (e.g. early-exit guard fired before DelegationThread started),
+				// revert last_applied so the next global cut triggers ordering again.
+				if (tinode_->offsets[broker_id_].ordered == ordered_before) {
+					const auto it = last_applied_global_cut_.find(broker_id_);
+					if (it != last_applied_global_cut_.end()) {
+						// Reset to the value before this cut was applied
+						it->second = ordered_before;  // will retry on next cut
+					}
+				}
 			}
 
 			num_global_cuts++;
