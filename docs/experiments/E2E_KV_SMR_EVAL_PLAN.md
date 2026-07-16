@@ -221,6 +221,21 @@ Scalog sticky; replicas included) and divergent only for reordered Scalog
 pipe — internal cross-check of the Valid checker (see E4 scope note: this is
 methodology hygiene and an AE-appendix aid, never a paper result).
 
+**Scalog Pipe reorder rate is stochastic at 10K-op local scale, not
+deterministic every trial** (`smr_fifo_r4c`, 3 trials, otherwise-identical
+config): session_reorders = 262, 978, 0 across trials 1–3 — one trial
+happened to see zero cross-broker inversions by timing luck alone. The
+per-trial byte-level Valid check still correctly failed 2/3 trials, and the
+existing aggregation rule (`plot_smr_fifo.py`: a system is Valid only if
+**every** trial passed) correctly rolls this up to Valid=NO — the right,
+conservative posture for a safety property. **Implication for the paper-scale
+campaign:** do not run only 1 trial for Scalog Pipe and do not be surprised
+by an occasional all-YES trial; report the ≥3-trial consensus verdict (as
+the harness already does) rather than a single run, and consider whether E3
+(higher payload / more brokers-worth of skew) should also report a
+reorder-rate fraction, not just a binary Valid/NO, for a fuller Appendix
+picture of how reliably the violation reproduces at a given scale.
+
 ## 7. Paper update map (execute as results bank)
 
 - `tab:kv-pipelined`: replace legacy 3-row table with System × Mode rows from
