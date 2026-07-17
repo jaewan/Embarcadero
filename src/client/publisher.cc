@@ -3401,6 +3401,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	// Track if we've sent at least one batch (to ensure connection is used)
 	bool has_sent_batch = false;
 	size_t consecutive_empty_reads = 0;
+	// [[EPOCH_CHANGE_RECONNECT]] Shadow of session_epoch_ seen by this thread.
+	// Initialised to 0 so the first batch read always syncs to the current epoch
+	// without triggering a spurious reconnect.
+	uint32_t thread_local_epoch = 0;
 
 	// Main publishing loop. [[CRITICAL: DRAIN_BEFORE_EXIT]] Do NOT break at loop top on consumer_should_exit_.
 	// Doing so would exit without draining the queue, leaving batches unsent and causing ACK timeout (~0.03% shortfall).
@@ -3450,6 +3454,55 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 	process_batch:
 			consecutive_empty_reads = 0;
+
+			// [[EPOCH_CHANGE_RECONNECT 2026-07-17]] After a session fence,
+			// HandleSessionFenced advances session_epoch_ and resumes the queue.
+			// Each PublishThread keeps its existing socket open (connected with the
+			// old epoch). The broker validates every batch header against the epoch
+			// from the SessionOpen handshake and rejects mismatches, triggering
+			// another fence cycle indefinitely. Fix: detect epoch change at batch
+			// dispatch time and proactively reconnect so the new SessionOpen carries
+			// the new epoch before we attempt to send any batch.
+			if (IsOrder5SessionMode()) {
+				const uint32_t cur_epoch = session_epoch_.load(std::memory_order_acquire);
+				if (cur_epoch != thread_local_epoch) {
+					if (thread_local_epoch != 0) {
+						// Epoch changed under us — reconnect on the same broker (or best
+						// survivor) so the handshake uses the new epoch.
+						LOG(WARNING) << "PublishThread[" << pubQuesIdx << "]: epoch changed "
+						             << thread_local_epoch << " → " << cur_epoch
+						             << " on broker=" << broker_id << "; reconnecting";
+						// Try current broker first, then iterate survivors on failure.
+						if (!connect_to_server(static_cast<size_t>(broker_id))) {
+							std::vector<int> all_brokers;
+							{ absl::MutexLock l(&mutex_); all_brokers = brokers_; }
+							bool reconnected = false;
+							for (int alt : all_brokers) {
+								if (alt == broker_id) continue;
+								if (connect_to_server(static_cast<size_t>(alt))) {
+									broker_id = alt;
+									{
+										absl::MutexLock l(&mutex_);
+										ReassignQueueBrokerLocked(static_cast<size_t>(pubQuesIdx),
+										                          broker_id, alt);
+									}
+									reconnected = true;
+									break;
+								}
+							}
+							if (!reconnected) {
+								LOG(ERROR) << "PublishThread[" << pubQuesIdx
+								           << "]: no survivor accepted epoch=" << cur_epoch
+								           << "; thread exiting";
+								pubQue_.ReleaseBatch(batch_header);
+								return;
+							}
+						}
+					}
+					thread_local_epoch = cur_epoch;
+				}
+			}
+
 #ifdef COLLECT_LATENCY_STATS
 			auto submit_time = std::chrono::steady_clock::now();
 			bool has_submit_time = pubQue_.GetBatchSubmitTime(batch_header, &submit_time);
@@ -3458,7 +3511,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				publish_submit_time_missing_.fetch_add(1, std::memory_order_relaxed);
 			}
 #endif
-		
+
 		if (enable_batch_attempted_for_timeout_log_) {
 			total_batches_attempted_.fetch_add(1, std::memory_order_relaxed);
 		}
@@ -3776,6 +3829,22 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 			broker_id = new_broker_id;
 			pubQue_.MarkQueueActive(pubQuesIdx);
+			// [[RECONNECT_EPOCH_RESTAMP 2026-07-17]] After reconnect the broker uses
+			// the epoch from the SessionOpen handshake (connection_session_epoch) to
+			// validate every arriving batch header.  If the session was fenced and
+			// reopened (new epoch) while this batch was in-flight, session_epoch_ has
+			// already been updated by HandleSessionFenced, but batch_header->session_epoch
+			// was stamped at the top of this loop iteration with the old value.
+			// Re-reading session_epoch_ here closes that window: the batch we are about
+			// to retransmit gets the epoch that matches the active connection.
+			if (IsOrder5SessionMode()) {
+				uint32_t cur_epoch = session_epoch_.load(std::memory_order_acquire);
+				if (cur_epoch == 0) {
+					cur_epoch = requested_session_epoch_.load(std::memory_order_acquire);
+				}
+				batch_header->session_epoch   = static_cast<uint16_t>(cur_epoch & 0xFFFFU);
+				batch_header->session_epoch32 = cur_epoch;
+			}
 			try {
 				send_batch_header();
 			} catch (const std::exception& e) {
