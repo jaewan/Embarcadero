@@ -3485,14 +3485,12 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// No batch available: exit only if shutdown requested and queue is drained.
 		if (batch_header == nullptr || batch_header->total_size == 0) {
-			// [[DRAIN_DEADLOCK_FIX]] If Read() returned nullptr because a drain
-			// wake was requested (fence drain in progress), yield briefly and
-			// loop rather than spinning at 100% CPU while waiting for
-			if (batch_header == nullptr &&
-			    session_fenced_reopen_pending_.load(std::memory_order_acquire)) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-				continue;
-			}
+			// When a fence is in progress (session_fenced_reopen_pending_=true),
+			// PublishThread must NOT sleep here. SealAllForSessionRollover() in
+			// HandleSessionFenced tries to push to consumer queues; if threads
+			// sleep instead of draining, the queues fill and SealCurrentAndAdvance
+			// deadlocks. Just continue normally — Read() will return work once
+			// ResumeSessionRollover() is called.
 			if (consumer_should_exit_.load(std::memory_order_relaxed)) {
 				// CRITICAL: Don't exit immediately if we haven't sent any batches yet
 				// This ensures the connection stays alive even if this thread got no batches
