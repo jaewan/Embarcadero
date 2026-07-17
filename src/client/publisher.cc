@@ -2412,14 +2412,9 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 				// from the fence observation regardless of trickle ACKs.
 				if (session_fenced_observed_.load(std::memory_order_acquire) > 0) {
 					const int64_t fence_ns = session_fence_observed_ns_.load(std::memory_order_acquire);
-					// [[FENCE_DEBUG]] Log every 2s to trace why exit not firing
 					if (fence_ns > 0) {
 						const int64_t elapsed_since_fence_ms =
 							(SteadyNowNs() - fence_ns) / 1000000LL;
-						LOG(INFO) << "[FENCE_DEBUG] fence_ns=" << fence_ns
-						          << " elapsed_ms=" << elapsed_since_fence_ms
-						          << " kill=" << kill_brokers_.load()
-						          << " observed=" << session_fenced_observed_.load();
 						if (elapsed_since_fence_ms >= 5000) {
 							LOG(INFO) << "[Publisher ACK]: SESSION_FENCED observed "
 							          << elapsed_since_fence_ms << "ms ago; exiting Poll "
