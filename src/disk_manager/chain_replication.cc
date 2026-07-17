@@ -536,6 +536,21 @@ void ChainReplicationManager::ReplicationThread() {
                     }
                     if (!do_sync) continue;
 
+                    // [[SLOW_SYNC_INJECT]] Artificial post-fdatasync sleep for
+                    // ordering-replication independence experiment. With
+                    // EMBARCADERO_SYNC_SLEEP_MS set, the sync thread stalls after
+                    // each fdatasync, raising ACK2 P99 while leaving network-receive
+                    // threads (and thus ACK1) unaffected.
+                    {
+                        static const int64_t kSleepMs = [] {
+                            const char* e = std::getenv("EMBARCADERO_SYNC_SLEEP_MS");
+                            return (e && e[0]) ? std::atoll(e) : 0LL;
+                        }();
+                        if (kSleepMs > 0) {
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(kSleepMs));
+                        }
+                    }
                     const uint64_t sync_start = SteadyNowNs();
                     if (fdatasync(pipe->fd) < 0) {
                         LOG(ERROR) << "ChainReplicationManager: fdatasync failed errno=" << errno

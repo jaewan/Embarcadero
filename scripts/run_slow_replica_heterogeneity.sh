@@ -160,6 +160,8 @@ INJECT_BG_PID=""
 
 inject_slowdown() {
   local pid=$1
+  # SKIP_SIGSTOP=1: rely only on EMBARCADERO_SYNC_SLEEP_MS, no SIGSTOP.
+  if [ "${SKIP_SIGSTOP:-0}" = "1" ]; then return 0; fi
   (
     sleep "$INJECT_AFTER_SEC"
     kill -STOP "$pid" >/dev/null 2>&1 || true
@@ -211,6 +213,13 @@ run_mode() {
   for ((attempt=1; attempt<=POINT_MAX_ATTEMPTS; attempt++)); do
     cleanup
     sleep 2  # Let signals settle before starting new cluster
+    # EMBARCADERO_SYNC_SLEEP_MS: set before cluster start so sync threads sleep.
+    # inject=1 trials use INJECT_SYNC_SLEEP_MS; baseline trials leave it unset.
+    if [ "$inject" = "1" ] && [ -n "${INJECT_SYNC_SLEEP_MS:-}" ]; then
+      export EMBARCADERO_SYNC_SLEEP_MS="$INJECT_SYNC_SLEEP_MS"
+    else
+      unset EMBARCADERO_SYNC_SLEEP_MS 2>/dev/null || true
+    fi
     local broker_pid_line
     broker_pid_line=$(start_cluster)
     read -r -a broker_pids <<<"$broker_pid_line"
