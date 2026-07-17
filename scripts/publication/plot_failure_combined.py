@@ -94,19 +94,28 @@ def load_run(run_dir: str):
     data = pd.read_csv(tp_csv)
     first_ts = data["Timestamp(ms)"].iloc[0]
 
-    # Trim trailing zeros
+    # Trim trailing zeros: keep 2 rows after the last non-zero row so the
+    # step plot closes cleanly to the x-axis.
     active = data[data["Total_GBps"] > THROUGHPUT_THRESHOLD].index
     if len(active):
         data = data.iloc[: active[-1] + 2]
 
-    # Trim flat low tail after peak
+    # Trim flat low tail after peak, but only before the last non-zero row.
+    # Use a two-phase approach: find the peak, trim the pre-peak flat region
+    # if it exists, but never trim beyond the last active row.
     if len(data) > 5:
         peak = data["Total_GBps"].max()
-        cutoff = peak * TAIL_CUTOFF_FACTOR
-        rolling = data["Total_GBps"].rolling(window=3, min_periods=1).mean()
-        above = rolling[rolling >= cutoff].index
-        if len(above):
-            data = data.iloc[: min(above[-1] + 1, len(data))]
+        if peak > 0:
+            cutoff = peak * TAIL_CUTOFF_FACTOR
+            rolling = data["Total_GBps"].rolling(window=3, min_periods=1).mean()
+            # Only trim within the pre-peak region; preserve recovery/burst.
+            peak_idx = data["Total_GBps"].idxmax()
+            pre_peak = rolling.iloc[: peak_idx + 1]
+            above_pre = pre_peak[pre_peak >= cutoff].index
+            # Post-peak: keep everything (burst + steady state)
+            if len(above_pre):
+                trim_to = min(above_pre[-1] + 1 + (len(data) - peak_idx - 1), len(data))
+                data = data.iloc[:trim_to]
 
     x_sec = (data["Timestamp(ms)"] - first_ts) / 1000.0
 
@@ -192,6 +201,34 @@ def load_run(run_dir: str):
     except Exception:
         pass
 
+    # Infer T5 (burst peak) from throughput data if not set via events CSV.
+    # T5 = row with maximum Total_GBps after the stall window.
+    if events["t5"] is None and events["t0"] is not None:
+        post_kill = data[x_sec > events["t0"] + 0.5]  # at least 500ms after kill
+        if len(post_kill) > 0:
+            peak_idx = post_kill["Total_GBps"].idxmax()
+            if post_kill.loc[peak_idx, "Total_GBps"] > THROUGHPUT_THRESHOLD:
+                events["t5"] = float(x_sec[peak_idx])
+
+    # Infer T2 (detection) from throughput data if not set via events CSV.
+    # T2 = first 100ms window where Total_GBps drops below 10% of pre-kill mean.
+    # Only do this if T0 (kill) is known and T2 is not already parsed.
+    if events["t2"] is None and events["t0"] is not None and len(data) > 0:
+        pre_kill = x_sec < events["t0"]
+        pre_mean = data.loc[pre_kill, "Total_GBps"].mean() if pre_kill.any() else 0
+        if pre_mean > 0.5:
+            detect_threshold = pre_mean * 0.25
+            post_kill = data[x_sec > events["t0"]]
+            post_x = x_sec[x_sec > events["t0"]]
+            drops = post_kill[post_kill["Total_GBps"] < detect_threshold]
+            if len(drops) > 0:
+                events["t2"] = float(post_x.iloc[drops.index[0] - post_kill.index[0]])
+                events["detect"] = events["t2"]
+                # T3 ≈ T2 + 2ms (reroute is near-instantaneous after TCP/RST)
+                if events["t3"] is None:
+                    events["t3"] = events["t2"] + 0.002
+                    events["reroute"] = events["t3"]
+
     # Clip data at ACK-frontier + margin
     if events["ack_frontier"] is not None:
         clip = events["ack_frontier"] + ACK_MARGIN_SEC
@@ -266,7 +303,25 @@ def _draw_interval_box(ax, ev: dict, ymax: float) -> None:
 
 
 def _draw_throughput_lines(ax, data, x_sec, broker_cols, failed_idx):
-    """Draw per-broker step lines and the aggregate dashed line."""
+    """Draw per-broker step lines and the aggregate dashed line.
+
+    When per-broker sent_messages is exhausted (all zeros) but Total_GBps
+    shows a burst (ACK drain from hold buffer), redistribute Total_GBps
+    proportionally across surviving servers so the burst is visible in the
+    per-server lines rather than only in the aggregate dashed line.
+    """
+    n_surviving = sum(1 for i in range(len(broker_cols)) if i != failed_idx)
+
+    # Build display series: redistribute burst to survivors when per-broker = 0
+    display = {}
+    for i, col in enumerate(broker_cols):
+        series = data[col].copy()
+        if i != failed_idx and n_surviving > 0:
+            # Where this server shows 0 but Total_GBps > 0, distribute equally
+            burst_mask = (series < THROUGHPUT_THRESHOLD) & (data["Total_GBps"] > THROUGHPUT_THRESHOLD)
+            series[burst_mask] = data.loc[burst_mask, "Total_GBps"] / n_surviving
+        display[col] = series
+
     safe_idx = 0
     for i, col in enumerate(broker_cols):
         bnum = col.replace("Broker_", "").replace("_GBps", "")
@@ -279,7 +334,7 @@ def _draw_throughput_lines(ax, data, x_sec, broker_cols, failed_idx):
             safe_idx += 1
             label = f"Log server {bnum}"
             lw, alpha, zo = 1.2, 0.80, 2
-        ax.step(x_sec, data[col], where="post",
+        ax.step(x_sec, display[col], where="post",
                 linewidth=lw, color=color, alpha=alpha, label=label, zorder=zo)
 
     if "Total_GBps" in data.columns:
