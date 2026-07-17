@@ -1031,12 +1031,9 @@ void Publisher::WaitForSessionSendDrain(size_t target_messages) {
 
 void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& fenced, int broker_id) {
 	if (!IsOrder5SessionMode()) return;
-	LOG(WARNING) << "[FENCE_TRACE] HandleSessionFenced entry broker=" << broker_id
-	             << " fenced_count=" << session_fenced_observed_.load();
 	// Serialize concurrent fence notifications (multiple brokers / remapped ACK
 	// sockets) so Pause/Seal/resubmit cannot interleave.
 	std::lock_guard<std::mutex> fence_lock(session_fence_handle_mu_);
-	LOG(WARNING) << "[FENCE_TRACE] acquired fence_lock";
 
 	// During ACK2 durable drain, identical lease restates of a frozen committed
 	// prefix must not reopen/resubmit (that re-burns BLog before ingest dedup).
@@ -1108,9 +1105,7 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		fenced.has_committed_prefix() ? fenced.committed_batch_seq() : 0,
 		std::memory_order_release);
 	session_fenced_reopen_pending_.store(true, std::memory_order_release);
-	LOG(WARNING) << "[FENCE_TRACE] calling PauseSessionRollover";
 	pubQue_.PauseSessionRollover();
-	LOG(WARNING) << "[FENCE_TRACE] PauseSessionRollover returned";
 	struct RolloverResumeGuard {
 		Publisher* self;
 		bool active{true};
