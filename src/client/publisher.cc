@@ -2412,9 +2412,14 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 				// from the fence observation regardless of trickle ACKs.
 				if (session_fenced_observed_.load(std::memory_order_acquire) > 0) {
 					const int64_t fence_ns = session_fence_observed_ns_.load(std::memory_order_acquire);
+					// [[FENCE_DEBUG]] Log every 2s to trace why exit not firing
 					if (fence_ns > 0) {
 						const int64_t elapsed_since_fence_ms =
 							(SteadyNowNs() - fence_ns) / 1000000LL;
+						LOG(INFO) << "[FENCE_DEBUG] fence_ns=" << fence_ns
+						          << " elapsed_ms=" << elapsed_since_fence_ms
+						          << " kill=" << kill_brokers_.load()
+						          << " observed=" << session_fenced_observed_.load();
 						if (elapsed_since_fence_ms >= 5000) {
 							LOG(INFO) << "[Publisher ACK]: SESSION_FENCED observed "
 							          << elapsed_since_fence_ms << "ms ago; exiting Poll "
@@ -3849,18 +3854,39 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				return;
 			}
 
-			// Connect to new broker
-			if (!connect_to_server(new_broker_id)) {
-				pubQue_.ReleaseBatch(batch_header);
-				RecordFailureEvent("Reconnect Fail Broker " + std::to_string(new_broker_id));
-				LOG(ERROR) << "Failed to connect to replacement broker " << new_broker_id;
-				// Already MarkQueueInactive above; refresh preferred so routing
-				// diagnostics drop this dead queue (ORDER=5 striping).
-				{
-					absl::MutexLock l(&mutex_);
-					RefreshOrder5PreferredQueuesLocked();
+			// Connect to new broker — try all survivors before giving up.
+			// [[RECONNECT_RETRY_ALL_SURVIVORS]] If the first replacement broker also
+			// rejects SessionOpen, the thread exits permanently, leaving permanent
+			// gaps in the hold buffer that can never drain. Retry the full survivor set.
+			{
+				bool connected = connect_to_server(new_broker_id);
+				if (!connected) {
+					RecordFailureEvent("Reconnect Fail Broker " + std::to_string(new_broker_id));
+					LOG(ERROR) << "Failed to connect to replacement broker " << new_broker_id
+					           << " — trying remaining survivors";
+					std::vector<int> all_brokers;
+					{ absl::MutexLock l(&mutex_); all_brokers = brokers_; }
+					for (int fallback : all_brokers) {
+						if (fallback == new_broker_id) continue;
+						LOG(WARNING) << "PublishThread[" << pubQuesIdx << "]: trying fallback broker "
+						             << fallback << " for queue";
+						if (connect_to_server(fallback)) {
+							new_broker_id = fallback;
+							connected = true;
+							break;
+						}
+						RecordFailureEvent("Reconnect Fail Broker " + std::to_string(fallback));
+					}
 				}
-				return;
+				if (!connected) {
+					pubQue_.ReleaseBatch(batch_header);
+					LOG(ERROR) << "All survivor brokers unreachable — thread exiting";
+					{
+						absl::MutexLock l(&mutex_);
+						RefreshOrder5PreferredQueuesLocked();
+					}
+					return;
+				}
 			}
 
 			std::string reconn_msg = "Reconnect Success Broker " + std::to_string(new_broker_id) + " (from " + std::to_string(broker_id) + ")";
