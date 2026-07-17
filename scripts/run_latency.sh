@@ -766,6 +766,9 @@ run_trial() {
     if [[ "$seq" == "SCALOG" ]]; then
       quoted_cmd+="export SCALOG_CXL_MODE=${SCALOG_CXL_MODE:-1} && "
     fi
+    if [[ -n "${EMBARCADERO_CLIENT_LINGER_US:-}" ]]; then
+      quoted_cmd+="export EMBARCADERO_CLIENT_LINGER_US=${EMBARCADERO_CLIENT_LINGER_US} && "
+    fi
     if [[ -n "$CLIENT_NUMA_BIND" ]]; then
       quoted_cmd+="$CLIENT_NUMA_BIND "
     fi

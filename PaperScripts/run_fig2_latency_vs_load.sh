@@ -81,6 +81,13 @@ SKIP_DISK_ABLATION="${SKIP_DISK_ABLATION:-0}"
 SKIP_NOLINGER="${SKIP_NOLINGER:-1}"
 SKIP_RF0_COMPANION="${SKIP_RF0_COMPANION:-1}"
 SKIP_LAZYLOG="${SKIP_LAZYLOG:-1}"
+SKIP_EPOCH_SWEEP="${SKIP_EPOCH_SWEEP:-1}"          # Default off; set 0 to enable
+EPOCH_SWEEP_TAUS_US="${EPOCH_SWEEP_TAUS_US:-250 500 1000 2000}"
+# tau=100us omitted: epoch driver sleep granularity (~25us) is 25% of tau,
+# making P99/tau unreliable at that scale. Start at 250us where sleep precision
+# is negligible relative to tau. Add tau=100 explicitly to run if needed.
+EPOCH_SWEEP_LOAD_MBPS="${EPOCH_SWEEP_LOAD_MBPS:-250}"  # Fixed load point
+EPOCH_SWEEP_TRIALS="${EPOCH_SWEEP_TRIALS:-5}"       # 5 trials; warmup=1 excludes cold first trial
 ALLOW_DIRTY_ARTIFACT="${ALLOW_DIRTY_ARTIFACT:-1}"
 export ALLOW_DIRTY_ARTIFACT
 
@@ -369,7 +376,7 @@ PY
 }
 
 ensure_results_header() {
-    local expected="campaign_id,pass_id,run_ts_utc,git_commit,cell,panel,system,order,linger,n_clients,client_host,target_mbps,trial_in_pass,global_trial_seq,status,p50_us,p95_us,p99_us,achieved_offered_mbps,achieved_e2e_goodput_mbps,pub_ack_p50_us,pub_ack_p99_us,msg_size,total_bytes,num_brokers,rf,ack,sink,pacing_mode,cxl_zero_mode,epoch_us,artifact_dir,notes"
+    local expected="campaign_id,pass_id,run_ts_utc,git_commit,cell,panel,system,order,linger,n_clients,client_host,target_mbps,trial_in_pass,global_trial_seq,status,p50_us,p95_us,p99_us,achieved_offered_mbps,achieved_e2e_goodput_mbps,pub_ack_p50_us,pub_ack_p99_us,msg_size,total_bytes,num_brokers,rf,ack,sink,pacing_mode,cxl_zero_mode,epoch_us,linger_us,artifact_dir,notes"
     if [[ ! -f "$RESULTS_CSV" ]]; then
         echo "$expected" >"$RESULTS_CSV"
         return 0
@@ -409,6 +416,7 @@ refresh_plot() {
             --mech-csv "$MECH_CSV" \
             --mech-pdf "$MECH_PDF" \
             --primary-metric ack \
+            --epoch-table \
             >>"$LOG_DIR/plot.log" 2>&1 || log "WARN: plot refresh failed (see $LOG_DIR/plot.log)"
     fi
 }
@@ -423,13 +431,14 @@ append_point_results() {
     python3 - "$RESULTS_CSV" "$CAMPAIGN_ID" "$PASS_ID" "$(stamp)" "$commit" \
         "$label" "$panel" "$system" "$order" "$linger" "$CLIENT_HOST" "$target" \
         "$cell_rc" "$run_dir" "$MSG_SIZE" "$TOTAL_BYTES" "$NUM_BROKERS" \
-        "$rf" "$ack" "$sink" "$PACING_MODE" "$EMBARCADERO_CXL_ZERO_MODE" "$EMBAR_ORDER5_EPOCH_US" <<'PY'
+        "$rf" "$ack" "$sink" "$PACING_MODE" "$EMBARCADERO_CXL_ZERO_MODE" "$EMBAR_ORDER5_EPOCH_US" \
+        "${EMBARCADERO_CLIENT_LINGER_US:-}" <<'PY'
 import csv, sys
 from pathlib import Path
 
 (results_csv, campaign_id, pass_id, run_ts, commit, label, panel, system, order, linger,
  client_host, target, cell_rc, run_dir, msg_size, total_bytes, num_brokers,
- rf, ack, sink, pacing_mode, cxl_zero_mode, epoch_us) = sys.argv[1:]
+ rf, ack, sink, pacing_mode, cxl_zero_mode, epoch_us, linger_us) = sys.argv[1:]
 cell_rc = int(cell_rc)
 run_path = Path(run_dir)
 
@@ -500,7 +509,7 @@ for trial_csv in trial_csvs:
                 row.get("achieved_e2e_goodput_mbps") or "",
                 pub50, pub99,
                 msg_size, total_bytes, num_brokers, rf, ack, sink,
-                pacing_mode, cxl_zero_mode, epoch_us,
+                pacing_mode, cxl_zero_mode, epoch_us, linger_us,
                 row.get("artifact_dir") or str(run_path), notes,
             ])
             appended += 1
@@ -518,7 +527,7 @@ if appended == 0:
         target, "1", str(gseq), "fail",
         "", "", "", "", "", "", "",
         msg_size, total_bytes, num_brokers, rf, ack, sink,
-        pacing_mode, cxl_zero_mode, epoch_us,
+        pacing_mode, cxl_zero_mode, epoch_us, linger_us,
         str(run_path), notes,
     ])
 print(f"appended={appended}")
@@ -583,6 +592,7 @@ run_fig2_point() {
             OUT_BASE="$LATENCY_ROOT" \
             EMBARCADERO_RUNTIME_MODE="$runtime_mode" \
             EMBAR_ORDER5_EPOCH_US="$EMBAR_ORDER5_EPOCH_US" \
+            EMBARCADERO_CLIENT_LINGER_US="${EMBARCADERO_CLIENT_LINGER_US:-}" \
             EMBARCADERO_CXL_SIZE="$EMBARCADERO_CXL_SIZE" \
             EMBARCADERO_CXL_ZERO_MODE="$EMBARCADERO_CXL_ZERO_MODE" \
             EMBARCADERO_CXL_MAP_POPULATE="$EMBARCADERO_CXL_MAP_POPULATE" \
@@ -623,6 +633,31 @@ run_series_loads() {
     for target in $loads; do
         run_fig2_point "$label" "$panel" "$system" "$order" "$linger" \
             "$sequencer" "$rf" "$ack" "$sink" "$target" "$@"
+    done
+}
+
+run_epoch_sweep() {
+    if [[ "${SKIP_EPOCH_SWEEP}" == "1" ]]; then
+        log "SKIP epoch_sweep (SKIP_EPOCH_SWEEP=1)"
+        return 0
+    fi
+    log "===== Epoch tau sweep @ ${EPOCH_SWEEP_LOAD_MBPS} MB/s ====="
+    local tau linger label
+    for tau in ${EPOCH_SWEEP_TAUS_US}; do
+        # Linger = tau/2 so linger deadline seals before epoch closes.
+        # This keeps the P99/tau ratio interpretable: linger ≪ tau means
+        # linger doesn't dominate; linger = tau/2 maintains the causal
+        # relationship (batch seals mid-epoch, not after it).
+        linger=$(( tau / 2 ))
+        [[ $linger -lt 50 ]] && linger=50   # floor at 50 µs
+        label="fig2_epoch_tau${tau}"
+        should_run_cell "$label" || continue
+        log "  tau=${tau}µs linger=${linger}µs label=$label"
+        NUM_TRIALS="$EPOCH_SWEEP_TRIALS" WARMUP_TRIALS=1 \
+        SERIES_LOADS="$EPOCH_SWEEP_LOAD_MBPS" \
+        EMBAR_ORDER5_EPOCH_US="$tau" \
+        EMBARCADERO_CLIENT_LINGER_US="$linger" \
+            run_series_loads "$label" epoch_sweep embar 5 on EMBARCADERO 2 2 mem
     done
 }
 
@@ -706,6 +741,9 @@ while true; do
         NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
           run_series_loads fig2_mech_embar_o5_ack2_rf2_disk mechanism embar 5 on EMBARCADERO 2 2 disk
     fi
+
+    # --- Epoch tau sweep (timer quantization proof) ---
+    run_epoch_sweep
 
     # --- Matched RF2 ACK2 mem baselines (same sink as primary) ---
     if [[ "$INCLUDE_BASELINES" == "1" ]]; then

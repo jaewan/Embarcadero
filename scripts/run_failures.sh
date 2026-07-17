@@ -55,6 +55,15 @@ FAILURE_MATCH_THROUGHPUT="${FAILURE_MATCH_THROUGHPUT:-1}"
 export EMBARCADERO_FAILURE_MATCH_THROUGHPUT="$FAILURE_MATCH_THROUGHPUT"
 export EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS="${EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS:-100}"
 
+# Panel (c) SESSION_FENCED exercise: FAILURE_MODE=client_kill stops the publisher
+# process (not a broker) so brokers fence the session after the lease expires.
+# broker_kill (default) = existing broker-kill behaviour (panels a & b).
+FAILURE_MODE="${FAILURE_MODE:-broker_kill}"
+# Session lease for client_kill mode: short so fence fires quickly after publisher exits.
+# Broker idle-force-expire must be <= session lease for the fence to trigger.
+PANEL_C_SESSION_LEASE_MS="${PANEL_C_SESSION_LEASE_MS:-15000}"
+PANEL_C_IDLE_FORCE_EXPIRE_MS="${PANEL_C_IDLE_FORCE_EXPIRE_MS:-15000}"
+
 SEQUENCER="${SEQUENCER:-EMBARCADERO}"
 ACK="${ACK:-1}"
 REPLICATION_FACTOR="${REPLICATION_FACTOR:-0}"
@@ -85,6 +94,17 @@ esac
 ack="$ACK"
 sequencer="$SEQUENCER"
 test_cases=(4)
+
+# Apply client_kill overrides: use num_brokers_to_kill=0 and short session lease.
+if [[ "${FAILURE_MODE}" == "client_kill" ]]; then
+  NUM_BROKERS_TO_KILL=0
+  export EMBARCADERO_SESSION_LEASE_MS="${EMBARCADERO_SESSION_LEASE_MS:-$PANEL_C_SESSION_LEASE_MS}"
+  export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS="${EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS:-$PANEL_C_IDLE_FORCE_EXPIRE_MS}"
+  export EMBARCADERO_FAILURE_MODE="client_kill"
+  # Short queue-drain timeout: publisher self-stops, Poll() will not reach target n.
+  export EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC="${EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC:-20}"
+  echo "FAILURE_MODE=client_kill: publisher self-stops after ${FAILURE_AFTER_MS}ms, session lease=${EMBARCADERO_SESSION_LEASE_MS}ms"
+fi
 
 # CXL knobs matching Fig2 (metadata clear; 72 GiB admits 4×8 GiB segments).
 export EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-1}"
@@ -404,6 +424,13 @@ for test_case in "${test_cases[@]}"; do
       if [[ -n "${EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS:-}" ]]; then
         remote_after_export+="export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS=$(printf '%q' "$EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS") && "
       fi
+      # Forward FAILURE_MODE and queue-drain timeout for client_kill mode.
+      if [[ -n "${EMBARCADERO_FAILURE_MODE:-}" ]]; then
+        remote_after_export+="export EMBARCADERO_FAILURE_MODE=$(printf '%q' "$EMBARCADERO_FAILURE_MODE") && "
+      fi
+      if [[ -n "${EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC:-}" ]]; then
+        remote_after_export+="export EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC=$(printf '%q' "$EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC") && "
+      fi
       # shellcheck disable=SC2029
       timeout --signal=TERM --kill-after=10 "$CLIENT_TIMEOUT" \
         ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$REMOTE_CLIENT_HOST" \
@@ -458,7 +485,50 @@ num_brokers=$NUM_BROKERS
 cxl_zero_mode=$EMBARCADERO_CXL_ZERO_MODE
 epoch_us=${EMBAR_ORDER5_EPOCH_US:-}
 trial=$trial
+failure_mode=${FAILURE_MODE:-broker_kill}
 EOF
+
+    # client_kill mode: scrape broker logs for SESSION_FENCED and append to failure_events.csv.
+    # The publisher exits before the broker fences the session (after lease expires),
+    # so the fence event is recorded from broker logs, not from the client AckThread.
+    if [[ "${FAILURE_MODE}" == "client_kill" ]]; then
+      echo "Waiting for SESSION_FENCED in broker logs (lease=${EMBARCADERO_SESSION_LEASE_MS:-30000}ms)..."
+      fence_wait_s="$(( (${EMBARCADERO_SESSION_LEASE_MS:-30000} + 10000) / 1000 ))"
+      fence_deadline="$(( $(date +%s) + fence_wait_s ))"
+      session_fenced_line=""
+      fence_found=0
+      while [[ $(date +%s) -lt "$fence_deadline" && $fence_found -eq 0 ]]; do
+        for broker_log in broker_*_trial${trial}.log; do
+          [ -f "$broker_log" ] || continue
+          found_line="$(grep -m1 'AckThread: delivered SessionFenced' "$broker_log" 2>/dev/null || true)"
+          if [[ -n "$found_line" ]]; then
+            session_fenced_line="$found_line"
+            fence_found=1
+            break
+          fi
+        done
+        [ $fence_found -eq 0 ] && sleep 1
+      done
+
+      if [[ $fence_found -eq 1 ]]; then
+        # Parse broker log line for hwm and committed_batch_seq.
+        fence_hwm="$(echo "$session_fenced_line" | grep -oP '(?<=committed_msg_hwm=)\d+' || echo '0')"
+        fence_batch="$(echo "$session_fenced_line" | grep -oP '(?<=committed_batch_seq=)\d+' || echo '0')"
+        fence_ts="$(echo "$session_fenced_line" | grep -oP 'W\d+ \d{2}:\d{2}:\d{2}' | head -1 || echo 'unknown')"
+        events_file_c="$FAILURE_DATA_DIR/failure_events.csv"
+        approx_ms="$(( ${FAILURE_AFTER_MS:-0} + ${EMBARCADERO_SESSION_LEASE_MS:-30000} ))"
+        echo "SESSION_FENCED found: hwm=$fence_hwm batch=$fence_batch ts=$fence_ts"
+        if [[ -f "$events_file_c" ]]; then
+          printf '%s,"SESSION_FENCED broker=0 hwm=%s committed_batch_seq=%s (from broker log: %s)"
+' "$approx_ms" "$fence_hwm" "$fence_batch" "$fence_ts" >> "$events_file_c"
+          echo "  SESSION_FENCED appended to $events_file_c at approx ${approx_ms}ms"
+        else
+          echo "WARNING: $events_file_c not found; cannot append SESSION_FENCED"
+        fi
+      else
+        echo "WARNING: SESSION_FENCED not found in broker logs within ${fence_wait_s}s"
+      fi
+    fi
 
     summarize_trial_results "$trial" "$CLIENT_LOG"
 

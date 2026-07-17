@@ -92,6 +92,10 @@ struct DeliveryLatencySample {
 	size_t recv_chunk_bytes = 0;
 	bool has_uid = false;
 	bool receive_matched = false;
+	// Per-client FIFO fields (populated when EMBARCADERO_FIFO_CHECK=1)
+	uint32_t sender_client_id = 0;
+	uint64_t per_client_seq = 0;
+	bool has_fifo_fields = false;
 };
 
 struct DeliveryDrainResult {
@@ -101,6 +105,8 @@ struct DeliveryDrainResult {
 	size_t invalid_messages = 0;
 	size_t duplicate_total_order = 0;
 	size_t out_of_order_total_order = 0;
+	size_t out_of_order_per_client = 0;   // per-client FIFO violations
+	size_t fifo_checked_messages = 0;     // messages where FIFO check was possible
 	size_t duplicate_uid = 0;
 	size_t missing_uid = 0;
 	size_t receive_matched = 0;
@@ -116,6 +122,7 @@ struct DeliveryDrainResult {
 		       invalid_messages == 0 &&
 		       duplicate_total_order == 0 &&
 		       out_of_order_total_order == 0 &&
+		       out_of_order_per_client == 0 &&
 		       duplicate_uid == 0 &&
 		       missing_uid == 0 &&
 		       !timed_out;
@@ -451,6 +458,12 @@ bool ExtractDeliveredMessage(void* raw,
 	if (payload_size >= sizeof(long long) + sizeof(uint64_t)) {
 		std::memcpy(&out->msg_uid, payload + sizeof(long long), sizeof(uint64_t));
 		out->has_uid = (out->msg_uid != 0);
+		// Per-client FIFO: high 32 bits = client_id, low 32 bits = per_client_seq
+		if (out->has_uid && std::getenv("EMBARCADERO_FIFO_CHECK") != nullptr) {
+			out->sender_client_id = static_cast<uint32_t>(out->msg_uid >> 32);
+			out->per_client_seq   = static_cast<uint64_t>(static_cast<uint32_t>(out->msg_uid));
+			out->has_fifo_fields  = (out->sender_client_id != 0);
+		}
 	}
 	return out->send_time_ns > 0;
 }
@@ -472,6 +485,7 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
 	bool have_expected_total_order = false;
 	uint64_t expected_total_order = 0;
+	std::unordered_map<uint32_t, uint64_t> per_client_expected_seq;
 	size_t unique_uids = 0;
 	bool saw_uid = false;
 	const size_t drain_batch_size = DeliveryDrainBatchSize();
@@ -522,7 +536,9 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 			expected_total_order++;
 			result.last_total_order = sample.total_order;
 
-			if (sample.has_uid) {
+			// Skip uid dedup/range check for FIFO-encoded messages (msg_uid encodes
+			// (client_id<<32|per_client_seq) and will never fall in [1, target_messages]).
+			if (sample.has_uid && !sample.has_fifo_fields) {
 				saw_uid = true;
 				if (!seen_uids.empty() &&
 				    sample.msg_uid > 0 &&
@@ -538,6 +554,21 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 				result.max_uid = std::max(result.max_uid, sample.msg_uid);
 			}
 
+			// Per-client FIFO check
+			if (sample.has_fifo_fields) {
+				result.fifo_checked_messages++;
+				auto& expected_seq = per_client_expected_seq[sample.sender_client_id];
+				if (expected_seq == 0) {
+					// First message from this client
+					expected_seq = sample.per_client_seq + 1;
+				} else if (sample.per_client_seq != expected_seq) {
+					result.out_of_order_per_client++;
+					// Advance to actual observed (avoid wedging checker permanently)
+					expected_seq = sample.per_client_seq + 1;
+				} else {
+					expected_seq++;
+				}
+			}
 			result.samples.push_back(sample);
 		}
 	}
@@ -669,7 +700,7 @@ void WriteDeliveryOrderingCsv(const DeliveryDrainResult& result) {
 		return;
 	}
 	out << "Target,Delivered,RecordedSamples,TimedOut,InvalidMessages,"
-	    << "DuplicateTotalOrder,OutOfOrderTotalOrder,DuplicateUid,MissingUid,"
+	    << "DuplicateTotalOrder,OutOfOrderTotalOrder,DuplicateUid,MissingUid,OutOfOrderPerClient,FifoCheckedMessages,"
 	    << "FirstTotalOrder,LastTotalOrder,MinUid,MaxUid,ReceiveMatched,Pass\n";
 	out << result.target
 	    << "," << result.delivered
@@ -680,6 +711,8 @@ void WriteDeliveryOrderingCsv(const DeliveryDrainResult& result) {
 	    << "," << result.out_of_order_total_order
 	    << "," << result.duplicate_uid
 	    << "," << result.missing_uid
+	    << "," << result.out_of_order_per_client
+	    << "," << result.fifo_checked_messages
 	    << "," << result.first_total_order
 	    << "," << result.last_total_order
 	    << "," << (result.min_uid == std::numeric_limits<uint64_t>::max() ? 0 : result.min_uid)
@@ -1197,16 +1230,30 @@ double FailurePublishThroughputTest(const cxxopts::ParseResult& result, char top
 		}
 
 		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
-		if (!p.Poll(n)) {
-			LOG(ERROR) << "Publish test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
-			delete[] message;
-			exit(1);
-		}
-
 		std::string events_dir = GetFailureDataDir();
 		std::string events_file = events_dir + "/failure_events.csv";
 		std::string throughput_file = events_dir + "/real_time_acked_throughput.csv";
-		p.WriteFailureEventsToFile(events_file);
+		// client_kill mode (SESSION_FENCED exercise): publisher self-shuts before all
+		// messages are sent, so Poll() will return false after the queue-drain timeout.
+		// In client_kill mode, Poll() will time out (EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC=20s) since
+		// shutdown_=true causes the publish loop to stop before all n messages are sent.
+		const bool is_client_kill_mode = [] {
+			const char* m = std::getenv("EMBARCADERO_FAILURE_MODE");
+			return m && std::string_view(m) == "client_kill";
+		}();
+		if (!p.Poll(n)) {
+			if (is_client_kill_mode) {
+				LOG(WARNING) << "[client_kill] Publisher self-shutdown: Poll() returned early (expected for SESSION_FENCED exercise).";
+				p.WriteFailureEventsToFile(events_file);
+			} else {
+				LOG(ERROR) << "Publish test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
+				p.WriteFailureEventsToFile(events_file);
+				delete[] message;
+				exit(1);
+			}
+		} else {
+			p.WriteFailureEventsToFile(events_file);
+		}
 		// Calculate elapsed time and bandwidth
 		auto end = std::chrono::high_resolution_clock::now();
 		std::chrono::duration<double> elapsed = end - start;
@@ -1908,8 +1955,22 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 					timestamp.time_since_epoch()).count();
 			memcpy(message.data(), &nanoseconds_since_epoch, sizeof(long long));
 			if (message_size >= sizeof(long long) + sizeof(uint64_t)) {
-				const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
-				memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
+				const char* fifo_check_env = std::getenv("EMBARCADERO_FIFO_CHECK");
+				const char* fifo_client_env = std::getenv("EMBARCADERO_FIFO_CLIENT_ID");
+				if (fifo_check_env != nullptr && fifo_client_env != nullptr) {
+					const uint32_t fifo_client_id = static_cast<uint32_t>(std::strtoul(fifo_client_env, nullptr, 10));
+					if (fifo_client_id != 0) {
+						const uint64_t fifo_uid = (static_cast<uint64_t>(fifo_client_id) << 32) |
+						                          static_cast<uint64_t>((i + 1) & 0xFFFFFFFFu);
+						memcpy(message.data() + sizeof(long long), &fifo_uid, sizeof(uint64_t));
+					} else {
+						const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
+						memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
+					}
+				} else {
+					const uint64_t msg_uid = static_cast<uint64_t>(i + 1);
+					memcpy(message.data() + sizeof(long long), &msg_uid, sizeof(uint64_t));
+				}
 			}
 
 			// Send the message

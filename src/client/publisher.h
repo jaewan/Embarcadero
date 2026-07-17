@@ -122,6 +122,15 @@ class Publisher {
 				absl::MutexLock lock(&event_mutex_);
 				failure_events_.clear();
 			}
+			// Reset T-event flags for fresh run
+			t1_recorded_.clear();
+			t2_recorded_.clear();
+			t3_recorded_.clear();
+			t4_recorded_.clear();
+			t5_recorded_.clear();
+			t6_recorded_.clear();
+			kill_fired_for_t1_.store(false, std::memory_order_relaxed);
+			reconnect_happened_.store(false, std::memory_order_relaxed);
 		}
 
 		// Call this *after* test run / joining threads
@@ -257,6 +266,16 @@ class Publisher {
 	std::atomic<bool> throttle_relaxed_{false};  // Set after killbrokers() returns; publish loop skips backpressure
 	static constexpr int kMaxBrokerIds = 32;
 	std::array<std::atomic<bool>, kMaxBrokerIds> broker_killed_{};  // Per-broker kill signal for fast PublishThread abort
+
+	// T-event flags for failure timeline instrumentation
+	std::atomic_flag t1_recorded_ = ATOMIC_FLAG_INIT;  // T1: last ACK before stall
+	std::atomic_flag t2_recorded_ = ATOMIC_FLAG_INIT;  // T2: first gRPC send fail detected
+	std::atomic_flag t3_recorded_ = ATOMIC_FLAG_INIT;  // T3: first reconnect success
+	std::atomic_flag t4_recorded_ = ATOMIC_FLAG_INIT;  // T4: first retransmit ACKed after reroute
+	std::atomic_flag t5_recorded_ = ATOMIC_FLAG_INIT;  // T5: burst peak (ACK spike after reroute)
+	std::atomic_flag t6_recorded_ = ATOMIC_FLAG_INIT;  // T6: steady state resumed (>90% pre-kill)
+	std::atomic<bool> kill_fired_for_t1_{false};        // Set after killbrokers() completes
+	std::atomic<bool> reconnect_happened_{false};       // Set after first reconnect success (T3)
 		std::chrono::steady_clock::time_point start_time_;
 		
 
