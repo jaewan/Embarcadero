@@ -2771,21 +2771,37 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 			auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count();
 			throughputFile << timestamp_ms;
 
-			size_t sum = 0;
+			size_t sum = 0;  // sum of ACK deltas for Total_GBps (correct aggregate)
 			// For ORDER=5, per-broker ACK accounting is collapsed onto broker_stats_[0]
-			// by HandleSessionFenced; use sent_messages for per-server display so the
-			// actual load distribution is visible in the figure.
+			// by HandleSessionFenced. Use sent_messages for the per-server columns so
+			// the actual load distribution is visible, but keep the Total_GBps column
+			// ACK-based so the stall (zero ACKs during hold) is accurately shown.
 			const bool use_sent_for_per_broker = IsOrder5SessionMode();
+			std::vector<size_t> prev_acked_for_total(num_brokers);
 			for (size_t i = 0; i < num_brokers; i++) {
+				prev_acked_for_total[i] =
+					broker_stats_[i].acked_messages.load(std::memory_order_relaxed) * message_size;
+			}
+			for (size_t i = 0; i < num_brokers; i++) {
+				// Per-server column: sent-based so striping is visible even for ORDER=5.
 				size_t bytes = (use_sent_for_per_broker
 					? broker_stats_[i].sent_messages.load(std::memory_order_relaxed)
 					: broker_stats_[i].acked_messages.load(std::memory_order_relaxed)) * message_size;
 				size_t delta_bytes = bytes - prev_throughputs[i];
 				double gbps = (static_cast<double>(delta_bytes) / elapsed_sec) / kGBDivisor;
 				throughputFile << "," << gbps;
-				sum += delta_bytes;
+				// Total_GBps uses acked delta (reflects hold-buffer stall correctly).
+				sum += prev_acked_for_total[i];  // accumulated below after subtraction
 				prev_throughputs[i] = bytes;
 			}
+			// Recompute sum as total ACK delta for Total_GBps
+			size_t ack_sum = 0;
+			for (size_t i = 0; i < num_brokers; i++) {
+				const size_t cur =
+					broker_stats_[i].acked_messages.load(std::memory_order_relaxed) * message_size;
+				if (cur > prev_acked_for_total[i]) ack_sum += cur - prev_acked_for_total[i];
+			}
+			sum = ack_sum;
 
 			double total_gbps = (static_cast<double>(sum) / elapsed_sec) / kGBDivisor;
 			throughputFile << "," << total_gbps << "\n";
