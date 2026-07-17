@@ -1084,6 +1084,14 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 	const uint32_t old_epoch = session_epoch_.load(std::memory_order_acquire);
 	const uint32_t new_epoch = NextSessionEpochAfterFence(old_epoch);
 	session_fenced_observed_.fetch_add(1, std::memory_order_relaxed);
+	// [[FENCE_POLL_EXIT]] Record the first fence observation time so Poll() can
+	// bound the post-fence ACK wait regardless of trickle ACKs from survivors.
+	{
+		int64_t expected_zero = 0;
+		const int64_t now_ns = SteadyNowNs();
+		session_fence_observed_ns_.compare_exchange_strong(
+			expected_zero, now_ns, std::memory_order_release, std::memory_order_relaxed);
+	}
 	const uint64_t release_hwm = fenced.has_committed_prefix() ? fenced.committed_batch_seq() : UINT64_MAX;
 	// UINT64_MAX sentinel means empty prefix: credit nothing by batch_seq compare.
 	session_fenced_committed_batch_seq_.store(
@@ -1202,6 +1210,7 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 	}
 	pubQue_.SetNextBatchSeqForNewSession(NextBatchSeqAfterSuffixResubmit(static_cast<size_t>(new_seq)));
 	session_fenced_reopen_pending_.store(false, std::memory_order_release);
+	// Resume the queue for epoch=N+1 publishing.
 	pubQue_.ResumeSessionRollover();
 	rollover_guard.dismiss();
 	LOG(WARNING) << "[SESSION_REOPEN_RESUBMIT]"
@@ -2389,6 +2398,25 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 					LOG(INFO) << "[Publisher ACK]: No new ACKs for 5s after broker kill. Assuming remaining " << (target_acks - current_acks) << " messages were lost in flight.";
 					break;
 				}
+				// [[FENCE_POLL_EXIT]] After SESSION_FENCED is observed the committed
+				// prefix is final.  Survivor brokers may still trickle ACKs for
+				// already-ordered held batches, resetting last_ack_change_time and
+				// extending the wait indefinitely.  Once fenced, cap the wait to 5s
+				// from the fence observation regardless of trickle ACKs.
+				if (session_fenced_observed_.load(std::memory_order_acquire) > 0) {
+					const int64_t fence_ns = session_fence_observed_ns_.load(std::memory_order_acquire);
+					if (fence_ns > 0) {
+						const int64_t elapsed_since_fence_ms =
+							(SteadyNowNs() - fence_ns) / 1000000LL;
+						if (elapsed_since_fence_ms >= 5000) {
+							LOG(INFO) << "[Publisher ACK]: SESSION_FENCED observed "
+							          << elapsed_since_fence_ms << "ms ago; exiting Poll "
+							          << "(committed=" << current_acks
+							          << " target=" << target_acks << ")";
+							break;
+						}
+					}
+				}
 			}
 			if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
 				std::string per_broker;
@@ -3419,6 +3447,14 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 		// No batch available: exit only if shutdown requested and queue is drained.
 		if (batch_header == nullptr || batch_header->total_size == 0) {
+			// [[DRAIN_DEADLOCK_FIX]] If Read() returned nullptr because a drain
+			// wake was requested (fence drain in progress), yield briefly and
+			// loop rather than spinning at 100% CPU while waiting for
+			if (batch_header == nullptr &&
+			    session_fenced_reopen_pending_.load(std::memory_order_acquire)) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				continue;
+			}
 			if (consumer_should_exit_.load(std::memory_order_relaxed)) {
 				// CRITICAL: Don't exit immediately if we haven't sent any batches yet
 				// This ensures the connection stays alive even if this thread got no batches

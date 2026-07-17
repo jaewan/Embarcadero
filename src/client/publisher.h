@@ -131,6 +131,8 @@ class Publisher {
 			t6_recorded_.clear();
 			kill_fired_for_t1_.store(false, std::memory_order_relaxed);
 			reconnect_happened_.store(false, std::memory_order_relaxed);
+				// Reset fence timestamp for fresh trial.
+				session_fence_observed_ns_.store(0, std::memory_order_relaxed);
 		}
 
 		// Call this *after* test run / joining threads
@@ -387,6 +389,8 @@ class Publisher {
 			std::atomic<uint64_t> session_fenced_committed_batch_seq_{0};
 			std::atomic<uint64_t> retransmit_attempts_{0};
 			std::atomic<uint64_t> session_fenced_observed_{0};
+			// Nanosecond timestamp of first SESSION_FENCED observation; used by Poll().
+			std::atomic<int64_t> session_fence_observed_ns_{0};
 			std::atomic<int64_t> last_unacked_send_ns_{0};
 			std::atomic<int64_t> last_ack_progress_ns_{0};
 			std::mutex session_fence_handle_mu_;
