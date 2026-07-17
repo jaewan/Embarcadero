@@ -58,7 +58,15 @@ def load_ok(csv_path: str) -> dict[tuple[str, str, int], list[float]]:
             except (KeyError, ValueError):
                 continue
             val = None
-            for key in ("overlap_gbps", "send_done_sum_gbps", "bandwidth_sum_gbps"):
+            # N=4 is the co-located ceiling point: the local publisher runs
+            # through its 10 GiB much faster than remote clients, collapsing
+            # the shared overlap window to sub-second and making overlap_gbps
+            # unreliable (FIG1.md Caveat B).  Use bandwidth_sum for N=4.
+            if n == 4:
+                metric_order = ("bandwidth_sum_gbps", "overlap_gbps", "send_done_sum_gbps")
+            else:
+                metric_order = ("overlap_gbps", "send_done_sum_gbps", "bandwidth_sum_gbps")
+            for key in metric_order:
                 raw = (row.get(key) or "").strip()
                 if not raw:
                     continue
