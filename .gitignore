@@ -76,3 +76,20 @@ CTestTestfile.cmake
 Makefile
 !benchmarks/sequencer/Makefile
 !scripts/network-emulation/Makefile
+
+# ── Temporary / backup files ──────────────────────────────────
+*.bak
+*.bak_*
+*.orig
+
+# ── Python bytecode ───────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Ad-hoc session scripts dropped in repo root ───────────────
+pilot_*.sh
+/tmp_*.sh
+
+# ── Leftover broker run artifacts in repo root ────────────────
+/order5_anomaly_counters_broker*.csv
