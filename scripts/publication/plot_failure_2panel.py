@@ -86,14 +86,27 @@ def draw(ax, x, br, ag, broker_cols, t_kill, t_stall, t_burst,
                         if j != i and np.any(br[c] > 0.05))
         if surviving > 0:
             series[burst_mask] = ag[burst_mask] / max(surviving, 1)
+        # Detect killed server: look for a server that was active pre-kill
+        # then drops to near-zero for an extended period mid-run (not just end-of-trial).
+        # A killed server: drops to 0 within 0-2s of t_kill and stays 0 for >0.5s.
+        is_killed = False
+        if t_kill is not None:
+            # Check 0.2s window around and after kill
+            early_zero = x[np.logical_and(x > t_kill - 0.1, x < t_kill + 0.4)]
+            series_window = series[np.logical_and(x > t_kill - 0.1, x < t_kill + 0.4)]
+            if len(series_window) > 0 and np.mean(series_window) < 0.1:
+                # Verify it was active before the kill
+                pre_series = series[x < t_kill - 0.2]
+                if len(pre_series) > 0 and np.mean(pre_series) > 0.5:
+                    is_killed = True
         ax.step(x, series, where="post",
-                linewidth=1.3, color=C_SERVER[i % len(C_SERVER)],
-                alpha=0.85, label=f"Log server {i}", zorder=2)
+                linewidth=1.1, color=C_SERVER[i % len(C_SERVER)],
+                alpha=0.60, label=f"Log server {i}", zorder=2)
 
-    # Aggregate (dashed black)
+    # Aggregate — the primary story: thick, prominent
     ax.step(x, ag, where="post",
-            linewidth=2.1, linestyle="--", color=C_AGGR,
-            alpha=0.90, label="Aggregate", zorder=4)
+            linewidth=2.8, linestyle="-", color=C_AGGR,
+            alpha=0.95, label="Aggregate ACK", zorder=6)
 
     # T-event overlays
     if show_tevent and t_kill is not None:
