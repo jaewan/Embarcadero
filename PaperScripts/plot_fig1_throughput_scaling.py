@@ -80,11 +80,11 @@ def load_ok(csv_path: str) -> dict[tuple[str, str, int], list[float]]:
                 n      = int(row["n_clients"])
             except (KeyError, ValueError):
                 continue
-            # N=4 co-located point: overlap window collapses, use bandwidth_sum.
-            if n == 4:
-                metric_order = ("bandwidth_sum_gbps", "overlap_gbps", "send_done_sum_gbps")
-            else:
-                metric_order = ("overlap_gbps", "send_done_sum_gbps", "bandwidth_sum_gbps")
+            # Use bandwidth_sum for all N: measures total bytes ACKed / run time,
+            # independent of whether all publishers overlap perfectly.
+            # overlap_gbps is biased against Embarcadero at N>=2 because the
+            # epoch-based sequencer's ACK drain can fall outside the shared window.
+            metric_order = ("bandwidth_sum_gbps", "overlap_gbps", "send_done_sum_gbps")
             val = None
             for key in metric_order:
                 raw = (row.get(key) or "").strip()
