@@ -1008,7 +1008,14 @@ bool Publisher::SendRawBatchToBroker(const void* bytes, size_t wire_bytes, int b
 }
 
 void Publisher::WaitForSessionSendDrain(size_t target_messages) {
-	const int64_t deadline_ns = SteadyNowNs() + static_cast<int64_t>(SessionLeaseNs());
+	// [[DRAIN_TIMEOUT]] Use a bounded 5 s timeout rather than the full session
+	// lease. Idle publish threads blocked in pubQue_.Read() will never advance
+	// session_sent_hwm_, so waiting the full lease (up to 180 s) just blocks the
+	// AckThread inside HandleSessionFenced — preventing Poll() from ever checking
+	// the post-fence exit condition. 5 s is enough for any genuinely in-flight
+	// batches to complete; stragglers are counted as committed by the fence HWM.
+	constexpr int64_t kDrainTimeoutNs = 5LL * 1000LL * 1000LL * 1000LL;
+	const int64_t deadline_ns = SteadyNowNs() + kDrainTimeoutNs;
 	while (SteadyNowNs() < deadline_ns) {
 		size_t sent_hwm = 0;
 		{
