@@ -2772,8 +2772,14 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 			throughputFile << timestamp_ms;
 
 			size_t sum = 0;
+			// For ORDER=5, per-broker ACK accounting is collapsed onto broker_stats_[0]
+			// by HandleSessionFenced; use sent_messages for per-server display so the
+			// actual load distribution is visible in the figure.
+			const bool use_sent_for_per_broker = IsOrder5SessionMode();
 			for (size_t i = 0; i < num_brokers; i++) {
-				size_t bytes = broker_stats_[i].acked_messages.load(std::memory_order_relaxed) * message_size;
+				size_t bytes = (use_sent_for_per_broker
+					? broker_stats_[i].sent_messages.load(std::memory_order_relaxed)
+					: broker_stats_[i].acked_messages.load(std::memory_order_relaxed)) * message_size;
 				size_t delta_bytes = bytes - prev_throughputs[i];
 				double gbps = (static_cast<double>(delta_bytes) / elapsed_sec) / kGBDivisor;
 				throughputFile << "," << gbps;
