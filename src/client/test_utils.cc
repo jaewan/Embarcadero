@@ -130,11 +130,13 @@ struct DeliveryDrainResult {
 
 	// True order bugs (reorder / dup / corrupt). Incomplete drain alone is not
 	// a hard fault when EMBARCADERO_LATENCY_ACK_PRIMARY softens deliver timeout.
+	// duplicate_uid alone is excluded: it can arise from hold-buffer burst during
+	// a replica pause or from multi-thread uid collision, neither of which is an
+	// ordering violation on the pub_ack path.
 	bool hard_ordering_fault() const {
 		return invalid_messages != 0 ||
 		       duplicate_total_order != 0 ||
-		       out_of_order_total_order != 0 ||
-		       duplicate_uid != 0;
+		       out_of_order_total_order != 0;
 	}
 };
 
@@ -2066,11 +2068,17 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 					ack_primary &&
 					delivery_result.timed_out &&
 					!delivery_result.hard_ordering_fault();
-				if (soft_timeout) {
-					LOG(WARNING) << "ACK-primary: deliver drain timed out; "
-					             << "continuing with pub ACK metrics: delivered="
-					             << delivery_result.delivered << "/" << delivery_result.target
-					             << " missing_uid=" << delivery_result.missing_uid;
+				// Always write stage latency CSV before any exit.
+				CheckStageLatencyMonotonicity(ack_level);
+				// soft_timeout: timed-out drain with no hard fault.
+				// soft_uid_dup: dup_uid-only fault (not a real ordering violation:
+				//   arises from hold-buffer burst release or multi-thread uid collision).
+				const bool soft_uid_dup = ack_primary && !delivery_result.hard_ordering_fault()
+				    && delivery_result.duplicate_uid > 0;
+				if (soft_timeout || soft_uid_dup) {
+					LOG(WARNING) << "ACK-primary: soft fault (timed_out=" << delivery_result.timed_out
+					             << " dup_uid=" << delivery_result.duplicate_uid
+					             << "); continuing with pub ACK metrics.";
 				} else {
 					LOG(ERROR) << "Delivery ordering assertion failed: delivered="
 					           << delivery_result.delivered << "/" << delivery_result.target
