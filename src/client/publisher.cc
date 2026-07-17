@@ -1031,9 +1031,12 @@ void Publisher::WaitForSessionSendDrain(size_t target_messages) {
 
 void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& fenced, int broker_id) {
 	if (!IsOrder5SessionMode()) return;
+	LOG(WARNING) << "[FENCE_TRACE] HandleSessionFenced entry broker=" << broker_id
+	             << " fenced_count=" << session_fenced_observed_.load();
 	// Serialize concurrent fence notifications (multiple brokers / remapped ACK
 	// sockets) so Pause/Seal/resubmit cannot interleave.
 	std::lock_guard<std::mutex> fence_lock(session_fence_handle_mu_);
+	LOG(WARNING) << "[FENCE_TRACE] acquired fence_lock";
 
 	// During ACK2 durable drain, identical lease restates of a frozen committed
 	// prefix must not reopen/resubmit (that re-burns BLog before ingest dedup).
@@ -1105,7 +1108,9 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		fenced.has_committed_prefix() ? fenced.committed_batch_seq() : 0,
 		std::memory_order_release);
 	session_fenced_reopen_pending_.store(true, std::memory_order_release);
+	LOG(WARNING) << "[FENCE_TRACE] calling PauseSessionRollover";
 	pubQue_.PauseSessionRollover();
+	LOG(WARNING) << "[FENCE_TRACE] PauseSessionRollover returned";
 	struct RolloverResumeGuard {
 		Publisher* self;
 		bool active{true};
@@ -2688,16 +2693,42 @@ void Publisher::FailBrokers(size_t total_message_size, size_t message_size,
 
 	// Start thread to monitor progress and kill brokers at specified percentage
 	kill_brokers_thread_ = std::thread([=, this]() {
-		size_t bytes_to_kill_brokers = total_message_size * failure_percentage;
+		// Wall-clock kill: if EMBARCADERO_FAILURE_AFTER_MS > 0, sleep for that many
+		// milliseconds after publish starts, then kill. Gives reproducible kill timing
+		// independent of throughput rate. Falls back to bytes-threshold when unset.
+		int after_ms = 0;
+		if (const char* env = std::getenv("EMBARCADERO_FAILURE_AFTER_MS")) {
+			try { after_ms = std::stoi(env); } catch (...) { after_ms = 0; }
+		}
 
-		while (!shutdown_.load(std::memory_order_relaxed) && !publish_finished_.load(std::memory_order_relaxed) && total_sent_bytes_.load(std::memory_order_acquire) < bytes_to_kill_brokers) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Was 10ms, use 1ms for faster detection
+		if (after_ms > 0) {
+			LOG(INFO) << "Failure kill armed: wall-clock " << after_ms
+			          << " ms after publish start";
+			for (int elapsed = 0;
+			     elapsed < after_ms &&
+			     !shutdown_.load(std::memory_order_relaxed) &&
+			     !publish_finished_.load(std::memory_order_relaxed);
+			     ++elapsed) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+		} else {
+			size_t bytes_to_kill_brokers = total_message_size * failure_percentage;
+			while (!shutdown_.load(std::memory_order_relaxed) &&
+			       !publish_finished_.load(std::memory_order_relaxed) &&
+			       total_sent_bytes_.load(std::memory_order_acquire) < bytes_to_kill_brokers) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
 		}
 
 		if (!shutdown_.load(std::memory_order_relaxed)) {
-			size_t sent_at_trigger = total_sent_bytes_.load(std::memory_order_acquire);
-			RecordFailureEvent("Failure threshold reached (sent frontier)");
-			LOG(INFO) << "Triggering broker kill at " << sent_at_trigger << " bytes sent";
+			const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - start_time_).count();
+			const size_t sent_at_trigger = total_sent_bytes_.load(std::memory_order_acquire);
+			RecordFailureEvent(after_ms > 0
+				? "Failure threshold reached (wall-clock)"
+				: "Failure threshold reached (sent frontier)");
+			LOG(INFO) << "Triggering broker kill at t=" << elapsed_ms
+			          << "ms sent=" << sent_at_trigger << " bytes";
 			RecordFailureEvent("Broker kill requested (gRPC)");
 			killbrokers();
 			throttle_relaxed_.store(true, std::memory_order_release);
