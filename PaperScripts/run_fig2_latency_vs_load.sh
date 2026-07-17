@@ -51,6 +51,12 @@ mkdir -p "$LOG_DIR" "$LATENCY_ROOT"
 NUM_TRIALS="${NUM_TRIALS:-1}"
 WARMUP_TRIALS="${WARMUP_TRIALS:-0}"
 TARGET_TRIALS="${TARGET_TRIALS:-0}"
+# SWEEP_PASSES: how many full iterate-all-cells passes to run.
+# When set, the script runs one trial per cell per pass, giving a complete
+# single-trial dataset after pass 1 — useful for writing in parallel — then
+# accumulates additional trials until TARGET_TRIALS is reached.
+# Ignored when TARGET_TRIALS=0 (no stopping criterion).
+SWEEP_PASSES="${SWEEP_PASSES:-1}"
 TOTAL_BYTES="${TOTAL_BYTES:-$((4 * 1024 * 1024 * 1024))}"
 MSG_SIZE="${MSG_SIZE:-1024}"
 NUM_BROKERS="${NUM_BROKERS:-4}"
@@ -656,60 +662,79 @@ if [[ "$WAIT_FOR_IDLE" == "1" ]]; then
     log "cluster idle — beginning Fig2 pass"
 fi
 
-# --- Primary: coordination claim (mem RF2) ---
-SERIES_LOADS="$LOAD_POINTS_MBPS" \
-  run_series_loads fig2_embar_o5_ack2_rf2_mem primary embar 5 on EMBARCADERO 2 2 mem
+# ---------------------------------------------------------------------------
+# Iterate-first sweep: each pass runs ONE trial per cell across all cells,
+# giving a complete single-trial dataset after pass 1.  TARGET_TRIALS gates
+# early exit so already-saturated cells are skipped automatically.
+# ---------------------------------------------------------------------------
+_pass=0
+while true; do
+    _pass=$(( _pass + 1 ))
+    log "===== Sweep pass $_pass / ${SWEEP_PASSES} ====="
 
-# Optional RF0 companion (ordering-only floor across loads)
-if [[ "$SKIP_RF0_COMPANION" != "1" ]]; then
-    SERIES_LOADS="$LOAD_POINTS_MBPS" \
-      run_series_loads fig2_embar_o5_ack1_rf0 companion embar 5 on EMBARCADERO 0 1 none
-fi
+    # --- Primary: coordination claim (mem RF2) ---
+    NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$LOAD_POINTS_MBPS" \
+      run_series_loads fig2_embar_o5_ack2_rf2_mem primary embar 5 on EMBARCADERO 2 2 mem
 
-if [[ "$SKIP_NOLINGER" != "1" ]]; then
-    SERIES_LOADS="$LOAD_POINTS_MBPS" \
-      run_series_loads fig2_embar_o5_ack2_rf2_mem_nolinger companion embar 5 off EMBARCADERO 2 2 mem
-fi
-
-# --- Disk ablation at one matched load (media-durable cost) ---
-if [[ "$SKIP_DISK_ABLATION" != "1" ]]; then
-    log "===== Disk ablation @ ${DISK_ABLATION_LOAD_MBPS} MB/s ====="
-    SERIES_LOADS="$DISK_ABLATION_LOAD_MBPS" \
-      run_series_loads fig2_embar_o5_ack2_rf2_disk disk_ablation embar 5 on EMBARCADERO 2 2 disk
-fi
-
-# --- Mechanism ablation at one matched load ---
-if [[ "$SKIP_MECHANISM" != "1" ]]; then
-    log "===== Mechanism ablation @ ${MECHANISM_LOAD_MBPS} MB/s ====="
-    SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
-      run_series_loads fig2_mech_embar_o0_ack1_rf0 mechanism embar 0 on EMBARCADERO 0 1 none
-    SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
-      run_series_loads fig2_mech_embar_o5_ack1_rf0 mechanism embar 5 on EMBARCADERO 0 1 none
-    SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
-      run_series_loads fig2_mech_embar_o5_ack2_rf2_mem mechanism embar 5 on EMBARCADERO 2 2 mem
-    SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
-      run_series_loads fig2_mech_embar_o5_ack2_rf2_disk mechanism embar 5 on EMBARCADERO 2 2 disk
-fi
-
-# --- Matched RF2 ACK2 mem baselines (same sink as primary) ---
-if [[ "$INCLUDE_BASELINES" == "1" ]]; then
-    log "===== Matched-load RF2 ACK2 mem baselines @ $BASELINE_LOAD_MBPS ====="
-    SERIES_LOADS="$BASELINE_LOAD_MBPS" \
-      run_series_loads fig2_corfu_o2_ack2_rf2_mem baseline corfu 2 na CORFU 2 2 mem \
-        EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
-    SERIES_LOADS="$BASELINE_LOAD_MBPS" \
-      run_series_loads fig2_scalog_o1_ack2_rf2_mem baseline scalog 1 na SCALOG 2 2 mem \
-        SKIP_REMOTE_SCALOG_SEQUENCER=1 \
-        EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP"
-    if [[ "$SKIP_LAZYLOG" != "1" ]]; then
-        SERIES_LOADS="$BASELINE_LOAD_MBPS" \
-          run_series_loads fig2_lazylog_o2_ack2_rf2_mem baseline lazylog 2 na LAZYLOG 2 2 mem \
-            SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
-            EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
-            BROKER_LISTEN_ADDR="$BROKER_IP" \
-            REQUIRE_FAITHFUL_LAZYLOG=0
+    # Optional RF0 companion (ordering-only floor across loads)
+    if [[ "$SKIP_RF0_COMPANION" != "1" ]]; then
+        NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$LOAD_POINTS_MBPS" \
+          run_series_loads fig2_embar_o5_ack1_rf0 companion embar 5 on EMBARCADERO 0 1 none
     fi
-fi
+
+    if [[ "$SKIP_NOLINGER" != "1" ]]; then
+        NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$LOAD_POINTS_MBPS" \
+          run_series_loads fig2_embar_o5_ack2_rf2_mem_nolinger companion embar 5 off EMBARCADERO 2 2 mem
+    fi
+
+    # --- Disk ablation at one matched load (media-durable cost) ---
+    if [[ "$SKIP_DISK_ABLATION" != "1" ]]; then
+        log "===== Disk ablation @ ${DISK_ABLATION_LOAD_MBPS} MB/s ====="
+        NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$DISK_ABLATION_LOAD_MBPS" \
+          run_series_loads fig2_embar_o5_ack2_rf2_disk disk_ablation embar 5 on EMBARCADERO 2 2 disk
+    fi
+
+    # --- Mechanism ablation at one matched load ---
+    if [[ "$SKIP_MECHANISM" != "1" ]]; then
+        log "===== Mechanism ablation @ ${MECHANISM_LOAD_MBPS} MB/s ====="
+        NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
+          run_series_loads fig2_mech_embar_o0_ack1_rf0 mechanism embar 0 on EMBARCADERO 0 1 none
+        NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
+          run_series_loads fig2_mech_embar_o5_ack1_rf0 mechanism embar 5 on EMBARCADERO 0 1 none
+        NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
+          run_series_loads fig2_mech_embar_o5_ack2_rf2_mem mechanism embar 5 on EMBARCADERO 2 2 mem
+        NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
+          run_series_loads fig2_mech_embar_o5_ack2_rf2_disk mechanism embar 5 on EMBARCADERO 2 2 disk
+    fi
+
+    # --- Matched RF2 ACK2 mem baselines (same sink as primary) ---
+    if [[ "$INCLUDE_BASELINES" == "1" ]]; then
+        log "===== Matched-load RF2 ACK2 mem baselines @ $BASELINE_LOAD_MBPS ====="
+        NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$BASELINE_LOAD_MBPS" \
+          run_series_loads fig2_corfu_o2_ack2_rf2_mem baseline corfu 2 na CORFU 2 2 mem \
+            EMBARCADERO_CORFU_SEQ_IP="$BROKER_IP"
+        NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$BASELINE_LOAD_MBPS" \
+          run_series_loads fig2_scalog_o1_ack2_rf2_mem baseline scalog 1 na SCALOG 2 2 mem \
+            SKIP_REMOTE_SCALOG_SEQUENCER=1 \
+            EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP"
+        if [[ "$SKIP_LAZYLOG" != "1" ]]; then
+            NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$BASELINE_LOAD_MBPS" \
+              run_series_loads fig2_lazylog_o2_ack2_rf2_mem baseline lazylog 2 na LAZYLOG 2 2 mem \
+                SKIP_REMOTE_LAZYLOG_SEQUENCER=1 \
+                EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
+                BROKER_LISTEN_ADDR="$BROKER_IP" \
+                REQUIRE_FAITHFUL_LAZYLOG=0
+        fi
+    fi
+
+    log "===== Sweep pass $_pass complete ====="
+
+    # Stop when we've done the requested number of passes, or when TARGET_TRIALS
+    # is set and every cell already has enough ok rows (run_fig2_point skips them).
+    if [[ "$_pass" -ge "$SWEEP_PASSES" ]]; then
+        break
+    fi
+done
 
 cleanup_shm_all
 cleanup_remote_stray_procs "$CLIENT_HOST"
