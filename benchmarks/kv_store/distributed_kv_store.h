@@ -396,6 +396,9 @@ class DistributedKVStore {
 		uint64_t getAppliedAnyEntryCount() const {
 			return applied_any_entries_.load(std::memory_order_acquire);
 		}
+		size_t getPublisherBatchesSent() const {
+			return publisher_ ? publisher_->GetTotalBatchesSent() : 0;
+		}
 		// Order-independent digest of the current KV state (replica convergence).
 		uint64_t stateDigest() const { return kv_store_.digest(); }
 

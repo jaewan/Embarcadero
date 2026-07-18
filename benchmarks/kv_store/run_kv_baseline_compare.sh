@@ -46,11 +46,20 @@ export EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-0}"
 # Each sequencer start uses a fresh EMBARCADERO_CXL_SHM_NAME under /dev/shm; without unlink,
 # back-to-back runs fill tmpfs (SIGBUS on memset) long before ftruncate fails.
 KV_BENCH_REMOVE_STALE_KVBASE_SHM="${KV_BENCH_REMOVE_STALE_KVBASE_SHM:-1}"
+DRIVER_CXL_SHM_NAME=""
 kv_bench_unlink_kvbase_shm() {
   [[ "${KV_BENCH_REMOVE_STALE_KVBASE_SHM}" == "1" ]] || return 0
-  # Only this driver's segments: a wildcard /dev/shm/CXL_* rm unlinks segments
-  # belonging to concurrently running harnesses (moscxl is a shared box).
-  rm -f /dev/shm/CXL_KVBASE_"${UID}"_* 2>/dev/null || true
+  [[ -n "$DRIVER_CXL_SHM_NAME" ]] || return 0
+  case "$DRIVER_CXL_SHM_NAME" in
+    /CXL_KVBASE_"${UID}"_*)
+      rm -f "/dev/shm/${DRIVER_CXL_SHM_NAME#/}" 2>/dev/null || true
+      ;;
+    *)
+      echo "ERROR: refusing to unlink unexpected SHM name: $DRIVER_CXL_SHM_NAME" >&2
+      return 1
+      ;;
+  esac
+  DRIVER_CXL_SHM_NAME=""
 }
 
 BROKER_READY_TIMEOUT_SEC="${BROKER_READY_TIMEOUT_SEC:-120}"
@@ -90,14 +99,29 @@ wait_scalog_port() {
 
 start_cluster() {
   local seq="$1"
+  local name pid state
+  for name in embarlet corfu_global_sequencer lazylog_global_sequencer scalog_global_sequencer; do
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+      if [[ -n "$state" && "$state" != "Z" ]]; then
+        echo "ERROR: live $name pid=$pid exists; refusing host-wide cleanup" >&2
+        return 1
+      fi
+    done < <(pgrep -x "$name" 2>/dev/null || true)
+  done
+  DRIVER_OWNS_CLUSTER=1
   broker_local_cleanup
   kv_bench_unlink_kvbase_shm
   sleep 0.5
 
   if [[ -n "${KV_BENCH_FIXED_CXL_SHM_NAME:-}" ]]; then
+    # A fixed caller-owned segment is never unlinked by this driver.
+    DRIVER_CXL_SHM_NAME=""
     export EMBARCADERO_CXL_SHM_NAME="$KV_BENCH_FIXED_CXL_SHM_NAME"
   else
-    export EMBARCADERO_CXL_SHM_NAME="/CXL_KVBASE_${UID}_${seq}_$$_$(date +%s)_${RANDOM}"
+    DRIVER_CXL_SHM_NAME="/CXL_KVBASE_${UID}_${seq}_$$_$(date +%s)_${RANDOM}"
+    export EMBARCADERO_CXL_SHM_NAME="$DRIVER_CXL_SHM_NAME"
   fi
 
   local -a run_env=(
@@ -164,7 +188,12 @@ start_cluster() {
 # processes host-wide by name, so a trap firing after a normal run (each config
 # already cleaned up) can kill a cluster a newer driver invocation just started.
 DRIVER_DONE=0
-cleanup() { [[ "$DRIVER_DONE" == 1 ]] || broker_local_cleanup; }
+DRIVER_OWNS_CLUSTER=0
+cleanup() {
+  [[ "$DRIVER_DONE" == 1 ]] && return 0
+  [[ "$DRIVER_OWNS_CLUSTER" == 1 ]] && broker_local_cleanup
+  kv_bench_unlink_kvbase_shm
+}
 trap cleanup EXIT
 
 BENCH_COMMON_BASE=(
@@ -175,7 +204,10 @@ BENCH_COMMON_BASE=(
   --write_ratio=1
   --warmup_ops="$KV_BENCH_WARMUP_OPS"
   --ack=1
-  --rf=1
+  # Keep the topic request aligned with the RF passed to every broker above;
+  # otherwise an inherited REPLICATION_FACTOR silently changes only half of
+  # the experiment.
+  --rf="$REPLICATION_FACTOR"
   --log_level="$KV_BENCH_LOG_LEVEL"
   --broker_ip="$KV_BENCH_BROKER_IP"
   --pub_threads="$KV_BENCH_PUB_THREADS"
@@ -202,7 +234,10 @@ run_one_config() {
   echo "======== $seq  trial $trial  $tag  (sync_interval=$sync_iv sync_barrier=$sync_barrier) ========"
   if ! start_cluster "$seq"; then
     echo "ERROR: skipping $seq trial $trial $tag (cluster did not start)" >&2
-    broker_local_cleanup; sleep 2; return 1
+    [[ "$DRIVER_OWNS_CLUSTER" == 1 ]] && broker_local_cleanup
+    DRIVER_OWNS_CLUSTER=0
+    sleep 2
+    return 1
   fi
   local -a bench_env=(
     env "EMBAR_USE_HUGETLB=$EMBAR_USE_HUGETLB"
@@ -222,6 +257,7 @@ run_one_config() {
   bench_status=${PIPESTATUS[0]}
   set -e
   broker_local_cleanup
+  DRIVER_OWNS_CLUSTER=0
   kv_bench_unlink_kvbase_shm
   sleep "${BROKER_SEQ_GAP_SEC:-3}"
   if [[ "$bench_status" -ne 0 ]]; then

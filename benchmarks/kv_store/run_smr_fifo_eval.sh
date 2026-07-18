@@ -6,11 +6,12 @@
 # Valid iff every key's final value is the LAST version submitted for it
 # (session FIFO), store size stays record_count, and applied == published.
 #
-# Matrix: sequencers x {pipe, serialize} x trials.
+# Matrix: sequencers x selected modes x trials.
 #   pipe      : sync_interval=0  (max pipeline; Embar's claimed setting)
+#   batch_ack : one publisher batch in flight; seal and wait for ACK before
+#               filling the next batch (strict FIFO while retaining batching)
 #   serialize : sync_interval=1, stop-and-wait on the ACK barrier — the
-#               "restore FIFO without native holds" fairness row for
-#               write-before-order baselines.
+#               per-operation policy lower bound.
 #
 # A striped-Scalog/LazyLog Pipe run that fails session-FIFO validation is a
 # RESULT (Appendix app:scalog-fifo), not a harness bug — do not "fix" it by
@@ -31,8 +32,6 @@ NUM_BROKERS="${NUM_BROKERS:-4}"
 export NUM_BROKERS EMBARCADERO_NUM_BROKERS="$NUM_BROKERS"
 # run_one overrides NUM_BROKERS per mode (sticky=1); remember the default.
 SMR_FIFO_NUM_BROKERS_DEFAULT="$NUM_BROKERS"
-REPLICATION_FACTOR="${REPLICATION_FACTOR:-1}"
-export REPLICATION_FACTOR EMBARCADERO_REPLICATION_FACTOR="$REPLICATION_FACTOR"
 export EMBARCADERO_RUNTIME_MODE="${EMBARCADERO_RUNTIME_MODE:-throughput}"
 export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
 # Default config (64GB CXL, 8GB segments) leaves a ~30GB segment region = 3
@@ -56,6 +55,13 @@ SMR_FIFO_WARMUP_OPS="${SMR_FIFO_WARMUP_OPS:-50000}"
 # compare RATES. Slowdown is computed from ops/s, not wall time.
 SMR_FIFO_SERIALIZE_OPS="${SMR_FIFO_SERIALIZE_OPS:-20000}"
 SMR_FIFO_SERIALIZE_BARRIER="${SMR_FIFO_SERIALIZE_BARRIER:-ack}"
+# Each fixed-size FIFO PUT serializes to ~134 bytes (type 1 + txid 8 + pairCount 4
+# + keyLen 4 + key 13 + valLen 4 + val 100). 4,096 ops * 134 B = 536 KB, which
+# exceeds the 512 KB default BATCH_SIZE but fits within 1 MiB. The bench_env
+# below sets EMBARCADERO_BATCH_SIZE=1048576 to prevent the 512 KB size-cap from
+# sealing partial batches and breaking the one-in-flight guarantee. batch_ack
+# also disables the time-based linger so the group seals as exactly one batch.
+SMR_FIFO_BATCH_ACK_OPS="${SMR_FIFO_BATCH_ACK_OPS:-4096}"
 SMR_FIFO_VALUE_SIZE="${SMR_FIFO_VALUE_SIZE:-100}"
 SMR_FIFO_ACK="${SMR_FIFO_ACK:-1}"
 SMR_FIFO_RF="${SMR_FIFO_RF:-1}"
@@ -65,7 +71,7 @@ SMR_FIFO_RF="${SMR_FIFO_RF:-1}"
 SMR_FIFO_PUB_THREADS="${SMR_FIFO_PUB_THREADS:-1}"
 SMR_FIFO_NUM_TRIALS="${SMR_FIFO_NUM_TRIALS:-3}"
 SMR_FIFO_SEQUENCERS="${SMR_FIFO_SEQUENCERS:-EMBARCADERO CORFU SCALOG LAZYLOG}"
-SMR_FIFO_MODES="${SMR_FIFO_MODES:-pipe serialize}"
+SMR_FIFO_MODES="${SMR_FIFO_MODES:-pipe batch_ack serialize}"
 SMR_FIFO_LOG_LEVEL="${SMR_FIFO_LOG_LEVEL:-0}"
 BENCH_TIMEOUT_SEC="${BENCH_TIMEOUT_SEC:-900}"
 BROKER_READY_TIMEOUT_SEC="${BROKER_READY_TIMEOUT_SEC:-120}"
@@ -73,11 +79,21 @@ BROKER_READY_TIMEOUT_SEC="${BROKER_READY_TIMEOUT_SEC:-120}"
 OUT_ROOT="${OUT_ROOT:-$PROJECT_ROOT/build/results/smr_fifo_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT_ROOT"
 
-# Only remove THIS driver's shm segments (CXL_KVBASE_<uid>_*). A wildcard
-# /dev/shm/CXL_* rm would unlink segments belonging to concurrently running
-# harnesses (moscxl is a shared box).
+# Exact SHM object owned by this driver. Never use a UID-wide wildcard: two
+# concurrent harnesses normally run as the same user on this shared host.
+DRIVER_CXL_SHM_NAME=""
 kv_bench_unlink_kvbase_shm() {
-  rm -f /dev/shm/CXL_KVBASE_"${UID}"_* 2>/dev/null || true
+  [[ -n "$DRIVER_CXL_SHM_NAME" ]] || return 0
+  case "$DRIVER_CXL_SHM_NAME" in
+    /CXL_KVBASE_"${UID}"_*)
+      rm -f "/dev/shm/${DRIVER_CXL_SHM_NAME#/}" 2>/dev/null || true
+      ;;
+    *)
+      echo "ERROR: refusing to unlink unexpected SHM name: $DRIVER_CXL_SHM_NAME" >&2
+      return 1
+      ;;
+  esac
+  DRIVER_CXL_SHM_NAME=""
 }
 
 # broker_local_cleanup kills embarlet/sequencer processes BY NAME, host-wide.
@@ -88,6 +104,18 @@ assert_broker_ports_free() {
   local i
   for i in $(seq 1 15); do
     if ! ss -H -ltn 'sport = :1214' 2>/dev/null | grep -q .; then
+      local name pid state
+      for name in embarlet corfu_global_sequencer lazylog_global_sequencer scalog_global_sequencer; do
+        while IFS= read -r pid; do
+          [[ -n "$pid" ]] || continue
+          state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+          if [[ -n "$state" && "$state" != "Z" ]]; then
+            echo "ERROR: live $name pid=$pid exists (possibly on alternate ports)." >&2
+            echo "       Refusing host-wide cleanup on this shared machine." >&2
+            return 1
+          fi
+        done < <(pgrep -x "$name" 2>/dev/null || true)
+      done
       return 0
     fi
     sleep 1
@@ -124,18 +152,23 @@ wait_scalog_port() {
 }
 
 start_cluster() {
-  local seq="$1"
+  local seq="$1" cluster_rf="$2"
   assert_broker_ports_free || return 1
+  DRIVER_OWNS_CLUSTER=1
   broker_local_cleanup
   kv_bench_unlink_kvbase_shm
   sleep 0.5
 
-  export EMBARCADERO_CXL_SHM_NAME="/CXL_KVBASE_${UID}_${seq}_$$_$(date +%s)_${RANDOM}"
+  DRIVER_CXL_SHM_NAME="/CXL_KVBASE_${UID}_${seq}_$$_$(date +%s)_${RANDOM}"
+  export EMBARCADERO_CXL_SHM_NAME="$DRIVER_CXL_SHM_NAME"
 
   local -a run_env=(
     env
-    "REPLICATION_FACTOR=$REPLICATION_FACTOR"
-    "EMBARCADERO_REPLICATION_FACTOR=$REPLICATION_FACTOR"
+    # Do not inherit a stale REPLICATION_FACTOR from the caller. The topic,
+    # benchmark metadata, and every broker must use the same per-trial RF
+    # (notably sticky mode may clamp RF to the one available broker).
+    "REPLICATION_FACTOR=$cluster_rf"
+    "EMBARCADERO_REPLICATION_FACTOR=$cluster_rf"
     "NUM_BROKERS=$NUM_BROKERS"
     "EMBARCADERO_NUM_BROKERS=$NUM_BROKERS"
     "EMBARCADERO_CXL_SHM_NAME=$EMBARCADERO_CXL_SHM_NAME"
@@ -195,6 +228,7 @@ start_cluster() {
 # a normal run (where each trial already cleaned up) can murder a cluster some
 # NEWER driver invocation just started. Skip it once all trials completed.
 DRIVER_DONE=0
+DRIVER_OWNS_CLUSTER=0
 # run_one populates these (not `local`) so an interrupt can reach them: a
 # multi-process trial's session/replica pids run in the background, so a
 # signal to this driver does not by itself guarantee they die too. An
@@ -208,15 +242,16 @@ cleanup() {
   if [[ ${#CURRENT_TRIAL_PIDS[@]} -gt 0 ]]; then
     kill "${CURRENT_TRIAL_PIDS[@]}" 2>/dev/null || true
   fi
-  broker_local_cleanup
+  [[ "$DRIVER_OWNS_CLUSTER" == 1 ]] && broker_local_cleanup
+  kv_bench_unlink_kvbase_shm
 }
 trap cleanup EXIT
 
 # run_one SEQ MODE TRIAL
 #
-# Modes: pipe (sync_interval=0, full striping), serialize (stop-and-wait on the
-# ACK barrier), sticky (single broker: FIFO by forfeiting striping — the
-# negative control and the "Kafka corner" row).
+# Modes: pipe (sync_interval=0, full striping), batch_ack (one sealed publisher
+# batch in flight), serialize (one KV operation in flight), sticky (single
+# broker: FIFO by forfeiting striping — the negative control).
 #
 # Multi-process knobs:
 #   SMR_FIFO_SESSIONS=N   N concurrent publisher sessions, disjoint keyspaces
@@ -227,12 +262,27 @@ trap cleanup EXIT
 #                         the publisher's digest (E4 convergence).
 run_one() {
   local seq="$1" mode="$2" trial="$3"
+  case "$mode" in
+    pipe|batch_ack|serialize|sticky) ;;
+    *) echo "ERROR: unsupported SMR_FIFO mode: $mode" >&2; return 2 ;;
+  esac
   local sync_iv=0 sync_barrier=apply ops="$SMR_FIFO_OPERATION_COUNT"
   local nb="$SMR_FIFO_NUM_BROKERS_DEFAULT" fifo_mode_flag="auto"
   if [[ "$mode" == "serialize" ]]; then
     sync_iv=1
     sync_barrier="$SMR_FIFO_SERIALIZE_BARRIER"
     ops="$SMR_FIFO_SERIALIZE_OPS"
+  elif [[ "$mode" == "batch_ack" ]]; then
+    sync_iv="$SMR_FIFO_BATCH_ACK_OPS"
+    sync_barrier="ack"
+    if [[ "$seq" == "LAZYLOG" ]]; then
+      # LazyLog's faithful pre-binding append ACK does not establish ordered
+      # visibility. Strict FIFO needs the harness's binding-gated barrier and
+      # must be labeled as such, not as faithful append throughput.
+      fifo_mode_flag="batch_binding_wait"
+    else
+      fifo_mode_flag="batch_stop_and_wait"
+    fi
   elif [[ "$mode" == "sticky" ]]; then
     nb=1
     fifo_mode_flag="sticky"
@@ -255,9 +305,12 @@ run_one() {
   export NUM_BROKERS EMBARCADERO_NUM_BROKERS="$nb"
 
   echo "======== $seq  $mode  trial $trial  (brokers=$nb sync_interval=$sync_iv barrier=$sync_barrier ops=$ops sessions=$sessions replicas=$replicas) ========"
-  if ! start_cluster "$seq"; then
+  if ! start_cluster "$seq" "$effective_rf"; then
     echo "ERROR: skipping $seq $mode trial $trial (cluster did not start)" >&2
-    broker_local_cleanup; sleep 2; return 1
+    [[ "$DRIVER_OWNS_CLUSTER" == 1 ]] && broker_local_cleanup
+    DRIVER_OWNS_CLUSTER=0
+    sleep 2
+    return 1
   fi
 
   # With any extra process, no bench process may TerminateCluster on exit;
@@ -276,6 +329,17 @@ run_one() {
     env "EMBAR_USE_HUGETLB=$EMBAR_USE_HUGETLB"
     "EMBARCADERO_RUNTIME_MODE=${KV_BENCH_CLIENT_RUNTIME_MODE:-latency}"
   )
+  if [[ "$mode" == "batch_ack" ]]; then
+    # Otherwise latency runtime's 300us linger can seal several partial
+    # publisher batches before the group barrier, defeating one-in-flight.
+    bench_env+=("EMBARCADERO_CLIENT_LINGER_US=0")
+    # 4096 ops * ~134 B/op = 536 KB exceeds the 512 KB default BATCH_SIZE and
+    # triggers an early size-cap seal, producing ~128 batches instead of 123.
+    # Set 1 MiB so the 4096-op group always fits as a single publisher batch.
+    # Must be listed here (not only in the outer shell) because bench_env uses
+    # env(1) which inherits the parent env; explicit listing is unambiguous.
+    bench_env+=("EMBARCADERO_BATCH_SIZE=1048576")
+  fi
 
   local bench_status=0 s r
   local -a session_pids=() replica_pids=()
@@ -390,6 +454,7 @@ run_one() {
   fi
 
   broker_local_cleanup
+  DRIVER_OWNS_CLUSTER=0
   kv_bench_unlink_kvbase_shm
   sleep "${BROKER_SEQ_GAP_SEC:-3}"
   if [[ "$bench_status" -ne 0 ]]; then
@@ -431,7 +496,7 @@ for f in "$OUT_ROOT"/*/summary.csv; do
   # optional so an OUT_ROOT reused across a driver upgrade (pre-multi-process
   # run dirs had no session suffix) still aggregates instead of silently
   # dropping those trials from the report.
-  mode="$(sed -E 's/.*_(pipe|serialize|sticky)_trial[0-9]+(_s[0-9]+)?$/\1/' <<<"$run_dir")"
+  mode="$(sed -E 's/.*_(pipe|batch_ack|serialize|sticky)_trial[0-9]+(_s[0-9]+)?$/\1/' <<<"$run_dir")"
   trial="$(sed -E 's/.*_trial([0-9]+)(_s[0-9]+)?$/\1/' <<<"$run_dir")"
   if [[ "$first" == 1 ]]; then
     echo "mode,trial,$(head -1 "$f")" > "$AGG"

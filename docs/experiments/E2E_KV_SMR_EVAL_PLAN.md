@@ -1,6 +1,7 @@
 # End-to-End KV/SMR Evaluation Plan — Q3 and the Application-Visible Contract
 
-**Status:** planning + partially executed (E1 smoke complete, 2026-07-16).
+**Status:** E1 paper-scale local campaign complete (2026-07-18); E2/E4/E6
+controls smoke-validated; remote placement and E3/E5/E7/E8 remain follow-ups.
 **Companion runbook:** `benchmarks/kv_store/README_SMR_FIFO.md` (Q3 harness mechanics).
 **Owner intent:** this document is the execution contract for the remaining
 e2e work and the source for the corresponding paper updates
@@ -42,12 +43,12 @@ serialization*, not "only Embar is correct":
 
 | # | Claim (paper wording target) | Instrument | Status |
 |---|------------------------------|------------|--------|
-| C1 | Under full striping and pipelined same-session overwrites, Embar applies correctly with **no serialization on the client path** (hold at sequencer, R = epoch) | E1 Pipe row | smoke ✅, paper-scale pending |
-| C2 | Corfu is also Valid under Pipe — by serializing **the client's write path** (token RTT per batch); it pays ~35–40% of Embar's pipe rate for it | E1 Pipe row (post `[[CORFU_FIFO_FIX]]`) | smoke ✅ |
-| C3 | Scalog/LazyLog global order **need not respect per-publisher submission order under striping** (`app:scalog-fifo`) — Pipe is Valid=NO with measured same-key inversions | E1 Pipe + reorder audit | smoke ✅ |
-| C4 | Restoring FIFO **client-side by stop-and-wait** costs ~10³× (policy lower bound, not a universal tax) | E1 Serialize row | smoke ✅ |
-| C5 | Restoring FIFO **by sticky routing** is free at small scale — and re-creates the single-ingress bottleneck striping exists to remove | E2 (control) + E3 (necessity) | not run |
-| C6 | Reorder pressure was real: same seed/striping produced ~10⁴ inversions on WBO systems; Embar absorbed the identical interleave in holds (0 reorders) | E1 audit counters | smoke ✅ |
+| C1 | Under full striping and pipelined same-session overwrites, Embar applies correctly with **no serialization on the client path** (hold at sequencer, R = epoch) | E1 Pipe row | paper-scale local ✅ |
+| C2 | Corfu is also Valid under Pipe — by serializing **the client's write path** in seal-time token order; under local batch amortization its rate is at parity with Embar | E1 Pipe row (post `[[CORFU_FIFO_FIX]]`) | paper-scale local ✅ |
+| C3 | Scalog/LazyLog global order **need not respect per-publisher submission order under striping** (`app:scalog-fifo`) — Pipe is Valid=NO with measured apply-order and same-key inversions | E1 Pipe + reorder audit | paper-scale local ✅ (LazyLog withheld for fidelity) |
+| C4 | Restoring FIFO **client-side by stop-and-wait** costs 325--370$\times$ here (policy lower bound, not a universal tax) | E1 Serialize row | paper-scale local ✅ |
+| C5 | Restoring FIFO **by sticky routing** is free at small scale — and re-creates the single-ingress bottleneck striping exists to remove | E2 (control) + E3 (necessity) | E2 smoke ✅; E3 pending |
+| C6 | Reorder pressure was real: the same seed/striping produced 13.8K--15.7K inversions per Scalog run; Embar absorbed the interleave with 0 reorders | E1 audit counters | paper-scale local ✅ |
 | C7 | The harness is a real SMR (independent subscriber replicas apply the log), and the Valid checker is itself cross-checked — **methodology hygiene, NOT a differentiator**: every totally-ordered log converges, including incorrect runs (uniformly wrong state) | E4 | harness done ✅ |
 | C8 | Pipelining is real depth, not batching luck: publish→apply lag distribution bounded under Pipe | E5 | hooks exist |
 | C9 | Per-client FIFO holds for **every** concurrent session, not just one | E6 | not run |
@@ -66,14 +67,16 @@ Common fixed knobs unless stated: 4 brokers, RF=1 ACK=1, `value_size=100`,
 `batch_size=1`, one client session, seed 42, medians of 3 trials, commit +
 host recorded. Driver: `benchmarks/kv_store/run_smr_fifo_eval.sh`.
 
-### E1 — SMR session-FIFO matrix (Pipe / Serialize) — **P0, harness done**
+### E1 — SMR session-FIFO matrix (Pipe / Serialize) — **complete locally 2026-07-18**
 - **Design:** 500K keys load, 50K warmup, 500K pipelined versioned overwrites
   (`--fifo_valid`); Serialize = `sync_interval=1`, ACK barrier, 2–5K ops
   (rates compared, caption states policy).
-- **Expected:** Embar Pipe Valid=YES ~0.7–1.0M ops/s, 0 reorders (legacy table
-  point: 1.00M). Corfu Pipe Valid=YES ~0.5M. Scalog/LazyLog Pipe Valid=NO,
-  session reorders ~10³–10⁴, same-key inversions surviving to final state.
-  Serialize: all Valid=YES at ~10²–10³ ops/s.
+- **Measured (medians, 3 trials):** Embar Pipe 649,405 ops/s, Valid=YES,
+  0 reorders; Corfu Pipe 661,340 ops/s, Valid=YES, 0 reorders; Scalog Pipe
+  658,073 ops/s, Valid=NO, with 13,799--15,685 session inversions and 2--6
+  stale final keys per trial. Stop-and-wait medians are 2,000 / 1,919 / 1,780
+  ops/s respectively. LazyLog Pipe is also invalid but remains withheld from
+  the paper table because this harness gates it on binding.
 - **Falsifier:** any Embar reorder count > 0, or a WBO Pipe run that passes
   session-FIFO Valid at N=4 (would contradict `app:scalog-fifo`).
 - **Paper:** fills `tab:kv-pipelined` (add Scalog row + Mode column or split
@@ -172,19 +175,20 @@ host recorded. Driver: `benchmarks/kv_store/run_smr_fifo_eval.sh`.
   (counts-level) still checked. **Never cited as FIFO evidence.** Appendix
   only; include fidelity labels if comparative.
 
-## 4. Expected headline (paper-scale predictions to verify)
+## 4. Measured local headline (remote placement still to verify)
 
 | System | Pipe (ops/s) | FIFO locus | Valid | Serialize (ops/s) |
 |---|---|---|---|---|
-| Embarcadero | ~0.7–1.0M | hold @ sequencer (off client path) | YES | ~2K (391× — even Embar pays if you force client serialization) |
-| CXL-Corfu | ~0.5M | token RTT @ client write path | YES | ~1.1K |
-| CXL-Scalog | ~0.6–0.7M | none under stripe | **NO** | ~230 (~3,000× stop-and-wait) |
-| CXL-LazyLog | (labeled non-faithful) | none under stripe | **NO** | ~280 |
+| Embarcadero | 649,405 | hold @ sequencer (off client path) | YES | 2,000 (325×) |
+| CXL-Corfu | 661,340 | ordered token stage @ client write path | YES | 1,919 (345×) |
+| CXL-Scalog | 658,073 | none under stripe | **NO** | 1,780 (370×) |
+| CXL-LazyLog | 679,165 (non-faithful path; withheld) | none under stripe | **NO** | 2,025 |
 
-Smoke sources: `build/results/smr_fifo_matrix1`, `smr_fifo_corfufix1`.
-These become table-ready only after: 3 trials at 500K scale, LazyLog labeling
-decision, and (for final ops/s optics) the remote-client layout per the
-testbed section — local co-located numbers stay internal.
+Source: `build/results/smr_fifo_20260718_041826` (500K/50K/500K, three
+trials, host `moscxl`, loopback client, recorded commit `ee7eacbd`). These are
+table-ready only with the co-located placement disclosed, as the paper now
+does. A remote-client rerun remains necessary before presenting the rates as
+representative of the paper's remote testbed.
 
 ## 5. Fidelity gates before any number enters the paper
 
@@ -202,7 +206,7 @@ testbed section — local co-located numbers stay internal.
 
 | Order | Item | Cost | Unblocks |
 |---|---|---|---|
-| 1 | E1 paper-scale (local) | ~2–2.5h wall | table draft, C1–C4, C6 |
+| 1 | E1 paper-scale (local) | **complete 2026-07-18** | table draft, C1–C4, C6 |
 | 2 | E2 sticky control | **harness done + smoke-validated 2026-07-16** | C5 control, E3 framing |
 | 3 | E4 replica mode | **harness done + smoke-validated 2026-07-16** (2 replicas + publisher digest-identical, `smr_fifo_v2`) | C7 |
 | 4 | E5 apply-lag CDF | run-only | C8 |
@@ -225,13 +229,13 @@ methodology hygiene and an AE-appendix aid, never a paper result).
 deterministic every trial** (`smr_fifo_r4c`, 3 trials, otherwise-identical
 config): session_reorders = 262, 978, 0 across trials 1–3 — one trial
 happened to see zero cross-broker inversions by timing luck alone. The
-per-trial byte-level Valid check still correctly failed 2/3 trials, and the
-existing aggregation rule (`plot_smr_fifo.py`: a system is Valid only if
-**every** trial passed) correctly rolls this up to Valid=NO — the right,
-conservative posture for a safety property. **Implication for the paper-scale
-campaign:** do not run only 1 trial for Scalog Pipe and do not be surprised
-by an occasional all-YES trial; report the ≥3-trial consensus verdict (as
-the harness already does) rather than a single run, and consider whether E3
+old per-trial byte-level check failed 2/3 trials. As of 2026-07-18, any
+observed `session_reorders>0` is itself a hard validity failure: final state
+can be repaired by a later write after the state machine has already observed
+an inversion. The aggregation rule also remains conservative (a system is
+Valid only if **every** trial passed). **Implication for future small-scale
+runs:** do not run only 1 trial for Scalog Pipe and do not be surprised by an
+occasional all-YES trial; report the ≥3-trial consensus verdict, and consider whether E3
 (higher payload / more brokers-worth of skew) should also report a
 reorder-rate fraction, not just a binary Valid/NO, for a fuller Appendix
 picture of how reliably the violation reproduces at a given scale.
@@ -256,10 +260,11 @@ picture of how reliably the violation reproduces at a given scale.
 ## 8. Wording bank (panel-approved boasts)
 
 - "Every system that preserves per-publisher FIFO serializes *somewhere*;
-  they differ in where and at what cost. Corfu serializes the client's write
+  they differ in where and at what cost. Corfu orders the client's sealed
+  batches before write
   path (a token round-trip per batch). Scalog and LazyLog leave submission
-  order unprotected under striping — restoring it client-side costs three
-  orders of magnitude (stop-and-wait) or forfeits striping (sticky). \sys
+  order unprotected under striping — restoring it client-side costs hundreds
+  of times in this stop-and-wait policy or forfeits striping (sticky). \sys
   serializes at the sequencer's hold, off the client path, bounded by the
   epoch — preserving both the pipeline and the contract."
 - "The same striped interleave that produced ~10⁴ per-session inversions on

@@ -141,7 +141,7 @@ struct BenchConfig {
 	// applied == published, and every key's final value is the LAST version this
 	// client submitted for it (session FIFO), verified byte-for-byte.
 	bool fifo_valid = false;
-	std::string fifo_mode = "auto";   // native|token_order|stop_and_wait|sticky|none|auto
+	std::string fifo_mode = "auto";   // native|token_order|batch_stop_and_wait|batch_binding_wait|stop_and_wait|sticky|none|auto
 
 	// Multi-process experiments (E4 replicas / E6 sessions):
 	bool manage_cluster = true;       // exactly one process may terminate the cluster
@@ -473,6 +473,28 @@ bool runBenchmark(BenchConfig& cfg) {
 	kv_cfg.track_latency = cfg.latency;
 	kv_cfg.fifo_audit = cfg.fifo_valid;
 
+	// [[BATCH_ACK_PREFLIGHT]] Early check before broker connection: verify the
+	// publisher batch cap is large enough to hold sync_interval KV ops without
+	// an early size-cap seal. Runs here so it fails fast, before any gRPC call.
+	// Each PUT serializes to type(1)+txid(8)+pairCount(4)+keyLen(4)+key+valLen(4)+val.
+	if (cfg.fifo_valid &&
+	    (cfg.fifo_mode == "batch_stop_and_wait" || cfg.fifo_mode == "batch_binding_wait") &&
+	    cfg.sync_interval > 0) {
+		const size_t entry_bytes = 1 + 8 + 4 + (4 + 13 + 4 + cfg.value_size);
+		const size_t needed_bytes = static_cast<size_t>(cfg.sync_interval) * entry_bytes;
+		const size_t batch_cap = Embarcadero::GetConfig().config().storage.batch_size.get();
+		if (needed_bytes > batch_cap) {
+			LOG(FATAL) << "batch_ack preflight FAIL: sync_interval=" << cfg.sync_interval
+			           << " ops * " << entry_bytes << " B/op = " << needed_bytes
+			           << " B exceeds BATCH_SIZE=" << batch_cap
+			           << " B. Set EMBARCADERO_BATCH_SIZE>=" << needed_bytes
+			           << " in bench_env before launching.";
+		}
+		LOG(INFO) << "batch_ack preflight OK: " << cfg.sync_interval << " ops * "
+		          << entry_bytes << " B/op = " << needed_bytes << " B <= BATCH_SIZE="
+		          << batch_cap;
+	}
+
 	LOG(INFO) << "Creating KV store: " << cfg.sequencer
 	          << " order=" << cfg.order << " ack=" << cfg.ack
 	          << " rf=" << cfg.rf << " broker=" << cfg.broker_ip;
@@ -639,6 +661,7 @@ bool runBenchmark(BenchConfig& cfg) {
 		fifo_last_version.assign(cfg.record_count, 0);
 	}
 
+	const size_t batches_before_run = store.getPublisherBatchesSent();
 	auto run_t0 = std::chrono::steady_clock::now();
 
 	uint64_t i = 0;
@@ -835,6 +858,8 @@ bool runBenchmark(BenchConfig& cfg) {
 	if (pending_opid > 0) {
 		store.waitForSyncWithLog(pending_opid);
 	}
+	const size_t publisher_batches =
+		store.getPublisherBatchesSent() - batches_before_run;
 
 	auto run_t1 = std::chrono::steady_clock::now();
 	double run_sec = std::chrono::duration<double>(run_t1 - run_t0).count();
@@ -873,6 +898,21 @@ bool runBenchmark(BenchConfig& cfg) {
 		LOG(ERROR) << "VERIFICATION FAILED: applied_entries=" << applied_entries
 		           << " expected=" << expected_applied_entries;
 		fail_check("applied_count");
+	}
+	if (cfg.fifo_valid &&
+	    (cfg.fifo_mode == "batch_stop_and_wait" ||
+	     cfg.fifo_mode == "batch_binding_wait") &&
+	    cfg.sync_interval > 0 && !run_aborted) {
+		const uint64_t expected_batches =
+			(cfg.operation_count + static_cast<uint64_t>(cfg.sync_interval) - 1) /
+			static_cast<uint64_t>(cfg.sync_interval);
+		if (publisher_batches != expected_batches) {
+			LOG(ERROR) << "VERIFICATION FAILED: batch-ACK mode sent "
+			           << publisher_batches << " publisher batches; expected "
+			           << expected_batches << " (linger or size auto-seal broke "
+			              "the one-batch-in-flight boundary)";
+			fail_check("batch_ack_boundary");
+		}
 	}
 
 	// SMR-FIFO validation sweep (untimed): every key's final value must be the
@@ -919,6 +959,12 @@ bool runBenchmark(BenchConfig& cfg) {
 		}
 		fifo_session_reorders = store.fifoSessionReorders();
 		fifo_key_reorders = store.fifoKeyReorders();
+		// Prefix-safe per-session FIFO is an apply-order property, not merely a
+		// final-state property. A later write can overwrite a stale value and
+		// make the final byte sweep pass even though the state machine already
+		// observed an inversion. Keep the final-value checks as independent
+		// stale-state and payload-corruption guards.
+		if (fifo_session_reorders > 0) fail_check("session_fifo_apply_order");
 		if (fifo_final_mismatch > 0) fail_check("session_fifo_final_value");
 		if (fifo_untouched_mismatch > 0) fail_check("untouched_key_value");
 		LOG(INFO) << "FIFO validation: overwritten_keys=" << fifo_overwritten_keys
@@ -960,6 +1006,9 @@ bool runBenchmark(BenchConfig& cfg) {
 	LOG(INFO) << "Ops: " << writes << " writes + " << reads << " reads + "
 	          << scans << " scans + " << rmws << " rmws = "
 	          << static_cast<uint64_t>(total_ops);
+	LOG(INFO) << "Publisher batches in measured phase: " << publisher_batches
+	          << "  ops/batch="
+	          << (publisher_batches == 0 ? 0.0 : total_ops / publisher_batches);
 	LOG(INFO) << "Throughput: " << std::setprecision(0) << throughput << " ops/s  ("
 	          << write_throughput << " write ops/s)";
 	LOG(INFO) << "Store size: " << final_store_size
@@ -991,7 +1040,8 @@ bool runBenchmark(BenchConfig& cfg) {
 		    << "value_size,workload,key_dist,zipf_theta,scan_len,"
 		    << "batch_size,write_ratio,sync_interval,sync_barrier,"
 		    << "runtime_sec,throughput_ops_sec,write_throughput_ops_sec,"
-		    << "writes,reads,scans,rmws,store_size,published_entries,applied_entries,valid,"
+		    << "writes,reads,scans,rmws,publisher_batches,ops_per_publisher_batch,"
+		    << "store_size,published_entries,applied_entries,valid,"
 		    << "pub_p50_us,pub_p95_us,pub_p99_us,pub_p999_us,"
 		    << "apply_p50_us,apply_p95_us,apply_p99_us,apply_p999_us,"
 		    << "read_p50_us,read_p99_us,"
@@ -1013,6 +1063,9 @@ bool runBenchmark(BenchConfig& cfg) {
 		    << "," << write_throughput
 		    << "," << writes << "," << reads
 		    << "," << scans << "," << rmws
+		    << "," << publisher_batches
+		    << "," << std::setprecision(2)
+		    << (publisher_batches == 0 ? 0.0 : total_ops / publisher_batches)
 		    << "," << final_store_size
 		    << "," << expected_applied_entries
 		    << "," << applied_entries
@@ -1064,7 +1117,7 @@ int main(int argc, char* argv[]) {
 		 cxxopts::value<int>()->default_value("-1"))
 		("ack", "ACK level (0|1|2)",
 		 cxxopts::value<int>()->default_value("1"))
-		("rf", "Replication factor (0=no replication; RF>=1 requires a replica process to be running)",
+		("rf", "Replication factor including the primary (RF=1 primary-only; RF=2 primary + one replica)",
 		 cxxopts::value<int>()->default_value("0"))
 		("record_count", "Records to pre-load",
 		 cxxopts::value<uint64_t>()->default_value("1000000"))
@@ -1090,7 +1143,7 @@ int main(int argc, char* argv[]) {
 		 cxxopts::value<std::string>()->default_value("apply"))
 		("fifo_valid", "SMR-FIFO overwrite eval (paper Q3): pipelined single-session "
 		 "versioned overwrites + session-FIFO final-state validation")
-		("fifo_mode", "FIFO mechanism label for CSV (auto|native|token_order|stop_and_wait|sticky|none)",
+		("fifo_mode", "FIFO mechanism label for CSV (auto|native|token_order|batch_stop_and_wait|batch_binding_wait|stop_and_wait|sticky|none)",
 		 cxxopts::value<std::string>()->default_value("auto"))
 		("manage_cluster", "Create topic / terminate cluster on exit (0 for all but one process in multi-process runs)",
 		 cxxopts::value<int>()->default_value("1"))

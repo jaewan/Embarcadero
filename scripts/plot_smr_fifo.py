@@ -7,9 +7,10 @@ benchmarks/kv_store/run_smr_fifo_eval.sh and emits:
   - <outdir>/smr_kv_pipe_ops.pdf : Pipe ops/s per system, Valid=NO hatched (Fig 1)
   - <outdir>/smr_fifo_tax.pdf    : Pipe vs Serialize per system (FIFO tax, Fig 2)
   - --markdown <file>            : markdown table matching
-                                   `System | Pipe (ops/s) | FIFO | Slowdown | Valid`
+                                   `System | Mode | Throughput | FIFO | FIFO cost | Valid`
 
-Medians across trials. Slowdown is vs the Embarcadero Pipe median.
+Medians across trials. For Serialize rows, FIFO cost is the same system's
+Pipe throughput divided by its Serialize throughput.
 Plots are skipped (with a note) if matplotlib is unavailable.
 """
 
@@ -41,15 +42,25 @@ def aggregate(rows):
     out = {}
     for key, rs in groups.items():
         tputs = [float(r["write_throughput_ops_sec"]) for r in rs]
-        valid = all(r["valid"] == "1" for r in rs)
+        # Older result files predate session_fifo_apply_order becoming a hard
+        # validity gate. Re-apply it here so an observed inversion cannot be
+        # reported as Valid merely because a later write repaired final state.
+        apply_order_invalid = any(
+            r.get("fifo_valid", "0") == "1"
+            and int(r.get("session_reorders", 0) or 0) > 0
+            for r in rs
+        )
+        valid = all(r["valid"] == "1" for r in rs) and not apply_order_invalid
         fifo_modes = {r.get("fifo_mode", "") for r in rs}
-        failed = sorted({r.get("failed_checks", "none") for r in rs} - {"none"})
+        failed = {r.get("failed_checks", "none") for r in rs} - {"none"}
+        if apply_order_invalid:
+            failed.add("session_fifo_apply_order")
         out[key] = {
             "ops_median": statistics.median(tputs),
             "trials": len(rs),
             "valid": valid,
             "fifo_mode": "/".join(sorted(fifo_modes)),
-            "failed_checks": "+".join(failed) if failed else "none",
+            "failed_checks": "+".join(sorted(failed)) if failed else "none",
             "mismatch_keys": max(int(r.get("final_mismatch_keys", 0) or 0) for r in rs),
             "key_reorders": max(int(r.get("key_reorders", 0) or 0) for r in rs),
         }
@@ -61,29 +72,29 @@ def fmt_ops(v):
 
 
 def make_markdown(agg):
-    ref = agg.get(("EMBARCADERO", "pipe"))
     lines = [
-        "<!-- fills tab:kv-pipelined; Valid = store size stays K, applied==published,",
-        "     AND per-key final value == last session-submitted version (session FIFO) -->",
-        "| System | Mode | Pipe (ops/s) | FIFO | Slowdown | Valid |",
-        "|--------|------|-------------:|------|---------:|-------|",
+        "<!-- fills tab:kv-pipelined; Valid also requires zero session apply-order inversions -->",
+        "| System | Mode | Throughput (ops/s) | FIFO | FIFO cost | Valid |",
+        "|--------|------|-------------------:|------|----------:|-------|",
     ]
     for seq in SYSTEM_ORDER:
-        for mode in ("pipe", "sticky", "serialize"):
+        for mode in ("pipe", "batch_ack", "sticky", "serialize"):
             a = agg.get((seq, mode))
             if a is None:
                 continue
-            slow = "---"
-            if ref and a is not ref and a["ops_median"] > 0:
-                slow = f"{ref['ops_median'] / a['ops_median']:.1f}x"
+            fifo_cost = "---"
+            pipe = agg.get((seq, "pipe"))
+            if mode in ("batch_ack", "serialize") and pipe and a["ops_median"] > 0:
+                fifo_cost = f"{pipe['ops_median'] / a['ops_median']:.1f}x"
             valid = "YES" if a["valid"] else f"**NO** ({a['failed_checks']})"
             lines.append(
                 f"| {SYSTEM_LABEL.get(seq, seq)} | {mode} | {fmt_ops(a['ops_median'])} "
-                f"| {a['fifo_mode']} | {slow} | {valid} |"
+                f"| {a['fifo_mode']} | {fifo_cost} | {valid} |"
             )
     lines.append("")
     lines.append(
-        "Medians over trials. Slowdown vs Embarcadero Pipe. A Valid=NO striped "
+        "Medians over trials. FIFO cost is each system's Pipe/Serialize ratio. "
+        "A Valid=NO striped "
         "Pipe row for a write-before-order system is the expected Q3 result "
         "(per-publisher FIFO violated under striping), not a harness failure."
     )
@@ -156,7 +167,7 @@ def make_plots(agg, outdir):
         ax.set_xticks(range(len(both)))
         ax.set_xticklabels([SYSTEM_LABEL[s] for s in both], rotation=15)
         ax.set_ylabel("ops/s (log)")
-        ax.set_title("Cost of restoring session FIFO without native holds")
+        ax.set_title("Forced client stop-and-wait vs. pipelining")
         ax.legend(frameon=False, fontsize=7)
         fig.tight_layout()
         fig.savefig(f"{outdir}/smr_fifo_tax.pdf")

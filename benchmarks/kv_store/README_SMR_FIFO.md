@@ -40,22 +40,19 @@ A trial is Valid iff **all** of:
 
 1. `applied == published` (every issued op applied before the clock stops);
 2. store size stays exactly `record_count` (overwrite-only phase);
-3. **session-FIFO final state**: for every key, the final value is
+3. **session-FIFO apply order**: the single apply thread observes strictly
+   increasing session versions (`session_reorders == 0`);
+4. **session-FIFO final state**: for every key, the final value is
    byte-for-byte the *last version this client session submitted for that
    key*; untouched keys still hold the load-phase template value.
 
-Check 3 is the new, load-bearing one: a system that applies a permutation of
-submission order leaves a stale version as the final value even though
-`applied == published` passes. Ground truth is *client submission order* (the
-bench records the last version it issued per key), **not** log order — using
-log order as truth would define the violation away and forfeit the FIFO claim.
-
-Diagnostics (not validity gates): the apply path also counts
-`session_reorders` (an applied version lower than any previously applied
-version — total order permuted submission order somewhere) and `key_reorders`
-(same, per key — the state-changing case). A run can have `session_reorders>0`
-with Valid=YES if no same-key pair was inverted; that is correct and worth
-reporting as "reorder pressure absorbed."
+Checks 3 and 4 are independent and load-bearing. Ground truth is *client
+submission order*, not log order — using log order as truth would define the
+violation away. A later write can repair a stale final value after the apply
+thread has already observed an inversion, so any `session_reorders>0` is a
+validity failure. The byte-for-byte final-state sweep separately detects stale
+state and payload corruption. `key_reorders` reports the state-changing subset
+where versions of the same key were applied in reverse order.
 
 ## 3. Workload
 
@@ -75,10 +72,11 @@ Striping: the client publisher round-robins *sealed batches* across all
 brokers' queues regardless of `pub_threads`
 (`src/client/queue_buffer.cc` `SealCurrentAndAdvance`; queues are per-broker,
 `src/client/publisher.cc` `PublishThread`). So even `pub_threads=1` stripes a
-single session across all `NUM_BROKERS` — the Q3 setting. The striping unit is
-a batch (~64KB ≈ ~340 ops at 100B values), so reorder pressure appears at
-batch granularity; consecutive-batch inversions across brokers are exactly
-Scalog's `app:scalog-fifo` case. `EMBARCADERO_ORDER5_HOME_BROKERS=1` exists as
+single session across all `NUM_BROKERS` — the Q3 setting. The configured size
+cap is 2 MiB, while the latency-mode 300 us linger normally seals a partial
+batch after hundreds of 100-byte operations. Reorder pressure therefore
+appears at batch granularity; consecutive-batch inversions across brokers are
+exactly Scalog's `app:scalog-fifo` case. `EMBARCADERO_ORDER5_HOME_BROKERS=1` exists as
 a sticky single-broker escape hatch **for Embar ORDER=5 only** — baselines
 have no equivalent, so the optional "Sticky" row is out of the main matrix.
 
@@ -94,17 +92,28 @@ subscriber luck.
 | Mode | `sync_interval` | Barrier | Purpose |
 |------|-----------------|---------|---------|
 | **Pipe** | 0 (sync at end) | apply | Headline: max pipeline depth |
+| **Batch-ACK** | 4096 (default) | ack | Strict FIFO with one sealed publisher batch in flight; batching retained |
 | **Serialize** | 1 (stop-and-wait) | ack (ACK1 = ordered frontier) | Restore FIFO without native holds; the fairness row |
 
-Serialize gates op N+1 on op N clearing the ordering pipeline (ACK1 frontier is
+Batch-ACK disables publisher linger, fills one group safely below the 2 MiB
+cap, seals it, and waits for ACK1 before filling the next group. The benchmark
+exports `publisher_batches` and fails `batch_ack_boundary` unless the measured
+batch count is exactly `ceil(operation_count / sync_interval)`, so this mode
+cannot silently degrade into several batches in flight. Serialize gates op
+N+1 on op N clearing the ordering pipeline (ACK1 frontier is
 the *ordered* frontier for all ordered modes), so submission order is forced
 into the log one op at a time. Serialize runs use fewer ops
 (`SMR_FIFO_SERIALIZE_OPS`, default 20K) — rates, not wall times, are compared.
 
+For Scalog, Batch-ACK waits on its ordered frontier. LazyLog's faithful
+pre-binding append ACK cannot establish FIFO by itself; its strict row uses the
+in-tree binding/ordered-visibility barrier and is labeled `batch_binding_wait`,
+not faithful LazyLog append throughput.
+
 ## 5. Matrix
 
 Systems: `EMBARCADERO/ORDER=5`, `CORFU/ORDER=2`, `SCALOG/ORDER=1`,
-`LAZYLOG/ORDER=2` × {Pipe, Serialize} × 3 trials (medians). Matched knobs:
+`LAZYLOG/ORDER=2` × {Pipe, Batch-ACK, Serialize} × 3 trials (medians). Matched knobs:
 RF=1, ACK=1, `value_size=100`, `batch_size=1`, `pub_threads=1`,
 `NUM_BROKERS=4`, fixed seed (42) so every system sees the identical
 key/version sequence.
@@ -155,13 +164,13 @@ Existing columns plus: `pub_threads`, `num_brokers`, `fifo_valid`,
 `fifo_mode` (`native|token_order|stop_and_wait|sticky|none`),
 `overwritten_keys`, `final_mismatch_keys`, `untouched_mismatch_keys`,
 `session_reorders`, `key_reorders`, `failed_checks`. `write_throughput_ops_sec`
-is the Pipe ops/s (drain-inclusive). Slowdown is computed at aggregation time
-vs the Embar Pipe median.
+is the Pipe ops/s (drain-inclusive). For Serialize rows, FIFO cost is computed
+as that system's Pipe throughput divided by its Serialize throughput.
 
 ## 7. Figures / tables
 
 - **Table (primary)** — fills `tab:kv-pipelined`:
-  `System | Pipe (ops/s) | FIFO | Slowdown | Valid`; caption states RF=1,
+  `System | Mode | Throughput (ops/s) | FIFO | FIFO cost | Valid`; caption states RF=1,
   500K keys, 50K warmup, 500K overwrites, full striping, and the Valid
   definition from §2. Generated as a markdown snippet by the plotter.
 - **Fig 1** `smr_kv_pipe_ops.pdf`: Pipe ops/s per system; Valid=NO bars
@@ -228,6 +237,12 @@ SMR_FIFO_WARMUP_OPS=2000 bash benchmarks/kv_store/run_smr_fifo_eval.sh
 # Sticky control (E2): single broker = FIFO by forfeiting striping
 SMR_FIFO_MODES="pipe sticky" bash benchmarks/kv_store/run_smr_fifo_eval.sh
 
+# Strict FIFO baseline with batching retained: one 4096-op publisher batch
+# in flight, ACK1 before the next batch.
+SMR_FIFO_MODES="pipe batch_ack" \
+  SMR_FIFO_SEQUENCERS="SCALOG LAZYLOG" \
+  bash benchmarks/kv_store/run_smr_fifo_eval.sh
+
 # Replica convergence (E4): N subscriber-only replicas; digests must match
 SMR_FIFO_REPLICAS=2 bash benchmarks/kv_store/run_smr_fifo_eval.sh
 
@@ -244,6 +259,13 @@ driver tears the cluster down); the session-FIFO audit is session-scoped
 `--key_offset` with the store-size check waived via `--shared_topic`
 (own-range completeness is still enforced by the validation sweep).
 
+The local drivers are intentionally single-owner. Before any host-wide broker
+cleanup they refuse to run if an `embarlet` or baseline sequencer process is
+already live, including on alternate ports. Each run also unlinks only its
+exact randomized SHM object; it never removes a UID-wide `CXL_KVBASE_*`
+wildcard. This matters on the shared evaluation host—do not weaken either
+guard to make an overlapping campaign start.
+
 Outputs land in `build/results/smr_fifo_<ts>/`: per-run dirs + logs,
 aggregated `summary.csv`, `paper_snippet.md`, and the two PDFs.
 
@@ -258,7 +280,8 @@ as a broken run.
 2. Same durability: RF=1 ACK=1; ACK2/disk stays out of Q3.
 3. Scalog Pipe Valid=NO is recorded and explained (`app:scalog-fifo`), never
    patched around; its Serialize row is the honest recovery path.
-4. Corfu slower-but-Valid under Pipe is expected (token order) and fine.
+4. Corfu Valid under Pipe is expected (ordered token stage); local batching
+   can amortize that stage enough to put its ops/s at parity with Embarcadero.
 5. Medians over 3 trials; commit hash + hostname recorded in each
    `metadata.txt`; warmup discarded.
 6. Single-broker runs cannot exhibit the violation — Q3 requires
@@ -283,6 +306,8 @@ as a broken run.
 - [x] Corfu client token-order fidelity: `[[CORFU_FIFO_FIX]]` ordered token
       stage; CORFU Pipe now Valid=YES, 0 reorders, 483K ops/s
       (`build/results/smr_fifo_corfufix1`)
-- [ ] Paper-scale run (500K/500K, 3 trials) → numbers into `tab:kv-pipelined`
-      (remaining fidelity caveat: LazyLog binding-gated Pipe row must stay
-      labeled/withheld per Sec7)
+- [x] Paper-scale local run (500K keys, 50K warmup, 500K overwrites, 3 trials)
+      in `build/results/smr_fifo_20260718_041826`; numbers incorporated into
+      `tab:kv-pipelined`. LazyLog's binding-gated Pipe row remains withheld.
+- [ ] Repeat the table rows with remote client placement before describing the
+      absolute ops/s as representative of the paper's remote testbed.
