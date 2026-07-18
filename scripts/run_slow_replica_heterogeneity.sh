@@ -83,6 +83,7 @@ cleanup() {
   pkill -9 -f "throughput_test" >/dev/null 2>&1 || true
   pkill -9 -f "scalog_global_sequencer" >/dev/null 2>&1 || true
   pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
+  pkill -9 -f "lazylog_global_sequencer" >/dev/null 2>&1 || true
   rm -f /tmp/embarlet_*_ready >/dev/null 2>&1 || true
   SEQUENCER_PID=""
 }
@@ -123,10 +124,15 @@ start_cluster() {
     SEQUENCER_PID="$!"
     sleep 1
   elif [[ "$SEQUENCER" == "SCALOG" ]]; then
-    # Run the global sequencer locally (SKIP_REMOTE_SCALOG_SEQUENCER=1 tells
-    # embarlet not to SSH out to a remote machine for it).
     SKIP_REMOTE_SCALOG_SEQUENCER=1 EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP" \
       ./scalog_global_sequencer >/tmp/hetero_scalog_sequencer.log 2>&1 &
+    SEQUENCER_PID="$!"
+    sleep 1
+  elif [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+    # LazyLog global sequencer runs locally; SKIP_REMOTE_LAZYLOG_SEQUENCER=1
+    # tells embarlet not to SSH out for it.
+    SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
+      ./lazylog_global_sequencer >/tmp/hetero_lazylog_sequencer.log 2>&1 &
     SEQUENCER_PID="$!"
     sleep 1
   fi
@@ -140,6 +146,21 @@ start_cluster() {
     for ((i=1; i<NUM_BROKERS; i++)); do
       SKIP_REMOTE_SCALOG_SEQUENCER=1 EMBARCADERO_SCALOG_SEQ_IP="$BROKER_IP" \
         $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --$SEQUENCER \
+        >/tmp/hetero_broker_${i}.log 2>&1 &
+      pids+=("$!")
+    done
+  elif [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+    # LazyLog: SIGSTOP injection (not sync-sleep, which only exists in
+    # chain_replication.cc). Stopping the follower broker blocks its
+    # replication_done updates, which LazyLog ordering reads via
+    # min(replication_done) in SendLocalProgress.
+    SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
+      $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --head --LAZYLOG \
+      >/tmp/hetero_broker_0.log 2>&1 &
+    pids+=("$!")
+    for ((i=1; i<NUM_BROKERS; i++)); do
+      SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
+        $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --LAZYLOG \
         >/tmp/hetero_broker_${i}.log 2>&1 &
       pids+=("$!")
     done
