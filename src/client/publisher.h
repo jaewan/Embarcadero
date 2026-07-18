@@ -11,6 +11,7 @@
 #include <vector>
 #include "absl/container/flat_hash_set.h"
 #include "common.h"
+#include "corfu_ordered_token_gate.h"
 #include "queue_buffer.h"
 #include "session.pb.h"
 
@@ -170,6 +171,10 @@ class Publisher {
 			return ack_received_.load(std::memory_order_relaxed);
 		}
 
+		size_t GetTotalBatchesSent() const {
+			return total_batches_sent_.load(std::memory_order_acquire);
+		}
+
 		// Wait until at least n messages have been ACKed without shutting down
 		// publisher threads. Used by stop-and-wait benchmark modes.
 		bool WaitUntilAcked(size_t n);
@@ -212,20 +217,47 @@ class Publisher {
 		std::array<std::atomic<size_t>, kMaxCorfuBrokers> order5_batch_seq_per_broker_{};
 		// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker to eliminate out-of-order retries (Phase 2C).
 		std::array<std::mutex, kMaxCorfuBrokers> corfu_seq_per_broker_lock_{};
-		// [[CORFU_FIFO_FIX]] Next seal-order batch ticket allowed to issue a token
-		// request. Corfu's per-client FIFO comes from token ACQUISITION order; the
-		// per-broker send threads must issue GetTotalOrder in seal (submission)
-		// order or the sequencer grants total_order in RPC-arrival order, silently
-		// permuting one client's cross-broker submission order.
-		std::atomic<size_t> corfu_token_next_ticket_{0};
+		// [[CORFU_FIFO_FIX]][[CORFU_GATE]] Ordered token-request gate. Corfu's
+		// per-client FIFO comes from token ACQUISITION order; the per-broker send
+		// threads must issue GetTotalOrder in seal (submission) order or the
+		// sequencer grants total_order in RPC-arrival order, silently permuting
+		// one client's cross-broker submission order.
+		// State machine per seal ticket (see docs/contracts/CORFU_INVARIANT_LEDGER.md):
+		//   WAITING --(next==ticket)--> HOLDING-TURN --grant--> COMPLETED (next=ticket+1)
+		//   WAITING --(abort|shutdown)--> ABORTED (thread exits without token/payload)
+		//   HOLDING-TURN --RPC failure--> ABORTED (gate poisoned; all waiters abort)
+		// The gate is fail-closed and terminal: once aborted, no later ticket may
+		// acquire a token or send payload (C2/C5); abort wakes every waiter (C7);
+		// a missing ticket cannot wedge waiters forever because abort/shutdown is
+		// re-checked on a bounded timed wait (C6).
+		CorfuOrderedTokenGate corfu_gate_;
+		// Returns true when this ticket holds the turn; false when the gate was
+		// aborted or the publisher is shutting down (caller must abort WITHOUT
+		// issuing a token or sending payload).
+		bool CorfuAcquireTicketTurn(size_t ticket);
+		// Called by the turn holder after a successful grant; passes the turn on.
+		bool CorfuCompleteTicket(size_t ticket);
+		// Terminal, idempotent: poisons the gate and wakes every waiter.
+		void CorfuAbortGate(const char* reason);
+		// Emits the [CORFU_TOKEN_PHASE] structured counter line (all exit paths).
+		void LogCorfuTokenPhase();
 		// C1 evidence: a Corfu payload must never begin before its ingress-proxy
-		// token grant. These counters are emitted by Poll for developer and
-		// evaluation artifacts, not used for control flow.
+		// token grant. Counters are emitted by Poll for developer and evaluation
+		// artifacts; payload_before_grant > 0 or aborted=1 marks the run INVALID.
 		std::atomic<uint64_t> corfu_token_requests_{0};
 		std::atomic<uint64_t> corfu_token_grants_{0};
+		std::atomic<uint64_t> corfu_token_failures_{0};
+		std::atomic<uint64_t> corfu_gate_denied_{0};     // acquisitions denied by abort/shutdown
 		std::atomic<uint64_t> corfu_token_latency_ns_{0};
+		std::atomic<uint64_t> corfu_ticket_wait_ns_{0};  // time spent waiting for the turn
 		std::atomic<uint64_t> corfu_payload_sends_{0};
 		std::atomic<uint64_t> corfu_payload_before_grant_{0};
+		std::atomic<uint64_t> corfu_payload_admission_denied_{0};
+		// [[CORFU_TOKEN_DELAY]] Controlled token-stage sensitivity (C9): extra
+		// post-grant delay while the ordered turn is held, independent of the
+		// deployed transport. Set once in Init() from
+		// EMBARCADERO_CORFU_TOKEN_DELAY_US before publish threads start.
+		uint64_t corfu_token_delay_us_{0};
 
 	// [[THREAD_SAFETY_FIX]] Atomic variables with relaxed ordering for minimal overhead thread coordination
 	// [[PERF]] Cache-line separate from producer-hot data so consumers don't bounce cache lines

@@ -907,6 +907,73 @@ void Publisher::CompleteUnackedThrough(int, size_t broker_ack_hwm) {
 	}
 }
 
+// [[CORFU_GATE]] Ordered token-request gate (C2/C5/C6/C7). See
+// docs/contracts/CORFU_INVARIANT_LEDGER.md. The turn is granted strictly in
+// seal-ticket order; failure or shutdown poisons the gate so no successor can
+// acquire a token past a failed predecessor.
+bool Publisher::CorfuAcquireTicketTurn(size_t ticket) {
+	const auto result = corfu_gate_.Acquire(ticket, shutdown_);
+	corfu_ticket_wait_ns_.fetch_add(result.wait_ns, std::memory_order_relaxed);
+	if (!result.acquired) {
+		corfu_gate_denied_.fetch_add(1, std::memory_order_relaxed);
+		LOG(ERROR) << "Corfu token turn denied: ticket=" << ticket
+		           << " next=" << result.next_ticket
+		           << " reason=\"" << result.abort_reason << "\"";
+	}
+	return result.acquired;
+}
+
+bool Publisher::CorfuCompleteTicket(size_t ticket) {
+	if (corfu_gate_.Complete(ticket, shutdown_)) return true;
+	const auto snapshot = corfu_gate_.GetSnapshot();
+	LOG(ERROR) << "CorfuCompleteTicket failed closed: ticket=" << ticket
+	           << " next=" << snapshot.next_ticket
+	           << " aborted=" << (snapshot.aborted ? 1 : 0)
+	           << " reason=\"" << snapshot.abort_reason << "\"";
+	return false;
+}
+
+void Publisher::CorfuAbortGate(const char* reason) {
+	// Cancel an in-flight RPC before poisoning the gate. Register/cancel is
+	// terminal and synchronized inside the client, so a retry cannot slip in
+	// after this cancellation point.
+	if (corfu_client_) corfu_client_->CancelActiveRequests();
+	if (corfu_gate_.Abort(reason)) {
+		const auto snapshot = corfu_gate_.GetSnapshot();
+		LOG(ERROR) << "[CORFU_GATE_ABORT] reason=\"" << reason
+		           << "\" next_ticket=" << snapshot.next_ticket;
+	}
+}
+
+void Publisher::LogCorfuTokenPhase() {
+	if (seq_type_ != heartbeat_system::SequencerType::CORFU) return;
+	const uint64_t token_requests = corfu_token_requests_.load(std::memory_order_relaxed);
+	const uint64_t token_grants = corfu_token_grants_.load(std::memory_order_relaxed);
+	const uint64_t token_latency_ns = corfu_token_latency_ns_.load(std::memory_order_relaxed);
+	const auto gate = corfu_gate_.GetSnapshot();
+	LOG(INFO) << "[CORFU_TOKEN_PHASE] requests=" << token_requests
+	          << " grants=" << token_grants
+	          << " failures=" << corfu_token_failures_.load(std::memory_order_relaxed)
+	          << " gate_aborts=" << gate.abort_transitions
+	          << " gate_denied=" << corfu_gate_denied_.load(std::memory_order_relaxed)
+	          << " payload_sends=" << corfu_payload_sends_.load(std::memory_order_relaxed)
+	          << " payload_before_grant="
+	          << corfu_payload_before_grant_.load(std::memory_order_relaxed)
+	          << " payload_admission_denied="
+	          << corfu_payload_admission_denied_.load(std::memory_order_relaxed)
+	          << " mean_token_latency_us="
+	          << (token_requests == 0 ? 0 : token_latency_ns / token_requests / 1000)
+	          << " ticket_wait_ms_sum="
+	          << corfu_ticket_wait_ns_.load(std::memory_order_relaxed) / 1000000
+	          << " unavailable_retries="
+	          << (corfu_client_ ? corfu_client_->UnavailableRetries() : 0)
+	          << " transient_retries="
+	          << (corfu_client_ ? corfu_client_->TransientRetries() : 0)
+	          << " token_delay_us=" << corfu_token_delay_us_
+	          << " aborted=" << (gate.aborted ? 1 : 0)
+	          << " abort_reason=\"" << gate.abort_reason << "\"";
+}
+
 bool Publisher::EnsureRetransmitChannel(int broker_id, int* out_fd) {
 	if (out_fd == nullptr) return false;
 	{
@@ -1334,6 +1401,13 @@ Publisher::~Publisher() {
 	shutdown_.store(true, std::memory_order_relaxed);
 	consumer_should_exit_.store(true, std::memory_order_relaxed);
 	unacked_cv_.notify_all();
+	// [[CORFU_GATE]] Wake ordered-token-gate waiters so the joins below cannot
+	// block on a wedged ticket (C6/C7). No-op after a normal Poll (threads
+	// already joined; gate idle).
+	if (seq_type_ == heartbeat_system::SequencerType::CORFU &&
+	    !threads_joined_.load(std::memory_order_acquire)) {
+		CorfuAbortGate("publisher destructor shutdown");
+	}
 	// Cancel current gRPC SubscribeToCluster call so cluster_probe_thread_ can exit (reader->Read() unblocks).
 	if (grpc::ClientContext* ctx = subscribe_context_.exchange(nullptr)) {
 		ctx->TryCancel();
@@ -1817,6 +1891,22 @@ bool Publisher::Init(int ack_level) {
 	// Initialize Corfu sequencer if needed
 	if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
 		corfu_client_ = std::make_unique<CorfuSequencerClient>(static_cast<uint64_t>(client_id_));
+		// [[CORFU_TOKEN_DELAY]] Token-stage sensitivity knob (C9). Parsed once
+		// before publish threads start; recorded in [CORFU_TOKEN_PHASE] (C10).
+		if (const char* delay_env = std::getenv("EMBARCADERO_CORFU_TOKEN_DELAY_US")) {
+			char* end = nullptr;
+			const long long v = std::strtoll(delay_env, &end, 10);
+			if (end == delay_env || *end != '\0' || v < 0 || v > 10'000'000) {
+				LOG(ERROR) << "Publisher::Init() invalid EMBARCADERO_CORFU_TOKEN_DELAY_US=\""
+				           << delay_env << "\" (must be an integer in [0, 10000000]); failing closed";
+				return false;
+			}
+			corfu_token_delay_us_ = static_cast<uint64_t>(v);
+			if (corfu_token_delay_us_ > 0) {
+				LOG(INFO) << "[CORFU_TOKEN_DELAY] injected post-grant token-stage delay: "
+				          << corfu_token_delay_us_ << " us";
+			}
+		}
 	}
 
 	// [[Issue 6]] Wait for all publisher threads to initialize with timeout
@@ -2189,6 +2279,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			           << "s: client_order=" << client_order_.load(std::memory_order_acquire)
 			           << " target=" << n
 			           << " — failing Poll instead of hanging (EMBARCADERO_QUEUE_DRAIN_TIMEOUT_SEC to tune)";
+			LogCorfuTokenPhase();
 			return false;
 		}
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - last_queue_log_time).count() >= 1) {
@@ -2248,7 +2339,11 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			std::mutex join_watchdog_mu;
 			std::condition_variable join_watchdog_cv;
 			std::thread join_watchdog;
-			if (IsOrder5SessionMode() && ack_level_ >= 1) {
+			// [[CORFU_GATE]] CORFU joins are watched too: a thread stuck in a slow
+			// send loop must not hang Poll forever; forcing shutdown_ makes gate
+			// waiters abort fail-closed (C6/C7).
+			if ((IsOrder5SessionMode() && ack_level_ >= 1) ||
+			    seq_type_ == heartbeat_system::SequencerType::CORFU) {
 				join_watchdog = std::thread([this, join_timeout_sec, &join_watchdog_stop,
 				                            &join_timed_out, &join_watchdog_mu,
 				                            &join_watchdog_cv]() {
@@ -2262,6 +2357,9 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 							           << "s — forcing shutdown so PublishThreads exit WaitForUnackedCapacity "
 							              "(EMBARCADERO_PUBLISH_JOIN_TIMEOUT_SEC to tune)";
 							shutdown_.store(true, std::memory_order_relaxed);
+							if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
+								CorfuAbortGate("publisher join watchdog timeout");
+							}
 							unacked_cv_.notify_all();
 							break;
 						}
@@ -2295,11 +2393,21 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 			if (join_timed_out.load(std::memory_order_acquire)) {
 				publisher_join_done_time = std::chrono::steady_clock::now();
 				LOG(ERROR) << "[PUBLISH_JOIN_TIMEOUT] Poll failing closed after PublishThread join timeout";
+				LogCorfuTokenPhase();
 				return false;
 			}
 			// All publisher threads completed transmission
 		}
 		publisher_join_done_time = std::chrono::steady_clock::now();
+		// [[CORFU_GATE]] Fail fast (C5): a poisoned gate means at least one batch
+		// was lost and successors were stopped. Do not wait out the ACK timeout;
+		// the run is terminally failed and its counters mark it INVALID.
+		if (seq_type_ == heartbeat_system::SequencerType::CORFU &&
+		    corfu_gate_.IsAborted()) {
+			LogCorfuTokenPhase();
+			LOG(ERROR) << "[CORFU_ABORT] Poll failing closed: ordered token gate aborted";
+			return false;
+		}
 		const size_t zero_batch_threads = zero_batch_publish_threads_.load(std::memory_order_relaxed);
 		if (zero_batch_threads > 0) {
 			LOG(WARNING) << "[Publisher Thread Distribution] " << zero_batch_threads
@@ -2549,18 +2657,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 	// This allows the subscriber to continue using the cluster management infrastructure
 	// The context will be cleaned up when the Publisher object is destroyed
 	LogOrder5RoutingSummary();
-	if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
-		const uint64_t token_requests = corfu_token_requests_.load(std::memory_order_relaxed);
-		const uint64_t token_grants = corfu_token_grants_.load(std::memory_order_relaxed);
-		const uint64_t token_latency_ns = corfu_token_latency_ns_.load(std::memory_order_relaxed);
-		LOG(INFO) << "[CORFU_TOKEN_PHASE] requests=" << token_requests
-		          << " grants=" << token_grants
-		          << " payload_sends=" << corfu_payload_sends_.load(std::memory_order_relaxed)
-		          << " payload_before_grant="
-		          << corfu_payload_before_grant_.load(std::memory_order_relaxed)
-		          << " mean_token_latency_us="
-		          << (token_requests == 0 ? 0 : token_latency_ns / token_requests / 1000);
-	}
+	LogCorfuTokenPhase();
 	const auto poll_done_time = std::chrono::steady_clock::now();
 	LOG(INFO) << "[POLL_BREAKDOWN] target_messages=" << n
 	          << " ack_enabled=" << (ack_level_ >= 1 ? 1 : 0)
@@ -2605,6 +2702,13 @@ bool Publisher::WaitUntilAcked(size_t n) {
 	const auto timeout_duration = std::chrono::seconds(timeout_seconds);
 
 	while (normalized_acks() < n && !shutdown_.load(std::memory_order_relaxed)) {
+		// [[CORFU_GATE]] A poisoned gate is terminal: the missing batch's ACK can
+		// never arrive. Fail fast instead of waiting out the timeout.
+		if (seq_type_ == heartbeat_system::SequencerType::CORFU &&
+		    corfu_gate_.IsAborted()) {
+			LOG(ERROR) << "[CORFU_ABORT] WaitUntilAcked failing closed: ordered token gate aborted";
+			return false;
+		}
 		auto now = std::chrono::steady_clock::now();
 		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - wait_start_time);
 		const size_t current_raw_acks = ack_received_.load(std::memory_order_acquire);
@@ -3291,6 +3395,22 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 	size_t sent_msgs = 0;
 	size_t sent_batches = 0;
 
+	// [[CORFU_GATE]] Any abnormal exit of a CORFU publish thread strands the
+	// seal tickets still queued for it; successors would wait on the gate for a
+	// turn that can never come (C6). Poison the gate on every exit path except
+	// the normal drained-queue fall-through (disarmed below). Idempotent with
+	// the explicit aborts in the catch handler.
+	struct CorfuThreadExitGuard {
+		Publisher* publisher;
+		bool clean = false;
+		~CorfuThreadExitGuard() {
+			if (publisher != nullptr && !clean) {
+				publisher->CorfuAbortGate("corfu publish thread exited before its queue drained");
+			}
+		}
+	} corfu_exit_guard{
+		seq_type_ == heartbeat_system::SequencerType::CORFU ? this : nullptr};
+
 	// Lambda function to establish connection to a broker
 	auto connect_to_server = [&](size_t brokerId) -> bool {
 		// Reassigning sock/efd closes previous fds via ScopedFd move assignment
@@ -3667,58 +3787,62 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					// this gate the per-broker threads race their RPCs and the sequencer
 					// (whose expected_batch_seq is per (client,broker) stream) grants
 					// total_order in arrival order, permuting cross-broker submission
-					// order. Re-sent batches (ticket already advanced) pass immediately.
+					// order.
+					// [[CORFU_GATE]] Fail-closed ordered gate (C2/C5/C6/C7): a denied
+					// turn (predecessor failure or shutdown) aborts this thread before
+					// any token request or payload byte.
 					const size_t corfu_token_ticket = batch_header->batch_seq;
-					{
-						auto ticket_wait_log = std::chrono::steady_clock::now();
-						while (corfu_token_next_ticket_.load(std::memory_order_acquire) <
-						       corfu_token_ticket) {
-							std::this_thread::yield();
-							if (std::chrono::steady_clock::now() - ticket_wait_log >
-							    std::chrono::seconds(5)) {
-								LOG(WARNING) << "Corfu token ticket wait: ticket="
-								             << corfu_token_ticket << " next="
-								             << corfu_token_next_ticket_.load(std::memory_order_acquire)
-								             << " broker=" << broker_id;
-								ticket_wait_log = std::chrono::steady_clock::now();
-							}
-							if (shutdown_.load(std::memory_order_relaxed)) break;
-						}
+					if (!CorfuAcquireTicketTurn(corfu_token_ticket)) {
+						throw std::runtime_error(
+							"corfu ordered token gate aborted before grant (shutdown or predecessor failure)");
 					}
-					if (broker_id >= 0 && broker_id < kMaxCorfuBrokers) {
-						// [[CORFU_ORDER2_FIX]] Serialize sequencer calls per broker (Phase 2C).
-						// This ensures in-order delivery to the sequencer, eliminating UNAVAILABLE retries.
+					if (broker_id < 0 || broker_id >= kMaxCorfuBrokers) {
+						// Fail closed: an unsequenced (client,broker) stream would desync
+						// the sequencer's expected_batch_seq for every later batch (C3).
+						CorfuAbortGate("corfu broker_id outside per-broker sequencing range");
+						throw std::runtime_error("corfu broker_id out of per-broker sequencing range");
+					}
+					{
+						// [[CORFU_ORDER2_FIX]] Per-broker lock keeps (client,broker)
+						// stream requests in-order at the sequencer. The global gate
+						// already serializes token requests; this stays as a cheap,
+						// uncontended second fence for the per-broker counter + RPC pair.
 						std::lock_guard<std::mutex> lock(corfu_seq_per_broker_lock_[broker_id]);
 						batch_header->batch_seq = corfu_batch_seq_per_broker_[broker_id].fetch_add(1, std::memory_order_relaxed);
 						const auto token_start = std::chrono::steady_clock::now();
 						corfu_token_requests_.fetch_add(1, std::memory_order_relaxed);
 						got_total_order = corfu_client_->GetTotalOrder(batch_header, proxy_endpoint);
-						corfu_token_latency_ns_.fetch_add(
-							std::chrono::duration_cast<std::chrono::nanoseconds>(
-								std::chrono::steady_clock::now() - token_start).count(),
-							std::memory_order_relaxed);
-					} else {
-						const auto token_start = std::chrono::steady_clock::now();
-						corfu_token_requests_.fetch_add(1, std::memory_order_relaxed);
-						got_total_order = corfu_client_->GetTotalOrder(batch_header, proxy_endpoint);
-						corfu_token_latency_ns_.fetch_add(
-							std::chrono::duration_cast<std::chrono::nanoseconds>(
-								std::chrono::steady_clock::now() - token_start).count(),
-							std::memory_order_relaxed);
-					}
-					// Advance the ticket even on failure so successors are not wedged
-					// behind a batch that is about to abort the run.
-					{
-						size_t expected = corfu_token_next_ticket_.load(std::memory_order_relaxed);
-						while (expected <= corfu_token_ticket &&
-						       !corfu_token_next_ticket_.compare_exchange_weak(
-						           expected, corfu_token_ticket + 1, std::memory_order_acq_rel)) {
+						if (got_total_order && corfu_token_delay_us_ > 0) {
+							// [[CORFU_TOKEN_DELAY]] Token-stage sensitivity (C9): add
+							// post-grant critical-path time while the ordered turn is held.
+							// This models stage cost; it is not a network fault injector.
+							std::this_thread::sleep_for(
+								std::chrono::microseconds(corfu_token_delay_us_));
 						}
+						corfu_token_latency_ns_.fetch_add(
+							std::chrono::duration_cast<std::chrono::nanoseconds>(
+								std::chrono::steady_clock::now() - token_start).count(),
+							std::memory_order_relaxed);
 					}
 					if (!got_total_order) {
+						corfu_token_failures_.fetch_add(1, std::memory_order_relaxed);
+						// Fail closed (C5): successors must not acquire tokens past a
+						// failed predecessor. The gate stays poisoned; every waiter
+						// aborts without sending payload.
+						CorfuAbortGate("corfu token acquisition failed");
 						throw std::runtime_error("corfu sequencer GetTotalOrder failed");
 					}
+					// The coordinator issued this token even if a concurrent terminal
+					// abort prevents its payload from being admitted. Such a range is
+					// deliberately burned, never reused or retried under a new identity.
 					corfu_token_grants_.fetch_add(1, std::memory_order_relaxed);
+					// Pass the turn only after a successful grant (C2): token
+					// acquisition order across brokers equals seal order. Completion
+					// also linearizes against abort/shutdown; a late grant is burned.
+					if (!CorfuCompleteTicket(corfu_token_ticket)) {
+						throw std::runtime_error(
+							"corfu token grant completed after terminal gate abort");
+					}
 					corfu_token_granted = true;
 
 				VLOG(2) << "Publisher: Got total_order=" << batch_header->total_order
@@ -3743,6 +3867,10 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				if (!corfu_token_granted) {
 					corfu_payload_before_grant_.fetch_add(1, std::memory_order_relaxed);
 					throw std::runtime_error("Corfu payload attempted without token grant");
+				}
+				if (!corfu_gate_.AdmitPayload(shutdown_)) {
+					corfu_payload_admission_denied_.fetch_add(1, std::memory_order_relaxed);
+					throw std::runtime_error("Corfu payload admission denied after terminal gate abort");
 				}
 				corfu_payload_sends_.fetch_add(1, std::memory_order_relaxed);
 			}
@@ -3845,6 +3973,23 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			// DYNAMIC MASK UPDATE: stop upstream from feeding this queue
 			pubQue_.MarkQueueInactive(pubQuesIdx);
 
+			// [[CORFU_GATE]] CORFU fails closed on ANY publish-thread failure
+			// (gate abort, token failure, header/payload send failure):
+			// - GetTotalOrder pre-assigns log_idx/broker_batch_seq for the original
+			//   broker, so rerouting would write the wrong broker-local log (C8);
+			// - publishing successors past a lost predecessor silently breaks the
+			//   client's FIFO as observed by consumers (C5).
+			// Poison the gate so every other publish thread aborts before its next
+			// token, then exit. Membership is left untouched for the subscriber.
+			if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
+				CorfuAbortGate("corfu publish thread failure");
+				pubQue_.ReleaseBatch(batch_header);
+				LOG(ERROR) << "CORFU: publish thread for broker " << broker_id
+				           << " aborting after failure; failing closed (no reroute).";
+				RecordFailureEvent("CORFU Fail-Closed Abort Broker " + std::to_string(broker_id));
+				return;
+			}
+
 				// Handle broker failure by finding another broker
 				int new_broker_id;
 				{
@@ -3874,16 +4019,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					}
 				}
 
-			// CORFU: GetTotalOrder pre-assigns log_idx and broker_batch_seq for the
-			// original broker. Re-routing after that would write data to the wrong
-			// broker-local log and can strand the original per-broker sequence.
-			if (seq_type_ == heartbeat_system::SequencerType::CORFU) {
-				pubQue_.ReleaseBatch(batch_header);
-				LOG(ERROR) << "CORFU: broker " << broker_id << " failed after GetTotalOrder was issued; "
-				           << "cannot reroute safely. Aborting thread.";
-				RecordFailureEvent("CORFU Header Send Fail No Reroute Broker " + std::to_string(broker_id));
-				return;
-			}
+			// (CORFU never reaches here: it fails closed at the top of this catch.)
 
 			// Connect to new broker — try all survivors before giving up.
 			// [[RECONNECT_RETRY_ALL_SURVIVORS]] If the first replacement broker also
@@ -3994,10 +4130,14 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 
 	}
 
+	// [[CORFU_GATE]] Normal exit: the queue is drained (or shutdown was
+	// requested, in which case waiters abort via the gate's shutdown check).
+	corfu_exit_guard.clean = true;
+
 	// IMPROVED: Keep connections alive for subscriber
 	// Don't close data connections when publisher finishes - this would cause brokers to shutdown
 	// The connections will be cleaned up when the Publisher object is destroyed
-	// 
+	//
 	// NOTE: We intentionally do NOT close sock and efd here to keep broker connections alive
 	// This allows the subscriber to continue working after publisher finishes
 	// Resources will be cleaned up in the Publisher destructor

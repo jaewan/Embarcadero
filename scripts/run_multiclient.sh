@@ -94,6 +94,11 @@ if [[ "$CORFU_REPLICA_ISOLATE_ATTEMPTS" != "0" && "$CORFU_REPLICA_ISOLATE_ATTEMP
 fi
 SEQUENCER=${SEQUENCER:-EMBARCADERO}
 CONTROL_TRANSPORT=${EMBARCADERO_BASELINE_CONTROL_TRANSPORT:-grpc}
+CORFU_TOKEN_DELAY_US=${EMBARCADERO_CORFU_TOKEN_DELAY_US:-0}
+if [[ ! "$CORFU_TOKEN_DELAY_US" =~ ^(0|[1-9][0-9]*)$ ]] || (( CORFU_TOKEN_DELAY_US > 10000000 )); then
+    echo "ERROR: EMBARCADERO_CORFU_TOKEN_DELAY_US must be an integer in [0,10000000]" >&2
+    exit 1
+fi
 DRY_RUN=${DRY_RUN:-0}
 REQUIRE_FAITHFUL_LAZYLOG=${REQUIRE_FAITHFUL_LAZYLOG:-0}
 LAZYLOG_METADATA_CONTRACT="not_applicable"
@@ -812,7 +817,7 @@ print_dry_run() {
     local seq_bin
     seq_bin="$(baseline_sequencer_binary)"
     echo "DRY_RUN=1: no processes will be started."
-    echo "CONTROL_TRANSPORT=$CONTROL_TRANSPORT SEQUENCER=$SEQUENCER RF=$REPLICATION_FACTOR REMOTE_REPLICAS=$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )) ACK=$ACK BATCH_SIZE=$EMBARCADERO_BATCH_SIZE CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB"
+    echo "CONTROL_TRANSPORT=$CONTROL_TRANSPORT SEQUENCER=$SEQUENCER RF=$REPLICATION_FACTOR REMOTE_REPLICAS=$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )) ACK=$ACK BATCH_SIZE=$EMBARCADERO_BATCH_SIZE CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB CORFU_TOKEN_DELAY_US=$CORFU_TOKEN_DELAY_US"
     echo "BUILD_BIN=$BUILD_BIN"
     echo "BROKER_COMMAND=$BUILD_BIN/embarlet --broker_id <0..$((NUM_BROKERS - 1))>"
     if [[ -n "$seq_bin" ]]; then
@@ -950,21 +955,47 @@ record_mailbox_runtime_backing() {
 validate_corfu_phase_evidence() {
     local trial="$1"
     [[ "$SEQUENCER" == "CORFU" ]] || return 0
-    local index log_file line requests grants payload violations
+    local index log_file line requests grants failures gate_aborts gate_denied
+    local payload violations admission_denied mean_latency wait_ms unavailable transient delay aborted
     for (( index=0; index<${#CLIENT_LOGS[@]}; index++ )); do
         log_file="${CLIENT_LOGS[$index]}"
         line="$(grep '\[CORFU_TOKEN_PHASE\]' "$log_file" 2>/dev/null | tail -1 || true)"
-        if [[ ! "$line" =~ requests=([0-9]+)[[:space:]]+grants=([0-9]+)[[:space:]]+payload_sends=([0-9]+)[[:space:]]+payload_before_grant=([0-9]+) ]]; then
-            echo "ERROR: missing or malformed CORFU_TOKEN_PHASE evidence in $log_file" >&2
+        corfu_phase_value() {
+            local key="$1"
+            if [[ "$line" =~ (^|[[:space:]])${key}=([0-9]+)($|[[:space:]]) ]]; then
+                printf '%s' "${BASH_REMATCH[2]}"
+                return 0
+            fi
+            return 1
+        }
+        requests="$(corfu_phase_value requests)" || true
+        grants="$(corfu_phase_value grants)" || true
+        failures="$(corfu_phase_value failures)" || true
+        gate_aborts="$(corfu_phase_value gate_aborts)" || true
+        gate_denied="$(corfu_phase_value gate_denied)" || true
+        payload="$(corfu_phase_value payload_sends)" || true
+        violations="$(corfu_phase_value payload_before_grant)" || true
+        admission_denied="$(corfu_phase_value payload_admission_denied)" || true
+        mean_latency="$(corfu_phase_value mean_token_latency_us)" || true
+        wait_ms="$(corfu_phase_value ticket_wait_ms_sum)" || true
+        unavailable="$(corfu_phase_value unavailable_retries)" || true
+        transient="$(corfu_phase_value transient_retries)" || true
+        delay="$(corfu_phase_value token_delay_us)" || true
+        aborted="$(corfu_phase_value aborted)" || true
+        if [[ -z "$requests" || -z "$grants" || -z "$failures" || -z "$gate_aborts" ||
+              -z "$gate_denied" || -z "$payload" || -z "$violations" ||
+              -z "$admission_denied" || -z "$mean_latency" || -z "$wait_ms" ||
+              -z "$unavailable" || -z "$transient" || -z "$delay" || -z "$aborted" ]]; then
+            echo "ERROR: missing or malformed CORFU_TOKEN_PHASE evidence in $log_file: $line" >&2
             return 1
         fi
-        requests="${BASH_REMATCH[1]}"; grants="${BASH_REMATCH[2]}"
-        payload="${BASH_REMATCH[3]}"; violations="${BASH_REMATCH[4]}"
-        if (( requests == 0 || grants != requests || payload != grants || violations != 0 )); then
+        if (( requests == 0 || grants != requests || payload != grants || failures != 0 ||
+              gate_aborts != 0 || gate_denied != 0 || violations != 0 ||
+              admission_denied != 0 || aborted != 0 || delay != CORFU_TOKEN_DELAY_US )); then
             echo "ERROR: Corfu phase invariant failed in $log_file: $line" >&2
             return 1
         fi
-        echo "$trial,${CLIENT_TAGS[$index]},$requests,$grants,$payload,$violations" >> "$CORFU_PHASE_CSV"
+        echo "$trial,${CLIENT_TAGS[$index]},$requests,$grants,$failures,$gate_aborts,$gate_denied,$payload,$violations,$admission_denied,$mean_latency,$wait_ms,$unavailable,$transient,$delay,$aborted" >> "$CORFU_PHASE_CSV"
     done
 }
 
@@ -1808,7 +1839,7 @@ echo "trial,attempt,result,reason" > "$ATTEMPT_SUMMARY_CSV"
 OVERLAP_SUMMARY_CSV="$LOG_DIR/overlap_summary.csv"
 echo "trial,overlap_total_gbps,overlap_window_ms,timeseries_clients" > "$OVERLAP_SUMMARY_CSV"
 CORFU_PHASE_CSV="$LOG_DIR/corfu_token_phase.csv"
-echo "trial,client,requests,grants,payload_sends,payload_before_grant" > "$CORFU_PHASE_CSV"
+echo "trial,client,requests,grants,failures,gate_aborts,gate_denied,payload_sends,payload_before_grant,payload_admission_denied,mean_token_latency_us,ticket_wait_ms_sum,unavailable_retries,transient_retries,token_delay_us,aborted" > "$CORFU_PHASE_CSV"
 RUN_CONTRACT_CSV="$LOG_DIR/run_contract.csv"
 GIT_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null)" ]]; then
@@ -1831,8 +1862,8 @@ if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
     # as smoke-only, never as CXL mailbox measurements.
     MAILBOX_BACKING="pending_runtime_verification"
 fi
-echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,corfu_group_commit_bytes,corfu_group_commit_delay_us,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
-echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES,$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US,${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
+echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,corfu_group_commit_bytes,corfu_group_commit_delay_us,corfu_token_gate_policy,corfu_token_delay_us,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
+echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES,$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US,cv_fail_closed_v1,$CORFU_TOKEN_DELAY_US,${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
 
 if ! lazylog_metadata_endpoints_ready; then
     exit 1
@@ -1973,6 +2004,7 @@ export EMBARCADERO_CXL_SHM_NAME=$EMBARCADERO_CXL_SHM_NAME
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=throughput
 export EMBARCADERO_REPLICATION_FACTOR=$REPLICATION_FACTOR
+export EMBARCADERO_CORFU_TOKEN_DELAY_US=$CORFU_TOKEN_DELAY_US
 export EMBARCADERO_ORDER0_FAST_PATH=$EMBARCADERO_ORDER0_FAST_PATH
 export EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES=$EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES
 export EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE=$EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE

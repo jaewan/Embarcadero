@@ -465,6 +465,15 @@ target_link_libraries(corfu_ordered_chain_smoke PRIVATE Threads::Threads)
 set_target_properties(corfu_ordered_chain_smoke PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME corfu_ordered_chain_smoke COMMAND corfu_ordered_chain_smoke)
+
+add_executable(corfu_ordered_token_gate_test
+    client/corfu_ordered_token_gate_test.cc)
+target_include_directories(corfu_ordered_token_gate_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(corfu_ordered_token_gate_test PRIVATE Threads::Threads)
+set_target_properties(corfu_ordered_token_gate_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME corfu_ordered_token_gate_test COMMAND corfu_ordered_token_gate_test)
 target_include_directories(scalog_mailbox_bench PUBLIC
     "${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_BINARY_DIR}"
