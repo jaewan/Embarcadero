@@ -187,19 +187,17 @@ start_cluster() {
   fi
 
   wait_for_brokers 120 "$NUM_BROKERS"
-  # Poll broker management ports (12140+i) with nc until all respond.
-  # Management port is where throughput_test sends the CreateTopic RPC.
-  local _mgmt_base=12140 _pt=60 _ts_pp _pp
+  # All broker readyfiles written. Poll the single head management port (12140)
+  # until it accepts connections, then sleep 15s to let followers fully init.
+  local _ts_pp _pt=60
   _ts_pp=$(date +%s)
-  for ((_pi=0; _pi<NUM_BROKERS; _pi++)); do
-    _pp=$((_mgmt_base + _pi))
-    while ! nc -z 127.0.0.1 "$_pp" 2>/dev/null; do
-      [ $(( $(date +%s) - _ts_pp )) -ge $_pt ] && { echo "[WARN] mgmt port $_pp not up after ${_pt}s" >&2; break; }
-      sleep 0.5
-    done
+  while ! nc -z 127.0.0.1 12140 2>/dev/null; do
+    [ $(( $(date +%s) - _ts_pp )) -ge $_pt ] && { echo "[WARN] head mgmt port 12140 not up after ${_pt}s" >&2; break; }
+    sleep 0.5
   done
-  # Extra settle time for the LazyLog global sequencer binding connection.
-  sleep 5
+  # Extra settle: followers need time after readyfile to be fully ready
+  # (LazyLog binding connection, CXL segment prefault, replica init).
+  sleep 15
   rm -f /tmp/embarlet_*_ready
   echo "${pids[*]}"
 }
