@@ -186,17 +186,20 @@ start_cluster() {
     done
   fi
 
-  wait_for_brokers 90 "$NUM_BROKERS"
-  # Poll per-broker ports so throughput_test does not hit ECONNREFUSED.
-  local _pb=1214 _pt=30 _pp _ts_pp
+  wait_for_brokers 120 "$NUM_BROKERS"
+  # Poll broker management ports (12140+i) with nc until all respond.
+  # Management port is where throughput_test sends the CreateTopic RPC.
+  local _mgmt_base=12140 _pt=60 _ts_pp _pp
   _ts_pp=$(date +%s)
   for ((_pi=0; _pi<NUM_BROKERS; _pi++)); do
-    _pp=$((_pb + _pi))
-    while ! ss -H -ltn "sport = :$_pp" 2>/dev/null | grep -q .; do
-      [ $(( $(date +%s) - _ts_pp )) -ge $_pt ] && { echo "[WARN] port $_pp not up" >&2; break; }
-      sleep 0.2
+    _pp=$((_mgmt_base + _pi))
+    while ! nc -z 127.0.0.1 "$_pp" 2>/dev/null; do
+      [ $(( $(date +%s) - _ts_pp )) -ge $_pt ] && { echo "[WARN] mgmt port $_pp not up after ${_pt}s" >&2; break; }
+      sleep 0.5
     done
   done
+  # Extra settle time for the LazyLog global sequencer binding connection.
+  sleep 5
   rm -f /tmp/embarlet_*_ready
   echo "${pids[*]}"
 }
