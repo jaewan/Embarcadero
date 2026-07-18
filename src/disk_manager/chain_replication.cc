@@ -536,11 +536,13 @@ void ChainReplicationManager::ReplicationThread() {
                     }
                     if (!do_sync) continue;
 
-                    // [[SLOW_SYNC_INJECT]] Artificial post-fdatasync sleep for
-                    // ordering-replication independence experiment. With
-                    // EMBARCADERO_SYNC_SLEEP_MS set, the sync thread stalls after
-                    // each fdatasync, raising ACK2 P99 while leaving network-receive
-                    // threads (and thus ACK1) unaffected.
+                    // [[SYNC_SLEEP]] Controlled sync-thread latency injection for the
+                    // ordering-replication independence microbenchmark (Sec. 7.4).
+                    // When EMBARCADERO_SYNC_SLEEP_MS=N is set, the sync thread (and only
+                    // the sync thread) sleeps N ms after each fdatasync cycle.  Network-
+                    // receive threads and the sequencer GOI commit path are unaffected,
+                    // so ACK2 P99 rises by ~N ms while ACK1 P99 is unchanged.
+                    // Default is 0 (disabled); production runs never set this variable.
                     {
                         static const int64_t kSleepMs = [] {
                             const char* e = std::getenv("EMBARCADERO_SYNC_SLEEP_MS");

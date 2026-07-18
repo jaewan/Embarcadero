@@ -5,21 +5,15 @@ set -euo pipefail
 # run_slow_replica_heterogeneity.sh
 #
 # Scientific claim tested (Appendix Table):
-#   "Slow replica stalls ordering: No for Embarcadero, Yes for Scalog/LazyLog"
+#   Embarcadero's ordering ACK is independent of replica-sync completion.
 #
-# Method: Run two trials per system — baseline (no fault) and slow_injected
-# (SIGSTOP on a follower broker).  Extract ACK1 (ordering) and ACK2 (durable)
-# P99 latencies from stage_latency_summary.csv and compare.
+# Method: Run paired baseline and slow-sync trials.  The slow trial injects a
+# sleep into every disk-durable replica sync thread before fdatasync.  Extract
+# ACK1 (ordering) and ACK2 (durable) P99 latencies and compare three pairs.
 #
-# For Embarcadero: SIGSTOP on broker 1 (follower) stalls its CXL→DRAM
-# replication payload copy and completion-vector update.  ACK1 (sequencer-
-# assigned ordering) comes from broker 0's sequencer — unaffected.
-# ACK2 (durable prefix) waits on broker 1's completion vector → stalls.
-#
-# For Scalog: SIGSTOP on broker 1 stalls its replication progress report to
-# the global cut.  The global cut uses element_wise_minimum over all shards,
-# so broker 1's stall holds back the global ordered sequence number → BOTH
-# ACK1 and ACK2 stall.
+# For Embarcadero, ACK1 comes from the sequencer's GOI commit and should not
+# inherit the injected delay.  ACK2 waits for completion-vector advancement
+# from the disk-durable sync path and therefore should inherit the delay.
 #
 # IMPORTANT — ACK level note:
 #   publisher.cc sets have_ordered_metric = (ack_level_ == 1).
@@ -52,10 +46,12 @@ CLIENT_CONFIG=${CLIENT_CONFIG:-config/client.yaml}
 # a follower slowdown propagates back to the sequencer (Scalog/LazyLog) or not
 # (Embarcadero).
 SLOW_BROKER_INDEX=${SLOW_BROKER_INDEX:-1}
-INJECT_AFTER_SEC=${INJECT_AFTER_SEC:-2}
-PAUSE_SEC=${PAUSE_SEC:-4}
-POINT_MAX_ATTEMPTS=${POINT_MAX_ATTEMPTS:-2}
-TIMEOUT_SEC=60
+SKIP_SIGSTOP=${SKIP_SIGSTOP:-1}  # Default: use sync-sleep only; SIGSTOP confounds the sync-thread experiment.
+NUM_TRIALS=${NUM_TRIALS:-3}  # Independent baseline/slow pairs for P99 dispersion
+INJECT_AFTER_SEC=${INJECT_AFTER_SEC:-20}
+PAUSE_SEC=${PAUSE_SEC:-10}
+POINT_MAX_ATTEMPTS=${POINT_MAX_ATTEMPTS:-3}
+TIMEOUT_SEC=180
 RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-$((TIMEOUT_SEC + 60))}
 OUTDIR=${OUTDIR:-data/latency/slow_replica}
 if [[ "$OUTDIR" != /* ]]; then
@@ -66,13 +62,16 @@ mkdir -p "$OUTDIR"
 # Resolve BROKER_IP for SCALOG local-sequencer mode (SKIP_REMOTE_SCALOG_SEQUENCER=1)
 BROKER_IP=${BROKER_IP:-$(hostname -I | awk '{print $1}')}
 
-# Replication sink: DRAM replica completion (same as Fig1 right panel).
-# This isolates the coordination path from NVMe latency — making ACK2 fast enough
-# for a latency comparison between ACK1 (ordering) and ACK2 (durable).
-# Without this, disk fdatasync dominates and the ACK2 sub-trial times out.
-export EMBARCADERO_CHAIN_REPLICATION_SINK="${EMBARCADERO_CHAIN_REPLICATION_SINK:-memory-copy}"
-export EMBARCADERO_CHAIN_REPLICATION_INMEM="${EMBARCADERO_CHAIN_REPLICATION_INMEM:-1}"
-export EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY="${EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY:-1}"
+# Replication sink must be disk-durable: the injection hook is in the fdatasync
+# path and is intentionally bypassed by the memory-copy sink.
+export EMBARCADERO_CHAIN_REPLICATION_SINK="${EMBARCADERO_CHAIN_REPLICATION_SINK:-disk-durable}"
+unset EMBARCADERO_CHAIN_REPLICATION_INMEM 2>/dev/null || true
+unset EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY 2>/dev/null || true
+# 128 GiB CXL ensures broker 2 can allocate a segment (64 GiB leaves only 3, and with RF=2 the 4th broker crashes).
+# Set replica disk dirs for disk-durable sink.
+export EMBARCADERO_REPLICA_DISK_DIRS="/home/domin/Embarcadero/.Replication/disk0,/home/domin/Embarcadero/.Replication/disk1"
+export EMBARCADERO_CXL_SIZE="${EMBARCADERO_CXL_SIZE:-137438953472}"
+export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
 
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
 CLIENT_NUMA_BIND="${CLIENT_NUMA_BIND:-numactl --cpunodebind=0 --membind=0}"
@@ -113,6 +112,10 @@ start_cluster() {
   # Pass RF to embarlet so it initialises the replication chain.
   # Without this, EMBARCADERO_REPLICATION_FACTOR=0 in the broker and ACK=2
   # clients wait forever for a replica that never starts.
+  # Fresh SHM per cluster start to avoid topic count accumulating across attempts.
+  export EMBARCADERO_CXL_SHM_NAME="/CXL_SLOWREP_${UID}_$$_$(date +%s)"
+  # Clean up any previous SHM from this driver instance.
+  rm -f /dev/shm/CXL_SLOWREP_${UID}_* 2>/dev/null || true
   export EMBARCADERO_REPLICATION_FACTOR="$REPLICATION_FACTOR"
   local pids=()
   if [[ "$SEQUENCER" == "CORFU" ]]; then
@@ -152,6 +155,16 @@ start_cluster() {
   fi
 
   wait_for_brokers 90 "$NUM_BROKERS"
+  # Poll per-broker ports so throughput_test does not hit ECONNREFUSED.
+  local _pb=1214 _pt=30 _pp _ts_pp
+  _ts_pp=$(date +%s)
+  for ((_pi=0; _pi<NUM_BROKERS; _pi++)); do
+    _pp=$((_pb + _pi))
+    while ! ss -H -ltn "sport = :$_pp" 2>/dev/null | grep -q .; do
+      [ $(( $(date +%s) - _ts_pp )) -ge $_pt ] && { echo "[WARN] port $_pp not up" >&2; break; }
+      sleep 0.2
+    done
+  done
   rm -f /tmp/embarlet_*_ready
   echo "${pids[*]}"
 }
@@ -223,6 +236,7 @@ run_mode() {
     local broker_pid_line
     broker_pid_line=$(start_cluster)
     read -r -a broker_pids <<<"$broker_pid_line"
+    sleep 30  # Wait for full CXL clear (~20s) + topic manager init before CreateNewTopic gRPC call
 
     if [ "$SLOW_BROKER_INDEX" -lt 0 ] || [ "$SLOW_BROKER_INDEX" -ge "${#broker_pids[@]}" ]; then
       echo "Invalid SLOW_BROKER_INDEX=$SLOW_BROKER_INDEX (pid count=${#broker_pids[@]})" >&2
@@ -249,7 +263,7 @@ run_mode() {
       -t "$TEST_TYPE"
       -o "$ORDER"
       -a "$ack_level"
-      -r "$REPLICATION_FACTOR"
+      -r "$REPLICATION_FACTOR"  # RF=2 for both sub-trials; replica must exist to test independence
       --sequencer "$SEQUENCER"
       --record_results
       -l 0
@@ -257,19 +271,17 @@ run_mode() {
 
     local run_ok=0
     if command -v timeout >/dev/null 2>&1; then
-      if $CLIENT_NUMA_BIND timeout "${RUN_TIMEOUT_SEC}s" "${test_cmd[@]}" 2>&1 | tee "$run_log"; then
+      if $CLIENT_NUMA_BIND timeout "${RUN_TIMEOUT_SEC}s" "${test_cmd[@]}" 2>&1 | tee "$run_log" >/dev/null; then
         run_ok=1
       fi
     else
-      if $CLIENT_NUMA_BIND "${test_cmd[@]}" 2>&1 | tee "$run_log"; then
+      if $CLIENT_NUMA_BIND "${test_cmd[@]}" 2>&1 | tee "$run_log" >/dev/null; then
         run_ok=1
       fi
     fi
 
-    # Check for catastrophic failure strings (not uid-dup from paused-replica scenario).
-    # "Delivery ordering assertion failed" with only dup_uid is expected when the
-    # replica pause causes hold-buffer batch release duplicates at the subscriber;
-    # pub_latency_stats.csv (pub_ack P99) is still valid — copy it regardless.
+    # Reject incomplete or failed benchmark runs.  Latency CSVs are copied for
+    # diagnosis, but their presence alone never makes a trial successful.
     local catastrophic_fail=0
     if grep -Eq "Latency test failed|Subscriber poll timeout|Subscriber::Poll timeout|Exception during latency test|not all messages acknowledged" "$run_log"; then
       catastrophic_fail=1
@@ -277,21 +289,14 @@ run_mode() {
 
     # Always copy latency CSVs if they exist (written before ordering assertion exit).
     # success=1 only when run_ok=1 AND no catastrophic failure.
-    local copied=0
     for f in stage_latency_summary.csv pub_latency_stats.csv latency_stats.csv \
               pub_cdf_latency_us.csv cdf_latency_us.csv; do
       if [ -f "$f" ]; then
         cp "$f" "$run_dir/${f%.csv}_ack${ack_level}.csv"
-        copied=1
       fi
     done
 
     if [ "${run_ok:-0}" -eq 1 ] && [ "$catastrophic_fail" -eq 0 ]; then
-      success=1
-    elif [ "$copied" -eq 1 ] && [ "$catastrophic_fail" -eq 0 ]; then
-      # Ordering assertion failed (likely uid-dup from pause scenario) but latency
-      # CSVs were written — treat as success for P99 extraction purposes.
-      echo "[INFO] Ordering assertion failed (likely pause-induced dup_uid) — treating as success for latency extraction" >&2
       success=1
     fi
 
@@ -366,36 +371,56 @@ echo "system,mode,status,ordered_p99_us,durable_p99_us" > "$RESULT_CSV"
 
 echo "=== Testing SEQUENCER=$SEQUENCER ===" >&2
 
-baseline_row=$(collect_pair "baseline" "0")
-echo "$baseline_row" >> "$RESULT_CSV"
-echo "  baseline: $baseline_row"
+for _trial in $(seq 1 "$NUM_TRIALS"); do
+  _saved_outdir="$OUTDIR"
+  OUTDIR="$OUTDIR/trial_${_trial}"
+  mkdir -p "$OUTDIR"
+  echo "--- Trial $_trial/$NUM_TRIALS ---" >&2
 
-slow_row=$(collect_pair "slow_injected" "1")
-echo "$slow_row" >> "$RESULT_CSV"
-echo "  slow_injected: $slow_row"
+  baseline_row=$(collect_pair "baseline" "0")
+  slow_row=$(collect_pair "slow_injected" "1")
+
+  OUTDIR="$_saved_outdir"
+  echo "$baseline_row" >> "$RESULT_CSV"
+  echo "$slow_row" >> "$RESULT_CSV"
+  echo "  trial $_trial baseline: $baseline_row" >&2
+  echo "  trial $_trial slow:     $slow_row" >&2
+done
 
 # ---------------------------------------------------------------------------
 # Human-readable delta table
 # ---------------------------------------------------------------------------
 awk -F',' '
+function median(values, n, sorted, i, j, tmp) {
+  for (i=1; i<=n; i++) sorted[i]=values[i]
+  for (i=1; i<=n; i++)
+    for (j=i+1; j<=n; j++)
+      if (sorted[i] > sorted[j]) {
+        tmp=sorted[i]; sorted[i]=sorted[j]; sorted[j]=tmp
+      }
+  if (n % 2) return sorted[(n+1)/2]
+  return (sorted[n/2] + sorted[n/2+1]) / 2
+}
 NR==1 {next}
 {
-  system=$1; mode=$2; status=$3; op99=$4; dp99=$5
-  if (mode=="baseline")   { b_o[system]=op99; b_d[system]=dp99 }
-  if (mode=="slow_injected") { s_o[system]=op99; s_d[system]=dp99 }
+  system_name=$1; mode=$2
+  if (mode=="baseline") {
+    ++nb; baseline_ordered[nb]=$4; baseline_durable[nb]=$5
+  }
+  if (mode=="slow_injected") {
+    ++ns; slow_ordered[ns]=$4; slow_durable[ns]=$5
+  }
 }
 END {
   fmt = "%-13s | %-14s | %10s | %10s | %12s | %12s\n"
   printf fmt, "System", "Mode", "ACK1-P99us", "ACK2-P99us", "ACK1-delta%", "ACK2-delta%"
   printf fmt, "-------------", "--------------", "----------", "----------", "------------", "------------"
-  for (sys in b_o) {
-    bo=b_o[sys]+0; bd=b_d[sys]+0
-    so=s_o[sys]+0; sd=s_d[sys]+0
-    dp_o = (bo>0) ? sprintf("+%.1f%%", 100*(so-bo)/bo) : "NA"
-    dp_d = (bd>0) ? sprintf("+%.1f%%", 100*(sd-bd)/bd) : "NA"
-    printf fmt, sys, "baseline",     b_o[sys], b_d[sys], "---", "---"
-    printf fmt, sys, "slow_injected", s_o[sys], s_d[sys], dp_o, dp_d
-  }
+  bo=median(baseline_ordered,nb); bd=median(baseline_durable,nb)
+  so=median(slow_ordered,ns); sd=median(slow_durable,ns)
+  dp_o = (bo>0) ? sprintf("%+.1f%%", 100*(so-bo)/bo) : "NA"
+  dp_d = (bd>0) ? sprintf("%+.1f%%", 100*(sd-bd)/bd) : "NA"
+  printf fmt, system_name, "baseline median", bo, bd, "---", "---"
+  printf fmt, system_name, "slow median", so, sd, dp_o, dp_d
 }
 ' "$RESULT_CSV" || true
 
