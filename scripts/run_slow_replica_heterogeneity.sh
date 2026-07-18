@@ -154,11 +154,22 @@ start_cluster() {
     # chain_replication.cc). Stopping the follower broker blocks its
     # replication_done updates, which LazyLog ordering reads via
     # min(replication_done) in SendLocalProgress.
+    # LAZYLOG_CXL_MODE=1: use CXL-based replica polling (no gRPC replication server needed).
+    # SIGSTOP on a broker stalls replication_done updates, blocking LazyLog ordering.
+    # Memory-copy sink: replication happens via CXL pull, not file writes.
+    LAZYLOG_CXL_MODE=1 \
+    EMBARCADERO_CHAIN_REPLICATION_SINK=memory-copy \
+    EMBARCADERO_CHAIN_REPLICATION_INMEM=1 \
+    EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=1 \
     SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
       $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --head --LAZYLOG \
       >/tmp/hetero_broker_0.log 2>&1 &
     pids+=("$!")
     for ((i=1; i<NUM_BROKERS; i++)); do
+      LAZYLOG_CXL_MODE=1 \
+      EMBARCADERO_CHAIN_REPLICATION_SINK=memory-copy \
+      EMBARCADERO_CHAIN_REPLICATION_INMEM=1 \
+      EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=1 \
       SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
         $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --LAZYLOG \
         >/tmp/hetero_broker_${i}.log 2>&1 &
