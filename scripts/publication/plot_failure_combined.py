@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Generate four-panel broker-failure figure for the Embarcadero paper (Fig3).
+"""Generate the two-panel broker-failure figure for the Embarcadero paper.
 
 Panel (a): arrival-order / hold disabled (sensitivity)
 Panel (b): ORDER=5 prefix-safe hold (contract claim)
-Panel (c): SESSION_FENCED exercise via publisher kill (stub if data unavailable)
-Panel (d): Embarcadero vs. Corfu comparison (stub if data unavailable)
 
 T-event timeline overlay (panels a and b):
   T0 = broker kill issued
@@ -22,13 +20,10 @@ Usage:
   python3 scripts/publication/plot_failure_combined.py \\
     --nohold-dir data/paper_eval/fig3/<pass>/arrival_order \\
     --hold-dir   data/paper_eval/fig3/<pass>/prefix_safe \\
-    [--session-fenced-dir data/paper_eval/fig3/<pass>/session_fenced] \\
-    [--corfu-dir          data/paper_eval/fig3/<pass>/corfu] \\
-    [--emb-dir            data/paper_eval/fig3/<pass>/embarcadero_d] \\
     [--out                data/paper_eval/fig3/<pass>/failure_combined.pdf]
 
 Env-var overrides (lower priority than CLI flags):
-  PANEL_A_DIR, PANEL_B_DIR, PANEL_C_DIR, PANEL_D_EMB_DIR, PANEL_D_CORFU_DIR
+  PANEL_A_DIR, PANEL_B_DIR
 """
 
 from __future__ import annotations
@@ -327,12 +322,12 @@ def _draw_throughput_lines(ax, data, x_sec, broker_cols, failed_idx):
         bnum = col.replace("Broker_", "").replace("_GBps", "")
         if i == failed_idx:
             color = FAILED_COLOR
-            label = f"Log server {bnum} (failed)"
+            label = "Failed log server"
             lw, alpha, zo = 1.4, 0.95, 3
         else:
             color = BROKER_COLORS[safe_idx % len(BROKER_COLORS)]
+            label = "Surviving log servers" if safe_idx == 0 else "_nolegend_"
             safe_idx += 1
-            label = f"Log server {bnum}"
             lw, alpha, zo = 1.2, 0.80, 2
         ax.step(x_sec, display[col], where="post",
                 linewidth=lw, color=color, alpha=alpha, label=label, zorder=zo)
@@ -364,15 +359,57 @@ def _make_ab_panel(ax, run_dir: str, title: str):
     _setup_throughput_ax(ax, title, float(x_sec.max()))
     _draw_throughput_lines(ax, data, x_sec, broker_cols, ev["failed_idx"])
 
-    # Red shading during outage window
-    if ev["kill"] is not None and ev["reroute"] is not None:
-        ax.axvspan(ev["kill"], ev["reroute"], alpha=0.08, color="red", zorder=0)
+    if ev["kill"] is not None:
+        ax.axvline(
+            ev["kill"], color=KILL_COLOR, linestyle="--",
+            linewidth=0.9, alpha=0.8, zorder=5,
+        )
+        ax.text(
+            ev["kill"], YMAX_CAP_GBPS * 0.97, "kill",
+            fontsize=5.5, color=KILL_COLOR, ha="center", va="top",
+            rotation=90, zorder=6,
+        )
 
-    # T-event vertical markers (T0-T6, whichever are populated)
-    _draw_tevent_overlays(ax, ev, YMAX_CAP_GBPS)
-
-    # Interval summary box (bottom-right corner)
-    _draw_interval_box(ax, ev, YMAX_CAP_GBPS)
+    # The ACK-frontier event is the first post-kill point at which cumulative
+    # ACK progress crosses the injected-failure threshold. It is the directly
+    # measured recovery endpoint in both modes.
+    if ev["ack_frontier"] is not None:
+        ax.axvline(
+            ev["ack_frontier"],
+            color="#6a3d9a",
+            linestyle="-.",
+            linewidth=1.0,
+            alpha=0.85,
+            zorder=5,
+        )
+        ax.text(
+            ev["ack_frontier"],
+            YMAX_CAP_GBPS * 0.80,
+            "ACK resumes",
+            fontsize=5.5,
+            color="#6a3d9a",
+            ha="center",
+            va="top",
+            rotation=90,
+            bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.80),
+            zorder=6,
+        )
+        if ev["kill"] is not None:
+            ax.axvspan(
+                ev["kill"], ev["ack_frontier"],
+                alpha=0.07, color="#6a3d9a", zorder=0,
+            )
+            pause_s = ev["ack_frontier"] - ev["kill"]
+            ax.text(
+                (ev["kill"] + ev["ack_frontier"]) / 2,
+                YMAX_CAP_GBPS * 0.58,
+                f"ACK pause\n{pause_s:.2f} s",
+                fontsize=6,
+                color="#4b2a6a",
+                ha="center",
+                va="center",
+                zorder=6,
+            )
 
     return ev, data
 
@@ -530,9 +567,6 @@ def make_panel_d(ax, emb_dir: str | None, corfu_dir: str | None) -> None:
 def make_figure(
     nohold_dir: str,
     hold_dir: str,
-    session_fenced_dir: str | None = None,
-    corfu_dir: str | None = None,
-    emb_dir: str | None = None,
 ) -> plt.Figure:
     plt.rcParams.update({
         "font.family": "serif",
@@ -553,12 +587,11 @@ def make_figure(
     })
 
     fig, axes = plt.subplots(
-        2, 2,
-        figsize=(6.8, 5.5),
+        1, 2,
+        figsize=(6.8, 2.55),
         constrained_layout=True,
     )
-    ax_a, ax_b = axes[0, 0], axes[0, 1]
-    ax_c, ax_d = axes[1, 0], axes[1, 1]
+    ax_a, ax_b = axes
 
     # --- Panel (a): arrival-order / hold disabled ---
     ev_a, data_a = _make_ab_panel(
@@ -574,13 +607,14 @@ def make_figure(
     )
     ax_b.set_ylabel("")
 
-    # Optional backlog-flush callout on panel (b) when peak exceeds y-cap
+    # Note a clipped backlog release without reporting the one-window peak as
+    # sustainable throughput.
     try:
         peak_b = (float(data_b["Total_GBps"].max())
                   if "Total_GBps" in data_b.columns else 0.0)
         if peak_b > YMAX_CAP_GBPS and ev_b.get("reroute") is not None:
             ax_b.annotate(
-                f"backlog\nflush\n({peak_b:.0f} GB/s)",
+                "held ACKs release\n(clipped)",
                 xy=(ev_b["reroute"] + 0.03, YMAX_CAP_GBPS * 0.995),
                 xytext=(ev_b["reroute"] + 0.50, YMAX_CAP_GBPS * 0.62),
                 fontsize=5.5,
@@ -596,16 +630,7 @@ def make_figure(
     ax_a.set_ylim(0, YMAX_CAP_GBPS)
     ax_b.set_ylim(0, YMAX_CAP_GBPS)
 
-    # --- Panel (c): SESSION_FENCED ---
-    make_panel_c(ax_c, session_fenced_dir)
-
-    # --- Panel (d): Embarcadero vs. Corfu ---
-    # If no dedicated emb_dir, reuse hold_dir as Embarcadero representative
-    effective_emb = (emb_dir if (emb_dir and os.path.isdir(emb_dir))
-                     else (hold_dir if corfu_dir else None))
-    make_panel_d(ax_d, effective_emb, corfu_dir)
-
-    # --- Shared legend for panels (a) and (b), placed between rows ---
+    # --- Shared legend for panels (a) and (b) ---
     handles, labels = [], []
     seen: set[str] = set()
     for ax in (ax_a, ax_b):
@@ -619,7 +644,7 @@ def make_figure(
         handles, labels,
         loc="lower center",
         ncol=5,
-        bbox_to_anchor=(0.5, 0.49),
+        bbox_to_anchor=(0.5, -0.01),
         frameon=True,
         handlelength=1.8,
         fontsize=6.5,
@@ -642,15 +667,6 @@ def main(argv=None):
                         "[env: PANEL_A_DIR]")
     p.add_argument("--hold-dir", default="",
                    help="Panel (b) prefix-safe hold run dir [env: PANEL_B_DIR]")
-    p.add_argument("--session-fenced-dir", default="",
-                   help="Panel (c) SESSION_FENCED run dir (optional) "
-                        "[env: PANEL_C_DIR]")
-    p.add_argument("--corfu-dir", default="",
-                   help="Panel (d) Corfu failure run dir (optional) "
-                        "[env: PANEL_D_CORFU_DIR]")
-    p.add_argument("--emb-dir", default="",
-                   help="Panel (d) Embarcadero run dir for comparison "
-                        "(defaults to --hold-dir) [env: PANEL_D_EMB_DIR]")
     p.add_argument(
         "--out",
         default=os.path.join(REPO_ROOT, "Paper", "Figures", "failure_combined.pdf"),
@@ -665,24 +681,12 @@ def main(argv=None):
     hold = (args.hold_dir
             or os.environ.get("PANEL_B_DIR", "")
             or os.path.join(LEGACY_RUNS, "20260402_c4_order5_acked_blogdiag"))
-    session_fenced = (args.session_fenced_dir
-                      or os.environ.get("PANEL_C_DIR", "")) or None
-    corfu = (args.corfu_dir
-             or os.environ.get("PANEL_D_CORFU_DIR", "")) or None
-    emb = (args.emb_dir
-           or os.environ.get("PANEL_D_EMB_DIR", "")) or None
-
     for label, d in (("nohold", nohold), ("hold", hold)):
         if not os.path.isdir(d):
             print(f"ERROR: {label} dir missing: {d}", file=sys.stderr)
             return 1
 
-    fig = make_figure(
-        nohold, hold,
-        session_fenced_dir=session_fenced,
-        corfu_dir=corfu,
-        emb_dir=emb,
-    )
+    fig = make_figure(nohold, hold)
 
     out = args.out
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)

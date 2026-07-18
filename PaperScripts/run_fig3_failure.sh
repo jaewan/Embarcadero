@@ -24,6 +24,8 @@ PASS_ID="${PASS_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$PROJECT_ROOT/data/paper_eval/fig3/$CAMPAIGN_ID}"
 PASS_DIR="$OUT_ROOT/runs/$PASS_ID"
 LOG_DIR="$OUT_ROOT/logs/$PASS_ID"
+GIT_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+GIT_DIRTY_FILES="$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null | wc -l)"
 FIG_PDF="${FIG_PDF:-$OUT_ROOT/failure_combined.pdf}"
 LOCK_FILE="${LOCK_FILE:-/tmp/embarcadero_paper_fig3.lock}"
 FIG2_LOCK="${FIG2_LOCK:-/tmp/embarcadero_paper_fig2.lock}"
@@ -142,6 +144,8 @@ cat > "$OUT_ROOT/campaign_contract.md" <<EOF
 # Fig3 campaign contract
 
 - pass_id: $PASS_ID
+- git_commit: $GIT_COMMIT
+- git_dirty_files: $GIT_DIRTY_FILES
 - panels: arrival_order (a), prefix_safe (b)
 - kill: FAILURE_AFTER_MS=$FAILURE_AFTER_MS
 - bytes: $TOTAL_MESSAGE_SIZE
