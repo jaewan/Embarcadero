@@ -50,7 +50,7 @@ mkdir -p "$LOG_DIR" "$MULTICLIENT_ROOT"
 # --- Knobs: identical to Fig 1 RF2 campaign ---
 NUM_BROKERS=4
 if [[ "$SMOKE_MODE" -eq 1 ]]; then
-    TOTAL_BYTES=$((512 * 1024 * 1024))   # 512 MiB for smoke
+    TOTAL_BYTES=$((2 * 1024 * 1024 * 1024))  # 2 GiB for smoke (enough for overlap window at 6+ GB/s)
     NUM_TRIALS=1
     N_VALUES="1"
 else
@@ -151,15 +151,32 @@ check_no_map_populate() {
 }
 
 # --- Parse overlap CSV and append rows to results CSV ---
+# Primary metric: bandwidth_sum from client trial logs (robust to short overlap windows).
+# overlap_gbps is secondary and may be empty when the publisher finishes faster than
+# the overlap measurement window (common at N=1 or small TOTAL_BYTES).
 append_results() {
     local cell="$1" variant="$2" order="$3" ack="$4" rf="$5" sink_label="$6"
     local n="$7" hosts="$8" cell_rc="$9" mc_log_dir="${10}"
     local overlap_csv="$mc_log_dir/overlap_summary.csv"
     local ok_count=0
 
+    # Build a list of trials from client logs regardless of overlap CSV
+    local trial_logs=()
+    mapfile -t trial_logs < <(ls "$mc_log_dir"/trial*_*.log 2>/dev/null | \
+        grep -oP 'trial\K[0-9]+' | sort -un 2>/dev/null || true)
+    [[ ${#trial_logs[@]} -eq 0 ]] && trial_logs=(1)  # fallback: assume trial 1
+
+    # Load overlap data if present (may have empty rows if window collapsed)
+    declare -A ov_gbps_map ov_ms_map
     if [[ -f "$overlap_csv" ]]; then
         while IFS=',' read -r t ov_gbps ov_ms ov_clients; do
             [[ "$t" == "trial" || -z "$t" ]] && continue
+            ov_gbps_map["$t"]="$ov_gbps"
+            ov_ms_map["$t"]="$ov_ms"
+        done <"$overlap_csv"
+    fi
+
+    for t in "${trial_logs[@]}"; do
             local status="ok"
             [[ "$cell_rc" -ne 0 ]] && status="fail"
             local bw="" sd=""
@@ -169,7 +186,9 @@ append_results() {
             sd="$(grep -hE '\] Bandwidth:.*Send-done:' "$mc_log_dir"/trial${t}_*.log 2>/dev/null \
                 | grep -oiP 'Send-done:\s*\K[0-9]+(\.[0-9]+)?' \
                 | awk '{s+=$1} END{if(NR) printf "%.3f", s/1000.0}')"
-            # Require nonempty bandwidth
+            local ov_gbps="${ov_gbps_map[$t]:-}"
+            local ov_ms="${ov_ms_map[$t]:-}"
+            # bandwidth_sum is the primary success criterion; overlap is secondary
             local notes=""
             if [[ -z "$bw" || "$bw" == "0.000" ]]; then
                 status="fail"; notes="empty_bandwidth"
@@ -184,17 +203,7 @@ with open('$RESULTS_CSV', 'a', newline='') as f:
   "$cell" "$variant" "$order" "$ack" "$rf" "$sink_label" \
   "$n" "$hosts" "$t" "$status" \
   "${bw:-}" "${sd:-}" "${ov_gbps:-}" "${ov_ms:-}" "$notes"
-        done <"$overlap_csv"
-    else
-        python3 -c "
-import csv, sys
-with open('$RESULTS_CSV', 'a', newline='') as f:
-    csv.writer(f).writerow(sys.argv[1:])
-" "$CAMPAIGN_ID" "$PASS_ID" "$(stamp)" \
-  "$GIT_COMMIT" "$GIT_DIRTY" "$BINARY_HASH_EMBARLET" "$BINARY_HASH_CLIENT" \
-  "$cell" "$variant" "$order" "$ack" "$rf" "$sink_label" \
-  "$n" "$hosts" "1" "fail" "" "" "" "" "no_overlap_csv"
-    fi
+    done
     echo "$ok_count"
 }
 

@@ -136,7 +136,7 @@ inline void CopyIntoRing(std::vector<uint8_t>& ring, size_t& write_pos, const vo
 }
 
 inline ChainReplicationSinkMode ParseSinkModeFromEnv() {
-    if (const char* sink = std::getenv("EMBARCADERO_CHAIN_REPLICATION_SINK")) {
+    if (const char* sink = std::getenv("EMBARCADERO_CHAIN_REPLICATION_SINK"); sink && *sink) {
         std::string s(sink);
         for (char& c : s) {
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
