@@ -774,6 +774,38 @@ void QueueBuffer::SetNextBatchSeqForNewSession(size_t next_batch_seq) {
 	batch_seq_.store(next_batch_seq, std::memory_order_relaxed);
 }
 
+bool QueueBuffer::EnqueueBatchForSessionRollover(
+		size_t queue_idx,
+		Embarcadero::BatchHeader* batch) {
+	if (batch == nullptr || queue_idx >= num_queues_) return false;
+	std::unique_lock<std::mutex> lock(session_rollover_mu_);
+	if (!session_rollover_paused_ ||
+	    active_producer_ops_.load(std::memory_order_acquire) != 0 ||
+	    !IsQueueActive(queue_idx)) {
+		LOG(ERROR) << "QueueBuffer::EnqueueBatchForSessionRollover invalid state"
+		           << " queue=" << queue_idx
+		           << " paused=" << (session_rollover_paused_ ? 1 : 0)
+		           << " producer_ops="
+		           << active_producer_ops_.load(std::memory_order_acquire)
+		           << " active=" << (IsQueueActive(queue_idx) ? 1 : 0);
+		return false;
+	}
+	lock.unlock();
+
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!queues_[queue_idx]->write(batch)) {
+		if (shutdown_.load(std::memory_order_acquire) ||
+		    std::chrono::steady_clock::now() >= deadline) {
+			LOG(ERROR) << "QueueBuffer::EnqueueBatchForSessionRollover queue full"
+			           << " queue=" << queue_idx;
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	NotifyQueueDataReady(queue_idx);
+	return true;
+}
+
 void QueueBuffer::ResumeSessionRollover() {
 	{
 		std::lock_guard<std::mutex> lock(session_rollover_mu_);

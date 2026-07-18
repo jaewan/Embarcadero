@@ -353,6 +353,9 @@ class Publisher {
 
 		// Persistent publish channels for ORDER=5 fence/retransmit (avoid one-TCP-per-batch).
 		mutable std::mutex retransmit_channel_mu_;
+		// Serializes sends with epoch-rollover channel invalidation. A
+		// retransmit socket is bound to the epoch negotiated by SessionOpen.
+		std::mutex retransmit_send_mu_;
 		absl::flat_hash_map<int, int> retransmit_channels_;  // broker_id -> connected fd
 
 		// Acknowledgement
@@ -450,10 +453,15 @@ class Publisher {
 			bool Ack2UsesOwnedRtoCopy() const;
 			size_t ComputeUnackedByteCap() const;
 			void ApplyUnackedByteCapBounds();
-			bool SendSessionOpenOnSocket(int sock_fd, int epoll_fd, size_t broker_id);
+			bool SendSessionOpenOnSocket(
+				int sock_fd,
+				int epoll_fd,
+				size_t broker_id,
+				bool allow_fence_recovery = true);
 			bool SendRawBatchToBroker(const void* bytes, size_t wire_bytes, int broker_id);
 			bool EnsureRetransmitChannel(int broker_id, int* out_fd);
 			void CloseRetransmitChannel(int broker_id);
+			void CloseAllRetransmitChannels();
 			void WaitForUnackedCapacity(size_t bytes);
 			// Erase unacked batches with original_batch_seq <= committed_batch_hwm and
 			// advance session_next_retire_batch_seq_ / session_retire_prefix_hwm_ so

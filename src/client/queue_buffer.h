@@ -121,6 +121,12 @@ public:
 	void PauseSessionRollover();
 	size_t SealAllForSessionRollover();
 	void SetNextBatchSeqForNewSession(size_t next_batch_seq);
+	/**
+	 * Requeue an existing pool-owned batch during a paused session rollover.
+	 * The normal PublishThread consumer then reconnects under the new epoch and
+	 * records the batch on the standard ACK path.
+	 */
+	bool EnqueueBatchForSessionRollover(size_t queue_idx, Embarcadero::BatchHeader* batch);
 	void ResumeSessionRollover();
 	void ResetBatchSeqForNewSession();
 

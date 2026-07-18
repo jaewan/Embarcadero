@@ -627,7 +627,11 @@ void Publisher::ApplyUnackedByteCapBounds() {
 	}
 }
 
-bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
+bool Publisher::SendSessionOpenOnSocket(
+		int sock_fd,
+		int,
+		size_t broker_id,
+		bool allow_fence_recovery) {
 	if (!IsOrder5SessionMode()) return true;
 	uint32_t requested = requested_session_epoch_.load(std::memory_order_acquire);
 	if (requested == 0) {
@@ -678,8 +682,6 @@ bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
 	if (!ack.ParseFromString(ack_payload) || ack.assigned_session_epoch() == 0) {
 		return false;
 	}
-	session_epoch_.store(ack.assigned_session_epoch(), std::memory_order_release);
-	requested_session_epoch_.store(ack.assigned_session_epoch(), std::memory_order_release);
 	LOG(INFO) << "[SESSION_OPEN_ACK]"
 	          << " broker_id=" << broker_id
 	          << " client_id=" << client_id_
@@ -689,6 +691,30 @@ bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
 	          << " status=" << ack.status();
 	if (ack.status() == embarcadero::session::SessionOpenAck::FENCED ||
 	    ack.status() == embarcadero::session::SessionOpenAck::EPOCH_STALE) {
+		// Auxiliary retransmit sockets are opened while retransmit_send_mu_ is
+		// held. They must never initiate rollover: doing so can invert
+		// retransmit_send_mu_ and session_fence_handle_mu_ against the primary
+		// ACK thread. Fail closed and let the primary ACK/control path recover.
+		if (!allow_fence_recovery) {
+			LOG(WARNING) << "[SESSION_OPEN_AUX_FENCED]"
+			             << " broker_id=" << broker_id
+			             << " assigned_session_epoch=" << ack.assigned_session_epoch()
+			             << " status=" << ack.status();
+			return false;
+		}
+		// A retransmit connection can race the primary ACK connection that
+		// already started rollover. SendRawBatchToBroker holds
+		// retransmit_send_mu_ while this handshake runs; recursively entering
+		// HandleSessionFenced would then deadlock with the outer handler, which
+		// closes epoch-bound retransmit channels while holding
+		// session_fence_handle_mu_. Let the active handler own recovery.
+		if (session_fenced_reopen_pending_.load(std::memory_order_acquire)) {
+			LOG(WARNING) << "[SESSION_OPEN_FENCE_DEFERRED]"
+			             << " broker_id=" << broker_id
+			             << " assigned_session_epoch=" << ack.assigned_session_epoch()
+			             << " status=" << ack.status();
+			return false;
+		}
 		embarcadero::session::SessionFenced fenced;
 		if (ack.has_committed_prefix()) {
 			fenced.set_committed_batch_seq(ack.committed_hwm());
@@ -703,7 +729,10 @@ bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
 			? embarcadero::session::SessionFenced::EPOCH_STALE
 			: embarcadero::session::SessionFenced::HOLD_EXPIRY);
 		HandleSessionFenced(fenced, static_cast<int>(broker_id));
+		return false;
 	} else if (ack.has_committed_prefix() && IsOrder5SessionMode() && ack_level_ >= 1) {
+		session_epoch_.store(ack.assigned_session_epoch(), std::memory_order_release);
+		requested_session_epoch_.store(ack.assigned_session_epoch(), std::memory_order_release);
 		// Trim optimistic unacked prefix through the inclusive reconnect HWM.
 		// Must advance the retire cursor with the erase — otherwise
 		// CompleteUnackedThrough wedges permanently on a retire gap.
@@ -716,6 +745,9 @@ bool Publisher::SendSessionOpenOnSocket(int sock_fd, int, size_t broker_id) {
 		for (auto* batch : release_after_unlock) {
 			pubQue_.ReleaseBatch(batch);
 		}
+	} else {
+		session_epoch_.store(ack.assigned_session_epoch(), std::memory_order_release);
+		requested_session_epoch_.store(ack.assigned_session_epoch(), std::memory_order_release);
 	}
 	return true;
 }
@@ -1031,7 +1063,13 @@ bool Publisher::EnsureRetransmitChannel(int broker_id, int* out_fd) {
 	shake.port = ack_port_;
 	shake.num_msg = num_brokers;
 	if (!SendAllBlocking(sock.get(), &shake, sizeof(shake))) return false;
-	if (!SendSessionOpenOnSocket(sock.get(), efd.get(), static_cast<size_t>(broker_id))) return false;
+	if (!SendSessionOpenOnSocket(
+		    sock.get(),
+		    efd.get(),
+		    static_cast<size_t>(broker_id),
+		    /*allow_fence_recovery=*/false)) {
+		return false;
+	}
 	if (old_flags >= 0) fcntl(sock.get(), F_SETFL, old_flags);
 
 	const int fd = sock.release();
@@ -1059,8 +1097,32 @@ void Publisher::CloseRetransmitChannel(int broker_id) {
 	retransmit_channels_.erase(it);
 }
 
+void Publisher::CloseAllRetransmitChannels() {
+	// Interrupt any blocked old-epoch send before waiting for the send lock.
+	// Closing first would permit fd reuse while SendRawBatchToBroker still uses
+	// the integer descriptor; shutdown() wakes the send without releasing the fd.
+	{
+		std::lock_guard<std::mutex> channel_lock(retransmit_channel_mu_);
+		for (const auto& [broker_id, fd] : retransmit_channels_) {
+			(void)broker_id;
+			if (fd >= 0) shutdown(fd, SHUT_RDWR);
+		}
+	}
+	// SendRawBatchToBroker does not hold retransmit_channel_mu_ while writing.
+	// Once its send has returned, take both locks in the normal send->channel
+	// order and close descriptors without a close()/fd-reuse race.
+	std::lock_guard<std::mutex> send_lock(retransmit_send_mu_);
+	std::lock_guard<std::mutex> channel_lock(retransmit_channel_mu_);
+	for (auto& [broker_id, fd] : retransmit_channels_) {
+		(void)broker_id;
+		if (fd >= 0) close(fd);
+	}
+	retransmit_channels_.clear();
+}
+
 bool Publisher::SendRawBatchToBroker(const void* bytes, size_t wire_bytes, int broker_id) {
 	if (bytes == nullptr || wire_bytes < sizeof(Embarcadero::BatchHeader)) return false;
+	std::lock_guard<std::mutex> send_lock(retransmit_send_mu_);
 	int fd = -1;
 	if (!EnsureRetransmitChannel(broker_id, &fd) || fd < 0) return false;
 	int old_flags = -1;
@@ -1172,7 +1234,11 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		fenced.has_committed_prefix() ? fenced.committed_batch_seq() : 0,
 		std::memory_order_release);
 	session_fenced_reopen_pending_.store(true, std::memory_order_release);
+	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=pause_begin"
+	             << " old_epoch=" << old_epoch
+	             << " new_epoch=" << new_epoch;
 	pubQue_.PauseSessionRollover();
+	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=pause_done";
 	struct RolloverResumeGuard {
 		Publisher* self;
 		bool active{true};
@@ -1184,13 +1250,22 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		void dismiss() { active = false; }
 	} rollover_guard{this};
 	const size_t sealed = pubQue_.SealAllForSessionRollover();
+	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=seal_done"
+	             << " sealed_messages=" << sealed;
 	if (sealed > 0) {
 		client_order_.fetch_add(sealed, std::memory_order_release);
 	}
 	WaitForSessionSendDrain(client_order_.load(std::memory_order_acquire));
+	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=send_drain_done";
 	requested_session_epoch_.store(new_epoch, std::memory_order_release);
 	session_epoch_.store(new_epoch, std::memory_order_release);
 	last_ack_progress_ns_.store(SteadyNowNs(), std::memory_order_release);
+	// Retransmit sockets are epoch-bound by their SessionOpen handshake. Reusing
+	// an epoch-N socket for epoch N+1 makes the broker reject the correctly
+	// restamped suffix and creates another gap/fence cycle.
+	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=close_retransmit_begin";
+	CloseAllRetransmitChannels();
+	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=close_retransmit_done";
 
 	std::vector<UnackedBatch> suffix;
 	std::vector<Embarcadero::BatchHeader*> release_after_unlock;
@@ -1221,6 +1296,9 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		session_trim_committed_valid_ = false;
 		unacked_cv_.notify_all();
 	}
+	LOG(WARNING) << "[SESSION_ROLLOVER_PHASE] phase=suffix_collected"
+	             << " suffix_batches=" << suffix.size()
+	             << " committed_messages=" << locally_committed_msgs;
 	for (auto* batch : release_after_unlock) {
 		pubQue_.ReleaseBatch(batch);
 	}
@@ -1250,29 +1328,89 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 		session_retire_prefix_hwm_ = rebased_ack_base;
 	}
 
+	// Preserve the retained prefix during recovery by draining it through one
+	// surviving PublishThread. Re-striping a large suffix immediately can make
+	// batch N+K overtake batch N on a different queue and consume the entire
+	// new-session lease before the missing predecessor is dispatched.
+	int recovery_broker = -1;
+	size_t recovery_queue = std::numeric_limits<size_t>::max();
+	{
+		absl::MutexLock lock(&mutex_);
+		for (int candidate : brokers_) {
+			auto it = broker_queue_indices_.find(candidate);
+			if (it == broker_queue_indices_.end()) continue;
+			for (size_t qidx : it->second) {
+				if (!pubQue_.IsQueueActive(qidx)) continue;
+				recovery_broker = candidate;
+				recovery_queue = qidx;
+				break;
+			}
+			if (recovery_broker >= 0) break;
+		}
+	}
+	if (recovery_broker < 0 ||
+	    recovery_queue == std::numeric_limits<size_t>::max()) {
+		LOG(ERROR) << "[SESSION_REOPEN_NO_RECOVERY_QUEUE]"
+		           << " old_epoch=" << old_epoch
+		           << " new_epoch=" << new_epoch;
+		shutdown_.store(true, std::memory_order_release);
+	}
+
 	uint64_t new_seq = 0;
+	size_t requeued_pool_batches = 0;
+	size_t direct_resubmit_batches = 0;
+	LOG(WARNING) << "[SESSION_REOPEN_RESUBMIT_BEGIN]"
+	             << " old_epoch=" << old_epoch
+	             << " new_epoch=" << new_epoch
+	             << " suffix_batches=" << suffix.size()
+	             << " recovery_broker=" << recovery_broker
+	             << " recovery_queue=" << recovery_queue;
 	for (auto& rec : suffix) {
+		if (shutdown_.load(std::memory_order_acquire)) break;
 		auto* header = rec.Header();
 		if (header == nullptr) continue;
 		header->batch_seq = new_seq++;
 		header->session_epoch = static_cast<uint16_t>(new_epoch & 0xFFFFU);
 		header->session_epoch32 = new_epoch;
 		header->client_id = client_id_;
-		std::vector<int> survivors;
-		{
-			absl::MutexLock lock(&mutex_);
-			survivors = brokers_;
+		header->broker_id = static_cast<uint32_t>(recovery_broker);
+		if (rec.pool_batch != nullptr) {
+			if (!pubQue_.EnqueueBatchForSessionRollover(recovery_queue, header)) {
+				LOG(ERROR) << "[SESSION_REOPEN_REQUEUE_FAILED]"
+				           << " epoch=" << new_epoch
+				           << " batch_seq=" << header->batch_seq
+				           << " broker=" << recovery_broker
+				           << " queue=" << recovery_queue;
+				shutdown_.store(true, std::memory_order_release);
+				break;
+			}
+			++requeued_pool_batches;
+			if ((requeued_pool_batches % 64) == 0 ||
+			    requeued_pool_batches == suffix.size()) {
+				LOG(WARNING) << "[SESSION_REOPEN_REQUEUE_PROGRESS]"
+				             << " epoch=" << new_epoch
+				             << " requeued=" << requeued_pool_batches
+				             << " suffix_batches=" << suffix.size();
+			}
+			continue;
 		}
-		const int target = RendezvousBroker(static_cast<uint32_t>(client_id_),
-		                                    header->batch_seq,
-		                                    survivors,
-		                                    -1);
-		if (target < 0) continue;
-		header->broker_id = static_cast<uint32_t>(target);
-		SendRawBatchToBroker(rec.WireBytes(), rec.wire_bytes, target);
+
+		// Owned-copy ACK2 records cannot be placed directly on QueueBuffer's
+		// pool queues. Keep the existing backstop path for that uncommon case;
+		// ACK1 (the failure experiment) always takes the queue path above.
+		if (!SendRawBatchToBroker(
+			    rec.WireBytes(), rec.wire_bytes, recovery_broker)) {
+			LOG(ERROR) << "[SESSION_REOPEN_DIRECT_RESUBMIT_FAILED]"
+			           << " epoch=" << new_epoch
+			           << " batch_seq=" << header->batch_seq
+			           << " broker=" << recovery_broker;
+			shutdown_.store(true, std::memory_order_release);
+			break;
+		}
+		++direct_resubmit_batches;
 		rec.current_batch_seq = header->batch_seq;
 		rec.session_epoch = new_epoch;
-		rec.broker_id = target;
+		rec.broker_id = recovery_broker;
 		rec.attempt = 1;
 		rec.last_send_ns = SteadyNowNs();
 		last_unacked_send_ns_.store(rec.last_send_ns, std::memory_order_release);
@@ -1291,7 +1429,11 @@ void Publisher::HandleSessionFenced(const embarcadero::session::SessionFenced& f
 	             << " old_epoch=" << old_epoch
 	             << " new_epoch=" << new_epoch
 	             << " committed_batch_seq=" << fenced.committed_batch_seq()
-	             << " suffix_batches=" << suffix.size();
+	             << " suffix_batches=" << suffix.size()
+	             << " requeued_pool_batches=" << requeued_pool_batches
+	             << " direct_resubmit_batches=" << direct_resubmit_batches
+	             << " recovery_broker=" << recovery_broker
+	             << " recovery_queue=" << recovery_queue;
 }
 
 void Publisher::RetransmitThread() {
@@ -1303,6 +1445,9 @@ void Publisher::RetransmitThread() {
 		}
 		const double sleep_ms = std::min(delta_ms / 2.0, 2.0);
 		std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int>(sleep_ms * 1000.0)));
+		if (session_fenced_reopen_pending_.load(std::memory_order_acquire)) {
+			continue;
+		}
 
 		// During durable ACK2 drain, suppress RTO storms that re-burn BLog for
 		// already-ingested batches. Allow a slow backstop after prolonged stall so
@@ -1364,6 +1509,14 @@ void Publisher::RetransmitThread() {
 			}
 		}
 		for (auto& rec : due) {
+			// A due snapshot can contain hundreds of batches. Re-check between
+			// sends so rollover does not wait for the entire stale-epoch
+			// snapshot to drain while the retransmit thread repeatedly
+			// reacquires retransmit_send_mu_.
+			if (session_fenced_reopen_pending_.load(std::memory_order_acquire) ||
+			    shutdown_.load(std::memory_order_relaxed)) {
+				break;
+			}
 			std::vector<int> survivors;
 			{
 				absl::MutexLock lock(&mutex_);
@@ -1378,6 +1531,9 @@ void Publisher::RetransmitThread() {
 			header->broker_id = static_cast<uint32_t>(target);
 			header->session_epoch = static_cast<uint16_t>(session_epoch_.load(std::memory_order_acquire) & 0xFFFFU);
 			header->session_epoch32 = session_epoch_.load(std::memory_order_acquire);
+			if (session_fenced_reopen_pending_.load(std::memory_order_acquire)) {
+				break;
+			}
 			if (SendRawBatchToBroker(rec.bytes.data(), rec.bytes.size(), target)) {
 				retransmit_attempts_.fetch_add(1, std::memory_order_relaxed);
 				last_unacked_send_ns_.store(SteadyNowNs(), std::memory_order_release);
@@ -1431,14 +1587,7 @@ Publisher::~Publisher() {
 	if (ack_thread_.joinable()) {
 		ack_thread_.join();
 	}
-	{
-		std::lock_guard<std::mutex> lock(retransmit_channel_mu_);
-		for (auto& [broker_id, fd] : retransmit_channels_) {
-			(void)broker_id;
-			if (fd >= 0) close(fd);
-		}
-		retransmit_channels_.clear();
-	}
+	CloseAllRetransmitChannels();
 
 	if (retransmit_thread_.joinable()) {
 		retransmit_thread_.join();

@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "../src/client/publisher.h"
@@ -109,6 +111,27 @@ struct PublisherTestPeer {
 	static size_t UnackedBatches(Publisher& publisher) {
 		std::lock_guard<std::mutex> lock(publisher.unacked_mu_);
 		return publisher.unacked_batches_.size();
+	}
+
+	static void InstallRetransmitChannel(Publisher& publisher, int broker_id, int fd) {
+		std::lock_guard<std::mutex> lock(publisher.retransmit_channel_mu_);
+		publisher.retransmit_channels_[broker_id] = fd;
+	}
+
+	static size_t RetransmitChannels(Publisher& publisher) {
+		std::lock_guard<std::mutex> lock(publisher.retransmit_channel_mu_);
+		return publisher.retransmit_channels_.size();
+	}
+
+	static void MapQueueToBroker(Publisher& publisher, int broker_id, size_t queue_idx) {
+		absl::MutexLock lock(&publisher.mutex_);
+		publisher.brokers_ = {broker_id};
+		publisher.nodes_[broker_id] = "127.0.0.1:1212";
+		publisher.broker_queue_indices_[broker_id] = {queue_idx};
+	}
+
+	static Embarcadero::BatchHeader* ReadQueue(Publisher& publisher, int queue_idx) {
+		return static_cast<Embarcadero::BatchHeader*>(publisher.pubQue_.Read(queue_idx));
 	}
 };
 
@@ -253,6 +276,72 @@ TEST(Order5PublisherRolloverTest, PublisherFenceAndRetireUseProductionState) {
 
 	PublisherTestPeer::Complete(publisher, committed_msgs + next->num_msg);
 	EXPECT_EQ(PublisherTestPeer::UnackedBatches(publisher), 0u);
+	publisher.WriteFinishedOrPaused();
+}
+
+TEST(Order5PublisherRolloverTest, FenceInvalidatesEpochBoundRetransmitChannels) {
+	setenv("EMBAR_USE_HUGETLB", "0", 1);
+	setenv("NUM_BROKERS", "1", 1);
+	char topic[TOPIC_NAME_SIZE] = {};
+	std::strncpy(topic, "TestTopicEpochChannel", sizeof(topic) - 1);
+	Publisher publisher(topic,
+	                    "127.0.0.1",
+	                    "1212",
+	                    /*num_threads_per_broker=*/1,
+	                    /*message_size=*/64,
+	                    /*queueSize=*/1 << 20,
+	                    Embarcadero::kOrderStrong,
+	                    heartbeat_system::SequencerType::EMBARCADERO);
+	PublisherTestPeer::ConfigureOrder5Session(publisher, 1);
+
+	int sockets[2] = {-1, -1};
+	ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+	PublisherTestPeer::InstallRetransmitChannel(publisher, 0, sockets[0]);
+	ASSERT_EQ(PublisherTestPeer::RetransmitChannels(publisher), 1u);
+
+	PublisherTestPeer::Fence(publisher, 0);
+	EXPECT_EQ(PublisherTestPeer::Epoch(publisher), 2u);
+	EXPECT_EQ(PublisherTestPeer::RetransmitChannels(publisher), 0u);
+	EXPECT_EQ(close(sockets[0]), -1) << "publisher must close the old-epoch fd";
+	close(sockets[1]);
+	publisher.WriteFinishedOrPaused();
+}
+
+TEST(Order5PublisherRolloverTest, FenceRequeuesAck1SuffixOnNormalPublishQueue) {
+	setenv("EMBAR_USE_HUGETLB", "0", 1);
+	setenv("NUM_BROKERS", "1", 1);
+	char topic[TOPIC_NAME_SIZE] = {};
+	std::strncpy(topic, "TestTopicSuffixQueue", sizeof(topic) - 1);
+	Publisher publisher(topic,
+	                    "127.0.0.1",
+	                    "1212",
+	                    /*num_threads_per_broker=*/1,
+	                    /*message_size=*/64,
+	                    /*queueSize=*/1 << 20,
+	                    Embarcadero::kOrderStrong,
+	                    heartbeat_system::SequencerType::EMBARCADERO);
+	PublisherTestPeer::ConfigureOrder5Session(publisher, 1);
+	PublisherTestPeer::MapQueueToBroker(publisher, 0, 0);
+
+	auto* committed = PublisherTestPeer::SealOneBatch(publisher, 1, 0, 4);
+	ASSERT_NE(committed, nullptr);
+	ASSERT_TRUE(PublisherTestPeer::Record(publisher, committed));
+	auto* suffix = PublisherTestPeer::SealOneBatch(publisher, 1, 1, 5);
+	ASSERT_NE(suffix, nullptr);
+	ASSERT_TRUE(PublisherTestPeer::Record(publisher, suffix));
+	PublisherTestPeer::SetClientOrder(
+		publisher, committed->num_msg + suffix->num_msg);
+
+	PublisherTestPeer::Fence(publisher, 0);
+	EXPECT_EQ(PublisherTestPeer::Epoch(publisher), 2u);
+	EXPECT_EQ(PublisherTestPeer::UnackedBatches(publisher), 0u)
+		<< "normal PublishThread must re-record the requeued suffix";
+
+	auto* requeued = PublisherTestPeer::ReadQueue(publisher, 0);
+	ASSERT_EQ(requeued, suffix);
+	EXPECT_EQ(requeued->session_epoch32, 2u);
+	EXPECT_EQ(requeued->batch_seq, 0u);
+	PublisherTestPeer::ReleasePoolBatch(publisher, requeued);
 	publisher.WriteFinishedOrPaused();
 }
 
