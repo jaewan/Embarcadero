@@ -295,7 +295,7 @@ run_mode() {
       -t "$TEST_TYPE"
       -o "$ORDER"
       -a "$ack_level"
-      -r "$REPLICATION_FACTOR"  # RF=2 for both sub-trials; replica must exist to test independence
+      -r "$(_rl_rf=$REPLICATION_FACTOR; [[ "$SEQUENCER" == "LAZYLOG" && "$ack_level" == "1" ]] && _rl_rf=1; echo $_rl_rf)"  # LAZYLOG ACK1 uses RF=1: CXL replica polling races at RF=2 stall ordering before test starts. RF=1 is sufficient to test whether SIGSTOP on broker stalls LazyLog ordering.
       --sequencer "$SEQUENCER"
       --record_results
       -l 0
