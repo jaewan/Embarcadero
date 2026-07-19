@@ -59,7 +59,7 @@ if [[ "$OUTDIR" != /* ]]; then
 fi
 mkdir -p "$OUTDIR"
 # Clear any stale /dev/shm CXL segments from prior runs
-cleanup_shm_stale
+rm -f /dev/shm/CXL_* /dev/shm/cxl_* 2>/dev/null || true
 
 # Resolve BROKER_IP for SCALOG local-sequencer mode (SKIP_REMOTE_SCALOG_SEQUENCER=1)
 BROKER_IP=${BROKER_IP:-$(hostname -I | awk '{print $1}')}
@@ -154,7 +154,7 @@ start_cluster() {
   elif [[ "$SEQUENCER" == "LAZYLOG" ]]; then
     # LazyLog global sequencer runs locally; SKIP_REMOTE_LAZYLOG_SEQUENCER=1
     # tells embarlet not to SSH out for it.
-    SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
+    SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" EMBARCADERO_NUM_BROKERS="$NUM_BROKERS" \
       ./lazylog_global_sequencer >/tmp/hetero_lazylog_sequencer.log 2>&1 &
     SEQUENCER_PID="$!"
     sleep 1
@@ -183,16 +183,16 @@ start_cluster() {
     LAZYLOG_CXL_MODE=1 \
     EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable \
     EMBARCADERO_REPLICA_DISK_DIRS="$EMBARCADERO_REPLICA_DISK_DIRS" \
-    SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
-      $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --head --LAZYLOG \
+    SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" EMBARCADERO_NUM_BROKERS="$NUM_BROKERS" \
+      $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --head --LAZYLOG --replicate_to_disk \
       >/tmp/hetero_broker_0.log 2>&1 &
     pids+=("$!")
     for ((i=1; i<NUM_BROKERS; i++)); do
       LAZYLOG_CXL_MODE=1 \
       EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable \
       EMBARCADERO_REPLICA_DISK_DIRS="$EMBARCADERO_REPLICA_DISK_DIRS" \
-      SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
-        $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --LAZYLOG \
+      SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" EMBARCADERO_NUM_BROKERS="$NUM_BROKERS" \
+        $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --LAZYLOG --replicate_to_disk \
         >/tmp/hetero_broker_${i}.log 2>&1 &
       pids+=("$!")
     done
