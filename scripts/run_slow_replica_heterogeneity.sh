@@ -187,7 +187,7 @@ start_cluster() {
   wait_for_brokers 120 "$NUM_BROKERS"
   # All broker readyfiles written. Poll the single head management port (12140)
   # until it accepts connections, then sleep 15s to let followers fully init.
-  local _ts_pp _pt=60
+  local _ts_pp _pt=120
   _ts_pp=$(date +%s)
   while ! nc -z 127.0.0.1 12140 2>/dev/null; do
     [ $(( $(date +%s) - _ts_pp )) -ge $_pt ] && { echo "[WARN] head mgmt port 12140 not up after ${_pt}s" >&2; break; }
