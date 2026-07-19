@@ -293,6 +293,24 @@ run_mode() {
       inject_slowdown "${broker_pids[$SLOW_BROKER_INDEX]}" "$(lazylog_inject_delay)"
     fi
 
+    # ─── Replication-ready warmup ─────────────────────────────────────────────
+    # Send 16 MiB without recording latency to trigger the first fdatasync cycle
+    # on all ReplicaPollingLoop threads. Without this, replication_done stays at
+    # kReplicationNotStarted and LazyLog's min(replication_done) is always 0,
+    # causing a permanent 75% ACK stall in the baseline trial.
+    if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+      echo "  [warmup] initializing replication_done for LAZYLOG (16 MiB, no record)..." >&2
+      local warmup_ok=0
+      $CLIENT_NUMA_BIND timeout 120s ./throughput_test         --config "../../${CLIENT_CONFIG}"         -n "$THREADS_PER_BROKER" -m "$MESSAGE_SIZE" -s $((16*1024*1024))         -t "$TEST_TYPE" -o "$ORDER" -a "$ack_level" -r "$REPLICATION_FACTOR"         --sequencer "$SEQUENCER" -l 0 >/dev/null 2>&1 && warmup_ok=1 || warmup_ok=0
+      if [[ "$warmup_ok" -eq 1 ]]; then
+        echo "  [warmup] done — sleeping 5s for replication_done to settle" >&2
+        sleep 5
+      else
+        echo "  [warmup] WARN: failed — replication may not be ready; proceeding anyway" >&2
+        sleep 3
+      fi
+    fi
+
     rm -f stage_latency_summary.csv pub_latency_stats.csv latency_stats.csv \
           pub_cdf_latency_us.csv cdf_latency_us.csv
 
