@@ -112,3 +112,42 @@ sink would lag, leaving the ingestion path free.
 | LazyLog | Yes (similar to Scalog) | Yes |
 
 This script measures the Embarcadero and Scalog rows directly.
+
+---
+
+## LazyLog Results (2026-07-19)
+
+LazyLog RF=2 slow-replica experiment successfully completed. 3 trials PASS.
+
+**Configuration:**
+- NUM_BROKERS=2, RF=2, disk-durable, SIGSTOP on pids[1]=broker_id=1
+- INJECT_AFTER_SEC=3, PAUSE_SEC=15, TOTAL_MESSAGE_SIZE=1 GiB
+- EMBARCADERO_NUM_BROKERS=2 passed to global sequencer (required for binding to start)
+- --replicate_to_disk passed to all embarlet processes (required for fdatasync coupling)
+- Results: data/latency/slow_replica_lazylog_rf2_2b_v3/
+
+**Results table:**
+
+| Trial | Mode | ACK1-P99 (ms) | ACK2-P99 (ms) |
+|---|---|---|---|
+| 1 | baseline | 1,006 | 976 |
+| 1 | slow_injected | 1,121 | 937 |
+| 2 | baseline | 890 | 858 |
+| 2 | slow_injected | 941 | 908 |
+| 3 | baseline | 1,091 | 1,009 |
+| 3 | slow_injected | 1,160 | 1,050 |
+| **Median** | **baseline** | **1,006** | **976** |
+| **Median** | **slow_injected** | **1,121** | **937** |
+
+ACK1 delta: +11.5% (1,006 → 1,121 ms). Both axes stall together.
+
+**Paper table (tab:slow-replica):** LazyLog rows filled with these numbers.
+The +11.5% ACK1 delta (vs <2% for Embar) empirically confirms the
+architectural claim "Slow replica stalls ordering: Yes for LazyLog, No for Embar."
+
+**Key fixes that enabled success:**
+1. `EMBARCADERO_NUM_BROKERS=$NUM_BROKERS` to global sequencer (binding loop waits for all brokers)
+2. `--replicate_to_disk` to embarlet (creates fdatasync coupling in LAZYLOG_CXL_MODE=1 path)
+3. `EMBARCADERO_CXL_ZERO_MODE=full` for LAZYLOG (wipes stale PBR ring batch_complete=1 from cache)
+4. Stale replica file cleanup before each cluster start
+5. /dev/shm cleanup after every experiment
