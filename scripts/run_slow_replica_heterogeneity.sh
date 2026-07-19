@@ -58,6 +58,8 @@ if [[ "$OUTDIR" != /* ]]; then
   OUTDIR="$PROJECT_ROOT/$OUTDIR"
 fi
 mkdir -p "$OUTDIR"
+# Clear any stale /dev/shm CXL segments from prior runs
+cleanup_shm_stale
 
 # Resolve BROKER_IP for SCALOG local-sequencer mode (SKIP_REMOTE_SCALOG_SEQUENCER=1)
 BROKER_IP=${BROKER_IP:-$(hostname -I | awk '{print $1}')}
@@ -85,7 +87,21 @@ cleanup() {
   pkill -9 -f "corfu_global_sequencer" >/dev/null 2>&1 || true
   pkill -9 -f "lazylog_global_sequencer" >/dev/null 2>&1 || true
   rm -f /tmp/embarlet_*_ready >/dev/null 2>&1 || true
+  # Clear ALL Embarcadero CXL shared memory segments from /dev/shm.
+  # Stale segments from crashed or killed runs accumulate and cause
+  # EEXIST errors or wrong-experiment state on the next cluster start.
+  rm -f /dev/shm/CXL_* /dev/shm/cxl_* 2>/dev/null || true
   SEQUENCER_PID=""
+}
+
+# Also clear stale /dev/shm at script startup before any cluster starts.
+cleanup_shm_stale() {
+  local before_count
+  before_count=$(ls /dev/shm/CXL_* /dev/shm/cxl_* 2>/dev/null | wc -l)
+  if [ "$before_count" -gt 0 ]; then
+    echo "[shm-clean] removing $before_count stale CXL shm segment(s) from /dev/shm" >&2
+    rm -f /dev/shm/CXL_* /dev/shm/cxl_* 2>/dev/null || true
+  fi
 }
 
 wait_for_brokers() {
