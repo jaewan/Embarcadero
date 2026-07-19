@@ -73,7 +73,14 @@ unset EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY 2>/dev/null || true
 # Set replica disk dirs for disk-durable sink.
 export EMBARCADERO_REPLICA_DISK_DIRS="/home/domin/Embarcadero/.Replication/disk0,/home/domin/Embarcadero/.Replication/disk1"
 export EMBARCADERO_CXL_SIZE="${EMBARCADERO_CXL_SIZE:-137438953472}"
-export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
+# LAZYLOG needs full CXL clear to wipe stale batch_complete=1 in PBR rings.
+# metadata mode only clears sequencer structures; PBR batch-header rings
+# retain stale data that causes DelegationThread stalls on empty slots.
+if [[ "${SEQUENCER:-EMBARCADERO}" == "LAZYLOG" ]]; then
+  export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-full}"
+else
+  export EMBARCADERO_CXL_ZERO_MODE="${EMBARCADERO_CXL_ZERO_MODE:-metadata}"
+fi
 
 EMBARLET_NUMA_BIND="${EMBARLET_NUMA_BIND:-numactl --cpunodebind=1 --membind=1,2}"
 CLIENT_NUMA_BIND="${CLIENT_NUMA_BIND:-numactl --cpunodebind=0 --membind=0}"
