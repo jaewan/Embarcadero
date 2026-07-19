@@ -150,26 +150,24 @@ start_cluster() {
       pids+=("$!")
     done
   elif [[ "$SEQUENCER" == "LAZYLOG" ]]; then
-    # LazyLog: SIGSTOP injection (not sync-sleep, which only exists in
-    # chain_replication.cc). Stopping the follower broker blocks its
-    # replication_done updates, which LazyLog ordering reads via
-    # min(replication_done) in SendLocalProgress.
-    # LAZYLOG_CXL_MODE=1: use CXL-based replica polling (no gRPC replication server needed).
-    # SIGSTOP on a broker stalls replication_done updates, blocking LazyLog ordering.
-    # Memory-copy sink: replication happens via CXL pull, not file writes.
+    # LazyLog: SIGSTOP injection to stall replication_done.
+    # LAZYLOG_CXL_MODE=1: CXL-based replica polling writes replication_done
+    # only after the replica-side fdatasync completes (disk-durable sink).
+    # With disk-durable: SIGSTOP on broker 1 freezes its fdatasync, which
+    # freezes its replication_done update, which blocks broker 0's
+    # SendLocalProgress (min(replication_done) stays stuck), stalling ordering.
+    # disk-durable sink creates the ~50-200ms fdatasync window that SIGSTOP hits.
     LAZYLOG_CXL_MODE=1 \
-    EMBARCADERO_CHAIN_REPLICATION_SINK=memory-copy \
-    EMBARCADERO_CHAIN_REPLICATION_INMEM=1 \
-    EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=1 \
+    EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable \
+    EMBARCADERO_REPLICA_DISK_DIRS="$EMBARCADERO_REPLICA_DISK_DIRS" \
     SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
       $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --head --LAZYLOG \
       >/tmp/hetero_broker_0.log 2>&1 &
     pids+=("$!")
     for ((i=1; i<NUM_BROKERS; i++)); do
       LAZYLOG_CXL_MODE=1 \
-      EMBARCADERO_CHAIN_REPLICATION_SINK=memory-copy \
-      EMBARCADERO_CHAIN_REPLICATION_INMEM=1 \
-      EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=1 \
+      EMBARCADERO_CHAIN_REPLICATION_SINK=disk-durable \
+      EMBARCADERO_REPLICA_DISK_DIRS="$EMBARCADERO_REPLICA_DISK_DIRS" \
       SKIP_REMOTE_LAZYLOG_SEQUENCER=1 EMBARCADERO_LAZYLOG_SEQ_IP="$BROKER_IP" \
         $EMBARLET_NUMA_BIND ./embarlet --config "../../${CONFIG}" --LAZYLOG \
         >/tmp/hetero_broker_${i}.log 2>&1 &
@@ -206,15 +204,29 @@ INJECT_BG_PID=""
 
 inject_slowdown() {
   local pid=$1
+  local delay=${2:-$INJECT_AFTER_SEC}  # optional per-call override
   # SKIP_SIGSTOP=1: rely only on EMBARCADERO_SYNC_SLEEP_MS, no SIGSTOP.
   if [ "${SKIP_SIGSTOP:-0}" = "1" ]; then return 0; fi
   (
-    sleep "$INJECT_AFTER_SEC"
+    sleep "$delay"
     kill -STOP "$pid" >/dev/null 2>&1 || true
     sleep "$PAUSE_SEC"
     kill -CONT "$pid" >/dev/null 2>&1 || true
   ) &
   INJECT_BG_PID=$!
+}
+
+# Per-sequencer injection delay (seconds after test start).
+# EMBARCADERO: 20s (sync-sleep runs throughout 180s test; early is fine).
+# LAZYLOG: 3s  (test runs ~10-60s depending on data; must fire EARLY to
+#               catch messages mid-binding, not after all messages are bound).
+# SCALOG:  20s (same as EMBARCADERO default; test runs long enough).
+lazylog_inject_delay() {
+  if [[ "$SEQUENCER" == "LAZYLOG" ]]; then
+    echo "${LAZYLOG_INJECT_AFTER_SEC:-3}"
+  else
+    echo "$INJECT_AFTER_SEC"
+  fi
 }
 
 kill_inject_bg() {
@@ -278,7 +290,7 @@ run_mode() {
     fi
 
     if [ "$inject" = "1" ]; then
-      inject_slowdown "${broker_pids[$SLOW_BROKER_INDEX]}"
+      inject_slowdown "${broker_pids[$SLOW_BROKER_INDEX]}" "$(lazylog_inject_delay)"
     fi
 
     rm -f stage_latency_summary.csv pub_latency_stats.csv latency_stats.csv \
@@ -296,7 +308,7 @@ run_mode() {
       -t "$TEST_TYPE"
       -o "$ORDER"
       -a "$ack_level"
-      -r "$(_rl_rf=$REPLICATION_FACTOR; [[ "$SEQUENCER" == "LAZYLOG" && "$ack_level" == "1" ]] && _rl_rf=1; echo $_rl_rf)"  # LAZYLOG ACK1 uses RF=1: CXL replica polling races at RF=2 stall ordering before test starts. RF=1 is sufficient to test whether SIGSTOP on broker stalls LazyLog ordering.
+      -r "$REPLICATION_FACTOR"  # RF=2 for all sub-trials. LazyLog ACK1 requires RF=2: at RF=1 replication_done is self-only and advances immediately on memory-copy ingest, so SIGSTOP has nothing to stall. At RF=2 stopping broker 1 withholds its replication_done from broker 0's TInode, blocking broker 0's local_progress report and stalling ordering.
       --sequencer "$SEQUENCER"
       --record_results
       -l 0
