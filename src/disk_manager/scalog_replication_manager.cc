@@ -910,6 +910,35 @@ namespace Scalog {
 		                         int target_broker_id, int source_broker_id,
 		                         bool track_local_cut, const char* context) {
 			if (!sync.has_pending) return true;
+			// Controlled, replica-specific delay for the Scalog/LazyLog durability
+			// coupling experiment. Target and source identify one follower copy;
+			// the primary, coordinator, network, and other replica threads remain
+			// untouched. Disabled unless all three variables match.
+			static const int64_t sync_sleep_ms = [] {
+				const char* value =
+				    std::getenv("EMBARCADERO_SCALOG_SYNC_SLEEP_MS");
+				return value ? std::atoll(value) : 0LL;
+			}();
+			static const int sync_sleep_target = [] {
+				const char* value =
+				    std::getenv("EMBARCADERO_SCALOG_SYNC_SLEEP_TARGET_BROKER");
+				return value ? std::atoi(value) : -1;
+			}();
+			static const int sync_sleep_source = [] {
+				const char* value =
+				    std::getenv("EMBARCADERO_SCALOG_SYNC_SLEEP_SOURCE_BROKER");
+				return value ? std::atoi(value) : -1;
+			}();
+			if (sync_sleep_ms > 0 &&
+			    target_broker_id == sync_sleep_target &&
+			    source_broker_id == sync_sleep_source) {
+				LOG(INFO) << "[SCALOG_SYNC_SLEEP] delay_ms=" << sync_sleep_ms
+				          << " target_broker=" << target_broker_id
+				          << " source_broker=" << source_broker_id
+				          << " context=" << context;
+				std::this_thread::sleep_for(
+				    std::chrono::milliseconds(sync_sleep_ms));
+			}
 			if (Embarcadero::DurableFdatasync(fd) == -1) {
 				LOG(ERROR) << context << ": amortized fdatasync failed: " << strerror(errno);
 				return false;
