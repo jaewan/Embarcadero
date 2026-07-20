@@ -259,96 +259,6 @@ def write_mechanism_summary(
     print(f"wrote {mech_pdf}")
 
 
-def median(vals: list[float]) -> float:
-    if not vals:
-        return float("nan")
-    s = sorted(vals)
-    n = len(s)
-    mid = n // 2
-    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
-
-
-def write_epoch_table(rows: list[dict[str, str]], out_dir: str) -> None:
-    """Write tab:epoch-sweep LaTeX table and text summary to stdout."""
-    epoch_rows = [r for r in rows if r.get("panel") == "epoch_sweep"]
-    if not epoch_rows:
-        print("No epoch_sweep rows found in results CSV — run SKIP_EPOCH_SWEEP=0 first.")
-        return
-
-    # Group by tau (epoch_us column)
-    by_tau: dict[int, dict[str, list[float]]] = defaultdict(
-        lambda: {"p50": [], "p99": []}
-    )
-    for r in epoch_rows:
-        try:
-            tau = int(float(r.get("epoch_us") or "0"))
-            p50 = float(r["pub_ack_p50_us"])
-            p99 = float(r["pub_ack_p99_us"])
-        except (KeyError, ValueError, TypeError):
-            continue
-        by_tau[tau]["p50"].append(p50)
-        by_tau[tau]["p99"].append(p99)
-
-    if not by_tau:
-        print("epoch_sweep rows present but no valid pub_ack percentiles found.")
-        return
-
-    taus = sorted(by_tau.keys())
-
-    # Text table header
-    print("\nEpoch tau sweep — timer quantization proof")
-    print(f"{'tau (µs)':>10}  {'P50 med':>10}  {'P50 std':>8}  {'P99 med':>10}  {'P99 std':>8}  {'P99/tau':>8}  {'n':>3}")
-    print("-" * 70)
-    tex_rows: list[tuple[int, float, float, float, float, float]] = []
-    for tau in taus:
-        d = by_tau[tau]
-        p50_med = median(d["p50"])
-        p99_med = median(d["p99"])
-        p50_std = (sum((x - p50_med)**2 for x in d["p50"]) / len(d["p50"]))**0.5 if len(d["p50"]) > 1 else 0.0
-        p99_std = (sum((x - p99_med)**2 for x in d["p99"]) / len(d["p99"]))**0.5 if len(d["p99"]) > 1 else 0.0
-        ratio = p99_med / tau if tau > 0 else float("nan")
-        n = len(d["p99"])
-        print(f"{tau:>10}  {p50_med:>10.0f}  {p50_std:>8.0f}  {p99_med:>10.0f}  {p99_std:>8.0f}  {ratio:>8.2f}  {n:>3}")
-        tex_rows.append((tau, p50_med, p50_std, p99_med, p99_std, ratio))
-    print()
-
-    # LaTeX table — includes std columns and a note that P99 ~ 2*tau + const_jitter
-    tex_lines = [
-        r"\begin{table}[t]",
-        r"\centering",
-        r"\footnotesize",
-        r"\caption{Epoch $\tau$ sensitivity at fixed 250\,MB/s offered load (Embar O5 RF\,=\,2 DRAM, 5 trials, warmup\,=\,1)."
-        r" P50\,$\approx$\,$\tau/2$ across all points; P99\,$\approx$\,$2\tau + c$ where constant $c\approx 80\,\mu$s"
-        r" reflects CXL scan jitter. P99/$\tau$ approaches 2 as $\tau$ grows and $c/\tau\to 0$."
-        r" Decreasing P99 std confirms the tail is timer-bounded, not load-driven.}",
-        r"\label{tab:epoch-sweep}",
-        r"\setlength{\tabcolsep}{4pt}",
-        r"\begin{tabular}{rrrrrrr}",
-        r"\toprule",
-        r"$\tau$ & \multicolumn{2}{c}{P50 ($\mu$s)} & \multicolumn{2}{c}{P99 ($\mu$s)} & P99/$\tau$ & $n$ \\",
-        r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}",
-        r"($\mu$s) & med & std & med & std & & \\",
-        r"\midrule",
-    ]
-    for tau, p50_med, p50_std, p99_med, p99_std, ratio in tex_rows:
-        if math.isnan(p50_med) or math.isnan(p99_med):
-            continue
-        tex_lines.append(
-            f"{tau} & {p50_med:.0f} & {p50_std:.0f} & {p99_med:.0f} & {p99_std:.0f} & {ratio:.2f} & 5 \\\\"
-        )
-    tex_lines += [
-        r"\bottomrule",
-        r"\end{tabular}",
-        r"\end{table}",
-    ]
-    tex_str = "\n".join(tex_lines) + "\n"
-
-    out_path = Path(out_dir) / "fig2_epoch_sweep_table.tex"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(tex_str)
-    print(f"wrote {out_path}")
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--csv", required=True)
@@ -364,11 +274,6 @@ def main() -> None:
         help="ack = append→ack (paper claim); deliver = publish→deliver inset",
     )
     ap.add_argument("--metric", choices=("p50", "p99", "both"), default="both")
-    ap.add_argument(
-        "--epoch-table",
-        action="store_true",
-        help="Generate tab:epoch-sweep LaTeX table from epoch_sweep panel rows",
-    )
     args = ap.parse_args()
 
     rows = load_ok(args.csv)
@@ -437,9 +342,6 @@ def main() -> None:
     if mech_pdf is None and args.pdf.endswith(".pdf"):
         mech_pdf = str(Path(args.pdf).with_name("fig2_mechanism_ablation.pdf"))
     write_mechanism_summary(rows, mech_csv, mech_pdf)
-
-    if args.epoch_table:
-        write_epoch_table(rows, str(Path(args.csv).parent))
 
 
 if __name__ == "__main__":

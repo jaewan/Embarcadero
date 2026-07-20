@@ -34,8 +34,6 @@ Latency cells (E3 / E9 latency) still use `RUNTIME_MODE=latency` and do **not** 
 | `run_fig2_latency_vs_load.sh` | **Fig 2** latency vs load: primary Embar **O5 ACK2 RF2**; matched-load mechanism ablation (O0/O5/ACK2); optional 1–2 baseline points. |
 | `plot_fig2_latency_vs_load.py` | Plot Fig 2 load sweep + mechanism table/bar |
 | `FIG2.md` | Fig 2 draft + caveats (RF2 primary, mechanism table, pacing) |
-| `run_fig3_failure.sh` | **Fig 3** broker-kill ACK throughput: prefix-safe hold vs arrival-order sensitivity |
-| `FIG3.md` | Fig 3 contract + knobs |
 | `run_e2_throughput_matrix.sh` | Wait for idle cluster → E2 N=1 Embar+baselines matrix |
 | `run_overnight_eval.sh` | Full paper overnight (E2 + E3 + E9 + E8) |
 | `run_order5_latency_package.sh` | ORDER=5 latency package (wraps `scripts/publication/`) |
