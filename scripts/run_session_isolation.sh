@@ -195,12 +195,50 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
   done
 
   echo "Waiting for brokers to be ready (timeout=${BROKER_READY_TIMEOUT_SEC}s)..."
-  broker_wait_for_ready_files "$NUM_BROKERS" "$BROKER_READY_TIMEOUT_SEC" || {
-    echo "ERROR: brokers not ready" >&2
-    for pid in "${local_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
-    cleanup
-    continue
-  }
+  # Use run_failures.sh-style wait: poll readyfiles for each PID
+  head_pid="${local_pids[0]}"
+  follower_pids=("${local_pids[@]:1}")
+  # Wait for head
+  start_wait=$(date +%s)
+  while true; do
+    if [ -f "/tmp/embarlet_${head_pid}_ready" ]; then
+      rm -f "/tmp/embarlet_${head_pid}_ready"
+      break
+    fi
+    if ! kill -0 "$head_pid" 2>/dev/null; then
+      echo "ERROR: head broker $head_pid died" >&2
+      for pid in "${local_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+      cleanup; continue 2
+    fi
+    elapsed=$(( $(date +%s) - start_wait ))
+    if [ "$elapsed" -ge "$BROKER_READY_TIMEOUT_SEC" ]; then
+      echo "ERROR: head broker not ready in ${BROKER_READY_TIMEOUT_SEC}s" >&2
+      for pid in "${local_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+      cleanup; continue 2
+    fi
+    sleep 0.5
+  done
+  # Wait for all followers
+  for fpid in "${follower_pids[@]}"; do
+    start_f=$(date +%s)
+    while true; do
+      if [ -f "/tmp/embarlet_${fpid}_ready" ]; then
+        rm -f "/tmp/embarlet_${fpid}_ready"
+        break
+      fi
+      if ! kill -0 "$fpid" 2>/dev/null; then
+        echo "ERROR: follower broker $fpid died" >&2
+        for pid in "${local_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+        cleanup; continue 3
+      fi
+      if [ "$(( $(date +%s) - start_f ))" -ge "$BROKER_READY_TIMEOUT_SEC" ]; then
+        echo "ERROR: follower $fpid not ready" >&2
+        for pid in "${local_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+        cleanup; continue 3
+      fi
+      sleep 0.5
+    done
+  done
   echo "All $NUM_BROKERS brokers ready."
 
   # Launch all sessions concurrently — one per broker
