@@ -1,0 +1,5 @@
+Stage,Average,Min,p50,p99,p999,Max,Count
+append_send_to_ordered,426130,7737,251149,1.25597e+06,1.25748e+06,1.25748e+06,169
+append_send_to_ack,426130,7737,251149,1.25597e+06,1.25748e+06,1.25748e+06,169
+append_send_to_deliver,445409,7974,263082,1.26726e+06,1.27556e+06,1.27764e+06,262144
+monotonic_ordered_le_ack_le_deliver,,,,,,,1

@@ -3,8 +3,10 @@
 #
 # Runs the shared-log KV store in --fifo_valid mode: one client session issues
 # pipelined, versioned overwrites that stripe across all brokers; the run is
-# Valid iff every key's final value is the LAST version submitted for it
-# (session FIFO), store size stays record_count, and applied == published.
+# Valid iff the apply path observes zero session-order inversions, every key's
+# final value is the LAST version submitted for it, store size stays
+# record_count, and applied == published.  The apply-order condition is
+# independent: later writes can hide an inversion from the final-state sweep.
 #
 # Matrix: sequencers x selected modes x trials.
 #   pipe      : sync_interval=0  (max pipeline; Embar's claimed setting)

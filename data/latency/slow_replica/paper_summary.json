@@ -1,0 +1,63 @@
+{
+  "groups": {
+    "EMBARCADERO.ack1.baseline": {
+      "median_p99_us": 1091.0,
+      "n": 3,
+      "values_p99_us": [
+        931.0,
+        1494.0,
+        1091.0
+      ]
+    },
+    "EMBARCADERO.ack1.ratio": 1.0320806599450045,
+    "EMBARCADERO.ack1.slow_injected": {
+      "median_p99_us": 1126.0,
+      "n": 3,
+      "values_p99_us": [
+        1203.0,
+        935.0,
+        1126.0
+      ]
+    },
+    "EMBARCADERO.ack2.baseline": {
+      "median_p99_us": 411054.0,
+      "n": 3,
+      "values_p99_us": [
+        392098.0,
+        411054.0,
+        425107.0
+      ]
+    },
+    "EMBARCADERO.ack2.ratio": 25.485459331377385,
+    "EMBARCADERO.ack2.slow_injected": {
+      "median_p99_us": 10475900.0,
+      "n": 3,
+      "values_p99_us": [
+        10475100.0,
+        10479600.0,
+        10475900.0
+      ]
+    },
+    "SCALOG.ack1.baseline": {
+      "median_p99_us": 268305.0,
+      "n": 3,
+      "values_p99_us": [
+        269458.0,
+        265380.0,
+        268305.0
+      ]
+    },
+    "SCALOG.ack1.ratio": 4.682916829727363,
+    "SCALOG.ack1.slow_injected": {
+      "median_p99_us": 1256450.0,
+      "n": 3,
+      "values_p99_us": [
+        1255970.0,
+        1256450.0,
+        1257380.0
+      ]
+    }
+  },
+  "rows_csv": "data/latency/slow_replica/paper_stage_rows.csv",
+  "selection": "all three per-trial stage summaries; no fallback/copy-success rows"
+}

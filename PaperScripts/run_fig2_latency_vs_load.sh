@@ -44,6 +44,8 @@ DELIVER_PDF="$OUT_ROOT/fig2_deliver_inset.pdf"
 LOCK_FILE="${LOCK_FILE:-/tmp/embarcadero_paper_fig2.lock}"
 
 mkdir -p "$LOG_DIR" "$LATENCY_ROOT"
+PROVENANCE_DIR="$OUT_ROOT/provenance/$PASS_ID"
+mkdir -p "$PROVENANCE_DIR"
 
 # ---------------------------------------------------------------------------
 # Fig2 publication knobs
@@ -309,6 +311,56 @@ write_campaign_contract() {
 - Replica dirs (disk ablation): $REPLICA_DISK_DIRS_CONFIG
 - Requires \`-DCOLLECT_LATENCY_STATS=ON\`
 EOF
+}
+
+write_provenance() {
+  local client_hash=""
+  sha256sum \
+    "$PROJECT_ROOT/build/bin/embarlet" \
+    "$PROJECT_ROOT/build/bin/throughput_test" \
+    "$PROJECT_ROOT/config/embarcadero.yaml" \
+    "$PROJECT_ROOT/config/client.yaml" \
+    >"$PROVENANCE_DIR/local_sha256.txt"
+  git rev-parse HEAD >"$PROVENANCE_DIR/git_commit.txt"
+  git status --short >"$PROVENANCE_DIR/git_status.txt"
+  git diff --binary >"$PROVENANCE_DIR/working_tree.patch"
+  sha256sum "$PROVENANCE_DIR/working_tree.patch" >"$PROVENANCE_DIR/working_tree_patch.sha256"
+  {
+    echo "campaign_id=$CAMPAIGN_ID"
+    echo "pass_id=$PASS_ID"
+    echo "load_points_mbps=$LOAD_POINTS_MBPS"
+    echo "target_trials=$TARGET_TRIALS"
+    echo "sweep_passes=$SWEEP_PASSES"
+    echo "total_bytes=$TOTAL_BYTES"
+    echo "msg_size=$MSG_SIZE"
+    echo "num_brokers=$NUM_BROKERS"
+    echo "epoch_us=$EMBAR_ORDER5_EPOCH_US"
+    echo "pacing_mode=$PACING_MODE"
+    echo "client_host=$CLIENT_HOST"
+    echo "cxl_size=$EMBARCADERO_CXL_SIZE"
+    echo "cxl_zero_mode=$EMBARCADERO_CXL_ZERO_MODE"
+    echo "cxl_map_populate=$EMBARCADERO_CXL_MAP_POPULATE"
+    echo "primary_sink=memory-copy"
+    echo "primary_rf=2"
+    echo "primary_ack=2"
+    echo "delivery_timeout_sec=${EMBARCADERO_E2E_TIMEOUT_SEC:-auto}"
+  } >"$PROVENANCE_DIR/parameters.env"
+  if [[ "$CLIENT_HOST" != "local" ]]; then
+    ssh -o BatchMode=yes "$CLIENT_HOST" \
+      'cd ~/Embarcadero && git rev-parse HEAD && git status --short' \
+      >"$PROVENANCE_DIR/client_git_state.txt" 2>&1 || true
+    ssh -o BatchMode=yes "$CLIENT_HOST" \
+      'sha256sum ~/Embarcadero/build/bin/throughput_test' \
+      >"$PROVENANCE_DIR/client_binary_sha256.txt" 2>&1 || true
+    client_hash="$(awk '{print $1}' "$PROVENANCE_DIR/client_binary_sha256.txt" 2>/dev/null || true)"
+    local local_hash
+    local_hash="$(sha256sum "$PROJECT_ROOT/build/bin/throughput_test" | awk '{print $1}')"
+    if [[ -z "$client_hash" || "$client_hash" != "$local_hash" ]]; then
+      log "FATAL: remote throughput_test hash does not match local binary"
+      return 1
+    fi
+  fi
+  cp "$CONTRACT_MD" "$PROVENANCE_DIR/campaign_contract.md"
 }
 
 is_cluster_busy() {
@@ -644,6 +696,7 @@ log "INCLUDE_BASELINES=$INCLUDE_BASELINES BASELINE_LOADS=$BASELINE_LOAD_MBPS"
 log "SKIP_RF0_COMPANION=$SKIP_RF0_COMPANION SKIP_NOLINGER=$SKIP_NOLINGER SKIP_LAZYLOG=$SKIP_LAZYLOG"
 
 preflight_fig2
+write_provenance
 
 # A non-mutating validation mode is useful before reserving the cluster for a
 # publication pass.  It intentionally runs after the complete preflight,

@@ -1,0 +1,193 @@
+{
+  "contract": {
+    "ack": 2,
+    "brokers": 4,
+    "git_commit": "3eaadffb61eb3c4698aeb16a1cc845ed456ea035",
+    "message_bytes": 4096,
+    "n_eq_4_metric": "bandwidth_sum_gbps",
+    "n_le_3_metric": "overlap_gbps",
+    "rf": 2,
+    "selection": "all status=ok rows at commit; no outlier filtering"
+  },
+  "generator": {
+    "path": "PaperScripts/plot_fig1_throughput_scaling.py",
+    "sha256": "4941a617de4815575f62409820fb89d84a9b1206b66bd29a0fe9b5b2928018fb"
+  },
+  "inputs": {
+    "data/paper_eval/fig1/fig1_embar_official_3eaadffb/results.csv": "ea8e3c9974627fafc65c5ecdaef6732b7413fc8e828e46a1968959a821e2d937",
+    "data/paper_eval/fig1/fig1_scalog_official_3eaadffb/results.csv": "76013cf083427d1f98a3d8f97ea7a3cbeb4ac580e993bc9587753c35282b8640"
+  },
+  "outputs": {
+    "data/paper_eval/fig1/throughput_scaling.pdf": "6094d772ce12396cc4ab0c6b3aeb266cbf19959e7bcd7206cb0e8ce00fe20cb6",
+    "data/paper_eval/fig1/throughput_scaling.png": "8b04b02045cd9ee79c1ff6cfdb3bd91011ae4856faaaaeb9883d80ad00fc2778"
+  },
+  "selected_rows_csv": "data/paper_eval/fig1/fig1_fixed_commit_3eaadffb_selected.csv",
+  "summary": {
+    "embar.disk.n1": {
+      "median_gbps": 1.331833941,
+      "n": 3,
+      "stddev_gbps": 0.017658958800157734,
+      "values_gbps": [
+        1.331833941,
+        1.314498737,
+        1.349814688
+      ]
+    },
+    "embar.disk.n2": {
+      "median_gbps": 1.297952068,
+      "n": 3,
+      "stddev_gbps": 0.041048692239898904,
+      "values_gbps": [
+        1.361767892,
+        1.285131456,
+        1.297952068
+      ]
+    },
+    "embar.disk.n3": {
+      "median_gbps": 1.227919251,
+      "n": 3,
+      "stddev_gbps": 0.03791895173163805,
+      "values_gbps": [
+        1.268936553,
+        1.193185469,
+        1.227919251
+      ]
+    },
+    "embar.disk.n4": {
+      "median_gbps": 1.35124,
+      "n": 3,
+      "stddev_gbps": 0.012196999631056842,
+      "values_gbps": [
+        1.35124,
+        1.34982,
+        1.37162
+      ]
+    },
+    "embar.mem.n1": {
+      "median_gbps": 6.546305149,
+      "n": 5,
+      "stddev_gbps": 2.6516852153902235,
+      "values_gbps": [
+        6.546305149,
+        6.65550054,
+        0.664117301,
+        6.524026315,
+        6.642429235
+      ]
+    },
+    "embar.mem.n2": {
+      "median_gbps": 6.036039712,
+      "n": 5,
+      "stddev_gbps": 0.6151216331513656,
+      "values_gbps": [
+        6.036039712,
+        6.087931942,
+        4.803675096,
+        6.405797286,
+        5.676528666
+      ]
+    },
+    "embar.mem.n3": {
+      "median_gbps": 5.955267273,
+      "n": 5,
+      "stddev_gbps": 0.6080825909400069,
+      "values_gbps": [
+        5.827658517,
+        4.748299382,
+        6.307254328,
+        5.955267273,
+        6.102490647
+      ]
+    },
+    "embar.mem.n4": {
+      "median_gbps": 7.83051,
+      "n": 3,
+      "stddev_gbps": 0.22629248131566396,
+      "values_gbps": [
+        7.4387,
+        7.83079,
+        7.83051
+      ]
+    },
+    "scalog.disk.n1": {
+      "median_gbps": 1.233264758,
+      "n": 3,
+      "stddev_gbps": 0.015215044819889938,
+      "values_gbps": [
+        1.233264758,
+        1.218237772,
+        1.24866709
+      ]
+    },
+    "scalog.disk.n2": {
+      "median_gbps": 1.29067058,
+      "n": 3,
+      "stddev_gbps": 0.029164449787668627,
+      "values_gbps": [
+        1.325120151,
+        1.29067058,
+        1.267132445
+      ]
+    },
+    "scalog.disk.n3": {
+      "median_gbps": 1.326358807,
+      "n": 3,
+      "stddev_gbps": 0.04808080883235532,
+      "values_gbps": [
+        1.263032405,
+        1.326358807,
+        1.357366314
+      ]
+    },
+    "scalog.disk.n4": {
+      "median_gbps": 1.31548,
+      "n": 3,
+      "stddev_gbps": 0.020214928477076895,
+      "values_gbps": [
+        1.32978,
+        1.31548,
+        1.28988
+      ]
+    },
+    "scalog.mem.n1": {
+      "median_gbps": 6.168034284,
+      "n": 3,
+      "stddev_gbps": 0.3186435063618134,
+      "values_gbps": [
+        5.807969656,
+        6.168034284,
+        6.443376706
+      ]
+    },
+    "scalog.mem.n2": {
+      "median_gbps": 6.530761718,
+      "n": 3,
+      "stddev_gbps": 0.4347815208275367,
+      "values_gbps": [
+        7.24709272,
+        6.462011145,
+        6.530761718
+      ]
+    },
+    "scalog.mem.n3": {
+      "median_gbps": 6.423140388,
+      "n": 3,
+      "stddev_gbps": 0.2733145552269635,
+      "values_gbps": [
+        6.423140388,
+        5.951088412,
+        6.425814499
+      ]
+    },
+    "scalog.mem.n4": {
+      "median_gbps": 7.95197,
+      "n": 3,
+      "stddev_gbps": 0.3029003104983553,
+      "values_gbps": [
+        7.66366,
+        7.95197,
+        8.26923
+      ]
+    }
+  }
+}

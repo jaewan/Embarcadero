@@ -1,0 +1,28 @@
+{
+  "cell": "fig2_embar_o5_ack2_rf2_mem",
+  "git_commits": [
+    "806b18093cd809d50b4370ce0ce4e34538ec4881"
+  ],
+  "input": "data/paper_eval/fig2/fig2_append_latency_primary_806b1809/results.csv",
+  "input_sha256": "ffb092650b9eca807f3e84830f1f4a74a62e447c9f38ec844788ac6e81ce0781",
+  "loads_mbps": [
+    100,
+    250,
+    500,
+    750,
+    1000,
+    1500,
+    2000
+  ],
+  "pass_ids": [
+    "20260720T173531Z",
+    "20260720T174733Z"
+  ],
+  "required_trials_per_load": 3,
+  "selection": "all status=ok steady RF2 ACK2 memory-copy rows",
+  "summary_csv": "data/paper_eval/fig2/fig2_append_latency_primary_806b1809/primary_summary.csv",
+  "validator": {
+    "path": "/home/domin/Embarcadero/PaperScripts/summarize_fig2_primary.py",
+    "sha256": "7b0ab11b53603ee1c814048c085380782f3c3353f990fbdd13e61ca5b4a65430"
+  }
+}

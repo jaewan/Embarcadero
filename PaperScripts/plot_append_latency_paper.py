@@ -51,8 +51,15 @@ def median(vals):
     return (s[n//2-1] + s[n//2]) / 2 if n % 2 == 0 else s[n//2]
 
 
-def plot(csv_path: str, pdf_path: str, png_path: str | None):
+def plot(csv_path: str, pdf_path: str, png_path: str | None, require_trials: int):
     p50s, p99s = load(csv_path)
+    bad = {load: len(values) for load, values in p50s.items()
+           if len(values) != require_trials}
+    if bad:
+        raise SystemExit(
+            f"primary plot requires exactly {require_trials} successful trials "
+            f"per load; got {bad}"
+        )
 
     loads = sorted(p50s.keys())
     x   = np.array(loads, dtype=float)
@@ -99,11 +106,15 @@ def plot(csv_path: str, pdf_path: str, png_path: str | None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default="data/paper_eval/fig2/fig2_append_latency/results.csv")
+    ap.add_argument(
+        "--csv",
+        default="data/paper_eval/fig2/fig2_append_latency_primary_806b1809/results.csv",
+    )
     ap.add_argument("--pdf", default="Paper/Figures/append_latency.pdf")
     ap.add_argument("--png", default="Paper/Figures/append_latency.png")
+    ap.add_argument("--require-trials", type=int, default=3)
     args = ap.parse_args()
-    plot(args.csv, args.pdf, args.png)
+    plot(args.csv, args.pdf, args.png, args.require_trials)
 
 
 if __name__ == "__main__":

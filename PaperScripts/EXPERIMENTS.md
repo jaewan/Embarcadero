@@ -7,16 +7,30 @@ the data directory with results, and the plot script.
 
 ### Fig 1 — ACK-paced throughput scaling (RF=2/ACK2)
 - **Script:** `PaperScripts/run_fig1_throughput_scaling.sh`
-- **Data:** `data/paper_eval/fig1/fig1_rf2_ack2_scaling/results.csv`
+- **Data:** fixed-commit campaigns
+  `data/paper_eval/fig1/fig1_{embar,scalog}_official_3eaadffb/results.csv`
 - **Plot:** `PaperScripts/plot_fig1_throughput_scaling.py`
-- **Notes:** Embar O5 + Corfu + Scalog × {disk, mem}. LazyLog excluded (metadata-bound; see FIG2_LAZYLOG.md).
+- **Manifest:** `data/paper_eval/fig1/fig1_fixed_commit_3eaadffb_manifest.json`
+- **Selected rows:** `data/paper_eval/fig1/fig1_fixed_commit_3eaadffb_selected.csv`
+- **Generated figure:** `data/paper_eval/fig1/throughput_scaling.{pdf,png}`
+- **Notes:** The plot accepts every successful row at commit `3eaadffb`; no
+  performance-based outlier filtering. N<=3 uses overlap throughput and N=4
+  uses ACK-drain aggregate bandwidth.
 
 ### Fig 2 — Append latency vs offered load (mechanism proof)
 - **Script:** `PaperScripts/run_fig2_latency_vs_load.sh`
-- **Data:** `data/paper_eval/fig2/fig2_append_latency/results.csv`
-- **Plot:** `PaperScripts/plot_fig2_latency_vs_load.py`
+- **Primary validator:** `PaperScripts/summarize_fig2_primary.py` (requires
+  exactly 3 successful steady-rate trials at every load)
+- **Primary data:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/results.csv`
+- **Primary summary:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/primary_summary.csv`
+- **Primary manifest:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/primary_manifest.json`
+- **Paper plot:** `PaperScripts/plot_append_latency_paper.py`
+- **Full diagnostic plot:** `PaperScripts/plot_fig2_latency_vs_load.py`
 - **Notes:** Also produces Tab. epoch-sweep and the mechanism ablation.
   Corfu/Scalog comparison: `data/paper_eval/fig2/fig2_corfu_official_3eaadffb/` and `fig2_scalog_official_3eaadffb/`.
+  Each new pass stores the commit, complete working-tree patch, binary/config
+  hashes, remote-client binary hash, and parameters under
+  `<campaign>/provenance/<pass-id>/`.
 
 ### Fig 3 — Failure and per-session recovery
 - **Script:** `PaperScripts/run_fig3_failure.sh`
@@ -27,7 +41,7 @@ the data directory with results, and the plot script.
 
 ### Tab. latency-sweep — Embar append latency across load
 - **Script:** `PaperScripts/run_fig2_latency_vs_load.sh` (subset of Fig 2 campaign)
-- **Data:** `data/paper_eval/fig2/fig2_append_latency/results.csv` (Embar rows)
+- **Data:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/primary_summary.csv`
 
 ### Tab. epoch-sweep — Epoch-period causal proof
 - **Script:** `PaperScripts/run_fig2_latency_vs_load.sh` (epoch sweep cells)
@@ -44,13 +58,19 @@ the data directory with results, and the plot script.
 
 ### Tab. slow-replica — Ordering-replication independence
 - **Script:** `scripts/run_slow_replica_heterogeneity.sh`
-- **Data (Embar):** `data/latency/slow_replica/EMBARCADERO/`
-  - Baseline: ACK1 P99 ~1.1ms, ACK2 P99 ~409ms
-  - Slow-sync: ACK1 P99 ~1.1ms (unchanged), ACK2 P99 ~10,472ms (+25.6×)
-- **Data (LazyLog):** `data/latency/slow_replica_lazylog_rf2_2b_v3/`
-  - Baseline: ACK1 P99 ~1,006ms, ACK2 P99 ~976ms
-  - Slow-stop: ACK1 P99 ~1,121ms (+11.5%), ACK2 P99 ~937ms (within noise)
+- **Aggregator:** `PaperScripts/build_slow_replica_summary.py`
+- **Data (Embar):** `data/latency/slow_replica/trial_{1,2,3}/EMBARCADERO/`
+  - Baseline: ACK1 P99 1.091ms, ACK2 P99 411ms
+  - Slow-sync: ACK1 P99 1.126ms, ACK2 P99 10,476ms (+25.5×)
+- **Data (Scalog):**
+  `data/latency/slow_replica_scalog_ack1_official_806b1809/trial_{1,2,3}/SCALOG/`
+- **LazyLog:** not reported; its paced fault workload failed the fail-closed
+  delivery checker.
 - **Notes:** See `PaperScripts/SLOW_REPLICA.md` for full config and analysis.
+  The paper-facing canonical source is
+  `data/latency/slow_replica/paper_stage_rows.csv` with hashes and
+  `paper_summary.json`; the legacy root `slow_replica_comparison.csv` is not
+  used because a later failed LazyLog attempt overwrote it.
 
 ### Tab. ablation-throughput — Throughput path ablation
 - **Script:** `PaperScripts/run_fig1_path_decomp.sh`
@@ -62,4 +82,3 @@ the data directory with results, and the plot script.
 - **Script:** `PaperScripts/run_fig1_throughput_scaling.sh` with `SKIP_LAZYLOG=0`
 - **Plan:** `PaperScripts/FIG2_LAZYLOG.md`
 - **Status:** Pending end-to-end hardware validation runs.
-

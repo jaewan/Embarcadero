@@ -19,6 +19,7 @@ import csv
 import statistics
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 SYSTEM_LABEL = {
     "EMBARCADERO": "Embarcadero",
@@ -52,7 +53,11 @@ def aggregate(rows):
         )
         valid = all(r["valid"] == "1" for r in rs) and not apply_order_invalid
         fifo_modes = {r.get("fifo_mode", "") for r in rs}
-        failed = {r.get("failed_checks", "none") for r in rs} - {"none"}
+        failed = set()
+        for row in rs:
+            for check in row.get("failed_checks", "none").split("+"):
+                if check and check != "none":
+                    failed.add(check)
         if apply_order_invalid:
             failed.add("session_fifo_apply_order")
         out[key] = {
@@ -65,6 +70,24 @@ def aggregate(rows):
             "key_reorders": max(int(r.get("key_reorders", 0) or 0) for r in rs),
         }
     return out
+
+
+def self_test():
+    """Regression: a repaired final state must not hide an apply inversion."""
+    base = {
+        "sequencer": "LAZYLOG",
+        "mode": "pipe",
+        "write_throughput_ops_sec": "1",
+        "fifo_valid": "1",
+        "fifo_mode": "none",
+        "final_mismatch_keys": "0",
+        "key_reorders": "0",
+        "failed_checks": "none",
+    }
+    repaired = dict(base, valid="1", session_reorders="5161")
+    correct = dict(base, valid="1", session_reorders="0")
+    assert aggregate([repaired])[("LAZYLOG", "pipe")]["valid"] is False
+    assert aggregate([correct])[("LAZYLOG", "pipe")]["valid"] is True
 
 
 def fmt_ops(v):
@@ -176,11 +199,16 @@ def make_plots(agg, outdir):
 
 
 def main():
+    self_test()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--csv", required=True, help="aggregated summary.csv")
     ap.add_argument("--outdir", required=True, help="directory for PDFs")
     ap.add_argument("--markdown", help="write markdown table here")
     args = ap.parse_args()
+
+    Path(args.outdir).mkdir(parents=True, exist_ok=True)
+    if args.markdown:
+        Path(args.markdown).parent.mkdir(parents=True, exist_ok=True)
 
     rows = load_rows(args.csv)
     if not rows:
