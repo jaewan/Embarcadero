@@ -321,6 +321,62 @@ size_t GetOrder5HomeBrokers() {
 	return static_cast<size_t>(parsed);
 }
 
+std::vector<int> GetOrder5BrokerAllowlist() {
+	const char* env = std::getenv("EMBARCADERO_ORDER5_BROKER_ALLOWLIST");
+	if (!env || env[0] == '\0') return {};
+
+	std::vector<int> brokers;
+	std::stringstream input(env);
+	std::string item;
+	while (std::getline(input, item, ',')) {
+		if (item.empty()) {
+			throw std::invalid_argument(
+			    std::string("empty broker in EMBARCADERO_ORDER5_BROKER_ALLOWLIST='") +
+			    env + "'");
+		}
+		char* end = nullptr;
+		long parsed = std::strtol(item.c_str(), &end, 10);
+		if (end == item.c_str() || *end != '\0' || parsed < 0 ||
+		    parsed >= NUM_MAX_BROKERS) {
+			throw std::invalid_argument(
+			    std::string("invalid broker '") + item +
+			    "' in EMBARCADERO_ORDER5_BROKER_ALLOWLIST='" + env + "'");
+		}
+		if (std::find(brokers.begin(), brokers.end(), static_cast<int>(parsed)) !=
+		    brokers.end()) {
+			throw std::invalid_argument(
+			    std::string("duplicate broker ") + std::to_string(parsed) +
+			    " in EMBARCADERO_ORDER5_BROKER_ALLOWLIST='" + env + "'");
+		}
+		brokers.push_back(static_cast<int>(parsed));
+	}
+	return brokers;
+}
+
+uint64_t GetOrder5GapBatchSeq() {
+	const char* env = std::getenv("EMBARCADERO_ORDER5_GAP_BATCH_SEQ");
+	if (!env || env[0] == '\0') return UINT64_MAX;
+	char* end = nullptr;
+	unsigned long long parsed = std::strtoull(env, &end, 10);
+	if (end == env || *end != '\0') {
+		throw std::invalid_argument(
+		    std::string("invalid EMBARCADERO_ORDER5_GAP_BATCH_SEQ='") + env + "'");
+	}
+	return static_cast<uint64_t>(parsed);
+}
+
+int GetOrder5GapDelayMs() {
+	const char* env = std::getenv("EMBARCADERO_ORDER5_GAP_DELAY_MS");
+	if (!env || env[0] == '\0') return 0;
+	char* end = nullptr;
+	long parsed = std::strtol(env, &end, 10);
+	if (end == env || *end != '\0' || parsed < 0 || parsed > 60000) {
+		throw std::invalid_argument(
+		    std::string("invalid EMBARCADERO_ORDER5_GAP_DELAY_MS='") + env + "'");
+	}
+	return static_cast<int>(parsed);
+}
+
 // Multi-client SessionOpen storms can exceed the old 1s reply window (N=2×24
 // threads). Override with EMBARCADERO_SESSION_OPEN_TIMEOUT_SEC.
 int GetSessionOpenTimeoutSec() {
@@ -391,6 +447,9 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 	broker_stats_(NUM_MAX_BROKERS),
 	start_time_(std::chrono::steady_clock::now()),  // Initialize immediately
 	order5_home_brokers_(GetOrder5HomeBrokers()),
+	order5_broker_allowlist_(GetOrder5BrokerAllowlist()),
+	order5_gap_batch_seq_(GetOrder5GapBatchSeq()),
+	order5_gap_delay_ms_(GetOrder5GapDelayMs()),
 	expected_num_brokers_(0)
 #ifdef COLLECT_LATENCY_STATS
 	,send_records_per_broker_(NUM_MAX_BROKERS),
@@ -431,6 +490,16 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 }
 
 std::vector<int> Publisher::Order5HomeBrokerIdsLocked() const {
+	if (!order5_broker_allowlist_.empty()) {
+		std::vector<int> allowed;
+		allowed.reserve(order5_broker_allowlist_.size());
+		for (int broker_id : order5_broker_allowlist_) {
+			if (std::find(brokers_.begin(), brokers_.end(), broker_id) != brokers_.end()) {
+				allowed.push_back(broker_id);
+			}
+		}
+		return allowed;
+	}
 	if (order5_home_brokers_ == 0 || brokers_.empty()) {
 		return brokers_;
 	}
@@ -452,7 +521,8 @@ std::vector<int> Publisher::Order5HomeBrokerIdsLocked() const {
 }
 
 bool Publisher::ShouldConnectPublishThreadsToBrokerLocked(int broker_id) const {
-	if (!IsOrder5SessionMode() || order5_home_brokers_ == 0) {
+	if (!IsOrder5SessionMode() ||
+	    (order5_home_brokers_ == 0 && order5_broker_allowlist_.empty())) {
 		return true;
 	}
 	const std::vector<int> homes = Order5HomeBrokerIdsLocked();
@@ -462,7 +532,7 @@ bool Publisher::ShouldConnectPublishThreadsToBrokerLocked(int broker_id) const {
 void Publisher::RefreshOrder5PreferredQueuesLocked() {
 	if (seq_type_ != heartbeat_system::SequencerType::EMBARCADERO ||
 	    order_level_ != Embarcadero::kOrderStrong ||
-	    order5_home_brokers_ == 0 ||
+	    (order5_home_brokers_ == 0 && order5_broker_allowlist_.empty()) ||
 	    brokers_.empty()) {
 		pubQue_.ClearPreferredQueues();
 		return;
@@ -509,6 +579,13 @@ void Publisher::LogOrder5RoutingSummary() const {
 	std::ostringstream oss;
 	oss << "[ORDER5_ROUTING] client_id=" << client_id_
 	    << " home_brokers=" << order5_home_brokers_;
+	if (!order5_broker_allowlist_.empty()) {
+		oss << " allowlist=";
+		for (size_t i = 0; i < order5_broker_allowlist_.size(); ++i) {
+			if (i != 0) oss << ",";
+			oss << order5_broker_allowlist_[i];
+		}
+	}
 	for (size_t broker_id = 0; broker_id < broker_stats_.size(); ++broker_id) {
 		const size_t sent = broker_stats_[broker_id].sent_messages.load(std::memory_order_relaxed);
 		if (sent == 0) continue;
@@ -2086,6 +2163,18 @@ bool Publisher::Init(int ack_level) {
 		}
 		{
 			absl::MutexLock lock(&mutex_);
+			if (!order5_broker_allowlist_.empty()) {
+				for (int broker_id : order5_broker_allowlist_) {
+					if (broker_id >= expected_num_brokers_ ||
+					    std::find(brokers_.begin(), brokers_.end(), broker_id) ==
+					        brokers_.end()) {
+						LOG(ERROR) << "Publisher::Init() ORDER=5 allowlist broker "
+						           << broker_id << " is not in the connected "
+						           << expected_num_brokers_ << "-broker cluster";
+						return false;
+					}
+				}
+			}
 			RefreshOrder5PreferredQueuesLocked();
 		}
 	}
@@ -3884,6 +3973,34 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				// Join-timeout / fail-closed path: drop this batch and exit so Poll can finish.
 				pubQue_.ReleaseBatch(batch_header);
 				break;
+			}
+			if (IsOrder5SessionMode() && order5_gap_delay_ms_ > 0 &&
+			    batch_header->batch_seq == order5_gap_batch_seq_ &&
+			    !order5_gap_injected_.exchange(true, std::memory_order_acq_rel)) {
+				const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				    std::chrono::system_clock::now().time_since_epoch()).count();
+				long long origin_ms = 0;
+				if (const char* origin =
+				        std::getenv("EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS")) {
+					char* end = nullptr;
+					origin_ms = std::strtoll(origin, &end, 10);
+					if (end == origin || *end != '\0') origin_ms = 0;
+				}
+				LOG(WARNING) << "[ORDER5_GAP_INJECT] phase=start batch_seq="
+				             << batch_header->batch_seq
+				             << " delay_ms=" << order5_gap_delay_ms_
+				             << " wall_ms=" << wall_ms
+				             << " event_rel_ms="
+				             << (origin_ms > 0 ? wall_ms - origin_ms : -1);
+				std::this_thread::sleep_for(
+				    std::chrono::milliseconds(order5_gap_delay_ms_));
+				const auto end_wall_ms =
+				    std::chrono::duration_cast<std::chrono::milliseconds>(
+				        std::chrono::system_clock::now().time_since_epoch())
+				        .count();
+				LOG(WARNING) << "[ORDER5_GAP_INJECT] phase=end batch_seq="
+				             << batch_header->batch_seq
+				             << " wall_ms=" << end_wall_ms;
 			}
 
 		// Function to send batch header

@@ -347,6 +347,12 @@ class Publisher {
 		std::vector<int> brokers_;
 		absl::flat_hash_map<int, std::vector<size_t>> broker_queue_indices_ ABSL_GUARDED_BY(mutex_);
 		size_t order5_home_brokers_{0};
+		// Optional explicit per-process routing set for controlled failure-isolation
+		// experiments. Empty preserves the production full-stripe/home behavior.
+		std::vector<int> order5_broker_allowlist_;
+		uint64_t order5_gap_batch_seq_{UINT64_MAX};
+		int order5_gap_delay_ms_{0};
+		std::atomic<bool> order5_gap_injected_{false};
 		// [[FIX: B2=0 ACKs]] Track which brokers have publisher threads to handle late registration
 		absl::flat_hash_set<int> brokers_with_threads_ ABSL_GUARDED_BY(mutex_);
 		char topic_[TOPIC_NAME_SIZE];

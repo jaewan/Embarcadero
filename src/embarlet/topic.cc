@@ -5211,10 +5211,12 @@ void Topic::CommitEpoch(
             // Publish GOI index last so readers never treat a partially-written entry as valid.
             entry->global_seq = batch_index;
             if (ShouldEnableOrder5SessionTestTrace()) {
+                const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
                 LOG(WARNING) << "[ORDER5_TEST_GOI_COMMIT]" << " client=" << m.client_id
                              << " session_epoch=" << m.session_epoch << " batch_seq=" << m.batch_seq
                              << " goi=" << batch_index << " pbr=" << m.pbr_absolute_index
-                             << " from_hold=1";
+                             << " from_hold=1 wall_ms=" << wall_ms;
             }
             next_order += m.num_msg;
         } else if (p.hdr != nullptr) {
@@ -5241,10 +5243,13 @@ void Topic::CommitEpoch(
             // Publish GOI index last so readers never treat a partially-written entry as valid.
             entry->global_seq = batch_index;
             if (ShouldEnableOrder5SessionTestTrace()) {
+                const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
                 LOG(WARNING) << "[ORDER5_TEST_GOI_COMMIT]" << " client=" << p.client_id
                              << " session_epoch=" << p.session_epoch
                              << " batch_seq=" << p.hdr->batch_seq << " goi=" << batch_index
-                             << " pbr=" << p.cached_pbr_absolute_index << " from_hold=0";
+                             << " pbr=" << p.cached_pbr_absolute_index
+                             << " from_hold=0 wall_ms=" << wall_ms;
             }
             next_order += p.num_msg;
         }

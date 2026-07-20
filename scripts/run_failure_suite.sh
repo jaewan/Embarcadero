@@ -122,6 +122,9 @@ run_kill_cell() {
         echo "hosts=$hosts numas=$numas pace=${per_session_mbps}MB/s/session kill=broker${kill_id}@T+${kill_after}s ts=${ts_interval_ms}ms extra_env=$*"
         echo "=== $(stamp): Starting cluster + $NUM_SESSIONS publisher sessions ==="
 
+        # Four 8-GiB segments do not fit after layout-v2 metadata in the
+        # configured 64-GiB CXL extent. Six GiB leaves four admitted segments
+        # and comfortably holds this paced failure workload.
         env \
         NUM_CLIENTS="$NUM_SESSIONS" \
         CLIENT_HOSTS_CSV="$hosts" \
@@ -136,6 +139,7 @@ run_kill_cell() {
         TEST_TYPE=5 \
         EMBARCADERO_CXL_ZERO_MODE=metadata \
         EMBARCADERO_CXL_MAP_POPULATE=0 \
+        EMBARCADERO_SEGMENT_SIZE="${EMBARCADERO_SEGMENT_SIZE:-6442450944}" \
         EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS="$ts_interval_ms" \
         EMBARCADERO_THROUGHPUT_TIMESERIES_ON_SENT=1 \
         CLIENT_EXTRA_ARGS="--target_mbps $per_session_mbps --steady_rate" \
@@ -166,12 +170,31 @@ run_kill_cell() {
 
     # Per-session stall CDF (non-zero if any session lacks a usable baseline/recovery).
     local analysis_rc=0
+    local -a analysis_args=()
+    if [[ "$label" == "e4a_broker_kill" ]]; then
+        analysis_args=(--affected-session c40 --control-session c41)
+    elif [[ "$label" == "e4a_session_gap" ]]; then
+        # Publisher ACK samples are per-broker aggregates and are retained only
+        # as offered-load corroboration. The separate sequencer trace below is
+        # the authoritative per-session commit-isolation contract.
+        analysis_args=(--gap-event-session c40)
+    fi
     if python3 "$SCRIPT_DIR/analyze_e4a_stall.py" "$cell_dir" \
-        --output "$cell_dir/stall_summary.csv" >> "$cell_log" 2>&1; then
+        --output "$cell_dir/stall_summary.csv" "${analysis_args[@]}" \
+        >> "$cell_log" 2>&1; then
         log "[$label] stall analysis written to $cell_dir/stall_summary.csv"
     else
         analysis_rc=$?
         log "[$label] WARNING: stall analysis failed (rc=$analysis_rc) — inspect $cell_log"
+    fi
+    if [[ "$label" == "e4a_session_gap" ]]; then
+        if python3 "$SCRIPT_DIR/analyze_e4a_commit_isolation.py" "$cell_dir" \
+            >> "$cell_log" 2>&1; then
+            log "[$label] sequencer commit-isolation contract passed"
+        else
+            analysis_rc=$?
+            log "[$label] WARNING: sequencer commit-isolation contract failed (rc=$analysis_rc)"
+        fi
     fi
     if [[ "$rc" -eq 0 && "$analysis_rc" -ne 0 ]]; then
         rc=$analysis_rc
@@ -186,7 +209,23 @@ run_kill_cell() {
 # ~zero stall; only sessions rerouting off the dead broker pay the repair.
 # ---------------------------------------------------------------------------
 run_e4a() {
-    run_kill_cell "e4a_broker_kill" "${E4A_KILL_BROKER_ID:-1}"
+    local kill_id="${E4A_KILL_BROKER_ID:-1}"
+    if [[ "$NUM_SESSIONS" -ne 2 ]]; then
+        echo "ERROR: E4a isolation contract requires NUM_SESSIONS=2 (affected + control)." >&2
+        return 1
+    fi
+    if [[ "$kill_id" -ne 1 || "$NUM_BROKERS" -ne 4 ]]; then
+        echo "ERROR: E4a explicit routing contract currently requires four brokers and kill_id=1." >&2
+        return 1
+    fi
+    # Both sessions fully stripe across the same four brokers and share the
+    # same sequencer. Hold only session 0's batch 64 for three seconds; later
+    # batches make its missing prefix observable while session 1 remains live.
+    run_kill_cell "e4a_session_gap" "$kill_id" \
+        BROKER_KILL_AFTER_SEC=0 \
+        CLIENT_ORDER5_GAP_DELAYS_MS_PIPE="3000|0" \
+        CLIENT_ORDER5_GAP_BATCH_SEQS_PIPE="64|0" \
+        EMBARCADERO_TEST_ORDER5_SESSION_TRACE=1
 }
 
 # ---------------------------------------------------------------------------

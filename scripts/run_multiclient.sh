@@ -61,6 +61,18 @@ fi
 if [[ -n "${CLIENT_NUMAS_CSV:-}" ]]; then
     IFS=',' read -r -a CLIENT_NUMAS <<< "$CLIENT_NUMAS_CSV"
 fi
+declare -a CLIENT_ORDER5_BROKER_ALLOWLISTS=()
+if [[ -n "${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-}" ]]; then
+    IFS='|' read -r -a CLIENT_ORDER5_BROKER_ALLOWLISTS <<< "$CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE"
+fi
+declare -a CLIENT_ORDER5_GAP_DELAYS_MS=()
+if [[ -n "${CLIENT_ORDER5_GAP_DELAYS_MS_PIPE:-}" ]]; then
+    IFS='|' read -r -a CLIENT_ORDER5_GAP_DELAYS_MS <<< "$CLIENT_ORDER5_GAP_DELAYS_MS_PIPE"
+fi
+declare -a CLIENT_ORDER5_GAP_BATCH_SEQS=()
+if [[ -n "${CLIENT_ORDER5_GAP_BATCH_SEQS_PIPE:-}" ]]; then
+    IFS='|' read -r -a CLIENT_ORDER5_GAP_BATCH_SEQS <<< "$CLIENT_ORDER5_GAP_BATCH_SEQS_PIPE"
+fi
 MAX_CLIENTS=${#CLIENT_HOSTS[@]}
 
 # ---------------------------------------------------------------------------
@@ -80,6 +92,18 @@ TEST_TYPE=${TEST_TYPE:-5}          # 5 = publish-only
 ORDER=${ORDER:-0}
 ACK=${ACK:-1}
 REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
+if (( ${#CLIENT_ORDER5_BROKER_ALLOWLISTS[@]} > 0 &&
+      ${#CLIENT_ORDER5_BROKER_ALLOWLISTS[@]} != NUM_CLIENTS )); then
+    echo "ERROR: CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE has ${#CLIENT_ORDER5_BROKER_ALLOWLISTS[@]} entries; expected NUM_CLIENTS=$NUM_CLIENTS" >&2
+    exit 1
+fi
+for _per_client_array_len in \
+    "${#CLIENT_ORDER5_GAP_DELAYS_MS[@]}" "${#CLIENT_ORDER5_GAP_BATCH_SEQS[@]}"; do
+    if (( _per_client_array_len > 0 && _per_client_array_len != NUM_CLIENTS )); then
+        echo "ERROR: per-client ORDER5 gap arrays must have NUM_CLIENTS=$NUM_CLIENTS entries" >&2
+        exit 1
+    fi
+done
 # A benchmark's fixed TestTopic name starts broker slot sequences at zero.  A
 # durable Corfu sidecar must therefore not be reused for a distinct invocation:
 # its conflict detection would (correctly) reject the new values.  The default
@@ -1967,6 +1991,18 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
                 remote_build_bin="$REMOTE_CLIENT_BIN_DIR"
             fi
             ts_file="$remote_build_bin/throughput_timeseries_trial${trial}_${client_tag}.csv"
+            client_order5_allowlist=""
+            if (( ${#CLIENT_ORDER5_BROKER_ALLOWLISTS[@]} > 0 )); then
+                client_order5_allowlist="${CLIENT_ORDER5_BROKER_ALLOWLISTS[$i]}"
+            fi
+            client_order5_gap_delay_ms=0
+            client_order5_gap_batch_seq=0
+            if (( ${#CLIENT_ORDER5_GAP_DELAYS_MS[@]} > 0 )); then
+                client_order5_gap_delay_ms="${CLIENT_ORDER5_GAP_DELAYS_MS[$i]}"
+            fi
+            if (( ${#CLIENT_ORDER5_GAP_BATCH_SEQS[@]} > 0 )); then
+                client_order5_gap_batch_seq="${CLIENT_ORDER5_GAP_BATCH_SEQS[$i]}"
+            fi
             CLIENT_TAGS+=( "$client_tag" )
             CLIENT_LOGS+=( "$log_file" )
             CLIENT_TS_LOCAL_FILES+=( "$LOG_DIR/trial${trial}_${client_tag}_timeseries.csv" )
@@ -2012,6 +2048,9 @@ export EMBARCADERO_BATCH_SIZE=$EMBARCADERO_BATCH_SIZE
 export EMBARCADERO_CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB
 export EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS
 export EMBARCADERO_ORDER5_HOME_BROKERS=$EMBARCADERO_ORDER5_HOME_BROKERS
+export EMBARCADERO_ORDER5_BROKER_ALLOWLIST=$client_order5_allowlist
+export EMBARCADERO_ORDER5_GAP_DELAY_MS=$client_order5_gap_delay_ms
+export EMBARCADERO_ORDER5_GAP_BATCH_SEQ=$client_order5_gap_batch_seq
 if [ -n "${EMBARCADERO_ACK_TIMEOUT_SEC:-}" ]; then export EMBARCADERO_ACK_TIMEOUT_SEC=${EMBARCADERO_ACK_TIMEOUT_SEC:-}; fi
 if [ -n "${EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC:-}" ]; then export EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC=${EMBARCADERO_ACK2_OFFERED_RATE_BYTES_PER_SEC:-}; fi
 if [ -n "${EMBARCADERO_OFFERED_RATE_BYTES_PER_SEC:-}" ]; then export EMBARCADERO_OFFERED_RATE_BYTES_PER_SEC=${EMBARCADERO_OFFERED_RATE_BYTES_PER_SEC:-}; fi
@@ -2206,6 +2245,14 @@ ENDINNERSCRIPT
             fi
             trial_success=1
             echo "$trial,$attempt,success,ok" >> "$ATTEMPT_SUMMARY_CSV"
+            # Preserve successful broker evidence as well as failed-attempt
+            # diagnostics. Failure experiments need per-trial sequencer traces;
+            # /tmp/broker_N.log is overwritten by the next trial.
+            for b in $(seq 0 $((NUM_BROKERS - 1))); do
+                cp -f "/tmp/broker_${b}.log" \
+                    "$LOG_DIR/trial${trial}_attempt${attempt}_broker${b}.log" \
+                    2>/dev/null || true
+            done
             break
         fi
 
