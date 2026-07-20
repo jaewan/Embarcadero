@@ -81,6 +81,10 @@ export EMBARCADERO_CXL_ZERO_MODE EMBARCADERO_CXL_SIZE
 export EMBARCADERO_SESSION_LEASE_MS="$SESSION_LEASE_MS"
 export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS="$IDLE_FORCE_EXPIRE_MS"
 export EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS="${EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS:-100}"
+# Disable hugepages for throughput_test clients: 4 concurrent sessions + 4 broker
+# processes compete for the same hugepage pool and can exhaust it, crashing
+# Publisher::Init() with MAP_HUGETLB failure. Use THP/madvise fallback instead.
+export EMBAR_USE_HUGETLB="${EMBAR_USE_HUGETLB:-0}"
 
 mkdir -p "$ISOLATION_DATA_DIR"
 echo "ISOLATION_DATA_DIR=$ISOLATION_DATA_DIR"
@@ -159,6 +163,8 @@ run_one_session() {
     renv+="export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=$(printf '%q' "${EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS}") && "
     renv+="export EMBARCADERO_SESSION_LEASE_MS=$(printf '%q' "$SESSION_LEASE_MS") && "
     renv+="export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS=$(printf '%q' "$IDLE_FORCE_EXPIRE_MS") && "
+    # Disable hugepages on remote clients too (same reason as local)
+    renv+="export EMBAR_USE_HUGETLB=$(printf '%q' "${EMBAR_USE_HUGETLB:-0}") && "
 
     local rcmd
     rcmd="./throughput_test --config $(printf '%q' "$REMOTE_CLIENT_CONFIG")"
