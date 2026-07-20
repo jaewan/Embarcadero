@@ -43,9 +43,14 @@ NUM_BROKERS="${NUM_BROKERS:-4}"
 FAILED_BROKER="${FAILED_BROKER:-1}"
 NUM_TRIALS="${NUM_TRIALS:-1}"
 # Each session sends this many bytes (not total — per session).
-SESSION_BYTES="${SESSION_BYTES:-5368709120}"   # 5 GiB per session
+# Must be large enough that sessions are still mid-flight when the kill fires.
+# At ~1-2 GB/s effective rate, 10 GiB takes 5-10 s; kill at 15 s is safely mid-run.
+SESSION_BYTES="${SESSION_BYTES:-10737418240}"   # 10 GiB per session
 MESSAGE_SIZE="${MESSAGE_SIZE:-1024}"
-FAILURE_AFTER_MS="${FAILURE_AFTER_MS:-1800}"   # kill at 1.8s
+# Kill fires at FAILURE_AFTER_MS ms after sessions start publishing.
+# Must be > session warm-up time (~5-8 s for ORDER=5 connection setup) but
+# well before sessions finish (session completes in ~5-10 s at effective rate).
+FAILURE_AFTER_MS="${FAILURE_AFTER_MS:-15000}"   # kill at 15 s (well into the run)
 SESSION_LEASE_MS="${SESSION_LEASE_MS:-180000}"  # 3-min lease (prefix-safe)
 IDLE_FORCE_EXPIRE_MS="${IDLE_FORCE_EXPIRE_MS:-180000}"
 THREADS_PER_SESSION="${THREADS_PER_SESSION:-4}"
@@ -257,16 +262,6 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
   done
   echo "All $NUM_BROKERS brokers ready."
 
-  # Schedule broker kill: after FAILURE_AFTER_MS ms, kill broker FAILED_BROKER
-  # using SIGKILL on its process. This is the external kill that triggers the hold.
-  failed_pid="${local_pids[$FAILED_BROKER]}"
-  echo "  Broker kill scheduled: pid=$failed_pid broker=$FAILED_BROKER at ${FAILURE_AFTER_MS}ms"
-  ( sleep "$(echo "scale=3; $FAILURE_AFTER_MS/1000" | bc)"; \
-    kill -9 "$failed_pid" 2>/dev/null && \
-    echo "[$(date +%T)] KILLED broker $FAILED_BROKER (pid=$failed_pid)" || \
-    echo "[$(date +%T)] WARN: broker $FAILED_BROKER (pid=$failed_pid) already dead" ) &
-  kill_bg_pid=$!
-
   # Launch all sessions concurrently — one per broker
   declare -a session_pids=()
   for ((sid=0; sid<NUM_BROKERS; sid++)); do
@@ -278,11 +273,26 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
     session_pids+=("$!")
   done
 
+  # Schedule broker kill AFTER sessions are launched and running.
+  # Wait a short settle time so all remote clients have connected before the kill.
+  # FAILURE_AFTER_MS counts from NOW (sessions already started), not from script start.
+  SETTLE_BEFORE_KILL_SEC="${SETTLE_BEFORE_KILL_SEC:-8}"
+  failed_pid="${local_pids[$FAILED_BROKER]}"
+  echo "  Settling ${SETTLE_BEFORE_KILL_SEC}s for sessions to connect, then scheduling kill..."
+  ( sleep "$SETTLE_BEFORE_KILL_SEC"; \
+    delay_s="$(echo "scale=3; $FAILURE_AFTER_MS/1000" | bc)"; \
+    sleep "$delay_s"; \
+    if kill -0 "$failed_pid" 2>/dev/null; then \
+      kill -9 "$failed_pid" 2>/dev/null && \
+      echo "[$(date +%T)] KILLED broker $FAILED_BROKER (pid=$failed_pid) — ${delay_s}s after session start" || \
+      echo "[$(date +%T)] WARN: broker $FAILED_BROKER already dead"; \
+    fi ) &
+  kill_bg_pid=$!
+
   echo "All $NUM_BROKERS sessions running. Waiting for completion..."
   for spid in "${session_pids[@]}"; do
     wait "$spid" || true
   done
-  # Cancel the kill bg process if it hasn't fired yet
   kill "$kill_bg_pid" 2>/dev/null || true
   echo "All sessions finished."
 
