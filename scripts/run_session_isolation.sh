@@ -110,31 +110,34 @@ run_one_session() {
   # Use a fixed remote tmp path so the remote client can always write it.
   local remote_ts="/tmp/session_isolation_s${session_id}.csv"
 
-  # Only the session pinned to the failed broker runs the failure test type (4).
-  # All other sessions run the plain publish-throughput test (5), which still
-  # writes the timeseries CSV when EMBARCADERO_THROUGHPUT_TIMESERIES_FILE is set.
+  # All sessions use test type 5 (plain publish-throughput).
+  # The broker kill is triggered by a separate background process (see main loop).
+  # Surviving sessions are pinned via BROKER_ALLOWLIST to their assigned broker.
+  # The "failed" session also runs type 5 but WITHOUT an allowlist restriction,
+  # so it can connect to all brokers and observe the hold/fence behavior after kill.
   local test_type=5
   local num_kill=0
-  if [[ "$broker_id" -eq "$FAILED_BROKER" ]]; then
-    test_type=4       # failure throughput test: kills broker at FAILURE_AFTER_MS
-    num_kill=1
+
+  # Surviving sessions are pinned via BROKER_ALLOWLIST; failed session has no pin.
+  local allowlist_env=""
+  if [[ "$broker_id" -ne "$FAILED_BROKER" ]]; then
+    allowlist_env="$broker_id"   # restrict to this broker only
   fi
+  # Note: no FAILURE_AFTER_MS here — killing is done externally (see main loop).
 
   if [[ "$host" == "local" ]]; then
-    export EMBARCADERO_ORDER5_BROKER_ALLOWLIST="$broker_id"
+    [[ -n "$allowlist_env" ]] && export EMBARCADERO_ORDER5_BROKER_ALLOWLIST="$allowlist_env" \
+                              || unset EMBARCADERO_ORDER5_BROKER_ALLOWLIST 2>/dev/null
     export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE="$ts_file"
     export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS="${EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS}"
     export EMBARCADERO_SESSION_LEASE_MS="$SESSION_LEASE_MS"
     export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS="$IDLE_FORCE_EXPIRE_MS"
-    [[ "$broker_id" -eq "$FAILED_BROKER" ]] && \
-      export EMBARCADERO_FAILURE_AFTER_MS="$FAILURE_AFTER_MS"
     timeout --signal=TERM --kill-after=10 "$CLIENT_TIMEOUT" \
       stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml \
       -n "$THREADS_PER_SESSION" -m "$MESSAGE_SIZE" -s "$SESSION_BYTES" \
       -t "$test_type" \
       --head_addr "$CLIENT_HEAD_ADDR" \
-      --num_brokers_to_kill "$num_kill" \
-      --failure_percentage 1.0 \
+      --num_brokers_to_kill 0 \
       -o "$ORDER" -a "$ACK" -r "$REPLICATION_FACTOR" -l 0 \
       >"$log_file" 2>&1
   else
@@ -142,16 +145,15 @@ run_one_session() {
     local renv=""
     renv+="export LD_LIBRARY_PATH=$(printf '%q' "$CLIENT_LD_LIBRARY_PATH")"
     renv+="\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} && "
-    # Pin this session to its assigned broker
-    renv+="export EMBARCADERO_ORDER5_BROKER_ALLOWLIST=$(printf '%q' "$broker_id") && "
+    # Pin surviving sessions to their broker; leave failed session unpinned
+    if [[ -n "$allowlist_env" ]]; then
+      renv+="export EMBARCADERO_ORDER5_BROKER_ALLOWLIST=$(printf '%q' "$allowlist_env") && "
+    fi
     # Remote client writes timeseries to its own /tmp, we scp it back below
     renv+="export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$(printf '%q' "$remote_ts") && "
     renv+="export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=$(printf '%q' "${EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS}") && "
     renv+="export EMBARCADERO_SESSION_LEASE_MS=$(printf '%q' "$SESSION_LEASE_MS") && "
     renv+="export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS=$(printf '%q' "$IDLE_FORCE_EXPIRE_MS") && "
-    if [[ "$broker_id" -eq "$FAILED_BROKER" ]]; then
-      renv+="export EMBARCADERO_FAILURE_AFTER_MS=$(printf '%q' "$FAILURE_AFTER_MS") && "
-    fi
 
     local rcmd
     rcmd="./throughput_test --config $(printf '%q' "$REMOTE_CLIENT_CONFIG")"
@@ -160,8 +162,7 @@ run_one_session() {
     rcmd+=" -s $SESSION_BYTES"
     rcmd+=" -t $test_type"
     rcmd+=" --head_addr $(printf '%q' "$CLIENT_HEAD_ADDR")"
-    rcmd+=" --num_brokers_to_kill $num_kill"
-    rcmd+=" --failure_percentage 1.0"
+    rcmd+=" --num_brokers_to_kill 0"
     rcmd+=" -o $ORDER -a $ACK"
     rcmd+=" -r $REPLICATION_FACTOR"
     rcmd+=" -l 0"
@@ -172,10 +173,10 @@ run_one_session() {
       "cd $(printf '%q' "$REMOTE_CLIENT_BIN_DIR") && ${renv} ${rcmd}" \
       >"$log_file" 2>&1
 
-    # Pull timeseries CSV back from remote
+    # Pull timeseries CSV back from remote /tmp
     scp -o StrictHostKeyChecking=no \
       "${host}:${remote_ts}" "$ts_file" 2>/dev/null || \
-      echo "WARNING: scp of timeseries from $host failed" >&2
+      echo "WARNING: scp of timeseries from $host failed (check path: ${remote_ts})" >&2
   fi
 }
 
@@ -256,6 +257,16 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
   done
   echo "All $NUM_BROKERS brokers ready."
 
+  # Schedule broker kill: after FAILURE_AFTER_MS ms, kill broker FAILED_BROKER
+  # using SIGKILL on its process. This is the external kill that triggers the hold.
+  failed_pid="${local_pids[$FAILED_BROKER]}"
+  echo "  Broker kill scheduled: pid=$failed_pid broker=$FAILED_BROKER at ${FAILURE_AFTER_MS}ms"
+  ( sleep "$(echo "scale=3; $FAILURE_AFTER_MS/1000" | bc)"; \
+    kill -9 "$failed_pid" 2>/dev/null && \
+    echo "[$(date +%T)] KILLED broker $FAILED_BROKER (pid=$failed_pid)" || \
+    echo "[$(date +%T)] WARN: broker $FAILED_BROKER (pid=$failed_pid) already dead" ) &
+  kill_bg_pid=$!
+
   # Launch all sessions concurrently — one per broker
   declare -a session_pids=()
   for ((sid=0; sid<NUM_BROKERS; sid++)); do
@@ -271,6 +282,8 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
   for spid in "${session_pids[@]}"; do
     wait "$spid" || true
   done
+  # Cancel the kill bg process if it hasn't fired yet
+  kill "$kill_bg_pid" 2>/dev/null || true
   echo "All sessions finished."
 
   # Merge per-session CSVs into combined.csv
