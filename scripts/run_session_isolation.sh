@@ -110,12 +110,13 @@ run_one_session() {
   # Use a fixed remote tmp path so the remote client can always write it.
   local remote_ts="/tmp/session_isolation_s${session_id}.csv"
 
-  # Only the session pinned to the failed broker kills a broker.
-  # All others use -t 2 (standard throughput test, no broker kill).
-  local test_type=2
+  # Only the session pinned to the failed broker runs the failure test type (4).
+  # All other sessions run the plain publish-throughput test (5), which still
+  # writes the timeseries CSV when EMBARCADERO_THROUGHPUT_TIMESERIES_FILE is set.
+  local test_type=5
   local num_kill=0
   if [[ "$broker_id" -eq "$FAILED_BROKER" ]]; then
-    test_type=4       # failure test type
+    test_type=4       # failure throughput test: kills broker at FAILURE_AFTER_MS
     num_kill=1
   fi
 
