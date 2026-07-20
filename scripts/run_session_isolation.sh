@@ -103,64 +103,78 @@ run_one_session() {
   local session_id="$1"
   local broker_id="$2"       # which broker this session is pinned to
   local host="$3"
-  local ts_file="$4"         # where to write timeseries CSV
+  local ts_file="$4"         # local path where timeseries CSV should end up
   local log_file="$5"
 
-  local common_env=""
-  common_env+="export LD_LIBRARY_PATH=$(printf '%q' "$CLIENT_LD_LIBRARY_PATH")"
-  common_env+="\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} && "
-  common_env+="export EMBARCADERO_ORDER5_BROKER_ALLOWLIST=$(printf '%q' "$broker_id") && "
-  common_env+="export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$(printf '%q' "$ts_file") && "
-  common_env+="export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=$(printf '%q' "${EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS}") && "
-  common_env+="export EMBARCADERO_SESSION_LEASE_MS=$(printf '%q' "$SESSION_LEASE_MS") && "
-  common_env+="export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS=$(printf '%q' "$IDLE_FORCE_EXPIRE_MS") && "
-  # Only the failed session should kill a broker.
+  # Remote clients write to a path on their own filesystem, then we scp it back.
+  # Use a fixed remote tmp path so the remote client can always write it.
+  local remote_ts="/tmp/session_isolation_s${session_id}.csv"
+
+  # Only the session pinned to the failed broker kills a broker.
+  # All others use -t 2 (standard throughput test, no broker kill).
+  local test_type=2
+  local num_kill=0
   if [[ "$broker_id" -eq "$FAILED_BROKER" ]]; then
-    common_env+="export EMBARCADERO_FAILURE_AFTER_MS=$(printf '%q' "$FAILURE_AFTER_MS") && "
+    test_type=4       # failure test type
+    num_kill=1
   fi
 
-  local cmd
-  cmd="./throughput_test --config $(printf '%q' "$REMOTE_CLIENT_CONFIG")"
-  cmd+=" -n $THREADS_PER_SESSION"
-  cmd+=" -m $MESSAGE_SIZE"
-  cmd+=" -s $SESSION_BYTES"
-  cmd+=" -t 4"              # failure test type
-  cmd+=" --head_addr $(printf '%q' "$CLIENT_HEAD_ADDR")"
-  cmd+=" --num_brokers_to_kill 1"
-  cmd+=" --failure_percentage 1.0"  # kill after FAILURE_AFTER_MS ms (wall-clock mode)
-  cmd+=" -o $ORDER -a $ACK"
-  cmd+=" -r $REPLICATION_FACTOR"
-  cmd+=" -l 0"
-
   if [[ "$host" == "local" ]]; then
-    eval "export EMBARCADERO_ORDER5_BROKER_ALLOWLIST=$broker_id"
-    eval "export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$(printf '%q' "$ts_file")"
-    eval "export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=${EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS}"
-    eval "export EMBARCADERO_SESSION_LEASE_MS=$SESSION_LEASE_MS"
-    eval "export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS=$IDLE_FORCE_EXPIRE_MS"
+    export EMBARCADERO_ORDER5_BROKER_ALLOWLIST="$broker_id"
+    export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE="$ts_file"
+    export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS="${EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS}"
+    export EMBARCADERO_SESSION_LEASE_MS="$SESSION_LEASE_MS"
+    export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS="$IDLE_FORCE_EXPIRE_MS"
     [[ "$broker_id" -eq "$FAILED_BROKER" ]] && \
-      eval "export EMBARCADERO_FAILURE_AFTER_MS=$FAILURE_AFTER_MS"
-    # shellcheck disable=SC2086
+      export EMBARCADERO_FAILURE_AFTER_MS="$FAILURE_AFTER_MS"
     timeout --signal=TERM --kill-after=10 "$CLIENT_TIMEOUT" \
       stdbuf -oL -eL ./throughput_test --config ../../config/client.yaml \
-      -n "$THREADS_PER_SESSION" -m "$MESSAGE_SIZE" -s "$SESSION_BYTES" -t 4 \
+      -n "$THREADS_PER_SESSION" -m "$MESSAGE_SIZE" -s "$SESSION_BYTES" \
+      -t "$test_type" \
       --head_addr "$CLIENT_HEAD_ADDR" \
-      --num_brokers_to_kill 1 --failure_percentage 1.0 \
+      --num_brokers_to_kill "$num_kill" \
+      --failure_percentage 1.0 \
       -o "$ORDER" -a "$ACK" -r "$REPLICATION_FACTOR" -l 0 \
       >"$log_file" 2>&1
   else
-    # Ensure remote output dir exists
-    ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" \
-      "mkdir -p $(printf '%q' "$(dirname "$ts_file")")" 2>/dev/null || true
+    # Build env string for remote execution
+    local renv=""
+    renv+="export LD_LIBRARY_PATH=$(printf '%q' "$CLIENT_LD_LIBRARY_PATH")"
+    renv+="\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} && "
+    # Pin this session to its assigned broker
+    renv+="export EMBARCADERO_ORDER5_BROKER_ALLOWLIST=$(printf '%q' "$broker_id") && "
+    # Remote client writes timeseries to its own /tmp, we scp it back below
+    renv+="export EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$(printf '%q' "$remote_ts") && "
+    renv+="export EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=$(printf '%q' "${EMBARCADERO_FAILURE_MEASURE_INTERVAL_MS}") && "
+    renv+="export EMBARCADERO_SESSION_LEASE_MS=$(printf '%q' "$SESSION_LEASE_MS") && "
+    renv+="export EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS=$(printf '%q' "$IDLE_FORCE_EXPIRE_MS") && "
+    if [[ "$broker_id" -eq "$FAILED_BROKER" ]]; then
+      renv+="export EMBARCADERO_FAILURE_AFTER_MS=$(printf '%q' "$FAILURE_AFTER_MS") && "
+    fi
+
+    local rcmd
+    rcmd="./throughput_test --config $(printf '%q' "$REMOTE_CLIENT_CONFIG")"
+    rcmd+=" -n $THREADS_PER_SESSION"
+    rcmd+=" -m $MESSAGE_SIZE"
+    rcmd+=" -s $SESSION_BYTES"
+    rcmd+=" -t $test_type"
+    rcmd+=" --head_addr $(printf '%q' "$CLIENT_HEAD_ADDR")"
+    rcmd+=" --num_brokers_to_kill $num_kill"
+    rcmd+=" --failure_percentage 1.0"
+    rcmd+=" -o $ORDER -a $ACK"
+    rcmd+=" -r $REPLICATION_FACTOR"
+    rcmd+=" -l 0"
+
     # shellcheck disable=SC2029
     timeout --signal=TERM --kill-after=10 "$CLIENT_TIMEOUT" \
       ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$host" \
-      "cd $(printf '%q' "$REMOTE_CLIENT_BIN_DIR") && \
-       ${common_env} ${cmd}" \
+      "cd $(printf '%q' "$REMOTE_CLIENT_BIN_DIR") && ${renv} ${rcmd}" \
       >"$log_file" 2>&1
-    # Pull timeseries CSV back if on non-shared filesystem
+
+    # Pull timeseries CSV back from remote
     scp -o StrictHostKeyChecking=no \
-      "${host}:${ts_file}" "$ts_file" 2>/dev/null || true
+      "${host}:${remote_ts}" "$ts_file" 2>/dev/null || \
+      echo "WARNING: scp of timeseries from $host failed" >&2
   fi
 }
 
