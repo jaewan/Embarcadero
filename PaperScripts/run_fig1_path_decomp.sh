@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
-# Fig 1 path decomposition: 5-variant ACK/replication ablation.
-# V0–V4 use identical binaries, commit, and cluster initialization.
+# Fig 1 path decomposition: 6-variant ACK/replication ablation.
+# V0–V4 + V3' use identical binaries, commit, and cluster initialization.
 #
-# Variant | Order | ACK | RF | Sink                | Repl executes? | ACK waits | Isolates
-# --------|-------|-----|----|--------------------|----------------|-----------|------------------------
-# V0      |  0    |  1  |  0 | disabled           |      No        |    No     | Unordered floor
-# V1      |  5    |  1  |  0 | disabled           |      No        |    No     | Ordering-only ceiling
-# V2      |  5    |  1  |  2 | memory-copy        |      Yes       |    No     | Background-repl contention
-# V3      |  5    |  2  |  2 | memory-accounting  |  Control path  |    Yes    | ACK2 protocol/accounting overhead
-# V4      |  5    |  2  |  2 | memory-copy        |      Yes       |    Yes    | Complete DRAM-replica path (paper result)
+# Variant | Order | ACK | RF | Sink                | CXL_COHERENT | Repl executes? | ACK waits | Isolates
+# --------|-------|-----|----|--------------------|--------------|----------------|-----------|----------------------------------
+# V0      |  0    |  1  |  0 | disabled           |    —         |      No        |    No     | Unordered floor
+# V1      |  5    |  1  |  0 | disabled           |    —         |      No        |    No     | Ordering-only ceiling
+# V2      |  5    |  1  |  2 | memory-copy        |    —         |      Yes       |    No     | Background-repl contention
+# V3      |  5    |  2  |  2 | memory-accounting  |    0         |  Control+clfl  |    Yes    | ACK2 protocol + clflush overhead
+# V3'     |  5    |  2  |  2 | memory-accounting  |    1         |  Control only  |    Yes    | ACK2 pure protocol (no payload CXL touch)
+# V4      |  5    |  2  |  2 | memory-copy        |    —         |      Yes       |    Yes    | Complete DRAM-replica path (paper result)
 #
 # 10 GiB TOTAL per run (aggregate across N clients, matching existing Fig1 setup).
-# N=1,2,3 remote clients. N=4 intentionally excluded: requires separate metric handling
-# (bandwidth_sum vs overlap) and is a ceiling characterization, not a fair comparison point.
+# N=1,2,3 remote; N=4 adds a co-located publisher on host-A (CXL write ceiling characterization).
+# N≤3 metric: overlap_gbps. N=4 metric: bandwidth_sum_gbps (overlap window collapses at N=4).
+#
+# V3' design rationale:
+#   V3 (memory-accounting) still calls invalidate_cache_range_for_read(payload, payload_size)
+#   — one _mm_clflush per 64-byte cache line — even though it never reads payload data.
+#   Setting EMBARCADERO_CXL_COHERENT=1 gates ShouldInvalidatePayloadBeforeRead() to false,
+#   skipping all clflush calls. This isolates the pure CV-advance protocol cost from the
+#   CXL cache-coherence maintenance cost. Expected: V3' ≈ V0 ≈ V1 at all N.
+#   At N=4 this should approach the CXL write saturation ceiling (~21 GB/s).
 #
 # Reqs:
 #   - 4/4 brokers must reach readiness (follower logs must show lazy mapping)
@@ -56,7 +65,7 @@ if [[ "$SMOKE_MODE" -eq 1 ]]; then
 else
     TOTAL_BYTES=$((10 * 1024 * 1024 * 1024))  # 10 GiB aggregate (same as Fig1)
     NUM_TRIALS=3
-    N_VALUES="1 2 3"
+    N_VALUES="1 2 3 4"   # N=4: co-located publisher (CXL write ceiling point)
 fi
 REQUIRED_SUCCESSES=$NUM_TRIALS
 MSG_SIZE=4096
@@ -69,6 +78,7 @@ BROKER_IP=10.10.10.10
 HOSTS_N1=c4
 HOSTS_N2=c4,c3
 HOSTS_N3=c4,c3,c1
+HOSTS_N4="${HOSTS_N4:-c4,c3,c1,local}"  # N=4: 3 remote + co-located on host-A (CXL ceiling)
 
 # --- CXL configuration: lazy follower mapping is critical ---
 export EMBARCADERO_CXL_SIZE=274877906944      # 256 GiB
@@ -94,7 +104,7 @@ campaign_id,pass_id,run_ts_utc,git_commit,git_dirty_files,embarlet_md5,client_md
 EOF
 fi
 
-hosts_for_n() { case "$1" in 1) echo "$HOSTS_N1";; 2) echo "$HOSTS_N2";; 3) echo "$HOSTS_N3";; esac; }
+hosts_for_n() { case "$1" in 1) echo "$HOSTS_N1";; 2) echo "$HOSTS_N2";; 3) echo "$HOSTS_N3";; 4) echo "$HOSTS_N4";; esac; }
 
 numas_for_hosts() {
     local out="" h
@@ -299,10 +309,23 @@ V2_ENV=(
 )
 
 # V3: ACK2 protocol/accounting overhead only (no payload copy to DRAM)
+# Still calls invalidate_cache_range_for_read (clflush per cache line) before skipping copy.
 V3_ENV=(
     "EMBARCADERO_CHAIN_REPLICATION_SINK=memory-accounting"
     "EMBARCADERO_CHAIN_REPLICATION_INMEM=1"
     "EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=0"
+)
+
+# V3': Pure ACK2 protocol overhead — no CXL payload touch at all.
+# EMBARCADERO_CXL_COHERENT=1 gates ShouldInvalidatePayloadBeforeRead() to false,
+# skipping all _mm_clflush calls on the payload region. The replication thread still
+# runs the full GOI-lookup + token/CV-advance control path; it simply never touches
+# the payload bytes. Expected throughput: same as V0/V1 (pure write-path ceiling).
+V3PRIME_ENV=(
+    "EMBARCADERO_CHAIN_REPLICATION_SINK=memory-accounting"
+    "EMBARCADERO_CHAIN_REPLICATION_INMEM=1"
+    "EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=0"
+    "EMBARCADERO_CXL_COHERENT=1"
 )
 
 # V4: Complete DRAM-replica path (this IS the current paper result, re-run for matched baseline)
@@ -312,7 +335,7 @@ V4_ENV=(
     "EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=1"
 )
 
-log "===== Fig1 path decomposition ====="
+log "===== Fig1 path decomposition (V0–V4 + V3') ====="
 log "Campaign=$CAMPAIGN_ID  Pass=$PASS_ID  Smoke=$SMOKE_MODE"
 log "Commit=$GIT_COMMIT  DirtyFiles=$GIT_DIRTY"
 log "embarlet_md5=$BINARY_HASH_EMBARLET  client_md5=$BINARY_HASH_CLIENT"
@@ -344,8 +367,16 @@ if [[ "$SMOKE_MODE" -eq 0 ]]; then
             5 2 2 "memory-accounting" "$n" "$(hosts_for_n "$n")" "${V3_ENV[@]}" || true
     done
 
+    log "--- V3': ACK2 pure protocol, no CXL payload touch (ORDER=5, ACK2, RF=2, memory-accounting, CXL_COHERENT=1) ---"
+    log "    Skips clflush on payload; isolates CV-advance protocol cost from CXL cache-coherence cost."
+    log "    Expected: same as V0/V1. At N=4, should approach CXL write saturation (~21 GB/s)."
+    for n in $N_VALUES; do
+        run_cell "v3prime_order5_ack2_rf2_acct_coherent" "ack2-coherent-noinval" \
+            5 2 2 "memory-accounting" "$n" "$(hosts_for_n "$n")" "${V3PRIME_ENV[@]}" || true
+    done
+
     log "--- V4: Complete DRAM-replica path (ORDER=5, ACK2, RF=2, memory-copy) — matched baseline ---"
-    log "    (Paper result re-run with same commit/binary as V0-V3 for controlled comparison)"
+    log "    (Paper result re-run with same commit/binary as V0-V3' for controlled comparison)"
     for n in $N_VALUES; do
         run_cell "v4_order5_ack2_rf2_copy" "complete-dram-replica" \
             5 2 2 "memory-copy" "$n" "$(hosts_for_n "$n")" "${V4_ENV[@]}" || true

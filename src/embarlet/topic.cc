@@ -4972,7 +4972,7 @@ void Topic::EpochDriverThread() {
 			}
 
 			size_t buffered_batches = 0;
-			for (const auto& q : next_buf.per_broker) buffered_batches += q.size();
+			for (const auto& q : next_buf.per_broker) buffered_batches += q.batches.size();
 			const size_t held_batches = GetTotalHoldBufferSize();
 			LOG(INFO) << "EpochDriverThread: Sealed trailing epoch " << next_epoch
 			          << " (buffered_batches=" << buffered_batches
@@ -5994,19 +5994,22 @@ void Topic::EpochSequencerThread() {
 		level0.clear(); level5.clear(); ready_level5.clear(); ready.clear();
 		by_slot.clear();
 		// [PHASE-10a] Pre-allocate batch_list
+		// [[OPT-B]] Drain each broker queue under its own lock (no shared data_mu).
 		{
 			size_t total = 0;
-			std::lock_guard<std::mutex> data_lock(buf.data_mu);
-			for (const auto& v : buf.per_broker) total += v.size();
+			for (auto& pbq : buf.per_broker) {
+				std::lock_guard<std::mutex> lk(pbq.mu);
+				total += pbq.batches.size();
+			}
 			batch_list.reserve(total);
 		}
 		{
-			std::lock_guard<std::mutex> data_lock(buf.data_mu);
-			for (auto& v : buf.per_broker) {
+			for (auto& pbq : buf.per_broker) {
+				std::lock_guard<std::mutex> lk(pbq.mu);
 				batch_list.insert(batch_list.end(),
-					std::make_move_iterator(v.begin()),
-					std::make_move_iterator(v.end()));
-				v.clear();
+					std::make_move_iterator(pbq.batches.begin()),
+					std::make_move_iterator(pbq.batches.end()));
+				pbq.batches.clear();
 			}
 		}
 
@@ -6309,20 +6312,23 @@ void Topic::EpochSequencerThread() {
 				continue;
 			}
 		}
+		// [[OPT-B]] Drain each broker queue under its own lock.
 		{
 			size_t total = 0;
-			std::lock_guard<std::mutex> data_lock(buf.data_mu);
-			for (const auto& v : buf.per_broker) total += v.size();
+			for (auto& pbq : buf.per_broker) {
+				std::lock_guard<std::mutex> lk(pbq.mu);
+				total += pbq.batches.size();
+			}
 			batch_list.reserve(total);
 		}
 		LOG(INFO) << "EpochSequencerThread Drain: Processing epoch " << last << " (buffer " << buffer_idx << ")";
 		{
-			std::lock_guard<std::mutex> data_lock(buf.data_mu);
-			for (auto& v : buf.per_broker) {
+			for (auto& pbq : buf.per_broker) {
+				std::lock_guard<std::mutex> lk(pbq.mu);
 				batch_list.insert(batch_list.end(),
-					std::make_move_iterator(v.begin()),
-					std::make_move_iterator(v.end()));
-				v.clear();
+					std::make_move_iterator(pbq.batches.begin()),
+					std::make_move_iterator(pbq.batches.end()));
+				pbq.batches.clear();
 			}
 		}
 		buf.state.store(EpochBuffer5::State::IDLE, std::memory_order_release);
@@ -7907,8 +7913,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 						EpochBuffer5& cur_buf = epoch_buffers_[epoch % 3];
 						if (cur_buf.enter_collection(broker_id)) {
 							{
-								std::lock_guard<std::mutex> data_lock(cur_buf.data_mu);
-								cur_buf.per_broker[broker_id].push_back(skip_marker);
+								// [[OPT-B]] per-broker lock: no cross-scanner contention
+								std::lock_guard<std::mutex> data_lock(cur_buf.per_broker[broker_id].mu);
+								cur_buf.per_broker[broker_id].batches.push_back(skip_marker);
 							}
 							cur_buf.exit_collection(broker_id);
 							pushed = true;
@@ -7916,8 +7923,8 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 							EpochBuffer5& next_buf = epoch_buffers_[(epoch + 1) % 3];
 							if (next_buf.enter_collection(broker_id)) {
 								{
-									std::lock_guard<std::mutex> data_lock(next_buf.data_mu);
-									next_buf.per_broker[broker_id].push_back(skip_marker);
+									std::lock_guard<std::mutex> data_lock(next_buf.per_broker[broker_id].mu);
+									next_buf.per_broker[broker_id].batches.push_back(skip_marker);
 								}
 								next_buf.exit_collection(broker_id);
 								pushed = true;
@@ -8030,8 +8037,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 			EpochBuffer5& cur_buf = epoch_buffers_[epoch % 3];
 			if (cur_buf.enter_collection(broker_id)) {
 				{
-					std::lock_guard<std::mutex> data_lock(cur_buf.data_mu);
-					cur_buf.per_broker[broker_id].push_back(pending);
+					// [[OPT-B]] per-broker lock: no cross-scanner contention
+					std::lock_guard<std::mutex> data_lock(cur_buf.per_broker[broker_id].mu);
+					cur_buf.per_broker[broker_id].batches.push_back(pending);
 				}
 				cur_buf.exit_collection(broker_id);
 				pushed = true;
@@ -8041,8 +8049,8 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				EpochBuffer5& next_buf = epoch_buffers_[(epoch + 1) % 3];
 				if (next_buf.enter_collection(broker_id)) {
 					{
-						std::lock_guard<std::mutex> data_lock(next_buf.data_mu);
-						next_buf.per_broker[broker_id].push_back(pending);
+						std::lock_guard<std::mutex> data_lock(next_buf.per_broker[broker_id].mu);
+						next_buf.per_broker[broker_id].batches.push_back(pending);
 					}
 					next_buf.exit_collection(broker_id);
 					pushed = true;
@@ -8234,8 +8242,9 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				EpochBuffer5& buf = epoch_buffers_[epoch % 3];
 				if (buf.enter_collection(broker_id)) {
 					{
-						std::lock_guard<std::mutex> data_lock(buf.data_mu);
-						buf.per_broker[broker_id].push_back(pending);
+						// [[OPT-B]] per-broker lock: no cross-scanner contention
+						std::lock_guard<std::mutex> data_lock(buf.per_broker[broker_id].mu);
+						buf.per_broker[broker_id].batches.push_back(pending);
 					}
 					buf.exit_collection(broker_id);
 					pushed = true;
