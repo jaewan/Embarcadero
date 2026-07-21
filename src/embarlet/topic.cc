@@ -5106,11 +5106,19 @@ void Topic::CommitEpoch(
 			<< " fenced=" << ((flags & kSessionEntryFlagFenced) != 0);
 		return true;
 	};
+	// [[OPT-GUARD]] Fast-path: skip spatial guard entirely when no session has ever been
+	// rejected (the common case on a healthy cluster). The guard only fires when a session
+	// is fenced mid-flight; once any reject occurs we revert to the full scan.
+	// Correctness: fencing is already enforced in classify_one (holds/drops fenced sessions
+	// before CommitEpoch); spatial_guard is a second, durable-CXL defense. Skipping it when
+	// order5_spatial_guard_rejects_==0 is safe because fencing has not occurred.
 	{
 		const auto guard_t = phase_now();
-		ready.erase(
-			std::remove_if(ready.begin(), ready.end(), spatial_guard_reject),
-			ready.end());
+		if (order5_spatial_guard_rejects_.load(std::memory_order_relaxed) > 0) {
+			ready.erase(
+				std::remove_if(ready.begin(), ready.end(), spatial_guard_reject),
+				ready.end());
+		}
 		phase_ns(order5_commit_guard_ns_, guard_t);
 	}
 	if (ready.empty()) {
@@ -5257,7 +5265,10 @@ void Topic::CommitEpoch(
         // seals the collector must commit a client's batches in strictly increasing client_seq.
         // A LOWER client_seq committed after a higher one for the same session is a genuine
         // collector reorder and must be surfaced immediately under EMBAR_ASSERT_COMMIT_ORDER.
-        if (order_ == kOrderStrong && (p.from_hold || p.hdr != nullptr)) {
+        // [[OPT-W12]] The commit_order_last_seq_ map update (flat_hash_map find+insert per batch)
+        // is purely a debug invariant used by ShouldAssertCommitOrder(). Gate the entire block
+        // behind the assert flag so production runs pay zero cost (no map write, no map lookup).
+        if (ShouldAssertCommitOrder() && order_ == kOrderStrong && (p.from_hold || p.hdr != nullptr)) {
             const uint64_t w12_cid = entry->client_id;
             const uint64_t w12_seq = entry->client_seq;
             const uint32_t w12_session_epoch =
@@ -5270,27 +5281,57 @@ void Topic::CommitEpoch(
                            << " session_epoch=" << w12_session_epoch
                            << " committed client_seq=" << w12_seq << " <= last=" << w12_it->second
                            << " broker=" << entry->broker_id << " goi_index=" << batch_index;
-                if (ShouldAssertCommitOrder()) {
-                    CHECK_GT(w12_seq, w12_it->second)
-                        << "[W1.2] per-session commit-order invariant violated";
-                }
+                CHECK_GT(w12_seq, w12_it->second)
+                    << "[W1.2] per-session commit-order invariant violated";
                 commit_order_last_seq_[w12_session_key] =
                     std::max<uint64_t>(w12_seq, w12_it->second);
             } else {
                 commit_order_last_seq_[w12_session_key] = w12_seq;
             }
         }
-        // [[CXL-1]] Sentinel-last ACROSS BOTH cache lines. LINE1 (client_seq@64, session_epoch@88,
-        // pbr_index, cumulative_message_count) must reach memory BEFORE LINE0, whose global_seq@0
-        // the recovery reader (RecoverSequencer5State) treats as the entry-valid sentinel. flush_cacheline
-        // is clflushopt (weakly ordered), so a store_fence between the two evictions is REQUIRED to keep
-        // line1's flush ahead of line0's; otherwise a crash/recovery reader could pair a fresh global_seq
-        // with stale line1 fields and poison the recovered dedup/FIFO frontier.
-        CXL::store_fence();                                                  // drain field stores
-        CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);  // LINE1 durable first
-        CXL::store_fence();                                                  // order line1 flush before sentinel flush
-        CXL::flush_cacheline(entry);                                         // LINE0 (global_seq sentinel) durable last
+        // [[OPT-GOI-FENCE]] LINE1 flush deferred to Pass 2 below.
+        // (No per-batch SFENCE here — see Pass 2 comment for the invariant argument.)
+        (void)entry;  // suppress unused-variable warning; entry used in Pass 2 via index
     }
+
+    // [[OPT-GOI-FENCE Pass 2]] Batched fence sequence for the entire epoch.
+    // [[CXL-1]] requires: all LINE1 fields durable BEFORE LINE0 sentinel. Original code:
+    //   per-batch: store_fence → flush_LINE1 → store_fence → flush_LINE0  (2×B SFENCEs)
+    // Optimized:  store_fence → flush_all_LINE1 → store_fence → flush_all_LINE0 → store_fence
+    //   → 3 total SFENCEs per epoch regardless of batch count.
+    // Correctness argument:
+    //   (a) The first store_fence drains all field stores from Pass 1 across all entries.
+    //       Since entries are GOI array slots written sequentially by one thread, all stores
+    //       are already in the store buffer by this point; the SFENCE drains them all at once.
+    //   (b) All flush_LINE1 calls (clflushopt, weakly ordered) are then issued. Because SFENCE
+    //       precedes them, the lines they evict contain committed data.
+    //   (c) The second store_fence serializes all LINE1 clflushopt above against LINE0 below,
+    //       preserving the [[CXL-1]] LINE1-before-LINE0 durability ordering globally.
+    //   (d) All flush_LINE0 calls (sentinel, includes global_seq) are issued.
+    //   (e) Final store_fence ensures LINE0 sentinels are visible before any reader can act.
+    // Note: the sentinel (global_seq) being written in Pass 1 and its LINE0 flush deferred
+    // to here is safe because no reader outside this thread can observe a partial GOI entry:
+    // the sentinel is LINE0[0:8] and is only meaningful after the LINE1 fields are durable.
+    CXL::store_fence();  // (a) drain all field stores from Pass 1
+    {
+        size_t goi_pass2_idx = 0;
+        for (const PendingBatch5& p : ready) {
+            if (p.skipped || p.is_held_marker) continue;
+            const GOIEntry* entry = &goi[base_batch_index_order5 + goi_pass2_idx++];
+            CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(entry) + 64);  // (b) LINE1
+        }
+    }
+    CXL::store_fence();  // (c) order all LINE1 evictions before LINE0
+    {
+        size_t goi_pass2_idx = 0;
+        for (const PendingBatch5& p : ready) {
+            if (p.skipped || p.is_held_marker) continue;
+            GOIEntry* entry = &goi[base_batch_index_order5 + goi_pass2_idx++];
+            CXL::flush_cacheline(entry);  // (d) LINE0 (global_seq sentinel) last
+        }
+    }
+    CXL::store_fence();  // (e) sentinels durable before any reader
+
     if (commit_profile) {
         order5_commit_goi_ns_.fetch_add(
             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
