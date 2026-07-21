@@ -4847,6 +4847,9 @@ void Topic::EpochDriverThread() {
 							}
 							continue;
 						}
+						// [[FAST-SEAL]] Stamp collection start for fast-seal floor check.
+						next_buf.epoch_collection_start_ns.store(
+							SteadyNowNs(), std::memory_order_relaxed);
 						epoch_index_.store(next, std::memory_order_release);
 						break;
 					}
@@ -4945,6 +4948,9 @@ void Topic::EpochDriverThread() {
 			if (!next_buf.reset_and_start()) {
 				break;
 			}
+			// [[FAST-SEAL]] Record when this epoch started collecting so scanners can
+			// enforce the kFastSealFloorNs minimum age before attempting a fast seal.
+			next_buf.epoch_collection_start_ns.store(SteadyNowNs(), std::memory_order_relaxed);
 			epoch_index_.store(next_epoch, std::memory_order_release);
 			LOG(INFO) << "EpochDriverThread: Trailing epoch " << next_epoch << " ready for collection";
 
@@ -6197,6 +6203,14 @@ void Topic::EpochSequencerThread() {
 		CommitEpoch(ready, by_slot, contiguous_consumed_per_broker, broker_seen_in_epoch,
 		           cv_max_cumulative, cv_max_pbr_index, batch_list, /*is_drain_mode=*/false);
 		FlushAccumulatedCVLogicalOnly(cv_logical_only_cumulative, cv_logical_only_pbr_index);
+
+		// [[FAST-SEAL]] After a clean commit, update the steady-state flag.
+		// Uses the lock-free order5_total_hold_size_ counter rather than acquiring
+		// any shard mutex — avoids contention with ProcessLevel5BatchesShard.
+		// Steady-state = no held batches anywhere across all shards.
+		order5_steady_state_.store(
+			order5_total_hold_size_.load(std::memory_order_acquire) == 0,
+			std::memory_order_release);
 		}
 
 	// [[TAIL_STALL_FIX]] Drain remaining sealed epochs before exit.
@@ -6539,7 +6553,9 @@ void Topic::ClientGc(Level5ShardState& shard) {
 	for (size_t cid : evict) {
 		auto hold_it = shard.hold_buffer.find(cid);
 		if (hold_it != shard.hold_buffer.end()) {
-			shard.hold_buffer_size -= hold_it->second.size();
+			const size_t n = hold_it->second.size();
+			shard.hold_buffer_size -= n;
+			order5_total_hold_size_.fetch_sub(n, std::memory_order_release);
 			shard.hold_buffer.erase(hold_it);
 		}
 		shard.clients_with_held_batches.erase(cid);
@@ -6780,7 +6796,9 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			for (const auto& [broker_id, slot_offset, hdr] : retire) {
 				RetireOrder5HeldSlotAndAdvance(hdr, broker_id, slot_offset);
 			}
-			shard.hold_buffer_size -= hold_it->second.size();
+			const size_t n = hold_it->second.size();
+			shard.hold_buffer_size -= n;
+			order5_total_hold_size_.fetch_sub(n, std::memory_order_release);
 			shard.hold_buffer.erase(hold_it);
 		}
 		shard.clients_with_held_batches.erase(shard_session_key);
@@ -7015,6 +7033,9 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				record_hold_insert(p.client_id, stream_map);
 			}
 			shard.hold_buffer_size++;
+			// [[FAST-SEAL]] Increment the lock-free aggregate; sequencer reads this
+			// without holding any shard mutex to determine steady-state.
+			order5_total_hold_size_.fetch_add(1, std::memory_order_release);
 			shard.clients_with_held_batches.insert(key);
 
 			PendingBatch5 marker;
@@ -7295,6 +7316,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 					}
 					cmap.erase(seq_it);
 					shard.hold_buffer_size--;
+				order5_total_hold_size_.fetch_sub(1, std::memory_order_release);
 				continue;
 			}
 			PendingBatch5 b = std::move(he.batch);
@@ -7395,6 +7417,7 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 						he.batch.hdr, he.meta.broker_id, he.meta.slot_offset);
 					cmap.erase(seq_it);
 					shard.hold_buffer_size--;
+				order5_total_hold_size_.fetch_sub(1, std::memory_order_release);
 				continue;
 			}
 			PendingBatch5 b = std::move(he.batch);
@@ -8183,6 +8206,52 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	total_batches_processed++;
 	scanner_pushed_batches_[broker_id].fetch_add(1, std::memory_order_relaxed);
 	scanner_pushed_msgs_[broker_id].fetch_add(static_cast<uint64_t>(pending.num_msg), std::memory_order_relaxed);
+
+	// [[FAST-SEAL]] Steady-state early-seal: if the system has no pending holds/gaps
+	// and the epoch has been open long enough, attempt to seal immediately rather than
+	// waiting for the 500µs EpochDriverThread timer. Reduces average ACK latency from
+	// epoch/2 (~250µs) to single-digit µs on the co-located steady-state path.
+	//
+	// Trigger conditions (all must be true):
+	//   1. order5_steady_state_ == true (sequencer says no active holds or gaps)
+	//   2. Epoch has been COLLECTING for >= kFastSealFloorNs (avoids sealing on first push
+	//      before other brokers have had a chance to push their batches)
+	//   3. The epoch is still in COLLECTING state (not already sealed by driver)
+	//
+	// Correctness:
+	//   - seal() is a CAS on state COLLECTING→SEALED; if the driver wins, this is a no-op.
+	//   - All ordering guarantees (PerSessionPrefix, NoDupCommit, etc.) are enforced by
+	//     CommitEpoch + classify_one, which run AFTER seal() quiesces — both unchanged.
+	//   - Sealing an epoch early is safe: batches from the same session that land in the
+	//     next epoch are still committed in sequence via ClientState5::next_expected.
+	//   - If seal() succeeds, we advance epoch_index_ to the successor, unblocking the
+	//     EpochSequencerThread busy-spin and triggering CommitEpoch immediately.
+	if (order5_steady_state_.load(std::memory_order_acquire)) {
+		const uint64_t pushed_epoch = epoch_index_.load(std::memory_order_acquire);
+		EpochBuffer5& pushed_buf = epoch_buffers_[pushed_epoch % 3];
+		const uint64_t start_ns =
+			pushed_buf.epoch_collection_start_ns.load(std::memory_order_relaxed);
+		const uint64_t age_ns = (start_ns > 0) ? (SteadyNowNs() - start_ns) : 0;
+		if (age_ns >= kFastSealFloorNs &&
+		    pushed_buf.state.load(std::memory_order_acquire) == EpochBuffer5::State::COLLECTING) {
+			if (pushed_buf.seal()) {
+				// Seal succeeded — advance epoch_index_ to the successor so the
+				// EpochSequencerThread picks it up on its next busy-spin iteration.
+				const uint64_t next_epoch = pushed_epoch + 1;
+				EpochBuffer5& next_buf = epoch_buffers_[next_epoch % 3];
+				if (next_buf.state.load(std::memory_order_acquire) == EpochBuffer5::State::IDLE) {
+					next_buf.epoch_collection_start_ns.store(
+						SteadyNowNs(), std::memory_order_relaxed);
+					next_buf.reset_and_start();
+				}
+				// CAS epoch_index_ from pushed_epoch → next_epoch (driver may race, that's fine).
+				uint64_t expected = pushed_epoch;
+				epoch_index_.compare_exchange_strong(
+					expected, next_epoch, std::memory_order_release, std::memory_order_relaxed);
+				order5_fast_seal_count_.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
 	if (slot_index < last_pushed_pbr_index_per_slot.size()) {
 		last_pushed_pbr_index_per_slot[slot_index] = pending.cached_pbr_absolute_index;
 	}

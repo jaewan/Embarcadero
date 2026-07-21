@@ -197,15 +197,16 @@ struct alignas(64) EpochBuffer5 {
 		return true;
 	}
 
+	// [[FAST-SEAL]] epoch_collection_start_ns: written by EpochDriverThread (or
+	// reset_and_start caller) when a new COLLECTING epoch opens. Read by scanners
+	// to enforce a minimum collection floor before attempting an early seal.
+	std::atomic<uint64_t> epoch_collection_start_ns{0};
+
 	void exit_collection(int broker_id) {
 		if (broker_id < 0 || broker_id >= NUM_MAX_BROKERS) return;
 		broker_active[broker_id].store(false, std::memory_order_release);
 
-		// [[OPT-C]] Only notify the driver when ALL broker scanners have exited.
-		// Replaces unconditional notify_all() on every push, reducing kernel wakeups
-		// from O(batch_rate) ~7.5 M/s to O(epoch_rate) ~2 K/s at N=4.
-		// Correctness: seal() checks broker_active[] inside wait_for(), so as long
-		// as the last exiting scanner notifies, seal() will see the quiesced state.
+		// [[OPT-C]] Only notify when ALL broker scanners have exited.
 		bool any_active = false;
 		for (int i = 0; i < NUM_MAX_BROKERS; ++i) {
 			if (broker_active[i].load(std::memory_order_acquire)) { any_active = true; break; }
@@ -991,6 +992,13 @@ class Topic {
 		std::atomic<uint64_t> order5_export_overruns_{0};
 		std::atomic<uint64_t> order5_export_skipped_batches_{0};
 		std::atomic<uint64_t> order5_spatial_guard_rejects_{0};
+		// [[FAST-SEAL]] Counter of fast-seal events triggered by scanners (diagnostic).
+		std::atomic<uint64_t> order5_fast_seal_count_{0};
+		// [[FAST-SEAL]] Lock-free aggregate hold-buffer size across all shards.
+		// Incremented by classify_one when a batch enters the hold buffer;
+		// decremented when it is released. Read by EpochSequencerThread (no lock)
+		// to determine steady-state without acquiring any shard mutex.
+		std::atomic<uint64_t> order5_total_hold_size_{0};
 		// [[ORDER5_COMMIT_PROFILE]] Cumulative wall-clock ns spent in each CommitEpoch phase,
 		// single-writer (EpochSequencerThread only) so relaxed ops suffice. Enabled via
 		// EMBAR_ORDER5_COMMIT_PROFILE; see topic.cc's periodic reporter in EpochSequencerThread.
@@ -1056,6 +1064,16 @@ class Topic {
 		// reopen/resubmit epoch is not immediately re-fenced under the 250ms short
 		// lease (seen as epoch 1→5 storm + pool-pin hang at linger@750 4GiB).
 		std::atomic<uint64_t> force_expire_rearm_cooldown_until_ns_{0};
+		// [[FAST-SEAL]] Steady-state flag: set true by EpochSequencerThread after a
+		// CommitEpoch that leaves the hold buffer empty and no deferred batches.
+		// Cleared immediately when a hold entry is inserted (classify_one GT path).
+		// When true, BrokerScannerWorker5 may attempt a fast seal after pushing,
+		// bypassing the 500µs epoch timer if the epoch has been open ≥kFastSealFloorNs.
+		std::atomic<bool> order5_steady_state_{false};
+		// Minimum age (ns) an epoch must have before a scanner may fast-seal it.
+		// 50µs: long enough for all N brokers to push their first batch in a
+		// synchronised N=4 workload, short enough to cut the ~250µs average wait.
+		static constexpr uint64_t kFastSealFloorNs = 50'000;
 		struct Order5FlightEvent {
 			uint64_t ts_ns{0};
 			uint64_t a{0};
