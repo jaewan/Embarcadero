@@ -1,56 +1,67 @@
 {
-  "schema": 1,
   "campaign": "data/paper_eval/fig3/fig3_failure_official_8351459f",
+  "figure": {
+    "generator": {
+      "path": "scripts/publication/plot_failure_combined.py",
+      "sha256": "c9af6e96c648739f7d6bc5c0a4b8db4cdafe995503c89ceeaa73f322b51ee879"
+    },
+    "outputs": {
+      "Paper/Figures/failure_combined.pdf": "859b4c85fc4e17ab66baf19ba34a67887b1db702b9773811c732d0a3d229ef0e",
+      "data/paper_eval/fig3/fig3_failure_official_8351459f/failure_combined.pdf": "859b4c85fc4e17ab66baf19ba34a67887b1db702b9773811c732d0a3d229ef0e",
+      "data/paper_eval/fig3/fig3_failure_official_8351459f/failure_combined.png": "f820bbf07f5581e4d8bf6c401118c44051945921dc946e4963004ae95e99f964"
+    }
+  },
   "git_commit": "8351459f420870dad3e39cd6630c9483386d9a05",
   "git_dirty_files": 0,
-  "pass_id": "20260718T134142Z",
   "inputs_sha256": {
     "runs/20260718T134142Z/prefix_safe/client_failure_trial1.log": "a0b6d08cdbba348483f6ad5558901435eeb7fe5f27b74430ca27f67b6c997103",
     "runs/20260718T134142Z/prefix_safe/client_failure_trial2.log": "867483747d60d9d29784c910018546a575769f45849e95a6bae99a9b67231440",
     "runs/20260718T134142Z/prefix_safe/client_failure_trial3.log": "dd74537eaa31e6e7786948fad034496e973918ff61a4df6d601465886ae9c32d"
   },
-  "trials": [
-    {
-      "trial": 1,
-      "kill_to_first_failure_ms": 112,
-      "kill_to_first_reconnect_ms": 113,
-      "kill_to_fence_ms": 5001.422,
-      "kill_to_resubmit_begin_ms": 7098.678,
-      "kill_to_ack_frontier_ms": 7100,
-      "suffix_batches": 513,
-      "unacked_bytes_end": 0,
-      "unacked_batches_end": 0
-    },
-    {
-      "trial": 2,
-      "kill_to_first_failure_ms": 118,
-      "kill_to_first_reconnect_ms": 119,
-      "kill_to_fence_ms": 4997.7970000000005,
-      "kill_to_resubmit_begin_ms": 7106.461,
-      "kill_to_ack_frontier_ms": 7203,
-      "suffix_batches": 512,
-      "unacked_bytes_end": 0,
-      "unacked_batches_end": 0
-    },
-    {
-      "trial": 3,
-      "kill_to_first_failure_ms": 114,
-      "kill_to_first_reconnect_ms": 115,
-      "kill_to_fence_ms": 5001.131,
-      "kill_to_resubmit_begin_ms": 7182.855,
-      "kill_to_ack_frontier_ms": 7200,
-      "suffix_batches": 512,
-      "unacked_bytes_end": 0,
-      "unacked_batches_end": 0
-    }
-  ],
   "medians": {
+    "kill_to_ack_frontier_ms": 7200.0,
+    "kill_to_fence_ms": 5001.131,
     "kill_to_first_failure_ms": 114.0,
     "kill_to_first_reconnect_ms": 115.0,
-    "kill_to_fence_ms": 5001.131,
     "kill_to_resubmit_begin_ms": 7106.461,
-    "kill_to_ack_frontier_ms": 7200.0,
     "suffix_batches": 512.0
   },
-  "scope": "protocol ACK/fence timeline; no downstream apply-state audit"
+  "pass_id": "20260718T134142Z",
+  "schema": 1,
+  "scope": "protocol ACK/fence timeline; no downstream apply-state audit",
+  "trials": [
+    {
+      "kill_to_ack_frontier_ms": 7100,
+      "kill_to_fence_ms": 5001.422,
+      "kill_to_first_failure_ms": 112,
+      "kill_to_first_reconnect_ms": 113,
+      "kill_to_resubmit_begin_ms": 7098.678,
+      "suffix_batches": 513,
+      "trial": 1,
+      "unacked_batches_end": 0,
+      "unacked_bytes_end": 0
+    },
+    {
+      "kill_to_ack_frontier_ms": 7203,
+      "kill_to_fence_ms": 4997.7970000000005,
+      "kill_to_first_failure_ms": 118,
+      "kill_to_first_reconnect_ms": 119,
+      "kill_to_resubmit_begin_ms": 7106.461,
+      "suffix_batches": 512,
+      "trial": 2,
+      "unacked_batches_end": 0,
+      "unacked_bytes_end": 0
+    },
+    {
+      "kill_to_ack_frontier_ms": 7200,
+      "kill_to_fence_ms": 5001.131,
+      "kill_to_first_failure_ms": 114,
+      "kill_to_first_reconnect_ms": 115,
+      "kill_to_resubmit_begin_ms": 7182.855,
+      "suffix_batches": 512,
+      "trial": 3,
+      "unacked_batches_end": 0,
+      "unacked_bytes_end": 0
+    }
+  ]
 }

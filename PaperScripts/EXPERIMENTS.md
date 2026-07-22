@@ -9,7 +9,8 @@ the data directory with results, and the plot script.
 - **Script:** `PaperScripts/run_fig1_throughput_scaling.sh`
 - **Data:** fixed-commit campaigns
   `data/paper_eval/fig1/fig1_{embar,scalog}_official_3eaadffb/results.csv`
-- **Plot:** `PaperScripts/plot_fig1_throughput_scaling.py`
+- **Plot:** `PaperScripts/plot_fig1_throughput_scaling.py` (matched scaling in
+  panels a--b; V0--V4 path decomposition in panel c; raw trials plus medians)
 - **Manifest:** `data/paper_eval/fig1/fig1_fixed_commit_3eaadffb_manifest.json`
 - **Selected rows:** `data/paper_eval/fig1/fig1_fixed_commit_3eaadffb_selected.csv`
 - **Generated figure:** `data/paper_eval/fig1/throughput_scaling.{pdf,png}`

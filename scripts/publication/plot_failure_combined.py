@@ -29,8 +29,11 @@ Env-var overrides (lower priority than CLI flags):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
+import shutil
 import sys
 
 import matplotlib
@@ -67,6 +70,22 @@ THROUGHPUT_THRESHOLD = 0.01
 TAIL_CUTOFF_FACTOR = 0.70
 ACK_MARGIN_SEC = 1.0
 YMAX_CAP_GBPS = 9.0
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _portable(path: str) -> str:
+    resolved = os.path.realpath(path)
+    try:
+        return os.path.relpath(resolved, os.path.realpath(REPO_ROOT))
+    except ValueError:
+        return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +608,6 @@ def make_figure(
     fig, axes = plt.subplots(
         1, 2,
         figsize=(6.8, 2.55),
-        constrained_layout=True,
     )
     ax_a, ax_b = axes
 
@@ -643,12 +661,13 @@ def make_figure(
     fig.legend(
         handles, labels,
         loc="lower center",
-        ncol=5,
-        bbox_to_anchor=(0.5, -0.01),
+        ncol=3,
+        bbox_to_anchor=(0.5, 0.01),
         frameon=True,
         handlelength=1.8,
         fontsize=6.5,
     )
+    fig.tight_layout(rect=(0, 0.15, 1, 1), pad=0.5)
 
     return fig
 
@@ -672,6 +691,16 @@ def main(argv=None):
         default=os.path.join(REPO_ROOT, "Paper", "Figures", "failure_combined.pdf"),
         help="Output PDF path",
     )
+    p.add_argument(
+        "--paper-out",
+        default="",
+        help="Optional exact copy of the generated PDF for the paper tree",
+    )
+    p.add_argument(
+        "--manifest",
+        default="",
+        help="Optional existing campaign manifest to augment with figure provenance",
+    )
     args = p.parse_args(argv)
 
     # Env-var fallbacks
@@ -690,9 +719,33 @@ def main(argv=None):
 
     out = args.out
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
-    fig.savefig(out, bbox_inches="tight", dpi=300)
+    fig.savefig(
+        out, bbox_inches="tight", dpi=300,
+        metadata={"CreationDate": None, "ModDate": None},
+    )
+    if args.paper_out:
+        os.makedirs(os.path.dirname(os.path.abspath(args.paper_out)) or ".", exist_ok=True)
+        shutil.copyfile(out, args.paper_out)
     png = out.replace(".pdf", ".png")
     fig.savefig(png, bbox_inches="tight", dpi=200)
+    if args.manifest:
+        with open(args.manifest) as handle:
+            manifest = json.load(handle)
+        manifest["figure"] = {
+            "generator": {
+                "path": _portable(__file__),
+                "sha256": _sha256(__file__),
+            },
+            "outputs": {
+                _portable(out): _sha256(out),
+                **({_portable(args.paper_out): _sha256(args.paper_out)}
+                   if args.paper_out else {}),
+                _portable(png): _sha256(png),
+            },
+        }
+        with open(args.manifest, "w") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
     print(f"Saved: {out}")
     print(f"Saved: {png}")
     return 0

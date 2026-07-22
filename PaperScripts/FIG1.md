@@ -35,9 +35,18 @@ true memory-copy).
 
 NUMA pins: c4→1, c3→1, c1→0, local→0 (broker node).
 
-## Series (legend)
+## Figure layout
 
-Embar O5 / Corfu O2 / Scalog O1 × {disk, mem} with **matched data sinks**.
+Panels (a--b) plot Embar O5 and Scalog O1 across {disk, mem} with **matched
+data sinks**. Panel (c) plots the validated V0--V4 Embarcadero path
+decomposition at N=2 from `fig1_path_decomp/path_ablation_summary.csv`.
+Individual accepted trials remain visible behind median lines; no
+performance-based outlier filtering is allowed.
+
+The N=4 point changes both the client roster and the reported metric. It is
+therefore drawn as an open `4*` ceiling marker connected by a dashed segment,
+not as a continuation of the N=1--3 remote overlap-throughput curve.
+
 LazyLog is **excluded from the sink panel by default** (`SKIP_LAZYLOG=1`): faithful
 ACK BW is metadata-bound (`AppendToAll` + sidecar fdatasync), so disk↔mem is not
 a fair data-sink A/B.

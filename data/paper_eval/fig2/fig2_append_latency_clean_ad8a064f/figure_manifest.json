@@ -1,0 +1,36 @@
+{
+  "contract": {
+    "epoch_trials_per_cell": 3,
+    "load_trials_per_cell": 3,
+    "primary_cell": "fig2_embar_o5_ack2_rf2_mem",
+    "selection": "all status=ok rows; no performance filtering"
+  },
+  "epochs_us": [
+    250,
+    500,
+    1000,
+    2000
+  ],
+  "generator": {
+    "path": "PaperScripts/plot_append_latency_paper.py",
+    "sha256": "c20740a5c4f433f5b1dbc3cd22d439e29f9068b40d8d0f75bb2a8762b389e855"
+  },
+  "inputs": {
+    "data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/results.csv": "816e8d320f5443d3cf56275230a265f177ceda7c5c0b4aa74b39f11f6369fd7f",
+    "data/paper_eval/fig2/fig2_mechanism_epoch_clean_fd1a36ce/results.csv": "6a9cb8b2ac7fa185335bc375b6a6b5a6a8846b193590291eac034e67d26f895d"
+  },
+  "loads_mbps": [
+    100,
+    250,
+    500,
+    750,
+    1000,
+    1500,
+    2000
+  ],
+  "outputs": {
+    "Paper/Figures/append_latency.pdf": "1aabc1f2b101e4481f744e74be7444c784728daaa8c9506b72f3716c82a79ce8",
+    "data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/append_latency.pdf": "1aabc1f2b101e4481f744e74be7444c784728daaa8c9506b72f3716c82a79ce8",
+    "data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/append_latency.png": "3ffa1ba8beb4004617a553d7ae9b6ad175e9d05543cdeaf5730071dbfacb7d0a"
+  }
+}
