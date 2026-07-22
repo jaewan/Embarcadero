@@ -547,6 +547,15 @@ if [[ "${SMOKE:-0}" != "1" ]]; then
             THREADS_PER_BROKER="$THREADS_THROUGHPUT" \
             EMBARCADERO_HEAD_ADDR="$BROKER_IP"
 
+        # Unordered ingestion ceiling for the same remote roster.  This is an
+        # ablation reference, not a contract-equivalent baseline for Scalog.
+        run_multi_cell "e2_embar0_rf0_ack1_n${nc}" "$nc" "$local_csv" \
+            SEQUENCER=EMBARCADERO ORDER=0 ACK=1 REPLICATION_FACTOR=0 \
+            TEST_TYPE=5 EMBARCADERO_RUNTIME_MODE=throughput \
+            EMBARCADERO_CLIENT_PUB_BATCH_KB="$CLIENT_PUB_BATCH_KB" \
+            THREADS_PER_BROKER="$THREADS_THROUGHPUT" \
+            EMBARCADERO_HEAD_ADDR="$BROKER_IP"
+
         if [[ "$SKIP_BASELINES" != "1" ]]; then
             run_multi_cell "e2_corfu_rf0_n${nc}" "$nc" "$local_csv" \
                 SEQUENCER=CORFU ORDER=2 ACK=1 REPLICATION_FACTOR=0 \
