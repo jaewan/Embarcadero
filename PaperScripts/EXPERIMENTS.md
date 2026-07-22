@@ -31,6 +31,12 @@ the data directory with results, and the plot script.
   Set `INCLUDE_EPOCH_SWEEP=1` for the matched 250 MB/s epoch cells; validate
   the epoch and mechanism rows with
   `PaperScripts/summarize_fig2_mechanisms.py`.
+- **Mechanism/epoch data:**
+  `data/paper_eval/fig2/fig2_mechanism_epoch_clean_fd1a36ce/results.csv`
+- **Mechanism/epoch summary:**
+  `data/paper_eval/fig2/fig2_mechanism_epoch_clean_fd1a36ce/mechanism_epoch_summary.csv`
+- **Mechanism/epoch manifest:**
+  `data/paper_eval/fig2/fig2_mechanism_epoch_clean_fd1a36ce/mechanism_epoch_manifest.json`
   Corfu/Scalog comparison: `data/paper_eval/fig2/fig2_corfu_official_3eaadffb/` and `fig2_scalog_official_3eaadffb/`.
   Validate each clean baseline campaign with
   `PaperScripts/summarize_fig2_baseline.py`.
@@ -67,11 +73,19 @@ the data directory with results, and the plot script.
 
 ### Tab. epoch-sweep — Epoch-period causal proof
 - **Script:** `PaperScripts/run_fig2_latency_vs_load.sh` (epoch sweep cells)
-- **Data:** `data/paper_eval/fig2/fig2_append_latency/results.csv` (epoch_us varied cells)
+- **Data:**
+  `data/paper_eval/fig2/fig2_mechanism_epoch_clean_fd1a36ce/mechanism_epoch_summary.csv`
+- **Scope:** publisher append-to-ACK latency at 250 MB/s; the manifest records
+  downstream delivery-drain soft faults separately from completed ACK samples.
 
 ### Tab. latency — Cross-system append latency at 2 GB/s
 - **Script:** `PaperScripts/run_fig2_latency_vs_load.sh`
-- **Data:** `data/paper_eval/fig2/fig2_append_latency/results.csv` (Embar + Scalog)
+- **Embar data:**
+  `data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/primary_summary.csv`
+- **Scalog data:**
+  `data/paper_eval/fig2/fig2_scalog_official_3eaadffb/results.csv`
+- **Corfu data:**
+  `data/paper_eval/fig2/fig2_corfu_official_3eaadffb/results.csv`
 
 ### Tab. kv-pipelined — SMR FIFO end-to-end (Q3)
 - **Script:** `benchmarks/kv_store/run_smr_fifo_eval.sh`

@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--load-mbps", type=int, default=250)
     parser.add_argument("--manifest-out", type=Path)
+    parser.add_argument("--summary-out", type=Path)
     args = parser.parse_args()
 
     contract_path = args.campaign / "campaign_contract.md"
@@ -43,6 +44,13 @@ def main() -> None:
     if len(commits) != 1:
         raise SystemExit("validation failed: selected rows mix commits")
 
+    allowed_notes = {"", "no_deliver_metric", "saturated_e2e_lt_50pct_target"}
+    unexpected_notes = sorted({row["notes"] for row in rows} - allowed_notes)
+    if unexpected_notes:
+        raise SystemExit(
+            "validation failed: unexpected run notes: " + ", ".join(unexpected_notes)
+        )
+
     summary: list[dict[str, object]] = []
     for cell in sorted(wanted):
         group = [row for row in rows if row["cell"] == cell]
@@ -58,8 +66,14 @@ def main() -> None:
         )
         if {int(row["epoch_us"]) for row in group} != {expected_epoch}:
             raise SystemExit(f"validation failed: {cell} uses the wrong epoch")
+        offered = [float(row["achieved_offered_mbps"]) for row in group]
+        if any(abs(value - args.load_mbps) / args.load_mbps > 0.02 for value in offered):
+            raise SystemExit(f"validation failed: {cell} missed its offered-load target")
         p50 = [float(row["pub_ack_p50_us"]) for row in group]
         p99 = [float(row["pub_ack_p99_us"]) for row in group]
+        soft_faults = [
+            row for row in group if row["notes"] == "saturated_e2e_lt_50pct_target"
+        ]
         summary.append(
             {
                 "cell": cell,
@@ -72,6 +86,7 @@ def main() -> None:
                 "append_ack_p99_us_stddev": statistics.stdev(p99),
                 "values_p50_us": p50,
                 "values_p99_us": p99,
+                "delivery_drain_soft_fault_trials": len(soft_faults),
             }
         )
 
@@ -80,6 +95,10 @@ def main() -> None:
         "campaign": str(args.campaign),
         "git_commit": next(iter(commits)),
         "git_dirty": False,
+        "metric_scope": (
+            "publisher append-to-ACK latency; downstream delivery-drain soft faults "
+            "are disclosed but do not replace or invalidate completed ACK samples"
+        ),
         "inputs_sha256": {
             results_path.name: hashlib.sha256(results_path.read_bytes()).hexdigest(),
             contract_path.name: hashlib.sha256(contract_path.read_bytes()).hexdigest(),
@@ -89,6 +108,24 @@ def main() -> None:
     if args.manifest_out:
         args.manifest_out.parent.mkdir(parents=True, exist_ok=True)
         args.manifest_out.write_text(json.dumps(manifest, indent=2) + "\n")
+    if args.summary_out:
+        args.summary_out.parent.mkdir(parents=True, exist_ok=True)
+        with args.summary_out.open("w", newline="") as stream:
+            fieldnames = [
+                "cell",
+                "target_mbps",
+                "epoch_us",
+                "trials",
+                "append_ack_p50_us_median",
+                "append_ack_p50_us_stddev",
+                "append_ack_p99_us_median",
+                "append_ack_p99_us_stddev",
+                "delivery_drain_soft_fault_trials",
+            ]
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            for item in summary:
+                writer.writerow({field: item[field] for field in fieldnames})
     print(json.dumps(manifest, indent=2))
 
 

@@ -1,0 +1,29 @@
+16309d069080867dd2299ae2e1cc3a5cb8c33969
+ M benchmarks/kv_store/README_SMR_FIFO.md
+ M benchmarks/kv_store/distributed_kv_store.cc
+ M benchmarks/kv_store/distributed_kv_store.h
+ M benchmarks/kv_store/kv_bench_main.cc
+ M benchmarks/kv_store/run_kv_baseline_compare.sh
+ M benchmarks/kv_store/run_smr_fifo_eval.sh
+ M docs/handoff/BASELINE_IMPLEMENTATION_IMPROVEMENT_PLAN_2026_07_12.md
+ M scripts/README.md
+ M scripts/lib/broker_lifecycle.sh
+ M scripts/plot_smr_fifo.py
+ M scripts/run_latency.sh
+ M scripts/run_latency_vs_load.sh
+ M scripts/run_multiclient.sh
+ M src/cxl_manager/lazylog_metadata_replica.cc
+ M src/cxl_manager/lazylog_metadata_replica.h
+ M src/cxl_manager/scalog_local_sequencer.cc
+ M src/disk_manager/corfu_ordered_chain_smoke.cc
+ M src/disk_manager/corfu_replica_store.cc
+ M src/disk_manager/corfu_replica_store.h
+ M src/disk_manager/corfu_replication_manager.cc
+ M src/disk_manager/scalog_replication_manager.cc
+ M src/disk_manager/scalog_replication_manager.h
+ M src/embarlet/topic.cc
+?? PaperScripts/
+?? docs/agent-prompts/SMR_E2E_EVAL_AGENT_PROMPT.md
+?? docs/experiments/E2E_KV_SMR_EVAL_PLAN.md
+?? docs/handoff/FIG1_MEM_ANOMALY_DIAGNOSIS_2026_07_16.md
+?? src/embarlet/topic.cc.bak_fix_2026_07_16

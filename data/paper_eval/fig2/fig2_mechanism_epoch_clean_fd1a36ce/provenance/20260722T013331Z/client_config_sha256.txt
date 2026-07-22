@@ -1,0 +1,2 @@
+459caeef82bd49308c9370283d5df0345342ad0e991b14298de3e12e4b0a343d  /home/domin/Embarcadero/config/client.yaml
+430711ea5b0d41a530cd715d279f1589a3d9b1bf3b58cbd437f20745046d0752  /home/domin/Embarcadero/config/embarcadero.yaml
