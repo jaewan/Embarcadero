@@ -1,5 +1,10 @@
 # Distributed KV Store on Embarcadero Shared Log — SOSP Evaluation Agent Prompt
 
+> **Historical prompt; do not execute.** It predates the current
+> `benchmarks/kv_store` harness, the VLDB submission target, and the remote
+> publication workflow. Use
+> `docs/agent-prompts/YCSB_DISTRIBUTED_KV_HANDOFF.md` for new YCSB work.
+
 ## Role and Objective
 
 You are a senior systems researcher implementing a **distributed key-value store** on top of the **Embarcadero shared log** for evaluation in a **SOSP 2026 submission**. Your goal is to design, implement, and benchmark a log-backed KV store that demonstrates Embarcadero's advantages over SCALOG, CORFU, and LazyLog as a shared log backbone.
