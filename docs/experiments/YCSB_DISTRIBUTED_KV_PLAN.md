@@ -669,13 +669,23 @@ gate is `valid=YES`/exit-code based, not the cosmetic `ops_line` — but it
 underscores why every result in this document has been cross-checked against
 raw log content rather than trusted from a driver's own summary output alone.
 
-**Status: gate steps 1-4 complete.** Remaining before Task 7 (the full
-preregistered matrix): (a) commit this session's changes — required per
-Section 6c, not optional — (b) CORFU/SCALOG gate smokes have not yet been
-run (only EMBARCADERO has been exercised through the distributed driver;
-CORFU/SCALOG sequencer bring-up in `run_ycsb_distributed.sh` is implemented
-per Section 6b but untested), (c) Section 2's clock-sync preflight (Task 2)
-is still open.
+**Status: gate steps 1-4 complete, and all Task 7 prerequisites now closed
+(2026-07-23).**
+
+- This session's changes committed (`88a073d5`, `c18fdd67`); re-ran
+  `cluster_setup.sh` against the clean commit and directly verified (not just
+  trusted the log) that c4's natively-rebuilt `kv_ycsb_bench` now contains
+  the key_offset fix via the committed `git archive` path — the manual
+  binary-copy workaround from Section 6c/6d is no longer needed or used.
+- `scripts/setup/check_clock_sync.sh` (new, committed): read-only
+  `chronyc tracking` check, no sudo/reconfiguration. c4/c3/c1 all under 3ms
+  of the NTP source — well within the 50ms default threshold.
+- CORFU and SCALOG gate smokes (`NUM_CLIENTS=1`, c4, RF1/ACK1): both **PASS**,
+  matching EMBARCADERO's result exactly (`1969 writes + 2031 reads = 4000`,
+  `valid=YES`). All three systems now confirmed working through the
+  distributed driver on real hardware, not just EMBARCADERO.
+
+Nothing outstanding blocks Task 7.
 
 ## 7. `benchmarks/README.md` correction (deferred until Section 6 tests land)
 
