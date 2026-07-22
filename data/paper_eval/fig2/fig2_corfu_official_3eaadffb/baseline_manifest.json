@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "system": "corfu",
+  "campaign": "data/paper_eval/fig2/fig2_corfu_official_3eaadffb",
+  "cell": "fig2_corfu_o2_ack2_rf2_mem",
+  "git_commit": "3eaadffb61eb3c4698aeb16a1cc845ed456ea035",
+  "git_dirty": false,
+  "inputs_sha256": {
+    "results.csv": "198bf771a4bc2935ae7e167eac1bb8604d7b30254a7f0ee1fef43666e687dcb2",
+    "campaign_contract.md": "6df23e5a74f2e986ec1ee1bdf4d7e95d018ebc1bbabd61651e721789b7e00877"
+  },
+  "summary": [
+    {
+      "target_mbps": 100,
+      "trials": 3,
+      "append_ack_p50_us_median": 2826.0,
+      "append_ack_p99_us_median": 58189.0,
+      "achieved_offered_mbps_median": 100.0,
+      "values_p50_us": [
+        2810.0,
+        2959.0,
+        2826.0
+      ],
+      "values_p99_us": [
+        58189.0,
+        45302.0,
+        58760.0
+      ]
+    },
+    {
+      "target_mbps": 250,
+      "trials": 3,
+      "append_ack_p50_us_median": 1460076.0,
+      "append_ack_p99_us_median": 2156247.0,
+      "achieved_offered_mbps_median": 155.702,
+      "values_p50_us": [
+        1864264.0,
+        1460076.0,
+        1447978.0
+      ],
+      "values_p99_us": [
+        2156247.0,
+        2132856.0,
+        2160892.0
+      ]
+    },
+    {
+      "target_mbps": 500,
+      "trials": 3,
+      "append_ack_p50_us_median": 1972837.0,
+      "append_ack_p99_us_median": 2141255.0,
+      "achieved_offered_mbps_median": 151.646,
+      "values_p50_us": [
+        1972837.0,
+        1722896.0,
+        1995618.0
+      ],
+      "values_p99_us": [
+        2143674.0,
+        2139541.0,
+        2141255.0
+      ]
+    },
+    {
+      "target_mbps": 1000,
+      "trials": 3,
+      "append_ack_p50_us_median": 1495096.0,
+      "append_ack_p99_us_median": 2142118.0,
+      "achieved_offered_mbps_median": 151.614,
+      "values_p50_us": [
+        1736343.0,
+        931017.0,
+        1495096.0
+      ],
+      "values_p99_us": [
+        2142118.0,
+        2133674.0,
+        2148442.0
+      ]
+    },
+    {
+      "target_mbps": 2000,
+      "trials": 3,
+      "append_ack_p50_us_median": 1900598.0,
+      "append_ack_p99_us_median": 2133018.0,
+      "achieved_offered_mbps_median": 156.627,
+      "values_p50_us": [
+        1773419.0,
+        1900598.0,
+        1914099.0
+      ],
+      "values_p99_us": [
+        2132836.0,
+        2154578.0,
+        2133018.0
+      ]
+    }
+  ]
+}

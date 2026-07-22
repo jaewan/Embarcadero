@@ -4,15 +4,22 @@
 import argparse
 import csv
 import glob
+import gzip
 import os
 import re
 import sys
 
 
+def open_text(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", errors="replace")
+    return open(path, errors="replace")
+
+
 def client_id_and_gap(path, require_gap, configured_gap_ms):
     client_id = None
     start = end = None
-    with open(path) as f:
+    with open_text(path) as f:
         for line in f:
             match = re.search(r"\bclient_id=(\d+)", line)
             if match and client_id is None:
@@ -35,7 +42,7 @@ def commits(path):
     rows = []
     pattern = re.compile(
         r"\[ORDER5_TEST_GOI_COMMIT\].*client=(\d+).*batch_seq=(\d+).*wall_ms=(\d+)")
-    with open(path) as f:
+    with open_text(path) as f:
         for line in f:
             match = pattern.search(line)
             if match:
@@ -64,6 +71,8 @@ def main():
             args.run_dir, f"trial{trial}_{args.control_session}.log")
         broker_log = os.path.join(
             args.run_dir, f"trial{trial}_attempt1_broker0.log")
+        if not os.path.exists(broker_log) and os.path.exists(broker_log + ".gz"):
+            broker_log += ".gz"
         try:
             affected_id, start, end = client_id_and_gap(
                 affected_log, True, args.gap_duration_ms)

@@ -8,7 +8,7 @@ pausing the broker, sequencer, network receive path, or other replica threads.
 
 | System | Ordering-visible ACK | Durable ACK | Injection |
 |---|---|---|---|
-| Embarcadero | ACK1, GOI commit | ACK2, completion-vector advance | 5 s before replica `fdatasync` |
+| Embarcadero | ACK1, GOI commit | ACK2, completion-vector advance | 5 s before each replica `fdatasync` |
 | CXL-Scalog | ACK1, global-cut progress | Not exposed independently by this port | 500 ms before one follower `fdatasync` |
 
 The systems use different injection durations, so the paper compares each

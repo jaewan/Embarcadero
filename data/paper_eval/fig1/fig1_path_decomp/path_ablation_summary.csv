@@ -1,0 +1,6 @@
+variant,cell,n_clients,metric,trials,median_gbps,delta_from_v0_gbps,delta_from_v0_pct
+V0,v0_order0_ack1_rf0,2,overlap_gbps,3,9.955150944,0.0,0.0
+V1,v1_order5_ack1_rf0,2,overlap_gbps,3,9.233380004,-0.721770939999999,-7.250225979094898
+V2,v2_order5_ack1_rf2_copy,2,overlap_gbps,3,6.456907437,-3.4982435069999998,-35.14003480889862
+V3,v3_order5_ack2_rf2_acct,2,overlap_gbps,3,8.909316668,-1.045834275999999,-10.505458750781942
+V4,v4_order5_ack2_rf2_copy,2,overlap_gbps,3,6.046044163,-3.9091067809999993,-39.267177393789595

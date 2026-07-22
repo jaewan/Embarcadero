@@ -1,0 +1,120 @@
+{
+  "schema": 1,
+  "input": "data/paper_eval/fig1/fig1_path_decomp/results.csv",
+  "input_sha256": "0fb56d16783ad90667cc98b5dff2c193f8260264e88836cea8708f1aba47a0fa",
+  "selection": {
+    "n_clients": 2,
+    "metric": "overlap_gbps"
+  },
+  "validation": {
+    "required_trials_per_variant": 3,
+    "status": "ok",
+    "git_dirty_files": 0,
+    "git_commit": "3eaadffb61eb3c4698aeb16a1cc845ed456ea035",
+    "embarlet_md5": "74986c19faa0ec2cc1713f7441ef96c2",
+    "client_md5": "3fcd5159b5467c325e840c4f631c0538"
+  },
+  "comparisons": {
+    "ordering": {
+      "before": "V0",
+      "after": "V1",
+      "delta_gbps": -0.721770939999999,
+      "delta_pct": -7.250225979094898
+    },
+    "background_replica_copy": {
+      "before": "V1",
+      "after": "V2",
+      "delta_gbps": -2.776472567000001,
+      "delta_pct": -30.069948012506824
+    },
+    "ack2_accounting": {
+      "before": "V1",
+      "after": "V3",
+      "delta_gbps": -0.32406333600000004,
+      "delta_pct": -3.509693480173157
+    },
+    "ack2_payload_copy": {
+      "before": "V3",
+      "after": "V4",
+      "delta_gbps": -2.8632725050000003,
+      "delta_pct": -32.137958630252164
+    }
+  },
+  "summary": [
+    {
+      "variant": "V0",
+      "cell": "v0_order0_ack1_rf0",
+      "n_clients": 2,
+      "metric": "overlap_gbps",
+      "trials": 3,
+      "median_gbps": 9.955150944,
+      "values_gbps": [
+        10.084495343,
+        9.885035063,
+        9.955150944
+      ],
+      "delta_from_v0_gbps": 0.0,
+      "delta_from_v0_pct": 0.0
+    },
+    {
+      "variant": "V1",
+      "cell": "v1_order5_ack1_rf0",
+      "n_clients": 2,
+      "metric": "overlap_gbps",
+      "trials": 3,
+      "median_gbps": 9.233380004,
+      "values_gbps": [
+        9.279886881,
+        9.013668621,
+        9.233380004
+      ],
+      "delta_from_v0_gbps": -0.721770939999999,
+      "delta_from_v0_pct": -7.250225979094898
+    },
+    {
+      "variant": "V2",
+      "cell": "v2_order5_ack1_rf2_copy",
+      "n_clients": 2,
+      "metric": "overlap_gbps",
+      "trials": 3,
+      "median_gbps": 6.456907437,
+      "values_gbps": [
+        6.201517516,
+        6.456907437,
+        7.172000023
+      ],
+      "delta_from_v0_gbps": -3.4982435069999998,
+      "delta_from_v0_pct": -35.14003480889862
+    },
+    {
+      "variant": "V3",
+      "cell": "v3_order5_ack2_rf2_acct",
+      "n_clients": 2,
+      "metric": "overlap_gbps",
+      "trials": 3,
+      "median_gbps": 8.909316668,
+      "values_gbps": [
+        9.122507998,
+        8.909316668,
+        8.206917147
+      ],
+      "delta_from_v0_gbps": -1.045834275999999,
+      "delta_from_v0_pct": -10.505458750781942
+    },
+    {
+      "variant": "V4",
+      "cell": "v4_order5_ack2_rf2_copy",
+      "n_clients": 2,
+      "metric": "overlap_gbps",
+      "trials": 3,
+      "median_gbps": 6.046044163,
+      "values_gbps": [
+        6.046044163,
+        6.475480755,
+        6.014116518
+      ],
+      "delta_from_v0_gbps": -3.9091067809999993,
+      "delta_from_v0_pct": -39.267177393789595
+    }
+  ]
+}

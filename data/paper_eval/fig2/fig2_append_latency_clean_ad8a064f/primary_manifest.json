@@ -1,0 +1,29 @@
+{
+  "cell": "fig2_embar_o5_ack2_rf2_mem",
+  "contract": "data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/campaign_contract.md",
+  "contract_sha256": "ef59909b5b869153a510bca31fc4e7fefa57b7233baf02159552111a9eaf5dc2",
+  "git_commits": [
+    "ad8a064f2e9f25efbb0ecc2a8dd740ac6baef790"
+  ],
+  "input": "data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/results.csv",
+  "input_sha256": "816e8d320f5443d3cf56275230a265f177ceda7c5c0b4aa74b39f11f6369fd7f",
+  "loads_mbps": [
+    100,
+    250,
+    500,
+    750,
+    1000,
+    1500,
+    2000
+  ],
+  "pass_ids": [
+    "20260722T005032Z"
+  ],
+  "required_trials_per_load": 3,
+  "selection": "all status=ok steady RF2 ACK2 memory-copy rows",
+  "summary_csv": "data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/primary_summary.csv",
+  "validator": {
+    "path": "PaperScripts/summarize_fig2_primary.py",
+    "sha256": "3861d72c8edb6902365b9d5f5dacf0109b7e2876ae40ea348338b1a938c13d7a"
+  }
+}

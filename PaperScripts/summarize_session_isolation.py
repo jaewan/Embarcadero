@@ -19,6 +19,13 @@ def main() -> None:
 
     summary_path = args.campaign / "commit_isolation_summary.csv"
     contract_path = args.campaign / "run_contract.csv"
+    raw_paths = sorted(args.campaign.glob("trial*_attempt1_broker0.log.gz"))
+    raw_paths += sorted(args.campaign.glob("trial*_c4[01].log"))
+    if len(raw_paths) != 9:
+        raise SystemExit(
+            "validation failed: expected 3 compressed sequencer traces and "
+            "6 client traces"
+        )
     rows = list(csv.DictReader(summary_path.open()))
     contracts = list(csv.DictReader(contract_path.open()))
     if len(rows) != 3 or sorted(int(row["trial"]) for row in rows) != [1, 2, 3]:
@@ -43,6 +50,10 @@ def main() -> None:
         "inputs_sha256": {
             summary_path.name: hashlib.sha256(summary_path.read_bytes()).hexdigest(),
             contract_path.name: hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+            **{
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in raw_paths
+            },
         },
         "trials": rows,
         "medians": {

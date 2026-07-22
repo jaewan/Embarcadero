@@ -1,0 +1,5 @@
+# Preserve benchmark artifacts byte-for-byte. CSV writers may use CRLF and raw
+# logs may contain whitespace-only payload lines; neither is source-code damage.
+data/**/*.csv -text whitespace=-trailing-space
+data/**/*.log -text whitespace=-trailing-space
+data/**/*.gz -text -diff

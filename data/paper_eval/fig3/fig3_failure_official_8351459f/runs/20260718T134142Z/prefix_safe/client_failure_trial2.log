@@ -1,0 +1,132 @@
+I20260718 22:45:31.716070 779859 main.cc:72] Using threads_per_broker from config: 3
+I20260718 22:45:31.722179 779859 main.cc:260] Running Broker failure at publish 
+I20260718 22:45:32.230398 779859 test_utils.cc:1054] 
+
+===== Failure Publish Throughput Test =====
+	  Message size: 1024 bytes
+	  Total message size: 21474836480 bytes
+	  Threads per broker: 4
+	  ACK level: 1
+	  Order level: 5
+	  Sequencer: EMBARCADERO
+I20260718 22:45:32.230435 779859 test_utils.cc:1120] Starting failure publish throughput test with 20971520 messages (21474836480 bytes total), failure at 50% of data sent
+I20260718 22:45:32.230468 779859 test_utils.cc:1146] Failure test queue size: 4294967296 bytes (throughput-matched via EMBARCADERO_FAILURE_MATCH_THROUGHPUT)
+I20260718 22:45:32.230480 779859 test_utils.cc:1150] Setting up dummy subscriber to keep connections open if needed
+I20260718 22:45:32.230654 779859 publisher.cc:411] Publisher: Expecting 4 brokers (from config max_brokers)
+I20260718 22:45:32.230727 779859 publisher.cc:1924] Publisher runtime mode=throughput ack_drain_ms_success=50 ack_drain_ms_failure=3000 ack_timeout_sec=180 epoll_wait_writable_ms=1
+I20260718 22:45:32.230742 779859 publisher.cc:1930] Publisher session lease_ns=5000000000 unacked_byte_cap_pre_pool=64424509440 ack_level=1 memory_emulated_ack2=0 unacked_retention=pool_pin
+I20260718 22:45:32.231323 779859 common.cc:392] Hugepages: 2048 free × 2048 kB = 4096 MB free; need 1026 MB (OK)
+I20260718 22:45:32.231401 779859 common.cc:426] mmap_large_buffer: MAP_HUGETLB success for 1077936128 bytes (retry=0)
+I20260718 22:45:32.421653 779859 queue_buffer.cc:203] QueueBuffer::AddBuffers region_slots=513 slot_size=2097280 pool_bytes=1075904640 hint_bytes=1073741824 max_pool_bytes=4294967296 queues=16 (pipeline_slots_per_queue=32)
+I20260718 22:45:32.421680 779859 publisher.cc:1995] Publisher unacked_byte_cap=64424509440 pool_bytes=1075904640 unacked_retention=pool_pin
+I20260718 22:45:32.424232 779899 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:32.464345 779900 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:32.504531 779901 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:32.544543 779902 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.486991 779903 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=1 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.527067 779904 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=1 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.567291 779905 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=1 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.607385 779906 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=1 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.647615 779907 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.687546 779908 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.727913 779909 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.767963 779910 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.808020 779911 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.848174 779912 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.888355 779913 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.928419 779914 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:34.928552 779859 test_utils.cc:1171] Failure test buffer warmup completed in 0 ms
+I20260718 22:45:34.928848 779915 publisher.cc:2948] Failure kill armed: wall-clock 1800 ms after publish start
+W20260718 22:45:36.834924 779915 publisher.h:334] Failure/Event @ 1906 ms: Failure threshold reached (wall-clock)
+I20260718 22:45:36.834972 779915 publisher.cc:2973] Triggering broker kill at t=1906ms sent=10812702528 bytes
+W20260718 22:45:36.835027 779915 publisher.h:334] Failure/Event @ 1906 ms: Broker kill requested (gRPC)
+I20260718 22:45:36.835039 779915 test_utils.cc:2105] Requesting to kill 1 brokers
+I20260718 22:45:36.835893 779915 test_utils.cc:2128] Successfully killed 1 brokers
+E20260718 22:45:36.952307 779904 publisher.cc:4081] Failed to send batch header: Connection reset by peer
+E20260718 22:45:36.952859 779906 publisher.cc:4081] Failed to send batch header: Connection reset by peer
+E20260718 22:45:36.953002 779903 publisher.cc:4081] Failed to send batch header: Connection reset by peer
+E20260718 22:45:36.953012 779904 publisher.cc:4118] Exception sending batch header: send failed
+E20260718 22:45:36.953063 779906 publisher.cc:4118] Exception sending batch header: send failed
+W20260718 22:45:36.953089 779906 publisher.h:334] Failure/Event @ 2024 ms: Header Send Fail Broker 1 (send failed)
+W20260718 22:45:36.953089 779904 publisher.h:334] Failure/Event @ 2024 ms: Header Send Fail Broker 1 (send failed)
+E20260718 22:45:36.953282 779903 publisher.cc:4118] Exception sending batch header: send failed
+W20260718 22:45:36.953334 779903 publisher.h:334] Failure/Event @ 2024 ms: Header Send Fail Broker 1 (send failed)
+E20260718 22:45:36.953719 779905 publisher.cc:4081] Failed to send batch header: Connection reset by peer
+I20260718 22:45:36.953716 779904 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=1 committed_hwm=5155 has_committed_prefix=1 status=0
+W20260718 22:45:36.953827 779904 publisher.h:334] Failure/Event @ 2025 ms: Reconnect Success Broker 0 (from 1)
+E20260718 22:45:36.953992 779905 publisher.cc:4118] Exception sending batch header: send failed
+W20260718 22:45:36.954028 779905 publisher.h:334] Failure/Event @ 2025 ms: Header Send Fail Broker 1 (send failed)
+I20260718 22:45:36.954089 779903 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=1 committed_hwm=5155 has_committed_prefix=1 status=0
+W20260718 22:45:36.954151 779903 publisher.h:334] Failure/Event @ 2025 ms: Reconnect Success Broker 3 (from 1)
+I20260718 22:45:36.954674 779906 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=1 committed_hwm=5155 has_committed_prefix=1 status=0
+W20260718 22:45:36.954699 779906 publisher.h:334] Failure/Event @ 2026 ms: Reconnect Success Broker 0 (from 1)
+I20260718 22:45:38.572517 779897 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=1 committed_hwm=5155 has_committed_prefix=1 status=0
+I20260718 22:45:38.574065 779897 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=1 committed_hwm=5155 has_committed_prefix=1 status=0
+W20260718 22:45:41.832721 779896 publisher.cc:3431] [SESSION_FENCED_OBSERVED] broker_id=0 committed_batch_seq=5171 committed_msg_hwm=9966444 control_epoch=2 reason=0
+W20260718 22:45:41.832782 779896 publisher.cc:1237] [SESSION_ROLLOVER_PHASE] phase=pause_begin old_epoch=1 new_epoch=2
+W20260718 22:45:41.832795 779896 publisher.cc:1241] [SESSION_ROLLOVER_PHASE] phase=pause_done
+W20260718 22:45:41.832816 779896 publisher.cc:1253] [SESSION_ROLLOVER_PHASE] phase=seal_done sealed_messages=0
+W20260718 22:45:41.832829 779896 publisher.cc:1259] [SESSION_ROLLOVER_PHASE] phase=send_drain_done
+W20260718 22:45:41.832839 779896 publisher.cc:1266] [SESSION_ROLLOVER_PHASE] phase=close_retransmit_begin
+E20260718 22:45:42.404898 779905 publisher.cc:3683] PublishThread: SessionOpen failed for broker 0
+W20260718 22:45:42.404951 779905 publisher.h:334] Failure/Event @ 7476 ms: Reconnect Fail Broker 0
+E20260718 22:45:42.404965 779905 publisher.cc:4181] Failed to connect to replacement broker 0 — trying remaining survivors
+W20260718 22:45:42.404978 779905 publisher.cc:4187] PublishThread[6]: trying fallback broker 2 for queue
+I20260718 22:45:42.408550 779905 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=2 committed_hwm=0 has_committed_prefix=0 status=0
+W20260718 22:45:42.408571 779905 publisher.h:334] Failure/Event @ 7479 ms: Reconnect Success Broker 2 (from 1)
+W20260718 22:45:43.941002 779896 publisher.cc:1268] [SESSION_ROLLOVER_PHASE] phase=close_retransmit_done
+W20260718 22:45:43.941365 779896 publisher.cc:1299] [SESSION_ROLLOVER_PHASE] phase=suffix_collected suffix_batches=512 committed_messages=0
+W20260718 22:45:43.941385 779896 publisher.cc:1362] [SESSION_REOPEN_RESUBMIT_BEGIN] old_epoch=1 new_epoch=2 suffix_batches=512 recovery_broker=0 recovery_queue=0
+W20260718 22:45:43.941418 779896 publisher.cc:1390] [SESSION_REOPEN_REQUEUE_PROGRESS] epoch=2 requeued=64 suffix_batches=512
+W20260718 22:45:43.941419 779899 publisher.cc:3820] PublishThread[0]: epoch changed 1 → 2 on broker=0; reconnecting
+W20260718 22:45:43.941450 779896 publisher.cc:1390] [SESSION_REOPEN_REQUEUE_PROGRESS] epoch=2 requeued=128 suffix_batches=512
+W20260718 22:45:43.941509 779896 publisher.cc:1390] [SESSION_REOPEN_REQUEUE_PROGRESS] epoch=2 requeued=192 suffix_batches=512
+W20260718 22:45:43.941535 779896 publisher.cc:1390] [SESSION_REOPEN_REQUEUE_PROGRESS] epoch=2 requeued=256 suffix_batches=512
+W20260718 22:45:43.941560 779896 publisher.cc:1390] [SESSION_REOPEN_REQUEUE_PROGRESS] epoch=2 requeued=320 suffix_batches=512
+W20260718 22:45:43.941602 779896 publisher.cc:1390] [SESSION_REOPEN_REQUEUE_PROGRESS] epoch=2 requeued=384 suffix_batches=512
+W20260718 22:45:43.941629 779896 publisher.cc:1390] [SESSION_REOPEN_REQUEUE_PROGRESS] epoch=2 requeued=448 suffix_batches=512
+W20260718 22:45:43.941655 779896 publisher.cc:1390] [SESSION_REOPEN_REQUEUE_PROGRESS] epoch=2 requeued=512 suffix_batches=512
+W20260718 22:45:43.941669 779896 publisher.cc:1428] [SESSION_REOPEN_RESUBMIT] old_epoch=1 new_epoch=2 committed_batch_seq=5171 suffix_batches=512 requeued_pool_batches=512 direct_resubmit_batches=0 recovery_broker=0 recovery_queue=0
+I20260718 22:45:43.945497 779899 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=2 committed_hwm=0 has_committed_prefix=0 status=0
+W20260718 22:45:43.947186 779901 publisher.cc:3820] PublishThread[2]: epoch changed 1 → 2 on broker=0; reconnecting
+W20260718 22:45:43.948953 779902 publisher.cc:3820] PublishThread[3]: epoch changed 1 → 2 on broker=0; reconnecting
+W20260718 22:45:43.949318 779903 publisher.cc:3820] PublishThread[4]: epoch changed 1 → 2 on broker=3; reconnecting
+I20260718 22:45:43.949388 779902 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=2 committed_hwm=0 has_committed_prefix=1 status=0
+I20260718 22:45:43.949844 779903 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=2 committed_hwm=0 has_committed_prefix=1 status=0
+W20260718 22:45:43.950477 779904 publisher.cc:3820] PublishThread[5]: epoch changed 1 → 2 on broker=0; reconnecting
+I20260718 22:45:43.950738 779901 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=2 committed_hwm=0 has_committed_prefix=0 status=0
+I20260718 22:45:43.951287 779904 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=2 committed_hwm=1 has_committed_prefix=1 status=0
+W20260718 22:45:43.951936 779905 publisher.cc:3820] PublishThread[6]: epoch changed 1 → 2 on broker=2; reconnecting
+W20260718 22:45:43.952275 779906 publisher.cc:3820] PublishThread[7]: epoch changed 1 → 2 on broker=0; reconnecting
+I20260718 22:45:43.952807 779906 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=2 committed_hwm=2 has_committed_prefix=1 status=0
+I20260718 22:45:43.952919 779905 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=2 committed_hwm=2 has_committed_prefix=1 status=0
+W20260718 22:45:43.953503 779907 publisher.cc:3820] PublishThread[8]: epoch changed 1 → 2 on broker=2; reconnecting
+W20260718 22:45:43.953871 779908 publisher.cc:3820] PublishThread[9]: epoch changed 1 → 2 on broker=2; reconnecting
+I20260718 22:45:43.953924 779907 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=2 committed_hwm=3 has_committed_prefix=1 status=0
+I20260718 22:45:43.954464 779908 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=2 committed_hwm=4 has_committed_prefix=1 status=0
+W20260718 22:45:43.955438 779909 publisher.cc:3820] PublishThread[10]: epoch changed 1 → 2 on broker=2; reconnecting
+I20260718 22:45:43.956147 779909 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=2 committed_hwm=5 has_committed_prefix=1 status=0
+W20260718 22:45:43.956897 779910 publisher.cc:3820] PublishThread[11]: epoch changed 1 → 2 on broker=2; reconnecting
+W20260718 22:45:43.957214 779911 publisher.cc:3820] PublishThread[12]: epoch changed 1 → 2 on broker=3; reconnecting
+I20260718 22:45:43.957399 779910 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=2 client_id=309521 assigned_session_epoch=2 committed_hwm=6 has_committed_prefix=1 status=0
+I20260718 22:45:43.957665 779911 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=2 committed_hwm=7 has_committed_prefix=1 status=0
+W20260718 22:45:43.957962 779912 publisher.cc:3820] PublishThread[13]: epoch changed 1 → 2 on broker=3; reconnecting
+I20260718 22:45:43.958325 779912 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=2 committed_hwm=7 has_committed_prefix=1 status=0
+W20260718 22:45:43.958912 779913 publisher.cc:3820] PublishThread[14]: epoch changed 1 → 2 on broker=3; reconnecting
+I20260718 22:45:43.959439 779913 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=2 committed_hwm=8 has_committed_prefix=1 status=0
+W20260718 22:45:43.960438 779914 publisher.cc:3820] PublishThread[15]: epoch changed 1 → 2 on broker=3; reconnecting
+I20260718 22:45:43.960898 779914 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=3 client_id=309521 assigned_session_epoch=2 committed_hwm=9 has_committed_prefix=1 status=0
+W20260718 22:45:43.961926 779900 publisher.cc:3820] PublishThread[1]: epoch changed 1 → 2 on broker=0; reconnecting
+I20260718 22:45:43.962344 779900 publisher.cc:685] [SESSION_OPEN_ACK] broker_id=0 client_id=309521 assigned_session_epoch=2 committed_hwm=10 has_committed_prefix=1 status=0
+W20260718 22:45:44.037658 779916 publisher.h:334] Failure/Event @ 9109 ms: Failure threshold reached (ACK frontier)
+W20260718 22:45:46.514040 779859 publisher.cc:2715] [Publisher ACK Normalize]: raw_received=30936037 target=20971520 excess=9964517 normalized_received=30936037
+W20260718 22:45:46.514111 779859 publisher.cc:2732] [Publisher ACK Per-Broker]: B0=30936037(sent=7542278,excess=23393759) B1=0(sent=2636136,short=2636136) B2=0(sent=5877350,short=5877350) B3=0(sent=5902380,short=5902380) B4=0 B5=0 B6=0 B7=0 B8=0 B9=0 B10=0 B11=0 B12=0 B13=0 B14=0 B15=0 B16=0 B17=0 B18=0 B19=0 B20=0 B21=0 B22=0 B23=0 B24=0 B25=0 B26=0 B27=0 B28=0 B29=0 B30=0 B31=0
+I20260718 22:45:46.514127 779859 publisher.cc:2762] [ACK_VERIFY] normalized_received=30936037 raw_received=30936037 target=20971520 100%
+I20260718 22:45:46.514140 779859 publisher.cc:2775] [UNACKED_DRAIN] bytes=0 batches=0 session_sent_hwm=11003149 ack_base=9966444
+I20260718 22:45:46.564242 779859 publisher.cc:517] [ORDER5_ROUTING] client_id=309521 home_brokers=0 broker0_msgs=7542278 broker1_msgs=2636136 broker2_msgs=5877350 broker3_msgs=5902380
+I20260718 22:45:46.564273 779859 publisher.cc:2811] [POLL_BREAKDOWN] target_messages=20971520 ack_enabled=1 queue_drain_ms=0.046 publisher_join_ms=333.015 ack_wait_ms=0.094 post_ack_ms=50.146 total_poll_ms=383.302 target_acks=20971520 normalized_acks=30936037
+W20260718 22:45:46.564774 779859 test_utils.cc:1295] Failed to compute active-window failure throughput summary from /home/domin/Embarcadero/data/paper_eval/fig3/fig3_failure_official_8351459f/runs/20260718T134142Z/prefix_safe/real_time_acked_throughput.csv and /home/domin/Embarcadero/data/paper_eval/fig3/fig3_failure_official_8351459f/runs/20260718T134142Z/prefix_safe/failure_events.csv; falling back to end-to-end bandwidth.
+I20260718 22:45:46.564790 779859 test_utils.cc:1300] Failure publish test completed in 11.64 seconds
+I20260718 22:45:46.564802 779859 test_utils.cc:1302] Bandwidth (active-window headline): 1760.08 MB/s
+I20260718 22:45:46.564832 779859 test_utils.cc:1304] Bandwidth (end-to-end incl. tail drain): 1760.08 MB/s
+I20260718 22:45:46.641871 779859 result_writer.cc:193] Publish bandwidth: 1760.08 MB/s

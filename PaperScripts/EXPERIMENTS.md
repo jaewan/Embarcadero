@@ -22,12 +22,15 @@ the data directory with results, and the plot script.
 - **Primary validator:** `PaperScripts/summarize_fig2_primary.py` (requires
   exactly 3 successful steady-rate trials at every load and a clean campaign
   contract)
-- **Primary data:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/results.csv`
-- **Primary summary:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/primary_summary.csv`
-- **Primary manifest:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/primary_manifest.json`
+- **Primary data:** `data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/results.csv`
+- **Primary summary:** `data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/primary_summary.csv`
+- **Primary manifest:** `data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/primary_manifest.json`
 - **Paper plot:** `PaperScripts/plot_append_latency_paper.py`
 - **Full diagnostic plot:** `PaperScripts/plot_fig2_latency_vs_load.py`
 - **Notes:** Also produces Tab. epoch-sweep and the mechanism ablation.
+  Set `INCLUDE_EPOCH_SWEEP=1` for the matched 250 MB/s epoch cells; validate
+  the epoch and mechanism rows with
+  `PaperScripts/summarize_fig2_mechanisms.py`.
   Corfu/Scalog comparison: `data/paper_eval/fig2/fig2_corfu_official_3eaadffb/` and `fig2_scalog_official_3eaadffb/`.
   Validate each clean baseline campaign with
   `PaperScripts/summarize_fig2_baseline.py`.
@@ -52,15 +55,15 @@ the data directory with results, and the plot script.
 ### Q2 two-session gap isolation
 - **Script:** `scripts/run_failure_suite.sh` (E4a session-gap mode)
 - **Validator:** `PaperScripts/summarize_session_isolation.py`
-- **Data:** `data/failure_suite/e4a_commit_official_806b1809/e4a_session_gap/`
-- **Status:** the existing result passes semantic checks but records a dirty
-  worktree, so it must be rerun from a clean commit before submission.
+- **Data:** `data/failure_suite/e4a_clean_d925dcb3/e4a_session_gap/`
+- **Status:** clean three-trial campaign; the affected session resumes at its
+  missing batch while the control session continues committing.
 
 ## Tables
 
 ### Tab. latency-sweep — Embar append latency across load
 - **Script:** `PaperScripts/run_fig2_latency_vs_load.sh` (subset of Fig 2 campaign)
-- **Data:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/primary_summary.csv`
+- **Data:** `data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/primary_summary.csv`
 
 ### Tab. epoch-sweep — Epoch-period causal proof
 - **Script:** `PaperScripts/run_fig2_latency_vs_load.sh` (epoch sweep cells)

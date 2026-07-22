@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "campaign": "data/failure_suite/e4a_clean_d925dcb3/e4a_session_gap",
+  "git_commit": "d925dcb3d70814fcff69d3b5011ae617271c7e97",
+  "git_dirty": false,
+  "inputs_sha256": {
+    "commit_isolation_summary.csv": "8413a48dcb940e6164a035dc88eae9b0899c4a74e4ea746537266de08e7c839e",
+    "run_contract.csv": "ae9c785d10493370bf92341172e772631bcc492242c9dacddc0bb22e8f4e2e18",
+    "trial1_attempt1_broker0.log.gz": "96b9febb3a89bbf32c4722fa4fd20e3be8404debfca2791c8d1211a757fe8b22",
+    "trial2_attempt1_broker0.log.gz": "d9eb5d6ec36bf1262c7c0030ea7a51e2b7d149ff77a87287c0955dc7cbfeda7a",
+    "trial3_attempt1_broker0.log.gz": "cf72edf07cc32f8ccfaa0998ec0ae91a8bb4b8d44fb1663fcc21222c49d9ea6d",
+    "trial1_c40.log": "e7b7b790daa8e723482633395eeb8ea2d4e528689bf4c2a2d88d743b222810fd",
+    "trial1_c41.log": "fb31d884260c47a297de1ffebd2726fec5f494496f000e6c91821c339064d6f8",
+    "trial2_c40.log": "0a4c3eb4a2ec09870d21ef16c16b77666308179f032b15e44c5228b342beae11",
+    "trial2_c41.log": "0ab5a7c70cdc87ca7d6b8f7707e6b7a9bbf1eff185cbfdefff5f43bd75171de0",
+    "trial3_c40.log": "6f14325e5cd19e3765e1db4ae1afaf8997567e1c584697a7715a6a31914ea441",
+    "trial3_c41.log": "9526af7333482f18ae8afa6844458a66bfd7d2d40d268ff112f5d43169605959"
+  },
+  "trials": [
+    {
+      "trial": "1",
+      "affected_client": "789452",
+      "control_client": "991383",
+      "gap_batch_seq": "64",
+      "gap_ms": "3000",
+      "affected_commits_at_or_after_gap_seq_during_gap": "0",
+      "affected_first_post_gap_seq": "64",
+      "control_commits_during_gap": "3500",
+      "control_max_intercommit_ms": "5",
+      "valid": "1"
+    },
+    {
+      "trial": "2",
+      "affected_client": "525514",
+      "control_client": "813833",
+      "gap_batch_seq": "64",
+      "gap_ms": "3000",
+      "affected_commits_at_or_after_gap_seq_during_gap": "0",
+      "affected_first_post_gap_seq": "64",
+      "control_commits_during_gap": "3500",
+      "control_max_intercommit_ms": "5",
+      "valid": "1"
+    },
+    {
+      "trial": "3",
+      "affected_client": "359356",
+      "control_client": "395831",
+      "gap_batch_seq": "64",
+      "gap_ms": "3001",
+      "affected_commits_at_or_after_gap_seq_during_gap": "0",
+      "affected_first_post_gap_seq": "64",
+      "control_commits_during_gap": "3500",
+      "control_max_intercommit_ms": "6",
+      "valid": "1"
+    }
+  ],
+  "medians": {
+    "control_commits_during_gap": 3500,
+    "control_max_intercommit_ms": 5
+  }
+}

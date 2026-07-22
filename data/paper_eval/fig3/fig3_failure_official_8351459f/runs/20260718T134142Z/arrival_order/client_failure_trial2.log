@@ -1,0 +1,60 @@
+I20260718 22:43:02.904775 778402 main.cc:72] Using threads_per_broker from config: 3
+I20260718 22:43:02.910785 778402 main.cc:260] Running Broker failure at publish 
+I20260718 22:43:03.419128 778402 test_utils.cc:1054] 
+
+===== Failure Publish Throughput Test =====
+	  Message size: 1024 bytes
+	  Total message size: 21474836480 bytes
+	  Threads per broker: 4
+	  ACK level: 1
+	  Order level: 4
+	  Sequencer: EMBARCADERO
+I20260718 22:43:03.419164 778402 test_utils.cc:1120] Starting failure publish throughput test with 20971520 messages (21474836480 bytes total), failure at 50% of data sent
+I20260718 22:43:03.419206 778402 test_utils.cc:1146] Failure test queue size: 4294967296 bytes (throughput-matched via EMBARCADERO_FAILURE_MATCH_THROUGHPUT)
+I20260718 22:43:03.419219 778402 test_utils.cc:1150] Setting up dummy subscriber to keep connections open if needed
+I20260718 22:43:03.419431 778402 publisher.cc:411] Publisher: Expecting 4 brokers (from config max_brokers)
+I20260718 22:43:03.419507 778402 publisher.cc:1924] Publisher runtime mode=throughput ack_drain_ms_success=50 ack_drain_ms_failure=3000 ack_timeout_sec=180 epoll_wait_writable_ms=1
+I20260718 22:43:03.419521 778402 publisher.cc:1930] Publisher session lease_ns=5000000000 unacked_byte_cap_pre_pool=64424509440 ack_level=1 memory_emulated_ack2=0 unacked_retention=pool_pin
+I20260718 22:43:03.420141 778402 common.cc:392] Hugepages: 2048 free × 2048 kB = 4096 MB free; need 1026 MB (OK)
+I20260718 22:43:03.420219 778402 common.cc:426] mmap_large_buffer: MAP_HUGETLB success for 1077936128 bytes (retry=0)
+I20260718 22:43:03.596431 778402 queue_buffer.cc:203] QueueBuffer::AddBuffers region_slots=513 slot_size=2097280 pool_bytes=1075904640 hint_bytes=1073741824 max_pool_bytes=4294967296 queues=16 (pipeline_slots_per_queue=32)
+I20260718 22:43:03.596455 778402 publisher.cc:1995] Publisher unacked_byte_cap=64424509440 pool_bytes=1075904640 unacked_retention=pool_pin
+I20260718 22:43:06.203727 778402 test_utils.cc:1171] Failure test buffer warmup completed in 0 ms
+I20260718 22:43:06.204031 778457 publisher.cc:2948] Failure kill armed: wall-clock 1800 ms after publish start
+W20260718 22:43:08.110463 778457 publisher.h:334] Failure/Event @ 1906 ms: Failure threshold reached (wall-clock)
+I20260718 22:43:08.110522 778457 publisher.cc:2973] Triggering broker kill at t=1906ms sent=10856733312 bytes
+W20260718 22:43:08.110580 778457 publisher.h:334] Failure/Event @ 1906 ms: Broker kill requested (gRPC)
+I20260718 22:43:08.110592 778457 test_utils.cc:2105] Requesting to kill 1 brokers
+I20260718 22:43:08.111546 778457 test_utils.cc:2128] Successfully killed 1 brokers
+E20260718 22:43:08.243940 778448 publisher.cc:4081] Failed to send batch header: Connection reset by peer
+E20260718 22:43:08.244531 778448 publisher.cc:4118] Exception sending batch header: send failed
+W20260718 22:43:08.244582 778448 publisher.h:334] Failure/Event @ 2040 ms: Header Send Fail Broker 1 (send failed)
+E20260718 22:43:08.244868 778446 publisher.cc:4081] Failed to send batch header: Connection reset by peer
+E20260718 22:43:08.245193 778446 publisher.cc:4118] Exception sending batch header: send failed
+W20260718 22:43:08.245242 778446 publisher.h:334] Failure/Event @ 2041 ms: Header Send Fail Broker 1 (send failed)
+W20260718 22:43:08.247540 778448 publisher.h:334] Failure/Event @ 2043 ms: Reconnect Success Broker 2 (from 1)
+W20260718 22:43:08.247776 778446 publisher.h:334] Failure/Event @ 2044 ms: Reconnect Success Broker 3 (from 1)
+E20260718 22:43:08.248760 778445 publisher.cc:4081] Failed to send batch header: Connection reset by peer
+E20260718 22:43:08.249044 778445 publisher.cc:4118] Exception sending batch header: send failed
+W20260718 22:43:08.249090 778445 publisher.h:334] Failure/Event @ 2045 ms: Header Send Fail Broker 1 (send failed)
+W20260718 22:43:08.249408 778445 publisher.h:334] Failure/Event @ 2045 ms: Reconnect Success Broker 0 (from 1)
+E20260718 22:43:08.249507 778447 publisher.cc:4081] Failed to send batch header: Connection reset by peer
+E20260718 22:43:08.249799 778447 publisher.cc:4118] Exception sending batch header: send failed
+W20260718 22:43:08.249853 778447 publisher.h:334] Failure/Event @ 2046 ms: Header Send Fail Broker 1 (send failed)
+W20260718 22:43:08.250042 778447 publisher.h:334] Failure/Event @ 2046 ms: Reconnect Success Broker 0 (from 1)
+W20260718 22:43:08.306310 778458 publisher.h:334] Failure/Event @ 2102 ms: Failure threshold reached (ACK frontier)
+I20260718 22:43:15.213542 778402 publisher.cc:2662] [Publisher ACK]: No new ACKs for 5s after broker kill. Assuming remaining 173430 messages were lost in flight.
+I20260718 22:43:15.213619 778402 publisher.cc:2736] [Publisher ACK]: Allowed shortfall due to killed brokers. normalized_received=20798090 target=20971520
+I20260718 22:43:18.216112 778402 test_utils.cc:1270] Failure real-time throughput summary:
+I20260718 22:43:18.216140 778402 test_utils.cc:1271]   Active window mean: 4.948 GB/s
+I20260718 22:43:18.216154 778402 test_utils.cc:1273]   Active window stddev: 0.206757 GB/s
+I20260718 22:43:18.216167 778402 test_utils.cc:1274]   Active window peak: 5.14044 GB/s
+I20260718 22:43:18.216179 778402 test_utils.cc:1276]   Pre-failure mean: 4.98878 GB/s
+I20260718 22:43:18.216192 778402 test_utils.cc:1280]   Post-reroute mean: 4.74172 GB/s
+I20260718 22:43:18.216203 778402 test_utils.cc:1284]   Post-reroute active mean: 4.96504 GB/s
+I20260718 22:43:18.216215 778402 test_utils.cc:1287]   Post-reroute active peak: 5.04996 GB/s
+I20260718 22:43:18.216228 778402 test_utils.cc:1292]   Failed broker (from events): 1
+I20260718 22:43:18.216238 778402 test_utils.cc:1300] Failure publish test completed in 12.01 seconds
+I20260718 22:43:18.216250 778402 test_utils.cc:1302] Bandwidth (active-window headline): 5066.42 MB/s
+I20260718 22:43:18.216262 778402 test_utils.cc:1304] Bandwidth (end-to-end incl. tail drain): 1704.99 MB/s
+I20260718 22:43:18.218361 778402 result_writer.cc:193] Publish bandwidth: 5066.42 MB/s

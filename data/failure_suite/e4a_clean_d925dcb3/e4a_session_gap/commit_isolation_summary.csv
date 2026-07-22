@@ -1,0 +1,4 @@
+trial,affected_client,control_client,gap_batch_seq,gap_ms,affected_commits_at_or_after_gap_seq_during_gap,affected_first_post_gap_seq,control_commits_during_gap,control_max_intercommit_ms,valid
+1,789452,991383,64,3000,0,64,3500,5,1
+2,525514,813833,64,3000,0,64,3500,5,1
+3,359356,395831,64,3001,0,64,3500,6,1

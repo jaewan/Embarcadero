@@ -51,17 +51,26 @@ def median(vals):
     return (s[n//2-1] + s[n//2]) / 2 if n % 2 == 0 else s[n//2]
 
 
-def plot(csv_path: str, pdf_path: str, png_path: str | None, require_trials: int):
+def plot(
+    csv_path: str,
+    pdf_path: str,
+    png_path: str | None,
+    require_trials: int,
+    expected_loads: list[int],
+):
     p50s, p99s = load(csv_path)
     bad = {load: len(values) for load, values in p50s.items()
            if len(values) != require_trials}
-    if bad:
+    missing = sorted(set(expected_loads) - set(p50s))
+    extras = sorted(set(p50s) - set(expected_loads))
+    if bad or missing or extras:
         raise SystemExit(
             f"primary plot requires exactly {require_trials} successful trials "
-            f"per load; got {bad}"
+            f"at loads {expected_loads}; bad_counts={bad}, "
+            f"missing={missing}, extras={extras}"
         )
 
-    loads = sorted(p50s.keys())
+    loads = expected_loads
     x   = np.array(loads, dtype=float)
     y50 = np.array([median(p50s[t]) / 1000.0 for t in loads])  # → ms
     y99 = np.array([median(p99s[t]) / 1000.0 for t in loads])
@@ -108,13 +117,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--csv",
-        default="data/paper_eval/fig2/fig2_append_latency_primary_806b1809/results.csv",
+        default="data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/results.csv",
     )
     ap.add_argument("--pdf", default="Paper/Figures/append_latency.pdf")
     ap.add_argument("--png", default="Paper/Figures/append_latency.png")
     ap.add_argument("--require-trials", type=int, default=3)
+    ap.add_argument("--loads", default="100 250 500 750 1000 1500 2000")
     args = ap.parse_args()
-    plot(args.csv, args.pdf, args.png, args.require_trials)
+    plot(
+        args.csv,
+        args.pdf,
+        args.png,
+        args.require_trials,
+        [int(value) for value in args.loads.split()],
+    )
 
 
 if __name__ == "__main__":

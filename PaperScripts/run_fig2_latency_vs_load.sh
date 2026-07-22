@@ -19,6 +19,7 @@
 #   NUM_TRIALS=1 bash PaperScripts/run_fig2_latency_vs_load.sh
 #   SKIP_DISK_ABLATION=1 bash ...          # mem-only
 #   INCLUDE_BASELINES=0 bash ...
+#   INCLUDE_EPOCH_SWEEP=1 bash ...         # 250--2000 us sensitivity
 #   FIG2_PREFLIGHT_ONLY=1 bash ...
 #
 set -uo pipefail
@@ -83,7 +84,10 @@ SKIP_DISK_ABLATION="${SKIP_DISK_ABLATION:-0}"
 SKIP_NOLINGER="${SKIP_NOLINGER:-1}"
 SKIP_RF0_COMPANION="${SKIP_RF0_COMPANION:-1}"
 SKIP_LAZYLOG="${SKIP_LAZYLOG:-1}"
-ALLOW_DIRTY_ARTIFACT="${ALLOW_DIRTY_ARTIFACT:-1}"
+INCLUDE_EPOCH_SWEEP="${INCLUDE_EPOCH_SWEEP:-0}"
+EPOCH_SWEEP_US="${EPOCH_SWEEP_US:-250 500 1000 2000}"
+EPOCH_SWEEP_LOAD_MBPS="${EPOCH_SWEEP_LOAD_MBPS:-250}"
+ALLOW_DIRTY_ARTIFACT="${ALLOW_DIRTY_ARTIFACT:-0}"
 export ALLOW_DIRTY_ARTIFACT
 
 # Keep the campaign's durable-media contract separate from the per-cell
@@ -306,6 +310,7 @@ write_campaign_contract() {
 ## Knobs
 - Msg / bytes: ${MSG_SIZE} B / ${TOTAL_BYTES} B
 - Epoch µs: $EMBAR_ORDER5_EPOCH_US
+- Epoch sweep: INCLUDE_EPOCH_SWEEP=$INCLUDE_EPOCH_SWEEP points=[$EPOCH_SWEEP_US] load=${EPOCH_SWEEP_LOAD_MBPS}MB/s
 - CXL: size=$EMBARCADERO_CXL_SIZE zero=$EMBARCADERO_CXL_ZERO_MODE populate=$EMBARCADERO_CXL_MAP_POPULATE
 - Broker ready timeout: ${BROKER_READY_TIMEOUT_SEC}s
 - Replica dirs (disk ablation): $REPLICA_DISK_DIRS_CONFIG
@@ -352,11 +357,22 @@ write_provenance() {
     ssh -o BatchMode=yes "$CLIENT_HOST" \
       'sha256sum ~/Embarcadero/build/bin/throughput_test' \
       >"$PROVENANCE_DIR/client_binary_sha256.txt" 2>&1 || true
+    ssh -o BatchMode=yes "$CLIENT_HOST" \
+      'sha256sum ~/Embarcadero/config/client.yaml ~/Embarcadero/config/embarcadero.yaml' \
+      >"$PROVENANCE_DIR/client_config_sha256.txt" 2>&1 || true
     client_hash="$(awk '{print $1}' "$PROVENANCE_DIR/client_binary_sha256.txt" 2>/dev/null || true)"
     local local_hash
     local_hash="$(sha256sum "$PROJECT_ROOT/build/bin/throughput_test" | awk '{print $1}')"
     if [[ -z "$client_hash" || "$client_hash" != "$local_hash" ]]; then
       log "FATAL: remote throughput_test hash does not match local binary"
+      return 1
+    fi
+    local remote_client_config remote_embar_config
+    remote_client_config="$(sed -n '1s/[[:space:]].*//p' "$PROVENANCE_DIR/client_config_sha256.txt")"
+    remote_embar_config="$(sed -n '2s/[[:space:]].*//p' "$PROVENANCE_DIR/client_config_sha256.txt")"
+    if [[ "$remote_client_config" != "$(sha256sum "$PROJECT_ROOT/config/client.yaml" | awk '{print $1}')" ||
+          "$remote_embar_config" != "$(sha256sum "$PROJECT_ROOT/config/embarcadero.yaml" | awk '{print $1}')" ]]; then
+      log "FATAL: remote client configuration hashes do not match local files"
       return 1
     fi
   fi
@@ -694,6 +710,7 @@ log "MECHANISM_LOAD_MBPS=$MECHANISM_LOAD_MBPS DISK_ABLATION_LOAD_MBPS=$DISK_ABLA
 log "SKIP_MECHANISM=$SKIP_MECHANISM SKIP_DISK_ABLATION=$SKIP_DISK_ABLATION"
 log "INCLUDE_BASELINES=$INCLUDE_BASELINES BASELINE_LOADS=$BASELINE_LOAD_MBPS"
 log "SKIP_RF0_COMPANION=$SKIP_RF0_COMPANION SKIP_NOLINGER=$SKIP_NOLINGER SKIP_LAZYLOG=$SKIP_LAZYLOG"
+log "INCLUDE_EPOCH_SWEEP=$INCLUDE_EPOCH_SWEEP EPOCH_SWEEP_US=$EPOCH_SWEEP_US EPOCH_SWEEP_LOAD_MBPS=$EPOCH_SWEEP_LOAD_MBPS"
 
 preflight_fig2
 write_provenance
@@ -758,6 +775,19 @@ while true; do
           run_series_loads fig2_mech_embar_o5_ack2_rf2_mem mechanism embar 5 on EMBARCADERO 2 2 mem
         NUM_TRIALS=1 WARMUP_TRIALS=0 SERIES_LOADS="$MECHANISM_LOAD_MBPS" \
           run_series_loads fig2_mech_embar_o5_ack2_rf2_disk mechanism embar 5 on EMBARCADERO 2 2 disk
+    fi
+
+    # --- Epoch sensitivity at one admitted load ---
+    if [[ "$INCLUDE_EPOCH_SWEEP" == "1" ]]; then
+        log "===== Epoch sweep @ ${EPOCH_SWEEP_LOAD_MBPS} MB/s ====="
+        for _tau_us in $EPOCH_SWEEP_US; do
+            EMBAR_ORDER5_EPOCH_US="$_tau_us" \
+            EMBARCADERO_CLIENT_LINGER_US="$((_tau_us / 2))" \
+            NUM_TRIALS=1 WARMUP_TRIALS=0 \
+            SERIES_LOADS="$EPOCH_SWEEP_LOAD_MBPS" \
+              run_series_loads "fig2_epoch_tau${_tau_us}" epoch_sweep \
+                embar 5 on EMBARCADERO 2 2 mem
+        done
     fi
 
     # --- Matched RF2 ACK2 mem baselines (same sink as primary) ---

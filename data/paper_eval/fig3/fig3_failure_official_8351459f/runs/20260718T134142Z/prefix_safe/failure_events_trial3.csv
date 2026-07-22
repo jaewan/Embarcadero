@@ -1,0 +1,13 @@
+Timestamp(ms),EventDescription
+1908,"Broker kill requested (gRPC)"
+1908,"Failure threshold reached (wall-clock)"
+2022,"Header Send Fail Broker 2 (broker dead (FIN/RST detected))"
+2023,"Reconnect Success Broker 3 (from 2)"
+2024,"Header Send Fail Broker 2 (send failed)"
+2025,"Header Send Fail Broker 2 (send failed)"
+2025,"Header Send Fail Broker 2 (send failed)"
+2025,"Reconnect Success Broker 3 (from 2)"
+2026,"Reconnect Success Broker 1 (from 2)"
+7043,"Reconnect Fail Broker 3"
+7046,"Reconnect Success Broker 0 (from 2)"
+9108,"Failure threshold reached (ACK frontier)"

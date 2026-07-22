@@ -271,7 +271,7 @@ run_cell() {
             OUT_BASE="$MULTICLIENT_ROOT" \
             BENCHMARK_TAG="$mc_tag" \
             CLIENT_LD_LIBRARY_PATH="$CLIENT_LIB" \
-            ALLOW_DIRTY_ARTIFACT=1 \
+            ALLOW_DIRTY_ARTIFACT="${ALLOW_DIRTY_ARTIFACT:-0}" \
             bash "$SCRIPTS_DIR/run_multiclient.sh"
     } >"$cell_log" 2>&1 || rc=$?
 
