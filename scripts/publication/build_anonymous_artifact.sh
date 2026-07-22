@@ -63,9 +63,9 @@ result tree. Machine-local paths, hostnames, and private testbed addresses are
 replaced with `/opt/embarcadero`, `broker-host`, and RFC 5737 addresses; set the
 documented environment variables for the evaluation testbed.
 
-The paper's compact result tables and figures are in the anonymous paper source
-package. Full raw traces should be uploaded separately through the venue's
-anonymous artifact service rather than embedded in the submission archive.
+The paper's compact result tables and figures are in the PVLDB paper source
+package. Full raw traces should be published separately through a stable
+artifact host rather than embedded in the submission archive.
 EOF
 
 mkdir -p "$output_dir"
