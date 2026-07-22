@@ -687,8 +687,7 @@ raw log content rather than trusted from a driver's own summary output alone.
 
 Nothing outstanding blocks Task 7.
 
-## 6e. EMBARCADERO ORDER=5 intermittent stall — characterized, not yet fully
-     root-caused (2026-07-23)
+## 6e. EMBARCADERO ORDER=5 intermittent stall — root-caused and fixed (2026-07-23)
 
 While calibrating for the real ≥1M-record matrix (gate step 5), EMBARCADERO
 (ORDER=5) runs intermittently (~2 hits in ~40 attempts across load-phase and
@@ -732,27 +731,58 @@ multi-broker total-order reconstruction, not broker-side sequencing.
   advance once one specific `total_order` position is never filled in
   `pending_messages_`, wedging every later position behind it forever.
 
-**Most likely mechanism (not yet confirmed with a client-side backtrace —
-the client process had already exited by the time gdb could attach in both
-captures)**: ORDER=5 deliberately does not stamp `total_order` into
-individual message headers on the wire (disabled at `topic.cc:8532-8538`,
-"was causing performance regression"); the client instead derives each
-message's position purely by counting within a batch, seeded from
-`BatchMetadata.batch_total_order` (`subscriber.cc` `StageOrderedMessages` /
-`ParseAndStageOrderedBytes`). A single off-by-one in that bookkeeping under
-rare timing (e.g. a batch boundary straddling two `recv()` calls) would
-silently misplace or drop one message's contribution, matching everything
-observed.
+**Root cause, confirmed and fixed (commit `5678fec9`)**: ORDER=5 deliberately
+does not stamp `total_order` into individual message headers on the wire
+(disabled at `topic.cc:8532-8538`, "was causing performance regression");
+the client instead derives each message's position purely by counting
+within a batch, seeded from `BatchMetadata.batch_total_order`. The actual
+bug is not in that derivation (an exhaustive/randomized chunk-boundary fuzz
+harness of `Subscriber::ParseAndStageOrderedBytes`/`StageOrderedMessages`
+found no fault there — see `test/order5_subscriber_reorder_test.cc`) but in
+gap handling: when a subscriber connection's export cursor falls behind far
+enough that the broker's export ring already overwrote the data it needed
+(`Topic::GetBatchToExportWithMetadata`'s `ORDER5_EXPORT_OVERRUN` path,
+`topic.cc`), the broker correctly skips forward and flags the next batch
+with `wire::BATCH_META_FLAG_EXPORT_GAP` — the protocol has designed,
+already-implemented support for exactly this ("reported, never a silent
+total-order hole"). `Subscriber::ProcessSequencer5Data` reads this flag and
+re-anchors correctly, but that function only runs under the diagnostic-only
+`EMBAR_VALIDATE_ORDER` env var. The function actually used by the real
+`ConsumeOrdered()` runtime path — `ParseAndStageOrderedBytes`/
+`StageOrderedMessages` — never referenced the flag at all: a gap batch got
+silently buffered at its (now unreachable) `total_order`, and
+`next_expected_order_` waited forever for positions the broker had already
+discarded and would never resend. This explains every observed symptom:
+broker-side sequencing counters stay perfectly consistent (the gap is a
+delivery-layer event on one lagging connection, unrelated to global
+sequencing completeness), the client wedges at one exact position forever,
+and it's intermittent (only when one connection lags enough under real
+cross-host network/scheduling jitter to lap the ring).
 
-**Diagnostic added (this session, not yet exercised against a live
-recurrence)**: `Subscriber::LogOrderGapIfStalled()` (`subscriber.cc`/`.h`,
-called from `TryPopOrderedMessageLocked`) logs, once `next_expected_order_`
-has been stuck for >5s and there is buffered data behind the gap:
-`[ORDER_GAP_DIAG] next_expected_order=... stuck_ms=... buffered_slots=...
+Fix: `StageOrderedMessages` now detects `gap_batch_starts` (collected in
+`ParseAndStageOrderedBytes` wherever a `BatchMetadata` frame carries the
+flag) and re-anchors `next_expected_order_` forward, reusing the existing
+stale-prefix-pop pattern so it re-bases the reorder deque rather than
+`clear()`-ing it — data a different, faster connection already buffered
+past the gap survives the jump (see
+`ExportGapReanchorPreservesAlreadyBufferedFutureData` in the test file).
+
+**Methodology note**: the live-cluster captures above were essential for
+*localizing* the bug (client-side, not broker-side) but were the wrong tool
+for *finding* it — three separate live-repro sessions (including two
+`/dev/shm`-exhaustion incidents from firing attempts too close together,
+see below) never caught the client process alive at the right instant. The
+actual fault was found in under fifteen minutes once the search shifted to
+an isolated, in-process fuzz test of the suspect component instead of
+attach-and-pray gdb chases against a live 4-broker/128GB-CXL cluster.
+
+**Diagnostic also added (this session)**: `Subscriber::LogOrderGapIfStalled()`
+(`subscriber.cc`/`.h`, called from `TryPopOrderedMessageLocked`) logs, if
+`next_expected_order_` is ever stuck for >5s with buffered data behind the
+gap: `[ORDER_GAP_DIAG] next_expected_order=... stuck_ms=... buffered_slots=...
 present=... missing=... first_present_order=... highest_buffered_order=...`.
-This should pinpoint the exact stuck position (and confirm data exists
-beyond it) the next time this fires naturally, without requiring another
-manual gdb chase.
+Kept as a permanent safety net for any future occurrence of this class of
+bug, independent of the specific fix above.
 
 **Operational hazard found and worth flagging for any future automated
 repro loop**: `scripts/lib/broker_lifecycle.sh`'s `broker_local_cleanup`
@@ -767,10 +797,13 @@ attempts, bounded ~90s with a warning) was introduced. Also: force-killing
 its `trap cleanup EXIT`, leaking its `CXL_KVBASE_*` shm segment — must be
 unlinked manually (scoped to `/CXL_KVBASE_${UID}_*`) after any such kill.
 
-Gate step 5 (full matrix) remains blocked on this until either the gap
-diagnostic captures a natural recurrence with the exact stuck position, or
-the team decides the failure rate (~5%, intermittent, EMBARCADERO/ORDER=5
-only) is acceptable to document as a known limitation and proceed.
+Gate step 5 (full matrix) is unblocked: the fix is committed, unit-tested
+(`unit_order5_subscriber_reorder`, 5/5 passing including the two gap
+regression tests), and synced/rebuilt on c4. Recommend one more realistic-
+scale throttled live run (matching the original failing conditions:
+`RECORD_COUNT_TOTAL=1000000 OPERATION_COUNT_PER_CLIENT=500000`) before
+committing to the full matrix, to confirm the fix holds under real
+cross-host network conditions and not just the in-process fuzz harness.
 
 ## 7. `benchmarks/README.md` correction (deferred until Section 6 tests land)
 
