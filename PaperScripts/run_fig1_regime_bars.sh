@@ -41,8 +41,9 @@ if [[ "${RUN_RF0:-1}" == 1 ]]; then
     fi
     env "${common[@]}" \
         RUN_TAG="$rf0_tag" OUT_BASE="$out_root/rf0" WARMUP_TRIALS=0 \
+        E2_CLIENT_COUNTS="2 4" CLIENT_HOSTS_E2=c4,c3,c1,local \
         SKIP_BASELINES=0 SKIP_CLUSTER_SETUP="${SKIP_CLUSTER_SETUP:-0}" \
-        ONLY_CELLS=e2_embar5_rf0_ack1_n2,e2_embar0_rf0_ack1_n2,e2_corfu_rf0_n2,e2_scalog_rf0_n2 \
+        ONLY_CELLS=e2_embar5_rf0_ack1_n2,e2_embar0_rf0_ack1_n2,e2_corfu_rf0_n2,e2_scalog_rf0_n2,e2_embar5_rf0_ack1_n4,e2_embar0_rf0_ack1_n4,e2_corfu_rf0_n4,e2_scalog_rf0_n4 \
         bash PaperScripts/run_overnight_eval.sh
 fi
 

@@ -56,7 +56,8 @@ cd "$PROJECT_ROOT"
 #   c2: 1G only — excluded
 # Use c4 as primary single client (NUMA-local, NUMA 1, matches original publication topology)
 CLIENT_HOSTS_REMOTE="${CLIENT_HOSTS_REMOTE:-c4}"    # single remote client — c4 is NUMA-optimal
-CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c4,c3,c1}"     # scaling: c4+c3 (both x16 NUMA-local) for N=2, +c1 (x8) for N=3 NIC saturation
+CLIENT_HOSTS_E2="${CLIENT_HOSTS_E2:-c4,c3,c1}"     # Add local explicitly when requesting the mixed N=4 ceiling.
+E2_CLIENT_COUNTS="${E2_CLIENT_COUNTS:-2 3}"
 
 # Single broker IP for all runs — c1 and c3 are both on 10.10.10.x.
 BROKER_IP="${BROKER_IP:-10.10.10.10}"
@@ -324,7 +325,7 @@ run_multi_cell() {
     local _h
     for _h in $(echo "$client_csv" | tr ',' ' '); do
         case "$_h" in
-            c1) numas_csv="${numas_csv:+${numas_csv},}0" ;;
+            c1|local) numas_csv="${numas_csv:+${numas_csv},}0" ;;
             *)  numas_csv="${numas_csv:+${numas_csv},}1" ;;
         esac
     done
@@ -529,15 +530,21 @@ fi
 # the primary comparison operating point. The comparison ratios in the paper
 # derive from RF=0 N=1 and N=2 all-remote results.
 
-# Multi-client throughput scaling N=1,2,3 (all-remote — E2 scaling figure)
+# Multi-client throughput cells. The default N=2,3 roster is all remote; an
+# explicit N=4 campaign may append `local` to measure the mixed-client ceiling.
 if [[ "${SMOKE:-0}" != "1" ]]; then
     # c4, c3, c1 all have 100G NICs on the 10.10.10.x fabric (c4 added
     # 2026-07-11; c1 is x8-downgraded ~3.3 GB/s). N=3 offered load
     # (~13-14 GB/s) saturates the broker's single 100G port (~12.4 GB/s TCP)
     # — that saturation point is the all-remote throughput headline.
-    for nc in 2 3; do
-        # Use first $nc hosts from CLIENT_HOSTS_E2 (= "c4,c3,c1")
+    for nc in $E2_CLIENT_COUNTS; do
+        # Use the first $nc hosts from CLIENT_HOSTS_E2.
         local_csv="$(echo "$CLIENT_HOSTS_E2" | tr ',' '\n' | head -"$nc" | tr '\n' ',' | sed 's/,$//')" || local_csv="c4,c3"
+        actual_clients="$(awk -F, '{print NF}' <<<"$local_csv")"
+        if [[ "$actual_clients" -ne "$nc" ]]; then
+            echo "ERROR: requested N=$nc but CLIENT_HOSTS_E2 supplies only $actual_clients hosts: $local_csv" >&2
+            exit 2
+        fi
         # Both c1 and c3 are on 10.10.10.x — use single BROKER_IP
         run_multi_cell "e2_embar5_rf0_ack1_n${nc}" "$nc" "$local_csv" \
             SEQUENCER=EMBARCADERO ORDER=5 ACK=1 REPLICATION_FACTOR=0 \
