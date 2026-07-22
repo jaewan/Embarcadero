@@ -23,7 +23,8 @@ file_list="$stage/files.txt"
 git -C "$project_root" ls-files | awk '
   /^(\.clang-format|\.editorconfig|\.gitattributes|\.gitignore|ARCHITECTURE.md|CMakeLists.txt|CONTRIBUTING.md|README.md|perf_run.sh)$/ { print; next }
   /^(benchmarks|config|PaperScripts|sessions|src|test)\// { print; next }
-  /^scripts\// && !/^scripts\/network-emulation\/build\// { print; next }
+  /^scripts\// && !/^scripts\/network-emulation\/build\// &&
+    !/^scripts\/publication\/build_anonymous_artifact\.sh$/ { print; next }
   /^spec\// && !/^spec\/results\// { print; next }
   /^docs\/(contracts|baselines|artifacts)\// { print; next }
   /^docs\/design\/protocol_spec\.md$/ { print; next }
