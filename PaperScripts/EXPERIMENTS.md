@@ -20,7 +20,8 @@ the data directory with results, and the plot script.
 ### Fig 2 — Append latency vs offered load (mechanism proof)
 - **Script:** `PaperScripts/run_fig2_latency_vs_load.sh`
 - **Primary validator:** `PaperScripts/summarize_fig2_primary.py` (requires
-  exactly 3 successful steady-rate trials at every load)
+  exactly 3 successful steady-rate trials at every load and a clean campaign
+  contract)
 - **Primary data:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/results.csv`
 - **Primary summary:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/primary_summary.csv`
 - **Primary manifest:** `data/paper_eval/fig2/fig2_append_latency_primary_806b1809/primary_manifest.json`
@@ -34,8 +35,24 @@ the data directory with results, and the plot script.
 
 ### Fig 3 — Failure and per-session recovery
 - **Script:** `PaperScripts/run_fig3_failure.sh`
-- **Data:** `data/paper_eval/fig3/`
-- **Notes:** Q2 experiment. Uses `failure_combined.pdf` figure.
+- **Data:** `data/paper_eval/fig3/fig3_failure_official_8351459f/`
+- **Validator:** `PaperScripts/summarize_fig3_failure.py`
+- **Notes:** Q2 experiment. The validator derives detection, fence, resubmit,
+  and ACK-frontier offsets from all three raw traces and records that this is a
+  protocol-ACK audit, not a downstream apply-state audit.
+
+### Fig. 1 path ablation
+- **Script:** `PaperScripts/run_fig1_path_decomp.sh`
+- **Validator:** `PaperScripts/summarize_fig1_path_ablation.py`
+- **Data:** `data/paper_eval/fig1/fig1_path_decomp/results.csv`
+- **Metric:** N=2 overlap throughput, matching the main N<=3 methodology.
+
+### Q2 two-session gap isolation
+- **Script:** `scripts/run_failure_suite.sh` (E4a session-gap mode)
+- **Validator:** `PaperScripts/summarize_session_isolation.py`
+- **Data:** `data/failure_suite/e4a_commit_official_806b1809/e4a_session_gap/`
+- **Status:** the existing result passes semantic checks but records a dirty
+  worktree, so it must be rerun from a clean commit before submission.
 
 ## Tables
 

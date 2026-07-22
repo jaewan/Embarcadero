@@ -17,6 +17,7 @@ CELL = "fig2_embar_o5_ack2_rf2_mem"
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
+    parser.add_argument("--contract", type=Path, required=True)
     parser.add_argument("--summary-csv", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--trials", type=int, default=3)
@@ -24,6 +25,11 @@ def main() -> None:
         "--loads", default="100 250 500 750 1000 1500 2000"
     )
     args = parser.parse_args()
+
+    contract = args.contract.read_text()
+    dirty_lines = [line for line in contract.splitlines() if line.startswith("- Dirty:")]
+    if len(dirty_lines) != 1 or dirty_lines[0].split(":", 1)[1].strip().lower() != "no":
+        raise SystemExit("noncanonical campaign: contract does not record Dirty: no")
 
     expected_loads = [int(v) for v in args.loads.split()]
     grouped: dict[int, list[dict[str, str]]] = defaultdict(list)
@@ -82,12 +88,16 @@ def main() -> None:
     commits = sorted(
         {row["git_commit"] for rows in grouped.values() for row in rows}
     )
+    if len(commits) != 1:
+        raise SystemExit(f"noncanonical campaign: mixed commits {commits}")
     passes = sorted(
         {row["pass_id"] for rows in grouped.values() for row in rows}
     )
     manifest = {
         "input": str(args.csv),
         "input_sha256": hashlib.sha256(args.csv.read_bytes()).hexdigest(),
+        "contract": str(args.contract),
+        "contract_sha256": hashlib.sha256(args.contract.read_bytes()).hexdigest(),
         "cell": CELL,
         "selection": "all status=ok steady RF2 ACK2 memory-copy rows",
         "required_trials_per_load": args.trials,
@@ -96,7 +106,7 @@ def main() -> None:
         "pass_ids": passes,
         "summary_csv": str(args.summary_csv),
         "validator": {
-            "path": str(Path(__file__).resolve()),
+            "path": "PaperScripts/summarize_fig2_primary.py",
             "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         },
     }
