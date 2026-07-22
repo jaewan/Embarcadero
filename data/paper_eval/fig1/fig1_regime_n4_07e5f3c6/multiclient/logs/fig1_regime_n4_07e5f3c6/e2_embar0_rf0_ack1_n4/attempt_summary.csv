@@ -1,0 +1,5 @@
+trial,attempt,result,reason
+1,1,success,ok
+2,1,failed,incomplete_or_missing_bandwidth
+2,2,success,ok
+3,1,success,ok

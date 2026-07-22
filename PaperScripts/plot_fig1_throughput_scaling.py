@@ -39,6 +39,7 @@ GROUPS = [
     ("disk", "NVMe durable\nRF2 / ACK2"),
     ("mem", "DRAM replica\nRF2 / ACK2"),
     ("rf0", "Replication off\nACK1"),
+    ("rf0_n4", "Mixed N=4 ceiling\nRF0 / ACK1"),
 ]
 
 RF2_CELLS = {
@@ -67,6 +68,17 @@ RF0_CELLS = {
                          "token ordered, replication off"),
     "e2_embar0_rf0_ack1_n2": ("rf0", "embar_o0", 0, 0, 1,
                                "unordered ingestion ceiling"),
+}
+
+RF0_N4_CELLS = {
+    "e2_embar5_rf0_ack1_n4": ("rf0_n4", "embar", 5, 0, 1,
+                                "ordered, replication off"),
+    "e2_scalog_rf0_n4": ("rf0_n4", "scalog", 1, 0, 1,
+                           "native cut, replication off"),
+    "e2_corfu_rf0_n4": ("rf0_n4", "corfu", 2, 0, 1,
+                          "token ordered, replication off"),
+    "e2_embar0_rf0_ack1_n4": ("rf0_n4", "embar_o0", 0, 0, 1,
+                                "unordered ingestion reference"),
 }
 
 TOTAL_RE = re.compile(r"TOTAL\s+→.*?\(([0-9.]+) GB/s\)")
@@ -117,16 +129,23 @@ def load_rf2(path: Path, commit: str) -> list[dict[str, object]]:
             selected.append({
                 "group": group, "series": series, "cell": cell,
                 "trial": index, "order": order, "rf": rf, "ack": ack,
+                "n_clients": 2, "client_hosts": "c4,c3",
                 "semantics": semantics,
                 "throughput_gbps": float(row["bandwidth_sum_gbps"]),
             })
     return selected
 
 
-def load_rf0(root: Path, commit: str) -> tuple[list[dict[str, object]], list[Path]]:
+def load_rf0(
+    root: Path,
+    commit: str,
+    cells: dict[str, tuple[str, str, int, int, int, str]],
+    n_clients: int,
+    client_hosts: str,
+) -> tuple[list[dict[str, object]], list[Path]]:
     selected: list[dict[str, object]] = []
     inputs: list[Path] = []
-    for cell, (group, series, order, rf, ack, semantics) in RF0_CELLS.items():
+    for cell, (group, series, order, rf, ack, semantics) in cells.items():
         cell_dir = root / cell
         log_path = root.parents[2] / "logs" / f"{cell}.log"
         attempts_path = cell_dir / "attempt_summary.csv"
@@ -139,9 +158,10 @@ def load_rf0(root: Path, commit: str) -> tuple[list[dict[str, object]], list[Pat
         with attempts_path.open(newline="") as handle:
             attempts = list(csv.DictReader(handle))
         successes = [row for row in attempts if row.get("result") == "success"]
-        if len(successes) != TRIALS or len(attempts) != TRIALS:
+        successful_trials = {row.get("trial") for row in successes}
+        if len(successes) != TRIALS or successful_trials != {"1", "2", "3"}:
             raise SystemExit(
-                f"{cell}: expected exactly {TRIALS} first-attempt successes; "
+                f"{cell}: expected one successful result for each of 3 trials; "
                 f"attempts={attempts}"
             )
 
@@ -154,13 +174,18 @@ def load_rf0(root: Path, commit: str) -> tuple[list[dict[str, object]], list[Pat
             "ack_level": str(ack), "replication_factor": str(rf),
         }, cell)
 
-        values = [float(value) for value in TOTAL_RE.findall(log_path.read_text())]
+        log_text = log_path.read_text()
+        roster = " ".join(client_hosts.split(","))
+        if f"NUM_CLIENTS:                     {n_clients}  ({roster})" not in log_text:
+            raise SystemExit(f"{cell}: client roster does not match {client_hosts}")
+        values = [float(value) for value in TOTAL_RE.findall(log_text)]
         if len(values) != TRIALS:
             raise SystemExit(f"{cell}: expected {TRIALS} TOTAL values, got {values}")
         for trial, value in enumerate(values, 1):
             selected.append({
                 "group": group, "series": series, "cell": cell,
                 "trial": trial, "order": order, "rf": rf, "ack": ack,
+                "n_clients": n_clients, "client_hosts": client_hosts,
                 "semantics": semantics, "throughput_gbps": value,
             })
     return selected, inputs
@@ -171,7 +196,10 @@ def main() -> None:
     parser.add_argument("--rf2-csv", required=True, type=Path)
     parser.add_argument("--rf0-root", required=True, type=Path,
                         help=".../multiclient/logs/<run-tag> directory")
+    parser.add_argument("--rf0-n4-root", required=True, type=Path,
+                        help="mixed-client N=4 .../multiclient/logs/<run-tag>")
     parser.add_argument("--commit", required=True)
+    parser.add_argument("--n4-commit", required=True)
     parser.add_argument("--pdf", required=True, type=Path)
     parser.add_argument("--paper-pdf", type=Path)
     parser.add_argument("--png", type=Path)
@@ -180,8 +208,15 @@ def main() -> None:
     args = parser.parse_args()
 
     rows = load_rf2(args.rf2_csv, args.commit)
-    rf0_rows, rf0_inputs = load_rf0(args.rf0_root, args.commit)
+    rf0_rows, rf0_inputs = load_rf0(
+        args.rf0_root, args.commit, RF0_CELLS, 2, "c4,c3"
+    )
     rows.extend(rf0_rows)
+    n4_rows, n4_inputs = load_rf0(
+        args.rf0_n4_root, args.n4_commit, RF0_N4_CELLS, 4,
+        "c4,c3,c1,local",
+    )
+    rows.extend(n4_rows)
 
     values: dict[tuple[str, str], list[float]] = {}
     for row in rows:
@@ -195,7 +230,7 @@ def main() -> None:
         "legend.fontsize": 6.8, "pdf.fonttype": 42,
     })
     fig, ax = plt.subplots(figsize=(6.5, 2.15))
-    centers = [0.0, 1.0, 2.0]
+    centers = list(range(len(GROUPS)))
     series_order = ["embar", "scalog", "corfu", "lazylog", "embar_o0"]
     offsets = {series: (index - 2) * 0.15
                for index, series in enumerate(series_order)}
@@ -208,7 +243,7 @@ def main() -> None:
         for center, (group, _) in zip(centers, GROUPS):
             trial_values = values.get((group, series))
             if not trial_values:
-                if series == "lazylog" and group in {"mem", "rf0"}:
+                if series == "lazylog" and group in {"mem", "rf0", "rf0_n4"}:
                     ax.text(center + offsets[series], 0.22, "N/A", ha="center",
                             va="bottom", fontsize=5.8, color="#666666")
                 continue
@@ -235,9 +270,9 @@ def main() -> None:
 
     ax.set_xticks(centers)
     ax.set_xticklabels([label for _, label in GROUPS])
-    ax.set_ylabel("ACK-drain throughput (GB/s)")
-    ax.set_ylim(0, 12.4)
-    ax.set_xlim(-0.55, 2.55)
+    ax.set_ylabel("Summed publisher ACK throughput (GB/s)")
+    ax.set_ylim(0, 19.2)
+    ax.set_xlim(-0.55, 3.55)
     ax.grid(True, axis="y", alpha=0.25, linestyle=":", zorder=0)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -258,7 +293,7 @@ def main() -> None:
 
     args.selected_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["group", "series", "cell", "trial", "order", "rf", "ack",
-                  "semantics", "throughput_gbps"]
+                  "n_clients", "client_hosts", "semantics", "throughput_gbps"]
     with args.selected_csv.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
@@ -271,14 +306,15 @@ def main() -> None:
             "min_gbps": min(trial_values), "max_gbps": max(trial_values),
             "values_gbps": trial_values,
         }
-    inputs = [args.rf2_csv, *rf0_inputs]
+    inputs = [args.rf2_csv, *rf0_inputs, *n4_inputs]
     manifest = {
         "contract": {
-            "git_commit": args.commit, "metric": "bandwidth_sum_gbps",
-            "selection": "all three successful fixed-commit trials; no filtering",
-            "n_clients": 2, "client_hosts": ["c4", "c3"],
-            "message_bytes": 4096, "bytes_per_client": 10737418240,
-            "aggregate_bytes": 21474836480,
+            "n2_git_commit": args.commit, "n4_git_commit": args.n4_commit,
+            "metric": "bandwidth_sum_gbps",
+            "selection": "one successful result for each of three predeclared trials; no performance filtering",
+            "client_rosters": {"n2": ["c4", "c3"],
+                               "n4_mixed": ["c4", "c3", "c1", "local"]},
+            "message_bytes": 4096, "aggregate_bytes": 10737418240,
             "brokers": 4, "threads_per_broker": 6, "batch_kb": 2048,
             "lazylog_note": "faithful pre-binding durable ACK; not ordered delivery",
             "embar_o0_note": "unordered ingestion reference; not Scalog-equivalent",

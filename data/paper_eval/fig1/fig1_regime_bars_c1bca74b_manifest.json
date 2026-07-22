@@ -1,25 +1,32 @@
 {
   "contract": {
-    "aggregate_bytes": 21474836480,
+    "aggregate_bytes": 10737418240,
     "batch_kb": 2048,
     "brokers": 4,
-    "bytes_per_client": 10737418240,
-    "client_hosts": [
-      "c4",
-      "c3"
-    ],
+    "client_rosters": {
+      "n2": [
+        "c4",
+        "c3"
+      ],
+      "n4_mixed": [
+        "c4",
+        "c3",
+        "c1",
+        "local"
+      ]
+    },
     "embar_o0_note": "unordered ingestion reference; not Scalog-equivalent",
-    "git_commit": "c1bca74bdcc4aa4eea7ba52b1ae3b76292c82231",
     "lazylog_note": "faithful pre-binding durable ACK; not ordered delivery",
     "message_bytes": 4096,
     "metric": "bandwidth_sum_gbps",
-    "n_clients": 2,
-    "selection": "all three successful fixed-commit trials; no filtering",
+    "n2_git_commit": "c1bca74bdcc4aa4eea7ba52b1ae3b76292c82231",
+    "n4_git_commit": "07e5f3c6f94ce0da917f15272c5410d00dae1089",
+    "selection": "one successful result for each of three predeclared trials; no performance filtering",
     "threads_per_broker": 6
   },
   "generator": {
     "path": "PaperScripts/plot_fig1_throughput_scaling.py",
-    "sha256": "6e9656c3b286bf22feb3cab77b582296f4e087d11a18ff95f3b1e0d6971faf11"
+    "sha256": "f4c3e01917f3b26a4acfa63da0e50c9e44773017f38485ff85f7828e3d1a4f7f"
   },
   "inputs": {
     "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/results.csv": "c1cdf3086c37f78b2b0853729553d5c816617c5f1a016cdbee78214e1f625ddf",
@@ -34,13 +41,25 @@
     "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_embar5_rf0_ack1_n2/attempt_summary.csv": "8d3f05c8f8db56a2d7fd70147a8731d473f302e96e0f43c0aecd652f1fc4c39c",
     "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_embar5_rf0_ack1_n2/run_contract.csv": "66aee0148728a6308837d4557d670bbc66f9319c54390eb4a684f33863729336",
     "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_scalog_rf0_n2/attempt_summary.csv": "8d3f05c8f8db56a2d7fd70147a8731d473f302e96e0f43c0aecd652f1fc4c39c",
-    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_scalog_rf0_n2/run_contract.csv": "c8430e83c811b43a7879e3ecfd50bdbcf6ecd00d7fbeba40b58ae6a45019de00"
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_scalog_rf0_n2/run_contract.csv": "c8430e83c811b43a7879e3ecfd50bdbcf6ecd00d7fbeba40b58ae6a45019de00",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/logs/e2_corfu_rf0_n4.log": "a2b484733b256526a03096cb6e3b049dcdd989ee2a6f09db66af7bbd80d79d55",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/logs/e2_embar0_rf0_ack1_n4.log": "2dbdca958c4f17a5a02f198d6eb352ce6846e7c68a935de82f1dcdfec04cfe8b",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/logs/e2_embar5_rf0_ack1_n4.log": "2f0475571a3f1b2cf2f16f9bfe2da035907e1f3536a788495dddbab5d1906747",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/logs/e2_scalog_rf0_n4.log": "a1524ec16e28ee32363178979802e0eb132ceffba24ba04bd8aaf17aa1483738",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/attempt_summary.csv": "8d3f05c8f8db56a2d7fd70147a8731d473f302e96e0f43c0aecd652f1fc4c39c",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/run_contract.csv": "50a05afdb99cd1690c937479a5af38e464af96d3fea2e54db4b3f726a612a6bf",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_embar0_rf0_ack1_n4/attempt_summary.csv": "c473388d471b836082266832157bfc13b979e3ff129e3c95cc964698bc56123f",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_embar0_rf0_ack1_n4/run_contract.csv": "811915c3047df4af3c27f7e7d6b8bc4a34338120e56f22c66c20d0273f1618e3",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_embar5_rf0_ack1_n4/attempt_summary.csv": "8d3f05c8f8db56a2d7fd70147a8731d473f302e96e0f43c0aecd652f1fc4c39c",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_embar5_rf0_ack1_n4/run_contract.csv": "f770bceef9cb6681d39450a2ad1b6618acadb2fc1a07de4f0a2ad87eb767b843",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_scalog_rf0_n4/attempt_summary.csv": "8d3f05c8f8db56a2d7fd70147a8731d473f302e96e0f43c0aecd652f1fc4c39c",
+    "data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_scalog_rf0_n4/run_contract.csv": "94bb00c7d6772cc8f22b1fb286abede8115305cc0923c3644d685d1a2a55424b"
   },
   "outputs": {
-    "Paper/Figures/throughput_scaling.pdf": "e62242334b1266ca095fafbecc9b224b816d4870b3321f219e20b5f0c85cfe20",
-    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b_selected.csv": "79c27b347e97bc17aefa8ef90c4ff95dea769a97a9fddb963758dd9ef4ee8422",
-    "data/paper_eval/fig1/throughput_scaling.pdf": "e62242334b1266ca095fafbecc9b224b816d4870b3321f219e20b5f0c85cfe20",
-    "data/paper_eval/fig1/throughput_scaling.png": "385f5425ff404cc1c5f2e44731450b792ba52f5ea28ff9f4c4ef63f6f3b35116"
+    "Paper/Figures/throughput_scaling.pdf": "114a29f5c1cb1550dc62dd21094d746ef6f960082c41ecce12ddadc9ae0eff2c",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b_selected.csv": "8533047d268149ada5c92b45e9823835888ba007c908e5e70b112865d8b42289",
+    "data/paper_eval/fig1/throughput_scaling.pdf": "114a29f5c1cb1550dc62dd21094d746ef6f960082c41ecce12ddadc9ae0eff2c",
+    "data/paper_eval/fig1/throughput_scaling.png": "5ab2c40044bb9ee0d357fe46318f203b08fd7285ad82f33dd4de25b7acd87acc"
   },
   "selected_rows_csv": "data/paper_eval/fig1/fig1_regime_bars_c1bca74b_selected.csv",
   "summary": {
@@ -163,6 +182,50 @@
         9.493,
         9.748,
         10.152
+      ]
+    },
+    "rf0_n4.corfu": {
+      "max_gbps": 2.547,
+      "median_gbps": 2.533,
+      "min_gbps": 2.476,
+      "n": 3,
+      "values_gbps": [
+        2.533,
+        2.476,
+        2.547
+      ]
+    },
+    "rf0_n4.embar": {
+      "max_gbps": 14.281,
+      "median_gbps": 14.17,
+      "min_gbps": 14.169,
+      "n": 3,
+      "values_gbps": [
+        14.281,
+        14.169,
+        14.17
+      ]
+    },
+    "rf0_n4.embar_o0": {
+      "max_gbps": 17.442,
+      "median_gbps": 16.287,
+      "min_gbps": 15.838,
+      "n": 3,
+      "values_gbps": [
+        16.287,
+        15.838,
+        17.442
+      ]
+    },
+    "rf0_n4.scalog": {
+      "max_gbps": 11.095,
+      "median_gbps": 10.836,
+      "min_gbps": 10.705,
+      "n": 3,
+      "values_gbps": [
+        11.095,
+        10.705,
+        10.836
       ]
     }
   }

@@ -54,7 +54,9 @@ fi
 python3 PaperScripts/plot_fig1_throughput_scaling.py \
     --rf2-csv "$out_root/results.csv" \
     --rf0-root "$out_root/rf0/multiclient/logs/$rf0_tag" \
+    --rf0-n4-root "$out_root/rf0/multiclient/logs/$rf0_tag" \
     --commit "$commit" \
+    --n4-commit "$commit" \
     --pdf "$out_root/throughput_regimes.pdf" \
     --png "$out_root/throughput_regimes.png" \
     --manifest "$out_root/throughput_regimes_manifest.json" \

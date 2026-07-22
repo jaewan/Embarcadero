@@ -5,16 +5,18 @@ the data directory with results, and the plot script.
 
 ## Figures
 
-### Fig. 1 — Throughput regimes at fixed N=2
+### Fig. 1 — Throughput regimes and mixed-client ceiling
 - **Scripts:** `PaperScripts/run_fig1_throughput_scaling.sh` for RF2 and
   `PaperScripts/run_overnight_eval.sh` for the filtered RF0 cells.
 - **Data:** `data/paper_eval/fig1/fig1_regime_bars_c1bca74b/`
+  plus `data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/`
 - **Plot:** `PaperScripts/plot_fig1_throughput_scaling.py`
 - **Manifest:** `data/paper_eval/fig1/fig1_regime_bars_c1bca74b_manifest.json`
 - **Selected rows:** `data/paper_eval/fig1/fig1_regime_bars_c1bca74b_selected.csv`
 - **Generated figure:** `data/paper_eval/fig1/throughput_scaling.{pdf,png}`
-- **Notes:** Every bar uses ACK-drain throughput from exactly three successful
-  rows at commit `c1bca74b`; no performance filtering. LazyLog is a faithful
+- **Notes:** Every bar uses the sum of publisher ACK-drain rates from three predeclared trials;
+  the N=2 and N=4 inputs are clean commits `c1bca74b` and `07e5f3c6`,
+  respectively, with no performance filtering. LazyLog is a faithful
   pre-binding durable-ACK reference, and O0 is an unordered reference.
 
 ### Fig 2 — Append latency vs offered load (mechanism proof)

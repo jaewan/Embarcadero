@@ -1,0 +1,162 @@
+================================================================
+  Embarcadero Multi-Client Throughput Benchmark
+================================================================
+  NUM_CLIENTS:                     4  (c4 c3 c1 local)
+  NUM_BROKERS:                     4
+  NUM_TRIALS:                      3
+  SEQUENCER / ORDER:               CORFU / 2
+  ACK / REPLICATION_FACTOR:        1 / 0
+  CHAIN_SINK_MODE:                 disk-durable
+  ACK_CLAIM_LABEL:                 n/a
+  MESSAGE_SIZE:                    4096 B
+  TOTAL_MESSAGE_SIZE:              10737418240 B  (10240 MiB)
+  LOAD_PER_CLIENT:                 2684354560 B  (2560 MiB)
+  THREADS_PER_BROKER:              4
+  BROKER_IP:                       10.10.10.10
+  START_DELAY_SEC:                 3
+  ORDER0_FAST_PATH:                1
+  PAYLOAD_SEND_CHUNK_BYTES:        524288
+  ENABLE_PAYLOAD_MSG_MORE:         1
+  BATCH_SIZE:                      524288
+  CLIENT_PUB_BATCH_KB:             2048
+  NETWORK_IO_THREADS:              24
+  CONTROL_TRANSPORT:               grpc
+  ORDER5_HOME_BROKERS:             (unset)
+  ORDER5_EPOCH_US:                 (default=500)
+  LOCAL_CLIENT_NUMA:               0
+  CORFU_SEQ_IP:                    10.10.10.10
+  CORFU_SEQ_PORT:                  (default)
+  ACK_DURABILITY_CONTRACT:         not_applicable
+================================================================
+
+=== Trial 1 / 3  (CORFU  Order=2  Brokers=4  Clients=4  msg=4096B) ===
+  Attempt 1 / 3
+  Corfu replica media: /home/domin/Embarcadero/.Replication/disk0,/mnt/nvme0/replication/disk1
+Resetting previous broker state...
+Resource snapshot: MemAvailable=1764152MB HugePagesFree=6500 (13000MB) HugePagesRsvd=0 HugePagesSurp=0 /dev/shm_avail=902833MB
+Starting 4 broker(s) with NUMA bind: ''
+Overlapping follower launch with head startup (zero_mode=metadata)...
+Waiting for 4 broker(s) to become ready (timeout: 300s)...
+Waiting for 4 brokers to signal readiness...
+Waiting 4s for cluster state propagation...
+All 4 brokers ready and reachable.
+  Barrier start time: 1784739686810 ms  (T+3s)
+  Launching client[0] host=c4  NUMA=1  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial1_c4.log
+  Launching client[1] host=c3  NUMA=1  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial1_c3.log
+  Launching client[2] host=c1  NUMA=0  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial1_c1.log
+  Launching client[3] host=local  NUMA=0  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial1_local.log
+  Push-go barrier armed (wait up to 120s for Init)
+  Waiting for 4 client(s)...
+  Push-go fired at 1784739689217
+WARNING: overlap window 3103 ms < MIN_OVERLAP_MS=10000; reporting anyway with caution
+
+--- Trial 1 Results ---
+  c4       → 816.47 MB/s  (Send-done 816.70 MB/s; join=1283.458ms ack_wait=0.000ms)
+  c3       → 407.03 MB/s  (Send-done 407.09 MB/s; join=2449.895ms ack_wait=0.000ms)
+  c1       → 622.20 MB/s  (Send-done 622.30 MB/s; join=1538.468ms ack_wait=0.001ms)
+  local    → 747.90 MB/s  (Send-done 748.04 MB/s; join=1407.376ms ack_wait=0.000ms)
+  ────────────────────────────────────────
+  TOTAL    → 2593.60 MB/s  (2.533 GB/s)  [end-to-end incl. Poll]
+  SENDDONE → 2594.13 MB/s  (2.533 GB/s)  [excludes Poll; prefer for short ORDER=5 runs]
+  OVERLAP  → 2.456586361 GB/s  (window=3103ms clients=4)
+  (naive sum of per-client averages; see OSDI/SOSP note below)
+Cleaning up...
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 978429 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_"$i".log 2>&1
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 978430 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_"$i".log 2>&1
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 978431 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_"$i".log 2>&1
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 978341 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_0.log 2>&1
+
+=== Trial 2 / 3  (CORFU  Order=2  Brokers=4  Clients=4  msg=4096B) ===
+  Attempt 1 / 3
+  Corfu replica media: /home/domin/Embarcadero/.Replication/disk0,/mnt/nvme0/replication/disk1
+Resetting previous broker state...
+Resource snapshot: MemAvailable=1764272MB HugePagesFree=6500 (13000MB) HugePagesRsvd=0 HugePagesSurp=0 /dev/shm_avail=902833MB
+Starting 4 broker(s) with NUMA bind: ''
+Overlapping follower launch with head startup (zero_mode=metadata)...
+Waiting for 4 broker(s) to become ready (timeout: 300s)...
+Waiting for 4 brokers to signal readiness...
+Waiting 4s for cluster state propagation...
+All 4 brokers ready and reachable.
+  Barrier start time: 1784739780751 ms  (T+3s)
+  Launching client[0] host=c4  NUMA=1  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial2_c4.log
+  Launching client[1] host=c3  NUMA=1  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial2_c3.log
+  Launching client[2] host=c1  NUMA=0  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial2_c1.log
+  Launching client[3] host=local  NUMA=0  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial2_local.log
+  Push-go barrier armed (wait up to 120s for Init)
+  Waiting for 4 client(s)...
+  Push-go fired at 1784739783198
+WARNING: overlap window 3102 ms < MIN_OVERLAP_MS=10000; reporting anyway with caution
+
+--- Trial 2 Results ---
+  c4       → 806.39 MB/s  (Send-done 806.59 MB/s; join=1317.418ms ack_wait=0.000ms)
+  c3       → 413.46 MB/s  (Send-done 413.52 MB/s; join=2460.818ms ack_wait=0.000ms)
+  c1       → 584.68 MB/s  (Send-done 584.78 MB/s; join=2049.065ms ack_wait=0.001ms)
+  local    → 730.78 MB/s  (Send-done 730.91 MB/s; join=1432.810ms ack_wait=0.000ms)
+  ────────────────────────────────────────
+  TOTAL    → 2535.31 MB/s  (2.476 GB/s)  [end-to-end incl. Poll]
+  SENDDONE → 2535.80 MB/s  (2.476 GB/s)  [excludes Poll; prefer for short ORDER=5 runs]
+  OVERLAP  → 2.438009670 GB/s  (window=3102ms clients=4)
+  (naive sum of per-client averages; see OSDI/SOSP note below)
+Cleaning up...
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 987380 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_"$i".log 2>&1
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 987381 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_"$i".log 2>&1
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 987293 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_0.log 2>&1
+
+=== Trial 3 / 3  (CORFU  Order=2  Brokers=4  Clients=4  msg=4096B) ===
+  Attempt 1 / 3
+  Corfu replica media: /home/domin/Embarcadero/.Replication/disk0,/mnt/nvme0/replication/disk1
+Resetting previous broker state...
+Resource snapshot: MemAvailable=1764280MB HugePagesFree=6500 (13000MB) HugePagesRsvd=0 HugePagesSurp=0 /dev/shm_avail=902833MB
+Starting 4 broker(s) with NUMA bind: ''
+Overlapping follower launch with head startup (zero_mode=metadata)...
+Waiting for 4 broker(s) to become ready (timeout: 300s)...
+Waiting for 4 brokers to signal readiness...
+Waiting 4s for cluster state propagation...
+All 4 brokers ready and reachable.
+  Barrier start time: 1784739874689 ms  (T+3s)
+  Launching client[0] host=c4  NUMA=1  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial3_c4.log
+  Launching client[1] host=c3  NUMA=1  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial3_c3.log
+  Launching client[2] host=c1  NUMA=0  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial3_c1.log
+  Launching client[3] host=local  NUMA=0  log=/home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/trial3_local.log
+  Push-go barrier armed (wait up to 120s for Init)
+  Waiting for 4 client(s)...
+  Push-go fired at 1784739877121
+WARNING: overlap window 3203 ms < MIN_OVERLAP_MS=10000; reporting anyway with caution
+
+--- Trial 3 Results ---
+  c4       → 812.84 MB/s  (Send-done 813.06 MB/s; join=1317.229ms ack_wait=0.001ms)
+  c3       → 394.89 MB/s  (Send-done 394.93 MB/s; join=2547.618ms ack_wait=0.000ms)
+  c1       → 659.98 MB/s  (Send-done 660.10 MB/s; join=1749.171ms ack_wait=0.001ms)
+  local    → 739.98 MB/s  (Send-done 740.17 MB/s; join=1423.826ms ack_wait=0.001ms)
+  ────────────────────────────────────────
+  TOTAL    → 2607.69 MB/s  (2.547 GB/s)  [end-to-end incl. Poll]
+  SENDDONE → 2608.26 MB/s  (2.547 GB/s)  [excludes Poll; prefer for short ORDER=5 runs]
+  OVERLAP  → 2.506243003 GB/s  (window=3203ms clients=4)
+  (naive sum of per-client averages; see OSDI/SOSP note below)
+Cleaning up...
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 996575 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_"$i".log 2>&1
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 996576 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_"$i".log 2>&1
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 996577 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_"$i".log 2>&1
+/home/domin/Embarcadero/scripts/lib/broker_lifecycle.sh: line 738: 996488 Killed                  $EMBARLET_NUMA_BIND ./embarlet --config "$BROKER_CONFIG_ABS" --head "--${SEQUENCER}" "${corfu_durability_args[@]}" --network_threads "$EMBARCADERO_NETWORK_IO_THREADS" > /tmp/broker_0.log 2>&1
+
+================================================================
+  Grand Summary  (naive aggregate MB/s per trial)
+================================================================
+  Trial         Bandwidth    Send-done   GB/s(BW)
+  Trial 1  :    2593.60    2594.13     2.533
+  Trial 2  :    2535.31    2535.80     2.476
+  Trial 3  :    2607.69    2608.26     2.547
+================================================================
+  Note: Bandwidth includes Poll(); Send-done excludes it.
+  After the ORDER=5 join-watchdog fix, short runs should agree;
+  if they diverge, inspect [POLL_BREAKDOWN] publisher_join_ms.
+================================================================
+
+  Logs: /home/domin/Embarcadero/data/paper_eval/fig1/fig1_regime_n4_07e5f3c6/multiclient/logs/fig1_regime_n4_07e5f3c6/e2_corfu_rf0_n4/
+
+  RIGOROUS AGGREGATION NOTE (OSDI/SOSP method):
+  The numbers above are naive sums of each client's average.  For
+  peer-reviewable results, determine the overlapping measurement
+  window from time-series CSVs (one per client) and divide total
+  bytes sent inside that window by its duration.
+================================================================

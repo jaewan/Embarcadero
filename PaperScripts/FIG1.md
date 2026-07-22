@@ -1,12 +1,13 @@
-# Fig. 1 — Throughput regimes at fixed N=2
+# Fig. 1 — Throughput regimes and mixed-client ceiling
 
 ## Claim
 
 At a fixed two-remote-publisher operating point, identify which resource binds
 throughput as the completion contract moves from dual-NVMe RF2, to DRAM-copy
-RF2, to replication-off ACK1. Fair baselines use the same replica sink and
-ACK-drain metric. LazyLog appears only as a faithful pre-binding durable-ACK
-reference; Embarcadero O0 appears only as an unordered ceiling reference.
+RF2, to replication-off ACK1; then add a mixed N=4 point to expose local-ingress
+headroom. Fair baselines use the same replica sink and ACK metric. LazyLog
+appears only as a faithful pre-binding durable-ACK reference; Embarcadero O0
+appears only as an unordered ceiling reference.
 
 ## Fixed knobs (do not change between trials)
 
@@ -16,7 +17,7 @@ reference; Embarcadero O0 appears only as an unordered ceiling reference.
 | RF / ACK | 2/2 or 0/1 | Regime-defining completion contract |
 | Embar order | 5; O0 reference | O0 is an unordered ablation only |
 | Message size | 4096 B | Paper Fig1 draft |
-| Bytes / publisher | 10 GiB | 20 GiB aggregate for every N=2 bar |
+| Bytes aggregate | 10 GiB | Divided evenly across publishers |
 | Publish batch | 2048 KB | `client.yaml` design point |
 | Threads/broker | 6 | Matched across Embar + baselines |
 | Epoch µs | 500 | ORDER=5 remote design point |
@@ -30,8 +31,9 @@ N=2: `c4,c3`, both remote 100 GbE publishers pinned to NUMA node 1.
 
 ## Figure layout
 
-One grouped chart uses a common linear axis and three regimes: NVMe RF2/ACK2,
-DRAM-copy RF2/ACK2, and replication-off ACK1. Bars are medians and whiskers are
+One grouped chart uses a common linear axis and four regimes: NVMe RF2/ACK2,
+DRAM-copy RF2/ACK2, replication-off ACK1 at N=2, and a replication-off mixed
+N=4 ceiling with three remote publishers plus one local publisher. Bars are medians and whiskers are
 min--max over all three accepted trials; no performance filtering is allowed.
 LazyLog is hatched to denote its weaker pre-binding ACK. Embarcadero O0 is
 hatched separately and must not be described as Scalog-equivalent.
@@ -50,7 +52,8 @@ a fair data-sink A/B.
 
 ## Metric
 
-- **ACK-drain GB/s** = aggregate acknowledged bytes / full completion interval.
+- **Summed publisher ACK GB/s** = sum of each synchronized publisher's
+  end-to-end acknowledged-byte rate (`bandwidth_sum_gbps`).
 - Also record overlap and send-done as diagnostics, but do not mix them into the
   bar chart.
 - Send-done scaling ≠ ACK scaling (publishers pipeline ahead of ACKs).
