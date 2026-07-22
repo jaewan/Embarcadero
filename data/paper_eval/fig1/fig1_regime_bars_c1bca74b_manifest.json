@@ -1,0 +1,169 @@
+{
+  "contract": {
+    "aggregate_bytes": 21474836480,
+    "batch_kb": 2048,
+    "brokers": 4,
+    "bytes_per_client": 10737418240,
+    "client_hosts": [
+      "c4",
+      "c3"
+    ],
+    "embar_o0_note": "unordered ingestion reference; not Scalog-equivalent",
+    "git_commit": "c1bca74bdcc4aa4eea7ba52b1ae3b76292c82231",
+    "lazylog_note": "faithful pre-binding durable ACK; not ordered delivery",
+    "message_bytes": 4096,
+    "metric": "bandwidth_sum_gbps",
+    "n_clients": 2,
+    "selection": "all three successful fixed-commit trials; no filtering",
+    "threads_per_broker": 6
+  },
+  "generator": {
+    "path": "PaperScripts/plot_fig1_throughput_scaling.py",
+    "sha256": "6e9656c3b286bf22feb3cab77b582296f4e087d11a18ff95f3b1e0d6971faf11"
+  },
+  "inputs": {
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/results.csv": "c1cdf3086c37f78b2b0853729553d5c816617c5f1a016cdbee78214e1f625ddf",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/logs/e2_corfu_rf0_n2.log": "b34b65556c9910165cce513494bedb4dae27f3998c1c23fcc9722e52c68554c6",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/logs/e2_embar0_rf0_ack1_n2.log": "86193fd26ffa316f43d5d42f33ce7fab922987f643a226064517be5028f9a317",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/logs/e2_embar5_rf0_ack1_n2.log": "0131dc48970cab21c7c7c8de2b416c7adc1459ebe86572455a1efd6fa083d086",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/logs/e2_scalog_rf0_n2.log": "a0f6bbea8cb1ad9ee2e46f655d43389c0302ea2dd2db2921b9541c7d01e711e3",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_corfu_rf0_n2/attempt_summary.csv": "8d3f05c8f8db56a2d7fd70147a8731d473f302e96e0f43c0aecd652f1fc4c39c",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_corfu_rf0_n2/run_contract.csv": "75244057cdcb2e222a3755a04541ae3331a747a4a1d363360b251d27ba0f6455",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_embar0_rf0_ack1_n2/attempt_summary.csv": "8d3f05c8f8db56a2d7fd70147a8731d473f302e96e0f43c0aecd652f1fc4c39c",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_embar0_rf0_ack1_n2/run_contract.csv": "a4c9aaf9d3bd7dd08e6b0a2dab726776176c8f4a603e1dcf8e19cd8410aee404",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_embar5_rf0_ack1_n2/attempt_summary.csv": "8d3f05c8f8db56a2d7fd70147a8731d473f302e96e0f43c0aecd652f1fc4c39c",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_embar5_rf0_ack1_n2/run_contract.csv": "66aee0148728a6308837d4557d670bbc66f9319c54390eb4a684f33863729336",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_scalog_rf0_n2/attempt_summary.csv": "8d3f05c8f8db56a2d7fd70147a8731d473f302e96e0f43c0aecd652f1fc4c39c",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b/e2_scalog_rf0_n2/run_contract.csv": "c8430e83c811b43a7879e3ecfd50bdbcf6ecd00d7fbeba40b58ae6a45019de00"
+  },
+  "outputs": {
+    "Paper/Figures/throughput_scaling.pdf": "e62242334b1266ca095fafbecc9b224b816d4870b3321f219e20b5f0c85cfe20",
+    "data/paper_eval/fig1/fig1_regime_bars_c1bca74b_selected.csv": "79c27b347e97bc17aefa8ef90c4ff95dea769a97a9fddb963758dd9ef4ee8422",
+    "data/paper_eval/fig1/throughput_scaling.pdf": "e62242334b1266ca095fafbecc9b224b816d4870b3321f219e20b5f0c85cfe20",
+    "data/paper_eval/fig1/throughput_scaling.png": "385f5425ff404cc1c5f2e44731450b792ba52f5ea28ff9f4c4ef63f6f3b35116"
+  },
+  "selected_rows_csv": "data/paper_eval/fig1/fig1_regime_bars_c1bca74b_selected.csv",
+  "summary": {
+    "disk.corfu": {
+      "max_gbps": 0.87901,
+      "median_gbps": 0.85883,
+      "min_gbps": 0.84583,
+      "n": 3,
+      "values_gbps": [
+        0.85883,
+        0.87901,
+        0.84583
+      ]
+    },
+    "disk.embar": {
+      "max_gbps": 1.36765,
+      "median_gbps": 1.36608,
+      "min_gbps": 1.36374,
+      "n": 3,
+      "values_gbps": [
+        1.36374,
+        1.36608,
+        1.36765
+      ]
+    },
+    "disk.lazylog": {
+      "max_gbps": 0.08725,
+      "median_gbps": 0.08687,
+      "min_gbps": 0.08443,
+      "n": 3,
+      "values_gbps": [
+        0.08443,
+        0.08725,
+        0.08687
+      ]
+    },
+    "disk.scalog": {
+      "max_gbps": 1.30305,
+      "median_gbps": 1.29489,
+      "min_gbps": 1.28675,
+      "n": 3,
+      "values_gbps": [
+        1.30305,
+        1.29489,
+        1.28675
+      ]
+    },
+    "mem.corfu": {
+      "max_gbps": 1.26442,
+      "median_gbps": 1.25872,
+      "min_gbps": 1.24816,
+      "n": 3,
+      "values_gbps": [
+        1.24816,
+        1.26442,
+        1.25872
+      ]
+    },
+    "mem.embar": {
+      "max_gbps": 7.22895,
+      "median_gbps": 7.18414,
+      "min_gbps": 6.71544,
+      "n": 3,
+      "values_gbps": [
+        7.18414,
+        7.22895,
+        6.71544
+      ]
+    },
+    "mem.scalog": {
+      "max_gbps": 7.385,
+      "median_gbps": 7.20997,
+      "min_gbps": 7.18841,
+      "n": 3,
+      "values_gbps": [
+        7.385,
+        7.20997,
+        7.18841
+      ]
+    },
+    "rf0.corfu": {
+      "max_gbps": 1.413,
+      "median_gbps": 1.393,
+      "min_gbps": 1.367,
+      "n": 3,
+      "values_gbps": [
+        1.413,
+        1.367,
+        1.393
+      ]
+    },
+    "rf0.embar": {
+      "max_gbps": 11.244,
+      "median_gbps": 11.13,
+      "min_gbps": 11.001,
+      "n": 3,
+      "values_gbps": [
+        11.244,
+        11.001,
+        11.13
+      ]
+    },
+    "rf0.embar_o0": {
+      "max_gbps": 11.188,
+      "median_gbps": 11.079,
+      "min_gbps": 10.882,
+      "n": 3,
+      "values_gbps": [
+        11.079,
+        11.188,
+        10.882
+      ]
+    },
+    "rf0.scalog": {
+      "max_gbps": 10.152,
+      "median_gbps": 9.748,
+      "min_gbps": 9.493,
+      "n": 3,
+      "values_gbps": [
+        9.493,
+        9.748,
+        10.152
+      ]
+    }
+  }
+}

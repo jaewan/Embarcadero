@@ -1,0 +1,34 @@
+group,series,cell,trial,order,rf,ack,semantics,throughput_gbps
+disk,embar,fig1_embar_o5_disk_n2,1,5,2,2,ordered + media durable,1.36374
+disk,embar,fig1_embar_o5_disk_n2,2,5,2,2,ordered + media durable,1.36608
+disk,embar,fig1_embar_o5_disk_n2,3,5,2,2,ordered + media durable,1.36765
+disk,scalog,fig1_scalog_o1_disk_n2,1,1,2,2,native cut + media durable,1.30305
+disk,scalog,fig1_scalog_o1_disk_n2,2,1,2,2,native cut + media durable,1.29489
+disk,scalog,fig1_scalog_o1_disk_n2,3,1,2,2,native cut + media durable,1.28675
+disk,corfu,fig1_corfu_o2_disk_n2,1,2,2,2,token ordered + media durable,0.85883
+disk,corfu,fig1_corfu_o2_disk_n2,2,2,2,2,token ordered + media durable,0.87901
+disk,corfu,fig1_corfu_o2_disk_n2,3,2,2,2,token ordered + media durable,0.84583
+disk,lazylog,fig1_lazylog_o2_disk_n2,1,2,2,2,pre-binding metadata/data durable,0.08443
+disk,lazylog,fig1_lazylog_o2_disk_n2,2,2,2,2,pre-binding metadata/data durable,0.08725
+disk,lazylog,fig1_lazylog_o2_disk_n2,3,2,2,2,pre-binding metadata/data durable,0.08687
+mem,embar,fig1_embar_o5_mem_n2,1,5,2,2,ordered + DRAM replicated,7.18414
+mem,embar,fig1_embar_o5_mem_n2,2,5,2,2,ordered + DRAM replicated,7.22895
+mem,embar,fig1_embar_o5_mem_n2,3,5,2,2,ordered + DRAM replicated,6.71544
+mem,scalog,fig1_scalog_o1_mem_n2,1,1,2,2,native cut + DRAM replicated,7.385
+mem,scalog,fig1_scalog_o1_mem_n2,2,1,2,2,native cut + DRAM replicated,7.20997
+mem,scalog,fig1_scalog_o1_mem_n2,3,1,2,2,native cut + DRAM replicated,7.18841
+mem,corfu,fig1_corfu_o2_mem_n2,1,2,2,2,token ordered + DRAM replicated,1.24816
+mem,corfu,fig1_corfu_o2_mem_n2,2,2,2,2,token ordered + DRAM replicated,1.26442
+mem,corfu,fig1_corfu_o2_mem_n2,3,2,2,2,token ordered + DRAM replicated,1.25872
+rf0,embar,e2_embar5_rf0_ack1_n2,1,5,0,1,"ordered, replication off",11.244
+rf0,embar,e2_embar5_rf0_ack1_n2,2,5,0,1,"ordered, replication off",11.001
+rf0,embar,e2_embar5_rf0_ack1_n2,3,5,0,1,"ordered, replication off",11.13
+rf0,scalog,e2_scalog_rf0_n2,1,1,0,1,"native cut, replication off",9.493
+rf0,scalog,e2_scalog_rf0_n2,2,1,0,1,"native cut, replication off",9.748
+rf0,scalog,e2_scalog_rf0_n2,3,1,0,1,"native cut, replication off",10.152
+rf0,corfu,e2_corfu_rf0_n2,1,2,0,1,"token ordered, replication off",1.413
+rf0,corfu,e2_corfu_rf0_n2,2,2,0,1,"token ordered, replication off",1.367
+rf0,corfu,e2_corfu_rf0_n2,3,2,0,1,"token ordered, replication off",1.393
+rf0,embar_o0,e2_embar0_rf0_ack1_n2,1,0,0,1,unordered ingestion ceiling,11.079
+rf0,embar_o0,e2_embar0_rf0_ack1_n2,2,0,0,1,unordered ingestion ceiling,11.188
+rf0,embar_o0,e2_embar0_rf0_ack1_n2,3,0,0,1,unordered ingestion ceiling,10.882

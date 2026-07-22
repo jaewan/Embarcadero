@@ -1,22 +1,22 @@
-# Fig 1 — Append throughput scaling (RF2 / ACK2)
+# Fig. 1 — Throughput regimes at fixed N=2
 
 ## Claim
 
-Under matched RF2+ACK2 durability, Embarcadero ORDER=5 scales with remote
-publishers until the broker NIC / CXL-replica path saturates; a 4th **local**
-publisher can lift throughput past the remote NIC knee (CXL headroom). Fair
-baselines require the **same replica sink wiring** (real dual-NVMe disk vs
-true memory-copy).
+At a fixed two-remote-publisher operating point, identify which resource binds
+throughput as the completion contract moves from dual-NVMe RF2, to DRAM-copy
+RF2, to replication-off ACK1. Fair baselines use the same replica sink and
+ACK-drain metric. LazyLog appears only as a faithful pre-binding durable-ACK
+reference; Embarcadero O0 appears only as an unordered ceiling reference.
 
 ## Fixed knobs (do not change between trials)
 
 | Knob | Value | Why |
 |------|-------|-----|
 | Brokers | 4 | Paper topology |
-| RF / ACK | 2 / 2 | Media-durable contract (`ack_rf_policy`) |
-| Embar order | 5 only | Fig1 is the strong-order curve (O0/O5 → Table 1) |
+| RF / ACK | 2/2 or 0/1 | Regime-defining completion contract |
+| Embar order | 5; O0 reference | O0 is an unordered ablation only |
 | Message size | 4096 B | Paper Fig1 draft |
-| Bytes / client | 10 GiB | Steady window; not microbench |
+| Bytes / publisher | 10 GiB | 20 GiB aggregate for every N=2 bar |
 | Publish batch | 2048 KB | `client.yaml` design point |
 | Threads/broker | 6 | Matched across Embar + baselines |
 | Epoch µs | 500 | ORDER=5 remote design point |
@@ -24,28 +24,17 @@ true memory-copy).
 | Runtime | `throughput` | Not latency/linger |
 | CXL size | 256 GiB | 64 GiB default fails 4-broker segment preflight |
 
-## Client roster (independent variable = N)
+## Client roster
 
-| N | Hosts | Role |
-|---|-------|------|
-| 1 | `c4` | Primary remote (NUMA 1, 100G) |
-| 2 | `c4,c3` | Two full-PCIe remotes |
-| 3 | `c4,c3,c1` | NIC saturation / plateau |
-| 4 | `c4,c3,c1,local` | 3 remote + 1 local (CXL headroom) |
-
-NUMA pins: c4→1, c3→1, c1→0, local→0 (broker node).
+N=2: `c4,c3`, both remote 100 GbE publishers pinned to NUMA node 1.
 
 ## Figure layout
 
-Panels (a--b) plot Embar O5 and Scalog O1 across {disk, mem} with **matched
-data sinks**. Lines show medians over every accepted trial; no
-performance-based outlier filtering is allowed. The V0--V4 path campaign is
-kept as a reproducible ablation artifact, while the paper reports only the
-contrasts needed to identify ordering, ACK2-accounting, and payload-copy cost.
-
-The N=4 point changes both the client roster and the reported metric. It is
-therefore drawn as an open `4*` ceiling marker connected by a dashed segment,
-not as a continuation of the N=1--3 remote overlap-throughput curve.
+One grouped chart uses a common linear axis and three regimes: NVMe RF2/ACK2,
+DRAM-copy RF2/ACK2, and replication-off ACK1. Bars are medians and whiskers are
+min--max over all three accepted trials; no performance filtering is allowed.
+LazyLog is hatched to denote its weaker pre-binding ACK. Embarcadero O0 is
+hatched separately and must not be described as Scalog-equivalent.
 
 LazyLog is **excluded from the sink panel by default** (`SKIP_LAZYLOG=1`): faithful
 ACK BW is metadata-bound (`AppendToAll` + sidecar fdatasync), so disk↔mem is not
@@ -61,9 +50,9 @@ a fair data-sink A/B.
 
 ## Metric
 
-- **Overlap GB/s** = Σ(Δ`Cum_Ack_Bytes` / shared window) — ACK-paced (ACK2 here).
-- Also record Bandwidth (e2e incl. `ack_wait`) and Send-done (excludes Poll).
-- Prefer Bandwidth when overlap window ≪ 10 s (`MIN_OVERLAP_MS` warnings).
+- **ACK-drain GB/s** = aggregate acknowledged bytes / full completion interval.
+- Also record overlap and send-done as diagnostics, but do not mix them into the
+  bar chart.
 - Send-done scaling ≠ ACK scaling (publishers pipeline ahead of ACKs).
 
 ## Appendable results

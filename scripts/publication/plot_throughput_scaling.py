@@ -9,12 +9,12 @@ ROOT = Path(__file__).resolve().parents[2]
 if len(sys.argv) == 1:
     sys.argv.extend(
         [
-            "--embar-csv",
-            str(ROOT / "data/paper_eval/fig1/fig1_embar_official_3eaadffb/results.csv"),
-            "--scalog-csv",
-            str(ROOT / "data/paper_eval/fig1/fig1_scalog_official_3eaadffb/results.csv"),
+            "--rf2-csv",
+            str(ROOT / "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/results.csv"),
+            "--rf0-root",
+            str(ROOT / "data/paper_eval/fig1/fig1_regime_bars_c1bca74b/rf0/multiclient/logs/fig1_regime_rf0_c1bca74b"),
             "--commit",
-            "3eaadffb61eb3c4698aeb16a1cc845ed456ea035",
+            "c1bca74bdcc4aa4eea7ba52b1ae3b76292c82231",
             "--pdf",
             str(ROOT / "data/paper_eval/fig1/throughput_scaling.pdf"),
             "--paper-pdf",
@@ -22,9 +22,9 @@ if len(sys.argv) == 1:
             "--png",
             str(ROOT / "data/paper_eval/fig1/throughput_scaling.png"),
             "--manifest",
-            str(ROOT / "data/paper_eval/fig1/fig1_fixed_commit_3eaadffb_manifest.json"),
+            str(ROOT / "data/paper_eval/fig1/fig1_regime_bars_c1bca74b_manifest.json"),
             "--selected-csv",
-            str(ROOT / "data/paper_eval/fig1/fig1_fixed_commit_3eaadffb_selected.csv"),
+            str(ROOT / "data/paper_eval/fig1/fig1_regime_bars_c1bca74b_selected.csv"),
         ]
     )
 runpy.run_path(

@@ -5,18 +5,17 @@ the data directory with results, and the plot script.
 
 ## Figures
 
-### Fig 1 — ACK-paced throughput scaling (RF=2/ACK2)
-- **Script:** `PaperScripts/run_fig1_throughput_scaling.sh`
-- **Data:** fixed-commit campaigns
-  `data/paper_eval/fig1/fig1_{embar,scalog}_official_3eaadffb/results.csv`
-- **Plot:** `PaperScripts/plot_fig1_throughput_scaling.py` (matched NVMe and
-  DRAM scaling panels; median lines over all accepted trials)
-- **Manifest:** `data/paper_eval/fig1/fig1_fixed_commit_3eaadffb_manifest.json`
-- **Selected rows:** `data/paper_eval/fig1/fig1_fixed_commit_3eaadffb_selected.csv`
+### Fig. 1 — Throughput regimes at fixed N=2
+- **Scripts:** `PaperScripts/run_fig1_throughput_scaling.sh` for RF2 and
+  `PaperScripts/run_overnight_eval.sh` for the filtered RF0 cells.
+- **Data:** `data/paper_eval/fig1/fig1_regime_bars_c1bca74b/`
+- **Plot:** `PaperScripts/plot_fig1_throughput_scaling.py`
+- **Manifest:** `data/paper_eval/fig1/fig1_regime_bars_c1bca74b_manifest.json`
+- **Selected rows:** `data/paper_eval/fig1/fig1_regime_bars_c1bca74b_selected.csv`
 - **Generated figure:** `data/paper_eval/fig1/throughput_scaling.{pdf,png}`
-- **Notes:** The plot accepts every successful row at commit `3eaadffb`; no
-  performance-based outlier filtering. N<=3 uses overlap throughput and N=4
-  uses ACK-drain aggregate bandwidth.
+- **Notes:** Every bar uses ACK-drain throughput from exactly three successful
+  rows at commit `c1bca74b`; no performance filtering. LazyLog is a faithful
+  pre-binding durable-ACK reference, and O0 is an unordered reference.
 
 ### Fig 2 — Append latency vs offered load (mechanism proof)
 - **Script:** `PaperScripts/run_fig2_latency_vs_load.sh`
