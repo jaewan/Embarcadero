@@ -516,6 +516,14 @@ class Subscriber {
 		size_t next_expected_order_ ABSL_GUARDED_BY(consume_mutex_){0};
 		std::deque<OwnedMessagePtr> pending_messages_ ABSL_GUARDED_BY(consume_mutex_);
 		size_t pending_messages_base_order_ ABSL_GUARDED_BY(consume_mutex_){0};
+		// [[ORDER_GAP_DIAG]] Tracks how long next_expected_order_ has been stuck so a
+		// permanent head-of-line block (one missing total_order wedging every later
+		// position) self-reports instead of only surfacing as an opaque caller-side
+		// timeout. See LogOrderGapIfStalled().
+		std::chrono::steady_clock::time_point last_progress_time_
+			ABSL_GUARDED_BY(consume_mutex_){std::chrono::steady_clock::now()};
+		std::chrono::steady_clock::time_point last_gap_log_time_
+			ABSL_GUARDED_BY(consume_mutex_){};
 		OwnedMessagePtr last_returned_;
 		std::vector<OwnedMessagePtr> last_returned_batch_;
 		uint16_t last_consumed_wire_version_{Embarcadero::wire::HEADER_VERSION_V1};
@@ -547,6 +555,11 @@ class Subscriber {
 		size_t TryPopOrderedMessagesLocked(size_t max_messages,
 		                                   std::vector<OwnedMessagePtr>* out)
 			ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
+		// [[ORDER_GAP_DIAG]] Emits a rate-limited diagnostic when next_expected_order_
+		// has not advanced for several seconds while pending_messages_ holds buffered,
+		// out-of-order data behind the gap. Cheap: only does real work once a stall is
+		// already suspected (last_progress_time_ old), never on the hot path.
+		void LogOrderGapIfStalled() ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
 		void* ConsumeOrdered(int timeout_ms);
 
 		// Helper to remove connection resources

@@ -687,6 +687,91 @@ raw log content rather than trusted from a driver's own summary output alone.
 
 Nothing outstanding blocks Task 7.
 
+## 6e. EMBARCADERO ORDER=5 intermittent stall — characterized, not yet fully
+     root-caused (2026-07-23)
+
+While calibrating for the real ≥1M-record matrix (gate step 5), EMBARCADERO
+(ORDER=5) runs intermittently (~2 hits in ~40 attempts across load-phase and
+mixed-workload phases, at scales from 500K to 1M records) hang permanently in
+`DistributedKVStore::waitForSyncWithLog()`: `applied_local_ops_` freezes at a
+fixed value while `target` (`Publisher::GetNextPublishOrder()`) keeps
+climbing as new writes keep succeeding. Not reproducible at will; not tied to
+a specific record count. CORFU and SCALOG show no analogous stall.
+
+**Ruled out** (each via direct evidence, not assumption):
+- CXL non-coherent-memory flush/fence gaps — this hardware's CXL is coherent
+  (explicit user correction); the code correctly gates flush calls off via
+  `CXL::ExplicitFlushRequired()`.
+- Session fencing / reconnect races (`IsOrder5SessionMode()` epoch-change
+  path, `MakeClientBrokerStreamKey` epoch keying) — zero fence/reconnect log
+  lines in any captured run, healthy or stalled.
+- The previously-fixed backward-resync-onto-invalidated-slot scanner bug
+  (`order5-ack-stall-preexisting` session memory, 2026-07-06) — its fix
+  (`kBatchHeaderFlagRetired`, forward-only bounded resync) is already present
+  and correct in `topic.cc` (~L329-348, ~L7690-7841); this is a different,
+  still-open issue.
+- `/dev/shm` exhaustion from repeated repro attempts (two incidents this
+  session, see below) — the stall's arithmetic is too clean to be a resource
+  artifact.
+
+**Localized (high confidence, from two independent live captures with
+`EMBARCADERO_ORDER5_PHASE_DIAG=1`)**: the bug is in the **client's**
+multi-broker total-order reconstruction, not broker-side sequencing.
+- In both captures, summing all 4 brokers' `ordered` counters exactly equals
+  the client's stuck `target` (e.g. 286296+286264+286533+286215 =
+  1,145,308 = target exactly) — every message was fully sequenced and
+  exported by its owning broker.
+- Live gdb at the moment of stall: brokers 1-3's `SubscribeNetworkThread` are
+  idle in `sched_yield()` (nothing new to export); broker 0 (head) was mid-
+  call in `GetBatchToExportWithMetadata`. Consistent with all brokers having
+  already sent everything they have.
+- `applied_local_ops_` sits at exactly `target − N` (N=64 during the load
+  phase's sync-every-64 checkpoint, N=14 during the mixed-workload phase),
+  and N only grows as new writes succeed — the signature of a permanent
+  head-of-line block: `Subscriber::TryPopOrderedMessageLocked` refuses to
+  advance once one specific `total_order` position is never filled in
+  `pending_messages_`, wedging every later position behind it forever.
+
+**Most likely mechanism (not yet confirmed with a client-side backtrace —
+the client process had already exited by the time gdb could attach in both
+captures)**: ORDER=5 deliberately does not stamp `total_order` into
+individual message headers on the wire (disabled at `topic.cc:8532-8538`,
+"was causing performance regression"); the client instead derives each
+message's position purely by counting within a batch, seeded from
+`BatchMetadata.batch_total_order` (`subscriber.cc` `StageOrderedMessages` /
+`ParseAndStageOrderedBytes`). A single off-by-one in that bookkeeping under
+rare timing (e.g. a batch boundary straddling two `recv()` calls) would
+silently misplace or drop one message's contribution, matching everything
+observed.
+
+**Diagnostic added (this session, not yet exercised against a live
+recurrence)**: `Subscriber::LogOrderGapIfStalled()` (`subscriber.cc`/`.h`,
+called from `TryPopOrderedMessageLocked`) logs, once `next_expected_order_`
+has been stuck for >5s and there is buffered data behind the gap:
+`[ORDER_GAP_DIAG] next_expected_order=... stuck_ms=... buffered_slots=...
+present=... missing=... first_present_order=... highest_buffered_order=...`.
+This should pinpoint the exact stuck position (and confirm data exists
+beyond it) the next time this fires naturally, without requiring another
+manual gdb chase.
+
+**Operational hazard found and worth flagging for any future automated
+repro loop**: `scripts/lib/broker_lifecycle.sh`'s `broker_local_cleanup`
+deliberately does not wait for a killed broker's ~128GB tmpfs-backed CXL
+mapping to finish unmapping (documented tradeoff at L767-770: "making the
+next experiment wait on it defeats bounded cleanup"). Firing many attempts
+back-to-back with only ~0.1-0.2s gaps outruns the kernel's reclaim and
+exhausts `/dev/shm`, killing the host session — happened twice this session
+before a throttled retry loop (explicit `/dev/shm` drain-wait between
+attempts, bounded ~90s with a warning) was introduced. Also: force-killing
+`run_ycsb_distributed.sh` itself via `kill -9` (rather than SIGTERM) skips
+its `trap cleanup EXIT`, leaking its `CXL_KVBASE_*` shm segment — must be
+unlinked manually (scoped to `/CXL_KVBASE_${UID}_*`) after any such kill.
+
+Gate step 5 (full matrix) remains blocked on this until either the gap
+diagnostic captures a natural recurrence with the exact stuck position, or
+the team decides the failure rate (~5%, intermittent, EMBARCADERO/ORDER=5
+only) is acceptable to document as a known limitation and proceed.
+
 ## 7. `benchmarks/README.md` correction (deferred until Section 6 tests land)
 
 Once the Section 3/Section 6 semantic tests validate A/F/Zipf/RMW behavior

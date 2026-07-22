@@ -3028,6 +3028,13 @@ void* Subscriber::TryPopOrderedMessageLocked() {
 	}
 	if (pending_messages_base_order_ != next_expected_order_ ||
 	    !pending_messages_.front()) {
+		// [[ORDER_GAP_DIAG]] Aligned but the very next slot is unfilled: only worth
+		// reporting if there is data buffered behind the gap (proves this is a real
+		// hole, not just "nothing new has arrived yet").
+		if (pending_messages_base_order_ == next_expected_order_ &&
+		    pending_messages_.size() > 1) {
+			LogOrderGapIfStalled();
+		}
 		return nullptr;
 	}
 	last_returned_ = std::move(pending_messages_.front());
@@ -3037,9 +3044,49 @@ void* Subscriber::TryPopOrderedMessageLocked() {
 	if (ret) {
 		last_consumed_wire_version_ = last_returned_->header_version;
 		next_expected_order_++;
+		last_progress_time_ = std::chrono::steady_clock::now();
 		return ret;
 	}
 	return nullptr;
+}
+
+void Subscriber::LogOrderGapIfStalled() {
+	constexpr auto kStallThreshold = std::chrono::seconds(5);
+	constexpr auto kLogInterval = std::chrono::seconds(5);
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last_progress_time_ < kStallThreshold) return;
+	if (now - last_gap_log_time_ < kLogInterval) return;
+	last_gap_log_time_ = now;
+
+	size_t missing_count = 0;
+	size_t present_count = 0;
+	size_t first_present_index = pending_messages_.size();
+	for (size_t i = 0; i < pending_messages_.size(); ++i) {
+		if (pending_messages_[i]) {
+			++present_count;
+			if (first_present_index == pending_messages_.size()) {
+				first_present_index = i;
+			}
+		} else {
+			++missing_count;
+		}
+	}
+	const auto stalled_for_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		now - last_progress_time_).count();
+	LOG(WARNING) << "[ORDER_GAP_DIAG] next_expected_order=" << next_expected_order_
+	             << " stuck_ms=" << stalled_for_ms
+	             << " pending_base_order=" << pending_messages_base_order_
+	             << " buffered_slots=" << pending_messages_.size()
+	             << " present=" << present_count
+	             << " missing=" << missing_count
+	             << " first_present_order="
+	             << (first_present_index < pending_messages_.size()
+	                     ? (pending_messages_base_order_ + first_present_index)
+	                     : 0)
+	             << " highest_buffered_order="
+	             << (pending_messages_.empty()
+	                     ? 0
+	                     : (pending_messages_base_order_ + pending_messages_.size() - 1));
 }
 
 size_t Subscriber::TryPopOrderedMessagesLocked(
@@ -3076,6 +3123,9 @@ size_t Subscriber::TryPopOrderedMessagesLocked(
 		pending_messages_base_order_++;
 		next_expected_order_++;
 		popped++;
+	}
+	if (popped > 0) {
+		last_progress_time_ = std::chrono::steady_clock::now();
 	}
 	if (pending_messages_.empty()) {
 		pending_messages_base_order_ = next_expected_order_;
