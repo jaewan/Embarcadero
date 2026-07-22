@@ -29,6 +29,8 @@ the data directory with results, and the plot script.
 - **Full diagnostic plot:** `PaperScripts/plot_fig2_latency_vs_load.py`
 - **Notes:** Also produces Tab. epoch-sweep and the mechanism ablation.
   Corfu/Scalog comparison: `data/paper_eval/fig2/fig2_corfu_official_3eaadffb/` and `fig2_scalog_official_3eaadffb/`.
+  Validate each clean baseline campaign with
+  `PaperScripts/summarize_fig2_baseline.py`.
   Each new pass stores the commit, complete working-tree patch, binary/config
   hashes, remote-client binary hash, and parameters under
   `<campaign>/provenance/<pass-id>/`.
