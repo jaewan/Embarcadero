@@ -7,7 +7,8 @@
   "git_dirty": false,
   "inputs_sha256": {
     "results.csv": "198bf771a4bc2935ae7e167eac1bb8604d7b30254a7f0ee1fef43666e687dcb2",
-    "campaign_contract.md": "6df23e5a74f2e986ec1ee1bdf4d7e95d018ebc1bbabd61651e721789b7e00877"
+    "campaign_contract.md": "13176493aadc9a058c7799a5518252567db19d4387640e2b1803e78031244fe5",
+    "corfu_invariant_summary.csv": "7bf788cc0c1688939335886a2ac3695fc840f2bf2749cd2692378e7152e34440"
   },
   "summary": [
     {

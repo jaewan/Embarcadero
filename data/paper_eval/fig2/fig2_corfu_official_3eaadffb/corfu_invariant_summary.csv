@@ -1,0 +1,16 @@
+run_id,target_mbps,control_transport,token_gate_policy,token_delay_us,replication_factor,ack_level,requests,grants,failures,gate_aborts,gate_denied,payload_sends,payload_before_grant,payload_admission_denied,aborted,mean_token_latency_us,ticket_wait_ms_sum
+run_l100,100,grpc,cv_fail_closed_v1,0,2,2,73105,73105,0,0,0,73105,0,0,0,594,130863
+run_l1000,1000,grpc,cv_fail_closed_v1,0,2,2,5504,5504,0,0,0,5504,0,0,0,683,103901
+run_l1000_070044,1000,grpc,cv_fail_closed_v1,0,2,2,5480,5480,0,0,0,5480,0,0,0,642,116078
+run_l1000_071107,1000,grpc,cv_fail_closed_v1,0,2,2,5688,5688,0,0,0,5688,0,0,0,642,109006
+run_l100_065433,100,grpc,cv_fail_closed_v1,0,2,2,71312,71312,0,0,0,71312,0,0,0,608,130911
+run_l100_070455,100,grpc,cv_fail_closed_v1,0,2,2,72765,72765,0,0,0,72765,0,0,0,595,130824
+run_l2000,2000,grpc,cv_fail_closed_v1,0,2,2,4325,4325,0,0,0,4325,0,0,0,692,103032
+run_l2000_070252,2000,grpc,cv_fail_closed_v1,0,2,2,4603,4603,0,0,0,4603,0,0,0,691,103843
+run_l2000_071311,2000,grpc,cv_fail_closed_v1,0,2,2,4360,4360,0,0,0,4360,0,0,0,705,105691
+run_l250,250,grpc,cv_fail_closed_v1,0,2,2,11761,11761,0,0,0,11761,0,0,0,532,101756
+run_l250_065640,250,grpc,cv_fail_closed_v1,0,2,2,11185,11185,0,0,0,11185,0,0,0,536,107159
+run_l250_070702,250,grpc,cv_fail_closed_v1,0,2,2,10743,10743,0,0,0,10743,0,0,0,529,105480
+run_l500,500,grpc,cv_fail_closed_v1,0,2,2,6919,6919,0,0,0,6919,0,0,0,610,99045
+run_l500_065844,500,grpc,cv_fail_closed_v1,0,2,2,7102,7102,0,0,0,7102,0,0,0,592,96765
+run_l500_070906,500,grpc,cv_fail_closed_v1,0,2,2,7240,7240,0,0,0,7240,0,0,0,593,103423

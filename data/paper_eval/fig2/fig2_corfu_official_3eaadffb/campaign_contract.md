@@ -29,6 +29,17 @@
 - Loads: `100 250 500 1000 2000` (INCLUDE_BASELINES=1)
 - `fig2_corfu_o2_ack2_rf2_mem`, `fig2_scalog_o1_ack2_rf2_mem`
 
+### Corfu invariant provenance
+- Coordinator transport: `grpc` (the campaign does not override the harness's
+  explicit `grpc` default).
+- Token gate: `cv_fail_closed_v1`; post-grant delay: 0 us; RF=2; ACK=2.
+- `corfu_invariant_summary.csv` is deterministically extracted from the 15
+  canonical raw `run.log` files by
+  `scripts/publication/extract_corfu_token_phase.sh`.
+- Across the campaign: 302,092 requests = 302,092 grants = 302,092 payload
+  sends; failures, gate aborts/denials, payload-before-grant,
+  admission-denied, and terminal abort counters are all zero.
+
 ## Knobs
 - Msg / bytes: 1024 B / 4294967296 B
 - Epoch µs: 500

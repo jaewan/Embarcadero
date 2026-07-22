@@ -55,15 +55,17 @@ machine-checked vs. argued in prose. Read that boundary before citing.
   forbids double commit (also the exactly-once guarantee across fence/re-open).
 - **Per-session prefix** — `PerSessionPrefix` (+ `LateNeverReordered` for the
   "late/duplicate rejected, never reordered" clause).
-- **ACKed iff committed** — `AckedIffCommitted`; the clause the **stale-CV** bug
-  (D2) attacks. The mechanism is faithful: the zombie `StaleCVAdvance` always may
-  write a stale-epoch signal; the broker `AckRelay` epoch check refuses it.
+- **Live-epoch durable ACK** — `AckedIffCommitted`; a durable ACK names a live
+  committed entry, and the **stale-CV** bug (D2) attacks this rule. The mechanism
+  is faithful: the zombie `StaleCVAdvance` always may write a stale-epoch signal;
+  the broker `AckRelay` epoch check refuses it.
   `stale_cv_bug_demo.cfg` (check off) is the necessity counterexample.
 - **Fencing** — `FencedSuffixNeverCommitted`.
-- **Reader agreement / sole divergence (D5 clause 3)** — `ReaderAgreement`: any
-  speculatively-read position that reaches durability agrees on identity
-  (client,cseq); the only permitted divergence is payload visibility (`lost`).
-  Speculative reads in a failover-truncated zone are epoch-scoped (re-read).
+- **Reader agreement for durable positions (D5 clause 3)** —
+  `ReaderAgreement`: any speculatively-read position that reaches durability
+  agrees on identity (client,cseq). Speculative reads in a failover-truncated
+  zone are epoch-scoped and must be re-read; module loss may mark an ACK1-only
+  payload unavailable.
 - **Spatial guard / wrap-fence** — `NoWrap`.
 
 ## The newly-found bug (D2 / W2 #5), in spec terms
@@ -72,7 +74,8 @@ After `SequencerFailover` the new epoch truncates non-durable GOI entries (they
 enter `orphaned`; PBR slots survive). `StaleCVAdvance` (zombie `S_old`) advances
 the CV for such an entry under the old epoch. Without the broker's control-block
 epoch check on `AckRelay`, the broker relays an ACK for a batch that never becomes
-visible under the current epoch — violating `AckedIffCommitted`.
+visible under the current epoch — violating the live-epoch ACK rule captured by
+`AckedIffCommitted`.
 `stale_cv_bug_demo.cfg` (fix off) produces the counterexample; `stale_cv_ack_relay.cfg`
 (fix on) shows the check restores safety. This is the D2 requirement Track 01 must
 implement on the `src/embarlet` ACK-relay path.

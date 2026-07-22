@@ -4,11 +4,16 @@
 **Scope:** CXL-Corfu baseline hardening (client token path, coordinator transport, evaluation).
 **Status legend:** `OPEN` (not yet enforced) / `ENFORCED-STATIC` (code enforces and isolated tests pass, publication-cluster validation pending) / `VALIDATED` (publication-cluster validation passed).
 
-> NOTE (2026-07-18): `throughput_test` compiles and the isolated
+> VALIDATION NOTE (2026-07-22): the isolated
 > `corfu_ordered_token_gate_test`, `corfu_sequencer_fifo_smoke`,
-> `corfu_token_proxy_smoke`, and `corfu_ordered_chain_smoke` tests pass. No
-> cluster process was started or stopped while the concurrent experiment was
-> running. Publication-cluster validation remains pending.
+> `corfu_token_proxy_smoke`, and `corfu_ordered_chain_smoke` tests pass. The
+> clean publication campaign at commit `3eaadffb` contains 15 raw invariant
+> records, summarized in
+> `data/paper_eval/fig2/fig2_corfu_official_3eaadffb/corfu_invariant_summary.csv`.
+> Across 302,092 appends, requests=grants=payload sends and every violation
+> counter is zero. This validates the clean publication path; failure-only
+> behaviors remain supported by focused injection/smoke tests rather than by
+> the no-failure latency sweep.
 
 ## Invariants
 
@@ -79,16 +84,16 @@ transport, token policy, RF, ACK contract, and batching policy were used
 
 | # | Finding | Invariant | Evidence (file:line) | Planned change | Static review | Dynamic validation |
 |---|---------|-----------|----------------------|----------------|---------------|--------------------|
-| L1 | Spin gate could hang during shutdown | C7, C6 | `corfu_ordered_token_gate.h`; gate test | Explicit CV wait with bounded shutdown observation and wake-all abort | ENFORCED-STATIC | isolated shutdown/wakeup PASS; cluster PENDING |
-| L2 | Failure advanced the old gate and admitted successors | C5, C2 | `publisher.cc` Corfu gate wrappers; gate test | Terminal abort; completion linearizes against abort; late grants are burned | ENFORCED-STATIC | isolated abort-during-holder PASS; cluster PENDING |
-| L3 | Payload-before-grant evidence was not a run-validity condition | C1 | `publisher.cc` token phase; `run_multiclient.sh` validator | Hard throw plus strict counter validation | ENFORCED-STATIC | parser sample PASS; cluster PENDING |
-| L4 | Global ticket ordering and per-broker sequence assignment lacked an explicit boundary | C2, C3 | `publisher.cc` Corfu branch | Assign per-broker sequence and issue RPC while unique global turn is held | ENFORCED-STATIC | ordered gate PASS; cluster PENDING |
+| L1 | Spin gate could hang during shutdown | C7, C6 | `corfu_ordered_token_gate.h`; gate test | Explicit CV wait with bounded shutdown observation and wake-all abort | ENFORCED-STATIC | isolated shutdown/wakeup PASS; publication clean path PASS |
+| L2 | Failure advanced the old gate and admitted successors | C5, C2 | `publisher.cc` Corfu gate wrappers; gate test | Terminal abort; completion linearizes against abort; late grants are burned | ENFORCED-STATIC | isolated abort-during-holder PASS; no-failure campaign PASS |
+| L3 | Payload-before-grant evidence was not a run-validity condition | C1 | `publisher.cc` token phase; `run_multiclient.sh` validator | Hard throw plus strict counter validation | VALIDATED | 15/15 publication runs PASS; 0 payload-before-grant |
+| L4 | Global ticket ordering and per-broker sequence assignment lacked an explicit boundary | C2, C3 | `publisher.cc` Corfu branch | Assign per-broker sequence and issue RPC while unique global turn is held | VALIDATED | ordered gate PASS; Q3 FIFO PASS; 15/15 publication runs clean |
 | L5 | Token/publish failure did not wake other publisher threads | C6, C7 | `CorfuAbortGate`; publish exit guard; destructor | Publisher-level terminal abort wakes all gate waiters | ENFORCED-STATIC | isolated abort/shutdown PASS; cluster PENDING |
-| L6 | Coordinator transport and latency sensitivity were not explicit dimensions | C9, C10 | baseline transport config; token-delay code; sensitivity script | Select `grpc|cxl_mailbox`; record and sweep post-grant token-stage delay | ENFORCED-STATIC | component smokes PASS; publication sweep PENDING |
-| L7 | Evaluation omitted token policy/counters from provenance | C10 | `run_multiclient.sh` run contract and `corfu_token_phase.csv` | Record gate policy, transport, delay, RF/ACK/batch, commit, and invariant counters | ENFORCED-STATIC | shell syntax/parser PASS; cluster PENDING |
+| L6 | Coordinator transport and latency sensitivity were not explicit dimensions | C9, C10 | baseline transport config; token-delay code; sensitivity script | Select `grpc|cxl_mailbox`; record and sweep post-grant token-stage delay | VALIDATED | component smokes PASS; gRPC publication campaign and delay sweep PASS |
+| L7 | Evaluation omitted token policy/counters from provenance | C10 | `run_multiclient.sh` run contract and `corfu_token_phase.csv` | Record gate policy, transport, delay, RF/ACK/batch, commit, and invariant counters | VALIDATED | canonical 15-run invariant summary PASS |
 | L8 | Ambiguous RPC completion could double-allocate on retry | C4, C8 | `corfu_client.h`; `corfu_token_proxy.cc` | Stable logical request identity plus proxy single-flight/cache; old requests reject after eviction | ENFORCED-STATIC | proxy smoke PASS; failure injection PENDING |
 | L9 | Grant followed by failure creates a token hole | C3, C4 | `publisher.cc` grant/completion path | Count and burn issued range; terminally abort; never reroute/reuse | ENFORCED-STATIC | isolated late-grant PASS; cluster PENDING |
-| L10 | Paper could attribute gRPC transport cost to the Corfu protocol | C9 | `Paper/Text/Sec7_Evaluation.tex` | Explicitly labels measured gap as Corfu plus gRPC and cites original RDMA cost | ENFORCED-STATIC | paper review PENDING |
+| L10 | Paper could attribute gRPC transport cost to the Corfu protocol | C9 | `Paper/Text/Sec7_Evaluation.tex` | Explicitly labels measured gap as Corfu plus gRPC and cites original RDMA cost | VALIDATED | paper and campaign contract explicitly scope transport |
 
 The client-visible publisher-to-ingress hop remains gRPC in both transport
 modes. `control_transport=cxl_mailbox` selects only the ingress-to-global-

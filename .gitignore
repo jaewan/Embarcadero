@@ -19,6 +19,19 @@ multiclient_logs/
 data/
 data_backup/
 datathroughput/
+
+# Canonical paper-facing Corfu invariant summary (derived from tracked raw
+# logs); keep this small provenance file versioned while all other data remain
+# ignored.
+!data/
+data/*
+!data/paper_eval/
+data/paper_eval/*
+!data/paper_eval/fig2/
+data/paper_eval/fig2/*
+!data/paper_eval/fig2/fig2_corfu_official_3eaadffb/
+data/paper_eval/fig2/fig2_corfu_official_3eaadffb/*
+!data/paper_eval/fig2/fig2_corfu_official_3eaadffb/corfu_invariant_summary.csv
 **/result*.csv
 **/baseline_*.csv
 **/*_latency.csv
@@ -93,3 +106,11 @@ pilot_*.sh
 
 # ── Leftover broker run artifacts in repo root ────────────────
 /order5_anomaly_counters_broker*.csv
+
+# Local TLA+ reproduction output.
+/spec/states/
+/spec/reproduced-results/
+/spec/tla2tools.jar
+
+# Accidental absolute-path artifact mirror created by legacy runners.
+/home/

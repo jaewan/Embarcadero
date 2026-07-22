@@ -26,8 +26,8 @@ mismatch between "checked" and "claimed" is the artifact's biggest integrity ris
 | `LateNeverReordered` | late/duplicate rejected, never reordered | D1 |
 | `FencedSuffixNeverCommitted` | fenced suffix never committed (session death, not gap-skip) | D1 |
 | `NoWrap` | spatial guard / wrap-fence | (kept) |
-| `AckedIffCommitted` | **ACKed iff committed** (committed + durable + live); the stale-CV target | D5, D2 |
-| `ReaderAgreement` | speculative vs durable reader: positions reaching durability never reorder/change identity; **sole divergence is payload visibility** | D5 (theorem clause 3) |
+| `AckedIffCommitted` | a **live durable ACK names a committed entry**; stale-epoch ACK relays are rejected | D5, D2 |
+| `ReaderAgreement` | positions reaching durability never reorder/change identity; an ACK1-only suffix may be truncated on failover | D5 (theorem clause 3) |
 | stale-CV **necessity** | the ACK-relay epoch check is load-bearing (`stale_cv_bug_demo` counterexample) | D2 |
 
 **NOT machine-checked — argued in prose or out of scope (do not claim as checked):**
@@ -40,12 +40,11 @@ mismatch between "checked" and "claimed" is the artifact's biggest integrity ris
   model shows the epoch check *never admits a bad ACK*; it cannot show the check
   *never wrongly blocks a legitimate re-sequenced-durable ACK* (that is a liveness
   property). The check being non-over-aggressive is argued, not checked.
-- **The speculative (ACK1) payload-loss delivery itself** — `ReaderAgreement`
-  checks that order/identity never diverge and that the divergence is confined to
-  payload visibility (`lost`). The end-to-end "a speculative reader *delivered* a
-  payload at *k* that a durable reader later sees as `ERR_DATA_LOSS` at *k*" is the
-  *documented divergence*; the model bounds the divergence to payload-only, it does
-  not model an application consuming the speculative payload.
+- **The speculative (ACK1) delivery contract** — `ReaderAgreement` constrains
+  positions that reach durability. The model permits failover to truncate an
+  ACK1-only suffix and does not model an application consuming that speculative
+  payload. ACK1 is not a failover-stable completion contract; speculative
+  readers detect the epoch change and reread.
 - **Scope bounds** — bugs that need ≥3 outstanding batches (deep multi-gap
   cascade), ≥2 failovers (a zombie surviving two epochs), or >2 brokers are out of
   the checked scope. Defensible for a model of this size; the paper says so.
@@ -91,16 +90,19 @@ state is expected, not a bug). Give parallel runs distinct `-metadir`s (TLC's
 time-stamped metadata dir otherwise collides).
 
 ```bash
-cd ~/Embarcadero-sessions/02-tla-spec
-curl -sSL -o tla2tools.jar \
+cd /path/to/Embarcadero/spec
+curl -fL -o tla2tools.jar \
   https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
 # one scenario:
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -deadlock -workers 16 \
   -metadir states/stale_cv_ack_relay \
-  -config spec/stale_cv_ack_relay.cfg spec/MCEmbarcadero.tla
-# all scenarios in parallel:
-bash spec/run_all.sh
+  -config stale_cv_ack_relay.cfg MCEmbarcadero.tla
+# all scenarios (safe defaults; tune TLC_WORKERS/TLC_HEAP if desired):
+bash run_all.sh
 ```
+
+`run_all.sh` writes fresh output to `reproduced-results/` and state to
+`states/`; it never overwrites the checked-in reference results.
 
 ## Results
 
@@ -113,7 +115,7 @@ Per-scenario TLC summaries are in `spec/results/<scenario>.txt`. Expected:
 
 - **Track 01 (core protocol):** the ACK-relay control-block **epoch check is
   load-bearing** — `stale_cv_bug_demo` shows that without it a broker relays an ACK
-  for an orphaned (failover-truncated) batch, violating "ACKed iff committed" (D2 /
+  for an orphaned (failover-truncated) batch, violating the live-epoch ACK rule (D2 /
   W2 #5). The check must guard the ACK-relay path in `src/embarlet` (see handoff).
 - Any counterexample found here is handed to Track 01, not "fixed" unilaterally
   ("TLA⁺ first, code second").
