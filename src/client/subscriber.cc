@@ -2671,6 +2671,9 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 	uint64_t latency_metadata_detected = 0;
 	uint64_t latency_parsed_messages = 0;
 	uint64_t latency_rejected_ts = 0;
+	// [[EXPORT_GAP_REANCHOR]] batch_total_order of any batch detected in this call that
+	// arrived flagged BATCH_META_FLAG_EXPORT_GAP -- see StageOrderedMessages.
+	std::vector<size_t> gap_batch_starts;
 
 	auto parse_contiguous = [&](const uint8_t* bytes, size_t size,
 	                            const std::shared_ptr<std::vector<uint8_t>>& retained_chunk,
@@ -2691,6 +2694,9 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 					state.has_pending_metadata = true;
 					state.current_batch_messages_processed = 0;
 					state.next_message_order_in_batch = meta->batch_total_order;
+					if (meta->flags & Embarcadero::wire::BATCH_META_FLAG_EXPORT_GAP) {
+						gap_batch_starts.push_back(meta->batch_total_order);
+					}
 					if (record_latency) {
 						latency_metadata_detected++;
 					}
@@ -2926,8 +2932,8 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 		}
 	}
 
-	if (!parsed_messages.empty()) {
-		StageOrderedMessages(std::move(parsed_messages));
+	if (!parsed_messages.empty() || !gap_batch_starts.empty()) {
+		StageOrderedMessages(std::move(parsed_messages), std::move(gap_batch_starts));
 	}
 	if (record_latency) {
 		{
@@ -2957,14 +2963,51 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 }
 
 void Subscriber::StageOrderedMessages(
-		std::vector<std::pair<size_t, OwnedMessagePtr>> messages) {
-	if (messages.empty()) {
+		std::vector<std::pair<size_t, OwnedMessagePtr>> messages,
+		std::vector<size_t> gap_batch_starts) {
+	if (messages.empty() && gap_batch_starts.empty()) {
 		return;
 	}
 
 	bool ready_to_consume = false;
 	{
 		absl::MutexLock lock(&consume_mutex_);
+
+		// [[EXPORT_GAP_REANCHOR]] The broker's export cursor for this connection lapped
+		// its ring and already overwrote the positions it skipped -- they will never be
+		// (re)sent. Waiting for them wedges the consumer forever even though every later
+		// position keeps arriving fine, because every other broker's sequencing stays
+		// fully caught up (docs/experiments/YCSB_DISTRIBUTED_KV_PLAN.md Sec 6e). Jump
+		// next_expected_order_ to the reported resync point instead of silently
+		// buffering now-unreachable data. Reuses the same stale-prefix-pop pattern as
+		// the per-message loop below so any data some OTHER (faster) connection already
+		// buffered at or past the new anchor is preserved, not discarded.
+		for (size_t gap_start : gap_batch_starts) {
+			if (gap_start <= next_expected_order_) {
+				continue;  // stale/duplicate report; already past this point
+			}
+			LOG(WARNING) << "Subscriber: ORDER=5 export gap re-anchoring "
+			             << "next_expected_order_ " << next_expected_order_ << " -> "
+			             << gap_start << " (" << (gap_start - next_expected_order_)
+			             << " positions permanently lost to a lagging export cursor)";
+			ordered_export_gaps_reported_.fetch_add(1, std::memory_order_relaxed);
+			next_expected_order_ = gap_start;
+			if (pending_messages_.empty()) {
+				pending_messages_base_order_ = next_expected_order_;
+			} else if (pending_messages_base_order_ < next_expected_order_) {
+				const size_t stale_count = std::min(
+					next_expected_order_ - pending_messages_base_order_,
+					pending_messages_.size());
+				for (size_t i = 0; i < stale_count; ++i) {
+					pending_messages_.pop_front();
+				}
+				pending_messages_base_order_ += stale_count;
+				if (pending_messages_.empty()) {
+					pending_messages_base_order_ = next_expected_order_;
+				}
+			}
+		}
+
 		for (auto& [total_order, msg] : messages) {
 			if (!msg || total_order < next_expected_order_) {
 				continue;

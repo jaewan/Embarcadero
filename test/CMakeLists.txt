@@ -588,6 +588,51 @@ if(PkgConfig_FOUND)
             LABELS "unit;order5;publisher;rollover;correctness"
         )
 
+        add_executable(order5_subscriber_reorder_test
+            order5_subscriber_reorder_test.cc
+            ../src/client/common.cc
+            ../src/client/buffer.cc
+            ../src/client/queue_buffer.cc
+            ../src/client/publisher.cc
+            ../src/client/subscriber.cc
+            ../src/client/result_writer.cc
+            ../src/common/configuration.cc
+            ../src/common/compat_isoc23.cpp
+        )
+        target_include_directories(order5_subscriber_reorder_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/client
+            ${CMAKE_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${GTEST_INCLUDE_DIRS}
+        )
+        target_compile_options(order5_subscriber_reorder_test PRIVATE ${GTEST_CFLAGS_OTHER})
+        target_link_libraries(order5_subscriber_reorder_test PRIVATE
+            ${GTEST_LIBRARIES}
+            ${GTEST_MAIN_LIB}
+            glog::glog
+            gflags
+            mimalloc
+            heartbeat_grpc_proto
+            session_proto
+            corfu_sequencer_grpc_proto
+            corfu_token_proxy_grpc_proto
+            corfu_replication_grpc_proto
+            scalog_replication_grpc_proto
+            grpc++_reflection
+            grpc++
+            protobuf::libprotobuf
+            ${FOLLY_LIBRARIES}
+            Threads::Threads
+            yaml-cpp
+        )
+        add_test(NAME unit_order5_subscriber_reorder COMMAND order5_subscriber_reorder_test)
+        set_tests_properties(unit_order5_subscriber_reorder PROPERTIES
+            TIMEOUT 120
+            LABELS "unit;order5;subscriber;reorder;correctness"
+        )
+
         add_executable(baseline_transport_equivalence_test
             baseline_transport_equivalence_test.cc
             ../src/cxl_manager/scalog_global_ordering_core.cc

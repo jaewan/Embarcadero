@@ -12,6 +12,7 @@
 #include <vector>
 
 class Subscriber;
+struct SubscriberTestPeer;
 
 // State for a single buffer within the dual-buffer setup
 struct BufferState {
@@ -398,6 +399,7 @@ class Subscriber {
 
 	private:
 		friend class ConnectionBuffers; // Allow access to members if needed
+			friend struct SubscriberTestPeer;
 		void StartMissingConfiguredBrokerConnections();
 
 		// --- Connection & Thread Management ---
@@ -550,7 +552,11 @@ class Subscriber {
 		                               size_t recv_chunk_bytes);
 		OwnedMessagePtr AcquireOwnedMessage();
 		void RecycleOwnedMessage(OwnedMessage* msg);
-		void StageOrderedMessages(std::vector<std::pair<size_t, OwnedMessagePtr>> messages);
+		// [[EXPORT_GAP_REANCHOR]] gap_batch_starts: batch_total_order of any batch(es) in
+		// this call that arrived flagged wire::BATCH_META_FLAG_EXPORT_GAP (a lagging
+		// export cursor's skipped-ahead resync point). Empty on the common path.
+		void StageOrderedMessages(std::vector<std::pair<size_t, OwnedMessagePtr>> messages,
+		                          std::vector<size_t> gap_batch_starts = {});
 		void* TryPopOrderedMessageLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(consume_mutex_);
 		size_t TryPopOrderedMessagesLocked(size_t max_messages,
 		                                   std::vector<OwnedMessagePtr>* out)
