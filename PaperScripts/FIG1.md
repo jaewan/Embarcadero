@@ -38,10 +38,10 @@ NUMA pins: c4→1, c3→1, c1→0, local→0 (broker node).
 ## Figure layout
 
 Panels (a--b) plot Embar O5 and Scalog O1 across {disk, mem} with **matched
-data sinks**. Panel (c) plots the validated V0--V4 Embarcadero path
-decomposition at N=2 from `fig1_path_decomp/path_ablation_summary.csv`.
-Individual accepted trials remain visible behind median lines; no
-performance-based outlier filtering is allowed.
+data sinks**. Lines show medians over every accepted trial; no
+performance-based outlier filtering is allowed. The V0--V4 path campaign is
+kept as a reproducible ablation artifact, while the paper reports only the
+contrasts needed to identify ordering, ACK2-accounting, and payload-copy cost.
 
 The N=4 point changes both the client roster and the reported metric. It is
 therefore drawn as an open `4*` ceiling marker connected by a dashed segment,

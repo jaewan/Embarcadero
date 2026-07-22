@@ -5,8 +5,7 @@ The script deliberately consumes raw campaign CSVs instead of embedding paper
 numbers.  It accepts every successful row at the requested commit; no
 performance-based outlier filtering is performed.  N<=3 uses overlap
 throughput and N=4 uses ACK-drain aggregate bandwidth, matching the paper.
-The third panel consumes the validated path-ablation summary.  It also writes
-the exact selected rows and input hashes beside the figure.
+It also writes the exact selected rows and input hashes beside the figure.
 """
 
 from __future__ import annotations
@@ -80,27 +79,10 @@ def load(path: Path, commit: str, expected_system: str) -> list[dict[str, str]]:
     return selected
 
 
-def load_ablation(path: Path) -> list[dict[str, str]]:
-    wanted = ["V0", "V1", "V2", "V3", "V4"]
-    rows: dict[str, dict[str, str]] = {}
-    with path.open(newline="") as handle:
-        for row in csv.DictReader(handle):
-            if row.get("variant") in wanted:
-                rows[row["variant"]] = row
-    missing = [variant for variant in wanted if variant not in rows]
-    if missing:
-        raise SystemExit(f"path-ablation summary is missing variants: {missing}")
-    for variant in wanted:
-        if int(rows[variant]["trials"]) < 3:
-            raise SystemExit(f"{variant} has fewer than three path-ablation trials")
-    return [rows[variant] for variant in wanted]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--embar-csv", type=Path, required=True)
     parser.add_argument("--scalog-csv", type=Path, required=True)
-    parser.add_argument("--path-summary", type=Path, required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--pdf", type=Path, required=True)
     parser.add_argument("--paper-pdf", type=Path)
@@ -113,7 +95,6 @@ def main() -> None:
         load(args.embar_csv, args.commit, "embar")
         + load(args.scalog_csv, args.commit, "scalog")
     )
-    ablation = load_ablation(args.path_summary)
     grouped: dict[tuple[str, str, int], list[float]] = defaultdict(list)
     for row in rows:
         grouped[(row["system"], row["sink"], int(row["n_clients"]))].append(
@@ -142,26 +123,14 @@ def main() -> None:
             "pdf.fonttype": 42,
         }
     )
-    fig, axes = plt.subplots(1, 3, figsize=(7.15, 2.35))
-    for ax, (sink, title) in zip(axes[:2], SINKS):
+    fig, axes = plt.subplots(1, 2, figsize=(6.6, 1.85))
+    legend_handles = []
+    for ax, (sink, title) in zip(axes, SINKS):
         for system, (label, color, marker) in SYSTEMS.items():
             x = [1, 2, 3, 4]
             vals = [grouped[(system, sink, n)] for n in x]
             medians = [statistics.median(v) for v in vals]
-            # Show every accepted trial. This exposes run-to-run variability
-            # without centering a standard deviation on a median.
-            for n, trials in zip(x, vals):
-                if len(trials) == 1:
-                    offsets = [0.0]
-                else:
-                    offsets = [(-0.055 + 0.11 * i / (len(trials) - 1))
-                               for i in range(len(trials))]
-                ax.scatter(
-                    [n + offset for offset in offsets], trials,
-                    color=color, marker=marker, s=10, alpha=0.28,
-                    linewidths=0, zorder=2,
-                )
-            ax.plot(
+            line, = ax.plot(
                 x[:3], medians[:3],
                 label=label,
                 color=color,
@@ -170,6 +139,8 @@ def main() -> None:
                 markersize=4.5,
                 zorder=3,
             )
+            if ax is axes[0]:
+                legend_handles.append(line)
             # N=4 changes both the client roster and reported metric. Do not
             # draw it as a continuation of the remote overlap-throughput line.
             ax.plot(
@@ -191,25 +162,16 @@ def main() -> None:
     axes[0].set_ylabel("Throughput (GB/s)")
     axes[0].set_ylim(0, 1.55)
     axes[1].set_ylim(0, 9.2)
-    axes[0].legend(loc="best", frameon=True)
-
-    ax = axes[2]
-    variants = [row["variant"] for row in ablation]
-    values = [float(row["median_gbps"]) for row in ablation]
-    colors = ["#969696", "#2166ac", "#74add1", "#4393c3", "#2166ac"]
-    bars = ax.bar(variants, values, color=colors, width=0.68)
-    for bar, value in zip(bars, values):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2, value + 0.22,
-            f"{value:.2f}", ha="center", va="bottom", fontsize=6.2,
-        )
-    ax.set_title("(c) Path decomposition ($N=2$)")
-    ax.set_xlabel("Variant")
-    ax.set_ylim(0, 11.2)
-    ax.grid(True, axis="y", alpha=0.25, linestyle=":")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    fig.tight_layout()
+    fig.legend(
+        handles=legend_handles,
+        labels=[handle.get_label() for handle in legend_handles],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.04),
+        ncol=2,
+        frameon=True,
+        handlelength=1.8,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.90), w_pad=2.0)
 
     args.pdf.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(
@@ -256,7 +218,6 @@ def main() -> None:
         "inputs": {
             portable_path(args.embar_csv): sha256(args.embar_csv),
             portable_path(args.scalog_csv): sha256(args.scalog_csv),
-            portable_path(args.path_summary): sha256(args.path_summary),
         },
         "generator": {
             "path": portable_path(Path(__file__)),
