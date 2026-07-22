@@ -49,7 +49,12 @@ fi
 
 # Binaries to sync to all client nodes
 LOCAL_BIN="$PROJECT_ROOT/build/bin"
-REQUIRED_BINS=(embarlet throughput_test corfu_global_sequencer)
+REQUIRED_BINS=(embarlet throughput_test corfu_global_sequencer kv_ycsb_bench)
+
+# Of the above, these are the ones actually launched *on* client nodes (as
+# opposed to embarlet/corfu_global_sequencer, which run on the broker host)
+# and therefore need a native client rebuild + ABI verification below.
+CLIENT_LAUNCH_BINS=(throughput_test kv_ycsb_bench)
 
 # Client binaries are built natively.  Do not normally inject broker-host
 # libraries here: c4's older glibc/libstdc++ cannot load the broker's glog or
@@ -71,7 +76,7 @@ for bin in "${REQUIRED_BINS[@]}"; do
     path="$LOCAL_BIN/$bin"
     if [[ ! -x "$path" ]]; then
         die "Missing binary: $path — build first:
-  cmake --build build -j --target embarlet throughput_test corfu_global_sequencer kv_ycsb_bench"
+  cmake --build build -j --target ${REQUIRED_BINS[*]}"
     fi
     age=$(( $(date +%s) - $(stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null) ))
     info "  $bin  age=${age}s  size=$(du -sh "$path" | cut -f1)"
@@ -85,7 +90,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Sync source + native-rebuild client binaries
 # ---------------------------------------------------------------------------
-info "=== 2. Syncing source and rebuilding throughput_test on client nodes ==="
+info "=== 2. Syncing source and rebuilding ${CLIENT_LAUNCH_BINS[*]} on client nodes ==="
 # Clients need a native build (broker AVX-512 binaries can SIGILL on older CPUs).
 # Sync a clean git-archive of HEAD (plus overnight script overlays) so uncommitted
 # WIP on the broker (e.g. LazyLog metadata) cannot break remote client builds.
@@ -127,7 +132,7 @@ for host in "${CLIENT_NODES[@]}"; do
             rsync -az --checksum "$LOCAL_LIB/" "$host:$REMOTE_ROOT/lib/"
         fi
 
-        info "  $host: native rebuild of throughput_test..."
+        info "  $host: native rebuild of ${CLIENT_LAUNCH_BINS[*]}..."
         if ! ssh -o BatchMode=yes "$host" "bash -s" <<REMOTE_BUILD
 set -euo pipefail
 cd "$REMOTE_ROOT"
@@ -135,43 +140,70 @@ mkdir -p build
 # A client may have been configured against a different distro glog (or with
 # a local static-link override).  rsync preserves source mtimes, so merely
 # rebuilding can incorrectly retain objects compiled against that ABI.  Drop
-# the cache and clean this target before each native client rebuild.
+# the cache and reconfigure once before each native client rebuild.
 rm -f build/CMakeCache.txt
-# Rebuild only this executable's objects.  A global clean target also destroys
+# Rebuild only these executables' objects.  A global clean target also destroys
 # the cached gRPC dependency graph and turns a client refresh into a long
 # cluster outage.  Remove target state before CMake regenerates its rules.
-rm -rf build/src/CMakeFiles/throughput_test.dir
-rm -f build/bin/throughput_test
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS= >/tmp/embar_client_cmake.log 2>&1
-cmake --build build -j"\$(nproc)" --target throughput_test
+rm -rf build/src/CMakeFiles/throughput_test.dir build/benchmarks/kv_store/CMakeFiles/kv_ycsb_bench.dir
+rm -f build/bin/throughput_test build/bin/kv_ycsb_bench
+# Some clients carry only a too-old system glog/yaml-cpp (e.g. a system glog
+# 0.4.0 lacking the VLOG3 symbols this codebase links against) alongside a
+# vendored compatible copy under third_party/.  A plain find_package() after
+# the cache wipe above resolves to the system package and breaks the link.
+# Prefer the vendored copy when present; this is a no-op on hosts whose
+# system/local packages already match (some clients already carry glog 0.6.0
+# natively and have no third_party/ directory at all).
+CMAKE_PREFIX_HINTS=""
+for vendored in third_party/glog-0.6 third_party/yaml-cpp-0.8; do
+    if [ -d "\$vendored" ]; then
+        CMAKE_PREFIX_HINTS="\${CMAKE_PREFIX_HINTS:+\$CMAKE_PREFIX_HINTS;}\$PWD/\$vendored"
+    fi
+done
+# Some clients run a CMake new enough to reject grpc's vendored c-ares
+# (its bundled CMakeLists.txt declares cmake_minimum_required below 3.5,
+# which recent CMake refuses outright: "Compatibility with CMake < 3.5 has
+# been removed"). This policy floor only affects that dependency's own
+# minimum-version check, not this project's build behavior.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS= \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    \${CMAKE_PREFIX_HINTS:+-DCMAKE_PREFIX_PATH="\$CMAKE_PREFIX_HINTS"} >/tmp/embar_client_cmake.log 2>&1
+cmake --build build -j"\$(nproc)" --target throughput_test kv_ycsb_bench
 test -x build/bin/throughput_test
+test -x build/bin/kv_ycsb_bench
 REMOTE_BUILD
         then
-            warn "  $host: native rebuild failed — falling back to broker binary sync"
-            rsync -az --checksum \
-                "$LOCAL_BIN/throughput_test" \
-                "$host:$REMOTE_ROOT/build/bin/"
+            warn "  $host: native rebuild failed for one or more targets — falling back to broker binary sync per missing target"
+            for bin in "${CLIENT_LAUNCH_BINS[@]}"; do
+                if ! ssh -o BatchMode=yes "$host" "test -x $REMOTE_ROOT/build/bin/$bin"; then
+                    warn "  $host: $bin missing natively — syncing broker binary"
+                    rsync -az --checksum "$LOCAL_BIN/$bin" "$host:$REMOTE_ROOT/build/bin/"
+                fi
+            done
         else
             info "  $host: native rebuild OK"
         fi
     fi
 
-    # Verify the native binary with its host ABI. ldd alone is insufficient;
-    # this bad-option invocation proves loader + C++ runtime compatibility.
+    # Verify each client-launched binary with its host ABI. ldd alone is
+    # insufficient; this bad-option invocation proves loader + C++ runtime
+    # compatibility.
     verify_client_binary_runs() {
         ssh -o BatchMode=yes "$1" \
             "cd $REMOTE_ROOT/build/bin && env -u LD_LIBRARY_PATH \
-             ./throughput_test --cluster_setup_verify_bad_option 2>&1 | head -3" 2>/dev/null \
+             ./$2 --cluster_setup_verify_bad_option 2>&1 | head -3" 2>/dev/null \
             | grep -q "no_such_option\|does not exist"
     }
-    if ! ssh -o BatchMode=yes "$host" "test -x $REMOTE_ROOT/build/bin/throughput_test"; then
-        die "$host: throughput_test missing after sync"
-    fi
-    if verify_client_binary_runs "$host"; then
-        info "  $host: throughput_test OK (executed under harness env)"
-    else
-        die "$host: native throughput_test cannot run — fix its host toolchain/runtime before launching"
-    fi
+    for bin in "${CLIENT_LAUNCH_BINS[@]}"; do
+        if ! ssh -o BatchMode=yes "$host" "test -x $REMOTE_ROOT/build/bin/$bin"; then
+            die "$host: $bin missing after sync"
+        fi
+        if verify_client_binary_runs "$host" "$bin"; then
+            info "  $host: $bin OK (executed under harness env)"
+        else
+            die "$host: native $bin cannot run — fix its host toolchain/runtime before launching"
+        fi
+    done
 done
 info "Source sync + client rebuild complete"
 rm -rf "$CLEAN_SYNC_ROOT"

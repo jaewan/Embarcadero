@@ -411,10 +411,18 @@ bool runBenchmark(BenchConfig& cfg) {
 		}
 	}
 	if (cfg.key_offset > 0 && !cfg.fifo_valid) {
-		// scan()/sampleKey wrap keys modulo record_count from a zero base; an
-		// offset silently breaks those paths, so only the fifo workload supports it.
-		LOG(ERROR) << "--key_offset requires --fifo_valid";
-		return false;
+		// A/B/C/F and manual write_ratio mode add key_offset once at every
+		// makeKey() call following sampleKey(), so a disjoint per-session range
+		// is safe there. D/E still resolve latest_insert_idx/scan() against a
+		// zero-based record_count and are not yet offset-safe outside fifo mode.
+		std::string wl0 = cfg.workload;
+		if (!wl0.empty())
+			wl0[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(wl0[0])));
+		if (wl0 == "D" || wl0 == "E") {
+			LOG(ERROR) << "--key_offset with workload " << wl0
+			           << " requires --fifo_valid (scan-based workloads are not offset-safe)";
+			return false;
+		}
 	}
 
 	// Normalize workload label for run_dir naming
@@ -743,7 +751,7 @@ bool runBenchmark(BenchConfig& cfg) {
 		} else if (is_workload_F) {
 			bool do_rmw = (dice >= 0.5);
 			uint64_t key_id = sampleKey(cfg, zipf_dist, rng, latest_insert_idx);
-			std::string key = makeKey(key_id);
+			std::string key = makeKey(cfg.key_offset + key_id);
 			if (do_rmw) {
 				if (cfg.latency) {
 					auto t0 = std::chrono::steady_clock::now();
@@ -807,7 +815,7 @@ bool runBenchmark(BenchConfig& cfg) {
 				batch.reserve(batch_end - i);
 				for (uint64_t j = i; j < batch_end; j++) {
 					uint64_t key_id = sampleKey(cfg, zipf_dist, rng, latest_insert_idx);
-					batch.push_back({makeKey(key_id), template_value});
+					batch.push_back({makeKey(cfg.key_offset + key_id), template_value});
 				}
 				if (cfg.latency) {
 					auto t0 = std::chrono::steady_clock::now();
@@ -827,7 +835,7 @@ bool runBenchmark(BenchConfig& cfg) {
 				i = batch_end;
 			} else {
 				uint64_t key_id = sampleKey(cfg, zipf_dist, rng, latest_insert_idx);
-				std::string key = makeKey(key_id);
+				std::string key = makeKey(cfg.key_offset + key_id);
 				if (cfg.latency) {
 					auto t0 = std::chrono::steady_clock::now();
 					store.get(key);
@@ -1148,7 +1156,7 @@ int main(int argc, char* argv[]) {
 		("manage_cluster", "Create topic / terminate cluster on exit (0 for all but one process in multi-process runs)",
 		 cxxopts::value<int>()->default_value("1"))
 		("shared_topic", "Other sessions also write this topic; skip the exact store-size check")
-		("key_offset", "Base key id for this session's disjoint keyspace (fifo mode only)",
+		("key_offset", "Base key id for this session's disjoint keyspace (workloads A/B/C/F or --fifo_valid; not D/E)",
 		 cxxopts::value<uint64_t>()->default_value("0"))
 		("replica", "Subscriber-only convergence replica: apply the log, wait for "
 		 "--expected_entries, emit a state digest")

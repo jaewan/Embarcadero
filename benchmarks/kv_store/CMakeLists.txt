@@ -17,6 +17,10 @@ set(KV_CLIENT_SOURCES
     ../../src/client/buffer.h
     ../../src/common/configuration.cc
     ../../src/common/configuration.h
+    # [[GLIBC_COMPAT]] Provide __isoc23_strtoul etc. locally so binaries
+    # compiled on GLIBC 2.39 (Ubuntu 24.04) run on GLIBC 2.35 (Ubuntu 22.04).
+    # Mirrors src/CMakeLists.txt's throughput_test target.
+    ../../src/common/compat_isoc23.cpp
 )
 
 set(KV_INCLUDE_DIRS
@@ -66,4 +70,9 @@ target_include_directories(kv_ycsb_bench PUBLIC ${KV_INCLUDE_DIRS})
 target_link_libraries(kv_ycsb_bench ${KV_LINK_LIBS})
 set_target_properties(kv_ycsb_bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    # [[GLIBC_COMPAT]] Allow binary to find shared libs (e.g. libglog.so.1)
+    # from the same directory as itself on remote machines without /usr/local/lib.
+    BUILD_RPATH_USE_ORIGIN TRUE
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
 )
