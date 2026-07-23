@@ -313,12 +313,33 @@ class DistributedKVStore {
 		absl::flat_hash_map<OPID, std::chrono::steady_clock::time_point> op_start_ts_ ABSL_GUARDED_BY(lat_mutex_);
 		std::vector<double> apply_latencies_ms_ ABSL_GUARDED_BY(lat_mutex_);
 
+		// [[APPLY_BATCH]] Per-op cross-thread bookkeeping (two counter atomics, the
+		// pending-ops mutex/erase, and the apply_mutex_ total-order update) is the
+		// dominant synchronization cost on the single-threaded ordered-apply path.
+		// When applying a delivered batch, processLogEntryFromRawBuffer accumulates
+		// that bookkeeping here and flushApplyBatch() commits it once per batch.
+		// Order-preserving and value-identical: the KV mutations, the FIFO audit, and
+		// the final counter/pending/total-order values are exactly as the per-op path
+		// produced them (applied_local_ops_ still lands on `target`, monotonically).
+		struct ApplyBatchAccum {
+			size_t total_entries = 0;   // -> applied_any_entries_
+			size_t max_total_order = 0; // -> last_applied_total_order_ (monotonic max)
+			// Local ops (client_id==server_id_) to retire from pending_ops_.
+			// first: use apply-ordinal (V2) rather than the recorded client_order (V1).
+			std::vector<std::pair<bool, OPID>> local_ops;
+			void reset() { total_entries = 0; max_total_order = 0; local_ops.clear(); }
+		};
+
 		// Process a log entry against the local state
 		void processLogEntry(const LogEntry& entry, uint64_t logPosition);
+		// acc==nullptr: per-op bookkeeping (unchanged path, used by latency mode and
+		// the replica path). acc!=nullptr: defer bookkeeping into acc for flushApplyBatch.
 		void processLogEntryFromRawBuffer(const void* data, size_t size,
 				uint32_t client_id, size_t client_order,
 				size_t total_order,
-				bool use_apply_ordinal_for_pending_completion);
+				bool use_apply_ordinal_for_pending_completion,
+				ApplyBatchAccum* acc = nullptr);
+		void flushApplyBatch(ApplyBatchAccum& acc);
 
 		// Complete a pending operation
 		void completeOperation(OPID opId);

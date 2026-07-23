@@ -219,7 +219,8 @@ DistributedKVStore::~DistributedKVStore() {
 void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t size,
 		uint32_t client_id, size_t client_order,
 		size_t total_order,
-		bool use_apply_ordinal_for_pending_completion) {
+		bool use_apply_ordinal_for_pending_completion,
+		ApplyBatchAccum* acc) {
 	if (!data || size == 0) {
 		LOG(ERROR) << "Invalid raw buffer data for processing";
 		return;
@@ -231,7 +232,11 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 	// errors) or it hangs to its full timeout with no diagnostic — counting
 	// here at the top, instead of after the switch below, means an early
 	// parse-error return still advances progress.
-	applied_any_entries_.fetch_add(1, std::memory_order_acq_rel);
+	// [[APPLY_BATCH]] In batch mode this count (including early parse-error returns
+	// below) is accumulated and flushed once; the top-of-function placement is
+	// preserved so a torn entry still advances progress exactly as before.
+	if (acc) acc->total_entries++;
+	else applied_any_entries_.fetch_add(1, std::memory_order_acq_rel);
 
 	const char* buffer = static_cast<const char*>(data);
 	size_t offset = 0;
@@ -294,11 +299,20 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				}
 
 				if (client_id == server_id_) {
-					const OPID applied_op =
-						applied_local_ops_.fetch_add(1, std::memory_order_acq_rel);
-					completePendingLocalOp(use_apply_ordinal_for_pending_completion
-					                               ? applied_op
-					                               : client_order);
+					if (acc) {
+						// Defer: retire the pending op at flush. V2 uses the apply
+						// ordinal (base+i, computed in flushApplyBatch); V1 uses
+						// this op's client_order.
+						acc->local_ops.emplace_back(
+							use_apply_ordinal_for_pending_completion,
+							static_cast<OPID>(client_order));
+					} else {
+						const OPID applied_op =
+							applied_local_ops_.fetch_add(1, std::memory_order_acq_rel);
+						completePendingLocalOp(use_apply_ordinal_for_pending_completion
+						                               ? applied_op
+						                               : client_order);
+					}
 				}
 				break;
 			}
@@ -330,11 +344,20 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				kv_store_.remove(key);
 
 				if (client_id == server_id_) {
-					const OPID applied_op =
-						applied_local_ops_.fetch_add(1, std::memory_order_acq_rel);
-					completePendingLocalOp(use_apply_ordinal_for_pending_completion
-					                               ? applied_op
-					                               : client_order);
+					if (acc) {
+						// Defer: retire the pending op at flush. V2 uses the apply
+						// ordinal (base+i, computed in flushApplyBatch); V1 uses
+						// this op's client_order.
+						acc->local_ops.emplace_back(
+							use_apply_ordinal_for_pending_completion,
+							static_cast<OPID>(client_order));
+					} else {
+						const OPID applied_op =
+							applied_local_ops_.fetch_add(1, std::memory_order_acq_rel);
+						completePendingLocalOp(use_apply_ordinal_for_pending_completion
+						                               ? applied_op
+						                               : client_order);
+					}
 				}
 				break;
 			}
@@ -370,11 +393,20 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				kv_store_.multiPut(kvPairs);
 
 				if (client_id == server_id_) {
-					const OPID applied_op =
-						applied_local_ops_.fetch_add(1, std::memory_order_acq_rel);
-					completePendingLocalOp(use_apply_ordinal_for_pending_completion
-					                               ? applied_op
-					                               : client_order);
+					if (acc) {
+						// Defer: retire the pending op at flush. V2 uses the apply
+						// ordinal (base+i, computed in flushApplyBatch); V1 uses
+						// this op's client_order.
+						acc->local_ops.emplace_back(
+							use_apply_ordinal_for_pending_completion,
+							static_cast<OPID>(client_order));
+					} else {
+						const OPID applied_op =
+							applied_local_ops_.fetch_add(1, std::memory_order_acq_rel);
+						completePendingLocalOp(use_apply_ordinal_for_pending_completion
+						                               ? applied_op
+						                               : client_order);
+					}
 				}
 				break;
 			}
@@ -392,10 +424,42 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 	}
 
 	// Update the last applied index
-	{
+	if (acc) {
+		if (acc->max_total_order < total_order) acc->max_total_order = total_order;
+	} else {
 		absl::MutexLock lock(&apply_mutex_);
 		if (last_applied_total_order_ < total_order) {
 			last_applied_total_order_ = total_order;
+		}
+	}
+}
+
+// [[APPLY_BATCH]] Commit one batch's accumulated bookkeeping with a single set of
+// cross-thread operations instead of one-per-op. Called after all entries in a
+// delivered batch have been parsed, applied to the KV store, and audited (in
+// total order). Correctness: applied_local_ops_ still reaches `target`
+// monotonically (release-ordered after the KV mutations, so a get()'s
+// waitForSyncWithLog acquire-load sees a consistent store); pending_ops_ retires
+// the same op-ids; last_applied_total_order_ ends at the same max.
+void DistributedKVStore::flushApplyBatch(ApplyBatchAccum& acc) {
+	if (acc.total_entries == 0) return;
+	applied_any_entries_.fetch_add(acc.total_entries, std::memory_order_acq_rel);
+	if (!acc.local_ops.empty()) {
+		// One release fetch_add publishes all KV mutations of this batch before the
+		// counter advances; base is the pre-increment value = first op's ordinal.
+		const OPID base = static_cast<OPID>(
+			applied_local_ops_.fetch_add(acc.local_ops.size(), std::memory_order_release));
+		absl::MutexLock lock(&pending_ops_mutex_);
+		for (size_t i = 0; i < acc.local_ops.size(); ++i) {
+			const bool use_ordinal = acc.local_ops[i].first;
+			const OPID id = use_ordinal ? (base + i) : acc.local_ops[i].second;
+			pending_ops_.erase(id);
+		}
+	}
+	{
+		absl::MutexLock lock(&apply_mutex_);
+		if (last_applied_total_order_ < acc.max_total_order) {
+			last_applied_total_order_ = acc.max_total_order;
 		}
 	}
 }
@@ -542,6 +606,45 @@ void DistributedKVStore::completePendingLocalOp(OPID op) {
 // ORDER>=2: Subscriber::Consume() dispatches to ConsumeOrdered (private); do not
 // bypass it unless a public ordered API is added.
 void DistributedKVStore::logConsumer() {
+	// [[APPLY_BATCH]] Throughput path (latency instrumentation off): pull a batch of
+	// ordered messages and amortize the per-op cross-thread bookkeeping over the
+	// whole batch via ApplyBatchAccum/flushApplyBatch. Messages are delivered by
+	// ConsumeOrderedBatch strictly in total_order and applied in that order, so
+	// this is order-identical to the per-message path below; only the counter/
+	// pending/total-order commits are batched. When track_latency_ is on, use the
+	// unchanged per-message path so per-op apply-latency samples stay exact.
+	if (!track_latency_) {
+		constexpr size_t kApplyBatchMax = 1024;
+		std::vector<Subscriber::OrderedMessageView> batch;
+		ApplyBatchAccum acc;
+		while (running_) {
+			batch.clear();
+			const size_t n = subscriber_->ConsumeOrderedBatch(&batch, kApplyBatchMax, 100);
+			if (n == 0) {
+				if (!running_) break;
+				continue;
+			}
+			acc.reset();
+			for (const auto& view : batch) {
+				if (view.data == nullptr) continue;
+				if (view.wire_header_version == Embarcadero::wire::HEADER_VERSION_V2) {
+					auto* h = reinterpret_cast<Embarcadero::BlogMessageHeader*>(view.data);
+					void* payload = reinterpret_cast<uint8_t*>(h) + sizeof(Embarcadero::BlogMessageHeader);
+					processLogEntryFromRawBuffer(payload, h->size,
+						static_cast<uint32_t>(h->client_id), h->batch_seq, h->total_order,
+						/*use_apply_ordinal_for_pending_completion=*/true, &acc);
+				} else {
+					auto* h = reinterpret_cast<Embarcadero::MessageHeader*>(view.data);
+					void* payload = reinterpret_cast<uint8_t*>(h) + sizeof(Embarcadero::MessageHeader);
+					processLogEntryFromRawBuffer(payload, h->size,
+						h->client_id, h->client_order, h->total_order,
+						/*use_apply_ordinal_for_pending_completion=*/false, &acc);
+				}
+			}
+			flushApplyBatch(acc);
+		}
+		return;
+	}
 	while (running_) {
 		void* raw = subscriber_->Consume();
 		if (raw == nullptr) {
