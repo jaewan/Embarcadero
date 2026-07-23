@@ -145,6 +145,8 @@ class TopicManager {
 				size_t &batch_total_order,
 				uint32_t &num_messages,
 				uint64_t* export_gap = nullptr);  // [[O5-1 EDIT B]] see Topic:: overload
+		// [[ORDER5_EXPORT_STALL_DIAG]] forwards to Topic::DumpOrder5ExportStall.
+		void DumpOrder5ExportStall(const char* topic, size_t next_export);
 		/**
 		 * Get message address and size for a topic
 		 *

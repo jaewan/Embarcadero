@@ -380,6 +380,14 @@ class Topic {
 				// [[O5-1 EDIT B]] optional out: export batches skipped due to a ring lap on this
 				// call (0 normally). Non-null caller uses it to terminalize+flag the lagging conn.
 				uint64_t* export_gap = nullptr);
+		// [[ORDER5_EXPORT_STALL_DIAG]] Called by the subscribe path only when a
+		// connection's export cursor has been stuck at next_export for seconds:
+		// dumps the one discriminating comparison (sequencer's export-write
+		// frontier vs. reader cursor vs. actual ring-slot contents + committed_seq)
+		// so a delivery gap is attributable to sequencer-side (never wrote the
+		// descriptor) vs. export-ring (wrote but reader can't find / overwritten).
+		// Zero cost on the healthy path (only invoked from the miss branch).
+		void DumpOrder5ExportStall(size_t next_export);
 		/**
 		 * Get the address and size of messages for a subscriber
 		 *

@@ -799,6 +799,13 @@ bool TopicManager::GetBatchToExportWithMetadata(
 	return topic_itr->second->GetBatchToExportWithMetadata(expected_batch_offset, batch_addr, batch_size, batch_total_order, num_messages, export_gap);
 }
 
+void TopicManager::DumpOrder5ExportStall(const char* topic, size_t next_export) {
+	absl::ReaderMutexLock lock(&topics_mutex_);
+	auto topic_itr = topics_.find(topic);
+	if (topic_itr == topics_.end()) return;
+	topic_itr->second->DumpOrder5ExportStall(next_export);
+}
+
 bool TopicManager::GetMessageAddr(
 		const char* topic, 
 		size_t &last_offset,

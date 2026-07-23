@@ -2141,6 +2141,10 @@ void NetworkManager::SubscribeNetworkThread(
 	}
 
 	uint64_t export_no_data_loops = 0;
+	// [[ORDER5_EXPORT_STALL_DIAG]] per-connection stall tracking (miss-branch only).
+	size_t stall_last_offset = SIZE_MAX;
+	uint64_t stall_spins = 0;
+	int64_t stall_last_dump_ns = 0;
 	uint64_t export_batches = 0;
 	uint64_t export_bytes = 0;
 	uint64_t export_messages = 0;
@@ -2201,6 +2205,25 @@ void NetworkManager::SubscribeNetworkThread(
 						}
 					}
 					export_no_data_loops++;
+					// [[ORDER5_EXPORT_STALL_DIAG]] Only fires once a connection is
+					// genuinely stuck at the same export cursor (>~0.x s of spins) and
+					// then at most once per 3s. Zero cost on the healthy path, so it
+					// cannot perturb the intermittent race the way per-call tracing does.
+					if (order == 5) {
+						if (local_offset != stall_last_offset) {
+							stall_last_offset = local_offset;
+							stall_spins = 0;
+						} else if (++stall_spins >= 500000) {
+							stall_spins = 0;
+							const int64_t now_ns =
+								std::chrono::duration_cast<std::chrono::nanoseconds>(
+									std::chrono::steady_clock::now().time_since_epoch()).count();
+							if (now_ns - stall_last_dump_ns > 3'000'000'000LL) {
+								stall_last_dump_ns = now_ns;
+								topic_manager_->DumpOrder5ExportStall(topic, local_offset);
+							}
+						}
+					}
 					std::this_thread::yield();
 					continue;
 				}

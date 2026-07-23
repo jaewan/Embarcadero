@@ -3485,151 +3485,120 @@ bool Topic::GetBatchToExportWithMetadata(
 		return true;
 	}
 
+	// [[ORDER5_GOI_SOURCED_EXPORT 2026-07-23]] Deliver from the GOI — the single
+	// dense total order — per the design (§Read Path: "a subscriber tails
+	// committed_seq, scans the GOI"). The prior implementation shipped a per-broker
+	// compacted export-descriptor ring that CommitEpoch wrote into the SAME
+	// BatchHeader region the producer PBR publishes into, via a cursor independent
+	// of the producer's. Under bursty hold-buffer commits a committed batch's export
+	// descriptor could fail to land in its ring slot while committed_seq (the GOI
+	// frontier) advanced past it, permanently stranding that batch from the
+	// subscriber — a silent, un-flagged delivery gap that hung the ordered-consume
+	// path (root-caused 2026-07-23 in the paper's own regime: committed_seq=603 while
+	// a committed batch's export descriptor was never written; client stalled forever
+	// one 64-msg batch short). The GOI is single-writer (sequencer only), monotonic,
+	// and gated by committed_seq plus the global_seq==index readiness token (I3), so
+	// it cannot drop, tear, or reorder a committed entry. Each broker connection ships
+	// the entries it owns (broker_id==broker_id_); the client merges the per-broker
+	// subsequences by total_order exactly as before, but the inputs are now complete
+	// by construction. expected_batch_offset is repurposed as this connection's
+	// GOI-index cursor (was the export-descriptor sequence).
 	const bool trace_order5 = ShouldEnableOrder5Trace() && (order_ == 5);
-	// ORDER=5 export is a compact stream of immutable descriptors written by CommitEpoch.
-	// It is intentionally not keyed by PBR: true client-chain ordering can hold or
-	// terminalize a PBR slot, then commit a later PBR first. Delivery follows total_order
-	// via BatchMetadata, so the subscriber cursor must advance by export descriptor sequence.
-	bool have_ring = false;
-	size_t ring_total_order = 0;
-	void* ring_batch_addr = nullptr;
-	size_t ring_batch_size = 0;
-	uint32_t ring_num_messages = 0;
-	size_t next_export = expected_batch_offset;
-	uint64_t ring_slot_export_seq = 0;
-	uint64_t ring_slot_ordered = 0;
-	uint64_t ring_slot_pbr_idx = 0;
-	uint32_t ring_slot_flags = 0;
-	uint32_t ring_slot_num_msg = 0;
+	if (export_gap) *export_gap = 0;  // GOI is dense: no ring-lap gap is possible.
+	if (cxl_addr_ == nullptr) return false;
 
-	if (num_slots_ > 0 && cxl_addr_) {
-		size_t slot = next_export % num_slots_;
-		BatchHeader* start_batch_header = reinterpret_cast<BatchHeader*>(
-			reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
-		BatchHeader* header = reinterpret_cast<BatchHeader*>(
-			reinterpret_cast<uint8_t*>(start_batch_header) + sizeof(BatchHeader) * slot);
-		CXL::flush_cacheline(header);
-		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(header) + 64);
-		CXL::full_fence();  // MFENCE required: CLFLUSHOPT only ordered by MFENCE (Intel SDM §8.2.5)
-		ring_slot_export_seq = header->batch_seq;
-		ring_slot_ordered = header->ordered;
-		ring_slot_pbr_idx = header->pbr_absolute_index;
-		ring_slot_flags = header->flags;
-		ring_slot_num_msg = header->num_msg;
-		const size_t log_idx = header->log_idx;
-		const size_t total_size = header->total_size;
-		const bool payload_in_bounds =
-			log_idx < CXL_SIZE && total_size > 0 && total_size <= (CXL_SIZE - log_idx);
-		if (header->ordered == 1 &&
-		    header->batch_seq == next_export &&
-		    header->num_msg > 0 &&
-		    payload_in_bounds) {
-			ring_total_order = header->total_order;
-			ring_batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + log_idx;
-			ring_batch_size = total_size;
-			ring_num_messages = header->num_msg;
-			have_ring = true;
-		} else if (header->ordered == 1 &&
-		           header->num_msg > 0 &&
-		           total_size > 0 &&
-		           header->batch_seq > next_export) {
-			const uint64_t observed = header->batch_seq;
-			const uint64_t oldest_live =
-				(observed >= static_cast<uint64_t>(num_slots_ - 1))
-					? observed - static_cast<uint64_t>(num_slots_ - 1)
-					: 0;
-			const uint64_t resync_to = std::max<uint64_t>(next_export + 1, oldest_live);
-			const uint64_t skipped = resync_to > next_export ? (resync_to - next_export) : 0;
-			order5_export_overruns_.fetch_add(1, std::memory_order_relaxed);
-			order5_export_skipped_batches_.fetch_add(skipped, std::memory_order_relaxed);
-			// [[O5-1 EDIT B]] Surface the lap to the caller so it can terminalize+flag this
-			// connection (report the gap to the client) instead of silently advancing the cursor.
-			if (export_gap) *export_gap = skipped;
-			LOG(ERROR) << "[ORDER5_EXPORT_OVERRUN B" << broker_id_ << "]"
-			           << " expected_export_seq=" << next_export
-			           << " observed_export_seq=" << observed
-			           << " resync_export_seq=" << resync_to
-			           << " skipped_export_batches=" << skipped
-			           << " slot=" << slot
-			           << " pbr=" << header->pbr_absolute_index
-			           << " total_order=" << header->total_order;
-			expected_batch_offset = resync_to;
-			if (ShouldFatalOnOrder5ExportOverrun()) {
-				LOG(FATAL) << "[ORDER5_EXPORT_OVERRUN_FATAL B" << broker_id_ << "]"
-				           << " expected_export_seq=" << next_export
-				           << " observed_export_seq=" << observed
-				           << " resync_export_seq=" << resync_to
-				           << " skipped_export_batches=" << skipped;
-			}
+	ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
+	CXL::invalidate_cacheline_for_read(control_block);
+	CXL::load_fence();
+	const uint64_t committed_seq = control_block->committed_seq.load(std::memory_order_acquire);
+	if (committed_seq == UINT64_MAX) return false;  // nothing committed yet
+
+	GOIEntry* goi = reinterpret_cast<GOIEntry*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + kGOIOffset);
+	size_t cursor = expected_batch_offset;
+	while (cursor <= committed_seq) {
+		GOIEntry* entry = &goi[cursor];
+		ReadGOIEntryFresh(entry);
+		// I3 readiness: below committed_seq the sequencer has already flushed the
+		// entry, so global_seq==cursor holds; a mismatch is a torn/transient read and
+		// is retried (never delivered), not skipped.
+		if (entry->global_seq != cursor) break;
+		// Ship only the entries this broker owns; peers' connections ship theirs.
+		if (static_cast<int>(entry->broker_id) != broker_id_) { ++cursor; continue; }
+		// Empty/skip GOI entries (aged-out or zero-count) carry no payload.
+		if (entry->message_count == 0 || entry->payload_size == 0) { ++cursor; continue; }
+		const size_t log_idx = entry->blog_offset;
+		const size_t total_size = entry->payload_size;
+		if (log_idx >= CXL_SIZE || total_size > (CXL_SIZE - log_idx)) {
+			LOG_EVERY_N(ERROR, 1000) << "[ORDER5_GOI_EXPORT B" << broker_id_
+				<< "] out-of-bounds payload at goi=" << cursor
+				<< " blog_offset=" << log_idx << " size=" << total_size << "; skipping";
+			++cursor;
+			continue;
 		}
-	}
-
-	auto trace_export = [&](const char* result, const char* source) {
-		if (!trace_order5) return;
-		static thread_local size_t last_next_export = static_cast<size_t>(-1);
-		static thread_local uint64_t last_export_seq = static_cast<uint64_t>(-1);
-		static thread_local uint64_t last_slot_ordered = static_cast<uint64_t>(-1);
-		static thread_local uint64_t last_slot_pbr = static_cast<uint64_t>(-1);
-		static thread_local uint32_t last_slot_flags = 0;
-		static thread_local uint32_t last_slot_num_msg = 0;
-		static thread_local uint64_t last_log_ns = 0;
-		const uint64_t now_ns = SteadyNowNs();
-		const bool changed =
-			(next_export != last_next_export) ||
-			(ring_slot_export_seq != last_export_seq) ||
-			(ring_slot_ordered != last_slot_ordered) ||
-			(ring_slot_pbr_idx != last_slot_pbr) ||
-			(ring_slot_flags != last_slot_flags) ||
-			(ring_slot_num_msg != last_slot_num_msg);
-		const bool periodic = (now_ns - last_log_ns) >= 200000000ULL;  // 200ms
-		if (!changed && !periodic) return;
-		LOG(INFO) << "[ORDER5_TRACE_EXPORT B" << broker_id_ << "]"
-		          << " result=" << result
-		          << " source=" << source
-		          << " next_export_seq=" << next_export
-		          << " slot_export_seq=" << ring_slot_export_seq
-		          << " have_ring=" << (have_ring ? 1 : 0)
-		          << " ring_total_order=" << ring_total_order
-		          << " ring_batch_size=" << ring_batch_size
-		          << " slot_ordered=" << ring_slot_ordered
-		          << " slot_pbr_idx=" << ring_slot_pbr_idx
-		          << " slot_flags=" << ring_slot_flags
-		          << " slot_num_msg=" << ring_slot_num_msg
-		          << " expected_batch_offset=" << expected_batch_offset;
-		last_next_export = next_export;
-		last_export_seq = ring_slot_export_seq;
-		last_slot_ordered = ring_slot_ordered;
-		last_slot_pbr = ring_slot_pbr_idx;
-		last_slot_flags = ring_slot_flags;
-		last_slot_num_msg = ring_slot_num_msg;
-		last_log_ns = now_ns;
-	};
-
-	if (have_ring) {
-		batch_addr = ring_batch_addr;
-		batch_size = ring_batch_size;
-		batch_total_order = ring_total_order;
-		num_messages = ring_num_messages;
+		batch_addr = reinterpret_cast<uint8_t*>(cxl_addr_) + log_idx;
+		batch_size = total_size;
+		batch_total_order = entry->total_order;
+		num_messages = entry->message_count;
+		expected_batch_offset = cursor + 1;
 		if (trace_order5) {
 			LOG(INFO) << "[ORDER5_TRACE_EXPORT_BATCH B" << broker_id_ << "]"
-			          << " source=ring"
-			          << " export_seq=" << ring_slot_export_seq
-			          << " pbr=" << ring_slot_pbr_idx
-			          << " total_order=" << ring_total_order
-			          << " batch_addr="
-			          << (reinterpret_cast<uint8_t*>(ring_batch_addr) -
-			              reinterpret_cast<uint8_t*>(cxl_addr_))
-			          << " batch_size=" << ring_batch_size
-			          << " num_messages=" << ring_num_messages;
+			          << " source=goi goi_index=" << cursor
+			          << " total_order=" << batch_total_order
+			          << " num_messages=" << num_messages
+			          << " batch_size=" << batch_size
+			          << " committed_seq=" << committed_seq;
 		}
-		expected_batch_offset = next_export + 1;
-		trace_export("hit", "ring");
 		return true;
 	}
-
-	trace_export("miss", "none");
-
+	// No owned, ready entry at/below committed_seq this call. Persist how far we
+	// scanned so committed non-owned/empty entries are not re-examined next call.
+	expected_batch_offset = cursor;
 	return false;
+}
+
+void Topic::DumpOrder5ExportStall(size_t next_export) {
+	if (order_ != 5 || cxl_addr_ == nullptr || num_slots_ == 0) return;
+
+	// What the reader is looking at: the export-ring slot for next_export.
+	BatchHeader* ring_start = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(cxl_addr_) + tinode_->offsets[broker_id_].batch_headers_offset);
+	const size_t slot = next_export % num_slots_;
+	BatchHeader* h = reinterpret_cast<BatchHeader*>(
+		reinterpret_cast<uint8_t*>(ring_start) + slot * sizeof(BatchHeader));
+	CXL::flush_cacheline(h);
+	CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(h) + 64);
+	CXL::load_fence();
+
+	// What the sequencer has actually written: the per-broker export-write frontier
+	// (how many export descriptors CommitEpoch has emitted for this broker).
+	uint64_t export_written;
+	{
+		absl::MutexLock lk(&export_cursor_mu_);
+		export_written = export_sequence_by_broker_[broker_id_];
+	}
+
+	ControlBlock* cb = reinterpret_cast<ControlBlock*>(cxl_addr_);
+	CXL::invalidate_cacheline_for_read(cb);
+	CXL::load_fence();
+	const uint64_t committed_seq = cb->committed_seq.load(std::memory_order_acquire);
+
+	LOG(ERROR) << "[ORDER5_EXPORT_STALL] broker=" << broker_id_
+	           << " reader_next_export=" << next_export
+	           << " seq_export_written=" << export_written
+	           << " (written>reader? " << (export_written > next_export ? "YES-ring/deliver-side"
+	                                                                      : "NO-sequencer-side") << ")"
+	           << " committed_seq=" << committed_seq
+	           << " slot=" << slot
+	           << " slot.batch_seq=" << h->batch_seq
+	           << " slot.ordered=" << h->ordered
+	           << " slot.num_msg=" << h->num_msg
+	           << " slot.total_order=" << h->total_order
+	           << " slot.flags=0x" << std::hex << h->flags << std::dec
+	           << " slot.pbr_abs=" << h->pbr_absolute_index
+	           << " (slot.batch_seq==reader_next_export? "
+	           << (h->batch_seq == next_export ? "YES-present-but-gated" : "NO-overwritten/diverged")
+	           << ")";
 }
 
 void Topic::AdvanceCVForSequencer(uint16_t broker_id, uint64_t pbr_index, uint64_t cumulative_msg_count) {
