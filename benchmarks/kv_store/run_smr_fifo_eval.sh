@@ -265,7 +265,7 @@ trap cleanup EXIT
 run_one() {
   local seq="$1" mode="$2" trial="$3"
   case "$mode" in
-    pipe|batch_ack|serialize|sticky) ;;
+    pipe|batch_ack|serialize|sticky|frontier) ;;
     *) echo "ERROR: unsupported SMR_FIFO mode: $mode" >&2; return 2 ;;
   esac
   local sync_iv=0 sync_barrier=apply ops="$SMR_FIFO_OPERATION_COUNT"
@@ -288,6 +288,15 @@ run_one() {
   elif [[ "$mode" == "sticky" ]]; then
     nb=1
     fifo_mode_flag="sticky"
+  elif [[ "$mode" == "frontier" ]]; then
+    # [[FRONTIER]] Closed-loop latency-throughput point: in-flight depth =
+    # SMR_FIFO_SYNC_INTERVAL_OVERRIDE (ops between ACK barriers). 0 = full
+    # pipeline (apply barrier); K>0 = wait for ACK every K ops (ack barrier).
+    # Op count comes from SMR_FIFO_OPERATION_COUNT (the wrapper scales it per K
+    # so each point measures over a comparable wall-time window).
+    sync_iv="${SMR_FIFO_SYNC_INTERVAL_OVERRIDE:-0}"
+    if [[ "$sync_iv" == "0" ]]; then sync_barrier="apply"; else sync_barrier="ack"; fi
+    fifo_mode_flag="auto"
   fi
   local effective_rf="$SMR_FIFO_RF"
   if [[ "$mode" == "sticky" && "$SMR_FIFO_RF" -gt "$nb" ]]; then
@@ -351,6 +360,8 @@ run_one() {
     local -a session_flags=("${multi_flags[@]}")
     session_flags+=(--manage_cluster="$manage")
     [[ "$sessions" -gt 1 ]] && session_flags+=(--key_offset=$((s * SMR_FIFO_RECORD_COUNT)))
+    # [[FRONTIER]] Capture publish->ACK latency percentiles for the latency axis.
+    [[ "${SMR_FIFO_TRACK_LATENCY:-0}" == "1" ]] && session_flags+=(--latency)
     timeout "$_bench_to" "${bench_env[@]}" \
       "${EMBARLET_NUMA_ARR[@]}" "$BIN_DIR/kv_ycsb_bench" \
       --sequencer="$seq" \
