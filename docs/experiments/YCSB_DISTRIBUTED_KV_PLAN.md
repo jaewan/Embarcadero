@@ -873,6 +873,53 @@ after reproducing that bug twice on its first cell; the full preregistered
 campaign was relaunched fresh from the corrected commit so every cell
 runs against the same, fixed binary.
 
+## 6g. ULTIMATE root cause and fix — ORDER=5 delivery sourced from the GOI
+     (2026-07-23, commit `bbc987f6`)
+
+Sec 6e and 6f each closed a real but *partial* source of ORDER=5 delivery
+gaps. The residual ~20% intermittent stall persisted — and, critically, it
+reproduced **in the paper's own KV regime** (single-client, RF=1,
+co-located, loopback). So the earlier framing that the failing regime was
+"beyond the paper's claim / cross-host+RF2 only" was wrong: the defect is in
+the ORDER=5 ordered-consume path that Table `kv-pipelined` (Q3) exercises.
+It is a *liveness* bug — every completing run is `Valid` with correct final
+state; failing runs hang — so the paper's *correctness* claim was never
+compromised, but its robustness was.
+
+**Confirmed mechanism (instrumented capture, loopback):** the remote/TCP
+subscriber export path (`Topic::GetBatchToExportWithMetadata`, ORDER=5)
+delivered from a per-broker *compacted export-descriptor ring* that
+`CommitEpoch` wrote into the **same** `BatchHeader` region the producer PBR
+publishes into, advanced by a cursor independent of the producer's. Under
+bursty hold-buffer commits, a committed batch's export descriptor could fail
+to land in its ring slot while `committed_seq` (the GOI frontier) advanced
+past it — a silent, un-flagged, permanent hole in the export projection of
+an otherwise-complete GOI. Captured live: client stuck at
+`next_expected_order=38464` (exactly one 64-msg batch missing) while
+`committed_seq` advanced `601→602→603` and the stuck export-ring slot read
+back all-zero (`batch_seq=0 ordered=0 num_msg=0` — descriptor never written).
+The `[ORDER5_EXPORT_STALL]` diagnostic (added this session, zero hot-path
+cost, fires only after a connection is stuck >3s) pinned it.
+
+**Fix — align to the paper's design.** §4 Read Path states the subscriber
+"tails `committed_seq`, scans the GOI." The GOI is the single dense total
+order, single-writer (sequencer only), monotonic, gated by `committed_seq` +
+the `global_seq==index` readiness token (I3) — it cannot drop, tear, or
+reorder a committed entry, and producers never touch it. The export path now
+delivers straight from the GOI (each broker connection ships the entries it
+owns, `broker_id==broker_id_`; the client merges per-broker subsequences by
+`total_order` exactly as before, but the inputs are complete by
+construction). This subsumes the whole gap class; the Sec 6e re-anchor is now
+vestigial for ORDER=5 (no ring-lap flag is ever produced) and the Sec 6f
+`total_msg` fix remains necessary to keep `total_order` itself dense in the
+GOI. `CommitEpoch` still writes the (now-unread) export descriptors; removing
+that write is deferred low-risk cleanup. CORFU/SCALOG/LazyLog use earlier
+branches and are unchanged.
+
+**Validation:** 25/25 loopback EMBARCADERO pipe trials `Valid=YES`, 0
+reorders, 0 stalls (pre-fix rate ~20%; P(25 clean by luck) ≈ 0.4%). Full Q3
+matrix re-run from the fixed commit for the paper numbers.
+
 ## 7. `benchmarks/README.md` correction (deferred until Section 6 tests land)
 
 Once the Section 3/Section 6 semantic tests validate A/F/Zipf/RMW behavior
