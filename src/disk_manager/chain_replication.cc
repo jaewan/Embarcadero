@@ -354,7 +354,15 @@ void ChainReplicationManager::ReplicationThread() {
             std::filesystem::create_directories(dir, ec);
             pipe->path = dir + "/replica_b" + std::to_string(local_broker_id_) + "_src" +
                          std::to_string(src) + ".dat";
-            pipe->fd = open(pipe->path.c_str(), O_CREAT | O_RDWR, 0644);
+            // O_TRUNC: this path is fixed (not scoped by run/topic), so a broker
+            // restart must start the sink fresh. Nothing in this file reads back
+            // existing content on open (no recovery/replay path here), so stale
+            // bytes from a prior run only ever sat unused past this run's own
+            // writes -- but they still accumulated on disk indefinitely (216GB+
+            // across .Replication/disk0,disk1 from past sessions) and are a
+            // standing trap for any future code that assumes file size reflects
+            // this run's data.
+            pipe->fd = open(pipe->path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
             if (pipe->fd < 0) {
                 LOG(FATAL) << "Failed to open replication disk file: " << pipe->path
                            << " error: " << strerror(errno)
