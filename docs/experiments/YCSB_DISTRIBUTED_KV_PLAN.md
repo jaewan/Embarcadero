@@ -797,8 +797,8 @@ attempts, bounded ~90s with a warning) was introduced. Also: force-killing
 its `trap cleanup EXIT`, leaking its `CXL_KVBASE_*` shm segment — must be
 unlinked manually (scoped to `/CXL_KVBASE_${UID}_*`) after any such kill.
 
-## 6f. Second, distinct intermittent stall — found via `[ORDER_GAP_DIAG]` in a
-     real RF=2/ACK=2 campaign cell, not yet root-caused (2026-07-23)
+## 6f. Second, distinct intermittent stall — root-caused and fixed
+     (2026-07-23)
 
 RF2/ACK2 validation before the full campaign turned up a second stall,
 confirmed genuinely different from Sec 6e's export-gap bug via the new
@@ -821,34 +821,57 @@ stream" scenario considered and set aside earlier (Sec 6e discussion of
 RF=2 attempts) — data continued arriving for many messages after the gap,
 ruling out an end-of-stream/no-later-data-to-compare-against explanation.
 
-**Working hypothesis, not yet verified**: ORDER=5's per-epoch commit
-(`Topic::CommitEpoch`, `topic.cc`) reserves total_order space via
-`global_seq_.fetch_add(total_msg, ...)` where `total_msg` is summed from the
-epoch's `ready` batch list's `num_msg` fields. If any per-batch step inside
-the same commit (the loop assigning `p.hdr->total_order`/`entry->total_order`
-per batch, ~topic.cc:5212-5243) can skip or under-deliver a batch that was
-still counted in `total_msg`, the reserved total_order range would exceed
-what actually gets exported -- a small, fixed-size permanent hole matching
-exactly what was observed. Not confirmed; `spatial_guard_reject` (the one
-known reason a `ready` entry can vanish) requires session fencing, which
-did not occur in this run, so if this hypothesis is right the actual skip
-condition is still unidentified.
+**Root cause, confirmed and fixed (commit `84978d95`)**: ORDER=5's per-epoch
+commit (`Topic::CommitEpoch`, `topic.cc`) reserves total_order space via
+`base_order = global_seq_.fetch_add(total_msg, ...)`, where `total_msg` was
+summed across **every** entry in the epoch's `ready` batch list. But the
+per-batch assignment loop a few dozen lines later — the one that actually
+advances `next_order` and hands out those reserved positions — correctly
+`continue`s past any entry with `skipped == true` or `is_held_marker ==
+true` (the same filter the neighboring `num_goi_order5` counting loop
+already applied). A batch ages out of the hold buffer and gets marked
+`skipped = true` when it sits longer than `kMaxEpochAge` (2000 epochs) —
+by design, to avoid leaking its PBR slot (`"Dropping stale batch: age > max"`,
+`topic.cc` ~L6108) — but its real, nonzero `num_msg` was still being counted
+into `total_msg` before this fix. That mismatch means `global_seq_` advanced
+past exactly that batch's message count while the assignment loop never
+filled those positions — a permanent gap no future epoch can ever close,
+since nothing after it will ever be tagged with those specific
+`total_order` values. Matches both live captures exactly: `missing=3` and
+`missing=1` on two separate runs, different mid-stream positions, neither
+ever flagged by the broker (there was nothing to detect — every sequencing
+counter was internally consistent; the reservation itself was simply too
+large). Plausibly why RF>=2 hit this far more than the RF=1 testing in Sec
+6e ever did (2/2 real 1M-record attempts here vs. an intermittent handful
+of percent at RF=1): replication adds latency, making a batch measurably
+more likely to sit in the hold buffer long enough to age out.
 
-**Disposition per explicit user direction**: not blocking the campaign.
-Mitigated by the matrix script's existing retry-on-failure (up to
-`TRIAL_MAX_ATTEMPTS=3`); documented here as a known open issue rather than
-investigated further right now. The `[ORDER_GAP_DIAG]` capture above is
-strong, precise evidence for whoever picks this up next -- in particular,
-the exact `missing=3` count and the mid-epoch positions are a much better
-starting point than the vaguer "some connection lagged" framing this
-investigation started with.
+Fix: the `total_msg` loop now applies the identical `if (p.skipped ||
+p.is_held_marker) continue;` filter already used by the two other loops
+over the same `ready` vector, so the reservation and the actual assignment
+can never again disagree. The third `skipped = true` call site (a scanner
+skip-marker for a stuck `CLAIMED` slot, `topic.cc` ~L7970) already sets
+`num_msg = 0`, so it was already harmless under the old code — only the
+two stale-batch-age-out sites (`topic.cc` ~L6110, ~L6408) actually reserved
+message counts that could go unfilled. No isolated unit test was added:
+unlike Sec 6e's `Subscriber` fix, `CommitEpoch` is tightly coupled to the
+live CXL layout (real `Topic` construction, epoch buffers, GOI array) with
+no existing decoupled harness to extend — building one would be a
+substantially bigger undertaking than this fix warrants on its own. The
+existing `unit_order5_*` suite (4/4) still passes; the practical validation
+is the full-scale RF=2/ACK=2 campaign itself, which was reliably hitting
+this exact bug before the fix.
 
 Gate step 5 (full matrix) is unblocked: the Sec 6e fix is committed,
 unit-tested (`unit_order5_subscriber_reorder`, 5/5 passing including the two
 gap regression tests), and synced/rebuilt on c4; the chain-replication
-disk-sink `O_TRUNC` hygiene fix (commit `cfb6ace9`) is also landed. The
-full preregistered campaign (commit `641f72c9`) is running with retry
-mitigation for the Sec 6f issue.
+disk-sink `O_TRUNC` hygiene fix (commit `cfb6ace9`) is also landed; the
+Sec 6f fix (commit `84978d95`) is landed and `embarlet` rebuilt locally
+(broker-only code, no client rebuild/c4 sync needed). The first campaign
+attempt (commit `641f72c9`, before the Sec 6f fix) was stopped cleanly
+after reproducing that bug twice on its first cell; the full preregistered
+campaign was relaunched fresh from the corrected commit so every cell
+runs against the same, fixed binary.
 
 ## 7. `benchmarks/README.md` correction (deferred until Section 6 tests land)
 
