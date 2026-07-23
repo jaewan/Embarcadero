@@ -797,13 +797,58 @@ attempts, bounded ~90s with a warning) was introduced. Also: force-killing
 its `trap cleanup EXIT`, leaking its `CXL_KVBASE_*` shm segment — must be
 unlinked manually (scoped to `/CXL_KVBASE_${UID}_*`) after any such kill.
 
-Gate step 5 (full matrix) is unblocked: the fix is committed, unit-tested
-(`unit_order5_subscriber_reorder`, 5/5 passing including the two gap
-regression tests), and synced/rebuilt on c4. Recommend one more realistic-
-scale throttled live run (matching the original failing conditions:
-`RECORD_COUNT_TOTAL=1000000 OPERATION_COUNT_PER_CLIENT=500000`) before
-committing to the full matrix, to confirm the fix holds under real
-cross-host network conditions and not just the in-process fuzz harness.
+## 6f. Second, distinct intermittent stall — found via `[ORDER_GAP_DIAG]` in a
+     real RF=2/ACK=2 campaign cell, not yet root-caused (2026-07-23)
+
+RF2/ACK2 validation before the full campaign turned up a second stall,
+confirmed genuinely different from Sec 6e's export-gap bug via the new
+`[ORDER_GAP_DIAG]` diagnostic (which fired for the first time against a real
+recurrence): `EMBARCADERO_A_n1` trial=1 attempt=1 of the first real campaign
+run (commit `641f72c9`, RF=2/ACK=2, 1M records) wedged with
+`next_expected_order=1019143 missing=3 first_present_order=1019146
+highest_buffered_order=1019168` — climbing to 26 buffered slots (23 present)
+over a 13-minute stall before the 900s cell timeout killed it. Exactly three
+positions (1019143-1019145), mid-stream (not the stream's tail), permanently
+missing while 23+ later messages kept arriving and buffering behind them the
+whole time.
+
+**Confirmed distinct from Sec 6e's bug**: zero `BATCH_META_FLAG_EXPORT_GAP`
+mentions anywhere in the client or broker logs for this run — the broker
+never flagged (or apparently ever detected) anything wrong. Sec 6e's fix
+re-anchors on a broker-reported gap; this gap was never reported, so there
+was nothing for that fix to act on. Also not the "last message of the
+stream" scenario considered and set aside earlier (Sec 6e discussion of
+RF=2 attempts) — data continued arriving for many messages after the gap,
+ruling out an end-of-stream/no-later-data-to-compare-against explanation.
+
+**Working hypothesis, not yet verified**: ORDER=5's per-epoch commit
+(`Topic::CommitEpoch`, `topic.cc`) reserves total_order space via
+`global_seq_.fetch_add(total_msg, ...)` where `total_msg` is summed from the
+epoch's `ready` batch list's `num_msg` fields. If any per-batch step inside
+the same commit (the loop assigning `p.hdr->total_order`/`entry->total_order`
+per batch, ~topic.cc:5212-5243) can skip or under-deliver a batch that was
+still counted in `total_msg`, the reserved total_order range would exceed
+what actually gets exported -- a small, fixed-size permanent hole matching
+exactly what was observed. Not confirmed; `spatial_guard_reject` (the one
+known reason a `ready` entry can vanish) requires session fencing, which
+did not occur in this run, so if this hypothesis is right the actual skip
+condition is still unidentified.
+
+**Disposition per explicit user direction**: not blocking the campaign.
+Mitigated by the matrix script's existing retry-on-failure (up to
+`TRIAL_MAX_ATTEMPTS=3`); documented here as a known open issue rather than
+investigated further right now. The `[ORDER_GAP_DIAG]` capture above is
+strong, precise evidence for whoever picks this up next -- in particular,
+the exact `missing=3` count and the mid-epoch positions are a much better
+starting point than the vaguer "some connection lagged" framing this
+investigation started with.
+
+Gate step 5 (full matrix) is unblocked: the Sec 6e fix is committed,
+unit-tested (`unit_order5_subscriber_reorder`, 5/5 passing including the two
+gap regression tests), and synced/rebuilt on c4; the chain-replication
+disk-sink `O_TRUNC` hygiene fix (commit `cfb6ace9`) is also landed. The
+full preregistered campaign (commit `641f72c9`) is running with retry
+mitigation for the Sec 6f issue.
 
 ## 7. `benchmarks/README.md` correction (deferred until Section 6 tests land)
 
