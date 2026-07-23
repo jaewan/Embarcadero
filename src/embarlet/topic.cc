@@ -5138,8 +5138,21 @@ void Topic::CommitEpoch(
 
 	// [[NAMING]] total_order = message-level sequence (subscribers); GOI index = slot in GOI array (design §2.4).
 	// One atomic per epoch (§3.2): reserve message-order range for this epoch.
+	// [[TOTAL_ORDER_SKIP_GAP_FIX]] Must exclude skipped/held entries exactly like the GOI-count
+	// loop below (num_goi_order5) and the per-batch assignment loop that advances next_order --
+	// otherwise a batch aged out of the hold buffer (skipped=true, e.g. stale-epoch drop at
+	// kMaxEpochAge) still has its num_msg counted here, reserving total_order space via
+	// global_seq_.fetch_add that the assignment loop then correctly never fills (it skips the
+	// same entry). That mismatch permanently strands exactly that batch's message count as a
+	// gap no future epoch can ever close, wedging every subscriber's strict total-order
+	// consumption forever (see docs/experiments/YCSB_DISTRIBUTED_KV_PLAN.md Sec 6f). A
+	// held-but-not-yet-ready entry (is_held_marker) must also be excluded: its real num_msg is
+	// counted later, when it is actually delivered via the p.from_hold branch in a future epoch.
 	size_t total_msg = 0;
-	for (const PendingBatch5& p : ready) total_msg += p.num_msg;
+	for (const PendingBatch5& p : ready) {
+		if (p.skipped || p.is_held_marker) continue;
+		total_msg += p.num_msg;
+	}
 	size_t base_order = global_seq_.fetch_add(total_msg, std::memory_order_relaxed);  // total_order space
 
 	// [PHASE-2D] Fast-path: ready vector is already sorted by broker+slot before calling CommitEpoch
