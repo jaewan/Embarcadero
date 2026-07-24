@@ -4709,6 +4709,9 @@ void Topic::EpochDriverThread() {
 	const auto epoch_duration = std::chrono::microseconds(epoch_us);
 	auto next_seal_deadline = std::chrono::steady_clock::now() + epoch_duration;
 	uint64_t epoch_count = 0;
+	uint64_t cadence_epochs = 0;
+	uint64_t cadence_force_epochs = 0;
+	auto last_cadence_diag = std::chrono::steady_clock::now();
 	const bool order5_phase_diag = (order_ == 5 && ShouldEnableOrder5PhaseDiag());
 	auto last_driver_diag = std::chrono::steady_clock::now();
 	while (!stop_threads_) {
@@ -4724,6 +4727,24 @@ void Topic::EpochDriverThread() {
 				CXL::cpu_pause();
 			}
 			continue;
+		}
+		++cadence_epochs;
+		if (disconnect_drain_active) {
+			++cadence_force_epochs;
+		}
+		if (ShouldEnableFrontierTrace()) {
+			const auto cadence_now = std::chrono::steady_clock::now();
+			if (cadence_now - last_cadence_diag >= std::chrono::seconds(1)) {
+				LOG(INFO) << "[FRONTIER_TRACE_EPOCH_CADENCE]"
+				          << " configured_epoch_us=" << epoch_us
+				          << " epochs=" << cadence_epochs
+				          << " force_epochs=" << cadence_force_epochs
+				          << " force_deadline_ns="
+				          << force_expire_hold_until_ns_.load(std::memory_order_acquire);
+				cadence_epochs = 0;
+				cadence_force_epochs = 0;
+				last_cadence_diag = cadence_now;
+			}
 		}
 		if (disconnect_drain_active) {
 			RecordOrder5FlightEvent(

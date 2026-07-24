@@ -157,6 +157,19 @@ start_cluster() {
   local seq="$1" cluster_rf="$2"
   assert_broker_ports_free || return 1
   DRIVER_OWNS_CLUSTER=1
+  # Preserve the broker-side ordering trace before the next trial overwrites
+  # build/bin/broker_<id>.log. Without this, a valid client summary can conceal
+  # a different internal runtime mode and the variance is impossible to audit.
+  local broker_log_dir="$OUT_ROOT/${seq}_${mode}_trial${trial}_broker_logs"
+  mkdir -p "$broker_log_dir"
+  local broker_log_id
+  for ((broker_log_id = 0; broker_log_id < NUM_BROKERS; broker_log_id++)); do
+    if [[ -f "$BIN_DIR/broker_${broker_log_id}.log" ]]; then
+      cp "$BIN_DIR/broker_${broker_log_id}.log" \
+        "$broker_log_dir/broker_${broker_log_id}.log"
+    fi
+  done
+
   broker_local_cleanup
   kv_bench_unlink_kvbase_shm
   sleep 0.5
