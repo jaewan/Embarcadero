@@ -2032,8 +2032,16 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
             # Build the command that will execute on the remote (or local) shell.
             # We use export statements so every env var is properly set regardless
             # of the remote shell's inherited environment.
+            # [[MULTI-PUB]] When MULTIPUB_LATENCY_DIRS is set, give each concurrent
+            # publisher its own latency-output dir so their pub_latency_stats.csv do
+            # not clobber each other in a shared cwd. Inert (blank line) when unset.
+            _publat_export=""
+            if [[ -n "${MULTIPUB_LATENCY_DIRS:-}" ]]; then
+                _publat_export="mkdir -p ${MULTIPUB_LATENCY_DIRS}/pub_${i} 2>/dev/null; export EMBARCADERO_LATENCY_OUT_DIR=${MULTIPUB_LATENCY_DIRS}/pub_${i}"
+            fi
             EXEC_CMD="$(cat <<ENDINNERSCRIPT
 set -e
+$_publat_export
 export EMBARCADERO_HEAD_ADDR=$BROKER_IP
 export NUM_BROKERS=$NUM_BROKERS
 export EMBARCADERO_CXL_SHM_NAME=$EMBARCADERO_CXL_SHM_NAME
