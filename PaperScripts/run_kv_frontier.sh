@@ -39,9 +39,15 @@ fi
 # them, then require a clean tracked tree so the manifest identifies their source.
 if [[ "$BUILD_BEFORE_RUN" == "1" ]]; then
   # --clean-first avoids timestamp-preserved checkouts making CMake accept an
-  # executable that predates the checked-out source commit.
+  # executable that predates the checked-out source commit. It cleans the WHOLE
+  # build tree, so every binary a run touches must be in --target or it is left
+  # deleted: the CORFU/SCALOG/LAZYLOG frontier points exec the global sequencers
+  # (benchmarks/kv_store/run_smr_fifo_eval.sh), so rebuild those too or those
+  # systems silently fall back to order=5 and stall (applied=0 -> timeout).
   cmake --build "$PROJECT_ROOT/build" --clean-first \
-    --target embarlet kv_ycsb_bench --parallel "$BUILD_JOBS"
+    --target embarlet kv_ycsb_bench \
+      corfu_global_sequencer scalog_global_sequencer lazylog_global_sequencer \
+    --parallel "$BUILD_JOBS"
 fi
 for binary in "$PROJECT_ROOT/build/bin/embarlet" "$PROJECT_ROOT/build/bin/kv_ycsb_bench"; do
   if [[ ! -x "$binary" ]]; then

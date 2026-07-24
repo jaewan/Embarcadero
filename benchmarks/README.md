@@ -62,7 +62,7 @@ Recent latency-harness finding:
 
 - A strict remote publication-mode failure on `throughput_test` was traced to an Embarcadero `ORDER=0` export bug, not to benchmark accounting. The broker could mislabel the actual message header format in `BatchMetadata`, which let bytes arrive while latency parsing lost framing.
 - That `ORDER=0` provenance bug is now fixed in Embarcadero and strict single-cell validation reaches `100%` parse coverage with zero parser fallback counters.
-- A separate Embarcadero `ORDER=5` remote issue still remains in the bounded strict matrix: only broker 0 delivers subscriber bytes while brokers 1-3 stay idle. That remaining failure is outside `kv_ycsb_bench` itself.
+- A separate Embarcadero `ORDER=5` subscriber-delivery issue (only broker 0 delivering while brokers 1-3 stayed idle) was root-caused and fixed: the subscriber had been sourcing from the fragile per-broker export-descriptor ring, which silently dropped committed batches; it now sources from the dense, single-writer global order index (GOI), which is authoritative. Single-client RF=1 co-located delivery is complete and Valid-audited (per-session FIFO, zero apply-order inversions) by the SMR-FIFO/KV correctness harness (`benchmarks/kv_store/run_smr_fifo_eval.sh`).
 
 Bottom line:
 

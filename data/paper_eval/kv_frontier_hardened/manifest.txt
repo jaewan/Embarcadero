@@ -1,0 +1,12 @@
+campaign=kv_frontier
+created_utc=2026-07-24T14:59:47Z
+git_commit=66e1fda002c5f624a0e84e773f5edfe3d70b6f39
+git_dirty=clean
+embarlet_sha256=44e8e2590c6751c021c473fa4c45d15857599d8a5dce33122255722e1a54d325
+kv_ycsb_bench_sha256=cb73586849589d341a481d6f19f420eb00ee27be41c16458103aa4d27282c731
+systems=EMBARCADERO CORFU SCALOG
+depths=1 4 16 64 256 0
+trials=3
+rf=1
+ack=1
+latency_tracking=1

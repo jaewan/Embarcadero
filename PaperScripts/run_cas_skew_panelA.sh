@@ -43,9 +43,14 @@ fi
 
 # Build the exact paper binaries, then require a clean tracked tree so the
 # manifest's commit identifies their source (stale binaries can outlive commits).
+# --clean-first cleans the WHOLE tree, so the CORFU/SCALOG sequencers this Panel
+# exercises must be in --target too, else they are deleted and those systems
+# stall (applied=0 -> timeout).
 if [[ "$BUILD_BEFORE_RUN" == "1" ]]; then
   cmake --build "$PROJECT_ROOT/build" --clean-first \
-    --target embarlet kv_ycsb_bench --parallel "$BUILD_JOBS"
+    --target embarlet kv_ycsb_bench \
+      corfu_global_sequencer scalog_global_sequencer lazylog_global_sequencer \
+    --parallel "$BUILD_JOBS"
 fi
 for binary in "$PROJECT_ROOT/build/bin/embarlet" "$PROJECT_ROOT/build/bin/kv_ycsb_bench"; do
   [[ -x "$binary" ]] || { echo "ERROR: missing executable: $binary" >&2; exit 2; }
