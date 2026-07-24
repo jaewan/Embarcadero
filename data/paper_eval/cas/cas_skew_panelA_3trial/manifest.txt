@@ -1,0 +1,11 @@
+commit=e9ca6a4c434995ec95215bd98fb936ed2b0a1def
+git_dirty=clean
+trials=3
+delays_ms=0 1 2 5 10
+systems=EMBARCADERO SCALOG CORFU
+ops=100000
+keys=5000
+skew_port=1217
+rf=1
+ack=1
+skew_tool=tc netem on lo dport 1217
