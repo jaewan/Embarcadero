@@ -306,7 +306,19 @@ class DistributedKVStore {
 		std::atomic<uint64_t> fifo_session_reorders_{0};
 		std::atomic<uint64_t> fifo_key_reorders_{0};
 
+		// CAS metadata-service audit (Q3 end-to-end): values "C|<key12>|<expected16>|<new16>|.."
+		// model an etcd/ZK compare-and-set chain. On apply the store checks the key's
+		// current version against `expected`; a match commits `new` (success), a mismatch
+		// is a rejected conditional write (an application-visible, unrepairable lost update
+		// — the signature of a per-session FIFO violation, since each client owns disjoint
+		// keys and issues a dependent version chain). Applied in log total order by the
+		// single logConsumer thread, so the map needs no lock; counters are atomic for reads.
+		absl::flat_hash_map<uint64_t, uint64_t> cas_key_version_;
+		std::atomic<uint64_t> cas_rejections_{0};
+		std::atomic<uint64_t> cas_success_{0};
+
 		void auditFifoValue(const std::string& value);
+		void auditCasValue(const std::string& value);
 
 		// Latency instrumentation (only active when track_latency_ == true)
 		absl::Mutex lat_mutex_;
@@ -438,6 +450,14 @@ class DistributedKVStore {
 		}
 		uint64_t fifoKeyReorders() const {
 			return fifo_key_reorders_.load(std::memory_order_acquire);
+		}
+		// CAS metadata-service counters: rejections>0 iff a client's compare-and-set
+		// chain observed an out-of-submission-order apply (per-session FIFO violation).
+		uint64_t casRejections() const {
+			return cas_rejections_.load(std::memory_order_acquire);
+		}
+		uint64_t casSuccess() const {
+			return cas_success_.load(std::memory_order_acquire);
 		}
 
 		bool opFinished(OPID opId){

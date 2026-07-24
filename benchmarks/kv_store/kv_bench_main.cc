@@ -141,6 +141,11 @@ struct BenchConfig {
 	// applied == published, and every key's final value is the LAST version this
 	// client submitted for it (session FIFO), verified byte-for-byte.
 	bool fifo_valid = false;
+	// CAS metadata-service variant of fifo_valid (Q3 end-to-end): each op is an
+	// etcd/ZK compare-and-set on the client's own version chain, so an out-of-order
+	// apply produces a rejected conditional write (application-visible, unrepairable)
+	// rather than a merely-audited reorder. Requires --fifo_valid.
+	bool cas = false;
 	std::string fifo_mode = "auto";   // native|token_order|batch_stop_and_wait|batch_binding_wait|stop_and_wait|sticky|none|auto
 
 	// Multi-process experiments (E4 replicas / E6 sessions):
@@ -161,6 +166,22 @@ std::string makeFifoValue(uint64_t key_id, uint64_t version, size_t len) {
 	char buf[40];
 	snprintf(buf, sizeof(buf), "F|%012lu|%016lu|",
 	         static_cast<unsigned long>(key_id), static_cast<unsigned long>(version));
+	std::string v(buf);
+	if (v.size() < len) v.append(len - v.size(), 'x');
+	return v;
+}
+
+// CAS value layout (fixed 49-byte prefix, padded to value_size):
+//   C|<key_id:12>|<expected_version:16>|<new_version:16>|xxxx...
+// `expected` is the client's previous version for this key (0 = key absent);
+// `new` is the fresh session-monotone version. The store commits only if the
+// key's current version equals `expected` (see DistributedKVStore::auditCasValue).
+std::string makeCasValue(uint64_t key_id, uint64_t expected, uint64_t new_ver, size_t len) {
+	char buf[56];
+	snprintf(buf, sizeof(buf), "C|%012lu|%016lu|%016lu|",
+	         static_cast<unsigned long>(key_id),
+	         static_cast<unsigned long>(expected),
+	         static_cast<unsigned long>(new_ver));
 	std::string v(buf);
 	if (v.size() < len) v.append(len - v.size(), 'x');
 	return v;
@@ -405,10 +426,16 @@ bool runBenchmark(BenchConfig& cfg) {
 			LOG(WARNING) << "fifo_valid forces batch_size=1 (was " << cfg.batch_size << ")";
 			cfg.batch_size = 1;
 		}
-		if (cfg.value_size < 32) {
-			LOG(WARNING) << "fifo_valid forces value_size=32 (was " << cfg.value_size << ")";
-			cfg.value_size = 32;
+		const size_t min_value = cfg.cas ? 49 : 32;  // CAS prefix is 49B, FIFO is 32B
+		if (cfg.value_size < min_value) {
+			LOG(WARNING) << "fifo_valid" << (cfg.cas ? "+cas" : "")
+			             << " forces value_size=" << min_value
+			             << " (was " << cfg.value_size << ")";
+			cfg.value_size = min_value;
 		}
+	} else if (cfg.cas) {
+		LOG(ERROR) << "--cas requires --fifo_valid";
+		return false;
 	}
 	if (cfg.key_offset > 0 && !cfg.fifo_valid) {
 		// A/B/C/F and manual write_ratio mode add key_offset once at every
@@ -677,8 +704,14 @@ bool runBenchmark(BenchConfig& cfg) {
 		while (i < cfg.operation_count) {
 			uint64_t key_id = rng() % cfg.record_count;
 			const uint64_t global_key = cfg.key_offset + key_id;
+			// CAS: expected = this client's previous version for the key (0 if absent),
+			// captured BEFORE the counter advances; the store commits only if the key's
+			// current version still equals it.
+			const uint64_t cas_expected = fifo_last_version[key_id];
 			++fifo_version_counter;
-			std::string value = makeFifoValue(global_key, fifo_version_counter, cfg.value_size);
+			std::string value = cfg.cas
+				? makeCasValue(global_key, cas_expected, fifo_version_counter, cfg.value_size)
+				: makeFifoValue(global_key, fifo_version_counter, cfg.value_size);
 			if (cfg.latency) {
 				auto t0 = std::chrono::steady_clock::now();
 				pending_opid = store.put(makeKey(global_key), value);
@@ -930,8 +963,13 @@ bool runBenchmark(BenchConfig& cfg) {
 	// stale version behind and fails here even though applied == published.
 	uint64_t fifo_overwritten_keys = 0, fifo_final_mismatch = 0, fifo_untouched_mismatch = 0;
 	uint64_t fifo_session_reorders = 0, fifo_key_reorders = 0;
+	uint64_t cas_rejections = 0, cas_success = 0;
 	if (cfg.fifo_valid && !run_aborted) {
-		for (uint64_t k = 0; k < cfg.record_count; ++k) {
+		// CAS mode stores "C|" values whose logical state lives in the store's
+		// compare-and-set oracle (cas_rejections), not in a byte-comparable "F|"
+		// final value — so skip the overwrite final-value sweep for --cas and let
+		// cas_rejections be the correctness gate below.
+		for (uint64_t k = 0; !cfg.cas && k < cfg.record_count; ++k) {
 			const uint64_t gk = cfg.key_offset + k;
 			std::string got = store.getLocal(makeKey(gk));
 			if (fifo_last_version[k] != 0) {
@@ -975,11 +1013,21 @@ bool runBenchmark(BenchConfig& cfg) {
 		if (fifo_session_reorders > 0) fail_check("session_fifo_apply_order");
 		if (fifo_final_mismatch > 0) fail_check("session_fifo_final_value");
 		if (fifo_untouched_mismatch > 0) fail_check("untouched_key_value");
+		if (cfg.cas) {
+			// CAS oracle: a rejection is an application-visible conditional-write
+			// failure, which under disjoint per-client keyspaces occurs iff this
+			// client's chain was applied out of submission order.
+			cas_rejections = store.casRejections();
+			cas_success = store.casSuccess();
+			if (cas_rejections > 0) fail_check("cas_conditional_write_rejected");
+		}
 		LOG(INFO) << "FIFO validation: overwritten_keys=" << fifo_overwritten_keys
 		          << " final_mismatch=" << fifo_final_mismatch
 		          << " untouched_mismatch=" << fifo_untouched_mismatch
 		          << " session_reorders=" << fifo_session_reorders
-		          << " key_reorders=" << fifo_key_reorders;
+		          << " key_reorders=" << fifo_key_reorders
+		          << (cfg.cas ? (" cas_rejections=" + std::to_string(cas_rejections) +
+		                         " cas_success=" + std::to_string(cas_success)) : "");
 	} else if (cfg.fifo_valid) {
 		fail_check("run_aborted_before_validation");
 	}
@@ -1055,7 +1103,8 @@ bool runBenchmark(BenchConfig& cfg) {
 		    << "read_p50_us,read_p99_us,"
 		    << "pub_threads,num_brokers,fifo_valid,fifo_mode,overwritten_keys,"
 		    << "final_mismatch_keys,untouched_mismatch_keys,session_reorders,"
-		    << "key_reorders,failed_checks,key_offset,state_digest\n";
+		    << "key_reorders,failed_checks,key_offset,state_digest,"
+		    << "cas_rejections,cas_success\n";
 		csv << cfg.sequencer << "," << cfg.order << "," << cfg.ack << "," << cfg.rf
 		    << "," << cfg.record_count << "," << cfg.operation_count
 		    << "," << cfg.value_size
@@ -1096,6 +1145,8 @@ bool runBenchmark(BenchConfig& cfg) {
 		    << "," << (failed_checks.empty() ? "none" : failed_checks)
 		    << "," << cfg.key_offset
 		    << "," << std::hex << state_digest << std::dec
+		    << "," << cas_rejections
+		    << "," << cas_success
 		    << "\n";
 	}
 
@@ -1151,6 +1202,9 @@ int main(int argc, char* argv[]) {
 		 cxxopts::value<std::string>()->default_value("apply"))
 		("fifo_valid", "SMR-FIFO overwrite eval (paper Q3): pipelined single-session "
 		 "versioned overwrites + session-FIFO final-state validation")
+		("cas", "CAS metadata-service variant of --fifo_valid (Q3 end-to-end): each op is "
+		 "an etcd/ZK compare-and-set on the client's version chain; out-of-order apply "
+		 "yields rejected conditional writes (application-visible). Requires --fifo_valid.")
 		("fifo_mode", "FIFO mechanism label for CSV (auto|native|token_order|batch_stop_and_wait|batch_binding_wait|stop_and_wait|sticky|none)",
 		 cxxopts::value<std::string>()->default_value("auto"))
 		("manage_cluster", "Create topic / terminate cluster on exit (0 for all but one process in multi-process runs)",
@@ -1206,6 +1260,7 @@ int main(int argc, char* argv[]) {
 	cfg.sync_interval = result["sync_interval"].as<int>();
 	cfg.sync_barrier = result["sync_barrier"].as<std::string>();
 	cfg.fifo_valid = result.count("fifo_valid") > 0;
+	cfg.cas = result.count("cas") > 0;
 	cfg.fifo_mode = result["fifo_mode"].as<std::string>();
 	cfg.manage_cluster = result["manage_cluster"].as<int>() != 0;
 	cfg.shared_topic = result.count("shared_topic") > 0;

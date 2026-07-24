@@ -362,6 +362,9 @@ run_one() {
     [[ "$sessions" -gt 1 ]] && session_flags+=(--key_offset=$((s * SMR_FIFO_RECORD_COUNT)))
     # [[FRONTIER]] Capture publish->ACK latency percentiles for the latency axis.
     [[ "${SMR_FIFO_TRACK_LATENCY:-0}" == "1" ]] && session_flags+=(--latency)
+    # [[CAS]] etcd/ZK compare-and-set metadata-service oracle (Q3 end-to-end):
+    # out-of-order apply -> rejected conditional writes (application-visible).
+    [[ "${SMR_FIFO_CAS:-0}" == "1" ]] && session_flags+=(--cas)
     timeout "$_bench_to" "${bench_env[@]}" \
       "${EMBARLET_NUMA_ARR[@]}" "$BIN_DIR/kv_ycsb_bench" \
       --sequencer="$seq" \

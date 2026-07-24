@@ -296,6 +296,7 @@ void DistributedKVStore::processLogEntryFromRawBuffer(const void* data, size_t s
 				// false "session reorders" the moment more than one client runs.
 				if (fifo_audit_ && client_id == server_id_) {
 					auditFifoValue(value);
+					auditCasValue(value);
 				}
 
 				if (client_id == server_id_) {
@@ -570,6 +571,44 @@ void DistributedKVStore::auditFifoValue(const std::string& value) {
 		} else {
 			it->second = version;
 		}
+	}
+}
+
+// CAS metadata-service apply (Q3 end-to-end): values "C|<key:12>|<expected:16>|<new:16>|pad".
+// Models an etcd/ZK compare-and-set. On apply in log total order, the key's current
+// version must equal `expected`; a match commits `new` (the client's dependent chain
+// advances), a mismatch is a rejected conditional write — an application-visible,
+// unrepairable lost update. With disjoint per-client keyspaces, a rejection occurs iff
+// this client's own ops were applied out of submission order (per-session FIFO violation),
+// and it cascades: once a key's chain breaks, later ops for that key also fail.
+void DistributedKVStore::auditCasValue(const std::string& value) {
+	// Layout: C(0) |(1) key[2..13] |(14) expected[15..30] |(31) new[32..47] |(48)
+	if (value.size() < 49 || value[0] != 'C' || value[1] != '|' ||
+	    value[14] != '|' || value[31] != '|' || value[48] != '|') {
+		return;  // not a CAS value (e.g. load-phase template or an 'F|' fifo value)
+	}
+	uint64_t key_id = 0, expected = 0, new_ver = 0;
+	for (int i = 2; i < 14; ++i) {
+		char c = value[i];
+		if (c < '0' || c > '9') return;
+		key_id = key_id * 10 + static_cast<uint64_t>(c - '0');
+	}
+	for (int i = 15; i < 31; ++i) {
+		char c = value[i];
+		if (c < '0' || c > '9') return;
+		expected = expected * 10 + static_cast<uint64_t>(c - '0');
+	}
+	for (int i = 32; i < 48; ++i) {
+		char c = value[i];
+		if (c < '0' || c > '9') return;
+		new_ver = new_ver * 10 + static_cast<uint64_t>(c - '0');
+	}
+	uint64_t& current = cas_key_version_[key_id];  // default-constructs to 0 (key absent)
+	if (current == expected) {
+		current = new_ver;
+		cas_success_.fetch_add(1, std::memory_order_acq_rel);
+	} else {
+		cas_rejections_.fetch_add(1, std::memory_order_acq_rel);
 	}
 }
 
