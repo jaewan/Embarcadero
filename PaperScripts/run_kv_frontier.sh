@@ -38,7 +38,9 @@ fi
 # survive several source commits. Build the exact paper executables before hashing
 # them, then require a clean tracked tree so the manifest identifies their source.
 if [[ "$BUILD_BEFORE_RUN" == "1" ]]; then
-  cmake --build "$PROJECT_ROOT/build" \
+  # --clean-first avoids timestamp-preserved checkouts making CMake accept an
+  # executable that predates the checked-out source commit.
+  cmake --build "$PROJECT_ROOT/build" --clean-first \
     --target embarlet kv_ycsb_bench --parallel "$BUILD_JOBS"
 fi
 for binary in "$PROJECT_ROOT/build/bin/embarlet" "$PROJECT_ROOT/build/bin/kv_ycsb_bench"; do
