@@ -1854,7 +1854,14 @@ void Publisher::WritePublishLatencyResults() {
 	}
 	LOG(INFO) << "  Submit timestamps missing (submit metric sample drops): " << missing_submit_timestamps;
 
-	const std::string latency_filename = "pub_latency_stats.csv";
+	// [[MULTI-PUB]] EMBARCADERO_LATENCY_OUT_DIR lets N concurrent publishers on one
+	// host each write to a distinct directory, avoiding clobbering a shared-cwd file.
+	// Empty/unset preserves the historical cwd-relative behavior. The caller must
+	// ensure the directory exists.
+	const char* _lat_out_env = std::getenv("EMBARCADERO_LATENCY_OUT_DIR");
+	const std::string _lat_out_dir =
+		(_lat_out_env && *_lat_out_env) ? (std::string(_lat_out_env) + "/") : std::string();
+	const std::string latency_filename = _lat_out_dir + "pub_latency_stats.csv";
 	std::ofstream latency_file(latency_filename);
 	if (!latency_file.is_open()) {
 		LOG(ERROR) << "Failed to open file for writing: " << latency_filename;
@@ -1926,7 +1933,7 @@ void Publisher::WritePublishLatencyResults() {
 		latency_file.close();
 	}
 
-	const std::string cdf_filename = "pub_cdf_latency_us.csv";
+	const std::string cdf_filename = _lat_out_dir + "pub_cdf_latency_us.csv";
 	std::ofstream cdf_file(cdf_filename);
 	if (!cdf_file.is_open()) {
 		LOG(ERROR) << "Failed to open file for writing: " << cdf_filename;
