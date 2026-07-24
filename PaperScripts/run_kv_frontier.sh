@@ -20,7 +20,7 @@ cd "$PROJECT_ROOT"
 
 SYSTEMS="${SYSTEMS:-EMBARCADERO CORFU SCALOG}"
 DEPTHS="${DEPTHS:-1 4 16 64 256 0}"     # 0 = full pipeline (apply barrier)
-TRIALS="${TRIALS:-2}"
+TRIALS="${TRIALS:-3}"   # >=3 for a stable median; per-point trials are high-variance
 TS="$(date +%Y%m%dT%H%M%SZ)"
 FRONTIER_ROOT="${OUT_ROOT:-$PROJECT_ROOT/data/paper_eval/kv_frontier_${TS}}"
 mkdir -p "$FRONTIER_ROOT"
