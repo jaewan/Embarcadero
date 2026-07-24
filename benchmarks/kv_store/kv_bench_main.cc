@@ -490,7 +490,7 @@ bool runBenchmark(BenchConfig& cfg) {
 		     << "\nbroker_ip=" << cfg.broker_ip
 		     << "\nwarmup_ops=" << cfg.warmup_ops
 		     << "\nhostname=" << getHostname()
-		     << "\ngit_commit=" << execCmd("git rev-parse --short HEAD 2>/dev/null")
+		     << "\ngit_commit=" << execCmd("git rev-parse HEAD 2>/dev/null")
 		     << "\ngit_dirty=" << execCmd("git diff --quiet && echo clean || echo dirty")
 		     << "\n";
 	}
