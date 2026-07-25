@@ -60,7 +60,7 @@ for t in $(seq 1 "$TRIALS"); do
   done
   [ "$any" = "0" ] && echo "$SYS,$t,NOSUMMARY,,,,,,$fenced,$reopened,stall_or_broken" | tee -a "$OUT/results.csv"
   echo "   fence markers: SESSION_FENCED=$fenced reopen(epoch>=2 or committed_prefix)=$reopened"
-  grep -rhoE "committed_msg_hwm=[0-9]+|committed_batch_seq=[0-9]+|assigned_session_epoch=[0-9]+ committed_hwm=[0-9]+|resubmit[a-z ]*[0-9]+|replay[a-z ]*[0-9]+" "$cell"/*.log "$cell"/*broker*/*.log 2>/dev/null | sort | uniq -c | sed 's/^/   hwm/replay: /' | head -10
+  grep -rhoE "committed_msg_hwm=[0-9]+|committed_batch_seq=[0-9]+|assigned_session_epoch=[0-9]+ committed_hwm=[0-9]+|resubmit[a-z ]*[0-9]+|replay[a-z ]*[0-9]+" "$cell"/*.log "$cell"/*broker*/*.log 2>/dev/null | sort | uniq -c | sed 's/^/   marker /' | head -10
   pkill -KILL -x embarlet 2>/dev/null || true
   for f in /dev/shm/CXL_*; do [ -e "$f" ] && [ "$(stat -c '%U' "$f")" = "domin" ] && rm -f "$f"; done 2>/dev/null
   sleep 2
