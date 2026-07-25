@@ -1,0 +1,2 @@
+commit=32edcb2f867721f81cb7d2e3b604b18f22dbfb27 dirty=[ M PaperScripts/run_task2_fence_replay.sh]
+embarlet_sha256=002769abfce2d0de0c56fa27424f36d38ea459ca7a44bb30e05617f7c980484a

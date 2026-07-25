@@ -1,0 +1,9 @@
+utc_before=2026-07-25T23:50:01Z
+target_broker=0 target_port=1214 resolved_pid=2830178
+listeners_before=
+cmdline_before=/home/domin/Embarcadero/build/bin/embarlet --config /home/domin/Embarcadero/config/embarcadero.yaml --head --EMBARCADERO 
+   KILL broker 0 port 1214 pid=2830178 @ 23:50:01Z
+utc_after=2026-07-25T23:50:08Z
+pid_alive_after=0
+listeners_after=none
+kill_verified=1

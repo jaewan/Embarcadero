@@ -14,7 +14,9 @@ Summary: data/paper_eval/tr_tau_task1/campaign/tr_tau_summary.csv
   epoch-index advance; seals_during_gap = hold_duration/tau exactly (median 110 at tau=250
   for 27.5ms holds; 673 at tau=500 for 337ms holds; 700 at tau=1000 for 704ms holds).
   A held suffix is NEVER released between seals.
-- Isolation: both sessions keep committing throughout (control never permanently stalled).
+- Both sessions carry the injected striped traffic and see holds; this campaign
+  therefore does not provide a stall-free control session. Cross-session
+  isolation is measured by the separate targeted-gap experiment.
 
 ## Correction for the paper
 - P (scan-pass, observation) and tau (seal, release/commit) are DIFFERENT periods; Sec2:32
@@ -24,8 +26,9 @@ Summary: data/paper_eval/tr_tau_task1/campaign/tr_tau_summary.csv
   The "~30" counted the observation/poll rate, not release opportunities.
 
 ## Honest caveat (operating point)
-- Co-located, holds are large (27ms-700ms) and grow with tau because at larger tau the
+- In this co-located instrumentation campaign, holds are large (27ms-700ms) and grow with tau because at larger tau the
   seal rate drops, the striped hold buffer backs up, and commits slow (throughput-collapse,
   NOT the ~1.5ms network skew of the paper). This does not affect the load-bearing facts
   (tau tracks the knob; release is seal-gated; P<<tau); the T/tau~=3 for T=1.5ms is arithmetic
-  from the measured tau. A GB/s remote deployment would show ~ms holds with the SAME T/tau law.
+  from the measured tau. The campaign does not extrapolate a remote hold
+  distribution from these values.

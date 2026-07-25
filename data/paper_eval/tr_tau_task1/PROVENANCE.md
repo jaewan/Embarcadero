@@ -33,4 +33,5 @@
 Release of a held suffix is EPOCH-SEAL-gated (τ), not scanner-pass-gated (P). A newly
 arrived predecessor cannot release the held suffix before the next seal (fast-seal is
 disabled whenever total_hold_size_>0). Release opportunities over skew window T = T/τ ≈ 3
-at τ=500µs, NOT T/P ≈ 30. Empirical confirmation pending (instrumentation + τ-sweep).
+at τ=500µs, NOT T/P ≈ 30. The completed three-point τ-sweep confirms this
+seal-gated release rule; see `RESULTS.md` and `campaign/tr_tau_summary.csv`.

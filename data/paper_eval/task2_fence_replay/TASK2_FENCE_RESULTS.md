@@ -8,9 +8,10 @@ Harness: PaperScripts/run_task2_fence_replay.sh.
 valid=1, applied==published=1,510,000, session_reorders=0, key_reorders=0, final_mismatch_keys=0,
 failed_checks=none. Fence markers per trial: SESSION_FENCED fired (both sessions), sessions reopened
 (SESSION_OPEN_ACK with a new session_epoch / committed_prefix), client replayed, run COMPLETED.
-=> The explicit prefix-safe recovery (kill/gap -> hold -> SESSION_FENCED@committed-HWM -> reopen
+=> The explicit prefix-safe recovery (gap -> hold -> SESSION_FENCED@committed-HWM -> reopen
 under new epoch -> replay unacked suffix -> deliver -> apply) is demonstrated END-TO-END with the
-apply-order checker passing: zero inversions, zero missing committed ops, correct final state, both
-the fenced/reopened session AND the control session complete. Combined with the follower-kill result
+apply-order checker passing: zero inversions, zero missing committed ops, correct final state, and
+both sessions complete (the global gap knob delays every publisher, so BOTH sessions were fenced+reopened;
+this run has no unaffected control session — cross-session isolation is a separate experiment). Combined with the follower-kill result
 (contract survives broker failure via replica), Task 2's Q2xQ3 thesis is demonstrated across BOTH
 recovery modes.

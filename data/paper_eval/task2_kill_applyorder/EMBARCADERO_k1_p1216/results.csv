@@ -1,7 +1,7 @@
-system,trial,kill,valid,applied,published,session_reorders,key_reorders,final_mismatch,failed_checks,status
-EMBARCADERO,1,1,1,2010000,2010000,0,0,0,none,done
-EMBARCADERO,1,1,1,2010000,2010000,0,0,0,none,done
-EMBARCADERO,2,1,1,2010000,2010000,0,0,0,none,done
-EMBARCADERO,2,1,1,2010000,2010000,0,0,0,none,done
-EMBARCADERO,3,1,1,2010000,2010000,0,0,0,none,done
-EMBARCADERO,3,1,1,2010000,2010000,0,0,0,none,done
+system,trial,session,kill,kill_target,valid,applied,published,session_reorders,key_reorders,final_mismatch,failed_checks,status
+EMBARCADERO,1,0,1,broker2:port1216,1,2010000,2010000,0,0,0,none,done
+EMBARCADERO,1,1,1,broker2:port1216,1,2010000,2010000,0,0,0,none,done
+EMBARCADERO,2,0,1,broker2:port1216,1,2010000,2010000,0,0,0,none,done
+EMBARCADERO,2,1,1,broker2:port1216,1,2010000,2010000,0,0,0,none,done
+EMBARCADERO,3,0,1,broker2:port1216,1,2010000,2010000,0,0,0,none,done
+EMBARCADERO,3,1,1,broker2:port1216,1,2010000,2010000,0,0,0,none,done

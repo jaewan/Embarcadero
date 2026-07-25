@@ -1,0 +1,185 @@
+I20260726 08:49:56.068269 2833032 kv_bench_main.cc:1290] === Shared-Log KV Benchmark ===
+I20260726 08:49:56.068400 2833032 kv_bench_main.cc:1291] EMBARCADERO order=-1 ack=1 rf=2
+I20260726 08:49:56.068413 2833032 kv_bench_main.cc:1293] ops=10000000 batch=1 write_ratio=1 workload=manual key_dist=uniform zipf_theta=0.99 scan_len=100 sync_interval=0 sync_barrier=apply latency=0
+I20260726 08:49:56.080273 2833032 kv_bench_main.cc:533] Creating KV store: EMBARCADERO order=5 ack=1 rf=2 broker=127.0.0.1
+I20260726 08:49:56.593472 2833032 subscriber.cc:113] Subscriber: configured broker count=4 sub_connections_per_broker=1
+I20260726 08:49:56.593827 2833032 queue_buffer.cc:118] QueueBuffer: publisher batch linger enabled, linger_us=300 (size cap still fires first under load; seal timing is order/FIFO-neutral)
+I20260726 08:49:56.593886 2833032 publisher.cc:463] Publisher: Expecting 4 brokers (from NUM_BROKERS env)
+I20260726 08:49:56.593967 2833032 publisher.cc:2008] Publisher runtime mode=latency ack_drain_ms_success=0 ack_drain_ms_failure=3000 ack_timeout_sec=120 epoll_wait_writable_ms=1
+I20260726 08:49:56.593981 2833032 publisher.cc:2014] Publisher session lease_ns=8000000000 unacked_byte_cap_pre_pool=103079215104 ack_level=1 memory_emulated_ack2=0 unacked_retention=pool_pin
+I20260726 08:49:56.594671 2833032 common.cc:392] Hugepages: 6500 free × 2048 kB = 13000 MB free; need 4095 MB (OK)
+W20260726 08:49:56.594722 2833032 common.cc:461] mmap_large_buffer: MAP_HUGETLB unavailable, falling back to THP/madvise path for 4294967040 bytes
+I20260726 08:49:56.595227 2833086 subscriber.cc:1926] SubscribeToCluster: Added data broker 0
+I20260726 08:49:56.595264 2833086 subscriber.cc:1926] SubscribeToCluster: Added data broker 3
+I20260726 08:49:56.595274 2833086 subscriber.cc:1926] SubscribeToCluster: Added data broker 1
+I20260726 08:49:56.595284 2833086 subscriber.cc:1926] SubscribeToCluster: Added data broker 2
+I20260726 08:49:58.696415 2833032 queue_buffer.cc:203] QueueBuffer::AddBuffers region_slots=8190 slot_size=524416 pool_bytes=4294967040 hint_bytes=8589934592 max_pool_bytes=4294967296 queues=4 (pipeline_slots_per_queue=32)
+I20260726 08:49:58.696487 2833032 publisher.cc:2079] Publisher unacked_byte_cap=103079215104 pool_bytes=4294967040 unacked_retention=pool_pin
+I20260726 08:49:58.698763 2833101 publisher.cc:762] [SESSION_OPEN_ACK] broker_id=0 client_id=719406 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260726 08:49:58.738840 2833102 publisher.cc:762] [SESSION_OPEN_ACK] broker_id=1 client_id=719406 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260726 08:49:58.778861 2833103 publisher.cc:762] [SESSION_OPEN_ACK] broker_id=2 client_id=719406 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260726 08:49:58.819079 2833104 publisher.cc:762] [SESSION_OPEN_ACK] broker_id=3 client_id=719406 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260726 08:49:58.869231 2833032 subscriber.h:340] Waiting for connections (brokers=4, sub_connections=1, data_brokers=pending)
+I20260726 08:49:58.869302 2833032 subscriber.h:368] Expected connections updated: 4 (data_brokers=4)
+I20260726 08:49:58.869313 2833032 subscriber.h:392] Connection wait complete: 4 connections
+I20260726 08:49:58.869483 2833032 kv_bench_main.cc:569] Loading 5000 records (pipelined, sync_every=64)...
+I20260726 08:49:58.890558 2833032 kv_bench_main.cc:596] Load: 5000 records in 0.02s  (237397 ops/s)  store_size=5000
+I20260726 08:49:58.890605 2833032 kv_bench_main.cc:605] Warmup: 5000 ops...
+I20260726 08:49:58.893498 2833032 kv_bench_main.cc:635] Run: 10000000 ops, write_ratio=1, batch=1, workload=manual, key_dist=uniform, sync_interval=0
+E20260726 08:50:02.796330 2833101 publisher.cc:4205] Failed to send batch header: Connection timed out
+E20260726 08:50:02.796795 2833101 publisher.cc:4242] Exception sending batch header: send failed
+W20260726 08:50:02.796819 2833101 publisher.h:334] Failure/Event @ 6202 ms: Header Send Fail Broker 0 (send failed)
+I20260726 08:50:02.797302 2833101 publisher.cc:762] [SESSION_OPEN_ACK] broker_id=1 client_id=719406 assigned_session_epoch=1 committed_hwm=9328 has_committed_prefix=1 status=0
+W20260726 08:50:02.797425 2833101 publisher.h:334] Failure/Event @ 6203 ms: Reconnect Success Broker 1 (from 0)
+W20260726 08:50:07.313571 2833094 subscriber.cc:1818] ReceiveWorkerThread fd=11 received 0 bytes (connection closed)
+W20260726 08:50:07.314005 2833086 subscriber.cc:1994] Cluster status stream failed: (14) recvmsg:Connection reset by peer. Retrying after delay...
+E20260726 08:50:07.314051 2833099 publisher.cc:4628] SubscribeToCluster stream ended: recvmsg:Connection reset by peer. Re-establishing.
+I20260726 08:50:07.314086 2833088 publisher.cc:762] [SESSION_OPEN_ACK] broker_id=3 client_id=719406 assigned_session_epoch=1 committed_hwm=9328 has_committed_prefix=1 status=0
+I20260726 08:50:07.314528 2833088 publisher.cc:762] [SESSION_OPEN_ACK] broker_id=1 client_id=719406 assigned_session_epoch=1 committed_hwm=9328 has_committed_prefix=1 status=0
+I20260726 08:50:07.315181 2833088 publisher.cc:762] [SESSION_OPEN_ACK] broker_id=2 client_id=719406 assigned_session_epoch=1 committed_hwm=9328 has_committed_prefix=1 status=0
+E20260726 08:50:07.814956 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:08.315234 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:08.815506 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:09.314811 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:09.315721 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:09.815955 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:10.316183 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:10.816409 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:11.315133 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:11.316655 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:11.816887 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:12.317116 2833099 publisher.cc:4614] SubscribeToCluster: reader->Read() returned false. Failure count: 11. Re-establishing gRPC reader.
+E20260726 08:50:12.317179 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:12.817370 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:13.315474 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:13.317615 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:13.817874 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:14.318100 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:14.818338 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:15.315796 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:15.318615 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:15.818872 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:16.319104 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:16.819392 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:17.316121 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+W20260726 08:50:17.319715 2833099 publisher.cc:4614] SubscribeToCluster: reader->Read() returned false. Failure count: 21. Re-establishing gRPC reader.
+E20260726 08:50:17.319803 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:17.820062 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:18.320353 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:18.820684 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:19.316444 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:19.320999 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:19.821316 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:20.321647 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:20.821933 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:21.316783 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:21.322198 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:21.822444 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:22.322697 2833099 publisher.cc:4614] SubscribeToCluster: reader->Read() returned false. Failure count: 31. Re-establishing gRPC reader.
+E20260726 08:50:22.322768 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:22.822978 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:23.317104 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:23.323195 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:23.823426 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:24.323688 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:24.823937 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:25.317425 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:25.324194 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:25.824482 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:26.324759 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:26.824990 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:27.317773 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+W20260726 08:50:27.325233 2833099 publisher.cc:4614] SubscribeToCluster: reader->Read() returned false. Failure count: 41. Re-establishing gRPC reader.
+E20260726 08:50:27.325307 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:27.825510 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:28.325773 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:28.826035 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:29.318104 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:29.326254 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:29.826483 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:30.326736 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:30.826987 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:31.318424 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:31.327243 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:31.827499 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:32.327739 2833099 publisher.cc:4614] SubscribeToCluster: reader->Read() returned false. Failure count: 51. Re-establishing gRPC reader.
+E20260726 08:50:32.327790 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:32.828008 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:33.318765 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:33.328329 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:33.828730 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:34.329295 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:34.829620 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:35.319087 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:35.329911 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:35.830231 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:36.330545 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:36.830866 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:37.319423 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+W20260726 08:50:37.331135 2833099 publisher.cc:4614] SubscribeToCluster: reader->Read() returned false. Failure count: 61. Re-establishing gRPC reader.
+E20260726 08:50:37.331179 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:37.831394 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:38.331707 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:38.831955 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:39.319813 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:39.332231 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:39.832495 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:40.332742 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:40.832971 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:41.320144 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:41.333225 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:41.833463 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:42.333722 2833099 publisher.cc:4614] SubscribeToCluster: reader->Read() returned false. Failure count: 71. Re-establishing gRPC reader.
+E20260726 08:50:42.333801 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:42.834015 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:43.320463 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:43.334261 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:43.834563 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:44.334862 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:44.835196 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:45.320823 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:45.335455 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:45.835704 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:46.335932 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:46.836170 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:47.321197 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+W20260726 08:50:47.336407 2833099 publisher.cc:4614] SubscribeToCluster: reader->Read() returned false. Failure count: 81. Re-establishing gRPC reader.
+E20260726 08:50:47.336477 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:47.836687 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:48.336939 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:48.837173 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:49.321539 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:49.337407 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:49.837726 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:50.337970 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:50.838225 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:51.321890 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:51.338461 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:51.838761 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:52.339025 2833099 publisher.cc:4614] SubscribeToCluster: reader->Read() returned false. Failure count: 91. Re-establishing gRPC reader.
+E20260726 08:50:52.339093 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:52.839291 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:53.322217 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:53.339540 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:53.839802 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:54.340044 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:54.840270 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+W20260726 08:50:55.322535 2833086 subscriber.cc:1994] Cluster status stream failed: (14) failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Retrying after delay...
+E20260726 08:50:55.340517 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+E20260726 08:50:55.840770 2833099 publisher.cc:4628] SubscribeToCluster stream ended: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:12140: Failed to connect to remote host: Connection refused. Re-establishing.
+*** Aborted at 1785023456 (unix time) try "date -d @1785023456" if you are using GNU date ***
+PC: @                0x0 (unknown)
+*** SIGTERM (@0x3ea002b3a86) received by PID 2833032 (TID 0x7f4870034480) from PID 2833030; stack trace: ***
+    @     0x7f486fe45330 (unknown)
+    @     0x7f486fe98d71 (unknown)
+    @     0x7f486fe9c116 pthread_cond_clockwait
+    @     0x55676d78f4e6 QueueBuffer::AcquireNextBatchFromPool()
+    @     0x55676d790e30 QueueBuffer::SealCurrentAndAdvance()
+    @     0x55676d7912ed QueueBuffer::Write()
+    @     0x55676d75f4b9 Publisher::Publish()
+    @     0x55676d754799 DistributedKVStore::put()
+    @     0x55676d71b6df (anonymous namespace)::runBenchmark()
+    @     0x55676d710801 main
+    @     0x7f486fe2a1ca (unknown)
+    @     0x7f486fe2a28b __libc_start_main
+    @     0x55676d716ff5 _start

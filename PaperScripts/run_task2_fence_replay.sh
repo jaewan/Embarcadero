@@ -8,7 +8,7 @@
 #
 # Audits (prompt Task-2 step 5):
 #   - apply-order inversions == 0, no missing committed ops (applied==published), final-state
-#     + digest correct, control session keeps committing  [from kv_ycsb_bench --fifo_valid]
+#     + digest correct for both deliberately delayed sessions [from kv_ycsb_bench --fifo_valid]
 #   - old-session committed HWM, reopen epoch, replayed suffix, fenced-suffix-not-committed
 #     [scraped from broker/client logs: SESSION_FENCED / SESSION_OPEN_ACK / resubmit markers]
 #
@@ -32,7 +32,7 @@ echo "embarlet_sha256=$(sha256sum build/bin/embarlet|awk '{print $1}')" >> "$OUT
 pkill -KILL -x embarlet 2>/dev/null || true
 for f in /dev/shm/CXL_*; do [ -e "$f" ] && [ "$(stat -c '%U' "$f")" = "domin" ] && rm -f "$f"; done 2>/dev/null
 
-echo "system,trial,valid,applied,published,session_reorders,key_reorders,final_mismatch,failed_checks,fenced,reopened,status" > "$OUT/results.csv"
+echo "system,trial,session,valid,applied,published,session_reorders,key_reorders,final_mismatch,failed_checks,fenced,reopened,status" > "$OUT/results.csv"
 
 for t in $(seq 1 "$TRIALS"); do
   cell="$OUT/trial${t}"; mkdir -p "$cell"; DRV="$cell/driver.log"
@@ -55,10 +55,11 @@ for t in $(seq 1 "$TRIALS"); do
   status="done"; any=0
   for f in "$cell"/${SYS}_*pipe*trial1_s*/summary.csv; do
     [ -e "$f" ] || continue; any=1
+    session=$(basename "$(dirname "$f")" | sed -n 's/.*_s\([0-9][0-9]*\)$/\1/p')
     row=$(awk -F, 'NR==1{for(i=1;i<=NF;i++)h[$i]=i} NR==2{printf "%s,%s,%s,%s,%s,%s,%s",$h["valid"],$h["applied_entries"],$h["published_entries"],$h["session_reorders"],$h["key_reorders"],$h["final_mismatch_keys"],$h["failed_checks"]}' "$f")
-    echo "$SYS,$t,$row,$fenced,$reopened,$status" | tee -a "$OUT/results.csv"
+    echo "$SYS,$t,${session:-unknown},$row,$fenced,$reopened,$status" | tee -a "$OUT/results.csv"
   done
-  [ "$any" = "0" ] && echo "$SYS,$t,NOSUMMARY,,,,,,$fenced,$reopened,stall_or_broken" | tee -a "$OUT/results.csv"
+  [ "$any" = "0" ] && echo "$SYS,$t,none,NOSUMMARY,,,,,,$fenced,$reopened,stall_or_broken" | tee -a "$OUT/results.csv"
   echo "   fence markers: SESSION_FENCED=$fenced reopen(epoch>=2 or committed_prefix)=$reopened"
   grep -rhoE "committed_msg_hwm=[0-9]+|committed_batch_seq=[0-9]+|assigned_session_epoch=[0-9]+ committed_hwm=[0-9]+|resubmit[a-z ]*[0-9]+|replay[a-z ]*[0-9]+" "$cell"/*.log "$cell"/*broker*/*.log 2>/dev/null | sort | uniq -c | sed 's/^/   marker /' | head -10
   pkill -KILL -x embarlet 2>/dev/null || true
