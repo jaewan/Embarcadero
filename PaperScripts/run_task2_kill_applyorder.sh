@@ -23,7 +23,7 @@ OPS="${OPS:-2000000}"
 KEYS="${KEYS:-5000}"
 RF="${RF:-2}"; ACK="${ACK:-1}"
 SESSIONS="${SESSIONS:-2}"
-OUT="$ROOT/data/paper_eval/task2_kill_applyorder/${SYS}_k${KILL}"; rm -rf "$OUT"; mkdir -p "$OUT"
+OUT="$ROOT/data/paper_eval/task2_kill_applyorder/${SYS}_k${KILL}_p${KILL_PORT}"; rm -rf "$OUT"; mkdir -p "$OUT"
 echo "commit=$(git rev-parse HEAD) dirty=[$(git status --porcelain --untracked-files=no|head -1)]" > "$OUT/provenance.txt"
 echo "embarlet_sha256=$(sha256sum build/bin/embarlet|awk '{print $1}')" >> "$OUT/provenance.txt"
 
