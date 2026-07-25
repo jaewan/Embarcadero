@@ -49,3 +49,20 @@ reproduces the ordering-only ceiling closely (c1 NIC still the pair bottleneck; 
 2nd host would close the residual). Both headline throughputs (RF2 6.72, RF0 10.66) reproduce
 within topology/drift variance with ZERO stale-PBR rejects -> the correctness fix is
 throughput-faithful.
+
+## ORDER=0 RF=0 reference (c4+c1) — O5 vs O0 at N=2
+ORDER=0 end-to-end: 10.49/10.26/10.17 GB/s (median 10.26). O5 RF=0 was 10.66 (median).
+=> O5 and O0 OVERLAP at N=2 (O5 even marginally higher, within noise) -> CONFIRMS the paper's
+claim that the ordering path is not the binding resource in this remote regime (NIC/CXL is).
+
+## LATENCY row (append->ACK) — RF=2/ACK2 DRAM, 1 remote pub (c4), 1KB, 100 MB/s, tau=500us
+NUM_TRIALS=3, commit f65102ed, stale_pbr==0, order_pass=1 every trial (ordering preserved through delivery).
+append->ACK (submit->ack, the paper metric):
+- P50 (us): 234 / 232 / 238   (median 234; paper 245)
+- P99 (us): 580 / 561 / 521   (median 561; paper 529)
+=> REPRODUCES the paper's matched latency row (245/529) within trial variance on the PBR-lock build.
+Did NOT stall (the documented "not-yet-clean RF2 tail" did not manifest in this co-located mem-copy
+config; delivered 2097152/2097152 every trial). Note: the separate Publish->Deliver (end-to-end
+delivery incl. subscriber consume) tail is large (p99 ~0.4-1.05s) — that's the delivery path, not the
+append->ACK latency the paper reports.
+Raw: data/publication/latency/order5_pbrlock_lat_rf2_100mbps/embarcadero_order5_rf2/run_lat_rf2_100_3trial/
