@@ -1,0 +1,4 @@
+tau_us,trials,tau_meas_p50_med,P_insp_us_p50_med,n_gaps_total,hold_us_p50_med,seals_in_gap_p50_med,seals_in_gap_p50_min,seals_in_gap_p50_max,insp_in_gap_p50_med,T1p5ms_seals_pred
+250,3,250.0,nan,12211,27506,110.0,110.0,117.0,49152,6.0
+500,3,500.0,nan,11404,337501,673.0,667.5,676.0,540672,3.0
+1000,3,1000.0,nan,11939,703995,700.0,690.0,712.0,1116160,1.5
