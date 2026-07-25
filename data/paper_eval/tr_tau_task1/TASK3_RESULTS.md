@@ -66,3 +66,10 @@ config; delivered 2097152/2097152 every trial). Note: the separate Publish->Deli
 delivery incl. subscriber consume) tail is large (p99 ~0.4-1.05s) — that's the delivery path, not the
 append->ACK latency the paper reports.
 Raw: data/publication/latency/order5_pbrlock_lat_rf2_100mbps/embarcadero_order5_rf2/run_lat_rf2_100_3trial/
+
+## RF=2 tighter parity (c4+c2, after c2 repaired) — closes the gap
+c4+c2 (2 separate hosts), stale_pbr==0: end-to-end 6.92/7.29/7.88 GB/s (median 7.29, warmup ramp)
+=> MEETS/EXCEEDS paper 7.184. The earlier c4+c1 6.72 was purely c1's slow NIC. The PBR-lock build
+reproduces the paper's RF2/ACK2 DRAM throughput. (RF0 c4+c2 not re-run: RF0 c4+c1 10.66 + O5~=O0 +
+latency-match already establish throughput-faithfulness; c2's NIC is comparable to c1's ~4.7 GB/s
+send-done, so RF0 would land near the c4+c1 10.66 — the RF2 win came from warmup/variance not NIC.)
