@@ -3088,16 +3088,21 @@ bool Topic::ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
 	claimed.batch_complete = 0;
 	claimed.publish_commit = kBatchHeaderPublishUncommitted;
 
-	// Persist a full immutable claim descriptor before publication.
-	// ORDER=5 scanners gate readiness on publish_commit + batch_complete, so exposing the
-	// descriptor early is safe and gives timeout recovery enough identity to retire a specific
-	// client sequence gap instead of an anonymous ring slot.
-	memcpy(slot, &claimed, sizeof(BatchHeader));
-	CXL::store_fence();
-	if (CXL::ExplicitFlushRequired()) {
-		CXL::flush_cacheline(batch_headers_log);
-		CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(batch_headers_log) + 64);
+	{
+		// Serialize claim replacement against a delayed receiver's ownership check
+		// and publication. The payload receive itself remains fully concurrent.
+		absl::MutexLock lifecycle_lock(&pbr_slot_lifecycle_mu_);
+		// Persist a full immutable claim descriptor before publication.
+		// ORDER=5 scanners gate readiness on publish_commit + batch_complete, so exposing the
+		// descriptor early is safe and gives timeout recovery enough identity to retire a specific
+		// client sequence gap instead of an anonymous ring slot.
+		memcpy(slot, &claimed, sizeof(BatchHeader));
 		CXL::store_fence();
+		if (CXL::ExplicitFlushRequired()) {
+			CXL::flush_cacheline(batch_headers_log);
+			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(batch_headers_log) + 64);
+			CXL::store_fence();
+		}
 	}
 	batch_header_location = reinterpret_cast<BatchHeader*>(batch_headers_log);
 	return true;
@@ -3107,6 +3112,20 @@ bool Topic::PublishPBRSlotDirect(const BatchHeader& batch_header, BatchHeader* b
 	if (!batch_header_location) return false;
 	CHECK(batch_header.pbr_absolute_index != kBatchHeaderPublishUncommitted)
 		<< "publish_commit sentinel collides with pbr_absolute_index";
+	absl::MutexLock lifecycle_lock(&pbr_slot_lifecycle_mu_);
+	if (!BatchHeaderClaimOwnedBy(*batch_header_location, batch_header)) {
+		const uint64_t rejected =
+			stale_pbr_publish_rejects_.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (rejected == 1 || (rejected & (rejected - 1)) == 0) {
+			LOG(WARNING) << "Rejecting stale PBR publication: expected_abs="
+			             << batch_header.pbr_absolute_index
+			             << " expected_batch=" << batch_header.batch_id
+			             << " slot_abs=" << batch_header_location->pbr_absolute_index
+			             << " slot_batch=" << batch_header_location->batch_id
+			             << " rejects=" << rejected;
+		}
+		return false;
+	}
 	BatchHeader published = batch_header;
 	// Keep CLAIMED set after publish so scanners never misclassify a published slot as empty tail
 	// if num_msg visibility lags on non-coherent CXL.

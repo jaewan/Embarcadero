@@ -3,7 +3,6 @@
 
 #include "topic.h"
 #include "common/performance_utils.h"
-#include "common/env_flags.h"
 #include <chrono>
 #include <unordered_map>
 #include <glog/logging.h>
@@ -31,17 +30,16 @@ namespace Embarcadero {
  * Protocol:
  * 1. Failure detection: Scan ring for entries older than timeout with num_replicated < target
  * 2. Stability check: Require unchanged num_replicated across multiple scans before classifying stalled
- * 3. Policy:
- *    - default (safe): monitor-only, do not mutate replication token
- *    - optional (unsafe): increment num_replicated from k to k+1
- * 4. Membership notification: TODO (not implemented)
+ * 3. Policy: fail closed. Report the stall but never mutate num_replicated;
+ *    timeout is not evidence that a payload reached durable media.
+ * 4. Membership notification/re-replication: TODO (not implemented). A future
+ *    reconfiguration may advance the token only after a replacement replica
+ *    supplies a fresh durable-completion proof.
  */
 void Topic::GOIRecoveryThread() {
 	LOG(INFO) << "GOIRecoveryThread started for topic " << topic_name_;
 
-	// Recovery is meaningful only for a multi-replica chain. For rf<=1 there is
-	// no next replica to unblock; force-incrementing num_replicated in that mode
-	// can acknowledge batches that were never replicated.
+	// Recovery monitoring is meaningful only for a multi-replica chain.
 	if (replication_factor_ <= 1) {
 		LOG(INFO) << "GOIRecoveryThread disabled for topic " << topic_name_
 		          << " (replication_factor=" << replication_factor_ << ")";
@@ -55,20 +53,13 @@ void Topic::GOIRecoveryThread() {
 	// Recovery statistics
 	uint64_t total_scans = 0;
 	uint64_t total_stalls = 0;
-	uint64_t total_recoveries = 0;
 	uint64_t last_stats_log_time_ns = 0;
 	struct StallState {
 		uint32_t last_replicated{0};
 		uint64_t first_stalled_ns{0};
+		bool reported{false};
 	};
 	std::unordered_map<uint64_t, StallState> stall_state;
-
-	const bool unsafe_recovery_enabled =
-		ReadEnvBoolLenient("EMBARCADERO_ENABLE_UNSAFE_CHAIN_RECOVERY", false);
-	if (unsafe_recovery_enabled) {
-		LOG(WARNING) << "GOIRecoveryThread: UNSAFE recovery enabled. "
-		             << "This may acknowledge batches without full proven durability.";
-	}
 
 	while (!stop_threads_) {
 		auto scan_start = std::chrono::steady_clock::now();
@@ -114,12 +105,12 @@ void Topic::GOIRecoveryThread() {
 			uint32_t current_replicated = goi_entry->num_replicated.load(std::memory_order_acquire);
 
 			// Check if replication is stuck
-			bool recovered_this_scan = false;
 			if (current_replicated < static_cast<uint32_t>(replication_factor_)) {
 				StallState& st = stall_state[goi_idx];
 				if (st.first_stalled_ns == 0 || st.last_replicated != current_replicated) {
 					st.last_replicated = current_replicated;
 					st.first_stalled_ns = now_ns;
+					st.reported = false;
 					continue;
 				}
 				const uint64_t stalled_ns = now_ns - st.first_stalled_ns;
@@ -127,26 +118,19 @@ void Topic::GOIRecoveryThread() {
 					continue;
 				}
 
-				total_stalls++;
-
-				if (unsafe_recovery_enabled) {
-					uint32_t new_value = current_replicated + 1;
-					goi_entry->num_replicated.store(new_value, std::memory_order_release);
-					CXL::flush_cacheline(goi_entry);
-					CXL::store_fence();
-					total_recoveries++;
-					stall_state.erase(goi_idx);
-					recovered_this_scan = true;
-
-					LOG(WARNING) << "GOI[" << goi_idx << "] UNSAFE recovered: num_replicated "
-					             << current_replicated << " -> " << new_value;
+				if (!st.reported) {
+					st.reported = true;
+					total_stalls++;
+					LOG(ERROR) << "GOI[" << goi_idx << "] replication stalled at "
+					           << current_replicated << "/" << replication_factor_
+					           << "; refusing to advance durability without a durable proof";
 				}
 			} else {
 				stall_state.erase(goi_idx);
 			}
 
-			// Clear completed entries (and unsafe-recovered entries) from scan ring.
-			if (current_replicated >= static_cast<uint32_t>(replication_factor_) || recovered_this_scan) {
+			// Only a genuine replica completion clears the scan entry.
+			if (current_replicated >= static_cast<uint32_t>(replication_factor_)) {
 				uint64_t expected = timestamp_ns;
 				goi_timestamps_[ring_pos].timestamp_ns.compare_exchange_strong(
 					expected, 0, std::memory_order_release, std::memory_order_relaxed);
@@ -158,8 +142,7 @@ void Topic::GOIRecoveryThread() {
 		// Log statistics every 10 seconds
 		if (now_ns - last_stats_log_time_ns > 10'000'000'000ULL) {
 			LOG(INFO) << "GOIRecoveryThread stats: " << total_scans << " scans, "
-			          << total_stalls << " stalls, "
-			          << total_recoveries << " recoveries since start";
+			          << total_stalls << " fail-closed stalls since start";
 			last_stats_log_time_ns = now_ns;
 		}
 
@@ -173,8 +156,7 @@ void Topic::GOIRecoveryThread() {
 
 	LOG(INFO) << "GOIRecoveryThread stopped for topic " << topic_name_
 	          << " (total_scans=" << total_scans
-	          << ", total_stalls=" << total_stalls
-	          << ", total_recoveries=" << total_recoveries << ")";
+	          << ", total_stalls=" << total_stalls << ")";
 }
 
 } // namespace Embarcadero

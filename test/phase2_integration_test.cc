@@ -318,14 +318,52 @@ TEST_F(Phase2Test, RingWraparoundCorrectness) {
     }
 }
 
-// Test 7: Committed-range bootstrap uses UINT64_MAX sentinel and advances on [0,n).
+// Test 7: A delayed receiver cannot publish after its physical slot is reused.
+TEST_F(Phase2Test, PBRClaimOwnershipFailsClosedAfterReuse) {
+    BatchHeader expected{};
+    expected.pbr_absolute_index = 7;
+    expected.batch_id = 0xA007;
+
+    BatchHeader slot = expected;
+    slot.flags = kBatchHeaderFlagClaimed;
+    slot.publish_commit = kBatchHeaderPublishUncommitted;
+    slot.batch_complete = 0;
+    EXPECT_TRUE(BatchHeaderClaimOwnedBy(slot, expected));
+
+    // Ring wrap installs a newer claim in the same physical slot.
+    slot.pbr_absolute_index = 7 + 128;
+    slot.batch_id = 0xA087;
+    EXPECT_FALSE(BatchHeaderClaimOwnedBy(slot, expected));
+
+    // Independently reject identity corruption and any terminal lifecycle state.
+    slot = expected;
+    slot.flags = kBatchHeaderFlagClaimed;
+    slot.publish_commit = kBatchHeaderPublishUncommitted;
+    slot.batch_complete = 0;
+    slot.batch_id++;
+    EXPECT_FALSE(BatchHeaderClaimOwnedBy(slot, expected));
+
+    slot = expected;
+    slot.flags = kBatchHeaderFlagClaimed | kBatchHeaderFlagValid;
+    slot.publish_commit = expected.pbr_absolute_index;
+    slot.batch_complete = 1;
+    EXPECT_FALSE(BatchHeaderClaimOwnedBy(slot, expected));
+
+    slot = expected;
+    slot.flags = kBatchHeaderFlagRetired;
+    slot.publish_commit = kBatchHeaderPublishUncommitted;
+    slot.batch_complete = 0;
+    EXPECT_FALSE(BatchHeaderClaimOwnedBy(slot, expected));
+}
+
+// Test 8: Committed-range bootstrap uses UINT64_MAX sentinel and advances on [0,n).
 TEST_F(Phase2Test, CommittedRangeBootstrapFromSentinel) {
     std::vector<TestRange> ranges{{0, 10}};
     uint64_t committed = ApplyRangesAndReturnCommitted(UINT64_MAX, ranges);
     EXPECT_EQ(committed, 9ULL);
 }
 
-// Test 8: Gap handling does not falsely advance committed prefix.
+// Test 9: Gap handling does not falsely advance committed prefix.
 TEST_F(Phase2Test, CommittedRangeGapNoFalseAdvance) {
     std::vector<TestRange> ranges{
         {5, 8},   // gap before first expected range
@@ -460,6 +498,9 @@ TEST_F(Phase2Test, EndToEndFlow) {
     std::atomic<uint64_t> global_batch_seq{0};
     std::atomic<uint64_t> broker_pbr_counter{0};
     std::atomic<bool> done{false};
+    for (int i = 0; i < NUM_BATCHES; ++i) {
+        goi_[i].global_seq = UINT64_MAX;
+    }
 
     // Stage 1: Sequencer writes to GOI
     std::thread sequencer([&]() {
@@ -468,13 +509,15 @@ TEST_F(Phase2Test, EndToEndFlow) {
             uint64_t pbr_absolute = broker_pbr_counter.fetch_add(1, std::memory_order_relaxed);
 
             GOIEntry* entry = &goi_[batch_idx];
-            entry->global_seq = batch_idx;
             entry->batch_id = (static_cast<uint64_t>(BROKER_ID) << 48) | i;
             entry->broker_id = BROKER_ID;
             entry->total_order = i * 100;
             entry->message_count = 100;
             entry->pbr_index = static_cast<uint32_t>(pbr_absolute);
             entry->num_replicated.store(0, std::memory_order_release);
+            // Publish identity last; otherwise the replica may observe
+            // global_seq before pbr_index and permanently skip the CV advance.
+            __atomic_store_n(&entry->global_seq, batch_idx, __ATOMIC_RELEASE);
 
             std::this_thread::sleep_for(std::chrono::microseconds(1));
         }
@@ -489,7 +532,7 @@ TEST_F(Phase2Test, EndToEndFlow) {
             uint64_t goi_index = next_goi_index.load(std::memory_order_relaxed);
             GOIEntry* entry = &goi_[goi_index];
 
-            if (entry->global_seq != goi_index) {
+            if (__atomic_load_n(&entry->global_seq, __ATOMIC_ACQUIRE) != goi_index) {
                 std::this_thread::yield();
                 continue;
             }

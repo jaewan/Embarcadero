@@ -1,8 +1,8 @@
 /**
  * Phase 3 Recovery Integration Tests
  *
- * Tests sequencer-driven recovery for stalled chain replication (§4.2.2):
- * 1. RecoveryDetectsStall - Verify recovery increments num_replicated after timeout
+ * Tests fail-closed monitoring for stalled chain replication (§4.2.2):
+ * 1. RecoveryDetectsStall - Verify timeout is reported without forging durability
  * 2. RecoveryUnderLoad - Verify 0% drops at high throughput
  * 3. RingWraparound - Verify correct behavior after >64K entries
  * 4. NoFalsePositives - Verify no spurious recoveries when replicas on time
@@ -15,6 +15,7 @@
 #include <vector>
 #include <chrono>
 #include <cstring>
+#include <unordered_set>
 #include "../src/cxl_manager/cxl_datastructure.h"
 #include "../src/common/performance_utils.h"
 
@@ -93,9 +94,9 @@ protected:
         CXL::store_fence();
     }
 
-    // Recovery thread implementation (simplified from goi_recovery_thread.cc)
+    // Fail-closed monitor (simplified from goi_recovery_thread.cc).
     void RecoveryThreadFunc(int replication_factor, uint64_t timeout_ns, uint64_t scan_interval_ns) {
-        uint64_t recovery_count = 0;
+        std::unordered_set<uint64_t> reported_stalls;
 
         while (!stop_recovery_.load(std::memory_order_acquire)) {
             auto scan_start = std::chrono::steady_clock::now();
@@ -128,26 +129,15 @@ protected:
                 CXL::load_fence();
                 uint32_t current_replicated = goi_entry->num_replicated.load(std::memory_order_acquire);
 
-                // Check if replication is stuck
+                // A timeout is not a durable-completion proof. Report each
+                // stalled GOI position once, but never advance its token.
                 if (current_replicated < static_cast<uint32_t>(replication_factor)) {
-                    // RECOVERY: Increment num_replicated to unblock chain
-                    uint32_t new_value = current_replicated + 1;
-                    goi_entry->num_replicated.store(new_value, std::memory_order_release);
-                    CXL::flush_cacheline(goi_entry);
-                    CXL::store_fence();
-
-                    recovery_count++;
-                    recoveries_detected_.fetch_add(1, std::memory_order_relaxed);
-
-                    // Only clear timestamp if fully recovered (reached replication_factor)
-                    if (new_value >= static_cast<uint32_t>(replication_factor)) {
-                        uint64_t expected = timestamp_ns;
-                        timestamp_ring_[ring_pos].timestamp_ns.compare_exchange_strong(
-                            expected, 0, std::memory_order_release, std::memory_order_relaxed);
+                    if (reported_stalls.insert(goi_idx).second) {
+                        stalls_detected_.fetch_add(1, std::memory_order_relaxed);
                     }
-                    // Otherwise keep timestamp so we detect stall again on next scan
                 } else {
                     // Replication completed normally - clear timestamp
+                    reported_stalls.erase(goi_idx);
                     uint64_t expected = timestamp_ns;
                     timestamp_ring_[ring_pos].timestamp_ns.compare_exchange_strong(
                         expected, 0, std::memory_order_release, std::memory_order_relaxed);
@@ -183,7 +173,7 @@ protected:
     GOITimestampEntry* timestamp_ring_{nullptr};
     std::atomic<uint64_t> write_pos_{0};
     std::atomic<bool> stop_recovery_{false};
-    std::atomic<uint64_t> recoveries_detected_{0};
+    std::atomic<uint64_t> stalls_detected_{0};
     std::thread recovery_thread_;
 };
 
@@ -206,16 +196,16 @@ TEST_F(Phase3RecoveryTest, RecoveryDetectsStall) {
     // Wait for timeout + scan interval + margin
     std::this_thread::sleep_for(std::chrono::milliseconds(12));
 
-    // Check that recovery incremented num_replicated
+    // Timeout must not manufacture a durability acknowledgment.
     GOIEntry* entry = &goi_[0];
     CXL::flush_cacheline(entry);
     CXL::load_fence();
     uint32_t final_replicated = entry->num_replicated.load(std::memory_order_acquire);
 
-    EXPECT_EQ(final_replicated, REPLICATION_FACTOR)
-        << "Recovery should have incremented num_replicated to " << REPLICATION_FACTOR;
-    EXPECT_EQ(recoveries_detected_.load(), 1)
-        << "Exactly 1 recovery should have been detected";
+    EXPECT_EQ(final_replicated, REPLICATION_FACTOR - 1)
+        << "Monitor must not advance num_replicated without durable proof";
+    EXPECT_EQ(stalls_detected_.load(), 1)
+        << "Exactly one stall should have been reported";
 }
 
 // Test 2: Recovery Under Load (No Drops)
@@ -249,9 +239,8 @@ TEST_F(Phase3RecoveryTest, RecoveryUnderLoad) {
     // Wait for recovery thread to scan all entries
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-    // Verify no recoveries (all replicas were on time)
-    EXPECT_EQ(recoveries_detected_.load(), 0)
-        << "No recoveries should occur when all replicas are on time";
+    EXPECT_EQ(stalls_detected_.load(), 0)
+        << "No stalls should be reported when all replicas are on time";
 
     // Verify write_pos advanced correctly
     uint64_t final_write_pos = write_pos_.load(std::memory_order_acquire);
@@ -289,9 +278,8 @@ TEST_F(Phase3RecoveryTest, RingWraparound) {
     // Wait for recovery to scan wrapped ring
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-    // Verify no recoveries (all completed on time)
-    EXPECT_EQ(recoveries_detected_.load(), 0)
-        << "Ring wraparound should not cause spurious recoveries";
+    EXPECT_EQ(stalls_detected_.load(), 0)
+        << "Ring wraparound should not cause spurious stalls";
 
     // Verify write_pos wrapped correctly
     uint64_t final_write_pos = write_pos_.load(std::memory_order_acquire);
@@ -324,8 +312,8 @@ TEST_F(Phase3RecoveryTest, NoFalsePositives) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     // Verify no spurious recoveries (allow small margin for timing variance)
-    EXPECT_LT(recoveries_detected_.load(), NUM_BATCHES / 100)
-        << "Less than 1% spurious recoveries acceptable for timing variance";
+    EXPECT_LT(stalls_detected_.load(), NUM_BATCHES / 100)
+        << "Less than 1% spurious stalls acceptable for timing variance";
 }
 
 // Test 5: Race-Free Clearing (CAS-based)
@@ -369,9 +357,9 @@ TEST_F(Phase3RecoveryTest, RaceFreeClearing) {
     EXPECT_GT(final_write_pos, kRingSize)
         << "Write position should exceed ring size (wraparound)";
 
-    // Verify no spurious recoveries due to race condition
+    // Verify no spurious stalls due to race condition
     // (CAS-based clearing prevents zeroing reused slots)
-    EXPECT_EQ(recoveries_detected_.load(), 0)
+    EXPECT_EQ(stalls_detected_.load(), 0)
         << "CAS-based clearing should prevent clearing reused slots";
 
     std::cout << "Final write position: " << final_write_pos
@@ -402,24 +390,22 @@ TEST_F(Phase3RecoveryTest, MultipleStalls) {
         }
     }
 
-    // Wait for recovery (need 2+ scans for num_replicated: 1→2→3)
-    // Timeout=10ms, scan=1ms, so wait 10ms + 2 scans + margin = 25ms
+    // Wait for timeout, scan, and scheduling margin.
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
 
-    // Verify recovery detected stalled batches
-    // Each stalled batch needs 2 recoveries (1→2, 2→3), so expect 5 batches × 2 = 10 recoveries
-    int expected_min_recoveries = NUM_BATCHES / 2;  // At least 5 (one per stalled batch)
-    EXPECT_GE(recoveries_detected_.load(), expected_min_recoveries)
-        << "Recovery should detect at least " << expected_min_recoveries << " stalled batches";
+    const int expected_stalls = NUM_BATCHES / 2;
+    EXPECT_EQ(stalls_detected_.load(), expected_stalls)
+        << "Monitor should report every stalled batch once";
 
-    // Verify all batches now have num_replicated == REPLICATION_FACTOR
+    // Completed batches reach RF; stalled batches remain at their proven frontier.
     for (int i = 0; i < NUM_BATCHES; i++) {
         GOIEntry* entry = &goi_[i];
         CXL::flush_cacheline(entry);
         CXL::load_fence();
         uint32_t replicated = entry->num_replicated.load(std::memory_order_acquire);
-        EXPECT_EQ(replicated, REPLICATION_FACTOR)
-            << "Batch " << i << " should have num_replicated=" << REPLICATION_FACTOR;
+        const uint32_t expected = (i % 2 == 0) ? REPLICATION_FACTOR : 1;
+        EXPECT_EQ(replicated, expected)
+            << "Batch " << i << " must retain only proven durable completions";
     }
 }
 

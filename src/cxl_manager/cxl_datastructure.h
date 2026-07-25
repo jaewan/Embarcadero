@@ -387,7 +387,7 @@ struct alignas(64) TInode{
  * Stage 3 (Sequencer):
  *   - Reads: publish_commit as readiness barrier; flags/num_msg remain sanity/liveness signals.
  *   - Writes: total_order, ordered=1, batch_off_to_export
- *   - Clears: publish_commit=UNCOMMITTED, batch_complete=0, flags=0 (prevents duplicate processing / ABA reuse)
+ *   - Clears: publish_commit=UNCOMMITTED, batch_complete=0, flags=0 (prevents duplicate processing)
  *   - MUST flush: cacheline containing ordered/batch_off_to_export (Stage-4 polls this)
  *   - MUST fence: CXL::store_fence() after flush
  * 
@@ -420,7 +420,12 @@ struct alignas(64) BatchHeader{
 	//    publish_commit=pbr_absolute_index and flushing the second cache line again.
 	// 2) Sequencer processes batch and clears publish_commit, batch_complete, and flags
 	//    (with flush+fence) before the slot can be safely reused.
-	// This prevents duplicate processing of ring slots under ABA reuse.
+	// 3) Before final publication, the receiver revalidates that the physical slot
+	//    still contains its (pbr_absolute_index, batch_id) claim. Claim installation
+	//    and validation/publication are serialized on the broker host. A delayed
+	//    receiver therefore fails closed after ring reuse instead of overwriting the
+	//    newer occupant. The scanner's absolute-index check is a second, read-side
+	//    stale-entry guard; it is not the writer-side ABA defense.
 	// Keep readiness-critical fields in the first cache line for CXL visibility
 	size_t batch_seq; // [[WRITER: NetworkManager]] Client seq in producer slots; ORDER=5 export seq in compact export descriptors
 	// Corfu token assignment rewrites batch_seq to broker-local sequence.  Keep
@@ -458,6 +463,20 @@ struct alignas(64) BatchHeader{
 inline bool BatchHeaderPublishCommitted(const BatchHeader& hdr) {
 	return hdr.publish_commit != kBatchHeaderPublishUncommitted &&
 	       hdr.publish_commit == hdr.pbr_absolute_index;
+}
+// A receiver may publish only while the physical slot still contains the
+// unpublished claim it installed at reservation time. This predicate is used
+// under Topic::pbr_slot_lifecycle_mu_; checking both absolute identity fields
+// also rejects accidental aliasing if either field is corrupted independently.
+inline bool BatchHeaderClaimOwnedBy(const BatchHeader& slot,
+		const BatchHeader& expected) {
+	constexpr uint32_t kExclusiveClaim =
+		kBatchHeaderFlagClaimed | kBatchHeaderFlagValid | kBatchHeaderFlagRetired;
+	return slot.pbr_absolute_index == expected.pbr_absolute_index &&
+	       slot.batch_id == expected.batch_id &&
+	       (slot.flags & kExclusiveClaim) == kBatchHeaderFlagClaimed &&
+	       slot.publish_commit == kBatchHeaderPublishUncommitted &&
+	       slot.batch_complete == 0;
 }
 static_assert(sizeof(BatchHeader) % 64 == 0, "BatchHeader must be cache-line sized");
 static_assert(sizeof(BatchHeader) == 128, "BatchHeader must be exactly 128 bytes (two cache lines); CompleteBatchInCXL flushes both");

@@ -535,6 +535,9 @@ class Topic {
 		uint64_t GetIngestDedupHits() const {
 			return ingest_dedup_hits_.load(std::memory_order_relaxed);
 		}
+		uint64_t GetStalePBRPublishRejects() const {
+			return stale_pbr_publish_rejects_.load(std::memory_order_relaxed);
+		}
 		/** True after a failed segment rollover until FreeSegment/GC restores capacity. */
 		bool IsBLogCapacityExhausted() const {
 			return blog_capacity_exhausted_.load(std::memory_order_acquire);
@@ -560,7 +563,8 @@ class Topic {
 		/**
 		 * @brief Publish a fully received batch into its reserved PBR slot.
 		 * Writes BatchHeader, marks batch_complete, and flushes both cachelines for CXL visibility.
-		 * @return true on success, false if inputs are invalid.
+		 * Fails closed if the ring has reused the physical slot since reservation.
+		 * @return true on success, false if inputs are invalid or ownership was lost.
 		 */
 		bool PublishPBRSlotAfterRecv(const BatchHeader& batch_header, BatchHeader* batch_header_location);
 		/** Request one-shot aggressive expiry of ORDER=5 hold buffer on next Level5 processing pass. */
@@ -834,6 +838,11 @@ class Topic {
 		// Synchronization
 		absl::Mutex mutex_;
 		absl::Mutex written_mutex_;
+		// Serializes physical-slot claim installation with ownership validation and
+		// final publication. It is held only for two cache-line metadata writes, not
+		// while receiving or flushing the payload.
+		absl::Mutex pbr_slot_lifecycle_mu_;
+		std::atomic<uint64_t> stale_pbr_publish_rejects_{0};
 
 		// Kafka specific
 		std::atomic<size_t> kafka_logical_offset_{0};
