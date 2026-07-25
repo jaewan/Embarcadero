@@ -55,9 +55,13 @@ for t in $(seq 1 "$TRIALS"); do
   if [ "$KILL" = "1" ] && [ -n "$clog" ]; then
     sleep "$KILL_DELAY"
     kb=$(( KILL_PORT - 1214 ))   # data port base 1214 -> broker index
+    # The head (broker 0) is the only process launched with --head; target it
+    # unambiguously (lsof on the shared port can return a client/other pid).
+    bpid=""
+    if [ "$kb" = "0" ]; then bpid=$(pgrep -f 'embarlet .*--head' | head -1); fi
     # Robust port->pid (ss -p often hides pid without privilege): try lsof, fuser,
     # then the broker's own log (embarlet logs "embarlet_<PID>_ready"), then ss.
-    bpid=$(lsof -ti "tcp:${KILL_PORT}" -sTCP:LISTEN 2>/dev/null | head -1)
+    [ -z "$bpid" ] && bpid=$(lsof -ti "tcp:${KILL_PORT}" -sTCP:LISTEN 2>/dev/null | head -1)
     [ -z "$bpid" ] && bpid=$(fuser -n tcp "$KILL_PORT" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1)
     [ -z "$bpid" ] && bpid=$(grep -oE 'embarlet_[0-9]+_ready' "$ROOT/build/bin/broker_${kb}.log" 2>/dev/null | grep -oE '[0-9]+' | head -1)
     [ -z "$bpid" ] && bpid=$(ss -tlnp 2>/dev/null | grep -E ":${KILL_PORT}\b" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
