@@ -377,6 +377,19 @@ int GetOrder5GapDelayMs() {
 	return static_cast<int>(parsed);
 }
 
+// 0 = one-shot gap; N>0 = re-inject the gap every N batches (repeated skew samples).
+uint64_t GetOrder5GapPeriodBatches() {
+	const char* env = std::getenv("EMBARCADERO_ORDER5_GAP_PERIOD_BATCHES");
+	if (!env || env[0] == '\0') return 0;
+	char* end = nullptr;
+	unsigned long long parsed = std::strtoull(env, &end, 10);
+	if (end == env || *end != '\0') {
+		throw std::invalid_argument(
+		    std::string("invalid EMBARCADERO_ORDER5_GAP_PERIOD_BATCHES='") + env + "'");
+	}
+	return static_cast<uint64_t>(parsed);
+}
+
 // Multi-client SessionOpen storms can exceed the old 1s reply window (N=2×24
 // threads). Override with EMBARCADERO_SESSION_OPEN_TIMEOUT_SEC.
 int GetSessionOpenTimeoutSec() {
@@ -450,6 +463,7 @@ Publisher::Publisher(char topic[TOPIC_NAME_SIZE], std::string head_addr, std::st
 	order5_broker_allowlist_(GetOrder5BrokerAllowlist()),
 	order5_gap_batch_seq_(GetOrder5GapBatchSeq()),
 	order5_gap_delay_ms_(GetOrder5GapDelayMs()),
+	order5_gap_period_batches_(GetOrder5GapPeriodBatches()),
 	expected_num_brokers_(0)
 #ifdef COLLECT_LATENCY_STATS
 	,send_records_per_broker_(NUM_MAX_BROKERS),
@@ -3981,9 +3995,20 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 				pubQue_.ReleaseBatch(batch_header);
 				break;
 			}
-			if (IsOrder5SessionMode() && order5_gap_delay_ms_ > 0 &&
-			    batch_header->batch_seq == order5_gap_batch_seq_ &&
-			    !order5_gap_injected_.exchange(true, std::memory_order_acq_rel)) {
+			bool should_inject_gap = false;
+			if (IsOrder5SessionMode() && order5_gap_delay_ms_ > 0) {
+				if (order5_gap_period_batches_ > 0) {
+					should_inject_gap =
+					    batch_header->batch_seq >= order5_gap_batch_seq_ &&
+					    ((batch_header->batch_seq - order5_gap_batch_seq_) %
+					     order5_gap_period_batches_) == 0;
+				} else {
+					should_inject_gap =
+					    batch_header->batch_seq == order5_gap_batch_seq_ &&
+					    !order5_gap_injected_.exchange(true, std::memory_order_acq_rel);
+				}
+			}
+			if (should_inject_gap) {
 				const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 				    std::chrono::system_clock::now().time_since_epoch()).count();
 				long long origin_ms = 0;

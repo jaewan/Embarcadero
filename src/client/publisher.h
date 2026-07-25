@@ -352,6 +352,9 @@ class Publisher {
 		std::vector<int> order5_broker_allowlist_;
 		uint64_t order5_gap_batch_seq_{UINT64_MAX};
 		int order5_gap_delay_ms_{0};
+		// 0 = one-shot gap at order5_gap_batch_seq_; N>0 = re-inject a gap every N
+		// batches from order5_gap_batch_seq_ (Task-1 T/tau skew measurement).
+		uint64_t order5_gap_period_batches_{0};
 		std::atomic<bool> order5_gap_injected_{false};
 		// [[FIX: B2=0 ACKs]] Track which brokers have publisher threads to handle late registration
 		absl::flat_hash_set<int> brokers_with_threads_ ABSL_GUARDED_BY(mutex_);

@@ -7,6 +7,7 @@
 #include "common/wire_formats.h"
 #include "common/order_level.h"
 #include "common/env_flags.h"
+#include "order5_tr_trace.h"
 
 #include <algorithm>
 #include <array>
@@ -4614,6 +4615,8 @@ void Topic::Sequencer5() {
 	if (committed_seq_updater_thread_.joinable()) {
 		committed_seq_updater_thread_.join();
 	}
+	// [[TR_TRACE]] All ORDER=5 producer threads have joined; write the trace CSV.
+	Order5TrTrace::Instance().Flush();
 }
 
 // Order 2: Total order (no per-client ordering). Same epoch pipeline as Sequencer5, but no Level 5
@@ -4709,6 +4712,8 @@ void Topic::Sequencer2() {
 	if (committed_seq_updater_thread_.joinable()) {
 		committed_seq_updater_thread_.join();
 	}
+	// [[TR_TRACE]] All ORDER=5 producer threads have joined; write the trace CSV.
+	Order5TrTrace::Instance().Flush();
 }
 
 void Topic::EpochDriverThread() {
@@ -4832,6 +4837,8 @@ void Topic::EpochDriverThread() {
 			}
 			if (cur_buf.seal()) {
 				uint64_t next = cur + 1;
+				// [[TR_TRACE]] Driver seal event -> tau (seal/commit period) distribution.
+				Order5TrTrace::Instance().RecordSeal(next, SteadyNowNs());
 				EpochBuffer5& next_buf = epoch_buffers_[next % 3];
 				// Critical invariant: after sealing current epoch, ensure there is always a
 				// COLLECTING successor before returning. Waiting only for IDLE can deadlock
@@ -6979,11 +6986,27 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			return;
 		}
 		if (seq == state.next_expected) {
+			// [[TR_TRACE]] Capture gap-detect time + num_msg before advance/move.
+			const uint64_t tr_gap0 = state.gap_since_ns;
+			const uint32_t tr_broker = static_cast<uint32_t>(p.broker_id);
+			const uint32_t tr_nmsg = p.num_msg;
 			state.mark_sequenced(seq);
 			state.advance_next_expected();
 			if (!CheckAndInsertBatchId(shard, p.cached_batch_id)) {
 				emitted.MarkEmitted(static_cast<uint64_t>(seq));
 				ready.push_back(std::move(p));
+				Order5TrTrace& tr = Order5TrTrace::Instance();
+				if (tr.enabled()) {
+					const uint64_t tr_now = SteadyNowNs();
+					tr.RecordCommit(tr_broker, key, tr_now, state.next_expected - 1, tr_nmsg);
+					if (tr_gap0 != 0) {
+						// This in-order batch resolved an open gap -> release the held suffix.
+						tr.RecordGapRelease(tr_broker, key, tr_now, state.next_expected,
+							epoch_index_.load(std::memory_order_relaxed),
+							tr.ScanPassTotal(),
+							order5_total_hold_size_.load(std::memory_order_relaxed));
+					}
+				}
 			}
 		} else if (seq < state.next_expected) {
 			state.mark_sequenced(seq);
@@ -7002,7 +7025,17 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			}
 		} else {
 			if (tcc) {
+				// [[TR_TRACE]] Record only the FIRST detection of this gap (note_gap is idempotent).
+				const bool tr_was_open = (state.gap_since_ns != 0);
 				state.note_gap(SteadyNowNs());
+				Order5TrTrace& tr = Order5TrTrace::Instance();
+				if (tr.enabled() && !tr_was_open && state.gap_since_ns != 0) {
+					tr.RecordGapDetect(static_cast<uint32_t>(p.broker_id), key,
+						state.gap_since_ns, state.next_expected,
+						epoch_index_.load(std::memory_order_relaxed),
+						tr.ScanPassTotal(),
+						order5_total_hold_size_.load(std::memory_order_relaxed));
+				}
 			}
 			if (shard.hold_buffer_size >= kHoldBufferMaxEntries) {
 				std::this_thread::sleep_for(std::chrono::microseconds(10));
@@ -7391,7 +7424,18 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 			state.gap_since_ns = 0;
 			continue;
 		}
+		// [[TR_TRACE]] Symmetric gap-detect for gaps first observed by the sweep
+		// (not classify_one) so detect/release pair 1:1 for clean hold-time stats.
+		const bool tr_was_open = (state.gap_since_ns != 0);
 		state.note_gap(now_ns);
+		if (!tr_was_open && state.gap_since_ns != 0) {
+			Order5TrTrace& tr = Order5TrTrace::Instance();
+			if (tr.enabled()) {
+				tr.RecordGapDetect(0, session_key, state.gap_since_ns, state.next_expected,
+					epoch_index_.load(std::memory_order_relaxed), tr.ScanPassTotal(),
+					order5_total_hold_size_.load(std::memory_order_relaxed));
+			}
+		}
 		if (ShouldFenceSessionGap(state, now_ns, effective_lease_ns)) {
 			shard.expired_hold_keys_buffer.emplace_back(session_key, state.next_expected);
 		}
@@ -7712,9 +7756,16 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 	// [[SCANNER_RETIRED_SKIP]] Bound CPU/CXL cost if the ring ever reads fully retired
 	// (possible only after a complete wrap): after a full lap of retired skips, yield.
 	size_t retired_skip_streak = 0;
+	uint64_t tr_scan_iter = 0;  // [[TR_TRACE]] scanner observation-pass sampler
 
 
 	while (!stop_threads_) {
+		// [[TR_TRACE]] Sample the scanner observation-pass rate (P). One sample per
+		// 4096 loop inspections keeps volume bounded; period P = dt/4096 offline.
+		if ((++tr_scan_iter & 0xFFF) == 0) {
+			Order5TrTrace::Instance().RecordScanPass(
+				static_cast<uint32_t>(broker_id), tr_scan_iter, SteadyNowNs());
+		}
 		// If sequencer has already advanced the authoritative consumed frontier beyond our current
 		// scanner cursor, jump forward. Otherwise the scanner can keep replaying an already-processed
 		// prefix whose slots still look locally readable.
@@ -8260,6 +8311,8 @@ void Topic::BrokerScannerWorker5(int broker_id) {
 				// Seal succeeded — advance epoch_index_ to the successor so the
 				// EpochSequencerThread picks it up on its next busy-spin iteration.
 				const uint64_t next_epoch = pushed_epoch + 1;
+				// [[TR_TRACE]] Fast-seal event (steady state only; disabled during a hold).
+				Order5TrTrace::Instance().RecordSeal(next_epoch, SteadyNowNs());
 				EpochBuffer5& next_buf = epoch_buffers_[next_epoch % 3];
 				if (next_buf.state.load(std::memory_order_acquire) == EpochBuffer5::State::IDLE) {
 					next_buf.epoch_collection_start_ns.store(
