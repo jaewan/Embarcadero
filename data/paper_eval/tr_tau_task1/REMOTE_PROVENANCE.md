@@ -22,3 +22,11 @@ host-local Boost/cmake issue (the CMakeLists-mtime reconfigure pitfall). Use
 CLIENT_HOSTS_CSV="c4 c2" (both VERIFIED, source-matched, remote over 100GbE). Both
 are remote-NIC publishers; the substitution is documented and does not change the
 2-remote-publisher topology. c2 also serves the RF=1 latency package (REMOTE_CLIENT_HOST=c2).
+
+## Task 3 networking (2026-07-25)
+moscxl data NIC = 10.10.10.10 (enp193s0f0np0), NOT 10.10.10.143 (infra-map default stale).
+Client->broker reachability to 10.10.10.10:1214 : c4 OK, c1 OK, c2 FAIL (c2 can't route to
+the 10.10.10.x data subnet). c3 build-failed (Boost 1.90). => Task 3 clients = c4 + c1.
+Broker binds data ports 1214-1217 INADDR_ANY (all reachable once up). Harness reachability
+preflight probes 1214-1217+12140 from every client; a 4-broker cluster needs ~30-40s for all
+4 data ports to bind, so BROKER_REACHABILITY_TIMEOUT_SEC>=90 helps.
