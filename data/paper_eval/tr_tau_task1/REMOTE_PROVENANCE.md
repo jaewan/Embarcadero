@@ -30,3 +30,18 @@ the 10.10.10.x data subnet). c3 build-failed (Boost 1.90). => Task 3 clients = c
 Broker binds data ports 1214-1217 INADDR_ANY (all reachable once up). Harness reachability
 preflight probes 1214-1217+12140 from every client; a 4-broker cluster needs ~30-40s for all
 4 data ports to bind, so BROKER_REACHABILITY_TIMEOUT_SEC>=90 helps.
+
+## Remote hosts REPAIRED (2026-07-25, subagents)
+- c1: link-fail root cause = clobbered system libyaml-cpp (moscxl 0.8/GLIBCXX_3.4.31 over c1 native
+  0.7); reinstalled libyaml-cpp0.7 (apt Proxy=false), re-linked. throughput_test sha a99e2fdd, native,
+  ldd clean, reachable. USABLE.
+- c2: routing root cause = data NIC enp24s0f0np0 had NO 10.10.10.x IP (NM profile DHCP, no server).
+  Set static ipv4 10.10.10.144/24 never-default (mgmt untouched, persists). ping 0.23ms, TCP 1214
+  REACHABLE, throughput_test present. USABLE. NOTE: stale docs list c2=10.10.10.12 (WRONG; that's c4).
+- => Task 3 2-separate-host parity clients = c4(10.10.10.12) + c1 (both native builds); or add c2(.144).
+  CLIENT_NUMAS: c4=1, c1=1, c2=1 (run_multiclient roster).
+- c3: build root cause = Boost 1.90 dropped compiled boost_system lib+config (folly-config.cmake
+  requires it); also missing cxxopts/mimalloc headers + libglog.so symlink. Agent added boost_system
+  config shim + mirrored cxxopts/mimalloc + libglog.so->.1 symlink, reconfigured, built. throughput_test
+  sha 114dcf33, ldd clean, source-matched, reachable. USABLE. rsync_code_to_remote.sh c3 now works.
+=> ALL 4 remote publishers usable: c4(.12), c1, c2(.144), c3. 2-host parity ready.
