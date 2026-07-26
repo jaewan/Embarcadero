@@ -184,6 +184,15 @@ PUBLICATION_BROKER_CONFIG='$PUBLICATION_BROKER_CONFIG' PUBLICATION_CLIENT_CONFIG
 EMBARCADERO_LAZYLOG_SEQ_IP='$EMBARCADERO_LAZYLOG_SEQ_IP' EMBARCADERO_LAZYLOG_SEQ_PORT='$EMBARCADERO_LAZYLOG_SEQ_PORT' \\
 EMBARCADERO_ACK_TIMEOUT_SEC='$EMBARCADERO_ACK_TIMEOUT_SEC' \\
 EMBARCADERO_BASELINE_CONTROL_TRANSPORT='$CONTROL_TRANSPORT' \\
+EMBARCADERO_CXL_SIZE='${EMBARCADERO_CXL_SIZE:-}' \\
+EMBARCADERO_SEGMENT_SIZE='${EMBARCADERO_SEGMENT_SIZE:-}' \\
+EMBARCADERO_CXL_ZERO_MODE='${EMBARCADERO_CXL_ZERO_MODE:-}' \\
+EMBARCADERO_CXL_MAP_POPULATE='${EMBARCADERO_CXL_MAP_POPULATE:-}' \\
+EMBARCADERO_SESSION_LEASE_MS='${EMBARCADERO_SESSION_LEASE_MS:-}' \\
+EMBARCADERO_ORDER5_HOME_BROKERS='${EMBARCADERO_ORDER5_HOME_BROKERS:-}' \\
+EMBARCADERO_ORDER5_BROKER_ALLOWLIST='${EMBARCADERO_ORDER5_BROKER_ALLOWLIST:-}' \\
+MIN_OVERLAP_MS='${MIN_OVERLAP_MS:-}' \\
+SKIP_CLUSTER_SETUP='${SKIP_CLUSTER_SETUP:-}' \\
 bash scripts/publication/run_throughput_cell.sh
 EOF
 chmod +x "$RUN_DIR/command.sh"
@@ -231,6 +240,15 @@ require_first_attempt_pass=$REQUIRE_FIRST_ATTEMPT_PASS
 require_clean_worktree=$REQUIRE_CLEAN_WORKTREE
 require_clean_remote=$REQUIRE_CLEAN_REMOTE
 ack_timeout_sec=${EMBARCADERO_ACK_TIMEOUT_SEC:-}
+cxl_size=${EMBARCADERO_CXL_SIZE:-}
+segment_size=${EMBARCADERO_SEGMENT_SIZE:-}
+cxl_zero_mode=${EMBARCADERO_CXL_ZERO_MODE:-}
+cxl_map_populate=${EMBARCADERO_CXL_MAP_POPULATE:-}
+session_lease_ms=${EMBARCADERO_SESSION_LEASE_MS:-}
+order5_home_brokers=${EMBARCADERO_ORDER5_HOME_BROKERS:-}
+order5_broker_allowlist=${EMBARCADERO_ORDER5_BROKER_ALLOWLIST:-}
+min_overlap_ms=${MIN_OVERLAP_MS:-}
+skip_cluster_setup=${SKIP_CLUSTER_SETUP:-}
 commit=$COMMIT
 start_time_utc=$RUN_TS
 EOF
@@ -339,15 +357,22 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
   mkdir -p "$trial_dir"
   trial_status="ok"
   total_mbs="0"
-  copied_any=0
+  client_logs=0
   shopt -s nullglob
   for log_file in "$RAW_DIR"/trial${trial}_*.log; do
     if [[ ! -f "$log_file" ]]; then
       continue
     fi
-    copied_any=1
     cp "$log_file" "$trial_dir/"
-    bw_val="$(grep -i 'bandwidth:' "$log_file" | tail -1 | grep -oiP 'bandwidth:\s*\K[0-9]+(\.[0-9]+)?' || true)"
+    # The raw directory also contains trialN_attemptM_brokerK.log.  Those are
+    # evidence, not client result logs, and must not make a successful trial
+    # look failed merely because they contain no Bandwidth line.
+    bw_line="$(grep -E '\] Bandwidth:.*Send-done:' "$log_file" 2>/dev/null | tail -1 || true)"
+    if [[ -z "$bw_line" ]]; then
+      continue
+    fi
+    client_logs=$((client_logs + 1))
+    bw_val="$(grep -oiP 'bandwidth:\s*\K[0-9]+(\.[0-9]+)?' <<<"$bw_line" || true)"
     if [[ "$bw_val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
       total_mbs="$(awk "BEGIN {printf \"%.6f\", $total_mbs + $bw_val}")"
     else
@@ -355,8 +380,10 @@ for trial in $(seq 1 "$NUM_TRIALS"); do
     fi
   done
   shopt -u nullglob
-  if [[ "$copied_any" -eq 0 ]]; then
+  if [[ "$client_logs" -eq 0 ]]; then
     trial_status="missing_logs"
+  elif [[ "$client_logs" -ne "$NUM_CLIENTS" ]]; then
+    trial_status="failed"
   fi
   throughput_gbps="$(awk "BEGIN {printf \"%.6f\", $total_mbs * 8 / 1024}")"
   overlap_gbps=""
