@@ -1,0 +1,8 @@
+condition,trial,broker0_msgs,broker1_msgs,broker2_msgs,broker3_msgs,reconnect_or_fence
+striped,1,1310904,1310904,1310904,1310168,0
+striped,2,1310904,1310904,1310904,1310168,0
+striped,3,1310904,1310904,1310904,1310168,0
+sticky_broker0,1,5242880,0,0,0,0
+sticky_broker0,2,5242880,0,0,0,0
+sticky_broker0,3,5242880,0,0,0,0
+

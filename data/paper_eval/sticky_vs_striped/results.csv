@@ -1,0 +1,8 @@
+condition,trial,status,overlap_GiB_s,overlap_window_ms,first_attempt_pass
+striped,1,ok,7.770728836,2503,1
+striped,2,ok,7.667562021,2603,1
+striped,3,ok,7.856950444,2503,1
+sticky_broker0,1,ok,6.307050562,3103,1
+sticky_broker0,2,ok,6.434282589,3102,1
+sticky_broker0,3,ok,4.553702684,4304,1
+
