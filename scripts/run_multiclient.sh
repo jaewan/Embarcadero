@@ -20,7 +20,8 @@
 #   EMBARCADERO_ORDER0_FAST_PATH, EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES,
 #   EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE, EMBARCADERO_BATCH_SIZE,
 #   EMBARCADERO_CLIENT_PUB_BATCH_KB, EMBARCADERO_NETWORK_IO_THREADS,
-#   EMBARCADERO_ORDER5_HOME_BROKERS, LOCAL_CLIENT_NUMA,
+#   EMBARCADERO_ORDER5_HOME_BROKERS, CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE,
+#   LOCAL_CLIENT_NUMA,
 #   REMOTE_CORFU_SEQUENCER_HOST, REMOTE_CORFU_BUILD_BIN,
 #   REMOTE_SCALOG_SEQUENCER_HOST, REMOTE_SCALOG_BUILD_BIN
 #   EMBARCADERO_CORFU_SEQ_IP / EMBARCADERO_CORFU_SEQ_PORT for CORFU + SSH clients
@@ -64,6 +65,10 @@ fi
 declare -a CLIENT_ORDER5_BROKER_ALLOWLISTS=()
 if [[ -n "${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-}" ]]; then
     IFS='|' read -r -a CLIENT_ORDER5_BROKER_ALLOWLISTS <<< "$CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE"
+fi
+if [[ -n "${EMBARCADERO_ORDER5_BROKER_ALLOWLIST:-}" ]]; then
+    echo "ERROR: run_multiclient ignores a process-global EMBARCADERO_ORDER5_BROKER_ALLOWLIST; use CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE (one '|' separated entry per client)" >&2
+    exit 2
 fi
 declare -a CLIENT_ORDER5_GAP_DELAYS_MS=()
 if [[ -n "${CLIENT_ORDER5_GAP_DELAYS_MS_PIPE:-}" ]]; then
@@ -1833,6 +1838,7 @@ fi
 printf "  %-32s %s\n" "NETWORK_IO_THREADS:"            "$EMBARCADERO_NETWORK_IO_THREADS"
 printf "  %-32s %s\n" "CONTROL_TRANSPORT:"            "$CONTROL_TRANSPORT"
 printf "  %-32s %s\n" "ORDER5_HOME_BROKERS:"           "${EMBARCADERO_ORDER5_HOME_BROKERS:-"(unset)"}"
+printf "  %-32s %s\n" "ORDER5_CLIENT_ALLOWLISTS:"       "${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-"(unset)"}"
 printf "  %-32s %s\n" "ORDER5_EPOCH_US:"               "${EMBAR_ORDER5_EPOCH_US:-"(default=500)"}"
 printf "  %-32s %s\n" "LOCAL_CLIENT_NUMA:"             "$(resolve_local_client_numa)"
 if [[ "$SEQUENCER" == "CORFU" ]]; then
@@ -1886,8 +1892,8 @@ if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
     # as smoke-only, never as CXL mailbox measurements.
     MAILBOX_BACKING="pending_runtime_verification"
 fi
-echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,corfu_group_commit_bytes,corfu_group_commit_delay_us,corfu_token_gate_policy,corfu_token_delay_us,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
-echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES,$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US,cv_fail_closed_v1,$CORFU_TOKEN_DELAY_US,${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
+echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,order5_client_allowlists,corfu_group_commit_bytes,corfu_group_commit_delay_us,corfu_token_gate_policy,corfu_token_delay_us,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
+echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-},$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES,$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US,cv_fail_closed_v1,$CORFU_TOKEN_DELAY_US,${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
 
 if ! lazylog_metadata_endpoints_ready; then
     exit 1
