@@ -15,3 +15,12 @@ both sessions complete (the global gap knob delays every publisher, so BOTH sess
 this run has no unaffected control session — cross-session isolation is a separate experiment). Combined with the follower-kill result
 (contract survives broker failure via replica), Task 2's Q2xQ3 thesis is demonstrated across BOTH
 recovery modes.
+
+## Lease sensitivity
+
+A matched 500 ms lease / 1,500 ms gap campaign also passes 3/3 trials for both
+sessions: all 1,510,000 operations apply with zero ordering or final-state
+violations. Across the six session executions, `SESSION_FENCED` is observed
+499.576--499.866 ms after gap injection. This isolates the implemented
+session-fence timer; it is not a measurement of the unimplemented CXL failure
+detector.

@@ -270,7 +270,7 @@ def main() -> None:
 
     ax.set_xticks(centers)
     ax.set_xticklabels([label for _, label in GROUPS])
-    ax.set_ylabel("Summed publisher ACK throughput (GB/s)")
+    ax.set_ylabel("ACK throughput (GB/s)")
     ax.set_ylim(0, 19.2)
     ax.set_xlim(-0.55, 3.55)
     ax.grid(True, axis="y", alpha=0.25, linestyle=":", zorder=0)
