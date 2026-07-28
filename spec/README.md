@@ -1,15 +1,14 @@
-# Embarcadero session protocol — TLA⁺ specification (Track 02 / W2)
+# Embarcadero session protocol — TLA⁺ artifact
 
 Machine-checked TLA⁺ model of the Embarcadero session protocol, covering the
-adversarial cross-product the resubmission relies on (`Paper/improvement_plan.md`
-→ G4 / W2). This is a shipped artifact and is cited in the paper's §5.
+adversarial scenarios described in the paper's fault-tolerance section.
 
 `Embarcadero.tla` is the single source of truth for the state machine.
 `MCEmbarcadero.tla` is the TLC harness (symmetry set + a state-space bound). Each
 scenario is a `.cfg` that toggles adversary/feature `CONSTANT` flags and checks
 `TypeOK` + `Safety`.
 
-## ⚠ Exactly what is machine-checked (read before citing "machine-checked in TLA⁺")
+## Exactly what is machine-checked
 
 Model checking here is **safety-only** and at **small finite scope** (2 clients or
 1 for the failover-heavy configs, 2 brokers, `MaxSeq`=2, ≤1 failover, ≤1 re-open).
@@ -62,7 +61,7 @@ epoch check** (D5/D2) — the zombie stale-CV advance is a real, always-enabled
 action, and the epoch check on the relay path is the fix; CXL-module loss in the
 ACK1→ACK2 window with a **speculative (ACK1) reader** (D5).
 
-## Scenario → cfg map (W2)
+## Scenario → configuration map
 
 | # | cfg | Scenario | Sessions | Key adversaries |
 |---|---|---|---|---|
@@ -82,7 +81,7 @@ ACK1→ACK2 window with a **speculative (ACK1) reader** (D5).
 (the checked properties are per-session; cross-session interleaving is covered by
 the 2-session non-failover configs) so the state space exhausts.
 
-## How to reproduce (on `broker`, CPU-only — no testbed lock)
+## How to reproduce
 
 TLC runs on Java (broker has OpenJDK 21). Model-checking uses no CXL/ports/cgroups,
 so **no `flock` is required**. Safety-only ⇒ pass `-deadlock` (a quiescent terminal
@@ -111,11 +110,8 @@ Per-scenario TLC summaries are in `spec/results/<scenario>.txt`. Expected:
 `AckedIffCommitted` counterexample (documented, not a regression). See
 `spec/results/SUMMARY.md` for the table.
 
-## Findings for other tracks
+## Deliberate counterexample
 
-- **Track 01 (core protocol):** the ACK-relay control-block **epoch check is
-  load-bearing** — `stale_cv_bug_demo` shows that without it a broker relays an ACK
-  for an orphaned (failover-truncated) batch, violating the live-epoch ACK rule (D2 /
-  W2 #5). The check must guard the ACK-relay path in `src/embarlet` (see handoff).
-- Any counterexample found here is handed to Track 01, not "fixed" unilaterally
-  ("TLA⁺ first, code second").
+The `stale_cv_bug_demo` configuration disables the ACK-relay epoch check. Its
+counterexample shows why the check is necessary: without it, a server can relay
+an ACK for a failover-truncated batch from a stale completion vector.
