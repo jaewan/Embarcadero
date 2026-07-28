@@ -88,8 +88,8 @@ python3 PaperScripts/plot_fig1_throughput_scaling.py \
 
 ### Matched ordering-path ablation
 
-`PaperScripts/run_fig1_path_decomp.sh` includes three replication-off modes on
-the same binary and `ORDER=5` publication path:
+`PaperScripts/run_fig1_path_decomp.sh` includes the two paper-scale
+replication-off modes and an opt-in semantic control:
 
 | Cell | Contract | Purpose |
 |---|---|---|
@@ -99,14 +99,16 @@ the same binary and `ORDER=5` publication path:
 
 The middle cell sets
 `EMBARCADERO_ORDER5_BYPASS_SESSION_FIFO_ABLATION=1`. It is deliberately invalid
-for correctness and failure claims; broker logs must contain
 `[ORDER5_SESSION_FIFO_ABLATION]`. Both `ORDER=5` cells enable
 `EMBAR_ORDER5_COMMIT_PROFILE=1`, which reports batches, messages, hold depth,
 and time in GOI, export, metadata, completion-vector, and held-slot phases.
 Because both `ORDER=5` modes retain grouping, within-round sorting, session
 state reconstruction, allocation, and reclamation, their difference measures
 the incremental checks and hold enforcement—not every CPU cycle attributable
-to session-aware processing.
+to session-aware processing. The bypass is not enabled in paper-scale
+performance campaigns: at large natural reorder depth, the present prototype
+does not yet separate classified from published session state. The fail-closed
+runner rejects such a short ACK frontier, so no V0.5 throughput is citable.
 
 Run a smoke test before the paper-scale campaign:
 
@@ -122,14 +124,14 @@ because of `session_fifo_apply_order`:
 PaperScripts/run_ordering_ablation_semantic_test.sh
 ```
 
-After the full run, require the new cell when generating the summary:
+Run the defensible V0-versus-V1 paper-scale comparison:
 
 ```bash
 # Target only the mixed local/remote ceiling; keep this on a clean commit.
 campaign="fig1_ordering_ablation_n4_$(git rev-parse --short=8 HEAD)_$(date -u +%Y%m%dT%H%M%SZ)"
 CAMPAIGN_ID="$campaign" \
 OUT_ROOT="data/paper_eval/fig1/$campaign" \
-N_VALUES=4 RUN_REPLICATION_VARIANTS=0 \
+N_VALUES=4 RUN_REPLICATION_VARIANTS=0 RUN_SESSION_ABLATION=0 \
 bash PaperScripts/run_fig1_path_decomp.sh
 
 column -s, -t \

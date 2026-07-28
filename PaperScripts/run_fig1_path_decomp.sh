@@ -5,7 +5,7 @@
 # Variant | Order | ACK | RF | Sink                | CXL_COHERENT | Repl executes? | ACK waits | Isolates
 # --------|-------|-----|----|--------------------|--------------|----------------|-----------|----------------------------------
 # V0      |  0    |  1  |  0 | disabled           |    —         |      No        |    No     | Unordered-ingest ceiling
-# V0.5    |  5*   |  1  |  0 | disabled           |    —         |      No        |    No     | Global order, session FIFO bypassed
+# V0.5*   |  5*   |  1  |  0 | disabled           |    —         |      No        |    No     | Experimental semantic control
 # V1      |  5    |  1  |  0 | disabled           |    —         |      No        |    No     | Global order + session FIFO
 # V2      |  5    |  1  |  2 | memory-copy        |    —         |      Yes       |    No     | Background-repl contention
 # V3      |  5    |  2  |  2 | memory-accounting  |    0         |  Control+clfl  |    Yes    | ACK2 protocol + clflush overhead
@@ -27,7 +27,7 @@
 # Reqs:
 #   - 4/4 brokers must reach readiness (follower logs must show lazy mapping)
 #   - No MAP_POPULATE in follower logs
-#   - No unknown-sink warnings for V0/V0.5/V1
+#   - No unknown-sink warnings for V0/V1 (and opt-in V0.5)
 #   - Exactly 3 successful, nonempty result rows per cell before advancing
 #   - Lock acquired, ports 1214-1217 + 12140 free, no stale processes before each cell
 #
@@ -37,7 +37,7 @@
 #   - send-done alone is insufficient; this script also checks broker receive counters
 #
 # Usage: bash PaperScripts/run_fig1_path_decomp.sh [--smoke]
-#   --smoke: runs V0+V0.5+V1 N=1, 1 trial to validate setup before full matrix
+#   --smoke: runs V0+V1 N=1, 1 trial to validate setup before full matrix
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,6 +73,10 @@ else
     N_VALUES="${N_VALUES:-1 2 3 4}"  # N=4 adds a co-located publisher
 fi
 RUN_REPLICATION_VARIANTS="${RUN_REPLICATION_VARIANTS:-1}"
+# V0.5 is an adversarial semantic control, not paper-scale performance
+# evidence. Keep it opt-in until classified-versus-published state is split;
+# the deterministic cross-seal gate remains PaperScripts/run_ordering_ablation_semantic_test.sh.
+RUN_SESSION_ABLATION="${RUN_SESSION_ABLATION:-0}"
 REQUIRED_SUCCESSES=$NUM_TRIALS
 MSG_SIZE=4096
 THREADS=6
@@ -409,11 +413,13 @@ for n in $N_VALUES; do
         0 1 0 "disabled" "$n" "$(hosts_for_n "$n")" "${V01_ENV[@]}"
 done
 
-log "--- V0.5: Global order with session FIFO bypassed (ORDER=5, ACK1, RF=0) ---"
-for n in $N_VALUES; do
-    run_required_cell "v05_order5_nofifo_ack1_rf0" "global-order-no-session-fifo" \
-        5 1 0 "disabled" "$n" "$(hosts_for_n "$n")" "${V05_ENV[@]}"
-done
+if [[ "$RUN_SESSION_ABLATION" -eq 1 ]]; then
+    log "--- V0.5 (experimental): Global order with session FIFO bypassed ---"
+    for n in $N_VALUES; do
+        run_required_cell "v05_order5_nofifo_ack1_rf0" "global-order-no-session-fifo" \
+            5 1 0 "disabled" "$n" "$(hosts_for_n "$n")" "${V05_ENV[@]}"
+    done
+fi
 
 log "--- V1: Global order + session FIFO (ORDER=5, ACK1, RF=0) ---"
 for n in $N_VALUES; do
@@ -463,9 +469,12 @@ elif [[ "$CAMPAIGN_FAILURES" -eq 0 ]]; then
         if [[ "$RUN_REPLICATION_VARIANTS" -eq 0 ]]; then
             summary_args+=(--ordering-only)
         fi
+        if [[ "$RUN_SESSION_ABLATION" -eq 1 ]]; then
+            summary_args+=(--require-session-ablation)
+        fi
         if ! python3 "$SCRIPT_DIR/summarize_fig1_path_ablation.py" \
             "$RESULTS_CSV" --n-clients "$n" --trials "$NUM_TRIALS" \
-            --metric "$metric" --require-session-ablation "${summary_args[@]}" \
+            --metric "$metric" "${summary_args[@]}" \
             --csv-out "$OUT_ROOT/ordering_ablation_n${n}_summary.csv" \
             --manifest-out "$OUT_ROOT/ordering_ablation_n${n}_manifest.json" \
             > "$OUT_ROOT/ordering_ablation_n${n}_summary.json"; then
@@ -483,7 +492,8 @@ fi
 log "CAMPAIGN PASS: all required cells and provenance checks succeeded"
 python3 - "$OUT_ROOT" "$CAMPAIGN_ID" "$PASS_ID" "$GIT_COMMIT" "$GIT_DIRTY" \
     "$BINARY_HASH_EMBARLET" "$BINARY_HASH_CLIENT" "$NUM_TRIALS" "$N_VALUES" \
-    "$TOTAL_BYTES" "$MSG_SIZE" "$BATCH_KB" "$EPOCH_US" <<'PY'
+    "$TOTAL_BYTES" "$MSG_SIZE" "$BATCH_KB" "$EPOCH_US" \
+    "$RUN_REPLICATION_VARIANTS" "$RUN_SESSION_ABLATION" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -493,6 +503,7 @@ root = pathlib.Path(sys.argv[1])
 (
     campaign, pass_id, commit, dirty, embarlet_md5, client_md5,
     trials, n_values, total_bytes, msg_size, batch_kb, epoch_us,
+    run_replication_variants, run_session_ablation,
 ) = sys.argv[2:]
 
 def sha(path):
@@ -522,6 +533,8 @@ manifest = {
         "message_bytes": int(msg_size),
         "publisher_batch_kb": int(batch_kb),
         "epoch_us": int(epoch_us),
+        "run_replication_variants": bool(int(run_replication_variants)),
+        "run_experimental_session_ablation": bool(int(run_session_ablation)),
     },
     "artifacts": artifacts,
 }

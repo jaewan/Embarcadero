@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ordering-only",
         action="store_true",
-        help="validate only V0, V0.5, and V1 from a targeted ordering campaign",
+        help="validate only V0 and V1 from a targeted ordering campaign",
     )
     parser.add_argument("--csv-out", type=Path)
     parser.add_argument("--manifest-out", type=Path)
@@ -60,7 +60,7 @@ def main() -> None:
         }
     else:
         expected_cells = dict(EXPECTED_CELLS)
-    if args.require_session_ablation or args.ordering_only:
+    if args.require_session_ablation:
         expected_cells.update(SESSION_ABLATION_CELL)
     raw = args.input.read_bytes()
     rows = list(csv.DictReader(raw.decode().splitlines()))
