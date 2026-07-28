@@ -1,0 +1,15 @@
+[2026-07-28T08:21:08Z] ===== Fig1 path decomposition (V0–V4 + V3') =====
+[2026-07-28T08:21:08Z] Campaign=fig1_ordering_path_n4_cb6bb340_20260728T082108Z  Pass=20260728T082108Z  Smoke=0
+[2026-07-28T08:21:08Z] Commit=cb6bb340baa5c3ef531b30d068618bb85535996b  DirtyFiles=0
+[2026-07-28T08:21:08Z] embarlet_md5=03b02c913ef076c19d2c4a2d99b80349  client_md5=c3ff24638df24917cd7e3926f8f6f1e9
+[2026-07-28T08:21:08Z] CXL_MAP_POPULATE=0 (must be 0 for lazy follower mapping)
+[2026-07-28T08:21:08Z] N_VALUES=4  NUM_TRIALS=3  TOTAL_BYTES=10737418240
+[2026-07-28T08:21:08Z] --- V0: Unordered-ingest ceiling (ORDER=0, ACK1, RF=0) ---
+[2026-07-28T08:21:09Z] START [v0_order0_ack1_rf0 N=4] variant=unordered-ingest-ceiling order=0 ack=1 rf=0 sink=disabled
+[2026-07-28T08:25:00Z] PASS [v0_order0_ack1_rf0 N=4] ok_rows=3
+[2026-07-28T08:25:00Z] --- V1: Global order + session FIFO (ORDER=5, ACK1, RF=0) ---
+[2026-07-28T08:25:02Z] START [v1_order5_ack1_rf0 N=4] variant=global-order-session-fifo order=5 ack=1 rf=0 sink=disabled
+[2026-07-28T08:28:43Z] PASS [v1_order5_ack1_rf0 N=4] ok_rows=3
+[2026-07-28T08:28:43Z] ===== Fig1 path decomposition COMPLETE =====
+[2026-07-28T08:28:43Z] CSV: /tmp/fig1_ordering_path_n4_cb6bb340_20260728T082108Z/results.csv
+[2026-07-28T08:28:43Z] CAMPAIGN PASS: all required cells and provenance checks succeeded

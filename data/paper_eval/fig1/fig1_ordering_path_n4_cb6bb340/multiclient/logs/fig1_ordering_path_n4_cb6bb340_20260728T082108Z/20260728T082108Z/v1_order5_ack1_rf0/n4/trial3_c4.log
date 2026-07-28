@@ -1,0 +1,53 @@
+I20260728 17:28:09.967847 2483391 main.cc:76] Using threads_per_broker from command line: 6
+I20260728 17:28:10.475418 2483391 test_utils.cc:1054] 
+
+===== Publish Throughput Test =====
+	  Message size: 4096 bytes
+	  Total message size: 2684354560 bytes
+	  Threads per broker: 6
+	  ACK level: 1
+	  Order level: 5
+	  Sequencer: EMBARCADERO
+I20260728 17:28:10.475703 2483391 publisher.cc:477] Publisher: Expecting 4 brokers (from NUM_BROKERS env)
+I20260728 17:28:10.475780 2483391 publisher.cc:2022] Publisher runtime mode=throughput ack_drain_ms_success=50 ack_drain_ms_failure=3000 ack_timeout_sec=300 epoll_wait_writable_ms=1
+I20260728 17:28:10.475793 2483391 publisher.cc:2028] Publisher session lease_ns=30000000000 unacked_byte_cap_pre_pool=386547056640 ack_level=1 memory_emulated_ack2=0 unacked_retention=pool_pin
+I20260728 17:28:10.476445 2483391 common.cc:392] Hugepages: 2048 free × 2048 kB = 4096 MB free; need 682 MB (OK)
+I20260728 17:28:10.476523 2483391 common.cc:426] mmap_large_buffer: MAP_HUGETLB success for 717225984 bytes (retry=0)
+I20260728 17:28:10.593382 2483391 queue_buffer.cc:203] QueueBuffer::AddBuffers region_slots=1365 slot_size=524416 pool_bytes=715827840 hint_bytes=715827882 max_pool_bytes=4294967296 queues=24 (pipeline_slots_per_queue=32)
+I20260728 17:28:10.593407 2483391 publisher.cc:2093] Publisher unacked_byte_cap=386547056640 pool_bytes=715827840 unacked_retention=pool_pin
+I20260728 17:28:10.595981 2484288 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=0 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.636158 2484289 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=0 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.676266 2484290 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=0 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.716593 2484291 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=0 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.756661 2484292 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=0 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.796744 2484293 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=0 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.837013 2484294 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=1 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.876977 2484295 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=1 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.917189 2484296 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=1 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.957244 2484297 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=1 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:10.997387 2484298 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=1 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.037443 2484299 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=1 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.077755 2484300 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=2 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.117807 2484301 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=2 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.157953 2484302 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=2 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.197969 2484303 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=2 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.238124 2484304 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=2 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.278301 2484305 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=2 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.318320 2484306 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=3 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.358547 2484307 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=3 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.398661 2484308 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=3 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.438786 2484309 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=3 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.478746 2484310 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=3 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.519018 2484311 publisher.cc:776] [SESSION_OPEN_ACK] broker_id=3 client_id=181588 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:28:11.519426 2483391 test_utils.cc:1426] Push-ready barrier: wrote ready file /tmp/embarcadero_e4_ready_t3_c4_3191303
+I20260728 17:28:13.565294 2483391 test_utils.cc:1438] Push-ready barrier: go_ns=1785227293404618532  spinning until system clock reaches go time...
+I20260728 17:28:13.565320 2483391 test_utils.cc:1444] Push-ready barrier: go time reached, starting push
+I20260728 17:28:13.565333 2483391 test_utils.cc:1458] Publisher push start (wall ns): 1785227293565333809
+I20260728 17:28:14.244690 2483391 publisher.cc:2872] [ACK_VERIFY] normalized_received=655360 raw_received=652806 target=655360 100%
+I20260728 17:28:14.244746 2483391 publisher.cc:2885] [UNACKED_DRAIN] bytes=0 batches=0 session_sent_hwm=655360 ack_base=0
+I20260728 17:28:14.244769 2483391 publisher.cc:608] [ORDER5_ROUTING] client_id=181588 home_brokers=0 broker0_msgs=164052 broker1_msgs=164052 broker2_msgs=163960 broker3_msgs=163296
+I20260728 17:28:14.244783 2483391 publisher.cc:2921] [POLL_BREAKDOWN] target_messages=655360 ack_enabled=1 queue_drain_ms=4.019 publisher_join_ms=2.132 ack_wait_ms=47.606 post_ack_ms=0.098 total_poll_ms=53.856 target_acks=655360 normalized_acks=655360
+I20260728 17:28:14.244803 2483391 test_utils.cc:1527] Publish test completed in 0.68 seconds (Poll overhead: 54 ms)
+I20260728 17:28:14.244824 2483391 test_utils.cc:1531] Bandwidth: 3767.64 MB/s | Send-done: 4090.82 MB/s
+I20260728 17:28:14.321741 2484352 publisher.cc:2387] Wrote throughput timeseries to /home/domin/Embarcadero/build/bin/throughput_timeseries_trial3_c4.csv
+I20260728 17:28:14.322872 2483391 result_writer.cc:193] Publish bandwidth: 3767.64 MB/s

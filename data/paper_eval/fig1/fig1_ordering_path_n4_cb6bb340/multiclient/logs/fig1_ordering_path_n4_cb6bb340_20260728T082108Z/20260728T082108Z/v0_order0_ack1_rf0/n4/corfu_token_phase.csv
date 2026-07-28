@@ -1,0 +1,1 @@
+trial,client,requests,grants,failures,gate_aborts,gate_denied,payload_sends,payload_before_grant,payload_admission_denied,mean_token_latency_us,ticket_wait_ms_sum,unavailable_retries,transient_retries,token_delay_us,aborted

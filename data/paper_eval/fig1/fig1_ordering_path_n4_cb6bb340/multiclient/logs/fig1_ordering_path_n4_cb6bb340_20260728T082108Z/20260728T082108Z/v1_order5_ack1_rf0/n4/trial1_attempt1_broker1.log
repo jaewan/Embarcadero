@@ -1,0 +1,141 @@
+I20260728 17:25:16.256778 3191487 embarlet.cc:209] Configuration loaded successfully from /home/domin/Embarcadero/config/embarcadero.yaml
+I20260728 17:25:16.256901 3191487 embarlet.cc:228] [CORFU_DEBUG] sequencerType=EMBARCADERO
+I20260728 17:25:16.262507 3191487 heartbeat.cc:624] Node registered: Node registered successfully (broker_id=1, attempt=1)
+I20260728 17:25:16.262677 3191487 embarlet.cc:294] Starting Embarlet broker_id: 1
+I20260728 17:25:16.262697 3191487 embarlet.cc:316] [EFFECTIVE_CONFIG] broker_id=1 head=0 network_threads=32 cxl_type=real sequencer=0 failure_domain=local_cxl domain_id=moscxl host_failure_tolerant=0 EMBARCADERO_REPLICATION_FACTOR=0 EMBARCADERO_CXL_ZERO_MODE=metadata EMBARCADERO_CXL_COHERENT= EMBARCADERO_CXL_NT_INGEST= EMBARCADERO_STAGE_TRACE=0 order5_fifo_ablation=0
+I20260728 17:25:16.262725 3191487 cxl_manager.cc:349] CXLManager: broker_id=1 using CXL size=274877906944 bytes
+I20260728 17:25:16.262779 3191487 cxl_manager.cc:179] Mapping CXL shared memory: 274877906944 bytes (lazy populate)
+I20260728 17:25:16.262801 3191487 cxl_manager.cc:236] CXL mapping successful at address: 0x600000000000
+I20260728 17:25:16.262810 3191487 cxl_manager.cc:360] CXL payload flush policy: explicit_flush_required cxl_type=Real dax_backed=0 EMBARCADERO_CXL_COHERENT=<unset>
+I20260728 17:25:16.262827 3191487 embarlet.cc:381] [CORFU_DEBUG] CXLManager OK, creating DiskManager (broker_id=1)
+I20260728 17:25:16.262840 3191487 embarlet.cc:385] embarlet: chain replication sink_mode=disk-durable ack_claim=media_durable inmem_bytes_per_source=268435456 sync_bytes=268435456 sync_interval_ms=250 EMBARCADERO_REPLICATION_FACTOR=0
+I20260728 17:25:16.262914 3191487 disk_manager.cc:237] DiskManager: Chain replication disabled (replication_factor=0, unified_replication_path=0)
+I20260728 17:25:16.262923 3191487 embarlet.cc:399] [CORFU_DEBUG] DiskManager constructed
+I20260728 17:25:16.263365 3191604 heartbeat.cc:801] Updated cluster info to version 1 with 2 nodes
+I20260728 17:25:16.263715 3191487 network_manager.cc:833] NetworkManager: Blocking recv direct to BLog (single code path)
+I20260728 17:25:16.266944 3191487 embarlet.cc:442] [CORFU_DEBUG] Managers connected, waiting for data port to listen
+I20260728 17:25:16.266968 3191487 embarlet.cc:465] [CORFU_DEBUG] Data port listening, signaling ready
+I20260728 17:25:16.266981 3191487 embarlet.cc:124] Failed to open script_signal_pipe: No such file or directory
+I20260728 17:25:16.267088 3191487 embarlet.cc:134] Wrote readiness signal to /tmp/embarlet_3191487_ready
+I20260728 17:25:16.267098 3191487 embarlet.cc:467] Embarcadero initialized. Ready to go
+I20260728 17:25:20.267354 3191604 heartbeat.cc:801] Updated cluster info to version 4 with 4 nodes
+I20260728 17:25:24.272099 3191604 heartbeat.cc:801] Updated cluster info to version 6 with 4 nodes
+I20260728 17:25:36.284468 3191604 heartbeat.cc:801] Updated cluster info to version 7 with 4 nodes
+I20260728 17:25:39.424335 3191683 topic_manager.cc:66] TopicManager discovery: creating local topic 'TestTopic' on broker 1
+I20260728 17:25:39.424453 3191683 cxl_manager.cc:812] GetNewSegment (Broker 1): CXL_size=274877906944 CONFIGURED_MAX_BROKERS=5 Segment_Region_size=222 GB SEGMENT_SIZE=8192 MB total_segments=27 bitmap_words=1
+I20260728 17:25:39.424486 3191683 cxl_manager.cc:893] Broker 1 allocated segment 1 at 0x600a64e66000
+I20260728 17:25:39.432952 3191683 topic_manager.cc:179] Initialized batch header ring at 0x600814666000 (10485760 bytes, publish_commit=UNCOMMITTED)
+I20260728 17:25:39.432981 3191683 topic_manager.cc:194] [TopicManager] CreateNewTopicInternal: broker_id=1 batch_headers_offset=34701991936 log_offset=44642496512
+I20260728 17:25:39.438043 3191683 topic.cc:768] Topic TestTopic: DelegationThread disabled for Order 5(subscribers use GetBatchToExportWithMetadata; eliminates scanner contention)
+I20260728 17:25:40.248162 3191613 network_manager.cc:1157] [SESSION_OPEN] client_id=137860 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:40.248246 3191613 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=137860 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:40.288229 3191615 network_manager.cc:1157] [SESSION_OPEN] client_id=137860 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:40.288286 3191615 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=137860 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:40.328547 3191616 network_manager.cc:1157] [SESSION_OPEN] client_id=137860 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:40.328698 3191616 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=137860 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:40.368394 3191617 network_manager.cc:1157] [SESSION_OPEN] client_id=137860 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:40.368453 3191617 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=137860 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:40.408542 3191618 network_manager.cc:1157] [SESSION_OPEN] client_id=137860 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:40.408625 3191618 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=137860 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:40.448662 3191619 network_manager.cc:1157] [SESSION_OPEN] client_id=137860 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:40.448747 3191619 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=137860 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:40.930179 3191618 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=137860, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:40.930177 3191617 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=137860, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:40.930289 3191613 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=137860, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:40.930172 3191616 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=137860, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:40.930162 3191615 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=137860, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:40.930209 3191619 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=137860, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:44.825872 3191620 network_manager.cc:1157] [SESSION_OPEN] client_id=801150 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.825932 3191620 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=801150 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.826071 3191620 network_manager.cc:752] SetupAcknowledgmentSocket: Broker 1 ACK connection established to 10.10.10.10:26486 (async)
+I20260728 17:25:44.826097 3191620 network_manager.cc:1262] HandlePublishRequest: Starting AckThread for broker 1, topic='TestTopic', client_id=801150, session_epoch=1
+I20260728 17:25:44.826323 3193655 network_manager.cc:2854] AckThread: Starting for broker 1, topic='TestTopic' (len=9), ack_level=1, client_id=801150, session_epoch=1
+I20260728 17:25:44.826463 3193655 network_manager.cc:2988] AckThread: Broker 1 sent broker_id to client for topic='TestTopic'
+I20260728 17:25:44.857424 3191621 network_manager.cc:1157] [SESSION_OPEN] client_id=753856 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.857478 3191621 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=753856 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.857674 3191621 network_manager.cc:752] SetupAcknowledgmentSocket: Broker 1 ACK connection established to 10.10.10.12:13430 (async)
+I20260728 17:25:44.857699 3191621 network_manager.cc:1262] HandlePublishRequest: Starting AckThread for broker 1, topic='TestTopic', client_id=753856, session_epoch=1
+I20260728 17:25:44.857929 3193656 network_manager.cc:2854] AckThread: Starting for broker 1, topic='TestTopic' (len=9), ack_level=1, client_id=753856, session_epoch=1
+I20260728 17:25:44.858098 3193656 network_manager.cc:2988] AckThread: Broker 1 sent broker_id to client for topic='TestTopic'
+I20260728 17:25:44.865912 3191623 network_manager.cc:1157] [SESSION_OPEN] client_id=801150 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.865948 3191623 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=801150 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.897404 3191626 network_manager.cc:1157] [SESSION_OPEN] client_id=753856 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.897444 3191626 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=753856 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.906008 3191629 network_manager.cc:1157] [SESSION_OPEN] client_id=801150 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.906055 3191629 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=801150 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.908171 3191632 network_manager.cc:1157] [SESSION_OPEN] client_id=602127 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.908212 3191632 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=602127 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.908392 3191632 network_manager.cc:752] SetupAcknowledgmentSocket: Broker 1 ACK connection established to 10.10.10.11:26008 (async)
+I20260728 17:25:44.908416 3191632 network_manager.cc:1262] HandlePublishRequest: Starting AckThread for broker 1, topic='TestTopic', client_id=602127, session_epoch=1
+I20260728 17:25:44.908668 3193657 network_manager.cc:2854] AckThread: Starting for broker 1, topic='TestTopic' (len=9), ack_level=1, client_id=602127, session_epoch=1
+I20260728 17:25:44.908854 3193657 network_manager.cc:2988] AckThread: Broker 1 sent broker_id to client for topic='TestTopic'
+I20260728 17:25:44.921495 3191635 network_manager.cc:1157] [SESSION_OPEN] client_id=424071 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.921597 3191635 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=424071 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.921957 3191635 network_manager.cc:752] SetupAcknowledgmentSocket: Broker 1 ACK connection established to 10.10.10.181:38395 (async)
+I20260728 17:25:44.921988 3191635 network_manager.cc:1262] HandlePublishRequest: Starting AckThread for broker 1, topic='TestTopic', client_id=424071, session_epoch=1
+I20260728 17:25:44.922232 3193658 network_manager.cc:2854] AckThread: Starting for broker 1, topic='TestTopic' (len=9), ack_level=1, client_id=424071, session_epoch=1
+I20260728 17:25:44.922384 3193658 network_manager.cc:2988] AckThread: Broker 1 sent broker_id to client for topic='TestTopic'
+I20260728 17:25:44.937763 3191638 network_manager.cc:1157] [SESSION_OPEN] client_id=753856 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.937842 3191638 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=753856 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.946099 3191641 network_manager.cc:1157] [SESSION_OPEN] client_id=801150 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.946165 3191641 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=801150 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.948248 3191643 network_manager.cc:1157] [SESSION_OPEN] client_id=602127 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.948289 3191643 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=602127 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.961527 3191646 network_manager.cc:1157] [SESSION_OPEN] client_id=424071 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.961910 3191646 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=424071 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.977777 3191650 network_manager.cc:1157] [SESSION_OPEN] client_id=753856 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.977836 3191650 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=753856 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.986145 3191653 network_manager.cc:1157] [SESSION_OPEN] client_id=801150 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.986200 3191653 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=801150 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:44.988358 3191655 network_manager.cc:1157] [SESSION_OPEN] client_id=602127 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:44.988440 3191655 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=602127 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.001569 3191659 network_manager.cc:1157] [SESSION_OPEN] client_id=424071 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.001664 3191659 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=424071 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.017920 3191662 network_manager.cc:1157] [SESSION_OPEN] client_id=753856 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.017988 3191662 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=753856 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.026242 3191665 network_manager.cc:1157] [SESSION_OPEN] client_id=801150 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.026296 3191665 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=801150 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.028378 3191668 network_manager.cc:1157] [SESSION_OPEN] client_id=602127 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.028465 3191668 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=602127 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.041499 3191671 network_manager.cc:1157] [SESSION_OPEN] client_id=424071 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.041538 3191671 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=424071 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.057880 3191674 network_manager.cc:1157] [SESSION_OPEN] client_id=753856 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.057921 3191674 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=753856 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.068348 3191676 network_manager.cc:1157] [SESSION_OPEN] client_id=602127 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.068383 3191676 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=602127 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.081764 3191680 network_manager.cc:1157] [SESSION_OPEN] client_id=424071 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.081847 3191680 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=424071 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.108415 3191609 network_manager.cc:1157] [SESSION_OPEN] client_id=602127 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.108459 3191609 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=602127 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:45.121670 3191610 network_manager.cc:1157] [SESSION_OPEN] client_id=424071 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=0 has_committed_prefix=0 status=0
+I20260728 17:25:45.121707 3191610 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=424071 session_epoch=1 active=0 fenced=0 committed_hwm=0 session_entry_hwm=0 goi_hwm=0 goi_found=0
+I20260728 17:25:47.715269 3191611 network_manager.cc:1157] [SESSION_OPEN] client_id=424071 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=811 has_committed_prefix=1 status=0
+I20260728 17:25:47.715363 3191611 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=424071 session_epoch=1 active=1 fenced=0 committed_hwm=811 session_entry_hwm=811 goi_hwm=811 goi_found=1
+I20260728 17:25:47.779076 3191612 network_manager.cc:1157] [SESSION_OPEN] client_id=753856 requested_session_epoch=1 assigned_session_epoch=1 committed_hwm=427 has_committed_prefix=1 status=0
+I20260728 17:25:47.779234 3191612 network_manager.cc:1165] HandlePublishRequest: session reconnect client_id=753856 session_epoch=1 active=1 fenced=0 committed_hwm=427 session_entry_hwm=427 goi_hwm=427 goi_found=1
+I20260728 17:25:47.818270 3191665 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=801150, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:47.821228 3191620 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=801150, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:47.906934 3191653 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=801150, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:47.919318 3191641 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=801150, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:47.954370 3191623 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=801150, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:47.968956 3191629 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=801150, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.211796 3191671 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=424071, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.211828 3191680 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=424071, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.211831 3191659 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=424071, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.214516 3191646 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=424071, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.223032 3191635 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=424071, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.229130 3191632 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=602127, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.229125 3191643 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=602127, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.230014 3191676 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=602127, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.231002 3191668 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=602127, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.231426 3191655 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=602127, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.244065 3191609 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=602127, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.276194 3191610 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=424071, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.326984 3191621 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=753856, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.327096 3191626 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=753856, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.327217 3191638 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=753856, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.327452 3191674 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=753856, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.327569 3191650 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=753856, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.335284 3191611 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=424071, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.348526 3191662 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=753856, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:25:48.360167 3191612 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=753856, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.

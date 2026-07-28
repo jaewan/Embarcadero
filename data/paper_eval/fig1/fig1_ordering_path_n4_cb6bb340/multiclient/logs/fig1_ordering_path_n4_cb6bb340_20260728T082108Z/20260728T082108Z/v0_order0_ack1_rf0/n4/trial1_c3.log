@@ -1,0 +1,27 @@
+I20260728 17:21:55.453670 1379651 main.cc:76] Using threads_per_broker from command line: 6
+I20260728 17:21:55.960855 1379651 test_utils.cc:1054] 
+
+===== Publish Throughput Test =====
+	  Message size: 4096 bytes
+	  Total message size: 2684354560 bytes
+	  Threads per broker: 6
+	  ACK level: 1
+	  Order level: 0
+	  Sequencer: EMBARCADERO
+I20260728 17:21:55.961045 1379651 publisher.cc:477] Publisher: Expecting 4 brokers (from NUM_BROKERS env)
+I20260728 17:21:55.961148 1379651 publisher.cc:2022] Publisher runtime mode=throughput ack_drain_ms_success=50 ack_drain_ms_failure=3000 ack_timeout_sec=300 epoll_wait_writable_ms=1
+I20260728 17:21:55.961158 1379651 publisher.cc:2028] Publisher session lease_ns=30000000000 unacked_byte_cap_pre_pool=386547056640 ack_level=1 memory_emulated_ack2=0 unacked_retention=pool_pin
+I20260728 17:21:55.961642 1379651 common.cc:392] Hugepages: 34288 free × 2048 kB = 68576 MB free; need 682 MB (OK)
+I20260728 17:21:55.961715 1379651 common.cc:426] mmap_large_buffer: MAP_HUGETLB success for 717225984 bytes (retry=0)
+I20260728 17:21:56.140578 1379651 queue_buffer.cc:203] QueueBuffer::AddBuffers region_slots=1365 slot_size=524416 pool_bytes=715827840 hint_bytes=715827882 max_pool_bytes=4294967296 queues=24 (pipeline_slots_per_queue=32)
+I20260728 17:21:56.140594 1379651 publisher.cc:2093] Publisher unacked_byte_cap=386547056640 pool_bytes=715827840 unacked_retention=pool_pin
+I20260728 17:21:57.114423 1379651 test_utils.cc:1426] Push-ready barrier: wrote ready file /tmp/embarcadero_e4_ready_t1_c3_3183920
+I20260728 17:21:58.993237 1379651 test_utils.cc:1438] Push-ready barrier: go_ns=1785226918894003077  spinning until system clock reaches go time...
+I20260728 17:21:58.993249 1379651 test_utils.cc:1444] Push-ready barrier: go time reached, starting push
+I20260728 17:21:58.993257 1379651 test_utils.cc:1458] Publisher push start (wall ns): 1785226918993256216
+I20260728 17:21:59.758983 1379651 publisher.cc:2872] [ACK_VERIFY] normalized_received=655360 raw_received=655360 target=655360 100%
+I20260728 17:21:59.759028 1379651 publisher.cc:2921] [POLL_BREAKDOWN] target_messages=655360 ack_enabled=1 queue_drain_ms=0.027 publisher_join_ms=1.004 ack_wait_ms=393.030 post_ack_ms=0.050 total_poll_ms=394.113 target_acks=655360 normalized_acks=655360
+I20260728 17:21:59.759047 1379651 test_utils.cc:1527] Publish test completed in 0.77 seconds (Poll overhead: 394 ms)
+I20260728 17:21:59.759054 1379651 test_utils.cc:1531] Bandwidth: 3342.95 MB/s | Send-done: 6885.74 MB/s
+I20260728 17:21:59.817978 1380364 publisher.cc:2387] Wrote throughput timeseries to /home/domin/Embarcadero/build/bin/throughput_timeseries_trial1_c3.csv
+I20260728 17:21:59.818789 1379651 result_writer.cc:193] Publish bandwidth: 3342.95 MB/s

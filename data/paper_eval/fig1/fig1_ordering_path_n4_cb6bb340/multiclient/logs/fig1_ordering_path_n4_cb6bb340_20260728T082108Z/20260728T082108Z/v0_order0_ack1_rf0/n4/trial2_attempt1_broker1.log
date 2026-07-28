@@ -1,0 +1,69 @@
+I20260728 17:22:41.241822 3186477 embarlet.cc:209] Configuration loaded successfully from /home/domin/Embarcadero/config/embarcadero.yaml
+I20260728 17:22:41.241945 3186477 embarlet.cc:228] [CORFU_DEBUG] sequencerType=EMBARCADERO
+I20260728 17:22:41.247946 3186477 heartbeat.cc:624] Node registered: Node registered successfully (broker_id=1, attempt=1)
+I20260728 17:22:41.248162 3186477 embarlet.cc:294] Starting Embarlet broker_id: 1
+I20260728 17:22:41.248183 3186477 embarlet.cc:316] [EFFECTIVE_CONFIG] broker_id=1 head=0 network_threads=32 cxl_type=real sequencer=0 failure_domain=local_cxl domain_id=moscxl host_failure_tolerant=0 EMBARCADERO_REPLICATION_FACTOR=0 EMBARCADERO_CXL_ZERO_MODE=metadata EMBARCADERO_CXL_COHERENT= EMBARCADERO_CXL_NT_INGEST= EMBARCADERO_STAGE_TRACE=0 order5_fifo_ablation=0
+I20260728 17:22:41.248265 3186477 cxl_manager.cc:349] CXLManager: broker_id=1 using CXL size=274877906944 bytes
+I20260728 17:22:41.248333 3186477 cxl_manager.cc:179] Mapping CXL shared memory: 274877906944 bytes (lazy populate)
+I20260728 17:22:41.248353 3186477 cxl_manager.cc:236] CXL mapping successful at address: 0x600000000000
+I20260728 17:22:41.248363 3186477 cxl_manager.cc:360] CXL payload flush policy: explicit_flush_required cxl_type=Real dax_backed=0 EMBARCADERO_CXL_COHERENT=<unset>
+I20260728 17:22:41.248389 3186477 embarlet.cc:381] [CORFU_DEBUG] CXLManager OK, creating DiskManager (broker_id=1)
+I20260728 17:22:41.248407 3186477 embarlet.cc:385] embarlet: chain replication sink_mode=disk-durable ack_claim=media_durable inmem_bytes_per_source=268435456 sync_bytes=268435456 sync_interval_ms=250 EMBARCADERO_REPLICATION_FACTOR=0
+I20260728 17:22:41.248494 3186477 disk_manager.cc:237] DiskManager: Chain replication disabled (replication_factor=0, unified_replication_path=0)
+I20260728 17:22:41.248503 3186477 embarlet.cc:399] [CORFU_DEBUG] DiskManager constructed
+I20260728 17:22:41.248795 3186594 heartbeat.cc:801] Updated cluster info to version 2 with 3 nodes
+I20260728 17:22:41.249258 3186477 network_manager.cc:833] NetworkManager: Blocking recv direct to BLog (single code path)
+I20260728 17:22:41.252408 3186477 embarlet.cc:442] [CORFU_DEBUG] Managers connected, waiting for data port to listen
+I20260728 17:22:41.252432 3186477 embarlet.cc:465] [CORFU_DEBUG] Data port listening, signaling ready
+I20260728 17:22:41.252447 3186477 embarlet.cc:124] Failed to open script_signal_pipe: No such file or directory
+I20260728 17:22:41.252568 3186477 embarlet.cc:134] Wrote readiness signal to /tmp/embarlet_3186477_ready
+I20260728 17:22:41.252578 3186477 embarlet.cc:467] Embarcadero initialized. Ready to go
+I20260728 17:22:45.252372 3186594 heartbeat.cc:801] Updated cluster info to version 4 with 4 nodes
+I20260728 17:22:49.256909 3186594 heartbeat.cc:801] Updated cluster info to version 6 with 4 nodes
+I20260728 17:23:01.269402 3186594 heartbeat.cc:801] Updated cluster info to version 7 with 4 nodes
+I20260728 17:23:12.439498 3186677 topic_manager.cc:66] TopicManager discovery: creating local topic 'TestTopic' on broker 1
+I20260728 17:23:12.439705 3186677 cxl_manager.cc:812] GetNewSegment (Broker 1): CXL_size=274877906944 CONFIGURED_MAX_BROKERS=5 Segment_Region_size=222 GB SEGMENT_SIZE=8192 MB total_segments=27 bitmap_words=1
+I20260728 17:23:12.439740 3186677 cxl_manager.cc:893] Broker 1 allocated segment 2 at 0x600c64e66000
+I20260728 17:23:12.448247 3186677 topic_manager.cc:179] Initialized batch header ring at 0x600814666000 (10485760 bytes, publish_commit=UNCOMMITTED)
+I20260728 17:23:12.448271 3186677 topic_manager.cc:194] [TopicManager] CreateNewTopicInternal: broker_id=1 batch_headers_offset=34701991936 log_offset=53232431104
+I20260728 17:23:12.453018 3186677 topic.cc:794] Topic TestTopic: DelegationThread disabled for Order 0 (fast path: network thread handles ACK cursor directly, no PBR)
+I20260728 17:23:13.470837 3186603 network_manager.cc:752] SetupAcknowledgmentSocket: Broker 1 ACK connection established to 10.10.10.10:61533 (async)
+I20260728 17:23:13.470954 3186603 network_manager.cc:1262] HandlePublishRequest: Starting AckThread for broker 1, topic='TestTopic', client_id=962138, session_epoch=0
+I20260728 17:23:13.471191 3188530 network_manager.cc:2854] AckThread: Starting for broker 1, topic='TestTopic' (len=9), ack_level=1, client_id=962138, session_epoch=0
+I20260728 17:23:13.471378 3188530 network_manager.cc:2988] AckThread: Broker 1 sent broker_id to client for topic='TestTopic'
+I20260728 17:23:13.510890 3186604 network_manager.cc:752] SetupAcknowledgmentSocket: Broker 1 ACK connection established to 10.10.10.12:31130 (async)
+I20260728 17:23:13.510993 3186604 network_manager.cc:1262] HandlePublishRequest: Starting AckThread for broker 1, topic='TestTopic', client_id=61273, session_epoch=0
+I20260728 17:23:13.511229 3188531 network_manager.cc:2854] AckThread: Starting for broker 1, topic='TestTopic' (len=9), ack_level=1, client_id=61273, session_epoch=0
+I20260728 17:23:13.511409 3188531 network_manager.cc:2988] AckThread: Broker 1 sent broker_id to client for topic='TestTopic'
+I20260728 17:23:13.565883 3186610 network_manager.cc:752] SetupAcknowledgmentSocket: Broker 1 ACK connection established to 10.10.10.11:18289 (async)
+I20260728 17:23:13.565995 3186610 network_manager.cc:1262] HandlePublishRequest: Starting AckThread for broker 1, topic='TestTopic', client_id=389699, session_epoch=0
+I20260728 17:23:13.566275 3188532 network_manager.cc:2854] AckThread: Starting for broker 1, topic='TestTopic' (len=9), ack_level=1, client_id=389699, session_epoch=0
+I20260728 17:23:13.566488 3188532 network_manager.cc:2988] AckThread: Broker 1 sent broker_id to client for topic='TestTopic'
+I20260728 17:23:13.573834 3186612 network_manager.cc:752] SetupAcknowledgmentSocket: Broker 1 ACK connection established to 10.10.10.181:54314 (async)
+I20260728 17:23:13.573879 3186612 network_manager.cc:1262] HandlePublishRequest: Starting AckThread for broker 1, topic='TestTopic', client_id=376105, session_epoch=0
+I20260728 17:23:13.574096 3188535 network_manager.cc:2854] AckThread: Starting for broker 1, topic='TestTopic' (len=9), ack_level=1, client_id=376105, session_epoch=0
+I20260728 17:23:13.574240 3188535 network_manager.cc:2988] AckThread: Broker 1 sent broker_id to client for topic='TestTopic'
+I20260728 17:23:16.110432 3186628 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=962138, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.123764 3186616 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=962138, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.144796 3186605 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=962138, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.254473 3186603 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=962138, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.256178 3186640 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=962138, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.261510 3186608 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=962138, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.541338 3186646 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=376105, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.576953 3186610 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=389699, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.577683 3186619 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=389699, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.578017 3186652 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=389699, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.579886 3186643 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=389699, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.587306 3186658 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=389699, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.598371 3186637 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=61273, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.603127 3186612 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=376105, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.618005 3186634 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=376105, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.623034 3186649 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=61273, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.632407 3186622 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=376105, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.637945 3186661 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=376105, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.663784 3186655 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=376105, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.695799 3186614 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=61273, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.727093 3186606 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=61273, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.731707 3186625 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=61273, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.747311 3186604 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=61273, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.
+I20260728 17:23:16.753413 3186631 network_manager.cc:1322] NetworkManager: Connection closed by publisher (client_id=389699, topic=TestTopic). Normal termination if publisher is re-routing or shutting down.

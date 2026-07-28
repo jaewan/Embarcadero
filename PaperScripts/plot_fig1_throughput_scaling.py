@@ -191,6 +191,76 @@ def load_rf0(
     return selected, inputs
 
 
+def load_n4_ordering_rerun(
+    csv_path: Path, manifest_path: Path, commit: str
+) -> tuple[list[dict[str, object]], list[Path]]:
+    """Load the clean same-commit V0/V1 rerun while retaining old baseline rows."""
+    if not csv_path.is_file() or not manifest_path.is_file():
+        raise SystemExit("missing N=4 ordering rerun or campaign manifest")
+    campaign = json.loads(manifest_path.read_text())
+    contract = campaign.get("contract", {})
+    if (
+        campaign.get("status") != "pass"
+        or campaign.get("git_commit") != commit
+        or campaign.get("git_dirty_files") != 0
+        or contract.get("trials_per_cell") != TRIALS
+        or contract.get("n_clients") != [4]
+        or contract.get("total_bytes") != 10 * 1024**3
+        or contract.get("message_bytes") != 4096
+        or contract.get("publisher_batch_kb") != 2048
+        or contract.get("run_experimental_session_ablation") is not False
+        or contract.get("run_replication_variants") is not False
+    ):
+        raise SystemExit(f"N=4 ordering campaign contract mismatch: {campaign}")
+    expected_hash = campaign.get("artifacts", {}).get("results.csv")
+    if expected_hash != sha256(csv_path):
+        raise SystemExit("N=4 ordering results.csv does not match campaign manifest")
+
+    cells = {
+        "v0_order0_ack1_rf0": ("embar_o0", 0, "unordered ingestion ceiling"),
+        "v1_order5_ack1_rf0": ("embar", 5, "ordered, replication off"),
+    }
+    by_cell: dict[str, list[dict[str, str]]] = {cell: [] for cell in cells}
+    with csv_path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            if row.get("cell") in by_cell:
+                by_cell[row["cell"]].append(row)
+
+    selected: list[dict[str, object]] = []
+    for cell, (series, order, semantics) in cells.items():
+        rows = by_cell[cell]
+        if len(rows) != TRIALS:
+            raise SystemExit(f"{cell}: expected {TRIALS} rerun rows, got {len(rows)}")
+        if sorted(int(row["trial"]) for row in rows) != [1, 2, 3]:
+            raise SystemExit(f"{cell}: rerun trial identifiers are incomplete")
+        for row in rows:
+            require_equal(row, {
+                "git_commit": commit,
+                "git_dirty_files": "0",
+                "status": "ok",
+                "order": str(order),
+                "ack": "1",
+                "rf": "0",
+                "sink": "disabled",
+                "n_clients": "4",
+                "client_hosts": "c4,c3,c1,local",
+            }, cell)
+            selected.append({
+                "group": "rf0_n4",
+                "series": series,
+                "cell": cell,
+                "trial": int(row["trial"]),
+                "order": order,
+                "rf": 0,
+                "ack": 1,
+                "n_clients": 4,
+                "client_hosts": "c4,c3,c1,local",
+                "semantics": semantics,
+                "throughput_gbps": float(row["bandwidth_sum_gbps"]),
+            })
+    return selected, [csv_path, manifest_path]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rf2-csv", required=True, type=Path)
@@ -200,6 +270,9 @@ def main() -> None:
                         help="mixed-client N=4 .../multiclient/logs/<run-tag>")
     parser.add_argument("--commit", required=True)
     parser.add_argument("--n4-commit", required=True)
+    parser.add_argument("--n4-ordering-csv", required=True, type=Path)
+    parser.add_argument("--n4-ordering-manifest", required=True, type=Path)
+    parser.add_argument("--n4-ordering-commit", required=True)
     parser.add_argument("--pdf", required=True, type=Path)
     parser.add_argument("--paper-pdf", type=Path)
     parser.add_argument("--png", type=Path)
@@ -216,7 +289,19 @@ def main() -> None:
         args.rf0_n4_root, args.n4_commit, RF0_N4_CELLS, 4,
         "c4,c3,c1,local",
     )
+    # Scalog and Corfu retain their calibrated baseline campaign; replace only
+    # Embarcadero and its ordering-off bound with the clean same-commit rerun.
+    n4_rows = [
+        row for row in n4_rows
+        if row["series"] not in {"embar", "embar_o0"}
+    ]
     rows.extend(n4_rows)
+    ordering_rows, ordering_inputs = load_n4_ordering_rerun(
+        args.n4_ordering_csv,
+        args.n4_ordering_manifest,
+        args.n4_ordering_commit,
+    )
+    rows.extend(ordering_rows)
 
     values: dict[tuple[str, str], list[float]] = {}
     for row in rows:
@@ -306,10 +391,12 @@ def main() -> None:
             "min_gbps": min(trial_values), "max_gbps": max(trial_values),
             "values_gbps": trial_values,
         }
-    inputs = [args.rf2_csv, *rf0_inputs, *n4_inputs]
+    inputs = [args.rf2_csv, *rf0_inputs, *n4_inputs, *ordering_inputs]
     manifest = {
         "contract": {
-            "n2_git_commit": args.commit, "n4_git_commit": args.n4_commit,
+            "n2_git_commit": args.commit,
+            "n4_baseline_git_commit": args.n4_commit,
+            "n4_ordering_git_commit": args.n4_ordering_commit,
             "metric": "bandwidth_sum_gbps",
             "selection": "one successful result for each of three predeclared trials; no performance filtering",
             "client_rosters": {"n2": ["c4", "c3"],

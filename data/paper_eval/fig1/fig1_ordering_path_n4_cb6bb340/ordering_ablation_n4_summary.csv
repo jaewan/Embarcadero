@@ -1,0 +1,3 @@
+variant,cell,n_clients,metric,trials,median_gbps,delta_from_v0_gbps,delta_from_v0_pct
+V0,v0_order0_ack1_rf0,4,bandwidth_sum_gbps,3,17.307,0.0,0.0
+V1,v1_order5_ack1_rf0,4,bandwidth_sum_gbps,3,14.906,-2.400999999999998,-13.87299936441901
