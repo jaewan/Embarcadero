@@ -342,6 +342,10 @@ int main(int argc, char* argv[]) {
 	          << " EMBARCADERO_STAGE_TRACE="
 	          << (std::getenv("EMBARCADERO_STAGE_TRACE")
 	                  ? std::getenv("EMBARCADERO_STAGE_TRACE")
+	                  : "0")
+	          << " order5_fifo_ablation="
+	          << (std::getenv("EMBARCADERO_ORDER5_BYPASS_SESSION_FIFO_ABLATION")
+	                  ? std::getenv("EMBARCADERO_ORDER5_BYPASS_SESSION_FIFO_ABLATION")
 	                  : "0");
 
 	// Create and connect all manager components

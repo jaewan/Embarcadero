@@ -23,6 +23,7 @@ EXPECTED_CELLS = {
     "v3_order5_ack2_rf2_acct": "V3",
     "v4_order5_ack2_rf2_copy": "V4",
 }
+SESSION_ABLATION_CELL = {"v05_order5_nofifo_ack1_rf0": "V0.5"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +32,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-clients", type=int, default=2)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--metric", default="overlap_gbps")
+    parser.add_argument(
+        "--require-session-ablation",
+        action="store_true",
+        help="require the matched ORDER=5 session-FIFO-bypass cell",
+    )
+    parser.add_argument(
+        "--ordering-only",
+        action="store_true",
+        help="validate only V0, V0.5, and V1 from a targeted ordering campaign",
+    )
     parser.add_argument("--csv-out", type=Path)
     parser.add_argument("--manifest-out", type=Path)
     return parser.parse_args()
@@ -42,13 +53,22 @@ def fail(message: str) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.ordering_only:
+        expected_cells = {
+            "v0_order0_ack1_rf0": "V0",
+            "v1_order5_ack1_rf0": "V1",
+        }
+    else:
+        expected_cells = dict(EXPECTED_CELLS)
+    if args.require_session_ablation or args.ordering_only:
+        expected_cells.update(SESSION_ABLATION_CELL)
     raw = args.input.read_bytes()
     rows = list(csv.DictReader(raw.decode().splitlines()))
     selected = [
         row
         for row in rows
         if int(row["n_clients"]) == args.n_clients
-        and row["cell"] in EXPECTED_CELLS
+        and row["cell"] in expected_cells
     ]
     if not selected:
         fail(f"no N={args.n_clients} rows")
@@ -66,7 +86,7 @@ def main() -> None:
         fail("selected rows include a failed trial")
 
     summaries: list[dict[str, object]] = []
-    for cell, label in EXPECTED_CELLS.items():
+    for cell, label in expected_cells.items():
         group = [row for row in selected if row["cell"] == cell]
         trial_ids = sorted(int(row["trial"]) for row in group)
         expected_trials = list(range(1, args.trials + 1))
@@ -102,12 +122,20 @@ def main() -> None:
             "delta_pct": 100.0 * (after_value - before_value) / before_value,
         }
 
-    comparisons = {
+    comparisons: dict[str, dict[str, float | str]] = {
+        # Backward-compatible key used by the existing artifact.
         "ordering": comparison("V0", "V1"),
-        "background_replica_copy": comparison("V1", "V2"),
-        "ack2_accounting": comparison("V1", "V3"),
-        "ack2_payload_copy": comparison("V3", "V4"),
+        "complete_ordering_path": comparison("V0", "V1"),
     }
+    if not args.ordering_only:
+        comparisons.update({
+            "background_replica_copy": comparison("V1", "V2"),
+            "ack2_accounting": comparison("V1", "V3"),
+            "ack2_payload_copy": comparison("V3", "V4"),
+        })
+    if "V0.5" in by_variant:
+        comparisons["global_ordering"] = comparison("V0", "V0.5")
+        comparisons["session_fifo"] = comparison("V0.5", "V1")
 
     manifest = {
         "schema": 1,

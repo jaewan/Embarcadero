@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Fig 1 path decomposition: 6-variant ACK/replication ablation.
-# V0–V4 + V3' use identical binaries, commit, and cluster initialization.
+# Fig 1 path decomposition: ACK/replication and ordering ablations.
+# All variants use identical binaries, commit, and cluster initialization.
 #
 # Variant | Order | ACK | RF | Sink                | CXL_COHERENT | Repl executes? | ACK waits | Isolates
 # --------|-------|-----|----|--------------------|--------------|----------------|-----------|----------------------------------
-# V0      |  0    |  1  |  0 | disabled           |    —         |      No        |    No     | Unordered floor
-# V1      |  5    |  1  |  0 | disabled           |    —         |      No        |    No     | Ordering-only ceiling
+# V0      |  0    |  1  |  0 | disabled           |    —         |      No        |    No     | Unordered-ingest ceiling
+# V0.5    |  5*   |  1  |  0 | disabled           |    —         |      No        |    No     | Global order, session FIFO bypassed
+# V1      |  5    |  1  |  0 | disabled           |    —         |      No        |    No     | Global order + session FIFO
 # V2      |  5    |  1  |  2 | memory-copy        |    —         |      Yes       |    No     | Background-repl contention
 # V3      |  5    |  2  |  2 | memory-accounting  |    0         |  Control+clfl  |    Yes    | ACK2 protocol + clflush overhead
 # V3'     |  5    |  2  |  2 | memory-accounting  |    1         |  Control only  |    Yes    | ACK2 pure protocol (no payload CXL touch)
@@ -26,7 +27,7 @@
 # Reqs:
 #   - 4/4 brokers must reach readiness (follower logs must show lazy mapping)
 #   - No MAP_POPULATE in follower logs
-#   - No unknown-sink warnings for V0/V1
+#   - No unknown-sink warnings for V0/V0.5/V1
 #   - Exactly 3 successful, nonempty result rows per cell before advancing
 #   - Lock acquired, ports 1214-1217 + 12140 free, no stale processes before each cell
 #
@@ -36,7 +37,7 @@
 #   - send-done alone is insufficient; this script also checks broker receive counters
 #
 # Usage: bash PaperScripts/run_fig1_path_decomp.sh [--smoke]
-#   --smoke: runs V0+V1 N=1, 1 trial, 512 MiB to validate setup before full matrix
+#   --smoke: runs V0+V0.5+V1 N=1, 1 trial to validate setup before full matrix
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,14 +47,18 @@ SCRIPTS_DIR="$PROJECT_ROOT/scripts"
 SMOKE_MODE=0
 [[ "${1:-}" == "--smoke" ]] && SMOKE_MODE=1
 
-CAMPAIGN_ID=fig1_path_decomp
-PASS_ID=$(date -u +%Y%m%dT%H%M%SZ)
-OUT_ROOT="$PROJECT_ROOT/data/paper_eval/fig1/$CAMPAIGN_ID"
+CAMPAIGN_ID="${CAMPAIGN_ID:-fig1_path_decomp}"
+PASS_ID="${PASS_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+OUT_ROOT="${OUT_ROOT:-$PROJECT_ROOT/data/paper_eval/fig1/$CAMPAIGN_ID}"
 LOG_DIR="$OUT_ROOT/logs/$PASS_ID"
 MULTICLIENT_ROOT="$OUT_ROOT/multiclient"
 RESULTS_CSV="$OUT_ROOT/results.csv"
 SUMMARY_LOG="$OUT_ROOT/sweep_summary.log"
 
+if [[ -e "$OUT_ROOT" ]]; then
+    echo "ERROR: output root already exists; refusing to append or mix passes: $OUT_ROOT" >&2
+    exit 2
+fi
 mkdir -p "$LOG_DIR" "$MULTICLIENT_ROOT"
 
 # --- Knobs: identical to Fig 1 RF2 campaign ---
@@ -63,10 +68,11 @@ if [[ "$SMOKE_MODE" -eq 1 ]]; then
     NUM_TRIALS=1
     N_VALUES="1"
 else
-    TOTAL_BYTES=$((10 * 1024 * 1024 * 1024))  # 10 GiB aggregate (same as Fig1)
-    NUM_TRIALS=3
-    N_VALUES="1 2 3 4"   # N=4: co-located publisher (CXL write ceiling point)
+    TOTAL_BYTES="${TOTAL_BYTES:-$((10 * 1024 * 1024 * 1024))}"  # same as Fig1
+    NUM_TRIALS="${NUM_TRIALS:-3}"
+    N_VALUES="${N_VALUES:-1 2 3 4}"  # N=4 adds a co-located publisher
 fi
+RUN_REPLICATION_VARIANTS="${RUN_REPLICATION_VARIANTS:-1}"
 REQUIRED_SUCCESSES=$NUM_TRIALS
 MSG_SIZE=4096
 THREADS=6
@@ -139,25 +145,60 @@ assert_clean_state() {
     return 0
 }
 
-# --- Validate follower logs after broker start ---
-check_no_map_populate() {
-    local mc_log_dir="$1"
-    # Follower logs are /tmp/broker_{1,2,3}.log (also copied to mc_log_dir by multiclient)
-    local warn=0
-    for b in 1 2 3; do
-        local blog="/tmp/broker_${b}.log"
-        if [[ -f "$blog" ]]; then
-            if grep -q 'MAP_POPULATE' "$blog" 2>/dev/null; then
-                log "WARNING: broker ${b} used MAP_POPULATE — CXL_MAP_POPULATE=0 may not have reached it"
-                warn=1
+# Validate the exact archived broker processes belonging to each successful
+# trial/attempt. Only broker 0 executes EpochSequencerThread, so the runtime
+# ablation marker is required there; every broker must report the effective
+# environment value in its startup configuration.
+validate_successful_attempt_logs() {
+    local mc_log_dir="$1" cell="$2"
+    local attempts="$mc_log_dir/attempt_summary.csv"
+    [[ -f "$attempts" ]] || {
+        log "FAIL [$cell]: missing attempt_summary.csv"
+        return 1
+    }
+
+    local expected_flag=0 success_count=0 bad=0
+    [[ "$cell" == "v05_order5_nofifo_ack1_rf0" ]] && expected_flag=1
+    while IFS=',' read -r trial attempt result reason; do
+        [[ "$trial" == "trial" || "$result" != "success" ]] && continue
+        success_count=$((success_count + 1))
+        local b broker_log
+        for b in 0 1 2 3; do
+            broker_log="$mc_log_dir/trial${trial}_attempt${attempt}_broker${b}.log"
+            if [[ ! -s "$broker_log" ]]; then
+                log "FAIL [$cell]: missing successful-attempt broker log $broker_log"
+                bad=1
+                continue
             fi
-            if grep -q 'unknown.*SINK\|falling back' "$blog" 2>/dev/null; then
-                log "WARNING: broker ${b} shows sink fallback warning"
-                warn=1
+            if ! grep -Fq "order5_fifo_ablation=$expected_flag" "$broker_log"; then
+                log "FAIL [$cell]: broker $b trial $trial attempt $attempt lacks effective ablation=$expected_flag"
+                bad=1
             fi
-        fi
-    done
-    return $warn
+            if grep -q 'MAP_POPULATE' "$broker_log"; then
+                log "FAIL [$cell]: broker $b trial $trial attempt $attempt used MAP_POPULATE"
+                bad=1
+            fi
+            if grep -Eqi 'unknown.*sink|sink.*falling back|falling back.*sink' "$broker_log"; then
+                log "FAIL [$cell]: broker $b trial $trial attempt $attempt reports sink fallback"
+                bad=1
+            fi
+            if [[ "$expected_flag" -eq 1 && "$b" -eq 0 ]]; then
+                if ! grep -Fq '[ORDER5_SESSION_FIFO_ABLATION]' "$broker_log"; then
+                    log "FAIL [$cell]: head trial $trial attempt $attempt lacks runtime ablation marker"
+                    bad=1
+                fi
+            elif grep -Fq '[ORDER5_SESSION_FIFO_ABLATION]' "$broker_log"; then
+                log "FAIL [$cell]: unexpected runtime ablation marker on broker $b trial $trial attempt $attempt"
+                bad=1
+            fi
+        done
+    done < "$attempts"
+
+    if [[ "$success_count" -ne "$REQUIRED_SUCCESSES" ]]; then
+        log "FAIL [$cell]: successful attempts=$success_count expected=$REQUIRED_SUCCESSES"
+        bad=1
+    fi
+    [[ "$bad" -eq 0 ]]
 }
 
 # --- Parse overlap CSV and append rows to results CSV ---
@@ -275,8 +316,10 @@ run_cell() {
             bash "$SCRIPTS_DIR/run_multiclient.sh"
     } >"$cell_log" 2>&1 || rc=$?
 
-    # Check for MAP_POPULATE and sink warnings
-    check_no_map_populate "$mc_log_dir" || true
+    if ! validate_successful_attempt_logs "$mc_log_dir" "$cell"; then
+        log "FAIL [$cell N=$n]: successful-attempt log validation failed"
+        rc=1
+    fi
 
     local ok_count
     ok_count=$(append_results "$cell" "$variant" "$order" "$ack" "$rf" "$sink_label" \
@@ -291,12 +334,30 @@ run_cell() {
     fi
 }
 
+CAMPAIGN_FAILURES=0
+run_required_cell() {
+    if ! run_cell "$@"; then
+        CAMPAIGN_FAILURES=$((CAMPAIGN_FAILURES + 1))
+    fi
+    return 0
+}
+
 # --- Variant env builders (subshell-safe "KEY=VALUE" arrays) ---
 # V0/V1: RF=0 — unset all sink vars so no warnings, no fallback
 V01_ENV=(
     "EMBARCADERO_CHAIN_REPLICATION_SINK="
     "EMBARCADERO_CHAIN_REPLICATION_INMEM=0"
     "EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=0"
+)
+V05_ENV=(
+    "${V01_ENV[@]}"
+    "EMBARCADERO_ORDER5_BYPASS_SESSION_FIFO_ABLATION=1"
+    "EMBAR_ORDER5_COMMIT_PROFILE=1"
+)
+V1_ENV=(
+    "${V01_ENV[@]}"
+    "EMBARCADERO_ORDER5_BYPASS_SESSION_FIFO_ABLATION=0"
+    "EMBAR_ORDER5_COMMIT_PROFILE=1"
 )
 # Actually need to unset — use empty string which run_multiclient ignores gracefully
 # The broker with RF=0 disables replication_manager regardless of sink
@@ -342,50 +403,135 @@ log "embarlet_md5=$BINARY_HASH_EMBARLET  client_md5=$BINARY_HASH_CLIENT"
 log "CXL_MAP_POPULATE=$EMBARCADERO_CXL_MAP_POPULATE (must be 0 for lazy follower mapping)"
 log "N_VALUES=$N_VALUES  NUM_TRIALS=$NUM_TRIALS  TOTAL_BYTES=$TOTAL_BYTES"
 
-log "--- V0: Unordered floor (ORDER=0, ACK1, RF=0) ---"
+log "--- V0: Unordered-ingest ceiling (ORDER=0, ACK1, RF=0) ---"
 for n in $N_VALUES; do
-    run_cell "v0_order0_ack1_rf0" "unordered-floor" \
-        0 1 0 "disabled" "$n" "$(hosts_for_n "$n")" "${V01_ENV[@]}" || true
+    run_required_cell "v0_order0_ack1_rf0" "unordered-ingest-ceiling" \
+        0 1 0 "disabled" "$n" "$(hosts_for_n "$n")" "${V01_ENV[@]}"
 done
 
-log "--- V1: Ordering ceiling (ORDER=5, ACK1, RF=0 — replication disabled) ---"
+log "--- V0.5: Global order with session FIFO bypassed (ORDER=5, ACK1, RF=0) ---"
 for n in $N_VALUES; do
-    run_cell "v1_order5_ack1_rf0" "ordering-only-ceiling" \
-        5 1 0 "disabled" "$n" "$(hosts_for_n "$n")" "${V01_ENV[@]}" || true
+    run_required_cell "v05_order5_nofifo_ack1_rf0" "global-order-no-session-fifo" \
+        5 1 0 "disabled" "$n" "$(hosts_for_n "$n")" "${V05_ENV[@]}"
 done
 
-if [[ "$SMOKE_MODE" -eq 0 ]]; then
+log "--- V1: Global order + session FIFO (ORDER=5, ACK1, RF=0) ---"
+for n in $N_VALUES; do
+    run_required_cell "v1_order5_ack1_rf0" "global-order-session-fifo" \
+        5 1 0 "disabled" "$n" "$(hosts_for_n "$n")" "${V1_ENV[@]}"
+done
+
+if [[ "$SMOKE_MODE" -eq 0 && "$RUN_REPLICATION_VARIANTS" -eq 1 ]]; then
     log "--- V2: Background replication contention (ORDER=5, ACK1, RF=2, memory-copy) ---"
     for n in $N_VALUES; do
-        run_cell "v2_order5_ack1_rf2_copy" "background-repl-contention" \
-            5 1 2 "memory-copy" "$n" "$(hosts_for_n "$n")" "${V2_ENV[@]}" || true
+        run_required_cell "v2_order5_ack1_rf2_copy" "background-repl-contention" \
+            5 1 2 "memory-copy" "$n" "$(hosts_for_n "$n")" "${V2_ENV[@]}"
     done
 
     log "--- V3: ACK2 protocol/accounting overhead (ORDER=5, ACK2, RF=2, memory-accounting) ---"
     for n in $N_VALUES; do
-        run_cell "v3_order5_ack2_rf2_acct" "ack2-protocol-overhead" \
-            5 2 2 "memory-accounting" "$n" "$(hosts_for_n "$n")" "${V3_ENV[@]}" || true
+        run_required_cell "v3_order5_ack2_rf2_acct" "ack2-protocol-overhead" \
+            5 2 2 "memory-accounting" "$n" "$(hosts_for_n "$n")" "${V3_ENV[@]}"
     done
 
     log "--- V3': ACK2 pure protocol, no CXL payload touch (ORDER=5, ACK2, RF=2, memory-accounting, CXL_COHERENT=1) ---"
     log "    Skips clflush on payload; isolates CV-advance protocol cost from CXL cache-coherence cost."
     log "    Expected: same as V0/V1. At N=4, should approach CXL write saturation (~21 GB/s)."
     for n in $N_VALUES; do
-        run_cell "v3prime_order5_ack2_rf2_acct_coherent" "ack2-coherent-noinval" \
-            5 2 2 "memory-accounting" "$n" "$(hosts_for_n "$n")" "${V3PRIME_ENV[@]}" || true
+        run_required_cell "v3prime_order5_ack2_rf2_acct_coherent" "ack2-coherent-noinval" \
+            5 2 2 "memory-accounting" "$n" "$(hosts_for_n "$n")" "${V3PRIME_ENV[@]}"
     done
 
     log "--- V4: Complete DRAM-replica path (ORDER=5, ACK2, RF=2, memory-copy) — matched baseline ---"
     log "    (Paper result re-run with same commit/binary as V0-V3' for controlled comparison)"
     for n in $N_VALUES; do
-        run_cell "v4_order5_ack2_rf2_copy" "complete-dram-replica" \
-            5 2 2 "memory-copy" "$n" "$(hosts_for_n "$n")" "${V4_ENV[@]}" || true
+        run_required_cell "v4_order5_ack2_rf2_copy" "complete-dram-replica" \
+            5 2 2 "memory-copy" "$n" "$(hosts_for_n "$n")" "${V4_ENV[@]}"
     done
 fi
 
 log "===== Fig1 path decomposition COMPLETE ====="
 log "CSV: $RESULTS_CSV"
 if [[ "$SMOKE_MODE" -eq 1 ]]; then
-    log "Smoke complete. Check follower logs for MAP_POPULATE warnings before full run."
+    log "Smoke complete. Archived successful-attempt logs passed all broker checks."
     log "Run full matrix: bash PaperScripts/run_fig1_path_decomp.sh"
+elif [[ "$CAMPAIGN_FAILURES" -eq 0 ]]; then
+    for n in $N_VALUES; do
+        metric=overlap_gbps
+        [[ "$n" -eq 4 ]] && metric=bandwidth_sum_gbps
+        summary_args=()
+        if [[ "$RUN_REPLICATION_VARIANTS" -eq 0 ]]; then
+            summary_args+=(--ordering-only)
+        fi
+        if ! python3 "$SCRIPT_DIR/summarize_fig1_path_ablation.py" \
+            "$RESULTS_CSV" --n-clients "$n" --trials "$NUM_TRIALS" \
+            --metric "$metric" --require-session-ablation "${summary_args[@]}" \
+            --csv-out "$OUT_ROOT/ordering_ablation_n${n}_summary.csv" \
+            --manifest-out "$OUT_ROOT/ordering_ablation_n${n}_manifest.json" \
+            > "$OUT_ROOT/ordering_ablation_n${n}_summary.json"; then
+            log "FAIL [summary N=$n]: validation or provenance generation failed"
+            CAMPAIGN_FAILURES=$((CAMPAIGN_FAILURES + 1))
+        fi
+    done
 fi
+
+if [[ "$CAMPAIGN_FAILURES" -ne 0 ]]; then
+    log "CAMPAIGN FAILED: $CAMPAIGN_FAILURES required cell/summary failure(s)"
+    exit 1
+fi
+
+log "CAMPAIGN PASS: all required cells and provenance checks succeeded"
+python3 - "$OUT_ROOT" "$CAMPAIGN_ID" "$PASS_ID" "$GIT_COMMIT" "$GIT_DIRTY" \
+    "$BINARY_HASH_EMBARLET" "$BINARY_HASH_CLIENT" "$NUM_TRIALS" "$N_VALUES" \
+    "$TOTAL_BYTES" "$MSG_SIZE" "$BATCH_KB" "$EPOCH_US" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+(
+    campaign, pass_id, commit, dirty, embarlet_md5, client_md5,
+    trials, n_values, total_bytes, msg_size, batch_kb, epoch_us,
+) = sys.argv[2:]
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+excluded = {"campaign_manifest.json", "SHA256SUMS"}
+artifacts = {
+    str(path.relative_to(root)): sha(path)
+    for path in sorted(root.rglob("*"))
+    if path.is_file() and path.name not in excluded
+}
+manifest = {
+    "schema": 1,
+    "status": "pass",
+    "campaign_id": campaign,
+    "pass_id": pass_id,
+    "git_commit": commit,
+    "git_dirty_files": int(dirty),
+    "binaries": {
+        "embarlet_md5": embarlet_md5,
+        "throughput_test_md5": client_md5,
+    },
+    "contract": {
+        "trials_per_cell": int(trials),
+        "n_clients": [int(value) for value in n_values.split()],
+        "total_bytes": int(total_bytes),
+        "message_bytes": int(msg_size),
+        "publisher_batch_kb": int(batch_kb),
+        "epoch_us": int(epoch_us),
+    },
+    "artifacts": artifacts,
+}
+(root / "campaign_manifest.json").write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+)
+PY
+(
+    cd "$OUT_ROOT"
+    find . -type f ! -name SHA256SUMS -print0 |
+        sort -z |
+        xargs -0 sha256sum > SHA256SUMS
+)

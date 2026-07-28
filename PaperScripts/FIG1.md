@@ -86,6 +86,61 @@ python3 PaperScripts/plot_fig1_throughput_scaling.py \
   --pdf data/paper_eval/fig1/fig1_rf2_ack2_scaling/fig1_throughput_scaling.pdf
 ```
 
+### Matched ordering-path ablation
+
+`PaperScripts/run_fig1_path_decomp.sh` includes three replication-off modes on
+the same binary and `ORDER=5` publication path:
+
+| Cell | Contract | Purpose |
+|---|---|---|
+| `v0_order0_ack1_rf0` | no global order | unordered-ingest upper bound |
+| `v05_order5_nofifo_ack1_rf0` | global order, session FIFO deliberately bypassed | isolates global-order publication |
+| `v1_order5_ack1_rf0` | global order plus session FIFO | adds predecessor checks and hold enforcement |
+
+The middle cell sets
+`EMBARCADERO_ORDER5_BYPASS_SESSION_FIFO_ABLATION=1`. It is deliberately invalid
+for correctness and failure claims; broker logs must contain
+`[ORDER5_SESSION_FIFO_ABLATION]`. Both `ORDER=5` cells enable
+`EMBAR_ORDER5_COMMIT_PROFILE=1`, which reports batches, messages, hold depth,
+and time in GOI, export, metadata, completion-vector, and held-slot phases.
+Because both `ORDER=5` modes retain grouping, within-round sorting, session
+state reconstruction, allocation, and reclamation, their difference measures
+the incremental checks and hold enforcement—not every CPU cycle attributable
+to session-aware processing.
+
+Run a smoke test before the paper-scale campaign:
+
+```bash
+bash PaperScripts/run_fig1_path_decomp.sh --smoke
+```
+
+Before any clean performance campaign, run the forced cross-seal semantic gate.
+It must report normal `ORDER=5` as valid and the bypass as invalid specifically
+because of `session_fifo_apply_order`:
+
+```bash
+PaperScripts/run_ordering_ablation_semantic_test.sh
+```
+
+After the full run, require the new cell when generating the summary:
+
+```bash
+# Target only the mixed local/remote ceiling; keep this on a clean commit.
+campaign="fig1_ordering_ablation_n4_$(git rev-parse --short=8 HEAD)_$(date -u +%Y%m%dT%H%M%SZ)"
+CAMPAIGN_ID="$campaign" \
+OUT_ROOT="data/paper_eval/fig1/$campaign" \
+N_VALUES=4 RUN_REPLICATION_VARIANTS=0 \
+bash PaperScripts/run_fig1_path_decomp.sh
+
+column -s, -t \
+  "data/paper_eval/fig1/$campaign/ordering_ablation_n4_summary.csv"
+```
+
+The runner already saves the required summary CSV and per-load manifest,
+constructs a campaign manifest containing archived-log hashes, writes
+`SHA256SUMS`, and exits nonzero on any missing cell, incomplete trial set,
+configuration mismatch, forbidden mapping/sink fallback, or summary failure.
+
 ## Caveats (read before citing numbers)
 
 ### A. Scalog / LazyLog RF2 sink mismatch (**fixed; old rows purged**)

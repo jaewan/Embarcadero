@@ -2031,6 +2031,12 @@ bool Publisher::Init(int ack_level) {
 	          << " memory_emulated_ack2=" << (IsMemoryEmulatedAck2() ? 1 : 0)
 	          << " unacked_retention="
 	          << (Ack2UsesOwnedRtoCopy() ? "owned_rto_copy" : "pool_pin");
+	if (order5_gap_delay_ms_ > 0) {
+		LOG(WARNING) << "[ORDER5_GAP_CONFIG]"
+		             << " batch_seq=" << order5_gap_batch_seq_
+		             << " delay_ms=" << order5_gap_delay_ms_
+		             << " period_batches=" << order5_gap_period_batches_;
+	}
 
 	// When set, PublishThread updates total_batches_attempted_ so ACK timeout log shows attempted count.
 	const char* ack_debug = std::getenv("EMBARCADERO_ACK_TIMEOUT_DEBUG");

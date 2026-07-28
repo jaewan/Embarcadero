@@ -157,6 +157,17 @@ static bool ShouldEnableOrder5CommitProfile() {
 	return enabled;
 }
 
+// Experimental cost-isolation switch. This retains the complete ORDER=5 scanner,
+// epoch, GOI, export, CV, ACK, fencing, and duplicate-suppression path, but bypasses
+// predecessor comparison and hold-map enforcement. It deliberately does NOT provide
+// per-session program order and must never be enabled for a correctness or failure run.
+// Its only supported use is a matched throughput ablation against normal ORDER=5.
+static bool ShouldBypassOrder5SessionFIFOForAblation() {
+	static const bool enabled = ReadEnvBoolLenient(
+		"EMBARCADERO_ORDER5_BYPASS_SESSION_FIFO_ABLATION", false);
+	return enabled;
+}
+
 static bool ShouldEnableOrder5SessionTestTrace() {
 	static const bool enabled =
 		ReadEnvBoolLenient("EMBARCADERO_TEST_ORDER5_SESSION_TRACE", false);
@@ -5791,6 +5802,11 @@ void Topic::EpochSequencerThread() {
 	// cost, to find why ACKed throughput can trail raw publish throughput on the ORDER=5
 	// EpochSequencerThread's single-threaded commit path. Deltas since the last print, so the
 	// numbers reflect recent load rather than a lifetime average that hides transients.
+	if (ShouldBypassOrder5SessionFIFOForAblation()) {
+		LOG(WARNING)
+			<< "[ORDER5_SESSION_FIFO_ABLATION] session FIFO is DISABLED; "
+			<< "this run provides global order only and is invalid for correctness/failure claims";
+	}
 	const bool commit_profile_enabled = (order_ == 5) && ShouldEnableOrder5CommitProfile();
 	auto last_commit_profile = std::chrono::steady_clock::now();
 	uint64_t last_cp_calls = 0, last_cp_batches = 0, last_cp_msgs = 0;
@@ -6985,6 +7001,19 @@ void Topic::ProcessLevel5BatchesShard(Level5ShardState& shard,
 				ready.push_back(std::move(p));
 				emitted.MarkEmitted(static_cast<uint64_t>(seq));
 				order5_fifo_violations_.fetch_add(1, std::memory_order_relaxed);
+			}
+			return;
+		}
+		if (ShouldBypassOrder5SessionFIFOForAblation()) {
+			// Fencing and both duplicate-suppression branches above remain identical
+			// to normal ORDER=5.  The ablation removes only predecessor comparison
+			// and hold-map enforcement: every unique, active-session batch proceeds
+			// to the unchanged epoch/GOI/CV/ACK path in scanner-observation order.
+			state.mark_sequenced(seq);
+			if (seq >= state.next_expected) state.set_next_expected(seq + 1);
+			if (!CheckAndInsertBatchId(shard, p.cached_batch_id)) {
+				emitted.MarkEmitted(static_cast<uint64_t>(seq));
+				ready.push_back(std::move(p));
 			}
 			return;
 		}

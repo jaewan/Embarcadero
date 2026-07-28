@@ -32,7 +32,7 @@ SERIES = {
     "scalog": ("CXL-Scalog", "#1b9e77", ""),
     "corfu": ("CXL-Corfu", "#d95f02", ""),
     "lazylog": ("CXL-LazyLog†", "#7570b3", "////"),
-    "embar_o0": ("Embar arrival-order‡", "#969696", "xx"),
+    "embar_o0": ("Embar ordering off‡", "#969696", "xx"),
 }
 
 GROUPS = [
