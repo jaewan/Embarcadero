@@ -47,7 +47,7 @@ serialization*, not "only Embar is correct":
 | C2 | Corfu is also Valid under Pipe — by serializing **the client's write path** in seal-time token order; under local batch amortization its rate is at parity with Embar | E1 Pipe row (post `[[CORFU_FIFO_FIX]]`) | paper-scale local ✅ |
 | C3 | Scalog/LazyLog global order **need not respect per-publisher submission order under striping** (`app:scalog-fifo`) — Pipe is Valid=NO with measured apply-order and same-key inversions | E1 Pipe + reorder audit | paper-scale local ✅ (LazyLog withheld for fidelity) |
 | C4 | Restoring FIFO **client-side by stop-and-wait** costs 325--370$\times$ here (policy lower bound, not a universal tax) | E1 Serialize row | paper-scale local ✅ |
-| C5 | Restoring FIFO **by sticky routing** is free at small scale — and re-creates the single-ingress bottleneck striping exists to remove | E2 (control) + E3 (necessity) | E2 smoke ✅; E3 pending |
+| C5 | Sticky routing preserves FIFO without a publication barrier, but forfeits per-session striping | E2 control + Q1 sticky/striped comparison | paper-scale E2 ✅; Q1 comparison ✅ |
 | C6 | Reorder pressure was real: the same seed/striping produced 13.8K--15.7K inversions per Scalog run; Embar absorbed the interleave with 0 reorders | E1 audit counters | paper-scale local ✅ |
 | C7 | The harness is a real SMR (independent subscriber replicas apply the log), and the Valid checker is itself cross-checked — **methodology hygiene, NOT a differentiator**: every totally-ordered log converges, including incorrect runs (uniformly wrong state) | E4 | harness done ✅ |
 | C8 | Pipelining is real depth, not batching luck: publish→apply lag distribution bounded under Pipe | E5 | hooks exist |
@@ -207,7 +207,7 @@ representative of the paper's remote testbed.
 | Order | Item | Cost | Unblocks |
 |---|---|---|---|
 | 1 | E1 paper-scale (local) | **complete 2026-07-18** | table draft, C1–C4, C6 |
-| 2 | E2 sticky control | **harness done + smoke-validated 2026-07-16** | C5 control, E3 framing |
+| 2 | E2 sticky control | **paper-scale complete 2026-07-28** (3/3 valid; median 1,129,327 apply ops/s) | C5 control |
 | 3 | E4 replica mode | **harness done + smoke-validated 2026-07-16** (2 replicas + publisher digest-identical, `smr_fifo_v2`) | C7 |
 | 4 | E5 apply-lag CDF | run-only | C8 |
 | 5 | E3 value-size scaling | ~1h runs; design sign-off first | C5 (necessity) |
@@ -224,6 +224,13 @@ negative control and the E3 premise that sticky is free at small payloads.
 Scalog sticky; replicas included) and divergent only for reordered Scalog
 pipe — internal cross-check of the Valid checker (see E4 scope note: this is
 methodology hygiene and an AE-appendix aid, never a paper result).
+
+Paper-scale sticky evidence is under
+`data/paper_eval/smr_fifo_scalog_sticky_151e0376/`. All three 500K-operation
+trials are Valid with zero inversions or final-state mismatches and the same
+digest. The one-active-server topology deliberately favors Scalog; it is a
+correctness control showing the placement tradeoff, not a four-server
+throughput claim.
 
 **Scalog Pipe reorder rate is stochastic at 10K-op local scale, not
 deterministic every trial** (`smr_fifo_r4c`, 3 trials, otherwise-identical
