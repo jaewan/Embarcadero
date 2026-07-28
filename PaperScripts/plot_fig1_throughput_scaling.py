@@ -32,14 +32,14 @@ SERIES = {
     "scalog": ("CXL-Scalog", "#1b9e77", ""),
     "corfu": ("CXL-Corfu", "#d95f02", ""),
     "lazylog": ("CXL-LazyLog†", "#7570b3", "////"),
-    "embar_o0": ("Embar O0 reference‡", "#969696", "xx"),
+    "embar_o0": ("Embar arrival-order‡", "#969696", "xx"),
 }
 
 GROUPS = [
-    ("disk", "NVMe durable\nRF2 / ACK2"),
-    ("mem", "DRAM replica\nRF2 / ACK2"),
-    ("rf0", "Replication off\nACK1"),
-    ("rf0_n4", "Mixed N=4 ceiling\nRF0 / ACK1"),
+    ("disk", "NVMe durable\n2-copy / durable ACK"),
+    ("mem", "DRAM completion\n2-copy"),
+    ("rf0", "Replication off\n2 remote publishers"),
+    ("rf0_n4", "Replication off\n3 remote + 1 local"),
 ]
 
 RF2_CELLS = {
@@ -270,7 +270,7 @@ def main() -> None:
 
     ax.set_xticks(centers)
     ax.set_xticklabels([label for _, label in GROUPS])
-    ax.set_ylabel("ACK throughput (GB/s)")
+    ax.set_ylabel("Acknowledged throughput (GB/s)")
     ax.set_ylim(0, 19.2)
     ax.set_xlim(-0.55, 3.55)
     ax.grid(True, axis="y", alpha=0.25, linestyle=":", zorder=0)

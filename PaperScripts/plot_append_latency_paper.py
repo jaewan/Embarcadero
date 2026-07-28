@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Paper-ready append-latency and epoch-sensitivity figure.
+"""Paper-ready batch-submit latency, baseline, and epoch-sensitivity figure.
 
-Panel (a) shows Embarcadero O5 ACK2 RF2 DRAM across offered load. Panel (b)
-shows the matched epoch sweep at 250 MB/s. Every accepted trial is shown behind
-the median lines; no performance outliers are removed.
+Panel (a) shows Embarcadero O5 ACK2 RF2 DRAM across publisher load targets.
+Panel (b) compares the three systems at the matched, admitted 100 MB/s point.
+Panel (c) shows the matched epoch sweep at 250 MB/s. Every accepted Embarcadero
+trial is shown behind the median lines; no performance outliers are removed.
 """
 from __future__ import annotations
 import argparse, csv, hashlib, json, os, shutil
@@ -18,6 +19,11 @@ import numpy as np
 # Publication colors
 C_P50 = "#2166AC"   # steel blue
 C_P99 = "#6BAED6"   # lighter blue for P99
+SYSTEM_COLORS = {
+    "Embarcadero": "#2166AC",
+    "CXL-Scalog": "#2CA25F",
+    "CXL-Corfu": "#D95F0E",
+}
 
 FONT_SIZE = 10
 TICK_SIZE = 9
@@ -82,6 +88,27 @@ def load_epochs(csv_path: str):
     return p50s, p99s
 
 
+def load_baseline_100(csv_path: str, cell: str):
+    p50s: list[float] = []
+    p99s: list[float] = []
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("status") != "ok" or row.get("cell") != cell:
+                continue
+            try:
+                target = int(float(row["target_mbps"]))
+                offered = float(row["achieved_offered_mbps"])
+                p50 = float(row["pub_ack_p50_us"])
+                p99 = float(row["pub_ack_p99_us"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if target != 100 or offered < 95.0:
+                continue
+            p50s.append(p50)
+            p99s.append(p99)
+    return p50s, p99s
+
+
 def median(vals):
     if not vals: return float("nan")
     s = sorted(vals)
@@ -92,6 +119,8 @@ def median(vals):
 def plot(
     csv_path: str,
     epoch_csv_path: str,
+    scalog_csv_path: str,
+    corfu_csv_path: str,
     pdf_path: str,
     paper_pdf_path: str | None,
     png_path: str | None,
@@ -125,6 +154,26 @@ def plot(
             f"missing={epoch_missing}, extras={epoch_extras}"
         )
 
+    baseline = {
+        "Embarcadero": (p50s[100], p99s[100]),
+        "CXL-Scalog": load_baseline_100(
+            scalog_csv_path, "fig2_scalog_o1_ack2_rf2_mem"
+        ),
+        "CXL-Corfu": load_baseline_100(
+            corfu_csv_path, "fig2_corfu_o2_ack2_rf2_mem"
+        ),
+    }
+    baseline_bad = {
+        system: (len(values[0]), len(values[1]))
+        for system, values in baseline.items()
+        if len(values[0]) != require_trials or len(values[1]) != require_trials
+    }
+    if baseline_bad:
+        raise SystemExit(
+            "matched baseline panel requires exactly "
+            f"{require_trials} admitted 100 MB/s trials: {baseline_bad}"
+        )
+
     loads = expected_loads
     x   = np.array(loads, dtype=float)
     y50 = np.array([median(p50s[t]) / 1000.0 for t in loads])  # → ms
@@ -136,7 +185,10 @@ def plot(
         "ytick.labelsize": TICK_SIZE, "legend.fontsize": 9,
     })
 
-    fig, axes = plt.subplots(1, 2, figsize=(7.1, 2.55))
+    fig, axes = plt.subplots(
+        1, 3, figsize=(7.1, 1.92),
+        gridspec_kw={"width_ratios": [1.12, 0.82, 1.0]},
+    )
 
     def raw_points(ax, xs, groups, scale=1000.0, color=C_P50, marker="o"):
         for x_value, values in zip(xs, groups):
@@ -158,9 +210,9 @@ def plot(
             markersize=4.5, linestyle="--", label="P99", zorder=3)
     ax.axhline(1.0, color="#999999", linestyle=":", linewidth=0.9, alpha=0.7)
     ax.text(100, 1.04, "1 ms", fontsize=7.5, color="#888888", va="bottom")
-    ax.set_title("(a) Offered-load sweep")
-    ax.set_xlabel("Offered load (MB/s)")
-    ax.set_ylabel("Append→ACK latency (ms)")
+    ax.set_title("(a) Publisher-load target")
+    ax.set_xlabel("Target (MB/s)")
+    ax.set_ylabel("Batch submit→ACK (ms)")
     ax.set_xlim(0, 2200)
     ax.set_ylim(0, max(y99) * 1.18)
     ax.yaxis.set_major_locator(ticker.MultipleLocator(0.5))
@@ -168,6 +220,30 @@ def plot(
               handlelength=1.5)
 
     ax = axes[1]
+    names = list(baseline)
+    positions = np.arange(len(names))
+    b50 = [median(baseline[name][0]) / 1000.0 for name in names]
+    b99 = [median(baseline[name][1]) / 1000.0 for name in names]
+    for i, name in enumerate(names):
+        color = SYSTEM_COLORS[name]
+        ax.plot([i, i], [b50[i], b99[i]], color=color, linewidth=1.2, zorder=2)
+        ax.scatter(i, b50[i], color=color, marker="o", s=24, zorder=3)
+        ax.scatter(
+            i, b99[i], facecolors="none", edgecolors=color, marker="s",
+            s=27, linewidths=1.2, zorder=3,
+        )
+    ax.set_yscale("log")
+    ax.set_ylim(0.15, 100)
+    ax.set_xticks(positions)
+    ax.set_xticklabels(["Embar.", "Scalog", "Corfu"], rotation=18)
+    ax.set_title("(b) Matched 100 MB/s")
+    ax.set_ylabel("Latency (ms)")
+    ax.text(
+        0.04, 0.95, "● P50   □ P99", transform=ax.transAxes,
+        fontsize=7.2, va="top",
+    )
+
+    ax = axes[2]
     epochs = expected_epochs
     e50 = np.array([median(epoch_p50s[t]) / 1000.0 for t in epochs])
     e99 = np.array([median(epoch_p99s[t]) / 1000.0 for t in epochs])
@@ -179,8 +255,8 @@ def plot(
             markersize=4.5, linestyle="--", label="P99", zorder=3)
     ax.plot(epochs, np.array(epochs) / 2000.0, color="#777777",
             linestyle=":", linewidth=1.0, label=r"$\tau/2$")
-    ax.set_title("(b) Epoch sweep at 250 MB/s")
-    ax.set_xlabel(r"Epoch $\tau$ ($\mu$s)")
+    ax.set_title("(c) Round sweep, 250 MB/s")
+    ax.set_xlabel(r"Round $\tau$ ($\mu$s)")
     ax.set_ylim(0, max(e99) * 1.16)
     ax.legend(loc="upper left", framealpha=0.92, edgecolor="#cccccc",
               handlelength=1.5)
@@ -191,7 +267,7 @@ def plot(
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
-    fig.tight_layout()
+    fig.tight_layout(pad=0.35, w_pad=0.55)
     os.makedirs(os.path.dirname(os.path.abspath(pdf_path)) or ".", exist_ok=True)
     fig.savefig(
         pdf_path, bbox_inches="tight",
@@ -214,6 +290,8 @@ def plot(
             "inputs": {
                 portable(csv_path): sha256(csv_path),
                 portable(epoch_csv_path): sha256(epoch_csv_path),
+                portable(scalog_csv_path): sha256(scalog_csv_path),
+                portable(corfu_csv_path): sha256(corfu_csv_path),
             },
             "generator": {
                 "path": portable(Path(__file__)),
@@ -245,6 +323,14 @@ def main():
         default="data/paper_eval/fig2/fig2_mechanism_epoch_clean_fd1a36ce/results.csv",
     )
     ap.add_argument(
+        "--scalog-csv",
+        default="data/paper_eval/fig2/fig2_scalog_official_3eaadffb/results.csv",
+    )
+    ap.add_argument(
+        "--corfu-csv",
+        default="data/paper_eval/fig2/fig2_corfu_official_3eaadffb/results.csv",
+    )
+    ap.add_argument(
         "--pdf",
         default="data/paper_eval/fig2/fig2_append_latency_clean_ad8a064f/append_latency.pdf",
     )
@@ -264,6 +350,8 @@ def main():
     plot(
         args.csv,
         args.epoch_csv,
+        args.scalog_csv,
+        args.corfu_csv,
         args.pdf,
         args.paper_pdf,
         args.png,

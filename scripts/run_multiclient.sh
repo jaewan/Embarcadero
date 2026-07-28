@@ -1417,7 +1417,11 @@ start_brokers() {
 	# One initial topic needs one CXL log segment per broker.  Ask the broker to
 	# reject an impossible real-CXL geometry during startup rather than retrying
 	# topic discovery until metadata allocation itself fails.
-    export EMBARCADERO_REQUIRED_CXL_SEGMENTS="$NUM_BROKERS"
+    # By default, prefault one initial payload segment per broker. Long-volume
+    # campaigns may roll each log into additional segments and must declare the
+    # full measured working set; preserve that explicit override so first-touch
+    # page faults do not re-enter the ingest path mid-run.
+    export EMBARCADERO_REQUIRED_CXL_SEGMENTS="${EMBARCADERO_REQUIRED_CXL_SEGMENTS:-$NUM_BROKERS}"
     local -a corfu_durability_args=()
     if [[ "$SEQUENCER" == "CORFU" && "$REPLICATION_FACTOR" -gt 1 ]]; then
         local corfu_sink

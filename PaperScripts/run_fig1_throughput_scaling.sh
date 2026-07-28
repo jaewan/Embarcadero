@@ -321,12 +321,9 @@ append_cell_results() {
             "$mc_log_dir" "$notes"
     fi
 
-    # Refresh figure after every cell so writing can start early.
-    if [[ -x "$(command -v python3)" ]]; then
-        python3 "$PAPER_DIR/plot_fig1_throughput_scaling.py" \
-            --csv "$RESULTS_CSV" --pdf "$FIG_PDF" --png "$FIG_PNG" \
-            >>"$LOG_DIR/plot.log" 2>&1 || log "WARN: plot refresh failed (see $LOG_DIR/plot.log)"
-    fi
+    # The canonical paper plot combines separately selected RF2/RF0 campaigns
+    # and validates their commits/manifests. Do not call that plotter with one
+    # in-progress campaign CSV; regenerate the figure only after selection.
 }
 
 run_fig1_cell() {

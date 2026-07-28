@@ -317,24 +317,12 @@ def _draw_interval_box(ax, ev: dict, ymax: float) -> None:
 
 
 def _draw_throughput_lines(ax, data, x_sec, broker_cols, failed_idx):
-    """Draw per-broker step lines and the aggregate dashed line.
+    """Draw raw per-broker step lines and the measured aggregate.
 
-    When per-broker sent_messages is exhausted (all zeros) but Total_GBps
-    shows a burst (ACK drain from hold buffer), redistribute Total_GBps
-    proportionally across surviving servers so the burst is visible in the
-    per-server lines rather than only in the aggregate dashed line.
+    Aggregate ACK progress can advance while the per-broker send counters are
+    zero (for example, when held ACKs drain). Keep those observables separate;
+    never infer a per-broker allocation from the aggregate.
     """
-    n_surviving = sum(1 for i in range(len(broker_cols)) if i != failed_idx)
-
-    # Build display series: redistribute burst to survivors when per-broker = 0
-    display = {}
-    for i, col in enumerate(broker_cols):
-        series = data[col].copy()
-        if i != failed_idx and n_surviving > 0:
-            # Where this server shows 0 but Total_GBps > 0, distribute equally
-            burst_mask = (series < THROUGHPUT_THRESHOLD) & (data["Total_GBps"] > THROUGHPUT_THRESHOLD)
-            series[burst_mask] = data.loc[burst_mask, "Total_GBps"] / n_surviving
-        display[col] = series
 
     safe_idx = 0
     for i, col in enumerate(broker_cols):
@@ -348,7 +336,7 @@ def _draw_throughput_lines(ax, data, x_sec, broker_cols, failed_idx):
             label = "Surviving log servers" if safe_idx == 0 else "_nolegend_"
             safe_idx += 1
             lw, alpha, zo = 1.2, 0.80, 2
-        ax.step(x_sec, display[col], where="post",
+        ax.step(x_sec, data[col], where="post",
                 linewidth=lw, color=color, alpha=alpha, label=label, zorder=zo)
 
     if "Total_GBps" in data.columns:
@@ -543,7 +531,7 @@ def make_panel_d(ax, emb_dir: str | None, corfu_dir: str | None) -> None:
             x_max = max(x_max, float(x_e.max()))
             ax.step(x_e, data_e["Total_GBps"], where="post",
                     color="#1f77b4", linewidth=2.0,
-                    label="Embarcadero ORDER=5 (reroutes)")
+                    label="Embarcadero prefix FIFO (reroutes)")
             if ev_e["kill"] is not None:
                 ax.axvline(ev_e["kill"], color="#1f77b4", linestyle=":",
                            linewidth=0.9, alpha=0.75)
@@ -621,7 +609,7 @@ def make_figure(
     # --- Panel (b): prefix-safe hold ---
     ev_b, data_b = _make_ab_panel(
         ax_b, hold_dir,
-        "(b) Prefix-safe hold (ORDER=5)",
+        "(b) Prefix-FIFO hold enabled",
     )
     ax_b.set_ylabel("")
 

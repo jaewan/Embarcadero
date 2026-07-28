@@ -271,6 +271,15 @@ trap cleanup EXIT
 # Multi-process knobs:
 #   SMR_FIFO_SESSIONS=N   N concurrent publisher sessions, disjoint keyspaces
 #                         (per-session FIFO validation; store-size check waived)
+#   SMR_FIFO_SESSION_ALLOWLISTS="ALL|0,1,3"
+#                         Optional per-session broker allowlists. "ALL" leaves
+#                         a session fully striped. This is used by the failure
+#                         isolation campaign to keep a control session striped
+#                         across the surviving brokers while another session
+#                         has an outstanding path through the failed broker.
+#   SMR_FIFO_TIMESERIES_DIR=DIR
+#                         Optional aligned per-session publisher ACK traces.
+#                         Requires KV_BENCH_CLIENT_RUNTIME_MODE=throughput.
 #   SMR_FIFO_REPLICAS=R   R subscriber-only replicas; each waits for the total
 #                         entry count and emits a state digest. Replica digests
 #                         must all match; with SESSIONS=1 they must also match
@@ -367,18 +376,47 @@ run_one() {
 
   local bench_status=0 s r
   local -a session_pids=() replica_pids=()
+  local timeseries_origin_ms=""
+  if [[ -n "${SMR_FIFO_TIMESERIES_DIR:-}" ]]; then
+    mkdir -p "$SMR_FIFO_TIMESERIES_DIR"
+    timeseries_origin_ms="$(date +%s%3N)"
+    printf '%s\n' "$timeseries_origin_ms" > "$SMR_FIFO_TIMESERIES_DIR/origin_epoch_ms.txt"
+  fi
+  local -a session_allowlists=()
+  if [[ -n "${SMR_FIFO_SESSION_ALLOWLISTS:-}" ]]; then
+    IFS='|' read -r -a session_allowlists <<< "$SMR_FIFO_SESSION_ALLOWLISTS"
+    if [[ "${#session_allowlists[@]}" -ne "$sessions" ]]; then
+      echo "ERROR: SMR_FIFO_SESSION_ALLOWLISTS has ${#session_allowlists[@]} entries; expected $sessions" >&2
+      [[ "$DRIVER_OWNS_CLUSTER" == 1 ]] && broker_local_cleanup
+      DRIVER_OWNS_CLUSTER=0
+      return 2
+    fi
+  fi
   CURRENT_TRIAL_PIDS=()  # global: lets an interrupt's EXIT trap kill these
   set +e
   for ((s = 0; s < sessions; s++)); do
     local -a session_flags=("${multi_flags[@]}")
+    local -a session_env=("${bench_env[@]}")
     session_flags+=(--manage_cluster="$manage")
     [[ "$sessions" -gt 1 ]] && session_flags+=(--key_offset=$((s * SMR_FIFO_RECORD_COUNT)))
+    if [[ -n "$timeseries_origin_ms" ]]; then
+      session_env+=(
+        "EMBARCADERO_THROUGHPUT_TIMESERIES_FILE=$SMR_FIFO_TIMESERIES_DIR/session_${s}.csv"
+        "EMBARCADERO_THROUGHPUT_TIMESERIES_ORIGIN_MS=$timeseries_origin_ms"
+        "EMBARCADERO_THROUGHPUT_TIMESERIES_INTERVAL_MS=${SMR_FIFO_TIMESERIES_INTERVAL_MS:-100}"
+      )
+    fi
+    if [[ "${#session_allowlists[@]}" -gt 0 &&
+          -n "${session_allowlists[$s]}" &&
+          "${session_allowlists[$s]}" != "ALL" ]]; then
+      session_env+=("EMBARCADERO_ORDER5_BROKER_ALLOWLIST=${session_allowlists[$s]}")
+    fi
     # [[FRONTIER]] Capture publish->ACK latency percentiles for the latency axis.
     [[ "${SMR_FIFO_TRACK_LATENCY:-0}" == "1" ]] && session_flags+=(--latency)
     # [[CAS]] etcd/ZK compare-and-set metadata-service oracle (Q3 end-to-end):
     # out-of-order apply -> rejected conditional writes (application-visible).
     [[ "${SMR_FIFO_CAS:-0}" == "1" ]] && session_flags+=(--cas)
-    timeout "$_bench_to" "${bench_env[@]}" \
+    timeout "$_bench_to" "${session_env[@]}" \
       "${EMBARLET_NUMA_ARR[@]}" "$BIN_DIR/kv_ycsb_bench" \
       --sequencer="$seq" \
       --order=-1 \

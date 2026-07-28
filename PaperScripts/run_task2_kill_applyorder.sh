@@ -17,17 +17,29 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 SYS="${SYS:-EMBARCADERO}"
 KILL="${KILL:-1}"
 KILL_PORT="${KILL_PORT:-1216}"     # broker 2 (a follower; head=1214)
-KILL_DELAY="${KILL_DELAY:-8}"
+KILL_DELAY="${KILL_DELAY:-15}"
 TRIALS="${TRIALS:-3}"
-OPS="${OPS:-2000000}"
+OPS="${OPS:-30000000}"
 KEYS="${KEYS:-5000}"
 RF="${RF:-2}"; ACK="${ACK:-1}"
 SESSIONS="${SESSIONS:-2}"
 BENCH_TIMEOUT_SEC="${BENCH_TIMEOUT_SEC:-300}"
+if [[ "$SESSIONS" -ne 2 ]]; then
+  echo "ERROR: this isolation campaign requires exactly two sessions" >&2
+  exit 2
+fi
 CAMPAIGN_ID="${CAMPAIGN_ID:-${SYS}_k${KILL}_p${KILL_PORT}}"
 OUT="$ROOT/data/paper_eval/task2_kill_applyorder/$CAMPAIGN_ID"; rm -rf "$OUT"; mkdir -p "$OUT"
-echo "commit=$(git rev-parse HEAD) dirty=[$(git status --porcelain --untracked-files=no|head -1)]" > "$OUT/provenance.txt"
+echo "git_commit=$(git rev-parse HEAD)" > "$OUT/provenance.txt"
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  echo "git_dirty=1" >> "$OUT/provenance.txt"
+else
+  echo "git_dirty=0" >> "$OUT/provenance.txt"
+fi
 echo "embarlet_sha256=$(sha256sum build/bin/embarlet|awk '{print $1}')" >> "$OUT/provenance.txt"
+echo "kv_ycsb_bench_sha256=$(sha256sum build/bin/kv_ycsb_bench|awk '{print $1}')" >> "$OUT/provenance.txt"
+git status --porcelain=v1 > "$OUT/worktree_status.txt"
+git diff --binary > "$OUT/worktree.patch"
 
 pkill -KILL -x embarlet 2>/dev/null || true
 for f in /dev/shm/CXL_*; do [ -e "$f" ] && [ "$(stat -c '%U' "$f")" = "domin" ] && rm -f "$f"; done 2>/dev/null
@@ -36,14 +48,31 @@ echo "system,trial,session,kill,kill_target,kill_verified,valid,applied,publishe
 
 for t in $(seq 1 "$TRIALS"); do
   cell="$OUT/trial${t}"; mkdir -p "$cell"; DRV="$cell/driver.log"; EVENT="$cell/failure_event.log"
+  mkdir -p "$cell/timeseries"
+  kb=$(( KILL_PORT - 1214 ))   # data port base 1214 -> broker index
+  if [[ -z "${SESSION_ALLOWLISTS:-}" ]]; then
+    survivor_allowlist=""
+    for broker_id in 0 1 2 3; do
+      [[ "$broker_id" -eq "$kb" ]] && continue
+      [[ -n "$survivor_allowlist" ]] && survivor_allowlist+=","
+      survivor_allowlist+="$broker_id"
+    done
+    # Session 0 is the affected, fully striped session. Session 1 remains
+    # striped across all three surviving servers and is the isolation control.
+    SESSION_ALLOWLISTS="ALL|$survivor_allowlist"
+  fi
   echo ">>> $SYS trial $t/$TRIALS RF=$RF ACK=$ACK sessions=$SESSIONS KILL=$KILL (port $KILL_PORT @ +${KILL_DELAY}s) $(date -u +%H:%M:%SZ)"
+  echo "    per-session broker allowlists: $SESSION_ALLOWLISTS"
   SMR_FIFO_SEQUENCERS="$SYS" SMR_FIFO_MODES="pipe" SMR_FIFO_NUM_TRIALS=1 \
     SMR_FIFO_SESSIONS="$SESSIONS" SMR_FIFO_RF="$RF" SMR_FIFO_ACK="$ACK" \
+    SMR_FIFO_SESSION_ALLOWLISTS="$SESSION_ALLOWLISTS" \
+    SMR_FIFO_TIMESERIES_DIR="$cell/timeseries" SMR_FIFO_TIMESERIES_INTERVAL_MS=100 \
     SMR_FIFO_RECORD_COUNT="$KEYS" SMR_FIFO_OPERATION_COUNT="$OPS" SMR_FIFO_WARMUP_OPS=5000 \
     EMBARCADERO_CHAIN_REPLICATION_SINK=memory-copy EMBARCADERO_CHAIN_REPLICATION_INMEM=1 EMBARCADERO_CHAIN_REPLICATION_INMEM_COPY=1 \
     EMBARCADERO_CORFU_SEQ_IP=10.10.10.10 \
     EMBARCADERO_SESSION_LEASE_MS=8000 EMBARCADERO_ORDER5_IDLE_FORCE_EXPIRE_MS=8000 \
     EMBARCADERO_TEST_ORDER5_SESSION_TRACE=1 \
+    KV_BENCH_CLIENT_RUNTIME_MODE=throughput \
     BENCH_TIMEOUT_SEC="$BENCH_TIMEOUT_SEC" OUT_ROOT="$cell" \
     setsid nohup bash benchmarks/kv_store/run_smr_fifo_eval.sh > "$DRV" 2>&1 &
   disown
@@ -57,7 +86,6 @@ for t in $(seq 1 "$TRIALS"); do
   kill_verified=0
   if [ "$KILL" = "1" ] && [ -n "$clog" ]; then
     sleep "$KILL_DELAY"
-    kb=$(( KILL_PORT - 1214 ))   # data port base 1214 -> broker index
     # The head (broker 0) is the only process launched with --head; target it
     # unambiguously (lsof on the shared port can return a client/other pid).
     bpid=""
@@ -70,6 +98,7 @@ for t in $(seq 1 "$TRIALS"); do
     [ -z "$bpid" ] && bpid=$(ss -tlnp 2>/dev/null | grep -E ":${KILL_PORT}\b" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
     {
       echo "utc_before=$(date -u +%FT%TZ)"
+      echo "epoch_ms_before=$(date +%s%3N)"
       echo "target_broker=$kb target_port=$KILL_PORT resolved_pid=${bpid:-none}"
       echo "listeners_before=$(ss -ltnp 2>/dev/null | grep -E \":${KILL_PORT}\\b\" || true)"
       if [ -n "$bpid" ] && [ -r "/proc/$bpid/cmdline" ]; then
@@ -88,6 +117,7 @@ for t in $(seq 1 "$TRIALS"); do
         ! kill -0 "$bpid" 2>/dev/null && [ -z "$listeners_after" ] && break
       done
       echo "utc_after=$(date -u +%FT%TZ)" >> "$EVENT"
+      echo "epoch_ms_after=$(date +%s%3N)" >> "$EVENT"
       echo "pid_alive_after=$(kill -0 "$bpid" 2>/dev/null && echo 1 || echo 0)" >> "$EVENT"
       echo "listeners_after=${listeners_after:-none}" >> "$EVENT"
       if ! kill -0 "$bpid" 2>/dev/null && [ -z "$listeners_after" ]; then
