@@ -147,6 +147,59 @@ struct QueueBufferTestPeer {
 
 namespace {
 
+TEST(Order5PublisherRetryPolicyTest, OverdueSuffixSelectsOnlyRetireCursorPredecessor) {
+	struct Candidate {
+		uint64_t batch_seq;
+		bool overdue;
+	};
+	// Every record is overdue.  Even if the container is not sorted, only the
+	// missing predecessor at the retire cursor is eligible; suffix records do
+	// not advance a cumulative ACK.
+	std::vector<Candidate> unacked{{9, true}, {7, true}, {8, true}};
+	auto selected = FindDueSessionRetirePredecessor(
+		unacked.begin(), unacked.end(), 7,
+		[](const Candidate& candidate) { return candidate.batch_seq; },
+		[](const Candidate& candidate) { return candidate.overdue; });
+	ASSERT_NE(selected, unacked.end());
+	EXPECT_TRUE(selected->overdue);
+	EXPECT_EQ(selected->batch_seq, 7u);
+
+	selected = FindDueSessionRetirePredecessor(
+		unacked.begin(), unacked.end(), 6,
+		[](const Candidate& candidate) { return candidate.batch_seq; },
+		[](const Candidate& candidate) { return candidate.overdue; });
+	EXPECT_EQ(selected, unacked.end())
+		<< "a suffix must not substitute for a missing retire-cursor batch";
+
+	unacked[1].overdue = false;
+	selected = FindDueSessionRetirePredecessor(
+		unacked.begin(), unacked.end(), 7,
+		[](const Candidate& candidate) { return candidate.batch_seq; },
+		[](const Candidate& candidate) { return candidate.overdue; });
+	EXPECT_EQ(selected, unacked.end())
+		<< "an overdue suffix must not substitute for a predecessor that is not due";
+}
+
+TEST(Order5PublisherRetryPolicyTest, ReadinessWithoutProgressStillExpiresDeadline) {
+	using Clock = std::chrono::steady_clock;
+	const auto start = Clock::time_point{};
+	const auto timeout = 30ms;
+
+	// Model repeated readiness notifications followed by EAGAIN.  Readiness is
+	// deliberately not an input to the predicate: without byte progress it must
+	// not reset or suppress the wall-clock deadline.
+	for (int readiness_events = 1; readiness_events < 30; ++readiness_events) {
+		EXPECT_FALSE(HeaderSendNoProgressExpired(
+			start + std::chrono::milliseconds(readiness_events), start, timeout));
+	}
+	EXPECT_TRUE(HeaderSendNoProgressExpired(start + timeout, start, timeout));
+	EXPECT_TRUE(HeaderSendNoProgressExpired(start + 10 * timeout, start, timeout));
+
+	const auto progressed = start + 25ms;
+	EXPECT_FALSE(HeaderSendNoProgressExpired(start + 40ms, progressed, timeout))
+		<< "actual byte progress resets the no-progress interval";
+}
+
 TEST(Order5PublisherRolloverTest, QueueBufferPauseCannotMissProducerEndWakeup) {
 	setenv("EMBAR_USE_HUGETLB", "0", 1);
 	QueueBuffer queue(/*num_buf=*/1, /*num_threads_per_broker=*/1, /*client_id=*/17,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -56,6 +57,30 @@ inline bool SessionPrefixAckEnd(uint64_t batch_seq,
 	if (batch_seq != expected_batch_seq || batch_ack_end == nullptr) return false;
 	*batch_ack_end = current_prefix_hwm + batch_num_msg;
 	return true;
+}
+
+// ACK1 retires one contiguous per-session prefix.  Only the batch at the
+// retire cursor can unblock that prefix; a later suffix batch is never a
+// useful retransmission candidate while its predecessor remains outstanding.
+// Keep this selection policy independent of Publisher's storage type so the
+// production decision can be regression-tested without sockets or timers.
+template <typename Iterator, typename SequenceOf, typename IsDue>
+Iterator FindDueSessionRetirePredecessor(Iterator begin,
+                                         Iterator end,
+                                         uint64_t retire_cursor,
+                                         SequenceOf sequence_of,
+                                         IsDue is_due) {
+	auto candidate = std::find_if(begin, end, [&](const auto& entry) {
+		return sequence_of(entry) == retire_cursor;
+	});
+	return candidate != end && is_due(*candidate) ? candidate : end;
+}
+
+inline bool HeaderSendNoProgressExpired(
+		std::chrono::steady_clock::time_point now,
+		std::chrono::steady_clock::time_point last_progress,
+		std::chrono::milliseconds timeout) {
+	return now - last_progress >= timeout;
 }
 
 inline size_t NextBatchSeqAfterSuffixResubmit(size_t suffix_batches) {

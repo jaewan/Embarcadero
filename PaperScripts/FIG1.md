@@ -94,7 +94,7 @@ replication-off modes and an opt-in semantic control:
 | Cell | Contract | Purpose |
 |---|---|---|
 | `v0_order0_ack1_rf0` | no global order | unordered-ingest upper bound |
-| `v05_order5_nofifo_ack1_rf0` | global order, session FIFO deliberately bypassed | isolates global-order publication |
+| `v05_order5_nofifo_ack1_rf0` | global order, session FIFO deliberately bypassed | adversarial semantic control; not a citable performance configuration |
 | `v1_order5_ack1_rf0` | global order plus session FIFO | adds predecessor checks and hold enforcement |
 
 The middle cell sets

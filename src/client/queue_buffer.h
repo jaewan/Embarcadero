@@ -17,6 +17,7 @@
 #include "folly/ProducerConsumerQueue.h"
 #include "folly/MPMCQueue.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -173,9 +174,9 @@ private:
 	std::unique_ptr<std::atomic<bool>[]> queue_active_;
 	std::unique_ptr<std::atomic<bool>[]> queue_preferred_;
 	std::atomic<size_t> preferred_queue_count_{0};
-	// Per-queue SPSC ring depth (queue fullness backpressure). Batch *pool* depth is
-	// send-pipeline only (queues×~32 slots); ACK/RTO credit is a separate Publisher
-	// bound and must not pin hugepage slots.
+	// Per-queue SPSC ring depth (queue fullness backpressure). ACK1 may retain pool
+	// slots for retransmission until its cumulative frontier advances; profile that
+	// coupling explicitly rather than assuming this is only a send-pipeline budget.
 	static constexpr size_t kQueueCapacity = 1024;
 
 	// Batch buffer pool (MPMC: producer acquires, consumers release via ReleaseBatch)
@@ -185,6 +186,9 @@ private:
 	std::vector<std::pair<void*, size_t>> batch_buffers_region_;  // (base, size) for munmap
 	size_t slot_size_{0};   // sizeof(BatchHeader) + batch_size_cached_, 64B aligned
 	size_t pool_slots_{0};
+	std::atomic<uint64_t> pool_wait_events_{0};
+	std::atomic<uint64_t> pool_wait_ns_{0};
+	std::atomic<uint64_t> pool_wait_max_ns_{0};
 	// Cached BATCH_SIZE once in AddBuffers; avoid GetConfig().get() + getenv() on every Write().
 	// Atomic so producer (Write) sees value set by cluster-probe thread (AddBuffers).
 	std::atomic<size_t> batch_size_cached_{0};

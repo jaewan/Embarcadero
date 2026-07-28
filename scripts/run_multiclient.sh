@@ -20,7 +20,9 @@
 #   EMBARCADERO_ORDER0_FAST_PATH, EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES,
 #   EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE, EMBARCADERO_BATCH_SIZE,
 #   EMBARCADERO_CLIENT_PUB_BATCH_KB, EMBARCADERO_NETWORK_IO_THREADS,
-#   EMBARCADERO_ORDER5_HOME_BROKERS, CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE,
+#   EMBARCADERO_ORDER5_HOME_BROKERS, CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE,
+#   CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE (legacy ORDER=5 alias),
+#   CLIENT_LOAD_BYTES_PIPE, CLIENT_TARGET_MBPS_PIPE,
 #   LOCAL_CLIENT_NUMA,
 #   REMOTE_CORFU_SEQUENCER_HOST, REMOTE_CORFU_BUILD_BIN,
 #   REMOTE_SCALOG_SEQUENCER_HOST, REMOTE_SCALOG_BUILD_BIN
@@ -63,11 +65,29 @@ if [[ -n "${CLIENT_NUMAS_CSV:-}" ]]; then
     IFS=',' read -r -a CLIENT_NUMAS <<< "$CLIENT_NUMAS_CSV"
 fi
 declare -a CLIENT_ORDER5_BROKER_ALLOWLISTS=()
-if [[ -n "${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-}" ]]; then
+if [[ -n "${CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE:-}" &&
+      -n "${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-}" ]]; then
+    echo "ERROR: set only CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE; the ORDER5 name is a legacy alias" >&2
+    exit 2
+elif [[ -n "${CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE:-}" ]]; then
+    IFS='|' read -r -a CLIENT_ORDER5_BROKER_ALLOWLISTS <<< "$CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE"
+elif [[ -n "${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-}" ]]; then
     IFS='|' read -r -a CLIENT_ORDER5_BROKER_ALLOWLISTS <<< "$CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE"
+fi
+declare -a CLIENT_LOAD_BYTES=()
+if [[ -n "${CLIENT_LOAD_BYTES_PIPE:-}" ]]; then
+    IFS='|' read -r -a CLIENT_LOAD_BYTES <<< "$CLIENT_LOAD_BYTES_PIPE"
+fi
+declare -a CLIENT_TARGET_MBPS=()
+if [[ -n "${CLIENT_TARGET_MBPS_PIPE:-}" ]]; then
+    IFS='|' read -r -a CLIENT_TARGET_MBPS <<< "$CLIENT_TARGET_MBPS_PIPE"
 fi
 if [[ -n "${EMBARCADERO_ORDER5_BROKER_ALLOWLIST:-}" ]]; then
     echo "ERROR: run_multiclient ignores a process-global EMBARCADERO_ORDER5_BROKER_ALLOWLIST; use CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE (one '|' separated entry per client)" >&2
+    exit 2
+fi
+if [[ -n "${EMBARCADERO_PUBLISH_BROKER_ALLOWLIST:-}" ]]; then
+    echo "ERROR: run_multiclient ignores a process-global EMBARCADERO_PUBLISH_BROKER_ALLOWLIST; use CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE" >&2
     exit 2
 fi
 declare -a CLIENT_ORDER5_GAP_DELAYS_MS=()
@@ -99,9 +119,29 @@ ACK=${ACK:-1}
 REPLICATION_FACTOR=${REPLICATION_FACTOR:-0}
 if (( ${#CLIENT_ORDER5_BROKER_ALLOWLISTS[@]} > 0 &&
       ${#CLIENT_ORDER5_BROKER_ALLOWLISTS[@]} != NUM_CLIENTS )); then
-    echo "ERROR: CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE has ${#CLIENT_ORDER5_BROKER_ALLOWLISTS[@]} entries; expected NUM_CLIENTS=$NUM_CLIENTS" >&2
+    echo "ERROR: per-client publish allowlist has ${#CLIENT_ORDER5_BROKER_ALLOWLISTS[@]} entries; expected NUM_CLIENTS=$NUM_CLIENTS" >&2
     exit 1
 fi
+if (( ${#CLIENT_LOAD_BYTES[@]} > 0 && ${#CLIENT_LOAD_BYTES[@]} != NUM_CLIENTS )); then
+    echo "ERROR: CLIENT_LOAD_BYTES_PIPE has ${#CLIENT_LOAD_BYTES[@]} entries; expected NUM_CLIENTS=$NUM_CLIENTS" >&2
+    exit 1
+fi
+if (( ${#CLIENT_TARGET_MBPS[@]} > 0 && ${#CLIENT_TARGET_MBPS[@]} != NUM_CLIENTS )); then
+    echo "ERROR: CLIENT_TARGET_MBPS_PIPE has ${#CLIENT_TARGET_MBPS[@]} entries; expected NUM_CLIENTS=$NUM_CLIENTS" >&2
+    exit 1
+fi
+for _client_load in "${CLIENT_LOAD_BYTES[@]}"; do
+    if [[ ! "$_client_load" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: CLIENT_LOAD_BYTES_PIPE entries must be positive integer byte counts (got '$_client_load')" >&2
+        exit 1
+    fi
+done
+for _client_target in "${CLIENT_TARGET_MBPS[@]}"; do
+    if [[ ! "$_client_target" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: CLIENT_TARGET_MBPS_PIPE entries must be positive integer MiB/s rates (got '$_client_target')" >&2
+        exit 1
+    fi
+done
 for _per_client_array_len in \
     "${#CLIENT_ORDER5_GAP_DELAYS_MS[@]}" "${#CLIENT_ORDER5_GAP_BATCH_SEQS[@]}"; do
     if (( _per_client_array_len > 0 && _per_client_array_len != NUM_CLIENTS )); then
@@ -1767,6 +1807,12 @@ start_brokers() {
 # Derived run-time values
 # ---------------------------------------------------------------------------
 LOAD_PER_CLIENT=$(( TOTAL_MESSAGE_SIZE / NUM_CLIENTS ))
+if (( ${#CLIENT_LOAD_BYTES[@]} > 0 )); then
+    TOTAL_MESSAGE_SIZE=0
+    for _client_load in "${CLIENT_LOAD_BYTES[@]}"; do
+        TOTAL_MESSAGE_SIZE=$(( TOTAL_MESSAGE_SIZE + _client_load ))
+    done
+fi
 
 echo "================================================================"
 echo "  Embarcadero Multi-Client Throughput Benchmark"
@@ -1829,7 +1875,13 @@ if [[ "$ACK" == "2" ]]; then
 fi
 printf "  %-32s %s\n" "MESSAGE_SIZE:"                  "$MESSAGE_SIZE B"
 printf "  %-32s %s\n" "TOTAL_MESSAGE_SIZE:"            "$TOTAL_MESSAGE_SIZE B  ($(( TOTAL_MESSAGE_SIZE / 1024 / 1024 )) MiB)"
-printf "  %-32s %s\n" "LOAD_PER_CLIENT:"               "$LOAD_PER_CLIENT B  ($(( LOAD_PER_CLIENT / 1024 / 1024 )) MiB)"
+if (( ${#CLIENT_LOAD_BYTES[@]} == 0 )); then
+    printf "  %-32s %s\n" "LOAD_PER_CLIENT:"               "$LOAD_PER_CLIENT B  ($(( LOAD_PER_CLIENT / 1024 / 1024 )) MiB)"
+else
+    printf "  %-32s %s\n" "LOAD_PER_CLIENT:"               "per-client vector below"
+fi
+printf "  %-32s %s\n" "CLIENT_LOAD_BYTES_PIPE:"        "${CLIENT_LOAD_BYTES_PIPE:-\"(uniform)\"}"
+printf "  %-32s %s\n" "CLIENT_TARGET_MBPS_PIPE:"       "${CLIENT_TARGET_MBPS_PIPE:-\"(unpaced)\"}"
 printf "  %-32s %s\n" "THREADS_PER_BROKER:"            "$THREADS_PER_BROKER"
 printf "  %-32s %s\n" "BROKER_IP:"                     "$BROKER_IP"
 printf "  %-32s %s\n" "START_DELAY_SEC:"               "$START_DELAY_SEC"
@@ -1846,6 +1898,7 @@ printf "  %-32s %s\n" "NETWORK_IO_THREADS:"            "$EMBARCADERO_NETWORK_IO_
 printf "  %-32s %s\n" "CONTROL_TRANSPORT:"            "$CONTROL_TRANSPORT"
 printf "  %-32s %s\n" "ORDER5_HOME_BROKERS:"           "${EMBARCADERO_ORDER5_HOME_BROKERS:-"(unset)"}"
 printf "  %-32s %s\n" "ORDER5_CLIENT_ALLOWLISTS:"       "${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-"(unset)"}"
+printf "  %-32s %s\n" "PUBLISH_CLIENT_ALLOWLISTS:"      "${CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE:-"(unset)"}"
 printf "  %-32s %s\n" "ORDER5_EPOCH_US:"               "${EMBAR_ORDER5_EPOCH_US:-"(default=500)"}"
 printf "  %-32s %s\n" "LOCAL_CLIENT_NUMA:"             "$(resolve_local_client_numa)"
 if [[ "$SEQUENCER" == "CORFU" ]]; then
@@ -1899,8 +1952,8 @@ if [[ "$CONTROL_TRANSPORT" == "cxl_mailbox" ]]; then
     # as smoke-only, never as CXL mailbox measurements.
     MAILBOX_BACKING="pending_runtime_verification"
 fi
-echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,order5_client_allowlists,corfu_group_commit_bytes,corfu_group_commit_delay_us,corfu_token_gate_policy,corfu_token_delay_us,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
-echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-},$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES,$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US,cv_fail_closed_v1,$CORFU_TOKEN_DELAY_US,${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
+echo "sequencer,control_transport,control_topology,mailbox_backing,cxl_layout_version,order,ack_level,replication_factor,rf_includes_primary,remote_replica_count,ack_durability_contract,lazylog_ack1_contract,lazylog_metadata_replica_count,order5_home_brokers,order5_client_allowlists,publish_client_allowlists,client_load_bytes_pipe,client_target_mbps_pipe,corfu_group_commit_bytes,corfu_group_commit_delay_us,corfu_token_gate_policy,corfu_token_delay_us,git_commit,git_dirty" > "$RUN_CONTRACT_CSV"
+echo "$SEQUENCER,$CONTROL_TRANSPORT,$CONTROL_TOPOLOGY,$MAILBOX_BACKING,$CXL_LAYOUT_VERSION,$ORDER,$ACK,$REPLICATION_FACTOR,true,$(( REPLICATION_FACTOR > 0 ? REPLICATION_FACTOR - 1 : 0 )),$ACK_DURABILITY_CONTRACT,$LAZYLOG_METADATA_CONTRACT,$LAZYLOG_METADATA_REPLICA_COUNT,${EMBARCADERO_ORDER5_HOME_BROKERS:-},${CLIENT_ORDER5_BROKER_ALLOWLISTS_PIPE:-},${CLIENT_PUBLISH_BROKER_ALLOWLISTS_PIPE:-},${CLIENT_LOAD_BYTES_PIPE:-},${CLIENT_TARGET_MBPS_PIPE:-},$EMBARCADERO_CORFU_GROUP_COMMIT_BYTES,$EMBARCADERO_CORFU_GROUP_COMMIT_DELAY_US,cv_fail_closed_v1,$CORFU_TOKEN_DELAY_US,${GIT_COMMIT},${GIT_DIRTY}" >> "$RUN_CONTRACT_CSV"
 
 if ! lazylog_metadata_endpoints_ready; then
     exit 1
@@ -2010,6 +2063,17 @@ for (( trial=1; trial<=NUM_TRIALS; trial++ )); do
             fi
             client_order5_gap_delay_ms=0
             client_order5_gap_batch_seq=0
+            client_load_bytes="$LOAD_PER_CLIENT"
+            client_extra_args="$CLIENT_EXTRA_ARGS"
+            if (( ${#CLIENT_LOAD_BYTES[@]} > 0 )); then
+                client_load_bytes="${CLIENT_LOAD_BYTES[$i]}"
+            fi
+            if (( ${#CLIENT_TARGET_MBPS[@]} > 0 )); then
+                # target_mbps alone applies continuous offered-load pacing. Do
+                # not add --steady_rate: that flag deliberately flushes and
+                # pauses every ~2 MiB, confounding placement with barriers.
+                client_extra_args="${client_extra_args} --target_mbps ${CLIENT_TARGET_MBPS[$i]}"
+            fi
             if (( ${#CLIENT_ORDER5_GAP_DELAYS_MS[@]} > 0 )); then
                 client_order5_gap_delay_ms="${CLIENT_ORDER5_GAP_DELAYS_MS[$i]}"
             fi
@@ -2060,6 +2124,10 @@ export NUM_BROKERS=$NUM_BROKERS
 export EMBARCADERO_CXL_SHM_NAME=$EMBARCADERO_CXL_SHM_NAME
 export EMBARCADERO_CXL_ZERO_MODE=${EMBARCADERO_CXL_ZERO_MODE:-full}
 export EMBARCADERO_RUNTIME_MODE=throughput
+if [ -n "${EMBARCADERO_TCP_USER_TIMEOUT_MS:-}" ]; then export EMBARCADERO_TCP_USER_TIMEOUT_MS=${EMBARCADERO_TCP_USER_TIMEOUT_MS:-}; fi
+if [ -n "${EMBARCADERO_HEADER_SEND_TIMEOUT_MS:-}" ]; then export EMBARCADERO_HEADER_SEND_TIMEOUT_MS=${EMBARCADERO_HEADER_SEND_TIMEOUT_MS:-}; fi
+if [ -n "${EMBARCADERO_SESSION_RTO_MIN_MS:-}" ]; then export EMBARCADERO_SESSION_RTO_MIN_MS=${EMBARCADERO_SESSION_RTO_MIN_MS:-}; fi
+if [ -n "${EMBARCADERO_THROUGHPUT_PACE_QUANTUM_BYTES:-}" ]; then export EMBARCADERO_THROUGHPUT_PACE_QUANTUM_BYTES=${EMBARCADERO_THROUGHPUT_PACE_QUANTUM_BYTES:-}; fi
 export EMBARCADERO_REPLICATION_FACTOR=$REPLICATION_FACTOR
 export EMBARCADERO_CORFU_TOKEN_DELAY_US=$CORFU_TOKEN_DELAY_US
 export EMBARCADERO_ORDER0_FAST_PATH=$EMBARCADERO_ORDER0_FAST_PATH
@@ -2070,6 +2138,7 @@ export EMBARCADERO_CLIENT_PUB_BATCH_KB=$EMBARCADERO_CLIENT_PUB_BATCH_KB
 export EMBARCADERO_NETWORK_IO_THREADS=$EMBARCADERO_NETWORK_IO_THREADS
 export EMBARCADERO_ORDER5_HOME_BROKERS=$EMBARCADERO_ORDER5_HOME_BROKERS
 export EMBARCADERO_ORDER5_BROKER_ALLOWLIST=$client_order5_allowlist
+export EMBARCADERO_PUBLISH_BROKER_ALLOWLIST=$client_order5_allowlist
 export EMBARCADERO_ORDER5_GAP_DELAY_MS=$client_order5_gap_delay_ms
 export EMBARCADERO_ORDER5_GAP_BATCH_SEQ=$client_order5_gap_batch_seq
 if [ -n "${EMBARCADERO_ACK_TIMEOUT_SEC:-}" ]; then export EMBARCADERO_ACK_TIMEOUT_SEC=${EMBARCADERO_ACK_TIMEOUT_SEC:-}; fi
@@ -2120,7 +2189,7 @@ if [ \$(( __bar_now_ms - $START_TIME_MS )) -gt 2000 ]; then
   echo "WARNING: BARRIER MISSED by \$(( __bar_now_ms - $START_TIME_MS )) ms — host clock skewed vs broker; concurrency of this trial is suspect" >&2
 fi
 echo \$\$ > $remote_pid_file
-exec numactl --cpunodebind=$numa --membind=$numa ./throughput_test --config $CLIENT_CONFIG_ABS -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $LOAD_PER_CLIENT -t $TEST_TYPE -o $ORDER -a $ACK -r $REPLICATION_FACTOR --sequencer $SEQUENCER --head_addr $BROKER_IP -l 0 $CLIENT_EXTRA_ARGS
+exec numactl --cpunodebind=$numa --membind=$numa ./throughput_test --config $CLIENT_CONFIG_ABS -n $THREADS_PER_BROKER -m $MESSAGE_SIZE -s $client_load_bytes -t $TEST_TYPE -o $ORDER -a $ACK -r $REPLICATION_FACTOR --sequencer $SEQUENCER --head_addr $BROKER_IP -l 0 $client_extra_args
 ENDINNERSCRIPT
 )"
 

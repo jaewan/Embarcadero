@@ -263,6 +263,9 @@ int GetNonblockingSock(char* broker_address, int port, bool send) {
             if (setsockopt(sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
                            &tcp_user_timeout_ms, sizeof(tcp_user_timeout_ms)) != 0) {
                 LOG(WARNING) << "setsockopt(TCP_USER_TIMEOUT) failed: " << strerror(errno);
+            } else {
+                LOG(INFO) << "[TCP_USER_TIMEOUT] fd=" << sock
+                          << " applied_ms=" << tcp_user_timeout_ms;
             }
         }
     }

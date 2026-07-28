@@ -2,7 +2,7 @@
 """Generate the two-panel broker-failure figure for the Embarcadero paper.
 
 Panel (a): arrival-order / hold disabled (sensitivity)
-Panel (b): program-order hold with prefix safety (contract claim)
+Panel (b): per-session FIFO hold with prefix safety (contract claim)
 
 T-event timeline overlay (panels a and b):
   T0 = broker kill issued
@@ -531,7 +531,7 @@ def make_panel_d(ax, emb_dir: str | None, corfu_dir: str | None) -> None:
             x_max = max(x_max, float(x_e.max()))
             ax.step(x_e, data_e["Total_GBps"], where="post",
                     color="#1f77b4", linewidth=2.0,
-                    label="Embarcadero program order (reroutes)")
+                    label="Embarcadero per-session FIFO (reroutes)")
             if ev_e["kill"] is not None:
                 ax.axvline(ev_e["kill"], color="#1f77b4", linestyle=":",
                            linewidth=0.9, alpha=0.75)
@@ -606,10 +606,10 @@ def make_figure(
     )
     ax_a.set_ylabel("Throughput (GB/s)")
 
-    # --- Panel (b): program-order hold with prefix safety ---
+    # --- Panel (b): per-session FIFO hold with prefix safety ---
     ev_b, data_b = _make_ab_panel(
         ax_b, hold_dir,
-        "(b) Program-order hold (prefix-safe)",
+        "(b) Per-session FIFO hold (prefix-safe)",
     )
     ax_b.set_ylabel("")
 

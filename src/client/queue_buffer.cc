@@ -22,9 +22,9 @@ namespace {
 	constexpr size_t kQueueFullSleepMs = 1;
 	constexpr size_t kMaxRegions = 4;  // allow multiple AddBuffers(); pool capacity = pool_slots_ * kMaxRegions
 	constexpr size_t kAlign = 64;
-	// Steady-state send-pipeline budget only. Unacked/ACK retention no longer
-	// pins pool slots (Publisher owns an RTO copy), so this must not track the
-	// ACK credit window. Exhausted pool → Write() blocks until ReleaseBatch.
+	// Base send-pipeline budget. Some Publisher retention policies (notably ACK1)
+	// pin pool slots until cumulative ACK, so experiments must size and profile
+	// this arena as an ACK-credit window too.
 	constexpr size_t kDefaultPoolSizeBytes = 256ULL * 1024 * 1024;
 	// Upper bound for hugepage mmap (pipeline depth under large thread counts).
 	// Still << the historical 48 GiB (queues×kQueueCapacity×slot) blow-up.
@@ -137,6 +137,17 @@ QueueBuffer::QueueBuffer(size_t num_buf, size_t num_threads_per_broker, int clie
 }
 
 QueueBuffer::~QueueBuffer() {
+	if (const char* profile = std::getenv("EMBAR_PROFILE_NETWORK_PATH");
+	    profile != nullptr && profile[0] != '\0' && profile[0] != '0') {
+		LOG(INFO) << "[QUEUE_POOL_PROFILE] wait_events="
+		          << pool_wait_events_.load(std::memory_order_relaxed)
+		          << " wait_ms="
+		          << (static_cast<double>(pool_wait_ns_.load(std::memory_order_relaxed)) / 1.0e6)
+		          << " max_wait_ms="
+		          << (static_cast<double>(pool_wait_max_ns_.load(std::memory_order_relaxed)) / 1.0e6)
+		          << " pool_slots=" << pool_slots_
+		          << " pool_bytes=" << (pool_slots_ * slot_size_);
+	}
 	for (auto& p : batch_buffers_region_) {
 		if (p.first && p.second) {
 			munmap(p.first, p.second);
@@ -281,7 +292,13 @@ bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* co
 	// active_producer_ops_==0 before it can trim/release unacked pool slots. If we
 	// keep the op held here, Pause waits forever and the pool never frees — hung
 	// overnight latency runs after SESSION_FENCED (futex forever, log frozen).
+	bool waited_for_pool = false;
+	auto wait_start = std::chrono::steady_clock::time_point{};
 	while (!pool_->read(next)) {
+		if (!waited_for_pool) {
+			waited_for_pool = true;
+			wait_start = std::chrono::steady_clock::now();
+		}
 		if (shutdown_.load(std::memory_order_relaxed)) {
 			current_batch_ = nullptr;
 			current_batch_tail_ = 0;
@@ -305,6 +322,18 @@ bool QueueBuffer::AcquireNextBatchFromPool(bool stop_on_shutdown, const char* co
 			current_batch_num_msg_ = 0;
 			return false;
 		}
+	}
+	if (waited_for_pool) {
+		const uint64_t elapsed_ns = static_cast<uint64_t>(
+			std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - wait_start).count());
+		pool_wait_events_.fetch_add(1, std::memory_order_relaxed);
+		pool_wait_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+		uint64_t previous = pool_wait_max_ns_.load(std::memory_order_relaxed);
+		while (elapsed_ns > previous &&
+		       !pool_wait_max_ns_.compare_exchange_weak(
+			   previous, elapsed_ns, std::memory_order_relaxed,
+			   std::memory_order_relaxed)) {}
 	}
 	current_batch_ = next;
 	// [[PERF]] Clear only the BatchHeader (128B), not the full 2MB slot.

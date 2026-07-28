@@ -172,9 +172,18 @@ struct EmbarcaderoConfig {
             ConfigValue<size_t> socket_recv_buffer_bytes_failure{16UL * 1024 * 1024, "EMBARCADERO_SOCKET_RCVBUF_BYTES_FAILURE"};
             ConfigValue<size_t> socket_recv_buffer_bytes_latency{16UL * 1024 * 1024, "EMBARCADERO_SOCKET_RCVBUF_BYTES_LATENCY"};
             // TCP_USER_TIMEOUT by mode (ms). Lower for failure detection.
-            ConfigValue<int> tcp_user_timeout_ms_throughput{500, "EMBARCADERO_TCP_USER_TIMEOUT_MS_THROUGHPUT"};
+            ConfigValue<int> tcp_user_timeout_ms_throughput{30000, "EMBARCADERO_TCP_USER_TIMEOUT_MS_THROUGHPUT"};
             ConfigValue<int> tcp_user_timeout_ms_failure{200, "EMBARCADERO_TCP_USER_TIMEOUT_MS_FAILURE"};
             ConfigValue<int> tcp_user_timeout_ms_latency{500, "EMBARCADERO_TCP_USER_TIMEOUT_MS_LATENCY"};
+            // Maximum duration with no progress in one non-blocking batch send.
+            ConfigValue<int> header_send_timeout_ms_throughput{30000, "EMBARCADERO_HEADER_SEND_TIMEOUT_MS_THROUGHPUT"};
+            ConfigValue<int> header_send_timeout_ms_failure{500, "EMBARCADERO_HEADER_SEND_TIMEOUT_MS_FAILURE"};
+            ConfigValue<int> header_send_timeout_ms_latency{500, "EMBARCADERO_HEADER_SEND_TIMEOUT_MS_LATENCY"};
+            // Application-level predecessor retransmission floor. TCP reliably
+            // carries healthy throughput traffic; avoid treating queued ACKs as loss.
+            ConfigValue<int> session_rto_min_ms_throughput{2000, "EMBARCADERO_SESSION_RTO_MIN_MS_THROUGHPUT"};
+            ConfigValue<int> session_rto_min_ms_failure{12, "EMBARCADERO_SESSION_RTO_MIN_MS_FAILURE"};
+            ConfigValue<int> session_rto_min_ms_latency{12, "EMBARCADERO_SESSION_RTO_MIN_MS_LATENCY"};
             // ACK wait timeout by mode (seconds).
             ConfigValue<int> ack_timeout_sec_throughput{120, "EMBARCADERO_ACK_TIMEOUT_SEC_THROUGHPUT"};
             ConfigValue<int> ack_timeout_sec_failure{120, "EMBARCADERO_ACK_TIMEOUT_SEC_FAILURE"};

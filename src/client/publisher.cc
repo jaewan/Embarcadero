@@ -118,6 +118,44 @@ int64_t SteadyNowNs() {
 			std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+int RuntimeHeaderSendTimeoutMs() {
+	if (const char* env = std::getenv("EMBARCADERO_HEADER_SEND_TIMEOUT_MS")) {
+		char* end = nullptr;
+		const long parsed = std::strtol(env, &end, 10);
+		if (end != env && *end == '\0' && parsed > 0 && parsed <= 600000) {
+			return static_cast<int>(parsed);
+		}
+		LOG(WARNING) << "Ignoring invalid EMBARCADERO_HEADER_SEND_TIMEOUT_MS='"
+		             << env << "'";
+	}
+	const auto& runtime = Embarcadero::GetConfig().config().client.runtime;
+	const std::string mode = Embarcadero::GetConfig().getRuntimeMode();
+	if (mode == "failure") return runtime.header_send_timeout_ms_failure.get();
+	if (mode == "latency") return runtime.header_send_timeout_ms_latency.get();
+	return runtime.header_send_timeout_ms_throughput.get();
+}
+
+double RuntimeSessionRtoFloorMs() {
+	static const double value = []() {
+		if (const char* env = std::getenv("EMBARCADERO_SESSION_RTO_MIN_MS")) {
+			char* end = nullptr;
+			const double parsed = std::strtod(env, &end);
+			if (end != env && *end == '\0' && parsed >= DeltaEstimator::kDeltaFloorMs &&
+			    parsed <= 60000.0) {
+				return parsed;
+			}
+			LOG(WARNING) << "Ignoring invalid EMBARCADERO_SESSION_RTO_MIN_MS='"
+			             << env << "'";
+		}
+		const auto& runtime = Embarcadero::GetConfig().config().client.runtime;
+		const std::string mode = Embarcadero::GetConfig().getRuntimeMode();
+		if (mode == "failure") return static_cast<double>(runtime.session_rto_min_ms_failure.get());
+		if (mode == "latency") return static_cast<double>(runtime.session_rto_min_ms_latency.get());
+		return static_cast<double>(runtime.session_rto_min_ms_throughput.get());
+	}();
+	return value;
+}
+
 size_t RuntimePayloadSendChunkBytes() {
 	static const size_t value = []() {
 		const char* env = std::getenv("EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES");
@@ -322,7 +360,12 @@ size_t GetOrder5HomeBrokers() {
 }
 
 std::vector<int> GetOrder5BrokerAllowlist() {
-	const char* env = std::getenv("EMBARCADERO_ORDER5_BROKER_ALLOWLIST");
+	const char* env_name = "EMBARCADERO_PUBLISH_BROKER_ALLOWLIST";
+	const char* env = std::getenv(env_name);
+	if (!env || env[0] == '\0') {
+		env_name = "EMBARCADERO_ORDER5_BROKER_ALLOWLIST";
+		env = std::getenv(env_name);
+	}
 	if (!env || env[0] == '\0') return {};
 
 	std::vector<int> brokers;
@@ -331,7 +374,7 @@ std::vector<int> GetOrder5BrokerAllowlist() {
 	while (std::getline(input, item, ',')) {
 		if (item.empty()) {
 			throw std::invalid_argument(
-			    std::string("empty broker in EMBARCADERO_ORDER5_BROKER_ALLOWLIST='") +
+			    std::string("empty broker in ") + env_name + "='" +
 			    env + "'");
 		}
 		char* end = nullptr;
@@ -340,13 +383,13 @@ std::vector<int> GetOrder5BrokerAllowlist() {
 		    parsed >= NUM_MAX_BROKERS) {
 			throw std::invalid_argument(
 			    std::string("invalid broker '") + item +
-			    "' in EMBARCADERO_ORDER5_BROKER_ALLOWLIST='" + env + "'");
+			    "' in " + env_name + "='" + env + "'");
 		}
 		if (std::find(brokers.begin(), brokers.end(), static_cast<int>(parsed)) !=
 		    brokers.end()) {
 			throw std::invalid_argument(
 			    std::string("duplicate broker ") + std::to_string(parsed) +
-			    " in EMBARCADERO_ORDER5_BROKER_ALLOWLIST='" + env + "'");
+			    " in " + env_name + "='" + env + "'");
 		}
 		brokers.push_back(static_cast<int>(parsed));
 	}
@@ -535,8 +578,16 @@ std::vector<int> Publisher::Order5HomeBrokerIdsLocked() const {
 }
 
 bool Publisher::ShouldConnectPublishThreadsToBrokerLocked(int broker_id) const {
+	// A general publish allowlist implements sticky placement for any sequencer.
+	// ORDER=5's home-broker policy remains the default when no explicit list is
+	// present.
+	if (!order5_broker_allowlist_.empty()) {
+		return std::find(order5_broker_allowlist_.begin(),
+		                 order5_broker_allowlist_.end(), broker_id) !=
+		       order5_broker_allowlist_.end();
+	}
 	if (!IsOrder5SessionMode() ||
-	    (order5_home_brokers_ == 0 && order5_broker_allowlist_.empty())) {
+	    order5_home_brokers_ == 0) {
 		return true;
 	}
 	const std::vector<int> homes = Order5HomeBrokerIdsLocked();
@@ -586,13 +637,18 @@ void Publisher::ReassignQueueBrokerLocked(size_t queue_idx, int old_broker_id, i
 }
 
 void Publisher::LogOrder5RoutingSummary() const {
-	if (seq_type_ != heartbeat_system::SequencerType::EMBARCADERO ||
-	    order_level_ != Embarcadero::kOrderStrong) {
+	if (!IsOrder5SessionMode() && order5_broker_allowlist_.empty()) {
 		return;
 	}
 	std::ostringstream oss;
-	oss << "[ORDER5_ROUTING] client_id=" << client_id_
-	    << " home_brokers=" << order5_home_brokers_;
+	oss << (IsOrder5SessionMode() ? "[ORDER5_ROUTING]" : "[PUBLISH_ROUTING]")
+	    << " client_id=" << client_id_
+	    << " home_brokers=" << order5_home_brokers_
+	    << " retransmit_attempts="
+	    << retransmit_attempts_.load(std::memory_order_relaxed)
+	    << " session_fenced_observed="
+	    << session_fenced_observed_.load(std::memory_order_relaxed)
+	    << " session_rto_min_ms=" << RuntimeSessionRtoFloorMs();
 	if (!order5_broker_allowlist_.empty()) {
 		oss << " allowlist=";
 		for (size_t i = 0; i < order5_broker_allowlist_.size(); ++i) {
@@ -1574,29 +1630,47 @@ void Publisher::RetransmitThread() {
 		std::vector<DueRetransmit> due;
 		{
 			std::lock_guard<std::mutex> lock(unacked_mu_);
-			for (auto& rec : unacked_batches_) {
-				const double backoff_ms = delta_ms * static_cast<double>(1ULL << std::min<uint32_t>(rec.attempt, 10));
-				const double backstop_ms = std::max(backoff_ms, DeltaEstimator::kDeltaCapMs);
-				const int64_t due_ns = static_cast<int64_t>(backstop_ms * 1.0e6);
-				const int64_t last_progress_ns = std::max(
-					last_unacked_send_ns_.load(std::memory_order_acquire),
-					last_ack_progress_ns_.load(std::memory_order_acquire));
-				if (last_progress_ns > 0 && now_ns - last_progress_ns < due_ns) {
-					continue;
+			// ACK1 is a cumulative per-session prefix.  When progress stalls, only
+			// the earliest unretired batch can unblock that prefix; retransmitting
+			// every later batch cannot advance the ACK.  Snapshotting the complete
+			// suffix here used to turn one missing predecessor into an O(window)
+			// duplicate burst (hundreds of 512 KiB batches), starving normal ingest
+			// and creating a self-amplifying ACK/RTO storm.  Select at most the
+			// current predecessor per pass and retain its existing exponential
+			// backoff/reroute policy.
+			auto it = FindDueSessionRetirePredecessor(
+				unacked_batches_.begin(), unacked_batches_.end(),
+				session_next_retire_batch_seq_,
+				[](const UnackedBatch& candidate) {
+					return candidate.current_batch_seq;
+				},
+				[&](const UnackedBatch& rec) {
+					const double backoff_ms = delta_ms * static_cast<double>(
+						1ULL << std::min<uint32_t>(rec.attempt, 10));
+					const double backstop_ms = std::max(
+						backoff_ms, RuntimeSessionRtoFloorMs());
+					const int64_t due_ns = static_cast<int64_t>(backstop_ms * 1.0e6);
+					// Later suffix sends do not constitute progress for this missing
+					// predecessor. Gate only on its own send and cumulative ACK progress.
+					const int64_t last_progress_ns = std::max(
+						rec.last_send_ns,
+						last_ack_progress_ns_.load(std::memory_order_acquire));
+					return (last_progress_ns <= 0 || now_ns - last_progress_ns >= due_ns) &&
+					       now_ns - rec.last_send_ns >= due_ns;
+				});
+			if (it != unacked_batches_.end()) {
+				auto& rec = *it;
+				DueRetransmit item;
+				item.broker_id = rec.broker_id;
+				item.current_batch_seq = rec.current_batch_seq;
+				const void* src = rec.WireBytes();
+				if (src != nullptr && rec.wire_bytes > 0) {
+					item.bytes.resize(rec.wire_bytes);
+					std::memcpy(item.bytes.data(), src, rec.wire_bytes);
+					due.push_back(std::move(item));
 				}
-				if (now_ns - rec.last_send_ns >= due_ns) {
-					DueRetransmit item;
-					item.broker_id = rec.broker_id;
-					item.current_batch_seq = rec.current_batch_seq;
-					const void* src = rec.WireBytes();
-					if (src != nullptr && rec.wire_bytes > 0) {
-						item.bytes.resize(rec.wire_bytes);
-						std::memcpy(item.bytes.data(), src, rec.wire_bytes);
-						due.push_back(std::move(item));
-					}
-					rec.attempt++;
-					rec.last_send_ns = now_ns;
-				}
+				rec.attempt++;
+				rec.last_send_ns = now_ns;
 			}
 		}
 		for (auto& rec : due) {
@@ -2176,16 +2250,16 @@ bool Publisher::Init(int ack_level) {
 		std::this_thread::yield();
 	}
 
-	// ORDER=5 per-session FIFO + preferred striping: partial connect leaves dead
-	// preferred queues that swallow batch_seq and create permanent head gaps
-	// (N=2 pilot: 8/24 threads → fence storm). Refuse to publish in that state.
-	if (IsOrder5SessionMode()) {
+	// ORDER=5 preferred striping and explicit sticky placement both require all
+	// selected publish paths to connect. A partial connection would silently
+	// change the requested placement policy.
+	if (IsOrder5SessionMode() || !order5_broker_allowlist_.empty()) {
 		const int ready = thread_count_.load(std::memory_order_acquire);
 		const int expected = num_threads_.load(std::memory_order_acquire);
 		if (ready < expected || expected <= 0) {
-			LOG(ERROR) << "Publisher::Init() ORDER=5 requires all publish threads connected; "
+			LOG(ERROR) << "Publisher::Init() requested routing requires all selected publish threads connected; "
 			           << "got thread_count_=" << ready << " num_threads_=" << expected
-			           << ". Refusing to publish into dead preferred queues.";
+			           << ". Refusing to run with partial placement.";
 			return false;
 		}
 		{
@@ -2195,14 +2269,14 @@ bool Publisher::Init(int ack_level) {
 					if (broker_id >= expected_num_brokers_ ||
 					    std::find(brokers_.begin(), brokers_.end(), broker_id) ==
 					        brokers_.end()) {
-						LOG(ERROR) << "Publisher::Init() ORDER=5 allowlist broker "
+						LOG(ERROR) << "Publisher::Init() publish allowlist broker "
 						           << broker_id << " is not in the connected "
 						           << expected_num_brokers_ << "-broker cluster";
 						return false;
 					}
 				}
 			}
-			RefreshOrder5PreferredQueuesLocked();
+			if (IsOrder5SessionMode()) RefreshOrder5PreferredQueuesLocked();
 		}
 	}
 
@@ -4180,8 +4254,9 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 			}
 			size_t total_sent = 0;
 			const size_t header_size = sizeof(Embarcadero::BatchHeader) + len;
-			size_t consecutive_timeouts = 0;
-			const size_t max_consecutive_timeouts = 500; // 500ms fallback (TCP_USER_TIMEOUT handles fast path)
+			const auto header_timeout =
+				std::chrono::milliseconds(RuntimeHeaderSendTimeoutMs());
+			auto header_last_progress = std::chrono::steady_clock::now();
 
 			while (total_sent < header_size) {
 				auto send_start = std::chrono::steady_clock::now();
@@ -4218,18 +4293,28 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 							if (errno == EINTR) continue;
 							LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
 							throw std::runtime_error("epoll_wait failed");
-						} else if (n == 0) {
+						} else {
 							if (net_profile) {
-								net_profile->header_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+								if (n == 0) {
+									net_profile->header_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+								}
 							}
-							consecutive_timeouts++;
-							size_t effective_hdr_timeout = throttle_relaxed_.load(std::memory_order_relaxed) ? 50 : max_consecutive_timeouts;
-							if (consecutive_timeouts > effective_hdr_timeout) {
-								LOG(ERROR) << "PublishThread: Header send timed out. Assuming broker is dead.";
+							// EPOLLOUT is level-triggered and may be reported even when the
+							// following send still makes no progress. Enforce the wall-clock
+							// deadline after every EAGAIN wait, not only epoll timeouts.
+							const auto effective_timeout =
+								throttle_relaxed_.load(std::memory_order_relaxed)
+									? std::chrono::milliseconds(50)
+									: header_timeout;
+							if (HeaderSendNoProgressExpired(
+							        std::chrono::steady_clock::now(),
+							        header_last_progress,
+							        effective_timeout)) {
+								LOG(ERROR) << "PublishThread: Header send timed out after "
+								           << effective_timeout.count()
+								           << " ms. Assuming broker is dead.";
 								throw std::runtime_error("send timeout");
 							}
-						} else {
-							consecutive_timeouts = 0;
 						}
 					} else {
 						// Fatal error
@@ -4237,6 +4322,7 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 						throw std::runtime_error("send failed");
 					}
 				} else {
+					header_last_progress = std::chrono::steady_clock::now();
 					if (net_profile) {
 						net_profile->header_send_calls.fetch_add(1, std::memory_order_relaxed);
 						net_profile->header_send_bytes.fetch_add(static_cast<uint64_t>(bytesSent), std::memory_order_relaxed);
@@ -4246,7 +4332,6 @@ void Publisher::PublishThread(int broker_id, int pubQuesIdx) {
 					broker_stats_[broker_id].sent_bytes.fetch_add(bytesSent, std::memory_order_relaxed);
 					total_sent_bytes_.fetch_add(bytesSent, std::memory_order_relaxed);
 
-					consecutive_timeouts = 0;
 					if (throttle_relaxed_.load(std::memory_order_relaxed)) {
 						char probe;
 						ssize_t r = recv(sock.get(), &probe, 1, MSG_PEEK | MSG_DONTWAIT);

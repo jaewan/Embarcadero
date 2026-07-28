@@ -1473,11 +1473,29 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 			const auto pace_start = std::chrono::steady_clock::now();
 			const double target_bytes_per_sec =
 				(target_mbps > 0.0) ? (target_mbps * 1024.0 * 1024.0) : 0.0;
+			// Preserve per-record pacing by default. Experiments that need to avoid
+			// micro-sleeps may opt into a bounded byte quantum; the cumulative deadline
+			// below prevents burst drift without silently changing existing campaigns.
+			size_t pace_quantum_bytes = paced_bytes_per_msg;
+			if (const char* env = std::getenv("EMBARCADERO_THROUGHPUT_PACE_QUANTUM_BYTES")) {
+				char* end = nullptr;
+				const unsigned long long parsed = std::strtoull(env, &end, 10);
+				if (end != env && *end == '\0' && parsed >= paced_bytes_per_msg &&
+				    parsed <= 64ULL * 1024ULL * 1024ULL) {
+					pace_quantum_bytes = static_cast<size_t>(parsed);
+				} else {
+					LOG(ERROR) << "Invalid EMBARCADERO_THROUGHPUT_PACE_QUANTUM_BYTES='"
+					           << env << "'";
+					exit(2);
+				}
+			}
 			uint64_t offered_bytes = 0;
+			uint64_t next_pace_check_bytes = pace_quantum_bytes;
 			size_t steady_window_bytes = 0;
 			if (target_mbps > 0.0 || steady_rate) {
 				LOG(INFO) << "PublishThroughput pacing: target_mbps=" << target_mbps
-					<< " steady_rate=" << (steady_rate ? "true" : "false");
+					<< " steady_rate=" << (steady_rate ? "true" : "false")
+					<< " quantum_bytes=" << pace_quantum_bytes;
 			}
 
 			// Publish messages
@@ -1487,7 +1505,13 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 						std::this_thread::sleep_for(std::chrono::microseconds(1500));
 						steady_window_bytes = 0;
 					}
-					if (target_bytes_per_sec > 0.0) {
+					p.Publish(message, message_size);
+					offered_bytes += paced_bytes_per_msg;
+					steady_window_bytes += paced_bytes_per_msg;
+					// Include the final partial quantum in elapsed send time.  Without this
+					// final deadline, short/cold sessions systematically exceed their plan.
+					if (target_bytes_per_sec > 0.0 &&
+					    (offered_bytes >= next_pace_check_bytes || i + 1 == n)) {
 						const double expected_ns =
 							(static_cast<double>(offered_bytes) * 1e9) / target_bytes_per_sec;
 						const auto target_time =
@@ -1496,10 +1520,10 @@ double PublishThroughputTest(const cxxopts::ParseResult& result, char topic[TOPI
 						if (target_time > now) {
 							std::this_thread::sleep_until(target_time);
 						}
+						do {
+							next_pace_check_bytes += pace_quantum_bytes;
+						} while (offered_bytes >= next_pace_check_bytes);
 					}
-					p.Publish(message, message_size);
-					offered_bytes += paced_bytes_per_msg;
-					steady_window_bytes += paced_bytes_per_msg;
 				}
 
 			// Finalize publishing

@@ -85,7 +85,9 @@ public:
 private:
     // Network socket utility functions
     bool ConfigureNonBlockingSocket(int fd);
-    bool SetupAcknowledgmentSocket(int& ack_fd, const struct sockaddr_in& client_address, uint32_t port);
+    bool SetupAcknowledgmentSocket(int& ack_fd, int& ack_efd,
+                                   const struct sockaddr_in& client_address,
+                                   uint32_t port);
     
     // Thread handlers
     void MainThread();
@@ -142,9 +144,6 @@ private:
 	absl::Mutex ack_mu_;
     absl::Mutex sub_mu_;
     std::vector<std::unique_ptr<SubscriberState>> sub_state_;  // <connection_id, state> - dense IDs
-    int ack_efd_; // Epoll file descriptor for acknowledgments
-    int ack_fd_ = -1; // Socket file descriptor for acknowledgments
-
     // Manager dependencies
     CXLManager* cxl_manager_ = nullptr;
     DiskManager* disk_manager_ = nullptr;

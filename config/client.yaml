@@ -10,9 +10,18 @@ client:
     socket_recv_buffer_bytes_throughput: 268435456
     socket_recv_buffer_bytes_failure: 16777216
     socket_recv_buffer_bytes_latency: 16777216
-    tcp_user_timeout_ms_throughput: 500
+    # Sustained throughput can legitimately backpressure a socket for longer
+    # than the failure detector's deadline. Keep the short timeout confined to
+    # explicit failure-mode runs.
+    tcp_user_timeout_ms_throughput: 30000
     tcp_user_timeout_ms_failure: 200
     tcp_user_timeout_ms_latency: 500
+    header_send_timeout_ms_throughput: 30000
+    header_send_timeout_ms_failure: 500
+    header_send_timeout_ms_latency: 500
+    session_rto_min_ms_throughput: 2000
+    session_rto_min_ms_failure: 12
+    session_rto_min_ms_latency: 12
     ack_timeout_sec_throughput: 120
     ack_timeout_sec_failure: 120
     ack_timeout_sec_latency: 120
@@ -22,12 +31,7 @@ client:
 
   publisher:
     threads_per_broker: 3   # Optimal for co-located config (10-12 GB/s, 4 brokers × 3 threads = 12 streams).
-    #
-    # SENTINEL NOTE: main.cc treats -n 4 as a sentinel that reads this yaml value instead.
-    # Passing -n 3 (or any value ≠ 4) uses that value directly.
-    # run_overnight_eval.sh passes THREADS_PER_BROKER=6 for throughput cells to bypass the
-    # sentinel and use 6 actual threads/broker → 24 streams → higher per-client ceiling.
-    #
+    # An explicit -n value overrides this default, including -n 4.
     # 1024 MB per buffer so 12 buffers (3 threads/broker × 4 brokers) hold 10 GB total (12 × 1 GB = 12 GB ≥ 10 GB).
     # Min would be ceil(10/12) GB ≈ 854 MB; 1024 MB gives headroom so 10 GB test does not wrap.
     buffer_size_mb: 1024

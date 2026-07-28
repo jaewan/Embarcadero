@@ -44,7 +44,7 @@ int main(int argc, char* argv[]) {
         ("target_mbps", "Target offered load for latency mode (MB/s). 0 disables pacing",
             cxxopts::value<double>()->default_value("0"))
         ("n,num_threads_per_broker", "Number of request threads_per_broker", 
-            cxxopts::value<size_t>()->default_value("4"))
+            cxxopts::value<size_t>())
         ("config", "Configuration file path", cxxopts::value<std::string>()->default_value("config/client.yaml"));
     
     auto result = options.parse(argc, argv);
@@ -64,14 +64,13 @@ int main(int argc, char* argv[]) {
     size_t message_size = result["size"].as<size_t>();
     size_t total_message_size = result["total_message_size"].as<size_t>();
     
-    // Use config value if command line argument is default
+    // Use the config only when the command-line option is absent.
     size_t num_threads_per_broker;
-    if (result["num_threads_per_broker"].count() == 0 || result["num_threads_per_broker"].as<size_t>() == 4) {
-        // Use config value
+    if (result["num_threads_per_broker"].count() == 0) {
         num_threads_per_broker = config.config().client.publisher.threads_per_broker.get();
         LOG(INFO) << "Using threads_per_broker from config: " << num_threads_per_broker;
     } else {
-        // Use command line value
+        // In particular, an explicit -n 4 is a real setting, not a sentinel.
         num_threads_per_broker = result["num_threads_per_broker"].as<size_t>();
         LOG(INFO) << "Using threads_per_broker from command line: " << num_threads_per_broker;
     }

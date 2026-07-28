@@ -3,12 +3,12 @@
   "figure": {
     "generator": {
       "path": "scripts/publication/plot_failure_combined.py",
-      "sha256": "81396cbe0fe6e3eda738579955cfb994dfcecf6c42ae9faec2de9860b342e0be"
+      "sha256": "40ee03e08656b05bdf02ea3be5fad594ff97f587d961bea20f3045a350eae60b"
     },
     "outputs": {
-      "Paper/Figures/failure_combined.pdf": "34da065f688e58a11876e5e5ad8393a401fca30d55dc609f4e80b1e0a6a8a9d3",
-      "data/paper_eval/fig3/fig3_failure_official_8351459f/failure_combined.pdf": "34da065f688e58a11876e5e5ad8393a401fca30d55dc609f4e80b1e0a6a8a9d3",
-      "data/paper_eval/fig3/fig3_failure_official_8351459f/failure_combined.png": "1a7ae1dd6d183bad28748baaf35419942a01c17d6d15d3ce90f4ab9dfcc635a1"
+      "Paper/Figures/failure_combined.pdf": "02e34965b16cb300e4dcec9fe4b8819041a07cffea6240919f03342095a3891c",
+      "data/paper_eval/fig3/fig3_failure_official_8351459f/failure_combined.pdf": "02e34965b16cb300e4dcec9fe4b8819041a07cffea6240919f03342095a3891c",
+      "data/paper_eval/fig3/fig3_failure_official_8351459f/failure_combined.png": "69bea6fe3dab8b3c9e467741371f98b4361abde4c7e43d1721abbdeb8f182724"
     }
   },
   "git_commit": "8351459f420870dad3e39cd6630c9483386d9a05",

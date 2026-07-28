@@ -108,10 +108,9 @@ LAZYLOG_RF2_METADATA_ENDPOINTS="${LAZYLOG_RF2_METADATA_ENDPOINTS:-${EMBARCADERO_
 EPOCH_US_THROUGHPUT="${EPOCH_US_THROUGHPUT:-500}"
 EPOCH_US_LATENCY="${EPOCH_US_LATENCY:-500}"
 
-# FIX 2: Threads per broker for throughput cells.
-#   main.cc line 68: -n 4 is a sentinel that reads threads_per_broker from config (currently 3).
-#   Passing 6 bypasses the sentinel and uses 6 actual threads/broker → more parallel batch streams.
-#   Latency cells are left at the config default (sentinel-4 → 3 threads) to avoid confounding.
+# FIX 2: Threads per broker for throughput cells. An explicit -n value is used
+# verbatim; omitting -n reads the client configuration. Throughput cells use six
+# streams per server, while latency campaigns set their own lower concurrency.
 THREADS_THROUGHPUT="${THREADS_THROUGHPUT:-6}"
 
 # Paper TP publish batch: match config/client.yaml (2048). scripts/run_multiclient.sh

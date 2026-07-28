@@ -655,9 +655,11 @@ bool NetworkManager::ConfigureNonBlockingSocket(int fd) {
  * Sets up an acknowledgment socket with connection retry logic
  */
 bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
+		int& ack_efd,
 		const struct sockaddr_in& client_address,
 		uint32_t port) {
 	ack_fd = -1;
+	ack_efd = -1;
 
 	// Setup server address for connection
 	// [[FIX: B1_ACK_ZERO]] Use inet_ntop (thread-safe) and explicit uint16_t port to avoid inet_ntoa/truncation issues
@@ -689,8 +691,8 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 			ack_fd = -1;
 			break;
 		}
-		ack_efd_ = epoll_create1(0);
-		if (ack_efd_ == -1) {
+		ack_efd = epoll_create1(0);
+		if (ack_efd == -1) {
 			LOG(ERROR) << "epoll_create1 failed for acknowledgment connection";
 			close(ack_fd);
 			ack_fd = -1;
@@ -711,9 +713,9 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 		if (errno != EINPROGRESS) {
 			LOG(ERROR) << "SetupAcknowledgmentSocket: Broker " << broker_id_
 			           << " connect failed to " << client_ip << ":" << port << ": " << strerror(errno);
-			CleanupSocketAndEpoll(ack_fd, ack_efd_);
+			CleanupSocketAndEpoll(ack_fd, ack_efd);
 			ack_fd = -1;
-			ack_efd_ = -1;
+			ack_efd = -1;
 			if (attempt < MAX_RETRIES) sleep(1);
 			continue;
 		}
@@ -723,17 +725,17 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 		event.data.fd = ack_fd;
 		event.events = EPOLLOUT;
 
-		if (epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
+		if (epoll_ctl(ack_efd, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
 			LOG(ERROR) << "epoll_ctl failed: " << strerror(errno);
-			CleanupSocketAndEpoll(ack_fd, ack_efd_);
+			CleanupSocketAndEpoll(ack_fd, ack_efd);
 			ack_fd = -1;
-			ack_efd_ = -1;
+			ack_efd = -1;
 			break;
 		}
 
 		// Wait for socket to become writable
 		struct epoll_event events[1];
-		int n = epoll_wait(ack_efd_, events, 1, 5000);  // 5-second timeout
+		int n = epoll_wait(ack_efd, events, 1, 5000);  // 5-second timeout
 
 		if (n > 0 && (events[0].events & EPOLLOUT)) {
 			// Check if the connection was successful
@@ -741,9 +743,9 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 			socklen_t len = sizeof(sock_error);
 			if (getsockopt(ack_fd, SOL_SOCKET, SO_ERROR, &sock_error, &len) < 0) {
 				LOG(ERROR) << "getsockopt failed: " << strerror(errno);
-				CleanupSocketAndEpoll(ack_fd, ack_efd_);
+				CleanupSocketAndEpoll(ack_fd, ack_efd);
 				ack_fd = -1;
-				ack_efd_ = -1;
+				ack_efd = -1;
 				break;
 			}
 
@@ -764,16 +766,16 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 		} else {
 			// epoll_wait error
 			LOG(ERROR) << "epoll_wait failed: " << strerror(errno);
-			CleanupSocketAndEpoll(ack_fd, ack_efd_);
+			CleanupSocketAndEpoll(ack_fd, ack_efd);
 			ack_fd = -1;
-			ack_efd_ = -1;
+			ack_efd = -1;
 			break;
 		}
 
 		if (!connected) {
-			CleanupSocketAndEpoll(ack_fd, ack_efd_);
+			CleanupSocketAndEpoll(ack_fd, ack_efd);
 			ack_fd = -1;
-			ack_efd_ = -1;
+			ack_efd = -1;
 			if (attempt < MAX_RETRIES) sleep(1);
 		}
 	}
@@ -785,11 +787,11 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 	}
 
 	// Close the connection-monitoring epoll before creating send-monitoring epoll
-	close(ack_efd_);
+	close(ack_efd);
 
 	// Setup epoll for the connected socket
-	ack_efd_ = epoll_create1(0);
-	if (ack_efd_ == -1) {
+	ack_efd = epoll_create1(0);
+	if (ack_efd == -1) {
 		LOG(ERROR) << "Failed to create epoll for ack monitoring";
 		close(ack_fd);
 		return false;
@@ -798,9 +800,9 @@ bool NetworkManager::SetupAcknowledgmentSocket(int& ack_fd,
 	struct epoll_event event;
 	event.data.fd = ack_fd;
 	event.events = EPOLLOUT;
-	if (epoll_ctl(ack_efd_, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
+	if (epoll_ctl(ack_efd, EPOLL_CTL_ADD, ack_fd, &event) == -1) {
 		LOG(ERROR) << "epoll_ctl failed for ack connection";
-		CleanupSocketAndEpoll(ack_fd, ack_efd_);
+		CleanupSocketAndEpoll(ack_fd, ack_efd);
 		return false;
 	}
 
@@ -868,10 +870,6 @@ void NetworkManager::Shutdown() {
 			}
 		}
 	}
-	if (ack_fd_ >= 0) {
-		shutdown(ack_fd_, SHUT_RDWR);
-	}
-
 	// Send sentinel values to wake up blocked threads
 	std::optional<struct NetworkRequest> sentinel = std::nullopt;
 	for (int i = 0; i < num_reqReceive_threads_; i++) {
@@ -1211,7 +1209,8 @@ void NetworkManager::HandlePublishRequest(
 			}
 
 			if (need_ack_thread) {
-				if (!SetupAcknowledgmentSocket(ack_fd, client_address, handshake.port)) {
+				if (!SetupAcknowledgmentSocket(
+						ack_fd, local_ack_efd, client_address, handshake.port)) {
 					{
 						absl::MutexLock lock(&ack_mu_);
 						auto it = ack_connections_.find(handshake.client_id);
@@ -1226,7 +1225,6 @@ void NetworkManager::HandlePublishRequest(
 					close(client_socket);
 					return;
 				}
-				local_ack_efd = ack_efd_;
 				bool registration_current = false;
 				{
 					absl::MutexLock lock(&ack_mu_);
@@ -1238,7 +1236,6 @@ void NetworkManager::HandlePublishRequest(
 						epoch_it != ack_connection_epochs_.end() &&
 						epoch_it->second == connection_session_epoch;
 					if (registration_current) {
-						ack_fd_ = ack_fd;
 						it->second = ack_fd;
 					}
 				}
@@ -1256,8 +1253,19 @@ void NetworkManager::HandlePublishRequest(
 				// Empty topic -> GetOffsetToAck returns wrong TInode -> client ACK timeout
 				if (need_ack_thread && strlen(handshake.topic) == 0) {
 					LOG(ERROR) << "HandlePublishRequest: Empty topic in handshake for broker " << broker_id_
-					           << ", client_id=" << handshake.client_id << ". NOT starting AckThread!";
-					// Still keep connection open for publish, but ACKs will not work correctly
+					           << ", client_id=" << handshake.client_id
+					           << ". Closing the ownerless ACK and publish channels.";
+					{
+						absl::MutexLock lock(&ack_mu_);
+						auto it = ack_connections_.find(handshake.client_id);
+						if (it != ack_connections_.end() && it->second == ack_fd) {
+							ack_connections_.erase(it);
+							ack_connection_epochs_.erase(handshake.client_id);
+						}
+					}
+					CleanupSocketAndEpoll(ack_fd, local_ack_efd);
+					close(client_socket);
+					return;
 				} else if (need_ack_thread) {
 					LOG(INFO) << "HandlePublishRequest: Starting AckThread for broker " << broker_id_
 					          << ", topic='" << handshake.topic << "', client_id=" << handshake.client_id
@@ -1274,9 +1282,6 @@ void NetworkManager::HandlePublishRequest(
 							if (it != ack_connections_.end() && it->second == ack_fd) {
 								ack_connections_.erase(it);
 								ack_connection_epochs_.erase(handshake.client_id);
-							}
-							if (ack_fd_ == ack_fd) {
-								ack_fd_ = -1;
 							}
 						}
 						CleanupSocketAndEpoll(ack_fd, local_ack_efd);
@@ -2862,8 +2867,16 @@ void NetworkManager::AckThread(
 			ack_connections_.erase(it);
 			ack_connection_epochs_.erase(client_id);
 		}
-		if (ack_fd_ == ack_fd) {
-			ack_fd_ = -1;
+	};
+	auto cleanup_ack = [&]() {
+		remove_ack_registration();
+		if (ack_fd >= 0) {
+			close(ack_fd);
+			ack_fd = -1;
+		}
+		if (ack_efd >= 0) {
+			close(ack_efd);
+			ack_efd = -1;
 		}
 	};
 
@@ -2872,9 +2885,7 @@ void NetworkManager::AckThread(
 	if (topic.empty()) {
 		LOG(ERROR) << "AckThread: Empty topic for broker " << broker_id_
 		           << ". Cannot send ACKs correctly. Exiting AckThread.";
-		remove_ack_registration();
-		close(ack_fd);
-		if (ack_efd >= 0) close(ack_efd);
+		cleanup_ack();
 		return;
 	}
 
@@ -2922,8 +2933,7 @@ void NetworkManager::AckThread(
 			if (consecutive_timeouts >= kMaxConsecutiveTimeouts) {
 				if (stop_threads_) break;
 				if (!reset_ack_epoll("broker_id_timeout")) {
-					remove_ack_registration();
-					close(ack_fd);
+					cleanup_ack();
 					return;
 				}
 				consecutive_timeouts = 0;
@@ -2937,8 +2947,7 @@ void NetworkManager::AckThread(
 			if (consecutive_errors >= kMaxConsecutiveErrors) {
 				if (stop_threads_) break;
 				if (!reset_ack_epoll("broker_id_error")) {
-					remove_ack_registration();
-					close(ack_fd);
+					cleanup_ack();
 					return;
 				}
 				consecutive_errors = 0;
@@ -2962,14 +2971,15 @@ void NetworkManager::AckThread(
 
 					if (bytes_sent < 0) {
 						if (errno == EAGAIN || errno == EWOULDBLOCK) {
-							retry = true;
-							continue;
+							// Readiness is only a hint. Return to epoll instead of
+							// spinning if the nonblocking send still cannot progress.
+							break;
 						} else if (errno == EINTR) {
 							retry = true;
 							continue;
 						} else {
 							LOG(ERROR) << "Offset acknowledgment failed: " << strerror(errno);
-							remove_ack_registration();
+							cleanup_ack();
 							return;
 						}
 					} else {
@@ -3321,8 +3331,7 @@ void NetworkManager::AckThread(
 						LOG(WARNING) << "AckThread: repeated ACK send timeouts for broker " << broker_id_
 						             << ", resetting epoll";
 						if (!reset_ack_epoll("ack_timeout")) {
-							remove_ack_registration();
-							close(ack_fd);
+							cleanup_ack();
 							return;
 						}
 						consecutive_timeouts = 0;
@@ -3336,8 +3345,7 @@ void NetworkManager::AckThread(
 					if (consecutive_errors >= kMaxConsecutiveErrors) {
 						if (stop_threads_) break;
 						if (!reset_ack_epoll("ack_error")) {
-							remove_ack_registration();
-							close(ack_fd);
+							cleanup_ack();
 							return;
 						}
 						consecutive_errors = 0;
@@ -3361,14 +3369,15 @@ void NetworkManager::AckThread(
 
 							if (bytes_sent < 0) {
 								if (errno == EAGAIN || errno == EWOULDBLOCK) {
-									retry = true;
-									continue;
+									// Re-poll for writability; a level-triggered EPOLLOUT
+									// event does not guarantee this send will progress.
+									break;
 								} else if (errno == EINTR) {
 									retry = true;
 									continue;
 								} else {
 									LOG(ERROR) << "Offset acknowledgment failed: " << strerror(errno);
-									remove_ack_registration();
+									cleanup_ack();
 									return;
 								}
 							} else {
@@ -3397,11 +3406,7 @@ void NetworkManager::AckThread(
 				}
 			}
 		}// end of while loop
-	remove_ack_registration();
-	close(ack_fd);
-	if (ack_efd >= 0) {
-		close(ack_efd);
-	}
+	cleanup_ack();
 }
 
 
