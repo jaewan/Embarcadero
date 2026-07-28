@@ -76,9 +76,10 @@ single session across all `NUM_BROKERS` — the Q3 setting. The configured size
 cap is 2 MiB, while the latency-mode 300 us linger normally seals a partial
 batch after hundreds of 100-byte operations. Reorder pressure therefore
 appears at batch granularity; consecutive-batch inversions across brokers are
-exactly Scalog's `app:scalog-fifo` case. `EMBARCADERO_ORDER5_HOME_BROKERS=1` exists as
-a sticky single-broker escape hatch **for Embar ORDER=5 only** — baselines
-have no equivalent, so the optional "Sticky" row is out of the main matrix.
+exactly Scalog's `app:scalog-fifo` case. The `sticky` control runs the same
+single session against one active broker. This is a favorable implementation
+of per-session pinning for every system: it avoids four-broker control-plane
+overhead, but deliberately gives up striping that session.
 
 Delivery/apply order: `Subscriber::Consume()` delivers strictly by
 `total_order` for every order level ≥1 (gap-filling reorder buffer,
@@ -235,7 +236,8 @@ SMR_FIFO_RECORD_COUNT=20000 SMR_FIFO_OPERATION_COUNT=20000 \
 SMR_FIFO_WARMUP_OPS=2000 bash benchmarks/kv_store/run_smr_fifo_eval.sh
 
 # Sticky control (E2): single broker = FIFO by forfeiting striping
-SMR_FIFO_MODES="pipe sticky" bash benchmarks/kv_store/run_smr_fifo_eval.sh
+SMR_FIFO_SEQUENCERS=SCALOG SMR_FIFO_MODES=sticky \
+  bash benchmarks/kv_store/run_smr_fifo_eval.sh
 
 # Strict FIFO baseline with batching retained: one 4096-op publisher batch
 # in flight, ACK1 before the next batch.
@@ -275,8 +277,9 @@ as a broken run.
 
 ## 10. Fairness / anti-footguns
 
-1. Same striping intent everywhere: no sticky routing for any system in the
-   main table (the knob doesn't even exist for baselines).
+1. Native-pipeline rows have the same four-broker striping intent everywhere.
+   A separately labeled sticky row uses one active broker as a favorable
+   correct control; it is not a striped-throughput result.
 2. Same durability: RF=1 ACK=1; ACK2/disk stays out of Q3.
 3. Scalog Pipe Valid=NO is recorded and explained (`app:scalog-fifo`), never
    patched around; its Serialize row is the honest recovery path.

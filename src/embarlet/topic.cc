@@ -2518,16 +2518,6 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
     size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
     size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
     batch_header_location = &batch_header_ring[slot_idx];
-    // [[FIX: stale-batch_complete]] Flush batch_complete=0 to CXL immediately.
-    // The DelegationThread reads slots via flush+load from CXL. If batch_complete=1
-    // persists from a prior experiment run (zero_mode=metadata only clears metadata,
-    // not the batch headers ring), the DelegationThread spuriously processes this
-    // stale slot and skips the real last batch, causing a permanent tail-drain stall.
-    // Writing 0 and flushing to CXL ensures the DelegationThread sees the reset.
-    __atomic_store_n(&batch_header_location->batch_complete, 0, __ATOMIC_RELEASE);
-    CXL::store_fence();
-    CXL::flush_cacheline(batch_header_location);
-    CXL::store_fence();
 
 	// Calculate addresses
 	const unsigned long long int segment_metadata =
@@ -2540,6 +2530,14 @@ std::function<void(void*, size_t)> Topic::ScalogGetCXLBuffer(
 
 	// Check for segment boundary
 	CheckSegmentBoundary(log, msg_size, segment_metadata);
+
+	// Install the same unpublished ownership claim used by the common
+	// post-receive PBR path. Scalog reserves before recv so its replication
+	// callback can retain the chosen payload address, but publication still
+	// validates this identity after recv. Merely clearing batch_complete (the
+	// old baseline path) is no longer sufficient once publication fails closed
+	// on stale/ring-reused slots.
+	InstallPBRClaim(batch_header, batch_header_location);
 
     size_t rep_offset = 0;
     if (!kCxlScalogMode) {
@@ -2597,14 +2595,6 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 	size_t num_slots = BATCHHEADERS_SIZE / sizeof(BatchHeader);
 	size_t slot_idx = static_cast<size_t>(pbr_idx % num_slots);
 	batch_header_location = &batch_header_ring[slot_idx];
-	// [[FIX: stale-batch_complete]] Mirror of ScalogGetCXLBuffer fix: flush batch_complete=0
-	// to CXL immediately. zero_mode=metadata clears metadata regions but not batch-header rings,
-	// so a stale batch_complete=1 from a prior run causes DelegationThread to skip the real last
-	// batch and stall permanently. Flushing ensures DelegationThread sees the cleared value.
-	__atomic_store_n(&batch_header_location->batch_complete, 0, __ATOMIC_RELEASE);
-	CXL::store_fence();
-	CXL::flush_cacheline(batch_header_location);
-	CXL::store_fence();
 
 	const unsigned long long int segment_metadata =
 		reinterpret_cast<unsigned long long int>(current_segment_);
@@ -2613,6 +2603,10 @@ std::function<void(void*, size_t)> Topic::LazyLogGetCXLBuffer(
 	log = reinterpret_cast<void*>(log_addr_.fetch_add(msg_size));
 	batch_header.log_idx = reinterpret_cast<uintptr_t>(log) - reinterpret_cast<uintptr_t>(cxl_addr_);
 	CheckSegmentBoundary(log, msg_size, segment_metadata);
+
+	// LazyLog shares Scalog's pre-receive reservation path and therefore needs
+	// the same complete ownership claim before PublishPBRSlotDirect validates it.
+	InstallPBRClaim(batch_header, batch_header_location);
 
 	size_t rep_offset = 0;
 	if (!kCxlLazyLogMode) {
@@ -3075,6 +3069,25 @@ bool Topic::ReservePBRSlotCore(BatchHeader& batch_header, void* log, bool epoch_
 	return true;
 }
 
+void Topic::InstallPBRClaim(const BatchHeader& batch_header,
+		BatchHeader* batch_header_location) {
+	CHECK(batch_header_location != nullptr);
+	BatchHeader claimed = batch_header;
+	claimed.flags = kBatchHeaderFlagClaimed;
+	claimed.batch_complete = 0;
+	claimed.publish_commit = kBatchHeaderPublishUncommitted;
+
+	absl::MutexLock lifecycle_lock(&pbr_slot_lifecycle_mu_);
+	memcpy(batch_header_location, &claimed, sizeof(BatchHeader));
+	CXL::store_fence();
+	if (CXL::ExplicitFlushRequired()) {
+		CXL::flush_cacheline(batch_header_location);
+		CXL::flush_cacheline(
+			reinterpret_cast<const uint8_t*>(batch_header_location) + 64);
+		CXL::store_fence();
+	}
+}
+
 bool Topic::ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
 		void*& segment_header, size_t& logical_offset, BatchHeader*& batch_header_location,
 		bool epoch_already_checked) {
@@ -3084,28 +3097,13 @@ bool Topic::ReservePBRSlotAfterRecv(BatchHeader& batch_header, void* log,
 		return false;
 	}
 	BatchHeader* slot = reinterpret_cast<BatchHeader*>(batch_headers_log);
-	BatchHeader claimed = batch_header;
-	claimed.flags = kBatchHeaderFlagClaimed;
-	claimed.batch_complete = 0;
-	claimed.publish_commit = kBatchHeaderPublishUncommitted;
-
-	{
-		// Serialize claim replacement against a delayed receiver's ownership check
-		// and publication. The payload receive itself remains fully concurrent.
-		absl::MutexLock lifecycle_lock(&pbr_slot_lifecycle_mu_);
-		// Persist a full immutable claim descriptor before publication.
-		// ORDER=5 scanners gate readiness on publish_commit + batch_complete, so exposing the
-		// descriptor early is safe and gives timeout recovery enough identity to retire a specific
-		// client sequence gap instead of an anonymous ring slot.
-		memcpy(slot, &claimed, sizeof(BatchHeader));
-		CXL::store_fence();
-		if (CXL::ExplicitFlushRequired()) {
-			CXL::flush_cacheline(batch_headers_log);
-			CXL::flush_cacheline(reinterpret_cast<const uint8_t*>(batch_headers_log) + 64);
-			CXL::store_fence();
-		}
-	}
-	batch_header_location = reinterpret_cast<BatchHeader*>(batch_headers_log);
+	// Serialize claim replacement against a delayed receiver's ownership check
+	// and publication. The payload receive itself remains fully concurrent.
+	// ORDER=5 scanners gate readiness on publish_commit + batch_complete, so
+	// exposing this immutable claim is safe and gives timeout recovery enough
+	// identity to retire a specific client-sequence gap.
+	InstallPBRClaim(batch_header, slot);
+	batch_header_location = slot;
 	return true;
 }
 
@@ -3123,6 +3121,11 @@ bool Topic::PublishPBRSlotDirect(const BatchHeader& batch_header, BatchHeader* b
 			             << " expected_batch=" << batch_header.batch_id
 			             << " slot_abs=" << batch_header_location->pbr_absolute_index
 			             << " slot_batch=" << batch_header_location->batch_id
+			             << " slot_flags=0x" << std::hex
+			             << batch_header_location->flags << std::dec
+			             << " slot_complete=" << batch_header_location->batch_complete
+			             << " slot_publish_commit="
+			             << batch_header_location->publish_commit
 			             << " rejects=" << rejected;
 		}
 		return false;
