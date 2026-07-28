@@ -88,15 +88,19 @@ so **no `flock` is required**. Safety-only ⇒ pass `-deadlock` (a quiescent ter
 state is expected, not a bug). Give parallel runs distinct `-metadir`s (TLC's
 time-stamped metadata dir otherwise collides).
 
+The reference outputs use TLC 2.19 from TLA+ Tools v1.7.4
+(`5a47802`). `fetch_tlc.sh` downloads that exact release and accepts it only
+when its SHA-256 is
+`936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`.
+
 ```bash
 cd /path/to/Embarcadero/spec
-curl -fL -o tla2tools.jar \
-  https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
 # one scenario:
+bash fetch_tlc.sh
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -deadlock -workers 16 \
   -metadir states/stale_cv_ack_relay \
   -config stale_cv_ack_relay.cfg MCEmbarcadero.tla
-# all scenarios (safe defaults; tune TLC_WORKERS/TLC_HEAP if desired):
+# All scenarios; this fetches the pinned JAR if it is absent.
 bash run_all.sh
 ```
 

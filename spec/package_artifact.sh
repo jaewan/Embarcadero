@@ -22,7 +22,8 @@ artifact="$stage/Embarcadero-TLA"
 mkdir -p "$artifact/results"
 
 for path in "$spec_dir"/*.tla "$spec_dir"/*.cfg \
-            "$spec_dir/README.md" "$spec_dir/run_all.sh"; do
+            "$spec_dir/README.md" "$spec_dir/run_all.sh" \
+            "$spec_dir/fetch_tlc.sh"; do
   [[ -f "$path" ]] || {
     echo "missing TLA+ artifact input: $path" >&2
     exit 1
@@ -40,10 +41,10 @@ for path in "$spec_dir"/results/*.txt; do
     "$path" > "$artifact/results/$name"
 done
 
-chmod +x "$artifact/run_all.sh"
+chmod +x "$artifact/run_all.sh" "$artifact/fetch_tlc.sh"
 (
   cd "$artifact"
-  sha256sum ./*.tla ./*.cfg README.md run_all.sh results/* \
+  sha256sum ./*.tla ./*.cfg README.md run_all.sh fetch_tlc.sh results/* \
     > SHA256SUMS
 )
 

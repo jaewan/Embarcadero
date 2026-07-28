@@ -12,9 +12,7 @@ heap=${TLC_HEAP:-8g}
 cfgs="core crash_pre_post_pbr retransmit_race dup_in_guard_window lease_false_positive stale_cv_ack_relay stale_cv_bug_demo client_crash_midstream seq_failover_open_gap module_loss_ack_window reader_agreement exactly_once_fence"
 
 if [[ ! -f "$jar" ]]; then
-  echo "missing tla2tools.jar: $jar" >&2
-  echo "download it as documented in spec/README.md or set TLA2TOOLS_JAR" >&2
-  exit 2
+  TLA2TOOLS_JAR="$jar" "$spec_dir/fetch_tlc.sh" >/dev/null
 fi
 mkdir -p "$state_root" "$result_root"
 
