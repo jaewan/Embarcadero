@@ -89,7 +89,7 @@ class ExperimentDispatchTests(unittest.TestCase):
         self.assertFalse(self.record.exists())
 
     def test_all_documented_shell_launchers_dispatch_before_historical_body(self):
-        profiles = {"--dev-dram": "dev", "--fault-dram": "fault", "--perf-dram": "perf",
+        profiles = {"--dev-dram": "dev", "--workload-dram": "workload", "--fault-dram": "fault", "--perf-dram": "perf",
                     "--legacy-startup": "legacy-startup"}
         for launcher in experiment.LEGACY_LAUNCHERS.values():
             for option, profile in profiles.items():

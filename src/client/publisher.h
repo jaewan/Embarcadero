@@ -563,6 +563,7 @@ class Publisher {
 		void RefreshOrder5PreferredQueuesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 		/** Home-broker IDs for ORDER=5 preferred striping; empty means all brokers. */
 		std::vector<int> Order5HomeBrokerIdsLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+		bool HasSupportedOrder5AckRouting(int ack_level) const;
 		bool ShouldConnectPublishThreadsToBrokerLocked(int broker_id) const
 			ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 		void ReassignQueueBrokerLocked(size_t queue_idx, int old_broker_id, int new_broker_id) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);

@@ -1,5 +1,10 @@
 # Documentation
 
+The latest refactoring work and qualification are recorded in the
+[follow-up report](reviews/2026-09-22-followup-results.md), with an explicit
+[original-plan closure audit](reviews/2026-09-22-plan-closure-audit.md).
+Earlier source09 results remain separate historical evidence.
+
 Design, evaluation, and operational documentation for Embarcadero.
 
 ## Start here
@@ -37,4 +42,4 @@ development guides for executable commands and implementation limits.
 - **Architecture:** [`design/EMBARCADERO_DEFINITIVE_DESIGN.md`](design/EMBARCADERO_DEFINITIVE_DESIGN.md)
 - **CXL memory layout:** [`design/CXL_MEMORY_LAYOUT_v2.md`](design/CXL_MEMORY_LAYOUT_v2.md)
 - **Configuration:** [`operations/configuration.md`](operations/configuration.md)
-- **Paper:** [current text](../Paper/Text/) and [SOSP reviewer material](../Paper/SOSP_Text/) (LaTeX sources; managed separately).
+- **Paper:** working copies live in `Paper/Text/` and `Paper/SOSP_Text/` (SOSP reviewer material). These ignored LaTeX sources are managed separately and are not included in the public source archive.

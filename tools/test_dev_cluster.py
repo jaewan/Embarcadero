@@ -56,6 +56,47 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.cpu_set("4-1")
 
+    def test_source_provenance_requires_successful_git_commands_and_revision(self):
+        revision = "a" * 40
+        for rev_code, rev, status_code, status, expected in (
+                (128, "", 128, "", "unavailable:"),
+                (0, "", 0, "", "unavailable:"),
+                (0, revision, 128, "", "unavailable:"),
+                (0, revision, 0, " M source.cc", "incomplete:"),
+                (0, revision, 0, "", "clean revision")):
+            with self.subTest(rev_code=rev_code, rev=rev, status_code=status_code, status=status):
+                results = [subprocess.CompletedProcess([], rev_code, rev, "revision diagnostic"),
+                           subprocess.CompletedProcess([], status_code, status, "status diagnostic")]
+                with mock.patch.object(runner.subprocess, "run", side_effect=results):
+                    evidence = runner.source_provenance(Path("/source-archive"))
+                self.assertTrue(evidence["source_provenance"].startswith(expected), evidence)
+                self.assertEqual(evidence["git_commands"]["git_revision"]["exit_code"], rev_code)
+                self.assertEqual(evidence["git_commands"]["git_status"]["exit_code"], status_code)
+                self.assertIn("compiled source association requires build evidence", evidence["source_provenance_scope"])
+        with mock.patch.object(runner.subprocess, "run", side_effect=FileNotFoundError("git unavailable")):
+            evidence = runner.source_provenance(Path("/source-archive"))
+        self.assertTrue(evidence["source_provenance"].startswith("unavailable:"))
+        self.assertIsNone(evidence["git_commands"]["git_revision"]["exit_code"])
+
+    def test_actual_proc_executable_identity_and_replaced_path_are_checked(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        try:
+            path = Path(sys.executable).resolve()
+            expected = runner.binary_digest(path)
+            evidence = {}
+            runner.verify_executed_binary(child, path, expected, evidence)
+            self.assertEqual(evidence['observed_sha256'], expected)
+            self.assertEqual(evidence['observed_path'], str(path))
+            for declared, sha in ((path, '0' * 64), (Path('/different/executable'), expected)):
+                evidence = {}
+                with self.assertRaisesRegex(runner.RunError, 'executed binary differs'):
+                    runner.verify_executed_binary(child, declared, sha, evidence)
+                self.assertEqual(evidence['observed_sha256'], expected)
+                self.assertEqual(evidence['declared_sha256'], sha)
+        finally:
+            child.terminate()
+            child.wait(timeout=3)
+
     def test_profile_and_environment_are_explicit(self):
         config = runner.effective_config(3)
         self.assertEqual(config["embarcadero"]["cxl"]["size"], 64 * runner.GIB)
@@ -174,7 +215,8 @@ time.sleep(60)
 """.replace("SHUTDOWN_EXIT", str(shutdown_exit)))
         client = binaries / "throughput_test"
         client.write_text("#!/usr/bin/env python3\n" + """
-import pathlib
+import pathlib,time
+time.sleep(.1)
 pathlib.Path('throughput_benchmark_summary.csv').write_text(
     'total_message_size_bytes,publish_goodput_mbps,e2e_goodput_mbps\\n33554432,1,1\\n')
 print('[ORDERED_DELIVERY_AUDIT] status=passed messages=8192 expected=8192 payload_bytes=33554432 duplicates=0 parse_errors=0 export_gaps=0 indexed_payload=1')
@@ -192,6 +234,12 @@ print('[ORDERED_DELIVERY_AUDIT] status=passed messages=8192 expected=8192 payloa
                 "nodes": {"0": {"cpus": [0]}, "1": {"cpus": [1]}}}))
             stack.enter_context(mock.patch.object(runner, "memory_preflight", return_value={}))
             stack.enter_context(mock.patch.object(runner, "placement_snapshot", return_value={}))
+            # Script fixtures execute Python, not native broker/client ELF files.
+            # The real procfs behavior is exercised independently above.
+            def fixture_identity(child, path, sha, evidence):
+                evidence.update(pid=child.pid, declared_path=str(path), declared_sha256=sha,
+                                observed_path=str(path), observed_sha256=sha, fixture_only=True)
+            stack.enter_context(mock.patch.object(runner, "verify_executed_binary", side_effect=fixture_identity))
             stack.enter_context(mock.patch.object(runner, "check_ports"))
             stack.enter_context(mock.patch.object(runner.shutil, "which", return_value=str(numactl)))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
@@ -255,9 +303,29 @@ print('[ORDERED_DELIVERY_AUDIT] status=passed messages=8192 expected=8192 payloa
             self.assertTrue(manifest["shared_memory_removed"])
             self.assertEqual(manifest["exit_codes"], {"broker-0": 0, "broker-1": 0, "broker-2": 0, "client": 0})
             self.assertFalse(Path(manifest["shared_memory"]).exists())
+            self.assertEqual(set(manifest['executed_broker_binaries']), {'broker-0', 'broker-1', 'broker-2'})
+            self.assertEqual(set(manifest['executed_binaries']), {'client'})
             for pid in manifest["pids"].values():
                 self.assertFalse(Path(f"/proc/{pid}").exists())
                 self.assertFalse(Path(f"/tmp/embarlet_{pid}_ready").exists())
+
+    def test_broker_executable_mismatch_fails_before_client_and_cleans_owned_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            build, numactl = self.fake_build(base)
+            def mismatch(child, path, sha, evidence):
+                evidence.update(pid=child.pid, declared_sha256=sha, observed_sha256='changed')
+                raise runner.RunError('executed binary differs from preflight')
+            with self.fake_host(numactl), mock.patch.object(runner, 'verify_executed_binary', side_effect=mismatch):
+                code = runner.main(['--build-dir', str(build), '--run-root', str(base)])
+            manifest = json.loads(next(base.glob('embarcadero-dev-*/manifest.json')).read_text())
+            self.assertEqual(code, 1)
+            self.assertEqual(manifest['status'], 'failed')
+            self.assertEqual(manifest['exit_codes'], {'broker-0': 0})
+            self.assertEqual(manifest['executed_broker_binaries']['broker-0']['observed_sha256'], 'changed')
+            self.assertNotIn('client', manifest['pids'])
+            self.assertTrue(manifest['shared_memory_removed'])
+            self.assertFalse(manifest['forced_shutdown'])
 
     def test_nonzero_broker_exit_during_cleanup_cannot_pass_audit(self):
         with tempfile.TemporaryDirectory() as directory:

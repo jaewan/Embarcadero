@@ -113,6 +113,15 @@ class CXLManager{
 		}
 
 	private:
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+        // Defined only by the linked allocator fixture. It bypasses backend
+        // startup, but exercises this manager's real allocator and destructor.
+        // All linked fixture sources use the same fault-enabled definition.
+        friend class CxlManagerGeometryTestAccess;
+        struct AllocatorFixtureTag {};
+        CXLManager(AllocatorFixtureTag, const cxl_manager::RegionLayout& layout,
+                   void* owned_mapping);
+#endif
 		int broker_id_;
 		std::string head_ip_;
 		size_t cxl_size_;

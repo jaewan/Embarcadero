@@ -16,6 +16,28 @@
 using namespace std::chrono_literals;
 
 struct PublisherTestPeer {
+	static void SetPublishAllowlist(Publisher& publisher, std::vector<int> brokers) {
+		publisher.order5_broker_allowlist_ = std::move(brokers);
+	}
+	static void SetHomeBrokers(Publisher& publisher, size_t count) {
+		publisher.order5_home_brokers_ = count;
+	}
+	static bool AckRoutingSupported(const Publisher& publisher, int ack_level) {
+		return publisher.HasSupportedOrder5AckRouting(ack_level);
+	}
+
+	static void ExpectNotStarted(const Publisher& publisher) {
+		EXPECT_FALSE(publisher.ack_thread_.joinable());
+		EXPECT_FALSE(publisher.retransmit_thread_.joinable());
+		EXPECT_FALSE(publisher.cluster_probe_thread_.joinable());
+		EXPECT_TRUE(publisher.threads_.empty());
+		EXPECT_EQ(publisher.thread_count_.load(), 0);
+	}
+
+	static size_t PoolBytes(Publisher& publisher) {
+		return publisher.pubQue_.PoolBytes();
+	}
+
 	static void ConfigureOrder5Session(Publisher& publisher, uint32_t epoch) {
 		publisher.ack_level_ = 1;
 		publisher.session_epoch_.store(epoch, std::memory_order_release);
@@ -166,6 +188,52 @@ struct QueueBufferTestPeer {
 };
 
 namespace {
+
+TEST(Order5PublisherRoutingTest, FollowerOnlyAcknowledgedInitRejectsBeforeWorkersOrPool) {
+	char topic[TOPIC_NAME_SIZE] = {};
+	std::strncpy(topic, "RoutingAdmission", sizeof(topic) - 1);
+	for (int ack_level : {1, 2}) {
+		Publisher publisher(topic, "127.0.0.1", "1", 1, 64, 1 << 20,
+		                    Embarcadero::kOrderStrong,
+		                    heartbeat_system::SequencerType::EMBARCADERO);
+		PublisherTestPeer::SetPublishAllowlist(publisher, {1, 2});
+		const size_t pool_before = PublisherTestPeer::PoolBytes(publisher);
+		EXPECT_FALSE(publisher.Init(ack_level));
+		PublisherTestPeer::ExpectNotStarted(publisher);
+		EXPECT_EQ(PublisherTestPeer::PoolBytes(publisher), pool_before);
+		PublisherTestPeer::SetPublishAllowlist(publisher, {});
+		PublisherTestPeer::SetHomeBrokers(publisher, 1);
+		EXPECT_TRUE(PublisherTestPeer::AckRoutingSupported(publisher, 0));
+		EXPECT_FALSE(publisher.Init(ack_level));
+		PublisherTestPeer::ExpectNotStarted(publisher);
+		EXPECT_EQ(PublisherTestPeer::PoolBytes(publisher), pool_before);
+	}
+}
+
+TEST(Order5PublisherRoutingTest, GuardPreservesDefaultExplicitHeadAndUnacknowledgedModes) {
+	char topic[TOPIC_NAME_SIZE] = {};
+	for (const auto seq : {heartbeat_system::SequencerType::EMBARCADERO,
+	                       heartbeat_system::SequencerType::CORFU}) {
+		for (const int order : {1, Embarcadero::kOrderStrong}) {
+			Publisher publisher(topic, "127.0.0.1", "1", 1, 64, 1 << 20, order, seq);
+			PublisherTestPeer::SetPublishAllowlist(publisher, {});
+			PublisherTestPeer::SetHomeBrokers(publisher, 0);
+			EXPECT_TRUE(PublisherTestPeer::AckRoutingSupported(publisher, 1));
+			EXPECT_TRUE(PublisherTestPeer::AckRoutingSupported(publisher, 2));
+			PublisherTestPeer::SetPublishAllowlist(publisher, {1, 2});
+			EXPECT_TRUE(PublisherTestPeer::AckRoutingSupported(publisher, 0));
+			if (seq != heartbeat_system::SequencerType::EMBARCADERO ||
+			    order != Embarcadero::kOrderStrong) {
+				EXPECT_TRUE(PublisherTestPeer::AckRoutingSupported(publisher, 1));
+				EXPECT_TRUE(PublisherTestPeer::AckRoutingSupported(publisher, 2));
+			}
+			PublisherTestPeer::SetPublishAllowlist(publisher, {0, 2});
+			PublisherTestPeer::SetHomeBrokers(publisher, 1);
+			EXPECT_TRUE(PublisherTestPeer::AckRoutingSupported(publisher, 1));
+			EXPECT_TRUE(PublisherTestPeer::AckRoutingSupported(publisher, 2));
+		}
+	}
+}
 
 TEST(Order5PublisherRetryPolicyTest, OverdueSuffixSelectsOnlyRetireCursorPredecessor) {
 	struct Candidate {

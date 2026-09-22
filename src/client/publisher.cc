@@ -665,6 +665,13 @@ Publisher::~Publisher() {
 }
 
 
+bool Publisher::HasSupportedOrder5AckRouting(int ack_level) const {
+	if (!IsOrder5SessionMode() || ack_level < 1) return true;
+	if (order5_broker_allowlist_.empty()) return order5_home_brokers_ == 0;
+	return std::find(order5_broker_allowlist_.begin(),
+	                 order5_broker_allowlist_.end(), 0) != order5_broker_allowlist_.end();
+}
+
 bool Publisher::Init(int ack_level) {
 #ifdef EMBARCADERO_CLIENT_NO_BASELINES
     if (seq_type_ != heartbeat_system::SequencerType::EMBARCADERO) {
@@ -674,6 +681,18 @@ bool Publisher::Init(int ack_level) {
 #endif
 
 	ack_level_ = ack_level;
+	// ORDER5 progress and fence notifications are authoritative only on the
+	// head. ACK connections currently follow publish connections; a follower-
+	// only allowlist would admit data with no way to observe its completion.
+	// Reject before Init resolves runtime config, allocates the batch pool, or
+	// starts owned workers/RPCs. The constructor's lazy gRPC channel exists already.
+	if (!HasSupportedOrder5AckRouting(ack_level)) {
+		LOG(ERROR) << "ORDER5 acknowledged publishing requires default all-broker routing "
+		              "or an explicit publish allowlist containing broker 0: head-only "
+		              "ACK/fence connectivity is not independent of publish routing. "
+		              "Follower-only allowlists and implicit home-broker routing are unsupported.";
+		return false;
+	}
 
 	const auto& runtime_cfg = Embarcadero::GetConfig().config().client.runtime;
 	runtime_mode_ = Embarcadero::GetConfig().getRuntimeMode();

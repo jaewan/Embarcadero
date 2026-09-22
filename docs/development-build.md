@@ -95,3 +95,19 @@ for each test process to avoid the GCC runtime's unexpected-mapping failure on
 high-ASLR kernels; it changes no host sysctl. Unsupported process personality
 or race reports fail the command. This is focused component coverage, not a
 full instrumented cluster or a model of noncoherent CXL cache visibility.
+
+For the larger production-linked fixtures, run
+`bash tools/build_support/run_tsan_linked.sh /tmp/embarcadero-tsan-linked`.
+Additional CMake arguments can select an existing pinned gRPC source checkout.
+The script instruments fetched dependencies consistently, applies the process
+address-layout workaround to build-time generators as well as tests, and fixes
+that process's timezone to UTC. It tests the actual publisher, Topic publication,
+disk replication, configuration, framing, and epoch shutdown paths. It contains
+no race suppressions and does not substitute for a fully instrumented live cluster.
+
+Follow-up source 11 passed 51 registered CTest targets and a fresh minimal-client
+build on this host. The extracted publisher passed 10 ASan/UBSan tests with leak
+detection; the corrected Topic fixture and five other linked targets passed
+TSan, as did the three small concurrency fixtures. See the
+[follow-up evidence](reviews/2026-09-22-followup-results.md) for exact source
+identities, the test-only post-freeze correction, initial failures and scope.

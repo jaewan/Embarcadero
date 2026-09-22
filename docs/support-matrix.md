@@ -1,6 +1,6 @@
 # Implemented modes and qualification limits
 
-Admission validation is a configuration contract, not a correctness or performance certification. The [final matched DRAM pilot](reviews/2026-09-22-completion-results.md) covers finite ORDER5/ACK1/RF0 transfers with one client and one or three local brokers; one-broker ACK throughput remains statistically inconclusive. Other implemented modes below retain their research interfaces; they have not inherited that qualification.
+Admission validation is a configuration contract, not a correctness or performance certification. The [latest matched DRAM campaign](reviews/2026-09-22-followup-results.md) covers finite ORDER5/ACK1/RF0 transfers with one client and one or three local brokers; one-broker ACK throughput remains statistically inconclusive. Other implemented modes below retain their research interfaces; they have not inherited that qualification.
 
 ## Ordering and acknowledgement
 
@@ -35,6 +35,6 @@ The legacy `--replicate_to_disk` switch and ORDER5 chain sink selection are diff
 
 `support_contract_test` exercises the same scalar, membership, and chain-admission helpers used by `TopicManager`/`DiskManager`, including partial-membership rejection. It is not a linked broker or failure-recovery test. Existing ACK policy, durable frontier, replication topology, sidecar, and process-restart fixtures cover narrower contracts. The disk/memory-copy ACK2 scripts are executable test specifications, not evidence that every listed configuration has passed.
 
-The owner-selected release contract is bounded storage: retain data and stop safely at capacity. All modes share finite-capacity, no-reuse storage limits. Exhaustion fails closed; the release does not recycle logs, evict retained data, or discard replayable history to accommodate slow subscribers. Real CXL visibility, independent-host durability, failure/recovery behavior, and all unqualified mode combinations require their own recorded experiments.
+The owner-selected release contract is bounded primary storage: retain data and stop safely at capacity. Primary BLog allocation is finite and non-recycling. The qualified ORDER5 path retains its BLog/GOI prefix and fails closed at exhaustion; it does not evict replayable history to accommodate slow subscribers. This does not turn the ORDER0 subscriber ring or the overwriteable memory-copy replica sink into retained replay stores. Those research-mode limits remain as listed above. Real CXL visibility, independent-host durability, failure/recovery behavior, and all unqualified mode combinations require their own recorded experiments.
 
 The paper's full durable ACK additionally requires replicated order/session/control metadata and a certified prefix across independent CXL modules. Payload `fsync` and completion-token ordering alone do not provide that recovery contract. Current order-visible delivery remains speculative across sequencer replacement; see [paper/implementation boundaries](reviews/2026-09-22-completion-results.md).

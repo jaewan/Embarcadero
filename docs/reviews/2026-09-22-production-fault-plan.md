@@ -1,17 +1,17 @@
 # Next gate: production-path fault tests
 
-Status: **implementation delivered; live qualification is recorded separately per immutable binary and run**. The owned runner implements all twenty cases: eighteen core cases plus two production-client extensions. This document distinguishes implemented coverage from stronger proposed schedules; it does not mark pending or failed live cases as passed. Consult the [completion ledger](2026-09-22-refactoring-completion-plan.md) and retained run manifests for execution verdicts. Historical line-number links below describe the design review; use named functions to locate moved code.
+Status: **implementation delivered; live qualification is recorded separately per immutable binary and run**. The owned runner implements all twenty-three cases: twenty-one core cases plus two production-client extensions. This document distinguishes implemented coverage from stronger proposed schedules; it does not mark pending or failed live cases as passed. Consult the [completion ledger](2026-09-22-refactoring-completion-plan.md) and retained run manifests for execution verdicts. Historical line-number links below describe the design review; use named functions to locate moved code.
 
 The controller, native wire driver, and owned runner are in [`test/integration/`](../../test/integration/) and [`common/fault_injection.*`](../../src/common/fault_injection.h). They exercise real ingress, Topic, publisher, replication, and shutdown paths on coherent DRAM. They do not establish non-coherent CXL visibility, persistent-media durability, host failover, physical writer fencing, or sustainable reclamation. Fault builds and later refactored binaries do not inherit the earlier frozen performance pilot's qualification.
 
 ## Implemented case inventory and scope
 
-The eighteen core runner cases include a success control and one production-publisher ACK case; “native campaign” does not mean all eighteen use the small native protocol client.
+The twenty-one core runner cases include a success control and one production-publisher ACK case; “native campaign” does not mean all twenty-one use the small native protocol client.
 
 | Group | Delivered runner cases | Bounded assertion |
 |---|---|---|
-| Control / T1 | `control`, `fragmented_open`, `truncated_control`, `mismatched_client`, `incomplete_payload`, `malformed_body` | Real wire parsing, rejection before publication, exact committed-prefix and recovery-control delivery |
-| T2 | `shutdown_partial_handshake`, `shutdown_ack_connect`, `shutdown_queue` | Controlled handshake/connect/full-queue waits cancel with owned normal shutdown; queue observation hook is released before testing the actual queue wait |
+| Control / T1 | `control`, `fragmented_open`, `truncated_control`, `mismatched_client`, `incomplete_payload`, `malformed_body`, `repeated_rejected_connections` | Real wire parsing, rejection before publication, exact committed-prefix and recovery-control delivery;128 completed rejected connections with before/after FD inventories |
+| T2 | `shutdown_partial_handshake`, `shutdown_ack_connect`, `shutdown_queue`, `shutdown_partial_control`, `shutdown_partial_body` | Controlled handshake/connect/full-queue waits cancel with owned normal shutdown; partial-control/body and queue cases record the exact worker syscall after hook release before SIGTERM; queue evidence requires a distinct untimed condition-variable wait |
 | T3 | `fence_before_commit`, `commit_before_fence`, `fence_empty_prefix` | Reachable serialized classification/commit schedules and exact nonempty/empty fenced prefixes; no claim of concurrent live commit/fence execution |
 | T4 | `ack_publication_lag` | Real publisher authoritative HWM can precede raw counter/retirement; retirement observed separately |
 | T5 / T6 | `rollover_retention`, `blog_capacity`, `goi_capacity`, `session_capacity` | Three retained segments, small production PBR wraps, fail-closed allocation/range admission, and the actual 4096-entry session table |
@@ -20,7 +20,9 @@ The eighteen core runner cases include a success control and one production-publ
 
 T7 repeatedly reads the head's real `SubscribeToCluster` initial snapshot for exactly IDs 0/1/2, all publishable, before CreateTopic; a follower listener marker alone does not satisfy admission. Every child image is checked through `/proc/PID/exe` at a controlled barrier against its preflight digest. Driver-only fixture fixes can therefore be recorded without relabeling the immutable broker/client image. Failed attempts remain failures even when a later fixture corrects its schedule or readiness prerequisite.
 
-**Stronger schedules still proposed:** linked-Topic synthetic concurrent gate winners; OPEN racing intermediate commit publication; three-broker session fencing/reopen; shutdown during partial control/body or PBR-full receive; real disk short-write/sync-failure injection; and fence-path or multiple-shard admission-failure schedules. These are not supplied by the twenty implemented cases. Explicit repeated-connection FD inventories are also not a delivered live oracle; owned process exit/cleanup is narrower evidence.
+**Additional delivered linked fixtures:** `topic_publication_test` invokes actual Topic classification, commit/fence gates and the production OPEN snapshot reader during intermediate publication. `chain_disk_fault_test` invokes the actual replication manager against owned temporary files with short-write, write/sync error, successful-sync and EINTR schedules. These bounded component schedules complement the live cases; they do not establish naturally concurrent live sequencing or persistent-media recovery.
+
+**Stronger schedules still proposed:** three-broker session fencing/reopen, shutdown during PBR-full receive, and fence-path or multiple-shard admission failures. The repeated-connection FD oracle checks one explicit rejection path; it is not universal descriptor-leak proof.
 
 ## What the oracle must observe
 

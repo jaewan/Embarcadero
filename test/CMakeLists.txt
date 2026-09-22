@@ -804,6 +804,10 @@ add_test(NAME unit_experiment_dispatch
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_experiment.py)
 set_tests_properties(unit_experiment_dispatch PROPERTIES
     TIMEOUT 30 LABELS "unit;runner;dispatch;correctness")
+add_test(NAME unit_experiment_workload
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_experiment_workload.py)
+set_tests_properties(unit_experiment_workload PROPERTIES
+    TIMEOUT 30 LABELS "unit;runner;workload;correctness")
 add_test(NAME unit_fault_packet_parser
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_fault_control.py)
 set_tests_properties(unit_fault_packet_parser PROPERTIES TIMEOUT 10 LABELS "unit;fault-control;correctness")
@@ -816,7 +820,7 @@ if(TARGET embarlet)
     list(REMOVE_ITEM _broker_fixture_sources embarlet/embarlet.cc)
     list(TRANSFORM _broker_fixture_sources PREPEND "${PROJECT_SOURCE_DIR}/src/")
     get_target_property(_broker_fixture_links embarlet LINK_LIBRARIES)
-    add_executable(topic_publication_test topic_publication_test.cc ${_broker_fixture_sources})
+    add_executable(topic_publication_test topic_publication_test.cc cxl_manager_geometry_test.cc ${_broker_fixture_sources})
     target_include_directories(topic_publication_test PRIVATE
         ${PROJECT_SOURCE_DIR}/src ${PROJECT_BINARY_DIR} ${PROJECT_BINARY_DIR}/src)
     target_link_libraries(topic_publication_test PRIVATE ${_broker_fixture_links})
@@ -826,6 +830,8 @@ if(TARGET embarlet)
     endif()
     add_test(NAME unit_topic_publication COMMAND topic_publication_test)
     set_tests_properties(unit_topic_publication PROPERTIES TIMEOUT 30 LABELS "unit;session;publication;fault-control;correctness")
+    add_test(NAME unit_cxl_manager_geometry COMMAND topic_publication_test --manager-geometry)
+    set_tests_properties(unit_cxl_manager_geometry PROPERTIES TIMEOUT 30 LABELS "unit;layout;allocation;correctness")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

@@ -4,6 +4,7 @@ Use one dispatcher for supported local development:
 
 ```sh
 python3 tools/experiment.py dev --build-dir build/debug --brokers 3 --dry-run
+python3 tools/experiment.py workload publishers --build-dir build/debug --clients 2 --dry-run
 python3 tools/experiment.py fault --build-dir build/debug-faults --case all
 python3 tools/experiment.py perf --help
 ```
@@ -17,6 +18,7 @@ translation, retry policy, or result qualification.
 | Profile | Existing owner | Scope |
 |---|---|---|
 | `dev` | [dev_cluster.py](../tools/dev_cluster.py) | Audited 32 MiB local DRAM smoke |
+| `workload` | [experiment_workload.py](../tools/experiment_workload.py), using the dev lifecycle | Finite latency telemetry and indexed sender gap; independent publisher acceptance pending |
 | `fault` | [run_production_faults.py](../test/integration/run_production_faults.py) | Bounded production fault cases; fault-enabled build required |
 | `perf` | [perf_compare.py](../tools/perf_compare.py) | Matched baseline/candidate DRAM pilot and immutable evidence |
 | `legacy-startup` | [check_legacy_startup.py](../test/integration/check_legacy_startup.py) | Owned ORDER0/ACK1 startup check, without indexed payload audit |
@@ -34,7 +36,7 @@ authoritative. See [supported commands](../docs/development-commands.md),
 ## Compatibility inventory
 
 These eleven previously documented launchers now share an early dispatch guard.
-Each accepts `--dev-dram`, `--fault-dram`, `--perf-dram`, and
+Each accepts `--dev-dram`, `--workload-dram`, `--fault-dram`, `--perf-dram`, and
 `--legacy-startup`, followed by that runner's options. Dispatch occurs before
 historical locks, sourced lifecycle code, host checks, SSH, or cleanup.
 `--help` explains the routes; unknown options fail before historical code.
@@ -57,6 +59,8 @@ For example:
 
 ```sh
 bash scripts/run_latency.sh --dev-dram --build-dir build/debug --dry-run
+bash scripts/run_latency.sh --workload-dram latency --build-dir build/debug --target-mibps 128 --dry-run
+bash scripts/run_multiclient.sh --workload-dram publishers --build-dir build/debug --brokers 3 --clients 2 --client-brokers '0;0,1,2' --dry-run
 bash scripts/run_failures.sh --fault-dram --build-dir build/debug-faults --case control --dry-run
 bash scripts/publication/run_throughput_matrix.sh --perf-dram --help
 ```
@@ -65,6 +69,19 @@ These select the named owned profile. A latency launcher's `--dev-dram` route
 runs the smoke profile; it does not reproduce its historical latency matrix.
 Historical environment variables are not translated into owned runner arguments.
 Use explicit options and the resulting manifest to establish what ran.
+
+The workload adapter selects actual existing latency, sender-delay or independent
+publisher behavior while reusing owned orchestration. It has separate completion
+and telemetry gates; these do not establish equivalence with historical remote
+experiments, fixed offered-load studies, or publication matrices. The supported
+subset, resource bounds and remaining gaps are listed in
+[the command guide](../docs/development-commands.md). Latency and gap passed their
+bounded live acceptance. The follower-only publisher attempt failed and remains
+in the evidence; publisher acceptance with supported destinations is pending.
+Every acknowledged client allowlist must include broker 0 because its current
+head-owned ACK/fence channel shares the publish connection. The runner rejects
+follower-only lists before any cluster launch and does not add a destination.
+Earlier smoke/fault/performance artifacts do not qualify these new modes.
 
 ## Historical workflows
 

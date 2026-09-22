@@ -14,6 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 PROFILES = {
     "dev": "tools/dev_cluster.py",
+    "workload": "tools/experiment_workload.py",
     "fault": "test/integration/run_production_faults.py",
     "perf": "tools/perf_compare.py",
     "legacy-startup": "test/integration/check_legacy_startup.py",
@@ -35,7 +36,7 @@ LEGACY_LAUNCHERS["run_throughput_matrix"] = "scripts/publication/run_throughput_
 def parser():
     return argparse.ArgumentParser(
         description=__doc__,
-        epilog=("Profiles: dev = audited DRAM smoke; fault = production fault cases; "
+        epilog=("Profiles: dev = audited DRAM smoke; workload = bounded latency/gap/publishers; fault = production fault cases; "
                 "perf = matched DRAM pilot; legacy-startup = ORDER0/ACK1 startup; "
                 "analyze = retained pilot analysis. Append --help for runner options. "
                 "legacy requires an inventory name and retains historical SSH/cleanup "

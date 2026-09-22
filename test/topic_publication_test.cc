@@ -163,13 +163,15 @@ void CommitWins(Control& control) {
           "must observe actual intermediate field publication");
   Require(middle.reconnect_committed_hwm == 0 && middle.goi_committed_hwm_found && middle.goi_committed_hwm == 0,
           "intermediate OPEN retains the prior contiguous prefix");
-  Require(f.Goi()[1].global_seq == 1 && f.Goi()[1].client_seq == 1, "prefix has real GOI entry");
   control.Arm(2, "fence.before_publication_gate", f.client);
   auto fence = std::async(std::launch::async, [&] { f.Fence(); });
   CancelOnFailure fence_cancel{control};
   control.Hit(2, "fence.before_publication_gate"); control.Release(2);
   Require(fence.wait_for(30ms) == std::future_status::timeout, "fence must wait for commit gate");
   control.Release(1); commit.get(); fence.get();
+  // GOI payload fields are non-atomic. The socket barrier controls the schedule
+  // but is not a C++ happens-before edge; inspect this new entry only after join.
+  Require(f.Goi()[1].global_seq == 1 && f.Goi()[1].client_seq == 1, "prefix has real GOI entry");
   TopicPublicationTestAccess::DrainCompleted(*f.topic);
   auto after = f.Snapshot();
   Require(after.goi_committed_hwm_found && after.goi_committed_hwm == 1 && after.reconnect_committed_hwm == 1, "production OPEN reader agrees with contiguous GOI updater");
@@ -198,8 +200,14 @@ void FenceWins(Control& control) {
           "rejected suffix must reserve/write no GOI entry");
 }
 }
-int main() {
+void RunCxlManagerGeometryTest();
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--manager-geometry") {
+      RunCxlManagerGeometryTest();
+      return 0;
+    }
+    Require(argc == 1, "unknown fixture argument");
     Control control; CommitWins(control); FenceWins(control);
     std::cout << "PASS production Topic publication, OPEN snapshot, commit/fence winners\n";
     return 0;

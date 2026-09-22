@@ -71,6 +71,17 @@ def binary_digest(path):
     return digest.hexdigest()
 
 
+def verify_executed_binary(child, declared_path, expected_digest, evidence):
+    """Check the executable inode mapped by an owned child, retaining failures."""
+    executable = Path(f"/proc/{child.pid}/exe")
+    evidence.update(pid=child.pid, declared_path=str(declared_path),
+                    declared_sha256=expected_digest, observed_path=os.readlink(executable),
+                    observed_sha256=binary_digest(executable), observed_monotonic=time.monotonic())
+    if (evidence["observed_path"] != str(declared_path.resolve()) or
+            evidence["observed_sha256"] != expected_digest):
+        raise RunError("executed binary differs from preflight: " + str(declared_path))
+
+
 def build_provenance(build_dir):
     cache = read_optional(build_dir / "CMakeCache.txt")
     selected = {}
@@ -85,6 +96,34 @@ def build_provenance(build_dir):
     return {"cmake_cache": selected, "cache_available": cache is not None,
             "compile_commands_sha256": binary_digest(commands) if commands.is_file() else None,
             "comparison_requirement": "match compiler, build type, ISA, sanitizer, and observed PBR reservation mode"}
+
+
+def source_provenance(directory):
+    """Describe the runner tree; this does not attest which sources built binaries."""
+    commands = {}
+    for field, command in (("git_revision", ["git", "rev-parse", "HEAD"]),
+                           ("git_status", ["git", "status", "--porcelain"])):
+        try:
+            result = subprocess.run(command, cwd=directory, capture_output=True,
+                                    text=True, timeout=10)
+            commands[field] = {"exit_code": result.returncode,
+                               "stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
+        except (OSError, subprocess.TimeoutExpired) as error:
+            commands[field] = {"exit_code": None, "stdout": "", "stderr": str(error)}
+    revision, status = commands["git_revision"], commands["git_status"]
+    if (revision["exit_code"] != 0 or status["exit_code"] != 0 or
+            not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision["stdout"])):
+        label = ("unavailable: no verified Git revision/status; a source archive or non-Git tree "
+                 "requires separate archive attestation")
+    elif status["stdout"]:
+        label = ("incomplete: working tree is dirty; binary hashes identify executed artifacts, "
+                 "not reproducible source")
+    else:
+        label = "clean revision"
+    return {"git_revision": revision["stdout"], "git_status": status["stdout"],
+            "git_commands": commands, "source_directory": str(directory),
+            "source_provenance": label,
+            "source_provenance_scope": "runner source tree only; compiled source association requires build evidence"}
 
 
 def effective_config(brokers):
@@ -251,14 +290,14 @@ class OwnedProcesses:
         self.closed = False
         self.stop_requested = False
 
-    def start(self, name, command, *, environment=None, pass_fds=()):
+    def start(self, name, command, *, environment=None, pass_fds=(), cwd=None):
         if self.stop_requested or self.closed:
             raise RunError("cannot start a child after owned cleanup begins")
         # Optional inherited controls are scoped to this child. The ordinary
         # smoke/performance callers retain their existing environment and FDs.
         child_env = self.env if environment is None else {**self.env, **environment}
         with (self.run_dir / f"{name}.log").open("wb") as log:
-            child = subprocess.Popen(command, cwd=self.run_dir, env=child_env,
+            child = subprocess.Popen(command, cwd=self.run_dir if cwd is None else cwd, env=child_env,
                                      stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                      start_new_session=True, pass_fds=pass_fds)
         self.children.append((name, child))
@@ -381,6 +420,10 @@ class SmokeProfile:
     order: int = 5
     audit_enabled: bool = True
     validator: object = validate_smoke
+    # Optional tools-only adapter: prepare configuration/environment, describe
+    # commands, and execute clients using this same owned broker/region lifecycle.
+    # The standard smoke and legacy startup adapters leave this unset.
+    workload: object = None
 
     def __post_init__(self):
         if self.order not in (0, 5) or not callable(self.validator):
@@ -453,17 +496,15 @@ def main(argv=None, *, profile=None):
             selected.pop("EMBARCADERO_CXL_BASE_ADDR", None)
         manifest["mapping_policy"] = "automatic head selection; followers use published descriptor" if args.automatic_mapping else "explicit common base"
         env["EMBAR_VALIDATE_ORDER"] = selected["EMBAR_VALIDATE_ORDER"] = "1" if profile.audit_enabled else "0"
+        if profile.workload is not None:
+            profile.workload.prepare(config, env, selected, manifest, hardware, args, run_dir)
+            write_json(config_path, config)
         manifest.update(environment=selected, ignored_environment_names=removed,
                         shared_memory=str(shm_path), cleanup_targets=[str(shm_path)])
         manifest["layout"] = layout_preflight(broker, config_path, env)
         manifest["binaries"] = {str(path): binary_digest(path) for path in (broker, client)}
         manifest["build"] = build_provenance(args.build_dir.resolve())
-        for field, command in (("git_revision", ["git", "rev-parse", "HEAD"]),
-                               ("git_status", ["git", "status", "--porcelain"])):
-            manifest[field] = subprocess.run(command, cwd=ROOT, capture_output=True,
-                                             text=True, timeout=10).stdout.strip()
-        manifest["source_provenance"] = ("clean revision" if not manifest["git_status"] else
-            "incomplete: working tree is dirty; binary hashes identify executed artifacts, not reproducible source")
+        manifest.update(source_provenance(ROOT))
         def binding(node):
             cpus = hardware["nodes"][str(node)]["cpus"]
             return [numactl, "--physcpubind=" + ",".join(map(str, cpus)), f"--membind={node}"]
@@ -474,6 +515,9 @@ def main(argv=None, *, profile=None):
         client_command = binding(0) + [str(client), "--config", str(config_path), "--head_addr", "127.0.0.1",
             "-t", "1", "-o", str(profile.order), "-a", "1", "-r", "0", "-n", "1", "-m", str(MESSAGE_BYTES),
             "-s", str(PAYLOAD_BYTES), "--sequencer", "EMBARCADERO"]
+        if profile.workload is not None:
+            client_command = None
+            manifest["client_commands"] = profile.workload.commands(binding(0), client, config_path, run_dir)
         ports = [CONTROL_PORT] + list(range(DATA_PORT, DATA_PORT + args.brokers))
         manifest.update(broker_commands=commands, client_command=client_command, ports=ports,
                         cpu_budget="all allowed CPUs on the designated node; shared among brokers, includes available SMT siblings")
@@ -497,6 +541,7 @@ def main(argv=None, *, profile=None):
             owned.start_wall = time.time()
             deadline = time.monotonic() + args.startup_timeout
             manifest["placement"] = {}
+            manifest["executed_broker_binaries"] = {}
             for broker_id, command in enumerate(commands):
                 name = f"broker-{broker_id}"
                 child = owned.start(name, command)
@@ -505,6 +550,8 @@ def main(argv=None, *, profile=None):
                 manifest["cleanup_targets"] = [str(shm_path)] + list(map(str, markers))
                 write_json(run_dir / "manifest.json", manifest)
                 wait_ready(child, owned, deadline)
+                evidence = manifest["executed_broker_binaries"].setdefault(name, {})
+                verify_executed_binary(child, broker, manifest["binaries"][str(broker)], evidence)
                 manifest["placement"][name] = placement_snapshot(child,
                     hardware["nodes"]["1"]["cpus"], 1, run_dir, name, shm_name if broker_id == 0 else None)
             if args.automatic_mapping:
@@ -520,27 +567,42 @@ def main(argv=None, *, profile=None):
                     manifest["mapping_bases"][name] = hex(int(logged[0], 16))
                 if len(set(manifest["mapping_bases"].values())) != 1:
                     raise RunError("automatic follower mappings disagree with the head")
-            workload = owned.start("client", client_command)
-            manifest["pids"] = {name: child.pid for name, child in owned.children}
-            manifest["status"] = "running"
-            write_json(run_dir / "manifest.json", manifest)
-            deadline = time.monotonic() + 30
-            placement_due = time.monotonic() + 0.25
-            while workload.poll() is None:
+            if profile.workload is not None:
+                profile.workload.execute(owned, manifest, hardware, run_dir)
+            else:
+                workload = owned.start("client", client_command)
+                manifest["pids"] = {name: child.pid for name, child in owned.children}
+                manifest["status"] = "running"
+                write_json(run_dir / "manifest.json", manifest)
+                deadline = time.monotonic() + 30
+                placement_due = time.monotonic() + 0.25
+                manifest["executed_binaries"] = {}
+                while workload.poll() is None:
+                    owned.check_brokers()
+                    if time.monotonic() >= deadline:
+                        raise RunError("client exceeded its 30-second smoke deadline")
+                    if "client" not in manifest["executed_binaries"]:
+                        try:
+                            observed = os.readlink(f"/proc/{workload.pid}/exe")
+                            # numactl can still own the process before exec.
+                            if observed != str(Path(numactl).resolve()):
+                                evidence = manifest["executed_binaries"].setdefault("client", {})
+                                verify_executed_binary(workload, client, manifest["binaries"][str(client)], evidence)
+                        except FileNotFoundError:
+                            pass  # A quick exit is rejected below if identity was never observed.
+                    if time.monotonic() >= placement_due:
+                        manifest["placement"]["client"] = placement_snapshot(workload,
+                            hardware["nodes"]["0"]["cpus"], 0, run_dir, "client")
+                        placement_due = float("inf")
+                    time.sleep(0.05)
                 owned.check_brokers()
-                if time.monotonic() >= deadline:
-                    raise RunError("client exceeded its 30-second smoke deadline")
-                if time.monotonic() >= placement_due:
-                    manifest["placement"]["client"] = placement_snapshot(workload,
-                        hardware["nodes"]["0"]["cpus"], 0, run_dir, "client")
-                    placement_due = float("inf")
-                time.sleep(0.05)
-            owned.check_brokers()
-            if "client" not in manifest["placement"]:
-                manifest["placement"]["client"] = {
-                    "status": "not observed: client exited before the first placement sample"}
-            if workload.returncode:
-                raise RunError(f"client exited with {workload.returncode}; see client.log")
+                if "client" not in manifest["placement"]:
+                    manifest["placement"]["client"] = {
+                        "status": "not observed: client exited before the first placement sample"}
+                if workload.returncode:
+                    raise RunError(f"client exited with {workload.returncode}; see client.log")
+                if not manifest["executed_binaries"].get("client", {}).get("observed_sha256"):
+                    raise RunError("client exited before executable identity could be verified")
             manifest["smoke"] = profile.validator(run_dir)
             manifest["status"] = "passed"
             exit_code = 0
@@ -601,6 +663,13 @@ def main(argv=None, *, profile=None):
             path.stem: sorted(set(re.findall(r"PBR reservation mode=(atomic128|mutex)\b",
                                             path.read_text(errors="replace")))) or ["not observed"]
             for path in run_dir.glob("broker-*.log")}
+        if profile.workload is not None:
+            try:
+                profile.workload.check_final_artifacts(run_dir)
+            except (RunError, OSError) as error:
+                manifest["status"] = "failed"
+                manifest["cleanup_error"] = str(error)
+                exit_code = 1
         write_json(run_dir / "manifest.json", manifest)
     return exit_code
 
