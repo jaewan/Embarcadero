@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-23",
+  "scope": "Local single-broker DRAM-emulation controls; identical frozen broker and client in every trial; not a baseline/candidate comparison or CXL evidence",
+  "binary_sha256": {
+    "broker": "cb024ee5d443561f4014d769068ae0275e17d75d31ada2c87edd743aca82ee18",
+    "client": "bc0fa749fc86cefe0010b0cabe1e7fe77dec0807e77e13eaa8a5d85da230be36"
+  },
+  "protocol": {
+    "qualifications_excluded_per_campaign": 2,
+    "measurements_per_campaign": 8,
+    "payload_bytes": 2147483648,
+    "message_bytes": 4096,
+    "order": 5,
+    "ack": 1,
+    "replication_factor": 0,
+    "broker_numa_node": 1,
+    "client_numa_node": 0,
+    "fresh_emulated_region_bytes": 68719476736
+  },
+  "controls": {
+    "thread_observer": {
+      "campaign_status": "passed",
+      "trials_passed": 10,
+      "source_index_sha256": "dfa8b6d157f86848b34d650af81ffd8c8262b5f2d89ce62dfe69b5877cb52794",
+      "rows": [
+        {
+          "sequence": 3,
+          "ack_ms": 1324.923,
+          "audit_inclusive_e2e_ms": 2056.014,
+          "sender_sampled_system_cpu_s": 1.0,
+          "client_sampled_runnable_wait_ms": 1.104,
+          "observer_cpu_s": 10.538,
+          "critical_coverage_fraction": 0.8518
+        },
+        {
+          "sequence": 4,
+          "ack_ms": 2074.571,
+          "audit_inclusive_e2e_ms": 2188.331,
+          "sender_sampled_system_cpu_s": 1.99,
+          "client_sampled_runnable_wait_ms": 1.202,
+          "observer_cpu_s": 10.583,
+          "critical_coverage_fraction": 0.9144
+        },
+        {
+          "sequence": 5,
+          "ack_ms": 1809.635,
+          "audit_inclusive_e2e_ms": 1810.665,
+          "sender_sampled_system_cpu_s": 1.74,
+          "client_sampled_runnable_wait_ms": 0.716,
+          "observer_cpu_s": 10.715,
+          "critical_coverage_fraction": 0.9669
+        },
+        {
+          "sequence": 6,
+          "ack_ms": 1930.426,
+          "audit_inclusive_e2e_ms": 1968.464,
+          "sender_sampled_system_cpu_s": 1.76,
+          "client_sampled_runnable_wait_ms": 1.329,
+          "observer_cpu_s": 9.639,
+          "critical_coverage_fraction": 0.8897
+        },
+        {
+          "sequence": 7,
+          "ack_ms": 1351.574,
+          "audit_inclusive_e2e_ms": 2108.959,
+          "sender_sampled_system_cpu_s": 1.25,
+          "client_sampled_runnable_wait_ms": 1.183,
+          "observer_cpu_s": 10.941,
+          "critical_coverage_fraction": 0.9489
+        },
+        {
+          "sequence": 8,
+          "ack_ms": 1834.742,
+          "audit_inclusive_e2e_ms": 1973.774,
+          "sender_sampled_system_cpu_s": 1.5,
+          "client_sampled_runnable_wait_ms": 2.339,
+          "observer_cpu_s": 10.843,
+          "critical_coverage_fraction": 0.8871
+        },
+        {
+          "sequence": 9,
+          "ack_ms": 2166.989,
+          "audit_inclusive_e2e_ms": 2193.922,
+          "sender_sampled_system_cpu_s": 2.0,
+          "client_sampled_runnable_wait_ms": 1.515,
+          "observer_cpu_s": 10.871,
+          "critical_coverage_fraction": 0.9121
+        },
+        {
+          "sequence": 10,
+          "ack_ms": 1757.929,
+          "audit_inclusive_e2e_ms": 2070.036,
+          "sender_sampled_system_cpu_s": 1.49,
+          "client_sampled_runnable_wait_ms": 1.108,
+          "observer_cpu_s": 10.938,
+          "critical_coverage_fraction": 0.9667
+        }
+      ]
+    },
+    "client_network_profile": {
+      "campaign_status": "passed",
+      "trials_passed": 10,
+      "source_index_sha256": "c49c0ac4c28c99745d7434057d72946fcc355f7d77240bc034b6919ffa2d4303",
+      "rows": [
+        {
+          "sequence": 3,
+          "ack_ms": 2165.022,
+          "audit_inclusive_e2e_ms": 2174.89,
+          "combined_send_syscall_ms": 2162.54,
+          "combined_send_calls": 1041,
+          "combined_send_bytes": 2181171328,
+          "eagain": 0,
+          "writable_wait_calls": 0,
+          "writable_wait_ms": 0.0,
+          "publisher_pool_wait_ms": 1297.26,
+          "whole_client_system_cpu_s": 3.366735
+        },
+        {
+          "sequence": 4,
+          "ack_ms": 1361.421,
+          "audit_inclusive_e2e_ms": 1551.559,
+          "combined_send_syscall_ms": 1358.59,
+          "combined_send_calls": 1041,
+          "combined_send_bytes": 2181171328,
+          "eagain": 0,
+          "writable_wait_calls": 0,
+          "writable_wait_ms": 0.0,
+          "publisher_pool_wait_ms": 711.756,
+          "whole_client_system_cpu_s": 2.083861
+        },
+        {
+          "sequence": 5,
+          "ack_ms": 1528.402,
+          "audit_inclusive_e2e_ms": 1705.229,
+          "combined_send_syscall_ms": 1525.9,
+          "combined_send_calls": 1041,
+          "combined_send_bytes": 2181171328,
+          "eagain": 0,
+          "writable_wait_calls": 0,
+          "writable_wait_ms": 0.0,
+          "publisher_pool_wait_ms": 743.261,
+          "whole_client_system_cpu_s": 2.74436
+        },
+        {
+          "sequence": 6,
+          "ack_ms": 1346.324,
+          "audit_inclusive_e2e_ms": 1696.905,
+          "combined_send_syscall_ms": 1343.31,
+          "combined_send_calls": 1041,
+          "combined_send_bytes": 2181171328,
+          "eagain": 0,
+          "writable_wait_calls": 0,
+          "writable_wait_ms": 0.0,
+          "publisher_pool_wait_ms": 730.992,
+          "whole_client_system_cpu_s": 2.212712
+        },
+        {
+          "sequence": 7,
+          "ack_ms": 2195.051,
+          "audit_inclusive_e2e_ms": 2196.767,
+          "combined_send_syscall_ms": 2192.43,
+          "combined_send_calls": 1041,
+          "combined_send_bytes": 2181171328,
+          "eagain": 0,
+          "writable_wait_calls": 0,
+          "writable_wait_ms": 0.0,
+          "publisher_pool_wait_ms": 1339.62,
+          "whole_client_system_cpu_s": 3.398667
+        },
+        {
+          "sequence": 8,
+          "ack_ms": 1409.914,
+          "audit_inclusive_e2e_ms": 2091.448,
+          "combined_send_syscall_ms": 1406.56,
+          "combined_send_calls": 1041,
+          "combined_send_bytes": 2181171328,
+          "eagain": 0,
+          "writable_wait_calls": 0,
+          "writable_wait_ms": 0.0,
+          "publisher_pool_wait_ms": 777.337,
+          "whole_client_system_cpu_s": 2.573298
+        },
+        {
+          "sequence": 9,
+          "ack_ms": 1314.929,
+          "audit_inclusive_e2e_ms": 1630.619,
+          "combined_send_syscall_ms": 1312.31,
+          "combined_send_calls": 1041,
+          "combined_send_bytes": 2181171328,
+          "eagain": 0,
+          "writable_wait_calls": 0,
+          "writable_wait_ms": 0.0,
+          "publisher_pool_wait_ms": 716.541,
+          "whole_client_system_cpu_s": 2.154648
+        },
+        {
+          "sequence": 10,
+          "ack_ms": 2210.074,
+          "audit_inclusive_e2e_ms": 2218.868,
+          "combined_send_syscall_ms": 2207.13,
+          "combined_send_calls": 1041,
+          "combined_send_bytes": 2181171328,
+          "eagain": 0,
+          "writable_wait_calls": 0,
+          "writable_wait_ms": 0.0,
+          "publisher_pool_wait_ms": 1341.41,
+          "whole_client_system_cpu_s": 3.426076
+        }
+      ]
+    }
+  },
+  "limitations": [
+    "Thread-observer CPU samples cover only an interior portion of E2E and have nonzero overhead.",
+    "Client network counters add per-call timing overhead and do not isolate kernel functions.",
+    "Raw logs and complete manifests are retained in ignored local results/refactor-next/2026-09-23, not bundled in this compact public review.",
+    "The two controls are not comparable treatments."
+  ]
+}
