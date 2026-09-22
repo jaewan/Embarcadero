@@ -16,6 +16,15 @@ import perf_compare as perf
 
 
 class PerfTests(unittest.TestCase):
+    def test_broker_protocol_preserves_serial_audit_despite_streaming_default(self):
+        with mock.patch.dict(os.environ, {"EMBARCADERO_E2E_AUDIT_MODE": "stream",
+                                         "EMBARCADERO_SUBSCRIBER_RETAINED_BYTES": "1"}):
+            env, selected, removed = perf.environment("/owned-perf-test", 1)
+        self.assertEqual(env["EMBARCADERO_E2E_AUDIT_MODE"], "serial")
+        self.assertEqual(selected["EMBARCADERO_SUBSCRIBER_RETAINED_BYTES"], str(3 * perf.dev.GIB))
+        self.assertEqual(selected["EMBARCADERO_SUBSCRIBER_MAX_MESSAGES"], "1048576")
+        self.assertIn("EMBARCADERO_E2E_AUDIT_MODE", removed)
+
     def test_archived_source_binds_inventory_archive_and_actual_build_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -243,7 +252,7 @@ while True: time.sleep(0.1)
             self.assertTrue(result["shared_memory_removed"])
             self.assertTrue(all(code == 0 for code in result["exit_codes"].values()))
             self.assertEqual(result["mapping_bases"]["broker-0"]["observed"], "0x400000000000")
-            self.assertEqual(result["protocol_revision"], "paired-dram-v3-fixed-mapping-base")
+            self.assertEqual(result["protocol_revision"], "paired-dram-v4-explicit-serial-audit")
             self.assertIn("client_rusage", result)
             self.assertGreater(result["ended_monotonic"], result["started_monotonic"])
             for pid in result["pids"].values():

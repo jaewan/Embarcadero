@@ -450,6 +450,7 @@ process_client_fd:;
 								       std::memory_order_acq_rel,
 								       std::memory_order_acquire)) {}
 							new_acked_msgs = session_global_acked > global_prev ? session_global_acked - global_prev : 0;
+                            if (new_acked_msgs > 0) ack_progress_event_.Notify();
 						} else if (prev_acked == (size_t)-1) {
 							// First ACK from this broker - use value directly (no previous to subtract)
 							new_acked_msgs = acked_msg;
@@ -475,6 +476,7 @@ process_client_fd:;
 								prev_ack_per_sock[client_sock] = session_global_acked; // Update last value for this socket
 								CompleteUnackedThrough(broker_id, session_global_acked);
 								ack_received_.fetch_add(new_acked_msgs, std::memory_order_release);
+                                if (!IsOrder5SessionMode()) ack_progress_event_.Notify();
 #if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
                                 if (IsOrder5SessionMode()) {
                                     size_t bytes, batches;

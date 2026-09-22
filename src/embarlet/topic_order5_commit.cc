@@ -548,11 +548,14 @@ void Topic::CommitEpoch(
 		const uint64_t batch_seq = p.from_hold ? p.hold_meta.batch_seq : p.batch_seq;
         const uint64_t session_key = MakeSessionKey(client_id, session_epoch);
         SessionEntry* entry = FindSessionEntry(session_key);
-        if (!entry) entry = FindOrCreateSessionEntry(session_key);
-        if (!entry) { admission_failed = true; return false; }
-
-		CXL::invalidate_cacheline_for_read(entry);
-		CXL::load_fence();
+        if (!entry) {
+            entry = FindOrCreateSessionEntry(session_key);
+            if (!entry) { admission_failed = true; return false; }
+            CXL::invalidate_cacheline_for_read(entry);
+            CXL::load_fence();
+        }
+        // A matching FindSessionEntry already refreshed this never-reused key.
+        // Keep every authoritative guard load under the publication gate.
 		const uint64_t state_word = entry->state_word.load(std::memory_order_acquire);
 		const uint64_t flags = state_word & 0xFFFFFFFFULL;
 		if ((flags & kSessionEntryFlagActive) == 0) return false;

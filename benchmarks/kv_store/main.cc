@@ -401,7 +401,7 @@ plt.show()
 		}
 };
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[]) try {
 	// Initialize logging
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
@@ -493,4 +493,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	return 0;
+} catch (const std::exception& error) {
+    LOG(ERROR) << "KV benchmark failed: " << error.what();
+    return 1;
 }

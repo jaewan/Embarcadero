@@ -24,12 +24,14 @@ SessionEntry* Topic::FindSessionEntry(uint64_t session_key) {
 }
 
 SessionEntry* Topic::FindOrCreateSessionEntry(uint64_t session_key) {
+  bool claimed = false;
   SessionEntry* entry = FindOrClaimSession(session_table_, kMaxSessions, session_key,
       static_cast<size_t>(Mix64(session_key) % kMaxSessions), [](SessionEntry* candidate) {
         CXL::invalidate_cacheline_for_read(candidate);
         CXL::load_fence();
-      });
-  if (entry) {
+      }, &claimed);
+  if (entry && SessionClaimNeedsFlush(claimed,
+          entry->state_word.load(std::memory_order_acquire))) {
     CXL::flush_cacheline(entry);
     CXL::store_fence();
   }
@@ -70,10 +72,9 @@ bool Topic::PublishSessionEntry(uint64_t session_key, const SessionPublishSnapsh
 	CXL::flush_cacheline(entry);
 	CXL::store_fence();
 
-    auto state_word = entry->state_word.load(std::memory_order_acquire);
-    while (!entry->state_word.compare_exchange_weak(state_word,
-        MergeSessionStateWord(state_word, snapshot.session_epoch, snapshot.fenced),
-        std::memory_order_release, std::memory_order_acquire)) {}
+    // Skip an unchanged locked RMW, but retain both visibility sequences:
+    // the completed prefix flush above must precede ACTIVE/fence publication.
+    MergeSessionState(entry->state_word, snapshot.session_epoch, snapshot.fenced);
 	CXL::store_fence();
 	CXL::flush_cacheline(&entry->state_word);
 	CXL::store_fence();

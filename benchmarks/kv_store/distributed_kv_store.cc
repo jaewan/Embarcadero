@@ -644,6 +644,16 @@ void DistributedKVStore::completePendingLocalOp(OPID op) {
 
 // ORDER>=2: Subscriber::Consume() dispatches to ConsumeOrdered (private); do not
 // bypass it unless a public ordered API is added.
+bool DistributedKVStore::StopForTerminalDelivery() {
+    const auto status = subscriber_->GetOrderedDeliveryStatus();
+    if (!delivery_failure_.Observe(status)) return false;
+    LOG(ERROR) << "[KV_DELIVERY_FAILED] retention_exhausted=" << status.retention_exhausted
+               << " stopped=" << status.stopped << " parsed=" << status.parsed_messages
+               << " delivered=" << status.delivered_messages;
+    running_.store(false, std::memory_order_release);
+    return true;
+}
+
 void DistributedKVStore::logConsumer() {
 	// [[APPLY_BATCH]] Throughput path (latency instrumentation off): pull a batch of
 	// ordered messages and amortize the per-op cross-thread bookkeeping over the
@@ -660,25 +670,19 @@ void DistributedKVStore::logConsumer() {
 			batch.clear();
 			const size_t n = subscriber_->ConsumeOrderedBatch(&batch, kApplyBatchMax, 100);
 			if (n == 0) {
-				if (!running_) break;
+				if (!running_ || StopForTerminalDelivery()) break;
 				continue;
 			}
 			acc.reset();
 			for (const auto& view : batch) {
 				if (view.data == nullptr) continue;
-				if (view.wire_header_version == Embarcadero::wire::HEADER_VERSION_V2) {
-					auto* h = reinterpret_cast<Embarcadero::BlogMessageHeader*>(view.data);
-					void* payload = reinterpret_cast<uint8_t*>(h) + sizeof(Embarcadero::BlogMessageHeader);
-					processLogEntryFromRawBuffer(payload, h->size,
-						static_cast<uint32_t>(h->client_id), h->batch_seq, h->total_order,
-						/*use_apply_ordinal_for_pending_completion=*/true, &acc);
-				} else {
-					auto* h = reinterpret_cast<Embarcadero::MessageHeader*>(view.data);
-					void* payload = reinterpret_cast<uint8_t*>(h) + sizeof(Embarcadero::MessageHeader);
-					processLogEntryFromRawBuffer(payload, h->size,
-						h->client_id, h->client_order, h->total_order,
-						/*use_apply_ordinal_for_pending_completion=*/false, &acc);
-				}
+                // Subscriber views borrow wire bytes at arbitrary alignment.
+                // Accessors decode scalar fields without copying the payload.
+                processLogEntryFromRawBuffer(
+                    view.Payload(), view.PayloadSize(),
+                    static_cast<uint32_t>(view.ClientId()), view.ClientOrder(), view.TotalOrder(),
+                    /*use_apply_ordinal_for_pending_completion=*/
+                    view.wire_header_version == Embarcadero::wire::HEADER_VERSION_V2, &acc);
 			}
 			flushApplyBatch(acc);
 		}
@@ -687,7 +691,7 @@ void DistributedKVStore::logConsumer() {
 	while (running_) {
 		void* raw = subscriber_->Consume();
 		if (raw == nullptr) {
-			if (!running_) break;
+			if (!running_ || StopForTerminalDelivery()) break;
 			std::this_thread::yield();
 			continue;
 		}
@@ -695,31 +699,12 @@ void DistributedKVStore::logConsumer() {
 		// Decode using the format the subscriber parsed (from BatchMetadata.header_version on
 		// the wire), not ShouldUseBlogHeader() here: broker vs client env mismatch would
 		// mis-read client_id/size and stall applied_local_ops_.
-		const uint16_t wire_ver = subscriber_->LastConsumedWireHeaderVersion();
-		const bool is_blog_wire =
-			(wire_ver == Embarcadero::wire::HEADER_VERSION_V2);
-		if (is_blog_wire) {
-			auto* header = reinterpret_cast<Embarcadero::BlogMessageHeader*>(raw);
-			void* payload = reinterpret_cast<uint8_t*>(header) + sizeof(Embarcadero::BlogMessageHeader);
-			processLogEntryFromRawBuffer(
-				payload,
-				header->size,
-				static_cast<uint32_t>(header->client_id),
-				header->batch_seq,
-				header->total_order,
-				/*use_apply_ordinal_for_pending_completion=*/true);
-			continue;
-		}
-
-		auto* header = reinterpret_cast<Embarcadero::MessageHeader*>(raw);
-		void* payload = reinterpret_cast<uint8_t*>(header) + sizeof(Embarcadero::MessageHeader);
-		processLogEntryFromRawBuffer(
-			payload,
-			header->size,
-			header->client_id,
-			header->client_order,
-			header->total_order,
-			/*use_apply_ordinal_for_pending_completion=*/false);
+        const Subscriber::OrderedMessageView view{raw, subscriber_->LastConsumedWireHeaderVersion()};
+        processLogEntryFromRawBuffer(
+            view.Payload(), view.PayloadSize(),
+            static_cast<uint32_t>(view.ClientId()), view.ClientOrder(), view.TotalOrder(),
+            /*use_apply_ordinal_for_pending_completion=*/
+            view.wire_header_version == Embarcadero::wire::HEADER_VERSION_V2);
 		/*
 		// Deserialize the message into a LogEntry
 		LogEntry entry = LogEntry::deserialize(payload, header->client_id, header->client_order);
@@ -792,6 +777,7 @@ size_t DistributedKVStore::multiPut(const std::vector<KeyValue>& kvPairs) {
 static constexpr int kSyncTimeoutSec = 30;
 
 void DistributedKVStore::waitForSyncWithLog(){
+    ThrowIfDeliveryFailed();
 	if (publisher_) {
 		publisher_->WriteFinishedOrPaused();
 	}
@@ -801,6 +787,7 @@ void DistributedKVStore::waitForSyncWithLog(){
 	auto last_log_time = std::chrono::steady_clock::now();
 
 	while (applied_local_ops_.load(std::memory_order_acquire) < target) {
+        delivery_failure_.ThrowIfFailed();
 		std::this_thread::yield();
 		auto now = std::chrono::steady_clock::now();
 		if (now - last_log_time >= std::chrono::seconds(5)) {
@@ -823,9 +810,11 @@ void DistributedKVStore::waitForSyncWithLog(){
 			break;
 		}
 	}
+    ThrowIfDeliveryFailed();
 }
 
 void DistributedKVStore::waitForSyncWithLog(OPID min_client_opid){
+    ThrowIfDeliveryFailed();
 	if (publisher_) {
 		publisher_->WriteFinishedOrPaused();
 	}
@@ -834,6 +823,7 @@ void DistributedKVStore::waitForSyncWithLog(OPID min_client_opid){
 	auto last_log_time = std::chrono::steady_clock::now();
 
 	while (applied_local_ops_.load(std::memory_order_acquire) <= min_client_opid) {
+        delivery_failure_.ThrowIfFailed();
 		std::this_thread::yield();
 		auto now = std::chrono::steady_clock::now();
 		if (now - last_log_time >= std::chrono::seconds(5)) {
@@ -856,30 +846,40 @@ void DistributedKVStore::waitForSyncWithLog(OPID min_client_opid){
 			break;
 		}
 	}
+    ThrowIfDeliveryFailed();
 }
 
 bool DistributedKVStore::waitForAckedWrites() {
+    ThrowIfDeliveryFailed();
 	if (!publisher_) {
 		return true;
 	}
 	publisher_->WriteFinishedOrPaused();
 	const uint64_t target = publisher_->GetNextPublishOrder();
-	return publisher_->WaitUntilAcked(target);
+	const bool acked = publisher_->WaitUntilAcked(target);
+    ThrowIfDeliveryFailed();
+    return acked;
 }
 
 bool DistributedKVStore::waitForAckedWrites(OPID min_client_opid) {
+    ThrowIfDeliveryFailed();
 	if (!publisher_) {
 		return true;
 	}
 	publisher_->WriteFinishedOrPaused();
-	return publisher_->WaitUntilAcked(static_cast<size_t>(min_client_opid) + 1);
+	const bool acked = publisher_->WaitUntilAcked(static_cast<size_t>(min_client_opid) + 1);
+    ThrowIfDeliveryFailed();
+    return acked;
 }
 
 void DistributedKVStore::waitUntilApplied(size_t total_order){
+    ThrowIfDeliveryFailed();
 	// Wait until the local KV store has applied up to at least total_order
 	while (getLastAppliedIndex() < total_order) {
+        delivery_failure_.ThrowIfFailed();
 		std::this_thread::yield();
 	}
+    ThrowIfDeliveryFailed();
 }
 
 std::string DistributedKVStore::get(const std::string& key) {

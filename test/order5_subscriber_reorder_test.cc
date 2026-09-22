@@ -23,11 +23,18 @@
 
 #include <algorithm>
 #include <cstring>
+#include <future>
 #include <numeric>
 #include <random>
 #include <vector>
 
 #include "../src/client/subscriber.h"
+#include "../src/client/delivery_completion.h"
+#include "../benchmarks/kv_store/distributed_kv_store.h"
+
+struct DistributedKVStoreTestPeer {
+    using DeliveryFailure = DistributedKVStore::DeliveryFailure;
+};
 #include "../src/cxl_manager/cxl_datastructure.h"
 #include "../src/common/order_level.h"
 #include "../src/common/wire_formats.h"
@@ -128,10 +135,17 @@ struct SubscriberTestPeer {
 		sub.next_expected_order_ = 0;
 		sub.pending_messages_base_order_ = 0;
 		sub.pending_messages_.clear();
+		sub.last_returned_.reset();
+		sub.last_returned_batch_.clear();
         sub.ordered_received_messages_ = 0;
         sub.ordered_duplicate_messages_ = 0;
         sub.ordered_parse_errors_.store(0);
         sub.ordered_export_gaps_reported_.store(0);
+		sub.retention_exhausted_.store(false);
+	}
+	static size_t AllocatedMessages(Subscriber& sub) {
+		absl::MutexLock lock(&sub.owned_message_pool_mutex_);
+		return sub.allocated_owned_messages_;
 	}
 };
 
@@ -492,5 +506,324 @@ TEST(Order5DeliveryAudit, IndexedPayloadDetectsReorderedIdenticalMessageBodies) 
         }
         SubscriberTestPeer::ParseChunk(sub, state, bytes.data(), bytes.size());
         EXPECT_EQ(sub.AuditOrderedDelivery(2, payload.data(), payload.size(), 100, true), variant == 0);
+    }
+}
+
+namespace {
+std::unique_ptr<Subscriber> BoundedSubscriber(OrderedRetentionLimits limits) {
+    char topic[TOPIC_NAME_SIZE] = "BoundedAudit";
+    return std::make_unique<Subscriber>("127.0.0.1", "1", topic, false,
+                                       Embarcadero::kOrderStrong, limits);
+}
+
+std::vector<uint8_t> IndexedAuditFrames(size_t start, uint32_t count) {
+    auto bytes = AuditFrames(count);
+    Embarcadero::wire::BatchMetadata meta{};
+    std::memcpy(&meta, bytes.data(), sizeof(meta));
+    meta.batch_total_order = start;
+    std::memcpy(bytes.data(), &meta, sizeof(meta));
+    const size_t stride = Embarcadero::wire::ComputeStrideV2(32);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t sequence = start + i;
+        std::memcpy(bytes.data() + sizeof(meta) + i * stride + kHeaderSize,
+                    &sequence, sizeof(sequence));
+    }
+    return bytes;
+}
+}
+
+TEST(Order5Retention, MissingEarlierOrderFailsClosedAtByteBudgetWithoutWaiting) {
+    const auto later = IndexedAuditFrames(1, 1);
+    auto sub = BoundedSubscriber({later.size() * 2 - 1, 64});
+    SubscriberTestPeer::StreamParseState first, second;
+    SubscriberTestPeer::ParseChunk(*sub, first, later.data(), later.size());
+    EXPECT_FALSE(sub->GetOrderedDeliveryStatus().retention_exhausted);
+    const auto next = IndexedAuditFrames(2, 1);
+    SubscriberTestPeer::ParseChunk(*sub, second, next.data(), next.size());
+    auto status = sub->GetOrderedDeliveryStatus();
+    EXPECT_TRUE(status.retention_exhausted);
+    EXPECT_EQ(status.retained_bytes, later.size());
+    EXPECT_LE(status.peak_retained_bytes, later.size() * 2 - 1);
+    const std::string payload(32, 'a');
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(sub->AuditOrderedDelivery(3, payload.data(), payload.size(), 10000, true));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(200));
+    // A subsequent earlier frame cannot resume a terminally failed stream.
+    const auto missing = IndexedAuditFrames(0, 1);
+    SubscriberTestPeer::ParseChunk(*sub, first, missing.data(), missing.size());
+    EXPECT_EQ(sub->GetOrderedDeliveryStatus().parsed_messages, 1u);
+}
+
+TEST(Order5Retention, DescriptorPoolAndSparseReorderDistanceAreBoundedSeparately) {
+    {
+        auto sub = BoundedSubscriber({1 << 20, 1});
+        SubscriberTestPeer::StreamParseState state;
+        const auto bytes = IndexedAuditFrames(0, 2);
+        SubscriberTestPeer::ParseChunk(*sub, state, bytes.data(), bytes.size());
+        EXPECT_TRUE(sub->GetOrderedDeliveryStatus().retention_exhausted);
+        EXPECT_LE(SubscriberTestPeer::AllocatedMessages(*sub), 1u);
+        EXPECT_EQ(sub->GetOrderedDeliveryStatus().retained_bytes, 0u);
+    }
+    {
+        auto sub = BoundedSubscriber({1 << 20, 8});
+        SubscriberTestPeer::StreamParseState state;
+        const auto distant = IndexedAuditFrames(1000000, 1);
+        SubscriberTestPeer::ParseChunk(*sub, state, distant.data(), distant.size());
+        EXPECT_TRUE(sub->GetOrderedDeliveryStatus().retention_exhausted);
+        EXPECT_EQ(SubscriberTestPeer::PendingBufferedSlots(*sub), 0u);
+        EXPECT_EQ(sub->GetOrderedDeliveryStatus().retained_bytes, 0u);
+    }
+}
+
+TEST(Order5Retention, CarryGrowthChargesBothAllocationsAndOwnerOutlivesSubscriber) {
+    SubscriberTestPeer::StreamParseState state;
+    auto sub = BoundedSubscriber({9000, 64});
+    std::mt19937_64 rng(17);
+    const auto bytes = BuildStream(0, 1, 1, 6000, rng);
+    // Single-byte input keeps the input chunk tiny. Growth from4096 to8192
+    // must fail with the old4096 allocation still charged against9000.
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        SubscriberTestPeer::ParseChunk(*sub, state, bytes.data() + i, 1);
+        if (sub->GetOrderedDeliveryStatus().retention_exhausted) break;
+    }
+    const auto status = sub->GetOrderedDeliveryStatus();
+    EXPECT_TRUE(status.retention_exhausted);
+    EXPECT_EQ(status.retained_bytes, 4096u);
+    EXPECT_LE(status.peak_retained_bytes, 9000u);
+    // StreamParseState can retain its budget owner beyond Subscriber lifetime.
+    sub.reset();
+    state = {};
+}
+
+TEST(Order5Retention, ConsumerViewsKeepChunkChargedUntilNextConsume) {
+    auto sub = BoundedSubscriber({1 << 20, 64});
+    SubscriberTestPeer::StreamParseState state;
+    const auto bytes = IndexedAuditFrames(0, 4);
+    SubscriberTestPeer::ParseChunk(*sub, state, bytes.data(), bytes.size());
+    std::vector<Subscriber::OrderedMessageView> views;
+    ASSERT_EQ(sub->ConsumeOrderedBatch(&views, 4, 100), 4u);
+    EXPECT_EQ(sub->GetOrderedDeliveryStatus().retained_bytes, bytes.size());
+    uint64_t index = UINT64_MAX;
+    std::memcpy(&index, static_cast<uint8_t*>(views.back().data) + kHeaderSize, sizeof(index));
+    EXPECT_EQ(index, 3u);
+    EXPECT_EQ(sub->ConsumeOrderedBatch(&views, 1, 0), 0u);
+    EXPECT_EQ(sub->GetOrderedDeliveryStatus().retained_bytes, 0u);
+    EXPECT_LE(SubscriberTestPeer::AllocatedMessages(*sub), 64u);
+}
+
+TEST(Order5DeliveryAudit, ConcurrentIndexedConsumptionReusesBoundedRetainedStorage) {
+    using namespace std::chrono_literals;
+    constexpr size_t count = 2048;
+    constexpr size_t budget = 16 << 10;
+    auto sub = BoundedSubscriber({budget, 256});
+    SubscriberTestPeer::StreamParseState earlier, later;
+    const std::string seed(32, 'a');
+    std::atomic<bool> cancelled{false};
+    auto audit = std::async(std::launch::async, [&] {
+        return sub->AuditOrderedDelivery(count, seed.data(), seed.size(), 5000, true, &cancelled);
+    });
+    bool progress = true;
+    for (size_t start = 0; start < count && progress; start += 32) {
+        // Two simulated broker connections overtake one another every pair.
+        const auto second = IndexedAuditFrames(start + 16, 16);
+        const auto first = IndexedAuditFrames(start, 16);
+        SubscriberTestPeer::ParseChunk(*sub, later, second.data(), second.size());
+        SubscriberTestPeer::ParseChunk(*sub, earlier, first.data(), first.size());
+        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (sub->GetOrderedDeliveryStatus().delivered_messages < start + 32 &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(1ms);
+        progress = sub->GetOrderedDeliveryStatus().delivered_messages >= start + 32;
+    }
+    if (!progress) cancelled.store(true);
+    EXPECT_TRUE(progress);
+    EXPECT_TRUE(audit.get());
+    EXPECT_TRUE(sub->ValidateOrderedDeliveryCompletion(count));
+    EXPECT_LE(sub->GetOrderedDeliveryStatus().peak_retained_bytes, budget);
+    EXPECT_LE(SubscriberTestPeer::AllocatedMessages(*sub), 256u);
+    // Total received framed data exceeds the budget by >8x; it cannot all remain retained.
+    EXPECT_GT(count * Embarcadero::wire::ComputeStrideV2(seed.size()), budget * 4);
+}
+
+TEST(Order5DeliveryAudit, FinalCounterCheckRejectsErrorsAfterEarlyAuditCompletion) {
+    const std::string payload(32, 'a');
+    for (bool duplicate : {false, true}) {
+        auto sub = BoundedSubscriber({1 << 20, 64});
+        SubscriberTestPeer::StreamParseState state;
+        const auto bytes = AuditFrames(1);
+        SubscriberTestPeer::ParseChunk(*sub, state, bytes.data(), bytes.size());
+        ASSERT_TRUE(sub->AuditOrderedDelivery(1, payload.data(), payload.size(), 100));
+        ASSERT_TRUE(sub->ValidateOrderedDeliveryCompletion(1));
+        if (duplicate) {
+            SubscriberTestPeer::ParseChunk(*sub, state, bytes.data(), bytes.size());
+        } else {
+            const std::vector<uint8_t> invalid(sizeof(Embarcadero::wire::BatchMetadata), 0xff);
+            SubscriberTestPeer::ParseChunk(*sub, state, invalid.data(), invalid.size());
+        }
+        EXPECT_FALSE(sub->ValidateOrderedDeliveryCompletion(1));
+    }
+}
+
+TEST(Order5DeliveryAudit, CancellationAndShutdownInterruptLongAuditDeadline) {
+    using namespace std::chrono_literals;
+    const char* previous = std::getenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US");
+    const std::string saved = previous ? previous : "";
+    const bool had_previous = previous != nullptr;
+    setenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US", "1000000", 1);
+    for (bool stop_subscriber : {false, true}) {
+        auto sub = BoundedSubscriber({1 << 20, 64});
+        const std::string seed(32, 'a');
+        std::atomic<bool> cancelled{false};
+        std::promise<void> started;
+        auto ready = started.get_future();
+        auto audit = std::async(std::launch::async, [&] {
+            started.set_value();
+            return sub->AuditOrderedDelivery(1, seed.data(), seed.size(), 10000, true, &cancelled);
+        });
+        ready.wait();
+        std::this_thread::sleep_for(10ms);
+        if (stop_subscriber) sub->Shutdown();
+        else cancelled.store(true, std::memory_order_release);
+        EXPECT_EQ(audit.wait_for(200ms), std::future_status::ready);
+        EXPECT_FALSE(audit.get());
+    }
+    if (had_previous) setenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US", saved.c_str(), 1);
+    else unsetenv("EMBARCADERO_CONSUME_ORDERED_WAIT_US");
+}
+
+TEST(Order5DeliveryAudit, TerminalParseErrorDoesNotWaitForMissingPopulation) {
+    using namespace std::chrono_literals;
+    auto sub = BoundedSubscriber({1 << 20, 64});
+    SubscriberTestPeer::StreamParseState state;
+    const std::vector<uint8_t> invalid(sizeof(Embarcadero::wire::BatchMetadata), 0xff);
+    SubscriberTestPeer::ParseChunk(*sub, state, invalid.data(), invalid.size());
+    const std::string seed(32, 'a');
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(sub->AuditOrderedDelivery(100, seed.data(), seed.size(), 10000, true));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 200ms);
+}
+
+TEST(LatencyDeliveryCompletion, ActualRetentionFailureCannotBecomeAckPrimarySuccess) {
+    using namespace std::chrono_literals;
+    auto sub = BoundedSubscriber({1 << 20, 1});
+    DistributedKVStoreTestPeer::DeliveryFailure kv_failure;
+    EXPECT_FALSE(kv_failure.Observe(sub->GetOrderedDeliveryStatus()));
+    EXPECT_NO_THROW(kv_failure.ThrowIfFailed());
+    SubscriberTestPeer::StreamParseState state;
+    const auto bytes = IndexedAuditFrames(0, 2);
+    SubscriberTestPeer::ParseChunk(*sub, state, bytes.data(), bytes.size());
+    ASSERT_TRUE(sub->GetOrderedDeliveryStatus().retention_exhausted);
+    std::vector<Subscriber::OrderedMessageView> batch;
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(sub->ConsumeOrderedBatch(&batch, 2, 10000), 0u);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 200ms);
+
+    auto consumer = std::async(std::launch::async, [&] {
+        return kv_failure.Observe(sub->GetOrderedDeliveryStatus());
+    });
+    ASSERT_TRUE(consumer.get());
+    EXPECT_THROW(kv_failure.ThrowIfFailed(), std::runtime_error);
+    EXPECT_TRUE(kv_failure.Observe({})); // A later benign snapshot cannot revive the stream.
+    EXPECT_THROW(kv_failure.ThrowIfFailed(), std::runtime_error);
+
+    Embarcadero::client::DeliveryCompletion completion;
+    EXPECT_TRUE(completion.ObserveOrderedStatus(sub->GetOrderedDeliveryStatus()));
+    EXPECT_FALSE(completion.timed_out);  // Terminal failure happened before any deadline.
+    EXPECT_FALSE(completion.MayUseAckPrimary(true, false, false));
+    completion.timed_out = true;
+    EXPECT_FALSE(completion.MayUseAckPrimary(true, false, true));
+    EXPECT_TRUE(completion.ObserveOrderedStatus({}));  // Failure cannot be reset by a later snapshot.
+}
+
+TEST(LatencyDeliveryCompletion, OrdinaryMissingPopulationRetainsTimeoutPolicy) {
+    auto sub = BoundedSubscriber({1 << 20, 64});
+    std::vector<Subscriber::OrderedMessageView> batch;
+    EXPECT_EQ(sub->ConsumeOrderedBatch(&batch, 1, 1), 0u);
+    Embarcadero::client::DeliveryCompletion completion;
+    EXPECT_FALSE(completion.ObserveOrderedStatus(sub->GetOrderedDeliveryStatus()));
+    EXPECT_FALSE(completion.MayUseAckPrimary(true, false, false));
+    completion.timed_out = true;
+    EXPECT_TRUE(completion.MayUseAckPrimary(true, false, false));
+    EXPECT_FALSE(completion.MayUseAckPrimary(false, false, false));
+    EXPECT_FALSE(completion.MayUseAckPrimary(true, true, false));
+    sub->Shutdown();
+    EXPECT_TRUE(completion.ObserveOrderedStatus(sub->GetOrderedDeliveryStatus()));
+    EXPECT_FALSE(completion.MayUseAckPrimary(true, false, false));
+}
+
+TEST(LatencyDeliveryCompletion, FinalSnapshotRejectsErrorsAfterPopulationWasDrained) {
+    for (bool duplicate : {false, true}) {
+        auto sub = BoundedSubscriber({1 << 20, 64});
+        SubscriberTestPeer::StreamParseState state;
+        const auto bytes = IndexedAuditFrames(0, 1);
+        SubscriberTestPeer::ParseChunk(*sub, state, bytes.data(), bytes.size());
+        std::vector<Subscriber::OrderedMessageView> batch;
+        ASSERT_EQ(sub->ConsumeOrderedBatch(&batch, 1, 100), 1u);
+        Embarcadero::client::DeliveryCompletion completion;
+        ASSERT_FALSE(completion.ObserveOrderedStatus(sub->GetOrderedDeliveryStatus()));
+        if (duplicate) {
+            SubscriberTestPeer::ParseChunk(*sub, state, bytes.data(), bytes.size());
+        } else {
+            const std::vector<uint8_t> invalid(sizeof(Embarcadero::wire::BatchMetadata), 0xff);
+            SubscriberTestPeer::ParseChunk(*sub, state, invalid.data(), invalid.size());
+        }
+        EXPECT_TRUE(completion.ObserveOrderedStatus(sub->GetOrderedDeliveryStatus()));
+        EXPECT_FALSE(completion.MayUseAckPrimary(true, false, true));
+    }
+}
+
+TEST(Order5WireAlignment, PublicViewReadsBothFormatsAtEveryByteAlignment) {
+    for (uint16_t version : {Embarcadero::wire::HEADER_VERSION_V1, Embarcadero::wire::HEADER_VERSION_V2}) {
+        for (size_t offset = 0; offset < 64; ++offset) {
+            std::vector<uint8_t> storage(offset + 128, 0);
+            auto* raw = storage.data() + offset;
+            if (version == Embarcadero::wire::HEADER_VERSION_V2) {
+                Embarcadero::BlogMessageHeader header{};
+                header.size = 32; header.total_order = 47; header.client_id = 17; header.batch_seq = 9;
+                std::memcpy(raw, &header, sizeof(header));
+            } else {
+                Embarcadero::MessageHeader header{};
+                header.size = 32; header.paddedSize = 128; header.total_order = 47;
+                header.client_id = 17; header.client_order = 9;
+                std::memcpy(raw, &header, sizeof(header));
+            }
+            Subscriber::OrderedMessageView view{raw, version};
+            EXPECT_EQ(view.PayloadSize(), 32u);
+            EXPECT_EQ(view.PaddedSize(), 128u);
+            EXPECT_EQ(view.HeaderSize(), 64u);
+            EXPECT_EQ(view.TotalOrder(), 47u);
+            EXPECT_EQ(view.ClientId(), 17u);
+            EXPECT_EQ(view.ClientOrder(), 9u);
+            EXPECT_EQ(view.Payload(), raw + 64);
+        }
+    }
+}
+
+TEST(Order5WireAlignment, V1FragmentationAndIndexedAuditUseSerializedHeaderFields) {
+    auto& sub = SharedSubscriber();
+    constexpr size_t payload_size = 32;
+    constexpr size_t stride = 128;
+    Embarcadero::wire::BatchMetadata metadata{};
+    metadata.header_version = Embarcadero::wire::HEADER_VERSION_V1;
+    metadata.num_messages = 2;
+    std::vector<uint8_t> bytes(sizeof(metadata) + 2 * stride, 0);
+    std::memcpy(bytes.data(), &metadata, sizeof(metadata));
+    for (size_t i = 0; i < 2; ++i) {
+        Embarcadero::MessageHeader header{};
+        header.paddedSize = stride; header.size = payload_size;
+        auto* frame = bytes.data() + sizeof(metadata) + i * stride;
+        std::memcpy(frame, &header, sizeof(header));
+        std::memset(frame + sizeof(header), 'a', payload_size);
+        const uint64_t sequence = i;
+        std::memcpy(frame + sizeof(header), &sequence, sizeof(sequence));
+    }
+    const std::string seed(payload_size, 'a');
+    for (size_t split = 1; split < bytes.size(); ++split) {
+        SubscriberTestPeer::ResetOrderState(sub);
+        SubscriberTestPeer::StreamParseState state;
+        SubscriberTestPeer::ParseChunk(sub, state, bytes.data(), split);
+        SubscriberTestPeer::ParseChunk(sub, state, bytes.data() + split, bytes.size() - split);
+        ASSERT_TRUE(sub.AuditOrderedDelivery(2, seed.data(), seed.size(), 100, true));
+        ASSERT_TRUE(sub.ValidateOrderedDeliveryCompletion(2));
     }
 }

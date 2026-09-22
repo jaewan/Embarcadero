@@ -63,3 +63,13 @@ Exercise the harness using fake executables, without a real shared mapping:
 ```sh
 python3 -m unittest discover -s tools -p test_perf_compare.py
 ```
+
+The current runner uses `paired-dram-v4-explicit-serial-audit`. It explicitly
+selects `EMBARCADERO_E2E_AUDIT_MODE=serial`, a 3 GiB ordered retention budget,
+and 1048576 descriptor/reorder slots for the 2 GiB workload. This preserves
+serial audit scheduling when using newer clients whose default is streaming.
+The audit timeout is explicitly 20 seconds after ACK completion. Earlier v3
+artifacts retain their original identities and are not silently relabeled.
+A comparison that changes both broker and client versions, including audit
+scheduling, needs a separate protocol and must not use the common-client
+analyzer to claim an isolated broker improvement.

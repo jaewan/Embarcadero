@@ -131,10 +131,18 @@ def validate_result(run_dir, case):
             r"normalized_received=(\d+) raw_received=(\d+) out of (\d+) \(timeout=(\d+)s\)", text)
         if len(failures) != 1 or tuple(map(int, failures[0])) != (2, 0, 0, 2, 2):
             raise dev.RunError("withheld HWM did not produce the exact two-second ACK timeout")
-        if "[ACK_VERIFY]" in text or "[ORDERED_DELIVERY_AUDIT] status=passed" in text:
+        if "[ACK_VERIFY]" in text or "[ORDERED_DELIVERY_FINAL] status=passed" in text:
             raise dev.RunError("client falsely completed while the authoritative HWM was withheld")
+        # A concurrent delivery audit can finish before ACK publication. It is
+        # not overall transfer success: Poll must still time out and exit 1.
+        delivery_successes = text.count("[ORDERED_DELIVERY_AUDIT] status=passed")
+        delivery = re.findall(r"\[ORDERED_DELIVERY_AUDIT\] status=passed messages=(\d+) expected=(\d+) "
+                              r"payload_bytes=(\d+) duplicates=(\d+) parse_errors=(\d+) export_gaps=(\d+) indexed_payload=1\b", text)
+        if delivery_successes and (delivery_successes != 1 or delivery != [("2", "2", "8192", "0", "0", "0")]):
+            raise dev.RunError("withheld HWM delivery-only audit was not exact")
         return {"expected_exit_code": 1, "ack_timeout_seconds": 2,
-                "scope": "real publisher Poll times out with the authoritative two-message HWM withheld; no successful delivery audit"}
+                "delivery_audit_completed_before_ack": bool(delivery_successes),
+                "scope": "real publisher Poll times out with the authoritative two-message HWM withheld; delivery-only success never substitutes for ACK completion"}
     if case == "session_reopen_resubmit":
         text = (run_dir / "driver.log").read_text(errors="replace")
         audits = re.findall(r"\[ORDERED_DELIVERY_AUDIT\] status=passed messages=(\d+) expected=(\d+) "

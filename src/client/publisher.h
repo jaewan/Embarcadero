@@ -12,6 +12,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "common.h"
 #include "common/order_level.h"
+#include "common/adaptive_wait.h"
 #include "corfu_ordered_token_gate.h"
 #include "queue_buffer.h"
 #include "session.pb.h"
@@ -583,6 +584,7 @@ class Publisher {
     std::mutex publisher_threads_mutex_;
     std::condition_variable publisher_work_cv_;
     uint64_t publisher_work_generation_{0};
+    Embarcadero::AdaptiveWaitEvent ack_progress_event_;
     void NotifyPublisherWork();
     Embarcadero::BatchHeader* ReadPublishBatch(int queue_index);
 };

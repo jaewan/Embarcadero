@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <utility>
@@ -13,6 +14,14 @@
 
 class Subscriber;
 struct SubscriberTestPeer;
+
+// Payload/carry allocations and descriptor/reorder slots have separate bounds.
+// Exceeding either is a terminal delivery error, never a receiver backpressure wait.
+struct OrderedRetentionLimits {
+	size_t retained_bytes = 256UL << 20;
+	size_t max_messages = 262144;
+	static OrderedRetentionLimits FromEnvironment();
+};
 
 // State for a single buffer within the dual-buffer setup
 struct BufferState {
@@ -275,18 +284,63 @@ class Subscriber {
 			return ordered_export_gaps_reported_.load(std::memory_order_relaxed);
 		}
 		// ... Constructor, destructor, other methods ...
-		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency=false, int order_level=0);
+		Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency=false, int order_level=0,
+		           OrderedRetentionLimits retention_limits = OrderedRetentionLimits::FromEnvironment());
 		~Subscriber(); // Important to manage shutdown and cleanup
 
-		// Legacy methods (unused but kept for compatibility)
+		// Single-consumer borrowed byte views, valid until the next consume call
+		// or destruction. For header fields use OrderedMessageView with
+		// LastConsumedWireHeaderVersion(), not a typed over-aligned header cast.
 		void* Consume(int timeout_ms = 1000);
 		void* ConsumeBatchAware(int timeout_ms = 1000);
 
 		struct OrderedMessageView {
+			// Serialized bytes can start at any alignment; never cast data to
+			// alignas(64) in-memory header structs. These accessors read wire fields.
 			void* data = nullptr;
 			uint16_t wire_header_version = Embarcadero::wire::HEADER_VERSION_V1;
+			size_t HeaderSize() const {
+				return wire_header_version == Embarcadero::wire::HEADER_VERSION_V2
+					? sizeof(Embarcadero::BlogMessageHeader) : sizeof(Embarcadero::MessageHeader);
+			}
+			size_t PayloadSize() const {
+				return wire_header_version == Embarcadero::wire::HEADER_VERSION_V2
+					? Field<uint32_t>(offsetof(Embarcadero::BlogMessageHeader, size))
+					: Field<size_t>(offsetof(Embarcadero::MessageHeader, size));
+			}
+			size_t PaddedSize() const {
+				return wire_header_version == Embarcadero::wire::HEADER_VERSION_V2
+					? Embarcadero::wire::ComputeStrideV2(PayloadSize())
+					: Field<size_t>(offsetof(Embarcadero::MessageHeader, paddedSize));
+			}
+			uint64_t TotalOrder() const {
+				return wire_header_version == Embarcadero::wire::HEADER_VERSION_V2
+					? Field<uint64_t>(offsetof(Embarcadero::BlogMessageHeader, total_order))
+					: Field<size_t>(offsetof(Embarcadero::MessageHeader, total_order));
+			}
+			uint64_t ClientId() const {
+				return wire_header_version == Embarcadero::wire::HEADER_VERSION_V2
+					? Field<uint64_t>(offsetof(Embarcadero::BlogMessageHeader, client_id))
+					: Field<size_t>(offsetof(Embarcadero::MessageHeader, client_id));
+			}
+			uint64_t ClientOrder() const { // V2 batch_seq; V1 client_order.
+				return wire_header_version == Embarcadero::wire::HEADER_VERSION_V2
+					? Field<uint32_t>(offsetof(Embarcadero::BlogMessageHeader, batch_seq))
+					: Field<size_t>(offsetof(Embarcadero::MessageHeader, client_order));
+			}
+			void* Payload() const {
+				return data ? static_cast<uint8_t*>(data) + HeaderSize() : nullptr;
+			}
+		private:
+			template <typename T> T Field(size_t offset) const {
+				T value{};
+				if (data) std::memcpy(&value, static_cast<const uint8_t*>(data) + offset, sizeof(value));
+				return value;
+			}
 		};
 
+		// One consumer per Subscriber. Views borrow storage until the next
+		// Consume/ConsumeOrderedBatch call or Subscriber destruction.
 		size_t ConsumeOrderedBatch(std::vector<OrderedMessageView>* out,
 		                           size_t max_messages,
 		                           int timeout_ms = 1000);
@@ -307,7 +361,24 @@ class Subscriber {
 		bool DEBUG_check_order(int order);
         // Opt-in benchmark audit through the real ordered consumer, including payload bytes.
         bool AuditOrderedDelivery(size_t expected_messages, const void* expected_payload,
-                                  size_t payload_size, int timeout_ms = 20000, bool indexed_payload = false);
+                                  size_t payload_size, int timeout_ms = 20000, bool indexed_payload = false,
+                                  const std::atomic<bool>* cancelled = nullptr);
+		struct OrderedDeliveryStatus {
+			size_t parsed_messages = 0;
+			size_t delivered_messages = 0;
+			size_t duplicates = 0;
+			size_t parse_errors = 0;
+			uint64_t export_gaps = 0;
+			size_t retained_bytes = 0;
+			size_t peak_retained_bytes = 0;
+			bool retention_exhausted = false;
+			bool stopped = false;
+			bool Complete(size_t expected) const;
+		};
+		OrderedDeliveryStatus GetOrderedDeliveryStatus();
+		// Call after publisher completion AND the payload audit: an audit that
+		// finishes earlier cannot validate errors arriving before the final ACK.
+		bool ValidateOrderedDeliveryCompletion(size_t expected_messages);
 		/**
 		 * Debug method to wait for a certain amount of data
 		 * @param total_msg_size Total size of all messages
@@ -479,24 +550,40 @@ class Subscriber {
 		std::vector<ThreadInfo> worker_threads_ ABSL_GUARDED_BY(worker_mutex_);
 
 		// --- Order-aware consume state (Order 2/5) ---
+		struct RetentionBudget {
+			explicit RetentionBudget(size_t bytes) : limit(bytes) {}
+			const size_t limit;
+			std::atomic<size_t> used{0};
+			std::atomic<size_t> peak{0};
+			bool Reserve(size_t bytes);
+		};
+		struct RetainedChunk {
+			std::shared_ptr<RetentionBudget> budget;
+			std::unique_ptr<uint8_t[]> storage;
+			size_t capacity = 0;
+			~RetainedChunk();
+			uint8_t* data() { return storage.get(); }
+			const uint8_t* data() const { return storage.get(); }
+		};
+		std::shared_ptr<RetentionBudget> retention_budget_;
+		const size_t max_retained_messages_;
+		std::atomic<bool> retention_exhausted_{false};
 		struct OwnedMessage {
 			// Complete frames borrow their retained receive chunk. Frames spanning
 			// receive calls keep using the owned-data fallback.
-			std::shared_ptr<std::vector<uint8_t>> retained_chunk;
+			std::shared_ptr<RetainedChunk> retained_chunk;
 			size_t retained_offset = 0;
-			std::vector<uint8_t> data;
 			uint16_t header_version = Embarcadero::wire::HEADER_VERSION_V1;
 
 			uint8_t* bytes() {
-				return retained_chunk ? retained_chunk->data() + retained_offset : data.data();
+				return retained_chunk ? retained_chunk->data() + retained_offset : nullptr;
 			}
 			const uint8_t* bytes() const {
-				return retained_chunk ? retained_chunk->data() + retained_offset : data.data();
+				return retained_chunk ? retained_chunk->data() + retained_offset : nullptr;
 			}
 			void Reset() {
 				retained_chunk.reset();
 				retained_offset = 0;
-				data.clear();
 				header_version = Embarcadero::wire::HEADER_VERSION_V1;
 			}
 		};
@@ -504,12 +591,13 @@ class Subscriber {
 			Subscriber* owner = nullptr;
 			OwnedMessageRecycler() noexcept = default;
 			explicit OwnedMessageRecycler(Subscriber* subscriber) noexcept : owner(subscriber) {}
-			void operator()(OwnedMessage* msg) const;
+			void operator()(OwnedMessage* msg) const noexcept;
 		};
 		using OwnedMessagePtr = std::unique_ptr<OwnedMessage, OwnedMessageRecycler>;
 
 		struct StreamParseState {
-			std::vector<uint8_t> buffer;
+			std::shared_ptr<RetainedChunk> carry;
+			size_t carry_size = 0;
 			bool has_pending_metadata = false;
 			Embarcadero::wire::BatchMetadata pending_metadata{};
 			size_t current_batch_messages_processed = 0;
@@ -518,6 +606,7 @@ class Subscriber {
 
 		absl::Mutex owned_message_pool_mutex_;
 		std::vector<std::unique_ptr<OwnedMessage>> owned_message_pool_ ABSL_GUARDED_BY(owned_message_pool_mutex_);
+		size_t allocated_owned_messages_ ABSL_GUARDED_BY(owned_message_pool_mutex_){0};
 		size_t next_expected_order_ ABSL_GUARDED_BY(consume_mutex_){0};
         size_t ordered_received_messages_ ABSL_GUARDED_BY(consume_mutex_){0};
         size_t ordered_duplicate_messages_ ABSL_GUARDED_BY(consume_mutex_){0};
@@ -557,7 +646,9 @@ class Subscriber {
 		                               long long recv_buffer_age_us,
 		                               size_t recv_chunk_bytes);
 		OwnedMessagePtr AcquireOwnedMessage();
-		void RecycleOwnedMessage(OwnedMessage* msg);
+		void RecycleOwnedMessage(OwnedMessage* msg) noexcept;
+		std::shared_ptr<RetainedChunk> AllocateRetainedChunk(size_t capacity, const uint8_t* bytes = nullptr);
+		void FailOrderedRetention(const char* resource);
 		// [[EXPORT_GAP_REANCHOR]] gap_batch_starts: batch_total_order of any batch(es) in
 		// this call that arrived flagged wire::BATCH_META_FLAG_EXPORT_GAP (a lagging
 		// export cursor's skipped-ahead resync point). Empty on the common path.

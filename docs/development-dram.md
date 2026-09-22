@@ -75,3 +75,33 @@ The `ack_hwm_withheld` client case expects exit code 1 only after the real publi
 `fence_before_commit` deliberately places two client identities in the held epoch to reach the general classification path. The single-client optimization can commit ready work before its later expiry sweep, which is a different legal schedule. The controller checks the selected scanner's epoch and the target client's ready count before releasing expiry; the successful case must ultimately deliver eight approved messages, including the independent control session's two batches.
 
 The fault profile requires 72 GiB free in `/dev/shm`, broker-node memory checked by the shared preflight, and 6 GiB free on the client node. It keeps 256 MiB segments and the full production GOI; storage cases use a 64-slot PBR derived from the native driver's side-effect-free geometry query and stay below 768 MiB of publisher ingress payload. Subscriber replay is additional traffic. After broker startup, an owned 60-second timer covers the entire active case, including blocked controller and native-stage waits; it is canceled before the separate 15-second child shutdown grace period. Removing the large tmpfs region can take additional time. Hooks use inherited local `SOCK_SEQPACKET` endpoints with per-run tokens, never public control listeners, and compile out of default builds. Fake-process harness tests run with `python3 -m unittest discover -s tools -p test_production_faults.py`; the native `--self-test` exercises wire transport, malformed boundaries and truncated frames without a cluster.
+
+The development runner explicitly selects a concurrent indexed audit
+(`EMBARCADERO_E2E_AUDIT_MODE=stream`). It verifies payloads and order while
+publishing proceeds, then checks final delivery counters again after publisher
+completion. Its audit deadline is 20 seconds from audit startup, before the
+publish loop. This avoids retaining the whole workload until ACK completion.
+
+The ordered consumer has separate limits: `EMBARCADERO_SUBSCRIBER_RETAINED_BYTES`
+(default 256 MiB, environment minimum 32 MiB) bounds retained receive chunks
+and carry/fallback allocation capacities;
+`EMBARCADERO_SUBSCRIBER_MAX_MESSAGES` (default 262144) bounds allocated message
+descriptors, including pooled descriptors, and sparse reorder slots. Exceeding
+either produces an explicit terminal delivery error instead of waiting behind
+a missing message. These are ordered-retention limits, not a universal process
+memory cap: fixed receive buffers and optional latency telemetry are separate.
+Library users can supply `OrderedRetentionLimits` at construction.
+
+For a deliberate serial audit, select `EMBARCADERO_E2E_AUDIT_MODE=serial` and
+size both limits for the full retained workload. For example, the matched
+2 GiB performance protocol uses 3 GiB and 1048576 slots. A slow consumer must
+stay within its declared capacity; successful publisher ACKs alone do not
+prove successful subscriber delivery.
+
+Ordered consumer views borrow serialized bytes until the next consume call.
+Use one consumer per subscriber and read header fields through
+`Subscriber::OrderedMessageView` (`PayloadSize()`, `TotalOrder()`, and
+`Payload()`), rather than casting the bytes to the shared-memory header types.
+TCP fragmentation can place a frame at any byte alignment; those in-memory
+header types require 64-byte alignment. The accessors preserve the wire format
+and read fields without copying the payload.

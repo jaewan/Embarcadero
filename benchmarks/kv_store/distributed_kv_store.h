@@ -16,6 +16,7 @@
 #include <future>
 #include <chrono>
 #include <vector>
+#include <stdexcept>
 
 // Unique identifier for operations
 struct OperationId {
@@ -286,7 +287,23 @@ class DistributedKVStore {
 
 		// Log consumer thread
 		std::vector<std::thread> log_consumer_threads_;
-		std::atomic<bool> running_;
+        std::atomic<bool> running_;
+        friend struct DistributedKVStoreTestPeer;
+        // Shared by the consumer's empty-result path and application waiters.
+        // Retention failure is terminal; an ordinary empty queue is not.
+        struct DeliveryFailure {
+            std::atomic<bool> failed{false};
+            bool Observe(const Subscriber::OrderedDeliveryStatus& status) {
+                if (status.retention_exhausted || status.stopped)
+                    failed.store(true, std::memory_order_release);
+                return failed.load(std::memory_order_acquire);
+            }
+            void ThrowIfFailed() const {
+                if (failed.load(std::memory_order_acquire))
+                    throw std::runtime_error("KV ordered delivery stopped or exhausted its retention budget");
+            }
+        } delivery_failure_;
+        bool StopForTerminalDelivery();
 
 		std::unique_ptr<HeartBeat::Stub> stub_;
 		std::unique_ptr<Publisher> publisher_;
@@ -389,6 +406,10 @@ class DistributedKVStore {
 
 		// Destructor
 		~DistributedKVStore();
+
+        // Throws on terminal subscriber failure; successful synchronization
+        // must never be inferred from a stopped or capacity-exhausted consumer.
+        void ThrowIfDeliveryFailed() const { delivery_failure_.ThrowIfFailed(); }
 
 		// Wait until the local state has applied up to at least the given log position
 		void waitUntilApplied(size_t total_order);

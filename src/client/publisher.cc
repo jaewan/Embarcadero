@@ -1454,7 +1454,8 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 		const auto ack_spin_duration = low_payload_poll_mode
 			? std::chrono::microseconds(100)
 			: std::chrono::microseconds(500);
-		uint32_t ack_wait_loops = 0;
+		uint64_t ack_event_waits = 0;
+
 		
 		// Configurable timeout for ACK waits. Runtime policy resolved once in Init().
 		int timeout_seconds = ack_timeout_seconds_;
@@ -1554,17 +1555,20 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 				last_log_time = now;
 			}
 
-			// [[REMOVED: co = client_order_.load()]] - This caused the race condition!
-			auto spin_start = std::chrono::steady_clock::now();
-			const auto spin_end = spin_start + ack_spin_duration;
-			while (std::chrono::steady_clock::now() < spin_end && normalized_acks() < target_acks) {
-				Embarcadero::CXL::cpu_pause();
-			}
-			if (normalized_acks() < target_acks) {
-				if (!low_payload_poll_mode || ((++ack_wait_loops & 0x3F) == 0)) {
-					std::this_thread::yield();
-				}
-		}
+            // Spin only at the start of this public wait, then park between
+            // progress events. The 1ms fallback also observes terminal states
+            // that originate outside the ACK thread without adding a tail tax
+            // to ordinary ACKs, which notify this event directly.
+            if (std::chrono::steady_clock::now() - wait_start_time < ack_spin_duration) {
+                Embarcadero::CXL::cpu_pause();
+            } else {
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+                if (timeout_seconds > 0) deadline = std::min(deadline, wait_start_time + timeout_duration);
+                ++ack_event_waits;
+                ack_progress_event_.WaitUntil(deadline, [&] {
+                    return normalized_acks() >= target_acks || shutdown_.load(std::memory_order_acquire);
+                });
+            }
 	}
 		// Only treat as success if we actually received ACKs for all messages
 		const size_t received = ack_received_.load(std::memory_order_relaxed);
@@ -1649,7 +1653,7 @@ bool Publisher::Poll(size_t n, bool include_tail_drain) {
 				          << " normalized_received=" << normalized_received
 				          << " raw_received=" << received
 				          << " wait_ms=" << ack_wait_ms
-				          << " wait_loops=" << ack_wait_loops
+				          << " event_waits=" << ack_event_waits
 				          << " low_payload_mode=" << (low_payload_poll_mode ? 1 : 0);
 			}
 			// [[ORDER_0_TAIL_ACK]] Drain so EpollAckThread can read in-flight ACKs before we return.
@@ -1714,7 +1718,7 @@ bool Publisher::WaitUntilAcked(size_t n) {
 	const auto ack_spin_duration = low_payload_poll_mode
 		? std::chrono::microseconds(100)
 		: std::chrono::microseconds(500);
-	uint32_t ack_wait_loops = 0;
+
 	int timeout_seconds = ack_timeout_seconds_;
 	const auto timeout_duration = std::chrono::seconds(timeout_seconds);
 
@@ -1767,16 +1771,16 @@ bool Publisher::WaitUntilAcked(size_t n) {
 			last_log_time = now;
 		}
 
-		auto spin_start = std::chrono::steady_clock::now();
-		const auto spin_end = spin_start + ack_spin_duration;
-		while (std::chrono::steady_clock::now() < spin_end && normalized_acks() < n) {
-			Embarcadero::CXL::cpu_pause();
-		}
-		if (normalized_acks() < n) {
-			if (!low_payload_poll_mode || ((++ack_wait_loops & 0x3F) == 0)) {
-				std::this_thread::yield();
-			}
-		}
+        if (std::chrono::steady_clock::now() - wait_start_time < ack_spin_duration) {
+            Embarcadero::CXL::cpu_pause();
+        } else {
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+            if (timeout_seconds > 0) deadline = std::min(deadline, wait_start_time + timeout_duration);
+            ack_progress_event_.WaitUntil(deadline, [&] {
+                return normalized_acks() >= n || shutdown_.load(std::memory_order_acquire) ||
+                    (seq_type_ == heartbeat_system::SequencerType::CORFU && corfu_gate_.IsAborted());
+            });
+        }
 	}
 
 	return normalized_acks() >= n;
@@ -1945,6 +1949,7 @@ void Publisher::WriteFinishedOrPaused() {
 
 
 void Publisher::NotifyPublisherWork() {
+    ack_progress_event_.Notify();
     {
         std::lock_guard<std::mutex> lock(publisher_work_mutex_);
         ++publisher_work_generation_;

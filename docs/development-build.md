@@ -105,9 +105,10 @@ that process's timezone to UTC. It tests the actual publisher, Topic publication
 disk replication, configuration, framing, and epoch shutdown paths. It contains
 no race suppressions and does not substitute for a fully instrumented live cluster.
 
-Follow-up source 11 passed 51 registered CTest targets and a fresh minimal-client
-build on this host. The extracted publisher passed 10 ASan/UBSan tests with leak
-detection; the corrected Topic fixture and five other linked targets passed
-TSan, as did the three small concurrency fixtures. See the
+Final source 14 passed 53 registered CTest targets and a fresh minimal-client
+build with the baseline-dependency exclusion check. All 12 publisher tests passed
+ASan/UBSan with leak detection. Seven linked TSan fixtures passed, including
+actual manager allocation, Topic publication and the publisher routing guard;
+three earlier small concurrency fixtures remain separately recorded. See the
 [follow-up evidence](reviews/2026-09-22-followup-results.md) for exact source
-identities, the test-only post-freeze correction, initial failures and scope.
+identities, instrumented dependency reuse, initial failures and limits.

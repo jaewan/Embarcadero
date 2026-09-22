@@ -116,6 +116,9 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("EMBAR_FAULT_INJECT", env)
         self.assertIn("EMBAR_FAULT_INJECT", removed)
         self.assertEqual(selected["NUM_BROKERS"], "3")
+        self.assertEqual(selected["EMBARCADERO_E2E_AUDIT_MODE"], "stream")
+        self.assertEqual(selected["EMBARCADERO_SUBSCRIBER_RETAINED_BYTES"], str(256 * runner.MIB))
+        self.assertEqual(selected["EMBARCADERO_SUBSCRIBER_MAX_MESSAGES"], "262144")
 
     def test_occupied_port_rejected_without_touching_listener(self):
         with socket.socket() as listener:

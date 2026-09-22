@@ -16,19 +16,56 @@ struct Entry {
   std::atomic<uint64_t> expected_seq{0};
 };
 
+// Force another claimant to win after our zero load but before our CAS.
+struct LostClaimKey {
+  std::atomic<uint64_t> value{0};
+  uint64_t load(std::memory_order order) { return value.load(order); }
+  bool compare_exchange_strong(uint64_t& expected, uint64_t desired,
+                               std::memory_order success, std::memory_order failure) {
+    value.store(desired, std::memory_order_release);
+    return value.compare_exchange_strong(expected, desired, success, failure);
+  }
+};
+struct LostClaimEntry { LostClaimKey session_key; };
+
 int main() {
   Entry table[4];
   auto observe = [](Entry*) {};
   // Force collisions and concurrent claims of the same four identities.
   std::vector<std::thread> threads;
+  std::atomic<size_t> claims{0};
   for (int t = 0; t < 8; ++t) threads.emplace_back([&, t] {
     for (int i = 0; i < 1000; ++i) {
       const uint64_t key = 1 + (i + t) % 4;
-      Entry* p = FindOrClaimSession(table, 4, key, 0, observe);
+      bool claimed = false;
+      Entry* p = FindOrClaimSession(table, 4, key, 0, observe, &claimed);
+      if (claimed) claims.fetch_add(1);
       REQUIRE(p && p->session_key.load() == key);
     }
   });
   for (auto& thread : threads) thread.join();
+  REQUIRE(claims.load() == 4);
+  LostClaimEntry lost;
+  bool claimed = true;
+  REQUIRE(FindOrClaimSession(&lost, 1, 17, 0, [](LostClaimEntry*) {}, &claimed) == &lost);
+  REQUIRE(!claimed);
+  REQUIRE(SessionClaimNeedsFlush(claimed, 0)); // Help an unpublished competing claim.
+  REQUIRE(SessionClaimNeedsFlush(true, MergeSessionStateWord(0, 7, false)));
+  REQUIRE(!SessionClaimNeedsFlush(false, MergeSessionStateWord(0, 7, false)));
+  REQUIRE(!SessionClaimNeedsFlush(false, MergeSessionStateWord(0, 7, true)));
+  Entry fresh;
+  REQUIRE(FindOrClaimSession(&fresh, 1, 23, 0, observe, &claimed) == &fresh && claimed);
+  REQUIRE(FindOrClaimSession(&fresh, 1, 23, 0, observe, &claimed) == &fresh && !claimed);
+  REQUIRE(!FindOrClaimSession(&fresh, 1, 24, 0, observe, &claimed) && !claimed);
+
+  std::atomic<uint64_t> merged{0};
+  REQUIRE(MergeSessionState(merged, 7, false));
+  REQUIRE(!MergeSessionState(merged, 7, false));
+  std::thread normal([&] { for (int i = 0; i < 1000; ++i) MergeSessionState(merged, 7, false); });
+  std::thread terminal([&] { MergeSessionState(merged, 7, true); });
+  normal.join(); terminal.join();
+  REQUIRE(merged.load() == MergeSessionStateWord(0, 7, true));
+  REQUIRE(!MergeSessionState(merged, 7, false));
   REQUIRE(!FindOrClaimSession(table, 4, 5, 0, observe));
   REQUIRE(!FindOrClaimSession(table, 4, 0, 0, observe));
   for (uint64_t key = 1; key <= 4; ++key)

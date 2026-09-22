@@ -42,6 +42,11 @@ class TopicPublicationTestAccess {
     t.committed_seq_updater_stop_.store(false);
   }
   static uint64_t Reserved(const Topic& t) { return t.global_batch_seq_.load(); }
+  static bool Publish(Topic& t, uint32_t client, uint64_t expected, uint64_t hwm, bool fenced) {
+    auto gate = t.session_publication_gate_.Lock();
+    Topic::SessionPublishSnapshot snapshot{7, expected, hwm, hwm, fenced};
+    return t.PublishSessionEntry(MakeSessionKey(client, 7), snapshot);
+  }
 };
 }
 namespace {
@@ -199,6 +204,20 @@ void FenceWins(Control& control) {
   Require(TopicPublicationTestAccess::Reserved(*f.topic) == 1 && f.Goi()[1].global_seq == UINT64_MAX,
           "rejected suffix must reserve/write no GOI entry");
 }
+void RepeatedPublicationPreservesPrefixAndFence() {
+  Fixture f(103);
+  Require(TopicPublicationTestAccess::Publish(*f.topic, f.client, 2, 1, false), "first publication");
+  Require(TopicPublicationTestAccess::Publish(*f.topic, f.client, 4, 3, false), "unchanged ACTIVE state publication");
+  auto snapshot = f.Snapshot();
+  Require(snapshot.active && !snapshot.fenced && snapshot.expected_seq == 4 &&
+          snapshot.committed_hwm == 3 && snapshot.highest_sequenced == 3, "unchanged state still publishes new prefix");
+  Require(TopicPublicationTestAccess::Publish(*f.topic, f.client, 4, 3, true), "fence publication");
+  Require(TopicPublicationTestAccess::Publish(*f.topic, f.client, 1, 0, false), "stale normal publication");
+  snapshot = f.Snapshot();
+  Require(snapshot.fenced && snapshot.expected_seq == 4 && snapshot.committed_hwm == 3 &&
+          snapshot.highest_sequenced == 3, "stale publication cannot lower prefix or clear fence");
+  Require(f.topic->TryAdmitSession(f.client, 7) == Topic::SessionAdmission::fenced, "OPEN still rejects fenced identity");
+}
 }
 void RunCxlManagerGeometryTest();
 int main(int argc, char** argv) {
@@ -209,6 +228,7 @@ int main(int argc, char** argv) {
     }
     Require(argc == 1, "unknown fixture argument");
     Control control; CommitWins(control); FenceWins(control);
+    RepeatedPublicationPreservesPrefixAndFence();
     std::cout << "PASS production Topic publication, OPEN snapshot, commit/fence winners\n";
     return 0;
   } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

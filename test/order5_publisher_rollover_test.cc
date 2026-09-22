@@ -16,6 +16,21 @@
 using namespace std::chrono_literals;
 
 struct PublisherTestPeer {
+    static void ConfigureAckWait(Publisher& publisher, bool session) {
+        publisher.ack_level_ = 1;
+        publisher.ack_timeout_seconds_ = 1;
+        if (!session) publisher.order_level_ = 0;
+        publisher.broker_stats_[0].sent_messages.store(3);
+    }
+    static void AdvanceAck(Publisher& publisher, bool session, size_t value) {
+        if (session) publisher.order5_last_ack_hwm_.store(value, std::memory_order_release);
+        else publisher.broker_stats_[0].acked_messages.store(value, std::memory_order_release);
+        publisher.ack_progress_event_.Notify();
+    }
+    static void StopAckWait(Publisher& publisher) {
+        publisher.shutdown_.store(true, std::memory_order_release);
+        publisher.NotifyPublisherWork();
+    }
 	static void SetPublishAllowlist(Publisher& publisher, std::vector<int> brokers) {
 		publisher.order5_broker_allowlist_ = std::move(brokers);
 	}
@@ -580,4 +595,62 @@ TEST(Order5PublisherRollover, FinishedInputStillConsumesRecoveryAndStopsWithoutA
     PublisherTestPeer::StopWorkers(publisher);
     EXPECT_EQ(stopping.wait_for(1s), std::future_status::ready);
     EXPECT_EQ(stopping.get(), nullptr);
+}
+
+TEST(AdaptiveAckWait, ProgressBeforeRegistrationAndDuringPredicateCheck) {
+    Embarcadero::AdaptiveWaitEvent event;
+    std::atomic<bool> ready{true};
+    event.Notify();
+    event.WaitUntil(std::chrono::steady_clock::now() + 1s, [&] { return ready.load(); });
+    ready.store(false);
+    std::promise<void> predicate_entered, updated;
+    auto update_done = updated.get_future();
+    auto writer = std::async(std::launch::async, [&] {
+        predicate_entered.get_future().wait();
+        ready.store(true, std::memory_order_release);
+        updated.set_value();
+        event.Notify(); // Must wait for registration's mutex before notifying.
+    });
+    bool first = true;
+    const auto started = std::chrono::steady_clock::now();
+    event.WaitUntil(started + 1s, [&] {
+        if (first) {
+            first = false;
+            predicate_entered.set_value();
+            update_done.wait();
+            return false; // Force the check-to-park race despite published progress.
+        }
+        return ready.load(std::memory_order_acquire);
+    });
+    writer.get();
+    EXPECT_LT(std::chrono::steady_clock::now() - started, 500ms);
+    EXPECT_TRUE(ready.load());
+}
+
+TEST(AdaptiveAckWait, BoundedFallbackWithoutNotification) {
+    Embarcadero::AdaptiveWaitEvent event;
+    const auto start = std::chrono::steady_clock::now();
+    event.WaitUntil(start + 2ms, [] { return false; });
+    EXPECT_GE(std::chrono::steady_clock::now() - start, 2ms);
+}
+
+TEST(Order5PublisherRollover, AckWaitUsesAuthoritativeFrontierAndLegacyNormalizer) {
+    for (bool session : {true, false}) {
+        char topic[TOPIC_NAME_SIZE] = "AckEvent";
+        Publisher publisher(topic, "127.0.0.1", "1212", 1, 64, 1 << 20,
+                            Embarcadero::kOrderStrong, heartbeat_system::SequencerType::EMBARCADERO);
+        PublisherTestPeer::ConfigureAckWait(publisher, session);
+        auto waiter = std::async(std::launch::async, [&] { return publisher.WaitUntilAcked(3); });
+        EXPECT_EQ(waiter.wait_for(10ms), std::future_status::timeout);
+        PublisherTestPeer::AdvanceAck(publisher, session, 2);
+        EXPECT_EQ(waiter.wait_for(10ms), std::future_status::timeout);
+        PublisherTestPeer::AdvanceAck(publisher, session, 3);
+        EXPECT_EQ(waiter.wait_for(500ms), std::future_status::ready);
+        EXPECT_TRUE(waiter.get()); // Raw ack_received_ deliberately remains zero.
+        EXPECT_TRUE(publisher.WaitUntilAcked(3)); // Completion before entering wait.
+        auto stopped = std::async(std::launch::async, [&] { return publisher.WaitUntilAcked(4); });
+        PublisherTestPeer::StopAckWait(publisher);
+        EXPECT_EQ(stopped.wait_for(500ms), std::future_status::ready);
+        EXPECT_FALSE(stopped.get());
+    }
 }

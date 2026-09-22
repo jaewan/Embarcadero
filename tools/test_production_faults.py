@@ -169,12 +169,23 @@ class ProductionFaultHarnessTests(unittest.TestCase):
                             "[Publisher ACK Failure]: Did not receive ACKs for all messages. "
                             "normalized_received=0 raw_received=0 target=2 short=2\n",
                             failure + "[ACK_VERIFY] normalized_received=2\n",
-                            failure + "[ORDERED_DELIVERY_AUDIT] status=passed\n"):
+                            failure + "[ORDERED_DELIVERY_AUDIT] status=passed\n",
+                            failure + "[ORDERED_DELIVERY_FINAL] status=passed\n"):
                 (base / "driver.log").write_text(invalid)
                 with self.assertRaises(dev.RunError):
                     faults.validate_result(base, "ack_hwm_withheld")
             (base / "driver.log").write_text(failure)
             self.assertEqual(faults.validate_result(base, "ack_hwm_withheld")["expected_exit_code"], 1)
+            delivery = ("[ORDERED_DELIVERY_AUDIT] status=passed messages=2 expected=2 "
+                        "payload_bytes=8192 duplicates=0 parse_errors=0 export_gaps=0 indexed_payload=1\n")
+            (base / "driver.log").write_text(delivery + failure)
+            self.assertTrue(faults.validate_result(base, "ack_hwm_withheld")["delivery_audit_completed_before_ack"])
+            for invalid in (delivery + delivery + failure,
+                            delivery.replace("payload_bytes=8192", "payload_bytes=4096") + failure,
+                            delivery.replace("duplicates=0", "duplicates=1") + failure):
+                (base / "driver.log").write_text(invalid)
+                with self.assertRaises(dev.RunError):
+                    faults.validate_result(base, "ack_hwm_withheld")
 
     def test_real_reopen_requires_exact_original_payload_and_one_complete_suffix(self):
         with tempfile.TemporaryDirectory() as directory:

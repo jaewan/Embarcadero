@@ -384,6 +384,7 @@ bool runReplica(BenchConfig& cfg) {
 	auto last_log = std::chrono::steady_clock::now();
 	uint64_t applied = 0;
 	while ((applied = store.getAppliedAnyEntryCount()) < cfg.expected_entries) {
+        store.ThrowIfDeliveryFailed();
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		auto now = std::chrono::steady_clock::now();
 		if (now - last_log >= std::chrono::seconds(5)) {
@@ -397,6 +398,7 @@ bool runReplica(BenchConfig& cfg) {
 			break;
 		}
 	}
+    store.ThrowIfDeliveryFailed();
 	const uint64_t digest = store.stateDigest();
 	const size_t store_size = store.storeSize();
 	const bool complete = (applied >= cfg.expected_entries);
@@ -1163,7 +1165,7 @@ bool runBenchmark(BenchConfig& cfg) {
 
 }  // namespace
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[]) try {
 	google::InitGoogleLogging(argv[0]);
 	google::InstallFailureSignalHandler();
 	FLAGS_logtostderr = 1;
@@ -1301,4 +1303,7 @@ int main(int argc, char* argv[]) {
 	          << " latency=" << cfg.latency;
 
 	return runBenchmark(cfg) ? 0 : 1;
+} catch (const std::exception& error) {
+    LOG(ERROR) << "KV benchmark failed: " << error.what();
+    return 1;
 }

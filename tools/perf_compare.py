@@ -24,7 +24,7 @@ import dev_cluster as dev
 
 SEGMENT_BYTES = 4 * dev.GIB
 BASELINE_REVISION = "ae9959dd2892af821878aa42d4e2c05fcb635466"
-PROTOCOL_REVISION = "paired-dram-v3-fixed-mapping-base"
+PROTOCOL_REVISION = "paired-dram-v4-explicit-serial-audit"
 CLIENT_CPUS = list(range(0, 32))
 BROKER_CPUS = [list(range(first, first + 32)) for first in (128, 160, 192)]
 
@@ -105,7 +105,11 @@ def effective_config(brokers):
 def environment(shm_name, brokers):
     env, selected, removed = dev.child_environment(shm_name, brokers)
     updates = {"EMBARCADERO_SESSION_RTO_MIN_MS": "2000", "EMBARCADERO_ACK_TIMEOUT_SEC": "60",
-               "EMBARCADERO_E2E_TIMEOUT_SEC": "60"}
+               "EMBARCADERO_E2E_TIMEOUT_SEC": "20",
+               # Preserve this broker-comparison protocol when client defaults change.
+               "EMBARCADERO_E2E_AUDIT_MODE": "serial",
+               "EMBARCADERO_SUBSCRIBER_RETAINED_BYTES": str(3 * dev.GIB),
+               "EMBARCADERO_SUBSCRIBER_MAX_MESSAGES": "1048576"}
     env.update(updates)
     selected.update(updates)
     return env, selected, removed

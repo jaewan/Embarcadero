@@ -1,4 +1,5 @@
 #include "test_utils.h"
+#include "delivery_completion.h"
 #include "common/configuration.h"
 #include "latency_stats.h"
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <random>
 #include <thread>
 #include <fstream>
+#include <future>
 #include <numeric>
 #include <optional>
 #include <algorithm>
@@ -98,7 +100,7 @@ struct DeliveryLatencySample {
 	bool has_fifo_fields = false;
 };
 
-struct DeliveryDrainResult {
+struct DeliveryDrainResult : Embarcadero::client::DeliveryCompletion {
 	size_t target = 0;
 	size_t message_size = 0;
 	size_t delivered = 0;
@@ -110,7 +112,6 @@ struct DeliveryDrainResult {
 	size_t duplicate_uid = 0;
 	size_t missing_uid = 0;
 	size_t receive_matched = 0;
-	bool timed_out = false;
 	uint64_t first_total_order = 0;
 	uint64_t last_total_order = 0;
 	uint64_t min_uid = std::numeric_limits<uint64_t>::max();
@@ -125,7 +126,7 @@ struct DeliveryDrainResult {
 		       out_of_order_per_client == 0 &&
 		       duplicate_uid == 0 &&
 		       missing_uid == 0 &&
-		       !timed_out;
+		       !timed_out && !terminal_delivery_error;
 	}
 
 	// True order bugs (reorder / dup / corrupt). Incomplete drain alone is not
@@ -134,7 +135,7 @@ struct DeliveryDrainResult {
 	// a replica pause or from multi-thread uid collision, neither of which is an
 	// ordering violation on the pub_ack path.
 	bool hard_ordering_fault() const {
-		return invalid_messages != 0 ||
+		return terminal_delivery_error || invalid_messages != 0 ||
 		       duplicate_total_order != 0 ||
 		       out_of_order_total_order != 0;
 	}
@@ -439,19 +440,10 @@ bool ExtractDeliveredMessage(void* raw,
 		DeliveryLatencySample* out) {
 	if (raw == nullptr || out == nullptr) return false;
 
-	const uint8_t* payload = nullptr;
-	size_t payload_size = configured_message_size;
-	if (wire_version == Embarcadero::wire::HEADER_VERSION_V2) {
-		auto* header = reinterpret_cast<Embarcadero::BlogMessageHeader*>(raw);
-		payload = reinterpret_cast<const uint8_t*>(raw) + sizeof(Embarcadero::BlogMessageHeader);
-		payload_size = header->size > 0 ? header->size : configured_message_size;
-		out->total_order = static_cast<uint64_t>(header->total_order);
-	} else {
-		auto* header = reinterpret_cast<Embarcadero::MessageHeader*>(raw);
-		payload = reinterpret_cast<const uint8_t*>(raw) + sizeof(Embarcadero::MessageHeader);
-		payload_size = header->size > 0 ? header->size : configured_message_size;
-		out->total_order = static_cast<uint64_t>(header->total_order);
-	}
+	const Subscriber::OrderedMessageView view{raw, wire_version};
+	const auto* payload = static_cast<const uint8_t*>(view.Payload());
+	const size_t payload_size = view.PayloadSize() > 0 ? view.PayloadSize() : configured_message_size;
+	out->total_order = view.TotalOrder();
 
 	if (payload_size < sizeof(long long)) {
 		return false;
@@ -468,6 +460,17 @@ bool ExtractDeliveredMessage(void* raw,
 		}
 	}
 	return out->send_time_ns > 0;
+}
+
+bool RecordTerminalDeliveryStatus(Subscriber& subscriber, DeliveryDrainResult& result) {
+	const auto status = subscriber.GetOrderedDeliveryStatus();
+	const bool already_failed = result.terminal_delivery_error;
+	if (result.ObserveOrderedStatus(status) && !already_failed) {
+		LOG(ERROR) << "[DELIVERY_TERMINAL_ERROR] retention_exhausted=" << status.retention_exhausted
+		           << " stopped=" << status.stopped << " parse_errors=" << status.parse_errors
+		           << " export_gaps=" << status.export_gaps << " duplicates=" << status.duplicates;
+	}
+	return result.terminal_delivery_error;
 }
 
 DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
@@ -502,6 +505,10 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 		const size_t batch_count =
 			subscriber.ConsumeOrderedBatch(&delivered_batch, max_to_drain, 10);
 		if (batch_count == 0) {
+			// Only the cold empty-batch path needs a status snapshot. A terminal
+			// receiver can never fill the remaining population; do not spin until
+			// the deadline or relabel that failure as a soft ACK-primary timeout.
+			if (RecordTerminalDeliveryStatus(subscriber, result)) break;
 			continue;
 		}
 		for (const auto& delivered : delivered_batch) {
@@ -575,7 +582,9 @@ DeliveryDrainResult DrainDeliveredMessages(Subscriber& subscriber,
 		}
 	}
 
-	result.timed_out = (result.delivered < target_messages);
+	result.timed_out = result.delivered < target_messages &&
+	    std::chrono::steady_clock::now() >= deadline;
+	RecordTerminalDeliveryStatus(subscriber, result);
 	if (saw_uid) {
 		const uint64_t expected_uid_min = 1;
 		const uint64_t expected_uid_max = static_cast<uint64_t>(target_messages);
@@ -703,7 +712,7 @@ void WriteDeliveryOrderingCsv(const DeliveryDrainResult& result) {
 	}
 	out << "Target,Delivered,RecordedSamples,TimedOut,InvalidMessages,"
 	    << "DuplicateTotalOrder,OutOfOrderTotalOrder,DuplicateUid,MissingUid,OutOfOrderPerClient,FifoCheckedMessages,"
-	    << "FirstTotalOrder,LastTotalOrder,MinUid,MaxUid,ReceiveMatched,Pass\n";
+	    << "FirstTotalOrder,LastTotalOrder,MinUid,MaxUid,ReceiveMatched,Pass,TerminalDeliveryError\n";
 	out << result.target
 	    << "," << result.delivered
 	    << "," << result.samples.size()
@@ -721,6 +730,7 @@ void WriteDeliveryOrderingCsv(const DeliveryDrainResult& result) {
 	    << "," << result.max_uid
 	    << "," << result.receive_matched
 	    << "," << (result.ordering_ok() ? 1 : 0)
+	    << "," << (result.terminal_delivery_error ? 1 : 0)
 	    << "\n";
 }
 
@@ -1749,6 +1759,24 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 	// Calculate number of messages
 	size_t n = total_message_size / message_size;
     const bool audited_ordered_delivery = ShouldValidateOrder() && order == 5;
+    const char* audit_mode = std::getenv("EMBARCADERO_E2E_AUDIT_MODE");
+    if (audit_mode && std::strcmp(audit_mode, "stream") != 0 && std::strcmp(audit_mode, "serial") != 0) {
+        LOG(ERROR) << "EMBARCADERO_E2E_AUDIT_MODE must be stream or serial";
+        return {0.0, 0.0};
+    }
+    const bool streaming_audit = audited_ordered_delivery &&
+        (!audit_mode || std::strcmp(audit_mode, "stream") == 0);
+    int audit_timeout_ms = streaming_audit ? 60000 : 20000;
+    if (const char* value = std::getenv("EMBARCADERO_E2E_TIMEOUT_SEC")) {
+        const std::string timeout(value);
+        if (timeout.empty() || timeout.size() > 4 ||
+            timeout.find_first_not_of("0123456789") != std::string::npos ||
+            std::stoi(timeout) < 1 || std::stoi(timeout) > 3600) {
+            LOG(ERROR) << "EMBARCADERO_E2E_TIMEOUT_SEC must be an integer in [1,3600]";
+            return {0.0, 0.0};
+        }
+        audit_timeout_ms = std::stoi(timeout) * 1000;
+    }
     if (audited_ordered_delivery && message_size < sizeof(uint64_t)) {
         LOG(ERROR) << "Indexed ordered audit requires at least 8 payload bytes";
         return {0.0, 0.0};
@@ -1781,6 +1809,16 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		Publisher p(topic, GetHeadAddr(result), std::to_string(BROKER_PORT),
 					num_threads_per_broker, message_size, q_size, order, seq_type);
 		Subscriber s(GetHeadAddr(result), std::to_string(BROKER_PORT), topic, false, order);
+		// Declared after Subscriber so cancellation/join precedes its destruction
+		// on success, early returns, and exceptions from publishing or validation.
+		struct AuditTask {
+			std::atomic<bool> cancelled{false};
+			std::future<bool> result;
+			~AuditTask() {
+				cancelled.store(true, std::memory_order_release);
+				if (result.valid()) result.wait();
+			}
+		} audit;
 		
 		// Wait for subscriber connections (network setup - not measured)
 		s.WaitUntilAllConnected();
@@ -1794,6 +1832,24 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		
 		// Warmup buffers to eliminate page fault variance (not measured)
 		p.WarmupBuffers();
+		if (audited_ordered_delivery) {
+			LOG(INFO) << "[E2E_AUDIT_SCHEDULE] mode=" << (streaming_audit ? "stream" : "serial")
+			          << " indexed_payload=1 timeout_ms=" << audit_timeout_ms
+			          << " timeout_start=" << (streaming_audit ? "before_publish" : "after_poll");
+		}
+		if (streaming_audit) {
+			// Publish mutates its index tag. The audit owns a separate immutable
+			// seed, including on error paths that delete the publisher's buffer.
+			std::vector<uint8_t> seed(message, message + message_size);
+			std::promise<void> launched;
+			auto ready = launched.get_future();
+			audit.result = std::async(std::launch::async,
+				[&s, &audit, n, message_size, audit_timeout_ms, seed = std::move(seed), launched = std::move(launched)]() mutable {
+					launched.set_value();
+					return s.AuditOrderedDelivery(n, seed.data(), message_size, audit_timeout_ms, true, &audit.cancelled);
+				});
+			ready.get();
+		}
 		
 		auto init_end = std::chrono::high_resolution_clock::now();
 		double init_seconds = std::chrono::duration<double>(init_end - init_start).count();
@@ -1824,7 +1880,7 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 			p.Publish(message, message_size); // Copies payload before the next index is written.
 		}
 
-		// Finalize publishing (Poll() seals, sets shutdown, joins threads, waits for ACKs)
+		// Poll seals the producer, waits for authoritative ACKs, then joins senders.
 		if (!p.Poll(n, false)) {
 			LOG(ERROR) << "End-to-end test failed: not all messages acknowledged (ACK timeout or shortfall). See logs above for per-broker details.";
 			delete[] message;
@@ -1840,11 +1896,10 @@ std::pair<double, double> E2EThroughputTest(const cxxopts::ParseResult& result, 
 		// Wait for all messages to be received by subscriber
 		LOG(INFO) << "Publishing complete, waiting for subscriber to receive all data...";
 		
-		// All order levels now use efficient passive polling
-		// Sequencer 5 logical reconstruction happens in receiver threads
-		VLOG(3) << "Using passive polling for order level " << order;
         if (audited_ordered_delivery) {
-            if (!s.AuditOrderedDelivery(n, message, message_size, 20000, true)) {
+            const bool audit_passed = streaming_audit ? audit.result.get() :
+                s.AuditOrderedDelivery(n, message, message_size, audit_timeout_ms, true);
+            if (!audit_passed || !s.ValidateOrderedDeliveryCompletion(n)) {
                 LOG(ERROR) << "End-to-end ordered delivery audit failed";
                 delete[] message;
                 return {0.0, 0.0};
@@ -2056,11 +2111,15 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 				if (delivery_thread.joinable()) {
 					delivery_thread.join();
 				}
+				// The drain may finish before Poll. Check again after both have
+				// completed so a late parser/retention failure cannot pass reporting.
+				RecordTerminalDeliveryStatus(s, delivery_result);
 				end = std::chrono::high_resolution_clock::now();
 				LOG(INFO) << "Delivery drain complete: delivered=" << delivery_result.delivered
 				          << "/" << delivery_result.target
 				          << " samples=" << delivery_result.samples.size()
 				          << " timeout=" << delivery_result.timed_out
+				          << " terminal_delivery_error=" << delivery_result.terminal_delivery_error
 				          << " order_pass=" << delivery_result.ordering_ok();
 			} else {
 				LOG(INFO) << "Publishing complete, waiting for subscriber to receive all data...";
@@ -2111,18 +2170,12 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 					const char* e = std::getenv("EMBARCADERO_LATENCY_ACK_PRIMARY");
 					return e != nullptr && e[0] != '\0' && e[0] != '0';
 				}();
-				const bool soft_timeout =
-					ack_primary &&
-					delivery_result.timed_out &&
-					!delivery_result.hard_ordering_fault();
 				// Always write stage latency CSV before any exit.
 				CheckStageLatencyMonotonicity(ack_level);
-				// soft_timeout: timed-out drain with no hard fault.
-				// soft_uid_dup: dup_uid-only fault (not a real ordering violation:
-				//   arises from hold-buffer burst release or multi-thread uid collision).
-				const bool soft_uid_dup = ack_primary && !delivery_result.hard_ordering_fault()
-				    && delivery_result.duplicate_uid > 0;
-				if (soft_timeout || soft_uid_dup) {
+				// Preserve legacy soft timeout/UID-only reporting, while terminal
+				// consumer failures always remain hard failures.
+				if (delivery_result.MayUseAckPrimary(ack_primary,
+				        delivery_result.hard_ordering_fault(), delivery_result.duplicate_uid > 0)) {
 					LOG(WARNING) << "ACK-primary: soft fault (timed_out=" << delivery_result.timed_out
 					             << " dup_uid=" << delivery_result.duplicate_uid
 					             << "); continuing with pub ACK metrics.";
@@ -2134,7 +2187,8 @@ std::pair<double, double> LatencyTest(const cxxopts::ParseResult& result, char t
 					           << " out_of_order_total_order=" << delivery_result.out_of_order_total_order
 					           << " dup_uid=" << delivery_result.duplicate_uid
 					           << " missing_uid=" << delivery_result.missing_uid
-					           << " timed_out=" << delivery_result.timed_out;
+					           << " timed_out=" << delivery_result.timed_out
+					           << " terminal_delivery_error=" << delivery_result.terminal_delivery_error;
 					exit(1);
 				}
 			}

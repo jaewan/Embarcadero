@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -21,6 +22,21 @@
 namespace {
 
 constexpr size_t kMinStreamReserveGrowth = 1UL << 20;
+
+// Network framing has byte alignment, unlike shared-memory message headers.
+// memcpy of fixed scalar widths compiles to unaligned-safe loads/stores without
+// copying payloads or constructing an over-aligned object in received storage.
+template <typename T>
+T ReadWireField(const void* bytes, size_t offset = 0) {
+	T value;
+	std::memcpy(&value, static_cast<const uint8_t*>(bytes) + offset, sizeof(value));
+	return value;
+}
+
+template <typename T>
+void WriteWireField(void* bytes, size_t offset, T value) {
+	std::memcpy(static_cast<uint8_t*>(bytes) + offset, &value, sizeof(value));
+}
 
 size_t ResolveConfiguredBrokerCount() {
 	constexpr size_t kMinBrokers = 1;
@@ -77,7 +93,27 @@ void ReserveForAppend(std::vector<uint8_t>& buffer, size_t bytes_to_append) {
 
 }  // namespace
 
-Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency, int order_level)
+OrderedRetentionLimits OrderedRetentionLimits::FromEnvironment() {
+	OrderedRetentionLimits limits;
+	auto read = [](const char* name, size_t fallback, size_t minimum) {
+		const char* value = std::getenv(name);
+		if (!value) return fallback;
+		const std::string text(value);
+		if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
+			throw std::invalid_argument(std::string(name) + " must be a positive integer");
+		size_t consumed = 0;
+		const auto parsed = std::stoull(text, &consumed);
+		if (consumed != text.size() || parsed < minimum || parsed > std::numeric_limits<size_t>::max())
+			throw std::invalid_argument(std::string(name) + " is outside the supported range");
+		return static_cast<size_t>(parsed);
+	};
+	limits.retained_bytes = read("EMBARCADERO_SUBSCRIBER_RETAINED_BYTES", limits.retained_bytes, 32UL << 20);
+	limits.max_messages = read("EMBARCADERO_SUBSCRIBER_MAX_MESSAGES", limits.max_messages, 1024);
+	return limits;
+}
+
+Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC_NAME_SIZE], bool measure_latency, int order_level,
+                       OrderedRetentionLimits retention_limits)
 	: head_addr_(head_addr),
 	port_(port),
 	shutdown_(false),
@@ -88,8 +124,13 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 	order_level_(order_level),
 	// 16MB per-buffer size (32MB total per connection with dual buffers)
 	buffer_size_per_buffer_((16UL << 20)),
-	client_id_(GenerateRandomNum())
+	client_id_(GenerateRandomNum()),
+	retention_budget_(std::make_shared<RetentionBudget>(retention_limits.retained_bytes)),
+	max_retained_messages_(retention_limits.max_messages)
 {
+	if (retention_limits.retained_bytes == 0 || retention_limits.max_messages == 0 ||
+	    retention_limits.max_messages > std::numeric_limits<size_t>::max() / sizeof(OwnedMessagePtr))
+		throw std::invalid_argument("Ordered retention limits must be positive and representable");
 	memcpy(topic_, topic, TOPIC_NAME_SIZE);
 	if (measure_latency_ && sub_connections_per_broker_ == 1 && NUM_SUB_CONNECTIONS > 1) {
 		LOG(INFO) << "Latency mode: reducing subscriber connections per broker from "
@@ -112,6 +153,9 @@ Subscriber::Subscriber(std::string head_addr, std::string port, char topic[TOPIC
 	data_broker_count_.store(configured_broker_count_, std::memory_order_release);
 	LOG(INFO) << "Subscriber: configured broker count=" << configured_broker_count_
 	          << " sub_connections_per_broker=" << sub_connections_per_broker_;
+	LOG(INFO) << "[ORDERED_RETENTION_LIMITS] bytes=" << retention_budget_->limit
+	          << " descriptors=" << max_retained_messages_
+	          << " reorder_slots=" << max_retained_messages_ << " policy=fail_closed";
 
 	// Start cluster probe thread (will call ManageBrokerConnections)
 	cluster_probe_thread_ = std::thread([this]() { this->SubscribeToClusterStatus(); });
@@ -192,12 +236,61 @@ void Subscriber::RemoveConnection(int fd) {
 	}
 }
 
-void Subscriber::OwnedMessageRecycler::operator()(OwnedMessage* msg) const {
+void Subscriber::OwnedMessageRecycler::operator()(OwnedMessage* msg) const noexcept {
 	if (owner != nullptr) {
 		owner->RecycleOwnedMessage(msg);
 		return;
 	}
 	delete msg;
+}
+
+bool Subscriber::RetentionBudget::Reserve(size_t bytes) {
+	size_t current = used.load(std::memory_order_relaxed);
+	do {
+		if (bytes > limit || current > limit - bytes) return false;
+	} while (!used.compare_exchange_weak(current, current + bytes,
+	                                    std::memory_order_relaxed));
+	size_t previous_peak = peak.load(std::memory_order_relaxed);
+	while (previous_peak < current + bytes &&
+	       !peak.compare_exchange_weak(previous_peak, current + bytes, std::memory_order_relaxed)) {}
+	return true;
+}
+
+Subscriber::RetainedChunk::~RetainedChunk() {
+	// Release the allocation before making its capacity available to another receiver.
+	storage.reset();
+	if (budget) budget->used.fetch_sub(capacity, std::memory_order_relaxed);
+}
+
+void Subscriber::FailOrderedRetention(const char* resource) {
+	if (!retention_exhausted_.exchange(true, std::memory_order_acq_rel)) {
+		LOG(ERROR) << "[ORDERED_RETENTION_EXHAUSTED] resource=" << resource
+		           << " byte_limit=" << retention_budget_->limit
+		           << " bytes=" << retention_budget_->used.load(std::memory_order_relaxed)
+		           << " descriptor_limit=" << max_retained_messages_;
+	}
+	consume_cv_.SignalAll();
+}
+
+std::shared_ptr<Subscriber::RetainedChunk> Subscriber::AllocateRetainedChunk(
+		size_t capacity, const uint8_t* bytes) {
+	if (retention_exhausted_.load(std::memory_order_acquire)) return {};
+	try {
+		auto chunk = std::make_shared<RetainedChunk>();
+		if (!retention_budget_->Reserve(capacity)) {
+			FailOrderedRetention("bytes");
+			return {};
+		}
+		chunk->budget = retention_budget_;
+		chunk->capacity = capacity;
+		// No value-initialization: every exposed byte is copied before parsing.
+		chunk->storage.reset(new uint8_t[capacity]);
+		if (bytes) std::memcpy(chunk->data(), bytes, capacity);
+		return chunk;
+	} catch (const std::bad_alloc&) {
+		FailOrderedRetention("allocation");
+		return {};
+	}
 }
 
 Subscriber::OwnedMessagePtr Subscriber::AcquireOwnedMessage() {
@@ -207,28 +300,46 @@ Subscriber::OwnedMessagePtr Subscriber::AcquireOwnedMessage() {
 		if (!owned_message_pool_.empty()) {
 			storage = std::move(owned_message_pool_.back());
 			owned_message_pool_.pop_back();
+		} else if (allocated_owned_messages_ >= max_retained_messages_) {
+			FailOrderedRetention("descriptors");
+			return OwnedMessagePtr(nullptr, OwnedMessageRecycler{this});
+		} else {
+			++allocated_owned_messages_;
 		}
 	}
 	if (!storage) {
-		storage = std::make_unique<OwnedMessage>();
+		try { storage = std::make_unique<OwnedMessage>(); }
+		catch (const std::bad_alloc&) {
+			absl::MutexLock lock(&owned_message_pool_mutex_);
+			--allocated_owned_messages_;
+			FailOrderedRetention("descriptor_allocation");
+			return OwnedMessagePtr(nullptr, OwnedMessageRecycler{this});
+		}
 	}
 	storage->Reset();
 	return OwnedMessagePtr(storage.release(), OwnedMessageRecycler{this});
 }
 
-void Subscriber::RecycleOwnedMessage(OwnedMessage* msg) {
+void Subscriber::RecycleOwnedMessage(OwnedMessage* msg) noexcept {
 	if (msg == nullptr) {
 		return;
 	}
 	msg->Reset();
-	constexpr size_t kMaxPooledMessages = 262144;
 	std::unique_ptr<OwnedMessage> storage(msg);
 	{
 		absl::MutexLock lock(&owned_message_pool_mutex_);
-		if (owned_message_pool_.size() < kMaxPooledMessages) {
-			owned_message_pool_.push_back(std::move(storage));
-			return;
+		if (owned_message_pool_.size() < max_retained_messages_) {
+			try {
+				owned_message_pool_.push_back(std::move(storage));
+				return;
+			} catch (const std::bad_alloc&) {
+				// Recycling is a unique_ptr deleter: dropping reusable storage is
+				// safe, throwing during stack unwinding is not.
+			}
 		}
+		// Make the descriptor slot reusable only after its storage is freed.
+		storage.reset();
+		--allocated_owned_messages_;
 	}
 }
 
@@ -410,7 +521,8 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		if (parse_batch_metadata &&
 		    !conn->latency_has_batch_metadata &&
 		    remaining >= sizeof(Embarcadero::wire::BatchMetadata)) {
-			auto* metadata = reinterpret_cast<Embarcadero::wire::BatchMetadata*>(current_parse_ptr);
+			auto metadata_value = ReadWireField<Embarcadero::wire::BatchMetadata>(current_parse_ptr);
+			auto* metadata = &metadata_value;
 			const bool header_ok =
 				metadata->header_version == Embarcadero::wire::HEADER_VERSION_V1 ||
 				metadata->header_version == Embarcadero::wire::HEADER_VERSION_V2;
@@ -449,7 +561,8 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		bool incomplete_message = false;
 
 		auto try_parse_v2 = [&](bool allow_incomplete) {
-			auto* v2_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(current_parse_ptr);
+			auto v2_hdr_value = ReadWireField<Embarcadero::BlogMessageHeader>(current_parse_ptr);
+			auto* v2_hdr = &v2_hdr_value;
 			if (v2_hdr->size == 0 || v2_hdr->size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
 				return false;
 			}
@@ -465,7 +578,8 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 		};
 
 		auto try_parse_v1 = [&](bool allow_incomplete) {
-			auto* v1_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(current_parse_ptr);
+			auto v1_hdr_value = ReadWireField<Embarcadero::MessageHeader>(current_parse_ptr);
+			auto* v1_hdr = &v1_hdr_value;
 			const size_t padded_size = v1_hdr->paddedSize;
 			if (padded_size < Embarcadero::wire::V1_HEADER_SIZE ||
 			    padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
@@ -595,31 +709,64 @@ void ParseLatencySamplesLocked(ConnectionBuffers* conn,
 
 } // namespace
 
+bool Subscriber::OrderedDeliveryStatus::Complete(size_t expected) const {
+	return expected > 0 && parsed_messages == expected && delivered_messages == expected &&
+	       duplicates == 0 && parse_errors == 0 && export_gaps == 0 &&
+	       !retention_exhausted && !stopped;
+}
+
+Subscriber::OrderedDeliveryStatus Subscriber::GetOrderedDeliveryStatus() {
+	OrderedDeliveryStatus status;
+	{
+		absl::MutexLock lock(&consume_mutex_);
+		status.parsed_messages = ordered_received_messages_;
+		status.delivered_messages = next_expected_order_;
+		status.duplicates = ordered_duplicate_messages_;
+	}
+	status.parse_errors = ordered_parse_errors_.load(std::memory_order_acquire);
+	status.export_gaps = GetOrderedExportGapsReported();
+	status.retained_bytes = retention_budget_->used.load(std::memory_order_relaxed);
+	status.peak_retained_bytes = retention_budget_->peak.load(std::memory_order_relaxed);
+	status.retention_exhausted = retention_exhausted_.load(std::memory_order_acquire);
+	status.stopped = shutdown_.load(std::memory_order_acquire);
+	return status;
+}
+
+bool Subscriber::ValidateOrderedDeliveryCompletion(size_t expected_messages) {
+	const auto status = GetOrderedDeliveryStatus();
+	const bool valid = status.Complete(expected_messages);
+	LOG(INFO) << "[ORDERED_DELIVERY_FINAL] status=" << (valid ? "passed" : "failed")
+	          << " expected=" << expected_messages << " parsed=" << status.parsed_messages
+	          << " delivered=" << status.delivered_messages << " duplicates=" << status.duplicates
+	          << " parse_errors=" << status.parse_errors << " export_gaps=" << status.export_gaps
+	          << " retention_exhausted=" << status.retention_exhausted
+	          << " retained_bytes=" << status.retained_bytes
+	          << " peak_retained_bytes=" << status.peak_retained_bytes;
+	return valid;
+}
+
 bool Subscriber::AuditOrderedDelivery(size_t expected_messages, const void* expected_payload,
-                                      size_t payload_size, int timeout_ms, bool indexed_payload) {
+                                      size_t payload_size, int timeout_ms, bool indexed_payload,
+                                      const std::atomic<bool>* cancelled) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     size_t received = 0;
     size_t payload_bytes = 0;
     bool valid = expected_messages > 0 && expected_payload && payload_size > 0 &&
                  (!indexed_payload || payload_size >= sizeof(uint64_t));
     std::vector<OrderedMessageView> messages;
-    while (valid && received < expected_messages && std::chrono::steady_clock::now() < deadline) {
+    while (valid && received < expected_messages && std::chrono::steady_clock::now() < deadline &&
+           !shutdown_.load(std::memory_order_acquire) &&
+           !retention_exhausted_.load(std::memory_order_acquire) &&
+           ordered_parse_errors_.load(std::memory_order_acquire) == 0 &&
+           GetOrderedExportGapsReported() == 0 &&
+           !(cancelled && cancelled->load(std::memory_order_acquire))) {
         ConsumeOrderedBatch(&messages, std::min(size_t{256}, expected_messages - received), 20);
         for (const auto& message : messages) {
-            uint64_t order = 0;
-            const uint8_t* payload = nullptr;
-            if (message.wire_header_version == Embarcadero::wire::HEADER_VERSION_V2) {
-                const auto* h = static_cast<const Embarcadero::BlogMessageHeader*>(message.data);
-                valid = h->size == payload_size;
-                order = h->total_order;
-                payload = reinterpret_cast<const uint8_t*>(h) + sizeof(*h);
-            } else {
-                const auto* h = static_cast<const Embarcadero::MessageHeader*>(message.data);
-                valid = h->size == payload_size && h->paddedSize >= sizeof(*h) &&
-                        payload_size <= h->paddedSize - sizeof(*h);
-                order = h->total_order;
-                payload = reinterpret_cast<const uint8_t*>(h) + sizeof(*h);
-            }
+            const uint64_t order = message.TotalOrder();
+            const auto* payload = static_cast<const uint8_t*>(message.Payload());
+            const size_t padded_size = message.PaddedSize();
+            valid = message.PayloadSize() == payload_size && padded_size >= message.HeaderSize() &&
+                    payload_size <= padded_size - message.HeaderSize();
             const size_t tag_bytes = indexed_payload ? sizeof(uint64_t) : 0;
             uint64_t sequence = received;
             if (valid && indexed_payload) std::memcpy(&sequence, payload, sizeof(sequence));
@@ -634,19 +781,15 @@ bool Subscriber::AuditOrderedDelivery(size_t expected_messages, const void* expe
             payload_bytes += payload_size;
         }
     }
-    size_t parsed, duplicates;
-    { absl::MutexLock lock(&consume_mutex_);
-      parsed = ordered_received_messages_;
-      duplicates = ordered_duplicate_messages_; }
-    const auto errors = ordered_parse_errors_.load(std::memory_order_relaxed);
-    const auto gaps = GetOrderedExportGapsReported();
-    valid = valid && received == expected_messages && parsed == expected_messages &&
-            duplicates == 0 && errors == 0 && gaps == 0;
+    const auto status = GetOrderedDeliveryStatus();
+    valid = valid && received == expected_messages && status.Complete(expected_messages) &&
+            !(cancelled && cancelled->load(std::memory_order_acquire));
     LOG(INFO) << "[ORDERED_DELIVERY_AUDIT] status=" << (valid ? "passed" : "failed")
               << " messages=" << received << " expected=" << expected_messages
-              << " payload_bytes=" << payload_bytes << " duplicates=" << duplicates
-              << " parse_errors=" << errors << " export_gaps=" << gaps
-              << " indexed_payload=" << (indexed_payload ? 1 : 0);
+              << " payload_bytes=" << payload_bytes << " duplicates=" << status.duplicates
+              << " parse_errors=" << status.parse_errors << " export_gaps=" << status.export_gaps
+              << " indexed_payload=" << (indexed_payload ? 1 : 0)
+              << " retention_exhausted=" << status.retention_exhausted;
     return valid;
 }
 
@@ -691,8 +834,8 @@ bool Subscriber::DEBUG_check_order(int order) {
 					// Check for BatchMetadata (16 bytes) before message headers
 					if (!has_batch_metadata && 
 					    remaining_in_buffer >= sizeof(Embarcadero::wire::BatchMetadata)) {
-						Embarcadero::wire::BatchMetadata* metadata = 
-							reinterpret_cast<Embarcadero::wire::BatchMetadata*>(current_parse_ptr);
+						auto metadata_value = ReadWireField<Embarcadero::wire::BatchMetadata>(current_parse_ptr);
+			auto* metadata = &metadata_value;
 						
 					if (Embarcadero::wire::IsValidHeaderVersion(metadata->header_version) &&
 					    metadata->num_messages > 0 && 
@@ -721,8 +864,8 @@ bool Subscriber::DEBUG_check_order(int order) {
 
 					if (current_header_version == 2) {
 						// [[BLOG_HEADER: Parse V2 BlogMessageHeader]]
-						Embarcadero::BlogMessageHeader* v2_hdr = 
-							reinterpret_cast<Embarcadero::BlogMessageHeader*>(current_parse_ptr);
+						auto v2_hdr_value = ReadWireField<Embarcadero::BlogMessageHeader>(current_parse_ptr);
+			auto* v2_hdr = &v2_hdr_value;
 						
 						// Validate payload size
 						if (Embarcadero::wire::ValidateV2Payload(v2_hdr->size, remaining_in_buffer)) {
@@ -752,8 +895,8 @@ bool Subscriber::DEBUG_check_order(int order) {
 						}
 					} else {
 						// [[LEGACY: Parse V1 MessageHeader]]
-						Embarcadero::MessageHeader* v1_hdr = 
-							reinterpret_cast<Embarcadero::MessageHeader*>(current_parse_ptr);
+						auto v1_hdr_value = ReadWireField<Embarcadero::MessageHeader>(current_parse_ptr);
+			auto* v1_hdr = &v1_hdr_value;
 						
 					// Validate paddedSize
 					if (Embarcadero::wire::ValidateV1PaddedSize(v1_hdr->paddedSize, remaining_in_buffer)) {
@@ -2224,8 +2367,8 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::sha
 		if (!batch_state.has_pending_metadata &&
 		    current_pos + sizeof(Embarcadero::wire::BatchMetadata) <= data_size) {
 
-			Embarcadero::wire::BatchMetadata* potential_metadata =
-				reinterpret_cast<Embarcadero::wire::BatchMetadata*>(data + current_pos);
+			auto potential_metadata_value = ReadWireField<Embarcadero::wire::BatchMetadata>(data + current_pos);
+			auto* potential_metadata = &potential_metadata_value;
 
 			// [[O5-1 PR-2]] NOTE: unlike the latency parser (see the flags mask ~line 425), the
 			// ordered path does not validate `flags` here — the metadata boundary is disambiguated by
@@ -2270,8 +2413,8 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::sha
 			                    batch_state.pending_metadata.header_version == 2);
 
 			if (is_v2_header) {
-				Embarcadero::BlogMessageHeader* v2_hdr =
-					reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg_ptr);
+				auto v2_hdr_value = ReadWireField<Embarcadero::BlogMessageHeader>(msg_ptr);
+			auto* v2_hdr = &v2_hdr_value;
 				size_t payload_size = v2_hdr->size;
 				size_t total_msg_size = Embarcadero::wire::ComputeStrideV2(payload_size);
 
@@ -2279,6 +2422,7 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::sha
 					if (batch_state.has_pending_metadata) {
 						if (v2_hdr->total_order == 0) {
 							v2_hdr->total_order = batch_state.next_message_order_in_batch++;
+							WriteWireField<uint64_t>(msg_ptr, offsetof(Embarcadero::BlogMessageHeader, total_order), v2_hdr->total_order);
 							batch_state.current_batch_messages_processed++;
 						} else {
 							batch_state.current_batch_messages_processed++;
@@ -2293,13 +2437,14 @@ void Subscriber::ProcessSequencer5Data(uint8_t* data, size_t data_size, std::sha
 					current_pos += 64;
 				}
 			} else {
-				Embarcadero::MessageHeader* v1_hdr =
-					reinterpret_cast<Embarcadero::MessageHeader*>(msg_ptr);
+				auto v1_hdr_value = ReadWireField<Embarcadero::MessageHeader>(msg_ptr);
+			auto* v1_hdr = &v1_hdr_value;
 
 				if (Embarcadero::wire::ValidateV1PaddedSize(v1_hdr->paddedSize, data_size - current_pos)) {
 					if (batch_state.has_pending_metadata) {
 						if (v1_hdr->total_order == 0) {
 							v1_hdr->total_order = batch_state.next_message_order_in_batch++;
+							WriteWireField<size_t>(msg_ptr, offsetof(Embarcadero::MessageHeader, total_order), v1_hdr->total_order);
 							batch_state.current_batch_messages_processed++;
 						} else if (batch_state.current_batch_messages_processed <
 						           batch_state.pending_metadata.num_messages) {
@@ -2407,8 +2552,8 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                             break;  // Not enough data for metadata
                         }
                         
-                        Embarcadero::wire::BatchMetadata* metadata = reinterpret_cast<Embarcadero::wire::BatchMetadata*>(
-                            static_cast<uint8_t*>(buffer_start) + parse_offset);
+                        auto metadata_value = ReadWireField<Embarcadero::wire::BatchMetadata>(static_cast<uint8_t*>(buffer_start) + parse_offset);
+			auto* metadata = &metadata_value;
                         
                         // Validate batch metadata
                         if (metadata->header_version >= 1 && metadata->header_version <= 2 &&
@@ -2452,9 +2597,8 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                             break;  // Incomplete message header
                         }
                         
-                        Embarcadero::BlogMessageHeader* v2_hdr = 
-                            reinterpret_cast<Embarcadero::BlogMessageHeader*>(
-                                static_cast<uint8_t*>(buffer_start) + parse_offset);
+                        auto v2_hdr_value = ReadWireField<Embarcadero::BlogMessageHeader>(static_cast<uint8_t*>(buffer_start) + parse_offset);
+			auto* v2_hdr = &v2_hdr_value;
                         
                         // Validate payload size is within bounds
                         const size_t remaining_bytes = write_offset - parse_offset;
@@ -2478,9 +2622,8 @@ void* Subscriber::ConsumeBatchAware(int timeout_ms) {
                             break;  // Incomplete message header
                         }
                         
-                        Embarcadero::MessageHeader* v1_hdr = 
-                            reinterpret_cast<Embarcadero::MessageHeader*>(
-                                static_cast<uint8_t*>(buffer_start) + parse_offset);
+                        auto v1_hdr_value = ReadWireField<Embarcadero::MessageHeader>(static_cast<uint8_t*>(buffer_start) + parse_offset);
+			auto* v1_hdr = &v1_hdr_value;
                         
                         // Validate v1 paddedSize
                         const size_t remaining_bytes = write_offset - parse_offset;
@@ -2629,8 +2772,8 @@ void* Subscriber::Consume(int timeout_ms) {
                 
                 // Parse message header directly
                 
-                Embarcadero::MessageHeader* header = 
-                    reinterpret_cast<Embarcadero::MessageHeader*>(buffer_data + current_pos);
+                auto header_value = ReadWireField<Embarcadero::MessageHeader>(buffer_data + current_pos);
+			auto* header = &header_value;
                 
                 // Validate message header
                 const size_t remaining_bytes = buffer_write_offset - current_pos;
@@ -2669,7 +2812,7 @@ void* Subscriber::Consume(int timeout_ms) {
                 
                 if (should_consume && message_to_return == nullptr) {
                     // Mark this message to return (but continue processing the buffer)
-                    message_to_return = static_cast<void*>(header);
+                    message_to_return = buffer_data + current_pos;
                     VLOG(4) << "Consume: Will return message with total_order=" << header->total_order
                             << ", paddedSize=" << header->paddedSize << ", fd=" << fd;
                 }
@@ -2703,24 +2846,49 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
                                            ConnectionBuffers* latency_conn,
                                            const std::chrono::steady_clock::time_point& recv_time,
                                            long long recv_buffer_age_us,
-                                           size_t recv_chunk_bytes) {
-	if (data == nullptr || len == 0) {
+                                           size_t recv_chunk_bytes) try {
+	if (data == nullptr || len == 0 || retention_exhausted_.load(std::memory_order_acquire)) {
 		return;
 	}
 	const bool record_latency = (latency_conn != nullptr);
 	// One retained copy per recv chunk replaces the hot per-message copies.
-	auto retained_input = std::make_shared<std::vector<uint8_t>>(data, data + len);
+	auto retained_input = AllocateRetainedChunk(len, data);
+	if (!retained_input) return;
 
-	constexpr size_t kMaxStreamBufferBytes = 64UL << 20; // 64 MB safety cap
+	constexpr size_t kMaxStreamBufferBytes = 2UL << 20; // Covers the largest supported frame.
 	auto reset_stream_state = [&]() {
-		state.buffer.clear();
+		state.carry_size = 0;
+				state.carry.reset();
 		state.has_pending_metadata = false;
 		state.current_batch_messages_processed = 0;
 		state.next_message_order_in_batch = 0;
 	};
 
+	// Charge both old and replacement capacity while growing, rather than only
+	// logical carry bytes. Cleared carry storage is released immediately.
+	auto append_carry = [&](const uint8_t* bytes, size_t count) {
+		if (retention_exhausted_.load(std::memory_order_acquire)) return false;
+		if (count > kMaxStreamBufferBytes - state.carry_size) {
+			FailOrderedRetention("carry_frame");
+			return false;
+		}
+		const size_t required = state.carry_size + count;
+		if (!state.carry || required > state.carry->capacity) {
+			const size_t previous = state.carry ? state.carry->capacity : 0;
+			const size_t capacity = std::min(kMaxStreamBufferBytes,
+				std::max(required, std::max(size_t{4096}, previous * 2)));
+			auto replacement = AllocateRetainedChunk(capacity);
+			if (!replacement) return false;
+			if (state.carry_size) std::memcpy(replacement->data(), state.carry->data(), state.carry_size);
+			state.carry = std::move(replacement);
+		}
+		std::memcpy(state.carry->data() + state.carry_size, bytes, count);
+		state.carry_size = required;
+		return true;
+	};
+
 	std::vector<std::pair<size_t, OwnedMessagePtr>> parsed_messages;
-	parsed_messages.reserve(std::min<size_t>((len / 1024) + 1, 4096));
+	parsed_messages.reserve(std::min({(len / 1024) + 1, size_t{4096}, max_retained_messages_}));
 	std::vector<LatencySample> latency_samples;
 	if (record_latency) {
 		latency_samples.reserve(parsed_messages.capacity());
@@ -2733,16 +2901,16 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 	std::vector<size_t> gap_batch_starts;
 
 	auto parse_contiguous = [&](const uint8_t* bytes, size_t size,
-	                            const std::shared_ptr<std::vector<uint8_t>>& retained_chunk,
+	                            const std::shared_ptr<RetainedChunk>& retained_chunk,
 	                            size_t retained_base_offset) -> size_t {
 		size_t pos = 0;
-		while (pos < size) {
+		while (pos < size && !retention_exhausted_.load(std::memory_order_relaxed)) {
 			if (!state.has_pending_metadata) {
 				if (size - pos < sizeof(Embarcadero::wire::BatchMetadata)) {
 					break;
 				}
-				const auto* meta = reinterpret_cast<const Embarcadero::wire::BatchMetadata*>(
-					bytes + pos);
+				const auto metadata = ReadWireField<Embarcadero::wire::BatchMetadata>(bytes + pos);
+				const auto* meta = &metadata;
 				if (Embarcadero::wire::IsValidHeaderVersion(meta->header_version) &&
 				    meta->num_messages > 0 &&
 				    meta->num_messages <= Embarcadero::wire::MAX_BATCH_MESSAGES &&
@@ -2770,9 +2938,8 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 				if (size - pos < sizeof(Embarcadero::BlogMessageHeader)) {
 					break;
 				}
-				const auto* hdr = reinterpret_cast<const Embarcadero::BlogMessageHeader*>(
-					bytes + pos);
-				const size_t payload_size = hdr->size;
+				const size_t payload_size = ReadWireField<uint32_t>(
+					bytes + pos, offsetof(Embarcadero::BlogMessageHeader, size));
 				if (payload_size == 0 ||
 				    payload_size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
                     ordered_parse_errors_.fetch_add(1, std::memory_order_relaxed);
@@ -2785,19 +2952,21 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 				}
 
 				auto msg = AcquireOwnedMessage();
+			if (!msg) return pos;
 				msg->header_version = header_version;
 				if (retained_chunk) {
 					msg->retained_chunk = retained_chunk;
 					msg->retained_offset = retained_base_offset + pos;
 				} else {
-					msg->data.resize(stride);
-					std::memcpy(msg->data.data(), bytes + pos, stride);
+					msg->retained_chunk = AllocateRetainedChunk(stride, bytes + pos);
+					if (!msg->retained_chunk) return pos;
 				}
-				auto* msg_hdr = reinterpret_cast<Embarcadero::BlogMessageHeader*>(msg->bytes());
-				if (msg_hdr->total_order == 0) {
-					msg_hdr->total_order = state.next_message_order_in_batch;
+				uint64_t total_order = ReadWireField<uint64_t>(
+					msg->bytes(), offsetof(Embarcadero::BlogMessageHeader, total_order));
+				if (total_order == 0) {
+					total_order = state.next_message_order_in_batch;
+					WriteWireField(msg->bytes(), offsetof(Embarcadero::BlogMessageHeader, total_order), total_order);
 				}
-				const size_t total_order = msg_hdr->total_order;
 				const size_t batch_message_index = state.current_batch_messages_processed;
 				if (record_latency) {
 					latency_parsed_messages++;
@@ -2832,9 +3001,8 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 			if (size - pos < sizeof(Embarcadero::MessageHeader)) {
 				break;
 			}
-			const auto* hdr = reinterpret_cast<const Embarcadero::MessageHeader*>(
-				bytes + pos);
-			const size_t padded_size = hdr->paddedSize;
+			const size_t padded_size = ReadWireField<size_t>(
+				bytes + pos, offsetof(Embarcadero::MessageHeader, paddedSize));
 			const bool invalid_v1_header =
 				padded_size < Embarcadero::wire::V1_HEADER_SIZE ||
 				padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
@@ -2849,19 +3017,21 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 			}
 
 			auto msg = AcquireOwnedMessage();
+			if (!msg) return pos;
 			msg->header_version = header_version;
 			if (retained_chunk) {
 				msg->retained_chunk = retained_chunk;
 				msg->retained_offset = retained_base_offset + pos;
 			} else {
-				msg->data.resize(padded_size);
-				std::memcpy(msg->data.data(), bytes + pos, padded_size);
+				msg->retained_chunk = AllocateRetainedChunk(padded_size, bytes + pos);
+				if (!msg->retained_chunk) return pos;
 			}
-			auto* msg_hdr = reinterpret_cast<Embarcadero::MessageHeader*>(msg->bytes());
-			if (msg_hdr->total_order == 0) {
-				msg_hdr->total_order = state.next_message_order_in_batch;
+			size_t total_order = ReadWireField<size_t>(
+				msg->bytes(), offsetof(Embarcadero::MessageHeader, total_order));
+			if (total_order == 0) {
+				total_order = state.next_message_order_in_batch;
+				WriteWireField(msg->bytes(), offsetof(Embarcadero::MessageHeader, total_order), total_order);
 			}
-			const size_t total_order = msg_hdr->total_order;
 			const size_t batch_message_index = state.current_batch_messages_processed;
 			if (record_latency) {
 				latency_parsed_messages++;
@@ -2895,7 +3065,7 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 	};
 
 	auto carry_bytes_needed = [&]() -> size_t {
-		const size_t carry_size = state.buffer.size();
+		const size_t carry_size = state.carry_size;
 		if (!state.has_pending_metadata) {
 			return carry_size < sizeof(Embarcadero::wire::BatchMetadata)
 				? sizeof(Embarcadero::wire::BatchMetadata) - carry_size
@@ -2906,9 +3076,8 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 			if (carry_size < sizeof(Embarcadero::BlogMessageHeader)) {
 				return sizeof(Embarcadero::BlogMessageHeader) - carry_size;
 			}
-			const auto* hdr = reinterpret_cast<const Embarcadero::BlogMessageHeader*>(
-				state.buffer.data());
-			const size_t payload_size = hdr->size;
+			const size_t payload_size = ReadWireField<uint32_t>(
+				state.carry->data(), offsetof(Embarcadero::BlogMessageHeader, size));
 			if (payload_size == 0 ||
 			    payload_size > Embarcadero::wire::MAX_MESSAGE_PAYLOAD_SIZE) {
 				return 0;
@@ -2919,9 +3088,8 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 		if (carry_size < sizeof(Embarcadero::MessageHeader)) {
 			return sizeof(Embarcadero::MessageHeader) - carry_size;
 		}
-		const auto* hdr = reinterpret_cast<const Embarcadero::MessageHeader*>(
-			state.buffer.data());
-		const size_t padded_size = hdr->paddedSize;
+		const size_t padded_size = ReadWireField<size_t>(
+			state.carry->data(), offsetof(Embarcadero::MessageHeader, paddedSize));
 		const bool invalid_v1_header =
 			padded_size < Embarcadero::wire::V1_HEADER_SIZE ||
 			padded_size > Embarcadero::wire::MaxV1PaddedSize() ||
@@ -2929,21 +3097,21 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 		if (invalid_v1_header) {
 			return 0;
 		}
-		return state.buffer.size() < padded_size ? padded_size - state.buffer.size() : 0;
+		return state.carry_size < padded_size ? padded_size - state.carry_size : 0;
 	};
 
-	if (!state.buffer.empty()) {
+	if (state.carry_size != 0) {
 		size_t input_pos = 0;
-		while (!state.buffer.empty() && input_pos < len) {
-			const size_t consumed = parse_contiguous(state.buffer.data(), state.buffer.size(), nullptr, 0);
-			if (consumed >= state.buffer.size()) {
-				state.buffer.clear();
+		while (state.carry_size != 0 && input_pos < len) {
+			const size_t consumed = parse_contiguous(state.carry->data(), state.carry_size, nullptr, 0);
+			if (consumed >= state.carry_size) {
+				state.carry_size = 0;
+				state.carry.reset();
 				break;
 			}
 			if (consumed > 0) {
-				state.buffer.erase(
-					state.buffer.begin(),
-					state.buffer.begin() + static_cast<std::vector<uint8_t>::difference_type>(consumed));
+				std::memmove(state.carry->data(), state.carry->data() + consumed, state.carry_size - consumed);
+				state.carry_size -= consumed;
 				continue;
 			}
 			size_t needed = carry_bytes_needed();
@@ -2951,32 +3119,31 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 				needed = std::min<size_t>(8, len - input_pos);
 			}
 			const size_t take = std::min(needed, len - input_pos);
-			ReserveForAppend(state.buffer, take);
-			state.buffer.insert(state.buffer.end(), data + input_pos, data + input_pos + take);
+			if (!append_carry(data + input_pos, take)) return;
 			input_pos += take;
-			if (state.buffer.size() > kMaxStreamBufferBytes) {
+			if (state.carry_size > kMaxStreamBufferBytes) {
 				LOG(WARNING) << "ConsumeOrdered: stream carry buffer exceeded cap, dropping "
-				             << state.buffer.size() << " bytes";
+				             << state.carry_size << " bytes";
                 ordered_parse_errors_.fetch_add(1, std::memory_order_relaxed);
 				reset_stream_state();
 				return;
 			}
 		}
-		if (!state.buffer.empty() && input_pos == len) {
-			const size_t consumed = parse_contiguous(state.buffer.data(), state.buffer.size(), nullptr, 0);
-			if (consumed >= state.buffer.size()) {
-				state.buffer.clear();
+		if (state.carry_size != 0 && input_pos == len) {
+			const size_t consumed = parse_contiguous(state.carry->data(), state.carry_size, nullptr, 0);
+			if (consumed >= state.carry_size) {
+				state.carry_size = 0;
+				state.carry.reset();
 			} else if (consumed > 0) {
-				state.buffer.erase(
-					state.buffer.begin(),
-					state.buffer.begin() + static_cast<std::vector<uint8_t>::difference_type>(consumed));
+				std::memmove(state.carry->data(), state.carry->data() + consumed, state.carry_size - consumed);
+				state.carry_size -= consumed;
 			}
 		}
-		if (state.buffer.empty() && input_pos < len) {
+		if ((state.carry_size == 0) && input_pos < len) {
 			const size_t consumed = parse_contiguous(retained_input->data() + input_pos, len - input_pos,
 			                                              retained_input, input_pos);
 			if (input_pos + consumed < len) {
-				state.buffer.assign(retained_input->data() + input_pos + consumed, retained_input->data() + len);
+				if (!append_carry(retained_input->data() + input_pos + consumed, len - input_pos - consumed)) return;
 			}
 		}
 	} else {
@@ -2990,10 +3157,11 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 				reset_stream_state();
 				return;
 			}
-			state.buffer.assign(retained_input->data() + consumed, retained_input->data() + len);
+			if (!append_carry(retained_input->data() + consumed, len - consumed)) return;
 		}
 	}
 
+	if (retention_exhausted_.load(std::memory_order_acquire)) return;
 	if (!parsed_messages.empty() || !gap_batch_starts.empty()) {
 		StageOrderedMessages(std::move(parsed_messages), std::move(gap_batch_starts));
 	}
@@ -3022,6 +3190,8 @@ void Subscriber::ParseAndStageOrderedBytes(StreamParseState& state,
 				static_cast<size_t>(latency_parsed_messages), std::memory_order_relaxed);
 		}
 	}
+} catch (const std::bad_alloc&) {
+	FailOrderedRetention("parser_allocation");
 }
 
 void Subscriber::StageOrderedMessages(
@@ -3034,6 +3204,7 @@ void Subscriber::StageOrderedMessages(
 	bool ready_to_consume = false;
 	{
 		absl::MutexLock lock(&consume_mutex_);
+        if (retention_exhausted_.load(std::memory_order_acquire)) return;
         ordered_received_messages_ += messages.size();
 
 		// [[EXPORT_GAP_REANCHOR]] The broker's export cursor for this connection lapped
@@ -3094,7 +3265,11 @@ void Subscriber::StageOrderedMessages(
 			if (total_order < pending_messages_base_order_) {
 				continue;
 			}
-			const size_t index = total_order - pending_messages_base_order_;
+		const size_t index = total_order - pending_messages_base_order_;
+			if (index >= max_retained_messages_) {
+				FailOrderedRetention("reorder_slots");
+				return;
+			}
 			if (index >= pending_messages_.size()) {
 				pending_messages_.resize(index + 1);
 			}
@@ -3251,7 +3426,9 @@ void* Subscriber::ConsumeOrdered(int timeout_ms) {
 		last_returned_.reset();
 	}
 
-	while (std::chrono::steady_clock::now() - start_time < timeout) {
+	while (std::chrono::steady_clock::now() - start_time < timeout &&
+	       !shutdown_.load(std::memory_order_acquire) &&
+	       !retention_exhausted_.load(std::memory_order_acquire)) {
 		absl::MutexLock lock(&consume_mutex_);
 		if (void* ret = TryPopOrderedMessageLocked()) {
 			return ret;
@@ -3280,15 +3457,23 @@ size_t Subscriber::ConsumeOrderedBatch(
 
 	last_returned_.reset();
 	last_returned_batch_.clear();
+	max_messages = std::min(max_messages, max_retained_messages_);
 	last_returned_batch_.reserve(max_messages);
+	const auto deadline = start_time + timeout;
 
-	while (std::chrono::steady_clock::now() - start_time < timeout) {
+	while (std::chrono::steady_clock::now() - start_time < timeout &&
+	       !shutdown_.load(std::memory_order_acquire) &&
+	       !retention_exhausted_.load(std::memory_order_acquire)) {
 		{
 			absl::MutexLock lock(&consume_mutex_);
 			if (TryPopOrderedMessagesLocked(max_messages, &last_returned_batch_) > 0) {
 				break;
 			}
-			consume_cv_.WaitWithTimeout(&consume_mutex_, absl::Microseconds(wait_us));
+			const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				deadline - std::chrono::steady_clock::now()).count();
+			if (remaining <= 0) break;
+			consume_cv_.WaitWithTimeout(&consume_mutex_,
+				absl::Nanoseconds(std::min<int64_t>(remaining, wait_us * 1000)));
 			if (TryPopOrderedMessagesLocked(max_messages, &last_returned_batch_) > 0) {
 				break;
 			}

@@ -1,7 +1,10 @@
 # Remaining refactoring work: follow-up
 
-Status: implementation and qualification in progress. Prior source09 evidence is
-retained separately and does not qualify the new extracted binaries.
+Status: source 14 implementation and scoped validation are complete. The full
+original plan remains partially open: one-broker primary nonregression is
+unestablished, and broader experiment migration/measurement and hardware gates
+remain in the [closure audit](2026-09-22-plan-closure-audit.md). Prior source09
+evidence is retained separately and does not qualify the new extracted binaries.
 
 Implemented: broker ordering/commit/scanning/recovery/export and client session/
 retention/ACK compilation boundaries; owned experiment dispatch for 11 historical
@@ -10,8 +13,7 @@ ChainReplicationManager disk-failure fixtures; per-process TSan workaround;
 private GitHub vulnerability reporting enabled; paper implementation pointer
 claim corrected to distinguish the common-address prototype from offset-only design.
 
-Validation and final measurements will be recorded here after source freeze.
-The [fixed measurement protocol](2026-09-22-followup-performance-protocol.md)
+Validation below identifies each frozen source and executed binary. The [fixed measurement protocol](2026-09-22-followup-performance-protocol.md)
 precedes the follow-up performance results.
 
 ## Implemented and checked
@@ -43,6 +45,59 @@ Private GitHub vulnerability reporting is enabled. A bounded pattern scan found
 no credential matches in 1779 tracked/unignored text paths; it excludes ignored
 content, build outputs, history and files larger than 2 MiB, and is not a security
 certification. Apache-2.0 and bounded non-recycling retention remain selected.
+
+## Final source 14 and a routing configuration regression
+
+The final source 14 Release build passed **53/53 CTest targets in 28.78s**.
+This includes actual differently sized `CXLManager` allocator instances in one
+process, the production Topic publication fixture and the new owned workload
+runner tests. The manager fixture uses a test-only constructor and small owned
+anonymous mappings; it exercises the unchanged production allocator and
+destructor, not full backend attachment or free/reuse behavior.
+
+Seven linked TSan fixtures passed. The Topic/manager and publisher fixture
+project objects were rebuilt consistently from source 14, using the recorded
+instrumented dependency build. Four unchanged linked fixtures were rerun from
+the retained source 11 TSan build. All 12 current publisher tests also passed
+ASan/UBSan with leak detection using freshly compiled source 14 project objects
+and consistently instrumented dependencies. The three earlier smaller TSan
+fixtures remain separately recorded. These results do not constitute a fully
+instrumented live-cluster qualification.
+
+Live source-13 tooling exposed a routing configuration gap: a publisher whose
+allowlist was only brokers 1–2 sent its workload but received no authoritative
+ORDER5 ACK progress and exited on timeout. The simultaneous broker-0 publisher
+completed. The failed run, original verdict and normal cleanup are retained at
+`owned-workloads/publishers/embarcadero-dev-1002-bd25yxtp/`. ORDER5 ACK1/ACK2 and
+fence notifications originate at the head, while this client's ACK connections
+follow its publishing connections. No separate ACK-only head connection exists.
+
+Source 14 therefore rejects follower-only acknowledged ORDER5 allowlists early
+in `Publisher::Init`. It also conservatively rejects implicit nonzero home-broker
+selection without an explicit head-containing list, since that policy can omit
+the head. Default all-broker routing and explicit lists containing broker 0 remain
+supported. ACK0 and unrelated modes are unchanged. Neither client nor runner
+silently changes the requested destinations. Linked tests exercise real Init
+rejection and unchanged Publisher-owned worker/pool state. The constructor's
+preexisting lazy gRPC channel is outside that Init-specific guarantee.
+
+The runner now reports failed/missing Git provenance as unavailable instead of
+calling an extracted archive a clean revision. Source archives and build evidence
+establish the association separately. It also checks each broker after readiness
+and each client after exec through `/proc/PID/exe`, retaining the observed path
+and digest or failing the run. Earlier source-13 manifests are preserved with
+their original inaccurate runner-Git label; their external native source/binary
+attestation is recorded in the independent audit.
+
+The source 14 archive SHA-256 is
+`811fd23dd548c2b310576c514d7b5642263c201c2ae493d9be9d951cb14383ec`.
+Its only native changes from source 13 are the publisher startup-routing
+predicate, Init check and declaration. The final broker's executable and
+relocation sections match measured source 11 exactly, including addresses and
+sizes. Its other differences are debug/build metadata and 32 source-path bytes
+in `.rodata`. This is not whole-file identity. Performance remains attributed
+to the executed source-11 broker/common-client binaries; the source-14 client
+has not been benchmarked.
 
 ## Frozen live fault campaign
 
@@ -125,3 +180,42 @@ sequencing causally; no stage CPU/counter measurement covers the exact ACK
 window. The trigger was investigated, its cause remains unresolved, and the
 one-broker classification remains inconclusive. The supporting per-run values
 are in `n1-retained-phase-diagnostics.json`.
+
+## Final owned profiles, minimal build and artifact boundaries
+
+Source 14's fresh minimal-client build passed the check for absence of baseline
+generated sources, headers and RPC symbols. The full Release test inventory,
+compile commands, package/dependency provenance and binary digests accompany
+both final builds. The earlier clean Ubuntu-rootfs validation remains historical;
+53 current CTests on this host are not relabeled as a newly executed clean-rootfs
+or hosted-CI campaign.
+
+All four final owned runs passed, with an independent 310-check audit:
+
+- Latency: all 8192 delivery samples, UID population and global-position checks;
+  finite telemetry, not a full-payload or per-session FIFO proof.
+- Sender gap: 8192 indexed messages delivered exactly, no retries/fences, both
+  delay markers present (logged 2 ms for the requested 1 ms); no overtaking claim.
+- Two publishers across three brokers: distinct sessions completed 4096 and
+  8192 messages. Destinations were `0` and `0,1,2`; the latter sent
+  3024/2648/2520 messages respectively. Both obeyed the same GO timestamp, with
+  a recorded start spread of 16960 ns. This is an ACK/routing check, not a
+  combined subscriber payload audit or performance comparison.
+- Ordinary automatic-mapping smoke: 8192 indexed messages passed with the head's
+  selected base `0x600000000000`.
+
+All 11 running executable identities (six broker processes and five clients)
+matched the final source-14 binaries. Git-unavailable labels were accurate;
+all children exited zero, no forced termination occurred, and all owned regions
+and PIDs were absent afterward. Results are under `owned-workloads/source14/`
+and `independent-source14-workload-audit.json`. The original failed follower-only
+run remains separately retained and is never counted as a successful profile.
+
+Independent source/fixture review passed 48 checks, including consistent fault
+definitions across all 30 linked Topic-fixture translation units and absence
+of the test constructor/fault symbols from the production broker. See
+`independent-source14-fixture-audit.json` and
+`independent-source-13-to-14-audit.json`. Reproduction commands and all failure,
+build, test and sanitizer logs are retained under the same campaign directory.
+The campaign started September 22 and final software validation finished
+September 23; keeping one artifact directory does not change execution dates.

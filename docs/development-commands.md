@@ -39,12 +39,14 @@ workload. These aliases select the owned profile, not the historical experiment
 suggested by a shell script's name; a latency launcher with `--dev-dram` runs the
 same audited smoke.
 
-The `latency` and `gap` profiles passed their bounded live acceptance runs;
-the asymmetric publisher attempt failed and is retained in the
-[independent workload audit](../results/refactor-followup/2026-09-22/independent-owned-workload-audit.json).
-Publisher acceptance remains pending with a supported destination set. These
-profiles reuse the smoke runner's broker startup, lock, 64 GiB region, NUMA
-placement and owned cleanup.
+All three profiles passed bounded live acceptance on source 14, including
+publishers with the supported `0;0,1,2` destination sets. The
+[final independent audit](../results/refactor-followup/2026-09-22/independent-source14-workload-audit.json)
+checks actual executable identities, completion and owned cleanup. The earlier
+follower-only publisher failure remains in the
+[original audit](../results/refactor-followup/2026-09-22/independent-owned-workload-audit.json).
+These profiles reuse the smoke runner's broker startup, lock, 64 GiB region,
+NUMA placement and owned cleanup.
 Each uses ORDER5/ACK1/RF0, 4 KiB messages and 1–32 MiB per process, with at most
 four processes and 128 MiB total. The whole client phase is bounded at 60 seconds;
 node 0 must have 3 GiB free per process. Log output is capped at 64 MiB, including
