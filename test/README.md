@@ -1,126 +1,38 @@
-# Embarcadero Test Suite
+# Embarcadero tests
 
-## Current Status
+The supported CTest suite contains production component tests, protocol/property fixtures, baseline tests, and Python tooling tests. Optional live tests use an owned local DRAM cluster. See [build instructions](../docs/development-build.md) for dependencies and [supported commands](../docs/development-commands.md) for orchestration.
 
-- ✅ **E2E Tests:** Implemented in `e2e/` - Run actual broker clusters
-- 🟡 **Unit Tests:** Archived in `archive/` - Disabled, need update for current architecture
-- ❌ **Integration Tests:** Not yet implemented
-- ❌ **Property Tests:** Not yet implemented (Paper Spec guarantees)
+```sh
+cmake --preset debug
+cmake --build --preset debug --parallel 8
+ctest --preset debug
 
-## Quick Start
-
-```bash
-# Build the project
-cd build
-cmake ..
-make -j$(nproc)
-
-# Run E2E tests
-cd ../test/e2e
-./run_all.sh
-
-# Publication-style end-to-end cells
-cd ../..
-bash scripts/run_multiclient.sh
+# Inspect first, then run a bounded audited cluster.
+python3 tools/dev_cluster.py --build-dir build/debug --brokers 3 --dry-run
+python3 tools/dev_cluster.py --build-dir build/debug --brokers 3 --automatic-mapping
 ```
 
-## Test Organization
+Run these commands from the repository root. Ordinary CTest does not start a 64 GiB broker cluster or run historical cleanup scripts. Target paths refer to the configured build tree; test dependencies and the expected inventory are checked during configuration.
 
-```
-test/
-├── e2e/                    # End-to-end tests (working)
-│   ├── run_all.sh
-│   └── README.md
-├── archive/                # Archived unit tests (disabled)
-│   ├── embarlet/
-│   │   ├── buffer_manager_test.cc
-│   │   ├── callback_manager_test.cc
-│   │   └── message_ordering_test.cc
-│   ├── cxl_manager.cc
-│   └── publish_test.cc
-└── CMakeLists.txt
+## Production fault campaign
+
+Use a separate [fault-enabled build](../docs/development-dram.md), then run:
+
+```sh
+python3 test/integration/run_production_faults.py --build-dir build/debug-faults --case all
 ```
 
-## Why Unit Tests Are Archived
+All 20 cases include fragmented/malformed ingress, blocked shutdown, fence/commit ordering, authoritative ACK publication, real-client suffix recovery, session/GOI/BLog exhaustion, retained payload across rollover, and a missing replication token. Native drivers use production protocol declarations and read-only region observers; client cases execute the real publisher. A successful helper/model test does not replace a live case. The [fault specification](../docs/reviews/2026-09-22-production-fault-plan.md) states each schedule and its limits.
 
-The unit tests were written for an older architecture (v0 with TInode) and are currently broken:
-- Interfaces changed (BufferManager, SegmentManager APIs)
-- Data structures changed (TInode → Bmeta/Blog migration in progress)
-- Mocks don't match current implementation
+The runner explicitly selects `--emul` for every broker, creates a unique region, binds brokers/memory to NUMA node 1 and clients/memory to node 0, checks executable provenance, and records owned cleanup. Node 2 and SSH clients are unnecessary. The supported live profile requires **64 GiB**, because the GOI alone reserves 32 GiB; do not shrink the whole mapping to 4–32 GiB. `cxl.size` is authoritative, not deprecated `cxl.emulation_size`. Small-capacity unit fixtures do not allocate the production region.
 
-They're **archived, not deleted** because:
-- Show good testing patterns (gtest, gmock, concurrency tests)
-- Can be updated when architecture stabilizes
-- Reference for future unit test development
+## Organization and evidence
 
-## Test Coverage
+- Top-level `*_test.cc`: linked production components and narrowly scoped protocol/property fixtures, registered by `CMakeLists.txt`.
+- `integration/`: optional native production fault drivers and owned Python runners.
+- `../tools/test_*.py`: orchestration, cleanup, provenance, and performance-analysis regressions.
+- `e2e/`: historical research scripts and hardware-specific scenarios. They are excluded from ordinary CTest by default; their older launch/cleanup assumptions do not define the supported local workflow.
 
-### What's Tested (E2E)
-- ✅ Scenario-specific broker/client correctness tests listed in `e2e/run_all.sh`
-- ✅ Publication-style broker/client runs through `scripts/run_multiclient.sh`
+Add regressions beside the affected production component and register generated executable paths. Prefer a deterministic reached/release barrier to sleeps for concurrency faults. Keep live clusters serialized, bound resources and deadlines, and retain failed artifacts. Never use global process killing or unlink an unowned region in a new test.
 
-### What's NOT Tested (High Priority Gaps)
-- ❌ FIFO ordering enforcement (Property 3d)
-- ❌ f+1 durability (Property 4a)
-- ❌ Broker failure recovery
-- ❌ Sequencer failover
-- ❌ Cache coherence primitives
-- ❌ CXL memory allocation correctness
-- ❌ Network partition handling
-
-## Adding New Tests
-
-### E2E Test (Recommended)
-1. Copy a current scenario script from `e2e/` as a template; do not use the
-   retired `test_basic_publish.sh`, which is intentionally excluded from CTest.
-2. Modify test scenario
-3. Add to `e2e/run_all.sh`
-4. Add to `CMakeLists.txt`
-
-### Unit Test (When Architecture Stabilizes)
-1. Create `<component>_test.cc` using gtest
-2. Add to `CMakeLists.txt`
-3. Run: `cd build && make && ctest`
-
-## Future Test Roadmap
-
-### Phase 1: E2E Coverage (Current)
-- [x] Basic publish flow
-- [ ] Ordering guarantees
-- [ ] Durability guarantees
-- [ ] Failure scenarios
-
-### Phase 2: Unit Test Revival
-- [ ] Update BufferManager tests
-- [ ] Add CXLManager tests
-- [ ] Add HeartBeatManager tests
-- [ ] Add Topic tests
-
-### Phase 3: Property-Based Tests
-- [ ] Verify Property 3d (Strong Total Ordering)
-- [ ] Verify Property 4a (Full Durability)
-- [ ] Verify cache coherence laws
-
-### Phase 4: CI Integration
-- [ ] GitHub Actions workflow
-- [ ] Automated test runs on PR
-- [ ] Code coverage reporting
-
-## Test Configuration
-
-For faster tests, use smaller CXL sizes in `config/embarcadero.yaml`:
-
-```yaml
-cxl:
-  size: 4294967296             # 4GB (fast) vs 68719476736 (64GB, slow)
-  emulation_size: 4294967296
-```
-
-4GB CXL maps in ~4 seconds vs 66 seconds for 64GB.
-
-## Resources
-
-- Test output: `build/test_output/<test_name>/`
-- E2E test guide: `e2e/README.md`
-- Test assessment: `../TEST_ASSESSMENT.md`
-- Paper spec: `../docs/memory-bank/paper_spec.md`
+ASan/UBSan and TSan have separate build presets. A configured sanitizer or CI workflow is not evidence of an executed successful run. DRAM tests do not establish CXL cache visibility, media durability, safe reclamation, sequencer replacement, or independent-host failure tolerance. See the [support matrix](../docs/support-matrix.md) and [completion ledger](../docs/reviews/2026-09-22-refactoring-completion-plan.md) for the recorded qualification scope.

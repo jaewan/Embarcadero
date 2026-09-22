@@ -4796,11 +4796,11 @@ void Topic::EpochDriverThread() {
 		const auto kFinalSequencerBudget =
 			(replication_factor_ > 0) ? std::chrono::seconds(12) : std::chrono::milliseconds(1800);
 		const int kMaxTrailingEpochs = (replication_factor_ > 0) ? 64 : 3;
-		uint64_t target_seq = final_epoch + 1;
+		uint64_t last_sealed_epoch = final_epoch;
 		auto collect_deadline = std::chrono::steady_clock::now() + kFinalCollectionBudget;
 
 		for (int step = 0; step < kMaxTrailingEpochs; ++step) {
-			uint64_t next_epoch = target_seq;
+			uint64_t next_epoch = last_sealed_epoch + 1;
 			EpochBuffer5& next_buf = epoch_buffers_[next_epoch % 3];
 			auto buf_avail_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
 			while (!next_buf.is_available() &&
@@ -4844,27 +4844,33 @@ void Topic::EpochDriverThread() {
 			}
 
 			size_t buffered_batches = 0;
-			for (const auto& q : next_buf.per_broker) buffered_batches += q.batches.size();
+            for (auto& q : next_buf.per_broker) {
+                std::lock_guard<std::mutex> lock(q.mu);
+                buffered_batches += q.batches.size();
+            }
 			const size_t held_batches = GetTotalHoldBufferSize();
 			LOG(INFO) << "EpochDriverThread: Sealed trailing epoch " << next_epoch
 			          << " (buffered_batches=" << buffered_batches
 			          << ", held_batches=" << held_batches
 			          << ", saw_activity=" << (saw_activity ? "yes" : "no") << ")";
-			target_seq = next_epoch + 1;
+			last_sealed_epoch = next_epoch;
 
 			if (!saw_activity && buffered_batches == 0 && held_batches == 0) {
 				break;
 			}
 		}
 
-		// Wait for sequencer to process final and trailing epochs; bounded for fast shutdown.
+		// last_sequenced_epoch_ is the next buffer to extract, not an inclusive
+        // commit frontier. Wait past the last successful seal; the sequencer
+        // thread is separately joined before Topic teardown completes.
 		auto deadline = std::chrono::steady_clock::now() + kFinalSequencerBudget;
-		while (last_sequenced_epoch_.load(std::memory_order_acquire) < target_seq &&
+		while (last_sequenced_epoch_.load(std::memory_order_acquire) <= last_sealed_epoch &&
 		       std::chrono::steady_clock::now() < deadline) {
 			std::this_thread::sleep_for(std::chrono::microseconds(100));
 		}
 		LOG(INFO) << "EpochDriverThread: Final epochs sealed, last_sequenced="
-		          << last_sequenced_epoch_.load(std::memory_order_acquire);
+		          << last_sequenced_epoch_.load(std::memory_order_acquire)
+                  << " last_sealed=" << last_sealed_epoch;
 	} else {
 		LOG(WARNING) << "EpochDriverThread: Failed to seal final epoch " << final_epoch;
 	}
@@ -6170,35 +6176,41 @@ void Topic::EpochSequencerThread() {
 	while (std::chrono::steady_clock::now() < drain_deadline) {
 		uint64_t last = last_sequenced_epoch_.load(std::memory_order_acquire);
 		uint64_t current = epoch_index_.load(std::memory_order_acquire);
-		if (last >= current) {
+        // Shutdown can seal the current epoch without opening a successor.
+        // Consume that SEALED buffer before waiting for driver_done, otherwise
+        // driver and sequencer wait on each other until the shutdown budget.
+        if (!epoch_buffers_[current % 3].CanDrainAt(last, current)) {
 			// [PANEL FIX] Only exit if EpochDriverThread has finished sealing everything.
 			// Otherwise, wait for it to seal the final late-arriving epoch.
 			if (epoch_driver_done_.load(std::memory_order_acquire)) {
 				EpochBuffer5& cur_buf = epoch_buffers_[current % 3];
-				if (cur_buf.state.load(std::memory_order_acquire) == EpochBuffer5::State::COLLECTING &&
-				    cur_buf.seal()) {
-					const uint64_t next_epoch = current + 1;
-					EpochBuffer5& next_buf = epoch_buffers_[next_epoch % 3];
-					EpochBuffer5::State next_state = next_buf.state.load(std::memory_order_acquire);
-					if (next_state == EpochBuffer5::State::IDLE) {
-						next_buf.reset_and_start();
-						next_state = next_buf.state.load(std::memory_order_acquire);
-					}
-					if (next_state == EpochBuffer5::State::COLLECTING ||
-					    next_state == EpochBuffer5::State::SEALED) {
-						uint64_t expected = current;
-						epoch_index_.compare_exchange_strong(
-							expected, next_epoch, std::memory_order_release, std::memory_order_acquire);
-					}
-					if (ShouldEnableOrder5Trace() && order_ == 5) {
-						LOG(INFO) << "[ORDER5_TRACE_DRAIN_SEAL]"
-						          << " sealed_epoch=" << current
-						          << " next_epoch=" << next_epoch
-						          << " scanners_shutdown_pending="
-						          << (!HaveAllScannerDrainsCompleted() ? 1 : 0);
-					}
-					continue;
-				}
+                // Consuming a sealed current epoch leaves it IDLE. Keep a
+                // collection destination available until scanner drain ends.
+                if (last == current + 1 && cur_buf.is_available() &&
+                    !HaveAllScannerDrainsCompleted()) {
+                    EpochBuffer5& next_buf = epoch_buffers_[last % 3];
+                    if (next_buf.reset_and_start()) {
+                        next_buf.epoch_collection_start_ns.store(SteadyNowNs(), std::memory_order_relaxed);
+                        epoch_index_.store(last, std::memory_order_release);
+                    }
+                    continue;
+                }
+                if (cur_buf.state.load(std::memory_order_acquire) == EpochBuffer5::State::COLLECTING) {
+                    if (!cur_buf.seal()) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        continue;
+                    }
+                    // CanDrainAt consumes the sealed current directly. Do not
+                    // create an empty successor here: the IDLE branch opens one
+                    // only while scanners still need a collection destination.
+                    if (ShouldEnableOrder5Trace() && order_ == 5) {
+                        LOG(INFO) << "[ORDER5_TRACE_DRAIN_SEAL]"
+                                  << " sealed_epoch=" << current
+                                  << " scanners_shutdown_pending="
+                                  << (!HaveAllScannerDrainsCompleted() ? 1 : 0);
+                    }
+                    continue;
+                }
 				if (!HaveAllScannerDrainsCompleted()) {
 					std::this_thread::sleep_for(std::chrono::microseconds(100));
 					continue;
@@ -6298,6 +6310,10 @@ void Topic::EpochSequencerThread() {
 		size_t buffer_idx = last % 3;
 		std::vector<PendingBatch5> batch_list;
 		EpochBuffer5& buf = epoch_buffers_[buffer_idx];
+        // seal() may still be waiting or rolling SEALED back to COLLECTING.
+        // Serialize shutdown extraction with that decision so rollback cannot
+        // resurrect a buffer after its records have been moved and it is IDLE.
+        std::unique_lock<std::mutex> sealed_ownership(buf.seal_mutex);
 		if (buf.state.load(std::memory_order_acquire) != EpochBuffer5::State::SEALED) {
 			std::this_thread::sleep_for(std::chrono::microseconds(100));
 			continue;
@@ -6340,6 +6356,7 @@ void Topic::EpochSequencerThread() {
 		buf.state.store(EpochBuffer5::State::IDLE, std::memory_order_release);
 		last_sequenced_epoch_.store(last + 1, std::memory_order_release);
 		current_epoch_for_hold_.store(last + 1, std::memory_order_release);
+        sealed_ownership.unlock();
 
 		ControlBlock* control_block = reinterpret_cast<ControlBlock*>(cxl_addr_);
 		CXL::flush_cacheline(control_block);

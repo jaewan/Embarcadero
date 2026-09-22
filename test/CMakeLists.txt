@@ -786,3 +786,10 @@ add_executable(test_memory_replica_sink memory_replica_sink_test.cc)
 target_include_directories(test_memory_replica_sink PRIVATE ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME unit_memory_replica_sink COMMAND test_memory_replica_sink)
 set_tests_properties(unit_memory_replica_sink PROPERTIES TIMEOUT 10 LABELS "unit;replication;correctness")
+
+add_executable(test_epoch_shutdown epoch_shutdown_test.cc)
+target_include_directories(test_epoch_shutdown PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_BINARY_DIR})
+target_link_libraries(test_epoch_shutdown PRIVATE heartbeat_grpc_proto corfu_replication_grpc_proto
+    scalog_replication_grpc_proto lazylog_metadata_grpc_proto glog::glog Threads::Threads)
+add_test(NAME unit_epoch_shutdown COMMAND test_epoch_shutdown)
+set_tests_properties(unit_epoch_shutdown PROPERTIES TIMEOUT 10 LABELS "unit;epoch;shutdown;correctness")

@@ -259,6 +259,14 @@ struct alignas(64) EpochBuffer5 {
 		return true;
 	}
 
+    // During shutdown the current collection epoch may already be sealed,
+    // without any successor yet advertised through epoch_index_.
+    bool CanDrainAt(uint64_t next_to_extract, uint64_t current_epoch) const {
+        return next_to_extract < current_epoch ||
+            (next_to_extract == current_epoch &&
+             state.load(std::memory_order_acquire) == State::SEALED);
+    }
+
 	bool is_available() const {
 		State s = state.load(std::memory_order_acquire);
 		return s == State::IDLE;

@@ -1,5 +1,7 @@
 # End-to-End Tests
 
+> Historical research scripts: use the [supported local commands](../../docs/development-commands.md) for owned DRAM development and the [test guide](../README.md) for current validation. These scripts are excluded from ordinary CTest by default and may retain machine-specific launch and cleanup assumptions.
+
 These tests validate the complete Embarcadero system by running actual brokers and clients.
 
 ## Test Structure
