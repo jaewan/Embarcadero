@@ -30,11 +30,11 @@ development guides for executable commands and implementation limits.
 | `agent-prompts/` | Archived AI-agent task prompts kept for provenance (KV store, Scalog/Embarcadero, Order-5 handoffs). |
 | `memory-bank/` | Working technical context and active-work notes. |
 | `perf/` | Performance analysis notes. |
-| `context/` | Generated codebase map (`codebase_map.xml`) — regenerate after structural changes. |
+| `context/` | Historical generated codebase snapshot (`codebase_map.xml`); it is not an inventory of the refactored working tree. |
 
 ## Paper and historical design
 
 - **Architecture:** [`design/EMBARCADERO_DEFINITIVE_DESIGN.md`](design/EMBARCADERO_DEFINITIVE_DESIGN.md)
 - **CXL memory layout:** [`design/CXL_MEMORY_LAYOUT_v2.md`](design/CXL_MEMORY_LAYOUT_v2.md)
 - **Configuration:** [`operations/configuration.md`](operations/configuration.md)
-- **Paper:** [current text](../Paper/Text/) and [previous SOSP draft](../Paper/SOSP_Text/) (LaTeX sources; managed separately).
+- **Paper:** [current text](../Paper/Text/) and [SOSP reviewer material](../Paper/SOSP_Text/) (LaTeX sources; managed separately).

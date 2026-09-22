@@ -565,6 +565,9 @@ if(PkgConfig_FOUND)
             ../src/client/buffer.cc
             ../src/client/queue_buffer.cc
             ../src/client/publisher.cc
+            ../src/client/publisher_session.cc
+            ../src/client/publisher_retention.cc
+            ../src/client/publisher_ack.cc
             ../src/client/subscriber.cc
             ../src/client/result_writer.cc
             ../src/common/configuration.cc
@@ -611,6 +614,9 @@ if(PkgConfig_FOUND)
             ../src/client/buffer.cc
             ../src/client/queue_buffer.cc
             ../src/client/publisher.cc
+            ../src/client/publisher_session.cc
+            ../src/client/publisher_retention.cc
+            ../src/client/publisher_ack.cc
             ../src/client/subscriber.cc
             ../src/client/result_writer.cc
             ../src/common/configuration.cc
@@ -793,3 +799,44 @@ target_link_libraries(test_epoch_shutdown PRIVATE heartbeat_grpc_proto corfu_rep
     scalog_replication_grpc_proto lazylog_metadata_grpc_proto glog::glog Threads::Threads)
 add_test(NAME unit_epoch_shutdown COMMAND test_epoch_shutdown)
 set_tests_properties(unit_epoch_shutdown PROPERTIES TIMEOUT 10 LABELS "unit;epoch;shutdown;correctness")
+
+add_test(NAME unit_experiment_dispatch
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_experiment.py)
+set_tests_properties(unit_experiment_dispatch PROPERTIES
+    TIMEOUT 30 LABELS "unit;runner;dispatch;correctness")
+add_test(NAME unit_fault_packet_parser
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/test_fault_control.py)
+set_tests_properties(unit_fault_packet_parser PROPERTIES TIMEOUT 10 LABELS "unit;fault-control;correctness")
+
+# Bounded fixture linked to the real broker implementation, with no broker main.
+# Keep dependency/source inventory identical to the broker as components evolve.
+if(TARGET embarlet)
+    find_package(cxxopts REQUIRED)
+    get_target_property(_broker_fixture_sources embarlet SOURCES)
+    list(REMOVE_ITEM _broker_fixture_sources embarlet/embarlet.cc)
+    list(TRANSFORM _broker_fixture_sources PREPEND "${PROJECT_SOURCE_DIR}/src/")
+    get_target_property(_broker_fixture_links embarlet LINK_LIBRARIES)
+    add_executable(topic_publication_test topic_publication_test.cc ${_broker_fixture_sources})
+    target_include_directories(topic_publication_test PRIVATE
+        ${PROJECT_SOURCE_DIR}/src ${PROJECT_BINARY_DIR} ${PROJECT_BINARY_DIR}/src)
+    target_link_libraries(topic_publication_test PRIVATE ${_broker_fixture_links})
+    if(NOT EMBARCADERO_ENABLE_FAULT_INJECTION)
+        target_sources(topic_publication_test PRIVATE ${PROJECT_SOURCE_DIR}/src/common/fault_injection.cc)
+        target_compile_definitions(topic_publication_test PRIVATE EMBARCADERO_ENABLE_FAULT_INJECTION=1)
+    endif()
+    add_test(NAME unit_topic_publication COMMAND topic_publication_test)
+    set_tests_properties(unit_topic_publication PROPERTIES TIMEOUT 30 LABELS "unit;session;publication;fault-control;correctness")
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(chain_disk_fault_test chain_disk_fault_test.cc
+        ${PROJECT_SOURCE_DIR}/src/disk_manager/chain_replication.cc)
+    target_include_directories(chain_disk_fault_test PRIVATE
+        ${PROJECT_SOURCE_DIR}/src ${PROJECT_BINARY_DIR} ${GTEST_INCLUDE_DIRS})
+    target_link_libraries(chain_disk_fault_test PRIVATE
+        ${GTEST_LIBRARIES} ${GTEST_MAIN_LIB} glog::glog heartbeat_grpc_proto Threads::Threads)
+    target_link_options(chain_disk_fault_test PRIVATE
+        -Wl,--wrap=pwrite -Wl,--wrap=fdatasync -Wl,--wrap=close)
+    add_test(NAME unit_chain_disk_fault COMMAND chain_disk_fault_test)
+    set_tests_properties(unit_chain_disk_fault PROPERTIES TIMEOUT 30 LABELS "unit;replication;disk;fault;correctness")
+endif()

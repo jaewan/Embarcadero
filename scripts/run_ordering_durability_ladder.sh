@@ -1,4 +1,7 @@
 #!/bin/bash
+# Dispatch supported profiles before any historical locks, SSH, or cleanup.
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/experiment_dispatch.sh" || exit 1
+if embarcadero_dispatch_supported "$@"; then shift; fi
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

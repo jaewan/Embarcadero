@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <gtest/gtest.h>
 
@@ -45,14 +46,17 @@ protected:
 
 TEST_F(ControlTest, FirstHookCannotOutrunArmingAndOnlyMatchingIdentityPauses) {
     uint64_t injected = 0;
+    std::atomic<long> native_tid{0};
     auto task = std::async(std::launch::async, [&] {
+        native_tid.store(syscall(SYS_gettid));
         return controller->Pause("commit.before", Context{7, 3, 9, 11, 12}, nullptr, &injected);
     });
     CancelOnExit cancel{*controller};
     EXPECT_EQ(task.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
     Send("ARM 1 commit.before 7 3 9 123"); ASSERT_EQ(Read(), "ARMED 1");
     Start();
-    ASSERT_EQ(Read(), "HIT 1 commit.before 7 3 9 11 12");
+    const auto hit = Read();
+    ASSERT_EQ(hit, "HIT 1 commit.before 7 3 9 11 12 " + std::to_string(native_tid.load()));
     EXPECT_EQ(task.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
     Send("RELEASE 1"); EXPECT_EQ(Read(), "RELEASED 1");
     EXPECT_TRUE(task.get()); EXPECT_EQ(injected, 123u);
@@ -61,9 +65,11 @@ TEST_F(ControlTest, FirstHookCannotOutrunArmingAndOnlyMatchingIdentityPauses) {
 TEST_F(ControlTest, NonmatchingCallDoesNotConsumeAnArm) {
     Send("ARM 1 point 7 3 9 0"); ASSERT_EQ(Read(), "ARMED 1"); Start();
     EXPECT_TRUE(controller->Pause("point", Context{8, 3, 9}));
-    auto task = std::async(std::launch::async, [&] { return controller->Pause("point", Context{7, 3, 9}); });
+    std::atomic<long> native_tid{0};
+    auto task = std::async(std::launch::async, [&] { native_tid.store(syscall(SYS_gettid)); return controller->Pause("point", Context{7, 3, 9}); });
     CancelOnExit cancel{*controller};
-    ASSERT_EQ(Read(), "HIT 1 point 7 3 9 0 0");
+    const auto hit = Read();
+    ASSERT_EQ(hit, "HIT 1 point 7 3 9 0 0 " + std::to_string(native_tid.load()));
     Send("RELEASE 1"); EXPECT_EQ(Read(), "RELEASED 1"); EXPECT_TRUE(task.get());
 }
 TEST_F(ControlTest, ShutdownCancelsPauseWithoutReleaseOrFalseSuccess) {

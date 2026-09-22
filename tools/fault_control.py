@@ -89,10 +89,12 @@ class FaultControl:
     def hit(self, identity, timeout=10):
         packet = self.wait(f"HIT {identity}", timeout)
         fields = packet.split()
-        if len(fields) != 8:
+        if len(fields) != 9:
             raise RuntimeError("malformed HIT event")
+        if int(fields[8]) <= 0:
+            raise RuntimeError("invalid HIT native thread identity")
         return {"id": int(fields[1]), "name": fields[2],
-                **dict(zip(("client", "epoch", "batch", "detail0", "detail1"),
+                **dict(zip(("client", "epoch", "batch", "detail0", "detail1", "tid"),
                            map(int, fields[3:])))}
 
     def release(self, identity):

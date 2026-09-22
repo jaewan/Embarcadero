@@ -46,8 +46,9 @@ working tree is dirty; a commit plus status listing cannot reconstruct edits.
 
 Before public release:
 
-- Obtain the owner's project license choice and inventory third-party licenses;
-  no project license is selected by these changes.
+- Preserve the project [Apache-2.0 license](../LICENSE), [attribution](../NOTICE),
+  and third-party license notices when packaging the release. The project
+  license was selected at the owner's direction, following Ray and vLLM.
 - Enable private vulnerability reporting and identify maintaining contacts.
 - Enumerate supported order/ACK/sink modes and reject unsupported combinations.
 - Pass clean bootstrap, supported tests, instrumented tests, and owned DRAM
@@ -84,3 +85,13 @@ all ten linked publisher rollover cases with leak detection and UBSan halt-on-er
 The CMake sanitizer configurations now enforce those two requirements, and CI
 includes this linked test. This is component qualification, not a fully
 instrumented live cluster or a hosted CI execution claim.
+
+## Focused ThreadSanitizer checks
+
+`bash tools/build_support/run_tsan_components.sh /tmp/embarcadero-tsan-components`
+compiles and runs the actual bounded-reservation, session-admission/publication,
+and single-topic admission concurrency tests under TSan. It uses `setarch -R`
+for each test process to avoid the GCC runtime's unexpected-mapping failure on
+high-ASLR kernels; it changes no host sysctl. Unsupported process personality
+or race reports fail the command. This is focused component coverage, not a
+full instrumented cluster or a model of noncoherent CXL cache visibility.

@@ -21,7 +21,21 @@ void RunIngress(const Options& options, RegionObserver& region) {
     region.CheckPrefix(2);
     Stage(options, "prefix_verified");
 
-    if (options.test_case == "truncated_control") {
+    if (options.test_case == "repeated_rejected_connections") {
+        Stage(options, "fd_baseline");
+        Continue(options);
+        for (int attempt = 0; attempt < 128; ++attempt) {
+            auto rejected = Connect(options.data_port);
+            // A complete native request with an empty topic is rejected before
+            // session admission or ACK-thread creation.
+            auto request = Handshake(kBadClient, 0);
+            std::memset(request.topic, 0, sizeof(request.topic));
+            Send(rejected.value, &request, sizeof(request));
+            ExpectClose(rejected.value);
+        }
+        Stage(options, "fd_completed");
+        Continue(options);
+    } else if (options.test_case == "truncated_control") {
         auto rejected = Connect(options.data_port);
         const auto request = Handshake(kBadClient, prefix.listener.port);
         Send(rejected.value, &request, sizeof(request));
@@ -65,10 +79,24 @@ void RunIngress(const Options& options, RegionObserver& region) {
 void RunShutdown(const Options& options, RegionObserver& region) {
     std::vector<Fd> sockets;
     std::unique_ptr<Listener> unavailable;
+    std::unique_ptr<PublisherSocket> publisher;
     if (options.test_case == "shutdown_partial_handshake") {
         sockets.push_back(Connect(options.data_port));
         const auto request = Handshake(kBadClient, 0);
         Send(sockets.back().value, &request, 8);
+    } else if (options.test_case == "shutdown_partial_control") {
+        CreateTopic(options);
+        sockets.push_back(Connect(options.data_port));
+        const auto request = Handshake(kBadClient, 0);
+        Send(sockets.back().value, &request, sizeof(request));
+        const uint32_t magic = network::kSessionControlMagic;
+        Send(sockets.back().value, &magic, 1);
+    } else if (options.test_case == "shutdown_partial_body") {
+        CreateTopic(options);
+        publisher = std::make_unique<PublisherSocket>(options, kPrefixClient);
+        Batch partial(kPrefixClient, 0, 0);
+        Send(publisher->ingress.value, &partial.header, sizeof(partial.header));
+        Send(publisher->ingress.value, partial.body.data(), 1);
     } else if (options.test_case == "shutdown_ack_connect") {
         CreateTopic(options);
         unavailable = std::make_unique<Listener>(false);  // Bound, owned, never listening.
@@ -84,6 +112,10 @@ void RunShutdown(const Options& options, RegionObserver& region) {
     region.CheckPrefix(0);
     Stage(options, "shutdown_sockets_open");
     for (auto& socket : sockets) ExpectClose(socket.value, After(20000));
+    if (publisher) {
+        ExpectClose(publisher->ingress.value, After(20000));
+        publisher->RejectExtraAck();
+    }
     region.CheckPrefix(0);
     std::cout << "[FAULT_RESULT] status=passed case=" << options.test_case
               << " messages=0 exact_prefix=1 false_ack=0 peers_closed=1" << std::endl;

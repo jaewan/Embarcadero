@@ -1,514 +1,94 @@
-# Scripts
+# Experiment launchers
 
-This directory contains the experiment launchers for throughput, latency, and related broker lifecycle workflows.
+Use one dispatcher for supported local development:
 
-## Directory layout
-
-| Path | Purpose |
-|------|---------|
-| `scripts/*.sh` | Top-level experiment launchers (throughput, latency, failures, multiclient). |
-| `scripts/setup/` | One-time cluster provisioning (deps, disks, CXL mount, cgroups, `sync_clocks.sh`). |
-| `scripts/lib/` | Reusable shell libraries sourced by launchers (`broker_lifecycle.sh`, `run_throughput_impl.sh`). |
-| `scripts/publication/` | Publication-grade experiment runners + result export/plotting. |
-| `PaperScripts/` | **Paper replication entry points** (forked overnight/E2 with honest TP defaults). Prefer this over editing `scripts/run_overnight_eval.sh` for paper runs. |
-| `scripts/plot/` | Plotting helpers for experimental data. |
-| `scripts/network/` | Cluster network/clock helpers (`run_clients.sh`, `run_servers.sh` iperf; `sync_clocks.sh`). |
-| `scripts/network-emulation/` | Standalone WAN/latency emulation harness. |
-
-> **Output convention:** generated data belongs in the git-ignored `results/` tree (see
-> `/results/README.md`). Some older scripts still write under `data/…`; migrate those to
-> `results/…` when you touch them.
->
-> **Note:** two `sync_clocks.sh` variants exist — `scripts/setup/` (chrony) and
-> `scripts/network/` (systemd-timesyncd, moved from the repo root). They target different
-> cluster configs; reconcile to one when convenient.
-
-## Quick Start
-
-Run any script as an environment-driven command:
-
-```bash
-VAR1=value VAR2=value scripts/singlenode_run_throughput.sh
+```sh
+python3 tools/experiment.py dev --build-dir build/debug --brokers 3 --dry-run
+python3 tools/experiment.py fault --build-dir build/debug-faults --case all
+python3 tools/experiment.py perf --help
 ```
 
-Most scripts read their options from environment variables instead of flags. That keeps them easy to compose in shell loops and CI jobs.
-
-## Common Options
-
-### Cluster / broker control
-
-- `NUM_BROKERS`: broker count to start or reuse.
-- `SEQUENCER`: `EMBARCADERO`, `CORFU`, or `SCALOG` depending on the script.
-- `BROKER_CONFIG`: broker config path, default `config/embarcadero.yaml`.
-- `CLIENT_CONFIG`: client config path, default `config/client.yaml`.
-- `FORCE_RESTART_BROKERS=1`: stop and relaunch brokers instead of reusing healthy ones.
-- `BROKER_READY_TIMEOUT_SEC`: remote/local startup timeout for broker readiness.
-- `BROKER_POLL_INTERVAL_SEC`: polling interval while waiting for broker readiness.
-
-### ACK levels (`ACK` / `ack_level`)
-
-The `ACK` variable controls what the publisher waits for before considering a message "sent":
-
-| Level | Semantics | What the broker does |
-|:---:|---|---|
-| `0` | **Fire and forget** — publisher does NOT wait for any broker confirmation. `Poll()` returns as soon as all publish threads have exited (data handed to kernel socket buffer). No guarantee the broker has received or written the data. | Broker sends no ACK; AckThread not started on publisher. |
-| `1` | **Written/ordered confirmation** — publisher waits until the broker confirms the message is written to shared memory (CXL). For ORDER=0 this means `tinode->offsets[broker_id].written` is advanced; for ORDER>0 it means `ordered` is advanced. | Broker's AckThread polls `GetOffsetToAck()` and sends cumulative count back to publisher via a TCP connection. |
-| `2` | **Replication confirmation** — publisher waits until all designated replica brokers have replicated the data. Requires `REPLICATION_FACTOR > 0`; with RF=0 this falls through to ack=1 semantics. | Same as ack=1 but broker waits for `replication_done` frontier across the full replication set. |
-
-**Use ack=1 for all meaningful throughput benchmarks.** Ack=0 only measures how fast the publisher fills the kernel socket buffer, not how fast the broker processes data. Ack=2 measures replication overhead on top of ack=1.
-
-### Remote mode
-
-Set these to run scripts from a client node while brokers live on a broker node:
-
-- `REMOTE_BROKER_HOST`: SSH alias or host name for the broker node. Set this to enable remote orchestration.
-- `REMOTE_PROJECT_ROOT`: repository path on the broker host.
-- `REMOTE_BUILD_BIN`: optional override for the broker host binary directory.
-- `EMBARCADERO_HEAD_ADDR`: broker-node IP or host name that clients should connect to.
-
-Remote mode reuses healthy brokers when possible. Use `FORCE_RESTART_BROKERS=1` when you want a clean cluster start.
-
-### Publication client layout
-
-The publication matrix uses a fixed mixed local+remote client expansion order:
-
-- `NUM_CLIENTS=1` -> `c4`
-- `NUM_CLIENTS=2` -> `c4,c3`
-- `NUM_CLIENTS=3` -> `c4,c3,moscxl(local)`
-
-The corresponding default host roster in the launcher continues with `c2` and `c1` for larger ad hoc runs, but publication results should treat the three-client mixed layout above as canonical.
-
-### Publication matrix contract
-
-For publication throughput reruns, keep the contract explicit:
-
-- `NUM_CLIENTS=1` -> `c4`
-- `NUM_CLIENTS=2` -> `c4,c3`
-- `NUM_CLIENTS=3` -> `c4,c3,moscxl(local)`
-- `REPLICATION_FACTOR=1` -> default `ACK_LEVEL=1`
-- `REPLICATION_FACTOR=2` -> default `ACK_LEVEL=2`
-
-The appendable matrix wrapper [run_throughput_matrix.sh](/home/domin/Embarcadero/scripts/publication/run_throughput_matrix.sh) now derives that default automatically unless `ACK_LEVEL` is set explicitly. If you want an RF=2 run with `ACK_LEVEL=1`, set `ACK_LEVEL=1` yourself; do not rely on the default.
-
-### Publication matrix runner
-
-Use [run_throughput_matrix.sh](/home/domin/Embarcadero/scripts/publication/run_throughput_matrix.sh) to reproduce the current publication throughput package.
-
-The wrapper now encodes the intended publication contracts:
-
-- `embarcadero0`: mixed local+remote client layout, `THREADS_PER_BROKER=4`, `RF=1`
-- `embarcadero5`: publication-safe remote-only layout, `THREADS_PER_BROKER=1`, `RF=1`
-- `corfu`, `lazylog`, `scalog`: mixed local+remote client layout, `THREADS_PER_BROKER=4`, `RF=1 2`
-- `NUM_CLIENTS=1 2 3` by default for every enabled system group
-- sequencer host defaults:
-  - `REMOTE_SEQ_HOST=c2`
-  - `REMOTE_SEQ_IP=10.10.10.144`
-  - `REMOTE_CORFU_SEQ_PORT=50052`
-  - `REMOTE_LAZYLOG_SEQ_PORT=50061`
-  - `REMOTE_SCALOG_SEQ_PORT=50051`
-
-Default invocation:
-
-```bash
-NUM_TRIALS=3 \
-TAG=publication_matrix_current \
-bash scripts/publication/run_throughput_matrix.sh
-```
-
-Useful overrides:
-
-- `MATRIX_SYSTEMS="corfu lazylog scalog"` to run only the baseline systems
-- `BASELINE_RF_VALUES="2"` to run only `rf2` baseline rows
-- `EMBARCADERO_RF_VALUES="1"` and `EMBARCADERO_ORDER5_RF_VALUES="1"` to keep the current Embarcadero publication contracts explicit
-- `SKIP_EXISTING_CELLS=1` to resume an appendable tag without rerunning completed cells
-- `NUM_TRIALS=1` to do a fast first-pass sweep before backfilling to `3` trials
-
-## Throughput Script
-
-### `scripts/singlenode_run_throughput.sh`
-
-Single-node throughput launcher. This is the original local workflow where the script starts local brokers and the client runs on the same machine.
-
-Common options:
-
-- `NUM_TRIALS`: number of benchmark trials.
-- `TOTAL_MESSAGE_SIZE`: total bytes to publish.
-- `MESSAGE_SIZE`: message size in bytes.
-- `TEST_TYPE`: throughput-test mode.
-- `ORDER`: ordering mode.
-- `ACK`: ack level.
-- `REPLICATION_FACTOR`: replication factor for ack/replication experiments.
-- `THREADS_PER_BROKER`: overrides the default thread selection.
-- `SEQUENCER`: broker sequencer mode.
-
-Examples:
-
-```bash
-NUM_BROKERS=4 TEST_TYPE=5 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO scripts/singlenode_run_throughput.sh
-```
-
-### `scripts/run_throughput.sh`
-
-Remote-client throughput launcher. This is the multi-node workflow where the client runs here and brokers are managed on a remote broker node over SSH.
-
-Remote-only requirements:
-
-- `REMOTE_BROKER_HOST`
-- `EMBARCADERO_HEAD_ADDR`
-
-```bash
-REMOTE_BROKER_HOST=broker \
-REMOTE_PROJECT_ROOT=/home/domin/Embarcadero \
-EMBARCADERO_HEAD_ADDR=10.10.10.10 \
-NUM_BROKERS=4 TEST_TYPE=5 ORDER=0 ACK=1 \
-TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 SEQUENCER=EMBARCADERO \
-scripts/run_throughput.sh
-```
-
-## Latency Scripts
-
-### `scripts/run_latency.sh`
-
-Runs the latency benchmark matrix across the configured modes and sequencers.
-
-Supports two scenarios:
-
-- `SCENARIO=local` (default): brokers and client on the same machine (loopback).
-- `SCENARIO=remote`: brokers on this machine, client runs on a remote node via SSH.
-  Requires `REMOTE_CLIENT_HOST` (e.g. `c4`) and `BROKER_LISTEN_ADDR` (e.g. `10.10.10.10`).
-  The script automatically sets `EMBARCADERO_HEAD_ADDR` so brokers bind to the external
-  NIC, cleans stale CSV files on the remote node before each trial, and `scp`s result
-  CSVs back after each trial.
-
-Common options:
-
-- `NUM_BROKERS`
-- `TEST_CASE`
-- `MSG_SIZE`
-- `ACK_LEVEL`
-- `TOTAL_MESSAGE_SIZE`
-- `NUM_TRIALS`
-- `RUN_ID`
-- `PLOT_RESULTS=1` to generate plots after the run
-- `TARGET_MBPS`
-- `MODES`: whitespace-separated list such as `steady burst`
-- `ORDERS`: space-separated order levels, e.g. `"0 5"`
-- `SCENARIO`: `local` or `remote`
-- `REMOTE_CLIENT_HOST`: SSH destination for remote client (default: `c4`)
-- `BROKER_LISTEN_ADDR`: IP the remote client uses to reach the broker (default: `10.10.10.10`)
-
-#### Batch size and latency
-
-The default batch size (512 KB in `EMBARCADERO_BATCH_SIZE`) is tuned for throughput:
-many messages are coalesced into a single batch before sending, which amortizes syscall
-and CXL-write overhead but adds **batching delay** — each message waits until the batch
-fills before it is sent.  This dominates measured latency at low offered loads.
-
-For per-record latency measurement, override `EMBARCADERO_BATCH_SIZE` to reduce the
-number of messages per batch.  This does **not** require recompilation — the value is
-read from the environment at runtime via `storage.batch_size`.
-
-| `EMBARCADERO_BATCH_SIZE` | Msgs/batch (1 KB msgs) | Typical p50 (ORDER=0, local) | Use case |
-|:---:|:---:|:---:|---|
-| 524288 (512 KB, default) | ~480 | ~1,940 µs | Throughput benchmarks |
-| 4096 (4 KB) | ~2–3 | ~137 µs | Low-latency benchmarks |
-| 1024 (1 KB) | 1 | ~149 µs | Per-record latency baseline |
-
-The 4 KB and 1 KB settings produce nearly identical p50 because once batching delay is
-removed, the remaining ~136–150 µs is the true single-message pipeline latency (publisher
-buffer write → TCP send → broker CXL write → subscriber TCP recv).
-
-**Important:** smaller batch sizes increase per-batch overhead and reduce maximum
-throughput.  Always use the default (or larger) batch size for throughput experiments.
-The `EMBARCADERO_BATCH_SIZE` override only affects the current process — other scripts
-and experiments are unaffected unless they explicitly set the same variable.
-
-### `scripts/run_throughput_latency_sweep.sh`
-
-Runs a throughput-vs-latency sweep over a list of offered-load targets.
-
-By default this launcher uses publication-grade CXL initialization:
-`EMBARCADERO_CXL_ZERO_MODE=full` and `EMBARCADERO_CXL_MAP_POPULATE=1`.
-That keeps BLog/CXL page allocation out of the measured ACK and delivery path.
-Use `EMBARCADERO_CXL_ZERO_MODE=metadata EMBARCADERO_CXL_MAP_POPULATE=0`
-only for explicit fast smoke tests; do not mix those runs into throughput or
-latency-vs-load claims.
-
-### CXL ingest / coherence flags
-
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `EMBARCADERO_CXL_COHERENT` | unset/false | When `1`/`true`/`yes`, skip explicit payload/PBR flushes (single-domain coherent mapping). Real CXL defaults to explicit flush. |
-| `EMBARCADERO_CXL_NT_INGEST` | unset/false | When `1`/`true`/`yes`, broker `recv`s into DRAM then non-temporal-copies into the CXL BLog. Raises same-host ingest toward the CXL NT write ceiling (~17–18 GB/s on this platform). Does not help remote 100GbE-limited runs. |
-
-Both flags are forwarded to local and remote brokers via `run_multiclient.sh` / `broker_lifecycle.sh`.
-
-Common options:
-
-- `NUM_BROKERS`
-- `MESSAGE_SIZE`
-- `TOTAL_BYTES`
-- `ORDER`
-- `ACK`
-- `REPLICATION_FACTOR`
-- `SEQUENCER`
-- `THREADS_PER_BROKER`
-- `SWEEP_TARGETS`: whitespace-separated MB/s targets
-- `POINT_MAX_ATTEMPTS`
-- `STRICT_BROKER_COUNT=1` to reject runs that do not use all brokers
-
-### `scripts/run_latency_vs_load.sh`
-
-Runs the publication-oriented latency-vs-load workflow.
-
-The run metadata records `EMBARCADERO_CXL_ZERO_MODE`,
-`EMBARCADERO_CXL_MAP_POPULATE`, and `EMBAR_USE_HUGETLB` so curves can be
-audited against the CXL initialization policy used for throughput runs.
-
-Common options:
-
-- `LOAD_POINTS_MBPS`: whitespace-separated offered-load targets for the x-axis
-- `PACING_MODE`: `open_loop` or `steady`
-- `SEQUENCER`
-- `ORDER`
-- `ACK_LEVEL`
-- `REPLICATION_FACTOR`
-- `MSG_SIZE`
-- `TOTAL_MESSAGE_SIZE`
-- `NUM_TRIALS`
-- `NUM_BROKERS`
-- `SCENARIO`
-- `BENCHMARK_TAG`
-- `RUN_ID`
-
-Outputs:
-
-- Raw artifacts per target/trial under `data/latency_vs_load/...`
-- `latency_benchmark_summary.csv` per trial
-- `trial_results.csv` and `summary.csv` aggregated for plotting
-
-### `scripts/run_e2e_throughput_benchmark.sh`
-
-Runs the publication-oriented end-to-end throughput harness for `throughput_test -t 1`.
-
-Common options:
-
-- `SCENARIO`: `local` or `remote`
-- `SEQUENCER`
-- `ORDER`
-- `ACK`
-- `REPLICATION_FACTOR`
-- `NUM_BROKERS`
-- `NUM_TRIALS`
-- `TOTAL_MESSAGE_SIZE`
-- `MESSAGE_SIZE`
-- `THREADS_PER_BROKER`
-- `BENCHMARK_TAG`
-- `RUN_ID`
-
-Outputs:
-
-- Raw per-trial logs and `throughput_benchmark_summary.csv` under `data/e2e_throughput/...`
-- `trial_results.csv` and `summary.csv` aggregated for the run
-
-## Experiment Wrappers
-
-### `scripts/run_failures.sh`
-
-Runs the broker-failure benchmark locally: starts a 4-broker cluster, kills one broker mid-run, records real-time throughput, writes failure events, and generates a plot.
-
-Common options:
-
-- `NUM_BROKERS`
-- `NUM_BROKERS_TO_KILL`
-- `FAILURE_PERCENTAGE`
-- `NUM_TRIALS`
-- `TOTAL_MESSAGE_SIZE`
-- `MESSAGE_SIZE`
-- `ORDER`
-- `ACK`
-- `SEQUENCER`
-- `THREADS_PER_BROKER`
-- `CLIENT_TIMEOUT`
-- `EMBARCADERO_RUNTIME_MODE`
-- `EMBARCADERO_ACK_TIMEOUT_SEC`
-- `EMBARCADERO_FAILURE_QUEUE_SIZE_MB` or `EMBARCADERO_FAILURE_QUEUE_SIZE_BYTES`
-
-Outputs:
-
-- `data/failure/real_time_acked_throughput.csv`
-- `data/failure/failure_events.csv`
-- `data/failure/failure.png`
-- `data/failure/failure.pdf`
-- per-trial archives such as `data/failure/real_time_acked_throughput_trial1.csv`
-
-The script now prints both the benchmark's reported end-to-end `Bandwidth` and a trimmed active-window throughput summary, which is usually the more representative metric for the failure/re-route phase.
-
-`plot_failure.py` also supports `--keep-full-tail` when you want to inspect the full post-failure drain/tail instead of the trimmed active window.
-
-Example:
-
-```bash
-ORDER=5 ACK=1 NUM_BROKERS=4 NUM_BROKERS_TO_KILL=1 FAILURE_PERCENTAGE=0.5 \
-TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 NUM_TRIALS=3 \
-scripts/run_failures.sh
-```
-
-### `scripts/run_multiclient.sh`
-
-Multi-client throughput orchestration script. Starts brokers locally, then launches up to five physical client machines in parallel using a NTP-synchronized future-timestamp barrier so all clients begin sending simultaneously.
-
-**Client roster** (cumulative; each level adds one machine):
-
-| `NUM_CLIENTS` | Active clients | NUMA binding |
-|:---:|---|---|
-| 1 | c4 | node 1 |
-| 2 | c4, c3 | node 1, node 1 |
-| 3 | c4, c3, local (broker node) | node 1, node 1, node 0 |
-| 4 | c4, c3, local, c2 | node 1, node 1, node 0, node 1 |
-| 5 | c4, c3, local, c2, c1 | node 1, node 1, node 0, node 1, node 1 |
-
-`TOTAL_MESSAGE_SIZE` is divided equally across all active clients; each client sends `TOTAL_MESSAGE_SIZE / NUM_CLIENTS` bytes.
-
-Configuration options:
-
-| Variable | Default | Description |
+`bash scripts/run_experiment.sh PROFILE ...` is the equivalent shell entrypoint.
+With no profile it prints help and starts nothing. The dispatcher replaces itself
+with the selected existing runner; arguments, signals, and exit status pass
+through directly. It adds no broker lifecycle, workload defaults, environment
+translation, retry policy, or result qualification.
+
+| Profile | Existing owner | Scope |
 |---|---|---|
-| `NUM_CLIENTS` | `1` | Number of clients to activate (1–5) |
-| `NUM_BROKERS` | `4` | Brokers to start locally |
-| `NUM_TRIALS` | `3` | Number of benchmark trials |
-| `TRIAL_MAX_ATTEMPTS` | `3` | Retry attempts per trial on failure |
-| `TOTAL_MESSAGE_SIZE` | `8589934592` | Combined bytes across all clients (8 GiB) |
-| `MESSAGE_SIZE` | `1024` | Per-message size in bytes |
-| `THREADS_PER_BROKER` | `4` | Publisher threads per broker connection |
-| `TEST_TYPE` | `5` | Throughput-test mode (5 = publish-only) |
-| `ORDER` | `0` | Ordering mode |
-| `ACK` | `1` | Ack level |
-| `REPLICATION_FACTOR` | `0` | Replication factor |
-| `SEQUENCER` | `EMBARCADERO` | Sequencer type |
-| `EMBARCADERO_HEAD_ADDR` | `10.10.10.10` | Broker node IP |
-| `START_DELAY_SEC` | `8` | Lead time (seconds) for SSH launch + clock settling |
-| `EMBARCADERO_ORDER0_FAST_PATH` | `1` | Enable Order-0 fast path |
-| `EMBARCADERO_PAYLOAD_SEND_CHUNK_BYTES` | `524288` | Client send chunk size (bytes) |
-| `EMBARCADERO_ENABLE_PAYLOAD_MSG_MORE` | `1` | Enable `MSG_MORE` on payload sends |
-| `EMBARCADERO_BATCH_SIZE` | `524288` | Client batch size (bytes) |
-| `EMBARCADERO_CLIENT_PUB_BATCH_KB` | `512` | Client publish batch (KiB) |
-| `EMBARCADERO_NETWORK_IO_THREADS` | `4` | Client network I/O threads |
+| `dev` | [dev_cluster.py](../tools/dev_cluster.py) | Audited 32 MiB local DRAM smoke |
+| `fault` | [run_production_faults.py](../test/integration/run_production_faults.py) | Bounded production fault cases; fault-enabled build required |
+| `perf` | [perf_compare.py](../tools/perf_compare.py) | Matched baseline/candidate DRAM pilot and immutable evidence |
+| `legacy-startup` | [check_legacy_startup.py](../test/integration/check_legacy_startup.py) | Owned ORDER0/ACK1 startup check, without indexed payload audit |
+| `analyze` | [analyze_perf_comparison.py](../tools/analyze_perf_comparison.py) | Read-only analysis of retained pilot runs |
+| `legacy` | An inventory launcher below | Explicit access to unchanged historical research behavior |
 
-Logs for each trial are written to `multiclient_logs/trial<N>_<host>.log`.
+Owned launch profiles select emulation explicitly, share the existing cluster
+lock, use unique regions, and clean up owned process groups and shared memory.
+Brokers/memory use NUMA node 1; clients/memory use node 0. They need no SSH client
+or NUMA node 2. The 64 GiB mapping and each runner's resource/deadline checks remain
+authoritative. See [supported commands](../docs/development-commands.md),
+[DRAM requirements](../docs/development-dram.md), and the
+[performance protocol](../docs/performance-pilot.md).
 
-Examples:
+## Compatibility inventory
 
-```bash
-# 1 client — c4 alone
-NUM_CLIENTS=1 scripts/run_multiclient.sh
+These eleven previously documented launchers now share an early dispatch guard.
+Each accepts `--dev-dram`, `--fault-dram`, `--perf-dram`, and
+`--legacy-startup`, followed by that runner's options. Dispatch occurs before
+historical locks, sourced lifecycle code, host checks, SSH, or cleanup.
+`--help` explains the routes; unknown options fail before historical code.
 
-# 2 clients — c4 + c3, 10 GiB total, ORDER=0
-NUM_CLIENTS=2 ORDER=0 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 \
-    SEQUENCER=EMBARCADERO EMBARCADERO_HEAD_ADDR=10.10.10.10 \
-    scripts/run_multiclient.sh
+| Launcher | Historical purpose | Name for `experiment.py legacy` |
+|---|---|---|
+| [singlenode_run_throughput.sh](singlenode_run_throughput.sh) | Local throughput | `singlenode_run_throughput` |
+| [run_throughput.sh](run_throughput.sh) | Remote-client throughput | `run_throughput` |
+| [run_multiclient.sh](run_multiclient.sh) | Multi-host throughput | `run_multiclient` |
+| [run_latency.sh](run_latency.sh) | Latency matrix | `run_latency` |
+| [run_throughput_latency_sweep.sh](run_throughput_latency_sweep.sh) | Offered-load sweep | `run_throughput_latency_sweep` |
+| [run_latency_vs_load.sh](run_latency_vs_load.sh) | Latency versus load | `run_latency_vs_load` |
+| [run_e2e_throughput_benchmark.sh](run_e2e_throughput_benchmark.sh) | Research E2E throughput | `run_e2e_throughput_benchmark` |
+| [run_failures.sh](run_failures.sh) | Broker-failure trace | `run_failures` |
+| [run_ordering_durability_ladder.sh](run_ordering_durability_ladder.sh) | ORDER/ACK sweep | `run_ordering_durability_ladder` |
+| [run_slow_replica_heterogeneity.sh](run_slow_replica_heterogeneity.sh) | Slow-replica experiment | `run_slow_replica_heterogeneity` |
+| [publication/run_throughput_matrix.sh](publication/run_throughput_matrix.sh) | Publication matrix | `run_throughput_matrix` |
 
-# 2 clients — c4 + c3, ORDER=5
-NUM_CLIENTS=2 ORDER=5 ACK=1 TOTAL_MESSAGE_SIZE=10737418240 MESSAGE_SIZE=1024 \
-    SEQUENCER=EMBARCADERO EMBARCADERO_HEAD_ADDR=10.10.10.10 \
-    scripts/run_multiclient.sh
+For example:
 
-# Full 5-client sweep, 5 trials, 16 GiB total load
-NUM_CLIENTS=5 NUM_TRIALS=5 TOTAL_MESSAGE_SIZE=17179869184 \
-    scripts/run_multiclient.sh
+```sh
+bash scripts/run_latency.sh --dev-dram --build-dir build/debug --dry-run
+bash scripts/run_failures.sh --fault-dram --build-dir build/debug-faults --case control --dry-run
+bash scripts/publication/run_throughput_matrix.sh --perf-dram --help
 ```
 
-**Prerequisite:** all cluster machines must have NTP-synchronized clocks before running.
-Use `scripts/setup/sync_clocks.sh` if they are not already synced.
+These select the named owned profile. A latency launcher's `--dev-dram` route
+runs the smoke profile; it does not reproduce its historical latency matrix.
+Historical environment variables are not translated into owned runner arguments.
+Use explicit options and the resulting manifest to establish what ran.
 
-**c3 setup prerequisites** (run once on c3 as root):
-```bash
-# Hugepages: ensure ≥ 8200 on NUMA node 1 (client runs --membind=1)
-echo 8200 | sudo tee /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
-sudo chmod 1777 /dev/hugepages
-# Socket buffers
-sudo sysctl -w net.core.rmem_max=268435456
-sudo sysctl -w net.core.wmem_max=268435456
-sudo sysctl -w net.ipv4.tcp_rmem='4096 65536 268435456'
-sudo sysctl -w net.ipv4.tcp_wmem='4096 65536 268435456'
-# NIC ring buffer (100G data NIC: ens801f0np0)
-sudo ethtool -G ens801f0np0 rx 8192 tx 8192
+## Historical workflows
+
+Historical bodies, paper scripts, and retained data remain in place. List the
+historical inventory without launching anything:
+
+```sh
+python3 tools/experiment.py legacy --help
 ```
 
-**Aggregation note:** the per-trial totals printed at the end are the naive sum of
-each client's self-reported average bandwidth. For peer-reviewable results, collect
-the per-client time-series CSVs and calculate throughput within the overlapping
-steady-state send window instead.
+To execute the old workflow use `python3 tools/experiment.py legacy run_latency`
+or `bash scripts/run_latency.sh --legacy` with its historical environment.
+Arguments after the launcher name are passed to its historical body; those
+scripts may not implement help or argument validation.
+The original environment-only invocation with no arguments also remains
+compatible; it is historical behavior and has no owned-runner cleanup guarantee.
 
-**Benchmark results** (2026-03-26, 4 brokers on moscxl, 1 KB messages, ACK=1, no replication):
+Historical workflows may use SSH, machine-specific hardware, host tuning,
+shared readiness files, or broad process cleanup. Inspect them before running
+them in a dedicated research environment. Existing notes are preserved in
+[HISTORICAL_LAUNCHERS.md](HISTORICAL_LAUNCHERS.md) for interpreting older artifacts.
+Additional publication, paper, setup, network, plotting, and diagnostic scripts
+have not been converted or newly qualified by this dispatch change.
 
-Multi-client publish throughput (c4 + c3 → moscxl, `NUM_CLIENTS=2`):
-
-| ORDER | Trial 1 | Trial 2 | Trial 3 | Notes |
-|:---:|---:|---:|---:|---|
-| 0 | 11.4 GB/s | 12.2 GB/s | 12.5 GB/s | ORDER=0 fast path, c4≈6.9 GB/s + c3≈5.9 GB/s |
-| 5 | 11.5 GB/s | 12.2 GB/s | 12.1 GB/s | Sequencer overhead negligible at this scale |
-
-E2E throughput (c4 publisher → moscxl brokers → c3 subscriber, 10 GiB, single client):
-
-| ORDER | Publish (c4→broker) | Subscribe (broker→c3) | Notes |
-|:---:|---:|---:|---|
-| 0 | 6,631 MB/s | 1,266 MB/s | Subscriber bound by CXL read + broker→wire |
-| 5 | 7,074 MB/s | 1,231 MB/s | ORDER=5 slightly faster publish (epoch batching) |
-
-Subscribe bandwidth reflects the broker reading from CXL (NUMA node 2, distance=255) and
-re-transmitting to the subscriber over the same 100 GbE fabric. The publish path is
-write-only (producer→CXL); the subscribe path adds a CXL read plus a second TCP send
-per byte, which limits it to ~1.2 GB/s with the current single-subscriber configuration.
-
-**TODO (pending test runs):**
-- [x] Test with 2 clients (c4 + c3) — ORDER=0 and ORDER=5 ✓
-- [ ] Test with 3 clients (c4 + c3 + local)
-- [ ] Test with 4 clients (c4 + c3 + local + c2)
-- [ ] Test with 5 clients (c4 + c3 + local + c2 + c1)
-- [ ] Verify aggregate throughput using time-series overlapping window analysis
-- [ ] Multi-subscriber e2e (c4 pub + c3 sub + c2 sub) to test fanout bandwidth
-
-### `scripts/run_ordering_durability_ladder.sh`
-
-Sweeps `ORDER` and `ACK` combinations by calling `singlenode_run_throughput.sh`.
-
-Common options:
-
-- `ORDERS`
-- `ACK_LEVELS`
-- `NUM_BROKERS`
-- `TEST_TYPE`
-- `TOTAL_MESSAGE_SIZE`
-- `MESSAGE_SIZE`
-- `THREADS_PER_BROKER`
-- `TRIAL_MAX_ATTEMPTS`
-- `EMBARCADERO_ACK_TIMEOUT_SEC`
-- `ACK2_REPLICATION_FACTOR`
-- `NON_REPLICATED_RF`
-
-### `scripts/run_slow_replica_heterogeneity.sh`
-
-Injects a temporary slowdown into one broker and compares the baseline versus slowed run.
-
-Common options:
-
-- `NUM_BROKERS`
-- `SEQUENCER`
-- `ORDER`
-- `ACK`
-- `MESSAGE_SIZE`
-- `TOTAL_MESSAGE_SIZE`
-- `THREADS_PER_BROKER`
-- `TEST_TYPE`
-- `SLOW_BROKER_INDEX`
-- `INJECT_AFTER_SEC`
-- `PAUSE_SEC`
-- `POINT_MAX_ATTEMPTS`
-
-## Tips
-
-- Keep local mode and remote mode separate in your shell history so it is obvious when a broker node is being managed over SSH.
-- If a remote cluster is left in a bad state, rerun with `FORCE_RESTART_BROKERS=1`.
-- For remote runs, use the broker node IP in `EMBARCADERO_HEAD_ADDR`, not `127.0.0.1`.
-- On the current host, `192.168.50.12` and `192.168.60.8` are on `1GbE` NICs. The `100GbE` interface currently has no usable IPv4 address assigned, so the scripts cannot target it until that interface is addressed and routed.
+The [support matrix](../docs/support-matrix.md) determines supported contracts.
+Local DRAM tests cannot qualify real CXL, persistent-media durability, independent
+host failure, or the historical latency/publication workflows.

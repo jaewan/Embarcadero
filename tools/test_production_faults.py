@@ -21,15 +21,37 @@ spec.loader.exec_module(faults)
 
 
 class ProductionFaultHarnessTests(unittest.TestCase):
-    def test_all_schedules_twenty_distinct_cases_including_real_client_recovery(self):
+    def test_wait_observation_requires_actual_hook_thread_transition(self):
+        # Same controller futex and a transient mutex WAIT do not qualify as
+        # production queue waiting; its distinct WAIT_BITSET does.
+        samples = ["running", "202 0x100 0x189 0 0 0 0 0 0",
+                   "202 0x200 0x80 0 0 0 0 0 0",
+                   "202 0x200 0x189 0 0xabc 0 0 0 0", "202 0x200 0x189 0 0 0 0 0 0"]
+        with mock.patch.object(Path, "read_text", side_effect=samples), \
+                mock.patch.object(faults.time, "sleep"), \
+                mock.patch.object(faults.os, "uname", return_value=mock.Mock(machine="x86_64")):
+            evidence = faults.observe_thread_syscall(100, 123, {202}, different_futex=0x100, futex_timed=False)
+        self.assertEqual(evidence["tid"], 123)
+        self.assertEqual(evidence["arguments"][0], 0x200)
+
+    def test_release_alone_and_wrong_syscall_cannot_qualify_wait(self):
+        with mock.patch.object(Path, "read_text", return_value="202 0x100 0x189 0 0 0 0 0 0"), \
+                mock.patch.object(faults.os, "uname", return_value=mock.Mock(machine="x86_64")):
+            with self.assertRaisesRegex(dev.RunError, "did not enter expected syscall"):
+                faults.observe_thread_syscall(100, 123, {45}, timeout=0)
+            with self.assertRaisesRegex(dev.RunError, "did not enter expected syscall"):
+                faults.observe_thread_syscall(100, 123, {202}, different_futex=0x100, timeout=0)
+
+
+    def test_all_schedules_twenty_three_distinct_cases_including_real_client_recovery(self):
         with mock.patch.object(dev, "topology", return_value={}), \
                 mock.patch.object(dev, "ClusterLock"), \
                 mock.patch.object(faults, "run_case", return_value=(True, Path("unused-manifest.json"))) as run:
             self.assertEqual(faults.main(["--case", "all"]), 0)
         scheduled = [call.args[1] for call in run.call_args_list]
         self.assertEqual(tuple(scheduled), faults.CASES)
-        self.assertEqual(len(scheduled), 20)
-        self.assertEqual(len(set(scheduled)), 20)
+        self.assertEqual(len(scheduled), 23)
+        self.assertEqual(len(set(scheduled)), 23)
         self.assertTrue(set(faults.REAL_CLIENT_CASES).issubset(scheduled))
         self.assertEqual(set(faults.PAYLOAD_UPPER_BOUNDS), set(scheduled))
 

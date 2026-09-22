@@ -11,6 +11,7 @@
 #include <vector>
 #include "absl/container/flat_hash_set.h"
 #include "common.h"
+#include "common/order_level.h"
 #include "corfu_ordered_token_gate.h"
 #include "queue_buffer.h"
 #include "session.pb.h"
@@ -455,7 +456,10 @@ class Publisher {
 			DeltaEstimator delta_estimator_;
 			std::mutex delta_mu_;
 
-			bool IsOrder5SessionMode() const;
+			bool IsOrder5SessionMode() const {
+				return seq_type_ == heartbeat_system::SequencerType::EMBARCADERO &&
+				       order_level_ == Embarcadero::kOrderStrong;
+			}
 			uint32_t InitialSessionEpochRequest() const;
 			uint64_t SessionLeaseNs() const;
 			bool IsMemoryEmulatedAck2() const;

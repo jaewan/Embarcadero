@@ -88,6 +88,12 @@ add_executable(embarlet
     embarlet/topic_manager.h
     embarlet/topic.cc
     embarlet/topic_session.cc
+    embarlet/topic_order5_epoch.cc
+    embarlet/topic_order5_sessions.cc
+    embarlet/topic_order5_commit.cc
+    embarlet/topic_order5_scanner.cc
+    embarlet/topic_order5_recovery.cc
+    embarlet/topic_export.cc
 	embarlet/goi_recovery_thread.cc
     embarlet/topic.h
 )
@@ -152,6 +158,9 @@ add_executable(throughput_test
     client/queue_buffer.cc
     client/queue_buffer.h
     client/publisher.cc
+    client/publisher_session.cc
+    client/publisher_retention.cc
+    client/publisher_ack.cc
     client/publisher.h
     client/subscriber.cc
     client/subscriber.h

@@ -58,3 +58,10 @@ bootstrap, baseline-free client preset, dependency provenance, and CI contract.
 See [security scope](SECURITY.md) before exposing a broker or reporting a
 sensitive defect. Fault-injection builds are explicitly test-only; ordinary
 builds leave `EMBARCADERO_ENABLE_FAULT_INJECTION=OFF`.
+
+## License
+
+Contributions intentionally submitted for inclusion in Embarcadero are provided
+under the [Apache License, Version 2.0](LICENSE), unless explicitly stated
+otherwise. Contributors retain their respective copyrights. Preserve existing
+third-party license and attribution notices.

@@ -1,6 +1,7 @@
 #include "topic.h"
 #include "topic_session_key.h"
 #include "session_admission.h"
+#include "common/fault_injection.h"
 #include "common/performance_utils.h"
 #include <glog/logging.h>
 
@@ -56,6 +57,13 @@ bool Topic::PublishSessionEntry(uint64_t session_key, const SessionPublishSnapsh
     }
 
     StoreSessionMaximum(entry->expected_seq, snapshot.expected_seq);
+#if EMBARCADERO_ENABLE_FAULT_INJECTION == 1
+    // Observe the real intermediate publication while the caller retains its gate.
+    // Cancellation releases the pause but must not leave a half-published snapshot.
+    (void)fault::Pause("session.after_expected_before_hwm",
+        {session_key >> 32, snapshot.session_epoch, snapshot.committed_hwm,
+         snapshot.expected_seq, snapshot.fenced ? 1ULL : 0ULL}, &stop_threads_);
+#endif
     StoreSessionMaximum(entry->committed_hwm, snapshot.committed_hwm);
     StoreSessionMaximum(entry->highest_sequenced, snapshot.highest_sequenced);
 	CXL::store_fence();

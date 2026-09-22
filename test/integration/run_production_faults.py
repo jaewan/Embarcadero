@@ -24,9 +24,9 @@ sys.path.insert(0, str(ROOT / "tools"))
 import dev_cluster as dev
 from fault_control import FaultControl
 
-CORE_CASES = ("control", "fragmented_open", "truncated_control", "mismatched_client",
+CORE_CASES = ("repeated_rejected_connections", "control", "fragmented_open", "truncated_control", "mismatched_client",
          "incomplete_payload", "malformed_body", "shutdown_partial_handshake",
-         "shutdown_ack_connect", "shutdown_queue", "fence_before_commit", "commit_before_fence",
+         "shutdown_ack_connect", "shutdown_queue", "shutdown_partial_control", "shutdown_partial_body", "fence_before_commit", "commit_before_fence",
          "fence_empty_prefix", "ack_publication_lag", "shutdown_replication_token", "session_capacity",
          "goi_capacity", "blog_capacity", "rollover_retention")
 SESSION_CASES = {"fence_before_commit": 8, "commit_before_fence": 8, "fence_empty_prefix": 2}
@@ -36,8 +36,10 @@ CASES = CORE_CASES + CLIENT_EXTENSIONS
 REAL_CLIENT_CASES = ("ack_publication_lag",) + CLIENT_EXTENSIONS
 ACTIVE_TIMEOUT_SECONDS = 60
 PAYLOAD_UPPER_BOUNDS = {
+    "repeated_rejected_connections": 24576,
     "control": 24576, "fragmented_open": 24576, "truncated_control": 24576,
     "mismatched_client": 24576, "incomplete_payload": 32768, "malformed_body": 32768,
+    "shutdown_partial_control": 0, "shutdown_partial_body": 8192,
     "shutdown_partial_handshake": 0, "shutdown_ack_connect": 0, "shutdown_queue": 0,
     "fence_before_commit": 49152, "commit_before_fence": 40960, "fence_empty_prefix": 16384,
     "ack_publication_lag": 8192, "ack_hwm_withheld": 8192, "session_reopen_resubmit": 65536,
@@ -47,6 +49,8 @@ PAYLOAD_UPPER_BOUNDS = {
 HOOKS = {
     "fragmented_open": ("ingress.session_prefix.partial",),
     "shutdown_partial_handshake": ("ingress.handshake.partial",),
+    "shutdown_partial_control": ("ingress.session_prefix.partial",),
+    "shutdown_partial_body": ("ingress.payload.partial",),
     "shutdown_ack_connect": ("ack.connect.wait",),
     "shutdown_queue": ("queue.worker_paused", "queue.push.blocked"),
 }
@@ -365,12 +369,46 @@ def memory_preflight(hardware, brokers=1):
     return result
 
 
+def observe_thread_syscall(pid, tid, numbers, *, different_futex=None, futex_timed=None, timeout=1.0):
+    """Observe the reached hook's Linux x86-64 thread, never just RELEASED."""
+    if os.uname().machine != "x86_64":
+        raise dev.RunError("native wait oracle requires Linux x86-64 syscall numbers")
+    if tid <= 0:
+        raise dev.RunError("missing native fault thread identity")
+    path = Path(f"/proc/{pid}/task/{tid}/syscall")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            raw = path.read_text().strip()
+        except OSError as error:
+            raise dev.RunError(f"cannot observe fault thread syscall: {error}") from error
+        fields = raw.split()
+        if len(fields) == 9:
+            try:
+                number = int(fields[0], 0)
+                args = [int(value, 0) for value in fields[1:7]]
+            except ValueError as error:
+                raise dev.RunError("malformed native syscall snapshot") from error
+            if number in numbers and (different_futex is None or args[0] != different_futex):
+                # For futex observations require condition-variable WAIT_BITSET,
+                # not transient reacquisition of the controller's mutex (WAIT).
+                if number != 202 or ((args[1] & 0x7f) == 9 and
+                        (futex_timed is None or bool(args[3]) == futex_timed)):
+                    return {"pid": pid, "tid": tid, "syscall": number, "arguments": args,
+                            "raw": raw, "monotonic": time.monotonic()}
+        if time.monotonic() >= deadline:
+            raise dev.RunError(f"fault thread {tid} did not enter expected syscall {sorted(numbers)}")
+        time.sleep(0.0005)
+
+
 def observe_hit(controller, identity, case):
     hit = controller.hit(identity)
-    if case == "fragmented_open" and (hit["detail0"], hit["detail1"]) != (1, 4):
+    if case in ("fragmented_open", "shutdown_partial_control") and (hit["detail0"], hit["detail1"]) != (1, 4):
         raise dev.RunError("fragment hook did not observe the one-byte control prefix")
     if case == "shutdown_partial_handshake" and (hit["detail0"], hit["detail1"]) != (8, 64):
         raise dev.RunError("handshake hook did not observe the exact truncated native handshake")
+    if case == "shutdown_partial_body" and not (hit["detail0"] == 1 and hit["detail1"] > 1):
+        raise dev.RunError("payload hook did not observe a one-byte incomplete body")
     if case == "shutdown_queue" and (hit["detail0"], hit["detail1"]) != (2, 2):
         raise dev.RunError("queue hook did not observe a full two-entry queue")
     return hit
@@ -571,6 +609,22 @@ def run_case(args, case, hardware):
                 manifest["fault_hits"] = replication_schedule(controls, arms, processes, driver_control)
             elif case in SESSION_CASES:
                 manifest["fault_hits"] = session_schedule(control, driver_control, armed, case)
+            elif case == "repeated_rejected_connections":
+                driver_control.wait("fd_baseline")
+                before = sorted(os.listdir(f"/proc/{process.pid}/fd"))
+                driver_control.proceed()
+                driver_control.wait("fd_completed")
+                deadline = time.monotonic() + 2
+                while True:
+                    after = sorted(os.listdir(f"/proc/{process.pid}/fd"))
+                    if len(after) <= len(before):
+                        break
+                    if time.monotonic() >= deadline:
+                        raise dev.RunError("broker descriptors grew after 128 rejected connections")
+                    time.sleep(0.02)
+                manifest["descriptor_inventory"] = {"before": before, "after": after,
+                    "rejected_connections": 128, "no_count_growth": True}
+                driver_control.proceed()
             elif case == "fragmented_open":
                 driver_control.wait("fragment_sent")
                 hook_id = armed["ingress.session_prefix.partial"]
@@ -581,10 +635,20 @@ def run_case(args, case, hardware):
                 driver_control.wait("shutdown_sockets_open")
                 name = HOOKS[case][-1]
                 manifest["fault_hit"] = observe_hit(control, armed[name], case)
-                if case == "shutdown_queue":
-                    # The sole consumer remains paused. Releasing the observation
-                    # reaches the real condition-variable wait on the full queue.
+                if case in ("shutdown_queue", "shutdown_partial_control", "shutdown_partial_body"):
+                    tid = manifest["fault_hit"]["tid"]
+                    before = observe_thread_syscall(process.pid, tid, {202}, futex_timed=True)
+                    manifest["native_wait_evidence"] = {"paused_hook": before}
                     control.release(armed[name])
+                    expected = {"shutdown_queue": {202}, "shutdown_partial_control": {35, 230},
+                                "shutdown_partial_body": {45}}[case]
+                    # The queue consumer remains paused. A different condition-
+                    # variable futex with no timeout distinguishes the actual queue
+                    # wait from both group words of the controller timed wait.
+                    after = observe_thread_syscall(process.pid, tid, expected,
+                        different_futex=before["arguments"][0] if case == "shutdown_queue" else None,
+                        futex_timed=False if case == "shutdown_queue" else None)
+                    manifest["native_wait_evidence"]["production_wait"] = after
                 manifest["shutdown_signal_monotonic"] = time.monotonic()
                 os.killpg(process.pid, signal.SIGTERM)
             deadline = active_deadline

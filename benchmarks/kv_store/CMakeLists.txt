@@ -6,6 +6,9 @@ set(KV_CLIENT_SOURCES
     distributed_kv_store.cc
     distributed_kv_store.h
     ../../src/client/publisher.cc
+    ../../src/client/publisher_session.cc
+    ../../src/client/publisher_retention.cc
+    ../../src/client/publisher_ack.cc
     ../../src/client/publisher.h
     ../../src/client/queue_buffer.cc
     ../../src/client/queue_buffer.h

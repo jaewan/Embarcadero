@@ -1,4 +1,7 @@
 #!/bin/bash
+# Dispatch supported profiles before any historical locks, SSH, or cleanup.
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/experiment_dispatch.sh" || exit 1
+if embarcadero_dispatch_supported "$@"; then shift; fi
 # scripts/run_multiclient.sh
 #
 # Multi-client throughput orchestration for Embarcadero.
@@ -36,37 +39,6 @@
 #   NUM_CLIENTS=3 NUM_BROKERS=4 MESSAGE_SIZE=8192 scripts/run_multiclient.sh
 
 set -euo pipefail
-
-# Supported local development route. Dispatch before backend checks, legacy
-# locks, sourced helpers, traps, SSH, or research-host cleanup. argparse in the
-# owned runner validates every forwarded argument before its preflight/actions.
-case "${1:-}" in
-    --dev-dram)
-        shift
-        _dev_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-        exec python3 "${_dev_repo_root}/tools/dev_cluster.py" "$@"
-        ;;
-    --help|-h)
-        cat <<'HELP'
-Usage:
-  scripts/run_multiclient.sh --dev-dram [dev_cluster.py options]
-  scripts/run_multiclient.sh --dev-dram --help
-  NUM_CLIENTS=... NUM_BROKERS=... scripts/run_multiclient.sh
-
---dev-dram is the supported local development route: explicit DRAM emulation,
-local NUMA-bound client, owned processes/region, no SSH or host tuning.
-Example: --dev-dram --build-dir build/debug --brokers 3 --dry-run
-
-The environment-driven command without --dev-dram is the historical research
-launcher. It uses machine-specific SSH topology and legacy broker cleanup;
-run it only in a dedicated research environment. Its default backend is real.
-See docs/development-commands.md for supported smoke, fault, and pilot commands.
-HELP
-        exit 0
-        ;;
-    "") ;;
-    *) echo "ERROR: unknown argument '$1'; use --help or --dev-dram --help" >&2; exit 2 ;;
-esac
 
 # Explicit memory backend, independent of the replication sink. Keep the
 # historical real default, but never silently label a DRAM-only host as CXL.

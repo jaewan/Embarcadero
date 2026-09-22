@@ -289,6 +289,8 @@ using FreeSegmentCallback = std::function<bool(void*)>;
  * Class representing a message topic with storage and sequencing capabilities
  */
 class Topic {
+    // Linked bounded fixture access; no additional fields or runtime interface.
+    friend class TopicPublicationTestAccess;
 	public:
 		/**
 		 * Constructor for a new Topic

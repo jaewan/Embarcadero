@@ -44,5 +44,19 @@ jobs:
             /tmp/build-manifest.json
             /tmp/full/test-inventory.txt
             /tmp/full/Testing/Temporary/LastTest.log
+            /tmp/asan/Testing/Temporary/LastTest.log
             /opt/embarcadero-deps/ubuntu-packages.tsv
             /opt/embarcadero-deps/folly-revision.txt
+  tsan-components:
+    # The container job may prohibit the per-process ADDR_NO_RANDOMIZE personality.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Focused ThreadSanitizer concurrency checks
+        run: bash tools/build_support/run_tsan_components.sh /tmp/tsan-components
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: tsan-component-evidence
+          path: /tmp/tsan-components/*.log

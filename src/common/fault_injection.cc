@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
 
@@ -178,7 +179,8 @@ bool Controller::Pause(const char* name, Context context, const std::atomic<bool
         arm->hit = true;
         std::ostringstream event;
         event << "HIT " << id << ' ' << name << ' ' << context.client_id << ' ' << context.epoch << ' '
-              << context.batch_seq << ' ' << context.detail0 << ' ' << context.detail1;
+              << context.batch_seq << ' ' << context.detail0 << ' ' << context.detail1
+              << ' ' << syscall(SYS_gettid);
         if (!impl_->Send(event.str())) return false;
         while (!arm->released && !impl_->cancelled.load(std::memory_order_acquire) &&
                !(stop && stop->load(std::memory_order_acquire)))
